@@ -26,6 +26,7 @@
 //! degraded path.
 
 use aether::certificates::{
+    approval::{DelegatedApproval, PolicyMigration},
     authority::{AstraIssuerAuthorization, RotationReason},
     client::{
         ClientCertificateGeneration, ClientCertificateRotationGrant,
@@ -71,6 +72,33 @@ pub enum IssuerError {
     IssuerKeyMismatch(&'static str),
 }
 
+/// What Astra asks the companion to delegate to, for one issuer epoch.
+///
+/// Astra generates and seals its own issuer keys locally (spec §9.5); what
+/// travels here is their public half and a PKCS#10 request for the TLS
+/// intermediate. The companion issues the intermediate under `CA-TLS` and
+/// binds both to one [`AstraIssuerAuthorization`] under `CA-PQ`.
+///
+/// It carries nothing secret, which is what lets it cross to another machine
+/// by hand. It also carries **no signature**, which is why the ordinary path
+/// deposits it as an [`aether::certificates::status::CampaignScope::IssuerDelegation`]
+/// campaign instead: signed on its own the request would authorize whoever
+/// handed the operator a file, whereas a campaign pins the exact material and
+/// shows it before the touch (spec §7.6, §9.5).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IssuerDelegationRequest {
+    /// Trust domain identifier, 32 hex characters. Compared with the vault's,
+    /// so a request meant for another authority is refused before it is
+    /// signed rather than after.
+    pub trust_domain_id: String,
+    pub issuer_epoch: u64,
+    /// ML-DSA-87 public key of the delegated issuer, base64.
+    pub pq_issuer_public_key: String,
+    /// PKCS#10 request for the TLS intermediate, DER base64.
+    pub tls_intermediate_csr: String,
+}
+
 /// The issuer's private material, as Astra holds it.
 ///
 /// The private halves are `Zeroizing`: they are read once at startup and never
@@ -80,12 +108,6 @@ pub struct DelegatedIssuer {
     pq_private_key: Zeroizing<Vec<u8>>,
     tls_intermediate_key_der: Zeroizing<Vec<u8>>,
 }
-
-/// Transcript the startup check signs to prove key ownership.
-///
-/// Domain-separated like every other signature here, and over a constant: it
-/// proves possession, and it must never be confusable with an object.
-const ISSUER_KEY_PROBE: &[u8] = b"helios-astra-delegated-issuer-key-probe-v5";
 
 impl DelegatedIssuer {
     pub fn new(
@@ -118,15 +140,11 @@ impl DelegatedIssuer {
         pq_private_key: Zeroizing<Vec<u8>>,
         tls_intermediate_key_der: Zeroizing<Vec<u8>>,
     ) -> Result<Self, IssuerError> {
-        let proof =
-            aether::certificates::encoding::sign_ml_dsa_87(&pq_private_key, ISSUER_KEY_PROBE)
-                .map_err(|_| IssuerError::IssuerKeyMismatch("ML-DSA-87"))?;
-        aether::certificates::encoding::verify_ml_dsa_87(
-            &authorization.pq_issuer_public_key,
-            ISSUER_KEY_PROBE,
-            &proof,
-        )
-        .map_err(|_| IssuerError::IssuerKeyMismatch("ML-DSA-87"))?;
+        let derived = aether::certificates::encoding::derive_ml_dsa_87_public_key(&pq_private_key)
+            .map_err(|_| IssuerError::IssuerKeyMismatch("ML-DSA-87"))?;
+        if derived != authorization.pq_issuer_public_key {
+            return Err(IssuerError::IssuerKeyMismatch("ML-DSA-87"));
+        }
 
         let tls_key = KeyPair::try_from(tls_intermediate_key_der.as_slice())
             .map_err(|_| IssuerError::IssuerKeyMismatch("TLS"))?;
@@ -157,6 +175,7 @@ impl DelegatedIssuer {
         window: &TransitionWindow,
         validity: (u64, u64),
         serial: [u8; 16],
+        reason: RotationReason,
     ) -> Result<(DerCertificate, PqCertificate), IssuerError> {
         let lifetime = validity
             .1
@@ -168,7 +187,7 @@ impl DelegatedIssuer {
             request.active_generation,
             request.requested_generation,
             lifetime,
-            RotationReason::Scheduled,
+            reason,
         )?;
         let _ = window;
 
@@ -228,11 +247,27 @@ impl DelegatedIssuer {
         window: TransitionWindow,
         issued_at: u64,
         stage_expires_at: u64,
-        reason: RotationReason,
+        approval: DelegatedApproval,
     ) -> Result<ClientCertificateStageAuthorization, IssuerError> {
+        // The reason is read off the evidence rather than supplied beside it:
+        // the two cannot then name different things (see `DelegatedApproval`).
+        let reason = approval.reason();
         if !reason.is_delegable() {
             return Err(IssuerError::MasterAuthorityRequired);
         }
+        let renewal_authorization_fingerprint = approval.fingerprint()?;
+        let (renewal_approval, campaign_approval) = match approval {
+            DelegatedApproval::Automatic(request_fingerprint) => {
+                if !request_fingerprint.matches(&request.fingerprint()) {
+                    return Err(IssuerError::Certificate(
+                        CertificateError::ApprovalMismatch("automatic renewal request fingerprint"),
+                    ));
+                }
+                (None, None)
+            }
+            DelegatedApproval::Renewal(evidence) => (Some(*evidence), None),
+            DelegatedApproval::Campaign(evidence) => (None, Some(evidence)),
+        };
         let authorization = ClientCertificateStageAuthorization {
             format_version: CERTIFICATE_FORMAT_VERSION,
             protocol_version: CERTIFICATE_PROTOCOL_VERSION,
@@ -245,6 +280,9 @@ impl DelegatedIssuer {
             issuer_authorization: Some(self.authorization.clone()),
             stage_id,
             request_fingerprint: request.fingerprint(),
+            renewal_authorization_fingerprint,
+            renewal_approval,
+            campaign_approval,
             gateway_wg_public_key: self.authorization.gateway_wg_public_key,
             server_name: self.authorization.server_name.clone(),
             client_wg_public_key: request.client_wg_public_key,
@@ -296,6 +334,9 @@ impl DelegatedIssuer {
             issuer_authorization_fingerprint: authorization.issuer_authorization_fingerprint,
             issuer_authorization: authorization.issuer_authorization.clone(),
             request_fingerprint: authorization.request_fingerprint,
+            renewal_authorization_fingerprint: authorization.renewal_authorization_fingerprint,
+            renewal_approval: authorization.renewal_approval.clone(),
+            campaign_approval: authorization.campaign_approval.clone(),
             stage_receipt_fingerprint: receipt.fingerprint(),
             stage_receipt: receipt.clone(),
             gateway_wg_public_key: authorization.gateway_wg_public_key,
@@ -337,9 +378,17 @@ impl DelegatedIssuer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aether::certificates::authority::AllowedUsage;
+    use aether::certificates::approval::AstraRenewalApprovalEvidence;
     use aether::certificates::encoding::{
         generate_ml_dsa_87_keypair, MlDsa87PublicKey, TrustDomainId, WireGuardKey,
+    };
+    use aether::certificates::{
+        approval::{
+            AstraCredentialApprovalRequest, AstraCredentialBinding, AstraIssuancePolicy,
+            AstraPolicyPin, AstraRenewalApproval, CredentialState,
+        },
+        authority::AllowedUsage,
+        webauthn::WebAuthnAssertion,
     };
     use rcgen::{
         BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose,
@@ -367,6 +416,12 @@ mod tests {
 
     fn client_key() -> WireGuardKey {
         WireGuardKey::from_bytes([2; 32])
+    }
+
+    fn automatic_policy_fingerprint() -> Fingerprint {
+        AstraIssuancePolicy::standard(domain(), gateway_key(), SERVER_NAME.into())
+            .fingerprint()
+            .expect("automatic policy")
     }
 
     fn intermediate() -> (DerCertificate, Zeroizing<Vec<u8>>) {
@@ -409,7 +464,7 @@ mod tests {
             tls_intermediate_certificate: intermediate_der,
             allowed_usage: AllowedUsage::AdmittedClientLeafRenewal,
             maximum_leaf_lifetime_secs: 200_000,
-            policy_fingerprint: Fingerprint::of(b"policy"),
+            policy_fingerprint: automatic_policy_fingerprint(),
             not_before: 0,
             not_after: 1_000_000,
             ca_pq_signature: MlDsa87Signature::placeholder(),
@@ -487,6 +542,72 @@ mod tests {
         .expect("sign request")
     }
 
+    /// Syntactically complete approval evidence for issuer unit tests.
+    ///
+    /// The cryptographic verification of this object is covered in `aether`;
+    /// these tests exercise only the delegated issuer's field propagation.
+    fn approval_evidence(
+        request: &ClientCertificateRotationRequest,
+    ) -> AstraRenewalApprovalEvidence {
+        let operation_id = Id16::new([8; 16]).expect("operation");
+        let approval_request = AstraCredentialApprovalRequest {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            operation_id,
+            request_fingerprint: request.fingerprint(),
+            trust_domain_id: domain(),
+            gateway_wg_public_key: gateway_key(),
+            client_wg_public_key: client_key(),
+            active_generation: 4,
+            requested_generation: 5,
+            credential_registry_epoch: 1,
+            webauthn_rp_id: "astra.example".into(),
+            webauthn_origin: "https://astra.example".into(),
+            allowed_credential_ids: vec![vec![1]],
+            required_credentials: 1,
+            created_at: 1_000,
+            expires_at: 1_300,
+            astra_service_key_epoch: 1,
+            astra_signature: MlDsa87Signature::placeholder(),
+        };
+        let assertion = WebAuthnAssertion {
+            authenticator_data: vec![1],
+            client_data_json: vec![1],
+            signature: vec![1],
+        };
+        let binding = AstraCredentialBinding {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            credential_id: vec![1],
+            credential_public_key: vec![1],
+            aaguid: [0; 16],
+            trust_domain_id: domain(),
+            gateway_wg_public_key: gateway_key(),
+            state: CredentialState::Active,
+            credential_epoch: 1,
+            credential_registry_epoch: 1,
+            ca_epoch: 1,
+            created_at: 1_000,
+            ca_pq_signature: MlDsa87Signature::placeholder(),
+        };
+        let approval = AstraRenewalApproval {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            operation_id,
+            request_fingerprint: request.fingerprint(),
+            approval_request_fingerprint: approval_request.fingerprint(),
+            credential_fingerprint: binding.fingerprint(),
+            assertion_fingerprint: assertion.fingerprint(),
+            credential_binding: binding,
+            webauthn_assertion: assertion,
+            approved_at: 1_000,
+            expires_at: 1_300,
+            astra_service_key_epoch: 1,
+            astra_signature: MlDsa87Signature::placeholder(),
+        };
+        AstraRenewalApprovalEvidence {
+            approval_request,
+            approval,
+        }
+    }
+
     /// The whole point of the delegation: the leaves it issues verify under
     /// **it**, and the object it signs verifies as an `astra` issuance.
     #[test]
@@ -499,7 +620,14 @@ mod tests {
         let window = TransitionWindow::new(1_000, 50_000, 60_000).expect("window");
         let (tls_leaf, pq_leaf) = fixture
             .issuer
-            .issue_generation(&request, "workstation", &window, (0, 100_000), [9; 16])
+            .issue_generation(
+                &request,
+                "workstation",
+                &window,
+                (0, 100_000),
+                [9; 16],
+                RotationReason::Scheduled,
+            )
             .expect("issuance");
 
         let authorization = fixture
@@ -514,7 +642,7 @@ mod tests {
                 window,
                 1_000,
                 1_000 + 3_600,
-                RotationReason::Scheduled,
+                DelegatedApproval::Automatic(request.fingerprint()),
             )
             .expect("authorization");
 
@@ -529,10 +657,180 @@ mod tests {
                 &client_key(),
                 &active(),
                 &[&fixture.tls_anchor],
+                Some(&AstraPolicyPin::new(automatic_policy_fingerprint()).expect("policy pin")),
                 None,
                 1_100,
             )
             .expect("the gateway accepts a delegated staging");
+    }
+
+    /// A domain on disk, pinned to one policy, holding everything `adopt` reads.
+    struct PinnedDomain {
+        registry: crate::registry::AstraRegistry,
+        ca_private: Zeroizing<Vec<u8>>,
+        issuer_public: MlDsa87PublicKey,
+        pq_key: std::path::PathBuf,
+        tls_key: std::path::PathBuf,
+        intermediate_der: DerCertificate,
+        /// Keeps the directory the two key paths point into alive.
+        _directory: tempfile::TempDir,
+    }
+
+    /// Builds a registry pinned to `policy`, with the private issuer material
+    /// on disk beside it.
+    fn domain_pinned_to(policy: Fingerprint) -> PinnedDomain {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let (ca_private, ca_public) = generate_ml_dsa_87_keypair().expect("keygen");
+        let (issuer_private, issuer_public) = generate_ml_dsa_87_keypair().expect("keygen");
+        let (_, service) = generate_ml_dsa_87_keypair().expect("keygen");
+        let (intermediate_der, intermediate_key) = intermediate();
+
+        let pq_key = directory.path().join("issuer-pq.bin");
+        let tls_key = directory.path().join("issuer-tls.der");
+        std::fs::write(&pq_key, issuer_private.as_slice()).expect("pq key");
+        std::fs::write(&tls_key, intermediate_key.as_slice()).expect("tls key");
+
+        let state = crate::registry::AstraState {
+            trust_domain_id: domain(),
+            gateway_wg_public_key: gateway_key(),
+            server_name: SERVER_NAME.into(),
+            authority_url: "https://astra.example".into(),
+            webauthn_rp_id: "astra.example".into(),
+            astra_policy_fingerprint: AstraPolicyPin::new(policy).expect("policy pin"),
+            credential_registry_epoch: 1,
+            ca_epoch: 1,
+            ca_public_key: ca_public,
+            ca_rotation: None,
+            ca_tls_epoch: 1,
+            ca_tls_fingerprint: Some(Fingerprint::of(b"client tls ca")),
+            ca_tls_rotation: None,
+            astra_service_key_epoch: 1,
+            astra_service_public_key: service,
+            issuer: None,
+            transitions: Vec::new(),
+            peers: std::collections::BTreeMap::new(),
+            status_epochs: std::collections::BTreeMap::new(),
+            audit: crate::audit::AuditChain::default(),
+        };
+        PinnedDomain {
+            registry: crate::registry::AstraRegistry::new(
+                directory.path().join("astra.json"),
+                state,
+            ),
+            ca_private,
+            issuer_public,
+            pq_key,
+            tls_key,
+            intermediate_der,
+            _directory: directory,
+        }
+    }
+
+    fn delegation_naming(
+        ca_private: &[u8],
+        issuer_public: MlDsa87PublicKey,
+        intermediate_der: DerCertificate,
+        policy_fingerprint: Fingerprint,
+    ) -> AstraIssuerAuthorization {
+        AstraIssuerAuthorization {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            trust_domain_id: domain(),
+            ca_epoch: 1,
+            ca_tls_epoch: 1,
+            gateway_wg_public_key: gateway_key(),
+            server_name: SERVER_NAME.into(),
+            issuer_epoch: 1,
+            pq_issuer_public_key: issuer_public,
+            tls_intermediate_certificate: intermediate_der,
+            allowed_usage: AllowedUsage::AdmittedClientLeafRenewal,
+            maximum_leaf_lifetime_secs: 200_000,
+            policy_fingerprint,
+            not_before: 0,
+            not_after: 1_000_000,
+            ca_pq_signature: MlDsa87Signature::placeholder(),
+        }
+        .sign(ca_private)
+        .expect("sign delegation")
+    }
+
+    /// The migration of 6 September 2026, through the door it actually uses:
+    /// installing a delegation. The pin and the delegation land together, so a
+    /// crash can never leave an authority allowed to issue unattended under a
+    /// policy nobody confirmed.
+    #[test]
+    fn installing_a_delegation_that_names_the_current_policy_migrates_a_superseded_domain() {
+        let superseded = aether::certificates::approval::superseded_per_request_policy_fingerprint(
+            domain(),
+            gateway_key(),
+            SERVER_NAME,
+        )
+        .expect("superseded");
+        let mut pinned = domain_pinned_to(superseded);
+
+        adopt(
+            &mut pinned.registry,
+            delegation_naming(
+                &pinned.ca_private,
+                pinned.issuer_public.clone(),
+                pinned.intermediate_der.clone(),
+                automatic_policy_fingerprint(),
+            ),
+            &pinned.pq_key,
+            &pinned.tls_key,
+            1_000,
+        )
+        .expect("the migration is accepted");
+
+        assert!(pinned
+            .registry
+            .state()
+            .astra_policy_fingerprint
+            .fingerprint()
+            .matches(&automatic_policy_fingerprint()));
+        assert!(
+            pinned.registry.state().issuer.is_some(),
+            "the delegation is installed by the same write"
+        );
+    }
+
+    /// A `CA-PQ` signature makes a delegation genuine, not applicable. One
+    /// naming a third policy leaves a superseded domain exactly where it was —
+    /// still refusing unattended issuance.
+    #[test]
+    fn a_delegation_naming_a_third_policy_migrates_nothing() {
+        let superseded = aether::certificates::approval::superseded_per_request_policy_fingerprint(
+            domain(),
+            gateway_key(),
+            SERVER_NAME,
+        )
+        .expect("superseded");
+        let mut pinned = domain_pinned_to(superseded);
+        let mut widened =
+            AstraIssuancePolicy::standard(domain(), gateway_key(), SERVER_NAME.into());
+        widened.maximum_leaf_lifetime_secs = 10 * 365 * 86_400;
+
+        assert!(matches!(
+            adopt(
+                &mut pinned.registry,
+                delegation_naming(
+                    &pinned.ca_private,
+                    pinned.issuer_public.clone(),
+                    pinned.intermediate_der.clone(),
+                    widened.fingerprint().expect("widened"),
+                ),
+                &pinned.pq_key,
+                &pinned.tls_key,
+                1_000,
+            ),
+            Err(AdoptionError::Policy(_))
+        ));
+        assert!(pinned
+            .registry
+            .state()
+            .astra_policy_fingerprint
+            .fingerprint()
+            .matches(&superseded));
+        assert!(pinned.registry.state().issuer.is_none());
     }
 
     /// Present is not correct. The delegation and the two private keys arrive
@@ -592,7 +890,8 @@ mod tests {
                 "workstation",
                 &window,
                 (0, 100_000),
-                [9; 16]
+                [9; 16],
+                RotationReason::Scheduled,
             ),
             Err(IssuerError::Certificate(
                 CertificateError::IssuerScopeViolation("generation")
@@ -602,30 +901,131 @@ mod tests {
         let request = request(&fixture, csr_der, &new_public, &new_private, 5);
         let (tls_leaf, pq_leaf) = fixture
             .issuer
-            .issue_generation(&request, "workstation", &window, (0, 100_000), [9; 16])
+            .issue_generation(
+                &request,
+                "workstation",
+                &window,
+                (0, 100_000),
+                [9; 16],
+                RotationReason::Scheduled,
+            )
             .expect("issuance");
+        let _ = (tls_leaf, pq_leaf);
+        // The four reasons this issuer may not sign for are no longer
+        // *expressible* here: `authorize_stage` reads the reason off the
+        // approval family, and neither family names one of them. The guard
+        // inside it stays as the belt to that suspenders, and this asserts the
+        // property the type now carries.
         for forbidden in [
             RotationReason::ExpiredRecovery,
             RotationReason::Readmission,
             RotationReason::EmergencyReplacement,
             RotationReason::KeyRecovery,
         ] {
-            assert!(matches!(
-                fixture.issuer.authorize_stage(
-                    &request,
-                    &active(),
-                    Id16::new([4; 16]).expect("stage"),
-                    fixture.tls_anchor.fingerprint(),
-                    tls_leaf.clone(),
-                    pq_leaf.clone(),
-                    window,
-                    1_000,
-                    1_000 + 3_600,
-                    forbidden,
-                ),
-                Err(IssuerError::MasterAuthorityRequired)
-            ));
+            assert!(!forbidden.is_delegable());
         }
+    }
+
+    /// The two families produce two different authorizations, and never a
+    /// hybrid: `authorize_stage` reads the reason off the evidence, so the
+    /// field that is filled and the reason that is signed always agree.
+    #[test]
+    fn each_approval_family_names_its_own_reason_and_fills_its_own_field() {
+        use aether::certificates::approval::AstraCampaignApprovalEvidence;
+        use aether::certificates::status::{
+            AstraRotationCampaign, CampaignApproval, CampaignScope, CampaignTarget, CertificateKind,
+        };
+
+        let fixture = fixture();
+        let (csr_der, _csr_key) = csr();
+        let (new_private, new_public) = generate_ml_dsa_87_keypair().expect("keygen");
+        let window = TransitionWindow {
+            not_before: 0,
+            activation_at: 1_000,
+            not_after: 100_000,
+        };
+        let request = request(&fixture, csr_der, &new_public, &new_private, 5);
+
+        let campaign = AstraRotationCampaign {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            campaign_id: Id16::new([7; 16]).expect("id"),
+            trust_domain_id: fixture.issuer.authorization.trust_domain_id,
+            gateway_wg_public_key: fixture.issuer.authorization.gateway_wg_public_key,
+            server_name: fixture.issuer.authorization.server_name.clone(),
+            created_at: 900,
+            expires_at: 1_200,
+            scope: CampaignScope::FleetLeafs,
+            targets: vec![CampaignTarget {
+                certificate_kind: CertificateKind::ClientPq,
+                identity_key: request.client_wg_public_key,
+                epoch: 1,
+                generation: active().generation,
+                active_tls_certificate_fingerprint: active().tls_certificate_fingerprint,
+                active_pq_certificate_fingerprint: active().pq_certificate_fingerprint,
+            }],
+            reason: "campagne trimestrielle".into(),
+            requested_by: "operator".into(),
+            policy_fingerprint: Fingerprint::of(b"policy"),
+            required_credentials: CampaignScope::FleetLeafs.required_credentials(),
+        };
+        let approval = CampaignApproval {
+            campaign_id: campaign.campaign_id,
+            campaign_fingerprint: campaign.fingerprint(),
+            required_credentials: campaign.required_credentials,
+            approved_at: 1_000,
+            approvals: Vec::new(),
+        };
+        let evidence = AstraCampaignApprovalEvidence {
+            campaign,
+            approval,
+            credential_registry: aether::certificates::approval::CredentialRegistry {
+                trust_domain_id: fixture.issuer.authorization.trust_domain_id,
+                gateway_wg_public_key: fixture.issuer.authorization.gateway_wg_public_key,
+                ca_epoch: 1,
+                credential_registry_epoch: 1,
+                bindings: Vec::new(),
+            },
+            webauthn_origin: "https://astra.example".into(),
+        };
+        let campaign_approval = DelegatedApproval::Campaign(Box::new(evidence));
+        assert_eq!(campaign_approval.reason(), RotationReason::ManualGlobal);
+
+        let (tls_leaf, pq_leaf) = fixture
+            .issuer
+            .issue_generation(
+                &request,
+                "workstation",
+                &window,
+                (0, 100_000),
+                [9; 16],
+                campaign_approval.reason(),
+            )
+            .expect("a campaign is delegable");
+        let expected = campaign_approval.fingerprint().expect("fingerprint");
+        let authorization = fixture
+            .issuer
+            .authorize_stage(
+                &request,
+                &active(),
+                Id16::new([4; 16]).expect("stage"),
+                fixture.tls_anchor.fingerprint(),
+                tls_leaf,
+                pq_leaf,
+                window,
+                1_000,
+                1_000 + 3_600,
+                campaign_approval,
+            )
+            .expect("authorization");
+
+        assert_eq!(authorization.reason, RotationReason::ManualGlobal);
+        assert!(authorization.campaign_approval.is_some());
+        // The other family must be absent, not merely unused: an object
+        // carrying both would leave "which one was checked" to its reader.
+        assert!(authorization.renewal_approval.is_none());
+        assert!(authorization
+            .renewal_authorization_fingerprint
+            .matches(&expected));
     }
 
     /// A lifetime beyond the delegation's ceiling is refused before issuance.
@@ -643,7 +1043,8 @@ mod tests {
                 "workstation",
                 &window,
                 (0, 300_000),
-                [9; 16]
+                [9; 16],
+                RotationReason::Scheduled,
             ),
             Err(IssuerError::Certificate(
                 CertificateError::IssuerScopeViolation("leaf lifetime")
@@ -662,7 +1063,14 @@ mod tests {
         let window = TransitionWindow::new(1_000, 50_000, 60_000).expect("window");
         let (tls_leaf, pq_leaf) = fixture
             .issuer
-            .issue_generation(&request, "workstation", &window, (0, 100_000), [9; 16])
+            .issue_generation(
+                &request,
+                "workstation",
+                &window,
+                (0, 100_000),
+                [9; 16],
+                RotationReason::Scheduled,
+            )
             .expect("issuance");
         let authorization = fixture
             .issuer
@@ -676,7 +1084,7 @@ mod tests {
                 window,
                 1_000,
                 1_000 + 3_600,
-                RotationReason::Scheduled,
+                DelegatedApproval::Renewal(Box::new(approval_evidence(&request))),
             )
             .expect("authorization");
 
@@ -693,6 +1101,7 @@ mod tests {
             stage_id: authorization.stage_id,
             stage_authorization_fingerprint: authorization.fingerprint().expect("fingerprint"),
             request_fingerprint: authorization.request_fingerprint,
+            renewal_authorization_fingerprint: authorization.renewal_authorization_fingerprint,
             gateway_wg_public_key: gateway_key(),
             client_wg_public_key: client_key(),
             active_generation: 4,
@@ -719,4 +1128,124 @@ mod tests {
             Err(IssuerError::ReceiptMismatch)
         ));
     }
+}
+
+/// Where one delegation's ML-DSA-87 private half is sealed in the state volume.
+///
+/// Named here rather than in the two callers, because «where the key is» is
+/// one fact: a request written by one path and adopted by another must look
+/// in the same place, and two spellings of the same format string is exactly
+/// how they stop doing so.
+pub fn pq_key_path(state_dir: &std::path::Path, issuer_epoch: u64) -> std::path::PathBuf {
+    state_dir.join(format!("issuer-pq-key-{issuer_epoch}.bin"))
+}
+
+/// Where one delegation's TLS private half is sealed in the state volume.
+pub fn tls_key_path(state_dir: &std::path::Path, issuer_epoch: u64) -> std::path::PathBuf {
+    state_dir.join(format!("issuer-tls-key-{issuer_epoch}.der"))
+}
+
+/// Everything that must be true before a signed delegation is recorded.
+///
+/// Three checks from three different places, and the delegation is only
+/// installed when all three agree: the anchor and epochs this registry pins,
+/// the issuance policy confirmed out of band at bootstrap, and the private
+/// halves already sealed in the state volume. A file that satisfies all three
+/// is one this authority can actually issue under; skipping the last would
+/// announce an issuer whose first use fails at 80 % of a client's leaf — and
+/// would make the next start-up refuse to load a registry it just wrote.
+///
+/// Recording the delegation already held is a no-op, so an operator result
+/// whose response was lost may be redeposited byte for byte (§8.2).
+#[derive(Debug, thiserror::Error)]
+pub enum AdoptionError {
+    #[error("delegation refused under this domain's anchor: {0}")]
+    Authorization(#[from] CertificateError),
+    #[error("the delegation does not match the pinned Astra issuance policy: {0}")]
+    Policy(#[source] CertificateError),
+    #[error(
+        "no private material for issuer epoch {issuer_epoch} in this state volume: the \
+         delegation answers a request another state directory made"
+    )]
+    NoPrivateMaterial { issuer_epoch: u64 },
+    #[error("reading the delegated issuer's private material: {0}")]
+    PrivateMaterial(#[source] std::io::Error),
+    #[error("the delegation does not match the private material on disk: {0}")]
+    Possession(#[source] IssuerError),
+    #[error("recording the delegation: {0}")]
+    Registry(#[from] crate::registry::RegistryError),
+}
+
+/// Verifies a signed delegation and records it (spec §9.5).
+///
+/// Shared by the local `astra issuer install` and by the operator result the
+/// service accepts on the §8.2 transport, because the checks are the same
+/// checks: which path the document arrived by decides nothing about whether
+/// this authority may issue under it.
+pub fn adopt(
+    registry: &mut crate::registry::AstraRegistry,
+    authorization: AstraIssuerAuthorization,
+    pq_key_path: &std::path::Path,
+    tls_key_path: &std::path::Path,
+    now_unix: u64,
+) -> Result<u64, AdoptionError> {
+    // `None` unless this delegation is the one that carries the domain off the
+    // superseded per-request policy; then it is the pin to persist with it.
+    let adopted_policy = {
+        let state = registry.state();
+        authorization.verify(
+            &state.ca_public_key,
+            &state.trust_domain_id,
+            state.ca_epoch,
+            state.ca_tls_epoch,
+            &state.gateway_wg_public_key,
+            &state.server_name,
+            now_unix,
+        )?;
+        // §2.4 ordering is preserved: `CA-PQ` has spoken above, and only then
+        // is the policy the document names read.
+        match state
+            .astra_policy_fingerprint
+            .assert_authorizes(&authorization)
+        {
+            Ok(()) => None,
+            Err(refusal) => match state
+                .astra_policy_fingerprint
+                .adopt_automatic_renewal_policy(
+                    state.trust_domain_id,
+                    state.gateway_wg_public_key,
+                    &state.server_name,
+                    &authorization,
+                ) {
+                Ok(PolicyMigration::Adopted(pin)) => Some(pin),
+                // The pin already names the current policy, yet the delegation
+                // did not match it: the document carries some third policy.
+                // The first refusal is the accurate one.
+                Ok(PolicyMigration::AlreadyCurrent) => return Err(AdoptionError::Policy(refusal)),
+                Err(_) => return Err(AdoptionError::Policy(refusal)),
+            },
+        }
+    };
+
+    let issuer_epoch = authorization.issuer_epoch;
+    if !pq_key_path.exists() || !tls_key_path.exists() {
+        return Err(AdoptionError::NoPrivateMaterial { issuer_epoch });
+    }
+    let pq_private_key =
+        Zeroizing::new(std::fs::read(pq_key_path).map_err(AdoptionError::PrivateMaterial)?);
+    let tls_private_key =
+        Zeroizing::new(std::fs::read(tls_key_path).map_err(AdoptionError::PrivateMaterial)?);
+    DelegatedIssuer::load(authorization.clone(), pq_private_key, tls_private_key)
+        .map_err(AdoptionError::Possession)?;
+
+    registry.install_issuer_adopting_policy(
+        aether::certificates::state::AstraIssuerState {
+            issuer_epoch,
+            authorization,
+            state: aether::certificates::state::IssuerLifecycle::Active,
+        },
+        adopted_policy,
+        now_unix,
+    )?;
+    Ok(issuer_epoch)
 }

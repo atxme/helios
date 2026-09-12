@@ -486,20 +486,52 @@ const CHALLENGE_TIMEOUT: Duration = Duration::from_secs(5);
 /// without ever looking like a hang.
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Builds the endpoint the key-negotiation port serves.
+///
+/// `client_cas` is a **set**, and it mirrors the PQ half of the very same
+/// handshake: the operator admission CA issues first-generation leaves, a
+/// renewed leaf chains to the domain's own `CA-TLS` through Astra's delegated
+/// intermediate, and during a §9.4 overlap the successor anchor is legitimate
+/// too. A verifier holding one of them alone refuses leaves the registry
+/// itself considers presentable — a lockout, not a refusal.
+///
+/// # Known limitation: the set is fixed for the life of the endpoint
+///
+/// The caller reads it once, as it already does for the served identity, and
+/// for the same reason: rebuilding the endpoint under live PSK slots is not
+/// something this crate offers. A client renewal never moves the set — only a
+/// §9.4 rotation does, and its overlap lasts a month, so the restart that
+/// carries the successor has ample room before the outgoing anchor retires.
 pub fn server_endpoint(
     bind: SocketAddr,
     identity: &TlsIdentity,
-    client_ca: Vec<u8>,
+    client_cas: &[Vec<u8>],
 ) -> Result<Endpoint, TransportError> {
-    let client_ca_der = client_ca.clone();
+    // Fail closed: an empty set would build a verifier no client can satisfy,
+    // and rustls would accept the configuration.
+    if client_cas.is_empty() {
+        return Err(TransportError::InvalidCertificate);
+    }
     let mut roots = RootCertStore::empty();
-    roots
-        .add(CertificateDer::from(client_ca))
-        .map_err(|_| TransportError::InvalidCertificate)?;
-    let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
-        .build()
-        .map_err(|error| TransportError::Tls(error.to_string()))?;
-    let mut tls = rustls::ServerConfig::builder()
+    for client_ca in client_cas {
+        roots
+            .add(CertificateDer::from(client_ca.clone()))
+            .map_err(|_| TransportError::InvalidCertificate)?;
+    }
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+        Arc::new(roots),
+        provider.clone(),
+    )
+    .build()
+    .map_err(|error| TransportError::Tls(error.to_string()))?;
+    // The workspace intentionally carries both rustls providers: the public
+    // QUIC path remains on `ring`, while the private Astra link uses AWS-LC.
+    // Never ask rustls to guess a process-wide default from unified Cargo
+    // features — a workspace test (or a future binary) can enable both.
+    let mut tls = rustls::ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|error| TransportError::Tls(error.to_string()))?
         .with_client_cert_verifier(verifier)
         .with_single_cert(identity.certificates(), identity.private_key()?)
         .map_err(|error| TransportError::Tls(error.to_string()))?;
@@ -523,7 +555,11 @@ pub fn server_endpoint(
         %bind,
         alpn = %String::from_utf8_lossy(KEY_NEGOTIATION_ALPN),
         served_certificate_sha256 = %identity.leaf_fingerprint(),
-        client_ca_sha256 = %certificate_fingerprint_der(&client_ca_der),
+        client_ca_sha256 = %client_cas
+            .iter()
+            .map(|client_ca| certificate_fingerprint_der(client_ca).to_string())
+            .collect::<Vec<_>>()
+            .join(" "),
         datagram_bytes = SAFE_UDP_PAYLOAD,
         "quic: key-negotiation server endpoint ready"
     );
@@ -583,7 +619,10 @@ fn client_config(
     roots
         .add(CertificateDer::from(gateway_ca))
         .map_err(|_| TransportError::InvalidCertificate)?;
-    let mut tls = rustls::ClientConfig::builder()
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut tls = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|error| TransportError::Tls(error.to_string()))?
         .with_root_certificates(roots)
         .with_client_auth_cert(identity.certificates(), identity.private_key()?)
         .map_err(|error| TransportError::Tls(error.to_string()))?;
@@ -1033,6 +1072,11 @@ async fn handle_connection(
     };
 
     if let Err(error) = request.request.validate() {
+        tracing::warn!(
+            %remote,
+            %error,
+            "quic: key-negotiation request refused: malformed request"
+        );
         write_frame(
             &mut send,
             &ServerMessage::Error {
@@ -1040,10 +1084,21 @@ async fn handle_connection(
             },
         )
         .await?;
-        return Err(TransportError::Protocol(error.to_string()));
+        // The error frame is the public answer. Finish the stream and wait
+        // for the peer to take it before closing the connection; dropping it
+        // immediately makes Quinn report `connection lost` instead of the
+        // actual protocol refusal.
+        drain_then_close(&connection, &mut send, "malformed negotiation request").await;
+        return Ok(());
     }
     // The request may only speak for the peer mTLS already bound it to.
     if request.request.client_wg_public_key != admitted_peer {
+        tracing::warn!(
+            %remote,
+            requested_peer = %request.request.client_wg_public_key,
+            admitted_peer = %admitted_peer,
+            "quic: key-negotiation request refused: certificate and WireGuard identities differ"
+        );
         write_frame(
             &mut send,
             &ServerMessage::Error {
@@ -1051,10 +1106,13 @@ async fn handle_connection(
             },
         )
         .await?;
-        return Err(TransportError::Protocol(
-            "request names a WireGuard key other than the one this certificate is admitted for"
-                .into(),
-        ));
+        drain_then_close(
+            &connection,
+            &mut send,
+            "certificate and WireGuard identities differ",
+        )
+        .await;
+        return Ok(());
     }
 
     let transaction_id = request.request.transaction_id;
@@ -1222,11 +1280,10 @@ fn consume_challenge(
 }
 
 fn random_challenge() -> Result<[u8; SERVER_CHALLENGE_LEN], TransportError> {
-    use aws_lc_rs::rand::SecureRandom as _;
     let mut challenge = [0u8; SERVER_CHALLENGE_LEN];
-    aws_lc_rs::rand::SystemRandom::new()
-        .fill(&mut challenge)
-        .map_err(|_| TransportError::Protocol("system RNG failed to produce a challenge".into()))?;
+    aether::random::fill_public(&mut challenge).map_err(|error| {
+        TransportError::Protocol(format!("the approved DRBG produced no challenge: {error}"))
+    })?;
     Ok(challenge)
 }
 
@@ -1978,6 +2035,38 @@ mod tests {
         }
     }
 
+    /// A second client authority, independent from the one that issued the
+    /// server identity in [`test_pki`].
+    ///
+    /// A renewed Orion leaf has exactly this shape: it chains to the domain
+    /// `CA-TLS`, while the gateway leaf and the first client generation still
+    /// belong to their original authorities.
+    fn independent_client_identity(name: &str) -> (Vec<u8>, TlsIdentity) {
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::CrlSign,
+        ];
+        let ca_key = KeyPair::generate().unwrap();
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+
+        let mut leaf_params = CertificateParams::new(vec![name.into()]).unwrap();
+        leaf_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        leaf_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        let leaf_key = KeyPair::generate().unwrap();
+        let leaf = leaf_params.signed_by(&leaf_key, &ca, &ca_key).unwrap();
+
+        (
+            ca.der().to_vec(),
+            TlsIdentity {
+                certificate_chain: vec![leaf.der().to_vec(), ca.der().to_vec()],
+                private_key: leaf_key.serialize_der(),
+            },
+        )
+    }
+
     struct Handler {
         expected_fingerprint: String,
         reject_prepare: AtomicBool,
@@ -2204,6 +2293,43 @@ mod tests {
         );
     }
 
+    /// The historical validator of an expired identity has no door on this
+    /// transport (spec §7.5, §14.1).
+    ///
+    /// Recovery is an Astra decision, reached over the veth after an operator
+    /// ceremony. QUIC carries three messages, its vocabulary is closed, and a
+    /// recovery request is not a message it can be asked to read — so an
+    /// expired leaf stays refused here for want of anything to present it to.
+    #[test]
+    fn the_quic_vocabulary_holds_no_recovery_message() {
+        // The whole vocabulary, and the only member that needs no signed
+        // material to build.
+        assert!(serde_json::from_str::<ClientMessage>(
+            r#"{"type":"challenge_request","protocol_version":5}"#
+        )
+        .is_ok());
+
+        // A recovery request has no discriminant here.
+        for smuggled in [
+            r#"{"type":"expired_certificate_recovery_request"}"#,
+            r#"{"type":"recovery"}"#,
+            r#"{"type":"historical_certificate"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<ClientMessage>(smuggled).is_err(),
+                "the transport accepted {smuggled}"
+            );
+        }
+
+        // Nor can one ride inside a message that does exist: the frames deny
+        // unknown fields, so a historical proof appended to a legal request is
+        // a frame the transport never parses.
+        assert!(serde_json::from_str::<ClientMessage>(
+            r#"{"type":"challenge_request","protocol_version":5,"historical_certificate":"x"}"#
+        )
+        .is_err());
+    }
+
     /// Monte le service et rend l'endpoint client, pour ne pas répéter huit
     /// lignes de PKI dans chaque test.
     fn bench(
@@ -2217,7 +2343,7 @@ mod tests {
         let server = server_endpoint(
             "127.0.0.1:0".parse().unwrap(),
             &pki.server,
-            pki.ca_der.clone(),
+            std::slice::from_ref(&pki.ca_der),
         )
         .unwrap();
         let server_addr = server.local_addr().unwrap();
@@ -2233,6 +2359,96 @@ mod tests {
         )
         .unwrap();
         (handler, task, client, server_addr)
+    }
+
+    /// The mTLS boundary must accept a renewed client whose chain ends at the
+    /// domain CA, even though the server certificate and first-generation
+    /// clients still use the original CA.
+    ///
+    /// Exercising a real Quinn handshake matters here: checking that two DER
+    /// blobs entered a `RootCertStore` would not prove rustls can build the
+    /// second chain presented by Orion.
+    #[tokio::test]
+    async fn every_configured_client_ca_can_authenticate_a_connection() {
+        let pki = test_pki();
+        let (domain_ca, renewed_client) = independent_client_identity("renewed-orion");
+        let client_cas = vec![pki.ca_der.clone(), domain_ca];
+        let server =
+            server_endpoint("127.0.0.1:0".parse().unwrap(), &pki.server, &client_cas).unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let mut handler = Handler::new(&pki);
+        handler.expected_fingerprint =
+            certificate_fingerprint_der(&renewed_client.certificate_chain[0]);
+        let handler = Arc::new(handler);
+        let task = tokio::spawn(serve(
+            server,
+            Arc::clone(&handler) as Arc<dyn NegotiationHandler>,
+        ));
+        let client = client_endpoint(
+            "127.0.0.1:0".parse().unwrap(),
+            &renewed_client,
+            pki.ca_der.clone(),
+        )
+        .unwrap();
+
+        let pending = request_challenge(&client, server_addr, "localhost", GATEWAY_WG_KEY)
+            .await
+            .expect("the domain CA is one of the configured client roots");
+        drop(pending);
+
+        client.close(0u32.into(), b"test complete");
+        task.abort();
+    }
+
+    /// An unrelated client authority remains outside the trust boundary.
+    /// Adding the domain CA must be an explicit set extension, not a fallback
+    /// that accepts any readable chain.
+    #[tokio::test]
+    async fn an_unconfigured_client_ca_is_refused_by_mtls() {
+        let pki = test_pki();
+        let (_untrusted_ca, untrusted_client) = independent_client_identity("untrusted-orion");
+        let server = server_endpoint(
+            "127.0.0.1:0".parse().unwrap(),
+            &pki.server,
+            std::slice::from_ref(&pki.ca_der),
+        )
+        .unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let mut handler = Handler::new(&pki);
+        handler.expected_fingerprint =
+            certificate_fingerprint_der(&untrusted_client.certificate_chain[0]);
+        let handler = Arc::new(handler);
+        let task = tokio::spawn(serve(
+            server,
+            Arc::clone(&handler) as Arc<dyn NegotiationHandler>,
+        ));
+        let client = client_endpoint(
+            "127.0.0.1:0".parse().unwrap(),
+            &untrusted_client,
+            pki.ca_der.clone(),
+        )
+        .unwrap();
+
+        assert!(
+            request_challenge(&client, server_addr, "localhost", GATEWAY_WG_KEY)
+                .await
+                .is_err(),
+            "a CA absent from the configured set must fail at the mTLS boundary"
+        );
+
+        client.close(0u32.into(), b"test complete");
+        task.abort();
+    }
+
+    /// An empty trust set is a configuration error, not a server that starts
+    /// successfully while refusing every legitimate client.
+    #[test]
+    fn an_empty_client_ca_set_is_refused() {
+        let pki = test_pki();
+        assert!(matches!(
+            server_endpoint("127.0.0.1:0".parse().unwrap(), &pki.server, &[]),
+            Err(TransportError::InvalidCertificate)
+        ));
     }
 
     /// The nominal v5 sequence is challenge, request, response, confirmation,

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import Alert from '@mui/material/Alert'
 import Badge from '@mui/material/Badge'
 import Box from '@mui/material/Box'
@@ -8,9 +8,11 @@ import Tooltip from '@mui/material/Tooltip'
 import Typography from '@mui/material/Typography'
 import { ChevronDown, Gauge, Radio, Settings2, ShieldCheck, Terminal, X } from 'lucide-react'
 import * as api from './api'
-import type { VaultPosture } from './types'
+import type { RenewalProgress, VaultPosture } from './types'
 import { useClient } from './hooks/useClient'
 import { CertificatesView } from './views/CertificatesView'
+import { AstraMark } from './components/AstraMark'
+import { AstraView } from './views/AstraView'
 import { ConnectView } from './views/ConnectView'
 import { ProfilesView } from './views/ProfilesView'
 import { SpeedTestView } from './views/SpeedTestView'
@@ -31,7 +33,12 @@ import { GUTTER, PINE } from './theme'
  * same length — that's exactly the defect being fixed here.
  */
 
-type View = 'connect' | 'profiles' | 'certificates' | 'speedtest' | 'logs'
+type View = 'connect' | 'profiles' | 'certificates' | 'astra' | 'speedtest' | 'logs'
+
+function operatorCeremonyIsLive(status: Awaited<ReturnType<typeof api.operatorCeremonyStatus>>) {
+  if (!status || typeof status.gesture !== 'string') return status !== null
+  return !['done', 'failed', 'cancelled'].includes(status.gesture)
+}
 
 /** Width of the collapsed rail. The icon slot is exactly this width. */
 const RAIL = 56
@@ -46,6 +53,7 @@ const VIEWS: { value: View; label: string; icon: typeof Radio }[] = [
   // §12.2's «tous les profils Helios de cet appareil» cannot live on a screen
   // that shows one profile at a time.
   { value: 'certificates', label: 'Certificats', icon: ShieldCheck },
+  { value: 'astra', label: 'Astra', icon: AstraMark },
   { value: 'speedtest', label: 'Speedtest', icon: Gauge },
   { value: 'logs', label: 'Journal', icon: Terminal },
 ]
@@ -53,6 +61,73 @@ const VIEWS: { value: View; label: string; icon: typeof Radio }[] = [
 export default function App() {
   const c = useClient()
   const [view, setView] = useState<View>('connect')
+  // Whether Astra has work waiting. The tab itself stays available because it
+  // also owns certificate-authority operations an operator may start there;
+  // this state drives only the attention badge.
+  const [astraPending, setAstraPending] = useState(false)
+  // The Certificates view is unmounted during the Astra ceremony. Keep the
+  // committed result here so returning to it does not erase the operation the
+  // user just completed.
+  const [completedRecovery, setCompletedRecovery] = useState<Record<
+    string,
+    RenewalProgress
+  > | null>(null)
+
+  // What makes the tab live: a protocol-2 ceremony the helper is running, or
+  // the legacy CA-TLS rotation still in flight. Polled rather than pushed
+  // because a ceremony outlives any one view, and an operator who switched
+  // away must find it again where they left it.
+  useEffect(() => {
+    let cancelled = false
+    const look = () => {
+      void Promise.allSettled([
+        api.operatorCeremonyStatus(),
+        api.astraCaTlsRotationStatus(),
+        api.operatorPendingOperations(),
+      ]).then(([operator, legacy, pending]) => {
+        if (cancelled) return
+        const live =
+          (operator.status === 'fulfilled' && operatorCeremonyIsLive(operator.value)) ||
+          (legacy.status === 'fulfilled' && legacy.value.phase !== 'idle') ||
+          (pending.status === 'fulfilled' && pending.value.length > 0)
+        if (live) {
+          setAstraPending(true)
+        } else if (
+          operator.status === 'fulfilled' &&
+          legacy.status === 'fulfilled' &&
+          pending.status === 'fulfilled'
+        ) {
+          // Only a complete observation may grey the entry. A transient
+          // failure must not hide work whose absence was never established.
+          setAstraPending(false)
+        }
+      })
+    }
+    look()
+    const timer = window.setInterval(look, 3000)
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+    }
+  }, [])
+
+  /// Opens the §7.5 ceremony for one operation, and goes to where it shows.
+  const approveRecovery = async (operationId: string) => {
+    await api.beginOperatorCeremony({ kind: 'recover_identity', operation_id: operationId })
+    setAstraPending(true)
+    setView('astra')
+  }
+
+  const finishRecovery = useCallback(async (operationId: string) => {
+    const outcome = await api.resumeCertificateRecovery(operationId)
+    // The committed result shown below is the acknowledgement. Clear the
+    // terminal helper session so reopening Astra cannot try to finish the
+    // same, already-consumed recovery again.
+    await api.dismissOperatorCeremony().catch(() => undefined)
+    setCompletedRecovery(outcome.progress)
+    setAstraPending(false)
+    setView('certificates')
+  }, [])
   const [navOpen, setNavOpen] = useState(false)
   const [postureAnchor, setPostureAnchor] = useState<HTMLElement | null>(null)
   // Read on every opening rather than once at startup: BitLocker can be
@@ -248,7 +323,12 @@ export default function App() {
           >
             {VIEWS.map(({ value, label, icon: Icon }) => {
               const active = view === value
-              const pending = value === 'logs' && view !== 'logs' ? c.logs.length : 0
+              const pending =
+                value === 'logs' && view !== 'logs'
+                  ? c.logs.length
+                  : value === 'astra' && astraPending && view !== 'astra'
+                    ? 1
+                    : 0
               return (
                 <ButtonBase
                   key={value}
@@ -262,6 +342,7 @@ export default function App() {
                     minHeight: 46,
                     flexShrink: 0,
                     color: active ? 'primary.main' : 'text.secondary',
+                    '&.Mui-disabled': { color: 'text.disabled', opacity: 0.55 },
                     '&:hover': { bgcolor: 'action.hover' },
                     '&.Mui-focusVisible': { outline: `2px solid ${PINE}`, outlineOffset: -2 },
                   }}
@@ -346,7 +427,16 @@ export default function App() {
 
           {view === 'certificates' && (
             <Box role="region" aria-label="Certificats" sx={{ height: '100%' }}>
-              <CertificatesView />
+              <CertificatesView
+                onApprove={approveRecovery}
+                completedRecovery={completedRecovery}
+              />
+            </Box>
+          )}
+
+          {view === 'astra' && (
+            <Box role="region" aria-label="Astra" sx={{ height: '100%' }}>
+              <AstraView onRecoveryReady={finishRecovery} />
             </Box>
           )}
 

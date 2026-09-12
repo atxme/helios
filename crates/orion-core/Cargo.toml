@@ -1,6 +1,6 @@
 [package]
 name = "orion-core"
-version = "1.31.3"
+version = "2.0.0"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -11,6 +11,9 @@ description = "Logique du client VPN Orion (config, backend WireGuard, provision
 # compilerait en refusant à l'exécution les profils qui épinglent un
 # certificat — un binaire d'apparence normale qui échoue avant WireGuard.
 aether = { workspace = true, features = ["key-negotiation-signing"] }
+# Rendering a rotation instant as a date. An operator diaries «2026-12-05»,
+# never «1796659573», and this crate produces the message the screen shows.
+time = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
@@ -40,6 +43,10 @@ defguard_wireguard_rs = { workspace = true, optional = true }
 helios-key-negotiation = { workspace = true }
 # Conteneur AEAD partagé des secrets au repos (ADR-006 §2).
 helios-vault = { workspace = true }
+# La frontière matérielle FIDO2 et la **seule** cérémonie qui n'ouvre aucun
+# coffre (§14.1). Orion ne lie ni `astra` ni le format de coffre : la caisse
+# est extraite précisément pour que ce chemin-là soit le seul qu'il ait.
+helios-fido = { workspace = true }
 # Normalisation NFC de la passphrase `nomade` : sans elle, la même phrase
 # saisie sur deux systèmes dérive deux clés différentes (ADR-006 §3).
 unicode-normalization = "0.1"
@@ -94,4 +101,12 @@ certificate-signing = ["aether/key-negotiation-signing"]
 
 [dev-dependencies]
 tempfile = "3"
+# Fixtures only. The renewal path is tested against a **real** CA-TLS issuing a
+# **real** leaf from the CSR the client produced: a grant carrying a hand-made
+# certificate would pass the checks that matter — the CSR binding above all —
+# without ever proving them.
+rcgen = { workspace = true }
+# `CertificateParams::not_before` is an `OffsetDateTime`; rcgen exposes the type
+# without re-exporting the crate that defines it.
+time = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "time", "test-util"] }

@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use super::{
     encoding::{
         validate_server_name, verify_ml_dsa_87, CanonicalBytes, DerCertificate, Fingerprint,
-        MlDsa87PublicKey, MlDsa87Signature, TrustDomainId, WireGuardKey,
+        MlDsa87PublicKey, MlDsa87Signature, SignedTranscript, TrustDomainId, WireGuardKey,
     },
     window::{require_next_generation, TransitionWindow},
     CertificateError, CERTIFICATE_FORMAT_VERSION,
@@ -64,7 +64,7 @@ pub struct CaTransition {
 }
 
 impl CaTransition {
-    fn signing_bytes(&self) -> Vec<u8> {
+    fn signing_bytes(&self) -> SignedTranscript {
         let mut bytes = CanonicalBytes::new(CA_TRANSITION_DOMAIN);
         bytes
             .u16(self.format_version)
@@ -77,7 +77,7 @@ impl CaTransition {
             .u64(self.window.not_before)
             .u64(self.window.activation_at)
             .u64(self.window.not_after);
-        bytes.finish()
+        bytes.finish_signed()
     }
 
     /// SHA-256 of the signed transcript followed by both signatures.
@@ -86,7 +86,7 @@ impl CaTransition {
     /// with the same fields and different signature encodings are two
     /// documents, and the idempotent-replay rule compares this.
     pub fn fingerprint(&self) -> Fingerprint {
-        let mut bytes = CanonicalBytes::new(&self.signing_bytes());
+        let mut bytes = CanonicalBytes::new(self.signing_bytes().as_bytes());
         bytes
             .length_prefixed(self.current_ca_signature.as_bytes())
             .length_prefixed(self.next_ca_signature.as_bytes());
@@ -167,7 +167,7 @@ pub struct ClientTlsCaTransition {
 }
 
 impl ClientTlsCaTransition {
-    fn signing_bytes(&self) -> Vec<u8> {
+    fn signing_bytes(&self) -> SignedTranscript {
         let mut bytes = CanonicalBytes::new(CLIENT_TLS_CA_TRANSITION_DOMAIN);
         bytes
             .u16(self.format_version)
@@ -180,11 +180,11 @@ impl ClientTlsCaTransition {
             .u64(self.window.not_before)
             .u64(self.window.activation_at)
             .u64(self.window.not_after);
-        bytes.finish()
+        bytes.finish_signed()
     }
 
     pub fn fingerprint(&self) -> Fingerprint {
-        let mut bytes = CanonicalBytes::new(&self.signing_bytes());
+        let mut bytes = CanonicalBytes::new(self.signing_bytes().as_bytes());
         bytes.length_prefixed(self.ca_pq_signature.as_bytes());
         Fingerprint::of(&bytes.finish())
     }
@@ -258,7 +258,7 @@ pub enum AllowedUsage {
 }
 
 impl AllowedUsage {
-    const fn domain_byte(self) -> u8 {
+    pub(crate) const fn domain_byte(self) -> u8 {
         match self {
             Self::AdmittedClientLeafRenewal => 1,
         }
@@ -292,7 +292,7 @@ pub struct AstraIssuerAuthorization {
 }
 
 impl AstraIssuerAuthorization {
-    fn signing_bytes(&self) -> Vec<u8> {
+    fn signing_bytes(&self) -> SignedTranscript {
         let mut bytes = CanonicalBytes::new(ISSUER_AUTHORIZATION_DOMAIN);
         bytes
             .u16(self.format_version)
@@ -309,12 +309,12 @@ impl AstraIssuerAuthorization {
             .fingerprint(&self.policy_fingerprint)
             .u64(self.not_before)
             .u64(self.not_after);
-        bytes.finish()
+        bytes.finish_signed()
     }
 
     /// Identifies this delegation in the objects that carry it (spec §7.2).
     pub fn fingerprint(&self) -> Fingerprint {
-        let mut bytes = CanonicalBytes::new(&self.signing_bytes());
+        let mut bytes = CanonicalBytes::new(self.signing_bytes().as_bytes());
         bytes.length_prefixed(self.ca_pq_signature.as_bytes());
         Fingerprint::of(&bytes.finish())
     }
@@ -474,7 +474,7 @@ pub struct AstraServiceKeyTransition {
 }
 
 impl AstraServiceKeyTransition {
-    fn signing_bytes(&self) -> Vec<u8> {
+    fn signing_bytes(&self) -> SignedTranscript {
         let mut bytes = CanonicalBytes::new(SERVICE_KEY_TRANSITION_DOMAIN);
         bytes
             .u16(self.format_version)
@@ -489,11 +489,11 @@ impl AstraServiceKeyTransition {
             .u64(self.window.activation_at)
             .u64(self.window.not_after)
             .u8(self.reason.domain_byte());
-        bytes.finish()
+        bytes.finish_signed()
     }
 
     pub fn fingerprint(&self) -> Fingerprint {
-        let mut bytes = CanonicalBytes::new(&self.signing_bytes());
+        let mut bytes = CanonicalBytes::new(self.signing_bytes().as_bytes());
         bytes
             .length_prefixed(self.current_service_key_signature.as_bytes())
             .length_prefixed(self.next_service_key_signature.as_bytes())
@@ -581,7 +581,7 @@ pub struct EmergencyAstraServiceKeyReplacement {
 }
 
 impl EmergencyAstraServiceKeyReplacement {
-    fn signing_bytes(&self) -> Vec<u8> {
+    fn signing_bytes(&self) -> SignedTranscript {
         let mut bytes = CanonicalBytes::new(SERVICE_KEY_EMERGENCY_DOMAIN);
         bytes
             .u16(self.format_version)
@@ -595,11 +595,11 @@ impl EmergencyAstraServiceKeyReplacement {
             .u64(self.revocation_epoch)
             .u64(self.effective_at)
             .u8(self.reason.domain_byte());
-        bytes.finish()
+        bytes.finish_signed()
     }
 
     pub fn fingerprint(&self) -> Fingerprint {
-        let mut bytes = CanonicalBytes::new(&self.signing_bytes());
+        let mut bytes = CanonicalBytes::new(self.signing_bytes().as_bytes());
         bytes
             .length_prefixed(self.next_service_key_signature.as_bytes())
             .length_prefixed(self.ca_pq_signature.as_bytes());

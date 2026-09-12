@@ -35,7 +35,10 @@
 //! (`libsecret`), and macOS the Keychain — each with its own unlock
 //! semantics, which is why neither is faked here.
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{Context, Result};
 use base64::Engine as _;
@@ -53,6 +56,9 @@ const SEAL_ENTROPY: &[u8] = b"helios-orion-key-negotiation-identity-v1";
 /// disk is a ciphertext, and nothing should invite opening it as text.
 const SEALED_SUFFIX: &str = ".identity";
 
+/// Version of the plaintext record sealed by the platform backend.
+const IDENTITY_RECORD_FORMAT_VERSION: u16 = 1;
+
 /// Bound on a sealed identity, checked before decrypting.
 ///
 /// A legitimate bundle is around 10 KB — two certificates and two private
@@ -65,7 +71,7 @@ const MAX_SEALED_BYTES: usize = 256 * 1024;
 /// Everything is base64: the document that carries it is JSON, and these are
 /// DER and raw byte strings. The two private halves are **secrets** — `Debug`
 /// is masked so an import failure cannot spill them into a log.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientIdentityBundle {
     /// Entry name under which this identity is sealed. The VPN profile
@@ -79,6 +85,219 @@ pub struct ClientIdentityBundle {
     pub pq_certificate: String,
     /// Raw ML-DSA-65 private key (base64). **Secret.**
     pub pq_private_key: String,
+}
+
+/// Whether a retained identity may still be selected for service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreviousIdentityPhase {
+    NotYetAvailable,
+    Available,
+    Expired,
+}
+
+/// Public facts about the second protected slot. No certificate or key leaves
+/// the store through this type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreviousIdentityStatus {
+    pub available_from: u64,
+    pub available_until: u64,
+    pub phase: PreviousIdentityPhase,
+    /// True only while the previous bundle is actually being served.
+    pub selected: bool,
+}
+
+/// One read of the protected record, for inventory callers that need both the
+/// served certificates and the bounded previous-slot status.
+pub struct IdentitySnapshot {
+    pub served: ClientIdentityBundle,
+    pub previous: Option<PreviousIdentityStatus>,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreviousIdentitySlot {
+    bundle: ClientIdentityBundle,
+    available_from: u64,
+    available_until: u64,
+}
+
+/// Non-secret tombstone kept after the outgoing private keys are destroyed.
+/// It lets the UI distinguish an expired window from a profile that never had
+/// a previous identity without retaining any credential material.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetiredIdentityWindow {
+    available_from: u64,
+    available_until: u64,
+}
+
+/// Plaintext format inside DPAPI. Active and previous move in one sealed file,
+/// so replacing the served bundle cannot lose the only rollback copy.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProtectedIdentityRecord {
+    format_version: u16,
+    current: ClientIdentityBundle,
+    previous: Option<PreviousIdentitySlot>,
+    #[serde(default)]
+    retired_previous: Option<RetiredIdentityWindow>,
+    serve_previous: bool,
+}
+
+impl ProtectedIdentityRecord {
+    fn new(current: ClientIdentityBundle) -> Self {
+        Self {
+            format_version: IDENTITY_RECORD_FORMAT_VERSION,
+            current,
+            previous: None,
+            retired_previous: None,
+            serve_previous: false,
+        }
+    }
+
+    fn validate(&self, identity: &str) -> Result<()> {
+        if self.format_version != IDENTITY_RECORD_FORMAT_VERSION {
+            anyhow::bail!(
+                "version d'identité protégée non prise en charge : {}",
+                self.format_version
+            );
+        }
+        self.current.validate()?;
+        if self.current.identity.trim() != identity.trim() {
+            anyhow::bail!("l'identité protégée ne correspond pas au nom demandé");
+        }
+        match &self.previous {
+            Some(previous) => {
+                previous.bundle.validate()?;
+                if previous.bundle.identity.trim() != identity.trim() {
+                    anyhow::bail!("l'identité précédente ne correspond pas au nom demandé");
+                }
+                if previous.available_from >= previous.available_until {
+                    anyhow::bail!("la fenêtre de retour à l'identité précédente est vide");
+                }
+            }
+            None if self.serve_previous => {
+                anyhow::bail!("le magasin sélectionne une identité précédente absente");
+            }
+            None => {}
+        }
+        if let Some(retired) = self.retired_previous {
+            if self.previous.is_some() {
+                anyhow::bail!("une identité précédente active et son tombstone coexistent");
+            }
+            if retired.available_from >= retired.available_until {
+                anyhow::bail!("la fenêtre retirée de l'identité précédente est vide");
+            }
+        }
+        Ok(())
+    }
+
+    fn previous_status(&self, now_unix: u64) -> Option<PreviousIdentityStatus> {
+        let (available_from, available_until, selectable) = if let Some(previous) = &self.previous {
+            (previous.available_from, previous.available_until, true)
+        } else {
+            let retired = self.retired_previous?;
+            (retired.available_from, retired.available_until, false)
+        };
+        let phase = if selectable {
+            if now_unix < available_from {
+                PreviousIdentityPhase::NotYetAvailable
+            } else if now_unix < available_until {
+                PreviousIdentityPhase::Available
+            } else {
+                PreviousIdentityPhase::Expired
+            }
+        } else {
+            PreviousIdentityPhase::Expired
+        };
+        Some(PreviousIdentityStatus {
+            available_from,
+            available_until,
+            phase,
+            selected: selectable
+                && self.serve_previous
+                && phase == PreviousIdentityPhase::Available,
+        })
+    }
+
+    fn served_at(&self, now_unix: u64) -> &ClientIdentityBundle {
+        match (&self.previous, self.previous_status(now_unix)) {
+            (Some(previous), Some(status))
+                if self.serve_previous && status.phase == PreviousIdentityPhase::Available =>
+            {
+                &previous.bundle
+            }
+            _ => &self.current,
+        }
+    }
+
+    fn promote(
+        &mut self,
+        candidate: ClientIdentityBundle,
+        available_from: u64,
+        available_until: u64,
+    ) -> Result<bool> {
+        if available_from >= available_until {
+            anyhow::bail!("la fenêtre de retour à l'identité précédente est vide");
+        }
+        if self.current == candidate {
+            let same_window = self.previous.as_ref().is_some_and(|previous| {
+                previous.available_from == available_from
+                    && previous.available_until == available_until
+            });
+            if !same_window {
+                anyhow::bail!("le candidat est déjà actif sans la fenêtre précédente attendue");
+            }
+            return Ok(false);
+        }
+        if self
+            .previous
+            .as_ref()
+            .is_some_and(|previous| available_from < previous.available_until)
+        {
+            anyhow::bail!("une identité précédente non expirée occupe déjà le second slot");
+        }
+        let outgoing = std::mem::replace(&mut self.current, candidate);
+        self.previous = Some(PreviousIdentitySlot {
+            bundle: outgoing,
+            available_from,
+            available_until,
+        });
+        self.retired_previous = None;
+        self.serve_previous = false;
+        Ok(true)
+    }
+
+    fn select_previous(&mut self, now_unix: u64) -> Result<PreviousIdentityStatus> {
+        let status = self
+            .previous_status(now_unix)
+            .ok_or_else(|| anyhow::anyhow!("aucune identité précédente n'est conservée"))?;
+        if status.phase != PreviousIdentityPhase::Available {
+            anyhow::bail!("l'identité précédente est hors de sa fenêtre de chevauchement");
+        }
+        self.serve_previous = true;
+        Ok(PreviousIdentityStatus {
+            selected: true,
+            ..status
+        })
+    }
+
+    fn retire_previous(&mut self, now_unix: u64) -> bool {
+        let due = self
+            .previous
+            .as_ref()
+            .is_some_and(|previous| now_unix >= previous.available_until);
+        if due {
+            self.retired_previous = self.previous.take().map(|previous| RetiredIdentityWindow {
+                available_from: previous.available_from,
+                available_until: previous.available_until,
+            });
+            self.serve_previous = false;
+        }
+        due
+    }
 }
 
 impl std::fmt::Debug for ClientIdentityBundle {
@@ -206,9 +425,119 @@ impl ProtectedIdentityStore {
     /// cannot leave a truncated blob where a valid one used to be.
     pub fn store(&self, bundle: &ClientIdentityBundle) -> Result<PathBuf> {
         bundle.validate()?;
-        let path = self.path_of(&bundle.identity)?;
+        self.write_record(
+            &bundle.identity,
+            &ProtectedIdentityRecord::new(bundle.clone()),
+        )
+    }
+
+    /// Opens a sealed identity.
+    pub fn load(&self, identity: &str) -> Result<ClientIdentityBundle> {
+        self.load_at(identity, unix_now()?)
+    }
+
+    /// Opens whichever bundle the local service selector names at this instant.
+    pub fn load_at(&self, identity: &str, now_unix: u64) -> Result<ClientIdentityBundle> {
+        Ok(self.snapshot_at(identity, now_unix)?.served)
+    }
+
+    /// Reads the served bundle and the bounded previous slot with one unseal.
+    pub fn snapshot_at(&self, identity: &str, now_unix: u64) -> Result<IdentitySnapshot> {
+        let record = self.read_record(identity)?;
+        Ok(IdentitySnapshot {
+            served: record.served_at(now_unix).clone(),
+            previous: record.previous_status(now_unix),
+        })
+    }
+
+    /// Replaces the served identity while retaining the outgoing one in the
+    /// same sealed write for exactly the signed overlap window.
+    pub(crate) fn promote_with_previous(
+        &self,
+        identity: &str,
+        candidate: &ClientIdentityBundle,
+        available_from: u64,
+        available_until: u64,
+    ) -> Result<bool> {
+        let mut record = self.read_record(identity)?;
+        let mut promoted = candidate.clone();
+        promoted.identity = identity.trim().to_string();
+        promoted.validate()?;
+        if !record.promote(promoted, available_from, available_until)? {
+            return Ok(false);
+        }
+        record.validate(identity)?;
+        self.write_record(identity, &record)?;
+        Ok(true)
+    }
+
+    /// Selects the outgoing bundle without changing either certificate state
+    /// or generation counters.
+    ///
+    /// `validate` runs on the exact record that will be written. This lets the
+    /// lifecycle compare both bundles with its authoritative active/next state
+    /// before a restored or substituted file can move the service selector.
+    pub(crate) fn select_previous<F>(
+        &self,
+        identity: &str,
+        now_unix: u64,
+        validate: F,
+    ) -> Result<PreviousIdentityStatus>
+    where
+        F: FnOnce(&ClientIdentityBundle, &ClientIdentityBundle) -> Result<()>,
+    {
+        let mut record = self.read_record(identity)?;
+        let previous = record
+            .previous
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("aucune identité précédente n'est conservée"))?;
+        validate(&record.current, &previous.bundle)?;
+        let status = record.select_previous(now_unix)?;
+        record.validate(identity)?;
+        self.write_record(identity, &record)?;
+        Ok(status)
+    }
+
+    /// Destroys an outgoing private identity once its overlap has ended.
+    pub(crate) fn retire_previous(&self, identity: &str, now_unix: u64) -> Result<bool> {
+        let mut record = self.read_record(identity)?;
+        if !record.retire_previous(now_unix) {
+            return Ok(false);
+        }
+        self.write_record(identity, &record)?;
+        Ok(true)
+    }
+
+    fn read_record(&self, identity: &str) -> Result<ProtectedIdentityRecord> {
+        let path = self.path_of(identity)?;
+        let sealed =
+            read_bounded(&path).map_err(|_| IdentityStoreError::NotFound(identity.to_string()))?;
+        let plaintext = unseal(&sealed)?;
+        let record = match serde_json::from_slice::<ProtectedIdentityRecord>(&plaintext) {
+            Ok(record) => record,
+            Err(record_error) => {
+                // Compatibility with every identity sealed before the second
+                // slot existed. A rewrite migrates it to the envelope; a read
+                // never needs a destructive migration merely to connect.
+                let bundle: ClientIdentityBundle = serde_json::from_slice(&plaintext).with_context(
+                    || {
+                        format!(
+                            "l'identité descellée n'a ni le format courant ({record_error}) ni le format historique"
+                        )
+                    },
+                )?;
+                ProtectedIdentityRecord::new(bundle)
+            }
+        };
+        record.validate(identity)?;
+        Ok(record)
+    }
+
+    fn write_record(&self, identity: &str, record: &ProtectedIdentityRecord) -> Result<PathBuf> {
+        record.validate(identity)?;
+        let path = self.path_of(identity)?;
         let plaintext = Zeroizing::new(
-            serde_json::to_vec(bundle).context("encodage de l'identité avant scellement")?,
+            serde_json::to_vec(record).context("encodage de l'identité avant scellement")?,
         );
         let sealed = seal(&plaintext)?;
 
@@ -217,18 +546,6 @@ impl ProtectedIdentityStore {
         aether::private_file::write_private_atomic(&path, &sealed)
             .with_context(|| format!("remplacement atomique de {}", path.display()))?;
         Ok(path)
-    }
-
-    /// Opens a sealed identity.
-    pub fn load(&self, identity: &str) -> Result<ClientIdentityBundle> {
-        let path = self.path_of(identity)?;
-        let sealed =
-            read_bounded(&path).map_err(|_| IdentityStoreError::NotFound(identity.to_string()))?;
-        let plaintext = unseal(&sealed)?;
-        let bundle: ClientIdentityBundle = serde_json::from_slice(&plaintext)
-            .context("l'identité descellée n'a pas le format attendu")?;
-        bundle.validate()?;
-        Ok(bundle)
     }
 
     /// Is an identity of this name already sealed on this machine?
@@ -240,6 +557,13 @@ impl ProtectedIdentityStore {
         self.path_of(identity)
             .is_ok_and(|path| std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file()))
     }
+}
+
+fn unix_now() -> Result<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .context("l'horloge système précède l'époque Unix")
 }
 
 fn read_bounded(path: &Path) -> Result<Vec<u8>> {
@@ -582,6 +906,78 @@ mod tests {
         assert!(read_bounded(&directory.join("missing.identity")).is_err());
 
         std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn promotion_keeps_the_outgoing_bundle_until_the_overlap_ends() {
+        let outgoing = bundle();
+        let mut incoming = outgoing.clone();
+        incoming.pq_private_key = base64::engine::general_purpose::STANDARD.encode([9u8; 64]);
+        let mut record = ProtectedIdentityRecord::new(outgoing.clone());
+
+        assert!(record
+            .promote(incoming.clone(), 2_000, 3_000)
+            .expect("promoted"));
+        assert_eq!(record.current, incoming);
+        assert_eq!(
+            record.previous.as_ref().map(|slot| &slot.bundle),
+            Some(&outgoing)
+        );
+        assert_eq!(
+            record.previous_status(2_000).map(|status| status.phase),
+            Some(PreviousIdentityPhase::Available)
+        );
+
+        record
+            .select_previous(2_100)
+            .expect("selected during overlap");
+        assert_eq!(record.served_at(2_100), &outgoing);
+        assert_eq!(
+            record.previous_status(2_100).map(|status| status.selected),
+            Some(true)
+        );
+
+        assert_ne!(record.served_at(3_000), &outgoing);
+        assert!(record.select_previous(3_000).is_err());
+        assert!(record.retire_previous(3_000));
+        assert!(record.previous.is_none());
+        assert!(!record.serve_previous);
+        let retired_record = serde_json::to_string(&record).expect("serialized tombstone");
+        assert!(!retired_record.contains(&outgoing.pq_private_key));
+        assert_eq!(
+            record.previous_status(3_001).map(|status| status.phase),
+            Some(PreviousIdentityPhase::Expired)
+        );
+    }
+
+    #[test]
+    fn replaying_promotion_preserves_an_explicit_service_rollback() {
+        let outgoing = bundle();
+        let mut incoming = outgoing.clone();
+        incoming.pq_private_key = base64::engine::general_purpose::STANDARD.encode([9u8; 64]);
+        let mut record = ProtectedIdentityRecord::new(outgoing.clone());
+        record
+            .promote(incoming.clone(), 2_000, 3_000)
+            .expect("promoted");
+        record.select_previous(2_100).expect("selected");
+
+        assert!(!record
+            .promote(incoming, 2_000, 3_000)
+            .expect("idempotent promotion"));
+        assert_eq!(record.served_at(2_200), &outgoing);
+    }
+
+    #[test]
+    fn a_second_previous_slot_is_refused_while_the_first_is_live() {
+        let outgoing = bundle();
+        let mut first = outgoing.clone();
+        first.pq_private_key = base64::engine::general_purpose::STANDARD.encode([8u8; 64]);
+        let mut second = outgoing.clone();
+        second.pq_private_key = base64::engine::general_purpose::STANDARD.encode([9u8; 64]);
+        let mut record = ProtectedIdentityRecord::new(outgoing);
+        record.promote(first, 2_000, 3_000).expect("first");
+
+        assert!(record.promote(second, 2_500, 4_000).is_err());
     }
 
     #[test]

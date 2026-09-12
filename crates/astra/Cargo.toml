@@ -1,6 +1,6 @@
 [package]
 name = "astra"
-version = "0.1.0"
+version = "0.2.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -14,15 +14,23 @@ path = "src/main.rs"
 aether = { workspace = true, features = ["key-negotiation-signing"] }
 # Conteneur AEAD unique du dépôt (ADR-006) : le coffre d'autorité en empile
 # trois — un par key-slot, plus le corps — au lieu d'inventer un format.
-helios-vault.workspace = true
+# Les deux bouts du canal privé Astra–Helios (ROTATION-CERTIFICATS §8.3) sont
+# définis dans `helios_api::internal`, et Astra en consomme la moitié cliente.
+# La dépendance se lit à l'envers — l'autorité vers l'API de la gateway — et
+# c'est délibéré : la seule alternative est une seconde copie du vérificateur
+# épinglé, de l'ALPN et du plancher de version, c'est-à-dire l'endroit exact où
+# « la reprise est refusée » devient vrai d'un côté et faux de l'autre.
+helios-api.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
-aws-lc-rs.workspace = true
 axum.workspace = true
 base64.workspace = true
 clap.workspace = true
 rcgen.workspace = true
-reqwest.workspace = true
+# La configuration TLS du listener privé. Le type traverse l'API de
+# `helios_api::internal`, qui la construit ; `astra` doit pouvoir la nommer
+# pour la porter jusqu'au serveur.
+rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -34,10 +42,16 @@ zeroize.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+# Le canal privé s'éprouve de bout en bout sur la boucle locale : listener
+# `helios-api` d'un côté, client `astra::gateway` de l'autre, un vrai
+# handshake mTLS entre les deux.
+async-trait.workspace = true
+axum.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
 # Les tests d'intégration du binaire lancent `astra` comme le fait un
 # opérateur, et fabriquent le matériel d'entrée (clé publique `CA-PQ`) avec les
 # mêmes types que la production.
 aether = { workspace = true, features = ["key-negotiation-signing"] }
 # Conteneur AEAD unique du dépôt (ADR-006) : le coffre d'autorité en empile
 # trois — un par key-slot, plus le corps — au lieu d'inventer un format.
-helios-vault.workspace = true

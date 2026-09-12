@@ -640,6 +640,8 @@ mod tests {
         write_file(root, "systemd/heliosd.service", b"[Unit]");
         write_file(root, "systemd/helios-update.service", b"[Unit]");
         write_file(root, "systemd/helios-update.path", b"[Path]");
+        write_file(root, "systemd/helios-log-prune.service", b"[Unit]");
+        write_file(root, "systemd/helios-log-prune.timer", b"[Unit]");
         write_file(root, "network.toml.example", b"wan_iface = \"eth0\"");
     }
 
@@ -704,6 +706,9 @@ mod tests {
         assert!(target.join("etc/systemd/system/heliosd.service").is_file());
         assert!(target
             .join("etc/systemd/system/helios-update.path")
+            .is_file());
+        assert!(target
+            .join("etc/systemd/system/helios-log-prune.timer")
             .is_file());
         assert!(target.join("var/lib/helios/network.toml").is_file());
         assert_eq!(

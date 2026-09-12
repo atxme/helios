@@ -23,7 +23,10 @@
 
 pub mod backend;
 pub mod certificate_actions;
+pub mod certificate_approval;
 pub mod certificate_inventory;
+pub mod certificate_recovery;
+pub mod certificate_renewal;
 pub mod certificates;
 pub mod config;
 pub mod events;
@@ -31,21 +34,28 @@ pub mod identity_store;
 pub mod key_negotiation;
 pub mod mtu;
 pub mod net_pin;
+pub mod operator_pending;
 pub mod profile_import;
 pub mod provisioning;
 pub mod speedtest;
 pub mod telemetry;
+#[cfg(all(test, feature = "certificate-signing"))]
+pub(crate) mod test_domain;
+pub mod trust_update;
 pub mod vault;
 
 pub use backend::{default_backend, EventSink, VpnBackend, VpnController, HANDSHAKE_STALE_AFTER};
 pub use certificate_actions::{CertificateAction, CertificateActionBlock, CertificateActionState};
 pub use certificate_inventory::{CertificateFacts, CertificateInventory, CertificatePhase};
 pub use config::{
-    ClientConfig, ClientProfile, KeyNegotiationSettings, DEFAULT_ALLOWED_IPS,
-    DEFAULT_KEEPALIVE_SECS,
+    verify_pinned_gateway_certificate, ClientConfig, ClientProfile, KeyNegotiationSettings,
+    ProfileKind, TrustMaterial, DEFAULT_ALLOWED_IPS, DEFAULT_KEEPALIVE_SECS,
 };
 pub use events::{ClientEvent, PskKind};
-pub use identity_store::{ClientIdentityBundle, IdentityStoreError, ProtectedIdentityStore};
+pub use identity_store::{
+    ClientIdentityBundle, IdentityStoreError, PreviousIdentityPhase, PreviousIdentityStatus,
+    ProtectedIdentityStore,
+};
 pub use profile_import::{
     complete_profile_import, inspect_profile, parse_profile_import, read_profile_import_path,
     CompletedImport, ProfileImport, ProfileIssues, MAX_PROFILE_IMPORT_BYTES,

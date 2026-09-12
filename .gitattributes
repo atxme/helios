@@ -1,0 +1,18 @@
+# Keep text files stable across platforms.
+* text=auto eol=lf
+
+# Files that must not be treated as text.
+*.dll binary
+*.exe binary
+*.gif binary
+*.ico binary
+*.jpg binary
+*.jpeg binary
+*.msi binary
+*.pdf binary
+*.png binary
+*.tar binary
+*.gz binary
+*.zip binary
+*.woff binary
+*.woff2 binary

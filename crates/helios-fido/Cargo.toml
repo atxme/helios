@@ -1,0 +1,34 @@
+[package]
+name = "helios-fido"
+version = "0.1.1"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Frontière matérielle FIDO2 et approbation de renouvellement — la seule cérémonie qui n'ouvre aucun coffre (ADR-008 §4, ROTATION-CERTIFICATS §14.1)."
+
+[dependencies]
+# Les objets signés et la vérification d'assertion. Aucune feature de
+# signature : cette caisse ne signe rien — elle fait signer une clé matérielle,
+# ce qui n'est pas la même opération et n'exige aucune clé privée en mémoire.
+aether = { workspace = true }
+anyhow.workspace = true
+aws-lc-rs.workspace = true
+base64.workspace = true
+thiserror.workspace = true
+# Pile CTAP2 sur HID, avec l'extension `hmac-secret`. Sans condition : un
+# binaire qui ne parle à aucune clé n'approuve rien, et il n'existe aucun
+# chemin qui approuve sans clé. Elle tire `hidapi`, donc `libudev` sous Linux
+# (scripts/setup-dev.sh).
+ctap-hid-fido2 = { version = "3.5", default-features = false, features = ["aws-lc-rs"] }
+
+# API WebAuthn de Windows, générée depuis les métadonnées Microsoft : aucune
+# déclaration FFI écrite à la main. C'est le chemin qui n'exige pas
+# d'élévation — et celui où le PIN est collecté par le système, donc n'entre
+# jamais dans ce processus. C'est aussi le seul utilisable depuis Orion, qui
+# tourne sous le compte de l'utilisateur.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WindowsWebServices",
+    "Win32_System_Console",
+] }

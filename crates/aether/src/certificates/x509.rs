@@ -343,6 +343,27 @@ pub fn subject_public_key_info(certificate: &DerCertificate) -> Result<Vec<u8>, 
     Ok(parse(certificate.as_bytes())?.public_key().raw.to_vec())
 }
 
+/// The `SubjectPublicKeyInfo` a PKCS#10 request proves possession of.
+///
+/// The same bytes [`subject_public_key_info`] reads from a certificate, taken
+/// from the request instead — so a decision made **before** issuance and a
+/// check made **after** it compare one value rather than two descriptions of
+/// it. The request's self-signature is verified first: pinning a key nobody
+/// proved they hold would pin whatever the file happened to contain.
+pub fn certification_request_public_key_info(
+    csr: &DerCertificate,
+) -> Result<Vec<u8>, CertificateError> {
+    let (rest, request) = X509CertificationRequest::from_der(csr.as_bytes())
+        .map_err(|_| CertificateError::InvalidX509("unparsable CSR"))?;
+    if !rest.is_empty() {
+        return Err(CertificateError::InvalidX509("trailing bytes after CSR"));
+    }
+    request
+        .verify_signature()
+        .map_err(|_| CertificateError::InvalidX509("CSR signature does not verify"))?;
+    Ok(request.certification_request_info.subject_pki.raw.to_vec())
+}
+
 /// The leaf certifies the key the CSR proved possession of.
 ///
 /// The signature on a grant says the authority meant to issue *something*; it
@@ -372,6 +393,70 @@ pub fn assert_csr_matches(
     }
     Ok(())
 }
+
+/// Signing side: the material a client generates before asking to be renewed.
+///
+/// Kept in `aether` rather than in Orion because the shape of the request is
+/// not the client's to choose. `CA-TLS` will only certify a leaf whose
+/// `keyUsage` and `extendedKeyUsage` are the ones [`assert_client_leaf`]
+/// checks for, and a CSR built a hundred lines away from that check drifts
+/// from it silently — the divergence surfaces as a refusal from the authority
+/// at 80 % of a leaf's life, with nothing on the client naming the field that
+/// is wrong.
+#[cfg(feature = "key-negotiation-signing")]
+mod signing {
+    use super::*;
+    use rcgen::{
+        CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
+        KeyUsagePurpose,
+    };
+    use zeroize::Zeroizing;
+
+    /// A fresh TLS key pair and the PKCS#10 request that proves possession.
+    ///
+    /// The private half never leaves the process that will hold the resulting
+    /// certificate: the CSR is what travels, and it carries only the public
+    /// key and a self-signature over it.
+    pub struct ClientRotationCsr {
+        /// PKCS#10, DER — what goes into the rotation request.
+        pub csr: DerCertificate,
+        /// PKCS#8, DER. **Secret.**
+        pub private_key_der: Zeroizing<Vec<u8>>,
+    }
+
+    /// Builds the CSR for a client leaf renewal (spec §7.1).
+    ///
+    /// `subject` is the common name the operator admitted this client under.
+    /// It is carried through unchanged: the authority decides what the leaf
+    /// finally says, and a client that renamed itself here would be asking for
+    /// a different identity rather than for a new certificate.
+    pub fn client_rotation_csr(subject: &str) -> Result<ClientRotationCsr, CertificateError> {
+        let subject = subject.trim();
+        if subject.is_empty() {
+            return Err(CertificateError::InvalidX509("empty CSR subject"));
+        }
+        let mut params = CertificateParams::new(Vec::<String>::new())
+            .map_err(|_| CertificateError::InvalidX509("CSR parameters"))?;
+        params.is_ca = IsCa::NoCa;
+        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        let mut name = DistinguishedName::new();
+        name.push(DnType::CommonName, subject);
+        params.distinguished_name = name;
+
+        let key = KeyPair::generate().map_err(|_| CertificateError::Signing)?;
+        let csr = params
+            .serialize_request(&key)
+            .map_err(|_| CertificateError::Signing)?;
+        Ok(ClientRotationCsr {
+            csr: DerCertificate::new(csr.der().to_vec())?,
+            private_key_der: Zeroizing::new(key.serialize_der()),
+        })
+    }
+}
+
+#[cfg(feature = "key-negotiation-signing")]
+pub use signing::{client_rotation_csr, ClientRotationCsr};
 
 #[cfg(test)]
 mod tests {
@@ -616,6 +701,29 @@ mod tests {
         assert!(matches!(
             assert_chains_to(&leaf, &[], &[&ca_der], activation, anchor.not_after),
             Err(CertificateError::InvalidX509("unusable chain link"))
+        ));
+    }
+
+    /// The value pinned before issuance and the value read after it are the
+    /// same bytes, or the check made before the operator's touch decides
+    /// nothing about what was actually certified.
+    #[test]
+    fn a_request_and_the_certificate_it_produced_name_one_public_key() {
+        let (_, ca, ca_key) = authority("ca");
+        let (leaf, csr, _) = client_leaf(&ca, &ca_key);
+        assert_eq!(
+            certification_request_public_key_info(&csr).expect("csr spki"),
+            subject_public_key_info(&leaf).expect("leaf spki")
+        );
+
+        // Proof of possession, not a claim: a request whose signature was
+        // stripped pins a key nobody showed they hold.
+        let mut tampered = csr.as_bytes().to_vec();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0x01;
+        assert!(matches!(
+            certification_request_public_key_info(&DerCertificate::new(tampered).expect("der")),
+            Err(CertificateError::InvalidX509(_))
         ));
     }
 

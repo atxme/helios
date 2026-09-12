@@ -57,12 +57,8 @@ pub struct DeviceRootKey(Zeroizing<[u8; KEY_LEN]>);
 impl DeviceRootKey {
     /// Draws a new installation root.
     pub fn generate() -> Result<Self, VaultError> {
-        use aws_lc_rs::rand::{SecureRandom as _, SystemRandom};
-
         let mut key = Zeroizing::new([0u8; KEY_LEN]);
-        SystemRandom::new()
-            .fill(key.as_mut())
-            .map_err(|_| VaultError::Rng)?;
+        aether::random::fill_secret(key.as_mut()).map_err(|_| VaultError::Rng)?;
         Ok(Self(key))
     }
 

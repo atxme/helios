@@ -155,16 +155,13 @@ fn publish_temporary(temporary: &Path, destination: &Path) -> std::io::Result<()
 
 /// Builds a temporary path nobody else is using.
 ///
-/// The randomness comes from the OS CSPRNG rather than a counter or a PID: two
-/// processes started in the same second must not collide, and a predictable
-/// name is exactly what lets someone else create the file first.
+/// The randomness comes from the approved DRBG rather than a counter or a PID:
+/// two processes started in the same second must not collide, and a
+/// predictable name is exactly what lets someone else create the file first.
 fn unique_temporary(path: &Path) -> std::io::Result<std::path::PathBuf> {
-    use aws_lc_rs::rand::{SecureRandom as _, SystemRandom};
-
     let mut suffix = [0u8; 8];
-    SystemRandom::new().fill(&mut suffix).map_err(|_| {
-        std::io::Error::other("system CSPRNG unavailable for the temporary file name")
-    })?;
+    crate::random::fill_public(&mut suffix)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
     let suffix: String = suffix.iter().map(|byte| format!("{byte:02x}")).collect();
     let name = path
         .file_name()

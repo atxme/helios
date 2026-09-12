@@ -97,10 +97,10 @@ des signatures valides.
 
 ### 5. Réception par l’API
 
-Le navigateur envoie le manifeste puis le binaire par fragments base64 JSON.
-Cette forme conserve l’invariant selon lequel toute mutation de l’API est du
-JSON, borne la mémoire du daemon et n’ajoute ni `multipart`, ni URL distante,
-ni règle de sortie au kill-switch.
+Le navigateur ou `helios-ctl app-update` envoie le manifeste puis le binaire
+par fragments base64 JSON. Cette forme conserve l'invariant selon lequel toute
+mutation de l'API est du JSON, borne la mémoire du daemon et n'ajoute ni
+`multipart`, ni URL distante, ni règle de sortie au kill-switch.
 
 Le staging écrit sous `/var/lib/helios/updates`. La finalisation vérifie à
 nouveau taille, hash, canal, target et signatures. L’activation exige la chaîne
@@ -122,6 +122,23 @@ nouveau taille, hash, canal, target et signatures. L’activation exige la chaî
 Le helper possède uniquement les droits nécessaires sur `/opt/helios`, l’état
 de mise à jour et le contrôle du service. Il ne télécharge rien et revérifie les
 octets même si `heliosd` les a déjà acceptés.
+
+Deux conséquences de l’étape 5, qui ne se voient qu’en service.
+
+`/run/helios` est le seul point de rendez-vous entre les deux processus, et
+c’est un répertoire d’exécution que le démon détruit en s’arrêtant — dont
+l’arrêt que l’installateur provoque lui-même à l’étape 4. Les deux unités le
+déclarent donc en `RuntimeDirectory` et le préservent : sous
+`ProtectSystem=strict`, un `ReadWritePaths` dont le répertoire manque au
+montage est ignoré **sans un mot**, et le service démarre avec un `/run` en
+lecture seule.
+
+La version que le manifeste porte est celle du **binaire livré**, jamais celle
+du workspace : c’est elle que le marqueur de disponibilité publie, et la
+comparaison de l’étape 5 lit les deux. Étiqueter une release avec un autre
+numéro rend son contrôle de santé structurellement infaisable — le démon
+démarre, l’installateur ne le reconnaît pas, et restaure une version qui
+n’avait pas échoué.
 
 Avant de sortir sur `SIGTERM`, `heliosd` repasse en `TunnelState::Down`, engage
 le pare-feu fail-closed puis démonte WireGuard. Le kill-switch reste installé.

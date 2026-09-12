@@ -116,7 +116,31 @@ admin_iface = "helios0"
 # escrow_public_key = "<clé publique X25519 de l'opérateur, base64>"
 
 # Optionnel : SSH d'administration autorisé même kill-switch engagé.
+#
+# Filtre sur l'adresse source seule, sans contrainte d'interface. Une adresse
+# que la gateway n'atteint qu'à travers un de ses propres overlays n'a donc
+# rien à faire ici : la règle ne tient que tant que l'overlay tient. Helios
+# refuse désormais toute entrée située dans le réseau du tunnel.
 # allow_ssh_from = ["10.0.0.0/8"]
+
+# ── Accès d'administration hors-bande ────────────────────────────────────────
+# Interfaces sur lesquelles SSH reste ouvert quel que soit l'état du tunnel :
+# le chemin de retour quand c'est Helios lui-même qui est tombé.
+#
+# Filtré par interface et non par adresse, pour deux raisons. La sécurité
+# d'abord : seul le démon de l'overlay pose des paquets sur son interface, et
+# seulement après avoir authentifié le pair — un `iifname` n'est pas
+# satisfaisable par une source falsifiée depuis le WAN, contrairement à une
+# entrée de `allow_ssh_from`. L'exploitation ensuite : un overlay n'a pas *une*
+# adresse. Tailscale en porte une v4 et une v6, celle de NordVPN suit le
+# serveur choisi, et les deux peuvent être réattribuées sans préavis. Les
+# énumérer ici voudrait dire que le chemin de secours cesse de correspondre le
+# jour où l'adresse bouge — c'est-à-dire le jour où on en a besoin. Une règle
+# par interface couvre toutes les adresses qu'elle portera, v4 comme v6.
+#
+# Ne doit jamais nommer l'interface Helios (c'est `allow_ssh_over_tunnel`) ni
+# une interface WAN : Helios refuse les deux.
+# admin_ifaces = ["tailscale0", "nordlynx"]
 
 # ── Adresse du WAN obtenue par bail DHCP ─────────────────────────────────────
 # Le kill-switch n'ouvre pas DHCP par défaut : une gateway a normalement une
@@ -181,12 +205,14 @@ allow_gateway_egress = true
 # Meshnet est un second overlay WireGuard local, jamais une interface WAN.
 # Helios autorise son transport Internet uniquement quand libtelio porte la
 # marque 0xe1f1, puis borne le trafic applicatif à nordlynx, aux pairs nommés
-# ici et aux seuls ports entrants nécessaires. Le pair ci-dessous est celui
-# observé sur cette gateway ; TCP 22 convient à Borg/Restic/rsync sur SSH et
-# TCP 49111 au service Nord Fileshare. Le routage Internet est accordé à ce
-# pair, mais l'accès aux réseaux privés reste fermé. Le déploiement reconstruit
-# ces deux listes depuis les permissions que NordVPN porte dans nftables.
-nordvpn_meshnet = { iface = "nordlynx", fwmark = 0xe1f1, peer_cidrs = ["100.70.36.212/32"], traffic_routing_peer_cidrs = ["100.70.36.212/32"], local_network_peer_cidrs = [], inbound_tcp_ports = [22, 49111], inbound_udp_ports = [], allow_icmp = true }
+# ici et aux seuls ports entrants nécessaires. Les pairs ci-dessous sont ceux
+# observés sur cette gateway ; TCP 22 convient à Borg/Restic/rsync sur SSH et
+# TCP 49111 au service Nord Fileshare. Le routage Internet n'est accordé qu'aux
+# pairs qui le tiennent déjà de NordVPN, et l'accès aux réseaux privés reste
+# fermé. Le déploiement reconstruit ces trois listes depuis l'inventaire de
+# `wg show nordlynx` et les permissions que NordVPN porte dans nftables : un
+# poste ajouté au Meshnet n'entre ici qu'au déploiement suivant.
+nordvpn_meshnet = { iface = "nordlynx", fwmark = 0xe1f1, peer_cidrs = ["100.70.36.212/32", "100.127.32.93/32"], traffic_routing_peer_cidrs = ["100.70.36.212/32"], local_network_peer_cidrs = [], inbound_tcp_ports = [22, 49111], inbound_udp_ports = [], allow_icmp = true }
 
 # ── ICMP sur le tunnel ───────────────────────────────────────────────────────
 # Ouvert par défaut, contrairement à tout le reste de ce fichier, et l'écart

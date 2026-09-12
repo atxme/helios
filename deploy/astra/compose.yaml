@@ -51,6 +51,22 @@ services:
       - --expected-audit-head
       - ${ASTRA_EXPECTED_AUDIT_HEAD:?relever la tête d_audit imprimée au bootstrap}
 
+    # Le canal privé Astra–Helios (ROTATION-CERTIFICATS §8.3), dans ses deux
+    # sens. Les quatre valeurs sortent de `astra init-channel` et de `heliosd
+    # init-astra-channel`, et `deploy.sh` les écrit dans le `.env` — aucune ne
+    # se recopie à la main.
+    #
+    # Les deux premières sont la direction qu'Astra appelle : staging d'un
+    # candidat et lecture d'un reçu. Les deux suivantes sont celle qu'il
+    # **écoute**, où la gateway relaie le renouvellement d'un client (§8.1.2).
+    # Chaque moitié est indépendante : absente, elle est journalisée et l'autre
+    # continue de fonctionner.
+    environment:
+      ASTRA_GATEWAY_CHANNEL: ${ASTRA_GATEWAY_CHANNEL:-}
+      ASTRA_GATEWAY_CERTIFICATE: ${ASTRA_GATEWAY_CERTIFICATE:-}
+      ASTRA_PRIVATE_BIND: ${ASTRA_PRIVATE_BIND:-}
+      ASTRA_GATEWAY_CLIENT_CERTIFICATE: ${ASTRA_GATEWAY_CLIENT_CERTIFICATE:-}
+
     # Aucune capacité, rootfs en lecture seule, pas d'escalade. Astra n'ouvre
     # qu'un socket TCP et n'écrit que dans son volume.
     read_only: true
@@ -71,7 +87,15 @@ services:
       - astra-state:/var/lib/astra
 
     networks:
-      - astra-public
+      # Adresse fixe ici aussi, et pour la même raison qu'en dessous : le
+      # pare-feu nomme la cible plutôt que d'ouvrir une interface entière.
+      astra-public:
+        ipv4_address: 10.88.7.10
+      # Le veth privé du §8.3. Adresse fixe : `heliosd` écoute sur l'autre bout
+      # et n'accepte qu'une identité épinglée, donc les deux extrémités sont
+      # nommées une fois pour toutes plutôt que découvertes.
+      astra-private:
+        ipv4_address: 10.88.7.2
 
     # Publié sur la boucle locale seulement : le terminateur TLS est devant.
     # Exposer 8443 sur l'hôte servirait du HTTP clair au monde.
@@ -92,5 +116,46 @@ volumes:
   astra-state:
 
 networks:
+  # L'origine publique, publiée sur la boucle locale et traduite par Docker
+  # vers ce pont.
+  #
+  # Nom de pont et plage figés, alors que Docker sait les inventer : c'est ce
+  # qui permet au pare-feu d'ouvrir la sortie de la gateway vers *cette*
+  # adresse et ce port, au lieu d'ouvrir une interface dont le nom change à
+  # chaque recréation. Sans cette ouverture, le paquet traduit sortait par un
+  # pont que la chaîne `output` en `drop` ne connaissait pas, et l'autorité
+  # était injoignable depuis sa propre machine — donc la récupération d'une
+  # identité expirée (ADR-008 §7.5) aussi, elle dont c'est tout l'objet.
+  #
+  # Pas `internal: true` : ce réseau porte la publication de port. C'est le
+  # `forward` en `drop` du pare-feu, et lui seul, qui empêche le conteneur de
+  # sortir par la gateway.
   astra-public:
     driver: bridge
+    driver_opts:
+      com.docker.network.bridge.name: astra1
+    ipam:
+      config:
+        - subnet: 10.88.7.8/29
+
+  # Le canal privé vers `heliosd` — ADR-008 §2, ROTATION-CERTIFICATS §8.3.
+  #
+  # `internal: true` est ce qui en fait un veth *privé* : Docker n'y pose ni
+  # route par défaut, ni masquerade, ni règle de sortie. Le namespace Astra n'a
+  # donc sur cette interface qu'une route vers le /29 ci-dessous, et rien
+  # d'autre — ni Internet, ni le LAN, ni une adresse de pair WireGuard. Le
+  # `forward` du pare-feu Helios, en `drop` par défaut, referme ce qui
+  # resterait.
+  #
+  # Un /29 et pas davantage : le réseau ne contient que ses deux extrémités,
+  # `10.88.7.1` côté hôte — celle que `heliosd init-astra-channel --bind`
+  # nomme — et `10.88.7.2` côté conteneur. Une plage plus large laisserait un
+  # second conteneur s'y attacher et parler au listener de cycle de vie.
+  astra-private:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.name: astra0
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.88.7.0/29

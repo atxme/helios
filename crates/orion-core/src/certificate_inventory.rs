@@ -4,27 +4,31 @@
 //!
 //! [`crate::certificates::TrustStore`] is the *decision* half of the
 //! certificate lifecycle: bounded slots, generations, transitions applied in
-//! one write. Nothing populates it yet — the Orion profile format has no
-//! `helios_key_negotiation` discriminant, so there is no document that could
-//! carry a trust domain, an Astra profile and a client generation into one
-//! (spec §19, §22, listed as *non livré*).
+//! one write. It is populated from the profile's trust material and advanced
+//! by the renewal driver; exposing that state directly would couple a display
+//! to the transaction store and its private candidate lifecycle.
 //!
-//! This module is the *observation* half, and it needs none of that. Four
+//! This module is the *observation* half. Four
 //! certificates already exist on any enrolled machine — the two the profile
 //! pins for the gateway, and the two the protected store holds for this
-//! client — and every question a user asks about the lifecycle can be
-//! answered from them: what is pinned, until when, and when the renewal
-//! window opens. The answers are computed with the lifecycle's own arithmetic
-//! (`ValidityPeriod` at 80 / 90 / 95 %), so the panel and the protocol agree
-//! by construction rather than by resemblance.
+//! client — and they answer what is pinned, until when, and when the renewal
+//! window opens. Those answers are computed with the lifecycle's own
+//! arithmetic (`ValidityPeriod` at 80 / 90 / 95 %), so the panel and the
+//! protocol agree by construction rather than by resemblance.
 //!
-//! # Limite connue
+//! # Operator credentials
 //!
-//! Nothing here *acts*. It reads four certificates and reports their dates: it
-//! does not renew, does not stage, does not apply a trust update. A leaf that
-//! reaches its renewal window is reported, and the renewal itself is still the
-//! operator re-issuing and the user re-importing. Wiring the automatic path
-//! needs the trust store above, which needs the profile discriminant.
+//! The profile holds the highest `credential_registry_epoch` it accepted, but
+//! Orion does not persist the corresponding CA-PQ-signed registry. The
+//! inventory therefore reports that epoch and states that the rows are not
+//! held locally. It never fetches a registry just to draw a screen: listing
+//! operator keys would otherwise turn an authenticated trust decision into a
+//! claim made by whichever network endpoint answered last.
+//!
+//! Showing the rows later requires the trust store to retain a registry only
+//! after verifying it under the pinned CA-PQ, with the same bounded size and
+//! monotonic epoch checks as every other consumer. Until that persistence
+//! exists, an epoch-only inventory is the complete and honest local fact.
 //!
 //! # What a fault is, and what an absence is
 //!
@@ -40,28 +44,17 @@ use aether::key_negotiation::PqCertificate;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
-use crate::identity_store::ProtectedIdentityStore;
+use crate::identity_store::{PreviousIdentityStatus, ProtectedIdentityStore};
 use crate::KeyNegotiationSettings;
 
 /// Where a certificate stands on the renewal ladder of spec §4.3.
 ///
-/// The thresholds are the protocol's own — 80 %, 90 %, 95 % of the lifetime —
-/// read through [`ValidityPeriod`] rather than recomputed here. A panel that
-/// drew its own would eventually disagree with the planner that decides.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CertificatePhase {
-    /// Prepared for later: its validity has not started.
-    NotYetValid,
-    Valid,
-    /// Past 80 %: the renewal window is open.
-    RenewalDue,
-    /// Past 90 %.
-    Warning,
-    /// Past 95 %.
-    Critical,
-    Expired,
-}
+/// The ladder itself lives in [`aether::certificates::window`], with the
+/// protocol's own thresholds. Orion keeps the name it has always exported —
+/// the wire form is unchanged — but no longer keeps a second copy of the
+/// comparisons: the Helios console reports the same rungs, and two surfaces
+/// computing them apart is how one of them ends up a threshold behind.
+pub use aether::certificates::window::ValidityPhase as CertificatePhase;
 
 /// One certificate, as an interface needs to state it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,6 +68,24 @@ pub struct CertificateFacts {
     /// Instant the renewal window opens — 80 % of the lifetime.
     pub renewal_at: u64,
     pub phase: CertificatePhase,
+}
+
+/// What this profile locally knows about the domain's operator credentials.
+///
+/// `EpochOnly` is a positive statement, not an empty list: the profile has
+/// accepted a registry generation, but this client has never retained its
+/// verified rows. Keeping that distinction in the value prevents a surface
+/// from rendering “zero registered keys”, which would be false.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorCredentialInventory {
+    pub registry_epoch: u64,
+    pub detail: OperatorCredentialDetail,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorCredentialDetail {
+    EpochOnly,
 }
 
 impl CertificateFacts {
@@ -91,19 +102,7 @@ impl CertificateFacts {
         let renewal_at = period
             .renewal_at()
             .map_err(|_| "période de validité incohérente".to_string())?;
-        let phase = if now_unix < not_before {
-            CertificatePhase::NotYetValid
-        } else if now_unix >= not_after {
-            CertificatePhase::Expired
-        } else if now_unix >= period.critical_at().unwrap_or(not_after) {
-            CertificatePhase::Critical
-        } else if now_unix >= period.warning_at().unwrap_or(not_after) {
-            CertificatePhase::Warning
-        } else if now_unix >= renewal_at {
-            CertificatePhase::RenewalDue
-        } else {
-            CertificatePhase::Valid
-        };
+        let phase = period.phase(now_unix);
         Ok(Self {
             subject,
             issuer,
@@ -131,6 +130,10 @@ pub struct CertificateInventory {
     pub faults: Vec<String>,
     /// The protected identity named by the profile is on this machine.
     pub identity_sealed: bool,
+    /// Outgoing identity retained for a bounded service rollback.
+    pub previous_identity: Option<PreviousIdentityStatus>,
+    /// Highest authenticated credential-registry epoch carried by the profile.
+    pub operator_credentials: Option<OperatorCredentialInventory>,
 }
 
 /// Reads a PQ certificate as the negotiation format carries it.
@@ -223,8 +226,8 @@ pub fn client_inventory(
     if !inventory.identity_sealed {
         return;
     }
-    let bundle = match store.load(identity) {
-        Ok(bundle) => bundle,
+    let snapshot = match store.snapshot_at(identity, now_unix) {
+        Ok(snapshot) => snapshot,
         Err(error) => {
             inventory
                 .faults
@@ -232,6 +235,18 @@ pub fn client_inventory(
             return;
         }
     };
+    if snapshot
+        .previous
+        .is_some_and(|previous| previous.phase == crate::PreviousIdentityPhase::Expired)
+    {
+        if let Err(error) = store.retire_previous(identity, now_unix) {
+            inventory.faults.push(format!(
+                "purge de l'identité cliente précédente impossible : {error}"
+            ));
+        }
+    }
+    inventory.previous_identity = snapshot.previous;
+    let bundle = snapshot.served;
 
     match bundle
         .certificate_chain
@@ -261,6 +276,14 @@ pub fn inventory(settings: Option<&KeyNegotiationSettings>, now_unix: u64) -> Ce
     let Some(settings) = settings else {
         return inventory;
     };
+    inventory.operator_credentials =
+        settings
+            .trust
+            .as_ref()
+            .map(|trust| OperatorCredentialInventory {
+                registry_epoch: trust.credential_registry_epoch,
+                detail: OperatorCredentialDetail::EpochOnly,
+            });
     gateway_inventory(settings, now_unix, &mut inventory);
     client_inventory(settings, now_unix, &mut inventory);
     inventory
@@ -332,6 +355,47 @@ mod tests {
         let found = inventory(None, 1_000);
         assert_eq!(found, CertificateInventory::default());
         assert!(found.faults.is_empty());
+    }
+
+    /// Orion must not turn a pinned epoch into an invented list. Until it
+    /// persists a CA-PQ-verified registry, the inventory says exactly what the
+    /// profile holds and distinguishes that from an empty registry.
+    #[test]
+    fn a_trust_profile_reports_the_registry_epoch_without_inventing_rows() {
+        let mut settings = KeyNegotiationSettings {
+            mode: aether::key_negotiation::ProtectionMode::MlKem,
+            minimum_mode: aether::key_negotiation::ProtectionMode::MlKem,
+            endpoint: "gateway:51821".into(),
+            server_name: "gateway.example".into(),
+            gateway_ca_der: "pas du base64 !".into(),
+            gateway_pq_certificate: "pas du base64 !".into(),
+            identity: String::new(),
+            trust: None,
+        };
+        settings.trust = Some(crate::config::TrustMaterial {
+            trust_domain_id: "01".repeat(16),
+            ca_epoch: 3,
+            ca_pq_public_key: String::new(),
+            ca_tls_epoch: 4,
+            client_tls_ca_der: String::new(),
+            client_generation: 7,
+            astra_authority_url: "https://astra.example".into(),
+            webauthn_rp_id: "astra.example".into(),
+            astra_policy_fingerprint: "11".repeat(32),
+            credential_registry_epoch: 12,
+            astra_credential_bindings: Vec::new(),
+            astra_service_key_epoch: 2,
+            astra_service_public_key: String::new(),
+        });
+
+        let found = inventory(Some(&settings), 1_000);
+        assert_eq!(
+            found.operator_credentials,
+            Some(OperatorCredentialInventory {
+                registry_epoch: 12,
+                detail: OperatorCredentialDetail::EpochOnly,
+            })
+        );
     }
 
     /// A block whose pinned material is unreadable names which half failed.

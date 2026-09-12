@@ -119,7 +119,7 @@ fn atomic_write(path: &str, bytes: &[u8]) -> Result<()> {
         }
     }
     let mut nonce = [0u8; 8];
-    getrandom::getrandom(&mut nonce).map_err(|error| TpmError::Rng(error.to_string()))?;
+    aether::random::fill_public(&mut nonce).map_err(|error| TpmError::Rng(error.to_string()))?;
     let tmp = format!("{path}.tmp.{}", hex::encode(nonce));
     let outcome = (|| {
         let mut options = std::fs::OpenOptions::new();

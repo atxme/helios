@@ -106,6 +106,35 @@ pub struct OfflineInputs {
     pub address: String,
     /// Internal API URL, for telemetry only. Absent is fine.
     pub heliosd_url: Option<String>,
+    /// The §19 trust block, as `heliosd show-trust-enrolment` printed it.
+    ///
+    /// Offline there is no API to ask, and the values are not guessable: they
+    /// are the domain's anchors and this peer's generation. Absent, the
+    /// profile omits the block and Orion says renewal is unavailable — which
+    /// is true, and better than a button that fails at its last step.
+    pub trust_material: Option<PathBuf>,
+}
+
+/// Reads a trust block printed by `heliosd show-trust-enrolment`.
+///
+/// Validated here rather than at import: an operator running this command has
+/// the gateway in front of them, and a block that is wrong is one SSH call
+/// away from being reprinted. The same block discovered as invalid on a user's
+/// machine is a redeployment.
+fn read_trust_material(path: &Path) -> Result<orion_core::TrustMaterial> {
+    let raw = std::fs::read(path)
+        .with_context(|| format!("reading the trust block from {}", path.display()))?;
+    let material: orion_core::TrustMaterial = serde_json::from_slice(&raw).with_context(|| {
+        format!(
+            "{} is not a trust block — it is what `heliosd show-trust-enrolment --public-key \
+             <clé>` prints",
+            path.display()
+        )
+    })?;
+    material
+        .validate()
+        .with_context(|| format!("the trust block in {} is unusable", path.display()))?;
+    Ok(material)
 }
 
 /// Gateway-side material a profile pins, however it was obtained.
@@ -125,7 +154,7 @@ struct GatewayMaterial {
 /// needs is inside the file, and verifying it here means a mistyped copy is
 /// caught now rather than as a refused negotiation later.
 fn offline_material(inputs: &OfflineInputs) -> Result<GatewayMaterial> {
-    use aether::key_negotiation::{PqCertificate, PqCertificateRole};
+    use aether::key_negotiation::PqCertificate;
 
     let certificate_der = std::fs::read(&inputs.gateway_certificate).with_context(|| {
         format!(
@@ -142,19 +171,13 @@ fn offline_material(inputs: &OfflineInputs) -> Result<GatewayMaterial> {
     let certificate: PqCertificate = serde_json::from_slice(&pq_certificate_json)
         .context("the gateway PQ certificate is not a readable JSON document")?;
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .context("system clock predates the Unix epoch")?
-        .as_secs();
-    certificate
-        .verify_self_signed(
-            PqCertificateRole::Gateway,
-            Some(&certificate.subject),
-            &certificate.wireguard_public_key,
-            now,
-        )
-        .context("the gateway PQ certificate does not verify — copied incompletely, or expired")?;
-
+    // The signature is **not** checked here. Which authority signs this leaf
+    // depends on whether the gateway has a trust domain — self-signed without
+    // one, `CA-PQ` with one (ADR-008 §13.1) — and the anchor for the second
+    // case lives in the trust block, which is only known once the peer is
+    // admitted. Verifying here would therefore accept exactly one of the two
+    // shapes. `run` checks the leaf once, for both paths, against the anchor
+    // the profile is about to pin.
     let encoder = base64::engine::general_purpose::STANDARD;
     Ok(GatewayMaterial {
         server_name: certificate.subject.clone(),
@@ -258,6 +281,54 @@ pub async fn run(client: &Client, base: &str, options: EnrollOptions) -> Result<
         None => admit(client, base, &options, &public_key, &client_material).await?,
     };
 
+    // The §19 trust block, read from the gateway once the peer is admitted —
+    // the generation it carries is that peer's, so it cannot be fetched
+    // earlier. Offline, there is nobody to ask: the document then omits it and
+    // Orion says so rather than offering a renewal that would fail at its last
+    // step.
+    let trust = match &options.offline {
+        Some(inputs) => match &inputs.trust_material {
+            Some(path) => Some(read_trust_material(path)?),
+            None => None,
+        },
+        None => api::trust_enrolment(client, base, &public_key).await?,
+    };
+    if trust.is_none() {
+        eprintln!(
+            "note : ce profil ne portera pas de matériel de confiance — cette gateway n'a pas de \
+             domaine amorcé (`heliosd init-trust-domain`). Le client se connectera, mais ne \
+             pourra pas renouveler son certificat."
+        );
+    }
+
+    // The one place the pinned gateway leaf is verified, under whichever
+    // authority actually issued it. It runs after the trust block is known
+    // because a `CA-PQ`-issued leaf can only be checked against the anchor
+    // that block carries — and it runs on the API path too, which until now
+    // pinned whatever the gateway returned without checking a signature.
+    {
+        let certificate: aether::key_negotiation::PqCertificate = serde_json::from_slice(
+            &base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                &material.gateway_pq_certificate,
+            )
+            .context("the gateway PQ certificate is not valid base64")?,
+        )
+        .context("the gateway PQ certificate is not a readable JSON document")?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .context("system clock predates the Unix epoch")?
+            .as_secs();
+        orion_core::verify_pinned_gateway_certificate(
+            &certificate,
+            &material.server_name,
+            &material.wireguard_public_key,
+            trust.as_ref(),
+            now,
+        )
+        .context("the gateway PQ certificate does not verify — copied incompletely, or expired")?;
+    }
+
     let encoder = base64::engine::general_purpose::STANDARD;
     let json = profile::render(profile::Profile {
         name: &options.name,
@@ -276,6 +347,7 @@ pub async fn run(client: &Client, base: &str, options: EnrollOptions) -> Result<
             gateway_ca_der: material.gateway_ca_der.clone(),
             gateway_pq_certificate: material.gateway_pq_certificate.clone(),
             identity: identity_name.clone(),
+            trust,
         }),
         key_negotiation_identity: Some(orion_core::ClientIdentityBundle {
             identity: identity_name.clone(),
@@ -368,9 +440,18 @@ async fn admit(
     public_key: &str,
     material: &key_nego::ClientMaterial,
 ) -> Result<String> {
+    // The two leaves travel with the two fingerprints: the peer table pins the
+    // digests, the certificate registry records the objects. One admission,
+    // one pair of certificates — a peer whose registry row was written from
+    // another enrollment would hold a generation nobody can renew.
+    let encoder = base64::engine::general_purpose::STANDARD;
+    let tls_certificate = encoder.encode(&material.certificate_der);
+    let pq_certificate = encoder.encode(&material.pq_certificate_json);
     let policy = peer::KeyNegotiationAdmission {
         tls_certificate_sha256: Some(&material.certificate_sha256),
         pq_certificate_sha256: Some(&material.pq_certificate_sha256),
+        tls_certificate: Some(&tls_certificate),
+        pq_certificate: Some(&pq_certificate),
         minimum_mode: options.mode,
     };
 
@@ -644,6 +725,7 @@ mod tests {
             gateway_pq_certificate: json.clone(),
             address: "100.64.1.2/32".into(),
             heliosd_url: None,
+            trust_material: None,
         };
         let material = offline_material(&inputs).expect("material read from the certificates");
         assert_eq!(material.server_name, "vpn.example.net");

@@ -7,7 +7,11 @@
 use std::time::{Duration, Instant};
 
 /// TCP and UDP port of the raw in-tunnel speedtest service.
-pub const SPEEDTEST_PORT: u16 = 5201;
+///
+/// Keep this distinct from iperf3's default port (`5201`). Operators use
+/// iperf3 to cross-check the built-in measurement, and a wildcard iperf3
+/// listener would otherwise prevent Helios from binding to its tunnel VIP.
+pub const SPEEDTEST_PORT: u16 = 51822;
 /// Protocol version. A mismatch is rejected before a stream can send data.
 ///
 /// Version 2 added the paced-rate field to the UDP header. The bump is
@@ -106,7 +110,7 @@ pub fn quality_rate_mbps(throughput_mbps: f64) -> f64 {
 
 /// Fixed in-tunnel address used by Orion when the gateway uses the default
 /// network configuration.
-pub const DEFAULT_WG_SPEEDTEST_ADDR: &str = "100.64.0.1:5201";
+pub const DEFAULT_WG_SPEEDTEST_ADDR: &str = "100.64.0.1:51822";
 
 /// TCP control frame size.
 pub const TCP_CONTROL_BYTES: usize = 24;
@@ -211,6 +215,15 @@ impl Pacer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_default_target_uses_the_reserved_helios_port() {
+        let target: std::net::SocketAddr = DEFAULT_WG_SPEEDTEST_ADDR
+            .parse()
+            .expect("default speedtest target");
+        assert_eq!(target.port(), SPEEDTEST_PORT);
+        assert_ne!(SPEEDTEST_PORT, 5201, "iperf3 owns its default port");
+    }
 
     /// The one value that changes the field's meaning rather than its
     /// precision is `0`. A slow but real line must never encode to it.

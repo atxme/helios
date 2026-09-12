@@ -1,12 +1,29 @@
 # Helios
 
-Passerelle VPN **WireGuard** pour appliance Linux, pilotée par un daemon Rust.
-**Orion** est son client de bureau Tauri, `aether` porte les contrats partagés.
+Helios est une passerelle VPN WireGuard pour appliance Linux, pilotée par un
+daemon Rust. Orion est son client de bureau Tauri ; `aether` porte les contrats
+partagés.
 
 Avant tout paquet WireGuard, Orion négocie avec la gateway sur un port UDP dédié
 (QUIC/mTLS, PKI **ML-DSA-87**) et en ressort avec le PSK post-quantique que le
 **premier** handshake utilisera — protocole v5,
 [ADR-005](docs/adr/ADR-005-NEGOCIATION-DE-CLE.md).
+
+## Fonctionnalités principales
+
+- passerelle WireGuard Linux avec routage, IPAM CGNAT, multi-uplink et règles
+  nftables atomiques ;
+- kill-switch fail-closed et suivi réel de l'état des tunnels par handshake ;
+- négociation de clé v5 avant WireGuard, via QUIC/mTLS, avec ML-KEM-1024 et
+  signatures ML-DSA-87 ;
+- PKI Astra avec coffre chiffré, clés opérateur YubiKey, registre de confiance,
+  renouvellement et rotation des certificats ;
+- client Orion pour Windows et Linux : profils, coffre sécurisé, tunnel
+  WireGuard, certificats, renouvellement et récupération d'identité ;
+- console web d'administration avec gestion des pairs, réseau, certificats,
+  télémétrie et tests de débit ;
+- mises à jour signées avec anti-rollback, TPM et outils de déploiement ;
+- support NordVPN Meshnet comme chemin d'accès réseau de secours.
 
 ```text
 Orion ── QUIC/mTLS ──► heliosd   négociation de clé (avant le tunnel)
@@ -16,22 +33,7 @@ heliosd : orchestrateur · API Axum/WS · IPAM ML-KEM · pare-feu nftables
           backend WireGuard · TPM/coffres · mise à jour signée
 ```
 
-## Fonctionnement
-
-La gateway crée `helios0`, écoute en UDP 51820 et attend les clients admis.
-WireGuard n'ayant pas de connexion persistante, l'état est inféré du handshake :
-`up` sous 150 s, `connecting` au-delà, plus `down`, `failed` et `captive_portal`.
-
-Le pare-feu est **fail-closed** : seul `up` autorise le trafic LAN, et le
-kill-switch reste engagé partout ailleurs, y compris à l'arrêt. Le backend
-Netlink traduit tout le ruleset puis l'applique — filtrage **et** NAT — en une
-seule transaction atomique.
-
-Orion n'a pas de pare-feu local : avec `AllowedIPs = 0.0.0.0/0`, son adaptateur
-reste monté après un échec pour que WireGuard jette les paquets. Seule une
-déconnexion explicite le démonte.
-
-## Workspace
+## Composants principaux
 
 | Composant | Rôle |
 |---|---|
@@ -40,6 +42,7 @@ déconnexion explicite le démonte.
 | `helios-wireguard` | Plan de données gateway et table de pairs |
 | `helios-provisioning` | IPAM CGNAT, admission, session ML-KEM |
 | `helios-key-negotiation` | Transport QUIC authentifié (ni CA, ni backend WireGuard) |
+| `astra` | Coordinateur PKI, registre de confiance et renouvellement des certificats |
 | `helios-api` | API Axum, WebSocket, IHM embarquée |
 | `helios-update` | Manifeste hybride, staging, anti-rollback |
 | `helio-tpm` | Scellement PCR, séquestre, fenêtre de mise à jour |
@@ -52,13 +55,17 @@ déconnexion explicite le démonte.
 | `helios-installer` | Helper privilégié sans réseau : activation et rollback |
 | `xtask` | Bundles d'installation et installateur Windows d'Orion |
 
-## Démarrage
+## Construire et tester
 
 Prérequis : Rust 1.82+, Node.js 20.19+ ou 22.12+. Shell Tauri Linux :
 WebKitGTK 4.1 et GTK3 (`scripts/setup-dev.sh`).
 
 ```sh
+cargo build
 cargo test --workspace --all-features
+bash scripts/regression.sh             # campagne complète locale et CI
+
+# Développement local
 cargo run -p heliosd -- run --dev      # gateway en simulation
 npm run dev --prefix web               # console, proxy vers :8080
 bash scripts/lab.sh --keep             # banc jetable + profil importable
@@ -67,7 +74,7 @@ bash scripts/lab.sh --keep             # banc jetable + profil importable
 `scripts/regression.sh` est la référence avant chaque version : fmt, Clippy,
 tests toutes features, audits Cargo/npm, Vitest et builds frontend.
 
-## Exploitation
+## Développement et exploitation
 
 ```sh
 # sur la gateway
@@ -95,7 +102,7 @@ négociation, elle, est lue une fois au démarrage : une rotation s'applique par
 La CA opérateur vit dans `~/.helios/certs/internal-ca`, et à **un seul** endroit :
 la gateway n'en épingle qu'une.
 
-## Compilation cible
+## Compilation cible et limites
 
 ```sh
 npm run build --prefix web
@@ -118,13 +125,17 @@ Livraison : `cargo xtask bundle`, `helios-publisher bundle`, `cargo xtask pack`,
 
 ## État et limites
 
-La négociation v5 est **partiellement implémentée** ; la
-[spécification](docs/specification/NEGOCIATION-DE-CLE-V5.md) nomme les lots
-ouverts. Le **cycle de vie des certificats n'est pas implémenté** : la leaf PQ de
-la gateway est encore auto-signée, sans slot actif/suivant ni génération
-anti-rollback (cible :
-[ROTATION-CERTIFICATS](docs/specification/ROTATION-CERTIFICATS.md) et
-[ADR-008](docs/adr/ADR-008-ASTRA-AUTORITE-CERTIFICATS.md)).
+La négociation v5 est opérationnelle pour l'établissement initial d'un tunnel :
+challenge, authentification, dérivation du PSK ML-KEM, preuve WireGuard et
+rollback sont en place. Restent notamment le renouvellement de PSK en place,
+l'enrôlement sans transport de clé privée et certaines validations sur matériel
+réel ; le détail est dans la
+[spécification v5](docs/specification/NEGOCIATION-DE-CLE-V5.md).
+
+Le cycle de vie des certificats est un chantier distinct, déjà partiellement
+livré avec Astra, le registre de confiance, le renouvellement client, la
+récupération d'une identité expirée et plusieurs rotations. Les lots ouverts
+sont listés dans [ROTATION-CERTIFICATS](docs/specification/ROTATION-CERTIFICATS.md).
 
 Par ailleurs :
 
@@ -142,5 +153,11 @@ Une compilation WSL2 n'est jamais une validation matérielle.
 
 ## Documentation
 
-[Index complet](docs/README.md) — architecture, ADR, spécifications, sécurité et
-tests. En cas de doute, le code et les ADR acceptés font foi.
+- [Architecture](docs/architecture/overview.md) — composants et responsabilités.
+- [Développement](docs/development/build.md) — construire, tester et travailler
+  localement.
+- [Contribution](CONTRIBUTING.md) — branches, commits et pull requests.
+- [Sécurité](SECURITY.md) — signalement et gestion des secrets.
+- [Index technique](docs/README.md) — ADR, spécifications, sécurité et tests.
+
+En cas de doute, le code et les ADR acceptés font foi.

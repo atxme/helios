@@ -21,6 +21,14 @@ struct AdmitBody<'a> {
     key_negotiation_certificate_sha256: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     key_negotiation_pq_certificate_sha256: Option<&'a str>,
+    /// The two leaves themselves, base64 — DER for the TLS one, the JSON
+    /// document for the PQ one. The fingerprints above are what the peer table
+    /// pins; these are what the certificate registry records, and a gateway
+    /// holding a trust domain refuses an admission without them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key_negotiation_certificate: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key_negotiation_pq_certificate: Option<&'a str>,
     minimum_key_negotiation_mode: ProtectionMode,
 }
 
@@ -32,6 +40,10 @@ struct RevokeBody<'a> {
 pub struct KeyNegotiationAdmission<'a> {
     pub tls_certificate_sha256: Option<&'a str>,
     pub pq_certificate_sha256: Option<&'a str>,
+    /// Base64 DER of the client's TLS leaf.
+    pub tls_certificate: Option<&'a str>,
+    /// Base64 of the client's PQ leaf, as a JSON document.
+    pub pq_certificate: Option<&'a str>,
     pub minimum_mode: ProtectionMode,
 }
 
@@ -53,6 +65,8 @@ pub async fn admit(
         KeyNegotiationAdmission {
             tls_certificate_sha256: certificate_sha256,
             pq_certificate_sha256: None,
+            tls_certificate: None,
+            pq_certificate: None,
             minimum_mode: ProtectionMode::Classic,
         },
     )
@@ -77,6 +91,8 @@ pub async fn admit_with_policy(
             admin,
             key_negotiation_certificate_sha256: key_negotiation.tls_certificate_sha256,
             key_negotiation_pq_certificate_sha256: key_negotiation.pq_certificate_sha256,
+            key_negotiation_certificate: key_negotiation.tls_certificate,
+            key_negotiation_pq_certificate: key_negotiation.pq_certificate,
             minimum_key_negotiation_mode: key_negotiation.minimum_mode,
         },
     )
@@ -228,7 +244,7 @@ mod tests {
 
     fn network_view(peers: serde_json::Value) -> String {
         serde_json::json!({
-            "wan_iface": "eth0",
+            "wan_ifaces": ["eth0"],
             "lan_ifaces": [],
             "allow_ssh_from": [],
             "admin_iface": "helios0",
@@ -251,6 +267,8 @@ mod tests {
             admin: false,
             key_negotiation_certificate_sha256: None,
             key_negotiation_pq_certificate_sha256: None,
+            key_negotiation_certificate: None,
+            key_negotiation_pq_certificate: None,
             minimum_key_negotiation_mode: ProtectionMode::Classic,
         };
         let value = serde_json::to_value(body).unwrap();
@@ -268,6 +286,8 @@ mod tests {
             admin: true,
             key_negotiation_certificate_sha256: Some("tls-pin"),
             key_negotiation_pq_certificate_sha256: Some("pq-pin"),
+            key_negotiation_certificate: Some("dGxz"),
+            key_negotiation_pq_certificate: Some("cHE="),
             minimum_key_negotiation_mode: ProtectionMode::MlKem,
         };
         let value = serde_json::to_value(body).unwrap();
@@ -275,6 +295,8 @@ mod tests {
         assert_eq!(value["admin"], true);
         assert_eq!(value["key_negotiation_certificate_sha256"], "tls-pin");
         assert_eq!(value["key_negotiation_pq_certificate_sha256"], "pq-pin");
+        assert_eq!(value["key_negotiation_certificate"], "dGxz");
+        assert_eq!(value["key_negotiation_pq_certificate"], "cHE=");
         assert_eq!(value["minimum_key_negotiation_mode"], "ml_kem");
     }
 
@@ -328,6 +350,8 @@ mod tests {
             KeyNegotiationAdmission {
                 tls_certificate_sha256: Some("tls"),
                 pq_certificate_sha256: Some("pq"),
+                tls_certificate: None,
+                pq_certificate: None,
                 minimum_mode: ProtectionMode::MlKem,
             },
         )

@@ -3,6 +3,9 @@
     "beforeBuildCommand": "npm run orion-deps && npm run build"
   },
   "bundle": {
+    "externalBin": [
+      "binaries/helios-astra-helper"
+    ],
     "resources": {
       "../../../resources-windows/": "resources-windows/",
       "icons/orion-profile.ico": "orion-profile.ico"

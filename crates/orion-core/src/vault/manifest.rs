@@ -26,12 +26,12 @@
 use zeroize::Zeroizing;
 
 use super::{codec, codec::Cursor, VaultError};
-use crate::config::{ClientProfile, KeyNegotiationSettings};
+use crate::config::{ClientProfile, KeyNegotiationSettings, ProfileKind};
 use aether::key_negotiation::ProtectionMode;
 
 /// Version written today. Any version not listed below is refused, never
 /// guessed.
-const MANIFEST_VERSION: u8 = 3;
+const MANIFEST_VERSION: u8 = 6;
 
 /// Previous version, still readable: it lacks the trailing `ssh_target`.
 ///
@@ -53,6 +53,56 @@ const MANIFEST_VERSION_WITHOUT_SSH: u8 = 1;
 /// spec §19. A profile sealed by an older Orion keeps decoding byte for byte,
 /// and re-sealing writes the current version.
 const MANIFEST_VERSION_WITHOUT_TRUST: u8 = 2;
+
+/// Previous version. It carries the first §19 trust block but predates the
+/// policy pin, WebAuthn RP ID and credential-registry anti-rollback counter.
+/// It remains readable so the UI can name the required profile re-issuance.
+const MANIFEST_VERSION_WITHOUT_ASTRA_POLICY: u8 = 3;
+
+/// Previous version: everything of today except the §19 profile discriminant.
+///
+/// Read as **undeclared**, not as classic. The difference is the whole point
+/// of the field: a profile sealed before it exists has no opinion recorded,
+/// and [`ClientProfile::kind`] infers one from the block exactly as this
+/// client always did — once, on the way in. Re-sealing writes the answer down,
+/// and from then on the guess is never made again.
+const MANIFEST_VERSION_WITHOUT_PROFILE_KIND: u8 = 4;
+
+/// Previous version: everything of today except the domain's operator
+/// credential bindings.
+///
+/// Read as an empty list, which is what such a profile actually knows. It
+/// still mounts a tunnel and still renews; what it cannot do is recover an
+/// expired identity, because §7.5 begins by naming the credential that will
+/// approve it. Re-sealing after a re-issued enrolment writes the list down.
+const MANIFEST_VERSION_WITHOUT_CREDENTIAL_BINDINGS: u8 = 5;
+
+/// The credential bindings, as the one text field the manifest stores them in.
+///
+/// JSON rather than a hand-rolled framing: a binding is a signed document with
+/// a dozen fields, and a second encoder for it would be a second place for the
+/// bytes under a `CA-PQ` signature to drift. What the manifest needs of it is
+/// only that it round-trips, and the signature is re-checked on the way out of
+/// the seed anyway.
+///
+/// An unencodable list yields an empty one rather than failing the seal: this
+/// value is a convenience the enrolment can restate, and refusing to save a
+/// profile over it would trade a recoverable identity for an unopenable vault.
+fn credential_bindings_json(trust: &crate::config::TrustMaterial) -> String {
+    serde_json::to_string(&trust.astra_credential_bindings).unwrap_or_else(|_| "[]".into())
+}
+
+/// The inverse, refusing what it cannot read exactly.
+fn decode_credential_bindings(
+    text: &str,
+) -> Result<Vec<aether::certificates::approval::AstraCredentialBinding>, VaultError> {
+    if text.is_empty() {
+        return Ok(Vec::new());
+    }
+    serde_json::from_str(text).map_err(|error| {
+        VaultError::ManifestEncoding(format!("invalid Astra credential bindings: {error}"))
+    })
+}
 
 /// Bound on a decoded manifest, checked before any allocation.
 ///
@@ -105,10 +155,22 @@ pub struct ProfileManifest {
     pub persistent_keepalive: u16,
     pub heliosd_url: Option<String>,
     pub ssh_target: Option<String>,
+    /// The §19 discriminant, absent in a manifest sealed before v5.
+    pub profile_type: Option<ProfileKind>,
     pub key_negotiation: Option<KeyNegotiationSettings>,
 }
 
 impl ProfileManifest {
+    /// Declared kind, or the one-time historical inference for a pre-v5 blob.
+    pub fn kind(&self) -> ProfileKind {
+        self.profile_type
+            .unwrap_or(if self.key_negotiation.is_some() {
+                ProfileKind::HeliosKeyNegotiation
+            } else {
+                ProfileKind::Classic
+            })
+    }
+
     /// Builds a manifest from the profile shape the UI edits.
     pub fn from_profile(profile: &ClientProfile, generation: SecurityGeneration) -> Self {
         Self {
@@ -123,6 +185,10 @@ impl ProfileManifest {
             persistent_keepalive: profile.persistent_keepalive,
             heliosd_url: profile.heliosd_url.clone(),
             ssh_target: profile.ssh_target.clone(),
+            // Resolved on the way in, so a manifest never stores the
+            // undeclared state a legacy one is read back as. Sealing is what
+            // turns the inference into a recorded fact.
+            profile_type: Some(profile.kind()),
             key_negotiation: profile.key_negotiation.clone(),
         }
     }
@@ -143,6 +209,7 @@ impl ProfileManifest {
             persistent_keepalive: self.persistent_keepalive,
             heliosd_url: self.heliosd_url.clone(),
             ssh_target: self.ssh_target.clone(),
+            profile_type: self.profile_type,
             key_negotiation: self.key_negotiation.clone(),
             preshared_key_is_negotiated: false,
         }
@@ -185,6 +252,31 @@ impl ProfileManifest {
                 field(settings.gateway_ca_der.as_bytes());
                 field(settings.gateway_pq_certificate.as_bytes());
                 field(&[mode_id(settings.minimum_mode)]);
+                match &settings.trust {
+                    None => field(b""),
+                    Some(trust) => {
+                        field(b"orion-trust-material-v2");
+                        field(trust.trust_domain_id.as_bytes());
+                        field(&trust.ca_epoch.to_be_bytes());
+                        field(trust.ca_pq_public_key.as_bytes());
+                        field(&trust.ca_tls_epoch.to_be_bytes());
+                        field(trust.client_tls_ca_der.as_bytes());
+                        field(&trust.client_generation.to_be_bytes());
+                        field(trust.astra_authority_url.as_bytes());
+                        field(trust.webauthn_rp_id.as_bytes());
+                        field(trust.astra_policy_fingerprint.as_bytes());
+                        field(&trust.credential_registry_epoch.to_be_bytes());
+                        // Les liaisons de credentials sont délibérément
+                        // absentes : ADR-006 §2 fait monter la génération sur
+                        // un changement d'**ancre**, et une liaison n'en est
+                        // pas une — elle est signée par celle-ci. L'y mettre
+                        // ferait monter le compteur à chaque enrôlement de clé
+                        // opérateur, et un vrai retour en arrière deviendrait
+                        // indiscernable d'une routine.
+                        field(&trust.astra_service_key_epoch.to_be_bytes());
+                        field(trust.astra_service_public_key.as_bytes());
+                    }
+                }
             }
         }
         let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, &input);
@@ -208,6 +300,7 @@ impl ProfileManifest {
         out.extend_from_slice(&self.persistent_keepalive.to_be_bytes());
         codec::put_option(&mut out, self.heliosd_url.as_deref().map(str::as_bytes))?;
         codec::put_option(&mut out, self.ssh_target.as_deref().map(str::as_bytes))?;
+        out.push(profile_kind_id(self.profile_type));
         match &self.key_negotiation {
             None => out.push(0),
             Some(settings) => {
@@ -230,6 +323,10 @@ impl ProfileManifest {
                         codec::put(&mut out, trust.client_tls_ca_der.as_bytes())?;
                         out.extend_from_slice(&trust.client_generation.to_be_bytes());
                         codec::put(&mut out, trust.astra_authority_url.as_bytes())?;
+                        codec::put(&mut out, trust.webauthn_rp_id.as_bytes())?;
+                        codec::put(&mut out, trust.astra_policy_fingerprint.as_bytes())?;
+                        out.extend_from_slice(&trust.credential_registry_epoch.to_be_bytes());
+                        codec::put(&mut out, credential_bindings_json(trust).as_bytes())?;
                         out.extend_from_slice(&trust.astra_service_key_epoch.to_be_bytes());
                         codec::put(&mut out, trust.astra_service_public_key.as_bytes())?;
                     }
@@ -250,6 +347,9 @@ impl ProfileManifest {
         let mut cursor = Cursor::new(bytes);
         let version = cursor.byte()?;
         if version != MANIFEST_VERSION
+            && version != MANIFEST_VERSION_WITHOUT_CREDENTIAL_BINDINGS
+            && version != MANIFEST_VERSION_WITHOUT_PROFILE_KIND
+            && version != MANIFEST_VERSION_WITHOUT_ASTRA_POLICY
             && version != MANIFEST_VERSION_WITHOUT_TRUST
             && version != MANIFEST_VERSION_WITHOUT_SSH
         {
@@ -272,6 +372,13 @@ impl ProfileManifest {
         } else {
             None
         };
+        // Read where it was written, so a v4 manifest keeps decoding byte for
+        // byte as it always did.
+        let profile_type = if version == MANIFEST_VERSION {
+            profile_kind_from_id(cursor.byte()?)?
+        } else {
+            None
+        };
         let key_negotiation = match cursor.byte()? {
             0 => None,
             1 => Some(KeyNegotiationSettings {
@@ -284,7 +391,11 @@ impl ProfileManifest {
                 identity: cursor.text()?,
                 // Read where it was written, so a v2 manifest keeps decoding
                 // byte for byte as it always did.
-                trust: if version == MANIFEST_VERSION {
+                trust: if version == MANIFEST_VERSION
+                    || version == MANIFEST_VERSION_WITHOUT_CREDENTIAL_BINDINGS
+                    || version == MANIFEST_VERSION_WITHOUT_PROFILE_KIND
+                    || version == MANIFEST_VERSION_WITHOUT_ASTRA_POLICY
+                {
                     match cursor.byte()? {
                         0 => None,
                         1 => Some(crate::config::TrustMaterial {
@@ -295,6 +406,30 @@ impl ProfileManifest {
                             client_tls_ca_der: cursor.text()?,
                             client_generation: u64::from_be_bytes(cursor.array::<8>()?),
                             astra_authority_url: cursor.text()?,
+                            webauthn_rp_id: if version != MANIFEST_VERSION_WITHOUT_ASTRA_POLICY {
+                                cursor.text()?
+                            } else {
+                                String::new()
+                            },
+                            astra_policy_fingerprint: if version
+                                != MANIFEST_VERSION_WITHOUT_ASTRA_POLICY
+                            {
+                                cursor.text()?
+                            } else {
+                                String::new()
+                            },
+                            credential_registry_epoch: if version
+                                != MANIFEST_VERSION_WITHOUT_ASTRA_POLICY
+                            {
+                                u64::from_be_bytes(cursor.array::<8>()?)
+                            } else {
+                                0
+                            },
+                            astra_credential_bindings: if version == MANIFEST_VERSION {
+                                decode_credential_bindings(&cursor.text()?)?
+                            } else {
+                                Vec::new()
+                            },
                             astra_service_key_epoch: u64::from_be_bytes(cursor.array::<8>()?),
                             astra_service_public_key: cursor.text()?,
                         }),
@@ -329,6 +464,7 @@ impl ProfileManifest {
             persistent_keepalive,
             heliosd_url,
             ssh_target,
+            profile_type,
             key_negotiation,
         })
     }
@@ -342,6 +478,32 @@ fn mode_id(mode: ProtectionMode) -> u8 {
         ProtectionMode::Classic => 0,
         ProtectionMode::StaticPsk => 1,
         ProtectionMode::MlKem => 2,
+    }
+}
+
+/// Explicit identifiers, for the same reason as [`mode_id`]: this byte decides
+/// whether a profile negotiates before WireGuard, and reordering an enum must
+/// never be able to change that for a profile already on disk.
+///
+/// `0` is the **undeclared** state, which only a v4-or-older manifest produces
+/// and which nothing writes: [`ProfileManifest::from_profile`] resolves the
+/// kind before sealing.
+fn profile_kind_id(kind: Option<ProfileKind>) -> u8 {
+    match kind {
+        None => 0,
+        Some(ProfileKind::Classic) => 1,
+        Some(ProfileKind::HeliosKeyNegotiation) => 2,
+    }
+}
+
+fn profile_kind_from_id(id: u8) -> Result<Option<ProfileKind>, VaultError> {
+    match id {
+        0 => Ok(None),
+        1 => Ok(Some(ProfileKind::Classic)),
+        2 => Ok(Some(ProfileKind::HeliosKeyNegotiation)),
+        other => Err(VaultError::ManifestEncoding(format!(
+            "unknown profile kind {other}"
+        ))),
     }
 }
 
@@ -385,6 +547,7 @@ mod tests {
             persistent_keepalive: 25,
             heliosd_url: Some("http://100.64.0.1:8080".into()),
             ssh_target: Some("christophe@100.64.0.1".into()),
+            profile_type: Some(ProfileKind::HeliosKeyNegotiation),
             key_negotiation: Some(negotiation()),
             preshared_key_is_negotiated: false,
         }
@@ -467,9 +630,28 @@ mod tests {
             client_tls_ca_der: "Y2EtdGxz".into(),
             client_generation: 4,
             astra_authority_url: "https://astra.example".into(),
+            webauthn_rp_id: "astra.example".into(),
+            astra_policy_fingerprint: "11".repeat(32),
+            credential_registry_epoch: 6,
+            astra_credential_bindings: Vec::new(),
             astra_service_key_epoch: 5,
             astra_service_public_key: "c2VydmljZQ==".into(),
         });
+
+        let original_digest =
+            ProfileManifest::from_profile(&source, SecurityGeneration(1)).security_digest();
+        let mut changed_policy = source.clone();
+        changed_policy
+            .key_negotiation
+            .as_mut()
+            .and_then(|block| block.trust.as_mut())
+            .expect("trust material")
+            .astra_policy_fingerprint = "22".repeat(32);
+        assert_ne!(
+            original_digest,
+            ProfileManifest::from_profile(&changed_policy, SecurityGeneration(1)).security_digest(),
+            "a restored policy pin must be observed as a security change"
+        );
 
         let encoded = ProfileManifest::from_profile(&source, SecurityGeneration(1))
             .encode()
@@ -534,6 +716,118 @@ mod tests {
             .encode()
             .expect("encode");
         assert_eq!(resealed[0], MANIFEST_VERSION);
+    }
+
+    /// Version 3 carried trust anchors but not the out-of-band Astra policy.
+    /// It remains decryptable so Orion can ask for a re-issued profile; the
+    /// three missing fields stay conspicuously invalid rather than being
+    /// invented from a signed delegation or a URL.
+    #[test]
+    fn a_v3_manifest_opens_but_cannot_invent_the_astra_policy() {
+        let source = profile();
+        let block = source.key_negotiation.as_ref().expect("negotiation block");
+        let mut v3 = Vec::new();
+        v3.push(MANIFEST_VERSION_WITHOUT_ASTRA_POLICY);
+        v3.extend_from_slice(&12u64.to_be_bytes());
+        codec::put(&mut v3, source.name.as_bytes()).unwrap();
+        codec::put(&mut v3, source.endpoint.as_bytes()).unwrap();
+        codec::put(&mut v3, source.private_key.as_bytes()).unwrap();
+        codec::put(&mut v3, source.peer_public_key.as_bytes()).unwrap();
+        codec::put_option(&mut v3, source.preshared_key.as_deref().map(str::as_bytes)).unwrap();
+        codec::put_option(&mut v3, source.address.as_deref().map(str::as_bytes)).unwrap();
+        codec::put(&mut v3, source.allowed_ips.as_bytes()).unwrap();
+        v3.extend_from_slice(&source.persistent_keepalive.to_be_bytes());
+        codec::put_option(&mut v3, source.heliosd_url.as_deref().map(str::as_bytes)).unwrap();
+        codec::put_option(&mut v3, source.ssh_target.as_deref().map(str::as_bytes)).unwrap();
+        v3.push(1);
+        v3.push(mode_id(block.mode));
+        v3.push(mode_id(block.minimum_mode));
+        codec::put(&mut v3, block.endpoint.as_bytes()).unwrap();
+        codec::put(&mut v3, block.server_name.as_bytes()).unwrap();
+        codec::put(&mut v3, block.gateway_ca_der.as_bytes()).unwrap();
+        codec::put(&mut v3, block.gateway_pq_certificate.as_bytes()).unwrap();
+        codec::put(&mut v3, block.identity.as_bytes()).unwrap();
+        v3.push(1);
+        codec::put(&mut v3, b"0102030405060708090a0b0c0d0e0f10").unwrap();
+        v3.extend_from_slice(&3u64.to_be_bytes());
+        codec::put(&mut v3, b"Y2EtcHE=").unwrap();
+        v3.extend_from_slice(&2u64.to_be_bytes());
+        codec::put(&mut v3, b"Y2EtdGxz").unwrap();
+        v3.extend_from_slice(&4u64.to_be_bytes());
+        codec::put(&mut v3, b"https://astra.example").unwrap();
+        v3.extend_from_slice(&5u64.to_be_bytes());
+        codec::put(&mut v3, b"c2VydmljZQ==").unwrap();
+
+        let decoded = ProfileManifest::decode(&v3).expect("v3 remains decryptable");
+        let trust = decoded
+            .to_profile()
+            .key_negotiation
+            .and_then(|settings| settings.trust)
+            .expect("old trust block");
+        assert!(trust.webauthn_rp_id.is_empty());
+        assert!(trust.astra_policy_fingerprint.is_empty());
+        assert_eq!(trust.credential_registry_epoch, 0);
+        assert!(
+            trust.validate().is_err(),
+            "an old profile must be re-issued, not silently upgraded"
+        );
+    }
+
+    /// A v4 manifest carries no discriminant, and is read as **undeclared**.
+    ///
+    /// Not as classic: the difference is the point of the field. An undeclared
+    /// profile still resolves through the historical inference, so it connects
+    /// exactly as it did — and re-sealing writes the answer down, which is
+    /// what stops the guess from being made a second time.
+    #[test]
+    fn a_v4_manifest_is_undeclared_and_resolves_by_the_old_inference() {
+        let source = profile();
+        let block = source.key_negotiation.as_ref().expect("negotiation block");
+        let mut v4 = Vec::new();
+        v4.push(MANIFEST_VERSION_WITHOUT_PROFILE_KIND);
+        v4.extend_from_slice(&12u64.to_be_bytes());
+        codec::put(&mut v4, source.name.as_bytes()).unwrap();
+        codec::put(&mut v4, source.endpoint.as_bytes()).unwrap();
+        codec::put(&mut v4, source.private_key.as_bytes()).unwrap();
+        codec::put(&mut v4, source.peer_public_key.as_bytes()).unwrap();
+        codec::put_option(&mut v4, source.preshared_key.as_deref().map(str::as_bytes)).unwrap();
+        codec::put_option(&mut v4, source.address.as_deref().map(str::as_bytes)).unwrap();
+        codec::put(&mut v4, source.allowed_ips.as_bytes()).unwrap();
+        v4.extend_from_slice(&source.persistent_keepalive.to_be_bytes());
+        codec::put_option(&mut v4, source.heliosd_url.as_deref().map(str::as_bytes)).unwrap();
+        codec::put_option(&mut v4, source.ssh_target.as_deref().map(str::as_bytes)).unwrap();
+        v4.push(1);
+        v4.push(mode_id(block.mode));
+        v4.push(mode_id(block.minimum_mode));
+        codec::put(&mut v4, block.endpoint.as_bytes()).unwrap();
+        codec::put(&mut v4, block.server_name.as_bytes()).unwrap();
+        codec::put(&mut v4, block.gateway_ca_der.as_bytes()).unwrap();
+        codec::put(&mut v4, block.gateway_pq_certificate.as_bytes()).unwrap();
+        codec::put(&mut v4, block.identity.as_bytes()).unwrap();
+        v4.push(0);
+
+        let decoded = ProfileManifest::decode(&v4).expect("v4 remains decryptable");
+        assert_eq!(decoded.profile_type, None, "a v4 manifest declares nothing");
+        let restored = decoded.to_profile();
+        assert_eq!(restored.kind(), ProfileKind::HeliosKeyNegotiation);
+        assert!(restored.negotiates());
+
+        // Re-sealing records the answer, so the inference happens once.
+        let resealed = ProfileManifest::from_profile(&restored, SecurityGeneration(13));
+        assert_eq!(
+            resealed.profile_type,
+            Some(ProfileKind::HeliosKeyNegotiation)
+        );
+    }
+
+    /// The byte is what decides whether a profile negotiates, so its
+    /// identifiers are pinned rather than derived from the enum order.
+    #[test]
+    fn profile_kind_identifiers_are_stable() {
+        assert_eq!(profile_kind_id(None), 0);
+        assert_eq!(profile_kind_id(Some(ProfileKind::Classic)), 1);
+        assert_eq!(profile_kind_id(Some(ProfileKind::HeliosKeyNegotiation)), 2);
+        assert!(profile_kind_from_id(3).is_err());
     }
 
     /// An unknown version is still refused — compatibility is a list, not a

@@ -19,6 +19,7 @@ import Tooltip from '@mui/material/Tooltip'
 import Typography from '@mui/material/Typography'
 import {
   AlertTriangle,
+  Check,
   ChevronRight,
   KeyRound,
   FileCode2,
@@ -121,6 +122,7 @@ function blankProfile(): ClientProfile {
     public_key: null,
     has_private_key: false,
     has_static_psk: false,
+    profile_type: 'classic',
     address: null,
     allowed_ips: '0.0.0.0/0',
     persistent_keepalive: 25,
@@ -142,6 +144,9 @@ function blankProfile(): ClientProfile {
  * describe a draft that has since moved on.
  */
 type Notice = { tone: 'success' | 'error'; message: string; transient?: boolean }
+
+/** Action waiting for the user's informed bare-volume decision. */
+type VolumeWarningAction = 'import' | 'save'
 
 /** How long a transient notice stays, in milliseconds. */
 const NOTICE_MS = 3000
@@ -237,6 +242,9 @@ export function ProfilesView({
   const [issues, setIssues] = useState<Partial<ProfileIssues>>({})
   const [history, setHistory] = useState<ClientProfile[]>([])
   const [deleteOpen, setDeleteOpen] = useState(false)
+  const [volumeWarningAction, setVolumeWarningAction] =
+    useState<VolumeWarningAction | null>(null)
+  const [volumeWarningBusy, setVolumeWarningBusy] = useState(false)
   const [advanced, setAdvanced] = useState(false)
   const [support, setSupport] = useState<KeyNegotiationSupport | null>(null)
   const fileInput = useRef<HTMLInputElement>(null)
@@ -359,13 +367,6 @@ export function ProfilesView({
     })
     onPathImportHandled()
   }, [config.profiles, loadDraft, onPathImportHandled, pathImport])
-
-  // The tray's «Importer un profil à partir d'un fichier…» ends here: the
-  // picker belongs to this screen, and opening it from the shell would mean a
-  // second one. `0` is the mounted value and opens nothing.
-  useEffect(() => {
-    if (importRequest > 0) fileInput.current?.click()
-  }, [importRequest])
 
   const set = <Key extends keyof ClientProfile>(key: Key, value: ClientProfile[Key]) => {
     setHistory((past) => [...past, draft].slice(-HISTORY_LIMIT))
@@ -520,7 +521,7 @@ export function ProfilesView({
     return () => window.removeEventListener('keydown', onKeyDown)
   }, [undo])
 
-  const save = async () => {
+  const persistDraft = async () => {
     try {
       await onSave(toDraft(draft))
       setDirty(false)
@@ -542,6 +543,72 @@ export function ProfilesView({
       // The global error keeps the draft intact to allow a correction.
     }
   }
+
+  /**
+   * Checks the measured volume posture before an action can persist a key.
+   *
+   * A missing BitLocker posture is not silently accepted: the warning is the
+   * gesture that turns the strict refusal into the existing, visible local
+   * waiver. Once chosen, the backend persists it and subsequent actions do not
+   * nag while the posture panel continues to report the downgrade.
+   */
+  const volumeAllows = async (action: VolumeWarningAction): Promise<boolean> => {
+    try {
+      const posture = await api.vaultPosture()
+      if (posture.volumeProtected || posture.unencryptedVolumeWaived) return true
+      setVolumeWarningAction(action)
+      return false
+    } catch (cause) {
+      setNotice({
+        tone: 'error',
+        message: `Posture du volume indéterminable : ${String(cause)}`,
+      })
+      return false
+    }
+  }
+
+  const save = async () => {
+    if (await volumeAllows('save')) await persistDraft()
+  }
+
+  const requestImport = async () => {
+    if (await volumeAllows('import')) fileInput.current?.click()
+  }
+
+  const acceptUnencryptedVolume = async () => {
+    const action = volumeWarningAction
+    if (!action) return
+    setVolumeWarningBusy(true)
+    try {
+      await api.allowUnencryptedVolume()
+      setVolumeWarningAction(null)
+      setNotice({
+        tone: 'success',
+        message:
+          'Volume non chiffré accepté : le coffre applicatif reste actif, mais la protection au repos est incomplète.',
+      })
+      if (action === 'import') fileInput.current?.click()
+      else await persistDraft()
+    } catch (cause) {
+      setNotice({
+        tone: 'error',
+        message: `Impossible d’enregistrer l’autorisation locale : ${String(cause)}`,
+      })
+    } finally {
+      setVolumeWarningBusy(false)
+    }
+  }
+
+  // The tray's «Importer un profil à partir d'un fichier…» ends here: the
+  // picker belongs to this screen, and opening it from the shell would mean a
+  // second one. `0` is the mounted value and opens nothing. It follows the
+  // same volume warning as the visible Import button.
+  useEffect(() => {
+    if (importRequest > 0) void requestImport()
+    // A counter is the event. The callback intentionally follows the current
+    // measured posture on each event rather than becoming another trigger.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [importRequest])
 
   /** Draws a pair in Rust and shows the public half at once. */
   const generateKey = async () => {
@@ -627,6 +694,26 @@ export function ProfilesView({
     }
   }
 
+  /**
+   * Makes one saved profile the profile Orion loads and connects with.
+   *
+   * Selection is persisted by the Rust shell before the editor follows it.
+   * If persistence fails, keeping the previous draft avoids showing a profile
+   * as loaded while the backend will still connect another one.
+   */
+  const selectProfile = async (profile: ClientProfile) => {
+    if (profile.name === draft.name && profile.name === config.selected) return
+    try {
+      await onSelect(profile.name)
+      loadDraft(profile)
+      setDirty(false)
+      setNotice(null)
+    } catch {
+      // The global error surface owns the backend failure. Most importantly,
+      // do not make the editor claim the rejected selection was adopted.
+    }
+  }
+
   const importFile = async (file: File | undefined) => {
     if (!file) return
     setNotice(null)
@@ -691,11 +778,16 @@ export function ProfilesView({
   }
 
   const exists = config.profiles.some((profile) => profile.name === draft.name)
+  const storedKind = config.profiles.find((profile) => profile.name === draft.name)?.profile_type
+  const draftKind: ClientProfile['profile_type'] = draft.key_negotiation
+    ? 'helios_key_negotiation'
+    : 'classic'
+  const kindChanged = storedKind !== undefined && storedKind !== draftKind
   // A PSK entered during this edit counts as present: it is what the save is
   // about to store, and showing "aucun" next to a value the user just typed
   // would read as the entry having been refused.
   const staticPsk = (draft.has_static_psk && !clearPsk) || stagedPsk
-  const invalid = Object.values(issues).some(Boolean)
+  const invalid = kindChanged || Object.values(issues).some(Boolean)
   // The "Advanced" collapse must flag what it hides: otherwise a faulty field
   // would stay invisible until someone thinks to open it. A narrowed range is
   // *not* one of those: split tunnelling is a decision, not a defect.
@@ -792,25 +884,28 @@ export function ProfilesView({
             color="text.disabled"
             sx={{ px: GUTTER, pb: 0.5 }}
           >
-            Profils
+            Profils à charger
           </Typography>
 
-          <Box component="ul" sx={{ m: 0, p: 0, listStyle: 'none', overflow: 'hidden' }}>
+          <Box
+            component="ul"
+            aria-label="Choisir le profil chargé"
+            sx={{ m: 0, p: 0, listStyle: 'none', overflow: 'hidden' }}
+          >
             {config.profiles.map((profile) => {
               const active = profile.name === draft.name
               return (
                 <Box component="li" key={profile.name}>
                   <ButtonBase
-                    onClick={() => {
-                      loadDraft(profile)
-                      setDirty(false)
-                      setNotice(null)
-                      void onSelect(profile.name).catch(() => {})
-                    }}
+                    onClick={() => void selectProfile(profile)}
+                    aria-label={profile.name}
                     aria-current={active ? 'true' : undefined}
                     sx={{
                       position: 'relative',
-                      display: 'block',
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'space-between',
+                      gap: 0.75,
                       width: '100%',
                       px: GUTTER,
                       py: 1,
@@ -839,10 +934,27 @@ export function ProfilesView({
                         fontSize: 12.5,
                         fontWeight: active ? 650 : 500,
                         color: active ? 'primary.main' : 'text.primary',
+                        minWidth: 0,
+                        flex: 1,
                       }}
                     >
                       {profile.name}
                     </Typography>
+                    {active && (
+                      <Box
+                        aria-hidden
+                        sx={{
+                          display: 'inline-flex',
+                          alignItems: 'center',
+                          gap: 0.35,
+                          color: 'primary.main',
+                          flexShrink: 0,
+                        }}
+                      >
+                        <Check size={12} />
+                        <Typography sx={{ fontSize: 9.5, fontWeight: 700 }}>chargé</Typography>
+                      </Box>
+                    )}
                   </ButtonBase>
                 </Box>
               )
@@ -873,7 +985,7 @@ export function ProfilesView({
               variant="contained"
               startIcon={<Upload size={15} aria-hidden />}
               disabled={importing}
-              onClick={() => fileInput.current?.click()}
+              onClick={() => void requestImport()}
             >
               {importing ? 'Chargement…' : 'Importer'}
             </Button>
@@ -1119,11 +1231,36 @@ export function ProfilesView({
 
           <Divider sx={{ my: 1.75 }} />
 
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, mb: 1.5 }}>
+            <Typography component="h3" sx={{ fontSize: 12.5, fontWeight: 650 }}>
+              Type de profil
+            </Typography>
+            <Typography
+              color="text.secondary"
+              sx={{ fontFamily: 'monospace', fontSize: 11 }}
+            >
+              {draftKind}
+            </Typography>
+          </Box>
+
+          {exists && (
+            <Alert
+              severity={kindChanged ? 'error' : 'info'}
+              role={kindChanged ? 'alert' : 'note'}
+              sx={{ mb: 1.5 }}
+            >
+              {kindChanged
+                ? `Le type enregistré « ${storedKind} » ne peut pas devenir « ${draftKind} » sous le même identifiant. Rétablissez le type initial ou choisissez un nouveau nom.`
+                : 'Le type d’un profil enregistré est immuable. Pour utiliser l’autre type, créez un nouveau profil sous un autre nom afin qu’il reçoive un identifiant distinct.'}
+            </Alert>
+          )}
+
           <KeyNegotiation
             settings={draft.key_negotiation}
             floorBaseline={floorBaseline}
             issue={issues.key_negotiation}
             support={support}
+            kindLocked={exists}
             pskField={pskField}
             onChange={setNegotiation}
             onRaiseFloor={raiseFloor}
@@ -1198,6 +1335,53 @@ export function ProfilesView({
           </Button>
         </DialogActions>
       </Dialog>
+
+      <Dialog
+        open={volumeWarningAction !== null}
+        onClose={() => {
+          if (!volumeWarningBusy) setVolumeWarningAction(null)
+        }}
+        aria-labelledby="unencrypted-volume-title"
+        maxWidth="sm"
+        fullWidth
+      >
+        <DialogTitle
+          id="unencrypted-volume-title"
+          sx={{ display: 'flex', alignItems: 'center', gap: 1 }}
+        >
+          <AlertTriangle size={20} aria-hidden />
+          Continuer sans BitLocker ?
+        </DialogTitle>
+        <DialogContent>
+          <DialogContentText component="div">
+            Le volume qui stocke les profils Orion n’est pas chiffré par BitLocker. Orion
+            chiffrera la configuration dans son coffre, mais la protection restera incomplète :
+            d’anciens blocs SSD, le fichier d’échange et le fichier d’hibernation peuvent conserver
+            des traces de la clé.
+            <Box component="span" sx={{ display: 'block', mt: 1.5 }}>
+              En continuant, vous acceptez cette protection dégradée pour ce poste. Orion la
+              signalera comme protection incomplète.
+            </Box>
+          </DialogContentText>
+        </DialogContent>
+        <DialogActions>
+          <Button
+            color="inherit"
+            disabled={volumeWarningBusy}
+            onClick={() => setVolumeWarningAction(null)}
+          >
+            Annuler
+          </Button>
+          <Button
+            color="warning"
+            variant="contained"
+            disabled={volumeWarningBusy}
+            onClick={() => void acceptUnencryptedVolume()}
+          >
+            {volumeWarningBusy ? 'Autorisation…' : 'Continuer avec une protection incomplète'}
+          </Button>
+        </DialogActions>
+      </Dialog>
     </Box>
   )
 }
@@ -1225,6 +1409,7 @@ function KeyNegotiation({
   floorBaseline,
   issue,
   support,
+  kindLocked,
   pskField,
   onChange,
   onRaiseFloor,
@@ -1235,6 +1420,8 @@ function KeyNegotiation({
   floorBaseline: ProtectionMode | null
   issue?: string | null
   support: KeyNegotiationSupport | null
+  /** An existing stable profile cannot change security variant. */
+  kindLocked: boolean
   /** The static PSK row, shown here when `static_psk` is the chosen mode. */
   pskField: React.ReactNode
   onChange: <Key extends keyof KeyNegotiationSettings>(
@@ -1265,15 +1452,18 @@ function KeyNegotiation({
           describeChild
           title="Sans négociation, le tunnel monte avant toute authentification post-quantique : le premier handshake n’est pas protégé."
         >
-          <Button
-            size="small"
-            variant="outlined"
-            startIcon={<ShieldPlus size={14} aria-hidden />}
-            onClick={() => onToggle(true)}
-            sx={{ ml: 'auto', flexShrink: 0 }}
-          >
-            Ajouter
-          </Button>
+          <span style={{ marginLeft: 'auto' }}>
+            <Button
+              size="small"
+              variant="outlined"
+              startIcon={<ShieldPlus size={14} aria-hidden />}
+              onClick={() => onToggle(true)}
+              disabled={kindLocked}
+              sx={{ flexShrink: 0 }}
+            >
+              Ajouter
+            </Button>
+          </span>
         </Tooltip>
       </Box>
     )
@@ -1283,7 +1473,7 @@ function KeyNegotiation({
   // Removing the block is a downgrade. It stays possible while nothing has
   // been negotiated — a block just added by hand, typically — and the floor
   // is what closes the door as soon as something has.
-  const removable = !floorBaseline || modeLevel(floorBaseline) === 0
+  const removable = !kindLocked && (!floorBaseline || modeLevel(floorBaseline) === 0)
   // A block loaded with `classic` cannot negotiate at all: the gateway
   // refuses that mode by name. It is not offered above, so it can only come
   // from a document written before the rule — and it has to be said, because

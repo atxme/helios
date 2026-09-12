@@ -14,14 +14,12 @@
 //! action becomes reachable, the surface does not change: the block simply
 //! stops being returned.
 //!
-//! # Limite connue : aucune de ces actions ne s'exécute encore
+//! # Execution stays behind the same gate
 //!
-//! Two of them — recovery and rollback — need an operator hardware credential
-//! and the `astra-signer` companion, which Astra itself refuses with `501`
-//! (spec §12.3). That is a known, documented gap.
-//!
-//! The other two are blocked by one of two things, and which one matters: the
-//! first is the operator's to fix, the second is ours.
+//! Renewal and recovery have their network drivers; rollback is a local service
+//! selector over two already-authorized generations. Keeping their admission
+//! here means none of them can begin work and only then discover the state was
+//! unavailable.
 //!
 //! The ordinary §7 renewal has the client sign a rotation request, hand it to
 //! Astra's delegated issuer, relay the resulting staging to the gateway, and
@@ -34,8 +32,15 @@
 //!
 //! That material now has a home — `KeyNegotiationSettings::trust`, carried by
 //! the `.orion` document and the vault manifest — so a profile enrolled since
-//! §19 holds it. What remains is the client half of the §7 exchange itself,
-//! and [`CertificateActionBlock::RenewalPathNotWired`] names that instead.
+//! §19 holds it, and [`crate::certificate_renewal`] signs the request, drives
+//! the operation and commits the grant. The operator's companion closes the
+//! chain over the same tunnel (`astra-signer approve --heliosd-url`), so the
+//! ordinary renewal has no missing link left and is no longer blocked here.
+//!
+//! `RenewalSession::companion_invocation` hands the shell the exact companion
+//! invocation. Launch remains a surface concern and not an action refusal: a
+//! machine whose policy blocks process creation still has a valid operation
+//! and the copyable command as its explicit fallback.
 //!
 //! Either way the refusal happens **before** a key pair is generated or an
 //! authority is asked to certify anything: a button that produced a key and
@@ -45,7 +50,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::certificate_inventory::{CertificateInventory, CertificatePhase};
-use crate::KeyNegotiationSettings;
+use crate::{KeyNegotiationSettings, PreviousIdentityPhase};
 
 /// The four actions spec §12.2 requires the Profiles surface to offer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,11 +109,18 @@ pub enum CertificateActionBlock {
     NothingExpired,
     /// No previous identity is held, so there is nothing to roll back to.
     NoPreviousIdentity,
+    /// A retained identity exists, but its overlap has ended definitively.
+    PreviousIdentityExpired { expired_at: u64 },
     /// The profile carries no trust domain, no Astra authority and no client
     /// `CA-TLS`: §19's discriminant.
     TrustMaterialMissing,
-    /// The trust material is there; the client half of §7 is not wired yet.
-    RenewalPathNotWired,
+    /// The trust material is there and the client half of §7 is wired; what
+    /// is missing is the operator companion's own transport.
+    ///
+    /// **Plus émis** depuis que `astra-signer approve --heliosd-url` existe :
+    /// la variante survit pour qu'un état sérialisé antérieur se relise, et
+    /// [`renewal_block`] ne la rend plus.
+    CompanionTransportMissing,
     /// Needs a hardware credential and the `astra-signer` companion.
     OperatorCredentialRequired,
 }
@@ -142,6 +154,10 @@ impl CertificateActionBlock {
                  pendant le chevauchement qui suit un renouvellement."
                     .into()
             }
+            Self::PreviousIdentityExpired { expired_at } => format!(
+                "L'identité précédente a été retirée à l'échéance {expired_at} du chevauchement. \
+                 La réintroduire ferait redescendre l'état de certificat."
+            ),
             Self::TrustMaterialMissing => {
                 "Ce profil ne porte pas le matériel de confiance qu'un renouvellement exige — \
                  domaine de confiance, autorité Astra épinglée et CA TLS cliente. Il a été \
@@ -149,10 +165,12 @@ impl CertificateActionBlock {
                  document réémis, qui les portera."
                     .into()
             }
-            Self::RenewalPathNotWired => {
-                "Ce profil porte bien son matériel de confiance, mais le chemin de \
-                 renouvellement du §7 — requête au délégué Astra, staging relayé à la gateway, \
-                 commit du grant — n'est pas encore branché côté client."
+            Self::CompanionTransportMissing => {
+                "Ce profil peut demander son renouvellement : la requête part, l'autorité ouvre \
+                 l'opération et attend la clé matérielle de l'opérateur. C'est là que la chaîne \
+                 s'arrête — le compagnon « astra-signer » ne sait pas encore lire sa demande à \
+                 travers le tunnel, et ses routes publiques répondent 501. Le renouvellement \
+                 reste donc en attente d'opérateur jusqu'à ce que ce transport existe."
                     .into()
             }
             Self::OperatorCredentialRequired => {
@@ -211,20 +229,90 @@ fn renewal_block(
     if settings.trust.is_none() {
         return Some(CertificateActionBlock::TrustMaterialMissing);
     }
-    Some(CertificateActionBlock::RenewalPathNotWired)
+    // Nothing blocks it any more. `certificate_renewal` signs the rotation
+    // request, drives the operation and commits the grant; `astra-signer
+    // approve --heliosd-url` fetches its own request through the same tunnel
+    // and posts the operator's assertion back. The chain closes.
+    //
+    // Launching the companion is a surface concern rather than a refusal:
+    // `RenewalSession::companion_invocation` hands the shell the exact value,
+    // and a launch failure still leaves the copyable fallback usable.
+    None
 }
 
-/// Whether anything this profile depends on has already expired.
-fn anything_expired(inventory: &CertificateInventory) -> bool {
-    [
-        inventory.gateway_pq.as_ref(),
-        inventory.gateway_ca_tls.as_ref(),
-        inventory.client_tls.as_ref(),
-        inventory.client_pq.as_ref(),
-    ]
-    .into_iter()
-    .flatten()
-    .any(|facts| facts.phase == CertificatePhase::Expired)
+/// What stands between this profile and a §7.5 recovery.
+///
+/// The same three prerequisites a renewal has — a protected store, the sealed
+/// identity, the trust material — plus the one that makes a recovery a
+/// recovery: a **client** leaf whose validity has passed. Recovery is not
+/// offered as a repair for a gateway certificate that aged out; that is the
+/// operator's side of the domain and no client credential moves it.
+///
+/// The sealed bundle is what makes this possible at all, and the reason the
+/// identity check is not merely inherited from the renewal: the expired
+/// private key signs the request. If the protected store lost it, no
+/// historical proof exists and the answer is a re-admission, which
+/// `certificate_recovery` says in its own words when it is reached.
+fn recovery_block(
+    settings: &KeyNegotiationSettings,
+    inventory: &CertificateInventory,
+    identity_store: bool,
+) -> Option<CertificateActionBlock> {
+    if !identity_store {
+        return Some(CertificateActionBlock::NoIdentityStore);
+    }
+    if !inventory.identity_sealed {
+        return Some(CertificateActionBlock::IdentityMissing {
+            identity: settings.identity.clone(),
+        });
+    }
+    if settings.trust.is_none() {
+        return Some(CertificateActionBlock::TrustMaterialMissing);
+    }
+    let client_expired = [inventory.client_tls.as_ref(), inventory.client_pq.as_ref()]
+        .into_iter()
+        .flatten()
+        .any(|facts| facts.phase == CertificatePhase::Expired);
+    if !client_expired {
+        return Some(CertificateActionBlock::NothingExpired);
+    }
+    // Nothing blocks it any more. `certificate_recovery` signs the historical
+    // request against Astra's public origin, `astra-signer recover` opens the
+    // vault once, and the commit comes back through the private channel — the
+    // client has no tunnel, which is the whole premise.
+    None
+}
+
+/// What stands between this profile and a local §4.4 service rollback.
+fn rollback_block(
+    settings: &KeyNegotiationSettings,
+    inventory: &CertificateInventory,
+    identity_store: bool,
+) -> Option<CertificateActionBlock> {
+    if !identity_store {
+        return Some(CertificateActionBlock::NoIdentityStore);
+    }
+    if !inventory.identity_sealed {
+        return Some(CertificateActionBlock::IdentityMissing {
+            identity: settings.identity.clone(),
+        });
+    }
+    if settings.trust.is_none() {
+        return Some(CertificateActionBlock::TrustMaterialMissing);
+    }
+    let Some(previous) = inventory.previous_identity else {
+        return Some(CertificateActionBlock::NoPreviousIdentity);
+    };
+    match previous.phase {
+        PreviousIdentityPhase::Available => None,
+        // The slot is only created when activation is due, so this state can
+        // only come from a restored future record. Refuse it without inventing
+        // a second pre-activation action reason.
+        PreviousIdentityPhase::NotYetAvailable => Some(CertificateActionBlock::NoPreviousIdentity),
+        PreviousIdentityPhase::Expired => Some(CertificateActionBlock::PreviousIdentityExpired {
+            expired_at: previous.available_until,
+        }),
+    }
 }
 
 /// The state of all four actions for one profile.
@@ -258,36 +346,48 @@ pub fn action_states(
                     },
                 }
             }
-            // Recovery is about an expired identity, and only about that. On a
-            // profile whose certificates are healthy the honest answer is
-            // "rien à récupérer", not the operator credential the user cannot
-            // produce either way.
+            // Recovery is about an expired **client** identity, and only about
+            // that. On a profile whose client leaves are healthy the honest
+            // answer is "rien à récupérer" — even when a gateway certificate
+            // has aged out, because §7.5 restores a client identity and
+            // nothing else.
             CertificateAction::RecoverExpired => {
-                if anything_expired(inventory) {
-                    CertificateActionState::blocked(
+                match recovery_block(settings, inventory, identity_store) {
+                    Some(block) => CertificateActionState::blocked(action, block),
+                    None => CertificateActionState {
                         action,
-                        CertificateActionBlock::OperatorCredentialRequired,
-                    )
-                } else {
-                    CertificateActionState::blocked(action, CertificateActionBlock::NothingExpired)
+                        label: action.label().to_string(),
+                        blocked_by: None,
+                        message: None,
+                    },
                 }
             }
-            // A rollback needs a previous identity held locally. Nothing keeps
-            // one: the protected store holds exactly one bundle per name.
             CertificateAction::RollbackToPrevious => {
-                CertificateActionState::blocked(action, CertificateActionBlock::NoPreviousIdentity)
+                match rollback_block(settings, inventory, identity_store) {
+                    Some(block) => CertificateActionState::blocked(action, block),
+                    None => CertificateActionState {
+                        action,
+                        label: action.label().to_string(),
+                        blocked_by: None,
+                        message: None,
+                    },
+                }
             }
         })
         .collect()
 }
 
-/// Runs an action, or says why it cannot.
+/// Decides whether an action may run, without running it.
 ///
-/// Every path currently returns the block, and that is deliberate: the failure
-/// happens **before** a key pair is generated or an authority is asked to
-/// certify anything. A button that produced a key and then discovered it could
-/// not finish would leave a half-rotation behind on every press.
-pub fn run(
+/// The check is deliberately separate from the work, and it happens **before**
+/// a key pair is generated or an authority is asked to certify anything: an
+/// action that produced a key and then discovered it could not finish would
+/// leave a half-rotation behind on every press.
+///
+/// What follows an `Ok` is [`crate::certificate_renewal::begin`] for renewal,
+/// the recovery driver for an expired identity, or the local service selector
+/// for a rollback.
+pub fn admits(
     action: CertificateAction,
     settings: Option<&KeyNegotiationSettings>,
     inventory: &CertificateInventory,
@@ -299,8 +399,6 @@ pub fn run(
         .ok_or(CertificateActionBlock::NoNegotiation)?;
     match state.blocked_by {
         Some(block) => Err(block),
-        // Unreachable while the trust material is missing, and left as the
-        // shape the §7 driver will fill rather than an `unreachable!()`.
         None => Ok(()),
     }
 }
@@ -418,14 +516,15 @@ mod tests {
             .is_some_and(|message| message.contains("domaine de confiance")));
     }
 
-    /// A profile enrolled since §19 carries the material, so the reason moves
-    /// to the one thing left: the client half of the exchange. Naming the
-    /// format gap there would send the operator re-issuing a document that is
-    /// already correct.
-    #[test]
-    fn a_profile_carrying_its_trust_material_is_blocked_on_the_path_instead() {
+    /// A profile enrolled since §19, with everything §7 and §7.5 need.
+    fn settings_with_trust() -> KeyNegotiationSettings {
         let mut settings = settings();
-        settings.trust = Some(crate::config::TrustMaterial {
+        settings.trust = Some(trust_material());
+        settings
+    }
+
+    fn trust_material() -> crate::config::TrustMaterial {
+        crate::config::TrustMaterial {
             trust_domain_id: "0102030405060708090a0b0c0d0e0f10".into(),
             ca_epoch: 1,
             ca_pq_public_key: String::new(),
@@ -433,9 +532,21 @@ mod tests {
             client_tls_ca_der: String::new(),
             client_generation: 4,
             astra_authority_url: "https://astra.example".into(),
+            webauthn_rp_id: "astra.example".into(),
+            astra_policy_fingerprint: "11".repeat(32),
+            credential_registry_epoch: 1,
+            astra_credential_bindings: Vec::new(),
             astra_service_key_epoch: 1,
             astra_service_public_key: String::new(),
-        });
+        }
+    }
+
+    /// A profile enrolled since §19 carries the material, and the whole chain
+    /// exists behind it. Blocking here would send the operator re-issuing a
+    /// document that is already correct, for a path that already works.
+    #[test]
+    fn a_profile_carrying_its_trust_material_may_renew() {
+        let settings = settings_with_trust();
         let inventory = CertificateInventory {
             identity_sealed: true,
             ..CertificateInventory::default()
@@ -446,7 +557,8 @@ mod tests {
                 CertificateAction::RenewNow
             )
             .blocked_by,
-            Some(CertificateActionBlock::RenewalPathNotWired)
+            None,
+            "a profile carrying its trust material may renew: the chain closes"
         );
     }
 
@@ -454,8 +566,8 @@ mod tests {
     /// certificates that they need a YubiKey answers a question they did not
     /// ask.
     #[test]
-    fn recovery_reports_the_expiry_before_the_credential() {
-        let settings = settings();
+    fn recovery_reports_the_expiry_before_anything_else() {
+        let settings = settings_with_trust();
         let healthy = CertificateInventory {
             identity_sealed: true,
             client_pq: Some(facts(CertificatePhase::Valid)),
@@ -469,7 +581,35 @@ mod tests {
             .blocked_by,
             Some(CertificateActionBlock::NothingExpired)
         );
+    }
 
+    /// A gateway certificate that aged out is the operator's side of the
+    /// domain: no client credential moves it, and offering a recovery for it
+    /// would send the user through a ceremony that repairs nothing they hold.
+    #[test]
+    fn recovery_is_about_the_client_identity_and_not_the_gateways() {
+        let settings = settings_with_trust();
+        let inventory = CertificateInventory {
+            identity_sealed: true,
+            client_pq: Some(facts(CertificatePhase::Valid)),
+            gateway_pq: Some(facts(CertificatePhase::Expired)),
+            ..CertificateInventory::default()
+        };
+        assert_eq!(
+            state_of(
+                &action_states(Some(&settings), &inventory, true),
+                CertificateAction::RecoverExpired
+            )
+            .blocked_by,
+            Some(CertificateActionBlock::NothingExpired)
+        );
+    }
+
+    /// The §7.5 chain closes: an expired client identity, a sealed bundle and
+    /// the trust material are all a recovery needs from this side.
+    #[test]
+    fn an_expired_client_identity_may_be_recovered() {
+        let settings = settings_with_trust();
         let expired = CertificateInventory {
             identity_sealed: true,
             client_pq: Some(facts(CertificatePhase::Expired)),
@@ -481,21 +621,92 @@ mod tests {
                 CertificateAction::RecoverExpired
             )
             .blocked_by,
-            Some(CertificateActionBlock::OperatorCredentialRequired)
+            None
+        );
+
+        // Without the §19 material there is no authority to ask, and that is
+        // the reason to give — not the security key the user cannot use yet.
+        let mut bare = settings.clone();
+        bare.trust = None;
+        assert_eq!(
+            state_of(
+                &action_states(Some(&bare), &expired, true),
+                CertificateAction::RecoverExpired
+            )
+            .blocked_by,
+            Some(CertificateActionBlock::TrustMaterialMissing)
+        );
+    }
+
+    #[test]
+    fn rollback_is_offered_only_while_the_previous_slot_is_in_overlap() {
+        let settings = settings_with_trust();
+        let available = CertificateInventory {
+            identity_sealed: true,
+            previous_identity: Some(crate::PreviousIdentityStatus {
+                available_from: 2_000,
+                available_until: 3_000,
+                phase: PreviousIdentityPhase::Available,
+                selected: false,
+            }),
+            ..CertificateInventory::default()
+        };
+        assert_eq!(
+            state_of(
+                &action_states(Some(&settings), &available, true),
+                CertificateAction::RollbackToPrevious
+            )
+            .blocked_by,
+            None
+        );
+
+        let expired = CertificateInventory {
+            previous_identity: Some(crate::PreviousIdentityStatus {
+                phase: PreviousIdentityPhase::Expired,
+                ..available.previous_identity.expect("status")
+            }),
+            ..available
+        };
+        let states = action_states(Some(&settings), &expired, true);
+        let state = state_of(&states, CertificateAction::RollbackToPrevious);
+        assert_eq!(
+            state.blocked_by,
+            Some(CertificateActionBlock::PreviousIdentityExpired { expired_at: 3_000 })
+        );
+        assert!(state
+            .message
+            .as_ref()
+            .is_some_and(|message| message.contains("retirée")));
+    }
+
+    #[test]
+    fn rollback_without_a_retained_slot_keeps_its_specific_reason() {
+        let settings = settings_with_trust();
+        let inventory = CertificateInventory {
+            identity_sealed: true,
+            ..CertificateInventory::default()
+        };
+        assert_eq!(
+            state_of(
+                &action_states(Some(&settings), &inventory, true),
+                CertificateAction::RollbackToPrevious
+            )
+            .blocked_by,
+            Some(CertificateActionBlock::NoPreviousIdentity)
         );
     }
 
     /// Running a blocked action fails **before** anything is generated: a
     /// half-rotation left behind on every press is worse than a refusal.
     #[test]
-    fn running_a_blocked_action_refuses_with_its_own_reason() {
+    fn admitting_a_blocked_action_refuses_with_its_own_reason() {
         let settings = settings();
         let inventory = CertificateInventory {
             identity_sealed: true,
             ..CertificateInventory::default()
         };
         assert_eq!(
-            run(
+            admits(
                 CertificateAction::RenewNow,
                 Some(&settings),
                 &inventory,

@@ -38,11 +38,15 @@ use serde::{Deserialize, Serialize};
 use crate::key_negotiation::PqCertificate;
 
 use super::{
+    approval::{AstraCredentialBinding, AstraPolicyPin},
     authority::{
         AstraIssuerAuthorization, AstraServiceKeyTransition, CaTransition, ClientTlsCaTransition,
-        EmergencyAstraServiceKeyReplacement,
+        EmergencyAstraServiceKeyReplacement, RotationReason,
     },
-    client::{ClientCertificateGeneration, ClientCertificateStageAuthorization},
+    client::{
+        ClientCertificateGeneration, ClientCertificateRotationGrant,
+        ClientCertificateStageAuthorization,
+    },
     encoding::{
         CanonicalBytes, DerCertificate, Fingerprint, Id16, MlDsa87PublicKey, TrustDomainId,
         WireGuardKey,
@@ -52,7 +56,7 @@ use super::{
         GatewayTransitionAbortTombstone,
     },
     revocation::{EmergencyCertificateRevocation, RevocationScope},
-    status::AstraCertificateStatus,
+    status::{AstraCertificateStatus, CertificateServiceRollbackAuthorization},
     window::TransitionWindow,
     CertificateError,
 };
@@ -126,6 +130,52 @@ pub struct GatewayCertificateState {
     pub revoked: bool,
     #[serde(default)]
     pub revocation_epoch: u64,
+    /// A manual selection of the outgoing leaf, in force during the overlap.
+    ///
+    /// Absent outside a rollback, which is the resting state (spec §4.4).
+    #[serde(default)]
+    pub service_rollback: Option<GatewayServiceRollback>,
+    /// The one transition a revoked identity will still accept (spec §10.1).
+    ///
+    /// Set from `replacement_transition_fingerprint` when a revocation
+    /// withdraws the served identity and names what replaces it. Without it a
+    /// revoked gateway has no way back at all: every transition is refused,
+    /// and the domain has to be rebuilt to bring the service up again.
+    ///
+    /// It names **one exact signed document**, so it is not a re-opening of
+    /// the state — nothing else installs, and the revoked leaves stay in the
+    /// ledger where `install_transition` already refuses them.
+    #[serde(default)]
+    pub awaited_replacement: Option<Fingerprint>,
+}
+
+/// A bounded, manual selection of the outgoing identity (spec §4.4).
+///
+/// It is a **service** rollback and never a state rollback: no counter moves,
+/// no slot is removed, and the decision it lives inside is untouched. It only
+/// says which of the two leaves the gateway presents while the overlap lasts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayServiceRollback {
+    /// Fingerprint of the authorization that installed it.
+    ///
+    /// So the same signed document carried twice is a replay, and a different
+    /// one — a later expiry, say — is a second decision rather than a silent
+    /// extension of the first.
+    pub authorization_fingerprint: Fingerprint,
+    /// The leaf selected. Always the outgoing one; the authorization cannot
+    /// name another, and this state re-checks it.
+    pub selected_certificate_fingerprint: Fingerprint,
+    /// At most the transition's `not_after`: a rollback cannot outlive the
+    /// overlap it rolls back within.
+    pub expires_at: u64,
+}
+
+impl GatewayServiceRollback {
+    /// Whether this selection is still the one to serve at `now_unix`.
+    pub const fn in_force(&self, now_unix: u64) -> bool {
+        now_unix < self.expires_at
+    }
 }
 
 impl GatewayCertificateState {
@@ -171,9 +221,6 @@ impl GatewayCertificateState {
         ledger: &TrustLedger,
         now_unix: u64,
     ) -> Result<InstallOutcome, CertificateError> {
-        if self.revoked {
-            return Err(CertificateError::Revoked);
-        }
         // A revoked leaf never comes back, whatever signs the document that
         // carries it (spec §10.2).
         ledger.assert_not_revoked(&transition.installed_fingerprints()?)?;
@@ -182,13 +229,28 @@ impl GatewayCertificateState {
         // "Identical" is the whole signed document: the same leaves under a
         // different window are a different decision.
         let fingerprint = transition.fingerprint()?;
+        let replaces_revoked = self.awaits_replacement(&fingerprint);
+        if self.revoked && !replaces_revoked {
+            return Err(CertificateError::Revoked);
+        }
+        // The reason is not decoration: an emergency replacement is the one
+        // transition that installs straight into the served slot, so it is
+        // accepted **only** where that is what §10 asks for. Offered on a
+        // healthy identity it would be an immediate, unscheduled swap that no
+        // client has been told about.
+        if (transition.reason == RotationReason::EmergencyReplacement) != replaces_revoked {
+            return Err(CertificateError::IllegalStateTransition(
+                "emergency_replacement belongs to a revoked identity awaiting exactly this \
+                 document, and nothing else does",
+            ));
+        }
         if self
             .next_transition_fingerprint
             .is_some_and(|staged| staged.matches(&fingerprint))
         {
             return Ok(InstallOutcome::AlreadyPresent);
         }
-        if self.next_gateway_identity_epoch.is_some() {
+        if !replaces_revoked && self.next_gateway_identity_epoch.is_some() {
             return Err(CertificateError::IllegalStateTransition(
                 "a transition is already staged",
             ));
@@ -203,6 +265,9 @@ impl GatewayCertificateState {
             &self.active_tls_fingerprint(),
             &self.active_pq_fingerprint()?,
         )?;
+        if replaces_revoked {
+            return self.replace_revoked_identity(transition);
+        }
         if now_unix >= transition.window.activation_at {
             return Err(CertificateError::IllegalStateTransition(
                 "transition activates in the past",
@@ -221,6 +286,59 @@ impl GatewayCertificateState {
         self.activation_at = Some(transition.window.activation_at);
         self.retire_active_at = Some(transition.window.not_after);
         self.published = false;
+        Ok(InstallOutcome::Installed)
+    }
+
+    /// Whether this exact document is the replacement a revocation named.
+    fn awaits_replacement(&self, fingerprint: &Fingerprint) -> bool {
+        self.revoked
+            && self
+                .awaited_replacement
+                .is_some_and(|awaited| awaited.matches(fingerprint))
+    }
+
+    /// Installs the replacement of a revoked identity (spec §6.1, §10.2).
+    ///
+    /// # Why it does not go through the window
+    ///
+    /// §4.1 schedules an **ordinary** transition: prepared, then served, with
+    /// the outgoing identity accepted throughout. Here the outgoing identity
+    /// has been withdrawn — §10.2 makes the revocation dominate `staged`,
+    /// `overlap` and any rollback — so there is nothing to overlap with.
+    /// Staging this one would leave the gateway serving nothing at all until
+    /// `activation_at`, on an incident where the service is already down.
+    ///
+    /// So it lands in the served slot directly, and the decision counter moves
+    /// with it. What keeps that from being a way back into a revoked identity
+    /// is upstream: the ledger refuses the retired fingerprints, and this path
+    /// is only reachable for the one document the revocation itself named.
+    fn replace_revoked_identity(
+        &mut self,
+        transition: &GatewayIdentityTransition,
+    ) -> Result<InstallOutcome, CertificateError> {
+        if let Some(certificate) = &transition.next_gateway_tls_certificate {
+            self.active_gateway_tls_certificate = certificate.clone();
+        }
+        if let Some(certificate) = &transition.next_gateway_certificate {
+            self.active_gateway_certificate = certificate.clone();
+        }
+        self.active_gateway_identity_epoch = transition.gateway_identity_epoch;
+        self.gateway_decision_epoch = transition.gateway_identity_epoch;
+        // Nothing staged, nothing to promote, nothing to roll back to: the
+        // identity this replaces is gone rather than outgoing.
+        self.next_gateway_identity_epoch = None;
+        self.next_transition_fingerprint = None;
+        self.next_gateway_tls_certificate = None;
+        self.next_gateway_certificate = None;
+        self.activation_at = None;
+        self.retire_active_at = None;
+        self.published = false;
+        self.service_rollback = None;
+        self.awaited_replacement = None;
+        // The revocation counter keeps its value. It is a separate axis
+        // (§4.2), and lowering it would make an already-consumed decision
+        // deliverable a second time.
+        self.revoked = false;
         Ok(InstallOutcome::Installed)
     }
 
@@ -279,6 +397,94 @@ impl GatewayCertificateState {
     /// Returns whether anything moved. Promotion is definitive even for a
     /// client that never observed the transition: the decision was persisted,
     /// and the alternative is a fleet that waits forever on its slowest member.
+    /// Whether an overlap is in force at `now_unix` (spec §6.2).
+    ///
+    /// Exactly the window in which the daemon would otherwise serve the
+    /// incoming leaf: staged, published, past `activation_at` and short of
+    /// `not_after`. A rollback is available there and nowhere else — before
+    /// publication the outgoing leaf is already the one served, and after
+    /// `not_after` reviving it would be a state rollback.
+    pub fn in_overlap(&self, now_unix: u64) -> bool {
+        if self.revoked || !self.published || self.next_gateway_identity_epoch.is_none() {
+            return false;
+        }
+        matches!(
+            (self.activation_at, self.retire_active_at),
+            (Some(activation_at), Some(retire_at))
+                if now_unix >= activation_at && now_unix < retire_at
+        )
+    }
+
+    /// Selects the outgoing leaf for the rest of the overlap (spec §4.4).
+    ///
+    /// Changes no counter and removes no slot: the transition it lives inside
+    /// is exactly as it was, and `promote_if_due` will still fire at
+    /// `not_after`. What it changes is which of the two leaves the daemon
+    /// serves — and that is read at startup, not mid-process.
+    ///
+    /// Refused outside an overlap, on a revoked identity, for any leaf other
+    /// than the outgoing one, and for an expiry past the overlap's end.
+    ///
+    /// Verification happens **here**, against the anchor, the transition and
+    /// the leaf this state already holds — as for every other document it
+    /// installs, a caller cannot hand in an authorization it verified against
+    /// something else.
+    pub fn apply_service_rollback(
+        &mut self,
+        authorization: &CertificateServiceRollbackAuthorization,
+        now_unix: u64,
+    ) -> Result<InstallOutcome, CertificateError> {
+        // The state question before the cryptographic one: an operator who
+        // asks for a rollback outside an overlap should be told that, not told
+        // their signature failed against fields that do not exist yet.
+        if !self.in_overlap(now_unix) {
+            return Err(CertificateError::RollbackUnavailable);
+        }
+        let staged = self
+            .next_transition_fingerprint
+            .ok_or(CertificateError::RollbackUnavailable)?;
+        let retire_at = self
+            .retire_active_at
+            .ok_or(CertificateError::RollbackUnavailable)?;
+        // `verify` is what refuses a leaf other than the outgoing one and an
+        // expiry past the overlap: both are checked against the values this
+        // state holds, which is the point of passing them from here.
+        authorization.verify(
+            &self.current_ca_public_key,
+            &self.trust_domain_id,
+            self.ca_epoch,
+            &self.gateway_wg_public_key,
+            &self.server_name,
+            &staged,
+            &self.active_tls_fingerprint(),
+            retire_at,
+            now_unix,
+        )?;
+        let fingerprint = authorization.fingerprint()?;
+        if let Some(existing) = &self.service_rollback {
+            if existing.authorization_fingerprint.matches(&fingerprint) {
+                return Ok(InstallOutcome::AlreadyPresent);
+            }
+        }
+        self.service_rollback = Some(GatewayServiceRollback {
+            authorization_fingerprint: fingerprint,
+            selected_certificate_fingerprint: authorization.selected_certificate_fingerprint,
+            expires_at: authorization.expires_at,
+        });
+        Ok(InstallOutcome::Installed)
+    }
+
+    /// The selection in force at `now_unix`, if any.
+    ///
+    /// Expiry is answered by the clock rather than by a purge: a rollback that
+    /// has run out stops being served the second it does, whether or not
+    /// anything has written to the registry since.
+    pub fn active_service_rollback(&self, now_unix: u64) -> Option<&GatewayServiceRollback> {
+        self.service_rollback
+            .as_ref()
+            .filter(|rollback| rollback.in_force(now_unix))
+    }
+
     pub fn promote_if_due(&mut self, now_unix: u64) -> Result<bool, CertificateError> {
         let Some(retire_at) = self.retire_active_at else {
             return Ok(false);
@@ -301,6 +507,9 @@ impl GatewayCertificateState {
         self.activation_at = None;
         self.retire_active_at = None;
         self.published = false;
+        // The overlap is over, so its selection is too. Keeping it would leave
+        // a document naming a leaf this state no longer holds.
+        self.service_rollback = None;
         Ok(true)
     }
 
@@ -323,6 +532,7 @@ impl GatewayCertificateState {
         revoked_tls_fingerprint: Option<&Fingerprint>,
         revoked_pq_fingerprint: Option<&Fingerprint>,
         revocation_epoch: u64,
+        replacement_transition_fingerprint: Option<&Fingerprint>,
     ) -> Result<bool, CertificateError> {
         let named = |candidate: &Fingerprint| {
             [revoked_tls_fingerprint, revoked_pq_fingerprint]
@@ -341,6 +551,11 @@ impl GatewayCertificateState {
             self.activation_at = None;
             self.retire_active_at = None;
             self.published = false;
+            self.service_rollback = None;
+            // The one document that will still install here. Without it a
+            // revoked gateway has no way back: every transition is refused,
+            // and the service stays down until the domain is rebuilt.
+            self.awaited_replacement = replacement_transition_fingerprint.copied();
             return Ok(true);
         }
 
@@ -364,6 +579,7 @@ impl GatewayCertificateState {
             self.activation_at = None;
             self.retire_active_at = None;
             self.published = false;
+            self.service_rollback = None;
             return Ok(true);
         }
         // A revocation naming a leaf this state never held is not an error —
@@ -730,6 +946,74 @@ impl ClientCertificateState {
         Ok(InstallOutcome::Installed)
     }
 
+    /// Persists a candidate from the **grant**, as Orion does (spec §8.1.2).
+    ///
+    /// The two ends stage from different documents, and that asymmetry is the
+    /// §0.5 amendment rather than an accident: `ClientCertificateStageAuthorization`
+    /// travels Astra → Helios on the veth and Orion never carries it. What
+    /// Orion holds is the grant, and the grant embeds the receipt the gateway
+    /// signed over that authorization — so the stage identifier, the
+    /// authorization fingerprint and the lease are all attested here, none of
+    /// them taken on the client's word.
+    ///
+    /// The candidate lands directly in [`PendingStageState::PendingCommit`]:
+    /// on this end there is no earlier moment. A client holds no candidate at
+    /// all until the grant exists, and `pending_grant` would describe a state
+    /// Orion is never in.
+    ///
+    /// The caller must have verified the grant first. This installs; it does
+    /// not authenticate.
+    pub fn stage_from_grant(
+        &mut self,
+        grant: &ClientCertificateRotationGrant,
+        ledger: &TrustLedger,
+        now_unix: u64,
+    ) -> Result<InstallOutcome, CertificateError> {
+        if self.revoked {
+            return Err(CertificateError::Revoked);
+        }
+        let candidate = grant.candidate()?;
+        ledger.assert_not_revoked(&[
+            candidate.tls_certificate_fingerprint,
+            candidate.pq_certificate_fingerprint,
+        ])?;
+        let receipt = &grant.stage_receipt;
+        if let Some(pending) = &self.pending {
+            if pending.stage_id == receipt.stage_id {
+                // Same rule as `stage`, read through the receipt: the identity
+                // of a staging is the signed authorization behind it, not the
+                // consequences two authorizations happen to share.
+                if pending
+                    .authorization_fingerprint
+                    .matches(&receipt.stage_authorization_fingerprint)
+                {
+                    return Ok(InstallOutcome::AlreadyPresent);
+                }
+                return Err(CertificateError::GenerationConflict {
+                    generation: candidate.generation,
+                });
+            }
+            return Err(CertificateError::StageAlreadyPresent);
+        }
+        if self.next.is_some() {
+            return Err(CertificateError::StageAlreadyPresent);
+        }
+        if now_unix >= receipt.stage_expires_at {
+            return Err(CertificateError::StageExpired);
+        }
+
+        self.pending = Some(ClientCertificatePendingStage {
+            stage_id: receipt.stage_id,
+            authorization_fingerprint: receipt.stage_authorization_fingerprint,
+            request_fingerprint: receipt.request_fingerprint,
+            candidate,
+            state: PendingStageState::PendingCommit,
+            stage_expires_at: receipt.stage_expires_at,
+            window: grant.window,
+        });
+        Ok(InstallOutcome::Installed)
+    }
+
     /// Marks the candidate as released to the client, still not activable.
     ///
     /// **Orion's** step, and only Orion's: the gateway never sees the grant
@@ -878,6 +1162,34 @@ impl ClientCertificateState {
         }
     }
 
+    /// The PQ fingerprint belonging to the **same generation** as `tls`.
+    ///
+    /// The negotiation resolves a caller by the fingerprint mTLS proved, then
+    /// has to know which PQ leaf that caller may present. Returning the union
+    /// of both generations would accept the mixed pair of spec §3.3 — the TLS
+    /// of the outgoing identity beside the PQ of the incoming one, an identity
+    /// the domain never issued. So the answer is one fingerprint: the partner
+    /// of the half already proved.
+    pub fn pq_paired_with_tls(&self, tls: &Fingerprint, now_unix: u64) -> Option<Fingerprint> {
+        if self.revoked {
+            return None;
+        }
+        if self.active.tls_certificate_fingerprint.matches(tls) && self.active.is_valid_at(now_unix)
+        {
+            return Some(self.active.pq_certificate_fingerprint);
+        }
+        match (&self.next, self.activation_at) {
+            (Some(next), Some(activation_at))
+                if now_unix >= activation_at
+                    && next.tls_certificate_fingerprint.matches(tls)
+                    && next.is_valid_at(now_unix) =>
+            {
+                Some(next.pq_certificate_fingerprint)
+            }
+            _ => None,
+        }
+    }
+
     /// PQ fingerprints acceptable at `now_unix`, for the trust-update route.
     pub fn acceptable_pq_fingerprints(&self, now_unix: u64) -> Vec<Fingerprint> {
         if self.revoked {
@@ -992,6 +1304,14 @@ fn generation_snapshot(bytes: &mut CanonicalBytes, generation: &ClientCertificat
 pub struct AstraProfile {
     pub authority_url: String,
     pub webauthn_rp_id: String,
+    /// Policy confirmed independently of any CA-PQ-signed delegation.
+    pub astra_policy_fingerprint: AstraPolicyPin,
+    /// Highest credential-registry epoch accepted by this consumer.
+    pub credential_registry_epoch: u64,
+    /// Last CA-PQ-signed decision per credential identifier. The global epoch
+    /// alone cannot make `revoked` terminal against a later forged restore.
+    #[serde(default)]
+    pub credential_bindings: BTreeMap<String, AstraCredentialBinding>,
     pub active_astra_service_public_key: MlDsa87PublicKey,
     pub next_astra_service_public_key: Option<MlDsa87PublicKey>,
     /// Fingerprint of the `AstraServiceKeyTransition` document that staged it.
@@ -1013,6 +1333,30 @@ pub struct AstraProfile {
 }
 
 impl AstraProfile {
+    /// Applies one credential decision without allowing rollback or revival.
+    pub fn accept_credential_binding(
+        &mut self,
+        binding: &AstraCredentialBinding,
+    ) -> Result<InstallOutcome, CertificateError> {
+        if binding.credential_registry_epoch < self.credential_registry_epoch {
+            return Err(CertificateError::GenerationRollback {
+                current: self.credential_registry_epoch,
+                proposed: binding.credential_registry_epoch,
+            });
+        }
+        let key = Fingerprint::of(&binding.credential_id).to_string();
+        let previous = self.credential_bindings.get(&key);
+        binding.supersedes(previous)?;
+        if previous.is_some_and(|known| known.fingerprint().matches(&binding.fingerprint())) {
+            return Ok(InstallOutcome::AlreadyPresent);
+        }
+        self.credential_registry_epoch = self
+            .credential_registry_epoch
+            .max(binding.credential_registry_epoch);
+        self.credential_bindings.insert(key, binding.clone());
+        Ok(InstallOutcome::Installed)
+    }
+
     /// The key that verifies a response announcing `epoch`.
     ///
     /// A response never selects its own verifier: the epoch it declares is
@@ -1237,6 +1581,10 @@ pub struct ScheduledRevocation {
     pub revoked_pq_not_after: Option<u64>,
     /// Fingerprint of the signed revocation, carried through to the tombstone.
     pub revocation_fingerprint: Option<Fingerprint>,
+    /// The replacement the revocation named, carried to the state it will
+    /// have to accept it from (spec §10.1).
+    #[serde(default)]
+    pub replacement_transition_fingerprint: Option<Fingerprint>,
 }
 
 impl ScheduledRevocation {
@@ -1379,6 +1727,7 @@ impl TrustLedger {
             revoked_pq_fingerprint: revocation.revoked_pq_fingerprint,
             revoked_pq_not_after: revocation.revoked_pq_not_after,
             revocation_fingerprint: Some(revocation.fingerprint()),
+            replacement_transition_fingerprint: revocation.replacement_transition_fingerprint,
         });
         Ok(())
     }
@@ -1444,10 +1793,15 @@ impl TrustLedger {
                     }
                 }
                 RevocationScope::Gateway => {
+                    // The client records the awaited replacement for the same
+                    // reason the gateway does: without it, a client that
+                    // received the revocation would refuse the transition
+                    // that repairs the service, and stay refusing forever.
                     gateway.apply_revocation(
                         revocation.revoked_tls_fingerprint.as_ref(),
                         revocation.revoked_pq_fingerprint.as_ref(),
                         revocation.revocation_epoch,
+                        revocation.replacement_transition_fingerprint.as_ref(),
                     )?;
                 }
             }
@@ -1575,10 +1929,17 @@ impl TrustLedger {
                 .u8(scope_byte(revocation.scope))
                 .u64(revocation.revocation_epoch)
                 .u64(revocation.effective_at)
-                .optional_fingerprint(revocation.revoked_tls_fingerprint.as_ref())
-                .optional_u64(revocation.revoked_tls_not_after)
-                .optional_fingerprint(revocation.revoked_pq_fingerprint.as_ref())
-                .optional_u64(revocation.revoked_pq_not_after)
+                // The same one-flag-per-pair rule as the signed revocation
+                // (spec §0.5): the base-state fingerprint must not be able to
+                // describe a half-filled pair either.
+                .optional_revoked_leaf(
+                    revocation.revoked_tls_fingerprint.as_ref(),
+                    revocation.revoked_tls_not_after,
+                )
+                .optional_revoked_leaf(
+                    revocation.revoked_pq_fingerprint.as_ref(),
+                    revocation.revoked_pq_not_after,
+                )
                 .optional_fingerprint(revocation.revocation_fingerprint.as_ref());
         }
         bytes.u16(self.revoked.len() as u16);
@@ -1748,6 +2109,88 @@ mod tests {
             window: TransitionWindow::new(1_000, 10_000, 20_000).expect("window"),
         });
         state
+    }
+
+    /// The negotiation resolves a caller by the TLS half mTLS proved, and
+    /// must then know which PQ leaf that caller may present.
+    ///
+    /// The answer is the partner of that exact half, never the union of both
+    /// generations: the union accepts the mixed pair of §3.3 — the TLS of the
+    /// outgoing identity beside the PQ of the incoming one — which is an
+    /// identity the domain never issued.
+    #[test]
+    fn the_pq_half_returned_belongs_to_the_generation_the_tls_half_named() {
+        let active = generation(4, 1);
+        let next = generation(5, 2);
+        let mut state = ClientCertificateState::new(active.clone());
+        state.next = Some(next.clone());
+        state.activation_at = Some(1_000);
+
+        assert_eq!(
+            state.pq_paired_with_tls(&active.tls_certificate_fingerprint, 2_000),
+            Some(active.pq_certificate_fingerprint)
+        );
+        assert_eq!(
+            state.pq_paired_with_tls(&next.tls_certificate_fingerprint, 2_000),
+            Some(next.pq_certificate_fingerprint)
+        );
+        // Never the other one's, from either side.
+        assert_ne!(
+            state.pq_paired_with_tls(&active.tls_certificate_fingerprint, 2_000),
+            Some(next.pq_certificate_fingerprint)
+        );
+    }
+
+    /// Before its activation instant the successor is not an identity yet.
+    #[test]
+    fn a_successor_resolves_nothing_until_its_activation() {
+        let active = generation(4, 1);
+        let next = generation(5, 2);
+        let mut state = ClientCertificateState::new(active.clone());
+        state.next = Some(next.clone());
+        state.activation_at = Some(1_000);
+
+        assert_eq!(
+            state.pq_paired_with_tls(&next.tls_certificate_fingerprint, 999),
+            None
+        );
+        assert_eq!(
+            state.pq_paired_with_tls(&next.tls_certificate_fingerprint, 1_000),
+            Some(next.pq_certificate_fingerprint)
+        );
+    }
+
+    /// Revocation dominates: neither half of either generation resolves.
+    #[test]
+    fn a_revoked_peer_resolves_no_pq_half_at_all() {
+        let active = generation(4, 1);
+        let next = generation(5, 2);
+        let mut state = ClientCertificateState::new(active.clone());
+        state.next = Some(next.clone());
+        state.activation_at = Some(1_000);
+        state.revoke(7);
+
+        assert_eq!(
+            state.pq_paired_with_tls(&active.tls_certificate_fingerprint, 2_000),
+            None
+        );
+        assert_eq!(
+            state.pq_paired_with_tls(&next.tls_certificate_fingerprint, 2_000),
+            None
+        );
+    }
+
+    /// A candidate under lease is not presentable, so it resolves nothing —
+    /// the same rule `accepts_pair` applies, stated for the half the
+    /// negotiation actually looks up.
+    #[test]
+    fn a_candidate_under_lease_resolves_no_pq_half() {
+        let state = staged_state();
+        let candidate = generation(5, 2);
+        assert_eq!(
+            state.pq_paired_with_tls(&candidate.tls_certificate_fingerprint, 2_000),
+            None
+        );
     }
 
     /// The commit is the moment a candidate becomes usable, and not before.
@@ -2020,6 +2463,7 @@ mod tests {
         use crate::certificates::authority::RotationReason;
         use crate::certificates::encoding::{generate_ml_dsa_87_keypair, MlDsa87Signature};
         use crate::certificates::gateway::AbortReason;
+        use crate::certificates::status::CertificateServiceRollbackAuthorization;
         use crate::certificates::{CERTIFICATE_FORMAT_VERSION, CERTIFICATE_PROTOCOL_VERSION};
         use crate::key_negotiation::{
             issue_pq_certificate, PqCertificateRole, PQ_CERTIFICATE_VERSION,
@@ -2084,6 +2528,8 @@ mod tests {
                 published: false,
                 revoked: false,
                 revocation_epoch: 0,
+                service_rollback: None,
+                awaited_replacement: None,
             }
         }
 
@@ -2134,6 +2580,407 @@ mod tests {
                 ca_signature: MlDsa87Signature::new(vec![0; 4627]).expect("placeholder"),
             };
             abort.sign(&ca.private).expect("sign")
+        }
+
+        /// Builds a state sitting inside a published overlap: the window is
+        /// [2_000, 3_000), so 2_000 is the first second the daemon would serve
+        /// the incoming leaf and 2_999 the last.
+        fn in_overlap(ca: &Keys, active: &Keys, candidate: &Keys) -> GatewayCertificateState {
+            let mut state = state(ca, leaf(ca, active, 1));
+            let transition = transition(ca, &state, 2, leaf(ca, candidate, 2));
+            state
+                .install_transition(&transition, &TrustLedger::default(), 500)
+                .expect("install");
+            state.mark_published().expect("publish");
+            state
+        }
+
+        /// A rollback authorization signed by `ca` for the state's own overlap.
+        fn rollback(
+            ca: &Keys,
+            state: &GatewayCertificateState,
+            selected: Fingerprint,
+            expires_at: u64,
+        ) -> CertificateServiceRollbackAuthorization {
+            let authorization = CertificateServiceRollbackAuthorization {
+                format_version: CERTIFICATE_FORMAT_VERSION,
+                trust_domain_id: state.trust_domain_id,
+                ca_epoch: state.ca_epoch,
+                gateway_wg_public_key: state.gateway_wg_public_key,
+                server_name: state.server_name.clone(),
+                transition_fingerprint: state
+                    .next_transition_fingerprint
+                    .unwrap_or_else(|| Fingerprint::of(b"no staged transition")),
+                selected_certificate_fingerprint: selected,
+                campaign_fingerprint: Fingerprint::of(b"campaign"),
+                expires_at,
+                ca_signature: MlDsa87Signature::new(vec![0; 4627]).expect("placeholder"),
+            };
+            authorization.sign(&ca.private).expect("sign")
+        }
+
+        /// A transition with the emergency reason, for a state that has been
+        /// revoked and told what replaces it.
+        fn replacement(
+            ca: &Keys,
+            state: &GatewayCertificateState,
+            epoch: u64,
+            next: PqCertificate,
+        ) -> GatewayIdentityTransition {
+            let mut transition = transition(ca, state, epoch, next);
+            transition.reason = RotationReason::EmergencyReplacement;
+            transition.sign(&ca.private).expect("sign")
+        }
+
+        /// §10.2 followed by §6.1: the revocation names what replaces the
+        /// identity it withdraws, and that one document still installs.
+        #[test]
+        fn a_revoked_identity_accepts_the_replacement_its_revocation_named() {
+            let (ca, active, candidate) = (keys(), keys(), keys());
+            let mut state = state(&ca, leaf(&ca, &active, 1));
+            let revoked_pq = state.active_pq_fingerprint().expect("fingerprint");
+            let replacement = replacement(&ca, &state, 2, leaf(&ca, &candidate, 2));
+            let named = replacement.fingerprint().expect("fingerprint");
+
+            assert!(state
+                .apply_revocation(None, Some(&revoked_pq), 3, Some(&named))
+                .expect("revocation"));
+            assert!(state.revoked);
+            assert!(
+                state.acceptable_pq_fingerprints(1_500).unwrap().is_empty(),
+                "a revoked gateway offers nothing while it waits"
+            );
+
+            assert_eq!(
+                state
+                    .install_transition(&replacement, &TrustLedger::default(), 1_500)
+                    .expect("replacement"),
+                InstallOutcome::Installed
+            );
+            // Served immediately: there is no outgoing identity to overlap
+            // with, and staging would leave the service down until
+            // activation_at.
+            assert!(!state.revoked);
+            assert_eq!(state.active_gateway_identity_epoch, 2);
+            assert_eq!(state.gateway_decision_epoch, 2);
+            assert!(state.next_gateway_identity_epoch.is_none());
+            assert!(state.activation_at.is_none());
+            assert_eq!(state.acceptable_pq_fingerprints(1_500).unwrap().len(), 1);
+            assert_eq!(
+                state.revocation_epoch, 3,
+                "the revocation counter is a separate axis and never comes back down"
+            );
+            assert!(state.awaited_replacement.is_none());
+        }
+
+        /// Any other document, however well signed, stays refused.
+        #[test]
+        fn a_revoked_identity_refuses_every_transition_but_the_one_named() {
+            let (ca, active, candidate) = (keys(), keys(), keys());
+            let mut state = state(&ca, leaf(&ca, &active, 1));
+            let revoked_pq = state.active_pq_fingerprint().expect("fingerprint");
+            let named = replacement(&ca, &state, 2, leaf(&ca, &candidate, 2))
+                .fingerprint()
+                .expect("fingerprint");
+            state
+                .apply_revocation(None, Some(&revoked_pq), 3, Some(&named))
+                .expect("revocation");
+
+            let other = keys();
+            let elsewhere = replacement(&ca, &state, 2, leaf(&ca, &other, 3));
+            assert!(matches!(
+                state.install_transition(&elsewhere, &TrustLedger::default(), 1_500),
+                Err(CertificateError::Revoked)
+            ));
+            assert!(state.revoked);
+        }
+
+        /// A revocation that names nothing leaves the identity terminal, which
+        /// is what it was before this path existed.
+        #[test]
+        fn a_revocation_naming_no_replacement_stays_terminal() {
+            let (ca, active, candidate) = (keys(), keys(), keys());
+            let mut state = state(&ca, leaf(&ca, &active, 1));
+            let revoked_pq = state.active_pq_fingerprint().expect("fingerprint");
+            state
+                .apply_revocation(None, Some(&revoked_pq), 3, None)
+                .expect("revocation");
+            assert!(state.awaited_replacement.is_none());
+
+            let refused = replacement(&ca, &state, 2, leaf(&ca, &candidate, 2));
+            assert!(matches!(
+                state.install_transition(&refused, &TrustLedger::default(), 1_500),
+                Err(CertificateError::Revoked)
+            ));
+        }
+
+        /// The revoked leaves never come back, whatever names them: the ledger
+        /// refuses them before the awaited fingerprint is even consulted.
+        #[test]
+        fn the_replacement_may_not_reinstall_the_leaf_that_was_revoked() {
+            let (ca, active) = (keys(), keys());
+            let mut state = state(&ca, leaf(&ca, &active, 1));
+            let revoked = leaf(&ca, &active, 7);
+            let revoked_fingerprint = pq_certificate_fingerprint(&revoked).expect("fingerprint");
+            let reinstalls = replacement(&ca, &state, 2, revoked);
+            let named = reinstalls.fingerprint().expect("fingerprint");
+            state
+                .apply_revocation(
+                    None,
+                    Some(&state.active_pq_fingerprint().expect("fingerprint")),
+                    3,
+                    Some(&named),
+                )
+                .expect("revocation");
+
+            let ledger = TrustLedger {
+                revoked: vec![RevocationTombstone {
+                    scope: RevocationScope::Gateway,
+                    family: RevokedFamily::Pq,
+                    fingerprint: revoked_fingerprint,
+                    revocation_epoch: 3,
+                    expires_at: 100_000,
+                    revocation_fingerprint: None,
+                }],
+                ..TrustLedger::default()
+            };
+
+            assert!(state
+                .install_transition(&reinstalls, &ledger, 1_500)
+                .is_err());
+            assert!(state.revoked, "and the identity stays withdrawn");
+        }
+
+        /// The reason and the situation must agree in both directions: an
+        /// emergency replacement offered to a healthy identity would be an
+        /// immediate swap nobody scheduled.
+        #[test]
+        fn the_emergency_reason_belongs_only_to_a_revoked_identity() {
+            let (ca, active, candidate) = (keys(), keys(), keys());
+            let mut state = state(&ca, leaf(&ca, &active, 1));
+            let emergency = replacement(&ca, &state, 2, leaf(&ca, &candidate, 2));
+            assert!(matches!(
+                state.install_transition(&emergency, &TrustLedger::default(), 1_500),
+                Err(CertificateError::IllegalStateTransition(_))
+            ));
+
+            // And the converse: the awaited document must carry the reason.
+            let ordinary = transition(&ca, &state, 2, leaf(&ca, &candidate, 3));
+            let named = ordinary.fingerprint().expect("fingerprint");
+            state
+                .apply_revocation(
+                    None,
+                    Some(&state.active_pq_fingerprint().expect("fingerprint")),
+                    3,
+                    Some(&named),
+                )
+                .expect("revocation");
+            assert!(matches!(
+                state.install_transition(&ordinary, &TrustLedger::default(), 1_500),
+                Err(CertificateError::IllegalStateTransition(_))
+            ));
+        }
+
+        /// The window a rollback lives in is exactly the window in which the
+        /// daemon would otherwise serve the incoming leaf.
+        #[test]
+        fn the_overlap_opens_at_activation_and_closes_at_not_after() {
+            let (ca, active, candidate) = (keys(), keys(), keys());
+            let mut state = state(&ca, leaf(&ca, &active, 1));
+            assert!(!state.in_overlap(2_500), "nothing staged");
+
+            let transition = transition(&ca, &state, 2, leaf(&ca, &candidate, 2));
+            state
+                .install_transition(&transition, &TrustLedger::default(), 500)
+                .expect("install");
+            assert!(!state.in_overlap(2_500), "staged but not published");
+
+            state.mark_published().expect("publish");
+            assert!(!state.in_overlap(1_999), "before activation_at");
+            assert!(state.in_overlap(2_000));
+            assert!(state.in_overlap(2_999));
+            assert!(!state.in_overlap(3_000), "at not_after the overlap is over");
+        }
+
+        /// The nominal gesture of §11.1 step 8: during the overlap, the
+        /// outgoing leaf is selected again, and nothing else moves.
+        #[test]
+        fn a_rollback_selects_the_outgoing_leaf_without_moving_a_counter() {
+            let (ca, active, candidate) = (keys(), keys(), keys());
+            let mut state = in_overlap(&ca, &active, &candidate);
+            let outgoing = state.active_tls_fingerprint();
+            let authorization = rollback(&ca, &state, outgoing, 2_800);
+
+            assert_eq!(
+                state
+                    .apply_service_rollback(&authorization, 2_100)
+                    .expect("rollback"),
+                InstallOutcome::Installed
+            );
+            assert_eq!(state.active_gateway_identity_epoch, 1);
+            assert_eq!(state.gateway_decision_epoch, 2);
+            assert_eq!(state.next_gateway_identity_epoch, Some(2));
+            assert!(state.published);
+            assert_eq!(
+                state.acceptable_pq_fingerprints(2_100).unwrap().len(),
+                2,
+                "a service rollback changes what is served, not what is accepted"
+            );
+            assert!(state.active_service_rollback(2_100).is_some());
+        }
+
+        /// The same signed document twice is a replay; the state says so
+        /// rather than writing a second time.
+        #[test]
+        fn the_same_authorization_carried_twice_is_a_replay() {
+            let (ca, active, candidate) = (keys(), keys(), keys());
+            let mut state = in_overlap(&ca, &active, &candidate);
+            let outgoing = state.active_tls_fingerprint();
+            let authorization = rollback(&ca, &state, outgoing, 2_800);
+            state
+                .apply_service_rollback(&authorization, 2_100)
+                .expect("rollback");
+            assert_eq!(
+                state
+                    .apply_service_rollback(&authorization, 2_200)
+                    .expect("replay"),
+                InstallOutcome::AlreadyPresent
+            );
+        }
+
+        /// Expiry is answered by the clock, not by a purge.
+        #[test]
+        fn a_rollback_stops_being_served_the_second_it_expires() {
+            let (ca, active, candidate) = (keys(), keys(), keys());
+            let mut state = in_overlap(&ca, &active, &candidate);
+            let outgoing = state.active_tls_fingerprint();
+            let authorization = rollback(&ca, &state, outgoing, 2_800);
+            state
+                .apply_service_rollback(&authorization, 2_100)
+                .expect("rollback");
+            assert!(state.active_service_rollback(2_799).is_some());
+            assert!(state.active_service_rollback(2_800).is_none());
+            assert!(
+                state.service_rollback.is_some(),
+                "the document is kept; only its effect ends"
+            );
+        }
+
+        /// Outside the overlap there is nothing to roll back to: before
+        /// publication the outgoing leaf is already served, and after
+        /// `not_after` reviving it would be a state rollback.
+        #[test]
+        fn a_rollback_is_refused_outside_an_overlap() {
+            let (ca, active, candidate) = (keys(), keys(), keys());
+            let mut state = state(&ca, leaf(&ca, &active, 1));
+            let outgoing = state.active_tls_fingerprint();
+            let unstaged = rollback(&ca, &state, outgoing, 2_800);
+            assert!(matches!(
+                state.apply_service_rollback(&unstaged, 2_100),
+                Err(CertificateError::RollbackUnavailable)
+            ));
+
+            let transition = transition(&ca, &state, 2, leaf(&ca, &candidate, 2));
+            state
+                .install_transition(&transition, &TrustLedger::default(), 500)
+                .expect("install");
+            let authorization = rollback(&ca, &state, outgoing, 2_800);
+            assert!(
+                matches!(
+                    state.apply_service_rollback(&authorization, 2_100),
+                    Err(CertificateError::RollbackUnavailable)
+                ),
+                "staged but unpublished: the outgoing leaf is already the one served"
+            );
+
+            state.mark_published().expect("publish");
+            let early = rollback(&ca, &state, outgoing, 1_900);
+            assert!(
+                matches!(
+                    state.apply_service_rollback(&early, 1_800),
+                    Err(CertificateError::RollbackUnavailable)
+                ),
+                "before activation_at"
+            );
+        }
+
+        /// Naming any leaf but the outgoing one would make this a downgrade
+        /// primitive rather than a selection.
+        #[test]
+        fn a_rollback_may_name_only_the_outgoing_leaf() {
+            let (ca, active, candidate) = (keys(), keys(), keys());
+            let mut state = in_overlap(&ca, &active, &candidate);
+            let elsewhere = rollback(&ca, &state, Fingerprint::of(b"another leaf"), 2_800);
+            assert!(matches!(
+                state.apply_service_rollback(&elsewhere, 2_100),
+                Err(CertificateError::RollbackUnavailable)
+            ));
+        }
+
+        /// A rollback cannot outlive the overlap it rolls back within, and
+        /// cannot be installed already expired.
+        #[test]
+        fn a_rollback_is_bounded_by_the_overlap_it_lives_in() {
+            let (ca, active, candidate) = (keys(), keys(), keys());
+            let mut state = in_overlap(&ca, &active, &candidate);
+            let outgoing = state.active_tls_fingerprint();
+            let beyond = rollback(&ca, &state, outgoing, 3_001);
+            assert!(
+                matches!(
+                    state.apply_service_rollback(&beyond, 2_100),
+                    Err(CertificateError::RollbackUnavailable)
+                ),
+                "past not_after"
+            );
+            let spent = rollback(&ca, &state, outgoing, 2_100);
+            assert!(
+                matches!(
+                    state.apply_service_rollback(&spent, 2_100),
+                    Err(CertificateError::RollbackUnavailable)
+                ),
+                "already expired"
+            );
+            let exact = rollback(&ca, &state, outgoing, 3_000);
+            state
+                .apply_service_rollback(&exact, 2_100)
+                .expect("exactly not_after is allowed");
+        }
+
+        /// Promotion ends the overlap, so it ends the selection: keeping it
+        /// would leave a document naming a leaf the state no longer holds.
+        #[test]
+        fn promotion_clears_the_selection_it_ends() {
+            let (ca, active, candidate) = (keys(), keys(), keys());
+            let mut state = in_overlap(&ca, &active, &candidate);
+            let outgoing = state.active_tls_fingerprint();
+            let authorization = rollback(&ca, &state, outgoing, 3_000);
+            state
+                .apply_service_rollback(&authorization, 2_100)
+                .expect("rollback");
+            assert!(state.promote_if_due(3_000).expect("promotion"));
+            assert!(state.service_rollback.is_none());
+        }
+
+        /// A revoked identity offers nothing to serve, rolled back or not.
+        #[test]
+        fn revocation_clears_the_selection_and_forbids_a_new_one() {
+            let (ca, active, candidate) = (keys(), keys(), keys());
+            let mut state = in_overlap(&ca, &active, &candidate);
+            let outgoing = state.active_tls_fingerprint();
+            let authorization = rollback(&ca, &state, outgoing, 3_000);
+            let second = rollback(&ca, &state, outgoing, 2_900);
+            state
+                .apply_service_rollback(&authorization, 2_100)
+                .expect("rollback");
+            assert!(state
+                .apply_revocation(Some(&outgoing), None, 1, None)
+                .expect("revocation"));
+            assert!(state.service_rollback.is_none());
+            assert!(!state.in_overlap(2_200));
+            assert!(matches!(
+                state.apply_service_rollback(&second, 2_200),
+                Err(CertificateError::RollbackUnavailable)
+            ));
         }
 
         #[test]
@@ -2441,6 +3288,10 @@ mod tests {
         let profile = AstraProfile {
             authority_url: "https://astra.example".into(),
             webauthn_rp_id: "astra.example".into(),
+            astra_policy_fingerprint: AstraPolicyPin::new(Fingerprint::of(b"policy"))
+                .expect("policy"),
+            credential_registry_epoch: 1,
+            credential_bindings: BTreeMap::new(),
             active_astra_service_public_key: active,
             next_astra_service_public_key: Some(next),
             next_service_key_transition_fingerprint: None,
@@ -2454,5 +3305,49 @@ mod tests {
         assert!(profile.service_key_for(4, 999).is_none());
         assert!(profile.service_key_for(4, 1_000).is_some());
         assert!(profile.service_key_for(3, 2_000).is_none());
+    }
+
+    #[test]
+    fn the_astra_profile_refuses_a_binding_older_than_its_global_registry() {
+        let Ok(service_key) = MlDsa87PublicKey::new(vec![1; 2_592]) else {
+            return;
+        };
+        let mut profile = AstraProfile {
+            authority_url: "https://astra.example".into(),
+            webauthn_rp_id: "astra.example".into(),
+            astra_policy_fingerprint: AstraPolicyPin::new(Fingerprint::of(b"policy"))
+                .expect("policy"),
+            credential_registry_epoch: 7,
+            credential_bindings: BTreeMap::new(),
+            active_astra_service_public_key: service_key,
+            next_astra_service_public_key: None,
+            next_service_key_transition_fingerprint: None,
+            astra_service_key_epoch: 1,
+            service_key_activation_at: None,
+            service_key_retire_active_at: None,
+            service_key_revocation_epoch: 0,
+            last_emergency_replacement_fingerprint: None,
+        };
+        let stale = AstraCredentialBinding {
+            format_version: crate::certificates::CERTIFICATE_FORMAT_VERSION,
+            credential_id: vec![1],
+            credential_public_key: vec![1],
+            aaguid: [0; 16],
+            trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+            gateway_wg_public_key: WireGuardKey::from_bytes([2; 32]),
+            state: crate::certificates::approval::CredentialState::Active,
+            credential_epoch: 1,
+            credential_registry_epoch: 6,
+            ca_epoch: 1,
+            created_at: 1,
+            ca_pq_signature: super::super::encoding::MlDsa87Signature::placeholder(),
+        };
+        assert!(matches!(
+            profile.accept_credential_binding(&stale),
+            Err(CertificateError::GenerationRollback {
+                current: 7,
+                proposed: 6
+            })
+        ));
     }
 }

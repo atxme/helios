@@ -121,7 +121,7 @@ export function PosturePanel({ anchor, onClose, state, adapterUp, profile, psk, 
             {!vault.volumeProtected && (
               <Row
                 label="volume"
-                value={vault.unencryptedVolumeWaived ? 'non chiffré — exigence levée' : 'non couvert'}
+                value={vault.unencryptedVolumeWaived ? 'non chiffré' : 'non couvert'}
                 tone={AMBER}
               />
             )}

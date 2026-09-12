@@ -1,6 +1,6 @@
 [package]
 name = "helios-ctl"
-version = "0.10.2"
+version = "0.11.0"
 edition.workspace = true
 authors.workspace = true
 
@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 aether.workspace = true
+helios-update.workspace = true
 # Emplacement fixe de la CA opérateur, indépendant du répertoire courant.
 directories = "5"
 # Séquestre de l'identité de la gateway : la moitié opérateur (génération de la
@@ -22,8 +23,8 @@ helio-tpm.workspace = true
 orion-core = { workspace = true }
 helios-key-negotiation.workspace = true
 base64.workspace = true
+hex.workspace = true
 x25519-dalek.workspace = true
-aws-lc-rs.workspace = true
 clap.workspace = true
 tokio.workspace = true
 serde.workspace = true

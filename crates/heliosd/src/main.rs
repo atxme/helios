@@ -1,13 +1,16 @@
 //! `heliosd` — control plane orchestrator daemon.
 
+mod astra_channel;
 mod certificates;
 mod gateway_key;
+mod gateway_rotation;
 mod key_negotiation;
 mod orchestrator;
 mod static_psk;
 mod uplink;
 mod vip_routing;
 
+use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -35,6 +38,12 @@ const API_BIND_ATTEMPTS: u32 = 20;
 
 /// Wait between two API listen attempts.
 const API_BIND_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+/// Cadence at which the raw speedtest keeps trying to bind, past the burst.
+///
+/// Thirty seconds: slow enough that a lasting conflict costs nothing, quick
+/// enough that freeing the port brings the service back before an operator has
+/// finished reading why it was gone.
+const RAW_SPEEDTEST_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Parser)]
 #[command(name = "heliosd", version, about = "Gateway VPN WireGuard Helios")]
@@ -52,6 +61,10 @@ enum Command {
         /// absent.
         #[arg(long)]
         dev: bool,
+        /// Unsafe maintenance mode: real WireGuard/TPM, but remove and keep
+        /// absent only the Helios nftables table. Never selected implicitly.
+        #[arg(long, conflicts_with = "dev")]
+        unsafe_disable_firewall: bool,
     },
     /// Displays the resolved configuration and system state.
     Status,
@@ -111,6 +124,10 @@ enum Command {
         /// anchor of the domain, and the only one this gateway ever trusts.
         #[arg(long)]
         ca_public_key: String,
+        /// Gateway PQ leaf returned by the offline `astra-signer
+        /// issue-gateway-bootstrap` ceremony.
+        #[arg(long)]
+        gateway_certificate: std::path::PathBuf,
         /// Astra's service public key, base64 — printed by `astra bootstrap`.
         /// It signs statuses and receipts; it certifies nothing.
         #[arg(long)]
@@ -122,6 +139,236 @@ enum Command {
         /// `astra-signer init --rp-id` and to `astra bootstrap`.
         #[arg(long)]
         webauthn_rp_id: String,
+        /// DER of the client `CA-TLS` **the domain** serves, self-signed from
+        /// the authority vault by `astra-signer issue-ca-tls` and carried by
+        /// the domain hand-off as `ca_tls_certificate`.
+        ///
+        /// This is not the operator CA that admits clients. That one lives on
+        /// this gateway as a file and decides who may open an mTLS session;
+        /// this one is the anchor a **renewed** leaf chains to, through Astra's
+        /// delegated intermediate. Seeding the registry with the operator CA
+        /// instead puts the admission authority where the domain anchor
+        /// belongs, and every staging is then refused with «the candidate TLS
+        /// leaf chains to no client CA this gateway holds» — a §9.4 rotation
+        /// cannot repair it, because a transition can only move away from an
+        /// anchor the gateway already holds.
+        #[arg(long)]
+        client_tls_ca: Option<std::path::PathBuf>,
+    },
+    /// Repairs registries created before `init-trust-domain --client-tls-ca`.
+    ///
+    /// The affected release stored the operator admission CA as the domain
+    /// anchor. This command accepts only that exact untouched epoch-1 shape,
+    /// replaces it atomically with the supplied self-signed domain CA-TLS and
+    /// keeps every peer identity and queued signed distribution.
+    ///
+    /// **For a stopped daemon.** A running process owns the registry in memory
+    /// and could overwrite an offline repair with its previous state.
+    RepairClientTlsCaBootstrap {
+        /// DER of the domain's original client CA-TLS, as carried by the
+        /// operator hand-off. The operator admission CA is read from the
+        /// gateway's served key-negotiation identity and must match the bad
+        /// anchor exactly.
+        #[arg(long)]
+        client_tls_ca: std::path::PathBuf,
+    },
+    /// Prepares this gateway's next identity and exports its request (§5).
+    ///
+    /// Step 1 and 2 of §11.1, and the only two that happen on the gateway
+    /// before an operator ceremony: the next ML-DSA-87 key is generated and
+    /// sealed **beside** the identity in service — never over it, which keeps
+    /// serving tunnels throughout — and a `GatewayCertificateRequest` carrying
+    /// only public halves is written out.
+    ///
+    /// The request proves possession of the new key and, on an ordinary
+    /// renewal, continuity from the leaf in service. It authorises nothing:
+    /// only `CA-PQ` issues, from a vault this machine must never hold. Carry
+    /// the file to the operator companion and bring back a signed
+    /// `GatewayIdentityTransition`.
+    ///
+    /// Re-running is a resumption, not a second attempt: an unexpired request
+    /// for the same epoch is returned unchanged, and one that has outlived the
+    /// 24 hours of §5 is re-signed over the **same** sealed key.
+    ///
+    /// **For a stopped daemon.** A running `heliosd` owns the certificate
+    /// registry in memory and persists it on its own mutations, so a write
+    /// made here can be overwritten by the next one it makes. With the daemon
+    /// up, the console's *Certificats* screen drives the same gesture through
+    /// the process that holds the lock.
+    PrepareGatewayCertificate {
+        /// Also replace the TLS leaf, self-signed and pinned like the active
+        /// one. Left out, the renewal moves the PQ half alone — §6.1 makes
+        /// each leaf independently optional.
+        #[arg(long)]
+        rotate_tls: bool,
+        /// Discard the sealed candidate and generate a fresh key.
+        ///
+        /// Not needed to refresh an expired request. Use it when the candidate
+        /// itself must be replaced — the previous one is destroyed, and the
+        /// epoch it was prepared for stays available.
+        #[arg(long)]
+        new_key: bool,
+        /// Build the request without a continuity signature (§5 recovery).
+        ///
+        /// Only after an explicit local procedure establishing that the active
+        /// private key is gone. The field is then absent rather than
+        /// unverified, and the transition that answers must carry the
+        /// `key_recovery` reason.
+        #[arg(long)]
+        key_recovery: bool,
+    },
+    /// Installs the signed transition that answers the request (§11.1 5).
+    ///
+    /// Step 5, and the first thing the gateway does with what comes back from
+    /// the ceremony. The transition is verified against the anchors this
+    /// gateway already pins — `CA-PQ`, its epoch, the stable WireGuard
+    /// identity, the server name and the two leaves in service — and refused
+    /// unless the private half of every leaf it installs is sealed here.
+    ///
+    /// **The identity served does not change.** Staging is a decision about
+    /// `activation_at`; until then the active leaf keeps mounting tunnels, and
+    /// the switch needs the restart of §11.1 step 7.
+    ///
+    /// **For a stopped daemon**, like `prepare-gateway-certificate`. The
+    /// console applies the same document through the process that owns the
+    /// registry.
+    InstallGatewayTransition {
+        /// Signed `GatewayIdentityTransition`, as JSON.
+        transition: PathBuf,
+    },
+    /// Cancels a staged, unpublished transition (§6.3).
+    ///
+    /// Accepted only while the transition is staged, has distributed no byte
+    /// and `activation_at` is still ahead — on the local clock as well as in
+    /// the document, so backdating the abort reopens nothing. The candidate
+    /// identity is destroyed and the epoch stays consumed: a fleet must never
+    /// have to choose between two decisions numbered the same.
+    ///
+    /// **For a stopped daemon**, like the two commands above.
+    AbortGatewayTransition {
+        /// Signed `GatewayTransitionAbort`, as JSON.
+        abort: PathBuf,
+    },
+    /// Installs a signed rotation of the domain anchor `CA-PQ` (§9.1).
+    ///
+    /// The anchor everything else hangs from. The outgoing `CA-PQ` authorises
+    /// its successor and the successor proves its own key — one signature
+    /// would not be enough — and both verify from `activation_at` until the
+    /// outgoing one is retired at `not_after`. The epoch moves only then.
+    ///
+    /// **For a stopped daemon.** A running one takes the same document on the
+    /// Certificates screen, which writes through the process that holds the
+    /// registry.
+    InstallCaTransition {
+        /// Signed `CaTransition`, as JSON.
+        transition: PathBuf,
+    },
+    /// Installs a signed rotation of the client `CA-TLS` (§9.4).
+    ///
+    /// The anchor that authenticates the mTLS transport before any PQ
+    /// signature is checked. Both chains are accepted during the overlap, and
+    /// the outgoing one retires at `not_after` — a rotation without that
+    /// overlap would cut every client that has not yet been re-issued.
+    ///
+    /// **For a stopped daemon**, like the gateway identity commands.
+    InstallClientTlsCa {
+        /// Signed `ClientTlsCaTransition`, as JSON.
+        transition: PathBuf,
+    },
+    /// Records Astra's delegated issuer, and the policy it names.
+    ///
+    /// Until the amendment of 6 September 2026 a scheduled renewal asked for
+    /// one operator credential per request. Dropping it widens what the
+    /// delegated issuer may do unattended, so the policy fingerprint changed
+    /// with it and no binary upgrade reinterprets the old one — the gateway
+    /// would refuse every automatic renewal instead.
+    ///
+    /// The evidence that moves it is an `AstraIssuerAuthorization` signed by
+    /// this domain's `CA-PQ` and naming the current policy: the out-of-band
+    /// confirmation §2.4 asks for, in the form the operator's security keys
+    /// already produce. A registry pinned to anything but the superseded
+    /// policy is left untouched.
+    ///
+    /// **For a stopped daemon**, like the other registry commands.
+    InstallAstraIssuer {
+        /// Signed `AstraIssuerAuthorization`, as JSON.
+        delegation: PathBuf,
+    },
+    /// Records the domain's operator credentials, so an enrolment can carry
+    /// them (spec §19, §7.5).
+    ///
+    /// The document is the one `astra-signer bindings` emits beside the vault,
+    /// and `deploy.sh` already copies it to Astra. This installs the same
+    /// bytes here, because the enrolment block is the only thing a client
+    /// reads before it has a tunnel — and recovering an expired identity
+    /// begins by naming the credential that will approve it.
+    ///
+    /// Nothing secret crosses: the rows are public and each carries its own
+    /// `CA-PQ` signature, which this registry checks under the anchor it
+    /// already holds.
+    ///
+    /// **Run it with `heliosd` stopped.** A running daemon holds the registry
+    /// in memory and rewrites it whole at the first decision it records, so an
+    /// edit made beside it is undone without a word at the next peer
+    /// admission — which is usually the very next thing a deployment does.
+    InstallAstraCredentials {
+        /// `CA-PQ`-signed credential registry, as JSON.
+        credentials: PathBuf,
+    },
+    /// Prints the trust block a client's profile must carry (spec §19).
+    ///
+    /// Read from the certificate registry in one pass, and printed as the
+    /// JSON an Orion profile embeds verbatim. Eleven public values: anchors,
+    /// epochs, the Astra origin and the generation this peer is at. None is
+    /// secret, and none is meant to be retyped — a value pasted wrong here
+    /// fails months later, at 80 % of a leaf's life, on a client with no
+    /// fallback.
+    ///
+    /// Exists beside the API route because an enrolment happens **before** the
+    /// client has a tunnel, and `provision-client.sh` reaches this gateway over
+    /// SSH rather than over the admin API.
+    ShowTrustEnrolment {
+        /// The peer's WireGuard public key, base64, as it was admitted.
+        #[arg(long)]
+        public_key: String,
+    },
+    /// Creates this gateway's end of the private Astra veth channel (§8.3).
+    ///
+    /// It generates a transport identity — a service identity, unrelated to
+    /// `CA-PQ` and to every client — and pins Astra's, byte for byte. It seals
+    /// nothing and unseals nothing, so it runs on a gateway whose TPM is
+    /// unavailable, like `init-trust-domain`.
+    ///
+    /// Without it the private listener stays closed, and the gateway keeps
+    /// working: an authority is an addition, not a prerequisite.
+    InitAstraChannel {
+        /// Address of the gateway's end of the veth, with its port. Never a
+        /// wildcard: this API belongs on one interface with no default route.
+        #[arg(long)]
+        bind: std::net::SocketAddr,
+        /// Astra's transport certificate, DER — printed by
+        /// `astra init-channel`. The only client identity this listener will
+        /// ever accept.
+        #[arg(long)]
+        astra_certificate: std::path::PathBuf,
+        /// Address of Astra's own private listener, on the same veth.
+        ///
+        /// The direction this gateway dials, to relay a client renewal
+        /// (spec §8.1.2). Absent, the four renewal routes answer `503` and the
+        /// staging half keeps working — an authority that only receives is a
+        /// supported deployment.
+        #[arg(long)]
+        authority: Option<std::net::SocketAddr>,
+        /// Astra's **authority** certificate, DER — printed by
+        /// `astra init-channel` beside its transport one. The only server
+        /// identity this gateway will dial.
+        #[arg(long)]
+        astra_authority_certificate: Option<std::path::PathBuf>,
+        /// Replaces an existing identity. **Astra must be re-pinned**: it
+        /// holds these exact bytes, and changing them without telling it stops
+        /// the two from talking.
+        #[arg(long)]
+        rotate: bool,
     },
     /// Prints what `wan_iface = "auto"` resolves to, and why.
     ///
@@ -205,6 +452,18 @@ enum PeerCommand {
         /// SHA-256 fingerprint of the client's ML-DSA-65 certificate.
         #[arg(long)]
         key_negotiation_pq_certificate_sha256: Option<String>,
+        /// The client's TLS leaf itself, DER.
+        ///
+        /// A gateway holding a trust domain records the **leaves**, not their
+        /// digests: it verifies signatures made by them. Without the two
+        /// files, this peer would connect and never be able to renew, so the
+        /// admission is refused rather than left to be discovered at 80 % of a
+        /// leaf's life.
+        #[arg(long)]
+        certificate: Option<PathBuf>,
+        /// The client's ML-DSA-87 leaf, its JSON document.
+        #[arg(long)]
+        pq_certificate: Option<PathBuf>,
         /// Refuses future negotiations below this protection level.
         #[arg(long, value_enum)]
         minimum_mode: Option<NegotiationMode>,
@@ -257,11 +516,30 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
+    // The randomness pipeline is named before anything draws from it. Both
+    // specifications require the banner (§4.3, §2.3.2), and an unusable
+    // provider is a start-up error rather than a refusal the first client to
+    // negotiate discovers.
+    // Settled before the first HTTP client: two rustls providers are compiled
+    // in, so an unnamed one is a panic rather than a choice.
+    helios_api::internal::install_process_default_provider();
+
+    let drbg = aether::random::configure().context("resolving the DRBG provider")?;
+    info!(%drbg, "randomness provider");
+
     match cli.command {
-        Command::Run { dev } => {
+        Command::Run {
+            dev,
+            unsafe_disable_firewall,
+        } => {
             let network = NetworkConfig::load().context("loading the network config")?;
             let dry_run = resolve_dry_run(dev);
-            run(network, dry_run).await
+            let firewall_mode = if unsafe_disable_firewall {
+                orchestrator::FirewallMode::DisabledForMaintenance
+            } else {
+                orchestrator::FirewallMode::Enforced
+            };
+            run(network, dry_run, firewall_mode).await
         }
         Command::Status => {
             let mut network = NetworkConfig::load().context("loading the network config")?;
@@ -293,18 +571,50 @@ async fn main() -> anyhow::Result<()> {
             let network = NetworkConfig::load().context("loading the network config")?;
             init_key_negotiation(&network, &server_name, &client_ca, &client_pq_ca, rotate)
         }
+        Command::ShowTrustEnrolment { public_key } => show_trust_enrolment(&public_key),
+        Command::PrepareGatewayCertificate {
+            rotate_tls,
+            new_key,
+            key_recovery,
+        } => prepare_gateway_certificate(rotate_tls, new_key, key_recovery),
+        Command::InstallGatewayTransition { transition } => install_gateway_transition(&transition),
+        Command::AbortGatewayTransition { abort } => abort_gateway_transition(&abort),
+        Command::InstallCaTransition { transition } => install_ca_transition(&transition),
+        Command::InstallClientTlsCa { transition } => install_client_tls_ca(&transition),
+        Command::InstallAstraIssuer { delegation } => install_astra_issuer(&delegation),
+        Command::InstallAstraCredentials { credentials } => install_astra_credentials(&credentials),
         Command::InitTrustDomain {
             trust_domain_id,
             ca_public_key,
+            gateway_certificate,
             astra_service_public_key,
             authority_url,
             webauthn_rp_id,
+            client_tls_ca,
         } => init_trust_domain(
             &trust_domain_id,
             &ca_public_key,
+            &gateway_certificate,
             &astra_service_public_key,
             &authority_url,
             &webauthn_rp_id,
+            client_tls_ca.as_deref(),
+        ),
+        Command::RepairClientTlsCaBootstrap { client_tls_ca } => {
+            repair_client_tls_ca_bootstrap(&client_tls_ca)
+        }
+        Command::InitAstraChannel {
+            bind,
+            astra_certificate,
+            authority,
+            astra_authority_certificate,
+            rotate,
+        } => init_astra_channel(
+            bind,
+            &astra_certificate,
+            authority,
+            astra_authority_certificate.as_deref(),
+            rotate,
         ),
         Command::ShowUplink => show_uplink(),
         Command::ShowIdentity => show_identity(),
@@ -448,10 +758,262 @@ fn init_key_negotiation(
     )?;
     println!("certificate: {}", result.certificate_path.display());
     println!("sha256: {}", result.certificate_sha256);
-    println!("PQ certificate: {}", result.pq_certificate_path.display());
-    println!("PQ sha256: {}", result.pq_certificate_sha256);
+    println!(
+        "gateway bootstrap request: {}",
+        result.bootstrap_request_path.display()
+    );
+    println!(
+        "request fingerprint: {}",
+        result.bootstrap_request_fingerprint
+    );
     info!("key-negotiation TLS and PQ private keys generated on the gateway and sealed");
     Ok(())
+}
+
+/// Prepares the next gateway identity and prints where its request landed.
+fn prepare_gateway_certificate(
+    rotate_tls: bool,
+    new_key: bool,
+    key_recovery: bool,
+) -> anyhow::Result<()> {
+    let boot = unlock_tpm_for_offline_command(&TpmSettings::default())
+        .context("unlocking the TPM vault to seal the candidate gateway identity")?;
+    let now_unix = now_unix()?;
+    let registry = gateway_rotation::open_registry_for_command()?;
+    let prepared = gateway_rotation::prepare_request(
+        &registry,
+        boot.secret(),
+        false,
+        rotate_tls,
+        new_key,
+        key_recovery,
+        now_unix,
+    )?;
+
+    println!("request: {}", prepared.path.display());
+    println!("epoch: {}", prepared.request.gateway_identity_epoch);
+    println!("request id: {}", prepared.request.request_id.to_hex());
+    println!("fingerprint: {}", prepared.request.fingerprint().to_hex());
+    println!(
+        "expires at: {}",
+        aether::display_time::format_paris_timestamp(prepared.request.expires_at)
+    );
+    match &prepared.tls_certificate {
+        Some(certificate) => println!("candidate TLS leaf: {}", certificate.fingerprint().to_hex()),
+        None => println!("candidate TLS leaf: unchanged"),
+    }
+    if prepared.reused {
+        info!("the request already prepared for this epoch is still valid and was reused");
+    } else if key_recovery {
+        warn!(
+            "request built without a continuity signature: the transition answering it must \
+             carry the key_recovery reason"
+        );
+    }
+    Ok(())
+}
+
+fn install_gateway_transition(source: &Path) -> anyhow::Result<()> {
+    let now_unix = now_unix()?;
+    let mut registry = gateway_rotation::open_registry_for_command()?;
+    let transition = gateway_rotation::read_signed_document(source, "transition")?;
+    let staged = gateway_rotation::install_transition(&mut registry, transition, now_unix)?;
+    let transition = &staged.transition;
+
+    println!("epoch: {}", transition.gateway_identity_epoch);
+    println!("fingerprint: {}", transition.fingerprint()?.to_hex());
+    println!("reason: {:?}", transition.reason);
+    println!(
+        "not before: {}",
+        aether::display_time::format_paris_timestamp(transition.window.not_before)
+    );
+    println!(
+        "activation at: {}",
+        aether::display_time::format_paris_timestamp(transition.window.activation_at)
+    );
+    println!(
+        "not after: {}",
+        aether::display_time::format_paris_timestamp(transition.window.not_after)
+    );
+    match &transition.next_gateway_certificate {
+        Some(certificate) => println!(
+            "next PQ leaf: {}",
+            aether::certificates::gateway::pq_certificate_fingerprint(certificate)?.to_hex()
+        ),
+        None => println!("next PQ leaf: unchanged"),
+    }
+    match &transition.next_gateway_tls_certificate {
+        Some(certificate) => println!("next TLS leaf: {}", certificate.fingerprint().to_hex()),
+        None => println!("next TLS leaf: unchanged"),
+    }
+    println!("document: {}", staged.path.display());
+
+    if staged.already_present {
+        info!("this transition was already staged; nothing moved");
+    } else {
+        info!(
+            "transition staged: the identity in service is unchanged until activation_at, and \
+             heliosd must be restarted at that instant to serve the next one"
+        );
+    }
+    Ok(())
+}
+
+fn abort_gateway_transition(source: &Path) -> anyhow::Result<()> {
+    let now_unix = now_unix()?;
+    let mut registry = gateway_rotation::open_registry_for_command()?;
+    let abort = gateway_rotation::read_signed_document(source, "abort")?;
+    let aborted = gateway_rotation::abort_transition(&mut registry, abort, now_unix)?;
+
+    println!("epoch: {}", aborted.abort.gateway_identity_epoch);
+    println!("aborted at: {}", aborted.abort.aborted_at);
+    println!("reason: {:?}", aborted.abort.reason);
+    println!(
+        "cancelled transition: {}",
+        aborted.abort.gateway_transition_fingerprint.to_hex()
+    );
+
+    if aborted.already_present {
+        info!("this abort had already been applied; nothing moved");
+    } else {
+        warn!(
+            "transition cancelled and the candidate identity destroyed: epoch {} stays consumed, \
+             the next attempt starts one decision higher",
+            aborted.abort.gateway_identity_epoch
+        );
+    }
+    Ok(())
+}
+
+fn install_ca_transition(source: &Path) -> anyhow::Result<()> {
+    use aether::certificates::state::InstallOutcome;
+
+    let now_unix = now_unix()?;
+    let mut registry = gateway_rotation::open_registry_for_command()?;
+    let transition: aether::certificates::authority::CaTransition =
+        gateway_rotation::read_signed_document(source, "CA-PQ transition")?;
+    let outcome = registry
+        .install_ca_transition(&transition, now_unix)
+        .context("installing the CA-PQ rotation")?;
+
+    println!(
+        "epoch: {} → {}",
+        transition.current_ca_epoch, transition.next_ca_epoch
+    );
+    println!("next anchor: {}", transition.next_ca_fingerprint.to_hex());
+    println!(
+        "activation at: {}",
+        aether::display_time::format_paris_timestamp(transition.window.activation_at)
+    );
+    println!(
+        "not after: {}",
+        aether::display_time::format_paris_timestamp(transition.window.not_after)
+    );
+    match outcome {
+        InstallOutcome::AlreadyPresent => info!("this rotation was already installed"),
+        InstallOutcome::Installed => warn!(
+            "CA-PQ rotation staged: both anchors verify from activation_at, and the outgoing one              is retired at not_after. Every client must have received this transition before that              date — one that has not is repaired by an operator, not by a late delivery"
+        ),
+    }
+    Ok(())
+}
+
+/// Records the domain's operator credentials, for the enrolment to carry.
+fn install_astra_credentials(source: &Path) -> anyhow::Result<()> {
+    let mut registry = gateway_rotation::open_registry_for_command()?;
+    let credentials: aether::certificates::approval::CredentialRegistry =
+        gateway_rotation::read_signed_document(source, "Astra credential registry")?;
+    let installed = registry
+        .install_astra_credentials(&credentials)
+        .context("recording the Astra operator credentials")?;
+
+    println!("registry epoch: {}", credentials.credential_registry_epoch);
+    println!("rows installed: {installed}");
+    if installed == 0 {
+        info!("this registry already holds every row of that document");
+    }
+    Ok(())
+}
+
+/// Records the delegation the authority issues under, and its policy.
+///
+/// Both halves matter and neither is optional: without the delegation the
+/// negotiation port cannot authenticate a renewed leaf, and without the policy
+/// the authority refuses to issue one unattended. Prints the pin it ends on
+/// either way, because "nothing changed" and "it was already right" are the
+/// same silence otherwise.
+fn install_astra_issuer(source: &Path) -> anyhow::Result<()> {
+    use aether::certificates::approval::PolicyMigration;
+
+    let now_unix = now_unix()?;
+    let mut registry = gateway_rotation::open_registry_for_command()?;
+    let delegation: aether::certificates::authority::AstraIssuerAuthorization =
+        gateway_rotation::read_signed_document(source, "Astra issuer authorization")?;
+    let migration = registry
+        .install_astra_issuer(&delegation, now_unix)
+        .context("adopting the current Astra issuance policy")?;
+
+    println!("issuer epoch: {}", delegation.issuer_epoch);
+    match migration {
+        PolicyMigration::AlreadyCurrent => {
+            println!("policy pin: unchanged");
+            info!("the delegation is recorded; this registry already pinned the policy it names");
+        }
+        PolicyMigration::Adopted(pin) => {
+            println!("policy pin: {}", pin.fingerprint().to_hex());
+            info!(
+                "issuance policy adopted: scheduled renewal of an active identity no longer asks                  for an operator credential on this gateway"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn install_client_tls_ca(source: &Path) -> anyhow::Result<()> {
+    use aether::certificates::state::InstallOutcome;
+
+    let now_unix = now_unix()?;
+    let mut registry = gateway_rotation::open_registry_for_command()?;
+    let transition: aether::certificates::authority::ClientTlsCaTransition =
+        gateway_rotation::read_signed_document(source, "client TLS CA transition")?;
+    let outcome = registry
+        .install_client_tls_ca_transition(&transition, now_unix)
+        .context("installing the client TLS CA rotation")?;
+
+    println!(
+        "epoch: {} → {}",
+        transition.current_ca_tls_epoch, transition.next_ca_tls_epoch
+    );
+    println!(
+        "next anchor: {}",
+        transition
+            .next_client_tls_ca_certificate
+            .fingerprint()
+            .to_hex()
+    );
+    println!(
+        "activation at: {}",
+        aether::display_time::format_paris_timestamp(transition.window.activation_at)
+    );
+    println!(
+        "not after: {}",
+        aether::display_time::format_paris_timestamp(transition.window.not_after)
+    );
+    match outcome {
+        InstallOutcome::AlreadyPresent => info!("this rotation was already installed"),
+        InstallOutcome::Installed => info!(
+            "client TLS CA rotation staged: both chains are accepted from activation_at, and the \
+             outgoing anchor retires at not_after"
+        ),
+    }
+    Ok(())
+}
+
+fn now_unix() -> anyhow::Result<u64> {
+    Ok(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock predates the Unix epoch")?
+        .as_secs())
 }
 
 /// Resolves `wan_iface = "auto"` against the kernel, once.
@@ -525,19 +1087,71 @@ fn show_uplink() -> anyhow::Result<()> {
 /// a script that has to parse JSON over SSH parses it with `sed`, and a `sed`
 /// pattern over a certificate is a defect waiting for a field to move.
 fn show_identity() -> anyhow::Result<()> {
-    let Some(served) = key_negotiation::served_identity()? else {
+    if let Some(served) = key_negotiation::served_identity()? {
+        println!("server_name={}", served.pq_certificate.subject);
+        println!(
+            "wireguard_public_key={}",
+            served.pq_certificate.wireguard_public_key
+        );
+        println!(
+            "pq_certificate_not_after={}",
+            served.pq_certificate.not_after_unix
+        );
+    } else if let Some(request) = key_negotiation::gateway_bootstrap_request()? {
+        request
+            .verify()
+            .context("verifying the gateway bootstrap request")?;
+        println!("server_name={}", request.server_name);
+        println!(
+            "wireguard_public_key={}",
+            request.gateway_wg_public_key.to_base64()
+        );
+        println!("bootstrap_request_fingerprint={}", request.fingerprint());
+    } else {
         anyhow::bail!(
             "this gateway has no key-negotiation identity: run `heliosd init-key-negotiation`"
         );
-    };
-    println!("server_name={}", served.pq_certificate.subject);
+    }
+    Ok(())
+}
+
+/// Creates the gateway's end of the private Astra channel (spec §8.3).
+///
+/// Prints its certificate in the same `clé=valeur` shape `show-identity` uses,
+/// and for the same reason: the consumer is `deploy.sh` over SSH, and a script
+/// that has to parse JSON parses it with `sed`.
+fn init_astra_channel(
+    bind: std::net::SocketAddr,
+    astra_certificate: &std::path::Path,
+    authority: Option<std::net::SocketAddr>,
+    astra_authority_certificate: Option<&std::path::Path>,
+    rotate: bool,
+) -> anyhow::Result<()> {
+    let identities = astra_channel::initialize(
+        bind,
+        astra_certificate,
+        authority,
+        astra_authority_certificate,
+        rotate,
+    )?;
+    println!("bind={bind}");
     println!(
-        "wireguard_public_key={}",
-        served.pq_certificate.wireguard_public_key
+        "gateway_channel_certificate={}",
+        identities.served.to_base64()
     );
     println!(
-        "pq_certificate_not_after={}",
-        served.pq_certificate.not_after_unix
+        "gateway_channel_fingerprint={}",
+        identities.served.fingerprint()
+    );
+    if let Some(client) = &identities.client {
+        println!("gateway_client_certificate={}", client.to_base64());
+        println!("gateway_client_fingerprint={}", client.fingerprint());
+    }
+    println!();
+    println!(
+        "hand the certificates above to Astra: it pins these exact bytes and accepts no other \
+         gateway — the served one to dial this listener, the client one to accept this gateway \
+         on its own"
     );
     Ok(())
 }
@@ -557,12 +1171,129 @@ fn show_identity() -> anyhow::Result<()> {
 /// their machine inside `astra-signer`, and the Astra service key inside the
 /// container. Neither is derivable here, and confirming them out of band is
 /// the point (ADR-008 §3).
+/// Prints one peer's §19 trust block, as an Orion profile embeds it.
+///
+/// JSON on stdout and nothing else, so a script can capture it into a file:
+/// `provision-client.sh` carries it beside the two gateway certificates it
+/// already copies. The same block the admin API serves, from the same reading
+/// of the same registry — a second shape here would be a second thing to keep
+/// equal by hand.
+fn show_trust_enrolment(public_key: &str) -> anyhow::Result<()> {
+    use aether::certificates::encoding::WireGuardKey;
+    use helios_provisioning::certificates::CertificateRegistry;
+
+    let path = CertificateRegistry::path();
+    let registry = CertificateRegistry::load(&path)
+        .with_context(|| format!("reading {}", path.display()))?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "this gateway has no trust domain: run `heliosd init-trust-domain` first. An \
+                 absent registry is not an empty one — the lifecycle routes stay closed."
+            )
+        })?;
+    let key = WireGuardKey::parse(public_key.trim())
+        .map_err(|error| anyhow::anyhow!("invalid WireGuard public key: {error}"))?;
+    let peer = registry.peer(&key).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no such peer in the certificate registry — admit it first, with `heliosd peer add` \
+             or `helios-ctl peer add`"
+        )
+    })?;
+    let view = certificates::enrolment_view(registry.state(), peer);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&view).context("encoding the trust block")?
+    );
+    Ok(())
+}
+
+/// The client `CA-TLS` a fresh registry records as generation 1.
+///
+/// The domain's own anchor when the deployment supplies it, and the operator
+/// admission CA otherwise. The fallback exists because a domain may be
+/// bootstrapped before `astra-signer issue-ca-tls` has run, but it is never
+/// silent: a registry seeded with the admission CA stages no renewal — the
+/// candidate leaf chains to Astra's delegated intermediate, which is signed by
+/// the domain anchor — and §9.4 cannot repair it afterwards, because a
+/// transition can only move away from an anchor the gateway already holds.
+fn domain_client_tls_ca(
+    supplied: Option<&std::path::Path>,
+    served: aether::certificates::encoding::DerCertificate,
+) -> anyhow::Result<aether::certificates::encoding::DerCertificate> {
+    let Some(path) = supplied else {
+        warn!(
+            fingerprint = %served.fingerprint(),
+            "no --client-tls-ca given: the registry records the operator admission CA as the \
+             domain anchor. Renewals will not stage until the domain's own CA-TLS is the active \
+             one, and a §9.4 rotation cannot install it — it can only move away from an anchor \
+             this gateway already holds"
+        );
+        return Ok(served);
+    };
+    let der = std::fs::read(path)
+        .with_context(|| format!("reading the domain client CA-TLS in {}", path.display()))?;
+    let certificate = aether::certificates::encoding::DerCertificate::new(der)
+        .context("the domain client CA-TLS is not a readable certificate")?;
+    info!(
+        fingerprint = %certificate.fingerprint(),
+        "client CA-TLS of the domain recorded as generation 1"
+    );
+    Ok(certificate)
+}
+
+/// Applies the one-time, fail-closed correction for the legacy CA-TLS seed.
+fn repair_client_tls_ca_bootstrap(client_tls_ca: &std::path::Path) -> anyhow::Result<()> {
+    use aether::certificates::encoding::DerCertificate;
+    use helios_provisioning::certificates::{BootstrapRepairOutcome, CertificateRegistry};
+
+    let domain_ca = DerCertificate::new(
+        std::fs::read(client_tls_ca)
+            .with_context(|| format!("reading {}", client_tls_ca.display()))?,
+    )
+    .context("the supplied domain client CA-TLS is not a readable certificate")?;
+    let served = key_negotiation::served_identity()?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "the gateway has no served key-negotiation identity from which to read the operator \
+             admission CA"
+        )
+    })?;
+    let path = CertificateRegistry::path();
+    let mut registry = CertificateRegistry::load(&path)
+        .with_context(|| format!("reading {}", path.display()))?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "this gateway has no certificate registry; use init-trust-domain for a new domain"
+            )
+        })?;
+    let admission_fingerprint = served.client_tls_ca.fingerprint();
+    let domain_fingerprint = domain_ca.fingerprint();
+    let outcome = registry
+        .repair_legacy_client_tls_ca_bootstrap(&served.client_tls_ca, &domain_ca)
+        .context("repairing the legacy client CA-TLS bootstrap")?;
+
+    match outcome {
+        BootstrapRepairOutcome::Repaired => println!(
+            "client CA-TLS bootstrap repaired atomically: {admission_fingerprint} -> \
+             {domain_fingerprint}"
+        ),
+        BootstrapRepairOutcome::AlreadyCorrect => {
+            println!("client CA-TLS bootstrap already current; nothing changed")
+        }
+        BootstrapRepairOutcome::LaterEpoch => {
+            println!("client CA-TLS bootstrap repair not applicable after epoch 1; nothing changed")
+        }
+    }
+    Ok(())
+}
+
 fn init_trust_domain(
     trust_domain_id: &str,
     ca_public_key: &str,
+    gateway_certificate: &std::path::Path,
     astra_service_public_key: &str,
     authority_url: &str,
     webauthn_rp_id: &str,
+    client_tls_ca: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
     use aether::certificates::encoding::{MlDsa87PublicKey, TrustDomainId, WireGuardKey};
     use aether::certificates::state::{
@@ -577,16 +1308,35 @@ fn init_trust_domain(
     let astra_service_public_key = MlDsa87PublicKey::parse(astra_service_public_key)
         .context("reading the Astra service public key")?;
 
+    let path = CertificateRegistry::path();
+    anyhow::ensure!(
+        !path.exists(),
+        "a certificate registry already exists at {}; init-trust-domain only creates a domain",
+        path.display()
+    );
+    key_negotiation::install_gateway_bootstrap_certificate(
+        gateway_certificate,
+        &ca_public_key,
+        now_unix()?,
+    )?;
     let Some(served) = key_negotiation::served_identity()? else {
         anyhow::bail!(
             "this gateway has no key-negotiation identity yet: run `heliosd \
-             init-key-negotiation` first, since the registry describes the leaves it serves"
+             init-key-negotiation`, complete the CA-PQ ceremony, then retry"
         );
     };
     let gateway_wg_public_key = WireGuardKey::parse(&served.pq_certificate.wireguard_public_key)
         .context("reading the WireGuard identity out of the served PQ leaf")?;
     let server_name = served.pq_certificate.subject.clone();
+    let astra_policy_fingerprint = aether::certificates::AstraIssuancePolicy::standard(
+        trust_domain_id,
+        gateway_wg_public_key,
+        server_name.clone(),
+    )
+    .pin()
+    .context("building the pinned Astra issuance policy")?;
 
+    let domain_client_tls_ca = domain_client_tls_ca(client_tls_ca, served.client_tls_ca)?;
     let state = RegistryState {
         trust_domain_id,
         gateway: GatewayCertificateState {
@@ -613,10 +1363,12 @@ fn init_trust_domain(
             published: false,
             revoked: false,
             revocation_epoch: 0,
+            service_rollback: None,
+            awaited_replacement: None,
         },
         client_tls_ca: ClientTlsCaState {
             ca_tls_epoch: 1,
-            active_client_tls_ca_certificate: served.client_tls_ca,
+            active_client_tls_ca_certificate: domain_client_tls_ca,
             next_client_tls_ca_certificate: None,
             next_transition_fingerprint: None,
             activation_at: None,
@@ -625,6 +1377,9 @@ fn init_trust_domain(
         astra: AstraProfile {
             authority_url: authority_url.to_string(),
             webauthn_rp_id: webauthn_rp_id.to_string(),
+            astra_policy_fingerprint,
+            credential_registry_epoch: 1,
+            credential_bindings: Default::default(),
             active_astra_service_public_key: astra_service_public_key,
             next_astra_service_public_key: None,
             next_service_key_transition_fingerprint: None,
@@ -643,7 +1398,6 @@ fn init_trust_domain(
         ledger: TrustLedger::default(),
     };
 
-    let path = CertificateRegistry::path();
     let registry = CertificateRegistry::bootstrap(path.clone(), state)
         .context("creating the certificate registry")?;
 
@@ -657,6 +1411,14 @@ fn init_trust_domain(
     println!(
         "CA-PQ fingerprint: {}",
         ca_public_key.authority_fingerprint()
+    );
+    println!(
+        "Astra policy pin : {}",
+        registry
+            .state()
+            .astra
+            .astra_policy_fingerprint
+            .fingerprint()
     );
     println!(
         "gateway TLS      : {}",
@@ -737,8 +1499,19 @@ fn peer_command(mut network: NetworkConfig, command: PeerCommand) -> anyhow::Res
             admin,
             key_negotiation_certificate_sha256,
             key_negotiation_pq_certificate_sha256,
+            certificate,
+            pq_certificate,
             minimum_mode,
         } => {
+            // Read and checked before `network.toml` moves: an admission whose
+            // certificates cannot be queued must not leave a peer admitted
+            // with no certificate generation.
+            let queued = queue_console_admission(
+                &name,
+                &public_key,
+                certificate.as_deref(),
+                pq_certificate.as_deref(),
+            )?;
             let minimum_mode = admission_floor(
                 minimum_mode,
                 key_negotiation_pq_certificate_sha256.is_some(),
@@ -756,6 +1529,13 @@ fn peer_command(mut network: NetworkConfig, command: PeerCommand) -> anyhow::Res
             network
                 .save()
                 .context("writing the network configuration")?;
+            if let Some(queued) = queued {
+                certificates::queue_admission(
+                    &helios_provisioning::certificates::CertificateRegistry::path(),
+                    &queued,
+                )
+                .context("queueing the peer's first certificate generation")?;
+            }
             println!("{}\t{}", peer.name, peer.address);
             info!("peer admitted — a running heliosd applies it within seconds, without restart");
             Ok(())
@@ -796,6 +1576,47 @@ fn peer_command(mut network: NetworkConfig, command: PeerCommand) -> anyhow::Res
             Ok(())
         }
     }
+}
+
+/// Prepares the console's half of an admission into the certificate registry.
+///
+/// Returns `None` when this gateway has no trust domain: there is nothing to
+/// record, and admission keeps working exactly as it did before ADR-008.
+///
+/// When it does have one, both certificates are required. The registry needs
+/// the objects — it verifies signatures made by them — and a peer admitted
+/// without them holds no generation, therefore no trust block, therefore a
+/// profile that connects and can never renew. That is refused here rather than
+/// discovered months later.
+fn queue_console_admission(
+    name: &str,
+    public_key: &str,
+    certificate: Option<&Path>,
+    pq_certificate: Option<&Path>,
+) -> anyhow::Result<Option<certificates::QueuedAdmission>> {
+    use base64::Engine as _;
+
+    if !helios_provisioning::certificates::CertificateRegistry::path().exists() {
+        return Ok(None);
+    }
+    let (Some(certificate), Some(pq_certificate)) = (certificate, pq_certificate) else {
+        anyhow::bail!(
+            "this gateway holds a trust domain, so `peer add` also takes the client's two \
+             certificates: --certificate <orion-client-cert.der> --pq-certificate \
+             <orion-client-pq-cert.json>. Without them the peer connects but can never renew."
+        );
+    };
+    let encoder = base64::engine::general_purpose::STANDARD;
+    let tls =
+        std::fs::read(certificate).with_context(|| format!("reading {}", certificate.display()))?;
+    let pq = std::fs::read(pq_certificate)
+        .with_context(|| format!("reading {}", pq_certificate.display()))?;
+    Ok(Some(certificates::QueuedAdmission {
+        name: name.to_string(),
+        client_wg_public_key: public_key.trim().to_string(),
+        tls_certificate: encoder.encode(tls),
+        pq_certificate: encoder.encode(pq),
+    }))
 }
 
 /// Derives the safe default without hiding an explicit operator floor.
@@ -938,7 +1759,11 @@ fn forbid_core_dumps(_dry_run: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run(mut network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
+async fn run(
+    mut network: NetworkConfig,
+    dry_run: bool,
+    firewall_mode: orchestrator::FirewallMode,
+) -> anyhow::Result<()> {
     // Before the TPM unseal below, which is where the first key appears.
     forbid_core_dumps(dry_run)?;
 
@@ -1072,11 +1897,42 @@ async fn run(mut network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
     // readers disagreeing on whether a peer is still there — and the whole
     // point of v5's liveness is that there is one answer, read where the
     // traffic is.
+    // Opened once, and shared. The negotiation *reads* it — a caller resolved
+    // by the fingerprint mTLS proved has to be looked up in the thing that
+    // recorded the last rotation, not in a file written at admission — while
+    // the lifecycle service below is its single writer. Two `CertificateRegistry`
+    // values over one path would be two writers of one slot.
+    let registry = match certificates::open_registry(
+        &helios_provisioning::certificates::CertificateRegistry::path(),
+    ) {
+        Ok(registry) => registry,
+        Err(error) => {
+            error!(
+                %error,
+                "certificate registry unusable — the in-tunnel lifecycle routes stay closed and \
+                 the negotiation falls back to the pins of network.toml"
+            );
+            None
+        }
+    };
+    if let Some(registry) = &registry {
+        let mut registry = registry.lock().await;
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .context("system clock predates the Unix epoch")?
+            .as_secs();
+        if gateway_rotation::maintain_gateway_identity(&mut registry, boot.secret(), now_unix)
+            .context("reconciling the scheduled gateway identity before startup")?
+        {
+            info!("gateway identity promoted and sealed slots synchronized");
+        }
+    }
     if let Some(handler) = key_negotiation::start(
         Arc::clone(&shared_network),
         psk_tx.clone(),
         handshake_tx,
         Arc::clone(&state.peer_runtime),
+        registry.clone(),
         &boot,
         dry_run,
     )
@@ -1086,22 +1942,70 @@ async fn run(mut network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
         // signs its receipts through the negotiation handler — the same leaf
         // the client already pins, unsealed once — and it is the single owner
         // of the registry: a second one would give one slot two writers.
-        match certificates::CertificateService::load(
-            helios_provisioning::certificates::CertificateRegistry::path(),
-            Arc::clone(&handler) as Arc<dyn certificates::StageReceiptSigner>,
-        ) {
-            Ok(Some(service)) => {
+        // Built before the service, and shared with it: the same veth client
+        // serves the four renewal routes and the trust-update producer, and a
+        // second one would open a second connection to say the same thing.
+        let authority = astra_channel::relay().map(Arc::new);
+        let gateway_identity_secret = boot.secret().cloned();
+        match registry.map(|registry| {
+            let service = certificates::CertificateService::new(
+                registry,
+                Arc::clone(&handler) as Arc<dyn certificates::StageReceiptSigner>,
+            )
+            .with_gateway_identity_secret(gateway_identity_secret);
+            Arc::new(match &authority {
+                Some(relay) => service.with_authority(
+                    Arc::clone(relay) as Arc<dyn helios_api::internal::TrustUpdatePreparer>
+                ),
+                None => service,
+            })
+        }) {
+            Some(service) => {
                 info!("certificate lifecycle ready");
                 certificates::spawn_maintenance(Arc::clone(&service));
+                // Admissions made on the console, in another process: it may
+                // only leave the two public leaves in an inbox, because this
+                // task is the single owner of the registry. Drained here, and
+                // at every start — an admission made while the daemon was down
+                // is recorded when it comes back.
+                certificates::spawn_admission_drain(
+                    Arc::clone(&service),
+                    helios_provisioning::certificates::CertificateRegistry::path(),
+                );
+                // The private veth listener, on its own socket. Never a path
+                // on the administration API: two listeners make "Astra may
+                // not admit a peer" a fact about which socket the packet
+                // arrived on, rather than about middleware ordering.
+                astra_channel::spawn(
+                    Arc::clone(&service) as Arc<dyn helios_api::internal::AstraChannelHandler>
+                );
+                // And the other direction: the four in-tunnel renewal routes
+                // relay into Astra's own listener. Separate from the trust
+                // update on purpose — a gateway may hold a registry and have
+                // no way to dial the authority, and in that state the
+                // trust-update route must keep working while the renewal
+                // routes report the authority unreachable.
+                if let Some(relay) = authority {
+                    // The same relay on both surfaces: one veth client, two
+                    // stores at the far end. The operator routes sit behind
+                    // `require_admin` rather than `require_peer` (spec §8.5),
+                    // which is what keeps a campaign out of reach of an
+                    // ordinary admitted peer.
+                    state = state.with_operator_campaign(Arc::clone(&relay)
+                        as Arc<dyn helios_api::certificates::OperatorCampaignRelay>);
+                    state = state.with_client_renewal(relay);
+                }
+                // The same service, on two surfaces: the lifecycle screen
+                // reads through `trust_update`, and its four gestures go
+                // through `gateway_identity`. One instance, because both
+                // mutate the registry this task owns.
+                state = state.with_gateway_identity(Arc::clone(&service)
+                    as Arc<dyn helios_api::certificates::GatewayIdentityHandler>);
                 state = state.with_trust_update(service);
             }
-            Ok(None) => info!(
+            None => info!(
                 "no certificate registry: the trust domain is not bootstrapped, and the \
                  in-tunnel lifecycle routes stay closed"
-            ),
-            Err(error) => error!(
-                %error,
-                "certificate registry unusable — the in-tunnel lifecycle routes stay closed"
             ),
         }
         // The in-tunnel `release` (spec §7.5) reaches the same state machine
@@ -1150,7 +2054,22 @@ async fn run(mut network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
     let raw_speedtest_shutdown = Arc::new(AtomicBool::new(false));
     let raw_speedtest_task_shutdown = Arc::clone(&raw_speedtest_shutdown);
     tokio::spawn(async move {
-        for attempt in 1..=API_BIND_ATTEMPTS {
+        // It never gives up, and that is the point. The tunnel address appears
+        // when WireGuard comes up, so the first binds legitimately fail — that
+        // is what the fast burst is for. But the port can also be held by
+        // **another program**, and that is not transient: `iperf3` listening on
+        // a wildcard listener wins the port and keeps it, and a gateway that
+        // stopped trying after ten seconds served no speedtest until someone
+        // restarted the daemon. Worse, it said so once, in a line long gone by
+        // the time a client reports « connexion fermée par l'hôte ».
+        //
+        // So after the burst it keeps retrying slowly, and logs only when the
+        // situation *changes* — a conflict that persists for a day is one line,
+        // not a hundred and seventy thousand.
+        let mut attempt: u32 = 0;
+        let mut reported: Option<String> = None;
+        loop {
+            attempt = attempt.saturating_add(1);
             match helios_api::speedtest::serve_raw(
                 raw_speedtest_state.clone(),
                 &raw_speedtest_bind,
@@ -1159,17 +2078,30 @@ async fn run(mut network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
             .await
             {
                 Ok(()) => return,
-                Err(error) if attempt < API_BIND_ATTEMPTS => {
-                    warn!(
-                        "raw speedtest unavailable (attempt {attempt}/{API_BIND_ATTEMPTS}), \
-                         retrying: {error:#}"
-                    );
-                    tokio::time::sleep(API_BIND_DELAY).await;
-                }
                 Err(error) => {
-                    tracing::error!(
-                        "raw speedtest given up after {API_BIND_ATTEMPTS} attempts: {error:#}"
-                    );
+                    let reason = format!("{error:#}");
+                    if attempt < API_BIND_ATTEMPTS {
+                        warn!(
+                            "raw speedtest unavailable (attempt {attempt}/{API_BIND_ATTEMPTS}), \
+                             retrying: {reason}"
+                        );
+                        tokio::time::sleep(API_BIND_DELAY).await;
+                        continue;
+                    }
+                    if reported.as_deref() != Some(reason.as_str()) {
+                        tracing::error!(
+                            bind = %raw_speedtest_bind,
+                            "raw speedtest still unavailable after {attempt} attempts: {reason}. \
+                             A client asking for a speedtest will be told the service is absent. \
+                             If the address is in use, another program holds this port — \
+                             `ss -lntup | grep {port}` names it, iperf3 on 0.0.0.0 being the \
+                             usual one. Retrying every {retry}s.",
+                            port = aether::speedtest::SPEEDTEST_PORT,
+                            retry = RAW_SPEEDTEST_RETRY.as_secs(),
+                        );
+                        reported = Some(reason);
+                    }
+                    tokio::time::sleep(RAW_SPEEDTEST_RETRY).await;
                 }
             }
         }
@@ -1178,6 +2110,7 @@ async fn run(mut network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
     let result = orchestrator::run(
         shared_network,
         dry_run,
+        firewall_mode,
         tunnel_state,
         event_tx,
         cmd_rx,
@@ -1203,8 +2136,23 @@ mod tests {
             Cli::try_parse_from(["heliosd", "run", "--dev"])
                 .unwrap()
                 .command,
-            Command::Run { dev: true }
+            Command::Run {
+                dev: true,
+                unsafe_disable_firewall: false
+            }
         ));
+        assert!(matches!(
+            Cli::try_parse_from(["heliosd", "run", "--unsafe-disable-firewall"])
+                .unwrap()
+                .command,
+            Command::Run {
+                dev: false,
+                unsafe_disable_firewall: true
+            }
+        ));
+        assert!(
+            Cli::try_parse_from(["heliosd", "run", "--dev", "--unsafe-disable-firewall"]).is_err()
+        );
         assert!(matches!(
             Cli::try_parse_from(["heliosd", "status"]).unwrap().command,
             Command::Status
@@ -1242,6 +2190,42 @@ mod tests {
                 .unwrap()
                 .command,
             Command::InitIdentity { rotate: true }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "heliosd",
+                "init-trust-domain",
+                "--trust-domain-id",
+                "00112233445566778899aabbccddeeff",
+                "--ca-public-key",
+                "ca",
+                "--gateway-certificate",
+                "/tmp/gateway.json",
+                "--astra-service-public-key",
+                "service",
+                "--authority-url",
+                "https://astra.example",
+                "--webauthn-rp-id",
+                "astra.example",
+            ])
+            .unwrap()
+            .command,
+            Command::InitTrustDomain {
+                gateway_certificate,
+                ..
+            } if gateway_certificate == std::path::Path::new("/tmp/gateway.json")
+        ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "heliosd",
+                "repair-client-tls-ca-bootstrap",
+                "--client-tls-ca",
+                "/tmp/domain-ca.der",
+            ])
+            .unwrap()
+            .command,
+            Command::RepairClientTlsCaBootstrap { client_tls_ca }
+                if client_tls_ca == std::path::Path::new("/tmp/domain-ca.der")
         ));
         assert!(Cli::try_parse_from([
             "heliosd",
@@ -1284,6 +2268,8 @@ mod tests {
                         name,
                         public_key,
                         admin,
+                        certificate: None,
+                        pq_certificate: None,
                         key_negotiation_certificate_sha256,
                         key_negotiation_pq_certificate_sha256,
                         minimum_mode,
@@ -1421,5 +2407,58 @@ mod tests {
         // SAFETY: PR_GET_DUMPABLE has no pointer argument and only reads the
         // current test process attribute.
         assert_eq!(unsafe { libc::prctl(libc::PR_GET_DUMPABLE) }, 0);
+    }
+}
+
+#[cfg(test)]
+mod trust_domain_seeding_tests {
+    use super::domain_client_tls_ca;
+    use aether::certificates::encoding::DerCertificate;
+
+    fn certificate(byte: u8) -> DerCertificate {
+        DerCertificate::new(vec![0x30, 0x03, 0x02, 0x01, byte]).expect("certificate")
+    }
+
+    /// The domain's own anchor wins over the admission CA that was served.
+    ///
+    /// This is the whole point of the option: `served.client_tls_ca` is the
+    /// operator CA that decides who may open an mTLS session, and recording it
+    /// as the domain anchor is what made every staging refuse the candidate
+    /// leaf — which chains to Astra's delegated intermediate, signed by the
+    /// domain's CA-TLS and by nothing else.
+    #[test]
+    fn a_supplied_domain_anchor_replaces_the_admission_ca() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("domain-client-ca-tls.der");
+        let domain = certificate(7);
+        std::fs::write(&path, domain.as_bytes()).expect("writing the anchor");
+
+        let seeded = domain_client_tls_ca(Some(&path), certificate(1)).expect("seeding");
+        assert_eq!(
+            seeded, domain,
+            "the registry records what the domain serves"
+        );
+    }
+
+    /// Without the option, the served CA is kept — a bootstrap before
+    /// `issue-ca-tls` must not fail — and the caller is warned it will not
+    /// stage a renewal.
+    #[test]
+    fn without_the_option_the_served_ca_is_kept() {
+        let served = certificate(1);
+        let seeded = domain_client_tls_ca(None, served.clone()).expect("seeding");
+        assert_eq!(seeded, served);
+    }
+
+    /// A file that is not a certificate is named, not recorded.
+    #[test]
+    fn a_file_that_is_not_a_certificate_is_refused() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("pas-un-certificat.der");
+        std::fs::write(&path, b"").expect("writing");
+        assert!(domain_client_tls_ca(Some(&path), certificate(1)).is_err());
+
+        let absent = directory.path().join("absent.der");
+        assert!(domain_client_tls_ca(Some(&absent), certificate(1)).is_err());
     }
 }

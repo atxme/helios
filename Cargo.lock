@@ -31,18 +31,21 @@ dependencies = [
 
 [[package]]
 name = "aether"
-version = "1.6.1"
+version = "2.0.0"
 dependencies = [
  "aws-lc-rs",
+ "aws-lc-sys",
  "base64 0.22.1",
  "curve25519-dalek 4.1.3",
  "fips204",
  "hex",
  "libc",
+ "rand_core 0.6.4",
  "rcgen",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "time",
  "tokio",
  "toml 0.8.2",
  "windows-sys 0.61.2",
@@ -230,16 +233,41 @@ dependencies = [
 
 [[package]]
 name = "astra"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aether",
  "anyhow",
  "async-trait",
- "aws-lc-rs",
  "axum",
  "base64 0.22.1",
  "clap",
+ "helios-api",
+ "rcgen",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "tracing-subscriber",
+ "zeroize",
+]
+
+[[package]]
+name = "astra-operator"
+version = "0.2.0"
+dependencies = [
+ "aether",
+ "anyhow",
+ "astra",
+ "aws-lc-rs",
+ "base64 0.22.1",
+ "helios-fido",
  "helios-vault",
+ "hex",
  "rcgen",
  "reqwest 0.12.28",
  "serde",
@@ -247,31 +275,26 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "time",
- "tokio",
- "tracing",
- "tracing-subscriber",
+ "x509-parser 0.16.0",
  "zeroize",
 ]
 
 [[package]]
 name = "astra-signer"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aether",
  "anyhow",
- "astra",
- "aws-lc-rs",
+ "astra-operator",
  "base64 0.22.1",
  "clap",
- "ctap-hid-fido2",
+ "helios-fido",
  "hex",
- "rcgen",
  "rpassword",
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 2.0.18",
- "windows-sys 0.59.0",
+ "x509-parser 0.16.0",
  "zeroize",
 ]
 
@@ -2240,11 +2263,10 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "helio-tpm"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "aether",
  "aws-lc-rs",
- "getrandom 0.2.17",
  "helios-vault",
  "hex",
  "serde",
@@ -2260,23 +2282,31 @@ dependencies = [
 
 [[package]]
 name = "helios-api"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "aether",
  "anyhow",
  "async-trait",
  "axum",
  "base64 0.22.1",
+ "bytes",
  "futures-util",
  "helios-firewall",
  "helios-provisioning",
  "helios-update",
  "helios-wireguard",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "mime_guess",
+ "rcgen",
  "rust-embed",
+ "rustls",
  "serde",
  "serde_json",
+ "time",
  "tokio",
+ "tokio-rustls",
  "tokio-tungstenite",
  "tower",
  "tracing",
@@ -2284,18 +2314,35 @@ dependencies = [
 ]
 
 [[package]]
-name = "helios-ctl"
-version = "0.10.2"
+name = "helios-astra-helper"
+version = "0.1.0"
 dependencies = [
  "aether",
  "anyhow",
- "aws-lc-rs",
+ "astra-operator",
+ "helios-fido",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "windows-sys 0.59.0",
+ "zeroize",
+]
+
+[[package]]
+name = "helios-ctl"
+version = "0.11.0"
+dependencies = [
+ "aether",
+ "anyhow",
  "base64 0.22.1",
  "clap",
  "directories",
  "futures-util",
  "helio-tpm",
  "helios-key-negotiation",
+ "helios-update",
+ "hex",
  "orion-core",
  "rcgen",
  "reqwest 0.12.28",
@@ -2311,8 +2358,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "helios-fido"
+version = "0.1.1"
+dependencies = [
+ "aether",
+ "anyhow",
+ "aws-lc-rs",
+ "base64 0.22.1",
+ "ctap-hid-fido2",
+ "thiserror 2.0.18",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "helios-firewall"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "aether",
  "async-trait",
@@ -2334,10 +2394,9 @@ dependencies = [
 
 [[package]]
 name = "helios-key-negotiation"
-version = "1.7.0"
+version = "2.0.0"
 dependencies = [
  "aether",
- "anyhow",
  "async-trait",
  "aws-lc-rs",
  "base64 0.22.1",
@@ -2355,10 +2414,9 @@ dependencies = [
 
 [[package]]
 name = "helios-provisioning"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "aether",
- "aws-lc-rs",
  "base64 0.22.1",
  "blake3",
  "serde",
@@ -2394,13 +2452,13 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "tracing",
 ]
 
 [[package]]
 name = "helios-vault"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
+ "aether",
  "aws-lc-rs",
  "thiserror 2.0.18",
  "zeroize",
@@ -2408,9 +2466,8 @@ dependencies = [
 
 [[package]]
 name = "helios-wireguard"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
- "aether",
  "async-trait",
  "base64 0.22.1",
  "defguard_wireguard_rs",
@@ -2422,7 +2479,7 @@ dependencies = [
 
 [[package]]
 name = "heliosd"
-version = "1.11.3"
+version = "1.12.0"
 dependencies = [
  "aether",
  "anyhow",
@@ -3749,7 +3806,7 @@ dependencies = [
 
 [[package]]
 name = "orion"
-version = "0.25.1"
+version = "0.26.0"
 dependencies = [
  "aether",
  "anyhow",
@@ -3763,12 +3820,13 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "windows-sys 0.61.2",
+ "xtask",
  "zeroize",
 ]
 
 [[package]]
 name = "orion-core"
-version = "1.31.3"
+version = "2.0.0"
 dependencies = [
  "aether",
  "anyhow",
@@ -3779,13 +3837,16 @@ dependencies = [
  "defguard_wireguard_rs",
  "directories",
  "futures-util",
+ "helios-fido",
  "helios-key-negotiation",
  "helios-vault",
+ "rcgen",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
+ "time",
  "tokio",
  "toml 0.8.2",
  "tracing",
@@ -4346,8 +4407,8 @@ version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "75e669e5202259b5314d1ea5397316ad400819437857b90861765f24c4cf80a2"
 dependencies = [
+ "aws-lc-rs",
  "pem",
- "ring",
  "rustls-pki-types",
  "time",
  "x509-parser 0.16.0",
@@ -4652,6 +4713,7 @@ version = "0.23.40"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ef86cd5876211988985292b91c96a8f2d298df24e75989a43a3c73f2d4d8168b"
 dependencies = [
+ "aws-lc-rs",
  "once_cell",
  "ring",
  "rustls-pki-types",
@@ -4676,6 +4738,7 @@ version = "0.103.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
 dependencies = [
+ "aws-lc-rs",
  "ring",
  "rustls-pki-types",
  "untrusted 0.9.0",
@@ -7225,14 +7288,12 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
- "aether",
  "anyhow",
  "clap",
  "helios-update",
  "reqwest 0.12.28",
- "serde_json",
  "zip",
 ]
 

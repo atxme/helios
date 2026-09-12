@@ -415,6 +415,12 @@ lève l'exigence, l'annonce en `WARN` à **chaque** démarrage, et la ligne
 « volume » du panneau passe à « non chiffré — exigence levée ». Sous ce mode, T1
 et T7 ne sont plus couverts.
 
+Orion peut créer ce réglage depuis le dialogue présenté avant l'import ou
+l'enregistrement : l'utilisateur doit accepter explicitement que le coffre
+applicatif reste actif mais que la protection des anciens blocs SSD, du fichier
+d'échange et de l'hibernation est incomplète. Une importation ordinaire ne pose
+jamais elle-même la dérogation.
+
 ### 4. Helios — combler les trois manques
 
 Les PSK **négociés** restent exclusivement en mémoire. Les PSK **statiques** sont

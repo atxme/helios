@@ -32,7 +32,10 @@ export function useClient() {
   const upSinceRef = useRef<number | null>(null)
 
   const pushLog = useCallback((level: string, message: string) => {
-    const ts = new Date().toLocaleTimeString('fr-FR', { hour12: false })
+    const ts = new Date().toLocaleTimeString('fr-FR', {
+      hour12: false,
+      timeZone: 'Europe/Paris',
+    })
     setLogs((prev) => [{ level, message, ts }, ...prev].slice(0, MAX_LOGS))
   }, [])
 

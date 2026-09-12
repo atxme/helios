@@ -12,8 +12,16 @@
 // 5)`, several minutes into the build. `ORION_DEPS_READY`, set by xtask
 // right before it spawns npm, is what tells the two callers apart.
 import { execFileSync } from 'node:child_process'
+import { existsSync } from 'node:fs'
+import { dirname, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
-if (process.env.ORION_DEPS_READY === '1') {
+const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..')
+const resourcesRoot = resolve(repositoryRoot, 'resources-windows')
+const resourcesReady = existsSync(resolve(resourcesRoot, 'binaries/wireguard-amd64.dll'))
+  && existsSync(resolve(resourcesRoot, 'binaries/wireguard-arm64.dll'))
+
+if (process.env.ORION_DEPS_READY === '1' || resourcesReady) {
   console.log('==> WireGuardNT: already provided by cargo xtask')
 } else {
   try {
@@ -21,6 +29,16 @@ if (process.env.ORION_DEPS_READY === '1') {
   } catch {
     // `stdio: inherit` already showed cargo's own diagnosis; a Node stack
     // trace on top of it would only bury it.
+    process.exit(1)
+  }
+}
+
+if (process.env.ORION_HELPER_READY === '1') {
+  console.log('==> Astra helper: already provided by cargo xtask')
+} else {
+  try {
+    execFileSync('cargo', ['xtask', 'orion-helper'], { stdio: 'inherit' })
+  } catch {
     process.exit(1)
   }
 }

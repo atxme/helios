@@ -132,15 +132,14 @@ fn decode_wg_key(b64: &str) -> Result<Vec<u8>, EnrollError> {
     Ok(raw)
 }
 
-/// Draws a session nonce from the system's CSPRNG.
+/// Draws a session nonce from the approved DRBG.
 pub fn fresh_nonce() -> [u8; NONCE_LEN] {
-    use aws_lc_rs::rand::{SecureRandom as _, SystemRandom};
     let mut nonce = [0u8; NONCE_LEN];
-    // `SystemRandom` can only fail if the OS has no entropy: in that case we
-    // must absolutely not continue with a predictable nonce.
-    SystemRandom::new()
-        .fill(&mut nonce)
-        .expect("system CSPRNG unavailable — cannot provision safely");
+    // The DRBG only fails when the platform has no entropy, its health test
+    // refuses a block, or a fork has not been reseeded away. In every one of
+    // those cases continuing with a predictable nonce is the worse outcome.
+    aether::random::fill_public(&mut nonce)
+        .expect("the approved DRBG cannot produce a session nonce");
     nonce
 }
 

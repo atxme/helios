@@ -41,10 +41,11 @@ use serde::{Deserialize, Serialize};
 use crate::key_negotiation::{PqCertificate, PqCertificateRole};
 
 use super::{
+    approval::{AstraCampaignApprovalEvidence, AstraPolicyPin, AstraRenewalApprovalEvidence},
     authority::{AstraIssuerAuthorization, RotationReason},
     encoding::{
         validate_server_name, verify_ml_dsa_87, CanonicalBytes, DerCertificate, Fingerprint, Id16,
-        MlDsa87PublicKey, MlDsa87Signature, TrustDomainId, WireGuardKey,
+        MlDsa87PublicKey, MlDsa87Signature, SignedTranscript, TrustDomainId, WireGuardKey,
     },
     gateway::pq_certificate_fingerprint,
     window::{
@@ -99,6 +100,44 @@ pub fn verify_client_leaf_under_any(
         }
     }
     Err(CertificateError::UnauthorizedIssuer)
+}
+
+/// Authenticates a client PQ leaf by **identity**, against the one the verifier
+/// itself recorded at admission, instead of by issuer.
+///
+/// A client's first leaf is issued by the operator CA. A domain registry does
+/// not carry that authority — and must not learn it from the request it is
+/// checking — so no issuer set can ever authenticate a first-generation leaf.
+/// Astra refused every peer that had never renewed, which on a fresh domain is
+/// every peer.
+///
+/// This is not the weaker question. An issuer set admits every certificate
+/// that authority ever signed; the recorded leaf admits exactly one. What
+/// identity does not replace is time: the validity window is still read
+/// against `now_unix` below, because a leaf that was recorded is not a leaf
+/// that is eternal.
+pub fn verify_client_leaf_against_recorded(
+    certificate: &PqCertificate,
+    recorded: &PqCertificate,
+    client_wg_public_key: &WireGuardKey,
+    now_unix: u64,
+) -> Result<(), CertificateError> {
+    if certificate != recorded {
+        return Err(CertificateError::UnauthorizedIssuer);
+    }
+    // The signature is not re-checked, and cannot be: its issuer is precisely
+    // the authority this side does not hold. It was checked once, by the side
+    // that admitted this exact certificate and stored it — which is what makes
+    // the equality above an authentication rather than a comparison.
+    if certificate.role != PqCertificateRole::Client
+        || certificate.wireguard_public_key != client_wg_public_key.to_base64()
+    {
+        return Err(CertificateError::UnauthorizedIssuer);
+    }
+    if certificate.not_before_unix > now_unix || now_unix > certificate.not_after_unix {
+        return Err(CertificateError::OutsideValidityPeriod);
+    }
+    Ok(())
 }
 
 /// One client generation: TLS and PQ bound together (spec §3.3).
@@ -185,7 +224,7 @@ pub struct ClientCertificateRotationRequest {
 }
 
 impl ClientCertificateRotationRequest {
-    fn signing_bytes(&self) -> Vec<u8> {
+    fn signing_bytes(&self) -> SignedTranscript {
         let mut bytes = CanonicalBytes::new(ROTATION_REQUEST_DOMAIN);
         bytes
             .u16(self.format_version)
@@ -203,12 +242,12 @@ impl ClientCertificateRotationRequest {
             .length_prefixed(self.new_ml_dsa_87_public_key.as_bytes())
             .u64(self.created_at)
             .u64(self.expires_at);
-        bytes.finish()
+        bytes.finish_signed()
     }
 
     /// Spec §7.2: the signed bytes, then each signature length-prefixed.
     pub fn fingerprint(&self) -> Fingerprint {
-        let mut bytes = CanonicalBytes::new(&self.signing_bytes());
+        let mut bytes = CanonicalBytes::new(self.signing_bytes().as_bytes());
         bytes
             .length_prefixed(self.active_pq_signature.as_bytes())
             .length_prefixed(self.new_pq_signature.as_bytes());
@@ -311,6 +350,19 @@ pub struct ClientCertificateStageAuthorization {
     pub issuer_authorization: Option<AstraIssuerAuthorization>,
     pub stage_id: Id16,
     pub request_fingerprint: Fingerprint,
+    /// Non-zero fingerprint of the exact operator approval carried below.
+    pub renewal_authorization_fingerprint: Fingerprint,
+    /// Complete ordinary-renewal evidence. Master-authority paths use another
+    /// approval family and therefore leave this absent; their caller must
+    /// verify that family before invoking this leaf-level verifier.
+    pub renewal_approval: Option<AstraRenewalApprovalEvidence>,
+    /// The other approval family of §7.2: the campaign that authorized this
+    /// rotation, present exactly when `reason` is [`RotationReason::ManualGlobal`].
+    ///
+    /// Boxed because a campaign carries up to 256 targets and a credential
+    /// registry, and every consumer of this authorization would otherwise
+    /// carry that weight on the ordinary path where the field is empty.
+    pub campaign_approval: Option<Box<AstraCampaignApprovalEvidence>>,
     pub gateway_wg_public_key: WireGuardKey,
     pub server_name: String,
     pub client_wg_public_key: WireGuardKey,
@@ -329,7 +381,7 @@ pub struct ClientCertificateStageAuthorization {
 }
 
 impl ClientCertificateStageAuthorization {
-    fn signing_bytes(&self) -> Result<Vec<u8>, CertificateError> {
+    fn signing_bytes(&self) -> Result<SignedTranscript, CertificateError> {
         let next_pq = pq_certificate_fingerprint(&self.next_pq_certificate)?;
         let mut bytes = CanonicalBytes::new(STAGE_AUTHORIZATION_DOMAIN);
         bytes
@@ -343,6 +395,7 @@ impl ClientCertificateStageAuthorization {
             .fingerprint(&self.issuer_authorization_fingerprint)
             .id(&self.stage_id)
             .fingerprint(&self.request_fingerprint)
+            .fingerprint(&self.renewal_authorization_fingerprint)
             .key(&self.gateway_wg_public_key)
             .text(&self.server_name)
             .key(&self.client_wg_public_key)
@@ -359,11 +412,11 @@ impl ClientCertificateStageAuthorization {
             .u64(self.window.activation_at)
             .u64(self.window.not_after)
             .u8(self.reason.domain_byte());
-        Ok(bytes.finish())
+        Ok(bytes.finish_signed())
     }
 
     pub fn fingerprint(&self) -> Result<Fingerprint, CertificateError> {
-        let mut bytes = CanonicalBytes::new(&self.signing_bytes()?);
+        let mut bytes = CanonicalBytes::new(self.signing_bytes()?.as_bytes());
         bytes.length_prefixed(self.signature.as_bytes());
         Ok(Fingerprint::of(&bytes.finish()))
     }
@@ -398,6 +451,7 @@ impl ClientCertificateStageAuthorization {
         client_wg_public_key: &WireGuardKey,
         active: &ClientCertificateGeneration,
         tls_anchors: &[&DerCertificate],
+        policy_pin: Option<&AstraPolicyPin>,
         request_expires_at: Option<u64>,
         now_unix: u64,
     ) -> Result<(), CertificateError> {
@@ -425,6 +479,51 @@ impl ClientCertificateStageAuthorization {
         if self.client_wg_public_key != *client_wg_public_key {
             return Err(CertificateError::ClientIdentityMismatch);
         }
+        if self
+            .renewal_authorization_fingerprint
+            .as_bytes()
+            .iter()
+            .all(|byte| *byte == 0)
+        {
+            return Err(CertificateError::ApprovalMismatch("missing approval"));
+        }
+        match (self.issuer_kind, self.reason, &self.renewal_approval) {
+            (IssuerKind::Astra, RotationReason::Scheduled, None)
+                if self
+                    .renewal_authorization_fingerprint
+                    .matches(&self.request_fingerprint) =>
+            {
+                policy_pin
+                    .ok_or(CertificateError::PolicyNotPinned)?
+                    .assert_allows_automatic_renewal(
+                        *trust_domain_id,
+                        *gateway_wg_public_key,
+                        server_name,
+                    )?;
+            }
+            (IssuerKind::Astra, RotationReason::Scheduled, _) => {
+                return Err(CertificateError::ApprovalMismatch(
+                    "automatic renewal request binding",
+                ));
+            }
+            (IssuerKind::Astra, RotationReason::ManualGlobal, None) => {}
+            (IssuerKind::Astra, RotationReason::ManualGlobal, Some(_)) => {
+                return Err(CertificateError::ApprovalMismatch(
+                    "unexpected per-request approval",
+                ));
+            }
+            (IssuerKind::Astra, _, _) => {
+                return Err(CertificateError::UnauthorizedIssuer);
+            }
+            // Master-authority operations use their own approval family. It
+            // must not be confused with an ordinary delegated renewal.
+            (IssuerKind::Master, _, Some(_)) => {
+                return Err(CertificateError::ApprovalMismatch(
+                    "unexpected delegated renewal approval",
+                ));
+            }
+            (IssuerKind::Master, _, None) => {}
+        }
         if self.active_generation != active.generation {
             return Err(CertificateError::GenerationRollback {
                 current: active.generation,
@@ -443,7 +542,17 @@ impl ClientCertificateStageAuthorization {
         }
         self.window.validate()?;
 
-        let mut bounds = vec![self.window.activation_at];
+        // An expired recovery is unusable until its signed two-key commit has
+        // replaced `pending_grant` with `next`, so its lease only bounds how
+        // long that commit may arrive. Unlike an ordinary rotation, it does
+        // not prepare a still-working identity ahead of a future cut-over:
+        // activation may therefore already have been reached while the stage
+        // remains pending. Keeping this exception on the signed reason makes
+        // it unavailable to every delegated/ordinary authorization.
+        let mut bounds = Vec::with_capacity(2);
+        if self.reason != RotationReason::ExpiredRecovery {
+            bounds.push(self.window.activation_at);
+        }
         if let Some(expiry) = request_expires_at {
             bounds.push(expiry);
         }
@@ -472,6 +581,7 @@ impl ClientCertificateStageAuthorization {
             self.active_generation,
             self.next_generation,
             self.reason,
+            policy_pin,
             now_unix,
         )?;
 
@@ -552,6 +662,7 @@ impl ClientCertificateStageAuthorization {
         active_generation: u64,
         next_generation: u64,
         reason: RotationReason,
+        policy_pin: Option<&AstraPolicyPin>,
         now_unix: u64,
     ) -> Result<&'a MlDsa87PublicKey, CertificateError> {
         match self.issuer_kind {
@@ -568,6 +679,9 @@ impl ClientCertificateStageAuthorization {
                     .issuer_authorization
                     .as_ref()
                     .ok_or(CertificateError::UnauthorizedIssuer)?;
+                policy_pin
+                    .ok_or(CertificateError::PolicyNotPinned)?
+                    .assert_authorizes(delegation)?;
                 delegation.verify(
                     ca_pq,
                     trust_domain_id,
@@ -615,6 +729,7 @@ pub struct GatewayCertificateStageReceipt {
     pub stage_id: Id16,
     pub stage_authorization_fingerprint: Fingerprint,
     pub request_fingerprint: Fingerprint,
+    pub renewal_authorization_fingerprint: Fingerprint,
     pub gateway_wg_public_key: WireGuardKey,
     pub client_wg_public_key: WireGuardKey,
     pub active_generation: u64,
@@ -630,7 +745,7 @@ pub struct GatewayCertificateStageReceipt {
 }
 
 impl GatewayCertificateStageReceipt {
-    fn signing_bytes(&self) -> Vec<u8> {
+    fn signing_bytes(&self) -> SignedTranscript {
         let mut bytes = CanonicalBytes::new(STAGE_RECEIPT_DOMAIN);
         bytes
             .u16(self.format_version)
@@ -639,6 +754,7 @@ impl GatewayCertificateStageReceipt {
             .id(&self.stage_id)
             .fingerprint(&self.stage_authorization_fingerprint)
             .fingerprint(&self.request_fingerprint)
+            .fingerprint(&self.renewal_authorization_fingerprint)
             .key(&self.gateway_wg_public_key)
             .key(&self.client_wg_public_key)
             .u64(self.active_generation)
@@ -650,11 +766,11 @@ impl GatewayCertificateStageReceipt {
             .u64(self.active_gateway_identity_epoch)
             .u64(self.gateway_decision_epoch)
             .fingerprint(&self.gateway_certificate_fingerprint);
-        bytes.finish()
+        bytes.finish_signed()
     }
 
     pub fn fingerprint(&self) -> Fingerprint {
-        let mut bytes = CanonicalBytes::new(&self.signing_bytes());
+        let mut bytes = CanonicalBytes::new(self.signing_bytes().as_bytes());
         bytes.length_prefixed(self.gateway_signature.as_bytes());
         Fingerprint::of(&bytes.finish())
     }
@@ -694,6 +810,9 @@ impl GatewayCertificateStageReceipt {
             || !self
                 .request_fingerprint
                 .matches(&authorization.request_fingerprint)
+            || !self
+                .renewal_authorization_fingerprint
+                .matches(&authorization.renewal_authorization_fingerprint)
         {
             return Err(CertificateError::FingerprintMismatch("stage authorization"));
         }
@@ -751,6 +870,11 @@ pub struct ClientCertificateRotationGrant {
     pub issuer_authorization_fingerprint: Fingerprint,
     pub issuer_authorization: Option<AstraIssuerAuthorization>,
     pub request_fingerprint: Fingerprint,
+    pub renewal_authorization_fingerprint: Fingerprint,
+    pub renewal_approval: Option<AstraRenewalApprovalEvidence>,
+    /// Carried onward from the authorization, so the client checks the same
+    /// family the gateway did rather than trusting that it happened.
+    pub campaign_approval: Option<Box<AstraCampaignApprovalEvidence>>,
     pub stage_receipt_fingerprint: Fingerprint,
     pub stage_receipt: GatewayCertificateStageReceipt,
     pub gateway_wg_public_key: WireGuardKey,
@@ -770,7 +894,7 @@ pub struct ClientCertificateRotationGrant {
 }
 
 impl ClientCertificateRotationGrant {
-    fn signing_bytes(&self) -> Result<Vec<u8>, CertificateError> {
+    fn signing_bytes(&self) -> Result<SignedTranscript, CertificateError> {
         let next_pq = pq_certificate_fingerprint(&self.next_pq_certificate)?;
         let mut bytes = CanonicalBytes::new(ROTATION_GRANT_DOMAIN);
         bytes
@@ -783,6 +907,7 @@ impl ClientCertificateRotationGrant {
             .u64(self.issuer_epoch)
             .fingerprint(&self.issuer_authorization_fingerprint)
             .fingerprint(&self.request_fingerprint)
+            .fingerprint(&self.renewal_authorization_fingerprint)
             .fingerprint(&self.stage_receipt_fingerprint)
             .key(&self.gateway_wg_public_key)
             .text(&self.server_name)
@@ -799,11 +924,11 @@ impl ClientCertificateRotationGrant {
             .u64(self.window.activation_at)
             .u64(self.window.not_after)
             .u8(self.reason.domain_byte());
-        Ok(bytes.finish())
+        Ok(bytes.finish_signed())
     }
 
     pub fn fingerprint(&self) -> Result<Fingerprint, CertificateError> {
-        let mut bytes = CanonicalBytes::new(&self.signing_bytes()?);
+        let mut bytes = CanonicalBytes::new(self.signing_bytes()?.as_bytes());
         bytes.length_prefixed(self.signature.as_bytes());
         Ok(Fingerprint::of(&bytes.finish()))
     }
@@ -845,6 +970,7 @@ impl ClientCertificateRotationGrant {
         client_wg_public_key: &WireGuardKey,
         request: &ClientCertificateRotationRequest,
         tls_anchors: &[&DerCertificate],
+        policy_pin: Option<&AstraPolicyPin>,
         now_unix: u64,
     ) -> Result<(), CertificateError> {
         let issuer_key = self.verify_common(
@@ -858,6 +984,7 @@ impl ClientCertificateRotationGrant {
             server_name,
             client_wg_public_key,
             tls_anchors,
+            policy_pin,
             now_unix,
         )?;
 
@@ -891,6 +1018,109 @@ impl ClientCertificateRotationGrant {
         verify_ml_dsa_87(issuer_key, &self.signing_bytes()?, &self.signature)
     }
 
+    /// Verifies the grant of a §7.5 recovery, as the client does.
+    ///
+    /// The same checks as [`Self::verify`], read off the recovery request
+    /// instead of the rotation one — and two extra refusals that only make
+    /// sense here: the grant must be `CA-PQ`'s own
+    /// ([`IssuerKind::Master`]) and its reason must be
+    /// [`RotationReason::ExpiredRecovery`].
+    ///
+    /// # Why this is a separate method and not a generic one
+    ///
+    /// A recovery installs a certificate for an identity every ordinary
+    /// validator refuses. Sharing one entry point with the ordinary path would
+    /// mean one `if` away from letting a delegated issuer's grant install a
+    /// generation that reaches past a validity period. Two methods make the
+    /// two paths impossible to confuse at the call site, which is where the
+    /// confusion would matter.
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_for_recovery(
+        &self,
+        ca_pq: &MlDsa87PublicKey,
+        gateway_pq_public_key: &MlDsa87PublicKey,
+        gateway_certificate_fingerprint: &Fingerprint,
+        trust_domain_id: &TrustDomainId,
+        ca_epoch: u64,
+        ca_tls_epoch: u64,
+        gateway_wg_public_key: &WireGuardKey,
+        server_name: &str,
+        client_wg_public_key: &WireGuardKey,
+        request: &ExpiredCertificateRecoveryRequest,
+        tls_anchors: &[&DerCertificate],
+        policy_pin: Option<&AstraPolicyPin>,
+        now_unix: u64,
+    ) -> Result<(), CertificateError> {
+        if self.issuer_kind != IssuerKind::Master {
+            return Err(CertificateError::IssuerScopeViolation(
+                "only CA-PQ grants the recovery of an expired identity",
+            ));
+        }
+        if self.reason != RotationReason::ExpiredRecovery {
+            return Err(CertificateError::IssuerScopeViolation(
+                "this grant was issued for another reason",
+            ));
+        }
+        let issuer_key = self.verify_common(
+            ca_pq,
+            gateway_pq_public_key,
+            gateway_certificate_fingerprint,
+            trust_domain_id,
+            ca_epoch,
+            ca_tls_epoch,
+            gateway_wg_public_key,
+            server_name,
+            client_wg_public_key,
+            tls_anchors,
+            policy_pin,
+            now_unix,
+        )?;
+
+        crate::certificates::x509::assert_csr_matches(
+            &request.tls_csr,
+            &self.next_tls_certificate,
+        )?;
+        if !self.request_fingerprint.matches(&request.fingerprint()) {
+            return Err(CertificateError::FingerprintMismatch("recovery request"));
+        }
+        if self.active_generation != request.expired_generation
+            || self.next_generation != request.requested_generation
+        {
+            return Err(CertificateError::GenerationConflict {
+                generation: self.next_generation,
+            });
+        }
+        if self.next_pq_certificate.ml_dsa_87_public_key
+            != request.new_ml_dsa_87_public_key.to_base64()
+        {
+            return Err(CertificateError::MissingProof("new client"));
+        }
+
+        verify_ml_dsa_87(issuer_key, &self.signing_bytes()?, &self.signature)
+    }
+
+    /// Checks the issuer's signature over this grant, and nothing else.
+    ///
+    /// # What this is for, and what it is not
+    ///
+    /// A **relay** needs to know that the authority whose key it pins produced
+    /// these bytes, before it stores or forwards them. It is not a substitute
+    /// for [`Self::verify`] or [`Self::verify_for_gateway`]: neither the
+    /// receipt, the leaves, the window, the anchors nor the generation are
+    /// examined here, and a consumer that installs anything on the strength of
+    /// this call alone would be installing an unverified certificate.
+    ///
+    /// Named so that no caller can mistake it for the whole check: the two
+    /// full verifications say what they verify *for*, this one says only that
+    /// it verifies a signature.
+    pub fn verify_signed_by(
+        &self,
+        issuer_public_key: &MlDsa87PublicKey,
+    ) -> Result<(), CertificateError> {
+        let transcript = self.signing_bytes()?;
+        verify_ml_dsa_87(issuer_public_key, &transcript, &self.signature)
+    }
+
     /// Verifies the grant as **Helios** does, on a commit arriving in the
     /// tunnel (spec §7.3).
     ///
@@ -916,6 +1146,7 @@ impl ClientCertificateRotationGrant {
         candidate: &ClientCertificateGeneration,
         stage_id: &Id16,
         tls_anchors: &[&DerCertificate],
+        policy_pin: Option<&AstraPolicyPin>,
         now_unix: u64,
     ) -> Result<(), CertificateError> {
         let issuer_key = self.verify_common(
@@ -929,6 +1160,7 @@ impl ClientCertificateRotationGrant {
             server_name,
             client_wg_public_key,
             tls_anchors,
+            policy_pin,
             now_unix,
         )?;
 
@@ -968,6 +1200,7 @@ impl ClientCertificateRotationGrant {
         server_name: &str,
         client_wg_public_key: &WireGuardKey,
         tls_anchors: &[&DerCertificate],
+        policy_pin: Option<&AstraPolicyPin>,
         now_unix: u64,
     ) -> Result<&'a MlDsa87PublicKey, CertificateError> {
         if self.format_version != CERTIFICATE_FORMAT_VERSION {
@@ -994,6 +1227,49 @@ impl ClientCertificateRotationGrant {
         if self.client_wg_public_key != *client_wg_public_key {
             return Err(CertificateError::ClientIdentityMismatch);
         }
+        if self
+            .renewal_authorization_fingerprint
+            .as_bytes()
+            .iter()
+            .all(|byte| *byte == 0)
+        {
+            return Err(CertificateError::ApprovalMismatch("missing approval"));
+        }
+        match (self.issuer_kind, self.reason, &self.renewal_approval) {
+            (IssuerKind::Astra, RotationReason::Scheduled, None)
+                if self
+                    .renewal_authorization_fingerprint
+                    .matches(&self.request_fingerprint) =>
+            {
+                policy_pin
+                    .ok_or(CertificateError::PolicyNotPinned)?
+                    .assert_allows_automatic_renewal(
+                        *trust_domain_id,
+                        *gateway_wg_public_key,
+                        server_name,
+                    )?;
+            }
+            (IssuerKind::Astra, RotationReason::Scheduled, _) => {
+                return Err(CertificateError::ApprovalMismatch(
+                    "automatic renewal request binding",
+                ));
+            }
+            (IssuerKind::Astra, RotationReason::ManualGlobal, None) => {}
+            (IssuerKind::Astra, RotationReason::ManualGlobal, Some(_)) => {
+                return Err(CertificateError::ApprovalMismatch(
+                    "unexpected per-request approval",
+                ));
+            }
+            (IssuerKind::Astra, _, _) => {
+                return Err(CertificateError::UnauthorizedIssuer);
+            }
+            (IssuerKind::Master, _, Some(_)) => {
+                return Err(CertificateError::ApprovalMismatch(
+                    "unexpected delegated renewal approval",
+                ));
+            }
+            (IssuerKind::Master, _, None) => {}
+        }
         if !self
             .stage_receipt_fingerprint
             .matches(&self.stage_receipt.fingerprint())
@@ -1006,6 +1282,10 @@ impl ClientCertificateRotationGrant {
                 .stage_receipt
                 .request_fingerprint
                 .matches(&self.request_fingerprint)
+            || !self
+                .stage_receipt
+                .renewal_authorization_fingerprint
+                .matches(&self.renewal_authorization_fingerprint)
         {
             return Err(CertificateError::FingerprintMismatch("stage receipt"));
         }
@@ -1047,6 +1327,7 @@ impl ClientCertificateRotationGrant {
             ca_tls_epoch,
             gateway_wg_public_key,
             server_name,
+            policy_pin,
             now_unix,
         )?;
         self.next_pq_certificate
@@ -1097,6 +1378,7 @@ impl ClientCertificateRotationGrant {
         ca_tls_epoch: u64,
         gateway_wg_public_key: &WireGuardKey,
         server_name: &str,
+        policy_pin: Option<&AstraPolicyPin>,
         now_unix: u64,
     ) -> Result<&'a MlDsa87PublicKey, CertificateError> {
         match self.issuer_kind {
@@ -1113,6 +1395,9 @@ impl ClientCertificateRotationGrant {
                     .issuer_authorization
                     .as_ref()
                     .ok_or(CertificateError::UnauthorizedIssuer)?;
+                policy_pin
+                    .ok_or(CertificateError::PolicyNotPinned)?
+                    .assert_authorizes(delegation)?;
                 delegation.verify(
                     ca_pq,
                     trust_domain_id,
@@ -1146,6 +1431,26 @@ impl ClientCertificateRotationGrant {
     }
 }
 
+/// A commit and the grant that authorizes it (spec §7.3).
+///
+/// The two travel together because the gateway needs both: the signatures
+/// prove who is committing, the grant proves the authority released anything
+/// at all. A commit alone would let a client that holds its own two private
+/// keys — which it always does, it generated them — activate a candidate the
+/// authority never granted.
+///
+/// It lives beside its two members rather than in the API crate that serves
+/// the route: a client cannot depend on the gateway's HTTP layer, and when the
+/// shape was defined there the two ends drifted — Orion posted a bare commit
+/// to a gateway that had always required the pair, and the mismatch only
+/// surfaced as an unreadable body on a real renewal.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StageCommitRequest {
+    pub commit: ClientCertificateStageCommit,
+    pub grant: ClientCertificateRotationGrant,
+}
+
 /// The client's commit, signed by the active **and** the candidate PQ key.
 ///
 /// Two signatures because the commit does two things: it proves the client
@@ -1177,7 +1482,7 @@ pub struct ClientCertificateStageCommit {
 }
 
 impl ClientCertificateStageCommit {
-    fn signing_bytes(&self) -> Vec<u8> {
+    fn signing_bytes(&self) -> SignedTranscript {
         let mut bytes = CanonicalBytes::new(STAGE_COMMIT_DOMAIN);
         bytes
             .u16(self.format_version)
@@ -1194,7 +1499,7 @@ impl ClientCertificateStageCommit {
             .fingerprint(&self.staged_pq_certificate_fingerprint)
             .u64(self.stage_expires_at)
             .u64(self.committed_at);
-        bytes.finish()
+        bytes.finish_signed()
     }
 
     /// SHA-256 of the signed transcript followed by both client signatures.
@@ -1203,7 +1508,7 @@ impl ClientCertificateStageCommit {
     /// become `next`, nothing else about the commit is still comparable, and
     /// "the same stage identifier" is not the same document.
     pub fn fingerprint(&self) -> Fingerprint {
-        let mut bytes = CanonicalBytes::new(&self.signing_bytes());
+        let mut bytes = CanonicalBytes::new(self.signing_bytes().as_bytes());
         bytes
             .length_prefixed(self.active_pq_signature.as_bytes())
             .length_prefixed(self.staged_pq_signature.as_bytes());
@@ -1321,7 +1626,7 @@ pub struct ExpiredCertificateRecoveryRequest {
 }
 
 impl ExpiredCertificateRecoveryRequest {
-    fn signing_bytes(&self) -> Vec<u8> {
+    fn signing_bytes(&self) -> SignedTranscript {
         let mut bytes = CanonicalBytes::new(RECOVERY_REQUEST_DOMAIN);
         bytes
             .id(&self.trust_domain_id)
@@ -1342,11 +1647,11 @@ impl ExpiredCertificateRecoveryRequest {
             .fingerprint(&Fingerprint::of(&self.credential_id))
             .u64(self.created_at)
             .u64(self.expires_at);
-        bytes.finish()
+        bytes.finish_signed()
     }
 
     pub fn fingerprint(&self) -> Fingerprint {
-        let mut bytes = CanonicalBytes::new(&self.signing_bytes());
+        let mut bytes = CanonicalBytes::new(self.signing_bytes().as_bytes());
         bytes
             .length_prefixed(self.expired_pq_signature.as_bytes())
             .length_prefixed(self.new_pq_signature.as_bytes());
@@ -1594,6 +1899,16 @@ mod tests {
         WireGuardKey::from_bytes([2; 32])
     }
 
+    fn automatic_policy_fingerprint() -> Fingerprint {
+        crate::certificates::approval::AstraIssuancePolicy::standard(
+            domain(),
+            gateway_key(),
+            SERVER_NAME.into(),
+        )
+        .fingerprint()
+        .expect("automatic policy")
+    }
+
     fn client_leaf(ca: &Keys, subject: &Keys, serial: u8) -> PqCertificate {
         let certificate = PqCertificate {
             version: PQ_CERTIFICATE_VERSION,
@@ -1784,6 +2099,9 @@ mod tests {
             issuer_authorization: None,
             stage_id: Id16::new([5; 16]).expect("stage"),
             request_fingerprint,
+            renewal_authorization_fingerprint: Fingerprint::of(b"operator approval"),
+            renewal_approval: None,
+            campaign_approval: None,
             gateway_wg_public_key: gateway_key(),
             server_name: SERVER_NAME.into(),
             client_wg_public_key: client_key(),
@@ -1826,6 +2144,7 @@ mod tests {
                 &active_generation(),
                 &[&tls.authority],
                 None,
+                None,
                 1_100,
             )
             .is_ok());
@@ -1854,6 +2173,7 @@ mod tests {
                 &client_key(),
                 &active_generation(),
                 &[&tls.authority],
+                None,
                 None,
                 1_100,
             ),
@@ -1889,7 +2209,7 @@ mod tests {
             ),
             allowed_usage: AllowedUsage::AdmittedClientLeafRenewal,
             maximum_leaf_lifetime_secs: 200_000,
-            policy_fingerprint: Fingerprint::of(b"policy"),
+            policy_fingerprint: automatic_policy_fingerprint(),
             not_before: 0,
             not_after: 500_000,
             ca_pq_signature: MlDsa87Signature::placeholder(),
@@ -1904,6 +2224,8 @@ mod tests {
         authorization.issuer_epoch = 3;
         authorization.issuer_authorization_fingerprint = delegation.fingerprint();
         authorization.issuer_authorization = Some(delegation.clone());
+        authorization.renewal_authorization_fingerprint = authorization.request_fingerprint;
+        authorization.renewal_approval = None;
         let authorization = authorization.sign(&issuer.private).expect("sign");
 
         authorization
@@ -1917,10 +2239,34 @@ mod tests {
                 &client_key(),
                 &active_generation(),
                 &[&tls.authority],
+                Some(&AstraPolicyPin::new(automatic_policy_fingerprint()).expect("policy pin")),
                 None,
                 1_100,
             )
             .expect("a delegated leaf verifies under its delegation");
+
+        let mut missing_binding = authorization.clone();
+        missing_binding.renewal_authorization_fingerprint = Fingerprint::of(b"another request");
+        let missing_binding = missing_binding.sign(&issuer.private).expect("sign");
+        assert!(matches!(
+            missing_binding.verify(
+                &ca.public,
+                &domain(),
+                1,
+                1,
+                &gateway_key(),
+                SERVER_NAME,
+                &client_key(),
+                &active_generation(),
+                &[&tls.authority],
+                Some(&AstraPolicyPin::new(automatic_policy_fingerprint()).expect("policy pin"),),
+                None,
+                1_100,
+            ),
+            Err(CertificateError::ApprovalMismatch(
+                "automatic renewal request binding"
+            ))
+        ));
 
         // The same object carrying a leaf issued by `CA-PQ` instead does not:
         // the delegation names the issuer, and the leaf must match it.
@@ -1939,6 +2285,7 @@ mod tests {
                 &client_key(),
                 &active_generation(),
                 &[&tls.authority],
+                Some(&AstraPolicyPin::new(automatic_policy_fingerprint()).expect("policy pin"),),
                 None,
                 1_100,
             ),
@@ -1969,6 +2316,7 @@ mod tests {
                 &active_generation(),
                 &[&tls.authority],
                 None,
+                None,
                 1_100,
             ),
             Err(CertificateError::InvalidLease)
@@ -1991,9 +2339,65 @@ mod tests {
                 &active_generation(),
                 &[&tls.authority],
                 None,
+                None,
                 1_100,
             ),
             Err(CertificateError::LeaseTooLong { .. })
+        ));
+    }
+
+    /// Recovery is the only family whose activation can already be reached
+    /// while its stage lease remains open. The candidate is still unusable
+    /// until commit moves it out of `pending_grant`; ordinary rotations keep
+    /// the stricter lease-before-activation rule.
+    #[test]
+    fn an_expired_recovery_stage_can_outlive_immediate_activation() {
+        let ca = keys();
+        let subject = keys();
+        let leaf = client_leaf(&ca, &subject, 2);
+        let tls = tls_material();
+        let mut authorization = authorization(&ca, &ca, leaf, Fingerprint::of(b"request"), &tls);
+        authorization.reason = RotationReason::ExpiredRecovery;
+        authorization.window = TransitionWindow::new(900, 1_000, 20_000).expect("window");
+        authorization.stage_expires_at = 4_600;
+        let authorization = authorization.sign(&ca.private).expect("sign recovery");
+
+        authorization
+            .verify(
+                &ca.public,
+                &domain(),
+                1,
+                1,
+                &gateway_key(),
+                SERVER_NAME,
+                &client_key(),
+                &active_generation(),
+                &[&tls.authority],
+                None,
+                Some(4_600),
+                1_100,
+            )
+            .expect("a committed recovery may activate immediately");
+
+        let mut ordinary = authorization;
+        ordinary.reason = RotationReason::Scheduled;
+        let ordinary = ordinary.sign(&ca.private).expect("sign ordinary rotation");
+        assert!(matches!(
+            ordinary.verify(
+                &ca.public,
+                &domain(),
+                1,
+                1,
+                &gateway_key(),
+                SERVER_NAME,
+                &client_key(),
+                &active_generation(),
+                &[&tls.authority],
+                None,
+                Some(4_600),
+                1_100,
+            ),
+            Err(CertificateError::InvalidLease)
         ));
     }
 
@@ -2116,6 +2520,232 @@ mod tests {
 
     /// The approved operation is bound to the exact request, its challenge and
     /// its deadline: none of the three can be moved afterwards.
+    /// Builds a recovery request whose expired leaf is genuinely expired.
+    ///
+    /// `ca` is the authority that issued it, `expired` the identity being
+    /// recovered, `fresh` the one asking to be certified.
+    fn recovery_request(
+        ca: &Keys,
+        expired: &Keys,
+        fresh: &Keys,
+        last_known: &ClientCertificateGeneration,
+        challenge: [u8; 32],
+    ) -> ExpiredCertificateRecoveryRequest {
+        ExpiredCertificateRecoveryRequest {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            protocol_version: CERTIFICATE_PROTOCOL_VERSION,
+            trust_domain_id: domain(),
+            astra_challenge: challenge,
+            request_id: Id16::new([9; 16]).expect("request id"),
+            gateway_wg_public_key: gateway_key(),
+            server_name: SERVER_NAME.into(),
+            client_wg_public_key: client_key(),
+            expired_generation: last_known.generation,
+            requested_generation: last_known.generation + 1,
+            expired_tls_certificate: tls_material().leaf,
+            expired_pq_certificate: client_leaf(ca, expired, 4),
+            tls_csr: tls_material().csr,
+            new_ml_dsa_87_public_key: fresh.public.clone(),
+            credential_id: vec![1, 2, 3],
+            created_at: 500_000,
+            expires_at: 500_120,
+            expired_pq_signature: MlDsa87Signature::placeholder(),
+            new_pq_signature: MlDsa87Signature::placeholder(),
+        }
+        .sign(&expired.private, &fresh.private)
+        .expect("sign")
+    }
+
+    /// The generation the registry still records for a peer whose leaf died.
+    fn expired_generation_of(
+        request: &ExpiredCertificateRecoveryRequest,
+    ) -> ClientCertificateGeneration {
+        ClientCertificateGeneration {
+            generation: 4,
+            ca_tls_epoch: 1,
+            tls_ca_certificate_fingerprint: Fingerprint::of(b"tls ca"),
+            tls_certificate_fingerprint: request.expired_tls_certificate.fingerprint(),
+            pq_certificate_fingerprint: pq_certificate_fingerprint(&request.expired_pq_certificate)
+                .expect("fingerprint"),
+            not_before: 0,
+            not_after: 100_000,
+        }
+    }
+
+    /// The period, and **only** the period, is waived (spec §7.5).
+    ///
+    /// This is the validator's whole reason to exist as a separate type: an
+    /// expired leaf is refused by mTLS, by QUIC and by every ordinary
+    /// validator, and here it is a historical proof rather than a credential.
+    /// Waiving one check is safe only while every other one still runs.
+    #[test]
+    fn a_leaf_long_past_its_expiry_still_proves_continuity() {
+        let ca = keys();
+        let expired = keys();
+        let fresh = keys();
+        let challenge = [7u8; 32];
+        let mut last_known = active_generation();
+        let request = recovery_request(&ca, &expired, &fresh, &last_known, challenge);
+        last_known = expired_generation_of(&request);
+
+        // Four hundred thousand seconds past the leaf's `not_after`.
+        request
+            .verify_historical(
+                &[&ca.public],
+                &domain(),
+                &gateway_key(),
+                SERVER_NAME,
+                &client_key(),
+                &last_known,
+                &challenge,
+                500_050,
+            )
+            .expect("an expired leaf is exactly what this validator is given");
+    }
+
+    /// Waiving the period does not waive the issuer.
+    #[test]
+    fn a_leaf_no_authority_of_this_domain_signed_is_refused() {
+        let ca = keys();
+        let stranger = keys();
+        let expired = keys();
+        let fresh = keys();
+        let challenge = [7u8; 32];
+        let request = recovery_request(&ca, &expired, &fresh, &active_generation(), challenge);
+        let last_known = expired_generation_of(&request);
+
+        assert!(matches!(
+            request.verify_historical(
+                &[&stranger.public],
+                &domain(),
+                &gateway_key(),
+                SERVER_NAME,
+                &client_key(),
+                &last_known,
+                &challenge,
+                500_050,
+            ),
+            Err(CertificateError::UnauthorizedIssuer)
+        ));
+    }
+
+    /// Only the **newest** recorded leaf proves continuity.
+    ///
+    /// An attacker holding *some* old certificate of the peer is stopped here:
+    /// accepting any leaf the domain ever issued would make every superseded
+    /// generation a permanent key to the identity.
+    #[test]
+    fn an_older_leaf_of_the_same_peer_is_refused() {
+        let ca = keys();
+        let expired = keys();
+        let fresh = keys();
+        let challenge = [7u8; 32];
+        let request = recovery_request(&ca, &expired, &fresh, &active_generation(), challenge);
+        let mut last_known = expired_generation_of(&request);
+        // The registry has since recorded a different leaf under the same
+        // generation number.
+        last_known.pq_certificate_fingerprint = Fingerprint::of(b"a newer leaf");
+
+        assert!(matches!(
+            request.verify_historical(
+                &[&ca.public],
+                &domain(),
+                &gateway_key(),
+                SERVER_NAME,
+                &client_key(),
+                &last_known,
+                &challenge,
+                500_050,
+            ),
+            Err(CertificateError::FingerprintMismatch("expired PQ leaf"))
+        ));
+    }
+
+    /// The challenge is Astra's, single-use, and not the requester's to pick.
+    #[test]
+    fn a_request_answering_another_challenge_is_refused() {
+        let ca = keys();
+        let expired = keys();
+        let fresh = keys();
+        let request = recovery_request(&ca, &expired, &fresh, &active_generation(), [7u8; 32]);
+        let last_known = expired_generation_of(&request);
+
+        assert!(matches!(
+            request.verify_historical(
+                &[&ca.public],
+                &domain(),
+                &gateway_key(),
+                SERVER_NAME,
+                &client_key(),
+                &last_known,
+                &[8u8; 32],
+                500_050,
+            ),
+            Err(CertificateError::InvalidChallenge)
+        ));
+    }
+
+    /// Continuity is a signature by the expired identity, not its certificate.
+    ///
+    /// Holding the old leaf is public knowledge — it travelled in every
+    /// handshake. Only its private half proves the recovery is asked for by
+    /// the machine that owned the identity.
+    #[test]
+    fn holding_the_expired_leaf_without_its_private_key_proves_nothing() {
+        let ca = keys();
+        let expired = keys();
+        let thief = keys();
+        let fresh = keys();
+        let challenge = [7u8; 32];
+        let mut request = recovery_request(&ca, &expired, &fresh, &active_generation(), challenge);
+        // The leaf stays the peer's; the continuity signature is the thief's.
+        request = request.sign(&thief.private, &fresh.private).expect("sign");
+        let last_known = expired_generation_of(&request);
+
+        assert!(matches!(
+            request.verify_historical(
+                &[&ca.public],
+                &domain(),
+                &gateway_key(),
+                SERVER_NAME,
+                &client_key(),
+                &last_known,
+                &challenge,
+                500_050,
+            ),
+            Err(CertificateError::MissingProof("expired client"))
+        ));
+    }
+
+    /// A recovery is the **next** generation, never a jump or a rollback.
+    #[test]
+    fn a_recovery_may_not_skip_a_generation() {
+        let ca = keys();
+        let expired = keys();
+        let fresh = keys();
+        let challenge = [7u8; 32];
+        let mut request = recovery_request(&ca, &expired, &fresh, &active_generation(), challenge);
+        request.requested_generation = 9;
+        let request = request
+            .sign(&expired.private, &fresh.private)
+            .expect("sign");
+        let last_known = expired_generation_of(&request);
+
+        assert!(matches!(
+            request.verify_historical(
+                &[&ca.public],
+                &domain(),
+                &gateway_key(),
+                SERVER_NAME,
+                &client_key(),
+                &last_known,
+                &challenge,
+                500_050,
+            ),
+            Err(CertificateError::GenerationSkipped { .. })
+        ));
+    }
+
     #[test]
     fn the_recovery_approval_challenge_binds_request_challenge_and_deadline() {
         let request = Fingerprint::of(b"request");
@@ -2133,5 +2763,44 @@ mod tests {
             base,
             expired_recovery_approval_challenge(&request, &challenge, 1_001)
         );
+    }
+
+    /// The bug this pairing exists to prevent, pinned as a test.
+    ///
+    /// Orion once posted a bare commit to a gateway that had always required
+    /// the pair. Both ends compiled, both ends were self-consistent, and the
+    /// disagreement surfaced only as an unreadable body on a real renewal.
+    /// The shape now lives here, and a bare commit must not pass for a request.
+    #[test]
+    fn a_bare_commit_is_not_a_stage_commit_request() {
+        let commit = ClientCertificateStageCommit {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            protocol_version: CERTIFICATE_PROTOCOL_VERSION,
+            trust_domain_id: domain(),
+            stage_id: Id16::new([5; 16]).expect("stage"),
+            grant_fingerprint: Fingerprint::of(b"grant"),
+            stage_receipt_fingerprint: Fingerprint::of(b"receipt"),
+            gateway_wg_public_key: gateway_key(),
+            client_wg_public_key: client_key(),
+            active_generation: 4,
+            staged_generation: 5,
+            staged_tls_certificate_fingerprint: Fingerprint::of(b"next tls"),
+            staged_pq_certificate_fingerprint: Fingerprint::of(b"next pq"),
+            stage_expires_at: 5_000,
+            committed_at: 1_200,
+            active_pq_signature: MlDsa87Signature::new(vec![0; 4627]).unwrap(),
+            staged_pq_signature: MlDsa87Signature::new(vec![0; 4627]).unwrap(),
+        };
+        let bare = serde_json::to_vec(&commit).expect("encode");
+        assert!(
+            serde_json::from_slice::<StageCommitRequest>(&bare).is_err(),
+            "a bare commit must not deserialize as the paired request"
+        );
+        // And the field the reader complains about is the first one it meets,
+        // which is exactly the message the gateway logged.
+        let error = serde_json::from_slice::<StageCommitRequest>(&bare)
+            .expect_err("bare commit")
+            .to_string();
+        assert!(error.contains("format_version"), "{error}");
     }
 }

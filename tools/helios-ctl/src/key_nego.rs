@@ -71,6 +71,30 @@ const PQ_CA_PUBLIC_KEY_FILE: &str = "orion-client-pq-ca-public.bin";
 const PQ_CA_PRIVATE_KEY_FILE: &str = "orion-client-pq-ca-private.bin";
 const CLIENT_PQ_CERTIFICATE_FILE: &str = "orion-client-pq-cert.json";
 const CLIENT_PQ_PRIVATE_KEY_FILE: &str = "orion-client-pq-private.bin";
+/// The production validity used by the ordinary provisioning path.
+pub const DEFAULT_CLIENT_VALIDITY_SECS: u64 = 825 * 24 * 60 * 60;
+/// Floor on a client leaf's life, for lifecycle tests only.
+///
+/// A renewal opens at 80 % of the life, and the leaf is backdated by
+/// [`CLOCK_SKEW_BACKDATE_SECS`], so the wait an operator actually sits through
+/// is `0.8 * (validity + backdate) - backdate` and the window left to act on
+/// the result is `0.2 * (validity + backdate)`. Two minutes of validity leaves
+/// under two minutes to act.
+///
+/// That is deliberately close to the edge: below it, a leaf can expire while
+/// the profile is still being admitted, and the test then measures operator
+/// typing speed instead of the renewal window it was meant to exercise. The
+/// floor is what keeps that failure mode a choice rather than an accident.
+pub const MIN_CLIENT_VALIDITY_SECS: u64 = 2 * 60;
+
+/// How far a freshly issued leaf is backdated.
+///
+/// Not a correction for a badly synchronised clock — it covers the moment when
+/// there is no synchronisation yet: a gateway restarted before its first NTP
+/// exchange, a workstation whose clock drifted while it was off. A verifier
+/// whose clock sits slightly behind the issuer's would otherwise refuse a leaf
+/// that is genuinely valid.
+pub const CLOCK_SKEW_BACKDATE_SECS: u64 = 300;
 
 #[derive(Subcommand)]
 pub enum KeyNegoCmd {
@@ -97,6 +121,10 @@ pub enum KeyNegoCmd {
         wireguard_public_key: String,
         #[arg(long)]
         output_dir: PathBuf,
+        /// Validité des feuilles clientes, en secondes. Réservé aux profils
+        /// de test ; défaut : 825 jours. Minimum : 600 secondes.
+        #[arg(long)]
+        validity_secs: Option<u64>,
     },
     /// Prints the canonical SHA-256 fingerprint of a DER certificate.
     Fingerprint {
@@ -117,6 +145,14 @@ pub enum KeyNegoCmd {
         client_private_key: PathBuf,
         #[arg(long)]
         gateway_pq_certificate: PathBuf,
+        /// `CA-PQ` anchor of the gateway's trust domain, base64 ML-DSA-87.
+        ///
+        /// Required against a gateway that carries a domain, since it then
+        /// serves a leaf `CA-PQ` issued rather than a self-signed one
+        /// (ADR-008 §13.1). Omitted for a gateway that carries none, where the
+        /// pinned leaf is the whole of the trust.
+        #[arg(long)]
+        gateway_ca_pq_public_key: Option<PathBuf>,
         #[arg(long)]
         client_pq_certificate: PathBuf,
         #[arg(long)]
@@ -162,13 +198,15 @@ pub async fn run(command: KeyNegoCmd) -> Result<()> {
             ca_pq_private_key,
             wireguard_public_key,
             output_dir,
-        } => issue_client(
+            validity_secs,
+        } => issue_client_with_validity(
             &name,
             &wireguard_public_key,
             &ca_certificate,
             &ca_private_key,
             &ca_pq_private_key,
             &output_dir,
+            validity_secs.unwrap_or(DEFAULT_CLIENT_VALIDITY_SECS),
         ),
         KeyNegoCmd::Fingerprint { certificate } => {
             let bytes = std::fs::read(&certificate)
@@ -190,6 +228,7 @@ pub async fn run(command: KeyNegoCmd) -> Result<()> {
             client_certificate,
             client_private_key,
             gateway_pq_certificate,
+            gateway_ca_pq_public_key,
             client_pq_certificate,
             client_pq_private_key,
             client_wg_private_key_file,
@@ -217,6 +256,19 @@ pub async fn run(command: KeyNegoCmd) -> Result<()> {
                 }
                 None => None,
             };
+            let ca_pq_anchor = match gateway_ca_pq_public_key {
+                Some(path) => Some(
+                    aether::certificates::encoding::MlDsa87PublicKey::parse(
+                        std::fs::read_to_string(&path)
+                            .with_context(|| format!("reading {}", path.display()))?
+                            .trim(),
+                    )
+                    .context("the CA-PQ anchor is not a readable ML-DSA-87 public key")?
+                    .as_bytes()
+                    .to_vec(),
+                ),
+                None => None,
+            };
             let negotiated = orion_core::key_negotiation::prepare(
                 KeyNegotiationClient {
                     remote: endpoint,
@@ -228,6 +280,7 @@ pub async fn run(command: KeyNegoCmd) -> Result<()> {
                     gateway_ca: read(&gateway_certificate)?,
                     gateway_pq_certificate: serde_json::from_slice(&read(&gateway_pq_certificate)?)
                         .context("parsing the gateway PQ certificate")?,
+                    gateway_ca_pq_public_key: ca_pq_anchor,
                     minimum_mode: mode.into(),
                 },
                 mode.into(),
@@ -335,6 +388,34 @@ pub fn issue_client_material(
     ca_private_key_path: &Path,
     ca_pq_private_key_path: &Path,
 ) -> Result<ClientMaterial> {
+    issue_client_material_with_validity(
+        name,
+        wireguard_public_key,
+        ca_certificate_path,
+        ca_private_key_path,
+        ca_pq_private_key_path,
+        DEFAULT_CLIENT_VALIDITY_SECS,
+    )
+}
+
+/// Issues a client identity with an explicit validity, for lifecycle tests.
+///
+/// The TLS and PQ leaves receive the same interval. Keeping this test hook in
+/// the single issuance helper is important: generating a short PQ leaf while
+/// leaving TLS at 825 days would exercise a split-brain certificate state, not
+/// the renewal planner.
+pub fn issue_client_material_with_validity(
+    name: &str,
+    wireguard_public_key: &str,
+    ca_certificate_path: &Path,
+    ca_private_key_path: &Path,
+    ca_pq_private_key_path: &Path,
+    validity_secs: u64,
+) -> Result<ClientMaterial> {
+    anyhow::ensure!(
+        validity_secs >= MIN_CLIENT_VALIDITY_SECS,
+        "client validity must be at least {MIN_CLIENT_VALIDITY_SECS} seconds"
+    );
     check_private_permissions(ca_private_key_path)?;
     check_private_permissions(ca_pq_private_key_path)?;
     aether::wg::validate_key(wireguard_public_key).context("invalid WireGuard public key")?;
@@ -356,7 +437,7 @@ pub fn issue_client_material(
     params.is_ca = IsCa::NoCa;
     params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
-    set_validity(&mut params, 825);
+    set_validity_secs(&mut params, validity_secs);
     let key = KeyPair::generate().context("generating the Orion client key")?;
     let certificate = params
         .signed_by(&key, &ca, &ca_key)
@@ -376,8 +457,10 @@ pub fn issue_client_material(
             wireguard_public_key: wireguard_public_key.trim().to_string(),
             ml_dsa_87_public_key: base64::engine::general_purpose::STANDARD
                 .encode(client_pq_public_key),
-            not_before_unix: now.saturating_sub(300),
-            not_after_unix: now + 825 * 24 * 60 * 60,
+            not_before_unix: now.saturating_sub(CLOCK_SKEW_BACKDATE_SECS),
+            not_after_unix: now
+                .checked_add(validity_secs)
+                .context("client validity exceeds the Unix timestamp range")?,
             ml_dsa_87_signature: String::new(),
         },
         ca_pq_private_key.as_slice(),
@@ -419,6 +502,10 @@ pub fn load_client_material(directory: &Path) -> Result<ClientMaterial> {
     })
 }
 
+/// The default-validity wrapper. Only the tests below reach it: the command
+/// line always passes a validity, so gating it keeps the binary from carrying
+/// a function nothing calls.
+#[cfg(test)]
 fn issue_client(
     name: &str,
     wireguard_public_key: &str,
@@ -426,6 +513,26 @@ fn issue_client(
     ca_private_key_path: &Path,
     ca_pq_private_key_path: &Path,
     output_dir: &Path,
+) -> Result<()> {
+    issue_client_with_validity(
+        name,
+        wireguard_public_key,
+        ca_certificate_path,
+        ca_private_key_path,
+        ca_pq_private_key_path,
+        output_dir,
+        DEFAULT_CLIENT_VALIDITY_SECS,
+    )
+}
+
+fn issue_client_with_validity(
+    name: &str,
+    wireguard_public_key: &str,
+    ca_certificate_path: &Path,
+    ca_private_key_path: &Path,
+    ca_pq_private_key_path: &Path,
+    output_dir: &Path,
+    validity_secs: u64,
 ) -> Result<()> {
     reject_existing(
         output_dir,
@@ -436,12 +543,13 @@ fn issue_client(
             CLIENT_PQ_PRIVATE_KEY_FILE,
         ],
     )?;
-    let material = issue_client_material(
+    let material = issue_client_material_with_validity(
         name,
         wireguard_public_key,
         ca_certificate_path,
         ca_private_key_path,
         ca_pq_private_key_path,
+        validity_secs,
     )?;
 
     std::fs::create_dir_all(output_dir)
@@ -478,17 +586,19 @@ fn distinguished_name(name: &str) -> DistinguishedName {
 }
 
 fn set_validity(params: &mut CertificateParams, days: i64) {
+    set_validity_secs(params, (days as u64).saturating_mul(24 * 60 * 60));
+}
+
+fn set_validity_secs(params: &mut CertificateParams, validity_secs: u64) {
     params.not_before = time::OffsetDateTime::now_utc() - time::Duration::minutes(5);
-    params.not_after = time::OffsetDateTime::now_utc() + time::Duration::days(days);
+    params.not_after = time::OffsetDateTime::now_utc()
+        + time::Duration::seconds(i64::try_from(validity_secs).unwrap_or(i64::MAX));
 }
 
 fn random_serial() -> Result<[u8; 16]> {
-    use aws_lc_rs::rand::{SecureRandom as _, SystemRandom};
-
     let mut serial = [0u8; 16];
-    SystemRandom::new()
-        .fill(&mut serial)
-        .map_err(|_| anyhow::anyhow!("system CSPRNG unavailable"))?;
+    aether::random::fill_public(&mut serial)
+        .map_err(|error| anyhow::anyhow!("the approved DRBG refused: {error}"))?;
     Ok(serial)
 }
 
@@ -738,6 +848,51 @@ mod tests {
             .is_err(),
             "issuing again must not replace the admitted identity"
         );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn short_validity_applies_to_the_pq_leaf_and_rejects_risky_values() {
+        let root = test_directory("short-validity");
+        let ca = root.join("ca");
+        init_client_ca("Orion test CA", &ca).unwrap();
+        let keypair = aether::wg::generate_keypair().unwrap();
+
+        let material = issue_client_material_with_validity(
+            "renewal-test",
+            &keypair.public_key,
+            &ca.join(CA_CERTIFICATE_FILE),
+            &ca.join(CA_PRIVATE_KEY_FILE),
+            &ca.join(PQ_CA_PRIVATE_KEY_FILE),
+            600,
+        )
+        .expect("short-lived identity");
+        let certificate: PqCertificate =
+            serde_json::from_slice(&material.pq_certificate_json).unwrap();
+        let now = unix_time_now().unwrap();
+        assert!(certificate.not_after_unix >= now + 590);
+        assert!(certificate.not_after_unix <= now + 600);
+        let tls = aether::certificates::encoding::DerCertificate::new(material.certificate_der)
+            .expect("short-lived TLS leaf");
+        let tls_facts = aether::certificates::x509::inspect(&tls).expect("inspect TLS leaf");
+        assert!(tls_facts.not_after >= now + 590);
+        assert!(tls_facts.not_after <= now + 600);
+
+        let error = match issue_client_material_with_validity(
+            "renewal-test",
+            &keypair.public_key,
+            &ca.join(CA_CERTIFICATE_FILE),
+            &ca.join(CA_PRIVATE_KEY_FILE),
+            &ca.join(PQ_CA_PRIVATE_KEY_FILE),
+            MIN_CLIENT_VALIDITY_SECS - 1,
+        ) {
+            Ok(_) => panic!("a profile must leave time to complete admission"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains(&format!("at least {MIN_CLIENT_VALIDITY_SECS} seconds")));
 
         std::fs::remove_dir_all(root).unwrap();
     }

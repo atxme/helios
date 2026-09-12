@@ -19,7 +19,21 @@ cd "$SCRIPTS/.."
 # shellcheck source=scripts/lib-remote.sh
 . "$SCRIPTS/lib-remote.sh"
 
-TARGET="${1:-$HELIOS_CIBLE}"
+TARGET=""
+FIREWALL_MODE=preserve
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --disable-firewall) FIREWALL_MODE=disabled; shift ;;
+        --enable-firewall) FIREWALL_MODE=enabled; shift ;;
+        -*) echo "unknown target-bootstrap option: $1" >&2; exit 2 ;;
+        *)
+            [ -z "$TARGET" ] || { echo "target-bootstrap accepts one SSH target" >&2; exit 2; }
+            TARGET="$1"
+            shift
+            ;;
+    esac
+done
+TARGET="${TARGET:-$HELIOS_CIBLE}"
 [ -n "$TARGET" ] || { echo "target-bootstrap.sh requires an SSH target" >&2; exit 2; }
 
 # Une seule invite pour tout le déploiement, prise **ici** : dans un pipeline,
@@ -28,8 +42,45 @@ helios_sudo_init "$TARGET"
 
 CERTS_ROOT="${HELIOS_CERTS_ROOT:-$HOME/.helios/certs}"
 TARGET_HOST="${TARGET#*@}"
-TARGET_ID="$(printf '%s' "$TARGET_HOST" | tr -c 'A-Za-z0-9._-' '_')"
+ADDRESS_ID="$(printf '%s' "$TARGET_HOST" | tr -c 'A-Za-z0-9._-' '_')"
+
+# The deployment state is indexed on the **machine**, not on the address used
+# to reach it.
+#
+# Indexing on the address is what caused the 2026-09-01 lockout: the same
+# gateway reached at a second address got an empty state directory, so the
+# `client-enrollment.conf` guard below saw no enrolment, re-issued the admin
+# certificate, and the client still holding the previous one stopped being
+# admitted. A gateway has many addresses — LAN, Tailscale, NordVPN — and which
+# one an operator types is not an identity.
+#
+# `/etc/machine-id` is stable across addresses and reboots, exists on every
+# systemd host, and does not depend on Helios being up to be readable.
+MACHINE_ID="$(ssh "$TARGET" 'cat /etc/machine-id 2>/dev/null' | tr -cd 'a-f0-9')"
+if [ -n "$MACHINE_ID" ]; then
+    TARGET_ID="$MACHINE_ID"
+else
+    echo "    /etc/machine-id illisible : repli sur l'adresse ($ADDRESS_ID)" >&2
+    TARGET_ID="$ADDRESS_ID"
+fi
 TARGET_DIR="$CERTS_ROOT/$TARGET_ID"
+
+# Adopt the state a previous address-indexed run left behind, rather than
+# treating this machine as new — re-enrolling is exactly the failure this
+# indexing change exists to prevent. Only ever a rename of an existing
+# directory: nothing is merged, so no enrolment can be silently overwritten.
+if [ ! -d "$TARGET_DIR" ] && [ -d "$CERTS_ROOT/$ADDRESS_ID" ]; then
+    echo "==> Reprise de l'état de déploiement $ADDRESS_ID -> $TARGET_ID"
+    # `client-enrollment.conf` stores the profile path absolutely, so the rename
+    # would leave it pointing at a directory that no longer exists. It is read
+    # back to tell the operator which profile to install: a stale path there
+    # sends them to a file that is not the one the gateway admits.
+    RENAMED_STATE="$CERTS_ROOT/$ADDRESS_ID/client-enrollment.conf"
+    if [ -f "$RENAMED_STATE" ]; then
+        sed -i "s|$CERTS_ROOT/$ADDRESS_ID/|$TARGET_DIR/|g" "$RENAMED_STATE"
+    fi
+    mv "$CERTS_ROOT/$ADDRESS_ID" "$TARGET_DIR"
+fi
 CA_DIR="$CERTS_ROOT/internal-ca"
 TARGET_CONFIG="$TARGET_DIR/target.conf"
 REMOTE_HELIOSD="/opt/helios/current/heliosd"
@@ -38,6 +89,13 @@ REMOTE_NETWORK="/var/lib/helios/network.toml"
 umask 077
 mkdir -p "$CERTS_ROOT" "$TARGET_DIR"
 chmod 700 "$CERTS_ROOT" "$TARGET_DIR"
+
+# Every address this machine has been reached at, so an operator can tell which
+# directory belongs to which gateway without decoding a machine-id.
+if ! grep -qxF "$TARGET_HOST" "$TARGET_DIR/aliases" 2>/dev/null; then
+    printf '%s\n' "$TARGET_HOST" >> "$TARGET_DIR/aliases"
+    chmod 600 "$TARGET_DIR/aliases"
+fi
 
 read_setting() {
     setting="$1"
@@ -141,6 +199,116 @@ case "$SSH_SOURCE" in
     *) SSH_CIDR="$SSH_SOURCE/32" ;;
 esac
 
+# The interface this deployment actually arrives on, asked of the kernel that
+# routes it back. This is the pivot of the whole check below: an address tells
+# us nothing about which overlay carries it, and the overlay is what decides
+# whether the rule we are about to write survives a `heliosd` restart.
+SSH_ARRIVAL_IFACE="$(ssh "$TARGET" "ip route get '$SSH_SOURCE' 2>/dev/null" |
+    awk '{for (i = 1; i <= NF; i++) if ($i == "dev") {print $(i + 1); exit}}')"
+
+# Refuse to pin SSH to an address that only exists while Helios is up.
+#
+# This is the 2026-09-01 lockout, encoded. The deployment was reached at a
+# CGNAT address that Helios itself routes, so `$SSH_CONNECTION` reported a peer
+# VIP; `allow_ssh_from` was pinned to it, `heliosd` restarted, the tunnel went
+# down and took the only permitted SSH source with it. `aether` now refuses
+# such a config outright — this catches it before it is ever written, where the
+# operator can still act on the advice.
+HELIOS_WG_IFACE="${HELIOS_WG_IFACE:-helios0}"
+if [ "$SSH_ARRIVAL_IFACE" = "$HELIOS_WG_IFACE" ]; then
+    cat >&2 <<EOF
+    Ce déploiement passe par le tunnel Helios lui-même ($SSH_ARRIVAL_IFACE,
+    source $SSH_SOURCE). Épingler allow_ssh_from sur cette adresse produirait
+    une règle qui disparaît au prochain redémarrage de heliosd — c'est
+    exactement le verrouillage du 1er septembre 2026.
+
+    Relancez depuis un chemin qui survit à une coupure du tunnel : le LAN, ou
+    une interface d'administration hors-bande (Tailscale, NordVPN).
+EOF
+    exit 1
+fi
+
+# Out-of-band administration interfaces: the way back in when the tunnel is
+# the thing that broke.
+#
+# **Every** overlay found is kept, not just the one this deployment came in on.
+# This gateway is not reachable from a LAN — the operator is remote for good —
+# so Tailscale and NordVPN Meshnet are the only paths that survive a Helios
+# outage, and closing one because the other happened to carry today's session
+# would leave a single point of failure on the recovery path itself.
+# HELIOS_ADMIN_IFACES overrides the list when an operator wants to narrow it.
+#
+# Filtered by interface rather than by address on purpose: Tailscale carries a
+# v4 and a v6, NordVPN's address follows the server it picked, and an address
+# list stops matching the day either moves — the day the recovery path is
+# needed. One `iifname` covers every address the interface will ever hold.
+ADMIN_IFACE_CANDIDATES="$(ssh "$TARGET" '
+    ip -brief link show 2>/dev/null |
+        awk "{print \$1}" |
+        sed "s/@.*//" |
+        grep -E "^(tailscale[0-9]*|nordlynx|zt[a-z0-9]+|tun[0-9]+)$" |
+        sort -u
+')"
+if [ -z "${HELIOS_ADMIN_IFACES+set}" ]; then
+    ADMIN_IFACES="$(printf '%s' "$ADMIN_IFACE_CANDIDATES" | paste -sd' ' -)"
+else
+    ADMIN_IFACES="$HELIOS_ADMIN_IFACES"
+fi
+if [ -n "$ADMIN_IFACE_CANDIDATES" ]; then
+    echo "    Interfaces d'administration détectées : $(printf '%s' "$ADMIN_IFACE_CANDIDATES" | paste -sd' ' -)"
+    echo "    Retenues : ${ADMIN_IFACES:-aucune}"
+fi
+
+# Closing the door this session came through is the one mistake that cannot be
+# undone remotely: the refusal has to happen before the firewall is written,
+# not after the operator has lost the shell that would have fixed it.
+case " $ADMIN_IFACES " in
+    *" $SSH_ARRIVAL_IFACE "*) ;;
+    *)
+        for candidate in $ADMIN_IFACE_CANDIDATES; do
+            [ "$candidate" = "$SSH_ARRIVAL_IFACE" ] || continue
+            echo "    $SSH_ARRIVAL_IFACE porte cette session mais est exclue de" >&2
+            echo "    HELIOS_ADMIN_IFACES : le déploiement fermerait l'accès qu'il utilise." >&2
+            exit 1
+        done
+        ;;
+esac
+
+# A remote gateway with no overlay left has no way back in once heliosd stops.
+if [ -z "$ADMIN_IFACES" ] && [ "$SSH_ARRIVAL_IFACE" != "$WAN_IFACE" ]; then
+    echo "    Aucune interface d'administration hors-bande : après un arrêt de" >&2
+    echo "    heliosd, seule allow_ssh_from ($SSH_CIDR) restera. Vérifier que cette" >&2
+    echo "    source survit à une coupure du tunnel." >&2
+fi
+for iface in $ADMIN_IFACES; do
+    case "$iface" in
+        *[!A-Za-z0-9_.:-]*) echo "unsafe administration interface name: $iface" >&2; exit 1 ;;
+    esac
+    if [ "$iface" = "$HELIOS_WG_IFACE" ] || [ "$iface" = "$WAN_IFACE" ]; then
+        echo "admin_ifaces must not name the Helios tunnel or the WAN: $iface" >&2
+        exit 1
+    fi
+    # Une interface d'administration qui n'existe pas sur la cible produit une
+    # règle nftables qui ne matchera jamais : le pare-feu paraît ouvert et ne
+    # l'est pas, et cela ne se découvre qu'au moment où l'accès est déjà perdu.
+    #
+    # C'est ce qui est arrivé le 2 septembre 2026 : deux noms concaténés en un
+    # seul — `nordlynxtailscale0` — ont été écrits sans que rien ne proteste,
+    # laissant une configuration qui annonçait un secours inexistant. Le nom est
+    # donc confronté au noyau, pas seulement à une expression régulière.
+    if ! ssh "$TARGET" "ip -brief link show dev '$iface'" >/dev/null 2>&1; then
+        echo "admin_ifaces nomme une interface absente de la cible : $iface" >&2
+        echo "    la règle SSH correspondante ne matcherait jamais, et l'accès de" >&2
+        echo "    secours n'existerait que dans le fichier." >&2
+        exit 1
+    fi
+done
+
+# La liste part en CSV vers `network-bootstrap.sh`. Construite avec `paste` et
+# non avec `printf '%s'`, qui réapplique son format à **chaque** argument sans
+# séparateur : `printf '%s' nordlynx tailscale0` donne `nordlynxtailscale0`.
+ADMIN_IFACES_CSV="$(printf '%s\n' $ADMIN_IFACES | paste -sd, -)"
+
 DYNAMIC_ARG=()
 if ssh "$TARGET" "ip -4 addr show dev '$WAN_IFACE'" | grep -qw dynamic; then
     DYNAMIC_ARG=(--dynamic-wan)
@@ -196,6 +364,10 @@ fi
 {
     printf 'wan_iface = "auto"\n'
     printf 'allow_ssh_from = ["%s"]\n' "$SSH_CIDR"
+    if [ -n "$ADMIN_IFACES" ]; then
+        printf 'admin_ifaces = [%s]\n' \
+            "$(printf '%s\n' $ADMIN_IFACES | sed 's/.*/"&"/' | paste -sd, -)"
+    fi
     if [ "${#DYNAMIC_ARG[@]}" -gt 0 ]; then
         printf 'allow_dhcp_on_wan = true\n'
     else
@@ -217,6 +389,7 @@ helios_ssh_sudo "$TARGET" "sh /tmp/helios-network-bootstrap.sh \
     --wg-port '$WG_PORT' \
     --key-negotiation-port '$KEY_PORT' \
     --escrow-public-key '$ESCROW_PUBLIC_KEY' \
+    ${ADMIN_IFACES:+--admin-ifaces \"$ADMIN_IFACES_CSV\"} \
     ${MESHNET_ARG[*]} \
     ${DYNAMIC_ARG[*]} && \
     '$REMOTE_HELIOSD' status && \
@@ -309,6 +482,37 @@ fi
 
 echo "==> Starting deployed services and staging the encrypted escrow"
 REMOTE_ESCROW="/tmp/helios-wg-key.escrow"
+FIREWALL_DROPIN_DIR="/etc/systemd/system/heliosd.service.d"
+FIREWALL_DROPIN="$FIREWALL_DROPIN_DIR/firewall-maintenance.conf"
+case "$FIREWALL_MODE" in
+    disabled)
+        echo "==> Enabling persistent Helios firewall maintenance mode"
+        helios_ssh_sudo "$TARGET" "
+            install -d -m 755 '$FIREWALL_DROPIN_DIR'
+            printf '%s\n' \
+                '[Service]' \
+                'ExecStart=' \
+                'ExecStart=/opt/helios/current/heliosd run --unsafe-disable-firewall' \
+                > '$FIREWALL_DROPIN'
+            chmod 644 '$FIREWALL_DROPIN'
+            systemctl unmask --runtime heliosd.service
+            systemctl daemon-reload
+        "
+        ;;
+    enabled)
+        echo "==> Re-enabling fail-closed Helios firewall enforcement"
+        helios_ssh_sudo "$TARGET" "
+            rm -f '$FIREWALL_DROPIN'
+            systemctl unmask --runtime heliosd.service
+            systemctl daemon-reload
+        "
+        ;;
+    preserve)
+        if ssh "$TARGET" "test -f '$FIREWALL_DROPIN'"; then
+            echo "==> Preserving existing Helios firewall maintenance mode"
+        fi
+        ;;
+esac
 # `heliosd` reconstruit le pare-feu au démarrage, sur le lien même par lequel
 # cette session passe. Le redémarrer **dans** la session, c'est demander à la
 # commande de survivre à la coupure de son propre transport : la connexion se
@@ -318,8 +522,9 @@ REMOTE_ESCROW="/tmp/helios-wg-key.escrow"
 # redémarrage se fait hors de la session, et l'état se relit ensuite sur une
 # connexion neuve.
 helios_ssh_sudo "$TARGET" "
-    systemctl enable heliosd helios-update.path >/dev/null
+    systemctl enable heliosd helios-update.path helios-log-prune.timer >/dev/null
     systemctl start helios-update.path
+    systemctl start helios-log-prune.timer
     systemd-run --collect --unit=helios-deploy-restart \
         systemctl restart heliosd >/dev/null
 "
@@ -344,6 +549,20 @@ if [ "$DEMARRE" = "0" ]; then
     exit 1
 fi
 ssh "${HELIOS_SSH_OPTS[@]}" "$TARGET" 'systemctl --no-pager --full status heliosd' || true
+
+if [ "$FIREWALL_MODE" = "disabled" ]; then
+    readiness="$(helios_ssh_sudo_capture "$TARGET" \
+        "cat /run/helios/ready 2>/dev/null || true")"
+    printf '%s\n' "$readiness" | grep -qx 'firewall_enforced=false' || {
+        echo "    heliosd n'annonce pas le mode firewall désactivé" >&2
+        exit 1
+    }
+    if helios_ssh_sudo "$TARGET" "nft list table inet helios >/dev/null 2>&1"; then
+        echo "    la table inet helios existe encore malgré le mode maintenance" >&2
+        exit 1
+    fi
+    echo "    firewall Helios désactivé et table inet helios absente"
+fi
 
 helios_ssh_sudo "$TARGET" "
     if test -f /var/lib/helios/wg-key.escrow; then

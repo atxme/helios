@@ -63,12 +63,8 @@ pub struct ProfileId([u8; 16]);
 impl ProfileId {
     /// Draws a new identifier.
     pub fn generate() -> Result<Self, VaultError> {
-        use aws_lc_rs::rand::{SecureRandom as _, SystemRandom};
-
         let mut id = [0u8; 16];
-        SystemRandom::new()
-            .fill(&mut id)
-            .map_err(|_| VaultError::Rng)?;
+        aether::random::fill_public(&mut id).map_err(|_| VaultError::Rng)?;
         // An all-zero identifier is what an uninitialised buffer looks like;
         // refusing it turns a silent bug into a loud one.
         if id.iter().all(|byte| *byte == 0) {
@@ -237,6 +233,16 @@ pub enum VaultError {
          autre poste ou d'un autre pair"
     )]
     ContextDisagrees,
+    #[error("profil contradictoire : {0}")]
+    InvalidProfileKind(String),
+    #[error(
+        "le type d'un profil scellé est immuable : « {known} » ne peut pas être remplacé par \
+         « {offered} » sous le même identifiant. Créer un nouveau profil sous un autre nom"
+    )]
+    ProfileKindChanged {
+        known: &'static str,
+        offered: &'static str,
+    },
     #[error("scellement DPAPI refusé par le système : {0}")]
     Dpapi(String),
     #[error("TPM : {0}")]
@@ -267,6 +273,8 @@ pub enum VaultError {
     GenerationWentBackwards { observed: u64, offered: u64 },
     #[error("hygiène mémoire : {0}")]
     MemoryHygiene(&'static str),
+    #[error("réglages locaux du coffre : {0}")]
+    LocalSettings(String),
     #[error(transparent)]
     Container(helios_vault::VaultError),
 }

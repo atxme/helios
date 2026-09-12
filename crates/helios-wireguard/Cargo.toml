@@ -1,13 +1,12 @@
 [package]
 name = "helios-wireguard"
-version = "0.2.1"
+version = "0.3.0"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 description = "Plan de données WireGuard de la gateway Helios : trait + backend dry-run (testable partout) et backend noyau (feature `wireguard`, target-only)."
 
 [dependencies]
-aether = { workspace = true }
 helios-provisioning = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }

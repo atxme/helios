@@ -368,5 +368,6 @@
       "Bash(bash -c '. scripts/lib-remote.sh; echo \"par défaut : $HELIOS_CIBLE\"')",
       "Bash(HELIOS_CIBLE=root@10.0.0.9 bash -c '. scripts/lib-remote.sh; echo \"override env : $HELIOS_CIBLE\"')"
     ]
-  }
+  },
+  "outputStyle": "Concise"
 }

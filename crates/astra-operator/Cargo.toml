@@ -1,0 +1,45 @@
+[package]
+name = "astra-operator"
+version = "0.2.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Bibliothèque opérateur d'Astra (ADR-008 §4) : le coffre d'autorité, les gestes FIDO2 qui l'ouvrent et les objets qu'ils signent. Ni Astra, ni la gateway, ni Orion ne dépendent d'elle — seul le processus qui tient la clé."
+
+[lib]
+name = "astra_operator"
+path = "src/lib.rs"
+
+[dependencies]
+# `key-negotiation-signing` sans condition : sans elle il n'existe aucune
+# fonction `sign`, et cette bibliothèque est précisément la seule du dépôt qui
+# signe sous `CA-PQ`. La construire sans donnerait un coffre qui s'ouvre et ne
+# peut rien en faire.
+aether = { workspace = true, features = ["key-negotiation-signing"] }
+astra.workspace = true
+helios-fido = { workspace = true }
+# Le format scellé du corps du coffre.
+helios-vault.workspace = true
+anyhow.workspace = true
+aws-lc-rs.workspace = true
+base64.workspace = true
+hex.workspace = true
+rcgen.workspace = true
+# Le transport in-tunnel du §8.1.2. Bloquant : l'appelant est un programme qui
+# attend qu'un humain touche une clé, il n'a pas d'exécuteur asynchrone et n'en
+# veut pas un pour trois requêtes.
+reqwest = { workspace = true, features = ["blocking"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+# Les périodes de validité X.509 que `rcgen` attend.
+time.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+# Le certificat `CA-TLS` que la bibliothèque auto-signe se relit avec un
+# parseur X.509 réel plutôt qu'avec l'émetteur qui vient de l'écrire : c'est la
+# signature et le `basicConstraints` qui comptent, pas ce que `rcgen` croit
+# avoir posé. Même version que celle qu'`aether` vérifie déjà.
+x509-parser = { version = "0.16", features = ["verify"] }

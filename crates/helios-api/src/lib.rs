@@ -21,6 +21,7 @@ pub mod auth;
 pub mod certificates;
 pub mod embed;
 pub mod health;
+pub mod internal;
 pub mod key_negotiation;
 pub mod provision;
 mod routes;
@@ -87,11 +88,28 @@ pub struct AppState {
     /// owns the per-peer serializer, and learns nothing back beyond a refusal
     /// class.
     pub psk_release: Option<Arc<dyn key_negotiation::PskReleaseHandler>>,
+    /// The gateway's own certificate identity, driven from the console
+    /// (spec §12.2). `None` on a daemon that holds no TPM unlock material:
+    /// the screen then reads the domain and offers no gesture, rather than
+    /// offering one that fails at its last step.
+    pub gateway_identity: Option<Arc<dyn certificates::GatewayIdentityHandler>>,
     /// Gateway side of the certificate lifecycle, `None` when the trust
     /// domain is not bootstrapped. Absent, the in-tunnel trust-update route
     /// answers `404` — the same answer an older gateway gives, so Orion has a
     /// single behaviour to implement.
     pub trust_update: Option<Arc<dyn certificates::TrustUpdateHandler>>,
+    /// Gateway side of the relayed client renewal (spec §8.1.2), `None` when
+    /// this gateway has no private channel to the authority. Absent, the four
+    /// renewal routes answer `503` — the route exists and the client is right
+    /// to use it; what is missing is the authority behind it.
+    pub client_renewal: Option<Arc<dyn certificates::ClientRenewalRelay>>,
+    /// The relay for operator campaigns inside the tunnel (spec §8.5).
+    ///
+    /// Separate from `client_renewal` because the two surfaces are separate:
+    /// one is a peer's own renewal, the other an authority ceremony an
+    /// administrator makes circulate. `None` is a gateway with no private
+    /// channel, and its routes answer `503`.
+    pub operator_campaign: Option<Arc<dyn certificates::OperatorCampaignRelay>>,
     /// Non-secret summary of the boot-time sealing decision, `None` when the
     /// daemon runs without TPM validation. A projection: `BootDecision` itself
     /// carries the unlock secret and must not reach this crate.
@@ -144,7 +162,10 @@ impl AppState {
             api_ready: Arc::new(AtomicBool::new(false)),
             key_negotiation: None,
             psk_release: None,
+            gateway_identity: None,
             trust_update: None,
+            client_renewal: None,
+            operator_campaign: None,
             tpm: None,
             peer_runtime: Arc::new(RwLock::new(Vec::new())),
         }
@@ -190,6 +211,34 @@ impl AppState {
         self.trust_update = Some(handler);
         self
     }
+
+    /// Wires the gateway's own identity, once the daemon can open its vault.
+    pub fn with_gateway_identity(
+        mut self,
+        handler: Arc<dyn certificates::GatewayIdentityHandler>,
+    ) -> Self {
+        self.gateway_identity = Some(handler);
+        self
+    }
+
+    /// Wires the relayed client renewal, once the gateway can reach Astra.
+    ///
+    /// Separate from [`Self::with_trust_update`] on purpose: a gateway may hold
+    /// a registry and yet have no private channel, and in that state the
+    /// trust-update route must keep working while the renewal routes report
+    /// that the authority is unreachable.
+    pub fn with_operator_campaign(
+        mut self,
+        relay: Arc<dyn certificates::OperatorCampaignRelay>,
+    ) -> Self {
+        self.operator_campaign = Some(relay);
+        self
+    }
+
+    pub fn with_client_renewal(mut self, relay: Arc<dyn certificates::ClientRenewalRelay>) -> Self {
+        self.client_renewal = Some(relay);
+        self
+    }
 }
 
 /// Builds the complete HTTP router.
@@ -215,6 +264,54 @@ pub fn router(state: AppState) -> Router {
         .route("/api/update/chunk", post(update::chunk))
         .route("/api/update/finalize", post(update::finalize))
         .route("/api/update/activate", post(update::activate))
+        .route(
+            "/api/certificates/gateway-renewal",
+            post(certificates::gateway_renewal),
+        )
+        .route(
+            "/api/certificates/gateway-transition",
+            post(certificates::gateway_transition_install),
+        )
+        .route(
+            "/api/certificates/gateway-transition/abort",
+            post(certificates::gateway_transition_abort),
+        )
+        .route(
+            "/api/certificates/gateway-transition/rollback",
+            post(certificates::gateway_transition_rollback),
+        )
+        .route(
+            "/api/certificates/ca-transition",
+            post(certificates::ca_transition_install),
+        )
+        // The operator campaign, relayed from inside the tunnel (spec §8.5).
+        // Four routes, image of the four surfaces Astra's public origin
+        // exposes, and on the **admin** surface rather than the peer one: a
+        // campaign belongs to no peer, and letting any admitted peer make one
+        // circulate is the distinction this placement exists to draw. None of
+        // them is a proxy — each accepts one type, one size, and relays an
+        // object this gateway built itself.
+        .route(
+            "/api/certificates/operator/pending",
+            get(certificates::operator_pending),
+        )
+        .route(
+            "/api/certificates/operator/operations/:operation",
+            get(certificates::operator_operation),
+        )
+        .route(
+            "/api/certificates/operator/signer-requests/:operation",
+            get(certificates::operator_signer_request),
+        )
+        .route(
+            "/api/certificates/operator/vaults/:fingerprint",
+            get(certificates::operator_vault),
+        )
+        .route(
+            "/api/certificates/operator/signer-results/:operation",
+            post(certificates::operator_signer_result)
+                .layer(DefaultBodyLimit::max(internal::MAX_OPERATOR_REQUEST_BYTES)),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_admin,
@@ -250,16 +347,40 @@ pub fn router(state: AppState) -> Router {
                 aether::certificates::transport::MAX_TRUST_UPDATE_REQUEST_BYTES,
             )),
         )
+        // Tombstone of the pre-15-August flow. Astra, not Orion, stages the
+        // candidate through the private veth API; an explicit 404 also keeps
+        // the SPA fallback from returning HTML with status 200.
         .route(
             "/api/key-negotiation/stage",
-            post(certificates::stage).layer(DefaultBodyLimit::max(
-                aether::certificates::transport::MAX_TRUST_UPDATE_REQUEST_BYTES,
-            )),
+            post(certificates::retired_in_tunnel_stage),
         )
         .route(
             "/api/key-negotiation/stage-commit",
             post(certificates::stage_commit).layer(DefaultBodyLimit::max(
+                aether::certificates::transport::MAX_STAGE_COMMIT_REQUEST_BYTES,
+            )),
+        )
+        // The relayed ordinary renewal (spec §8.1.2). A peer opens an
+        // operation, polls it, then commits the resulting grant. The 80 %
+        // path has no operator-companion exchange.
+        .route(
+            "/api/key-negotiation/certificate-renewal/request",
+            post(certificates::renewal_request).layer(DefaultBodyLimit::max(
                 aether::certificates::transport::MAX_TRUST_UPDATE_REQUEST_BYTES,
+            )),
+        )
+        .route(
+            "/api/key-negotiation/certificate-renewal/operations/:operation",
+            get(certificates::renewal_operation),
+        )
+        // The commit of §8.1.2 is the route above under its historical path.
+        // Both are mounted on the same handler: the spec's list names the
+        // renewal prefix, and a client already built against the shorter path
+        // must not stop committing because a path moved.
+        .route(
+            "/api/key-negotiation/certificate-renewal/stage-commit",
+            post(certificates::stage_commit).layer(DefaultBodyLimit::max(
+                aether::certificates::transport::MAX_STAGE_COMMIT_REQUEST_BYTES,
             )),
         )
         .route("/ws", get(ws::handler))
@@ -275,6 +396,17 @@ pub fn router(state: AppState) -> Router {
         .route("/api/health", get(health::health))
         .route("/api/network", get(routes::network_get))
         .route("/api/key-negotiation", get(routes::key_negotiation_get))
+        // What a profile must carry for its holder to renew (spec §19). An
+        // operator read, on the admin surface: it is consulted while the
+        // client is being enrolled, hence before it has any tunnel.
+        .route(
+            "/api/key-negotiation/trust-enrolment/:public_key",
+            get(certificates::trust_enrolment),
+        )
+        // The domain as the operator console reads it. On the admin surface
+        // rather than in the tunnel: it reports every admitted peer, which is
+        // exactly what no client may learn about its neighbours.
+        .route("/api/certificates", get(certificates::domain))
         .route("/api/firewall/rules", get(routes::firewall_rules_get))
         .merge(admin)
         .merge(authenticated_peer)
@@ -428,6 +560,107 @@ mod security_tests {
             }
         });
         tx
+    }
+
+    /// The operator campaign sits on the admin surface, not the peer one.
+    ///
+    /// Three probes of the same route, in the real router: a source tied to no
+    /// admitted peer, a browser origin that is not this host, and — in the
+    /// third — an admitted administrator whose gateway simply has no authority
+    /// to relay to. The first two must not be told the route exists; the third
+    /// is told the authority is missing, which is the one answer §8.5 allows
+    /// to be specific.
+    #[tokio::test]
+    async fn the_operator_campaign_routes_live_behind_the_admin_barrier() {
+        const URI: &str = "/api/certificates/operator/operations/07070707070707070707070707070707";
+
+        let (unknown_state, _cmd_rx) = state();
+        let mut unknown = Request::builder().uri(URI).body(Body::empty()).unwrap();
+        unknown.extensions_mut().insert(ConnectInfo(
+            "100.64.9.9:4242".parse::<SocketAddr>().unwrap(),
+        ));
+        let response = router(unknown_state).oneshot(unknown).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "a source tied to no admitted peer must not reach a campaign"
+        );
+
+        let (cross_state, _cmd_rx) = state();
+        let mut cross_origin = Request::builder()
+            .uri(URI)
+            .header(header::HOST, "100.64.0.1:8080")
+            .header(header::ORIGIN, "https://hostile.example")
+            .body(Body::empty())
+            .unwrap();
+        cross_origin.extensions_mut().insert(ConnectInfo(
+            "100.64.1.2:4242".parse::<SocketAddr>().unwrap(),
+        ));
+        let response = router(cross_state).oneshot(cross_origin).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "an inconsistent browser origin is refused before the caller is resolved"
+        );
+
+        let (admin_state, _cmd_rx) = state();
+        let mut administrator = Request::builder().uri(URI).body(Body::empty()).unwrap();
+        administrator.extensions_mut().insert(ConnectInfo(
+            "100.64.1.2:4242".parse::<SocketAddr>().unwrap(),
+        ));
+        let response = router(admin_state).oneshot(administrator).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the administrator is admitted; what is missing is the private channel"
+        );
+    }
+
+    /// Operator results have their own 64 KiB contract.
+    ///
+    /// The trust-update protocol is chunked and uses a smaller 32 KiB request
+    /// bound. Reusing that constant here would make the tunnel reject a result
+    /// which Astra's public operator origin accepts. Invalid JSON below lets us
+    /// distinguish "the route read it" (`400`) from "the body limit stopped it"
+    /// (`413`) without constructing a signed authority result.
+    #[tokio::test]
+    async fn operator_results_use_the_operator_body_bound() {
+        const URI: &str =
+            "/api/certificates/operator/signer-results/07070707070707070707070707070707";
+
+        let (within_state, _cmd_rx) = state();
+        let within = " ".repeat(40 * 1024);
+        let mut request = admin_request(URI, &within);
+        request.headers_mut().insert(
+            header::AUTHORIZATION,
+            "Bearer invalid".parse().expect("header"),
+        );
+        let response = router(within_state).oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "a body above the trust-update bound but within the operator bound must reach the parser"
+        );
+
+        let (oversized_state, _cmd_rx) = state();
+        let oversized = " ".repeat(internal::MAX_OPERATOR_REQUEST_BYTES + 1);
+        let mut request = admin_request(URI, &oversized);
+        request.headers_mut().insert(
+            header::AUTHORIZATION,
+            "Bearer invalid".parse().expect("header"),
+        );
+        let response = router(oversized_state).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn orion_cannot_relay_astra_stage_authorizations() {
+        let (state, _cmd_rx) = state();
+        let response = router(state)
+            .oneshot(admin_request("/api/key-negotiation/stage", "{}"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -587,6 +820,133 @@ mod security_tests {
         r#""key_negotiation_pq_certificate_sha256":"#,
         r#""bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb""#
     );
+
+    /// A gateway holding a trust domain, for the two admission refusals below.
+    struct RecordingTrustHandler {
+        admitted: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl certificates::TrustUpdateHandler for RecordingTrustHandler {
+        async fn trust_enrolment(
+            &self,
+            _peer_wg_public_key: &str,
+        ) -> Result<certificates::TrustEnrolmentView, certificates::TrustUpdateRefusal> {
+            Err(certificates::TrustUpdateRefusal::Rejected)
+        }
+
+        async fn domain(
+            &self,
+        ) -> Result<certificates::CertificateDomainView, certificates::TrustUpdateRefusal> {
+            Err(certificates::TrustUpdateRefusal::Rejected)
+        }
+
+        async fn admit_peer(
+            &self,
+            _name: &str,
+            peer_wg_public_key: &str,
+            _tls_certificate: aether::certificates::encoding::DerCertificate,
+            _pq_certificate: Box<aether::key_negotiation::PqCertificate>,
+        ) -> Result<(), certificates::TrustUpdateRefusal> {
+            self.admitted
+                .lock()
+                .unwrap()
+                .push(peer_wg_public_key.to_string());
+            Ok(())
+        }
+
+        async fn trust_update(
+            &self,
+            _caller_wg_public_key: &str,
+            _request: aether::certificates::transport::AuthenticatedTrustUpdateRequest,
+        ) -> Result<certificates::TrustUpdateResponse, certificates::TrustUpdateRefusal> {
+            Err(certificates::TrustUpdateRefusal::Rejected)
+        }
+
+        async fn stage_commit(
+            &self,
+            _caller_wg_public_key: &str,
+            _request: Box<certificates::StageCommitRequest>,
+        ) -> Result<(), certificates::TrustUpdateRefusal> {
+            Err(certificates::TrustUpdateRefusal::Rejected)
+        }
+    }
+
+    /// A gateway that holds a trust domain records the **leaves**, not their
+    /// digests. An admission that carries only the fingerprints would produce
+    /// a peer with no registry row: a client that connects and can never renew,
+    /// and nothing would say so until 80 % of its leaf's life.
+    #[tokio::test]
+    async fn admission_into_a_trust_domain_refuses_fingerprints_alone() {
+        let (_lock, _path) = isolated_config().await;
+        let (mut state, _cmd_rx) = state();
+        state.trust_update = Some(Arc::new(RecordingTrustHandler {
+            admitted: Default::default(),
+        }));
+
+        let response = router(state)
+            .oneshot(admin_request(
+                "/api/peers",
+                &format!(r#"{{"name":"laptop","public_key":"{NEW_KEY}",{ADMIT_IDENTITY}}}"#),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let message = String::from_utf8_lossy(&body);
+        assert!(
+            message.contains("certificates"),
+            "the refusal names what is missing: {message}"
+        );
+    }
+
+    /// The peer table pins digests and the registry records objects. If the
+    /// two disagree, the gateway would hold two answers about which
+    /// certificate belongs to this peer — so the admission is refused rather
+    /// than resolved in favour of either.
+    #[tokio::test]
+    async fn admission_refuses_a_certificate_that_contradicts_its_pin() {
+        use base64::Engine as _;
+        let (_lock, _path) = isolated_config().await;
+        let (mut state, _cmd_rx) = state();
+        let handler = Arc::new(RecordingTrustHandler {
+            admitted: Default::default(),
+        });
+        state.trust_update = Some(handler.clone());
+
+        let encoder = base64::engine::general_purpose::STANDARD;
+        let certificate = encoder.encode(vec![9u8; 64]);
+        let pq = encoder.encode(
+            serde_json::to_vec(&serde_json::json!({
+                "version": 2,
+                "serial": vec![0u8; 16],
+                "subject": "laptop",
+                "issuer": "CA-PQ",
+                "role": "client",
+                "wireguard_public_key": NEW_KEY,
+                "ml_dsa_87_public_key": "cHVibGlj",
+                "not_before_unix": 0,
+                "not_after_unix": 1_000_000,
+                "ml_dsa_87_signature": "c2ln",
+            }))
+            .unwrap(),
+        );
+
+        let body = format!(
+            r#"{{"name":"laptop","public_key":"{NEW_KEY}",{ADMIT_IDENTITY},"key_negotiation_certificate":"{certificate}","key_negotiation_pq_certificate":"{pq}"}}"#
+        );
+        let response = router(state)
+            .oneshot(admin_request("/api/peers", &body))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            handler.admitted.lock().unwrap().is_empty(),
+            "nothing reaches the registry when the two halves disagree"
+        );
+    }
 
     #[tokio::test]
     async fn admission_allocates_a_vip_and_notifies_the_orchestrator() {

@@ -60,7 +60,7 @@ pub struct InterfaceConfig {
     pub address: String,
     /// Interface MTU, or `None` to leave WireGuard's default.
     ///
-    /// Derived from the WAN link's MTU by [`aether::mtu::tunnel_mtu`]: the
+    /// Derived from the WAN link's MTU by `aether::mtu::tunnel_mtu`: the
     /// default of 1420 assumes a 1500 transport and makes large packets
     /// vanish as soon as the WAN is narrower.
     ///

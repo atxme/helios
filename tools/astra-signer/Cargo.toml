@@ -1,51 +1,36 @@
 [package]
 name = "astra-signer"
-version.workspace = true
+version = "0.2.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Compagnon opérateur d'Astra (ADR-008 §4) : ouvre le coffre d'autorité par une clé de sécurité FIDO2, sur le poste où elle est branchée. Ni Astra, ni la gateway, ni un navigateur ne voient jamais CA-PQ."
-
-[lib]
-name = "astra_signer"
-path = "src/lib.rs"
+description = "Adaptateur en ligne de commande de la bibliothèque opérateur d'Astra. Conservé le temps de la migration vers Orion : l'ADR-008 §4 exige encore un compagnon portable et un transport hors ligne."
 
 [[bin]]
 name = "astra-signer"
 path = "src/main.rs"
 
 [dependencies]
-aether.workspace = true
-astra.workspace = true
+# Tout ce qui ouvre un coffre ou signe vit dans `astra-operator`. Ce binaire
+# n'est plus que des invites et des chemins de fichiers.
+astra-operator.workspace = true
+# `key-negotiation-signing` sans condition : les types signés traversent cette
+# interface, et sans la fonctionnalité ils n'existent pas.
+aether = { workspace = true, features = ["key-negotiation-signing"] }
+helios-fido = { workspace = true }
 anyhow.workspace = true
-aws-lc-rs.workspace = true
 base64.workspace = true
 clap.workspace = true
 hex.workspace = true
-rcgen.workspace = true
 rpassword.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
 zeroize.workspace = true
-# Pile CTAP2 sur HID, avec l'extension `hmac-secret`. Sans condition : un
-# compagnon qui ne parle à aucune clé n'ouvre aucun coffre, et la spécification
-# refuse tout autre déverrouillage — le bâtir sans serait indiscernable d'une
-# panne. Elle tire `hidapi`, donc `libudev` sous Linux (scripts/setup-dev.sh).
-# `aws-lc-rs` plutôt que `ring` : c'est le backend cryptographique du dépôt, et
-# deux piles dans un même binaire sont deux surfaces à suivre.
-ctap-hid-fido2 = { version = "3.5", default-features = false, features = ["aws-lc-rs"] }
 
 [dev-dependencies]
 tempfile = "3"
-
-# API WebAuthn de Windows, générée depuis les métadonnées Microsoft : aucune
-# déclaration FFI écrite à la main. C'est le chemin qui n'exige pas
-# d'élévation — et celui où le PIN est collecté par le système, donc n'entre
-# jamais dans ce processus.
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = [
-    "Win32_Foundation",
-    "Win32_Networking_WindowsWebServices",
-    "Win32_System_Console",
-] }
+# Le certificat `CA-TLS` que le compagnon auto-signe se relit avec un parseur
+# X.509 réel plutôt qu'avec l'émetteur qui vient de l'écrire : c'est la
+# signature et le `basicConstraints` qui comptent, pas ce que `rcgen` croit
+# avoir posé. Même version que celle qu'`aether` vérifie déjà.
+x509-parser = { version = "0.16", features = ["verify"] }

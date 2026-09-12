@@ -143,11 +143,12 @@ export function isAlarming(phase: CertificatePhase): boolean {
   return PHASE[phase].alarming
 }
 
-/** Date in the machine's locale, to the minute. Seconds say nothing here. */
+/** Date in Europe/Paris civil time, to the minute. Seconds say nothing here. */
 function instant(seconds: number): string {
-  return new Date(seconds * 1000).toLocaleString(undefined, {
+  return new Date(seconds * 1000).toLocaleString('fr-FR', {
     dateStyle: 'medium',
     timeStyle: 'short',
+    timeZone: 'Europe/Paris',
   })
 }
 
@@ -186,7 +187,7 @@ export function CertificatePanel({
   identityName: string
   /** The four actions of spec §12.2 and their state, decided in Rust. */
   actions?: CertificateActionState[]
-  /** Last action that failed on this profile — §12.2 asks for it. */
+  /** Last action result on this profile — §12.2 asks for it. */
   lastError?: string | null
   onRun?: (action: CertificateAction) => void
 }) {
@@ -220,6 +221,7 @@ export function CertificatePanel({
     !inventory.client_pq &&
     identityName.trim() !== '' &&
     !inventory.identity_sealed
+  const recovery = actions.find((state) => state.action === 'recover_expired')
 
   // Counted **with** the missing identity, and that is the point: a profile
   // that pins nothing readable and names an unsealed identity is exactly the
@@ -229,6 +231,7 @@ export function CertificatePanel({
     groups.some((group) => group.rows.some((row) => row.facts)) ||
     inventory.faults.length > 0 ||
     clientMissing ||
+    inventory.operator_credentials !== null ||
     actions.length > 0
   if (!anything) return null
 
@@ -271,6 +274,64 @@ export function CertificatePanel({
         </Box>
       )}
 
+      {inventory.previous_identity?.phase === 'available' && (
+        <Box sx={{ display: 'flex', alignItems: 'baseline', gap: 1, minWidth: 0 }}>
+          <Typography color="text.secondary" sx={{ width: 110, flexShrink: 0, fontSize: 11.5 }}>
+            retour temporaire
+          </Typography>
+          <Typography color="text.primary" sx={{ fontSize: 11.5, fontWeight: 600 }}>
+            {inventory.previous_identity.selected ? 'ancienne identité servie' : 'disponible'}
+          </Typography>
+          <Typography noWrap color="text.disabled" sx={{ minWidth: 0, fontSize: 11 }}>
+            jusqu’au {instant(inventory.previous_identity.available_until)}
+          </Typography>
+        </Box>
+      )}
+
+      {(inventory.operator_credentials || recovery) && (
+        <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.4 }}>
+          <Typography variant="overline" color="text.disabled">
+            Opérateur
+          </Typography>
+          {inventory.operator_credentials && (
+            <>
+              <Box sx={{ display: 'flex', alignItems: 'baseline', gap: 1, minWidth: 0 }}>
+                <Typography color="text.secondary" sx={{ width: 110, flexShrink: 0, fontSize: 11.5 }}>
+                  credentials
+                </Typography>
+                <Typography color="text.primary" sx={{ fontSize: 11.5, fontWeight: 600 }}>
+                  registre époque {inventory.operator_credentials.registry_epoch}
+                </Typography>
+              </Box>
+              <Typography color="text.disabled" sx={{ pl: '118px', fontSize: 11, lineHeight: 1.45 }}>
+                Détail non conservé sur ce poste : Orion n’affiche aucune clé sans registre vérifié
+                sous CA-PQ.
+              </Typography>
+            </>
+          )}
+          {recovery && (
+            <>
+              <Box sx={{ display: 'flex', alignItems: 'baseline', gap: 1, minWidth: 0 }}>
+                <Typography color="text.secondary" sx={{ width: 110, flexShrink: 0, fontSize: 11.5 }}>
+                  récupération
+                </Typography>
+                <Typography
+                  color={recovery.blocked_by ? 'text.disabled' : 'text.primary'}
+                  sx={{ fontSize: 11.5, fontWeight: 600 }}
+                >
+                  {recovery.blocked_by ? 'indisponible' : 'disponible'}
+                </Typography>
+              </Box>
+              {recovery.message && (
+                <Typography color="text.disabled" sx={{ pl: '118px', fontSize: 11, lineHeight: 1.45 }}>
+                  {recovery.message}
+                </Typography>
+              )}
+            </>
+          )}
+        </Box>
+      )}
+
       {clientMissing && (
         <Fault>
           Aucune identité protégée nommée <strong>{identityName}</strong> scellée sur ce poste.
@@ -280,12 +341,12 @@ export function CertificatePanel({
         <Fault key={fault}>{fault}</Fault>
       ))}
 
-      {/* The last attempt that failed. Shown once, above the buttons that
-          produced it, rather than repeated inside each of their tooltips. */}
+      {/* The last attempt's result. A 403 while the active PQ leaf is still
+          valid is a policy answer («not due»), not a broken renewal. Keep
+          that distinction visible without asking the gateway to disclose the
+          protected Astra reason over the tunnel. */}
       {lastError && (
-        <Alert severity="error" variant="outlined" sx={{ py: 0, fontSize: 11 }}>
-          {lastError}
-        </Alert>
+        <RenewalResult message={lastError} inventory={inventory} />
       )}
 
       {actions.length > 0 && (
@@ -296,6 +357,32 @@ export function CertificatePanel({
         </Box>
       )}
     </Box>
+  )
+}
+
+/**
+ * Presents the bounded refusal the gateway is allowed to return.
+ *
+ * Astra deliberately collapses its protected reasons to HTTP 403. Orion can
+ * still make the one safe distinction it owns: a current client PQ leaf means
+ * the ordinary renewal window has not opened yet. This is deliberately
+ * conservative; every other 403 remains an error instead of being guessed at
+ * as `not_due`.
+ */
+function RenewalResult({
+  message,
+  inventory,
+}: {
+  message: string
+  inventory: CertificateInventory
+}) {
+  const notDue = /\b403\b/.test(message) && inventory.client_pq?.phase === 'valid'
+  return (
+    <Alert severity={notDue ? 'info' : 'error'} variant="outlined" sx={{ py: 0, fontSize: 11 }}>
+      {notDue
+        ? 'Renouvellement non nécessaire pour le moment : le certificat client est encore valide et la protection de la gateway bloque la rotation avant sa fenêtre.'
+        : message}
+    </Alert>
   )
 }
 

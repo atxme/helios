@@ -41,6 +41,7 @@ while [ "$#" -gt 0 ]; do
         --key-negotiation-port) KEY_NEGOTIATION_PORT="${2:-}"; shift 2 ;;
         --escrow-public-key) ESCROW_PUBLIC_KEY="${2:-}"; shift 2 ;;
         --dynamic-wan) DYNAMIC_WAN="1"; shift ;;
+        --admin-ifaces) ADMIN_IFACES="${2:-}"; shift 2 ;;
         --meshnet-peer-cidrs) MESHNET_PEER_CIDRS="${2:-}"; shift 2 ;;
         --meshnet-routing-peer-cidrs) MESHNET_ROUTING_PEER_CIDRS="${2:-}"; shift 2 ;;
         --meshnet-local-network-peer-cidrs) MESHNET_LOCAL_NETWORK_PEER_CIDRS="${2:-}"; shift 2 ;;
@@ -101,6 +102,27 @@ for cidr in $(printf '%s' "$MESHNET_LOCAL_NETWORK_PEER_CIDRS" | tr ',' ' '); do
         { echo "Meshnet local-network peer has no routing permission: $cidr" >&2; exit 2; }
 done
 
+# Left empty when the caller names none, and an empty value keeps the key
+# **unmanaged** below. That is deliberate: a redeploy that forgets
+# `--admin-ifaces` must not silently erase the operator's way back in.
+ADMIN_IFACES_TOML=""
+if [ -n "${ADMIN_IFACES:-}" ]; then
+    admin_toml=""
+    old_ifs=$IFS
+    IFS=,
+    for iface in $ADMIN_IFACES; do
+        case "$iface" in
+            ""|*[!A-Za-z0-9_.:-]*) echo "invalid administration interface: $iface" >&2; exit 2 ;;
+        esac
+        if [ -n "$admin_toml" ]; then
+            admin_toml="$admin_toml, "
+        fi
+        admin_toml="$admin_toml\"$iface\""
+    done
+    IFS=$old_ifs
+    ADMIN_IFACES_TOML="[$admin_toml]"
+fi
+
 MESHNET_TOML=""
 MESHNET_ROUTING_TOML="[]"
 MESHNET_LOCAL_NETWORK_TOML="[]"
@@ -133,11 +155,13 @@ awk \
     -v wg_port="$WG_PORT" \
     -v key_port="$KEY_NEGOTIATION_PORT" \
     -v escrow_key="$ESCROW_PUBLIC_KEY" \
+    -v admin_ifaces="$ADMIN_IFACES_TOML" \
     -v dynamic_wan="$DYNAMIC_WAN" \
     -v meshnet_cidrs="$MESHNET_TOML" \
     -v meshnet_routing_cidrs="$MESHNET_ROUTING_TOML" \
     -v meshnet_local_cidrs="$MESHNET_LOCAL_NETWORK_TOML" '
 BEGIN {
+    SQ = sprintf("%c", 39)
     order[1] = "wan_iface"
     order[2] = "lan_ifaces"
     order[3] = "allow_ssh_from"
@@ -155,11 +179,14 @@ BEGIN {
     order[15] = "allow_tunnel_icmp"
     order[16] = "allow_ssh_over_tunnel"
     order[17] = "allow_gateway_egress"
+    order_count = 17
+    if (admin_ifaces != "") {
+        order_count++
+        order[order_count] = "admin_ifaces"
+    }
     if (meshnet_cidrs != "") {
-        order[18] = "nordvpn_meshnet"
-        order_count = 18
-    } else {
-        order_count = 17
+        order_count++
+        order[order_count] = "nordvpn_meshnet"
     }
 
     managed["wan_iface"] = 1
@@ -179,6 +206,12 @@ BEGIN {
     managed["allow_tunnel_icmp"] = 1
     managed["allow_ssh_over_tunnel"] = 1
     managed["allow_gateway_egress"] = 1
+    # Unmanaged when the caller names none: a redeploy without --admin-ifaces
+    # leaves whatever the operator already relies on in place.
+    if (admin_ifaces != "") {
+        managed["admin_ifaces"] = 1
+        desired["admin_ifaces"] = admin_ifaces
+    }
     if (meshnet_cidrs != "") {
         managed["nordvpn_meshnet"] = 1
     }
@@ -218,6 +251,53 @@ BEGIN {
         forced["allow_gateway_egress"] = 1
         forced["nordvpn_meshnet"] = 1
     }
+    # Imposée dès que ce script la nomme, et seulement alors. Sans « forced »
+    # la valeur en place gagne, donc une entree fautive ne peut plus etre
+    # reparee par un deploiement — un `admin_ifaces` corrompu a ainsi survecu a
+    # la correction censee le remplacer. Option absente, la cle nest pas geree
+    # du tout et la valeur posee par loperateur est preservee.
+    #
+    # Pas dapostrophe dans ce programme awk : il est cite en guillemets
+    # simples, et une seule apostrophe termine la chaine shell — le reste du
+    # programme est alors interprete comme du shell, en silence.
+    if (admin_ifaces != "") {
+        forced["admin_ifaces"] = 1
+    }
+}
+
+# Profondeur de crochets/accolades laissee ouverte par un texte TOML.
+#
+# Les chaines citees sont ignorees : un CIDR nen contient pas, mais un nom
+# dinterface pourrait, et une valeur qui ferme faussement le compte ferait
+# avaler la suite du fichier. Le commentaire de fin de ligne aussi.
+#
+# `SQ` plutot que lapostrophe litterale : ce programme est cite en guillemets
+# simples, et une seule apostrophe terminerait la chaine shell.
+function open_depth(text,    i, c, in_str, quote, depth) {
+    depth = 0
+    in_str = 0
+    for (i = 1; i <= length(text); i++) {
+        c = substr(text, i, 1)
+        if (in_str) {
+            if (c == "\\") {
+                i++
+            } else if (c == quote) {
+                in_str = 0
+            }
+            continue
+        }
+        if (c == "\"" || c == SQ) {
+            in_str = 1
+            quote = c
+        } else if (c == "#") {
+            break
+        } else if (c == "[" || c == "{") {
+            depth++
+        } else if (c == "]" || c == "}") {
+            depth--
+        }
+    }
+    return depth
 }
 
 function emit_missing(    i, key) {
@@ -233,7 +313,23 @@ function emit_missing(    i, key) {
     emitted = 1
 }
 
-/^[[:space:]]*\[\[peers\]\][[:space:]]*$/ {
+# Tout en-tete de table, pas seulement `[[peers]]`.
+#
+# En TOML, une cle ecrite apres `[nordvpn_meshnet]` appartient a cette table et
+# non a la racine. Emettre les cles manquantes au seul `[[peers]]` les placait
+# donc **dans** la table qui precede : `admin_ifaces` est devenu
+# `nordvpn_meshnet.admin_ifaces`, champ inconnu, ignore en silence. Le fichier
+# restait du TOML valide, heliosd demarrait sans rien dire, et le pare-feu
+# nouvrait aucune des interfaces annoncees.
+#
+# `seen[nom]` est marque ici parce quun en-tete **definit** cette cle : sans
+# cela, emit_missing ecrirait en plus une version inline juste avant la table,
+# et deux definitions de la meme cle racine ne sont pas du TOML valide.
+/^[[:space:]]*\[/ {
+    header = $0
+    sub(/^[[:space:]]*\[+[[:space:]]*/, "", header)
+    sub(/[[:space:]]*\]+[[:space:]]*$/, "", header)
+    seen[header] = 1
     emit_missing()
     in_peers = 1
     print
@@ -248,20 +344,35 @@ function emit_missing(    i, key) {
         sub(/[[:space:]]*=.*/, "", assignment)
         key = assignment
         if (managed[key]) {
-            if (in_peers) {
-                next
-            }
-            if (seen[key]) {
-                next
-            }
-            seen[key] = 1
-            if (forced[key]) {
-                print key " = " desired[key]
-            } else if (key == "allow_ssh_from" &&
-                       line ~ /=[[:space:]]*\[[[:space:]]*\][[:space:]]*$/) {
-                print key " = " desired[key]
+            drop = 0
+            if (in_peers || seen[key]) {
+                drop = 1
             } else {
-                print line
+                seen[key] = 1
+                if (forced[key]) {
+                    print key " = " desired[key]
+                    drop = 1
+                } else if (key == "allow_ssh_from" &&
+                           line ~ /=[[:space:]]*\[[[:space:]]*\][[:space:]]*$/) {
+                    print key " = " desired[key]
+                    drop = 1
+                } else {
+                    print line
+                }
+            }
+            # Une valeur TOML peut sétendre sur plusieurs lignes : un tableau
+            # ou une table inline que loperateur a aere. Juger une ligne a la
+            # fois remplacait alors la ligne douverture et abandonnait sa
+            # suite sur place — le fichier gardait un fragment orphelin, qui
+            # nest plus du TOML, et heliosd refusait de le lire en entier.
+            # Ici la valeur est consommee jusqua sa fermeture, puis rendue ou
+            # jetee avec la ligne qui la portait.
+            depth = open_depth(line)
+            while (depth > 0 && (getline continuation) > 0) {
+                depth += open_depth(continuation)
+                if (!drop) {
+                    print continuation
+                }
             }
             next
         }

@@ -53,6 +53,7 @@ mod tests {
             key_negotiation_port: Some(51821),
             mode: PolicyMode::FailClosed,
             allow_ssh_from: vec![],
+            admin_ifaces: vec![],
             allow_dhcp_on_wan: false,
             allow_client_internet: true,
             allow_tunnel_icmp: true,

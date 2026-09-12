@@ -32,6 +32,8 @@ const inventory = (overrides: Partial<CertificateInventory> = {}): CertificateIn
   client_pq: null,
   faults: [],
   identity_sealed: false,
+  previous_identity: null,
+  operator_credentials: null,
   ...overrides,
 })
 
@@ -194,6 +196,40 @@ describe('CertificatePanel', () => {
     expect(run).toEqual(['renew_now'])
   })
 
+  it('shows how long a selected previous identity may stay in service', () => {
+    render(
+      <CertificatePanel
+        inventory={inventory({
+          identity_sealed: true,
+          previous_identity: {
+            available_from: 1_000,
+            available_until: Date.now() / 1000 + 3_600,
+            phase: 'available',
+            selected: true,
+          },
+        })}
+        identityName="orion-poste"
+        actions={[
+          {
+            action: 'rollback_to_previous',
+            label: 'Revenir temporairement à l’ancienne identité',
+            blocked_by: null,
+            message: null,
+          },
+        ]}
+        onRun={() => {}}
+      />,
+    )
+
+    expect(screen.getByText('ancienne identité servie')).toBeTruthy()
+    expect(screen.getByText(/jusqu’au/)).toBeTruthy()
+    expect(
+      (screen.getByRole('button', {
+        name: 'Revenir temporairement à l’ancienne identité',
+      }) as HTMLButtonElement).disabled,
+    ).toBe(false)
+  })
+
   /** The two other things §12.2 asks the surface to show. */
   it('states the chosen renewal date and the last error', () => {
     render(
@@ -205,6 +241,38 @@ describe('CertificatePanel', () => {
     )
     expect(screen.getByText('renouvellement')).toBeTruthy()
     expect(screen.getByText(/matériel de confiance/)).toBeTruthy()
+  })
+
+  /**
+   * A fresh certificate is not broken when Astra answers 403: its policy is
+   * saying that the 80% renewal window has not opened. The UI must make that
+   * distinction without receiving Astra's protected reason over WireGuard.
+   */
+  it('presents a 403 before the renewal window as information', () => {
+    render(
+      <CertificatePanel
+        inventory={inventory({ client_pq: facts('valid') })}
+        identityName="orion-poste"
+        lastError="la gateway a refusé le renouvellement (403)."
+      />,
+    )
+    const alert = screen.getByRole('alert')
+    expect(alert.textContent).toMatch(/Renouvellement non nécessaire pour le moment/)
+    expect(alert.className).toContain('MuiAlert-colorInfo')
+  })
+
+  /** A 403 during an active renewal window still needs operator attention. */
+  it('keeps a 403 during the renewal window as an error', () => {
+    render(
+      <CertificatePanel
+        inventory={inventory({ client_pq: facts('renewal_due') })}
+        identityName="orion-poste"
+        lastError="la gateway a refusé le renouvellement (403)."
+      />,
+    )
+    const alert = screen.getByRole('alert')
+    expect(alert.textContent).toMatch(/la gateway a refusé/)
+    expect(alert.className).toContain('MuiAlert-colorError')
   })
 
   /**

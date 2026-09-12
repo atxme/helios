@@ -1,83 +1,82 @@
 # Documentation Helios
 
-Point d'entrée de la documentation. Le code et les ADR acceptés font foi en
-cas de doute (voir [AGENTS.md](../AGENTS.md)).
+Index central de la documentation du dépôt. Le code et les ADR acceptés font
+foi en cas de doute (voir [AGENTS.md](../AGENTS.md)).
+
+## Gouvernance et contribution
+
+- [README](../README.md) — présentation, démarrage et points d'entrée.
+- [CONTRIBUTING](../CONTRIBUTING.md) — branches, commits et pull requests.
+- [SECURITY](../SECURITY.md) — signalement, secrets et pratiques de sécurité.
+- [AGENTS.md](../AGENTS.md) — règles communes pour les agents et développeurs.
+- [CLAUDE.md](../CLAUDE.md) — adaptateur d'instructions spécifique à Claude.
 
 ## Architecture
 
-- [ARCHITECTURE.md](ARCHITECTURE.md) — vue opérationnelle courante du système
-  (Helios, Orion, `aether`).
-- [adr/ADR-003-MISES-A-JOUR-APPLICATIVES.md](adr/ADR-003-MISES-A-JOUR-APPLICATIVES.md)
-  — architecture de mise à jour du binaire `heliosd`.
+- [Vue d'ensemble](architecture/overview.md) — composants, responsabilités et
+  flux principaux.
+- [Architecture opérationnelle](ARCHITECTURE.md) — démarrage de la gateway,
+  états WireGuard, kill-switch, API, secrets et validation.
+
+## Développement
+
+- [Build](development/build.md) — prérequis et commandes de compilation.
+- [Tests](development/testing.md) — vérifications ciblées, régression et
+  limites d'environnement.
+- [Workflow Git](development/git-workflow.md) — branches, commits et contrôles
+  avant pull request.
+
+## Exploitation
+
+- [RENOUVELLEMENT-CERTIFICATS.md](RENOUVELLEMENT-CERTIFICATS.md) — commandes de
+  renouvellement et de rotation des certificats.
+- [DEPLOIEMENT-ASTRA.md](DEPLOIEMENT-ASTRA.md) — déploiement de l'autorité et
+  état réellement éprouvé.
 
 ## Décisions (ADR)
 
-- [adr/ADR-001-WIREGUARD.md](adr/ADR-001-WIREGUARD.md) — bascule d'IKEv2/IPsec
-  vers WireGuard.
-- [adr/ADR-002-SIGNATURES-PQ.md](adr/ADR-002-SIGNATURES-PQ.md) — signatures
-  post-quantiques hybrides des artefacts de confiance.
-- [adr/ADR-003-MISES-A-JOUR-APPLICATIVES.md](adr/ADR-003-MISES-A-JOUR-APPLICATIVES.md)
-  — mises à jour applicatives signées, autorisation WireGuard et rollback.
-- [adr/ADR-004-CHAINE-DE-LIVRAISON.md](adr/ADR-004-CHAINE-DE-LIVRAISON.md) —
-  cycle de vie des secrets, admission, profils clients et livraison
-  d'artefacts.
-- [adr/ADR-005-NEGOCIATION-DE-CLE.md](adr/ADR-005-NEGOCIATION-DE-CLE.md) —
-  décision et modèle de menace de la négociation de clé pré-WireGuard : port
-  public, PKI applicative post-quantique, PSK ML-KEM du **premier** handshake,
-  plancher anti-downgrade et identité cliente scellée. Amendé les 6 et 8 août
-  2026 pour la v5 : fermeture de QUIC après le commit, challenge anti-rejeu,
-  ML-DSA-87, preuve WireGuard bilatérale, états générationnels, enrôlement
-  autorisé sans clé privée transportée et opérations post-commit dans le
-  tunnel.
-- [adr/ADR-006-SECRETS-AU-REPOS.md](adr/ADR-006-SECRETS-AU-REPOS.md) —
-  chiffrement AES-256-GCM des secrets sur disque, hiérarchie de clés Orion liée
-  au TPM, hygiène mémoire et modèle de menace du stockage local. Le chiffrement
-  de volume (BitLocker / dm-crypt) y devient un **prérequis d'installation**.
-- [adr/ADR-007-FENETRE-DE-MISE-A-JOUR.md](adr/ADR-007-FENETRE-DE-MISE-A-JOUR.md)
-  — transport du secret scellé à travers un redémarrage planifié qui déplace
-  les PCR.
-- [adr/ADR-008-ASTRA-AUTORITE-CERTIFICATS.md](adr/ADR-008-ASTRA-AUTORITE-CERTIFICATS.md)
-  — coordinateur PKI Astra co-implanté, émetteur délégué, YubiKeys,
-  renouvellement autonome et récupération distante.
+- [README ADR](adr/README.md) — format et modèle minimal des décisions.
+- [ADR-001 — WireGuard](adr/ADR-001-WIREGUARD.md) — choix du plan de données.
+- [ADR-002 — Signatures PQ](adr/ADR-002-SIGNATURES-PQ.md) — signatures des
+  artefacts de confiance.
+- [ADR-003 — Mises à jour applicatives](adr/ADR-003-MISES-A-JOUR-APPLICATIVES.md)
+  — mises à jour signées et rollback.
+- [ADR-004 — Chaîne de livraison](adr/ADR-004-CHAINE-DE-LIVRAISON.md) — secrets,
+  admission, profils et artefacts.
+- [ADR-005 — Négociation de clé](adr/ADR-005-NEGOCIATION-DE-CLE.md) — protocole
+  pré-WireGuard et modèle de menace.
+- [ADR-006 — Secrets au repos](adr/ADR-006-SECRETS-AU-REPOS.md) — stockage
+  chiffré et protection des secrets.
+- [ADR-007 — Fenêtre de mise à jour](adr/ADR-007-FENETRE-DE-MISE-A-JOUR.md) —
+  secret scellé et redémarrage planifié.
+- [ADR-008 — Astra](adr/ADR-008-ASTRA-AUTORITE-CERTIFICATS.md) — autorité de
+  certificats et renouvellement.
 
-## Négociation de clé — notes techniques
+## Spécifications
 
-Les deux notes coexistent volontairement : l'une décrit ce qui tourne, l'autre
-ce qui tournait. La bascule est coupante — ALPN, domaines de signature et
-format de certificat distincts — donc rien ne négocie entre les deux.
-
-- [specification/NEGOCIATION-DE-CLE-V4.md](specification/NEGOCIATION-DE-CLE-V4.md) — protocole historique,
-  conservé comme trace de ce qui tournait avant la bascule.
-- [specification/NEGOCIATION-DE-CLE-V5.md](specification/NEGOCIATION-DE-CLE-V5.md) — protocole
-  **actuellement servi, mais partiellement implémenté** : son état de tête nomme
-  les lots encore ouverts. Son §0 indexe les constats successifs des revues de
-  sécurité. Le mode Orion `classic` reste disponible pour les hôtes WireGuard
-  génériques, mais demeure strictement hors du protocole de négociation Helios
-  v5.
-- [specification/ROTATION-CERTIFICATS.md](specification/ROTATION-CERTIFICATS.md)
-  — cycle de vie cible des certificats TLS/PQ : chevauchement borné,
-  générations anti-rollback, Astra, rotation de `CA-PQ`, récupération expirée
-  et campagnes manuelles YubiKey.
+- [Négociation v4](specification/NEGOCIATION-DE-CLE-V4.md) — protocole
+  historique.
+- [Négociation v5](specification/NEGOCIATION-DE-CLE-V5.md) — protocole servi,
+  avec ses lots encore ouverts.
+- [Rotation des certificats](specification/ROTATION-CERTIFICATS.md) — cycle de
+  vie cible des certificats TLS/PQ.
 
 ## Sécurité
 
-- [security/SECURITY.md](security/SECURITY.md) — contrôles automatisés et
-  dette suivie.
-- [security/POST-QUANTUM.md](security/POST-QUANTUM.md) — les deux mécanismes
-  post-quantiques (PSK WireGuard, signatures éditeur) et ce qui les distingue.
-- [security/PUBLISHER-SIGNING.md](security/PUBLISHER-SIGNING.md) — guide
-  opératoire de `helios-publisher` (poste éditeur).
-- [security/OPERATOR-TOOLING.md](security/OPERATOR-TOOLING.md) — guide
-  opératoire du poste opérateur : identité de la gateway, séquestre, admission
-  et profils clients.
+- [SECURITY.md](../SECURITY.md) — règles de contribution et signalement.
+- [security/SECURITY.md](security/SECURITY.md) — contrôles automatisés et dette
+  suivie.
+- [POST-QUANTUM.md](security/POST-QUANTUM.md) — mécanismes post-quantiques.
+- [PUBLISHER-SIGNING.md](security/PUBLISHER-SIGNING.md) — signature éditeur.
+- [OPERATOR-TOOLING.md](security/OPERATOR-TOOLING.md) — outillage opérateur.
 
 ## Tests et validation
 
-- [testing/TESTING.md](testing/TESTING.md) — stratégie de test, matrice
-  automatisée, référence `scripts/regression.sh`.
-- [testing/PREMIER-DEPLOIEMENT.md](testing/PREMIER-DEPLOIEMENT.md) — marche à
-  suivre pour installer une vraie gateway et y connecter un client Windows.
-- [testing/MANUAL-TESTING.md](testing/MANUAL-TESTING.md) — recette
-  interactive pour les binaires et les IHM.
-- [testing/WSL2-DEV.md](testing/WSL2-DEV.md) — ce que WSL2 prouve et ne prouve
-  pas (compilation vs exécution réelle).
+- [Guide de test](development/testing.md) — commandes ciblées et campagne
+  complète.
+- [TESTING.md](testing/TESTING.md) — stratégie, matrice et limites de cible.
+- [PREMIER-DEPLOIEMENT.md](testing/PREMIER-DEPLOIEMENT.md) — première gateway
+  réelle et client Windows.
+- [MANUAL-TESTING.md](testing/MANUAL-TESTING.md) — recette interactive des
+  binaires et interfaces.
+- [WSL2-DEV.md](testing/WSL2-DEV.md) — ce que WSL2 valide ou non.

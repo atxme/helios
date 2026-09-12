@@ -99,7 +99,7 @@ pub struct UpdateState {
     pub active_version: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct FinalizedRelease {
     pub release_sequence: u64,
@@ -115,7 +115,7 @@ pub struct ActivationRequest {
     pub delay_seconds: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateStatus {
     pub highest_confirmed_sequence: u64,
     pub active_version: Option<String>,
@@ -162,6 +162,32 @@ impl UpdateStore {
         reject_rollback(manifest.payload.release_sequence, &state)?;
 
         let directory = self.layout.staged_dir(manifest.payload.release_sequence);
+        if directory.exists() {
+            let existing = read_manifest(&directory)?;
+            if &existing != manifest {
+                return Err(update_error(format!(
+                    "release sequence {} is already staged with different signed metadata",
+                    manifest.payload.release_sequence
+                )));
+            }
+            if directory.join(FINALIZED_FILE).is_file() {
+                verify_binary(&directory.join(BINARY_FILE), manifest)?;
+                return Ok(summary(manifest));
+            }
+
+            // Replaying the exact signed manifest restarts an interrupted
+            // transfer at offset zero. Without this idempotence, losing one
+            // HTTP response would permanently consume the release sequence.
+            let part = directory.join(PART_FILE);
+            match fs::remove_file(&part) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            write_new_synced(&part, &[], 0o600)?;
+            sync_directory(&directory)?;
+            return Ok(summary(manifest));
+        }
         fs::create_dir_all(&directory)?;
         let manifest_path = directory.join(MANIFEST_FILE);
         let bytes = serde_json::to_vec_pretty(manifest)
@@ -709,6 +735,30 @@ mod tests {
         assert!(store.request_activation(7, "INSTALLER 6").is_err());
         store.request_activation(7, "INSTALLER 7").unwrap();
         assert_eq!(store.status().unwrap().activation_pending, Some(7));
+    }
+
+    #[test]
+    fn restaging_is_idempotent_only_for_the_exact_signed_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, manifest, binary) = store_with_test_keys(dir.path());
+
+        store.stage_manifest(&manifest).unwrap();
+        store.append_chunk(7, 0, &binary[..16]).unwrap();
+        store.stage_manifest(&manifest).unwrap();
+        assert_eq!(
+            store.append_chunk(7, 0, &binary).unwrap(),
+            binary.len() as u64
+        );
+        let finalized = store.finalize(7).unwrap();
+        assert_eq!(store.stage_manifest(&manifest).unwrap(), finalized);
+
+        let mut different_binary = binary;
+        different_binary[30] = 1;
+        let (different_manifest, _) = signed(&different_binary, 7);
+        let error = store
+            .stage_manifest(&different_manifest)
+            .expect_err("one sequence cannot name different signed metadata");
+        assert!(error.to_string().contains("different signed metadata"));
     }
 
     #[test]

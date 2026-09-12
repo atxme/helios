@@ -49,17 +49,23 @@
 
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt as _;
+use std::path::Path;
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Security::{
     DuplicateTokenEx, GetTokenInformation, SecurityImpersonation, TokenElevation, TokenPrimary,
     TOKEN_ALL_ACCESS, TOKEN_DUPLICATE, TOKEN_ELEVATION, TOKEN_QUERY,
 };
+use windows_sys::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
 use windows_sys::Win32::System::Threading::{
-    CreateProcessWithTokenW, OpenProcess, OpenProcessToken, CREATE_NEW_CONSOLE, LOGON_WITH_PROFILE,
-    PROCESS_INFORMATION, PROCESS_QUERY_INFORMATION, STARTUPINFOW,
+    CreateProcessWithTokenW, OpenProcess, OpenProcessToken, CREATE_NEW_CONSOLE, CREATE_NO_WINDOW,
+    CREATE_UNICODE_ENVIRONMENT, LOGON_WITH_PROFILE, PROCESS_INFORMATION, PROCESS_QUERY_INFORMATION,
+    STARTUPINFOW,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::{GetShellWindow, GetWindowThreadProcessId};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    AllowSetForegroundWindow, GetForegroundWindow, GetShellWindow, GetWindowThreadProcessId,
+    SetForegroundWindow,
+};
 
 /// A handle closed on drop — a token, or the shell process it came from.
 ///
@@ -85,41 +91,233 @@ impl Drop for Token {
 /// [`orion_core::profile_import::validate_ssh_target`]: it is placed on a
 /// command line, and the allow-list grammar is what makes that inert.
 pub fn spawn_ssh_terminal(target: &str) -> Result<(), String> {
-    let token = standard_user_token()?;
+    spawn_with_standard_token(
+        None,
+        format!("powershell.exe -NoExit -Command ssh {target}"),
+        "ouverture du terminal",
+        &[],
+        CREATE_NEW_CONSOLE,
+    )?;
+    tracing::info!(%target, "terminal SSH ouvert sous le compte standard");
+    Ok(())
+}
 
-    // The last gate, and the one that counts. Everything above can be wrong
-    // in a way that still returns a handle; only Windows can say what that
-    // handle actually confers.
-    if is_elevated(&token)? {
-        return Err(
-            "refus : le jeton obtenu est toujours élevé, le terminal ne sera pas ouvert".into(),
-        );
+/// Runs the fixed Astra companion as the standard user, in its own console.
+///
+/// The arguments come from `orion-core::CompanionInvocation`; the program does
+/// not. Keeping the executable literal at this boundary prevents a WebView or
+/// profile value from turning this into a general process launcher.
+pub fn spawn_astra_signer(arguments: &[String]) -> Result<(), String> {
+    let command = windows_command_line("astra-signer", arguments);
+    spawn_with_standard_token(
+        None,
+        command,
+        "lancement du compagnon",
+        &[],
+        CREATE_NEW_CONSOLE,
+    )
+    .map(|_| ())
+}
+
+/// Runs the Astra operator helper as the standard user, with no console and
+/// with `environment` added to the block Windows builds for that user.
+///
+/// The two differences from the companion above are the whole point of this
+/// entry:
+///
+/// * **No console.** The helper draws its own owner window for the WebAuthn
+///   dialog; a console would be an empty black rectangle appearing beside
+///   Orion for the length of a ceremony.
+/// * **An environment block of its own.** The session token travels in it,
+///   outside ordinary process-list command lines. A process allowed to debug
+///   this child remains outside that protection boundary.
+///
+/// The block is the user's own, from `CreateEnvironmentBlock`, with these
+/// variables appended. Not a bare block of two variables: the helper resolves
+/// the vault beside the user's profile, and a child with no `USERPROFILE`
+/// would look for the domain in a directory that does not exist.
+pub fn spawn_astra_helper(
+    program: &Path,
+    arguments: &[String],
+    environment: &[(String, String)],
+) -> Result<u32, String> {
+    let program_text = program.to_string_lossy();
+    let command = windows_command_line(&program_text, arguments);
+    spawn_with_standard_token(
+        Some(program),
+        command,
+        "lancement du processus opérateur",
+        environment,
+        CREATE_NO_WINDOW,
+    )
+}
+
+/// The user's environment block, with `additions` appended.
+///
+/// A Windows environment block is a run of NUL-terminated `NAME=VALUE` strings
+/// ended by one further NUL. Held alive by the returned vector for the length
+/// of the `CreateProcessWithTokenW` call, and zeroed on drop because one of
+/// the values it carries is a session token.
+struct EnvironmentBlock {
+    block: Vec<u16>,
+}
+
+impl Drop for EnvironmentBlock {
+    fn drop(&mut self) {
+        self.block.iter_mut().for_each(|unit| *unit = 0);
+    }
+}
+
+fn environment_block(
+    token: &Token,
+    additions: &[(String, String)],
+) -> Result<EnvironmentBlock, String> {
+    let mut inherited: *mut std::ffi::c_void = std::ptr::null_mut();
+    // SAFETY: `token` is a live primary token; the pointer is written by the
+    // call and released below.
+    let created = unsafe { CreateEnvironmentBlock(&mut inherited, token.0, 0) };
+    if created == 0 {
+        return Err(format!(
+            "environnement de l'utilisateur indisponible : {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let mut block = Vec::new();
+    // SAFETY: the block Windows returned is a NUL-separated run of UTF-16
+    // strings terminated by an empty one; the walk stops on that terminator.
+    unsafe {
+        let mut cursor = inherited as *const u16;
+        loop {
+            let mut length = 0usize;
+            while *cursor.add(length) != 0 {
+                length += 1;
+            }
+            if length == 0 {
+                break;
+            }
+            let entry = std::slice::from_raw_parts(cursor, length);
+            let text = String::from_utf16_lossy(entry);
+            let shadowed = additions.iter().any(|(name, _)| {
+                text.get(..name.len())
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(name))
+                    && text.as_bytes().get(name.len()) == Some(&b'=')
+            });
+            if !shadowed {
+                block.extend_from_slice(entry);
+                block.push(0);
+            }
+            cursor = cursor.add(length + 1);
+        }
+        DestroyEnvironmentBlock(inherited);
+    }
+    for (name, value) in additions {
+        block.extend(OsStr::new(&format!("{name}={value}")).encode_wide());
+        block.push(0);
+    }
+    // The block itself ends on an empty string.
+    block.push(0);
+    Ok(EnvironmentBlock { block })
+}
+
+/// Quotes one argument according to the Windows command-line grammar consumed
+/// by `CommandLineToArgvW` and Rust/clap. No shell interprets the result.
+fn quote_argument(argument: &str) -> String {
+    if !argument.is_empty()
+        && !argument
+            .chars()
+            .any(|character| character.is_whitespace() || character == '"')
+    {
+        return argument.to_string();
     }
 
-    let mut command: Vec<u16> =
-        OsStr::new(&format!("powershell.exe -NoExit -Command ssh {target}"))
+    let mut quoted = String::from("\"");
+    let mut backslashes = 0usize;
+    for character in argument.chars() {
+        if character == '\\' {
+            backslashes += 1;
+            continue;
+        }
+        if character == '"' {
+            quoted.push_str(&"\\".repeat(backslashes * 2 + 1));
+            quoted.push('"');
+        } else {
+            quoted.push_str(&"\\".repeat(backslashes));
+            quoted.push(character);
+        }
+        backslashes = 0;
+    }
+    quoted.push_str(&"\\".repeat(backslashes * 2));
+    quoted.push('"');
+    quoted
+}
+
+fn windows_command_line(program: &str, arguments: &[String]) -> String {
+    std::iter::once(program)
+        .chain(arguments.iter().map(String::as_str))
+        .map(quote_argument)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn spawn_with_standard_token(
+    application: Option<&Path>,
+    command: String,
+    action: &str,
+    environment: &[(String, String)],
+    creation_flags: u32,
+) -> Result<u32, String> {
+    let token = standard_user_token()?;
+    if is_elevated(&token)? {
+        return Err(format!(
+            "refus : le jeton obtenu est toujours élevé, {action} annulé"
+        ));
+    }
+
+    let mut command: Vec<u16> = OsStr::new(&command)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let application: Option<Vec<u16>> = application.map(|path| {
+        path.as_os_str()
             .encode_wide()
             .chain(std::iter::once(0))
-            .collect();
-
+            .collect()
+    });
     let mut startup: STARTUPINFOW = unsafe { std::mem::zeroed() };
     startup.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
     let mut process: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
 
-    // SAFETY: `command` is NUL-terminated and stays alive for the call;
-    // `startup` and `process` are correctly sized zeroed structures.
+    // Built only when something is being added. With nothing to add, NULL is
+    // the better answer: Windows then builds the block itself from the profile
+    // `token` selects, which is what the companion has always relied on.
+    let mut block = if environment.is_empty() {
+        None
+    } else {
+        Some(environment_block(&token, environment)?)
+    };
+    let (environment_pointer, creation_flags) = match block.as_mut() {
+        Some(block) => (
+            block.block.as_ptr() as *const std::ffi::c_void,
+            creation_flags | CREATE_UNICODE_ENVIRONMENT,
+        ),
+        None => (std::ptr::null(), creation_flags),
+    };
+
+    // SAFETY: `command` is NUL-terminated and remains alive for the call;
+    // `startup` and `process` are correctly sized initialized structures.
     let created = unsafe {
         CreateProcessWithTokenW(
             token.0,
             LOGON_WITH_PROFILE,
-            std::ptr::null(),
+            application
+                .as_ref()
+                .map_or(std::ptr::null(), |path| path.as_ptr()),
             command.as_mut_ptr(),
-            CREATE_NEW_CONSOLE,
-            // NULL rather than our own block: with a null environment,
-            // `CreateProcessWithTokenW` builds one from the profile of the
-            // user the token designates — which is the standard user, not the
-            // elevated context this process runs in.
-            std::ptr::null(),
+            creation_flags,
+            // NULL unless something had to be added: Windows then builds the
+            // block itself from the standard user's profile selected by
+            // `token`. Never Orion's own environment.
+            environment_pointer,
             std::ptr::null(),
             &startup,
             &mut process,
@@ -127,17 +325,79 @@ pub fn spawn_ssh_terminal(target: &str) -> Result<(), String> {
     };
     if created == 0 {
         return Err(format!(
-            "ouverture du terminal impossible : CreateProcessWithTokenW a échoué ({})",
+            "{action} impossible : CreateProcessWithTokenW a échoué ({})",
             std::io::Error::last_os_error()
         ));
     }
-    // SAFETY: both handles were produced by the successful call above.
+    let process_id = process.dwProcessId;
+    // SAFETY: both handles were returned by the successful call above.
     unsafe {
         CloseHandle(process.hProcess);
         CloseHandle(process.hThread);
     }
-    tracing::info!(%target, "terminal SSH ouvert sous le compte standard");
-    Ok(())
+    tracing::info!(%action, "processus ouvert sous le compte standard");
+    Ok(process_id)
+}
+
+/// Hands the helper the right to raise its WebAuthn dialog.
+///
+/// # Why the right has to be taken back before it is given
+///
+/// `AllowSetForegroundWindow` gives away a right the caller must itself hold,
+/// and Windows revokes that grant on the next input directed elsewhere. The
+/// helper is launched by the first press, but the WebAuthn call follows a
+/// second press after the verified manifest was shown. Granting at launch is
+/// therefore too early: that second press can revoke the grant before the
+/// helper has a prompt to raise.
+///
+/// Re-asserting the foreground on Orion's own window is legitimate at that
+/// exact second press. It takes focus from nobody, since the requested window
+/// is the one the operator just used. The helper then consumes the grant by
+/// activating its private owner immediately before it calls WebAuthn.
+///
+/// A refusal names what was seen. The same sentence otherwise covers three
+/// different situations — no window handed down, a foreground window belonging
+/// to another application, and a genuine refusal by Windows — and the operator
+/// has no way to tell them apart from the ceremony that did not open.
+pub fn cede_foreground(owner: isize, child: u32) -> Result<(), String> {
+    if owner == 0 {
+        return Err("aucune fenêtre Orion n'a été transmise".to_string());
+    }
+    let owner = owner as *mut core::ffi::c_void;
+    let mut owner_pid = 0u32;
+    // SAFETY: `owner` is the window handle Tauri reported for Orion's own
+    // window; this call only reads its owning process identifier.
+    unsafe { GetWindowThreadProcessId(owner, &mut owner_pid) };
+    if owner_pid != std::process::id() {
+        return Err("la fenêtre transmise n'appartient pas à Orion".to_string());
+    }
+    // The WebView renderer receives the input, while this process owns the
+    // top-level window. Re-assert it before transferring the right.
+    if unsafe { GetForegroundWindow() } != owner {
+        // SAFETY: the handle was validated as Orion's own window above.
+        unsafe { SetForegroundWindow(owner) };
+        if unsafe { GetForegroundWindow() } != owner {
+            return Err("Windows n'a pas rendu le premier plan à Orion".to_string());
+        }
+    }
+    // SAFETY: no pointer argument. `child` is the authenticated helper held by
+    // the current operator session.
+    if unsafe { AllowSetForegroundWindow(child) } != 0 {
+        return Ok(());
+    }
+    let refusal = std::io::Error::last_os_error();
+    // SAFETY: returns this session's foreground window, or null.
+    let foreground = unsafe { GetForegroundWindow() };
+    let mut foreground_pid = 0u32;
+    if !foreground.is_null() {
+        // SAFETY: `foreground` is a valid window handle; writes one u32.
+        unsafe { GetWindowThreadProcessId(foreground, &mut foreground_pid) };
+    }
+    Err(format!(
+        "impossible d'autoriser sa boîte WebAuthn au premier plan ({refusal}). \
+         Premier plan tenu par le processus {foreground_pid}, Orion est le processus {}",
+        std::process::id()
+    ))
 }
 
 /// The interactive user's token, borrowed from the desktop shell.

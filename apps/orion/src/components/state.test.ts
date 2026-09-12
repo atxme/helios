@@ -14,6 +14,7 @@ import {
 const profile = (over: Partial<ClientProfile> = {}): ClientProfile => ({
   name: 'site-a',
   endpoint: '203.0.113.10:51820',
+  profile_type: 'classic',
   peer_public_key: '',
   public_key: null,
   has_private_key: false,

@@ -93,6 +93,28 @@ impl LocalSettings {
             ),
         }
     }
+
+    /// Persists the complete local choice atomically, beside the vault.
+    ///
+    /// The file can be created by the interface on first use; its absence is
+    /// merely the strict default, not an installation error. A complete write
+    /// preserves the other downgrade flag instead of replacing it with an
+    /// implicit default.
+    pub fn save(&self, dir: &std::path::Path) -> Result<(), super::VaultError> {
+        aether::private_file::create_private_dir(dir).map_err(|cause| super::VaultError::Io {
+            path: dir.to_path_buf(),
+            cause: cause.to_string(),
+        })?;
+        let path = dir.join(SETTINGS_FILE);
+        let encoded = toml::to_string(self)
+            .map_err(|cause| super::VaultError::LocalSettings(cause.to_string()))?;
+        aether::private_file::write_private_atomic(&path, encoded.as_bytes()).map_err(|cause| {
+            super::VaultError::Io {
+                path,
+                cause: cause.to_string(),
+            }
+        })
+    }
 }
 
 #[cfg(test)]
@@ -178,6 +200,20 @@ mod tests {
         )
         .unwrap();
         assert!(!LocalSettings::load(&dir).0.danger_allow_software_keystore);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saving_creates_the_file_and_preserves_every_choice() {
+        let dir = dir("save");
+        let settings = LocalSettings {
+            danger_allow_software_keystore: true,
+            danger_allow_unencrypted_volume: true,
+        };
+
+        settings.save(&dir).unwrap();
+
+        assert_eq!(LocalSettings::load(&dir).0, settings);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

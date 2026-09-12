@@ -211,6 +211,58 @@ impl ValidityPeriod {
             .ok_or(CertificateError::ArithmeticOverflow)?
             / lifetime)
     }
+
+    /// Where this certificate sits on the renewal ladder, at one reading of
+    /// the clock.
+    ///
+    /// Every interface that reports a leaf answers this question, and each one
+    /// answering it for itself is how a console and a planner end up
+    /// disagreeing about the same certificate. The thresholds are the
+    /// protocol's own — 80 / 90 / 95 % — so a screen that says *renouvellement
+    /// dû* is saying exactly what opens the window.
+    ///
+    /// A period so short that `fraction_at` overflows falls back to
+    /// `not_after`: the phase then degrades to [`ValidityPhase::Valid`] until
+    /// expiry rather than raising. This is a display, and a certificate whose
+    /// arithmetic does not hold is refused where it is *installed*, not here.
+    pub fn phase(&self, now_unix: u64) -> ValidityPhase {
+        if now_unix < self.not_before {
+            return ValidityPhase::NotYetValid;
+        }
+        if now_unix >= self.not_after {
+            return ValidityPhase::Expired;
+        }
+        if now_unix >= self.critical_at().unwrap_or(self.not_after) {
+            ValidityPhase::Critical
+        } else if now_unix >= self.warning_at().unwrap_or(self.not_after) {
+            ValidityPhase::Warning
+        } else if now_unix >= self.renewal_at().unwrap_or(self.not_after) {
+            ValidityPhase::RenewalDue
+        } else {
+            ValidityPhase::Valid
+        }
+    }
+}
+
+/// Where a certificate stands on the renewal ladder of spec §4.3.
+///
+/// Shared by every surface that reports a leaf — the Helios console, Orion's
+/// inventory, the planner — because the alternative is each of them writing
+/// the same three comparisons and one of them eventually writing `>` where the
+/// others wrote `>=`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidityPhase {
+    /// Prepared for later: its validity has not started.
+    NotYetValid,
+    Valid,
+    /// Past 80 %: the renewal window is open.
+    RenewalDue,
+    /// Past 90 %.
+    Warning,
+    /// Past 95 %.
+    Critical,
+    Expired,
 }
 
 /// What a proposed generation is, relative to the persisted one (spec §4.2).

@@ -96,6 +96,27 @@ pub struct TrustMaterial {
     /// Generation this client's current identity is at.
     pub client_generation: u64,
     pub astra_authority_url: String,
+    /// RP ID of the operator WebAuthn ceremony. It is stable across a TLS
+    /// certificate rotation of Astra and is never inferred from a relay URL.
+    #[serde(default)]
+    pub webauthn_rp_id: String,
+    /// Out-of-band policy pin, lowercase SHA-256 hexadecimal.
+    #[serde(default)]
+    pub astra_policy_fingerprint: String,
+    /// Highest CA-PQ-signed credential registry decision this profile saw.
+    #[serde(default)]
+    pub credential_registry_epoch: u64,
+    /// The operator credentials of the domain, as `CA-PQ` signed them.
+    ///
+    /// Verified under [`Self::ca_pq_public_key`] before anything is done with
+    /// them, so the document that carried them proves nothing by itself.
+    ///
+    /// Absent on a profile emitted before this field existed. That profile
+    /// still mounts a tunnel and still renews; what it cannot do is recover an
+    /// expired identity, because naming the credential that will approve it is
+    /// the first thing §7.5 does.
+    #[serde(default)]
+    pub astra_credential_bindings: Vec<aether::certificates::approval::AstraCredentialBinding>,
     pub astra_service_key_epoch: u64,
     /// Astra's service key, base64 ML-DSA-87.
     pub astra_service_public_key: String,
@@ -136,16 +157,30 @@ impl TrustMaterial {
         aether::certificates::x509::assert_certificate_authority(&certificate)
             .map_err(|error| anyhow::anyhow!("CA TLS cliente : {error}"))?;
 
-        if self.astra_authority_url.trim().is_empty() {
-            anyhow::bail!("l'URL de l'autorité Astra est vide");
+        let authority = url::Url::parse(self.astra_authority_url.trim())
+            .map_err(|_| anyhow::anyhow!("l'URL de l'autorité Astra est illisible"))?;
+        if authority.scheme() != "https" || authority.host_str().is_none() {
+            anyhow::bail!("l'URL de l'autorité Astra doit être une origine https://");
         }
-        // Astra authenticates itself by its pinned ML-DSA-87 service key, not
-        // by its transport (spec §9.6). `https` is still required: without it
-        // an observer reads which client renews, and when.
-        if !self.astra_authority_url.trim().starts_with("https://") {
-            anyhow::bail!("l'URL de l'autorité Astra doit être en https://");
+        aether::certificates::encoding::validate_server_name(self.webauthn_rp_id.trim())
+            .map_err(|_| anyhow::anyhow!("RP ID WebAuthn Astra invalide"))?;
+        let host = authority.host_str().expect("checked above");
+        let rp_id = self.webauthn_rp_id.trim();
+        if host != rp_id && !host.ends_with(&format!(".{rp_id}")) {
+            anyhow::bail!("le RP ID WebAuthn Astra ne gouverne pas l'origine de l'autorité");
         }
-        if self.ca_epoch == 0 || self.ca_tls_epoch == 0 || self.astra_service_key_epoch == 0 {
+        let policy = aether::certificates::encoding::Fingerprint::parse_hex(
+            self.astra_policy_fingerprint.trim(),
+        )
+        .map_err(|_| anyhow::anyhow!("empreinte de politique Astra illisible"))?;
+        aether::certificates::AstraPolicyPin::new(policy)
+            .map_err(|_| anyhow::anyhow!("empreinte de politique Astra absente"))?;
+        if self.ca_epoch == 0
+            || self.ca_tls_epoch == 0
+            || self.client_generation == 0
+            || self.astra_service_key_epoch == 0
+            || self.credential_registry_epoch == 0
+        {
             anyhow::bail!("les compteurs d'autorité commencent à 1");
         }
         Ok(())
@@ -170,6 +205,15 @@ impl TrustMaterial {
             .map_err(|_| anyhow::anyhow!("CA TLS cliente : base64 illisible"))?;
         aether::certificates::encoding::DerCertificate::new(der)
             .map_err(|error| anyhow::anyhow!("CA TLS cliente : {error}"))
+    }
+
+    pub fn astra_policy_pin(&self) -> Result<aether::certificates::AstraPolicyPin> {
+        let fingerprint = aether::certificates::encoding::Fingerprint::parse_hex(
+            self.astra_policy_fingerprint.trim(),
+        )
+        .map_err(|_| anyhow::anyhow!("empreinte de politique Astra illisible"))?;
+        aether::certificates::AstraPolicyPin::new(fingerprint)
+            .map_err(|error| anyhow::anyhow!("empreinte de politique Astra : {error}"))
     }
 }
 
@@ -235,14 +279,13 @@ pub fn validate_key_negotiation(
         .duration_since(std::time::UNIX_EPOCH)
         .context("l'horloge système précède l'époque Unix")?
         .as_secs();
-    certificate
-        .verify_self_signed(
-            aether::key_negotiation::PqCertificateRole::Gateway,
-            Some(&settings.server_name),
-            peer_public_key,
-            now,
-        )
-        .context("le certificat PQ épinglé ne correspond pas à cette gateway")?;
+    verify_pinned_gateway_certificate(
+        &certificate,
+        &settings.server_name,
+        peer_public_key,
+        settings.trust.as_ref(),
+        now,
+    )?;
 
     match (settings.mode, has_preshared_key) {
         (ProtectionMode::StaticPsk, false) => {
@@ -255,12 +298,92 @@ pub fn validate_key_negotiation(
     }
 }
 
+/// Verifies the pinned gateway leaf under the authority that actually issued it.
+///
+/// Two shapes exist, and a profile is only ever right about one of them. A
+/// gateway with no trust domain serves a self-signed leaf: the pinned bytes
+/// *are* the trust, and there is no anchor to check them against. Once
+/// `heliosd init-trust-domain` installs the CA-PQ bootstrap leaf (ADR-008
+/// §13.1) the same gateway serves a leaf signed by `CA-PQ`, and the anchor
+/// that verifies it is the one the trust block carries.
+///
+/// The choice is made on `issuer == subject`, not on the presence of a trust
+/// block, so the two cases can never swap silently: a CA-issued leaf in a
+/// profile that carries no anchor is refused by name rather than accepted on
+/// its own signature — which is what `verify_self_signed` would do if the
+/// leaf ever carried the issuer's key.
+pub fn verify_pinned_gateway_certificate(
+    certificate: &aether::key_negotiation::PqCertificate,
+    server_name: &str,
+    peer_public_key: &str,
+    trust: Option<&TrustMaterial>,
+    now_unix: u64,
+) -> Result<()> {
+    let role = aether::key_negotiation::PqCertificateRole::Gateway;
+    let subject = Some(server_name.trim());
+    if certificate.issuer == certificate.subject {
+        return certificate
+            .verify_self_signed(role, subject, peer_public_key, now_unix)
+            .context("le certificat PQ épinglé ne correspond pas à cette gateway");
+    }
+    let trust = trust.ok_or_else(|| {
+        anyhow::anyhow!(
+            "le certificat PQ épinglé est émis par l'autorité « {} », que ce profil ne porte \
+             pas : réimporter un profil produit après l'amorçage du domaine de confiance",
+            certificate.issuer.trim()
+        )
+    })?;
+    let anchor =
+        aether::certificates::encoding::MlDsa87PublicKey::parse(trust.ca_pq_public_key.trim())
+            .map_err(|_| anyhow::anyhow!("clé publique CA-PQ illisible"))?;
+    certificate
+        .verify(anchor.as_bytes(), role, subject, peer_public_key, now_unix)
+        .context("le certificat PQ épinglé n'est pas émis par le CA-PQ de ce domaine")
+}
+
 /// Name of a mode as the user reads it on screen.
 fn mode_label(mode: ProtectionMode) -> &'static str {
     match mode {
         ProtectionMode::Classic => "classique",
         ProtectionMode::StaticPsk => "PSK statique",
         ProtectionMode::MlKem => "ML-KEM-1024",
+    }
+}
+
+/// What kind of profile this is (spec §19, §22).
+///
+/// # Why an explicit discriminant, when the block already says it
+///
+/// It used to be inferred: a `key_negotiation` block meant a Helios profile,
+/// its absence meant classic. Inference reads a **presence** as an
+/// **intention**, and the two come apart in the direction that matters — a
+/// profile whose negotiation block was dropped by an edit, a conversion or a
+/// partial import arrives looking exactly like a deliberate classic profile.
+/// Orion would then mount a tunnel with no pre-WireGuard authentication and
+/// report nothing, because from its side nothing was wrong. A silent downgrade
+/// of the protection level is the one outcome this client may not produce.
+///
+/// So the profile says which it is, and the two shapes are **exclusive**: a
+/// `helios_key_negotiation` profile without a block, or a `classic` profile
+/// carrying one, is refused rather than cleaned up. Guessing which half of a
+/// contradiction to keep is choosing a protection level in the operator's
+/// place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfileKind {
+    /// A plain WireGuard peer. No negotiation block, and none expected.
+    Classic,
+    /// A Helios profile: the negotiation block is mandatory.
+    HeliosKeyNegotiation,
+}
+
+impl ProfileKind {
+    /// Name of the kind as it is written in a document and read on screen.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Classic => "classic",
+            Self::HeliosKeyNegotiation => "helios_key_negotiation",
+        }
     }
 }
 
@@ -337,6 +460,16 @@ pub struct ClientProfile {
     /// have a natural home.
     #[serde(default)]
     pub ssh_target: Option<String>,
+    /// Which of the two profile shapes this is (spec §19, §22).
+    ///
+    /// `None` only for a profile that predates the discriminant — a sealed
+    /// manifest below v5, or a document written before §19. Every path that
+    /// **produces** a profile stamps it, so the absent case is a migration
+    /// state and not a third kind. Read it through [`ClientProfile::kind`],
+    /// never directly: that is where the legacy inference lives, once, with
+    /// its reason.
+    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+    pub profile_type: Option<ProfileKind>,
     /// Authenticated public negotiation performed before WireGuard is mounted.
     #[serde(default)]
     pub key_negotiation: Option<KeyNegotiationSettings>,
@@ -378,6 +511,7 @@ impl fmt::Debug for ClientProfile {
             .field("persistent_keepalive", &self.persistent_keepalive)
             .field("heliosd_url", &self.heliosd_url)
             .field("ssh_target", &self.ssh_target)
+            .field("profile_type", &self.profile_type)
             .field("key_negotiation", &self.key_negotiation)
             .finish()
     }
@@ -389,7 +523,87 @@ impl ClientProfile {
     /// An incomplete profile must not be presented as connectable: we fail
     /// **before** touching the network rather than mounting an adapter that
     /// will never handshake.
+    /// The kind this profile is, declared or — for a legacy profile — inferred.
+    ///
+    /// The inference is the historical rule, kept in exactly one place instead
+    /// of at every call site: a profile sealed before manifest v5 carries no
+    /// discriminant, and the presence of the block is the only thing left to
+    /// go on. It is resolved once, and [`crate::vault::store::ProfileStore`]
+    /// writes the answer back at the next save — so the guess is made about a
+    /// file, never about a decision.
+    pub fn kind(&self) -> ProfileKind {
+        self.profile_type.unwrap_or({
+            if self.key_negotiation.is_some() {
+                ProfileKind::HeliosKeyNegotiation
+            } else {
+                ProfileKind::Classic
+            }
+        })
+    }
+
+    /// Does this profile negotiate before WireGuard?
+    ///
+    /// The single question the connection path asks. It reads the
+    /// discriminant, not the presence of the block: a Helios profile that lost
+    /// its block must fail loudly at [`Self::validate`], never quietly mount a
+    /// classic tunnel.
+    pub fn negotiates(&self) -> bool {
+        self.kind() == ProfileKind::HeliosKeyNegotiation
+    }
+
+    /// Checks the two shapes of spec §19 against each other.
+    ///
+    /// Separate from [`Self::validate`] because it answers a different
+    /// question, at a different moment. `validate` asks whether a profile can
+    /// mount a tunnel, and a half-filled draft legitimately cannot. This asks
+    /// whether the profile **contradicts itself**, which a draft never has the
+    /// right to do — so it can be applied when a profile is stored, long
+    /// before it is complete.
+    pub fn check_kind(&self) -> Result<()> {
+        // The contradiction is refused rather than resolved. Either half could
+        // be the true one, and the wrong guess mounts a tunnel with no
+        // pre-WireGuard authentication while the screen still says «Helios».
+        match (self.profile_type, self.key_negotiation.is_some()) {
+            (Some(ProfileKind::HeliosKeyNegotiation), false) => anyhow::bail!(
+                "ce profil se déclare « helios_key_negotiation » mais ne porte pas de bloc de \
+                 négociation : il monterait un tunnel sans authentification avant WireGuard. \
+                 Réimporter le document d'enrôlement."
+            ),
+            (Some(ProfileKind::Classic), true) => anyhow::bail!(
+                "ce profil se déclare « classic » mais porte un bloc de négociation : l'un des \
+                 deux est faux, et deviner lequel reviendrait à choisir un niveau de protection \
+                 à la place de l'opérateur"
+            ),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Refuses changing the security variant of an existing stable profile.
+    ///
+    /// A classic and a Helios profile may target the same endpoint, but they
+    /// must have distinct stable identifiers (spec §14, §19). Reusing the
+    /// existing profile would erase the fact that it has carried Helios trust
+    /// material; after that, losing the negotiation block would once again
+    /// look exactly like an intentional classic profile.
+    pub fn check_replacement_of(&self, known: &Self) -> Result<()> {
+        self.check_kind()?;
+        known.check_kind()?;
+        if self.kind() != known.kind() {
+            anyhow::bail!(
+                "le type du profil « {} » est immuable : il est enregistré comme « {} » mais \
+                 le remplacement propose « {} ». Créer un nouveau profil sous un autre nom \
+                 pour obtenir un identifiant distinct.",
+                known.name,
+                known.kind().as_str(),
+                self.kind().as_str(),
+            );
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<()> {
+        self.check_kind()?;
         if self.endpoint.trim().is_empty() {
             anyhow::bail!("l'endpoint de la gateway (IP/FQDN:port) est requis");
         }
@@ -503,6 +717,12 @@ impl Default for ClientProfile {
             allowed_ips: default_allowed_ips(),
             persistent_keepalive: DEFAULT_KEEPALIVE_SECS,
             heliosd_url: None,
+            // Left undeclared while the user is still filling the form: a new
+            // profile that started as classic and receives a negotiation block
+            // must not have to fight its own discriminant. It is stamped when
+            // the profile is persisted, which is the moment it becomes a fact
+            // rather than a draft.
+            profile_type: None,
             ssh_target: None,
             key_negotiation: None,
             preshared_key_is_negotiated: false,
@@ -585,33 +805,32 @@ impl ClientConfig {
     /// refuses to lower a peer's floor when a redacted view is reposted
     /// (ADR-001, amendment of 24 July 2026). A screen that forgot the block,
     /// or a draft opened before a raise and saved after it, must not silently
-    /// reopen a weaker negotiation. Lowering the floor stays possible, but
-    /// only by editing `profiles.toml` by hand — a deliberate local act, never
-    /// a side effect of saving a form.
-    pub fn upsert(&mut self, mut profile: ClientProfile) {
+    /// reopen a weaker negotiation. The profile variant is an even stronger
+    /// boundary: changing it under the same stable profile is refused. A
+    /// classic peer and a Helios peer use two distinct profile identifiers.
+    pub fn upsert(&mut self, mut profile: ClientProfile) -> Result<()> {
+        profile.check_kind()?;
         match self.profiles.iter_mut().find(|p| p.name == profile.name) {
             Some(slot) => {
+                profile.check_replacement_of(slot)?;
                 Self::keep_strongest_floor(&mut profile, slot);
                 *slot = profile;
             }
             None => self.profiles.push(profile),
         }
+        Ok(())
     }
 
     /// Carries the known floor over to the profile about to replace it.
     ///
-    /// Dropping the block entirely is a downgrade too: a profile that
-    /// negotiated in ML-KEM and comes back without any block would fall back
-    /// to the legacy path, whose first handshake is unprotected. The known
-    /// block is therefore preserved rather than erased.
+    /// The caller has already proved both profiles are Helios. Dropping the
+    /// block is refused before this function; only the monotone floor remains
+    /// to reconcile here.
     fn keep_strongest_floor(incoming: &mut ClientProfile, known: &ClientProfile) {
         let Some(previous) = known.key_negotiation.as_ref() else {
             return;
         };
         let Some(next) = incoming.key_negotiation.as_mut() else {
-            if previous.minimum_mode != ProtectionMode::Classic {
-                incoming.key_negotiation = Some(previous.clone());
-            }
             return;
         };
         if !next.minimum_mode.satisfies(previous.minimum_mode) {
@@ -635,17 +854,206 @@ impl ClientConfig {
 mod tests {
     use super::*;
 
+    /// Verification of the pinned gateway leaf, which only has two legal
+    /// shapes. Gated like [`crate::test_domain`]: the fixture signs real
+    /// ML-DSA-87 objects, and a test that faked them would not exercise the
+    /// signature check that is the whole point here.
+    #[cfg(feature = "certificate-signing")]
+    mod pinned_gateway_certificate {
+        use crate::config::{verify_pinned_gateway_certificate, TrustMaterial};
+        use crate::test_domain::{domain, gateway_key, settings, Domain, NOW, SERVER_NAME};
+        use aether::certificates::encoding::generate_ml_dsa_87_keypair;
+        use aether::key_negotiation::{
+            issue_pq_certificate, PqCertificate, PqCertificateRole, PQ_CERTIFICATE_VERSION,
+        };
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+        /// The shape a gateway serves once it has no trust domain: the pinned
+        /// bytes are the whole trust, and there is no anchor to check them under.
+        fn self_signed_gateway_leaf() -> PqCertificate {
+            let (private, public) = generate_ml_dsa_87_keypair().expect("gateway key");
+            issue_pq_certificate(
+                PqCertificate {
+                    version: PQ_CERTIFICATE_VERSION,
+                    serial: [3; 16],
+                    subject: SERVER_NAME.into(),
+                    issuer: SERVER_NAME.into(),
+                    role: PqCertificateRole::Gateway,
+                    wireguard_public_key: gateway_key().to_base64(),
+                    ml_dsa_87_public_key: B64.encode(public.as_bytes()),
+                    not_before_unix: NOW - 3_600,
+                    not_after_unix: NOW + 10 * 86_400,
+                    ml_dsa_87_signature: String::new(),
+                },
+                &private,
+            )
+            .expect("self-signed gateway leaf")
+        }
+
+        fn trust_of(domain: &Domain) -> TrustMaterial {
+            settings(domain)
+                .trust
+                .expect("the fixture carries a trust block")
+        }
+
+        /// The regression this pair of checks exists for.
+        ///
+        /// `heliosd init-trust-domain` replaces the gateway's self-signed leaf
+        /// with one issued under `CA-PQ` (ADR-008 §13.1). Verifying that leaf
+        /// against its own key — which is what `verify_self_signed` does — fails
+        /// by construction, so a profile pinned to a gateway with a trust domain
+        /// was refused at load and no client could be enrolled at all.
+        #[test]
+        fn a_ca_issued_gateway_leaf_verifies_under_the_domain_anchor() {
+            let domain = domain();
+            let trust = trust_of(&domain);
+            verify_pinned_gateway_certificate(
+                &domain.gateway_leaf,
+                SERVER_NAME,
+                &gateway_key().to_base64(),
+                Some(&trust),
+                NOW,
+            )
+            .expect("the anchor the profile pins is the one that issued the leaf");
+        }
+
+        /// The half that keeps the fix from being a downgrade: a CA-issued leaf
+        /// carries the issuer's name, never the issuer's key, so there is nothing
+        /// in it to fall back on. Without the anchor it must be refused by name.
+        #[test]
+        fn a_ca_issued_gateway_leaf_is_refused_without_an_anchor() {
+            let domain = domain();
+            let error = verify_pinned_gateway_certificate(
+                &domain.gateway_leaf,
+                SERVER_NAME,
+                &gateway_key().to_base64(),
+                None,
+                NOW,
+            )
+            .expect_err("no anchor, no verification");
+            let message = format!("{error}");
+            assert!(
+                message.contains("CA-PQ") && message.contains("ne porte pas"),
+                "the message must name the missing anchor, not the signature: {message}"
+            );
+        }
+
+        /// A second domain's anchor is not this domain's anchor.
+        #[test]
+        fn a_ca_issued_gateway_leaf_is_refused_under_a_foreign_anchor() {
+            let this = domain();
+            let other = domain();
+            let mut trust = trust_of(&this);
+            trust.ca_pq_public_key = other.ca_pq_public.to_base64();
+            verify_pinned_gateway_certificate(
+                &this.gateway_leaf,
+                SERVER_NAME,
+                &gateway_key().to_base64(),
+                Some(&trust),
+                NOW,
+            )
+            .expect_err("a leaf signed by another authority is not this domain's gateway");
+        }
+
+        /// Profiles issued before any trust domain existed keep working: they pin
+        /// a self-signed leaf and carry no anchor, and that combination stays
+        /// valid rather than becoming collateral of the fix.
+        #[test]
+        fn a_self_signed_gateway_leaf_still_verifies_without_a_trust_block() {
+            verify_pinned_gateway_certificate(
+                &self_signed_gateway_leaf(),
+                SERVER_NAME,
+                &gateway_key().to_base64(),
+                None,
+                NOW,
+            )
+            .expect("a gateway without a trust domain is verified by its own key");
+        }
+    }
+
+    /// The failure the discriminant exists for.
+    ///
+    /// A Helios profile whose negotiation block is lost — a bad edit, a
+    /// partial import, a conversion — used to arrive looking exactly like a
+    /// deliberate classic profile. Orion mounted a tunnel with no
+    /// pre-WireGuard authentication and reported nothing, because from its
+    /// side nothing was wrong. That is a silent downgrade of the protection
+    /// level, which is the one outcome this client may not produce.
+    #[test]
+    fn a_helios_profile_that_lost_its_block_is_refused_not_downgraded() {
+        let mut profile = ClientProfile {
+            name: "poste".into(),
+            endpoint: "203.0.113.10:51820".into(),
+            private_key: "cHJpdmF0ZQ==".into(),
+            peer_public_key: "cHVibGlj".into(),
+            profile_type: Some(ProfileKind::HeliosKeyNegotiation),
+            ..ClientProfile::default()
+        };
+        profile.key_negotiation = None;
+
+        let error = profile
+            .validate()
+            .expect_err("the contradiction is refused");
+        assert!(
+            format!("{error}").contains("sans authentification avant WireGuard"),
+            "the message must name the consequence, not the field: {error}"
+        );
+        assert!(
+            profile.negotiates(),
+            "the declared kind still governs: a lost block never turns a Helios \
+             profile into a classic one"
+        );
+    }
+
+    /// The other half of the exclusivity, refused for the same reason.
+    #[test]
+    fn a_classic_profile_carrying_a_negotiation_block_is_refused() {
+        let profile = ClientProfile {
+            name: "poste".into(),
+            endpoint: "203.0.113.10:51820".into(),
+            private_key: "cHJpdmF0ZQ==".into(),
+            peer_public_key: "cHVibGlj".into(),
+            profile_type: Some(ProfileKind::Classic),
+            key_negotiation: Some(KeyNegotiationSettings {
+                mode: ProtectionMode::MlKem,
+                minimum_mode: ProtectionMode::MlKem,
+                endpoint: "203.0.113.10:51821".into(),
+                server_name: "gw.example".into(),
+                gateway_ca_der: "MIIB".into(),
+                gateway_pq_certificate: "e30=".into(),
+                identity: "orion-poste".into(),
+                trust: None,
+            }),
+            ..ClientProfile::default()
+        };
+
+        assert!(profile.validate().is_err());
+    }
+
+    /// A profile that predates the field keeps behaving exactly as before.
+    #[test]
+    fn an_undeclared_profile_falls_back_to_the_historical_inference() {
+        let classic = ClientProfile {
+            profile_type: None,
+            ..ClientProfile::default()
+        };
+        assert_eq!(classic.kind(), ProfileKind::Classic);
+        assert!(!classic.negotiates());
+    }
+
     #[test]
     fn upsert_and_remove() {
         let mut cfg = ClientConfig::default();
         cfg.upsert(ClientProfile {
             name: "a".into(),
             ..ClientProfile::default()
-        });
+        })
+        .unwrap();
         cfg.upsert(ClientProfile {
             name: "b".into(),
             ..ClientProfile::default()
-        });
+        })
+        .unwrap();
         cfg.selected = Some("b".into());
         assert_eq!(cfg.profiles.len(), 2);
 
@@ -654,7 +1062,8 @@ mod tests {
             name: "a".into(),
             endpoint: "203.0.113.1:51820".into(),
             ..ClientProfile::default()
-        });
+        })
+        .unwrap();
         assert_eq!(cfg.profiles.len(), 2);
         assert_eq!(cfg.find("a").unwrap().endpoint, "203.0.113.1:51820");
 
@@ -689,11 +1098,13 @@ mod tests {
     #[test]
     fn saving_a_profile_never_lowers_the_key_negotiation_floor() {
         let mut cfg = ClientConfig::default();
-        cfg.upsert(negotiating(ProtectionMode::MlKem, ProtectionMode::MlKem));
+        cfg.upsert(negotiating(ProtectionMode::MlKem, ProtectionMode::MlKem))
+            .unwrap();
         cfg.upsert(negotiating(
             ProtectionMode::Classic,
             ProtectionMode::Classic,
-        ));
+        ))
+        .unwrap();
 
         let saved = cfg.find("poste").unwrap().key_negotiation.as_ref().unwrap();
         assert_eq!(saved.minimum_mode, ProtectionMode::MlKem);
@@ -705,26 +1116,29 @@ mod tests {
     /// Dropping the block is a downgrade too: the legacy path leaves the
     /// first handshake unprotected.
     #[test]
-    fn saving_a_profile_without_its_block_keeps_the_known_one() {
+    fn saving_a_profile_without_its_block_is_refused() {
         let mut cfg = ClientConfig::default();
-        cfg.upsert(negotiating(ProtectionMode::MlKem, ProtectionMode::MlKem));
-        cfg.upsert(ClientProfile {
-            name: "poste".into(),
-            ..ClientProfile::default()
-        });
+        cfg.upsert(negotiating(ProtectionMode::MlKem, ProtectionMode::MlKem))
+            .unwrap();
+        let error = cfg
+            .upsert(ClientProfile {
+                name: "poste".into(),
+                profile_type: Some(ProfileKind::Classic),
+                ..ClientProfile::default()
+            })
+            .unwrap_err();
 
-        let saved = cfg.find("poste").unwrap().key_negotiation.as_ref().unwrap();
-        assert_eq!(saved.minimum_mode, ProtectionMode::MlKem);
+        assert!(error.to_string().contains("type du profil"));
+        assert_eq!(
+            cfg.find("poste").unwrap().kind(),
+            ProfileKind::HeliosKeyNegotiation
+        );
     }
 
-    /// Adding negotiation to a profile that had none must survive the save
-    /// **and** the round-trip through `profiles.toml`.
+    /// A separately identified Helios profile survives the save and reload.
     ///
-    /// This is the upgrade path a user actually walks: a profile enrolled long
-    /// ago, re-enrolled with a negotiation block. If the block were dropped by
-    /// the ratchet, by serialization, or by a default, the Profiles screen
-    /// would keep saying "this profile does not negotiate" with no way to tell
-    /// whether the import or the display was at fault.
+    /// A classic profile cannot be converted in place: the new Helios profile
+    /// receives another stable identifier, represented here by another name.
     ///
     /// Serialized in place rather than through `save`/`load`: those go through
     /// `ORION_CONFIG`, a process-wide variable that parallel tests would fight
@@ -738,16 +1152,19 @@ mod tests {
             endpoint: "vpn.example.net:51820".into(),
             private_key: "cHJpdmF0ZQ==".into(),
             ..ClientProfile::default()
-        });
+        })
+        .unwrap();
         assert!(cfg.find("poste").unwrap().key_negotiation.is_none());
 
-        // Re-enrolled: same name, now carrying negotiation.
-        cfg.upsert(negotiating(ProtectionMode::MlKem, ProtectionMode::MlKem));
+        // Re-enrolled under a distinct name, now carrying negotiation.
+        let mut enrolled = negotiating(ProtectionMode::MlKem, ProtectionMode::MlKem);
+        enrolled.name = "poste-helios".into();
+        cfg.upsert(enrolled).unwrap();
 
         let encoded = toml::to_string_pretty(&cfg).unwrap();
         let reloaded: ClientConfig = toml::from_str(&encoded).unwrap();
         let settings = reloaded
-            .find("poste")
+            .find("poste-helios")
             .expect("profile kept")
             .key_negotiation
             .as_ref()
@@ -756,20 +1173,25 @@ mod tests {
         assert_eq!(settings.identity, "orion-poste");
     }
 
-    /// A floor still at `classic` carries no promise: nothing to preserve.
+    /// Even a legacy `classic` floor does not permit changing profile kind.
     #[test]
-    fn a_classic_floor_does_not_pin_the_block() {
+    fn a_classic_floor_does_not_allow_reclassifying_the_profile() {
         let mut cfg = ClientConfig::default();
         cfg.upsert(negotiating(
             ProtectionMode::Classic,
             ProtectionMode::Classic,
-        ));
-        cfg.upsert(ClientProfile {
-            name: "poste".into(),
-            ..ClientProfile::default()
-        });
+        ))
+        .unwrap();
+        let error = cfg
+            .upsert(ClientProfile {
+                name: "poste".into(),
+                profile_type: Some(ProfileKind::Classic),
+                ..ClientProfile::default()
+            })
+            .unwrap_err();
 
-        assert!(cfg.find("poste").unwrap().key_negotiation.is_none());
+        assert!(error.to_string().contains("type du profil"));
+        assert!(cfg.find("poste").unwrap().key_negotiation.is_some());
     }
 
     #[test]
@@ -788,7 +1210,8 @@ mod tests {
             preshared_key: Some("cHNr".into()),
             address: Some("100.64.1.2/32".into()),
             ..ClientProfile::default()
-        });
+        })
+        .unwrap();
         cfg.selected = Some("site-a".into());
         cfg.save().unwrap();
 

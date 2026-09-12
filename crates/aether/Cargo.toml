@@ -1,6 +1,6 @@
 [package]
 name = "aether"
-version = "1.6.1"
+version = "2.0.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -12,16 +12,21 @@ default = []
 publisher-signing = ["fips204/default-rng"]
 # Runtime ML-DSA signing for authenticated key negotiation.
 key-negotiation-signing = ["fips204/default-rng", "dep:rcgen"]
+# Point d'entrée des cibles de fuzzing du §14.1. Compilé par les tests de toute
+# façon ; la feature n'existe que pour le crate `fuzz/`, hors espace de travail.
+fuzzing = []
 
 [dependencies]
 serde.workspace = true
 toml.workspace = true
 thiserror.workspace = true
 aws-lc-rs.workspace = true
+aws-lc-sys.workspace = true
 zeroize.workspace = true
 base64.workspace = true
 hex.workspace = true
 serde_json.workspace = true
+time.workspace = true
 fips204.workspace = true
 curve25519-dalek.workspace = true
 # Contrôles X.509 du cycle de vie des certificats : CA réelle, usage
@@ -36,6 +41,10 @@ rcgen = { workspace = true, optional = true }
 # Clés Curve25519 du plan de données WireGuard (`wg`) : `StaticSecret` porte la
 # clé privée persistée d'un pair, par opposition aux clés éphémères.
 x25519-dalek.workspace = true
+# `rand_core` 0.6 : l'interface que `fips204` attend pour recevoir un
+# générateur. C'est par elle que la génération de clés et la signature hedged
+# tirent du DRBG approuvé de `random` plutôt que du CSPRNG système.
+rand_core = { version = "0.6", default-features = false }
 # `sync` seul : aether ne tire aucun runtime, uniquement le `oneshot` qui porte
 # l'acquittement d'installation du PSK (voir `events::InstallPskRequest`).
 tokio = { workspace = true, features = ["sync"] }
@@ -45,6 +54,12 @@ base64.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+# Les contrôles X.509 se testent sur du matériel réel, jamais sur une chaîne
+# d'octets factice : `x509.rs` émet ses CA, ses leafs et ses CSR au moment du
+# test. En dépendance de développement, ces tests tournent sous un `cargo test
+# -p aether` nu, sans que la feature de signature soit exigée et sans qu'une
+# gateway qui ne fait que vérifier lie rcgen (voir `dependencies`).
+rcgen.workspace = true
 
 # `mlock` / `VirtualLock` : empêche un secret d'atteindre le fichier d'échange
 # ou celui d'hibernation, que `zeroize` ne peut pas nettoyer (ADR-006 §5).

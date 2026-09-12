@@ -39,6 +39,15 @@ pub struct ClientIdentity {
 /// DPAPI or an equivalent protected platform store.
 #[async_trait]
 pub trait IdentityProvider: Send + Sync {
+    /// Applies any due local service selection before the identity is read.
+    ///
+    /// Test and external providers need no lifecycle store and keep the
+    /// no-op default. The protected Orion store overrides it so an expired
+    /// recovery can cross its activation boundary before a tunnel exists.
+    async fn prepare_for_profile(&self, _profile: &ClientProfile) -> Result<()> {
+        Ok(())
+    }
+
     async fn load(&self, identity: &str) -> Result<ClientIdentity>;
 }
 
@@ -49,6 +58,19 @@ pub trait IdentityProvider: Send + Sync {
 /// guarantees the bytes came back exactly as they were sealed.
 #[async_trait]
 impl IdentityProvider for crate::identity_store::ProtectedIdentityStore {
+    async fn prepare_for_profile(&self, profile: &ClientProfile) -> Result<()> {
+        let Some(settings) = profile.key_negotiation.as_ref() else {
+            return Ok(());
+        };
+        crate::certificate_renewal::prepare_identity_for_connection(
+            settings,
+            self,
+            unix_time_now()?,
+        )
+        .context("promoting a due key-negotiation identity before connecting")?;
+        Ok(())
+    }
+
     async fn load(&self, identity: &str) -> Result<ClientIdentity> {
         let bundle = self.load(identity)?;
         let decoder = base64::engine::general_purpose::STANDARD;
@@ -91,8 +113,16 @@ pub struct KeyNegotiationClient {
     pub client_pq_private_key: Vec<u8>,
     /// CA certificate that authenticates the gateway certificate.
     pub gateway_ca: Vec<u8>,
-    /// Pinned self-signed ML-DSA-87 gateway certificate.
+    /// Pinned ML-DSA-87 gateway certificate — self-signed, or issued by the
+    /// `CA-PQ` below once the gateway carries a trust domain.
     pub gateway_pq_certificate: PqCertificate,
+    /// `CA-PQ` of the trust domain this profile belongs to, raw ML-DSA-87.
+    ///
+    /// `None` for a profile issued by a gateway that carries no domain: the
+    /// pinned leaf is then self-signed and *is* the trust, with no anchor above
+    /// it. Carried here rather than re-derived at each negotiation because the
+    /// profile is the only place it exists.
+    pub gateway_ca_pq_public_key: Option<Vec<u8>>,
     /// Orion refuses any locally selected mode below this floor.
     pub minimum_mode: ProtectionMode,
 }
@@ -112,6 +142,10 @@ impl std::fmt::Debug for KeyNegotiationClient {
             .field("client_pq_private_key", &"***")
             .field("gateway_ca", &self.gateway_ca.len())
             .field("gateway_pq_certificate", &"pinned")
+            .field(
+                "gateway_ca_pq_public_key",
+                &self.gateway_ca_pq_public_key.is_some(),
+            )
             .field("minimum_mode", &self.minimum_mode)
             .finish()
     }
@@ -340,6 +374,7 @@ pub async fn prepare(
             &client.gateway_pq_certificate,
             &client.server_name,
             expected_gateway_wg_public_key,
+            client.gateway_ca_pq_public_key.as_deref(),
             unix_time_now()?,
         )
         .context("rejecting an invalid PQ-authenticated key-negotiation response")?;
@@ -399,6 +434,19 @@ pub async fn prepare_for_profile(
             .context("decoding the gateway PQ certificate")?,
     )
     .context("parsing the gateway PQ certificate")?;
+    // Absent for a gateway with no trust domain, and that is the whole of the
+    // distinction: the pinned leaf is then self-signed, and there is no anchor
+    // above it to hold.
+    let gateway_ca_pq_public_key = match settings.trust.as_ref() {
+        Some(trust) => Some(
+            trust
+                .ca_pq()
+                .context("reading the CA-PQ anchor of the profile trust block")?
+                .as_bytes()
+                .to_vec(),
+        ),
+        None => None,
+    };
     let client_wg_public_key = profile
         .public_key()
         .context("deriving the client WireGuard public key")?;
@@ -409,6 +457,7 @@ pub async fn prepare_for_profile(
         floor = ?settings.minimum_mode,
         "key negotiation: loading the protected identity"
     );
+    identities.prepare_for_profile(profile).await?;
     let identity = identities.load(&settings.identity).await.with_context(|| {
         format!(
             "loading key-negotiation identity {} from the machine's protected store",
@@ -425,6 +474,7 @@ pub async fn prepare_for_profile(
             client_pq_private_key: identity.pq_private_key,
             gateway_ca,
             gateway_pq_certificate,
+            gateway_ca_pq_public_key,
             minimum_mode: settings.minimum_mode,
         },
         settings.mode,
@@ -464,16 +514,13 @@ async fn resolve_remote(value: &str) -> Result<SocketAddr> {
 }
 
 fn random_identifier() -> Result<[u8; KEY_NEGOTIATION_NONCE_LEN]> {
-    use aws_lc_rs::rand::{SecureRandom as _, SystemRandom};
-
     let mut value = [0u8; KEY_NEGOTIATION_NONCE_LEN];
-    SystemRandom::new()
-        .fill(&mut value)
-        .map_err(|_| anyhow::anyhow!("system CSPRNG unavailable"))?;
+    aether::random::fill_public(&mut value)
+        .map_err(|error| anyhow::anyhow!("the approved DRBG refused: {error}"))?;
+    // A shape check, not a generator check: the DRBG above is what makes the
+    // value unpredictable, and an all-zero identifier is refused on receipt.
     if value.iter().all(|byte| *byte == 0) {
-        return Err(anyhow::anyhow!(
-            "system CSPRNG returned an invalid identifier"
-        ));
+        return Err(anyhow::anyhow!("the DRBG returned an invalid identifier"));
     }
     Ok(value)
 }

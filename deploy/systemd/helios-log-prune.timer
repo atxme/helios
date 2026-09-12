@@ -1,0 +1,10 @@
+[Unit]
+Description=Hourly Helios journal pruning
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+Unit=helios-log-prune.service
+
+[Install]
+WantedBy=timers.target

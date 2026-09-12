@@ -196,6 +196,21 @@ pub enum SpeedTestError {
     InvalidUrl(String),
     #[error("transport du speedtest impossible : {0}")]
     Transport(String),
+    #[error(
+        "la gateway ne sert pas le speedtest Helios sur le port {port} ({detail}). Soit heliosd \
+         n’a pas pu s’y lier — un autre programme l’occupe, iperf3 en écoute sur \
+         0.0.0.0:{port} étant le cas courant —, soit le service est tombé. Le journal de heliosd \
+         le dit : « raw speedtest »"
+    )]
+    ServiceAbsent { port: u16, detail: String },
+    #[error(
+        "aucune réponse de la gateway sur le port {port} ({detail}). Les paquets partent dans le \
+         tunnel et rien ne revient — ni donnée, ni refus. Soit heliosd n’écoute pas sur l’adresse \
+         du tunnel — son journal l’annonce : « raw speedtest on … » —, soit le pare-feu de la \
+         gateway n’ouvre pas ce port sur l’interface WireGuard. Sur la gateway : \
+         `ss -lntup | grep {port}` et `nft list chain inet helios input`"
+    )]
+    Unreachable { port: u16, detail: String },
     #[error("la gateway a refusé le speedtest (HTTP {status}) : {body}")]
     Rejected { status: u16, body: String },
     #[error("réponse du speedtest illisible : {0}")]
@@ -477,10 +492,10 @@ fn measure_raw_latency(target: SocketAddr) -> Result<(f64, f64, f64), SpeedTestE
             &[],
         );
         let started = Instant::now();
-        socket.send(&request).map_err(raw_transport)?;
-        let length = socket.recv(&mut response).map_err(raw_transport)?;
+        socket.send(&request).map_err(raw_udp_transport)?;
+        let length = socket.recv(&mut response).map_err(raw_udp_transport)?;
         let frame = parse_client_udp_frame(&response[..length])
-            .ok_or_else(|| SpeedTestError::BadResponse("pong UDP invalide".into()))?;
+            .ok_or_else(|| service_absent("réponse UDP illisible"))?;
         if frame.kind != aether::speedtest::UDP_KIND_PONG || frame.session != session {
             return Err(SpeedTestError::BadResponse("pong UDP inattendu".into()));
         }
@@ -593,8 +608,11 @@ fn raw_tcp_stream(
     // handshake fails. Otherwise the parent and the other streams could wait
     // forever for a peer that already returned an error.
     let prepared = (|| -> Result<TcpStream, String> {
+        // A connection that never completes is the same fact as a latency
+        // probe that never answers, and deserves the same sentence rather than
+        // « os error 10060 ».
         let mut stream = TcpStream::connect_timeout(&target, Duration::from_secs(5))
-            .map_err(|error| error.to_string())?;
+            .map_err(foreign_or_transport)?;
         stream
             .set_nodelay(true)
             .and_then(|_| {
@@ -608,13 +626,21 @@ fn raw_tcp_stream(
                 duration_secs,
                 session,
             ))
-            .map_err(|error| error.to_string())?;
+            .map_err(foreign_or_transport)?;
         let mut ready = [0u8; aether::speedtest::TCP_CONTROL_BYTES];
+        // The one place a foreign listener shows itself: the connection was
+        // accepted, our control frame went out, and the answer never came —
+        // because whatever is on this port does not speak this protocol.
         stream
             .read_exact(&mut ready)
-            .map_err(|error| error.to_string())?;
+            .map_err(foreign_or_transport)?;
         let (kind, ready_mode, ready_duration, ready_session) =
-            parse_tcp_control(&ready).map_err(|error| error.to_string())?;
+            parse_tcp_control(&ready).map_err(|error| {
+                // Sixteen bytes arrived and they are not ours. Same conclusion
+                // as a reset, reached from the other side: the port answers,
+                // and not with Helios.
+                foreign_service(&error.to_string())
+            })?;
         if (kind, ready_mode, ready_duration, ready_session)
             != (
                 aether::speedtest::TCP_KIND_READY,
@@ -1036,6 +1062,105 @@ fn next_session() -> u64 {
 
 fn raw_transport(error: std::io::Error) -> SpeedTestError {
     SpeedTestError::Transport(error.to_string())
+}
+
+/// A UDP failure, named for what it most likely is.
+///
+/// Applied to the latency probe, which is the **first** thing a run does: a
+/// gateway with no speedtest service is therefore reported before ten seconds
+/// of throughput are attempted against it.
+fn raw_udp_transport(error: std::io::Error) -> SpeedTestError {
+    if looks_like_a_foreign_listener(&error) {
+        service_absent(&error.to_string())
+    } else if looks_unanswered(&error) {
+        unreachable(&error.to_string())
+    } else {
+        SpeedTestError::Transport(error.to_string())
+    }
+}
+
+/// The rendered text of [`SpeedTestError::ForeignService`].
+///
+/// The worker threads exchange failures as strings — they cross a barrier and
+/// a `join` — so the diagnosis is rendered here rather than carried as a type
+/// and re-wrapped at every layer.
+fn foreign_service(detail: &str) -> String {
+    service_absent(detail).to_string()
+}
+
+/// The refusal that names what a reset on this port actually means.
+fn service_absent(detail: &str) -> SpeedTestError {
+    SpeedTestError::ServiceAbsent {
+        port: aether::speedtest::SPEEDTEST_PORT,
+        detail: detail.to_string(),
+    }
+}
+
+/// The refusal that names what **silence** on this port actually means.
+fn unreachable(detail: &str) -> SpeedTestError {
+    SpeedTestError::Unreachable {
+        port: aether::speedtest::SPEEDTEST_PORT,
+        detail: detail.to_string(),
+    }
+}
+
+/// Whether a failure means "the probe left and nothing came back".
+///
+/// The counterpart of [`looks_like_a_foreign_listener`], and its opposite
+/// remedy. A reset says a machine answered — something is on the port, or the
+/// host refused. Silence says the packets are being dropped, or that they are
+/// arriving where nothing is bound: on the gateway, either the firewall does
+/// not open the speedtest port on the tunnel interface, or `heliosd` bound its
+/// listeners elsewhere. Both are facts about the gateway, and neither is worth
+/// retrying from the client.
+///
+/// A connected UDP socket surfaces the exhausted read timeout as `TimedOut` on
+/// Windows (`os error 10060`) and as `WouldBlock` on Unix; `TcpStream::
+/// connect_timeout` reports its own expiry as `TimedOut` on both.
+fn looks_unanswered(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+    )
+}
+
+/// A control-channel I/O failure, named for what it most likely is.
+fn foreign_or_transport(error: std::io::Error) -> String {
+    if looks_like_a_foreign_listener(&error) {
+        foreign_service(&error.to_string())
+    } else if looks_unanswered(&error) {
+        unreachable(&error.to_string()).to_string()
+    } else {
+        error.to_string()
+    }
+}
+
+/// Whether a failure means "nothing of ours is on this port".
+///
+/// The distinction matters because the two have opposite remedies. A path
+/// problem is transient and worth retrying; a port served by something else —
+/// or by nothing at all — is a fact about the gateway, and an operator faced
+/// with « une connexion existante a dû être fermée par l’hôte distant » has
+/// no reason to go and read heliosd’s journal, which is where the answer is.
+///
+/// Both transports land here, for two different reasons that mean the same
+/// thing:
+///
+/// - **TCP**: the connection is accepted, then dies as soon as our control
+///   frame arrives — a service that speaks another protocol reading sixteen
+///   bytes of nonsense and hanging up;
+/// - **UDP**: there is no socket at all, the host answers ICMP port
+///   unreachable, and Windows surfaces that on the *next* `recv` of a
+///   connected socket as `WSAECONNRESET` — the very `os error 10054` this
+///   diagnosis exists for.
+fn looks_like_a_foreign_listener(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::BrokenPipe
+    )
 }
 
 fn udp_frame(
@@ -1607,6 +1732,41 @@ mod tests {
         sync::Mutex,
     };
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    /// Silence and a reset are different facts about the gateway.
+    ///
+    /// A reset means something answered on the speedtest port — another
+    /// service, or the host refusing. A timeout means the probe left and
+    /// nothing came back at all: the packets are dropped, or they arrive where
+    /// nothing is bound. The operator's next move differs, so the two must not
+    /// share a sentence — and neither may be reported as a bare `os error`.
+    #[test]
+    fn a_gateway_that_never_answers_is_named_rather_than_reported_as_an_os_error() {
+        for kind in [std::io::ErrorKind::TimedOut, std::io::ErrorKind::WouldBlock] {
+            let error = raw_udp_transport(std::io::Error::new(kind, "os error 10060"));
+            assert!(
+                matches!(error, SpeedTestError::Unreachable { port, .. }
+                    if port == aether::speedtest::SPEEDTEST_PORT),
+                "{kind:?} must be named unreachable, got {error}"
+            );
+            assert!(error.to_string().contains("pare-feu"));
+        }
+
+        let reset = raw_udp_transport(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "os error 10054",
+        ));
+        assert!(matches!(reset, SpeedTestError::ServiceAbsent { .. }));
+
+        // Anything else keeps its own words: inventing a diagnosis for a
+        // failure we have not identified would send the operator to the wrong
+        // machine.
+        let other = raw_udp_transport(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "refusé",
+        ));
+        assert!(matches!(other, SpeedTestError::Transport(_)));
+    }
 
     #[tokio::test]
     async fn adaptive_engine_uses_latency_and_both_transfer_directions() {

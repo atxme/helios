@@ -1,6 +1,10 @@
 use std::time::SystemTime;
 
-use aether::{key_negotiation::ProtectionMode, NetworkConfig, OrchestratorCmd, WgPeer};
+use aether::{
+    certificates::encoding::DerCertificate,
+    key_negotiation::{PqCertificate, ProtectionMode},
+    NetworkConfig, OrchestratorCmd, WgPeer,
+};
 use axum::{extract::State, http::StatusCode, Json};
 use helios_firewall::ruleset;
 use helios_wireguard::PeerStatus;
@@ -18,6 +22,9 @@ pub struct StatusResponse {
     pub lan_ifaces: Vec<String>,
     pub wg_peers: Vec<String>,
     pub allow_ssh_from: Vec<String>,
+    /// Out-of-band administration interfaces, so an operator can see the way
+    /// back in without reading `network.toml` on the gateway.
+    pub admin_ifaces: Vec<String>,
     pub peers: Vec<PeerSummary>,
     pub wg_iface: String,
     pub wg_listen_port: Option<u16>,
@@ -115,6 +122,12 @@ pub struct NetworkConfigView {
     pub wan_ifaces: Vec<String>,
     pub lan_ifaces: Vec<String>,
     pub allow_ssh_from: Vec<String>,
+    /// Exposed for the same reason as [`Self::allow_dhcp_on_wan`], and the
+    /// cost of omitting it is higher: a view that dropped it would erase the
+    /// out-of-band administration path on the first config reload from the
+    /// UI, and the gateway would become unreachable at the next restart of
+    /// `heliosd` — precisely the failure this field exists to prevent.
+    pub admin_ifaces: Vec<String>,
     /// Deliberately exposed: it isn't a secret, and a view that omitted it
     /// would drop the field back to `false` on the first config reload from
     /// the UI — the gateway would lose its lease hours later, with nothing
@@ -159,6 +172,7 @@ impl From<&NetworkConfig> for NetworkConfigView {
             wan_ifaces: config.wan_ifaces.clone(),
             lan_ifaces: config.lan_ifaces.clone(),
             allow_ssh_from: config.allow_ssh_from.clone(),
+            admin_ifaces: config.admin_ifaces.clone(),
             allow_dhcp_on_wan: config.allow_dhcp_on_wan,
             allow_client_internet: config.allow_client_internet,
             admin_iface: config.admin_iface.clone(),
@@ -311,6 +325,7 @@ pub async fn status(State(s): State<AppState>) -> Json<StatusResponse> {
         lan_ifaces: network.lan_ifaces.clone(),
         wg_peers: network.wg_peers(),
         allow_ssh_from: network.allow_ssh_from.clone(),
+        admin_ifaces: network.admin_ifaces.clone(),
         peers,
         wg_iface: network.wg_iface.clone(),
         wg_listen_port: policy.wg_listen_port,
@@ -429,6 +444,18 @@ pub struct PeerAdmitRequest {
     /// Persistent anti-downgrade floor.
     #[serde(default)]
     pub minimum_key_negotiation_mode: Option<ProtectionMode>,
+    /// The client's TLS leaf itself, DER in base64.
+    ///
+    /// The fingerprints above are what `network.toml` pins; these two are what
+    /// the certificate registry records, and it needs the objects rather than
+    /// their digests — it verifies signatures made by them (spec §13.1). They
+    /// are optional so a gateway without a trust domain keeps admitting peers
+    /// exactly as before; supplied, they must agree with the fingerprints.
+    #[serde(default)]
+    pub key_negotiation_certificate: Option<String>,
+    /// The client's ML-DSA-87 leaf, its JSON document in base64.
+    #[serde(default)]
+    pub key_negotiation_pq_certificate: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -470,10 +497,105 @@ pub async fn peer_admit(
         minimum_mode,
     )
     .map_err(admission_status)?;
+
+    // The certificate registry **before** the configuration is written: a peer
+    // in `network.toml` with no registry row is a client that connects and can
+    // never renew, and nothing later says so. The reverse — a row for a peer
+    // whose admission then failed to persist — is caught by the next
+    // admission, which is idempotent for an unchanged peer.
+    register_first_generation(&s, &body, &peer).await?;
+
     apply_network(&s, updated).await?;
 
     tracing::info!(peer = %peer.name, vip = %peer.address, admin = peer.admin, "peer admitted");
     Ok(Json(PeerSummary::from_config(&peer)))
+}
+
+/// Hands the peer's first generation to the certificate registry.
+///
+/// Three outcomes, and they are deliberately different: no trust domain means
+/// nothing to record and the admission stands; a trust domain with no
+/// certificates supplied is an admission that will not be able to renew, and
+/// it is refused rather than left to be discovered later; anything else is the
+/// registry's own answer.
+async fn register_first_generation(
+    s: &AppState,
+    body: &PeerAdmitRequest,
+    peer: &aether::WgPeer,
+) -> Result<(), (StatusCode, String)> {
+    use base64::Engine as _;
+
+    let Some(handler) = s.trust_update.as_ref() else {
+        return Ok(());
+    };
+    let decoder = base64::engine::general_purpose::STANDARD;
+    let (Some(tls), Some(pq)) = (
+        body.key_negotiation_certificate.as_deref(),
+        body.key_negotiation_pq_certificate.as_deref(),
+    ) else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "this gateway holds a trust domain, so admission also takes the client's two              certificates — the registry records the leaves themselves, not their digests.              `helios-ctl enroll` sends them; a caller that cannot must admit on a gateway              without a trust domain."
+                .to_string(),
+        ));
+    };
+    let tls = decoder
+        .decode(tls.trim())
+        .ok()
+        .and_then(|der| DerCertificate::new(der).ok())
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            "the client TLS certificate is not base64 DER".to_string(),
+        ))?;
+    let pq: PqCertificate = decoder
+        .decode(pq.trim())
+        .ok()
+        .and_then(|json| serde_json::from_slice(&json).ok())
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            "the client PQ certificate is not a base64 JSON document".to_string(),
+        ))?;
+
+    // Both halves of the same identity, checked against what admission just
+    // pinned. Recording a leaf the peer table does not name would give the
+    // gateway two answers about which certificate belongs to this peer.
+    let declared_tls = peer
+        .key_negotiation_certificate_sha256
+        .as_deref()
+        .unwrap_or_default();
+    let declared_pq = peer
+        .key_negotiation_pq_certificate_sha256
+        .as_deref()
+        .unwrap_or_default();
+    if tls.fingerprint().to_hex() != declared_tls {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "the TLS certificate does not hash to the fingerprint this admission pins".to_string(),
+        ));
+    }
+    let pq_fingerprint =
+        aether::certificates::gateway::pq_certificate_fingerprint(&pq).map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                "the PQ certificate cannot be canonically encoded".to_string(),
+            )
+        })?;
+    if pq_fingerprint.to_hex() != declared_pq {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "the PQ certificate does not hash to the fingerprint this admission pins".to_string(),
+        ));
+    }
+
+    handler
+        .admit_peer(&peer.name, &peer.public_key, tls, Box::new(pq))
+        .await
+        .map_err(|refusal| {
+            (
+                StatusCode::from(refusal),
+                "the certificate registry refused this peer's first generation".to_string(),
+            )
+        })
 }
 
 /// Removes a peer from admission.

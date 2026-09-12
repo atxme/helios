@@ -302,6 +302,71 @@ gateway ne protège pas Orion : deux machines, deux modèles de menace. nftables
 sur l'appliance empêche le LAN *derrière la gateway* de fuir ; il ne fait rien
 pour un portable sur le Wi-Fi d'un café.
 
+### 3 ter. Mode de maintenance distant sans pare-feu Helios
+
+Le déploiement distant dispose d'un mode d'exploitation temporaire et explicite,
+`deploy.sh --sans-firewall`. Il ne simule ni WireGuard ni le TPM : le démon
+reste en mode réel, mais sélectionne le backend
+`FirewallDisabledBackend`, qui supprime atomiquement la seule table
+`inet helios` et la maintient absente à chaque transition. Il ne touche pas aux
+tables d'un overlay d'administration tel que NordVPN ou Tailscale.
+
+Ce mode est une dérogation opérateur, jamais un repli. Une erreur du backend
+Netlink normal reste fatale et ne peut pas l'activer. Le choix vit dans un
+drop-in systemd séparé de l'unité signée, survit donc à une mise à jour
+applicative et apparaît dans les journaux ainsi que dans le témoin de
+disponibilité (`firewall_enforced=false`). La commande `--avec-firewall` retire
+explicitement le drop-in ; un déploiement sans l'une de ces deux options
+préserve l'état existant.
+
+`--sans-firewall` saute Astra : une opération de maintenance destinée à
+stabiliser la gateway ne doit pas enchaîner avec le déploiement indépendant de
+l'autorité. Tant que ce mode est actif, Helios ne garantit plus le fail-closed
+du trafic relayé ; il ne doit donc pas devenir une configuration nominale.
+
+### 3 quater. Accès d'administration hors-bande : `admin_ifaces`
+
+**La gateway est administrée à distance, sans accès LAN.** C'est une donnée du
+déploiement, pas une hypothèse de confort : l'opérateur n'est pas sur le réseau
+de la gateway et n'y reviendra pas. Trois chemins existent, et seulement trois —
+l'API Helios dans le tunnel pour le nominal, Tailscale et NordVPN Meshnet pour
+la reprise en main. Les deux derniers sont les seuls qui survivent à un
+`heliosd` arrêté.
+
+Il en découle un invariant : **le pare-feu ne doit jamais fermer les interfaces
+de ces deux overlays.** Ce sont elles qui portent la réparation quand Helios est
+ce qui est cassé, et un kill-switch qui emporte le moyen de le lever transforme
+une panne en déplacement physique.
+
+`admin_ifaces` nomme ces interfaces. SSH y est accepté dans **tous** les états
+du tunnel, `Down` et `Connecting` compris. Le déploiement les retient **toutes**
+plutôt que la seule qui porte la session courante : n'en garder qu'une
+réintroduit un point de défaillance unique là où il est le moins acceptable.
+
+**Filtré par interface, jamais par adresse.** L'argument de sécurité est celui
+de `allow_ssh_over_tunnel` : seul le démon de l'overlay pose des paquets sur son
+interface, et seulement après avoir authentifié le pair, donc un `iifname`
+n'est pas satisfaisable par une source falsifiée depuis le WAN — ce qu'une
+entrée de `allow_ssh_from` est. L'argument d'exploitation est propre aux
+overlays : un overlay n'a pas *une* adresse. Tailscale en porte une v4 et une
+v6, celle de NordVPN suit le serveur choisi, et les deux se réattribuent sans
+préavis. Une liste d'adresses cesse donc de correspondre le jour où l'adresse
+bouge, c'est-à-dire le jour où le chemin de secours sert.
+
+`admin_ifaces` ne peut nommer ni l'interface Helios — c'est
+`allow_ssh_over_tunnel`, que l'opérateur ouvre délibérément — ni une interface
+WAN, qui exposerait SSH à l'Internet. `NetworkConfig::validate` refuse les deux.
+
+**Corollaire : `allow_ssh_from` refuse une adresse du réseau du tunnel.** Le
+verrouillage du 1er septembre 2026 en est la raison. Un déploiement lancé *à
+travers* le tunnel Helios a lu sa propre adresse source — un VIP de pair, car
+l'adresse visée tombait dans le `100.64.0.0/10` que Helios route — et a épinglé
+SSH dessus. La règle n'a tenu que le temps du tunnel : au redémarrage de
+`heliosd`, celui-ci est tombé et a emporté la seule source SSH autorisée. Une
+règle d'accès de secours qui dépend du service qu'elle doit permettre de
+réparer n'est pas un accès de secours ; `validate` la refuse désormais, et
+`target-bootstrap.sh` refuse de l'écrire.
+
 ### 4. Provisioning : reconstruire ce qu'IKEv2 donnait gratuitement
 
 C'est le vrai coût de la bascule, et le seul chantier réellement neuf.

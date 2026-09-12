@@ -1,6 +1,6 @@
 [package]
 name = "xtask"
-version = "0.3.1"
+version = "0.4.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -11,14 +11,12 @@ publish = false
 name = "xtask"
 path = "src/main.rs"
 
+[lib]
+path = "src/lib.rs"
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-# Empreintes du contenu et lecture du manifeste : le même code que celui qui
-# vérifie à l'installation, pour que la fabrique ne puisse pas produire un
-# bundle que l'installateur refuserait.
 helios-update.workspace = true
-aether.workspace = true
-serde_json.workspace = true
 reqwest = { workspace = true, features = ["blocking"] }
 zip = { version = "=4.6.1", default-features = false, features = ["deflate"] }

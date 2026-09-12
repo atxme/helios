@@ -123,7 +123,14 @@ poste et la négociation avec une gateway réelle.
 13. Une `release_sequence` inférieure ou égale à la dernière confirmée est
    refusée, y compris avec des signatures valides.
 14. Un binaire installé qui n’atteint pas son point de disponibilité rend la
-   main à la version précédente.
+    main à la version précédente.
+
+Le mode explicite `--unsafe-disable-firewall` est testé séparément de ces
+invariants nominaux : il exige toujours les backends WireGuard/TPM réels,
+supprime `inet helios` par une transaction idempotente `Add → Del`, publie
+`firewall_enforced=false` et n'est jamais sélectionné après une erreur du
+backend Netlink. Le drop-in posé par `deploy.sh --sans-firewall` survit à une
+mise à jour applicative ; seul `--avec-firewall` le retire.
 
 Lorsqu’un bug de sécurité est corrigé, ajouter d’abord un test qui échoue avec
 l’ancien comportement et le garder comme test de non-régression.
@@ -197,6 +204,27 @@ Valider avec accès console :
   trois modes, un certificat client non lié, un ciphertext altéré, la fermeture
   avant confirmation, le timeout, puis un handshake réussi avec le PSK négocié
   et l’ACK de commit ;
+- réparation sur redémarrage de gateway (§12.5) : tunnel `ml_kem` monté,
+  `systemctl restart heliosd`, puis **ne rien faire**. Le journal client doit
+  annoncer « renégociation 1/3 » en nommant le handshake vieilli, et le tunnel
+  doit reporter du trafic en moins de trois minutes sans geste de
+  l'utilisateur. Le contre-essai compte autant : gateway éteinte pour de bon,
+  trois renégociations puis un tunnel en erreur — pas une boucle. Et le même
+  redémarrage sur un profil `static_psk` ne doit déclencher **aucune**
+  renégociation : ce slot est relu depuis `network.toml` ;
+- migration du manifeste de coffre v4 → v5 : installer par-dessus un Orion qui
+  détient déjà des profils scellés, sans en réimporter aucun. Chaque profil doit
+  s'ouvrir, afficher son type — `helios_key_negotiation` pour ceux qui portent un
+  bloc — et se connecter comme avant. Puis enregistrer une modification anodine
+  et vérifier au redémarrage suivant que le type est **toujours** le même : c'est
+  le scellement en v5 qui écrit l'inférence, et une réponse qui changerait entre
+  deux lectures serait exactement la panne que le discriminant supprime ;
+- désinstallation d'un profil monté (§12.2) : supprimer le profil dont le
+  tunnel est up. La gateway doit journaliser le `release` **avant** que
+  l'adaptateur tombe, et `wg show` doit y montrer le slot vidé tout de suite —
+  pas cinq minutes plus tard par la récupération. L'ordre est ce qui est
+  éprouvé : le message voyage dans le tunnel et est signé par l'identité du
+  profil, donc supprimer d'abord ne libère rien ;
 - identité key-negotiation : `heliosd init-key-negotiation` scelle réellement la
   clé serveur, refuse l’écrasement sans `--rotate` et redémarre avec le même
   certificat et la même clé descellée ;
@@ -276,11 +304,21 @@ Valider avec accès console :
   qu'au redémarrage le journal passe de « no certificate registry » à
   « certificate lifecycle ready ».
 
+  Pour un registre historique créé sans `--client-tls-ca`, vérifier daemon
+  arrêté que `heliosd repair-client-tls-ca-bootstrap` remplace la CA opérateur
+  par la CA-TLS du relais tout en conservant les pairs, leurs certificats PQ,
+  les révocations et les distributions en attente. La répétition doit être
+  idempotente ; une génération cliente supérieure à 1, un candidat, un
+  successeur ou une rotation d'ancre en cours doit refuser toute écriture.
+
   Le conteneur lui-même : rootfs en lecture seule effectif (une écriture hors
   `/var/lib/astra` et `/tmp` doit échouer), aucune capacité, UID 10001, et le
   volume d'état seul montage. Restaurer une sauvegarde du volume dont la tête
-  d'audit diffère de `--expected-audit-head` doit **refuser le démarrage** —
-  c'est la seule chose qui distingue une restauration d'un fork.
+  d'audit diffère de `--expected-audit-head` doit **refuser le démarrage**, sauf
+  l'extension composée exclusivement des anciennes entrées
+  `StatusPublished` produites par une lecture de statut — celles-ci sont une
+  compatibilité de migration et ne constituent pas une décision d'autorité.
+  Toute autre entrée après le témoin reste un fork et doit être refusée.
 
 - **uplinks multiples** (`wan_iface = "auto"`), sur une machine qui a les deux
   liens. C'est la bascule qu'il faut éprouver, pas le choix :
@@ -679,6 +717,31 @@ sont pas observables ailleurs.
 | tunnel Meshnet sain mais services et routage incomplets | Helios n'ouvrait que SSH en entrée et ne produisait aucune règle `forward`. TCP 49111 couvre désormais Nord Fileshare ; les listes `traffic_routing_peer_cidrs` et `local_network_peer_cidrs`, relues depuis les ensembles de permissions NordVPN au déploiement, bornent le routage pair par pair |
 | arrêt de `heliosd` figé après le retrait de `helios0` | le serveur brut de mesure attendait indéfiniment dans un `spawn_blocking`; Tokio attend les tâches bloquantes à la destruction du runtime, donc systemd finissait par tuer le démon après son délai. Les sockets TCP/UDP observent désormais un signal d'arrêt testé |
 
+### Boucle de mise à jour sur gateway en service (1er septembre 2026)
+
+Une activation poussée depuis la console d'administration a laissé la gateway
+en redémarrage toutes les 30 s pendant une heure. Trois défauts indépendants,
+dont deux que le premier masquait.
+
+| Défaut | Effet |
+| --- | --- |
+| `/run/helios` absent du bac à sable de `helios-update.service` | `ReadWritePaths` ne monte rien pour un répertoire qui n'existe pas au montage, **sans le dire**, et `ProtectSystem=strict` laisse alors `/run` en lecture seule. Le répertoire appartient au démon, qui le détruit à chaque arrêt — dont celui que l'installateur déclenche lui-même. Le retrait du marqueur échouait en `EROFS`, et l'erreur du rollback masquait celle d'origine. Les deux unités déclarent désormais `RuntimeDirectory=helios` et `RuntimeDirectoryPreserve=yes` |
+| activation non consommée quand le rollback échoue | `helios-update.path` redéclenche sur la seule existence de `activate.json` : une mise à jour ratée redémarrait la gateway indéfiniment. L'activation est maintenant consommée **avant** la tentative de restauration, et l'erreur d'origine n'est plus effacée par celle du rollback |
+| release étiquetée avec la version du workspace | `xtask pack` lisait `[workspace.package] version` (`0.1.0`) alors que le marqueur de disponibilité porte celle du crate `heliosd` (`1.12.0`) : le contrôle de santé comparait deux numéros différents pour la même release et ne pouvait jamais aboutir. L'étiquette vient désormais de `crates/heliosd/Cargo.toml`, avec test de non-régression |
+
+Vérification cible, après déploiement des unités corrigées :
+
+```sh
+sudo systemd-run -q --wait --pipe --collect --service-type=oneshot \
+    -p ProtectSystem=strict -p RuntimeDirectory=helios \
+    -p RuntimeDirectoryPreserve=yes \
+    /bin/sh -c 'touch /run/helios/.probe && rm /run/helios/.probe && echo RW-OK'
+# attendu : RW-OK
+```
+
+Un `Read-only file system` signifie que l'unité installée est antérieure au
+correctif : le bac à sable est le seul endroit où l'écart se voit.
+
 Vérification cible du second, après déploiement :
 
 ```sh
@@ -742,7 +805,64 @@ dernier effet exige la gateway réelle.
     C’est ainsi qu’ont été validés `OpenProcessToken` (dans `System::Threading`,
     pas `Security`) et le `dwflags: OBJECT_SECURITY_INFORMATION` de
     `NCryptGetProperty`. Seule une compilation sur cible fait foi ;
-- la récupération signée attend l’arbitrage du compteur monotone ;
+- **le renouvellement de certificat ne se boucle pas en WSL2**, et pour la même
+  raison : ses deux écritures locales scellent des clés privées. `open_or_seed`,
+  la construction et la double signature de la requête, la vérification du
+  grant, la pose du candidat et le commit sont tous éprouvés hors matériel —
+  `crates/orion-core/src/certificate_renewal.rs`, quatorze essais dont un qui
+  fait émettre une vraie `CA-TLS` **depuis la CSR que le client a produite**.
+  Ce qui n’est pas exercé ici est le scellement du candidat sous
+  `<identité>-next` et sa promotion à l’activation : les deux passent par
+  `ProtectedIdentityStore`, donc par DPAPI. Un renouvellement complet est donc
+  une recette cible : Orion sous Windows, tunnel monté, gateway avec Astra
+  déployé, et `astra-signer approve --heliosd-url … --operation-id …` lancé sur
+  la même machine avec la clé branchée. Le transport du compagnon, lui,
+  s’éprouve hors matériel contre une gateway factice
+  (`tools/astra-signer/tests/tunnel.rs`). **Ce que cette recette doit vérifier
+  en dernier**, et qui est l’acceptation réelle du renouvellement : que le
+  client **rouvre le tunnel après l’activation**. Tout le reste peut réussir et
+  laisser un poste enfermé dehors à la fin du chevauchement — c’est précisément
+  ce que la chaîne `[feuille, intermédiaire]` scellée par `candidate_bundle` et
+  l’ensemble d’émetteurs lu dans le registre existent pour éviter, et hors
+  matériel on n’en prouve que la logique ;
+- **le sidecar opérateur d'Orion ne s'exerce pas en WSL2** : aucun passthrough
+  USB, et le transport plateforme est propre à Windows. Hors matériel, les
+  tests couvrent le protocole IPC borné, le manifeste typé, l'ordre strict des
+  révisions et la collecte de chaque assertion pendant que sa clé physique est
+  encore branchée. La recette Windows part de l'installateur produit, vérifie
+  que `helios-astra-helper.exe` est installé à côté d'Orion et absent du
+  `PATH`, puis exerce d'abord les refus : sidecar absent, fenêtre propriétaire
+  impossible, jeton absent, session périmée et seconde clé identique. Elle
+  termine par une récupération complète et une campagne de certificats clients,
+  avec apparition au premier plan de chaque boîte WebAuthn. Pour éprouver le
+  séquençage réel, la recette laisse d'abord Orion afficher le manifeste, puis
+  utilise le bouton de confirmation qui déclenche la clé : le droit de premier
+  plan doit être transmis sur ce second clic, et de nouveau avant la seconde
+  clé d'une campagne ;
+- **l’aléa se vérifie par sa gestion, pas par son moteur.** `aether::random`
+  n’implémente aucun DRBG : il appelle `aws_lc_rs::rand::SystemRandom`, refuse
+  fermement quand celui-ci échoue, et journalise au démarrage fournisseur,
+  version, mécanisme, `use_df` et intervalle de reseed. Les tests couvrent ce
+  qui est du ressort du dépôt — refus sans octet produit quand le fournisseur
+  échoue, refus d’un bloc entièrement nul à la sonde de démarrage, borne par
+  appel, propagation vers `fips204`, profil annoncé tenant sous le plafond de
+  `2^20` — au moyen d’un faux fournisseur déterministe, **thread-local**, qu’aucun
+  binaire livré ne peut sélectionner. Un test épingle en outre le **profil
+  annoncé** — mécanisme, `use_df`, intervalle de reseed, résistance à la
+  prédiction — pour qu’une bannière qui divergerait de la source AWS-LC embarquée
+  casse un test au lieu de devenir silencieusement fausse. Ce qui relève du
+  fournisseur ne s’éprouve pas ici et n’a pas à l’être : le CTR-DRBG-AES-256, son
+  reseed à 4096 générations, sa réinstanciation après fork ou reprise
+  d’instantané et son `abort()` sur échec d’entropie sont dans le code AWS-LC
+  embarqué (`crypto/fipsmodule/rand`, `crypto/ube`). L'instanciation sans DF à
+  seed de pleine entropie est admise par les spécifications. Les tirages
+  secrets utilisent l'entrée native
+  `RAND_bytes_with_user_prediction_resistance`, avec matériau issu du DRBG
+  public séparé ; le canal privé rustls sélectionne AWS-LC explicitement.
+  L’écart restant est le **matériel de session TLS** des autres chemins
+  `rustls`/`quinn`, encore sur le CSPRNG de `ring`. La **validation FIPS est hors périmètre** — la
+  construction `aws-lc-fips-sys` exige Go (« Go is required for FIPS »), et aucun
+  déploiement d’Helios ne revendique de certificat ;
 - **le cycle de vie des certificats est vérifié en logique, pas en
   exploitation.** `aether::certificates`, le registre gateway, le magasin Orion
   et le binaire `astra` sont couverts par des tests déterministes qui prennent

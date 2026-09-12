@@ -267,7 +267,7 @@ Depuis le poste opérateur, une seule commande produit les deux fichiers de
 configuration :
 
 ```sh
-./scripts/key-negotiation-setup.sh christophe@192.168.1.44 --nom portable
+./scripts/key-negotiation-setup.sh christophe@100.72.220.76 --nom portable
 ```
 
 Pour **ajouter la négociation à un profil Orion déjà en place**, repartir de sa
@@ -500,6 +500,33 @@ La recette de sécurité attendue est :
 Le provisioning ML-KEM peut être testé au niveau protocole, mais son PSK ne doit
 pas être considéré comme installé automatiquement tant que le câblage atomique
 du plan de données gateway n'est pas terminé.
+
+## Le speedtest ne répond pas
+
+Orion affiche « aucune réponse de la gateway sur le port 51822 » : les paquets
+partent dans le tunnel et rien ne revient. Deux causes, deux vérifications sur
+la gateway.
+
+```sh
+# 1. heliosd écoute-t-il, et sur la bonne adresse ?
+ss -lntup | grep 51822  # attendu : 100.64.0.1:51822, pas 127.0.0.1:51822
+journalctl --namespace=helios -u heliosd | grep 'raw speedtest'
+
+# 2. le pare-feu ouvre-t-il le port sur l'interface du tunnel ?
+nft list chain inet helios input | grep 51822
+# attendu : deux règles `iifname "helios0" ... dport 51822 accept`
+```
+
+Une écoute sur `127.0.0.1` signifie que la gateway a démarré sans identité
+WireGuard : l'adresse du tunnel n'existait pas, et le service s'est replié sur
+la boucle locale jusqu'au prochain démarrage.
+
+À ne pas confondre avec un port **occupé** : là, Orion dit que la gateway ne
+sert pas le speedtest (un refus, `os error 10054`), et
+`ss -lntup | grep 51822` nomme le programme fautif. Le service Helios utilise
+précisément `51822` afin de ne plus entrer en conflit avec iperf3, dont le port
+par défaut est `5201`. Le silence est un problème de joignabilité, le refus un
+problème d'occupation.
 
 ## Recouper le speedtest avec `iperf3`
 

@@ -25,30 +25,44 @@
 //!
 //! # Limites connues
 //!
-//! Three parts of ADR-008 are specified here and not implemented, and are
-//! refused explicitly rather than approximated:
+//! One route of ADR-008 is not implemented, and is refused explicitly rather
+//! than approximated: **opening a campaign from the public origin**. The
+//! approval itself is live in both directions — in the tunnel through
+//! [`renewal`], and out of it through [`signing`] and the three
+//! capability-bound routes of §8.2. What stays `501` is `POST /v1/campaigns`,
+//! because §11.6 has that route *resolve* a campaign over the fleet's current
+//! targets: on an unauthenticated public route, that answers every caller with
+//! the domain's inventory, and the authentication it would need is not settled
+//! anywhere. `astra campaign open` and `astra revocation open` do the
+//! resolution locally instead.
 //!
-//! - the **operator credential layer** — FIDO2 `hmac-secret` key slots, the
-//!   `astra-signer` companion, the one- and two-credential approval policies.
-//!   It needs a physical authenticator, which no WSL2 build can provide. The
-//!   routes that would use it answer `501` through
-//!   [`service::ServiceError::OperatorCredentialUnavailable`];
-//! - the **private veth channel** to `heliosd` and its mutually authenticated
-//!   TLS 1.3 transport. Ordinary renewals do not need it — they travel in the
-//!   client's own WireGuard tunnel — but the recovery of an expired identity
-//!   does, so that path is not yet reachable end to end;
-//! - the **encrypted HVLT vault** and its backup, which belong with the
-//!   credential layer.
+//! Both directions of the private veth channel are served. [`gateway`] dials
+//! `heliosd`'s `/internal/v1/certificates/*` listener under mutually
+//! authenticated TLS 1.3 with pinned identities, no resumption and no 0-RTT,
+//! and `astra run` opens it — and checks its pin — at startup; the reverse
+//! relay of the 15 August 2026 amendment, in which `heliosd` forwards an
+//! active Orion's canonical request, is [`renewal::router`] on
+//! `ASTRA_PRIVATE_BIND`. Its absence is a degraded authority, not a dead one:
+//! the public endpoint comes up either way and the gateway answers `503` to
+//! every client renewal.
 //!
 //! See [`docs/testing/TESTING.md`](../../../docs/testing/TESTING.md) for what
 //! a WSL2 build does and does not prove.
 
 pub mod audit;
+pub mod chain;
+pub mod distribution;
+pub mod gateway;
 pub mod issuer;
+pub mod operations;
+pub mod operator;
 pub mod planner;
+pub mod reconciliation;
+pub mod recovery;
 pub mod registry;
+pub mod renewal;
 pub mod service;
-pub mod vault;
+pub mod signing;
 
 pub use audit::{AuditChain, AuditEvent};
 pub use issuer::DelegatedIssuer;

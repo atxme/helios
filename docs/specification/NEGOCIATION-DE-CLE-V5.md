@@ -68,19 +68,48 @@ un **contrat à finir d'implémenter**, pas une description du système.
 > WireGuard de la requête étant vérifiée contre le pair résolu au lieu de
 > servir elle-même de clé de recherche.
 >
-> **Ce qui n'est pas implémenté**, au 2026-08-08 :
+> **Ce qui n'est pas implémenté**, au 2026-08-16 :
 >
-> - le **discriminant de type de profil Orion**
->   ([§19](#19-fin-des-chemins-hérités), [§22](#22-correspondance-avec-le-code)).
->   `classic` est bien refusé à la validation d'une requête v5 et à la
->   préparation — serde le décode, `validate()` le rejette, et aucun message v5
->   ne peut donc le sélectionner. Mais la variante subsiste dans
->   `ProtectionMode`, et un profil Orion reste un bloc `key_negotiation`
->   **facultatif** au lieu de l'union explicite `ClassicWireGuard` /
->   `HeliosKeyNegotiation`. L'absence du bloc peut donc encore signifier
->   implicitement « profil classique ». La retirer entièrement est une migration
->   de format : `network.toml` (`minimum_key_negotiation_mode = "classic"`), le
->   document `.orion`, le manifeste de coffre (`mode_id = 0`) et les deux IHM.
+> - la **validation du fournisseur d'aléa** du §4.3. Le reste de l'alignement
+>   cryptographique du 16 août est livré : toute signature ML-DSA-87 passe par
+>   `aether::ml_dsa`, qui exige le `ctx` non vide du §8, refuse un contexte
+>   vide, celui d'un autre type, un NUL ou un octet non imprimable, et refuse
+>   un message qui ne s'ouvre pas sur son domaine — le préfixe interne et le
+>   contexte externe sont deux contrôles distincts, tous deux appliqués. Une
+>   signature HashML-DSA ne vérifie pas sous ce chemin, et aucun appel n'emprunte
+>   une variante préhachée. Tout tirage passe de même par `aether::random`,
+>   qui ne contient **aucun** état DRBG : c'est une adaptation de type vers le
+>   fournisseur, un refus ferme quand il échoue, et la bannière de démarrage que
+>   ce paragraphe exige. La source est `aws_lc_rs::rand::SystemRandom` — le
+>   `RAND_bytes` d'AWS-LC déjà employé pour AES-GCM, HKDF et HMAC : CTR-DRBG-AES-256
+>   avec DF, état par thread, reseed toutes les 4096 générations, et
+>   réinstanciation avant toute sortie après fork ou reprise d'instantané, ce
+>   qui est précisément pourquoi le module n'a pas de détection de fork à lui.
+>   La validation CAVP/ACVP est hors périmètre et rien ne la revendique.
+>   Reste ouverte la **résistance à la prédiction par appel**, présente dans
+>   l'API C d'AWS-LC mais absente du binding Rust ; la réaliser au-dessus
+>   reviendrait à détenir ici l'état DRBG que ce même paragraphe interdit ;
+>
+>   **Migration** : le `ctx` entre dans la vérification, donc tout certificat PQ
+>   émis avant ce changement cesse de vérifier. Un parc existant se ré-émet
+>   (`scripts/provision-client.sh`, `heliosd init-key-negotiation --rotate`) ;
+> - la variante `classic` de `ProtectionMode`
+>   ([§19](#19-fin-des-chemins-hérités), [§22](#22-correspondance-avec-le-code)),
+>   qui subsiste dans le type. Elle est bien refusée à la validation d'une
+>   requête v5 et à la préparation — serde la décode, `validate()` la rejette,
+>   et aucun message v5 ne peut donc la sélectionner — et elle doit subsister
+>   pour relire un `network.toml` existant. La retirer entièrement reste une
+>   migration de `network.toml` (`minimum_key_negotiation_mode = "classic"`) et
+>   de l'octet `mode_id = 0` du manifeste de coffre.
+>
+>   Le **discriminant de type de profil Orion**, lui, est livré : un profil
+>   déclare `type = "classic"` ou `type = "helios_key_negotiation"`, le document
+>   `.orion` le porte, le manifeste de coffre le scelle en v5, l'écran *Profils*
+>   le montre, et le chemin de connexion lit le type déclaré au lieu de la
+>   présence du bloc. Les deux formes sont exclusives et la contradiction est
+>   refusée. L'inférence historique ne survit qu'à la lecture d'un manifeste
+>   antérieur à la v5 ou d'un document antérieur à §19, s'applique une fois, et
+>   le prochain scellement écrit la réponse.
 >   Ce qui débloquerait : écrire cette migration et son chemin de relecture des
 >   documents déjà émis ;
 > - le **renouvellement de PSK en place** ([§12.3](#123-politique-de-renouvellement)),
@@ -90,20 +119,9 @@ un **contrat à finir d'implémenter**, pas une description du système.
 >   découvrir un défaut de conception à travers une implémentation qui le
 >   masque. Conséquence : un PSK vit jusqu'à son échéance de 24 h, puis la
 >   gateway le retire ;
-> - la **renégociation d'Orion sur vieillissement du handshake**
->   ([§12.5](#125-redémarrage-de-la-gateway)). La gateway récupère bien son
->   slot à 300 s, mais rien ne prévient le client : après un redémarrage de
->   `heliosd`, le tunnel meurt au rekey suivant sans se réparer seul ;
 > - l'**enrôlement sans clé privée et sa signature opérateur**
 >   ([§15](#15-enrôlement)). `helios-ctl enroll` distribue encore l'identité
 >   cliente comme en v4, avec le document `.orion` secret que cela implique ;
-> - la **libération à la désinstallation d'un profil**
->   ([§12.2](#122-cycle-de-vie-du-psk)). Le `release` du
->   [§7.5](#75-libération-signée-dans-le-tunnel) est bien envoyé dans le tunnel
->   à la déconnexion, mais retirer un profil pendant que son tunnel est monté
->   ne l'envoie pas : le slot reste posé jusqu'à la récupération à 300 s. Ce
->   qui débloquerait : donner au chemin de suppression de profil l'accès au
->   contrôleur, qui seul détient le reçu de commit ;
 > - tout le **cycle de vie des certificats**
 >   ([ROTATION-CERTIFICATS](ROTATION-CERTIFICATS.md)) : la leaf PQ gateway
 >   est encore auto-signée, il n'y a ni slot actif/suivant, ni génération
@@ -467,7 +485,7 @@ SHA-256 de la sérialisation `serde_json` n'est plus acceptée ; voir
 | champs inconnus | refusés par `deny_unknown_fields` |
 | longueur transaction / nonce | 16 octets |
 | longueur du challenge gateway | 32 octets |
-| source aléatoire | CSPRNG système, voir [§4.3](#43-exigences-sur-laléa) |
+| source aléatoire | DRBG SP 800-90A à 256 bits de la bibliothèque cryptographique, voir [§4.3](#43-exigences-sur-laléa) |
 | taille maximale d'un datagramme QUIC | 1200 octets |
 | découverte de MTU | désactivée |
 
@@ -546,18 +564,73 @@ Tout matériel aléatoire du protocole — `transaction_id`, `client_nonce`,
 clés ML-KEM et ML-DSA — suit le même pipeline :
 
 ```text
-TRNG matériel  →  seed / reseed  →  DRBG approuvé  →  octets consommés
+source d'entropie plateforme fail-closed
+    → DRBG SP 800-90A de la bibliothèque cryptographique, force 256 bits
+    → octets consommés
 ```
 
-Le TRNG fournit l'entropie de démarrage et de réensemencement. Un DRBG ou
-CSPRNG approuvé produit ensuite les octets. Il n'est **pas** exigé que les
-32 octets d'un PSK soient lus directement d'une source matérielle : les
-standards NIST distinguent explicitement source d'entropie et générateur
+Deux mécanismes seulement sont admis : **HMAC-DRBG-SHA-512** ou
+**CTR-DRBG-AES-256**. Ils fournissent une force de sécurité de 256 bits. Pour
+CTR-DRBG, deux instanciations sont acceptables et une seule doit être annoncée :
+avec **fonction de dérivation** (`use_df = true`, SP 800-90Ar1 §10.2.1.3.2), ou
+avec une **entrée d'entropie pleine** d'exactement un `seedlen`
+(§10.2.1.3.1) — le cas que la fonction de dérivation existe pour éviter, et
+qu'un fournisseur alimenté par une source de pleine entropie satisfait. Le
+démarrage annonce laquelle est en service ; il n'existe pas de troisième forme,
+ni d'annonce par défaut. Le mécanisme vient de la
+bibliothèque cryptographique du projet, pas d'un générateur écrit ici : Helios,
+Orion et leurs caisses communes ne réimplémentent ni DRBG, ni dérivation de
+seed, ni tests de santé. Une adaptation de type et de configuration est admise
+seulement si elle ne produit aucun octet elle-même. Un faux fournisseur
+déterministe est permis uniquement sous `cfg(test)`, ne peut être sélectionné
+par aucun binaire livré et n'est jamais présenté comme conforme.
+
+**La validation CAVP/ACVP du fournisseur n'est pas exigée par cette version.**
+Un déploiement qui la veut construit la même bibliothèque dans sa variante
+validée : le mécanisme et le format filaire sont identiques, seule la
+paperasse change. Réciproquement, aucun code, journal ni document du projet ne
+présente le pipeline comme validé tant que cette variante n'est pas celle qui
+tourne, et un numéro de certificat ne s'affirme jamais depuis une constante
+compilée.
+
+Le démarrage journalise sans secret le fournisseur, sa version, le mécanisme
+choisi, l'activation de `use_df` pour CTR-DRBG et l'intervalle de reseed
+annoncé.
+
+Le choix du mécanisme est local, explicite et journalisé ; il ne se négocie pas
+sur le fil. L'absence de fournisseur utilisable est une erreur de démarrage,
+sans bascule silencieuse vers un PRNG généraliste. Un processus n'émet un
+identifiant, une clé, un PSK ou un challenge que si le DRBG du fournisseur est
+`instantiated` et que sa dernière opération d'apport d'entropie plateforme —
+instanciation initiale ou reseed — a réussi. Sinon l'appel retourne une erreur
+fatale et n'écrit aucun octet de sortie.
+
+```text
+instantiate : entropy_input >= 32 octets issus de la source plateforme
+              + nonce >= 16 octets issu d'un tirage distinct
+reseed      : intervalle fournisseur configuré <= 2^20 appels generate,
+              après chaque fork, et avant toute génération de clé privée
+              ML-DSA-87, ML-KEM ou TLS
+generate    : prediction_resistance = true pour une clé privée ;
+              false admis pour un transaction_id, nonce ou challenge public
+```
+
+Une « génération » est un appel au DRBG, indépendamment du nombre d'octets
+demandé. La borne de `2^20` est configurée dans le fournisseur ou garantie par
+son profil validé ; elle n'est pas réalisée par un second DRBG applicatif.
+Dans le processus enfant d'un fork, le contexte fournisseur hérité est invalide
+et aucune sortie n'est permise avant réinstanciation ou reseed réussi. Il n'est
+**pas** exigé que les 32 octets d'un PSK soient lus directement de la source
+plateforme : l'architecture NIST distingue source d'entropie et générateur
 déterministe, et le bon modèle est celui ci-dessus.
 
-Un échec du TRNG, un échec de seed ou de reseed, ou un échec du test de santé
-de la source d'entropie est une **erreur ferme**. Aucun repli vers une source
-plus faible, aucune dégradation silencieuse, aucune génération « au mieux ».
+Un identifiant, nonce ou challenge entièrement nul est refusé à la réception,
+mais ce contrôle ne remplace pas le fournisseur : un générateur défaillant n'a
+pas le droit de produire puis filtrer la valeur. Un échec de la source
+plateforme, de son test de santé, d'instanciation, de reseed ou de génération
+est une **erreur ferme**. Aucun repli vers l'heure, un UUID, un PRNG généraliste
+ou un compteur, aucune sortie partielle, aucune génération « au mieux » et
+aucun DRBG applicatif maison.
 
 ### 4.4 Niveau post-quantique
 
@@ -723,7 +796,7 @@ ne dit donc rien à un attaquant non admis.
 
 Le motif réel est journalisé côté gateway, en clair et nommé, dans le journal
 protégé du service — jamais sur le réseau. Un opérateur qui diagnostique lit
-`journalctl -u heliosd` ; un attaquant qui sonde lit `rejected`.
+`journalctl --namespace=helios -u heliosd` ; un attaquant qui sonde lit `rejected`.
 
 L'uniformité du code ne prétend pas rendre des chemins cryptographiques de
 coûts différents strictement constants. La gateway ferme la connexion après
@@ -1017,6 +1090,26 @@ sa révocation ou son échéance. Voir
 
 Les signatures ML-DSA utilisent une sérialisation binaire dédiée. Le JSON ne
 sert jamais de message signé.
+
+Elles emploient **ML-DSA pur** de FIPS 204, jamais HashML-DSA. Le paramètre
+externe `ctx` est non vide et vaut exactement le domaine ASCII du type, sans
+NUL final, normalisation ni encodage de longueur :
+
+| Type | `ctx` ML-DSA-87 exact |
+| --- | --- |
+| certificat PQ v2 | `helios-key-negotiation-pq-certificate-v2` |
+| requête v5 | `helios-key-negotiation-pq-request-v5` |
+| réponse v5 | `helios-key-negotiation-pq-response-v5` |
+| confirmation v5 | `helios-key-negotiation-pq-confirmation-v5` |
+| commit v5 | `helios-key-negotiation-pq-commit-v5` |
+| libération in-tunnel v5 | `helios-key-negotiation-pq-in-tunnel-release-v5` |
+
+Le message `M` conserve ce même domaine comme préfixe : `ctx` et le préfixe
+interne sont deux contrôles distincts. Les deux signatures d'un même type
+emploient le même contexte quelle que soit la clé signataire, notamment
+lorsque `CA-PQ` émet un certificat. Un `ctx` vide, celui d'un autre type ou une
+signature HashML-DSA sont refusés. Une bibliothèque qui ne sait pas passer le
+contexte externe est non conforme ; préfixer seulement `M` ne l'émule pas.
 
 Les entiers sont big-endian. Les champs de longueur sont des `u32`. Un champ
 optionnel est encodé par :
@@ -1604,7 +1697,11 @@ Une déconnexion VPN explicite en mode `ml_kem` déclenche un `release` sur l'AP
 interne **avant** le démontage de l'adaptateur, puis la zéroïsation locale. La
 tentative est bornée à deux secondes et son échec ne retarde jamais davantage
 la déconnexion. La désinstallation d'un profil fait de même si le tunnel, le
-reçu de commit et une identité utilisable sont encore disponibles. En
+reçu de commit et une identité utilisable sont encore disponibles : la
+suppression déconnecte d'abord, puis retire, parce que le `release` voyage dans
+ce tunnel et est signé par l'identité de ce profil. Si le démontage de
+l'adaptateur échoue, la suppression est refusée : le profil reste associé à
+l'adaptateur encore monté et permet de réessayer. En
 `static_psk`, Orion démonte seulement son adaptateur et libère sa copie mémoire ;
 la source configurée reste protégée dans son stockage.
 
@@ -1868,11 +1965,27 @@ redémarrage de gateway est donc réparé en moins de trois minutes, sans geste 
 l'utilisateur, et le journal client nomme la cause — handshake vieilli, pas
 échec de négociation.
 
-Cette renégociation reste **bornée** : trois tentatives, deux secondes entre
-elles, puis le tunnel passe en erreur avec un message qui invite à se
-reconnecter. Une gateway durablement absente ne doit pas produire une boucle de
-négociation agressive ; c'est la même réserve que la v4 opposait à la
-reconnexion automatique.
+Cette renégociation reste **bornée** : trois tentatives, puis le tunnel passe
+en erreur avec un message qui invite à se reconnecter. Une gateway durablement
+absente ne doit pas produire une boucle de négociation agressive ; c'est la
+même réserve que la v4 opposait à la reconnexion automatique. L'espacement
+n'est pas celui de deux secondes que cette section nommait à l'origine : chaque
+tentative est elle-même la boucle bornée de la négociation, dont le délai entre
+essais est de onze secondes parce que [§4.5](#45-délais-et-limites) arme dix
+secondes de repos après un rollback — une reprise à l'intérieur de cette
+fenêtre est refusée par construction. Le budget n'est rendu que par un
+handshake réussi, jamais par le fait d'avoir tenté une réparation.
+
+Le déclencheur exige un **reçu de commit `ml_kem`**. Un slot `static_psk` est
+la configuration de l'opérateur : `network.toml` le contient, la gateway le
+relit à chaque démarrage, donc il est toujours là et un handshake vieilli y
+signifie autre chose. Un tunnel `classic` n'a pas de slot du tout et WireGuard
+réessaie seul.
+
+Le reçu précédent reste détenu jusqu'au commit de son remplaçant. Une
+renégociation qui échoue avant ce commit ne prouve pas que l'ancien slot a
+disparu : si son handshake revient, Orion repasse à `Up`, et une déconnexion
+peut encore nommer exactement cette transaction dans son `release` signé.
 
 ## 13. Déroulement nominal
 
@@ -2289,12 +2402,17 @@ retour est vérifié sous cette ancre déjà épinglée.
 
 ### 15.4 Gateway
 
-`heliosd init-key-negotiation` lit la CA TLS opérateur et la clé publique
-`CA-PQ`, génère une clé TLS gateway et une clé **ML-DSA-87** gateway, scelle les
-deux clés privées au TPM et produit la demande publique de certificat liée à la
-clé WireGuard gateway. Le poste opérateur vérifie la preuve de possession,
-émet la leaf PQ sous `CA-PQ`, puis réinstalle seulement les certificats et CA
-publics. Aucune clé privée ne revient vers la gateway.
+`heliosd init-key-negotiation` lit les CA clientes publiques, génère une clé TLS
+gateway et une clé **ML-DSA-87** gateway, scelle les deux clés privées au TPM et
+produit `GatewayBootstrapRequest`, demande publique signée par la nouvelle clé
+et liée à la clé WireGuard gateway. Il ne produit aucune leaf PQ. Le poste
+opérateur vérifie la preuve de possession, exige les deux credentials de
+`CampaignScope::GatewayBootstrap`, puis émet la leaf PQ sous `CA-PQ` par
+`astra-signer issue-gateway-bootstrap`. `heliosd init-trust-domain` reçoit
+ensuite cette leaf publique, la vérifie sous l'ancre fournie et refuse une leaf
+auto-signée avant de créer le registre d'époque 1. Aucune clé privée ne revient
+vers la gateway ; l'échange se fait par fichiers, avant qu'Astra possède un
+registre ou un canal en ligne.
 
 L'identité est chargée une fois au démarrage. Une rotation exige
 `systemctl restart heliosd` ; le démarrage journalise l'empreinte servie et la
@@ -2556,6 +2674,16 @@ déclarer la v5 implémentée.
 - refus de clés ML-KEM de 1568 octets qui échouent au contrôle d'entrée FIPS
   203, de ciphertexts non valides et des représentations base64/hex non
   canoniques ;
+- chaque certificat et message ML-DSA-87 accepté avec le `ctx` exact de §8,
+  puis refusé avec `ctx = ""`, le contexte d'un autre type, un NUL final ou
+  HashML-DSA, y compris sous une signature `CA-PQ` cryptographiquement valide ;
+- l'un des deux mécanismes DRBG autorisés, fourni par la bibliothèque
+  cryptographique, refusant toute sortie après échec de la source plateforme ou
+  du reseed, avec au plus `2^20` appels entre deux apports d'entropie,
+  réinstanciation ou reseed dans l'enfant après fork, et aucun octet partiel
+  rendu en erreur ; fournisseur absent, CTR-DRBG ni dérivé ni semé en pleine
+  entropie, et DRBG applicatif maison refusés ; une valeur nulle filtrée ne
+  compte jamais comme un succès du générateur ;
 - horodatages `0`, `u64::MAX`, juste dans et juste hors de la fenêtre : aucun
   overflow ni panic, résultat déterministe ;
 - `confirmation_timeout_secs` hors de `[1, 45]` refusé par Orion, même signé ;
@@ -2798,4 +2926,4 @@ courant détaillé en tête de note.
 | [`helios-ctl::enroll`](../../tools/helios-ctl/src/enroll.rs) | invitation et registre à usage unique, preuve WireGuard, émission, liaison et signature JCS du document |
 
 `AGENTS.md` décrit l'implémentation v5 effectivement servie et nomme les écarts
-encore ouverts, dont la libération manquante à la désinstallation d'un profil.
+encore ouverts.

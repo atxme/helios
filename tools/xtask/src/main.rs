@@ -19,14 +19,14 @@
 //! bundle therefore cannot ship by accident.
 
 use std::{
-    fs::File,
-    io::{Read, Write},
     path::{Path, PathBuf},
     process::Command,
 };
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+
+use xtask::{orion_deps, orion_helper};
 
 /// Features of the shipped gateway. A production bundle carries all of them:
 /// a `heliosd` without `netlink` or `wireguard` would refuse to start on a
@@ -60,34 +60,12 @@ const SYSTEMD_UNITS: &[&str] = &[
     "helios-update.path",
     "helios-update-window.service",
     "helios-update-window.timer",
+    "helios-log-prune.service",
+    "helios-log-prune.timer",
 ];
 
 /// Shipped binaries, and their role.
 const BINARIES: &[&str] = &["heliosd", "helios-installer", "helios-ctl"];
-
-/// WireGuardNT binary version shipped with Orion.
-const WIREGUARD_NT_VERSION: &str = "1.1";
-/// Official archive, pinned: changing the version requires recomputing and
-/// re-reading its content before updating this fingerprint.
-const WIREGUARD_NT_URL: &str = "https://download.wireguard.com/wireguard-nt/wireguard-nt-1.1.zip";
-const WIREGUARD_NT_SHA256: &str =
-    "dceb30a9bc4be48cce0f74160fc88a585a2c2627366e8f846fc6658f9038dace";
-const MAX_WIREGUARD_ARCHIVE_BYTES: u64 = 16 * 1024 * 1024;
-
-/// Output names are imposed by `defguard_wireguard_rs 0.11.0`, not by the
-/// Orion bundler. Its Windows backend opens them relative to the current
-/// directory under `resources-windows/binaries/`.
-const WIREGUARD_FILES: &[(&str, &str)] = &[
-    (
-        "wireguard-nt/bin/amd64/wireguard.dll",
-        "binaries/wireguard-amd64.dll",
-    ),
-    (
-        "wireguard-nt/bin/arm64/wireguard.dll",
-        "binaries/wireguard-arm64.dll",
-    ),
-    ("wireguard-nt/LICENSE.txt", "LICENSE-WireGuardNT.txt"),
-];
 
 #[derive(Parser)]
 #[command(
@@ -103,6 +81,17 @@ struct Cli {
 enum Cmd {
     /// Downloads and verifies the WireGuardNT DLLs needed by the Orion bundle.
     OrionDeps,
+    /// Builds the private Astra helper in the sidecar location Tauri expects.
+    OrionHelper,
+    /// Builds the production heliosd binary for an API application update.
+    App {
+        /// Target triple. Default: the host.
+        #[arg(long)]
+        target: Option<String>,
+        /// Does not rebuild the embedded frontend (local iteration).
+        #[arg(long)]
+        skip_frontend: bool,
+    },
     /// Builds the binaries and assembles the bundle directory.
     Bundle {
         /// Target triple. Default: the host.
@@ -148,6 +137,11 @@ enum Cmd {
 fn main() -> Result<()> {
     match Cli::parse().command {
         Cmd::OrionDeps => orion_deps(),
+        Cmd::OrionHelper => prepare_orion_helper(&workspace_root()?),
+        Cmd::App {
+            target,
+            skip_frontend,
+        } => app(target, skip_frontend),
         Cmd::Bundle {
             target,
             skip_frontend,
@@ -164,116 +158,17 @@ fn main() -> Result<()> {
 
 fn orion_deps() -> Result<()> {
     let root = workspace_root()?;
-    let cache_dir = root.join("target").join("orion-deps");
-    let archive = cache_dir.join(format!("wireguard-nt-{WIREGUARD_NT_VERSION}.zip"));
-    let part = archive.with_extension("zip.part");
-    std::fs::create_dir_all(&cache_dir)
-        .with_context(|| format!("creating {}", cache_dir.display()))?;
-
-    let archive_is_valid = archive.is_file() && sha256_matches(&archive, WIREGUARD_NT_SHA256)?;
-    if archive_is_valid {
-        println!("==> WireGuardNT {WIREGUARD_NT_VERSION}: cached archive verified");
-    } else {
-        if archive.exists() {
-            std::fs::remove_file(&archive)
-                .with_context(|| format!("removing invalid archive {}", archive.display()))?;
-        }
-        if part.exists() {
-            std::fs::remove_file(&part)
-                .with_context(|| format!("removing incomplete download {}", part.display()))?;
-        }
-        println!("==> WireGuardNT {WIREGUARD_NT_VERSION}: official download");
-        download_bounded(WIREGUARD_NT_URL, &part, MAX_WIREGUARD_ARCHIVE_BYTES)?;
-        if !sha256_matches(&part, WIREGUARD_NT_SHA256)? {
-            let actual = hex(&helios_update::sha256_file(&part)
-                .map_err(|e| anyhow::anyhow!("fingerprint of {}: {e}", part.display()))?);
-            std::fs::remove_file(&part).ok();
-            bail!("WireGuardNT archive rejected: SHA-256 {actual}, expected {WIREGUARD_NT_SHA256}");
-        }
-        std::fs::rename(&part, &archive)
-            .with_context(|| format!("validating {}", archive.display()))?;
-    }
-
-    let destination = root.join("resources-windows");
-    extract_wireguard_files(&archive, &destination)?;
-    println!(
-        "==> Orion dependencies ready in {} (outside Git)",
-        destination.display()
-    );
-    Ok(())
+    orion_deps::prepare(&root)
 }
 
-fn download_bounded(url: &str, destination: &Path, maximum: u64) -> Result<()> {
-    let mut response = reqwest::blocking::Client::builder()
-        .user_agent("Helios-xtask/orion-deps")
-        .build()
-        .context("creating the HTTPS client")?
-        .get(url)
-        .send()
-        .with_context(|| format!("downloading {url}"))?
-        .error_for_status()
-        .with_context(|| format!("HTTP response from {url}"))?;
-    if response
-        .content_length()
-        .is_some_and(|length| length > maximum)
-    {
-        bail!("WireGuardNT archive too large (maximum {maximum} bytes)");
-    }
-
-    let mut file =
-        File::create(destination).with_context(|| format!("creating {}", destination.display()))?;
-    let copied = std::io::copy(&mut response.by_ref().take(maximum + 1), &mut file)
-        .with_context(|| format!("writing {}", destination.display()))?;
-    file.flush()
-        .with_context(|| format!("finalizing {}", destination.display()))?;
-    if copied > maximum {
-        std::fs::remove_file(destination).ok();
-        bail!("WireGuardNT archive too large (maximum {maximum} bytes)");
-    }
-    Ok(())
-}
-
-fn sha256_matches(path: &Path, expected: &str) -> Result<bool> {
-    let digest = helios_update::sha256_file(path)
-        .map_err(|e| anyhow::anyhow!("fingerprint of {}: {e}", path.display()))?;
-    Ok(hex(&digest) == expected)
-}
-
-fn extract_wireguard_files(archive: &Path, destination: &Path) -> Result<()> {
-    let file = File::open(archive).with_context(|| format!("opening {}", archive.display()))?;
-    let mut zip = zip::ZipArchive::new(file)
-        .with_context(|| format!("reading archive {}", archive.display()))?;
-
-    for (source, relative_destination) in WIREGUARD_FILES {
-        let mut entry = zip
-            .by_name(source)
-            .with_context(|| format!("entry {source} missing from the WireGuardNT archive"))?;
-        if entry.is_dir() {
-            bail!("unexpected WireGuardNT entry: {source} is a directory");
-        }
-        let output = destination.join(relative_destination);
-        if let Some(parent) = output.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
-        }
-        let temporary = output.with_extension("part");
-        let mut target = File::create(&temporary)
-            .with_context(|| format!("creating {}", temporary.display()))?;
-        std::io::copy(&mut entry, &mut target).with_context(|| format!("extracting {source}"))?;
-        target
-            .flush()
-            .with_context(|| format!("finalizing {}", temporary.display()))?;
-        // `rename` does not replace an existing destination on Windows. The
-        // command is replayed before each bundle: removing only this
-        // generated file guarantees the new extraction wins.
-        if output.exists() {
-            std::fs::remove_file(&output)
-                .with_context(|| format!("replacing {}", output.display()))?;
-        }
-        std::fs::rename(&temporary, &output)
-            .with_context(|| format!("validating {}", output.display()))?;
-        println!("  {}", output.display());
-    }
+fn app(target: Option<String>, skip_frontend: bool) -> Result<()> {
+    let root = workspace_root()?;
+    let target = match target {
+        Some(target) => target,
+        None => host_target()?,
+    };
+    let binary = build_gateway(&root, &target, skip_frontend)?;
+    println!("\n==> Application ready: {}", binary.display());
     Ok(())
 }
 
@@ -340,6 +235,9 @@ fn orion_msi(unsigned: bool, with_nsis: bool, skip_npm_ci: bool) -> Result<()> {
     println!("==> WireGuardNT dependencies");
     orion_deps()?;
 
+    println!("==> Astra operator helper");
+    prepare_orion_helper(&root)?;
+
     // Tauri's `beforeBuildCommand` fetches those same dependencies, so that a
     // plain `npm run tauri build` also produces a complete installer. They are
     // in place by now, and letting the hook redo it would re-enter `cargo`
@@ -347,6 +245,7 @@ fn orion_msi(unsigned: bool, with_nsis: bool, skip_npm_ci: bool) -> Result<()> {
     // while it executes fails with `Access is denied (os error 5)` — minutes
     // in, after the download and the whole workspace build.
     std::env::set_var("ORION_DEPS_READY", "1");
+    std::env::set_var("ORION_HELPER_READY", "1");
 
     if skip_npm_ci && orion.join("node_modules").is_dir() {
         println!("==> npm: existing node_modules reused (--skip-npm-ci)");
@@ -375,6 +274,18 @@ fn orion_msi(unsigned: bool, with_nsis: bool, skip_npm_ci: bool) -> Result<()> {
     )?;
 
     report_installers(&root.join("target").join("release").join("bundle"))
+}
+
+/// Builds and stages the helper under Tauri's target-qualified sidecar name.
+///
+/// The installer ships the release helper, built in the workspace target
+/// directory: nothing holds its lock here, unlike inside Orion's build script.
+fn prepare_orion_helper(root: &Path) -> Result<()> {
+    if !cfg!(windows) {
+        bail!("the Orion helper sidecar is built only for a Windows installer");
+    }
+    let target = host_target()?;
+    orion_helper::prepare(root, &target, &root.join("target"), true)
 }
 
 /// Lists what was produced, with a fingerprint for each artifact.
@@ -423,44 +334,9 @@ fn bundle(target: Option<String>, skip_frontend: bool, output: Option<PathBuf>) 
         Some(target) => target,
         None => host_target()?,
     };
-    let version = workspace_version(&root)?;
+    let version = release_version(&root)?;
 
-    // The publisher's public keyring is required by `heliosd`'s release
-    // build. Checking it here avoids waiting several minutes of compilation
-    // to learn it was missing.
-    let keyring = std::env::var("HELIOS_PUBLISHER_KEYRING_PATH").map_err(|_| {
-        anyhow::anyhow!(
-            "HELIOS_PUBLISHER_KEYRING_PATH must point to the publisher's public keyring: \
-             a bundle built without a trust anchor cannot verify any update"
-        )
-    })?;
-    if !Path::new(&keyring).is_file() {
-        bail!("public keyring not found: {keyring}");
-    }
-
-    if skip_frontend {
-        println!("==> Frontend: reused as is (--skip-frontend)");
-    } else {
-        println!("==> Embedded frontend");
-        run(&root, NPM, &["ci", "--prefix", "web"])?;
-        run(&root, NPM, &["run", "build", "--prefix", "web"])?;
-    }
-
-    println!("==> heliosd ({GATEWAY_FEATURES})");
-    run(
-        &root,
-        "cargo",
-        &[
-            "build",
-            "--release",
-            "--target",
-            &target,
-            "-p",
-            "heliosd",
-            "--features",
-            GATEWAY_FEATURES,
-        ],
-    )?;
+    let heliosd = build_gateway(&root, &target, skip_frontend)?;
 
     println!("==> helios-installer, helios-ctl");
     run(
@@ -488,7 +364,12 @@ fn bundle(target: Option<String>, skip_frontend: bool, output: Option<PathBuf>) 
         .with_context(|| format!("creating {}", staging.display()))?;
 
     let built = root.join("target").join(&target).join("release");
-    for binary in BINARIES {
+    copy_executable(&heliosd, &staging.join("heliosd"))?;
+    for binary in BINARIES
+        .iter()
+        .copied()
+        .filter(|binary| *binary != "heliosd")
+    {
         copy_executable(&built.join(binary), &staging.join(binary))?;
     }
     for unit in SYSTEMD_UNITS {
@@ -514,11 +395,63 @@ fn bundle(target: Option<String>, skip_frontend: bool, output: Option<PathBuf>) 
         "  helios-publisher bundle --dir {} \\\n    --key-epoch <N> --release-sequence <N> \\\n    \
          --channel <testing|production> --version {version} \\\n    --git-commit $(git rev-parse \
          --short=16 HEAD) --target {target} \\\n    --ed25519-private-key <…> \
-         --ml-dsa-65-private-key <…> --keyring {keyring}",
-        staging.display()
+         --ml-dsa-65-private-key <…> --keyring {}",
+        staging.display(),
+        publisher_keyring()?.display()
     );
     println!("  cargo xtask pack --dir {}", staging.display());
     Ok(())
+}
+
+/// Builds the exact daemon shape shipped to a real gateway.
+///
+/// Kept in one function because installation bundles and application updates
+/// must never drift to different feature sets or embedded frontends.
+fn build_gateway(root: &Path, target: &str, skip_frontend: bool) -> Result<PathBuf> {
+    publisher_keyring()?;
+
+    if skip_frontend {
+        println!("==> Frontend: reused as is (--skip-frontend)");
+    } else {
+        println!("==> Embedded frontend");
+        run(root, NPM, &["ci", "--prefix", "web"])?;
+        run(root, NPM, &["run", "build", "--prefix", "web"])?;
+    }
+
+    println!("==> heliosd ({GATEWAY_FEATURES})");
+    run(
+        root,
+        "cargo",
+        &[
+            "build",
+            "--release",
+            "--target",
+            target,
+            "-p",
+            "heliosd",
+            "--features",
+            GATEWAY_FEATURES,
+        ],
+    )?;
+    Ok(root
+        .join("target")
+        .join(target)
+        .join("release")
+        .join("heliosd"))
+}
+
+fn publisher_keyring() -> Result<PathBuf> {
+    let keyring = std::env::var_os("HELIOS_PUBLISHER_KEYRING_PATH").ok_or_else(|| {
+        anyhow::anyhow!(
+            "HELIOS_PUBLISHER_KEYRING_PATH must point to the publisher's public keyring: \
+             a gateway binary built without a trust anchor cannot verify any update"
+        )
+    })?;
+    let keyring = PathBuf::from(keyring);
+    if !keyring.is_file() {
+        bail!("public keyring not found: {}", keyring.display());
+    }
+    Ok(keyring)
 }
 
 fn pack(dir: &Path, output: Option<PathBuf>) -> Result<()> {
@@ -661,15 +594,27 @@ fn workspace_root() -> Result<PathBuf> {
         .context("workspace root not found")
 }
 
-fn workspace_version(root: &Path) -> Result<String> {
-    let manifest = std::fs::read_to_string(root.join("Cargo.toml"))
-        .context("reading the workspace Cargo.toml")?;
+/// The version the bundle is labeled with, read from the `heliosd` crate.
+///
+/// It must be the daemon's own version, not the workspace's. `heliosd` does
+/// not inherit `version.workspace`, and the readiness marker it writes after
+/// an update carries `env!("CARGO_PKG_VERSION")` — its crate version. The
+/// installer compares that marker to the manifest before confirming, so a
+/// bundle labeled with the workspace version cannot be confirmed by the
+/// binary it ships: the health check reads two different numbers for the same
+/// release, times out, and rolls back a daemon that had in fact started.
+fn release_version(root: &Path) -> Result<String> {
+    let manifest = std::fs::read_to_string(root.join("crates").join("heliosd").join("Cargo.toml"))
+        .context("reading crates/heliosd/Cargo.toml")?;
     manifest
         .lines()
-        .skip_while(|line| line.trim() != "[workspace.package]")
+        .take_while(|line| {
+            let line = line.trim();
+            !line.starts_with('[') || line == "[package]"
+        })
         .find_map(|line| line.trim().strip_prefix("version = "))
         .map(|value| value.trim().trim_matches('"').to_string())
-        .context("version missing from [workspace.package]")
+        .context("version missing from crates/heliosd/Cargo.toml [package]")
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -681,13 +626,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_version_comes_from_the_workspace() {
+    fn the_version_is_the_daemon_s_own() {
         let root = workspace_root().expect("root");
-        let version = workspace_version(&root).expect("version");
+        let version = release_version(&root).expect("version");
         assert!(
             version.split('.').count() == 3,
             "unexpected version: {version}"
         );
+
+        // The label and the readiness marker must be the same number. The
+        // marker is `heliosd`'s `CARGO_PKG_VERSION`, so reading anything but
+        // that crate's `[package] version` re-opens the mismatch that makes
+        // every update time out on its own health check.
+        let daemon = std::fs::read_to_string(root.join("crates/heliosd/Cargo.toml"))
+            .expect("heliosd manifest");
+        let declared = daemon
+            .lines()
+            .take_while(|line| {
+                let line = line.trim();
+                !line.starts_with('[') || line == "[package]"
+            })
+            .find_map(|line| line.trim().strip_prefix("version = "))
+            .map(|value| value.trim().trim_matches('"'))
+            .expect("heliosd version");
+        assert_eq!(version, declared);
     }
 
     /// The target is read from `rustc`, never from a constant: a bundle
@@ -730,6 +692,8 @@ mod tests {
             // happened stays live until the next boot.
             "helios-update-window.service",
             "helios-update-window.timer",
+            "helios-log-prune.service",
+            "helios-log-prune.timer",
         ] {
             assert!(
                 SYSTEMD_UNITS.contains(&unit),
@@ -798,6 +762,31 @@ mod tests {
     }
 
     #[test]
+    fn the_windows_application_update_launcher_uses_the_canonical_tools() {
+        let script =
+            std::fs::read_to_string(workspace_root().unwrap().join("scripts/deploy-app.ps1"))
+                .expect("the Windows application update launcher must exist");
+
+        for required in [
+            "helios-ctl",
+            "app-update",
+            "scripts/deploy-app.sh",
+            "wsl.exe",
+        ] {
+            assert!(
+                script.contains(required),
+                "the Windows launcher must invoke `{required}`"
+            );
+        }
+        for duplicated_api in ["Invoke-RestMethod", "/api/update/chunk"] {
+            assert!(
+                !script.contains(duplicated_api),
+                "the Windows launcher must not duplicate the update API through `{duplicated_api}`"
+            );
+        }
+    }
+
+    #[test]
     fn the_regression_workflow_executes_and_measures_orion_on_windows() {
         let workflow = std::fs::read_to_string(
             workspace_root()
@@ -809,6 +798,7 @@ mod tests {
         for required in [
             "orion-windows:",
             "runs-on: windows-2025",
+            "Get-Command .\\scripts\\deploy-app.ps1 -Syntax",
             "cargo clippy",
             "cargo llvm-cov --package orion-core --package orion --all-features",
             "coverage-orion-windows",
@@ -860,18 +850,87 @@ mod tests {
         assert!(!unit.contains("/opt/helios/current/bin/heliosd"));
     }
 
+    /// The readiness handshake between the installer and the daemon runs
+    /// through `/run/helios`. Under `ProtectSystem=strict` a `ReadWritePaths`
+    /// entry whose directory does not yet exist is dropped without a word, so
+    /// the directory each unit needs is declared as its own runtime directory,
+    /// preserved across the restart the installer performs.
+    #[test]
+    fn the_readiness_directory_survives_the_update_restart() {
+        let root = workspace_root().expect("root");
+        let installer = std::fs::read_to_string(root.join("deploy/systemd/helios-update.service"))
+            .expect("update service");
+        let daemon =
+            std::fs::read_to_string(root.join("deploy/systemd/heliosd.service")).expect("daemon");
+
+        for (unit, text) in [
+            ("helios-update.service", &installer),
+            ("heliosd.service", &daemon),
+        ] {
+            assert!(
+                text.lines()
+                    .any(|line| line.trim() == "RuntimeDirectory=helios"),
+                "{unit} must declare RuntimeDirectory=helios"
+            );
+            assert!(
+                text.lines()
+                    .any(|line| line.trim() == "RuntimeDirectoryPreserve=yes"),
+                "{unit} must preserve /run/helios across restarts"
+            );
+        }
+        assert!(
+            !installer
+                .lines()
+                .any(|line| line.starts_with("ReadWritePaths=") && line.contains("/run/helios")),
+            "/run/helios must come from RuntimeDirectory, not from a ReadWritePaths entry              that is ignored when the directory is absent"
+        );
+    }
+
+    #[test]
+    fn firewall_maintenance_is_explicit_persistent_and_verified_on_target() {
+        let root = workspace_root().expect("root");
+        let deploy = std::fs::read_to_string(root.join("scripts/deploy.sh"))
+            .expect("gateway deployment script");
+        let bootstrap = std::fs::read_to_string(root.join("scripts/target-bootstrap.sh"))
+            .expect("target bootstrap script");
+        let unit = std::fs::read_to_string(root.join("deploy/systemd/heliosd.service"))
+            .expect("daemon service");
+
+        for required in ["--sans-firewall", "--avec-firewall", "ASTRA=0"] {
+            assert!(
+                deploy.contains(required),
+                "deployment maintenance contract is missing `{required}`"
+            );
+        }
+        for required in [
+            "firewall-maintenance.conf",
+            "run --unsafe-disable-firewall",
+            "firewall_enforced=false",
+            "nft list table inet helios",
+        ] {
+            assert!(
+                bootstrap.contains(required),
+                "target maintenance verification is missing `{required}`"
+            );
+        }
+        assert!(
+            !unit.contains("--unsafe-disable-firewall"),
+            "maintenance must never become the signed service's default"
+        );
+    }
+
     #[test]
     fn wireguard_nt_is_pinned_and_stays_out_of_git() {
-        assert!(WIREGUARD_NT_URL.starts_with("https://download.wireguard.com/"));
-        assert_eq!(WIREGUARD_NT_SHA256.len(), 64);
-        assert!(WIREGUARD_NT_SHA256
+        assert!(orion_deps::WIREGUARD_NT_URL.starts_with("https://download.wireguard.com/"));
+        assert_eq!(orion_deps::WIREGUARD_NT_SHA256.len(), 64);
+        assert!(orion_deps::WIREGUARD_NT_SHA256
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit()));
-        assert!(WIREGUARD_FILES.contains(&(
+        assert!(orion_deps::WIREGUARD_FILES.contains(&(
             "wireguard-nt/bin/amd64/wireguard.dll",
             "binaries/wireguard-amd64.dll"
         )));
-        assert!(WIREGUARD_FILES.contains(&(
+        assert!(orion_deps::WIREGUARD_FILES.contains(&(
             "wireguard-nt/bin/arm64/wireguard.dll",
             "binaries/wireguard-arm64.dll"
         )));

@@ -6,8 +6,17 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import type {
   About,
+  ApprovalManifest,
+  AstraRotationInput,
+  AstraRotationStatus,
+  OperationLocator,
+  OperatorAction,
+  OperatorPendingOperation,
+  OperatorStatus,
   CertificateAction,
   CertificateActionState,
+  ActionOutcome,
+  RenewalProgress,
   CertificateInventory,
   ClientConfig,
   ClientEvent,
@@ -106,9 +115,56 @@ export const certificateActions = (keyNegotiation: KeyNegotiationSettings | null
 export const certificateOverview = () =>
   invoke<ProfileCertificates[]>('certificate_overview')
 
-/** Runs one of them, or rejects with the reason it cannot run. */
+/**
+ * Runs one of them, or rejects with the reason it cannot run.
+ *
+ * Resolves with where the renewal stopped rather than with nothing: a renewal
+ * waits on a human, so «lancé» is not an outcome the screen can show. Pressing
+ * again on an operation already open resumes it — it never opens a second one.
+ *
+ * Keyed by profile: `renew_every_profile` advances all of them by one step,
+ * and each has its own place to wait.
+ */
 export const runCertificateAction = (name: string, action: CertificateAction) =>
-  invoke<void>('run_certificate_action', { name, action })
+  invoke<ActionOutcome>('run_certificate_action', { name, action })
+
+/**
+ * Launches the operator companion for this profile's in-memory operation.
+ *
+ * The inlined Tauri plugin accepts only the profile name. Rust resolves the
+ * session and its core-built invocation; no executable or argument crosses
+ * from the WebView.
+ */
+export const launchCertificateCompanion = (name: string) =>
+  invoke<void>('plugin:companion|launch_certificate_companion', { name })
+
+/**
+ * Reads the approval request the open renewal is waiting on.
+ *
+ * Verified on the Rust side before it comes back. Nothing touches a security
+ * key here — the manifest exists so the user decides before the ceremony.
+ */
+export const certificateApprovalManifest = (name: string) =>
+  invoke<ApprovalManifest>('certificate_approval_manifest', { name })
+
+/**
+ * Whether this machine's key collects its own PIN.
+ *
+ * Asked rather than assumed: under Windows the platform dialog collects it and
+ * it never enters Orion, so prompting would be asking for a secret Orion has
+ * no use for.
+ */
+export const certificateApprovalNeedsPin = (name: string) =>
+  invoke<boolean>('certificate_approval_needs_pin', { name })
+
+/**
+ * Runs the ceremony and posts the assertion.
+ *
+ * Resolves with where the renewal reached. The manifest must have been read
+ * first: what is signed is what was shown.
+ */
+export const approveCertificateRenewal = (name: string, pin?: string) =>
+  invoke<RenewalProgress>('approve_certificate_renewal', { name, pin })
 
 /** The last certificate action that failed on this profile, if any. */
 export const lastCertificateError = (name: string) =>
@@ -199,6 +255,46 @@ export const openSshTerminal = (name?: string) =>
 export const connect = (name?: string) => invoke<void>('connect', { name: name ?? null })
 export const disconnect = () => invoke<void>('disconnect')
 
+/** Opens the Rust-owned, two-key CA-TLS signing ceremony. */
+export const startAstraCaTlsRotation = (input: AstraRotationInput) =>
+  invoke<AstraRotationStatus>('start_astra_ca_tls_rotation', { input })
+
+/** Advances the open ceremony after the requested security key was connected. */
+export const continueAstraCaTlsRotation = () =>
+  invoke<AstraRotationStatus>('continue_astra_ca_tls_rotation')
+
+/** Stops the open signer session without producing a transition. */
+export const cancelAstraCaTlsRotation = () =>
+  invoke<AstraRotationStatus>('cancel_astra_ca_tls_rotation')
+
+/** Restores or polls the Rust-owned ceremony after a view change. */
+export const astraCaTlsRotationStatus = () =>
+  invoke<AstraRotationStatus>('astra_ca_tls_rotation_status')
+
+/* Cérémonies opérateur (protocole 2). Le WebView ne nomme qu'un localisateur ;
+ * l'origine, le RP ID, le domaine et la clé de service viennent du hand-off que
+ * le processus opérateur épingle lui-même. */
+export const beginOperatorCeremony = (locator: OperationLocator) =>
+  invoke<OperatorStatus>('begin_operator_ceremony', { locator })
+
+export const advanceOperatorCeremony = (action: OperatorAction, revision: number) =>
+  invoke<OperatorStatus>('advance_operator_ceremony', { action, revision })
+
+export const dismissOperatorCeremony = () => invoke<void>('dismiss_operator_ceremony')
+
+export const operatorCeremonyStatus = () =>
+  invoke<OperatorStatus | null>('operator_ceremony_status')
+
+/** Installs and commits the grant released by the matching §7.5 ceremony. */
+export const resumeCertificateRecovery = (operationId: string) =>
+  invoke<ActionOutcome>('resume_certificate_recovery', { operationId })
+
+/* Lu sur la gateway, dans le tunnel, sur la surface administrateur : l'origine
+ * publique d'Astra sert une récupération sans tunnel, et y placer une liste la
+ * rendrait lisible par quiconque l'atteint. */
+export const operatorPendingOperations = () =>
+  invoke<OperatorPendingOperation[]>('operator_pending_operations')
+
 /**
  * Adjusts the window to the displayed view.
  *
@@ -265,3 +361,12 @@ export function onConfigChanged(cb: () => void): Promise<UnlistenFn> {
  * once at startup would eventually claim a protection that has since gone.
  */
 export const vaultPosture = () => invoke<VaultPosture>('vault_posture')
+
+/**
+ * Persists the informed choice made in the bare-volume warning.
+ *
+ * Kept separate from save/import so neither action can silently manufacture
+ * consent merely because BitLocker is absent.
+ */
+export const allowUnencryptedVolume = () =>
+  invoke<VaultPosture>('allow_unencrypted_volume')

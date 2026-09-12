@@ -33,19 +33,42 @@ cd "$SCRIPTS/.."
 # shellcheck source=scripts/lib-remote.sh
 . "$SCRIPTS/lib-remote.sh"
 
-EPOQUE="${HELIOS_PUBLISHER_EPOCH:-$HOME/.helios/publisher-epoch-1}"
+EPOQUE="$HOME/.helios/publisher-epoch-1"
 CANAL="${HELIOS_DEPLOY_CHANNEL:-production}"
 INSTALLER=1
 ASTRA=1
 ASTRA_ONLY=0
+FIREWALL_MODE=preserve
 SEQUENCE=""
 # Relais public écrit par `astra-signer init` : domaine, RP ID, ancre CA-PQ.
 # Rien de secret — le coffre, lui, ne quitte jamais le poste opérateur.
 RELAIS="${ASTRA_HANDOFF:-$HOME/.helios/astra/astra-domain.json}"
+# Leaf publique rendue par la cérémonie hors ligne du §13.1. Le chemin par
+# défaut est à côté du relais : le premier passage y dépose la demande, le
+# compagnon y écrit la réponse, puis `--astra` reprend sans valeur à recopier.
+CERTIFICAT_AMORCAGE="${HELIOS_GATEWAY_BOOTSTRAP_CERTIFICATE:-$(dirname "$RELAIS")/gateway-bootstrap-certificate.json}"
 # L'installation ne met rien dans le PATH : `heliosd` n'existe que sous ce
 # chemin, et root ne le trouve pas autrement. Le nommer en clair évite un
 # « command not found » là où l'on croirait lire un refus d'amorçage.
 HELIOSD=/opt/helios/current/heliosd
+# Chemin du binaire Astra **dans** son image. Nécessaire parce que `docker
+# compose exec` n'applique pas l'`ENTRYPOINT` : il exécute l'argv tel quel, donc
+# « status » y serait cherché dans le PATH comme un programme. Les deux autres
+# accès de l'étape 7 (`run` et le conteneur jetable) passent, eux, par
+# l'entrypoint et ne le prennent pas.
+ASTRA_BIN=/usr/local/bin/astra
+# Bout gateway du veth privé Astra ↔ Helios (ROTATION-CERTIFICATS §8.3).
+# La même adresse que le réseau `astra-private` de `deploy/astra/compose.yaml` :
+# un /29 qui ne contient que ses deux extrémités, sans route par défaut.
+# Cette coordonnée fait partie du ruleset atomique Helios et du bridge `astra0`
+# de compose. La rendre surchargeable sans recompiler le pare-feu créerait un
+# listener que la politique refuse — ou, pire, une ouverture sans listener.
+CANAL_PRIVE="10.88.7.1:8444"
+# Bout Astra du même veth, pour la direction opposée : c'est Helios qui appelle,
+# pour relayer le renouvellement d'un client (§8.1.2). Un second port plutôt
+# qu'un second réseau — le ruleset atomique nomme déjà les deux sens, adresses
+# et ports exacts, et `helios-firewall::ruleset` refuse tout le reste.
+CANAL_AUTORITE="10.88.7.2:8445"
 
 usage() {
     cat >&2 <<'EOF'
@@ -55,7 +78,10 @@ Usage : ./scripts/deploy.sh [hôte-ssh] [options]
   --copie-seule    Copie l'archive sans lancer l'installation privilégiée
   --canal C        testing ou production (défaut : production)
   --sans-astra     Saute le conteneur d'autorité, même si un relais existe
-  --astra    Reprend uniquement l'étape Astra, sans relivrer la gateway
+  --astra           Reprend uniquement l'étape Astra, sans relivrer la gateway
+  --sans-firewall   Mode maintenance persistant : firewall Helios désactivé
+                    après redémarrage et Astra sauté
+  --avec-firewall   Retire explicitement le mode maintenance au redémarrage
 
 Astra (ADR-008) se déploie tout seul dès qu'un relais de domaine existe —
 celui qu'écrit `astra-signer init` à côté du coffre. Sans relais, cette
@@ -66,8 +92,8 @@ L'hôte est en dur dans scripts/lib-remote.sh (HELIOS_CIBLE) : la commande
 n'en prend aucun. L'argument reste accepté pour viser ponctuellement une
 autre machine, sans rien changer aux appels suivants.
 
-Variables reconnues : HELIOS_CIBLE, HELIOS_PUBLISHER_EPOCH,
-HELIOS_DEPLOY_CHANNEL.
+Variables reconnues : HELIOS_CIBLE, HELIOS_DEPLOY_CHANNEL, ASTRA_HANDOFF,
+HELIOS_GATEWAY_BOOTSTRAP_CERTIFICATE.
 EOF
     exit 1
 }
@@ -79,6 +105,8 @@ while [ $# -gt 0 ]; do
         --copie-seule) INSTALLER=0; shift ;;
         --sans-astra) ASTRA=0; shift ;;
         --astra) ASTRA_ONLY=1; shift ;;
+        --sans-firewall) FIREWALL_MODE=disabled; ASTRA=0; shift ;;
+        --avec-firewall) FIREWALL_MODE=enabled; shift ;;
         --canal) CANAL="${2:-}"; shift 2 ;;
         -h|--help) usage ;;
         -*) echo "option inconnue : $1" >&2; usage ;;
@@ -97,6 +125,10 @@ if [ -z "$CIBLE" ]; then
 fi
 if [ "$ASTRA_ONLY" = "1" ] && [ "$ASTRA" = "0" ]; then
     echo "--astra et --sans-astra sont incompatibles" >&2
+    exit 1
+fi
+if [ "$ASTRA_ONLY" = "1" ] && [ "$FIREWALL_MODE" != "preserve" ]; then
+    echo "--astra ne modifie pas le mode firewall ; relivrer la gateway séparément" >&2
     exit 1
 fi
 
@@ -142,8 +174,15 @@ if [ -n "$(git status --porcelain)" ]; then
 fi
 
 CIBLE_TRIPLE="$(rustc -vV | sed -n 's/^host: //p')"
-VERSION="$(sed -n '/^\[workspace.package\]/,/^\[/p' Cargo.toml |
+# La version du démon, pas celle du workspace : `heliosd` n'hérite pas de
+# `version.workspace`, et le marqueur de disponibilité qu'il écrit après une
+# mise à jour porte la version de son crate. Un manifeste étiqueté avec la
+# version du workspace ne peut jamais être confirmé, et le nom du bundle ne
+# correspondrait plus à celui que `xtask bundle` produit. Même source que
+# `xtask::release_version`.
+VERSION="$(sed -n '/^\[package\]/,/^\[/p' crates/heliosd/Cargo.toml |
     sed -n 's/^version = "\(.*\)"/\1/p' | head -1)"
+[ -n "$VERSION" ] || { echo "version illisible dans crates/heliosd/Cargo.toml" >&2; exit 1; }
 NOM="helios-$VERSION-$CIBLE_TRIPLE"
 REP="target/bundle/$NOM"
 ARCHIVE="target/bundle/$NOM.tar.gz"
@@ -212,10 +251,124 @@ helios_ssh_sudo "$CIBLE" \
 ssh "$CIBLE" "rm -rf ~/$NOM"
 
 echo "==> 6/7  Network, TPM, PKI and Orion identity bootstrap"
-./scripts/target-bootstrap.sh "$CIBLE"
+FIREWALL_ARG=()
+case "$FIREWALL_MODE" in
+    disabled) FIREWALL_ARG=(--disable-firewall) ;;
+    enabled) FIREWALL_ARG=(--enable-firewall) ;;
+esac
+./scripts/target-bootstrap.sh "$CIBLE" "${FIREWALL_ARG[@]}"
 else
     echo "==> Reprise Astra seule sur $CIBLE"
 fi
+
+# ── Le terminateur TLS de l'origine publique ────────────────────────────────
+#
+# Astra sert du HTTP clair sur `127.0.0.1:8443`. Ce n'est pas un oubli : le
+# certificat de transport n'authentifie pas l'autorité — c'est sa clé de
+# service ML-DSA-87 épinglée qui le fait (ADR-008 §9.6). Mais la récupération
+# d'une identité expirée (§7.5) est le seul chemin qui n'a plus de tunnel : elle
+# monte un client HTTPS ordinaire, qui valide la chaîne sous les racines du
+# système. Sans terminateur devant, cette origine n'existe pas et §7.5 est
+# fermée — c'est exactement la limite que ce dépôt documentait.
+#
+# Quand l'origine est un nom `*.ts.net`, le terminateur est déjà là. Tailscale
+# émet et renouvelle tout seul un certificat publiquement reconnu pour le nom du
+# nœud, et `tailscale serve` le présente sur 443 **à l'intérieur du tailnet
+# seulement**. Rien à installer sur l'hôte, aucune autorité locale à faire
+# approuver dans le magasin racine du poste opérateur, et aucune règle 443 dans
+# le pare-feu applicatif : l'écoute appartient à `tailscaled`, pas à Helios, et
+# le contrôle d'accès est celui des ACL du tailnet.
+#
+# Funnel exposerait ce même nom sur l'Internet public. Il n'est jamais activé
+# ici, et le trouver activé arrête l'étape plutôt que de la confirmer.
+#
+# Toute autre origine garde le modèle documenté par l'ADR-008 §2 : un
+# terminateur externe, à la charge de l'opérateur.
+terminateur_tailscale() {
+    local url="$1" hote fqdn sortie
+    hote="${url#https://}"
+    hote="${hote%%/*}"
+    hote="${hote%%:*}"
+    case "$hote" in
+        *.ts.net) ;;
+        *)
+            echo "    origine $hote : terminateur TLS externe attendu (ADR-008 §2)"
+            return 0
+            ;;
+    esac
+
+    if ! ssh "${HELIOS_SSH_OPTS[@]}" "$CIBLE" 'command -v tailscale >/dev/null 2>&1'; then
+        echo "    l'origine est $hote mais la cible n'a pas de tailscale : rien ne" >&2
+        echo "    termine le TLS, et la récupération §7.5 reste fermée." >&2
+        return 1
+    fi
+
+    # `tailscale serve` ne sait présenter que le certificat du nœud sur lequel
+    # il tourne. Une origine qui nomme une autre machine ne serait donc pas
+    # servie ici — et le dire maintenant vaut mieux qu'un échec de validation
+    # TLS le jour où une identité est déjà expirée.
+    fqdn="$(ssh "${HELIOS_SSH_OPTS[@]}" "$CIBLE" 'tailscale status --json --peers=false' |
+        sed -n 's/.*"DNSName"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+    fqdn="${fqdn%.}"
+    if [ -z "$fqdn" ]; then
+        echo "    nom Tailscale de la cible illisible : MagicDNS est-il actif ?" >&2
+        return 1
+    fi
+    if [ "$fqdn" != "$hote" ]; then
+        echo "    l'origine du domaine est $hote, mais cette machine est $fqdn." >&2
+        echo "    Tailscale ne peut présenter que son propre nom : servir ici" >&2
+        echo "    donnerait un certificat que le client refuserait." >&2
+        return 1
+    fi
+
+    if ssh "${HELIOS_SSH_OPTS[@]}" "$CIBLE" 'tailscale serve status --json 2>/dev/null' |
+        grep -q '"AllowFunnel"'; then
+        echo "    Funnel est configuré sur ce nœud : l'origine de l'autorité serait" >&2
+        echo "    exposée sur l'Internet public. Le retirer par « tailscale funnel" >&2
+        echo "    reset » avant de reprendre." >&2
+        return 1
+    fi
+
+    # Idempotent : rejouer la même cartographie ne change rien. `--bg` la rend
+    # persistante, donc elle survit au redémarrage de la cible sans unité
+    # systemd à écrire.
+    if ! sortie="$(helios_ssh_sudo_capture "$CIBLE" \
+        'tailscale serve --bg --https=443 http://127.0.0.1:8443 2>&1')"; then
+        echo "    « tailscale serve » a échoué :" >&2
+        printf '%s\n' "$sortie" | tail -10 >&2
+        return 1
+    fi
+
+    # La vérification est la première requête que fait §7.5, et pas une sonde
+    # inventée pour l'occasion : si celle-ci passe, le chemin complet passe —
+    # certificat public, Serve, publication Docker, Astra. `--fail` pour qu'un
+    # 502 de `tailscaled` devant un conteneur arrêté ne compte pas comme un
+    # succès, et pas de `--insecure` : valider la chaîne est tout l'objet.
+    #
+    # `--resolve` plutôt que le DNS de la cible : une gateway n'a aucune raison
+    # de résoudre son propre nom MagicDNS — son `resolved` peut ne pas pointer
+    # vers `100.100.100.100`, et sa propre politique de sortie peut fermer le
+    # port 53. Ce que cette étape doit prouver est que l'origine répond à qui
+    # l'appelle depuis le tailnet, pas que la machine sait s'appeler elle-même :
+    # échouer là-dessus serait un faux négatif sur un déploiement correct.
+    local ip4
+    ip4="$(ssh "${HELIOS_SSH_OPTS[@]}" "$CIBLE" 'tailscale ip -4' | head -1 | tr -d '\r')"
+    if [ -z "$ip4" ]; then
+        echo "    adresse Tailscale de la cible illisible" >&2
+        return 1
+    fi
+    if ! sortie="$(ssh "${HELIOS_SSH_OPTS[@]}" "$CIBLE" "curl -fsS --max-time 15 \
+        --resolve '$hote:443:$ip4' \
+        -X POST -H 'content-type: application/json' -d 'null' \
+        'https://$hote/v1/client-rotation/challenge' 2>&1")"; then
+        echo "    l'origine https://$hote ne répond pas encore :" >&2
+        printf '%s\n' "$sortie" | tail -5 >&2
+        echo "    la cartographie Serve est posée ; reprendre après le démarrage" >&2
+        echo "    d'Astra la vérifiera." >&2
+        return 1
+    fi
+    echo "    origine   https://$hote (Tailscale Serve, tailnet seulement)"
+}
 
 # ── 7. Astra et le domaine de confiance (ADR-008) ────────────────────────────
 #
@@ -228,8 +381,10 @@ fi
 deployer_astra() {
     local compose etat wg_pub nom_serveur url rp domaine ancre sortie
     local cle_service tete_audit identite moteur compose_env statut_astra
-    local tete_attendue registre_gateway
-    local unite_build etat_build resultat_build code_build tentative
+    local tete_attendue registre_gateway statut_tete_ancienne tete_ancienne
+    local unite_build etat_build resultat_build code_build tentative astra_lire_frais
+    local canal_present cert_astra cert_gateway demande_gateway certificat_distant
+    local ca_tls_der empreinte_ca_tls ca_tls_distant arg_ca_tls
 
     # `docker` n'est utilisable sans privilège ni ici ni sur la gateway :
     # l'utilisateur n'est dans le groupe `docker` d'aucune des deux. Tout ce
@@ -271,6 +426,28 @@ deployer_astra() {
     echo "    domaine $domaine"
     echo "    RP ID   $rp"
 
+    # L'ancre TLS cliente en service, épinglée par son empreinte et non par son
+    # époque. Sans elle, `astra` retient le numéro de l'ancre sans retenir
+    # l'ancre : une transition du §9.4 ne pourrait être comparée qu'à la valeur
+    # que l'objet transporte lui-même — c'est-à-dire à rien — et le binaire la
+    # refuse par son nom jusqu'à un `pin-ca-tls`.
+    #
+    # Elle se calcule ici plutôt que de se retaper : le relais porte déjà le
+    # certificat public (`ca_tls_certificate`, DER en base64) dès qu'`astra-signer
+    # issue-ca-tls` a tourné, et l'empreinte en est le SHA-256 en hexadécimal
+    # minuscule — exactement ce que `Fingerprint::of` calcule sur ces octets.
+    ca_tls_der="$(sed -n \
+        's/.*"ca_tls_certificate"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$RELAIS")"
+    if [ -n "$ca_tls_der" ]; then
+        empreinte_ca_tls="$(printf '%s' "$ca_tls_der" | base64 -d | sha256sum | cut -d' ' -f1)"
+        echo "    CA-TLS  $empreinte_ca_tls"
+    else
+        empreinte_ca_tls=""
+        echo "    aucune CA TLS cliente dans le relais : la rotation du §9.4 restera" >&2
+        echo "    refusée ici. L'émettre par « astra-signer issue-ca-tls », puis" >&2
+        echo "    relancer ./scripts/deploy.sh --astra." >&2
+    fi
+
     # Le nom de serveur et la clé WireGuard sortent de la leaf PQ que la
     # gateway sert, lue par `heliosd` lui-même — donc sous privilège, comme
     # tout ce qui touche à /var/lib/helios.
@@ -287,6 +464,31 @@ deployer_astra() {
         return 1
     fi
     echo "    serveur $nom_serveur"
+
+    # La première leaf naît avant tout registre Astra. Le premier passage
+    # transporte donc seulement la demande publique vers le poste opérateur et
+    # s'arrête ; la reprise reçoit la leaf signée et peut alors amorcer les deux
+    # moitiés du domaine. Aucun endpoint en ligne n'est inventé pour franchir
+    # une frontière qui n'existe pas encore.
+    registre_gateway="$(helios_ssh_sudo_capture "$CIBLE" \
+        "if test -f /var/lib/helios/certificates.json; then echo present; else echo absent; fi" \
+        | tr -d '\r' | tail -1)"
+    if [ "$registre_gateway" = "absent" ] && [ ! -f "$CERTIFICAT_AMORCAGE" ]; then
+        demande_gateway="$(dirname "$RELAIS")/gateway-bootstrap-request.json"
+        mkdir -p "$(dirname "$demande_gateway")"
+        helios_ssh_sudo_capture "$CIBLE" \
+            "cat /var/lib/helios/gateway-bootstrap-certificate-request.json" \
+            > "$demande_gateway" || {
+            echo "    demande d'amorçage gateway introuvable" >&2
+            return 1
+        }
+        echo "    demande publique rapatriée : $demande_gateway"
+        echo "    deux credentials distincts doivent maintenant émettre la leaf :" >&2
+        echo "      astra-signer issue-gateway-bootstrap --request '$demande_gateway' \\" >&2
+        echo "        --out '$CERTIFICAT_AMORCAGE'" >&2
+        echo "    puis reprendre : ./scripts/deploy.sh --astra" >&2
+        return 1
+    fi
 
     # ── Sources et image, sur la cible ──────────────────────────────────────
     # `git archive` plutôt qu'un rsync : ce qui part est ce qui est commité,
@@ -454,18 +656,203 @@ deployer_astra() {
         return 1
     fi
 
-    statut_astra="$(helios_ssh_sudo_capture "$CIBLE" "cd '$racine' && \
+    # Le service tourne-t-il déjà ? La question précède l'interrogation, et
+    # elle n'est pas une optimisation.
+    #
+    # `compose run` crée un **second** conteneur du service, donc attaché aux
+    # mêmes réseaux — et `astra-private` épingle `ipv4_address: 10.88.7.2`. Si
+    # le service tourne, cette adresse est prise, et Docker répond « failed to
+    # set up container networking: Address already in use ». C'est-à-dire que
+    # `run` échoue systématiquement dans le seul cas où le registre existe
+    # vraiment. Un déploiement réel s'est arrêté là en accusant un registre
+    # illisible alors que rien n'avait été lu.
+    #
+    # Un conteneur **arrêté** garde sa réservation jusqu'à sa suppression, donc
+    # le cas se produit aussi service éteint. Trois manières de lire, une par
+    # situation, et chacune est la seule qui marche dans la sienne :
+    #
+    #   en marche      → `exec`, qui n'alloue rien ;
+    #   présent, arrêté → un conteneur jetable **sans réseau du tout**, monté
+    #                     directement sur le volume ;
+    #   absent          → `compose run`, sans concurrent possible.
+    conteneur_astra="$(helios_ssh_sudo_capture "$CIBLE" "cd '$racine' && \
         $compose_env $compose -f deploy/astra/compose.yaml --env-file '$env_distant' \
-        run --rm --no-deps astra status 2>&1")" && etat=amorce || etat=vierge
+        ps -aq astra 2>/dev/null" | tr -d '\r' | tail -1)"
+    astra_en_marche=non
+    if [ -n "$conteneur_astra" ] && helios_ssh_sudo "$CIBLE" \
+        "$moteur inspect -f '{{.State.Running}}' '$conteneur_astra' 2>/dev/null | grep -qx true"
+    then
+        astra_en_marche=oui
+    fi
+
+    compose_astra="$compose_env $compose -f deploy/astra/compose.yaml \
+        --env-file '$env_distant'"
+    # Le contrôle de reprise doit exécuter le binaire de l'image fraîche sans
+    # toucher au réseau Compose. `docker compose run --network none` n'est pas
+    # disponible avec toutes les versions de Compose et son échec était
+    # auparavant masqué par le message générique de fork. Récupérer le volume
+    # même lorsque le conteneur tourne permet ensuite un `docker run` direct,
+    # sans adresse statique ni conflit avec le veth Astra.
+    if [ -z "${volume_astra:-}" ] && [ -n "$conteneur_astra" ]; then
+        volume_astra="$(helios_ssh_sudo_capture "$CIBLE" "$moteur inspect \
+            -f '{{range .Mounts}}{{if eq .Destination \"/var/lib/astra\"}}{{.Name}}{{end}}{{end}}' \
+            '$conteneur_astra' 2>/dev/null" | tr -d '\r' | tail -1)"
+    fi
+
+    # Le conteneur en marche porte encore la **release précédente** : l'image
+    # fraîche ne devient la sienne qu'au `up -d` final. Or l'amorçage ci-dessous
+    # écrit dans le registre avec des sous-verbes que la version en place peut
+    # ne pas connaître — c'est exactement ce qui a échoué le 2 septembre 2026,
+    # sur `pin-ca-tls` : `exec` a atteint le binaire d'août, qui a répondu
+    # « unrecognized subcommand » alors que la commande existait dans l'image
+    # qu'on venait de construire.
+    #
+    # L'arrêter ici plutôt que de lancer l'image fraîche à côté : `pin-ca-tls`
+    # **écrit**, et deux processus sur `/var/lib/astra` sont une corruption de
+    # registre, pas une lecture concurrente. Une fois arrêté, la sélection
+    # ci-dessous retombe d'elle-même sur le conteneur jetable monté sur le
+    # volume — la branche prévue pour « présent, arrêté ». Le service remonte au
+    # `up -d` final, avec la nouvelle image et un registre déjà amorcé, donc
+    # sans jamais servir un domaine à moitié écrit.
+    if [ "$astra_en_marche" = oui ] && [ -n "${volume_astra:-}" ]; then
+        echo "    arrêt d'Astra pendant l'amorçage (l'image fraîche écrit sur le volume)"
+        helios_ssh_sudo "$CIBLE" "cd '$racine' && $compose_env $compose \
+            -f deploy/astra/compose.yaml --env-file '$env_distant' \
+            stop astra" >/dev/null || {
+            echo "    Astra n'a pas pu être arrêté : l'amorçage écrirait sur un" >&2
+            echo "    volume que le service utilise encore." >&2
+            return 1
+        }
+        astra_en_marche=non
+    fi
+    # A compatibility check must use the freshly built image. The running
+    # container can still be the previous release until the final `up -d`, so
+    # `exec` would not know about the status-tail migration below. A direct
+    # runtime invocation with `--network none` keeps this disposable read from
+    # competing for Astra's static veth address.
+    if [ -n "${volume_astra:-}" ]; then
+        astra_lire_frais="$moteur run --rm --network none \
+            -v '$volume_astra':/var/lib/astra helios/astra:latest"
+    else
+        # No existing container means no reserved static address; Compose is
+        # safe for the initial read and is retained for that one case.
+        astra_lire_frais="$compose_astra run --rm --no-deps -T astra"
+    fi
+    if [ "$astra_en_marche" = oui ]; then
+        # Le chemin absolu, et pas le sous-verbe seul : `exec` n'applique pas
+        # l'`ENTRYPOINT` de l'image, il exécute l'argv tel quel. « status » y
+        # est un nom de programme, que le runtime cherche dans le PATH et ne
+        # trouve évidemment pas. `run` et le conteneur jetable, eux, passent
+        # bien par l'entrypoint — d'où trois formes et non une.
+        astra_lire="$compose_astra exec -T astra $ASTRA_BIN"
+        astra_lire_shell="$compose_astra exec -T astra /bin/sh -c"
+    elif [ -n "$conteneur_astra" ]; then
+        # Le volume se lit sans passer par le service. `--network none` est ce
+        # qui rend la lecture toujours possible : aucune adresse n'est demandée,
+        # donc aucune ne peut être prise. Le nom du volume est lu sur le
+        # conteneur lui-même plutôt que deviné depuis le nom de projet compose,
+        # qui dépend du répertoire de travail.
+        volume_astra="$(helios_ssh_sudo_capture "$CIBLE" "$moteur inspect \
+            -f '{{range .Mounts}}{{if eq .Destination \"/var/lib/astra\"}}{{.Name}}{{end}}{{end}}' \
+            '$conteneur_astra' 2>/dev/null" | tr -d '\r' | tail -1)"
+        if [ -z "$volume_astra" ]; then
+            echo "    le conteneur Astra existant ne monte aucun volume sur /var/lib/astra." >&2
+            echo "    Rien n'est su de son état, donc rien n'est amorcé." >&2
+            return 1
+        fi
+        astra_lire="$moteur run --rm -i --network none \
+            -v '$volume_astra':/var/lib/astra helios/astra:latest"
+        astra_lire_shell="$moteur run --rm -i --network none \
+            -v '$volume_astra':/var/lib/astra --entrypoint /bin/sh helios/astra:latest -c"
+    else
+        astra_lire="$compose_astra run --rm --no-deps -T astra"
+        astra_lire_shell="$compose_astra run --rm --no-deps -T --entrypoint /bin/sh astra -c"
+    fi
+
+    # Ce que le runtime refuse n'est pas ce qu'Astra refuse.
+    #
+    # Une sortie qui vient du démon — conteneur arrêté, exécutable introuvable,
+    # réseau impossible — dit qu'`astra status` n'a **jamais tourné**. En tirer
+    # une conclusion sur le registre revient à lui imputer une panne que
+    # personne n'a observée, et c'est exactement ce qu'un déploiement réel a
+    # affiché deux fois de suite pour deux causes différentes.
+    astra_sonde_muette() {
+        echo "    impossible d'interroger le volume Astra : la sonde n'a pas répondu." >&2
+        echo "    Rien n'est su du registre, donc rien n'est amorcé." >&2
+        [ -z "${1:-}" ] || echo "    Réponse de la sonde : $1" >&2
+        printf '%s\n' "$statut_astra" | tail -20 >&2
+        case "$statut_astra" in
+            *"Address already in use"*|*"address already in use"*)
+                echo "    L'adresse 10.88.7.2 du veth privé est déjà prise. Un conteneur" >&2
+                echo "    Astra antérieur la retient — même arrêté, sa réservation tient" >&2
+                echo "    jusqu'à sa suppression :" >&2
+                echo "      ssh $CIBLE 'sudo $moteur ps -a --filter name=astra'" >&2
+                echo "      ssh $CIBLE 'sudo $moteur rm <id>'" >&2
+                ;;
+            *"executable file not found"*)
+                echo "    Le runtime n'a pas trouvé le programme à lancer : c'est l'appel qui" >&2
+                echo "    est fautif, pas le volume. $ASTRA_BIN est le chemin attendu." >&2
+                ;;
+        esac
+    }
+
+    # Trois états, pas deux. `status` échoue aussi bien parce qu'il n'y a rien
+    # à lire que parce que ce qu'il y a est illisible, et confondre les deux
+    # est ce qui a mené un déploiement réel à enchaîner sur un `bootstrap` que
+    # le registre existant refusait — en n'affichant que ce refus, jamais la
+    # cause. On regarde donc le volume avant de conclure.
+    statut_astra="$(helios_ssh_sudo_capture "$CIBLE" "cd '$racine' && \
+        $astra_lire status 2>&1")" && etat=amorce || etat=inconnu
+    if [ "$etat" = "inconnu" ]; then
+        case "$statut_astra" in
+            *"OCI runtime"*|*"executable file not found"*|*"Error response from daemon"*|\
+            *"failed to set up container networking"*|*"is not running"*|*"No such container"*)
+                astra_sonde_muette
+                return 1
+                ;;
+        esac
+        registre_present="$(helios_ssh_sudo_capture "$CIBLE" "cd '$racine' && \
+            $astra_lire_shell \
+            'test -f /var/lib/astra/registry.json && echo present || echo absent' 2>/dev/null" \
+            | tr -d '\r' | tail -1)"
+        case "$registre_present" in
+            absent) etat=vierge ;;
+            present)
+                # Astra a bien tourné, a bien lu, et a refusé. C'est la seule
+                # combinaison où le registre est en cause. Amorcer par-dessus
+                # démarrerait une seconde histoire pour le même domaine, et le
+                # binaire le refuse — mais c'est ici qu'il faut s'arrêter, en
+                # montrant l'erreur réelle plutôt que celle du refus.
+                echo "    Astra a un registre et ne peut pas le lire :" >&2
+                printf '%s\n' "$statut_astra" | tail -20 >&2
+                echo "    ne pas amorcer par-dessus : ce volume porte déjà une clé de service," >&2
+                echo "    une chaîne d'audit et un domaine. Sauvegarder /var/lib/astra avant" >&2
+                echo "    toute autre action." >&2
+                return 1
+                ;;
+            *)
+                # Quatrième cas, et il ne se confond avec aucun des trois : la
+                # sonde du volume n'a pas répondu non plus. Le ranger avec
+                # « registre illisible » accuserait le registre ; le ranger avec
+                # « vierge » enchaînerait sur un amorçage par-dessus une autorité
+                # existante — la seule erreur irrattrapable ici.
+                astra_sonde_muette "${registre_present:-<vide>}"
+                return 1
+                ;;
+        esac
+    fi
 
     if [ "$etat" = "vierge" ]; then
         echo "    amorçage du domaine"
+        # Le **même** accès que la sonde, pour la même raison : un conteneur
+        # arrêté qui retient 10.88.7.2 ferait échouer un `compose run` ici aussi,
+        # et l'amorçage est l'étape où un échec obscur coûte le plus cher.
         sortie="$(helios_ssh_sudo_capture "$CIBLE" "cd '$racine' && \
-            $compose_env $compose -f deploy/astra/compose.yaml --env-file '$env_distant' \
-            run --rm astra bootstrap \
+            $astra_lire bootstrap \
             --ca-public-key '$ancre' --trust-domain-id '$domaine' \
             --gateway-wireguard-public-key '$wg_pub' --server-name '$nom_serveur' \
-            --authority-url '$url' --webauthn-rp-id '$rp'")" || {
+            --authority-url '$url' --webauthn-rp-id '$rp' \
+            ${empreinte_ca_tls:+--ca-tls-fingerprint '$empreinte_ca_tls'}")" || {
             echo "    l'amorçage d'Astra a échoué :" >&2
             printf '%s\n' "$sortie" >&2
             return 1
@@ -514,11 +901,75 @@ deployer_astra() {
             return 1
         fi
         if [ "$tete_attendue" != "$tete_audit" ]; then
-            echo "    refus de reprendre une histoire Astra différente du témoin opérateur" >&2
-            echo "    attendue : $tete_attendue" >&2
-            echo "    présente : $tete_audit" >&2
-            return 1
+            # Ask the freshly built image whether the old witness is still in
+            # the chain and its suffix contains only unattended per-peer
+            # lifecycle. Authority configuration decisions still require an
+            # explicitly recorded witness.
+            # Conserver la sortie même en cas d'échec : elle nomme l'option
+            # de runtime ou le volume qui empêcherait la sonde de s'exécuter,
+            # au lieu de transformer cette panne en faux « fork » silencieux.
+            statut_tete_ancienne="$(helios_ssh_sudo_capture "$CIBLE" \
+                "cd '$racine' && $astra_lire_frais status \
+                    --expected-audit-head '$tete_attendue' 2>&1")" || true
+            tete_ancienne="$(printf '%s\n' "$statut_tete_ancienne" |
+                sed -n 's/^audit head[[:space:]]*:[[:space:]]*//p' | head -1)"
+            if [ "$tete_ancienne" != "$tete_audit" ]; then
+                echo "    refus de reprendre une histoire Astra différente du témoin opérateur" >&2
+                echo "    attendue : $tete_attendue" >&2
+                echo "    présente : $tete_audit" >&2
+                if [ -n "$statut_tete_ancienne" ] && [ -z "$tete_ancienne" ]; then
+                    echo "    sonde de compatibilité Astra :" >&2
+                fi
+                [ -z "$statut_tete_ancienne" ] ||
+                    printf '%s\n' "$statut_tete_ancienne" | tail -20 >&2
+                return 1
+            fi
+            echo "    témoin avancé : l'écart ne contient que du cycle de vie pair non privilégié"
+            mkdir -p "$(dirname "$RELAIS")"
+            printf '%s\n' "$tete_audit" > "$(dirname "$RELAIS")/audit-head"
         fi
+        # Un domaine amorcé avant que cette ancre soit épinglée — ou avant que
+        # ce script la calcule — n'en retient que l'époque. `pin-ca-tls`
+        # l'enregistre une fois et refuse d'en remplacer une : il est donc
+        # idempotent, et une seconde exécution ne dit rien de plus que « rien
+        # n'a changé ».
+        #
+        # Un refus, lui, n'est pas un détail d'exploitation : il signifie que
+        # le relais de l'opérateur et le registre d'Astra ne nomment pas la
+        # même CA TLS cliente. Deux moitiés du domaine qui se contredisent
+        # s'arrêtent, exactement comme pour la tête d'audit — et c'est bien
+        # **après** le contrôle du témoin que l'épinglage a lieu, pour ne
+        # jamais prolonger une histoire dont le fork n'a pas encore été écarté.
+        #
+        # L'épinglage ajoute `ClientTlsCaPinned` à la chaîne : la tête bouge, et
+        # les deux témoins qui la portent — le `.env` de compose et le fichier
+        # opérateur — sont donc réécrits ensuite, jamais avant. Les figer avant
+        # ferait refuser `astra run --expected-audit-head` au démarrage suivant.
+        if [ -n "$empreinte_ca_tls" ]; then
+            sortie="$(helios_ssh_sudo_capture "$CIBLE" "cd '$racine' && \
+                $astra_lire pin-ca-tls --fingerprint '$empreinte_ca_tls' 2>&1")" || {
+                echo "    l'ancre CA-TLS du relais n'a pas pu être épinglée :" >&2
+                echo "    attendue : $empreinte_ca_tls" >&2
+                printf '%s\n' "$sortie" | tail -10 >&2
+                return 1
+            }
+            statut_astra="$(helios_ssh_sudo_capture "$CIBLE" "cd '$racine' && \
+                $astra_lire status 2>&1")" || {
+                echo "    état Astra illisible après l'épinglage de l'ancre CA-TLS :" >&2
+                printf '%s\n' "$statut_astra" | tail -10 >&2
+                return 1
+            }
+            tete_audit="$(printf '%s\n' "$statut_astra" |
+                sed -n 's/^audit head[[:space:]]*:[[:space:]]*//p' | head -1)"
+            if [ -z "$tete_audit" ]; then
+                echo "    tête d'audit illisible après l'épinglage de l'ancre CA-TLS :" >&2
+                printf '%s\n' "$statut_astra" | tail -10 >&2
+                return 1
+            fi
+            mkdir -p "$(dirname "$RELAIS")"
+            printf '%s\n' "$tete_audit" > "$(dirname "$RELAIS")/audit-head"
+        fi
+
         helios_ssh_sudo "$CIBLE" \
             "printf 'ASTRA_EXPECTED_AUDIT_HEAD=%s\n' '$tete_audit' > '$env_distant'
              chmod 600 '$env_distant'" || {
@@ -531,22 +982,243 @@ deployer_astra() {
     # Elle peut manquer alors que le volume Astra existe déjà : une coupure
     # entre les deux amorçages ne doit ni fabriquer une seconde autorité, ni
     # laisser les routes de cycle de vie fermées pour toujours.
-    registre_gateway="$(helios_ssh_sudo_capture "$CIBLE" \
-        "if test -f /var/lib/helios/certificates.json; then echo present; else echo absent; fi" \
-        | tr -d '\r' | tail -1)"
     if [ "$registre_gateway" = "absent" ]; then
         echo "    amorçage du registre gateway"
+        certificat_distant="$(ssh "$CIBLE" 'printf %s "$HOME"')/gateway-bootstrap-certificate.json"
+        scp -q "$CERTIFICAT_AMORCAGE" "$CIBLE:$certificat_distant" || {
+            echo "    transfert de la leaf gateway impossible" >&2
+            return 1
+        }
+        # L'ancre TLS **du domaine**, et non la CA opérateur qui admet les
+        # clients. Sans elle, le registre retient l'autorité d'admission à la
+        # place de l'ancre du domaine : plus aucun renouvellement ne se stage,
+        # et une rotation du §9.4 ne le répare pas — elle ne sait que quitter
+        # une ancre déjà détenue. Le DER est celui que le relais porte déjà et
+        # dont l'empreinte a été épinglée dans Astra plus haut.
+        arg_ca_tls=""
+        if [ -n "$ca_tls_der" ]; then
+            ca_tls_distant="$(ssh "$CIBLE" 'printf %s "$HOME"')/domain-client-ca-tls.der"
+            printf '%s' "$ca_tls_der" | base64 -d |
+                ssh "$CIBLE" "cat > '$ca_tls_distant'" || {
+                echo "    transfert de la CA-TLS du domaine impossible" >&2
+                return 1
+            }
+            arg_ca_tls="--client-tls-ca '$ca_tls_distant'"
+        else
+            echo "    relais sans ca_tls_certificate : le registre gateway va retenir la CA" >&2
+            echo "    opérateur comme ancre du domaine, et aucun renouvellement ne pourra" >&2
+            echo "    se stager. Émettre la CA-TLS par astra-signer issue-ca-tls." >&2
+        fi
         helios_ssh_sudo "$CIBLE" "$HELIOSD init-trust-domain \
             --trust-domain-id '$domaine' --ca-public-key '$ancre' \
+            --gateway-certificate '$certificat_distant' \
             --astra-service-public-key '$cle_service' \
-            --authority-url '$url' --webauthn-rp-id '$rp'" || {
+            --authority-url '$url' --webauthn-rp-id '$rp' $arg_ca_tls" || {
             echo "    le registre gateway n'a pas été amorcé — Astra tourne, la" >&2
             echo "    gateway ignore encore le domaine. Ses routes de cycle de" >&2
             echo "    vie in-tunnel restent fermées." >&2
             return 1
         }
+        ssh "$CIBLE" "rm -f '$certificat_distant' '$ca_tls_distant'"
         helios_ssh_sudo "$CIBLE" "systemd-run --collect --unit=helios-trust-restart \
             systemctl restart heliosd >/dev/null"
+    elif [ -n "$ca_tls_der" ]; then
+        # Les versions antérieures à `init-trust-domain --client-tls-ca`
+        # pouvaient avoir amorcé le registre avec la CA opérateur. Corriger ce
+        # cas en place évite de supprimer le registre et de réadmettre tous les
+        # pairs. La commande refuse tout état qui a déjà quitté la génération
+        # initiale ; elle n'est donc ni une rotation non signée, ni un chemin
+        # de récupération général.
+        echo "    vérification de l'ancre CA-TLS du registre gateway"
+        ca_tls_distant="$(ssh "$CIBLE" 'printf %s "$HOME"')/domain-client-ca-tls.der"
+        printf '%s' "$ca_tls_der" | base64 -d |
+            ssh "$CIBLE" "cat > '$ca_tls_distant'" || {
+            echo "    transfert de la CA-TLS du domaine impossible" >&2
+            return 1
+        }
+        if ! sortie_reparation="$(helios_ssh_sudo_capture "$CIBLE" "
+            set -e
+            redemarrer_heliosd() { systemctl start heliosd; }
+            trap redemarrer_heliosd EXIT HUP INT TERM
+            systemctl stop heliosd
+            '$HELIOSD' repair-client-tls-ca-bootstrap \
+                --client-tls-ca '$ca_tls_distant'
+            systemctl start heliosd
+            trap - EXIT HUP INT TERM
+        ")"; then
+            ssh "$CIBLE" "rm -f '$ca_tls_distant'"
+            echo "    réparation de l'ancre CA-TLS refusée ; heliosd a été redémarré" >&2
+            printf '%s\n' "$sortie_reparation" >&2
+            return 1
+        fi
+        printf '%s\n' "$sortie_reparation"
+        ssh "$CIBLE" "rm -f '$ca_tls_distant'"
+    fi
+
+    # ── Le canal privé Astra ↔ Helios (ROTATION-CERTIFICATS §8.3) ───────────
+    # Deux identités de transport, une de chaque côté du veth, épinglées l'une
+    # par l'autre. Aucune n'est recopiée à la main : chaque `init` imprime son
+    # certificat et le script le porte à l'autre bout. Les deux commandes sont
+    # idempotentes, donc une reprise après coupure finit ce qu'une première a
+    # commencé.
+    #
+    # Non fatal : sans ce canal, Astra sert son endpoint public et la gateway
+    # garde ses routes in-tunnel. C'est exactement l'état d'avant ce lot.
+    canal_present="$(helios_ssh_sudo_capture "$CIBLE" \
+        "if test -f /var/lib/helios/astra-channel.json; then echo present; else echo absent; fi" \
+        | tr -d '\r' | tail -1)"
+    # Encore le même accès : `init-channel` écrit dans le même volume, et un
+    # `compose run` y buterait sur la même adresse retenue.
+    if sortie="$(helios_ssh_sudo_capture "$CIBLE" "cd '$racine' && \
+        $astra_lire init-channel 2>&1")"; then
+        cert_astra="$(printf '%s\n' "$sortie" |
+            sed -n 's/^astra_channel_certificate=//p' | tr -d '\r' | head -1)"
+        cert_autorite="$(printf '%s\n' "$sortie" |
+            sed -n 's/^astra_authority_certificate=//p' | tr -d '\r' | head -1)"
+    fi
+    if [ -z "${cert_astra:-}" ]; then
+        echo "    identité de transport Astra illisible — canal privé non monté" >&2
+        printf '%s\n' "${sortie:-}" | tail -10 >&2
+    else
+        # Le DER traverse en base64 puis est décodé sur la cible : `heliosd`
+        # attend un fichier DER, et faire transiter du binaire par SSH est le
+        # genre de détail qui casse une fois sur dix sans dire pourquoi.
+        # Les deux certificats d'Astra traversent en base64 puis sont décodés
+        # sur la cible : `heliosd` attend des fichiers DER, et faire transiter
+        # du binaire par SSH est le genre de détail qui casse une fois sur dix
+        # sans dire pourquoi. Le second n'est passé que s'il existe — un Astra
+        # antérieur à ce lot n'en imprime pas, et la moitié « relais » reste
+        # alors fermée sans que la moitié « staging » en souffre.
+        sortie="$(helios_ssh_sudo_capture "$CIBLE" \
+            "umask 077 && printf '%s' '$cert_astra' | base64 -d > /run/astra-channel.der && \
+             printf '%s' '${cert_autorite:-}' | base64 -d > /run/astra-authority.der 2>/dev/null; \
+             if test -s /run/astra-authority.der; then \
+                 $HELIOSD init-astra-channel --bind '$CANAL_PRIVE' \
+                     --astra-certificate /run/astra-channel.der \
+                     --authority '$CANAL_AUTORITE' \
+                     --astra-authority-certificate /run/astra-authority.der 2>&1; \
+             else \
+                 $HELIOSD init-astra-channel --bind '$CANAL_PRIVE' \
+                     --astra-certificate /run/astra-channel.der 2>&1; \
+             fi; \
+             code=\$?; rm -f /run/astra-channel.der /run/astra-authority.der; exit \$code")" && \
+            cert_gateway="$(printf '%s\n' "$sortie" |
+                sed -n 's/^gateway_channel_certificate=//p' | tr -d '\r' | head -1)" && \
+            cert_client="$(printf '%s\n' "$sortie" |
+                sed -n 's/^gateway_client_certificate=//p' | tr -d '\r' | head -1)"
+        if [ -z "${cert_gateway:-}" ]; then
+            echo "    la gateway n'a pas pu monter son bout du canal privé :" >&2
+            printf '%s\n' "$sortie" | tail -10 >&2
+        else
+            helios_ssh_sudo "$CIBLE" \
+                "printf 'ASTRA_GATEWAY_CHANNEL=%s\nASTRA_GATEWAY_CERTIFICATE=%s\n' \
+                     '$CANAL_PRIVE' '$cert_gateway' >> '$env_distant'" || {
+                echo "    le canal privé n'a pas pu être écrit dans l'environnement" >&2
+                return 1
+            }
+            echo "    canal privé $CANAL_PRIVE"
+            # La direction opposée, seulement si les deux bouts l'ont produite.
+            # Sans elle Astra ne sert pas son listener et la gateway répond 503
+            # sur ses quatre routes de renouvellement : un état supporté, et
+            # celui de toute installation antérieure à ce lot.
+            if [ -n "${cert_client:-}" ]; then
+                helios_ssh_sudo "$CIBLE" \
+                    "printf 'ASTRA_PRIVATE_BIND=%s\nASTRA_GATEWAY_CLIENT_CERTIFICATE=%s\n' \
+                         '$CANAL_AUTORITE' '$cert_client' >> '$env_distant'" || {
+                    echo "    le relais de renouvellement n'a pas pu être écrit" >&2
+                    return 1
+                }
+                echo "    relais de renouvellement $CANAL_AUTORITE"
+            else
+                echo "    relais de renouvellement non monté : la gateway répondra 503"
+            fi
+            # `heliosd` lit ce document au démarrage et le sert jusqu'à l'arrêt,
+            # comme l'identité de négociation : un document neuf sous un démon
+            # en marche ne change rien tant qu'il n'a pas redémarré.
+            if [ "$canal_present" = "absent" ]; then
+                helios_ssh_sudo "$CIBLE" "systemd-run --collect \
+                    --unit=helios-channel-restart systemctl restart heliosd >/dev/null"
+            fi
+        fi
+    fi
+
+    # ── Le document de credentials opérateur ────────────────────────────────
+    # Sans lui, Astra n'a aucune liste d'autorisation : la demande d'approbation
+    # d'un renouvellement ordinaire n'a plus de credential à proposer, et chaque
+    # rotation est refusée en le disant. Il est signé par `CA-PQ` et ne porte
+    # rien de secret — c'est le consommateur qui le vérifie sous son ancre, pas
+    # ce script, pas la gateway et pas Astra.
+    #
+    # Il vit à côté du coffre, sur le poste opérateur, et `astra-signer` le
+    # réémet à chaque geste qui déplace la table de key-slots. Le recopier ici
+    # est donc idempotent, et l'oublier est la panne qu'on ne comprend qu'au
+    # premier renouvellement.
+    #
+    # En base64, pour la même raison que les deux certificats plus haut :
+    # `helios_ssh_sudo` compose lui-même l'entrée standard de la session, donc
+    # rien ne peut y être redirigé.
+    credentials_local="$(dirname "$RELAIS")/astra-credentials.json"
+    if [ -f "$credentials_local" ]; then
+        credentials_b64="$(base64 -w0 < "$credentials_local")"
+        if helios_ssh_sudo "$CIBLE" "cd '$racine' && \
+            printf '%s' '$credentials_b64' | base64 -d | \
+            $astra_lire_shell 'cat > /var/lib/astra/.credentials.tmp && \
+                mv /var/lib/astra/.credentials.tmp /var/lib/astra/astra-credentials.json'"; then
+            echo "    credentials opérateur copiés"
+            # Le document est lu **au démarrage**. Copié dans un conteneur qui
+            # tourne déjà, il ne prendrait effet qu'au prochain redémarrage —
+            # et `up -d` ne recrée pas un service dont rien n'a changé. Le
+            # redémarrage est donc explicite, et seulement dans ce cas.
+            if [ "$astra_en_marche" = oui ]; then
+                helios_ssh_sudo "$CIBLE" "cd '$racine' && \
+                    $compose_astra restart astra" >/dev/null || {
+                    echo "    Astra n'a pas redémarré : il sert encore la liste" >&2
+                    echo "    d'autorisation précédente." >&2
+                }
+            fi
+            # Le même document, dans le registre de la gateway. Astra s'en
+            # sert pour proposer un credential à une approbation ; la gateway
+            # s'en sert pour le **distribuer** — le bloc d'enrôlement du §19
+            # est la seule chose qu'un client lit avant d'avoir un tunnel, et
+            # récupérer une identité expirée commence par nommer le credential
+            # qui l'approuvera. Un client qui devrait aller chercher la liste
+            # devrait le faire par le lien qu'il vient justement de perdre.
+            #
+            # `heliosd` est arrêté le temps de l'écriture, comme pour la
+            # réparation d'ancre plus haut et pour la même raison : le démon
+            # tient le registre en mémoire et le réécrit entier à la première
+            # décision qu'il enregistre. Une édition hors du démon serait donc
+            # annulée sans bruit à la prochaine admission de pair — et c'est
+            # exactement ce qui arrive, puisque la commande suivante d'un
+            # déploiement est souvent d'enrôler un client.
+            credentials_distant="$(ssh "$CIBLE" 'printf %s "$HOME"')/astra-credentials.json"
+            if printf '%s' "$credentials_b64" | base64 -d |
+                ssh "$CIBLE" "cat > '$credentials_distant'"; then
+                helios_ssh_sudo "$CIBLE" "
+                    set -e
+                    redemarrer_heliosd() { systemctl start heliosd; }
+                    trap redemarrer_heliosd EXIT HUP INT TERM
+                    systemctl stop heliosd
+                    '$HELIOSD' install-astra-credentials '$credentials_distant'
+                    systemctl start heliosd
+                    trap - EXIT HUP INT TERM
+                " || {
+                    echo "    le registre gateway n'a pas retenu les credentials :" >&2
+                    echo "    les profils émis ensuite ne pourront pas récupérer une" >&2
+                    echo "    identité expirée." >&2
+                }
+                ssh "$CIBLE" "rm -f '$credentials_distant'"
+            fi
+        else
+            echo "    les credentials opérateur n'ont pas pu être copiés :" >&2
+            echo "      $credentials_local" >&2
+            echo "    Astra tournera, mais refusera tout renouvellement ordinaire." >&2
+        fi
+    else
+        echo "    aucun document de credentials à côté du coffre :" >&2
+        echo "      $credentials_local" >&2
+        echo "    l'émettre par « astra-signer bindings », sinon aucun opérateur ne" >&2
+        echo "    peut approuver un renouvellement." >&2
     fi
 
     echo "    démarrage"
@@ -559,6 +1231,8 @@ deployer_astra() {
             logs --tail 40 astra" >&2 || true
         return 1
     }
+
+    terminateur_tailscale "$url"
 }
 
 if [ "$ASTRA" = "0" ]; then

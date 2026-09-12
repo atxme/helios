@@ -24,7 +24,7 @@
 //! where an operator looks anyway:
 //!
 //! ```text
-//! journalctl -u heliosd -b | grep -i 'update window'
+//! journalctl --namespace=helios -u heliosd -b | grep -i 'update window'
 //! ```
 //!
 //! Arming needs the TPM secret, so it is a local `sudo heliosd tpm`
@@ -248,7 +248,7 @@ pub fn run(yes: bool) -> Result<()> {
     // never reach the terminal.
     println!("\n==> Arming the update window and rebooting");
     println!("    The connection will drop. Once the gateway is back:");
-    println!("      journalctl -u heliosd -b | grep -i 'update window'");
+    println!("      journalctl --namespace=helios -u heliosd -b | grep -i 'update window'");
     println!();
     heliosd_tpm(&heliosd, &["prepare-update", "--reboot"]).context("arming the update window")?;
 

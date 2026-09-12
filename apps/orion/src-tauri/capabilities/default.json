@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Permissions de base : fenêtre principale + écoute d'événements.",
+  "description": "Fenêtre principale, événements et lancement borné du compagnon Astra.",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": ["core:default", "companion:allow-launch-certificate-companion"]
 }

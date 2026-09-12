@@ -82,7 +82,37 @@ pub struct FirewallPolicy {
     pub mode: PolicyMode,
     /// CIDR or IPs allowed on port 22 (administrative SSH), even when the
     /// kill-switch is engaged.
+    ///
+    /// Matches on the **source address alone**, with no interface constraint.
+    /// That is what makes it the wrong tool for an address the gateway only
+    /// reaches through one of its own overlays: see [`Self::admin_ifaces`],
+    /// which is the answer for those.
     pub allow_ssh_from: Vec<String>,
+    /// Out-of-band administration interfaces: SSH is accepted on them in
+    /// **every** tunnel state, kill-switch included.
+    ///
+    /// These are the operator's way back in when the Helios tunnel is down —
+    /// a Tailscale or NordVPN interface, typically. Scoped by interface for
+    /// two reasons, and the second one is why this field exists at all.
+    ///
+    /// The security reason is the one spelled out on
+    /// [`Self::allow_ssh_over_tunnel`]: only the overlay's own daemon puts
+    /// packets on its interface, and only after authenticating the far end,
+    /// so an interface match cannot be satisfied by a forged source from the
+    /// WAN — an [`Self::allow_ssh_from`] entry can.
+    ///
+    /// The operational reason is that an overlay does not have *an* address.
+    /// Tailscale carries a v4 and a v6 (`100.x` and `fd7a:…`), NordVPN's
+    /// changes with the server, and both can be reassigned without warning.
+    /// Enumerating them in [`Self::allow_ssh_from`] means the recovery path
+    /// silently stops matching on the day the address moves — which is
+    /// precisely the day it is needed. One `iifname` rule covers every
+    /// address the interface will ever carry, v4 and v6 alike.
+    ///
+    /// Must never name [`Self::wg_iface`]: that opening is
+    /// [`Self::allow_ssh_over_tunnel`], which the operator turns on
+    /// deliberately. `NetworkConfig` rejects the overlap.
+    pub admin_ifaces: Vec<String>,
     /// Allows DHCP (UDP 67/68) on the WAN interface, kill-switch engaged.
     ///
     /// A gateway normally has a fixed address, hence the default of `false`.

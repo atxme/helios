@@ -5,18 +5,11 @@
 //! service key, and its own certificate generations — and it applies trust
 //! updates in **one** local write.
 //!
-//! # Why the renewal instant is derived, not drawn
+//! # Renewal starts at the fixed safety threshold
 //!
-//! The window opens at 80 % of the leaf's life, and every client in a fleet
-//! reaches it at nearly the same moment. Drawing a random instant inside it
-//! would disperse them — until the first restart, when a fresh draw would
-//! bunch them up again or move a renewal that was about to happen.
-//!
-//! [`renewal_instant`] instead derives the instant from values that do not
-//! change: the client's WireGuard key, the generation and the certificate's
-//! own period. It is stable across restarts by construction — there is nothing
-//! to persist, and therefore nothing that can be lost — and it is uniform
-//! across the fleet because the keys are.
+//! The ordinary path opens at 80 % of the active leaf's life. It does not
+//! disperse a client anywhere in the remaining 20 %: doing so could postpone
+//! the only automatic attempt until immediately before expiry.
 //!
 //! # Why nothing is applied halfway
 //!
@@ -46,13 +39,13 @@
 use std::path::{Path, PathBuf};
 
 use aether::certificates::{
-    client::ClientCertificateGeneration,
-    encoding::{Fingerprint, MlDsa87PublicKey, TrustDomainId, WireGuardKey},
+    client::{ClientCertificateGeneration, ClientCertificateRotationGrant},
+    encoding::{Fingerprint, Id16, MlDsa87PublicKey, TrustDomainId, WireGuardKey},
     gateway::{pq_certificate_fingerprint, GatewayIdentityTransition},
     revocation::RevocationScope,
     state::{
         base_state_fingerprint, AstraProfile, ClientCertificateState, ClientTlsCaState,
-        GatewayCertificateState, InstallOutcome, TrustLedger, TrustSnapshot,
+        GatewayCertificateState, InstallOutcome, PendingStageState, TrustLedger, TrustSnapshot,
     },
     status::{AstraCertificateStatus, CertificateKind},
     transport::{
@@ -218,10 +211,13 @@ impl TrustStore {
         // manifest: a transaction that named the key which verifies it would
         // authorize itself.
         let (authority_key, authority_epoch) = match manifest.manifest_authority_kind {
-            aether::certificates::transport::ManifestAuthority::CaPq => (
-                &self.state.gateway.current_ca_public_key,
-                self.state.gateway.ca_epoch,
-            ),
+            // `CA-PQ` authorizes objects and the offline document, never an
+            // online per-client envelope (spec §0.6, §8.1.1).
+            aether::certificates::transport::ManifestAuthority::CaPq => {
+                return Err(TrustError::Certificate(
+                    CertificateError::UnauthorizedIssuer,
+                ))
+            }
             aether::certificates::transport::ManifestAuthority::AstraServiceKey => (
                 &self.state.astra.active_astra_service_public_key,
                 self.state.astra.astra_service_key_epoch,
@@ -323,6 +319,10 @@ impl TrustStore {
                     // A delegation is not an anchor, but it decides which key
                     // may have issued the client's own next leaf. Ignoring it
                     // would make every renewed identity unverifiable here.
+                    candidate
+                        .astra
+                        .astra_policy_fingerprint
+                        .assert_authorizes(delegation)?;
                     delegation.verify(
                         &candidate.gateway.current_ca_public_key,
                         &candidate.trust_domain_id,
@@ -449,6 +449,58 @@ impl TrustStore {
         self.write(&candidate)?;
         self.state = candidate;
         Ok(applied)
+    }
+
+    /// Persists a candidate whose grant the caller has already verified.
+    ///
+    /// **Orion stages from the grant**, not from the staging authorization:
+    /// the §0.5 amendment keeps `ClientCertificateStageAuthorization` on the
+    /// Astra–Helios veth, and a client never carries one. What the grant
+    /// embeds is the receipt the gateway signed over that authorization, so
+    /// the stage identifier, its fingerprint and its lease are attested rather
+    /// than asserted.
+    ///
+    /// The verification is deliberately the caller's: it needs the rotation
+    /// request, which only the session that signed it holds, and this store
+    /// has no business keeping a copy of a signed object it did not produce.
+    /// See [`crate::certificate_renewal`].
+    pub fn stage_verified_grant(
+        &mut self,
+        grant: &ClientCertificateRotationGrant,
+        now_unix: u64,
+    ) -> Result<InstallOutcome, TrustError> {
+        let mut candidate = self.state.clone();
+        let outcome =
+            candidate
+                .certificates
+                .stage_from_grant(grant, &candidate.ledger, now_unix)?;
+        self.write(&candidate)?;
+        self.state = candidate;
+        Ok(outcome)
+    }
+
+    /// Turns the pending candidate into `next`, once the gateway confirmed.
+    ///
+    /// `PendingCommit` is passed explicitly rather than accepted from whatever
+    /// the slot holds: the two ends commit from different states, and a client
+    /// that adopted the gateway's rule would commit a candidate before the
+    /// grant that releases it ever arrived.
+    pub fn commit_staged_candidate(
+        &mut self,
+        stage_id: &Id16,
+        commit_fingerprint: &Fingerprint,
+        now_unix: u64,
+    ) -> Result<InstallOutcome, TrustError> {
+        let mut candidate = self.state.clone();
+        let outcome = candidate.certificates.commit(
+            stage_id,
+            commit_fingerprint,
+            PendingStageState::PendingCommit,
+            now_unix,
+        )?;
+        self.write(&candidate)?;
+        self.state = candidate;
+        Ok(outcome)
     }
 
     /// Applies an offline `orion-trust-update` document (spec §8.4).
@@ -678,38 +730,13 @@ fn absorb_status(
 
 /// The instant this client opens its renewal window (spec §4.3).
 ///
-/// Derived, never drawn: the offset inside `[renewal_at, not_after)` comes
-/// from the client's WireGuard key, the generation and the certificate period.
-/// Restarting recomputes the same value, so a renewal that was about to happen
-/// still happens, and the fleet stays spread out.
+/// The fixed 80 % threshold. The key remains an argument because callers
+/// identify the generation and its owner together.
 pub fn renewal_instant(
     generation: &ClientCertificateGeneration,
-    client_wg_public_key: &WireGuardKey,
+    _client_wg_public_key: &WireGuardKey,
 ) -> Result<u64, CertificateError> {
-    let validity = generation.validity()?;
-    let renewal_at = validity.renewal_at()?;
-    let span = validity
-        .not_after
-        .checked_sub(renewal_at)
-        .filter(|span| *span > 0)
-        .ok_or(CertificateError::ArithmeticOverflow)?;
-
-    let mut input = Vec::with_capacity(64);
-    input.extend_from_slice(b"helios-client-renewal-dispersion-v5");
-    input.extend_from_slice(client_wg_public_key.as_bytes());
-    input.extend_from_slice(&generation.generation.to_be_bytes());
-    input.extend_from_slice(&validity.not_before.to_be_bytes());
-    input.extend_from_slice(&validity.not_after.to_be_bytes());
-    let digest = Fingerprint::of(&input);
-    let offset = u64::from_be_bytes(
-        digest.as_bytes()[..8]
-            .try_into()
-            .expect("a fingerprint is 32 bytes"),
-    ) % span;
-
-    renewal_at
-        .checked_add(offset)
-        .ok_or(CertificateError::ArithmeticOverflow)
+    generation.validity()?.renewal_at()
 }
 
 /// Whether a renewal is due at `now_unix`.
@@ -769,28 +796,32 @@ mod tests {
         }
     }
 
-    /// Different clients land on different instants: that dispersion is the
-    /// whole point, and a fleet arriving together is what it prevents.
+    /// Every client gets the full remaining 20 % as its retry margin.
     #[test]
-    fn two_clients_do_not_renew_at_the_same_instant() {
+    fn clients_renew_at_the_eighty_percent_threshold() {
         let generation = generation(4);
-        let instants: std::collections::BTreeSet<_> = (0..32u8)
-            .map(|seed| renewal_instant(&generation, &key(seed)).expect("instant"))
-            .collect();
-        assert!(
-            instants.len() > 24,
-            "expected a spread, got {} distinct instants",
-            instants.len()
-        );
+        let expected = generation
+            .validity()
+            .expect("validity")
+            .renewal_at()
+            .expect("renewal");
+        for seed in 0..32u8 {
+            assert_eq!(
+                renewal_instant(&generation, &key(seed)).expect("instant"),
+                expected
+            );
+        }
     }
 
-    /// A new generation moves the instant even for the same client, so two
-    /// consecutive renewals do not fall on the same offset.
+    /// A generation with a different validity period gets its own threshold.
     #[test]
-    fn a_new_generation_moves_the_instant() {
+    fn a_new_generation_uses_its_own_validity_period() {
+        let mut next = generation(5);
+        next.not_before = 1_000_000;
+        next.not_after = 2_000_000;
         assert_ne!(
             renewal_instant(&generation(4), &key(1)).expect("instant"),
-            renewal_instant(&generation(5), &key(1)).expect("instant")
+            renewal_instant(&next, &key(1)).expect("instant")
         );
     }
 
@@ -800,6 +831,83 @@ mod tests {
         let instant = renewal_instant(&generation, &key(1)).expect("instant");
         assert!(!renewal_is_due(&generation, &key(1), instant - 1).expect("due"));
         assert!(renewal_is_due(&generation, &key(1), instant).expect("due"));
+    }
+
+    /// Astra sends a suggested window with every status. It may bring a
+    /// renewal **forward** — an incident campaign — and can never push one
+    /// back: a gateway able to delay renewals could manufacture the very
+    /// expiry the planner exists to prevent (spec §4.3, §14.1).
+    #[cfg(feature = "certificate-signing")]
+    #[test]
+    fn an_astra_window_never_delays_the_local_renewal_instant() {
+        use aether::certificates::encoding::{generate_ml_dsa_87_keypair, MlDsa87Signature};
+        use aether::certificates::status::{
+            AstraCertificateStatus, CertificateKind, CertificateStatus,
+        };
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let (_, anchor_public) = generate_ml_dsa_87_keypair().expect("keygen");
+        let (service_private, service_public) = generate_ml_dsa_87_keypair().expect("keygen");
+        let mut store = store(
+            directory.path().join("trust.json"),
+            anchor_public,
+            service_public,
+        );
+        let active = store.state().certificates.active.clone();
+        let client = store.state().client_wg_public_key;
+        let validity = active.validity().expect("validity");
+        let local_renewal_at = validity.renewal_at().expect("renewal");
+        let before = renewal_instant(&active, &client).expect("instant");
+
+        // A status that would have this client wait until the last thousand
+        // seconds of the leaf's life.
+        let late = AstraCertificateStatus {
+            format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+            trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+            certificate_fingerprint: active.pq_certificate_fingerprint,
+            certificate_kind: CertificateKind::ClientPq,
+            generation: active.generation,
+            status: CertificateStatus::Active,
+            suggested_window_start: validity.not_after - 1_000,
+            suggested_window_end: validity.not_after + 10_000,
+            produced_at: 1_000,
+            next_update: 4_600,
+            status_epoch: 1,
+            astra_service_key_epoch: 1,
+            astra_signature: MlDsa87Signature::placeholder(),
+        }
+        .sign(&service_private)
+        .expect("sign");
+
+        store
+            .apply(
+                &[TrustUpdateObject::CertificateStatus(Box::new(late.clone()))],
+                1_000,
+            )
+            .expect("a correctly signed status about a slot this store holds");
+
+        // The status landed — and moved nothing but its own counter.
+        assert_eq!(
+            store
+                .state()
+                .ledger
+                .last_status_for(&active.pq_certificate_fingerprint),
+            Some((1, 1))
+        );
+        assert_eq!(
+            renewal_instant(&store.state().certificates.active, &client).expect("instant"),
+            before,
+            "the local instant is derived from the certificate, never from a status"
+        );
+        assert!(
+            renewal_is_due(&store.state().certificates.active, &client, before).expect("due"),
+            "the client renews at its own instant, whatever Astra suggested"
+        );
+        assert_eq!(
+            late.clamped_window(local_renewal_at, validity.not_after),
+            (local_renewal_at, validity.not_after),
+            "both bounds are clamped back to what this client computed"
+        );
     }
 
     /// A signed gateway leaf: a PQ certificate's fingerprint covers its own
@@ -865,6 +973,8 @@ mod tests {
                     published: false,
                     revoked: false,
                     revocation_epoch: 0,
+                    service_rollback: None,
+                    awaited_replacement: None,
                 },
                 client_tls_ca: ClientTlsCaState {
                     ca_tls_epoch: 1,
@@ -878,6 +988,12 @@ mod tests {
                 astra: AstraProfile {
                     authority_url: "https://astra.example".into(),
                     webauthn_rp_id: "astra.example".into(),
+                    astra_policy_fingerprint: aether::certificates::approval::AstraPolicyPin::new(
+                        Fingerprint::of(b"policy"),
+                    )
+                    .expect("policy pin"),
+                    credential_registry_epoch: 1,
+                    credential_bindings: Default::default(),
                     active_astra_service_public_key: service,
                     next_astra_service_public_key: None,
                     next_service_key_transition_fingerprint: None,
@@ -956,6 +1072,94 @@ mod tests {
             before,
             store.base_state_fingerprint().expect("fingerprint"),
             "the counter moved, so the state a manifest was built against did too"
+        );
+    }
+
+    /// The producer and the client meet: what `aether`'s builder emits — the
+    /// exact call Astra makes — is collected, verified and applied by the real
+    /// client, with nothing between them but the wire types.
+    ///
+    /// This is the test the 503 existed for. Every half was covered on its own
+    /// long before either could talk to the other.
+    #[cfg(feature = "certificate-signing")]
+    #[test]
+    fn a_transaction_built_by_the_authority_is_applied_by_the_client() {
+        use aether::certificates::encoding::{generate_ml_dsa_87_keypair, MlDsa87Signature};
+        use aether::certificates::revocation::{
+            EmergencyCertificateRevocation, RevocationReason, RevocationScope,
+        };
+        use aether::certificates::transport::signing::{build_transaction, TransactionPlan};
+
+        let directory = tempfile::tempdir().expect("temp");
+        let (anchor_private, anchor_public) = generate_ml_dsa_87_keypair().expect("keygen");
+        let (service_private, service_public) = generate_ml_dsa_87_keypair().expect("keygen");
+        let mut store = store(
+            directory.path().join("trust.json"),
+            anchor_public,
+            service_public,
+        );
+        let active = generation(4);
+
+        let revocation = EmergencyCertificateRevocation {
+            format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+            trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+            ca_epoch: 1,
+            scope: RevocationScope::Client,
+            identity_key: key(2),
+            server_name: None,
+            revocation_epoch: 1,
+            revoked_tls_fingerprint: Some(active.tls_certificate_fingerprint),
+            revoked_tls_not_after: Some(active.not_after),
+            revoked_pq_fingerprint: None,
+            revoked_pq_not_after: None,
+            effective_at: 9_000,
+            reason: RevocationReason::KeyCompromise,
+            replacement_transition_fingerprint: None,
+            ca_signature: MlDsa87Signature::placeholder(),
+        }
+        .sign(&anchor_private)
+        .expect("sign");
+
+        // The token the client would have signed into its request, read off
+        // the very store the transaction is about to be applied to.
+        let base = store.base_state_fingerprint().expect("base state");
+        let plan = TransactionPlan {
+            transaction_id: Id16::new([5; 16]).expect("id"),
+            trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+            gateway_wg_public_key: key(9),
+            client_wg_public_key: key(2),
+            base_state_fingerprint: base,
+            created_at: 1_000,
+            expires_at: 5_000,
+            minimum_activation_at: 9_000,
+            authority_epoch: 1,
+            // The **service** key, not `CA-PQ`: §0.6 makes the online manifest
+            // a coordination signature. The revocation inside it still carries
+            // its own `CA-PQ` proof, which is what actually authorizes it.
+            authority_private_key: &service_private,
+        };
+        let (manifest, chunks) = build_transaction(
+            vec![TrustUpdateObject::CertificateRevocation(Box::new(
+                revocation,
+            ))],
+            &plan,
+            32 * 1024,
+        )
+        .expect("built");
+
+        let applied = store
+            .verify_and_apply_transaction(&manifest, &chunks, 1_100)
+            .expect("the client applies what the authority built");
+        assert_eq!(applied, 1);
+        assert_eq!(store.state().ledger.scheduled_revocations.len(), 1);
+
+        // And the store has moved, so the same transaction no longer applies:
+        // the compare-and-swap token is the whole point.
+        assert!(
+            store
+                .verify_and_apply_transaction(&manifest, &chunks, 1_100)
+                .is_err(),
+            "a transaction bound to a state the store has left was applied twice"
         );
     }
 

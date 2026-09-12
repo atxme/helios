@@ -1,0 +1,16 @@
+[Unit]
+Description=Prune Helios journal entries
+Documentation=https://github.com/christophe/helios
+After=local-fs.target systemd-journald.service
+Requires=systemd-journald.service
+
+[Service]
+Type=oneshot
+# Rotate first so entries older than the policy are eligible immediately.
+ExecStart=/usr/bin/journalctl --namespace=helios --rotate --vacuum-time=3d --vacuum-size=100M
+NoNewPrivileges=true
+PrivateNetwork=true
+PrivateTmp=true
+# journalctl doit pouvoir supprimer les archives sous /var/log/journal.
+ProtectSystem=full
+ProtectHome=true

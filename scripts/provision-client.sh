@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Provisionne un client Orion de bout en bout, en une commande.
 #
-#   ./scripts/provision-client.sh poste-windows christophe@192.168.1.44 \
+#   ./scripts/provision-client.sh poste-windows christophe@100.72.220.76 \
 #       --endpoint 86.229.12.86:51820
 #   ./scripts/provision-client.sh portable --endpoint 86.229.12.86:51820
 #
@@ -36,6 +36,13 @@
 # il le dit avant d'agir.
 set -euo pipefail
 
+# Résolu AVANT le `cd` : plus bas, un garde-fou relit ce fichier avec awk, et
+# `$0` relatif — `./provision-client.sh` lancé depuis `scripts/` — ne désigne
+# plus rien une fois le répertoire changé. Le garde-fou échouait alors sans
+# bruit : awk se plaignait, `grep -q` ne trouvait rien, et le test passait à
+# vide. Un contrôle qui ne s'exécute pas est pire que pas de contrôle.
+CE_SCRIPT="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+
 # Un seul mot de passe sudo pour tout le déploiement : voir lib-remote.sh.
 # shellcheck source=scripts/lib-remote.sh
 . "$(dirname "$0")/lib-remote.sh"
@@ -49,6 +56,7 @@ MODE="ml-kem"
 ENDPOINT=""
 SERVER_NAME=""
 TRAFIC=""
+LEAF_VALIDITY_SECS=""
 
 usage() {
     cat >&2 <<'EOF'
@@ -65,6 +73,11 @@ Usage : ./scripts/provision-client.sh <nom-client> [hôte-ssh] [options]
                        chaque poste évite qu'un parc finisse avec autant de
                        tables de routage que d'utilisateurs.
                          --trafic "100.64.0.0/10, 192.168.1.0/24"
+  --leaf-validity-secs N
+                       Validité des feuilles clientes en secondes, pour un
+                       profil de test du renouvellement (minimum 120 ;
+                       défaut 825 jours). L'attente avant que le
+                       renouvellement s'ouvre vaut 0,8 × (V + 300) − 300.
   --remplacer          (sans effet : un pair du même nom est toujours remplacé)
   --refaire-ca         Régénère la CA opérateur ET la négociation de la
                        gateway. Invalide tous les clients déjà admis.
@@ -83,6 +96,7 @@ while [ $# -gt 0 ]; do
         --server-name) SERVER_NAME="${2:-}"; shift 2 ;;
         --mode) MODE="${2:-}"; shift 2 ;;
         --trafic|--allowed-ips) TRAFIC="${2:-}"; shift 2 ;;
+        --leaf-validity-secs) LEAF_VALIDITY_SECS="${2:-}"; shift 2 ;;
         --remplacer) REMPLACER=1; shift ;;
         --refaire-ca) REFAIRE_CA=1; shift ;;
         --sortie) SORTIE="${2:-}"; shift 2 ;;
@@ -175,12 +189,57 @@ CTL=(cargo run --quiet -p helios-ctl --)
 
 ARG_TRAFIC=()
 [ -n "$TRAFIC" ] && ARG_TRAFIC=(--allowed-ips "$TRAFIC")
+ARG_LEAF_VALIDITY=()
+if [ -n "$LEAF_VALIDITY_SECS" ]; then
+    case "$LEAF_VALIDITY_SECS" in
+        ''|*[!0-9]*)
+            echo "--leaf-validity-secs doit être un entier positif." >&2
+            exit 1
+            ;;
+    esac
+    if [ "$LEAF_VALIDITY_SECS" -lt 120 ]; then
+        echo "--leaf-validity-secs doit valoir au moins 120 secondes." >&2
+        exit 1
+    fi
+    ARG_LEAF_VALIDITY=(--validity-secs "$LEAF_VALIDITY_SECS")
+fi
+
+# Décidé ici, avant que quoi que ce soit ne bouge sur la gateway.
+#
+# `enroll` refuse d'écraser un profil — il porte des clés privées, et un
+# écrasement silencieux est la mauvaise valeur par défaut. Mais découvrir ce
+# refus À LA FIN laisse le pire état possible : la négociation de la gateway
+# refaite, le pair réadmis sous de nouveaux certificats, et aucun profil pour
+# s'y connecter — le matériel client vient d'être généré dans un répertoire
+# temporaire que la sortie efface. C'est exactement ce qui est arrivé.
+#
+# Le fichier est donc retiré maintenant, et seulement après l'avoir annoncé :
+# provisionner « $CLIENT » signifie faire marcher ce client-là, et l'ancien
+# profil devient invalide à la seconde où le pair est réadmis. Le même
+# raisonnement que pour l'admission, qui est nominative et se recrée.
+mkdir -p "$SORTIE"
+PROFIL="$SORTIE/$CLIENT.orion"
 
 echo "==> Client     $CLIENT"
 echo "==> Gateway    $CIBLE   (SSH)"
 echo "==> Public     $ENDPOINT   (nom authentifié : $SERVER_NAME, mode $MODE)"
 echo "==> CA         $CA_DIR"
 echo "==> Trafic     ${TRAFIC:-0.0.0.0/0 (tunnel complet)}"
+echo "==> Validité   ${LEAF_VALIDITY_SECS:-825 jours (production)}"
+echo "==> Profil     $PROFIL"
+if [ -e "$PROFIL" ]; then
+    echo "               un profil de ce nom existe : il sera remplacé, et il"
+    echo "               cesse de fonctionner de toute façon dès la réadmission"
+fi
+# Le répertoire doit être inscriptible maintenant, pas après la gateway.
+if ! : > "$PROFIL.essai" 2>/dev/null; then
+    echo >&2
+    echo "Le profil ne peut pas être écrit dans $SORTIE." >&2
+    echo "Corriger les droits — ou choisir un autre --sortie — avant de toucher" >&2
+    echo "à la gateway : une fois la négociation refaite, il n'y a pas de retour." >&2
+    exit 1
+fi
+rm -f -- "$PROFIL.essai"
 echo
 
 TRAVAIL="$(mktemp -d)"
@@ -237,7 +296,7 @@ EMPREINTES="$("${CTL[@]}" key-nego issue-client \
     --ca-private-key "$CA_DIR/orion-client-ca-key.der" \
     --ca-pq-private-key "$CA_DIR/orion-client-pq-ca-private.bin" \
     --wireguard-public-key "$WG_PUBLIQUE" \
-    --output-dir "$PKI")"
+    --output-dir "$PKI" "${ARG_LEAF_VALIDITY[@]}")"
 FP_TLS="$(printf '%s\n' "$EMPREINTES" | sed -n 's/^sha256: //p')"
 FP_PQ="$(printf '%s\n' "$EMPREINTES" | sed -n 's/^PQ certificate sha256: //p')"
 if [ -z "$FP_TLS" ] || [ -z "$FP_PQ" ]; then
@@ -267,13 +326,27 @@ if [ "$REFAIRE_CA" = 1 ]; then
     scp -q "$CA_DIR/orion-client-pq-ca-public.bin" "$CIBLE:/tmp/orion-client-pq-ca-public.bin"
 fi
 
+# Les deux certificats du client, publics, vont aussi à la gateway : une
+# gateway qui porte un domaine de confiance enregistre les feuilles elles-mêmes
+# et pas leurs empreintes — elle vérifie des signatures faites par elles. Sans
+# elles, le pair se connecte et ne peut jamais renouveler, et rien ne le dit
+# avant 80 % de la vie de sa feuille.
+echo "==> Envoi des certificats du client à la gateway"
+scp -q "$PKI/orion-client-cert.der" "$CIBLE:/tmp/helios-client-cert-$$.der"
+scp -q "$PKI/orion-client-pq-cert.json" "$CIBLE:/tmp/helios-client-pq-cert-$$.json"
+
 # Garde-fou : ce heredoc n'est pas quote — il ne peut pas l'etre, les valeurs
 # locales doivent s'y substituer — donc tout backtick ou $(...) y serait execute
 # ICI, a la construction. Le piege s'est referme deux fois : un « scp » entre
 # backticks dans un commentaire lancait scp sans argument, puis un « tail -1 »
 # faisait bloquer le script sur une lecture d'entree standard. Le test suivant
 # echoue tout de suite plutot que de laisser la surprise au poste de l'operateur.
-if awk '/^cat > "\$TRAVAIL\/gateway.sh" <<REMOTE$/,/^REMOTE$/' "$0" | grep -q '`'; then
+if [ ! -r "$CE_SCRIPT" ]; then
+    echo "Bug interne : ce script ne se relit pas ($CE_SCRIPT)." >&2
+    echo "Le garde-fou du heredoc distant ne peut pas s'executer." >&2
+    exit 1
+fi
+if awk '/^cat > "\$TRAVAIL\/gateway.sh" <<REMOTE$/,/^REMOTE$/' "$CE_SCRIPT" | grep -q '`'; then
     echo "Bug interne : un backtick subsiste dans le heredoc du script distant." >&2
     echo "Il serait execute a la construction. Le remplacer par des guillemets." >&2
     exit 1
@@ -293,6 +366,13 @@ if [ "$REFAIRE_CA" = 1 ]; then
         --client-pq-ca /tmp/orion-client-pq-ca-public.bin \
         --rotate
     rm -f /tmp/orion-client-ca.der /tmp/orion-client-pq-ca-public.bin
+    # L'identite de negociation n'est pas relue a chaud : elle est lue une fois
+    # au demarrage et servie jusqu'a l'arret. Sans ce redemarrage la gateway
+    # sert encore l'ancien certificat pendant que le profil epingle le neuf, et
+    # le client refuse le handshake QUIC sur « invalid peer certificate:
+    # BadSignature » — qui nomme une signature, pas l'ecart derriere elle.
+    echo "-- redemarrage de heliosd"
+    systemctl restart heliosd || echo "!! heliosd n'a pas redemarre : le faire a la main"
 fi
 
 # Le pair du meme nom est retire d'office, et ce n'est pas une commodite :
@@ -314,8 +394,11 @@ echo "-- peer add"
     --public-key '$WG_PUBLIQUE' \
     --key-negotiation-certificate-sha256 '$FP_TLS' \
     --key-negotiation-pq-certificate-sha256 '$FP_PQ' \
+    --certificate /tmp/helios-client-cert-$$.der \
+    --pq-certificate /tmp/helios-client-pq-cert-$$.json \
     --minimum-mode '$MODE' \
     | awk -F'\t' -v n='$CLIENT' '\$1 == n { print \$2 }' > "\$DEPOT/peer.txt"
+rm -f /tmp/helios-client-cert-$$.der /tmp/helios-client-pq-cert-$$.json
 
 # Le port de negociation ne figure dans aucun certificat : hors API, il faut
 # aller le lire dans la configuration de la gateway, sans quoi « enroll » refuse
@@ -323,8 +406,38 @@ echo "-- peer add"
 sed -n 's/^[[:space:]]*key_negotiation_port[[:space:]]*=[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
     /var/lib/helios/network.toml | head -1 > "\$DEPOT/port.txt"
 
+# L'API de cycle de vie n'est pas l'endpoint public et ne se devine pas depuis
+# l'adresse SSH : elle écoute sur l'adresse de la gateway dans le tunnel. Le
+# chemin hors API doit donc transmettre cette valeur à enroll, sinon le
+# profil peut se connecter mais Orion n'a aucune route à appeler au
+# renouvellement. Le port 8080 est le contrat aether::API_PORT.
+sed -n 's/^[[:space:]]*wg_address[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' \
+    /var/lib/helios/network.toml | head -1 > "\$DEPOT/wg-address.txt"
+
 cp /var/lib/helios/key-negotiation-cert.der "\$DEPOT/gw-cert.der"
 cp /var/lib/helios/key-negotiation-pq-cert.json "\$DEPOT/gw-pq-cert.json"
+
+# Le bloc de confiance du §19, sans lequel le client se connecte mais ne peut
+# pas renouveler son certificat. Il se lit apres l'admission : il porte la
+# generation de CE pair. Une gateway sans domaine amorce n'en a pas — ce n'est
+# pas une erreur, le fichier reste absent et l'enrolement le dit.
+# L'admission est déposée pour le démon, qui est seul propriétaire du registre
+# et la relit toutes les deux secondes : le bloc n'existe donc pas à l'instant
+# où « peer add » rend la main. On attend, plutôt que de conclure à son absence.
+ESSAI=0
+while [ "\$ESSAI" -lt 15 ]; do
+    if "\$HELIOSD" show-trust-enrolment --public-key '$WG_PUBLIQUE' \
+            > "\$DEPOT/trust.json" 2>"\$DEPOT/trust.err"; then
+        break
+    fi
+    rm -f "\$DEPOT/trust.json"
+    ESSAI=\$((ESSAI + 1))
+    sleep 1
+done
+if [ ! -s "\$DEPOT/trust.json" ]; then
+    rm -f "\$DEPOT/trust.json"
+    echo "-- pas de bloc de confiance : \$(tail -1 "\$DEPOT/trust.err")"
+fi
 # Rendus au compte qui a lance sudo : scp les reprendra sans privilege.
 # Ni backticks ni \$(...) dans ce heredoc : il n'est pas quote — il ne peut pas
 # l'etre, les valeurs locales doivent s'y substituer — donc tout backtick y
@@ -343,8 +456,12 @@ fi
 echo "==> Récupération des résultats"
 scp -q "$CIBLE:$DEPOT/peer.txt" "$TRAVAIL/peer.txt"
 scp -q "$CIBLE:$DEPOT/port.txt" "$TRAVAIL/port.txt"
+scp -q "$CIBLE:$DEPOT/wg-address.txt" "$TRAVAIL/wg-address.txt"
 scp -q "$CIBLE:$DEPOT/gw-cert.der" "$TRAVAIL/gw-cert.der"
 scp -q "$CIBLE:$DEPOT/gw-pq-cert.json" "$TRAVAIL/gw-pq-cert.json"
+# Absent quand la gateway n'a pas de domaine de confiance : `scp` échoue, et
+# c'est un cas légitime, pas une panne.
+scp -q "$CIBLE:$DEPOT/trust.json" "$TRAVAIL/trust.json" 2>/dev/null || true
 ssh "$CIBLE" "rm -rf -- '$DEPOT'"
 
 VIP="$(tr -d '\r' < "$TRAVAIL/peer.txt" | cut -f2)"
@@ -365,12 +482,36 @@ fi
 # laquelle ce script a joint la gateway en SSH.
 NEGOCIATION="${ENDPOINT%:*}:$PORT_NEGO"
 echo "    négociation $NEGOCIATION"
+
+WG_ADDRESS="$(tr -d '\r' < "$TRAVAIL/wg-address.txt")"
+WG_HOST="${WG_ADDRESS%%/*}"
+if [ -z "$WG_HOST" ] || [ "$WG_HOST" = "$WG_ADDRESS" ]; then
+    echo "La gateway ne publie pas un wg_address CIDR lisible dans network.toml." >&2
+    exit 1
+fi
+case "$WG_HOST" in
+    *:*) HELIOSD_URL="http://[$WG_HOST]:8080" ;;
+    *)   HELIOSD_URL="http://$WG_HOST:8080" ;;
+esac
+echo "    API dans le tunnel $HELIOSD_URL"
 [ -s "$TRAVAIL/gw-cert.der" ] || { echo "certificat TLS de la gateway vide" >&2; exit 1; }
 [ -s "$TRAVAIL/gw-pq-cert.json" ] || { echo "certificat PQ de la gateway vide" >&2; exit 1; }
 
+# Le bloc de confiance est facultatif : une gateway sans domaine amorcé en
+# produit aucun, et le client se connecte quand même — il ne pourra simplement
+# pas renouveler son certificat, ce qu'Orion affiche.
+ARG_CONFIANCE=()
+if [ -s "$TRAVAIL/trust.json" ]; then
+    ARG_CONFIANCE=(--trust-material "$TRAVAIL/trust.json")
+    echo "    matériel de confiance présent : le renouvellement sera disponible"
+else
+    echo "    aucun domaine de confiance sur la gateway : profil sans renouvellement"
+fi
+
 # ── 6. Enrôlement ────────────────────────────────────────────────────────────
-mkdir -p "$SORTIE"
-PROFIL="$SORTIE/$CLIENT.orion"
+# Retiré juste avant l'écriture, jamais plus tôt : un échec entre l'annonce et
+# ici laisserait l'opérateur sans profil ancien ni profil neuf.
+rm -f -- "$PROFIL"
 echo "==> Enrôlement"
 "${CTL[@]}" enroll \
     --name "$CLIENT" \
@@ -384,7 +525,8 @@ echo "==> Enrôlement"
     --gateway-certificate "$TRAVAIL/gw-cert.der" \
     --gateway-pq-certificate "$TRAVAIL/gw-pq-cert.json" \
     --address "$VIP" \
-    --output "$PROFIL" "${ARG_TRAFIC[@]}"
+    --heliosd-url "$HELIOSD_URL" \
+    --output "$PROFIL" "${ARG_TRAFIC[@]}" "${ARG_CONFIANCE[@]}"
 
 echo
 echo "==> Profil écrit : $PROFIL"
@@ -393,6 +535,7 @@ echo "Il porte les clés privées du client : le transmettre par un canal"
 echo "contrôlé, l'importer dans Orion, puis le détruire des deux côtés."
 if [ "$REFAIRE_CA" = 1 ]; then
     echo
-    echo "⚠  La négociation de la gateway a été réinitialisée : tous les autres"
-    echo "   clients doivent être réenrôlés avec ce même script."
+    echo "⚠  La négociation de la gateway a été réinitialisée, et le démon"
+    echo "   redémarré pour la servir : tous les autres clients doivent être"
+    echo "   réenrôlés avec ce même script."
 fi

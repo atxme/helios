@@ -28,7 +28,7 @@ use aws_lc_rs::{constant_time, digest};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use fips204::{
     ml_dsa_87::{self, PublicKey},
-    traits::{SerDes, Verifier},
+    traits::SerDes,
 };
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
 
@@ -290,12 +290,6 @@ impl MlDsa87PublicKey {
         input.extend_from_slice(&self.0);
         Fingerprint::of(&input)
     }
-
-    fn verifier(&self) -> Result<PublicKey, CertificateError> {
-        let fixed = <[u8; ml_dsa_87::PK_LEN]>::try_from(self.0.as_slice())
-            .map_err(|_| CertificateError::InvalidPublicKey)?;
-        PublicKey::try_from_bytes(fixed).map_err(|_| CertificateError::InvalidPublicKey)
-    }
 }
 
 impl fmt::Debug for MlDsa87PublicKey {
@@ -450,34 +444,40 @@ pub fn validate_server_name(value: &str) -> Result<(), CertificateError> {
 /// Every object in this module builds its signed bytes here, so the encoding
 /// rules live in one place instead of being restated — and mistyped — once per
 /// message.
-pub(crate) struct CanonicalBytes(Vec<u8>);
+pub(crate) struct CanonicalBytes {
+    domain: Vec<u8>,
+    bytes: Vec<u8>,
+}
 
 impl CanonicalBytes {
     /// Starts a transcript with its domain separator.
     pub(crate) fn new(domain: &[u8]) -> Self {
         let mut buffer = Vec::with_capacity(512);
         buffer.extend_from_slice(domain);
-        Self(buffer)
+        Self {
+            domain: domain.to_vec(),
+            bytes: buffer,
+        }
     }
 
     pub(crate) fn u8(&mut self, value: u8) -> &mut Self {
-        self.0.push(value);
+        self.bytes.push(value);
         self
     }
 
     pub(crate) fn u16(&mut self, value: u16) -> &mut Self {
-        self.0.extend_from_slice(&value.to_be_bytes());
+        self.bytes.extend_from_slice(&value.to_be_bytes());
         self
     }
 
     pub(crate) fn u64(&mut self, value: u64) -> &mut Self {
-        self.0.extend_from_slice(&value.to_be_bytes());
+        self.bytes.extend_from_slice(&value.to_be_bytes());
         self
     }
 
     /// Raw fixed-length bytes: identifiers, keys and fingerprints only.
     pub(crate) fn raw(&mut self, bytes: &[u8]) -> &mut Self {
-        self.0.extend_from_slice(bytes);
+        self.bytes.extend_from_slice(bytes);
         self
     }
 
@@ -507,17 +507,31 @@ impl CanonicalBytes {
         }
     }
 
-    /// An optional integer: a presence byte, then the value if present.
+    /// A revoked leaf and its cryptographic expiry, behind **one** presence
+    /// byte (spec §0.5).
     ///
-    /// Using zero as an absence sentinel would make `None` and `Some(0)` share
-    /// one signed transcript even though they have different semantics.
-    pub(crate) fn optional_u64(&mut self, value: Option<u64>) -> &mut Self {
-        match value {
-            Some(value) => {
+    /// The two halves are one decision: a fingerprint without its `not_after`
+    /// is a revocation that never expires, and an expiry without a fingerprint
+    /// names nothing. Encoding them under two independent flags lets the
+    /// canonical bytes express a pair the validator forbids — and a verifier
+    /// that skipped the validator would accept it, because the bytes are still
+    /// well-formed. One flag makes the impossible state unrepresentable in the
+    /// transcript itself.
+    pub(crate) fn optional_revoked_leaf(
+        &mut self,
+        fingerprint: Option<&Fingerprint>,
+        not_after: Option<u64>,
+    ) -> &mut Self {
+        match (fingerprint, not_after) {
+            (Some(fingerprint), Some(not_after)) => {
                 self.u8(1);
-                self.u64(value)
+                self.fingerprint(fingerprint);
+                self.u64(not_after)
             }
-            None => self.u8(0),
+            // A half-filled pair encodes as absent rather than as itself: the
+            // object is refused by `validate` either way, and a transcript
+            // that could carry it would be a transcript worth forging.
+            _ => self.u8(0),
         }
     }
 
@@ -526,8 +540,8 @@ impl CanonicalBytes {
         // A field longer than 4 GiB cannot exist here: every variable-length
         // type in this module is bounded well below that at deserialization.
         let length = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
-        self.0.extend_from_slice(&length.to_be_bytes());
-        self.0.extend_from_slice(bytes);
+        self.bytes.extend_from_slice(&length.to_be_bytes());
+        self.bytes.extend_from_slice(bytes);
         self
     }
 
@@ -535,24 +549,61 @@ impl CanonicalBytes {
         self.length_prefixed(value.as_bytes())
     }
 
+    /// The accumulated bytes, for a value that is hashed rather than signed.
     pub(crate) fn finish(&self) -> Vec<u8> {
-        self.0.clone()
+        self.bytes.clone()
+    }
+
+    /// The accumulated bytes, bound to the domain they must be signed under.
+    pub(crate) fn finish_signed(&self) -> SignedTranscript {
+        SignedTranscript {
+            domain: self.domain.clone(),
+            bytes: self.bytes.clone(),
+        }
+    }
+}
+
+/// A canonical transcript and the ML-DSA-87 context it must be signed under.
+///
+/// The specification asks for two distinct controls: the domain opens the
+/// signed bytes, *and* it is the external context of the signature. Carrying
+/// them in one value is what keeps them from drifting apart — a call site
+/// cannot pick the context, because it never sees one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedTranscript {
+    domain: Vec<u8>,
+    bytes: Vec<u8>,
+}
+
+impl SignedTranscript {
+    /// The signed bytes.
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// The external context, validated as a FIPS 204 domain.
+    fn context(&self) -> Result<crate::ml_dsa::Context<'_>, CertificateError> {
+        crate::ml_dsa::Context::new(&self.domain)
+            .map_err(|_| CertificateError::InvalidSigningContext)
     }
 }
 
 /// Verifies an ML-DSA-87 signature over a canonical transcript.
 pub fn verify_ml_dsa_87(
     public_key: &MlDsa87PublicKey,
-    message: &[u8],
+    transcript: &SignedTranscript,
     signature: &MlDsa87Signature,
 ) -> Result<(), CertificateError> {
-    let verifier = public_key.verifier()?;
-    let signature = <[u8; ml_dsa_87::SIG_LEN]>::try_from(signature.as_bytes())
-        .map_err(|_| CertificateError::InvalidSignatureEncoding)?;
-    if !verifier.verify(message, &signature, &[]) {
-        return Err(CertificateError::InvalidSignature);
+    if signature.as_bytes().len() != ml_dsa_87::SIG_LEN {
+        return Err(CertificateError::InvalidSignatureEncoding);
     }
-    Ok(())
+    crate::ml_dsa::verify(
+        public_key.as_bytes(),
+        transcript.context()?,
+        transcript.as_bytes(),
+        signature.as_bytes(),
+    )
+    .map_err(map_ml_dsa_error)
 }
 
 /// Signs a canonical transcript with an ML-DSA-87 private key.
@@ -560,36 +611,56 @@ pub fn verify_ml_dsa_87(
 /// Behind the same feature as the negotiation signing API: a gateway that only
 /// verifies never links a signing implementation.
 #[cfg(feature = "key-negotiation-signing")]
-pub fn sign_ml_dsa_87(
+pub(crate) fn sign_ml_dsa_87(
     private_key: &[u8],
-    message: &[u8],
+    transcript: &SignedTranscript,
 ) -> Result<MlDsa87Signature, CertificateError> {
-    use fips204::{ml_dsa_87::PrivateKey, traits::Signer as _};
+    let signature = crate::ml_dsa::sign(private_key, transcript.context()?, transcript.as_bytes())
+        .map_err(map_ml_dsa_error)?;
+    MlDsa87Signature::new(signature)
+}
 
-    let private_key = <[u8; ml_dsa_87::SK_LEN]>::try_from(private_key)
-        .map_err(|_| CertificateError::InvalidPrivateKey)?;
-    let private_key =
-        PrivateKey::try_from_bytes(private_key).map_err(|_| CertificateError::InvalidPrivateKey)?;
-    let signature = private_key
-        .try_sign(message, &[])
-        .map_err(|_| CertificateError::Signing)?;
-    MlDsa87Signature::new(signature.to_vec())
+fn map_ml_dsa_error(error: crate::ml_dsa::MlDsaError) -> CertificateError {
+    use crate::ml_dsa::MlDsaError;
+
+    match error {
+        MlDsaError::InvalidContext | MlDsaError::DomainMismatch => {
+            CertificateError::InvalidSigningContext
+        }
+        MlDsaError::InvalidPublicKey => CertificateError::InvalidPublicKey,
+        #[cfg(feature = "key-negotiation-signing")]
+        MlDsaError::InvalidPrivateKey => CertificateError::InvalidPrivateKey,
+        MlDsaError::InvalidSignature => CertificateError::InvalidSignature,
+        #[cfg(feature = "key-negotiation-signing")]
+        MlDsaError::Signing => CertificateError::Signing,
+    }
 }
 
 /// Generates an ML-DSA-87 authority or leaf key pair.
 ///
 /// Returns `(private, public)`. The private half is the caller's to seal — no
-/// path in this module writes one to disk.
+/// path in this module writes one to disk. The bytes come from the approved
+/// DRBG with prediction resistance, never from the platform CSPRNG directly.
 #[cfg(feature = "key-negotiation-signing")]
 pub fn generate_ml_dsa_87_keypair(
 ) -> Result<(zeroize::Zeroizing<Vec<u8>>, MlDsa87PublicKey), CertificateError> {
-    let (public_key, private_key) =
-        ml_dsa_87::try_keygen().map_err(|_| CertificateError::Signing)?;
-    let public_key = MlDsa87PublicKey::new(public_key.into_bytes().to_vec())?;
-    Ok((
-        zeroize::Zeroizing::new(private_key.into_bytes().to_vec()),
-        public_key,
-    ))
+    let (private_key, public_key) = crate::ml_dsa::generate_keypair().map_err(map_ml_dsa_error)?;
+    let public_key = MlDsa87PublicKey::new(public_key)?;
+    Ok((private_key, public_key))
+}
+
+/// Derives the public half of a stored ML-DSA-87 private key.
+///
+/// Loading an Astra issuer uses this comparison as its proof of possession;
+/// no ad-hoc signed message or context is introduced outside the normative
+/// context registry.
+#[cfg(feature = "key-negotiation-signing")]
+pub fn derive_ml_dsa_87_public_key(
+    private_key: &[u8],
+) -> Result<MlDsa87PublicKey, CertificateError> {
+    let public_key =
+        crate::ml_dsa::public_key_from_private(private_key).map_err(map_ml_dsa_error)?;
+    MlDsa87PublicKey::new(public_key)
 }
 
 #[cfg(test)]
@@ -650,13 +721,40 @@ mod tests {
         assert_ne!(absent.finish(), zero.finish());
     }
 
+    /// One presence byte covers a revoked leaf **and** its expiry (spec §0.5).
+    ///
+    /// Three properties, and each one is a way the old two-flag encoding could
+    /// be wrong: an absent pair does not encode like a present all-zero one; a
+    /// half-filled pair encodes as absent rather than as itself, so the
+    /// transcript cannot describe a state the object refuses; and two
+    /// different expiries under one fingerprint stay distinguishable.
     #[test]
-    fn an_absent_optional_integer_does_not_encode_like_zero() {
+    fn a_revoked_leaf_and_its_expiry_share_one_presence_byte() {
+        let leaf = Fingerprint::from_bytes([0; FINGERPRINT_LEN]);
+
         let mut absent = CanonicalBytes::new(b"domain");
-        absent.optional_u64(None);
+        absent.optional_revoked_leaf(None, None);
         let mut zero = CanonicalBytes::new(b"domain");
-        zero.optional_u64(Some(0));
+        zero.optional_revoked_leaf(Some(&leaf), Some(0));
         assert_ne!(absent.finish(), zero.finish());
+
+        // A fingerprint with no expiry is a revocation that never ends, and an
+        // expiry with no fingerprint names nothing. Neither is expressible.
+        let mut half = CanonicalBytes::new(b"domain");
+        half.optional_revoked_leaf(Some(&leaf), None);
+        let mut other_half = CanonicalBytes::new(b"domain");
+        other_half.optional_revoked_leaf(None, Some(10_000));
+        let mut nothing = CanonicalBytes::new(b"domain");
+        nothing.optional_revoked_leaf(None, None);
+        let nothing = nothing.finish();
+        assert_eq!(half.finish(), nothing);
+        assert_eq!(other_half.finish(), nothing);
+
+        let mut early = CanonicalBytes::new(b"domain");
+        early.optional_revoked_leaf(Some(&leaf), Some(1));
+        let mut late = CanonicalBytes::new(b"domain");
+        late.optional_revoked_leaf(Some(&leaf), Some(2));
+        assert_ne!(early.finish(), late.finish());
     }
 
     /// Two adjacent variable-length fields must not be re-splittable.
@@ -698,11 +796,61 @@ mod tests {
     #[test]
     fn a_signature_verifies_only_over_the_bytes_it_covers() {
         let (private_key, public_key) = generate_ml_dsa_87_keypair().expect("keygen");
-        let signature = sign_ml_dsa_87(&private_key, b"transcript").expect("sign");
-        assert!(verify_ml_dsa_87(&public_key, b"transcript", &signature).is_ok());
+        let mut transcript = CanonicalBytes::new(b"helios-trust-base-state-v5");
+        transcript.u64(7);
+        let transcript = transcript.finish_signed();
+        let signature = sign_ml_dsa_87(&private_key, &transcript).expect("sign");
+        assert!(verify_ml_dsa_87(&public_key, &transcript, &signature).is_ok());
+
+        let mut moved = CanonicalBytes::new(b"helios-trust-base-state-v5");
+        moved.u64(8);
         assert!(matches!(
-            verify_ml_dsa_87(&public_key, b"transcripT", &signature),
+            verify_ml_dsa_87(&public_key, &moved.finish_signed(), &signature),
             Err(CertificateError::InvalidSignature)
+        ));
+    }
+
+    /// A transcript carries its own context, so no call site can swap one.
+    ///
+    /// Pointing a verification at another type's domain does not produce a
+    /// signature that fails to verify — it produces a transcript that no
+    /// longer opens with its domain, which is refused before any arithmetic.
+    /// The cryptographic half of the separation is exercised in
+    /// [`crate::ml_dsa`].
+    #[cfg(feature = "key-negotiation-signing")]
+    #[test]
+    fn a_context_cannot_be_pointed_at_another_types_transcript() {
+        let (private_key, public_key) = generate_ml_dsa_87_keypair().expect("keygen");
+        let transcript = CanonicalBytes::new(b"helios-trust-base-state-v5").finish_signed();
+        let signature = sign_ml_dsa_87(&private_key, &transcript).expect("sign");
+        let elsewhere = SignedTranscript {
+            domain: b"helios-ca-transition-v5".to_vec(),
+            bytes: transcript.as_bytes().to_vec(),
+        };
+        assert!(matches!(
+            verify_ml_dsa_87(&public_key, &elsewhere, &signature),
+            Err(CertificateError::InvalidSigningContext)
+        ));
+    }
+
+    /// A transcript whose domain is not a usable context is refused before any
+    /// signature exists, on both sides.
+    #[cfg(feature = "key-negotiation-signing")]
+    #[test]
+    fn a_transcript_without_a_usable_domain_is_refused() {
+        let (private_key, public_key) = generate_ml_dsa_87_keypair().expect("keygen");
+        let empty = SignedTranscript {
+            domain: Vec::new(),
+            bytes: Vec::new(),
+        };
+        assert!(matches!(
+            sign_ml_dsa_87(&private_key, &empty),
+            Err(CertificateError::InvalidSigningContext)
+        ));
+        let signature = MlDsa87Signature::new(vec![0; ml_dsa_87::SIG_LEN]).expect("signature");
+        assert!(matches!(
+            verify_ml_dsa_87(&public_key, &empty, &signature),
+            Err(CertificateError::InvalidSigningContext)
         ));
     }
 

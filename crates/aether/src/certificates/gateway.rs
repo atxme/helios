@@ -37,13 +37,14 @@ use super::{
     authority::RotationReason,
     encoding::{
         validate_server_name, verify_ml_dsa_87, CanonicalBytes, DerCertificate, Fingerprint, Id16,
-        MlDsa87PublicKey, MlDsa87Signature, TrustDomainId, WireGuardKey,
+        MlDsa87PublicKey, MlDsa87Signature, SignedTranscript, TrustDomainId, WireGuardKey,
     },
     window::{require_next_generation, TransitionWindow, MAX_REQUEST_LIFETIME_SECS},
     CertificateError, CERTIFICATE_FORMAT_VERSION, CERTIFICATE_PROTOCOL_VERSION,
 };
 
 const GATEWAY_REQUEST_DOMAIN: &[u8] = b"helios-gateway-certificate-request-v5";
+const GATEWAY_BOOTSTRAP_REQUEST_DOMAIN: &[u8] = b"helios-gateway-bootstrap-request-v5";
 const GATEWAY_TRANSITION_DOMAIN: &[u8] = b"helios-gateway-identity-transition-v5";
 const GATEWAY_ABORT_DOMAIN: &[u8] = b"helios-gateway-identity-transition-abort-v5";
 
@@ -72,6 +73,58 @@ pub enum Continuity<'a> {
     WaivedForKeyRecovery,
 }
 
+/// Public proof exported before a trust domain knows this gateway (§13.1).
+///
+/// The request deliberately carries no trust-domain identifier or epoch: the
+/// operator's offline authority supplies those when it issues epoch 1. The
+/// stable WireGuard identity and server name are signed by the private half of
+/// `ml_dsa_87_public_key`, proving that the key certified by `CA-PQ` is the one
+/// generated and sealed on the gateway. No private material leaves that host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayBootstrapRequest {
+    pub format_version: u16,
+    pub gateway_wg_public_key: WireGuardKey,
+    pub server_name: String,
+    pub ml_dsa_87_public_key: MlDsa87PublicKey,
+    pub key_possession_proof: MlDsa87Signature,
+}
+
+impl GatewayBootstrapRequest {
+    fn signing_bytes(&self) -> SignedTranscript {
+        let mut bytes = CanonicalBytes::new(GATEWAY_BOOTSTRAP_REQUEST_DOMAIN);
+        bytes
+            .u16(self.format_version)
+            .key(&self.gateway_wg_public_key)
+            .text(&self.server_name)
+            .length_prefixed(self.ml_dsa_87_public_key.as_bytes());
+        bytes.finish_signed()
+    }
+
+    pub fn fingerprint(&self) -> Fingerprint {
+        let mut bytes = CanonicalBytes::new(self.signing_bytes().as_bytes());
+        bytes.length_prefixed(self.key_possession_proof.as_bytes());
+        Fingerprint::of(&bytes.finish())
+    }
+
+    /// Verifies the stable identity and proof of possession before issuance.
+    pub fn verify(&self) -> Result<(), CertificateError> {
+        if self.format_version != CERTIFICATE_FORMAT_VERSION {
+            return Err(CertificateError::UnsupportedFormatVersion {
+                received: self.format_version,
+                supported: CERTIFICATE_FORMAT_VERSION,
+            });
+        }
+        validate_server_name(&self.server_name)?;
+        verify_ml_dsa_87(
+            &self.ml_dsa_87_public_key,
+            &self.signing_bytes(),
+            &self.key_possession_proof,
+        )
+        .map_err(|_| CertificateError::MissingProof("bootstrap gateway"))
+    }
+}
+
 /// Public request the operator companion turns into a leaf (spec §5).
 ///
 /// The gateway generates and seals its own ML-DSA-87 private key; this object
@@ -97,7 +150,7 @@ pub struct GatewayCertificateRequest {
 }
 
 impl GatewayCertificateRequest {
-    fn signing_bytes(&self) -> Vec<u8> {
+    fn signing_bytes(&self) -> SignedTranscript {
         let mut bytes = CanonicalBytes::new(GATEWAY_REQUEST_DOMAIN);
         bytes
             .u16(self.format_version)
@@ -109,11 +162,11 @@ impl GatewayCertificateRequest {
             .id(&self.request_id)
             .u64(self.created_at)
             .u64(self.expires_at);
-        bytes.finish()
+        bytes.finish_signed()
     }
 
     pub fn fingerprint(&self) -> Fingerprint {
-        let mut bytes = CanonicalBytes::new(&self.signing_bytes());
+        let mut bytes = CanonicalBytes::new(self.signing_bytes().as_bytes());
         bytes.length_prefixed(self.new_key_proof.as_bytes());
         match &self.current_key_authorization {
             Some(signature) => {
@@ -215,7 +268,7 @@ pub struct GatewayIdentityTransition {
 }
 
 impl GatewayIdentityTransition {
-    fn signing_bytes(&self) -> Result<Vec<u8>, CertificateError> {
+    fn signing_bytes(&self) -> Result<SignedTranscript, CertificateError> {
         let next_tls = self
             .next_gateway_tls_certificate
             .as_ref()
@@ -243,12 +296,12 @@ impl GatewayIdentityTransition {
             .u64(self.window.activation_at)
             .u64(self.window.not_after)
             .u8(self.reason.domain_byte());
-        Ok(bytes.finish())
+        Ok(bytes.finish_signed())
     }
 
     /// Identifies the exact document an abort names (spec §6.3).
     pub fn fingerprint(&self) -> Result<Fingerprint, CertificateError> {
-        let mut bytes = CanonicalBytes::new(&self.signing_bytes()?);
+        let mut bytes = CanonicalBytes::new(self.signing_bytes()?.as_bytes());
         bytes.length_prefixed(self.ca_signature.as_bytes());
         Ok(Fingerprint::of(&bytes.finish()))
     }
@@ -315,6 +368,22 @@ impl GatewayIdentityTransition {
         }
         validate_server_name(&self.server_name)?;
         require_next_generation(gateway_decision_epoch, self.gateway_identity_epoch)?;
+        // §6.1 admits three reasons here, and `RotationReason` carries six:
+        // the other three describe a **client** decision. Nothing downstream
+        // branches on this field, which is exactly why it has to be checked —
+        // an unread value is one nobody would notice being wrong, and it is
+        // signed, so it would be wrong in a document an operator approved.
+        if !matches!(
+            self.reason,
+            RotationReason::Scheduled
+                | RotationReason::KeyRecovery
+                | RotationReason::EmergencyReplacement
+        ) {
+            return Err(CertificateError::IssuerScopeViolation(
+                "a gateway identity transition carries scheduled, key_recovery or \
+                 emergency_replacement",
+            ));
+        }
         if self.next_gateway_tls_certificate.is_none() && self.next_gateway_certificate.is_none() {
             return Err(CertificateError::EmptyTransition);
         }
@@ -402,7 +471,7 @@ pub struct GatewayTransitionAbort {
 }
 
 impl GatewayTransitionAbort {
-    fn signing_bytes(&self) -> Vec<u8> {
+    fn signing_bytes(&self) -> SignedTranscript {
         let mut bytes = CanonicalBytes::new(GATEWAY_ABORT_DOMAIN);
         bytes
             .u16(self.format_version)
@@ -416,11 +485,11 @@ impl GatewayTransitionAbort {
             .u64(self.aborted_at)
             .u8(self.reason.domain_byte())
             .fingerprint(&self.campaign_fingerprint);
-        bytes.finish()
+        bytes.finish_signed()
     }
 
     pub fn fingerprint(&self) -> Fingerprint {
-        let mut bytes = CanonicalBytes::new(&self.signing_bytes());
+        let mut bytes = CanonicalBytes::new(self.signing_bytes().as_bytes());
         bytes.length_prefixed(self.ca_signature.as_bytes());
         Fingerprint::of(&bytes.finish())
     }
@@ -514,6 +583,13 @@ pub struct GatewayTransitionAbortTombstone {
 mod signing {
     use super::*;
     use crate::certificates::encoding::sign_ml_dsa_87;
+
+    impl GatewayBootstrapRequest {
+        pub fn sign(mut self, private_key: &[u8]) -> Result<Self, CertificateError> {
+            self.key_possession_proof = sign_ml_dsa_87(private_key, &self.signing_bytes())?;
+            Ok(self)
+        }
+    }
 
     impl GatewayCertificateRequest {
         /// `current_key_private` is `None` on the key-recovery path, where the
@@ -609,6 +685,29 @@ mod tests {
         DerCertificate::new(certificate.der().to_vec()).expect("DER")
     }
 
+    #[test]
+    fn a_bootstrap_request_proves_the_key_sealed_by_the_gateway() {
+        let gateway = keys();
+        let request = GatewayBootstrapRequest {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            gateway_wg_public_key: gateway_key(),
+            server_name: SERVER_NAME.into(),
+            ml_dsa_87_public_key: gateway.public.clone(),
+            key_possession_proof: MlDsa87Signature::placeholder(),
+        }
+        .sign(&gateway.private)
+        .expect("sign request");
+
+        request.verify().expect("verify request");
+
+        let mut substituted = request;
+        substituted.gateway_wg_public_key = WireGuardKey::from_bytes([9; 32]);
+        assert!(matches!(
+            substituted.verify(),
+            Err(CertificateError::MissingProof("bootstrap gateway"))
+        ));
+    }
+
     fn transition(ca: &Keys, next_leaf: Option<PqCertificate>) -> GatewayIdentityTransition {
         let mut transition = GatewayIdentityTransition {
             format_version: CERTIFICATE_FORMAT_VERSION,
@@ -626,6 +725,50 @@ mod tests {
             reason: RotationReason::Scheduled,
             ca_signature: MlDsa87Signature::new(vec![0; 4627]).expect("placeholder"),
         };
+        let transcript = transition.signing_bytes().expect("transcript");
+        transition.ca_signature = sign_ml_dsa_87(&ca.private, &transcript).expect("sign");
+        transition
+    }
+
+    /// §6.1 admits three reasons; `RotationReason` carries six, and the other
+    /// three describe a client decision. Nothing downstream reads this field,
+    /// which is why an unchecked value would be a signed lie nobody notices.
+    #[test]
+    fn a_transition_carries_only_the_three_reasons_of_the_gateway() {
+        let ca = keys();
+        let subject = keys();
+        let leaf = gateway_leaf(&ca, &subject);
+
+        for reason in [
+            RotationReason::Scheduled,
+            RotationReason::KeyRecovery,
+            RotationReason::EmergencyReplacement,
+        ] {
+            let mut accepted = transition(&ca, Some(leaf.clone()));
+            accepted.reason = reason;
+            let signed = resign(accepted, &ca);
+            verify(&signed, &ca, 1).unwrap_or_else(|error| panic!("{reason:?}: {error}"));
+        }
+
+        for reason in [
+            RotationReason::ManualGlobal,
+            RotationReason::ExpiredRecovery,
+            RotationReason::Readmission,
+        ] {
+            let mut refused = transition(&ca, Some(leaf.clone()));
+            refused.reason = reason;
+            let signed = resign(refused, &ca);
+            assert!(
+                matches!(
+                    verify(&signed, &ca, 1),
+                    Err(CertificateError::IssuerScopeViolation(_))
+                ),
+                "{reason:?} was accepted on a gateway transition"
+            );
+        }
+    }
+
+    fn resign(mut transition: GatewayIdentityTransition, ca: &Keys) -> GatewayIdentityTransition {
         let transcript = transition.signing_bytes().expect("transcript");
         transition.ca_signature = sign_ml_dsa_87(&ca.private, &transcript).expect("sign");
         transition

@@ -39,7 +39,7 @@ possède sa propre catégorie.
 
 Usage
 -----
-    python3 scripts/target_campaign.py --host christophe@192.168.1.44
+    python3 scripts/target_campaign.py --host christophe@100.72.220.76
     python3 scripts/target_campaign.py --only unite
     python3 scripts/target_campaign.py --pare-feu --json rapport.json
 """
@@ -1603,7 +1603,7 @@ ajoute l'utilisateur au groupe tss. Un seul mot de passe sudo est demandé.
 
 Seules les dépendances système restent à poser une fois, sur la cible :
 
-    ssh -t christophe@192.168.1.44 'cd ~/helios && bash scripts/setup-dev.sh --target'
+    ssh -t christophe@100.72.220.76 'cd ~/helios && bash scripts/setup-dev.sh --target'
 
 Règle générée pour cette cible, donnée à titre de contrôle :
 

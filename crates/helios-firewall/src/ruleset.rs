@@ -65,6 +65,33 @@ const PRIVATE_IPV4_CIDRS: [&str; 4] = [
     "192.168.0.0/16",
 ];
 
+/// Fixed, host-visible bridge of the Astra private channel (spec §8.3).
+///
+/// Compose gives the bridge this exact name; keeping the tuple here avoids an
+/// interface wildcard turning a source-spoofed packet into an authority call.
+const ASTRA_PRIVATE_IFACE: &str = "astra0";
+const ASTRA_PRIVATE_HOST: &str = "10.88.7.1/32";
+const ASTRA_PRIVATE_PEER: &str = "10.88.7.2/32";
+const HELIOS_LIFECYCLE_PORT: u16 = 8444;
+const ASTRA_LIFECYCLE_PORT: u16 = 8445;
+
+/// Fixed bridge of the Astra **public** origin, and its two coordinates.
+///
+/// Named for the same reason `astra0` is: compose pins the bridge and the
+/// addresses, so the opening below can state all four coordinates instead of
+/// wildcarding an interface Docker renames on every recreation.
+///
+/// The origin is published on `127.0.0.1:8443`, which Docker DNATs onto this
+/// bridge. Without this rule the translated packet leaves through `astra1`,
+/// matches nothing in a chain whose policy is `drop`, and dies — so the
+/// authority's own machine cannot reach the authority. That is what blocks
+/// the expired-identity recovery of ADR-008 §7.5, whose whole point is to be
+/// reachable when the tunnel is not.
+const ASTRA_PUBLIC_IFACE: &str = "astra1";
+const ASTRA_PUBLIC_HOST: &str = "10.88.7.9/32";
+const ASTRA_PUBLIC_PEER: &str = "10.88.7.10/32";
+const ASTRA_ORIGIN_PORT: u16 = 8443;
+
 /// Verdict of a rule or default policy of a chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
@@ -275,34 +302,6 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
         rules.push(
             Rule::new(
                 Input,
-                vec![
-                    Match::DestPort {
-                        port: SPEEDTEST_PORT,
-                        proto: L4::Tcp,
-                    },
-                    Match::InIface(iface.to_string()),
-                ],
-                Verdict::Accept,
-            )
-            .with_note("raw speedtest TCP: only via the tunnel interface"),
-        );
-        rules.push(
-            Rule::new(
-                Input,
-                vec![
-                    Match::DestPort {
-                        port: SPEEDTEST_PORT,
-                        proto: L4::Udp,
-                    },
-                    Match::InIface(iface.to_string()),
-                ],
-                Verdict::Accept,
-            )
-            .with_note("raw speedtest UDP: only via the tunnel interface"),
-        );
-        rules.push(
-            Rule::new(
-                Input,
                 vec![Match::DestPort {
                     port,
                     proto: L4::Tcp,
@@ -333,6 +332,65 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
         rules.push(Rule::new(chain, vec![loopback], Verdict::Accept));
         rules.push(Rule::new(chain, vec![Match::Established], Verdict::Accept));
     }
+
+    // ── Private Astra ↔ Helios lifecycle channel ───────────────────────────
+    // These openings name all four coordinates: interface, source, target and
+    // port. They are harmless when the optional bridge does not exist and do
+    // not grant the container any forwarding or general host access.
+    rules.push(
+        Rule::new(
+            Input,
+            vec![
+                Match::InIface(ASTRA_PRIVATE_IFACE.into()),
+                Match::SourceNet(ASTRA_PRIVATE_PEER.into()),
+                Match::DestNet(ASTRA_PRIVATE_HOST.into()),
+                Match::DestPort {
+                    port: HELIOS_LIFECYCLE_PORT,
+                    proto: L4::Tcp,
+                },
+            ],
+            Verdict::Accept,
+        )
+        .with_note("Astra mTLS client to the private Helios lifecycle API"),
+    );
+    rules.push(
+        Rule::new(
+            Output,
+            vec![
+                Match::OutIface(ASTRA_PRIVATE_IFACE.into()),
+                Match::SourceNet(ASTRA_PRIVATE_HOST.into()),
+                Match::DestNet(ASTRA_PRIVATE_PEER.into()),
+                Match::DestPort {
+                    port: ASTRA_LIFECYCLE_PORT,
+                    proto: L4::Tcp,
+                },
+            ],
+            Verdict::Accept,
+        )
+        .with_note("Helios mTLS client to the private Astra lifecycle API"),
+    );
+    // The gateway reaching the authority's public origin, on its own machine.
+    //
+    // Output only, and scoped to the container: nothing here lets the origin
+    // out to the WAN, and nothing lets a third party in. `forward` stays
+    // `drop`, so the container gains no route through the gateway either —
+    // the opening is the host's, not Astra's.
+    rules.push(
+        Rule::new(
+            Output,
+            vec![
+                Match::OutIface(ASTRA_PUBLIC_IFACE.into()),
+                Match::SourceNet(ASTRA_PUBLIC_HOST.into()),
+                Match::DestNet(ASTRA_PUBLIC_PEER.into()),
+                Match::DestPort {
+                    port: ASTRA_ORIGIN_PORT,
+                    proto: L4::Tcp,
+                },
+            ],
+            Verdict::Accept,
+        )
+        .with_note("Helios client to the public Astra origin, published on loopback"),
+    );
 
     // ── WireGuard listener (server role) ─────────────────────────────────────
     // Road-warrior clients arrive from unknown, changing IPs: impossible to
@@ -692,6 +750,38 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
                 .with_note("administrative SSH arriving through the tunnel"),
             );
         }
+        // The Helios speedtest, on the address the daemon binds inside the
+        // tunnel.
+        //
+        // It lives here, with the tunnel's own openings, and no longer beside
+        // the administration API. It sat in that block for as long as it took
+        // one gateway to leave `admin_iface` unset: `admin_port` is derived
+        // from that field, the whole block is skipped when it is absent, and
+        // the two rules below went with it. Nothing else opens the speedtest
+        // port, so every probe was dropped in `input` — and a drop is silent,
+        // so the client reported a timeout (`os error 10060`) against a daemon
+        // that was listening perfectly well. The opening belongs to the
+        // interface the service listens on, not to another service's
+        // configuration.
+        //
+        // Input only: the gateway never opens a speedtest flow of its own, and
+        // its answers are `established`.
+        for proto in [L4::Tcp, L4::Udp] {
+            rules.push(
+                Rule::new(
+                    Input,
+                    vec![
+                        Match::InIface(policy.wg_iface.clone()),
+                        Match::DestPort {
+                            port: SPEEDTEST_PORT,
+                            proto,
+                        },
+                    ],
+                    Verdict::Accept,
+                )
+                .with_note("raw speedtest: only via the tunnel interface"),
+            );
+        }
         // `iperf3`, and the only opening here that touches `output`.
         //
         // Both roles have to work: server on the gateway (the `input` rule),
@@ -744,6 +834,35 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
             ],
             Verdict::Accept,
         ));
+    }
+
+    // ── Out-of-band administration overlays, regardless of tunnel state ──────
+    //
+    // The operator's way back in when Helios itself is down, so it is rendered
+    // in every state — `Down` and `Connecting` included, which is the whole
+    // point: those are the states a broken tunnel leaves the gateway in.
+    //
+    // Scoped by interface, never by address, for the reason on the tunnel
+    // openings above — and for a second one specific to overlays. Tailscale
+    // and NordVPN each carry several addresses (v4 and v6), reassigned
+    // without notice. An address list stops matching the day the address
+    // moves, which is the day the recovery path is needed; `iifname` covers
+    // every address the interface will ever hold.
+    for iface in &policy.admin_ifaces {
+        rules.push(
+            Rule::new(
+                Input,
+                vec![
+                    Match::InIface(iface.clone()),
+                    Match::DestPort {
+                        port: 22,
+                        proto: L4::Tcp,
+                    },
+                ],
+                Verdict::Accept,
+            )
+            .with_note("out-of-band administration SSH: survives a tunnel that cannot come up"),
+        );
     }
 
     if state.captive_portal_active() {
@@ -879,6 +998,7 @@ mod tests {
             key_negotiation_port: Some(51821),
             mode: PolicyMode::FailClosed,
             allow_ssh_from: vec![],
+            admin_ifaces: vec![],
             allow_dhcp_on_wan: false,
             allow_client_internet: false,
             allow_tunnel_icmp: false,
@@ -922,6 +1042,50 @@ mod tests {
                 "state {st:?}: the WireGuard listening port must stay reachable"
             );
         }
+    }
+
+    #[test]
+    fn astra_channel_is_open_only_on_its_fixed_bridge_tuple() {
+        let rs = render(&policy(), TunnelState::Down);
+        let input = text(&rs, ChainKind::Input);
+        let output = text(&rs, ChainKind::Output);
+        assert!(input.iter().any(|rule| {
+            rule == "iifname \"astra0\" ip saddr 10.88.7.2/32 ip daddr 10.88.7.1/32 tcp dport 8444 accept"
+        }));
+        assert!(output.iter().any(|rule| {
+            rule == "oifname \"astra0\" ip saddr 10.88.7.1/32 ip daddr 10.88.7.2/32 tcp dport 8445 accept"
+        }));
+        assert!(!text(&rs, ChainKind::Forward)
+            .iter()
+            .any(|rule| rule.contains("astra0") || rule.contains("10.88.7.")));
+    }
+
+    /// The origin published on loopback is DNATed onto the public Astra
+    /// bridge, so the packet leaves through `astra1` and is judged by the
+    /// output chain — not by the loopback rule its destination address
+    /// suggests. Without this opening the gateway cannot reach its own
+    /// authority, and the §7.5 recovery of an expired identity has nowhere to
+    /// go: it is the one exchange that must work when the tunnel does not.
+    #[test]
+    fn the_public_astra_origin_is_reachable_from_the_gateway_only_outbound() {
+        let rs = render(&policy(), TunnelState::Down);
+        let expected =
+            "oifname \"astra1\" ip saddr 10.88.7.9/32 ip daddr 10.88.7.10/32 tcp dport 8443 accept";
+        assert!(
+            text(&rs, ChainKind::Output)
+                .iter()
+                .any(|rule| rule == expected),
+            "the gateway must be able to dial the origin: {:?}",
+            text(&rs, ChainKind::Output)
+        );
+        // The opening is the host's. Nothing here admits the container inbound
+        // or grants it a route through the gateway.
+        assert!(!text(&rs, ChainKind::Input)
+            .iter()
+            .any(|rule| rule.contains("astra1")));
+        assert!(!text(&rs, ChainKind::Forward)
+            .iter()
+            .any(|rule| rule.contains("astra1")));
     }
 
     /// UDP conntrack is not a transport contract. A WireGuard rekey or the
@@ -1335,6 +1499,62 @@ mod tests {
         }
     }
 
+    /// The way back in when the tunnel is the thing that is broken.
+    ///
+    /// The incident this encodes: a deployment ran *through* the Helios
+    /// tunnel, read its own source address — a peer VIP — and pinned SSH to
+    /// it via `allow_ssh_from`. Restarting `heliosd` dropped the tunnel, the
+    /// rule stopped matching, and the only permitted SSH source no longer
+    /// existed. `admin_ifaces` has to hold in exactly the states that
+    /// followed, which is why `Down` and `Connecting` are asserted here and
+    /// not just `Up`.
+    #[test]
+    fn admin_ifaces_open_ssh_in_every_state_scoped_to_their_interface() {
+        let mut p = policy();
+        p.admin_ifaces = vec!["tailscale0".into(), "nordlynx".into()];
+
+        for state in [TunnelState::Down, TunnelState::Connecting, TunnelState::Up] {
+            let input = text(&render(&p, state), ChainKind::Input);
+            for iface in ["tailscale0", "nordlynx"] {
+                assert!(
+                    input
+                        .iter()
+                        .any(|r| r == &format!("iifname \"{iface}\" tcp dport 22 accept")),
+                    "{state:?}: {iface} must keep administrative SSH open"
+                );
+            }
+        }
+
+        // Never by address: an overlay carries several, and they move. The
+        // interface match is what covers v4 and v6 at once, today and after
+        // the next reassignment.
+        for rule in render(&p, TunnelState::Down).chain(ChainKind::Input) {
+            if rule.verdict == Verdict::Accept
+                && rule.matches.contains(&Match::DestPort {
+                    port: 22,
+                    proto: L4::Tcp,
+                })
+            {
+                assert!(
+                    rule.matches
+                        .iter()
+                        .any(|m| matches!(m, Match::InIface(_) | Match::SourceNet(_))),
+                    "`{rule}` opens SSH with neither an interface nor a source scope"
+                );
+            }
+        }
+    }
+
+    /// An empty list renders nothing at all — the default stays fail-closed.
+    #[test]
+    fn no_admin_iface_opens_no_ssh() {
+        let input = text(&render(&policy(), TunnelState::Down), ChainKind::Input);
+        assert!(
+            !input.iter().any(|r| r.contains("tcp dport 22")),
+            "SSH must stay closed when nothing declares an administration path"
+        );
+    }
+
     /// A gateway that cannot bring up its interface must open neither.
     ///
     /// Same gate as the listener ports: a rule naming an interface that does
@@ -1409,15 +1629,52 @@ mod tests {
             accept < drop,
             "the scoped accept must take precedence over the drop"
         );
-        assert!(input
-            .iter()
-            .any(|r| r.contains("tcp dport 5201") && r.contains("iifname \"helios0\"")));
-        assert!(input
-            .iter()
-            .any(|r| r.contains("udp dport 5201") && r.contains("iifname \"helios0\"")));
+    }
+
+    /// The speedtest opening follows the tunnel interface, not the API's.
+    ///
+    /// It used to be rendered inside the administration block, which is
+    /// skipped entirely when `admin_iface` is unset. On such a gateway nothing
+    /// opened the speedtest port, every probe was dropped in `input`, and the
+    /// client — with no answer and no refusal — reported a timeout against a
+    /// daemon that was listening.
+    #[test]
+    fn speedtest_stays_open_on_the_tunnel_without_an_administration_interface() {
+        let mut p = policy();
+        p.admin_port = None;
+        p.admin_iface = None;
+        let input = text(&render(&p, TunnelState::Up), ChainKind::Input);
+
+        for proto in ["tcp", "udp"] {
+            assert!(
+                input
+                    .iter()
+                    .any(|r| r.contains(&format!("{proto} dport {SPEEDTEST_PORT}"))
+                        && r.contains("iifname \"helios0\"")),
+                "the speedtest must stay reachable through the tunnel ({proto})"
+            );
+        }
+        // Never unscoped: only WireGuard puts packets on the tunnel interface.
         assert!(!input
             .iter()
-            .any(|r| r == "tcp dport 5201 accept" || r == "udp dport 5201 accept"));
+            .any(|r| r == &format!("tcp dport {SPEEDTEST_PORT} accept")
+                || r == &format!("udp dport {SPEEDTEST_PORT} accept")));
+    }
+
+    /// Nothing to scope the opening to means no opening at all.
+    #[test]
+    fn speedtest_is_closed_without_a_tunnel_interface() {
+        let mut p = policy();
+        p.wg_iface = String::new();
+        let rs = render(&p, TunnelState::Up);
+        for chain in [ChainKind::Input, ChainKind::Output] {
+            assert!(
+                !text(&rs, chain)
+                    .iter()
+                    .any(|r| r.contains(&SPEEDTEST_PORT.to_string())),
+                "no speedtest opening without a tunnel interface"
+            );
+        }
     }
 
     /// Closed unless asked for: an always-open `iperf3` is always-open surface.

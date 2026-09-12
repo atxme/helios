@@ -128,7 +128,7 @@ impl Outcome {
 pub fn generate_keys() {
     let engine = base64::engine::general_purpose::STANDARD;
     let mut raw = [0u8; 32];
-    aws_lc_rs::rand::fill(&mut raw).expect("system CSPRNG unavailable");
+    aether::random::fill_secret(&mut raw).expect("the approved DRBG cannot produce a private key");
     let secret = x25519_dalek::StaticSecret::from(raw);
     let public = x25519_dalek::PublicKey::from(&secret);
     let (private, public) = (
@@ -172,8 +172,10 @@ fn ephemeral_profile() -> ClientProfile {
     let engine = base64::engine::general_purpose::STANDARD;
     let mut client = [0u8; 32];
     let mut gateway = [0u8; 32];
-    aws_lc_rs::rand::fill(&mut client).expect("system CSPRNG unavailable");
-    aws_lc_rs::rand::fill(&mut gateway).expect("system CSPRNG unavailable");
+    aether::random::fill_secret(&mut client)
+        .expect("the approved DRBG cannot produce a private key");
+    aether::random::fill_secret(&mut gateway)
+        .expect("the approved DRBG cannot produce a private key");
     let gateway_public = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(gateway));
 
     ClientProfile {
@@ -351,8 +353,8 @@ async fn scenario_stable_vip(profile: &ClientProfile, url: &str) -> Outcome {
 async fn scenario_unadmitted_peer(profile: &ClientProfile, url: &str) -> Outcome {
     // A fresh key, so absent from `network.toml` by construction.
     let mut raw = [0u8; 32];
-    if aws_lc_rs::rand::fill(&mut raw).is_err() {
-        return Outcome::fail("system CSPRNG unavailable");
+    if aether::random::fill_secret(&mut raw).is_err() {
+        return Outcome::fail("the approved DRBG produced no key");
     }
     let engine = base64::engine::general_purpose::STANDARD;
     let intruder = ClientProfile {

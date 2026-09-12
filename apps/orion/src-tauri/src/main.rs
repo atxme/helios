@@ -56,9 +56,20 @@ use tokio::sync::{watch, Mutex};
 #[cfg(target_os = "windows")]
 mod deelevate;
 
+/// Process launch is isolated behind a one-command Tauri plugin and a fixed
+/// executable. Keeping it out of the application invoke handler makes the ACL
+/// visible and prevents this shell from acquiring a generic process right.
+mod companion;
+
 /// Notification-area menu. Its model and labels are portable and tested
 /// everywhere; only the wiring inside is Windows-only.
 mod tray;
+
+/// The Astra CA-TLS ceremony, driven from this window and signed elsewhere.
+/// The vault, the PIN and the FIDO gesture stay inside the companion; only
+/// the public progress states cross into Orion.
+mod astra;
+mod operator;
 
 /// Shared application state, injected into each command via [`State`].
 struct AppState {
@@ -112,6 +123,16 @@ struct AppState {
     /// back out. `None` means "no new PSK this session" — whatever the profile
     /// already held is left alone.
     staged_psk: Arc<Mutex<Option<StagedPsk>>>,
+    /// The Astra CA-TLS rotation this window is hosting, if one is open.
+    ///
+    /// Owned by Rust, not by the WebView: the ceremony outlives the view that
+    /// started it — leaving the screen mid-rotation must not abandon a
+    /// companion that is about to write a durable decision — and its phase is
+    /// the one thing a reload has to be able to recover.
+    astra: astra::Ceremony,
+    /// The protocol-2 ceremony, which every operation but the `CA-TLS`
+    /// rotation now runs through.
+    operator: operator::OperatorCeremony,
     /// Why the vault could not be opened at startup, if it could not.
     ///
     /// Orion keeps running — the screen is more useful than a blank window —
@@ -140,6 +161,46 @@ struct AppState {
     /// session, and a message surviving a restart would outlive the situation
     /// it described — an identity imported since, a store now available.
     last_certificate_error: Arc<Mutex<std::collections::HashMap<String, String>>>,
+    /// Renewals opened in this session, by profile name.
+    ///
+    /// Held in memory and nowhere else, because the session carries the
+    /// candidate **private keys**. That is what makes an abandoned renewal
+    /// leave nothing behind: closing Orion drops them, the authority's
+    /// operation expires on its own, and the active generation was never
+    /// touched. The cost is that a restart reopens rather than resumes — the
+    /// cheap failure, since nothing was committed.
+    renewals: Arc<Mutex<std::collections::HashMap<String, InFlightRenewal>>>,
+    /// One automatic renewal timer for the mounted profile. It is cancelled
+    /// with the connection so reconnecting cannot leave stale tasks racing a
+    /// newer profile.
+    certificate_renewal_task: Arc<StdMutex<Option<tauri::async_runtime::JoinHandle<()>>>>,
+    /// Recoveries of expired identities in progress (§7.5).
+    ///
+    /// A separate map, for the same reason Astra keeps a separate store: a
+    /// recovery reaches past a validity period, and an identifier from one
+    /// must never resolve where an ordinary renewal is resumed. Absence
+    /// carries the rule; a comparison would only describe it.
+    recoveries: Arc<Mutex<std::collections::HashMap<String, InFlightRecovery>>>,
+}
+
+/// One recovery in progress: the session that drives it, and its profile.
+struct InFlightRecovery {
+    session: orion_core::certificate_recovery::RecoverySession,
+    settings: orion_core::KeyNegotiationSettings,
+}
+
+/// One renewal in progress: what drives it, and the state it writes into.
+struct InFlightRenewal {
+    session: orion_core::certificate_renewal::RenewalSession,
+    store: orion_core::certificates::TrustStore,
+    settings: orion_core::KeyNegotiationSettings,
+    /// The approval request, once read and verified.
+    ///
+    /// Held between the read and the ceremony so that what is signed is what
+    /// was shown: a screen that displayed one manifest and then re-fetched
+    /// before touching the key would be asking for a touch on something the
+    /// user never saw.
+    approval: Option<orion_core::certificate_approval::VerifiedApproval>,
 }
 
 /// A WireGuard key pair held between its creation and its save.
@@ -454,12 +515,28 @@ async fn certificate_overview(
     };
     let errors = state.last_certificate_error.lock().await.clone();
     let identity_store = state.controller.key_negotiation_ready();
+    let protected_identities = orion_core::ProtectedIdentityStore::for_current_user().ok();
     let now = now_unix();
 
     Ok(profiles
         .into_iter()
         .map(|(name, settings)| {
-            let inventory = orion_core::certificate_inventory::inventory(settings.as_ref(), now);
+            let promotion_error = settings
+                .as_ref()
+                .zip(protected_identities.as_ref())
+                .and_then(|(settings, identities)| {
+                    orion_core::certificate_renewal::promote_local_identity_if_due(
+                        settings, identities, now,
+                    )
+                    .err()
+                });
+            let mut inventory =
+                orion_core::certificate_inventory::inventory(settings.as_ref(), now);
+            if let Some(error) = promotion_error {
+                inventory
+                    .faults
+                    .push(format!("promotion de l'identité cliente : {error}"));
+            }
             let actions = orion_core::certificate_actions::action_states(
                 settings.as_ref(),
                 &inventory,
@@ -512,34 +589,655 @@ async fn run_certificate_action(
     state: State<'_, AppState>,
     name: String,
     action: orion_core::CertificateAction,
-) -> Result<(), String> {
-    let settings = {
+) -> Result<ActionOutcome, String> {
+    match action {
+        orion_core::CertificateAction::RenewEveryProfile => renew_every_profile(&state).await,
+        // The other three each concern one profile.
+        _ => {
+            let step = run_for_one(&state, &name, action).await?;
+            Ok(ActionOutcome::of(&name, step))
+        }
+    }
+}
+
+/// Asks the gateway, once per connection, whether this profile is behind.
+///
+/// # Why it is spawned and never awaited
+///
+/// It runs from the event sink, which the tunnel's own state machine drives. A
+/// trust update that blocked there would make a gateway that accepts the
+/// connection and then stalls hold up the client's notion of being connected —
+/// the update is a convenience, the tunnel is the product.
+///
+/// Every outcome is said in the log the user actually reads, including the
+/// refusals: a client that silently never catches up on a revocation is the
+/// one failure this whole path exists to prevent, and «nothing happened» is
+/// indistinguishable from «nothing was owed» unless one of them is written
+/// down.
+fn spawn_trust_refresh(
+    settings: orion_core::KeyNegotiationSettings,
+    heliosd_url: String,
+    sink: EventSink,
+) -> tauri::async_runtime::JoinHandle<()> {
+    tauri::async_runtime::spawn(async move {
+        match orion_core::trust_update::refresh(&settings, &heliosd_url, now_unix()).await {
+            Ok(orion_core::trust_update::TrustUpdateOutcome::UpToDate) => {
+                tracing::debug!("mise à jour de confiance : rien à récupérer");
+            }
+            Ok(orion_core::trust_update::TrustUpdateOutcome::Applied { objects }) => {
+                let message = format!(
+                    "confiance mise à jour : {objects} objet(s) signé(s) appliqué(s) depuis la \
+                     gateway"
+                );
+                tracing::info!(objects, "mise à jour de confiance appliquée");
+                sink(ClientEvent::log("info", message));
+            }
+            Err(error) => {
+                // Not fatal, and deliberately not silent. The tunnel works;
+                // what may not is a future renewal, and that is worth a line
+                // now rather than a refusal nobody can explain later.
+                let message = format!(
+                    "mise à jour de confiance impossible : {error}. Le tunnel n'est pas \
+                             affecté."
+                );
+                tracing::warn!(%error, "mise à jour de confiance refusée");
+                sink(ClientEvent::log("warn", message));
+            }
+        }
+    })
+}
+
+/// Runs the ordinary client renewal at the fixed 80 % threshold.
+///
+/// The task is tied to the mounted connection. It first lets the authenticated
+/// trust refresh finish, then waits for the locally computed threshold. A
+/// reconnect cancels this task and creates a new one from the current durable
+/// state, so no timer can act for a profile that is no longer mounted.
+fn spawn_automatic_certificate_renewal(
+    prerequisite: tauri::async_runtime::JoinHandle<()>,
+    controller: Arc<VpnController>,
+    renewals: Arc<Mutex<std::collections::HashMap<String, InFlightRenewal>>>,
+    profile_name: String,
+    settings: orion_core::KeyNegotiationSettings,
+    heliosd_url: String,
+    sink: EventSink,
+) -> tauri::async_runtime::JoinHandle<()> {
+    tauri::async_runtime::spawn(async move {
+        let _ = prerequisite.await;
+        let now = now_unix();
+        let inventory = orion_core::certificate_inventory::inventory(Some(&settings), now);
+        let Some(client) = inventory.client_pq else {
+            tracing::warn!(profile = %profile_name, "automatic renewal skipped: client PQ certificate is unavailable");
+            return;
+        };
+        if client.phase == orion_core::certificate_inventory::CertificatePhase::Expired {
+            sink(ClientEvent::log(
+                "warn",
+                format!(
+                    "certificat du profil « {profile_name} » expiré : le renouvellement automatique ne peut plus prouver une identité active ; utiliser la récupération YubiKey"
+                ),
+            ));
+            return;
+        }
+
+        let wait = client.renewal_at.saturating_sub(now);
+        if wait > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+        }
+        if controller.state() != TunnelState::Up
+            || controller.mounted_profile().await.as_deref() != Some(profile_name.as_str())
+        {
+            return;
+        }
+
+        match drive_renewal_in_map(&renewals, &profile_name, settings, heliosd_url).await {
+            Ok(RenewalProgress::Committed { generation }) => {
+                tracing::info!(profile = %profile_name, generation, "automatic certificate renewal committed");
+                sink(ClientEvent::log(
+                    "info",
+                    format!(
+                        "certificats du profil « {profile_name} » renouvelés automatiquement ; génération {generation} prête pour le chevauchement"
+                    ),
+                ));
+            }
+            Ok(progress) => {
+                tracing::warn!(profile = %profile_name, ?progress, "automatic certificate renewal remains in progress");
+                sink(ClientEvent::log(
+                    "warn",
+                    format!(
+                        "renouvellement automatique du profil « {profile_name} » incomplet ; Orion réessaiera à la prochaine connexion"
+                    ),
+                ));
+            }
+            Err(error) => {
+                tracing::warn!(profile = %profile_name, %error, "automatic certificate renewal failed");
+                sink(ClientEvent::log(
+                    "warn",
+                    format!(
+                        "renouvellement automatique du profil « {profile_name} » impossible : {error}. Orion réessaiera à la prochaine connexion"
+                    ),
+                ));
+            }
+        }
+    })
+}
+
+/// One action, one profile.
+async fn run_for_one(
+    state: &State<'_, AppState>,
+    name: &str,
+    action: orion_core::CertificateAction,
+) -> Result<RenewalProgress, String> {
+    let (settings, heliosd_url) = {
         let cfg = state.config.lock().await;
-        cfg.find(&name)
-            .and_then(|profile| profile.key_negotiation.clone())
+        let profile = cfg.find(name);
+        (
+            profile.and_then(|profile| profile.key_negotiation.clone()),
+            profile.and_then(|profile| profile.heliosd_url.clone()),
+        )
     };
     let inventory = orion_core::certificate_inventory::inventory(settings.as_ref(), now_unix());
-    let outcome = orion_core::certificate_actions::run(
+    if let Err(block) = orion_core::certificate_actions::admits(
         action,
         settings.as_ref(),
         &inventory,
         state.controller.key_negotiation_ready(),
-    );
-    match outcome {
-        Ok(()) => {
-            state.last_certificate_error.lock().await.remove(&name);
-            Ok(())
+    ) {
+        return Err(record_certificate_error(state, name, block.message()).await);
+    }
+
+    let outcome = match action {
+        orion_core::CertificateAction::RenewNow => {
+            drive_renewal(state, name, settings, heliosd_url).await
         }
-        Err(block) => {
-            let message = block.message();
-            state
-                .last_certificate_error
-                .lock()
-                .await
-                .insert(name, message.clone());
-            Err(message)
+        orion_core::CertificateAction::RenewEveryProfile => {
+            unreachable!("the fleet action is dispatched before this point")
+        }
+        orion_core::CertificateAction::RecoverExpired => {
+            drive_recovery(state, name, settings).await
+        }
+        orion_core::CertificateAction::RollbackToPrevious => {
+            let settings = settings.ok_or_else(|| "ce profil ne négocie pas de clé".to_string())?;
+            let rollback =
+                orion_core::certificate_renewal::rollback_to_previous(&settings, now_unix())
+                    .map_err(|error| error.to_string())?;
+            Ok(RenewalProgress::RolledBack {
+                generation: rollback.selected_generation,
+                available_until: rollback.available_until,
+            })
+        }
+    };
+    match outcome {
+        Ok(progress) => {
+            state.last_certificate_error.lock().await.remove(name);
+            Ok(progress)
+        }
+        Err(message) => Err(record_certificate_error(state, name, message).await),
+    }
+}
+
+/// Advances **every** Helios profile of this device by one step (§12.2).
+///
+/// # Why one step and not «until finished»
+///
+/// A renewal is not a call, it is a sequence that waits on a human: the
+/// authority opens an operation, a security key answers its challenge, and
+/// only then is anything issued. Driving one profile to completion before
+/// starting the next would leave the other five untouched behind a touch that
+/// may never come. Each press therefore advances all of them by one step,
+/// exactly as a press on a single profile does — which also makes this action
+/// the same shape as the one beside it, and resumable for the same reason.
+///
+/// # Why one profile's failure does not end the run
+///
+/// The profiles are independent: a gateway that is down, a block that is too
+/// old to renew, a missing tunnel address — each concerns its own profile, and
+/// stopping at the first would make the outcome depend on the order of a list.
+/// Every refusal is recorded against **its** profile, where the screen already
+/// shows it.
+async fn renew_every_profile(state: &State<'_, AppState>) -> Result<ActionOutcome, String> {
+    let profiles: Vec<String> = {
+        let cfg = state.config.lock().await;
+        cfg.profiles
+            .iter()
+            .filter(|profile| profile.negotiates())
+            .map(|profile| profile.name.clone())
+            .collect()
+    };
+    if profiles.is_empty() {
+        return Err("aucun profil Helios sur cet appareil".to_string());
+    }
+
+    let mut outcome = ActionOutcome::default();
+    for name in profiles {
+        match run_for_one(state, &name, orion_core::CertificateAction::RenewNow).await {
+            Ok(step) => {
+                outcome.progress.insert(name, step);
+            }
+            // Already recorded against this profile by `run_for_one`; carried
+            // here too so the press that caused it reports it without waiting
+            // for the overview to be read again.
+            Err(message) => {
+                outcome.refused.insert(name, message);
+            }
         }
     }
+    Ok(outcome)
+}
+
+/// What one press produced, per profile.
+///
+/// A map and not a single step, because one of the four actions is
+/// device-wide: returning the progress of the profile the press happened to
+/// start from would have attributed five other renewals to it, and hidden the
+/// approval each of them is waiting for.
+#[derive(serde::Serialize, Clone, Debug, Default, PartialEq, Eq)]
+struct ActionOutcome {
+    progress: std::collections::BTreeMap<String, RenewalProgress>,
+    /// Profiles that could not be advanced, and why.
+    ///
+    /// Only ever populated by the fleet action: a single-profile press reports
+    /// its refusal as an error, exactly as before.
+    refused: std::collections::BTreeMap<String, String>,
+}
+
+impl ActionOutcome {
+    fn of(name: &str, step: RenewalProgress) -> Self {
+        Self {
+            progress: [(name.to_string(), step)].into_iter().collect(),
+            refused: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
+/// Where a renewal stands, as the Certificates surface states it.
+///
+/// `companion_command` is a **value**, not advice: it is the exact fallback for
+/// the invocation Orion launches automatically. It remains visible while an
+/// operator is awaited, including after a successful launch.
+#[derive(serde::Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", tag = "step")]
+enum RenewalProgress {
+    AwaitingOperator {
+        operation_id: String,
+        companion_command: String,
+    },
+    Issuing {
+        operation_id: String,
+    },
+    Committed {
+        generation: u64,
+    },
+    /// A §7.5 recovery, waiting on an operator who is not on this machine.
+    ///
+    /// The operator runs `astra-signer` on **their** workstation, so nothing
+    /// here can be launched. `operator_command` is still carried, and for the
+    /// same reason the renewal carries its companion line: what travels
+    /// between the two people is a command to run, not an identifier to be
+    /// reassembled by hand into arguments only one of them knows.
+    RecoveryAwaitingOperator {
+        operation_id: String,
+        operator_command: String,
+    },
+    Recovered {
+        generation: u64,
+        activation_at: u64,
+    },
+    RolledBack {
+        generation: u64,
+        available_until: u64,
+    },
+}
+
+/// Launches the companion for the operation held by one renewal session.
+///
+/// Only the profile name crosses IPC. The executable and every argument come
+/// from the session owned by `orion-core`, so the WebView cannot turn this
+/// permission into a shell or retarget an approval to another operation.
+#[tauri::command]
+async fn launch_certificate_companion(
+    state: State<'_, AppState>,
+    name: String,
+) -> Result<(), String> {
+    let invocation = {
+        let renewals = state.renewals.lock().await;
+        let renewal = renewals
+            .get(&name)
+            .ok_or_else(|| format!("aucun renouvellement en attente pour le profil « {name} »"))?;
+        renewal
+            .session
+            .companion_invocation()
+            .ok_or_else(|| format!("le profil « {name} » n'attend aucune approbation opérateur"))?
+    };
+    companion::launch(&invocation)
+}
+
+fn companion_plugin<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
+    tauri::plugin::Builder::new("companion")
+        .invoke_handler(tauri::generate_handler![launch_certificate_companion])
+        .build()
+}
+
+impl RenewalProgress {
+    fn of_recovery(
+        step: &orion_core::certificate_recovery::RecoveryStep,
+        session: &orion_core::certificate_recovery::RecoverySession,
+    ) -> Self {
+        use orion_core::certificate_recovery::RecoveryStep;
+        match step {
+            RecoveryStep::AwaitingOperator { operation_id } => Self::RecoveryAwaitingOperator {
+                operation_id: operation_id.to_hex(),
+                operator_command: format!(
+                    "astra-signer recover --authority-url {} --operation-id {}",
+                    session.authority_url(),
+                    operation_id.to_hex()
+                ),
+            },
+            RecoveryStep::Issuing { operation_id } => Self::Issuing {
+                operation_id: operation_id.to_hex(),
+            },
+            RecoveryStep::Recovered {
+                generation,
+                activation_at,
+            } => Self::Recovered {
+                generation: *generation,
+                activation_at: *activation_at,
+            },
+        }
+    }
+}
+
+impl RenewalProgress {
+    fn of(
+        step: &orion_core::certificate_renewal::RenewalStep,
+        session: &orion_core::certificate_renewal::RenewalSession,
+    ) -> Self {
+        use orion_core::certificate_renewal::RenewalStep;
+        match step {
+            RenewalStep::AwaitingOperator { operation_id } => Self::AwaitingOperator {
+                operation_id: operation_id.to_hex(),
+                companion_command: session
+                    .companion_invocation()
+                    .map(|invocation| invocation.command_line())
+                    .unwrap_or_default(),
+            },
+            RenewalStep::Issuing { operation_id } => Self::Issuing {
+                operation_id: operation_id.to_hex(),
+            },
+            RenewalStep::Committed { generation } => Self::Committed {
+                generation: *generation,
+            },
+        }
+    }
+}
+
+/// Opens a renewal, or takes one more step on the one already open.
+///
+/// Resuming rather than restarting is the whole reason the session is kept:
+/// a second `begin` would generate a second key pair and open a second
+/// operation, burning a generation for nothing while the first one still waits
+/// on the same operator.
+async fn drive_renewal(
+    state: &State<'_, AppState>,
+    name: &str,
+    settings: Option<orion_core::KeyNegotiationSettings>,
+    heliosd_url: Option<String>,
+) -> Result<RenewalProgress, String> {
+    let settings = settings.ok_or_else(|| "ce profil ne négocie pas de clé".to_string())?;
+    let url = heliosd_url.ok_or_else(|| {
+        "ce profil ne porte pas l'adresse de l'API de la gateway dans le tunnel : sans elle il n'y          a aucune route de renouvellement à appeler."
+            .to_string()
+    })?;
+
+    drive_renewal_in_map(&state.renewals, name, settings, url).await
+}
+
+async fn drive_renewal_in_map(
+    renewals: &Arc<Mutex<std::collections::HashMap<String, InFlightRenewal>>>,
+    name: &str,
+    settings: orion_core::KeyNegotiationSettings,
+    url: String,
+) -> Result<RenewalProgress, String> {
+    let mut renewals = renewals.lock().await;
+    if let Some(in_flight) = renewals.get_mut(name) {
+        let step = orion_core::certificate_renewal::resume(
+            &mut in_flight.session,
+            &mut in_flight.store,
+            &in_flight.settings,
+            now_unix(),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        let progress = RenewalProgress::of(&step, &in_flight.session);
+        if matches!(
+            step,
+            orion_core::certificate_renewal::RenewalStep::Committed { .. }
+        ) {
+            renewals.remove(name);
+        }
+        return Ok(progress);
+    }
+
+    let (session, store, step) =
+        orion_core::certificate_renewal::begin(&settings, &url, now_unix())
+            .await
+            .map_err(|error| error.to_string())?;
+    let progress = RenewalProgress::of(&step, &session);
+    if !matches!(
+        step,
+        orion_core::certificate_renewal::RenewalStep::Committed { .. }
+    ) {
+        renewals.insert(
+            name.to_string(),
+            InFlightRenewal {
+                session,
+                store,
+                settings,
+                approval: None,
+            },
+        );
+    }
+    Ok(progress)
+}
+
+/// Opens a §7.5 recovery, or takes one more step on the one already open.
+///
+/// # Why resuming matters even more here than for a renewal
+///
+/// A recovery burns the one historical proof this machine has: the expired
+/// private key signs a request naming a specific generation, and Astra
+/// consumes the challenge it answered. Starting a second one while the first
+/// still waits would leave an operator holding an identifier that no longer
+/// matches what the client will present — and the operator is on another
+/// machine, with no way to see that.
+async fn drive_recovery(
+    state: &State<'_, AppState>,
+    name: &str,
+    settings: Option<orion_core::KeyNegotiationSettings>,
+) -> Result<RenewalProgress, String> {
+    let settings = settings.ok_or_else(|| "ce profil ne négocie pas de clé".to_string())?;
+
+    let mut recoveries = state.recoveries.lock().await;
+    if let Some(in_flight) = recoveries.get(name) {
+        let step = orion_core::certificate_recovery::resume(
+            &in_flight.session,
+            &in_flight.settings,
+            now_unix(),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        let progress = RenewalProgress::of_recovery(&step, &in_flight.session);
+        tracing::info!(
+            profile = %name,
+            operation = %in_flight.session.operation_id().to_hex(),
+            ?step,
+            "récupération §7.5 reprise"
+        );
+        if matches!(
+            step,
+            orion_core::certificate_recovery::RecoveryStep::Recovered { .. }
+        ) {
+            recoveries.remove(name);
+        }
+        return Ok(progress);
+    }
+
+    let (session, step) = orion_core::certificate_recovery::begin(&settings, now_unix())
+        .await
+        .map_err(|error| error.to_string())?;
+    let progress = RenewalProgress::of_recovery(&step, &session);
+    tracing::info!(
+        profile = %name,
+        operation = %session.operation_id().to_hex(),
+        autorite = %session.authority_url(),
+        ?step,
+        "récupération §7.5 ouverte"
+    );
+    if !matches!(
+        step,
+        orion_core::certificate_recovery::RecoveryStep::Recovered { .. }
+    ) {
+        recoveries.insert(name.to_string(), InFlightRecovery { session, settings });
+    }
+    Ok(progress)
+}
+
+/// Resumes the recovery whose operator ceremony has just released its grant.
+///
+/// The operation id is only a selector over sessions this Orion process
+/// already owns. The WebView cannot name a profile, settings or authority,
+/// and the lock is released before the network call so the ordinary recovery
+/// driver remains the sole mutator of the session.
+#[tauri::command]
+async fn resume_certificate_recovery(
+    state: State<'_, AppState>,
+    operation_id: String,
+) -> Result<ActionOutcome, String> {
+    let operation = aether::certificates::encoding::Id16::parse_hex(&operation_id)
+        .map_err(|_| "identifiant de récupération illisible".to_string())?;
+    let found = {
+        let recoveries = state.recoveries.lock().await;
+        recoveries
+            .iter()
+            .find(|(_, recovery)| recovery.session.operation_id() == operation)
+            .map(|(name, recovery)| (name.clone(), recovery.settings.clone()))
+    };
+    let (name, settings) = found.ok_or_else(|| {
+        "aucune récupération ouverte dans Orion ne correspond à cette opération".to_string()
+    })?;
+
+    match drive_recovery(&state, &name, Some(settings)).await {
+        Ok(progress) => {
+            state.last_certificate_error.lock().await.remove(&name);
+            Ok(ActionOutcome::of(&name, progress))
+        }
+        Err(message) => Err(record_certificate_error(&state, &name, message).await),
+    }
+}
+
+async fn record_certificate_error(
+    state: &State<'_, AppState>,
+    name: &str,
+    message: String,
+) -> String {
+    state
+        .last_certificate_error
+        .lock()
+        .await
+        .insert(name.to_string(), message.clone());
+    message
+}
+
+/// Reads the approval request the open renewal is waiting on (§8.1.2 step 4a).
+///
+/// Verified before it comes back, against what the profile pins — so what the
+/// screen shows is attested rather than announced. Nothing touches a security
+/// key here: the manifest exists precisely so the user decides *before* the
+/// ceremony, not during it.
+#[tauri::command]
+async fn certificate_approval_manifest(
+    state: State<'_, AppState>,
+    name: String,
+) -> Result<orion_core::certificate_approval::ApprovalManifest, String> {
+    let mut renewals = state.renewals.lock().await;
+    let in_flight = renewals
+        .get_mut(&name)
+        .ok_or_else(|| "aucun renouvellement ouvert pour ce profil".to_string())?;
+    let verified = in_flight
+        .session
+        .fetch_approval(&in_flight.store, now_unix())
+        .await
+        .map_err(|error| error.to_string())?;
+    let manifest = verified.manifest();
+    in_flight.approval = Some(verified);
+    Ok(manifest)
+}
+
+/// Runs the ceremony and posts the assertion (§8.1.2 step 4b).
+///
+/// The blocking call lives on a blocking thread: talking to a security key
+/// puts a modal on screen and waits for a human, and holding the async runtime
+/// for that would stop every other task in Orion — the tunnel's telemetry
+/// included.
+///
+/// The verified request is **consumed**. A second run would ask for a touch
+/// against a window the authority has since closed, and the user would be
+/// standing at a prompt for nothing.
+#[tauri::command]
+async fn approve_certificate_renewal(
+    state: State<'_, AppState>,
+    name: String,
+    pin: Option<String>,
+) -> Result<RenewalProgress, String> {
+    let verified = {
+        let mut renewals = state.renewals.lock().await;
+        let in_flight = renewals
+            .get_mut(&name)
+            .ok_or_else(|| "aucun renouvellement ouvert pour ce profil".to_string())?;
+        in_flight.approval.take().ok_or_else(|| {
+            "lire d'abord la demande d'approbation : c'est elle qui est vérifiée, et ce qui est              signé est ce qui a été montré"
+                .to_string()
+        })?
+    };
+
+    let pin = pin.unwrap_or_default();
+    let approval = tokio::task::spawn_blocking(move || verified.run(&pin, now_unix()))
+        .await
+        .map_err(|error| format!("la cérémonie n'a pas pu être lancée : {error}"))?
+        .map_err(|error| error.to_string())?;
+
+    let mut renewals = state.renewals.lock().await;
+    let in_flight = renewals
+        .get_mut(&name)
+        .ok_or_else(|| "aucun renouvellement ouvert pour ce profil".to_string())?;
+    let step = in_flight
+        .session
+        .submit_approval(&approval)
+        .await
+        .map_err(|error| error.to_string())?;
+    let progress = RenewalProgress::of(&step, &in_flight.session);
+    Ok(progress)
+}
+
+/// Whether this machine's key collects its own PIN.
+///
+/// Asked rather than assumed: under Windows the platform API puts up its own
+/// dialog and the PIN never enters this process, so prompting for one would be
+/// asking the user for a secret Orion has no use for.
+#[tauri::command]
+async fn certificate_approval_needs_pin(
+    state: State<'_, AppState>,
+    name: String,
+) -> Result<bool, String> {
+    let renewals = state.renewals.lock().await;
+    let in_flight = renewals
+        .get(&name)
+        .ok_or_else(|| "aucun renouvellement ouvert pour ce profil".to_string())?;
+    let approval = in_flight
+        .approval
+        .as_ref()
+        .ok_or_else(|| "lire d'abord la demande d'approbation".to_string())?;
+    approval.needs_pin().map_err(|error| error.to_string())
 }
 
 /// The last certificate action that failed on this profile, if any.
@@ -644,6 +1342,12 @@ struct ProfileView {
     heliosd_url: Option<String>,
     ssh_target: Option<String>,
     key_negotiation: Option<orion_core::KeyNegotiationSettings>,
+    /// Which of the two shapes of spec §19 this profile is.
+    ///
+    /// Resolved, never `null`: a profile sealed before the discriminant
+    /// existed still has a kind, and the screen shows what the connection
+    /// path will act on rather than what the file happens to record.
+    profile_type: &'static str,
     /// Public half of the profile's WireGuard key. The one value of the pair
     /// that is *meant* to leave the machine — it is what the operator admits.
     public_key: Option<String>,
@@ -665,6 +1369,7 @@ impl From<&ClientProfile> for ProfileView {
             heliosd_url: profile.heliosd_url.clone(),
             ssh_target: profile.ssh_target.clone(),
             key_negotiation: profile.key_negotiation.clone(),
+            profile_type: profile.kind().as_str(),
             public_key: profile.public_key(),
             has_private_key: !profile.private_key.trim().is_empty(),
             has_static_psk: profile.has_static_psk(),
@@ -754,6 +1459,7 @@ impl ProfileDraft {
         staged: Option<&StagedKey>,
         staged_psk: Option<&StagedPsk>,
     ) -> Result<ClientProfile, String> {
+        let stored_kind = stored.map(ClientProfile::kind);
         let mut profile = match stored {
             Some(profile) => profile.clone(),
             None => ClientProfile {
@@ -803,11 +1509,36 @@ impl ProfileDraft {
         profile.heliosd_url = self.heliosd_url;
         profile.ssh_target = self.ssh_target;
         profile.key_negotiation = self.key_negotiation;
+        // An existing stable profile keeps its declared variant. Switching
+        // between classic and Helios requires another profile identifier (spec
+        // §14, §19); deriving the kind from the edited block here made deleting
+        // that block a persistent downgrade. A new draft has no history and is
+        // stamped from the shape the user chose before its first save.
+        profile.profile_type = Some(stored_kind.unwrap_or_else(|| {
+            if profile.key_negotiation.is_some() {
+                orion_core::ProfileKind::HeliosKeyNegotiation
+            } else {
+                orion_core::ProfileKind::Classic
+            }
+        }));
+        profile.check_kind().map_err(|error| error.to_string())?;
         // A stored profile never carries a negotiated PSK: that one only ever
         // exists in the ephemeral copy the backend mounts.
         profile.preshared_key_is_negotiated = false;
         Ok(profile)
     }
+}
+
+/// Selects the profile that is actually being edited.
+///
+/// An import is a replacement transaction, not a suggestion layered over a
+/// profile with the same display name. In particular, its private WireGuard
+/// key and its sealed negotiation identity were issued as one pair.
+fn profile_edit_base<'a>(
+    pending_import: Option<&'a ClientProfile>,
+    stored: Option<&'a ClientProfile>,
+) -> Option<&'a ClientProfile> {
+    pending_import.or(stored)
 }
 
 #[tauri::command]
@@ -1029,6 +1760,29 @@ async fn vault_posture(
     Ok(state.store.posture())
 }
 
+/// Persists the user's informed choice to keep profiles on a bare volume.
+///
+/// This command is deliberately separate from import/save: the interface must
+/// first state the guarantees being withdrawn, and an ordinary write must
+/// never turn a missing BitLocker posture into consent by itself.
+#[tauri::command]
+async fn allow_unencrypted_volume(
+    state: State<'_, AppState>,
+) -> Result<orion_core::vault::VaultPosture, String> {
+    let posture = state.store.posture();
+    if posture.volume_protected || posture.unencrypted_volume_waived {
+        return Ok(posture);
+    }
+    state
+        .store
+        .persist_unencrypted_volume_waiver()
+        .map_err(|error| error.to_string())?;
+    tracing::warn!(
+        "CHIFFREMENT DE VOLUME NON EXIGÉ après confirmation dans Orion — les anciens blocs disque, le fichier d'échange et celui d'hibernation ne sont pas couverts"
+    );
+    Ok(state.store.posture())
+}
+
 /// Draws a WireGuard key pair and returns its **public** half.
 ///
 /// The private half stays in [`AppState::staged_key`] until the profile is
@@ -1239,24 +1993,32 @@ async fn save_profile(
 ) -> Result<ConfigView, String> {
     let mut cfg = state.config.lock().await;
     require_protected_volume(&state)?;
-    // A profile already stored wins over a pending import of the same name:
-    // editing an existing profile must not silently adopt the key of a
-    // document imported earlier in the session and never saved.
-    let stored = match cfg.find(&draft.name).cloned() {
-        Some(profile) => Some(profile),
-        None => state.pending_imports.lock().await.remove(&draft.name),
-    };
+    // A pending import wins over the stored profile of the same name. An
+    // imported document may carry a *new* WireGuard private key together
+    // with a newly sealed key-negotiation identity. Keeping the old profile
+    // here would pair those two identities from different admissions: the
+    // gateway accepts the TLS certificate, then rejects the request because
+    // its WireGuard key is the old one. Ordinary edits never have a pending
+    // import, so they still use the stored profile and preserve its secrets.
+    let pending = state.pending_imports.lock().await.remove(&draft.name);
+    let known = cfg.find(&draft.name);
+    let stored = profile_edit_base(pending.as_ref(), known);
     // Taken, not peeked: the key is now the profile's, and leaving a copy in
     // the slot would let the next profile saved adopt it too.
     let staged = state.staged_key.lock().await.take();
     let staged_psk = state.staged_psk.lock().await.take();
-    let profile = draft.merge(stored.as_ref(), staged.as_ref(), staged_psk.as_ref())?;
+    let profile = draft.merge(stored, staged.as_ref(), staged_psk.as_ref())?;
+    if let Some(known) = known {
+        profile
+            .check_replacement_of(known)
+            .map_err(|error| error.to_string())?;
+    }
     let selected = profile.name.clone();
     state
         .store
         .save_profile(&profile)
         .map_err(|e| e.to_string())?;
-    cfg.upsert(profile);
+    cfg.upsert(profile).map_err(|error| error.to_string())?;
     cfg.selected = Some(selected.clone());
     state.store.select(&selected).map_err(|e| e.to_string())?;
     let view = ConfigView::from(&*cfg);
@@ -1267,12 +2029,27 @@ async fn save_profile(
     Ok(view)
 }
 
+/// Removes a profile, unmounting its tunnel first if that tunnel is the one up.
+///
+/// The order is the whole point (spec §12.2). The signed `release` that frees
+/// the gateway's PSK slot travels **inside** the tunnel and is signed by the
+/// profile's own identity, so it has to leave before either disappears.
+/// Deleting first left the slot held until the gateway reclaimed it on
+/// handshake silence, five minutes later — and left the adapter mounted for a
+/// profile that no longer existed.
 #[tauri::command]
 async fn delete_profile(
     app: AppHandle,
     state: State<'_, AppState>,
     name: String,
 ) -> Result<ConfigView, String> {
+    // Before the configuration lock, not after: the disconnection is a network
+    // round trip, and `stop_connection` rebuilds nothing that needs the config
+    // — but holding a lock across it would stall every other command for the
+    // two seconds the release is allowed.
+    if state.controller.mounted_profile().await.as_deref() == Some(name.as_str()) {
+        stop_connection(&app).await?;
+    }
     let mut cfg = state.config.lock().await;
     state
         .store
@@ -1397,7 +2174,21 @@ async fn start_connection(app: AppHandle, name: Option<String>) -> Result<(), St
     let telemetry = Arc::clone(&state.telemetry);
     let heliosd_url = profile.heliosd_url.clone();
     let app_for_tel = app.clone();
-    let negotiating = profile.key_negotiation.is_some();
+    let negotiating = profile.negotiates();
+    // The trust update of §8.1.1 lives inside the tunnel, so the moment it
+    // becomes reachable is the moment it is worth asking. Captured here rather
+    // than read later: by the time the tunnel is up, the configuration may
+    // already describe a different profile.
+    let trust_settings = profile.key_negotiation.clone();
+    let trust_url = profile.heliosd_url.clone();
+    // Once per connection. `Up` is re-emitted whenever the inference loop sees
+    // a fresh handshake after a stall, and each of those is the same tunnel —
+    // asking again on every one would poll the gateway for the life of the
+    // session.
+    let trust_asked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let renewal_task = Arc::clone(&state.certificate_renewal_task);
+    let renewal_controller = Arc::clone(&state.controller);
+    let renewal_sessions = Arc::clone(&state.renewals);
     let negotiated_profile = profile.name.clone();
     let config = Arc::clone(&state.config);
     let store = Arc::clone(&state.store);
@@ -1423,8 +2214,36 @@ async fn start_connection(app: AppHandle, name: Option<String>) -> Result<(), St
                     if let Some(url) = heliosd_url.clone() {
                         telemetry.start(url, emit_sink(app_for_tel.clone()));
                     }
+                    if let (Some(settings), Some(url), false) = (
+                        trust_settings.clone(),
+                        trust_url.clone(),
+                        trust_asked.swap(true, std::sync::atomic::Ordering::SeqCst),
+                    ) {
+                        let refresh = spawn_trust_refresh(
+                            settings.clone(),
+                            url.clone(),
+                            emit_sink(app_for_tel.clone()),
+                        );
+                        let renewal = spawn_automatic_certificate_renewal(
+                            refresh,
+                            Arc::clone(&renewal_controller),
+                            Arc::clone(&renewal_sessions),
+                            negotiated_profile.clone(),
+                            settings,
+                            url,
+                            emit_sink(app_for_tel.clone()),
+                        );
+                        if let Some(previous) = renewal_task.lock().unwrap().replace(renewal) {
+                            previous.abort();
+                        }
+                    }
                 }
-                TunnelState::Down | TunnelState::Failed => telemetry.stop(),
+                TunnelState::Down | TunnelState::Failed => {
+                    telemetry.stop();
+                    if let Some(task) = renewal_task.lock().unwrap().take() {
+                        task.abort();
+                    }
+                }
                 _ => {}
             }
         }
@@ -1530,14 +2349,13 @@ fn raise_key_negotiation_floor(
 
 #[tauri::command]
 async fn disconnect(app: AppHandle) -> Result<(), String> {
-    stop_connection(&app).await;
-    Ok(())
+    stop_connection(&app).await
 }
 
 /// Unmounts the tunnel. Shared by the `disconnect` command and the tray menu,
 /// for the same reason as [`start_connection`]: two paths that differ by one
 /// step end up differing by more.
-async fn stop_connection(app: &AppHandle) {
+async fn stop_connection(app: &AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
     state.telemetry.stop();
     // The inference stops before the state moves, not after: a poll that read
@@ -1547,7 +2365,11 @@ async fn stop_connection(app: &AppHandle) {
     if let Some(poll) = poll {
         poll.abort();
     }
-    state.controller.disconnect(emit_sink(app.clone())).await;
+    state
+        .controller
+        .disconnect(emit_sink(app.clone()))
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// Reports the faulty fields of a profile being edited.
@@ -1565,18 +2387,24 @@ async fn validate_profile(
     // "clé privée requise" on every profile that has one — a red field the
     // user cannot clear, on a value they are not allowed to see.
     let cfg = state.config.lock().await;
-    let stored = match cfg.find(&draft.name).cloned() {
-        Some(profile) => Some(profile),
-        // Peeked, not removed: validation runs on every keystroke, and
-        // consuming the import here would make the third character typed lose
-        // the key the first two had.
-        None => state.pending_imports.lock().await.get(&draft.name).cloned(),
-    };
+    // The pending import is the profile being edited, even when it replaces a
+    // stored profile with the same name. Looking at the stored key here would
+    // report a valid replacement as if its new negotiation identity belonged
+    // to the old WireGuard key, then `save_profile` would persist that split.
+    // Peeked, not removed: validation runs on every keystroke.
+    let pending = state.pending_imports.lock().await.get(&draft.name).cloned();
+    let known = cfg.find(&draft.name);
+    let stored = profile_edit_base(pending.as_ref(), known);
     // Validation runs on every keystroke: the staged secrets are read, never
     // taken.
     let staged = state.staged_key.lock().await;
     let staged_psk = state.staged_psk.lock().await;
-    let profile = draft.merge(stored.as_ref(), staged.as_ref(), staged_psk.as_ref())?;
+    let profile = draft.merge(stored, staged.as_ref(), staged_psk.as_ref())?;
+    if let Some(known) = known {
+        profile
+            .check_replacement_of(known)
+            .map_err(|error| error.to_string())?;
+    }
     Ok(inspect_profile(&profile))
 }
 
@@ -1599,9 +2427,10 @@ fn window_size_for(view: &str) -> (f64, f64) {
         // device that holds one spent the difference on empty paper. Beyond
         // what fits, the view scrolls.
         "certificates" => (680.0, 620.0),
-        // The speedtest is a single centred column — a dial, two direction
-        // rows, three qualities. It was given the width of a two-column form
-        // and spent it on margins.
+        // The speedtest is a single centred column showing one state at a
+        // time — the launch, the leg under way and its curve, or the finished
+        // figures above the previous runs. It was given the width of a
+        // two-column form and spent it on margins.
         "speedtest" => (520.0, 620.0),
         "logs" => (760.0, 640.0),
         // Connection has only an orb, a state, and a button: giving it the
@@ -1735,7 +2564,7 @@ fn prepare_wireguard_nt_working_directory() -> anyhow::Result<()> {
             .ok_or_else(|| anyhow::anyhow!("Orion workspace root not found"))?;
         if !workspace.join(DLL).is_file() {
             anyhow::bail!(
-                "WireGuardNT is missing ({DLL}); run `cargo xtask orion-deps` before Orion"
+                "WireGuardNT is missing ({DLL}); rebuild Orion so its Windows dependencies are prepared"
             );
         }
         workspace.to_path_buf()
@@ -1871,6 +2700,13 @@ fn main() {
         },
         "démarrage d'Orion"
     );
+
+    // The randomness pipeline is named before anything draws from it, and an
+    // unusable provider stops the start-up: a client that cannot draw a
+    // transaction identifier cannot negotiate, and failing here says why
+    // (NEGOCIATION-DE-CLE-V5 §4.3).
+    let drbg = aether::random::configure().expect("no usable DRBG provider for the negotiation");
+    tracing::info!(%drbg, "randomness provider");
 
     #[cfg(debug_assertions)]
     let _frontend_dev_server =
@@ -2019,6 +2855,7 @@ fn main() {
                 tracing::warn!(%error, "unable to reveal Orion from the secondary instance");
             }
         }))
+        .plugin(companion_plugin())
         .manage(AppState {
             controller,
             store,
@@ -2029,10 +2866,15 @@ fn main() {
             pending_imports: Arc::new(Mutex::new(std::collections::HashMap::new())),
             staged_key: Arc::new(Mutex::new(None)),
             staged_psk: Arc::new(Mutex::new(None)),
+            astra: astra::Ceremony::default(),
+            operator: operator::OperatorCeremony::default(),
             handshake_poll: StdMutex::new(None),
             vault_error,
             log_path,
             last_certificate_error: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            renewals: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            certificate_renewal_task: Arc::new(StdMutex::new(None)),
+            recoveries: Arc::new(Mutex::new(std::collections::HashMap::new())),
         })
         .setup(|_app| {
             #[cfg(target_os = "windows")]
@@ -2068,17 +2910,179 @@ fn main() {
             export_logs,
             resize_for_view,
             validate_profile,
+            allow_unencrypted_volume,
             key_negotiation_support,
             certificate_inventory,
             certificate_actions,
+            certificate_approval_manifest,
+            certificate_approval_needs_pin,
+            approve_certificate_renewal,
             certificate_overview,
             run_certificate_action,
+            resume_certificate_recovery,
             last_certificate_error,
             run_speed_test,
             vault_posture,
+            start_astra_ca_tls_rotation,
+            continue_astra_ca_tls_rotation,
+            cancel_astra_ca_tls_rotation,
+            astra_ca_tls_rotation_status,
+            begin_operator_ceremony,
+            advance_operator_ceremony,
+            dismiss_operator_ceremony,
+            operator_ceremony_status,
+            operator_pending_operations,
         ])
         .run(tauri::generate_context!())
         .expect("error while launching Tauri");
+}
+
+/// Opens the two-key CA-TLS ceremony described in ADR-008 §9.4.
+///
+/// Everything that decides anything happens in the companion: the campaign is
+/// fetched and verified there, under the Astra service key the vault's
+/// hand-off pins, and the two credentials are exercised there. This command
+/// starts it and returns the first state it publishes.
+#[tauri::command]
+async fn start_astra_ca_tls_rotation(
+    state: State<'_, AppState>,
+    input: astra::RotationInput,
+) -> Result<aether::certificates::operator_ipc::AstraCaTlsStatus, String> {
+    state.astra.start(input).await
+}
+
+/// Takes the next step, once the operator says the requested key is plugged in.
+#[tauri::command]
+async fn continue_astra_ca_tls_rotation(
+    state: State<'_, AppState>,
+) -> Result<aether::certificates::operator_ipc::AstraCaTlsStatus, String> {
+    state
+        .astra
+        .advance(aether::certificates::operator_ipc::AstraIpcCommand::Continue)
+        .await
+}
+
+/// Abandons the ceremony, which only the phases before the first durable write
+/// accept.
+#[tauri::command]
+async fn cancel_astra_ca_tls_rotation(
+    state: State<'_, AppState>,
+) -> Result<aether::certificates::operator_ipc::AstraCaTlsStatus, String> {
+    state
+        .astra
+        .advance(aether::certificates::operator_ipc::AstraIpcCommand::Cancel)
+        .await
+}
+
+/// The ceremony's current state, for a view that was opened after it started.
+#[tauri::command]
+async fn astra_ca_tls_rotation_status(
+    state: State<'_, AppState>,
+) -> Result<aether::certificates::operator_ipc::AstraCaTlsStatus, String> {
+    Ok(state.astra.status().await)
+}
+
+/// Opens an operator ceremony for the operation the WebView names.
+///
+/// The locator is all it may name — a kind, and at most an identifier this
+/// process itself opened. Everything else the helper resolves from the hand-off
+/// pinned beside the vault it holds.
+#[tauri::command]
+async fn begin_operator_ceremony(
+    state: State<'_, AppState>,
+    locator: aether::certificates::operator_session::OperationLocator,
+) -> Result<aether::certificates::operator_session::OperatorStatus, String> {
+    state.operator.begin(locator).await
+}
+
+/// The handle of the window the press came from, or `0` where there is none.
+///
+/// Read on the exact advance that opens a key dialog, so Orion can re-assert
+/// its own foreground right before ceding it to the helper. The click was
+/// delivered to the WebView's renderer process, and Windows grants that right
+/// to whoever received the last input — not to the process that owns the
+/// window around it.
+fn owner_window(window: &tauri::Window) -> isize {
+    #[cfg(target_os = "windows")]
+    {
+        window.hwnd().map(|handle| handle.0 as isize).unwrap_or(0)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = window;
+        0
+    }
+}
+
+/// Takes the next step, or abandons, against the status the operator saw.
+///
+/// The revision is not decoration: a press on a screen the helper has already
+/// left is refused here and again there, rather than applied to whatever
+/// replaced it.
+#[tauri::command]
+async fn advance_operator_ceremony(
+    state: State<'_, AppState>,
+    window: tauri::Window,
+    action: aether::certificates::operator_session::OperatorAction,
+    revision: u64,
+) -> Result<aether::certificates::operator_session::OperatorStatus, String> {
+    state
+        .operator
+        .advance(action, revision, owner_window(&window))
+        .await
+}
+
+/// Removes the final status once the operator has acknowledged it.
+#[tauri::command]
+async fn dismiss_operator_ceremony(state: State<'_, AppState>) -> Result<(), String> {
+    state.operator.dismiss().await
+}
+
+/// Everything waiting for an operator, through the gateway of one profile.
+///
+/// The gateway rather than Astra's public origin, and the difference is the
+/// access control: the origin serves a §7.5 recovery without a tunnel, so a
+/// list there would be readable by anyone who can reach it. Recoveries are
+/// absent from what comes back — Orion already holds the identifier of the
+/// ones it opened, and nothing else may enumerate them.
+///
+/// An unreachable gateway returns an empty list rather than an error: this
+/// runs on a timer behind a navigation rail, and a tunnel that is down is
+/// «rien en attente», not a red banner.
+#[tauri::command]
+async fn operator_pending_operations(
+    state: State<'_, AppState>,
+) -> Result<Vec<orion_core::operator_pending::OperatorPendingOperation>, String> {
+    let gateways: Vec<String> = {
+        let cfg = state.config.lock().await;
+        let mut seen: Vec<String> = Vec::new();
+        for profile in &cfg.profiles {
+            if let Some(url) = profile.heliosd_url.as_ref() {
+                if !seen.iter().any(|held| held == url) {
+                    seen.push(url.clone());
+                }
+            }
+        }
+        seen
+    };
+    let mut pending = Vec::new();
+    for gateway in gateways {
+        match orion_core::operator_pending::pending(&gateway).await {
+            Ok(list) => pending.extend(list.operations),
+            Err(error) => {
+                tracing::debug!(%gateway, %error, "aucune opération lisible sur cette gateway")
+            }
+        }
+    }
+    Ok(pending)
+}
+
+/// The ceremony's current state, for a view opened after it started.
+#[tauri::command]
+async fn operator_ceremony_status(
+    state: State<'_, AppState>,
+) -> Result<Option<aether::certificates::operator_session::OperatorStatus>, String> {
+    Ok(state.operator.status().await)
 }
 
 #[cfg(test)]
@@ -2118,6 +3122,22 @@ mod security_tests {
             use_staged_psk: false,
             ssh_target: None,
         }
+    }
+
+    #[test]
+    fn a_pending_import_replaces_the_stored_wireguard_identity() {
+        let stored = profile("poste-windows");
+        let imported = profile("poste-windows");
+        assert_ne!(stored.private_key, imported.private_key);
+
+        let base = super::profile_edit_base(Some(&imported), Some(&stored))
+            .expect("an imported profile is the edit base");
+        let merged = draft("poste-windows")
+            .merge(Some(base), None, None)
+            .expect("the imported profile remains complete");
+
+        assert_eq!(merged.private_key, imported.private_key);
+        assert_ne!(merged.private_key, stored.private_key);
     }
 
     /// The payload the screen actually sends must deserialise.
@@ -2246,6 +3266,26 @@ mod security_tests {
         assert_eq!(merged.private_key, key, "la clé stockée a été perdue");
         assert_eq!(merged.preshared_key, psk, "le PSK stocké a été perdu");
         assert_eq!(merged.endpoint, "198.51.100.7:51820");
+    }
+
+    /// Removing the block cannot rewrite an existing Helios profile as classic.
+    #[test]
+    fn editing_cannot_change_an_existing_profile_kind() {
+        let mut stored = profile("poste");
+        stored.profile_type = Some(orion_core::ProfileKind::HeliosKeyNegotiation);
+        stored.key_negotiation = Some(orion_core::KeyNegotiationSettings {
+            mode: aether::key_negotiation::ProtectionMode::MlKem,
+            minimum_mode: aether::key_negotiation::ProtectionMode::MlKem,
+            endpoint: "203.0.113.10:51821".into(),
+            server_name: "gateway.example".into(),
+            gateway_ca_der: "Q0E=".into(),
+            gateway_pq_certificate: "Q0VSVA==".into(),
+            identity: "poste".into(),
+            trust: None,
+        });
+
+        let error = draft("poste").merge(Some(&stored), None, None).unwrap_err();
+        assert!(error.contains("helios_key_negotiation"), "{error}");
     }
 
     /// The staged key is what a save adopts, and only when asked.
@@ -2442,6 +3482,10 @@ mod security_tests {
             config["bundle"]["resources"]["../../../resources-windows/"],
             "resources-windows/"
         );
+        assert_eq!(
+            config["bundle"]["externalBin"][0],
+            "binaries/helios-astra-helper"
+        );
         let args = config["bundle"]["windows"]["signCommand"]["args"]
             .as_array()
             .unwrap();
@@ -2537,7 +3581,10 @@ mod security_tests {
         assert_eq!(capabilities["windows"], serde_json::json!(["main"]));
         assert_eq!(
             capabilities["permissions"],
-            serde_json::json!(["core:default"])
+            serde_json::json!([
+                "core:default",
+                "companion:allow-launch-certificate-companion"
+            ])
         );
     }
 

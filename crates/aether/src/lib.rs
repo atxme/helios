@@ -10,16 +10,27 @@
 //! ADR-001 §2 and the vigilance notes).
 
 pub mod certificates;
+
 pub mod config;
+pub mod display_time;
 pub mod enroll;
 pub mod error;
 pub mod events;
+/// Fuzz entry points (spec §14.1).
+///
+/// Compiled by the ordinary build so a harness that stopped working fails
+/// with everything else; the libFuzzer targets in `fuzz/` are three-line
+/// wrappers over it.
+#[cfg(any(test, feature = "fuzzing"))]
+pub mod fuzzing;
 pub mod key_negotiation;
 pub mod locked;
+pub(crate) mod ml_dsa;
 pub mod mtu;
 pub mod policy;
 pub mod pq;
 pub mod private_file;
+pub mod random;
 pub mod secret;
 pub mod sig;
 pub mod speedtest;

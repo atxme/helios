@@ -17,6 +17,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use aether::certificates::{
+    approval::{AstraIssuancePolicy, AstraPolicyPin},
     client::ClientCertificateGeneration,
     encoding::{Fingerprint, Id16, MlDsa87PublicKey, TrustDomainId, WireGuardKey},
     state::AstraIssuerState,
@@ -45,6 +46,15 @@ pub struct PeerRecord {
     /// identity (spec §10.2).
     pub revoked: bool,
     pub revocation_epoch: u64,
+    /// The operator admission anchor the gateway named when it transcribed
+    /// this peer.
+    ///
+    /// A first-generation leaf is signed by it and by nothing this domain
+    /// holds: enrolment is offline, so `CA-PQ` cannot sign it. Recorded so a
+    /// §7.5 recovery can verify a leaf that has never been renewed — the only
+    /// population that recovery is for.
+    #[serde(default)]
+    pub admission_pq_ca: Option<MlDsa87PublicKey>,
 }
 
 /// A rotation in flight, from the authority's point of view.
@@ -61,6 +71,112 @@ pub struct PendingRotation {
     pub granted: bool,
 }
 
+/// One anchor transition the operator companion signed, held for delivery.
+///
+/// # Why the authority stores an object it cannot produce
+///
+/// §0.6 splits the two halves of a trust mutation. `CA-PQ` signs the object,
+/// once, in the companion — the only program that ever holds it in the clear.
+/// This authority's service key then signs as many per-client manifests as
+/// there are peers to reach. Storing the object is therefore storing something
+/// the storer could never forge, which is exactly what makes an online copy of
+/// it harmless: a compromised service key can delay, omit or reorder delivery,
+/// and cannot invent a single transition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoredTransition {
+    /// The campaign whose approval produced it. Audited, and the reason a
+    /// stored object can always be traced back to a text an operator read.
+    pub campaign_id: Id16,
+    pub accepted_at: u64,
+    /// Whether this object may leave the authority (spec §6.3).
+    ///
+    /// Only a gateway transition is held back: a `CA-PQ` transition and a
+    /// revocation are distributable the moment they are accepted, while §11.1
+    /// makes publication a step of its own — the last instant at which an
+    /// operator may still cancel. Defaulted, so a registry written before this
+    /// field existed still loads; the objects it holds are not gateway
+    /// transitions, which could not be stored at all back then.
+    #[serde(default)]
+    pub published: bool,
+    pub object: aether::certificates::transport::TrustUpdateObject,
+    /// Operator credential rows re-signed under the anchor this object
+    /// installs, when it installs one.
+    ///
+    /// Carried with the transition rather than beside it: a successor anchor
+    /// and a credential document only its predecessor can verify would leave
+    /// the domain unable to approve anything again — on the one path that
+    /// repairs a domain.
+    #[serde(default)]
+    pub credential_registry: Option<Box<aether::certificates::approval::CredentialRegistry>>,
+}
+
+/// Largest number of anchor transitions the registry keeps at once.
+///
+/// An anchor rotates on a human timescale and its overlap is measured in
+/// weeks, so more than a handful alive means something is re-depositing. The
+/// ceiling is a refusal, never an eviction: dropping the oldest would drop the
+/// one a lagging peer is still missing.
+pub const MAX_STORED_TRANSITIONS: usize = 8;
+/// Revocations retained for redistribution while their signed leaves live.
+///
+/// Aligned with the holder-side tombstone ledger: accepting more here than a
+/// recipient can remember would only defer a deterministic refusal.
+pub const MAX_STORED_REVOCATIONS: usize = aether::certificates::state::MAX_REVOCATION_TOMBSTONES;
+
+/// The incoming `CA-PQ` anchor Astra has accepted but not yet adopted.
+///
+/// The signed transition remains in the bounded public store. Keeping the
+/// successor and its window together here makes the authority's active/next
+/// state explicit and lets retirement move the pin without consulting an
+/// object that may already have been pruned.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaPqRotation {
+    pub next_ca_epoch: u64,
+    pub next_ca_public_key: MlDsa87PublicKey,
+    pub activation_at: u64,
+    pub retire_active_at: u64,
+}
+
+impl CaPqRotation {
+    fn from_transition(transition: &aether::certificates::authority::CaTransition) -> Self {
+        Self {
+            next_ca_epoch: transition.next_ca_epoch,
+            next_ca_public_key: transition.next_ca_public_key.clone(),
+            activation_at: transition.window.activation_at,
+            retire_active_at: transition.window.not_after,
+        }
+    }
+}
+
+/// The incoming client TLS anchor Astra has accepted but not yet adopted.
+///
+/// The complete certificate remains in the signed transition held below. The
+/// registry only needs the state that becomes authoritative at retirement,
+/// kept together so a partially described window is not representable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientTlsCaRotation {
+    pub next_ca_tls_epoch: u64,
+    pub next_ca_tls_fingerprint: Fingerprint,
+    pub activation_at: u64,
+    pub retire_active_at: u64,
+}
+
+impl ClientTlsCaRotation {
+    fn from_transition(
+        transition: &aether::certificates::authority::ClientTlsCaTransition,
+    ) -> Self {
+        Self {
+            next_ca_tls_epoch: transition.next_ca_tls_epoch,
+            next_ca_tls_fingerprint: transition.next_client_tls_ca_certificate.fingerprint(),
+            activation_at: transition.window.activation_at,
+            retire_active_at: transition.window.not_after,
+        }
+    }
+}
+
 /// Everything Astra persists.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -70,15 +186,47 @@ pub struct AstraState {
     pub server_name: String,
     pub authority_url: String,
     pub webauthn_rp_id: String,
+    pub astra_policy_fingerprint: AstraPolicyPin,
+    pub credential_registry_epoch: u64,
 
     pub ca_epoch: u64,
     pub ca_public_key: MlDsa87PublicKey,
+    /// Signed `CA-PQ` successor awaiting retirement of the active anchor.
+    ///
+    /// Additive and defaulted so a registry written while Astra only
+    /// redistributed this transition can recover the slot from that signed
+    /// object when it next loads.
+    #[serde(default)]
+    pub ca_rotation: Option<CaPqRotation>,
     pub ca_tls_epoch: u64,
+    /// SHA-256 of the client `CA-TLS` in service, confirmed out of band.
+    ///
+    /// `None` on a domain bootstrapped before this field existed. It is not
+    /// defaulted to a placeholder, because a placeholder would be a value
+    /// `ClientTlsCaTransition::verify` compares against and always accepts —
+    /// pinning an epoch without pinning the anchor is what made a `CA-TLS`
+    /// rotation impossible to check at all. Absent, the rotation is refused by
+    /// name; `astra pin-ca-tls` records it once.
+    #[serde(default)]
+    pub ca_tls_fingerprint: Option<Fingerprint>,
+    /// Signed `CA-TLS` successor awaiting retirement of the active anchor.
+    ///
+    /// Additive and defaulted so a registry written before Astra adopted the
+    /// anchor it distributes still loads with no rotation in flight.
+    #[serde(default)]
+    pub ca_tls_rotation: Option<ClientTlsCaRotation>,
 
     pub astra_service_key_epoch: u64,
     pub astra_service_public_key: MlDsa87PublicKey,
 
     pub issuer: Option<AstraIssuerState>,
+    /// Anchor transitions accepted from an approved authority campaign.
+    ///
+    /// Additive and defaulted: the file is on disk, and a registry written
+    /// before this field existed must still load. A version bump would refuse
+    /// the whole domain to add a list that starts empty.
+    #[serde(default)]
+    pub transitions: Vec<StoredTransition>,
     pub peers: BTreeMap<String, PeerRecord>,
     /// Monotonic status counter per certificate fingerprint (spec §4.2).
     pub status_epochs: BTreeMap<String, u64>,
@@ -89,6 +237,20 @@ pub struct AstraState {
 pub enum RegistryError {
     #[error("unknown peer")]
     UnknownPeer,
+    #[error(
+        "this authority already records generation {held} for that peer: adopting {offered} \
+         would walk a client identity backwards"
+    )]
+    GenerationRegression { held: u64, offered: u64 },
+    #[error(
+        "generation {generation} is recorded here under a different leaf than the one served: \
+         one number, two histories"
+    )]
+    GenerationDisagrees { generation: u64 },
+    #[error("the gateway and this authority disagree about the peer's terminal revocation state")]
+    RevocationDisagrees,
+    #[error("the gateway offered another admission anchor for an existing peer")]
+    AdmissionAnchorDisagrees,
     #[error("peer is revoked; no credential lifts that state")]
     Revoked,
     #[error("a rotation is already in flight for this peer")]
@@ -101,6 +263,24 @@ pub enum RegistryError {
     Io(#[from] std::io::Error),
     #[error("registry is unreadable: {0}")]
     Corrupt(String),
+    #[error(
+        "this authority already holds the delegation of epoch {installed}: installing epoch \
+         {offered} would walk an issuer decision backwards"
+    )]
+    IssuerEpochNotAdvancing { installed: u64, offered: u64 },
+    #[error(
+        "this authority already holds {held} anchor transitions, the ceiling of \
+         {MAX_STORED_TRANSITIONS}: a peer that is still missing one must not have it dropped to \
+         make room"
+    )]
+    TransitionStoreFull { held: usize },
+    #[error(
+        "this authority already holds {held} live revocations, the ceiling of \
+         {MAX_STORED_REVOCATIONS}; no live decision is evicted to make room"
+    )]
+    RevocationStoreFull { held: usize },
+    #[error("the transition this campaign produced is refused: {0}")]
+    Transition(#[from] aether::certificates::CertificateError),
 }
 
 /// The registry and its file.
@@ -116,15 +296,223 @@ impl AstraRegistry {
     }
 
     /// Loads the registry, refusing a chain that forks away from `expected_head`.
+    ///
+    /// A registry written before [`AstraState::astra_policy_fingerprint`] and
+    /// `credential_registry_epoch` existed is **migrated** rather than
+    /// refused — see [`Self::migrate`]. Refusing it would leave an operator
+    /// with an authority that has a history, a service key and a domain, and
+    /// no way to read any of them.
     pub fn load(path: &Path, expected_head: Option<&Fingerprint>) -> Result<Self, RegistryError> {
+        Self::load_with(path, expected_head, false)
+    }
+
+    /// Loads a registry for a daemon restart, accepting the unattended
+    /// per-peer lifecycle appended since the operator recorded the witness.
+    ///
+    /// See [`crate::audit::AuditChain::verify_from_witness`] for where the line
+    /// is drawn. What grew is logged rather than swallowed.
+    pub fn load_allowing_unattended_tail(
+        path: &Path,
+        expected_head: Option<&Fingerprint>,
+    ) -> Result<Self, RegistryError> {
+        Self::load_with(path, expected_head, true)
+    }
+
+    fn load_with(
+        path: &Path,
+        expected_head: Option<&Fingerprint>,
+        allow_unattended_tail: bool,
+    ) -> Result<Self, RegistryError> {
         let raw = std::fs::read(path)?;
-        let state: AstraState = serde_json::from_slice(&raw)
+        let mut document: serde_json::Value = serde_json::from_slice(&raw)
             .map_err(|error| RegistryError::Corrupt(error.to_string()))?;
-        state.audit.verify(expected_head)?;
-        Ok(Self {
+        let mut migrated = Self::migrate(&mut document)?;
+        let mut state: AstraState = serde_json::from_value(document)
+            .map_err(|error| RegistryError::Corrupt(error.to_string()))?;
+        migrated |= Self::recover_ca_pq_rotation(&mut state)?;
+        migrated |= Self::recover_client_tls_ca_rotation(&mut state)?;
+        match expected_head {
+            Some(expected) if allow_unattended_tail => {
+                let growth = state.audit.verify_from_witness(expected)?;
+                if growth.appended > 0 {
+                    tracing::info!(
+                        witnessed_sequence = growth.witnessed_sequence,
+                        appended = growth.appended,
+                        "the audit chain grew past the recorded witness; every record after it \
+                         is per-peer lifecycle, which widens nothing this authority may do"
+                    );
+                }
+            }
+            _ => state.audit.verify(expected_head)?,
+        }
+        let registry = Self {
             path: path.to_path_buf(),
             state,
-        })
+        };
+        if migrated {
+            // Written back so this happens once. The audit chain is untouched:
+            // nothing was decided here, and appending an event for a field
+            // that was always implied would fork the head an operator holds.
+            registry.save()?;
+            tracing::info!(
+                path = %path.display(),
+                "registry migrated: derived state was restored from the identity and signed \
+                 transitions already recorded"
+            );
+        }
+        Ok(registry)
+    }
+
+    /// Fills the two fields a registry written before them does not carry.
+    ///
+    /// Both are **derived**, which is the only reason this is a migration and
+    /// not a decision:
+    ///
+    /// - the issuance policy pin is `AstraIssuancePolicy::standard` over the
+    ///   trust domain, the gateway key and the server name — the three values
+    ///   already in the file. Astra and Helios each compute it independently
+    ///   at bootstrap and compare the result out of band, so recomputing it
+    ///   here reproduces exactly what bootstrap would have written. It is not
+    ///   read from anywhere, and a file that supplied its own would be
+    ///   supplying a pin, which is the one thing a pin may never be;
+    /// - the credential registry epoch starts at zero rather than at one.
+    ///   Every consumer keeps the highest it has seen, so the lowest possible
+    ///   value is the only safe one: starting higher would refuse the first
+    ///   genuine credential document as a rollback.
+    ///
+    /// Returns whether anything was filled, so a file already current is not
+    /// rewritten.
+    fn migrate(document: &mut serde_json::Value) -> Result<bool, RegistryError> {
+        let Some(object) = document.as_object_mut() else {
+            return Err(RegistryError::Corrupt(
+                "the registry is not a JSON object".into(),
+            ));
+        };
+        let mut migrated = false;
+        if !object.contains_key("credential_registry_epoch") {
+            object.insert("credential_registry_epoch".into(), serde_json::json!(0));
+            migrated = true;
+        }
+        if !object.contains_key("astra_policy_fingerprint") {
+            let identity = |field: &str| -> Result<String, RegistryError> {
+                object
+                    .get(field)
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .ok_or_else(|| {
+                        RegistryError::Corrupt(format!(
+                            "the registry carries no policy pin and no `{field}` to recompute it \
+                             from"
+                        ))
+                    })
+            };
+            let trust_domain_id = TrustDomainId::parse_hex(&identity("trust_domain_id")?)
+                .map_err(|error| RegistryError::Corrupt(error.to_string()))?;
+            let gateway_wg_public_key = WireGuardKey::parse(&identity("gateway_wg_public_key")?)
+                .map_err(|error| RegistryError::Corrupt(error.to_string()))?;
+            let pin = AstraIssuancePolicy::standard(
+                trust_domain_id,
+                gateway_wg_public_key,
+                identity("server_name")?,
+            )
+            .pin()
+            .map_err(|error| RegistryError::Corrupt(error.to_string()))?;
+            object.insert(
+                "astra_policy_fingerprint".into(),
+                serde_json::to_value(pin)
+                    .map_err(|error| RegistryError::Corrupt(error.to_string()))?,
+            );
+            migrated = true;
+        }
+        Ok(migrated)
+    }
+
+    /// Restores the `CA-TLS` window accepted by a registry written before the
+    /// window itself was persisted.
+    ///
+    /// The transition is verified again against the active pin. Two different
+    /// successors for the same epoch are refused as corruption rather than
+    /// choosing one based on storage order.
+    fn recover_client_tls_ca_rotation(state: &mut AstraState) -> Result<bool, RegistryError> {
+        use aether::certificates::transport::TrustUpdateObject;
+
+        if state.ca_tls_rotation.is_some() {
+            return Ok(false);
+        }
+        let Some(active) = state.ca_tls_fingerprint else {
+            return Ok(false);
+        };
+        let mut recovered = None;
+        for transition in state
+            .transitions
+            .iter()
+            .filter_map(|stored| match &stored.object {
+                TrustUpdateObject::ClientTlsCaTransition(transition)
+                    if transition.current_ca_tls_epoch == state.ca_tls_epoch
+                        && transition.active_client_tls_ca_fingerprint.matches(&active) =>
+                {
+                    Some(transition.as_ref())
+                }
+                _ => None,
+            })
+        {
+            transition.verify(
+                &state.ca_public_key,
+                &state.trust_domain_id,
+                state.ca_epoch,
+                state.ca_tls_epoch,
+                &active,
+            )?;
+            if recovered.is_some() {
+                return Err(RegistryError::Corrupt(
+                    "multiple client CA-TLS rotations target the active epoch".into(),
+                ));
+            }
+            recovered = Some(ClientTlsCaRotation::from_transition(transition));
+        }
+        let restored = recovered.is_some();
+        state.ca_tls_rotation = recovered;
+        Ok(restored)
+    }
+
+    /// Restores a `CA-PQ` window accepted before Astra persisted its own
+    /// active/next anchor state.
+    ///
+    /// Recovery still verifies both signatures under the anchor already
+    /// pinned in the registry. Ambiguous successors are corruption, never a
+    /// storage-order choice.
+    fn recover_ca_pq_rotation(state: &mut AstraState) -> Result<bool, RegistryError> {
+        use aether::certificates::transport::TrustUpdateObject;
+
+        if state.ca_rotation.is_some() {
+            return Ok(false);
+        }
+        let active = state.ca_public_key.authority_fingerprint();
+        let mut recovered = None;
+        for transition in state
+            .transitions
+            .iter()
+            .filter_map(|stored| match &stored.object {
+                TrustUpdateObject::CaTransition(transition)
+                    if transition.current_ca_epoch == state.ca_epoch
+                        && transition.current_ca_fingerprint.matches(&active) =>
+                {
+                    Some(transition.as_ref())
+                }
+                _ => None,
+            })
+        {
+            transition.verify(&state.ca_public_key, &state.trust_domain_id, state.ca_epoch)?;
+            if recovered.is_some() {
+                return Err(RegistryError::Corrupt(
+                    "multiple CA-PQ rotations target the active epoch".into(),
+                ));
+            }
+            recovered = Some(CaPqRotation::from_transition(transition));
+        }
+        let restored = recovered.is_some();
+        state.ca_rotation = recovered;
+        Ok(restored)
     }
 
     pub fn state(&self) -> &AstraState {
@@ -147,19 +535,581 @@ impl AstraRegistry {
     }
 
     /// Records a peer's first generation.
+    ///
+    /// Astra does not decide admission — the gateway does — so this is a
+    /// **transcription**: the record is built from what the gateway answers on
+    /// the private channel, and it exists so a renewal can be checked against
+    /// the generation the domain actually holds rather than the one a request
+    /// claims. Re-transcribing an unchanged peer is a no-op, which is what
+    /// makes the lazy path of [`crate::renewal`] safe to retry.
     pub fn admit(&mut self, record: PeerRecord, now_unix: u64) -> Result<(), RegistryError> {
         let key = record.client_wg_public_key.to_base64();
+        if self.state.peers.get(&key) == Some(&record) {
+            return Ok(());
+        }
         let generation = record.active.generation;
         let name = record.name.clone();
         self.state.peers.insert(key, record);
         self.state.audit.append(
-            AuditEvent::ClientStageAuthorized {
+            AuditEvent::PeerAdmitted {
                 peer: name,
                 generation,
             },
             now_unix,
         );
         self.save()
+    }
+
+    /// Adopts the gateway's view of a peer without ever moving it backwards.
+    ///
+    /// # Why this is not `admit`
+    ///
+    /// [`Self::admit`] writes a whole `PeerRecord`. Calling it to refresh a
+    /// peer would drop `pending` — a rotation whose grant may already be in a
+    /// client's hands — and would happily accept a generation lower than the
+    /// one already recorded, which is how a stale or rolled-back gateway view
+    /// would rewrite this authority's idea of who is current.
+    ///
+    /// So the rules are stated rather than implied:
+    ///
+    /// * a generation below the recorded one is refused, never adopted;
+    /// * the same generation must describe the same leaf, or it is two
+    ///   histories wearing one number and it is refused;
+    /// * terminal revocation state must agree, and an admission anchor already
+    ///   pinned here cannot be replaced by a later gateway view;
+    /// * a rotation in flight survives an adoption it is still ahead of, and
+    ///   is dropped only when the adopted generation has caught up with or
+    ///   passed the candidate it was staging;
+    /// * an unchanged record writes nothing and appends nothing.
+    ///
+    /// Returns whether anything moved. Idempotent by construction, which is
+    /// what makes it safe to replay after a crash: the gateway is the one that
+    /// promotes, and this only ever copies what it already serves.
+    pub fn reconcile_peer(
+        &mut self,
+        record: PeerRecord,
+        now_unix: u64,
+    ) -> Result<bool, RegistryError> {
+        let key = record.client_wg_public_key.to_base64();
+        let Some(held) = self.state.peers.get(&key) else {
+            self.admit(record, now_unix)?;
+            return Ok(true);
+        };
+        if held.revoked != record.revoked || held.revocation_epoch != record.revocation_epoch {
+            return Err(RegistryError::RevocationDisagrees);
+        }
+        if held
+            .admission_pq_ca
+            .as_ref()
+            .is_some_and(|anchor| record.admission_pq_ca.as_ref() != Some(anchor))
+        {
+            return Err(RegistryError::AdmissionAnchorDisagrees);
+        }
+        let (held_generation, adopted) = (held.active.generation, record.active.generation);
+        if adopted < held_generation {
+            return Err(RegistryError::GenerationRegression {
+                held: held_generation,
+                offered: adopted,
+            });
+        }
+        if adopted == held_generation
+            && (held.active != record.active
+                || held.active_pq_certificate != record.active_pq_certificate)
+        {
+            return Err(RegistryError::GenerationDisagrees {
+                generation: adopted,
+            });
+        }
+
+        // The rotation in flight is this authority's own, and the gateway view
+        // knows nothing of it. It is kept while it still names a generation
+        // ahead of what is served, and dropped once it no longer can: a
+        // candidate at or below the adopted generation has either landed or
+        // been overtaken, and either way nothing is left to grant.
+        let pending = held
+            .pending
+            .clone()
+            .filter(|rotation| rotation.candidate.generation > adopted);
+        let dropped_stage = held.pending.is_some() && pending.is_none();
+        let name = record.name.clone();
+        let admission_pq_ca = held
+            .admission_pq_ca
+            .clone()
+            .or(record.admission_pq_ca.clone());
+        let refreshed = PeerRecord {
+            pending,
+            admission_pq_ca,
+            ..record
+        };
+        if self.state.peers.get(&key) == Some(&refreshed) {
+            return Ok(false);
+        }
+        self.state.peers.insert(key, refreshed);
+        if dropped_stage {
+            self.state.audit.append(
+                AuditEvent::ClientStagePurged {
+                    peer: name.clone(),
+                    generation: adopted,
+                },
+                now_unix,
+            );
+        }
+        if adopted > held_generation {
+            self.state.audit.append(
+                AuditEvent::PeerGenerationAdopted {
+                    peer: name,
+                    generation: adopted,
+                },
+                now_unix,
+            );
+        }
+        self.save()?;
+        Ok(true)
+    }
+
+    /// Installs the delegation the operator companion signed (spec §9.5).
+    ///
+    /// The epoch must move forward. A delegation reinstalled at an epoch
+    /// already used would let a withdrawn intermediate come back under a
+    /// signature that is still perfectly valid — the same walk-back the
+    /// credential document refuses, and for the same reason.
+    pub fn install_issuer(
+        &mut self,
+        issuer: AstraIssuerState,
+        now_unix: u64,
+    ) -> Result<(), RegistryError> {
+        self.install_issuer_adopting_policy(issuer, None, now_unix)
+    }
+
+    /// Installs a delegation and, in the same durable write, the issuance
+    /// policy it carried the domain onto.
+    ///
+    /// One write rather than two: a pin persisted without its delegation
+    /// would widen what the authority may do unattended before anything
+    /// authorized it, and a delegation persisted without its pin would be
+    /// refused on the next read by the policy it was meant to install.
+    pub fn install_issuer_adopting_policy(
+        &mut self,
+        issuer: AstraIssuerState,
+        adopted_policy: Option<AstraPolicyPin>,
+        now_unix: u64,
+    ) -> Result<(), RegistryError> {
+        if let Some(policy) = adopted_policy {
+            self.state.astra_policy_fingerprint = policy;
+            self.state.audit.append(
+                AuditEvent::IssuancePolicyAdopted {
+                    policy_fingerprint: policy.fingerprint().to_string(),
+                },
+                now_unix,
+            );
+        }
+        if let Some(installed) = &self.state.issuer {
+            // Installing the delegation already held is a no-op, not a
+            // walk-back: a companion whose response was lost retries the same
+            // bytes, and §8.2 makes that replay the repair. Only a *different*
+            // delegation at a spent epoch is the substitution this refuses.
+            if installed == &issuer {
+                // The delegation is already held. The pin may still have moved
+                // just above, so the write is not skipped with it.
+                return if adopted_policy.is_some() {
+                    self.save()
+                } else {
+                    Ok(())
+                };
+            }
+            if issuer.issuer_epoch <= installed.issuer_epoch {
+                return Err(RegistryError::IssuerEpochNotAdvancing {
+                    installed: installed.issuer_epoch,
+                    offered: issuer.issuer_epoch,
+                });
+            }
+        }
+        let issuer_epoch = issuer.issuer_epoch;
+        self.state.issuer = Some(issuer);
+        self.state
+            .audit
+            .append(AuditEvent::IssuerInstalled { issuer_epoch }, now_unix);
+        self.save()
+    }
+
+    /// Records the anchor transitions an approved campaign produced (§0.6).
+    ///
+    /// Every object is verified **here**, under the anchor and the epoch this
+    /// registry already holds, before a byte is written. That is the whole
+    /// reason the online authority may hold them at all: it re-derives the
+    /// `CA-PQ` proof rather than trusting the channel that delivered it, and a
+    /// forged object fails against a key no online process possesses.
+    ///
+    /// Depositing the same object twice is a **no-op**, not a second entry: a
+    /// companion that retries after a lost response must not make the peer
+    /// collect the same transition under two fingerprints.
+    pub fn accept_transitions(
+        &mut self,
+        campaign: &aether::certificates::status::AstraRotationCampaign,
+        objects: &[aether::certificates::transport::TrustUpdateObject],
+        credential_registry: Option<Box<aether::certificates::approval::CredentialRegistry>>,
+        now_unix: u64,
+    ) -> Result<usize, RegistryError> {
+        use aether::certificates::transport::TrustUpdateObject;
+
+        let campaign_id = campaign.campaign_id;
+
+        let mut fresh = Vec::new();
+        let mut withdrawn = Vec::new();
+        let mut ca_rotation = self.state.ca_rotation.clone();
+        let mut ca_tls_rotation = self.state.ca_tls_rotation.clone();
+        for object in objects {
+            let fingerprint = object.fingerprint()?;
+            let held = self.state.transitions.iter().try_fold(
+                false,
+                |found, stored| -> Result<bool, RegistryError> {
+                    Ok(found || stored.object.fingerprint()?.matches(&fingerprint))
+                },
+            )?;
+            let repeated_in_batch = fresh.iter().try_fold(
+                false,
+                |found, pending: &TrustUpdateObject| -> Result<bool, RegistryError> {
+                    Ok(found || pending.fingerprint()?.matches(&fingerprint))
+                },
+            )?;
+            // An identical retry names an object this registry has already
+            // verified and applied. In particular, checking its old counter
+            // against the now-advanced revocation counter would turn the
+            // idempotent retry into a rollback error.
+            if held || repeated_in_batch {
+                continue;
+            }
+            match object {
+                TrustUpdateObject::CaTransition(transition) => {
+                    transition.verify(
+                        &self.state.ca_public_key,
+                        &self.state.trust_domain_id,
+                        self.state.ca_epoch,
+                    )?;
+                    if ca_rotation.is_some() {
+                        return Err(RegistryError::Transition(
+                            aether::certificates::CertificateError::IllegalStateTransition(
+                                "a CA-PQ rotation is already in flight",
+                            ),
+                        ));
+                    }
+                    ca_rotation = Some(CaPqRotation::from_transition(transition));
+                }
+                TrustUpdateObject::CertificateRevocation(revocation) => {
+                    use aether::certificates::revocation::RevocationScope;
+
+                    if revocation.effective_at > now_unix {
+                        return Err(RegistryError::Transition(
+                            aether::certificates::CertificateError::IssuerScopeViolation(
+                                "this authority accepts only immediately effective revocations",
+                            ),
+                        ));
+                    }
+                    if revocation.scope == RevocationScope::Gateway {
+                        // The gateway's own leaves were never recorded here,
+                        // so the approved campaign is the only place their
+                        // state is pinned — the same asymmetry as a gateway
+                        // transition. `covers_revocation` ties identity,
+                        // fingerprints and counter to the text an operator
+                        // read at a security key; only then may the counter be
+                        // read back from the object to verify its signature.
+                        campaign.covers_revocation(revocation)?;
+                        let current_epoch = revocation.revocation_epoch.checked_sub(1).ok_or(
+                            RegistryError::Transition(
+                                aether::certificates::CertificateError::CampaignMismatch,
+                            ),
+                        )?;
+                        revocation.verify(
+                            &self.state.ca_public_key,
+                            &self.state.trust_domain_id,
+                            self.state.ca_epoch,
+                            current_epoch,
+                        )?;
+                        fresh.push(object.clone());
+                        continue;
+                    }
+                    let key = revocation.identity_key.to_base64();
+                    let peer = self
+                        .state
+                        .peers
+                        .get(&key)
+                        .ok_or(RegistryError::UnknownPeer)?;
+                    revocation.verify(
+                        &self.state.ca_public_key,
+                        &self.state.trust_domain_id,
+                        self.state.ca_epoch,
+                        peer.revocation_epoch,
+                    )?;
+                    let tls_matches = revocation
+                        .revoked_tls_fingerprint
+                        .zip(revocation.revoked_tls_not_after)
+                        .is_none_or(|(fingerprint, not_after)| {
+                            peer.active
+                                .tls_certificate_fingerprint
+                                .matches(&fingerprint)
+                                && peer.active.not_after == not_after
+                        });
+                    let pq_matches = revocation
+                        .revoked_pq_fingerprint
+                        .zip(revocation.revoked_pq_not_after)
+                        .is_none_or(|(fingerprint, not_after)| {
+                            peer.active.pq_certificate_fingerprint.matches(&fingerprint)
+                                && peer.active.not_after == not_after
+                        });
+                    if !tls_matches || !pq_matches {
+                        return Err(RegistryError::Transition(
+                            aether::certificates::CertificateError::CampaignMismatch,
+                        ));
+                    }
+                    withdrawn.push((key, revocation.revocation_epoch));
+                }
+                TrustUpdateObject::GatewayIdentityTransition(transition) => {
+                    // The campaign first, and it is not a formality here: this
+                    // authority holds no gateway leaf, so the approved text is
+                    // the only place the state this decision was taken against
+                    // is pinned. Verifying the object against fingerprints it
+                    // carries itself would be verifying nothing — it is
+                    // `covers_gateway_transition` that ties them to what an
+                    // operator read at a security key.
+                    campaign.covers_gateway_transition(transition)?;
+                    transition.verify(
+                        &self.state.ca_public_key,
+                        &self.state.trust_domain_id,
+                        self.state.ca_epoch,
+                        transition.gateway_identity_epoch.checked_sub(1).ok_or(
+                            RegistryError::Transition(
+                                aether::certificates::CertificateError::CampaignMismatch,
+                            ),
+                        )?,
+                        &self.state.gateway_wg_public_key,
+                        &self.state.server_name,
+                        &transition.active_gateway_tls_certificate_fingerprint,
+                        &transition.active_gateway_certificate_fingerprint,
+                    )?;
+                }
+                TrustUpdateObject::GatewayTransitionAbort(abort) => {
+                    campaign.covers_gateway_abort(abort)?;
+                    // An abort is verified against the exact document it
+                    // cancels, so that document must already be here. It is
+                    // the same rule the gateway applies, and it is why an
+                    // abort deposited before its transition is refused rather
+                    // than stored for a transition that may never arrive.
+                    let cancelled = self
+                        .state
+                        .transitions
+                        .iter()
+                        .filter_map(|stored| match &stored.object {
+                            TrustUpdateObject::GatewayIdentityTransition(held) => {
+                                Some((held, stored.published))
+                            }
+                            _ => None,
+                        })
+                        .find(|(held, _)| {
+                            held.fingerprint().is_ok_and(|held_fingerprint| {
+                                held_fingerprint.matches(&abort.gateway_transition_fingerprint)
+                            })
+                        })
+                        .ok_or(RegistryError::Transition(
+                            aether::certificates::CertificateError::CampaignMismatch,
+                        ))?;
+                    // The publication marker this authority persisted, not a
+                    // constant: past it a client may already hold the decision,
+                    // and refusing the abort here is what keeps one fleet from
+                    // holding two truths (spec §6.3).
+                    abort.verify(
+                        &self.state.ca_public_key,
+                        cancelled.0,
+                        cancelled.1,
+                        now_unix,
+                    )?;
+                }
+                TrustUpdateObject::ClientTlsCaTransition(transition) => {
+                    // The anchor this registry pins, never one taken from the
+                    // object: comparing a transition to the fingerprint it
+                    // carries itself would be comparing a value to itself.
+                    // A domain bootstrapped before that pin existed is refused
+                    // by name rather than checked against nothing.
+                    let active = self
+                        .state
+                        .ca_tls_fingerprint
+                        .ok_or(RegistryError::Transition(
+                            aether::certificates::CertificateError::IllegalStateTransition(
+                                "no client CA-TLS anchor is pinned here: record it with \
+                             `astra pin-ca-tls` before a rotation can be verified",
+                            ),
+                        ))?;
+                    transition.verify(
+                        &self.state.ca_public_key,
+                        &self.state.trust_domain_id,
+                        self.state.ca_epoch,
+                        self.state.ca_tls_epoch,
+                        &active,
+                    )?;
+                    if ca_tls_rotation.is_some() {
+                        return Err(RegistryError::Transition(
+                            aether::certificates::CertificateError::IllegalStateTransition(
+                                "a client CA-TLS rotation is already in flight",
+                            ),
+                        ));
+                    }
+                    ca_tls_rotation = Some(ClientTlsCaRotation::from_transition(transition));
+                }
+                _ => {
+                    return Err(RegistryError::Transition(
+                        aether::certificates::CertificateError::IssuerScopeViolation(
+                            "this authority stores only a CA-PQ transition, a gateway identity \
+                             decision or a client revocation",
+                        ),
+                    ))
+                }
+            }
+            fresh.push(object.clone());
+        }
+        if fresh.is_empty() {
+            return Ok(0);
+        }
+        let held_revocations = self
+            .state
+            .transitions
+            .iter()
+            .filter(|stored| {
+                matches!(stored.object, TrustUpdateObject::CertificateRevocation(_))
+                    && retained_until(&stored.object).is_some_and(|not_after| now_unix < not_after)
+            })
+            .count();
+        let fresh_revocations = fresh
+            .iter()
+            .filter(|object| matches!(object, TrustUpdateObject::CertificateRevocation(_)))
+            .count();
+        if held_revocations + fresh_revocations > MAX_STORED_REVOCATIONS {
+            return Err(RegistryError::RevocationStoreFull {
+                held: held_revocations,
+            });
+        }
+        let held_transitions = self
+            .state
+            .transitions
+            .iter()
+            .filter(|stored| {
+                !matches!(stored.object, TrustUpdateObject::CertificateRevocation(_))
+                    && retained_until(&stored.object).is_some_and(|not_after| now_unix < not_after)
+            })
+            .count();
+        let fresh_transitions = fresh.len() - fresh_revocations;
+        if held_transitions + fresh_transitions > MAX_STORED_TRANSITIONS {
+            return Err(RegistryError::TransitionStoreFull {
+                held: held_transitions,
+            });
+        }
+
+        // Capacity has been proven without mutation. Only now remove expired
+        // objects and commit the fresh batch, so a refused deposit leaves the
+        // in-memory state exactly as it was.
+        self.state.transitions.retain(|stored| {
+            retained_until(&stored.object).is_some_and(|not_after| now_unix < not_after)
+        });
+        self.state.ca_rotation = ca_rotation;
+        self.state.ca_tls_rotation = ca_tls_rotation;
+        let accepted = fresh.len();
+        for object in fresh {
+            // A gateway transition is held back until §11.1 step 6; every
+            // other object is distributable the moment it is accepted.
+            let published = !matches!(
+                object,
+                TrustUpdateObject::GatewayIdentityTransition(_)
+                    | TrustUpdateObject::GatewayTransitionAbort(_)
+            );
+            self.state.transitions.push(StoredTransition {
+                campaign_id,
+                accepted_at: now_unix,
+                object,
+                published,
+                credential_registry: credential_registry.clone(),
+            });
+        }
+        // The authority stops issuing for the identity as part of accepting
+        // the signed decision. Delivery to other clients may follow later;
+        // it must never be a prerequisite for the local withdrawal.
+        for (key, revocation_epoch) in withdrawn {
+            if let Some(peer) = self.state.peers.get_mut(&key) {
+                peer.revoked = true;
+                peer.revocation_epoch = revocation_epoch;
+                peer.pending = None;
+                self.state.audit.append(
+                    AuditEvent::CertificateRevoked {
+                        target: peer.name.clone(),
+                    },
+                    now_unix,
+                );
+            }
+        }
+        if fresh_transitions > 0 {
+            self.state.audit.append(
+                AuditEvent::AnchorTransitionsAccepted {
+                    campaign: campaign_id.to_hex(),
+                    objects: fresh_transitions,
+                },
+                now_unix,
+            );
+        }
+        self.save()?;
+        Ok(accepted)
+    }
+
+    /// Adopts due `CA-PQ` and client TLS anchors, then drops transitions no
+    /// peer can still be told about (spec §§4.1, 9.2 and 9.4).
+    ///
+    /// A transition past its `not_after` authorizes nothing: a client that
+    /// received it would refuse it, and one that did not has to be repaired by
+    /// an operator rather than by a delivery that arrives after the window it
+    /// was signed for. Forgetting it is what keeps the bounded store from
+    /// filling with objects that can no longer do anything. Promotion and the
+    /// removal of the transition it consumes share this method and therefore
+    /// one atomic registry write: after a restart Astra cannot observe one
+    /// without the other.
+    pub fn forget_expired_transitions(&mut self, now_unix: u64) -> Result<usize, RegistryError> {
+        let before = self.state.transitions.len();
+        self.state
+            .transitions
+            .retain(|stored| match retained_until(&stored.object) {
+                Some(not_after) => now_unix < not_after,
+                // Something with no window is something this store does not
+                // hold; keeping it would be keeping an object nothing prunes.
+                None => false,
+            });
+        let dropped = before - self.state.transitions.len();
+        let due_ca_rotation = self
+            .state
+            .ca_rotation
+            .as_ref()
+            .filter(|rotation| now_unix >= rotation.retire_active_at)
+            .cloned();
+        let ca_promoted = if let Some(rotation) = due_ca_rotation {
+            self.state.ca_epoch = rotation.next_ca_epoch;
+            self.state.ca_public_key = rotation.next_ca_public_key;
+            self.state.ca_rotation = None;
+            true
+        } else {
+            false
+        };
+        let due_tls_rotation = self
+            .state
+            .ca_tls_rotation
+            .as_ref()
+            .filter(|rotation| now_unix >= rotation.retire_active_at)
+            .cloned();
+        let ca_tls_promoted = if let Some(rotation) = due_tls_rotation {
+            self.state.ca_tls_epoch = rotation.next_ca_tls_epoch;
+            self.state.ca_tls_fingerprint = Some(rotation.next_ca_tls_fingerprint);
+            self.state.ca_tls_rotation = None;
+            true
+        } else {
+            false
+        };
+        if dropped > 0 || ca_promoted || ca_tls_promoted {
+            self.save()?;
+        }
+        Ok(dropped)
     }
 
     /// Opens a rotation, refusing a second one for the same peer.
@@ -181,6 +1131,9 @@ impl AstraRegistry {
             return Err(RegistryError::Revoked);
         }
         if let Some(existing) = &peer.pending {
+            if existing == &rotation {
+                return Ok(());
+            }
             // An expired stage is not "in flight": it is debris, and it must
             // not block the renewal it was supposed to perform.
             if now_unix < existing.stage_expires_at {
@@ -200,6 +1153,45 @@ impl AstraRegistry {
         self.save()
     }
 
+    /// Un-reserves a rotation the gateway refused, before its lease runs out.
+    ///
+    /// A staging that fails must not leave the peer holding a reservation
+    /// nobody can clear: `active + 1` would stay unavailable until the lease
+    /// expired, for a renewal that never happened. It names the stage it is
+    /// clearing and clears nothing else — a refusal arriving after a later
+    /// rotation opened would otherwise cancel that one instead.
+    ///
+    /// A rotation already `granted` is **not** cleared. Past that point Astra
+    /// has released the leaves and the client may commit at any moment; taking
+    /// the reservation back would let a second candidate be issued for a
+    /// generation the gateway is about to promote.
+    pub fn abandon_rotation(
+        &mut self,
+        key: &WireGuardKey,
+        stage_id: &Id16,
+        now_unix: u64,
+    ) -> Result<(), RegistryError> {
+        let peer = self
+            .state
+            .peers
+            .get_mut(&key.to_base64())
+            .ok_or(RegistryError::UnknownPeer)?;
+        let rotation = peer.pending.as_ref().ok_or(RegistryError::NoRotation)?;
+        if rotation.stage_id != *stage_id || rotation.granted {
+            return Err(RegistryError::NoRotation);
+        }
+        let rotation = peer.pending.take().expect("checked immediately above");
+        let name = peer.name.clone();
+        self.state.audit.append(
+            AuditEvent::ClientStagePurged {
+                peer: name,
+                generation: rotation.candidate.generation,
+            },
+            now_unix,
+        );
+        self.save()
+    }
+
     /// Marks a rotation as granted — the point past which Astra has released
     /// the leaves and can no longer withhold them.
     pub fn mark_granted(&mut self, key: &WireGuardKey, now_unix: u64) -> Result<(), RegistryError> {
@@ -210,6 +1202,9 @@ impl AstraRegistry {
             .ok_or(RegistryError::UnknownPeer)?;
         let name = peer.name.clone();
         let rotation = peer.pending.as_mut().ok_or(RegistryError::NoRotation)?;
+        if rotation.granted {
+            return Ok(());
+        }
         rotation.granted = true;
         let generation = rotation.candidate.generation;
         self.state.audit.append(
@@ -308,6 +1303,103 @@ impl AstraRegistry {
         *entry
     }
 
+    /// Lets a stored gateway decision leave the authority (spec §11.1 step 6).
+    ///
+    /// Persisted **before** the first byte, and irreversible. A gateway
+    /// transition that has been distributed can no longer be aborted: a client
+    /// may hold it, go offline, and promote on its own at `not_after`.
+    ///
+    /// Idempotent, because the relay to the gateway that follows may fail
+    /// after this write. Re-running the step must be able to finish the relay
+    /// without asking `CA-PQ` to sign anything again.
+    pub fn publish_gateway_transition(
+        &mut self,
+        gateway_identity_epoch: u64,
+        now_unix: u64,
+    ) -> Result<aether::certificates::gateway::GatewayIdentityTransition, RegistryError> {
+        use aether::certificates::transport::TrustUpdateObject;
+
+        let position = self
+            .state
+            .transitions
+            .iter()
+            .position(|stored| match &stored.object {
+                TrustUpdateObject::GatewayIdentityTransition(transition) => {
+                    transition.gateway_identity_epoch == gateway_identity_epoch
+                }
+                _ => false,
+            })
+            .ok_or(RegistryError::UnknownPeer)?;
+        let TrustUpdateObject::GatewayIdentityTransition(transition) =
+            self.state.transitions[position].object.clone()
+        else {
+            return Err(RegistryError::UnknownPeer);
+        };
+        if self.state.transitions[position].published {
+            return Ok(*transition);
+        }
+        // An aborted decision never becomes publishable: the tombstone that
+        // cancelled it is itself a stored object at the same epoch.
+        let cancelled = self
+            .state
+            .transitions
+            .iter()
+            .any(|stored| match &stored.object {
+                TrustUpdateObject::GatewayTransitionAbort(abort) => {
+                    abort.gateway_identity_epoch == gateway_identity_epoch
+                }
+                _ => false,
+            });
+        if cancelled {
+            return Err(RegistryError::Transition(
+                aether::certificates::CertificateError::IllegalStateTransition(
+                    "this transition was aborted; the epoch stays consumed",
+                ),
+            ));
+        }
+        self.state.transitions[position].published = true;
+        self.state.audit.append(
+            AuditEvent::GatewayTransitionPublished {
+                gateway_identity_epoch,
+            },
+            now_unix,
+        );
+        self.save()?;
+        Ok(*transition)
+    }
+
+    /// Records the client `CA-TLS` this domain serves, once (spec §9.4).
+    ///
+    /// Refuses to replace one already pinned: an anchor that a command can
+    /// overwrite is an anchor an operator error can move, and §9.4 makes that
+    /// move a signed transition instead.
+    pub fn pin_client_tls_ca(
+        &mut self,
+        fingerprint: Fingerprint,
+        now_unix: u64,
+    ) -> Result<(), RegistryError> {
+        if let Some(held) = self.state.ca_tls_fingerprint {
+            if !held.matches(&fingerprint) {
+                return Err(RegistryError::Transition(
+                    aether::certificates::CertificateError::IllegalStateTransition(
+                        "a client CA-TLS anchor is already pinned; replacing it is a rotation",
+                    ),
+                ));
+            }
+            return Ok(());
+        }
+        let mut state = self.state.clone();
+        state.ca_tls_fingerprint = Some(fingerprint);
+        state.audit.append(
+            AuditEvent::ClientTlsCaPinned {
+                ca_tls_epoch: state.ca_tls_epoch,
+            },
+            now_unix,
+        );
+        self.state = state;
+        self.save()
+    }
+
     pub fn record(&mut self, event: AuditEvent, now_unix: u64) -> Result<(), RegistryError> {
         self.state.audit.append(event, now_unix);
         self.save()
@@ -362,6 +1454,37 @@ impl ChallengeStore {
     }
 }
 
+/// The window an anchor transition is in force for, when it carries one.
+///
+/// Read from the object rather than recorded beside it: two copies of a
+/// deadline drift, and the one that decides must be the one the signature
+/// covers.
+fn transition_window(
+    object: &aether::certificates::transport::TrustUpdateObject,
+) -> Option<&TransitionWindow> {
+    use aether::certificates::transport::TrustUpdateObject;
+    match object {
+        TrustUpdateObject::CaTransition(transition) => Some(&transition.window),
+        TrustUpdateObject::ClientTlsCaTransition(transition) => Some(&transition.window),
+        TrustUpdateObject::GatewayIdentityTransition(transition) => Some(&transition.window),
+        _ => None,
+    }
+}
+
+/// Last instant at which a stored object can still affect a recipient.
+fn retained_until(object: &aether::certificates::transport::TrustUpdateObject) -> Option<u64> {
+    use aether::certificates::transport::TrustUpdateObject;
+
+    if let TrustUpdateObject::CertificateRevocation(revocation) = object {
+        return revocation
+            .revoked_tls_not_after
+            .into_iter()
+            .chain(revocation.revoked_pq_not_after)
+            .max();
+    }
+    transition_window(object).map(|window| window.not_after)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -395,6 +1518,1370 @@ mod tests {
         }
     }
 
+    /// The anchor-transition half of §0.6, with the private key that signs.
+    ///
+    /// A separate module because every test here needs the outgoing `CA-PQ`
+    /// in hand: what is being asserted is that this registry re-derives the
+    /// proof itself rather than trusting whatever reached it.
+    mod anchor_transitions {
+        use super::*;
+        use aether::certificates::authority::CaTransition;
+        use aether::certificates::transport::TrustUpdateObject;
+        use aether::certificates::window::TransitionWindow;
+        use aether::certificates::CERTIFICATE_FORMAT_VERSION;
+
+        struct Anchored {
+            registry: AstraRegistry,
+            ca_private: zeroize::Zeroizing<Vec<u8>>,
+            ca_public: MlDsa87PublicKey,
+            _directory: tempfile::TempDir,
+        }
+
+        fn anchored() -> Anchored {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (ca_private, ca_public) = generate_ml_dsa_87_keypair().expect("keygen");
+            let (_, service) = generate_ml_dsa_87_keypair().expect("keygen");
+            let state = AstraState {
+                trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+                gateway_wg_public_key: WireGuardKey::from_bytes([1; 32]),
+                server_name: "gateway.example".into(),
+                authority_url: "https://astra.example".into(),
+                webauthn_rp_id: "astra.example".into(),
+                astra_policy_fingerprint: AstraPolicyPin::new(Fingerprint::of(b"policy"))
+                    .expect("policy pin"),
+                credential_registry_epoch: 1,
+                ca_epoch: 1,
+                ca_public_key: ca_public.clone(),
+                ca_rotation: None,
+                ca_tls_epoch: 1,
+                ca_tls_fingerprint: Some(Fingerprint::of(b"client tls ca")),
+                ca_tls_rotation: None,
+                astra_service_key_epoch: 1,
+                astra_service_public_key: service,
+                issuer: None,
+                transitions: Vec::new(),
+                peers: BTreeMap::new(),
+                status_epochs: BTreeMap::new(),
+                audit: AuditChain::default(),
+            };
+            Anchored {
+                registry: AstraRegistry::new(directory.path().join("astra.json"), state),
+                ca_private,
+                ca_public,
+                _directory: directory,
+            }
+        }
+
+        fn transition_from(
+            registry: &AstraRegistry,
+            current_private: &[u8],
+            current_public: &MlDsa87PublicKey,
+            current_epoch: u64,
+            window: TransitionWindow,
+        ) -> (
+            TrustUpdateObject,
+            zeroize::Zeroizing<Vec<u8>>,
+            MlDsa87PublicKey,
+        ) {
+            let (next_private, next_public) = generate_ml_dsa_87_keypair().expect("keygen");
+            let transition = CaTransition {
+                format_version: CERTIFICATE_FORMAT_VERSION,
+                trust_domain_id: registry.state().trust_domain_id,
+                current_ca_epoch: current_epoch,
+                next_ca_epoch: current_epoch + 1,
+                current_ca_fingerprint: current_public.authority_fingerprint(),
+                next_ca_fingerprint: next_public.authority_fingerprint(),
+                next_ca_public_key: next_public.clone(),
+                window,
+                current_ca_signature: aether::certificates::encoding::MlDsa87Signature::placeholder(
+                ),
+                next_ca_signature: aether::certificates::encoding::MlDsa87Signature::placeholder(),
+            }
+            .sign(current_private, &next_private)
+            .expect("signing");
+            (
+                TrustUpdateObject::CaTransition(Box::new(transition)),
+                next_private,
+                next_public,
+            )
+        }
+
+        fn transition(anchored: &Anchored, current_epoch: u64) -> TrustUpdateObject {
+            transition_from(
+                &anchored.registry,
+                &anchored.ca_private,
+                &anchored.ca_public,
+                current_epoch,
+                TransitionWindow::new(1_000, 90_000, 200_000).expect("window"),
+            )
+            .0
+        }
+
+        fn campaign_id() -> Id16 {
+            Id16::new([7; 16]).expect("id")
+        }
+
+        /// The approved text an acceptance is checked against.
+        ///
+        /// Only the gateway-identity arms read its rows; every other object
+        /// carries the state it is verified against, or is verified against an
+        /// anchor this registry pins. Which is exactly the asymmetry: the
+        /// gateway's own leaves live nowhere here.
+        fn campaign(
+            scope: aether::certificates::status::CampaignScope,
+            targets: Vec<aether::certificates::status::CampaignTarget>,
+        ) -> aether::certificates::status::AstraRotationCampaign {
+            aether::certificates::status::AstraRotationCampaign {
+                format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+                campaign_id: campaign_id(),
+                trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+                gateway_wg_public_key: WireGuardKey::from_bytes([1; 32]),
+                server_name: "gateway.example".into(),
+                created_at: 1_000,
+                expires_at: 1_300,
+                scope,
+                targets,
+                reason: "rotation".into(),
+                requested_by: "operator".into(),
+                policy_fingerprint: Fingerprint::of(b"policy"),
+                required_credentials: scope.required_credentials(),
+            }
+        }
+
+        fn anchor_campaign() -> aether::certificates::status::AstraRotationCampaign {
+            campaign(
+                aether::certificates::status::CampaignScope::TrustAuthorities,
+                Vec::new(),
+            )
+        }
+
+        fn admitted(anchored: &mut Anchored) -> WireGuardKey {
+            let client = WireGuardKey::from_bytes([5; 32]);
+            anchored.registry.state.peers.insert(
+                client.to_base64(),
+                PeerRecord {
+                    name: "compromised workstation".into(),
+                    client_wg_public_key: client,
+                    active: generation(3),
+                    active_pq_certificate: certificate(),
+                    pending: Some(PendingRotation {
+                        stage_id: Id16::new([4; 16]).expect("stage"),
+                        request_fingerprint: Fingerprint::of(b"request"),
+                        candidate: generation(4),
+                        window: TransitionWindow::new(1_000, 2_000, 3_000).expect("window"),
+                        stage_expires_at: 3_000,
+                        granted: false,
+                    }),
+                    revoked: false,
+                    revocation_epoch: 0,
+                    admission_pq_ca: None,
+                },
+            );
+            client
+        }
+
+        fn revocation(
+            anchored: &Anchored,
+            client: WireGuardKey,
+            effective_at: u64,
+            not_after: u64,
+        ) -> TrustUpdateObject {
+            use aether::certificates::revocation::{
+                EmergencyCertificateRevocation, RevocationReason, RevocationScope,
+            };
+
+            let active = generation(3);
+            let object = EmergencyCertificateRevocation {
+                format_version: CERTIFICATE_FORMAT_VERSION,
+                trust_domain_id: anchored.registry.state().trust_domain_id,
+                ca_epoch: 1,
+                scope: RevocationScope::Client,
+                identity_key: client,
+                server_name: None,
+                revocation_epoch: 1,
+                revoked_tls_fingerprint: Some(active.tls_certificate_fingerprint),
+                revoked_tls_not_after: Some(not_after),
+                revoked_pq_fingerprint: Some(active.pq_certificate_fingerprint),
+                revoked_pq_not_after: Some(not_after),
+                effective_at,
+                reason: RevocationReason::KeyCompromise,
+                replacement_transition_fingerprint: None,
+                ca_signature: aether::certificates::encoding::MlDsa87Signature::placeholder(),
+            }
+            .sign(&anchored.ca_private)
+            .expect("signing");
+            TrustUpdateObject::CertificateRevocation(Box::new(object))
+        }
+
+        fn gateway_campaign(
+            epoch: u64,
+            tls: Fingerprint,
+            pq: Fingerprint,
+        ) -> aether::certificates::status::AstraRotationCampaign {
+            campaign(
+                aether::certificates::status::CampaignScope::GatewayIdentity,
+                vec![aether::certificates::status::CampaignTarget {
+                    certificate_kind: aether::certificates::status::CertificateKind::GatewayPq,
+                    identity_key: WireGuardKey::from_bytes([1; 32]),
+                    epoch,
+                    generation: epoch,
+                    active_tls_certificate_fingerprint: tls,
+                    active_pq_certificate_fingerprint: pq,
+                }],
+            )
+        }
+
+        /// The leaf a transition installs. A decision that installs neither
+        /// half is refused as empty, and rightly: it would consume an epoch
+        /// and move nothing.
+        fn gateway_leaf(anchored: &Anchored, epoch: u64) -> PqCertificate {
+            use base64::Engine as _;
+
+            let (_, subject) = generate_ml_dsa_87_keypair().expect("keygen");
+            aether::key_negotiation::issue_pq_certificate(
+                PqCertificate {
+                    version: PQ_CERTIFICATE_VERSION,
+                    serial: [epoch as u8; 16],
+                    subject: "gateway.example".into(),
+                    issuer: "helios-ca-pq".into(),
+                    role: PqCertificateRole::Gateway,
+                    wireguard_public_key: WireGuardKey::from_bytes([1; 32]).to_base64(),
+                    ml_dsa_87_public_key: base64::engine::general_purpose::STANDARD
+                        .encode(subject.as_bytes()),
+                    not_before_unix: 0,
+                    not_after_unix: 100_000,
+                    ml_dsa_87_signature: String::new(),
+                },
+                &anchored.ca_private,
+            )
+            .expect("issue")
+        }
+
+        fn gateway_transition(
+            anchored: &Anchored,
+            epoch: u64,
+            tls: Fingerprint,
+            pq: Fingerprint,
+        ) -> TrustUpdateObject {
+            use aether::certificates::authority::RotationReason;
+            use aether::certificates::gateway::GatewayIdentityTransition;
+
+            let object = GatewayIdentityTransition {
+                format_version: CERTIFICATE_FORMAT_VERSION,
+                protocol_version: aether::certificates::CERTIFICATE_PROTOCOL_VERSION,
+                trust_domain_id: anchored.registry.state().trust_domain_id,
+                ca_epoch: 1,
+                gateway_identity_epoch: epoch,
+                gateway_wg_public_key: WireGuardKey::from_bytes([1; 32]),
+                server_name: "gateway.example".into(),
+                active_gateway_tls_certificate_fingerprint: tls,
+                next_gateway_tls_certificate: None,
+                active_gateway_certificate_fingerprint: pq,
+                next_gateway_certificate: Some(gateway_leaf(anchored, epoch)),
+                window: TransitionWindow::new(1_000, 3_000, 5_000).expect("window"),
+                reason: RotationReason::Scheduled,
+                ca_signature: aether::certificates::encoding::MlDsa87Signature::placeholder(),
+            }
+            .sign(&anchored.ca_private)
+            .expect("signing");
+            TrustUpdateObject::GatewayIdentityTransition(Box::new(object))
+        }
+
+        fn gateway_abort(
+            anchored: &Anchored,
+            transition: &TrustUpdateObject,
+            aborted_at: u64,
+        ) -> TrustUpdateObject {
+            use aether::certificates::gateway::{AbortReason, GatewayTransitionAbort};
+
+            let TrustUpdateObject::GatewayIdentityTransition(cancelled) = transition else {
+                panic!("not a gateway transition");
+            };
+            let object = GatewayTransitionAbort {
+                format_version: CERTIFICATE_FORMAT_VERSION,
+                protocol_version: aether::certificates::CERTIFICATE_PROTOCOL_VERSION,
+                trust_domain_id: anchored.registry.state().trust_domain_id,
+                ca_epoch: 1,
+                gateway_wg_public_key: WireGuardKey::from_bytes([1; 32]),
+                server_name: "gateway.example".into(),
+                gateway_identity_epoch: cancelled.gateway_identity_epoch,
+                gateway_transition_fingerprint: cancelled.fingerprint().expect("fingerprint"),
+                aborted_at,
+                reason: AbortReason::OperatorCancelled,
+                campaign_fingerprint: Fingerprint::of(b"campaign"),
+                ca_signature: aether::certificates::encoding::MlDsa87Signature::placeholder(),
+            }
+            .sign(&anchored.ca_private)
+            .expect("signing");
+            TrustUpdateObject::GatewayTransitionAbort(Box::new(object))
+        }
+
+        /// A gateway revocation belongs to the **revocation** family, not to
+        /// the gateway-identity one: it withdraws a leaf, it does not move an
+        /// identity forward, and the two refuse each other's objects.
+        fn gateway_revocation_campaign(
+            epoch: u64,
+            tls: Fingerprint,
+            pq: Fingerprint,
+        ) -> aether::certificates::status::AstraRotationCampaign {
+            campaign(
+                aether::certificates::status::CampaignScope::EmergencyRevocation,
+                vec![aether::certificates::status::CampaignTarget {
+                    certificate_kind: aether::certificates::status::CertificateKind::GatewayPq,
+                    identity_key: WireGuardKey::from_bytes([1; 32]),
+                    epoch,
+                    generation: epoch,
+                    active_tls_certificate_fingerprint: tls,
+                    active_pq_certificate_fingerprint: pq,
+                }],
+            )
+        }
+
+        fn gateway_revocation(
+            anchored: &Anchored,
+            revocation_epoch: u64,
+            tls: Fingerprint,
+            pq: Fingerprint,
+            effective_at: u64,
+        ) -> TrustUpdateObject {
+            use aether::certificates::revocation::{
+                EmergencyCertificateRevocation, RevocationReason, RevocationScope,
+            };
+
+            let object = EmergencyCertificateRevocation {
+                format_version: CERTIFICATE_FORMAT_VERSION,
+                trust_domain_id: anchored.registry.state().trust_domain_id,
+                ca_epoch: 1,
+                scope: RevocationScope::Gateway,
+                identity_key: WireGuardKey::from_bytes([1; 32]),
+                server_name: Some("gateway.example".into()),
+                revocation_epoch,
+                revoked_tls_fingerprint: Some(tls),
+                revoked_tls_not_after: Some(200_000),
+                revoked_pq_fingerprint: Some(pq),
+                revoked_pq_not_after: Some(300_000),
+                effective_at,
+                reason: RevocationReason::KeyCompromise,
+                replacement_transition_fingerprint: None,
+                ca_signature: aether::certificates::encoding::MlDsa87Signature::placeholder(),
+            }
+            .sign(&anchored.ca_private)
+            .expect("signing");
+            TrustUpdateObject::CertificateRevocation(Box::new(object))
+        }
+
+        /// The gateway's leaves were never recorded here, so the campaign is
+        /// the only place their state is pinned — as for a transition.
+        #[test]
+        fn a_gateway_revocation_is_stored_against_the_campaign_that_froze_it() {
+            let mut anchored = anchored();
+            let tls = Fingerprint::of(b"gateway tls in service");
+            let pq = Fingerprint::of(b"gateway pq in service");
+            let object = gateway_revocation(&anchored, 5, tls, pq, 2_000);
+
+            assert_eq!(
+                anchored
+                    .registry
+                    .accept_transitions(
+                        &gateway_revocation_campaign(4, tls, pq),
+                        &[object],
+                        None,
+                        2_000,
+                    )
+                    .expect("accepted"),
+                1
+            );
+            assert_eq!(anchored.registry.state().transitions.len(), 1);
+        }
+
+        /// A leaf the operator never read, under a signature that verifies.
+        #[test]
+        fn a_gateway_revocation_over_another_leaf_is_refused() {
+            let mut anchored = anchored();
+            let tls = Fingerprint::of(b"gateway tls in service");
+            let pq = Fingerprint::of(b"gateway pq in service");
+            let elsewhere =
+                gateway_revocation(&anchored, 5, tls, Fingerprint::of(b"another leaf"), 2_000);
+
+            assert!(anchored
+                .registry
+                .accept_transitions(
+                    &gateway_revocation_campaign(4, tls, pq),
+                    &[elsewhere],
+                    None,
+                    2_000,
+                )
+                .is_err());
+            assert!(anchored.registry.state().transitions.is_empty());
+        }
+
+        /// The two gateway families refuse each other: withdrawing a leaf and
+        /// moving an identity forward are not the same decision, and one
+        /// approved text must not authorise the other.
+        #[test]
+        fn a_gateway_revocation_under_an_identity_campaign_is_refused() {
+            let mut anchored = anchored();
+            let tls = Fingerprint::of(b"gateway tls in service");
+            let pq = Fingerprint::of(b"gateway pq in service");
+            let object = gateway_revocation(&anchored, 5, tls, pq, 2_000);
+
+            assert!(anchored
+                .registry
+                .accept_transitions(&gateway_campaign(4, tls, pq), &[object], None, 2_000)
+                .is_err());
+        }
+
+        /// §10.2: a consumed counter never comes back down.
+        #[test]
+        fn a_gateway_revocation_replaying_a_counter_is_refused() {
+            let mut anchored = anchored();
+            let tls = Fingerprint::of(b"gateway tls in service");
+            let pq = Fingerprint::of(b"gateway pq in service");
+            let replayed = gateway_revocation(&anchored, 4, tls, pq, 2_000);
+
+            assert!(anchored
+                .registry
+                .accept_transitions(
+                    &gateway_revocation_campaign(4, tls, pq),
+                    &[replayed],
+                    None,
+                    2_000,
+                )
+                .is_err());
+        }
+
+        /// A decision dated in the future is not this authority's to hold.
+        #[test]
+        fn a_gateway_revocation_that_is_not_yet_effective_is_refused() {
+            let mut anchored = anchored();
+            let tls = Fingerprint::of(b"gateway tls in service");
+            let pq = Fingerprint::of(b"gateway pq in service");
+            let later = gateway_revocation(&anchored, 5, tls, pq, 9_000);
+
+            assert!(anchored
+                .registry
+                .accept_transitions(
+                    &gateway_revocation_campaign(4, tls, pq),
+                    &[later],
+                    None,
+                    2_000,
+                )
+                .is_err());
+        }
+
+        /// This authority holds no gateway leaf, so the approved text is the
+        /// only place the state a decision was taken against is pinned.
+        #[test]
+        fn a_gateway_transition_is_stored_against_the_campaign_that_froze_it() {
+            let mut anchored = anchored();
+            let tls = Fingerprint::of(b"gateway tls in service");
+            let pq = Fingerprint::of(b"gateway pq in service");
+            let object = gateway_transition(&anchored, 5, tls, pq);
+
+            assert_eq!(
+                anchored
+                    .registry
+                    .accept_transitions(&gateway_campaign(4, tls, pq), &[object], None, 2_000)
+                    .expect("accepted"),
+                1
+            );
+            assert_eq!(anchored.registry.state().transitions.len(), 1);
+        }
+
+        /// A leaf the operator never read, under a signature that verifies.
+        #[test]
+        fn a_gateway_transition_over_another_leaf_in_service_is_refused() {
+            let mut anchored = anchored();
+            let tls = Fingerprint::of(b"gateway tls in service");
+            let pq = Fingerprint::of(b"gateway pq in service");
+            let elsewhere = gateway_transition(&anchored, 5, tls, Fingerprint::of(b"another leaf"));
+
+            assert!(anchored
+                .registry
+                .accept_transitions(&gateway_campaign(4, tls, pq), &[elsewhere], None, 2_000)
+                .is_err());
+            assert!(anchored.registry.state().transitions.is_empty());
+        }
+
+        /// An abort is verified against the exact document it cancels, so that
+        /// document has to be here — not promised for later.
+        #[test]
+        fn an_abort_without_its_transition_is_refused() {
+            let mut anchored = anchored();
+            let tls = Fingerprint::of(b"gateway tls in service");
+            let pq = Fingerprint::of(b"gateway pq in service");
+            let transition = gateway_transition(&anchored, 5, tls, pq);
+            let abort = gateway_abort(&anchored, &transition, 2_100);
+
+            assert!(anchored
+                .registry
+                .accept_transitions(&gateway_campaign(5, tls, pq), &[abort], None, 2_200)
+                .is_err());
+        }
+
+        /// §6.3, at the authority: past the publication no abort is
+        /// legitimate, because a client may already hold the decision.
+        #[test]
+        fn an_abort_is_refused_once_the_transition_has_been_published() {
+            let mut anchored = anchored();
+            let tls = Fingerprint::of(b"gateway tls in service");
+            let pq = Fingerprint::of(b"gateway pq in service");
+            let transition = gateway_transition(&anchored, 5, tls, pq);
+            anchored
+                .registry
+                .accept_transitions(
+                    &gateway_campaign(4, tls, pq),
+                    std::slice::from_ref(&transition),
+                    None,
+                    2_000,
+                )
+                .expect("staged");
+            anchored
+                .registry
+                .publish_gateway_transition(5, 2_050)
+                .expect("published");
+            let abort = gateway_abort(&anchored, &transition, 2_100);
+
+            assert!(anchored
+                .registry
+                .accept_transitions(&gateway_campaign(5, tls, pq), &[abort], None, 2_200)
+                .is_err());
+        }
+
+        /// A cancelled decision never becomes publishable again.
+        #[test]
+        fn an_aborted_transition_is_not_published_afterwards() {
+            let mut anchored = anchored();
+            let tls = Fingerprint::of(b"gateway tls in service");
+            let pq = Fingerprint::of(b"gateway pq in service");
+            let transition = gateway_transition(&anchored, 5, tls, pq);
+            anchored
+                .registry
+                .accept_transitions(
+                    &gateway_campaign(4, tls, pq),
+                    std::slice::from_ref(&transition),
+                    None,
+                    2_000,
+                )
+                .expect("staged");
+            let abort = gateway_abort(&anchored, &transition, 2_100);
+            anchored
+                .registry
+                .accept_transitions(&gateway_campaign(5, tls, pq), &[abort], None, 2_200)
+                .expect("cancelled");
+
+            assert!(anchored
+                .registry
+                .publish_gateway_transition(5, 2_300)
+                .is_err());
+        }
+
+        #[test]
+        fn an_abort_cancels_the_transition_already_stored() {
+            let mut anchored = anchored();
+            let tls = Fingerprint::of(b"gateway tls in service");
+            let pq = Fingerprint::of(b"gateway pq in service");
+            let transition = gateway_transition(&anchored, 5, tls, pq);
+            anchored
+                .registry
+                .accept_transitions(
+                    &gateway_campaign(4, tls, pq),
+                    std::slice::from_ref(&transition),
+                    None,
+                    2_000,
+                )
+                .expect("staged");
+            let abort = gateway_abort(&anchored, &transition, 2_100);
+
+            assert_eq!(
+                anchored
+                    .registry
+                    .accept_transitions(&gateway_campaign(5, tls, pq), &[abort], None, 2_200)
+                    .expect("cancelled"),
+                1
+            );
+            assert_eq!(anchored.registry.state().transitions.len(), 2);
+        }
+
+        fn client_tls_ca_transition(
+            anchored: &Anchored,
+            current_epoch: u64,
+            active: Fingerprint,
+        ) -> (
+            TrustUpdateObject,
+            aether::certificates::encoding::DerCertificate,
+        ) {
+            client_tls_ca_transition_with_window(
+                anchored,
+                current_epoch,
+                active,
+                "successor",
+                TransitionWindow::new(1_000, 3_000, 5_000).expect("window"),
+            )
+        }
+
+        fn client_tls_ca_transition_with_window(
+            anchored: &Anchored,
+            current_epoch: u64,
+            active: Fingerprint,
+            successor_name: &str,
+            window: TransitionWindow,
+        ) -> (
+            TrustUpdateObject,
+            aether::certificates::encoding::DerCertificate,
+        ) {
+            use aether::certificates::authority::ClientTlsCaTransition;
+
+            let next = aether::certificates::test_x509::client_material(successor_name).authority;
+            let object = ClientTlsCaTransition {
+                format_version: CERTIFICATE_FORMAT_VERSION,
+                trust_domain_id: anchored.registry.state().trust_domain_id,
+                ca_epoch: 1,
+                current_ca_tls_epoch: current_epoch,
+                next_ca_tls_epoch: current_epoch + 1,
+                active_client_tls_ca_fingerprint: active,
+                next_client_tls_ca_certificate: next.clone(),
+                window,
+                ca_pq_signature: aether::certificates::encoding::MlDsa87Signature::placeholder(),
+            }
+            .sign(&anchored.ca_private)
+            .expect("signing");
+            (
+                TrustUpdateObject::ClientTlsCaTransition(Box::new(object)),
+                next,
+            )
+        }
+
+        /// §9.4 was unverifiable while this registry pinned the epoch of that
+        /// anchor without pinning the anchor: the only value to compare
+        /// against came from the object itself.
+        #[test]
+        fn a_client_tls_ca_rotation_is_verified_against_the_pinned_anchor() {
+            let mut anchored = anchored();
+            let active = anchored
+                .registry
+                .state()
+                .ca_tls_fingerprint
+                .expect("pinned by the fixture");
+            let (object, next) = client_tls_ca_transition(&anchored, 1, active);
+
+            assert_eq!(
+                anchored
+                    .registry
+                    .accept_transitions(&anchor_campaign(), &[object], None, 2_000)
+                    .expect("accepted"),
+                1
+            );
+            assert_eq!(
+                anchored.registry.state().ca_tls_rotation,
+                Some(ClientTlsCaRotation {
+                    next_ca_tls_epoch: 2,
+                    next_ca_tls_fingerprint: next.fingerprint(),
+                    activation_at: 3_000,
+                    retire_active_at: 5_000,
+                })
+            );
+        }
+
+        #[test]
+        fn a_client_tls_ca_rotation_does_not_promote_before_not_after() {
+            let mut anchored = anchored();
+            let active = anchored
+                .registry
+                .state()
+                .ca_tls_fingerprint
+                .expect("pinned");
+            let (object, next) = client_tls_ca_transition(&anchored, 1, active);
+            anchored
+                .registry
+                .accept_transitions(&anchor_campaign(), &[object], None, 2_000)
+                .expect("accepted");
+
+            assert_eq!(
+                anchored
+                    .registry
+                    .forget_expired_transitions(4_999)
+                    .expect("sweep before retirement"),
+                0
+            );
+            assert_eq!(anchored.registry.state().ca_tls_epoch, 1);
+            assert_eq!(anchored.registry.state().ca_tls_fingerprint, Some(active));
+            assert!(anchored.registry.state().ca_tls_rotation.is_some());
+            assert_eq!(anchored.registry.state().transitions.len(), 1);
+            assert!(!active.matches(&next.fingerprint()));
+        }
+
+        #[test]
+        fn a_due_client_tls_ca_rotation_is_promoted_once_and_allows_the_next_rotation() {
+            let mut anchored = anchored();
+            let active = anchored
+                .registry
+                .state()
+                .ca_tls_fingerprint
+                .expect("pinned");
+            let (first, first_successor) = client_tls_ca_transition(&anchored, 1, active);
+            let first_successor_fingerprint = first_successor.fingerprint();
+            anchored
+                .registry
+                .accept_transitions(&anchor_campaign(), &[first], None, 2_000)
+                .expect("first rotation accepted");
+
+            assert_eq!(
+                anchored
+                    .registry
+                    .forget_expired_transitions(5_000)
+                    .expect("promoted at retirement"),
+                1
+            );
+            assert_eq!(anchored.registry.state().ca_tls_epoch, 2);
+            assert_eq!(
+                anchored.registry.state().ca_tls_fingerprint,
+                Some(first_successor_fingerprint)
+            );
+            assert!(anchored.registry.state().ca_tls_rotation.is_none());
+            assert!(anchored.registry.state().transitions.is_empty());
+
+            anchored.registry =
+                AstraRegistry::load(&anchored._directory.path().join("astra.json"), None)
+                    .expect("the promotion and removal were persisted together");
+            assert_eq!(
+                anchored
+                    .registry
+                    .forget_expired_transitions(5_000)
+                    .expect("second promotion is a no-op"),
+                0
+            );
+            assert_eq!(anchored.registry.state().ca_tls_epoch, 2);
+            assert_eq!(
+                anchored.registry.state().ca_tls_fingerprint,
+                Some(first_successor_fingerprint)
+            );
+
+            let (second, second_successor) = client_tls_ca_transition_with_window(
+                &anchored,
+                2,
+                first_successor_fingerprint,
+                "second-successor",
+                TransitionWindow::new(6_000, 7_000, 8_000).expect("second window"),
+            );
+            let second_campaign = campaign(
+                aether::certificates::status::CampaignScope::TrustAuthorities,
+                vec![aether::certificates::status::CampaignTarget {
+                    certificate_kind: aether::certificates::status::CertificateKind::CaTls,
+                    identity_key: anchored.registry.state().gateway_wg_public_key,
+                    epoch: 2,
+                    generation: 2,
+                    active_tls_certificate_fingerprint: first_successor_fingerprint,
+                    active_pq_certificate_fingerprint: first_successor_fingerprint,
+                }],
+            );
+            second_campaign
+                .covers_authority_object(&second)
+                .expect("the next campaign describes the promoted anchor");
+            assert_eq!(
+                anchored
+                    .registry
+                    .accept_transitions(&second_campaign, &[second], None, 6_500)
+                    .expect("second rotation accepted"),
+                1
+            );
+            assert_eq!(
+                anchored.registry.state().ca_tls_rotation,
+                Some(ClientTlsCaRotation {
+                    next_ca_tls_epoch: 3,
+                    next_ca_tls_fingerprint: second_successor.fingerprint(),
+                    activation_at: 7_000,
+                    retire_active_at: 8_000,
+                })
+            );
+        }
+
+        #[test]
+        fn a_registry_recovers_a_stored_client_tls_ca_window_from_the_legacy_format() {
+            let mut anchored = anchored();
+            let active = anchored
+                .registry
+                .state()
+                .ca_tls_fingerprint
+                .expect("pinned");
+            let (object, _) = client_tls_ca_transition(&anchored, 1, active);
+            anchored
+                .registry
+                .accept_transitions(&anchor_campaign(), &[object], None, 2_000)
+                .expect("accepted");
+            let expected = anchored.registry.state().ca_tls_rotation.clone();
+            let mut encoded = serde_json::to_value(anchored.registry.state()).expect("encoding");
+            encoded
+                .as_object_mut()
+                .expect("registry object")
+                .remove("ca_tls_rotation");
+            let path = anchored._directory.path().join("astra.json");
+            std::fs::write(
+                &path,
+                serde_json::to_vec_pretty(&encoded).expect("legacy encoding"),
+            )
+            .expect("legacy registry written");
+
+            let restored = AstraRegistry::load(&path, None).expect("legacy registry loaded");
+            assert_eq!(restored.state().ca_tls_rotation, expected);
+        }
+
+        #[test]
+        fn a_second_client_tls_ca_rotation_is_refused_while_one_is_in_flight() {
+            let mut anchored = anchored();
+            let active = anchored
+                .registry
+                .state()
+                .ca_tls_fingerprint
+                .expect("pinned");
+            let (first, _) = client_tls_ca_transition(&anchored, 1, active);
+            anchored
+                .registry
+                .accept_transitions(&anchor_campaign(), &[first], None, 2_000)
+                .expect("first accepted");
+            let held = anchored.registry.state().ca_tls_rotation.clone();
+            let (competing, _) = client_tls_ca_transition_with_window(
+                &anchored,
+                1,
+                active,
+                "competing-successor",
+                TransitionWindow::new(1_000, 3_500, 5_500).expect("competing window"),
+            );
+
+            assert!(anchored
+                .registry
+                .accept_transitions(&anchor_campaign(), &[competing], None, 2_100)
+                .is_err());
+            assert_eq!(anchored.registry.state().ca_tls_rotation, held);
+            assert_eq!(anchored.registry.state().transitions.len(), 1);
+        }
+
+        #[test]
+        fn a_client_tls_ca_rotation_over_another_anchor_is_refused() {
+            let mut anchored = anchored();
+            let (object, _) =
+                client_tls_ca_transition(&anchored, 1, Fingerprint::of(b"another anchor"));
+
+            assert!(anchored
+                .registry
+                .accept_transitions(&anchor_campaign(), &[object], None, 2_000)
+                .is_err());
+            assert!(anchored.registry.state().transitions.is_empty());
+        }
+
+        /// A domain bootstrapped before the pin existed is refused by name,
+        /// not checked against a placeholder that would always match.
+        #[test]
+        fn a_client_tls_ca_rotation_without_a_pinned_anchor_is_refused() {
+            let anchored = anchored();
+            let active = anchored
+                .registry
+                .state()
+                .ca_tls_fingerprint
+                .expect("pinned");
+            let (object, _) = client_tls_ca_transition(&anchored, 1, active);
+            let mut unpinned = anchored.registry.state().clone();
+            unpinned.ca_tls_fingerprint = None;
+            let mut registry =
+                AstraRegistry::new(anchored._directory.path().join("unpinned.json"), unpinned);
+
+            let refusal = registry
+                .accept_transitions(&anchor_campaign(), &[object], None, 2_000)
+                .expect_err("no anchor to verify against");
+            assert!(format!("{refusal}").contains("pin-ca-tls"));
+        }
+
+        /// An anchor a command can overwrite is an anchor an operator error
+        /// can move; §9.4 makes that move a signed transition.
+        #[test]
+        fn a_pinned_client_tls_ca_is_not_replaced_by_a_command() {
+            let mut anchored = anchored();
+            let held = anchored
+                .registry
+                .state()
+                .ca_tls_fingerprint
+                .expect("pinned");
+
+            anchored
+                .registry
+                .pin_client_tls_ca(held, 2_000)
+                .expect("idempotent");
+            assert!(anchored
+                .registry
+                .pin_client_tls_ca(Fingerprint::of(b"elsewhere"), 2_000)
+                .is_err());
+            assert_eq!(anchored.registry.state().ca_tls_fingerprint, Some(held));
+        }
+
+        #[test]
+        fn a_ca_pq_rotation_opens_an_active_next_window() {
+            let mut anchored = anchored();
+            let (object, _, next) = transition_from(
+                &anchored.registry,
+                &anchored.ca_private,
+                &anchored.ca_public,
+                1,
+                TransitionWindow::new(1_000, 3_000, 5_000).expect("window"),
+            );
+
+            assert_eq!(
+                anchored
+                    .registry
+                    .accept_transitions(&anchor_campaign(), &[object], None, 2_000)
+                    .expect("accepted"),
+                1
+            );
+            assert_eq!(anchored.registry.state().ca_epoch, 1);
+            assert_eq!(anchored.registry.state().ca_public_key, anchored.ca_public);
+            assert_eq!(
+                anchored.registry.state().ca_rotation,
+                Some(CaPqRotation {
+                    next_ca_epoch: 2,
+                    next_ca_public_key: next,
+                    activation_at: 3_000,
+                    retire_active_at: 5_000,
+                })
+            );
+        }
+
+        #[test]
+        fn a_ca_pq_rotation_does_not_promote_before_not_after() {
+            let mut anchored = anchored();
+            let object = transition_from(
+                &anchored.registry,
+                &anchored.ca_private,
+                &anchored.ca_public,
+                1,
+                TransitionWindow::new(1_000, 3_000, 5_000).expect("window"),
+            )
+            .0;
+            anchored
+                .registry
+                .accept_transitions(&anchor_campaign(), &[object], None, 2_000)
+                .expect("accepted");
+
+            assert_eq!(
+                anchored
+                    .registry
+                    .forget_expired_transitions(4_999)
+                    .expect("sweep before retirement"),
+                0
+            );
+            assert_eq!(anchored.registry.state().ca_epoch, 1);
+            assert_eq!(anchored.registry.state().ca_public_key, anchored.ca_public);
+            assert!(anchored.registry.state().ca_rotation.is_some());
+            assert_eq!(anchored.registry.state().transitions.len(), 1);
+        }
+
+        #[test]
+        fn a_due_ca_pq_rotation_is_promoted_once_and_allows_the_next_rotation() {
+            let mut anchored = anchored();
+            let (first, first_successor_private, first_successor_public) = transition_from(
+                &anchored.registry,
+                &anchored.ca_private,
+                &anchored.ca_public,
+                1,
+                TransitionWindow::new(1_000, 3_000, 5_000).expect("first window"),
+            );
+            anchored
+                .registry
+                .accept_transitions(&anchor_campaign(), &[first], None, 2_000)
+                .expect("first rotation accepted");
+
+            assert_eq!(
+                anchored
+                    .registry
+                    .forget_expired_transitions(5_000)
+                    .expect("promoted at retirement"),
+                1
+            );
+            assert_eq!(anchored.registry.state().ca_epoch, 2);
+            assert_eq!(
+                anchored.registry.state().ca_public_key,
+                first_successor_public
+            );
+            assert!(anchored.registry.state().ca_rotation.is_none());
+            assert!(anchored.registry.state().transitions.is_empty());
+
+            anchored.registry =
+                AstraRegistry::load(&anchored._directory.path().join("astra.json"), None)
+                    .expect("the promotion and removal were persisted together");
+            assert_eq!(
+                anchored
+                    .registry
+                    .forget_expired_transitions(5_000)
+                    .expect("second promotion is a no-op"),
+                0
+            );
+            assert_eq!(anchored.registry.state().ca_epoch, 2);
+
+            let (second, _, second_successor_public) = transition_from(
+                &anchored.registry,
+                &first_successor_private,
+                &first_successor_public,
+                2,
+                TransitionWindow::new(6_000, 7_000, 8_000).expect("second window"),
+            );
+            assert_eq!(
+                anchored
+                    .registry
+                    .accept_transitions(&anchor_campaign(), &[second], None, 6_500)
+                    .expect("second rotation accepted"),
+                1
+            );
+            assert_eq!(
+                anchored.registry.state().ca_rotation,
+                Some(CaPqRotation {
+                    next_ca_epoch: 3,
+                    next_ca_public_key: second_successor_public,
+                    activation_at: 7_000,
+                    retire_active_at: 8_000,
+                })
+            );
+        }
+
+        /// Three offline CA transitions in a row, and never three anchors
+        /// (spec §14.1).
+        ///
+        /// The bound is what makes an offline rotation safe to repeat: between
+        /// two of them the registry holds one anchor, and during one it holds
+        /// the outgoing key and its single successor. A third would mean a
+        /// document signed by a key nobody can still place.
+        #[test]
+        fn three_successive_ca_pq_transitions_never_hold_three_anchors() {
+            let mut anchored = anchored();
+            let mut private = anchored.ca_private.clone();
+            let mut public = anchored.ca_public.clone();
+            let mut retired = vec![public.clone()];
+
+            for round in 0..3u64 {
+                let epoch = round + 1;
+                let base = 10_000 * (round + 1);
+                let window =
+                    TransitionWindow::new(base, base + 1_000, base + 2_000).expect("window");
+                let (object, next_private, next_public) =
+                    transition_from(&anchored.registry, &private, &public, epoch, window);
+                anchored
+                    .registry
+                    .accept_transitions(&anchor_campaign(), &[object], None, base + 500)
+                    .expect("successive rotation accepted");
+
+                // Staged: the outgoing anchor and exactly one successor.
+                let state = anchored.registry.state();
+                assert_eq!(state.ca_epoch, epoch);
+                assert_eq!(state.ca_public_key, public);
+                let rotation = state.ca_rotation.clone().expect("a rotation is in flight");
+                assert_eq!(rotation.next_ca_epoch, epoch + 1);
+                assert_eq!(rotation.next_ca_public_key, next_public);
+                assert_eq!(
+                    state.transitions.len(),
+                    1,
+                    "one decision in flight, never two"
+                );
+                assert!(
+                    !retired.contains(&rotation.next_ca_public_key),
+                    "a rotation must not reinstate an anchor already retired"
+                );
+
+                // Promoted at retirement: the predecessor goes in the same
+                // write that installs the successor.
+                assert_eq!(
+                    anchored
+                        .registry
+                        .forget_expired_transitions(base + 2_000)
+                        .expect("promotion at retirement"),
+                    1
+                );
+                let state = anchored.registry.state();
+                assert_eq!(state.ca_epoch, epoch + 1);
+                assert_eq!(state.ca_public_key, next_public);
+                assert!(state.ca_rotation.is_none(), "no successor is kept around");
+                assert!(state.transitions.is_empty());
+
+                retired.push(public);
+                private = next_private;
+                public = next_public;
+            }
+
+            assert_eq!(anchored.registry.state().ca_epoch, 4);
+            assert_eq!(
+                retired.len(),
+                4,
+                "three predecessors and the anchor of \
+                                          the fixture, none of them still held"
+            );
+        }
+
+        #[test]
+        fn a_registry_recovers_a_stored_ca_pq_window_from_the_legacy_format() {
+            let mut anchored = anchored();
+            let object = transition_from(
+                &anchored.registry,
+                &anchored.ca_private,
+                &anchored.ca_public,
+                1,
+                TransitionWindow::new(1_000, 3_000, 5_000).expect("window"),
+            )
+            .0;
+            anchored
+                .registry
+                .accept_transitions(&anchor_campaign(), &[object], None, 2_000)
+                .expect("accepted");
+            let expected = anchored.registry.state().ca_rotation.clone();
+            let mut encoded = serde_json::to_value(anchored.registry.state()).expect("encoding");
+            encoded
+                .as_object_mut()
+                .expect("registry object")
+                .remove("ca_rotation");
+            let path = anchored._directory.path().join("astra.json");
+            std::fs::write(
+                &path,
+                serde_json::to_vec_pretty(&encoded).expect("legacy encoding"),
+            )
+            .expect("legacy registry written");
+
+            let restored = AstraRegistry::load(&path, None).expect("legacy registry loaded");
+            assert_eq!(restored.state().ca_rotation, expected);
+        }
+
+        #[test]
+        fn a_second_ca_pq_rotation_is_refused_while_one_is_in_flight() {
+            let mut anchored = anchored();
+            let first = transition_from(
+                &anchored.registry,
+                &anchored.ca_private,
+                &anchored.ca_public,
+                1,
+                TransitionWindow::new(1_000, 3_000, 5_000).expect("first window"),
+            )
+            .0;
+            anchored
+                .registry
+                .accept_transitions(&anchor_campaign(), &[first], None, 2_000)
+                .expect("first accepted");
+            let held = anchored.registry.state().ca_rotation.clone();
+            let competing = transition_from(
+                &anchored.registry,
+                &anchored.ca_private,
+                &anchored.ca_public,
+                1,
+                TransitionWindow::new(1_000, 3_500, 5_500).expect("competing window"),
+            )
+            .0;
+
+            assert!(anchored
+                .registry
+                .accept_transitions(&anchor_campaign(), &[competing], None, 2_100)
+                .is_err());
+            assert_eq!(anchored.registry.state().ca_rotation, held);
+            assert_eq!(anchored.registry.state().transitions.len(), 1);
+        }
+
+        /// The one property that lets an online authority hold `CA-PQ` output
+        /// at all: it re-derives the proof under the anchor it already pins.
+        #[test]
+        fn a_transition_is_verified_under_the_anchor_this_registry_pins() {
+            let mut anchored = anchored();
+            let object = transition(&anchored, 1);
+            assert_eq!(
+                anchored
+                    .registry
+                    .accept_transitions(&anchor_campaign(), &[object], None, 2_000)
+                    .expect("accepted"),
+                1
+            );
+            assert_eq!(anchored.registry.state().transitions.len(), 1);
+        }
+
+        /// A transition leaving another epoch, or signed by another anchor, is
+        /// refused — the check is the object's own `verify`, run here.
+        #[test]
+        fn a_transition_this_domain_did_not_authorize_is_refused() {
+            let mut anchored = anchored();
+            let wrong_epoch = transition(&anchored, 2);
+            assert!(anchored
+                .registry
+                .accept_transitions(&anchor_campaign(), &[wrong_epoch], None, 2_000)
+                .is_err());
+
+            let other_domain = super::anchor_transitions::anchored();
+            let foreign = transition(&other_domain, 1);
+            assert!(anchored
+                .registry
+                .accept_transitions(&anchor_campaign(), &[foreign], None, 2_000)
+                .is_err());
+            assert!(anchored.registry.state().transitions.is_empty());
+        }
+
+        /// A companion that retries after a lost response must not make a peer
+        /// collect the same transition under two fingerprints.
+        #[test]
+        fn depositing_the_same_transition_twice_stores_it_once() {
+            let mut anchored = anchored();
+            let object = transition(&anchored, 1);
+            assert_eq!(
+                anchored
+                    .registry
+                    .accept_transitions(
+                        &anchor_campaign(),
+                        std::slice::from_ref(&object),
+                        None,
+                        2_000
+                    )
+                    .expect("accepted"),
+                1
+            );
+            assert_eq!(
+                anchored
+                    .registry
+                    .accept_transitions(&anchor_campaign(), &[object], None, 2_100)
+                    .expect("replayed"),
+                0
+            );
+            assert_eq!(anchored.registry.state().transitions.len(), 1);
+        }
+
+        #[test]
+        fn an_accepted_revocation_is_terminal_and_cancels_staging() {
+            let mut anchored = anchored();
+            let client = admitted(&mut anchored);
+            let object = revocation(&anchored, client, 2_000, generation(3).not_after);
+            assert_eq!(
+                anchored
+                    .registry
+                    .accept_transitions(
+                        &anchor_campaign(),
+                        std::slice::from_ref(&object),
+                        None,
+                        2_000,
+                    )
+                    .expect("accepted"),
+                1
+            );
+            let peer = &anchored.registry.state().peers[&client.to_base64()];
+            assert!(peer.revoked);
+            assert_eq!(peer.revocation_epoch, 1);
+            assert!(peer.pending.is_none());
+
+            assert_eq!(
+                anchored
+                    .registry
+                    .accept_transitions(&anchor_campaign(), &[object], None, 2_100)
+                    .expect("identical retry"),
+                0
+            );
+        }
+
+        #[test]
+        fn a_revocation_with_a_retyped_expiry_or_future_effect_is_refused_atomically() {
+            let mut anchored = anchored();
+            let client = admitted(&mut anchored);
+            let wrong_expiry = revocation(&anchored, client, 2_000, 99_999);
+            assert!(anchored
+                .registry
+                .accept_transitions(&anchor_campaign(), &[wrong_expiry], None, 2_000)
+                .is_err());
+            let future = revocation(&anchored, client, 2_001, generation(3).not_after);
+            assert!(anchored
+                .registry
+                .accept_transitions(&anchor_campaign(), &[future], None, 2_000)
+                .is_err());
+            let peer = &anchored.registry.state().peers[&client.to_base64()];
+            assert!(!peer.revoked);
+            assert!(anchored.registry.state().transitions.is_empty());
+        }
+
+        #[test]
+        fn a_revocation_is_retained_until_its_signed_expiry() {
+            let mut anchored = anchored();
+            let client = admitted(&mut anchored);
+            let expiry = generation(3).not_after;
+            let object = revocation(&anchored, client, 2_000, expiry);
+            anchored
+                .registry
+                .accept_transitions(&anchor_campaign(), &[object], None, 2_000)
+                .expect("accepted");
+            assert_eq!(
+                anchored
+                    .registry
+                    .forget_expired_transitions(expiry - 1)
+                    .expect("sweep"),
+                0
+            );
+            assert_eq!(
+                anchored
+                    .registry
+                    .forget_expired_transitions(expiry)
+                    .expect("sweep"),
+                1
+            );
+        }
+
+        /// The ceiling refuses rather than evicting: dropping the oldest would
+        /// drop the one a lagging peer is still missing.
+        #[test]
+        fn the_store_refuses_rather_than_dropping_what_a_peer_still_needs() {
+            let mut anchored = anchored();
+            let tls = Fingerprint::of(b"gateway tls in service");
+            let pq = Fingerprint::of(b"gateway pq in service");
+            for index in 0..MAX_STORED_TRANSITIONS {
+                let active_epoch = index as u64 + 1;
+                let object = gateway_transition(&anchored, active_epoch + 1, tls, pq);
+                anchored
+                    .registry
+                    .accept_transitions(
+                        &gateway_campaign(active_epoch, tls, pq),
+                        &[object],
+                        None,
+                        2_000 + index as u64,
+                    )
+                    .expect("accepted");
+            }
+            let active_epoch = MAX_STORED_TRANSITIONS as u64 + 1;
+            let overflow = gateway_transition(&anchored, active_epoch + 1, tls, pq);
+            assert!(matches!(
+                anchored.registry.accept_transitions(
+                    &gateway_campaign(active_epoch, tls, pq),
+                    &[overflow],
+                    None,
+                    3_000,
+                ),
+                Err(RegistryError::TransitionStoreFull { .. })
+            ));
+            assert_eq!(
+                anchored.registry.state().transitions.len(),
+                MAX_STORED_TRANSITIONS
+            );
+        }
+
+        /// Past its `not_after` a transition authorizes nothing, and keeping
+        /// it would fill a bounded store with objects that can no longer act.
+        #[test]
+        fn an_expired_transition_is_forgotten() {
+            let mut anchored = anchored();
+            let object = transition(&anchored, 1);
+            anchored
+                .registry
+                .accept_transitions(&anchor_campaign(), &[object], None, 2_000)
+                .expect("accepted");
+            assert_eq!(
+                anchored
+                    .registry
+                    .forget_expired_transitions(199_999)
+                    .expect("swept"),
+                0
+            );
+            assert_eq!(
+                anchored
+                    .registry
+                    .forget_expired_transitions(200_000)
+                    .expect("swept"),
+                1
+            );
+            assert!(anchored.registry.state().transitions.is_empty());
+        }
+    }
+
     fn registry() -> (AstraRegistry, tempfile::TempDir) {
         let directory = tempfile::tempdir().expect("temp dir");
         let (_, ca) = generate_ml_dsa_87_keypair().expect("keygen");
@@ -405,12 +2892,19 @@ mod tests {
             server_name: "gateway.example".into(),
             authority_url: "https://astra.example".into(),
             webauthn_rp_id: "astra.example".into(),
+            astra_policy_fingerprint: AstraPolicyPin::new(Fingerprint::of(b"policy"))
+                .expect("policy pin"),
+            credential_registry_epoch: 1,
             ca_epoch: 1,
             ca_public_key: ca,
+            ca_rotation: None,
             ca_tls_epoch: 1,
+            ca_tls_fingerprint: Some(Fingerprint::of(b"client tls ca")),
+            ca_tls_rotation: None,
             astra_service_key_epoch: 1,
             astra_service_public_key: service,
             issuer: None,
+            transitions: Vec::new(),
             peers: BTreeMap::new(),
             status_epochs: BTreeMap::new(),
             audit: AuditChain::default(),
@@ -426,6 +2920,7 @@ mod tests {
                     pending: None,
                     revoked: false,
                     revocation_epoch: 0,
+                    admission_pq_ca: None,
                 },
                 1_000,
             )
@@ -442,6 +2937,264 @@ mod tests {
             stage_expires_at: expires_at,
             granted: false,
         }
+    }
+
+    fn served(index: u64) -> PeerRecord {
+        PeerRecord {
+            name: "workstation".into(),
+            client_wg_public_key: WireGuardKey::from_bytes([2; 32]),
+            active: generation(index),
+            active_pq_certificate: certificate(),
+            pending: None,
+            revoked: false,
+            revocation_epoch: 0,
+            admission_pq_ca: None,
+        }
+    }
+
+    /// The whole point of the method: the gateway promotes, this adopts, and
+    /// the chain says so with an event of its own.
+    #[test]
+    fn a_promoted_generation_is_adopted_and_recorded() {
+        let (mut registry, _dir) = registry();
+        assert!(registry.reconcile_peer(served(5), 2_000).expect("adopted"));
+        let key = WireGuardKey::from_bytes([2; 32]);
+        assert_eq!(registry.peer(&key).expect("peer").active.generation, 5);
+        assert!(matches!(
+            registry.state().audit.records.last().map(|r| &r.event),
+            Some(AuditEvent::PeerGenerationAdopted { generation: 5, .. })
+        ));
+    }
+
+    /// Idempotence is what makes the repair safe to replay after a crash.
+    #[test]
+    fn adopting_what_is_already_recorded_writes_nothing() {
+        let (mut registry, _dir) = registry();
+        let before = registry.state().audit.records.len();
+        assert!(!registry.reconcile_peer(served(4), 2_000).expect("no-op"));
+        assert_eq!(registry.state().audit.records.len(), before);
+    }
+
+    /// A stale or rolled-back gateway view must not rewrite this authority's
+    /// idea of who is current.
+    #[test]
+    fn a_generation_below_the_recorded_one_is_refused() {
+        let (mut registry, _dir) = registry();
+        assert!(matches!(
+            registry.reconcile_peer(served(3), 2_000),
+            Err(RegistryError::GenerationRegression {
+                held: 4,
+                offered: 3
+            })
+        ));
+    }
+
+    /// One number, two leaves, is two histories — and the fingerprint is what
+    /// tells them apart before either is believed.
+    #[test]
+    fn the_same_generation_under_another_leaf_is_refused() {
+        let (mut registry, _dir) = registry();
+        let mut divergent = served(4);
+        divergent.active.pq_certificate_fingerprint = Fingerprint::of(b"another leaf");
+        assert!(matches!(
+            registry.reconcile_peer(divergent, 2_000),
+            Err(RegistryError::GenerationDisagrees { generation: 4 })
+        ));
+    }
+
+    /// A generation is the TLS/PQ pair and its validity metadata, not only the
+    /// PQ fingerprint. Accepting another TLS leaf under the same number would
+    /// reintroduce the mixed-generation pair the lifecycle is built to reject.
+    #[test]
+    fn the_same_generation_with_other_tls_state_is_refused() {
+        let (mut registry, _dir) = registry();
+        let mut divergent = served(4);
+        divergent.active.tls_certificate_fingerprint = Fingerprint::of(b"another TLS leaf");
+        assert!(matches!(
+            registry.reconcile_peer(divergent, 2_000),
+            Err(RegistryError::GenerationDisagrees { generation: 4 })
+        ));
+    }
+
+    /// Revocation is owned by the signed authority decision and is terminal.
+    /// A stale gateway view must not lift it before the caller checks it.
+    #[test]
+    fn reconciliation_never_lifts_a_revocation() {
+        let (mut registry, _dir) = registry();
+        let key = WireGuardKey::from_bytes([2; 32]);
+        registry.revoke(&key, 1, 1_200).expect("revoked");
+
+        assert!(matches!(
+            registry.reconcile_peer(served(4), 2_000),
+            Err(RegistryError::RevocationDisagrees)
+        ));
+        assert!(registry.peer(&key).expect("peer").revoked);
+    }
+
+    /// The gateway supplies the admission anchor at first sight, but it does
+    /// not get to replace that recovery root on a later lifecycle contact.
+    #[test]
+    fn reconciliation_never_replaces_a_pinned_admission_anchor() {
+        let (mut registry, _dir) = registry();
+        let key = WireGuardKey::from_bytes([2; 32]);
+        let (_, first) = generate_ml_dsa_87_keypair().expect("first anchor");
+        let (_, second) = generate_ml_dsa_87_keypair().expect("second anchor");
+        registry
+            .state
+            .peers
+            .get_mut(&key.to_base64())
+            .expect("peer")
+            .admission_pq_ca = Some(first);
+        let mut divergent = served(4);
+        divergent.admission_pq_ca = Some(second);
+
+        assert!(matches!(
+            registry.reconcile_peer(divergent, 2_000),
+            Err(RegistryError::AdmissionAnchorDisagrees)
+        ));
+    }
+
+    /// The reason `admit` could not be reused: a grant may already be in a
+    /// client's hands, and a refresh that dropped it would withhold something
+    /// this authority has no right to withhold.
+    #[test]
+    fn a_rotation_still_ahead_of_the_served_generation_survives() {
+        let (mut registry, _dir) = registry();
+        let key = WireGuardKey::from_bytes([2; 32]);
+        registry
+            .state
+            .peers
+            .get_mut(&key.to_base64())
+            .expect("peer")
+            .pending = Some(rotation(9, 50_000));
+
+        registry.reconcile_peer(served(4), 2_000).ok();
+        assert!(
+            registry.peer(&key).expect("peer").pending.is_some(),
+            "the candidate is generation 5 and the gateway still serves 4"
+        );
+    }
+
+    /// And its other half: once the served generation has caught up with the
+    /// candidate, the stage has either landed or been overtaken, and there is
+    /// nothing left to grant.
+    #[test]
+    fn a_rotation_the_served_generation_reached_is_purged() {
+        let (mut registry, _dir) = registry();
+        let key = WireGuardKey::from_bytes([2; 32]);
+        registry
+            .state
+            .peers
+            .get_mut(&key.to_base64())
+            .expect("peer")
+            .pending = Some(rotation(9, 50_000));
+
+        assert!(registry.reconcile_peer(served(5), 2_000).expect("adopted"));
+        assert!(registry.peer(&key).expect("peer").pending.is_none());
+        assert!(registry
+            .state()
+            .audit
+            .records
+            .iter()
+            .any(|record| matches!(record.event, AuditEvent::ClientStagePurged { .. })));
+    }
+
+    /// A peer nobody transcribed yet is the first-sight case, and it is still
+    /// an admission.
+    #[test]
+    fn an_unknown_peer_is_admitted_rather_than_refused() {
+        let (mut registry, _dir) = registry();
+        let mut fresh = served(1);
+        fresh.client_wg_public_key = WireGuardKey::from_bytes([9; 32]);
+        fresh.name = "laptop".into();
+        assert!(registry.reconcile_peer(fresh, 2_000).expect("admitted"));
+        assert!(registry.peer(&WireGuardKey::from_bytes([9; 32])).is_some());
+    }
+
+    /// A delegation is installed by epoch, and the epoch only ever rises.
+    /// Reinstalling one already used would let a withdrawn intermediate come
+    /// back under a signature that is still perfectly valid.
+    #[test]
+    fn a_delegation_may_not_walk_its_epoch_backwards() {
+        use aether::certificates::authority::{AllowedUsage, AstraIssuerAuthorization};
+        use aether::certificates::encoding::{DerCertificate, MlDsa87Signature};
+        use aether::certificates::state::{AstraIssuerState, IssuerLifecycle};
+
+        let (mut registry, _dir) = registry();
+        let (_, issuer_key) = generate_ml_dsa_87_keypair().expect("keygen");
+        let delegation = |epoch: u64| AstraIssuerState {
+            issuer_epoch: epoch,
+            authorization: AstraIssuerAuthorization {
+                format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+                trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+                ca_epoch: 1,
+                ca_tls_epoch: 1,
+                gateway_wg_public_key: WireGuardKey::from_bytes([1; 32]),
+                server_name: "gateway.example".into(),
+                issuer_epoch: epoch,
+                pq_issuer_public_key: issuer_key.clone(),
+                tls_intermediate_certificate: DerCertificate::new(vec![9; 64]).expect("der"),
+                allowed_usage: AllowedUsage::AdmittedClientLeafRenewal,
+                maximum_leaf_lifetime_secs: 100,
+                policy_fingerprint: Fingerprint::of(b"policy"),
+                not_before: 0,
+                not_after: 100_000,
+                ca_pq_signature: MlDsa87Signature::placeholder(),
+            },
+            state: IssuerLifecycle::Active,
+        };
+
+        registry
+            .install_issuer(delegation(1), 1_000)
+            .expect("first");
+        // The same delegation again is a replay of §8.2, not a walk-back: a
+        // companion whose response was lost redeposits the same bytes.
+        registry
+            .install_issuer(delegation(1), 1_100)
+            .expect("an identical delegation is a no-op");
+        // A *different* delegation at a spent epoch is the substitution this
+        // refuses — it would bring back an intermediate that was withdrawn,
+        // under a signature that still verifies.
+        let mut substituted = delegation(1);
+        substituted.authorization.tls_intermediate_certificate =
+            DerCertificate::new(vec![7; 64]).expect("der");
+        assert!(matches!(
+            registry.install_issuer(substituted, 1_150),
+            Err(RegistryError::IssuerEpochNotAdvancing {
+                installed: 1,
+                offered: 1
+            })
+        ));
+        registry
+            .install_issuer(delegation(2), 1_200)
+            .expect("second");
+        assert_eq!(
+            registry
+                .state()
+                .issuer
+                .as_ref()
+                .expect("issuer")
+                .issuer_epoch,
+            2
+        );
+    }
+
+    /// The peer table is a transcription of the gateway's admission, and the
+    /// lazy path re-runs it on every renewal. Re-transcribing an unchanged
+    /// peer must not append an audit record — a chain that grew on every
+    /// renewal would make its head useless as a restore witness.
+    #[test]
+    fn re_transcribing_an_unchanged_peer_appends_nothing() {
+        let (mut registry, _dir) = registry();
+        let head = registry.audit_head();
+        let record = registry
+            .peer(&WireGuardKey::from_bytes([2; 32]))
+            .expect("peer")
+            .clone();
+
+        registry.admit(record, 2_000).expect("re-transcription");
+
+        assert_eq!(registry.audit_head(), head);
     }
 
     #[test]
@@ -535,5 +3288,76 @@ mod tests {
         assert!(store.issue([2; 32], 1_000));
         assert!(!store.issue([3; 32], 1_000));
         assert!(store.consume(&[1; 32], 1_010), "the earlier one survived");
+    }
+
+    /// A registry written before the policy pin and the credential epoch
+    /// existed still loads, and comes back describing the same domain.
+    ///
+    /// Refusing it is what actually happened on a live gateway: `astra status`
+    /// failed, the deployment read that failure as "not bootstrapped", and the
+    /// bootstrap then refused to start a second history over the first. The
+    /// operator was left with an authority holding a service key, an audit
+    /// chain and a domain, and no command that could read any of them.
+    #[test]
+    fn a_registry_written_before_the_policy_pin_is_migrated_rather_than_refused() {
+        let (registry, directory) = registry();
+        registry.save().expect("save");
+        let path = directory.path().join("astra.json");
+
+        // Exactly the older shape: the two fields simply are not there.
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let object = document.as_object_mut().unwrap();
+        object.remove("astra_policy_fingerprint");
+        object.remove("credential_registry_epoch");
+        std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+
+        let loaded = AstraRegistry::load(&path, None).expect("the older registry loads");
+        let state = loaded.state();
+        assert_eq!(state.trust_domain_id, TrustDomainId::new([1; 16]).unwrap());
+        assert_eq!(state.peers.len(), 1, "the peers survived the migration");
+        // The lowest possible epoch: every consumer keeps the highest it has
+        // seen, so starting higher would refuse the first genuine document.
+        assert_eq!(state.credential_registry_epoch, 0);
+        // Recomputed, never read: exactly what bootstrap would have written
+        // for this identity.
+        let expected = AstraIssuancePolicy::standard(
+            state.trust_domain_id,
+            state.gateway_wg_public_key,
+            state.server_name.clone(),
+        )
+        .pin()
+        .expect("pin");
+        assert_eq!(&state.astra_policy_fingerprint, &expected);
+
+        // Written back, so the migration happens once and the audit head is
+        // the one the operator already holds.
+        let reloaded = AstraRegistry::load(&path, Some(&registry.audit_head()))
+            .expect("and the chain did not fork");
+        assert_eq!(
+            reloaded.state().astra_policy_fingerprint,
+            state.astra_policy_fingerprint
+        );
+    }
+
+    /// A registry that carries neither the pin nor the identity to recompute
+    /// it from is refused by name. It is not a registry.
+    #[test]
+    fn a_registry_with_nothing_to_recompute_the_pin_from_is_refused() {
+        let (registry, directory) = registry();
+        registry.save().expect("save");
+        let path = directory.path().join("astra.json");
+
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let object = document.as_object_mut().unwrap();
+        object.remove("astra_policy_fingerprint");
+        object.remove("server_name");
+        std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+
+        assert!(matches!(
+            AstraRegistry::load(&path, None),
+            Err(RegistryError::Corrupt(_))
+        ));
     }
 }

@@ -1,6 +1,12 @@
 // In dev, Vite proxies /api and /ws to heliosd. In production, the embedded
 // interface and the API are served by the same Axum process.
 import type {
+  AnchorDecisionView,
+  CertificateDomain,
+  GatewayDecisionView,
+  GatewayRenewalRequest,
+  GatewayRenewalView,
+  GatewayRollbackView,
   CommandResponse,
   FinalizedRelease,
   FirewallRules,
@@ -70,6 +76,25 @@ export const applyFirewallRules = (rules: string) => command('/api/firewall/rule
 
 export const fetchUpdateStatus = () => json<UpdateStatus>('/api/update')
 
+/**
+ * The trust domain, or `null` when this gateway has none.
+ *
+ * `404` is a *state*, not a failure: a gateway that has never run
+ * `heliosd init-trust-domain` holds no registry, and an absent registry is not
+ * an empty one — the lifecycle routes stay closed. Folding it into the error
+ * path would put "le démon ne répond pas" on screen for a gateway answering
+ * perfectly, and send the operator looking at the network.
+ */
+export async function fetchCertificateDomain(): Promise<CertificateDomain | null> {
+  const response = await fetch('/api/certificates')
+  if (response.status === 404) return null
+  if (!response.ok) {
+    const detail = await response.text()
+    throw new Error(`HTTP ${response.status}${detail ? ` — ${detail}` : ''}`)
+  }
+  return response.json() as Promise<CertificateDomain>
+}
+
 export async function stageUpdate(manifest: unknown): Promise<FinalizedRelease> {
   const response = await json<{ release: FinalizedRelease }>('/api/update/stage', {
     method: 'POST',
@@ -129,3 +154,52 @@ export function createWebSocket(): WebSocket {
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
   return new WebSocket(`${protocol}//${window.location.host}/ws`)
 }
+
+/**
+ * The gateway's own identity, driven from the console (spec §12.2).
+ *
+ * These three refuse with `409` and a reason in the body, and the reason is
+ * the point: unlike the public negotiation surface — where a precise refusal
+ * would be an oracle — this one is behind the admin authentication, and an
+ * operator sent to the daemon logs during a renewal is sent there at the worst
+ * possible moment.
+ */
+async function gatewayAction<T>(url: string, body: unknown): Promise<T> {
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  if (response.ok) return response.json() as Promise<T>
+  const detail = await response.text()
+  throw new Error(refusalMessage(detail) ?? `HTTP ${response.status}`)
+}
+
+/** The refusal reason, whether the daemon answered JSON or plain text. */
+function refusalMessage(detail: string): string | null {
+  if (!detail) return null
+  try {
+    const parsed = JSON.parse(detail) as { message?: unknown }
+    return typeof parsed.message === 'string' ? parsed.message : detail
+  } catch {
+    return detail
+  }
+}
+
+export const prepareGatewayRenewal = (request: GatewayRenewalRequest) =>
+  gatewayAction<GatewayRenewalView>('/api/certificates/gateway-renewal', request)
+
+export const installGatewayTransition = (transition: unknown) =>
+  gatewayAction<GatewayDecisionView>('/api/certificates/gateway-transition', transition)
+
+export const abortGatewayTransition = (abort: unknown) =>
+  gatewayAction<GatewayDecisionView>('/api/certificates/gateway-transition/abort', abort)
+
+export const installCaTransition = (transition: unknown) =>
+  gatewayAction<AnchorDecisionView>('/api/certificates/ca-transition', transition)
+
+export const installGatewayRollback = (authorization: unknown) =>
+  gatewayAction<GatewayRollbackView>(
+    '/api/certificates/gateway-transition/rollback',
+    authorization,
+  )

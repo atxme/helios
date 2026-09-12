@@ -1,0 +1,49 @@
+[package]
+name = "helios-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Deliberately not a workspace member. libFuzzer needs a nightly toolchain, and
+# a nightly requirement inside the workspace would reach every `cargo build`
+# the project runs. What the stable build does compile is
+# `aether::fuzzing`, where all the substance lives.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.aether]
+path = "../crates/aether"
+features = ["fuzzing", "key-negotiation-signing"]
+
+[[bin]]
+name = "signed_object"
+path = "fuzz_targets/signed_object.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "trust_transaction"
+path = "fuzz_targets/trust_transaction.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "x509_documents"
+path = "fuzz_targets/x509_documents.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "gateway_state_machine"
+path = "fuzz_targets/gateway_state_machine.rs"
+test = false
+doc = false
+bench = false

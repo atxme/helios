@@ -22,6 +22,8 @@ const api = vi.hoisted(() => ({
   discardStagedKey: vi.fn(),
   adoptPresharedKey: vi.fn(),
   discardStagedPsk: vi.fn(),
+  vaultPosture: vi.fn(),
+  allowUnencryptedVolume: vi.fn(),
 }))
 const documents = vi.hoisted(() => ({ readProfileDocument: vi.fn() }))
 
@@ -30,21 +32,27 @@ vi.mock('../profileDocument', () => ({ readProfileDocument: documents.readProfil
 
 import { ProfilesView } from './ProfilesView'
 
-const profile = (overrides: Partial<ClientProfile> = {}): ClientProfile => ({
-  name: 'portable',
-  endpoint: '203.0.113.10:51820',
-  peer_public_key: 'gateway-public',
-  public_key: 'client-public',
-  has_private_key: true,
-  has_static_psk: false,
-  address: '100.64.1.2/32',
-  allowed_ips: '0.0.0.0/0',
-  persistent_keepalive: 25,
-  heliosd_url: 'http://100.64.0.1:8080',
-  ssh_target: null,
-  key_negotiation: null,
-  ...overrides,
-})
+const profile = (overrides: Partial<ClientProfile> = {}): ClientProfile => {
+  const profile_type =
+    overrides.profile_type ??
+    (overrides.key_negotiation ? 'helios_key_negotiation' : 'classic')
+  return {
+    name: 'portable',
+    endpoint: '203.0.113.10:51820',
+    peer_public_key: 'gateway-public',
+    profile_type,
+    public_key: 'client-public',
+    has_private_key: true,
+    has_static_psk: false,
+    address: '100.64.1.2/32',
+    allowed_ips: '0.0.0.0/0',
+    persistent_keepalive: 25,
+    heliosd_url: 'http://100.64.0.1:8080',
+    ssh_target: null,
+    key_negotiation: null,
+    ...overrides,
+  }
+}
 
 /**
  * What the shell reports for a profile whose identity is not on this machine.
@@ -59,6 +67,8 @@ const emptyInventory: CertificateInventory = {
   client_pq: null,
   faults: [],
   identity_sealed: false,
+  previous_identity: null,
+  operator_credentials: null,
 }
 
 const noIssues: ProfileIssues = {
@@ -98,6 +108,20 @@ beforeEach(() => {
   api.discardStagedKey.mockResolvedValue(undefined)
   api.adoptPresharedKey.mockResolvedValue(undefined)
   api.discardStagedPsk.mockResolvedValue(undefined)
+  api.vaultPosture.mockResolvedValue({
+    hardwareBacked: true,
+    softwareKeystore: false,
+    volume: 'Volume chiffré.',
+    volumeProtected: true,
+    unencryptedVolumeWaived: false,
+    memoryLocked: true,
+    memory: '',
+    dumpsExcluded: true,
+    dumps: '',
+    rotationRequired: [],
+    legacyPresent: false,
+  })
+  api.allowUnencryptedVolume.mockResolvedValue(undefined)
   documents.readProfileDocument.mockResolvedValue('{"format":"orion-profile"}')
 })
 
@@ -366,13 +390,14 @@ describe('ProfilesView interactions', () => {
    * (`ClassicNotNegotiable`), so offering it here would only build profiles
    * that fail before the first handshake.
    */
-  it('offers only the two negotiable modes, and reaches classic by removing the block', async () => {
+  it('offers only the two negotiable modes and keeps an existing profile Helios', async () => {
     const handlers = callbacks()
     render(
       <ProfilesView
         config={{
           profiles: [
             profile({
+              profile_type: 'helios_key_negotiation',
               key_negotiation: {
                 mode: 'ml_kem',
                 minimum_mode: 'classic',
@@ -401,12 +426,8 @@ describe('ProfilesView interactions', () => {
     // has climbed past is the point.
     expect(within(screen.getByLabelText('Plancher')).getAllByRole('button')).toHaveLength(3)
 
-    fireEvent.click(screen.getByRole('button', { name: 'Retirer' }))
-    await waitFor(() => expect(screen.getByText('aucune')).toBeTruthy())
-    // And the PSK comes back to the WireGuard settings, where it is plain
-    // WireGuard again.
-    fireEvent.click(screen.getByRole('button', { name: 'Avancé' }))
-    expect(screen.getByRole('button', { name: 'Définir un PSK statique' })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Retirer' })).toBeNull()
+    expect(screen.getByText(/type d’un profil enregistré est immuable/i)).toBeTruthy()
   })
 
   /** Certificates have their own destination: none of it leaks back here. */
@@ -505,9 +526,17 @@ describe('ProfilesView interactions', () => {
       />,
     )
 
+    expect(screen.getByRole('list', { name: 'Choisir le profil chargé' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'portable' }).getAttribute('aria-current')).toBe(
+      'true',
+    )
+
     fireEvent.click(screen.getByRole('button', { name: 'backup' }))
-    expect(handlers.onSelect).toHaveBeenCalledWith('backup')
-    expect((screen.getByLabelText('Nom') as HTMLInputElement).value).toBe('backup')
+    await waitFor(() => expect(handlers.onSelect).toHaveBeenCalledWith('backup'))
+    await waitFor(() =>
+      expect((screen.getByLabelText('Nom') as HTMLInputElement).value).toBe('backup'),
+    )
+    expect(screen.getByRole('button', { name: 'backup' }).getAttribute('aria-current')).toBe('true')
 
     fireEvent.click(screen.getByRole('button', { name: 'Nouveau' }))
     expect((screen.getByLabelText('Nom') as HTMLInputElement).value).toBe('nouveau')
@@ -518,6 +547,28 @@ describe('ProfilesView interactions', () => {
     const dialog = screen.getByRole('dialog', { name: 'Supprimer « portable » ?' })
     fireEvent.click(within(dialog).getByRole('button', { name: 'Supprimer' }))
     await waitFor(() => expect(handlers.onDelete).toHaveBeenCalledWith('portable'))
+  })
+
+  it('keeps the loaded profile when selecting another profile is refused', async () => {
+    const handlers = callbacks()
+    handlers.onSelect.mockRejectedValueOnce(new Error('configuration non écrite'))
+    render(
+      <ProfilesView
+        config={{
+          profiles: [profile(), profile({ name: 'backup', endpoint: 'backup.example:51820' })],
+          selected: 'portable',
+        }}
+        pathImport={null}
+        {...handlers}
+      />,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'backup' }))
+    await waitFor(() => expect(handlers.onSelect).toHaveBeenCalledWith('backup'))
+    expect((screen.getByLabelText('Nom') as HTMLInputElement).value).toBe('portable')
+    expect(screen.getByRole('button', { name: 'portable' }).getAttribute('aria-current')).toBe(
+      'true',
+    )
   })
 
   /**
@@ -621,7 +672,89 @@ describe('ProfilesView interactions', () => {
         />,
       )
     }
-    expect(click).toHaveBeenCalledTimes(2)
+    await waitFor(() => expect(click).toHaveBeenCalledTimes(2))
+  })
+
+  it('allows import without BitLocker only after stating the incomplete protection', async () => {
+    api.vaultPosture.mockResolvedValueOnce({
+      hardwareBacked: true,
+      softwareKeystore: false,
+      volume: 'Volume non chiffré.',
+      volumeProtected: false,
+      unencryptedVolumeWaived: false,
+      memoryLocked: true,
+      memory: '',
+      dumpsExcluded: true,
+      dumps: '',
+      rotationRequired: [],
+      legacyPresent: false,
+    })
+    const handlers = callbacks()
+    const { container } = render(
+      <ProfilesView
+        config={{ profiles: [profile()], selected: 'portable' }}
+        pathImport={null}
+        {...handlers}
+      />,
+    )
+    const input = container.querySelector('input[type="file"]') as HTMLInputElement
+    const click = vi.spyOn(input, 'click')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Importer' }))
+
+    expect(await screen.findByRole('dialog')).toBeTruthy()
+    expect(screen.getByText(/anciens blocs SSD/)).toBeTruthy()
+    expect(screen.getByText(/Orion la signalera comme protection incomplète/)).toBeTruthy()
+    expect(screen.queryByText(/exigence levée/)).toBeNull()
+    expect(click).not.toHaveBeenCalled()
+
+    fireEvent.click(
+      screen.getByRole('button', { name: 'Continuer avec une protection incomplète' }),
+    )
+
+    await waitFor(() => expect(api.allowUnencryptedVolume).toHaveBeenCalledOnce())
+    await waitFor(() => expect(click).toHaveBeenCalledOnce())
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+  })
+
+  it('retries the pending save as soon as the bare-volume choice is persisted', async () => {
+    api.vaultPosture.mockResolvedValueOnce({
+      hardwareBacked: true,
+      softwareKeystore: false,
+      volume: 'Volume non chiffré.',
+      volumeProtected: false,
+      unencryptedVolumeWaived: false,
+      memoryLocked: true,
+      memory: '',
+      dumpsExcluded: true,
+      dumps: '',
+      rotationRequired: [],
+      legacyPresent: false,
+    })
+    const handlers = callbacks()
+    render(
+      <ProfilesView
+        config={{ profiles: [profile()], selected: 'portable' }}
+        pathImport={null}
+        {...handlers}
+      />,
+    )
+    await waitFor(() => expect(api.validateProfile).toHaveBeenCalled())
+    fireEvent.change(screen.getByLabelText('Endpoint'), {
+      target: { value: 'vpn.example:51820' },
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Enregistrer' }))
+
+    expect(await screen.findByRole('dialog')).toBeTruthy()
+    expect(handlers.onSave).not.toHaveBeenCalled()
+    fireEvent.click(
+      screen.getByRole('button', { name: 'Continuer avec une protection incomplète' }),
+    )
+
+    await waitFor(() => expect(api.allowUnencryptedVolume).toHaveBeenCalledOnce())
+    await waitFor(() => expect(handlers.onSave).toHaveBeenCalledOnce())
+    expect(handlers.onSave.mock.calls[0][0].endpoint).toBe('vpn.example:51820')
   })
 
   it('loads an associated profile and explains a failed identity seal', async () => {

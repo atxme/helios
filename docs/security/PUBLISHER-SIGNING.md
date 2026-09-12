@@ -106,6 +106,62 @@ confirmé sur les gateways. L’outil valide également l’en-tête ELF et sa t
 trie les features, refuse l’écrasement du manifeste et auto-vérifie les deux
 signatures.
 
+### Déploiement applicatif courant depuis le poste de développement
+
+Quand le même poste tient les rôles de build, d’éditeur et d’opérateur, le
+flux principal est une seule commande :
+
+```sh
+./scripts/deploy-app.sh
+```
+
+Elle construit le frontend et le seul binaire `heliosd`, signe le manifeste,
+transfère l’artefact par l’API derrière `helios0`, demande son activation puis
+attend que la gateway confirme la nouvelle séquence. La compilation incrémentale
+peut réutiliser un frontend déjà construit avec `--skip-frontend`. Pour une
+gateway de laboratoire ou une URL non standard :
+
+```sh
+./scripts/deploy-app.sh --channel testing --url http://100.64.0.1:8080
+```
+
+Le transfert seul reste utilisable avec des artefacts préparés ailleurs :
+
+```sh
+helios-ctl --url http://100.64.0.1:8080 app-update \
+  --manifest heliosd.release.json --binary heliosd
+```
+
+Depuis PowerShell sous Windows, le script natif pilote la même commande et
+envoie un ELF Linux déjà construit et son manifeste signé :
+
+```powershell
+.\scripts\deploy-app.ps1 `
+  -Manifest .\heliosd.release.json `
+  -Binary .\heliosd `
+  -Yes
+```
+
+`-HeliosCtl C:\outils\helios-ctl.exe` évite `cargo run` lorsqu'un binaire
+Windows de l'outil est déjà disponible. Windows ne construit pas nativement
+le daemon Linux et ses dépendances noyau/TPM. Quand le dépôt et les clés
+éditeur vivent dans WSL, PowerShell peut lancer la chaîne complète :
+
+```powershell
+.\scripts\deploy-app.ps1 `
+  -BuildInWsl `
+  -WslRepo /home/utilisateur/helios
+```
+
+Dans ce second mode, build, signature et transfert s'exécutent dans WSL ;
+`-WslDistribution Ubuntu` sélectionne explicitement la distribution. Si WSL
+ne voit pas la route installée par Orion sous Windows, produire les artefacts
+dans WSL puis employer le premier mode fait partir l'appel API de Windows.
+
+Sans `--yes`, `helios-ctl` demande confirmation après le staging. `--stage-only`
+n’active rien. Ce chemin ne remplace pas le bundle signé : une modification de
+`helios-installer`, `helios-ctl` ou d’une unité systemd exige toujours un bundle.
+
 ## Signer un bundle d’installation
 
 Un bundle porte le daemon, l’installateur, l’outil d’exploitation, les unités

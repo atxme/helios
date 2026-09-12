@@ -110,8 +110,9 @@ export type CertificateActionBlockKind =
   | 'identity_missing'
   | 'nothing_expired'
   | 'no_previous_identity'
+  | 'previous_identity_expired'
   | 'trust_material_missing'
-  | 'renewal_path_not_wired'
+  | 'companion_transport_missing'
   | 'operator_credential_required'
 
 /** One action and whether it may run, as the shell decides. */
@@ -122,6 +123,62 @@ export interface CertificateActionState {
   blocked_by: { kind: CertificateActionBlockKind } | null
   /** The sentence to show, as-is. `null` when the action may run. */
   message: string | null
+}
+
+/**
+ * Where a renewal stands after one press (spec §8.1.2).
+ *
+ * `awaiting_operator` is a step and not a failure: it is where every renewal
+ * legitimately waits, sometimes for hours, while a human finds their key.
+ * `companion_command` is the exact line that approves this operation — a value
+ * the operator runs, which is why it is carried rather than described.
+ *
+ * The two recovery steps are the §7.5 path, where the active leaf has already
+ * expired. They are separate variants and not a flag on the others, because
+ * nothing about them can be done here: no manifest to read, no ceremony to
+ * run, no companion to launch. Every step the shell can send is named — one it
+ * does not know is one the surface renders as nothing at all, which is
+ * indistinguishable from a press that did nothing.
+ */
+export type RenewalProgress =
+  | { step: 'awaiting_operator'; operation_id: string; companion_command: string }
+  | { step: 'issuing'; operation_id: string }
+  | { step: 'committed'; generation: number }
+  | { step: 'recovery_awaiting_operator'; operation_id: string; operator_command: string }
+  | { step: 'recovered'; generation: number; activation_at: number }
+  | { step: 'rolled_back'; generation: number; available_until: number }
+
+/**
+ * What one press produced, per profile.
+ *
+ * A map and not a single step, because one of the four actions is
+ * device-wide: returning the progress of the profile the press started from
+ * would attribute every other renewal to it, and hide the approval each of
+ * them is waiting for. `refused` is only ever filled by that action — a
+ * single-profile press rejects instead.
+ */
+export interface ActionOutcome {
+  progress: Record<string, RenewalProgress>
+  refused: Record<string, string>
+}
+
+/**
+ * What the operator is shown **before** being asked to touch their key.
+ *
+ * Every field comes from a request verified against what the profile pins, not
+ * from the answer's own claims: showing a generation or a peer that nothing
+ * vouches for is how a ceremony gets spent on a lie.
+ */
+export interface ApprovalManifest {
+  operation_id: string
+  client_wg_public_key: string
+  active_generation: number
+  requested_generation: number
+  /** SHA-256 of the rotation request this approval is bound to. */
+  request_fingerprint: string
+  expires_at: number
+  /** How many of the domain's credentials may answer this request. */
+  eligible_credentials: number
 }
 
 /** Everything the Certificates screen shows for one profile. */
@@ -143,6 +200,17 @@ export interface CertificateInventory {
   client_pq: CertificateFacts | null
   faults: string[]
   identity_sealed: boolean
+  previous_identity: {
+    available_from: number
+    available_until: number
+    phase: 'not_yet_available' | 'available' | 'expired'
+    selected: boolean
+  } | null
+  /** Authenticated epoch held locally; Orion does not persist registry rows. */
+  operator_credentials: {
+    registry_epoch: number
+    detail: 'epoch_only'
+  } | null
 }
 
 /**
@@ -215,8 +283,18 @@ export interface About {
 //
 // What the screen actually needs is the **public** half — the one value meant
 // to leave the machine — plus a boolean saying whether each secret is present.
+export type ProfileKind = 'classic' | 'helios_key_negotiation'
+
 export interface ClientProfile {
   name: string
+  /**
+   * Which of the two profile shapes this is (spec §19).
+   *
+   * Resolved by the core, never absent: a profile stored before the
+   * discriminant existed still has a kind, and the screen shows what the
+   * connection path acts on rather than what the file happens to record.
+   */
+  profile_type: ProfileKind
   /** Gateway's UDP endpoint: `IP:port` or `FQDN:port`. */
   endpoint: string
   /** Gateway's Curve25519 public key (base64). */
@@ -411,6 +489,65 @@ export interface SpeedTestResult {
   measurement_rounds: number
 }
 
+/** Paths and existing Astra campaign chosen by the operator for a CA-TLS rotation. */
+export interface AstraRotationInput {
+  vault_path: string
+  heliosd_url: string
+  operation_id: string
+  output_path: string
+}
+
+/** One observable boundary of the two-key CA-TLS ceremony. */
+export type AstraRotationPhase =
+  | 'idle'
+  | 'starting'
+  | 'awaiting_first_key'
+  | 'processing_first_key'
+  | 'awaiting_second_key'
+  | 'processing_second_key'
+  | 'finalizing'
+  | 'prepared'
+  | 'deposited'
+  | 'awaiting_promotion_key'
+  | 'promoting'
+  | 'promoted'
+  | 'failed'
+  | 'cancelled'
+
+/** Verified campaign fields displayed before either credential is exercised. */
+export interface AstraCaTlsRotationManifest {
+  reason: string
+  requested_by: string
+  fingerprint: string
+  current_ca_tls_epoch: number
+  next_ca_tls_epoch: number
+  activation_at: number
+  not_after: number
+  outgoing_anchor_fingerprint: string
+  affected_ca: 'client_tls'
+  target_count: number
+}
+
+/**
+ * State returned by the Rust-owned signer session.
+ *
+ * Labels identify the credentials that actually answered; the WebView never
+ * discovers security keys or handles their PINs itself.
+ */
+export interface AstraRotationStatus {
+  phase: AstraRotationPhase
+  message: string
+  can_continue: boolean
+  can_cancel: boolean
+  manifest?: AstraCaTlsRotationManifest | null
+  first_key_label?: string | null
+  second_key_label?: string | null
+  output_path?: string | null
+  next_ca_tls_epoch?: number | null
+  activation_at?: number | null
+  not_after?: number | null
+}
+
 /**
  * What the vault can honestly claim about itself (ADR-006 §3).
  *
@@ -447,4 +584,223 @@ export interface VaultPosture {
   rotationRequired: string[]
   /** A plaintext `profiles.toml` is still present and not yet migrated. */
   legacyPresent: boolean
+}
+
+/* ─────────────────────────── Cérémonies opérateur ───────────────────────────
+ *
+ * Protocole 2. Deux machines d'état et non une : une récupération est tenue par
+ * deux parties à la fois — Orion détient les clés privées clientes et signe le
+ * commit, le processus opérateur détient le coffre et signe le grant. « Attente
+ * de la clé » et « mis en scène chez la gateway » sont deux coordonnées, pas
+ * deux points d'une ligne.
+ *
+ * Les manifestes sont typés par opération. Une liste libre `label/valeur`
+ * laisserait omettre une génération ou reformuler une opération dangereuse sans
+ * que rien ici puisse s'en apercevoir, et §12.2 demande que ce qui est signé
+ * soit ce qui a été montré. Les mots affichés sont choisis **ici**, jamais
+ * transportés depuis le processus opérateur ou le réseau.
+ */
+
+export type OperationKind =
+  | 'recover_identity'
+  | 'approve_campaign'
+  | 'authorize_issuer'
+  | 'rotate_client_tls_ca'
+  | 'rotate_anchor'
+  | 'revoke_certificate'
+
+/** Ce que le WebView a le droit de nommer : un genre, au plus un identifiant. */
+export interface OperationLocator {
+  kind: OperationKind
+  operation_id?: string
+}
+
+export type OperatorAction = 'continue' | 'cancel'
+
+/** Où en est la cérémonie **chez l'autorité**. */
+export type RemoteState =
+  | 'local'
+  | 'awaiting_operator'
+  | 'prepared'
+  | 'deposited'
+  | 'staged'
+  | 'pending_grant'
+  | 'granted'
+  | 'committed'
+  | { activation_deferred: { activation_at: number } }
+  | 'refused'
+
+export type KeyPurpose = 'open_vault' | 'approve_campaign' | 'second_approval' | 'promotion'
+
+/** Où en est la cérémonie **sur ce poste**. */
+export type GestureState =
+  | 'verifying'
+  | 'idle'
+  | { awaiting_key: { index: number; of: number; purpose: KeyPurpose } }
+  | { processing_key: { index: number; of: number } }
+  | 'signing'
+  | 'done'
+  | 'cancelled'
+  | 'failed'
+
+export type Refusal =
+  | { refusal: 'vault_unavailable' }
+  | { refusal: 'key_declined' }
+  | { refusal: 'foreground_unavailable' }
+  | { refusal: 'key_not_enrolled' }
+  | { refusal: 'key_repeated' }
+  | { refusal: 'window_expired' }
+  | { refusal: 'authority_refused'; status: number }
+  | { refusal: 'handoff_mismatch' }
+  | { refusal: 'manifest_mismatch' }
+  | { refusal: 'protocol_violation' }
+  | { refusal: 'cancelled' }
+  | { refusal: 'internal' }
+
+export interface RecoveryManifest {
+  operation: 'recovery'
+  trust_domain_id: string
+  peer_name: string
+  client_wg_public_key: string
+  expired_generation: number
+  next_generation: number
+  expired_since_secs: number
+  request_fingerprint: string
+  ca_epoch: number
+  ca_tls_epoch: number
+  activation_at: number
+  not_after: number
+}
+
+export type AffectedCa = 'ca_pq' | 'ca_tls'
+
+export type CampaignScope =
+  | 'orion_profile'
+  | 'orion_device'
+  | 'fleet_leafs'
+  | 'full_certificate_chain'
+  | 'trust_authorities'
+  | 'emergency_revocation'
+  | 'gateway_identity'
+  | 'issuer_delegation'
+  | 'gateway_bootstrap'
+
+export interface CampaignManifest {
+  operation: 'campaign'
+  campaign: {
+    format_version: number
+    campaign_id: string
+    trust_domain_id: string
+    gateway_wg_public_key: string
+    server_name: string
+    created_at: number
+    expires_at: number
+    scope: CampaignScope
+    targets: Array<{
+      certificate_kind:
+        | 'gateway_tls'
+        | 'gateway_pq'
+        | 'client_tls'
+        | 'client_pq'
+        | 'ca_pq'
+        | 'ca_tls'
+        | 'astra_issuer'
+        | 'astra_service_key'
+      identity_key: string
+      epoch: number
+      generation: number
+      active_tls_certificate_fingerprint: string
+      active_pq_certificate_fingerprint: string
+    }>
+    reason: string
+    requested_by: string
+    policy_fingerprint: string
+    required_credentials: number
+  }
+  fingerprint: string
+}
+
+export interface IssuerManifest {
+  operation: 'issuer_authorization'
+  trust_domain_id: string
+  issuer_epoch: number
+  not_before: number
+  not_after: number
+  allowed_usages: string[]
+  policy_fingerprint: string
+  request_fingerprint: string
+}
+
+export interface CaRotationManifest {
+  operation: 'ca_rotation'
+  trust_domain_id: string
+  affected_ca: AffectedCa
+  current_epoch: number
+  next_epoch: number
+  activation_at: number
+  not_after: number
+  outgoing_anchor_fingerprint: string
+  next_anchor_fingerprint: string
+  target_count: number
+}
+
+export interface RevocationManifest {
+  operation: 'revocation'
+  trust_domain_id: string
+  target: string
+  scope: string
+  reason: string
+  revocation_epoch: number
+  effective_at: number
+}
+
+export type AstraManifest =
+  | RecoveryManifest
+  | CampaignManifest
+  | IssuerManifest
+  | CaRotationManifest
+  | RevocationManifest
+
+export interface KeySlotLabel {
+  slot: string
+  label: string
+}
+
+export interface OperatorStatus {
+  session_id: string
+  /** Strictement croissante. Une commande nomme celle à laquelle elle répond. */
+  revision: number
+  operation: OperationKind
+  operation_id?: string
+  remote: RemoteState
+  gesture: GestureState
+  /** Dérivé côté Rust, et vérifié à l'arrivée : un bouton inventé ici ne sert à rien. */
+  allowed: OperatorAction[]
+  manifest?: AstraManifest
+  keys?: KeySlotLabel[]
+  refusal?: Refusal
+}
+
+/**
+ * Une opération qui attend l'opérateur, telle qu'une liste peut la nommer.
+ *
+ * Aucun jeton de capacité : ils sont émis pour l'appelant qui va agir, sur
+ * l'opération qu'il a nommée. Une liste qui les porterait donnerait à tout
+ * lecteur un droit sur toutes les opérations qu'elle contient.
+ *
+ * Les récupérations en sont **absentes**, et cette absence est leur contrôle
+ * d'accès : une récupération est servie sans tunnel — le tunnel est ce qui a
+ * expiré — et sa seule revendication est l'identifiant que le client détient.
+ * Orion a déjà celui des siennes, puisque c'est lui qui les ouvre.
+ */
+export interface OperatorPendingOperation {
+  operation_id: string
+  scope: CampaignScope
+  reason: string
+  requested_by: string
+  target_count: number
+  required_credentials: number
+  campaign_fingerprint: string
+  created_at: number
+  expires_at: number
 }

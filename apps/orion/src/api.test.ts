@@ -11,11 +11,15 @@ vi.mock('@tauri-apps/api/event', () => ({ listen: mocks.listen }))
 import {
   aboutOrion,
   adapterIsUp,
+  allowUnencryptedVolume,
+  astraCaTlsRotationStatus,
+  cancelAstraCaTlsRotation,
   backendKind,
   certificateActions,
   certificateInventory,
   certificateOverview,
   connect,
+  continueAstraCaTlsRotation,
   deleteProfile,
   disconnect,
   getConfig,
@@ -33,6 +37,7 @@ import {
   runSpeedTest,
   saveProfile,
   selectProfile,
+  startAstraCaTlsRotation,
   validateProfile,
   vaultPosture,
   exportLogs,
@@ -55,6 +60,7 @@ describe('Orion Tauri bridge', () => {
     await importProfilePath()
     await validateProfile(profile as never)
     await vaultPosture()
+    await allowUnencryptedVolume()
     await keyNegotiationSupport()
     await certificateInventory(profile as never)
     await certificateActions(profile as never)
@@ -68,6 +74,16 @@ describe('Orion Tauri bridge', () => {
     await connect('portable')
     await connect()
     await disconnect()
+    const astraInput = {
+      vault_path: 'C:\\astra\\authority-vault.json',
+      heliosd_url: 'http://100.64.0.1:8080',
+      operation_id: 'a'.repeat(32),
+      output_path: 'C:\\astra\\ca-tls-transition.json',
+    }
+    await startAstraCaTlsRotation(astraInput)
+    await continueAstraCaTlsRotation()
+    await cancelAstraCaTlsRotation()
+    await astraCaTlsRotationStatus()
     await resizeForView('profiles')
     await exportLogs('orion-log', 'contents')
 
@@ -88,6 +104,7 @@ describe('Orion Tauri bridge', () => {
       ['import_profile_path', { path: null }],
       ['validate_profile', { draft: profile }],
       ['vault_posture'],
+      ['allow_unencrypted_volume'],
       ['key_negotiation_support'],
       ['certificate_inventory', { keyNegotiation: profile }],
       ['certificate_actions', { keyNegotiation: profile }],
@@ -101,6 +118,10 @@ describe('Orion Tauri bridge', () => {
       ['connect', { name: 'portable' }],
       ['connect', { name: null }],
       ['disconnect'],
+      ['start_astra_ca_tls_rotation', { input: astraInput }],
+      ['continue_astra_ca_tls_rotation'],
+      ['cancel_astra_ca_tls_rotation'],
+      ['astra_ca_tls_rotation_status'],
       ['resize_for_view', { view: 'profiles' }],
       ['export_logs', { stem: 'orion-log', contents: 'contents' }],
     ])

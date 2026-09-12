@@ -23,6 +23,7 @@ use serde_json::Value;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 mod api;
+mod app_update;
 mod campaign;
 mod campaign_key_nego;
 mod enroll;
@@ -45,6 +46,8 @@ EXAMPLES:
   cargo run -p helios-ctl -- watch
   cargo run -p helios-ctl -- network show
   cargo run -p helios-ctl -- network load config/network.toml
+  cargo run -p helios-ctl -- --url http://100.64.0.1:8080 app-update \
+    --manifest heliosd.release.json --binary heliosd
   cargo run -p helios-ctl -- scenario nominal
   cargo run -p helios-ctl -- update                 # on the gateway
   cargo run -p helios-ctl -- --url http://192.168.1.1:8080 status"
@@ -168,6 +171,13 @@ enum Cmd {
         /// URL de l'API interne, pour la seule télémétrie.
         #[arg(long)]
         heliosd_url: Option<String>,
+        /// Bloc de confiance §19, tel que `heliosd show-trust-enrolment` l'imprime.
+        ///
+        /// Sans lui le profil se connecte mais ne peut pas renouveler son
+        /// certificat, et Orion le dit. Les valeurs ne sont pas devinables :
+        /// ce sont les ancres du domaine et la génération de ce pair.
+        #[arg(long, requires = "gateway_certificate")]
+        trust_material: Option<PathBuf>,
     },
     /// Escrow of the gateway identity — **operator workstation**.
     ///
@@ -182,13 +192,28 @@ enum Cmd {
         #[command(subcommand)]
         command: key_nego::KeyNegoCmd,
     },
+    /// Transfers and activates a signed heliosd release through the admin API.
+    AppUpdate {
+        /// Signed `helios-binary-release-v1` JSON manifest.
+        #[arg(long)]
+        manifest: PathBuf,
+        /// Exact heliosd ELF named by the manifest.
+        #[arg(long)]
+        binary: PathBuf,
+        /// Stages and verifies the release without activating it.
+        #[arg(long, conflicts_with = "yes")]
+        stage_only: bool,
+        /// Activates without an interactive confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Upgrades this gateway's OS and reboots, keeping its identity (ADR-007).
     ///
     /// **Runs on the gateway.** Refreshes the package lists, reports which
     /// pending packages move which PCR, upgrades, then arms a TPM update
     /// window and reboots — which kills this command. Whether the window was
     /// consumed is in the journal at the next boot:
-    /// `journalctl -u heliosd -b | grep -i 'update window'`.
+    /// `journalctl --namespace=helios -u heliosd -b | grep -i 'update window'`.
     Update {
         /// Skips the confirmation.
         #[arg(long)]
@@ -260,6 +285,16 @@ enum PeerCmd {
         /// SHA-256 fingerprint of the client's ML-DSA-87 certificate.
         #[arg(long)]
         key_negotiation_pq_certificate_sha256: Option<String>,
+        /// The client's TLS leaf, DER — the file `key-nego issue-client` wrote.
+        ///
+        /// A gateway holding a trust domain records the leaves themselves, not
+        /// their digests, and refuses an admission without them: a peer with
+        /// no registry row is a client that connects and can never renew.
+        #[arg(long)]
+        certificate: Option<PathBuf>,
+        /// The client's ML-DSA-87 leaf, its JSON document.
+        #[arg(long)]
+        pq_certificate: Option<PathBuf>,
         /// Refuses every future network negotiation below this mode.
         #[arg(long, value_enum)]
         minimum_mode: Option<key_nego::Mode>,
@@ -362,10 +397,14 @@ enum NetworkCmd {
 struct Status {
     state: String,
     version: String,
-    wan_iface: String,
+    /// Uplinks, in the gateway's order of preference: the API publishes the
+    /// whole set, not a single interface.
+    wan_ifaces: Vec<String>,
     lan_ifaces: Vec<String>,
     wg_peers: Vec<String>,
     allow_ssh_from: Vec<String>,
+    #[serde(default)]
+    admin_ifaces: Vec<String>,
     peers: Vec<PeerSummary>,
     wg_iface: String,
     wg_listen_port: Option<u16>,
@@ -473,7 +512,7 @@ async fn cmd_status(client: &Client, base: &str) -> Result<()> {
     println!();
     println!("  {}  {}", state_dot(&s.state), colored_state(&s.state));
     println!();
-    println!("  {:<14} {}", "WAN", s.wan_iface);
+    println!("  {:<14} {}", "WAN", s.wan_ifaces.join(", "));
     println!("  {:<14} {}", "LAN", s.lan_ifaces.join(", "));
     println!(
         "  {:<14} {}{}",
@@ -496,6 +535,9 @@ async fn cmd_status(client: &Client, base: &str) -> Result<()> {
     }
     if !s.allow_ssh_from.is_empty() {
         println!("  {:<14} {}", "SSH allowed", s.allow_ssh_from.join(", "));
+    }
+    if !s.admin_ifaces.is_empty() {
+        println!("  {:<14} {}", "Admin access", s.admin_ifaces.join(", "));
     }
     if !s.split_tunnel_cidrs.is_empty() {
         println!(
@@ -567,10 +609,10 @@ async fn cmd_network_show(client: &Client, base: &str) -> Result<()> {
     println!(
         "  {:<16} {}",
         "WAN",
-        if cfg.wan_iface.is_empty() {
-            "(not set)"
+        if cfg.wan_ifaces.is_empty() {
+            "(not set)".to_string()
         } else {
-            &cfg.wan_iface
+            cfg.wan_ifaces.join(", ")
         }
     );
     println!(
@@ -588,6 +630,9 @@ async fn cmd_network_show(client: &Client, base: &str) -> Result<()> {
             "SSH allowed from",
             cfg.allow_ssh_from.join(", ")
         );
+    }
+    if !cfg.admin_ifaces.is_empty() {
+        println!("  {:<16} {}", "Admin ifaces", cfg.admin_ifaces.join(", "));
     }
     if let Some(ref iface) = cfg.admin_iface {
         println!("  {:<16} {}", "Admin iface", iface);
@@ -819,6 +864,18 @@ fn ensure_command(response: CmdResp, action: &str) -> Result<()> {
 ///
 /// The normalized form is what gets written, so a document and the screen that
 /// displays it never disagree on spelling.
+/// Reads a file and encodes it base64, for the two certificates an admission
+/// carries.
+///
+/// A path rather than a value on the command line: `ps` shows every process's
+/// argv, and a certificate pasted there is one more place an operator can put
+/// the wrong bytes without noticing.
+fn read_base64(path: PathBuf) -> Result<String> {
+    use base64::Engine as _;
+    let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+}
+
 fn check_allowed_ips(value: Option<String>) -> Result<Option<String>> {
     let Some(value) = value else {
         return Ok(None);
@@ -853,6 +910,12 @@ fn check_ssh_target(value: Option<String>) -> Result<Option<String>> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Two rustls providers are compiled in — `ring` for the negotiation's QUIC
+    // stack, AWS-LC for the private channel — so the process-level default is
+    // ambiguous, and `hyper-rustls` builds `reqwest`'s TLS config without
+    // naming one (`connector.rs:269`). Settled here, before the first client.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     let cli = Cli::parse();
     let client = Client::new();
     let base = cli.url.trim_end_matches('/');
@@ -874,8 +937,12 @@ async fn main() -> Result<()> {
                 admin,
                 key_negotiation_certificate_sha256,
                 key_negotiation_pq_certificate_sha256,
+                certificate,
+                pq_certificate,
                 minimum_mode,
             } => {
+                let certificate = certificate.map(read_base64).transpose()?;
+                let pq_certificate = pq_certificate.map(read_base64).transpose()?;
                 let minimum_mode = minimum_mode.map(Into::into).unwrap_or_else(|| {
                     if key_negotiation_pq_certificate_sha256.is_some() {
                         aether::key_negotiation::ProtectionMode::MlKem
@@ -892,6 +959,8 @@ async fn main() -> Result<()> {
                     peer::KeyNegotiationAdmission {
                         tls_certificate_sha256: key_negotiation_certificate_sha256.as_deref(),
                         pq_certificate_sha256: key_negotiation_pq_certificate_sha256.as_deref(),
+                        tls_certificate: certificate.as_deref(),
+                        pq_certificate: pq_certificate.as_deref(),
                         minimum_mode,
                     },
                 )
@@ -950,6 +1019,7 @@ async fn main() -> Result<()> {
             gateway_pq_certificate,
             address,
             heliosd_url,
+            trust_material,
         } => {
             // Checked before the gateway is contacted: a missing CA must not
             // be discovered after a peer has been admitted.
@@ -963,6 +1033,7 @@ async fn main() -> Result<()> {
                         gateway_pq_certificate,
                         address,
                         heliosd_url,
+                        trust_material,
                     })
                 }
                 // `requires` in the parser already rules out partial
@@ -1001,6 +1072,24 @@ async fn main() -> Result<()> {
             } => escrow::open(&escrow, &private_key, &output),
         },
         Cmd::KeyNego { command } => key_nego::run(command).await,
+        Cmd::AppUpdate {
+            manifest,
+            binary,
+            stage_only,
+            yes,
+        } => {
+            app_update::run(
+                &client,
+                base,
+                app_update::Options {
+                    manifest,
+                    binary,
+                    stage_only,
+                    yes,
+                },
+            )
+            .await
+        }
         Cmd::Update { yes } => update::run(yes),
         Cmd::Scenario { name } => match name.as_str() {
             "nominal" => scenario_nominal(&client, base).await,
@@ -1046,14 +1135,17 @@ mod tests {
     #[test]
     fn current_wireguard_status_is_deserializable() {
         let raw = r#"{
-            "state":"down","version":"0.1.0","wan_iface":"eth0",
+            "state":"down","version":"0.1.0","wan_ifaces":["enp3s0","wlo1"],
             "lan_ifaces":["eth1"],"wg_peers":[],"allow_ssh_from":[],
             "peers":[{"name":"orion","public_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","address":"100.64.1.2/32","post_quantum":false}],
-            "wg_iface":"helios0","wg_listen_port":51820,"dry_run":true,
-            "split_tunnel_cidrs":[],"mss_clamp":null,"captive_portal_gateway":null
+            "wg_iface":"helios0","wg_listen_port":51820,
+            "key_negotiation_port":51821,"dry_run":true,
+            "split_tunnel_cidrs":[],"mss_clamp":null,"captive_portal_gateway":null,
+            "handshake_stale_after_seconds":150
         }"#;
         let status: Status = serde_json::from_str(raw).expect("valid status");
         assert_eq!(status.wg_iface, "helios0");
+        assert_eq!(status.wan_ifaces, ["enp3s0", "wlo1"]);
         assert_eq!(status.peers[0].name, "orion");
     }
 
@@ -1088,6 +1180,8 @@ mod tests {
                     admin: true,
                     key_negotiation_certificate_sha256: Some(tls),
                     key_negotiation_pq_certificate_sha256: Some(pq),
+                    certificate: None,
+                    pq_certificate: None,
                     minimum_mode: Some(key_nego::Mode::MlKem),
                 }
             } if name == "operator" && public_key == "public" && tls == "tls" && pq == "pq"
@@ -1122,6 +1216,15 @@ mod tests {
             vec!["helios-ctl", "network", "load", "network.toml"],
             vec!["helios-ctl", "profile", "check", "client.orion"],
             vec!["helios-ctl", "escrow", "keygen", "--output-dir", "keys"],
+            vec![
+                "helios-ctl",
+                "app-update",
+                "--manifest",
+                "heliosd.release.json",
+                "--binary",
+                "heliosd",
+                "--yes",
+            ],
             vec!["helios-ctl", "scenario", "flap"],
             vec!["helios-ctl", "campaign", "--generate-keys"],
         ] {
@@ -1144,6 +1247,17 @@ mod tests {
             .is_err(),
             "partial offline enrollment material must be refused"
         );
+        assert!(Cli::try_parse_from([
+            "helios-ctl",
+            "app-update",
+            "--manifest",
+            "heliosd.release.json",
+            "--binary",
+            "heliosd",
+            "--stage-only",
+            "--yes",
+        ])
+        .is_err());
     }
 
     #[test]

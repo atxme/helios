@@ -56,7 +56,12 @@ struct JsonProfile {
     /// Absent in a document written before the field existed; the kind is
     /// then inferred from the negotiation block, which is the behaviour this
     /// field exists to stop relying on.
-    #[serde(default)]
+    ///
+    /// Spelled `type` in the document, as the specification writes it.
+    /// `profile_type` stays accepted as an alias: the field was read under
+    /// that name before, and a document already written must not stop being
+    /// intelligible over a spelling.
+    #[serde(default, rename = "type", alias = "profile_type")]
     profile_type: Option<ProfileKind>,
     /// `default`, like everything below it.
     ///
@@ -120,31 +125,10 @@ struct JsonKeyNegotiation {
     trust: Option<crate::config::TrustMaterial>,
 }
 
-/// What kind of profile a document declares (spec §19, §22).
+/// The §19 discriminant, defined with the profile model it belongs to.
 ///
-/// # Why an explicit discriminant, when the block already says it
-///
-/// It used to be inferred: a `key_negotiation` block meant a Helios profile,
-/// its absence meant classic. Inference reads a **presence** as an
-/// **intention**, and the two come apart in the direction that matters — a
-/// document whose negotiation block was dropped by an editor, a conversion, a
-/// hand-written file missing a brace, all arrive looking exactly like a
-/// deliberate classic profile. Orion would then mount a tunnel with no
-/// pre-WireGuard authentication and report nothing, because from its side
-/// nothing was wrong.
-///
-/// So the document says which it is, and a document that claims
-/// `helios_key_negotiation` without a block is refused instead of silently
-/// downgraded. Inference survives only for documents written before the field
-/// existed, where there is nothing else to go on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProfileKind {
-    /// A plain WireGuard peer. No negotiation block, and none expected.
-    Classic,
-    /// A Helios profile: the negotiation block is mandatory.
-    HeliosKeyNegotiation,
-}
+/// Re-exported here because a document is where it is first read.
+pub use crate::config::ProfileKind;
 
 impl From<JsonKeyNegotiation> for KeyNegotiationSettings {
     fn from(value: JsonKeyNegotiation) -> Self {
@@ -175,6 +159,7 @@ impl From<JsonProfile> for ClientProfile {
             private_key: profile.private_key,
             peer_public_key: profile.peer_public_key,
             preshared_key: profile.preshared_key,
+            profile_type: profile.profile_type,
             address: profile.address,
             allowed_ips: profile
                 .allowed_ips
@@ -576,7 +561,9 @@ fn parse_json(contents: &str) -> Result<(ClientProfile, Option<ClientIdentityBun
              la place de l'opérateur"
         ),
         // No claim: inferred, as documents written before §19 have always
-        // been read. This is the arm the discriminant exists to retire.
+        // been read. The inference happens **here**, once, and is written into
+        // the profile below — so a document that predates the field still ends
+        // up with a recorded kind, and nothing downstream ever guesses again.
         _ => {}
     }
 
@@ -589,7 +576,12 @@ fn parse_json(contents: &str) -> Result<(ClientProfile, Option<ClientIdentityBun
             .validate()
             .context("matériel de confiance du document")?;
     }
-    Ok((profile.into(), identity))
+    let mut profile: ClientProfile = profile.into();
+    // Mandatory after import (spec §19): from here on the profile carries its
+    // own answer, declared by the document or resolved from it at this single
+    // point.
+    profile.profile_type = Some(profile.kind());
+    Ok((profile, identity))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -753,6 +745,9 @@ fn parse_wg_quick(contents: &str, file_name: &str) -> Result<WgQuickImport> {
             .unwrap_or_else(|| DEFAULT_ALLOWED_IPS.to_string()),
         persistent_keepalive: keepalive,
         heliosd_url: None,
+        // A wg-quick file **is** the classic shape: it has no way to express a
+        // Helios negotiation, so the discriminant is a fact here, not a guess.
+        profile_type: Some(ProfileKind::Classic),
         ssh_target: None,
         key_negotiation: None,
         preshared_key_is_negotiated: false,
@@ -1649,7 +1644,7 @@ mod tests {
             "private_key": CLIENT_PRIVATE,
             "peer_public_key": GATEWAY_PUBLIC,
             "address": "100.64.1.2/32",
-            "profile_type": kind,
+            "type": kind,
         });
         if let Some(settings) = settings {
             profile
@@ -1703,6 +1698,41 @@ mod tests {
         .expect("a declared Helios profile with its block");
     }
 
+    /// After import the kind is a **recorded fact**, never re-derived.
+    ///
+    /// A document written before §19 declares nothing, and the historical
+    /// inference is applied here — once, at the single point that turns a
+    /// document into a profile. Everything downstream reads the answer.
+    #[test]
+    fn an_undeclared_document_is_stamped_at_import() {
+        let settings = serde_json::to_value(gateway_settings(ProtectionMode::MlKem)).unwrap();
+
+        let helios = parse_profile_import(&document_with(settings), "portable.orion")
+            .expect("a document without the field still imports");
+        assert_eq!(
+            helios.profile.profile_type,
+            Some(ProfileKind::HeliosKeyNegotiation),
+            "the block resolved the kind, and the answer is written down"
+        );
+
+        let classic = parse_profile_import(&document_of_kind("classic", None), "portable.orion")
+            .expect("a declared classic document imports");
+        assert_eq!(classic.profile.profile_type, Some(ProfileKind::Classic));
+    }
+
+    /// The document spells it `type`, and the former name keeps being read.
+    ///
+    /// A spelling change must not make an already-written document
+    /// unintelligible — that is exactly the class of failure this whole field
+    /// exists to prevent.
+    #[test]
+    fn the_former_spelling_of_the_discriminant_is_still_accepted() {
+        let document = document_of_kind("classic", None).replace("\"type\"", "\"profile_type\"");
+        let imported =
+            parse_profile_import(&document, "portable.orion").expect("the alias is accepted");
+        assert_eq!(imported.profile.profile_type, Some(ProfileKind::Classic));
+    }
+
     /// A document written before §19 declares nothing, and is still inferred.
     /// That arm is what the discriminant exists to retire, not to break.
     #[test]
@@ -1729,6 +1759,9 @@ mod tests {
                 "client_tls_ca_der": "",
                 "client_generation": 4,
                 "astra_authority_url": "https://astra.example",
+                "webauthn_rp_id": "astra.example",
+                "astra_policy_fingerprint": "1111111111111111111111111111111111111111111111111111111111111111",
+                "credential_registry_epoch": 1,
                 "astra_service_key_epoch": 1,
                 "astra_service_public_key": "",
             }),
@@ -1760,6 +1793,9 @@ mod tests {
                 "client_tls_ca_der": STANDARD.encode(ca_tls.as_bytes()),
                 "client_generation": 4,
                 "astra_authority_url": "https://astra.example",
+                "webauthn_rp_id": "astra.example",
+                "astra_policy_fingerprint": "1111111111111111111111111111111111111111111111111111111111111111",
+                "credential_registry_epoch": 1,
                 "astra_service_key_epoch": 1,
                 "astra_service_public_key": astra.to_base64(),
             }),
@@ -2083,11 +2119,13 @@ mod tests {
         assert!(imported.profile.private_key.is_empty());
 
         let mut config = ClientConfig::default();
-        config.upsert(ClientProfile {
-            name: "portable".into(),
-            private_key: CLIENT_PRIVATE.into(),
-            ..complete_profile()
-        });
+        config
+            .upsert(ClientProfile {
+                name: "portable".into(),
+                private_key: CLIENT_PRIVATE.into(),
+                ..complete_profile()
+            })
+            .unwrap();
 
         let completed = complete_profile_import(imported.profile, &config, None, Vec::new())
             .unwrap()
@@ -2128,12 +2166,14 @@ mod tests {
         assert_eq!(imported.admitted_public_key().as_deref(), Some(&*admitted));
 
         let mut config = ClientConfig::default();
-        config.upsert(ClientProfile {
-            // Same client, other name: the situation the name rule refused.
-            name: "poste-de-christophe".into(),
-            private_key: CLIENT_PRIVATE.into(),
-            ..complete_profile()
-        });
+        config
+            .upsert(ClientProfile {
+                // Same client, other name: the situation the name rule refused.
+                name: "poste-de-christophe".into(),
+                private_key: CLIENT_PRIVATE.into(),
+                ..complete_profile()
+            })
+            .unwrap();
 
         let admitted_key = imported.admitted_public_key();
         let completed = complete_profile_import(
@@ -2158,10 +2198,12 @@ mod tests {
             ..complete_profile()
         };
         let mut config = ClientConfig::default();
-        config.upsert(ClientProfile {
-            private_key: "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=".into(),
-            ..complete_profile()
-        });
+        config
+            .upsert(ClientProfile {
+                private_key: "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=".into(),
+                ..complete_profile()
+            })
+            .unwrap();
 
         let completed = complete_profile_import(
             invitation,

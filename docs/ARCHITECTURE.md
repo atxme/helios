@@ -211,9 +211,10 @@ lot 3.
 
 ## Application update
 
-The UI transfers a `helios-binary-release-v1` manifest and the binary in JSON
-chunks. `heliosd` verifies the Ed25519 and ML-DSA-65 signatures, the target, the
-channel, the size and the SHA-256, then stages under `/var/lib/helios/updates`.
+The UI or `helios-ctl app-update` transfers a `helios-binary-release-v1`
+manifest and the binary in JSON chunks. `heliosd` verifies the Ed25519 and
+ML-DSA-65 signatures, the target, the channel, the size and the SHA-256, then
+stages under `/var/lib/helios/updates`.
 `helios-installer`, launched by systemd and denied network access, re-verifies
 the artefact, switches `/opt/helios/current`, restarts the daemon and restores
 the previous link if the daemon and its API do not become ready.
