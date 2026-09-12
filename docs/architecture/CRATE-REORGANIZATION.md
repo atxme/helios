@@ -27,7 +27,7 @@ normales. Les arêtes de test et de build sont données séparément. Les lignes
 de code indiquées sont des ordres de grandeur issus de `wc -l`, utiles pour
 repérer les concentrations, pas une mesure de complexité.
 
-## 1. Architecture actuelle
+## 1. Architecture actuelle et direction cible
 
 Le découpage fonctionnel est déjà visible, mais il n’est pas toujours reflété
 par les frontières Cargo. La cible de nommage et d’ownership Helios–Orion doit
@@ -454,74 +454,17 @@ crates d’erreurs, DTO, utils, sérialisation ou backend.
 
 ### Organisation interne par blocs fonctionnels
 
-La frontière Cargo ne suffit pas : plusieurs fichiers concentrent encore
-plusieurs workflows ou machines à états. Le découpage recommandé est
-intra-crate et suit le propriétaire du comportement, pas une taxonomie
-générique `models/errors/utils`.
+La frontière Cargo ne suffit pas : `heliosd`, Orion/Tauri, le transport de
+négociation et certains contrats Aether réunissent plusieurs capacités dans
+un même fichier. À l’inverse, les tailles brutes de
+`helios-provisioning::certificates`, `astra::registry`, du firewall, du vault
+et de l’update sont fortement augmentées par leurs tests inline ; leur code de
+production est plus cohérent que le nombre total de lignes ne le laisse croire.
 
-Les critères sont les suivants :
-
-- un module porte un bloc fonctionnel cohérent et ses invariants ;
-- les transitions d’état restent ensemble, au lieu d’être réparties entre un
-  fichier de types et plusieurs fichiers de fonctions sans propriétaire clair ;
-- un fichier de 1 000 lignes n’est pas automatiquement mauvais, mais plusieurs
-  workflows indépendants dans le même fichier sont un signal de découpage ;
-- `mod.rs`/`lib.rs` orchestre et expose la surface stable, il ne doit pas
-  redevenir le lieu de toute l’implémentation ;
-- les tests suivent le même bloc fonctionnel, avec des tests d’intégration à la
-  frontière de la crate ;
-- un découpage de fichiers ne justifie pas à lui seul une nouvelle crate.
-
-| Zone | Concentration observée | Découpage interne proposé |
-| --- | --- | --- |
-| `aether` certificats | `state.rs` 3 353, `status.rs` 3 021, `client.rs` 2 806, `approval.rs` 2 546 | regrouper explicitement modèle/état, encodage-X.509, autorité/émission, client, approbation, révocation, transport et WebAuthn ; conserver les invariants dans leurs blocs |
-| `aether` négociation | `key_negotiation.rs` 2 617 | séparer contrats de transcript, validation, messages et matériaux de clé ; laisser QUIC/TLS dans la crate de transport partagée |
-| `helios-key-negotiation` | `src/lib.rs` 2 705 | `types`, `client`, `server`, transport, rate limiting, rollback et erreurs ; garder une seule crate protocolaire |
-| `helios-provisioning` | `certificates.rs` 4 373 | isoler registre, état persistant, staging/commit, promotion/purge et vues de rotation ; l’admission, l’IPAM et la session restent des modules frères |
-| `helios-firewall` | `ruleset.rs` 1 865 | distinguer IR/ruleset, validation, compilation/rendu et adaptation backend ; conserver dry-run/netlink dans la crate |
-| `astra` | `registry.rs` 3 363, `main.rs` 2 491 | séparer transitions/persistance/vues du registre ; découper le binaire par commandes et bootstrap sans créer une crate CLI parallèle |
-| `helios-api` | `internal.rs` 2 255, `certificates.rs` 1 746 | extraire d’abord le canal Astra ; puis organiser routes, projections HTTP, certificats, provisioning et WebSocket par domaine |
-| `heliosd` | `key_negotiation.rs` 4 076, `certificates.rs` 2 681, `main.rs` 2 464 | déplacer le comportement vers ses propriétaires ; dans le binaire, séparer CLI, construction des composants, lifecycle et commandes process |
-| `orion-core` | `certificate_renewal.rs` 2 721, `profile_import.rs` 2 702, `speedtest.rs` 2 190 | séparer planification/exécution/état dans les workflows ; conserver backend, vault, certificats et provisioning comme blocs clients identifiables |
-| `orion` Tauri | `src/main.rs` 3 725 | séparer état applicatif, commandes Tauri, vues/projections, lifecycle, logging et intégrations desktop |
-| outils opérateur | `astra-signer/src/main.rs` 3 991, `helios-ctl/src/main.rs` 1 325 | organiser les commandes par opération et garder les appels de protocole dans les crates propriétaires |
-
-Découpage indicatif des concentrations les plus importantes :
-
-```text
-aether/src/certificates/
-  mod.rs                 surface et composition du sous-système
-  model.rs               types communs et invariants de représentation
-  encoding.rs            encodage, fingerprint et X.509
-  authority.rs           autorité, émission et délégation
-  client.rs              identité et opérations côté client
-  approval.rs            approbations et WebAuthn
-  lifecycle.rs           staging, transitions et fenêtres
-  revocation.rs          révocation et états associés
-  transport.rs           contrats de transport et vues signées
-
-helios-provisioning/src/certificates/
-  mod.rs                 façade du registre
-  registry.rs            ownership et index du registre
-  state.rs               transitions et sérialisation d’état
-  staging.rs             préparation et commit
-  promotion.rs           promotion, purge et rollback
-  rotation.rs            orchestration liée aux certificats
-
-helios-key-negotiation/src/
-  lib.rs                 surface publique
-  types.rs               contrats publics
-  client.rs              session cliente
-  server.rs              endpoint et admission serveur
-  transport.rs           TLS/QUIC et pinning
-  lifecycle.rs           commit, rollback et clôture
-  rate_limit.rs          limites et budgets
-```
-
-Ces noms sont des repères de responsabilité, pas une prescription de déplacer
-chaque type dans un fichier. Avant chaque découpage, il faut établir les
-invariants, réduire les `pub`, conserver les réexports nécessaires et vérifier
-que les tests couvrent les chemins d’échec et d’annulation.
+La section `Internal Module Organization` distingue donc systématiquement
+taille totale, code avant le module de tests, responsabilité réelle et action.
+Elle privilégie les splits par agrégat, commande ou transport concret et
+refuse les arbres génériques `models/services/validators/utils`.
 
 ## 5. Architecture cible proposée
 
@@ -532,13 +475,13 @@ frontières démontrées :
 crates/
   aether/                    contrats partagés et crypto commune
   aether-fido/               FIDO partagé ou abstraction FIDO [renommé]
-  aether-key-negotiation/    protocole v5 Helios/Orion [renommé]
+  aether-key-negotiation/    transport QUIC/TLS v5 partagé [renommé]
   aether-vault/              conteneur AEAD partagé [renommé]
   astra/                     sous-système autorité/certificats
-  helios-astra-channel/      canal privé Astra <-> gateway [nouveau]
+  astra-channel/             canal privé Astra <-> gateway [nouveau]
   helios-api/                API/WS/UI gateway
   helios-escrow/             format et opérations de séquestre [nouveau]
-  helios-firewall/           policy -> IR -> compiler -> backend
+  helios-firewall/           FirewallPolicy -> IR -> backend
   helios-provisioning/       admission, IPAM, session et rotation PSK
   helios-trust/              registre durable des certificats [conditionnel]
   helios-tpm/                TPM, boot et fenêtre d’update [renommé]
@@ -559,7 +502,7 @@ tools/
   xtask/
 ```
 
-`helios-astra-channel` est justifiée par un protocole de processus à processus,
+`astra-channel` est justifiée par un protocole de processus à processus,
 ses bornes TLS/ALPN, deux côtés indépendants et la suppression de
 `astra -> helios-api`. `helios-escrow` est justifiée par une frontière de
 secret opérateur et son absence de dépendance TPM réelle. `helios-trust` reste
@@ -595,21 +538,21 @@ helios-update -> aether
 
 helios-wireguard -> helios-provisioning  [contrat PeerTable/IPAM à stabiliser]
 
-helios-astra-channel -> aether
+astra-channel -> aether
 
 astra
   -> aether
-  -> helios-astra-channel
+  -> astra-channel
 
 astra-operator
   -> aether
   -> aether-fido
   -> aether-vault
-  -> helios-astra-channel       [uniquement si ses contrats y résident]
+  -> astra-channel              [uniquement si ses contrats y résident]
 
 helios-api
   -> aether
-  -> helios-astra-channel
+  -> astra-channel
   -> helios-firewall
   -> helios-provisioning
   -> helios-trust                  [si extraction confirmée]
@@ -631,6 +574,7 @@ orion-core
   -> aether-vault
 
 orion
+  -> aether
   -> orion-core
   -> xtask                       [build seulement]
 
@@ -654,8 +598,8 @@ explicitement partagée, jamais dans une application.
   Tauri, ni du frontend `web`.
 - `heliosd` ne dépend pas de `orion-core`, y compris pour ses tests de package ;
   l’interopérabilité utilise un harnais dédié.
-- `astra` ne dépend pas de `helios-api` ; le canal privé possède son propre
-  propriétaire.
+- `astra` ne dépend ni de `helios-api` ni d’une crate nommée `helios-*` ; le
+  canal privé possède son propre propriétaire neutre.
 - `astra-operator` ne dépend pas de l’implémentation `astra` pour des DTO ou
   des états déjà partagés.
 - `orion-core` ne dépend d’aucun serveur ou shell Helios.
@@ -693,17 +637,16 @@ acceptées ont changé.
 
 ### Phase 1 — corrections sans déplacement
 
-Simplifier le manifest racine avec des patterns, vérifier le périmètre du build
-par défaut et caractériser les features mortes. L’option la plus simple est :
+Simplifier uniquement `members` avec des patterns, vérifier le périmètre du
+build par défaut et caractériser les features mortes :
 
 ```toml
 members = ["crates/*", "tools/*", "apps/orion/src-tauri"]
-default-members = ["crates/*", "tools/*", "apps/orion/src-tauri"]
 ```
 
-Cela inclut aussi `helios-publisher` dans le build par défaut. Si ce coût n’est
-pas accepté, garder un `default-members` explicite mais réduire uniquement la
-liste `members`; dans les deux cas, vérifier que `orion` reste compilé/testé.
+Conserver `default-members` explicite et inchangé afin qu’Orion reste
+compilé/testé par défaut sans ajouter silencieusement `helios-publisher` à ce
+périmètre.
 
 Fichiers : `Cargo.toml`, manifests avec forwarding de features, workflows et
 documentation de build si leurs sélections de packages sont explicites.
@@ -718,7 +661,7 @@ Reclasser les dépendances de `orion-core` vers `helios-fido`,
 partagées dans `aether` lorsque le module est un contrat pur ; sinon renommer
 les packages en `aether-*` ou en noms neutres, sans déplacer les backends
 plateforme dans le socle. Puis extraire les contrats, TLS/ALPN et client/serveur
-du canal privé vers `helios-astra-channel`. Faire consommer cette crate par
+du canal privé vers `astra-channel`. Faire consommer cette crate par
 Astra, `heliosd` et la façade API qui en a besoin. Classifier puis déplacer
 `IssuerDelegationRequest` et les vues d’opération vers leur propriétaire
 canonique. Déplacer le test d’interopérabilité hors de la dépendance dev de
@@ -754,12 +697,15 @@ tests matériels conditionnels sur les cibles décrites dans
 ### Phase 4 — découpage interne par blocs fonctionnels
 
 Traiter une crate à la fois, en commençant par les fichiers où plusieurs
-workflows indépendants partagent un même état ou une même façade. Le premier
-lot recommandé est `helios-key-negotiation`, puis
-`helios-provisioning::certificates`, `helios-firewall::ruleset`, Aether
-certificats, `helios-api` et `orion-core`. Chaque déplacement de fichier doit
-conserver les noms de types, la sérialisation et la surface publique, sauf
-réduction de visibilité explicitement vérifiée.
+workflows indépendants partagent un même état ou une même façade. Commencer par
+les déplacements de tests qui clarifient la mesure sans toucher aux invariants
+(`helios-provisioning::certificates`, `astra::registry`, ruleset firewall), une
+crate à la fois. Traiter ensuite les seams de production démontrés : transport
+de négociation, identité/transactions de `heliosd`, moteurs speedtest et
+formats d’import Orion. Les contrats Aether viennent après, avec des golden
+files inchangés. Chaque déplacement doit conserver noms de types,
+sérialisation et surface publique, sauf réduction de visibilité explicitement
+vérifiée.
 
 Les tests suivent le déplacement : tests de validation avec la validation,
 tests de transitions avec la machine à états, tests de protocole dans les
@@ -914,6 +860,12 @@ workflows indépendants dans le même fichier sont en revanche un signal de
 découpage. Aucun dossier ou fichier ne doit être créé sans responsabilité
 identifiable.
 
+Les tailles du tableau sont totales. Lorsqu’un fichier termine par un module
+de tests inline, la colonne distingue approximativement les lignes avant ce
+module et sa suite de tests. Cette mesure ne remplace pas une analyse de
+cohésion, mais évite de prendre un corpus de régression volumineux pour une
+implémentation monolithique.
+
 ### Inventaire actuel des arbres `src/`
 
 Cet inventaire reprend les fichiers Rust réellement présents au moment de
@@ -993,42 +945,42 @@ pas une crate runtime supplémentaire.
 
 ### Tableau de synthèse
 
-| Crate | Fichier | Taille | Responsabilités détectées | Problème | Action | Priorité |
+| Crate | Fichier | Taille totale (avant tests + tests) | Responsabilités détectées | Problème | Action | Priorité |
 | --- | --- | ---: | --- | --- | --- | --- |
-| `aether` | `src/certificates/state.rs` | 3 353 | état, transitions, persistance et invariants certificats | plusieurs transitions et représentations dans un même bloc | `SPLIT` | haute |
-| `aether` | `src/certificates/status.rs` | 3 021 | phases, statuts, projections et règles de validité | modèle et projections difficiles à distinguer | `SPLIT` | haute |
-| `aether` | `src/certificates/client.rs` | 2 806 | identité client, certificats, validation et opérations | capacité client trop concentrée | `SPLIT` | moyenne |
-| `aether` | `src/certificates/approval.rs` | 2 546 | approbation, WebAuthn, signatures et états | workflow d’approbation mêlé à ses contrats | `SPLIT` | moyenne |
-| `aether` | `src/key_negotiation.rs` | 2 617 | transcript, matériaux de clé, messages et validation | contrat partagé trop monolithique | `SPLIT` | haute |
-| `astra` | `src/registry.rs` | 3 363 | état du registre, index, transitions et vues | plusieurs responsabilités métier dans un fichier | `SPLIT` | haute |
-| `astra` | `src/main.rs` | 2 491 | CLI, bootstrap, canaux, commandes et lifecycle | binaire trop chargé en orchestration métier | `SPLIT` | haute |
-| `astra-operator` | `src/authority.rs` | 1 733 | contrats opérateur, délégation, limites et validation | contrats et workflow opérateur entremêlés | `SPLIT` | moyenne |
-| `astra-operator` | `src/vault.rs` | 1 622 | slots, credentials, ouverture et opérations de coffre | plusieurs workflows dans une capacité dense | `SPLIT` | moyenne |
-| `helio-tpm` | `src/boot_controller.rs` | 884 | décisions de boot, accès TPM et état de démarrage | cohésion acceptable ; backend à isoler | `KEEP` | basse |
-| `helio-tpm` | `src/tpm_real.rs` | 777 | adaptation `tss-esapi` et opérations TPM réelles | backend externe à isoler du contrat | `MOVE` | moyenne |
+| `aether` | `src/certificates/state.rs` | 3 353 (2 078 + 1 275) | agrégats gateway/client/Astra, transitions et ledger de confiance | plusieurs agrégats bornés partagent un fichier ; aucune I/O de persistance | `SPLIT` | moyenne |
+| `aether` | `src/certificates/status.rs` | 3 021 (1 465 + 1 556) | statut certificat, campagnes, échanges signer et rollback | plusieurs familles de contrats wire distinctes | `SPLIT` | haute |
+| `aether` | `src/certificates/client.rs` | 2 806 (1 870 + 936) | rotation, staging, commit et recovery client | plusieurs étapes du lifecycle client, fortement liées | `SPLIT` | moyenne |
+| `aether` | `src/certificates/approval.rs` | 2 546 (1 540 + 1 006) | policy, credentials et preuves d’approbation | trois capacités de contrat identifiables | `SPLIT` | moyenne |
+| `aether` | `src/key_negotiation.rs` | 2 617 (1 523 + 1 094) | messages v5, authentification, dérivation et validation | wire types et opérations crypto réunis | `SPLIT` | haute |
+| `astra` | `src/registry.rs` | 3 363 (1 488 + 1 875) | registre autoritatif, audit, transitions et persistance | majorité de tests ; conserver les mutations atomiques ensemble | `SPLIT` | moyenne |
+| `astra` | `src/main.rs` | 2 491 (sans module de tests inline) | CLI, bootstrap, canaux, commandes et lifecycle | composition root trop chargé | `SPLIT` | haute |
+| `astra-operator` | `src/authority.rs` | 1 733 (sans module de tests inline) | gestes de signature de l’autorité | fichier long mais cohérent ; nom actuel peu précis | `RENAME` | basse |
+| `astra-operator` | `src/vault.rs` | 1 622 (994 + 628) | slots, ouverture et opérations du coffre | capacité cohérente, corpus de tests important | `KEEP` | basse |
+| `helio-tpm` | `src/boot_controller.rs` | 884 | décisions de boot et état de démarrage | machine de décision cohérente | `KEEP` | basse |
+| `helio-tpm` | `src/tpm_real.rs` | 777 | adaptation `tss-esapi` | backend externe clairement identifiable | `MOVE` | moyenne |
 | `helio-tpm` | `src/escrow.rs` | 344 | HESC, X25519/AEAD et séquestre opérateur | responsabilité sans dépendance TPM | `MOVE` | haute |
-| `helios-api` | `src/internal.rs` | 2 255 | canal Astra, TLS/ALPN, client/serveur et vues privées | transport et contrats privés, reverse dependency | `MOVE` | très haute |
-| `helios-api` | `src/certificates.rs` | 1 746 | routes, vues, validation et opérations certificats | façade API et logique métier mélangées | `SPLIT` | haute |
-| `helios-api` | `src/routes.rs` | 1 105 | routes HTTP, extraction, réponses et dispatch | plusieurs domaines dans un routeur unique | `SPLIT` | moyenne |
-| `helios-fido` | `src/authenticator.rs` | 1 032 | CTAP HID, authenticator, capacités et erreurs | contrat et adaptation matérielle à préciser | `SPLIT` | moyenne |
-| `helios-firewall` | `src/ruleset.rs` | 1 865 | IR, validation, compilation, rendu et policy | cœur firewall trop concentré | `SPLIT` | haute |
-| `helios-key-negotiation` | `src/lib.rs` | 2 705 | messages, QUIC, TLS, sessions, rate limit et rollback | protocole, transport et lifecycle entremêlés | `SPLIT` | très haute |
-| `helios-provisioning` | `src/certificates.rs` | 4 373 | registre, staging, commit, purge, rotation et état | registre durable trop concentré | `SPLIT` | très haute |
-| `helios-update` | `src/lib.rs` | 833 | layout, état, vérification, activation et filesystem | orchestration et I/O mélangées | `SPLIT` | moyenne |
-| `helios-vault` | `src/lib.rs` | 1 128 | HVLT, KDF, seal/open, parsing et fichiers | format crypto et I/O réunis | `SPLIT` | moyenne |
-| `helios-wireguard` | `src/lib.rs` | 261 | types interface/peer, routing et trait backend | petite surface cohérente | `KEEP` | basse |
-| `heliosd` | `src/main.rs` | 2 464 | CLI, bootstrap, commandes et lifecycle process | composition root et implémentation mélangés | `SPLIT` | très haute |
-| `heliosd` | `src/key_negotiation.rs` | 4 076 | admission, installation PSK, handshake et rollback | orchestration gateway trop volumineuse | `SPLIT` | très haute |
-| `heliosd` | `src/certificates.rs` | 2 681 | préparation, installation et inspection certificats | plusieurs workflows réunis | `SPLIT` | haute |
-| `heliosd` | `src/orchestrator.rs` | 1 912 | coordination composants, événements et lifecycle | service process et détails composants mélangés | `MOVE` | très haute |
-| `orion-core` | `src/certificate_renewal.rs` | 2 721 | planification, transport, état et progression | workflow client trop dense | `SPLIT` | haute |
-| `orion-core` | `src/profile_import.rs` | 2 702 | parsing, validation, migration et installation profil | entrée utilisateur et système mélangés | `SPLIT` | haute |
-| `orion-core` | `src/speedtest.rs` | 2 190 | protocole, mesure, agrégation et reporting | transport et présentation réunis | `SPLIT` | moyenne |
-| `orion-core` | `src/backend/mod.rs` | 1 620 | abstraction VPN, plateforme, routes et événements | façade et backend système trop proches | `SPLIT` | haute |
-| `orion` Tauri | `src/main.rs` | 3 725 | état UI, commandes, certificats, profils, logs et lifecycle | shell Tauri utilisé comme service | `SPLIT` | très haute |
-| `astra-signer` | `src/main.rs` | 3 991 | commandes, cérémonies, vault, signatures et transport | outil monolithique par opérations | `SPLIT` | moyenne |
-| `helios-ctl` | `src/main.rs` | 1 325 | parsing CLI, affichage, WebSocket et vues | composition et présentation mélangées | `SPLIT` | moyenne |
-| `xtask` | `src/main.rs` | 946 | build, packaging, téléchargement et installation | workflows de build indépendants | `SPLIT` | basse |
+| `helios-api` | `src/internal.rs` | 2 255 (1 666 + 589) | canal Astra, TLS/ALPN, clients, serveur et contrats privés | reverse dependency et frontière protocolaire autonome | `MOVE` | très haute |
+| `helios-api` | `src/certificates.rs` | 1 746 (1 221 + 525) | vues HTTP, traits handlers et routes certificat | plusieurs capacités API, pas logique de registre | `SPLIT` | haute |
+| `helios-api` | `src/routes.rs` | 1 105 (847 + 258) | DTO et routes status/network/peer/firewall/trust | plusieurs ressources HTTP indépendantes | `SPLIT` | moyenne |
+| `helios-fido` | `src/authenticator.rs` | 1 032 (925 + 107) | contrat Authenticator et backends CTAP/plateforme | frontière matériel cohérente, WebAuthn déjà séparé | `KEEP` | basse |
+| `helios-firewall` | `src/ruleset.rs` | 1 865 (987 + 878) | IR structurée et compilation d’une policy en ruleset | production cohérente ; près de la moitié du fichier est du test | `KEEP` | basse |
+| `helios-key-negotiation` | `src/lib.rs` | 2 705 (1 688 + 1 017) | QUIC/TLS, serveur/client, limites, transaction et rollback | transport et lifecycle ont des seams réels | `SPLIT` | haute |
+| `helios-provisioning` | `src/certificates.rs` | 4 373 (1 688 + 2 685) | registre gateway atomique et tests de toutes ses transitions | tests majoritaires ; ne pas disperser le sérialiseur des mutations | `SPLIT` | haute |
+| `helios-update` | `src/lib.rs` | 833 (657 + 176) | store, vérification, staging et activation atomique | capacité compacte et cohérente | `KEEP` | basse |
+| `helios-vault` | `src/lib.rs` | 1 128 (578 + 550) | format HVLT, KDF, seal/open et lecture bornée | format et crypto étroitement liés ; moitié de tests | `KEEP` | basse |
+| `helios-wireguard` | `src/lib.rs` | 261 | types interface/peer et trait backend | petite surface cohérente | `KEEP` | basse |
+| `heliosd` | `src/main.rs` | 2 464 (2 129 + 335) | CLI, bootstrap, commandes et lifecycle process | composition root et implémentation mélangés | `SPLIT` | très haute |
+| `heliosd` | `src/key_negotiation.rs` | 4 076 (2 614 + 1 462) | transactions PSK et identité de service négociation | deux capacités de sécurité distinctes dans un fichier | `SPLIT` | très haute |
+| `heliosd` | `src/certificates.rs` | 2 681 (1 593 + 1 088) | service gateway, admission, canal Astra et projections API | plusieurs adaptateurs autour du registre | `SPLIT` | haute |
+| `heliosd` | `src/orchestrator.rs` | 1 912 (1 415 + 497) | data plane, commandes, reload, télémétrie, probes et lifecycle | plusieurs boucles/runtime sans propriétaire local clair | `SPLIT` | très haute |
+| `orion-core` | `src/certificate_renewal.rs` | 2 721 (1 672 + 1 049) | trust store local et session HTTP de renewal | persistance locale et protocole client séparables | `SPLIT` | haute |
+| `orion-core` | `src/profile_import.rs` | 2 702 (1 283 + 1 419) | JSON Orion, wg-quick, validation et complétion | tests majoritaires ; seams naturels par format | `SPLIT` | moyenne |
+| `orion-core` | `src/speedtest.rs` | 2 190 (1 727 + 463) | moteurs HTTP, TCP brut, UDP brut et métriques | transports indépendants réunis | `SPLIT` | haute |
+| `orion-core` | `src/backend/mod.rs` | 1 620 (1 019 + 601) | contrat backend et contrôleur VPN | façade publique et orchestration client réunies | `SPLIT` | moyenne |
+| `orion` Tauri | `src/main.rs` | 3 725 (3 088 + 637) | état UI, commandes, certificats, profils, logs et lifecycle | shell Tauri utilisé comme service applicatif | `SPLIT` | très haute |
+| `astra-signer` | `src/main.rs` | 3 991 (3 931 + 60) | commandes, cérémonies, vault, signatures et transport | vrai monolithe de binaire | `SPLIT` | haute |
+| `helios-ctl` | `src/main.rs` | 1 325 (1 131 + 194) | dispatch CLI, affichage et suivi WebSocket | commandes métier déjà en modules ; extraire seulement le monitoring | `SPLIT` | basse |
+| `xtask` | `src/main.rs` | 946 (624 + 322) | dispatch build/package et tests | taille de production modérée, support déjà séparé | `KEEP` | basse |
 | `helios-astra-helper` | `src/main.rs` | 627 | protocole interactif et composition helper | cohésion acceptable avec modules voisins | `KEEP` | basse |
 | `helios-publisher` | `src/main.rs` | 570 | CLI release, validation et signature | outil cohérent | `KEEP` | basse |
 | `helios-installer` | `src/main.rs` | 422 | installation, activation et rollback | workflow privilégié cohérent | `KEEP` | basse |
@@ -1048,19 +1000,45 @@ crates/aether/src/
   lib.rs
   certificates/
     mod.rs
-    model.rs                 types communs et invariants
     encoding.rs              encodage, fingerprint et X.509
+    x509.rs
+    capability.rs
+    window.rs
     authority.rs             autorité, émission et délégation
-    client.rs                identité et opérations client
-    approval.rs              approbation et WebAuthn
-    lifecycle.rs             staging, transitions et fenêtres
+    client/
+      mod.rs
+      rotation.rs
+      staging.rs
+      recovery.rs
+    approval/
+      mod.rs
+      policy.rs
+      credentials.rs
+      renewal.rs
+      recovery.rs
+    state/
+      mod.rs
+      gateway.rs
+      client.rs
+      astra.rs
+      ledger.rs
+    status/
+      mod.rs
+      certificate.rs
+      campaign.rs
+      signer_exchange.rs
+      rollback.rs
     revocation.rs            révocation et états associés
     transport.rs             contrats de transport et vues signées
-    status.rs                projections de validité et statuts
+    gateway.rs
+    operator_ipc.rs
+    operator_session.rs
+    webauthn.rs
   key_negotiation/
     mod.rs
-    transcript.rs            contrats de transcript et messages
-    material.rs              matériaux de clé et validation
+    messages.rs              wire types v5
+    authentication.rs        bytes canoniques et signatures
+    derivation.rs            dérivation et commitments PSK
   config.rs
   enroll.rs
   events.rs
@@ -1073,26 +1051,35 @@ crates/aether/src/
   wg.rs
 ```
 
-`lib.rs` doit conserver les modules publics et les réexports canoniques. Les
-helpers d’encodage, de validation et les fixtures restent privés ou
-`pub(crate)`. Les tests de transitions restent avec leurs modules ; les golden
-files et vecteurs de sérialisation restent dans des tests d’intégration Aether.
+Les dossiers proposés correspondent à des familles déjà visibles dans les
+types, pas à des couches génériques. Le split de `state.rs` doit conserver les
+opérations du `TrustLedger` et chaque agrégat borné dans un même fichier ; il
+ne doit pas séparer données et transitions. `lib.rs` conserve les modules
+publics et les réexports canoniques. Les helpers et fixtures restent privés ou
+`pub(crate)`. Les tests peuvent suivre les sous-modules, tandis que les golden
+files et vecteurs restent des tests d’intégration Aether.
 
 #### Astra et opérateur
 
-`registry.rs` doit colocaliser état, transitions et persistance sans confondre
-les vues de lecture avec les mutations. Le binaire Astra conserve les
-commandes, mais les workflows métier restent dans la crate.
+`registry.rs` est moins monolithique que sa taille brute ne le suggère :
+1 875 de ses 3 363 lignes appartiennent à son corpus de tests. Les mutations,
+l’audit et la persistance forment une transaction autoritative et doivent
+rester ensemble dans un premier temps. La première séparation concerne les
+tests par comportement et le `ChallengeStore`, puis seulement les commandes du
+binaire Astra.
 
 ```text
 crates/astra/src/
   lib.rs
+  registry.rs                état, mutations atomiques, audit et persistance
   registry/
-    mod.rs
-    state.rs
-    transitions.rs
-    persistence.rs
-    queries.rs
+    challenge.rs
+    tests/
+      mod.rs
+      peers.rs
+      rotations.rs
+      trust_updates.rs
+      migration.rs
   issuer.rs
   distribution.rs
   operations.rs
@@ -1100,20 +1087,21 @@ crates/astra/src/
   reconciliation.rs
   recovery.rs
   service.rs
-  channel.rs                 après extraction du canal privé
+  main.rs                    composition process
+  cli.rs
+  commands/
+    mod.rs
+    bootstrap.rs
+    campaign.rs
+    chain.rs
+    gateway_identity.rs
+    issuer.rs
+    revocation.rs
 
 crates/astra-operator/src/
   lib.rs
-  authority/
-    mod.rs
-    contracts.rs
-    delegation.rs
-    validation.rs
-  campaign/
-    mod.rs
-    planning.rs
-    execution.rs
-    state.rs
+  signing.rs                 renommage de authority.rs : gestes CA-PQ/CA-TLS
+  campaign.rs
   credentials.rs
   documents.rs
   gestures.rs
@@ -1126,56 +1114,48 @@ crates/astra-operator/src/
   prepared.rs
   store.rs
   tunnel.rs
-  vault/
-    mod.rs
-    slots.rs
-    operations.rs
+  vault.rs
 ```
 
-Les tests de campagne, de coffre et de transport suivent leurs dossiers. Les
-tests de bout en bout de l’autorité restent sous `crates/astra/tests/`.
+`authority.rs` ne doit pas être éclaté par couches techniques : sa cohésion est
+la séquence des gestes qui utilisent les ancres. Le nom `signing.rs` décrit
+mieux cette responsabilité. Les tests de campagne, de coffre et de transport
+restent avec leurs modules ; les tests de bout en bout de l’autorité restent
+sous `crates/astra/tests/`.
 
 #### Firewall et WireGuard
 
-`helios-firewall` constitue déjà une bonne frontière Cargo. Son `ruleset.rs`
-doit cependant distinguer policy/IR, validation, compilation et application.
-Le trait `FirewallBackend` reste la frontière d’exécution.
+`helios-firewall` constitue déjà une bonne frontière Cargo. Créer une
+hiérarchie `policy/model/validation/compiler` serait excessif : la policy
+canonique appartient à Aether, et les 987 lignes de production de
+`ruleset.rs` forment un compilateur cohérent vers une IR structurée. Le gain
+immédiat est de sortir son important corpus de tests et de regrouper les
+backends, sans casser l’atomicité du ruleset. Le trait `FirewallBackend` reste
+la frontière d’exécution.
 
 ```text
 crates/helios-firewall/src/
   lib.rs
-  policy/
-    mod.rs
-    model.rs
-    validation.rs
-  compiler/
-    mod.rs
-    ir.rs
-    compile.rs
-    render.rs
+  ruleset.rs                 IR et compilation depuis FirewallPolicy
+  ruleset/
+    tests.rs
   backend/
     mod.rs
-    nftables.rs              application atomique du ruleset
-    netlink.rs
+    netlink.rs               adaptation rustables/libnftables
     dryrun.rs
 
 crates/helios-wireguard/src/
   lib.rs
-  interface.rs               configuration d’interface
-  peer.rs                    configuration et observation peer
-  routing.rs                 PeerAddressTable et routage
-  lifecycle.rs               installation, retrait et états
   backend/
     mod.rs
     kernel.rs
     dryrun.rs
 ```
 
-Le fichier `helios-wireguard/src/lib.rs` reste `KEEP` tant que ses types
-interface/peer/routing restent cohérents. L’arbre ci-dessus est une réserve
-d’évolution, non un découpage obligatoire immédiat. Les tests policy/IR restent
-indépendants de Linux ; les tests Netlink, nftables, noyau et dry-run sont
-séparés et conditionnés.
+Le fichier `helios-wireguard/src/lib.rs` reste `KEEP` : ses 261 lignes forment
+une petite surface publique de types et trait backend. Seul le rangement
+physique des backends est proposé. Les tests de ruleset restent indépendants
+de Linux ; les tests Netlink, noyau et dry-run sont séparés et conditionnés.
 
 #### TPM, escrow, FIDO, vault et update
 
@@ -1199,39 +1179,29 @@ crates/helios-tpm/src/
   settings.rs
 
 crates/helios-escrow/src/
-  lib.rs
-  format.rs                  HESC et encodage borné
-  crypto.rs                  X25519/AEAD et dérivation
-  envelope.rs                lecture/écriture de l’enveloppe
+  lib.rs                     HESC, X25519/AEAD et enveloppe ; 344 lignes
 
 crates/aether-fido/src/
   lib.rs
-  authenticator/
-    mod.rs
-    transport.rs              CTAP HID
-    capabilities.rs
-    webauthn.rs
-  approval.rs
+  authenticator.rs           contrat et backend CTAP HID
+  authenticator/webauthn.rs  backend Windows WebAuthn
 
 crates/aether-vault/src/
-  lib.rs
-  format.rs                  HVLT, parsing et bornes
-  crypto.rs                  KDF, seal/open
-  file.rs                    lecture fichier bornée
+  lib.rs                     HVLT, KDF, seal/open et lecture bornée
 
 crates/helios-update/src/
   lib.rs
   bundle.rs
-  verification.rs
-  layout.rs
-  activation.rs
-  storage.rs
 ```
 
-Le nom `aether-fido` reste conditionnel : si CTAP HID est uniquement un
-backend de plateforme, il faut plutôt un contrat partagé minimal et des
-adaptateurs dans les consommateurs. Dans les deux cas, Orion ne dépend pas
-d’un package `helios-fido`.
+Ne pas créer de splits `format.rs`/`crypto.rs`/`file.rs` pour escrow et vault :
+ils produiraient de petits fichiers tout en séparant les invariants du format
+de leur authentification. Même conclusion pour `helios-update`, dont les 657
+lignes de production forment un workflow atomique cohérent. Le nom
+`aether-fido` reste conditionnel : si CTAP HID est
+seulement un backend de plateforme, il faut un nom neutre de capacité plutôt
+que faire croire qu’Aether possède l’adaptateur. Dans tous les cas, Orion ne
+dépend pas d’un package `helios-fido`.
 
 #### API et provisioning
 
@@ -1254,11 +1224,11 @@ crates/helios-api/src/
   certificates/
     mod.rs
     views.rs
-    commands.rs
-  provision/
-    mod.rs
-    requests.rs
-    responses.rs
+    gateway_identity.rs
+    renewal.rs
+    trust_update.rs
+    operator_relay.rs
+  provision.rs
   key_negotiation.rs
   speedtest.rs
   update.rs
@@ -1270,19 +1240,23 @@ crates/helios-provisioning/src/
   ipam.rs
   session.rs
   rotation.rs
-  certificates/
+  certificates.rs             registre et sérialiseur des mutations
+  certificates/tests/
     mod.rs
-    registry.rs
-    state.rs
+    fixtures.rs
     staging.rs
-    promotion.rs
+    distribution.rs
+    trust_transitions.rs
     persistence.rs
 ```
 
-Le registre de certificats reste une machine à états cohérente, mais ses
-étapes de staging, commit, promotion et purge doivent être navigables sans
-parcourir 4 373 lignes. L’extraction vers `helios-trust` reste une décision de
-crate séparée ; le premier travail est ce découpage interne.
+Le registre de certificats reste une machine à états cohérente. Ses 1 688
+lignes de production partagent volontairement un seul sérialiseur : staging,
+commit, promotion et purge calculent un état candidat, le persistent, puis
+l’adoptent. Les disperser par opération affaiblirait la lecture de cet
+invariant. Le premier découpage porte donc sur les 2 685 lignes de tests,
+classées par comportement. L’extraction vers `helios-trust` reste une décision
+de crate séparée.
 
 #### Négociation
 
@@ -1292,23 +1266,25 @@ unique doit distinguer contrat, transport, session et lifecycle.
 ```text
 crates/aether-key-negotiation/src/      après renommage éventuel
   lib.rs
-  types.rs
-  transcript.rs
-  validation.rs
-  material.rs
-  client.rs
-  server.rs
-  transport.rs
-  lifecycle.rs
+  tls.rs                     identités, pinning et configurations rustls
+  endpoint.rs                endpoints QUIC et paramètres transport
+  server.rs                  transaction servie et limites publiques
+  client.rs                  ClientSession et PendingChallenge
+  transaction.rs             deadline, commit et rollback cancellation-safe
   rate_limit.rs
-  error.rs
+  tests/
+    mod.rs
+    interop.rs
+    rollback.rs
 ```
 
-Les messages et règles de validation restent indépendants de QUIC autant que
-possible. Le transport porte TLS/QUIC, pinning et limites réseau. Le lifecycle
-porte commit, handshake observé, clôture et rollback. Les tests de messages
-restent sans réseau ; les tests de transport et d’interopérabilité sont
-distincts.
+Les messages v5, signatures et dérivations restent dans Aether : la crate
+actuelle les importe déjà depuis `aether::key_negotiation`. Il ne faut donc pas
+recréer ici des fichiers `types`, `validation`, `material` ou `error` qui
+dupliqueraient cette ownership. La crate de transport porte TLS/QUIC, client,
+serveur, limites réseau et rollback. Les erreurs restent près du bloc qui les
+produit. Les tests d’interopérabilité et d’annulation sont séparés lorsque cela
+ne nécessite plus la dépendance dev `heliosd -> orion-core`.
 
 #### `heliosd`
 
@@ -1319,35 +1295,55 @@ d’arrêt.
 
 ```text
 crates/heliosd/src/
-  main.rs                     parse CLI, démarrer et arrêter
-  cli/
+  main.rs                     dispatch et lancement du process
+  cli.rs                      types clap
+  commands/
     mod.rs
-    commands.rs
-    arguments.rs
-  bootstrap.rs                configuration et préflight
-  lifecycle.rs                signaux, shutdown et fail-closed
-  gateway/
-    mod.rs
+    tpm.rs
     identity.rs
-    certificates.rs
-    rotation.rs
-    static_psk.rs
-  negotiation/
+    trust.rs
+    peer.rs
+  bootstrap.rs               configuration, préflight et construction
+  key_negotiation/
     mod.rs
-    admission.rs
-    installation.rs
-    observation.rs
-  network/
+    transaction.rs            ownership PSK, handshake, commit et rollback
+    identity.rs               identité TLS/PQ servie et stockage scellé
+    server.rs                 endpoint et reclaimer
+    tests/
+      mod.rs
+      transaction.rs
+      identity.rs
+      interop.rs
+  certificates/
     mod.rs
-    uplink.rs
-    vip_routing.rs
+    service.rs                orchestration autour du registre
+    admission.rs              inbox et première génération
+    astra.rs                  adaptation du canal privé
+    views.rs                  projections API sans secrets
+  orchestrator/
+    mod.rs
+    data_plane.rs             WireGuard, firewall et kill-switch
+    commands.rs               commandes de l’orchestrateur
+    reload.rs                 hot reload de network.toml
+    observation.rs            handshakes et transitions peers
+    probes.rs                 captive portal et MTU
+    telemetry.rs
+  gateway_key.rs
+  gateway_rotation.rs
+  static_psk.rs
+  uplink.rs
+  vip_routing.rs
   astra_channel.rs
 ```
 
 `main.rs` ne doit pas parser des certificats, ouvrir le vault, configurer
-WireGuard ou compiler le firewall. `orchestrator.rs` est candidat à un
-déplacement vers le lifecycle et les propriétaires fonctionnels. Un runtime
-réutilisable ne sera créé que si un second hôte existe.
+WireGuard ou compiler le firewall. Le split de `key_negotiation.rs` suit ses
+deux responsabilités observées — transaction PSK et identité servie — plutôt
+que des couches abstraites admission/installation/observation. Celui de
+`orchestrator.rs` suit les boucles réellement présentes : data plane,
+commandes, reload, observation, probes et télémétrie. Ces modules restent dans
+`heliosd` tant qu’un propriétaire de sous-système ou un second runtime n’est
+pas démontré.
 
 #### `orion-core` et Tauri
 
@@ -1359,49 +1355,48 @@ serveur ni de Tauri.
 crates/orion-core/src/
   lib.rs
   backend/
-    mod.rs
-    controller.rs
-    platform.rs
+    mod.rs                     VpnBackend et sélection du backend
+    controller.rs              VpnController et lifecycle client
     wireguard.rs
-    routing.rs
+    dryrun.rs
   certificates/
     mod.rs
     inventory.rs
     actions.rs
-    renewal/
-      mod.rs
-      planning.rs
-      execution.rs
-      progress.rs
+    renewal.rs                 protocole et session de renouvellement
+    trust_store.rs             seed, promotion et rollback locaux
     recovery.rs
-  config/
-    mod.rs
-    profile.rs
-    persistence.rs
-    validation.rs
-  identity_store/
-    mod.rs
-    identities.rs
-    protected_volume.rs
-  provisioning/
-    mod.rs
-    protocol.rs
-    validation.rs
-    service.rs
+    approval.rs
+  config.rs
+  identity_store.rs
+  provisioning.rs
   profile_import/
     mod.rs
-    parsing.rs
+    json.rs
+    wg_quick.rs
     validation.rs
-    installation.rs
   vault/
     mod.rs
+    codec.rs
+    keys.rs
+    manifest.rs
+    passphrase.rs
+    registry.rs
+    settings.rs
     store.rs
-    state.rs
+    windows/
+      mod.rs
+      bitlocker.rs
+      dpapi.rs
+      dumps.rs
+      prompt.rs
+      tpm.rs
   speedtest/
     mod.rs
-    transport.rs
-    measurement.rs
-    reporting.rs
+    http.rs
+    raw_tcp.rs
+    raw_udp.rs
+    metrics.rs
   telemetry.rs
   events.rs
 
@@ -1426,9 +1421,12 @@ apps/orion/src-tauri/src/
   operator.rs
 ```
 
-Les commandes Tauri valident l’entrée, appellent `orion-core` et convertissent
-le résultat en projection UI. Les backends Windows, Wintun, DPAPI, CNG et
-routage restent derrière l’abstraction backend. Les tests de workflow client
+Les splits suivent les seams observés : trust store versus session HTTP pour
+le renouvellement, JSON versus `wg-quick` pour l’import, HTTP versus TCP/UDP
+bruts pour le speedtest, et contrôleur versus backend WireGuard. La structure
+`vault/` existante est conservée : elle est déjà organisée par capacité et par
+plateforme. Les commandes Tauri valident l’entrée, appellent `orion-core` et
+convertissent le résultat en projection UI. Les tests de workflow client
 restent dans `orion-core` ; les tests Tauri couvrent l’adaptation de commande,
 d’état et d’événement.
 
@@ -1443,39 +1441,41 @@ tools/astra-signer/src/
   main.rs
   commands/
     mod.rs
-    authority.rs
-    campaign.rs
-    certificate.rs
+    vault.rs                  init, enrol, verify, list, remove
+    issuer.rs                 émission CA-TLS et délégation
+    campaign.rs               approbation et dépôt de résultats
+    gateway_identity.rs       bootstrap, transition, abort et rollback
     recovery.rs
-    rotation.rs
-  ceremonies.rs
-  input.rs
-  output.rs
+    ca_rotation.rs
 
 tools/helios-ctl/src/
-  main.rs                     CLI et dispatch uniquement
-  api.rs                      transport API et DTO locaux
-  commands/
-    mod.rs
-    enroll.rs
-    peer.rs
-    profile.rs
-    campaign.rs
-    update.rs
-    escrow.rs
+  main.rs                     CLI, dispatch et rendu court
+  monitor.rs                  suivi WebSocket et rendu des événements
+  api.rs
+  app_update.rs
+  campaign.rs
+  campaign_key_negotiation.rs
+  enroll.rs
+  escrow.rs
+  files.rs
   key_negotiation.rs
+  peer.rs
+  profile.rs
+  update.rs
 
 tools/xtask/src/
-  main.rs                     dispatch
+  main.rs
   orion_deps.rs
   orion_helper.rs
-  commands/
-    mod.rs
-    build.rs
-    bundle.rs
-    package.rs
-    installer.rs
 ```
+
+`astra-signer` est le seul de ces outils où le split de production est
+prioritaire : 3 931 lignes couvrent plusieurs cérémonies distinctes. Le nom de
+chaque fichier cible correspond à une commande ou une famille de décisions de
+sécurité. `helios-ctl` conserve ses modules actuels et extrait seulement le
+monitoring encore présent dans `main.rs`; les abréviations `key_nego` sont
+renommées pour rendre la navigation explicite. `xtask` reste inchangé tant que
+ses 624 lignes de production restent un dispatch cohérent.
 
 Les tests inline restent adaptés aux invariants locaux. Les tests de protocole,
 interopérabilité, persistance et backend peuvent être séparés en fichiers
@@ -1485,7 +1485,23 @@ explicitement conditionnés et documentés selon `docs/testing/TESTING.md`.
 
 ### Visibilité et API à contrôler
 
-Chaque découpage doit inclure une passe de visibilité :
+La visibilité n’est pas uniformément mauvaise. Les constats précis sont :
+
+| Crate | Surface observée | Recommandation |
+| --- | --- | --- |
+| `aether` | nombreux modules publics et réexports racine de contrats | conserver les contrats canoniques ; rendre privés les helpers issus des splits sans ajouter de nouveaux réexports globaux |
+| `astra` | modules métier publics utilisés par son binaire et l’opérateur | retirer d’abord la dépendance `astra-operator -> astra` pour les DTO, puis réduire seulement les modules sans consommateur |
+| `astra-operator` | réexport de `helios_fido::authenticator` et de contrats Astra | faire dépendre les consommateurs du propriétaire réel ; ne pas utiliser la façade opérateur pour masquer deux autres crates |
+| `helio-tpm` | backend et stockage principalement privés, API racine explicite | conserver ce modèle ; l’extraction d’escrow retire son seul module public hors TPM |
+| `helios-api` | `pub mod internal` expose canal, TLS, clients et contrats à Astra | supprimer ce module public après extraction vers `astra-channel` |
+| `helios-firewall` | backend privé, types utiles réexportés à la racine | surface correcte ; les futurs sous-modules de backend restent privés |
+| `helios-key-negotiation` | API publique directement dans `lib.rs` | garder les futurs modules privés et réexporter uniquement endpoints, sessions et traits réellement consommés |
+| `helios-provisioning` | modules domaine publics, réexports partiels à la racine | conserver `certificates` nommé tant que son registre est consommé comme sous-système ; éviter un deuxième chemin réexporté pour chaque type |
+| `helios-vault` / `helios-update` / `helios-wireguard` | surfaces racine compactes | pas de réduction motivée par la taille |
+| `orion-core` | nombreux `pub mod` et réexports racine utilisés par Tauri/outils | définir la façade client attendue, migrer les consommateurs, puis rendre privés les modules de workflow et backends concrets |
+| binaires et outils | modules privés par défaut | conserver ; les splits de `main.rs` ne nécessitent aucun `pub` externe |
+
+Chaque découpage retenu inclut ensuite une passe de visibilité :
 
 - supprimer les `pub mod` utilisés uniquement par des consommateurs internes ;
 - préférer `mod` ou `pub(crate)` lorsque le contrat ne sort pas de la crate ;
@@ -1504,22 +1520,22 @@ techniques génériques.
 ## Recommended first migration
 
 La plus petite modification au meilleur rapport bénéfice/risque est une
-correction du workspace Cargo, sans déplacement de code : remplacer les listes
-explicites de `members` et `default-members` par des patterns équivalents et
-conserver Orion/Tauri dans le build par défaut.
-
-La version la plus simple inclut `helios-publisher` dans le build par défaut :
+clarification du workspace Cargo, sans déplacement de code : remplacer
+uniquement `members` par les patterns couvrant les emplacements canoniques,
+conserver la liste `default-members` actuelle et ajouter un contrôle qui exige
+toujours Orion/Tauri dans le build par défaut.
 
 ```toml
 members = ["crates/*", "tools/*", "apps/orion/src-tauri"]
-default-members = ["crates/*", "tools/*", "apps/orion/src-tauri"]
 ```
 
-Si l’augmentation du périmètre liée à `helios-publisher` n’est pas souhaitée,
-la première migration doit garder une liste `default-members` explicite et
-ajouter un contrôle CI qui vérifie que `apps/orion/src-tauri` est bien présent.
-Dans les deux cas, la propriété non négociable est la compilation et les tests
-du client Orion dans le build par défaut.
+La liste explicite `default-members` reste inchangée : elle inclut Orion et
+exclut volontairement `helios-publisher` du build par défaut.
+
+Utiliser les mêmes wildcards dans `default-members` n’est pas équivalent : cela
+ajouterait `helios-publisher` au build par défaut et modifierait le périmètre de
+validation. Cette variation n’apporte pas de bénéfice architectural suffisant
+pour être glissée dans un nettoyage de manifest.
 
 Cette étape est limitée au manifest, ne touche aucun contrat externe et produit
 un diff facilement réversible. Elle doit être livrée seule puis relue et
