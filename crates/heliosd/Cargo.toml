@@ -57,8 +57,10 @@ serde_json.workspace = true
 tempfile = "3"
 # The gateway does not depend on the client — but their interoperability has to
 # be proven somewhere, and the only honest place is against the real client
-# code. `orion-core` is therefore a **test-only** dependency: it verifies that
-# both ends derive the same PSK, which no unit test on either side can show.
+# code. `orion-core` is therefore a **test-only** dependency, and it proves two
+# things no unit test on either side can show: that both ends derive the same
+# PSK (`key_negotiation.rs`), and that the enrolment block this gateway serves
+# is one Orion accepts (`certificates.rs`).
 orion-core = { workspace = true }
 rcgen = { workspace = true }
 
