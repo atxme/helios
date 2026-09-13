@@ -74,25 +74,6 @@ pub(crate) use trust_store::{client_pq_leaf, open_identity_store};
 
 use exchange::{committed_and_waiting, horodatage};
 
-// Reached only through the test glob `use crate::certificate_renewal::*`,
-// which sees this module's namespace and not a submodule's.
-#[cfg(all(test, feature = "certificate-signing"))]
-use {
-    crate::certificates::TrustStore,
-    aether::certificates::encoding::{
-        generate_ml_dsa_87_keypair, DerCertificate, Fingerprint, Id16, MlDsa87PublicKey,
-        MlDsa87Signature, WireGuardKey,
-    },
-    aether::certificates::transport::{ClientRenewalOperationState, ClientRenewalOperationView},
-    aether::certificates::{CERTIFICATE_FORMAT_VERSION, CERTIFICATE_PROTOCOL_VERSION},
-    aether::key_negotiation::PqCertificate,
-    base64::Engine as _,
-    exchange::assert_active_can_prove_continuity,
-    promotion::rollback_window,
-    trust_store::identity_trust_store_path,
-    zeroize::Zeroizing,
-};
-
 #[derive(Debug, thiserror::Error)]
 pub enum RenewalError {
     #[error("renewal refused: {0}")]

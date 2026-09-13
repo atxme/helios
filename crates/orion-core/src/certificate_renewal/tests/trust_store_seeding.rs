@@ -2,9 +2,11 @@
 //! identity: what the active generation is read from, which operator
 //! credentials travel with it, and which profiles are refused or named.
 
+use aether::certificates::encoding::{DerCertificate, WireGuardKey};
 use base64::engine::general_purpose::STANDARD;
+use base64::Engine as _;
 
-use crate::certificate_renewal::*;
+use crate::certificate_renewal::{open_or_seed, RenewalError};
 use crate::test_domain::*;
 
 /// A profile plus a sealed identity is enough to seed the bounded state.

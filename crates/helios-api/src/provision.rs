@@ -96,9 +96,9 @@ pub async fn provision(
 
     let admitted = AdmittedFromConfig(network.peers.iter().map(|p| p.public_key.clone()).collect());
 
-    // The *live* peer table serves as the source of truth for VIP
-    // collisions. In dry-run it is empty: the derived VIP is then kept
-    // as-is, which is the expected behavior.
+    // Collision probing is not wired to the live data-plane snapshot yet.
+    // Keep the empty view explicit: changing it requires plumbing a snapshot
+    // through AppState and deciding how snapshot failures fail closed.
     let peers = PeerAddressTable::from_peers(&[]);
 
     let identity = GatewayIdentity {
@@ -205,17 +205,17 @@ fn gateway_public_key(private_key_b64: &str) -> Result<String, String> {
         .map_err(|e| format!("unreadable gateway private key: {e}"))
 }
 
-/// View of the live peer table, wired onto the IPAM.
+/// Adapts a live data-plane snapshot to the IPAM collision view.
 ///
-/// This is the link that makes "no disk state" VIP assignment real: the
-/// source of truth is the data plane itself, rebuilt as clients reconnect
-/// (ADR-001 §4).
+/// The conversion is ready for the stateless assignment described by
+/// ADR-001 §4. The provisioning handler does not receive that snapshot yet;
+/// its call site documents the missing runtime wiring explicitly.
 ///
 /// It lives here, with its only caller, rather than in the data plane: it is
 /// the wiring between two subsystems, and wiring belongs to whoever composes
 /// them. Keeping it in `helios-wireguard` made the data plane depend on
 /// admission for a single one-method trait.
-pub struct PeerAddressTable {
+struct PeerAddressTable {
     /// `(VIP, raw public key)` for each known peer.
     entries: Vec<(std::net::Ipv4Addr, Vec<u8>)>,
 }
@@ -225,7 +225,7 @@ impl PeerAddressTable {
     ///
     /// Non-IPv4 or malformed `allowed_ips` are ignored: they cannot collide
     /// with a derived CGNAT VIP.
-    pub fn from_peers(peers: &[PeerStatus]) -> Self {
+    fn from_peers(peers: &[PeerStatus]) -> Self {
         let mut entries = Vec::new();
         for peer in peers {
             for cidr in &peer.allowed_ips {
@@ -238,7 +238,8 @@ impl PeerAddressTable {
         Self { entries }
     }
 
-    pub fn is_empty(&self) -> bool {
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 }
@@ -305,7 +306,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snapshot_feeds_the_ipam() {
+    async fn a_wireguard_snapshot_populates_the_collision_view() {
         const KEY_A: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
         const KEY_B: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
 

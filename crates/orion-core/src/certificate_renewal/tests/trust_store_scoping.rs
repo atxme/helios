@@ -2,7 +2,11 @@
 //! migration of a machine-wide legacy store, and the refusal of a store
 //! describing another domain or another client key.
 
-use crate::certificate_renewal::*;
+use aether::certificates::encoding::WireGuardKey;
+
+use crate::certificate_renewal::trust_store::identity_trust_store_path;
+use crate::certificate_renewal::{open_identity_store, open_or_seed, RenewalError};
+use crate::certificates::TrustStore;
 use crate::test_domain::*;
 
 /// A machine can hold several Orion identities, including several peers

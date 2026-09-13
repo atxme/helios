@@ -2,6 +2,8 @@ use super::*;
 use aether::certificates::encoding::generate_ml_dsa_87_keypair;
 use aether::key_negotiation::{PqCertificate, PqCertificateRole, PQ_CERTIFICATE_VERSION};
 
+mod delegation;
+
 fn certificate() -> PqCertificate {
     PqCertificate {
         version: PQ_CERTIFICATE_VERSION,

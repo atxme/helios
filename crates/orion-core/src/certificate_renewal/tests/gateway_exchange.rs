@@ -2,8 +2,15 @@
 //! operation views it adopts or refuses, and the grant it verifies, stages and
 //! commits.
 
+use aether::certificates::encoding::{
+    generate_ml_dsa_87_keypair, Fingerprint, Id16, MlDsa87PublicKey, WireGuardKey,
+};
+use aether::certificates::transport::{ClientRenewalOperationState, ClientRenewalOperationView};
+use aether::certificates::CertificateError;
+use zeroize::Zeroizing;
+
 use super::fixtures::{grant, session, window};
-use crate::certificate_renewal::*;
+use crate::certificate_renewal::{ActiveIdentity, RenewalError, RenewalSession, RenewalStep};
 use crate::test_domain::*;
 
 /// The request is built from the store and from nothing else, and both

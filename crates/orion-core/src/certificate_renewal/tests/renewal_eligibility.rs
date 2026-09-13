@@ -2,7 +2,11 @@
 //! until it activates, the continuity an expired active leaf can no longer
 //! prove, and the overlap a service rollback reads.
 
-use crate::certificate_renewal::*;
+use aether::certificates::encoding::Fingerprint;
+
+use crate::certificate_renewal::exchange::assert_active_can_prove_continuity;
+use crate::certificate_renewal::promotion::rollback_window;
+use crate::certificate_renewal::{committed_and_waiting, horodatage, open_or_seed, RenewalError};
 use crate::test_domain::*;
 
 /// The contradiction this guard exists to remove.

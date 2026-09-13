@@ -2,17 +2,22 @@
 //! under, the chain the bundle carries for a delegated or a master-issued
 //! leaf, and the private keys this machine generated.
 
-use aether::certificates::client::IssuerKind;
-use aether::certificates::encoding::derive_ml_dsa_87_public_key;
+use aether::certificates::client::{ClientCertificateRotationGrant, IssuerKind};
+use aether::certificates::encoding::{
+    derive_ml_dsa_87_public_key, generate_ml_dsa_87_keypair, DerCertificate, Fingerprint,
+    MlDsa87Signature,
+};
 use aether::certificates::window::TransitionWindow;
+use aether::certificates::CERTIFICATE_FORMAT_VERSION;
 use base64::engine::general_purpose::STANDARD;
+use base64::Engine as _;
 use rcgen::{
     CertificateParams, CertificateSigningRequestParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
     KeyUsagePurpose,
 };
 
 use super::fixtures::{grant, session, window};
-use crate::certificate_renewal::*;
+use crate::certificate_renewal::{candidate_identity_of, RenewalSession};
 use crate::test_domain::*;
 
 /// The candidate is sealed beside the active identity, never over it: the

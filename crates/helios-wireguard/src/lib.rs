@@ -13,9 +13,8 @@
 //!
 //! The crate owns no admission and no IPAM: it reports [`PeerStatus`], and
 //! whoever composes the gateway turns that snapshot into the VIP collision
-//! view the IPAM consumes (`helios-api::provision::PeerAddressTable`,
-//! ADR-001 §4). That keeps this crate a leaf — the data plane depends on
-//! nothing else in the workspace.
+//! view the IPAM consumes (ADR-001 §4). That keeps this crate a leaf — the
+//! data plane depends on nothing else in the workspace.
 
 use std::time::SystemTime;
 

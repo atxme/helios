@@ -2,12 +2,20 @@
 //! transition window, a grant as Astra would build it, and a signed session.
 
 use aether::certificates::authority::RotationReason;
-use aether::certificates::client::{GatewayCertificateStageReceipt, IssuerKind};
+use aether::certificates::client::{
+    ClientCertificateRotationGrant, GatewayCertificateStageReceipt, IssuerKind,
+};
+use aether::certificates::encoding::{DerCertificate, Fingerprint, Id16, MlDsa87Signature};
 use aether::certificates::window::TransitionWindow;
-use aether::key_negotiation::{issue_pq_certificate, PqCertificateRole, PQ_CERTIFICATE_VERSION};
+use aether::certificates::{CERTIFICATE_FORMAT_VERSION, CERTIFICATE_PROTOCOL_VERSION};
+use aether::key_negotiation::{
+    issue_pq_certificate, PqCertificate, PqCertificateRole, PQ_CERTIFICATE_VERSION,
+};
 use rcgen::{CertificateSigningRequestParams, ExtendedKeyUsagePurpose, IsCa, KeyUsagePurpose};
+use zeroize::Zeroizing;
 
-use crate::certificate_renewal::*;
+use crate::certificate_renewal::{ActiveIdentity, RenewalSession};
+use crate::certificates::TrustStore;
 use crate::test_domain::*;
 
 fn active_identity(domain: &Domain) -> ActiveIdentity {
