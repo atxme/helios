@@ -588,6 +588,10 @@ fn write_new_synced(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(mode);
     }
+    // `mode` is a Unix permission bitmask with no equivalent elsewhere: on
+    // Windows the new file inherits the parent directory's ACL.
+    #[cfg(not(unix))]
+    let _ = mode;
     let mut file = options.open(path)?;
     file.write_all(bytes)?;
     file.sync_all()?;

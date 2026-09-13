@@ -153,3 +153,13 @@ orion-core = { path = "crates/orion-core" }
 [profile.release]
 lto = "thin"
 strip = true
+
+# Le lien d'Orion en debug sous Windows/MSVC dépassait la limite de 4 Gio du
+# PDB (LNK1140) : le fichier agrège les infos de débogage de tout le graphe —
+# `windows-*` et leurs types générés, le C d'`aws-lc-sys`, tauri/wry/tao.
+# Les dépendances sont donc compilées sans infos de débogage ; les crates de
+# l'espace de travail gardent le debug complet du profil `dev`, donc le
+# pas-à-pas et les backtraces du code Helios/Orion restent intacts. Seul le
+# pas-à-pas *dans la source d'une dépendance* est perdu.
+[profile.dev.package."*"]
+debug = false
