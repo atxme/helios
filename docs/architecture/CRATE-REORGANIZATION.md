@@ -3,6 +3,11 @@
 > Document d’audit préalable. Cette livraison ne migre aucun code, ne modifie
 > aucun manifest et ne change aucun contrat. Les décisions proposées doivent
 > être relues et validées avant toute phase d’implémentation.
+>
+> **L’implémentation a commencé depuis.** Les sections 1 à 12 restent le
+> constat daté qui a motivé chaque décision ; l’état réel du dépôt est en
+> [§13](#13-état-dimplémentation), relevé à `HEAD = b9380ca`. Lire §13 avant
+> de se fier à une description d’arbre ou de graphe des sections précédentes.
 
 ## Périmètre et méthode
 
@@ -162,6 +167,12 @@ consommateur indépendant ne l’exige.
 d’interface/pairs, observation des handshakes, dry-run et backend réel. Son
 unique arête vers `helios-provisioning` vient du trait `PeerTable` utilisé pour
 l’IPAM ; c’est une inversion de couche à surveiller, pas un cycle.
+
+> **État (`c050537`) : DONE.** L’arête n’existe plus. `PeerAddressTable` est
+> désormais défini chez son unique appelant, `helios-api/src/provision.rs:218`,
+> et `crates/helios-wireguard/Cargo.toml` ne déclare plus aucune dépendance de
+> workspace : `cargo metadata` confirme une crate feuille. Le paragraphe
+> ci-dessus décrit l’état audité qui a motivé le déplacement.
 
 Les frontières `helios-vault`, `helios-fido`, `helios-tpm` et
 `helios-key-negotiation` sont justifiées respectivement par un format secret,
@@ -541,7 +552,7 @@ helios-tpm -> aether
 helios-trust -> aether                  [si extraction confirmée]
 helios-update -> aether
 
-helios-wireguard -> helios-provisioning  [contrat PeerTable/IPAM à stabiliser]
+helios-wireguard                         [feuille : arête supprimée, c050537]
 
 astra-channel -> aether
 
@@ -601,8 +612,8 @@ explicitement partagée, jamais dans une application.
 - Aether ne dépend d’aucune crate, app ou outil Helios/Orion.
 - Une crate de sous-système ne dépend ni de `heliosd`, ni de `orion`, ni de
   Tauri, ni du frontend `web`.
-- `heliosd` ne dépend pas de `orion-core`, y compris pour ses tests de package ;
-  l’interopérabilité utilise un harnais dédié.
+- `heliosd` ne dépend pas de `orion-core` **en production**. La dépendance
+  `dev` est conservée : voir l’arbitrage ci-dessous.
 - `astra` ne dépend ni de `helios-api` ni d’une crate nommée `helios-*` ; le
   canal privé possède son propre propriétaire neutre.
 - `astra-operator` ne dépend pas de l’implémentation `astra` pour des DTO ou
@@ -622,10 +633,47 @@ explicitement partagée, jamais dans une application.
   ou un backend sans frontière de sécurité, protocole, plateforme, cycle de
   vie ou réutilisation indépendante démontrée.
 
+### Arbitrage : `heliosd -[dev]-> orion-core`
+
+La règle initiale (« y compris pour ses tests de package ») **contredisait
+l’arbre cible de la Phase 4 de ce même document**, qui place
+`crates/heliosd/src/key_negotiation/tests/interop.rs` — donc sous la dépendance
+`dev`. La contradiction est tranchée ici en faveur de l’arbre : **REJECTED**,
+l’arête `dev` est conservée et la règle ci-dessus est restreinte à la
+production.
+
+Ce que l’audit a mesuré :
+
+- `crates/heliosd/Cargo.toml` ne déclare qu’un `[[bin]]`. Sortir le test exige
+  donc d’abord d’ajouter une cible `lib` à un composition root.
+- Le test construit `GatewayHandler` par littéral de structure
+  (`crates/heliosd/src/key_negotiation.rs:3954`) : ses **12 champs sont privés**
+  et `TransactionState` (`:218`) l’est aussi. L’extraction demande de publier
+  les deux — c’est-à-dire d’exposer l’état interne du serveur de négociation
+  pour servir un test.
+- Le second test (`crates/heliosd/src/certificates.rs:2125`) appelle
+  `enrolment_view`, `pub fn` dans un binaire, donc inatteignable de l’extérieur
+  pour la même raison.
+- La preuve elle-même se dégraderait : aujourd’hui elle est une **comparaison
+  déterministe de PSK** en `dry_run` contre un plan de données factice. Un
+  harnais externe ne pourrait plus atteindre le PSK installé et devrait se
+  rabattre sur l’observation d’un handshake WireGuard, donc sur un noyau — ce
+  que `docs/testing/TESTING.md` réserve à la cible.
+
+Le coût architectural (cible `lib`, surface publique élargie) dépasse le
+bénéfice (une arête `dev` qui ne figure pas dans le graphe de production et
+qu’aucun binaire livré ne porte). La justification est inscrite dans
+`crates/heliosd/Cargo.toml` (`b9380ca`), qui nomme les deux propriétés
+couvertes.
+
 ## 8. Plan de migration progressive
 
 Chaque phase doit former un diff reviewable, compiler, passer ses tests et
 laisser inchangés protocoles, formats, clés, certificats, CLI et comportement.
+
+> L’état d’avancement réel de chacune de ces phases est en
+> [§13](#13-état-dimplémentation). Les descriptions de phase ci-dessous ne sont
+> pas réécrites : elles restent la trace de l’intention datée.
 
 ### Phase 0 — cartographie
 
@@ -844,6 +892,115 @@ Le repository doit permettre d’identifier rapidement :
 | 5 | `heliosd/src/main.rs` et modules lifecycle, tests de démarrage/arrêt, éventuellement manifest `helios-runtime` |
 | 6 | chemins `crates/`, `tools/`, `apps/`, manifests, scripts, workflows, Tauri, packaging |
 | 7 | réexports, compatibilités, features, `docs/ARCHITECTURE.md`, `docs/architecture/overview.md`, guides de test et ADR touchés |
+
+## 13. État d’implémentation
+
+> Relevé au 2026-09-13, `HEAD = b9380ca`, branche `refactor-module-organization`.
+> Chaque état est tiré du code, pas d’une intention. Les sections 1 à 12 et
+> `Internal Module Organization` ne sont pas réécrites : elles restent le
+> constat daté qui explique *pourquoi* chaque décision a été prise — même
+> traitement que celui donné à ADR-004 pour l’escrow et aux mentions
+> `helio-tpm` par `9e4f425`.
+>
+> Vocabulaire : **DONE** livré et vérifié ; **PARTIAL** commencé, reste
+> mesurable ; **DEFERRED** non commencé, toujours souhaitable ;
+> **REJECTED** mesuré puis abandonné, avec la mesure.
+
+### Vérifications exécutées pour ce relevé
+
+```text
+cargo metadata --format-version 1 --no-deps          graphe interne
+cargo fmt --all --check                              réussi
+cargo test --workspace                               1530 réussis, 0 échec
+cargo test -p orion-core --features certificate-signing        317
+cargo test -p helios-provisioning --features certificate-signing 95
+cargo test -p helios-firewall --features netlink                54
+cargo clippy --workspace --all-targets --all-features -- -D warnings   réussi
+cargo doc --workspace --no-deps --all-features        liens intra-doc
+```
+
+WSL2 ne prouve ni le noyau `nf_tables`, ni WireGuard, ni le TPM, ni
+WireGuardNT : `docs/testing/TESTING.md` reste la référence pour ces cibles.
+
+### 13.1 Frontières Cargo
+
+| Élément de plan | État | Justification tirée du code |
+| --- | --- | --- |
+| Phase 1 — `members` par patterns | **DONE** | `Cargo.toml` porte `members = ["crates/*", "tools/*", "apps/orion/src-tauri"]`, et `default-members` reste la liste explicite qui inclut Orion et exclut `helios-publisher`. |
+| `helios-escrow` (extraction de l’escrow) | **DONE** | `crates/helios-escrow/` existe ; `helios-tpm` ne l’a plus qu’en `dev-dependency`, `helios-ctl` et `heliosd` en dépendance normale. |
+| `helio-tpm` -> `helios-tpm` | **DONE** | `9e4f425` ; plus aucune occurrence de `helio_tpm`/`helio-tpm` hors des constats datés de ce document et d’ADR-004. |
+| `helios-wireguard -> helios-provisioning` | **DONE** | Arête supprimée (`c050537`). `helios-wireguard` ne déclare plus aucune dépendance de workspace. |
+| `heliosd -[dev]-> orion-core` | **REJECTED** | Voir l’arbitrage en §7 : cible `lib` requise, 12 champs privés de `GatewayHandler` + `TransactionState` à publier, et la preuve passerait d’une comparaison déterministe de PSK à une observation de handshake exigeant un noyau. |
+| `astra -> helios-api` | **PARTIAL** | `050c03c` a requalifié 10 sites vers `aether` (les contrats de renouvellement sont définis dans `aether::certificates::transport`, `helios-api` ne fait que les réexporter). Il reste 24 lignes dans 9 fichiers de `crates/astra/src/` qui nomment `helios_api::` — mesure faite par `grep -rn helios_api crates/astra/src`. |
+| `astra-channel` (SPLIT de `helios-api`) | **DEFERRED, bloquée** | `helios-api/src/lib.rs:24` porte toujours `pub mod internal` (2 255 lignes). La crate réunit 3 des 4 conditions de §5 — protocole processus-à-processus, bornes TLS/ALPN, deux côtés indépendants — mais **pas** la quatrième : `astra` consomme aussi `helios_api::certificates::TrustUpdateRefusal` (`crates/helios-api/src/certificates.rs:85`) depuis `distribution.rs:100` et `renewal.rs:159`. Tant que ce type n’est pas classé (contrat du canal privé, ou contrat de l’API in-tunnel), l’extraction déplace l’arête au lieu de la supprimer. |
+| `astra-operator -> astra` | **DEFERRED — meilleur rapport bénéfice/risque restant** | 13 chemins `astra::` dans `astra-operator/src/` ; 12 nomment `SigningOperationView`/`SigningOperationState`, que `crates/astra/src/signing.rs:107` se contente de réexporter depuis `aether::certificates::transport`. `astra-operator` dépend déjà d’`aether` : la requalification est un renommage de chemin, exactement la technique de `050c03c`. Elle ne supprime pas l’arête — reste `IssuerDelegationRequest` (`crates/astra/src/issuer.rs:90`), réexporté par `astra-operator/src/authority.rs:129`, qui demande une décision d’ownership. |
+| `aether-fido`, `aether-key-negotiation`, `aether-vault` | **DEFERRED** | Non commencé. `cargo metadata` montre toujours `orion-core -> helios-fido, helios-key-negotiation, helios-vault`. La règle de nommage de §1 reste donc violée. Avec `astra -> helios-api` et `astra-operator -> astra`, ce sont les trois interdits de §7 encore enfreints en production. |
+| `helios-trust` (extraction de `helios-provisioning::certificates`) | **DEFERRED** | La *seam* que la Phase 3 exigeait avant extraction est désormais prouvée au niveau module : `096c1e9` a découpé le registre en cinq sous-modules dont chacun a son fichier de tests jumeau. Mais la condition de crate n’est pas remplie : un seul consommateur, `heliosd` (22 lignes) ; `helios-api` ne consomme que la moitié admission de `helios-provisioning`. Le registre reste donc un module, comme §5 l’autorisait explicitement. |
+| `helios-runtime` | **REJECTED** | `e8e771f` a extrait `run()` vers `crates/heliosd/src/daemon.rs`, déclaré `mod daemon;` (privé) dans `main.rs:6`. Aucun second hôte runtime : la condition que §5 posait n’est pas rencontrée. Même conclusion pour `crates/astra/src/daemon.rs`, `mod daemon;` privé dans `astra/src/main.rs:29`. |
+| Phase 6 — organisation physique | **DEFERRED** | Aucun répertoire de crate déplacé. Les regroupements `backend/` prévus pour `helios-firewall` et `helios-wireguard` ne sont pas faits : `dryrun.rs`, `kernel.rs`, `netlink.rs` restent à la racine de leur `src/`. |
+| Phase 7 — nettoyage | **DEFERRED** | Aucune compatibilité ni feature de transition à retirer tant que les Phases 2 et 6 ne sont pas terminées. |
+
+### 13.2 Découpage interne — tests par capacité
+
+| Élément de plan | État | Justification tirée du code |
+| --- | --- | --- |
+| `helios-firewall::ruleset` | **DONE** | `src/ruleset/tests/{access,egress,transport,uplinks,support}.rs`, plus `golden.rs` ajouté par `d95be0c`. |
+| `helios-provisioning::certificates` | **DONE** | `src/certificates/tests/{fixtures,staging,distribution,transitions,trust,persistence}.rs` — un fichier par sous-module de production, correspondance exacte. |
+| `astra::registry` | **DONE, avec un écart nommé** | `src/registry/tests/{challenges,peer_lifecycle,persistence,transitions}.rs`. Écart : le test d’`install_issuer` vit dans `tests/peer_lifecycle.rs:166` (`a_delegation_may_not_walk_its_epoch_backwards`) alors que sa production est dans `registry/delegation.rs` depuis `8b4fe96`, et il n’existe pas de `tests/delegation.rs`. `8b4fe96` a signalé l’écart plutôt que de toucher aux tests. |
+| `orion-core::profile_import` | **DONE** | `src/profile_import/tests/` — neuf fichiers par capacité plus les fixtures, 50 noms de tests inchangés (`15bd6b3`). |
+| `orion-core::certificate_renewal` | **DONE** | `src/certificate_renewal/tests/` — cinq fichiers par capacité plus les fixtures, 26 noms de tests inchangés (`b0bcb42`). La gate `#[cfg(all(test, feature = "certificate-signing"))]` est préservée (`certificate_renewal.rs:191`). |
+| `helios-key-negotiation` | **DONE** | `src/tests/{fixtures,limits,material,protocol,rollback,transport}.rs` (`da36e3b`) : l’arbre livré est exactement celui que §« Négociation » proposait. |
+
+### 13.3 Découpage interne — production
+
+| Élément de plan | État | Justification tirée du code |
+| --- | --- | --- |
+| `helios-key-negotiation/src/lib.rs` (`SPLIT`, haute) | **DONE** | `identity.rs`, `endpoint.rs`, `framing.rs`, `server.rs`, `client.rs`, `transaction.rs`, `rate_limit.rs`, `error.rs` — l’arbre cible au fichier près ; `lib.rs` ne garde que les `mod` privés, les réexports et les constantes bornées. |
+| `helios-provisioning::certificates` (`SPLIT`, haute) | **DONE** | `certificates/{persistence,staging,distribution,transitions,trust}.rs` (`096c1e9`). Seule modification de visibilité : `persist` passe `pub(super)`, portée effective identique. |
+| `helios-firewall::ruleset` | **DONE** (au-delà du plan, qui disait `KEEP`) | `ruleset/{nftables,administration,astra_channel,transport,gateway_wan,meshnet,tunnel_interface,kill_switch}.rs` (`f788e14`). Les six snapshots de `d95be0c`, écrits **avant** le découpage contre le `render` monolithique, passent sans retouche : l’ordre des règles — sémantique en nftables — est prouvé inchangé. |
+| `helios-firewall::netlink` | **DONE** | `netlink/{expressions,transaction,maintenance}.rs` (`2d49c17`). Non exercé contre un noyau : WSL2 n’a pas `nf_tables`. Comparaison ligne à ligne avant/après : aucune ligne de logique ne diffère, seulement imports, `mod`, visibilité et documentation. |
+| `heliosd/src/main.rs` (`SPLIT`, très haute) | **DONE** | `main.rs` est ramené à la surface clap, `main()` et son dispatch (813 lignes, dont ~195 de tests de la surface clap) ; `daemon.rs`, `process_guards.rs`, `commands/{tpm,trust,identity,peer,wan}.rs` (`e8e771f`). `run()` fait 366 lignes, octet pour octet identiques à l’original. Les 24 écrans d’aide sont inchangés. |
+| `astra/src/main.rs` (`SPLIT`, haute) | **DONE** | `main.rs` ramené à 598 lignes ; `daemon.rs`, `private_channel.rs`, `campaign_deposit.rs`, `commands/{trust_domain,campaign,chain,gateway_identity,revocation,issuer}.rs` (`2eb9afe`). Écarts assumés par rapport à l’arbre cible : `bootstrap.rs` s’appelle `trust_domain.rs` (le fichier porte aussi `pin_ca_tls` et `status`), et aucun `cli.rs` n’a été créé — la surface clap reste dans `main.rs`. Les 21 écrans d’aide sont inchangés. |
+| `astra/src/registry.rs` (`SPLIT`, moyenne) | **DONE** (au-delà du plan) | Le plan ne demandait que `challenge.rs` et les tests ; `8b4fe96` a livré en plus `persistence.rs`, `peer_lifecycle.rs`, `transitions.rs`, `delegation.rs`, chacun propriétaire exclusif de champs de `AstraState`. `accept_transitions` n’a pas été découpé, volontairement : sa preuve de capacité précède toute mutation et son écriture est atomique. |
+| `orion-core/src/profile_import.rs` (`SPLIT`, moyenne) | **DONE** | `profile_import/{document,json,wg_quick,field_rules,validation}.rs` (`0908da2`). Deux écarts au plan, justifiés dans le commit : `field_rules` est séparé de `validation` (les validateurs de champ n’ont jamais vu un `ClientProfile`), et l’intake documentaire est réuni avec la complétion d’invitation. |
+| `orion-core/src/certificate_renewal.rs` (`SPLIT`, haute) | **PARTIAL** | `certificate_renewal/{trust_store,promotion,exchange}.rs` (`17bf3d3`) livre la seam « trust store local vs session HTTP ». Reste `impl RenewalSession` : voir 13.4. |
+| `aether/src/certificates/{state,status,client,approval}.rs`, `aether/src/key_negotiation.rs` | **DEFERRED** | Aucun de ces fichiers n’a de sous-dossier ; `crates/aether/src/certificates/` est toujours plat. |
+| `heliosd/src/key_negotiation.rs` (`SPLIT`, très haute) | **DEFERRED** | 4 076 lignes, inchangé hors renommage `helios_tpm`. C’est désormais le plus gros fichier du dépôt. |
+| `heliosd/src/orchestrator.rs` (`SPLIT`, très haute) | **DEFERRED** | 1 912 lignes, intact. |
+| `heliosd/src/certificates.rs` (`SPLIT`, haute) | **DEFERRED** | 2 681 lignes, intact. |
+| `helios-api/src/{internal,certificates,routes}.rs` | **DEFERRED** | Intacts ; `internal.rs` est bloqué derrière la classification de `TrustUpdateRefusal` (13.1). |
+| `orion-core/src/speedtest.rs`, `src/backend/mod.rs` | **DEFERRED** | 2 190 et 1 620 lignes, intacts. |
+| `orion` Tauri `src/main.rs` (`SPLIT`, très haute) | **DEFERRED** | 3 725 lignes, intact. |
+| `astra-signer/src/main.rs` (`SPLIT`, haute) | **DEFERRED** | 3 991 lignes, intact : c’est le plus gros binaire monolithique restant. |
+| `astra-operator/src/authority.rs` -> `signing.rs` (`RENAME`) | **DEFERRED** | `authority.rs` existe toujours ; `operations/rotation.rs` n’est pas créé. |
+| `helios-ctl` — extraction de `monitor.rs`, renommage `key_nego` | **DEFERRED** | `main.rs` (1 325 lignes) porte toujours le suivi WebSocket ; `campaign_key_nego.rs` et `key_nego.rs` gardent leur abréviation. |
+
+### 13.4 Travaux nommés pendant l’implémentation
+
+Ces points n’existaient pas dans l’audit initial : ils ont été mesurés en
+cours de route et sont enregistrés ici plutôt que traités dans un déplacement.
+
+| Point | État | Détail |
+| --- | --- | --- |
+| `impl RenewalSession` (orion-core) | **DEFERRED** | La plomberie HTTP est une vraie frontière — huit méthodes ne touchent que `self.http` — mais l’extraire n’est pas un déplacement : les méthodes restent des méthodes de `RenewalSession`, le champ `http` et cinq méthodes passeraient `pub(super)`, et la configuration de transport (`no_proxy`, `redirect::Policy::none`, `CALL_TIMEOUT`) est construite au milieu du protocole, dans `prepare`. L’extraction honnête introduit un type `RenewalTransport` propriétaire de son client : une réécriture de corps, pas un déplacement. |
+| Bloc `use` gaté pour les tests de `certificate_renewal` | **PARTIAL — dette nommée** | `crates/orion-core/src/certificate_renewal.rs:79` porte un bloc `use` sous `#[cfg(all(test, feature = "certificate-signing"))]` dont l’unique raison d’être est le glob `use crate::certificate_renewal::*;` des six fichiers de tests. Il n’élargit aucune API (un `use` privé ne réexporte rien) et n’a aucun effet à l’exécution, mais il fait porter au module de production la liste des symboles que ses tests attendent. Le module voisin `profile_import` montre la sortie : ses tests nomment leurs imports, et son découpage n’a demandé aucun bloc équivalent. Le nettoyage — imports explicites dans les six fichiers de tests, suppression du bloc — n’était dans le périmètre d’aucun agent. |
+| `PeerAddressTable::from_peers(&[])` | **À décider — hors réorganisation** | `crates/helios-api/src/provision.rs:102` construit la table avec une tranche vide inconditionnelle : la table de pairs vivante qu’ADR-001 §4 exige de consulter à l’enrôlement ne l’est jamais. C’est un écart de comportement **antérieur** au déplacement, relevé par `c050537` et laissé à une décision distincte. Le type reste `pub` alors qu’il n’a plus aucun consommateur hors de `helios-api` : il pourra être réduit à `pub(crate)` au même moment. |
+| Tests du ruleset firewall vs modules de production | **PARTIAL** | `f788e14` a découpé la production par capacité (`administration`, `transport`, `kill_switch`…) mais n’a pas réaligné `ruleset/tests/`, organisé par comportement (`access`, `egress`, `transport`, `uplinks`) depuis `ff9f095`. Les deux axes coexistent ; `golden.rs` couvre l’ordre global. Réaligner n’est utile que si l’on accepte de renommer des tests, ce qu’aucun déplacement n’a fait jusqu’ici. |
+| Liens intra-doc cassés préexistants | **À corriger — hors périmètre** | `cargo doc --workspace --no-deps --all-features` signale 34 liens non résolus ou pointant vers des items privés. Aucun n’a été introduit par la réorganisation : tous existent à l’identique avant `b837036`, et `096c1e9` en a au contraire réparé un (`RegistryState::client_leaf_issuers`, désormais `crates/helios-provisioning/src/certificates/trust.rs:47`). |
+
+### 13.5 Collision à arbitrer avec la spécification
+
+`docs/specification/ROTATION-CERTIFICATS.md:3988` attribue nommément à
+`helios-api` « l’API privée appelée par Astra ». C’est exactement la
+responsabilité que §4 de ce document classe `SPLIT` et que §5 propose
+d’extraire vers `astra-channel`.
+
+Les deux documents ne peuvent pas être vrais en même temps : la spécification
+est un contrat de responsabilité, et l’extraction la contredirait. Cette
+collision est **signalée, pas résolue** : `ROTATION-CERTIFICATS.md` n’est pas
+modifié ici. Toute livraison d’`astra-channel` doit commencer par une décision
+explicite sur ce tableau — et la classification de `TrustUpdateRefusal` (13.1)
+est la même question posée au niveau du type.
 
 ## Internal Module Organization
 
@@ -1551,6 +1708,10 @@ members = ["crates/*", "tools/*", "apps/orion/src-tauri"]
 
 La liste explicite `default-members` reste inchangée : elle inclut Orion et
 exclut volontairement `helios-publisher` du build par défaut.
+
+> **État : DONE.** `Cargo.toml` porte les patterns et la liste explicite
+> `default-members`. La suite décrite ci-dessous — canal Astra, trust registry,
+> escrow, `helios-runtime` — a depuis été traitée ou tranchée : voir §13.
 
 Utiliser les mêmes wildcards dans `default-members` n’est pas équivalent : cela
 ajouterait `helios-publisher` au build par défaut et modifierait le périmètre de
