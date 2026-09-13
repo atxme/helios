@@ -37,7 +37,7 @@ use helios_provisioning::{
     handle_request, session::fresh_nonce, AdmittedPeers, GatewayIdentity, Provisioned,
     DEFAULT_PSK_LIFETIME_SECS,
 };
-use helios_wireguard::PeerAddressTable;
+use helios_wireguard::PeerStatus;
 use tokio::sync::oneshot;
 
 use crate::AppState;
@@ -205,6 +205,52 @@ fn gateway_public_key(private_key_b64: &str) -> Result<String, String> {
         .map_err(|e| format!("unreadable gateway private key: {e}"))
 }
 
+/// View of the live peer table, wired onto the IPAM.
+///
+/// This is the link that makes "no disk state" VIP assignment real: the
+/// source of truth is the data plane itself, rebuilt as clients reconnect
+/// (ADR-001 §4).
+///
+/// It lives here, with its only caller, rather than in the data plane: it is
+/// the wiring between two subsystems, and wiring belongs to whoever composes
+/// them. Keeping it in `helios-wireguard` made the data plane depend on
+/// admission for a single one-method trait.
+pub struct PeerAddressTable {
+    /// `(VIP, raw public key)` for each known peer.
+    entries: Vec<(std::net::Ipv4Addr, Vec<u8>)>,
+}
+
+impl PeerAddressTable {
+    /// Builds the table from a data plane snapshot.
+    ///
+    /// Non-IPv4 or malformed `allowed_ips` are ignored: they cannot collide
+    /// with a derived CGNAT VIP.
+    pub fn from_peers(peers: &[PeerStatus]) -> Self {
+        let mut entries = Vec::new();
+        for peer in peers {
+            for cidr in &peer.allowed_ips {
+                let host = cidr.split('/').next().unwrap_or(cidr);
+                if let Ok(addr) = host.parse::<std::net::Ipv4Addr>() {
+                    entries.push((addr, peer.public_key.clone()));
+                }
+            }
+        }
+        Self { entries }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+impl helios_provisioning::PeerTable for PeerAddressTable {
+    fn is_taken_by_other(&self, addr: std::net::Ipv4Addr, pubkey: &[u8]) -> bool {
+        self.entries
+            .iter()
+            .any(|(a, owner)| *a == addr && owner.as_slice() != pubkey)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,6 +259,82 @@ mod tests {
     use aether::{NetworkConfig, TunnelState};
     use std::sync::Arc;
     use tokio::sync::{broadcast, mpsc, RwLock};
+
+    use helios_provisioning::PeerTable;
+    use helios_wireguard::{DryRunBackend, InterfaceConfig, PeerConfig, WireguardBackend};
+    use std::net::Ipv4Addr;
+
+    fn live_peer(pubkey: &[u8], vip: &str) -> PeerStatus {
+        PeerStatus {
+            public_key: pubkey.to_vec(),
+            allowed_ips: vec![vip.to_string()],
+            last_handshake: None,
+            endpoint: None,
+            rx_bytes: 0,
+            tx_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn table_detects_collision_with_another_peer() {
+        let table = PeerAddressTable::from_peers(&[live_peer(&[1u8; 32], "100.64.1.2/32")]);
+        let vip: Ipv4Addr = "100.64.1.2".parse().unwrap();
+
+        // Another key claiming the same VIP = collision.
+        assert!(table.is_taken_by_other(vip, &[2u8; 32]));
+        // The same peer never collides with itself (reconnection).
+        assert!(!table.is_taken_by_other(vip, &[1u8; 32]));
+    }
+
+    #[test]
+    fn free_address_not_flagged() {
+        let table = PeerAddressTable::from_peers(&[live_peer(&[1u8; 32], "100.64.1.2/32")]);
+        let other: Ipv4Addr = "100.64.9.9".parse().unwrap();
+        assert!(!table.is_taken_by_other(other, &[2u8; 32]));
+    }
+
+    #[test]
+    fn non_ipv4_allowed_ips_ignored() {
+        let mut p = live_peer(&[1u8; 32], "100.64.1.2/32");
+        p.allowed_ips.push("fd00::1/128".into());
+        p.allowed_ips.push("not-an-address".into());
+        let table = PeerAddressTable::from_peers(&[p]);
+        // Only the valid IPv4 entry is retained.
+        assert!(!table.is_empty());
+        assert!(table.is_taken_by_other("100.64.1.2".parse().unwrap(), &[2u8; 32]));
+    }
+
+    #[tokio::test]
+    async fn snapshot_feeds_the_ipam() {
+        const KEY_A: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        const KEY_B: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+
+        let be = DryRunBackend::with_handshakes();
+        be.up(
+            &InterfaceConfig {
+                name: "helios0".into(),
+                private_key: KEY_A.into(),
+                listen_port: helios_wireguard::WG_LISTEN_PORT,
+                address: "100.64.0.1/10".into(),
+                mtu: None,
+            },
+            &[PeerConfig {
+                public_key: KEY_B.into(),
+                allowed_ips: "100.64.1.2/32".into(),
+                preshared_key: None,
+                persistent_keepalive_secs: 25,
+            }],
+        )
+        .await
+        .unwrap();
+
+        let snapshot = be.peers().await.unwrap();
+        assert!(snapshot[0].last_handshake.is_some());
+
+        let table = PeerAddressTable::from_peers(&snapshot);
+        let vip = "100.64.1.2".parse().unwrap();
+        assert!(table.is_taken_by_other(vip, &[9u8; 32]));
+    }
 
     const PRIV: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
     const CLIENT_PRIV: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";

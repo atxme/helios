@@ -11,12 +11,12 @@
 //! * [`DryRunBackend`] — in memory, testable everywhere (including WSL2);
 //! * [`KernelBackend`] — real, behind the `wireguard` feature.
 //!
-//! The crate also provides [`PeerAddressTable`], which wires the **live**
-//! peer table onto `helios-provisioning`'s IPAM: it is the source of truth
-//! used for VIP collision resolution, with no state persisted to disk
-//! (ADR-001 §4).
+//! The crate owns no admission and no IPAM: it reports [`PeerStatus`], and
+//! whoever composes the gateway turns that snapshot into the VIP collision
+//! view the IPAM consumes (`helios-api::provision::PeerAddressTable`,
+//! ADR-001 §4). That keeps this crate a leaf — the data plane depends on
+//! nothing else in the workspace.
 
-use std::net::Ipv4Addr;
 use std::time::SystemTime;
 
 use async_trait::async_trait;
@@ -164,51 +164,9 @@ pub trait WireguardBackend: Send + Sync {
     fn kind(&self) -> &'static str;
 }
 
-/// View of the live peer table, wired onto the IPAM.
-///
-/// This is the link that makes "no disk state" VIP assignment real: the
-/// source of truth is the data plane itself, rebuilt as clients reconnect
-/// (ADR-001 §4).
-pub struct PeerAddressTable {
-    /// `(VIP, raw public key)` for each known peer.
-    entries: Vec<(Ipv4Addr, Vec<u8>)>,
-}
-
-impl PeerAddressTable {
-    /// Builds the table from a data plane snapshot.
-    ///
-    /// Non-IPv4 or malformed `allowed_ips` are ignored: they cannot collide
-    /// with a derived CGNAT VIP.
-    pub fn from_peers(peers: &[PeerStatus]) -> Self {
-        let mut entries = Vec::new();
-        for peer in peers {
-            for cidr in &peer.allowed_ips {
-                let host = cidr.split('/').next().unwrap_or(cidr);
-                if let Ok(addr) = host.parse::<Ipv4Addr>() {
-                    entries.push((addr, peer.public_key.clone()));
-                }
-            }
-        }
-        Self { entries }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-}
-
-impl helios_provisioning::PeerTable for PeerAddressTable {
-    fn is_taken_by_other(&self, addr: Ipv4Addr, pubkey: &[u8]) -> bool {
-        self.entries
-            .iter()
-            .any(|(a, owner)| *a == addr && owner.as_slice() != pubkey)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use helios_provisioning::PeerTable;
 
     fn peer(pubkey: &[u8], vip: &str) -> PeerStatus {
         PeerStatus {
@@ -219,35 +177,6 @@ mod tests {
             rx_bytes: 0,
             tx_bytes: 0,
         }
-    }
-
-    #[test]
-    fn table_detects_collision_with_another_peer() {
-        let table = PeerAddressTable::from_peers(&[peer(&[1u8; 32], "100.64.1.2/32")]);
-        let vip: Ipv4Addr = "100.64.1.2".parse().unwrap();
-
-        // Another key claiming the same VIP = collision.
-        assert!(table.is_taken_by_other(vip, &[2u8; 32]));
-        // The same peer never collides with itself (reconnection).
-        assert!(!table.is_taken_by_other(vip, &[1u8; 32]));
-    }
-
-    #[test]
-    fn free_address_not_flagged() {
-        let table = PeerAddressTable::from_peers(&[peer(&[1u8; 32], "100.64.1.2/32")]);
-        let other: Ipv4Addr = "100.64.9.9".parse().unwrap();
-        assert!(!table.is_taken_by_other(other, &[2u8; 32]));
-    }
-
-    #[test]
-    fn non_ipv4_allowed_ips_ignored() {
-        let mut p = peer(&[1u8; 32], "100.64.1.2/32");
-        p.allowed_ips.push("fd00::1/128".into());
-        p.allowed_ips.push("not-an-address".into());
-        let table = PeerAddressTable::from_peers(&[p]);
-        // Only the valid IPv4 entry is retained.
-        assert!(!table.is_empty());
-        assert!(table.is_taken_by_other("100.64.1.2".parse().unwrap(), &[2u8; 32]));
     }
 
     #[test]

@@ -2482,7 +2482,6 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "defguard_wireguard_rs",
- "helios-provisioning",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
