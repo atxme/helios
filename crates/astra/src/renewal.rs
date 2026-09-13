@@ -50,6 +50,7 @@
 
 use std::sync::Arc;
 
+use aether::certificates::transport::{ClientRenewalOperationView, ClientRenewalSignerRequest};
 use aether::certificates::{
     approval::{
         AstraCampaignApprovalEvidence, AstraCredentialApprovalRequest, AstraRenewalApproval,
@@ -61,7 +62,6 @@ use aether::certificates::{
     window::{TransitionWindow, MAX_OVERLAP_SECS, MAX_STAGE_LEASE_SECS},
     CERTIFICATE_FORMAT_VERSION,
 };
-use helios_api::internal::{ClientRenewalOperationView, ClientRenewalSignerRequest};
 
 use crate::operations::{Operation, OperationError};
 use crate::planner::{urgency, RenewalUrgency};
@@ -454,7 +454,8 @@ pub async fn read(
     // changes neither generation nor candidate keys.
     let needs_refresh = {
         let operation = operations.get(operation_id, caller, now_unix)?;
-        operation.state == helios_api::internal::ClientRenewalOperationState::AwaitingOperator
+        operation.state
+            == aether::certificates::transport::ClientRenewalOperationState::AwaitingOperator
             && now_unix >= operation.approval_request.expires_at
     };
     if needs_refresh {
@@ -467,10 +468,10 @@ pub async fn read(
     let state = operations.get(operation_id, caller, now_unix)?.state;
     drop(operations);
     match state {
-        helios_api::internal::ClientRenewalOperationState::PendingGrant => {
+        aether::certificates::transport::ClientRenewalOperationState::PendingGrant => {
             resume_stage(service, caller, operation_id, now_unix).await?;
         }
-        helios_api::internal::ClientRenewalOperationState::PendingCommit => {
+        aether::certificates::transport::ClientRenewalOperationState::PendingCommit => {
             reconcile_released_grant(service, caller, operation_id, now_unix).await?;
         }
         _ => {}
@@ -553,10 +554,10 @@ pub async fn signer_result(
         let state = operation.state;
         drop(operations);
         match state {
-            helios_api::internal::ClientRenewalOperationState::PendingGrant => {
+            aether::certificates::transport::ClientRenewalOperationState::PendingGrant => {
                 resume_stage(service, caller, operation_id, now_unix).await?;
             }
-            helios_api::internal::ClientRenewalOperationState::PendingCommit => {
+            aether::certificates::transport::ClientRenewalOperationState::PendingCommit => {
                 reconcile_released_grant(service, caller, operation_id, now_unix).await?;
             }
             _ => {}
@@ -677,7 +678,9 @@ async fn resume_stage(
     let (request, approval, stored_authorization, stored_receipt) = {
         let operations = service.operations.lock().await;
         let operation = operations.get(operation_id, caller, now_unix)?;
-        if operation.state != helios_api::internal::ClientRenewalOperationState::PendingGrant {
+        if operation.state
+            != aether::certificates::transport::ClientRenewalOperationState::PendingGrant
+        {
             return Ok(());
         }
         (
@@ -832,7 +835,9 @@ async fn reconcile_released_grant(
     let stage_id = {
         let operations = service.operations.lock().await;
         let operation = operations.get(operation_id, caller, now_unix)?;
-        if operation.state != helios_api::internal::ClientRenewalOperationState::PendingCommit {
+        if operation.state
+            != aether::certificates::transport::ClientRenewalOperationState::PendingCommit
+        {
             return Ok(());
         }
         operation
