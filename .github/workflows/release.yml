@@ -1,13 +1,13 @@
 name: Bundle de release
 
-# Déclenché à la main ou sur un tag. La CI **ne signe rien** : elle produit des
-# artefacts nus et leurs empreintes (ADR-004 §7). Les signatures — hybride
-# Ed25519 + ML-DSA-65 pour la gateway, Authenticode pour Orion — sont jouées
-# hors ligne, avec des clés qui n'entrent jamais ici.
+# Déclenché à la main ou sur un tag. La CI hébergée **ne signe rien** : les
+# signatures hybrides Ed25519 + ML-DSA-65 de la gateway restent hors ligne.
+# Orion est signé uniquement par le runner Windows interne protégé, avec une
+# clé non exportable installée dans son magasin de certificats.
 #
 # Deux artefacts, deux plateformes de fabrication : le bundle gateway se
-# construit sous Linux, les installateurs Orion sous Windows, parce que le
-# bundling MSI/NSIS et l'édition de liens MSVC n'y ont pas d'équivalent
+# construit sous Linux, l'installateur Orion sous Windows, parce que le
+# bundling MSI et l'édition de liens MSVC n'y ont pas d'équivalent
 # croisé. Aucun des deux ne demande quoi que ce soit à l'utilisateur final.
 #
 # Les deux jobs restent **indépendants** — aucun `needs` — donc parallèles :
@@ -28,20 +28,45 @@ permissions:
 
 jobs:
   orion-windows:
-    name: Installateurs Orion (Windows)
-    # Le bundling MSI/NSIS et l'édition de liens MSVC n'existent que sur
+    name: Installateur Orion signé (Windows)
+    if: github.event_name == 'push' || github.ref == 'refs/heads/main'
+    environment: orion-signing
+    env:
+      ORION_SIGNING_CERT_SHA1: ${{ vars.ORION_SIGNING_CERT_SHA1 }}
+      ORION_TIMESTAMP_URL: ${{ vars.ORION_TIMESTAMP_URL }}
+    # Le bundling MSI et l'édition de liens MSVC n'existent que sur
     # Windows : ce job est la seule façon de produire un installateur Orion
     # sans machine Windows manuelle.
-    runs-on: windows-latest
+    runs-on: [self-hosted, windows, x64, orion-signing]
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          cache: npm
-          cache-dependency-path: apps/orion/package-lock.json
+      # Le runner est une station de signature, pas une machine jetable. Rust
+      # stable, Node 24, le SDK Windows et signtool y sont préinstallés ; ne pas
+      # télécharger de code d'action tiers dans le contexte qui détient la clé.
+
+      - name: Prérequis de la station de signature
+        shell: pwsh
+        run: |
+          if ($env:ORION_SIGNING_CERT_SHA1 -notmatch '^[0-9A-Fa-f]{40}$') {
+            throw "La variable ORION_SIGNING_CERT_SHA1 est absente ou invalide."
+          }
+          if ([string]::IsNullOrWhiteSpace($env:ORION_TIMESTAMP_URL)) {
+            throw "La variable ORION_TIMESTAMP_URL est absente ou invalide."
+          }
+          $timestamp = [System.Uri]$env:ORION_TIMESTAMP_URL
+          if (-not $timestamp.IsAbsoluteUri -or $timestamp.Scheme -notin @("http", "https")) {
+            throw "La variable ORION_TIMESTAMP_URL est invalide."
+          }
+          $certificate = Get-Item "Cert:\CurrentUser\My\$env:ORION_SIGNING_CERT_SHA1" -ErrorAction Stop
+          if (-not $certificate.HasPrivateKey) {
+            throw "Le certificat Authenticode attendu n'a pas de clé privée."
+          }
+          $configuredSignTool = -not [string]::IsNullOrWhiteSpace($env:TAURI_WINDOWS_SIGNTOOL_PATH) -and
+            (Test-Path -LiteralPath $env:TAURI_WINDOWS_SIGNTOOL_PATH -PathType Leaf)
+          if (-not (Get-Command signtool.exe -ErrorAction SilentlyContinue) -and -not $configuredSignTool) {
+            throw "signtool.exe est introuvable."
+          }
 
       # Orion dépend d'`aether`, dont le build script refuse le trousseau de
       # développement en profil release. Un installateur se construit donc avec
@@ -62,9 +87,6 @@ jobs:
             exit 1
           }
 
-      - name: Dépendances npm
-        run: npm ci --prefix apps/orion
-
       # `cargo xtask orion-msi` télécharge WireGuardNT et vérifie son empreinte
       # épinglée avant d'appeler Tauri. La DLL entre dans l'installateur :
       # l'utilisateur final ne télécharge jamais rien. Le `beforeBuildCommand`
@@ -77,36 +99,35 @@ jobs:
       # énuméreraient chacun de leur côté finiraient par diverger, et la
       # divergence ne se verrait qu'à l'usage — un installateur qui refuse un
       # profil négociant, sans rien dire du drapeau manquant.
-      - name: Construction des installateurs
+      - name: Construction de l'installateur signé
         env:
           HELIOS_PUBLISHER_KEYRING_PATH: ${{ runner.temp }}/publisher-keyring.json
-        run: cargo xtask orion-msi --unsigned --with-nsis --skip-npm-ci
+        run: cargo xtask orion-msi
 
-      # Le suffixe `-unsigned` est posé avant toute publication : un MSI sans
-      # signature ne doit pas pouvoir être confondu avec une release au moment
-      # où quelqu'un le récupère.
-      - name: Marquage et empreintes
+      - name: Vérification Authenticode et empreintes
         shell: pwsh
         run: |
           $bundle = "target/release/bundle"
-          Get-ChildItem -Path $bundle -Recurse -Include *.msi, *.exe | ForEach-Object {
-            $destination = Join-Path $_.DirectoryName "$($_.BaseName)-unsigned$($_.Extension)"
-            Move-Item -LiteralPath $_.FullName -Destination $destination
-          }
-
-          $artifacts = Get-ChildItem -Path $bundle -Recurse -Include *.msi, *.exe
+          $artifacts = @(Get-ChildItem -Path $bundle -Recurse -Filter *.msi)
           if ($artifacts.Count -eq 0) {
-            Write-Output "::error::Aucun installateur produit."
+            Write-Output "::error::Aucun MSI produit."
             exit 1
           }
 
-          # Garde-fou du chemin non signé : il doit avoir réellement laissé les
-          # artefacts nus. Un artefact à moitié signé serait le pire des deux.
-          $signed = $artifacts | Where-Object {
-            (Get-AuthenticodeSignature -LiteralPath $_.FullName).Status -ne "NotSigned"
+          $expected = $env:ORION_SIGNING_CERT_SHA1.Replace(" ", "").ToUpperInvariant()
+          $invalid = $artifacts | Where-Object {
+            $signature = Get-AuthenticodeSignature -LiteralPath $_.FullName
+            $actual = if ($null -ne $signature.SignerCertificate) {
+              $signature.SignerCertificate.Thumbprint
+            } else {
+              $null
+            }
+            $signature.Status -ne "Valid" -or
+              $null -eq $signature.TimeStamperCertificate -or
+              $actual -ne $expected
           }
-          if ($signed) {
-            Write-Output "::error::Artefact signé alors que la CI ne doit rien signer : $($signed.Name -join ', ')"
+          if ($invalid) {
+            Write-Output "::error::MSI absent, mal signé, non horodaté ou signé par un certificat inattendu : $($invalid.Name -join ', ')"
             exit 1
           }
 
@@ -115,14 +136,11 @@ jobs:
             ForEach-Object { "{0}  {1}" -f $_.Hash.ToLower(), (Split-Path -Leaf $_.Path) } |
             Tee-Object -FilePath (Join-Path $bundle "SHA256SUMS")
 
-      # À télécharger sur le poste de signature, signer avec
-      # `windows/sign-orion.ps1`, puis distribuer.
       - uses: actions/upload-artifact@v4
         with:
-          name: installateurs-orion-windows-non-signes
+          name: installateur-orion-windows-signe
           path: |
             target/release/bundle/msi/
-            target/release/bundle/nsis/
             target/release/bundle/SHA256SUMS
           if-no-files-found: error
           retention-days: 14

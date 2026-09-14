@@ -79,6 +79,22 @@ Import-Certificate -FilePath .\orion-root-ca.cer -CertStoreLocation Cert:\LocalM
 L'import du PFX se fait dans `Cert:\CurrentUser\My` sur le poste de signature.
 Son empreinte SHA-1 publique alimente `ORION_SIGNING_CERT_SHA1`.
 
+Depuis une console PowerShell ouverte sous le compte Windows dédié au runner :
+
+```powershell
+.\scripts\setup-orion-signing.ps1 `
+  -PfxPath C:\transfert\orion-code-signing.pfx `
+  -RootCertificatePath C:\transfert\orion-root-ca.cer `
+  -ExpectedThumbprint EMPREINTE_SHA1_SANS_SEPARATEURS
+```
+
+Le script demande le mot de passe sans l'écrire dans la ligne de commande,
+contrôle l'empreinte, l'EKU Code Signing et l'expiration, puis importe la clé
+sans la rendre exportable. Il approuve la racine pour le seul compte de
+signature et configure l'horodateur RFC 3161 utilisé dans l'exemple officiel
+de SignTool. La copie de transfert du PFX est supprimée manuellement après le
+premier build vérifié ; la racine privée reste dans `authority-offline`.
+
 ## Build et horodatage obligatoires
 
 Le fichier `tauri.windows.conf.json` force tous les artefacts Windows produits
@@ -87,8 +103,8 @@ l'empreinte du certificat ou l'URL RFC 3161 manque, appelle `signtool` avec
 `/fd SHA256 /tr … /td SHA256`, puis vérifie avec `/pa /tw`.
 
 ```powershell
-$env:ORION_SIGNING_CERT_SHA1 = "EMPREINTE_SHA1_SANS_ESPACES"
-$env:ORION_TIMESTAMP_URL = "https://tsa.interne.example/rfc3161"
+$env:ORION_SIGNING_CERT_SHA1 = "EMPREINTE_SHA1_SANS_SEPARATEURS"
+$env:ORION_TIMESTAMP_URL = "http://timestamp.digicert.com"
 npm run tauri build --prefix apps/orion -- --features wireguard
 ```
 
@@ -97,34 +113,29 @@ sans jeton temporel n'est pas une release : après expiration du certificat,
 Windows ne pourrait plus établir que le binaire avait été signé pendant sa
 période de validité.
 
-## Fabrication en CI, signature hors ligne
+## Fabrication et signature sur le runner interne
 
-Personne n'installe de chaîne de compilation pour utiliser Orion : la CI
-fabrique l'installateur, et l'utilisateur reçoit un MSI. Le job `orion-windows`
-de `release.yml` tourne sur `windows-latest` — le bundling MSI/NSIS et
-l'édition de liens MSVC n'ont pas d'équivalent croisé depuis Linux — et publie
-les installateurs **non signés** avec leurs empreintes.
+Personne n'installe de chaîne de compilation pour utiliser Orion : le runner
+Windows interne fabrique et signe le MSI, puis l'utilisateur reçoit ce MSI. Le
+bundling WiX et l'édition de liens MSVC n'ont pas d'équivalent croisé depuis
+Linux ou WSL2.
 
-La CI ne détient aucun certificat, et ne doit pas en détenir. Elle emprunte donc
-un chemin explicite :
+Le runner porte les labels `self-hosted`, `windows`, `x64` et
+`orion-signing`. Il utilise un compte Windows dédié, dans lequel le PFX est
+importé sans être exportable. Rust stable, Node 24, le SDK Windows et
+`signtool.exe` sont préinstallés. Les variables de dépôt
+`ORION_SIGNING_CERT_SHA1` et `ORION_TIMESTAMP_URL` ne sont pas secrètes ; le
+PFX et son mot de passe ne sont jamais placés dans GitHub.
 
-```text
-ORION_UNSIGNED_FOR_OFFLINE_SIGNING=1
-```
+L'environnement GitHub `orion-signing` doit exiger une approbation. Le job
+refuse les lancements manuels hors de `main`; les tags de release doivent être
+protégés. Il ne tourne jamais pour une pull request. Après le build, il exige
+que chaque MSI ait une signature `Valid`, le certificat attendu et un jeton
+d'horodatage, puis calcule les empreintes avant publication.
 
-`sign-orion.ps1` refuse toujours de signer sans certificat ni horodatage ; cette
-variable, comparée strictement à `1`, lui fait sauter la signature en le disant
-bruyamment. Le job renomme ensuite les artefacts en `-unsigned` et **vérifie par
-`Get-AuthenticodeSignature` qu'ils sont réellement nus** : un artefact à moitié
-signé serait le pire des deux états.
-
-La suite se joue sur le poste de signature : télécharger l'artefact, le signer
-avec `windows/sign-orion.ps1` en fournissant les deux variables ci-dessus, puis
-distribuer. C'est la même séparation que pour le bundle gateway, où la CI
-assemble et où `helios-publisher` signe hors ligne.
-
-Une machine Windows de développement reste utile pour itérer, mais elle n'est
-plus le seul chemin vers un installateur.
+Le chemin `cargo xtask orion-msi --unsigned` reste disponible uniquement pour
+les essais locaux. Aucun artefact empruntant ce chemin n'est publié par la
+release.
 
 ## Amorçage circulaire
 

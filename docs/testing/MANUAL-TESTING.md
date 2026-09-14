@@ -194,8 +194,8 @@ Sur le poste de build **Windows**, une seule commande :
 
 ```powershell
 $env:HELIOS_PUBLISHER_KEYRING_PATH = "C:\chemin\publisher-keyring.json"
-$env:ORION_SIGNING_CERT_SHA1 = "EMPREINTE_SHA1_SANS_ESPACES"
-$env:ORION_TIMESTAMP_URL = "https://tsa.interne.example/rfc3161"
+$env:ORION_SIGNING_CERT_SHA1 = "EMPREINTE_SHA1_SANS_SEPARATEURS"
+$env:ORION_TIMESTAMP_URL = "http://timestamp.digicert.com"
 cargo xtask orion-msi
 ```
 

@@ -756,6 +756,24 @@ mod tests {
             "the release job must build the installer through `xtask orion-msi`"
         );
         assert!(
+            workflow.contains("runs-on: [self-hosted, windows, x64, orion-signing]"),
+            "the signing key must remain on the dedicated internal runner"
+        );
+        assert!(
+            !workflow.contains("cargo xtask orion-msi --unsigned"),
+            "the release must not publish an unsigned Orion installer"
+        );
+        for required in [
+            "Get-AuthenticodeSignature",
+            "TimeStamperCertificate",
+            "ORION_SIGNING_CERT_SHA1",
+        ] {
+            assert!(
+                workflow.contains(required),
+                "the release must verify the signed and timestamped MSI: {required}"
+            );
+        }
+        assert!(
             !workflow.contains("tauri build"),
             "the release job must not spell out its own Tauri invocation: the features would drift"
         );

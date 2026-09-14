@@ -122,13 +122,21 @@ Le document reste le format v1 déjà lu par `orion-core::profile_import`. Le
 champ `private_key` y devient facultatif : c’est ce qui rend le mode invitation
 représentable sans inventer un second format.
 
-### 7. Aucun secret ne traverse la CI
+### 7. Aucun secret ne traverse la CI hébergée
 
-La CI construit et publie des artefacts **nus** accompagnés de leurs
-empreintes. La signature hybride ADR-002 est jouée hors ligne, depuis le poste
-éditeur, sur l’artefact exact publié. Cela conserve l’invariant « les secrets
-éditeur n’entrent jamais dans le dépôt » sans demander de HSM ni de signature
-sans clé.
+La CI hébergée construit et publie les artefacts gateway **nus** accompagnés de
+leurs empreintes. La signature hybride ADR-002 est jouée hors ligne, depuis le
+poste éditeur, sur l’artefact exact publié. Cela conserve l’invariant « les
+secrets éditeur n’entrent jamais dans le dépôt » sans demander de HSM ni de
+signature sans clé.
+
+Le certificat Authenticode Orion suit une frontière distincte : sa clé privée
+non exportable vit dans le magasin d'un compte Windows dédié sur un runner
+interne. Seul le workflow de release protégé peut adresser ce runner, depuis un
+tag protégé ou `main` après approbation ; aucune pull request n'y est exécutée.
+Le PFX, son mot de passe et la clé de l'autorité interne ne traversent jamais
+GitHub. Le runner signe pendant le bundling Tauri afin que l'exécutable contenu
+dans le MSI et l'enveloppe MSI portent tous deux Authenticode.
 
 Le trousseau **public** de l’éditeur n’est pas un secret : c’est l’ancre de
 confiance compilée dans le binaire. Il est fourni à la CI en variable de dépôt,
