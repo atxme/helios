@@ -73,42 +73,42 @@ const PHASE: Record<CertificatePhase, PhaseSkin> = {
   not_yet_valid: {
     label: 'pas encore valide',
     color: AHEAD,
-    hint: 'Préparé pour plus tard : sa validité n’a pas commencé. Une rotation en cours a cette allure.',
+    hint: 'Sa période de validité n’a pas encore commencé.',
     alarming: false,
     severity: 1,
   },
   valid: {
     label: 'valide',
     color: CALM,
-    hint: 'Dans sa période de validité, avant les 80 % qui ouvrent le renouvellement.',
+    hint: 'Dans sa période de validité.',
     alarming: false,
     severity: 0,
   },
   renewal_due: {
     label: 'renouvellement ouvert',
     color: DUE,
-    hint: 'Passé 80 % de sa durée de vie : c’est la fenêtre où le renouvellement doit avoir lieu.',
+    hint: 'Le renouvellement peut avoir lieu.',
     alarming: true,
     severity: 2,
   },
   warning: {
     label: 'renouvellement en retard',
     color: DUE,
-    hint: 'Passé 90 % de sa durée de vie. Le renouvellement aurait dû aboutir.',
+    hint: 'Le renouvellement aurait dû aboutir.',
     alarming: true,
     severity: 3,
   },
   critical: {
     label: 'expiration imminente',
     color: LATE,
-    hint: 'Passé 95 % de sa durée de vie. À l’échéance, la connexion échouera avant WireGuard.',
+    hint: 'À l’échéance, la connexion échouera.',
     alarming: true,
     severity: 4,
   },
   expired: {
     label: 'expiré',
     color: LATE,
-    hint: 'Hors validité : la connexion échoue avant WireGuard.',
+    hint: 'Hors validité : la connexion échoue.',
     alarming: true,
     severity: 5,
   },
@@ -294,20 +294,14 @@ export function CertificatePanel({
             Opérateur
           </Typography>
           {inventory.operator_credentials && (
-            <>
-              <Box sx={{ display: 'flex', alignItems: 'baseline', gap: 1, minWidth: 0 }}>
-                <Typography color="text.secondary" sx={{ width: 110, flexShrink: 0, fontSize: 11.5 }}>
-                  credentials
-                </Typography>
-                <Typography color="text.primary" sx={{ fontSize: 11.5, fontWeight: 600 }}>
-                  registre époque {inventory.operator_credentials.registry_epoch}
-                </Typography>
-              </Box>
-              <Typography color="text.disabled" sx={{ pl: '118px', fontSize: 11, lineHeight: 1.45 }}>
-                Détail non conservé sur ce poste : Orion n’affiche aucune clé sans registre vérifié
-                sous CA-PQ.
+            <Box sx={{ display: 'flex', alignItems: 'baseline', gap: 1, minWidth: 0 }}>
+              <Typography color="text.secondary" sx={{ width: 110, flexShrink: 0, fontSize: 11.5 }}>
+                credentials
               </Typography>
-            </>
+              <Typography color="text.primary" sx={{ fontSize: 11.5, fontWeight: 600 }}>
+                registre époque {inventory.operator_credentials.registry_epoch}
+              </Typography>
+            </Box>
           )}
           {recovery && (
             <>
@@ -380,7 +374,7 @@ function RenewalResult({
   return (
     <Alert severity={notDue ? 'info' : 'error'} variant="outlined" sx={{ py: 0, fontSize: 11 }}>
       {notDue
-        ? 'Renouvellement non nécessaire pour le moment : le certificat client est encore valide et la protection de la gateway bloque la rotation avant sa fenêtre.'
+        ? 'Renouvellement pas encore nécessaire.'
         : message}
     </Alert>
   )

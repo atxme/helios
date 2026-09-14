@@ -112,7 +112,7 @@ export function postureMeta(state: TunnelState, adapterUp: boolean): PostureMeta
     return {
       posture: 'exposed',
       label: 'Exposé',
-      detail: 'Aucun adaptateur WireGuard : le trafic sort hors tunnel.',
+      detail: 'Trafic hors tunnel.',
       color: EXPOSED,
       accent: EXPOSED_VIVID,
     }
@@ -123,7 +123,7 @@ export function postureMeta(state: TunnelState, adapterUp: boolean): PostureMeta
       label: 'Protégé',
       // "Tout" would be a word too many: DNS queries leave outside the
       // tunnel, a documented limit the posture panel states in full.
-      detail: 'Dernier handshake WireGuard il y a moins de 150 s : le trafic IP passe par la gateway.',
+      detail: 'Trafic routé par la gateway.',
       color: UP,
       accent: UP_VIVID,
     }
@@ -131,7 +131,7 @@ export function postureMeta(state: TunnelState, adapterUp: boolean): PostureMeta
   return {
     posture: 'blocked',
     label: 'Trafic bloqué',
-    detail: 'Adaptateur WireGuard monté sans tunnel actif. Se reconnecter, ou déconnecter pour le démonter.',
+    detail: 'Tunnel inactif. Reconnectez-vous ou déconnectez.',
     color: BLOCKED,
     accent: BLOCKED_VIVID,
   }

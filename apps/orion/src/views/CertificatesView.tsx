@@ -221,8 +221,7 @@ export function CertificatesView({
 
       {profiles !== null && !failed && helios.length === 0 && (
         <Typography color="text.secondary" sx={{ fontSize: 11.5, lineHeight: 1.55 }}>
-          Aucun profil de ce poste ne négocie de clé : un profil WireGuard ordinaire n’épingle
-          aucun certificat.
+          Aucun profil de ce poste ne négocie de clé.
         </Typography>
       )}
 
@@ -405,8 +404,7 @@ function RenewalStep({
       {step?.step === 'recovery_awaiting_operator' && (
         <>
           <Typography color="text.secondary" sx={{ mt: 0.75, fontSize: 11.5, lineHeight: 1.55 }}>
-            Demande déposée. Elle attend un opérateur muni de sa clé, sur son propre poste :
-            l’identité de celui-ci a expiré et ne peut plus rien approuver.
+            Demande déposée. Elle attend un opérateur muni de sa clé.
           </Typography>
           {onApprove && (
             <Button
@@ -464,8 +462,8 @@ function RenewalStep({
           {manualPath && (
             <>
               <Typography color="text.disabled" sx={{ mt: 0.5, fontSize: 11, lineHeight: 1.5 }}>
-                Sur le poste qui porte la clé, l’approbation s’y fait par cette commande, puis
-                on relance « Récupérer le certificat expiré » ici.
+                Lancer cette commande sur le poste qui porte la clé, puis relancer
+                « Récupérer le certificat expiré » ici.
               </Typography>
               <Row label="commande" value={step.operator_command} copyable />
             </>
@@ -493,9 +491,6 @@ function RenewalStep({
             </Button>
           ) : (
             <Box sx={{ mt: 0.75 }}>
-              <Typography color="text.disabled" sx={{ fontSize: 11, lineHeight: 1.5, mb: 0.5 }}>
-                Vérifié contre ce que ce profil épingle. C’est cela qui sera signé.
-              </Typography>
               <Row label="pair" value={manifest.client_wg_public_key} copyable />
               <Row
                 label="génération"
@@ -519,9 +514,7 @@ function RenewalStep({
 
               {manifest.eligible_credentials === 0 ? (
                 <Alert severity="warning" variant="outlined" sx={{ mt: 0.75, fontSize: 11.5 }}>
-                  Aucune clé du domaine n’est autorisée à répondre à cette demande. Rien à
-                  toucher ici : c’est le registre de credentials qu’il faut reprendre côté
-                  autorité.
+                  Aucune clé du domaine n’est autorisée à répondre à cette demande.
                 </Alert>
               ) : (
                 <>
@@ -590,7 +583,7 @@ function RenewalStep({
           </Button>
           {launch?.state === 'launched' && (
             <Alert severity="info" variant="outlined" sx={{ mt: 0.75, fontSize: 11.5 }}>
-              Compagnon lancé. L’approbation et la clé matérielle restent dans sa fenêtre.
+              Compagnon lancé : l’approbation se poursuit dans sa fenêtre.
             </Alert>
           )}
           {launch?.state === 'failed' && (

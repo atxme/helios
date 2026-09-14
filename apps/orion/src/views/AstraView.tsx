@@ -311,8 +311,7 @@ export function AstraView({
           Astra
         </Typography>
         <Typography color="text.secondary" sx={{ fontSize: 11.5, lineHeight: 1.55, mb: 1.5 }}>
-          Une opération attend l’opérateur. Rien n’est à saisir : tout ce qui est montré
-          ci-dessous vient de ce que le coffre épingle.
+          Une opération attend l’opérateur.
         </Typography>
         <OperatorCeremonyPanel
           status={ceremony}
@@ -367,8 +366,7 @@ export function AstraView({
         <Typography color="text.secondary" sx={{ fontSize: 11.5, lineHeight: 1.55, mb: 1.5 }}>
           {pending.length === 1
             ? 'Une opération attend l’opérateur.'
-            : `${pending.length} opérations attendent l’opérateur.`}{' '}
-          Le détail complet est montré avant qu’une clé soit demandée.
+            : `${pending.length} opérations attendent l’opérateur.`}
         </Typography>
         <Stack spacing={1.25}>
           {pending.map((operation) => {
@@ -405,8 +403,7 @@ export function AstraView({
                 </Button>
                 {!supported && (
                   <Alert severity="warning" variant="outlined" sx={{ mt: 1, fontSize: 11.5 }}>
-                    Cette famille n’est pas encore portée dans Orion. Utiliser l’adaptateur
-                    astra-signer jusqu’à sa parité fonctionnelle et sa recette Windows.
+                    Cette cérémonie n’est pas encore disponible dans Orion.
                   </Alert>
                 )}
               </Paper>
@@ -428,9 +425,7 @@ export function AstraView({
         Astra
       </Typography>
       <Typography color="text.secondary" sx={{ fontSize: 11.5, lineHeight: 1.55, mb: 1.5 }}>
-        Rotation de l’autorité CA-TLS cliente. C’est la dernière cérémonie encore pilotée
-        par cette page : les autres se présentent d’elles-mêmes quand elles attendent
-        l’opérateur, sans rien à saisir.
+        Rotation de l’autorité CA-TLS cliente.
       </Typography>
 
       <Paper variant="outlined" sx={{ p: 1.75 }}>
@@ -484,7 +479,7 @@ export function AstraView({
           <CeremonyStep
             number={1}
             title="Vérifier la campagne"
-            detail="Astra lit la campagne existante et vérifie l’ancre actuellement en service."
+            detail="Lecture de la campagne en cours."
             state={stateOf(0, phase)}
           />
           <CeremonyStep
@@ -493,7 +488,7 @@ export function AstraView({
             detail={
               status?.first_key_label
                 ? `Clé reconnue : ${status.first_key_label}`
-                : 'Branchez la clé principale, puis continuez. Le système demandera son PIN et son contact.'
+                : 'Branchez la clé principale, puis continuez.'
             }
             state={stateOf(1, phase)}
           />
@@ -513,15 +508,13 @@ export function AstraView({
           <>
             {status.manifest && <CampaignManifest status={status} />}
             <Alert severity="info" variant="outlined" icon={<KeyRound size={17} />} sx={{ mt: 1.5, fontSize: 11.5 }}>
-              {status.message} Branchez la première clé autorisée. Le système demandera le
-              PIN et le contact après votre clic sur Continuer.
+              {status.message}
             </Alert>
           </>
         )}
         {status?.phase === 'awaiting_second_key' && (
           <Alert severity="info" variant="outlined" icon={<KeyRound size={17} />} sx={{ mt: 1.5, fontSize: 11.5 }}>
-            {status.message} Débranchez la première clé, puis branchez la seconde. Le système
-            demandera le PIN et le contact après votre clic sur Continuer.
+            {status.message}
           </Alert>
         )}
         {['starting', 'processing_first_key', 'processing_second_key', 'finalizing'].includes(
@@ -536,14 +529,13 @@ export function AstraView({
         )}
         {status?.phase === 'prepared' && (
           <Alert severity="warning" variant="outlined" sx={{ mt: 1.5, fontSize: 11.5 }}>
-            {status.message} La transition est préparée sur disque, mais son dépôt n’est pas
-            confirmé.
+            {status.message} Le dépôt n’est pas confirmé.
           </Alert>
         )}
         {status?.phase === 'deposited' && (
           <Alert severity="success" variant="outlined" sx={{ mt: 1.5, fontSize: 11.5 }}>
-            Transition CA-TLS préparée et déposée{status.output_path ? ` dans ${status.output_path}` : ''}.
-            La promotion CA-TLS reste requise à la fin de la fenêtre de recouvrement.
+            Transition CA-TLS déposée{status.output_path ? ` dans ${status.output_path}` : ''}.
+            La promotion reste à faire.
           </Alert>
         )}
         {status?.phase === 'awaiting_promotion_key' && (
@@ -553,7 +545,7 @@ export function AstraView({
         )}
         {status?.phase === 'promoted' && (
           <Alert severity="success" variant="outlined" sx={{ mt: 1.5, fontSize: 11.5 }}>
-            {status.message} Le coffre CA-TLS utilise maintenant la nouvelle époque.
+            {status.message}
           </Alert>
         )}
         {(status?.phase === 'failed' || error) && (

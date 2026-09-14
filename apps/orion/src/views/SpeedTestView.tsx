@@ -875,10 +875,6 @@ export function SpeedTestView({ state, profile }: Props) {
               <Typography sx={{ fontSize: 15.5, fontWeight: 700 }}>
                 Prêt à tester votre connexion
               </Typography>
-              <Typography color="text.secondary" sx={{ fontSize: 12, lineHeight: 1.5, maxWidth: 330 }}>
-                Ce test mesure votre débit en réception, en émission ainsi que la latence de votre
-                connexion.
-              </Typography>
               {startButton('Lancer le test', <Play size={16} aria-hidden />)}
               {availability}
             </Stack>

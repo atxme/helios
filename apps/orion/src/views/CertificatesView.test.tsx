@@ -290,7 +290,6 @@ describe('CertificatesView', () => {
     render(<CertificatesView />)
 
     expect(await screen.findByText('registre époque 7')).toBeTruthy()
-    expect(screen.getByText(/Détail non conservé sur ce poste/)).toBeTruthy()
     expect(screen.getByText('indisponible')).toBeTruthy()
     expect(screen.getByText('Aucun certificat client n’est expiré.')).toBeTruthy()
   })
@@ -453,7 +452,9 @@ describe('CertificatesView', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Renouveler maintenant' }))
     fireEvent.click(await screen.findByRole('button', { name: 'Lire la demande d’approbation' }))
 
-    expect(await screen.findByText(/registre de credentials/)).toBeTruthy()
+    expect(
+      await screen.findByText(/Aucune clé du domaine n’est autorisée à répondre/),
+    ).toBeTruthy()
     expect(screen.queryByRole('button', { name: 'Approuver avec la clé' })).toBeNull()
     // And the other door stays open: the key may be elsewhere.
     expect(screen.getByRole('button', { name: 'Relancer le compagnon' })).toBeTruthy()
