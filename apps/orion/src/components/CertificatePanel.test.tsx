@@ -257,7 +257,7 @@ describe('CertificatePanel', () => {
       />,
     )
     const alert = screen.getByRole('alert')
-    expect(alert.textContent).toMatch(/Renouvellement non nécessaire pour le moment/)
+    expect(alert.textContent).toMatch(/Renouvellement pas encore nécessaire/)
     expect(alert.className).toContain('MuiAlert-colorInfo')
   })
 

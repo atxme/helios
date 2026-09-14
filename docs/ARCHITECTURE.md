@@ -191,7 +191,7 @@ operator workstation, never on the gateway it rescues.
 
 ## Verified boot and update window
 
-`helio-tpm` seals the secret protecting the gateway's WireGuard identity against
+`helios-tpm` seals the secret protecting the gateway's WireGuard identity against
 PCR 0/4/7. A v2 resealing ticket must carry two valid signatures over the same
 canonical bytes — Ed25519 **and** ML-DSA-65. The signed key epoch selects a
 compiled public keyring; its counter is mandatory and must strictly increase;

@@ -10,7 +10,7 @@ clés (ADR-001 §2, déjà post-quantique via ML-KEM-1024).
 | Lot | État | Preuve principale |
 |---|---|---|
 | Enveloppe hybride et trousseau | fait | `aether::sig`, tests anti-downgrade et Ed25519 strict |
-| Billet TPM v2 | fait | `helio-tpm::reseal_ticket`, rupture v1 sans fallback |
+| Billet TPM v2 | fait | `helios-tpm::reseal_ticket`, rupture v1 sans fallback |
 | Récupération WireGuard | bloqué | arbitrage compteur fichier / NV TPM requis |
 | Outil éditeur | fait | `helios-publisher`, auto-vérification et tests CLI |
 
@@ -131,7 +131,7 @@ Sans cela, on aurait signé un artefact rejouable — une fausse sécurité.
 * **`aether::sig`** (nouveau) — l'abstraction `SignatureSuite`, l'enveloppe et la
   vérification hybride. Dans `aether` parce que le client Orion en aura besoin
   s'il vérifie un jour des artefacts éditeur.
-* **`helio-tpm`** — consomme `aether::sig` pour le billet et la récupération ;
+* **`helios-tpm`** — consomme `aether::sig` pour le billet et la récupération ;
   perd sa dépendance directe à `ed25519-dalek`.
 * **Ancrage de confiance** — les clés publiques éditeur (Ed25519 + ML-DSA) sont
   **compilées dans le binaire**. Une rotation de clé éditeur exige donc une mise
@@ -144,7 +144,7 @@ Sans cela, on aurait signé un artefact rejouable — une fausse sécurité.
 | Besoin | Crate | Détail |
 |---|---|---|
 | ML-DSA-65 | **`fips204` 0.4.x** | signature (outil éditeur) + vérification (gateway) |
-| Ed25519 | **`aws-lc-rs`** | `ed25519-dalek` retiré de `helio-tpm` — un seul backend |
+| Ed25519 | **`aws-lc-rs`** | `ed25519-dalek` retiré de `helios-tpm` — un seul backend |
 | ML-KEM / AEAD / hash | **`aws-lc-rs`** | inchangé vs ADR-001 ; feature `fips` reste **optionnelle** |
 | SLH-DSA | **aucun** | prévu par le format *n*-signatures uniquement |
 
@@ -170,7 +170,7 @@ inconnus supplémentaires : ignorés (compatibilité avant). Jamais « au moins 
 | Crate | Rôle |
 |---|---|
 | **`aether::sig`** | `AlgId`, enveloppe, `verify` hybride, `sign` derrière une feature |
-| **`helio-tpm`** | consomme `aether::sig` pour le billet et la récupération |
+| **`helios-tpm`** | consomme `aether::sig` pour le billet et la récupération |
 | **outil éditeur** | seul binaire compilant `sign` ; détient les clés privées |
 | **gateway** | `verify` **seul** ; clés publiques éditeur compilées dans le binaire |
 
@@ -323,7 +323,7 @@ Une période de double acceptation serait précisément une fenêtre de downgrad
 | Lot | Contenu | Prérequis |
 |---|---|---|
 | 1 | `aether::sig` : enveloppe (`key_epoch` **signé**, amendement 3), suite hybride, trousseau compilé, vérification anti-downgrade + tests dédiés | — |
-| 2 | Billet de rescellement → enveloppe `v2` ; `ed25519-dalek` retiré de `helio-tpm` ; **tests existants portés** (amendement 4) | lot 1 |
+| 2 | Billet de rescellement → enveloppe `v2` ; `ed25519-dalek` retiré de `helios-tpm` ; **tests existants portés** (amendement 4) | lot 1 |
 | 3 | Fichier de récupération signé : compteur obligatoire + PCR optionnel (amendement 1), câblage `gateway_key` | lot 1 + **trancher l'amendement 2** |
 | 4 | Outil éditeur de signature (hors gateway) et documentation opérateur | lot 1 |
 

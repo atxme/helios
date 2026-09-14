@@ -5,7 +5,7 @@
 //! `wg_private_key` is the gateway's **cryptographic identity**: it is what
 //! authenticates every WireGuard handshake. In the clear on disk, a stolen
 //! disk is enough to impersonate the gateway. It is therefore moved into a
-//! vault encrypted by the secret sealed in the TPM ([`helio_tpm::keystore`]):
+//! vault encrypted by the secret sealed in the TPM ([`helios_tpm::keystore`]):
 //! decrypting it requires a successful unseal, hence an intact boot chain
 //! (PCR 0/4/7).
 //!
@@ -29,7 +29,7 @@
 //! # Recovery without SSH: escrow
 //!
 //! When the PCRs change, resealing generates a **new** secret and the vault
-//! becomes undecipherable. [Escrow](helio_tpm::escrow) covers this case: a
+//! becomes undecipherable. [`helios_escrow`] covers this case: a
 //! copy of the key, encrypted to the operator's public key, is written on
 //! every sealing. The operator opens it offline, deposits the key into a
 //! recovery file delivered **with the OTA bundle** — the same channel as the
@@ -41,7 +41,7 @@
 use std::path::PathBuf;
 
 use aether::NetworkConfig;
-use helio_tpm::{BootDecision, KeystoreError, SealedKeystore, TpmError};
+use helios_tpm::{BootDecision, KeystoreError, SealedKeystore, TpmError};
 use tracing::{info, warn};
 
 /// Location of the vault containing the WireGuard private key.
@@ -116,7 +116,7 @@ pub struct ResolvedKey {
 fn keystore() -> SealedKeystore {
     SealedKeystore::new(
         PathBuf::from(keystore_path()),
-        helio_tpm::DOMAIN_GATEWAY_WG_KEY,
+        helios_tpm::DOMAIN_GATEWAY_WG_KEY,
     )
 }
 
@@ -125,10 +125,10 @@ fn keystore() -> SealedKeystore {
 /// It is what stops a vault from being opened as another gateway's, and it is
 /// derivable from the very secret the vault holds — which is why reading goes
 /// through `load_declared` and compares afterwards (ADR-006 §2).
-fn identity_context(private_key: &str) -> Result<helio_tpm::Context, String> {
+fn identity_context(private_key: &str) -> Result<helios_tpm::Context, String> {
     let public = aether::wg::public_from_private(private_key)
         .map_err(|e| format!("deriving the gateway public key: {e}"))?;
-    Ok(helio_tpm::Context::new().field("wg_public_key", public.as_bytes()))
+    Ok(helios_tpm::Context::new().field("wg_public_key", public.as_bytes()))
 }
 
 /// What a vault's declared context says about the key it contains.
@@ -196,7 +196,7 @@ fn write_escrow(network: &NetworkConfig, private_key: &str) {
         }
     };
 
-    match helio_tpm::escrow::seal_to_operator(&pubkey, private_key.as_bytes()) {
+    match helios_escrow::seal_to_operator(&pubkey, private_key.as_bytes()) {
         Ok(blob) => match write_atomic(&escrow_path(), &blob) {
             Ok(()) => info!(
                 path = %escrow_path(),
@@ -213,7 +213,7 @@ fn write_escrow(network: &NetworkConfig, private_key: &str) {
 /// Only called when the vault is undecipherable: outside of that case, a
 /// stray recovery file must never be able to replace the key in effect —
 /// that would be an identity substitution vector.
-fn try_recovery(secret: &helio_tpm::SecretKey) -> Option<String> {
+fn try_recovery(secret: &helios_tpm::SecretKey) -> Option<String> {
     let path = PathBuf::from(recovery_path());
     if !path.exists() {
         return None;
@@ -551,7 +551,7 @@ mod tests {
     }
 
     fn context_of(public_key: &str) -> Vec<u8> {
-        helio_tpm::Context::new()
+        helios_tpm::Context::new()
             .field("wg_public_key", public_key.as_bytes())
             .as_bytes()
             .to_vec()
@@ -632,7 +632,7 @@ mod tests {
     #[test]
     fn a_context_under_another_label_is_refused() {
         let (private_key, public_key) = keypair();
-        let mislabelled = helio_tpm::Context::new()
+        let mislabelled = helios_tpm::Context::new()
             .field("public_key", public_key.as_bytes())
             .as_bytes()
             .to_vec();
@@ -690,7 +690,7 @@ mod tests {
     #[test]
     fn the_escrow_is_written_and_only_the_operator_can_open_it() {
         let (private_key, public_key) =
-            helio_tpm::escrow::generate_operator_keypair().expect("operator keypair");
+            helios_escrow::generate_operator_keypair().expect("operator keypair");
         let network = NetworkConfig {
             escrow_public_key: Some(base64::engine::general_purpose::STANDARD.encode(public_key)),
             ..NetworkConfig::default()
@@ -706,7 +706,7 @@ mod tests {
                     .any(|w| w == wg_private.as_bytes()),
                 "the escrow holds the key in the clear"
             );
-            let opened = helio_tpm::escrow::open_as_operator(private_key.as_ref(), &blob)
+            let opened = helios_escrow::open_as_operator(private_key.as_ref(), &blob)
                 .expect("the operator must be able to open it");
             assert_eq!(opened.as_slice(), wg_private.as_bytes());
         });
@@ -716,8 +716,7 @@ mod tests {
     /// no client expects anymore.
     #[test]
     fn the_escrow_is_replaced_rather_than_appended() {
-        let (_, public_key) =
-            helio_tpm::escrow::generate_operator_keypair().expect("operator keypair");
+        let (_, public_key) = helios_escrow::generate_operator_keypair().expect("operator keypair");
         let network = NetworkConfig {
             escrow_public_key: Some(base64::engine::general_purpose::STANDARD.encode(public_key)),
             ..NetworkConfig::default()

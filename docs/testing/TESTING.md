@@ -401,7 +401,7 @@ Répéter pour chaque classe de paquet : noyau, `grub-efi` / `shim-signed`,
   retombe sur billet et séquestre.
 
 Le cycle NV — armement, état, révocation — est partiellement couvert par
-`cargo test -p helio-tpm --features tpm --test materiel` avec
+`cargo test -p helios-tpm --features tpm --test materiel` avec
 `HELIOS_TPM_MATERIEL=1`. Ce test **écrit** un index NV disposable
 (`0x01804846`), contrairement aux autres du fichier ; le retirer ensuite avec
 `tpm2_nvundefine 0x01804846` si la machine n'est pas jetable. La consommation

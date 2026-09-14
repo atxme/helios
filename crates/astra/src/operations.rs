@@ -46,6 +46,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use aether::certificates::transport::{ClientRenewalOperationState, ClientRenewalOperationView};
 use aether::certificates::{
     approval::{
         AstraCampaignApprovalEvidence, AstraCredentialApprovalRequest,
@@ -57,7 +58,6 @@ use aether::certificates::{
     },
     encoding::{Fingerprint, Id16, WireGuardKey},
 };
-use helios_api::internal::{ClientRenewalOperationState, ClientRenewalOperationView};
 use serde::{Deserialize, Serialize};
 
 /// Largest number of operations held at once.

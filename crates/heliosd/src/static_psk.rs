@@ -35,7 +35,7 @@
 use std::collections::BTreeMap;
 
 use aether::SecretString;
-use helio_tpm::Context;
+use helios_tpm::Context;
 use zeroize::Zeroizing;
 
 /// Vault domain of the table (ADR-006 §2).

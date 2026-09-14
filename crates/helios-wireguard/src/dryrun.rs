@@ -208,21 +208,4 @@ mod tests {
         let bad = peer("AAAA", "100.64.1.2/32");
         assert!(be.up(&iface(), &[bad]).await.is_err());
     }
-
-    #[tokio::test]
-    async fn snapshot_feeds_the_ipam() {
-        use helios_provisioning::PeerTable;
-
-        let be = DryRunBackend::with_handshakes();
-        be.up(&iface(), &[peer(KEY_B, "100.64.1.2/32")])
-            .await
-            .unwrap();
-
-        let snapshot = be.peers().await.unwrap();
-        assert!(snapshot[0].last_handshake.is_some());
-
-        let table = crate::PeerAddressTable::from_peers(&snapshot);
-        let vip = "100.64.1.2".parse().unwrap();
-        assert!(table.is_taken_by_other(vip, &[9u8; 32]));
-    }
 }

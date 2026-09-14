@@ -1062,7 +1062,7 @@ export function ProfilesView({
             <ReadOnlyField
               label="Votre clé publique"
               value={publicKey ?? '—'}
-              hint="À transmettre à l’opérateur : l’admission est hors bande, elle doit être déclarée sur Helios avant le premier handshake."
+              hint="À transmettre à l’opérateur."
             />
 
             <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1, alignItems: 'center' }}>
@@ -1243,15 +1243,9 @@ export function ProfilesView({
             </Typography>
           </Box>
 
-          {exists && (
-            <Alert
-              severity={kindChanged ? 'error' : 'info'}
-              role={kindChanged ? 'alert' : 'note'}
-              sx={{ mb: 1.5 }}
-            >
-              {kindChanged
-                ? `Le type enregistré « ${storedKind} » ne peut pas devenir « ${draftKind} » sous le même identifiant. Rétablissez le type initial ou choisissez un nouveau nom.`
-                : 'Le type d’un profil enregistré est immuable. Pour utiliser l’autre type, créez un nouveau profil sous un autre nom afin qu’il reçoive un identifiant distinct.'}
+          {kindChanged && (
+            <Alert severity="error" role="alert" sx={{ mb: 1.5 }}>
+              {`Le type enregistré « ${storedKind} » ne peut pas devenir « ${draftKind} » sous le même identifiant. Rétablissez le type initial ou choisissez un nouveau nom.`}
             </Alert>
           )}
 
@@ -1354,13 +1348,10 @@ export function ProfilesView({
         </DialogTitle>
         <DialogContent>
           <DialogContentText component="div">
-            Le volume qui stocke les profils Orion n’est pas chiffré par BitLocker. Orion
-            chiffrera la configuration dans son coffre, mais la protection restera incomplète :
-            d’anciens blocs SSD, le fichier d’échange et le fichier d’hibernation peuvent conserver
-            des traces de la clé.
+            Le volume qui stocke les profils n’est pas chiffré par BitLocker : la protection
+            de vos secrets au repos restera incomplète.
             <Box component="span" sx={{ display: 'block', mt: 1.5 }}>
-              En continuant, vous acceptez cette protection dégradée pour ce poste. Orion la
-              signalera comme protection incomplète.
+              En continuant, vous acceptez ce niveau de protection pour ce poste.
             </Box>
           </DialogContentText>
         </DialogContent>
@@ -1450,7 +1441,7 @@ function KeyNegotiation({
             belongs. */}
         <Tooltip
           describeChild
-          title="Sans négociation, le tunnel monte avant toute authentification post-quantique : le premier handshake n’est pas protégé."
+          title="Active la négociation post-quantique."
         >
           <span style={{ marginLeft: 'auto' }}>
             <Button
@@ -1490,7 +1481,7 @@ function KeyNegotiation({
         {removable && (
           <Tooltip
             describeChild
-            title="Retirer la négociation : le profil redevient un pair WireGuard ordinaire, et le tunnel monte sans protection avant le premier handshake."
+            title="Repasse le profil en WireGuard simple."
           >
             <Button
               size="small"
@@ -1517,8 +1508,7 @@ function KeyNegotiation({
 
       {notNegotiable && (
         <Caution>
-          Ce profil demande le mode <strong>classique</strong>, que la gateway refuse de négocier.
-          Choisir « PSK » ou « ML-KEM », ou retirer la négociation.
+          Mode <strong>classique</strong> refusé par la gateway. Choisir « PSK » ou « ML-KEM ».
         </Caution>
       )}
 
@@ -1532,7 +1522,7 @@ function KeyNegotiation({
         modes={PROTECTION_MODES}
         value={settings.minimum_mode}
         floor={floorBaseline ?? 'classic'}
-        hint="Mode sous lequel ce profil refuse de négocier, avant tout accès réseau. Il ne redescend pas : le relever engage les connexions suivantes."
+        hint="Niveau minimum exigé. Ne redescend jamais."
         onChange={onRaiseFloor}
       />
 
@@ -1578,9 +1568,7 @@ function KeyNegotiation({
 
       {unusable && (
         <Caution>
-          Aucun stockage protégé d’identité sur ce poste : le certificat client ne peut pas
-          être scellé ni relu, et la connexion échouera <strong>avant</strong> WireGuard. Le
-          scellement passe par DPAPI, qui n’existe que sous Windows.
+          Aucun stockage protégé d’identité sur ce poste : la connexion échouera.
         </Caution>
       )}
     </Box>
@@ -1702,21 +1690,16 @@ function EncodedData({
             store yet: a reissued certificate is re-pasted here. Saying so on
             hover is what keeps the day it happens from looking like a
             breakage. */}
-        <Tooltip
-          describeChild
-          title="Matériel public d’épinglage. Le renouvellement automatique n’est pas branché côté Orion : après une réémission, la nouvelle valeur se colle ici."
+        <Button
+          size="small"
+          variant="text"
+          color="inherit"
+          startIcon={<FileCode2 size={14} aria-hidden />}
+          onClick={() => setOpen(true)}
+          sx={{ ml: 'auto', flexShrink: 0, color: 'text.secondary', fontSize: 11 }}
         >
-          <Button
-            size="small"
-            variant="text"
-            color="inherit"
-            startIcon={<FileCode2 size={14} aria-hidden />}
-            onClick={() => setOpen(true)}
-            sx={{ ml: 'auto', flexShrink: 0, color: 'text.secondary', fontSize: 11 }}
-          >
-            Afficher les données encodées
-          </Button>
-        </Tooltip>
+          Afficher les données encodées
+        </Button>
       </Box>
 
       <Dialog

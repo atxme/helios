@@ -1,7 +1,7 @@
 //! Escrow of the gateway identity, from the **operator workstation**.
 //!
 //! On each sealing, the gateway writes a copy of its WireGuard private key,
-//! encrypted to the operator's public key (`helio_tpm::escrow`). This is the
+//! encrypted to the operator's public key (`helios_escrow`). This is the
 //! only way to recover a gateway's identity after a PCR change — new kernel,
 //! bootloader, or firmware — without SSH access.
 //!
@@ -30,7 +30,7 @@ const PUBLIC_FILE: &str = "escrow-public.key";
 /// Generates the operator's escrow key pair in a fresh directory.
 pub fn keygen(output_dir: &Path) -> Result<()> {
     crate::files::create_private_dir(output_dir)?;
-    let (private_key, public_key) = helio_tpm::escrow::generate_operator_keypair()
+    let (private_key, public_key) = helios_escrow::generate_operator_keypair()
         .map_err(|e| anyhow::anyhow!("generating the escrow key pair: {e}"))?;
 
     let public_b64 = B64.encode(public_key);
@@ -68,15 +68,15 @@ pub fn open(escrow_path: &Path, private_key_path: &Path, output: &Path) -> Resul
     let private_key = B64
         .decode(private_b64.trim())
         .context("unreadable escrow private key (expected base64)")?;
-    if private_key.len() != helio_tpm::escrow::KEY_LEN {
+    if private_key.len() != helios_escrow::KEY_LEN {
         bail!(
             "escrow private key is {} bytes instead of {}",
             private_key.len(),
-            helio_tpm::escrow::KEY_LEN
+            helios_escrow::KEY_LEN
         );
     }
 
-    let recovered = helio_tpm::escrow::open_as_operator(&private_key, &blob)
+    let recovered = helios_escrow::open_as_operator(&private_key, &blob)
         .map_err(|e| anyhow::anyhow!("could not open escrow: {e}"))?;
     let wg_private_key = std::str::from_utf8(recovered.as_slice())
         .context("escrow does not contain a base64 WireGuard key")?
@@ -128,8 +128,8 @@ mod tests {
         let public = B64
             .decode(std::fs::read_to_string(directory.join(PUBLIC_FILE)).unwrap())
             .unwrap();
-        assert_eq!(private.len(), helio_tpm::escrow::KEY_LEN);
-        assert_eq!(public.len(), helio_tpm::escrow::KEY_LEN);
+        assert_eq!(private.len(), helios_escrow::KEY_LEN);
+        assert_eq!(public.len(), helios_escrow::KEY_LEN);
         assert!(
             keygen(&directory).is_err(),
             "existing keys must not be replaced"
@@ -159,8 +159,8 @@ mod tests {
     fn operator_command_recovers_a_wireguard_key_without_printing_it() {
         let directory = test_directory("open");
         std::fs::create_dir_all(&directory).unwrap();
-        let (private, public) = helio_tpm::escrow::generate_operator_keypair().unwrap();
-        let blob = helio_tpm::escrow::seal_to_operator(&public, WG_PRIVATE_KEY.as_bytes()).unwrap();
+        let (private, public) = helios_escrow::generate_operator_keypair().unwrap();
+        let blob = helios_escrow::seal_to_operator(&public, WG_PRIVATE_KEY.as_bytes()).unwrap();
         let escrow_path = directory.join("wg-key.escrow");
         let private_path = directory.join(PRIVATE_FILE);
         let output = directory.join("recovery.key");
@@ -213,20 +213,20 @@ mod tests {
     fn recovered_plaintext_must_be_utf8_and_a_valid_wireguard_key() {
         let directory = test_directory("bad-content");
         std::fs::create_dir_all(&directory).unwrap();
-        let (private, public) = helio_tpm::escrow::generate_operator_keypair().unwrap();
+        let (private, public) = helios_escrow::generate_operator_keypair().unwrap();
         let private_path = directory.join("private");
         let escrow_path = directory.join("blob");
         let output = directory.join("output");
         std::fs::write(&private_path, B64.encode(private.as_slice())).unwrap();
 
-        let non_utf8 = helio_tpm::escrow::seal_to_operator(&public, &[0xff, 0xfe]).unwrap();
+        let non_utf8 = helios_escrow::seal_to_operator(&public, &[0xff, 0xfe]).unwrap();
         std::fs::write(&escrow_path, non_utf8).unwrap();
         assert!(open(&escrow_path, &private_path, &output)
             .unwrap_err()
             .to_string()
             .contains("base64 WireGuard key"));
 
-        let invalid = helio_tpm::escrow::seal_to_operator(&public, b"not-a-wg-key").unwrap();
+        let invalid = helios_escrow::seal_to_operator(&public, b"not-a-wg-key").unwrap();
         std::fs::write(&escrow_path, invalid).unwrap();
         assert!(open(&escrow_path, &private_path, &output)
             .unwrap_err()

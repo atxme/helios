@@ -3,7 +3,7 @@
 //! # Why a single container
 //!
 //! Before this crate there was **one** encrypted container in the repository
-//! (`HKS1`, in `helio-tpm`) and **none** on the Orion side. Adding a second
+//! (`HKS1`, in `helios-tpm`) and **none** on the Orion side. Adding a second
 //! format would have guaranteed the two drift apart, and that a review of one
 //! misses the defect in the other. Everything that must survive on a disk goes
 //! through here — gateway, client, present and future.

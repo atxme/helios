@@ -59,7 +59,7 @@ l'expurgation avant écriture est systématique sur les quatre chemins qui appel
 ### Deux conteneurs, ou zéro
 
 Il existe aujourd'hui **un** conteneur chiffré dans le dépôt (`HKS1`, dans
-`helio-tpm/src/keystore.rs`) et **aucun** côté Orion. Ajouter un second format
+`helios-tpm/src/keystore.rs`) et **aucun** côté Orion. Ajouter un second format
 serait la garantie qu'ils divergent, et qu'une revue portant sur l'un manque le
 défaut de l'autre.
 
@@ -188,7 +188,7 @@ refuse aussi de produire un blob qui dépasserait la borne. Toute longueur est
 validée avant indexation ou allocation ; une version, une KDF ou un encodage de
 contexte inconnus sont refusés.
 
-`helio-tpm::keystore` devient un client de ce crate, en conservant une lecture
+`helios-tpm::keystore` devient un client de ce crate, en conservant une lecture
 compatible de `HKS1` : une gateway en production ne doit pas perdre son identité
 en se mettant à jour. `HKS1` reste lecture seule et est réécrit en `HVLT` après
 une ouverture réussie et vérifiée.

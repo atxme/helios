@@ -112,7 +112,7 @@ async fn pending(
     let operations = service.signing.lock().await.pending(now_unix());
     (
         axum::http::StatusCode::OK,
-        Json(helios_api::internal::OperatorPendingList { operations }),
+        Json(aether::certificates::transport::OperatorPendingList { operations }),
     )
         .into_response()
 }

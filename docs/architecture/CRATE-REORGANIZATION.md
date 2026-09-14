@@ -1,175 +1,177 @@
 # Audit et proposition de réorganisation des crates
 
-> Document d'audit préalable. Aucune migration de code n'a été effectuée pour
-> produire ce document. Les propositions ci-dessous restent soumises à revue.
+> Document d’audit préalable. Cette livraison ne migre aucun code, ne modifie
+> aucun manifest et ne change aucun contrat. Les décisions proposées doivent
+> être relues et validées avant toute phase d’implémentation.
+>
+> **L’implémentation a commencé depuis.** Les sections 1 à 12 restent le
+> constat daté qui a motivé chaque décision ; l’état réel du dépôt est en
+> [§13](#13-état-dimplémentation), relevé à `HEAD = b9380ca`. Lire §13 avant
+> de se fier à une description d’arbre ou de graphe des sections précédentes.
 
 ## Périmètre et méthode
 
-L'audit porte sur le workspace Cargo racine, ses 21 packages, les sources
-Rust, les features, les réexports, les tests et les dépendances spécifiques
-aux plateformes. Le workspace `fuzz/` est un workspace imbriqué distinct et
-reste hors du graphe Cargo racine.
+L’audit a porté sur les 21 packages du workspace Cargo racine : 14 crates sous
+`crates/`, 6 outils sous `tools/` et l’application Tauri
+`apps/orion/src-tauri`. Le workspace de fuzzing `fuzz/` est imbriqué et reste
+hors du workspace racine.
 
-Sources consultées :
+Sources examinées :
 
-- `Cargo.toml` racine et chaque `Cargo.toml` de `crates/`, `tools/` et
-  `apps/orion/src-tauri` ;
-- `cargo metadata --format-version 1` pour le graphe réellement résolu ;
-- les `src/lib.rs`, `src/main.rs` et les principaux modules de chaque package ;
-- les ADR 001 à 008, la spécification de négociation v5 et la spécification de
-  rotation des certificats ;
-- `docs/ARCHITECTURE.md`, `docs/architecture/overview.md` et
-  `docs/testing/TESTING.md` ;
-- les workflows `.github/workflows/regression.yml` et `release.yml`.
+- `Cargo.toml` racine et tous les `Cargo.toml` des crates, outils et apps ;
+- `cargo metadata --format-version 1`, avec distinction entre dépendances
+  normales, `dev` et `build` ;
+- tous les `src/lib.rs` et `src/main.rs`, les modules principaux, les traits,
+  types publics et réexports ;
+- les tests unitaires, d’intégration, frontend et fuzzing ;
+- les ADR, spécifications et documents de test pertinents ;
+- les workflows CI et les scripts de build/livraison.
 
-Les métriques de fan-in et fan-out ci-dessous sont des degrés directs entre
-packages internes. Une arête `dev` ou `build` est indiquée explicitement quand
-elle a une portée architecturale différente d'une dépendance normale.
+Les fan-in/fan-out sont les degrés directs du graphe des dépendances internes
+normales. Les arêtes de test et de build sont données séparément. Les lignes
+de code indiquées sont des ordres de grandeur issus de `wc -l`, utiles pour
+repérer les concentrations, pas une mesure de complexité.
 
-## 1. Architecture actuelle
+## 1. Architecture actuelle et direction cible
 
-Le dépôt contient quatre catégories qui ne sont pas encore matérialisées par
-des répertoires distincts :
-
-1. le socle partagé `aether` ;
-2. les sous-systèmes de la gateway (`astra`, API, firewall, WireGuard,
-   provisioning, négociation, coffre, TPM, mises à jour) ;
-3. la logique cliente portable `orion-core` et le shell Tauri ;
-4. les programmes de composition, d'exploitation, de signature et de build.
-
-L'organisation fonctionnelle est déjà reconnaissable, mais l'organisation
-Cargo laisse trois frontières moins nettes :
-
-- `helios-api` porte à la fois l'API gateway et un canal privé Astra–Helios ;
-- `helios-provisioning` porte l'admission/IPAM et une importante partie du
-  registre de certificats gateway ;
-- `helio-tpm` mélange le support matériel TPM de la gateway et l'enveloppe de
-  séquestre opérateur.
-
-`heliosd` est un binaire de composition, mais ses modules contiennent encore
-une partie importante du comportement applicatif : négociation, certificats,
-rotation Astra, PSK statiques, uplinks et routage VIP. Son fan-out est donc
-élevé, sans que cela constitue à lui seul une preuve qu'une nouvelle crate est
-nécessaire.
-
-Le chemin d'exécution principal est :
+Le découpage fonctionnel est déjà visible, mais il n’est pas toujours reflété
+par les frontières Cargo. La cible de nommage et d’ownership Helios–Orion doit
+se lire ainsi :
 
 ```text
-Orion/Tauri -> orion-core -> négociation QUIC/mTLS -> heliosd
-                                                   -> provisioning
-                                                   -> WireGuard
-                                                   -> firewall
-                                                   -> API/WebSocket/UI
-                                                   -> Astra / TPM / vault / update
+orion (Tauri) -> orion-core
+orion-core -> aether
+           -> aether-fido
+           -> aether-key-negotiation
+           -> aether-vault
+
+heliosd -> aether
+        -> aether-key-negotiation
+        -> aether-vault
+        -> helios-api
+        -> helios-escrow
+        -> helios-firewall
+        -> helios-provisioning
+        -> helios-tpm
+        -> helios-update
+        -> helios-wireguard
 ```
 
-Cette vue est fonctionnellement correcte, mais elle ne montre pas que `astra`
-utilise aujourd'hui `helios-api` pour son canal privé, ni que
-`helios-wireguard` utilise le trait d'IPAM défini par `helios-provisioning`.
+`heliosd` assemble effectivement les composants, mais ses propres modules
+contiennent encore une grande partie du comportement gateway : orchestrateur,
+négociation, certificats, rotation, PSK statiques, uplinks, routage VIP,
+clé gateway et canal Astra. Le binaire est donc un composition root incomplet,
+pas un simple câblage.
+
+Le graphe Cargo exact observé est donné en section 2. Il montre encore les
+anciens packages `helios-fido`, `helios-key-negotiation` et `helios-vault` dans
+les dépendances d’Orion ; ces noms et cette ownership sont précisément à
+corriger, pas à conserver dans la cible.
+
+- le graphe de production ne contient pas `heliosd -> orion-core` ;
+- le test d’interopérabilité de `heliosd` dépend toutefois de `orion-core` en
+  `dev-dependencies`, ce qui rend la frontière conceptuellement ambiguë.
+
+### Règle de nommage et d’ownership Helios–Orion
+
+L’état actuel expose directement à `orion-core` trois packages nommés
+`helios-*` : `helios-fido`, `helios-key-negotiation` et `helios-vault`. Même si
+leurs API sont réutilisables, leur nom suggère une propriété gateway et rend la
+frontière serveur/client difficile à comprendre.
+
+La cible doit donc interdire à Orion toute dépendance directe vers un package
+`helios-*`. Une capacité utilisée par Helios et Orion doit être soit :
+
+- un contrat réellement partagé dans `aether` ;
+- une crate partagée au nom neutre ou `aether-*`, dont l’ownership est explicite
+  (`aether-key-negotiation`, `aether-vault`, et éventuellement `aether-fido`) ;
+- une abstraction partagée, avec son backend Linux/Windows conservé dans la
+  couche qui en a besoin.
+
+Cette règle ne signifie pas que toute implémentation doit être fusionnée dans
+`aether`. Elle évite au contraire d’agrandir encore le socle en *god crate* :
+les contrats/protocoles communs peuvent être dans Aether ou dans des crates
+`aether-*`, tandis que les adaptateurs plateforme restent hors du modèle
+partagé.
 
 ### Aether
 
-`aether` est devenu un socle très large : environ 30 500 lignes Rust, dont
-environ 21 000 dans `certificates/`. Il contient notamment :
+`aether` représente environ 30 410 lignes Rust, dont environ 20 991 dans
+`src/certificates/`. Il contient :
 
-- configuration, état de tunnel, événements, politiques firewall et types
-  WireGuard ;
-- contrats de négociation de clé v5, PQ, X25519 et secret ;
-- génération aléatoire centralisée, signatures éditeur et signatures de
-  négociation ;
-- contrats X.509, certificats client/gateway, autorité, révocation, statut,
-  approbation, transport et fenêtre de mise à jour ;
-- quelques utilitaires partagés comme fichiers privés, verrouillage, temps et
-  speedtest.
+- les modèles de configuration gateway, états de tunnel, événements, policy
+  firewall, types WireGuard, MTU et speedtest ;
+- les contrats d’enrôlement et de négociation v5, ML-KEM, X25519 et secrets ;
+- le RNG applicatif, ML-DSA, signatures de release et signatures PKI ;
+- l’ensemble des contrats de certificats : encoding, X.509, autorité, gateway,
+  client, révocation, statuts, capacités, transport, WebAuthn et fenêtres ;
+- quelques capacités d’exécution : fichiers privés, verrouillage mémoire,
+  sérialisation TOML/JSON et fixtures X.509.
 
-Les réexports de `aether/src/lib.rs` rendent directement visibles la
-configuration, les erreurs, les événements, les politiques, les types PQ, les
-secrets, le speedtest et l'état de tunnel. Les certificats restent plutôt
-accessibles par leurs sous-modules, ce qui limite partiellement la façade.
+Il mélange donc bien modèles, protocole, machine à états, politique, crypto,
+RNG, certificats et sérialisation. Il contient aussi des utilitaires système
+ciblés (`libc`/`windows-sys`) malgré sa promesse d’être sans ressource système
+à l’exécution.
 
-Le constat n'est pas « une crate par thème ». `certificates/` forme un
-ensemble de contrats de confiance et de sécurité cohérent, partagé par Astra,
-la gateway, Orion et les outils. Cependant `aether` est le principal candidat
-à l'appellation de *god crate* potentiel : son fan-in est de 17 et il réunit
-contrats, implémentations cryptographiques et quelques fonctions d'exécution.
-Son découpage immédiat créerait plusieurs problèmes : dépendances croisées
-entre certificats, négociation, RNG et signatures ; réexports cassés ; et
-risque de séparer des invariants de sécurité. La bonne décision à court terme
-est de le conserver, tout en réduisant les nouveaux ajouts et en isolant les
-responsabilités par modules avant toute extraction.
+Cela en fait un *god crate* potentiel par son fan-in de 18, mais pas une raison
+suffisante pour le découper immédiatement. Les modules de certificats sont
+fortement couplés entre eux et portent des invariants de sécurité communs ;
+les domaines ML-DSA-65 et ML-DSA-87 doivent rester séparés même s’ils partagent
+le même socle. La décision est de conserver Aether, de limiter les nouveaux
+ajouts et de clarifier ses modules/public APIs avant toute extraction.
 
-Un écart documentaire est à noter : `docs/ARCHITECTURE.md` décrit encore le
-cycle de vie des certificats comme non implémenté, alors que le code actuel
-contient Astra, les registres, les rotations et leurs tests. Pour l'état
-présent, le code, les tests et les ADR/spécifications acceptées sont plus
-probants. La mise à jour de cette documentation générale devra être une étape
-distincte.
+### Heliosd et Orion
 
-### Helios et Orion
+`orion-core` est une crate cliente portable d’environ 25 708 lignes. Elle
+regroupe profils/configuration, coffre local, identité, provisioning,
+négociation cliente, backend VPN, télémétrie, speedtest et cycle de vie des
+certificats. Cette largeur est cohérente avec son cycle de vie et ses deux
+consommateurs normaux (`orion` et `helios-ctl`) ; elle ne justifie pas encore
+une division en micro-crates.
 
-`orion-core` est une crate cliente portable de grande taille, environ 25 700
-lignes. Elle regroupe configuration/profils, admission, négociation, backend
-VPN, identité, coffre client, certificats, renouvellement, récupération,
-télémétrie et speedtest. Cette largeur est cohérente avec le rôle de logique
-cliente portable ; elle ne justifie pas encore des crates séparées, car la
-crate a une frontière de cycle de vie et trois consommateurs distincts : le
-shell Orion, `helios-ctl` et les tests d'interopérabilité de `heliosd`.
+`apps/orion/src-tauri` est le shell : IPC Tauri, fenêtre/tray, lancement du
+compagnon Astra, intégrations Windows et build. Il ne doit pas devenir une
+dépendance de serveur.
 
-La dépendance suspecte `heliosd -> orion-core` n'est pas une dépendance de
-production. Elle se trouve dans `[dev-dependencies]` et sert à faire dialoguer
-le vrai client avec le vrai serveur pour vérifier la dérivation de PSK et le
-handshake. L'intention de test est légitime et explicitement documentée dans
-l'ADR de négociation, mais la présence du lien dans le package gateway rend la
-frontière moins lisible. À terme, ce test doit vivre dans un harnais
-d'interopérabilité indépendant ou dans un package d'intégration ; il ne faut
-pas extraire du code client dans Helios pour supprimer artificiellement ce
-lien.
+La dépendance `heliosd -> orion-core` est donc suspecte uniquement parce
+qu’elle existe dans les tests. Elle sert à prouver l’interopérabilité avec le
+vrai client, notamment la dérivation de PSK. Il faut conserver cette preuve,
+mais la déplacer vers un harnais d’intégration indépendant lorsque la seam
+sera stabilisée, plutôt que d’extraire du code client vers Helios.
 
 ### Astra
 
-`astra` est un sous-système réel : registre, autorité, chaîne d'audit,
-opérations, renouvellement, récupération, distribution, réconciliation et
-service. Le package fournit à la fois une bibliothèque et le binaire Astra,
-qui peut rester un composition root du sous-système.
+`astra` est un sous-système cohérent avec registre, audit chaîné, autorité,
+issuer délégué, opérations, renouvellement, récupération, distribution,
+réconciliation, service HTTP et binaire Astra. Sa bibliothèque et son binaire
+partagent le même cycle de vie du sous-système.
 
-`astra-operator` est également une frontière de sécurité réelle : coffre
-opérateur, FIDO, gestes d'approbation, opérations hors ligne et origines
-client/tunnel. Il dépend toutefois de `astra` uniquement pour des vues d'état
-d'opération et une demande de délégation d'émetteur. Ce sont des contrats qui
-ne devraient pas imposer la dépendance à l'implémentation du service Astra.
+`astra-operator` est une frontière de sécurité distincte : coffre d’autorité,
+gestes FIDO2, approbations, campagnes, récupération, transport public et
+transport in-tunnel. Il dépend encore directement de `astra` pour
+`IssuerDelegationRequest` et pour des vues d’opération que `astra` réexporte
+déjà depuis Aether. C’est une dépendance de contrat mal placée, pas une raison
+de fusionner les deux crates.
 
-`astra-signer` et `helios-astra-helper` sont des programmes séparés, avec des
-cycles de vie et des privilèges différents. Ils ne sont pas des couches
-internes à transformer en crates de bibliothèque générales.
+`astra-signer` et `helios-astra-helper` sont des processus distincts avec des
+privilèges et des chemins de vie différents. Ils doivent rester des outils.
 
 ### Firewall, WireGuard et sécurité
 
-`helios-firewall` possède une frontière claire. Sa policy, son IR, sa
-validation, sa compilation, son backend dry-run et son backend Netlink restent
-des modules d'une seule crate. La feature `netlink` active l'implémentation
-Linux sans imposer plusieurs crates artificielles.
+`helios-firewall` est une bonne frontière : policy -> IR/ruleset -> validation
+et rendu -> backend dry-run ou Netlink. Les modules `ruleset`, `dryrun` et
+`netlink` doivent rester internes à la crate tant qu’aucun cycle de vie ou
+consommateur indépendant ne l’exige.
 
-`helios-wireguard` possède de même une frontière de plan de données claire :
-trait backend, état, pairs, interface, dry-run et backend réel. Son unique
-dépendance interne normale est `helios-provisioning`, car la table d'adresses
-des pairs implémente le trait `PeerTable` défini par l'IPAM. C'est une petite
-arête de contrat à surveiller, pas un cycle ni une raison suffisante pour
-scinder le firewall ou WireGuard.
+`helios-wireguard` est également une bonne frontière : trait backend, config
+d’interface/pairs, observation des handshakes, dry-run et backend réel. La vue
+qui adapte un snapshot de pairs au trait IPAM vit désormais chez son unique
+appelant, `helios-api::provision`. `helios-wireguard` ne dépend donc plus de
+`helios-provisioning` et constitue une crate feuille du graphe interne.
 
-Les crates `helios-vault`, `helios-fido`, `helio-tpm` et
-`helios-key-negotiation` sont toutes des frontières de sécurité ou de
-protocole plausibles. Elles n'ont pas le même rôle :
-
-- `helios-vault` possède le format de conteneur AEAD et son cycle seal/open ;
-- `helios-fido` possède l'interaction avec l'authentificateur matériel et les
-  APIs WebAuthn ;
-- `helio-tpm` possède le scellement, les fenêtres de mise à jour et les états
-  TPM, mais aussi le séquestre opérateur ;
-- `helios-key-negotiation` possède le protocole QUIC/mTLS v5 et ses contrats de
-  transport.
-
-Ces frontières doivent être conservées. Le seul mélange suffisamment net pour
-justifier une évolution est la séparation TPM/séquestre.
+Les frontières `helios-vault`, `helios-fido`, `helios-tpm` et
+`helios-key-negotiation` sont justifiées respectivement par un format secret,
+un périphérique matériel, le matériel TPM et un protocole de transport.
 
 ## 2. Graphe réel des dépendances internes
 
@@ -191,7 +193,7 @@ astra-signer
   -> astra-operator
   -> helios-fido
 
-helio-tpm
+helios-tpm
   -> aether
   -> helios-vault
 
@@ -209,10 +211,13 @@ helios-astra-helper
 
 helios-ctl
   -> aether
-  -> helio-tpm
+  -> helios-escrow
   -> helios-key-negotiation
   -> helios-update
   -> orion-core
+
+helios-escrow
+  -> aether
 
 helios-fido
   -> aether
@@ -240,15 +245,15 @@ helios-vault
   -> aether
 
 helios-wireguard
-  -> helios-provisioning
 
 heliosd
   -> aether
-  -> helio-tpm
   -> helios-api
+  -> helios-escrow
   -> helios-firewall
   -> helios-key-negotiation
   -> helios-provisioning
+  -> helios-tpm
   -> helios-update
   -> helios-vault
   -> helios-wireguard
@@ -267,193 +272,236 @@ xtask
   -> helios-update
 ```
 
-`astra`, `astra-operator`, `astra-signer` et `helios-astra-helper` composent
-le sous-système Astra et ses opérateurs ; les outils restent des feuilles du
-graphe. `heliosd` possède le plus grand fan-out direct, avec 10 dépendances
-internes. `aether` possède le plus grand fan-in, avec 17 consommateurs
-directs.
-
-### Dépendances dev et build
+### Arêtes non-runtime
 
 ```text
-heliosd [dev]
-  -> orion-core
-
-orion [build]
-  -> xtask
+heliosd  -[dev]->   orion-core
+orion    -[build]-> xtask
 ```
 
-Les arêtes `aether [dev]` de plusieurs crates ne changent pas le graphe
-normal : elles complètent leurs fixtures. L'arête `heliosd [dev]` doit rester
-visible dans les outils d'architecture même si elle ne fuit pas dans le
-binaire gateway. L'arête `orion [build] -> xtask` sert à télécharger/stager
-WireGuardNT et l'helper Windows ; elle ne concerne pas le runtime, mais elle
-couple le build de l'application à un outil.
+Les dépendances `dev` de `aether`, `helios-update` et `helios-tpm` activent des
+fixtures/signatures pour leurs propres tests. Elles ne forment pas des arêtes
+de production.
 
-### Fan-in et fan-out
+### Fan-in, fan-out et cycles
 
-| Package | Fan-in direct | Fan-out direct | Observation |
-| --- | ---: | ---: | --- |
-| `aether` | 17 | 0 | Socle partagé et principal god crate potentiel |
-| `heliosd` | 0 | 10 | Composition root, mais encore beaucoup de logique locale |
-| `orion-core` | 3 | 4 | Frontière cliente portable |
-| `helios-api` | 2 | 5 | Façade API et canal Astra mélangés |
-| `helios-update` | 6 | 1 | Sous-système réutilisé par gateway et outils |
-| `astra-operator` | 2 | 4 | Frontière opérateur, consommée par deux outils |
-| `helios-provisioning` | 3 | 1 | Admission/IPAM + registre de certificats |
-| `helios-fido` | 4 | 1 | Bon adaptateur matériel partagé |
-| `helios-vault` | 4 | 1 | Bon conteneur de sécurité partagé |
-| `helios-firewall` | 2 | 1 | Sous-système de plan de données |
-| `helios-wireguard` | 2 | 1 | Sous-système de plan de données |
-| Autres feuilles/outils | 0 à 2 | 0 à 3 | Rôles ciblés ou composition locale |
+| Package | Fan-in normal | Fan-out normal |
+| --- | ---: | ---: |
+| `aether` | 18 | 0 |
+| `astra` | 1 | 2 |
+| `astra-operator` | 2 | 4 |
+| `astra-signer` | 0 | 3 |
+| `helios-tpm` | 1 | 2 |
+| `helios-api` | 2 | 5 |
+| `helios-astra-helper` | 0 | 3 |
+| `helios-ctl` | 0 | 5 |
+| `helios-escrow` | 2 | 1 |
+| `helios-fido` | 4 | 1 |
+| `helios-firewall` | 2 | 1 |
+| `helios-installer` | 0 | 1 |
+| `helios-key-negotiation` | 3 | 1 |
+| `helios-provisioning` | 2 | 1 |
+| `helios-publisher` | 0 | 2 |
+| `helios-update` | 6 | 1 |
+| `helios-vault` | 4 | 1 |
+| `helios-wireguard` | 2 | 0 |
+| `heliosd` | 0 | 10 |
+| `orion` | 0 | 2 |
+| `orion-core` | 2 | 4 |
+| `xtask` | 0 | 1 |
 
-Il n'existe aucun cycle direct dans le graphe Cargo actuel. Les cycles
-architecturaux à éviter sont plutôt des cycles de responsabilité : service
-Astra qui dépend de la façade HTTP gateway, opérateur qui dépend de
-l'implémentation Astra, ou logique partagée qui dépend d'un shell.
+Le plus grand fan-in est celui d’Aether. Le plus grand fan-out est celui de
+`heliosd`, ce qui est attendu pour un composition root mais révèle aussi la
+logique encore locale. Le graphe normal est acyclique. Les arêtes de test et
+de build ne créent pas de cycle Cargo, mais `heliosd -> orion-core` brouille la
+lecture produit Helios/client Orion.
 
-## 3. Features Cargo et plateformes
+Packages à zéro consommateur normal : les outils/apps feuilles
+(`astra-signer`, `helios-astra-helper`, `helios-ctl`, `helios-installer`,
+`helios-publisher`, `heliosd`, `orion`, `xtask`). Package de sous-système à un
+consommateur : `astra` n’est utilisé normalement que par `astra-operator` ;
+cela renforce le besoin de découpler ses contrats sans imposer une fusion.
 
-### Features observées
+## 3. Problèmes détectés
 
-| Package | Features | Effet architectural |
+### Frontières et responsabilités
+
+1. `helios-api` est à la fois la façade HTTP/WS/UI de la gateway et le
+   propriétaire effectif du protocole privé Astra–Helios (`internal.rs`, TLS,
+   routes, clients et DTO). Cela force `astra -> helios-api`, une direction
+   inverse à la composition attendue.
+2. `astra-operator` dépend de l’implémentation `astra` pour des contrats qui
+   sont soit déjà dans Aether, soit transportables dans la frontière du canal.
+3. `helios-provisioning` contient un registre durable de certificats de plus de
+   4 300 lignes (`certificates.rs`) en plus de l’admission, l’IPAM, les
+   sessions ML-KEM et la rotation de PSK. Son nom ne décrit pas tout son
+   propriétaire.
+4. `helio-tpm::escrow` implémente un format et un protocole X25519/AEAD
+   opérateur qui ne parlent pas au TPM. Il est consommé par `heliosd` et
+   `helios-ctl` et mérite une frontière de sécurité propre.
+5. `heliosd` porte 16 153 lignes de code et n’est pas encore principalement du
+   câblage. Une crate `helios-runtime` n’est cependant pas démontrée : il n’y
+   a pas de second hôte runtime réutilisant actuellement ce lifecycle.
+6. La frontière de nommage Helios–Orion est inversée pour FIDO, négociation et
+   vault : `orion-core` dépend directement de `helios-*`. Ces capacités doivent
+   être reclassées comme Aether/shared ou recevoir un nom neutre avant leur
+   prochaine évolution.
+
+### Aether et réexports
+
+Les réexports rendent l’usage agréable mais masquent parfois le vrai
+propriétaire :
+
+- `aether/src/lib.rs` réexporte config, erreurs, événements, policy, PQ,
+  secrets, speedtest et états ; les certificats restent surtout sous leurs
+  modules, avec quelques réexports dans `certificates/mod.rs` ;
+- `astra::signing` réexporte `SigningOperationState` et
+  `SigningOperationView` depuis Aether ; `helios-api::internal` réexporte aussi
+  plusieurs vues et états de transport Aether ;
+- `astra-operator::authority` réexporte `astra::issuer::IssuerDelegationRequest`;
+  ce contrat ne devrait pas obliger l’opérateur à connaître l’implémentation
+  Astra ;
+- `orion-core::certificate_inventory` expose `ValidityPhase` sous le nom
+  `CertificatePhase`, projection utile mais à documenter comme façade ;
+- les vues `NetworkConfigView`, `NetworkPeerView`, `PeerSummary`,
+  `KeyNegotiationMaterial` et les types `Relayed*` sont des DTO locaux ou des
+  projections. Ils ne sont pas tous des doublons : la redaction des secrets et
+  la séparation d’un message signé d’une vue HTTP sont intentionnelles.
+
+Le risque est de supprimer un réexport avant d’avoir classifié le type comme
+contrat partagé, DTO local ou projection de sécurité. Cette classification doit
+précéder tout déplacement.
+
+### Features Cargo
+
+| Package | Features | Couplage observé |
 | --- | --- | --- |
-| `aether` | `fuzzing`, `key-negotiation-signing`, `publisher-signing` | Mélange de contrats communs et de capacités cryptographiques optionnelles |
-| `helio-tpm` | `tpm` | Active `tss-esapi`, dépendance cible et matériel |
-| `helios-api` | `embed-ui` | Fait entrer l'asset web dans la façade API |
-| `helios-firewall` | `netlink` | Active le backend Linux réel |
-| `helios-provisioning` | `certificate-signing` | Forward vers la signature de négociation, surtout fixtures/certificats |
-| `helios-update` | `publisher-signing` | Forward vers Aether, sans usage de code correspondant dans la crate |
-| `helios-wireguard` | `wireguard` | Active le backend WireGuard réel |
-| `orion-core` | `certificate-signing`, `wireguard` | Signature de fixtures/certificats et backend client |
-| `heliosd` | `embed-ui`, `netlink`, `tpm`, `wireguard` | Composition des choix de plateforme gateway |
-| `orion` | `wireguard` | Forward vers `orion-core` |
+| `aether` | `publisher-signing`, `key-negotiation-signing`, `fuzzing` | fait entrer les capacités de signature et fixtures dans le socle partagé |
+| `helios-tpm` | `tpm` | active `tss-esapi` et le backend matériel |
+| `helios-api` | `embed-ui` | couple la façade API à l’asset web de production |
+| `helios-firewall` | `netlink` | active `rustables`/`ipnetwork` pour le backend réel |
+| `helios-provisioning` | `certificate-signing` | ne sert essentiellement qu’aux tests de signature de certificats |
+| `helios-update` | `publisher-signing` | forward vers Aether, sans usage runtime identifié dans cette crate |
+| `helios-wireguard` | `wireguard` | active `defguard_wireguard_rs` |
+| `orion-core` | `wireguard`, `certificate-signing` | backend réel client et fixtures de certificats |
+| `heliosd` | `netlink`, `wireguard`, `embed-ui`, `tpm` | composition des choix gateway |
+| `orion` | `wireguard` | forward vers `orion-core` |
 
-Les features de backend sont globalement placées au bon niveau : les
-applications choisissent les implémentations et les crates de sous-système les
-exposent. Elles devraient toutefois être vérifiées par cible afin qu'une
-feature activée sur une plateforme incompatible échoue explicitement.
+Le domaine de signature release ML-DSA-65 et le domaine PKI/négociation
+ML-DSA-87 sont correctement distincts dans le code, mais les features Aether
+font remonter une capacité d’implémentation dans plusieurs consommateurs. La
+feature `helios-update/publisher-signing` est candidate à suppression après
+vérification des commandes et tests, car elle ressemble à un forwarding mort.
+Les features backend sont au bon niveau conceptuel, mais `netlink` et TPM
+devraient être validées par cible dans la CI ; `--all-features` ne constitue
+pas une preuve matérielle.
 
-Le point le plus couplant est la signature de négociation :
-`key-negotiation-signing` active `fips204` et `rcgen` dans `aether`, puis est
-demandée sans condition par plusieurs consommateurs runtime. C'est une
-capacité distincte des signatures de release ML-DSA-65, mais son nom et son
-forwarding font remonter une grande partie de la pile X.509 dans le graphe.
-Une évolution ultérieure devrait distinguer plus clairement contrat de
-vérification, émission de fixtures et émission runtime, sans mélanger les
-domaines ML-DSA-65 et ML-DSA-87.
+### Dépendances plateforme
 
-La feature `helios-update/publisher-signing` paraît être un forwarding
-historique ou inutilisé. Elle mérite une suppression contrôlée après
-confirmation des consommateurs ; elle ne doit pas être conservée comme
-fausse frontière entre publisher et gateway.
-
-### Dépendances spécifiques aux plateformes
-
-| Zone | Dépendance | Constat |
+| Zone | Dépendances | Lecture architecturale |
 | --- | --- | --- |
-| `aether` | `libc` Linux, `windows-sys` Windows | Utilitaires de verrouillage mémoire ; la crate n'est pas sans dépendance plateforme au sens strict |
-| `helios-firewall` | `rustables`, `ipnetwork` | Backend Netlink/nftables Linux dans une feature, manifest non target-gardé |
-| `helios-wireguard` | `defguard_wireguard_rs` | Backend réel de plan de données, correctement optionnel mais cible à expliciter |
-| `helio-tpm` | `tss-esapi` | Matériel TPM ; doit rester hors du socle partagé |
-| `heliosd` | `libc` Unix | `prctl` de protection des dumps, propre à l'application gateway |
-| `helios-fido` | `ctap-hid-fido2`, hidapi/libudev, WebAuthn Windows | Adaptateur matériel et OS, correctement isolé dans sa crate |
-| `orion-core` | `windows`, `windows-sys` | DPAPI/CNG, WMI/COM, BitLocker, exclusion des dumps et routage client |
-| `orion` | Tauri, GTK/WebKit Linux, WebView2/Win32 Windows | Shell graphique et intégrations de plateforme |
-| `xtask` | WireGuardNT et APIs Windows | Support de build et packaging client, non runtime |
-| `helios-astra-helper` | Win32/GDI/owner window | Processus compagnon opérateur |
+| `aether` | `libc` Linux, `windows-sys` Windows | verrouillage mémoire/fichiers ; utilitaire partagé, mais pas totalement neutre plateforme |
+| `helios-firewall` | `rustables`, `ipnetwork` optionnels | backend Netlink/nftables, à garder hors contrats |
+| `helios-wireguard` | `defguard_wireguard_rs` optionnel | backend WireGuard réel de la gateway |
+| `helios-tpm` | `tss-esapi` optionnel | TPM réel, cible matérielle |
+| `helios-fido` | `ctap-hid-fido2`, hidapi/libudev, `windows-sys` | frontière FIDO/WebAuthn matérielle |
+| `orion-core` | `windows`, `windows-sys`, `defguard_wireguard_rs` | DPAPI/CNG, BitLocker/WMI, Wintun/route pinning client |
+| `heliosd` | `libc` Unix | protection des core dumps du daemon |
+| `orion` | Tauri, WebView/GTK ou WebView2 | shell graphique uniquement |
+| `helios-astra-helper` | Win32/GDI | propriété de fenêtre et désélévation du compagnon |
+| `xtask` | téléchargement WireGuardNT et packaging | build workstation, jamais runtime |
 
-La contamination la plus importante n'est pas une dépendance Windows/Linux
-dans `aether`, qui reste limitée à des utilitaires ciblés ; c'est le risque de
-faire remonter ces APIs dans les contrats ou les applications opposées. Les
-implémentations restent aujourd'hui principalement dans des modules
-conditionnels de `orion-core`, `helios-fido`, `helios-firewall`,
-`helios-wireguard`, `helio-tpm` et `heliosd`.
+Les contrats partagés ne dépendent pas directement de Tauri, Netlink, TPM,
+WireGuard réel ou Win32. La contamination actuelle est localisée dans les
+modules d’implémentation ; elle ne doit pas remonter dans le modèle partagé.
+
+### Tests et emplacement
+
+- Les tests unitaires sont majoritairement colocés dans les modules `src/`.
+  C’est le cas d’Aether, API, firewall, WireGuard, provisioning, négociation,
+  vault, update, `heliosd`, `orion-core` et de l’application Tauri.
+- Les tests d’intégration sont dans `crates/astra/tests/` (`cli.rs`,
+  `private_channel.rs`), `crates/astra-operator/tests/`,
+  `crates/helios-tpm/tests/materiel.rs` et
+  `tools/helios-publisher/tests/cli_security.rs`.
+- `heliosd` possède un test d’interopérabilité client via sa dépendance dev à
+  `orion-core`, mais pas de harnais indépendant.
+- Les tests frontend vivent dans `web/` et `apps/orion/`; les cibles libFuzzer
+  vivent sous `fuzz/`, hors workspace racine.
+
+Le principal déficit de placement est donc le test Helios/Orion, pas l’absence
+de tests dans les sous-systèmes.
 
 ## 4. Responsabilité actuelle et décision
 
 | Package / application | Responsabilité observée | Décision | Justification |
 | --- | --- | --- | --- |
-| `aether` | Contrats partagés, états, protocole, crypto, certificats et quelques utilitaires | **KEEP** | Fan-in élevé et invariants liés ; resserrer les modules avant toute extraction |
-| `astra` | Autorité/coordonateur de certificats, registre, opérations, service et binaire | **KEEP** | Sous-système cohérent avec son propre cycle de vie |
-| `astra-operator` | Coffre opérateur, FIDO, gestes, approbation et opérations hors ligne | **KEEP** | Frontière de sécurité réelle ; retirer la dépendance d'implémentation à `astra` |
-| `helios-firewall` | Policy, IR, validation, compilation et backends nftables/dry-run | **KEEP** | Bonne frontière ; garder les parties comme modules internes |
-| `helios-update` | Bundle, vérification, staging, activation et rollback | **KEEP** | Cycle de vie et frontière de confiance indépendants |
-| `helios-api` | API Axum/WebSocket/UI gateway et relais privé Astra | **SPLIT** | Séparer l'API publique du canal privé et de ses contrats TLS |
-| `helio-tpm` | TPM, boot, rescellement, fenêtres d'update et séquestre | **SPLIT + RENAME** | Garder `helios-tpm` pour le matériel ; extraire `helios-escrow` |
-| `helios-provisioning` | Admission, IPAM, session et registre/certificats gateway | **SPLIT** | Extraire plus tard le registre de confiance si la seam est confirmée |
-| `helios-wireguard` | Interface, pairs, état et backends WireGuard | **KEEP** | Frontière de plan de données claire |
-| `helios-key-negotiation` | Transport QUIC/mTLS et protocole v5 | **KEEP** | Frontière de protocole explicite et partagée |
-| `helios-vault` | Conteneur AEAD HVLT et seal/open | **KEEP** | Format et sécurité indépendants |
-| `helios-fido` | Authentificateurs FIDO/WebAuthn | **KEEP** | Adaptateur matériel/OS réutilisable |
-| `orion-core` | Logique cliente portable et cycle de vie Orion | **KEEP** | Cohérent malgré sa taille ; aucun nouveau découpage prouvé |
-| `heliosd` | Binaire gateway, lifecycle et composition des sous-systèmes | **KEEP** | Composition root actuel ; pas encore de preuve pour `helios-runtime` |
-| `astra-signer` | Outil de signature et approbation opérateur | **KEEP** | Processus de confiance distinct, pas une bibliothèque de service |
-| `helios-astra-helper` | Compagnon opérateur et intégration Win32 | **KEEP** | Processus et privilèges propres |
-| `helios-ctl` | CLI opérateur : API, enrollment, campagnes, update, escrow | **KEEP** | Composition root d'outil ; extraire seulement du code réellement partagé |
-| `helios-installer` | Helper privilégié d'installation d'update | **KEEP** | Frontière de privilège et cycle de vie indépendants |
-| `helios-publisher` | Génération de clés et signature de releases/bundles | **KEEP** | Doit rester hors gateway et hors logique client |
-| `xtask` | Build, téléchargement/staging WireGuardNT, packaging | **KEEP** | Outil de build ; extraire un support stable seulement si nécessaire |
-| `orion` | Shell Tauri/React, IPC et intégrations desktop | **KEEP** | Application ; ses modules locaux ne justifient pas des crates |
-| `fuzz` | Workspace de fuzzing libFuzzer/nightly | **KEEP** | Délibérément hors workspace racine |
+| `aether` | Contrats, états, protocole, crypto, certificats, quelques I/O/utilitaires | **KEEP** | fan-in élevé et invariants liés ; clarifier les modules avant extraction |
+| `astra` | Autorité PKI, registre/opérations, service et binaire | **KEEP** | sous-système cohérent avec cycle de vie propre |
+| `astra-operator` | Coffre opérateur, FIDO, gestes, campagnes et relais | **KEEP** | frontière de sécurité réelle ; supprimer sa dépendance de contrat vers `astra` |
+| `helios-firewall` | Policy, IR/ruleset, validation, compilation et backends | **KEEP** | bonne frontière ; conserver les backends comme modules |
+| `helios-update` | Bundle, vérification, staging, activation et rollback | **KEEP** | cycle de vie et privilège indépendants |
+| `helios-api` | API Axum/WS/UI et canal privé Astra | **SPLIT** | extraire le canal privé, conserver la façade HTTP gateway |
+| `helio-tpm` | TPM, boot, rescellement, fenêtre d’update et escrow | **SPLIT / RENAME** | extraire `escrow`, puis renommer le package matériel en `helios-tpm` |
+| `helios-provisioning` | Admission, IPAM, session ML-KEM, rotation et registre certificats | **SPLIT différé** | extraire le registre vers un sous-système trust seulement après preuve de seam |
+| `helios-wireguard` | Plan de données, pairs, observation et backends | **KEEP** | frontière de plan de données claire |
+| `helios-key-negotiation` | QUIC/mTLS et protocole v5 avant WireGuard | **RENAME / MOVE** | capacité Helios/Orion ; candidate `aether-key-negotiation`, avec transport partagé et backends hors modèle |
+| `helios-vault` | Format AEAD HVLT et seal/open | **RENAME / MOVE** | format de sécurité Helios/Orion ; candidate `aether-vault`, sans préfixe gateway |
+| `helios-fido` | CTAP2 HID et WebAuthn Windows | **RENAME** | adaptateur utilisé par Orion et l’opérateur ; candidate `aether-fido`, à garder séparé d’Aether si la dépendance plateforme l’exige |
+| `orion-core` | Logique client portable, coffre, provisioning, certificats et backend VPN | **KEEP** | cycle de vie client cohérent ; pas de troisième crate prouvée |
+| `heliosd` | CLI gateway, lifecycle et composition des sous-systèmes | **KEEP** | composition root à amincir ; `helios-runtime` non démontré |
+| `astra-signer` | CLI d’approbation/signature opérateur | **KEEP** | processus hors ligne et privilège distincts |
+| `helios-astra-helper` | Compagnon interactif Windows | **KEEP** | processus et intégration Win32 propres |
+| `helios-ctl` | CLI opérateur : admission, campagnes, escrow, update, profils | **KEEP** | composition root d’outil |
+| `helios-installer` | Helper privilégié d’installation/rollback | **KEEP** | frontière de privilège distincte |
+| `helios-publisher` | Clés et signatures de releases/bundles | **KEEP** | doit rester hors gateway et hors client |
+| `xtask` | Build, téléchargement de dépendances et packaging | **KEEP** | outil de build, non runtime |
+| `orion` | Shell Tauri/React et intégrations desktop | **KEEP** | application et composition UI |
+| `fuzz` | Workspace libFuzzer hors workspace racine | **KEEP** | cycle de build nightly volontairement séparé |
 
-Les décisions `SPLIT` sont des cibles séquencées, pas une autorisation de
-créer immédiatement trois nouvelles crates. En particulier, ni les erreurs,
-ni les types génériques, ni la sérialisation, ni chaque backend ne doivent
-devenir des packages autonomes.
+Les décisions `SPLIT` sont des cibles séquencées, pas la création immédiate de
+crates d’erreurs, DTO, utils, sérialisation ou backend.
 
-### Réexports et types à surveiller
+### Organisation interne par blocs fonctionnels
 
-Les réexports principaux de `aether` sont utiles pour les consommateurs, mais
-ils cachent la différence entre types de domaine, contrats de transport et
-types d'affichage. Les cas les plus significatifs sont :
+La frontière Cargo ne suffit pas : `heliosd`, Orion/Tauri, le transport de
+négociation et certains contrats Aether réunissent plusieurs capacités dans
+un même fichier. À l’inverse, les tailles brutes de
+`helios-provisioning::certificates`, `astra::registry`, du firewall, du vault
+et de l’update sont fortement augmentées par leurs tests inline ; leur code de
+production est plus cohérent que le nombre total de lignes ne le laisse croire.
 
-- `helios-api::internal` réexporte des types de transport Aether et ajoute des
-  vues gateway (`PeerCertificateStateView`, `GatewayIdentityView`) ;
-- `helios-api::certificates` ajoute de nombreuses vues HTTP autour de contrats
-  Aether ;
-- `orion-core::certificate_inventory` réexporte `ValidityPhase` sous le nom
-  `CertificatePhase` ;
-- `astra-operator` consomme directement
-  `astra::signing::{SigningOperationState, SigningOperationView}` ;
-- `astra::issuer::IssuerDelegationRequest` est consommé hors de `astra`, alors
-  qu'il représente un contrat de délégation ;
-- plusieurs crates possèdent leurs propres `*Request`, `*Response`, `*View`.
-
-Il ne s'agit pas d'une preuve que tous ces types sont des doublons : les DTO
-HTTP et les contrats signés n'ont pas le même propriétaire. Le problème est
-que les frontières ne disent pas toujours si un type est canonique, une vue
-locale ou un message de transport. La migration doit commencer par une
-classification et des tests de sérialisation, puis déplacer seulement les
-types réellement partagés. Il faut éviter les réexports de compatibilité
-permanents qui masquent une dépendance supprimée.
+La section `Internal Module Organization` distingue donc systématiquement
+taille totale, code avant le module de tests, responsabilité réelle et action.
+Elle privilégie les splits par agrégat, commande ou transport concret et
+refuse les arbres génériques `models/services/validators/utils`.
 
 ## 5. Architecture cible proposée
 
-Cette cible conserve le nombre de crates proche de l'existant et n'introduit
-que des frontières justifiées par un changement de propriétaire :
+La cible conserve la majorité des crates existantes et ajoute seulement des
+frontières démontrées :
 
 ```text
 crates/
   aether/                    contrats partagés et crypto commune
+  aether-fido/               FIDO partagé ou abstraction FIDO [renommé]
+  aether-key-negotiation/    transport QUIC/TLS v5 partagé [renommé]
+  aether-vault/              conteneur AEAD partagé [renommé]
   astra/                     sous-système autorité/certificats
-  helios-astra-channel/      protocole privé Astra <-> gateway
-  helios-api/                API/WS/UI de la gateway
-  helios-escrow/             enveloppes de séquestre opérateur
-  helios-fido/               FIDO/WebAuthn matériel
-  helios-firewall/           policy -> IR -> compiler -> backend
-  helios-key-negotiation/    QUIC/mTLS et négociation v5
-  helios-provisioning/       admission, IPAM et session
-  helios-trust/              registre de certificats gateway, si seam confirmée
-  helios-tpm/                TPM, boot et fenêtres d'update
+  astra-channel/             canal privé Astra <-> gateway [nouveau]
+  helios-api/                API/WS/UI gateway
+  helios-escrow/             format et opérations de séquestre [nouveau]
+  helios-firewall/           FirewallPolicy -> IR -> backend
+  helios-provisioning/       admission, IPAM, session et rotation PSK
+  helios-trust/              registre durable des certificats [conditionnel]
+  helios-tpm/                TPM, boot et fenêtre d’update [renommé]
   helios-update/             releases et activation
-  helios-vault/              format de coffre AEAD
   helios-wireguard/          plan de données WireGuard
   orion-core/                logique cliente portable
 
 apps/
   heliosd/                   composition root gateway
-  orion/src-tauri/           composition root Tauri
+  orion/                     composition root Tauri
 
 tools/
   helios-ctl/
@@ -464,306 +512,344 @@ tools/
   xtask/
 ```
 
-Les noms de package peuvent rester ceux d'aujourd'hui pendant la migration.
-Le déplacement physique de `crates/helio-tpm` vers `crates/helios-tpm` est
-souhaitable pour la cohérence, mais ne doit intervenir qu'après la séparation
-des responsabilités et la vérification des références externes. Les modules
-firewall (`policy`, IR, validation, compiler, backend) et les modules
-WireGuard restent dans leurs crates respectives.
+Les crates `aether-*` sont des crates sœurs de `aether`, pas des modules
+internes ni des dépendances de `aether`. En particulier,
+`aether-key-negotiation -> aether` : le transport partagé consomme les contrats
+canoniques, tandis qu'`aether` ne dépend jamais de QUIC/TLS.
 
-`helios-runtime` n'est pas retenu dans la cible immédiate. Il deviendra
-justifié uniquement si une seconde application ou un second hôte doit
-construire et exécuter le même lifecycle gateway. Tant que `heliosd` est le
-seul consommateur normal, une telle crate déplacerait simplement sa complexité
-sans créer de frontière réelle.
+`astra-channel` est justifiée par un protocole de processus à processus,
+ses bornes TLS/ALPN, deux côtés indépendants et la suppression de
+`astra -> helios-api`. `helios-escrow` est justifiée par une frontière de
+secret opérateur et son absence de dépendance TPM réelle. `helios-trust` reste
+conditionnelle : si l’extraction du registre produit un package utilisé par un
+seul consommateur sans simplifier son ownership, le registre peut rester un
+module du sous-système gateway.
+
+`helios-runtime` n’est pas retenue maintenant. Elle ne deviendra justifiée que
+si un second binaire, un autre hôte ou un test de lifecycle réutilisable doit
+assembler le même runtime gateway.
+
+Le graphe Orion cible ne doit donc contenir que `aether`, les crates
+`aether-*`/neutres explicitement partagées et ses propres modules. Les
+packages `helios-*` restent réservés aux sous-systèmes gateway ou aux outils
+qui en sont les compositions roots.
+
+Les modules firewall et WireGuard restent internes à leurs crates. La
+réorganisation physique ne crée pas de hiérarchie artificielle
+`domain/services/infrastructure/application`.
 
 ## 6. Graphe cible
 
-Le graphe ci-dessous représente les frontières après les extractions proposées.
-Les crates nouvelles sont annotées ; l'arête WireGuard–provisioning peut rester
-temporairement le temps de stabiliser le trait d'IPAM.
-
 ```text
-aether
-  ^
-  ├── helios-vault
-  ├── helios-escrow                 [nouvelle frontière]
-  ├── helios-tpm
-  ├── helios-fido
-  ├── helios-key-negotiation
-  ├── helios-provisioning
-  ├── helios-trust                  [extraction confirmée par seam]
-  ├── helios-astra-channel          [contrats/canal privé]
-  ├── helios-firewall
-  ├── helios-update
-  └── orion-core
+aether-fido -> aether
+aether-key-negotiation -> aether
+aether-vault -> aether
+helios-escrow -> aether
+helios-firewall -> aether
+helios-provisioning -> aether
+helios-tpm -> aether
+helios-trust -> aether                  [si extraction confirmée]
+helios-update -> aether
 
-helios-wireguard
-  -> helios-provisioning             [contrat PeerTable, à réduire si utile]
+helios-wireguard                         [feuille : arête supprimée, c050537]
+
+astra-channel -> aether
 
 astra
   -> aether
-  -> helios-astra-channel
+  -> astra-channel
 
 astra-operator
   -> aether
-  -> helios-fido
-  -> helios-vault
+  -> aether-fido
+  -> aether-vault
+  -> astra-channel              [uniquement si ses contrats y résident]
 
 helios-api
   -> aether
-  -> helios-astra-channel
+  -> astra-channel
   -> helios-firewall
   -> helios-provisioning
-  -> helios-trust
+  -> helios-trust                  [si extraction confirmée]
   -> helios-update
   -> helios-wireguard
 
 heliosd
-  -> sous-systèmes Helios ci-dessus
-  -> helios-api
-  -> helios-astra-channel
-  -> helios-escrow / helios-tpm
-  -/-> orion-core                   [aucune dépendance de production ni dev]
+  -> aether
+  -> aether-key-negotiation
+  -> aether-vault
+  -> helios-api, helios-escrow et helios-firewall
+  -> helios-provisioning, helios-tpm, helios-update et helios-wireguard
+  -/-> orion-core                [ni normal ni dev après migration]
 
 orion-core
   -> aether
-  -> helios-fido
-  -> helios-key-negotiation
-  -> helios-vault
+  -> aether-fido
+  -> aether-key-negotiation
+  -> aether-vault
 
 orion
   -> aether
   -> orion-core
-  -> support de build éventuel      [build seulement]
+  -> xtask                       [build seulement]
 
 helios-ctl
   -> aether
   -> helios-escrow / helios-tpm
-  -> helios-key-negotiation
+  -> aether-key-negotiation
   -> helios-update
   -> orion-core
 ```
 
-Le graphe cible ne rend pas `astra` dépendante d'une façade HTTP gateway et ne
-rend pas `astra-operator` dépendante de l'implémentation du service. Le code
-partagé demeure sous les deux produits et aucune crate de sous-système ne
-connaît le shell Tauri ou l'application `heliosd`.
+Les applications restent au-dessus des sous-systèmes. Aether ne connaît ni
+Helios, ni Orion, ni Tauri. Astra ne connaît plus la façade API de la gateway.
+Le code commun à Helios et Orion reste dans Aether ou dans une future frontière
+explicitement partagée, jamais dans une application.
 
 ## 7. Dépendances interdites
 
-Les règles suivantes doivent devenir des invariants vérifiables par revue et,
-si possible, par un contrôle de graphe CI :
+- Aether ne dépend d’aucune crate, app ou outil Helios/Orion.
+- Une crate de sous-système ne dépend ni de `heliosd`, ni de `orion`, ni de
+  Tauri, ni du frontend `web`.
+- `heliosd` ne dépend pas de `orion-core` **en production**. La dépendance
+  `dev` est conservée : voir l’arbitrage ci-dessous.
+- `astra` ne dépend ni de `helios-api` ni d’une crate nommée `helios-*` ; le
+  canal privé possède son propre propriétaire neutre.
+- `astra-operator` ne dépend pas de l’implémentation `astra` pour des DTO ou
+  des états déjà partagés.
+- `orion-core` ne dépend d’aucun serveur ou shell Helios.
+- `orion-core` ne dépend directement d’aucun package nommé `helios-*` ; une
+  capacité commune est possédée par `aether`, `aether-*` ou une crate au nom
+  neutre documentée comme partagée.
+- Les contrats partagés ne dépendent pas de Win32, WebView2, GTK, Netlink,
+  `tss-esapi` ou du backend WireGuard réel.
+- Firewall et WireGuard communiquent par interfaces de sous-système, pas par
+  accès aux implémentations internes.
+- Les signatures ML-DSA-65 de release et ML-DSA-87 de négociation/PKI restent
+  deux domaines séparés.
+- Aucun DTO API redigé ne reconstruit ni ne persiste `network.toml`.
+- Aucune nouvelle crate n’est introduite pour une erreur, un type, un utilitaire
+  ou un backend sans frontière de sécurité, protocole, plateforme, cycle de
+  vie ou réutilisation indépendante démontrée.
 
-- `aether` ne dépend d'aucune crate Helios, Orion, application ou outil ;
-- une crate de sous-système ne dépend ni de `heliosd`, ni de `orion`, ni de
-  Tauri, ni de `web` ;
-- `heliosd` ne dépend pas d'`orion-core` dans ses dépendances normales ; son
-  interopérabilité doit être testée par un harnais indépendant ;
-- `astra` ne dépend pas de `helios-api` ; le canal privé possède son propre
-  propriétaire ;
-- `astra-operator` ne dépend pas de l'implémentation `astra` ; ses contrats
-  sont partagés ou fournis par le canal ;
-- `orion-core` ne dépend d'aucune implémentation serveur Helios ;
-- les contrats Aether ne dépendent pas de Win32, WebView2, GTK, Netlink,
-  `tss-esapi` ou WireGuard réel ;
-- `helios-firewall` et `helios-wireguard` ne s'appellent pas directement pour
-  contourner leurs interfaces de sous-système ;
-- la clé et la capacité de signature de release restent dans
-  `helios-publisher`, tandis que les signatures de négociation/PKI restent
-  dans leur domaine ; ML-DSA-65 et ML-DSA-87 ne sont pas fusionnées ;
-- aucun API DTO redigé ne sert à reconstruire et persister `network.toml` ;
-- aucune nouvelle crate n'est créée pour une erreur, un type, un utilitaire ou
-  un backend tant qu'une frontière de cycle de vie, sécurité, protocole,
-  plateforme ou réutilisation indépendante n'est pas démontrée.
+### Arbitrage : `heliosd -[dev]-> orion-core`
+
+La règle initiale (« y compris pour ses tests de package ») **contredisait
+l’arbre cible de la Phase 4 de ce même document**, qui place
+`crates/heliosd/src/key_negotiation/tests/interop.rs` — donc sous la dépendance
+`dev`. La contradiction est tranchée ici en faveur de l’arbre : **REJECTED**,
+l’arête `dev` est conservée et la règle ci-dessus est restreinte à la
+production.
+
+Ce que l’audit a mesuré :
+
+- `crates/heliosd/Cargo.toml` ne déclare qu’un `[[bin]]`. Sortir le test exige
+  donc d’abord d’ajouter une cible `lib` à un composition root.
+- Le test construit `GatewayHandler` par littéral de structure
+  (`crates/heliosd/src/key_negotiation.rs:3954`) : ses **12 champs sont privés**
+  et `TransactionState` (`:218`) l’est aussi. L’extraction demande de publier
+  les deux — c’est-à-dire d’exposer l’état interne du serveur de négociation
+  pour servir un test.
+- Le second test (`crates/heliosd/src/certificates.rs:2125`) appelle
+  `enrolment_view`, `pub fn` dans un binaire, donc inatteignable de l’extérieur
+  pour la même raison.
+- La preuve elle-même se dégraderait : aujourd’hui elle est une **comparaison
+  déterministe de PSK** en `dry_run` contre un plan de données factice. Un
+  harnais externe ne pourrait plus atteindre le PSK installé et devrait se
+  rabattre sur l’observation d’un handshake WireGuard, donc sur un noyau — ce
+  que `docs/testing/TESTING.md` réserve à la cible.
+
+Le coût architectural (cible `lib`, surface publique élargie) dépasse le
+bénéfice (une arête `dev` qui ne figure pas dans le graphe de production et
+qu’aucun binaire livré ne porte). La justification est inscrite dans
+`crates/heliosd/Cargo.toml` (`b9380ca`), qui nomme les deux propriétés
+couvertes.
 
 ## 8. Plan de migration progressive
 
-Chaque phase doit former un commit ou une petite série cohérente, conserver
-les formats et comportements existants, puis passer les validations adaptées.
+Chaque phase doit former un diff reviewable, compiler, passer ses tests et
+laisser inchangés protocoles, formats, clés, certificats, CLI et comportement.
 
-### Phase 0 — cartographie et garde-fous
+> L’état d’avancement réel de chacune de ces phases est en
+> [§13](#13-état-dimplémentation). Les descriptions de phase ci-dessous ne sont
+> pas réécrites : elles restent la trace de l’intention datée.
 
-Livrable : le présent document. Aucun source Rust, manifest ou test n'est
-déplacé. Ajouter seulement, après validation, une règle de revue ou un contrôle
-de graphe qui signale les dépendances interdites.
+### Phase 0 — cartographie
 
-Fichiers concernés :
+Livrer ce document comme référence. Aucun déplacement de source ou manifest.
+Ajouter éventuellement un contrôle read-only du graphe après validation des
+règles interdites.
 
-- `docs/architecture/CRATE-REORGANIZATION.md` ;
-- éventuellement un script de contrôle d'architecture et le workflow de
-  régression, seulement après accord sur les règles.
+Fichiers : `docs/architecture/CRATE-REORGANIZATION.md`, puis éventuellement un
+script de contrôle et son workflow.
 
 Validation : `cargo fmt --all -- --check`, `cargo check --workspace`,
-`cargo test --workspace` et vérification que seuls les fichiers de
-documentation/contrôle ont changé.
+`cargo test --workspace`, contrôle que seules la documentation et les règles
+acceptées ont changé.
 
 ### Phase 1 — corrections sans déplacement
 
-Simplifier le manifest racine avec `crates/*`, `tools/*` et
-`apps/orion/src-tauri`. La suppression de `default-members` ferait entrer
-`helios-publisher` dans le build par défaut ; cette conséquence doit être
-acceptée explicitement. Si son exclusion est intentionnelle, conserver une
-liste documentée plutôt que de prétendre supprimer toute duplication.
+Simplifier uniquement `members` avec des patterns, vérifier le périmètre du
+build par défaut et caractériser les features mortes :
 
-Vérifier et corriger les features mortes ou trop larges, notamment le
-forwarding `helios-update/publisher-signing`, sans modifier les algorithmes ni
-les formats.
+```toml
+members = ["crates/*", "tools/*", "apps/orion/src-tauri"]
+```
 
-Fichiers concernés :
+Conserver `default-members` explicite et inchangé afin qu’Orion reste
+compilé/testé par défaut sans ajouter silencieusement `helios-publisher` à ce
+périmètre.
 
-- `Cargo.toml` ;
-- `crates/aether/Cargo.toml`, `crates/helios-update/Cargo.toml`,
-  `crates/helios-provisioning/Cargo.toml`, `crates/orion-core/Cargo.toml` et
-  les manifests des applications qui forwardent les features ;
-- `.github/workflows/regression.yml`, `.github/workflows/release.yml` si la
-  sélection de packages ou le cache doit être explicitée ;
-- documentation de build concernée, après vérification des commandes.
+Fichiers : `Cargo.toml`, manifests avec forwarding de features, workflows et
+documentation de build si leurs sélections de packages sont explicites.
 
-Validation : métadonnées Cargo par défaut et `--workspace`, build/test de
-`helios-publisher`, compilation/test d'Orion et tests unitaires frontend.
+Validation : métadonnées par défaut et workspace, `cargo check`, tests de
+`helios-publisher`, `orion` et frontend.
 
-### Phase 2 — correction des dépendances de service
+### Phase 2 — frontières partagées et canal Astra
 
-Extraire les contrats du canal privé Astra–Helios de `helios-api` vers une
-crate dédiée, ou vers le propriétaire partagé retenu après revue. Faire
-consommer cette crate par `astra` et `heliosd`, et conserver `helios-api` comme
-façade HTTP/WS/UI. Déplacer les vues et types d'opération nécessaires à
-`astra-operator` vers leur propriétaire canonique, puis retirer sa dépendance
-à `astra`.
+Reclasser les dépendances de `orion-core` vers `helios-fido`,
+`helios-key-negotiation` et `helios-vault`. Déplacer les responsabilités
+partagées dans `aether` lorsque le module est un contrat pur ; sinon renommer
+les packages en `aether-*` ou en noms neutres, sans déplacer les backends
+plateforme dans le socle. Puis extraire les contrats, TLS/ALPN et client/serveur
+du canal privé vers `astra-channel`. Faire consommer cette crate par
+Astra, `heliosd` et la façade API qui en a besoin. Classifier puis déplacer
+`IssuerDelegationRequest` et les vues d’opération vers leur propriétaire
+canonique. Déplacer le test d’interopérabilité hors de la dépendance dev de
+`heliosd`.
 
-Déplacer enfin le test d'interopérabilité `heliosd`/`orion-core` vers un
-harnais indépendant si Cargo permet de conserver le même niveau de preuve.
+Fichiers : manifests de `orion-core`, `helios-fido`,
+`helios-key-negotiation`, `helios-vault`, leurs `src/lib.rs`,
+`helios-api/src/internal.rs`, `src/certificates.rs`, `src/lib.rs`,
+`astra/src/{gateway.rs,distribution.rs,operations.rs,renewal.rs,service.rs}`,
+`astra-operator/src/{authority.rs,origin.rs,tunnel.rs,campaign.rs}`,
+`heliosd/src/astra_channel.rs`, les manifests et les tests de canal.
 
-Fichiers concernés :
+Validation : tests mTLS/TLS 1.3/ALPN, canal privé dans
+`crates/astra/tests/private_channel.rs`, tests opérateur, interopérabilité v5
+et workspace complet.
 
-- `crates/helios-api/src/internal.rs`, `src/certificates.rs`, `src/lib.rs` ;
-- `crates/astra/src/{issuer.rs,signing.rs,gateway.rs,operations.rs}` et les
-  modules de service qui utilisent le canal ;
-- `crates/astra-operator/src/{origin.rs,authority.rs,tunnel.rs,campaign.rs}` ;
-- `crates/heliosd/src/astra_channel.rs`, `src/main.rs` et ses tests ;
-- les tests `crates/astra/tests/private_channel.rs` et les tests concernés de
-  `astra-operator` ;
-- `crates/heliosd/Cargo.toml` et les nouveaux manifest/source du canal ou du
-  harnais.
+### Phase 3 — frontières de sécurité et trust
 
-Validation : tests de canal privé, TLS 1.3/ALPN, tests Astra opérateur,
-interopérabilité de négociation v5 et tests workspace.
+Extraire `helio-tpm::escrow` vers `helios-escrow`, renommer le package matériel
+en `helios-tpm` et mettre à jour les imports sans changer HESC, HVLT, tickets ni
+clés. Ensuite, après caractérisation des tests, extraire
+`helios-provisioning::certificates` vers `helios-trust` uniquement si son
+ownership durable est réellement plus lisible.
 
-### Phase 3 — frontières de sécurité
+Fichiers : `crates/helio-tpm/**`, futur `crates/helios-tpm/**`,
+`tools/helios-ctl/src/escrow.rs`, `heliosd/src/{gateway_key.rs,gateway_rotation.rs}`,
+`helios-provisioning/src/{certificates.rs,lib.rs}`, manifests et tests.
 
-Séparer le séquestre de `helio-tpm` en `helios-escrow`, renommer le package
-matériel en `helios-tpm` et conserver des points de compatibilité transitoires
-si des consommateurs internes en ont besoin. Le format HESC, les tickets,
-les clés et les politiques de rescellement restent inchangés.
+État d'implémentation : l'extraction de l'escrow (`helios-escrow`) et le
+renommage `helio-tpm` -> `helios-tpm` sont faits. Les noms `helio-tpm` employés
+ci-dessus décrivent l'état audité qui a motivé la phase, pas l'ownership
+actuel. L'extraction de `helios-provisioning::certificates` reste ouverte.
 
-Après caractérisation par tests, extraire le registre de certificats gateway
-de `helios-provisioning` vers `helios-trust`. Les contrats partagés restent
-dans Aether ; l'extraction ne doit pas dupliquer le registre ni ses invariants.
+Validation : tests HVLT/HESC, tests dry-run TPM, tests de registre/rotation et
+tests matériels conditionnels sur les cibles décrites dans
+`docs/testing/TESTING.md`.
 
-Fichiers concernés :
+### Phase 4 — découpage interne par blocs fonctionnels
 
-- `crates/helio-tpm/**`, `crates/helio-tpm/Cargo.toml` et le futur
-  `crates/helios-tpm/` ;
-- `crates/heliosd/src/gateway_key.rs`, les modules TPM de `heliosd` et
-  `tools/helios-ctl/src/escrow.rs` ;
-- `crates/helios-provisioning/src/certificates.rs`, `src/lib.rs` et les
-  nouveaux fichiers de `helios-trust` ;
-- les manifests et tests de `helios-api`, `heliosd`, `helios-ctl` et
-  `astra-operator` ;
-- `docs/adr/ADR-002-SIGNATURES-PQ.md`, `docs/adr/ADR-006-SECRETS-AU-REPOS.md`
-  et la documentation TPM, uniquement pour refléter les propriétaires après
-  validation.
+Traiter une crate à la fois, en commençant par les fichiers où plusieurs
+workflows indépendants partagent un même état ou une même façade. Commencer par
+les déplacements de tests qui clarifient la mesure sans toucher aux invariants
+(`helios-provisioning::certificates`, `astra::registry`, ruleset firewall), une
+crate à la fois. Traiter ensuite les seams de production démontrés : transport
+de négociation, identité/transactions de `heliosd`, moteurs speedtest et
+formats d’import Orion. Les contrats Aether viennent après, avec des golden
+files inchangés. Chaque déplacement doit conserver noms de types,
+sérialisation et surface publique, sauf réduction de visibilité explicitement
+vérifiée.
 
-Validation : tests de format HVLT/HESC, tests TPM dry-run, tests matériels
-conditionnels sur cible, tests de rotation et de registre, puis régression
-complète.
+Les tests suivent le déplacement : tests de validation avec la validation,
+tests de transitions avec la machine à états, tests de protocole dans les
+fichiers d’intégration dédiés et tests backend dans les modules conditionnés
+par la plateforme. Une phase de découpage interne ne doit pas modifier le
+comportement ; elle sert à rendre le propriétaire du comportement explicite.
 
-### Phase 4 — composition de `heliosd`
+Fichiers : les arbres indiqués dans `Internal Module Organization`, une crate
+à la fois ; aucun nouveau package requis.
 
-Mesurer le call graph réel après les phases précédentes. Déplacer vers les
-crates propriétaires les fonctions qui ne nécessitent ni process ni lifecycle
-global. Ne créer `helios-runtime` que si un second hôte réutilisable est
-identifié. Le `main` doit alors charger la configuration, construire les
-backends, injecter les dépendances, démarrer et arrêter le lifecycle.
+Validation : formatage, compilation, tests de la crate concernée, tests
+d’intégration associés, puis workspace complet et contrôle des symboles
+publics.
 
-Fichiers concernés :
+### Phase 5 — composition de heliosd
 
-- `crates/heliosd/src/main.rs` ;
-- `crates/heliosd/src/{orchestrator.rs,key_negotiation.rs,certificates.rs,
-  gateway_rotation.rs,astra_channel.rs,static_psk.rs,gateway_key.rs,
-  uplink.rs,vip_routing.rs}` ;
-- `crates/heliosd/Cargo.toml` et un éventuel manifest `helios-runtime` ;
-- tests unitaires correspondants et tests de démarrage/arrêt ;
-- `apps/orion/src-tauri/src/main.rs` et ses modules uniquement pour rendre le
-  shell Tauri plus lisible, sans déplacer la logique d'`orion-core`.
+Mesurer le call graph après les phases précédentes. Déplacer vers les
+propriétaires les fonctions sans état process/lifecycle global ; ne créer
+`helios-runtime` que si un second consommateur est démontré. Réduire `main.rs`
+à la configuration, construction des backends, injection, démarrage, arrêt et
+gestion du process. Garder les politiques gateway dans leurs sous-systèmes,
+pas dans une crate générique d’application.
 
-Validation : lifecycle fail-closed, kill-switch, démarrage/arrêt, WireGuard,
-firewall atomique, configuration hot reload, tests v5, tests API et tests
-frontend.
+Fichiers : `heliosd/src/main.rs`, `orchestrator.rs`, `key_negotiation.rs`,
+`certificates.rs`, `gateway_rotation.rs`, `astra_channel.rs`, `static_psk.rs`,
+`gateway_key.rs`, `uplink.rs`, `vip_routing.rs`, tests lifecycle.
 
-### Phase 5 — organisation physique
+Validation : démarrage/arrêt fail-closed, kill-switch, hot reload, firewall,
+WireGuard, provisioning, négociation v5, API et tests Orion.
 
-Déplacer les dossiers vers `crates/*`, `apps/*` et `tools/*` seulement lorsque
-les propriétaires sont stabilisés. Utiliser des déplacements Git simples,
-mettre à jour les chemins Cargo et les scripts, et préserver les noms de
-packages pour éviter un changement de contrat inutile.
+### Phase 6 — organisation physique
 
-Fichiers concernés : manifests racine et locaux, `tools/xtask/**`, scripts de
-build/package, workflows CI, liens `docs/`, fichiers Tauri et fichiers de
-configuration qui référencent des chemins. Aucun fichier de protocole ou de
-format persistant ne doit être modifié dans cette phase.
+Déplacer uniquement les répertoires dont le propriétaire est stabilisé. Les
+chemins courts `crates/firewall` et `crates/tpm` sont acceptables si les noms
+Cargo restent compatibles (`helios-firewall`, `helios-tpm`). Mettre à jour les
+scripts, workflows, Tauri et packaging. Aucun format protocolaire ou persistant
+ne change dans cette phase.
 
-Validation : build par défaut incluant Orion, build workspace, packaging
-gateway, packaging Orion Windows/Linux selon la cible, et recherche des
-anciens chemins.
+Fichiers : manifests racine/locaux, scripts, workflows, `tools/xtask`, chemins
+Tauri et liens documentaires.
 
-### Phase 6 — nettoyage contrôlé
+Validation : build par défaut incluant Orion, workspace, bundles gateway,
+packaging Orion sur les cibles disponibles et recherche des anciens chemins.
 
-Supprimer les compatibilités temporaires, réexports qui masquent encore une
-dépendance, features inutilisées et commentaires de transition, uniquement
-après migration de tous les consommateurs. Mettre à jour la documentation
-d'architecture générale, l'index et les guides de test.
+### Phase 7 — nettoyage
 
-Fichiers concernés : manifests, `src/lib.rs`, modules de compatibilité, CI,
-`docs/ARCHITECTURE.md`, `docs/architecture/overview.md`,
-`docs/testing/TESTING.md` et les ADR touchés.
+Supprimer les compatibilités, réexports et features de transition seulement
+après migration de tous les consommateurs. Mettre à jour `docs/ARCHITECTURE.md`,
+`docs/architecture/overview.md`, l’index et les guides de test.
 
-## 9. Risques et contrôles
+Fichiers : manifests, `src/lib.rs`, modules de compatibilité, CI et
+documentation concernée.
 
-| Risque | Contrôle requis |
+## 9. Risques
+
+| Risque | Contrôle |
 | --- | --- |
-| Casser un message signé ou une sérialisation | Tests de vecteurs, golden files et compatibilité avant/après |
-| Séparer un invariant certificat de son état | Définir le propriétaire avant déplacement ; tests de transition/rollback |
-| Transformer une dépendance de test en dépendance runtime | Inspection de `cargo metadata` et de chaque section manifest |
-| Affaiblir la frontière de confiance Astra | Tests TLS/ALPN/mTLS et vérification du canal privé dédié |
-| Réintroduire une clé ou un secret dans une couche partagée | Revue des types publics, logs, sérialisation et API de lecture |
-| Rendre une feature disponible sur la mauvaise cible | Matrices CI Linux/Windows et erreurs explicites hors cible |
-| Cacher une régression Orion en simplifiant le workspace | Assertion CI sur la présence d'Orion/Tauri dans le build par défaut |
-| Créer `helios-runtime` sans consommateur réel | Exiger un second hôte ou une réutilisation démontrée |
-| Renommer `helio-tpm` avec un consommateur externe inconnu | Recherche de références, compatibilité de package ou période de transition |
-| Perdre la preuve d'interopérabilité | Conserver le test contre les implémentations réelles dans un harnais dédié |
+| casser une sérialisation ou un message signé | golden files, vecteurs et tests avant/après |
+| séparer un invariant de certificat de son état | propriétaire explicite, tests de transition/rollback |
+| transformer une dépendance de test en runtime | audit `cargo metadata` et manifests par section |
+| affaiblir le canal Astra | tests mTLS, ALPN, pinning et bornes de taille |
+| exposer un secret via un contrat déplacé | revue des types publics, Debug, logs et API de lecture |
+| activer un backend sur la mauvaise cible | matrice Linux/Windows et refus explicite |
+| masquer une casse Orion | assertion CI sur le build/test par défaut de Tauri |
+| créer `helios-runtime` sans besoin | exiger un second hôte ou consommateur réel |
+| renommer `helio-tpm` avec un contrat externe inconnu | recherche de références et transition de package |
+| perdre l’interopérabilité Helios/Orion | harnais indépendant contre les implémentations livrées |
 
-Les protocoles réseau v5, formats persistés, formats cryptographiques, clés,
-signatures, certificats, commandes CLI et comportement runtime sont hors
-objectif de cette réorganisation. Tout écart observé pendant une phase devra
-être arrêté et documenté séparément.
+Cette refonte ne modifie volontairement aucun protocole réseau, format
+persisté/configuration, format crypto, clé, signature, certificat, commande CLI,
+comportement firewall, WireGuard, Orion ou Helios. Tout écart observé pendant
+une phase doit arrêter cette phase et faire l’objet d’une décision distincte.
 
-## 10. Tests et validations
+## 10. Tests et validations nécessaires
 
-État de référence exécuté avant toute modification :
+Référence exécutée avant cette livraison documentaire :
 
-- `cargo fmt --all -- --check` : réussi ;
-- `cargo check --workspace` : réussi ;
-- `cargo test --workspace` : réussi, y compris 404 tests Aether et 259 tests
-  `orion-core` dans cette exécution.
+```text
+cargo fmt --all -- --check       réussi
+cargo check --workspace          réussi
+cargo test --workspace           réussi
+```
 
-Les vérifications non exécutées dans cet audit documentaire sont :
-
-- `cargo clippy --workspace --all-targets --all-features -- -D warnings` ;
-- `npm run test:unit --prefix web` ;
-- `npm run test:unit --prefix apps/orion` ;
-- les tests matériels TPM/FIDO, WireGuard noyau, Netlink et packaging natif.
+La suite `cargo test --workspace` a notamment compilé le package Tauri Orion
+et exécuté les tests unitaires Aether et `orion-core`. Les tests matériels TPM,
+FIDO, Netlink, WireGuard noyau/WireGuardNT et packaging natif ne sont pas
+prouvés par cet environnement.
 
 Après chaque phase de code, exécuter au minimum :
 
@@ -776,46 +862,863 @@ npm run test:unit --prefix web
 npm run test:unit --prefix apps/orion
 ```
 
-Pour les phases de sécurité, protocole, packaging ou multi-crates, ajouter
-`bash scripts/regression.sh`. Les limites de cible restent celles de
-`docs/testing/TESTING.md` : WSL2 et dry-run ne prouvent pas le fonctionnement
-du kernel WireGuard, de Netlink, du TPM ou de l'installation native.
+Pour une phase multi-crates, sécurité, protocole ou packaging, ajouter
+`bash scripts/regression.sh`. Les validations matérielles suivent
+`docs/testing/TESTING.md`; WSL2/dry-run ne prouvent pas les effets du kernel,
+TPM, Netlink, WireGuardNT ou de l’installation.
 
 ## 11. Résultat attendu pour un nouvel ingénieur
 
-Après migration, le dépôt doit permettre de répondre sans parcourir les
-applications :
+Le repository doit permettre d’identifier rapidement :
 
-- les contrats et invariants partagés sont dans `aether` ;
-- chaque sous-système gateway possède son propriétaire et son backend interne ;
-- Astra, TPM, FIDO, vault et séquestre sont des frontières de sécurité
-  explicites ;
-- Orion est une logique cliente indépendante, avec ses adaptations de
-  plateforme dans `orion-core`/Tauri ;
-- `heliosd`, `orion` et les outils assemblent les composants mais ne les
-  possèdent pas ;
-- le graphe interdit les dépendances application-vers-sous-système inverse,
-  les dépendances Helios-vers-Orion de production et les remontées de
-  plateformes dans les contrats.
+- Aether comme socle de contrats et invariants réellement partagés ;
+- chaque sous-système gateway et son backend interne ;
+- les frontières de confiance TPM, FIDO, vault, escrow, Astra et négociation ;
+- Orion comme client indépendant, avec ses plateformes dans `orion-core` et
+  Tauri ;
+- `heliosd`, `orion` et les outils comme compositions roots ;
+- les dépendances autorisées, interdites et les points d’extension.
+
+## 12. Fichiers impactés par phase
+
+| Phase | Fichiers principaux |
+| --- | --- |
+| 0 | `docs/architecture/CRATE-REORGANIZATION.md`, éventuel contrôle read-only |
+| 1 | `Cargo.toml`, manifests de features, workflows, docs de build |
+| 2 | manifests et sources de `orion-core`, `helios-fido`, `helios-key-negotiation`, `helios-vault`, `helios-api/src/{internal.rs,certificates.rs,lib.rs}`, Astra, `astra-operator`, `heliosd/src/astra_channel.rs`, tests de canal et d’interopérabilité |
+| 3 | `crates/helio-tpm/**`, futur `helios-tpm`, futur `helios-escrow`, `helios-provisioning/src/certificates.rs`, `heliosd`, `helios-ctl`, tests de sécurité |
+| 4 | arbres internes indiqués dans `Internal Module Organization`, tests colocalisés et surfaces publiques des crates concernées |
+| 5 | `heliosd/src/main.rs` et modules lifecycle, tests de démarrage/arrêt, éventuellement manifest `helios-runtime` |
+| 6 | chemins `crates/`, `tools/`, `apps/`, manifests, scripts, workflows, Tauri, packaging |
+| 7 | réexports, compatibilités, features, `docs/ARCHITECTURE.md`, `docs/architecture/overview.md`, guides de test et ADR touchés |
+
+## 13. État d’implémentation
+
+> Relevé au 2026-09-13, `HEAD = b9380ca`, branche `refactor-module-organization`.
+> Chaque état est tiré du code, pas d’une intention. Les sections 1 à 12 et
+> `Internal Module Organization` ne sont pas réécrites : elles restent le
+> constat daté qui explique *pourquoi* chaque décision a été prise — même
+> traitement que celui donné à ADR-004 pour l’escrow et aux mentions
+> `helio-tpm` par `9e4f425`.
+>
+> Vocabulaire : **DONE** livré et vérifié ; **PARTIAL** commencé, reste
+> mesurable ; **DEFERRED** non commencé, toujours souhaitable ;
+> **REJECTED** mesuré puis abandonné, avec la mesure.
+
+### Vérifications exécutées pour ce relevé
+
+```text
+cargo metadata --format-version 1 --no-deps          graphe interne
+cargo fmt --all --check                              réussi
+cargo test --workspace                               1530 réussis, 0 échec
+cargo test -p orion-core --features certificate-signing        317
+cargo test -p helios-provisioning --features certificate-signing 95
+cargo test -p helios-firewall --features netlink                54
+cargo clippy --workspace --all-targets --all-features -- -D warnings   réussi
+cargo doc --workspace --no-deps --all-features        liens intra-doc
+```
+
+WSL2 ne prouve ni le noyau `nf_tables`, ni WireGuard, ni le TPM, ni
+WireGuardNT : `docs/testing/TESTING.md` reste la référence pour ces cibles.
+
+### 13.1 Frontières Cargo
+
+| Élément de plan | État | Justification tirée du code |
+| --- | --- | --- |
+| Phase 1 — `members` par patterns | **DONE** | `Cargo.toml` porte `members = ["crates/*", "tools/*", "apps/orion/src-tauri"]`, et `default-members` reste la liste explicite qui inclut Orion et exclut `helios-publisher`. |
+| `helios-escrow` (extraction de l’escrow) | **DONE** | `crates/helios-escrow/` existe ; `helios-tpm` ne l’a plus qu’en `dev-dependency`, `helios-ctl` et `heliosd` en dépendance normale. |
+| `helio-tpm` -> `helios-tpm` | **DONE** | `9e4f425` ; plus aucune occurrence de `helio_tpm`/`helio-tpm` hors des constats datés de ce document et d’ADR-004. |
+| `helios-wireguard -> helios-provisioning` | **DONE** | Arête supprimée (`c050537`). `helios-wireguard` ne déclare plus aucune dépendance de workspace. |
+| `helios_wireguard::PeerAddressTable` | **RUPTURE SOURCE INTERNE À CONFIRMER** | `c050537` supprime ce chemin Rust public en déplaçant l’adaptateur chez son seul consommateur observé dans le workspace. Aucun contrat réseau, persistant ou CLI ne change, mais un consommateur Rust externe éventuel ne compilerait plus. Le dépôt ne déclare pas ces packages comme publiés ; cette absence d’usage externe doit néanmoins être confirmée avant fusion. |
+| `heliosd -[dev]-> orion-core` | **REJECTED** | Voir l’arbitrage en §7 : cible `lib` requise, 12 champs privés de `GatewayHandler` + `TransactionState` à publier, et la preuve passerait d’une comparaison déterministe de PSK à une observation de handshake exigeant un noyau. |
+| `astra -> helios-api` | **PARTIAL** | `050c03c` a requalifié 10 sites vers `aether` (les contrats de renouvellement sont définis dans `aether::certificates::transport`, `helios-api` ne fait que les réexporter). Il reste 24 lignes dans 9 fichiers de `crates/astra/src/` qui nomment `helios_api::` — mesure faite par `grep -rn helios_api crates/astra/src`. |
+| `astra-channel` (SPLIT de `helios-api`) | **DEFERRED, bloquée** | `helios-api/src/lib.rs:24` porte toujours `pub mod internal` (2 255 lignes). La crate réunit 3 des 4 conditions de §5 — protocole processus-à-processus, bornes TLS/ALPN, deux côtés indépendants — mais **pas** la quatrième : `astra` consomme aussi `helios_api::certificates::TrustUpdateRefusal` (`crates/helios-api/src/certificates.rs:85`) depuis `distribution.rs:100` et `renewal.rs:159`. Tant que ce type n’est pas classé (contrat du canal privé, ou contrat de l’API in-tunnel), l’extraction déplace l’arête au lieu de la supprimer. |
+| `astra-operator -> astra` | **DEFERRED — meilleur rapport bénéfice/risque restant** | 13 chemins `astra::` dans `astra-operator/src/` ; 12 nomment `SigningOperationView`/`SigningOperationState`, que `crates/astra/src/signing.rs:107` se contente de réexporter depuis `aether::certificates::transport`. `astra-operator` dépend déjà d’`aether` : la requalification est un renommage de chemin, exactement la technique de `050c03c`. Elle ne supprime pas l’arête — reste `IssuerDelegationRequest` (`crates/astra/src/issuer.rs:90`), réexporté par `astra-operator/src/authority.rs:129`, qui demande une décision d’ownership. |
+| `aether-fido`, `aether-key-negotiation`, `aether-vault` | **DEFERRED** | Non commencé. `cargo metadata` montre toujours `orion-core -> helios-fido, helios-key-negotiation, helios-vault`. La règle de nommage de §1 reste donc violée. Avec `astra -> helios-api` et `astra-operator -> astra`, ce sont les trois interdits de §7 encore enfreints en production. |
+| `helios-trust` (extraction de `helios-provisioning::certificates`) | **DEFERRED** | La *seam* que la Phase 3 exigeait avant extraction est désormais prouvée au niveau module : `096c1e9` a découpé le registre en cinq sous-modules dont chacun a son fichier de tests jumeau. Mais la condition de crate n’est pas remplie : un seul consommateur, `heliosd` (22 lignes) ; `helios-api` ne consomme que la moitié admission de `helios-provisioning`. Le registre reste donc un module, comme §5 l’autorisait explicitement. |
+| `helios-runtime` | **REJECTED** | `e8e771f` a extrait `run()` vers `crates/heliosd/src/daemon.rs`, déclaré `mod daemon;` (privé) dans `main.rs:6`. Aucun second hôte runtime : la condition que §5 posait n’est pas rencontrée. Même conclusion pour `crates/astra/src/daemon.rs`, `mod daemon;` privé dans `astra/src/main.rs:29`. |
+| Phase 6 — organisation physique | **DEFERRED** | Aucun répertoire de crate déplacé. Les regroupements `backend/` prévus pour `helios-firewall` et `helios-wireguard` ne sont pas faits : `dryrun.rs`, `kernel.rs`, `netlink.rs` restent à la racine de leur `src/`. |
+| Phase 7 — nettoyage | **DEFERRED** | Aucune compatibilité ni feature de transition à retirer tant que les Phases 2 et 6 ne sont pas terminées. |
+
+### 13.2 Découpage interne — tests par capacité
+
+| Élément de plan | État | Justification tirée du code |
+| --- | --- | --- |
+| `helios-firewall::ruleset` | **DONE** | `src/ruleset/tests/{access,egress,transport,uplinks,support}.rs`, plus `golden.rs` ajouté par `d95be0c`. |
+| `helios-provisioning::certificates` | **DONE** | `src/certificates/tests/{fixtures,staging,distribution,transitions,trust,persistence}.rs` — un fichier par sous-module de production, correspondance exacte. |
+| `astra::registry` | **DONE** | `src/registry/tests/{challenges,delegation,peer_lifecycle,persistence,transitions}.rs`. La revue finale a replacé `a_delegation_may_not_walk_its_epoch_backwards` avec la production `registry/delegation.rs`. |
+| `orion-core::profile_import` | **DONE** | `src/profile_import/tests/` — neuf fichiers par capacité plus les fixtures, 50 noms de tests inchangés (`15bd6b3`). |
+| `orion-core::certificate_renewal` | **DONE** | `src/certificate_renewal/tests/` — cinq fichiers par capacité plus les fixtures, 26 noms de tests inchangés (`b0bcb42`). La gate `#[cfg(all(test, feature = "certificate-signing"))]` est préservée. |
+| `helios-key-negotiation` | **DONE** | `src/tests/{fixtures,limits,material,protocol,rollback,transport}.rs` (`da36e3b`) : l’arbre livré est exactement celui que §« Négociation » proposait. |
+
+### 13.3 Découpage interne — production
+
+| Élément de plan | État | Justification tirée du code |
+| --- | --- | --- |
+| `helios-key-negotiation/src/lib.rs` (`SPLIT`, haute) | **DONE** | `identity.rs`, `endpoint.rs`, `framing.rs`, `server.rs`, `client.rs`, `transaction.rs`, `rate_limit.rs`, `error.rs` — l’arbre cible au fichier près ; `lib.rs` ne garde que les `mod` privés, les réexports et les constantes bornées. |
+| `helios-provisioning::certificates` (`SPLIT`, haute) | **DONE** | `certificates/{persistence,staging,distribution,transitions,trust}.rs` (`096c1e9`). Seule modification de visibilité : `persist` passe `pub(super)`, portée effective identique. |
+| `helios-firewall::ruleset` | **DONE** (au-delà du plan, qui disait `KEEP`) | `ruleset/{nftables,administration,astra_channel,transport,gateway_wan,meshnet,tunnel_interface,kill_switch}.rs` (`f788e14`). Les six snapshots de `d95be0c`, écrits **avant** le découpage contre le `render` monolithique, passent sans retouche : l’ordre des règles — sémantique en nftables — est prouvé inchangé. |
+| `helios-firewall::netlink` | **DONE** | `netlink/{expressions,transaction,maintenance}.rs` (`2d49c17`). Non exercé contre un noyau : WSL2 n’a pas `nf_tables`. Comparaison ligne à ligne avant/après : aucune ligne de logique ne diffère, seulement imports, `mod`, visibilité et documentation. |
+| `heliosd/src/main.rs` (`SPLIT`, très haute) | **DONE** | `main.rs` est ramené à la surface clap, `main()` et son dispatch (813 lignes, dont ~195 de tests de la surface clap) ; `daemon.rs`, `process_guards.rs`, `commands/{tpm,trust,identity,peer,wan}.rs` (`e8e771f`). `run()` fait 366 lignes, octet pour octet identiques à l’original. Les 24 écrans d’aide sont inchangés. |
+| `astra/src/main.rs` (`SPLIT`, haute) | **DONE** | `main.rs` ramené à 598 lignes ; `daemon.rs`, `private_channel.rs`, `campaign_deposit.rs`, `commands/{trust_domain,campaign,chain,gateway_identity,revocation,issuer}.rs` (`2eb9afe`). Écarts assumés par rapport à l’arbre cible : `bootstrap.rs` s’appelle `trust_domain.rs` (le fichier porte aussi `pin_ca_tls` et `status`), et aucun `cli.rs` n’a été créé — la surface clap reste dans `main.rs`. Les 21 écrans d’aide sont inchangés. |
+| `astra/src/registry.rs` (`SPLIT`, moyenne) | **DONE** (au-delà du plan) | Le plan ne demandait que `challenge.rs` et les tests ; `8b4fe96` a livré en plus `persistence.rs`, `peer_lifecycle.rs`, `transitions.rs`, `delegation.rs`, chacun propriétaire exclusif de champs de `AstraState`. `accept_transitions` n’a pas été découpé, volontairement : sa preuve de capacité précède toute mutation et son écriture est atomique. |
+| `orion-core/src/profile_import.rs` (`SPLIT`, moyenne) | **DONE** | `profile_import/{document,json,wg_quick,field_rules,validation}.rs` (`0908da2`). Deux écarts au plan, justifiés dans le commit : `field_rules` est séparé de `validation` (les validateurs de champ n’ont jamais vu un `ClientProfile`), et l’intake documentaire est réuni avec la complétion d’invitation. |
+| `orion-core/src/certificate_renewal.rs` (`SPLIT`, haute) | **PARTIAL** | `certificate_renewal/{trust_store,promotion,exchange}.rs` (`17bf3d3`) livre la seam « trust store local vs session HTTP ». Reste `impl RenewalSession` : voir 13.4. |
+| `aether/src/certificates/{state,status,client,approval}.rs`, `aether/src/key_negotiation.rs` | **DEFERRED** | Aucun de ces fichiers n’a de sous-dossier ; `crates/aether/src/certificates/` est toujours plat. |
+| `heliosd/src/key_negotiation.rs` (`SPLIT`, très haute) | **DEFERRED** | 4 076 lignes, inchangé hors renommage `helios_tpm`. C’est désormais le plus gros fichier du dépôt. |
+| `heliosd/src/orchestrator.rs` (`SPLIT`, très haute) | **DEFERRED** | 1 912 lignes, intact. |
+| `heliosd/src/certificates.rs` (`SPLIT`, haute) | **DEFERRED** | 2 681 lignes, intact. |
+| `helios-api/src/{internal,certificates,routes}.rs` | **DEFERRED** | Intacts ; `internal.rs` est bloqué derrière la classification de `TrustUpdateRefusal` (13.1). |
+| `orion-core/src/speedtest.rs`, `src/backend/mod.rs` | **DEFERRED** | 2 190 et 1 620 lignes, intacts. |
+| `orion` Tauri `src/main.rs` (`SPLIT`, très haute) | **DEFERRED** | 3 725 lignes, intact. |
+| `astra-signer/src/main.rs` (`SPLIT`, haute) | **DEFERRED** | 3 991 lignes, intact : c’est le plus gros binaire monolithique restant. |
+| `astra-operator/src/authority.rs` -> `signing.rs` (`RENAME`) | **DEFERRED** | `authority.rs` existe toujours ; `operations/rotation.rs` n’est pas créé. |
+| `helios-ctl` — extraction de `monitor.rs`, renommage `key_nego` | **DEFERRED** | `main.rs` (1 325 lignes) porte toujours le suivi WebSocket ; `campaign_key_nego.rs` et `key_nego.rs` gardent leur abréviation. |
+
+### 13.4 Travaux nommés pendant l’implémentation
+
+Ces points n’existaient pas dans l’audit initial : ils ont été mesurés en
+cours de route et sont enregistrés ici plutôt que traités dans un déplacement.
+
+| Point | État | Détail |
+| --- | --- | --- |
+| `impl RenewalSession` (orion-core) | **DEFERRED** | La plomberie HTTP est une vraie frontière — huit méthodes ne touchent que `self.http` — mais l’extraire n’est pas un déplacement : les méthodes restent des méthodes de `RenewalSession`, le champ `http` et cinq méthodes passeraient `pub(super)`, et la configuration de transport (`no_proxy`, `redirect::Policy::none`, `CALL_TIMEOUT`) est construite au milieu du protocole, dans `prepare`. L’extraction honnête introduit un type `RenewalTransport` propriétaire de son client : une réécriture de corps, pas un déplacement. |
+| Imports des tests de `certificate_renewal` | **DONE** | La revue finale a remplacé les six globs par des imports explicites et supprimé du module de production le bloc `use` conditionnel qui ne servait qu’aux tests. |
+| `PeerAddressTable::from_peers(&[])` | **À décider — hors réorganisation** | `crates/helios-api/src/provision.rs` construit la table avec une tranche vide inconditionnelle : la table de pairs vivante qu’ADR-001 §4 exige de consulter à l’enrôlement ne l’est jamais. C’est un écart de comportement **antérieur** au déplacement, laissé à une décision distincte car le corriger nécessite de propager un snapshot et de définir le comportement fail-closed si sa lecture échoue. La revue finale a seulement rendu l’adaptateur privé et corrigé le commentaire trompeur, sans modifier le comportement. |
+| Tests du ruleset firewall vs modules de production | **PARTIAL** | `f788e14` a découpé la production par capacité (`administration`, `transport`, `kill_switch`…) mais n’a pas réaligné `ruleset/tests/`, organisé par comportement (`access`, `egress`, `transport`, `uplinks`) depuis `ff9f095`. Les deux axes coexistent ; `golden.rs` couvre l’ordre global. Réaligner n’est utile que si l’on accepte de renommer des tests, ce qu’aucun déplacement n’a fait jusqu’ici. |
+| Liens intra-doc cassés préexistants | **À corriger — hors périmètre** | `cargo doc --workspace --no-deps --all-features` signale 34 liens non résolus ou pointant vers des items privés. Aucun n’a été introduit par la réorganisation : tous existent à l’identique avant `b837036`, et `096c1e9` en a au contraire réparé un (`RegistryState::client_leaf_issuers`, désormais `crates/helios-provisioning/src/certificates/trust.rs:47`). |
+
+### 13.5 Collision à arbitrer avec la spécification
+
+`docs/specification/ROTATION-CERTIFICATS.md:3988` attribue nommément à
+`helios-api` « l’API privée appelée par Astra ». C’est exactement la
+responsabilité que §4 de ce document classe `SPLIT` et que §5 propose
+d’extraire vers `astra-channel`.
+
+Les deux documents ne peuvent pas être vrais en même temps : la spécification
+est un contrat de responsabilité, et l’extraction la contredirait. Cette
+collision est **signalée, pas résolue** : `ROTATION-CERTIFICATS.md` n’est pas
+modifié ici. Toute livraison d’`astra-channel` doit commencer par une décision
+explicite sur ce tableau — et la classification de `TrustUpdateRefusal` (13.1)
+est la même question posée au niveau du type.
+
+## Internal Module Organization
+
+Cette analyse porte sur la structure interne des packages, indépendamment des
+extractions de crates. Le signal principal est la cohésion fonctionnelle : un
+fichier est problématique lorsqu’il mélange plusieurs workflows, frontières
+de confiance ou modes d’exécution, même s’il reste court. Inversement, une
+machine à états longue mais cohérente peut rester dans un seul module.
+
+La règle de navigation retenue est :
+
+```text
+crate       = frontière architecturale forte
+module      = capacité ou bloc fonctionnel cohérent
+fichier     = responsabilité suffisamment précise et compréhensible
+```
+
+Le découpage recommandé est intra-crate et suit le propriétaire du
+comportement, pas une taxonomie générique `models/errors/utils`. Un module doit
+conserver ses invariants et les transitions de son workflow. `lib.rs` ou
+`mod.rs` doit principalement déclarer les grands blocs et exposer la surface
+stable. Un fichier de 1 000 lignes n’est pas automatiquement mauvais ; des
+workflows indépendants dans le même fichier sont en revanche un signal de
+découpage. Aucun dossier ou fichier ne doit être créé sans responsabilité
+identifiable.
+
+Les tailles du tableau sont totales. Lorsqu’un fichier termine par un module
+de tests inline, la colonne distingue approximativement les lignes avant ce
+module et sa suite de tests. Cette mesure ne remplace pas une analyse de
+cohésion, mais évite de prendre un corpus de régression volumineux pour une
+implémentation monolithique.
+
+### Inventaire actuel des arbres `src/`
+
+Cet inventaire reprend les fichiers Rust réellement présents au moment de
+l’audit. Les fichiers imbriqués sont indiqués avec leur chemin ; les noms
+correspondent donc à l’organisation actuelle, pas à la cible proposée.
+
+```text
+crates/aether/src/
+  lib.rs config.rs error.rs events.rs display_time.rs enroll.rs
+  key_negotiation.rs locked.rs mtu.rs policy.rs pq.rs private_file.rs
+  random.rs secret.rs sig.rs speedtest.rs state.rs wg.rs ml_dsa.rs fuzzing.rs
+  certificates/{mod,approval,authority,capability,client,encoding,gateway,
+                operator_ipc,operator_session,revocation,state,status,transport,
+                webauthn,window,x509}.rs
+
+crates/astra/src/
+  lib.rs main.rs audit.rs chain.rs distribution.rs gateway.rs issuer.rs
+  operations.rs operator.rs planner.rs reconciliation.rs recovery.rs
+  registry.rs renewal.rs service.rs signing.rs
+
+crates/astra-operator/src/
+  lib.rs authority.rs campaign.rs credentials.rs documents.rs gestures.rs
+  handoff.rs origin.rs orion.rs prepared.rs store.rs tunnel.rs vault.rs
+  operations.rs operations/{campaign,recovery}.rs
+
+crates/helios-tpm/src/
+  lib.rs blob_store.rs boot_controller.rs escrow.rs keystore.rs provisioning.rs
+  reseal_ticket.rs secret.rs settings.rs tpm_interface.rs tpm_real.rs
+  update_window.rs
+
+crates/helios-api/src/
+  lib.rs auth.rs certificates.rs embed.rs health.rs internal.rs
+  key_negotiation.rs provision.rs routes.rs speedtest.rs update.rs ws.rs
+
+crates/helios-fido/src/
+  lib.rs authenticator.rs authenticator/webauthn.rs
+
+crates/helios-firewall/src/
+  lib.rs ruleset.rs netlink.rs dryrun.rs
+
+crates/helios-key-negotiation/src/  lib.rs
+crates/helios-provisioning/src/     lib.rs admission.rs certificates.rs ipam.rs rotation.rs session.rs
+crates/helios-update/src/           lib.rs bundle.rs
+crates/helios-vault/src/            lib.rs
+crates/helios-wireguard/src/        lib.rs kernel.rs dryrun.rs
+
+crates/heliosd/src/
+  main.rs astra_channel.rs certificates.rs gateway_key.rs gateway_rotation.rs
+  key_negotiation.rs orchestrator.rs static_psk.rs uplink.rs vip_routing.rs
+
+crates/orion-core/src/
+  lib.rs backend/{mod,wireguard,dryrun}.rs
+  vault/{mod,settings,passphrase,keys,registry,store,manifest,codec}.rs
+  vault/windows/{mod,dpapi,dumps,tpm,bitlocker,prompt}.rs
+  certificate_actions.rs certificate_approval.rs certificate_inventory.rs
+  certificate_recovery.rs certificate_renewal.rs certificates.rs config.rs
+  events.rs identity_store.rs key_negotiation.rs mtu.rs net_pin.rs
+  operator_pending.rs profile_import.rs provisioning.rs speedtest.rs
+  telemetry.rs test_domain.rs trust_update.rs
+
+tools/astra-signer/src/             main.rs
+tools/helios-astra-helper/src/      main.rs owner.rs session.rs
+tools/helios-ctl/src/               main.rs api.rs app_update.rs campaign.rs
+                                    campaign_key_nego.rs enroll.rs escrow.rs
+                                    files.rs key_nego.rs peer.rs profile.rs update.rs
+tools/helios-installer/src/         main.rs
+tools/helios-publisher/src/         main.rs
+tools/xtask/src/                    lib.rs main.rs orion_deps.rs orion_helper.rs
+
+apps/orion/src-tauri/src/           main.rs astra.rs companion.rs deelevate.rs
+                                    operator.rs tray.rs
+```
+
+`fuzz/` possède son propre workspace hors du workspace racine ; ses harnesses
+restent rattachés aux capacités qu’ils testent dans `aether` et ne constituent
+pas une crate runtime supplémentaire.
+
+### Tableau de synthèse
+
+| Crate | Fichier | Taille totale (avant tests + tests) | Responsabilités détectées | Problème | Action | Priorité |
+| --- | --- | ---: | --- | --- | --- | --- |
+| `aether` | `src/certificates/state.rs` | 3 353 (2 078 + 1 275) | agrégats gateway/client/Astra, transitions et ledger de confiance | plusieurs agrégats bornés partagent un fichier ; aucune I/O de persistance | `SPLIT` | moyenne |
+| `aether` | `src/certificates/status.rs` | 3 021 (1 465 + 1 556) | statut certificat, campagnes, échanges signer et rollback | plusieurs familles de contrats wire distinctes | `SPLIT` | haute |
+| `aether` | `src/certificates/client.rs` | 2 806 (1 870 + 936) | rotation, staging, commit et recovery client | plusieurs étapes du lifecycle client, fortement liées | `SPLIT` | moyenne |
+| `aether` | `src/certificates/approval.rs` | 2 546 (1 540 + 1 006) | policy, credentials et preuves d’approbation | trois capacités de contrat identifiables | `SPLIT` | moyenne |
+| `aether` | `src/key_negotiation.rs` | 2 617 (1 523 + 1 094) | messages v5, authentification, dérivation et validation | wire types et opérations crypto réunis | `SPLIT` | haute |
+| `astra` | `src/registry.rs` | 3 363 (1 488 + 1 875) | registre autoritatif, audit, transitions et persistance | majorité de tests ; conserver les mutations atomiques ensemble | `SPLIT` | moyenne |
+| `astra` | `src/main.rs` | 2 491 (sans module de tests inline) | CLI, bootstrap, canaux, commandes et lifecycle | composition root trop chargé | `SPLIT` | haute |
+| `astra-operator` | `src/authority.rs` | 1 733 (sans module de tests inline) | gestes de signature de l’autorité | fichier long mais cohérent ; nom actuel peu précis | `RENAME` | basse |
+| `astra-operator` | `src/vault.rs` | 1 622 (994 + 628) | slots, ouverture et opérations du coffre | capacité cohérente, corpus de tests important | `KEEP` | basse |
+| `helios-tpm` | `src/boot_controller.rs` | 884 | décisions de boot et état de démarrage | machine de décision cohérente | `KEEP` | basse |
+| `helios-tpm` | `src/tpm_real.rs` | 777 | adaptation `tss-esapi` | backend externe clairement identifiable | `MOVE` | moyenne |
+| `helio-tpm` | `src/escrow.rs` | 344 | HESC, X25519/AEAD et séquestre opérateur | responsabilité sans dépendance TPM | `MOVE` | haute |
+| `helios-api` | `src/internal.rs` | 2 255 (1 666 + 589) | canal Astra, TLS/ALPN, clients, serveur et contrats privés | reverse dependency et frontière protocolaire autonome | `MOVE` | très haute |
+| `helios-api` | `src/certificates.rs` | 1 746 (1 221 + 525) | vues HTTP, traits handlers et routes certificat | plusieurs capacités API, pas logique de registre | `SPLIT` | haute |
+| `helios-api` | `src/routes.rs` | 1 105 (847 + 258) | DTO et routes status/network/peer/firewall/trust | plusieurs ressources HTTP indépendantes | `SPLIT` | moyenne |
+| `helios-fido` | `src/authenticator.rs` | 1 032 (925 + 107) | contrat Authenticator et backends CTAP/plateforme | frontière matériel cohérente, WebAuthn déjà séparé | `KEEP` | basse |
+| `helios-firewall` | `src/ruleset.rs` | 1 865 (987 + 878) | IR structurée et compilation d’une policy en ruleset | production cohérente ; près de la moitié du fichier est du test | `KEEP` | basse |
+| `helios-key-negotiation` | `src/lib.rs` | 2 705 (1 688 + 1 017) | QUIC/TLS, serveur/client, limites, transaction et rollback | transport et lifecycle ont des seams réels | `SPLIT` | haute |
+| `helios-provisioning` | `src/certificates.rs` | 4 373 (1 688 + 2 685) | registre gateway atomique et tests de toutes ses transitions | tests majoritaires ; ne pas disperser le sérialiseur des mutations | `SPLIT` | haute |
+| `helios-update` | `src/lib.rs` | 833 (657 + 176) | store, vérification, staging et activation atomique | capacité compacte et cohérente | `KEEP` | basse |
+| `helios-vault` | `src/lib.rs` | 1 128 (578 + 550) | format HVLT, KDF, seal/open et lecture bornée | format et crypto étroitement liés ; moitié de tests | `KEEP` | basse |
+| `helios-wireguard` | `src/lib.rs` | 261 | types interface/peer et trait backend | petite surface cohérente | `KEEP` | basse |
+| `heliosd` | `src/main.rs` | 2 464 (2 129 + 335) | CLI, bootstrap, commandes et lifecycle process | composition root et implémentation mélangés | `SPLIT` | très haute |
+| `heliosd` | `src/key_negotiation.rs` | 4 076 (2 614 + 1 462) | transactions PSK et identité de service négociation | deux capacités de sécurité distinctes dans un fichier | `SPLIT` | très haute |
+| `heliosd` | `src/certificates.rs` | 2 681 (1 593 + 1 088) | service gateway, admission, canal Astra et projections API | plusieurs adaptateurs autour du registre | `SPLIT` | haute |
+| `heliosd` | `src/orchestrator.rs` | 1 912 (1 415 + 497) | data plane, commandes, reload, télémétrie, probes et lifecycle | plusieurs boucles/runtime sans propriétaire local clair | `SPLIT` | très haute |
+| `orion-core` | `src/certificate_renewal.rs` | 2 721 (1 672 + 1 049) | trust store local et session HTTP de renewal | persistance locale et protocole client séparables | `SPLIT` | haute |
+| `orion-core` | `src/profile_import.rs` | 2 702 (1 283 + 1 419) | JSON Orion, wg-quick, validation et complétion | tests majoritaires ; seams naturels par format | `SPLIT` | moyenne |
+| `orion-core` | `src/speedtest.rs` | 2 190 (1 727 + 463) | moteurs HTTP, TCP brut, UDP brut et métriques | transports indépendants réunis | `SPLIT` | haute |
+| `orion-core` | `src/backend/mod.rs` | 1 620 (1 019 + 601) | contrat backend et contrôleur VPN | façade publique et orchestration client réunies | `SPLIT` | moyenne |
+| `orion` Tauri | `src/main.rs` | 3 725 (3 088 + 637) | état UI, commandes, certificats, profils, logs et lifecycle | shell Tauri utilisé comme service applicatif | `SPLIT` | très haute |
+| `astra-signer` | `src/main.rs` | 3 991 (3 931 + 60) | commandes, cérémonies, vault, signatures et transport | vrai monolithe de binaire | `SPLIT` | haute |
+| `helios-ctl` | `src/main.rs` | 1 325 (1 131 + 194) | dispatch CLI, affichage et suivi WebSocket | commandes métier déjà en modules ; extraire seulement le monitoring | `SPLIT` | basse |
+| `xtask` | `src/main.rs` | 946 (624 + 322) | dispatch build/package et tests | taille de production modérée, support déjà séparé | `KEEP` | basse |
+| `helios-astra-helper` | `src/main.rs` | 627 | protocole interactif et composition helper | cohésion acceptable avec modules voisins | `KEEP` | basse |
+| `helios-publisher` | `src/main.rs` | 570 | CLI release, validation et signature | outil cohérent | `KEEP` | basse |
+| `helios-installer` | `src/main.rs` | 422 | installation, activation et rollback | workflow privilégié cohérent | `KEEP` | basse |
+
+### Arbres cibles par crate
+
+#### Aether
+
+`aether` doit d’abord être réorganisée en modules. Son fan-in élevé et le
+couplage des invariants de certificats ne justifient pas une multiplication de
+crates. Les extractions concernent les gros fichiers du sous-dossier
+certificats et le contrat de négociation, sans déplacer les types à travers
+des crates tant que leur ownership n’est pas prouvé.
+
+```text
+crates/aether/src/
+  lib.rs
+  certificates/
+    mod.rs
+    encoding.rs              encodage, fingerprint et X.509
+    x509.rs
+    capability.rs
+    window.rs
+    authority.rs             autorité, émission et délégation
+    client/
+      mod.rs
+      rotation.rs
+      staging.rs
+      recovery.rs
+    approval/
+      mod.rs
+      policy.rs
+      credentials.rs
+      renewal.rs
+      recovery.rs
+    state/
+      mod.rs
+      gateway.rs
+      client.rs
+      astra.rs
+      ledger.rs
+    status/
+      mod.rs
+      certificate.rs
+      campaign.rs
+      signer_exchange.rs
+      rollback.rs
+    revocation.rs            révocation et états associés
+    transport.rs             contrats de transport et vues signées
+    gateway.rs
+    operator_ipc.rs
+    operator_session.rs
+    webauthn.rs
+  key_negotiation/
+    mod.rs
+    messages.rs              wire types v5
+    authentication.rs        bytes canoniques et signatures
+    derivation.rs            dérivation et commitments PSK
+  config.rs
+  enroll.rs
+  events.rs
+  policy.rs
+  pq.rs
+  random.rs
+  secret.rs
+  sig.rs
+  state.rs
+  wg.rs
+```
+
+Les dossiers proposés correspondent à des familles déjà visibles dans les
+types, pas à des couches génériques. Le split de `state.rs` doit conserver les
+opérations du `TrustLedger` et chaque agrégat borné dans un même fichier ; il
+ne doit pas séparer données et transitions. `lib.rs` conserve les modules
+publics et les réexports canoniques. Les helpers et fixtures restent privés ou
+`pub(crate)`. Les tests peuvent suivre les sous-modules, tandis que les golden
+files et vecteurs restent des tests d’intégration Aether.
+
+#### Astra et opérateur
+
+`registry.rs` est moins monolithique que sa taille brute ne le suggère :
+1 875 de ses 3 363 lignes appartiennent à son corpus de tests. Les mutations,
+l’audit et la persistance forment une transaction autoritative et doivent
+rester ensemble dans un premier temps. La première séparation concerne les
+tests par comportement et le `ChallengeStore`, puis seulement les commandes du
+binaire Astra.
+
+```text
+crates/astra/src/
+  lib.rs
+  registry.rs                état, mutations atomiques, audit et persistance
+  registry/
+    challenge.rs
+    tests/
+      mod.rs
+      peers.rs
+      rotations.rs
+      trust_updates.rs
+      migration.rs
+  issuer.rs
+  distribution.rs
+  operations.rs
+  renewal.rs
+  reconciliation.rs
+  recovery.rs
+  service.rs
+  main.rs                    composition process
+  cli.rs
+  commands/
+    mod.rs
+    bootstrap.rs
+    campaign.rs
+    chain.rs
+    gateway_identity.rs
+    issuer.rs
+    revocation.rs
+
+crates/astra-operator/src/
+  lib.rs
+  signing.rs                 renommage de authority.rs : gestes CA-PQ/CA-TLS
+  campaign.rs
+  credentials.rs
+  documents.rs
+  gestures.rs
+  handoff.rs
+  operations/
+    mod.rs
+    recovery.rs
+    rotation.rs
+  origin.rs
+  prepared.rs
+  store.rs
+  tunnel.rs
+  vault.rs
+```
+
+`authority.rs` ne doit pas être éclaté par couches techniques : sa cohésion est
+la séquence des gestes qui utilisent les ancres. Le nom `signing.rs` décrit
+mieux cette responsabilité. Les tests de campagne, de coffre et de transport
+restent avec leurs modules ; les tests de bout en bout de l’autorité restent
+sous `crates/astra/tests/`.
+
+#### Firewall et WireGuard
+
+`helios-firewall` constitue déjà une bonne frontière Cargo. Créer une
+hiérarchie `policy/model/validation/compiler` serait excessif : la policy
+canonique appartient à Aether, et les 987 lignes de production de
+`ruleset.rs` forment un compilateur cohérent vers une IR structurée. Le gain
+immédiat est de sortir son important corpus de tests et de regrouper les
+backends, sans casser l’atomicité du ruleset. Le trait `FirewallBackend` reste
+la frontière d’exécution.
+
+```text
+crates/helios-firewall/src/
+  lib.rs
+  ruleset.rs                 IR et compilation depuis FirewallPolicy
+  ruleset/
+    tests.rs
+  backend/
+    mod.rs
+    netlink.rs               adaptation rustables/libnftables
+    dryrun.rs
+
+crates/helios-wireguard/src/
+  lib.rs
+  backend/
+    mod.rs
+    kernel.rs
+    dryrun.rs
+```
+
+Le fichier `helios-wireguard/src/lib.rs` reste `KEEP` : ses 261 lignes forment
+une petite surface publique de types et trait backend. Seul le rangement
+physique des backends est proposé. Les tests de ruleset restent indépendants
+de Linux ; les tests Netlink, noyau et dry-run sont séparés et conditionnés.
+
+#### TPM, escrow, FIDO, vault et update
+
+Ces crates sont des frontières de sécurité. Le découpage préserve une surface
+réduite et ne doit jamais faire circuler de clé privée ou de plaintext dans des
+modules de lecture génériques.
+
+```text
+crates/helios-tpm/src/
+  lib.rs
+  boot_controller.rs
+  tpm_interface.rs            contrats TPM
+  backend/
+    mod.rs
+    real.rs                   adaptation tss-esapi
+  keystore.rs
+  update_window.rs
+  provisioning.rs
+  reseal_ticket.rs
+  secret.rs
+  settings.rs
+
+crates/helios-escrow/src/
+  lib.rs                     HESC, X25519/AEAD et enveloppe ; 344 lignes
+
+crates/aether-fido/src/
+  lib.rs
+  authenticator.rs           contrat et backend CTAP HID
+  authenticator/webauthn.rs  backend Windows WebAuthn
+
+crates/aether-vault/src/
+  lib.rs                     HVLT, KDF, seal/open et lecture bornée
+
+crates/helios-update/src/
+  lib.rs
+  bundle.rs
+```
+
+Ne pas créer de splits `format.rs`/`crypto.rs`/`file.rs` pour escrow et vault :
+ils produiraient de petits fichiers tout en séparant les invariants du format
+de leur authentification. Même conclusion pour `helios-update`, dont les 657
+lignes de production forment un workflow atomique cohérent. Le nom
+`aether-fido` reste conditionnel : si CTAP HID est
+seulement un backend de plateforme, il faut un nom neutre de capacité plutôt
+que faire croire qu’Aether possède l’adaptateur. Dans tous les cas, Orion ne
+dépend pas d’un package `helios-fido`.
+
+#### API et provisioning
+
+Après extraction du canal Astra, `helios-api` devient une façade de transport
+et de projection. Les modèles persistants, contrats signés et DTO HTTP restent
+distincts.
+
+```text
+crates/helios-api/src/
+  lib.rs                      AppState et surface router
+  auth.rs
+  health.rs
+  routes/
+    mod.rs
+    status.rs
+    peers.rs
+    network.rs
+    firewall.rs
+    commands.rs
+  certificates/
+    mod.rs
+    views.rs
+    gateway_identity.rs
+    renewal.rs
+    trust_update.rs
+    operator_relay.rs
+  provision.rs
+  key_negotiation.rs
+  speedtest.rs
+  update.rs
+  ws.rs
+
+crates/helios-provisioning/src/
+  lib.rs
+  admission.rs
+  ipam.rs
+  session.rs
+  rotation.rs
+  certificates.rs             registre et sérialiseur des mutations
+  certificates/tests/
+    mod.rs
+    fixtures.rs
+    staging.rs
+    distribution.rs
+    trust_transitions.rs
+    persistence.rs
+```
+
+Le registre de certificats reste une machine à états cohérente. Ses 1 688
+lignes de production partagent volontairement un seul sérialiseur : staging,
+commit, promotion et purge calculent un état candidat, le persistent, puis
+l’adoptent. Les disperser par opération affaiblirait la lecture de cet
+invariant. Le premier découpage porte donc sur les 2 685 lignes de tests,
+classées par comportement. L’extraction vers `helios-trust` reste une décision
+de crate séparée.
+
+#### Négociation
+
+La crate protocolaire conserve une seule frontière Cargo, mais son fichier
+unique doit distinguer contrat, transport, session et lifecycle.
+
+```text
+crates/aether-key-negotiation/src/      après renommage éventuel
+  lib.rs
+  identity.rs                identité TLS et empreintes
+  endpoint.rs                endpoints QUIC et paramètres transport
+  framing.rs                 framing JSON privé, borné et inchangé
+  server.rs                  transaction servie et préparation du matériau
+  client.rs                  ClientSession et PendingChallenge
+  transaction.rs             deadline, commit et rollback cancellation-safe
+  rate_limit.rs
+  error.rs                   contrat d'erreur transversal client/serveur
+  tests/
+    mod.rs
+    fixtures.rs
+    limits.rs
+    material.rs
+    protocol.rs
+    rollback.rs
+    transport.rs
+```
+
+Les messages v5, signatures et dérivations restent dans Aether : la crate
+actuelle les importe déjà depuis `aether::key_negotiation`. Il ne faut donc pas
+recréer ici des fichiers `types`, `validation` ou `crypto` qui dupliqueraient
+cette ownership. `error.rs` est une exception locale justifiée : `PublicError`
+et `TransportError` forment le contrat transversal déjà consommé par les chemins
+client et serveur ; ce n'est ni une crate d'erreurs ni un nouveau format. La
+crate de transport porte TLS/QUIC, client, serveur, limites réseau et rollback.
+Les tests QUIC internes restent dans cette crate. Les tests d'interopérabilité
+réelle Helios/Orion sont actuellement dans `heliosd/src/key_negotiation.rs` ;
+leur extraction est une migration séparée nécessaire pour retirer la dépendance
+dev `heliosd -> orion-core`.
+
+#### `heliosd`
+
+`heliosd` est le point principal de mélange entre application et sous-système.
+La priorité est de rendre visibles les blocs qui appartiennent déjà aux
+crates gateway, puis de laisser `main.rs` exprimer le workflow de démarrage et
+d’arrêt.
+
+```text
+crates/heliosd/src/
+  main.rs                     dispatch et lancement du process
+  cli.rs                      types clap
+  commands/
+    mod.rs
+    tpm.rs
+    identity.rs
+    trust.rs
+    peer.rs
+  bootstrap.rs               configuration, préflight et construction
+  key_negotiation/
+    mod.rs
+    transaction.rs            ownership PSK, handshake, commit et rollback
+    identity.rs               identité TLS/PQ servie et stockage scellé
+    server.rs                 endpoint et reclaimer
+    tests/
+      mod.rs
+      transaction.rs
+      identity.rs
+      interop.rs
+  certificates/
+    mod.rs
+    service.rs                orchestration autour du registre
+    admission.rs              inbox et première génération
+    astra.rs                  adaptation du canal privé
+    views.rs                  projections API sans secrets
+  orchestrator/
+    mod.rs
+    data_plane.rs             WireGuard, firewall et kill-switch
+    commands.rs               commandes de l’orchestrateur
+    reload.rs                 hot reload de network.toml
+    observation.rs            handshakes et transitions peers
+    probes.rs                 captive portal et MTU
+    telemetry.rs
+  gateway_key.rs
+  gateway_rotation.rs
+  static_psk.rs
+  uplink.rs
+  vip_routing.rs
+  astra_channel.rs
+```
+
+`main.rs` ne doit pas parser des certificats, ouvrir le vault, configurer
+WireGuard ou compiler le firewall. Le split de `key_negotiation.rs` suit ses
+deux responsabilités observées — transaction PSK et identité servie — plutôt
+que des couches abstraites admission/installation/observation. Celui de
+`orchestrator.rs` suit les boucles réellement présentes : data plane,
+commandes, reload, observation, probes et télémétrie. Ces modules restent dans
+`heliosd` tant qu’un propriétaire de sous-système ou un second runtime n’est
+pas démontré.
+
+#### `orion-core` et Tauri
+
+`orion-core` contient plusieurs capacités client légitimes, mais les gros
+workflows doivent être organisés en dossiers. Il ne doit dépendre ni du
+serveur ni de Tauri.
+
+```text
+crates/orion-core/src/
+  lib.rs
+  backend/
+    mod.rs                     VpnBackend et sélection du backend
+    controller.rs              VpnController et lifecycle client
+    wireguard.rs
+    dryrun.rs
+  certificates/
+    mod.rs
+    inventory.rs
+    actions.rs
+    renewal.rs                 protocole et session de renouvellement
+    trust_store.rs             seed, promotion et rollback locaux
+    recovery.rs
+    approval.rs
+  config.rs
+  identity_store.rs
+  provisioning.rs
+  profile_import/
+    mod.rs
+    json.rs
+    wg_quick.rs
+    validation.rs
+  vault/
+    mod.rs
+    codec.rs
+    keys.rs
+    manifest.rs
+    passphrase.rs
+    registry.rs
+    settings.rs
+    store.rs
+    windows/
+      mod.rs
+      bitlocker.rs
+      dpapi.rs
+      dumps.rs
+      prompt.rs
+      tpm.rs
+  speedtest/
+    mod.rs
+    http.rs
+    raw_tcp.rs
+    raw_udp.rs
+    metrics.rs
+  telemetry.rs
+  events.rs
+
+apps/orion/src-tauri/src/
+  main.rs                     composition Tauri et lifecycle
+  state.rs                    état applicatif et synchronisation
+  commands/
+    mod.rs
+    certificates.rs
+    profiles.rs
+    provisioning.rs
+    recovery.rs
+  views.rs                    projections sûres pour le frontend
+  events.rs                   émission vers React
+  platform/
+    mod.rs
+    deelevate.rs
+    companion.rs
+  tray.rs
+  logging.rs
+  astra.rs
+  operator.rs
+```
+
+Les splits suivent les seams observés : trust store versus session HTTP pour
+le renouvellement, JSON versus `wg-quick` pour l’import, HTTP versus TCP/UDP
+bruts pour le speedtest, et contrôleur versus backend WireGuard. La structure
+`vault/` existante est conservée : elle est déjà organisée par capacité et par
+plateforme. Les commandes Tauri valident l’entrée, appellent `orion-core` et
+convertissent le résultat en projection UI. Les tests de workflow client
+restent dans `orion-core` ; les tests Tauri couvrent l’adaptation de commande,
+d’état et d’événement.
+
+#### Outils et tests
+
+Les petits packages `helios-installer`, `helios-publisher` et
+`helios-astra-helper` restent en fichiers courts. Les outils plus grands
+peuvent suivre cette organisation sans devenir de nouvelles crates :
+
+```text
+tools/astra-signer/src/
+  main.rs
+  commands/
+    mod.rs
+    vault.rs                  init, enrol, verify, list, remove
+    issuer.rs                 émission CA-TLS et délégation
+    campaign.rs               approbation et dépôt de résultats
+    gateway_identity.rs       bootstrap, transition, abort et rollback
+    recovery.rs
+    ca_rotation.rs
+
+tools/helios-ctl/src/
+  main.rs                     CLI, dispatch et rendu court
+  monitor.rs                  suivi WebSocket et rendu des événements
+  api.rs
+  app_update.rs
+  campaign.rs
+  campaign_key_negotiation.rs
+  enroll.rs
+  escrow.rs
+  files.rs
+  key_negotiation.rs
+  peer.rs
+  profile.rs
+  update.rs
+
+tools/xtask/src/
+  main.rs
+  orion_deps.rs
+  orion_helper.rs
+```
+
+`astra-signer` est le seul de ces outils où le split de production est
+prioritaire : 3 931 lignes couvrent plusieurs cérémonies distinctes. Le nom de
+chaque fichier cible correspond à une commande ou une famille de décisions de
+sécurité. `helios-ctl` conserve ses modules actuels et extrait seulement le
+monitoring encore présent dans `main.rs`; les abréviations `key_nego` sont
+renommées pour rendre la navigation explicite. `xtask` reste inchangé tant que
+ses 624 lignes de production restent un dispatch cohérent.
+
+Les tests inline restent adaptés aux invariants locaux. Les tests de protocole,
+interopérabilité, persistance et backend peuvent être séparés en fichiers
+d’intégration nommés par comportement, plutôt qu’en un unique `tests.rs`.
+Les tests nécessitant root, Netlink, WireGuard, TPM ou une plateforme restent
+explicitement conditionnés et documentés selon `docs/testing/TESTING.md`.
+
+### Visibilité et API à contrôler
+
+La visibilité n’est pas uniformément mauvaise. Les constats précis sont :
+
+| Crate | Surface observée | Recommandation |
+| --- | --- | --- |
+| `aether` | nombreux modules publics et réexports racine de contrats | conserver les contrats canoniques ; rendre privés les helpers issus des splits sans ajouter de nouveaux réexports globaux |
+| `astra` | modules métier publics utilisés par son binaire et l’opérateur | retirer d’abord la dépendance `astra-operator -> astra` pour les DTO, puis réduire seulement les modules sans consommateur |
+| `astra-operator` | réexport de `helios_fido::authenticator` et de contrats Astra | faire dépendre les consommateurs du propriétaire réel ; ne pas utiliser la façade opérateur pour masquer deux autres crates |
+| `helios-tpm` | backend et stockage principalement privés, API racine explicite | conserver ce modèle ; l’extraction d’escrow retire son seul module public hors TPM |
+| `helios-api` | `pub mod internal` expose canal, TLS, clients et contrats à Astra | supprimer ce module public après extraction vers `astra-channel` |
+| `helios-firewall` | backend privé, types utiles réexportés à la racine | surface correcte ; les futurs sous-modules de backend restent privés |
+| `helios-key-negotiation` | API publique directement dans `lib.rs` | garder les futurs modules privés et réexporter uniquement endpoints, sessions et traits réellement consommés |
+| `helios-provisioning` | modules domaine publics, réexports partiels à la racine | conserver `certificates` nommé tant que son registre est consommé comme sous-système ; éviter un deuxième chemin réexporté pour chaque type |
+| `helios-vault` / `helios-update` / `helios-wireguard` | surfaces racine compactes | pas de réduction motivée par la taille |
+| `orion-core` | nombreux `pub mod` et réexports racine utilisés par Tauri/outils | définir la façade client attendue, migrer les consommateurs, puis rendre privés les modules de workflow et backends concrets |
+| binaires et outils | modules privés par défaut | conserver ; les splits de `main.rs` ne nécessitent aucun `pub` externe |
+
+Chaque découpage retenu inclut ensuite une passe de visibilité :
+
+- supprimer les `pub mod` utilisés uniquement par des consommateurs internes ;
+- préférer `mod` ou `pub(crate)` lorsque le contrat ne sort pas de la crate ;
+- réduire les réexports de `lib.rs` à une façade intentionnelle ;
+- séparer projections API, vues UI, modèles persistants et contrats signés ;
+- vérifier `Debug`, sérialisation, logs et méthodes de lecture pour éviter toute
+  exposition de secret ;
+- ajouter un test lorsque la réduction de visibilité est une garantie
+  importante.
+
+Le critère final est la localité du changement : modifier l’admission, le
+firewall, la rotation de certificats ou le backend Windows doit conduire à un
+dossier fonctionnel et à ses tests, sans traverser plusieurs répertoires
+techniques génériques.
 
 ## Recommended first migration
 
 La plus petite modification au meilleur rapport bénéfice/risque est une
-modification du manifest racine uniquement : remplacer les listes explicites
-du workspace par les patterns `crates/*`, `tools/*` et
-`apps/orion/src-tauri`, puis supprimer `default-members` afin que tous les
-packages membres, Orion compris, soient inclus par défaut.
+clarification du workspace Cargo, sans déplacement de code : remplacer
+uniquement `members` par les patterns couvrant les emplacements canoniques,
+conserver la liste `default-members` actuelle et ajouter un contrôle qui exige
+toujours Orion/Tauri dans le build par défaut.
 
-Cette étape ne déplace aucun code et ne change aucun protocole. Elle supprime
-la divergence actuelle entre `members` et `default-members`, rend visible
-`helios-publisher` dans le build par défaut et conserve la garantie importante
-que Tauri/Orion est compilé et testé. Elle doit néanmoins être revue comme un
-changement de périmètre de build : si l'exclusion actuelle de
-`helios-publisher` est intentionnelle, garder une liste `default-members`
-explicitement justifiée et limiter la première migration à l'ajout d'un
-contrôle CI attestant qu'Orion est toujours présent.
+```toml
+members = ["crates/*", "tools/*", "apps/orion/src-tauri"]
+```
 
-Cette première étape doit être livrée seule, avec vérification de
-`cargo metadata`, `cargo check --workspace`, `cargo test --workspace`, les
-tests frontend et une revue du diff. Aucune phase suivante ne doit commencer
-avant validation de ce rapport et de cette décision.
+La liste explicite `default-members` reste inchangée : elle inclut Orion et
+exclut volontairement `helios-publisher` du build par défaut.
+
+> **État : DONE.** `Cargo.toml` porte les patterns et la liste explicite
+> `default-members`. La suite décrite ci-dessous — canal Astra, trust registry,
+> escrow, `helios-runtime` — a depuis été traitée ou tranchée : voir §13.
+
+Utiliser les mêmes wildcards dans `default-members` n’est pas équivalent : cela
+ajouterait `helios-publisher` au build par défaut et modifierait le périmètre de
+validation. Cette variation n’apporte pas de bénéfice architectural suffisant
+pour être glissée dans un nettoyage de manifest.
+
+Cette étape est limitée au manifest, ne touche aucun contrat externe et produit
+un diff facilement réversible. Elle doit être livrée seule puis relue et
+validée avant toute extraction du canal Astra, du trust registry, de l’escrow,
+ou toute tentative de création de `helios-runtime`.

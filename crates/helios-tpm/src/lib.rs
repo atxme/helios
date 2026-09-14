@@ -31,7 +31,8 @@
 
 mod blob_store;
 mod boot_controller;
-pub mod escrow;
+#[cfg(test)]
+mod escrow_recovery_tests;
 pub mod keystore;
 mod provisioning;
 mod reseal_ticket;
@@ -43,7 +44,6 @@ mod tpm_real;
 mod update_window;
 
 pub use boot_controller::{BootController, BootDecision};
-pub use escrow::EscrowError;
 pub use keystore::{
     Context, KeystoreError, SealedKeystore, DOMAIN_GATEWAY_WG_KEY, DOMAIN_KEY_NEGOTIATION_IDENTITY,
 };
@@ -110,9 +110,6 @@ pub enum TpmError {
 
     #[error(transparent)]
     Keystore(#[from] keystore::KeystoreError),
-
-    #[error(transparent)]
-    Escrow(#[from] escrow::EscrowError),
 
     #[error("real TPM operation not implemented ({0}) — to be validated on target")]
     NotImplemented(&'static str),

@@ -28,6 +28,11 @@ Le même flou existe sur les secrets. Trois manques sont concrets :
   document `orion-profile` v1 a un **consommateur** (`orion-core::profile_import`)
   sans **producteur**.
 
+État d’implémentation : la responsabilité de séquestre appartient désormais à
+la crate `helios-escrow`, consommée directement par `heliosd` et
+`helios-ctl`. La référence à `helio_tpm::escrow` ci-dessus décrit l’état qui a
+motivé cette décision, pas l’ownership actuel.
+
 ## Décision
 
 ### 1. Trois rôles, trois outils, un seul humain possible

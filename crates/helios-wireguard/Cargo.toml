@@ -7,7 +7,6 @@ license.workspace = true
 description = "Plan de données WireGuard de la gateway Helios : trait + backend dry-run (testable partout) et backend noyau (feature `wireguard`, target-only)."
 
 [dependencies]
-helios-provisioning = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

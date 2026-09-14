@@ -198,7 +198,7 @@ pub async fn run(
     shared_peers: Arc<RwLock<Vec<PeerStatus>>>,
     // Held here and nowhere else: the TPM sealing secret must not transit
     // through the API crate. Only the orchestrator can seal.
-    boot: helio_tpm::BootDecision,
+    boot: helios_tpm::BootDecision,
     api_ready: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let mut policy = shared_network.read().await.firewall_policy();
@@ -463,7 +463,7 @@ async fn handle_external_cmd(
     policy: &mut FirewallPolicy,
     internal_tx: &mpsc::Sender<OrchestratorCmd>,
     shared_policy: &Arc<RwLock<FirewallPolicy>>,
-    boot: &helio_tpm::BootDecision,
+    boot: &helios_tpm::BootDecision,
 ) -> anyhow::Result<()> {
     match cmd {
         OrchestratorCmd::Connect => {
@@ -1899,7 +1899,7 @@ mod tests {
             &internal_tx,
             &policy,
             // TPM disabled: this test does not perform a key rotation.
-            &helio_tpm::BootDecision::Disabled,
+            &helios_tpm::BootDecision::Disabled,
         )
         .await
         .unwrap();

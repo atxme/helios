@@ -161,7 +161,7 @@ function remoteSentence(remote: RemoteState): string {
   if (typeof remote === 'object') {
     return `Signée et commitée. La nouvelle génération prend effet le ${instant(
       remote.activation_deferred.activation_at,
-    )} — d’ici là, l’ancienne reste servie.`
+    )}.`
   }
   switch (remote) {
     case 'local':
@@ -169,11 +169,11 @@ function remoteSentence(remote: RemoteState): string {
     case 'awaiting_operator':
       return 'L’autorité tient la demande et attend un opérateur.'
     case 'prepared':
-      return 'Signé sur ce poste. Rien n’a encore quitté cette machine.'
+      return 'Signé sur ce poste.'
     case 'deposited':
-      return 'Déposé auprès de l’autorité. À partir d’ici, plus rien ne s’annule.'
+      return 'Déposé auprès de l’autorité. Plus rien ne s’annule.'
     case 'staged':
-      return 'La gateway a mis la génération candidate en scène.'
+      return 'La gateway a préparé la génération candidate.'
     case 'pending_grant':
       return 'Reçu signé par la gateway ; le grant reste à libérer.'
     case 'granted':
@@ -197,8 +197,8 @@ function gestureSentence(gesture: GestureState, operation: OperationKind): strin
           : purpose === 'approve_campaign'
             ? 'pour approuver la campagne affichée'
           : purpose === 'second_approval'
-            ? 'pour la seconde approbation, qui doit venir d’une autre clé'
-            : 'pour promouvoir ce qui a déjà été préparé'
+            ? 'pour la seconde approbation'
+            : 'pour promouvoir ce qui a été préparé'
       return `Brancher la clé autorisée${which}, ${why}.`
     }
     const { index, of } = gesture.processing_key
@@ -206,15 +206,15 @@ function gestureSentence(gesture: GestureState, operation: OperationKind): strin
   }
   switch (gesture) {
     case 'verifying':
-      return 'Vérification de ce qui est demandé, avant qu’aucune clé ne soit sollicitée.'
+      return 'Vérification de la demande.'
     case 'idle':
       return 'En attente de l’autorité.'
     case 'signing':
-      return 'Signature en cours. Le système peut demander le PIN et le contact de la clé.'
+      return 'Signature en cours.'
     case 'done':
       return TITLES[operation] + ' : terminé.'
     case 'cancelled':
-      return 'Abandonné avant que quoi que ce soit ne quitte cette machine.'
+      return 'Abandonné. Rien n’a quitté cette machine.'
     case 'failed':
       return 'La cérémonie s’est arrêtée.'
   }
@@ -224,7 +224,7 @@ function gestureSentence(gesture: GestureState, operation: OperationKind): strin
 function refusalSentence(refusal: Refusal): string {
   switch (refusal.refusal) {
     case 'vault_unavailable':
-      return 'Le coffre d’autorité est absent, illisible, ou n’est pas celui de ce domaine.'
+      return 'Coffre d’autorité absent, illisible, ou étranger à ce domaine.'
     case 'key_declined':
       return 'Aucune clé n’a répondu, ou le geste a été refusé.'
     case 'foreground_unavailable':
@@ -237,13 +237,11 @@ function refusalSentence(refusal: Refusal): string {
     case 'key_repeated':
       return 'Les deux approbations doivent venir de deux clés distinctes.'
     case 'window_expired':
-      return 'La fenêtre de l’opération s’est refermée avant la fin du geste. En rouvrir une.'
+      return 'La fenêtre de l’opération s’est refermée. En rouvrir une.'
     case 'authority_refused':
-      return `L’autorité a décliné${
-        refusal.status ? ` (${refusal.status})` : ''
-      }. Le motif détaillé reste dans son journal protégé.`
+      return `L’autorité a décliné${refusal.status ? ` (${refusal.status})` : ''}.`
     case 'handoff_mismatch':
-      return 'Ce que l’autorité propose ne correspond pas à ce que ce coffre épingle. Rien n’a été signé.'
+      return 'La proposition ne correspond pas à ce que ce coffre épingle.'
     case 'manifest_mismatch':
       return 'La réponse ne décrit pas la demande envoyée.'
     case 'protocol_violation':
@@ -319,9 +317,6 @@ export function OperatorCeremonyPanel({
 
       {status.manifest && (
         <Box sx={{ mt: 1.25, pt: 1.25, borderTop: `1px solid ${RULE}` }}>
-          <Typography color="text.disabled" sx={{ fontSize: 11, lineHeight: 1.5, mb: 0.5 }}>
-            Vérifié contre ce que ce coffre épingle. C’est cela qui sera signé.
-          </Typography>
           {rowsOf(status.manifest).map(([label, value]) => (
             <Row key={label} label={label} value={value} />
           ))}

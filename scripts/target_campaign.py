@@ -1000,7 +1000,7 @@ def _campagne_psk_plan_de_donnees(ctx: Contexte):
 
 @scenario("scellement et liaison PCR sur TPM réel", "tpm")
 def _tpm_materiel(ctx: Contexte):
-    """Exécute les essais matériels de `helio-tpm` sur `/dev/tpmrm0`.
+    """Exécute les essais matériels de `helios-tpm` sur `/dev/tpmrm0`.
 
     Les tests unitaires du crate tournent contre `DryRunTpm` : ils éprouvent la
     logique de décision, jamais le silicium. Ceux-ci scellent réellement, puis
@@ -1017,7 +1017,7 @@ def _tpm_materiel(ctx: Contexte):
         return Etat.ECHEC, "TPM présent mais illisible — relancer --bootstrap (groupe tss)"
 
     s = ctx.cible.executer(
-        "HELIOS_TPM_MATERIEL=1 cargo test -p helio-tpm --features tpm --test materiel 2>&1",
+        "HELIOS_TPM_MATERIEL=1 cargo test -p helios-tpm --features tpm --test materiel 2>&1",
         timeout=1800,
     )
     details = [

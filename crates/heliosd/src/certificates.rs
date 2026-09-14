@@ -113,7 +113,7 @@ pub struct CertificateService {
     signer: Arc<dyn StageReceiptSigner>,
     /// TPM-derived unlock material retained only so step 9 can atomically
     /// replace the sealed active gateway identity at `not_after`.
-    gateway_identity_secret: Option<helio_tpm::SecretKey>,
+    gateway_identity_secret: Option<helios_tpm::SecretKey>,
     /// The authority's transaction producer, when this gateway has one.
     ///
     /// `None` on a gateway deployed without Astra, and that is a supported
@@ -133,7 +133,7 @@ impl CertificateService {
         }
     }
 
-    pub fn with_gateway_identity_secret(mut self, secret: Option<helio_tpm::SecretKey>) -> Self {
+    pub fn with_gateway_identity_secret(mut self, secret: Option<helios_tpm::SecretKey>) -> Self {
         self.gateway_identity_secret = secret;
         self
     }

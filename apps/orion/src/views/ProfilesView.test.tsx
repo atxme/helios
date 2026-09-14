@@ -427,7 +427,6 @@ describe('ProfilesView interactions', () => {
     expect(within(screen.getByLabelText('Plancher')).getAllByRole('button')).toHaveLength(3)
 
     expect(screen.queryByRole('button', { name: 'Retirer' })).toBeNull()
-    expect(screen.getByText(/type d’un profil enregistré est immuable/i)).toBeTruthy()
   })
 
   /** Certificates have their own destination: none of it leaks back here. */
@@ -703,8 +702,8 @@ describe('ProfilesView interactions', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Importer' }))
 
     expect(await screen.findByRole('dialog')).toBeTruthy()
-    expect(screen.getByText(/anciens blocs SSD/)).toBeTruthy()
-    expect(screen.getByText(/Orion la signalera comme protection incomplète/)).toBeTruthy()
+    expect(screen.getByText(/n’est pas chiffré par BitLocker/)).toBeTruthy()
+    expect(screen.getByText(/vous acceptez ce niveau de protection/)).toBeTruthy()
     expect(screen.queryByText(/exigence levée/)).toBeNull()
     expect(click).not.toHaveBeenCalled()
 

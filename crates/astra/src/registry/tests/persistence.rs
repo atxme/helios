@@ -1,0 +1,86 @@
+use super::*;
+
+/// A backup that ends on another head is a fork, not a resume.
+#[test]
+fn loading_a_forked_chain_is_refused() {
+    let (registry, directory) = registry();
+    let head = registry.audit_head();
+    let path = directory.path().join("astra.json");
+
+    AstraRegistry::load(&path, Some(&head)).expect("same head");
+    assert!(matches!(
+        AstraRegistry::load(&path, Some(&Fingerprint::of(b"another history"))),
+        Err(RegistryError::Audit(AuditError::Forked))
+    ));
+}
+
+/// A registry written before the policy pin and the credential epoch
+/// existed still loads, and comes back describing the same domain.
+///
+/// Refusing it is what actually happened on a live gateway: `astra status`
+/// failed, the deployment read that failure as "not bootstrapped", and the
+/// bootstrap then refused to start a second history over the first. The
+/// operator was left with an authority holding a service key, an audit
+/// chain and a domain, and no command that could read any of them.
+#[test]
+fn a_registry_written_before_the_policy_pin_is_migrated_rather_than_refused() {
+    let (registry, directory) = registry();
+    registry.save().expect("save");
+    let path = directory.path().join("astra.json");
+
+    // Exactly the older shape: the two fields simply are not there.
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let object = document.as_object_mut().unwrap();
+    object.remove("astra_policy_fingerprint");
+    object.remove("credential_registry_epoch");
+    std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+
+    let loaded = AstraRegistry::load(&path, None).expect("the older registry loads");
+    let state = loaded.state();
+    assert_eq!(state.trust_domain_id, TrustDomainId::new([1; 16]).unwrap());
+    assert_eq!(state.peers.len(), 1, "the peers survived the migration");
+    // The lowest possible epoch: every consumer keeps the highest it has
+    // seen, so starting higher would refuse the first genuine document.
+    assert_eq!(state.credential_registry_epoch, 0);
+    // Recomputed, never read: exactly what bootstrap would have written
+    // for this identity.
+    let expected = AstraIssuancePolicy::standard(
+        state.trust_domain_id,
+        state.gateway_wg_public_key,
+        state.server_name.clone(),
+    )
+    .pin()
+    .expect("pin");
+    assert_eq!(&state.astra_policy_fingerprint, &expected);
+
+    // Written back, so the migration happens once and the audit head is
+    // the one the operator already holds.
+    let reloaded = AstraRegistry::load(&path, Some(&registry.audit_head()))
+        .expect("and the chain did not fork");
+    assert_eq!(
+        reloaded.state().astra_policy_fingerprint,
+        state.astra_policy_fingerprint
+    );
+}
+
+/// A registry that carries neither the pin nor the identity to recompute
+/// it from is refused by name. It is not a registry.
+#[test]
+fn a_registry_with_nothing_to_recompute_the_pin_from_is_refused() {
+    let (registry, directory) = registry();
+    registry.save().expect("save");
+    let path = directory.path().join("astra.json");
+
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let object = document.as_object_mut().unwrap();
+    object.remove("astra_policy_fingerprint");
+    object.remove("server_name");
+    std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+
+    assert!(matches!(
+        AstraRegistry::load(&path, None),
+        Err(RegistryError::Corrupt(_))
+    ));
+}

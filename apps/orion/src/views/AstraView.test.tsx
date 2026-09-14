@@ -106,7 +106,7 @@ describe('AstraView', () => {
         output_path: 'C:\\astra\\ca-tls-transition.json',
       }),
     )
-    expect(await screen.findByText(/Branchez la première clé autorisée/)).toBeTruthy()
+    expect(await screen.findByText(/première clé attendue/)).toBeTruthy()
     expect(screen.getByText(/Campagne vérifiée/)).toBeTruthy()
     expect(screen.getByText('rotation planifiée')).toBeTruthy()
     expect(screen.getByText('1 → 2')).toBeTruthy()
@@ -126,8 +126,8 @@ describe('AstraView', () => {
       screen.getByRole('button', { name: 'Seconde clé branchée — continuer' }),
     )
     await waitFor(() => expect(screen.getByText(/Clé reconnue : YubiKey home/)).toBeTruthy())
-    expect(screen.getByText(/Transition CA-TLS préparée et déposée/)).toBeTruthy()
-    expect(screen.getByText(/La promotion CA-TLS reste requise/)).toBeTruthy()
+    expect(screen.getByText(/Transition CA-TLS déposée/)).toBeTruthy()
+    expect(screen.getByText(/La promotion reste à faire/)).toBeTruthy()
     expect(api.continueAstraCaTlsRotation).toHaveBeenCalledTimes(2)
   })
 
@@ -199,7 +199,7 @@ describe('AstraView', () => {
     expect(await screen.findByText('rotation des ancres')).toBeTruthy()
     const open = screen.getByRole('button', { name: 'Ouvrir la cérémonie' })
     expect(open.hasAttribute('disabled')).toBe(true)
-    expect(screen.getByText(/n’est pas encore portée dans Orion/)).toBeTruthy()
+    expect(screen.getByText(/n’est pas encore disponible dans Orion/)).toBeTruthy()
     fireEvent.click(open)
     expect(api.beginOperatorCeremony).not.toHaveBeenCalled()
   })

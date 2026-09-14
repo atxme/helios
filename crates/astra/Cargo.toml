@@ -15,7 +15,9 @@ aether = { workspace = true, features = ["key-negotiation-signing"] }
 # Conteneur AEAD unique du dépôt (ADR-006) : le coffre d'autorité en empile
 # trois — un par key-slot, plus le corps — au lieu d'inventer un format.
 # Les deux bouts du canal privé Astra–Helios (ROTATION-CERTIFICATS §8.3) sont
-# définis dans `helios_api::internal`, et Astra en consomme la moitié cliente.
+# définis dans `helios_api::internal`, et Astra en consomme les deux : la moitié
+# cliente pour appeler la gateway, et la moitié serveur pour son propre listener
+# privé (`server_config` et `serve`).
 # La dépendance se lit à l'envers — l'autorité vers l'API de la gateway — et
 # c'est délibéré : la seule alternative est une seconde copie du vérificateur
 # épinglé, de l'ALPN et du plancher de version, c'est-à-dire l'endroit exact où

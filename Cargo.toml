@@ -1,26 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/aether",
-    "crates/astra",
-    "crates/astra-operator",
-    "crates/helios-firewall",
-    "crates/helios-update",
-    "crates/helios-api",
-    "crates/helio-tpm",
-    "crates/helios-provisioning",
-    "crates/helios-wireguard",
-    "crates/helios-key-negotiation",
-    "crates/helios-vault",
-    "crates/helios-fido",
-    "crates/orion-core",
-    "crates/heliosd",
-    "tools/astra-signer",
-    "tools/helios-astra-helper",
-    "tools/helios-ctl",
-    "tools/helios-publisher",
-    "tools/helios-installer",
-    "tools/xtask",
+    "crates/*",
+    "tools/*",
     "apps/orion/src-tauri",
 ]
 
@@ -37,7 +19,8 @@ default-members = [
     "crates/helios-firewall",
     "crates/helios-update",
     "crates/helios-api",
-    "crates/helio-tpm",
+    "crates/helios-tpm",
+    "crates/helios-escrow",
     "crates/helios-provisioning",
     "crates/helios-wireguard",
     "crates/helios-key-negotiation",
@@ -163,9 +146,20 @@ helios-fido = { path = "crates/helios-fido" }
 helios-api = { path = "crates/helios-api" }
 helios-firewall = { path = "crates/helios-firewall" }
 helios-update = { path = "crates/helios-update" }
-helio-tpm = { path = "crates/helio-tpm" }
+helios-escrow = { path = "crates/helios-escrow" }
+helios-tpm = { path = "crates/helios-tpm" }
 orion-core = { path = "crates/orion-core" }
 
 [profile.release]
 lto = "thin"
 strip = true
+
+# Le lien d'Orion en debug sous Windows/MSVC dépassait la limite de 4 Gio du
+# PDB (LNK1140) : le fichier agrège les infos de débogage de tout le graphe —
+# `windows-*` et leurs types générés, le C d'`aws-lc-sys`, tauri/wry/tao.
+# Les dépendances sont donc compilées sans infos de débogage ; les crates de
+# l'espace de travail gardent le debug complet du profil `dev`, donc le
+# pas-à-pas et les backtraces du code Helios/Orion restent intacts. Seul le
+# pas-à-pas *dans la source d'une dépendance* est perdu.
+[profile.dev.package."*"]
+debug = false
