@@ -10,6 +10,67 @@
 
 use std::fmt;
 
+/// Conntrack states understood by the Helios firewall IR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionState {
+    Invalid,
+    Established,
+    Related,
+    New,
+    Untracked,
+}
+
+impl ConnectionState {
+    const fn bit(self) -> u8 {
+        match self {
+            Self::Invalid => 1 << 0,
+            Self::Established => 1 << 1,
+            Self::Related => 1 << 2,
+            Self::New => 1 << 3,
+            Self::Untracked => 1 << 4,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Invalid => "invalid",
+            Self::Established => "established",
+            Self::Related => "related",
+            Self::New => "new",
+            Self::Untracked => "untracked",
+        }
+    }
+}
+
+/// Non-empty set of conntrack states, with deterministic rendering order.
+///
+/// The bits are private so an unknown or empty state set cannot enter a
+/// [`Match`]. Add a named constant when Helios needs another combination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectionStates(u8);
+
+impl ConnectionStates {
+    pub const INVALID: Self = Self(ConnectionState::Invalid.bit());
+    pub const ESTABLISHED_RELATED: Self =
+        Self(ConnectionState::Established.bit() | ConnectionState::Related.bit());
+
+    pub const fn contains(self, state: ConnectionState) -> bool {
+        self.0 & state.bit() != 0
+    }
+
+    pub fn iter(self) -> impl Iterator<Item = ConnectionState> {
+        [
+            ConnectionState::Invalid,
+            ConnectionState::Established,
+            ConnectionState::Related,
+            ConnectionState::New,
+            ConnectionState::Untracked,
+        ]
+        .into_iter()
+        .filter(move |state| self.contains(*state))
+    }
+}
+
 /// Verdict of a rule or default policy of a chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
@@ -57,8 +118,8 @@ impl L4 {
 /// A match criterion.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Match {
-    /// `ct state established,related`
-    Established,
+    /// `ct state <states>`
+    ConnectionState(ConnectionStates),
     /// `iifname "<iface>"`
     InIface(String),
     /// `oifname "<iface>"`
@@ -94,7 +155,14 @@ pub enum Match {
 impl fmt::Display for Match {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Match::Established => write!(f, "ct state established,related"),
+            Match::ConnectionState(states) => {
+                let list = states
+                    .iter()
+                    .map(ConnectionState::as_str)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                write!(f, "ct state {list}")
+            }
             Match::InIface(i) => write!(f, "iifname \"{i}\""),
             Match::OutIface(i) => write!(f, "oifname \"{i}\""),
             Match::DestPort { port, proto } => write!(f, "{} dport {port}", proto.as_str()),

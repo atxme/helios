@@ -61,7 +61,9 @@ mod nftables;
 mod transport;
 mod tunnel_interface;
 
-pub use nftables::{ChainKind, Match, Rule, Ruleset, Verdict, L4};
+pub use nftables::{
+    ChainKind, ConnectionState, ConnectionStates, Match, Rule, Ruleset, Verdict, L4,
+};
 
 use aether::{FirewallPolicy, TunnelState, SPEEDTEST_PORT};
 
@@ -86,6 +88,21 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
     let mut rules = Vec::new();
     let wan_ifaces = policy.wan_ifaces.clone();
 
+    // Invalid conntrack entries must never be rescued by a later, narrower
+    // accept rule (the administration API is intentionally rendered before
+    // the ordinary established/related opening). Keep this invariant at the
+    // absolute head of every hooked chain.
+    for chain in [Input, Forward, Output] {
+        rules.push(
+            Rule::new(
+                chain,
+                vec![Match::ConnectionState(ConnectionStates::INVALID)],
+                Verdict::Drop,
+            )
+            .with_note("invalid conntrack state: dropped before every opening"),
+        );
+    }
+
     administration::admin_api(&mut rules, policy);
 
     // ── Always allowed ───────────────────────────────────────────────────────
@@ -102,7 +119,13 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
             Match::InIface("lo".into())
         };
         rules.push(Rule::new(chain, vec![loopback], Verdict::Accept));
-        rules.push(Rule::new(chain, vec![Match::Established], Verdict::Accept));
+        rules.push(Rule::new(
+            chain,
+            vec![Match::ConnectionState(
+                ConnectionStates::ESTABLISHED_RELATED,
+            )],
+            Verdict::Accept,
+        ));
     }
 
     astra_channel::lifecycle_and_public_origin(&mut rules);

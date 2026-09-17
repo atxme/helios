@@ -3,6 +3,55 @@
 use super::super::*;
 use super::support::{policy, text};
 
+#[test]
+fn invalid_conntrack_is_dropped_before_every_opening() {
+    let mut p = policy();
+    p.admin_port = Some(8080);
+    p.admin_iface = Some("helios0".into());
+    p.allow_tunnel_icmp = true;
+
+    let rs = render(&p, TunnelState::Up);
+    for chain in [ChainKind::Input, ChainKind::Forward, ChainKind::Output] {
+        let rules = rs.chain(chain).collect::<Vec<_>>();
+        assert_eq!(
+            rules.first().map(|rule| (&rule.matches, rule.verdict)),
+            Some((
+                &vec![Match::ConnectionState(ConnectionStates::INVALID)],
+                Verdict::Drop,
+            )),
+            "{chain:?}: invalid traffic must be dropped before any accept rule"
+        );
+    }
+
+    let input = rs.chain(ChainKind::Input).collect::<Vec<_>>();
+    let invalid = input
+        .iter()
+        .position(|rule| rule.matches == vec![Match::ConnectionState(ConnectionStates::INVALID)])
+        .unwrap();
+    let admin_accept = input
+        .iter()
+        .position(|rule| {
+            rule.verdict == Verdict::Accept
+                && rule.matches.contains(&Match::DestPort {
+                    port: 8080,
+                    proto: L4::Tcp,
+                })
+        })
+        .unwrap();
+    let established = input
+        .iter()
+        .position(|rule| {
+            rule.matches
+                == vec![Match::ConnectionState(
+                    ConnectionStates::ESTABLISHED_RELATED,
+                )]
+        })
+        .unwrap();
+
+    assert!(invalid < admin_accept);
+    assert!(admin_accept < established);
+}
+
 /// The WireGuard listener is in `input` (traffic towards the gateway),
 /// LAN forward in `forward`. Confusing them would block or open the
 /// wrong traffic.

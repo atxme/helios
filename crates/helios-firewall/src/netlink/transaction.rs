@@ -214,7 +214,9 @@ mod tests {
                 crate::ruleset::Rule {
                     chain: ChainKind::Input,
                     matches: vec![
-                        Match::Established,
+                        Match::ConnectionState(
+                            crate::ruleset::ConnectionStates::ESTABLISHED_RELATED,
+                        ),
                         Match::InIface("helios0".into()),
                         Match::DestPort {
                             port: 8080,

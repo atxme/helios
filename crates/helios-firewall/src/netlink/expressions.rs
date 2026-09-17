@@ -15,15 +15,7 @@ use rustables::{
 };
 
 use super::NetlinkBackend;
-use crate::ruleset::{ChainKind, Match, L4};
-
-/// Conntrack states [`Match::Established`] accepts, as the kernel reads them.
-///
-/// Pinned as a constant so a refactor back to [`NfRule::established`] — which
-/// sets `ESTABLISHED` alone, i.e. `0b010` — fails a test instead of quietly
-/// halving what the rule matches.
-const ESTABLISHED_OR_RELATED: u32 =
-    ConnTrackState::ESTABLISHED.bits() | ConnTrackState::RELATED.bits();
+use crate::ruleset::{ChainKind, ConnectionState, ConnectionStates, Match, L4};
 
 impl NetlinkBackend {
     pub(super) fn hook_class(kind: ChainKind) -> HookClass {
@@ -42,7 +34,7 @@ impl NetlinkBackend {
         };
 
         Ok(match m {
-            Match::Established => Self::established_or_related(rule)?,
+            Match::ConnectionState(states) => Self::connection_states(rule, *states)?,
             Match::InIface(i) => rule.iiface(i).map_err(Self::err)?,
             Match::OutIface(i) => rule.oiface(i).map_err(Self::err)?,
             Match::DestPort { port, proto: p } => rule.dport(*port, proto(*p)),
@@ -68,7 +60,7 @@ impl NetlinkBackend {
         mark.to_ne_bytes()
     }
 
-    /// `ct state established,related`, built by hand.
+    /// A structured `ct state` match, built from the exact IR state set.
     ///
     /// [`NfRule::established`] would be the obvious call, and it is wrong
     /// here: it masks `ESTABLISHED` alone, so what got applied was `ct state
@@ -84,16 +76,24 @@ impl NetlinkBackend {
     /// fail-closed policy black-holes path-MTU discovery: connections open,
     /// then hang on the first full-size packet, and the tunnel gets blamed.
     ///
-    /// The three expressions reproduce what `rustables` emits, with the mask
-    /// widened by one bit — same layout, same little-endian mask convention.
-    fn established_or_related(rule: NfRule) -> Result<NfRule> {
+    /// The three expressions reproduce what `rustables` emits while deriving
+    /// the mask from the structured state set — same layout and same
+    /// little-endian mask convention.
+    fn connection_states(rule: NfRule, states: ConnectionStates) -> Result<NfRule> {
+        let mut mask = 0u32;
+        for state in states.iter() {
+            mask |= match state {
+                ConnectionState::Invalid => ConnTrackState::INVALID.bits(),
+                ConnectionState::Established => ConnTrackState::ESTABLISHED.bits(),
+                ConnectionState::Related => ConnTrackState::RELATED.bits(),
+                ConnectionState::New => ConnTrackState::NEW.bits(),
+                ConnectionState::Untracked => ConnTrackState::UNTRACKED.bits(),
+            };
+        }
         Ok(rule
             .with_expr(Conntrack::new(ConntrackKey::State))
-            .with_expr(
-                Bitwise::new(ESTABLISHED_OR_RELATED.to_le_bytes(), 0u32.to_be_bytes())
-                    .map_err(Self::err)?,
-            )
-            // Non-zero after masking: the packet is in one of the two states.
+            .with_expr(Bitwise::new(mask.to_le_bytes(), 0u32.to_be_bytes()).map_err(Self::err)?)
+            // Non-zero after masking: the packet is in one of the requested states.
             .with_expr(Cmp::new(CmpOp::Neq, 0u32.to_be_bytes())))
     }
 
@@ -188,14 +188,40 @@ mod tests {
     /// established,related` is target-only, see `docs/testing/TESTING.md`.
     #[test]
     fn the_conntrack_mask_carries_related_and_not_established_alone() {
+        let established_or_related =
+            ConnTrackState::ESTABLISHED.bits() | ConnTrackState::RELATED.bits();
         assert_eq!(
-            ESTABLISHED_OR_RELATED, 0b110,
+            established_or_related, 0b110,
             "the mask the kernel reads must carry both states"
         );
         assert_ne!(
-            ESTABLISHED_OR_RELATED,
+            established_or_related,
             ConnTrackState::ESTABLISHED.bits(),
-            "`NfRule::established` is precisely what this constant exists to avoid"
+            "`NfRule::established` must not replace the structured state encoder"
+        );
+    }
+
+    #[test]
+    fn connection_state_masks_match_the_kernel_bits() {
+        let mask = |states: ConnectionStates| {
+            states.iter().fold(0u32, |mask, state| {
+                mask | match state {
+                    ConnectionState::Invalid => ConnTrackState::INVALID.bits(),
+                    ConnectionState::Established => ConnTrackState::ESTABLISHED.bits(),
+                    ConnectionState::Related => ConnTrackState::RELATED.bits(),
+                    ConnectionState::New => ConnTrackState::NEW.bits(),
+                    ConnectionState::Untracked => ConnTrackState::UNTRACKED.bits(),
+                }
+            })
+        };
+
+        assert_eq!(
+            mask(ConnectionStates::INVALID),
+            ConnTrackState::INVALID.bits()
+        );
+        assert_eq!(
+            mask(ConnectionStates::ESTABLISHED_RELATED),
+            ConnTrackState::ESTABLISHED.bits() | ConnTrackState::RELATED.bits()
         );
     }
 
