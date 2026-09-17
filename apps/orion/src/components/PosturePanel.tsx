@@ -108,7 +108,7 @@ export function PosturePanel({ anchor, onClose, state, adapterUp, profile, psk, 
             operator made — routing a subnet and leaving the rest alone is the
             normal shape of a corporate profile, not a degradation. The amber
             rows below are for facts the machine reports about itself. */}
-        <Row label="trafic capté" value={profile?.allowed_ips ?? '—'} />
+        <Row label="trafic via le tunnel" value={profile?.allowed_ips ?? '—'} />
       </Box>
 
       {degraded && vault && (

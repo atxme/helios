@@ -153,7 +153,9 @@ describe('ProfilesView interactions', () => {
     )
 
     fireEvent.click(screen.getByRole('button', { name: 'Avancé' }))
-    fireEvent.change(screen.getByLabelText('Trafic capté'), { target: { value: '100.64.0.0/10' } })
+    fireEvent.change(screen.getByLabelText('Trafic via le tunnel'), {
+      target: { value: '100.64.0.0/10' },
+    })
     // The speedtest targets Helios through the established tunnel; there is
     // no user-configurable API URL on a profile anymore.
     expect(screen.queryByLabelText('URL Helios')).toBeNull()
@@ -754,6 +756,57 @@ describe('ProfilesView interactions', () => {
     await waitFor(() => expect(api.allowUnencryptedVolume).toHaveBeenCalledOnce())
     await waitFor(() => expect(handlers.onSave).toHaveBeenCalledOnce())
     expect(handlers.onSave.mock.calls[0][0].endpoint).toBe('vpn.example:51820')
+  })
+
+  /**
+   * The split-tunnel row, on the property that made it worth adding: one
+   * click each way, and the field it writes into stays the authority.
+   */
+  it('switches the captured traffic between presets without losing the field', async () => {
+    const handlers = callbacks()
+    render(
+      <ProfilesView
+        config={{ profiles: [profile()], selected: 'portable' }}
+        pathImport={null}
+        {...handlers}
+      />,
+    )
+    await waitFor(() => expect(api.validateProfile).toHaveBeenCalled())
+    fireEvent.click(screen.getByRole('button', { name: 'Avancé' }))
+
+    const field = () => screen.getByLabelText('Trafic via le tunnel') as HTMLInputElement
+    expect(field().value).toBe('0.0.0.0/0')
+    expect(screen.getByRole('button', { name: 'Tout le trafic' }).getAttribute('aria-pressed')).toBe(
+      'true',
+    )
+
+    // The gateway prefix comes from the profile's internal Helios URL, not
+    // from a constant: this profile answers at 100.64.0.1.
+    fireEvent.click(screen.getByRole('button', { name: 'Helios seul' }))
+    expect(field().value).toBe('100.64.0.1/32')
+    expect(screen.getByRole('button', { name: 'Helios seul' }).getAttribute('aria-pressed')).toBe(
+      'true',
+    )
+    expect(screen.queryByText(/Votre propre réseau local/)).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Réseaux privés' }))
+    expect(field().value).toBe('100.64.0.1/32, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16')
+    // The one cost the user cannot see coming, stated where the choice is made.
+    expect(screen.getByText(/Votre propre réseau local/)).toBeTruthy()
+
+    // And back, in one click.
+    fireEvent.click(screen.getByRole('button', { name: 'Tout le trafic' }))
+    expect(field().value).toBe('0.0.0.0/0')
+
+    // Typing still wins: no preset claims a hand-written list.
+    fireEvent.change(field(), { target: { value: '192.168.42.0/24' } })
+    expect(screen.getByRole('button', { name: 'Personnalisé' }).getAttribute('aria-pressed')).toBe(
+      'true',
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Enregistrer' }))
+    await waitFor(() => expect(handlers.onSave).toHaveBeenCalledOnce())
+    expect(handlers.onSave.mock.calls[0][0].allowed_ips).toBe('192.168.42.0/24')
   })
 
   it('loads an associated profile and explains a failed identity seal', async () => {

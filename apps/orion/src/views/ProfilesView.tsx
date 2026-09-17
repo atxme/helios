@@ -40,6 +40,12 @@ import {
   NEGOTIABLE_MODES,
   PROTECTION_MODES,
 } from '../components/state'
+import {
+  matchPreset,
+  presetPrefixes,
+  SPLIT_TUNNEL_PRESETS,
+  type SplitTunnelPreset,
+} from '../splitTunnel'
 import { GUTTER } from '../theme'
 import type {
   ClientConfig,
@@ -154,6 +160,35 @@ const NOTICE_MS = 3000
 const MAX_IMPORT_BYTES = 64 * 1024
 
 /**
+ * How each split-tunnel choice is named on screen.
+ *
+ * Named by what goes through the tunnel, not by the prefix it writes: the
+ * prefix is in the field just below, and a button that repeats it is a button
+ * that only helps whoever already knew the answer.
+ */
+const SPLIT_TUNNEL_LABELS: Record<SplitTunnelPreset, string> = {
+  full: 'Tout le trafic',
+  gateway: 'Helios seul',
+  private: 'Réseaux privés',
+  custom: 'Personnalisé',
+}
+
+/**
+ * Same skin as the protection-mode row, but wrapping.
+ *
+ * Standalone buttons rather than a `ToggleButtonGroup`: this row lives in the
+ * narrow column of the form, where four segments welded into one bar would
+ * overflow rather than wrap.
+ */
+const SPLIT_TUNNEL_BUTTON = {
+  px: 1.25,
+  py: 0.4,
+  fontSize: 11.5,
+  textTransform: 'none',
+  borderRadius: 1,
+} as const
+
+/**
  * Delay before judging a field, in milliseconds.
  *
  * We wait for typing to stop: validating on every character would highlight
@@ -248,6 +283,8 @@ export function ProfilesView({
   const [advanced, setAdvanced] = useState(false)
   const [support, setSupport] = useState<KeyNegotiationSupport | null>(null)
   const fileInput = useRef<HTMLInputElement>(null)
+  /** Focus target of «Personnalisé»: the list is typed, not chosen. */
+  const allowedIpsInput = useRef<HTMLInputElement>(null)
 
   useEffect(() => {
     if (!notice?.transient) return
@@ -788,6 +825,10 @@ export function ProfilesView({
   // would read as the entry having been refused.
   const staticPsk = (draft.has_static_psk && !clearPsk) || stagedPsk
   const invalid = kindChanged || Object.values(issues).some(Boolean)
+  // Derived from the value, never stored: the field remains the authority, and
+  // a preset that stayed lit after the list was edited would describe a
+  // profile that no longer exists.
+  const splitTunnel = matchPreset(draft.allowed_ips, draft)
   // The "Advanced" collapse must flag what it hides: otherwise a faulty field
   // would stay invisible until someone thinks to open it. A narrowed range is
   // *not* one of those: split tunnelling is a decision, not a defect.
@@ -1194,18 +1235,79 @@ export function ProfilesView({
 
               <Collapse in={advanced} unmountOnExit>
                 <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5 }}>
-                  {/* The example lives in the placeholder, not under the
-                      field: it is a value, and a value belongs where the value
-                      goes. No caution for a narrowed range either — routing one
-                      subnet and leaving the rest alone is what most corporate
-                      profiles do on purpose. */}
-                  <Field
-                    label="Trafic capté"
-                    error={issues.allowed_ips}
-                    placeholder="0.0.0.0/0  ·  100.64.0.0/10, 192.168.1.0/24"
-                    value={draft.allowed_ips}
-                    onChange={(value) => set('allowed_ips', value)}
-                  />
+                  {/* Three routine decisions and the field they write into.
+                      The field stays the authority — «Personnalisé» is not a
+                      fourth value, it is what the three fail to recognise —
+                      because the lists a real deployment needs are not
+                      guessable from the client side. No caution for a narrowed
+                      range: routing one subnet and leaving the rest alone is
+                      what most corporate profiles do on purpose. */}
+                  <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.75 }}>
+                    <Typography
+                      id="split-tunnel-label"
+                      color="text.secondary"
+                      sx={{ fontSize: 11.5, fontWeight: 600 }}
+                    >
+                      Que faire passer par Helios ?
+                    </Typography>
+                    <Box
+                      role="group"
+                      aria-labelledby="split-tunnel-label"
+                      sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5 }}
+                    >
+                      {SPLIT_TUNNEL_PRESETS.map((preset) => {
+                        const prefixes = presetPrefixes(preset, draft)
+                        return (
+                          <ToggleButton
+                            key={preset}
+                            size="small"
+                            value={preset}
+                            selected={splitTunnel === preset}
+                            // The value it would write, before it writes it.
+                            // The rest of the screen prints no captions; this
+                            // one is worth a hover because the button is
+                            // deliberately not named after its prefixes.
+                            title={prefixes}
+                            onChange={() => set('allowed_ips', prefixes)}
+                            sx={SPLIT_TUNNEL_BUTTON}
+                          >
+                            {SPLIT_TUNNEL_LABELS[preset]}
+                          </ToggleButton>
+                        )
+                      })}
+                      <ToggleButton
+                        size="small"
+                        value="custom"
+                        selected={splitTunnel === 'custom'}
+                        title="Saisir la liste des préfixes"
+                        onChange={() => allowedIpsInput.current?.focus()}
+                        sx={SPLIT_TUNNEL_BUTTON}
+                      >
+                        {SPLIT_TUNNEL_LABELS.custom}
+                      </ToggleButton>
+                    </Box>
+                    {/* The example lives in the placeholder, not under the
+                        field: it is a value, and a value belongs where the
+                        value goes. */}
+                    <Field
+                      label="Trafic via le tunnel"
+                      error={issues.allowed_ips}
+                      placeholder="0.0.0.0/0  ·  100.64.0.1/32, 192.168.1.0/24"
+                      value={draft.allowed_ips}
+                      inputRef={allowedIpsInput}
+                      onChange={(value) => set('allowed_ips', value)}
+                    />
+                    {/* Only «Réseaux privés» has a cost the user cannot see
+                        coming: the three RFC 1918 ranges cover the machine's
+                        own LAN as surely as the gateway's. */}
+                    {splitTunnel === 'private' && (
+                      <Caution>
+                        Votre propre réseau local — box, imprimante, NAS — passe aussi par le
+                        tunnel. Remplacez les plages par le seul sous-réseau visé si ce n’est pas
+                        voulu.
+                      </Caution>
+                    )}
+                  </Box>
                   <Field
                     label="Keepalive (s)"
                     error={issues.persistent_keepalive}
@@ -1802,12 +1904,15 @@ function Field({
   type = 'text',
   placeholder,
   error,
+  inputRef,
 }: {
   label: string
   value: string
   onChange: (value: string) => void
   type?: 'text' | 'number'
   placeholder?: string
+  /** Lets a control above the field put the caret in it. */
+  inputRef?: React.Ref<HTMLInputElement>
   /**
    * Message from the core, `null` if the field is acceptable.
    *
@@ -1828,6 +1933,7 @@ function Field({
       value={value}
       error={Boolean(error)}
       helperText={error}
+      inputRef={inputRef}
       onChange={(event) => onChange(event.target.value)}
       sx={{
         '& input': { fontFamily: 'monospace', fontSize: 12 },
