@@ -166,12 +166,19 @@ describe('ProfilesView interactions', () => {
     // about nothing.
     expect(screen.queryByText(/en clair/)).toBeNull()
     expect(screen.queryByDisplayValue('static-secret')).toBeNull()
-    // No negotiation block on this profile, so the PSK is a plain WireGuard
-    // setting and lives here.
+    // The static PSK is this profile's whole protection, so it sits on the
+    // «Protection du tunnel» ladder and not under «Avancé». Taking it away
+    // drops the profile to the rung below.
+    expect(
+      screen.getByRole('button', { name: 'PSK statique' }).getAttribute('aria-pressed'),
+    ).toBe('true')
     fireEvent.click(screen.getByRole('button', { name: 'Retirer le PSK statique' }))
+    expect(screen.getByRole('button', { name: 'Aucune' }).getAttribute('aria-pressed')).toBe(
+      'true',
+    )
     fireEvent.click(screen.getByRole('button', { name: 'Générer une nouvelle clé' }))
 
-    fireEvent.click(screen.getByRole('button', { name: 'Ajouter' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Négociation Helios' }))
     expect(screen.getByText(/CA TLS absente/)).toBeTruthy()
     fireEvent.change(screen.getByLabelText('Identité protégée'), { target: { value: 'workstation' } })
     // Certificates live in their own destination now; what stays here is the
@@ -188,7 +195,9 @@ describe('ProfilesView interactions', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Fermer' }))
     await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
 
-    fireEvent.click(screen.getByRole('button', { name: 'Retirer' }))
+    // Back down the ladder: nothing has been negotiated, so the floor is
+    // still `classic` and the rung is reachable.
+    fireEvent.click(screen.getByRole('button', { name: 'Aucune' }))
     fireEvent.click(screen.getByRole('button', { name: 'Enregistrer' }))
     await waitFor(() => expect(handlers.onSave).toHaveBeenCalledOnce())
     expect(screen.getByText(/« workstation » enregistré/)).toBeTruthy()
@@ -850,6 +859,98 @@ describe('ProfilesView interactions', () => {
     const field = screen.getByRole('textbox', { name: 'Trafic via le tunnel' })
     expect((field as HTMLInputElement).value).toBe('10.9.0.0/16, 192.168.1.0/24')
     expect(field.hasAttribute('readonly')).toBe(false)
+  })
+
+  /**
+   * The protection ladder, on the two things it replaced: a PSK filed under
+   * «Avancé» and a type nobody could choose.
+   */
+  it('puts the static PSK on the protection ladder and opens its entry field', async () => {
+    const handlers = callbacks()
+    render(
+      <ProfilesView
+        config={{ profiles: [profile()], selected: 'portable' }}
+        pathImport={null}
+        {...handlers}
+      />,
+    )
+    await waitFor(() => expect(api.validateProfile).toHaveBeenCalled())
+
+    const pressed = (name: string) =>
+      screen.getByRole('button', { name }).getAttribute('aria-pressed')
+
+    // A classic profile with no key: the weakest rung, and the ladder says so
+    // without anyone opening a fold.
+    expect(pressed('Aucune')).toBe('true')
+    expect(screen.getByText(/premier handshake n’est protégé par rien/)).toBeTruthy()
+
+    // Choosing the rung opens what it is waiting for, rather than a link to it.
+    fireEvent.click(screen.getByRole('button', { name: 'PSK statique' }))
+    expect(pressed('PSK statique')).toBe('true')
+    const field = screen.getByLabelText('PSK WireGuard (base64)') as HTMLInputElement
+    expect(field.type).toBe('password')
+    fireEvent.change(field, { target: { value: 'cHNrLXN0YXRpcXVl' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Valider' }))
+    await waitFor(() => expect(api.adoptPresharedKey).toHaveBeenCalledWith('cHNrLXN0YXRpcXVl'))
+    expect(document.body.innerHTML).not.toContain('cHNrLXN0YXRpcXVl')
+
+    // The rung is not a WireGuard setting: «Avancé» keeps the three that are.
+    fireEvent.click(screen.getByRole('button', { name: 'Avancé' }))
+    expect(screen.queryByRole('button', { name: 'Définir un PSK statique' })).toBeNull()
+
+    // A stored profile does not change type. The refusal is said on the
+    // segment now, instead of being an alert raised after the save.
+    const negotiation = screen.getByRole('button', { name: 'Négociation Helios' })
+    expect(negotiation.hasAttribute('disabled')).toBe(true)
+    expect(negotiation.getAttribute('title')).toMatch(/Renommez-le/)
+
+    fireEvent.change(screen.getByLabelText('Nom'), { target: { value: 'atelier' } })
+    expect(
+      screen.getByRole('button', { name: 'Négociation Helios' }).hasAttribute('disabled'),
+    ).toBe(false)
+  })
+
+  /**
+   * The anti-downgrade ratchet of ADR-001, said where the gesture is made:
+   * a profile that has negotiated something does not go back to a bare tunnel.
+   */
+  it('refuses to leave the negotiation rung once a floor has been climbed', async () => {
+    const handlers = callbacks()
+    render(
+      <ProfilesView
+        config={{
+          profiles: [
+            profile({
+              name: 'atelier',
+              key_negotiation: {
+                mode: 'ml_kem',
+                minimum_mode: 'ml_kem',
+                endpoint: '203.0.113.10:51821',
+                server_name: '203.0.113.10',
+                gateway_ca_der: 'ca',
+                gateway_pq_certificate: 'pq',
+                identity: 'orion-atelier',
+              },
+            }),
+          ],
+          selected: 'atelier',
+        }}
+        pathImport={null}
+        {...handlers}
+      />,
+    )
+    await waitFor(() => expect(api.validateProfile).toHaveBeenCalled())
+
+    expect(
+      screen.getByRole('button', { name: 'Négociation Helios' }).getAttribute('aria-pressed'),
+    ).toBe('true')
+    for (const rung of ['Aucune', 'PSK statique']) {
+      const segment = screen.getByRole('button', { name: rung })
+      expect(segment.hasAttribute('disabled')).toBe(true)
+      fireEvent.click(segment)
+    }
+    // Neither click went through: the block is still there, mode included.
+    expect(within(screen.getByLabelText('Mode')).getAllByRole('button')).toHaveLength(2)
   })
 
   it('loads an associated profile and explains a failed identity seal', async () => {

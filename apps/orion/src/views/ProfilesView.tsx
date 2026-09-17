@@ -26,7 +26,6 @@ import {
   Plus,
   RotateCcw,
   Save,
-  ShieldPlus,
   Trash2,
   Upload,
 } from 'lucide-react'
@@ -76,18 +75,23 @@ import type {
  * # Two blocks, and the line between them is the protocol's
  *
  * «Tunnel WireGuard» holds what a plain WireGuard peer needs and nothing
- * else: a profile with that block filled in and no negotiation connects to
- * any WireGuard gateway. Everything the v5 negotiation adds — the mode, the
- * floor, the negotiation endpoint, the pinned gateway material, the protected
- * identity — lives in the second block, and so does the static PSK **as soon
- * as a negotiation block exists**, because there it stops being a WireGuard
- * setting and becomes the material of one mode.
+ * else: a profile with that block filled in connects to any WireGuard
+ * gateway. «Protection du tunnel» holds the other question entirely — what
+ * stands between this profile and an unprotected first handshake — as one
+ * ladder of three rungs: none, a static PSK, the v5 negotiation.
  *
- * That line is not a presentation choice. `classic` is refused as a
- * negotiable mode by `aether::key_negotiation` (`ClassicNotNegotiable`): a
- * negotiated `classic` is a tunnel with no preshared key, which is exactly
- * what the first block already expresses. So classic is not a mode offered
- * inside the negotiation block — it is the absence of the block.
+ * That line is not a presentation choice, and neither is the ladder. The rung
+ * **is** the profile type: the first two are `classic` and differ only by
+ * whether a preshared key exists, the third is the one that writes a
+ * negotiation block. `classic` is refused as a negotiable mode by
+ * `aether::key_negotiation` (`ClassicNotNegotiable`) — a negotiated `classic`
+ * is a tunnel with no preshared key, which the lower rungs already express —
+ * so it is not a mode inside the block, it is the absence of the block.
+ *
+ * What the ladder does not do is merge the two static PSKs. A key copied by
+ * hand and a key the `static_psk` mode obtains through an authenticated v5
+ * transaction land in the same WireGuard slot and are not the same fact, so
+ * the negotiated one stays inside the block, under the mode that owns it.
  *
  * # No captions
  *
@@ -179,19 +183,54 @@ const SPLIT_TUNNEL_CHOICES: Record<SplitTunnelPreset, { label: string; detail: s
 const SPLIT_TUNNEL_CHOICES_ORDER: SplitTunnelPreset[] = [...SPLIT_TUNNEL_PRESETS, 'custom']
 
 /**
- * One segment of the choice bar.
+ * One segment of a choice bar.
  *
- * Same skin as the protection-mode row one block below: exclusive choice is
- * already expressed that way on this screen, and two grammars for the same
- * gesture is one too many. Short labels, because four segments have to fit the
- * form's narrow column — what each one means is the line underneath.
+ * The screen has three of them now — split tunnelling, tunnel protection, the
+ * negotiated mode and its floor — and they are the same gesture: pick exactly
+ * one. Short labels, because a bar has to fit the form's column; what each
+ * segment means is the line underneath it.
  */
-const SPLIT_TUNNEL_SEGMENT = {
+const SEGMENT_BUTTON = {
   px: 1.25,
   py: 0.4,
   fontSize: 11.5,
   textTransform: 'none',
 } as const
+
+/**
+ * What protects this tunnel, as one ladder instead of three places.
+ *
+ * The three rungs were spread across the screen: `classic` was a read-only
+ * word under «Type de profil», its static PSK was a row under «Avancé», and
+ * the negotiated modes lived in a block reached by an «Ajouter» button. Those
+ * are not three subjects. They are one — *what stands between this profile and
+ * an unprotected first handshake* — and a PSK filed under "advanced settings"
+ * is the clearest symptom: it is not a setting, it is the entire protection of
+ * a classic profile.
+ *
+ * What this deliberately does **not** do is flatten the negotiated
+ * `static_psk` into the same rung as a plain WireGuard PSK. Both end up in the
+ * same WireGuard slot, but one is copied by hand once and never rotates while
+ * the other is the outcome of an authenticated v5 transaction — so the
+ * negotiated one stays inside the negotiation block, under the mode that owns
+ * it.
+ */
+type TunnelProtection = 'none' | 'static_psk' | 'negotiation'
+
+/** The rungs, weakest first. The order is the ratchet's. */
+const TUNNEL_PROTECTIONS: TunnelProtection[] = ['none', 'static_psk', 'negotiation']
+
+const TUNNEL_PROTECTION_CHOICES: Record<TunnelProtection, { label: string; detail: string }> = {
+  none: { label: 'Aucune', detail: 'Tunnel WireGuard nu : le premier handshake n’est protégé par rien.' },
+  static_psk: {
+    label: 'PSK statique',
+    detail: 'Clé partagée reçue hors bande. Elle protège, elle ne tourne jamais.',
+  },
+  negotiation: {
+    label: 'Négociation Helios',
+    detail: 'Le PSK est négocié avant le tunnel, à chaque connexion (v5).',
+  },
+}
 
 /**
  * Delay before judging a field, in milliseconds.
@@ -301,6 +340,16 @@ export function ProfilesView({
    */
   const [manualPrefixes, setManualPrefixes] = useState(false)
   /**
+   * «PSK statique» was chosen, before any key has been entered.
+   *
+   * Same reason as {@link manualPrefixes}: the rung cannot be read back from
+   * the profile alone. A classic profile with no PSK yet and a classic profile
+   * that will never have one are the same object, and the difference is the
+   * gesture just made — without it, picking the rung would light «Aucune» back
+   * up and close the entry field under the user.
+   */
+  const [wantsStaticPsk, setWantsStaticPsk] = useState(false)
+  /**
    * Bumped by «Personnalisé» so the caret lands in the field.
    *
    * The field does not exist while a preset is selected, so it cannot be
@@ -401,9 +450,11 @@ export function ProfilesView({
     // staged key onto the next profile loaded would attach it to an identity
     // the operator never admitted.
     setStagedPublicKey(null)
-    // Same reason: «Personnalisé» is a gesture made on *this* list. The next
-    // profile is read again, and a preset it matches must light up.
+    // Same reason: «Personnalisé» and «PSK statique» are gestures made on
+    // *this* profile. The next one is read again, and what it actually holds
+    // is what must light up.
     setManualPrefixes(false)
+    setWantsStaticPsk(false)
     setPasting(false)
     setPasted('')
     void api.discardStagedKey().catch(() => {})
@@ -854,6 +905,72 @@ export function ProfilesView({
   // about to store, and showing "aucun" next to a value the user just typed
   // would read as the entry having been refused.
   const staticPsk = (draft.has_static_psk && !clearPsk) || stagedPsk
+  /**
+   * Which rung the profile is on.
+   *
+   * Read from the profile, except for the one state it cannot express: a
+   * «PSK statique» asked for and not yet entered.
+   */
+  const protection: TunnelProtection = draft.key_negotiation
+    ? 'negotiation'
+    : staticPsk || wantsStaticPsk
+      ? 'static_psk'
+      : 'none'
+  /**
+   * Why a rung cannot be reached, or `undefined` if it can.
+   *
+   * The refusals are the ones that already existed, said where the gesture is
+   * made instead of after it: a stored profile does not change type — that is
+   * `kindChanged`, which used to be an alert raised at save time — and a
+   * negotiation block is not removed once something has been negotiated, which
+   * is the anti-downgrade ratchet of ADR-001 (`ClientConfig::upsert` refuses
+   * to lower a known floor, including by deleting the block).
+   */
+  const protectionRefusal = (rung: TunnelProtection): string | undefined => {
+    if (rung === protection) return undefined
+    const renameFirst =
+      'Un profil enregistré ne change pas de type. Renommez-le pour en créer un autre.'
+    if (rung === 'negotiation') return exists ? renameFirst : undefined
+    if (protection !== 'negotiation') return undefined
+    if (exists) return renameFirst
+    return floorBaseline && modeLevel(floorBaseline) > 0
+      ? `Plancher « ${modeMeta(floorBaseline).label} » : la négociation ne se retire plus.`
+      : undefined
+  }
+
+  /**
+   * Moves the profile to another rung.
+   *
+   * Everything it does already existed behind a button or a fold; what it adds
+   * is that leaving a rung disposes of what belonged to it. Dropping to
+   * «Aucune» clears the PSK for the same reason `dropStagedPskFor` does under
+   * a mode that forbids one: `orion-core` refuses a profile holding a PSK
+   * nothing uses, and leaving it would move the refusal to the save, pointing
+   * at a field the user never opened.
+   */
+  const chooseProtection = (rung: TunnelProtection) => {
+    if (rung === protection || protectionRefusal(rung)) return
+    if (rung === 'negotiation') {
+      setWantsStaticPsk(false)
+      toggleNegotiation(true)
+      return
+    }
+    // The block goes first: on the way down from a negotiated `static_psk`,
+    // the key stays and simply becomes what it is without a block — a plain
+    // WireGuard preshared key.
+    if (draft.key_negotiation) toggleNegotiation(false)
+    if (rung === 'static_psk') {
+      setWantsStaticPsk(true)
+      setClearPsk(false)
+      // Nothing to state yet, so the rung opens on the one thing it is
+      // waiting for rather than on a link to it.
+      if (!staticPsk) setPastingPsk(true)
+      return
+    }
+    setWantsStaticPsk(false)
+    dropStagedPskFor('classic')
+  }
+
   const invalid = kindChanged || Object.values(issues).some(Boolean)
   // Read from the value, except when the user has asked to write it himself:
   // a preset that stayed lit after the list was edited would describe a
@@ -866,10 +983,7 @@ export function ProfilesView({
   // would stay invisible until someone thinks to open it. A narrowed range is
   // *not* one of those: split tunnelling is a decision, not a defect.
   const advancedFlagged = Boolean(
-    issues.allowed_ips ||
-      issues.persistent_keepalive ||
-      issues.ssh_target ||
-      (!draft.key_negotiation && issues.preshared_key),
+    issues.allowed_ips || issues.persistent_keepalive || issues.ssh_target,
   )
 
   /**
@@ -1306,7 +1420,7 @@ export function ProfilesView({
                     setManualPrefixes(false)
                     set('allowed_ips', presetPrefixes(next, draft))
                   }}
-                  sx={{ '& .MuiToggleButton-root': SPLIT_TUNNEL_SEGMENT }}
+                  sx={{ '& .MuiToggleButton-root': SEGMENT_BUTTON }}
                 >
                   {SPLIT_TUNNEL_CHOICES_ORDER.map((preset) => (
                     <ToggleButton
@@ -1400,44 +1514,81 @@ export function ProfilesView({
                   onChange={(value) => set('ssh_target', value || null)}
                 />
               </Box>
-              {/* Only without a negotiation block. With one, the PSK is the
-                  material of the `static_psk` mode and belongs under that
-                  mode, not among the WireGuard settings. */}
-              {!draft.key_negotiation && pskField}
             </Box>
           </Collapse>
 
           <Divider sx={{ my: 1.75 }} />
 
-          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, mb: 1.5 }}>
-            <Typography component="h3" sx={{ fontSize: 12.5, fontWeight: 650 }}>
-              Type de profil
-            </Typography>
+          {/* ── Protection du tunnel ─────────────────────────────────────
+              One ladder where there used to be a read-only word, a folded
+              row and a button. The rung *is* the profile type: «Aucune» and
+              «PSK statique» are both `classic`, and only the third one writes
+              a negotiation block. */}
+          <Box sx={{ display: 'flex', alignItems: 'baseline', gap: 1.5, mb: 1 }}>
             <Typography
-              color="text.secondary"
-              sx={{ fontFamily: 'monospace', fontSize: 11 }}
+              component="h3"
+              id="tunnel-protection-label"
+              sx={{ fontSize: 12.5, fontWeight: 650 }}
             >
+              Protection du tunnel
+            </Typography>
+            <Typography color="text.secondary" sx={{ fontFamily: 'monospace', fontSize: 11 }}>
               {draftKind}
             </Typography>
           </Box>
 
+          <ToggleButtonGroup
+            exclusive
+            size="small"
+            value={protection}
+            aria-labelledby="tunnel-protection-label"
+            onChange={(_event, next: TunnelProtection | null) => {
+              if (next) chooseProtection(next)
+            }}
+            sx={{ '& .MuiToggleButton-root': SEGMENT_BUTTON }}
+          >
+            {TUNNEL_PROTECTIONS.map((rung) => {
+              const refusal = protectionRefusal(rung)
+              return (
+                <ToggleButton
+                  key={rung}
+                  value={rung}
+                  disabled={refusal !== undefined}
+                  // Only the refusal is worth a tooltip: it is the one thing a
+                  // greyed-out segment cannot say by itself.
+                  title={refusal}
+                >
+                  {TUNNEL_PROTECTION_CHOICES[rung].label}
+                </ToggleButton>
+              )
+            })}
+          </ToggleButtonGroup>
+          <Typography color="text.secondary" sx={{ mt: 0.75, fontSize: 10.5, lineHeight: 1.5 }}>
+            {TUNNEL_PROTECTION_CHOICES[protection].detail}
+          </Typography>
+
           {kindChanged && (
-            <Alert severity="error" role="alert" sx={{ mb: 1.5 }}>
+            <Alert severity="error" role="alert" sx={{ mt: 1.5 }}>
               {`Le type enregistré « ${storedKind} » ne peut pas devenir « ${draftKind} » sous le même identifiant. Rétablissez le type initial ou choisissez un nouveau nom.`}
             </Alert>
           )}
 
-          <KeyNegotiation
-            settings={draft.key_negotiation}
-            floorBaseline={floorBaseline}
-            issue={issues.key_negotiation}
-            support={support}
-            kindLocked={exists}
-            pskField={pskField}
-            onChange={setNegotiation}
-            onRaiseFloor={raiseFloor}
-            onToggle={toggleNegotiation}
-          />
+          {/* What the chosen rung is made of, and nothing about the others. */}
+          {protection === 'static_psk' && <Box sx={{ mt: 1.5 }}>{pskField}</Box>}
+
+          {draft.key_negotiation && (
+            <Box sx={{ mt: 1.5 }}>
+              <KeyNegotiation
+                settings={draft.key_negotiation}
+                floorBaseline={floorBaseline}
+                issue={issues.key_negotiation}
+                support={support}
+                pskField={pskField}
+                onChange={setNegotiation}
+                onRaiseFloor={raiseFloor}
+              />
+            </Box>
+          )}
 
         </Box>
       </Box>
@@ -1573,24 +1724,28 @@ export function ProfilesView({
  * it are shown disabled rather than hidden — seeing what one has left behind
  * is the whole point of a ratchet.
  */
+/**
+ * The negotiation rung's own settings.
+ *
+ * It no longer decides whether it exists: «Protection du tunnel» above owns
+ * that, and this component is only rendered on the rung that has a block. The
+ * «Ajouter»/«Retirer» pair it used to carry said the same thing as a segment
+ * of that bar, one screenful lower and in another grammar.
+ */
 function KeyNegotiation({
   settings,
   floorBaseline,
   issue,
   support,
-  kindLocked,
   pskField,
   onChange,
   onRaiseFloor,
-  onToggle,
 }: {
-  settings: KeyNegotiationSettings | null
+  settings: KeyNegotiationSettings
   /** Floor the profile was loaded with: the screen never goes under it. */
   floorBaseline: ProtectionMode | null
   issue?: string | null
   support: KeyNegotiationSupport | null
-  /** An existing stable profile cannot change security variant. */
-  kindLocked: boolean
   /** The static PSK row, shown here when `static_psk` is the chosen mode. */
   pskField: React.ReactNode
   onChange: <Key extends keyof KeyNegotiationSettings>(
@@ -1598,51 +1753,8 @@ function KeyNegotiation({
     value: KeyNegotiationSettings[Key],
   ) => void
   onRaiseFloor: (floor: ProtectionMode) => void
-  onToggle: (enabled: boolean) => void
 }) {
-  const title = (
-    <Typography component="h3" sx={{ fontSize: 12.5, fontWeight: 650 }}>
-      Négociation de clé
-    </Typography>
-  )
-
-  if (!settings) {
-    return (
-      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5 }}>
-        {title}
-        <Typography color="text.secondary" sx={{ fontFamily: 'monospace', fontSize: 11 }}>
-          aucune
-        </Typography>
-        {/* `describeChild`: the sentence describes the button, it does not
-            rename it. Without it MUI turns the tooltip into the accessible
-            name, and a screen reader announces a paragraph where a verb
-            belongs. */}
-        <Tooltip
-          describeChild
-          title="Active la négociation post-quantique."
-        >
-          <span style={{ marginLeft: 'auto' }}>
-            <Button
-              size="small"
-              variant="outlined"
-              startIcon={<ShieldPlus size={14} aria-hidden />}
-              onClick={() => onToggle(true)}
-              disabled={kindLocked}
-              sx={{ flexShrink: 0 }}
-            >
-              Ajouter
-            </Button>
-          </span>
-        </Tooltip>
-      </Box>
-    )
-  }
-
   const unusable = support && !support.identity_store
-  // Removing the block is a downgrade. It stays possible while nothing has
-  // been negotiated — a block just added by hand, typically — and the floor
-  // is what closes the door as soon as something has.
-  const removable = !kindLocked && (!floorBaseline || modeLevel(floorBaseline) === 0)
   // A block loaded with `classic` cannot negotiate at all: the gateway
   // refuses that mode by name. It is not offered above, so it can only come
   // from a document written before the rule — and it has to be said, because
@@ -1652,28 +1764,6 @@ function KeyNegotiation({
 
   return (
     <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
-      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-        {/* No floor chip here: the "Plancher" row below states it, and
-            saying it twice is how a screen ends up unreadable. */}
-        {title}
-        {removable && (
-          <Tooltip
-            describeChild
-            title="Repasse le profil en WireGuard simple."
-          >
-            <Button
-              size="small"
-              variant="text"
-              color="inherit"
-              onClick={() => onToggle(false)}
-              sx={{ ml: 'auto', color: 'text.secondary', fontSize: 11 }}
-            >
-              Retirer
-            </Button>
-          </Tooltip>
-        )}
-      </Box>
-
       {/* Two modes, not three. `classic` is the absence of this block, and
           the gateway refuses it as a negotiated mode by name. */}
       <ModeChoice
@@ -1799,7 +1889,7 @@ function ModeChoice({
           if (next) onChange(next)
         }}
         aria-label={label}
-        sx={{ '& .MuiToggleButton-root': { px: 1.25, py: 0.4, fontSize: 11.5, textTransform: 'none' } }}
+        sx={{ '& .MuiToggleButton-root': SEGMENT_BUTTON }}
       >
         {modes.map((mode) => {
           const meta = modeMeta(mode)

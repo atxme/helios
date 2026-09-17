@@ -69,6 +69,33 @@ post-négociation n'est envoyé qu'à une adresse couverte par `AllowedIPs`
 > annonce pas. Quand le sous-réseau visé est connu, **Personnalisé** et ce seul
 > préfixe valent mieux que les trois plages.
 
+### Protection du tunnel
+
+L'écran Profils pose la question en une échelle de trois crans, et le cran
+**est** le type de profil :
+
+| Cran | Profil | Ce qui protège le premier handshake |
+| --- | --- | --- |
+| Aucune | `classic` | rien |
+| PSK statique | `classic` | une clé partagée reçue hors bande, jamais renouvelée |
+| Négociation Helios | `helios_key_negotiation` | un PSK négocié avant le tunnel, à chaque connexion |
+
+Choisir « PSK statique » ouvre directement la saisie de la clé : sur un profil
+classique, ce PSK n'est pas un réglage avancé, c'est toute sa protection. Le
+PSK **négocié** reste à l'intérieur du bloc de négociation, sous le mode
+`static_psk` qui le possède : il occupe le même emplacement WireGuard qu'un PSK
+statique mais sort d'une transaction v5 authentifiée, et les confondre
+effacerait la seule différence qui compte.
+
+Deux refus sont énoncés sur le cran lui-même plutôt qu'après coup :
+
+- un profil enregistré ne change pas de type — le renommer crée un autre
+  profil et rouvre le choix ;
+- une fois un plancher franchi, la négociation ne se retire plus. C'est le
+  cliquet anti-downgrade d'[ADR-001](../../docs/adr/ADR-001-WIREGUARD.md) :
+  `ClientConfig::upsert` refuse d'abaisser un plancher connu, y compris en
+  supprimant le bloc.
+
 Les clés privées et PSK sont scellés dans le coffre ([ADR-006](../../docs/adr/ADR-006-SECRETS-AU-REPOS.md)) :
 ni l’IHM ni un message Tauri ne les transportent, et l’écran n’affiche que la clé
 **publique**. Le stockage vit dans le répertoire applicatif de l’OS sous
