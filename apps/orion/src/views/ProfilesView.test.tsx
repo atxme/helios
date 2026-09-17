@@ -795,14 +795,11 @@ describe('ProfilesView interactions', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Helios seul' }))
     expect(pressed('Helios seul')).toBe('true')
     expect(screen.getByText('100.64.0.1/32')).toBeTruthy()
-    expect(screen.queryByText(/Votre propre réseau local/)).toBeNull()
 
     fireEvent.click(screen.getByRole('button', { name: 'Réseaux privés' }))
     expect(
       screen.getByText('100.64.0.1/32, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16'),
     ).toBeTruthy()
-    // The one cost the user cannot see coming, stated where the choice is made.
-    expect(screen.getByText(/Votre propre réseau local/)).toBeTruthy()
 
     // And back, in one click.
     fireEvent.click(screen.getByRole('button', { name: 'Tout le trafic' }))

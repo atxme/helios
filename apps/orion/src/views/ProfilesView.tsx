@@ -1401,16 +1401,6 @@ export function ProfilesView({
                         </Box>
                       </Box>
                     )}
-                    {/* Only «Réseaux privés» has a cost the user cannot see
-                        coming: the three RFC 1918 ranges cover the machine's
-                        own LAN as surely as the gateway's. */}
-                    {splitTunnel === 'private' && (
-                      <Caution>
-                        Votre propre réseau local — box, imprimante, NAS — passe aussi par le
-                        tunnel. Remplacez les plages par le seul sous-réseau visé si ce n’est pas
-                        voulu.
-                      </Caution>
-                    )}
                   </Box>
                   <Field
                     label="Keepalive (s)"

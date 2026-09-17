@@ -38,6 +38,37 @@ Un profil contient :
 - un keepalive persistant de 25 secondes par défaut ;
 - un éventuel PSK post-quantique et l’URL interne de l’API Helios.
 
+### Ce qui passe par le tunnel
+
+`AllowedIPs` **est** la table de routage cryptographique de WireGuard : ce qui y
+figure part chiffré vers la gateway, le reste sort par l'interface physique en
+clair. L'écran Profils propose les trois listes qui couvrent l'usage courant,
+sous « Avancé » ; le mode **Personnalisé** rouvre le champ de saisie et accepte
+n'importe quelle liste de préfixes.
+
+| Choix | `AllowedIPs` écrit |
+| --- | --- |
+| Tout le trafic | `0.0.0.0/0` |
+| Réseaux privés | VIP de la gateway en `/32`, puis `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` |
+| Helios seul | VIP de la gateway en `/32` |
+
+La VIP est lue sur le profil — l'URL interne de l'API Helios d'abord, la
+destination SSH ensuite — et non fixée en dur : un nom d'hôte n'en est pas une,
+puisque le DNS d'Orion n'est pas tunnelisé. À défaut, `100.64.0.1/32` est
+proposé, soit l'adresse que porte une gateway dont l'opérateur n'a pas changé
+`wg_address`. Elle figure aussi dans « Réseaux privés » parce que le `release`
+post-négociation n'est envoyé qu'à une adresse couverte par `AllowedIPs`
+([NEGOCIATION-DE-CLE-V5](../../docs/specification/NEGOCIATION-DE-CLE-V5.md)).
+
+> **« Réseaux privés » capte aussi le réseau local du poste.** Les trois plages
+> RFC 1918 ne distinguent pas le `192.168.1.0/24` du bureau de celui de la box
+> personnelle : imprimante, NAS et routeur du poste passent par le tunnel eux
+> aussi, et deviennent injoignables si la gateway ne route pas vers eux. Un
+> profil ne peut pas faire mieux tout seul — rien dans `ClientProfile` ne décrit
+> les sous-réseaux qui vivent derrière la gateway, et la négociation ne les
+> annonce pas. Quand le sous-réseau visé est connu, **Personnalisé** et ce seul
+> préfixe valent mieux que les trois plages.
+
 Les clés privées et PSK sont scellés dans le coffre ([ADR-006](../../docs/adr/ADR-006-SECRETS-AU-REPOS.md)) :
 ni l’IHM ni un message Tauri ne les transportent, et l’écran n’affiche que la clé
 **publique**. Le stockage vit dans le répertoire applicatif de l’OS sous
