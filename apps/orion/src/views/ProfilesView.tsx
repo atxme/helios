@@ -1206,6 +1206,12 @@ export function ProfilesView({
           <Typography component="h3" sx={{ mb: 1, fontSize: 12.5, fontWeight: 650 }}>
             Tunnel WireGuard
           </Typography>
+          {/* Two columns of two, and everything optional underneath.
+              «Avancé» used to hang off the right column, which made that
+              column as tall as the whole block the moment it was opened while
+              the left one stopped at three fields. What is folded away is not
+              a property of the right-hand half of the form — it belongs under
+              both. */}
           <Box
             sx={{
               display: 'grid',
@@ -1224,12 +1230,6 @@ export function ProfilesView({
                 value={draft.endpoint}
                 onChange={(value) => set('endpoint', value)}
               />
-              <Field
-                label="Clé publique gateway"
-                error={issues.peer_public_key}
-                value={draft.peer_public_key}
-                onChange={(value) => set('peer_public_key', value)}
-              />
             </Box>
 
             <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5 }}>
@@ -1240,153 +1240,172 @@ export function ProfilesView({
                 value={draft.address ?? ''}
                 onChange={(value) => set('address', value || null)}
               />
-              <ButtonBase
-                onClick={() => setAdvanced((open) => !open)}
-                aria-expanded={advanced}
-                sx={{
-                  display: 'flex',
-                  justifyContent: 'flex-start',
-                  gap: 0.5,
-                  py: 0.5,
-                  color: 'text.secondary',
-                  '&:hover': { color: 'text.primary' },
-                }}
-              >
-                <ChevronRight
-                  size={14}
-                  aria-hidden
-                  style={{
-                    transform: advanced ? 'rotate(90deg)' : undefined,
-                    transition: 'transform 140ms ease',
-                  }}
-                />
-                <Typography sx={{ fontSize: 12, fontWeight: 600 }}>Avancé</Typography>
-                {advancedFlagged && (
-                  <AlertTriangle size={13} aria-hidden style={{ color: '#A16207' }} />
-                )}
-              </ButtonBase>
-
-              <Collapse in={advanced} unmountOnExit>
-                <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5 }}>
-                  {/* Three routine decisions and the field they write into.
-                      The field stays the authority — «Personnalisé» is not a
-                      fourth value, it is what the three fail to recognise —
-                      because the lists a real deployment needs are not
-                      guessable from the client side. No caution for a narrowed
-                      range: routing one subnet and leaving the rest alone is
-                      what most corporate profiles do on purpose. */}
-                  <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.75 }}>
-                    <Typography
-                      id="split-tunnel-label"
-                      color="text.secondary"
-                      sx={{ fontSize: 11.5, fontWeight: 600 }}
-                    >
-                      Que faire passer par Helios ?
-                    </Typography>
-                    <ToggleButtonGroup
-                      exclusive
-                      size="small"
-                      value={splitTunnel}
-                      aria-labelledby="split-tunnel-label"
-                      onChange={(_event, next: SplitTunnelPreset | null) => {
-                        // `null` is the selected segment being pressed again:
-                        // there is no "no choice" here, the field always holds
-                        // one list. `custom` is handled on the segment itself,
-                        // because pressing it while it is already selected has
-                        // to keep working — that is when it is most useful.
-                        if (next === null || next === 'custom') return
-                        setManualPrefixes(false)
-                        set('allowed_ips', presetPrefixes(next, draft))
-                      }}
-                      sx={{ '& .MuiToggleButton-root': SPLIT_TUNNEL_SEGMENT }}
-                    >
-                      {SPLIT_TUNNEL_CHOICES_ORDER.map((preset) => (
-                        <ToggleButton
-                          key={preset}
-                          value={preset}
-                          // The prefixes it would write, before it writes
-                          // them — the one thing the bar deliberately does not
-                          // print.
-                          title={preset === 'custom' ? undefined : presetPrefixes(preset, draft)}
-                          // «Personnalisé» writes nothing: it opens the field
-                          // on the list the preset left behind, which is the
-                          // starting point a narrowed range is edited from.
-                          // Handled on the segment rather than on the group so
-                          // that pressing it while it is already selected
-                          // still hands over the caret.
-                          onClick={
-                            preset === 'custom'
-                              ? () => {
-                                  setManualPrefixes(true)
-                                  setCaretRequest((request) => request + 1)
-                                }
-                              : undefined
-                          }
-                        >
-                          {SPLIT_TUNNEL_CHOICES[preset].label}
-                        </ToggleButton>
-                      ))}
-                    </ToggleButtonGroup>
-                    {/* One line, for the chosen segment only. Four captions
-                        printed at once is a paragraph, and a paragraph under a
-                        control is what stops being read. */}
-                    <Typography color="text.secondary" sx={{ fontSize: 10.5, lineHeight: 1.5 }}>
-                      {SPLIT_TUNNEL_CHOICES[splitTunnel].detail}
-                    </Typography>
-                    {/* A preset owns the list it wrote, so the field states it
-                        rather than taking it: an input accepting text that
-                        would flip the segment above it is the contradiction
-                        this bar was added to remove. The value stays on screen
-                        because a choice named «Réseaux privés» has to be
-                        checkable against the prefixes it stands for.
-
-                        The example lives in the placeholder, not under the
-                        field: it is a value, and a value belongs where the
-                        value goes. */}
-                    {splitTunnel === 'custom' ? (
-                      <Field
-                        label="Trafic via le tunnel"
-                        error={issues.allowed_ips}
-                        placeholder="0.0.0.0/0  ·  100.64.0.1/32, 192.168.1.0/24"
-                        value={draft.allowed_ips}
-                        inputRef={allowedIpsInput}
-                        onChange={(value) => set('allowed_ips', value)}
-                      />
-                    ) : (
-                      <ReadOnlyField label="Trafic via le tunnel" value={draft.allowed_ips} />
-                    )}
-                    {/* The exception this screen makes to its own rule: the
-                        field is the one place where «réseaux» has to be read
-                        as prefixes, and the bar above no longer spells it. It
-                        gives way to the error the moment there is one. */}
-                    {!issues.allowed_ips && (
-                      <Typography color="text.disabled" sx={{ fontSize: 10.5, lineHeight: 1.5 }}>
-                        Liste des réseaux qui seront acheminés dans le tunnel.
-                      </Typography>
-                    )}
-                  </Box>
-                  <Field
-                    label="Keepalive (s)"
-                    error={issues.persistent_keepalive}
-                    type="number"
-                    value={String(draft.persistent_keepalive)}
-                    onChange={(value) => set('persistent_keepalive', Number(value) || 0)}
-                  />
-                  {/* Only without a negotiation block. With one, the PSK is
-                      the material of the `static_psk` mode and belongs under
-                      that mode, not among the WireGuard settings. */}
-                  {!draft.key_negotiation && pskField}
-                  <Field
-                    label="Destination SSH"
-                    error={issues.ssh_target}
-                    placeholder="utilisateur@100.64.0.1"
-                    value={draft.ssh_target ?? ''}
-                    onChange={(value) => set('ssh_target', value || null)}
-                  />
-                </Box>
-              </Collapse>
+              <Field
+                label="Clé publique gateway"
+                error={issues.peer_public_key}
+                value={draft.peer_public_key}
+                onChange={(value) => set('peer_public_key', value)}
+              />
             </Box>
           </Box>
+
+          <ButtonBase
+            onClick={() => setAdvanced((open) => !open)}
+            aria-expanded={advanced}
+            sx={{
+              display: 'flex',
+              justifyContent: 'flex-start',
+              gap: 0.5,
+              mt: 1.5,
+              py: 0.5,
+              color: 'text.secondary',
+              '&:hover': { color: 'text.primary' },
+            }}
+          >
+            <ChevronRight
+              size={14}
+              aria-hidden
+              style={{
+                transform: advanced ? 'rotate(90deg)' : undefined,
+                transition: 'transform 140ms ease',
+              }}
+            />
+            <Typography sx={{ fontSize: 12, fontWeight: 600 }}>Avancé</Typography>
+            {advancedFlagged && <AlertTriangle size={13} aria-hidden style={{ color: '#A16207' }} />}
+          </ButtonBase>
+
+          <Collapse in={advanced} unmountOnExit>
+            <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5, pt: 0.5 }}>
+              {/* Three routine decisions and the field they write into.
+                  The field stays the authority — «Personnalisé» is not a
+                  fourth value, it is what the three fail to recognise —
+                  because the lists a real deployment needs are not
+                  guessable from the client side. No caution for a narrowed
+                  range: routing one subnet and leaving the rest alone is
+                  what most corporate profiles do on purpose. */}
+              <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.75 }}>
+                <Typography
+                  id="split-tunnel-label"
+                  color="text.secondary"
+                  sx={{ fontSize: 11.5, fontWeight: 600 }}
+                >
+                  Que faire passer par Helios ?
+                </Typography>
+                <ToggleButtonGroup
+                  exclusive
+                  size="small"
+                  value={splitTunnel}
+                  aria-labelledby="split-tunnel-label"
+                  onChange={(_event, next: SplitTunnelPreset | null) => {
+                    // `null` is the selected segment being pressed again:
+                    // there is no "no choice" here, the field always holds
+                    // one list. `custom` is handled on the segment itself,
+                    // because pressing it while it is already selected has
+                    // to keep working — that is when it is most useful.
+                    if (next === null || next === 'custom') return
+                    setManualPrefixes(false)
+                    set('allowed_ips', presetPrefixes(next, draft))
+                  }}
+                  sx={{ '& .MuiToggleButton-root': SPLIT_TUNNEL_SEGMENT }}
+                >
+                  {SPLIT_TUNNEL_CHOICES_ORDER.map((preset) => (
+                    <ToggleButton
+                      key={preset}
+                      value={preset}
+                      // The prefixes it would write, before it writes
+                      // them — the one thing the bar deliberately does not
+                      // print.
+                      title={preset === 'custom' ? undefined : presetPrefixes(preset, draft)}
+                      // «Personnalisé» writes nothing: it opens the field
+                      // on the list the preset left behind, which is the
+                      // starting point a narrowed range is edited from.
+                      // Handled on the segment rather than on the group so
+                      // that pressing it while it is already selected
+                      // still hands over the caret.
+                      onClick={
+                        preset === 'custom'
+                          ? () => {
+                              setManualPrefixes(true)
+                              setCaretRequest((request) => request + 1)
+                            }
+                          : undefined
+                      }
+                    >
+                      {SPLIT_TUNNEL_CHOICES[preset].label}
+                    </ToggleButton>
+                  ))}
+                </ToggleButtonGroup>
+                {/* One line, for the chosen segment only. Four captions
+                    printed at once is a paragraph, and a paragraph under a
+                    control is what stops being read. */}
+                <Typography color="text.secondary" sx={{ fontSize: 10.5, lineHeight: 1.5 }}>
+                  {SPLIT_TUNNEL_CHOICES[splitTunnel].detail}
+                </Typography>
+                {/* A preset owns the list it wrote, so the field states it
+                    rather than taking it: an input accepting text that
+                    would flip the segment above it is the contradiction
+                    this bar was added to remove. The value stays on screen
+                    because a choice named «Réseaux privés» has to be
+                    checkable against the prefixes it stands for.
+
+                    The example lives in the placeholder, not under the
+                    field: it is a value, and a value belongs where the
+                    value goes. */}
+                {splitTunnel === 'custom' ? (
+                  <Field
+                    label="Trafic via le tunnel"
+                    error={issues.allowed_ips}
+                    placeholder="0.0.0.0/0  ·  100.64.0.1/32, 192.168.1.0/24"
+                    value={draft.allowed_ips}
+                    inputRef={allowedIpsInput}
+                    onChange={(value) => set('allowed_ips', value)}
+                  />
+                ) : (
+                  <ReadOnlyField label="Trafic via le tunnel" value={draft.allowed_ips} />
+                )}
+                {/* The exception this screen makes to its own rule: the
+                    field is the one place where «réseaux» has to be read
+                    as prefixes, and the bar above no longer spells it. It
+                    gives way to the error the moment there is one. */}
+                {!issues.allowed_ips && (
+                  <Typography color="text.disabled" sx={{ fontSize: 10.5, lineHeight: 1.5 }}>
+                    Liste des réseaux qui seront acheminés dans le tunnel.
+                  </Typography>
+                )}
+              </Box>
+              {/* Two short fields side by side rather than one above the
+                  other: neither a keepalive nor a login is worth the width of
+                  the panel, and stacking them would push the PSK below the
+                  fold for nothing. */}
+              <Box
+                sx={{
+                  display: 'grid',
+                  gridTemplateColumns: 'repeat(2, minmax(0, 1fr))',
+                  gap: 1.5,
+                  alignItems: 'start',
+                }}
+              >
+                <Field
+                  label="Keepalive (s)"
+                  error={issues.persistent_keepalive}
+                  type="number"
+                  value={String(draft.persistent_keepalive)}
+                  onChange={(value) => set('persistent_keepalive', Number(value) || 0)}
+                />
+                <Field
+                  label="Destination SSH"
+                  error={issues.ssh_target}
+                  placeholder="utilisateur@100.64.0.1"
+                  value={draft.ssh_target ?? ''}
+                  onChange={(value) => set('ssh_target', value || null)}
+                />
+              </Box>
+              {/* Only without a negotiation block. With one, the PSK is the
+                  material of the `static_psk` mode and belongs under that
+                  mode, not among the WireGuard settings. */}
+              {!draft.key_negotiation && pskField}
+            </Box>
+          </Collapse>
 
           <Divider sx={{ my: 1.75 }} />
 
