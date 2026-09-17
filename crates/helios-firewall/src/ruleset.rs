@@ -62,7 +62,7 @@ mod transport;
 mod tunnel_interface;
 
 pub use nftables::{
-    ChainKind, ConnectionState, ConnectionStates, Match, Rule, Ruleset, Verdict, L4,
+    AddressFamily, ChainKind, ConnectionState, ConnectionStates, Match, Rule, Ruleset, Verdict, L4,
 };
 
 use aether::{FirewallPolicy, TunnelState, SPEEDTEST_PORT};

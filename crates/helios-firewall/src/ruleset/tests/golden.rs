@@ -210,6 +210,7 @@ output oifname \"wlo1\" udp dport 53 accept
 output oifname \"wlo1\" tcp dport { 53, 80, 443 } accept
 output oifname \"wlo1\" udp dport 123 accept
 input iifname \"helios0\" meta l4proto icmp accept
+input iifname \"helios0\" meta l4proto ipv6-icmp accept
 input iifname \"helios0\" tcp dport 22 accept
 input iifname \"helios0\" tcp dport 51822 accept
 input iifname \"helios0\" udp dport 51822 accept

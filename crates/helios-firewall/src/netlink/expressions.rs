@@ -15,7 +15,10 @@ use rustables::{
 };
 
 use super::NetlinkBackend;
-use crate::ruleset::{ChainKind, ConnectionState, ConnectionStates, Match, L4};
+use crate::ruleset::{AddressFamily, ChainKind, ConnectionState, ConnectionStates, Match, L4};
+
+const IP_PROTOCOL_ICMP: u8 = 1;
+const IP_PROTOCOL_ICMPV6: u8 = 58;
 
 impl NetlinkBackend {
     pub(super) fn hook_class(kind: ChainKind) -> HookClass {
@@ -46,7 +49,7 @@ impl NetlinkBackend {
             }
             Match::DestNet(addr) => Self::match_net(rule, addr, false)?,
             Match::SourceNet(addr) => Self::match_net(rule, addr, true)?,
-            Match::Icmp => rule.icmp(),
+            Match::Icmp(family) => Self::icmp_protocol(rule, *family),
             Match::PacketMark(mark) => rule
                 .with_expr(Meta::new(MetaType::Mark))
                 .with_expr(Cmp::new(CmpOp::Eq, Self::packet_mark_bytes(*mark))),
@@ -58,6 +61,15 @@ impl NetlinkBackend {
     /// protocol field and must therefore not use network byte order.
     fn packet_mark_bytes(mark: u32) -> [u8; 4] {
         mark.to_ne_bytes()
+    }
+
+    fn icmp_protocol(rule: NfRule, family: AddressFamily) -> NfRule {
+        let protocol = match family {
+            AddressFamily::Ipv4 => IP_PROTOCOL_ICMP,
+            AddressFamily::Ipv6 => IP_PROTOCOL_ICMPV6,
+        };
+        rule.with_expr(Meta::new(MetaType::L4Proto))
+            .with_expr(Cmp::new(CmpOp::Eq, [protocol]))
     }
 
     /// A structured `ct state` match, built from the exact IR state set.
@@ -240,5 +252,12 @@ mod tests {
             u32::from_ne_bytes(NetlinkBackend::packet_mark_bytes(mark)),
             mark
         );
+    }
+
+    #[test]
+    fn icmp_protocol_numbers_are_family_specific() {
+        assert_eq!(IP_PROTOCOL_ICMP, 1);
+        assert_eq!(IP_PROTOCOL_ICMPV6, 58);
+        assert_ne!(IP_PROTOCOL_ICMP, IP_PROTOCOL_ICMPV6);
     }
 }

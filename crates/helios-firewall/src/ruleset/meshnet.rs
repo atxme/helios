@@ -8,7 +8,7 @@
 use aether::FirewallPolicy;
 
 use super::ChainKind::{Forward, Input, Output};
-use super::{Match, Rule, Verdict, L4, PRIVATE_IPV4_CIDRS};
+use super::{AddressFamily, Match, Rule, Verdict, L4, PRIVATE_IPV4_CIDRS};
 
 pub(super) fn nordvpn_meshnet(
     rules: &mut Vec<Rule>,
@@ -59,7 +59,7 @@ pub(super) fn nordvpn_meshnet(
                         vec![
                             Match::InIface(meshnet.iface.clone()),
                             Match::SourceNet(peer.clone()),
-                            Match::Icmp,
+                            Match::Icmp(AddressFamily::Ipv4),
                         ],
                         Verdict::Accept,
                     )

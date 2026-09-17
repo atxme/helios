@@ -93,7 +93,11 @@ fn loopback_is_accepted_according_to_chain_direction() {
 #[test]
 fn tunnel_icmp_and_ssh_are_opt_in_and_scoped_to_the_tunnel_interface() {
     let closed = render(&policy(), TunnelState::Up);
-    for forbidden in ["meta l4proto icmp", "tcp dport 22"] {
+    for forbidden in [
+        "meta l4proto icmp",
+        "meta l4proto ipv6-icmp",
+        "tcp dport 22",
+    ] {
         assert!(
             !text(&closed, ChainKind::Input)
                 .iter()
@@ -112,13 +116,19 @@ fn tunnel_icmp_and_ssh_are_opt_in_and_scoped_to_the_tunnel_interface() {
         .any(|r| r == "iifname \"helios0\" meta l4proto icmp accept"));
     assert!(input
         .iter()
+        .any(|r| r == "iifname \"helios0\" meta l4proto ipv6-icmp accept"));
+    assert!(input
+        .iter()
         .any(|r| r == "iifname \"helios0\" tcp dport 22 accept"));
 
     // Neither may ever be rendered without its interface match, whatever
     // the state: that rule alone is what keeps them off the WAN.
     for state in [TunnelState::Down, TunnelState::Connecting, TunnelState::Up] {
         for rule in render(&open, state).chain(ChainKind::Input) {
-            let touches_tunnel_opening = rule.matches.contains(&Match::Icmp)
+            let touches_tunnel_opening = rule
+                .matches
+                .iter()
+                .any(|criterion| matches!(criterion, Match::Icmp(_)))
                 || rule.matches.contains(&Match::DestPort {
                     port: 22,
                     proto: L4::Tcp,
@@ -201,7 +211,11 @@ fn the_tunnel_openings_need_a_wireguard_interface() {
     p.allow_ssh_over_tunnel = true;
     p.wg_iface = String::new();
     let rs = render(&p, TunnelState::Up);
-    for forbidden in ["meta l4proto icmp", "tcp dport 22"] {
+    for forbidden in [
+        "meta l4proto icmp",
+        "meta l4proto ipv6-icmp",
+        "tcp dport 22",
+    ] {
         assert!(
             !text(&rs, ChainKind::Input)
                 .iter()

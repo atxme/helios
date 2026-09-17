@@ -182,7 +182,7 @@ impl FirewallBackend for NetlinkBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ruleset::{Match, L4};
+    use crate::ruleset::{AddressFamily, Match, L4};
 
     #[test]
     fn table_is_created_before_being_deleted() {
@@ -241,6 +241,15 @@ mod tests {
                         Match::SourceNet("2001:db8::1".into()),
                     ],
                     verdict: Verdict::Drop,
+                    note: None,
+                },
+                crate::ruleset::Rule {
+                    chain: ChainKind::Input,
+                    matches: vec![
+                        Match::InIface("helios0".into()),
+                        Match::Icmp(AddressFamily::Ipv6),
+                    ],
+                    verdict: Verdict::Accept,
                     note: None,
                 },
             ],

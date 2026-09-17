@@ -10,6 +10,13 @@
 
 use std::fmt;
 
+/// Network-layer family used by family-sensitive matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddressFamily {
+    Ipv4,
+    Ipv6,
+}
+
 /// Conntrack states understood by the Helios firewall IR.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionState {
@@ -134,20 +141,17 @@ pub enum Match {
     DestNet(String),
     /// `ip saddr <addr>` — IP or CIDR.
     SourceNet(String),
-    /// `meta l4proto icmp`
+    /// `meta l4proto icmp` or `meta l4proto ipv6-icmp`.
     ///
-    /// # Limite connue : le type ICMP n'est pas discriminé
+    /// # Known limitation: ICMP type is not discriminated
     ///
-    /// La règle porte sur le protocole, pas sur `icmp type echo-request` :
-    /// l'API haut niveau de `rustables` expose `Rule::icmp()` et aucun moyen
-    /// de comparer l'octet de type sans écrire l'expression `payload` à la
-    /// main — même nature de limite que le MSS clamping documenté en tête de
-    /// `netlink`. Ce que ça élargit reste borné : la règle n'est posée que
-    /// sur l'interface du tunnel, donc seuls des pairs déjà admis par
-    /// WireGuard l'atteignent, et les erreurs ICMP utiles étaient déjà
-    /// acceptées par `ct state established,related`. Ce qui la débloquerait :
-    /// une expression `payload` brute, ou un `rustables` qui expose le type.
-    Icmp,
+    /// The match covers the protocol, not a narrower type such as
+    /// `echo-request`. The high-level `rustables` API has no ICMPv4 payload
+    /// field for the type octet. The widening remains interface-scoped, so
+    /// only peers already admitted by WireGuard can reach the tunnel rule.
+    /// Supporting typed ICMP messages requires a checked payload-expression
+    /// encoder for both families.
+    Icmp(AddressFamily),
     /// Packet mark assigned by a privileged local networking service.
     PacketMark(u32),
 }
@@ -175,7 +179,8 @@ impl fmt::Display for Match {
             }
             Match::DestNet(a) => write!(f, "ip daddr {a}"),
             Match::SourceNet(a) => write!(f, "ip saddr {a}"),
-            Match::Icmp => write!(f, "meta l4proto icmp"),
+            Match::Icmp(AddressFamily::Ipv4) => write!(f, "meta l4proto icmp"),
+            Match::Icmp(AddressFamily::Ipv6) => write!(f, "meta l4proto ipv6-icmp"),
             Match::PacketMark(mark) => write!(f, "meta mark {mark:#x}"),
         }
     }
