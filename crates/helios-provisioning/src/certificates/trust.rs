@@ -41,26 +41,6 @@ impl CertificateRegistry {
         Ok(outcome)
     }
 
-    /// Records Astra's delegated issuer, and the policy that delegation names.
-    ///
-    /// The gateway has to hold the delegation itself, not merely see one
-    /// inside an approval: [`RegistryState::client_leaf_issuers`](super::RegistryState::client_leaf_issuers) is what both
-    /// the staging check and the negotiation port build their issuer set from,
-    /// and the two must not drift — a staging check that trusted a delegation
-    /// the port does not hold would stage a leaf that locks its owner out at
-    /// the end of the overlap. So the delegation is durable state here, as it
-    /// is on the authority side.
-    ///
-    /// It is verified under the `CA-PQ` this registry already holds before its
-    /// policy is read, and its epoch must advance — a spent epoch carrying
-    /// different bytes is a substitution, not a replay.
-    ///
-    /// The pinned policy is decided in the same call and written in the same
-    /// atomic persist: a delegation recorded without the policy it names would
-    /// be refused on the next read, and a policy adopted without its
-    /// delegation would widen what may be issued before anything authorized
-    /// it. See
-    /// [`AstraPolicyPin::adopt_automatic_renewal_policy`](aether::certificates::approval::AstraPolicyPin::adopt_automatic_renewal_policy).
     /// Records the domain's operator credentials, from the `CA-PQ`-signed
     /// document the companion emits.
     ///
@@ -85,6 +65,17 @@ impl CertificateRegistry {
     /// rows about to be used. A document carrying one forged row beside honest
     /// ones would otherwise install it, and that row is what a later
     /// `supersedes` would be compared against.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`RegistryError`] if the document or any binding fails
+    /// signature, domain, gateway, epoch, or binding validation. No partial
+    /// document is persisted when validation or installation fails.
+    ///
+    /// # Side effects
+    ///
+    /// Persists all newly accepted bindings in one state transition and
+    /// returns their count. Replayed bindings are accepted as no-ops.
     pub fn install_astra_credentials(
         &mut self,
         registry: &aether::certificates::approval::CredentialRegistry,
@@ -115,6 +106,31 @@ impl CertificateRegistry {
         Ok(installed)
     }
 
+    /// Records Astra's delegated issuer and the automatic-renewal policy it
+    /// names.
+    ///
+    /// The gateway holds the delegation itself, not merely one embedded in an
+    /// approval: [`RegistryState::client_leaf_issuers`](super::RegistryState::client_leaf_issuers)
+    /// is used both by staging and by the negotiation port. Keeping those
+    /// views aligned prevents a leaf from being staged under an issuer that
+    /// the port does not serve.
+    ///
+    /// The delegation is verified under the registry's current `CA-PQ`, its
+    /// epoch must advance when its bytes change, and the policy pin is adopted
+    /// in the same persisted state transition. A delegation and its policy are
+    /// therefore never persisted separately.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`RegistryError`] when the delegation signature, domain,
+    /// gateway identity, certificate epoch, validity window, or issuer epoch
+    /// is invalid. Persistence errors are returned unchanged.
+    ///
+    /// # Side effects
+    ///
+    /// On success, persists the issuer as active and may update the pinned
+    /// automatic-renewal policy. `now_unix` is the Unix timestamp used for
+    /// validity checking.
     pub fn install_astra_issuer(
         &mut self,
         delegation: &aether::certificates::authority::AstraIssuerAuthorization,

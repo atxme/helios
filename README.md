@@ -30,7 +30,7 @@ Orion ── QUIC/mTLS ──► heliosd   négociation de clé (avant le tunnel
 Orion ── WireGuard ──► heliosd   trafic + API d'administration
 
 heliosd : orchestrateur · API Axum/WS · IPAM ML-KEM · pare-feu nftables
-          backend WireGuard · TPM/coffres · mise à jour signée
+          backend WireGuard · TPM · séquestre · mise à jour signée
 ```
 
 ## Composants principaux
@@ -45,7 +45,8 @@ heliosd : orchestrateur · API Axum/WS · IPAM ML-KEM · pare-feu nftables
 | `astra` | Coordinateur PKI, registre de confiance et renouvellement des certificats |
 | `helios-api` | API Axum, WebSocket, IHM embarquée |
 | `helios-update` | Manifeste hybride, staging, anti-rollback |
-| `helios-tpm` | Scellement PCR, séquestre, fenêtre de mise à jour |
+| `helios-escrow` | Séquestre opérateur de l'identité WireGuard |
+| `helios-tpm` | Scellement PCR et fenêtre de mise à jour |
 | `helios-vault` | Conteneur AEAD unique des secrets au repos (ADR-006) |
 | `heliosd` | CLI et orchestration de la gateway |
 | `orion-core` / `apps/orion` | Cœur portable et shell Tauri du client |

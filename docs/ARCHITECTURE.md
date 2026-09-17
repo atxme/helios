@@ -18,7 +18,8 @@ Orion (Tauri)                          Helios (Linux appliance)
 │  ├─ key negotiation  │              │  ├─ Axum API / WebSocket       │
 │  ├─ identity store   │◄─ WireGuard ►│  ├─ WireGuard backend          │
 │  └─ WireGuard backend│              │  ├─ nftables firewall          │
-└──────────────────────┘              │  ├─ TPM, vault, escrow         │
+└──────────────────────┘              │  ├─ TPM, vault                 │
+                                      │  ├─ escrow                     │
                                       │  └─ signed update + rollback   │
                                       └────────────────────────────────┘
 ```

@@ -96,10 +96,11 @@ pub async fn provision(
 
     let admitted = AdmittedFromConfig(network.peers.iter().map(|p| p.public_key.clone()).collect());
 
-    // Collision probing is not wired to the live data-plane snapshot yet.
-    // Keep the empty view explicit: changing it requires plumbing a snapshot
-    // through AppState and deciding how snapshot failures fail closed.
-    let peers = PeerAddressTable::from_peers(&[]);
+    // The orchestrator owns the backend and publishes its latest read-only
+    // snapshot through AppState. Copy it before releasing the network lock so
+    // provisioning never reaches into, or depends on, the WireGuard backend.
+    let peer_snapshot = s.peer_runtime.read().await.clone();
+    let peers = PeerAddressTable::from_peers(&peer_snapshot);
 
     let identity = GatewayIdentity {
         wg_public_key: &gateway_public_key,
@@ -207,10 +208,6 @@ fn gateway_public_key(private_key_b64: &str) -> Result<String, String> {
 
 /// Adapts a live data-plane snapshot to the IPAM collision view.
 ///
-/// The conversion is ready for the stateless assignment described by
-/// ADR-001 §4. The provisioning handler does not receive that snapshot yet;
-/// its call site documents the missing runtime wiring explicitly.
-///
 /// It lives here, with its only caller, rather than in the data plane: it is
 /// the wiring between two subsystems, and wiring belongs to whoever composes
 /// them. Keeping it in `helios-wireguard` made the data plane depend on
@@ -261,7 +258,7 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::{broadcast, mpsc, RwLock};
 
-    use helios_provisioning::PeerTable;
+    use helios_provisioning::{derive_cgnat_ip, PeerTable};
     use helios_wireguard::{DryRunBackend, InterfaceConfig, PeerConfig, WireguardBackend};
     use std::net::Ipv4Addr;
 
@@ -303,6 +300,37 @@ mod tests {
         // Only the valid IPv4 entry is retained.
         assert!(!table.is_empty());
         assert!(table.is_taken_by_other("100.64.1.2".parse().unwrap(), &[2u8; 32]));
+    }
+
+    #[test]
+    fn empty_and_multiple_snapshots_are_represented_correctly() {
+        let empty = PeerAddressTable::from_peers(&[]);
+        assert!(empty.is_empty());
+
+        let snapshot = vec![
+            live_peer(&[1u8; 32], "100.64.1.2/32"),
+            live_peer(&[2u8; 32], "100.64.1.3/32"),
+        ];
+        let table = PeerAddressTable::from_peers(&snapshot);
+        assert!(table.is_taken_by_other("100.64.1.2".parse().unwrap(), &[3u8; 32]));
+        assert!(table.is_taken_by_other("100.64.1.3".parse().unwrap(), &[3u8; 32]));
+        assert!(!table.is_taken_by_other("100.64.1.4".parse().unwrap(), &[3u8; 32]));
+    }
+
+    #[test]
+    fn snapshot_collision_view_leaves_the_next_address_available() {
+        let key = [7u8; 32];
+        let natural = derive_cgnat_ip(&key, 0);
+        let next = derive_cgnat_ip(&key, 1);
+        let table =
+            PeerAddressTable::from_peers(&[live_peer(&[8u8; 32], &format!("{natural}/32"))]);
+
+        assert!(table.is_taken_by_other(natural, &key));
+        assert!(!table.is_taken_by_other(next, &key));
+        assert_eq!(
+            helios_provisioning::assign_vip(&table, &key, 64).unwrap(),
+            next
+        );
     }
 
     #[tokio::test]
@@ -460,6 +488,40 @@ mod tests {
             "the PSK installed on the gateway must be the one the client derives, \
              otherwise every subsequent handshake would fail"
         );
+    }
+
+    #[tokio::test]
+    async fn provisioning_uses_existing_wireguard_peers_for_ipam() {
+        let (state, mut psk_rx) = provisionable_state();
+        let (_, _, request) = client_request();
+        use base64::Engine as _;
+        let client_key = request.client_wg_public_key.clone();
+        let client_raw = base64::engine::general_purpose::STANDARD
+            .decode(&client_key)
+            .unwrap();
+        let natural = derive_cgnat_ip(&client_raw, 0);
+
+        // This peer is not in network.toml's admission list for the request;
+        // it represents a peer already present in the live WireGuard table.
+        state
+            .peer_runtime
+            .write()
+            .await
+            .push(live_peer(&[9u8; 32], &format!("{natural}/32")));
+
+        let orchestrator = tokio::spawn(async move {
+            let demand = psk_rx.recv().await.expect("a request must arrive");
+            demand.reply.send(Ok(())).unwrap();
+        });
+
+        let response = provision(State(state), None, Json(request))
+            .await
+            .expect("provisioning must succeed")
+            .0;
+        orchestrator.await.unwrap();
+
+        let expected_next = derive_cgnat_ip(&client_raw, 1);
+        assert_eq!(response.assigned_address, format!("{expected_next}/32"));
     }
 
     /// Fail-closed: if the gateway cannot install the PSK, it does not

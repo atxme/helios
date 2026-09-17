@@ -16,7 +16,7 @@ heliosd ── helios-key-negotiation ── helios-provisioning
    ├── helios-wireguard ── WireGuard du noyau ou backend configuré
    ├── helios-firewall ── nftables
    ├── astra / aether
-   ├── helios-tpm / helios-vault
+   ├── helios-tpm / helios-vault / helios-escrow
    └── helios-update
 ```
 
@@ -31,8 +31,8 @@ heliosd ── helios-key-negotiation ── helios-provisioning
 - `helios-api` expose l'API Axum/WebSocket et l'interface web embarquée ; `web`
   est la console React/MUI.
 - `astra` coordonne le cycle de vie des certificats et la confiance ;
-  `helios-tpm` et `helios-vault` gèrent respectivement le matériel TPM et les
-  secrets chiffrés.
+  `helios-tpm`, `helios-vault` et `helios-escrow` gèrent respectivement le
+  matériel TPM, les secrets chiffrés et le séquestre opérateur WireGuard.
 - `helios-update` traite les mises à jour signées et le rollback.
 - `orion-core` porte la logique cliente portable ; `apps/orion` fournit le shell
   React/Tauri et les intégrations de plateforme.
