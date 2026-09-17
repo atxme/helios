@@ -779,47 +779,47 @@ describe('ProfilesView interactions', () => {
 
     const pressed = (name: string) =>
       screen.getByRole('button', { name }).getAttribute('aria-pressed')
+    const field = () => screen.getByRole('textbox', { name: 'Trafic via le tunnel' })
 
-    // Each row says what it does, and the caption is not the accessible name:
-    // the four choices are told apart by their label alone.
+    // Under a preset the list is stated, never offered for editing, and one
+    // caption explains the chosen segment — not all four at once.
+    expect(pressed('Tout')).toBe('true')
+    expect((field() as HTMLInputElement).value).toBe('0.0.0.0/0')
+    expect(field().hasAttribute('readonly')).toBe(true)
     expect(screen.getByText('Internet et réseaux privés')).toBeTruthy()
-    expect(screen.getByText('Uniquement la passerelle')).toBeTruthy()
-
-    // Under a preset the list is shown, never offered for editing.
-    expect(pressed('Tout le trafic')).toBe('true')
-    expect(screen.queryByRole('textbox', { name: 'Trafic via le tunnel' })).toBeNull()
-    expect(screen.getByText('0.0.0.0/0')).toBeTruthy()
+    expect(screen.queryByText('Uniquement la passerelle')).toBeNull()
 
     // The gateway prefix comes from the profile's internal Helios URL, not
     // from a constant: this profile answers at 100.64.0.1.
     fireEvent.click(screen.getByRole('button', { name: 'Helios seul' }))
     expect(pressed('Helios seul')).toBe('true')
-    expect(screen.getByText('100.64.0.1/32')).toBeTruthy()
+    expect((field() as HTMLInputElement).value).toBe('100.64.0.1/32')
+    expect(screen.getByText('Uniquement la passerelle')).toBeTruthy()
 
     fireEvent.click(screen.getByRole('button', { name: 'Réseaux privés' }))
-    expect(
-      screen.getByText('100.64.0.1/32, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16'),
-    ).toBeTruthy()
+    expect((field() as HTMLInputElement).value).toBe(
+      '100.64.0.1/32, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16',
+    )
 
     // And back, in one click.
-    fireEvent.click(screen.getByRole('button', { name: 'Tout le trafic' }))
-    expect(pressed('Tout le trafic')).toBe('true')
+    fireEvent.click(screen.getByRole('button', { name: 'Tout' }))
+    expect(pressed('Tout')).toBe('true')
 
     // «Personnalisé» opens the field on the list the preset left behind, with
     // the caret already in it.
     fireEvent.click(screen.getByRole('button', { name: 'Personnalisé' }))
-    const field = screen.getByLabelText('Trafic via le tunnel') as HTMLInputElement
-    expect(field.value).toBe('0.0.0.0/0')
     expect(pressed('Personnalisé')).toBe('true')
-    await waitFor(() => expect(document.activeElement).toBe(field))
+    expect((field() as HTMLInputElement).value).toBe('0.0.0.0/0')
+    expect(field().hasAttribute('readonly')).toBe(false)
+    await waitFor(() => expect(document.activeElement).toBe(field()))
 
-    // And it stays open even on a list a preset would recognise: closing the
-    // field under the caret is what the sticky choice exists to prevent.
-    fireEvent.change(field, { target: { value: '100.64.0.1/32' } })
+    // And it stays editable even on a list a preset would recognise: closing
+    // the field under the caret is what the sticky choice exists to prevent.
+    fireEvent.change(field(), { target: { value: '100.64.0.1/32' } })
     expect(pressed('Personnalisé')).toBe('true')
-    expect(screen.getByRole('textbox', { name: 'Trafic via le tunnel' })).toBeTruthy()
+    expect(field().hasAttribute('readonly')).toBe(false)
 
-    fireEvent.change(field, { target: { value: '192.168.42.0/24' } })
+    fireEvent.change(field(), { target: { value: '192.168.42.0/24' } })
     fireEvent.click(screen.getByRole('button', { name: 'Enregistrer' }))
     await waitFor(() => expect(handlers.onSave).toHaveBeenCalledOnce())
     expect(handlers.onSave.mock.calls[0][0].allowed_ips).toBe('192.168.42.0/24')
@@ -847,9 +847,9 @@ describe('ProfilesView interactions', () => {
     expect(
       screen.getByRole('button', { name: 'Personnalisé' }).getAttribute('aria-pressed'),
     ).toBe('true')
-    expect((screen.getByLabelText('Trafic via le tunnel') as HTMLInputElement).value).toBe(
-      '10.9.0.0/16, 192.168.1.0/24',
-    )
+    const field = screen.getByRole('textbox', { name: 'Trafic via le tunnel' })
+    expect((field as HTMLInputElement).value).toBe('10.9.0.0/16, 192.168.1.0/24')
+    expect(field.hasAttribute('readonly')).toBe(false)
   })
 
   it('loads an associated profile and explains a failed identity seal', async () => {

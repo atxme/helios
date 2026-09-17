@@ -48,7 +48,7 @@ n'importe quelle liste de préfixes.
 
 | Choix | `AllowedIPs` écrit |
 | --- | --- |
-| Tout le trafic | `0.0.0.0/0` |
+| Tout | `0.0.0.0/0` |
 | Réseaux privés | VIP de la gateway en `/32`, puis `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` |
 | Helios seul | VIP de la gateway en `/32` |
 

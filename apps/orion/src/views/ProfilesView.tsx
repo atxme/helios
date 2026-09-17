@@ -21,8 +21,6 @@ import {
   AlertTriangle,
   Check,
   ChevronRight,
-  Circle,
-  CircleDot,
   KeyRound,
   FileCode2,
   Plus,
@@ -171,30 +169,27 @@ const MAX_IMPORT_BYTES = 64 * 1024
  * a noun each is a list one has to try to read.
  */
 const SPLIT_TUNNEL_CHOICES: Record<SplitTunnelPreset, { label: string; detail: string }> = {
-  full: { label: 'Tout le trafic', detail: 'Internet et réseaux privés' },
+  full: { label: 'Tout', detail: 'Internet et réseaux privés' },
   private: { label: 'Réseaux privés', detail: 'Uniquement les réseaux Helios' },
   gateway: { label: 'Helios seul', detail: 'Uniquement la passerelle' },
   custom: { label: 'Personnalisé', detail: 'Choisir les réseaux manuellement' },
 }
 
-/**
- * One row of the choice list.
- *
- * A vertical `ToggleButtonGroup` rather than a `RadioGroup`: exclusive choice
- * is already expressed that way one block below, in the protection modes, and
- * two grammars for the same gesture on the same screen is one too many. The
- * radio glyph is there because the rows are wide enough to read as buttons
- * that could all be pressed at once.
- */
-/** The rows, in order. `custom` closes the list: it is the way out of it. */
+/** The segments, in order. `custom` closes the bar: it is the way out of it. */
 const SPLIT_TUNNEL_CHOICES_ORDER: SplitTunnelPreset[] = [...SPLIT_TUNNEL_PRESETS, 'custom']
 
-const SPLIT_TUNNEL_ROW = {
-  justifyContent: 'flex-start',
-  gap: 1,
+/**
+ * One segment of the choice bar.
+ *
+ * Same skin as the protection-mode row one block below: exclusive choice is
+ * already expressed that way on this screen, and two grammars for the same
+ * gesture is one too many. Short labels, because four segments have to fit the
+ * form's narrow column — what each one means is the line underneath.
+ */
+const SPLIT_TUNNEL_SEGMENT = {
   px: 1.25,
-  py: 0.75,
-  textAlign: 'left',
+  py: 0.4,
+  fontSize: 11.5,
   textTransform: 'none',
 } as const
 
@@ -1290,74 +1285,60 @@ export function ProfilesView({
                     </Typography>
                     <ToggleButtonGroup
                       exclusive
-                      orientation="vertical"
                       size="small"
                       value={splitTunnel}
                       aria-labelledby="split-tunnel-label"
                       onChange={(_event, next: SplitTunnelPreset | null) => {
-                        // `null` is the selected row being pressed again:
+                        // `null` is the selected segment being pressed again:
                         // there is no "no choice" here, the field always holds
-                        // one list. `custom` is handled on the row itself,
+                        // one list. `custom` is handled on the segment itself,
                         // because pressing it while it is already selected has
                         // to keep working — that is when it is most useful.
                         if (next === null || next === 'custom') return
                         setManualPrefixes(false)
                         set('allowed_ips', presetPrefixes(next, draft))
                       }}
-                      sx={{ '& .MuiToggleButton-root': SPLIT_TUNNEL_ROW }}
+                      sx={{ '& .MuiToggleButton-root': SPLIT_TUNNEL_SEGMENT }}
                     >
-                      {SPLIT_TUNNEL_CHOICES_ORDER.map((preset) => {
-                        const choice = SPLIT_TUNNEL_CHOICES[preset]
-                        const selected = splitTunnel === preset
-                        const Glyph = selected ? CircleDot : Circle
-                        return (
-                          <ToggleButton
-                            key={preset}
-                            value={preset}
-                            // The accessible name stays the choice itself: the
-                            // second line explains it, it does not rename it.
-                            aria-label={choice.label}
-                            // The prefixes it would write, before it writes
-                            // them — the one thing the row deliberately does
-                            // not print.
-                            title={preset === 'custom' ? undefined : presetPrefixes(preset, draft)}
-                            // «Personnalisé» writes nothing: it opens the
-                            // field on the list the preset left behind, which
-                            // is the starting point a narrowed range is edited
-                            // from. Handled on the row rather than on the
-                            // group so that pressing it while it is already
-                            // selected still hands over the caret.
-                            onClick={
-                              preset === 'custom'
-                                ? () => {
-                                    setManualPrefixes(true)
-                                    setCaretRequest((request) => request + 1)
-                                  }
-                                : undefined
-                            }
-                          >
-                            <Glyph size={13} aria-hidden style={{ flexShrink: 0 }} />
-                            <Box sx={{ display: 'flex', flexDirection: 'column', minWidth: 0 }}>
-                              <Typography sx={{ fontSize: 11.5, fontWeight: 600, lineHeight: 1.4 }}>
-                                {choice.label}
-                              </Typography>
-                              <Typography
-                                color="text.secondary"
-                                sx={{ fontSize: 10.5, lineHeight: 1.4 }}
-                              >
-                                {choice.detail}
-                              </Typography>
-                            </Box>
-                          </ToggleButton>
-                        )
-                      })}
+                      {SPLIT_TUNNEL_CHOICES_ORDER.map((preset) => (
+                        <ToggleButton
+                          key={preset}
+                          value={preset}
+                          // The prefixes it would write, before it writes
+                          // them — the one thing the bar deliberately does not
+                          // print.
+                          title={preset === 'custom' ? undefined : presetPrefixes(preset, draft)}
+                          // «Personnalisé» writes nothing: it opens the field
+                          // on the list the preset left behind, which is the
+                          // starting point a narrowed range is edited from.
+                          // Handled on the segment rather than on the group so
+                          // that pressing it while it is already selected
+                          // still hands over the caret.
+                          onClick={
+                            preset === 'custom'
+                              ? () => {
+                                  setManualPrefixes(true)
+                                  setCaretRequest((request) => request + 1)
+                                }
+                              : undefined
+                          }
+                        >
+                          {SPLIT_TUNNEL_CHOICES[preset].label}
+                        </ToggleButton>
+                      ))}
                     </ToggleButtonGroup>
-                    {/* A preset owns the list it wrote, so there is no field
-                        to type in — an input accepting text that would flip
-                        the choice above it is the contradiction this row was
-                        added to remove. What stays is the value itself: a
-                        choice named «Réseaux privés» has to be checkable
-                        against the prefixes it stands for.
+                    {/* One line, for the chosen segment only. Four captions
+                        printed at once is a paragraph, and a paragraph under a
+                        control is what stops being read. */}
+                    <Typography color="text.secondary" sx={{ fontSize: 10.5, lineHeight: 1.5 }}>
+                      {SPLIT_TUNNEL_CHOICES[splitTunnel].detail}
+                    </Typography>
+                    {/* A preset owns the list it wrote, so the field states it
+                        rather than taking it: an input accepting text that
+                        would flip the segment above it is the contradiction
+                        this bar was added to remove. The value stays on screen
+                        because a choice named «Réseaux privés» has to be
+                        checkable against the prefixes it stands for.
 
                         The example lives in the placeholder, not under the
                         field: it is a value, and a value belongs where the
@@ -1372,34 +1353,16 @@ export function ProfilesView({
                         onChange={(value) => set('allowed_ips', value)}
                       />
                     ) : (
-                      <Box>
-                        <Typography
-                          id="split-tunnel-value"
-                          color="text.secondary"
-                          sx={{ fontSize: 10.5 }}
-                        >
-                          Trafic via le tunnel
-                        </Typography>
-                        <Box
-                          sx={{ display: 'flex', alignItems: 'flex-start', gap: 0.5, mt: 0.25 }}
-                        >
-                          <Typography
-                            aria-labelledby="split-tunnel-value"
-                            sx={{
-                              fontFamily: 'monospace',
-                              fontSize: 12,
-                              lineHeight: 1.5,
-                              wordBreak: 'break-all',
-                            }}
-                          >
-                            {draft.allowed_ips}
-                          </Typography>
-                          <CopyButton
-                            value={draft.allowed_ips}
-                            label="le trafic via le tunnel"
-                          />
-                        </Box>
-                      </Box>
+                      <ReadOnlyField label="Trafic via le tunnel" value={draft.allowed_ips} />
+                    )}
+                    {/* The exception this screen makes to its own rule: the
+                        field is the one place where «réseaux» has to be read
+                        as prefixes, and the bar above no longer spells it. It
+                        gives way to the error the moment there is one. */}
+                    {!issues.allowed_ips && (
+                      <Typography color="text.disabled" sx={{ fontSize: 10.5, lineHeight: 1.5 }}>
+                        Liste des réseaux qui seront acheminés dans le tunnel.
+                      </Typography>
                     )}
                   </Box>
                   <Field
