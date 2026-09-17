@@ -46,6 +46,12 @@ impl NetlinkBackend {
     /// having sent anything to the kernel — the previous policy stays in
     /// place, which is the expected fail-closed behavior.
     fn build_batch(&self, rs: &Ruleset) -> Result<Batch> {
+        if let Some(mss) = rs.mss_clamp {
+            return Err(Self::err(format!(
+                "MSS clamp {mss} cannot be encoded by rustables 0.8.7; transaction not sent"
+            )));
+        }
+
         let mut batch = Batch::new();
         let table = Table::new(ProtocolFamily::Inet).with_name(self.table_name.clone());
 
@@ -131,14 +137,6 @@ impl NetlinkBackend {
 
     fn commit(&self, policy: &FirewallPolicy, state: TunnelState) -> Result<()> {
         let rs = render(policy, state);
-
-        if let Some(mss) = rs.mss_clamp {
-            warn!(
-                "MSS clamping ({mss} bytes) not applied: mangle action not expressible \
-                 via rustables. Performance optimization, no security gap."
-            );
-        }
-
         let batch = self.build_batch(&rs)?;
         batch.send().map_err(|e| {
             Self::err(format!(
@@ -263,7 +261,7 @@ mod tests {
                     note: None,
                 },
             ],
-            mss_clamp: Some(1280),
+            mss_clamp: None,
             masquerade_out: vec!["eth0".into()],
         };
 
@@ -302,6 +300,22 @@ mod tests {
                 "an invalid address must cancel translation"
             );
         }
+    }
+
+    #[test]
+    fn mss_clamping_fails_translation_instead_of_being_ignored() {
+        let ruleset = Ruleset {
+            default_verdict: Verdict::Drop,
+            rules: Vec::new(),
+            mss_clamp: Some(1280),
+            masquerade_out: Vec::new(),
+        };
+
+        let error = match NetlinkBackend::new().build_batch(&ruleset) {
+            Ok(_) => panic!("an unapplied MSS clamp must not produce a transaction"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("MSS clamp 1280") && error.contains("transaction not sent"));
     }
 
     #[test]
