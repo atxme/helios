@@ -9,6 +9,7 @@
 //! [`FirewallPolicy`]: aether::FirewallPolicy
 
 use std::fmt;
+use std::num::{NonZeroU32, NonZeroU64};
 
 /// Network-layer family used by family-sensitive matches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,11 +106,46 @@ pub struct LogAction {
     pub group: Option<u16>,
 }
 
+/// Time unit for a packet rate limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateUnit {
+    Second,
+    Minute,
+    Hour,
+}
+
+impl RateUnit {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Second => "second",
+            Self::Minute => "minute",
+            Self::Hour => "hour",
+        }
+    }
+}
+
+/// Whether a rule matches packets inside or above the configured rate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateLimitMode {
+    Until,
+    Over,
+}
+
+/// Packet rate limit represented without zero-rate or zero-burst states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateLimit {
+    pub rate: NonZeroU64,
+    pub unit: RateUnit,
+    pub burst: NonZeroU32,
+    pub mode: RateLimitMode,
+}
+
 /// Non-verdict statements evaluated after the matches and before the verdict.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     Counter(Counter),
     Log(LogAction),
+    Limit(RateLimit),
 }
 
 /// Netfilter hooked chain.
@@ -268,6 +304,19 @@ impl fmt::Display for Rule {
                     }
                     write!(f, " ")?;
                 }
+                Action::Limit(limit) => {
+                    write!(f, "limit rate ")?;
+                    if limit.mode == RateLimitMode::Over {
+                        write!(f, "over ")?;
+                    }
+                    write!(
+                        f,
+                        "{}/{} burst {} packets ",
+                        limit.rate,
+                        limit.unit.as_str(),
+                        limit.burst
+                    )?;
+                }
             }
         }
         match self.verdict {
@@ -343,5 +392,26 @@ mod tests {
             .with_counter(Counter::Named("drop-kill-switch".into()));
 
         assert_eq!(rule.to_string(), "counter name \"drop-kill-switch\" drop");
+    }
+
+    #[test]
+    fn rate_limits_render_all_security_relevant_parameters() {
+        let rule = Rule {
+            chain: ChainKind::Input,
+            matches: Vec::new(),
+            actions: vec![Action::Limit(RateLimit {
+                rate: NonZeroU64::new(30).unwrap(),
+                unit: RateUnit::Minute,
+                burst: NonZeroU32::new(10).unwrap(),
+                mode: RateLimitMode::Over,
+            })],
+            verdict: Verdict::Drop,
+            note: None,
+        };
+
+        assert_eq!(
+            rule.to_string(),
+            "limit rate over 30/minute burst 10 packets drop"
+        );
     }
 }

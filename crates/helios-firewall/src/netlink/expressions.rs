@@ -73,6 +73,12 @@ impl NetlinkBackend {
             Action::Log(log) => {
                 rule.with_expr(NfLog::new(log.group, Some(log.prefix.clone())).map_err(Self::err)?)
             }
+            Action::Limit(limit) => {
+                return Err(Self::err(format!(
+                    "rate limit {}/{:?} burst {} {:?} is not supported by rustables 0.8.7",
+                    limit.rate, limit.unit, limit.burst, limit.mode
+                )))
+            }
         })
     }
 

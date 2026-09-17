@@ -63,7 +63,7 @@ mod tunnel_interface;
 
 pub use nftables::{
     Action, AddressFamily, ChainKind, ConnectionState, ConnectionStates, Counter, LogAction, Match,
-    Rule, Ruleset, Verdict, L4,
+    RateLimit, RateLimitMode, RateUnit, Rule, Ruleset, Verdict, L4,
 };
 
 use aether::{FirewallPolicy, TunnelState, SPEEDTEST_PORT};

@@ -184,8 +184,12 @@ impl FirewallBackend for NetlinkBackend {
 
 #[cfg(test)]
 mod tests {
+    use std::num::{NonZeroU32, NonZeroU64};
+
     use super::*;
-    use crate::ruleset::{Action, AddressFamily, Counter, LogAction, Match, L4};
+    use crate::ruleset::{
+        Action, AddressFamily, Counter, LogAction, Match, RateLimit, RateLimitMode, RateUnit, L4,
+    };
 
     #[test]
     fn table_is_created_before_being_deleted() {
@@ -394,5 +398,32 @@ mod tests {
         };
 
         assert!(NetlinkBackend::new().build_batch(&ruleset).is_err());
+    }
+
+    #[test]
+    fn rate_limits_fail_translation_instead_of_being_ignored() {
+        let ruleset = Ruleset {
+            default_verdict: Verdict::Drop,
+            rules: vec![crate::ruleset::Rule {
+                chain: ChainKind::Input,
+                matches: Vec::new(),
+                actions: vec![Action::Limit(RateLimit {
+                    rate: NonZeroU64::new(20).unwrap(),
+                    unit: RateUnit::Second,
+                    burst: NonZeroU32::new(5).unwrap(),
+                    mode: RateLimitMode::Until,
+                })],
+                verdict: Verdict::Accept,
+                note: None,
+            }],
+            mss_clamp: None,
+            masquerade_out: Vec::new(),
+        };
+
+        let error = match NetlinkBackend::new().build_batch(&ruleset) {
+            Ok(_) => panic!("a rate limit must not disappear during translation"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("rate limit") && error.contains("rustables 0.8.7"));
     }
 }
