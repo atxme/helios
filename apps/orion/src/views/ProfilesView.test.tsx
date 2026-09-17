@@ -172,7 +172,7 @@ describe('ProfilesView interactions', () => {
     expect(
       screen.getByRole('button', { name: 'PSK statique' }).getAttribute('aria-pressed'),
     ).toBe('true')
-    fireEvent.click(screen.getByRole('button', { name: 'Retirer le PSK statique' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Retirer' }))
     expect(screen.getByRole('button', { name: 'Aucune' }).getAttribute('aria-pressed')).toBe(
       'true',
     )
@@ -232,7 +232,7 @@ describe('ProfilesView interactions', () => {
     // The secrets are *stated*, never shown — and the public half, which is
     // meant to leave the machine, is the one value on screen.
     expect(screen.getByText('clé scellée dans le coffre')).toBeTruthy()
-    expect(screen.getByText('scellé dans le coffre')).toBeTruthy()
+    expect(screen.getByText('Scellé dans le coffre')).toBeTruthy()
     expect((screen.getByLabelText('Votre clé publique') as HTMLInputElement).value).toBe(
       'client-public',
     )
@@ -281,7 +281,7 @@ describe('ProfilesView interactions', () => {
     expect(screen.getByText('nouvelle clé — à enregistrer')).toBeTruthy()
 
     fireEvent.click(screen.getByRole('button', { name: 'Avancé' }))
-    fireEvent.click(screen.getByRole('button', { name: 'Retirer le PSK statique' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Retirer' }))
     fireEvent.click(screen.getByRole('button', { name: 'Enregistrer' }))
     await waitFor(() => expect(handlers.onSave).toHaveBeenCalledOnce())
 
@@ -370,14 +370,13 @@ describe('ProfilesView interactions', () => {
     // with a sentence explaining why it is unusable. Nor is it hiding under
     // «Avancé»: a negotiation block owns the PSK, the WireGuard block does
     // not.
-    expect(screen.queryByRole('button', { name: 'Définir un PSK statique' })).toBeNull()
+    expect(screen.queryByLabelText('PSK WireGuard (base64)')).toBeNull()
     fireEvent.click(screen.getByRole('button', { name: 'Avancé' }))
-    expect(screen.queryByRole('button', { name: 'Définir un PSK statique' })).toBeNull()
+    expect(screen.queryByLabelText('PSK WireGuard (base64)')).toBeNull()
 
     // Choosing the mode is what brings the field with it.
-    const modes = within(screen.getByLabelText('Mode'))
+    const modes = within(screen.getByLabelText('Mode de négociation'))
     fireEvent.click(modes.getByRole('button', { name: 'PSK' }))
-    fireEvent.click(screen.getByRole('button', { name: 'Définir un PSK statique' }))
     const field = screen.getByLabelText('PSK WireGuard (base64)') as HTMLInputElement
     expect(field.type).toBe('password')
     fireEvent.change(field, { target: { value: 'cHNrLXNlY3JldA==' } })
@@ -387,7 +386,7 @@ describe('ProfilesView interactions', () => {
     // The field is gone and the secret never stayed in the document.
     await waitFor(() => expect(screen.queryByLabelText('PSK WireGuard (base64)')).toBeNull())
     expect(document.body.innerHTML).not.toContain('cHNrLXNlY3JldA==')
-    expect(screen.getByText('nouveau PSK — à enregistrer')).toBeTruthy()
+    expect(screen.getByText('Nouveau PSK — à enregistrer')).toBeTruthy()
 
     fireEvent.click(screen.getByRole('button', { name: 'Enregistrer' }))
     await waitFor(() => expect(handlers.onSave).toHaveBeenCalledOnce())
@@ -431,14 +430,14 @@ describe('ProfilesView interactions', () => {
     )
     await waitFor(() => expect(api.validateProfile).toHaveBeenCalled())
 
-    const modes = within(screen.getByLabelText('Mode'))
+    const modes = within(screen.getByLabelText('Mode de négociation'))
     expect(modes.getAllByRole('button').map((button) => button.textContent)).toEqual([
       'PSK',
       'ML-KEM',
     ])
     // The floor still shows all three: it is a ratchet, and seeing what one
     // has climbed past is the point.
-    expect(within(screen.getByLabelText('Plancher')).getAllByRole('button')).toHaveLength(3)
+    expect(within(screen.getByLabelText('Plancher anti-downgrade')).getAllByRole('button')).toHaveLength(3)
 
     expect(screen.queryByRole('button', { name: 'Retirer' })).toBeNull()
   })
@@ -488,15 +487,15 @@ describe('ProfilesView interactions', () => {
     await waitFor(() => expect(api.validateProfile).toHaveBeenCalled())
     // Shown with its mode, without opening «Avancé»: the PSK belongs to the
     // negotiation block now.
-    expect(screen.getByText('scellé dans le coffre')).toBeTruthy()
+    expect(screen.getByText('Scellé dans le coffre')).toBeTruthy()
 
     // Scoped to the mode group: the floor row offers the same labels.
-    const modes = within(screen.getByLabelText('Mode'))
+    const modes = within(screen.getByLabelText('Mode de négociation'))
     fireEvent.click(modes.getByRole('button', { name: 'ML-KEM' }))
     // The row goes away with the mode that owned it, rather than lingering as
     // an "aucun" with a sentence about the floor.
-    await waitFor(() => expect(screen.queryByText('scellé dans le coffre')).toBeNull())
-    expect(screen.queryByRole('button', { name: 'Définir un PSK statique' })).toBeNull()
+    await waitFor(() => expect(screen.queryByText('Scellé dans le coffre')).toBeNull())
+    expect(screen.queryByLabelText('PSK WireGuard (base64)')).toBeNull()
 
     fireEvent.click(screen.getByRole('button', { name: 'Enregistrer' }))
     await waitFor(() => expect(handlers.onSave).toHaveBeenCalledOnce())
@@ -882,7 +881,7 @@ describe('ProfilesView interactions', () => {
     // A classic profile with no key: the weakest rung, and the ladder says so
     // without anyone opening a fold.
     expect(pressed('Aucune')).toBe('true')
-    expect(screen.getByText(/premier handshake n’est protégé par rien/)).toBeTruthy()
+    expect(screen.queryByLabelText('PSK WireGuard (base64)')).toBeNull()
 
     // Choosing the rung opens what it is waiting for, rather than a link to it.
     fireEvent.click(screen.getByRole('button', { name: 'PSK statique' }))
@@ -894,9 +893,22 @@ describe('ProfilesView interactions', () => {
     await waitFor(() => expect(api.adoptPresharedKey).toHaveBeenCalledWith('cHNrLXN0YXRpcXVl'))
     expect(document.body.innerHTML).not.toContain('cHNrLXN0YXRpcXVl')
 
+    // Once the key is staged the field gives way to the one line that can be
+    // said about a secret nothing may display.
+    expect(screen.getByText('Nouveau PSK — à enregistrer')).toBeTruthy()
+    expect(screen.queryByLabelText('PSK WireGuard (base64)')).toBeNull()
+
+    // «Remplacer» brings the field back; backing out of it leaves the key
+    // alone, and is not named «Annuler» — the footer already owns that verb
+    // for the whole edit.
+    fireEvent.click(screen.getByRole('button', { name: 'Remplacer' }))
+    expect(screen.getByLabelText('PSK WireGuard (base64)')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Garder le PSK' }))
+    expect(screen.getByText('Nouveau PSK — à enregistrer')).toBeTruthy()
+
     // The rung is not a WireGuard setting: «Avancé» keeps the three that are.
     fireEvent.click(screen.getByRole('button', { name: 'Avancé' }))
-    expect(screen.queryByRole('button', { name: 'Définir un PSK statique' })).toBeNull()
+    expect(screen.queryByLabelText('PSK WireGuard (base64)')).toBeNull()
 
     // A stored profile does not change type. The refusal is said on the
     // segment now, instead of being an alert raised after the save.
@@ -950,7 +962,7 @@ describe('ProfilesView interactions', () => {
       fireEvent.click(segment)
     }
     // Neither click went through: the block is still there, mode included.
-    expect(within(screen.getByLabelText('Mode')).getAllByRole('button')).toHaveLength(2)
+    expect(within(screen.getByLabelText('Mode de négociation')).getAllByRole('button')).toHaveLength(2)
   })
 
   it('loads an associated profile and explains a failed identity seal', async () => {

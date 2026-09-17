@@ -45,7 +45,7 @@ import {
   SPLIT_TUNNEL_PRESETS,
   type SplitTunnelPreset,
 } from '../splitTunnel'
-import { GUTTER } from '../theme'
+import { GUTTER, PINE } from '../theme'
 import type {
   ClientConfig,
   ClientProfile,
@@ -220,16 +220,10 @@ type TunnelProtection = 'none' | 'static_psk' | 'negotiation'
 /** The rungs, weakest first. The order is the ratchet's. */
 const TUNNEL_PROTECTIONS: TunnelProtection[] = ['none', 'static_psk', 'negotiation']
 
-const TUNNEL_PROTECTION_CHOICES: Record<TunnelProtection, { label: string; detail: string }> = {
-  none: { label: 'Aucune', detail: 'Tunnel WireGuard nu : le premier handshake n’est protégé par rien.' },
-  static_psk: {
-    label: 'PSK statique',
-    detail: 'Clé partagée reçue hors bande. Elle protège, elle ne tourne jamais.',
-  },
-  negotiation: {
-    label: 'Négociation Helios',
-    detail: 'Le PSK est négocié avant le tunnel, à chaque connexion (v5).',
-  },
+const TUNNEL_PROTECTION_LABELS: Record<TunnelProtection, string> = {
+  none: 'Aucune',
+  static_psk: 'PSK statique',
+  negotiation: 'Négociation Helios',
 }
 
 /**
@@ -962,9 +956,10 @@ export function ProfilesView({
     if (rung === 'static_psk') {
       setWantsStaticPsk(true)
       setClearPsk(false)
-      // Nothing to state yet, so the rung opens on the one thing it is
-      // waiting for rather than on a link to it.
-      if (!staticPsk) setPastingPsk(true)
+      // The entry field is what the rung shows while there is no key, so
+      // there is nothing to open here.
+      setPastingPsk(false)
+      setPastedPsk('')
       return
     }
     setWantsStaticPsk(false)
@@ -995,37 +990,59 @@ export function ProfilesView({
    * keeping it in the WireGuard block while a mode governs it, is what made
    * the two halves of this screen impossible to tell apart.
    */
+  /**
+   * The static PSK, as the one thing its rung is about.
+   *
+   * Same inbound-only rule as the private key (ADR-006 §5): the value travels
+   * *towards* Rust once, at an explicit gesture, and no path returns one.
+   *
+   * There is no «aucun» state line any more, and no «Définir un PSK
+   * statique» link. On the rung with no key yet there is exactly one thing to
+   * do, so the field to do it with is what the rung shows — a row announcing
+   * an absence above a link that opens the field to fix it was three steps
+   * for one. What the state line is still worth saying is the opposite case:
+   * a key exists, cannot be shown, and the only useful facts about it are
+   * that it is there and what can be done to it.
+   */
+  const pskEntry = !staticPsk || pastingPsk
   const pskField = (
-    <>
-      {/* Same inbound-only rule as the private key (ADR-006 §5). */}
-      <SecretState
-        label="PSK statique"
-        present={staticPsk}
-        error={issues.preshared_key}
-        presentLabel={stagedPsk ? 'nouveau PSK — à enregistrer' : 'scellé dans le coffre'}
-        absentLabel="aucun"
-        action={
-          staticPsk
-            ? {
-                label: 'Retirer le PSK statique',
-                onClick: () => {
-                  setClearPsk(true)
-                  if (stagedPsk) {
-                    setStagedPsk(false)
-                    void api.discardStagedPsk().catch(() => {})
-                  }
-                  setDirty(true)
-                },
-                disabled: clearPsk && !stagedPsk,
+    <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.75 }}>
+      {!pskEntry && (
+        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, flexWrap: 'wrap' }}>
+          <Check size={14} aria-hidden style={{ color: PINE, flexShrink: 0 }} />
+          <Typography sx={{ fontSize: 11.5 }}>
+            {stagedPsk ? 'Nouveau PSK — à enregistrer' : 'Scellé dans le coffre'}
+          </Typography>
+          <Button
+            size="small"
+            variant="text"
+            onClick={() => setPastingPsk(true)}
+            disabled={pskBusy}
+            sx={{ ml: 'auto', fontSize: 11, textTransform: 'none' }}
+          >
+            Remplacer
+          </Button>
+          <Button
+            size="small"
+            variant="text"
+            color="inherit"
+            onClick={() => {
+              setClearPsk(true)
+              if (stagedPsk) {
+                setStagedPsk(false)
+                void api.discardStagedPsk().catch(() => {})
               }
-            : {
-                label: pastingPsk ? 'Annuler' : 'Définir un PSK statique',
-                onClick: () => setPastingPsk((open) => !open),
-                disabled: pskBusy,
-              }
-        }
-      />
-      {pastingPsk && !staticPsk && (
+              setWantsStaticPsk(false)
+              setDirty(true)
+            }}
+            disabled={clearPsk && !stagedPsk}
+            sx={{ fontSize: 11, textTransform: 'none', color: 'text.secondary' }}
+          >
+            Retirer
+          </Button>
+        </Box>
+      )}
+      {pskEntry && (
         <Box sx={{ display: 'flex', gap: 1, alignItems: 'flex-start' }}>
           <TextField
             fullWidth
@@ -1048,9 +1065,32 @@ export function ProfilesView({
           >
             Valider
           </Button>
+          {/* Only while replacing: on a rung with no key there is nothing to
+              go back to, and leaving is done on the bar above. Named after
+              what it abandons, because the footer already has an «Annuler»
+              that abandons the whole edit. */}
+          {staticPsk && (
+            <Button
+              size="small"
+              variant="text"
+              color="inherit"
+              onClick={() => {
+                setPastingPsk(false)
+                setPastedPsk('')
+              }}
+              sx={{ mt: 0.5, fontSize: 11.5, textTransform: 'none', flexShrink: 0, color: 'text.secondary' }}
+            >
+              Garder le PSK
+            </Button>
+          )}
         </Box>
       )}
-    </>
+      {issues.preshared_key && (
+        <Typography color="error" sx={{ fontSize: 10.5, lineHeight: 1.4 }}>
+          {issues.preshared_key}
+        </Typography>
+      )}
+    </Box>
   )
 
   return (
@@ -1558,15 +1598,11 @@ export function ProfilesView({
                   // greyed-out segment cannot say by itself.
                   title={refusal}
                 >
-                  {TUNNEL_PROTECTION_CHOICES[rung].label}
+                  {TUNNEL_PROTECTION_LABELS[rung]}
                 </ToggleButton>
               )
             })}
           </ToggleButtonGroup>
-          <Typography color="text.secondary" sx={{ mt: 0.75, fontSize: 10.5, lineHeight: 1.5 }}>
-            {TUNNEL_PROTECTION_CHOICES[protection].detail}
-          </Typography>
-
           {kindChanged && (
             <Alert severity="error" role="alert" sx={{ mt: 1.5 }}>
               {`Le type enregistré « ${storedKind} » ne peut pas devenir « ${draftKind} » sous le même identifiant. Rétablissez le type initial ou choisissez un nouveau nom.`}
@@ -1763,11 +1799,11 @@ function KeyNegotiation({
   const notNegotiable = settings.mode === 'classic'
 
   return (
-    <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
+    <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5 }}>
       {/* Two modes, not three. `classic` is the absence of this block, and
           the gateway refuses it as a negotiated mode by name. */}
       <ModeChoice
-        label="Mode"
+        label="Mode de négociation"
         modes={NEGOTIABLE_MODES}
         value={settings.mode}
         floor={settings.minimum_mode}
@@ -1786,7 +1822,7 @@ function KeyNegotiation({
       {settings.mode === 'static_psk' && pskField}
 
       <ModeChoice
-        label="Plancher"
+        label="Plancher anti-downgrade"
         modes={PROTECTION_MODES}
         value={settings.minimum_mode}
         floor={floorBaseline ?? 'classic'}
@@ -1848,6 +1884,11 @@ function KeyNegotiation({
  *
  * What is under the floor is disabled rather than absent: a ratchet one
  * cannot see having climbed teaches nothing.
+ *
+ * Title above, segments below, same shape as «Protection du tunnel» and «Que
+ * faire passer par Helios ?». It used to be a 62-pixel uppercase label to the
+ * left of the bar, which read as a third grammar for the same gesture on a
+ * screen that now makes that gesture three times.
  */
 function ModeChoice({
   label,
@@ -1863,22 +1904,13 @@ function ModeChoice({
   value: ProtectionMode
   /** Nothing below this is selectable. */
   floor: ProtectionMode
+  /** One line under the bar, for what the segments cannot say themselves. */
   hint?: string
   onChange: (mode: ProtectionMode) => void
 }) {
-  const group = (
-    <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-      <Typography
-        color="text.disabled"
-        sx={{
-          width: 62,
-          flexShrink: 0,
-          fontFamily: 'monospace',
-          fontSize: 9.5,
-          letterSpacing: '0.08em',
-          textTransform: 'uppercase',
-        }}
-      >
+  return (
+    <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.75 }}>
+      <Typography color="text.secondary" sx={{ fontSize: 11.5, fontWeight: 600 }}>
         {label}
       </Typography>
       <ToggleButtonGroup
@@ -1909,9 +1941,13 @@ function ModeChoice({
           )
         })}
       </ToggleButtonGroup>
+      {hint && (
+        <Typography color="text.disabled" sx={{ fontSize: 10.5, lineHeight: 1.5 }}>
+          {hint}
+        </Typography>
+      )}
     </Box>
   )
-  return hint ? <Tooltip title={hint}>{group}</Tooltip> : group
 }
 
 /**
@@ -2138,89 +2174,3 @@ function ReadOnlyField({ label, value, hint }: { label: string; value: string; h
   return hint ? <Tooltip title={hint}>{field}</Tooltip> : field
 }
 
-/** Secret field: masked by default, revealable without forcing blind entry. */
-/**
- * States that a secret exists, without being able to carry it.
- *
- * # What this replaces, and why
- *
- * A `TextField` holding the WireGuard private key, with a button to reveal it.
- * That single component was the widest hole in ADR-006: the value had to be
- * serialised across the Tauri IPC to be displayed, parsed into a JavaScript
- * string nothing can wipe, and kept in a DOM node's `value` for the life of
- * the screen — where a screenshot, an accessibility client, or anything with
- * access to the WebView could read it. Sealing a key on disk and then showing
- * it in a browser engine protects the quiet half of its life.
- *
- * There is deliberately **no `value` prop**. The component cannot display a
- * secret because it is never given one, which is a stronger guarantee than a
- * component that merely chooses not to. What the user acts on is an *intent* —
- * generate, clear — carried out in Rust.
- */
-function SecretState({
-  label,
-  present,
-  presentLabel,
-  absentLabel,
-  action,
-  error,
-}: {
-  label: string
-  present: boolean
-  /** What to say when the secret is there. Never the secret. */
-  presentLabel: string
-  absentLabel: string
-  action?: { label: string; onClick: () => void; disabled?: boolean }
-  /** Message from the core, `null` if the field is acceptable. */
-  error?: string | null
-}) {
-  return (
-    <Box>
-      <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, minWidth: 0 }}>
-        <Typography
-          color="text.disabled"
-          sx={{
-            width: 110,
-            flexShrink: 0,
-            fontFamily: 'monospace',
-            fontSize: 9.5,
-            letterSpacing: '0.08em',
-            textTransform: 'uppercase',
-          }}
-        >
-          {label}
-        </Typography>
-        <Typography
-          sx={{
-            minWidth: 0,
-            color: error ? 'error.main' : present ? 'text.primary' : 'text.secondary',
-            fontFamily: 'monospace',
-            fontSize: 11.5,
-            overflowWrap: 'anywhere',
-          }}
-        >
-          {present ? presentLabel : absentLabel}
-        </Typography>
-      </Box>
-      {action && (
-        <Button
-          size="small"
-          variant="text"
-          onClick={action.onClick}
-          disabled={action.disabled}
-          sx={{ ml: '118px', mt: 0.25, fontSize: 11, textTransform: 'none' }}
-        >
-          {action.label}
-        </Button>
-      )}
-      {error && (
-        <Typography
-          color="error"
-          sx={{ mt: 0.25, ml: '118px', fontSize: 10.5, lineHeight: 1.4 }}
-        >
-          {error}
-        </Typography>
-      )}
-    </Box>
-  )
-}
