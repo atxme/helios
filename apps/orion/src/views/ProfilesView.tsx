@@ -21,6 +21,8 @@ import {
   AlertTriangle,
   Check,
   ChevronRight,
+  Circle,
+  CircleDot,
   KeyRound,
   FileCode2,
   Plus,
@@ -160,32 +162,40 @@ const NOTICE_MS = 3000
 const MAX_IMPORT_BYTES = 64 * 1024
 
 /**
- * How each split-tunnel choice is named on screen.
+ * How each split-tunnel choice is named on screen, and what it does.
  *
- * Named by what goes through the tunnel, not by the prefix it writes: the
- * prefix is in the field just below, and a button that repeats it is a button
- * that only helps whoever already knew the answer.
+ * Named by what goes through the tunnel, never by the prefixes it writes:
+ * those are in the field just below, and a row that repeated them would only
+ * help whoever already knew the answer. The second line is the exception the
+ * rest of this screen does not make — four exclusive choices with nothing but
+ * a noun each is a list one has to try to read.
  */
-const SPLIT_TUNNEL_LABELS: Record<SplitTunnelPreset, string> = {
-  full: 'Tout le trafic',
-  gateway: 'Helios seul',
-  private: 'Réseaux privés',
-  custom: 'Personnalisé',
+const SPLIT_TUNNEL_CHOICES: Record<SplitTunnelPreset, { label: string; detail: string }> = {
+  full: { label: 'Tout le trafic', detail: 'Internet et réseaux privés' },
+  private: { label: 'Réseaux privés', detail: 'Uniquement les réseaux Helios' },
+  gateway: { label: 'Helios seul', detail: 'Uniquement la passerelle' },
+  custom: { label: 'Personnalisé', detail: 'Choisir les réseaux manuellement' },
 }
 
 /**
- * Same skin as the protection-mode row, but wrapping.
+ * One row of the choice list.
  *
- * Standalone buttons rather than a `ToggleButtonGroup`: this row lives in the
- * narrow column of the form, where four segments welded into one bar would
- * overflow rather than wrap.
+ * A vertical `ToggleButtonGroup` rather than a `RadioGroup`: exclusive choice
+ * is already expressed that way one block below, in the protection modes, and
+ * two grammars for the same gesture on the same screen is one too many. The
+ * radio glyph is there because the rows are wide enough to read as buttons
+ * that could all be pressed at once.
  */
-const SPLIT_TUNNEL_BUTTON = {
+/** The rows, in order. `custom` closes the list: it is the way out of it. */
+const SPLIT_TUNNEL_CHOICES_ORDER: SplitTunnelPreset[] = [...SPLIT_TUNNEL_PRESETS, 'custom']
+
+const SPLIT_TUNNEL_ROW = {
+  justifyContent: 'flex-start',
+  gap: 1,
   px: 1.25,
-  py: 0.4,
-  fontSize: 11.5,
+  py: 0.75,
+  textAlign: 'left',
   textTransform: 'none',
-  borderRadius: 1,
 } as const
 
 /**
@@ -1250,42 +1260,63 @@ export function ProfilesView({
                     >
                       Que faire passer par Helios ?
                     </Typography>
-                    <Box
-                      role="group"
+                    <ToggleButtonGroup
+                      exclusive
+                      orientation="vertical"
+                      size="small"
+                      value={splitTunnel}
                       aria-labelledby="split-tunnel-label"
-                      sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5 }}
+                      onChange={(_event, next: SplitTunnelPreset | null) => {
+                        // `null` is the selected row being pressed again:
+                        // there is no "no choice" here, the field always holds
+                        // one list. `custom` is handled on the row itself,
+                        // because pressing it while it is already selected has
+                        // to keep working — that is when it is most useful.
+                        if (next === null || next === 'custom') return
+                        set('allowed_ips', presetPrefixes(next, draft))
+                      }}
+                      sx={{ '& .MuiToggleButton-root': SPLIT_TUNNEL_ROW }}
                     >
-                      {SPLIT_TUNNEL_PRESETS.map((preset) => {
-                        const prefixes = presetPrefixes(preset, draft)
+                      {SPLIT_TUNNEL_CHOICES_ORDER.map((preset) => {
+                        const choice = SPLIT_TUNNEL_CHOICES[preset]
+                        const selected = splitTunnel === preset
+                        const Glyph = selected ? CircleDot : Circle
                         return (
                           <ToggleButton
                             key={preset}
-                            size="small"
                             value={preset}
-                            selected={splitTunnel === preset}
-                            // The value it would write, before it writes it.
-                            // The rest of the screen prints no captions; this
-                            // one is worth a hover because the button is
-                            // deliberately not named after its prefixes.
-                            title={prefixes}
-                            onChange={() => set('allowed_ips', prefixes)}
-                            sx={SPLIT_TUNNEL_BUTTON}
+                            // The accessible name stays the choice itself: the
+                            // second line explains it, it does not rename it.
+                            aria-label={choice.label}
+                            // The prefixes it would write, before it writes
+                            // them — the one thing the row deliberately does
+                            // not print.
+                            title={preset === 'custom' ? undefined : presetPrefixes(preset, draft)}
+                            // «Personnalisé» writes nothing: it is the
+                            // recognition of a hand-written list, so the only
+                            // useful thing it can do is hand over the caret.
+                            onClick={
+                              preset === 'custom'
+                                ? () => allowedIpsInput.current?.focus()
+                                : undefined
+                            }
                           >
-                            {SPLIT_TUNNEL_LABELS[preset]}
+                            <Glyph size={13} aria-hidden style={{ flexShrink: 0 }} />
+                            <Box sx={{ display: 'flex', flexDirection: 'column', minWidth: 0 }}>
+                              <Typography sx={{ fontSize: 11.5, fontWeight: 600, lineHeight: 1.4 }}>
+                                {choice.label}
+                              </Typography>
+                              <Typography
+                                color="text.secondary"
+                                sx={{ fontSize: 10.5, lineHeight: 1.4 }}
+                              >
+                                {choice.detail}
+                              </Typography>
+                            </Box>
                           </ToggleButton>
                         )
                       })}
-                      <ToggleButton
-                        size="small"
-                        value="custom"
-                        selected={splitTunnel === 'custom'}
-                        title="Saisir la liste des préfixes"
-                        onChange={() => allowedIpsInput.current?.focus()}
-                        sx={SPLIT_TUNNEL_BUTTON}
-                      >
-                        {SPLIT_TUNNEL_LABELS.custom}
-                      </ToggleButton>
-                    </Box>
+                    </ToggleButtonGroup>
                     {/* The example lives in the placeholder, not under the
                         field: it is a value, and a value belongs where the
                         value goes. */}

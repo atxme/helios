@@ -56,11 +56,16 @@ const EVERYTHING = '0.0.0.0/0'
  */
 export type SplitTunnelPreset = 'full' | 'gateway' | 'private' | 'custom'
 
-/** Presets that produce a value, in the order the screen offers them. */
+/**
+ * Presets that produce a value, in the order the screen offers them.
+ *
+ * Widest first: the list reads as a tunnel being closed down, and the default
+ * a new profile carries is the one at the top.
+ */
 export const SPLIT_TUNNEL_PRESETS: Exclude<SplitTunnelPreset, 'custom'>[] = [
   'full',
-  'gateway',
   'private',
+  'gateway',
 ]
 
 /** What the profile needs to carry for a preset to be built from it. */

@@ -798,11 +798,21 @@ describe('ProfilesView interactions', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Tout le trafic' }))
     expect(field().value).toBe('0.0.0.0/0')
 
+    // Each row says what it does, and the caption is not the accessible name:
+    // the four choices are told apart by their label alone.
+    expect(screen.getByText('Internet et réseaux privés')).toBeTruthy()
+    expect(screen.getByText('Uniquement la passerelle')).toBeTruthy()
+
     // Typing still wins: no preset claims a hand-written list.
     fireEvent.change(field(), { target: { value: '192.168.42.0/24' } })
     expect(screen.getByRole('button', { name: 'Personnalisé' }).getAttribute('aria-pressed')).toBe(
       'true',
     )
+    // «Personnalisé» writes nothing — it hands over the caret and leaves the
+    // list exactly as the user typed it.
+    fireEvent.click(screen.getByRole('button', { name: 'Personnalisé' }))
+    expect(field().value).toBe('192.168.42.0/24')
+    expect(document.activeElement).toBe(field())
 
     fireEvent.click(screen.getByRole('button', { name: 'Enregistrer' }))
     await waitFor(() => expect(handlers.onSave).toHaveBeenCalledOnce())
