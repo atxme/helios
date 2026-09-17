@@ -72,9 +72,9 @@ const DOWN_FAIL_CLOSED: &str = "\
 default drop
 mss clamp none
 masquerade []
-input ct state invalid drop
-forward ct state invalid drop
-output ct state invalid drop
+input ct state invalid counter drop
+forward ct state invalid counter drop
+output ct state invalid counter drop
 input iifname \"lo\" accept
 input ct state established,related accept
 forward iifname \"lo\" accept
@@ -113,9 +113,9 @@ const UP_WITHOUT_CLIENT_INTERNET: &str = "\
 default drop
 mss clamp none
 masquerade []
-input ct state invalid drop
-forward ct state invalid drop
-output ct state invalid drop
+input ct state invalid counter drop
+forward ct state invalid counter drop
+output ct state invalid counter drop
 input iifname \"lo\" accept
 input ct state established,related accept
 forward iifname \"lo\" accept
@@ -175,9 +175,9 @@ const UP_EVERY_CAPABILITY_OPEN: &str = "\
 default drop
 mss clamp 1280
 masquerade [enp3s0, wlo1]
-input ct state invalid drop
-forward ct state invalid drop
-output ct state invalid drop
+input ct state invalid counter drop
+forward ct state invalid counter drop
+output ct state invalid counter drop
 input tcp dport 8080 iifname \"helios0\" accept
 input tcp dport 8080 drop
 input iifname \"lo\" accept
@@ -270,9 +270,9 @@ const DOWN_MESHNET_WITHOUT_LISTENERS: &str = "\
 default drop
 mss clamp none
 masquerade []
-input ct state invalid drop
-forward ct state invalid drop
-output ct state invalid drop
+input ct state invalid counter drop
+forward ct state invalid counter drop
+output ct state invalid counter drop
 input iifname \"lo\" accept
 input ct state established,related accept
 forward iifname \"lo\" accept
@@ -314,9 +314,9 @@ const CAPTIVE_PORTAL_KNOWN_GATEWAY: &str = "\
 default drop
 mss clamp none
 masquerade []
-input ct state invalid drop
-forward ct state invalid drop
-output ct state invalid drop
+input ct state invalid counter drop
+forward ct state invalid counter drop
+output ct state invalid counter drop
 input iifname \"lo\" accept
 input ct state established,related accept
 forward iifname \"lo\" accept
@@ -359,9 +359,9 @@ const CAPTIVE_PORTAL_UNKNOWN_GATEWAY_FAIL_OPEN: &str = "\
 default accept
 mss clamp none
 masquerade []
-input ct state invalid drop
-forward ct state invalid drop
-output ct state invalid drop
+input ct state invalid counter drop
+forward ct state invalid counter drop
+output ct state invalid counter drop
 input iifname \"lo\" accept
 input ct state established,related accept
 forward iifname \"lo\" accept

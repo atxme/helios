@@ -62,7 +62,8 @@ mod transport;
 mod tunnel_interface;
 
 pub use nftables::{
-    AddressFamily, ChainKind, ConnectionState, ConnectionStates, Match, Rule, Ruleset, Verdict, L4,
+    Action, AddressFamily, ChainKind, ConnectionState, ConnectionStates, Counter, LogAction, Match,
+    Rule, Ruleset, Verdict, L4,
 };
 
 use aether::{FirewallPolicy, TunnelState, SPEEDTEST_PORT};
@@ -99,6 +100,7 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
                 vec![Match::ConnectionState(ConnectionStates::INVALID)],
                 Verdict::Drop,
             )
+            .with_counter(Counter::Anonymous)
             .with_note("invalid conntrack state: dropped before every opening"),
         );
     }

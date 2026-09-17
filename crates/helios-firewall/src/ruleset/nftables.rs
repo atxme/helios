@@ -85,6 +85,33 @@ pub enum Verdict {
     Drop,
 }
 
+/// Packet/byte counter attached to a rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Counter {
+    /// Counter state lives directly in the rule.
+    Anonymous,
+    /// Counter state lives in a separately named nftables object.
+    ///
+    /// The IR can preserve the operator-facing identity, but the current
+    /// Netlink adapter rejects this variant because `rustables 0.8.7` cannot
+    /// create or reference named counter objects.
+    Named(String),
+}
+
+/// Kernel log statement, independent from the rule verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogAction {
+    pub prefix: String,
+    pub group: Option<u16>,
+}
+
+/// Non-verdict statements evaluated after the matches and before the verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Action {
+    Counter(Counter),
+    Log(LogAction),
+}
+
 /// Netfilter hooked chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChainKind {
@@ -191,6 +218,7 @@ impl fmt::Display for Match {
 pub struct Rule {
     pub chain: ChainKind,
     pub matches: Vec<Match>,
+    pub actions: Vec<Action>,
     pub verdict: Verdict,
     /// Justification, for human reading. No effect on filtering.
     pub note: Option<String>,
@@ -201,6 +229,7 @@ impl Rule {
         Self {
             chain,
             matches,
+            actions: Vec::new(),
             verdict,
             note: None,
         }
@@ -210,12 +239,36 @@ impl Rule {
         self.note = Some(note.into());
         self
     }
+
+    pub(super) fn with_counter(mut self, counter: Counter) -> Self {
+        self.actions.push(Action::Counter(counter));
+        self
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_log(mut self, log: LogAction) -> Self {
+        self.actions.push(Action::Log(log));
+        self
+    }
 }
 
 impl fmt::Display for Rule {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for m in &self.matches {
             write!(f, "{m} ")?;
+        }
+        for action in &self.actions {
+            match action {
+                Action::Counter(Counter::Anonymous) => write!(f, "counter ")?,
+                Action::Counter(Counter::Named(name)) => write!(f, "counter name \"{name}\" ")?,
+                Action::Log(LogAction { prefix, group }) => {
+                    write!(f, "log prefix \"{prefix}\"")?;
+                    if let Some(group) = group {
+                        write!(f, " group {group}")?;
+                    }
+                    write!(f, " ")?;
+                }
+            }
         }
         match self.verdict {
             Verdict::Accept => write!(f, "accept"),
@@ -258,5 +311,37 @@ impl Ruleset {
     /// Rules of a given chain, in order.
     pub fn chain(&self, kind: ChainKind) -> impl Iterator<Item = &Rule> {
         self.rules.iter().filter(move |r| r.chain == kind)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn actions_render_in_evaluation_order_before_the_verdict() {
+        let rule = Rule::new(
+            ChainKind::Input,
+            vec![Match::ConnectionState(ConnectionStates::INVALID)],
+            Verdict::Drop,
+        )
+        .with_counter(Counter::Anonymous)
+        .with_log(LogAction {
+            prefix: "helios invalid: ".into(),
+            group: Some(7),
+        });
+
+        assert_eq!(
+            rule.to_string(),
+            "ct state invalid counter log prefix \"helios invalid: \" group 7 drop"
+        );
+    }
+
+    #[test]
+    fn named_counter_identity_is_preserved_by_the_ir_display() {
+        let rule = Rule::new(ChainKind::Forward, Vec::new(), Verdict::Drop)
+            .with_counter(Counter::Named("drop-kill-switch".into()));
+
+        assert_eq!(rule.to_string(), "counter name \"drop-kill-switch\" drop");
     }
 }

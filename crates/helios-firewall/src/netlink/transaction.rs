@@ -84,6 +84,9 @@ impl NetlinkBackend {
                     for m in &matches {
                         nf = Self::apply_match(nf, m)?;
                     }
+                    for action in &rule.actions {
+                        nf = Self::apply_action(nf, action)?;
+                    }
                     nf = match rule.verdict {
                         Verdict::Accept => nf.accept(),
                         Verdict::Drop => nf.drop(),
@@ -182,7 +185,7 @@ impl FirewallBackend for NetlinkBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ruleset::{AddressFamily, Match, L4};
+    use crate::ruleset::{Action, AddressFamily, Counter, LogAction, Match, L4};
 
     #[test]
     fn table_is_created_before_being_deleted() {
@@ -225,6 +228,7 @@ mod tests {
                         Match::DestNet("100.64.0.1".into()),
                         Match::SourceNet("100.64.0.0/10".into()),
                     ],
+                    actions: Vec::new(),
                     verdict: Verdict::Accept,
                     note: None,
                 },
@@ -240,6 +244,7 @@ mod tests {
                         Match::DestNet("2001:db8::/32".into()),
                         Match::SourceNet("2001:db8::1".into()),
                     ],
+                    actions: Vec::new(),
                     verdict: Verdict::Drop,
                     note: None,
                 },
@@ -249,6 +254,7 @@ mod tests {
                         Match::InIface("helios0".into()),
                         Match::Icmp(AddressFamily::Ipv6),
                     ],
+                    actions: Vec::new(),
                     verdict: Verdict::Accept,
                     note: None,
                 },
@@ -280,6 +286,7 @@ mod tests {
                 rules: vec![crate::ruleset::Rule {
                     chain: ChainKind::Output,
                     matches: vec![malformed],
+                    actions: Vec::new(),
                     verdict: Verdict::Accept,
                     note: None,
                 }],
@@ -309,7 +316,77 @@ mod tests {
                         proto: L4::Udp,
                     },
                 ],
+                actions: Vec::new(),
                 verdict: Verdict::Accept,
+                note: None,
+            }],
+            mss_clamp: None,
+            masquerade_out: Vec::new(),
+        };
+
+        assert!(NetlinkBackend::new().build_batch(&ruleset).is_err());
+    }
+
+    #[test]
+    fn anonymous_counters_and_logs_translate_before_any_side_effect() {
+        let ruleset = Ruleset {
+            default_verdict: Verdict::Drop,
+            rules: vec![crate::ruleset::Rule {
+                chain: ChainKind::Input,
+                matches: vec![Match::ConnectionState(
+                    crate::ruleset::ConnectionStates::INVALID,
+                )],
+                actions: vec![
+                    Action::Counter(Counter::Anonymous),
+                    Action::Log(LogAction {
+                        prefix: "helios invalid: ".into(),
+                        group: None,
+                    }),
+                ],
+                verdict: Verdict::Drop,
+                note: None,
+            }],
+            mss_clamp: None,
+            masquerade_out: Vec::new(),
+        };
+
+        assert!(NetlinkBackend::new().build_batch(&ruleset).is_ok());
+    }
+
+    #[test]
+    fn named_counters_fail_translation_instead_of_becoming_anonymous() {
+        let ruleset = Ruleset {
+            default_verdict: Verdict::Drop,
+            rules: vec![crate::ruleset::Rule {
+                chain: ChainKind::Input,
+                matches: Vec::new(),
+                actions: vec![Action::Counter(Counter::Named("drop-invalid".into()))],
+                verdict: Verdict::Drop,
+                note: None,
+            }],
+            mss_clamp: None,
+            masquerade_out: Vec::new(),
+        };
+
+        let error = match NetlinkBackend::new().build_batch(&ruleset) {
+            Ok(_) => panic!("a named counter must not be downgraded to an anonymous one"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("named counter `drop-invalid`"));
+    }
+
+    #[test]
+    fn invalid_log_prefix_fails_translation() {
+        let ruleset = Ruleset {
+            default_verdict: Verdict::Drop,
+            rules: vec![crate::ruleset::Rule {
+                chain: ChainKind::Input,
+                matches: Vec::new(),
+                actions: vec![Action::Log(LogAction {
+                    prefix: "x".repeat(128),
+                    group: None,
+                })],
+                verdict: Verdict::Drop,
                 note: None,
             }],
             mss_clamp: None,

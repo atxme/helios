@@ -21,6 +21,11 @@ fn invalid_conntrack_is_dropped_before_every_opening() {
             )),
             "{chain:?}: invalid traffic must be dropped before any accept rule"
         );
+        assert_eq!(
+            rules.first().map(|rule| rule.actions.as_slice()),
+            Some([Action::Counter(Counter::Anonymous)].as_slice()),
+            "{chain:?}: invalid drops must remain observable"
+        );
     }
 
     let input = rs.chain(ChainKind::Input).collect::<Vec<_>>();

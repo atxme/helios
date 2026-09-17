@@ -10,12 +10,17 @@ use std::str::FromStr;
 
 use aether::Result;
 use rustables::{
-    expr::{Bitwise, Cmp, CmpOp, ConnTrackState, Conntrack, ConntrackKey, Meta, MetaType},
+    expr::{
+        Bitwise, Cmp, CmpOp, ConnTrackState, Conntrack, ConntrackKey, Counter as NfCounter,
+        Log as NfLog, Meta, MetaType,
+    },
     HookClass, Protocol, Rule as NfRule,
 };
 
 use super::NetlinkBackend;
-use crate::ruleset::{AddressFamily, ChainKind, ConnectionState, ConnectionStates, Match, L4};
+use crate::ruleset::{
+    Action, AddressFamily, ChainKind, ConnectionState, ConnectionStates, Counter, Match, L4,
+};
 
 const IP_PROTOCOL_ICMP: u8 = 1;
 const IP_PROTOCOL_ICMPV6: u8 = 58;
@@ -53,6 +58,21 @@ impl NetlinkBackend {
             Match::PacketMark(mark) => rule
                 .with_expr(Meta::new(MetaType::Mark))
                 .with_expr(Cmp::new(CmpOp::Eq, Self::packet_mark_bytes(*mark))),
+        })
+    }
+
+    /// Applies a non-verdict statement to a rule under construction.
+    pub(super) fn apply_action(rule: NfRule, action: &Action) -> Result<NfRule> {
+        Ok(match action {
+            Action::Counter(Counter::Anonymous) => rule.with_expr(NfCounter::default()),
+            Action::Counter(Counter::Named(name)) => {
+                return Err(Self::err(format!(
+                    "named counter `{name}` is not supported by rustables 0.8.7"
+                )))
+            }
+            Action::Log(log) => {
+                rule.with_expr(NfLog::new(log.group, Some(log.prefix.clone())).map_err(Self::err)?)
+            }
         })
     }
 
