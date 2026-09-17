@@ -295,12 +295,34 @@ export function ProfilesView({
   const fileInput = useRef<HTMLInputElement>(null)
   /** Focus target of «Personnalisé»: the list is typed, not chosen. */
   const allowedIpsInput = useRef<HTMLInputElement>(null)
+  /**
+   * «Personnalisé» was asked for, whatever the list currently says.
+   *
+   * The choice cannot be read back from the value alone. A hand-written
+   * `100.64.0.1/32` is indistinguishable from the one «Helios seul» writes,
+   * and a screen that re-derived the row from the text would close the field
+   * the moment the user typed a list that happens to match a preset —
+   * mid-edit, with the caret in it.
+   */
+  const [manualPrefixes, setManualPrefixes] = useState(false)
+  /**
+   * Bumped by «Personnalisé» so the caret lands in the field.
+   *
+   * The field does not exist while a preset is selected, so it cannot be
+   * focused in the click handler: React has to mount it first.
+   */
+  const [caretRequest, setCaretRequest] = useState(0)
 
   useEffect(() => {
     if (!notice?.transient) return
     const id = setTimeout(() => setNotice(null), NOTICE_MS)
     return () => clearTimeout(id)
   }, [notice])
+
+  useEffect(() => {
+    if (caretRequest === 0) return
+    allowedIpsInput.current?.focus()
+  }, [caretRequest])
 
   // A build fact, not a profile one: asked once.
   useEffect(() => {
@@ -384,6 +406,9 @@ export function ProfilesView({
     // staged key onto the next profile loaded would attach it to an identity
     // the operator never admitted.
     setStagedPublicKey(null)
+    // Same reason: «Personnalisé» is a gesture made on *this* list. The next
+    // profile is read again, and a preset it matches must light up.
+    setManualPrefixes(false)
     setPasting(false)
     setPasted('')
     void api.discardStagedKey().catch(() => {})
@@ -835,10 +860,13 @@ export function ProfilesView({
   // would read as the entry having been refused.
   const staticPsk = (draft.has_static_psk && !clearPsk) || stagedPsk
   const invalid = kindChanged || Object.values(issues).some(Boolean)
-  // Derived from the value, never stored: the field remains the authority, and
+  // Read from the value, except when the user has asked to write it himself:
   // a preset that stayed lit after the list was edited would describe a
-  // profile that no longer exists.
-  const splitTunnel = matchPreset(draft.allowed_ips, draft)
+  // profile that no longer exists, and a list matching no preset is by
+  // definition hand-written whether or not the row was ever clicked.
+  const detectedPreset = matchPreset(draft.allowed_ips, draft)
+  const splitTunnel: SplitTunnelPreset =
+    manualPrefixes || detectedPreset === 'custom' ? 'custom' : detectedPreset
   // The "Advanced" collapse must flag what it hides: otherwise a faulty field
   // would stay invisible until someone thinks to open it. A narrowed range is
   // *not* one of those: split tunnelling is a decision, not a defect.
@@ -1273,6 +1301,7 @@ export function ProfilesView({
                         // because pressing it while it is already selected has
                         // to keep working — that is when it is most useful.
                         if (next === null || next === 'custom') return
+                        setManualPrefixes(false)
                         set('allowed_ips', presetPrefixes(next, draft))
                       }}
                       sx={{ '& .MuiToggleButton-root': SPLIT_TUNNEL_ROW }}
@@ -1292,12 +1321,18 @@ export function ProfilesView({
                             // them — the one thing the row deliberately does
                             // not print.
                             title={preset === 'custom' ? undefined : presetPrefixes(preset, draft)}
-                            // «Personnalisé» writes nothing: it is the
-                            // recognition of a hand-written list, so the only
-                            // useful thing it can do is hand over the caret.
+                            // «Personnalisé» writes nothing: it opens the
+                            // field on the list the preset left behind, which
+                            // is the starting point a narrowed range is edited
+                            // from. Handled on the row rather than on the
+                            // group so that pressing it while it is already
+                            // selected still hands over the caret.
                             onClick={
                               preset === 'custom'
-                                ? () => allowedIpsInput.current?.focus()
+                                ? () => {
+                                    setManualPrefixes(true)
+                                    setCaretRequest((request) => request + 1)
+                                  }
                                 : undefined
                             }
                           >
@@ -1317,17 +1352,55 @@ export function ProfilesView({
                         )
                       })}
                     </ToggleButtonGroup>
-                    {/* The example lives in the placeholder, not under the
+                    {/* A preset owns the list it wrote, so there is no field
+                        to type in — an input accepting text that would flip
+                        the choice above it is the contradiction this row was
+                        added to remove. What stays is the value itself: a
+                        choice named «Réseaux privés» has to be checkable
+                        against the prefixes it stands for.
+
+                        The example lives in the placeholder, not under the
                         field: it is a value, and a value belongs where the
                         value goes. */}
-                    <Field
-                      label="Trafic via le tunnel"
-                      error={issues.allowed_ips}
-                      placeholder="0.0.0.0/0  ·  100.64.0.1/32, 192.168.1.0/24"
-                      value={draft.allowed_ips}
-                      inputRef={allowedIpsInput}
-                      onChange={(value) => set('allowed_ips', value)}
-                    />
+                    {splitTunnel === 'custom' ? (
+                      <Field
+                        label="Trafic via le tunnel"
+                        error={issues.allowed_ips}
+                        placeholder="0.0.0.0/0  ·  100.64.0.1/32, 192.168.1.0/24"
+                        value={draft.allowed_ips}
+                        inputRef={allowedIpsInput}
+                        onChange={(value) => set('allowed_ips', value)}
+                      />
+                    ) : (
+                      <Box>
+                        <Typography
+                          id="split-tunnel-value"
+                          color="text.secondary"
+                          sx={{ fontSize: 10.5 }}
+                        >
+                          Trafic via le tunnel
+                        </Typography>
+                        <Box
+                          sx={{ display: 'flex', alignItems: 'flex-start', gap: 0.5, mt: 0.25 }}
+                        >
+                          <Typography
+                            aria-labelledby="split-tunnel-value"
+                            sx={{
+                              fontFamily: 'monospace',
+                              fontSize: 12,
+                              lineHeight: 1.5,
+                              wordBreak: 'break-all',
+                            }}
+                          >
+                            {draft.allowed_ips}
+                          </Typography>
+                          <CopyButton
+                            value={draft.allowed_ips}
+                            label="le trafic via le tunnel"
+                          />
+                        </Box>
+                      </Box>
+                    )}
                     {/* Only «Réseaux privés» has a cost the user cannot see
                         coming: the three RFC 1918 ranges cover the machine's
                         own LAN as surely as the gateway's. */}

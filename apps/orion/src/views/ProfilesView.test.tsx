@@ -153,6 +153,9 @@ describe('ProfilesView interactions', () => {
     )
 
     fireEvent.click(screen.getByRole('button', { name: 'Avancé' }))
+    // A preset owns the list it wrote: typing one is what «Personnalisé» is
+    // for, and the field does not exist until it is chosen.
+    fireEvent.click(screen.getByRole('button', { name: 'Personnalisé' }))
     fireEvent.change(screen.getByLabelText('Trafic via le tunnel'), {
       target: { value: '100.64.0.0/10' },
     })
@@ -759,10 +762,10 @@ describe('ProfilesView interactions', () => {
   })
 
   /**
-   * The split-tunnel row, on the property that made it worth adding: one
-   * click each way, and the field it writes into stays the authority.
+   * The split-tunnel rows, on the property that made them worth adding: one
+   * click each way, and no field contradicting the row that is lit.
    */
-  it('switches the captured traffic between presets without losing the field', async () => {
+  it('switches the captured traffic between presets and only types under «Personnalisé»', async () => {
     const handlers = callbacks()
     render(
       <ProfilesView
@@ -774,49 +777,82 @@ describe('ProfilesView interactions', () => {
     await waitFor(() => expect(api.validateProfile).toHaveBeenCalled())
     fireEvent.click(screen.getByRole('button', { name: 'Avancé' }))
 
-    const field = () => screen.getByLabelText('Trafic via le tunnel') as HTMLInputElement
-    expect(field().value).toBe('0.0.0.0/0')
-    expect(screen.getByRole('button', { name: 'Tout le trafic' }).getAttribute('aria-pressed')).toBe(
-      'true',
-    )
-
-    // The gateway prefix comes from the profile's internal Helios URL, not
-    // from a constant: this profile answers at 100.64.0.1.
-    fireEvent.click(screen.getByRole('button', { name: 'Helios seul' }))
-    expect(field().value).toBe('100.64.0.1/32')
-    expect(screen.getByRole('button', { name: 'Helios seul' }).getAttribute('aria-pressed')).toBe(
-      'true',
-    )
-    expect(screen.queryByText(/Votre propre réseau local/)).toBeNull()
-
-    fireEvent.click(screen.getByRole('button', { name: 'Réseaux privés' }))
-    expect(field().value).toBe('100.64.0.1/32, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16')
-    // The one cost the user cannot see coming, stated where the choice is made.
-    expect(screen.getByText(/Votre propre réseau local/)).toBeTruthy()
-
-    // And back, in one click.
-    fireEvent.click(screen.getByRole('button', { name: 'Tout le trafic' }))
-    expect(field().value).toBe('0.0.0.0/0')
+    const pressed = (name: string) =>
+      screen.getByRole('button', { name }).getAttribute('aria-pressed')
 
     // Each row says what it does, and the caption is not the accessible name:
     // the four choices are told apart by their label alone.
     expect(screen.getByText('Internet et réseaux privés')).toBeTruthy()
     expect(screen.getByText('Uniquement la passerelle')).toBeTruthy()
 
-    // Typing still wins: no preset claims a hand-written list.
-    fireEvent.change(field(), { target: { value: '192.168.42.0/24' } })
-    expect(screen.getByRole('button', { name: 'Personnalisé' }).getAttribute('aria-pressed')).toBe(
-      'true',
-    )
-    // «Personnalisé» writes nothing — it hands over the caret and leaves the
-    // list exactly as the user typed it.
-    fireEvent.click(screen.getByRole('button', { name: 'Personnalisé' }))
-    expect(field().value).toBe('192.168.42.0/24')
-    expect(document.activeElement).toBe(field())
+    // Under a preset the list is shown, never offered for editing.
+    expect(pressed('Tout le trafic')).toBe('true')
+    expect(screen.queryByRole('textbox', { name: 'Trafic via le tunnel' })).toBeNull()
+    expect(screen.getByText('0.0.0.0/0')).toBeTruthy()
 
+    // The gateway prefix comes from the profile's internal Helios URL, not
+    // from a constant: this profile answers at 100.64.0.1.
+    fireEvent.click(screen.getByRole('button', { name: 'Helios seul' }))
+    expect(pressed('Helios seul')).toBe('true')
+    expect(screen.getByText('100.64.0.1/32')).toBeTruthy()
+    expect(screen.queryByText(/Votre propre réseau local/)).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Réseaux privés' }))
+    expect(
+      screen.getByText('100.64.0.1/32, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16'),
+    ).toBeTruthy()
+    // The one cost the user cannot see coming, stated where the choice is made.
+    expect(screen.getByText(/Votre propre réseau local/)).toBeTruthy()
+
+    // And back, in one click.
+    fireEvent.click(screen.getByRole('button', { name: 'Tout le trafic' }))
+    expect(pressed('Tout le trafic')).toBe('true')
+
+    // «Personnalisé» opens the field on the list the preset left behind, with
+    // the caret already in it.
+    fireEvent.click(screen.getByRole('button', { name: 'Personnalisé' }))
+    const field = screen.getByLabelText('Trafic via le tunnel') as HTMLInputElement
+    expect(field.value).toBe('0.0.0.0/0')
+    expect(pressed('Personnalisé')).toBe('true')
+    await waitFor(() => expect(document.activeElement).toBe(field))
+
+    // And it stays open even on a list a preset would recognise: closing the
+    // field under the caret is what the sticky choice exists to prevent.
+    fireEvent.change(field, { target: { value: '100.64.0.1/32' } })
+    expect(pressed('Personnalisé')).toBe('true')
+    expect(screen.getByRole('textbox', { name: 'Trafic via le tunnel' })).toBeTruthy()
+
+    fireEvent.change(field, { target: { value: '192.168.42.0/24' } })
     fireEvent.click(screen.getByRole('button', { name: 'Enregistrer' }))
     await waitFor(() => expect(handlers.onSave).toHaveBeenCalledOnce())
     expect(handlers.onSave.mock.calls[0][0].allowed_ips).toBe('192.168.42.0/24')
+  })
+
+  /**
+   * An imported profile whose list matches no preset opens on the field, with
+   * no click needed: it was hand-written by whoever produced the document.
+   */
+  it('opens on the field when the stored list matches no preset', async () => {
+    const handlers = callbacks()
+    render(
+      <ProfilesView
+        config={{
+          profiles: [profile({ allowed_ips: '10.9.0.0/16, 192.168.1.0/24' })],
+          selected: 'portable',
+        }}
+        pathImport={null}
+        {...handlers}
+      />,
+    )
+    await waitFor(() => expect(api.validateProfile).toHaveBeenCalled())
+    fireEvent.click(screen.getByRole('button', { name: 'Avancé' }))
+
+    expect(
+      screen.getByRole('button', { name: 'Personnalisé' }).getAttribute('aria-pressed'),
+    ).toBe('true')
+    expect((screen.getByLabelText('Trafic via le tunnel') as HTMLInputElement).value).toBe(
+      '10.9.0.0/16, 192.168.1.0/24',
+    )
   })
 
   it('loads an associated profile and explains a failed identity seal', async () => {
