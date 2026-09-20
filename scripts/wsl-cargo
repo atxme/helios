@@ -68,6 +68,11 @@ fi
 
 mkdir -p "$target_dir"
 echo "==> Cache Cargo WSL : $target_dir ($(format_gib "$before") avant build)"
+# Cargo already serializes parts of a target directory, but this lock also
+# covers the size check and prevents two independent wrappers from compiling
+# concurrently into the one WSL cache.
+exec 9>"$target_dir/.helios-build.lock"
+flock 9
 if CARGO_TARGET_DIR="$target_dir" cargo "$@"; then
     status=0
 else
