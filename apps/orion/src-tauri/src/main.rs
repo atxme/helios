@@ -40,7 +40,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use aether::TunnelState;
+use aether::{SecretString, TunnelState};
 use orion_core::{
     backend::EventSink, complete_profile_import, default_backend, inspect_profile,
     parse_profile_import, read_profile_import_path, telemetry, ClientConfig, ClientEvent,
@@ -209,15 +209,8 @@ struct InFlightRenewal {
 /// leave this process, and it does so as a plain `String` the caller asks for
 /// explicitly (ADR-006 §5).
 struct StagedKey {
-    private_key: String,
+    private_key: SecretString,
     public_key: String,
-}
-
-impl Drop for StagedKey {
-    fn drop(&mut self) {
-        use zeroize::Zeroize as _;
-        self.private_key.zeroize();
-    }
 }
 
 /// A static PSK held between the moment it is typed and the save.
@@ -225,14 +218,7 @@ impl Drop for StagedKey {
 /// Nothing of it is meant to leave this process — not even a public half, for
 /// there is none. The screen learns only that a value is waiting.
 struct StagedPsk {
-    value: String,
-}
-
-impl Drop for StagedPsk {
-    fn drop(&mut self) {
-        use zeroize::Zeroize as _;
-        self.value.zeroize();
-    }
+    value: SecretString,
 }
 
 /// Polling interval for the last WireGuard handshake.
@@ -1476,7 +1462,7 @@ impl ProfileDraft {
             // would produce a profile whose handshakes never succeed, with
             // nothing on either side naming the cause — the gateway admitted a
             // key this profile does not hold. Re-deriving costs microseconds.
-            let derived = aether::wg::public_from_private(&staged.private_key)
+            let derived = aether::wg::public_from_private(staged.private_key.expose())
                 .map_err(|error| format!("clé en attente illisible : {error}"))?;
             if derived != staged.public_key {
                 return Err(
@@ -1485,12 +1471,19 @@ impl ProfileDraft {
                         .into(),
                 );
             }
-            profile.private_key = staged.private_key.clone();
+            // `ClientProfile` is the existing persistence/backend contract and
+            // still owns a plain String. This is the one deliberate copy from
+            // the zeroizing staging buffer; the source remains protected until
+            // the staged value is dropped by the caller.
+            profile.private_key = staged.private_key.expose().to_owned();
         }
         if self.use_staged_psk {
             let staged = staged_psk
                 .ok_or("aucun PSK en attente : saisir le PSK statique avant d'enregistrer")?;
-            profile.preshared_key = Some(staged.value.clone());
+            // Same compatibility boundary as the private key above: the
+            // profile contract requires an owned String, so make the copy
+            // explicit and keep the staged SecretString zeroizing on drop.
+            profile.preshared_key = Some(staged.value.expose().to_owned());
         }
         // After adoption, never before: clearing is what the screen sends when
         // the requested mode no longer tolerates a static PSK, and that verdict
@@ -1681,7 +1674,10 @@ async fn finish_import(
             // profile whose handshakes fail with nothing to explain them.
             (Some(staged), Some(admitted)) if staged.public_key == admitted => {
                 if let Some(staged) = slot.take() {
-                    completed.profile.private_key = staged.private_key.clone();
+                    // The completed import still uses ClientProfile's legacy
+                    // String field; this explicit copy is the compatibility
+                    // boundary. `staged` is dropped immediately afterwards.
+                    completed.profile.private_key = staged.private_key.expose().to_owned();
                     completed.private_key_missing = None;
                 }
             }
@@ -1702,7 +1698,7 @@ async fn finish_import(
             // they meant.
             (Some(_), None) => {
                 if let Some(staged) = slot.take() {
-                    completed.profile.private_key = staged.private_key.clone();
+                    completed.profile.private_key = staged.private_key.expose().to_owned();
                     completed.private_key_missing = None;
                 }
             }
@@ -1794,12 +1790,16 @@ async fn allow_unencrypted_volume(
 async fn generate_private_key(state: State<'_, AppState>) -> Result<String, String> {
     let pair = aether::wg::generate_keypair()
         .map_err(|error| format!("génération de la paire de clés : {error}"))?;
-    let public_key = pair.public_key.clone();
+    let aether::wg::Keypair {
+        private_key,
+        public_key,
+    } = pair;
+    let returned_public_key = public_key.clone();
     *state.staged_key.lock().await = Some(StagedKey {
-        private_key: pair.private_key.expose().to_string(),
-        public_key: public_key.clone(),
+        private_key,
+        public_key,
     });
-    Ok(public_key)
+    Ok(returned_public_key)
 }
 
 /// Adopts a private key the user supplies, and returns its public half.
@@ -1826,14 +1826,19 @@ async fn adopt_private_key(
     state: State<'_, AppState>,
     private_key: String,
 ) -> Result<String, String> {
-    let private_key = private_key.trim().to_string();
-    let public_key = aether::wg::public_from_private(&private_key).map_err(|_| {
+    // Take ownership of the IPC buffer in a zeroizing container immediately.
+    // Normalization necessarily creates a second buffer to preserve the prior
+    // trimmed-storage behavior; the original is then dropped through
+    // SecretString as soon as this binding is replaced.
+    let private_key = SecretString::new(private_key);
+    let normalized = SecretString::new(private_key.expose().trim().to_owned());
+    let public_key = aether::wg::public_from_private(normalized.expose()).map_err(|_| {
         "clé privée invalide : une clé WireGuard est 32 octets encodés en base64 \
          (44 caractères finissant par « = »)"
             .to_string()
     })?;
     *state.staged_key.lock().await = Some(StagedKey {
-        private_key,
+        private_key: normalized,
         public_key: public_key.clone(),
     });
     Ok(public_key)
@@ -1864,8 +1869,9 @@ async fn adopt_preshared_key(
     state: State<'_, AppState>,
     preshared_key: String,
 ) -> Result<(), String> {
-    let value = preshared_key.trim().to_string();
-    aether::wg::validate_key(&value).map_err(|_| {
+    let preshared_key = SecretString::new(preshared_key);
+    let value = SecretString::new(preshared_key.expose().trim().to_owned());
+    aether::wg::validate_key(value.expose()).map_err(|_| {
         "PSK invalide : un PSK WireGuard est 32 octets encodés en base64 \
          (44 caractères finissant par « = »), tel que le produit `wg genpsk`"
             .to_string()
@@ -3297,14 +3303,14 @@ mod security_tests {
     fn only_a_staged_key_becomes_a_profile_key() {
         let pair = aether::wg::generate_keypair().expect("keypair");
         let staged = StagedKey {
-            private_key: pair.private_key.expose().to_string(),
+            private_key: aether::SecretString::new(pair.private_key.expose().to_owned()),
             public_key: pair.public_key.clone(),
         };
 
         let mut adopting = draft("nouveau");
         adopting.use_staged_key = true;
         let created = adopting.merge(None, Some(&staged), None).expect("merge");
-        assert_eq!(created.private_key, staged.private_key);
+        assert_eq!(created.private_key, staged.private_key.expose());
         assert_eq!(
             created.public_key().as_deref(),
             Some(pair.public_key.as_str())
@@ -3346,7 +3352,7 @@ mod security_tests {
 
         // Adopting one: the value waited in Rust, the draft only said "keep it".
         let waiting = StagedPsk {
-            value: "bm91dmVhdS1wc2stc3RhdGlxdWUtaG9ycy1iYW5kZQ==".into(),
+            value: aether::SecretString::new("bm91dmVhdS1wc2stc3RhdGlxdWUtaG9ycy1iYW5kZQ=="),
         };
         let mut adopting = draft("poste");
         adopting.use_staged_psk = true;
@@ -3356,7 +3362,7 @@ mod security_tests {
                 .expect("merge")
                 .preshared_key
                 .as_deref(),
-            Some(waiting.value.as_str())
+            Some(waiting.value.expose())
         );
 
         // Claiming a PSK that was never staged fails rather than silently

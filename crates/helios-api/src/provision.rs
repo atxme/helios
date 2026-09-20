@@ -342,7 +342,7 @@ mod tests {
         be.up(
             &InterfaceConfig {
                 name: "helios0".into(),
-                private_key: KEY_A.into(),
+                private_key: helios_wireguard::Zeroizing::new(KEY_A.into()),
                 listen_port: helios_wireguard::WG_LISTEN_PORT,
                 address: "100.64.0.1/10".into(),
                 mtu: None,

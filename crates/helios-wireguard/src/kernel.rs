@@ -72,7 +72,8 @@ impl KernelBackend {
 
         if let Some(psk) = cfg
             .preshared_key
-            .as_deref()
+            .as_ref()
+            .map(|psk| psk.as_str())
             .filter(|k| !k.trim().is_empty())
         {
             let psk = Key::try_from(psk)
@@ -107,7 +108,10 @@ impl WireguardBackend for KernelBackend {
 
         let interface = InterfaceConfiguration {
             name: config.name.clone(),
-            prvkey: config.private_key.clone(),
+            // `defguard` owns its own copy of the key and gives no borrowing
+            // form, so this duplication is the boundary's, not ours. It lives
+            // as long as `interface`, which does not outlive this call.
+            prvkey: config.private_key.to_string(),
             addresses: vec![address],
             port: config.listen_port,
             peers: wg_peers,
@@ -202,6 +206,7 @@ impl WireguardBackend for KernelBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zeroize::Zeroizing;
 
     const KEY_B: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
 
@@ -229,7 +234,7 @@ mod tests {
         let peer = KernelBackend::build_peer(&PeerConfig {
             public_key: KEY_B.into(),
             allowed_ips: "100.64.1.2/32".into(),
-            preshared_key: Some(KEY_B.into()),
+            preshared_key: Some(Zeroizing::new(KEY_B.into())),
             persistent_keepalive_secs: 25,
         })
         .unwrap();
@@ -241,7 +246,7 @@ mod tests {
         let without_psk = KernelBackend::build_peer(&PeerConfig {
             public_key: KEY_B.into(),
             allowed_ips: "100.64.1.2/32".into(),
-            preshared_key: Some("   ".into()),
+            preshared_key: Some(Zeroizing::new("   ".into())),
             persistent_keepalive_secs: 25,
         })
         .unwrap();
@@ -251,7 +256,7 @@ mod tests {
             KernelBackend::build_peer(&PeerConfig {
                 public_key: KEY_B.into(),
                 allowed_ips: "100.64.1.2/32".into(),
-                preshared_key: Some("not-a-key".into()),
+                preshared_key: Some(Zeroizing::new("not-a-key".into())),
                 persistent_keepalive_secs: 25,
             }),
             Err(WgError::BadKey(message)) if message.contains("post-quantum PSK")

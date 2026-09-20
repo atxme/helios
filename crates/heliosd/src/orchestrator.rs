@@ -32,6 +32,7 @@ use tokio::{
     time,
 };
 use tracing::{info, warn};
+use zeroize::Zeroizing;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// WireGuard UDP listening port (architectural invariant).
@@ -84,7 +85,12 @@ fn wireguard_backend(dry_run: bool, ifname: &str) -> anyhow::Result<Box<dyn Wire
 fn wg_config(network: &NetworkConfig) -> (InterfaceConfig, Vec<PeerConfig>) {
     let iface = InterfaceConfig {
         name: network.wg_iface.clone(),
-        private_key: network.wg_private_key.clone(),
+        // A copy of the gateway identity and of every PSK: the backend trait
+        // takes owned configuration, and the shared `NetworkConfig` cannot be
+        // borrowed across the `await` that applies it. `Zeroizing` is what
+        // bounds these copies — they die with the returned structures, at the
+        // end of the bring-up or of the peer synchronization (ADR-006 §5).
+        private_key: Zeroizing::new(network.wg_private_key.clone()),
         listen_port: network.wg_listen_port,
         address: network.wg_address.clone(),
         mtu: Some(aether::mtu::tunnel_mtu(mtu_transport(
@@ -97,7 +103,7 @@ fn wg_config(network: &NetworkConfig) -> (InterfaceConfig, Vec<PeerConfig>) {
         .map(|p| PeerConfig {
             public_key: p.public_key.clone(),
             allowed_ips: p.address.clone(),
-            preshared_key: p.preshared_key.clone(),
+            preshared_key: p.preshared_key.clone().map(Zeroizing::new),
             persistent_keepalive_secs: p.persistent_keepalive_secs,
         })
         .collect();
@@ -1619,11 +1625,14 @@ mod tests {
         let (iface, peers) = wg_config(&network);
 
         assert_eq!(iface.name, "helios0");
-        assert_eq!(iface.private_key, PRIVATE_KEY);
+        assert_eq!(iface.private_key.as_str(), PRIVATE_KEY);
         assert_eq!(iface.listen_port, WG_LISTEN_PORT);
         assert_eq!(peers.len(), 1);
         assert_eq!(peers[0].allowed_ips, "100.64.1.2/32");
-        assert_eq!(peers[0].preshared_key.as_deref(), Some("psk-test"));
+        assert_eq!(
+            peers[0].preshared_key.as_ref().map(|psk| psk.as_str()),
+            Some("psk-test")
+        );
     }
 
     #[test]
