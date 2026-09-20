@@ -5,10 +5,10 @@
 //! addresses, then SSH on the out-of-band overlay interfaces. ADR-001 §3
 //! quater names them and explains why the last one is scoped by interface.
 
-use aether::FirewallPolicy;
+use aether::{FirewallPolicy, Result};
 
 use super::ChainKind::Input;
-use super::{Match, Rule, Verdict, L4};
+use super::{network, Match, Rule, Verdict, L4};
 
 pub(super) fn admin_api(rules: &mut Vec<Rule>, policy: &FirewallPolicy) {
     // ── Administration: the API must only be reachable through the tunnel ──
@@ -46,13 +46,13 @@ pub(super) fn admin_api(rules: &mut Vec<Rule>, policy: &FirewallPolicy) {
     }
 }
 
-pub(super) fn ssh_sources(rules: &mut Vec<Rule>, policy: &FirewallPolicy) {
+pub(super) fn ssh_sources(rules: &mut Vec<Rule>, policy: &FirewallPolicy) -> Result<()> {
     // ── Administrative SSH, regardless of tunnel state ───────────────────────
     for src in &policy.allow_ssh_from {
         rules.push(Rule::new(
             Input,
             vec![
-                Match::SourceNet(src.clone()),
+                Match::SourceNet(network(src)?),
                 Match::DestPort {
                     port: 22,
                     proto: L4::Tcp,
@@ -61,6 +61,7 @@ pub(super) fn ssh_sources(rules: &mut Vec<Rule>, policy: &FirewallPolicy) {
             Verdict::Accept,
         ));
     }
+    Ok(())
 }
 
 pub(super) fn out_of_band_admin_ifaces(rules: &mut Vec<Rule>, policy: &FirewallPolicy) {

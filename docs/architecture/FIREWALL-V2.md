@@ -13,7 +13,7 @@ aether::FirewallPolicy + TunnelState
                  ↓
 helios_firewall::ruleset::render
                  ↓
-Ruleset { Rule { Match, Action, Verdict }, NAT, MSS }
+Result<Ruleset { Rule { Match, Action, Verdict }, NAT, MSS }>
                  ↓
 DryRunBackend / vue API     NetlinkBackend
                                  ↓
@@ -36,6 +36,8 @@ Les nouveaux concepts structurés sont :
 - `RateLimit`, dont débit et burst sont nécessairement non nuls ;
 - `Counter::Anonymous` et `Counter::Named`, sans conversion silencieuse entre
   les deux.
+- `IpNetwork` dans `SourceNet` et `DestNet` : une adresse invalide est refusée
+  pendant la compilation de la policy et ne peut pas entrer dans l’IR.
 
 ## Cartographie de la policy jusqu’au Netlink
 
@@ -58,7 +60,7 @@ Les nouveaux concepts structurés sont :
 | `wg_iface` | plusieurs modules | `InIface` / `OutIface` | `Meta` + `Cmp` |
 | `admin_port`, `admin_iface` | `administration::admin_api` | accept borné puis drop générique | règles ordonnées dans `input` |
 | `split_tunnel_cidrs` | `kill_switch::state_gated_openings` | `DestNet` | famille réseau + masque + `Cmp` |
-| `mss_clamp` | `render` si trafic autorisé | `Ruleset::mss_clamp` | **refus explicite avant envoi** |
+| `mss_clamp` | policy runtime, acceptée seulement si le backend l’annonce | `Ruleset::mss_clamp` si trafic autorisé | capacité non annoncée par Netlink ; refus défensif avant envoi |
 | `captive_portal_gateway` | `kill_switch::state_gated_openings` | WAN, destination, TCP 80/443 | `Meta`, famille réseau, `Payload`, `Cmp` |
 | `nordvpn_meshnet` | `meshnet::nordvpn_meshnet` | marque, interface, pairs, ports, ICMPv4 | `Meta`, famille réseau, `Payload`, `Cmp` |
 
@@ -94,8 +96,8 @@ verrouillent cet ordre complet.
 | ICMPv4 | **SUPPORTED** | famille explicite, règle tunnel et Meshnet, protocole Netlink 1 |
 | ICMPv6 | **SUPPORTED** | famille explicite, règle tunnel, protocole Netlink 58 ; pas d’IPAM IPv6 ajouté |
 | types ICMP | **PARTIAL** | protocole seulement ; pas encore de primitive de type commune aux deux familles |
-| adresses IPv4/IPv6 | **PARTIAL** | le backend parse et encode les deux familles ; `SourceNet`/`DestNet` restent des chaînes dans l’IR |
-| MSS clamp | **BLOCKED BY BACKEND** | `exthdr`/écriture d’option TCP absents ; la transaction échoue désormais explicitement |
+| adresses IPv4/IPv6 | **SUPPORTED** | `SourceNet`/`DestNet` portent des `IpNetwork` validés ; le backend n’analyse plus de texte |
+| MSS clamp | **BLOCKED BY BACKEND** | `exthdr`/écriture d’option TCP absents ; Netlink n’annonce pas la capacité, donc la sonde conserve la mesure mais ne modifie pas la policy ; une IR construite directement avec un clamp reste refusée avant envoi |
 | anti-spoof `fib` | **BLOCKED BY BACKEND** | expression absente et sémantique de routage à borner avant activation |
 | NAT/masquerade | **SUPPORTED** | comportement existant conservé dans la transaction atomique |
 | remplacement atomique | **SUPPORTED** | `Add → Del → Add`, chaînes filter et NAT, un seul `Batch::send` |
@@ -120,7 +122,15 @@ expressions. Cela ne suffit pas : `ExpressionVariant` est fermé,
 sérialisation Netlink est privé. Une crate consommatrice ne peut donc pas
 ajouter proprement une expression manquante.
 
-Les options techniques, par ordre de proximité avec l’existant, sont :
+État amont vérifié le 20 septembre 2026 : le
+[projet GitLab](https://gitlab.com/rustwall/rustables) reste la source déclarée
+et [`rustables 0.8.8`](https://docs.rs/crate/rustables/0.8.8) a été publié le
+23 juin 2026. Le projet est donc encore publié, avec une cadence faible ; cette
+seule publication ne justifie ni une montée de version ni un fork. L’audit de
+capacités ci-dessus reste celui de la `0.8.7` verrouillée par Helios.
+
+Les options techniques disponibles si un besoin bloquant apparaît sont, par
+ordre de proximité avec l’existant :
 
 1. contribuer ou maintenir un petit fork de `rustables` ajoutant `limit`,
    `fib`, `objref`/objets et `exthdr`, avec tests d’octets et tests noyau ;
@@ -131,6 +141,14 @@ Les options techniques, par ordre de proximité avec l’existant, sont :
 
 La génération de commandes `nft`, le reparsing de texte et l’API JSON pilotée
 par un processus externe ne sont pas des solutions acceptées pour Helios.
+
+Helios ne maintient pas de fork dans ce lot. `fib` reste différé par sa
+sémantique multi-uplink/policy-routing, les compteurs inline couvrent le besoin
+actuel sans `objref`, et le MSS clamp est une optimisation de performance dont
+l’absence n’ouvre pas de faille. Le déclencheur retenu pour réévaluer un fork
+est une exigence de rate limiting, notamment avant d’activer le logging en
+production. À ce moment-là, l’état de maintenance amont de `rustables` devra
+être revérifié avant de choisir entre contribution, fork ou autre backend.
 
 ## Anti-spoofing et routage
 
@@ -225,6 +243,9 @@ et un `nft monitor`, puis vérifier :
 ### Capacités non validables dans ce lot
 
 Le rate limiting, les compteurs nommés, l’anti-spoof `fib` et le MSS clamp ne
-doivent pas être marqués comme validés sur cible : le backend les refuse encore.
-Le logging est encodable, mais aucune policy de production ne l’active avant de
-disposer d’un rate limit qui empêche le log flood.
+doivent pas être marqués comme validés sur cible : le backend ne les annonce
+pas ou les refuse encore. Vérifier en revanche qu’une sonde MTU réussie avec le
+backend Netlink journalise une seule fois l’absence de clamping, laisse
+`mss_clamp` vide et ne coupe pas la connexion. Le logging est encodable, mais
+aucune policy de production ne l’active avant de disposer d’un rate limit qui
+empêche le log flood.

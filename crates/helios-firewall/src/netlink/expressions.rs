@@ -5,10 +5,8 @@
 //! That is why the batch built from them can be validated without a machine
 //! carrying `nf_tables`.
 
-use std::net::IpAddr;
-use std::str::FromStr;
-
 use aether::Result;
+use ipnetwork::IpNetwork;
 use rustables::{
     expr::{
         Bitwise, Cmp, CmpOp, ConnTrackState, Conntrack, ConntrackKey, Counter as NfCounter,
@@ -135,20 +133,18 @@ impl NetlinkBackend {
             .with_expr(Cmp::new(CmpOp::Neq, 0u32.to_be_bytes())))
     }
 
-    /// Applies an address match, accepting either a plain IP or a CIDR.
-    fn match_net(rule: NfRule, addr: &str, source: bool) -> Result<NfRule> {
-        if addr.contains('/') {
-            let net = ipnetwork::IpNetwork::from_str(addr)
-                .map_err(|e| Self::err(format!("invalid CIDR `{addr}`: {e}")))?;
+    /// Applies an already validated address match.
+    fn match_net(rule: NfRule, network: &IpNetwork, source: bool) -> Result<NfRule> {
+        let host_prefix = if network.is_ipv4() { 32 } else { 128 };
+        if network.prefix() != host_prefix {
             let r = if source {
-                rule.snetwork(net)
+                rule.snetwork(*network)
             } else {
-                rule.dnetwork(net)
+                rule.dnetwork(*network)
             };
             r.map_err(Self::err)
         } else {
-            let ip = IpAddr::from_str(addr)
-                .map_err(|e| Self::err(format!("invalid IP `{addr}`: {e}")))?;
+            let ip = network.ip();
             Ok(if source {
                 rule.saddr(ip)
             } else {
@@ -261,13 +257,6 @@ mod tests {
             mask(ConnectionStates::ESTABLISHED_RELATED),
             ConnTrackState::ESTABLISHED.bits() | ConnTrackState::RELATED.bits()
         );
-    }
-
-    #[test]
-    fn address_parsing() {
-        assert!(ipnetwork::IpNetwork::from_str("10.0.0.0/8").is_ok());
-        assert!(IpAddr::from_str("203.0.113.10").is_ok());
-        assert!(ipnetwork::IpNetwork::from_str("not-a-cidr").is_err());
     }
 
     #[test]

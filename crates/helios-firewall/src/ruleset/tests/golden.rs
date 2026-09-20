@@ -18,7 +18,7 @@
 //! the product of its flags; each one is justified where it is defined.
 
 use super::super::*;
-use super::support::policy;
+use super::support::{policy, render};
 use aether::{NordvpnMeshnetPolicy, PolicyMode};
 
 /// Renders the whole ruleset as ordered, comparable text.
@@ -88,7 +88,7 @@ input iifname \"eth0\" udp dport 51820 accept
 output oifname \"eth0\" udp sport 51820 accept
 input iifname \"eth0\" udp dport 51821 accept
 output oifname \"eth0\" udp sport 51821 accept
-output oifname \"eth0\" ip daddr 203.0.113.10 udp dport 51820 accept
+output oifname \"eth0\" ip daddr 203.0.113.10/32 udp dport 51820 accept
 input iifname \"helios0\" tcp dport 51822 accept
 input iifname \"helios0\" udp dport 51822 accept
 ";
@@ -129,7 +129,7 @@ input iifname \"eth0\" udp dport 51820 accept
 output oifname \"eth0\" udp sport 51820 accept
 input iifname \"eth0\" udp dport 51821 accept
 output oifname \"eth0\" udp sport 51821 accept
-output oifname \"eth0\" ip daddr 203.0.113.10 udp dport 51820 accept
+output oifname \"eth0\" ip daddr 203.0.113.10/32 udp dport 51820 accept
 input iifname \"helios0\" tcp dport 51822 accept
 input iifname \"helios0\" udp dport 51822 accept
 forward iifname \"eth1\" oifname \"eth0\" accept
@@ -197,8 +197,8 @@ input iifname \"enp3s0\" udp dport 51821 accept
 output oifname \"enp3s0\" udp sport 51821 accept
 input iifname \"wlo1\" udp dport 51821 accept
 output oifname \"wlo1\" udp sport 51821 accept
-output oifname \"enp3s0\" ip daddr 203.0.113.10 udp dport 51820 accept
-output oifname \"wlo1\" ip daddr 203.0.113.10 udp dport 51820 accept
+output oifname \"enp3s0\" ip daddr 203.0.113.10/32 udp dport 51820 accept
+output oifname \"wlo1\" ip daddr 203.0.113.10/32 udp dport 51820 accept
 output oifname \"enp3s0\" udp dport 67 accept
 input iifname \"enp3s0\" udp dport 68 accept
 output oifname \"wlo1\" udp dport 67 accept
@@ -330,11 +330,11 @@ input iifname \"eth0\" udp dport 51820 accept
 output oifname \"eth0\" udp sport 51820 accept
 input iifname \"eth0\" udp dport 51821 accept
 output oifname \"eth0\" udp sport 51821 accept
-output oifname \"eth0\" ip daddr 203.0.113.10 udp dport 51820 accept
+output oifname \"eth0\" ip daddr 203.0.113.10/32 udp dport 51820 accept
 input iifname \"helios0\" tcp dport 51822 accept
 input iifname \"helios0\" udp dport 51822 accept
-output oifname \"eth0\" ip daddr 192.0.2.1 tcp dport { 80, 443 } accept
-forward oifname \"eth0\" ip daddr 192.0.2.1 tcp dport { 80, 443 } accept
+output oifname \"eth0\" ip daddr 192.0.2.1/32 tcp dport { 80, 443 } accept
+forward oifname \"eth0\" ip daddr 192.0.2.1/32 tcp dport { 80, 443 } accept
 ";
 
 #[test]
@@ -375,7 +375,7 @@ input iifname \"eth0\" udp dport 51820 accept
 output oifname \"eth0\" udp sport 51820 accept
 input iifname \"eth0\" udp dport 51821 accept
 output oifname \"eth0\" udp sport 51821 accept
-output oifname \"eth0\" ip daddr 203.0.113.10 udp dport 51820 accept
+output oifname \"eth0\" ip daddr 203.0.113.10/32 udp dport 51820 accept
 input iifname \"helios0\" tcp dport 51822 accept
 input iifname \"helios0\" udp dport 51822 accept
 output oifname \"eth0\" tcp dport { 80, 443 } accept

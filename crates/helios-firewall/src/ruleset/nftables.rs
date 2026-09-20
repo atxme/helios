@@ -11,6 +11,8 @@
 use std::fmt;
 use std::num::{NonZeroU32, NonZeroU64};
 
+use ipnetwork::IpNetwork;
+
 /// Network-layer family used by family-sensitive matches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AddressFamily {
@@ -201,9 +203,9 @@ pub enum Match {
     /// `<proto> dport { a, b }` — set of ports.
     DestPortSet { ports: Vec<u16>, proto: L4 },
     /// `ip daddr <addr>` — IP or CIDR.
-    DestNet(String),
+    DestNet(IpNetwork),
     /// `ip saddr <addr>` — IP or CIDR.
-    SourceNet(String),
+    SourceNet(IpNetwork),
     /// `meta l4proto icmp` or `meta l4proto ipv6-icmp`.
     ///
     /// # Known limitation: ICMP type is not discriminated
@@ -240,8 +242,16 @@ impl fmt::Display for Match {
                 let list: Vec<String> = ports.iter().map(u16::to_string).collect();
                 write!(f, "{} dport {{ {} }}", proto.as_str(), list.join(", "))
             }
-            Match::DestNet(a) => write!(f, "ip daddr {a}"),
-            Match::SourceNet(a) => write!(f, "ip saddr {a}"),
+            Match::DestNet(network) => write!(
+                f,
+                "{} daddr {network}",
+                if network.is_ipv4() { "ip" } else { "ip6" }
+            ),
+            Match::SourceNet(network) => write!(
+                f,
+                "{} saddr {network}",
+                if network.is_ipv4() { "ip" } else { "ip6" }
+            ),
             Match::Icmp(AddressFamily::Ipv4) => write!(f, "meta l4proto icmp"),
             Match::Icmp(AddressFamily::Ipv6) => write!(f, "meta l4proto ipv6-icmp"),
             Match::PacketMark(mark) => write!(f, "meta mark {mark:#x}"),
@@ -413,5 +423,14 @@ mod tests {
             rule.to_string(),
             "limit rate over 30/minute burst 10 packets drop"
         );
+    }
+
+    #[test]
+    fn network_matches_render_their_typed_address_family() {
+        let ipv4: IpNetwork = "192.0.2.1".parse().unwrap();
+        let ipv6: IpNetwork = "2001:db8::/32".parse().unwrap();
+
+        assert_eq!(Match::SourceNet(ipv4).to_string(), "ip saddr 192.0.2.1/32");
+        assert_eq!(Match::DestNet(ipv6).to_string(), "ip6 daddr 2001:db8::/32");
     }
 }

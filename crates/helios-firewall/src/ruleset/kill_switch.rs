@@ -7,17 +7,17 @@
 //! opens the split-tunnel bypasses, the LAN forward and, on request, the
 //! road-warrior egress.
 
-use aether::{FirewallPolicy, TunnelState};
+use aether::{FirewallPolicy, Result, TunnelState};
 
 use super::ChainKind::{Forward, Output};
-use super::{Match, Rule, Verdict, L4};
+use super::{network, Match, Rule, Verdict, L4};
 
 pub(super) fn state_gated_openings(
     rules: &mut Vec<Rule>,
     policy: &FirewallPolicy,
     state: TunnelState,
     wan_ifaces: &[String],
-) {
+) -> Result<()> {
     if state.captive_portal_active() {
         // Captive portal: the kill-switch is lifted for HTTP/HTTPS only.
         let ports = Match::DestPortSet {
@@ -33,7 +33,7 @@ pub(super) fn state_gated_openings(
                                 chain,
                                 vec![
                                     Match::OutIface(wan.clone()),
-                                    Match::DestNet(gw.clone()),
+                                    Match::DestNet(network(gw)?),
                                     ports.clone(),
                                 ],
                                 Verdict::Accept,
@@ -65,7 +65,7 @@ pub(super) fn state_gated_openings(
         for cidr in &policy.split_tunnel_cidrs {
             rules.push(Rule::new(
                 Forward,
-                vec![Match::DestNet(cidr.clone())],
+                vec![Match::DestNet(network(cidr)?)],
                 Verdict::Accept,
             ));
         }
@@ -102,4 +102,5 @@ pub(super) fn state_gated_openings(
             }
         }
     }
+    Ok(())
 }

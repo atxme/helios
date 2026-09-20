@@ -1,7 +1,7 @@
 //! Tests for the ruleset renderer, grouped by the behavior they protect.
 
 use super::super::*;
-use super::support::{policy, text};
+use super::support::{policy, render, text};
 
 /// The default stays closed: a gateway normally has a fixed address, and
 /// opening DHCP without reason would widen fail-closed for nothing.
@@ -157,7 +157,7 @@ fn meshnet_is_scoped_to_its_mark_interface_peers_and_services() {
             .any(|rule| rule.contains("nordlynx") || rule.contains("0xe1f1")));
         assert!(!rs.rules.iter().any(|rule| {
             rule.matches
-                .contains(&Match::SourceNet("100.70.36.213/32".into()))
+                .contains(&Match::SourceNet("100.70.36.213/32".parse().unwrap()))
         }));
     }
 }

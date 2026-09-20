@@ -5,8 +5,10 @@
 //! are harmless when the bridges do not exist, and the public one carries the
 //! recovery path of ADR-008 §7.5, which must work when the tunnel does not.
 
+use aether::Result;
+
 use super::ChainKind::{Input, Output};
-use super::{Match, Rule, Verdict, L4};
+use super::{network, Match, Rule, Verdict, L4};
 
 /// Fixed, host-visible bridge of the Astra private channel (spec §8.3).
 ///
@@ -35,7 +37,7 @@ const ASTRA_PUBLIC_HOST: &str = "10.88.7.9/32";
 const ASTRA_PUBLIC_PEER: &str = "10.88.7.10/32";
 const ASTRA_ORIGIN_PORT: u16 = 8443;
 
-pub(super) fn lifecycle_and_public_origin(rules: &mut Vec<Rule>) {
+pub(super) fn lifecycle_and_public_origin(rules: &mut Vec<Rule>) -> Result<()> {
     // ── Private Astra ↔ Helios lifecycle channel ───────────────────────────
     // These openings name all four coordinates: interface, source, target and
     // port. They are harmless when the optional bridge does not exist and do
@@ -45,8 +47,8 @@ pub(super) fn lifecycle_and_public_origin(rules: &mut Vec<Rule>) {
             Input,
             vec![
                 Match::InIface(ASTRA_PRIVATE_IFACE.into()),
-                Match::SourceNet(ASTRA_PRIVATE_PEER.into()),
-                Match::DestNet(ASTRA_PRIVATE_HOST.into()),
+                Match::SourceNet(network(ASTRA_PRIVATE_PEER)?),
+                Match::DestNet(network(ASTRA_PRIVATE_HOST)?),
                 Match::DestPort {
                     port: HELIOS_LIFECYCLE_PORT,
                     proto: L4::Tcp,
@@ -61,8 +63,8 @@ pub(super) fn lifecycle_and_public_origin(rules: &mut Vec<Rule>) {
             Output,
             vec![
                 Match::OutIface(ASTRA_PRIVATE_IFACE.into()),
-                Match::SourceNet(ASTRA_PRIVATE_HOST.into()),
-                Match::DestNet(ASTRA_PRIVATE_PEER.into()),
+                Match::SourceNet(network(ASTRA_PRIVATE_HOST)?),
+                Match::DestNet(network(ASTRA_PRIVATE_PEER)?),
                 Match::DestPort {
                     port: ASTRA_LIFECYCLE_PORT,
                     proto: L4::Tcp,
@@ -83,8 +85,8 @@ pub(super) fn lifecycle_and_public_origin(rules: &mut Vec<Rule>) {
             Output,
             vec![
                 Match::OutIface(ASTRA_PUBLIC_IFACE.into()),
-                Match::SourceNet(ASTRA_PUBLIC_HOST.into()),
-                Match::DestNet(ASTRA_PUBLIC_PEER.into()),
+                Match::SourceNet(network(ASTRA_PUBLIC_HOST)?),
+                Match::DestNet(network(ASTRA_PUBLIC_PEER)?),
                 Match::DestPort {
                     port: ASTRA_ORIGIN_PORT,
                     proto: L4::Tcp,
@@ -94,4 +96,5 @@ pub(super) fn lifecycle_and_public_origin(rules: &mut Vec<Rule>) {
         )
         .with_note("Helios client to the public Astra origin, published on loopback"),
     );
+    Ok(())
 }

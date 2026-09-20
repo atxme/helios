@@ -10,7 +10,7 @@ use rustables::{Batch, MsgType, ProtocolFamily, Table};
 use tracing::warn;
 
 use super::{NetlinkBackend, TABLE_NAME};
-use crate::FirewallBackend;
+use crate::{FirewallBackend, FirewallCapabilities};
 
 /// Explicit maintenance backend: no Helios filtering, real kernel networking.
 ///
@@ -61,6 +61,10 @@ impl Default for FirewallDisabledBackend {
 
 #[async_trait]
 impl FirewallBackend for FirewallDisabledBackend {
+    fn capabilities(&self) -> FirewallCapabilities {
+        FirewallCapabilities::default()
+    }
+
     async fn apply(&self, _policy: &FirewallPolicy, _state: TunnelState) -> Result<()> {
         self.remove()
     }

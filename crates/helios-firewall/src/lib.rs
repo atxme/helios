@@ -32,9 +32,21 @@ pub use netlink::{FirewallDisabledBackend, NetlinkBackend};
 use aether::{FirewallPolicy, Result, TunnelState};
 use async_trait::async_trait;
 
+/// Operations a backend can faithfully encode.
+///
+/// Callers use this before accepting runtime policy updates. Translation
+/// still rejects unsupported operations as a defense in depth.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FirewallCapabilities {
+    pub mss_clamp: bool,
+}
+
 /// Backend responsible for concretely enforcing the firewall policy.
 #[async_trait]
 pub trait FirewallBackend: Send + Sync {
+    /// Operations this backend can faithfully encode and apply.
+    fn capabilities(&self) -> FirewallCapabilities;
+
     /// Applies the ruleset matching the tunnel's current state.
     async fn apply(&self, policy: &FirewallPolicy, state: TunnelState) -> Result<()>;
 

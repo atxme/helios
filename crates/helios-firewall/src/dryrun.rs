@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use tracing::info;
 
 use crate::ruleset::{render, ChainKind};
-use crate::FirewallBackend;
+use crate::{FirewallBackend, FirewallCapabilities};
 
 /// Backend that logs the ruleset without touching the kernel.
 ///
@@ -13,8 +13,12 @@ pub struct DryRunBackend;
 
 #[async_trait]
 impl FirewallBackend for DryRunBackend {
+    fn capabilities(&self) -> FirewallCapabilities {
+        FirewallCapabilities { mss_clamp: true }
+    }
+
     async fn apply(&self, policy: &FirewallPolicy, state: TunnelState) -> Result<()> {
-        let rs = render(policy, state);
+        let rs = render(policy, state)?;
         info!(
             "table inet helios (default policy: {:?}) — tunnel state {:?}",
             rs.default_verdict, state

@@ -15,7 +15,7 @@ use tracing::{info, warn};
 
 use super::TABLE_NAME;
 use crate::ruleset::{render, ChainKind, Ruleset, Verdict};
-use crate::FirewallBackend;
+use crate::{FirewallBackend, FirewallCapabilities};
 
 pub struct NetlinkBackend {
     table_name: String,
@@ -136,7 +136,7 @@ impl NetlinkBackend {
     }
 
     fn commit(&self, policy: &FirewallPolicy, state: TunnelState) -> Result<()> {
-        let rs = render(policy, state);
+        let rs = render(policy, state)?;
         let batch = self.build_batch(&rs)?;
         batch.send().map_err(|e| {
             Self::err(format!(
@@ -164,6 +164,10 @@ impl Default for NetlinkBackend {
 
 #[async_trait]
 impl FirewallBackend for NetlinkBackend {
+    fn capabilities(&self) -> FirewallCapabilities {
+        FirewallCapabilities::default()
+    }
+
     async fn apply(&self, policy: &FirewallPolicy, state: TunnelState) -> Result<()> {
         self.commit(policy, state)
     }
@@ -188,6 +192,10 @@ mod tests {
     use crate::ruleset::{
         Action, AddressFamily, Counter, LogAction, Match, RateLimit, RateLimitMode, RateUnit, L4,
     };
+
+    fn network(value: &str) -> ipnetwork::IpNetwork {
+        value.parse().expect("valid test network")
+    }
 
     #[test]
     fn table_is_created_before_being_deleted() {
@@ -227,8 +235,8 @@ mod tests {
                             port: 8080,
                             proto: L4::Tcp,
                         },
-                        Match::DestNet("100.64.0.1".into()),
-                        Match::SourceNet("100.64.0.0/10".into()),
+                        Match::DestNet(network("100.64.0.1")),
+                        Match::SourceNet(network("100.64.0.0/10")),
                     ],
                     actions: Vec::new(),
                     verdict: Verdict::Accept,
@@ -243,8 +251,8 @@ mod tests {
                             ports: vec![53, 51820],
                             proto: L4::Udp,
                         },
-                        Match::DestNet("2001:db8::/32".into()),
-                        Match::SourceNet("2001:db8::1".into()),
+                        Match::DestNet(network("2001:db8::/32")),
+                        Match::SourceNet(network("2001:db8::1")),
                     ],
                     actions: Vec::new(),
                     verdict: Verdict::Drop,
@@ -273,33 +281,6 @@ mod tests {
         assert!(NetlinkBackend::new()
             .build_batch(&accept_by_default)
             .is_ok());
-    }
-
-    #[test]
-    fn malformed_addresses_abort_the_batch_before_it_can_be_sent() {
-        for malformed in [
-            Match::DestNet("not-an-address".into()),
-            Match::DestNet("10.0.0.0/99".into()),
-            Match::SourceNet("still-not-an-address".into()),
-            Match::SourceNet("2001:db8::/999".into()),
-        ] {
-            let ruleset = Ruleset {
-                default_verdict: Verdict::Drop,
-                rules: vec![crate::ruleset::Rule {
-                    chain: ChainKind::Output,
-                    matches: vec![malformed],
-                    actions: Vec::new(),
-                    verdict: Verdict::Accept,
-                    note: None,
-                }],
-                mss_clamp: None,
-                masquerade_out: Vec::new(),
-            };
-            assert!(
-                NetlinkBackend::new().build_batch(&ruleset).is_err(),
-                "an invalid address must cancel translation"
-            );
-        }
     }
 
     #[test]

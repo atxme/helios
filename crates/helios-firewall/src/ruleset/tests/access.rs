@@ -1,7 +1,7 @@
 //! Tests for the ruleset renderer, grouped by the behavior they protect.
 
 use super::super::*;
-use super::support::{policy, text};
+use super::support::{policy, render, text};
 
 #[test]
 fn invalid_conntrack_is_dropped_before_every_opening() {
@@ -55,6 +55,18 @@ fn invalid_conntrack_is_dropped_before_every_opening() {
 
     assert!(invalid < admin_accept);
     assert!(admin_accept < established);
+}
+
+#[test]
+fn invalid_networks_never_enter_the_structured_ir() {
+    for invalid in ["not-an-address", "10.0.0.0/99", "2001:db8::/999"] {
+        let mut p = policy();
+        p.allow_ssh_from = vec![invalid.into()];
+        assert!(
+            super::super::render(&p, TunnelState::Down).is_err(),
+            "invalid network {invalid} must stop ruleset compilation"
+        );
+    }
 }
 
 /// The WireGuard listener is in `input` (traffic towards the gateway),

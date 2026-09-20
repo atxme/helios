@@ -29,6 +29,12 @@ pub(super) fn policy() -> FirewallPolicy {
     }
 }
 
+/// Valid fixtures are expected to compile; individual refusal tests call the
+/// fallible renderer directly.
+pub(super) fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
+    super::super::render(policy, state).expect("valid firewall test policy")
+}
+
 /// Textual rendering of a chain, for readable assertions.
 pub(super) fn text(rs: &Ruleset, kind: ChainKind) -> Vec<String> {
     rs.chain(kind).map(|r| r.to_string()).collect()
