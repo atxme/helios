@@ -57,6 +57,7 @@ ENDPOINT=""
 SERVER_NAME=""
 TRAFIC=""
 LEAF_VALIDITY_SECS=""
+ADMIN=0
 
 usage() {
     cat >&2 <<'EOF'
@@ -78,6 +79,10 @@ Usage : ./scripts/provision-client.sh <nom-client> [hôte-ssh] [options]
                        profil de test du renouvellement (minimum 120 ;
                        défaut 825 jours). L'attente avant que le
                        renouvellement s'ouvre vaut 0,8 × (V + 300) − 300.
+  --admin              Admet le pair comme administrateur de la gateway :
+                       son profil ouvre la console et les routes
+                       d'administration. Sans ce drapeau, le client se
+                       connecte mais n'administre rien.
   --remplacer          (sans effet : un pair du même nom est toujours remplacé)
   --refaire-ca         Régénère la CA opérateur ET la négociation de la
                        gateway. Invalide tous les clients déjà admis.
@@ -97,6 +102,7 @@ while [ $# -gt 0 ]; do
         --mode) MODE="${2:-}"; shift 2 ;;
         --trafic|--allowed-ips) TRAFIC="${2:-}"; shift 2 ;;
         --leaf-validity-secs) LEAF_VALIDITY_SECS="${2:-}"; shift 2 ;;
+        --admin) ADMIN=1; shift ;;
         --remplacer) REMPLACER=1; shift ;;
         --refaire-ca) REFAIRE_CA=1; shift ;;
         --sortie) SORTIE="${2:-}"; shift 2 ;;
@@ -189,6 +195,9 @@ CTL=(cargo run --quiet -p helios-ctl --)
 
 ARG_TRAFIC=()
 [ -n "$TRAFIC" ] && ARG_TRAFIC=(--allowed-ips "$TRAFIC")
+# Interpolé dans le script distant, donc un simple mot et pas un tableau.
+ARG_ADMIN=""
+[ "$ADMIN" = 1 ] && ARG_ADMIN="--admin"
 ARG_LEAF_VALIDITY=()
 if [ -n "$LEAF_VALIDITY_SECS" ]; then
     case "$LEAF_VALIDITY_SECS" in
@@ -396,7 +405,7 @@ echo "-- peer add"
     --key-negotiation-pq-certificate-sha256 '$FP_PQ' \
     --certificate /tmp/helios-client-cert-$$.der \
     --pq-certificate /tmp/helios-client-pq-cert-$$.json \
-    --minimum-mode '$MODE' \
+    --minimum-mode '$MODE' $ARG_ADMIN \
     | awk -F'\t' -v n='$CLIENT' '\$1 == n { print \$2 }' > "\$DEPOT/peer.txt"
 rm -f /tmp/helios-client-cert-$$.der /tmp/helios-client-pq-cert-$$.json
 

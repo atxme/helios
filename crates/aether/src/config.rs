@@ -1397,8 +1397,8 @@ mod tests {
             wg_address: "100.64.0.1/10".into(),
             ..NetworkConfig::default()
         };
-        assert_eq!(cfg.speedtest_bind(), "100.64.0.1:51822");
-        assert_eq!(NetworkConfig::default().speedtest_bind(), "127.0.0.1:51822");
+        assert_eq!(cfg.speedtest_bind(), "100.64.0.1:55182");
+        assert_eq!(NetworkConfig::default().speedtest_bind(), "127.0.0.1:55182");
     }
 
     /// Without a configured gateway, no reason to expose the API: loopback.

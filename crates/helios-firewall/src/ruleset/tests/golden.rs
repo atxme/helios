@@ -86,8 +86,8 @@ output oifname \"eth0\" udp sport 51820 accept
 input iifname \"eth0\" udp dport 51821 accept
 output oifname \"eth0\" udp sport 51821 accept
 output oifname \"eth0\" ip daddr 203.0.113.10 udp dport 51820 accept
-input iifname \"helios0\" tcp dport 51822 accept
-input iifname \"helios0\" udp dport 51822 accept
+input iifname \"helios0\" tcp dport 55182 accept
+input iifname \"helios0\" udp dport 55182 accept
 ";
 
 #[test]
@@ -124,8 +124,8 @@ output oifname \"eth0\" udp sport 51820 accept
 input iifname \"eth0\" udp dport 51821 accept
 output oifname \"eth0\" udp sport 51821 accept
 output oifname \"eth0\" ip daddr 203.0.113.10 udp dport 51820 accept
-input iifname \"helios0\" tcp dport 51822 accept
-input iifname \"helios0\" udp dport 51822 accept
+input iifname \"helios0\" tcp dport 55182 accept
+input iifname \"helios0\" udp dport 55182 accept
 forward iifname \"eth1\" oifname \"eth0\" accept
 ";
 
@@ -202,8 +202,8 @@ output oifname \"wlo1\" tcp dport { 53, 80, 443 } accept
 output oifname \"wlo1\" udp dport 123 accept
 input iifname \"helios0\" meta l4proto icmp accept
 input iifname \"helios0\" tcp dport 22 accept
-input iifname \"helios0\" tcp dport 51822 accept
-input iifname \"helios0\" udp dport 51822 accept
+input iifname \"helios0\" tcp dport 55182 accept
+input iifname \"helios0\" udp dport 55182 accept
 input iifname \"helios0\" tcp dport 5201 accept
 output oifname \"helios0\" tcp dport 5201 accept
 input iifname \"helios0\" udp dport 5201 accept
@@ -315,8 +315,8 @@ output oifname \"eth0\" udp sport 51820 accept
 input iifname \"eth0\" udp dport 51821 accept
 output oifname \"eth0\" udp sport 51821 accept
 output oifname \"eth0\" ip daddr 203.0.113.10 udp dport 51820 accept
-input iifname \"helios0\" tcp dport 51822 accept
-input iifname \"helios0\" udp dport 51822 accept
+input iifname \"helios0\" tcp dport 55182 accept
+input iifname \"helios0\" udp dport 55182 accept
 output oifname \"eth0\" ip daddr 192.0.2.1 tcp dport { 80, 443 } accept
 forward oifname \"eth0\" ip daddr 192.0.2.1 tcp dport { 80, 443 } accept
 ";
@@ -357,8 +357,8 @@ output oifname \"eth0\" udp sport 51820 accept
 input iifname \"eth0\" udp dport 51821 accept
 output oifname \"eth0\" udp sport 51821 accept
 output oifname \"eth0\" ip daddr 203.0.113.10 udp dport 51820 accept
-input iifname \"helios0\" tcp dport 51822 accept
-input iifname \"helios0\" udp dport 51822 accept
+input iifname \"helios0\" tcp dport 55182 accept
+input iifname \"helios0\" udp dport 55182 accept
 output oifname \"eth0\" tcp dport { 80, 443 } accept
 forward oifname \"eth0\" tcp dport { 80, 443 } accept
 ";
