@@ -95,6 +95,21 @@ pub struct TrustMaterial {
     pub client_tls_ca_der: String,
     /// Generation this client's current identity is at.
     pub client_generation: u64,
+    /// Epoch of the gateway leaf the domain serves, and the highest decision
+    /// this profile is told about. Both are `1` on a fresh domain (§13.1).
+    ///
+    /// They are seeded from here and from nowhere else: an identity transition
+    /// only moves a store from the decision it already holds to the next one,
+    /// so a store seeded at `0` against a registry at `1` stays behind for
+    /// good, and the gateway answers `503` to every trust update it sends.
+    ///
+    /// `default` for the shape alone — a block emitted before these fields
+    /// existed decodes, and [`Self::validate`] then refuses it by name rather
+    /// than sealing a profile that cannot ever update its trust.
+    #[serde(default)]
+    pub active_gateway_identity_epoch: u64,
+    #[serde(default)]
+    pub gateway_decision_epoch: u64,
     pub astra_authority_url: String,
     /// RP ID of the operator WebAuthn ceremony. It is stable across a TLS
     /// certificate rotation of Astra and is never inferred from a relay URL.
@@ -182,6 +197,17 @@ impl TrustMaterial {
             || self.credential_registry_epoch == 0
         {
             anyhow::bail!("les compteurs d'autorité commencent à 1");
+        }
+        // Named apart from the counters above because the remedy is different.
+        // A block printed before these two fields existed carries them as
+        // zero, and the profile made from it is refused a trust update for
+        // good — a 503 on every poll, which no renewal repairs. What fixes it
+        // is reprinting the block, so the message says exactly that.
+        if self.active_gateway_identity_epoch == 0 || self.gateway_decision_epoch == 0 {
+            anyhow::bail!(
+                "bloc de confiance trop ancien : il ne porte pas les époques d'identité de la \
+                 gateway. Le réimprimer avec `heliosd show-trust-enrolment --public-key <clé>`"
+            );
         }
         Ok(())
     }
@@ -968,6 +994,44 @@ mod tests {
                 NOW,
             )
             .expect("a gateway without a trust domain is verified by its own key");
+        }
+    }
+
+    /// The trust block's own refusals. Gated with the fixture it needs: a
+    /// block that validates carries a real CA-TLS and two real ML-DSA-87 keys.
+    #[cfg(feature = "certificate-signing")]
+    mod trust_material_validation {
+        use crate::test_domain::{domain, settings};
+
+        /// A block printed before the gateway identity epochs existed decodes
+        /// to zero, and zero is not a state any domain is ever in (§13.1).
+        ///
+        /// Refused here rather than seeded: a store at epoch 0 against a
+        /// registry at 1 is behind on the trust-update comparison forever, so
+        /// the gateway answers `503` to every poll and no renewal repairs it.
+        /// The operator is holding the gateway when this runs; the message
+        /// names the command that reprints the block.
+        #[test]
+        fn a_block_without_the_gateway_identity_epochs_is_refused_by_name() {
+            let domain = domain();
+            let material = settings(&domain).trust.expect("trust block");
+            material.validate().expect("the fixture's block is usable");
+
+            for spoil in [
+                |m: &mut crate::config::TrustMaterial| m.active_gateway_identity_epoch = 0,
+                |m: &mut crate::config::TrustMaterial| m.gateway_decision_epoch = 0,
+            ] {
+                let mut stale = material.clone();
+                spoil(&mut stale);
+                let error = stale
+                    .validate()
+                    .expect_err("a zero gateway epoch is not a domain state");
+                let message = format!("{error}");
+                assert!(
+                    message.contains("show-trust-enrolment"),
+                    "the message must name the command that repairs it: {message}"
+                );
+            }
         }
     }
 

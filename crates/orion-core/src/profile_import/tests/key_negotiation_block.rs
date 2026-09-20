@@ -62,6 +62,8 @@ fn a_genuine_trust_block_reaches_the_profile() {
             "credential_registry_epoch": 1,
             "astra_service_key_epoch": 1,
             "astra_service_public_key": astra.to_base64(),
+            "active_gateway_identity_epoch": 1,
+            "gateway_decision_epoch": 1,
         }),
     );
     let imported = parse_profile_import(&document_with(settings), "portable.orion")
@@ -73,6 +75,8 @@ fn a_genuine_trust_block_reaches_the_profile() {
         .expect("the trust material reaches the profile");
     assert_eq!(trust.ca_epoch, 2);
     assert_eq!(trust.client_generation, 4);
+    assert_eq!(trust.active_gateway_identity_epoch, 1);
+    assert_eq!(trust.gateway_decision_epoch, 1);
     assert!(trust.trust_domain().is_ok());
     assert!(trust.ca_pq().is_ok());
     assert!(trust.client_tls_ca().is_ok());
@@ -139,4 +143,47 @@ fn a_certificate_pinned_to_another_gateway_is_refused() {
     document["profile"]["peer_public_key"] = serde_json::Value::String(CLIENT_PRIVATE.to_string());
 
     assert!(parse_profile_import(&document.to_string(), "portable.json").is_err());
+}
+
+/// A document written before the gateway identity epochs existed is refused
+/// here, where the operator can reprint the block.
+///
+/// Importing it would seed a store at epoch 0 against a registry that starts
+/// at 1, and every trust update this profile ever sent would come back as a
+/// `503` that no renewal repairs — discovered on the user's machine, months
+/// later, as a refusal nobody can explain.
+#[test]
+fn a_trust_block_without_the_gateway_identity_epochs_is_refused_at_import() {
+    use aether::certificates::encoding::generate_ml_dsa_87_keypair;
+    use base64::engine::general_purpose::STANDARD;
+
+    let (_, ca_pq) = generate_ml_dsa_87_keypair().unwrap();
+    let (_, astra) = generate_ml_dsa_87_keypair().unwrap();
+    let ca_tls = aether::certificates::test_x509::certificate_authority("CA-TLS");
+
+    let mut settings = serde_json::to_value(gateway_settings(ProtectionMode::MlKem)).unwrap();
+    settings.as_object_mut().unwrap().insert(
+        "trust".into(),
+        serde_json::json!({
+            "trust_domain_id": "0102030405060708090a0b0c0d0e0f10",
+            "ca_epoch": 2,
+            "ca_pq_public_key": ca_pq.to_base64(),
+            "ca_tls_epoch": 1,
+            "client_tls_ca_der": STANDARD.encode(ca_tls.as_bytes()),
+            "client_generation": 4,
+            "astra_authority_url": "https://astra.example",
+            "webauthn_rp_id": "astra.example",
+            "astra_policy_fingerprint": "1111111111111111111111111111111111111111111111111111111111111111",
+            "credential_registry_epoch": 1,
+            "astra_service_key_epoch": 1,
+            "astra_service_public_key": astra.to_base64(),
+        }),
+    );
+    let error = parse_profile_import(&document_with(settings), "portable.orion")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("matériel de confiance"),
+        "the import names the trust block: {error}"
+    );
 }

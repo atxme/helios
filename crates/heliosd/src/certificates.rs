@@ -1117,6 +1117,8 @@ pub fn enrolment_view(
                 .as_bytes(),
         ),
         client_generation: peer.state.active.generation,
+        active_gateway_identity_epoch: state.gateway.active_gateway_identity_epoch,
+        gateway_decision_epoch: state.gateway.gateway_decision_epoch,
         astra_authority_url: state.astra.authority_url.clone(),
         webauthn_rp_id: state.astra.webauthn_rp_id.clone(),
         astra_policy_fingerprint: state.astra.astra_policy_fingerprint.fingerprint().to_hex(),
@@ -2136,6 +2138,14 @@ mod tests {
         assert_eq!(view.ca_tls_epoch, state.client_tls_ca.ca_tls_epoch);
         assert_eq!(view.client_generation, peer.state.active.generation);
         assert_eq!(
+            view.active_gateway_identity_epoch,
+            state.gateway.active_gateway_identity_epoch
+        );
+        assert_eq!(
+            view.gateway_decision_epoch,
+            state.gateway.gateway_decision_epoch
+        );
+        assert_eq!(
             view.astra_service_public_key,
             state.astra.active_astra_service_public_key.to_base64()
         );
@@ -2155,6 +2165,38 @@ mod tests {
         let state = state();
         let peer = peer();
         assert!(caller_is_current(&state, &peer, &request(&state, &peer)).expect("comparison"));
+    }
+
+    /// A client that has just been enrolled is **not** behind.
+    ///
+    /// The comparison reads eleven values; the enrolment block is where a
+    /// fresh client learns the ones it cannot derive from its own
+    /// certificates. A value missing from the block is seeded as zero, which
+    /// no registry is ever at, and the caller is then behind on a counter that
+    /// no transition can advance — the gateway answers `503` to every poll for
+    /// the life of the profile. So the block is compared to the request here,
+    /// field by field, rather than each half being trusted on its own.
+    #[test]
+    fn a_caller_seeded_from_the_enrolment_block_is_current() {
+        let state = state();
+        let peer = peer();
+        let view = enrolment_view(&state, &peer);
+
+        // Exactly what `orion_core::certificate_renewal` seeds from the block
+        // and then declares. The rest of the request is the local material:
+        // the certificates the client holds, and its own base state.
+        let mut request = request(&state, &peer);
+        request.ca_epoch = view.ca_epoch;
+        request.ca_tls_epoch = view.ca_tls_epoch;
+        request.astra_service_key_epoch = view.astra_service_key_epoch;
+        request.client_identity_generation = view.client_generation;
+        request.active_gateway_identity_epoch = view.active_gateway_identity_epoch;
+        request.gateway_decision_epoch = view.gateway_decision_epoch;
+
+        assert!(
+            caller_is_current(&state, &peer, &request).expect("comparison"),
+            "a profile enrolled from this block must not be born behind"
+        );
     }
 
     /// Every counter and every active fingerprint is compared. A gap in this

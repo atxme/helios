@@ -386,6 +386,8 @@ mod tests {
             astra_credential_bindings: Vec::new(),
             astra_service_key_epoch: 2,
             astra_service_public_key: String::new(),
+            active_gateway_identity_epoch: 1,
+            gateway_decision_epoch: 1,
         });
 
         let found = inventory(Some(&settings), 1_000);

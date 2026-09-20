@@ -4021,6 +4021,8 @@ mod tests {
                         astra_service_key_epoch: 1,
                         astra_service_public_key: base64::engine::general_purpose::STANDARD
                             .encode(&ca_public),
+                        active_gateway_identity_epoch: 1,
+                        gateway_decision_epoch: 1,
                     }),
                 },
             }),

@@ -248,3 +248,30 @@ fn a_profile_without_trust_material_is_named() {
         Err(RenewalError::TrustMaterialMissing)
     ));
 }
+
+/// The gateway identity epochs are read from the enrolment block.
+///
+/// They cannot be learned any other way. An identity transition only moves a
+/// store from the decision it already holds to the next one, so a store seeded
+/// at `0` against a registry that starts at `1` (§13.1) is behind on the
+/// trust-update comparison for the life of the profile, and the gateway
+/// answers `503` to every poll it makes. The values here are deliberately not
+/// `1`: a seed that read a constant would pass against the fixture's own.
+#[test]
+fn the_gateway_identity_epochs_come_from_the_enrolment_block() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let domain = domain();
+    let mut settings = settings(&domain);
+    let bundle = bundle(&domain);
+    {
+        let trust = settings.trust.as_mut().expect("trust block");
+        trust.active_gateway_identity_epoch = 3;
+        trust.gateway_decision_epoch = 4;
+    }
+    let path = directory.path().join("trust.json");
+
+    let store = open_or_seed(&path, &settings, &bundle).expect("seeded");
+    let gateway = &store.state().gateway;
+    assert_eq!(gateway.active_gateway_identity_epoch, 3);
+    assert_eq!(gateway.gateway_decision_epoch, 4);
+}
