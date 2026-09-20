@@ -5,10 +5,10 @@
 //! uplink: a gateway with a cable and a radio must keep answering when one of
 //! them goes away.
 
-use aether::FirewallPolicy;
+use aether::{FirewallPolicy, Result};
 
 use super::ChainKind::{Input, Output};
-use super::{Match, Rule, Verdict, L4};
+use super::{network, Match, Rule, Verdict, L4};
 
 pub(super) fn wireguard_listener(
     rules: &mut Vec<Rule>,
@@ -105,7 +105,7 @@ pub(super) fn site_to_site_peers(
     rules: &mut Vec<Rule>,
     policy: &FirewallPolicy,
     wan_ifaces: &[String],
-) {
+) -> Result<()> {
     // ── Outbound WireGuard transport to static peers (site-to-site) ─────────
     // Scoped by destination: opening 51820 outbound without restricting the
     // destination would be a leak.
@@ -115,7 +115,7 @@ pub(super) fn site_to_site_peers(
                 Output,
                 vec![
                     Match::OutIface(wan.clone()),
-                    Match::DestNet(peer.clone()),
+                    Match::DestNet(network(peer)?),
                     Match::DestPort {
                         port: 51820,
                         proto: L4::Udp,
@@ -125,4 +125,5 @@ pub(super) fn site_to_site_peers(
             ));
         }
     }
+    Ok(())
 }

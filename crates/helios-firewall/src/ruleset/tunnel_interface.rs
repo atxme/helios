@@ -8,7 +8,7 @@
 use aether::FirewallPolicy;
 
 use super::ChainKind::{Input, Output};
-use super::{Match, Rule, Verdict, L4, SPEEDTEST_PORT};
+use super::{AddressFamily, Match, Rule, Verdict, L4, SPEEDTEST_PORT};
 
 pub(super) fn openings(rules: &mut Vec<Rule>, policy: &FirewallPolicy) {
     // ── ICMP and SSH on the tunnel interface ─────────────────────────────────
@@ -21,17 +21,19 @@ pub(super) fn openings(rules: &mut Vec<Rule>, policy: &FirewallPolicy) {
     // `allow_ssh_from`.
     if !policy.wg_iface.is_empty() {
         if policy.allow_tunnel_icmp {
-            rules.push(
-                Rule::new(
-                    Input,
-                    vec![Match::InIface(policy.wg_iface.clone()), Match::Icmp],
-                    Verdict::Accept,
-                )
-                .with_note(
-                    "ICMP on the tunnel: `ping` is the first test anyone runs, and under a \
-                     drop policy it fails identically whether the tunnel works or not",
-                ),
-            );
+            for family in [AddressFamily::Ipv4, AddressFamily::Ipv6] {
+                rules.push(
+                    Rule::new(
+                        Input,
+                        vec![Match::InIface(policy.wg_iface.clone()), Match::Icmp(family)],
+                        Verdict::Accept,
+                    )
+                    .with_note(
+                        "ICMP on the tunnel: `ping` is the first test anyone runs, and under a \
+                         drop policy it fails identically whether the tunnel works or not",
+                    ),
+                );
+            }
         }
         if policy.allow_ssh_over_tunnel {
             rules.push(

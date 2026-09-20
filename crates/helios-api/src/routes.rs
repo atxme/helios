@@ -688,10 +688,13 @@ pub async fn tunnel_stop(State(s): State<AppState>) -> Json<CmdResponse> {
     })
 }
 
-pub async fn firewall_rules_get(State(s): State<AppState>) -> Json<FirewallRulesResponse> {
+pub async fn firewall_rules_get(
+    State(s): State<AppState>,
+) -> Result<Json<FirewallRulesResponse>, (StatusCode, String)> {
     let state = *s.tunnel_state.read().await;
     let policy = s.policy.read().await;
-    let rs = ruleset::render(&policy, state);
+    let rs = ruleset::render(&policy, state)
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
 
     let verdict_str = match rs.default_verdict {
         ruleset::Verdict::Drop => "drop",
@@ -736,11 +739,11 @@ pub async fn firewall_rules_get(State(s): State<AppState>) -> Json<FirewallRules
     }
     lines.push("}".to_string());
 
-    Json(FirewallRulesResponse {
+    Ok(Json(FirewallRulesResponse {
         rules: lines.join("\n"),
         default_verdict: verdict_str.to_string(),
         dry_run: s.dry_run,
-    })
+    }))
 }
 
 pub async fn firewall_rules_apply(
@@ -1077,7 +1080,7 @@ mod tests {
     async fn firewall_rendering_stays_fail_closed_outside_an_active_tunnel() {
         let (app, _cmd_rx) = app_state(TunnelState::Down);
 
-        let response = firewall_rules_get(State(app)).await.0;
+        let response = firewall_rules_get(State(app)).await.unwrap().0;
 
         assert_eq!(response.default_verdict, "drop");
         assert!(response.rules.contains("udp dport 51820 accept"));

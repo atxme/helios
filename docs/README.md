@@ -17,6 +17,8 @@ foi en cas de doute (voir [AGENTS.md](../AGENTS.md)).
   flux principaux.
 - [Architecture opérationnelle](ARCHITECTURE.md) — démarrage de la gateway,
   états WireGuard, kill-switch, API, secrets et validation.
+- [Firewall v2](architecture/FIREWALL-V2.md) — audit Policy/IR/Netlink,
+  capacités, limites backend et recette de validation cible.
 
 ## Développement
 

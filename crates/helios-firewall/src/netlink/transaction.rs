@@ -15,7 +15,7 @@ use tracing::{info, warn};
 
 use super::TABLE_NAME;
 use crate::ruleset::{render, ChainKind, Ruleset, Verdict};
-use crate::FirewallBackend;
+use crate::{FirewallBackend, FirewallCapabilities};
 
 pub struct NetlinkBackend {
     table_name: String,
@@ -46,6 +46,12 @@ impl NetlinkBackend {
     /// having sent anything to the kernel — the previous policy stays in
     /// place, which is the expected fail-closed behavior.
     fn build_batch(&self, rs: &Ruleset) -> Result<Batch> {
+        if let Some(mss) = rs.mss_clamp {
+            return Err(Self::err(format!(
+                "MSS clamp {mss} cannot be encoded by rustables 0.8.7; transaction not sent"
+            )));
+        }
+
         let mut batch = Batch::new();
         let table = Table::new(ProtocolFamily::Inet).with_name(self.table_name.clone());
 
@@ -83,6 +89,9 @@ impl NetlinkBackend {
                     let mut nf = NfRule::new(&chain).map_err(Self::err)?;
                     for m in &matches {
                         nf = Self::apply_match(nf, m)?;
+                    }
+                    for action in &rule.actions {
+                        nf = Self::apply_action(nf, action)?;
                     }
                     nf = match rule.verdict {
                         Verdict::Accept => nf.accept(),
@@ -127,15 +136,7 @@ impl NetlinkBackend {
     }
 
     fn commit(&self, policy: &FirewallPolicy, state: TunnelState) -> Result<()> {
-        let rs = render(policy, state);
-
-        if let Some(mss) = rs.mss_clamp {
-            warn!(
-                "MSS clamping ({mss} bytes) not applied: mangle action not expressible \
-                 via rustables. Performance optimization, no security gap."
-            );
-        }
-
+        let rs = render(policy, state)?;
         let batch = self.build_batch(&rs)?;
         batch.send().map_err(|e| {
             Self::err(format!(
@@ -163,6 +164,10 @@ impl Default for NetlinkBackend {
 
 #[async_trait]
 impl FirewallBackend for NetlinkBackend {
+    fn capabilities(&self) -> FirewallCapabilities {
+        FirewallCapabilities::default()
+    }
+
     async fn apply(&self, policy: &FirewallPolicy, state: TunnelState) -> Result<()> {
         self.commit(policy, state)
     }
@@ -181,8 +186,16 @@ impl FirewallBackend for NetlinkBackend {
 
 #[cfg(test)]
 mod tests {
+    use std::num::{NonZeroU32, NonZeroU64};
+
     use super::*;
-    use crate::ruleset::{Match, L4};
+    use crate::ruleset::{
+        Action, AddressFamily, Counter, LogAction, Match, RateLimit, RateLimitMode, RateUnit, L4,
+    };
+
+    fn network(value: &str) -> ipnetwork::IpNetwork {
+        value.parse().expect("valid test network")
+    }
 
     #[test]
     fn table_is_created_before_being_deleted() {
@@ -214,15 +227,18 @@ mod tests {
                 crate::ruleset::Rule {
                     chain: ChainKind::Input,
                     matches: vec![
-                        Match::Established,
+                        Match::ConnectionState(
+                            crate::ruleset::ConnectionStates::ESTABLISHED_RELATED,
+                        ),
                         Match::InIface("helios0".into()),
                         Match::DestPort {
                             port: 8080,
                             proto: L4::Tcp,
                         },
-                        Match::DestNet("100.64.0.1".into()),
-                        Match::SourceNet("100.64.0.0/10".into()),
+                        Match::DestNet(network("100.64.0.1")),
+                        Match::SourceNet(network("100.64.0.0/10")),
                     ],
+                    actions: Vec::new(),
                     verdict: Verdict::Accept,
                     note: None,
                 },
@@ -235,14 +251,25 @@ mod tests {
                             ports: vec![53, 51820],
                             proto: L4::Udp,
                         },
-                        Match::DestNet("2001:db8::/32".into()),
-                        Match::SourceNet("2001:db8::1".into()),
+                        Match::DestNet(network("2001:db8::/32")),
+                        Match::SourceNet(network("2001:db8::1")),
                     ],
+                    actions: Vec::new(),
                     verdict: Verdict::Drop,
                     note: None,
                 },
+                crate::ruleset::Rule {
+                    chain: ChainKind::Input,
+                    matches: vec![
+                        Match::InIface("helios0".into()),
+                        Match::Icmp(AddressFamily::Ipv6),
+                    ],
+                    actions: Vec::new(),
+                    verdict: Verdict::Accept,
+                    note: None,
+                },
             ],
-            mss_clamp: Some(1280),
+            mss_clamp: None,
             masquerade_out: vec!["eth0".into()],
         };
 
@@ -257,29 +284,19 @@ mod tests {
     }
 
     #[test]
-    fn malformed_addresses_abort_the_batch_before_it_can_be_sent() {
-        for malformed in [
-            Match::DestNet("not-an-address".into()),
-            Match::DestNet("10.0.0.0/99".into()),
-            Match::SourceNet("still-not-an-address".into()),
-            Match::SourceNet("2001:db8::/999".into()),
-        ] {
-            let ruleset = Ruleset {
-                default_verdict: Verdict::Drop,
-                rules: vec![crate::ruleset::Rule {
-                    chain: ChainKind::Output,
-                    matches: vec![malformed],
-                    verdict: Verdict::Accept,
-                    note: None,
-                }],
-                mss_clamp: None,
-                masquerade_out: Vec::new(),
-            };
-            assert!(
-                NetlinkBackend::new().build_batch(&ruleset).is_err(),
-                "an invalid address must cancel translation"
-            );
-        }
+    fn mss_clamping_fails_translation_instead_of_being_ignored() {
+        let ruleset = Ruleset {
+            default_verdict: Verdict::Drop,
+            rules: Vec::new(),
+            mss_clamp: Some(1280),
+            masquerade_out: Vec::new(),
+        };
+
+        let error = match NetlinkBackend::new().build_batch(&ruleset) {
+            Ok(_) => panic!("an unapplied MSS clamp must not produce a transaction"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("MSS clamp 1280") && error.contains("transaction not sent"));
     }
 
     #[test]
@@ -298,6 +315,7 @@ mod tests {
                         proto: L4::Udp,
                     },
                 ],
+                actions: Vec::new(),
                 verdict: Verdict::Accept,
                 note: None,
             }],
@@ -306,5 +324,101 @@ mod tests {
         };
 
         assert!(NetlinkBackend::new().build_batch(&ruleset).is_err());
+    }
+
+    #[test]
+    fn anonymous_counters_and_logs_translate_before_any_side_effect() {
+        let ruleset = Ruleset {
+            default_verdict: Verdict::Drop,
+            rules: vec![crate::ruleset::Rule {
+                chain: ChainKind::Input,
+                matches: vec![Match::ConnectionState(
+                    crate::ruleset::ConnectionStates::INVALID,
+                )],
+                actions: vec![
+                    Action::Counter(Counter::Anonymous),
+                    Action::Log(LogAction {
+                        prefix: "helios invalid: ".into(),
+                        group: None,
+                    }),
+                ],
+                verdict: Verdict::Drop,
+                note: None,
+            }],
+            mss_clamp: None,
+            masquerade_out: Vec::new(),
+        };
+
+        assert!(NetlinkBackend::new().build_batch(&ruleset).is_ok());
+    }
+
+    #[test]
+    fn named_counters_fail_translation_instead_of_becoming_anonymous() {
+        let ruleset = Ruleset {
+            default_verdict: Verdict::Drop,
+            rules: vec![crate::ruleset::Rule {
+                chain: ChainKind::Input,
+                matches: Vec::new(),
+                actions: vec![Action::Counter(Counter::Named("drop-invalid".into()))],
+                verdict: Verdict::Drop,
+                note: None,
+            }],
+            mss_clamp: None,
+            masquerade_out: Vec::new(),
+        };
+
+        let error = match NetlinkBackend::new().build_batch(&ruleset) {
+            Ok(_) => panic!("a named counter must not be downgraded to an anonymous one"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("named counter `drop-invalid`"));
+    }
+
+    #[test]
+    fn invalid_log_prefix_fails_translation() {
+        let ruleset = Ruleset {
+            default_verdict: Verdict::Drop,
+            rules: vec![crate::ruleset::Rule {
+                chain: ChainKind::Input,
+                matches: Vec::new(),
+                actions: vec![Action::Log(LogAction {
+                    prefix: "x".repeat(128),
+                    group: None,
+                })],
+                verdict: Verdict::Drop,
+                note: None,
+            }],
+            mss_clamp: None,
+            masquerade_out: Vec::new(),
+        };
+
+        assert!(NetlinkBackend::new().build_batch(&ruleset).is_err());
+    }
+
+    #[test]
+    fn rate_limits_fail_translation_instead_of_being_ignored() {
+        let ruleset = Ruleset {
+            default_verdict: Verdict::Drop,
+            rules: vec![crate::ruleset::Rule {
+                chain: ChainKind::Input,
+                matches: Vec::new(),
+                actions: vec![Action::Limit(RateLimit {
+                    rate: NonZeroU64::new(20).unwrap(),
+                    unit: RateUnit::Second,
+                    burst: NonZeroU32::new(5).unwrap(),
+                    mode: RateLimitMode::Until,
+                })],
+                verdict: Verdict::Accept,
+                note: None,
+            }],
+            mss_clamp: None,
+            masquerade_out: Vec::new(),
+        };
+
+        let error = match NetlinkBackend::new().build_batch(&ruleset) {
+            Ok(_) => panic!("a rate limit must not disappear during translation"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("rate limit") && error.contains("rustables 0.8.7"));
     }
 }

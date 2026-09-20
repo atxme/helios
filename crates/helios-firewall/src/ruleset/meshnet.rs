@@ -5,16 +5,16 @@
 //! rules *before* its accept, and that order is the permission: inverted, the
 //! same rules would open the LAN they exist to close.
 
-use aether::FirewallPolicy;
+use aether::{FirewallPolicy, Result};
 
 use super::ChainKind::{Forward, Input, Output};
-use super::{Match, Rule, Verdict, L4, PRIVATE_IPV4_CIDRS};
+use super::{network, AddressFamily, Match, Rule, Verdict, L4, PRIVATE_IPV4_CIDRS};
 
 pub(super) fn nordvpn_meshnet(
     rules: &mut Vec<Rule>,
     policy: &FirewallPolicy,
     wan_ifaces: &[String],
-) {
+) -> Result<()> {
     // ── NordVPN Meshnet: transport, local services and routing ──────────────
     // Libtelio marks its relay, STUN and direct-path packets; accepting that
     // mark on a declared WAN lets paths and ports evolve without granting an
@@ -45,7 +45,7 @@ pub(super) fn nordvpn_meshnet(
                     Output,
                     vec![
                         Match::OutIface(meshnet.iface.clone()),
-                        Match::DestNet(peer.clone()),
+                        Match::DestNet(network(peer)?),
                     ],
                     Verdict::Accept,
                 )
@@ -58,8 +58,8 @@ pub(super) fn nordvpn_meshnet(
                         Input,
                         vec![
                             Match::InIface(meshnet.iface.clone()),
-                            Match::SourceNet(peer.clone()),
-                            Match::Icmp,
+                            Match::SourceNet(network(peer)?),
+                            Match::Icmp(AddressFamily::Ipv4),
                         ],
                         Verdict::Accept,
                     )
@@ -76,7 +76,7 @@ pub(super) fn nordvpn_meshnet(
                             Input,
                             vec![
                                 Match::InIface(meshnet.iface.clone()),
-                                Match::SourceNet(peer.clone()),
+                                Match::SourceNet(network(peer)?),
                                 Match::DestPortSet {
                                     ports: ports.clone(),
                                     proto,
@@ -100,8 +100,8 @@ pub(super) fn nordvpn_meshnet(
                             Forward,
                             vec![
                                 Match::InIface(meshnet.iface.clone()),
-                                Match::SourceNet(peer.clone()),
-                                Match::DestNet(private_network.into()),
+                                Match::SourceNet(network(peer)?),
+                                Match::DestNet(network(private_network)?),
                             ],
                             Verdict::Drop,
                         )
@@ -124,7 +124,7 @@ pub(super) fn nordvpn_meshnet(
                         Forward,
                         vec![
                             Match::InIface(meshnet.iface.clone()),
-                            Match::SourceNet(peer.clone()),
+                            Match::SourceNet(network(peer)?),
                             Match::OutIface(out_iface),
                         ],
                         Verdict::Accept,
@@ -134,4 +134,5 @@ pub(super) fn nordvpn_meshnet(
             }
         }
     }
+    Ok(())
 }

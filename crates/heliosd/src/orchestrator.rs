@@ -177,6 +177,27 @@ async fn sync_policy(shared: &Arc<RwLock<FirewallPolicy>>, policy: &FirewallPoli
     *shared.write().await = policy.clone();
 }
 
+/// Accepts a discovered clamp only when the selected backend can encode it.
+///
+/// Applying a candidate before mutating the live policy also keeps the policy
+/// aligned with the ruleset if a capable backend rejects the transaction.
+async fn apply_mss_clamp(
+    fw: &dyn FirewallBackend,
+    policy: &mut FirewallPolicy,
+    state: TunnelState,
+    mss: u16,
+) -> anyhow::Result<bool> {
+    if !fw.capabilities().mss_clamp {
+        return Ok(false);
+    }
+
+    let mut candidate = policy.clone();
+    candidate.mss_clamp = Some(mss);
+    fw.apply(&candidate, state).await?;
+    *policy = candidate;
+    Ok(true)
+}
+
 /// Daemon's main loop.
 ///
 /// Many parameters, but each is a distinct dependency injected once from
@@ -287,6 +308,7 @@ pub async fn run(
     publish_readiness(dry_run, firewall_mode)?;
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
+    let mut unsupported_mss_clamp_reported = false;
 
     loop {
         tokio::select! {
@@ -340,19 +362,34 @@ pub async fn run(
             internal = internal_rx.recv() => {
                 match internal {
                     Some(OrchestratorCmd::SetMssClamp(mss)) => {
-                        policy.mss_clamp = Some(mss);
                         let state = *shared_state.read().await;
-                        fw.apply(&policy, state).await.context("firewall MSS clamping")?;
-                        sync_policy(&shared_policy, &policy).await;
-                        if firewall_mode.enforced() {
-                            info!("PMTUD: MSS clamping applied at {mss} bytes");
-                        } else {
+                        if apply_mss_clamp(fw.as_ref(), &mut policy, state, mss)
+                            .await
+                            .context("firewall MSS clamping")?
+                        {
+                            sync_policy(&shared_policy, &policy).await;
+                            if firewall_mode.enforced() {
+                                info!("PMTUD: MSS clamping applied at {mss} bytes");
+                            } else {
+                                warn!(
+                                    "PMTUD: optimal MSS is {mss} bytes but firewall enforcement is disabled"
+                                );
+                            }
+                            emit_log(&event_tx, "info",
+                                &format!("PMTUD: optimal MSS detected = {mss} bytes"));
+                        } else if !unsupported_mss_clamp_reported {
                             warn!(
-                                "PMTUD: optimal MSS is {mss} bytes but firewall enforcement is disabled"
+                                "PMTUD: optimal MSS is {mss} bytes but the firewall backend does not support MSS clamping; policy unchanged"
                             );
+                            emit_log(
+                                &event_tx,
+                                "warn",
+                                &format!(
+                                    "PMTUD: optimal MSS detected = {mss} bytes; firewall backend does not support clamping"
+                                ),
+                            );
+                            unsupported_mss_clamp_reported = true;
                         }
-                        emit_log(&event_tx, "info",
-                            &format!("PMTUD: optimal MSS detected = {mss} bytes"));
                     }
                     // Promotion or demotion inferred from handshakes. It goes
                     // through `transition`, hence through a firewall
@@ -614,12 +651,24 @@ async fn handle_external_cmd(
         }
 
         OrchestratorCmd::SetMssClamp(mss) => {
-            policy.mss_clamp = Some(mss);
             let state = *shared_state.read().await;
-            fw.apply(policy, state)
+            if apply_mss_clamp(fw, policy, state, mss)
                 .await
-                .context("firewall MSS clamping (manual)")?;
-            sync_policy(shared_policy, policy).await;
+                .context("firewall MSS clamping (manual)")?
+            {
+                sync_policy(shared_policy, policy).await;
+            } else {
+                warn!(
+                    "manual MSS clamp {mss} ignored: the firewall backend does not support clamping"
+                );
+                emit_log(
+                    event_tx,
+                    "warn",
+                    &format!(
+                        "MSS clamp {mss} not accepted: firewall backend does not support clamping"
+                    ),
+                );
+            }
         }
 
         OrchestratorCmd::LoadNetworkConfig(new_cfg) => {
@@ -1436,9 +1485,30 @@ pub async fn check_update(dry_run: bool) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use helios_firewall::FirewallCapabilities;
 
     const PRIVATE_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
     const PEER_KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+
+    struct UnsupportedMssFirewall {
+        applied: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl FirewallBackend for UnsupportedMssFirewall {
+        fn capabilities(&self) -> FirewallCapabilities {
+            FirewallCapabilities::default()
+        }
+
+        async fn apply(&self, _policy: &FirewallPolicy, _state: TunnelState) -> aether::Result<()> {
+            self.applied.store(true, Ordering::Relaxed);
+            Ok(())
+        }
+
+        async fn teardown(&self) -> aether::Result<()> {
+            Ok(())
+        }
+    }
 
     fn configured_network() -> NetworkConfig {
         NetworkConfig {
@@ -1737,6 +1807,22 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(events.try_recv().is_err());
         assert!(commands.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn unsupported_mss_clamp_does_not_mutate_policy_or_reapply_firewall() {
+        let firewall = UnsupportedMssFirewall {
+            applied: AtomicBool::new(false),
+        };
+        let mut policy = configured_network().firewall_policy();
+
+        let accepted = apply_mss_clamp(&firewall, &mut policy, TunnelState::Up, 1380)
+            .await
+            .unwrap();
+
+        assert!(!accepted);
+        assert_eq!(policy.mss_clamp, None);
+        assert!(!firewall.applied.load(Ordering::Relaxed));
     }
 
     #[tokio::test]

@@ -5,25 +5,23 @@
 //! That is why the batch built from them can be validated without a machine
 //! carrying `nf_tables`.
 
-use std::net::IpAddr;
-use std::str::FromStr;
-
 use aether::Result;
+use ipnetwork::IpNetwork;
 use rustables::{
-    expr::{Bitwise, Cmp, CmpOp, ConnTrackState, Conntrack, ConntrackKey, Meta, MetaType},
+    expr::{
+        Bitwise, Cmp, CmpOp, ConnTrackState, Conntrack, ConntrackKey, Counter as NfCounter,
+        Log as NfLog, Meta, MetaType,
+    },
     HookClass, Protocol, Rule as NfRule,
 };
 
 use super::NetlinkBackend;
-use crate::ruleset::{ChainKind, Match, L4};
+use crate::ruleset::{
+    Action, AddressFamily, ChainKind, ConnectionState, ConnectionStates, Counter, Match, L4,
+};
 
-/// Conntrack states [`Match::Established`] accepts, as the kernel reads them.
-///
-/// Pinned as a constant so a refactor back to [`NfRule::established`] — which
-/// sets `ESTABLISHED` alone, i.e. `0b010` — fails a test instead of quietly
-/// halving what the rule matches.
-const ESTABLISHED_OR_RELATED: u32 =
-    ConnTrackState::ESTABLISHED.bits() | ConnTrackState::RELATED.bits();
+const IP_PROTOCOL_ICMP: u8 = 1;
+const IP_PROTOCOL_ICMPV6: u8 = 58;
 
 impl NetlinkBackend {
     pub(super) fn hook_class(kind: ChainKind) -> HookClass {
@@ -42,7 +40,7 @@ impl NetlinkBackend {
         };
 
         Ok(match m {
-            Match::Established => Self::established_or_related(rule)?,
+            Match::ConnectionState(states) => Self::connection_states(rule, *states)?,
             Match::InIface(i) => rule.iiface(i).map_err(Self::err)?,
             Match::OutIface(i) => rule.oiface(i).map_err(Self::err)?,
             Match::DestPort { port, proto: p } => rule.dport(*port, proto(*p)),
@@ -54,10 +52,31 @@ impl NetlinkBackend {
             }
             Match::DestNet(addr) => Self::match_net(rule, addr, false)?,
             Match::SourceNet(addr) => Self::match_net(rule, addr, true)?,
-            Match::Icmp => rule.icmp(),
+            Match::Icmp(family) => Self::icmp_protocol(rule, *family),
             Match::PacketMark(mark) => rule
                 .with_expr(Meta::new(MetaType::Mark))
                 .with_expr(Cmp::new(CmpOp::Eq, Self::packet_mark_bytes(*mark))),
+        })
+    }
+
+    /// Applies a non-verdict statement to a rule under construction.
+    pub(super) fn apply_action(rule: NfRule, action: &Action) -> Result<NfRule> {
+        Ok(match action {
+            Action::Counter(Counter::Anonymous) => rule.with_expr(NfCounter::default()),
+            Action::Counter(Counter::Named(name)) => {
+                return Err(Self::err(format!(
+                    "named counter `{name}` is not supported by rustables 0.8.7"
+                )))
+            }
+            Action::Log(log) => {
+                rule.with_expr(NfLog::new(log.group, Some(log.prefix.clone())).map_err(Self::err)?)
+            }
+            Action::Limit(limit) => {
+                return Err(Self::err(format!(
+                    "rate limit {}/{:?} burst {} {:?} is not supported by rustables 0.8.7",
+                    limit.rate, limit.unit, limit.burst, limit.mode
+                )))
+            }
         })
     }
 
@@ -68,7 +87,16 @@ impl NetlinkBackend {
         mark.to_ne_bytes()
     }
 
-    /// `ct state established,related`, built by hand.
+    fn icmp_protocol(rule: NfRule, family: AddressFamily) -> NfRule {
+        let protocol = match family {
+            AddressFamily::Ipv4 => IP_PROTOCOL_ICMP,
+            AddressFamily::Ipv6 => IP_PROTOCOL_ICMPV6,
+        };
+        rule.with_expr(Meta::new(MetaType::L4Proto))
+            .with_expr(Cmp::new(CmpOp::Eq, [protocol]))
+    }
+
+    /// A structured `ct state` match, built from the exact IR state set.
     ///
     /// [`NfRule::established`] would be the obvious call, and it is wrong
     /// here: it masks `ESTABLISHED` alone, so what got applied was `ct state
@@ -84,33 +112,39 @@ impl NetlinkBackend {
     /// fail-closed policy black-holes path-MTU discovery: connections open,
     /// then hang on the first full-size packet, and the tunnel gets blamed.
     ///
-    /// The three expressions reproduce what `rustables` emits, with the mask
-    /// widened by one bit — same layout, same little-endian mask convention.
-    fn established_or_related(rule: NfRule) -> Result<NfRule> {
+    /// The three expressions reproduce what `rustables` emits while deriving
+    /// the mask from the structured state set — same layout and same
+    /// little-endian mask convention.
+    fn connection_states(rule: NfRule, states: ConnectionStates) -> Result<NfRule> {
+        let mut mask = 0u32;
+        for state in states.iter() {
+            mask |= match state {
+                ConnectionState::Invalid => ConnTrackState::INVALID.bits(),
+                ConnectionState::Established => ConnTrackState::ESTABLISHED.bits(),
+                ConnectionState::Related => ConnTrackState::RELATED.bits(),
+                ConnectionState::New => ConnTrackState::NEW.bits(),
+                ConnectionState::Untracked => ConnTrackState::UNTRACKED.bits(),
+            };
+        }
         Ok(rule
             .with_expr(Conntrack::new(ConntrackKey::State))
-            .with_expr(
-                Bitwise::new(ESTABLISHED_OR_RELATED.to_le_bytes(), 0u32.to_be_bytes())
-                    .map_err(Self::err)?,
-            )
-            // Non-zero after masking: the packet is in one of the two states.
+            .with_expr(Bitwise::new(mask.to_le_bytes(), 0u32.to_be_bytes()).map_err(Self::err)?)
+            // Non-zero after masking: the packet is in one of the requested states.
             .with_expr(Cmp::new(CmpOp::Neq, 0u32.to_be_bytes())))
     }
 
-    /// Applies an address match, accepting either a plain IP or a CIDR.
-    fn match_net(rule: NfRule, addr: &str, source: bool) -> Result<NfRule> {
-        if addr.contains('/') {
-            let net = ipnetwork::IpNetwork::from_str(addr)
-                .map_err(|e| Self::err(format!("invalid CIDR `{addr}`: {e}")))?;
+    /// Applies an already validated address match.
+    fn match_net(rule: NfRule, network: &IpNetwork, source: bool) -> Result<NfRule> {
+        let host_prefix = if network.is_ipv4() { 32 } else { 128 };
+        if network.prefix() != host_prefix {
             let r = if source {
-                rule.snetwork(net)
+                rule.snetwork(*network)
             } else {
-                rule.dnetwork(net)
+                rule.dnetwork(*network)
             };
             r.map_err(Self::err)
         } else {
-            let ip = IpAddr::from_str(addr)
-                .map_err(|e| Self::err(format!("invalid IP `{addr}`: {e}")))?;
+            let ip = network.ip();
             Ok(if source {
                 rule.saddr(ip)
             } else {
@@ -188,22 +222,41 @@ mod tests {
     /// established,related` is target-only, see `docs/testing/TESTING.md`.
     #[test]
     fn the_conntrack_mask_carries_related_and_not_established_alone() {
+        let established_or_related =
+            ConnTrackState::ESTABLISHED.bits() | ConnTrackState::RELATED.bits();
         assert_eq!(
-            ESTABLISHED_OR_RELATED, 0b110,
+            established_or_related, 0b110,
             "the mask the kernel reads must carry both states"
         );
         assert_ne!(
-            ESTABLISHED_OR_RELATED,
+            established_or_related,
             ConnTrackState::ESTABLISHED.bits(),
-            "`NfRule::established` is precisely what this constant exists to avoid"
+            "`NfRule::established` must not replace the structured state encoder"
         );
     }
 
     #[test]
-    fn address_parsing() {
-        assert!(ipnetwork::IpNetwork::from_str("10.0.0.0/8").is_ok());
-        assert!(IpAddr::from_str("203.0.113.10").is_ok());
-        assert!(ipnetwork::IpNetwork::from_str("not-a-cidr").is_err());
+    fn connection_state_masks_match_the_kernel_bits() {
+        let mask = |states: ConnectionStates| {
+            states.iter().fold(0u32, |mask, state| {
+                mask | match state {
+                    ConnectionState::Invalid => ConnTrackState::INVALID.bits(),
+                    ConnectionState::Established => ConnTrackState::ESTABLISHED.bits(),
+                    ConnectionState::Related => ConnTrackState::RELATED.bits(),
+                    ConnectionState::New => ConnTrackState::NEW.bits(),
+                    ConnectionState::Untracked => ConnTrackState::UNTRACKED.bits(),
+                }
+            })
+        };
+
+        assert_eq!(
+            mask(ConnectionStates::INVALID),
+            ConnTrackState::INVALID.bits()
+        );
+        assert_eq!(
+            mask(ConnectionStates::ESTABLISHED_RELATED),
+            ConnTrackState::ESTABLISHED.bits() | ConnTrackState::RELATED.bits()
+        );
     }
 
     #[test]
@@ -214,5 +267,12 @@ mod tests {
             u32::from_ne_bytes(NetlinkBackend::packet_mark_bytes(mark)),
             mark
         );
+    }
+
+    #[test]
+    fn icmp_protocol_numbers_are_family_specific() {
+        assert_eq!(IP_PROTOCOL_ICMP, 1);
+        assert_eq!(IP_PROTOCOL_ICMPV6, 58);
+        assert_ne!(IP_PROTOCOL_ICMP, IP_PROTOCOL_ICMPV6);
     }
 }

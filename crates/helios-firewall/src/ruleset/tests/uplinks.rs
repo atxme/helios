@@ -1,7 +1,7 @@
 //! Tests for the ruleset renderer, grouped by the behavior they protect.
 
 use super::super::*;
-use super::support::policy;
+use super::support::{policy, render};
 /// A gateway with a cable and a radio: every rule that names the WAN is
 /// emitted for both. This is what makes an uplink failover survive with no
 /// restart — the kernel moves its default route and the rules are already

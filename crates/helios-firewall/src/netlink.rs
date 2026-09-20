@@ -29,11 +29,11 @@
 //!
 //! # Known limitation: MSS clamping
 //!
-//! `Ruleset::mss_clamp` is **not** applied here: rewriting the TCP MSS option
-//! is a *mangle* action that `rustables`' high-level API does not expose.
-//! This is a performance optimization (avoiding fragmentation), not a
-//! security rule: its absence leaves no gap. It is logged at `warn` level so
-//! it does not silently disappear.
+//! Rewriting the TCP MSS option needs the nf_tables `exthdr` expression, which
+//! `rustables 0.8.7` neither models nor lets a downstream crate add. A ruleset
+//! requesting a clamp is therefore rejected during translation, before any
+//! Netlink message is sent. It must never be accepted and silently applied
+//! without the requested mangle action.
 
 mod expressions;
 mod maintenance;

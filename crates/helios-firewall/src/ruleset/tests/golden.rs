@@ -18,7 +18,7 @@
 //! the product of its flags; each one is justified where it is defined.
 
 use super::super::*;
-use super::support::policy;
+use super::support::{policy, render};
 use aether::{NordvpnMeshnetPolicy, PolicyMode};
 
 /// Renders the whole ruleset as ordered, comparable text.
@@ -72,6 +72,9 @@ const DOWN_FAIL_CLOSED: &str = "\
 default drop
 mss clamp none
 masquerade []
+input ct state invalid counter drop
+forward ct state invalid counter drop
+output ct state invalid counter drop
 input iifname \"lo\" accept
 input ct state established,related accept
 forward iifname \"lo\" accept
@@ -85,7 +88,7 @@ input iifname \"eth0\" udp dport 51820 accept
 output oifname \"eth0\" udp sport 51820 accept
 input iifname \"eth0\" udp dport 51821 accept
 output oifname \"eth0\" udp sport 51821 accept
-output oifname \"eth0\" ip daddr 203.0.113.10 udp dport 51820 accept
+output oifname \"eth0\" ip daddr 203.0.113.10/32 udp dport 51820 accept
 input iifname \"helios0\" tcp dport 55182 accept
 input iifname \"helios0\" udp dport 55182 accept
 ";
@@ -110,6 +113,9 @@ const UP_WITHOUT_CLIENT_INTERNET: &str = "\
 default drop
 mss clamp none
 masquerade []
+input ct state invalid counter drop
+forward ct state invalid counter drop
+output ct state invalid counter drop
 input iifname \"lo\" accept
 input ct state established,related accept
 forward iifname \"lo\" accept
@@ -123,7 +129,7 @@ input iifname \"eth0\" udp dport 51820 accept
 output oifname \"eth0\" udp sport 51820 accept
 input iifname \"eth0\" udp dport 51821 accept
 output oifname \"eth0\" udp sport 51821 accept
-output oifname \"eth0\" ip daddr 203.0.113.10 udp dport 51820 accept
+output oifname \"eth0\" ip daddr 203.0.113.10/32 udp dport 51820 accept
 input iifname \"helios0\" tcp dport 55182 accept
 input iifname \"helios0\" udp dport 55182 accept
 forward iifname \"eth1\" oifname \"eth0\" accept
@@ -169,6 +175,9 @@ const UP_EVERY_CAPABILITY_OPEN: &str = "\
 default drop
 mss clamp 1280
 masquerade [enp3s0, wlo1]
+input ct state invalid counter drop
+forward ct state invalid counter drop
+output ct state invalid counter drop
 input tcp dport 8080 iifname \"helios0\" accept
 input tcp dport 8080 drop
 input iifname \"lo\" accept
@@ -188,8 +197,8 @@ input iifname \"enp3s0\" udp dport 51821 accept
 output oifname \"enp3s0\" udp sport 51821 accept
 input iifname \"wlo1\" udp dport 51821 accept
 output oifname \"wlo1\" udp sport 51821 accept
-output oifname \"enp3s0\" ip daddr 203.0.113.10 udp dport 51820 accept
-output oifname \"wlo1\" ip daddr 203.0.113.10 udp dport 51820 accept
+output oifname \"enp3s0\" ip daddr 203.0.113.10/32 udp dport 51820 accept
+output oifname \"wlo1\" ip daddr 203.0.113.10/32 udp dport 51820 accept
 output oifname \"enp3s0\" udp dport 67 accept
 input iifname \"enp3s0\" udp dport 68 accept
 output oifname \"wlo1\" udp dport 67 accept
@@ -201,6 +210,7 @@ output oifname \"wlo1\" udp dport 53 accept
 output oifname \"wlo1\" tcp dport { 53, 80, 443 } accept
 output oifname \"wlo1\" udp dport 123 accept
 input iifname \"helios0\" meta l4proto icmp accept
+input iifname \"helios0\" meta l4proto ipv6-icmp accept
 input iifname \"helios0\" tcp dport 22 accept
 input iifname \"helios0\" tcp dport 55182 accept
 input iifname \"helios0\" udp dport 55182 accept
@@ -260,6 +270,9 @@ const DOWN_MESHNET_WITHOUT_LISTENERS: &str = "\
 default drop
 mss clamp none
 masquerade []
+input ct state invalid counter drop
+forward ct state invalid counter drop
+output ct state invalid counter drop
 input iifname \"lo\" accept
 input ct state established,related accept
 forward iifname \"lo\" accept
@@ -301,6 +314,9 @@ const CAPTIVE_PORTAL_KNOWN_GATEWAY: &str = "\
 default drop
 mss clamp none
 masquerade []
+input ct state invalid counter drop
+forward ct state invalid counter drop
+output ct state invalid counter drop
 input iifname \"lo\" accept
 input ct state established,related accept
 forward iifname \"lo\" accept
@@ -314,11 +330,11 @@ input iifname \"eth0\" udp dport 51820 accept
 output oifname \"eth0\" udp sport 51820 accept
 input iifname \"eth0\" udp dport 51821 accept
 output oifname \"eth0\" udp sport 51821 accept
-output oifname \"eth0\" ip daddr 203.0.113.10 udp dport 51820 accept
+output oifname \"eth0\" ip daddr 203.0.113.10/32 udp dport 51820 accept
 input iifname \"helios0\" tcp dport 55182 accept
 input iifname \"helios0\" udp dport 55182 accept
-output oifname \"eth0\" ip daddr 192.0.2.1 tcp dport { 80, 443 } accept
-forward oifname \"eth0\" ip daddr 192.0.2.1 tcp dport { 80, 443 } accept
+output oifname \"eth0\" ip daddr 192.0.2.1/32 tcp dport { 80, 443 } accept
+forward oifname \"eth0\" ip daddr 192.0.2.1/32 tcp dport { 80, 443 } accept
 ";
 
 #[test]
@@ -343,6 +359,9 @@ const CAPTIVE_PORTAL_UNKNOWN_GATEWAY_FAIL_OPEN: &str = "\
 default accept
 mss clamp none
 masquerade []
+input ct state invalid counter drop
+forward ct state invalid counter drop
+output ct state invalid counter drop
 input iifname \"lo\" accept
 input ct state established,related accept
 forward iifname \"lo\" accept
@@ -356,7 +375,7 @@ input iifname \"eth0\" udp dport 51820 accept
 output oifname \"eth0\" udp sport 51820 accept
 input iifname \"eth0\" udp dport 51821 accept
 output oifname \"eth0\" udp sport 51821 accept
-output oifname \"eth0\" ip daddr 203.0.113.10 udp dport 51820 accept
+output oifname \"eth0\" ip daddr 203.0.113.10/32 udp dport 51820 accept
 input iifname \"helios0\" tcp dport 55182 accept
 input iifname \"helios0\" udp dport 55182 accept
 output oifname \"eth0\" tcp dport { 80, 443 } accept

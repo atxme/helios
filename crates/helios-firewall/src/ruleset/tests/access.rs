@@ -1,7 +1,73 @@
 //! Tests for the ruleset renderer, grouped by the behavior they protect.
 
 use super::super::*;
-use super::support::{policy, text};
+use super::support::{policy, render, text};
+
+#[test]
+fn invalid_conntrack_is_dropped_before_every_opening() {
+    let mut p = policy();
+    p.admin_port = Some(8080);
+    p.admin_iface = Some("helios0".into());
+    p.allow_tunnel_icmp = true;
+
+    let rs = render(&p, TunnelState::Up);
+    for chain in [ChainKind::Input, ChainKind::Forward, ChainKind::Output] {
+        let rules = rs.chain(chain).collect::<Vec<_>>();
+        assert_eq!(
+            rules.first().map(|rule| (&rule.matches, rule.verdict)),
+            Some((
+                &vec![Match::ConnectionState(ConnectionStates::INVALID)],
+                Verdict::Drop,
+            )),
+            "{chain:?}: invalid traffic must be dropped before any accept rule"
+        );
+        assert_eq!(
+            rules.first().map(|rule| rule.actions.as_slice()),
+            Some([Action::Counter(Counter::Anonymous)].as_slice()),
+            "{chain:?}: invalid drops must remain observable"
+        );
+    }
+
+    let input = rs.chain(ChainKind::Input).collect::<Vec<_>>();
+    let invalid = input
+        .iter()
+        .position(|rule| rule.matches == vec![Match::ConnectionState(ConnectionStates::INVALID)])
+        .unwrap();
+    let admin_accept = input
+        .iter()
+        .position(|rule| {
+            rule.verdict == Verdict::Accept
+                && rule.matches.contains(&Match::DestPort {
+                    port: 8080,
+                    proto: L4::Tcp,
+                })
+        })
+        .unwrap();
+    let established = input
+        .iter()
+        .position(|rule| {
+            rule.matches
+                == vec![Match::ConnectionState(
+                    ConnectionStates::ESTABLISHED_RELATED,
+                )]
+        })
+        .unwrap();
+
+    assert!(invalid < admin_accept);
+    assert!(admin_accept < established);
+}
+
+#[test]
+fn invalid_networks_never_enter_the_structured_ir() {
+    for invalid in ["not-an-address", "10.0.0.0/99", "2001:db8::/999"] {
+        let mut p = policy();
+        p.allow_ssh_from = vec![invalid.into()];
+        assert!(
+            super::super::render(&p, TunnelState::Down).is_err(),
+            "invalid network {invalid} must stop ruleset compilation"
+        );
+    }
+}
 
 /// The WireGuard listener is in `input` (traffic towards the gateway),
 /// LAN forward in `forward`. Confusing them would block or open the
@@ -44,7 +110,11 @@ fn loopback_is_accepted_according_to_chain_direction() {
 #[test]
 fn tunnel_icmp_and_ssh_are_opt_in_and_scoped_to_the_tunnel_interface() {
     let closed = render(&policy(), TunnelState::Up);
-    for forbidden in ["meta l4proto icmp", "tcp dport 22"] {
+    for forbidden in [
+        "meta l4proto icmp",
+        "meta l4proto ipv6-icmp",
+        "tcp dport 22",
+    ] {
         assert!(
             !text(&closed, ChainKind::Input)
                 .iter()
@@ -63,13 +133,19 @@ fn tunnel_icmp_and_ssh_are_opt_in_and_scoped_to_the_tunnel_interface() {
         .any(|r| r == "iifname \"helios0\" meta l4proto icmp accept"));
     assert!(input
         .iter()
+        .any(|r| r == "iifname \"helios0\" meta l4proto ipv6-icmp accept"));
+    assert!(input
+        .iter()
         .any(|r| r == "iifname \"helios0\" tcp dport 22 accept"));
 
     // Neither may ever be rendered without its interface match, whatever
     // the state: that rule alone is what keeps them off the WAN.
     for state in [TunnelState::Down, TunnelState::Connecting, TunnelState::Up] {
         for rule in render(&open, state).chain(ChainKind::Input) {
-            let touches_tunnel_opening = rule.matches.contains(&Match::Icmp)
+            let touches_tunnel_opening = rule
+                .matches
+                .iter()
+                .any(|criterion| matches!(criterion, Match::Icmp(_)))
                 || rule.matches.contains(&Match::DestPort {
                     port: 22,
                     proto: L4::Tcp,
@@ -152,7 +228,11 @@ fn the_tunnel_openings_need_a_wireguard_interface() {
     p.allow_ssh_over_tunnel = true;
     p.wg_iface = String::new();
     let rs = render(&p, TunnelState::Up);
-    for forbidden in ["meta l4proto icmp", "tcp dport 22"] {
+    for forbidden in [
+        "meta l4proto icmp",
+        "meta l4proto ipv6-icmp",
+        "tcp dport 22",
+    ] {
         assert!(
             !text(&rs, ChainKind::Input)
                 .iter()

@@ -1,7 +1,7 @@
 //! Tests for the ruleset renderer, grouped by the behavior they protect.
 
 use super::super::*;
-use super::support::{policy, text};
+use super::support::{policy, render, text};
 #[test]
 fn down_blocks_lan_forward() {
     let rs = render(&policy(), TunnelState::Down);

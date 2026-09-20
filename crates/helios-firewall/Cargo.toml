@@ -7,9 +7,10 @@ authors.workspace = true
 
 [features]
 default = []
-# Active le backend Netlink réel (rustables). Nécessite libnftnl/libmnl et un
-# kernel avec nf_tables — donc la machine dédiée, pas WSL2.
-netlink = ["dep:rustables", "dep:ipnetwork"]
+# Active le backend Netlink réel (rustables). rustables parle Netlink en Rust
+# pur ; sa génération de bindings requiert libclang et les headers noyau.
+# L'exécution requiert un kernel avec nf_tables — donc la cible, pas WSL2.
+netlink = ["dep:rustables"]
 
 [dependencies]
 aether.workspace = true
@@ -17,7 +18,7 @@ async-trait.workspace = true
 tracing.workspace = true
 rustables = { version = "0.8", optional = true }
 # Version alignée sur celle qu'expose rustables dans ses signatures.
-ipnetwork = { version = "0.21", optional = true }
+ipnetwork = "0.21"
 
 [dev-dependencies]
 toml.workspace = true
