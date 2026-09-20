@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# Cargo entry point for the WSL development checks.
+#
+# WSL's VHD grows with every distinct Cargo target directory and does not
+# automatically shrink after a clean. Keep routine checks in one bounded cache
+# instead of leaving a target directory per worktree or review task.
+set -euo pipefail
+
+if [ "$#" -eq 0 ]; then
+    echo "Usage: scripts/wsl-cargo <cargo arguments...>" >&2
+    exit 2
+fi
+
+if ! grep -qiE '(microsoft|wsl)' /proc/sys/kernel/osrelease 2>/dev/null; then
+    exec cargo "$@"
+fi
+
+target_dir="${HELIOS_WSL_TARGET_DIR:-$HOME/.cache/helios-target}"
+warning_gib="${HELIOS_WSL_BUILD_WARNING_GIB:-40}"
+maximum_gib="${HELIOS_WSL_BUILD_MAX_GIB:-45}"
+
+if ! [[ "$warning_gib" =~ ^[0-9]+$ && "$maximum_gib" =~ ^[0-9]+$ ]] \
+    || [ "$warning_gib" -ge "$maximum_gib" ]; then
+    echo "HELIOS_WSL_BUILD_WARNING_GIB and HELIOS_WSL_BUILD_MAX_GIB must be increasing integers." >&2
+    exit 2
+fi
+
+bytes_for_gib=$((1024 * 1024 * 1024))
+warning_bytes=$((warning_gib * bytes_for_gib))
+maximum_bytes=$((maximum_gib * bytes_for_gib))
+
+target_size() {
+    if [ -d "$target_dir" ]; then
+        du -sb "$target_dir" | awk '{print $1}'
+    else
+        echo 0
+    fi
+}
+
+format_gib() {
+    awk -v bytes="$1" 'BEGIN { printf "%.1f GiB", bytes / 1024 / 1024 / 1024 }'
+}
+
+before="$(target_size)"
+if [ "$before" -ge "$maximum_bytes" ]; then
+    echo "Refus : le cache Cargo WSL $(format_gib "$before") atteint la limite de ${maximum_gib} GiB." >&2
+    echo "Nettoyez-le explicitement : cargo clean --target-dir \"$target_dir\"" >&2
+    exit 75
+fi
+if [ "$before" -ge "$warning_bytes" ]; then
+    echo "Avertissement : le cache Cargo WSL est à $(format_gib "$before") (seuil ${warning_gib} GiB)." >&2
+fi
+
+# Full workspace checks gain little from incremental state, which accounts for
+# several GiB on Helios. Leave focused development commands incremental.
+full_workspace=0
+for argument in "$@"; do
+    if [ "$argument" = "--workspace" ]; then
+        full_workspace=1
+        break
+    fi
+done
+if [ "$full_workspace" = "1" ] \
+    && { [ "$1" = "check" ] || [ "$1" = "clippy" ] || [ "$1" = "test" ]; }; then
+    export CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}"
+    echo "==> Validation workspace WSL sans compilation incrémentale"
+fi
+
+mkdir -p "$target_dir"
+echo "==> Cache Cargo WSL : $target_dir ($(format_gib "$before") avant build)"
+if CARGO_TARGET_DIR="$target_dir" cargo "$@"; then
+    status=0
+else
+    status=$?
+fi
+
+after="$(target_size)"
+echo "==> Cache Cargo WSL : $(format_gib "$after") après build"
+if [ "$after" -ge "$maximum_bytes" ]; then
+    echo "ERREUR : la limite de ${maximum_gib} GiB est dépassée ; nettoyez ce cache avant le prochain build." >&2
+    exit 75
+fi
+
+exit "$status"
