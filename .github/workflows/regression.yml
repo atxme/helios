@@ -52,7 +52,7 @@ jobs:
       - name: Audit des dépendances Rust (Cargo.lock)
         run: |
           if ! command -v cargo-audit >/dev/null 2>&1; then
-            cargo install cargo-audit --locked
+            cargo install cargo-audit --version 0.22.2 --locked
           fi
           # cargo-audit inspecte directement le lockfile et ne fournit pas
           # d'option `--locked` dans sa CLI.
@@ -85,7 +85,7 @@ jobs:
       - name: Outil d'audit Rust
         run: |
           if ! command -v cargo-audit >/dev/null 2>&1; then
-            cargo install cargo-audit --locked
+            cargo install cargo-audit --version 0.22.2 --locked
           fi
       - name: Campagne de régression
         run: bash scripts/regression.sh

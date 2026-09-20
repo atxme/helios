@@ -1584,11 +1584,9 @@ mod tests {
 
     /// Production persistence never lets a runtime secret reach `network.toml`.
     ///
-    /// The most valuable test of ADR-006's validation family, and the cheapest:
-    /// it does not check that we *remembered* to redact a known list of fields,
-    /// it scans the produced bytes for the secrets themselves. A field added
-    /// later that happens to carry a secret fails here rather than in a
-    /// customer's backup.
+    /// The projection is an allow-list, so a field added later stays off disk
+    /// until it is classified explicitly. This test complements that structural
+    /// guarantee by scanning the produced bytes for today's secrets themselves.
     ///
     /// It scans the temporary files too — a secret written and renamed away is
     /// still a secret that touched the disk.
@@ -1701,12 +1699,12 @@ mod tests {
             wg_address: "100.64.0.1/10".into(),
             ..NetworkConfig::default()
         };
-        cfg.save().expect("first save");
+        cfg.save_redacted().expect("first save");
         let mode =
             |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&path), 0o600, "mode after the first save");
 
-        cfg.save().expect("rewrite");
+        cfg.save_redacted().expect("rewrite");
         assert_eq!(mode(&path), 0o600, "mode after a rewrite");
 
         std::env::remove_var("HELIOS_NETWORK_CONFIG");

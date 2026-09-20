@@ -616,8 +616,8 @@ pub async fn peer_revoke(
 
 /// Persists a mutated configuration then forwards it to the orchestrator.
 ///
-/// [`aether::NetworkConfig::save`] owns the production projection and excludes
-/// every runtime secret. Dry-run uses the one explicit exception: its
+/// [`aether::NetworkConfig::save_redacted`] owns the production projection and
+/// excludes every runtime secret. Dry-run uses the one explicit exception: its
 /// disposable WireGuard identity has no TPM vault, so it stays in
 /// `network.toml`; peer PSKs remain excluded in both modes.
 ///

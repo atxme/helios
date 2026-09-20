@@ -168,14 +168,20 @@ impl TpmSealer for TpmDevice {
                 })
                 .map_err(|e| TpmError::Connection(format!("create (seal): {e}")));
 
-            let _ = ctx.flush_context(SessionHandle::from(session).into());
+            log_cleanup_error(
+                "flush seal session",
+                ctx.flush_context(SessionHandle::from(session).into()),
+            );
             let created = created?;
 
             let blob = marshal_blob(&self.indices, &created.out_public, &created.out_private)?;
             Ok(SealedBlob::from_bytes(blob))
         })();
 
-        let _ = ctx.flush_context(primary.key_handle.into());
+        log_cleanup_error(
+            "flush seal primary",
+            ctx.flush_context(primary.key_handle.into()),
+        );
         outcome
     }
 
@@ -217,14 +223,20 @@ impl TpmSealer for TpmDevice {
                     })
             });
 
-            let _ = ctx.flush_context(SessionHandle::from(session).into());
-            let _ = ctx.flush_context(object);
+            log_cleanup_error(
+                "flush unseal session",
+                ctx.flush_context(SessionHandle::from(session).into()),
+            );
+            log_cleanup_error("flush unseal object", ctx.flush_context(object));
 
             let sensitive = unsealed?;
             to_secret_key(sensitive)
         })();
 
-        let _ = ctx.flush_context(primary.key_handle.into());
+        log_cleanup_error(
+            "flush unseal primary",
+            ctx.flush_context(primary.key_handle.into()),
+        );
         outcome
     }
 
@@ -255,13 +267,19 @@ impl TpmSealer for TpmDevice {
                 })
                 .map_err(|e| TpmError::Connection(format!("NV write (arm window): {e}")));
 
-            let _ = ctx.flush_context(SessionHandle::from(session).into());
+            log_cleanup_error(
+                "flush update-window write session",
+                ctx.flush_context(SessionHandle::from(session).into()),
+            );
             let mut object = ObjectHandle::from(handle);
-            let _ = ctx.tr_close(&mut object);
+            log_cleanup_error("close update-window write index", ctx.tr_close(&mut object));
             written
         })();
 
-        let _ = ctx.flush_context(primary.key_handle.into());
+        log_cleanup_error(
+            "flush update-window write primary",
+            ctx.flush_context(primary.key_handle.into()),
+        );
         outcome
     }
 
@@ -281,7 +299,10 @@ impl TpmSealer for TpmDevice {
             .execute_with_nullauth_session(|ctx| ctx.nv_write(NvAuth::Owner, handle, data, 0))
             .map_err(|e| TpmError::Connection(format!("NV write (revoke window): {e}")));
         let mut object = ObjectHandle::from(handle);
-        let _ = ctx.tr_close(&mut object);
+        log_cleanup_error(
+            "close revoked update-window index",
+            ctx.tr_close(&mut object),
+        );
         written
     }
 
@@ -329,13 +350,19 @@ impl TpmDevice {
                     }
                 })
             });
-            let _ = ctx.flush_context(SessionHandle::from(session).into());
+            log_cleanup_error(
+                "flush update-window read session",
+                ctx.flush_context(SessionHandle::from(session).into()),
+            );
             read
         })();
 
-        let _ = ctx.flush_context(primary.key_handle.into());
+        log_cleanup_error(
+            "flush update-window read primary",
+            ctx.flush_context(primary.key_handle.into()),
+        );
         let mut object = ObjectHandle::from(handle);
-        let _ = ctx.tr_close(&mut object);
+        log_cleanup_error("close update-window read index", ctx.tr_close(&mut object));
         Ok(Some(Zeroizing::new(outcome?.value().to_vec())))
     }
 }
@@ -533,7 +560,10 @@ fn compute_pcr_policy_digest(
             .map_err(|e| TpmError::Connection(format!("policy_get_digest: {e}")))
     })();
 
-    let _ = ctx.flush_context(SessionHandle::from(session).into());
+    log_cleanup_error(
+        "flush PCR policy session",
+        ctx.flush_context(SessionHandle::from(session).into()),
+    );
     result
 }
 
@@ -588,8 +618,20 @@ fn compute_window_policy_digest(
             .map_err(|e| TpmError::Connection(format!("policy_get_digest (window): {e}")))
     })();
 
-    let _ = ctx.flush_context(SessionHandle::from(session).into());
+    log_cleanup_error(
+        "flush update-window policy session",
+        ctx.flush_context(SessionHandle::from(session).into()),
+    );
     result
+}
+
+/// Reports a failed best-effort cleanup without replacing the TPM operation's
+/// result. The primary operation remains the authoritative failure: cleanup
+/// runs after it and cannot make a successful operation fail retroactively.
+fn log_cleanup_error(operation: &'static str, result: std::result::Result<(), TssError>) {
+    if let Err(error) = result {
+        tracing::warn!(operation, error = %error, "TPM resource cleanup failed");
+    }
 }
 
 /// Opens the revocation index, or `None` if it is not defined.

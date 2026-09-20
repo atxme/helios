@@ -1,0 +1,85 @@
+name: Fuzzing planifié
+
+# libFuzzer est volontairement isolé de la validation des pull requests :
+# chaque cible dispose d'un budget borné et les quatre campagnes sont exécutées
+# dans le même job afin de ne pas compiler quatre fois le workspace fuzzing.
+on:
+  schedule:
+    - cron: "17 3 * * 0"
+  workflow_dispatch:
+
+concurrency:
+  group: fuzzing
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: Campagne libFuzzer
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache du workspace fuzzing
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            fuzz -> fuzz/target
+
+      - name: Installer cargo-fuzz
+        run: cargo +nightly install cargo-fuzz --version 0.13.2 --locked
+
+      - name: Vérifier les targets
+        working-directory: fuzz
+        run: cargo +nightly fuzz list
+
+      - name: Exécuter les campagnes bornées
+        id: fuzz_run
+        continue-on-error: true
+        run: |
+          set -u
+          failed=0
+
+          for target in signed_object trust_transaction x509_documents gateway_state_machine; do
+            echo "::group::Fuzzing ${target}"
+            mkdir -p "fuzz/ci-logs/${target}" "fuzz/artifacts/${target}"
+
+            set +e
+            cargo +nightly fuzz run "${target}" -- \
+              -max_total_time=120 \
+              -print_final_stats=1 \
+              -artifact_prefix="fuzz/artifacts/${target}/" \
+              2>&1 | tee "fuzz/ci-logs/${target}/run.log"
+            status=${PIPESTATUS[0]}
+            set -e
+
+            if [ "${status}" -ne 0 ]; then
+              echo "::error title=Fuzzing failure::La target ${target} a échoué (code ${status})."
+              failed=1
+            fi
+            echo "::endgroup::"
+          done
+
+          exit "${failed}"
+
+      - name: Publier corpus, crashes et logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzzing-${{ github.run_id }}
+          path: |
+            fuzz/artifacts/
+            fuzz/corpus/
+            fuzz/ci-logs/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Rejouer l'échec de fuzzing
+        if: steps.fuzz_run.outcome == 'failure'
+        run: exit 1

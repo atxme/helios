@@ -423,13 +423,19 @@ async fn shutdown_signal() -> anyhow::Result<()> {
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
                 .context("installing the SIGTERM handler")?;
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = terminate.recv() => {}
+            result = tokio::signal::ctrl_c() => {
+                result.context("waiting for Ctrl-C")?;
+            }
+            signal = terminate.recv() => {
+                anyhow::ensure!(signal.is_some(), "SIGTERM handler closed unexpectedly");
+            }
         }
     }
     #[cfg(not(unix))]
     {
-        let _ = tokio::signal::ctrl_c().await;
+        tokio::signal::ctrl_c()
+            .await
+            .context("waiting for Ctrl-C")?;
     }
     Ok(())
 }
