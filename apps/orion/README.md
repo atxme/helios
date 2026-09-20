@@ -78,14 +78,28 @@ L'écran Profils pose la question en une échelle de trois crans, et le cran
 | --- | --- | --- |
 | Aucune | `classic` | rien |
 | PSK statique | `classic` | une clé partagée reçue hors bande, jamais renouvelée |
-| Négociation Helios | `helios_key_negotiation` | un PSK négocié avant le tunnel, à chaque connexion |
+| Négociation Helios | `helios_key_negotiation` | un PSK ML-KEM-1024 dérivé avant le tunnel, à chaque connexion |
 
 Choisir « PSK statique » ouvre directement la saisie de la clé : sur un profil
-classique, ce PSK n'est pas un réglage avancé, c'est toute sa protection. Le
-PSK **négocié** reste à l'intérieur du bloc de négociation, sous le mode
-`static_psk` qui le possède : il occupe le même emplacement WireGuard qu'un PSK
-statique mais sort d'une transaction v5 authentifiée, et les confondre
-effacerait la seule différence qui compte.
+classique, ce PSK n'est pas un réglage avancé, c'est toute sa protection.
+
+**L'échelle est tout le choix.** Le cran « Négociation Helios » écrit
+`mode = ml_kem` et n'offre pas de mode à lui : une clé partagée est le cran du
+dessous, et une négociation qui poserait celle-là au lieu d'en dériver une
+fraîche serait la même décision écrite à deux endroits, sans rien à l'écran
+pour dire lequel gagne. Monter sur ce cran retire donc le PSK du cran
+précédent — `orion-core` refuse un profil qui garde une clé qu'aucun mode
+n'utilise.
+
+`static_psk` reste néanmoins un mode v5 explicite côté protocole : la
+transaction QUIC a bien lieu et le client prouve la possession de la clé par un
+engagement HMAC lié à la session avant que la gateway n'installe le PSK déjà
+configuré ([NEGOCIATION-DE-CLE-V5](../../docs/specification/NEGOCIATION-DE-CLE-V5.md)
+§9.1). Un document produit par `helios-ctl enroll` peut donc légitimement le
+porter. Orion ne le compose plus mais l'affiche tel quel — la clé qu'il exige
+comprise — avec un bouton **Passer en ML-KEM** : le réétiqueter serait mentir
+sur ce que le profil fait, et masquer son PSK laisserait un profil invalide
+sans champ à regarder.
 
 Deux refus sont énoncés sur le cran lui-même plutôt qu'après coup :
 

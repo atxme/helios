@@ -340,7 +340,7 @@ describe('ProfilesView interactions', () => {
    * treats mode and PSK as a single decision, so a screen that set them apart
    * could only build profiles it would then have to mark invalid.
    */
-  it('takes a static PSK under the mode that owns it, never among the WireGuard settings', async () => {
+  it('keeps the negotiation rung free of any stored PSK', async () => {
     const handlers = callbacks()
     render(
       <ProfilesView
@@ -366,34 +366,17 @@ describe('ProfilesView interactions', () => {
     )
     await waitFor(() => expect(api.validateProfile).toHaveBeenCalled())
 
-    // Under ML-KEM there is no PSK row at all — not a greyed one, not one
-    // with a sentence explaining why it is unusable. Nor is it hiding under
-    // «Avancé»: a negotiation block owns the PSK, the WireGuard block does
-    // not.
+    // The rung this screen composes derives its key: no PSK row anywhere,
+    // and none hiding under «Avancé» either.
     expect(screen.queryByLabelText('PSK WireGuard (base64)')).toBeNull()
+    expect(screen.queryByText('Scellé dans le coffre')).toBeNull()
     fireEvent.click(screen.getByRole('button', { name: 'Avancé' }))
     expect(screen.queryByLabelText('PSK WireGuard (base64)')).toBeNull()
 
-    // Choosing the mode is what brings the field with it.
-    const modes = within(screen.getByLabelText('Mode de négociation'))
-    fireEvent.click(modes.getByRole('button', { name: 'PSK' }))
-    const field = screen.getByLabelText('PSK WireGuard (base64)') as HTMLInputElement
-    expect(field.type).toBe('password')
-    fireEvent.change(field, { target: { value: 'cHNrLXNlY3JldA==' } })
-    fireEvent.click(screen.getByRole('button', { name: 'Valider' }))
-
-    await waitFor(() => expect(api.adoptPresharedKey).toHaveBeenCalledWith('cHNrLXNlY3JldA=='))
-    // The field is gone and the secret never stayed in the document.
-    await waitFor(() => expect(screen.queryByLabelText('PSK WireGuard (base64)')).toBeNull())
-    expect(document.body.innerHTML).not.toContain('cHNrLXNlY3JldA==')
-    expect(screen.getByText('Nouveau PSK — à enregistrer')).toBeTruthy()
-
-    fireEvent.click(screen.getByRole('button', { name: 'Enregistrer' }))
-    await waitFor(() => expect(handlers.onSave).toHaveBeenCalledOnce())
-    const sent = handlers.onSave.mock.calls[0][0]
-    expect(sent.useStagedPsk).toBe(true)
-    expect(sent.clearPresharedKey).toBe(false)
-    expect(sent.key_negotiation.mode).toBe('static_psk')
+    // And there is no mode to pick: a preshared key is a rung of the bar
+    // above, not a variant of this one.
+    expect(screen.queryByLabelText('Mode de négociation')).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Passer en ML-KEM' })).toBeNull()
   })
 
   /**
@@ -403,7 +386,7 @@ describe('ProfilesView interactions', () => {
    * (`ClassicNotNegotiable`), so offering it here would only build profiles
    * that fail before the first handshake.
    */
-  it('offers only the two negotiable modes and keeps an existing profile Helios', async () => {
+  it('offers no negotiated mode and keeps an existing profile Helios', async () => {
     const handlers = callbacks()
     render(
       <ProfilesView
@@ -430,14 +413,14 @@ describe('ProfilesView interactions', () => {
     )
     await waitFor(() => expect(api.validateProfile).toHaveBeenCalled())
 
-    const modes = within(screen.getByLabelText('Mode de négociation'))
-    expect(modes.getAllByRole('button').map((button) => button.textContent)).toEqual([
-      'PSK',
-      'ML-KEM',
-    ])
+    // No mode row: this rung writes `ml_kem` and nothing else.
+    expect(screen.queryByLabelText('Mode de négociation')).toBeNull()
     // The floor still shows all three: it is a ratchet, and seeing what one
-    // has climbed past is the point.
-    expect(within(screen.getByLabelText('Plancher anti-downgrade')).getAllByRole('button')).toHaveLength(3)
+    // has climbed past is the point. `static_psk` stays a floor one may
+    // demand even though Orion no longer composes it as a mode.
+    expect(
+      within(screen.getByLabelText('Plancher anti-downgrade')).getAllByRole('button'),
+    ).toHaveLength(3)
 
     expect(screen.queryByRole('button', { name: 'Retirer' })).toBeNull()
   })
@@ -459,7 +442,7 @@ describe('ProfilesView interactions', () => {
   })
 
   /** The other direction: asking for ML-KEM is what removes the PSK. */
-  it('removes the static PSK only when the requested mode stops allowing one', async () => {
+  it('shows a loaded static_psk block as it is and converts it on request', async () => {
     const handlers = callbacks()
     render(
       <ProfilesView
@@ -485,16 +468,18 @@ describe('ProfilesView interactions', () => {
       />,
     )
     await waitFor(() => expect(api.validateProfile).toHaveBeenCalled())
-    // Shown with its mode, without opening «Avancé»: the PSK belongs to the
-    // negotiation block now.
+    // A block that already carried `static_psk` is shown as what it is — the
+    // key it needs included — rather than relabelled ML-KEM behind the user's
+    // back. What the screen offers is the one gesture back to what it
+    // composes.
     expect(screen.getByText('Scellé dans le coffre')).toBeTruthy()
+    expect(screen.getByText(/Orion ne compose plus ce mode/)).toBeTruthy()
 
-    // Scoped to the mode group: the floor row offers the same labels.
-    const modes = within(screen.getByLabelText('Mode de négociation'))
-    fireEvent.click(modes.getByRole('button', { name: 'ML-KEM' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Passer en ML-KEM' }))
     // The row goes away with the mode that owned it, rather than lingering as
     // an "aucun" with a sentence about the floor.
     await waitFor(() => expect(screen.queryByText('Scellé dans le coffre')).toBeNull())
+    expect(screen.queryByText(/Orion ne compose plus ce mode/)).toBeNull()
     expect(screen.queryByLabelText('PSK WireGuard (base64)')).toBeNull()
 
     fireEvent.click(screen.getByRole('button', { name: 'Enregistrer' }))
@@ -917,9 +902,23 @@ describe('ProfilesView interactions', () => {
     expect(negotiation.getAttribute('title')).toMatch(/Renommez-le/)
 
     fireEvent.change(screen.getByLabelText('Nom'), { target: { value: 'atelier' } })
-    expect(
-      screen.getByRole('button', { name: 'Négociation Helios' }).hasAttribute('disabled'),
-    ).toBe(false)
+    const enabled = screen.getByRole('button', { name: 'Négociation Helios' })
+    expect(enabled.hasAttribute('disabled')).toBe(false)
+
+    // Climbing to the negotiation rung disposes of the key the rung below
+    // owned: that rung derives a fresh one on every connection and stores
+    // none, and `orion-core` refuses a profile holding a PSK no mode uses.
+    fireEvent.click(enabled)
+    expect(pressed('Négociation Helios')).toBe('true')
+    expect(screen.queryByText('Nouveau PSK — à enregistrer')).toBeNull()
+    expect(screen.queryByLabelText('PSK WireGuard (base64)')).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Enregistrer' }))
+    await waitFor(() => expect(handlers.onSave).toHaveBeenCalledOnce())
+    const sent = handlers.onSave.mock.calls[0][0]
+    expect(sent.clearPresharedKey).toBe(true)
+    expect(sent.useStagedPsk).toBe(false)
+    expect(sent.key_negotiation.mode).toBe('ml_kem')
   })
 
   /**
@@ -961,8 +960,10 @@ describe('ProfilesView interactions', () => {
       expect(segment.hasAttribute('disabled')).toBe(true)
       fireEvent.click(segment)
     }
-    // Neither click went through: the block is still there, mode included.
-    expect(within(screen.getByLabelText('Mode de négociation')).getAllByRole('button')).toHaveLength(2)
+    // Neither click went through: the block is still there, floor included.
+    expect(
+      within(screen.getByLabelText('Plancher anti-downgrade')).getAllByRole('button'),
+    ).toHaveLength(3)
   })
 
   it('loads an associated profile and explains a failed identity seal', async () => {

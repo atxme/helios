@@ -32,13 +32,7 @@ import {
 import * as api from '../api'
 import { readProfileDocument } from '../profileDocument'
 import { CopyButton } from '../components/CopyButton'
-import {
-  modeAllowed,
-  modeLevel,
-  modeMeta,
-  NEGOTIABLE_MODES,
-  PROTECTION_MODES,
-} from '../components/state'
+import { modeAllowed, modeLevel, modeMeta, PROTECTION_MODES } from '../components/state'
 import {
   matchPreset,
   presetPrefixes,
@@ -88,10 +82,15 @@ import type {
  * is a tunnel with no preshared key, which the lower rungs already express —
  * so it is not a mode inside the block, it is the absence of the block.
  *
- * What the ladder does not do is merge the two static PSKs. A key copied by
- * hand and a key the `static_psk` mode obtains through an authenticated v5
- * transaction land in the same WireGuard slot and are not the same fact, so
- * the negotiated one stays inside the block, under the mode that owns it.
+ * The ladder is also the whole of the choice: the negotiation rung writes
+ * `ml_kem` and offers no mode of its own. A preshared key is the rung below,
+ * and a negotiation that installs one instead of deriving a fresh one would
+ * be the same decision written twice with nothing on screen to say which one
+ * wins. `static_psk` remains an explicit v5 mode — the transaction runs and
+ * proves possession with a session-bound HMAC commitment before the gateway
+ * installs the configured key — so a block that already carries it is
+ * displayed as what it is, with the key it needs and one gesture back to
+ * ML-KEM, rather than relabelled.
  *
  * # No captions
  *
@@ -583,13 +582,11 @@ export function ProfilesView({
   const toggleNegotiation = (enabled: boolean) => {
     if (!enabled && floorBaseline && modeLevel(floorBaseline) > 0) return
     setHistory((past) => [...past, draft].slice(-HISTORY_LIMIT))
-    // A block created over an existing static PSK opens on `static_psk`, not
-    // on the strongest mode. Without a negotiation block that PSK was the
-    // profile's whole protection; defaulting to ML-KEM here would silently
-    // discard it the moment the user ticked a box about something else.
-    // Choosing ML-KEM afterwards still drops it — but then it is a choice.
+    // Always ML-KEM. A block created over an existing static PSK used to open
+    // on `static_psk` so as not to discard the key silently; now the two are
+    // separate rungs of one bar, so moving to this one *is* the choice to
+    // stop using that key, and `chooseProtection` disposes of it explicitly.
     const settings = enabled ? blankNegotiation() : null
-    if (settings && staticPsk) settings.mode = 'static_psk'
     setDraft((profile) => ({ ...profile, key_negotiation: settings }))
     setFloorBaseline(settings?.minimum_mode ?? null)
     setDirty(true)
@@ -946,6 +943,10 @@ export function ProfilesView({
     if (rung === protection || protectionRefusal(rung)) return
     if (rung === 'negotiation') {
       setWantsStaticPsk(false)
+      // The rung derives a fresh key on every connection, so it stores none.
+      // `orion-core` refuses a profile holding a PSK no mode uses, and
+      // leaving it would move the refusal to the save.
+      dropStagedPskFor('ml_kem')
       toggleNegotiation(true)
       return
     }
@@ -1782,7 +1783,7 @@ function KeyNegotiation({
   floorBaseline: ProtectionMode | null
   issue?: string | null
   support: KeyNegotiationSupport | null
-  /** The static PSK row, shown here when `static_psk` is the chosen mode. */
+  /** The static PSK row, for a loaded block that still carries that mode. */
   pskField: React.ReactNode
   onChange: <Key extends keyof KeyNegotiationSettings>(
     key: Key,
@@ -1791,34 +1792,50 @@ function KeyNegotiation({
   onRaiseFloor: (floor: ProtectionMode) => void
 }) {
   const unusable = support && !support.identity_store
-  // A block loaded with `classic` cannot negotiate at all: the gateway
-  // refuses that mode by name. It is not offered above, so it can only come
-  // from a document written before the rule — and it has to be said, because
-  // the failure would otherwise land at connection time with no field to look
-  // at.
-  const notNegotiable = settings.mode === 'classic'
+  // Anything but ML-KEM is a block this screen no longer composes.
+  //
+  // The rung is the choice: a preshared key is «PSK statique» one bar above,
+  // and a negotiation that installs one instead of deriving a fresh one is
+  // the same decision written twice, in two places, with nothing on screen
+  // to say which one wins. So the mode row is gone and this rung writes
+  // `ml_kem`.
+  //
+  // It cannot simply *assume* `ml_kem`, though. `static_psk` remains an
+  // explicit v5 mode — the transaction still runs and proves possession with
+  // an HMAC commitment bound to the session before the gateway installs the
+  // configured key (NEGOCIATION-DE-CLE-V5 §9.1) — so a document produced by
+  // `helios-ctl enroll` may legitimately carry it, and `classic` may come
+  // from a document older than the rule that refuses it. Displaying either
+  // one as ML-KEM would be a lie about what the profile does, and hiding the
+  // PSK that `static_psk` requires would leave a profile invalid with no
+  // field to look at. Both are therefore shown as what they are, with the one
+  // gesture that brings the profile back to what this screen composes.
+  const legacyMode = settings.mode !== 'ml_kem'
 
   return (
     <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5 }}>
-      {/* Two modes, not three. `classic` is the absence of this block, and
-          the gateway refuses it as a negotiated mode by name. */}
-      <ModeChoice
-        label="Mode de négociation"
-        modes={NEGOTIABLE_MODES}
-        value={settings.mode}
-        floor={settings.minimum_mode}
-        onChange={(mode) => onChange('mode', mode)}
-      />
-
-      {notNegotiable && (
-        <Caution>
-          Mode <strong>classique</strong> refusé par la gateway. Choisir « PSK » ou « ML-KEM ».
-        </Caution>
+      {legacyMode && (
+        <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.75 }}>
+          <Caution>
+            {settings.mode === 'classic'
+              ? 'Ce profil négocie en mode « classique », que la gateway refuse par son nom : la connexion échouera.'
+              : 'Ce profil négocie un PSK statique. Orion ne compose plus ce mode : une clé partagée se choisit au cran « PSK statique » ci-dessus.'}
+          </Caution>
+          <Button
+            size="small"
+            variant="outlined"
+            color="inherit"
+            onClick={() => onChange('mode', 'ml_kem')}
+            disabled={!modeAllowed('ml_kem', settings.minimum_mode)}
+            sx={{ alignSelf: 'flex-start', fontSize: 11.5, textTransform: 'none' }}
+          >
+            Passer en ML-KEM
+          </Button>
+        </Box>
       )}
 
-      {/* The PSK belongs to the mode that uses it, and appears with it. Under
-          ML-KEM there is no PSK row at all — nothing to grey out, nothing to
-          explain. */}
+      {/* Only for a block that already carried one: the rung this screen
+          composes derives its key and stores nothing. */}
       {settings.mode === 'static_psk' && pskField}
 
       <ModeChoice
