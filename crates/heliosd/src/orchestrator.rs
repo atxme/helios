@@ -284,11 +284,19 @@ pub async fn run(
 
     loop {
         tokio::select! {
-            _ = &mut shutdown => {
-                if firewall_mode.enforced() {
-                    info!("shutdown requested: kill-switch maintained (fail-closed)");
-                } else {
-                    warn!("shutdown requested: Helios firewall remains disabled");
+            shutdown_result = &mut shutdown => {
+                match shutdown_result {
+                    Ok(()) if firewall_mode.enforced() => {
+                        info!("shutdown requested: kill-switch maintained (fail-closed)");
+                    }
+                    Ok(()) => {
+                        warn!("shutdown requested: Helios firewall remains disabled");
+                    }
+                    Err(error) => {
+                        warn!(
+                            "shutdown signal setup failed; stopping and keeping the firewall fail-closed: {error:#}"
+                        );
+                    }
                 }
                 break;
             }
@@ -408,12 +416,12 @@ async fn wait_api_ready(api_ready: &AtomicBool) -> anyhow::Result<()> {
     anyhow::bail!("the API did not reach its ready state within the allotted time")
 }
 
-async fn shutdown_signal() {
+async fn shutdown_signal() -> anyhow::Result<()> {
     #[cfg(unix)]
     {
         let mut terminate =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("installing the SIGTERM handler");
+                .context("installing the SIGTERM handler")?;
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {}
             _ = terminate.recv() => {}
@@ -423,6 +431,7 @@ async fn shutdown_signal() {
     {
         let _ = tokio::signal::ctrl_c().await;
     }
+    Ok(())
 }
 
 fn publish_readiness(dry_run: bool, firewall_mode: FirewallMode) -> anyhow::Result<()> {

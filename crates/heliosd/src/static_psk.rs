@@ -464,10 +464,12 @@ fn strip_from_file() -> Result<(), StaticPskError> {
     for peer in &mut on_disk.peers {
         peer.preshared_key = None;
     }
-    on_disk.save().map_err(|e| StaticPskError::Io {
-        path: path.display().to_string(),
-        cause: e.to_string(),
-    })
+    on_disk
+        .save_preserving_legacy_identity()
+        .map_err(|e| StaticPskError::Io {
+            path: path.display().to_string(),
+            cause: e.to_string(),
+        })
 }
 
 #[cfg(test)]
@@ -843,7 +845,13 @@ mod tests {
 
         let network_path = dir.join("network.toml");
         with_network_config(&dir, || {
-            on_disk.save().expect("write the legacy file");
+            let legacy = format!(
+                "wg_private_key = \"{LEGACY_IDENTITY}\"\nwg_address = \"100.64.0.1/10\"\n\
+                 [[peers]]\nname = \"alice\"\npublic_key = \"{alice}\"\n\
+                 address = \"100.64.1.2/32\"\nadmin = false\n\
+                 preshared_key = \"cHNrLXN0YXRpcXVlLWVuLWNsYWly\"\n"
+            );
+            std::fs::write(&network_path, legacy).expect("write the legacy file");
             // What the daemon holds by then: the identity already resolved from
             // the sealed vault, not the one the file carries.
             let mut running = aether::NetworkConfig {

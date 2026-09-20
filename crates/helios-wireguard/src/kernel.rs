@@ -13,7 +13,7 @@
 
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use async_trait::async_trait;
 use defguard_wireguard_rs::{
@@ -49,6 +49,14 @@ impl KernelBackend {
             iface: self.ifname.clone(),
             source_msg: e.to_string(),
         }
+    }
+
+    fn lock_api(&self) -> Result<MutexGuard<'_, WGApi<Kernel>>> {
+        self.api.lock().map_err(|_| {
+            self.iface_err(
+                "WireGuard backend mutex poisoned; refusing further data-plane operations",
+            )
+        })
     }
 
     /// Translates a Helios peer into a `defguard` peer. **Without an
@@ -107,7 +115,7 @@ impl WireguardBackend for KernelBackend {
             fwmark: None,
         };
 
-        let mut api = self.api.lock().unwrap();
+        let mut api = self.lock_api()?;
         api.create_interface().map_err(|e| self.iface_err(e))?;
         self.up.store(true, Ordering::SeqCst);
 
@@ -127,7 +135,7 @@ impl WireguardBackend for KernelBackend {
     async fn down(&self) -> Result<()> {
         // `mut` required on Windows (`remove_interface(&mut self)`), superfluous elsewhere.
         #[allow(unused_mut)]
-        let mut api = self.api.lock().unwrap();
+        let mut api = self.lock_api()?;
         let result = api.remove_interface();
         self.up.store(false, Ordering::SeqCst);
         result.map_err(|e| self.iface_err(e))?;
@@ -137,7 +145,7 @@ impl WireguardBackend for KernelBackend {
 
     async fn sync_peers(&self, peers: &[PeerConfig]) -> Result<()> {
         let wanted = Self::build_peers(peers)?;
-        let api = self.api.lock().unwrap();
+        let api = self.lock_api()?;
 
         let host = api.read_interface_data().map_err(|e| self.iface_err(e))?;
 
@@ -162,9 +170,7 @@ impl WireguardBackend for KernelBackend {
 
     async fn peers(&self) -> Result<Vec<PeerStatus>> {
         let host = self
-            .api
-            .lock()
-            .unwrap()
+            .lock_api()?
             .read_interface_data()
             .map_err(|e| self.iface_err(e))?;
 

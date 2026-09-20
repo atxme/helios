@@ -697,14 +697,12 @@ impl GatewayHandler {
             return Ok(());
         };
 
-        let mut on_disk = network.clone();
-        if !self.dry_run {
-            on_disk.wg_private_key.clear();
-        }
-        for peer in &mut on_disk.peers {
-            peer.preshared_key = None;
-        }
-        if on_disk.save().is_err() {
+        let persisted = if self.dry_run {
+            network.save_for_development()
+        } else {
+            network.save_redacted()
+        };
+        if persisted.is_err() {
             if let Some(peer) = network
                 .peers
                 .iter_mut()

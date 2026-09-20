@@ -343,6 +343,119 @@ pub struct WgPeer {
     pub persistent_keepalive_secs: u16,
 }
 
+/// Allow-listed projection of [`NetworkConfig`] for `network.toml`.
+///
+/// Runtime configuration deliberately contains material that must not reach
+/// disk. Keeping persistence as a separate shape makes new fields fail closed:
+/// adding one to [`NetworkConfig`] does not serialize it until this projection
+/// explicitly classifies it as public configuration.
+#[derive(Serialize)]
+struct PersistedNetworkConfig<'a> {
+    #[serde(rename = "wan_iface")]
+    wan_ifaces: &'a [String],
+    lan_ifaces: &'a [String],
+    allow_ssh_from: &'a [String],
+    admin_ifaces: &'a [String],
+    allow_dhcp_on_wan: bool,
+    allow_client_internet: bool,
+    allow_tunnel_icmp: bool,
+    allow_gateway_egress: bool,
+    allow_ssh_over_tunnel: bool,
+    iperf_port: Option<u16>,
+    admin_iface: &'a Option<String>,
+    split_tunnel_cidrs: &'a [String],
+    nordvpn_meshnet: Option<PersistedNordvpnMeshnetConfig<'a>>,
+    wg_iface: &'a str,
+    wg_private_key: &'a str,
+    wg_address: &'a str,
+    wg_listen_port: u16,
+    key_negotiation_port: Option<u16>,
+    peers: Vec<PersistedWgPeer<'a>>,
+    static_peer_addrs: &'a [String],
+    escrow_public_key: &'a Option<String>,
+}
+
+#[derive(Serialize)]
+struct PersistedNordvpnMeshnetConfig<'a> {
+    iface: &'a str,
+    fwmark: u32,
+    peer_cidrs: &'a [String],
+    traffic_routing_peer_cidrs: &'a [String],
+    local_network_peer_cidrs: &'a [String],
+    inbound_tcp_ports: &'a [u16],
+    inbound_udp_ports: &'a [u16],
+    allow_icmp: bool,
+}
+
+#[derive(Serialize)]
+struct PersistedWgPeer<'a> {
+    name: &'a str,
+    public_key: &'a str,
+    address: &'a str,
+    admin: bool,
+    key_negotiation_certificate_sha256: &'a Option<String>,
+    key_negotiation_pq_certificate_sha256: &'a Option<String>,
+    minimum_key_negotiation_mode: crate::key_negotiation::ProtectionMode,
+    persistent_keepalive_secs: u16,
+}
+
+impl<'a> PersistedNetworkConfig<'a> {
+    fn new(config: &'a NetworkConfig, include_development_identity: bool) -> Self {
+        Self {
+            wan_ifaces: &config.wan_ifaces,
+            lan_ifaces: &config.lan_ifaces,
+            allow_ssh_from: &config.allow_ssh_from,
+            admin_ifaces: &config.admin_ifaces,
+            allow_dhcp_on_wan: config.allow_dhcp_on_wan,
+            allow_client_internet: config.allow_client_internet,
+            allow_tunnel_icmp: config.allow_tunnel_icmp,
+            allow_gateway_egress: config.allow_gateway_egress,
+            allow_ssh_over_tunnel: config.allow_ssh_over_tunnel,
+            iperf_port: config.iperf_port,
+            admin_iface: &config.admin_iface,
+            split_tunnel_cidrs: &config.split_tunnel_cidrs,
+            nordvpn_meshnet: config.nordvpn_meshnet.as_ref().map(|meshnet| {
+                PersistedNordvpnMeshnetConfig {
+                    iface: &meshnet.iface,
+                    fwmark: meshnet.fwmark,
+                    peer_cidrs: &meshnet.peer_cidrs,
+                    traffic_routing_peer_cidrs: &meshnet.traffic_routing_peer_cidrs,
+                    local_network_peer_cidrs: &meshnet.local_network_peer_cidrs,
+                    inbound_tcp_ports: &meshnet.inbound_tcp_ports,
+                    inbound_udp_ports: &meshnet.inbound_udp_ports,
+                    allow_icmp: meshnet.allow_icmp,
+                }
+            }),
+            wg_iface: &config.wg_iface,
+            wg_private_key: if include_development_identity {
+                &config.wg_private_key
+            } else {
+                ""
+            },
+            wg_address: &config.wg_address,
+            wg_listen_port: config.wg_listen_port,
+            key_negotiation_port: config.key_negotiation_port,
+            peers: config
+                .peers
+                .iter()
+                .map(|peer| PersistedWgPeer {
+                    name: &peer.name,
+                    public_key: &peer.public_key,
+                    address: &peer.address,
+                    admin: peer.admin,
+                    key_negotiation_certificate_sha256: &peer.key_negotiation_certificate_sha256,
+                    key_negotiation_pq_certificate_sha256: &peer
+                        .key_negotiation_pq_certificate_sha256,
+                    minimum_key_negotiation_mode: peer.minimum_key_negotiation_mode,
+                    persistent_keepalive_secs: peer.persistent_keepalive_secs,
+                })
+                .collect(),
+            static_peer_addrs: &config.static_peer_addrs,
+            escrow_public_key: &config.escrow_public_key,
+        }
+    }
+}
+
 /// Gateway-side keep-alive interval, in seconds.
 ///
 /// Matches the client default. Short enough that a rekey happens well inside
@@ -383,11 +496,56 @@ impl NetworkConfig {
         }
     }
 
-    /// Persists the network config atomically (rename).
+    /// Persists an already public network config atomically (rename).
+    ///
+    /// Secret-bearing runtime state is refused rather than silently redacted:
+    /// an offline caller cannot know whether a plaintext gateway identity is a
+    /// disposable development key or the only copy of a legacy identity.
     pub fn save(&self) -> Result<()> {
+        if !self.wg_private_key.trim().is_empty()
+            || self.peers.iter().any(|peer| peer.preshared_key.is_some())
+        {
+            return Err(HeliosError::Config(
+                "refusing to persist runtime secrets through NetworkConfig::save".into(),
+            ));
+        }
+        self.save_projected(false)
+    }
+
+    /// Persists the allow-listed public projection of runtime configuration.
+    ///
+    /// This is the daemon path: its gateway identity already lives in the TPM
+    /// vault and peer PSKs are runtime-only material.
+    pub fn save_redacted(&self) -> Result<()> {
+        self.save_projected(false)
+    }
+
+    /// Persists a development configuration, including its simulated gateway
+    /// identity but still excluding every peer PSK.
+    ///
+    /// A dry-run has no TPM vault, so its disposable identity has no other
+    /// durable home. The separate name keeps that exception explicit at each
+    /// call site; production code must use [`Self::save`].
+    pub fn save_for_development(&self) -> Result<()> {
+        self.save_projected(true)
+    }
+
+    /// Rewrites a legacy configuration while preserving the plaintext gateway
+    /// identity it already contained and excluding every peer PSK.
+    ///
+    /// This narrow compatibility path prevents an in-place migration from
+    /// deleting the gateway's only identity before it has been sealed. New
+    /// production writes must use [`Self::save`] or [`Self::save_redacted`].
+    pub fn save_preserving_legacy_identity(&self) -> Result<()> {
+        self.save_projected(true)
+    }
+
+    fn save_projected(&self, include_development_identity: bool) -> Result<()> {
         self.validate()?;
         let path = Self::path();
-        let raw = toml::to_string_pretty(self).map_err(|e| HeliosError::Config(e.to_string()))?;
+        let persisted = PersistedNetworkConfig::new(self, include_development_identity);
+        let raw =
+            toml::to_string_pretty(&persisted).map_err(|e| HeliosError::Config(e.to_string()))?;
         if let Some(parent) = path.parent() {
             // 0700, so the mode of the file it holds is not the only barrier.
             crate::private_file::create_private_dir(parent)
@@ -1424,7 +1582,7 @@ mod tests {
     #[cfg(unix)]
     static NETWORK_CONFIG_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// No secret ever reaches `network.toml`, whatever the field.
+    /// Production persistence never lets a runtime secret reach `network.toml`.
     ///
     /// The most valuable test of ADR-006's validation family, and the cheapest:
     /// it does not check that we *remembered* to redact a known list of fields,
@@ -1436,7 +1594,7 @@ mod tests {
     /// still a secret that touched the disk.
     #[cfg(unix)]
     #[test]
-    fn no_secret_ever_reaches_the_network_config() {
+    fn production_save_excludes_runtime_secrets_and_development_keeps_only_identity() {
         let _guard = NETWORK_CONFIG_ENV.lock().unwrap_or_else(|e| e.into_inner());
         const PRIVATE_KEY: &str = "MOTIF-CLE-PRIVEE-GATEWAY-A-NE-JAMAIS-ECRIRE";
         const PSK: &str = "MOTIF-PSK-NEGOCIE-A-NE-JAMAIS-ECRIRE";
@@ -1451,10 +1609,8 @@ mod tests {
         let path = dir.join("network.toml");
         std::env::set_var("HELIOS_NETWORK_CONFIG", &path);
 
-        // The redaction that callers are supposed to perform before saving.
-        // Here the config is saved **without** it on purpose: what is under
-        // test is that `save` itself cannot be handed a secret and quietly
-        // publish it — the failure must be loud.
+        // Hand `save` the complete runtime value on purpose: the persistence
+        // boundary, rather than each caller, owns the public projection.
         let mut cfg = NetworkConfig {
             wg_private_key: PRIVATE_KEY.into(),
             wg_address: "100.64.0.1/10".into(),
@@ -1472,13 +1628,13 @@ mod tests {
             persistent_keepalive_secs: DEFAULT_PERSISTENT_KEEPALIVE_SECS,
         });
 
-        // What the daemon actually does before persisting (ADR-006 §4).
-        let mut on_disk = cfg.clone();
-        on_disk.wg_private_key.clear();
-        for peer in &mut on_disk.peers {
-            peer.preshared_key = None;
-        }
-        on_disk.save().expect("save");
+        let error = cfg.save().expect_err("secret-bearing save must fail");
+        assert!(error
+            .to_string()
+            .contains("refusing to persist runtime secrets"));
+        assert!(!path.exists(), "a refused save must not touch the file");
+
+        cfg.save_redacted().expect("redacted save");
 
         for entry in std::fs::read_dir(&dir).expect("read_dir") {
             let entry = entry.expect("entry");
@@ -1493,6 +1649,19 @@ mod tests {
                 );
             }
         }
+
+        let persisted = NetworkConfig::load().expect("reload persisted config");
+        assert!(persisted.wg_private_key.is_empty());
+        assert_eq!(persisted.peers.len(), 1);
+        assert_eq!(persisted.peers[0].name, "poste");
+        assert_eq!(persisted.peers[0].preshared_key, None);
+
+        // The dry-run exception is deliberately narrower than "save all": it
+        // retains the simulated gateway identity and still excludes peer PSKs.
+        cfg.save_for_development().expect("development save");
+        let development = std::fs::read_to_string(&path).expect("development config");
+        assert!(development.contains(PRIVATE_KEY));
+        assert!(!development.contains(PSK));
 
         std::env::remove_var("HELIOS_NETWORK_CONFIG");
         let _ = std::fs::remove_dir_all(&dir);

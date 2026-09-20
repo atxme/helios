@@ -44,6 +44,9 @@ jobs:
       # Le runner est une station de signature, pas une machine jetable. Rust
       # stable, Node 24, le SDK Windows et signtool y sont préinstallés ; ne pas
       # télécharger de code d'action tiers dans le contexte qui détient la clé.
+      # `cargo +stable` ci-dessous rend cette exception explicite : le workflow
+      # de validation utilise le MSRV épinglé, tandis que cette station conserve
+      # sa toolchain stable préinstallée.
 
       - name: Prérequis de la station de signature
         shell: pwsh
@@ -102,7 +105,7 @@ jobs:
       - name: Construction de l'installateur signé
         env:
           HELIOS_PUBLISHER_KEYRING_PATH: ${{ runner.temp }}/publisher-keyring.json
-        run: cargo xtask orion-msi
+        run: cargo +stable xtask orion-msi
 
       - name: Vérification Authenticode et empreintes
         shell: pwsh
@@ -151,7 +154,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.88.0
       - uses: actions/setup-node@v4
         with:
           node-version: 24
