@@ -10,6 +10,7 @@ use helios_firewall::ruleset;
 use helios_wireguard::PeerStatus;
 use serde::{Deserialize, Serialize};
 
+use crate::certificates::TrustUpdateRefusalStatus;
 use crate::AppState;
 
 #[derive(Serialize)]
@@ -599,7 +600,7 @@ async fn register_first_generation(
         .await
         .map_err(|refusal| {
             (
-                StatusCode::from(refusal),
+                refusal.status(),
                 "the certificate registry refused this peer's first generation".to_string(),
             )
         })

@@ -156,8 +156,8 @@ impl RenewalError {
     /// Everything that is not an authority-side failure collapses to
     /// `Rejected`: on this link the reason travels in the protected log, and a
     /// finer taxonomy relayed to a peer is an oracle on other peers' state.
-    pub fn refusal(&self) -> helios_api::certificates::TrustUpdateRefusal {
-        use helios_api::certificates::TrustUpdateRefusal as Refusal;
+    pub fn refusal(&self) -> aether::certificates::transport::TrustUpdateRefusal {
+        use aether::certificates::transport::TrustUpdateRefusal as Refusal;
         match self {
             Self::Registry(RegistryError::Io(_) | RegistryError::Corrupt(_))
             | Self::Operation(OperationError::Persistence(_) | OperationError::Corrupt(_))

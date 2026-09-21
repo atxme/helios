@@ -97,8 +97,8 @@ pub enum PrepareError {
 
 impl PrepareError {
     /// The bounded class the gateway — and through it the client — learns.
-    pub fn refusal(&self) -> helios_api::certificates::TrustUpdateRefusal {
-        use helios_api::certificates::TrustUpdateRefusal as Refusal;
+    pub fn refusal(&self) -> aether::certificates::transport::TrustUpdateRefusal {
+        use aether::certificates::transport::TrustUpdateRefusal as Refusal;
         match self {
             Self::Internal(_) => Refusal::Internal,
             Self::NoIssuer => Refusal::Unavailable,

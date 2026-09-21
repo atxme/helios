@@ -759,6 +759,34 @@ impl OrionTrustUpdateDocument {
     }
 }
 
+/// Why a trust update was refused, in the only shapes a carrier may report.
+///
+/// It lives here rather than in `helios-api` because both ends of the refusal
+/// name it: the gateway answers the in-tunnel route with it, and Astra maps
+/// its own distribution and renewal errors onto it before handing the answer
+/// back over the private link. `helios-api` cannot own a type Astra names —
+/// `astra` must not depend on it (`docs/architecture/CRATE-REORGANIZATION.md`
+/// §7). Same reason [`ClientRenewalOperationView`] is here.
+///
+/// The four shapes are deliberately coarse. The detailed reason goes to the
+/// gateway's protected log: an error taxonomy served to an
+/// authenticated-but-hostile caller is an oracle on other peers' generations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustUpdateRefusal {
+    /// Unusable message: malformed body, wrong version.
+    Protocol,
+    /// Authenticated transport, refused identity: another peer, another
+    /// gateway, a certificate or signature that does not verify.
+    Rejected,
+    /// The caller is behind, and the gateway holds no signed object to bring
+    /// it forward. Distinct from "you are current" on purpose: answering an
+    /// empty update to a client that is provably out of date would tell it the
+    /// opposite of the truth, and it would stop asking.
+    Unavailable,
+    /// The gateway failed on its own side.
+    Internal,
+}
+
 /// Signing side of the transport objects (see `authority::signing`).
 ///
 /// Public, unlike its siblings: besides the inherent `sign` methods, it holds

@@ -80,22 +80,14 @@ pub struct TrustUpdateResponse {
 
 pub use aether::certificates::client::StageCommitRequest;
 
-/// Why a trust update was refused, in the only shapes the API may report.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TrustUpdateRefusal {
-    /// Unusable message: malformed body, wrong version.
-    Protocol,
-    /// Authenticated transport, refused identity: another peer, another
-    /// gateway, a certificate or signature that does not verify.
-    Rejected,
-    /// The caller is behind, and the gateway holds no signed object to bring
-    /// it forward. Distinct from "you are current" on purpose: answering an
-    /// empty update to a client that is provably out of date would tell it the
-    /// opposite of the truth, and it would stop asking.
-    Unavailable,
-    /// The gateway failed on its own side.
-    Internal,
-}
+/// Why a trust update was refused, defined in `aether`.
+///
+/// It lives there rather than here because Astra names it too — it maps its
+/// distribution and renewal errors onto these four shapes — and `astra` must
+/// not depend on this crate (`docs/architecture/CRATE-REORGANIZATION.md` §7).
+/// Same reason [`aether::certificates::transport::ClientRenewalOperationView`]
+/// is there.
+pub use aether::certificates::transport::TrustUpdateRefusal;
 
 /// What a client needs in order to renew its own identity (spec §19).
 ///
@@ -759,15 +751,19 @@ pub async fn retired_in_tunnel_stage() -> StatusCode {
     StatusCode::NOT_FOUND
 }
 
-impl TrustUpdateRefusal {
-    fn status(self) -> StatusCode {
-        StatusCode::from(self)
-    }
+/// The one status each refusal class is served as.
+///
+/// An extension trait rather than an inherent `impl` or a `From`, because
+/// [`TrustUpdateRefusal`] is defined in `aether`, which carries no HTTP: the
+/// refusal is the shared contract, and the status code it becomes on this
+/// listener is this crate's business.
+pub(crate) trait TrustUpdateRefusalStatus {
+    fn status(self) -> StatusCode;
 }
 
-impl From<TrustUpdateRefusal> for StatusCode {
-    fn from(refusal: TrustUpdateRefusal) -> Self {
-        match refusal {
+impl TrustUpdateRefusalStatus for TrustUpdateRefusal {
+    fn status(self) -> StatusCode {
+        match self {
             TrustUpdateRefusal::Protocol => StatusCode::BAD_REQUEST,
             TrustUpdateRefusal::Rejected => StatusCode::FORBIDDEN,
             TrustUpdateRefusal::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
