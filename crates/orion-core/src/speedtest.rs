@@ -112,6 +112,20 @@ const TARGET_CHUNK_DURATION: Duration = Duration::from_millis(350);
 const CONNECTION_WARMUP_BYTES: usize = 256 * 1024;
 const ERROR_BODY_LIMIT: usize = 4 * 1024;
 
+/// How long a UDP leg waits for the gateway to admit its session.
+///
+/// The hello and the ready are two datagrams on the very service whose loss
+/// the leg is about to measure, so the handshake needs the patience of the
+/// latency probe rather than the 100 ms the data loops poll on. Without it a
+/// single dropped frame — routine on a tunnel that has just carried twenty
+/// seconds of TCP at line rate — ended the whole run.
+const UDP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Gap between two hellos while the gateway has not answered.
+///
+/// Above the round trip of any path this test is meant for, so a retry is a
+/// reaction to a lost frame and not a second copy racing the first.
+const UDP_HANDSHAKE_RETRY: Duration = Duration::from_millis(250);
+
 #[derive(Debug, Clone, Copy)]
 struct EngineConfig {
     latency_warmups: usize,
@@ -729,27 +743,47 @@ fn measure_raw_udp(
         .set_read_timeout(Some(Duration::from_millis(100)))
         .map_err(raw_transport)?;
     let session = next_session();
-    socket
-        .send(&udp_frame(
-            aether::speedtest::UDP_KIND_HELLO,
-            mode,
-            session,
-            0,
-            duration_secs,
-            rate,
-            &[],
-        ))
-        .map_err(raw_transport)?;
+    let hello = udp_frame(
+        aether::speedtest::UDP_KIND_HELLO,
+        mode,
+        session,
+        0,
+        duration_secs,
+        rate,
+        &[],
+    );
+    socket.send(&hello).map_err(raw_udp_transport)?;
     let mut received = [0u8; aether::speedtest::SPEEDTEST_UDP_DATAGRAM_BYTES + 64];
+    // The socket polls on the 100 ms timeout the data loops need; the
+    // handshake gets its own deadline on top of it, and re-sends its hello
+    // rather than reading one expired poll as a dead gateway.
+    let handshake_deadline = Instant::now() + UDP_HANDSHAKE_TIMEOUT;
+    let mut last_hello = Instant::now();
     loop {
-        let length = socket.recv(&mut received).map_err(raw_transport)?;
-        let frame = parse_client_udp_frame(&received[..length])
-            .ok_or_else(|| SpeedTestError::BadResponse("préparation UDP invalide".into()))?;
-        if frame.kind == aether::speedtest::UDP_KIND_READY
-            && frame.session == session
-            && frame.mode == mode
-        {
-            break;
+        match socket.recv(&mut received) {
+            Ok(length) => {
+                let frame = parse_client_udp_frame(&received[..length]).ok_or_else(|| {
+                    SpeedTestError::BadResponse("préparation UDP invalide".into())
+                })?;
+                if frame.kind == aether::speedtest::UDP_KIND_READY
+                    && frame.session == session
+                    && frame.mode == mode
+                {
+                    break;
+                }
+            }
+            Err(error) if looks_unanswered(&error) => {}
+            Err(error) => return Err(raw_udp_transport(error)),
+        }
+        if Instant::now() >= handshake_deadline {
+            return Err(unreachable(&format!(
+                "la session UDP n'a pas été acceptée en {} s",
+                UDP_HANDSHAKE_TIMEOUT.as_secs()
+            )));
+        }
+        if last_hello.elapsed() >= UDP_HANDSHAKE_RETRY {
+            socket.send(&hello).map_err(raw_udp_transport)?;
+            last_hello = Instant::now();
         }
     }
     socket
@@ -762,7 +796,7 @@ fn measure_raw_udp(
             rate,
             &[],
         ))
-        .map_err(raw_transport)?;
+        .map_err(raw_udp_transport)?;
     let started = Instant::now();
     match mode {
         aether::speedtest::SPEEDTEST_MODE_DOWNLOAD => measure_udp_download(
@@ -842,7 +876,7 @@ fn measure_udp_download(
                     error.kind(),
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) => {}
-            Err(error) => return Err(raw_transport(error)),
+            Err(error) => return Err(raw_udp_transport(error)),
         }
         if last_report.elapsed() >= Duration::from_millis(250) {
             emit_progress(
@@ -923,7 +957,7 @@ fn measure_udp_upload(
             duration_secs,
             rate,
         );
-        let sent = socket.send(&packet).map_err(raw_transport)?;
+        let sent = socket.send(&packet).map_err(raw_udp_transport)?;
         if sent < aether::speedtest::SPEEDTEST_UDP_HEADER_BYTES {
             continue;
         }
@@ -953,7 +987,7 @@ fn measure_udp_upload(
             aether::speedtest::SPEEDTEST_RATE_UNPACED,
             &[],
         ))
-        .map_err(raw_transport)?;
+        .map_err(raw_udp_transport)?;
     let mut summary = [0u8; aether::speedtest::SPEEDTEST_UDP_DATAGRAM_BYTES + 64];
     let receiver = loop {
         match socket.recv(&mut summary) {
@@ -979,7 +1013,7 @@ fn measure_udp_upload(
             {
                 break None
             }
-            Err(error) => return Err(raw_transport(error)),
+            Err(error) => return Err(raw_udp_transport(error)),
         }
     };
     let elapsed = started.elapsed();
@@ -1891,6 +1925,106 @@ mod tests {
             .unwrap()
             .iter()
             .any(|update| update.phase == SpeedTestPhase::TcpDownload));
+    }
+
+    /// A lost HELLO must not end the run.
+    ///
+    /// The handshake that opens a UDP leg runs over the same lossy datagram
+    /// service the leg measures: one dropped frame — routine on a tunnel that
+    /// has just carried twenty seconds of TCP at line rate — and the client
+    /// would otherwise die on the 100 ms poll timeout the data loops need,
+    /// reporting Windows' « os error 10060 » for what is a single lost packet.
+    #[test]
+    fn udp_leg_retransmits_its_hello_until_the_gateway_is_ready() {
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("udp listener");
+        let address = socket.local_addr().expect("udp address");
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("udp timeout");
+        let server = std::thread::spawn(move || {
+            let mut packet = [0u8; aether::speedtest::SPEEDTEST_UDP_DATAGRAM_BYTES + 64];
+            // The first hello is dropped on the floor, as the path would.
+            let (length, _) = socket.recv_from(&mut packet).expect("first hello");
+            let first = parse_client_udp_frame(&packet[..length]).expect("first hello frame");
+            assert_eq!(first.kind, aether::speedtest::UDP_KIND_HELLO);
+
+            let (length, peer) = socket.recv_from(&mut packet).expect("second hello");
+            let hello = parse_client_udp_frame(&packet[..length]).expect("second hello frame");
+            assert_eq!(hello.kind, aether::speedtest::UDP_KIND_HELLO);
+            assert_eq!(hello.mode, aether::speedtest::SPEEDTEST_MODE_DOWNLOAD);
+            let (mode, session) = (hello.mode, hello.session);
+            socket
+                .send_to(
+                    &udp_frame(
+                        aether::speedtest::UDP_KIND_READY,
+                        mode,
+                        session,
+                        0,
+                        1,
+                        aether::speedtest::SPEEDTEST_RATE_UNPACED,
+                        &[],
+                    ),
+                    peer,
+                )
+                .expect("ready");
+            let (length, _) = socket.recv_from(&mut packet).expect("go");
+            let go = parse_client_udp_frame(&packet[..length]).expect("go frame");
+            assert_eq!(go.kind, aether::speedtest::UDP_KIND_GO);
+
+            let payload = vec![
+                0x42;
+                aether::speedtest::SPEEDTEST_UDP_DATAGRAM_BYTES
+                    - aether::speedtest::SPEEDTEST_UDP_HEADER_BYTES
+            ];
+            let sent_packets = 16u64;
+            for sequence in 0..sent_packets {
+                socket
+                    .send_to(
+                        &udp_frame(
+                            aether::speedtest::UDP_KIND_DATA,
+                            mode,
+                            session,
+                            sequence,
+                            1,
+                            aether::speedtest::SPEEDTEST_RATE_UNPACED,
+                            &payload,
+                        ),
+                        peer,
+                    )
+                    .expect("data");
+            }
+            let mut end_payload = [0u8; 16];
+            end_payload[..8].copy_from_slice(&sent_packets.to_be_bytes());
+            end_payload[8..].copy_from_slice(&(sent_packets * payload.len() as u64).to_be_bytes());
+            socket
+                .send_to(
+                    &udp_frame(
+                        aether::speedtest::UDP_KIND_END,
+                        mode,
+                        session,
+                        sent_packets,
+                        1,
+                        aether::speedtest::SPEEDTEST_RATE_UNPACED,
+                        &end_payload,
+                    ),
+                    peer,
+                )
+                .expect("end");
+        });
+
+        let started = Instant::now();
+        let measurement = measure_raw_udp(
+            address,
+            aether::speedtest::SPEEDTEST_MODE_DOWNLOAD,
+            1,
+            50.0,
+            SpeedTestPhase::UdpDownload,
+            &(Arc::new(|_| {}) as SpeedTestProgressSink),
+            started,
+        )
+        .expect("the leg survives one lost hello");
+        server.join().expect("udp server");
+        assert!(measurement.bytes > 0);
     }
 
     #[test]
