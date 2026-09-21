@@ -140,7 +140,10 @@ pub fn admit_with_key_negotiation(
         // the gateway cannot inspect a client's configuration to check it.
         persistent_keepalive_secs: aether::config::DEFAULT_PERSISTENT_KEEPALIVE_SECS,
     };
-    config.peers.push(peer.clone());
+    // Named rather than derived since `WgPeer` may carry a PSK. This one
+    // cannot yet — the field just above is `None` by construction — so the
+    // duplication copies no secret.
+    config.peers.push(peer.duplicate());
     Ok(peer)
 }
 
@@ -463,7 +466,10 @@ mod tests {
         admit(&mut config, "new", &key(2), false).expect("admission");
 
         assert_eq!(
-            config.peers[0].preshared_key.as_deref(),
+            config.peers[0]
+                .preshared_key
+                .as_ref()
+                .map(aether::SecretString::expose),
             Some("existing-psk")
         );
         assert!(config.peers[0].admin, "the admin role is preserved");

@@ -40,7 +40,17 @@ pub enum HeliosEvent {
 }
 
 /// Commands sent by the web interface to the orchestrator.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is derived and stays safe because the two variants that carry
+/// secret material declare it with a secret type: the enum used to hold the
+/// gateway's private key as a bare `String` and a whole [`NetworkConfig`]
+/// with every peer PSK, so one `{cmd:?}` put the gateway's identity in a log
+/// line (ADR-006 §5).
+///
+/// `Clone` is gone with them. A command is sent once down an mpsc channel and
+/// consumed once; copying one was never needed, and for these two variants it
+/// was a second buffer nobody wiped.
+#[derive(Debug)]
 pub enum OrchestratorCmd {
     Connect,
     /// Replaces the gateway's WireGuard private key and seals it in the TPM.
@@ -50,7 +60,7 @@ pub enum OrchestratorCmd {
     ///
     /// **Identity rotation**: after applying, all clients must update their
     /// `peer_public_key`.
-    UpdateGatewayKey(String),
+    UpdateGatewayKey(SecretString),
     /// Applies a raw nftables ruleset (dry-run = log only).
     ApplyFirewallRules(String),
     Disconnect,
@@ -136,4 +146,59 @@ pub struct ObserveHandshakeRequest {
     /// `Ok(None)`: one means the gateway cannot tell, the other means it can
     /// and the answer is "never".
     pub reply: oneshot::Sender<Result<Option<std::time::SystemTime>, String>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A command's `Debug` must not print the material it carries.
+    ///
+    /// Both variants used to hold it as plain data — `UpdateGatewayKey` a
+    /// bare `String`, `LoadNetworkConfig` a whole configuration with every
+    /// peer PSK — inside an enum that derives `Debug`. One `{cmd:?}` in a
+    /// `tracing` call was all it took (ADR-006 §5).
+    #[test]
+    fn a_command_debug_reveals_neither_the_gateway_key_nor_a_psk() {
+        const KEY: &str = "nouvelle-cle-privee-de-la-gateway";
+        const PSK: &str = "psk-du-pair-en-clair";
+
+        let rotation = OrchestratorCmd::UpdateGatewayKey(KEY.into());
+        let rendered = format!("{rotation:?}");
+        assert!(
+            !rendered.contains(KEY),
+            "the rotation leaked the key: {rendered}"
+        );
+
+        let mut config = NetworkConfig {
+            wg_private_key: KEY.into(),
+            ..NetworkConfig::default()
+        };
+        config.peers.push(crate::config::WgPeer {
+            name: "alice".into(),
+            public_key: "CLE-PUBLIQUE-ALICE".into(),
+            address: "100.64.1.2/32".into(),
+            admin: false,
+            preshared_key: Some(PSK.into()),
+            key_negotiation_certificate_sha256: None,
+            key_negotiation_pq_certificate_sha256: None,
+            minimum_key_negotiation_mode: crate::key_negotiation::ProtectionMode::MlKem,
+            persistent_keepalive_secs: crate::config::DEFAULT_PERSISTENT_KEEPALIVE_SECS,
+        });
+
+        let reload = OrchestratorCmd::LoadNetworkConfig(Box::new(config));
+        let rendered = format!("{reload:?}");
+        assert!(
+            !rendered.contains(KEY),
+            "the hot reload leaked the identity: {rendered}"
+        );
+        assert!(
+            !rendered.contains(PSK),
+            "the hot reload leaked a PSK: {rendered}"
+        );
+        assert!(
+            rendered.contains("alice"),
+            "the rest must stay diagnosable: {rendered}"
+        );
+    }
 }

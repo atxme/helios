@@ -978,11 +978,15 @@ mod security_tests {
             Some(OrchestratorCmd::LoadNetworkConfig(config)) => {
                 assert_eq!(config.peers.len(), 2);
                 assert_eq!(
-                    config.wg_private_key, PRIVATE_KEY,
+                    config.wg_private_key.expose(),
+                    PRIVATE_KEY,
                     "the orchestrator must keep the resolved identity"
                 );
                 assert_eq!(
-                    config.peers[0].preshared_key.as_deref(),
+                    config.peers[0]
+                        .preshared_key
+                        .as_ref()
+                        .map(aether::SecretString::expose),
                     Some(PEER_PSK),
                     "the existing peer's PSK must survive admission"
                 );
@@ -1166,11 +1170,15 @@ mod security_tests {
                     "the requested setting applies"
                 );
                 assert_eq!(
-                    config.wg_private_key, PRIVATE_KEY,
+                    config.wg_private_key.expose(),
+                    PRIVATE_KEY,
                     "the gateway's identity was erased by a plain setting change"
                 );
                 assert_eq!(
-                    config.peers[0].preshared_key.as_deref(),
+                    config.peers[0]
+                        .preshared_key
+                        .as_ref()
+                        .map(aether::SecretString::expose),
                     Some(PEER_PSK),
                     "the negotiated PSK was erased by a plain setting change"
                 );

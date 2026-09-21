@@ -89,7 +89,7 @@ pub async fn provision(
         ));
     }
 
-    let gateway_public_key = match gateway_public_key(&network.wg_private_key) {
+    let gateway_public_key = match gateway_public_key(network.wg_private_key.expose()) {
         Ok(k) => k,
         Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, e)),
     };

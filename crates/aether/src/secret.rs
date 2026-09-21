@@ -25,6 +25,18 @@
 //! is. Since these values are compared against attacker-supplied ones — a PSK
 //! fingerprint, a pasted key — the implementation here compares every byte.
 //!
+//! # Deserializing yes, serializing never
+//!
+//! [`serde::Deserialize`] is implemented; `Serialize` is not, and the
+//! asymmetry is the whole point. Deserializing *creates* a secret from bytes
+//! the process already holds — it is the « raw serialized data → immediate
+//! conversion to a runtime secret type » step ADR-006 §5 asks for, and doing
+//! it any other way means parsing into a bare `String` first. Serializing
+//! would *emit* one, which is what the ADR forbids: « aucune sérialisation
+//! TOML/JSON ne reçoit un type contenant un secret ». A structure holding a
+//! [`SecretString`] therefore reads back from a legacy file, and cannot be
+//! written to one by accident.
+//!
 //! # What this does not do
 //!
 //! It does not lock the page in RAM. A `String` grows by reallocating, and the
@@ -33,6 +45,7 @@
 
 use std::fmt;
 
+use serde::{Deserialize, Deserializer};
 use zeroize::Zeroize as _;
 
 /// A secret string (base64 PSK, private key…) that never prints itself.
@@ -64,6 +77,25 @@ impl SecretString {
     /// Is the secret empty? Useful for validating without exposing.
     pub fn is_empty(&self) -> bool {
         self.0.trim().is_empty()
+    }
+}
+
+/// An absent secret. Required by `#[serde(default)]` on the fields that carry
+/// one, and it is the honest default: no key rather than a placeholder.
+impl Default for SecretString {
+    fn default() -> Self {
+        Self(String::new())
+    }
+}
+
+/// Reads a secret from a serialized document. See the module documentation
+/// for why the mirror image — `Serialize` — is deliberately absent.
+impl<'de> Deserialize<'de> for SecretString {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Through `String` because that is what the TOML/JSON parser hands
+        // back; it is moved into the secret, not copied, so this detour
+        // leaves no second buffer behind.
+        String::deserialize(deserializer).map(Self)
     }
 }
 
@@ -107,6 +139,15 @@ impl Eq for SecretString {}
 impl From<String> for SecretString {
     fn from(value: String) -> Self {
         Self(value)
+    }
+}
+
+/// Only ever *into* the secret. The dangerous direction — a secret turning
+/// back into a `String` by inference — has no conversion at all: it goes
+/// through [`SecretString::expose`], which a reviewer can grep for.
+impl From<&str> for SecretString {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
     }
 }
 
@@ -154,6 +195,32 @@ mod tests {
             !rendered.contains("secret-a-ne-pas-logger"),
             "leak: {rendered}"
         );
+    }
+
+    /// A legacy `network.toml` still carries a plaintext key, so reading one
+    /// must land in the secret type rather than in a bare `String`.
+    #[test]
+    fn a_secret_is_read_back_from_a_serialized_document() {
+        #[derive(Deserialize)]
+        struct Document {
+            #[serde(default)]
+            wg_private_key: SecretString,
+            #[serde(default)]
+            preshared_key: Option<SecretString>,
+        }
+
+        let document: Document =
+            toml::from_str("wg_private_key = \"cle-heritee\"\npreshared_key = \"psk\"\n")
+                .expect("a legacy document must still parse");
+        assert_eq!(document.wg_private_key.expose(), "cle-heritee");
+        assert_eq!(
+            document.preshared_key.as_ref().map(SecretString::expose),
+            Some("psk")
+        );
+
+        let absent: Document = toml::from_str("").expect("an empty document is valid");
+        assert!(absent.wg_private_key.is_empty());
+        assert!(absent.preshared_key.is_none());
     }
 
     #[test]

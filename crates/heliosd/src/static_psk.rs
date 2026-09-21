@@ -402,11 +402,11 @@ pub fn adopt_from_config(
 
     for peer in &mut network.peers {
         match peer.preshared_key.take() {
-            Some(psk) if !psk.trim().is_empty() => {
+            Some(psk) if !psk.is_empty() => {
                 // The file wins over the table: an operator who edited
                 // `network.toml` by hand meant that value, and silently
                 // keeping the old one would make the edit look ignored.
-                map.insert(peer.public_key.clone(), SecretString::new(psk));
+                map.insert(peer.public_key.clone(), psk);
                 adopted += 1;
             }
             _ => {}
@@ -424,7 +424,7 @@ pub fn adopt_from_config(
     // without its PSK would fail every handshake with no channel to recover.
     for peer in &mut network.peers {
         if let Some(psk) = map.get(&peer.public_key) {
-            peer.preshared_key = Some(psk.expose().to_string());
+            peer.preshared_key = Some(psk.duplicate());
         }
     }
     Ok(adopted)
@@ -747,7 +747,10 @@ mod tests {
         );
         // Back in the running config, so the data plane still works…
         assert_eq!(
-            network.peers[0].preshared_key.as_deref(),
+            network.peers[0]
+                .preshared_key
+                .as_ref()
+                .map(SecretString::expose),
             Some("cHNrLWFsaWNl")
         );
         // …and in the sealed table.
@@ -768,7 +771,10 @@ mod tests {
             0
         );
         assert_eq!(
-            network.peers[0].preshared_key.as_deref(),
+            network.peers[0]
+                .preshared_key
+                .as_ref()
+                .map(SecretString::expose),
             Some("cHNrLWFsaWNl")
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -856,7 +862,7 @@ mod tests {
             // the sealed vault, not the one the file carries.
             let mut running = aether::NetworkConfig {
                 wg_private_key: "REMPLACEE-PAR-LE-COFFRE".into(),
-                ..on_disk.clone()
+                ..on_disk.duplicate()
             };
             assert_eq!(
                 adopt_from_config(&mut running, &table_path, &gateway).expect("adopt"),

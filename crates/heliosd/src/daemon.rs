@@ -18,7 +18,6 @@ use helios_api::AppState;
 use helios_tpm::{BootController, BootDecision, TpmSettings};
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tracing::{error, info, warn};
-use zeroize::Zeroizing;
 
 use crate::commands::wan::resolve_uplink;
 use crate::process_guards::forbid_core_dumps;
@@ -99,15 +98,11 @@ pub(crate) async fn run(
              bringing up an interface. Provide a key (POST /api/gateway/wireguard-key)."
         ),
     }
-    // `NetworkConfig` is the shared runtime state the data plane and the
-    // negotiation both read from, so this copy is the durable one — the
-    // limitation ADR-006 §5 declares and does not claim to have lifted.
-    //
-    // The `drop` is load-bearing, not decoration: `resolved` lives until the
-    // end of `run`, which is the lifetime of the daemon. Wiping it here is
-    // what keeps the count of durable copies at one.
-    network.wg_private_key = resolved.private_key.expose().to_owned();
-    drop(resolved.private_key);
+    // A move, not a copy: both sides are a `SecretString`, so the buffer the
+    // vault produced *becomes* the runtime one. `NetworkConfig` is the shared
+    // state the data plane and the negotiation read from, and keeping the
+    // gateway identity there is the limitation ADR-006 §5 declares.
+    network.wg_private_key = resolved.private_key;
 
     // Static PSKs move out of `network.toml` and into the sealed table
     // (ADR-006 §4). The value is moved, not dropped: the running config is
@@ -119,13 +114,12 @@ pub(crate) async fn run(
     // starting without the PSK and falling back to classic mode. So the
     // affected peers keep no PSK and stay unable to handshake, which is the
     // fail-closed outcome — announced loudly rather than silently degraded.
-    if !network.wg_private_key.trim().is_empty() {
+    if !network.wg_private_key.is_empty() {
         let table = static_psk::default_path();
         // A copy, because `adopt_from_config` needs `&mut network` and the
-        // identity at the same time. `Zeroizing` bounds its lifetime to this
-        // block instead of leaving it in a freed allocation.
-        let identity = Zeroizing::new(network.wg_private_key.clone());
-        match static_psk::adopt_from_config(&mut network, &table, &identity) {
+        // identity at the same time. Named, and wiped when this block ends.
+        let identity = network.wg_private_key.duplicate();
+        match static_psk::adopt_from_config(&mut network, &table, identity.expose()) {
             Ok(0) => {}
             Ok(adopted) => warn!(
                 adopted,

@@ -90,7 +90,7 @@ fn wg_config(network: &NetworkConfig) -> (InterfaceConfig, Vec<PeerConfig>) {
         // borrowed across the `await` that applies it. `Zeroizing` is what
         // bounds these copies — they die with the returned structures, at the
         // end of the bring-up or of the peer synchronization (ADR-006 §5).
-        private_key: Zeroizing::new(network.wg_private_key.clone()),
+        private_key: Zeroizing::new(network.wg_private_key.expose().to_owned()),
         listen_port: network.wg_listen_port,
         address: network.wg_address.clone(),
         mtu: Some(aether::mtu::tunnel_mtu(mtu_transport(
@@ -103,7 +103,10 @@ fn wg_config(network: &NetworkConfig) -> (InterfaceConfig, Vec<PeerConfig>) {
         .map(|p| PeerConfig {
             public_key: p.public_key.clone(),
             allowed_ips: p.address.clone(),
-            preshared_key: p.preshared_key.clone().map(Zeroizing::new),
+            preshared_key: p
+                .preshared_key
+                .as_ref()
+                .map(|psk| Zeroizing::new(psk.expose().to_owned())),
             persistent_keepalive_secs: p.persistent_keepalive_secs,
         })
         .collect();
@@ -543,7 +546,11 @@ async fn handle_external_cmd(
             // Identity rotation: seal first, apply only afterwards. Sealing
             // after bringing up the interface would leave a window where the
             // key in effect would not be the one that survives a restart.
-            match crate::gateway_key::update_sealed(&*shared_network.read().await, boot, &new_key) {
+            match crate::gateway_key::update_sealed(
+                &*shared_network.read().await,
+                boot,
+                new_key.expose(),
+            ) {
                 Err(e) => {
                     warn!("WireGuard key rotation refused: {e}");
                     emit_log(event_tx, "error", &format!("Rotation refused: {e}"));
@@ -814,8 +821,12 @@ async fn install_peer_psk(
                          the declared address is kept"
                     );
                 }
+                // `previous` is a `SecretString`, so the value displaced by
+                // the new one is wiped whether it is put back on rollback or
+                // dropped on success — it used to be a bare `String` that
+                // survived either way (ADR-006 §5).
                 let previous = peer.preshared_key.take();
-                peer.preshared_key = psk.as_ref().map(|secret| secret.expose().to_string());
+                peer.preshared_key = psk.as_ref().map(aether::SecretString::duplicate);
                 previous
             }
         }
@@ -1889,7 +1900,10 @@ mod tests {
 
         // The in-memory config carries the PSK…
         assert_eq!(
-            shared.read().await.peers[0].preshared_key.as_deref(),
+            shared.read().await.peers[0]
+                .preshared_key
+                .as_ref()
+                .map(aether::SecretString::expose),
             Some("psk-from-ml-kem")
         );
         // …and so does the data plane: it is what actually protects it.
@@ -1929,7 +1943,10 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(
-            shared.read().await.peers[0].preshared_key.as_deref(),
+            shared.read().await.peers[0]
+                .preshared_key
+                .as_ref()
+                .map(aether::SecretString::expose),
             Some("psk-test"),
             "a failed rotation must return the peer to its prior state"
         );
@@ -1985,7 +2002,7 @@ mod tests {
     #[tokio::test]
     async fn disconnection_tears_down_wireguard_and_re_engages_the_kill_switch() {
         let network = configured_network();
-        let shared_network = Arc::new(RwLock::new(network.clone()));
+        let shared_network = Arc::new(RwLock::new(network.duplicate()));
         let state = Arc::new(RwLock::new(TunnelState::Up));
         let policy = Arc::new(RwLock::new(network.firewall_policy()));
         let (events, _) = broadcast::channel(8);

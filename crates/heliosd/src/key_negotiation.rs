@@ -847,7 +847,12 @@ impl NegotiationHandler for GatewayHandler {
             };
             (
                 peer.address.clone(),
-                peer.preshared_key.clone(),
+                // `key_negotiation` keeps its own `String` map; the
+                // conversion happens here, at the boundary, rather than
+                // through the whole module.
+                peer.preshared_key
+                    .as_ref()
+                    .map(|psk| psk.expose().to_owned()),
                 pq_fingerprint,
                 peer.minimum_key_negotiation_mode,
             )
@@ -1430,11 +1435,15 @@ pub async fn start(
             .iter()
             .filter_map(|peer| {
                 peer.preshared_key
-                    .clone()
-                    .map(|psk| (peer.public_key.clone(), psk))
+                    .as_ref()
+                    .map(|psk| (peer.public_key.clone(), psk.expose().to_owned()))
             })
             .collect();
-        (port, network.wg_private_key.clone(), static_psks)
+        (
+            port,
+            network.wg_private_key.expose().to_owned(),
+            static_psks,
+        )
     };
     let gateway_public_key = aether::wg::public_from_private(&gateway_private_key)
         .context("gateway WireGuard identity is unavailable for key negotiation")?;

@@ -178,8 +178,10 @@ impl From<&NetworkConfig> for NetworkConfigView {
             admin_iface: config.admin_iface.clone(),
             split_tunnel_cidrs: config.split_tunnel_cidrs.clone(),
             wg_iface: config.wg_iface.clone(),
-            wg_private_key_configured: !config.wg_private_key.trim().is_empty(),
-            wg_public_key: aether::wg::public_from_private(&config.wg_private_key).ok(),
+            wg_private_key_configured: !config.wg_private_key.is_empty(),
+            // The **public** half is what this view publishes; the private
+            // one is exposed only to derive it and never reaches the JSON.
+            wg_public_key: aether::wg::public_from_private(config.wg_private_key.expose()).ok(),
             wg_address: config.wg_address.clone(),
             wg_listen_port: config.wg_listen_port,
             key_negotiation_port: config.key_negotiation_port,
@@ -284,7 +286,7 @@ pub async fn gateway_key_set(
 
     let ok = s
         .cmd_tx
-        .send(OrchestratorCmd::UpdateGatewayKey(key.to_string()))
+        .send(OrchestratorCmd::UpdateGatewayKey(key.into()))
         .await
         .is_ok();
     Ok(Json(if ok {
@@ -479,7 +481,7 @@ pub async fn peer_admit(
     State(s): State<AppState>,
     Json(body): Json<PeerAdmitRequest>,
 ) -> Result<Json<PeerSummary>, (StatusCode, String)> {
-    let mut updated = s.network.read().await.clone();
+    let mut updated = s.network.read().await.duplicate();
     // `ml_kem` unconditionally. The v4 default fell back to `classic` when no
     // PQ certificate was supplied, which quietly produced peers whose first
     // handshake was unprotected; the admission layer now refuses such a peer
@@ -606,7 +608,7 @@ pub async fn peer_revoke(
     State(s): State<AppState>,
     Json(body): Json<PeerRevokeRequest>,
 ) -> Result<Json<PeerSummary>, (StatusCode, String)> {
-    let mut updated = s.network.read().await.clone();
+    let mut updated = s.network.read().await.duplicate();
     let peer = helios_provisioning::revoke(&mut updated, &body.name).map_err(admission_status)?;
     apply_network(&s, updated).await?;
 

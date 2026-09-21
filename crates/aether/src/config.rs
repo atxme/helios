@@ -2,6 +2,8 @@ use std::{collections::HashSet, net::Ipv4Addr, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::secret::SecretString;
+
 use crate::error::{HeliosError, Result};
 use crate::policy::{FirewallPolicy, NordvpnMeshnetPolicy, PolicyMode};
 use crate::speedtest::SPEEDTEST_PORT;
@@ -64,7 +66,24 @@ fn valid_ipv4_cidr(value: &str) -> bool {
 /// Persisted in `/var/lib/helios/network.toml`. It is the only configuration
 /// file provided by the operator — all other parameters (TPM, API and
 /// firewall mode) are architectural constants.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Deliberately derives neither `Clone` nor `Serialize`.
+///
+/// **`Serialize`**: the only shape that reaches `network.toml` is
+/// [`PersistedNetworkConfig`], an allow-list. The derive was dead code that
+/// would have made any `toml::to_string(&config)` write the gateway identity
+/// to disk — the one thing ADR-006 §4 exists to prevent.
+///
+/// **`Clone`**: this structure carries the gateway's private key and every
+/// peer PSK. Duplicating it is a decision, not a convenience, so it goes
+/// through [`NetworkConfig::duplicate`] — the same reasoning, and the same
+/// name, as [`SecretString::duplicate`].
+///
+/// `Debug` **is** derived, and that is safe by construction rather than by
+/// vigilance: the two secret fields are [`SecretString`], whose `Debug`
+/// prints nothing. A field added later leaks only if someone declares it with
+/// a non-secret type — which is the point of putting the rule on the type
+/// (ADR-006 §5).
+#[derive(Debug, PartialEq, Eq, Deserialize)]
 pub struct NetworkConfig {
     /// Uplink interfaces, in order of preference, or a single
     /// [`Self::WAN_IFACE_AUTO`] to let the daemon enumerate them.
@@ -172,8 +191,12 @@ pub struct NetworkConfig {
     pub wg_iface: String,
     /// Gateway's Curve25519 private key, in base64. **Secret.**
     /// Empty = the gateway cannot bring up its interface.
+    ///
+    /// Nominally it comes from the TPM vault and this field is filled at
+    /// startup; a legacy `network.toml` may still carry it in the clear,
+    /// which is why it still deserializes (ADR-006 §4).
     #[serde(default)]
-    pub wg_private_key: String,
+    pub wg_private_key: SecretString,
     /// Gateway's address in the tunnel network (CGNAT, ADR-001 §4).
     #[serde(default = "default_wg_address")]
     pub wg_address: String,
@@ -293,7 +316,10 @@ fn default_wg_port() -> u16 {
 }
 
 /// An authorized WireGuard client on the gateway.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Same derives, and the same reasons, as [`NetworkConfig`]: it may hold a
+/// PSK. Duplication goes through [`WgPeer::duplicate`].
+#[derive(Debug, PartialEq, Eq, Deserialize)]
 pub struct WgPeer {
     /// Friendly name (logging, UI).
     pub name: String,
@@ -307,8 +333,11 @@ pub struct WgPeer {
     #[serde(default)]
     pub admin: bool,
     /// Post-quantum PSK derived from the ML-KEM exchange, in base64. **Secret.**
+    ///
+    /// Runtime-only for a negotiated PSK; a static one lives in the sealed
+    /// table and is refilled here at startup. Never written back to the file.
     #[serde(default)]
-    pub preshared_key: Option<String>,
+    pub preshared_key: Option<SecretString>,
     /// SHA-256 fingerprint of the client leaf certificate authorized for
     /// public key negotiation. Public metadata; the certificate private key
     /// remains on Orion.
@@ -427,8 +456,11 @@ impl<'a> PersistedNetworkConfig<'a> {
                 }
             }),
             wg_iface: &config.wg_iface,
+            // The one place the identity may legitimately reach a
+            // serializer, and only under the two named exceptions. Every
+            // other field of this projection is public configuration.
             wg_private_key: if include_development_identity {
-                &config.wg_private_key
+                config.wg_private_key.expose()
             } else {
                 ""
             },
@@ -463,6 +495,29 @@ impl<'a> PersistedNetworkConfig<'a> {
 /// 25 seconds.
 pub const DEFAULT_PERSISTENT_KEEPALIVE_SECS: u16 = 25;
 
+impl WgPeer {
+    /// Makes a second, independent copy of the peer, PSK included.
+    ///
+    /// Replaces the `Clone` derive, for the reason [`NetworkConfig::duplicate`]
+    /// gives.
+    #[must_use]
+    pub fn duplicate(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            public_key: self.public_key.clone(),
+            address: self.address.clone(),
+            admin: self.admin,
+            preshared_key: self.preshared_key.as_ref().map(SecretString::duplicate),
+            key_negotiation_certificate_sha256: self.key_negotiation_certificate_sha256.clone(),
+            key_negotiation_pq_certificate_sha256: self
+                .key_negotiation_pq_certificate_sha256
+                .clone(),
+            minimum_key_negotiation_mode: self.minimum_key_negotiation_mode,
+            persistent_keepalive_secs: self.persistent_keepalive_secs,
+        }
+    }
+}
+
 const fn default_persistent_keepalive_secs() -> u16 {
     DEFAULT_PERSISTENT_KEEPALIVE_SECS
 }
@@ -481,7 +536,11 @@ impl NetworkConfig {
     /// Returns an empty config if the file does not exist yet.
     pub fn load() -> Result<Self> {
         let path = Self::path();
-        match std::fs::read_to_string(&path) {
+        match std::fs::read_to_string(&path).map(zeroize::Zeroizing::new) {
+            // The file's text is `Zeroizing` because a legacy `network.toml`
+            // still carries the gateway identity in the clear, and a
+            // hand-edited one a static PSK: the parse buffer holds both
+            // (ADR-006 §5).
             Ok(raw) => {
                 let config: Self =
                     toml::from_str(&raw).map_err(|e| HeliosError::Config(e.to_string()))?;
@@ -502,7 +561,7 @@ impl NetworkConfig {
     /// an offline caller cannot know whether a plaintext gateway identity is a
     /// disposable development key or the only copy of a legacy identity.
     pub fn save(&self) -> Result<()> {
-        if !self.wg_private_key.trim().is_empty()
+        if !self.wg_private_key.is_empty()
             || self.peers.iter().any(|peer| peer.preshared_key.is_some())
         {
             return Err(HeliosError::Config(
@@ -587,12 +646,45 @@ impl NetworkConfig {
     /// Everything else — the peer list itself, addresses, flags, ports —
     /// comes from the incoming configuration. That is the point: this is how
     /// a peer admitted on the console reaches the running gateway.
+    /// Makes a second, independent copy of the whole configuration.
+    ///
+    /// Replaces the `Clone` derive. The name is the point: this copy carries
+    /// the gateway identity and every peer PSK, so each call site is a place
+    /// to justify in review — exactly like [`SecretString::duplicate`], whose
+    /// reasoning this follows (ADR-006 §5).
+    #[must_use]
+    pub fn duplicate(&self) -> Self {
+        Self {
+            wan_ifaces: self.wan_ifaces.clone(),
+            lan_ifaces: self.lan_ifaces.clone(),
+            allow_ssh_from: self.allow_ssh_from.clone(),
+            admin_ifaces: self.admin_ifaces.clone(),
+            allow_dhcp_on_wan: self.allow_dhcp_on_wan,
+            allow_client_internet: self.allow_client_internet,
+            allow_tunnel_icmp: self.allow_tunnel_icmp,
+            allow_gateway_egress: self.allow_gateway_egress,
+            allow_ssh_over_tunnel: self.allow_ssh_over_tunnel,
+            iperf_port: self.iperf_port,
+            admin_iface: self.admin_iface.clone(),
+            split_tunnel_cidrs: self.split_tunnel_cidrs.clone(),
+            nordvpn_meshnet: self.nordvpn_meshnet.clone(),
+            wg_iface: self.wg_iface.clone(),
+            wg_private_key: self.wg_private_key.duplicate(),
+            wg_address: self.wg_address.clone(),
+            wg_listen_port: self.wg_listen_port,
+            key_negotiation_port: self.key_negotiation_port,
+            peers: self.peers.iter().map(WgPeer::duplicate).collect(),
+            static_peer_addrs: self.static_peer_addrs.clone(),
+            escrow_public_key: self.escrow_public_key.clone(),
+        }
+    }
+
     pub fn adopt_runtime_secrets_from(&mut self, current: &Self) {
         if self.wan_iface_is_auto() && !current.wan_iface_is_auto() {
             self.wan_ifaces.clone_from(&current.wan_ifaces);
         }
-        if self.wg_private_key.trim().is_empty() {
-            self.wg_private_key.clone_from(&current.wg_private_key);
+        if self.wg_private_key.is_empty() {
+            self.wg_private_key = current.wg_private_key.duplicate();
         }
         if self.key_negotiation_port.is_none() {
             self.key_negotiation_port = current.key_negotiation_port;
@@ -606,7 +698,7 @@ impl NetworkConfig {
                 continue;
             };
             if peer.preshared_key.is_none() {
-                peer.preshared_key.clone_from(&known.preshared_key);
+                peer.preshared_key = known.preshared_key.as_ref().map(SecretString::duplicate);
             }
             if peer.key_negotiation_certificate_sha256.is_none() {
                 peer.key_negotiation_certificate_sha256
@@ -893,7 +985,7 @@ impl NetworkConfig {
 
     /// Is the gateway configured to bring up its WireGuard interface?
     pub fn wireguard_ready(&self) -> bool {
-        !self.wg_private_key.trim().is_empty() && !self.wg_address.trim().is_empty()
+        !self.wg_private_key.is_empty() && !self.wg_address.trim().is_empty()
     }
 
     /// Out-of-band administration interfaces, trimmed and deduplicated.
@@ -1127,7 +1219,7 @@ mod tests {
                     // floor must not follow it down.
                     minimum_key_negotiation_mode: crate::key_negotiation::ProtectionMode::Classic,
                     persistent_keepalive_secs: DEFAULT_PERSISTENT_KEEPALIVE_SECS,
-                    ..running.peers[0].clone()
+                    ..running.peers[0].duplicate()
                 },
                 WgPeer {
                     name: "nouveau".into(),
@@ -1146,10 +1238,13 @@ mod tests {
 
         from_disk.adopt_runtime_secrets_from(&running);
 
-        assert_eq!(from_disk.wg_private_key, "SECRET-DE-LA-GATEWAY");
+        assert_eq!(from_disk.wg_private_key.expose(), "SECRET-DE-LA-GATEWAY");
         assert_eq!(from_disk.key_negotiation_port, Some(51821));
         assert_eq!(
-            from_disk.peers[0].preshared_key.as_deref(),
+            from_disk.peers[0]
+                .preshared_key
+                .as_ref()
+                .map(SecretString::expose),
             Some("PSK-NEGOCIE"),
             "the negotiated PSK must survive a reload"
         );
@@ -1169,6 +1264,81 @@ mod tests {
         assert_eq!(from_disk.peers.len(), 2);
         assert_eq!(from_disk.peers[1].name, "nouveau");
         assert_eq!(from_disk.peers[1].preshared_key, None);
+    }
+
+    /// The `Debug` of the running configuration must not print the gateway
+    /// identity nor a peer PSK.
+    ///
+    /// This is the derive, not a hand-written impl: it stays safe because the
+    /// two fields are `SecretString`. The test is what fails if one of them
+    /// ever goes back to a bare `String` (ADR-006 §5).
+    #[test]
+    fn the_debug_of_a_running_configuration_reveals_no_secret() {
+        const KEY: &str = "cle-privee-de-la-gateway";
+        const PSK: &str = "psk-negocie-du-pair";
+
+        let mut config = NetworkConfig {
+            wg_private_key: KEY.into(),
+            ..NetworkConfig::default()
+        };
+        config.peers.push(WgPeer {
+            name: "alice".into(),
+            public_key: "CLE-PUBLIQUE-ALICE".into(),
+            address: "100.64.1.2/32".into(),
+            admin: false,
+            preshared_key: Some(PSK.into()),
+            key_negotiation_certificate_sha256: None,
+            key_negotiation_pq_certificate_sha256: None,
+            minimum_key_negotiation_mode: crate::key_negotiation::ProtectionMode::MlKem,
+            persistent_keepalive_secs: DEFAULT_PERSISTENT_KEEPALIVE_SECS,
+        });
+
+        let rendered = format!("{config:?}");
+        assert!(!rendered.contains(KEY), "the identity leaked: {rendered}");
+        assert!(!rendered.contains(PSK), "a PSK leaked: {rendered}");
+        // The rest must stay readable, or the redaction would have cost the
+        // diagnostic the `Debug` exists for.
+        assert!(rendered.contains("alice"));
+        assert!(rendered.contains("100.64.1.2/32"));
+    }
+
+    /// Duplication is named, and it really does copy the secrets.
+    ///
+    /// Both halves matter: a `duplicate` that dropped them would silently
+    /// disarm the hot reload, which is what `adopt_runtime_secrets_from`
+    /// relies on.
+    #[test]
+    fn duplicating_a_configuration_carries_the_secrets_independently() {
+        let mut original = NetworkConfig {
+            wg_private_key: "identite".into(),
+            ..NetworkConfig::default()
+        };
+        original.peers.push(WgPeer {
+            name: "alice".into(),
+            public_key: "CLE-PUBLIQUE-ALICE".into(),
+            address: "100.64.1.2/32".into(),
+            admin: false,
+            preshared_key: Some("psk".into()),
+            key_negotiation_certificate_sha256: None,
+            key_negotiation_pq_certificate_sha256: None,
+            minimum_key_negotiation_mode: crate::key_negotiation::ProtectionMode::MlKem,
+            persistent_keepalive_secs: DEFAULT_PERSISTENT_KEEPALIVE_SECS,
+        });
+
+        let copy = original.duplicate();
+        assert_eq!(copy.wg_private_key.expose(), "identite");
+        assert_eq!(
+            copy.peers[0]
+                .preshared_key
+                .as_ref()
+                .map(SecretString::expose),
+            Some("psk")
+        );
+        assert_eq!(copy, original);
+
+        // Independent: mutating one must not reach the other.
+        original.wg_private_key = "autre".into();
+        assert_eq!(copy.wg_private_key.expose(), "identite");
     }
 
     #[test]

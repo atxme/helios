@@ -99,12 +99,12 @@ pub(crate) fn peer_command(mut network: NetworkConfig, command: PeerCommand) -> 
             // and would make it slide back onto that public key if it were
             // ever re-admitted.
             let table = static_psk::default_path();
-            let identity = network.wg_private_key.trim().to_string();
+            let identity = network.wg_private_key.duplicate();
             if !identity.is_empty() {
-                match static_psk::load(&table, &identity) {
+                match static_psk::load(&table, identity.expose()) {
                     Ok(mut map) => {
                         if map.remove(&peer.public_key) {
-                            static_psk::store(&table, &identity, &map).map_err(|e| {
+                            static_psk::store(&table, identity.expose(), &map).map_err(|e| {
                                 anyhow::anyhow!("writing the static PSK table: {e}")
                             })?;
                             info!("static PSK removed with the peer");

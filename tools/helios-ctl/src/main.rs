@@ -676,10 +676,21 @@ async fn cmd_network_load(client: &Client, base: &str, file: &PathBuf) -> Result
         .await
         .with_context(|| format!("could not read {}", file.display()))?;
 
+    // Parsed once to fail here rather than on the gateway: an invalid file
+    // must not travel.
     let config: NetworkConfig =
         toml::from_str(&raw).with_context(|| format!("invalid TOML in {}", file.display()))?;
 
-    let body = serde_json::to_string(&config)?;
+    // What travels is the operator's document, not a re-serialized
+    // `NetworkConfig`. `NetworkConfig` deliberately has no `Serialize`: it
+    // carries the gateway's private key and every peer PSK, and a derive
+    // there would make any `to_string(&config)` emit them (ADR-006 §4/§5).
+    // Sending the document keeps this command's behaviour exactly as it was —
+    // a legacy file carrying a plaintext identity still reaches
+    // `POST /api/network`, which is what installs it.
+    let document: toml::Value =
+        toml::from_str(&raw).with_context(|| format!("invalid TOML in {}", file.display()))?;
+    let body = serde_json::to_string(&document)?;
     let resp: CmdResp = client
         .post(format!("{base}/api/network"))
         .header("Content-Type", "application/json")
@@ -1131,6 +1142,43 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `network load` sends the operator's document, not a re-serialized
+    /// `NetworkConfig`. The gateway still has to be able to read it.
+    ///
+    /// `NetworkConfig` has no `Serialize` — it carries the gateway identity
+    /// and every peer PSK — so this command converts the parsed TOML instead.
+    /// That is only sound if the conversion round-trips, including the
+    /// legacy plaintext identity a migration file still holds.
+    #[test]
+    fn a_pushed_document_round_trips_through_json() {
+        const LEGACY: &str = r#"
+            wan_iface = "eth0"
+            wg_private_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+            wg_address = "100.64.0.1/10"
+            key_negotiation_port = 51821
+
+            [[peers]]
+            name = "alice"
+            public_key = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="
+            address = "100.64.1.2/32"
+            preshared_key = "cHNrLXN0YXRpcXVl"
+        "#;
+
+        for raw in [LEGACY, include_str!("../../../config/network.toml")] {
+            let document: toml::Value = toml::from_str(raw).expect("the document parses");
+            let body = serde_json::to_string(&document).expect("the document converts to JSON");
+            let received: NetworkConfig =
+                serde_json::from_str(&body).expect("the gateway reads back what was sent");
+            received.validate().expect("and it validates there");
+
+            let direct: NetworkConfig = toml::from_str(raw).expect("reference parse");
+            assert_eq!(
+                received, direct,
+                "the document must reach the gateway unchanged"
+            );
+        }
+    }
 
     #[test]
     fn current_wireguard_status_is_deserializable() {

@@ -378,7 +378,7 @@ pub fn resolve(network: &NetworkConfig, boot: &BootDecision) -> ResolvedKey {
     }
 
     // 2. Fall back to the plaintext key from the config — degraded mode.
-    let plain = network.wg_private_key.trim();
+    let plain = network.wg_private_key.expose().trim();
     if !plain.is_empty() {
         warn!(
             "WireGuard key read IN THE CLEAR from network.toml — a stolen disk is \
@@ -503,7 +503,7 @@ pub fn update_sealed(
     // A failure here aborts the rotation rather than proceeding: an identity
     // replaced while its PSK table stayed behind is exactly the silent
     // half-migration the ADR forbids.
-    let old_key = network.wg_private_key.trim();
+    let old_key = network.wg_private_key.expose().trim();
     if !old_key.is_empty() && old_key != key {
         match crate::static_psk::rotate(&crate::static_psk::default_path(), old_key, key) {
             Ok(0) => {}
