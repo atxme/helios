@@ -616,14 +616,10 @@ pub async fn peer_revoke(
 
 /// Persists a mutated configuration then forwards it to the orchestrator.
 ///
-/// The copy written to disk is stripped of the secrets the in-memory
-/// configuration carries:
-///
-/// * the post-quantum PSKs, **always**: they get renegotiated at enrollment,
-///   and a PSK on disk would survive the rotation meant to replace it;
-/// * the WireGuard private key, **outside dry-run**: it comes from the
-///   sealed TPM vault, and rewriting it into `network.toml` would put it back
-///   in clear on disk, exactly what the sealing exists to prevent.
+/// [`aether::NetworkConfig::save_redacted`] owns the production projection and
+/// excludes every runtime secret. Dry-run uses the one explicit exception: its
+/// disposable WireGuard identity has no TPM vault, so it stays in
+/// `network.toml`; peer PSKs remain excluded in both modes.
 ///
 /// The dry-run exception is explicit and cannot otherwise be worked around:
 /// without a TPM, the vault doesn't exist and `network.toml` is the **only**
@@ -637,16 +633,12 @@ async fn apply_network(
     s: &AppState,
     updated: aether::NetworkConfig,
 ) -> Result<(), (StatusCode, String)> {
-    let mut on_disk = updated.clone();
-    if !s.dry_run {
-        on_disk.wg_private_key.clear();
-    }
-    for peer in &mut on_disk.peers {
-        peer.preshared_key = None;
-    }
-    on_disk
-        .save()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let persisted = if s.dry_run {
+        updated.save_for_development()
+    } else {
+        updated.save_redacted()
+    };
+    persisted.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     s.cmd_tx
         .send(OrchestratorCmd::LoadNetworkConfig(Box::new(updated)))

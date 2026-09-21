@@ -257,8 +257,13 @@ fn seed(
             next_ca_transition_fingerprint: None,
             ca_activation_at: None,
             ca_retire_active_at: None,
-            active_gateway_identity_epoch: 0,
-            gateway_decision_epoch: 0,
+            // From the enrolment block, never a constant: the registry that
+            // admitted this client is at epoch 1 from its first day (§13.1),
+            // and a store seeded at 0 is behind on a comparison no transition
+            // can close — the gateway would answer 503 to every trust update
+            // this profile ever sends.
+            active_gateway_identity_epoch: trust.active_gateway_identity_epoch,
+            gateway_decision_epoch: trust.gateway_decision_epoch,
             next_gateway_identity_epoch: None,
             next_transition_fingerprint: None,
             last_aborted_transition: None,

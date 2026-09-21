@@ -11,6 +11,7 @@ async-trait = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 base64 = "0.22"
+zeroize = { workspace = true }
 defguard_wireguard_rs = { workspace = true, optional = true }
 
 [features]

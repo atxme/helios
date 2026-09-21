@@ -23,7 +23,7 @@ pub(crate) fn init_key_negotiation(
     let boot = unlock_tpm_for_offline_command(&TpmSettings::default())
         .context("unlocking the TPM vault for key-negotiation identity creation")?;
     let resolved = gateway_key::resolve(network, &boot);
-    let gateway_wg_public_key = aether::wg::public_from_private(&resolved.private_key)
+    let gateway_wg_public_key = aether::wg::public_from_private(resolved.private_key.expose())
         .context("gateway WireGuard identity is unavailable")?;
     let result = key_negotiation::initialize(
         server_name,

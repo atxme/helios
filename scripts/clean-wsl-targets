@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Remove every Helios-specific Cargo target except the canonical WSL cache.
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Keep the cleanup target fixed: unlike the build wrapper, this script performs
+# deletion and must never let an environment variable widen its scope.
+canonical_target="$HOME/.cache/helios-target"
+
+remove_target() {
+    local target="$1"
+    [ -d "$target" ] || return 0
+    case "$target" in
+        "$repo_root/target"|"$repo_root/fuzz/target"|"$repo_root"/../helios-worktrees/*/target|"$HOME/.cache/helios-audit"|"$canonical_target") ;;
+        *) echo "Refus : cible non autorisée : $target" >&2; exit 2 ;;
+    esac
+    echo "Suppression : $target"
+    rm -rf -- "$target"
+}
+
+remove_target "$repo_root/target"
+remove_target "$repo_root/fuzz/target"
+remove_target "$HOME/.cache/helios-audit"
+if [ -d "$repo_root/../helios-worktrees" ]; then
+    while IFS= read -r -d '' target; do
+        remove_target "$target"
+    done < <(find "$repo_root/../helios-worktrees" -mindepth 2 -maxdepth 2 -type d -name target -print0)
+fi
+
+# The canonical directory is emptied too, so the next wrapper invocation is a
+# genuinely fresh single-target build. It is recreated on demand.
+remove_target "$canonical_target"
+echo "Cibles Helios nettoyées. La prochaine compilation utilisera uniquement : $canonical_target"

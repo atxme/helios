@@ -41,6 +41,23 @@ vérifiée qu’au moment de la PR.
 | Admission | VIP dérivée de la clé publique, adresse de la gateway réservée, doublons de nom et de clé refusés, PSK des autres pairs préservés, persistance sans clé privée ni PSK (ADR-004) |
 | Bundle d'installation | manifeste `helios-bundle-v1` : signature hybride, fichier altéré, manquant **et surnuméraire**, chemin hors racine, lien symbolique, destination inconnue, canal, anti-rollback, configuration préservée (ADR-004) |
 
+## Fuzzing planifié
+
+Le workflow *Fuzzing planifié* s'exécute chaque dimanche à 03:17 UTC et peut
+être lancé manuellement. Il ne s'exécute pas sur les pull requests. Il utilise
+la toolchain nightly uniquement pour `cargo-fuzz`, qui est requis par
+libFuzzer, et conserve le build fuzzing hors de l'espace de travail principal.
+
+Les quatre targets (`signed_object`, `trust_transaction`, `x509_documents` et
+`gateway_state_machine`) sont exécutées séquentiellement avec un budget de
+120 secondes chacune. Le job est limité à 20 minutes. Les corpus générés, les
+artefacts de crash et les logs sont publiés comme un artefact conservé 30 jours,
+y compris lorsqu'une target échoue ; l'échec est ensuite propagé au workflow.
+
+Cette campagne complète les tests de graines de `aether::fuzzing` et ne remplace
+pas les validations matérielles décrites plus bas. Les corpus et crashes issus
+d'une campagne doivent être examinés avant toute suppression ou régénération.
+
 `cargo-audit` est un prérequis local :
 
 ```sh

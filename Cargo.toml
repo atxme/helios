@@ -69,7 +69,7 @@ axum = { version = "0.7", features = ["ws"] }
 mime_guess = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 quinn = { version = "0.11.9", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
-rustls = { version = "0.23.40", default-features = false, features = ["ring", "aws_lc_rs", "std", "tls12"] }
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "aws_lc_rs", "std", "tls12"] }
 # `aws_lc_rs` plutôt que le défaut `ring` : rcgen tire ses **clés privées X.509**
 # de son fournisseur, et par défaut c'est le CSPRNG de `ring` — un second
 # générateur, à côté de celui que NEGOCIATION-DE-CLE-V5 §4.3 impose. Ce réglage
@@ -104,8 +104,8 @@ netlink-sys = { version = "0.8", features = ["tokio_socket"] }
 # `fips` (aws-lc-fips-sys, certificats CAVP/CMVP) reste hors périmètre : elle
 # exige les chaînes CMake et Go qu'ADR-001 §2 tient hors du build, pour le même
 # mécanisme.
-aws-lc-rs = { version = "1.17", features = ["prebuilt-nasm"] }
-aws-lc-sys = "0.42.0"
+aws-lc-rs = { version = "1.18.1", features = ["prebuilt-nasm"] }
+aws-lc-sys = "0.45.0"
 # ML-DSA (FIPS 204), épinglé après lecture de la source 0.4.6. Le RNG par défaut
 # reste désactivé côté vérification.
 #

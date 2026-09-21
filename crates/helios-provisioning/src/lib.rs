@@ -36,8 +36,9 @@
 //! itself also behind the tunnel.
 //!
 //! The TPM intent remains valid but targets a different secret:
-//! `wg_private_key`, the gateway's real identity, today stored in clear in
-//! `network.toml`.
+//! `wg_private_key`, the gateway's real identity. The nominal storage is the
+//! TPM-sealed vault; a plaintext value in `network.toml` remains accepted only
+//! as a legacy fallback and is sealed automatically when possible.
 //!
 //! # PSK installation: the order is a safety invariant
 //!

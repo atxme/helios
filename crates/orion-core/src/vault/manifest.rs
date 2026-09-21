@@ -31,7 +31,7 @@ use aether::key_negotiation::ProtectionMode;
 
 /// Version written today. Any version not listed below is refused, never
 /// guessed.
-const MANIFEST_VERSION: u8 = 6;
+const MANIFEST_VERSION: u8 = 7;
 
 /// Previous version, still readable: it lacks the trailing `ssh_target`.
 ///
@@ -76,6 +76,16 @@ const MANIFEST_VERSION_WITHOUT_PROFILE_KIND: u8 = 4;
 /// expired identity, because §7.5 begins by naming the credential that will
 /// approve it. Re-sealing after a re-issued enrolment writes the list down.
 const MANIFEST_VERSION_WITHOUT_CREDENTIAL_BINDINGS: u8 = 5;
+
+/// Previous version: everything of today except the two gateway identity
+/// epochs of the §19 block.
+///
+/// Read as zero, which is what such a profile actually knows — and which the
+/// trust block's own validation refuses, so the profile is re-issued rather
+/// than resealed into a store that can never be updated. It still mounts a
+/// tunnel; what it cannot do is collect a trust update, because a store seeded
+/// at epoch 0 is permanently behind a registry that starts at 1.
+const MANIFEST_VERSION_WITHOUT_GATEWAY_EPOCHS: u8 = 6;
 
 /// The credential bindings, as the one text field the manifest stores them in.
 ///
@@ -329,6 +339,8 @@ impl ProfileManifest {
                         codec::put(&mut out, credential_bindings_json(trust).as_bytes())?;
                         out.extend_from_slice(&trust.astra_service_key_epoch.to_be_bytes());
                         codec::put(&mut out, trust.astra_service_public_key.as_bytes())?;
+                        out.extend_from_slice(&trust.active_gateway_identity_epoch.to_be_bytes());
+                        out.extend_from_slice(&trust.gateway_decision_epoch.to_be_bytes());
                     }
                 }
             }
@@ -347,6 +359,7 @@ impl ProfileManifest {
         let mut cursor = Cursor::new(bytes);
         let version = cursor.byte()?;
         if version != MANIFEST_VERSION
+            && version != MANIFEST_VERSION_WITHOUT_GATEWAY_EPOCHS
             && version != MANIFEST_VERSION_WITHOUT_CREDENTIAL_BINDINGS
             && version != MANIFEST_VERSION_WITHOUT_PROFILE_KIND
             && version != MANIFEST_VERSION_WITHOUT_ASTRA_POLICY
@@ -373,8 +386,12 @@ impl ProfileManifest {
             None
         };
         // Read where it was written, so a v4 manifest keeps decoding byte for
-        // byte as it always did.
-        let profile_type = if version == MANIFEST_VERSION {
+        // byte as it always did. Written since v5, so the test is the version
+        // that introduced it and not the current one: a comparison against
+        // `MANIFEST_VERSION` stops being true for every sealed profile the
+        // moment the version is bumped, and each of them would then be read
+        // one byte out of step.
+        let profile_type = if version > MANIFEST_VERSION_WITHOUT_PROFILE_KIND {
             profile_kind_from_id(cursor.byte()?)?
         } else {
             None
@@ -391,11 +408,7 @@ impl ProfileManifest {
                 identity: cursor.text()?,
                 // Read where it was written, so a v2 manifest keeps decoding
                 // byte for byte as it always did.
-                trust: if version == MANIFEST_VERSION
-                    || version == MANIFEST_VERSION_WITHOUT_CREDENTIAL_BINDINGS
-                    || version == MANIFEST_VERSION_WITHOUT_PROFILE_KIND
-                    || version == MANIFEST_VERSION_WITHOUT_ASTRA_POLICY
-                {
+                trust: if version > MANIFEST_VERSION_WITHOUT_TRUST {
                     match cursor.byte()? {
                         0 => None,
                         1 => Some(crate::config::TrustMaterial {
@@ -425,13 +438,29 @@ impl ProfileManifest {
                             } else {
                                 0
                             },
-                            astra_credential_bindings: if version == MANIFEST_VERSION {
+                            astra_credential_bindings: if version
+                                > MANIFEST_VERSION_WITHOUT_CREDENTIAL_BINDINGS
+                            {
                                 decode_credential_bindings(&cursor.text()?)?
                             } else {
                                 Vec::new()
                             },
                             astra_service_key_epoch: u64::from_be_bytes(cursor.array::<8>()?),
                             astra_service_public_key: cursor.text()?,
+                            active_gateway_identity_epoch: if version
+                                > MANIFEST_VERSION_WITHOUT_GATEWAY_EPOCHS
+                            {
+                                u64::from_be_bytes(cursor.array::<8>()?)
+                            } else {
+                                0
+                            },
+                            gateway_decision_epoch: if version
+                                > MANIFEST_VERSION_WITHOUT_GATEWAY_EPOCHS
+                            {
+                                u64::from_be_bytes(cursor.array::<8>()?)
+                            } else {
+                                0
+                            },
                         }),
                         other => {
                             return Err(VaultError::ManifestEncoding(format!(
@@ -636,6 +665,8 @@ mod tests {
             astra_credential_bindings: Vec::new(),
             astra_service_key_epoch: 5,
             astra_service_public_key: "c2VydmljZQ==".into(),
+            active_gateway_identity_epoch: 7,
+            gateway_decision_epoch: 8,
         });
 
         let original_digest =
@@ -667,6 +698,8 @@ mod tests {
         assert_eq!(trust.ca_tls_epoch, 2);
         assert_eq!(trust.client_generation, 4);
         assert_eq!(trust.astra_service_key_epoch, 5);
+        assert_eq!(trust.active_gateway_identity_epoch, 7);
+        assert_eq!(trust.gateway_decision_epoch, 8);
         assert_eq!(trust.astra_authority_url, "https://astra.example");
     }
 

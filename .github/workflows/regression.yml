@@ -1,7 +1,8 @@
 name: Régression
 
 # Les pull requests jouent le socle rapide ; `main` et les lancements manuels
-# jouent la campagne complète, dont les audits et couvertures coûteux.
+# jouent la campagne complète, dont les audits et couvertures coûteux. Tous les
+# jobs Rust de validation utilisent explicitement le MSRV 1.88.0.
 # `bash scripts/regression.sh` reste la référence locale de cette campagne.
 #
 # `workflow_dispatch` reste ouvert à toutes les branches : une campagne à la
@@ -30,7 +31,10 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Toolchain Rust 1.88.0 (MSRV)
+        uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          components: rustfmt, clippy
       # Cache Rust standard : registre, dépendances git et artefacts de build.
       # Le toolchain et le job distinguent naturellement Linux et Windows.
       - uses: Swatinem/rust-cache@v2
@@ -45,6 +49,14 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libtss2-dev libudev-dev
+      - name: Audit des dépendances Rust (Cargo.lock)
+        run: |
+          if ! command -v cargo-audit >/dev/null 2>&1; then
+            cargo install cargo-audit --version 0.22.2 --locked
+          fi
+          # cargo-audit inspecte directement le lockfile et ne fournit pas
+          # d'option `--locked` dans sa CLI.
+          cargo audit --file Cargo.lock
       - name: Vérifications rapides
         run: bash scripts/check.sh
 
@@ -54,9 +66,10 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Toolchain Rust 1.88.0 (MSRV)
+        uses: dtolnay/rust-toolchain@1.88.0
         with:
-          components: llvm-tools-preview
+          components: llvm-tools-preview, rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-node@v4
         with:
@@ -72,7 +85,7 @@ jobs:
       - name: Outil d'audit Rust
         run: |
           if ! command -v cargo-audit >/dev/null 2>&1; then
-            cargo install cargo-audit --locked
+            cargo install cargo-audit --version 0.22.2 --locked
           fi
       - name: Campagne de régression
         run: bash scripts/regression.sh
@@ -96,9 +109,10 @@ jobs:
     runs-on: windows-2025
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Toolchain Rust 1.88.0 (MSRV)
+        uses: dtolnay/rust-toolchain@1.88.0
         with:
-          components: llvm-tools-preview
+          components: llvm-tools-preview, clippy
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-node@v4
         with:

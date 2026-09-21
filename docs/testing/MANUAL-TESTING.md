@@ -503,18 +503,18 @@ du plan de données gateway n'est pas terminé.
 
 ## Le speedtest ne répond pas
 
-Orion affiche « aucune réponse de la gateway sur le port 51822 » : les paquets
+Orion affiche « aucune réponse de la gateway sur le port 55182 » : les paquets
 partent dans le tunnel et rien ne revient. Deux causes, deux vérifications sur
 la gateway.
 
 ```sh
 # 1. heliosd écoute-t-il, et sur la bonne adresse ?
-ss -lntup | grep 51822  # attendu : 100.64.0.1:51822, pas 127.0.0.1:51822
+ss -lntup | grep 55182  # attendu : 100.64.0.1:55182, pas 127.0.0.1:55182
 journalctl --namespace=helios -u heliosd | grep 'raw speedtest'
 
 # 2. le pare-feu ouvre-t-il le port sur l'interface du tunnel ?
-nft list chain inet helios input | grep 51822
-# attendu : deux règles `iifname "helios0" ... dport 51822 accept`
+nft list chain inet helios input | grep 55182
+# attendu : deux règles `iifname "helios0" ... dport 55182 accept`
 ```
 
 Une écoute sur `127.0.0.1` signifie que la gateway a démarré sans identité
@@ -523,10 +523,10 @@ la boucle locale jusqu'au prochain démarrage.
 
 À ne pas confondre avec un port **occupé** : là, Orion dit que la gateway ne
 sert pas le speedtest (un refus, `os error 10054`), et
-`ss -lntup | grep 51822` nomme le programme fautif. Le service Helios utilise
-précisément `51822` afin de ne plus entrer en conflit avec iperf3, dont le port
-par défaut est `5201`. Le silence est un problème de joignabilité, le refus un
-problème d'occupation.
+`ss -lntup | grep 55182` nomme le programme fautif. Le service Helios utilise
+`55182`, dans la plage privée/dynamique, afin de rester distinct de WireGuard
+(`51820`), de la négociation de clé (`51821`) et d'iperf3 (`5201`). Le silence
+est un problème de joignabilité, le refus un problème d'occupation.
 
 ## Recouper le speedtest avec `iperf3`
 

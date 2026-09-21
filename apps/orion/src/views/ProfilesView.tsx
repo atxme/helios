@@ -26,21 +26,20 @@ import {
   Plus,
   RotateCcw,
   Save,
-  ShieldPlus,
   Trash2,
   Upload,
 } from 'lucide-react'
 import * as api from '../api'
 import { readProfileDocument } from '../profileDocument'
 import { CopyButton } from '../components/CopyButton'
+import { modeAllowed, modeLevel, modeMeta, PROTECTION_MODES } from '../components/state'
 import {
-  modeAllowed,
-  modeLevel,
-  modeMeta,
-  NEGOTIABLE_MODES,
-  PROTECTION_MODES,
-} from '../components/state'
-import { GUTTER } from '../theme'
+  matchPreset,
+  presetPrefixes,
+  SPLIT_TUNNEL_PRESETS,
+  type SplitTunnelPreset,
+} from '../splitTunnel'
+import { GUTTER, PINE } from '../theme'
 import type {
   ClientConfig,
   ClientProfile,
@@ -70,18 +69,28 @@ import type {
  * # Two blocks, and the line between them is the protocol's
  *
  * «Tunnel WireGuard» holds what a plain WireGuard peer needs and nothing
- * else: a profile with that block filled in and no negotiation connects to
- * any WireGuard gateway. Everything the v5 negotiation adds — the mode, the
- * floor, the negotiation endpoint, the pinned gateway material, the protected
- * identity — lives in the second block, and so does the static PSK **as soon
- * as a negotiation block exists**, because there it stops being a WireGuard
- * setting and becomes the material of one mode.
+ * else: a profile with that block filled in connects to any WireGuard
+ * gateway. «Protection du tunnel» holds the other question entirely — what
+ * stands between this profile and an unprotected first handshake — as one
+ * ladder of three rungs: none, a static PSK, the v5 negotiation.
  *
- * That line is not a presentation choice. `classic` is refused as a
- * negotiable mode by `aether::key_negotiation` (`ClassicNotNegotiable`): a
- * negotiated `classic` is a tunnel with no preshared key, which is exactly
- * what the first block already expresses. So classic is not a mode offered
- * inside the negotiation block — it is the absence of the block.
+ * That line is not a presentation choice, and neither is the ladder. The rung
+ * **is** the profile type: the first two are `classic` and differ only by
+ * whether a preshared key exists, the third is the one that writes a
+ * negotiation block. `classic` is refused as a negotiable mode by
+ * `aether::key_negotiation` (`ClassicNotNegotiable`) — a negotiated `classic`
+ * is a tunnel with no preshared key, which the lower rungs already express —
+ * so it is not a mode inside the block, it is the absence of the block.
+ *
+ * The ladder is also the whole of the choice: the negotiation rung writes
+ * `ml_kem` and offers no mode of its own. A preshared key is the rung below,
+ * and a negotiation that installs one instead of deriving a fresh one would
+ * be the same decision written twice with nothing on screen to say which one
+ * wins. `static_psk` remains an explicit v5 mode — the transaction runs and
+ * proves possession with a session-bound HMAC commitment before the gateway
+ * installs the configured key — so a block that already carries it is
+ * displayed as what it is, with the key it needs and one gesture back to
+ * ML-KEM, rather than relabelled.
  *
  * # No captions
  *
@@ -152,6 +161,69 @@ type VolumeWarningAction = 'import' | 'save'
 const NOTICE_MS = 3000
 
 const MAX_IMPORT_BYTES = 64 * 1024
+
+/**
+ * How each split-tunnel choice is named on screen, and what it does.
+ *
+ * Named by what goes through the tunnel, never by the prefixes it writes:
+ * those are in the field just below, and a row that repeated them would only
+ * help whoever already knew the answer. The second line is the exception the
+ * rest of this screen does not make — four exclusive choices with nothing but
+ * a noun each is a list one has to try to read.
+ */
+const SPLIT_TUNNEL_CHOICES: Record<SplitTunnelPreset, { label: string; detail: string }> = {
+  full: { label: 'Tout', detail: 'Internet et réseaux privés' },
+  private: { label: 'Réseaux privés', detail: 'Uniquement les réseaux Helios' },
+  gateway: { label: 'Helios seul', detail: 'Uniquement la passerelle' },
+  custom: { label: 'Personnalisé', detail: 'Choisir les réseaux manuellement' },
+}
+
+/** The segments, in order. `custom` closes the bar: it is the way out of it. */
+const SPLIT_TUNNEL_CHOICES_ORDER: SplitTunnelPreset[] = [...SPLIT_TUNNEL_PRESETS, 'custom']
+
+/**
+ * One segment of a choice bar.
+ *
+ * The screen has three of them now — split tunnelling, tunnel protection, the
+ * negotiated mode and its floor — and they are the same gesture: pick exactly
+ * one. Short labels, because a bar has to fit the form's column; what each
+ * segment means is the line underneath it.
+ */
+const SEGMENT_BUTTON = {
+  px: 1.25,
+  py: 0.4,
+  fontSize: 11.5,
+  textTransform: 'none',
+} as const
+
+/**
+ * What protects this tunnel, as one ladder instead of three places.
+ *
+ * The three rungs were spread across the screen: `classic` was a read-only
+ * word under «Type de profil», its static PSK was a row under «Avancé», and
+ * the negotiated modes lived in a block reached by an «Ajouter» button. Those
+ * are not three subjects. They are one — *what stands between this profile and
+ * an unprotected first handshake* — and a PSK filed under "advanced settings"
+ * is the clearest symptom: it is not a setting, it is the entire protection of
+ * a classic profile.
+ *
+ * What this deliberately does **not** do is flatten the negotiated
+ * `static_psk` into the same rung as a plain WireGuard PSK. Both end up in the
+ * same WireGuard slot, but one is copied by hand once and never rotates while
+ * the other is the outcome of an authenticated v5 transaction — so the
+ * negotiated one stays inside the negotiation block, under the mode that owns
+ * it.
+ */
+type TunnelProtection = 'none' | 'static_psk' | 'negotiation'
+
+/** The rungs, weakest first. The order is the ratchet's. */
+const TUNNEL_PROTECTIONS: TunnelProtection[] = ['none', 'static_psk', 'negotiation']
+
+const TUNNEL_PROTECTION_LABELS: Record<TunnelProtection, string> = {
+  none: 'Aucune',
+  static_psk: 'PSK statique',
+  negotiation: 'Négociation Helios',
+}
 
 /**
  * Delay before judging a field, in milliseconds.
@@ -248,12 +320,46 @@ export function ProfilesView({
   const [advanced, setAdvanced] = useState(false)
   const [support, setSupport] = useState<KeyNegotiationSupport | null>(null)
   const fileInput = useRef<HTMLInputElement>(null)
+  /** Focus target of «Personnalisé»: the list is typed, not chosen. */
+  const allowedIpsInput = useRef<HTMLInputElement>(null)
+  /**
+   * «Personnalisé» was asked for, whatever the list currently says.
+   *
+   * The choice cannot be read back from the value alone. A hand-written
+   * `100.64.0.1/32` is indistinguishable from the one «Helios seul» writes,
+   * and a screen that re-derived the row from the text would close the field
+   * the moment the user typed a list that happens to match a preset —
+   * mid-edit, with the caret in it.
+   */
+  const [manualPrefixes, setManualPrefixes] = useState(false)
+  /**
+   * «PSK statique» was chosen, before any key has been entered.
+   *
+   * Same reason as {@link manualPrefixes}: the rung cannot be read back from
+   * the profile alone. A classic profile with no PSK yet and a classic profile
+   * that will never have one are the same object, and the difference is the
+   * gesture just made — without it, picking the rung would light «Aucune» back
+   * up and close the entry field under the user.
+   */
+  const [wantsStaticPsk, setWantsStaticPsk] = useState(false)
+  /**
+   * Bumped by «Personnalisé» so the caret lands in the field.
+   *
+   * The field does not exist while a preset is selected, so it cannot be
+   * focused in the click handler: React has to mount it first.
+   */
+  const [caretRequest, setCaretRequest] = useState(0)
 
   useEffect(() => {
     if (!notice?.transient) return
     const id = setTimeout(() => setNotice(null), NOTICE_MS)
     return () => clearTimeout(id)
   }, [notice])
+
+  useEffect(() => {
+    if (caretRequest === 0) return
+    allowedIpsInput.current?.focus()
+  }, [caretRequest])
 
   // A build fact, not a profile one: asked once.
   useEffect(() => {
@@ -337,6 +443,11 @@ export function ProfilesView({
     // staged key onto the next profile loaded would attach it to an identity
     // the operator never admitted.
     setStagedPublicKey(null)
+    // Same reason: «Personnalisé» and «PSK statique» are gestures made on
+    // *this* profile. The next one is read again, and what it actually holds
+    // is what must light up.
+    setManualPrefixes(false)
+    setWantsStaticPsk(false)
     setPasting(false)
     setPasted('')
     void api.discardStagedKey().catch(() => {})
@@ -471,13 +582,11 @@ export function ProfilesView({
   const toggleNegotiation = (enabled: boolean) => {
     if (!enabled && floorBaseline && modeLevel(floorBaseline) > 0) return
     setHistory((past) => [...past, draft].slice(-HISTORY_LIMIT))
-    // A block created over an existing static PSK opens on `static_psk`, not
-    // on the strongest mode. Without a negotiation block that PSK was the
-    // profile's whole protection; defaulting to ML-KEM here would silently
-    // discard it the moment the user ticked a box about something else.
-    // Choosing ML-KEM afterwards still drops it — but then it is a choice.
+    // Always ML-KEM. A block created over an existing static PSK used to open
+    // on `static_psk` so as not to discard the key silently; now the two are
+    // separate rungs of one bar, so moving to this one *is* the choice to
+    // stop using that key, and `chooseProtection` disposes of it explicitly.
     const settings = enabled ? blankNegotiation() : null
-    if (settings && staticPsk) settings.mode = 'static_psk'
     setDraft((profile) => ({ ...profile, key_negotiation: settings }))
     setFloorBaseline(settings?.minimum_mode ?? null)
     setDirty(true)
@@ -787,15 +896,90 @@ export function ProfilesView({
   // about to store, and showing "aucun" next to a value the user just typed
   // would read as the entry having been refused.
   const staticPsk = (draft.has_static_psk && !clearPsk) || stagedPsk
+  /**
+   * Which rung the profile is on.
+   *
+   * Read from the profile, except for the one state it cannot express: a
+   * «PSK statique» asked for and not yet entered.
+   */
+  const protection: TunnelProtection = draft.key_negotiation
+    ? 'negotiation'
+    : staticPsk || wantsStaticPsk
+      ? 'static_psk'
+      : 'none'
+  /**
+   * Why a rung cannot be reached, or `undefined` if it can.
+   *
+   * The refusals are the ones that already existed, said where the gesture is
+   * made instead of after it: a stored profile does not change type — that is
+   * `kindChanged`, which used to be an alert raised at save time — and a
+   * negotiation block is not removed once something has been negotiated, which
+   * is the anti-downgrade ratchet of ADR-001 (`ClientConfig::upsert` refuses
+   * to lower a known floor, including by deleting the block).
+   */
+  const protectionRefusal = (rung: TunnelProtection): string | undefined => {
+    if (rung === protection) return undefined
+    const renameFirst =
+      'Un profil enregistré ne change pas de type. Renommez-le pour en créer un autre.'
+    if (rung === 'negotiation') return exists ? renameFirst : undefined
+    if (protection !== 'negotiation') return undefined
+    if (exists) return renameFirst
+    return floorBaseline && modeLevel(floorBaseline) > 0
+      ? `Plancher « ${modeMeta(floorBaseline).label} » : la négociation ne se retire plus.`
+      : undefined
+  }
+
+  /**
+   * Moves the profile to another rung.
+   *
+   * Everything it does already existed behind a button or a fold; what it adds
+   * is that leaving a rung disposes of what belonged to it. Dropping to
+   * «Aucune» clears the PSK for the same reason `dropStagedPskFor` does under
+   * a mode that forbids one: `orion-core` refuses a profile holding a PSK
+   * nothing uses, and leaving it would move the refusal to the save, pointing
+   * at a field the user never opened.
+   */
+  const chooseProtection = (rung: TunnelProtection) => {
+    if (rung === protection || protectionRefusal(rung)) return
+    if (rung === 'negotiation') {
+      setWantsStaticPsk(false)
+      // The rung derives a fresh key on every connection, so it stores none.
+      // `orion-core` refuses a profile holding a PSK no mode uses, and
+      // leaving it would move the refusal to the save.
+      dropStagedPskFor('ml_kem')
+      toggleNegotiation(true)
+      return
+    }
+    // The block goes first: on the way down from a negotiated `static_psk`,
+    // the key stays and simply becomes what it is without a block — a plain
+    // WireGuard preshared key.
+    if (draft.key_negotiation) toggleNegotiation(false)
+    if (rung === 'static_psk') {
+      setWantsStaticPsk(true)
+      setClearPsk(false)
+      // The entry field is what the rung shows while there is no key, so
+      // there is nothing to open here.
+      setPastingPsk(false)
+      setPastedPsk('')
+      return
+    }
+    setWantsStaticPsk(false)
+    dropStagedPskFor('classic')
+  }
+
   const invalid = kindChanged || Object.values(issues).some(Boolean)
+  // Read from the value, except when the user has asked to write it himself:
+  // a preset that stayed lit after the list was edited would describe a
+  // profile that no longer exists, and a list matching no preset is by
+  // definition hand-written whether or not the row was ever clicked.
+  const detectedPreset = matchPreset(draft.allowed_ips, draft)
+  const splitTunnel: SplitTunnelPreset =
+    manualPrefixes || detectedPreset === 'custom' ? 'custom' : detectedPreset
   // The "Advanced" collapse must flag what it hides: otherwise a faulty field
   // would stay invisible until someone thinks to open it. A narrowed range is
   // *not* one of those: split tunnelling is a decision, not a defect.
   const advancedFlagged = Boolean(
-    issues.allowed_ips ||
-      issues.persistent_keepalive ||
-      issues.ssh_target ||
-      (!draft.key_negotiation && issues.preshared_key),
+    issues.allowed_ips || issues.persistent_keepalive || issues.ssh_target,
   )
 
   /**
@@ -807,37 +991,59 @@ export function ProfilesView({
    * keeping it in the WireGuard block while a mode governs it, is what made
    * the two halves of this screen impossible to tell apart.
    */
+  /**
+   * The static PSK, as the one thing its rung is about.
+   *
+   * Same inbound-only rule as the private key (ADR-006 §5): the value travels
+   * *towards* Rust once, at an explicit gesture, and no path returns one.
+   *
+   * There is no «aucun» state line any more, and no «Définir un PSK
+   * statique» link. On the rung with no key yet there is exactly one thing to
+   * do, so the field to do it with is what the rung shows — a row announcing
+   * an absence above a link that opens the field to fix it was three steps
+   * for one. What the state line is still worth saying is the opposite case:
+   * a key exists, cannot be shown, and the only useful facts about it are
+   * that it is there and what can be done to it.
+   */
+  const pskEntry = !staticPsk || pastingPsk
   const pskField = (
-    <>
-      {/* Same inbound-only rule as the private key (ADR-006 §5). */}
-      <SecretState
-        label="PSK statique"
-        present={staticPsk}
-        error={issues.preshared_key}
-        presentLabel={stagedPsk ? 'nouveau PSK — à enregistrer' : 'scellé dans le coffre'}
-        absentLabel="aucun"
-        action={
-          staticPsk
-            ? {
-                label: 'Retirer le PSK statique',
-                onClick: () => {
-                  setClearPsk(true)
-                  if (stagedPsk) {
-                    setStagedPsk(false)
-                    void api.discardStagedPsk().catch(() => {})
-                  }
-                  setDirty(true)
-                },
-                disabled: clearPsk && !stagedPsk,
+    <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.75 }}>
+      {!pskEntry && (
+        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, flexWrap: 'wrap' }}>
+          <Check size={14} aria-hidden style={{ color: PINE, flexShrink: 0 }} />
+          <Typography sx={{ fontSize: 11.5 }}>
+            {stagedPsk ? 'Nouveau PSK — à enregistrer' : 'Scellé dans le coffre'}
+          </Typography>
+          <Button
+            size="small"
+            variant="text"
+            onClick={() => setPastingPsk(true)}
+            disabled={pskBusy}
+            sx={{ ml: 'auto', fontSize: 11, textTransform: 'none' }}
+          >
+            Remplacer
+          </Button>
+          <Button
+            size="small"
+            variant="text"
+            color="inherit"
+            onClick={() => {
+              setClearPsk(true)
+              if (stagedPsk) {
+                setStagedPsk(false)
+                void api.discardStagedPsk().catch(() => {})
               }
-            : {
-                label: pastingPsk ? 'Annuler' : 'Définir un PSK statique',
-                onClick: () => setPastingPsk((open) => !open),
-                disabled: pskBusy,
-              }
-        }
-      />
-      {pastingPsk && !staticPsk && (
+              setWantsStaticPsk(false)
+              setDirty(true)
+            }}
+            disabled={clearPsk && !stagedPsk}
+            sx={{ fontSize: 11, textTransform: 'none', color: 'text.secondary' }}
+          >
+            Retirer
+          </Button>
+        </Box>
+      )}
+      {pskEntry && (
         <Box sx={{ display: 'flex', gap: 1, alignItems: 'flex-start' }}>
           <TextField
             fullWidth
@@ -860,9 +1066,32 @@ export function ProfilesView({
           >
             Valider
           </Button>
+          {/* Only while replacing: on a rung with no key there is nothing to
+              go back to, and leaving is done on the bar above. Named after
+              what it abandons, because the footer already has an «Annuler»
+              that abandons the whole edit. */}
+          {staticPsk && (
+            <Button
+              size="small"
+              variant="text"
+              color="inherit"
+              onClick={() => {
+                setPastingPsk(false)
+                setPastedPsk('')
+              }}
+              sx={{ mt: 0.5, fontSize: 11.5, textTransform: 'none', flexShrink: 0, color: 'text.secondary' }}
+            >
+              Garder le PSK
+            </Button>
+          )}
         </Box>
       )}
-    </>
+      {issues.preshared_key && (
+        <Typography color="error" sx={{ fontSize: 10.5, lineHeight: 1.4 }}>
+          {issues.preshared_key}
+        </Typography>
+      )}
+    </Box>
   )
 
   return (
@@ -1132,6 +1361,12 @@ export function ProfilesView({
           <Typography component="h3" sx={{ mb: 1, fontSize: 12.5, fontWeight: 650 }}>
             Tunnel WireGuard
           </Typography>
+          {/* Two columns of two, and everything optional underneath.
+              «Avancé» used to hang off the right column, which made that
+              column as tall as the whole block the moment it was opened while
+              the left one stopped at three fields. What is folded away is not
+              a property of the right-hand half of the form — it belongs under
+              both. */}
           <Box
             sx={{
               display: 'grid',
@@ -1150,12 +1385,6 @@ export function ProfilesView({
                 value={draft.endpoint}
                 onChange={(value) => set('endpoint', value)}
               />
-              <Field
-                label="Clé publique gateway"
-                error={issues.peer_public_key}
-                value={draft.peer_public_key}
-                onChange={(value) => set('peer_public_key', value)}
-              />
             </Box>
 
             <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5 }}>
@@ -1166,100 +1395,237 @@ export function ProfilesView({
                 value={draft.address ?? ''}
                 onChange={(value) => set('address', value || null)}
               />
-              <ButtonBase
-                onClick={() => setAdvanced((open) => !open)}
-                aria-expanded={advanced}
-                sx={{
-                  display: 'flex',
-                  justifyContent: 'flex-start',
-                  gap: 0.5,
-                  py: 0.5,
-                  color: 'text.secondary',
-                  '&:hover': { color: 'text.primary' },
-                }}
-              >
-                <ChevronRight
-                  size={14}
-                  aria-hidden
-                  style={{
-                    transform: advanced ? 'rotate(90deg)' : undefined,
-                    transition: 'transform 140ms ease',
-                  }}
-                />
-                <Typography sx={{ fontSize: 12, fontWeight: 600 }}>Avancé</Typography>
-                {advancedFlagged && (
-                  <AlertTriangle size={13} aria-hidden style={{ color: '#A16207' }} />
-                )}
-              </ButtonBase>
-
-              <Collapse in={advanced} unmountOnExit>
-                <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5 }}>
-                  {/* The example lives in the placeholder, not under the
-                      field: it is a value, and a value belongs where the value
-                      goes. No caution for a narrowed range either — routing one
-                      subnet and leaving the rest alone is what most corporate
-                      profiles do on purpose. */}
-                  <Field
-                    label="Trafic capté"
-                    error={issues.allowed_ips}
-                    placeholder="0.0.0.0/0  ·  100.64.0.0/10, 192.168.1.0/24"
-                    value={draft.allowed_ips}
-                    onChange={(value) => set('allowed_ips', value)}
-                  />
-                  <Field
-                    label="Keepalive (s)"
-                    error={issues.persistent_keepalive}
-                    type="number"
-                    value={String(draft.persistent_keepalive)}
-                    onChange={(value) => set('persistent_keepalive', Number(value) || 0)}
-                  />
-                  {/* Only without a negotiation block. With one, the PSK is
-                      the material of the `static_psk` mode and belongs under
-                      that mode, not among the WireGuard settings. */}
-                  {!draft.key_negotiation && pskField}
-                  <Field
-                    label="Destination SSH"
-                    error={issues.ssh_target}
-                    placeholder="utilisateur@100.64.0.1"
-                    value={draft.ssh_target ?? ''}
-                    onChange={(value) => set('ssh_target', value || null)}
-                  />
-                </Box>
-              </Collapse>
+              <Field
+                label="Clé publique gateway"
+                error={issues.peer_public_key}
+                value={draft.peer_public_key}
+                onChange={(value) => set('peer_public_key', value)}
+              />
             </Box>
           </Box>
 
+          <ButtonBase
+            onClick={() => setAdvanced((open) => !open)}
+            aria-expanded={advanced}
+            sx={{
+              display: 'flex',
+              justifyContent: 'flex-start',
+              gap: 0.5,
+              mt: 1.5,
+              py: 0.5,
+              color: 'text.secondary',
+              '&:hover': { color: 'text.primary' },
+            }}
+          >
+            <ChevronRight
+              size={14}
+              aria-hidden
+              style={{
+                transform: advanced ? 'rotate(90deg)' : undefined,
+                transition: 'transform 140ms ease',
+              }}
+            />
+            <Typography sx={{ fontSize: 12, fontWeight: 600 }}>Avancé</Typography>
+            {advancedFlagged && <AlertTriangle size={13} aria-hidden style={{ color: '#A16207' }} />}
+          </ButtonBase>
+
+          <Collapse in={advanced} unmountOnExit>
+            <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5, pt: 0.5 }}>
+              {/* Three routine decisions and the field they write into.
+                  The field stays the authority — «Personnalisé» is not a
+                  fourth value, it is what the three fail to recognise —
+                  because the lists a real deployment needs are not
+                  guessable from the client side. No caution for a narrowed
+                  range: routing one subnet and leaving the rest alone is
+                  what most corporate profiles do on purpose. */}
+              <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.75 }}>
+                <Typography
+                  id="split-tunnel-label"
+                  color="text.secondary"
+                  sx={{ fontSize: 11.5, fontWeight: 600 }}
+                >
+                  Que faire passer par Helios ?
+                </Typography>
+                <ToggleButtonGroup
+                  exclusive
+                  size="small"
+                  value={splitTunnel}
+                  aria-labelledby="split-tunnel-label"
+                  onChange={(_event, next: SplitTunnelPreset | null) => {
+                    // `null` is the selected segment being pressed again:
+                    // there is no "no choice" here, the field always holds
+                    // one list. `custom` is handled on the segment itself,
+                    // because pressing it while it is already selected has
+                    // to keep working — that is when it is most useful.
+                    if (next === null || next === 'custom') return
+                    setManualPrefixes(false)
+                    set('allowed_ips', presetPrefixes(next, draft))
+                  }}
+                  sx={{ '& .MuiToggleButton-root': SEGMENT_BUTTON }}
+                >
+                  {SPLIT_TUNNEL_CHOICES_ORDER.map((preset) => (
+                    <ToggleButton
+                      key={preset}
+                      value={preset}
+                      // The prefixes it would write, before it writes
+                      // them — the one thing the bar deliberately does not
+                      // print.
+                      title={preset === 'custom' ? undefined : presetPrefixes(preset, draft)}
+                      // «Personnalisé» writes nothing: it opens the field
+                      // on the list the preset left behind, which is the
+                      // starting point a narrowed range is edited from.
+                      // Handled on the segment rather than on the group so
+                      // that pressing it while it is already selected
+                      // still hands over the caret.
+                      onClick={
+                        preset === 'custom'
+                          ? () => {
+                              setManualPrefixes(true)
+                              setCaretRequest((request) => request + 1)
+                            }
+                          : undefined
+                      }
+                    >
+                      {SPLIT_TUNNEL_CHOICES[preset].label}
+                    </ToggleButton>
+                  ))}
+                </ToggleButtonGroup>
+                {/* One line, for the chosen segment only. Four captions
+                    printed at once is a paragraph, and a paragraph under a
+                    control is what stops being read. */}
+                <Typography color="text.secondary" sx={{ fontSize: 10.5, lineHeight: 1.5 }}>
+                  {SPLIT_TUNNEL_CHOICES[splitTunnel].detail}
+                </Typography>
+                {/* A preset owns the list it wrote, so the field states it
+                    rather than taking it: an input accepting text that
+                    would flip the segment above it is the contradiction
+                    this bar was added to remove. The value stays on screen
+                    because a choice named «Réseaux privés» has to be
+                    checkable against the prefixes it stands for.
+
+                    The example lives in the placeholder, not under the
+                    field: it is a value, and a value belongs where the
+                    value goes. */}
+                {splitTunnel === 'custom' ? (
+                  <Field
+                    label="Trafic via le tunnel"
+                    error={issues.allowed_ips}
+                    placeholder="0.0.0.0/0  ·  100.64.0.1/32, 192.168.1.0/24"
+                    value={draft.allowed_ips}
+                    inputRef={allowedIpsInput}
+                    onChange={(value) => set('allowed_ips', value)}
+                  />
+                ) : (
+                  <ReadOnlyField label="Trafic via le tunnel" value={draft.allowed_ips} />
+                )}
+                {/* The exception this screen makes to its own rule: the
+                    field is the one place where «réseaux» has to be read
+                    as prefixes, and the bar above no longer spells it. It
+                    gives way to the error the moment there is one. */}
+                {!issues.allowed_ips && (
+                  <Typography color="text.disabled" sx={{ fontSize: 10.5, lineHeight: 1.5 }}>
+                    Liste des réseaux qui seront acheminés dans le tunnel.
+                  </Typography>
+                )}
+              </Box>
+              {/* Two short fields side by side rather than one above the
+                  other: neither a keepalive nor a login is worth the width of
+                  the panel, and stacking them would push the PSK below the
+                  fold for nothing. */}
+              <Box
+                sx={{
+                  display: 'grid',
+                  gridTemplateColumns: 'repeat(2, minmax(0, 1fr))',
+                  gap: 1.5,
+                  alignItems: 'start',
+                }}
+              >
+                <Field
+                  label="Keepalive (s)"
+                  error={issues.persistent_keepalive}
+                  type="number"
+                  value={String(draft.persistent_keepalive)}
+                  onChange={(value) => set('persistent_keepalive', Number(value) || 0)}
+                />
+                <Field
+                  label="Destination SSH"
+                  error={issues.ssh_target}
+                  placeholder="utilisateur@100.64.0.1"
+                  value={draft.ssh_target ?? ''}
+                  onChange={(value) => set('ssh_target', value || null)}
+                />
+              </Box>
+            </Box>
+          </Collapse>
+
           <Divider sx={{ my: 1.75 }} />
 
-          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, mb: 1.5 }}>
-            <Typography component="h3" sx={{ fontSize: 12.5, fontWeight: 650 }}>
-              Type de profil
-            </Typography>
+          {/* ── Protection du tunnel ─────────────────────────────────────
+              One ladder where there used to be a read-only word, a folded
+              row and a button. The rung *is* the profile type: «Aucune» and
+              «PSK statique» are both `classic`, and only the third one writes
+              a negotiation block. */}
+          <Box sx={{ display: 'flex', alignItems: 'baseline', gap: 1.5, mb: 1 }}>
             <Typography
-              color="text.secondary"
-              sx={{ fontFamily: 'monospace', fontSize: 11 }}
+              component="h3"
+              id="tunnel-protection-label"
+              sx={{ fontSize: 12.5, fontWeight: 650 }}
             >
+              Protection du tunnel
+            </Typography>
+            <Typography color="text.secondary" sx={{ fontFamily: 'monospace', fontSize: 11 }}>
               {draftKind}
             </Typography>
           </Box>
 
+          <ToggleButtonGroup
+            exclusive
+            size="small"
+            value={protection}
+            aria-labelledby="tunnel-protection-label"
+            onChange={(_event, next: TunnelProtection | null) => {
+              if (next) chooseProtection(next)
+            }}
+            sx={{ '& .MuiToggleButton-root': SEGMENT_BUTTON }}
+          >
+            {TUNNEL_PROTECTIONS.map((rung) => {
+              const refusal = protectionRefusal(rung)
+              return (
+                <ToggleButton
+                  key={rung}
+                  value={rung}
+                  disabled={refusal !== undefined}
+                  // Only the refusal is worth a tooltip: it is the one thing a
+                  // greyed-out segment cannot say by itself.
+                  title={refusal}
+                >
+                  {TUNNEL_PROTECTION_LABELS[rung]}
+                </ToggleButton>
+              )
+            })}
+          </ToggleButtonGroup>
           {kindChanged && (
-            <Alert severity="error" role="alert" sx={{ mb: 1.5 }}>
+            <Alert severity="error" role="alert" sx={{ mt: 1.5 }}>
               {`Le type enregistré « ${storedKind} » ne peut pas devenir « ${draftKind} » sous le même identifiant. Rétablissez le type initial ou choisissez un nouveau nom.`}
             </Alert>
           )}
 
-          <KeyNegotiation
-            settings={draft.key_negotiation}
-            floorBaseline={floorBaseline}
-            issue={issues.key_negotiation}
-            support={support}
-            kindLocked={exists}
-            pskField={pskField}
-            onChange={setNegotiation}
-            onRaiseFloor={raiseFloor}
-            onToggle={toggleNegotiation}
-          />
+          {/* What the chosen rung is made of, and nothing about the others. */}
+          {protection === 'static_psk' && <Box sx={{ mt: 1.5 }}>{pskField}</Box>}
+
+          {draft.key_negotiation && (
+            <Box sx={{ mt: 1.5 }}>
+              <KeyNegotiation
+                settings={draft.key_negotiation}
+                floorBaseline={floorBaseline}
+                issue={issues.key_negotiation}
+                support={support}
+                pskField={pskField}
+                onChange={setNegotiation}
+                onRaiseFloor={raiseFloor}
+              />
+            </Box>
+          )}
 
         </Box>
       </Box>
@@ -1395,130 +1761,85 @@ export function ProfilesView({
  * it are shown disabled rather than hidden — seeing what one has left behind
  * is the whole point of a ratchet.
  */
+/**
+ * The negotiation rung's own settings.
+ *
+ * It no longer decides whether it exists: «Protection du tunnel» above owns
+ * that, and this component is only rendered on the rung that has a block. The
+ * «Ajouter»/«Retirer» pair it used to carry said the same thing as a segment
+ * of that bar, one screenful lower and in another grammar.
+ */
 function KeyNegotiation({
   settings,
   floorBaseline,
   issue,
   support,
-  kindLocked,
   pskField,
   onChange,
   onRaiseFloor,
-  onToggle,
 }: {
-  settings: KeyNegotiationSettings | null
+  settings: KeyNegotiationSettings
   /** Floor the profile was loaded with: the screen never goes under it. */
   floorBaseline: ProtectionMode | null
   issue?: string | null
   support: KeyNegotiationSupport | null
-  /** An existing stable profile cannot change security variant. */
-  kindLocked: boolean
-  /** The static PSK row, shown here when `static_psk` is the chosen mode. */
+  /** The static PSK row, for a loaded block that still carries that mode. */
   pskField: React.ReactNode
   onChange: <Key extends keyof KeyNegotiationSettings>(
     key: Key,
     value: KeyNegotiationSettings[Key],
   ) => void
   onRaiseFloor: (floor: ProtectionMode) => void
-  onToggle: (enabled: boolean) => void
 }) {
-  const title = (
-    <Typography component="h3" sx={{ fontSize: 12.5, fontWeight: 650 }}>
-      Négociation de clé
-    </Typography>
-  )
-
-  if (!settings) {
-    return (
-      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5 }}>
-        {title}
-        <Typography color="text.secondary" sx={{ fontFamily: 'monospace', fontSize: 11 }}>
-          aucune
-        </Typography>
-        {/* `describeChild`: the sentence describes the button, it does not
-            rename it. Without it MUI turns the tooltip into the accessible
-            name, and a screen reader announces a paragraph where a verb
-            belongs. */}
-        <Tooltip
-          describeChild
-          title="Active la négociation post-quantique."
-        >
-          <span style={{ marginLeft: 'auto' }}>
-            <Button
-              size="small"
-              variant="outlined"
-              startIcon={<ShieldPlus size={14} aria-hidden />}
-              onClick={() => onToggle(true)}
-              disabled={kindLocked}
-              sx={{ flexShrink: 0 }}
-            >
-              Ajouter
-            </Button>
-          </span>
-        </Tooltip>
-      </Box>
-    )
-  }
-
   const unusable = support && !support.identity_store
-  // Removing the block is a downgrade. It stays possible while nothing has
-  // been negotiated — a block just added by hand, typically — and the floor
-  // is what closes the door as soon as something has.
-  const removable = !kindLocked && (!floorBaseline || modeLevel(floorBaseline) === 0)
-  // A block loaded with `classic` cannot negotiate at all: the gateway
-  // refuses that mode by name. It is not offered above, so it can only come
-  // from a document written before the rule — and it has to be said, because
-  // the failure would otherwise land at connection time with no field to look
-  // at.
-  const notNegotiable = settings.mode === 'classic'
+  // Anything but ML-KEM is a block this screen no longer composes.
+  //
+  // The rung is the choice: a preshared key is «PSK statique» one bar above,
+  // and a negotiation that installs one instead of deriving a fresh one is
+  // the same decision written twice, in two places, with nothing on screen
+  // to say which one wins. So the mode row is gone and this rung writes
+  // `ml_kem`.
+  //
+  // It cannot simply *assume* `ml_kem`, though. `static_psk` remains an
+  // explicit v5 mode — the transaction still runs and proves possession with
+  // an HMAC commitment bound to the session before the gateway installs the
+  // configured key (NEGOCIATION-DE-CLE-V5 §9.1) — so a document produced by
+  // `helios-ctl enroll` may legitimately carry it, and `classic` may come
+  // from a document older than the rule that refuses it. Displaying either
+  // one as ML-KEM would be a lie about what the profile does, and hiding the
+  // PSK that `static_psk` requires would leave a profile invalid with no
+  // field to look at. Both are therefore shown as what they are, with the one
+  // gesture that brings the profile back to what this screen composes.
+  const legacyMode = settings.mode !== 'ml_kem'
 
   return (
-    <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
-      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-        {/* No floor chip here: the "Plancher" row below states it, and
-            saying it twice is how a screen ends up unreadable. */}
-        {title}
-        {removable && (
-          <Tooltip
-            describeChild
-            title="Repasse le profil en WireGuard simple."
+    <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5 }}>
+      {legacyMode && (
+        <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.75 }}>
+          <Caution>
+            {settings.mode === 'classic'
+              ? 'Ce profil négocie en mode « classique », que la gateway refuse par son nom : la connexion échouera.'
+              : 'Ce profil négocie un PSK statique. Orion ne compose plus ce mode : une clé partagée se choisit au cran « PSK statique » ci-dessus.'}
+          </Caution>
+          <Button
+            size="small"
+            variant="outlined"
+            color="inherit"
+            onClick={() => onChange('mode', 'ml_kem')}
+            disabled={!modeAllowed('ml_kem', settings.minimum_mode)}
+            sx={{ alignSelf: 'flex-start', fontSize: 11.5, textTransform: 'none' }}
           >
-            <Button
-              size="small"
-              variant="text"
-              color="inherit"
-              onClick={() => onToggle(false)}
-              sx={{ ml: 'auto', color: 'text.secondary', fontSize: 11 }}
-            >
-              Retirer
-            </Button>
-          </Tooltip>
-        )}
-      </Box>
-
-      {/* Two modes, not three. `classic` is the absence of this block, and
-          the gateway refuses it as a negotiated mode by name. */}
-      <ModeChoice
-        label="Mode"
-        modes={NEGOTIABLE_MODES}
-        value={settings.mode}
-        floor={settings.minimum_mode}
-        onChange={(mode) => onChange('mode', mode)}
-      />
-
-      {notNegotiable && (
-        <Caution>
-          Mode <strong>classique</strong> refusé par la gateway. Choisir « PSK » ou « ML-KEM ».
-        </Caution>
+            Passer en ML-KEM
+          </Button>
+        </Box>
       )}
 
-      {/* The PSK belongs to the mode that uses it, and appears with it. Under
-          ML-KEM there is no PSK row at all — nothing to grey out, nothing to
-          explain. */}
+      {/* Only for a block that already carried one: the rung this screen
+          composes derives its key and stores nothing. */}
       {settings.mode === 'static_psk' && pskField}
 
       <ModeChoice
-        label="Plancher"
+        label="Plancher anti-downgrade"
         modes={PROTECTION_MODES}
         value={settings.minimum_mode}
         floor={floorBaseline ?? 'classic'}
@@ -1580,6 +1901,11 @@ function KeyNegotiation({
  *
  * What is under the floor is disabled rather than absent: a ratchet one
  * cannot see having climbed teaches nothing.
+ *
+ * Title above, segments below, same shape as «Protection du tunnel» and «Que
+ * faire passer par Helios ?». It used to be a 62-pixel uppercase label to the
+ * left of the bar, which read as a third grammar for the same gesture on a
+ * screen that now makes that gesture three times.
  */
 function ModeChoice({
   label,
@@ -1595,22 +1921,13 @@ function ModeChoice({
   value: ProtectionMode
   /** Nothing below this is selectable. */
   floor: ProtectionMode
+  /** One line under the bar, for what the segments cannot say themselves. */
   hint?: string
   onChange: (mode: ProtectionMode) => void
 }) {
-  const group = (
-    <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-      <Typography
-        color="text.disabled"
-        sx={{
-          width: 62,
-          flexShrink: 0,
-          fontFamily: 'monospace',
-          fontSize: 9.5,
-          letterSpacing: '0.08em',
-          textTransform: 'uppercase',
-        }}
-      >
+  return (
+    <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.75 }}>
+      <Typography color="text.secondary" sx={{ fontSize: 11.5, fontWeight: 600 }}>
         {label}
       </Typography>
       <ToggleButtonGroup
@@ -1621,7 +1938,7 @@ function ModeChoice({
           if (next) onChange(next)
         }}
         aria-label={label}
-        sx={{ '& .MuiToggleButton-root': { px: 1.25, py: 0.4, fontSize: 11.5, textTransform: 'none' } }}
+        sx={{ '& .MuiToggleButton-root': SEGMENT_BUTTON }}
       >
         {modes.map((mode) => {
           const meta = modeMeta(mode)
@@ -1641,9 +1958,13 @@ function ModeChoice({
           )
         })}
       </ToggleButtonGroup>
+      {hint && (
+        <Typography color="text.disabled" sx={{ fontSize: 10.5, lineHeight: 1.5 }}>
+          {hint}
+        </Typography>
+      )}
     </Box>
   )
-  return hint ? <Tooltip title={hint}>{group}</Tooltip> : group
 }
 
 /**
@@ -1802,12 +2123,15 @@ function Field({
   type = 'text',
   placeholder,
   error,
+  inputRef,
 }: {
   label: string
   value: string
   onChange: (value: string) => void
   type?: 'text' | 'number'
   placeholder?: string
+  /** Lets a control above the field put the caret in it. */
+  inputRef?: React.Ref<HTMLInputElement>
   /**
    * Message from the core, `null` if the field is acceptable.
    *
@@ -1828,6 +2152,7 @@ function Field({
       value={value}
       error={Boolean(error)}
       helperText={error}
+      inputRef={inputRef}
       onChange={(event) => onChange(event.target.value)}
       sx={{
         '& input': { fontFamily: 'monospace', fontSize: 12 },
@@ -1866,89 +2191,3 @@ function ReadOnlyField({ label, value, hint }: { label: string; value: string; h
   return hint ? <Tooltip title={hint}>{field}</Tooltip> : field
 }
 
-/** Secret field: masked by default, revealable without forcing blind entry. */
-/**
- * States that a secret exists, without being able to carry it.
- *
- * # What this replaces, and why
- *
- * A `TextField` holding the WireGuard private key, with a button to reveal it.
- * That single component was the widest hole in ADR-006: the value had to be
- * serialised across the Tauri IPC to be displayed, parsed into a JavaScript
- * string nothing can wipe, and kept in a DOM node's `value` for the life of
- * the screen — where a screenshot, an accessibility client, or anything with
- * access to the WebView could read it. Sealing a key on disk and then showing
- * it in a browser engine protects the quiet half of its life.
- *
- * There is deliberately **no `value` prop**. The component cannot display a
- * secret because it is never given one, which is a stronger guarantee than a
- * component that merely chooses not to. What the user acts on is an *intent* —
- * generate, clear — carried out in Rust.
- */
-function SecretState({
-  label,
-  present,
-  presentLabel,
-  absentLabel,
-  action,
-  error,
-}: {
-  label: string
-  present: boolean
-  /** What to say when the secret is there. Never the secret. */
-  presentLabel: string
-  absentLabel: string
-  action?: { label: string; onClick: () => void; disabled?: boolean }
-  /** Message from the core, `null` if the field is acceptable. */
-  error?: string | null
-}) {
-  return (
-    <Box>
-      <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, minWidth: 0 }}>
-        <Typography
-          color="text.disabled"
-          sx={{
-            width: 110,
-            flexShrink: 0,
-            fontFamily: 'monospace',
-            fontSize: 9.5,
-            letterSpacing: '0.08em',
-            textTransform: 'uppercase',
-          }}
-        >
-          {label}
-        </Typography>
-        <Typography
-          sx={{
-            minWidth: 0,
-            color: error ? 'error.main' : present ? 'text.primary' : 'text.secondary',
-            fontFamily: 'monospace',
-            fontSize: 11.5,
-            overflowWrap: 'anywhere',
-          }}
-        >
-          {present ? presentLabel : absentLabel}
-        </Typography>
-      </Box>
-      {action && (
-        <Button
-          size="small"
-          variant="text"
-          onClick={action.onClick}
-          disabled={action.disabled}
-          sx={{ ml: '118px', mt: 0.25, fontSize: 11, textTransform: 'none' }}
-        >
-          {action.label}
-        </Button>
-      )}
-      {error && (
-        <Typography
-          color="error"
-          sx={{ mt: 0.25, ml: '118px', fontSize: 10.5, lineHeight: 1.4 }}
-        >
-          {error}
-        </Typography>
-      )}
-    </Box>
-  )
-}

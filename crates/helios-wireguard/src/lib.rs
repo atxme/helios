@@ -27,6 +27,10 @@ pub mod kernel;
 pub use dryrun::DryRunBackend;
 #[cfg(feature = "wireguard")]
 pub use kernel::KernelBackend;
+/// Re-exported because it is part of this crate's public shape: the secret
+/// fields below are declared with it, so a caller must be able to name it
+/// without taking its own `zeroize` dependency.
+pub use zeroize::Zeroizing;
 
 /// Gateway's WireGuard listening port (architectural invariant).
 pub const WG_LISTEN_PORT: u16 = 51820;
@@ -47,12 +51,22 @@ pub enum WgError {
 pub type Result<T> = std::result::Result<T, WgError>;
 
 /// Configuration of the gateway's WireGuard interface.
-#[derive(Debug, Clone)]
+///
+/// Deliberately derives **neither `Debug` nor `Clone`**: it carries the
+/// gateway's private key, and both derives are exactly how such a value ends
+/// up in a log line or in a buffer nobody wipes (ADR-006 §5). A duplication
+/// that is genuinely needed is written out at the call site.
+///
+/// The key is held in [`Zeroizing`] rather than in a bare `String` so the
+/// copy this structure owns is wiped when the bring-up is over. `zeroize`
+/// rather than `aether::SecretString`: this crate is a leaf, as the module
+/// documentation states, and the data plane is where a workspace dependency
+/// has the least business being.
 pub struct InterfaceConfig {
     /// Interface name (e.g. `helios0`).
     pub name: String,
     /// Gateway's Curve25519 private key, in base64. **Secret.**
-    pub private_key: String,
+    pub private_key: Zeroizing<String>,
     /// UDP listening port. The gateway listens; it does not dial.
     pub listen_port: u16,
     /// Gateway's address within the tunnel network (e.g. `100.64.0.1/10`).
@@ -70,7 +84,11 @@ pub struct InterfaceConfig {
 }
 
 /// A peer (Orion client) admitted on the gateway.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Same reasoning as [`InterfaceConfig`], for the same reason: the optional
+/// PSK is a secret. `PartialEq` goes with them — comparing a structure that
+/// holds a PSK byte by byte is a timing oracle nobody asked for, and nothing
+/// compares two peers.
 pub struct PeerConfig {
     /// Client's Curve25519 public key, in base64 — its identity.
     pub public_key: String,
@@ -80,7 +98,10 @@ pub struct PeerConfig {
     /// peers cannot claim the same address.
     pub allowed_ips: String,
     /// Post-quantum PSK derived from the ML-KEM exchange, in base64. **Secret.**
-    pub preshared_key: Option<String>,
+    ///
+    /// Wiped with the structure: a negotiated PSK has a lifetime bounded by
+    /// its installation on the data plane, and this copy must not outlive it.
+    pub preshared_key: Option<Zeroizing<String>>,
     /// Seconds between keep-alives the **gateway** sends this peer. `0` is off.
     ///
     /// Set by the gateway rather than inherited from the client, so that the

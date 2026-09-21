@@ -18,7 +18,7 @@ for app in web apps/orion; do
 done
 
 echo '==> Analyse Rust, toutes les features'
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+"$repo_root/scripts/wsl-cargo" clippy --workspace --all-targets --all-features -- -D warnings
 
 echo '==> Tests Rust, toutes les features'
-cargo test --workspace --all-features
+"$repo_root/scripts/wsl-cargo" test --workspace --all-features

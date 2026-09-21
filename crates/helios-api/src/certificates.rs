@@ -117,6 +117,18 @@ pub struct TrustEnrolmentView {
     pub client_tls_ca_der: String,
     /// Generation the named peer's identity is at, right now.
     pub client_generation: u64,
+    /// Epoch of the gateway leaf this domain serves, and the highest decision
+    /// accepted about it (spec §13.1: both are `1` on a fresh installation).
+    ///
+    /// Carried because nothing else can teach them to a client. A trust store
+    /// seeded at `0` while the registry sits at `1` is permanently *behind* on
+    /// [`crate::certificates::TrustUpdateHandler::trust_update`]'s comparison,
+    /// with no transition able to close the gap — an identity transition only
+    /// moves a client from the decision it already holds to the next one, and
+    /// there is no transition to epoch 1. The gateway would answer `503` to
+    /// every poll, for the life of the profile.
+    pub active_gateway_identity_epoch: u64,
+    pub gateway_decision_epoch: u64,
     pub astra_authority_url: String,
     pub webauthn_rp_id: String,
     pub astra_policy_fingerprint: String,

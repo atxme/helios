@@ -40,9 +40,10 @@
 
 use std::path::PathBuf;
 
-use aether::NetworkConfig;
+use aether::{NetworkConfig, SecretString};
 use helios_tpm::{BootDecision, KeystoreError, SealedKeystore, TpmError};
 use tracing::{info, warn};
+use zeroize::Zeroizing;
 
 /// Location of the vault containing the WireGuard private key.
 const KEYSTORE_PATH: &str = "/var/lib/helios/wg-key.sealed";
@@ -107,10 +108,26 @@ pub enum KeyOrigin {
 }
 
 /// Key resolved at startup.
+///
+/// The key is a [`SecretString`] rather than a `String`: it is the gateway's
+/// identity, this structure is what carries it out of the vault, and an
+/// ordinary `String` here is a buffer nobody wipes and a field a future
+/// `#[derive(Debug)]` would print (ADR-006 §5).
 pub struct ResolvedKey {
     /// Private key in base64, ready for the data plane. Empty if `Missing`.
-    pub private_key: String,
+    pub private_key: SecretString,
     pub origin: KeyOrigin,
+}
+
+impl ResolvedKey {
+    /// The one outcome with no key: named, so the three refusal paths in
+    /// [`resolve`] cannot disagree about what "no key" looks like.
+    fn missing() -> Self {
+        Self {
+            private_key: SecretString::new(String::new()),
+            origin: KeyOrigin::Missing,
+        }
+    }
 }
 
 fn keystore() -> SealedKeystore {
@@ -213,20 +230,23 @@ fn write_escrow(network: &NetworkConfig, private_key: &str) {
 /// Only called when the vault is undecipherable: outside of that case, a
 /// stray recovery file must never be able to replace the key in effect —
 /// that would be an identity substitution vector.
-fn try_recovery(secret: &helios_tpm::SecretKey) -> Option<String> {
+fn try_recovery(secret: &helios_tpm::SecretKey) -> Option<SecretString> {
     let path = PathBuf::from(recovery_path());
     if !path.exists() {
         return None;
     }
 
-    let raw = match std::fs::read_to_string(&path) {
+    // Both buffers hold the key in the clear: the file's bytes, then the
+    // trimmed copy. `Zeroizing` is what makes them go away on every exit
+    // path — including the four `return None` below (ADR-006 §5).
+    let raw = match std::fs::read_to_string(&path).map(Zeroizing::new) {
         Ok(s) => s,
         Err(e) => {
             warn!("unreadable recovery file: {e}");
             return None;
         }
     };
-    let key = raw.trim().to_string();
+    let key = Zeroizing::new(raw.trim().to_string());
 
     if let Err(e) = validate_wg_key(&key) {
         warn!("invalid recovery file ({e}) — ignored, not consumed");
@@ -257,7 +277,7 @@ fn try_recovery(secret: &helios_tpm::SecretKey) -> Option<String> {
     }
 
     warn!("WireGuard identity restored from escrow and resealed");
-    Some(key)
+    Some(SecretString::new(key.as_str()))
 }
 
 fn write_atomic(path: &str, bytes: &[u8]) -> std::io::Result<()> {
@@ -293,9 +313,12 @@ pub fn resolve(network: &NetworkConfig, boot: &BootDecision) -> ResolvedKey {
                 );
             }
             Some(secret) => match store.load_declared(secret) {
-                Ok((declared, bytes)) => match String::from_utf8(bytes.to_vec()) {
+                // `bytes` is already `Zeroizing`; the two decoding steps that
+                // follow must be too, or the vault's content survives in two
+                // freed allocations (ADR-006 §5).
+                Ok((declared, bytes)) => match std::str::from_utf8(&bytes) {
                     Ok(key) => {
-                        let key = key.trim().to_string();
+                        let key = Zeroizing::new(key.trim().to_string());
                         match verify_declared_context(&declared, &key) {
                             ContextVerdict::Matches => {}
                             ContextVerdict::Legacy => warn!(
@@ -307,17 +330,11 @@ pub fn resolve(network: &NetworkConfig, boot: &BootDecision) -> ResolvedKey {
                                     "vault context does not match the key it contains — \
                                      refusing this identity"
                                 );
-                                return ResolvedKey {
-                                    private_key: String::new(),
-                                    origin: KeyOrigin::Missing,
-                                };
+                                return ResolvedKey::missing();
                             }
                             ContextVerdict::UnusableKey(cause) => {
                                 warn!("unusable vault content ({cause})");
-                                return ResolvedKey {
-                                    private_key: String::new(),
-                                    origin: KeyOrigin::Missing,
-                                };
+                                return ResolvedKey::missing();
                             }
                         }
                         info!("WireGuard key loaded from the sealed TPM vault");
@@ -325,7 +342,7 @@ pub fn resolve(network: &NetworkConfig, boot: &BootDecision) -> ResolvedKey {
                         // was just added, it is created on this very startup.
                         write_escrow(network, &key);
                         return ResolvedKey {
-                            private_key: key,
+                            private_key: SecretString::new(key.as_str()),
                             origin: KeyOrigin::Sealed,
                         };
                     }
@@ -342,7 +359,7 @@ pub fn resolve(network: &NetworkConfig, boot: &BootDecision) -> ResolvedKey {
                          regenerated. Looking for a recovery file…"
                     );
                     if let Some(key) = try_recovery(secret) {
-                        write_escrow(network, &key);
+                        write_escrow(network, key.expose());
                         return ResolvedKey {
                             private_key: key,
                             origin: KeyOrigin::Recovered,
@@ -372,10 +389,7 @@ pub fn resolve(network: &NetworkConfig, boot: &BootDecision) -> ResolvedKey {
                 Ok(context) => context,
                 Err(e) => {
                     warn!("plaintext key unusable ({e}) — not sealed");
-                    return ResolvedKey {
-                        private_key: String::new(),
-                        origin: KeyOrigin::Missing,
-                    };
+                    return ResolvedKey::missing();
                 }
             };
             match store.store(secret, &context, plain.as_bytes()) {
@@ -391,16 +405,13 @@ pub fn resolve(network: &NetworkConfig, boot: &BootDecision) -> ResolvedKey {
             warn!("no TPM secret available: the key stays in the clear");
         }
         return ResolvedKey {
-            private_key: plain.to_string(),
+            private_key: SecretString::new(plain),
             origin: KeyOrigin::PlaintextConfig,
         };
     }
 
     // 3. Nothing usable.
-    ResolvedKey {
-        private_key: String::new(),
-        origin: KeyOrigin::Missing,
-    }
+    ResolvedKey::missing()
 }
 
 /// Creates the gateway's WireGuard identity, seals it, and returns its
@@ -809,7 +820,7 @@ mod tests {
         };
         let resolved = resolve(&network, &BootDecision::Disabled);
         assert_eq!(resolved.origin, KeyOrigin::PlaintextConfig);
-        assert_eq!(resolved.private_key, VALID);
+        assert_eq!(resolved.private_key.expose(), VALID);
     }
 
     /// Without a TPM secret, sealing is refused rather than silently failing.
