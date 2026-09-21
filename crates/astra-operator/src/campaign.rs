@@ -94,7 +94,7 @@ impl Campaign {
         operation_id: &Id16,
         result_token: &str,
         result: &AstraSignerResult,
-    ) -> Result<astra::signing::SigningOperationState> {
+    ) -> Result<aether::certificates::transport::SigningOperationState> {
         match self {
             Self::Origin(origin) => origin.submit(operation_id, result_token, result),
             Self::Tunnel(tunnel) => tunnel.submit_campaign(operation_id, result_token, result),

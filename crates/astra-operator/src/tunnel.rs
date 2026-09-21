@@ -333,7 +333,7 @@ impl Tunnel {
     /// Sharing the check is what keeps the two transports from drifting into
     /// accepting different things.
     pub fn fetch_campaign(&self, operation_id: &Id16) -> Result<crate::origin::CampaignRequest> {
-        let view: astra::signing::SigningOperationView = self
+        let view: aether::certificates::transport::SigningOperationView = self
             .get_campaign(
                 &format!(
                     "{}{OPERATOR_PREFIX}/operations/{}",
@@ -406,7 +406,7 @@ impl Tunnel {
         operation_id: &Id16,
         result_token: &str,
         result: &aether::certificates::status::AstraSignerResult,
-    ) -> Result<astra::signing::SigningOperationState> {
+    ) -> Result<aether::certificates::transport::SigningOperationState> {
         let body = serde_json::to_vec(result).context("encodage du résultat de campagne")?;
         let response = self
             .http
@@ -423,7 +423,7 @@ impl Tunnel {
             .body(body)
             .send()
             .context("dépôt de l'approbation")?;
-        let view: astra::signing::SigningOperationView =
+        let view: aether::certificates::transport::SigningOperationView =
             Self::decode_bounded(response, crate::origin::MAX_ANSWER_BYTES)?;
         Ok(view.state)
     }

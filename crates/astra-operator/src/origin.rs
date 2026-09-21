@@ -104,7 +104,7 @@ impl Origin {
     }
 
     pub fn fetch(&self, operation_id: &Id16) -> Result<CampaignRequest> {
-        let view: astra::signing::SigningOperationView = self
+        let view: aether::certificates::transport::SigningOperationView = self
             .get(
                 &format!("{}/v1/operations/{}", self.base, operation_id.to_hex()),
                 None,
@@ -129,7 +129,7 @@ impl Origin {
     /// view twice would otherwise be to hand it over.
     pub(crate) fn read_token(
         operation_id: &Id16,
-        view: &astra::signing::SigningOperationView,
+        view: &aether::certificates::transport::SigningOperationView,
     ) -> Result<String> {
         Self::assert_view(operation_id, view)?;
         view.signer_request_token.clone().ok_or_else(|| {
@@ -141,7 +141,10 @@ impl Origin {
     }
 
     /// What an operation read must say before anything else is asked of it.
-    fn assert_view(operation_id: &Id16, view: &astra::signing::SigningOperationView) -> Result<()> {
+    fn assert_view(
+        operation_id: &Id16,
+        view: &aether::certificates::transport::SigningOperationView,
+    ) -> Result<()> {
         if view.operation_id != *operation_id {
             bail!(
                 "l'autorité a répondu au sujet de l'opération {} et non de {}",
@@ -149,7 +152,7 @@ impl Origin {
                 operation_id.to_hex()
             );
         }
-        if view.state != astra::signing::SigningOperationState::AwaitingOperator {
+        if view.state != aether::certificates::transport::SigningOperationState::AwaitingOperator {
             bail!(
                 "cette campagne est déjà approuvée : une seconde assertion ne changerait rien, et \
                  l'autorité la refuserait comme un conflit."
@@ -166,7 +169,7 @@ impl Origin {
     /// the operator will read is the one the *signed* request names.
     pub(crate) fn accept(
         operation_id: &Id16,
-        view: astra::signing::SigningOperationView,
+        view: aether::certificates::transport::SigningOperationView,
         answer: SignerRequestAnswer,
     ) -> Result<CampaignRequest> {
         Self::assert_view(operation_id, &view)?;
@@ -279,7 +282,7 @@ impl Origin {
         operation_id: &Id16,
         result_token: &str,
         result: &AstraSignerResult,
-    ) -> Result<astra::signing::SigningOperationState> {
+    ) -> Result<aether::certificates::transport::SigningOperationState> {
         let body = serde_json::to_vec(result).context("encodage du résultat de campagne")?;
         let response = self
             .http
@@ -296,7 +299,7 @@ impl Origin {
             .body(body)
             .send()
             .context("dépôt de l'approbation")?;
-        let view: astra::signing::SigningOperationView = Self::decode(response)?;
+        let view: aether::certificates::transport::SigningOperationView = Self::decode(response)?;
         Ok(view.state)
     }
 
@@ -448,8 +451,8 @@ mod tests {
     use aether::certificates::status::{
         CampaignScope, CampaignTarget, CertificateKind, MAX_CAMPAIGN_TARGETS,
     };
+    use aether::certificates::transport::{SigningOperationState, SigningOperationView};
     use aether::certificates::CERTIFICATE_FORMAT_VERSION;
-    use astra::signing::{SigningOperationState, SigningOperationView};
 
     const NOW: u64 = 1_700_000_000;
 
