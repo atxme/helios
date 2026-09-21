@@ -1020,7 +1020,7 @@ Ces points exigent les machines cibles décrites dans
 | --- | --- |
 | [`aether::key_negotiation`](../../crates/aether/src/key_negotiation.rs) | types, validation, certificats, signatures, HKDF |
 | [`aether::pq`](../../crates/aether/src/pq.rs) | abstraction ML-KEM-1024 |
-| [`helios-key-negotiation`](../../crates/helios-key-negotiation/src/lib.rs) | QUIC, TLS, trames, limites, session de vivacité |
+| [`aether-key-negotiation`](../../crates/aether-key-negotiation/src/lib.rs) | QUIC, TLS, trames, limites, session de vivacité |
 | [`heliosd::key_negotiation`](../../crates/heliosd/src/key_negotiation.rs) | admission, pose, rollback, commit, TPM |
 | [`orion-core::key_negotiation`](../../crates/orion-core/src/key_negotiation.rs) | requête client, décapsulation, dérivation, confirmation |
 | [`orion-core::backend`](../../crates/orion-core/src/backend/mod.rs) | pose client, preuve WireGuard, retries, cycle de vie |

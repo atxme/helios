@@ -123,7 +123,7 @@ loin de la borne — mais l'argument doit être mathématiquement exact. Un éch
 CSPRNG ou de la dérivation est fatal ; aucun nonce fixe ni compteur réinitialisé
 n'est utilisé en repli.
 
-### 2. Un conteneur unique — `crates/helios-vault`
+### 2. Un conteneur unique — `crates/aether-vault`
 
 ```
 HVLT │ ver:u8 │ kdf:u8 │ dom_len:u8 │ ctx_len:u16be

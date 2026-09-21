@@ -1,5 +1,5 @@
 [package]
-name = "helios-vault"
+name = "aether-vault"
 version = "0.4.2"
 edition.workspace = true
 authors.workspace = true

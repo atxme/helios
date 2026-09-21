@@ -41,9 +41,9 @@ base64.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 # Non optionnelle : voir la note sur `aether` plus bas.
-helios-key-negotiation = { workspace = true }
+aether-key-negotiation = { workspace = true }
 # Conteneur AEAD de la table des PSK statiques (ADR-006 §4).
-helios-vault = { workspace = true }
+aether-vault = { workspace = true }
 thiserror.workspace = true
 aws-lc-rs.workspace = true
 zeroize.workspace = true

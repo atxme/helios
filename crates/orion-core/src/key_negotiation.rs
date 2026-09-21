@@ -15,12 +15,12 @@ use aether::{
     pq::{Kem, MlKem1024Kem},
     SecretString,
 };
+use aether_key_negotiation::{
+    client_endpoint_on_socket, negotiate, request_challenge, ClientSession, TlsIdentity,
+};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use base64::Engine as _;
-use helios_key_negotiation::{
-    client_endpoint_on_socket, negotiate, request_challenge, ClientSession, TlsIdentity,
-};
 use zeroize::Zeroizing;
 
 use crate::ClientProfile;

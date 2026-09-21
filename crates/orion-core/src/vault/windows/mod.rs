@@ -135,7 +135,7 @@ impl PlatformRootKeyProvider {
         // Same bound as every other sealed file: the wrapped root is a few
         // hundred bytes, and the path is one an attacker with local write
         // access can point at something enormous (ADR-006 §2).
-        let sealed = helios_vault::read_file_bounded(&self.path).map_err(VaultError::Container)?;
+        let sealed = aether_vault::read_file_bounded(&self.path).map_err(VaultError::Container)?;
         let wrapped = dpapi::unprotect(&sealed)?;
         if self.software_only {
             self.record(false);

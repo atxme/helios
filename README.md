@@ -41,13 +41,13 @@ heliosd : orchestrateur · API Axum/WS · IPAM ML-KEM · pare-feu nftables
 | `helios-firewall` | Rendu nftables, backends `dry-run` / `netlink` |
 | `helios-wireguard` | Plan de données gateway et table de pairs |
 | `helios-provisioning` | IPAM CGNAT, admission, session ML-KEM |
-| `helios-key-negotiation` | Transport QUIC authentifié (ni CA, ni backend WireGuard) |
+| `aether-key-negotiation` | Transport QUIC authentifié (ni CA, ni backend WireGuard) |
 | `astra` | Coordinateur PKI, registre de confiance et renouvellement des certificats |
 | `helios-api` | API Axum, WebSocket, IHM embarquée |
 | `helios-update` | Manifeste hybride, staging, anti-rollback |
 | `helios-escrow` | Séquestre opérateur de l'identité WireGuard |
 | `helios-tpm` | Scellement PCR et fenêtre de mise à jour |
-| `helios-vault` | Conteneur AEAD unique des secrets au repos (ADR-006) |
+| `aether-vault` | Conteneur AEAD unique des secrets au repos (ADR-006) |
 | `heliosd` | CLI et orchestration de la gateway |
 | `orion-core` / `apps/orion` | Cœur portable et shell Tauri du client |
 | `web` | Console d'administration React (MUI seul, polices auto-hébergées) |

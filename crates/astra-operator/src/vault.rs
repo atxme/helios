@@ -68,7 +68,7 @@
 //! See [`docs/testing/TESTING.md`](../../../docs/testing/TESTING.md).
 
 use aether::certificates::encoding::{Fingerprint, TrustDomainId};
-use helios_vault::{Context, Unlock};
+use aether_vault::{Context, Unlock};
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -87,7 +87,7 @@ pub const AUTHORITY_VAULT_VERSION: u16 = 1;
 /// Re-exported from the shared contracts: CTAP2 fixes it, so the value belongs
 /// where the key's own properties are stated rather than where the file is
 /// written. Kept visible here because every vault reader names it. Taken from
-/// `aether` and not from `helios-fido` on purpose — Astra reads this format
+/// `aether` and not from `aether-fido` on purpose — Astra reads this format
 /// but never speaks to a key, and linking the CTAP2 stack for a constant would
 /// drag `libudev` into a container that has no USB port to offer it.
 pub use aether::certificates::webauthn::SALT_LEN;
@@ -125,7 +125,7 @@ pub const MAX_LABEL_CHARS: usize = 64;
 #[derive(Debug, thiserror::Error)]
 pub enum VaultError {
     #[error("coffre d'autorité : {0}")]
-    Container(#[from] helios_vault::VaultError),
+    Container(#[from] aether_vault::VaultError),
     #[error("version de coffre non prise en charge : {0}")]
     UnsupportedVersion(u16),
     #[error("aucun key-slot ne porte cet identifiant")]
@@ -476,9 +476,9 @@ fn wrap_master(
     vault_id: &[u8; 16],
     slot_id: &[u8; 16],
     secret: &SlotSecret,
-    master: &[u8; helios_vault::KEY_LEN],
+    master: &[u8; aether_vault::KEY_LEN],
 ) -> Result<String> {
-    let blob = helios_vault::seal(
+    let blob = aether_vault::seal(
         SLOT_DOMAIN,
         &slot_context(vault_id, slot_id),
         &Unlock::Derived {
@@ -516,7 +516,7 @@ impl AuthorityVault {
             return Err(VaultError::Corrupt("RP ID WebAuthn vide".into()));
         }
         let vault_id: [u8; 16] = random_bytes()?;
-        let master: [u8; helios_vault::KEY_LEN] = random_bytes()?;
+        let master: [u8; aether_vault::KEY_LEN] = random_bytes()?;
         let mut master = Zeroizing::new(master);
 
         let slot_id: [u8; 16] = random_bytes()?;
@@ -612,13 +612,13 @@ impl AuthorityVault {
         &self,
         slot_id: &[u8; 16],
         secret: &SlotSecret,
-    ) -> Result<Zeroizing<[u8; helios_vault::KEY_LEN]>> {
+    ) -> Result<Zeroizing<[u8; aether_vault::KEY_LEN]>> {
         if self.format_version != AUTHORITY_VAULT_VERSION {
             return Err(VaultError::UnsupportedVersion(self.format_version));
         }
         let slot = self.slot(slot_id)?;
         let blob = decode(&slot.wrapped_master, "key-slot")?;
-        let opened = helios_vault::open(
+        let opened = aether_vault::open(
             SLOT_DOMAIN,
             &slot_context(&self.vault_id, slot_id),
             &Unlock::Derived {
@@ -627,7 +627,7 @@ impl AuthorityVault {
             },
             &blob,
         )?;
-        let master: [u8; helios_vault::KEY_LEN] = opened
+        let master: [u8; aether_vault::KEY_LEN] = opened
             .as_slice()
             .try_into()
             .map_err(|_| VaultError::Corrupt("clé maîtresse de longueur inattendue".into()))?;
@@ -645,9 +645,9 @@ impl AuthorityVault {
         self.open_payload(&master)
     }
 
-    fn open_payload(&self, master: &[u8; helios_vault::KEY_LEN]) -> Result<AuthoritySecrets> {
+    fn open_payload(&self, master: &[u8; aether_vault::KEY_LEN]) -> Result<AuthoritySecrets> {
         let blob = decode(&self.sealed_payload, "corps du coffre")?;
-        let payload = helios_vault::open(
+        let payload = aether_vault::open(
             PAYLOAD_DOMAIN,
             &payload_context(
                 &self.vault_id,
@@ -918,7 +918,7 @@ impl AuthorityVault {
     fn reseal(
         &mut self,
         slots: Vec<KeySlot>,
-        master: &[u8; helios_vault::KEY_LEN],
+        master: &[u8; aether_vault::KEY_LEN],
         secrets: &AuthoritySecrets,
     ) -> Result<()> {
         let sealed_payload = seal_payload(
@@ -974,13 +974,13 @@ fn seal_payload(
     vault_id: &[u8; 16],
     trust_domain_id: &TrustDomainId,
     slots: &Fingerprint,
-    master: &[u8; helios_vault::KEY_LEN],
+    master: &[u8; aether_vault::KEY_LEN],
     secrets: &AuthoritySecrets,
 ) -> Result<String> {
     let payload =
         serde_json::to_vec(secrets).map_err(|error| VaultError::Corrupt(error.to_string()))?;
     let mut payload = Zeroizing::new(payload);
-    let blob = helios_vault::seal(
+    let blob = aether_vault::seal(
         PAYLOAD_DOMAIN,
         &payload_context(vault_id, trust_domain_id, slots),
         &Unlock::Key(master),

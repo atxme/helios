@@ -181,7 +181,7 @@ independent of key negotiation.
 ## Secrets at rest
 
 [ADR-006](adr/ADR-006-SECRETS-AU-REPOS.md) mandates a single container,
-`helios-vault`: AES-256-GCM, domain and object-context separation, bounded
+`aether-vault`: AES-256-GCM, domain and object-context separation, bounded
 parser. A `domain` separates uses; an `object_context` separates instances of
 one use, so two blobs of the same kind never stay interchangeable.
 

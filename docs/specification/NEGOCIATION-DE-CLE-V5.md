@@ -2913,7 +2913,7 @@ courant détaillé en tête de note.
 | [`aether::key_negotiation`](../../crates/aether/src/key_negotiation.rs) | types v5, challenge, engagement HMAC, certificats v2, signatures ML-DSA-87, HKDF |
 | [`aether::pq`](../../crates/aether/src/pq.rs) | abstraction ML-KEM-1024, zéroïsation de la clé éphémère |
 | [`aether::sig`](../../crates/aether/src/sig.rs) | **inchangé** — ADR-002, artefacts éditeur, Ed25519 + ML-DSA-65 |
-| [`helios-key-negotiation`](../../crates/helios-key-negotiation/src/lib.rs) | QUIC sans reprise/0-RTT, trames, flux et délais bornés, phase unique de challenge, fermeture après commit |
+| [`aether-key-negotiation`](../../crates/aether-key-negotiation/src/lib.rs) | QUIC sans reprise/0-RTT, trames, flux et délais bornés, phase unique de challenge, fermeture après commit |
 | [`heliosd::key_negotiation`](../../crates/heliosd/src/key_negotiation.rs) | machine d'état générationnelle, pose, preuve WireGuard gateway, rollback, point de non-retour, traitement sérialisé du `release`, échéance de PSK, staging et promotion de l'identité v5 |
 | [`helios-api`](../../crates/helios-api/src/lib.rs) | `POST /api/key-negotiation/release`, résolution de la VIP source par `require_peer`, borne JSON et transfert au sérialiseur du slot |
 | [`orion-core::key_negotiation`](../../crates/orion-core/src/key_negotiation.rs) | challenge, requête, décapsulation, dérivation et confirmation ; construction/signature du `release` sans transport QUIC |

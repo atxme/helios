@@ -5,14 +5,14 @@
 //! ADR-008 §4 keeps `astra-signer` away from every other program because it is
 //! the one that holds `CA-PQ` in the clear. The **ordinary approval** holds
 //! nothing: §14.1 requires it to obtain no PRF output and open no key-slot, and
-//! [`helios_fido::approve_renewal`] enforces that by taking no vault and
+//! [`aether_fido::approve_renewal`] enforces that by taking no vault and
 //! passing no salt. The gesture is therefore separable from the program, and
 //! separating it is what removes the second binary.
 //!
 //! What Orion may do with a security key is exactly this: one `GetAssertion`
 //! over one challenge, for one operation. Registering a credential, deriving a
 //! slot secret and everything else that touches `hmac-secret` stays in the
-//! companion — Orion links `helios-fido`, never `astra`, so the vault format
+//! companion — Orion links `aether-fido`, never `astra`, so the vault format
 //! is not reachable from this process at all.
 //!
 //! # What Orion checks before touching the key
@@ -46,8 +46,8 @@
 use aether::certificates::approval::{AstraCredentialApprovalRequest, AstraRenewalApproval};
 use aether::certificates::encoding::MlDsa87PublicKey;
 use aether::certificates::transport::ClientRenewalSignerRequest;
-use helios_fido::authenticator::Transport;
-use helios_fido::DomainIdentity;
+use aether_fido::authenticator::Transport;
+use aether_fido::DomainIdentity;
 
 use crate::certificates::TrustState;
 
@@ -69,7 +69,7 @@ pub const fn transport() -> Transport {
 #[derive(Debug, thiserror::Error)]
 pub enum ApprovalError {
     #[error("approbation refusée : {0}")]
-    Ceremony(#[from] helios_fido::ApprovalError),
+    Ceremony(#[from] aether_fido::ApprovalError),
     #[error("objet refusé : {0}")]
     Certificate(#[from] aether::certificates::CertificateError),
     #[error(
@@ -228,12 +228,12 @@ impl VerifiedApproval {
     ///
     /// `pin` is only ever consulted on the HID transport. Under Windows the
     /// system collects it in its own dialog and it never enters this process,
-    /// which is why [`needs_pin`](helios_fido::authenticator::Authenticator::needs_pin)
+    /// which is why [`needs_pin`](aether_fido::authenticator::Authenticator::needs_pin)
     /// is asked rather than assumed.
     pub fn run(&self, pin: &str, now_unix: u64) -> Result<AstraRenewalApproval, ApprovalError> {
-        let key = helios_fido::authenticator::connect(transport())
+        let key = aether_fido::authenticator::connect(transport())
             .map_err(|_| ApprovalError::NoAuthenticator)?;
-        Ok(helios_fido::approve_renewal(
+        Ok(aether_fido::approve_renewal(
             key.as_ref(),
             &self.request,
             &self.service_key,
@@ -250,7 +250,7 @@ impl VerifiedApproval {
 
     /// Whether the caller has to collect a PIN at all.
     pub fn needs_pin(&self) -> Result<bool, ApprovalError> {
-        let key = helios_fido::authenticator::connect(transport())
+        let key = aether_fido::authenticator::connect(transport())
             .map_err(|_| ApprovalError::NoAuthenticator)?;
         Ok(key.needs_pin())
     }

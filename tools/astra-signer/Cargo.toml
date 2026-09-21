@@ -17,7 +17,7 @@ astra-operator.workspace = true
 # `key-negotiation-signing` sans condition : les types signés traversent cette
 # interface, et sans la fonctionnalité ils n'existent pas.
 aether = { workspace = true, features = ["key-negotiation-signing"] }
-helios-fido = { workspace = true }
+aether-fido = { workspace = true }
 anyhow.workspace = true
 base64.workspace = true
 clap.workspace = true

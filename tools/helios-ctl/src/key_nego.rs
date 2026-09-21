@@ -216,7 +216,7 @@ pub async fn run(command: KeyNegoCmd) -> Result<()> {
             } else {
                 println!(
                     "{}",
-                    helios_key_negotiation::certificate_fingerprint_der(&bytes)
+                    aether_key_negotiation::certificate_fingerprint_der(&bytes)
                 );
             }
             Ok(())
@@ -468,7 +468,7 @@ pub fn issue_client_material_with_validity(
     .context("issuing the Orion PQ certificate")?;
 
     Ok(ClientMaterial {
-        certificate_sha256: helios_key_negotiation::certificate_fingerprint_der(
+        certificate_sha256: aether_key_negotiation::certificate_fingerprint_der(
             certificate.der().as_ref(),
         ),
         pq_certificate_sha256: pq_certificate.fingerprint()?,
@@ -493,7 +493,7 @@ pub fn load_client_material(directory: &Path) -> Result<ClientMaterial> {
     let pq_certificate: PqCertificate = serde_json::from_slice(&pq_certificate_json)
         .context("the client PQ certificate is not a readable JSON document")?;
     Ok(ClientMaterial {
-        certificate_sha256: helios_key_negotiation::certificate_fingerprint_der(&certificate_der),
+        certificate_sha256: aether_key_negotiation::certificate_fingerprint_der(&certificate_der),
         pq_certificate_sha256: pq_certificate.fingerprint()?,
         certificate_der,
         private_key_der: Zeroizing::new(read(&directory.join(CLIENT_PRIVATE_KEY_FILE))?),
@@ -824,7 +824,7 @@ mod tests {
         assert!(!loaded.pq_private_key.is_empty());
         assert_eq!(
             loaded.certificate_sha256,
-            helios_key_negotiation::certificate_fingerprint_der(&loaded.certificate_der)
+            aether_key_negotiation::certificate_fingerprint_der(&loaded.certificate_der)
         );
         let pq_certificate: PqCertificate =
             serde_json::from_slice(&loaded.pq_certificate_json).unwrap();

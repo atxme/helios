@@ -16,13 +16,13 @@ use aether::{
     },
     InstallPskRequest, NetworkConfig, SecretString,
 };
-use anyhow::{Context, Result};
-use base64::Engine as _;
-use helios_api::key_negotiation::PskReleaseRefusal;
-use helios_key_negotiation::{
+use aether_key_negotiation::{
     prepare_key_material, server_endpoint, GatewayIdentity, NegotiationHandler,
     PreparedNegotiation, PublicError, TlsIdentity, DEFAULT_CONFIRMATION_TIMEOUT,
 };
+use anyhow::{Context, Result};
+use base64::Engine as _;
+use helios_api::key_negotiation::PskReleaseRefusal;
 use helios_tpm::{BootDecision, SealedKeystore, SecretKey};
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use zeroize::Zeroizing;
@@ -1510,13 +1510,13 @@ pub async fn start(
     // accepted client anchors are fixed here for exactly the same reason; a
     // client renewal never moves them, and a §9.4 overlap lasts a month.
     tracing::info!(
-        certificate_sha256 = %helios_key_negotiation::certificate_fingerprint_der(
+        certificate_sha256 = %aether_key_negotiation::certificate_fingerprint_der(
             identity.tls.certificate_chain.first().map_or(&[], Vec::as_slice)
         ),
         client_ca_sha256 = %client_cas
             .iter()
             .map(|client_ca| {
-                helios_key_negotiation::certificate_fingerprint_der(client_ca).to_string()
+                aether_key_negotiation::certificate_fingerprint_der(client_ca).to_string()
             })
             .collect::<Vec<_>>()
             .join(" "),
@@ -1553,7 +1553,7 @@ pub async fn start(
     });
     tracing::info!("key-negotiation listening on UDP {port}");
     spawn_psk_reclaimer(Arc::clone(&handler), peer_runtime);
-    tokio::spawn(helios_key_negotiation::serve(
+    tokio::spawn(aether_key_negotiation::serve(
         endpoint,
         Arc::clone(&handler) as Arc<dyn NegotiationHandler>,
     ));
@@ -2283,7 +2283,7 @@ pub fn initialize(
         );
     }
     Ok(InitializedIdentity {
-        certificate_sha256: helios_key_negotiation::certificate_fingerprint_der(
+        certificate_sha256: aether_key_negotiation::certificate_fingerprint_der(
             certificate.der().as_ref(),
         ),
         certificate_path,
@@ -3827,7 +3827,7 @@ mod tests {
     /// certificate as its trust anchor.
     struct TestTls {
         ca_der: Vec<u8>,
-        server: helios_key_negotiation::TlsIdentity,
+        server: aether_key_negotiation::TlsIdentity,
         client_certificate: Vec<u8>,
         client_key: Vec<u8>,
     }
@@ -3862,7 +3862,7 @@ mod tests {
 
         TestTls {
             ca_der: ca.der().to_vec(),
-            server: helios_key_negotiation::TlsIdentity {
+            server: aether_key_negotiation::TlsIdentity {
                 certificate_chain: vec![server_certificate.der().to_vec(), ca.der().to_vec()],
                 private_key: server_key.serialize_der(),
             },
@@ -3967,7 +3967,7 @@ mod tests {
             admin: false,
             preshared_key: None,
             key_negotiation_certificate_sha256: Some(
-                helios_key_negotiation::certificate_fingerprint_der(&tls.client_certificate),
+                aether_key_negotiation::certificate_fingerprint_der(&tls.client_certificate),
             ),
             key_negotiation_pq_certificate_sha256: Some(
                 client_pq_certificate.fingerprint().unwrap(),
@@ -3995,14 +3995,14 @@ mod tests {
             transactions: Mutex::new(TransactionState::default()),
         });
 
-        let server = helios_key_negotiation::server_endpoint(
+        let server = aether_key_negotiation::server_endpoint(
             "127.0.0.1:0".parse().unwrap(),
             &tls.server,
             std::slice::from_ref(&tls.ca_der),
         )
         .unwrap();
         let address = server.local_addr().unwrap();
-        let served = tokio::spawn(helios_key_negotiation::serve(server, handler));
+        let served = tokio::spawn(aether_key_negotiation::serve(server, handler));
 
         // From here on, everything runs through the client Orion actually
         // ships — same module, same code path as a real connection.

@@ -131,9 +131,9 @@ jobs:
           Get-Command .\scripts\deploy-app.ps1 -Syntax | Out-Null
           Get-Command .\scripts\setup-orion-signing.ps1 -Syntax | Out-Null
       - name: Analyse statique des chemins Windows
-        run: cargo clippy -p helios-fido -p orion-core -p orion -p astra-signer --all-targets --all-features -- -D warnings
+        run: cargo clippy -p aether-fido -p orion-core -p orion -p astra-signer --all-targets --all-features -- -D warnings
       - name: Tests du compagnon Astra sous Windows
-        run: cargo test -p helios-fido -p astra-signer --all-features
+        run: cargo test -p aether-fido -p astra-signer --all-features
       - name: Tests et couverture Orion sous Windows
         if: github.event_name != 'pull_request'
         shell: pwsh

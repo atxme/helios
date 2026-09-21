@@ -2597,7 +2597,7 @@ fn prepare_wireguard_nt_working_directory() -> anyhow::Result<()> {
 /// are quiet as long as nothing connects, so the cost is paid only where the
 /// answer lives. `RUST_LOG` overrides the whole thing.
 const DEFAULT_LOG_FILTER: &str = "info,orion=debug,orion_core=debug,aether=debug,\
-                                  helios_vault=debug,helios_key_negotiation=debug,\
+                                  aether_vault=debug,aether_key_negotiation=debug,\
                                   quinn=debug,quinn_proto=debug,rustls=debug";
 
 /// Log file, beside the vault it describes.

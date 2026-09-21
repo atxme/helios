@@ -40,13 +40,13 @@ zeroize.workspace = true
 x25519-dalek = { workspace = true }
 defguard_wireguard_rs = { workspace = true, optional = true }
 # Non optionnelle : voir la note sur `aether` ci-dessus.
-helios-key-negotiation = { workspace = true }
+aether-key-negotiation = { workspace = true }
 # Conteneur AEAD partagé des secrets au repos (ADR-006 §2).
-helios-vault = { workspace = true }
+aether-vault = { workspace = true }
 # La frontière matérielle FIDO2 et la **seule** cérémonie qui n'ouvre aucun
 # coffre (§14.1). Orion ne lie ni `astra` ni le format de coffre : la caisse
 # est extraite précisément pour que ce chemin-là soit le seul qu'il ait.
-helios-fido = { workspace = true }
+aether-fido = { workspace = true }
 # Normalisation NFC de la passphrase `nomade` : sans elle, la même phrase
 # saisie sur deux systèmes dérive deux clés différentes (ADR-006 §3).
 unicode-normalization = "0.1"

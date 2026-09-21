@@ -84,8 +84,8 @@ use aether::certificates::webauthn::{
 };
 use aether::certificates::window::TransitionWindow;
 use aether::certificates::{CertificateError, CERTIFICATE_FORMAT_VERSION};
+use aether_fido::authenticator::{Approval, Authenticator};
 use base64::Engine as _;
-use helios_fido::authenticator::{Approval, Authenticator};
 use rcgen::{
     BasicConstraints, CertificateParams, CertificateSigningRequestParams, DistinguishedName,
     DnType, IsCa, KeyPair, KeyUsagePurpose,
@@ -141,7 +141,7 @@ pub struct DelegationBounds {
 /// Defined at the approval boundary and re-exported: Orion needs the same five
 /// values to run the ceremony of §14.1, and two definitions of a domain are
 /// two things to keep equal.
-pub use helios_fido::DomainIdentity;
+pub use aether_fido::DomainIdentity;
 
 /// The companion's campaign result, and the assertions inside it.
 ///
@@ -1455,7 +1455,7 @@ pub struct RecoveryAuthorization {
 /// properties are the ones §7.5 names: same credential, same connection, and
 /// the assertion verified before the secret is used. What is missing is the
 /// convenience of one press. Merging them means a combined call in
-/// `helios-fido` and in **both** transports, neither of which can be exercised
+/// `aether-fido` and in **both** transports, neither of which can be exercised
 /// where this is built.
 #[allow(clippy::too_many_arguments)]
 pub fn recover_expired_identity(

@@ -61,7 +61,7 @@ flowchart LR
 
     subgraph Gateway["Gateway Helios"]
         Public["UDP key_negotiation_port<br/>QUIC + mTLS"]
-        Handler["helios-key-negotiation<br/>transaction par pair"]
+        Handler["aether-key-negotiation<br/>transaction par pair"]
         WGServer["WireGuard noyau<br/>slot PSK"]
         Config["network.toml<br/>admission + plancher"]
         TPM["Identité TLS + ML-DSA<br/>scellée au TPM"]

@@ -55,6 +55,49 @@ dependencies = [
 ]
 
 [[package]]
+name = "aether-fido"
+version = "0.1.1"
+dependencies = [
+ "aether",
+ "anyhow",
+ "aws-lc-rs",
+ "base64 0.22.1",
+ "ctap-hid-fido2",
+ "thiserror 2.0.18",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "aether-key-negotiation"
+version = "2.0.0"
+dependencies = [
+ "aether",
+ "async-trait",
+ "aws-lc-rs",
+ "base64 0.22.1",
+ "hex",
+ "quinn",
+ "rcgen",
+ "rustls",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
+name = "aether-vault"
+version = "0.4.2"
+dependencies = [
+ "aether",
+ "aws-lc-rs",
+ "thiserror 2.0.18",
+ "zeroize",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -261,12 +304,12 @@ name = "astra-operator"
 version = "0.2.0"
 dependencies = [
  "aether",
+ "aether-fido",
+ "aether-vault",
  "anyhow",
  "astra",
  "aws-lc-rs",
  "base64 0.22.1",
- "helios-fido",
- "helios-vault",
  "hex",
  "rcgen",
  "reqwest 0.12.28",
@@ -284,11 +327,11 @@ name = "astra-signer"
 version = "0.2.0"
 dependencies = [
  "aether",
+ "aether-fido",
  "anyhow",
  "astra-operator",
  "base64 0.22.1",
  "clap",
- "helios-fido",
  "hex",
  "rpassword",
  "serde",
@@ -2299,9 +2342,9 @@ name = "helios-astra-helper"
 version = "0.1.0"
 dependencies = [
  "aether",
+ "aether-fido",
  "anyhow",
  "astra-operator",
- "helios-fido",
  "serde",
  "serde_json",
  "tempfile",
@@ -2315,13 +2358,13 @@ name = "helios-ctl"
 version = "0.11.0"
 dependencies = [
  "aether",
+ "aether-key-negotiation",
  "anyhow",
  "base64 0.22.1",
  "clap",
  "directories",
  "futures-util",
  "helios-escrow",
- "helios-key-negotiation",
  "helios-update",
  "hex",
  "orion-core",
@@ -2350,19 +2393,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "helios-fido"
-version = "0.1.1"
-dependencies = [
- "aether",
- "anyhow",
- "aws-lc-rs",
- "base64 0.22.1",
- "ctap-hid-fido2",
- "thiserror 2.0.18",
- "windows-sys 0.59.0",
-]
-
-[[package]]
 name = "helios-firewall"
 version = "0.5.0"
 dependencies = [
@@ -2382,26 +2412,6 @@ dependencies = [
  "anyhow",
  "clap",
  "helios-update",
-]
-
-[[package]]
-name = "helios-key-negotiation"
-version = "2.0.0"
-dependencies = [
- "aether",
- "async-trait",
- "aws-lc-rs",
- "base64 0.22.1",
- "hex",
- "quinn",
- "rcgen",
- "rustls",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "zeroize",
 ]
 
 [[package]]
@@ -2439,9 +2449,9 @@ name = "helios-tpm"
 version = "0.7.0"
 dependencies = [
  "aether",
+ "aether-vault",
  "aws-lc-rs",
  "helios-escrow",
- "helios-vault",
  "hex",
  "serde",
  "serde_json",
@@ -2466,16 +2476,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "helios-vault"
-version = "0.4.2"
-dependencies = [
- "aether",
- "aws-lc-rs",
- "thiserror 2.0.18",
- "zeroize",
-]
-
-[[package]]
 name = "helios-wireguard"
 version = "0.3.0"
 dependencies = [
@@ -2493,6 +2493,8 @@ name = "heliosd"
 version = "1.13.0"
 dependencies = [
  "aether",
+ "aether-key-negotiation",
+ "aether-vault",
  "anyhow",
  "async-trait",
  "aws-lc-rs",
@@ -2501,11 +2503,9 @@ dependencies = [
  "helios-api",
  "helios-escrow",
  "helios-firewall",
- "helios-key-negotiation",
  "helios-provisioning",
  "helios-tpm",
  "helios-update",
- "helios-vault",
  "helios-wireguard",
  "libc",
  "orion-core",
@@ -3841,6 +3841,9 @@ name = "orion-core"
 version = "3.0.0"
 dependencies = [
  "aether",
+ "aether-fido",
+ "aether-key-negotiation",
+ "aether-vault",
  "anyhow",
  "async-trait",
  "aws-lc-rs",
@@ -3849,9 +3852,6 @@ dependencies = [
  "defguard_wireguard_rs",
  "directories",
  "futures-util",
- "helios-fido",
- "helios-key-negotiation",
- "helios-vault",
  "rcgen",
  "reqwest 0.12.28",
  "serde",

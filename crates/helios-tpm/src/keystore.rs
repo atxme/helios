@@ -36,13 +36,13 @@
 use std::path::{Path, PathBuf};
 
 // Direct AEAD use is confined to reading the legacy `HKS1` container: the
-// current format goes through `helios-vault`.
+// current format goes through `aether-vault`.
 use aws_lc_rs::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, NONCE_LEN};
 use zeroize::Zeroizing;
 
 use crate::{secret::SecretKey, Result, TpmError};
 
-pub use helios_vault::Context;
+pub use aether_vault::Context;
 
 /// Domain of the gateway's WireGuard identity (ADR-006 §2).
 pub const DOMAIN_GATEWAY_WG_KEY: &str = "helios.gateway.wg-key";
@@ -108,10 +108,10 @@ impl SealedKeystore {
     /// mid-write leaves the old vault intact rather than a truncated file —
     /// so the gateway can still restart.
     pub fn store(&self, secret: &SecretKey, context: &Context, plaintext: &[u8]) -> Result<()> {
-        let blob = helios_vault::seal(
+        let blob = aether_vault::seal(
             self.domain,
             context,
-            &helios_vault::Unlock::Key(secret.as_bytes()),
+            &aether_vault::Unlock::Key(secret.as_bytes()),
             plaintext,
         )
         .map_err(|e| KeystoreError::Format(e.to_string()))?;
@@ -130,11 +130,11 @@ impl SealedKeystore {
         if self.is_legacy()? {
             return self.load_legacy_file(secret);
         }
-        helios_vault::open_file(
+        aether_vault::open_file(
             &self.path,
             self.domain,
             context,
-            &helios_vault::Unlock::Key(secret.as_bytes()),
+            &aether_vault::Unlock::Key(secret.as_bytes()),
         )
         .map_err(translate)
     }
@@ -155,11 +155,11 @@ impl SealedKeystore {
             return Ok((Vec::new(), self.load_legacy_file(secret)?));
         }
         let blob = self.read_bounded()?;
-        let context = helios_vault::peek_context(&blob).map_err(translate)?;
-        let plaintext = helios_vault::open(
+        let context = aether_vault::peek_context(&blob).map_err(translate)?;
+        let plaintext = aether_vault::open(
             self.domain,
             &rebuild(&context),
-            &helios_vault::Unlock::Key(secret.as_bytes()),
+            &aether_vault::Unlock::Key(secret.as_bytes()),
             &blob,
         )
         .map_err(translate)?;
@@ -188,16 +188,16 @@ impl SealedKeystore {
             cause: e.to_string(),
         };
         let metadata = std::fs::metadata(&self.path).map_err(io)?;
-        if metadata.len() > helios_vault::MAX_VAULT_BYTES as u64 {
+        if metadata.len() > aether_vault::MAX_VAULT_BYTES as u64 {
             return Err(KeystoreError::Format("vault over the size bound".into()).into());
         }
         let mut blob = Vec::new();
         std::fs::File::open(&self.path)
             .map_err(io)?
-            .take(helios_vault::MAX_VAULT_BYTES as u64 + 1)
+            .take(aether_vault::MAX_VAULT_BYTES as u64 + 1)
             .read_to_end(&mut blob)
             .map_err(io)?;
-        if blob.len() > helios_vault::MAX_VAULT_BYTES {
+        if blob.len() > aether_vault::MAX_VAULT_BYTES {
             return Err(KeystoreError::Format("vault over the size bound".into()).into());
         }
         Ok(blob)
@@ -243,9 +243,9 @@ impl SealedKeystore {
 /// `Undecipherable` is kept distinct because the caller acts on it: it is the
 /// signature of a resealing that lost the old secret, and the trigger for the
 /// escrow recovery path.
-fn translate(error: helios_vault::VaultError) -> TpmError {
+fn translate(error: aether_vault::VaultError) -> TpmError {
     match error {
-        helios_vault::VaultError::Undecipherable => KeystoreError::Undecipherable.into(),
+        aether_vault::VaultError::Undecipherable => KeystoreError::Undecipherable.into(),
         other => KeystoreError::Format(other.to_string()).into(),
     }
 }
@@ -294,7 +294,7 @@ fn load_legacy(secret: &SecretKey, blob: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
 
 /// Builds the AEAD key from the unsealed secret — **legacy path only**.
 ///
-/// The current format derives it inside `helios-vault`; this remains for
+/// The current format derives it inside `aether-vault`; this remains for
 /// reading an `HKS1` vault written before the migration.
 fn aead_key(secret: &SecretKey) -> Result<LessSafeKey> {
     let unbound = UnboundKey::new(&AES_256_GCM, secret.as_bytes())

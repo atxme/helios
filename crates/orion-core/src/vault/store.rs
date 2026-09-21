@@ -339,11 +339,11 @@ impl ProfileStore {
         }
         let key = root.registry_key()?;
         let context = super::registry_context(&self.install_id()?);
-        let plaintext = helios_vault::open_file(
+        let plaintext = aether_vault::open_file(
             &path,
             DOMAIN_REGISTRY,
             &context,
-            &helios_vault::Unlock::Key(&key),
+            &aether_vault::Unlock::Key(&key),
         )
         .map_err(VaultError::Container)?;
         Registry::decode(&plaintext)
@@ -352,10 +352,10 @@ impl ProfileStore {
     fn store_registry(&self, root: &DeviceRootKey, registry: &Registry) -> Result<(), VaultError> {
         let key = root.registry_key()?;
         let context = super::registry_context(&self.install_id()?);
-        let blob = helios_vault::seal(
+        let blob = aether_vault::seal(
             DOMAIN_REGISTRY,
             &context,
-            &helios_vault::Unlock::Key(&key),
+            &aether_vault::Unlock::Key(&key),
             &registry.encode()?,
         )
         .map_err(VaultError::Container)?;
@@ -375,7 +375,7 @@ impl ProfileStore {
         // size to be checked before the blob is allocated, and says in as many
         // words that a bound applied after a `std::fs::read` is a bound that
         // already lost. A sparse manifest file costs an attacker nothing.
-        let blob = helios_vault::read_file_bounded(&self.manifest_path(entry.id))
+        let blob = aether_vault::read_file_bounded(&self.manifest_path(entry.id))
             .map_err(VaultError::Container)?;
         let manifest = open_manifest(
             root,
@@ -626,7 +626,7 @@ impl ProfileStore {
             // Reopen and verify **before** publishing anything (ADR-006 §3).
             // Trusting the write would mean discovering an unreadable vault on
             // the day the legacy file no longer exists.
-            let written = helios_vault::read_file_bounded(&self.manifest_path(id))
+            let written = aether_vault::read_file_bounded(&self.manifest_path(id))
                 .map_err(VaultError::Container)?;
             let reopened = open_manifest(
                 &root,

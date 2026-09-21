@@ -27,7 +27,7 @@
 //! qu'il faut essayer en premier n'est pas le chemin heureux : c'est le refus
 //! quand la fenêtre ne se crée pas.
 
-use helios_fido::authenticator::DialogOwner;
+use aether_fido::authenticator::DialogOwner;
 
 /// A window owned for the length of a ceremony.
 ///

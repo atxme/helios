@@ -44,7 +44,7 @@ pub use registry::{Registry, RegistryEntry};
 pub use settings::LocalSettings;
 pub use store::{Bootstrap, MigrationReport, ProfileStore};
 
-use helios_vault::Context;
+use aether_vault::Context;
 
 /// Vault domain of an Orion profile manifest (ADR-006 §2).
 pub const DOMAIN_PROFILE: &str = "orion.profile";
@@ -167,10 +167,10 @@ pub fn seal_manifest(
     let key = root.profile_root_key(id)?;
     let context = profile_context(id, client_public_key, &manifest.peer_public_key);
     let encoded = manifest.encode()?;
-    helios_vault::seal(
+    aether_vault::seal(
         DOMAIN_PROFILE,
         &context,
-        &helios_vault::Unlock::Key(&key),
+        &aether_vault::Unlock::Key(&key),
         &encoded,
     )
     .map_err(VaultError::Container)
@@ -190,10 +190,10 @@ pub fn open_manifest(
 ) -> Result<ProfileManifest, VaultError> {
     let key = root.profile_root_key(id)?;
     let context = profile_context(id, client_public_key, gateway_public_key);
-    let plaintext = helios_vault::open(
+    let plaintext = aether_vault::open(
         DOMAIN_PROFILE,
         &context,
-        &helios_vault::Unlock::Key(&key),
+        &aether_vault::Unlock::Key(&key),
         blob,
     )
     .map_err(VaultError::Container)?;
@@ -276,7 +276,7 @@ pub enum VaultError {
     #[error("réglages locaux du coffre : {0}")]
     LocalSettings(String),
     #[error(transparent)]
-    Container(helios_vault::VaultError),
+    Container(aether_vault::VaultError),
 }
 
 #[cfg(test)]

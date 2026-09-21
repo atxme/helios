@@ -237,8 +237,8 @@ fn recover<R: std::io::BufRead, W: std::io::Write>(
             return Err(error);
         }
     };
-    let key = match helios_fido::authenticator::connect_owned(
-        helios_fido::authenticator::Transport::default(),
+    let key = match aether_fido::authenticator::connect_owned(
+        aether_fido::authenticator::Transport::default(),
         owner,
     ) {
         Ok(key) => key,
@@ -362,8 +362,8 @@ fn approve_campaign<R: std::io::BufRead, W: std::io::Write>(
                 return Err(error);
             }
         };
-        let key = match helios_fido::authenticator::connect_owned(
-            helios_fido::authenticator::Transport::default(),
+        let key = match aether_fido::authenticator::connect_owned(
+            aether_fido::authenticator::Transport::default(),
             owner,
         ) {
             Ok(key) => key,

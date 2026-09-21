@@ -267,10 +267,10 @@ pub fn store(
 ) -> Result<(), StaticPskError> {
     let ikm = identity_material(gateway_private_key)?;
     let context = context_for(gateway_private_key, map)?;
-    let blob = helios_vault::seal(
+    let blob = aether_vault::seal(
         DOMAIN,
         &context,
-        &helios_vault::Unlock::Derived {
+        &aether_vault::Unlock::Derived {
             ikm: &ikm,
             info: INFO,
         },
@@ -307,7 +307,7 @@ pub fn load(
     // is explicit that a `std::fs::read` followed by a length check is not the
     // rule being asked for. The table is read at every start, from a path a
     // local attacker can replace with a sparse file.
-    let blob = helios_vault::read_file_bounded(path).map_err(|e| StaticPskError::Io {
+    let blob = aether_vault::read_file_bounded(path).map_err(|e| StaticPskError::Io {
         path: path.display().to_string(),
         cause: e.to_string(),
     })?;
@@ -317,18 +317,18 @@ pub fn load(
     // the AEAD is what authenticates it — then checked against what the
     // decoded table actually contains.
     let declared =
-        helios_vault::peek_context(&blob).map_err(|e| StaticPskError::Encoding(e.to_string()))?;
-    let plaintext = helios_vault::open(
+        aether_vault::peek_context(&blob).map_err(|e| StaticPskError::Encoding(e.to_string()))?;
+    let plaintext = aether_vault::open(
         DOMAIN,
         &Context::from_encoded(declared.clone()),
-        &helios_vault::Unlock::Derived {
+        &aether_vault::Unlock::Derived {
             ikm: &ikm,
             info: INFO,
         },
         &blob,
     )
     .map_err(|error| match error {
-        helios_vault::VaultError::Undecipherable => StaticPskError::Undecipherable,
+        aether_vault::VaultError::Undecipherable => StaticPskError::Undecipherable,
         other => StaticPskError::Encoding(other.to_string()),
     })?;
 

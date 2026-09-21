@@ -59,9 +59,9 @@ Read only the documents relevant to the touched area:
 * `aether`: shared canonical config/state/protocol/crypto contracts.
 * `astra`: certificate-authority coordinator and trust-domain state.
 * `helios-firewall` / `helios-wireguard`: nftables and WireGuard data plane.
-* `helios-provisioning` / `helios-key-negotiation`: admission, IPAM, ML-KEM orchestration and authenticated QUIC transport.
+* `helios-provisioning` / `aether-key-negotiation`: admission, IPAM, ML-KEM orchestration and authenticated QUIC transport.
 * `helios-api`: Axum REST/WebSocket API and embedded-web integration.
-* `helios-update` / `helios-vault` / `helios-escrow` / `helios-tpm`: signed updates, encrypted secrets, operator-held recovery and TPM support.
+* `helios-update` / `aether-vault` / `helios-escrow` / `helios-tpm`: signed updates, encrypted secrets, operator-held recovery and TPM support.
 * `orion-core` / `apps/orion`: portable client logic and Tauri/React desktop shell.
 * `heliosd`: gateway CLI and orchestration.
 * `web`: React/MUI gateway administration console.

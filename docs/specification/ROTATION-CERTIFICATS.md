@@ -3197,7 +3197,7 @@ contournés :
   même session, deux fois. Les propriétés que §7.5 nomme tiennent — même
   credential, même connexion, assertion vérifiée avant emploi du secret ; ce
   qui manque est le confort d'un seul appui, et le débloquer demande un appel
-  combiné dans `helios-fido` et dans **les deux** transports ;
+  combiné dans `aether-fido` et dans **les deux** transports ;
 - l'**exécution d'une campagne d'autorité**. Une campagne sur les **leafs
   clientes** s'exécute désormais : quand un pair couvert envoie sa demande de
   rotation, `astra::renewal::open` retrouve l'opération approuvée par
@@ -3522,7 +3522,7 @@ manques serait aussi trompeur que les taire :
   avec. Les propriétés que le §7.5 nomme tiennent — même credential, même
   connexion, assertion vérifiée avant tout emploi du secret ; ce qui manque est
   le confort d'un seul appui. Le débloquer demande un appel combiné dans
-  `helios-fido` et dans les deux transports, sur le chemin le plus sensible du
+  `aether-fido` et dans les deux transports, sur le chemin le plus sensible du
   produit et sans matériel pour l'éprouver.
 
 **Et un point ne sera pas tranché ici** : les essais d'intégration du §14.2
@@ -3984,7 +3984,7 @@ le dernier hash d'audit connu et refuser un fork de génération.
 | bibliothèque `astra-operator` | vérification et exécution des cérémonies sans dépendre d'une ligne de commande |
 | sidecar `helios-astra-helper` | assertions FIDO2 des récupérations/campagnes lancées par Orion ; ouverture locale du coffre par PRF, puis zéroïsation |
 | adaptateur `astra-signer` | flux portables et hors ligne tant que leur parité Orion n'est pas validée sur Windows |
-| `helios-vault` | coffre maître et key-slots multiples liés aux credentials YubiKey |
+| `aether-vault` | coffre maître et key-slots multiples liés aux credentials YubiKey |
 | `helios-api` | routes typées dans WireGuard, relais vers l'API Astra du veth et API privée appelée par Astra, authentification de source et limites HTTP |
 | `heliosd::key_negotiation` | identité active, staging gateway, marqueur publié, avortement, reçu signé et preuve de leaf servie |
 | `helios-provisioning::admission` | pending client, lease, commit/purge, générations TLS/PQ atomiques, unicité et révocation dominante |
