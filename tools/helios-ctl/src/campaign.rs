@@ -288,7 +288,9 @@ async fn scenario_provisioning_nominal(profile: &ClientProfile, url: &str) -> Ou
         Err(e) => Outcome::fail(format!("{e}")),
         Ok(outcome) => {
             let engine = base64::engine::general_purpose::STANDARD;
-            let size = engine.decode(&outcome.preshared_key).map(|k| k.len());
+            let size = engine
+                .decode(outcome.preshared_key.expose())
+                .map(|k| k.len());
             match size {
                 Ok(32) if outcome.lifetime > Duration::ZERO => Outcome::pass(format!(
                     "PSK 32 B, VIP {}, lifetime {} s",

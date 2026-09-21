@@ -119,7 +119,6 @@ struct Transaction {
 /// it vanished with the client. v5 has no link, so the slot's meaning is
 /// written down — and the two kinds of PSK a slot can hold are **not**
 /// interchangeable, which is the distinction v4 never had to make.
-#[derive(Clone)]
 enum SlotState {
     /// Nothing posed, or a candidate that never committed.
     Empty,
@@ -155,7 +154,7 @@ enum SlotState {
         transaction_id: [u8; 16],
         previous: Box<SlotState>,
         address: String,
-        previous_psk: Option<String>,
+        previous_psk: Option<SecretString>,
         /// Whether the candidate's installation has been **begun**.
         ///
         /// Set before the call, not after it, so that it is true even when
@@ -167,6 +166,36 @@ enum SlotState {
         /// to survive the task that began the write.
         install_attempted: bool,
     },
+}
+
+impl SlotState {
+    /// A named copy, because a slot can hold a secret and [`SecretString`]
+    /// deliberately has no `Clone`.
+    ///
+    /// `Preparing` carries the PSK to put back on rollback, which makes the
+    /// whole slot a secret-bearing type. ADR-006 §5 asks that the copies such
+    /// a type needs be operations a reviewer can grep for rather than ones
+    /// the compiler performs silently, so the derive is replaced by this.
+    fn duplicate(&self) -> Self {
+        match self {
+            Self::Empty => Self::Empty,
+            Self::ConfiguredStatic => Self::ConfiguredStatic,
+            Self::Committed(installed) => Self::Committed(installed.clone()),
+            Self::Preparing {
+                transaction_id,
+                previous,
+                address,
+                previous_psk,
+                install_attempted,
+            } => Self::Preparing {
+                transaction_id: *transaction_id,
+                previous: Box::new(previous.duplicate()),
+                address: address.clone(),
+                previous_psk: previous_psk.as_ref().map(SecretString::duplicate),
+                install_attempted: *install_attempted,
+            },
+        }
+    }
 }
 
 /// A PSK the gateway holds for a peer, and when it started holding it.
@@ -260,7 +289,7 @@ pub struct GatewayHandler {
     served_certificate_fingerprint: String,
     gateway_pq_private_key: Zeroizing<Vec<u8>>,
     dry_run: bool,
-    static_psks: RwLock<HashMap<String, String>>,
+    static_psks: RwLock<HashMap<String, SecretString>>,
     transactions: Mutex<TransactionState>,
 }
 
@@ -436,9 +465,9 @@ impl GatewayHandler {
                     previous_psk,
                     install_attempted,
                 } if *owner == transaction_id => (
-                    (**previous).clone(),
+                    (**previous).duplicate(),
                     address.clone(),
-                    previous_psk.clone(),
+                    previous_psk.as_ref().map(SecretString::duplicate),
                     *install_attempted,
                 ),
                 // Someone else owns the slot, or this transaction already
@@ -452,11 +481,7 @@ impl GatewayHandler {
                 }
             };
         if let Err(error) = self
-            .install(
-                public_key.to_string(),
-                address,
-                previous_psk.map(SecretString::new),
-            )
+            .install(public_key.to_string(), address, previous_psk)
             .await
         {
             tracing::error!(
@@ -847,12 +872,9 @@ impl NegotiationHandler for GatewayHandler {
             };
             (
                 peer.address.clone(),
-                // `key_negotiation` keeps its own `String` map; the
-                // conversion happens here, at the boundary, rather than
-                // through the whole module.
                 peer.preshared_key
                     .as_ref()
-                    .map(|psk| psk.expose().to_owned()),
+                    .map(aether::SecretString::duplicate),
                 pq_fingerprint,
                 peer.minimum_key_negotiation_mode,
             )
@@ -893,13 +915,13 @@ impl NegotiationHandler for GatewayHandler {
             .read()
             .await
             .get(&request.client_wg_public_key)
-            .cloned();
+            .map(SecretString::duplicate);
         // Recomputed against this transaction's context, so a match proves
         // possession now rather than agreeing with a stable identifier.
         let current_matches_static_request = request
             .static_psk_commitment
             .as_deref()
-            .zip(previous_psk.as_deref())
+            .zip(previous_psk.as_ref().map(SecretString::expose))
             .is_some_and(|(presented, current)| {
                 aether::key_negotiation::static_psk_commitment(
                     current,
@@ -914,9 +936,9 @@ impl NegotiationHandler for GatewayHandler {
                 })
             });
         let configured_static_psk = if current_matches_static_request {
-            previous_psk.as_deref()
+            previous_psk.as_ref().map(SecretString::expose)
         } else {
-            baseline_static_psk.as_deref()
+            baseline_static_psk.as_ref().map(SecretString::expose)
         };
 
         let generation = {
@@ -979,7 +1001,7 @@ impl NegotiationHandler for GatewayHandler {
                 transaction_id: request.transaction_id,
                 previous: Box::new(previous_state),
                 address: address.clone(),
-                previous_psk: previous_psk.clone(),
+                previous_psk: previous_psk.as_ref().map(SecretString::duplicate),
                 install_attempted: false,
             };
             slot.generation
@@ -1086,7 +1108,7 @@ impl NegotiationHandler for GatewayHandler {
             "key negotiation prepared: PSK installed, awaiting the client's confirmation"
         );
         if request.mode == ProtectionMode::StaticPsk && current_matches_static_request {
-            if let Some(static_psk) = previous_psk.clone() {
+            if let Some(static_psk) = previous_psk.as_ref().map(SecretString::duplicate) {
                 self.static_psks
                     .write()
                     .await
@@ -1436,7 +1458,7 @@ pub async fn start(
             .filter_map(|peer| {
                 peer.preshared_key
                     .as_ref()
-                    .map(|psk| (peer.public_key.clone(), psk.expose().to_owned()))
+                    .map(|psk| (peer.public_key.clone(), psk.duplicate()))
             })
             .collect();
         (
@@ -3272,7 +3294,7 @@ mod tests {
             dry_run: true,
             static_psks: RwLock::new(HashMap::from([(
                 CLIENT_KEY.into(),
-                previous_psk.to_string(),
+                SecretString::new(previous_psk),
             )])),
             transactions: Mutex::new(TransactionState::default()),
         };
@@ -3678,7 +3700,7 @@ mod tests {
                 transaction_id,
                 previous: Box::new(SlotState::Empty),
                 address: "100.64.1.2/32".into(),
-                previous_psk: Some(previous_psk.clone()),
+                previous_psk: Some(SecretString::new(&previous_psk)),
                 install_attempted: false,
             };
             slot.generation

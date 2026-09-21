@@ -3,7 +3,7 @@ use std::time::SystemTime;
 use aether::{
     certificates::encoding::DerCertificate,
     key_negotiation::{PqCertificate, ProtectionMode},
-    NetworkConfig, OrchestratorCmd, WgPeer,
+    NetworkConfig, OrchestratorCmd, SecretString, WgPeer,
 };
 use axum::{extract::State, http::StatusCode, Json};
 use helios_firewall::ruleset;
@@ -251,7 +251,12 @@ pub struct SplitTunnelRequest {
 #[derive(Deserialize)]
 pub struct GatewayKeyRequest {
     /// New Curve25519 private key for the gateway, in base64.
-    pub private_key: String,
+    ///
+    /// A [`SecretString`] rather than a `String`: the key arrives here from
+    /// the wire, and this is the first type that holds it. Deserializing
+    /// straight into the secret is what ADR-006 §5 asks for — parsing into a
+    /// bare `String` first would leave a copy no `Drop` ever clears.
+    pub private_key: SecretString,
 }
 
 /// Replaces the gateway's WireGuard private key and reseals it.
@@ -270,7 +275,7 @@ pub async fn gateway_key_set(
 ) -> Result<Json<CmdResponse>, (StatusCode, String)> {
     use base64::Engine as _;
 
-    let key = body.private_key.trim();
+    let key = body.private_key.expose().trim();
     let raw = base64::engine::general_purpose::STANDARD
         .decode(key)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("undecodable key: {e}")))?;

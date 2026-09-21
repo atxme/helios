@@ -49,7 +49,12 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Debug)]
 pub struct ProvisionOutcome {
     /// Post-quantum PSK, in base64, ready for the `PresharedKey` slot.
-    pub preshared_key: String,
+    ///
+    /// A [`SecretString`], which is also what keeps the `Debug` above honest:
+    /// this structure is built on every enrolment, and a derived `Debug` over
+    /// a bare `String` would print the PSK into any log that formats it
+    /// (ADR-006 §5).
+    pub preshared_key: aether::SecretString,
     /// VIP assigned by the gateway (CIDR).
     pub address: String,
     /// Gateway's WireGuard public key, as it declares itself.
@@ -133,7 +138,7 @@ pub fn finish(
     )?;
 
     Ok(ProvisionOutcome {
-        preshared_key: aether::enroll::psk_to_base64(&psk),
+        preshared_key: aether::enroll::psk_to_base64(&psk).into(),
         address: response.assigned_address.clone(),
         gateway_public_key: response.gateway_wg_public_key.clone(),
         lifetime: Duration::from_secs(u64::from(response.psk_lifetime_secs)),
@@ -277,12 +282,37 @@ mod tests {
         // ── Client-side return ──
         let outcome = finish(&profile, &secret_key, &client_nonce, &response).unwrap();
         assert_eq!(
-            outcome.preshared_key,
+            outcome.preshared_key.expose(),
             aether::enroll::psk_to_base64(&expected_psk),
             "the client must derive exactly the PSK the gateway computed"
         );
         assert_eq!(outcome.address, "100.64.1.2/32");
         assert_eq!(outcome.lifetime, Duration::from_secs(3600));
+    }
+
+    /// `ProvisionOutcome` derives `Debug` and is built on every enrolment, so
+    /// the only thing standing between the PSK and any log that formats the
+    /// outcome is the field's type. The test is what fails if it goes back to
+    /// being a `String` (ADR-006 §5).
+    #[test]
+    fn the_debug_of_an_outcome_reveals_no_preshared_key() {
+        let outcome = ProvisionOutcome {
+            preshared_key: "PSK-QUI-NE-DOIT-PAS-FUIR".into(),
+            address: "100.64.1.2/32".into(),
+            gateway_public_key: GATEWAY_PUB.into(),
+            lifetime: Duration::from_secs(3600),
+        };
+
+        let rendered = format!("{outcome:?}");
+        assert!(
+            !rendered.contains("PSK-QUI-NE-DOIT-PAS-FUIR"),
+            "the Debug of an outcome must not carry the PSK: {rendered}"
+        );
+        assert_eq!(
+            outcome.preshared_key.expose(),
+            "PSK-QUI-NE-DOIT-PAS-FUIR",
+            "redacting the Debug must not alter the value itself"
+        );
     }
 
     /// A gateway that isn't the profile's must be rejected.

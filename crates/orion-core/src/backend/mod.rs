@@ -232,7 +232,7 @@ async fn upgrade_to_post_quantum(
     }
 
     let upgraded = ClientProfile {
-        preshared_key: Some(outcome.preshared_key.clone()),
+        preshared_key: Some(outcome.preshared_key.expose().to_owned()),
         // Same rule as the pre-WireGuard negotiation: this PSK is the result
         // of an ML-KEM exchange, not a secret typed into the profile.
         preshared_key_is_negotiated: true,
