@@ -970,7 +970,7 @@ WireGuardNT : `docs/testing/TESTING.md` reste la référence pour ces cibles.
 | `heliosd/src/orchestrator.rs` (`SPLIT`, très haute) | **DEFERRED** | 1 912 lignes, intact. |
 | `heliosd/src/certificates.rs` (`SPLIT`, haute) | **DEFERRED** | 2 681 lignes, intact. |
 | `helios-api/src/{internal,certificates,routes}.rs` | **PARTIAL** | `internal.rs` est sorti vers `astra-channel` (13.1). `certificates.rs` et `routes.rs` restent intacts hors requalification des chemins. |
-| `orion-core/src/speedtest.rs`, `src/backend/mod.rs` | **DEFERRED** | 2 190 et 1 620 lignes, intacts. |
+| `orion-core/src/speedtest.rs`, `src/backend/mod.rs` | **PARTIAL** | `speedtest.rs` est devenu `speedtest/` : `mod.rs` (API publique, constantes, statistiques partagées par les deux moteurs), `raw.rs` (session brute, latence, TCP, progression), `udp.rs`, `failure.rs` (classification des erreurs de socket), `wire.rs` (cadrage TCP/UDP) et `http.rs` (moteur HTTP et ses six types privés). Code déplacé identique token pour token ; 46 `pub(super)` dictés par le compilateur ; les 13 items publics gardent leur chemin, `run_at` par réexport. Seuls 8 tests couvrent les 1 760 lignes de production. `backend/mod.rs` reste à faire, tests sortis (13.4). |
 | `orion` Tauri `src/main.rs` (`SPLIT`, très haute) | **DEFERRED** | 3 725 lignes, intact. |
 | `astra-signer/src/main.rs` (`SPLIT`, haute) | **DEFERRED** | 3 991 lignes, intact : c’est le plus gros binaire monolithique restant. |
 | `astra-operator/src/authority.rs` -> `signing.rs` (`RENAME`) | **DEFERRED** | `authority.rs` existe toujours ; `operations/rotation.rs` n’est pas créé. |
