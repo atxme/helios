@@ -994,3 +994,81 @@ fn a_pin_that_is_neither_standard_is_left_alone() {
         Err(CertificateError::InvalidPolicy(_))
     ));
 }
+
+/// Approval values that cross a boundary, built from constant bytes only, and
+/// the fingerprints they must keep.
+///
+/// The standard policy fingerprint is computed independently by Astra and by
+/// Helios at bootstrap, shown to the operator, confirmed out of band and
+/// carried by enrolment documents. The credential-binding fingerprint and the
+/// approval request's WebAuthn challenge are what a security key and the
+/// anchor sign over. Refactoring these types — splitting this module included
+/// — must not move a byte of any of them, and no other test would notice: they
+/// all compare two values computed by the same code. A change here is a
+/// wire-format change and needs new domains, not new constants.
+#[test]
+fn the_approval_fingerprints_are_pinned() {
+    let domain = TrustDomainId::new([1; 16]).expect("domain");
+    let gateway = WireGuardKey::from_bytes([2; 32]);
+
+    let policy = AstraIssuancePolicy::standard(domain, gateway, "gateway.example".into());
+    let binding = AstraCredentialBinding {
+        format_version: ISSUANCE_POLICY_FORMAT_VERSION,
+        credential_id: vec![3; 16],
+        credential_public_key: vec![4; 77],
+        aaguid: [5; 16],
+        trust_domain_id: domain,
+        gateway_wg_public_key: gateway,
+        state: CredentialState::Active,
+        credential_epoch: 1,
+        credential_registry_epoch: 1,
+        ca_epoch: 1,
+        created_at: 1_000,
+        ca_pq_signature: MlDsa87Signature::new(vec![
+            6;
+            crate::key_negotiation::ML_DSA_87_SIGNATURE_LEN
+        ])
+        .expect("signature"),
+    };
+    let request = AstraCredentialApprovalRequest {
+        format_version: ISSUANCE_POLICY_FORMAT_VERSION,
+        operation_id: Id16::new([7; 16]).expect("id"),
+        request_fingerprint: Fingerprint::of(b"rotation request"),
+        trust_domain_id: domain,
+        gateway_wg_public_key: gateway,
+        client_wg_public_key: WireGuardKey::from_bytes([8; 32]),
+        active_generation: 1,
+        requested_generation: 2,
+        credential_registry_epoch: 1,
+        webauthn_rp_id: "astra.example".into(),
+        webauthn_origin: "https://astra.example".into(),
+        allowed_credential_ids: vec![vec![3; 16]],
+        required_credentials: 1,
+        created_at: 1_000,
+        expires_at: 1_300,
+        astra_service_key_epoch: 1,
+        astra_signature: MlDsa87Signature::new(vec![
+            9;
+            crate::key_negotiation::ML_DSA_87_SIGNATURE_LEN
+        ])
+        .expect("signature"),
+    };
+
+    assert_eq!(
+        [
+            policy
+                .fingerprint()
+                .expect("the standard policy is valid")
+                .to_hex(),
+            binding.fingerprint().to_hex(),
+            request.challenge().to_hex(),
+            request.fingerprint().to_hex(),
+        ],
+        [
+            "7c5b4fc1e3f62d2c6bbcbf5ae3676ce0d6c054be6fc84ceb933cfc3e888c9225",
+            "e71513de77fdbb2214b795c41747d2771d172530f3999496acbe157db93517ca",
+            "4b4927c7aeef9b37e4cbc3286d96e3c361e967153066012c0dcffd3ac5ce4151",
+            "a267325005a3a02fc76559d4f4d31c039e11b4d9b24a508a779c5afc05a0e3f4",
+        ]
+    );
+}
