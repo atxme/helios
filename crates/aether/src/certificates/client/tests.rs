@@ -932,3 +932,139 @@ fn a_bare_commit_is_not_a_stage_commit_request() {
         .to_string();
     assert!(error.contains("format_version"), "{error}");
 }
+
+/// Four client objects built from constant bytes only, and the fingerprints
+/// they must keep.
+///
+/// These fingerprints are what the next object in the chain binds: the stage
+/// authorization names the request's, the grant names the receipt's, the
+/// commit names the grant's (spec §7). Orion, Astra and the gateway compute
+/// them independently, so moving these types around — splitting this module
+/// included — must not move a byte of their canonical transcripts. Every other
+/// test compares two fingerprints computed by the same code and would not
+/// notice. The stage authorization and the grant are left out: they embed
+/// signed certificates and approval evidence that constant bytes cannot
+/// produce. A change of these values is a wire-format change and needs new
+/// domains, not new constants here.
+#[test]
+fn the_client_object_fingerprints_are_pinned() {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+    let id = |byte: u8| Id16::new([byte; 16]).expect("id");
+    let key = |byte: u8| WireGuardKey::from_bytes([byte; 32]);
+    let signature = |byte: u8| {
+        MlDsa87Signature::new(vec![byte; crate::key_negotiation::ML_DSA_87_SIGNATURE_LEN])
+            .expect("signature")
+    };
+    let domain = TrustDomainId::new([1; 16]).expect("domain");
+
+    let request = ClientCertificateRotationRequest {
+        format_version: CERTIFICATE_FORMAT_VERSION,
+        protocol_version: CERTIFICATE_PROTOCOL_VERSION,
+        request_id: id(2),
+        trust_domain_id: domain,
+        gateway_wg_public_key: key(3),
+        server_name: "gateway.example".into(),
+        client_wg_public_key: key(4),
+        active_generation: 1,
+        requested_generation: 2,
+        active_tls_certificate_fingerprint: Fingerprint::of(b"active tls"),
+        active_pq_certificate_fingerprint: Fingerprint::of(b"active pq"),
+        tls_csr: DerCertificate::new(vec![5; 64]).expect("csr"),
+        created_at: 1_000,
+        expires_at: 2_000,
+        new_ml_dsa_87_public_key: MlDsa87PublicKey::new(vec![22; 2592]).expect("key"),
+        active_pq_signature: signature(6),
+        new_pq_signature: signature(7),
+    };
+    let receipt = GatewayCertificateStageReceipt {
+        format_version: CERTIFICATE_FORMAT_VERSION,
+        protocol_version: CERTIFICATE_PROTOCOL_VERSION,
+        trust_domain_id: domain,
+        stage_id: id(8),
+        stage_authorization_fingerprint: Fingerprint::of(b"stage authorization"),
+        request_fingerprint: request.fingerprint(),
+        renewal_authorization_fingerprint: Fingerprint::of(b"renewal authorization"),
+        gateway_wg_public_key: key(3),
+        client_wg_public_key: key(4),
+        active_generation: 1,
+        staged_generation: 2,
+        staged_tls_certificate_fingerprint: Fingerprint::of(b"staged tls"),
+        staged_pq_certificate_fingerprint: Fingerprint::of(b"staged pq"),
+        persisted_at: 1_100,
+        stage_expires_at: 1_700,
+        active_gateway_identity_epoch: 1,
+        gateway_decision_epoch: 1,
+        gateway_certificate_fingerprint: Fingerprint::of(b"gateway leaf"),
+        gateway_signature: signature(9),
+    };
+    let commit = ClientCertificateStageCommit {
+        format_version: CERTIFICATE_FORMAT_VERSION,
+        protocol_version: CERTIFICATE_PROTOCOL_VERSION,
+        trust_domain_id: domain,
+        stage_id: id(8),
+        grant_fingerprint: Fingerprint::of(b"grant"),
+        stage_receipt_fingerprint: receipt.fingerprint(),
+        gateway_wg_public_key: key(3),
+        client_wg_public_key: key(4),
+        active_generation: 1,
+        staged_generation: 2,
+        staged_tls_certificate_fingerprint: Fingerprint::of(b"staged tls"),
+        staged_pq_certificate_fingerprint: Fingerprint::of(b"staged pq"),
+        stage_expires_at: 1_700,
+        committed_at: 1_200,
+        active_pq_signature: signature(10),
+        staged_pq_signature: signature(11),
+    };
+    let recovery = ExpiredCertificateRecoveryRequest {
+        format_version: CERTIFICATE_FORMAT_VERSION,
+        protocol_version: CERTIFICATE_PROTOCOL_VERSION,
+        trust_domain_id: domain,
+        astra_challenge: [12; 32],
+        request_id: id(13),
+        gateway_wg_public_key: key(3),
+        server_name: "gateway.example".into(),
+        client_wg_public_key: key(4),
+        expired_generation: 1,
+        requested_generation: 2,
+        expired_tls_certificate: DerCertificate::new(vec![14; 64]).expect("der"),
+        expired_pq_certificate: PqCertificate {
+            version: crate::key_negotiation::PQ_CERTIFICATE_VERSION,
+            serial: [15; 16],
+            subject: "client".into(),
+            issuer: "CA-PQ".into(),
+            role: crate::key_negotiation::PqCertificateRole::Client,
+            wireguard_public_key: key(4).to_base64(),
+            // Constant bytes of the exact lengths: a real ML-DSA signature is
+            // randomized, which a pinned value cannot be.
+            ml_dsa_87_public_key: STANDARD
+                .encode([16; crate::key_negotiation::ML_DSA_87_PUBLIC_KEY_LEN]),
+            not_before_unix: 0,
+            not_after_unix: 900,
+            ml_dsa_87_signature: STANDARD
+                .encode([17; crate::key_negotiation::ML_DSA_87_SIGNATURE_LEN]),
+        },
+        tls_csr: DerCertificate::new(vec![18; 64]).expect("csr"),
+        credential_id: vec![19; 16],
+        created_at: 1_000,
+        expires_at: 2_000,
+        new_ml_dsa_87_public_key: MlDsa87PublicKey::new(vec![23; 2592]).expect("key"),
+        expired_pq_signature: signature(20),
+        new_pq_signature: signature(21),
+    };
+
+    assert_eq!(
+        [
+            request.fingerprint().to_hex(),
+            receipt.fingerprint().to_hex(),
+            commit.fingerprint().to_hex(),
+            recovery.fingerprint().to_hex(),
+        ],
+        [
+            "fb00902615b864f5d65968bdd751252c9113dbb4a385a05d3f6eb140a361a296",
+            "8e9c869f226af2d8bf41bf4e3ba53a96a5b8d509d8bdde531995212ef4ff5f4f",
+            "8806e00f531885fd1fa25fd15087b07aa08c153346419cb97558accf2f709549",
+            "717703958f6f7a7089547c4d433d6dcdad7c18b42b6c355d85b173e866f9e167",
+        ]
+    );
+}
