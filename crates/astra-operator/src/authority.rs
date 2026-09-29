@@ -122,11 +122,13 @@ pub const ANCHOR_ROTATION_CREDENTIALS: usize = 2;
 
 /// What Astra asks the companion to delegate to, for one issuer epoch.
 ///
-/// Defined by `astra`, which is the end that **writes** it, and re-exported
-/// here rather than declared twice: the two ends are two programs on two
-/// machines, and a field that drifted would surface as a JSON refusal in the
-/// middle of a ceremony with a security key already plugged in.
-pub use astra::issuer::IssuerDelegationRequest;
+/// Defined in `aether` and re-exported here rather than declared twice: the
+/// two ends are two programs on two machines, and a field that drifted would
+/// surface as a JSON refusal in the middle of a ceremony with a security key
+/// already plugged in. Owned by `aether` rather than by `astra`, the end that
+/// writes it, so that the companion does not depend on the online
+/// coordinator to read one document.
+pub use aether::certificates::authority::IssuerDelegationRequest;
 
 /// n   The bounds an operator sets on one delegation.
 #[derive(Debug, Clone, Copy)]

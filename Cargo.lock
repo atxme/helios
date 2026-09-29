@@ -307,7 +307,6 @@ dependencies = [
  "aether-fido",
  "aether-vault",
  "anyhow",
- "astra",
  "aws-lc-rs",
  "base64 0.22.1",
  "hex",

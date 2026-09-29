@@ -16,7 +16,6 @@ path = "src/lib.rs"
 # signe sous `CA-PQ`. La construire sans donnerait un coffre qui s'ouvre et ne
 # peut rien en faire.
 aether = { workspace = true, features = ["key-negotiation-signing"] }
-astra.workspace = true
 aether-fido = { workspace = true }
 # Le format scellé du corps du coffre.
 aether-vault.workspace = true
