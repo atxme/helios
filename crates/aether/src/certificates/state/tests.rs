@@ -1267,3 +1267,104 @@ fn the_astra_profile_refuses_a_binding_older_than_its_global_registry() {
         })
     ));
 }
+
+/// A fixed trust state, built from constant bytes only, and the fingerprint it
+/// must keep.
+///
+/// `base_state_fingerprint` is what a manifest binds (spec §8.1): the gateway
+/// and every client compute it independently and must agree byte for byte.
+/// Refactoring the states around it — moving them, reordering fields,
+/// splitting this module — must not move a single byte of the canonical
+/// encoding, and no other test would notice if it did: they all compare two
+/// fingerprints computed by the same code. If this value changes, the change
+/// is a wire-format change, and it needs a new `BASE_STATE_DOMAIN`, not a new
+/// constant here.
+#[test]
+fn the_base_state_fingerprint_is_pinned() {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+    let gateway = GatewayCertificateState {
+        trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+        gateway_wg_public_key: WireGuardKey::from_bytes([2; 32]),
+        server_name: "gateway.example".into(),
+        ca_epoch: 1,
+        current_ca_public_key: MlDsa87PublicKey::new(vec![4; 2592]).expect("key"),
+        next_ca_public_key: None,
+        next_ca_transition_fingerprint: None,
+        ca_activation_at: None,
+        ca_retire_active_at: None,
+        active_gateway_identity_epoch: 1,
+        gateway_decision_epoch: 1,
+        next_gateway_identity_epoch: None,
+        next_transition_fingerprint: None,
+        last_aborted_transition: None,
+        active_gateway_tls_certificate: DerCertificate::new(vec![1; 64]).expect("der"),
+        next_gateway_tls_certificate: None,
+        active_gateway_certificate: PqCertificate {
+            version: crate::key_negotiation::PQ_CERTIFICATE_VERSION,
+            serial: [3; 16],
+            subject: "gateway.example".into(),
+            issuer: "CA-PQ".into(),
+            role: crate::key_negotiation::PqCertificateRole::Gateway,
+            wireguard_public_key: WireGuardKey::from_bytes([2; 32]).to_base64(),
+            // Constant bytes of the exact ML-DSA-87 lengths: the fingerprint
+            // decodes both halves but verifies nothing, and a real signature
+            // is randomized, which a pinned value cannot be.
+            ml_dsa_87_public_key: STANDARD
+                .encode([8; crate::key_negotiation::ML_DSA_87_PUBLIC_KEY_LEN]),
+            not_before_unix: 0,
+            not_after_unix: 100_000,
+            ml_dsa_87_signature: STANDARD
+                .encode([9; crate::key_negotiation::ML_DSA_87_SIGNATURE_LEN]),
+        },
+        next_gateway_certificate: None,
+        activation_at: None,
+        retire_active_at: None,
+        published: true,
+        revoked: false,
+        revocation_epoch: 0,
+        service_rollback: None,
+        awaited_replacement: None,
+    };
+    let client_tls_ca = ClientTlsCaState {
+        ca_tls_epoch: 1,
+        active_client_tls_ca_certificate: DerCertificate::new(vec![5; 64]).expect("der"),
+        next_client_tls_ca_certificate: None,
+        next_transition_fingerprint: None,
+        activation_at: None,
+        retire_active_at: None,
+    };
+    let astra = AstraProfile {
+        authority_url: "https://astra.example".into(),
+        webauthn_rp_id: "astra.example".into(),
+        astra_policy_fingerprint: AstraPolicyPin::new(Fingerprint::of(b"policy")).expect("pin"),
+        credential_registry_epoch: 1,
+        credential_bindings: BTreeMap::new(),
+        active_astra_service_public_key: MlDsa87PublicKey::new(vec![6; 2592]).expect("key"),
+        next_astra_service_public_key: None,
+        next_service_key_transition_fingerprint: None,
+        astra_service_key_epoch: 1,
+        service_key_activation_at: None,
+        service_key_retire_active_at: None,
+        service_key_revocation_epoch: 0,
+        last_emergency_replacement_fingerprint: None,
+    };
+    let client = ClientCertificateState::new(generation(1, 7));
+    let ledger = TrustLedger::default();
+
+    let fingerprint = base_state_fingerprint(&TrustSnapshot {
+        gateway: &gateway,
+        client_tls_ca: &client_tls_ca,
+        astra: &astra,
+        issuer_epoch: 3,
+        issuer: None,
+        client: &client,
+        ledger: &ledger,
+    })
+    .expect("a well-formed state has a fingerprint");
+
+    assert_eq!(
+        fingerprint.to_hex(),
+        "73d2a0af6597a32bbb10fe65cca280e874c621f43542e3f115b2c6e9497dc627"
+    );
+}
