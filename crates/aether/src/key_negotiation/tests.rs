@@ -1090,3 +1090,88 @@ fn a_version_one_certificate_is_refused() {
         Err(KeyNegotiationError::InvalidPqCertificate)
     );
 }
+
+/// Negotiation values both ends compute independently, from constant inputs,
+/// and the values they must keep.
+///
+/// The gateway and Orion each derive the WireGuard PSK from the ML-KEM secret
+/// and the transcript, each compute the static-PSK commitment, and each name a
+/// PQ leaf by its fingerprint. A tunnel comes up only if both sides agree to
+/// the byte. Every other test here compares two values produced by the same
+/// code, so a refactor that moved a byte of a transcript — splitting this
+/// module included — would pass them all. A change of these values breaks
+/// interoperability with deployed peers and needs new domains.
+#[test]
+fn the_negotiation_values_are_pinned() {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+    let pattern =
+        |seed: u8| -> [u8; 32] { std::array::from_fn(|i| seed.wrapping_add(i as u8 * 7)) };
+    let client_key = STANDARD.encode(pattern(1));
+    let gateway_key = STANDARD.encode(pattern(2));
+
+    let certificate = PqCertificate {
+        version: PQ_CERTIFICATE_VERSION,
+        serial: [3; KEY_NEGOTIATION_NONCE_LEN],
+        subject: "gateway.example".into(),
+        issuer: "CA-PQ".into(),
+        role: PqCertificateRole::Gateway,
+        wireguard_public_key: gateway_key.clone(),
+        ml_dsa_87_public_key: STANDARD.encode([4; ML_DSA_87_PUBLIC_KEY_LEN]),
+        not_before_unix: 0,
+        not_after_unix: 100_000,
+        ml_dsa_87_signature: STANDARD.encode([5; ML_DSA_87_SIGNATURE_LEN]),
+    };
+
+    let commitment = static_psk_commitment(
+        &STANDARD.encode(pattern(6)),
+        &[7; KEY_NEGOTIATION_NONCE_LEN],
+        &[8; KEY_NEGOTIATION_NONCE_LEN],
+        &[9; SERVER_CHALLENGE_LEN],
+        &client_key,
+        &gateway_key,
+    )
+    .expect("a well-formed static PSK has a commitment");
+
+    let request = KeyNegotiationRequest {
+        protocol_version: KEY_NEGOTIATION_VERSION,
+        server_challenge: [9; SERVER_CHALLENGE_LEN],
+        transaction_id: [7; KEY_NEGOTIATION_NONCE_LEN],
+        mode: ProtectionMode::MlKem,
+        client_wg_public_key: client_key.clone(),
+        gateway_wg_public_key: gateway_key.clone(),
+        server_name: "gateway.example".into(),
+        gateway_certificate_fingerprint: certificate.fingerprint().expect("fingerprint"),
+        client_nonce: [8; KEY_NEGOTIATION_NONCE_LEN],
+        timestamp_unix: 1_000,
+        kem_public_key: Some(vec![12; crate::pq::PUBLIC_KEY_LEN]),
+        static_psk_commitment: None,
+    };
+    let response = KeyNegotiationResponse {
+        protocol_version: KEY_NEGOTIATION_VERSION,
+        transaction_id: [7; KEY_NEGOTIATION_NONCE_LEN],
+        server_challenge: [9; SERVER_CHALLENGE_LEN],
+        selected_mode: ProtectionMode::MlKem,
+        gateway_wg_public_key: gateway_key.clone(),
+        client_wg_public_key: client_key.clone(),
+        gateway_nonce: [10; KEY_NEGOTIATION_NONCE_LEN],
+        kem_ciphertext: Some(vec![13; crate::pq::CIPHERTEXT_LEN]),
+        confirmation_timeout_secs: 30,
+        psk_lifetime_secs: NEGOTIATED_PSK_LIFETIME_SECS,
+    };
+    let psk = derive_negotiated_psk(&Zeroizing::new(pattern(11)), &request, &response)
+        .expect("a consistent ML-KEM transcript derives a PSK");
+
+    assert_eq!(
+        [
+            certificate.fingerprint().expect("fingerprint"),
+            commitment,
+            STANDARD.encode(*psk),
+        ],
+        [
+            "83dd514cedec29d8fdc92dc7a6c7439ece2b95d3c804da563ffbea8ef2b29c26",
+            "4e713cdfb69656e29b1ad1f93ef657f71a3791b5a79b5e09b3886bd0335de0e5",
+            "c3RJcdp39JblINzZ/EnxzMlVv6YzUkHVeZhvG0RHWtw=",
+        ]
+    );
+}
