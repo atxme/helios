@@ -2,7 +2,7 @@
 
 **Statut** : cible spécifiée — **cycle de vie partiellement implémenté**
 (revu le 2026-08-09, amendé les 2026-08-15, 2026-08-16, 2026-08-22,
-2026-08-30 et 2026-09-06). Le protocole de négociation servi est déjà la v5. Le §12.3 nomme
+2026-08-30, 2026-09-06 et 2026-09-29). Le protocole de négociation servi est déjà la v5. Le §12.3 nomme
 précisément ce qui est livré et ce qui ne l'est pas ; ne pas lire le reste de
 la note comme une capacité disponible, et ne pas déduire d'une liste raccourcie
 que le §12.1 est atteint — le §12.5 tranche cette question, et il répond non.
@@ -238,6 +238,31 @@ La dispersion dans les 20 % restants est supprimée : elle réduisait de façon
 imprévisible la marge de reprise d'un client. Si le seuil est atteint hors
 ligne, Orion agit à la prochaine connexion ; une identité déjà expirée ne
 bascule jamais vers ce chemin et exige la récupération du §7.5.
+
+### 0.8 Amendement de découpage du 29 septembre 2026
+
+Le canal privé Astra–Helios du §8.3 change de propriétaire dans le code, pas
+de comportement. Le §16 attribuait à `helios-api` « l'API privée appelée par
+Astra » ; il l'attribue désormais à une bibliothèque `astra-channel`, qui ne
+dépend que d'`aether` et que consomment `astra`, `heliosd` et `helios-api`.
+`helios-api` garde les routes typées dans WireGuard, le relais vers l'API Astra
+du veth, l'authentification de source et les limites HTTP.
+
+La raison est une règle de dépendance, pas une propriété de sécurité : Astra ne
+dépend ni de `helios-api` ni d'aucun package `helios-*`
+([CRATE-REORGANIZATION.md §7](../architecture/CRATE-REORGANIZATION.md)). Les
+deux extrémités du canal partagent les mêmes contrats et les mêmes bornes TLS ;
+les héberger dans la façade HTTP de la gateway obligeait le coordinateur à lier
+toute cette façade pour parler au veth.
+
+Rien ne change sur le fil : paire veth sans route par défaut, mTLS mutuel entre
+certificats épinglés, ALPN `helios-astra-lifecycle/1`, préfixe et routes de
+l'API privée, autorisation ML-DSA-87 propre à chaque mutation. L'ALPN est une
+valeur de protocole et garde son nom.
+
+Tant que l'extraction n'est pas livrée, ces responsabilités vivent dans le
+module `helios_api::internal`. L'avancement est tenu au §13 de
+CRATE-REORGANIZATION.md, pas dans cette spécification.
 
 ## 1. Périmètre
 
@@ -3985,7 +4010,8 @@ le dernier hash d'audit connu et refuser un fork de génération.
 | sidecar `helios-astra-helper` | assertions FIDO2 des récupérations/campagnes lancées par Orion ; ouverture locale du coffre par PRF, puis zéroïsation |
 | adaptateur `astra-signer` | flux portables et hors ligne tant que leur parité Orion n'est pas validée sur Windows |
 | `aether-vault` | coffre maître et key-slots multiples liés aux credentials YubiKey |
-| `helios-api` | routes typées dans WireGuard, relais vers l'API Astra du veth et API privée appelée par Astra, authentification de source et limites HTTP |
+| `helios-api` | routes typées dans WireGuard, relais vers l'API Astra du veth, authentification de source et limites HTTP |
+| `astra-channel` | canal privé Astra–Helios du §8.3 : contrats échangés, configurations mTLS client et serveur des deux extrémités, ALPN, routeur de l'API privée de cycle de vie appelée par Astra, que `heliosd` héberge sur le veth ; ne dépend que d'`aether` (§0.8) |
 | `heliosd::key_negotiation` | identité active, staging gateway, marqueur publié, avortement, reçu signé et preuve de leaf servie |
 | `helios-provisioning::admission` | pending client, lease, commit/purge, générations TLS/PQ atomiques, unicité et révocation dominante |
 | configuration TLS de `heliosd` | deux CA clientes au plus, promotion par `ca_tls_epoch` et vérification mTLS avant résolution de génération |

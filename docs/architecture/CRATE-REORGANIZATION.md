@@ -932,7 +932,7 @@ WireGuardNT : `docs/testing/TESTING.md` reste la référence pour ces cibles.
 | `helios_wireguard::PeerAddressTable` | **RUPTURE SOURCE INTERNE À CONFIRMER** | `c050537` supprime ce chemin Rust public en déplaçant l’adaptateur chez son seul consommateur observé dans le workspace. Aucun contrat réseau, persistant ou CLI ne change, mais un consommateur Rust externe éventuel ne compilerait plus. Le dépôt ne déclare pas ces packages comme publiés ; cette absence d’usage externe doit néanmoins être confirmée avant fusion. |
 | `heliosd -[dev]-> orion-core` | **REJECTED** | Voir l’arbitrage en §7 : cible `lib` requise, 12 champs privés de `GatewayHandler` + `TransactionState` à publier, et la preuve passerait d’une comparaison déterministe de PSK à une observation de handshake exigeant un noyau. |
 | `astra -> helios-api` | **PARTIAL** | `050c03c` a requalifié 10 sites vers `aether` (les contrats de renouvellement sont définis dans `aether::certificates::transport`, `helios-api` ne fait que les réexporter) ; le déplacement de `TrustUpdateRefusal` vers ce même module en a requalifié 4 de plus. Il reste 20 lignes dans 9 fichiers de `crates/astra/src/` qui nomment `helios_api::`, **toutes vers `helios_api::internal`** — mesure faite par `grep -rn helios_api crates/astra/src`. L'arête ne tient donc plus qu'au canal privé. |
-| `astra-channel` (SPLIT de `helios-api`) | **DEFERRED, débloquée** | `helios-api/src/lib.rs:24` porte toujours `pub mod internal` (2 255 lignes) et aucune crate n’est extraite. La quatrième condition de §5 est en revanche remplie : `TrustUpdateRefusal` n’est plus un type de `helios-api`. Il est classé comme contrat partagé — la gateway le sert sur la route in-tunnel, Astra y projette ses erreurs de distribution et de renouvellement — donc défini dans `aether::certificates::transport`, réexporté par `helios-api` et nommé directement par `astra` (`distribution.rs:100`, `renewal.rs:159`). Les 20 lignes `helios_api::` qui restent dans `astra` visent toutes `internal` : l’extraction supprimerait l’arête au lieu de la déplacer. |
+| `astra-channel` (SPLIT de `helios-api`) | **DEFERRED, débloquée** | `helios-api/src/lib.rs:24` porte toujours `pub mod internal` (2 255 lignes) et aucune crate n’est extraite. La quatrième condition de §5 est en revanche remplie : `TrustUpdateRefusal` n’est plus un type de `helios-api`. Il est classé comme contrat partagé — la gateway le sert sur la route in-tunnel, Astra y projette ses erreurs de distribution et de renouvellement — donc défini dans `aether::certificates::transport`, réexporté par `helios-api` et nommé directement par `astra` (`distribution.rs:100`, `renewal.rs:159`). Les 20 lignes `helios_api::` qui restent dans `astra` visent toutes `internal` : l’extraction supprimerait l’arête au lieu de la déplacer. La collision avec la spécification est tranchée (13.5) : plus rien dans les documents normatifs ne s’oppose à l’extraction. Le graphe cible du §6 omet `heliosd -> astra-channel` : le plan du §8 et le code l’exigent, `heliosd` hébergeant le serveur du canal (41 références à `helios_api::internal` dans `crates/heliosd/src/astra_channel.rs`). La spécification amendée nomme donc `heliosd` parmi les consommateurs. |
 | `astra-operator -> astra` | **DONE** | Arête supprimée : `astra` ne figure plus dans `crates/astra-operator/Cargo.toml`, et `cargo metadata` donne `astra-operator -> aether, aether-fido, aether-vault`. Les 12 chemins `SigningOperationView`/`SigningOperationState` nomment `aether::certificates::transport`, que `crates/astra/src/signing.rs` se contentait de réexporter (technique de `050c03c`). Le dernier chemin, `IssuerDelegationRequest`, a été classé **contrat partagé** : document sans secret que `astra` écrit et que le compagnon relit sur une autre machine. Il est défini en `crates/aether/src/certificates/authority.rs`, à côté de l’`AstraIssuerAuthorization` qu’il demande ; `astra::issuer` et `astra_operator::authority` le réexportent, si bien qu’aucun consommateur (`astra-signer`, tests d’intégration) n’a changé de chemin. Format JSON inchangé : mêmes champs, même `deny_unknown_fields`. |
 | `aether-fido`, `aether-key-negotiation`, `aether-vault` | **DONE** | Renommage seul, aucune ligne de logique touchée. Les répertoires sont `crates/aether-fido/`, `crates/aether-key-negotiation/`, `crates/aether-vault/` et leurs `[package] name` suivent ; `crates/orion-core/Cargo.toml` ne déclare plus que `aether-key-negotiation`, `aether-vault` et `aether-fido`, donc plus aucun package `helios-*`. La règle de nommage de §1 n'est plus violée. Les valeurs de format et de protocole gardent volontairement leur nom historique — `AAD_PREFIX = b"helios-vault/v1"` (`crates/aether-vault/src/lib.rs:76`), `KEY_NEGOTIATION_ALPN = b"helios-key-negotiation/5"` (`crates/aether-key-negotiation/src/lib.rs:30`), les domaines ML-DSA-87 de `crates/aether/src/key_negotiation.rs` et le discriminant de profil Orion `helios_key_negotiation` — les renommer casserait des coffres, des sessions et des profils existants. Reste `astra -> helios-api` comme seul interdit de §7 enfreint en production — 20 lignes, toutes vers `helios_api::internal`, que seule l’extraction d’`astra-channel` peut lever. |
 | `helios-trust` (extraction de `helios-provisioning::certificates`) | **DEFERRED** | La *seam* que la Phase 3 exigeait avant extraction est désormais prouvée au niveau module : `096c1e9` a découpé le registre en cinq sous-modules dont chacun a son fichier de tests jumeau. Mais la condition de crate n’est pas remplie : un seul consommateur, `heliosd` (22 lignes) ; `helios-api` ne consomme que la moitié admission de `helios-provisioning`. Le registre reste donc un module, comme §5 l’autorisait explicitement. |
@@ -988,19 +988,22 @@ cours de route et sont enregistrés ici plutôt que traités dans un déplacemen
 | Tests du ruleset firewall vs modules de production | **PARTIAL** | `f788e14` a découpé la production par capacité (`administration`, `transport`, `kill_switch`…) mais n’a pas réaligné `ruleset/tests/`, organisé par comportement (`access`, `egress`, `transport`, `uplinks`) depuis `ff9f095`. Les deux axes coexistent ; `golden.rs` couvre l’ordre global. Réaligner n’est utile que si l’on accepte de renommer des tests, ce qu’aucun déplacement n’a fait jusqu’ici. |
 | Liens intra-doc cassés préexistants | **À corriger — hors périmètre** | `cargo doc --workspace --no-deps --all-features` signale 34 liens non résolus ou pointant vers des items privés. Aucun n’a été introduit par la réorganisation : tous existent à l’identique avant `b837036`, et `096c1e9` en a au contraire réparé un (`RegistryState::client_leaf_issuers`, désormais `crates/helios-provisioning/src/certificates/trust.rs:47`). |
 
-### 13.5 Collision à arbitrer avec la spécification
+### 13.5 Collision avec la spécification — tranchée
 
-`docs/specification/ROTATION-CERTIFICATS.md:3988` attribue nommément à
-`helios-api` « l’API privée appelée par Astra ». C’est exactement la
-responsabilité que §4 de ce document classe `SPLIT` et que §5 propose
-d’extraire vers `astra-channel`.
+`docs/specification/ROTATION-CERTIFICATS.md` attribuait nommément à
+`helios-api` « l’API privée appelée par Astra », c’est-à-dire la
+responsabilité que §4 de ce document classe `SPLIT` et que §5 extrait vers
+`astra-channel`. Les deux documents ne pouvaient pas être vrais en même temps.
 
-Les deux documents ne peuvent pas être vrais en même temps : la spécification
-est un contrat de responsabilité, et l’extraction la contredirait. Cette
-collision est **signalée, pas résolue** : `ROTATION-CERTIFICATS.md` n’est pas
-modifié ici. Toute livraison d’`astra-channel` doit commencer par une décision
-explicite sur ce tableau — et la classification de `TrustUpdateRefusal` (13.1)
-est la même question posée au niveau du type.
+La collision est tranchée en faveur de l’extraction. L’amendement du
+29 septembre 2026 (§0.8 de la spécification) déplace cette ligne du §16 vers
+`astra-channel` et précise que rien ne change sur le fil : veth, mTLS épinglé,
+ALPN `helios-astra-lifecycle/1`, routes et autorisations ML-DSA-87. La
+classification de `TrustUpdateRefusal` (13.1) avait déjà tranché la même
+question au niveau du type, dans le même sens.
+
+L’extraction elle-même reste à livrer. D’ici là, la spécification indique que
+ces responsabilités vivent dans `helios_api::internal`.
 
 ## Internal Module Organization
 
