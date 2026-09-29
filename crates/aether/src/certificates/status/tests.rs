@@ -1539,3 +1539,82 @@ mod campaign_approval {
         ));
     }
 }
+
+/// Status values that cross a boundary, built from constant bytes only, and
+/// the values they must keep.
+///
+/// A campaign fingerprint is what an operator approves with a security key and
+/// what every later object of the campaign binds; a rollback authorization's
+/// fingerprint is what the gateway records; a status query's transcript is what
+/// a client signs out of tunnel. Astra, the companion, Orion and the gateway
+/// compute these independently. Refactoring this module — splitting it
+/// included — must not move a byte of any of them, and no other test would
+/// notice. A change here is a wire-format change and needs new domains.
+#[test]
+fn the_status_fingerprints_are_pinned() {
+    let domain = TrustDomainId::new([1; 16]).expect("domain");
+    let gateway = WireGuardKey::from_bytes([2; 32]);
+    let signature = |byte: u8| {
+        MlDsa87Signature::new(vec![byte; crate::key_negotiation::ML_DSA_87_SIGNATURE_LEN])
+            .expect("signature")
+    };
+
+    let campaign = AstraRotationCampaign {
+        format_version: CERTIFICATE_FORMAT_VERSION,
+        campaign_id: Id16::new([3; 16]).expect("id"),
+        trust_domain_id: domain,
+        gateway_wg_public_key: gateway,
+        server_name: "gateway.example".into(),
+        created_at: 1_000,
+        expires_at: 4_600,
+        scope: CampaignScope::FleetLeafs,
+        targets: vec![CampaignTarget {
+            certificate_kind: CertificateKind::ClientTls,
+            identity_key: WireGuardKey::from_bytes([4; 32]),
+            epoch: 1,
+            generation: 2,
+            active_tls_certificate_fingerprint: Fingerprint::of(b"active tls"),
+            active_pq_certificate_fingerprint: Fingerprint::of(b"active pq"),
+        }],
+        reason: "scheduled".into(),
+        requested_by: "operator".into(),
+        policy_fingerprint: Fingerprint::of(b"policy"),
+        required_credentials: 2,
+    };
+    let rollback = CertificateServiceRollbackAuthorization {
+        format_version: CERTIFICATE_FORMAT_VERSION,
+        trust_domain_id: domain,
+        ca_epoch: 1,
+        gateway_wg_public_key: gateway,
+        server_name: "gateway.example".into(),
+        transition_fingerprint: Fingerprint::of(b"transition"),
+        selected_certificate_fingerprint: Fingerprint::of(b"selected leaf"),
+        campaign_fingerprint: campaign.fingerprint(),
+        expires_at: 4_600,
+        ca_signature: signature(5),
+    };
+    let query = status_query_signing_bytes(
+        &domain,
+        &[6; 32],
+        &Id16::new([7; 16]).expect("id"),
+        &gateway,
+        &WireGuardKey::from_bytes([4; 32]),
+        &Fingerprint::of(b"leaf"),
+    );
+
+    assert_eq!(
+        [
+            campaign.fingerprint().to_hex(),
+            rollback
+                .fingerprint()
+                .expect("a well-formed authorization")
+                .to_hex(),
+            Fingerprint::of(query.as_bytes()).to_hex(),
+        ],
+        [
+            "fbf63ea9284b75a20f9c8bfdca7b96a8009d51372a4b25ba37dd7562fdff9d57",
+            "71828e889928ef34390e402baf58de36a3e3b0a86003e489a2e62a3545e50694",
+            "c5328672da12136ec701b86137f40468d846ac93488dca444ae91adb3e6cda40",
+        ]
+    );
+}
