@@ -20,7 +20,7 @@
 //!   delegated policy authorize only `active + 1`;
 //! - **the authorization never touches Orion**. It is handed to the gateway on
 //!   the veth and the receipt comes back on that same relationship (§8.3,
-//!   amendment of 16 August 2026). The client is a client of `helios-api`, not
+//!   amendment of 16 August 2026). The client is a client of the gateway's private API, not
 //!   a courier between two authorities;
 //! - **no grant before the receipt**. Astra cannot release the leaves it just
 //!   signed until the gateway says, under its own served leaf, that the
@@ -191,7 +191,7 @@ pub(crate) async fn transcribe_peer(
     service: &Arc<AstraService>,
     caller: &WireGuardKey,
     now_unix: u64,
-) -> Result<helios_api::internal::PeerCertificateStateView, RenewalError> {
+) -> Result<astra_channel::PeerCertificateStateView, RenewalError> {
     // Le pair est **relu à chaque fois**, et non transcrit une seule fois.
     //
     // La gateway est ce qui promeut : elle seule sait quelle génération elle
@@ -1246,9 +1246,9 @@ mod tests {
 
 /// Astra's private listener: the four routes the gateway relays into.
 ///
-/// It is the mirror of [`helios_api::internal::router`], and it carries the
+/// It is the mirror of [`astra_channel::router`], and it carries the
 /// same three properties. Everything outside
-/// [`helios_api::internal::ASTRA_INTERNAL_PREFIX`] is refused by the router
+/// [`astra_channel::ASTRA_INTERNAL_PREFIX`] is refused by the router
 /// rather than by convention; every body is bounded before it is
 /// deserialized; and every refusal collapses to the coarse class of
 /// [`RenewalError::refusal`], because the finer reason is an oracle on other
@@ -1263,18 +1263,18 @@ pub mod router {
     use std::sync::Arc;
 
     use aether::certificates::encoding::Id16;
+    use astra_channel::{
+        InternalRefusal, PreparedTrustUpdate, PreparedTrustUpdateTransaction,
+        RelayedOperationQuery, RelayedRotationRequest, RelayedTrustUpdatePreparation,
+        ASTRA_INTERNAL_PREFIX, ASTRA_TRUST_UPDATE_PREFIX, ROTATION_OPERATION_ROUTE,
+        ROTATION_REQUEST_PATH, TRUST_UPDATE_PREPARE_PATH,
+    };
     use axum::{
         extract::{DefaultBodyLimit, Path, State},
         http::{StatusCode, Uri},
         response::{IntoResponse, Response},
         routing::post,
         Json, Router,
-    };
-    use helios_api::internal::{
-        InternalRefusal, PreparedTrustUpdate, PreparedTrustUpdateTransaction,
-        RelayedOperationQuery, RelayedRotationRequest, RelayedTrustUpdatePreparation,
-        ASTRA_INTERNAL_PREFIX, ASTRA_TRUST_UPDATE_PREFIX, ROTATION_OPERATION_ROUTE,
-        ROTATION_REQUEST_PATH, TRUST_UPDATE_PREPARE_PATH,
     };
 
     use super::{now_unix, RenewalError};

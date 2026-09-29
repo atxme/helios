@@ -260,9 +260,9 @@ certificats épinglés, ALPN `helios-astra-lifecycle/1`, préfixe et routes de
 l'API privée, autorisation ML-DSA-87 propre à chaque mutation. L'ALPN est une
 valeur de protocole et garde son nom.
 
-Tant que l'extraction n'est pas livrée, ces responsabilités vivent dans le
-module `helios_api::internal`. L'avancement est tenu au §13 de
-CRATE-REORGANIZATION.md, pas dans cette spécification.
+La bibliothèque est livrée dans `crates/astra-channel` : elle reprend tel quel
+l'ancien module `helios_api::internal`, tests compris. L'état du découpage est
+tenu au §13 de CRATE-REORGANIZATION.md, pas dans cette spécification.
 
 ## 1. Périmètre
 

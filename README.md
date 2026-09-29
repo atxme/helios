@@ -43,6 +43,7 @@ heliosd : orchestrateur · API Axum/WS · IPAM ML-KEM · pare-feu nftables
 | `helios-provisioning` | IPAM CGNAT, admission, session ML-KEM |
 | `aether-key-negotiation` | Transport QUIC authentifié (ni CA, ni backend WireGuard) |
 | `astra` | Coordinateur PKI, registre de confiance et renouvellement des certificats |
+| `astra-channel` | Canal privé Astra–gateway sur le veth : mTLS, ALPN, API de cycle de vie |
 | `helios-api` | API Axum, WebSocket, IHM embarquée |
 | `helios-update` | Manifeste hybride, staging, anti-rollback |
 | `helios-escrow` | Séquestre opérateur de l'identité WireGuard |

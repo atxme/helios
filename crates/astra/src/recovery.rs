@@ -637,7 +637,7 @@ pub async fn commit(
     }
 
     gateway
-        .commit_recovery(&helios_api::internal::RelayedStageCommit {
+        .commit_recovery(&astra_channel::RelayedStageCommit {
             authorization,
             commit,
             grant,

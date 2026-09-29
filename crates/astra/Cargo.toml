@@ -15,14 +15,13 @@ aether = { workspace = true, features = ["key-negotiation-signing"] }
 # Conteneur AEAD unique du dépôt (ADR-006) : le coffre d'autorité en empile
 # trois — un par key-slot, plus le corps — au lieu d'inventer un format.
 # Les deux bouts du canal privé Astra–Helios (ROTATION-CERTIFICATS §8.3) sont
-# définis dans `helios_api::internal`, et Astra en consomme les deux : la moitié
+# définis dans `astra-channel`, et Astra en consomme les deux : la moitié
 # cliente pour appeler la gateway, et la moitié serveur pour son propre listener
-# privé (`server_config` et `serve`).
-# La dépendance se lit à l'envers — l'autorité vers l'API de la gateway — et
-# c'est délibéré : la seule alternative est une seconde copie du vérificateur
-# épinglé, de l'ALPN et du plancher de version, c'est-à-dire l'endroit exact où
-# « la reprise est refusée » devient vrai d'un côté et faux de l'autre.
-helios-api.workspace = true
+# privé (`server_config` et `serve`). Une seule définition des deux bouts : une
+# seconde copie du vérificateur épinglé, de l'ALPN et du plancher de version
+# serait l'endroit exact où « la reprise est refusée » devient vrai d'un côté et
+# faux de l'autre.
+astra-channel.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 axum.workspace = true
@@ -30,7 +29,7 @@ base64.workspace = true
 clap.workspace = true
 rcgen.workspace = true
 # La configuration TLS du listener privé. Le type traverse l'API de
-# `helios_api::internal`, qui la construit ; `astra` doit pouvoir la nommer
+# `astra-channel`, qui la construit ; `astra` doit pouvoir la nommer
 # pour la porter jusqu'au serveur.
 rustls.workspace = true
 serde.workspace = true
@@ -45,7 +44,7 @@ zeroize.workspace = true
 [dev-dependencies]
 tempfile = "3"
 # Le canal privé s'éprouve de bout en bout sur la boucle locale : listener
-# `helios-api` d'un côté, client `astra::gateway` de l'autre, un vrai
+# `astra-channel` d'un côté, client `astra::gateway` de l'autre, un vrai
 # handshake mTLS entre les deux.
 async-trait.workspace = true
 axum.workspace = true

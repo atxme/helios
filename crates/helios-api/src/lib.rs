@@ -21,7 +21,6 @@ pub mod auth;
 pub mod certificates;
 pub mod embed;
 pub mod health;
-pub mod internal;
 pub mod key_negotiation;
 pub mod provision;
 mod routes;
@@ -309,8 +308,9 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/api/certificates/operator/signer-results/:operation",
-            post(certificates::operator_signer_result)
-                .layer(DefaultBodyLimit::max(internal::MAX_OPERATOR_REQUEST_BYTES)),
+            post(certificates::operator_signer_result).layer(DefaultBodyLimit::max(
+                astra_channel::MAX_OPERATOR_REQUEST_BYTES,
+            )),
         )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -643,7 +643,7 @@ mod security_tests {
         );
 
         let (oversized_state, _cmd_rx) = state();
-        let oversized = " ".repeat(internal::MAX_OPERATOR_REQUEST_BYTES + 1);
+        let oversized = " ".repeat(astra_channel::MAX_OPERATOR_REQUEST_BYTES + 1);
         let mut request = admin_request(URI, &oversized);
         request.headers_mut().insert(
             header::AUTHORIZATION,

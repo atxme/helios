@@ -120,13 +120,9 @@ pub(crate) fn run(
             // not a dead one.
             let router = astra::renewal::router::router(service.clone());
             tokio::spawn(async move {
-                if let Err(error) = helios_api::internal::serve(
-                    bind,
-                    config,
-                    router,
-                    helios_api::internal::ASTRA_INTERNAL_PREFIX,
-                )
-                .await
+                if let Err(error) =
+                    astra_channel::serve(bind, config, router, astra_channel::ASTRA_INTERNAL_PREFIX)
+                        .await
                 {
                     tracing::error!(
                         %bind, %error,

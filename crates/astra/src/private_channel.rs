@@ -116,7 +116,7 @@ pub(crate) fn private_listener(
         .map_err(|error| anyhow::anyhow!("the pinned gateway client certificate: {error}"))?;
     let identity = astra::gateway::authority_identity(state_dir)
         .map_err(|error| anyhow::anyhow!("reading the authority transport identity: {error}"))?;
-    let config = helios_api::internal::server_config(&identity, &pinned)
+    let config = astra_channel::server_config(&identity, &pinned)
         .map_err(|error| anyhow::anyhow!("building the private renewal listener: {error}"))?;
     tracing::info!(
         %bind,
@@ -131,7 +131,7 @@ pub(crate) fn read_gateway_identity(
     state_dir: &Path,
     gateway_channel: SocketAddr,
     gateway_certificate: &str,
-) -> Result<helios_api::internal::GatewayIdentityView> {
+) -> Result<astra_channel::GatewayIdentityView> {
     let pinned = aether::certificates::encoding::DerCertificate::parse(gateway_certificate)
         .map_err(|error| anyhow::anyhow!("--gateway-certificate: {error}"))?;
     let channel = astra::gateway::GatewayChannel::open(state_dir, gateway_channel, &pinned)

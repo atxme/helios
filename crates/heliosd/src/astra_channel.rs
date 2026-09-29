@@ -1,6 +1,6 @@
 //! The gateway's end of the private Astra ↔ Helios veth channel (spec §8.3).
 //!
-//! [`helios_api::internal`] holds the protocol — the four routes, the two TLS
+//! [`astra-channel`](::astra_channel) holds the protocol — the four routes, the two TLS
 //! configurations, the pinned verifier. This module holds the deployment: where
 //! the transport identity lives on this machine, how it is created, and how the
 //! listener is started beside the administration API without ever becoming part
@@ -37,10 +37,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::{fmt, mem};
 
+use ::astra_channel::{AstraChannelHandler, ChannelIdentity};
 use aether::certificates::encoding::DerCertificate;
 use anyhow::{Context, Result};
 use base64::Engine as _;
-use helios_api::internal::{AstraChannelHandler, ChannelIdentity};
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -233,14 +233,13 @@ impl AstraChannel {
     /// Built here rather than by the caller so the pin is checked at start-up:
     /// an unusable pairing found at deployment costs a command, and the same
     /// pairing found at 80 % of a leaf's life costs a night.
-    pub fn authority_client(&self) -> Result<Option<helios_api::internal::AstraLifecycleClient>> {
+    pub fn authority_client(&self) -> Result<Option<::astra_channel::AstraLifecycleClient>> {
         let Some(authority) = &self.authority else {
             return Ok(None);
         };
-        let tls =
-            helios_api::internal::client_config(&authority.identity, &authority.astra_certificate)
-                .map_err(|error| anyhow::anyhow!("{error}"))?;
-        Ok(Some(helios_api::internal::AstraLifecycleClient::new(
+        let tls = ::astra_channel::client_config(&authority.identity, &authority.astra_certificate)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        Ok(Some(::astra_channel::AstraLifecycleClient::new(
             authority.address,
             tls,
         )))
@@ -248,7 +247,7 @@ impl AstraChannel {
 
     /// Builds the TLS configuration, refusing a pin that cannot serve.
     fn server_config(&self) -> Result<rustls::ServerConfig> {
-        helios_api::internal::server_config(&self.identity, &self.astra_certificate)
+        ::astra_channel::server_config(&self.identity, &self.astra_certificate)
             .map_err(|error| anyhow::anyhow!("{error}"))
     }
 }
@@ -288,7 +287,7 @@ pub fn spawn(handler: Arc<dyn AstraChannelHandler>) {
         }
     };
     let bind = channel.bind;
-    let router = helios_api::internal::router(handler);
+    let router = ::astra_channel::router(handler);
     tokio::spawn(async move {
         // The address belongs to the veth, whose host end is created by the
         // container engine — which may well start after `heliosd`. The first
@@ -298,11 +297,11 @@ pub fn spawn(handler: Arc<dyn AstraChannelHandler>) {
         // keeps a genuine misconfiguration visible instead of retrying for
         // ever.
         for attempt in 1..=BIND_ATTEMPTS {
-            match helios_api::internal::serve(
+            match ::astra_channel::serve(
                 bind,
                 config.clone(),
                 router.clone(),
-                helios_api::internal::INTERNAL_PREFIX,
+                ::astra_channel::INTERNAL_PREFIX,
             )
             .await
             {
@@ -414,7 +413,7 @@ pub fn initialize(
         .map_err(|error| anyhow::anyhow!("Astra's transport certificate: {error}"))?;
 
     let mut params =
-        CertificateParams::new(vec![helios_api::internal::INTERNAL_SERVER_NAME.to_string()])
+        CertificateParams::new(vec![::astra_channel::INTERNAL_SERVER_NAME.to_string()])
             .context("building the channel certificate parameters")?;
     params.is_ca = IsCa::NoCa;
     params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
@@ -507,7 +506,7 @@ pub fn initialize(
 
 /// The name the gateway's client certificate carries.
 ///
-/// Distinct from [`helios_api::internal::INTERNAL_SERVER_NAME`], which the
+/// Distinct from [`::astra_channel::INTERNAL_SERVER_NAME`], which the
 /// served certificate carries: two identities, two names, so a mis-pinned pair
 /// cannot look like a working one right up to the pin comparison.
 const CLIENT_IDENTITY_NAME: &str = "helios-gateway-client.internal";
@@ -542,11 +541,11 @@ pub struct TransportIdentities {
 /// class, because a finer one on the in-tunnel route would be an oracle about
 /// other peers.
 pub struct AstraRenewalRelay {
-    client: helios_api::internal::AstraLifecycleClient,
+    client: ::astra_channel::AstraLifecycleClient,
 }
 
 impl AstraRenewalRelay {
-    pub fn new(client: helios_api::internal::AstraLifecycleClient) -> Self {
+    pub fn new(client: ::astra_channel::AstraLifecycleClient) -> Self {
         Self { client }
     }
 
@@ -566,10 +565,10 @@ impl AstraRenewalRelay {
     /// One channel failure, logged with its reason and answered with a class.
     fn refuse(
         route: &str,
-        error: helios_api::internal::ChannelError,
+        error: ::astra_channel::ChannelError,
     ) -> helios_api::certificates::TrustUpdateRefusal {
+        use ::astra_channel::ChannelError;
         use helios_api::certificates::TrustUpdateRefusal;
-        use helios_api::internal::ChannelError;
         match error {
             // A status the authority chose is relayed as what it means, not as
             // a gateway failure: `403` is a refusal the peer earned, and
@@ -596,7 +595,7 @@ impl AstraRenewalRelay {
 }
 
 #[async_trait::async_trait]
-impl helios_api::internal::TrustUpdatePreparer for AstraRenewalRelay {
+impl ::astra_channel::TrustUpdatePreparer for AstraRenewalRelay {
     /// Relays one preparation and hands back whatever the authority built.
     ///
     /// The same coarse-class mapping as every other relayed call: this end
@@ -604,15 +603,13 @@ impl helios_api::internal::TrustUpdatePreparer for AstraRenewalRelay {
     /// be an oracle about the domain's state.
     async fn prepare(
         &self,
-        relayed: &helios_api::internal::RelayedTrustUpdatePreparation,
-    ) -> Result<
-        helios_api::internal::PreparedTrustUpdate,
-        helios_api::certificates::TrustUpdateRefusal,
-    > {
+        relayed: &::astra_channel::RelayedTrustUpdatePreparation,
+    ) -> Result<::astra_channel::PreparedTrustUpdate, helios_api::certificates::TrustUpdateRefusal>
+    {
         self.client
             .prepare_trust_update(relayed)
             .await
-            .map_err(|error| Self::refuse(helios_api::internal::TRUST_UPDATE_PREPARE_PATH, error))
+            .map_err(|error| Self::refuse(::astra_channel::TRUST_UPDATE_PREPARE_PATH, error))
     }
 }
 
@@ -628,13 +625,11 @@ impl helios_api::certificates::OperatorCampaignRelay for AstraRenewalRelay {
     /// structured service log only.
     async fn pending(
         &self,
-        operator: &helios_api::internal::OperatorIdentity,
-    ) -> Result<
-        helios_api::internal::OperatorPendingList,
-        helios_api::certificates::TrustUpdateRefusal,
-    > {
+        operator: &::astra_channel::OperatorIdentity,
+    ) -> Result<::astra_channel::OperatorPendingList, helios_api::certificates::TrustUpdateRefusal>
+    {
         self.client
-            .operator_pending(&helios_api::internal::RelayedOperatorCampaign {
+            .operator_pending(&::astra_channel::RelayedOperatorCampaign {
                 operator: operator.clone(),
             })
             .await
@@ -643,16 +638,14 @@ impl helios_api::certificates::OperatorCampaignRelay for AstraRenewalRelay {
 
     async fn operation(
         &self,
-        operator: &helios_api::internal::OperatorIdentity,
+        operator: &::astra_channel::OperatorIdentity,
         operation: &aether::certificates::encoding::Id16,
-    ) -> Result<
-        helios_api::internal::SigningOperationView,
-        helios_api::certificates::TrustUpdateRefusal,
-    > {
+    ) -> Result<::astra_channel::SigningOperationView, helios_api::certificates::TrustUpdateRefusal>
+    {
         self.client
             .operator_operation(
                 operation,
-                &helios_api::internal::RelayedOperatorCampaign {
+                &::astra_channel::RelayedOperatorCampaign {
                     operator: operator.clone(),
                 },
             )
@@ -662,18 +655,18 @@ impl helios_api::certificates::OperatorCampaignRelay for AstraRenewalRelay {
 
     async fn signer_request(
         &self,
-        operator: &helios_api::internal::OperatorIdentity,
+        operator: &::astra_channel::OperatorIdentity,
         operation: &aether::certificates::encoding::Id16,
         capability_token: &str,
     ) -> Result<
-        helios_api::internal::OperatorSignerRequestResponse,
+        ::astra_channel::OperatorSignerRequestResponse,
         helios_api::certificates::TrustUpdateRefusal,
     > {
         self.client
             .operator_signer_request(
                 operation,
                 capability_token,
-                &helios_api::internal::RelayedOperatorCampaign {
+                &::astra_channel::RelayedOperatorCampaign {
                     operator: operator.clone(),
                 },
             )
@@ -683,7 +676,7 @@ impl helios_api::certificates::OperatorCampaignRelay for AstraRenewalRelay {
 
     async fn encrypted_vault(
         &self,
-        operator: &helios_api::internal::OperatorIdentity,
+        operator: &::astra_channel::OperatorIdentity,
         fingerprint: &aether::certificates::encoding::Fingerprint,
         capability_token: &str,
     ) -> Result<Vec<u8>, helios_api::certificates::TrustUpdateRefusal> {
@@ -691,7 +684,7 @@ impl helios_api::certificates::OperatorCampaignRelay for AstraRenewalRelay {
             .operator_encrypted_vault(
                 fingerprint,
                 capability_token,
-                &helios_api::internal::RelayedOperatorCampaign {
+                &::astra_channel::RelayedOperatorCampaign {
                     operator: operator.clone(),
                 },
             )
@@ -701,19 +694,17 @@ impl helios_api::certificates::OperatorCampaignRelay for AstraRenewalRelay {
 
     async fn signer_result(
         &self,
-        operator: &helios_api::internal::OperatorIdentity,
+        operator: &::astra_channel::OperatorIdentity,
         operation: &aether::certificates::encoding::Id16,
         capability_token: &str,
         result: Box<aether::certificates::status::AstraSignerResult>,
-    ) -> Result<
-        helios_api::internal::SigningOperationView,
-        helios_api::certificates::TrustUpdateRefusal,
-    > {
+    ) -> Result<::astra_channel::SigningOperationView, helios_api::certificates::TrustUpdateRefusal>
+    {
         self.client
             .operator_signer_result(
                 operation,
                 capability_token,
-                &helios_api::internal::RelayedOperatorSignerResult {
+                &::astra_channel::RelayedOperatorSignerResult {
                     operator: operator.clone(),
                     result,
                 },
@@ -730,12 +721,12 @@ impl helios_api::certificates::ClientRenewalRelay for AstraRenewalRelay {
         caller_wg_public_key: &str,
         request: Box<aether::certificates::client::ClientCertificateRotationRequest>,
     ) -> Result<
-        helios_api::internal::ClientRenewalOperationView,
+        ::astra_channel::ClientRenewalOperationView,
         helios_api::certificates::TrustUpdateRefusal,
     > {
         let caller = Self::caller(caller_wg_public_key)?;
         self.client
-            .request_rotation(&helios_api::internal::RelayedRotationRequest {
+            .request_rotation(&::astra_channel::RelayedRotationRequest {
                 caller_wg_public_key: caller,
                 request,
             })
@@ -748,14 +739,14 @@ impl helios_api::certificates::ClientRenewalRelay for AstraRenewalRelay {
         caller_wg_public_key: &str,
         operation: &aether::certificates::encoding::Id16,
     ) -> Result<
-        helios_api::internal::ClientRenewalOperationView,
+        ::astra_channel::ClientRenewalOperationView,
         helios_api::certificates::TrustUpdateRefusal,
     > {
         let caller = Self::caller(caller_wg_public_key)?;
         self.client
             .operation(
                 operation,
-                &helios_api::internal::RelayedOperationQuery {
+                &::astra_channel::RelayedOperationQuery {
                     caller_wg_public_key: caller,
                 },
             )
@@ -769,7 +760,7 @@ impl helios_api::certificates::ClientRenewalRelay for AstraRenewalRelay {
         operation: &aether::certificates::encoding::Id16,
         capability_token: &str,
     ) -> Result<
-        helios_api::internal::ClientRenewalSignerRequest,
+        ::astra_channel::ClientRenewalSignerRequest,
         helios_api::certificates::TrustUpdateRefusal,
     > {
         let caller = Self::caller(caller_wg_public_key)?;
@@ -777,7 +768,7 @@ impl helios_api::certificates::ClientRenewalRelay for AstraRenewalRelay {
             .signer_request(
                 operation,
                 capability_token,
-                &helios_api::internal::RelayedOperationQuery {
+                &::astra_channel::RelayedOperationQuery {
                     caller_wg_public_key: caller,
                 },
             )
@@ -792,7 +783,7 @@ impl helios_api::certificates::ClientRenewalRelay for AstraRenewalRelay {
         capability_token: &str,
         approval: Box<aether::certificates::approval::AstraRenewalApproval>,
     ) -> Result<
-        helios_api::internal::ClientRenewalOperationView,
+        ::astra_channel::ClientRenewalOperationView,
         helios_api::certificates::TrustUpdateRefusal,
     > {
         let caller = Self::caller(caller_wg_public_key)?;
@@ -800,7 +791,7 @@ impl helios_api::certificates::ClientRenewalRelay for AstraRenewalRelay {
             .signer_result(
                 operation,
                 capability_token,
-                &helios_api::internal::ClientRenewalSignerResult {
+                &::astra_channel::ClientRenewalSignerResult {
                     caller_wg_public_key: caller,
                     approval,
                 },

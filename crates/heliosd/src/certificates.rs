@@ -43,14 +43,14 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use ::astra_channel::AstraStageHandler;
 use aether::certificates::client::GatewayCertificateStageReceipt;
 use aether::certificates::{encoding::WireGuardKey, CertificateError};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use helios_api::certificates::GatewayActionRefusal;
 use helios_api::certificates::{
-    AstraStageHandler, StageCommitRequest, TrustUpdateHandler, TrustUpdateRefusal,
-    TrustUpdateResponse,
+    StageCommitRequest, TrustUpdateHandler, TrustUpdateRefusal, TrustUpdateResponse,
 };
 use helios_provisioning::certificates::{CertificateRegistry, RegistryError};
 use tokio::sync::Mutex;
@@ -120,7 +120,7 @@ pub struct CertificateService {
     /// shape, not a degraded one: such a domain distributes nothing, so a
     /// lagging client is told the authority has queued nothing — the same
     /// answer, reached without a call that could not succeed.
-    authority: Option<Arc<dyn helios_api::internal::TrustUpdatePreparer>>,
+    authority: Option<Arc<dyn ::astra_channel::TrustUpdatePreparer>>,
 }
 
 impl CertificateService {
@@ -141,7 +141,7 @@ impl CertificateService {
     /// The same service, able to ask the authority to build a transaction.
     pub fn with_authority(
         mut self,
-        authority: Arc<dyn helios_api::internal::TrustUpdatePreparer>,
+        authority: Arc<dyn ::astra_channel::TrustUpdatePreparer>,
     ) -> Self {
         self.authority = Some(authority);
         self
@@ -172,14 +172,14 @@ impl CertificateService {
         let peer = {
             let registry = self.registry.lock().await;
             let peer = registry.peer(caller).ok_or(TrustUpdateRefusal::Rejected)?;
-            helios_api::internal::PeerCertificateStateView {
+            ::astra_channel::PeerCertificateStateView {
                 name: peer.name.clone(),
                 state: peer.state.clone(),
                 active_pq_certificate: peer.active_pq_certificate.clone(),
                 admission_pq_ca: admission_pq_ca(),
             }
         };
-        let relayed = helios_api::internal::RelayedTrustUpdatePreparation {
+        let relayed = ::astra_channel::RelayedTrustUpdatePreparation {
             caller_wg_public_key: *caller,
             request: Box::new(request.clone()),
             peer: Box::new(peer),
@@ -662,7 +662,7 @@ fn admission_pq_ca() -> Option<aether::certificates::encoding::MlDsa87PublicKey>
 }
 
 #[async_trait]
-impl helios_api::internal::AstraChannelHandler for CertificateService {
+impl ::astra_channel::AstraChannelHandler for CertificateService {
     async fn revoke(
         &self,
         revocation: Box<aether::certificates::revocation::EmergencyCertificateRevocation>,
@@ -726,12 +726,12 @@ impl helios_api::internal::AstraChannelHandler for CertificateService {
     async fn peer_state(
         &self,
         identity: &WireGuardKey,
-    ) -> Result<helios_api::internal::PeerCertificateStateView, TrustUpdateRefusal> {
+    ) -> Result<::astra_channel::PeerCertificateStateView, TrustUpdateRefusal> {
         let registry = self.registry.lock().await;
         let peer = registry
             .peer(identity)
             .ok_or(TrustUpdateRefusal::Rejected)?;
-        Ok(helios_api::internal::PeerCertificateStateView {
+        Ok(::astra_channel::PeerCertificateStateView {
             name: peer.name.clone(),
             state: peer.state.clone(),
             active_pq_certificate: peer.active_pq_certificate.clone(),
@@ -752,7 +752,7 @@ impl helios_api::internal::AstraChannelHandler for CertificateService {
     /// from one moment and a counter from another.
     async fn gateway_identity(
         &self,
-    ) -> Result<helios_api::internal::GatewayIdentityView, TrustUpdateRefusal> {
+    ) -> Result<::astra_channel::GatewayIdentityView, TrustUpdateRefusal> {
         let registry = self.registry.lock().await;
         let state = registry.state();
         let pq_certificate = self.signer.served_pq_certificate();
@@ -763,7 +763,7 @@ impl helios_api::internal::AstraChannelHandler for CertificateService {
             tracing::error!(%error, "the served gateway leaf has no fingerprint");
             TrustUpdateRefusal::Internal
         })?;
-        Ok(helios_api::internal::GatewayIdentityView {
+        Ok(::astra_channel::GatewayIdentityView {
             pq_certificate_fingerprint,
             pq_certificate,
             tls_certificate_fingerprint: state.gateway.active_tls_fingerprint(),
@@ -782,7 +782,7 @@ impl helios_api::internal::AstraChannelHandler for CertificateService {
 
     async fn gateway_transition_published(
         &self,
-        published: helios_api::internal::GatewayTransitionPublished,
+        published: ::astra_channel::GatewayTransitionPublished,
     ) -> Result<(), TrustUpdateRefusal> {
         let mut registry = self.registry.lock().await;
         registry
@@ -816,7 +816,7 @@ impl helios_api::internal::AstraChannelHandler for CertificateService {
     /// deadline; Orion checks the signatures, under anchors it already trusts.
     async fn distribute(
         &self,
-        distribution: Box<helios_api::internal::TrustDistribution>,
+        distribution: Box<::astra_channel::TrustDistribution>,
     ) -> Result<(), TrustUpdateRefusal> {
         let peer = distribution.manifest.client_wg_public_key;
         let mut registry = self.registry.lock().await;
@@ -851,12 +851,12 @@ impl helios_api::internal::AstraChannelHandler for CertificateService {
     /// tunnel exists to keep the client's own.
     async fn commit_recovery(
         &self,
-        relayed: Box<helios_api::internal::RelayedStageCommit>,
+        relayed: Box<::astra_channel::RelayedStageCommit>,
     ) -> Result<(), TrustUpdateRefusal> {
         use aether::certificates::authority::RotationReason;
         use aether::certificates::client::IssuerKind;
 
-        let helios_api::internal::RelayedStageCommit {
+        let ::astra_channel::RelayedStageCommit {
             authorization,
             commit,
             grant,
@@ -1739,7 +1739,7 @@ mod tests {
     /// The signatures are placeholders on purpose: every assertion that uses
     /// this refuses **before** any signature is read, and building real ones
     /// would hide which check actually fired.
-    fn relayed_commit() -> helios_api::internal::RelayedStageCommit {
+    fn relayed_commit() -> ::astra_channel::RelayedStageCommit {
         use aether::certificates::authority::RotationReason;
         use aether::certificates::client::{
             ClientCertificateStageAuthorization, ClientCertificateStageCommit,
@@ -1848,7 +1848,7 @@ mod tests {
             reason: authorization.reason,
             signature: MlDsa87Signature::placeholder(),
         };
-        helios_api::internal::RelayedStageCommit {
+        ::astra_channel::RelayedStageCommit {
             authorization: Box::new(authorization),
             commit: Box::new(commit),
             grant: Box::new(grant),
@@ -1915,15 +1915,15 @@ mod tests {
     /// registry's own `stage_distribution` is the check — so the stub answers
     /// unconditionally and the test asserts on what the queue then holds.
     struct StubAuthority {
-        prepared: helios_api::internal::PreparedTrustUpdate,
+        prepared: ::astra_channel::PreparedTrustUpdate,
     }
 
     #[async_trait::async_trait]
-    impl helios_api::internal::TrustUpdatePreparer for StubAuthority {
+    impl ::astra_channel::TrustUpdatePreparer for StubAuthority {
         async fn prepare(
             &self,
-            _relayed: &helios_api::internal::RelayedTrustUpdatePreparation,
-        ) -> Result<helios_api::internal::PreparedTrustUpdate, TrustUpdateRefusal> {
+            _relayed: &::astra_channel::RelayedTrustUpdatePreparation,
+        ) -> Result<::astra_channel::PreparedTrustUpdate, TrustUpdateRefusal> {
             Ok(self.prepared.clone())
         }
     }
@@ -2340,9 +2340,9 @@ mod tests {
     /// party that is not the client.
     #[tokio::test]
     async fn an_ordinary_renewal_is_never_committed_on_the_private_link() {
+        use ::astra_channel::AstraChannelHandler;
         use aether::certificates::authority::RotationReason;
         use aether::certificates::client::IssuerKind;
-        use helios_api::internal::AstraChannelHandler;
 
         let mut state = state();
         state.peers.insert(key(2).to_base64(), peer());
@@ -2367,7 +2367,7 @@ mod tests {
     /// stage is refused: the relay may carry a decision, never describe one.
     #[tokio::test]
     async fn a_recovery_commit_must_name_the_staging_the_registry_recorded() {
-        use helios_api::internal::AstraChannelHandler;
+        use ::astra_channel::AstraChannelHandler;
 
         let mut state = state();
         state.peers.insert(key(2).to_base64(), peer());
@@ -2387,8 +2387,8 @@ mod tests {
         let (service, _directory) = service(state);
         let prepared = distribution(0, 1);
         let service = service.with_authority(Arc::new(StubAuthority {
-            prepared: helios_api::internal::PreparedTrustUpdate {
-                transaction: Some(helios_api::internal::PreparedTrustUpdateTransaction {
+            prepared: ::astra_channel::PreparedTrustUpdate {
+                transaction: Some(::astra_channel::PreparedTrustUpdateTransaction {
                     manifest: prepared.manifest.clone(),
                     chunks: prepared.chunks.clone(),
                 }),

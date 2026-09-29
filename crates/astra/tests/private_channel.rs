@@ -1,6 +1,6 @@
 //! End-to-end proof of the private Astra ↔ Helios channel (spec §8.3).
 //!
-//! Both configurations are built from `helios_api::internal`, and both are
+//! Both configurations are built from `astra_channel`, and both are
 //! exercised against each other over a real loopback socket: a real TLS
 //! handshake, a real HTTP request, real refusals. This is the strongest thing
 //! that can be shown without a gateway — what it does **not** show is the veth
@@ -18,17 +18,18 @@ use aether::certificates::encoding::{DerCertificate, Fingerprint, WireGuardKey};
 use aether::certificates::gateway::pq_certificate_fingerprint;
 use aether::certificates::revocation::EmergencyCertificateRevocation;
 use aether::certificates::state::ClientCertificateState;
+use aether::certificates::transport::TrustUpdateRefusal;
 use aether::key_negotiation::{
     generate_ml_dsa_87_keypair, issue_pq_certificate, PqCertificate, PqCertificateRole,
     PQ_CERTIFICATE_VERSION,
 };
 use astra::gateway::GatewayChannel;
-use async_trait::async_trait;
-use base64::Engine as _;
-use helios_api::certificates::{AstraStageHandler, TrustUpdateRefusal};
-use helios_api::internal::{
+use astra_channel::AstraStageHandler;
+use astra_channel::{
     AstraChannelHandler, ChannelIdentity, GatewayIdentityView, PeerCertificateStateView,
 };
+use async_trait::async_trait;
+use base64::Engine as _;
 
 /// The leaf this fake gateway serves.
 ///
@@ -95,7 +96,7 @@ impl AstraChannelHandler for Recorder {
 
     async fn distribute(
         &self,
-        distribution: Box<helios_api::internal::TrustDistribution>,
+        distribution: Box<astra_channel::TrustDistribution>,
     ) -> Result<(), TrustUpdateRefusal> {
         self.seen.lock().unwrap().push(format!(
             "distribute {}",
@@ -106,7 +107,7 @@ impl AstraChannelHandler for Recorder {
 
     async fn commit_recovery(
         &self,
-        relayed: Box<helios_api::internal::RelayedStageCommit>,
+        relayed: Box<astra_channel::RelayedStageCommit>,
     ) -> Result<(), TrustUpdateRefusal> {
         self.seen.lock().unwrap().push(format!(
             "commit_recovery {}",
@@ -117,7 +118,7 @@ impl AstraChannelHandler for Recorder {
 
     async fn gateway_transition_published(
         &self,
-        published: helios_api::internal::GatewayTransitionPublished,
+        published: astra_channel::GatewayTransitionPublished,
     ) -> Result<(), TrustUpdateRefusal> {
         self.seen
             .lock()
@@ -172,9 +173,8 @@ fn astra_identity(state_dir: &std::path::Path) -> DerCertificate {
 /// The gateway's, built exactly as `heliosd init-astra-channel` builds it.
 fn gateway_identity() -> (ChannelIdentity, DerCertificate) {
     use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose};
-    let mut params =
-        CertificateParams::new(vec![helios_api::internal::INTERNAL_SERVER_NAME.to_string()])
-            .expect("params");
+    let mut params = CertificateParams::new(vec![astra_channel::INTERNAL_SERVER_NAME.to_string()])
+        .expect("params");
     params.is_ca = IsCa::NoCa;
     params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
@@ -198,21 +198,15 @@ async fn listen(
     pinned_astra: &DerCertificate,
     handler: Arc<Recorder>,
 ) -> SocketAddr {
-    let config = helios_api::internal::server_config(identity, pinned_astra).expect("server");
+    let config = astra_channel::server_config(identity, pinned_astra).expect("server");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
     let address = listener.local_addr().expect("address");
     drop(listener);
-    let router = helios_api::internal::router(handler);
+    let router = astra_channel::router(handler);
     tokio::spawn(async move {
-        let _ = helios_api::internal::serve(
-            address,
-            config,
-            router,
-            helios_api::internal::INTERNAL_PREFIX,
-        )
-        .await;
+        let _ = astra_channel::serve(address, config, router, astra_channel::INTERNAL_PREFIX).await;
     });
     // The listener is spawned; give it the moment it needs to bind before the
     // first dial, rather than racing it and reporting a connection refusal as
@@ -336,11 +330,11 @@ async fn a_tls12_client_is_refused() {
                 .expect("key"),
         )
         .expect("client");
-    tls.alpn_protocols = vec![helios_api::internal::INTERNAL_ALPN.to_vec()];
+    tls.alpn_protocols = vec![astra_channel::INTERNAL_ALPN.to_vec()];
 
     let stream = tokio::net::TcpStream::connect(address).await.expect("tcp");
-    let name = rustls::pki_types::ServerName::try_from(helios_api::internal::INTERNAL_SERVER_NAME)
-        .expect("name");
+    let name =
+        rustls::pki_types::ServerName::try_from(astra_channel::INTERNAL_SERVER_NAME).expect("name");
     let refusal = tokio_rustls::TlsConnector::from(Arc::new(tls))
         .connect(name, stream)
         .await;
@@ -375,8 +369,7 @@ async fn no_connection_ever_resumes() {
         private_key_der: std::fs::read(state_dir.path().join(astra::gateway::CHANNEL_KEY_FILE))
             .expect("key"),
     };
-    let mut tls =
-        helios_api::internal::client_config(&identity, &gateway_certificate).expect("client");
+    let mut tls = astra_channel::client_config(&identity, &gateway_certificate).expect("client");
     // Deliberately the opposite of what the shipped client does: this one
     // remembers sessions, so a ticket would be offered if one were granted.
     tls.resumption = rustls::client::Resumption::in_memory_sessions(8);
@@ -384,9 +377,8 @@ async fn no_connection_ever_resumes() {
 
     for attempt in 1..=2 {
         let stream = tokio::net::TcpStream::connect(address).await.expect("tcp");
-        let name =
-            rustls::pki_types::ServerName::try_from(helios_api::internal::INTERNAL_SERVER_NAME)
-                .expect("name");
+        let name = rustls::pki_types::ServerName::try_from(astra_channel::INTERNAL_SERVER_NAME)
+            .expect("name");
         let stream = tokio_rustls::TlsConnector::from(Arc::clone(&tls))
             .connect(name, stream)
             .await

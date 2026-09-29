@@ -243,7 +243,7 @@ pub(crate) async fn run(
             .with_gateway_identity_secret(gateway_identity_secret);
             Arc::new(match &authority {
                 Some(relay) => service.with_authority(
-                    Arc::clone(relay) as Arc<dyn helios_api::internal::TrustUpdatePreparer>
+                    Arc::clone(relay) as Arc<dyn ::astra_channel::TrustUpdatePreparer>
                 ),
                 None => service,
             })
@@ -265,7 +265,7 @@ pub(crate) async fn run(
                 // not admit a peer" a fact about which socket the packet
                 // arrived on, rather than about middleware ordering.
                 astra_channel::spawn(
-                    Arc::clone(&service) as Arc<dyn helios_api::internal::AstraChannelHandler>
+                    Arc::clone(&service) as Arc<dyn ::astra_channel::AstraChannelHandler>
                 );
                 // And the other direction: the four in-tunnel renewal routes
                 // relay into Astra's own listener. Separate from the trust

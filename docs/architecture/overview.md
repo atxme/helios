@@ -13,6 +13,7 @@ Orion (React/Tauri, orion-core)
 heliosd ── aether-key-negotiation ── helios-provisioning
    │
    ├── helios-api ── web (React/MUI)
+   ├── astra-channel ── astra (veth privé)
    ├── helios-wireguard ── WireGuard du noyau ou backend configuré
    ├── helios-firewall ── nftables
    ├── astra / aether
@@ -31,6 +32,8 @@ heliosd ── aether-key-negotiation ── helios-provisioning
 - `helios-api` expose l'API Axum/WebSocket et l'interface web embarquée ; `web`
   est la console React/MUI.
 - `astra` coordonne le cycle de vie des certificats et la confiance ;
+  `astra-channel` porte le canal privé Astra–gateway sur le veth (mTLS, ALPN,
+  API de cycle de vie), partagé par `heliosd`, `astra` et `helios-api` ;
   `helios-tpm`, `aether-vault` et `helios-escrow` gèrent respectivement le
   matériel TPM, les secrets chiffrés et le séquestre opérateur WireGuard.
 - `helios-update` traite les mises à jour signées et le rollback.

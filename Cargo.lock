@@ -280,11 +280,11 @@ version = "0.2.0"
 dependencies = [
  "aether",
  "anyhow",
+ "astra-channel",
  "async-trait",
  "axum",
  "base64 0.22.1",
  "clap",
- "helios-api",
  "rcgen",
  "rustls",
  "serde",
@@ -297,6 +297,27 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "zeroize",
+]
+
+[[package]]
+name = "astra-channel"
+version = "0.1.0"
+dependencies = [
+ "aether",
+ "async-trait",
+ "axum",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "rcgen",
+ "rustls",
+ "serde",
+ "serde_json",
+ "time",
+ "tokio",
+ "tokio-rustls",
+ "tower",
+ "tracing",
 ]
 
 [[package]]
@@ -2309,27 +2330,20 @@ version = "0.5.0"
 dependencies = [
  "aether",
  "anyhow",
+ "astra-channel",
  "async-trait",
  "axum",
  "base64 0.22.1",
- "bytes",
  "futures-util",
  "helios-firewall",
  "helios-provisioning",
  "helios-update",
  "helios-wireguard",
- "http-body-util",
- "hyper",
- "hyper-util",
  "mime_guess",
- "rcgen",
  "rust-embed",
- "rustls",
  "serde",
  "serde_json",
- "time",
  "tokio",
- "tokio-rustls",
  "tokio-tungstenite",
  "tower",
  "tracing",
@@ -2495,6 +2509,7 @@ dependencies = [
  "aether-key-negotiation",
  "aether-vault",
  "anyhow",
+ "astra-channel",
  "async-trait",
  "aws-lc-rs",
  "base64 0.22.1",

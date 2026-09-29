@@ -30,6 +30,7 @@ helios-firewall.workspace = true
 helios-wireguard.workspace = true
 helios-update.workspace = true
 helios-api.workspace = true
+astra-channel.workspace = true
 helios-tpm.workspace = true
 helios-escrow.workspace = true
 helios-provisioning.workspace = true

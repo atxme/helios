@@ -641,14 +641,14 @@ pub trait ClientRenewalRelay: Send + Sync {
         &self,
         caller_wg_public_key: &str,
         request: Box<aether::certificates::client::ClientCertificateRotationRequest>,
-    ) -> Result<crate::internal::ClientRenewalOperationView, TrustUpdateRefusal>;
+    ) -> Result<astra_channel::ClientRenewalOperationView, TrustUpdateRefusal>;
 
     /// Reads one operation the caller owns.
     async fn operation(
         &self,
         caller_wg_public_key: &str,
         operation: &aether::certificates::encoding::Id16,
-    ) -> Result<crate::internal::ClientRenewalOperationView, TrustUpdateRefusal>;
+    ) -> Result<astra_channel::ClientRenewalOperationView, TrustUpdateRefusal>;
 
     /// Fetches what the signing companion has to display and answer.
     async fn signer_request(
@@ -656,7 +656,7 @@ pub trait ClientRenewalRelay: Send + Sync {
         caller_wg_public_key: &str,
         operation: &aether::certificates::encoding::Id16,
         capability_token: &str,
-    ) -> Result<crate::internal::ClientRenewalSignerRequest, TrustUpdateRefusal>;
+    ) -> Result<astra_channel::ClientRenewalSignerRequest, TrustUpdateRefusal>;
 
     /// Delivers the operator's assertion and returns what it produced.
     async fn signer_result(
@@ -665,7 +665,7 @@ pub trait ClientRenewalRelay: Send + Sync {
         operation: &aether::certificates::encoding::Id16,
         capability_token: &str,
         approval: Box<aether::certificates::approval::AstraRenewalApproval>,
-    ) -> Result<crate::internal::ClientRenewalOperationView, TrustUpdateRefusal>;
+    ) -> Result<astra_channel::ClientRenewalOperationView, TrustUpdateRefusal>;
 }
 
 /// The gateway's half of the in-tunnel operator campaign (spec §8.5).
@@ -693,28 +693,28 @@ pub trait OperatorCampaignRelay: Send + Sync {
     /// would hand every reader a credential for every operation on it.
     async fn pending(
         &self,
-        operator: &crate::internal::OperatorIdentity,
-    ) -> Result<crate::internal::OperatorPendingList, TrustUpdateRefusal>;
+        operator: &astra_channel::OperatorIdentity,
+    ) -> Result<astra_channel::OperatorPendingList, TrustUpdateRefusal>;
 
     /// Reads one campaign operation.
     async fn operation(
         &self,
-        operator: &crate::internal::OperatorIdentity,
+        operator: &astra_channel::OperatorIdentity,
         operation: &aether::certificates::encoding::Id16,
-    ) -> Result<crate::internal::SigningOperationView, TrustUpdateRefusal>;
+    ) -> Result<astra_channel::SigningOperationView, TrustUpdateRefusal>;
 
     /// Fetches what the companion has to display before it asks for a touch.
     async fn signer_request(
         &self,
-        operator: &crate::internal::OperatorIdentity,
+        operator: &astra_channel::OperatorIdentity,
         operation: &aether::certificates::encoding::Id16,
         capability_token: &str,
-    ) -> Result<crate::internal::OperatorSignerRequestResponse, TrustUpdateRefusal>;
+    ) -> Result<astra_channel::OperatorSignerRequestResponse, TrustUpdateRefusal>;
 
     /// Downloads the encrypted vault this campaign names, still encrypted.
     async fn encrypted_vault(
         &self,
-        operator: &crate::internal::OperatorIdentity,
+        operator: &astra_channel::OperatorIdentity,
         fingerprint: &aether::certificates::encoding::Fingerprint,
         capability_token: &str,
     ) -> Result<Vec<u8>, TrustUpdateRefusal>;
@@ -722,24 +722,11 @@ pub trait OperatorCampaignRelay: Send + Sync {
     /// Delivers the operator's assertion and returns what it produced.
     async fn signer_result(
         &self,
-        operator: &crate::internal::OperatorIdentity,
+        operator: &astra_channel::OperatorIdentity,
         operation: &aether::certificates::encoding::Id16,
         capability_token: &str,
         result: Box<aether::certificates::status::AstraSignerResult>,
-    ) -> Result<crate::internal::SigningOperationView, TrustUpdateRefusal>;
-}
-
-/// Private Astra-to-Helios staging contract.
-///
-/// This trait deliberately has no route in the in-tunnel router. The future
-/// veth listener owns its mTLS authentication and calls it only for an Astra
-/// peer pinned by the local trust domain.
-#[async_trait]
-pub trait AstraStageHandler: Send + Sync {
-    async fn stage_from_astra(
-        &self,
-        authorization: Box<aether::certificates::client::ClientCertificateStageAuthorization>,
-    ) -> Result<Box<aether::certificates::client::GatewayCertificateStageReceipt>, TrustUpdateRefusal>;
+    ) -> Result<astra_channel::SigningOperationView, TrustUpdateRefusal>;
 }
 
 /// Tombstone for the pre-amendment Orion-to-Helios staging route.
@@ -983,7 +970,7 @@ pub async fn renewal_operation(
 fn operator_caller(
     caller: &crate::auth::Caller,
     route: &str,
-) -> Result<crate::internal::OperatorIdentity, StatusCode> {
+) -> Result<astra_channel::OperatorIdentity, StatusCode> {
     if !caller.admin {
         tracing::warn!(
             pair = %caller.name,
@@ -994,7 +981,7 @@ fn operator_caller(
         return Err(StatusCode::FORBIDDEN);
     }
     if caller.dev_loopback {
-        return Ok(crate::internal::OperatorIdentity::DevLoopback);
+        return Ok(astra_channel::OperatorIdentity::DevLoopback);
     }
     let Some(public_key) = caller.public_key.as_deref() else {
         tracing::error!(
@@ -1016,7 +1003,7 @@ fn operator_caller(
             );
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
-    Ok(crate::internal::OperatorIdentity::WireGuard { public_key })
+    Ok(astra_channel::OperatorIdentity::WireGuard { public_key })
 }
 
 /// One coarse refusal for everything a caller could probe with.
@@ -1027,7 +1014,7 @@ fn operator_caller(
 /// after relay. A finer status here would answer «that campaign exists» to
 /// whoever asked.
 fn operator_refused(
-    operator: &crate::internal::OperatorIdentity,
+    operator: &astra_channel::OperatorIdentity,
     route: &str,
     reason: &str,
 ) -> Response {
@@ -1041,7 +1028,7 @@ fn operator_refused(
 /// This is the one refusal on these routes allowed to be specific, because it
 /// says nothing about the domain — only that this deployment has no private
 /// channel to dial.
-fn operator_unavailable(operator: &crate::internal::OperatorIdentity, route: &str) -> Response {
+fn operator_unavailable(operator: &astra_channel::OperatorIdentity, route: &str) -> Response {
     tracing::warn!(
         operator = %operator,
         route,
@@ -1113,7 +1100,7 @@ pub async fn operator_signer_request(
             "unparseable operation identifier",
         );
     };
-    let Some(token) = crate::internal::bearer_token(&headers) else {
+    let Some(token) = astra_channel::bearer_token(&headers) else {
         return operator_refused(&operator, "signer-request", "no capability token");
     };
     let token = token.to_string();
@@ -1145,7 +1132,7 @@ pub async fn operator_vault(
     else {
         return operator_refused(&operator, "vault", "unparseable vault fingerprint");
     };
-    let Some(token) = crate::internal::bearer_token(&headers) else {
+    let Some(token) = astra_channel::bearer_token(&headers) else {
         return operator_refused(&operator, "vault", "no capability token");
     };
     let token = token.to_string();
@@ -1182,11 +1169,11 @@ pub async fn operator_signer_result(
             "unparseable operation identifier",
         );
     };
-    let Some(token) = crate::internal::bearer_token(&headers) else {
+    let Some(token) = astra_channel::bearer_token(&headers) else {
         return operator_refused(&operator, "signer-result", "no capability token");
     };
     let token = token.to_string();
-    if body.len() > crate::internal::MAX_OPERATOR_REQUEST_BYTES {
+    if body.len() > astra_channel::MAX_OPERATOR_REQUEST_BYTES {
         return StatusCode::PAYLOAD_TOO_LARGE.into_response();
     }
     let result: aether::certificates::status::AstraSignerResult = match serde_json::from_slice(
@@ -1357,8 +1344,8 @@ mod tests {
 
     /// A relay that records who reached it, and answers what it was given.
     struct SpyCampaign {
-        answer: Result<crate::internal::SigningOperationView, TrustUpdateRefusal>,
-        seen: Mutex<Option<crate::internal::OperatorIdentity>>,
+        answer: Result<astra_channel::SigningOperationView, TrustUpdateRefusal>,
+        seen: Mutex<Option<astra_channel::OperatorIdentity>>,
     }
 
     impl SpyCampaign {
@@ -1381,36 +1368,36 @@ mod tests {
     impl OperatorCampaignRelay for SpyCampaign {
         async fn pending(
             &self,
-            operator: &crate::internal::OperatorIdentity,
-        ) -> Result<crate::internal::OperatorPendingList, TrustUpdateRefusal> {
+            operator: &astra_channel::OperatorIdentity,
+        ) -> Result<astra_channel::OperatorPendingList, TrustUpdateRefusal> {
             *self.seen.lock().unwrap() = Some(operator.clone());
-            Ok(crate::internal::OperatorPendingList {
+            Ok(astra_channel::OperatorPendingList {
                 operations: Vec::new(),
             })
         }
 
         async fn operation(
             &self,
-            operator: &crate::internal::OperatorIdentity,
+            operator: &astra_channel::OperatorIdentity,
             _operation: &Id16,
-        ) -> Result<crate::internal::SigningOperationView, TrustUpdateRefusal> {
+        ) -> Result<astra_channel::SigningOperationView, TrustUpdateRefusal> {
             *self.seen.lock().unwrap() = Some(operator.clone());
             self.answer.clone()
         }
 
         async fn signer_request(
             &self,
-            operator: &crate::internal::OperatorIdentity,
+            operator: &astra_channel::OperatorIdentity,
             _operation: &Id16,
             _capability_token: &str,
-        ) -> Result<crate::internal::OperatorSignerRequestResponse, TrustUpdateRefusal> {
+        ) -> Result<astra_channel::OperatorSignerRequestResponse, TrustUpdateRefusal> {
             *self.seen.lock().unwrap() = Some(operator.clone());
             Err(TrustUpdateRefusal::Rejected)
         }
 
         async fn encrypted_vault(
             &self,
-            operator: &crate::internal::OperatorIdentity,
+            operator: &astra_channel::OperatorIdentity,
             _fingerprint: &Fingerprint,
             _capability_token: &str,
         ) -> Result<Vec<u8>, TrustUpdateRefusal> {
@@ -1420,20 +1407,20 @@ mod tests {
 
         async fn signer_result(
             &self,
-            operator: &crate::internal::OperatorIdentity,
+            operator: &astra_channel::OperatorIdentity,
             _operation: &Id16,
             _capability_token: &str,
             _result: Box<aether::certificates::status::AstraSignerResult>,
-        ) -> Result<crate::internal::SigningOperationView, TrustUpdateRefusal> {
+        ) -> Result<astra_channel::SigningOperationView, TrustUpdateRefusal> {
             *self.seen.lock().unwrap() = Some(operator.clone());
             self.answer.clone()
         }
     }
 
-    fn campaign_view() -> crate::internal::SigningOperationView {
-        crate::internal::SigningOperationView {
+    fn campaign_view() -> astra_channel::SigningOperationView {
+        astra_channel::SigningOperationView {
             operation_id: Id16::new([7; 16]).unwrap(),
-            state: crate::internal::SigningOperationState::AwaitingOperator,
+            state: astra_channel::SigningOperationState::AwaitingOperator,
             scope: aether::certificates::status::CampaignScope::TrustAuthorities,
             target_count: 1,
             required_credentials: 1,
@@ -1471,7 +1458,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             relay.seen.lock().unwrap().as_ref(),
-            Some(&crate::internal::OperatorIdentity::WireGuard {
+            Some(&astra_channel::OperatorIdentity::WireGuard {
                 public_key: aether::certificates::encoding::WireGuardKey::parse(CLIENT_KEY)
                     .unwrap(),
             }),
@@ -1498,7 +1485,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             relay.seen.lock().unwrap().as_ref(),
-            Some(&crate::internal::OperatorIdentity::DevLoopback)
+            Some(&astra_channel::OperatorIdentity::DevLoopback)
         );
     }
 

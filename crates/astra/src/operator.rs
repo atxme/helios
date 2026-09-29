@@ -33,16 +33,16 @@
 use std::sync::Arc;
 
 use aether::certificates::encoding::{Fingerprint, Id16};
+use astra_channel::{
+    OperatorIdentity, RelayedOperatorCampaign, RelayedOperatorSignerResult,
+    MAX_OPERATOR_RELAY_BODY_BYTES, OPERATOR_OPERATION_ROUTE, OPERATOR_PENDING_ROUTE,
+    OPERATOR_SIGNER_REQUEST_ROUTE, OPERATOR_SIGNER_RESULT_ROUTE, OPERATOR_VAULT_ROUTE,
+};
 use axum::{
     extract::{DefaultBodyLimit, Path, State},
     response::{IntoResponse, Response},
     routing::post,
     Json, Router,
-};
-use helios_api::internal::{
-    OperatorIdentity, RelayedOperatorCampaign, RelayedOperatorSignerResult,
-    MAX_OPERATOR_RELAY_BODY_BYTES, OPERATOR_OPERATION_ROUTE, OPERATOR_PENDING_ROUTE,
-    OPERATOR_SIGNER_REQUEST_ROUTE, OPERATOR_SIGNER_RESULT_ROUTE, OPERATOR_VAULT_ROUTE,
 };
 
 use crate::service::{

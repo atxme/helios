@@ -134,7 +134,7 @@ pub(crate) fn gateway_identity_publish(
         .context("starting a runtime for the private channel")?;
     runtime
         .block_on(channel.gateway_transition_published(
-            &helios_api::internal::GatewayTransitionPublished {
+            &astra_channel::GatewayTransitionPublished {
                 gateway_identity_epoch: epoch,
                 transition_fingerprint: fingerprint,
             },

@@ -57,7 +57,7 @@ Read only the documents relevant to the touched area:
 ## Workspace map
 
 * `aether`: shared canonical config/state/protocol/crypto contracts.
-* `astra`: certificate-authority coordinator and trust-domain state.
+* `astra` / `astra-channel`: certificate-authority coordinator and trust-domain state; private Astra–gateway veth channel (mTLS, ALPN, lifecycle API).
 * `helios-firewall` / `helios-wireguard`: nftables and WireGuard data plane.
 * `helios-provisioning` / `aether-key-negotiation`: admission, IPAM, ML-KEM orchestration and authenticated QUIC transport.
 * `helios-api`: Axum REST/WebSocket API and embedded-web integration.

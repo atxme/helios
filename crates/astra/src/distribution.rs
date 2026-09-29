@@ -61,7 +61,7 @@ use aether::certificates::{
     },
     CertificateError,
 };
-use helios_api::internal::RelayedTrustUpdatePreparation;
+use astra_channel::RelayedTrustUpdatePreparation;
 
 use crate::service::AstraService;
 

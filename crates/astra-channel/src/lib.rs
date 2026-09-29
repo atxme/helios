@@ -13,7 +13,7 @@
 //!
 //! # Why a second listener rather than a path on the administration API
 //!
-//! The administration API of [`crate::router`] admits peers, rewrites the
+//! The administration API of `helios-api` admits peers, rewrites the
 //! network configuration, drives the firewall and serves the console. None of
 //! that is Astra's business, and a shared listener would make "Astra may not
 //! call it" a matter of middleware ordering. Two listeners make it a matter of
@@ -95,7 +95,7 @@ use axum::{
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use serde::{Deserialize, Serialize};
 
-use crate::certificates::{AstraStageHandler, TrustUpdateRefusal};
+use aether::certificates::transport::TrustUpdateRefusal;
 
 /// ALPN of the private channel.
 ///
@@ -232,12 +232,25 @@ pub struct PeerCertificateStateView {
     pub admission_pq_ca: Option<aether::certificates::encoding::MlDsa87PublicKey>,
 }
 
+/// Private Astra-to-Helios staging contract.
+///
+/// This trait deliberately has no route in the in-tunnel router. The veth
+/// listener of this crate owns its mTLS authentication and calls it only for
+/// an Astra peer pinned by the local trust domain.
+#[async_trait]
+pub trait AstraStageHandler: Send + Sync {
+    async fn stage_from_astra(
+        &self,
+        authorization: Box<aether::certificates::client::ClientCertificateStageAuthorization>,
+    ) -> Result<Box<aether::certificates::client::GatewayCertificateStageReceipt>, TrustUpdateRefusal>;
+}
+
 /// The gateway side of the private channel, implemented by the daemon.
 ///
-/// Staging comes from [`AstraStageHandler`], which already exists as the
-/// reserved Astra-to-Helios contract; this trait adds the two other routes
-/// rather than declaring a second staging entry point. A trait for the same
-/// reason [`crate::certificates::TrustUpdateHandler`] is one: the API process
+/// Staging comes from [`AstraStageHandler`], the reserved Astra-to-Helios
+/// contract above; this trait adds the two other routes rather than declaring
+/// a second staging entry point. A trait for the same reason
+/// `helios_api::certificates::TrustUpdateHandler` is one: the API process
 /// holds no registry lock and no WireGuard backend, so it hands an object to
 /// whatever owns the serializer and learns back only a refusal class.
 ///

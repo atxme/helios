@@ -443,7 +443,7 @@ fn main() -> Result<()> {
     // (ROTATION-CERTIFICATS §2.3.2).
     // Settled before the first HTTP client: two rustls providers are compiled
     // in, so an unnamed one is a panic rather than a choice.
-    helios_api::internal::install_process_default_provider();
+    astra_channel::install_process_default_provider();
 
     let drbg = aether::random::configure().context("resolving the DRBG provider")?;
     tracing::info!(%drbg, "randomness provider");

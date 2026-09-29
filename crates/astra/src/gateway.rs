@@ -1,7 +1,7 @@
 //! Astra's end of the private veth channel to `heliosd` (spec §8.3).
 //!
 //! The protocol — the four routes, the TLS bounds, the pinned verifier — lives
-//! in [`helios_api::internal`], and both ends are built from it on purpose: a
+//! in [`astra_channel`], and both ends are built from it on purpose: a
 //! bound that only one side declares bounds only that side. This module holds
 //! what belongs to Astra alone: where its transport identity lives inside the
 //! container, how it is created, and the pin it puts on the gateway.
@@ -39,7 +39,7 @@ use aether::certificates::client::{
 };
 use aether::certificates::encoding::{DerCertificate, WireGuardKey};
 use aether::certificates::revocation::EmergencyCertificateRevocation;
-use helios_api::internal::{
+use astra_channel::{
     ChannelError, ChannelIdentity, GatewayIdentityView, GatewayLifecycleClient,
     PeerCertificateStateView,
 };
@@ -90,7 +90,7 @@ impl GatewayChannel {
             certificate_der: std::fs::read(state_dir.join(CHANNEL_CERTIFICATE_FILE))?,
             private_key_der: std::fs::read(state_dir.join(CHANNEL_KEY_FILE))?,
         };
-        let tls = helios_api::internal::client_config(&identity, pinned_gateway_certificate)?;
+        let tls = astra_channel::client_config(&identity, pinned_gateway_certificate)?;
         Ok(Self {
             client: GatewayLifecycleClient::new(address, tls),
         })
@@ -120,7 +120,7 @@ impl GatewayChannel {
     /// `CA-PQ` authorization presented alongside. This end never claims it.
     pub async fn commit_recovery(
         &self,
-        relayed: &helios_api::internal::RelayedStageCommit,
+        relayed: &astra_channel::RelayedStageCommit,
     ) -> Result<(), ChannelError> {
         self.client.commit_recovery(relayed).await
     }
@@ -154,7 +154,7 @@ impl GatewayChannel {
     /// Tells the gateway a staged transition has left the authority (§6.3).
     pub async fn gateway_transition_published(
         &self,
-        published: &helios_api::internal::GatewayTransitionPublished,
+        published: &astra_channel::GatewayTransitionPublished,
     ) -> Result<(), ChannelError> {
         self.client.gateway_transition_published(published).await
     }
@@ -178,7 +178,7 @@ pub fn initialize(state_dir: &Path, rotate: bool) -> Result<DerCertificate, Chan
 pub struct TransportIdentities {
     /// `clientAuth`, named `astra.internal`. The gateway pins it.
     pub client: DerCertificate,
-    /// `serverAuth`, named [`helios_api::internal::ASTRA_INTERNAL_SERVER_NAME`].
+    /// `serverAuth`, named [`astra_channel::ASTRA_INTERNAL_SERVER_NAME`].
     /// The gateway pins it too, for the direction it dials.
     pub authority: DerCertificate,
 }
@@ -207,7 +207,7 @@ pub fn initialize_pair(
             rotate,
             AUTHORITY_CERTIFICATE_FILE,
             AUTHORITY_KEY_FILE,
-            helios_api::internal::ASTRA_INTERNAL_SERVER_NAME,
+            astra_channel::ASTRA_INTERNAL_SERVER_NAME,
             Role::Server,
         )?,
     })
