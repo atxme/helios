@@ -554,3 +554,224 @@ async fn rejects_non_http_urls_before_network_access() {
     let error = run_at("file:///etc/hosts").await.expect_err("invalid URL");
     assert!(matches!(error, SpeedTestError::InvalidUrl(_)));
 }
+
+/// A control frame reads back as what was written.
+#[test]
+fn a_control_frame_round_trips_through_its_parser() {
+    let frame = wire_tcp_frame();
+    assert_eq!(
+        parse_tcp_control(&frame).expect("our own frame parses"),
+        (
+            aether::speedtest::TCP_KIND_HELLO,
+            aether::speedtest::SPEEDTEST_MODE_DOWNLOAD,
+            17,
+            0x0102_0304_0506_0708
+        )
+    );
+}
+
+/// The control frame keeps the byte layout the gateway's listener parses.
+///
+/// The client and `helios-api` build and read these frames independently, so
+/// the positions are the contract: a field moved by one byte on one side is a
+/// test that hangs on the other, not a compile error.
+#[test]
+fn a_control_frame_keeps_the_layout_the_gateway_parses() {
+    let frame = wire_tcp_frame();
+    assert_eq!(frame.len(), aether::speedtest::TCP_CONTROL_BYTES);
+    assert_eq!(frame[..8], aether::speedtest::SPEEDTEST_MAGIC);
+    assert_eq!(frame[8], aether::speedtest::SPEEDTEST_PROTOCOL_VERSION);
+    assert_eq!(frame[9], aether::speedtest::TCP_KIND_HELLO);
+    assert_eq!(frame[10], aether::speedtest::SPEEDTEST_MODE_DOWNLOAD);
+    assert_eq!(frame[11], 0, "reserved");
+    assert_eq!(frame[12..14], 17u16.to_be_bytes(), "duration, big-endian");
+    assert_eq!(frame[14..16], [0, 0], "reserved");
+    assert_eq!(
+        frame[16..24],
+        0x0102_0304_0506_0708u64.to_be_bytes(),
+        "session, big-endian"
+    );
+}
+
+/// A frame from another protocol, or another version of this one, is refused.
+#[test]
+fn a_control_frame_with_another_magic_or_version_is_refused() {
+    let mut foreign = wire_tcp_frame();
+    foreign[0] ^= 0xFF;
+    assert!(parse_tcp_control(&foreign).is_err());
+
+    let mut newer = wire_tcp_frame();
+    newer[8] = aether::speedtest::SPEEDTEST_PROTOCOL_VERSION.wrapping_add(1);
+    assert!(parse_tcp_control(&newer).is_err());
+}
+
+/// A datagram reads back as what was written, and its header keeps the
+/// layout the gateway parses.
+#[test]
+fn a_datagram_round_trips_and_keeps_its_header_layout() {
+    let payload = [0xAB; 5];
+    let packet = udp_frame(
+        aether::speedtest::UDP_KIND_DATA,
+        aether::speedtest::SPEEDTEST_MODE_UPLOAD,
+        0x1112_1314_1516_1718,
+        0x2122_2324_2526_2728,
+        9,
+        300,
+        &payload,
+    );
+    let header = aether::speedtest::SPEEDTEST_UDP_HEADER_BYTES;
+    assert_eq!(packet.len(), header + payload.len());
+    assert_eq!(packet[..8], aether::speedtest::SPEEDTEST_MAGIC);
+    assert_eq!(packet[8], aether::speedtest::SPEEDTEST_PROTOCOL_VERSION);
+    assert_eq!(packet[11], 0, "reserved");
+    assert_eq!(
+        packet[20..28],
+        0x2122_2324_2526_2728u64.to_be_bytes(),
+        "sequence"
+    );
+    assert_eq!(packet[28..30], 9u16.to_be_bytes(), "duration");
+    assert_eq!(packet[30..32], 300u16.to_be_bytes(), "rate");
+
+    let parsed = parse_client_udp_frame(&packet).expect("our own datagram parses");
+    assert_eq!(parsed.kind, aether::speedtest::UDP_KIND_DATA);
+    assert_eq!(parsed.mode, aether::speedtest::SPEEDTEST_MODE_UPLOAD);
+    assert_eq!(parsed.session, 0x1112_1314_1516_1718);
+    assert_eq!(parsed.payload, payload);
+}
+
+/// A datagram shorter than a header, or not ours, is ignored rather than read.
+#[test]
+fn a_short_or_foreign_datagram_is_not_ours() {
+    let header = aether::speedtest::SPEEDTEST_UDP_HEADER_BYTES;
+    let packet = udp_frame(aether::speedtest::UDP_KIND_PING, 0, 1, 2, 3, 4, &[]);
+
+    assert!(parse_client_udp_frame(&packet[..header - 1]).is_none());
+    let exact = parse_client_udp_frame(&packet).expect("a bare header is a datagram");
+    assert!(exact.payload.is_empty());
+
+    let mut foreign = packet.clone();
+    foreign[3] ^= 0xFF;
+    assert!(parse_client_udp_frame(&foreign).is_none());
+
+    let mut newer = packet;
+    newer[8] = aether::speedtest::SPEEDTEST_PROTOCOL_VERSION.wrapping_add(1);
+    assert!(parse_client_udp_frame(&newer).is_none());
+}
+
+/// The transfer payload is the same every time and is not a run of one byte.
+///
+/// Deterministic, so two runs measure the same bytes; varied, so a link that
+/// compresses cannot report a throughput the payload never had.
+#[test]
+fn the_payload_is_deterministic_and_varied() {
+    let first = raw_buffer();
+    assert_eq!(first.len(), aether::speedtest::SPEEDTEST_TCP_BUFFER_BYTES);
+    assert_eq!(first, raw_buffer());
+    let distinct = first.iter().collect::<std::collections::HashSet<_>>().len();
+    assert!(distinct > 200, "only {distinct} distinct byte values");
+}
+
+/// A reset names a service that is not ours, silence names an unreachable
+/// gateway, and anything else stays a transport error.
+#[test]
+fn a_udp_failure_is_named_for_what_it_most_likely_is() {
+    use std::io::{Error, ErrorKind};
+
+    for kind in [
+        ErrorKind::ConnectionReset,
+        ErrorKind::ConnectionAborted,
+        ErrorKind::UnexpectedEof,
+        ErrorKind::BrokenPipe,
+    ] {
+        assert!(
+            matches!(
+                raw_udp_transport(Error::from(kind)),
+                SpeedTestError::ServiceAbsent { port, .. }
+                    if port == aether::speedtest::SPEEDTEST_PORT
+            ),
+            "{kind:?}"
+        );
+    }
+    for kind in [ErrorKind::TimedOut, ErrorKind::WouldBlock] {
+        assert!(
+            matches!(
+                raw_udp_transport(Error::from(kind)),
+                SpeedTestError::Unreachable { port, .. }
+                    if port == aether::speedtest::SPEEDTEST_PORT
+            ),
+            "{kind:?}"
+        );
+    }
+    assert!(matches!(
+        raw_udp_transport(Error::from(ErrorKind::PermissionDenied)),
+        SpeedTestError::Transport(_)
+    ));
+}
+
+/// The control channel reaches the same diagnosis, rendered as the text the
+/// worker threads exchange.
+#[test]
+fn a_control_channel_failure_carries_the_same_diagnosis() {
+    use std::io::{Error, ErrorKind};
+
+    let reset = Error::from(ErrorKind::ConnectionReset);
+    let detail = reset.to_string();
+    assert_eq!(
+        foreign_or_transport(reset),
+        service_absent(&detail).to_string()
+    );
+
+    let silence = Error::from(ErrorKind::TimedOut);
+    let detail = silence.to_string();
+    assert_eq!(
+        foreign_or_transport(silence),
+        unreachable(&detail).to_string()
+    );
+
+    let other = Error::from(ErrorKind::PermissionDenied);
+    let detail = other.to_string();
+    assert_eq!(foreign_or_transport(other), detail);
+}
+
+/// A raw run lasts between one second and the protocol's ceiling.
+#[test]
+fn the_raw_duration_is_bounded() {
+    let ceiling = aether::speedtest::SPEEDTEST_MAX_DURATION_SECS;
+    assert!(validate_raw_duration(0).is_err());
+    assert!(validate_raw_duration(1).is_ok());
+    assert!(validate_raw_duration(ceiling).is_ok());
+    assert!(validate_raw_duration(ceiling + 1).is_err());
+}
+
+/// The UI's mode is one of three names, spelled exactly.
+#[test]
+fn the_mode_parses_only_its_three_names() {
+    assert_eq!(SpeedTestMode::parse("tcp").ok(), Some(SpeedTestMode::Tcp));
+    assert_eq!(SpeedTestMode::parse("udp").ok(), Some(SpeedTestMode::Udp));
+    assert_eq!(SpeedTestMode::parse("full").ok(), Some(SpeedTestMode::Full));
+    for other in ["TCP", "", "both", "tcp "] {
+        assert!(
+            matches!(SpeedTestMode::parse(other), Err(SpeedTestError::InvalidMode(value)) if value == other),
+            "{other:?}"
+        );
+    }
+}
+
+/// A rate over no elapsed time is finite, and a huge duration saturates
+/// rather than wrapping.
+#[test]
+fn rates_and_durations_stay_finite() {
+    assert!((rate_mbps(1_000_000, Duration::from_secs(1)) - 8.0).abs() < 1e-9);
+    assert!(rate_mbps(1_000_000, Duration::ZERO).is_finite());
+    assert_eq!(saturating_millis(Duration::from_millis(1_500)), 1_500);
+    assert_eq!(saturating_millis(Duration::MAX), u64::MAX);
+}
+
+fn wire_tcp_frame() -> [u8; aether::speedtest::TCP_CONTROL_BYTES] {
+    tcp_control(
+        aether::speedtest::TCP_KIND_HELLO,
+        aether::speedtest::SPEEDTEST_MODE_DOWNLOAD,
+        17,
+        0x0102_0304_0506_0708,
+    )
+}
