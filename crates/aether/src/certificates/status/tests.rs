@@ -1010,6 +1010,7 @@ fn revoked_is_the_only_terminal_status() {
 /// And before the signature: the family check is a match, the signature is
 /// an ML-DSA-87 verification, and a combination the table does not hold is
 /// meaningless whoever signed it.
+#[cfg(feature = "key-negotiation-signing")]
 #[test]
 fn a_status_outside_its_family_is_refused_before_its_signature() {
     let (_, service_key) =
@@ -1148,6 +1149,7 @@ fn every_state_has_its_own_transcript_byte() {
     assert_eq!(CertificateStatus::Revoked.domain_byte(), 9);
 }
 
+#[cfg(feature = "key-negotiation-signing")]
 mod campaign_approval {
     use super::*;
     use crate::certificates::approval::{

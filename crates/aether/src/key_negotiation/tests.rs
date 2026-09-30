@@ -481,6 +481,7 @@ fn pq_certificate(
 /// names an authority it was not signed by is not a shape any gateway
 /// serves, and a fixture that carries it hides which of the two paths a
 /// verification took.
+#[cfg(feature = "key-negotiation-signing")]
 fn self_signed_gateway_certificate(
     subject: &str,
     wireguard_key: &str,
