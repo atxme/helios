@@ -69,7 +69,7 @@ fn valid_ipv4_cidr(value: &str) -> bool {
 /// Deliberately derives neither `Clone` nor `Serialize`.
 ///
 /// **`Serialize`**: the only shape that reaches `network.toml` is
-/// [`PersistedNetworkConfig`], an allow-list. The derive was dead code that
+/// `PersistedNetworkConfig`, an allow-list. The derive was dead code that
 /// would have made any `toml::to_string(&config)` write the gateway identity
 /// to disk — the one thing ADR-006 §4 exists to prevent.
 ///
@@ -357,7 +357,7 @@ pub struct WgPeer {
     /// Since v5 the whole liveness story reads the data plane: Orion
     /// renegotiates when its last handshake ages past
     /// `HANDSHAKE_STALE_AFTER_SECS`, and the gateway reclaims a PSK slot past
-    /// [`PSK_RECLAIM_AFTER_STALE_SECS`](crate::key_negotiation::PSK_RECLAIM_AFTER_STALE_SECS).
+    /// `heliosd`'s `PSK_RECLAIM_AFTER_STALE_SECS`.
     /// Both assume a live tunnel keeps producing handshakes, which an idle one
     /// does not unless something sends.
     ///

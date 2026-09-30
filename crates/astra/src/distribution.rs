@@ -44,7 +44,7 @@
 //!
 //! # Limite connue : certaines transitions restent sans producteur
 //!
-//! [`AstraIssuerAuthorization`], the `CA-PQ` transition of §9.1 and emergency
+//! [`AstraIssuerAuthorization`](aether::certificates::authority::AstraIssuerAuthorization), the `CA-PQ` transition of §9.1 and emergency
 //! revocations are what this authority holds. `CA-TLS` transitions are refused at the registry
 //! rather than stored — it pins the epoch of that anchor without pinning the
 //! anchor itself, so it could only check such an object against a value the

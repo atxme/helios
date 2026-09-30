@@ -20,7 +20,7 @@ impl AstraRegistry {
     ///
     /// A registry written before [`AstraState::astra_policy_fingerprint`] and
     /// `credential_registry_epoch` existed is **migrated** rather than
-    /// refused — see [`Self::migrate`]. Refusing it would leave an operator
+    /// refused — see `Self::migrate`. Refusing it would leave an operator
     /// with an authority that has a history, a service key and a domain, and
     /// no way to read any of them.
     pub fn load(path: &Path, expected_head: Option<&Fingerprint>) -> Result<Self, RegistryError> {

@@ -23,7 +23,7 @@
 //! ## WSL2 / target split
 //!
 //! All decision logic (boot flow, hybrid ticket, blob store, anti-replay) is
-//! testable on WSL2 via [`tpm_interface::DryRunTpm`]. The real backend
+//! testable on WSL2 via `tpm_interface::DryRunTpm`. The real backend
 //! (`feature tpm`, `tpm_interface::TpmDevice`) can run against a software TPM
 //! to verify its ESAPI command flow. Secure Boot measurements, hardware-bus
 //! protection, and persistence still require target trials — like the

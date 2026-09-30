@@ -10,7 +10,7 @@
 //!
 //! A crash between them leaves this registry naming a generation that expired.
 //! The next lifecycle contact repairs it on its own, because
-//! [`crate::renewal::transcribe_peer`] re-reads the gateway every time. But a
+//! `crate::renewal::transcribe_peer` re-reads the gateway every time. But a
 //! client that never comes back — which is exactly the population a recovery
 //! serves — would leave the disagreement standing, invisible, until somebody
 //! looked.

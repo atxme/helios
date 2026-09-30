@@ -20,7 +20,7 @@ impl CertificateRegistry {
     /// flight, or one whose activation is already in the past.
     ///
     /// The anchor does **not** move here. Both are acceptable from
-    /// `activation_at`, which is what [`TrustState::client_leaf_issuers`]
+    /// `activation_at`, which is what [`RegistryState::client_leaf_issuers`](super::RegistryState::client_leaf_issuers)
     /// already reads, and `promote_due` retires the outgoing one at
     /// `not_after`. Persisted only when the state moved.
     pub fn install_ca_transition(

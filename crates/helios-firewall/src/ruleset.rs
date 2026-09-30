@@ -2,7 +2,7 @@
 //!
 //! The ruleset is a data structure, not text: it is what the Netlink backend
 //! translates into expressions, and from which [`crate::DryRunBackend`] and the
-//! API derive human-readable nftables syntax via [`Display`]. The reverse —
+//! API derive human-readable nftables syntax via [`Display`](std::fmt::Display). The reverse —
 //! producing text then re-parsing it — would be fragile and would silently
 //! let the display diverge from what is actually applied.
 //!

@@ -18,7 +18,7 @@
 //!
 //! # What the transport is not allowed to decide
 //!
-//! Nothing. Both arms verify through the same [`origin::Origin::accept`]:
+//! Nothing. Both arms verify through the same `origin::Origin::accept`:
 //! the objects carry the signatures, so what arrives through a tunnel is
 //! trusted exactly as much — and exactly as little — as what arrives over
 //! HTTPS. In particular the relying party a channel reports is displayed and

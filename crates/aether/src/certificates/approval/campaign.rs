@@ -13,7 +13,7 @@ use super::*;
 ///
 /// # Why the registry travels with it
 ///
-/// [`CampaignApproval::verify`] resolves each credential against a
+/// [`CampaignApproval::verify`](crate::certificates::status::CampaignApproval::verify) resolves each credential against a
 /// `CA-PQ`-signed [`CredentialRegistry`]. Helios holds the per-credential
 /// decisions it has already accepted, not that document, so the document comes
 /// along and is verified under the `CA-PQ` the consumer already pins — never

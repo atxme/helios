@@ -15,7 +15,7 @@
 //!
 //! # Where the randomness comes from
 //!
-//! Neither [`Kem::generate_keypair`] nor [`Kem::encapsulate`] takes an RNG, so
+//! Neither [`Kem::generate`] nor [`Kem::encapsulate`] takes an RNG, so
 //! it is worth stating where their bytes originate rather than leaving a reader
 //! to hope: AWS-LC's ML-KEM routes every draw through `mlk_randombytes`, which
 //! is `RAND_bytes` — the very generator [`crate::random`] hands to the rest of

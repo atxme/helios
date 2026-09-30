@@ -16,7 +16,7 @@
 //!
 //! # What crosses the channel
 //!
-//! Only [`AstraCaTlsStatus`] one way and [`AstraIpcCommand`] the other, both
+//! Only [`AstraCaTlsStatus`](aether::certificates::operator_ipc::AstraCaTlsStatus) one way and [`AstraIpcCommand`](aether::certificates::operator_ipc::AstraIpcCommand) the other, both
 //! defined in `aether` and both public by construction: a phase, a sentence,
 //! the campaign manifest the authority signed, and the labels of the key-slots
 //! that answered. No PIN, no assertion, no vault byte. The WebView therefore

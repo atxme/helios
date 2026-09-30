@@ -97,7 +97,7 @@ pub const MEASUREMENT_ROUNDS: usize = 3;
 /// Nominal duration of one measured window.
 pub const ROUND_DURATION: Duration = Duration::from_millis(1_500);
 /// Total measured traffic ceiling per direction. Calibration and connection
-/// warm-up are small and bounded separately by [`MAX_CHUNK_BYTES`].
+/// warm-up are small and bounded separately by `MAX_CHUNK_BYTES`.
 pub const MAX_MEASURED_BYTES_PER_DIRECTION: u64 = 1024 * 1024 * 1024;
 /// Per-request timeout. A path slower than this cannot produce a meaningful
 /// interactive speedtest and must fail explicitly.

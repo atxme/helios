@@ -14,7 +14,7 @@
 //! items in place would mean holding a handle on each one and keeping the list
 //! of profile items in sync by hand — a second model, next to the one the
 //! vault already holds, that would drift the day a profile is renamed. Building
-//! the menu from a [`TrayModel`] read on the spot has no such second copy: what
+//! the menu from a [`TrayModel`](crate::tray::TrayModel) read on the spot has no such second copy: what
 //! the menu shows is what the state said at the moment it was built.
 //!
 //! # Limite connue

@@ -50,7 +50,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct ProvisionOutcome {
     /// Post-quantum PSK, in base64, ready for the `PresharedKey` slot.
     ///
-    /// A [`SecretString`], which is also what keeps the `Debug` above honest:
+    /// A [`SecretString`](aether::SecretString), which is also what keeps the `Debug` above honest:
     /// this structure is built on every enrolment, and a derived `Debug` over
     /// a bare `String` would print the PSK into any log that formats it
     /// (ADR-006 §5).

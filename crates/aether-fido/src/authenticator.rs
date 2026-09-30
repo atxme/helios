@@ -671,7 +671,7 @@ mod ctap {
         /// attempting the operation, turns any misreading of that report into
         /// « your key cannot do this » — which is what happened to a YubiKey 5
         /// firmware 5.7.4 that does it perfectly well. The operation is the
-        /// proof: [`Ctap2Authenticator::register`] checks the attestation, and
+        /// proof: [`Ctap2Authenticator`]'s [`register`](super::Authenticator::register) checks the attestation, and
         /// `derive` fails with [`AuthenticatorError::NoHmacOutput`] if nothing
         /// comes back. Both are facts rather than claims.
         ///

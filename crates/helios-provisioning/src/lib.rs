@@ -69,7 +69,7 @@
 //! authority — the operator or the derivation — which is beyond the scope of
 //! provisioning.
 //!
-//! [`admission::admit`] **reduces** this gap without eliminating it: it
+//! [`admission::admit_with_key_negotiation`] **reduces** this gap without eliminating it: it
 //! declares precisely the address the IPAM derives, so a peer admitted this
 //! way does not diverge. What remains are entries written by hand into
 //! `network.toml`, for which the above limitation still holds.

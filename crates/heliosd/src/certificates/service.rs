@@ -112,7 +112,7 @@ impl CertificateService {
     ///
     /// Shared by the two ways a peer is admitted — the API route, which runs
     /// inside this process, and the console inbox drained by
-    /// [`Self::drain_admissions`]. One implementation, because a second one
+    /// [`spawn_admission_drain`]. One implementation, because a second one
     /// would eventually date a generation differently and the divergence would
     /// only show at a renewal.
     pub(super) async fn record_first_generation(

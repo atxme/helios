@@ -1394,7 +1394,7 @@ impl From<&ClientConfig> for ConfigView {
 /// `save_profile` then refused the payload with `missing field peerPublicKey`,
 /// and no test caught it: the TypeScript suite mocks the command, and the Rust
 /// suite builds the struct directly. Neither crossed the boundary where the
-/// names actually have to agree. [`the_frontend_payload_deserialises`] does.
+/// names actually have to agree. `the_frontend_payload_deserialises` does.
 ///
 /// Only the two **intents** are camelCase, because they exist nowhere else and
 /// the screen writes them by hand.
@@ -1935,7 +1935,7 @@ async fn resolve_ssh_target(
 ///
 /// Orion runs elevated, always and by design: WireGuard-NT cannot be loaded
 /// otherwise, and the shipped manifest asks for `requireAdministrator`
-/// ([`windows_manifest_requires_administrator_privileges`]). A child inherits
+/// (`windows_manifest_requires_administrator_privileges`). A child inherits
 /// its parent's token, so the ordinary `Command::spawn` would hand out an
 /// **Administrator** shell from one click, with no UAC prompt of its own, to
 /// whoever can reach this window — or anything that can reach this command,

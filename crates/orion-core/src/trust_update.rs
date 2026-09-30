@@ -17,7 +17,7 @@
 //! renewal committing, a revocation landing, a scheduled item coming due —
 //! invalidates the transaction rather than applying a decision taken about a
 //! state that no longer exists. The recomputation happens at
-//! [`TrustStore::apply_transaction`], on the live store, not here.
+//! [`TrustStore::verify_and_apply_transaction`], on the live store, not here.
 //!
 //! # Why a session and not a call
 //!

@@ -23,7 +23,7 @@
 //!   re-admission, which *can* create a new continuity, needs two;
 //! - **`CA-PQ`** signs the staging and the grant. The delegated issuer is
 //!   deliberately not allowed to: it may renew a live identity, never revive an
-//!   expired one, and [`RotationReason::is_delegable`] refuses the reason.
+//!   expired one, and [`RotationReason::is_delegable`](aether::certificates::authority::RotationReason::is_delegable) refuses the reason.
 //!
 //! # Why the state is in memory
 //!

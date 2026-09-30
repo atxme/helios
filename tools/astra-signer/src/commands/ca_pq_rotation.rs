@@ -257,7 +257,7 @@ pub(crate) fn rotate_ca_pq(
 /// The object a campaign target is compared against, before anything signs.
 ///
 /// A placeholder transition carrying the outgoing epoch and fingerprint: what
-/// [`AstraRotationCampaign::covers_authority_object`] reads is exactly those
+/// [`AstraRotationCampaign::covers_authority_object`](aether::certificates::status::AstraRotationCampaign::covers_authority_object) reads is exactly those
 /// two values, so comparing here costs no signature and answers the only
 /// question that matters before a key is touched — does the authority name the
 /// anchor this vault holds.

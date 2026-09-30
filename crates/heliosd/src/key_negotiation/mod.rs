@@ -49,7 +49,7 @@ const GATEWAY_BOOTSTRAP_REQUEST_PATH: &str =
 ///
 /// `pub(crate)` because the certificate lifecycle has to ask the same question
 /// before it stages a candidate: see
-/// [`crate::certificates::assert_candidate_is_presentable`].
+/// `crate::certificates::astra::assert_candidate_is_presentable`.
 pub(crate) const CLIENT_PQ_CA_PATH: &str =
     "/var/lib/helios/key-negotiation-client-pq-ca-public.bin";
 const PRIVATE_KEYSTORE_PATH: &str = "/var/lib/helios/key-negotiation-key.sealed";

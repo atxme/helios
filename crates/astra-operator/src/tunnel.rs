@@ -326,7 +326,7 @@ impl Tunnel {
 
     /// Reads the campaign operation, then the request it is waiting on.
     ///
-    /// The verification is [`crate::origin::Origin::accept`] — the same
+    /// The verification is `crate::origin::Origin::accept` — the same
     /// function the public origin path uses, deliberately: the objects carry
     /// the signatures, so a campaign fetched through a tunnel is trusted
     /// exactly as much, and exactly as little, as one fetched from HTTPS.

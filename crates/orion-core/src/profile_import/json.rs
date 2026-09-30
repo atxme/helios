@@ -55,14 +55,14 @@ struct JsonProfile {
     /// An operator hands out what they know, and a document is allowed to be
     /// partial. Refusing to **parse** one returned the user to a file picker
     /// with a sentence, when the useful outcome is a form with one field left
-    /// to fill. [`complete_profile_import`] names what is missing, and
+    /// to fill. [`complete_profile_import`](super::complete_profile_import) names what is missing, and
     /// [`ClientProfile::validate`] is what refuses a tunnel — parsing only
     /// decides whether the document is intelligible.
     #[serde(default)]
     endpoint: String,
     /// Absent in an invitation profile: the operator doesn't hold the
     /// client's private key and therefore has nothing to send back
-    /// (ADR-004 §6). [`complete_profile_import`] then takes it from the local
+    /// (ADR-004 §6). [`complete_profile_import`](super::complete_profile_import) then takes it from the local
     /// profile holding the admitted key, or from a key just generated.
     #[serde(default)]
     private_key: String,

@@ -670,7 +670,7 @@ fn deposit_gateway_decision(
 
 /// The signed object as `heliosd` reads it: bare, without the routing envelope.
 ///
-/// [`TrustUpdateObject`] is internally tagged, and that tag is how Astra's
+/// [`TrustUpdateObject`](aether::certificates::transport::TrustUpdateObject) is internally tagged, and that tag is how Astra's
 /// registry tells one decision from another. The `heliosd install-*` readers
 /// take one concrete type and refuse an unknown `kind` field, so a file
 /// carrying the envelope is a file the command this companion prints cannot

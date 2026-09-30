@@ -77,7 +77,7 @@
 //! - **ML-KEM-1024** ([`crate::pq`]) — key generation and encapsulation go
 //!   through AWS-LC's `mlk_randombytes`, which is `RAND_bytes`. Same DRBG, no
 //!   adaptation needed;
-//! - **ML-DSA-87** — [`crate::ml_dsa`] hands `fips204` a [`DrbgRng`], so key
+//! - **ML-DSA-87** — `crate::ml_dsa` hands `fips204` a [`DrbgRng`], so key
 //!   generation and hedged signing draw from here. (AWS-LC's own ML-DSA also
 //!   calls `RAND_bytes`, but this project uses the `fips204` implementation.);
 //! - **X.509 private keys** produced by `rcgen` — CA-TLS, client leaves, the

@@ -207,7 +207,7 @@ fn host_of(cidr: &str) -> Option<Ipv4Addr> {
 /// Raw bytes of a base64 public key, empty if it is unreadable.
 ///
 /// The IPAM derives the VIP from the bytes, never from the encoding. An
-/// unreadable key cannot reach here via [`admit`], which validates first;
+/// unreadable key cannot reach here via [`admit_with_key_negotiation`], which validates first;
 /// the case only remains for entries inherited from a manual edit of
 /// `network.toml`.
 fn decode_key(public_key: &str) -> Vec<u8> {

@@ -22,7 +22,7 @@ pub(super) fn raw_udp_transport(error: std::io::Error) -> SpeedTestError {
     }
 }
 
-/// The rendered text of [`SpeedTestError::ForeignService`].
+/// The rendered text of [`SpeedTestError::ServiceAbsent`].
 ///
 /// The worker threads exchange failures as strings — they cross a barrier and
 /// a `join` — so the diagnosis is rendered here rather than carried as a type

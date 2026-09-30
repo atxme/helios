@@ -2,7 +2,7 @@
 //!
 //! # Why the whole table is re-signed every time
 //!
-//! An [`AstraCredentialBinding`] says «this credential belongs to this trust
+//! An [`AstraCredentialBinding`](aether::certificates::approval::AstraCredentialBinding) says «this credential belongs to this trust
 //! domain, in this state». A binding describing a key-slot the vault no longer
 //! holds is a signed lie, and nothing downstream can catch it: Helios and Orion
 //! check the `CA-PQ` signature, and the signature is genuine.
@@ -20,7 +20,7 @@
 //! decision they can act on: §2.4 makes `revoked` a signed state that dominates
 //! permanently. A withdrawn credential therefore keeps a row, marked `revoked`,
 //! carrying the public key it was registered with — which is exactly what makes
-//! [`AstraCredentialBinding::supersedes`] refuse a restored backup that would
+//! [`AstraCredentialBinding::supersedes`](aether::certificates::approval::AstraCredentialBinding::supersedes) refuse a restored backup that would
 //! un-revoke it.
 //!
 //! # Why the epoch lives here

@@ -119,7 +119,7 @@ pub enum CertificateActionBlock {
     ///
     /// **Plus émis** depuis que `astra-signer approve --heliosd-url` existe :
     /// la variante survit pour qu'un état sérialisé antérieur se relise, et
-    /// [`renewal_block`] ne la rend plus.
+    /// `renewal_block` ne la rend plus.
     CompanionTransportMissing,
     /// Needs a hardware credential and the `astra-signer` companion.
     OperatorCredentialRequired,
