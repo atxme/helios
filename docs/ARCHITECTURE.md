@@ -94,7 +94,8 @@ sets its own (25 s) rather than trusting one it cannot inspect.
 The public QUIC port answers with three error codes only — `protocol`,
 `rejected`, `internal` — so that it cannot be used to enumerate admitted peers
 or read their floor. Its DoS bounds are Retry before any state, a budget per
-IPv4 address or per IPv6 `/64` prefix, a budget per admitted identity after
+IPv4 address or per IPv6 `/64` prefix (an IPv4-mapped `::ffff:a.b.c.d` source
+counts as its IPv4 address), a budget per admitted identity after
 mTLS, a 90-second absolute connection lifetime, TLS resumption and 0-RTT
 disabled on both ends, no unidirectional streams, and datagrams pinned to 1200
 bytes with MTU discovery off on both sides.
@@ -154,8 +155,10 @@ It never brings the initial tunnel up.
 - `GET /api/key-negotiation` serves the public negotiation material that
   `helios-ctl enroll` reads;
 - every mutation requires `application/json`, and no permissive CORS is enabled;
-- the source address resolves to a WireGuard peer's single `/32` VIP, with no
-  proxy header accepted, and mutations require `admin = true`;
+- the source address, canonicalized (`::ffff:a.b.c.d` is its IPv4 address),
+  resolves to a WireGuard peer's single `/32` IPv4 VIP, with no proxy header
+  accepted, and mutations require `admin = true`; a native IPv6 source is never
+  a caller;
 - the WebSocket streams state transitions and post-connection telemetry.
 
 The HTTP barrier guards against cross-origin forms. The application identity is
