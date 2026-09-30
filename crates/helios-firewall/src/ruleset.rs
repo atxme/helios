@@ -19,7 +19,9 @@
 //!   `wan_iface`, for hosts located *behind* the gateway;
 //! * **road-warrior**, behind `allow_client_internet`: `forward` from
 //!   `wg_iface` to `wan_iface`, plus a masquerade in `postrouting`, for a
-//!   client arriving *through* the tunnel.
+//!   client arriving *through* the tunnel. Both are IPv4-only
+//!   (`meta nfproto ipv4`): the table is `inet`, and relaying or NAT-ing
+//!   IPv6 is a decision not taken yet, see [`MasqueradeRule`].
 //!
 //! The second is closed by default. A gateway granting access to internal
 //! resources has no reason to route Internet traffic, and opening it would
@@ -62,8 +64,8 @@ mod transport;
 mod tunnel_interface;
 
 pub use nftables::{
-    Action, AddressFamily, ChainKind, ConnectionState, ConnectionStates, Counter, LogAction, Match,
-    RateLimit, RateLimitMode, RateUnit, Rule, Ruleset, Verdict, L4,
+    Action, AddressFamily, ChainKind, ConnectionState, ConnectionStates, Counter, LogAction,
+    MasqueradeRule, Match, RateLimit, RateLimitMode, RateUnit, Rule, Ruleset, Verdict, L4,
 };
 
 use aether::{FirewallPolicy, HeliosError, Result, TunnelState, SPEEDTEST_PORT};

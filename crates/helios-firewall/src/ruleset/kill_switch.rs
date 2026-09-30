@@ -10,7 +10,7 @@
 use aether::{FirewallPolicy, Result, TunnelState};
 
 use super::ChainKind::{Forward, Output};
-use super::{network, Match, Rule, Verdict, L4};
+use super::{network, MasqueradeRule, Match, Rule, Verdict, L4};
 
 pub(super) fn state_gated_openings(
     rules: &mut Vec<Rule>,
@@ -86,12 +86,20 @@ pub(super) fn state_gated_openings(
         // the forward chain's `ct state established,related` rule: opening
         // the outbound direction is enough, and scoping to the client -> WAN
         // direction only avoids exposing the gateway's LAN to clients.
+        //
+        // The opening relays the family the masquerade rewrites, and only
+        // that one. The table is `inet`: without the guard, an IPv6 packet on
+        // the tunnel interface would be forwarded to the WAN as soon as the
+        // gateway enables IPv6 forwarding. WireGuard's IPv4-only AllowedIPs
+        // keep IPv6 off the tunnel today; the guard makes that explicit
+        // before any IPv6 tunnel address exists (ADRESSAGE-IPV6 §6.4).
         if policy.allow_client_internet && !policy.wg_iface.is_empty() {
             for wan in wan_ifaces {
                 rules.push(
                     Rule::new(
                         Forward,
                         vec![
+                            Match::Family(MasqueradeRule::FAMILY),
                             Match::InIface(policy.wg_iface.clone()),
                             Match::OutIface(wan.clone()),
                         ],

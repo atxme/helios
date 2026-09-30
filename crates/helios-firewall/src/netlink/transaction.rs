@@ -14,7 +14,7 @@ use rustables::{
 use tracing::{info, warn};
 
 use super::TABLE_NAME;
-use crate::ruleset::{render, ChainKind, Ruleset, Verdict};
+use crate::ruleset::{render, ChainKind, MasqueradeRule, Match, Rule, Ruleset, Verdict};
 use crate::{FirewallBackend, FirewallCapabilities};
 
 pub struct NetlinkBackend {
@@ -86,18 +86,7 @@ impl NetlinkBackend {
 
             for rule in rs.chain(kind) {
                 for matches in Self::expand_port_sets(&rule.matches) {
-                    let mut nf = NfRule::new(&chain).map_err(Self::err)?;
-                    for m in &matches {
-                        nf = Self::apply_match(nf, m)?;
-                    }
-                    for action in &rule.actions {
-                        nf = Self::apply_action(nf, action)?;
-                    }
-                    nf = match rule.verdict {
-                        Verdict::Accept => nf.accept(),
-                        Verdict::Drop => nf.drop(),
-                    };
-                    nf.add_to_batch(&mut batch);
+                    Self::filter_rule(&chain, &matches, rule)?.add_to_batch(&mut batch);
                 }
             }
         }
@@ -122,17 +111,39 @@ impl NetlinkBackend {
                 // filtering verdict, it rewrites or lets through.
                 .add_to_batch(&mut batch);
 
-            for out_iface in &rs.masquerade_out {
-                NfRule::new(&chain)
-                    .map_err(Self::err)?
-                    .oiface(out_iface)
-                    .map_err(Self::err)?
-                    .with_expr(Masquerade::default())
-                    .add_to_batch(&mut batch);
+            for rule in rs.masquerade_rules() {
+                Self::masquerade_rule(&chain, &rule)?.add_to_batch(&mut batch);
             }
         }
 
         Ok(batch)
+    }
+
+    /// Translates one port-expanded match set of `rule` into a filter rule.
+    fn filter_rule(chain: &Chain, matches: &[Match], rule: &Rule) -> Result<NfRule> {
+        let mut nf = NfRule::new(chain).map_err(Self::err)?;
+        for m in matches {
+            nf = Self::apply_match(nf, m)?;
+        }
+        for action in &rule.actions {
+            nf = Self::apply_action(nf, action)?;
+        }
+        Ok(match rule.verdict {
+            Verdict::Accept => nf.accept(),
+            Verdict::Drop => nf.drop(),
+        })
+    }
+
+    /// Translates a masquerade rule: its matches — the IPv4 guard first —
+    /// then the `masquerade` statement. The matches go through the same
+    /// [`Self::apply_match`] as the filter rules, so the guard applied is the
+    /// one [`MasqueradeRule`]'s display shows.
+    fn masquerade_rule(chain: &Chain, rule: &MasqueradeRule) -> Result<NfRule> {
+        let mut nf = NfRule::new(chain).map_err(Self::err)?;
+        for m in rule.matches() {
+            nf = Self::apply_match(nf, m)?;
+        }
+        Ok(nf.with_expr(Masquerade::default()))
     }
 
     fn commit(&self, policy: &FirewallPolicy, state: TunnelState) -> Result<()> {
@@ -188,13 +199,109 @@ impl FirewallBackend for NetlinkBackend {
 mod tests {
     use std::num::{NonZeroU32, NonZeroU64};
 
+    use aether::PolicyMode;
+    use rustables::expr::{Cmp, CmpOp, Meta, MetaType, RawExpression};
+
     use super::*;
     use crate::ruleset::{
-        Action, AddressFamily, Counter, LogAction, Match, RateLimit, RateLimitMode, RateUnit, L4,
+        Action, AddressFamily, Counter, LogAction, RateLimit, RateLimitMode, RateUnit, L4,
     };
 
     fn network(value: &str) -> ipnetwork::IpNetwork {
         value.parse().expect("valid test network")
+    }
+
+    /// Road-warrior egress open on two uplinks.
+    fn client_internet_policy() -> FirewallPolicy {
+        FirewallPolicy {
+            wan_ifaces: vec!["enp3s0".into(), "wlo1".into()],
+            lan_ifaces: vec!["eth1".into()],
+            wg_peers: vec![],
+            wg_listen_port: Some(51820),
+            key_negotiation_port: None,
+            mode: PolicyMode::FailClosed,
+            allow_ssh_from: vec![],
+            admin_ifaces: vec![],
+            allow_dhcp_on_wan: false,
+            allow_client_internet: true,
+            allow_tunnel_icmp: false,
+            allow_gateway_egress: false,
+            allow_ssh_over_tunnel: false,
+            iperf_port: None,
+            wg_iface: "helios0".into(),
+            admin_port: None,
+            admin_iface: None,
+            split_tunnel_cidrs: vec![],
+            mss_clamp: None,
+            captive_portal_gateway: None,
+            nordvpn_meshnet: None,
+        }
+    }
+
+    /// A chain of the table `build_batch` creates, for per-rule translation.
+    fn chain(name: &str) -> Chain {
+        Chain::new(&Table::new(ProtocolFamily::Inet).with_name(TABLE_NAME)).with_name(name)
+    }
+
+    fn expressions(rule: &NfRule) -> Vec<RawExpression> {
+        rule.get_expressions()
+            .map(|list| list.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// `meta nfproto ipv4`, exactly as `rustables` emits it ahead of an IPv4
+    /// address in `Rule::match_ip`.
+    fn ipv4_guard() -> [RawExpression; 2] {
+        [
+            RawExpression::from(Meta::new(MetaType::NfProto)),
+            RawExpression::from(Cmp::new(CmpOp::Eq, [2u8])),
+        ]
+    }
+
+    /// In an `inet` NAT chain, a masquerade on `oifname` alone would NAT66
+    /// the first IPv6 packet relayed to a WAN. Each uplink's rule must carry
+    /// the IPv4 guard before the interface match and the rewrite.
+    #[test]
+    fn the_masquerade_rewrites_ipv4_only_on_every_uplink() {
+        let rs = render(&client_internet_policy(), TunnelState::Up).expect("valid test policy");
+        assert!(NetlinkBackend::new().build_batch(&rs).is_ok());
+
+        let postrouting = chain("postrouting");
+        let rules: Vec<MasqueradeRule> = rs.masquerade_rules().collect();
+        assert_eq!(rules.len(), 2, "one masquerade per uplink");
+        for (rule, uplink) in rules.iter().zip(["enp3s0", "wlo1"]) {
+            let nf = NetlinkBackend::masquerade_rule(&postrouting, rule)
+                .expect("a masquerade rule translates");
+            let oifname = expressions(
+                &NfRule::default()
+                    .oiface(uplink)
+                    .expect("valid interface name"),
+            );
+
+            let mut expected = ipv4_guard().to_vec();
+            expected.extend(oifname);
+            expected.push(RawExpression::from(Masquerade::default()));
+            assert_eq!(expressions(&nf), expected, "masquerade on {uplink}");
+        }
+    }
+
+    /// The forward opening that feeds the masquerade relays IPv4 only: the
+    /// guard is translated ahead of the interface matches.
+    #[test]
+    fn the_client_internet_forward_rule_carries_the_ipv4_guard() {
+        let rs = render(&client_internet_policy(), TunnelState::Up).expect("valid test policy");
+        let forward = chain(ChainKind::Forward.as_str());
+
+        let egress: Vec<&Rule> = rs
+            .chain(ChainKind::Forward)
+            .filter(|rule| rule.matches.contains(&Match::InIface("helios0".into())))
+            .collect();
+        assert_eq!(egress.len(), 2, "one client egress rule per uplink");
+        for rule in egress {
+            let nf = NetlinkBackend::filter_rule(&forward, &rule.matches, rule)
+                .expect("the egress rule translates");
+            assert_eq!(expressions(&nf)[..2], ipv4_guard(), "{rule}");
+        }
     }
 
     #[test]

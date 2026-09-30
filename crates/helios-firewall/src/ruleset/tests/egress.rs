@@ -255,7 +255,7 @@ fn client_internet_egress_follows_tunnel_state_exactly() {
     assert!(
         text(&up, ChainKind::Forward)
             .iter()
-            .any(|r| r == "iifname \"helios0\" oifname \"eth0\" accept"),
+            .any(|r| r == "meta nfproto ipv4 iifname \"helios0\" oifname \"eth0\" accept"),
         "client forward rule missing in the Up state: {:?}",
         text(&up, ChainKind::Forward)
     );
@@ -288,10 +288,14 @@ fn client_internet_egress_does_not_open_lan_to_clients() {
     p.allow_client_internet = true;
     let rs = render(&p, TunnelState::Up);
 
+    // Asserted on the structured matches rather than on a text prefix: the
+    // egress rule now opens with its family guard, and a prefix check would
+    // pass vacuously.
     assert!(
-        !text(&rs, ChainKind::Forward)
-            .iter()
-            .any(|r| r.starts_with("iifname \"helios0\" oifname \"eth1\"")),
+        !rs.chain(ChainKind::Forward).any(|rule| {
+            rule.matches.contains(&Match::InIface("helios0".into()))
+                && rule.matches.contains(&Match::OutIface("eth1".into()))
+        }),
         "a client must not reach the gateway's LAN"
     );
 }
