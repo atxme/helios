@@ -6,6 +6,9 @@ set -euo pipefail
 
 SCRIPTS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPTS/.."
+# shellcheck source=scripts/cargo-budget.sh
+source scripts/cargo-budget.sh
+helios_budget_enter "$PWD"
 
 URL="${HELIOS_URL:-http://100.64.0.1:8080}"
 EPOCH_DIR="$HOME/.helios/publisher-epoch-1"
@@ -79,7 +82,7 @@ fi
 
 OUTPUT_DIR="target/app-release"
 MANIFEST="$OUTPUT_DIR/heliosd-$SEQUENCE.release.json"
-BINARY="target/$TARGET/release/heliosd"
+BINARY="${CARGO_TARGET_DIR:-target}/$TARGET/release/heliosd"
 mkdir -p "$OUTPUT_DIR"
 
 echo "==> Build heliosd $VERSION ($TARGET)"

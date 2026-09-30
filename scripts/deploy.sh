@@ -27,6 +27,9 @@ set -euo pipefail
 # directory » qui ne se produisait que depuis ce répertoire-là.
 SCRIPTS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPTS/.."
+# shellcheck source=scripts/cargo-budget.sh
+source scripts/cargo-budget.sh
+helios_budget_enter "$PWD"
 
 # Un seul mot de passe sudo pour tout le déploiement, et l'adresse de la
 # gateway : voir lib-remote.sh.

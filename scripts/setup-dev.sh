@@ -133,6 +133,9 @@ fi
 
 # ── 6. Dépendances npm verrouillées ──────────────────────────────────────────
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=scripts/cargo-budget.sh
+source "$REPO_ROOT/scripts/cargo-budget.sh"
+helios_budget_enter "$REPO_ROOT"
 for app in web apps/orion; do
     info "Installation npm verrouillée ($app)..."
     npm ci --silent --prefix "$REPO_ROOT/$app"
@@ -143,7 +146,7 @@ success "node_modules Helios et Orion OK"
 if $BUILD_MODE; then
     info "Compilation de heliosd (dry-run, sans features noyau)..."
     cargo build -p heliosd 2>&1 | tail -5
-    success "heliosd OK → target/debug/heliosd"
+    success "heliosd OK → ${CARGO_TARGET_DIR:-target}/debug/heliosd"
 
     info "Build du frontend gateway (web)..."
     npm run build --prefix "$REPO_ROOT/web" 2>&1 | tail -8
@@ -162,7 +165,7 @@ if $BUILD_MODE; then
     if pkg-config --exists webkit2gtk-4.1 2>/dev/null; then
         info "Compilation du shell Tauri orion..."
         cargo build -p orion 2>&1 | tail -5
-        success "orion OK → target/debug/orion"
+        success "orion OK → ${CARGO_TARGET_DIR:-target}/debug/orion"
     else
         warn "webkit2gtk-4.1 absent → shell Tauri non compilé (cargo build -p orion sauté)."
     fi

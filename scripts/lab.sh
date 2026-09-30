@@ -18,6 +18,9 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+# shellcheck source=scripts/cargo-budget.sh
+source scripts/cargo-budget.sh
+helios_budget_enter "$PWD"
 
 URL="http://127.0.0.1:8080"
 ENDPOINT="127.0.0.1:51820"

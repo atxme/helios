@@ -28,6 +28,9 @@ set -euo pipefail
 . "$(dirname "$0")/lib-remote.sh"
 
 cd "$(dirname "$0")/.."
+# shellcheck source=scripts/cargo-budget.sh
+source scripts/cargo-budget.sh
+helios_budget_enter "$PWD"
 
 # La CA opérateur vit HORS du dépôt : c'est une clé privée, elle n'a rien à
 # faire dans un arbre versionné où un `git add -A` finirait par l'attraper.

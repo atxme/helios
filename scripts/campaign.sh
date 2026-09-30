@@ -19,6 +19,9 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+# shellcheck source=scripts/cargo-budget.sh
+source scripts/cargo-budget.sh
+helios_budget_enter "$PWD"
 
 TMP="$(mktemp -d)"
 DAEMON_PID=""
@@ -65,7 +68,7 @@ fi
 ARTIFACTS="$TMP/artifacts"
 mkdir -p "$ARTIFACTS"
 for binaire in heliosd helios-ctl helios-installer; do
-    cp "target/debug/$binaire" "$ARTIFACTS/$binaire"
+    cp "${CARGO_TARGET_DIR:-target}/debug/$binaire" "$ARTIFACTS/$binaire"
     strip "$ARTIFACTS/$binaire"
 done
 
