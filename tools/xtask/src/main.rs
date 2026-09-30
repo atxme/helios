@@ -363,7 +363,7 @@ fn bundle(target: Option<String>, skip_frontend: bool, output: Option<PathBuf>) 
     std::fs::create_dir_all(staging.join("systemd"))
         .with_context(|| format!("creating {}", staging.display()))?;
 
-    let built = root.join("target").join(&target).join("release");
+    let built = cargo_target_dir(&root).join(&target).join("release");
     copy_executable(&heliosd, &staging.join("heliosd"))?;
     for binary in BINARIES
         .iter()
@@ -433,8 +433,7 @@ fn build_gateway(root: &Path, target: &str, skip_frontend: bool) -> Result<PathB
             GATEWAY_FEATURES,
         ],
     )?;
-    Ok(root
-        .join("target")
+    Ok(cargo_target_dir(root)
         .join(target)
         .join("release")
         .join("heliosd"))
@@ -594,6 +593,24 @@ fn workspace_root() -> Result<PathBuf> {
         .context("workspace root not found")
 }
 
+/// Where the Cargo builds this tool launches write their output.
+///
+/// `CARGO_TARGET_DIR` when set, the workspace's `target/` otherwise. The WSL
+/// build scripts pin it to the single bounded cache, and reading binaries
+/// from `target/` then would find nothing, or a stale build.
+fn cargo_target_dir(root: &Path) -> PathBuf {
+    cargo_target_dir_from(root, std::env::var_os("CARGO_TARGET_DIR"))
+}
+
+/// Resolves a configured target directory as Cargo does for the builds run
+/// from `root`: a relative path is relative to that directory.
+fn cargo_target_dir_from(root: &Path, configured: Option<std::ffi::OsString>) -> PathBuf {
+    match configured {
+        Some(directory) if !directory.is_empty() => root.join(directory),
+        _ => root.join("target"),
+    }
+}
+
 /// The version the bundle is labeled with, read from the `heliosd` crate.
 ///
 /// It must be the daemon's own version, not the workspace's. `heliosd` does
@@ -660,6 +677,30 @@ mod tests {
         let host = host_target().expect("host triple");
         assert!(host.contains('-'), "unexpected triple: {host}");
         assert_eq!(host, helios_update::BUILD_TARGET);
+    }
+
+    /// The bundle reads the binaries where Cargo wrote them. Before this,
+    /// a build pinned to the shared WSL cache left `target/` empty and the
+    /// bundle failed on a missing `heliosd`, after the whole release build.
+    #[test]
+    fn built_binaries_are_read_from_the_configured_target_directory() {
+        let root = Path::new("/work/helios");
+        assert_eq!(
+            cargo_target_dir_from(root, None),
+            Path::new("/work/helios/target")
+        );
+        assert_eq!(
+            cargo_target_dir_from(root, Some("".into())),
+            Path::new("/work/helios/target")
+        );
+        assert_eq!(
+            cargo_target_dir_from(root, Some("/cache/helios-target".into())),
+            Path::new("/cache/helios-target")
+        );
+        assert_eq!(
+            cargo_target_dir_from(root, Some("build/out".into())),
+            Path::new("/work/helios/build/out")
+        );
     }
 
     /// A bundle's name contains the version, hence dots: substituting the
