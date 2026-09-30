@@ -318,8 +318,17 @@ export interface ClientProfile {
   has_static_psk: boolean
   /** CGNAT VIP assigned by the gateway at enrollment (e.g. `100.64.1.2/32`). */
   address: string | null
-  /** Traffic routed into the tunnel. Defaults to `0.0.0.0/0`. */
+  /** Traffic routed into the tunnel. Defaults to `0.0.0.0/0, ::/0`. */
   allowed_ips: string
+  /**
+   * The stored list captures all of IPv4 and lets IPv6 out — the full
+   * tunnel as it was before `::/0` joined the default.
+   *
+   * Decided by `orion-core` (`ClientProfile::ipv6_uncaptured_full_tunnel`)
+   * for the **stored** list. The profile editor judges the list being typed
+   * with `splitTunnel.leavesIpv6Uncaptured`, which mirrors the same rule.
+   */
+  ipv6_uncaptured_full_tunnel: boolean
   /** Keepalive in seconds. Defaults to 25. */
   persistent_keepalive: number
   heliosd_url: string | null

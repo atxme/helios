@@ -159,6 +159,33 @@ fn the_view_reports_presence_and_the_public_half() {
     assert_eq!(view.public_key, None);
 }
 
+/// The IPv6 gap of an old full tunnel reaches the screen as the core's verdict.
+///
+/// And saving such a profile for an unrelated edit hands its list back
+/// untouched: the screen warns, the user decides, nothing widens it on the
+/// way through.
+#[test]
+fn the_view_flags_an_ipv4_only_full_tunnel_and_saving_keeps_it() {
+    let legacy = ClientProfile {
+        allowed_ips: "0.0.0.0/0".into(),
+        ..profile("poste")
+    };
+    assert!(ProfileView::from(&legacy).ipv6_uncaptured_full_tunnel);
+    assert!(!ProfileView::from(&profile("poste")).ipv6_uncaptured_full_tunnel);
+    let split = ClientProfile {
+        allowed_ips: "100.64.0.1/32, 10.0.0.0/8".into(),
+        ..profile("poste")
+    };
+    assert!(!ProfileView::from(&split).ipv6_uncaptured_full_tunnel);
+
+    let mut edit = draft("poste");
+    edit.endpoint = "198.51.100.7:51820".into();
+    edit.allowed_ips = ProfileView::from(&legacy).allowed_ips;
+    let merged = edit.merge(Some(&legacy), None, None).expect("merge");
+    assert_eq!(merged.allowed_ips, "0.0.0.0/0");
+    assert!(merged.ipv6_uncaptured_full_tunnel());
+}
+
 /// A draft that never carried the secret must not erase it on save.
 ///
 /// This is what makes the redaction usable rather than merely safe: the
