@@ -9,21 +9,24 @@
 //! # The one rule that shapes this module
 //!
 //! An ordinary client renewal must not open the vault (spec §14.1, ADR-008
-//! §4). That is enforced here by a type rather than by a convention:
-//! [`approve_renewal`] takes no [`AuthorityVault`] at all, and the
-//! authenticator method it calls — [`Authenticator::approve`] — is handed no
-//! salt, so there is no `hmac-secret` output for it to obtain and no key-slot
-//! for it to unwrap. A future edit that wanted to open the vault there would
-//! have to change both signatures, which is the point.
+//! §4). That is enforced by a type rather than by a convention:
+//! [`approve_renewal`](aether_fido::approve_renewal) takes no
+//! [`AuthorityVault`] at all, and the authenticator method it calls —
+//! [`Authenticator::approve`] — is handed no salt, so there is no
+//! `hmac-secret` output for it to obtain and no key-slot for it to unwrap. A
+//! future edit that wanted to open the vault there would have to change both
+//! signatures, which is the point. The function lives in `aether-fido`, a crate
+//! that does not depend on the vault and could not even name it.
 //!
 //! Everything else in this module does the opposite, and says so by taking an
-//! [`Opened`]: issuing `CA-TLS`, signing a delegation, signing credential
+//! [`Opened`](crate::authenticator::Opened): issuing `CA-TLS`, signing a delegation, signing credential
 //! bindings, rotating the anchor. Those hold private keys in memory for the
 //! length of one operation and drop them.
 //!
 //! # What a security key signs here
 //!
-//! Nothing this protocol keeps. [`approve_renewal`] and [`approve_campaign`]
+//! Nothing this protocol keeps. [`approve_renewal`](aether_fido::approve_renewal)
+//! and [`approve_campaign`]
 //! obtain a WebAuthn assertion, and that assertion **authorizes** — it names
 //! the exact request or campaign an operator agreed to, and travels beside the
 //! ML-DSA-87 objects rather than inside them. A YubiKey 5 holds RSA, P-256 and
@@ -48,7 +51,7 @@
 //! # Limite connue : `AstraRenewalApproval` sort sans la signature de service
 //!
 //! Le compagnon ne détient pas la clé de service Astra, et ne doit pas la
-//! détenir : elle est en ligne, l'ancre ne l'est pas. [`approve_renewal`] rend
+//! détenir : elle est en ligne, l'ancre ne l'est pas. [`approve_renewal`](aether_fido::approve_renewal) rend
 //! donc l'objet complet avec un `astra_signature` de remplissage, qu'Astra
 //! remplace par la sienne au moment de le persister. Tout le reste de l'objet
 //! — l'assertion, le binding, les quatre empreintes — est produit et

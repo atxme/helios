@@ -34,7 +34,7 @@
 //!   automatically by every gesture that moves that table.
 //! - `approve` approves one exact client renewal, from files or straight
 //!   through the client's tunnel. **It does not open the vault**, and cannot:
-//!   see [`astra_operator::authority::approve_renewal`].
+//!   see [`aether_fido::approve_renewal`].
 //! - `approve-campaign` approves a manual rotation campaign, at as many
 //!   distinct keys as its scope demands.
 //! - `issue-gateway-bootstrap` verifies the public request of a new gateway
