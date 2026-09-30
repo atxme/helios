@@ -1,0 +1,337 @@
+# Spécification — modèle d'adressage IPv6 du tunnel
+
+**Statut** : proposée le 30 septembre 2026, **non implémentée**. Elle fixe
+les décisions d'adressage que l'étude
+[ETUDE-IPV6.md](../architecture/ETUDE-IPV6.md) laissait ouvertes (ticket T00).
+Les tickets T07 et T10 à T14 de l'étude l'appliquent ; aucun ne doit trancher
+autrement un point décidé ici.
+
+Elle ne traite pas la sortie Internet IPv6 des clients (spécification B,
+ticket T21). Tant que cette spécification B n'existe pas, **aucun paquet IPv6
+n'est relayé** entre `wg_iface` et un WAN.
+
+Le vocabulaire normatif est « doit », « ne doit pas », « peut ». Les
+identifiants de code sont en anglais ; les noms de types sont des cibles, pas
+des symboles existants.
+
+## 1. Périmètre
+
+Couvert :
+
+- l'adresse IPv6 de la gateway dans le tunnel et celle de chaque pair ;
+- la génération et la stabilité du préfixe tunnel ;
+- la dérivation déterministe de l'adresse d'un pair ;
+- le format de persistance (`network.toml`), de provisioning et de profil ;
+- la projection vers WireGuard, le routage VIP et le firewall ;
+- le rôle de l'adresse IPv6 dans l'identité.
+
+Hors périmètre :
+
+- la sortie Internet IPv6 (spécification B) ;
+- l'adressage IPv6 du LAN (RA, DHCPv6, délégation de préfixe) : Helios
+  n'adresse pas non plus le LAN en IPv4 ;
+- un préfixe global (GUA) dans le tunnel : il relève de la spécification B ;
+- un tunnel sans adresse IPv4 (§2.7).
+
+## 2. Décisions
+
+### 2.1 L'IPv4 reste obligatoire et inchangée
+
+Chaque pair a exactement un VIP IPv4 `/32` dans `100.64.0.0/10`, attribué par
+l'IPAM CGNAT existant (`helios_provisioning::ipam`). Cette spécification ne
+change ni la dérivation, ni la validation, ni le routage de ce VIP.
+
+### 2.2 L'IPv6 est optionnelle, par gateway puis par pair
+
+- Une gateway sans `wg_address_v6` se comporte **exactement** comme
+  aujourd'hui : aucun pair n'a de VIP IPv6, et rien de nouveau n'apparaît dans
+  les fichiers, les profils, les routes ni le ruleset.
+- Une gateway avec `wg_address_v6` attribue un VIP IPv6 à chaque pair admis
+  ensuite, et à chaque pair existant qui en reçoit un par réadmission ou par
+  déclaration de l'opérateur (§5.3).
+
+### 2.3 Un pair a au plus une adresse IPv6, en `/128`
+
+Jamais un `/64` ni un préfixe plus large par pair. Un pair libre de choisir son
+adresse dans un préfixe pourrait émettre depuis plusieurs sources (adresses
+temporaires RFC 8981), ce qui rendrait ambiguë toute association « adresse
+source → pair ».
+
+### 2.4 Le préfixe tunnel est un ULA `/64`
+
+- Forme : `fdXX:XXXX:XXXX:0000::/64` — préfixe ULA `fd00::/8` (bit L = 1,
+  RFC 4193), Global ID de 40 bits, Subnet ID `0000`.
+- Adresse de la gateway : `<préfixe>::1`, donc `wg_address_v6 =
+  "fdXX:XXXX:XXXX::1/64"`.
+- Tout autre préfixe est refusé en v1 : un préfixe `fc00::/8` (L = 0, non
+  défini), un GUA, un préfixe autre que `/64`, une adresse gateway autre que
+  `::1`.
+
+Le choix d'un ULA suit celui du CGNAT pour l'IPv4 : un espace privé, stable, que
+la gateway attribue seule. Avec une source ULA, la table de politique RFC 6724
+fait préférer l'IPv4 aux clients dual-stack pour les destinations globales, ce
+qui garde le comportement actuel du trafic Internet.
+
+### 2.5 Le préfixe est aléatoire, généré une fois, puis persisté
+
+- Le Global ID est tiré **une fois** par `aether::random::fill_public`, par une
+  commande opérateur explicite, et écrit dans `network.toml`. L'opérateur peut
+  aussi l'écrire à la main.
+- Il n'est **jamais** régénéré automatiquement, ni dérivé à chaque démarrage.
+- Il n'est **pas** dérivé de la clé WireGuard de la gateway : une rotation de
+  cette clé renumérotait sinon tous les pairs.
+
+Changer le préfixe est un acte opérateur. Il renumérote tous les VIP IPv6 et
+rend l'adresse IPv6 des profils déjà émis invalide. Le tunnel IPv4 de ces
+profils continue de fonctionner (§2.6).
+
+### 2.6 L'identité et le plan de contrôle restent en IPv4
+
+En v1 :
+
+- l'API d'administration, la release post-commit
+  (`POST /api/key-negotiation/release`), le provisioning in-tunnel
+  (`POST /api/provision`) et le speedtest écoutent sur le VIP IPv4 de la
+  gateway seulement ;
+- la résolution de l'appelant (`helios_api::auth`) ne s'appuie que sur le VIP
+  IPv4 ; le VIP IPv6 n'est **pas** une source d'identité ;
+- `heliosd_url` reste une URL IPv4.
+
+Conséquence voulue : aucun invariant d'autorisation ne change. Ouvrir l'API en
+IPv6 serait une évolution distincte, avec sa propre spécification.
+
+Indépendamment de cette spécification, `auth` doit comparer des `IpAddr`
+typées et canonicalisées (`to_canonical()`), et non des chaînes (ticket T08).
+
+### 2.7 « IPv6-only » désigne le transport, pas le tunnel
+
+- **Transport** : l'endpoint UDP (WireGuard et négociation) peut être IPv6. Ce
+  point ne dépend pas du préfixe tunnel et n'est pas contraint ici.
+- **Tunnel** : un pair a toujours son VIP IPv4. Un tunnel qui ne porterait que
+  de l'IPv6 n'est pas une cible, puisque le plan de contrôle est en IPv4
+  (§2.6).
+
+## 3. Dérivation du VIP IPv6 d'un pair
+
+### 3.1 Formule
+
+```text
+IID(pubkey, n) = BLAKE3("helios-ipam-v6-v1" || pubkey || n_le32)[0..8]
+VIP6           = préfixe_gateway | IID          (64 bits bas)
+```
+
+- `pubkey` : les 32 octets bruts de la clé publique WireGuard du pair, comme
+  pour l'IPv4.
+- `n` : compteur de sondage, `u32` little-endian, en partant de 0.
+- Le séparateur de domaine est obligatoire : l'IPv4 dérive
+  `BLAKE3(pubkey || n)` sans séparateur, et les deux dérivations ne doivent pas
+  partager leur entrée.
+- La chaîne `helios-ipam-v6-v1` est figée : la changer renumérote tous les
+  pairs.
+
+### 3.2 Identifiants exclus
+
+Un candidat est rejeté, et le compteur incrémenté, si son IID est :
+
+- `0` (anycast Subnet-Router, RFC 4291) ;
+- `1` (la gateway) ;
+- `≥ 0xfdff_ffff_ffff_ff80` (anycast réservés, RFC 5453).
+
+### 3.3 Collisions
+
+- Même borne que l'IPv4 : `MAX_VIP_PROBES` (64). Au-delà : `IpamError::Exhausted`.
+- La table de collision est l'union de la table WireGuard vivante et des
+  adresses déclarées dans `network.toml`, comme pour l'IPv4.
+- Les compteurs IPv4 et IPv6 sont **indépendants** : une collision IPv4
+  n'avance pas le compteur IPv6.
+
+Sur 2^64 identifiants, une collision est un garde-fou, pas un cas nominal.
+
+## 4. Types canoniques
+
+Dans un module `aether::net` (ticket T07). `ipnetwork` est déjà au
+`Cargo.lock` via `helios-firewall` ; aucune nouvelle crate.
+
+```rust
+/// Tunnel prefix of the gateway: an ULA /64 whose host ::1 is the gateway.
+/// Construction refuses anything else (§2.4).
+pub struct TunnelPrefixV6(Ipv6Addr);
+
+/// Every address a peer owns inside the tunnel. Two fields rather than a
+/// list: "no v4" and "two v6" cannot be written.
+pub struct PeerVips {
+    pub v4: Ipv4Addr,
+    pub v6: Option<Ipv6Addr>,
+}
+```
+
+Ces types exposent le rendu texte actuel (`100.64.1.2/32`, `fd…/128`) pour que
+la persistance reste compatible. Le domaine ne manipule plus d'adresse en
+`String` une fois le fichier lu.
+
+## 5. Persistance
+
+### 5.1 `network.toml`
+
+```toml
+wg_address    = "100.64.0.1/10"            # inchangé, obligatoire
+wg_address_v6 = "fd3c:91a2:7e04::1/64"     # nouveau, optionnel
+
+[[peers]]
+name       = "laptop"
+address    = "100.64.98.223/32"            # inchangé, obligatoire
+address_v6 = "fd3c:91a2:7e04:0:8a1f:3b2c:9d40:e517/128"   # nouveau, optionnel
+```
+
+- Clés **séparées**, pas de liste : la clé `address` garde sa forme actuelle,
+  sur le modèle de `wan_iface`.
+- `PersistedNetworkConfig` n'écrit `wg_address_v6` et `address_v6` que s'ils
+  sont présents. Un fichier sans IPv6 doit être relu puis réécrit **à
+  l'identique, octet pour octet**.
+- La vue API redigée (`GET /api/network`) expose `wg_address_v6` et
+  `address_v6` ; elles ne sont pas secrètes. La règle « ne jamais reconstruire
+  `network.toml` depuis cette vue » s'applique inchangée.
+
+### 5.2 Validation (`NetworkConfig::validate`)
+
+Refusé, avec une erreur nommée :
+
+- `wg_address_v6` hors des règles du §2.4 ;
+- `address_v6` présent alors que `wg_address_v6` est absent ;
+- `address_v6` qui n'est pas un `/128` ;
+- `address_v6` hors du préfixe de la gateway, ou égal à `::1` ;
+- `address_v6` présent en double ;
+- un IID exclu par le §3.2.
+
+L'unicité IPv4 existante (`validate_peer_identities`) reste inchangée.
+
+### 5.3 Adresse déclarée et adresse dérivée
+
+Comme pour l'IPv4 (`heliosd/src/orchestrator/data_plane.rs`, installation de
+PSK), l'adresse **déclarée** fait foi : si elle diffère de la dérivée, elle est
+conservée et l'écart est journalisé. Changer l'`AllowedIPs` d'une session
+vivante couperait le trafic.
+
+Un pair existant sans `address_v6` n'en reçoit pas en silence au démarrage :
+l'attribution passe par l'admission (`helios_provisioning::admission`), par la
+réadmission, ou par une déclaration explicite.
+
+### 5.4 Rechargement à chaud
+
+- `address_v6` d'un pair : rechargé à chaud, par le chemin d'adoption existant
+  (`NetworkConfig::adopt_runtime_secrets_from`), comme la table des pairs.
+- `wg_address_v6` : exige un redémarrage, comme les autres paramètres que le
+  plan de données ne peut pas changer en marche.
+
+## 6. Projection vers le plan de données
+
+### 6.1 WireGuard
+
+- Interface gateway : `[wg_address, wg_address_v6?]`.
+- `AllowedIPs` d'un pair côté gateway : **exactement** `{v4/32}` plus
+  `{v6/128}` s'il existe. Aucun autre préfixe n'est ajouté par cette
+  spécification. La cryptokey routing assure ainsi le contrôle de source sur
+  `wg_iface` pour les deux familles.
+
+### 6.2 Conditions d'installation de l'IPv6
+
+L'adresse IPv6 de l'interface n'est pas posée, et la gateway démarre en IPv4
+seule dans un état **dégradé visible**, si :
+
+- `tunnel_mtu(...) < 1280` (minimum IPv6, RFC 8200) ;
+- le noyau refuse l'adresse (par exemple `disable_ipv6 = 1`).
+
+L'échec porte une erreur typée et nommée. Il est journalisé, diffusé comme
+événement, et exposé par l'API et le CLI. Ce n'est pas une ouverture : les
+clients qui capturent `::/0` voient leur IPv6 jetée par WireGuard, comme sans
+VIP IPv6.
+
+### 6.3 Routage VIP
+
+`heliosd::vip_routing` applique à l'IPv6 le même plan qu'à l'IPv4 :
+
+- une route `/128` par pair dans la table `51820`, `dev <wg_iface> src
+  <préfixe>::1` ;
+- une règle `to <préfixe>/64 lookup 51820 priority 32000`, en famille IPv6 ;
+- purge et retrait par famille : `ip -4` et `ip -6` sont distincts.
+
+### 6.4 Firewall
+
+Cette spécification n'ajoute aucune ouverture. En particulier :
+
+- le `forward` de `wg_iface` vers un WAN reste **IPv4 seulement** ;
+- le masquerade reste `meta nfproto ipv4` (ticket T04) ;
+- l'ICMPv6 sur `wg_iface` suit `allow_tunnel_icmp`, comme aujourd'hui.
+
+Entre pairs, le trafic IPv6 obéit aux mêmes règles que l'IPv4 : le `forward`
+de `wg_iface` vers `wg_iface` n'est pas ouvert aujourd'hui, et cette
+spécification ne l'ouvre pas.
+
+## 7. Provisioning et profil
+
+### 7.1 `ProvisionResponse`
+
+Nouveau champ `assigned_address_v6: Option<String>`, avec `serde(default)` et
+omis quand il est absent. `ProvisionResponse` n'est pas
+`deny_unknown_fields` : un Orion antérieur l'ignore. Aucun changement de
+`PROTOCOL_VERSION`.
+
+### 7.2 Document `orion-profile`
+
+- Nouveau champ `address_v6`, optionnel.
+- Le document est `deny_unknown_fields` : un Orion antérieur **refuse** un
+  profil qui porte ce champ. C'est un refus explicite, pas une ouverture.
+- `helios-ctl` n'émet `address_v6` que si le pair en a un. Un profil émis par
+  une gateway sans IPv6 reste lisible par tous les Orion.
+- Le message de refus d'un Orion antérieur est hors de notre contrôle ; la
+  documentation opérateur indique la version d'Orion minimale.
+
+### 7.3 Orion
+
+- L'adaptateur porte les deux adresses.
+- `AllowedIPs` n'est pas défini par cette spécification : la capture de
+  `::/0` relève du ticket T01, qui s'applique avec ou sans VIP IPv6.
+
+## 8. Compatibilité
+
+| Situation | Comportement attendu |
+| --- | --- |
+| `network.toml` existant, sans IPv6 | inchangé, réécrit à l'identique |
+| Gateway IPv6, Orion antérieur, profil sans `address_v6` | IPv4 seule, fonctionne |
+| Gateway IPv6, Orion antérieur, profil avec `address_v6` | profil refusé à l'import |
+| Gateway sans IPv6, Orion récent | IPv4 seule, aucun champ v6 |
+| Préfixe changé par l'opérateur | IPv4 intacte ; IPv6 des anciens profils hors préfixe, donc jetée par WireGuard |
+| Pair ancien, sans `address_v6`, sur gateway IPv6 | IPv4 seule jusqu'à réadmission ou déclaration |
+
+## 9. Critères d'acceptation
+
+Les implémentations des tickets T07 et T10 à T14 doivent au minimum démontrer :
+
+1. le round-trip octet pour octet de `config/network.toml` et d'un fichier de
+   production sans IPv6 ;
+2. le refus de chaque cas du §5.2, avec un message qui nomme le champ ;
+3. la dérivation déterministe : même clé → même VIP IPv6, sur deux instances et
+   après redémarrage ;
+4. l'indépendance des dérivations IPv4 et IPv6 (séparateur de domaine) ;
+5. les exclusions du §3.2 et la borne `MAX_VIP_PROBES` ;
+6. un ruleset **identique** à celui d'aujourd'hui quand `wg_address_v6` est
+   absent (golden tests inchangés) ;
+7. des `AllowedIPs` gateway égaux exactement à `{v4/32, v6/128}` ;
+8. le démarrage dégradé visible du §6.2 ;
+9. l'absence de changement dans `helios_api::auth` hors canonicalisation.
+
+Sur cible, en plus : ajout de l'adresse sur `helios0`, routes et règle de la
+table `51820` en IPv6, `ping -6` gateway ↔ pair avec `allow_tunnel_icmp`.
+
+## 10. Correspondance avec l'étude
+
+| Ticket | Sections applicables |
+| --- | --- |
+| T07 `aether::net` | §4 |
+| T10 configuration `_v6` | §5 |
+| T11 IPAM IPv6 | §3 |
+| T12 WireGuard multi-adresses | §6.1, §6.2 |
+| T13 `vip_routing` IPv6 | §6.3 |
+| T14 admission et provisioning | §5.3, §7.1 |
+| T16 auth API | §2.6 : canonicalisation seulement en v1 |
+| T19 Orion dual-stack | §7.2, §7.3 |

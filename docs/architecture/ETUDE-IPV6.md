@@ -841,6 +841,7 @@ cible.
 **T16 — Auth API v6**
 - Fichiers : `crates/helios-api/src/auth.rs`, `routes.rs` (vue redigée).
 - Dépend : T08, T10.
+- Portée réduite par la [spécification A](../specification/ADRESSAGE-IPV6.md) §2.6 : en v1, l'identité reste le VIP IPv4 ; le ticket se limite à exposer `address_v6` dans la vue redigée et à vérifier qu'une source IPv6 n'est jamais un appelant.
 - Tests : §12. Risque : élevé (autorisation). Acceptation : tests de sécurité `security_tests.rs` étendus.
 
 **T17 — Négociation sur IPv6**

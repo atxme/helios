@@ -64,6 +64,8 @@ foi en cas de doute (voir [AGENTS.md](../AGENTS.md)).
   avec ses lots encore ouverts.
 - [Rotation des certificats](specification/ROTATION-CERTIFICATS.md) — cycle de
   vie cible des certificats TLS/PQ.
+- [Adressage IPv6](specification/ADRESSAGE-IPV6.md) — modèle d'adressage
+  IPv6 du tunnel (ULA `/64`, VIP `/128`), proposé, non implémenté.
 
 ## Sécurité
 
