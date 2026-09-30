@@ -219,6 +219,14 @@ pub enum Match {
     Icmp(AddressFamily),
     /// Packet mark assigned by a privileged local networking service.
     PacketMark(u32),
+    /// `meta nfproto ipv4` or `meta nfproto ipv6`.
+    ///
+    /// The table is `inet`: a rule that names no address applies to both
+    /// families. Address matches already carry their own family guard, so
+    /// this match is for rules that must stay single-family without naming an
+    /// address — the tunnel clients' Internet egress first among them, which
+    /// relays IPv4 only.
+    Family(AddressFamily),
 }
 
 impl fmt::Display for Match {
@@ -255,6 +263,8 @@ impl fmt::Display for Match {
             Match::Icmp(AddressFamily::Ipv4) => write!(f, "meta l4proto icmp"),
             Match::Icmp(AddressFamily::Ipv6) => write!(f, "meta l4proto ipv6-icmp"),
             Match::PacketMark(mark) => write!(f, "meta mark {mark:#x}"),
+            Match::Family(AddressFamily::Ipv4) => write!(f, "meta nfproto ipv4"),
+            Match::Family(AddressFamily::Ipv6) => write!(f, "meta nfproto ipv6"),
         }
     }
 }
@@ -432,5 +442,17 @@ mod tests {
 
         assert_eq!(Match::SourceNet(ipv4).to_string(), "ip saddr 192.0.2.1/32");
         assert_eq!(Match::DestNet(ipv6).to_string(), "ip6 daddr 2001:db8::/32");
+    }
+
+    #[test]
+    fn family_matches_render_the_nfproto_guard() {
+        assert_eq!(
+            Match::Family(AddressFamily::Ipv4).to_string(),
+            "meta nfproto ipv4"
+        );
+        assert_eq!(
+            Match::Family(AddressFamily::Ipv6).to_string(),
+            "meta nfproto ipv6"
+        );
     }
 }
