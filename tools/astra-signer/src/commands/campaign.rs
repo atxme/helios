@@ -301,7 +301,7 @@ pub(crate) fn approve_campaign(
         keys.iter().map(|key| key.as_ref()).collect();
     let pin_refs: Vec<&str> = pins.iter().map(|pin| pin.as_str()).collect();
 
-    let approval = authority::approve_campaign(
+    let approval = signing::approve_campaign(
         &key_refs,
         &campaign,
         &registry,

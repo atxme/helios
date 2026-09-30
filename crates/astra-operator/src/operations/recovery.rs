@@ -32,7 +32,7 @@ use base64::Engine as _;
 
 use crate::authenticator::Authenticator;
 use crate::vault::AuthorityVault;
-use crate::{authority, credentials, gestures, handoff, origin, store};
+use crate::{credentials, gestures, handoff, origin, signing, store};
 
 const DAY_SECS: u64 = 86_400;
 
@@ -69,7 +69,7 @@ pub const WINDOW_BACKDATE_SECS: u64 = 300;
 /// it once they agree.
 pub struct Verified {
     vault: AuthorityVault,
-    identity: authority::DomainIdentity,
+    identity: signing::DomainIdentity,
     registry: credentials::CredentialRegistry,
     ca_tls_certificate: DerCertificate,
     client: origin::Origin,
@@ -216,7 +216,7 @@ impl Verified {
         pin: &str,
         progress: &mut dyn FnMut(RemoteState),
     ) -> Result<()> {
-        let produced = authority::recover_expired_identity(
+        let produced = signing::recover_expired_identity(
             &self.vault,
             key,
             pin,
@@ -266,7 +266,7 @@ impl Verified {
 
         progress(RemoteState::PendingGrant);
         let opening = gestures::open_with_authorized_key(key, &self.vault, pin)?;
-        let grant = authority::grant_recovered_identity(
+        let grant = signing::grant_recovered_identity(
             &self.vault,
             &opening,
             &authorization,

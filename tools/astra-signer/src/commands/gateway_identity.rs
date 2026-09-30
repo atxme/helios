@@ -96,11 +96,11 @@ pub(crate) fn issue_gateway_bootstrap(
     gestures::prove_anchors_open(&vault, &first.opened)?;
     gestures::prove_anchors_open(&vault, &second.opened)?;
 
-    let certificate = authority::issue_gateway_bootstrap_certificate(
+    let certificate = signing::issue_gateway_bootstrap_certificate(
         &vault,
         &first.opened,
         &ca_pq_public_key,
-        &authority::GatewayBootstrapDecision {
+        &signing::GatewayBootstrapDecision {
             request: &request,
             leaf_validity: (now.saturating_sub(300), validity),
             serial: random_id()?,
@@ -294,7 +294,7 @@ pub(crate) fn sign_gateway_transition(
     let key = authenticator::connect(transport)?;
     let pin = pin_for(key.as_ref(), "PIN de la clé de sécurité : ")?;
 
-    let approval = authority::approve_campaign(
+    let approval = signing::approve_campaign(
         &[key.as_ref()],
         &campaign,
         &registry,
@@ -306,7 +306,7 @@ pub(crate) fn sign_gateway_transition(
         now,
     )?;
     let opening = gestures::open_with_authorized_key(key.as_ref(), &vault, &pin)?;
-    let decision = authority::GatewayTransitionDecision {
+    let decision = signing::GatewayTransitionDecision {
         gateway_identity_epoch: epoch,
         gateway_wg_public_key: campaign.gateway_wg_public_key,
         server_name: campaign.server_name.clone(),
@@ -323,7 +323,7 @@ pub(crate) fn sign_gateway_transition(
         },
         serial: random_id()?,
     };
-    let transition = authority::sign_gateway_transition(
+    let transition = signing::sign_gateway_transition(
         &vault,
         &opening,
         &identity,
@@ -434,7 +434,7 @@ pub(crate) fn abort_gateway_transition(
     let key = authenticator::connect(transport)?;
     let pin = pin_for(key.as_ref(), "PIN de la clé de sécurité : ")?;
 
-    let approval = authority::approve_campaign(
+    let approval = signing::approve_campaign(
         &[key.as_ref()],
         &campaign,
         &registry,
@@ -446,12 +446,12 @@ pub(crate) fn abort_gateway_transition(
         now,
     )?;
     let opening = gestures::open_with_authorized_key(key.as_ref(), &vault, &pin)?;
-    let abort = authority::sign_gateway_abort(
+    let abort = signing::sign_gateway_abort(
         &vault,
         &opening,
         &identity,
         &ca_pq_public_key,
-        &authority::GatewayAbortDecision {
+        &signing::GatewayAbortDecision {
             transition: &transition,
             reason,
             campaign_fingerprint: campaign.fingerprint(),
@@ -594,7 +594,7 @@ pub(crate) fn sign_gateway_rollback(
     // The assertion attests the text above, not merely the vault: §7.6 binds a
     // rollback to a YubiKey campaign, and an unenrolled key is refused here
     // against the credential document `CA-PQ` signed.
-    let approval = authority::approve_campaign(
+    let approval = signing::approve_campaign(
         &[key.as_ref()],
         &campaign,
         &registry,
@@ -606,12 +606,12 @@ pub(crate) fn sign_gateway_rollback(
         now,
     )?;
     let opening = gestures::open_with_authorized_key(key.as_ref(), &vault, &pin)?;
-    let authorization = authority::sign_service_rollback(
+    let authorization = signing::sign_service_rollback(
         &vault,
         &opening,
         &identity,
         &ca_pq_public_key,
-        &authority::ServiceRollbackDecision {
+        &signing::ServiceRollbackDecision {
             transition: &transition,
             campaign_fingerprint: approval.campaign_fingerprint,
             expires_at,

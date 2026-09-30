@@ -109,7 +109,7 @@ pub(crate) fn rotate_ca_tls(
     let origin = origin
         .map(str::to_string)
         .unwrap_or_else(|| format!("https://{}", vault.rp_id));
-    let mut approval = authority::CampaignApprovalSession::new(
+    let mut approval = signing::CampaignApprovalSession::new(
         &campaign,
         &registry,
         &identity,
@@ -153,7 +153,7 @@ pub(crate) fn rotate_ca_tls(
     approval.accept_for(assertion, Some(&second.opened.credential_id), now_unix())?;
     let approval = approval.finish(now_unix())?;
 
-    let rotated = authority::rotate_ca_tls(
+    let rotated = signing::rotate_ca_tls(
         &mut vault,
         &first.opened,
         &identity,
@@ -315,7 +315,7 @@ pub(crate) fn promote_ca_tls(path: &Path, transport: Transport) -> Result<()> {
         "Brancher une clé autorisée, puis appuyer sur Entrée.",
     )?;
     let opening = gestures::open_with_authorized_key(opened.key.as_ref(), &vault, &opened.pin)?;
-    let advance = authority::advance_ca_tls(&mut vault, &opening, now)?;
+    let advance = signing::advance_ca_tls(&mut vault, &opening, now)?;
 
     match &advance {
         CaTlsAdvance::Idle => {

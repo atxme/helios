@@ -142,7 +142,7 @@ pub(crate) fn rotate_ca_pq(
                      d'exécuter une campagne d'autorité"
                 )
             })?;
-            Some(authority::CampaignApprovalSession::new(
+            Some(signing::CampaignApprovalSession::new(
                 campaign,
                 registry,
                 &identity,
@@ -200,7 +200,7 @@ pub(crate) fn rotate_ca_pq(
         .map(|session| session.finish(now_unix()))
         .transpose()?;
 
-    let rotated = authority::rotate_ca_pq(
+    let rotated = signing::rotate_ca_pq(
         &mut vault,
         &[&first.opened, &second.opened],
         &identity,
@@ -262,7 +262,7 @@ pub(crate) fn rotate_ca_pq(
 /// question that matters before a key is touched — does the authority name the
 /// anchor this vault holds.
 fn anchor_probe(
-    identity: &authority::DomainIdentity,
+    identity: &signing::DomainIdentity,
     current: &MlDsa87PublicKey,
     window: TransitionWindow,
 ) -> Result<aether::certificates::transport::TrustUpdateObject> {

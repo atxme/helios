@@ -28,13 +28,13 @@ use aether::certificates::status::{
 use aether::certificates::window::TransitionWindow;
 use aether::certificates::CERTIFICATE_FORMAT_VERSION;
 use astra_operator::authenticator::Opened;
-use astra_operator::authority::{
-    self, CampaignApprovalSession, DelegationBounds, DomainIdentity, IssuerDelegationRequest,
-    MAX_CA_TLS_LIFETIME_SECS,
-};
 use astra_operator::credentials::CredentialRegistry;
 use astra_operator::gestures::{
     add_key, create_authority, open_with_authorized_key, NewAuthority, NewKey,
+};
+use astra_operator::signing::{
+    self, CampaignApprovalSession, DelegationBounds, DomainIdentity, IssuerDelegationRequest,
+    MAX_CA_TLS_LIFETIME_SECS,
 };
 use astra_operator::vault::{AuthorityVault, SlotRole};
 use base64::Engine as _;
@@ -101,7 +101,7 @@ fn ca_pq_public_key(vault: &AuthorityVault) -> MlDsa87PublicKey {
 }
 
 fn bindings(vault: &AuthorityVault, opening: &Opened) -> CredentialRegistry {
-    authority::sign_credential_bindings(vault, opening, &identity(), None, &[], NOW)
+    signing::sign_credential_bindings(vault, opening, &identity(), None, &[], NOW)
         .expect("bindings")
 }
 
@@ -122,11 +122,11 @@ fn bootstrap_issues_the_gateway_leaf_under_ca_pq() {
     .sign(&gateway_private)
     .expect("bootstrap request");
 
-    let leaf = authority::issue_gateway_bootstrap_certificate(
+    let leaf = signing::issue_gateway_bootstrap_certificate(
         &vault,
         &opening,
         &ca_pq_public_key(&vault),
-        &authority::GatewayBootstrapDecision {
+        &signing::GatewayBootstrapDecision {
             request: &request,
             leaf_validity: (NOW, NOW + 365 * 86_400),
             serial: [9; 16],
@@ -157,7 +157,7 @@ fn the_self_signed_ca_tls_certifies_under_the_vaults_own_key() {
     let vault = bootstrapped(&first, &second);
     let opening = open(&first, &vault);
 
-    let certificate = authority::issue_ca_tls(
+    let certificate = signing::issue_ca_tls(
         &vault,
         &opening,
         &identity(),
@@ -176,7 +176,7 @@ fn the_self_signed_ca_tls_certifies_under_the_vaults_own_key() {
 
     // A window longer than the ceiling is refused by name rather than clamped:
     // a fleet-wide pin must not silently outlive what §9.4 allows.
-    assert!(authority::issue_ca_tls(
+    assert!(signing::issue_ca_tls(
         &vault,
         &opening,
         &identity(),
@@ -192,7 +192,7 @@ fn an_emergency_revocation_is_signed_by_the_master_anchor() {
     let second = FakeKey::new(2);
     let vault = bootstrapped(&first, &second);
     let opening = open(&first, &vault);
-    let decision = authority::RevocationDecision {
+    let decision = signing::RevocationDecision {
         scope: RevocationScope::Client,
         identity_key: WireGuardKey::from_bytes([7; 32]),
         server_name: None,
@@ -204,7 +204,7 @@ fn an_emergency_revocation_is_signed_by_the_master_anchor() {
         replacement_transition_fingerprint: None,
     };
 
-    let revocation = authority::sign_revocation(
+    let revocation = signing::sign_revocation(
         &vault,
         &opening,
         &identity(),
@@ -230,7 +230,7 @@ fn a_delegation_verifies_under_the_anchor_that_signed_it() {
     // The CA has to outlive the delegation it covers: an intermediate whose
     // issuer expires first is refused by name rather than served.
     let ca_tls =
-        authority::issue_ca_tls(&vault, &opening, &identity, NOW, NOW + 365 * 86_400).unwrap();
+        signing::issue_ca_tls(&vault, &opening, &identity, NOW, NOW + 365 * 86_400).unwrap();
 
     let (_, issuer_public) = generate_ml_dsa_87_keypair().expect("issuer keypair");
     let issuer_tls_key = rcgen::KeyPair::generate().expect("issuer TLS key");
@@ -255,7 +255,7 @@ fn a_delegation_verifies_under_the_anchor_that_signed_it() {
     };
 
     let authorization =
-        authority::authorize_issuer(&vault, &opening, &identity, &ca_tls, &request, &bounds, NOW)
+        signing::authorize_issuer(&vault, &opening, &identity, &ca_tls, &request, &bounds, NOW)
             .expect("the delegation signs");
     authorization
         .verify(
@@ -274,7 +274,7 @@ fn a_delegation_verifies_under_the_anchor_that_signed_it() {
     // finding that out at the gateway is finding it out too late.
     let mut foreign = request.clone();
     foreign.trust_domain_id = TrustDomainId::new([0x33; 16]).unwrap().to_hex();
-    assert!(authority::authorize_issuer(
+    assert!(signing::authorize_issuer(
         &vault, &opening, &identity, &ca_tls, &foreign, &bounds, NOW
     )
     .is_err());
@@ -336,7 +336,7 @@ fn bindings_describe_the_slot_table_and_nothing_else() {
     astra_operator::gestures::remove_key(&mut vault, &opening, &slot).expect("removes");
 
     let opening = open(&first, &vault);
-    let next = authority::sign_credential_bindings(
+    let next = signing::sign_credential_bindings(
         &vault,
         &opening,
         &identity,
@@ -357,7 +357,7 @@ fn bindings_describe_the_slot_table_and_nothing_else() {
     // modified file get re-signed by the master authority.
     let mut tampered = registry.clone();
     tampered.bindings[0].created_at += 1;
-    assert!(authority::sign_credential_bindings(
+    assert!(signing::sign_credential_bindings(
         &vault,
         &opening,
         &identity,
@@ -569,7 +569,7 @@ fn a_two_credential_campaign_refuses_two_touches_of_one_token() {
     let registry = bindings(&vault, &opening);
     let campaign = campaign(&registry);
 
-    let approval = authority::approve_campaign(
+    let approval = signing::approve_campaign(
         &[&first, &second],
         &campaign,
         &registry,
@@ -586,7 +586,7 @@ fn a_two_credential_campaign_refuses_two_touches_of_one_token() {
         .assert_unchanged(&approval.campaign_fingerprint)
         .expect("the campaign has not moved");
 
-    assert!(authority::approve_campaign(
+    assert!(signing::approve_campaign(
         &[&first, &first],
         &campaign,
         &registry,
@@ -708,7 +708,7 @@ fn rotating_the_anchor_leaves_every_key_slot_working() {
     let first_opening = open(&first, &vault);
     let second_opening = open(&second, &vault);
     let window = TransitionWindow::new(NOW, NOW + 3_600, NOW + 7_200).expect("window");
-    let rotated = authority::rotate_ca_pq(
+    let rotated = signing::rotate_ca_pq(
         &mut vault,
         &[&first_opening, &second_opening],
         &identity,
@@ -753,7 +753,7 @@ fn rotating_the_anchor_leaves_every_key_slot_working() {
     let fourth = FakeKey::new(4);
     let mut other = bootstrapped(&third, &fourth);
     let only = open(&third, &other);
-    assert!(authority::rotate_ca_pq(&mut other, &[&only], &identity, None, window, NOW,).is_err());
+    assert!(signing::rotate_ca_pq(&mut other, &[&only], &identity, None, window, NOW,).is_err());
 }
 
 /// The signing gestures must fit the stack the binary reserves, like the
@@ -786,7 +786,7 @@ fn the_signing_gestures_fit_the_stack_the_binary_reserves() {
             )
             .expect("approves");
             let _: DerCertificate =
-                authority::issue_ca_tls(&vault, &opening, &identity(), NOW, NOW + 86_400)
+                signing::issue_ca_tls(&vault, &opening, &identity(), NOW, NOW + 86_400)
                     .expect("issues");
         })
         .expect("spawn")
@@ -814,7 +814,7 @@ fn an_issuer_campaign_pins_the_exact_material_it_will_certify() {
     let opening = open(&first, &vault);
     let identity = identity();
     let ca_tls =
-        authority::issue_ca_tls(&vault, &opening, &identity, NOW, NOW + 365 * 86_400).unwrap();
+        signing::issue_ca_tls(&vault, &opening, &identity, NOW, NOW + 365 * 86_400).unwrap();
 
     let delegation_request = |seed: u8| {
         let (_, issuer_public) = generate_ml_dsa_87_keypair().expect("issuer keypair");
@@ -880,7 +880,7 @@ fn an_issuer_campaign_pins_the_exact_material_it_will_certify() {
     };
     let signed =
         |request: &IssuerDelegationRequest| -> aether::certificates::authority::AstraIssuerAuthorization {
-            authority::authorize_issuer(&vault, &opening, &identity, &ca_tls, request, &bounds, NOW)
+            signing::authorize_issuer(&vault, &opening, &identity, &ca_tls, request, &bounds, NOW)
                 .expect("the delegation signs")
         };
     let result = |authorization| AstraSignerResult {

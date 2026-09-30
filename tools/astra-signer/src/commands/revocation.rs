@@ -162,7 +162,7 @@ pub(crate) fn revoke(
     let key = authenticator::connect(transport)?;
     let pin = pin_for(key.as_ref(), "PIN de la clé de sécurité : ")?;
 
-    let approval = authority::approve_campaign(
+    let approval = signing::approve_campaign(
         &[key.as_ref()],
         &campaign,
         &registry,
@@ -174,7 +174,7 @@ pub(crate) fn revoke(
         now,
     )?;
     let opening = gestures::open_with_authorized_key(key.as_ref(), &vault, &pin)?;
-    let decision = authority::RevocationDecision {
+    let decision = signing::RevocationDecision {
         scope,
         identity_key: target.identity_key,
         // §10.1 names the service only for a gateway: a client leaf is
@@ -195,7 +195,7 @@ pub(crate) fn revoke(
         reason,
         replacement_transition_fingerprint,
     };
-    let revocation = authority::sign_revocation(
+    let revocation = signing::sign_revocation(
         &vault,
         &opening,
         &identity,

@@ -45,7 +45,6 @@ pub const WORK_STACK_BYTES: usize = 32 * 1024 * 1024;
 /// key-slot can be unwrapped (§14.1). Keeping it here as well would be a
 /// second copy of a security boundary.
 pub use aether_fido::authenticator;
-pub mod authority;
 pub mod campaign;
 pub mod credentials;
 pub mod documents;
@@ -55,6 +54,7 @@ pub mod operations;
 pub mod origin;
 pub mod orion;
 pub mod prepared;
+pub mod signing;
 pub mod store;
 pub mod tunnel;
 pub mod vault;

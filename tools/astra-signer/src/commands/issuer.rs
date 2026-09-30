@@ -28,7 +28,7 @@ pub(crate) fn issue_ca_tls(
         transport,
         "Auto-signature de CA-TLS. Brancher une clé autorisée, puis appuyer sur Entrée.",
     )?;
-    let certificate = authority::issue_ca_tls(&vault, &opening, &identity, not_before, not_after)?;
+    let certificate = signing::issue_ca_tls(&vault, &opening, &identity, not_before, not_after)?;
 
     // The epoch moves with the certificate, in the same write: a hand-off
     // naming one epoch and carrying another would have every later delegation
@@ -186,7 +186,7 @@ pub(crate) fn authorize_issuer(
             wait_for_operator()?;
             let key = authenticator::connect(transport)?;
             let pin = pin_for(key.as_ref(), "PIN de la clé de sécurité : ")?;
-            let approval = authority::approve_campaign(
+            let approval = signing::approve_campaign(
                 &[key.as_ref()],
                 campaign,
                 &registry,
@@ -198,7 +198,7 @@ pub(crate) fn authorize_issuer(
                 now_unix(),
             )?;
             let opening = gestures::open_with_authorized_key(key.as_ref(), &vault, &pin)?;
-            let authorization = authority::authorize_issuer(
+            let authorization = signing::authorize_issuer(
                 &vault,
                 &opening,
                 &identity,
@@ -215,7 +215,7 @@ pub(crate) fn authorize_issuer(
                 transport,
                 "Signature de la délégation. Brancher une clé autorisée, puis appuyer sur Entrée.",
             )?;
-            let authorization = authority::authorize_issuer(
+            let authorization = signing::authorize_issuer(
                 &vault,
                 &opening,
                 &identity,

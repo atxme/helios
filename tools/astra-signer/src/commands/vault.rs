@@ -361,7 +361,7 @@ fn resign_bindings(path: &Path, vault: &AuthorityVault, opening: &Opened) -> Res
     };
     let registry_path = credentials::path_beside(path);
     let previous = credentials::load(&registry_path)?;
-    let registry = authority::sign_credential_bindings(
+    let registry = signing::sign_credential_bindings(
         vault,
         opening,
         &identity,
@@ -409,7 +409,7 @@ pub(crate) fn bindings(
         transport,
         "Signature du document de credentials. Brancher une clé autorisée, puis Entrée.",
     )?;
-    let registry = authority::sign_credential_bindings(
+    let registry = signing::sign_credential_bindings(
         &vault,
         &opening,
         &identity,

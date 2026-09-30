@@ -3,7 +3,7 @@
 //! # Two keys, and why they are asked for one at a time
 //!
 //! A campaign names how many distinct credentials must approve it. Two touches
-//! of the same token is exactly what [`crate::authority::approve_campaign`]
+//! of the same token is exactly what [`crate::signing::approve_campaign`]
 //! refuses, and refusing it after both gestures would waste the operator's
 //! window on a decision they cannot un-take. So the keys are collected one
 //! after another, each connection its own, and the second one is asked for
@@ -20,8 +20,8 @@
 //!
 //! Ce module n'assemble que des entrées déjà vérifiées ailleurs : la campagne
 //! est authentifiée par [`crate::handoff::verify_campaign_request`] et le geste
-//! par [`crate::authority::approve_campaign`], tous deux éprouvés contre des
-//! clés simulées dans `tests/authority.rs`. Y ajouter un test qui n'exerce ni
+//! par [`crate::signing::approve_campaign`], tous deux éprouvés contre des
+//! clés simulées dans `tests/signing.rs`. Y ajouter un test qui n'exerce ni
 //! l'un ni l'autre donnerait l'apparence d'une couverture sans la substance.
 
 use std::path::Path;
@@ -33,12 +33,12 @@ use anyhow::{bail, Context, Result};
 
 use crate::authenticator::Authenticator;
 use crate::vault::AuthorityVault;
-use crate::{authority, credentials, handoff, origin, store};
+use crate::{credentials, handoff, origin, signing, store};
 
 /// A campaign whose every input has been verified, waiting on the keys.
 pub struct Verified {
     vault: AuthorityVault,
-    identity: authority::DomainIdentity,
+    identity: signing::DomainIdentity,
     registry: credentials::CredentialRegistry,
     ca_pq_public_key: MlDsa87PublicKey,
     client: origin::Origin,
@@ -127,7 +127,7 @@ pub fn begin(
 impl Verified {
     /// Starts the credential session without touching a key.
     pub fn start_approval(self, now: u64) -> Result<InProgressApproval> {
-        let approval = authority::CampaignApprovalSession::new(
+        let approval = signing::CampaignApprovalSession::new(
             &self.campaign,
             &self.registry,
             &self.identity,
@@ -158,7 +158,7 @@ pub struct InProgressApproval {
     client: origin::Origin,
     operation: Id16,
     result_token: String,
-    approval: authority::CampaignApprovalSession,
+    approval: signing::CampaignApprovalSession,
 }
 
 impl InProgressApproval {

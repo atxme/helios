@@ -39,9 +39,9 @@ use aether::certificates::encoding::{MlDsa87PublicKey, TrustDomainId, WireGuardK
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::authority::DomainIdentity;
 use crate::campaign::Campaign;
 use crate::origin::CampaignRequest;
+use crate::signing::DomainIdentity;
 
 /// Name of the hand-off file, beside the vault.
 pub const HANDOFF_FILE: &str = "astra-domain.json";

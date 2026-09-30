@@ -22,7 +22,7 @@ use anyhow::{bail, Context, Result};
 use zeroize::Zeroizing;
 
 use crate::authenticator::{self, Authenticator, Opened, Transport};
-use crate::authority::{self, CampaignApprovalSession, DomainIdentity};
+use crate::signing::{self, CampaignApprovalSession, DomainIdentity};
 use crate::{campaign::Campaign, credentials, gestures, handoff, prepared, store};
 
 const DAY_SECS: u64 = 86_400;
@@ -194,7 +194,7 @@ impl CaTlsCeremony {
             .first_opening
             .as_ref()
             .context("aucune clé n'a ouvert le coffre")?;
-        let rotated = authority::rotate_ca_tls(
+        let rotated = signing::rotate_ca_tls(
             &mut self.vault,
             opening,
             &self.identity,
@@ -421,7 +421,7 @@ fn resume_existing(
     let mut vault = store::load(&options.vault_path)?;
     let key = connect_platform_key()?;
     let opening = gestures::open_with_authorized_key(key.as_ref(), &vault, "")?;
-    match authority::advance_ca_tls(&mut vault, &opening, now_unix())? {
+    match signing::advance_ca_tls(&mut vault, &opening, now_unix())? {
         CaTlsAdvance::Rotated { .. } => {
             store::save(&options.vault_path, &vault)?;
             let mut relay = handoff::DomainHandoff::beside(&options.vault_path, &vault)?;
