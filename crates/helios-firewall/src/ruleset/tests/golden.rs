@@ -9,9 +9,9 @@
 //! is exactly that, and it passes every behavioral test in this directory.
 //!
 //! These snapshots close that gap. They capture the whole `Ruleset`: the
-//! default verdict, the MSS clamp, the masquerade uplinks, and every rule in
-//! `rules` order with its chain — so a change of content *or* of position
-//! fails. The expected text is literal and readable in review on purpose: a
+//! default verdict, the MSS clamp, the masquerade uplinks, every rule in
+//! `rules` order with its chain, then the `postrouting` masquerade rules — so
+//! a change of content *or* of position fails. The expected text is literal and readable in review on purpose: a
 //! snapshot nobody can read in a diff protects nothing.
 //!
 //! The cases are chosen to cover the branches of `render`, not to enumerate
@@ -46,6 +46,12 @@ fn snapshot(rs: &Ruleset) -> String {
     out.push_str(&format!("masquerade [{}]\n", rs.masquerade_out.join(", ")));
     for rule in &rs.rules {
         out.push_str(&format!("{} {rule}\n", rule.chain.as_str()));
+    }
+    // The masquerade rules as the backend translates them, family guard
+    // included: the uplink list above cannot show that guard, and a
+    // masquerade losing it would NAT66 in the `inet` table.
+    for rule in rs.masquerade_rules() {
+        out.push_str(&format!("postrouting {rule}\n"));
     }
     out
 }
@@ -223,8 +229,10 @@ input iifname \"tailscale0\" tcp dport 22 accept
 forward ip daddr 192.168.50.0/24 accept
 forward iifname \"eth1\" oifname \"enp3s0\" accept
 forward iifname \"eth1\" oifname \"wlo1\" accept
-forward iifname \"helios0\" oifname \"enp3s0\" accept
-forward iifname \"helios0\" oifname \"wlo1\" accept
+forward meta nfproto ipv4 iifname \"helios0\" oifname \"enp3s0\" accept
+forward meta nfproto ipv4 iifname \"helios0\" oifname \"wlo1\" accept
+postrouting meta nfproto ipv4 oifname \"enp3s0\" masquerade
+postrouting meta nfproto ipv4 oifname \"wlo1\" masquerade
 ";
 
 #[test]

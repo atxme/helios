@@ -28,8 +28,8 @@ impl FirewallBackend for DryRunBackend {
                 info!("  [{}] {}", kind.as_str(), rule);
             }
         }
-        for out in &rs.masquerade_out {
-            info!("  [postrouting] oifname \"{out}\" masquerade  # client Internet egress");
+        for rule in rs.masquerade_rules() {
+            info!("  [postrouting] {rule}  # client Internet egress");
         }
         if let Some(mss) = rs.mss_clamp {
             info!("  (mangle) MSS clamping = {mss}");

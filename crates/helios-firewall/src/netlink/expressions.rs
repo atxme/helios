@@ -22,6 +22,10 @@ use crate::ruleset::{
 
 const IP_PROTOCOL_ICMP: u8 = 1;
 const IP_PROTOCOL_ICMPV6: u8 = 58;
+/// Netfilter family numbers (`NFPROTO_IPV4`, `NFPROTO_IPV6`), the value
+/// `meta nfproto` loads into the register.
+const NFPROTO_IPV4: u8 = 2;
+const NFPROTO_IPV6: u8 = 10;
 
 impl NetlinkBackend {
     pub(super) fn hook_class(kind: ChainKind) -> HookClass {
@@ -56,6 +60,7 @@ impl NetlinkBackend {
             Match::PacketMark(mark) => rule
                 .with_expr(Meta::new(MetaType::Mark))
                 .with_expr(Cmp::new(CmpOp::Eq, Self::packet_mark_bytes(*mark))),
+            Match::Family(family) => Self::network_family(rule, *family),
         })
     }
 
@@ -94,6 +99,20 @@ impl NetlinkBackend {
         };
         rule.with_expr(Meta::new(MetaType::L4Proto))
             .with_expr(Cmp::new(CmpOp::Eq, [protocol]))
+    }
+
+    /// A standalone `meta nfproto` guard.
+    ///
+    /// The same two expressions `rustables` emits ahead of an address in
+    /// [`NfRule::match_ip`], without the address: the rule stays
+    /// single-family in the `inet` table while naming no address.
+    fn network_family(rule: NfRule, family: AddressFamily) -> NfRule {
+        let nfproto = match family {
+            AddressFamily::Ipv4 => NFPROTO_IPV4,
+            AddressFamily::Ipv6 => NFPROTO_IPV6,
+        };
+        rule.with_expr(Meta::new(MetaType::NfProto))
+            .with_expr(Cmp::new(CmpOp::Eq, [nfproto]))
     }
 
     /// A structured `ct state` match, built from the exact IR state set.
@@ -182,6 +201,8 @@ impl NetlinkBackend {
 
 #[cfg(test)]
 mod tests {
+    use rustables::{expr::RawExpression, ProtocolFamily};
+
     use super::*;
 
     #[test]
@@ -274,5 +295,41 @@ mod tests {
         assert_eq!(IP_PROTOCOL_ICMP, 1);
         assert_eq!(IP_PROTOCOL_ICMPV6, 58);
         assert_ne!(IP_PROTOCOL_ICMP, IP_PROTOCOL_ICMPV6);
+    }
+
+    /// `rustables` binds its protocol families to the kernel UAPI values:
+    /// checking the constants against them pins what the kernel will read.
+    #[test]
+    fn nfproto_numbers_are_the_kernel_family_values() {
+        assert_eq!(NFPROTO_IPV4, 2);
+        assert_eq!(NFPROTO_IPV6, 10);
+        assert_eq!(i32::from(NFPROTO_IPV4), ProtocolFamily::Ipv4 as i32);
+        assert_eq!(i32::from(NFPROTO_IPV6), ProtocolFamily::Ipv6 as i32);
+    }
+
+    #[test]
+    fn family_match_emits_the_nfproto_guard_rustables_uses() {
+        let expressions = |family| {
+            NetlinkBackend::apply_match(NfRule::default(), &Match::Family(family))
+                .expect("a family match always translates")
+                .get_expressions()
+                .map(|list| list.iter().cloned().collect::<Vec<RawExpression>>())
+                .unwrap_or_default()
+        };
+
+        assert_eq!(
+            expressions(AddressFamily::Ipv4),
+            [
+                RawExpression::from(Meta::new(MetaType::NfProto)),
+                RawExpression::from(Cmp::new(CmpOp::Eq, [2u8])),
+            ]
+        );
+        assert_eq!(
+            expressions(AddressFamily::Ipv6),
+            [
+                RawExpression::from(Meta::new(MetaType::NfProto)),
+                RawExpression::from(Cmp::new(CmpOp::Eq, [10u8])),
+            ]
+        );
     }
 }

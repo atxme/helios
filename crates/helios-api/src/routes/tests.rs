@@ -244,6 +244,26 @@ async fn firewall_rendering_stays_fail_closed_outside_an_active_tunnel() {
     assert!(!response.rules.contains("pq-secret-must-not-leak"));
 }
 
+/// The console shows the masquerade the Netlink backend applies, IPv4 guard
+/// included: an unguarded line would describe an `inet` NAT that also
+/// rewrites IPv6.
+#[tokio::test]
+async fn firewall_rendering_shows_the_ipv4_only_masquerade() {
+    let (app, _cmd_rx) = app_state(TunnelState::Up);
+    app.policy.write().await.allow_client_internet = true;
+
+    let response = firewall_rules_get(State(app)).await.unwrap().0;
+
+    assert!(
+        response
+            .rules
+            .contains("    meta nfproto ipv4 oifname \"eth0\" masquerade  #"),
+        "{}",
+        response.rules
+    );
+    assert!(!response.rules.contains("    oifname \"eth0\" masquerade"));
+}
+
 #[tokio::test]
 async fn explicit_error_if_orchestrator_is_absent() {
     let (app, cmd_rx) = app_state(TunnelState::Down);

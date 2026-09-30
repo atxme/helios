@@ -3,6 +3,7 @@
 mod access;
 mod egress;
 mod golden;
+mod ipv6_relay;
 mod support;
 mod transport;
 mod uplinks;

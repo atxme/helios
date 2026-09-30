@@ -219,6 +219,14 @@ pub enum Match {
     Icmp(AddressFamily),
     /// Packet mark assigned by a privileged local networking service.
     PacketMark(u32),
+    /// `meta nfproto ipv4` or `meta nfproto ipv6`.
+    ///
+    /// The table is `inet`: a rule that names no address applies to both
+    /// families. Address matches already carry their own family guard, so
+    /// this match is for rules that must stay single-family without naming an
+    /// address — the tunnel clients' Internet egress first among them, which
+    /// relays IPv4 only.
+    Family(AddressFamily),
 }
 
 impl fmt::Display for Match {
@@ -255,6 +263,8 @@ impl fmt::Display for Match {
             Match::Icmp(AddressFamily::Ipv4) => write!(f, "meta l4proto icmp"),
             Match::Icmp(AddressFamily::Ipv6) => write!(f, "meta l4proto ipv6-icmp"),
             Match::PacketMark(mark) => write!(f, "meta mark {mark:#x}"),
+            Match::Family(AddressFamily::Ipv4) => write!(f, "meta nfproto ipv4"),
+            Match::Family(AddressFamily::Ipv6) => write!(f, "meta nfproto ipv6"),
         }
     }
 }
@@ -363,6 +373,9 @@ pub struct Ruleset {
     /// **Empty** outside of states where traffic is allowed — NAT must never
     /// survive the tunnel going down, otherwise the kill-switch would leak
     /// what it is supposed to hold back.
+    ///
+    /// Only the uplinks are stored here. The rules themselves, with their
+    /// IPv4 guard, come from [`Ruleset::masquerade_rules`].
     pub masquerade_out: Vec<String>,
 }
 
@@ -370,6 +383,59 @@ impl Ruleset {
     /// Rules of a given chain, in order.
     pub fn chain(&self, kind: ChainKind) -> impl Iterator<Item = &Rule> {
         self.rules.iter().filter(move |r| r.chain == kind)
+    }
+
+    /// The `postrouting` masquerade rules, one per entry of
+    /// [`masquerade_out`](Self::masquerade_out), in the same order.
+    ///
+    /// The single place where a masquerade gets its matches: the Netlink
+    /// backend translates exactly these, and the dry-run, the API and the
+    /// golden snapshots display exactly these, so what is shown cannot drift
+    /// from what is applied.
+    pub fn masquerade_rules(&self) -> impl Iterator<Item = MasqueradeRule> + '_ {
+        self.masquerade_out.iter().map(|out_iface| MasqueradeRule {
+            matches: vec![
+                Match::Family(MasqueradeRule::FAMILY),
+                Match::OutIface(out_iface.clone()),
+            ],
+        })
+    }
+}
+
+/// A source-NAT rule of the `postrouting` chain.
+///
+/// # Why the family is not a field of the ruleset
+///
+/// In an `inet` table a masquerade that names only an interface also
+/// rewrites IPv6: the first IPv6 packet relayed to a WAN would be NAT66-ed,
+/// a translation nobody decided. The masquerade therefore carries
+/// `meta nfproto ipv4`. That guard is a fixed invariant — NAT44 exists
+/// because tunnel addresses are non-routable CGNAT, and IPv6 egress is a
+/// separate, still open decision — not a per-uplink choice, so
+/// [`Ruleset::masquerade_out`] keeps listing uplinks only and this type adds
+/// the guard. Its matches are private and only [`Ruleset::masquerade_rules`]
+/// builds it: an unguarded or IPv6 masquerade cannot be represented.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MasqueradeRule {
+    matches: Vec<Match>,
+}
+
+impl MasqueradeRule {
+    /// The only family the masquerade rewrites.
+    pub const FAMILY: AddressFamily = AddressFamily::Ipv4;
+
+    /// Matches evaluated before the `masquerade` statement, in order.
+    pub fn matches(&self) -> &[Match] {
+        &self.matches
+    }
+}
+
+impl fmt::Display for MasqueradeRule {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for m in &self.matches {
+            write!(f, "{m} ")?;
+        }
+        write!(f, "masquerade")
     }
 }
 
@@ -432,5 +498,39 @@ mod tests {
 
         assert_eq!(Match::SourceNet(ipv4).to_string(), "ip saddr 192.0.2.1/32");
         assert_eq!(Match::DestNet(ipv6).to_string(), "ip6 daddr 2001:db8::/32");
+    }
+
+    #[test]
+    fn family_matches_render_the_nfproto_guard() {
+        assert_eq!(
+            Match::Family(AddressFamily::Ipv4).to_string(),
+            "meta nfproto ipv4"
+        );
+        assert_eq!(
+            Match::Family(AddressFamily::Ipv6).to_string(),
+            "meta nfproto ipv6"
+        );
+    }
+
+    #[test]
+    fn masquerade_rules_carry_the_ipv4_guard_before_the_uplink() {
+        let ruleset = Ruleset {
+            default_verdict: Verdict::Drop,
+            rules: Vec::new(),
+            mss_clamp: None,
+            masquerade_out: vec!["enp3s0".into(), "wlo1".into()],
+        };
+
+        let rendered: Vec<String> = ruleset
+            .masquerade_rules()
+            .map(|rule| rule.to_string())
+            .collect();
+        assert_eq!(
+            rendered,
+            [
+                "meta nfproto ipv4 oifname \"enp3s0\" masquerade",
+                "meta nfproto ipv4 oifname \"wlo1\" masquerade",
+            ]
+        );
     }
 }

@@ -733,10 +733,8 @@ pub async fn firewall_rules_get(
     if !rs.masquerade_out.is_empty() {
         lines.push("  chain postrouting {".to_string());
         lines.push("    type nat hook postrouting priority srcnat;".to_string());
-        for out in &rs.masquerade_out {
-            lines.push(format!(
-                "    oifname \"{out}\" masquerade  # tunnel clients' Internet egress"
-            ));
+        for rule in rs.masquerade_rules() {
+            lines.push(format!("    {rule}  # tunnel clients' Internet egress"));
         }
         lines.push("  }".to_string());
     }
