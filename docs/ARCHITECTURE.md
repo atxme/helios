@@ -94,7 +94,8 @@ sets its own (25 s) rather than trusting one it cannot inspect.
 The public QUIC port answers with three error codes only — `protocol`,
 `rejected`, `internal` — so that it cannot be used to enumerate admitted peers
 or read their floor. Its DoS bounds are Retry before any state, a budget per
-IPv4 address or per IPv6 `/64` prefix, a budget per admitted identity after
+IPv4 address or per IPv6 `/64` prefix (an IPv4-mapped `::ffff:a.b.c.d` source
+counts as its IPv4 address), a budget per admitted identity after
 mTLS, a 90-second absolute connection lifetime, TLS resumption and 0-RTT
 disabled on both ends, no unidirectional streams, and datagrams pinned to 1200
 bytes with MTU discovery off on both sides.

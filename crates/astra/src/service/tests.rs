@@ -19,6 +19,27 @@ fn an_ipv6_budget_counts_prefixes_not_addresses() {
     assert!(budget.charge(elsewhere, 1_000));
 }
 
+/// A dual-stack `[::]` listener hands IPv4 clients over as `::ffff:a.b.c.d`.
+/// Each must keep its own IPv4 budget rather than share `::/64`.
+#[test]
+fn an_ipv4_mapped_source_is_charged_as_its_ipv4_address() {
+    let mut budget = SourceBudget::default();
+    let mapped: IpAddr = "::ffff:203.0.113.7".parse().unwrap();
+    let plain: IpAddr = "203.0.113.7".parse().unwrap();
+    for _ in 0..SOURCE_BUDGET {
+        assert!(budget.charge(mapped, 1_000));
+    }
+    assert!(
+        !budget.charge(plain, 1_000),
+        "the mapped and plain forms are one source and share one budget"
+    );
+    let neighbour: IpAddr = "::ffff:203.0.113.8".parse().unwrap();
+    assert!(
+        budget.charge(neighbour, 1_000),
+        "two IPv4 clients must never share a budget through their mapped form"
+    );
+}
+
 /// An unbounded map turns a rate limit into a memory-exhaustion
 /// primitive: every fresh source would cost an entry, and an attacker has
 /// as many as they like.
