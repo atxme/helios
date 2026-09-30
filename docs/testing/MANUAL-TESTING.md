@@ -421,7 +421,7 @@ Address = 100.64.1.2/32
 
 [Peer]
 PublicKey = <gateway_public>
-AllowedIPs = 0.0.0.0/0
+AllowedIPs = 0.0.0.0/0, ::/0
 Endpoint = 127.0.0.1:51820
 PersistentKeepalive = 25
 ```
@@ -432,13 +432,22 @@ le même fichier doit avertir que l’enregistrement remplacera le profil
 existant. Un fichier contenant un second `[Peer]` ou `DNS = 100.64.0.1` doit
 être refusé explicitement et ne doit modifier aucun profil enregistré.
 
+Le même fichier avec `AllowedIPs = 0.0.0.0/0` seul (l’ancien tunnel complet)
+doit s’importer tel quel : sous « Avancé », le choix « Personnalisé » est actif
+et l’avertissement « Tunnel complet IPv4 seulement : le trafic IPv6 sort en
+clair » est affiché. Une fois enregistré puis rouvert, le profil reste
+`0.0.0.0/0`, l’écran indique « Profil à jour » malgré l’avertissement, et le
+panneau de posture affiche la ligne « trafic via le tunnel » en ambre. Choisir
+« Tout » puis enregistrer écrit `0.0.0.0/0, ::/0` et fait disparaître les deux
+avertissements.
+
 Le même profil peut toujours être créé à la main avec :
 
 - endpoint : `127.0.0.1:51820` ;
 - clé privée : `client_private` ;
 - clé publique de gateway : `gateway_public` ;
 - adresse : `100.64.1.2/32` ;
-- AllowedIPs : `0.0.0.0/0` ;
+- AllowedIPs : `0.0.0.0/0, ::/0` ;
 - keepalive : `25`.
 
 Le backend par défaut est simulé. Vérifier que le profil peut être enregistré
