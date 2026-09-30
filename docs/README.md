@@ -19,6 +19,8 @@ foi en cas de doute (voir [AGENTS.md](../AGENTS.md)).
   états WireGuard, kill-switch, API, secrets et validation.
 - [Firewall v2](architecture/FIREWALL-V2.md) — audit Policy/IR/Netlink,
   capacités, limites backend et recette de validation cible.
+- [Étude IPv6](architecture/ETUDE-IPV6.md) — audit des dépendances IPv4,
+  architecture dual-stack cible, risques et roadmap par tickets.
 
 ## Développement
 
