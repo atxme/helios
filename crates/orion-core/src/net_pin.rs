@@ -8,7 +8,8 @@
 //! link held for the tunnel's whole lifetime.
 //!
 //! In between, the interface captures `AllowedIPs`. On Windows that means a
-//! `0.0.0.0/0` route on the tunnel with interface metric 0, installed by
+//! `0.0.0.0/0` route (and `::/0`, for the default full tunnel) on the tunnel
+//! with interface metric 0, installed by
 //! `wireguard_nt::Adapter::set_default_route` — and **no `/32` exclusion for
 //! the gateway endpoint**, because `defguard_wireguard_rs::wgapi_windows`
 //! implements `configure_peer_routing` as a no-op. WireGuard-NT avoids the

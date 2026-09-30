@@ -120,6 +120,55 @@ pub fn split_cidr_list(value: &str) -> Vec<&str> {
         .collect()
 }
 
+/// How much of each address family an `AllowedIPs` list sends into the tunnel.
+///
+/// Only the whole-family entries count — a prefix of length zero, `0.0.0.0/0`
+/// or `::/0` — because they are what decides whether anything of that family
+/// can still leave through the physical interface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TunnelCapture {
+    /// Both families captured whole: the full tunnel.
+    Full,
+    /// All of IPv4, but no whole-family IPv6 entry: IPv6 leaves in clear.
+    ///
+    /// Not a split tunnel. It is what the full tunnel used to be, before
+    /// [`crate::DEFAULT_ALLOWED_IPS`] added `::/0`, and a profile still holding
+    /// it believes it is protected when half of its traffic is not.
+    Ipv4Only,
+    /// Anything else: a tunnel narrowed on purpose, which is the operator's
+    /// decision and not a defect.
+    Partial,
+}
+
+/// Classifies a prefix list by what it captures whole, family by family.
+///
+/// Entries are read as [`split_cidr_list`] and [`validate_cidr`] read them, so
+/// the classification never contradicts validation; an entry validation would
+/// refuse captures nothing here. The Orion screen mirrors this rule for the
+/// draft being typed (`apps/orion/src/splitTunnel.ts`), and its tests pin the
+/// same cases as this module's.
+pub fn tunnel_capture(value: &str) -> TunnelCapture {
+    let mut ipv4 = false;
+    let mut ipv6 = false;
+    for entry in split_cidr_list(value) {
+        let Some((address, prefix)) = entry.split_once('/') else {
+            continue;
+        };
+        let (Ok(address), Ok(0)) = (address.parse::<IpAddr>(), prefix.parse::<u8>()) else {
+            continue;
+        };
+        match address {
+            IpAddr::V4(_) => ipv4 = true,
+            IpAddr::V6(_) => ipv6 = true,
+        }
+    }
+    match (ipv4, ipv6) {
+        (true, true) => TunnelCapture::Full,
+        (true, false) => TunnelCapture::Ipv4Only,
+        _ => TunnelCapture::Partial,
+    }
+}
+
 /// Validates a list of prefixes: `AllowedIPs` is one, an address is not.
 ///
 /// # Why several

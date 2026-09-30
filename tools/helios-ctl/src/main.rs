@@ -138,7 +138,7 @@ enum Cmd {
         /// Trafic capté par le tunnel : une ou plusieurs plages CIDR,
         /// séparées par des virgules.
         ///
-        /// Absent = tunnel complet (`0.0.0.0/0`), qui reste le bon défaut.
+        /// Absent = tunnel complet (`0.0.0.0/0, ::/0`), qui reste le bon défaut.
         /// Le préciser ici plutôt que dans chaque poste évite qu'un parc
         /// finisse avec autant de tables de routage que d'utilisateurs.
         /// Ex. : `--allowed-ips "100.64.0.0/10, 192.168.1.0/24"`
@@ -340,7 +340,7 @@ enum ProfileCmd {
         /// Trafic capté par le tunnel : une ou plusieurs plages CIDR,
         /// séparées par des virgules.
         ///
-        /// Absent = tunnel complet (`0.0.0.0/0`), qui reste le bon défaut.
+        /// Absent = tunnel complet (`0.0.0.0/0, ::/0`), qui reste le bon défaut.
         /// Le préciser ici plutôt que dans chaque poste évite qu'un parc
         /// finisse avec autant de tables de routage que d'utilisateurs.
         /// Ex. : `--allowed-ips "100.64.0.0/10, 192.168.1.0/24"`

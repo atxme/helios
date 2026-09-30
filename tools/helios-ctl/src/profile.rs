@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 
 use aether::key_negotiation::ProtectionMode;
 use anyhow::{bail, Context, Result};
+use orion_core::profile_import::TunnelCapture;
 use orion_core::ProfileKind;
 use reqwest::Client;
 use serde::Serialize;
@@ -89,8 +90,9 @@ pub struct Profile<'a> {
     /// comma-separated.
     ///
     /// Omitted rather than defaulted, because the two are not the same thing:
-    /// an absent field lets `orion-core` apply `0.0.0.0/0`, the full tunnel,
-    /// which stays the right answer when the operator has said nothing. Only
+    /// an absent field lets `orion-core` apply its default full tunnel,
+    /// `0.0.0.0/0, ::/0`, which stays the right answer when the operator has
+    /// said nothing. Only
     /// a split tunnel needs stating, and it is stated **here** so a fleet gets
     /// it from the document rather than from each user retyping prefixes into
     /// the Advanced panel.
@@ -178,13 +180,9 @@ pub fn check(path: &Path) -> Result<()> {
     // is what the client will route, and an absent field means the full
     // tunnel — a fact no one should have to know the defaulting rule to learn.
     println!(
-        "  trafic capté    : {}{}",
+        "  trafic capté    : {}  {}",
         profile.allowed_ips,
-        if profile.allowed_ips == orion_core::DEFAULT_ALLOWED_IPS {
-            "  (tunnel complet)"
-        } else {
-            "  (tunnel fractionné — le reste sort en clair)"
-        }
+        capture_label(&profile.allowed_ips)
     );
     println!(
         "  API dans tunnel : {}",
@@ -235,6 +233,20 @@ pub fn check(path: &Path) -> Result<()> {
         }
     );
     Ok(())
+}
+
+/// What a document's `AllowedIPs` leaves outside the tunnel, in words.
+///
+/// Classified by `orion-core`, the same rule the Orion screen warns with: a
+/// document that captures `0.0.0.0/0` alone was a full tunnel before `::/0`
+/// joined the default, and calling it one still would tell the operator that
+/// a client leaking all of its IPv6 is protected.
+fn capture_label(allowed_ips: &str) -> &'static str {
+    match orion_core::profile_import::tunnel_capture(allowed_ips) {
+        TunnelCapture::Full => "(tunnel complet)",
+        TunnelCapture::Ipv4Only => "(tunnel complet IPv4 seulement — le trafic IPv6 sort en clair)",
+        TunnelCapture::Partial => "(tunnel fractionné — le reste sort en clair)",
+    }
 }
 
 pub async fn emit(client: &Client, base: &str, options: EmitOptions) -> Result<()> {
@@ -597,12 +609,14 @@ mod tests {
         );
     }
 
-    /// Saying nothing is not saying `0.0.0.0/0` — but it must behave that way.
+    /// Saying nothing is not saying `0.0.0.0/0, ::/0` — but it must behave that
+    /// way.
     ///
     /// The field is omitted rather than written out, so an operator reading a
     /// document sees only what was decided. `orion-core` supplies the full
-    /// tunnel, which is the safe default: it is that prefix, with the adapter
-    /// lifecycle, that makes WireGuard drop packets rather than leak them.
+    /// tunnel, which is the safe default: it is that capture, in both
+    /// families, with the adapter lifecycle, that makes WireGuard drop packets
+    /// rather than leak them.
     #[test]
     fn an_omitted_split_tunnel_becomes_the_full_tunnel_on_the_client() {
         let client_key = aether::wg::generate_keypair().unwrap();
@@ -624,9 +638,34 @@ mod tests {
 
         assert!(!json.contains("allowed_ips"), "{json}");
         let imported = orion_core::parse_profile_import(&json, "portable.json").unwrap();
+        assert_eq!(imported.profile.allowed_ips, "0.0.0.0/0, ::/0");
         assert_eq!(
-            imported.profile.allowed_ips,
-            orion_core::DEFAULT_ALLOWED_IPS
+            capture_label(&imported.profile.allowed_ips),
+            "(tunnel complet)"
+        );
+    }
+
+    /// The old full tunnel is not called a full tunnel any more.
+    ///
+    /// `0.0.0.0/0` alone leaves IPv6 outside: labelled « tunnel complet », a
+    /// client leaking all of its IPv6 would read as protected to the operator
+    /// checking its document. A narrowed list keeps its own label.
+    #[test]
+    fn the_capture_label_names_an_ipv4_only_full_tunnel() {
+        assert_eq!(
+            capture_label("0.0.0.0/0"),
+            "(tunnel complet IPv4 seulement — le trafic IPv6 sort en clair)"
+        );
+        assert_eq!(capture_label("0.0.0.0/0, ::/0"), "(tunnel complet)");
+        // Order is not a decision: the same two prefixes are the same tunnel.
+        assert_eq!(capture_label("::/0, 0.0.0.0/0"), "(tunnel complet)");
+        assert_eq!(
+            capture_label("100.64.0.0/10, 192.168.1.0/24"),
+            "(tunnel fractionné — le reste sort en clair)"
+        );
+        assert_eq!(
+            capture_label("::/0"),
+            "(tunnel fractionné — le reste sort en clair)"
         );
     }
 }

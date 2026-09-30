@@ -20,7 +20,8 @@ pub use document::{
     ProfileImport, MAX_PROFILE_IMPORT_BYTES,
 };
 pub use field_rules::{
-    normalize_cidr_list, split_cidr_list, validate_allowed_ips, validate_ssh_target,
+    normalize_cidr_list, split_cidr_list, tunnel_capture, validate_allowed_ips,
+    validate_ssh_target, TunnelCapture,
 };
 pub use json::{PROFILE_IMPORT_FORMAT, PROFILE_IMPORT_VERSION};
 pub use validation::{inspect_profile, ProfileIssues};

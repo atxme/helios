@@ -20,12 +20,20 @@ use anyhow::{Context, Result};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
-/// Default `AllowedIPs`: all traffic goes through the tunnel.
+/// Default `AllowedIPs`: all traffic goes through the tunnel, in both families.
 ///
-/// It's this `0.0.0.0/0`, combined with the adapter lifecycle invariant
-/// (see [`crate::backend`]), that makes WireGuard **drop** packets instead of
+/// It's this capture, combined with the adapter lifecycle invariant (see
+/// [`crate::backend`]), that makes WireGuard **drop** packets instead of
 /// letting them leak in clear when the session is dead.
-pub const DEFAULT_ALLOWED_IPS: &str = "0.0.0.0/0";
+///
+/// `::/0` is there even though the gateway routes no IPv6 for its peers: what
+/// the adapter captures and cannot deliver, WireGuard drops, which is exactly
+/// the kill-switch §3 bis of ADR-001 relies on. With `0.0.0.0/0` alone, a
+/// dual-stack machine sent all of its IPv6 out of the physical interface, in
+/// clear, while the tunnel was up. Spelled in the canonical form of
+/// [`crate::profile_import::normalize_cidr_list`], so a fresh profile never
+/// reads as modified.
+pub const DEFAULT_ALLOWED_IPS: &str = "0.0.0.0/0, ::/0";
 
 /// Enforced keepalive: without traffic, WireGuard doesn't handshake and our
 /// state inference would wrongly conclude the tunnel is down (ADR-001 §3).
@@ -460,6 +468,11 @@ pub struct ClientProfile {
     /// [`crate::profile_import::normalize_cidr_list`]: the screen, the sealed
     /// profile and the peer built from it have to agree character for
     /// character, or a reloaded profile reads as modified.
+    ///
+    /// A stored value is never widened behind the user's back, including the
+    /// `0.0.0.0/0` every profile carried before [`DEFAULT_ALLOWED_IPS`]
+    /// captured IPv6 too: [`ClientProfile::ipv6_uncaptured_full_tunnel`]
+    /// names that case so the screen can warn, and the user decides.
     #[serde(default = "default_allowed_ips")]
     pub allowed_ips: String,
     /// Keepalive in seconds. Defaults to [`DEFAULT_KEEPALIVE_SECS`].
@@ -704,6 +717,20 @@ impl ClientProfile {
     /// one is its result.
     pub fn has_static_psk(&self) -> bool {
         self.has_preshared_key() && !self.preshared_key_is_negotiated
+    }
+
+    /// Does this profile route all IPv4 into the tunnel and let IPv6 out?
+    ///
+    /// The shape of every full tunnel stored before [`DEFAULT_ALLOWED_IPS`]
+    /// captured `::/0`: on a dual-stack machine its IPv6 leaves in clear
+    /// while the tunnel is up. Such a profile is **reported, never rewritten**
+    /// — widening a stored routing table is a decision for the user, taken in
+    /// the editor, not a migration run on load. The rule lives in
+    /// [`crate::profile_import::tunnel_capture`], once, so the screen and
+    /// `helios-ctl` cannot disagree about which profiles it names.
+    pub fn ipv6_uncaptured_full_tunnel(&self) -> bool {
+        crate::profile_import::tunnel_capture(&self.allowed_ips)
+            == crate::profile_import::TunnelCapture::Ipv4Only
     }
 
     /// Public key corresponding to the profile's private key.

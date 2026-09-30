@@ -1341,6 +1341,13 @@ struct ProfileView {
     has_private_key: bool,
     /// Whether a **static** PSK is stored. A negotiated one is never at rest.
     has_static_psk: bool,
+    /// The stored list captures all of IPv4 and lets IPv6 out.
+    ///
+    /// Decided by `orion-core`, not by the screen: the posture panel warns on
+    /// it, and a rule re-derived in TypeScript is one more place for the two
+    /// to disagree about which profiles leak. Reported only — the stored list
+    /// is never widened on the user's behalf.
+    ipv6_uncaptured_full_tunnel: bool,
 }
 
 impl From<&ClientProfile> for ProfileView {
@@ -1359,6 +1366,7 @@ impl From<&ClientProfile> for ProfileView {
             public_key: profile.public_key(),
             has_private_key: !profile.private_key.trim().is_empty(),
             has_static_psk: profile.has_static_psk(),
+            ipv6_uncaptured_full_tunnel: profile.ipv6_uncaptured_full_tunnel(),
         }
     }
 }

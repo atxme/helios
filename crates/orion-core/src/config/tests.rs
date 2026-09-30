@@ -427,6 +427,45 @@ fn disk_roundtrip() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The default full tunnel captures both families, spelled canonically.
+///
+/// `0.0.0.0/0` alone let a dual-stack machine send all of its IPv6 around the
+/// tunnel, in clear. The spelling matters as much: a default the import path
+/// would rewrite reads as an unsaved change on the first reload.
+#[test]
+fn the_default_full_tunnel_captures_both_families() {
+    assert_eq!(DEFAULT_ALLOWED_IPS, "0.0.0.0/0, ::/0");
+    assert_eq!(
+        crate::profile_import::normalize_cidr_list(DEFAULT_ALLOWED_IPS),
+        DEFAULT_ALLOWED_IPS
+    );
+    assert!(crate::profile_import::validate_allowed_ips(DEFAULT_ALLOWED_IPS).is_ok());
+    let fresh = ClientProfile::default();
+    assert_eq!(fresh.allowed_ips, DEFAULT_ALLOWED_IPS);
+    assert!(!fresh.ipv6_uncaptured_full_tunnel());
+}
+
+/// A profile stored with the old IPv4-only default is read back as stored.
+///
+/// The serde default only fills an **absent** field. A stored `0.0.0.0/0` is
+/// a value, and widening it on load would change a routing table nobody
+/// edited: it is flagged instead.
+#[test]
+fn a_stored_ipv4_only_full_tunnel_is_not_widened_on_load() {
+    let raw = r#"
+        selected = "site-a"
+
+        [[profiles]]
+        name = "site-a"
+        endpoint = "203.0.113.10:51820"
+        allowed_ips = "0.0.0.0/0"
+    "#;
+    let loaded: ClientConfig = toml::from_str(raw).unwrap();
+    let profile = loaded.find("site-a").unwrap();
+    assert_eq!(profile.allowed_ips, "0.0.0.0/0");
+    assert!(profile.ipv6_uncaptured_full_tunnel());
+}
+
 #[test]
 fn secrets_masked_in_debug() {
     let p = ClientProfile {

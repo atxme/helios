@@ -78,9 +78,11 @@ export function stateMeta(state: TunnelState): StateMeta {
  *
  * Orion is deliberately **fail-open** (ADR-001 §3 bis): no firewall, no WFP.
  * Its protection relies on a lifecycle invariant — the WireGuard adapter,
- * which captures `0.0.0.0/0`, is never unmounted on failure, only on
- * explicit disconnection. As long as it's mounted, WireGuard **drops**
- * packets for lack of a handshake; there is no leak.
+ * which captures `0.0.0.0/0, ::/0` by default, is never unmounted on failure,
+ * only on explicit disconnection. As long as it's mounted, WireGuard **drops**
+ * what it captures for lack of a handshake; there is no leak. A profile still
+ * holding the old `0.0.0.0/0` alone lets IPv6 out regardless — the posture
+ * panel warns on it (`ipv6_uncaptured_full_tunnel`).
  *
  * This is counter-intuitive and the UI must say so: a tunnel that is gone with
  * the adapter still mounted is not an exposed situation — it is a machine whose

@@ -27,7 +27,8 @@ const profile: ClientProfile = {
   has_private_key: true,
   has_static_psk: false,
   address: '100.64.1.2/32',
-  allowed_ips: '0.0.0.0/0',
+  allowed_ips: '0.0.0.0/0, ::/0',
+  ipv6_uncaptured_full_tunnel: false,
   persistent_keepalive: 25,
   // The speedtest target is fixed inside the WireGuard network; a profile
   // URL is neither required nor consulted.

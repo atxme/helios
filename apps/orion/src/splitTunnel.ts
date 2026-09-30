@@ -45,8 +45,14 @@ const DEFAULT_GATEWAY_HOST = '100.64.0.1'
  */
 const PRIVATE_RANGES = ['10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16'] as const
 
-/** Every prefix, v4. */
-const EVERYTHING = '0.0.0.0/0'
+/**
+ * Every prefix, both families — mirrors `orion_core::DEFAULT_ALLOWED_IPS`.
+ *
+ * `::/0` even though the gateway routes no IPv6: what the adapter captures
+ * and cannot deliver, WireGuard drops. With `0.0.0.0/0` alone, a dual-stack
+ * machine sent its IPv6 around the tunnel, in clear.
+ */
+const EVERYTHING = '0.0.0.0/0, ::/0'
 
 /**
  * The choice a prefix list expresses.
@@ -155,6 +161,40 @@ export function presetPrefixes(
       // address inside `AllowedIPs`, would have nowhere to go.
       return [gatewayPrefix(source), ...PRIVATE_RANGES].join(', ')
   }
+}
+
+/**
+ * The list captures all of IPv4 and lets IPv6 out.
+ *
+ * The full tunnel every profile carried before `::/0` joined the default: it
+ * no longer reads as «Tout» (`matchPreset` finds `custom`), and the editor
+ * warns on it rather than rewriting it — the stored list is the user's.
+ *
+ * A mirror of `orion_core::profile_import::tunnel_capture`, for the one case
+ * the core cannot answer in time: the draft being typed. The stored profile's
+ * verdict arrives from the core as `ipv6_uncaptured_full_tunnel`. Same rule,
+ * same cases pinned by both test suites: an entry whose prefix length is zero
+ * captures its whole family, and no other entry counts. A split tunnel is not
+ * flagged — narrowing the capture is a decision, not a leak.
+ *
+ * The host checks here are looser than the core's IPv6 parser, so the two
+ * agree on every list `inspect_profile` accepts; on a list it refuses, the
+ * screen shows the core's error instead of this warning.
+ */
+export function leavesIpv6Uncaptured(value: string): boolean {
+  let ipv4 = false
+  let ipv6 = false
+  for (const entry of splitPrefixes(value)) {
+    const slash = entry.indexOf('/')
+    if (slash < 0) continue
+    const host = entry.slice(0, slash)
+    const length = entry.slice(slash + 1)
+    // `u8::from_str`, which the core uses: optional `+`, decimal digits.
+    if (!/^\+?\d+$/.test(length) || Number(length) !== 0) continue
+    if (isIpv4(host)) ipv4 = true
+    else if (isIpv6(host)) ipv6 = true
+  }
+  return ipv4 && !ipv6
 }
 
 /**

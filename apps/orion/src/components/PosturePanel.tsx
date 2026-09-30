@@ -107,8 +107,22 @@ export function PosturePanel({ anchor, onClose, state, adapterUp, profile, psk, 
         {/* No amber for a narrowed range. Split tunnelling is a decision the
             operator made — routing a subnet and leaving the rest alone is the
             normal shape of a corporate profile, not a degradation. The amber
-            rows below are for facts the machine reports about itself. */}
-        <Row label="trafic via le tunnel" value={profile?.allowed_ips ?? '—'} />
+            rows below are for facts the machine reports about itself.
+
+            The one exception is not a narrowing: `0.0.0.0/0` alone is the
+            full tunnel as it was before `::/0` joined the default, and on a
+            dual-stack machine its IPv6 leaves in clear with the tunnel up.
+            The core decides which profiles that is; the list is never
+            rewritten for the user. */}
+        {profile?.ipv6_uncaptured_full_tunnel ? (
+          <Row
+            label="trafic via le tunnel"
+            value={`${profile.allowed_ips} — IPv4 seulement, l’IPv6 sort en clair`}
+            tone={AMBER}
+          />
+        ) : (
+          <Row label="trafic via le tunnel" value={profile?.allowed_ips ?? '—'} />
+        )}
       </Box>
 
       {degraded && vault && (

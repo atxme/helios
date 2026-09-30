@@ -129,9 +129,14 @@ private key, gateway public key, VIP, `AllowedIPs`, keep-alive and the PSK the
 negotiation just produced. The Helios API never takes part in that initial
 bring-up, since it lives behind the tunnel.
 
-Orion has no local kill-switch. With `AllowedIPs = 0.0.0.0/0`, the adapter must
-stay up after a failure so WireGuard keeps capturing and dropping packets;
-`down()` is called on explicit disconnection only. A binary built with
+Orion has no local kill-switch. With `AllowedIPs = 0.0.0.0/0, ::/0` (the
+default full tunnel), the adapter must stay up after a failure so WireGuard
+keeps capturing and dropping packets; `down()` is called on explicit
+disconnection only. `::/0` is captured even though the gateway routes no IPv6
+for its peers: WireGuard drops it, which is what keeps a dual-stack machine's
+IPv6 from leaving in clear. A profile stored with `0.0.0.0/0` alone is never
+rewritten; Orion and `helios-ctl profile check` flag it as an IPv4-only full
+tunnel. A binary built with
 `orion/wireguard` refuses to start when the real backend cannot initialise, and
 never falls back to a simulation. Conversely, an Orion **for Windows** built
 without that feature does not compile: the fallback would ship a client that

@@ -24,7 +24,8 @@ const profile = (overrides: Partial<ClientProfile> = {}): ClientProfile => ({
   has_private_key: true,
   has_static_psk: false,
   address: '100.64.1.2/32',
-  allowed_ips: '0.0.0.0/0',
+  allowed_ips: '0.0.0.0/0, ::/0',
+  ipv6_uncaptured_full_tunnel: false,
   persistent_keepalive: 25,
   heliosd_url: 'http://100.64.0.1:8080',
   ssh_target: null,
@@ -183,6 +184,23 @@ describe('Orion presentational branches', () => {
 
     expect(html).toContain('203.0.113.10:51821')
     expect(html).toContain('100.64.0.0/10')
+    // A narrowed range is the operator's decision: stated, not warned about.
+    expect(html).not.toContain('IPv6 sort en clair')
+  })
+
+  /// The full tunnel stored before `::/0` joined the default leaks IPv6 with
+  /// the tunnel up. The core's verdict decides the row, not the panel.
+  it('warns in amber on a full tunnel that leaves IPv6 out', () => {
+    const legacy = postureHtml(
+      profile({ allowed_ips: '0.0.0.0/0', ipv6_uncaptured_full_tunnel: true }),
+      null,
+    )
+    expect(legacy).toContain('0.0.0.0/0 — IPv4 seulement, l’IPv6 sort en clair')
+    expect(legacy).toContain('rgb(161, 98, 7)')
+
+    const dual = postureHtml(profile(), null)
+    expect(dual).toContain('0.0.0.0/0, ::/0')
+    expect(dual).not.toContain('IPv6 sort en clair')
   })
 
   it('server-renders the initial application without starting platform effects', () => {

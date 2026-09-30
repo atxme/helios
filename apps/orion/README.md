@@ -34,7 +34,7 @@ Un profil contient :
 - un nom et l’endpoint `IP:port` ou `FQDN:port` de la gateway ;
 - la clé privée Curve25519 du client et la clé publique de la gateway ;
 - la VIP CGNAT attribuée au client ;
-- `AllowedIPs` (`0.0.0.0/0` par défaut) ;
+- `AllowedIPs` (`0.0.0.0/0, ::/0` par défaut) ;
 - un keepalive persistant de 25 secondes par défaut ;
 - un éventuel PSK post-quantique et l’URL interne de l’API Helios.
 
@@ -48,7 +48,7 @@ n'importe quelle liste de préfixes.
 
 | Choix | `AllowedIPs` écrit |
 | --- | --- |
-| Tout | `0.0.0.0/0` |
+| Tout | `0.0.0.0/0, ::/0` |
 | Réseaux privés | VIP de la gateway en `/32`, puis `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` |
 | Helios seul | VIP de la gateway en `/32` |
 
@@ -68,6 +68,14 @@ post-négociation n'est envoyé qu'à une adresse couverte par `AllowedIPs`
 > les sous-réseaux qui vivent derrière la gateway, et la négociation ne les
 > annonce pas. Quand le sous-réseau visé est connu, **Personnalisé** et ce seul
 > préfixe valent mieux que les trois plages.
+
+> **« Tout » capte aussi l'IPv6.** La gateway ne route aucun IPv6 vers ses
+> pairs : ce que l'adaptateur capte en `::/0`, WireGuard le jette, et c'est ce
+> qui empêche l'IPv6 d'un poste dual-stack de sortir en clair tunnel monté. Un
+> profil enregistré avec `0.0.0.0/0` seul — l'ancien « Tout » — n'est jamais
+> réécrit : il s'ouvre en **Personnalisé**, avec l'avertissement « Tunnel
+> complet IPv4 seulement : le trafic IPv6 sort en clair », repris en ambre dans
+> le panneau de posture. Choisir « Tout » puis enregistrer le corrige.
 
 ### Protection du tunnel
 
@@ -195,7 +203,7 @@ Le format JSON courant est `orion-profile` version 1 :
     "private_key": "base64-de-32-octets",
     "peer_public_key": "base64-de-32-octets",
     "address": "100.64.1.2/32",
-    "allowed_ips": "0.0.0.0/0",
+    "allowed_ips": "0.0.0.0/0, ::/0",
     "persistent_keepalive": 25,
     "heliosd_url": "http://100.64.0.1:8080"
   }
@@ -204,11 +212,12 @@ Le format JSON courant est `orion-profile` version 1 :
 
 `allowed_ips`, `persistent_keepalive`, `heliosd_url` et `preshared_key` sont
 facultatifs. L’adresse virtuelle reste obligatoire : le tunnel initial en a
-besoin avant de pouvoir joindre l’API interne. `AllowedIPs` vaut `0.0.0.0/0` et
-le keepalive 25 secondes lorsqu’ils sont omis. Un `preshared_key` importé est
-traité comme un PSK statique et désactive la négociation ML-KEM automatique ;
-il ne doit être fourni que si les deux pairs portent déjà exactement la même
-valeur.
+besoin avant de pouvoir joindre l’API interne. `AllowedIPs` vaut
+`0.0.0.0/0, ::/0` et le keepalive 25 secondes lorsqu’ils sont omis ; un
+`allowed_ips` explicite est importé tel quel, `0.0.0.0/0` seul compris (il est
+alors signalé, pas élargi). Un `preshared_key` importé est traité comme un PSK
+statique et désactive la négociation ML-KEM automatique ; il ne doit être
+fourni que si les deux pairs portent déjà exactement la même valeur.
 
 ## Cycle de vie et protection anti-fuite
 
@@ -217,7 +226,7 @@ WireGuard rekeyant silencieusement, il n’existe aucun état `rekeying` dans
 l’application.
 
 Orion n’installe pas de pare-feu local. Son invariant est le cycle de vie de
-l’adaptateur : avec `AllowedIPs = 0.0.0.0/0`, l’adaptateur reste monté en
+l’adaptateur : avec `AllowedIPs = 0.0.0.0/0, ::/0`, l’adaptateur reste monté en
 `connecting` et après un échec. WireGuard capture alors les routes et jette les
 paquets si aucun handshake n’est possible. Seule l’action explicite
 « Déconnecter » appelle `down()`.
