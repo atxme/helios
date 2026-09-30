@@ -20,5 +20,11 @@ done
 echo '==> Analyse Rust, toutes les features'
 "$repo_root/scripts/wsl-cargo" clippy --workspace --all-targets --all-features -- -D warnings
 
+echo '==> aether sans la feature de signature'
+# Le workspace unifie les features : un test d'aether qui appelle une fonction
+# signante sans la conditionner compile ici, et casse `cargo test -p aether`
+# partout ailleurs. Ce contrôle est le seul à construire aether sans elle.
+"$repo_root/scripts/wsl-cargo" test -p aether --lib
+
 echo '==> Tests Rust, toutes les features'
 "$repo_root/scripts/wsl-cargo" test --workspace --all-features
