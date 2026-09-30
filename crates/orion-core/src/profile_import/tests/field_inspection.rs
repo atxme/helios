@@ -2,7 +2,9 @@
 //! what an unfinished profile is allowed to leave empty.
 
 use super::fixtures::{complete_profile, CLIENT_PRIVATE};
-use crate::profile_import::{inspect_profile, validate_imported_profile, validate_ssh_target};
+use crate::profile_import::{
+    inspect_profile, tunnel_capture, validate_imported_profile, validate_ssh_target, TunnelCapture,
+};
 use crate::ClientProfile;
 
 /// A mistyped IPv4 must not pass for a domain name.
@@ -143,6 +145,48 @@ fn allowed_ips_accepts_several_prefixes_and_names_the_faulty_one() {
         ..complete_profile()
     };
     assert!(validate_imported_profile(empty).is_err());
+}
+
+/// The full tunnel stored before `::/0` joined the default is named, and
+/// nothing else is.
+///
+/// A split tunnel is not a leak to report: routing one subnet and leaving the
+/// rest alone is a decision the operator took. `0.0.0.0/0` alone is not a
+/// decision of that kind — it is the old default, and a profile still holding
+/// it believes it is protected while its IPv6 leaves in clear.
+#[test]
+fn only_an_ipv4_only_full_tunnel_is_flagged() {
+    for (allowed_ips, expected) in [
+        ("0.0.0.0/0", TunnelCapture::Ipv4Only),
+        ("0.0.0.0/0, ::/0", TunnelCapture::Full),
+        ("100.64.0.1/32, 10.0.0.0/8", TunnelCapture::Partial),
+        ("::/0", TunnelCapture::Partial),
+        // IPv6 routed in part is still IPv6 leaving in part.
+        ("0.0.0.0/0, fd00::/8", TunnelCapture::Ipv4Only),
+        // Read as the rest of the core reads the list: order, spacing and
+        // empty entries change nothing.
+        ("::/0,0.0.0.0/0", TunnelCapture::Full),
+        (" 0.0.0.0/0 ,, ", TunnelCapture::Ipv4Only),
+        ("  ::/0 , 10.0.0.0/8,0.0.0.0/0 ", TunnelCapture::Full),
+        // The address of a whole-family prefix is irrelevant, as it is to
+        // WireGuard: `/0` is the length that decides.
+        ("10.1.2.3/0, 0::/0", TunnelCapture::Full),
+        // What validation refuses captures nothing here either.
+        ("0.0.0.0", TunnelCapture::Partial),
+        ("0.0.0.0/0, ::/zero", TunnelCapture::Ipv4Only),
+        ("", TunnelCapture::Partial),
+    ] {
+        assert_eq!(tunnel_capture(allowed_ips), expected, "{allowed_ips:?}");
+        let profile = ClientProfile {
+            allowed_ips: allowed_ips.into(),
+            ..complete_profile()
+        };
+        assert_eq!(
+            profile.ipv6_uncaptured_full_tunnel(),
+            expected == TunnelCapture::Ipv4Only,
+            "{allowed_ips:?}"
+        );
+    }
 }
 
 /// The allow-list holds against everything a shell could read as syntax.

@@ -344,8 +344,11 @@ mod tests {
         let p = profile();
         let peer = WireGuardBackend::build_peer(&p).unwrap();
 
-        assert_eq!(peer.allowed_ips.len(), 1);
+        // Both families: `::/0` is what makes WireGuard drop IPv6 instead of
+        // letting it leave through the physical interface.
+        assert_eq!(peer.allowed_ips.len(), 2);
         assert_eq!(peer.allowed_ips[0].to_string(), "0.0.0.0/0");
+        assert_eq!(peer.allowed_ips[1].to_string(), "::/0");
         assert_eq!(peer.persistent_keepalive_interval, Some(25));
         assert!(peer.endpoint.is_some());
         assert!(peer.preshared_key.is_none(), "no PSK in this profile");

@@ -508,6 +508,43 @@ fn saving_without_changing_the_key_keeps_the_generation() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A sealed IPv4-only full tunnel stays exactly what it was, until edited.
+///
+/// `::/0` joined the default after profiles were already sealed with
+/// `0.0.0.0/0` alone. Those are warned about, never rewritten: not on load,
+/// not when saved back for an unrelated reason. Only an edit of the list
+/// itself changes it.
+#[test]
+fn a_stored_ipv4_only_full_tunnel_survives_load_and_save_unchanged() {
+    let (dir, store) = store("ipv4-only");
+    let legacy = ClientProfile {
+        allowed_ips: "0.0.0.0/0".into(),
+        ..profile("poste")
+    };
+    store.save_profile(&legacy).unwrap();
+
+    let loaded = store.load().unwrap().profiles.remove(0);
+    assert_eq!(loaded.allowed_ips, "0.0.0.0/0");
+    assert!(loaded.ipv6_uncaptured_full_tunnel());
+
+    // Saved back with another field edited: the list is left alone.
+    let mut edited = loaded;
+    edited.endpoint = "198.51.100.7:51820".into();
+    store.save_profile(&edited).unwrap();
+    let reloaded = store.load().unwrap().profiles.remove(0);
+    assert_eq!(reloaded.endpoint, "198.51.100.7:51820");
+    assert_eq!(reloaded.allowed_ips, "0.0.0.0/0");
+
+    // The user's own edit is the only thing that widens it.
+    let mut widened = reloaded;
+    widened.allowed_ips = crate::DEFAULT_ALLOWED_IPS.into();
+    store.save_profile(&widened).unwrap();
+    let reloaded = store.load().unwrap().profiles.remove(0);
+    assert_eq!(reloaded.allowed_ips, "0.0.0.0/0, ::/0");
+    assert!(!reloaded.ipv6_uncaptured_full_tunnel());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn a_legacy_file_is_migrated_and_removed() {
     let (dir, store) = store("migration");

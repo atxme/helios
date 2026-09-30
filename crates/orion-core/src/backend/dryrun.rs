@@ -71,8 +71,9 @@ impl VpnBackend for DryRunBackend {
         profile.validate_for_data_plane()?;
 
         // 1. The adapter mounts BEFORE any network attempt: from this instant,
-        //    AllowedIPs = 0.0.0.0/0 captures traffic and WireGuard drops it as
-        //    long as the session isn't established. Nothing can leak in clear.
+        //    AllowedIPs (by default 0.0.0.0/0, ::/0) captures traffic and
+        //    WireGuard drops it as long as the session isn't established.
+        //    Nothing it captures can leak in clear.
         self.adapter_up.store(true, Ordering::SeqCst);
         sink(ClientEvent::state(TunnelState::Connecting));
         sink(ClientEvent::log(

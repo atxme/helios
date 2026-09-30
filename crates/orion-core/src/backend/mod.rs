@@ -6,15 +6,21 @@
 //! (ADR-001 §3 bis). Its only protection against leaking in clear is a
 //! lifecycle discipline:
 //!
-//! > The adapter (Wintun) carries `AllowedIPs = 0.0.0.0/0`. It is mounted on
-//! > connection and **is NEVER unmounted on failure** — neither in `Connecting`,
-//! > nor in `Failed`, nor after N attempts. It is removed only on **explicit
-//! > disconnection** by the user or application shutdown.
+//! > The adapter (Wintun) carries `AllowedIPs = 0.0.0.0/0, ::/0`. It is
+//! > mounted on connection and **is NEVER unmounted on failure** — neither in
+//! > `Connecting`, nor in `Failed`, nor after N attempts. It is removed only on
+//! > **explicit disconnection** by the user or application shutdown.
 //!
 //! As long as the adapter holds, packets go out toward WireGuard, which
 //! **drops** them if the session is dead: an attacker who blocks UDP 51820
 //! only gets a denial of service. If it falls, the default route falls back to
 //! the physical interface and traffic exits **in clear**.
+//!
+//! The drop covers what the adapter captures and nothing more. A profile
+//! stored with `0.0.0.0/0` alone — the default before `::/0` joined it — sends
+//! its IPv6 out of the physical interface even with the tunnel up; it is
+//! flagged by [`ClientProfile::ipv6_uncaptured_full_tunnel`], never widened
+//! behind the user's back.
 //!
 //! This is why the trait separates [`VpnBackend::up`] from
 //! [`VpnBackend::down`]: `down` is only called from
@@ -76,7 +82,8 @@ pub type EventSink = Arc<dyn Fn(ClientEvent) + Send + Sync>;
 /// A WireGuard stack capable of mounting/unmounting a tunnel to a gateway.
 #[async_trait]
 pub trait VpnBackend: Send + Sync {
-    /// Mounts the adapter (`AllowedIPs = 0.0.0.0/0`) and configures the peer.
+    /// Mounts the adapter (the profile's `AllowedIPs`, by default
+    /// `0.0.0.0/0, ::/0`) and configures the peer.
     ///
     /// **Contract**: on failure, the implementation must **not** unmount
     /// the adapter if it succeeded in creating it — letting WireGuard drop
