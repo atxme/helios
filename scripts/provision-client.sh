@@ -48,6 +48,9 @@ CE_SCRIPT="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 . "$(dirname "$0")/lib-remote.sh"
 
 cd "$(dirname "$0")/.."
+# shellcheck source=scripts/cargo-budget.sh
+source scripts/cargo-budget.sh
+helios_budget_enter "$PWD"
 
 SORTIE="${HELIOS_PROVISION_OUT:-$PWD}"
 REFAIRE_CA=0

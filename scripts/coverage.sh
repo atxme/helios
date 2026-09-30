@@ -8,6 +8,9 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
+# shellcheck source=scripts/cargo-budget.sh
+source scripts/cargo-budget.sh
+helios_budget_enter "$repo_root"
 
 if ! cargo llvm-cov --version >/dev/null 2>&1; then
   echo 'cargo-llvm-cov is missing: cargo install cargo-llvm-cov --locked' >&2

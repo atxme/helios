@@ -6,6 +6,9 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
+# shellcheck source=scripts/cargo-budget.sh
+source scripts/cargo-budget.sh
+helios_budget_enter "$PWD"
 
 echo '==> Vérifications rapides communes'
 bash "$repo_root/scripts/check.sh"

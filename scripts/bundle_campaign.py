@@ -140,7 +140,9 @@ def run(racine_depot: pathlib.Path, tmp: pathlib.Path, epoque: pathlib.Path,
         version: str, commit: str, target: str, artefacts: pathlib.Path) -> None:
     # L'installateur est exécuté, pas installé : il n'entre pas dans le bundle
     # et sa taille ne regarde donc pas `MAX_BINARY_SIZE`.
-    installateur = racine_depot / "target" / "debug" / "helios-installer"
+    # Là où Cargo l'a écrit : le cache unique quand campaign.sh l'a épinglé.
+    cible_cargo = racine_depot / os.environ.get("CARGO_TARGET_DIR", "target")
+    installateur = cible_cargo / "debug" / "helios-installer"
     bundle = tmp / "bundle" / f"helios-{version}-{target}"
     assembler(racine_depot, bundle, artefacts)
     signer(racine_depot, bundle, epoque, version, commit, target, SEQUENCE)
