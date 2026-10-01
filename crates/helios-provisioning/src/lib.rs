@@ -16,11 +16,12 @@
 //!   cannot bring up the tunnel: WireGuard is built on Noise_IK, the
 //!   responder rejects an initiator it doesn't know. Admission is therefore
 //!   **necessarily out of band**: an operator declares the public key in
-//!   `peers`, via [`admission`]. Its VIP is deterministically derived from it
-//!   by [`ipam`], with no state on disk.
+//!   `peers`, via [`admission`]. Its VIPs are chosen by [`ipam`] — derived
+//!   from the key, collisions resolved — and written to `network.toml`.
 //! * **Provisioning** ([`session`]) — once the classical tunnel is up, the
 //!   control channel *inside* the tunnel automates the ML-KEM exchange, the
-//!   derivation of the post-quantum PSK, and confirmation of the VIP.
+//!   derivation of the post-quantum PSK, and confirmation of the VIPs
+//!   admission persisted.
 //!
 //! The protocol messages and PSK derivation live in [`aether::enroll`], since
 //! the client has to share them.
@@ -59,20 +60,15 @@
 //! response is received, via an idempotent `up()` that never tears down the
 //! adapter.
 //!
-//! # Known limitation: the derived VIP is not reconciled
+//! # One IPAM, one truth about addresses
 //!
-//! [`ipam::assign_vip`] derives the VIP from the peer's public key and never
-//! consults the address declared in `network.toml`. The two can diverge.
-//! Neither end arbitrates: the gateway keeps the address the operator
-//! declared, the client keeps the one from its profile, and the discrepancy
-//! is logged on both sides. Reconciling requires deciding who has
-//! authority — the operator or the derivation — which is beyond the scope of
-//! provisioning.
-//!
-//! [`admission::admit_with_key_negotiation`] **reduces** this gap without eliminating it: it
-//! declares precisely the address the IPAM derives, so a peer admitted this
-//! way does not diverge. What remains are entries written by hand into
-//! `network.toml`, for which the above limitation still holds.
+//! The IPAM runs at admission only, through one collision view and one
+//! allocation point shared by every admission path
+//! (`ADRESSAGE-IPV6.md` §3 bis). What admission writes to `network.toml` is
+//! the peer's address from then on: provisioning returns it and never derives
+//! one, so the address announced to a client is the one the gateway routes.
+//! A divergence can now only come from the client side — a profile emitted
+//! for another address — and Orion reports it as a stale profile.
 
 pub mod admission;
 pub mod certificates;
@@ -80,8 +76,12 @@ pub mod ipam;
 pub mod rotation;
 pub mod session;
 
-pub use admission::{admit_with_key_negotiation, revoke, AdmissionError};
-pub use ipam::{assign_vip, derive_cgnat_ip, IpamError, PeerTable, MAX_VIP_PROBES, POOL_SIZE};
+pub use admission::{
+    admit_with_key_negotiation, revoke, Admission, AdmissionError, AdmissionOutcome,
+};
+pub use ipam::{
+    derive_cgnat_ip, derive_ula_iid, IpamError, LivePeer, IPV6_DOMAIN, MAX_VIP_PROBES, POOL_SIZE,
+};
 pub use rotation::{RotationAction, RotationState, REVERT_AFTER};
 pub use session::{
     handle_request, AdmittedPeers, GatewayIdentity, Provisioned, DEFAULT_PSK_LIFETIME_SECS,

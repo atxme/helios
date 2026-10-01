@@ -37,6 +37,31 @@ fn network_timeout_remains_retryable() {
     assert!(!is_terminal_negotiation_error(&error));
 }
 
+/// §9 criterion 11, client side: the gateway now announces the address it
+/// persisted, which is the one a profile emitted from its record carries —
+/// so a connection made with that profile reports no divergence.
+#[test]
+fn a_profile_carrying_the_persisted_address_raises_no_warning() {
+    assert_eq!(
+        stale_profile_address(Some("100.64.1.2/32"), "100.64.1.2/32"),
+        None
+    );
+    assert_eq!(stale_profile_address(None, "100.64.1.2/32"), None);
+}
+
+/// A divergence names both addresses, calls the profile stale and asks for a
+/// re-emitted one, without telling the user to type the announced address in.
+#[test]
+fn a_profile_with_another_address_is_reported_stale() {
+    let warning = stale_profile_address(Some("100.98.165.218/32"), "100.124.38.30/32")
+        .expect("a divergence is reported");
+    assert!(warning.contains("100.98.165.218/32"), "{warning}");
+    assert!(warning.contains("100.124.38.30/32"), "{warning}");
+    assert!(warning.contains("périmé"), "{warning}");
+    assert!(warning.contains("réémis"), "{warning}");
+    assert!(!warning.contains("corriger le profil"), "{warning}");
+}
+
 fn sink() -> EventSink {
     Arc::new(|_| {})
 }

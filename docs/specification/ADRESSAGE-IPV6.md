@@ -1,7 +1,7 @@
 # Spécification — modèle d'adressage IPv6 du tunnel
 
 **Statut** : proposée le 30 septembre 2026, **validée par l'opérateur le
-1er octobre 2026**, en cours d'implémentation sur `feature/support-ipv6` (§4 et §5 livrés par T07 et T10). La validation porte aussi sur l'IPAM
+1er octobre 2026**, en cours d'implémentation sur `feature/support-ipv6` (§4 et §5 livrés par T07 et T10, §3, §3 bis et §7.1 par T11 et T14). La validation porte aussi sur l'IPAM
 unifié du §3 bis, qui absorbe une partie du chantier « IPAM / adressage
 unifié ». Elle fixe
 les décisions d'adressage que l'étude
@@ -225,6 +225,44 @@ Le cas exige une collision, il est donc rare ; mais il y a deux vérités.
   opérateur, réservée par l'IPAM mais jamais attribuée par lui.
 - Le routage VIP (§6.3) et les `AllowedIPs` (§6.1) consomment le `PeerVips`
   persisté ; ils ne dérivent rien.
+
+### 3 bis.4 Implémentation (T11/T14)
+
+Cette section décrit où vivent les règles ci-dessus ; elle ne change aucune
+décision.
+
+- Dérivation : `helios_provisioning::ipam` — `derive_cgnat_ip` (IPv4,
+  inchangée) et `derive_ula_iid` (§3.1). Les huit octets du condensat sont lus
+  dans l'ordre de l'adresse (gros-boutiste) : l'identifiant `fdff:ffff:ffff:ff80`
+  du §3.2 se compare donc comme le nombre `0xfdff_ffff_ffff_ff80`. Un vecteur
+  de référence fige la formule : la clé `[7u8; 32]` donne l'IID
+  `0xf545e4780e887a7f` au compteur 0.
+- Vue unique : `AddressView::new` (privé à la crate) construit la table de
+  collision des deux familles à partir des pairs déclarés, de la table
+  WireGuard vivante (`LivePeer`) et des réservations. Les IID exclus, `::1` et
+  tout ce qui sort du préfixe sont réservés par
+  `TunnelPrefixV6::check_peer_vip` ; les deux hôtes réservés du `/10` restent
+  écartés par la dérivation IPv4. `DeclaredPeers`, `PeerAddressTable`, le
+  trait `PeerTable` et `assign_vip` n'existent plus.
+- Point d'attribution unique : `AddressView::assign`, privé lui aussi, appelé
+  par `admission::admit_with_key_negotiation` seulement. Il rend un `PeerVips`
+  complet, garde toute adresse déclarée et n'attribue que la famille manquante.
+- Table vivante à l'admission : `POST /api/peers` (chemin de `helios-ctl peer`
+  et `helios-ctl enroll`) passe l'instantané que l'orchestrateur republie ;
+  `heliosd peer add` n'en passe aucun, ce processus n'ayant pas de plan de
+  données. Les pairs déclarés sont toujours dans la vue.
+- Réadmission : même nom, même clé et même identité (rôle, empreintes,
+  plancher) rendent `Unchanged`, ou `Ipv6Added` si la gateway a gagné un
+  préfixe depuis ; une autre identité est refusée (`ReadmissionDiffers`). Une
+  réadmission n'écrit `network.toml` que si elle l'a modifié, et n'enregistre
+  aucune génération de certificats.
+- Provisioning : `session::handle_request` lit `WgPeer::vips` et remplit
+  `assigned_address` et `assigned_address_v6` ; une adresse déclarée illisible
+  donne `EnrollError::UndeclaredAddress` (HTTP 500). L'avertissement d'écart de
+  l'installation de PSK (`heliosd`) reste comme garde-fou : il ne se déclenche
+  plus que si `network.toml` a été rechargé entre la lecture et
+  l'installation. Côté Orion, un écart signale un profil périmé, à faire
+  réémettre par l'opérateur ; Orion ne réécrit pas le profil.
 
 ## 4. Types canoniques
 

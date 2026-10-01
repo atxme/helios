@@ -9,7 +9,9 @@ use serde::{Deserialize, Serialize};
 use crate::secret::SecretString;
 
 use crate::error::{HeliosError, Result};
-use crate::net::{format_vip_v6, parse_vip_v6, AddressError, TunnelPrefixV6};
+use crate::net::{
+    format_vip_v6, parse_vip_v4, parse_vip_v6, AddressError, PeerVips, TunnelPrefixV6,
+};
 use crate::policy::{FirewallPolicy, NordvpnMeshnetPolicy, PolicyMode};
 use crate::speedtest::SPEEDTEST_PORT;
 
@@ -583,6 +585,19 @@ impl<'a> PersistedNetworkConfig<'a> {
 pub const DEFAULT_PERSISTENT_KEEPALIVE_SECS: u16 = 25;
 
 impl WgPeer {
+    /// The VIPs this peer was admitted with, as `network.toml` declares them.
+    ///
+    /// The persisted pair is the one truth about a peer's addresses
+    /// (`ADRESSAGE-IPV6.md` §3 bis.2, rule 3): provisioning reads it here
+    /// rather than deriving anything. An `address` that is not one IPv4 host
+    /// in `/32` form is refused, never repaired.
+    pub fn vips(&self) -> std::result::Result<PeerVips, AddressError> {
+        Ok(PeerVips {
+            v4: parse_vip_v4(&self.address)?,
+            v6: self.address_v6,
+        })
+    }
+
     /// Makes a second, independent copy of the peer, PSK included.
     ///
     /// Replaces the `Clone` derive, for the reason [`NetworkConfig::duplicate`]

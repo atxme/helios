@@ -7,6 +7,7 @@ use aether::{
 };
 use axum::{extract::State, http::StatusCode, Json};
 use helios_firewall::ruleset;
+use helios_provisioning::AdmissionOutcome;
 use helios_wireguard::PeerStatus;
 use serde::{Deserialize, Serialize};
 
@@ -510,6 +511,19 @@ pub async fn peer_admit(
     Json(body): Json<PeerAdmitRequest>,
 ) -> Result<Json<PeerSummary>, (StatusCode, String)> {
     let mut updated = s.network.read().await.duplicate();
+    // The collision view takes the live WireGuard table as well as the
+    // declared peers (`ADRESSAGE-IPV6.md` §3 bis.2, rule 2). This is the
+    // snapshot the orchestrator republishes, not a fresh read of the backend:
+    // it lags by at most one poll, and what it could miss — a peer added
+    // since — is in the declared table anyway.
+    let live_snapshot = s.peer_runtime.read().await.clone();
+    let live: Vec<helios_provisioning::LivePeer<'_>> = live_snapshot
+        .iter()
+        .map(|peer| helios_provisioning::LivePeer {
+            public_key: &peer.public_key,
+            allowed_ips: &peer.allowed_ips,
+        })
+        .collect();
     // `ml_kem` unconditionally. The v4 default fell back to `classic` when no
     // PQ certificate was supplied, which quietly produced peers whose first
     // handshake was unprotected; the admission layer now refuses such a peer
@@ -517,8 +531,9 @@ pub async fn peer_admit(
     let minimum_mode = body
         .minimum_key_negotiation_mode
         .unwrap_or(ProtectionMode::MlKem);
-    let peer = helios_provisioning::admit_with_key_negotiation(
+    let admission = helios_provisioning::admit_with_key_negotiation(
         &mut updated,
+        &live,
         &body.name,
         &body.public_key,
         body.admin,
@@ -527,18 +542,38 @@ pub async fn peer_admit(
         minimum_mode,
     )
     .map_err(admission_status)?;
+    let peer = &admission.peer;
 
     // The certificate registry **before** the configuration is written: a peer
     // in `network.toml` with no registry row is a client that connects and can
     // never renew, and nothing later says so. The reverse — a row for a peer
     // whose admission then failed to persist — is caught by the next
     // admission, which is idempotent for an unchanged peer.
-    register_first_generation(&s, &body, &peer).await?;
+    //
+    // A readmission registers nothing: the peer's generation was recorded
+    // when it was first admitted, and recording it again would replace
+    // whatever renewal state the registry has kept since.
+    if admission.outcome == AdmissionOutcome::Admitted {
+        register_first_generation(&s, &body, peer).await?;
+    }
 
-    apply_network(&s, updated).await?;
+    let summary = updated
+        .peers
+        .iter()
+        .find(|declared| declared.name == peer.name)
+        .map_or_else(|| PeerSummary::from_config(peer), PeerSummary::from_config);
+    if admission.changed_config() {
+        apply_network(&s, updated).await?;
+    }
 
-    tracing::info!(peer = %peer.name, vip = %peer.address, admin = peer.admin, "peer admitted");
-    Ok(Json(PeerSummary::from_config(&peer)))
+    tracing::info!(
+        peer = %peer.name,
+        vip = %peer.address,
+        admin = peer.admin,
+        outcome = ?admission.outcome,
+        "peer admitted"
+    );
+    Ok(Json(summary))
 }
 
 /// Hands the peer's first generation to the certificate registry.
@@ -693,9 +728,12 @@ fn admission_status(error: helios_provisioning::AdmissionError) -> (StatusCode, 
         // what v5 requires — a PQ identity, and the `ml_kem` floor.
         | E::MissingNegotiationIdentity
         | E::FloorBelowMlKem(_) => StatusCode::BAD_REQUEST,
-        E::NameTaken(_) | E::KeyTaken(_) => StatusCode::CONFLICT,
+        E::NameTaken(_) | E::KeyTaken(_) | E::ReadmissionDiffers(_) => StatusCode::CONFLICT,
         E::Unknown(_) => StatusCode::NOT_FOUND,
         E::Ipam(_) => StatusCode::INSUFFICIENT_STORAGE,
+        // The peer table holds an address the gateway cannot read: its
+        // configuration is at fault, not the request.
+        E::UndeclaredAddress { .. } => StatusCode::INTERNAL_SERVER_ERROR,
     };
     (code, error.to_string())
 }

@@ -55,8 +55,13 @@ pub struct ProvisionOutcome {
     /// a bare `String` would print the PSK into any log that formats it
     /// (ADR-006 §5).
     pub preshared_key: aether::SecretString,
-    /// VIP assigned by the gateway (CIDR).
+    /// VIP assigned by the gateway (CIDR): the one persisted for this peer.
     pub address: String,
+    /// IPv6 VIP persisted for this peer (`…/128`), when it has one.
+    ///
+    /// Carried, not applied yet: putting it on the adapter belongs to the
+    /// dual-stack client (`ETUDE-IPV6.md`, ticket T19).
+    pub address_v6: Option<String>,
     /// Gateway's WireGuard public key, as it declares itself.
     pub gateway_public_key: String,
     /// Announced validity duration of the PSK.
@@ -140,6 +145,7 @@ pub fn finish(
     Ok(ProvisionOutcome {
         preshared_key: aether::enroll::psk_to_base64(&psk).into(),
         address: response.assigned_address.clone(),
+        address_v6: response.assigned_address_v6.clone(),
         gateway_public_key: response.gateway_wg_public_key.clone(),
         lifetime: Duration::from_secs(u64::from(response.psk_lifetime_secs)),
     })
@@ -275,6 +281,7 @@ mod tests {
             kem_ciphertext: ciphertext,
             gateway_nonce,
             assigned_address: "100.64.1.2/32".into(),
+            assigned_address_v6: None,
             gateway_wg_public_key: GATEWAY_PUB.into(),
             psk_lifetime_secs: 3600,
         };
@@ -287,6 +294,7 @@ mod tests {
             "the client must derive exactly the PSK the gateway computed"
         );
         assert_eq!(outcome.address, "100.64.1.2/32");
+        assert_eq!(outcome.address_v6, None);
         assert_eq!(outcome.lifetime, Duration::from_secs(3600));
     }
 
@@ -299,6 +307,7 @@ mod tests {
         let outcome = ProvisionOutcome {
             preshared_key: "PSK-QUI-NE-DOIT-PAS-FUIR".into(),
             address: "100.64.1.2/32".into(),
+            address_v6: None,
             gateway_public_key: GATEWAY_PUB.into(),
             lifetime: Duration::from_secs(3600),
         };
@@ -327,6 +336,7 @@ mod tests {
             kem_ciphertext: ciphertext,
             gateway_nonce: [0; NONCE_LEN],
             assigned_address: "100.64.1.2/32".into(),
+            assigned_address_v6: None,
             // A different identity than the one expected by the profile.
             gateway_wg_public_key: "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=".into(),
             psk_lifetime_secs: 3600,
@@ -347,6 +357,7 @@ mod tests {
             kem_ciphertext: vec![0u8; 10],
             gateway_nonce: [0; NONCE_LEN],
             assigned_address: "100.64.1.2/32".into(),
+            assigned_address_v6: None,
             gateway_wg_public_key: GATEWAY_PUB.into(),
             psk_lifetime_secs: 3600,
         };

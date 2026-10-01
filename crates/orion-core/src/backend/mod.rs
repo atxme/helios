@@ -228,20 +228,8 @@ async fn upgrade_to_post_quantum(
         }
     };
 
-    // The announced VIP must match the profile's. We don't silently correct
-    // it: the adapter's address is already set, and changing it under a live
-    // session's feet would do more harm than good.
-    if let Some(declared) = profile.address.as_deref() {
-        if declared != outcome.address {
-            sink(ClientEvent::log(
-                "warn",
-                format!(
-                    "La gateway attribue {} alors que le profil déclare {declared} — \
-                     corriger le profil puis se reconnecter",
-                    outcome.address
-                ),
-            ));
-        }
+    if let Some(warning) = stale_profile_address(profile.address.as_deref(), &outcome.address) {
+        sink(ClientEvent::log("warn", warning));
     }
 
     let upgraded = ClientProfile {
@@ -281,6 +269,31 @@ async fn upgrade_to_post_quantum(
             ));
         }
     }
+}
+
+/// What to tell the user when the profile's VIP is not the one the gateway
+/// announced, or `None` when they agree.
+///
+/// The gateway announces the address persisted for this peer at admission —
+/// the one its `AllowedIPs` carry — and no longer a re-derivation that could
+/// disagree with it (`ADRESSAGE-IPV6.md` §3 bis.2). A difference therefore
+/// means this profile is stale: it was emitted for another address, or
+/// before the peer was readmitted. Its traffic leaves from an address the
+/// gateway drops. The fix is a profile re-emitted by the operator, from the
+/// gateway's own record; Orion neither edits the address by hand nor
+/// rewrites the profile on its own, like for `AllowedIPs`: the adapter's
+/// address is already set, and changing it under a live session's feet would
+/// do more harm than good.
+fn stale_profile_address(profile_address: Option<&str>, announced: &str) -> Option<String> {
+    let declared = profile_address?;
+    (declared != announced).then(|| {
+        format!(
+            "Profil périmé : la gateway a enregistré {announced} pour ce poste, le profil \
+             déclare {declared}. La gateway rejette le trafic émis depuis {declared}. Demander \
+             à l'opérateur un profil réémis (helios-ctl profile emit) puis le réimporter ; \
+             Orion ne modifie pas le profil de lui-même."
+        )
+    })
 }
 
 /// Connection controller: holds the tunnel's current state and orchestrates

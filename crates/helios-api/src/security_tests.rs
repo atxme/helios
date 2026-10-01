@@ -636,6 +636,97 @@ async fn duplicate_admission_is_a_conflict() {
     }
 }
 
+/// The remote admission path hands the live WireGuard table to the
+/// collision view: a peer the data plane carries holds its address even
+/// when `network.toml` does not declare it (`ADRESSAGE-IPV6.md` §3 bis.2).
+#[tokio::test]
+async fn admission_avoids_an_address_held_in_the_live_table() {
+    let (_lock, _path) = isolated_config().await;
+    let (state, mut cmd_rx) = state();
+    let natural = helios_provisioning::derive_cgnat_ip(&[2u8; 32], 0);
+    state.peer_runtime.write().await.push(PeerStatus {
+        public_key: vec![9u8; 32],
+        allowed_ips: vec![format!("{natural}/32")],
+        last_handshake: None,
+        endpoint: None,
+        rx_bytes: 0,
+        tx_bytes: 0,
+    });
+
+    let response = router(state)
+        .oneshot(admin_request(
+            "/api/peers",
+            &format!(r#"{{"name":"laptop","public_key":"{NEW_KEY}",{ADMIT_IDENTITY}}}"#),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let probed = helios_provisioning::derive_cgnat_ip(&[2u8; 32], 1);
+    assert_eq!(json["address"], format!("{probed}/32"));
+    let _ = cmd_rx.recv().await;
+}
+
+/// §9 criterion 12 through the API: readmitting the same identity answers
+/// with the same address and writes nothing; once the gateway has a tunnel
+/// prefix, readmission declares the IPv6 VIP alone.
+#[tokio::test]
+async fn readmission_keeps_the_vip_and_only_adds_the_ipv6_one() {
+    let (_lock, _path) = isolated_config().await;
+    let (state, mut cmd_rx) = state();
+    let body = format!(r#"{{"name":"laptop","public_key":"{NEW_KEY}",{ADMIT_IDENTITY}}}"#);
+    let admit = |state: AppState| {
+        let request = admin_request("/api/peers", &body);
+        async move { router(state).oneshot(request).await.unwrap() }
+    };
+
+    assert_eq!(admit(state.clone()).await.status(), StatusCode::OK);
+    let admitted = match cmd_rx.recv().await {
+        Some(OrchestratorCmd::LoadNetworkConfig(config)) => config,
+        other => panic!("unexpected command: {other:?}"),
+    };
+    let address = admitted.peers[1].address.clone();
+    // What the orchestrator would do with it.
+    *state.network.write().await = *admitted;
+
+    let again = admit(state.clone()).await;
+    assert_eq!(again.status(), StatusCode::OK);
+    let body_again = to_bytes(again.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body_again).unwrap();
+    assert_eq!(json["address"], address.as_str());
+    assert!(
+        cmd_rx.try_recv().is_err(),
+        "an unchanged readmission has nothing to apply"
+    );
+
+    let prefix: aether::net::TunnelPrefixV6 = "fd3c:91a2:7e04::1/64".parse().unwrap();
+    state.network.write().await.wg_address_v6 = Some(prefix);
+    assert_eq!(admit(state.clone()).await.status(), StatusCode::OK);
+    match cmd_rx.recv().await {
+        Some(OrchestratorCmd::LoadNetworkConfig(config)) => {
+            let laptop = &config.peers[1];
+            assert_eq!(laptop.address, address, "the IPv4 VIP is untouched");
+            let iid = helios_provisioning::derive_ula_iid(&[2u8; 32], 0);
+            assert_eq!(
+                laptop.address_v6,
+                Some(std::net::Ipv6Addr::from(
+                    u128::from(prefix.network()) | u128::from(iid)
+                ))
+            );
+            assert_eq!(
+                config.peers[0]
+                    .preshared_key
+                    .as_ref()
+                    .map(aether::SecretString::expose),
+                Some(PEER_PSK),
+                "the other peer's PSK survives the readmission"
+            );
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn revocation_removes_the_peer_and_refuses_an_unknown_one() {
     let (_lock, _path) = isolated_config().await;

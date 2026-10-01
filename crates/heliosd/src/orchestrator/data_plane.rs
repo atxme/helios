@@ -141,20 +141,27 @@ pub(super) async fn install_peer_psk(
                 return;
             }
             Some(peer) => {
-                // The address declared by the operator is authoritative and
-                // is **not** overwritten by the derived VIP. `AllowedIPs` is
+                // The declared address is authoritative and is **not**
+                // overwritten by the one in the request. `AllowedIPs` is
                 // WireGuard's cryptographic routing table: changing it under
-                // a live session, while the client keeps its profile's
-                // address, would cut off traffic. The divergence is
-                // reported, not silently resolved — see the module's known
-                // limitation.
+                // a live session would cut off traffic.
+                //
+                // Both senders read `address` from this same declaration —
+                // provisioning returns the persisted VIP since the unified
+                // IPAM (`ADRESSAGE-IPV6.md` §3 bis.2, rule 4), and the key
+                // negotiation copies `peer.address`. A difference is
+                // therefore no longer a derivation disagreeing with the
+                // operator; it means `network.toml` was reloaded with a new
+                // address for this peer between their read and this
+                // installation. Kept as a defensive check, reported rather
+                // than resolved.
                 if peer.address != address {
                     warn!(
                         peer = %public_key,
                         declared = %peer.address,
-                        derived = %address,
-                        "the derived VIP differs from the declared address: \
-                         the declared address is kept"
+                        requested = %address,
+                        "the PSK request names another VIP than the one now declared \
+                         (configuration reloaded meanwhile): the declared address is kept"
                     );
                 }
                 // `previous` is a `SecretString`, so the value displaced by
