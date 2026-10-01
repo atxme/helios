@@ -18,6 +18,9 @@
 //! check, [`PeerVips::check_against`]: the prefix is gateway configuration,
 //! not something a peer's own record carries.
 //!
+//! [`Ipv6TunnelStatus`] is the other side of the prefix: whether the gateway
+//! actually installed it on its data plane, or why not (§6.2).
+//!
 //! # Representation
 //!
 //! Hosts are `std::net` addresses. The only prefix arithmetic needed is a
@@ -325,6 +328,50 @@ pub fn format_vip_v6(vip: Ipv6Addr) -> String {
 /// every native IPv6 address.
 pub fn canonical_source(source: IpAddr) -> IpAddr {
     source.to_canonical()
+}
+
+/// What the gateway's last bring-up did with IPv6 inside the tunnel (§6.2).
+///
+/// Published by `heliosd` and read by the API, which reports it as
+/// `"installed"`, `"not_configured"` or `{"unavailable": {"reason": …}}`.
+/// `Unavailable` is the visible degraded state: the gateway runs IPv4-only,
+/// and its peers' IPv6 VIPs are not in their `AllowedIPs`, so WireGuard drops
+/// their IPv6 traffic exactly as for a peer without one. It opens nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Ipv6TunnelStatus {
+    /// No `wg_address_v6`: the gateway behaves exactly as without IPv6
+    /// (§2.2). Also the value before the first bring-up.
+    #[default]
+    NotConfigured,
+    /// `<prefix>::1/64` is on the interface and the peers' `/128` are in
+    /// their `AllowedIPs`.
+    Installed,
+    /// A prefix is configured but could not be installed.
+    Unavailable(Ipv6Unavailable),
+}
+
+/// Why a configured IPv6 tunnel prefix was not installed (§6.2).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "reason", rename_all = "snake_case")]
+pub enum Ipv6Unavailable {
+    /// The interface MTU is below the IPv6 minimum; Linux would strip IPv6
+    /// from the interface.
+    #[error(
+        "the tunnel MTU of {tunnel_mtu} bytes is below the {minimum} bytes IPv6 requires (RFC 8200)"
+    )]
+    TunnelMtuTooSmall { tunnel_mtu: u32, minimum: u32 },
+    /// The kernel has IPv6 disabled for new interfaces.
+    #[error("the kernel has IPv6 disabled ({setting} = 1)")]
+    DisabledByKernel { setting: String },
+    /// The kernel has no IPv6 stack at all (booted with `ipv6.disable=1`, or
+    /// built without it).
+    #[error("the kernel has no IPv6 stack ({path} does not exist)")]
+    NoKernelSupport { path: String },
+    /// The bring-up with the IPv6 address failed, and the one without it
+    /// succeeded.
+    #[error("bringing the interface up with {address} failed ({detail}); it came up without it")]
+    AddressRefused { address: String, detail: String },
 }
 
 /// Splits `address/length`, refusing a zone identifier and any length not

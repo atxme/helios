@@ -56,7 +56,7 @@ fn configured_network() -> NetworkConfig {
 async fn handshake_promotion_goes_through_the_main_loop() {
     let network = Arc::new(RwLock::new(configured_network()));
     let wireguard = Arc::new(helios_wireguard::DryRunBackend::with_handshakes());
-    let (iface, peers) = wg_config(&*network.read().await);
+    let (iface, peers) = wg_config(&*network.read().await, &Ipv6TunnelStatus::NotConfigured);
     wireguard
         .up(&iface, &peers)
         .await
@@ -198,7 +198,7 @@ async fn a_session_without_psk_is_reported_as_classic() {
 fn wireguard_projection_keeps_the_interface_and_required_secrets() {
     let network = configured_network();
 
-    let (iface, peers) = wg_config(&network);
+    let (iface, peers) = wg_config(&network, &Ipv6TunnelStatus::NotConfigured);
 
     assert_eq!(iface.name, "helios0");
     assert_eq!(iface.private_key.as_str(), PRIVATE_KEY);
@@ -365,6 +365,15 @@ async fn request_installation(
     wg: &dyn WireguardBackend,
     public_key: &str,
 ) -> Result<(), String> {
+    request_installation_with(shared, wg, public_key, Ipv6TunnelStatus::NotConfigured).await
+}
+
+async fn request_installation_with(
+    shared: &Arc<RwLock<NetworkConfig>>,
+    wg: &dyn WireguardBackend,
+    public_key: &str,
+    ipv6: Ipv6TunnelStatus,
+) -> Result<(), String> {
     let (events, _) = broadcast::channel(8);
     let (reply, response) = tokio::sync::oneshot::channel();
     install_peer_psk(
@@ -376,6 +385,7 @@ async fn request_installation(
         },
         shared,
         wg,
+        &Arc::new(RwLock::new(ipv6)),
         &events,
     )
     .await;
@@ -485,6 +495,7 @@ async fn dry_run_connection_stays_blocked_until_handshake() {
         &firewall,
         &network.firewall_policy(),
         true,
+        &Arc::new(RwLock::new(Ipv6TunnelStatus::NotConfigured)),
     )
     .await
     .unwrap();
@@ -504,7 +515,7 @@ async fn disconnection_tears_down_wireguard_and_re_engages_the_kill_switch() {
     let (internal_tx, _internal_rx) = mpsc::channel(1);
     let firewall = DryRunBackend;
     let wireguard = helios_wireguard::DryRunBackend::new();
-    let (iface, peers) = wg_config(&network);
+    let (iface, peers) = wg_config(&network, &Ipv6TunnelStatus::NotConfigured);
     wireguard.up(&iface, &peers).await.unwrap();
     let mut current_policy = network.firewall_policy();
     current_policy.mss_clamp = Some(1380);
@@ -522,6 +533,7 @@ async fn disconnection_tears_down_wireguard_and_re_engages_the_kill_switch() {
         &policy,
         // TPM disabled: this test does not perform a key rotation.
         &helios_tpm::BootDecision::Disabled,
+        &Arc::new(RwLock::new(Ipv6TunnelStatus::NotConfigured)),
     )
     .await
     .unwrap();
@@ -559,6 +571,7 @@ async fn reload(
         &policy,
         // TPM disabled: a reload performs no key rotation.
         &helios_tpm::BootDecision::Disabled,
+        &Arc::new(RwLock::new(Ipv6TunnelStatus::NotConfigured)),
     )
     .await
     .unwrap();
@@ -613,4 +626,338 @@ async fn a_tunnel_prefix_change_is_refused_until_restart() {
     };
     assert!(message.contains("wg_address_v6"), "{message}");
     assert!(message.contains("restart"), "{message}");
+}
+
+// ─── IPv6 on the data plane (`ADRESSAGE-IPV6.md` §6.1, §6.2) ─────────────────
+
+const PREFIX: &str = "fd3c:91a2:7e04::1/64";
+const PEER_VIP_V6: &str = "fd3c:91a2:7e04::2/128";
+
+fn addresses_and_allowed_ips(
+    network: &NetworkConfig,
+    ipv6: &Ipv6TunnelStatus,
+) -> (Vec<String>, Vec<String>) {
+    let (iface, peers) = wg_config(network, ipv6);
+    (iface.addresses, peers[0].allowed_ips.clone())
+}
+
+/// Criterion 6: without `wg_address_v6`, nothing changes — whatever the
+/// status says, since no status can conjure a prefix the file does not have.
+#[test]
+fn a_gateway_without_a_prefix_projects_exactly_the_ipv4_data_plane() {
+    let network = configured_network();
+    for ipv6 in [
+        Ipv6TunnelStatus::NotConfigured,
+        Ipv6TunnelStatus::Installed,
+        Ipv6TunnelStatus::Unavailable(Ipv6Unavailable::TunnelMtuTooSmall {
+            tunnel_mtu: 1200,
+            minimum: 1280,
+        }),
+    ] {
+        let (iface, peers) = wg_config(&network, &ipv6);
+        assert_eq!(iface.addresses, ["100.64.0.1/10"], "{ipv6:?}");
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].allowed_ips, ["100.64.1.2/32"], "{ipv6:?}");
+    }
+    assert_eq!(
+        ipv6_installability(&network, 576, std::path::Path::new("/nonexistent")),
+        Ipv6TunnelStatus::NotConfigured,
+        "a gateway without a prefix is not degraded, and nothing is read for it"
+    );
+}
+
+/// Criterion 7: exactly `{v4/32, v6/128}` per peer and `[wg_address,
+/// prefix::1/64]` on the interface.
+#[test]
+fn an_installed_prefix_adds_exactly_one_host_per_family() {
+    let (addresses, allowed) =
+        addresses_and_allowed_ips(&dual_stack_network(), &Ipv6TunnelStatus::Installed);
+    assert_eq!(addresses, ["100.64.0.1/10", PREFIX]);
+    assert_eq!(allowed, ["100.64.1.2/32", PEER_VIP_V6]);
+}
+
+/// A peer admitted before the gateway had a prefix keeps its IPv4 alone
+/// (§8): the projection adds nothing it was not given.
+#[test]
+fn a_peer_without_an_ipv6_vip_keeps_its_ipv4_alone() {
+    let mut network = dual_stack_network();
+    network.peers[0].address_v6 = None;
+    let (addresses, allowed) = addresses_and_allowed_ips(&network, &Ipv6TunnelStatus::Installed);
+    assert_eq!(addresses, ["100.64.0.1/10", PREFIX]);
+    assert_eq!(allowed, ["100.64.1.2/32"]);
+}
+
+/// Criterion 8, projection half: unavailable means absent from the interface
+/// *and* from every `AllowedIPs`, or the data plane would contradict itself.
+#[test]
+fn an_unavailable_prefix_is_neither_on_the_interface_nor_in_allowed_ips() {
+    let unavailable = Ipv6TunnelStatus::Unavailable(Ipv6Unavailable::DisabledByKernel {
+        setting: "net.ipv6.conf.all.disable_ipv6".into(),
+    });
+    let (addresses, allowed) = addresses_and_allowed_ips(&dual_stack_network(), &unavailable);
+    assert_eq!(addresses, ["100.64.0.1/10"]);
+    assert_eq!(allowed, ["100.64.1.2/32"]);
+}
+
+/// A kernel `conf` directory with the two settings the decision reads.
+fn ipv6_conf(all: &str, default: &str) -> tempfile::TempDir {
+    let directory = tempfile::tempdir().expect("tempdir");
+    for (scope, value) in [("all", all), ("default", default)] {
+        std::fs::create_dir(directory.path().join(scope)).expect("scope directory");
+        std::fs::write(directory.path().join(scope).join("disable_ipv6"), value).expect("setting");
+    }
+    directory
+}
+
+#[test]
+fn ipv6_is_installable_on_a_wide_enough_tunnel_with_ipv6_enabled() {
+    let conf = ipv6_conf("0\n", "0\n");
+    assert_eq!(
+        ipv6_installability(&dual_stack_network(), 1420, conf.path()),
+        Ipv6TunnelStatus::Installed
+    );
+    assert_eq!(
+        ipv6_installability(&dual_stack_network(), 1280, conf.path()),
+        Ipv6TunnelStatus::Installed,
+        "1280 is the IPv6 minimum itself, not below it"
+    );
+}
+
+#[test]
+fn a_tunnel_below_1280_bytes_cannot_carry_ipv6() {
+    let conf = ipv6_conf("0\n", "0\n");
+    assert_eq!(
+        ipv6_installability(&dual_stack_network(), 1279, conf.path()),
+        Ipv6TunnelStatus::Unavailable(Ipv6Unavailable::TunnelMtuTooSmall {
+            tunnel_mtu: 1279,
+            minimum: 1280,
+        })
+    );
+}
+
+#[test]
+fn disable_ipv6_for_new_or_all_interfaces_is_named() {
+    for (all, default, scope) in [("1\n", "0\n", "all"), ("0\n", "1\n", "default")] {
+        let conf = ipv6_conf(all, default);
+        assert_eq!(
+            ipv6_installability(&dual_stack_network(), 1420, conf.path()),
+            Ipv6TunnelStatus::Unavailable(Ipv6Unavailable::DisabledByKernel {
+                setting: format!("net.ipv6.conf.{scope}.disable_ipv6"),
+            })
+        );
+    }
+}
+
+#[test]
+fn a_kernel_without_an_ipv6_stack_is_named() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let status = ipv6_installability(&dual_stack_network(), 1420, directory.path());
+    assert!(
+        matches!(
+            &status,
+            Ipv6TunnelStatus::Unavailable(Ipv6Unavailable::NoKernelSupport { path })
+                if path.ends_with("disable_ipv6")
+        ),
+        "{status:?}"
+    );
+}
+
+/// What a bring-up left behind: the interface, the peers, the published
+/// status and the events.
+struct BringUp {
+    wireguard: helios_wireguard::DryRunBackend,
+    state: Arc<RwLock<TunnelState>>,
+    ipv6: Ipv6TunnelStatus,
+    events: Vec<HeliosEvent>,
+}
+
+async fn bring_up(
+    network: &NetworkConfig,
+    candidate: Ipv6TunnelStatus,
+    wireguard: helios_wireguard::DryRunBackend,
+) -> anyhow::Result<BringUp> {
+    let state = Arc::new(RwLock::new(TunnelState::Down));
+    let shared_ipv6 = Arc::new(RwLock::new(Ipv6TunnelStatus::default()));
+    let (event_tx, mut received) = broadcast::channel(32);
+    connect_with_ipv6(
+        network,
+        candidate,
+        &wireguard,
+        &state,
+        &event_tx,
+        &DryRunBackend,
+        &network.firewall_policy(),
+        true,
+        &shared_ipv6,
+    )
+    .await?;
+    let mut events = Vec::new();
+    while let Ok(event) = received.try_recv() {
+        events.push(event);
+    }
+    let ipv6 = shared_ipv6.read().await.clone();
+    Ok(BringUp {
+        wireguard,
+        state,
+        ipv6,
+        events,
+    })
+}
+
+fn warnings(events: &[HeliosEvent]) -> Vec<&str> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            HeliosEvent::Log { level, message } if level == "warn" => Some(message.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn an_installed_prefix_reaches_the_interface_and_the_peers() {
+    let up = bring_up(
+        &dual_stack_network(),
+        Ipv6TunnelStatus::Installed,
+        helios_wireguard::DryRunBackend::new(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        up.wireguard.interface_addresses(),
+        ["100.64.0.1/10", PREFIX]
+    );
+    assert_eq!(
+        up.wireguard.peers().await.unwrap()[0].allowed_ips,
+        ["100.64.1.2/32", PEER_VIP_V6]
+    );
+    assert_eq!(up.ipv6, Ipv6TunnelStatus::Installed);
+    assert!(warnings(&up.events).is_empty(), "{:?}", up.events);
+}
+
+/// Criterion 8: a prefix that cannot be installed leaves an IPv4-only
+/// gateway, says why on the event stream, and publishes the reason.
+#[tokio::test]
+async fn a_tunnel_too_narrow_for_ipv6_starts_ipv4_only_and_says_so() {
+    let reason = Ipv6Unavailable::TunnelMtuTooSmall {
+        tunnel_mtu: 1200,
+        minimum: 1280,
+    };
+    let up = bring_up(
+        &dual_stack_network(),
+        Ipv6TunnelStatus::Unavailable(reason.clone()),
+        helios_wireguard::DryRunBackend::new(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(up.wireguard.interface_addresses(), ["100.64.0.1/10"]);
+    assert_eq!(
+        up.wireguard.peers().await.unwrap()[0].allowed_ips,
+        ["100.64.1.2/32"]
+    );
+    assert_eq!(up.ipv6, Ipv6TunnelStatus::Unavailable(reason));
+    let warned = warnings(&up.events);
+    assert!(
+        warned
+            .iter()
+            .any(|message| message.contains("IPv6 not installed") && message.contains("1280")),
+        "{warned:?}"
+    );
+    assert!(up.state.read().await.kill_switch_engaged());
+}
+
+/// Criterion 8, kernel half: the address the pre-checks could not foresee is
+/// refused at bring-up; the half-configured interface is replaced by an
+/// IPv4-only one, and the refusal is published verbatim.
+#[tokio::test]
+async fn a_kernel_refusing_the_ipv6_address_leaves_an_ipv4_only_gateway() {
+    let up = bring_up(
+        &dual_stack_network(),
+        Ipv6TunnelStatus::Installed,
+        helios_wireguard::DryRunBackend::without_ipv6(),
+    )
+    .await
+    .unwrap();
+
+    assert!(up.wireguard.is_up());
+    assert_eq!(up.wireguard.interface_addresses(), ["100.64.0.1/10"]);
+    assert_eq!(
+        up.wireguard.peers().await.unwrap()[0].allowed_ips,
+        ["100.64.1.2/32"]
+    );
+    match &up.ipv6 {
+        Ipv6TunnelStatus::Unavailable(Ipv6Unavailable::AddressRefused { address, detail }) => {
+            assert_eq!(address, PREFIX);
+            assert!(detail.contains("IPv6 is disabled"), "{detail}");
+        }
+        other => panic!("expected AddressRefused, got {other:?}"),
+    }
+    assert!(
+        warnings(&up.events)
+            .iter()
+            .any(|message| message.contains("IPv6 not installed")),
+        "{:?}",
+        up.events
+    );
+    assert!(up.state.read().await.kill_switch_engaged());
+}
+
+/// Only a kernel-side refusal is retried: a configuration the backend
+/// refuses before touching anything fails the start, as it always did.
+#[tokio::test]
+async fn a_refusal_that_is_not_the_kernels_is_not_retried_without_ipv6() {
+    let mut network = dual_stack_network();
+    network.peers[0].public_key = "AAAA".into();
+
+    let error = bring_up(
+        &network,
+        Ipv6TunnelStatus::Installed,
+        helios_wireguard::DryRunBackend::new(),
+    )
+    .await
+    .err()
+    .expect("an invalid peer key must fail the bring-up");
+
+    assert!(
+        error
+            .to_string()
+            .contains("bringing up the WireGuard interface"),
+        "{error:#}"
+    );
+    assert!(!format!("{error:#}").contains("without IPv6"), "{error:#}");
+}
+
+/// The PSK path projects the peers again: it must keep the families the
+/// bring-up installed, no more and no fewer.
+#[tokio::test]
+async fn a_psk_installation_keeps_the_installed_families() {
+    for (ipv6, expected) in [
+        (
+            Ipv6TunnelStatus::Installed,
+            vec!["100.64.1.2/32", PEER_VIP_V6],
+        ),
+        (
+            Ipv6TunnelStatus::Unavailable(Ipv6Unavailable::DisabledByKernel {
+                setting: "net.ipv6.conf.all.disable_ipv6".into(),
+            }),
+            vec!["100.64.1.2/32"],
+        ),
+    ] {
+        let mut network = dual_stack_network();
+        network.peers[0].preshared_key = None;
+        let shared = Arc::new(RwLock::new(network));
+        let wireguard = helios_wireguard::DryRunBackend::new();
+
+        request_installation_with(&shared, &wireguard, PEER_KEY, ipv6.clone())
+            .await
+            .expect("the installation must succeed");
+
+        assert_eq!(
+            wireguard.peers().await.unwrap()[0].allowed_ips,
+            expected,
+            "{ipv6:?}"
+        );
+    }
 }

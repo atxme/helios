@@ -21,12 +21,15 @@ use std::{
 };
 
 use aether::{
+    net::{Ipv6TunnelStatus, Ipv6Unavailable, TunnelPrefixV6},
     FirewallPolicy, HeliosEvent, InstallPskRequest, NetworkConfig, ObserveHandshakeRequest,
     OrchestratorCmd, TunnelEvent, TunnelState,
 };
 use anyhow::Context;
 use helios_firewall::{DryRunBackend, FirewallBackend};
-use helios_wireguard::{InterfaceConfig, PeerConfig, PeerStatus, WireguardBackend, WG_LISTEN_PORT};
+use helios_wireguard::{
+    InterfaceConfig, PeerConfig, PeerStatus, WgError, WireguardBackend, WG_LISTEN_PORT,
+};
 use tokio::{
     sync::{broadcast, mpsc, RwLock},
     time,
@@ -145,6 +148,10 @@ pub async fn run(
         Arc::from(wireguard_backend(dry_run, &ifname)?)
     };
     let (internal_tx, mut internal_rx) = mpsc::channel::<OrchestratorCmd>(8);
+    // What the last bring-up did with IPv6. Every later projection of the
+    // peers reads it, so a PSK installation or a reload never puts back an
+    // IPv6 `/128` the interface does not carry.
+    let shared_ipv6 = Arc::new(RwLock::new(Ipv6TunnelStatus::default()));
 
     // 1. Establish the explicitly selected firewall posture before bringing
     // up WireGuard. Maintenance removes an old table; normal mode engages the
@@ -174,6 +181,7 @@ pub async fn run(
             fw.as_ref(),
             &policy,
             dry_run,
+            &shared_ipv6,
         )
         .await?;
         let wan = network.primary_wan_iface().unwrap_or_default().to_string();
@@ -244,6 +252,7 @@ pub async fn run(
                         handle_external_cmd(
                             c, &shared_network, dry_run, wg.as_ref(), &shared_state, &event_tx,
                             fw.as_ref(), &mut policy, &internal_tx, &shared_policy, &boot,
+                            &shared_ipv6,
                         ).await?;
                     }
                 }
@@ -254,7 +263,9 @@ pub async fn run(
             // announcing the PSK to the client — see `InstallPskRequest`.
             psk_request = psk_rx.recv() => {
                 if let Some(request) = psk_request {
-                    install_peer_psk(request, &shared_network, wg.as_ref(), &event_tx).await;
+                    install_peer_psk(
+                        request, &shared_network, wg.as_ref(), &shared_ipv6, &event_tx,
+                    ).await;
                 }
             }
 
@@ -325,6 +336,7 @@ pub async fn run(
                         handle_external_cmd(
                             cmd, &shared_network, dry_run, wg.as_ref(), &shared_state, &event_tx,
                             fw.as_ref(), &mut policy, &internal_tx, &shared_policy, &boot,
+                            &shared_ipv6,
                         ).await?;
                     }
                     _ => {}

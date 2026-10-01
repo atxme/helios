@@ -51,6 +51,25 @@ pub const MTU_PLANCHER: u32 = 576;
 /// Default MTU of a transport whose value could not be read.
 pub const MTU_TRANSPORT_DEFAUT: u32 = 1500;
 
+/// Smallest MTU a link must offer to carry IPv6 (RFC 8200 §5).
+///
+/// Unlike [`MTU_PLANCHER`], this is not a floor the computation applies: a
+/// tunnel narrower than this still carries IPv4. Linux removes IPv6 from an
+/// interface whose MTU drops below it, so the gateway does not install its
+/// IPv6 tunnel address on such an interface (`ADRESSAGE-IPV6.md` §6.2).
+pub const MTU_MIN_IPV6: u32 = 1280;
+
+/// Whether a tunnel of this MTU can carry IPv6.
+///
+/// ```
+/// use aether::mtu::{carries_ipv6, tunnel_mtu};
+/// assert!(carries_ipv6(tunnel_mtu(1500)));
+/// assert!(!carries_ipv6(tunnel_mtu(1280))); // WSL2: IPv4 only
+/// ```
+pub fn carries_ipv6(tunnel_mtu: u32) -> bool {
+    tunnel_mtu >= MTU_MIN_IPV6
+}
+
 /// MTU to set on the WireGuard interface, derived from the MTU of the link
 /// carrying it.
 ///
@@ -93,6 +112,15 @@ mod tests {
         // must stay under this limit to also cover IPv6.
         let measured_ipv4_limit = 1280 - 60;
         assert!(tunnel_mtu(1280) <= measured_ipv4_limit);
+    }
+
+    #[test]
+    fn ipv6_needs_a_transport_of_at_least_1360_bytes() {
+        // 1360 − 80 = 1280, the IPv6 minimum: one byte less and the tunnel
+        // is IPv4-only.
+        assert!(carries_ipv6(tunnel_mtu(1360)));
+        assert!(!carries_ipv6(tunnel_mtu(1359)));
+        assert!(carries_ipv6(tunnel_mtu(1492)), "PPPoE still carries IPv6");
     }
 
     #[test]

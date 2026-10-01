@@ -15,6 +15,7 @@ pub(super) async fn handle_external_cmd(
     internal_tx: &mpsc::Sender<OrchestratorCmd>,
     shared_policy: &Arc<RwLock<FirewallPolicy>>,
     boot: &helios_tpm::BootDecision,
+    shared_ipv6: &Arc<RwLock<Ipv6TunnelStatus>>,
 ) -> anyhow::Result<()> {
     match cmd {
         OrchestratorCmd::Connect => {
@@ -25,7 +26,17 @@ pub(super) async fn handle_external_cmd(
                 "Connection requested via the web interface",
             );
             let network = shared_network.read().await;
-            do_connect(&network, wg, shared_state, event_tx, fw, policy, dry_run).await?;
+            do_connect(
+                &network,
+                wg,
+                shared_state,
+                event_tx,
+                fw,
+                policy,
+                dry_run,
+                shared_ipv6,
+            )
+            .await?;
             let wan = network.primary_wan_iface().unwrap_or_default().to_string();
             drop(network);
             spawn_mtu_probe_if_up(&wan, dry_run, shared_state, event_tx, internal_tx).await;
@@ -62,7 +73,17 @@ pub(super) async fn handle_external_cmd(
                         warn!("tearing down before rotation: {e}");
                     }
                     let network = shared_network.read().await;
-                    do_connect(&network, wg, shared_state, event_tx, fw, policy, dry_run).await?;
+                    do_connect(
+                        &network,
+                        wg,
+                        shared_state,
+                        event_tx,
+                        fw,
+                        policy,
+                        dry_run,
+                        shared_ipv6,
+                    )
+                    .await?;
                     drop(network);
                     sync_policy(shared_policy, policy).await;
                 }
@@ -128,7 +149,17 @@ pub(super) async fn handle_external_cmd(
                 transition(shared_state, event_tx, next, fw, policy).await?;
                 sync_policy(shared_policy, policy).await;
                 let network = shared_network.read().await;
-                do_connect(&network, wg, shared_state, event_tx, fw, policy, dry_run).await?;
+                do_connect(
+                    &network,
+                    wg,
+                    shared_state,
+                    event_tx,
+                    fw,
+                    policy,
+                    dry_run,
+                    shared_ipv6,
+                )
+                .await?;
                 let wan = network.primary_wan_iface().unwrap_or_default().to_string();
                 drop(network);
                 spawn_mtu_probe_if_up(&wan, dry_run, shared_state, event_tx, internal_tx).await;
@@ -195,7 +226,8 @@ pub(super) async fn handle_external_cmd(
             // Aligns the data plane with the new peer list (client
             // enrollment, or revocation).
             if wg.is_up() {
-                let (iface, peers) = wg_config(&*shared_network.read().await);
+                let ipv6 = shared_ipv6.read().await.clone();
+                let (iface, peers) = wg_config(&*shared_network.read().await, &ipv6);
                 if let Err(e) = wg.sync_peers(&peers).await {
                     warn!("WireGuard peer synchronization: {e}");
                     emit_log(event_tx, "warn", &format!("Peer synchronization: {e}"));

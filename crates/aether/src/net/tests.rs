@@ -486,3 +486,40 @@ fn loopbacks_are_recognised_after_canonicalization() {
         IpAddr::V6(Ipv6Addr::LOCALHOST)
     );
 }
+
+/// The API wire form the console and `helios-ctl` read.
+#[test]
+fn the_ipv6_status_serializes_to_its_documented_wire_form() {
+    let render = |status: &Ipv6TunnelStatus| serde_json::to_value(status).expect("serializable");
+    assert_eq!(
+        render(&Ipv6TunnelStatus::NotConfigured),
+        serde_json::json!("not_configured")
+    );
+    assert_eq!(
+        render(&Ipv6TunnelStatus::Installed),
+        serde_json::json!("installed")
+    );
+    let degraded = Ipv6TunnelStatus::Unavailable(Ipv6Unavailable::TunnelMtuTooSmall {
+        tunnel_mtu: 1200,
+        minimum: 1280,
+    });
+    assert_eq!(
+        render(&degraded),
+        serde_json::json!({
+            "unavailable": {"reason": "tunnel_mtu_too_small", "tunnel_mtu": 1200, "minimum": 1280}
+        })
+    );
+    let back: Ipv6TunnelStatus =
+        serde_json::from_value(render(&degraded)).expect("the wire form reads back");
+    assert_eq!(back, degraded);
+}
+
+#[test]
+fn an_ipv6_refusal_names_its_cause() {
+    let refused = Ipv6Unavailable::DisabledByKernel {
+        setting: "net.ipv6.conf.default.disable_ipv6".into(),
+    };
+    assert!(refused
+        .to_string()
+        .contains("net.ipv6.conf.default.disable_ipv6 = 1"));
+}
