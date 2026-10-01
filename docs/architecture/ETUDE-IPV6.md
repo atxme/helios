@@ -750,7 +750,8 @@ Avancement sur `feature/support-ipv6` (1er octobre 2026) :
 | T03 + T04 | fusionnés | cible : batch accepté, NAT44 inchangé |
 | T05 | fusionné | cible : ND `untracked`, voisins et route par défaut IPv6 stables, renouvellement DHCPv6 |
 | T08 | fusionné | cible avec T17 : sources `::ffff:` sur socket `[::]` |
-| T06, T09 | à faire | — |
+| T06 | fusionné | accepter des pairs Meshnet IPv6 exige de couvrir un préfixe global du lien WAN, puis un essai sur cible |
+| T09 | fusionné | `heliosd run` refuse désormais une `wg_address` sans hôte IPv4 au lieu de basculer sur loopback |
 | T07, T10–T23 | à faire | T07 et T10–T14 attendent la validation de T00 |
 
 **T00 — Spécification A : modèle d'adressage IPv6**
