@@ -1,5 +1,7 @@
 use super::*;
 
+mod ipv6;
+
 /// A configuration reloaded from disk carries no secret — by design.
 ///
 /// This is the accident the merge exists to prevent: `network.toml` is

@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4},
     path::PathBuf,
 };
@@ -629,18 +629,21 @@ impl NetworkConfig {
             // still carries the gateway identity in the clear, and a
             // hand-edited one a static PSK: the parse buffer holds both
             // (ADR-006 §5).
-            Ok(raw) => {
-                let config: Self =
-                    toml::from_str(&raw).map_err(|e| HeliosError::Config(e.to_string()))?;
-                config.validate()?;
-                Ok(config)
-            }
+            Ok(raw) => Self::from_toml(&raw),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(HeliosError::Config(format!(
                 "reading {}: {e}",
                 path.display()
             ))),
         }
+    }
+
+    /// Reads and validates the text of `network.toml`: what [`Self::load`]
+    /// does once the file is read.
+    fn from_toml(raw: &str) -> Result<Self> {
+        let config: Self = toml::from_str(raw).map_err(|e| HeliosError::Config(e.to_string()))?;
+        config.validate()?;
+        Ok(config)
     }
 
     /// Persists an already public network config atomically (rename).
@@ -881,9 +884,56 @@ impl NetworkConfig {
         Ok(())
     }
 
+    /// Validates the peers' IPv6 VIPs against the gateway's tunnel prefix
+    /// (`ADRESSAGE-IPV6.md` §5.2).
+    ///
+    /// The shape — one host, `/128` — is the type's: a broader `address_v6`
+    /// is refused when the file is read and never reaches this point. What
+    /// is checked here depends on the gateway or on the other peers: a prefix
+    /// to belong to, an address inside it that is neither the gateway's
+    /// `::1` nor an excluded identifier (§3.2), and no two peers on the same
+    /// address. A duplicate is refused, never renumbered (§3 bis.2, rule 5).
+    ///
+    /// Kept apart from [`Self::validate_peer_identities`]: that table is the
+    /// one the API resolves callers from, and the IPv6 VIP is not an identity
+    /// source (§2.6).
+    fn validate_peer_vips_v6(&self) -> Result<()> {
+        let mut owners: HashMap<Ipv6Addr, &str> = HashMap::new();
+        for peer in &self.peers {
+            let Some(vip) = peer.address_v6 else {
+                continue;
+            };
+            let Some(prefix) = &self.wg_address_v6 else {
+                return Err(HeliosError::Config(format!(
+                    "peer {}: address_v6 {} is declared but wg_address_v6 is absent: {}",
+                    peer.name,
+                    format_vip_v6(vip),
+                    AddressError::V6WithoutTunnelPrefix(vip)
+                )));
+            };
+            prefix.check_peer_vip(vip).map_err(|error| {
+                HeliosError::Config(format!(
+                    "peer {}: address_v6 {} is refused under wg_address_v6 {prefix}: {error}",
+                    peer.name,
+                    format_vip_v6(vip)
+                ))
+            })?;
+            if let Some(owner) = owners.insert(vip, &peer.name) {
+                return Err(HeliosError::Config(format!(
+                    "duplicate address_v6 in the peer table: {} is declared by peer {owner} and \
+                     by peer {}",
+                    format_vip_v6(vip),
+                    peer.name
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Validates relationships that cannot be expressed by serde defaults.
     pub fn validate(&self) -> Result<()> {
         self.validate_peer_identities()?;
+        self.validate_peer_vips_v6()?;
         // `auto` means « enumerate them all », so it cannot sit beside a name:
         // the two readings — « these, plus whatever you find » and « just
         // these » — differ, and a firewall built on the wrong one is a gateway
