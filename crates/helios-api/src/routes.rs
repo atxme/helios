@@ -3,6 +3,7 @@ use std::time::SystemTime;
 use aether::{
     certificates::encoding::DerCertificate,
     key_negotiation::{PqCertificate, ProtectionMode},
+    net::Ipv6TunnelStatus,
     NetworkConfig, OrchestratorCmd, SecretString, WgPeer,
 };
 use axum::{extract::State, http::StatusCode, Json};
@@ -46,6 +47,12 @@ pub struct StatusResponse {
     /// lifts, and an interface applying its own would eventually report a
     /// client as connected after the firewall had already cut it.
     pub handshake_stale_after_seconds: u64,
+    /// What the last bring-up did with the IPv6 tunnel prefix:
+    /// `"not_configured"`, `"installed"`, or `{"unavailable": {"reason": …}}`
+    /// when the gateway runs IPv4-only in the degraded state of
+    /// `ADRESSAGE-IPV6.md` §6.2. Observed on the data plane, like the peers'
+    /// runtime, not read from the configuration.
+    pub ipv6: Ipv6TunnelStatus,
 }
 
 /// An authorized WireGuard peer, as exposed to the UI.
@@ -351,6 +358,7 @@ pub async fn status(State(s): State<AppState>) -> Json<StatusResponse> {
         mss_clamp: policy.mss_clamp,
         captive_portal_gateway: policy.captive_portal_gateway.clone(),
         handshake_stale_after_seconds: helios_wireguard::HANDSHAKE_STALE_AFTER_SECS,
+        ipv6: s.ipv6.read().await.clone(),
     })
 }
 

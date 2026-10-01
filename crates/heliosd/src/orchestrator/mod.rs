@@ -21,12 +21,15 @@ use std::{
 };
 
 use aether::{
+    net::{Ipv6TunnelStatus, Ipv6Unavailable, TunnelPrefixV6},
     FirewallPolicy, HeliosEvent, InstallPskRequest, NetworkConfig, ObserveHandshakeRequest,
     OrchestratorCmd, TunnelEvent, TunnelState,
 };
 use anyhow::Context;
 use helios_firewall::{DryRunBackend, FirewallBackend};
-use helios_wireguard::{InterfaceConfig, PeerConfig, PeerStatus, WireguardBackend, WG_LISTEN_PORT};
+use helios_wireguard::{
+    InterfaceConfig, PeerConfig, PeerStatus, WgError, WireguardBackend, WG_LISTEN_PORT,
+};
 use tokio::{
     sync::{broadcast, mpsc, RwLock},
     time,
@@ -131,6 +134,11 @@ pub async fn run(
     // WireGuard backend and must not, so the runtime reaches it the same way
     // the tunnel state does.
     shared_peers: Arc<RwLock<Vec<PeerStatus>>>,
+    // What the last bring-up did with IPv6, published for the API like the
+    // snapshot above. Every later projection of the peers also reads it, so a
+    // PSK installation or a reload never puts back an IPv6 `/128` the
+    // interface does not carry.
+    shared_ipv6: Arc<RwLock<Ipv6TunnelStatus>>,
     // Held here and nowhere else: the TPM sealing secret must not transit
     // through the API crate. Only the orchestrator can seal.
     boot: helios_tpm::BootDecision,
@@ -174,6 +182,7 @@ pub async fn run(
             fw.as_ref(),
             &policy,
             dry_run,
+            &shared_ipv6,
         )
         .await?;
         let wan = network.primary_wan_iface().unwrap_or_default().to_string();
@@ -244,6 +253,7 @@ pub async fn run(
                         handle_external_cmd(
                             c, &shared_network, dry_run, wg.as_ref(), &shared_state, &event_tx,
                             fw.as_ref(), &mut policy, &internal_tx, &shared_policy, &boot,
+                            &shared_ipv6,
                         ).await?;
                     }
                 }
@@ -254,7 +264,9 @@ pub async fn run(
             // announcing the PSK to the client — see `InstallPskRequest`.
             psk_request = psk_rx.recv() => {
                 if let Some(request) = psk_request {
-                    install_peer_psk(request, &shared_network, wg.as_ref(), &event_tx).await;
+                    install_peer_psk(
+                        request, &shared_network, wg.as_ref(), &shared_ipv6, &event_tx,
+                    ).await;
                 }
             }
 
@@ -325,6 +337,7 @@ pub async fn run(
                         handle_external_cmd(
                             cmd, &shared_network, dry_run, wg.as_ref(), &shared_state, &event_tx,
                             fw.as_ref(), &mut policy, &internal_tx, &shared_policy, &boot,
+                            &shared_ipv6,
                         ).await?;
                     }
                     _ => {}
@@ -353,7 +366,8 @@ pub async fn run(
     // The interface is gone; routes naming it would linger in our table and
     // the rule would keep sending the range at an empty lookup. Harmless, but
     // it is state the daemon put there and must take back.
-    unpin_peer_vips(dry_run).await;
+    let ipv6 = shared_ipv6.read().await.clone();
+    unpin_peer_vips(dry_run, &ipv6).await;
     Ok(())
 }
 
@@ -438,6 +452,13 @@ pub fn status(network: &NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
     );
     println!("  WG address   : {}", network.wg_address);
     println!(
+        "  IPv6 tunnel  : {}",
+        describe_ipv6(
+            network,
+            ipv6_installability(network, tunnel_mtu(network), &ipv6_conf_dir())
+        )
+    );
+    println!(
         "  ready        : {}",
         if network.wireguard_ready() {
             "yes"
@@ -455,6 +476,26 @@ pub fn status(network: &NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
         println!("    - {} -> {}{}", p.name, p.address, pq);
     }
     Ok(())
+}
+
+/// The IPv6 line of `heliosd status`.
+///
+/// This command runs beside the daemon, not in it: it applies the same
+/// pre-checks the bring-up applies (`ipv6_installability`), on this host, now.
+/// A refusal only the kernel could voice at bring-up is the running daemon's
+/// to report — `GET /api/status` and `helios-ctl status` carry it.
+fn describe_ipv6(network: &NetworkConfig, decided: Ipv6TunnelStatus) -> String {
+    let Some(prefix) = network.wg_address_v6 else {
+        return "not configured".into();
+    };
+    match decided {
+        Ipv6TunnelStatus::Unavailable(reason) => {
+            format!("{prefix} — unavailable, the gateway starts IPv4-only (degraded): {reason}")
+        }
+        Ipv6TunnelStatus::Installed | Ipv6TunnelStatus::NotConfigured => {
+            format!("{prefix} (installable on this host)")
+        }
+    }
 }
 
 pub async fn check_update(dry_run: bool) -> anyhow::Result<()> {

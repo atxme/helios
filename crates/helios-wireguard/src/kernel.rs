@@ -66,9 +66,17 @@ impl KernelBackend {
             .map_err(|e| WgError::BadKey(format!("{}: {e}", cfg.public_key)))?;
         let mut peer = Peer::new(key);
 
-        let allowed = IpAddrMask::from_str(&cfg.allowed_ips)
-            .map_err(|e| WgError::BadAddress(format!("{}: {e}", cfg.allowed_ips)))?;
-        peer.set_allowed_ips(vec![allowed]);
+        // An empty list used to be impossible to write — the field was one
+        // string, and an empty one failed to parse. A peer with no
+        // `AllowedIPs` is unreachable and claims nothing, which is a
+        // configuration bug rather than a state worth installing.
+        if cfg.allowed_ips.is_empty() {
+            return Err(WgError::BadAddress(format!(
+                "peer {} has no AllowedIPs",
+                cfg.public_key
+            )));
+        }
+        peer.set_allowed_ips(Self::parse_masks(&cfg.allowed_ips)?);
 
         if let Some(psk) = cfg
             .preshared_key
@@ -94,30 +102,55 @@ impl KernelBackend {
     fn build_peers(peers: &[PeerConfig]) -> Result<Vec<Peer>> {
         peers.iter().map(Self::build_peer).collect()
     }
+
+    /// Translates the interface and its peers into a `defguard`
+    /// configuration, validating everything that can be refused without
+    /// touching the kernel.
+    ///
+    /// Every address is passed on: `defguard` assigns them one by one, and
+    /// one the kernel refuses fails the whole bring-up. Leaving an address
+    /// out is a decision for the caller, which knows why it would.
+    fn build_interface(
+        config: &InterfaceConfig,
+        peers: &[PeerConfig],
+    ) -> Result<InterfaceConfiguration> {
+        Key::try_from(config.private_key.as_str())
+            .map_err(|e| WgError::BadKey(format!("gateway private key: {e}")))?;
+        if config.addresses.is_empty() {
+            return Err(WgError::BadAddress("no gateway address".into()));
+        }
+        Ok(InterfaceConfiguration {
+            name: config.name.clone(),
+            // `defguard` owns its own copy of the key and gives no borrowing
+            // form, so this duplication is the boundary's, not ours. It lives
+            // as long as the returned value, which does not outlive `up`.
+            prvkey: config.private_key.to_string(),
+            addresses: Self::parse_masks(&config.addresses)?,
+            port: config.listen_port,
+            peers: Self::build_peers(peers)?,
+            mtu: config.mtu,
+            fwmark: None,
+        })
+    }
+
+    /// Parses every CIDR of a list, refusing the whole list on the first
+    /// invalid entry and naming it.
+    fn parse_masks(values: &[String]) -> Result<Vec<IpAddrMask>> {
+        values
+            .iter()
+            .map(|value| {
+                IpAddrMask::from_str(value)
+                    .map_err(|e| WgError::BadAddress(format!("{value}: {e}")))
+            })
+            .collect()
+    }
 }
 
 #[async_trait]
 impl WireguardBackend for KernelBackend {
     async fn up(&self, config: &InterfaceConfig, peers: &[PeerConfig]) -> Result<()> {
         // Everything that can fail without side effects is done first.
-        Key::try_from(config.private_key.as_str())
-            .map_err(|e| WgError::BadKey(format!("gateway private key: {e}")))?;
-        let address = IpAddrMask::from_str(&config.address)
-            .map_err(|e| WgError::BadAddress(format!("{}: {e}", config.address)))?;
-        let wg_peers = Self::build_peers(peers)?;
-
-        let interface = InterfaceConfiguration {
-            name: config.name.clone(),
-            // `defguard` owns its own copy of the key and gives no borrowing
-            // form, so this duplication is the boundary's, not ours. It lives
-            // as long as `interface`, which does not outlive this call.
-            prvkey: config.private_key.to_string(),
-            addresses: vec![address],
-            port: config.listen_port,
-            peers: wg_peers,
-            mtu: config.mtu,
-            fwmark: None,
-        };
+        let interface = Self::build_interface(config, peers)?;
 
         let mut api = self.lock_api()?;
         api.create_interface().map_err(|e| self.iface_err(e))?;
@@ -130,7 +163,7 @@ impl WireguardBackend for KernelBackend {
             "interface {} up — UDP listener {}, address {}, {} peer(s)",
             config.name,
             config.listen_port,
-            config.address,
+            config.addresses.join(", "),
             peers.len()
         );
         Ok(())
@@ -215,7 +248,7 @@ mod tests {
     fn gateway_peer_without_endpoint() {
         let peer = KernelBackend::build_peer(&PeerConfig {
             public_key: KEY_B.into(),
-            allowed_ips: "100.64.1.2/32".into(),
+            allowed_ips: vec!["100.64.1.2/32".into()],
             preshared_key: None,
             persistent_keepalive_secs: 25,
         })
@@ -233,7 +266,7 @@ mod tests {
     fn post_quantum_psk_transmitted() {
         let peer = KernelBackend::build_peer(&PeerConfig {
             public_key: KEY_B.into(),
-            allowed_ips: "100.64.1.2/32".into(),
+            allowed_ips: vec!["100.64.1.2/32".into()],
             preshared_key: Some(Zeroizing::new(KEY_B.into())),
             persistent_keepalive_secs: 25,
         })
@@ -245,7 +278,7 @@ mod tests {
     fn an_empty_psk_is_absent_and_an_invalid_psk_is_refused() {
         let without_psk = KernelBackend::build_peer(&PeerConfig {
             public_key: KEY_B.into(),
-            allowed_ips: "100.64.1.2/32".into(),
+            allowed_ips: vec!["100.64.1.2/32".into()],
             preshared_key: Some(Zeroizing::new("   ".into())),
             persistent_keepalive_secs: 25,
         })
@@ -255,7 +288,7 @@ mod tests {
         assert!(matches!(
             KernelBackend::build_peer(&PeerConfig {
                 public_key: KEY_B.into(),
-                allowed_ips: "100.64.1.2/32".into(),
+                allowed_ips: vec!["100.64.1.2/32".into()],
                 preshared_key: Some(Zeroizing::new("not-a-key".into())),
                 persistent_keepalive_secs: 25,
             }),
@@ -268,13 +301,13 @@ mod tests {
         let peers = [
             PeerConfig {
                 public_key: KEY_B.into(),
-                allowed_ips: "100.64.1.2/32".into(),
+                allowed_ips: vec!["100.64.1.2/32".into()],
                 preshared_key: None,
                 persistent_keepalive_secs: 25,
             },
             PeerConfig {
                 public_key: "invalid".into(),
-                allowed_ips: "100.64.1.3/32".into(),
+                allowed_ips: vec!["100.64.1.3/32".into()],
                 preshared_key: None,
                 persistent_keepalive_secs: 25,
             },
@@ -284,11 +317,82 @@ mod tests {
         assert!(KernelBackend::build_peers(&peers[..1]).is_ok());
     }
 
+    /// A dual-stack peer claims one host per family, and both reach the
+    /// kernel: dropping the IPv6 one would have WireGuard throw that traffic
+    /// away as if the peer had no IPv6 VIP.
+    #[test]
+    fn a_dual_stack_peer_carries_both_hosts() {
+        let peer = KernelBackend::build_peer(&PeerConfig {
+            public_key: KEY_B.into(),
+            allowed_ips: vec![
+                "100.64.1.2/32".into(),
+                "fd3c:91a2:7e04:0:8a1f:3b2c:9d40:e517/128".into(),
+            ],
+            preshared_key: None,
+            persistent_keepalive_secs: 25,
+        })
+        .unwrap();
+
+        let allowed: Vec<String> = peer.allowed_ips.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            allowed,
+            ["100.64.1.2/32", "fd3c:91a2:7e04:0:8a1f:3b2c:9d40:e517/128"]
+        );
+    }
+
+    #[test]
+    fn a_peer_without_allowed_ips_is_refused() {
+        assert!(matches!(
+            KernelBackend::build_peer(&PeerConfig {
+                public_key: KEY_B.into(),
+                allowed_ips: Vec::new(),
+                preshared_key: None,
+                persistent_keepalive_secs: 25,
+            }),
+            Err(WgError::BadAddress(_))
+        ));
+    }
+
+    fn interface(addresses: &[&str]) -> InterfaceConfig {
+        InterfaceConfig {
+            name: "helios0".into(),
+            private_key: Zeroizing::new(KEY_B.into()),
+            listen_port: crate::WG_LISTEN_PORT,
+            addresses: addresses.iter().map(|a| (*a).to_string()).collect(),
+            mtu: Some(1420),
+        }
+    }
+
+    #[test]
+    fn every_interface_address_reaches_defguard_in_order() {
+        let built = KernelBackend::build_interface(
+            &interface(&["100.64.0.1/10", "fd3c:91a2:7e04::1/64"]),
+            &[],
+        )
+        .unwrap();
+
+        let addresses: Vec<String> = built.addresses.iter().map(ToString::to_string).collect();
+        assert_eq!(addresses, ["100.64.0.1/10", "fd3c:91a2:7e04::1/64"]);
+        assert_eq!(built.mtu, Some(1420));
+    }
+
+    #[test]
+    fn an_interface_without_address_or_with_a_bad_one_is_refused() {
+        assert!(matches!(
+            KernelBackend::build_interface(&interface(&[]), &[]),
+            Err(WgError::BadAddress(_))
+        ));
+        assert!(matches!(
+            KernelBackend::build_interface(&interface(&["100.64.0.1/10", "fd3c::1/999"]), &[]),
+            Err(WgError::BadAddress(message)) if message.contains("fd3c::1/999")
+        ));
+    }
+
     #[test]
     fn invalid_key_or_vip_rejected() {
         assert!(KernelBackend::build_peer(&PeerConfig {
             public_key: "not-base64".into(),
-            allowed_ips: "100.64.1.2/32".into(),
+            allowed_ips: vec!["100.64.1.2/32".into()],
             preshared_key: None,
             persistent_keepalive_secs: 25,
         })
@@ -296,7 +400,7 @@ mod tests {
 
         assert!(KernelBackend::build_peer(&PeerConfig {
             public_key: KEY_B.into(),
-            allowed_ips: "not-an-address".into(),
+            allowed_ips: vec!["not-an-address".into()],
             preshared_key: None,
             persistent_keepalive_secs: 25,
         })

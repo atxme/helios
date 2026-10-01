@@ -40,6 +40,18 @@ The order is a security property:
 6. move to `up` once a handshake is younger than 150 seconds;
 7. fall back to `connecting` when that handshake goes stale.
 
+With `wg_address_v6`, step 3 also installs `<prefix>::1/64` on `helios0`, puts
+each peer's `/128` next to its `/32` in `AllowedIPs`, and pins those `/128` in
+the VIP routing table `51820` with an `ip -6` rule. Before bring-up the gateway
+refuses IPv6 when the tunnel MTU is below 1280 or the kernel has
+`disable_ipv6 = 1` (or no IPv6 stack); a kernel that still refuses the address
+gets one IPv4-only retry after the interface is taken down. The gateway then
+starts IPv4-only in a visible degraded state: a warning on the journal and the
+event stream, `ipv6: {"unavailable": {"reason": …}}` in `GET /api/status`
+(`"installed"` or `"not_configured"` otherwise), shown by `helios-ctl status`,
+and the same pre-checks printed by `heliosd status`. Without `wg_address_v6`
+nothing changes (`specification/ADRESSAGE-IPV6.md` §6).
+
 Only `TunnelState::Up` allows LAN traffic. `down`, `connecting`, `failed` and
 `captive_portal` stay fail-closed, save for the narrowly declared openings for
 the handshake, administration and the captive portal.

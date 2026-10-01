@@ -1,7 +1,7 @@
 # Spécification — modèle d'adressage IPv6 du tunnel
 
 **Statut** : proposée le 30 septembre 2026, **validée par l'opérateur le
-1er octobre 2026**, en cours d'implémentation sur `feature/support-ipv6` (§4 et §5 livrés par T07 et T10, §3, §3 bis et §7.1 par T11 et T14). La validation porte aussi sur l'IPAM
+1er octobre 2026**, en cours d'implémentation sur `feature/support-ipv6` (§4 et §5 livrés par T07 et T10, §3, §3 bis et §7.1 par T11 et T14, §6.1 à §6.3 par T12 et T13). La validation porte aussi sur l'IPAM
 unifié du §3 bis, qui absorbe une partie du chantier « IPAM / adressage
 unifié ». Elle fixe
 les décisions d'adressage que l'étude
@@ -398,6 +398,45 @@ Cette spécification n'ajoute aucune ouverture. En particulier :
 Entre pairs, le trafic IPv6 obéit aux mêmes règles que l'IPv4 : le `forward`
 de `wg_iface` vers `wg_iface` n'est pas ouvert aujourd'hui, et cette
 spécification ne l'ouvre pas.
+
+### 6.5 Implémentation (T12/T13)
+
+Cette section décrit où vivent les règles ci-dessus ; elle ne change aucune
+décision.
+
+- Plan de données : `helios_wireguard::InterfaceConfig::addresses` et
+  `PeerConfig::allowed_ips` sont des listes, passées telles quelles à
+  `defguard` par le backend noyau. `heliosd` les construit en un seul endroit,
+  `orchestrator::data_plane::wg_config`, utilisé par la montée, l'installation
+  de PSK et le rechargement : l'IPv4 déclarée d'abord, puis `<préfixe>::1/64`
+  et le `/128` de chaque pair **seulement** si la montée a installé l'IPv6.
+- Conditions du §6.2 : `ipv6_installability` écarte l'IPv6 avant la montée si
+  `tunnel_mtu < 1280` (`aether::mtu::carries_ipv6`), si
+  `net.ipv6.conf.{all,default}.disable_ipv6` vaut `1`, ou si le noyau n'a pas
+  de pile IPv6 (répertoire `conf` absent ; chemin remplaçable par
+  `HELIOS_IPV6_CONF_PATH` pour les tests). Aucun sysctl n'est modifié.
+- Refus par le noyau malgré ces vérifications : la montée échoue côté noyau
+  (`WgError::Interface`) ; l'interface à moitié configurée est démontée, puis
+  remontée **une fois** sans IPv6. Ni une clé ni une adresse refusées avant
+  tout effet de bord ne sont retentées. Si le démontage échoue, le démarrage
+  échoue en le disant ; si la remontée IPv4 échoue, l'erreur nomme les deux
+  échecs. Le kill-switch reste engagé tout du long.
+- État dégradé visible : `aether::net::Ipv6TunnelStatus` (`not_configured`,
+  `installed`, `unavailable`) et sa raison typée `Ipv6Unavailable`
+  (`tunnel_mtu_too_small`, `disabled_by_kernel`, `no_kernel_support`,
+  `address_refused`). La raison est journalisée et diffusée en événement
+  `warn`, publiée dans `GET /api/status` (champ `ipv6`) et affichée par
+  `helios-ctl status`. `heliosd status`, qui ne parle pas au démon, applique
+  les mêmes vérifications préalables sur l'hôte. Sans `wg_address_v6`, l'état
+  est `not_configured` et rien d'autre ne change.
+- Routage VIP : `heliosd::vip_routing::plan_v6` et `apply_v6` appliquent le
+  plan du §6.3 en famille IPv6 (`ip -6`), à partir des `AllowedIPs`
+  effectivement posés ; les règles et la table sont purgées et retirées par
+  famille. Aucune commande `ip -6` n'est lancée si l'IPv6 n'est pas installée.
+  Limite connue : une règle IPv6 laissée par un arrêt brutal n'est purgée qu'à
+  la prochaine montée qui installe l'IPv6 ; elle reste inerte d'ici là, ses
+  routes ayant disparu avec l'interface.
+- Essais sur cible : [TESTING.md](../testing/TESTING.md), « IPv6 du tunnel ».
 
 ## 7. Provisioning et profil
 

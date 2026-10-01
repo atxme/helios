@@ -412,6 +412,10 @@ struct Status {
     split_tunnel_cidrs: Vec<String>,
     mss_clamp: Option<u16>,
     captive_portal_gateway: Option<String>,
+    /// Absent from a gateway older than the IPv6 tunnel: read as "nothing to
+    /// report" rather than refused.
+    #[serde(default)]
+    ipv6: aether::net::Ipv6TunnelStatus,
 }
 
 #[derive(Debug, Deserialize)]
@@ -522,6 +526,14 @@ async fn cmd_status(client: &Client, base: &str) -> Result<()> {
             .map(|port| format!(" (UDP {port})"))
             .unwrap_or_else(|| " (port closed)".to_string())
     );
+    match &s.ipv6 {
+        aether::net::Ipv6TunnelStatus::NotConfigured => {}
+        aether::net::Ipv6TunnelStatus::Installed => println!("  {:<14} installed", "IPv6"),
+        aether::net::Ipv6TunnelStatus::Unavailable(reason) => println!(
+            "  {:<14} \x1b[33munavailable\x1b[0m — IPv4-only (degraded): {reason}",
+            "IPv6"
+        ),
+    }
     for peer in &s.peers {
         let pq = if peer.post_quantum { " [PQ]" } else { "" };
         let key = peer.public_key.get(..8).unwrap_or(&peer.public_key);

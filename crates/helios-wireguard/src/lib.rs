@@ -69,8 +69,17 @@ pub struct InterfaceConfig {
     pub private_key: Zeroizing<String>,
     /// UDP listening port. The gateway listens; it does not dial.
     pub listen_port: u16,
-    /// Gateway's address within the tunnel network (e.g. `100.64.0.1/10`).
-    pub address: String,
+    /// Gateway's addresses within the tunnel network, in CIDR notation: the
+    /// IPv4 one first (e.g. `100.64.0.1/10`), then the IPv6 one when the
+    /// gateway installs it (e.g. `fd3c:91a2:7e04::1/64`).
+    ///
+    /// Text rather than a typed CIDR: this crate is a leaf, `std` has no CIDR
+    /// type, and the kernel backend parses each entry into `defguard`'s own
+    /// `IpAddrMask` at the boundary anyway. The caller renders them from the
+    /// typed values it already holds. Every entry is required: the bring-up
+    /// fails if the kernel refuses one, and deciding what to leave out is the
+    /// caller's business, not the data plane's.
+    pub addresses: Vec<String>,
     /// Interface MTU, or `None` to leave WireGuard's default.
     ///
     /// Derived from the WAN link's MTU by `aether::mtu::tunnel_mtu`: the
@@ -92,11 +101,14 @@ pub struct InterfaceConfig {
 pub struct PeerConfig {
     /// Client's Curve25519 public key, in base64 — its identity.
     pub public_key: String,
-    /// VIP assigned to the client, in CIDR notation (e.g. `100.64.1.2/32`).
+    /// VIPs assigned to the client, in CIDR notation (e.g. `100.64.1.2/32`,
+    /// then `fd3c:91a2:7e04:0:8a1f:3b2c:9d40:e517/128` when it has one).
     ///
     /// In WireGuard, `AllowedIPs` **is** the cryptographic routing table: two
-    /// peers cannot claim the same address.
-    pub allowed_ips: String,
+    /// peers cannot claim the same address. A list because a dual-stack peer
+    /// owns one host per family; the same shape [`PeerStatus::allowed_ips`]
+    /// reports back.
+    pub allowed_ips: Vec<String>,
     /// Post-quantum PSK derived from the ML-KEM exchange, in base64. **Secret.**
     ///
     /// Wiped with the structure: a negotiated PSK has a lifetime bounded by
