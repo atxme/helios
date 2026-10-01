@@ -531,3 +531,86 @@ async fn disconnection_tears_down_wireguard_and_re_engages_the_kill_switch() {
     assert!(state.read().await.kill_switch_engaged());
     assert_eq!(policy.read().await.mss_clamp, None);
 }
+
+/// Hands `incoming` to the orchestrator as a reload, the way the API and the
+/// `network.toml` watcher both do, and returns the events it emitted.
+async fn reload(
+    shared_network: &Arc<RwLock<NetworkConfig>>,
+    incoming: NetworkConfig,
+) -> Vec<HeliosEvent> {
+    let running = shared_network.read().await.duplicate();
+    let state = Arc::new(RwLock::new(TunnelState::Down));
+    let policy = Arc::new(RwLock::new(running.firewall_policy()));
+    let mut current_policy = running.firewall_policy();
+    let (events, mut received) = broadcast::channel(8);
+    let (internal_tx, _internal_rx) = mpsc::channel(1);
+    let wireguard = helios_wireguard::DryRunBackend::new();
+
+    handle_external_cmd(
+        OrchestratorCmd::LoadNetworkConfig(Box::new(incoming)),
+        shared_network,
+        true,
+        &wireguard,
+        &state,
+        &events,
+        &DryRunBackend,
+        &mut current_policy,
+        &internal_tx,
+        &policy,
+        // TPM disabled: a reload performs no key rotation.
+        &helios_tpm::BootDecision::Disabled,
+    )
+    .await
+    .unwrap();
+
+    let mut emitted = Vec::new();
+    while let Ok(event) = received.try_recv() {
+        emitted.push(event);
+    }
+    emitted
+}
+
+fn dual_stack_network() -> NetworkConfig {
+    let mut network = configured_network();
+    network.wg_address_v6 = Some("fd3c:91a2:7e04::1/64".parse().unwrap());
+    network.peers[0].address_v6 = Some("fd3c:91a2:7e04::2".parse().unwrap());
+    network
+}
+
+/// A peer's IPv6 VIP is part of the peer table: it reloads live
+/// (`ADRESSAGE-IPV6.md` §5.4).
+#[tokio::test]
+async fn a_peer_ipv6_vip_change_is_applied_live() {
+    let shared_network = Arc::new(RwLock::new(dual_stack_network()));
+    let mut incoming = dual_stack_network();
+    incoming.peers[0].address_v6 = Some("fd3c:91a2:7e04::3".parse().unwrap());
+
+    reload(&shared_network, incoming).await;
+
+    assert_eq!(
+        shared_network.read().await.peers[0].address_v6,
+        Some("fd3c:91a2:7e04::3".parse().unwrap())
+    );
+}
+
+/// The tunnel prefix is applied at startup only: a reload that changes it is
+/// not applied at all — not even its other changes — and says so on the
+/// event stream the console reads.
+#[tokio::test]
+async fn a_tunnel_prefix_change_is_refused_until_restart() {
+    let shared_network = Arc::new(RwLock::new(dual_stack_network()));
+    let mut incoming = dual_stack_network();
+    incoming.wg_address_v6 = Some("fd00:1:2::1/64".parse().unwrap());
+    incoming.peers[0].address_v6 = Some("fd00:1:2::2".parse().unwrap());
+    incoming.peers[0].name = "renamed".into();
+
+    let events = reload(&shared_network, incoming).await;
+
+    assert_eq!(*shared_network.read().await, dual_stack_network());
+    let message = match events.as_slice() {
+        [HeliosEvent::Log { level, message }] if level == "warn" => message,
+        other => panic!("expected one warning, got {other:?}"),
+    };
+    assert!(message.contains("wg_address_v6"), "{message}");
+    assert!(message.contains("restart"), "{message}");
+}

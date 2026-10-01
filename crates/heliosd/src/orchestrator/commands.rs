@@ -169,6 +169,20 @@ pub(super) async fn handle_external_cmd(
         }
 
         OrchestratorCmd::LoadNetworkConfig(new_cfg) => {
+            // Both reload paths — the API and the `network.toml` watcher —
+            // converge here, so this is where a value the running data plane
+            // cannot take is refused. The whole configuration is kept, not
+            // only that value: see `NetworkConfig::check_hot_reload`.
+            let reloadable = new_cfg.check_hot_reload(&*shared_network.read().await);
+            if let Err(refusal) = reloadable {
+                // `emit_log` writes the journal line as well as the event.
+                emit_log(
+                    event_tx,
+                    "warn",
+                    &format!("Network configuration not applied: {refusal}"),
+                );
+                return Ok(());
+            }
             info!("network config reloaded: {} peer(s)", new_cfg.peers.len());
             *policy = new_cfg.firewall_policy();
             *shared_network.write().await = *new_cfg;
