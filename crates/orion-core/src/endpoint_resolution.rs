@@ -28,9 +28,21 @@
 //! tunnel endpoint chosen without a race (no negotiation) would otherwise be
 //! pinned to the dead family.
 
+use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
+use futures_util::stream::{FuturesUnordered, StreamExt as _};
+
+/// RFC 8305 §5 "Connection Attempt Delay": how long an attempt runs alone
+/// before the next candidate is started beside it.
+///
+/// The RFC's recommended default. Long enough for a healthy path to answer
+/// first — the QUIC handshake to a gateway is one round trip — and short
+/// enough that a broken IPv6 path costs a quarter of a second instead of the
+/// ten-second connect timeout it used to cost on its own.
+pub const CONNECTION_ATTEMPT_DELAY: Duration = Duration::from_millis(250);
 
 /// Address family of a candidate, as written in Orion's logs.
 pub fn family(address: &SocketAddr) -> &'static str {
@@ -103,6 +115,208 @@ pub async fn resolve_candidates(endpoint: &str) -> Result<Vec<SocketAddr>> {
         anyhow::bail!("{endpoint} resolved to no usable address");
     }
     Ok(ordered)
+}
+
+/// A candidate that was started and did not win.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PassedOver {
+    pub address: SocketAddr,
+    /// Why it failed, or `None` when it was still waiting for an answer and
+    /// was cancelled because another candidate won.
+    pub failure: Option<String>,
+}
+
+/// The candidate that won a [`race`], with what it produced.
+pub struct Won<T> {
+    pub address: SocketAddr,
+    pub value: T,
+    /// Every other candidate that was started, in candidate order. A
+    /// candidate never started is not listed: it was not tried.
+    pub passed_over: Vec<PassedOver>,
+}
+
+/// Every started candidate failed — and every candidate was started.
+#[derive(Debug)]
+pub struct AllFailed {
+    /// In the order the failures arrived.
+    pub failures: Vec<(SocketAddr, anyhow::Error)>,
+}
+
+impl AllFailed {
+    /// One error naming `endpoint` and everything that was tried.
+    ///
+    /// A single candidate — a literal endpoint, or a name with one address —
+    /// returns its own error untouched, exactly as before the race existed.
+    pub fn into_error(mut self, endpoint: &str) -> anyhow::Error {
+        if self.failures.len() == 1 {
+            if let Some((_, error)) = self.failures.pop() {
+                return error;
+            }
+        }
+        if self.failures.is_empty() {
+            return anyhow::anyhow!("{endpoint}: no candidate address to try");
+        }
+        let tried = self
+            .failures
+            .iter()
+            .map(|(address, error)| format!("{address} ({}): {error:#}", family(address)))
+            .collect::<Vec<_>>()
+            .join("; ");
+        anyhow::anyhow!("no address of {endpoint} answered — {tried}")
+    }
+}
+
+/// Tries `candidates` the RFC 8305 way, and returns the first success.
+///
+/// The first candidate starts at once. Each next one starts when the
+/// previous start is [`CONNECTION_ATTEMPT_DELAY`] old with no winner yet,
+/// or as soon as an attempt fails (§5): a failure hands over immediately
+/// instead of letting the delay run. Attempts already running keep running.
+///
+/// # Cancellation
+///
+/// The first `Ok` returns, and every attempt still in flight is **dropped**
+/// with the race: its future never runs again. A caller must therefore make
+/// each attempt cancel-safe by drop — leave nothing behind that only a
+/// completed `await` would clean up — which is what the key negotiation does
+/// by racing nothing past the challenge (see `key_negotiation::prepare`).
+///
+/// Each attempt keeps its own timeouts; this adds none.
+pub async fn race<T, F, Fut>(
+    candidates: &[SocketAddr],
+    attempt_delay: Duration,
+    mut connect: F,
+) -> Result<Won<T>, AllFailed>
+where
+    F: FnMut(SocketAddr) -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    async fn tagged<T>(
+        address: SocketAddr,
+        attempt: impl Future<Output = Result<T>>,
+    ) -> (SocketAddr, Result<T>) {
+        (address, attempt.await)
+    }
+
+    let mut in_flight = FuturesUnordered::new();
+    let mut failures: Vec<(SocketAddr, anyhow::Error)> = Vec::new();
+    let mut started = 0usize;
+    let mut last_start = tokio::time::Instant::now();
+    let mut start = |started: &mut usize, last_start: &mut tokio::time::Instant| {
+        let address = candidates[*started];
+        tracing::info!(
+            %address,
+            family = family(&address),
+            rank = *started + 1,
+            candidates = candidates.len(),
+            "endpoint candidate: attempt started"
+        );
+        *started += 1;
+        *last_start = tokio::time::Instant::now();
+        tagged(address, connect(address))
+    };
+
+    loop {
+        if in_flight.is_empty() {
+            if started == candidates.len() {
+                return Err(AllFailed { failures });
+            }
+            in_flight.push(start(&mut started, &mut last_start));
+        }
+        let more = started < candidates.len();
+        tokio::select! {
+            biased;
+            Some((address, outcome)) = in_flight.next() => match outcome {
+                Ok(value) => {
+                    let passed_over = candidates[..started]
+                        .iter()
+                        .filter(|candidate| **candidate != address)
+                        .map(|candidate| PassedOver {
+                            address: *candidate,
+                            failure: failures
+                                .iter()
+                                .find(|(failed, _)| failed == candidate)
+                                .map(|(_, error)| format!("{error:#}")),
+                        })
+                        .collect();
+                    // `in_flight` is dropped on the way out: every attempt
+                    // still running is cancelled here.
+                    return Ok(Won { address, value, passed_over });
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %address,
+                        family = family(&address),
+                        error = format!("{error:#}"),
+                        "endpoint candidate: attempt failed"
+                    );
+                    failures.push((address, error));
+                    if more {
+                        in_flight.push(start(&mut started, &mut last_start));
+                    }
+                }
+            },
+            () = tokio::time::sleep_until(last_start + attempt_delay), if more => {
+                in_flight.push(start(&mut started, &mut last_start));
+            }
+        }
+    }
+}
+
+/// Which candidate a connection ended up using, and what it passed over.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Selection {
+    /// The endpoint as the profile writes it.
+    pub endpoint: String,
+    pub address: SocketAddr,
+    pub passed_over: Vec<PassedOver>,
+}
+
+impl Selection {
+    pub fn new<T>(endpoint: &str, won: &Won<T>) -> Self {
+        Self {
+            endpoint: endpoint.to_string(),
+            address: won.address,
+            passed_over: won.passed_over.clone(),
+        }
+    }
+
+    /// The log line for the user, and its level.
+    ///
+    /// A clean first-candidate win is `info`. Anything passed over is a
+    /// `warn`: a family that did not answer — typically IPv6 broken on the
+    /// local network while IPv4 works — is a fact the user and the operator
+    /// have to be able to see, never a fallback that happens in silence.
+    pub fn describe(&self) -> (&'static str, String) {
+        let mut message = format!(
+            "endpoint {} : {} {} retenu",
+            self.endpoint,
+            family(&self.address),
+            self.address
+        );
+        if self.passed_over.is_empty() {
+            return ("info", message);
+        }
+        let passed_over = self
+            .passed_over
+            .iter()
+            .map(|candidate| match &candidate.failure {
+                Some(failure) => format!(
+                    "{} {} en échec ({failure})",
+                    family(&candidate.address),
+                    candidate.address
+                ),
+                None => format!(
+                    "{} {} sans réponse, tentative annulée",
+                    family(&candidate.address),
+                    candidate.address
+                ),
+            })
+            .collect::<Vec<_>>()
+            .join(" ; ");
+        message.push_str(&format!(" après {passed_over}"));
+        ("warn", message)
+    }
 }
 
 /// The literal socket address a backend installs as the WireGuard endpoint.

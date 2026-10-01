@@ -872,6 +872,14 @@ async fn connect_with_key_negotiation(
                 }
             };
         let mode = negotiated.mode;
+        // Which address answered, in which family, and what was passed over
+        // on the way: a broken IPv6 path that IPv4 replaced is said here, as
+        // a warning, never absorbed in silence.
+        let (level, route) = negotiated.selection().describe();
+        sink(ClientEvent::log(
+            level,
+            format!("négociation {attempt}/{KEY_NEGOTIATION_ATTEMPTS} : {route}"),
+        ));
         sink(ClientEvent::log(
             "info",
             format!(

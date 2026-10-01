@@ -172,3 +172,309 @@ fn the_family_is_named() {
     assert_eq!(family(&addr("[2001:db8::1]:51820")), "IPv6");
     assert_eq!(family(&addr("203.0.113.10:51820")), "IPv4");
 }
+
+// --- The staggered race, with injected connectors: no socket, no resolver.
+
+const V6: &str = "[2001:db8::1]:51821";
+const V4: &str = "203.0.113.10:51821";
+
+type Shared<T> = std::sync::Arc<std::sync::Mutex<Vec<T>>>;
+
+/// Records which candidates were started, and which were dropped unfinished.
+#[derive(Default, Clone)]
+struct Journal {
+    started: Shared<(SocketAddr, Duration)>,
+    cancelled: Shared<SocketAddr>,
+}
+
+/// Records its address in `cancelled` if dropped while still armed.
+struct DropProbe {
+    address: SocketAddr,
+    cancelled: Shared<SocketAddr>,
+    armed: bool,
+}
+
+impl DropProbe {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for DropProbe {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cancelled.lock().unwrap().push(self.address);
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Script {
+    Hang,
+    SucceedAfter(u64),
+    FailAfter(u64),
+}
+
+type Attempt = std::pin::Pin<Box<dyn Future<Output = Result<SocketAddr>>>>;
+
+/// A fake connector: each address follows its script, in virtual time.
+fn connector(
+    journal: &Journal,
+    origin: tokio::time::Instant,
+    script: impl Fn(SocketAddr) -> Script,
+) -> impl FnMut(SocketAddr) -> Attempt {
+    let journal = journal.clone();
+    move |address| {
+        journal
+            .started
+            .lock()
+            .unwrap()
+            .push((address, origin.elapsed()));
+        let mut probe = DropProbe {
+            address,
+            cancelled: std::sync::Arc::clone(&journal.cancelled),
+            armed: true,
+        };
+        let step = script(address);
+        Box::pin(async move {
+            let outcome = match step {
+                Script::Hang => std::future::pending().await,
+                Script::SucceedAfter(ms) => {
+                    tokio::time::sleep(Duration::from_millis(ms)).await;
+                    Ok(address)
+                }
+                Script::FailAfter(ms) => {
+                    tokio::time::sleep(Duration::from_millis(ms)).await;
+                    Err(anyhow::anyhow!("no answer from {address}"))
+                }
+            };
+            // A method, not a field write: a `move` block would capture the
+            // `bool` field alone, by copy, and drop the probe at once.
+            probe.disarm();
+            outcome
+        })
+    }
+}
+
+fn expect_win(outcome: Result<Won<SocketAddr>, AllFailed>) -> Won<SocketAddr> {
+    outcome.unwrap_or_else(|failed| panic!("{:#}", failed.into_error("gateway.example:51821")))
+}
+
+fn expect_failure(outcome: Result<Won<SocketAddr>, AllFailed>) -> AllFailed {
+    match outcome {
+        Ok(won) => panic!("nothing should win, {} did", won.address),
+        Err(failed) => failed,
+    }
+}
+
+/// The case the race exists for: IPv6 is published but broken on this
+/// network. It never answers; IPv4 starts after the attempt delay and wins,
+/// and the hung IPv6 attempt is cancelled rather than left running.
+#[tokio::test(start_paused = true)]
+async fn a_hung_ipv6_loses_to_ipv4_after_the_attempt_delay() {
+    let journal = Journal::default();
+    let origin = tokio::time::Instant::now();
+    let won = expect_win(
+        race(
+            &addrs(&[V6, V4]),
+            CONNECTION_ATTEMPT_DELAY,
+            connector(&journal, origin, |address| {
+                if address.is_ipv6() {
+                    Script::Hang
+                } else {
+                    Script::SucceedAfter(20)
+                }
+            }),
+        )
+        .await,
+    );
+
+    assert_eq!(won.address, addr(V4));
+    assert_eq!(won.value, addr(V4));
+    assert_eq!(origin.elapsed(), Duration::from_millis(270));
+    assert_eq!(
+        *journal.started.lock().unwrap(),
+        vec![
+            (addr(V6), Duration::ZERO),
+            (addr(V4), CONNECTION_ATTEMPT_DELAY)
+        ]
+    );
+    assert_eq!(*journal.cancelled.lock().unwrap(), vec![addr(V6)]);
+    assert_eq!(
+        won.passed_over,
+        vec![PassedOver {
+            address: addr(V6),
+            failure: None
+        }]
+    );
+}
+
+/// A healthy IPv6 answering inside the delay: IPv4 is never even started.
+#[tokio::test(start_paused = true)]
+async fn a_fast_ipv6_win_never_starts_ipv4() {
+    let journal = Journal::default();
+    let origin = tokio::time::Instant::now();
+    let won = expect_win(
+        race(
+            &addrs(&[V6, V4]),
+            CONNECTION_ATTEMPT_DELAY,
+            connector(&journal, origin, |_| Script::SucceedAfter(30)),
+        )
+        .await,
+    );
+
+    assert_eq!(won.address, addr(V6));
+    assert!(won.passed_over.is_empty());
+    assert_eq!(
+        *journal.started.lock().unwrap(),
+        vec![(addr(V6), Duration::ZERO)]
+    );
+    assert!(journal.cancelled.lock().unwrap().is_empty());
+}
+
+/// A slow but working IPv6 that answers after IPv4 was started: IPv6 wins,
+/// and the IPv4 attempt still in flight is cancelled.
+#[tokio::test(start_paused = true)]
+async fn a_slow_ipv6_win_cancels_the_started_ipv4() {
+    let journal = Journal::default();
+    let origin = tokio::time::Instant::now();
+    let won = expect_win(
+        race(
+            &addrs(&[V6, V4]),
+            CONNECTION_ATTEMPT_DELAY,
+            connector(&journal, origin, |address| {
+                if address.is_ipv6() {
+                    Script::SucceedAfter(300)
+                } else {
+                    Script::Hang
+                }
+            }),
+        )
+        .await,
+    );
+
+    assert_eq!(won.address, addr(V6));
+    assert_eq!(*journal.cancelled.lock().unwrap(), vec![addr(V4)]);
+    assert_eq!(
+        won.passed_over,
+        vec![PassedOver {
+            address: addr(V4),
+            failure: None
+        }]
+    );
+}
+
+/// A failure does not wait out the delay: the next candidate starts at once.
+#[tokio::test(start_paused = true)]
+async fn a_failure_hands_over_without_waiting_for_the_delay() {
+    let journal = Journal::default();
+    let origin = tokio::time::Instant::now();
+    let won = expect_win(
+        race(
+            &addrs(&[V6, V4]),
+            CONNECTION_ATTEMPT_DELAY,
+            connector(&journal, origin, |address| {
+                if address.is_ipv6() {
+                    Script::FailAfter(10)
+                } else {
+                    Script::SucceedAfter(10)
+                }
+            }),
+        )
+        .await,
+    );
+
+    assert_eq!(won.address, addr(V4));
+    assert_eq!(origin.elapsed(), Duration::from_millis(20));
+    assert_eq!(
+        won.passed_over,
+        vec![PassedOver {
+            address: addr(V6),
+            failure: Some(format!("no answer from {V6}")),
+        }]
+    );
+}
+
+/// Nothing answers: the error names the endpoint and every address tried,
+/// each with its own cause.
+#[tokio::test(start_paused = true)]
+async fn every_candidate_failing_is_one_explicit_error() {
+    let journal = Journal::default();
+    let origin = tokio::time::Instant::now();
+    let failed = expect_failure(
+        race(
+            &addrs(&[V6, V4]),
+            CONNECTION_ATTEMPT_DELAY,
+            connector(&journal, origin, |_| Script::FailAfter(1_000)),
+        )
+        .await,
+    );
+    assert_eq!(failed.failures.len(), 2);
+    let message = format!("{:#}", failed.into_error("gateway.example:51821"));
+    assert!(message.contains("gateway.example:51821"), "{message}");
+    assert!(
+        message.contains(&format!("{V6} (IPv6): no answer from {V6}")),
+        "{message}"
+    );
+    assert!(
+        message.contains(&format!("{V4} (IPv4): no answer from {V4}")),
+        "{message}"
+    );
+}
+
+/// One candidate — a literal endpoint — keeps the error it always had.
+#[tokio::test(start_paused = true)]
+async fn a_single_candidate_failure_is_returned_untouched() {
+    let journal = Journal::default();
+    let origin = tokio::time::Instant::now();
+    let failed = expect_failure(
+        race(
+            &addrs(&[V4]),
+            CONNECTION_ATTEMPT_DELAY,
+            connector(&journal, origin, |_| Script::FailAfter(5)),
+        )
+        .await,
+    );
+    assert_eq!(
+        format!("{:#}", failed.into_error("203.0.113.10:51821")),
+        format!("no answer from {V4}")
+    );
+}
+
+#[test]
+fn a_clean_win_is_logged_as_information() {
+    let selection = Selection {
+        endpoint: "gateway.example:51821".into(),
+        address: addr(V6),
+        passed_over: Vec::new(),
+    };
+    assert_eq!(
+        selection.describe(),
+        (
+            "info",
+            format!("endpoint gateway.example:51821 : IPv6 {V6} retenu")
+        )
+    );
+}
+
+/// IPv6 gave nothing and IPv4 won: a warning naming both families.
+#[test]
+fn a_family_fallback_is_a_named_warning() {
+    let selection = Selection {
+        endpoint: "gateway.example:51821".into(),
+        address: addr(V4),
+        passed_over: vec![PassedOver {
+            address: addr(V6),
+            failure: None,
+        }],
+    };
+    let (level, message) = selection.describe();
+    assert_eq!(level, "warn");
+    assert_eq!(
+        message,
+        format!(
+            "endpoint gateway.example:51821 : IPv4 {V4} retenu après IPv6 {V6} sans réponse, \
+             tentative annulée"
+        )
+    );
+}
