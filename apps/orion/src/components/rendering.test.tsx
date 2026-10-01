@@ -5,7 +5,7 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it, vi } from 'vitest'
 
 import App from '../App'
-import type { ClientProfile, LogLine, TunnelState, VaultPosture } from '../types'
+import type { CaptureCheck, ClientProfile, LogLine, TunnelState, VaultPosture } from '../types'
 import { ConnectView } from '../views/ConnectView'
 import { ProfilesView } from '../views/ProfilesView'
 import { CopyButton } from './CopyButton'
@@ -33,7 +33,11 @@ const profile = (overrides: Partial<ClientProfile> = {}): ClientProfile => ({
   ...overrides,
 })
 
-function postureHtml(selected: ClientProfile, vault: VaultPosture | null): string {
+function postureHtml(
+  selected: ClientProfile,
+  vault: VaultPosture | null,
+  capture: CaptureCheck | null = null,
+): string {
   const anchor = document.createElement('button')
   document.body.append(anchor)
   render(
@@ -44,6 +48,7 @@ function postureHtml(selected: ClientProfile, vault: VaultPosture | null): strin
       adapterUp
       profile={selected}
       psk="ml_kem"
+      capture={capture}
       vault={vault}
     />,
   )
@@ -201,6 +206,46 @@ describe('Orion presentational branches', () => {
     const dual = postureHtml(profile(), null)
     expect(dual).toContain('0.0.0.0/0, ::/0')
     expect(dual).not.toContain('IPv6 sort en clair')
+  })
+
+  /// The driver may apply less than the profile asks — on Windows, `::/0` on
+  /// an adapter without IPv6 — and nothing else on screen would show it.
+  it('names in amber the prefixes the driver did not apply', () => {
+    const stripped = postureHtml(profile(), null, { status: 'incomplete', missing: ['::/0'] })
+    expect(stripped).toContain('::/0 non appliqué par le pilote — hors tunnel')
+    expect(stripped).toContain('rgb(161, 98, 7)')
+    // The gap outranks the profile's own list: showing «0.0.0.0/0, ::/0»
+    // alone would state a capture the adapter does not have.
+    expect(stripped).not.toContain('0.0.0.0/0, ::/0')
+
+    const both = postureHtml(profile(), null, {
+      status: 'incomplete',
+      missing: ['0.0.0.0/0', '::/0'],
+    })
+    expect(both).toContain('0.0.0.0/0, ::/0 non appliqués par le pilote — hors tunnel')
+
+    // Even on a legacy IPv4-only profile, the measured gap is what is shown.
+    const legacy = postureHtml(
+      profile({ allowed_ips: '0.0.0.0/0', ipv6_uncaptured_full_tunnel: true }),
+      null,
+      { status: 'incomplete', missing: ['0.0.0.0/0'] },
+    )
+    expect(legacy).toContain('0.0.0.0/0 non appliqué par le pilote — hors tunnel')
+  })
+
+  it('does not present an unverified capture as a healthy one', () => {
+    const unverified = postureHtml(profile(), null, {
+      status: 'unverified',
+      reason: 'configuration du pilote : lecture impossible',
+    })
+    expect(unverified).toContain('0.0.0.0/0, ::/0 — non vérifié sur l’adaptateur')
+    expect(unverified).toContain('rgb(161, 98, 7)')
+
+    const complete = postureHtml(profile(), null, { status: 'complete' })
+    expect(complete).toContain('0.0.0.0/0, ::/0')
+    expect(complete).not.toContain('non vérifié')
+    expect(complete).not.toContain('non appliqué')
+    expect(complete).not.toContain('rgb(161, 98, 7)')
   })
 
   it('server-renders the initial application without starting platform effects', () => {

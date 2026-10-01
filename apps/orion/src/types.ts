@@ -432,10 +432,25 @@ export interface ProfileIssues {
  */
 export type PskKind = 'none' | 'static' | 'ml_kem'
 
+/**
+ * What the mounted adapter really captures — mirror of
+ * `orion_core::events::CaptureCheck`.
+ *
+ * The profile states what was asked; the driver may apply less without
+ * failing (on Windows, a family the adapter does not carry is dropped). Only
+ * the core's read-back knows, and only the real backend sends it: no verdict
+ * means nothing was verified, never that everything was.
+ */
+export type CaptureCheck =
+  | { status: 'complete' }
+  | { status: 'incomplete'; missing: string[] }
+  | { status: 'unverified'; reason: string }
+
 // Events pushed by the Rust backend (emit "helios://event").
 export type ClientEvent =
   | { type: 'state_changed'; state: TunnelState }
   | { type: 'protection'; psk: PskKind }
+  | { type: 'capture'; capture: CaptureCheck }
   | { type: 'log'; level: string; message: string }
   | { type: 'telemetry'; iface: string; rx_bps: number; tx_bps: number; rx_pps: number; tx_pps: number }
   | { type: 'error'; message: string }
