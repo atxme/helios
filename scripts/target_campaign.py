@@ -625,10 +625,10 @@ def _build_orion(ctx: Contexte):
 def _generer_cles(ctx: Contexte) -> None:
     """Deux paires WireGuard jetables, jamais persistées hors du répertoire
     temporaire de la campagne."""
-    if not ctx.cible.executer("test -x target/release/helios-ctl").ok:
-        raise RuntimeError("target/release/helios-ctl absent : jouer la catégorie build")
+    if not ctx.cible.executer("test -x target/release/helios").ok:
+        raise RuntimeError("target/release/helios absent : jouer la catégorie build")
     for role in ("client", "gateway"):
-        s = ctx.cible.executer("./target/release/helios-ctl campaign --generate-keys 2>/dev/null")
+        s = ctx.cible.executer("./target/release/helios campaign --generate-keys 2>/dev/null")
         if not s.ok:
             raise RuntimeError(
                 f"génération de clés {role} impossible (code {s.code}) : "
@@ -748,7 +748,7 @@ def _campagne_binaire(ctx: Contexte):
 def _campagne_client(ctx: Contexte):
     _assurer_cles(ctx)
     s = ctx.cible.executer(
-        f"./target/release/helios-ctl campaign --only client "
+        f"./target/release/helios campaign --only client "
         f"--client-key {shlex.quote(ctx.client_priv)} "
         f"--gateway-key {shlex.quote(ctx.gateway_pub)}"
     )
@@ -774,7 +774,7 @@ def _campagne_protocole(ctx: Contexte):
         if not _api_est_la_notre(ctx, "http://127.0.0.1:8080"):
             return Etat.ECHEC, "l'API répondante n'est pas celle du daemon lancé"
         s = ctx.cible.executer(
-            f"./target/release/helios-ctl campaign --only protocole "
+            f"./target/release/helios campaign --only protocole "
             f"--client-key {shlex.quote(ctx.client_priv)} "
             f"--gateway-key {shlex.quote(ctx.gateway_pub)}"
         )
@@ -825,7 +825,7 @@ def _mise_a_jour_api(ctx: Contexte):
     )
     if not build_daemon.ok:
         return Etat.ECHEC, build_daemon.stderr.strip()[-1200:]
-    if not ctx.cible.executer("test -x target/release/helios-ctl").ok:
+    if not ctx.cible.executer("test -x target/release/helios").ok:
         build_ctl = _cargo_release(ctx, "cargo build --release -p helios-ctl", timeout=1800)
         if not build_ctl.ok:
             return Etat.ECHEC, build_ctl.stderr.strip()[-1000:]
@@ -908,7 +908,7 @@ def _campagne_daemon_reel(ctx: Contexte):
     # sudoers, qui n'accepte aucun joker (sudo-rs). `helios-ctl` en a besoin
     # autant que le daemon : c'est lui qui lit le plan de données via
     # `wg show`, refusé sans CAP_NET_ADMIN.
-    for nom in ("heliosd", "helios-ctl"):
+    for nom in ("heliosd", "helios"):
         binaire = f"{ctx.cible.repo}/target/release/{nom}"
         pose = ctx.cible.executer(
             f"sudo -n setcap cap_net_admin,cap_net_raw+eip {shlex.quote(binaire)}",
@@ -1179,7 +1179,7 @@ def _tunnel_bout_en_bout(ctx: Contexte):
 
         # Provisioning PQ **dans** le tunnel, depuis le client.
         campagne = _local(
-            f"./target/release/helios-ctl --url http://100.64.0.1:8080 campaign "
+            f"./target/release/helios --url http://100.64.0.1:8080 campaign "
             f"--only protocole --client-key {shlex.quote(ctx.client_priv)} "
             f"--gateway-key {shlex.quote(ctx.gateway_pub)}",
             timeout=300,
@@ -1657,7 +1657,7 @@ def _regle_sudoers(utilisateur: str, repo: str) -> str:
 
     Ni shell générique, ni ``apt-get``, ni root inconditionnel n'y figurent.
     """
-    binaires = [f"{repo}/target/release/heliosd", f"{repo}/target/release/helios-ctl"]
+    binaires = [f"{repo}/target/release/heliosd", f"{repo}/target/release/helios"]
     commandes = [
         "/usr/sbin/modprobe wireguard",
         "/usr/sbin/modprobe nf_tables",

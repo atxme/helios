@@ -67,7 +67,7 @@ if ! command -v strip > /dev/null; then
 fi
 ARTIFACTS="$TMP/artifacts"
 mkdir -p "$ARTIFACTS"
-for binaire in heliosd helios-ctl helios-installer; do
+for binaire in heliosd helios helios-installer; do
     cp "${CARGO_TARGET_DIR:-target}/debug/$binaire" "$ARTIFACTS/$binaire"
     strip "$ARTIFACTS/$binaire"
 done

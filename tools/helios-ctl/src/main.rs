@@ -1,4 +1,4 @@
-//! `helios-ctl` — development and control tool for heliosd.
+//! `helios` — interactive and scripted gateway administration.
 //!
 //! ```sh
 //! cargo run -p heliosd -- run --dev          # daemon in dev mode
@@ -29,6 +29,8 @@ mod campaign_key_nego;
 mod enroll;
 mod escrow;
 mod files;
+mod firmware;
+mod interactive;
 mod key_nego;
 mod peer;
 mod profile;
@@ -38,10 +40,13 @@ mod update;
 
 #[derive(Parser)]
 #[command(
-    name = "helios-ctl",
-    about = "Test and control tool for heliosd",
+    name = "helios",
+    about = "Helios gateway administration",
     after_help = "\
 EXAMPLES:
+  helios                                      # interactive terminal
+  helios update --check                       # passive local plan
+  helios firmware list                        # local firmware inventory
   cargo run -p helios-ctl -- status
   cargo run -p helios-ctl -- watch
   cargo run -p helios-ctl -- network show
@@ -57,11 +62,18 @@ struct Cli {
     url: String,
 
     #[command(subcommand)]
-    command: Cmd,
+    command: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Opens the interactive administration terminal.
+    Shell,
+    /// Firmware inventory, prepared updates and verified reboot/recovery through SSH.
+    Firmware {
+        #[command(subcommand)]
+        command: firmware::FirmwareCmd,
+    },
     /// Shows the daemon's current state.
     Status,
     /// Connects the VPN tunnel.
@@ -214,10 +226,14 @@ enum Cmd {
     /// window and reboots — which kills this command. Whether the window was
     /// consumed is in the journal at the next boot:
     /// `journalctl --namespace=helios -u heliosd -b | grep -i 'update window'`.
+    /// PCR 0/7 changes are refused when sealing is enabled. `--check` is passive.
     Update {
         /// Skips the confirmation.
         #[arg(long)]
         yes: bool,
+        /// Shows pending OS packages and firmware without changing the system.
+        #[arg(long, conflicts_with = "yes")]
+        check: bool,
     },
     /// Runs a predefined test scenario.
     Scenario {
@@ -584,13 +600,18 @@ async fn cmd_watch(base: &str) -> Result<()> {
         .context("could not connect — is heliosd running?")?;
     println!("\x1b[2m↳ connected — Ctrl-C to quit\x1b[0m\n");
 
-    while let Some(msg) = stream.next().await {
-        if let Ok(Message::Text(text)) = msg {
-            let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-            print_ws_event(&hh_mm_ss(), &v);
+    loop {
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => { result?; return Ok(()); }
+            message = stream.next() => {
+                let Some(message) = message else { return Ok(()); };
+                if let Ok(Message::Text(text)) = message {
+                    let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+                    print_ws_event(&hh_mm_ss(), &v);
+                }
+            }
         }
     }
-    Ok(())
 }
 
 async fn cmd_network_show(client: &Client, base: &str) -> Result<()> {
@@ -932,16 +953,25 @@ async fn main() -> Result<()> {
     let base = cli.url.trim_end_matches('/');
 
     match cli.command {
-        Cmd::Status => cmd_status(&client, base).await,
-        Cmd::Connect => cmd_connect(&client, base).await,
-        Cmd::Disconnect => cmd_disconnect(&client, base).await,
+        None | Some(Cmd::Shell) => interactive::run(&client, base).await,
+        Some(command) => execute_command(&client, base, command).await,
+    }
+}
+
+async fn execute_command(client: &Client, base: &str, command: Cmd) -> Result<()> {
+    match command {
+        Cmd::Shell => anyhow::bail!("open the shell at the command entry point"),
+        Cmd::Firmware { command } => firmware::run(command),
+        Cmd::Status => cmd_status(client, base).await,
+        Cmd::Connect => cmd_connect(client, base).await,
+        Cmd::Disconnect => cmd_disconnect(client, base).await,
         Cmd::Watch => cmd_watch(base).await,
         Cmd::Network { command } => match command {
-            NetworkCmd::Show => cmd_network_show(&client, base).await,
-            NetworkCmd::Load { file } => cmd_network_load(&client, base, &file).await,
+            NetworkCmd::Show => cmd_network_show(client, base).await,
+            NetworkCmd::Load { file } => cmd_network_load(client, base, &file).await,
         },
         Cmd::Peer { command } => match command {
-            PeerCmd::List => peer::cmd_list(&client, base).await,
+            PeerCmd::List => peer::cmd_list(client, base).await,
             PeerCmd::Add {
                 name,
                 public_key,
@@ -962,7 +992,7 @@ async fn main() -> Result<()> {
                     }
                 });
                 peer::cmd_add(
-                    &client,
+                    client,
                     base,
                     &name,
                     &public_key,
@@ -977,7 +1007,7 @@ async fn main() -> Result<()> {
                 )
                 .await
             }
-            PeerCmd::Revoke { name } => peer::cmd_revoke(&client, base, &name).await,
+            PeerCmd::Revoke { name } => peer::cmd_revoke(client, base, &name).await,
         },
         Cmd::Profile { command } => match command {
             ProfileCmd::Check { path } => profile::check(&path),
@@ -995,7 +1025,7 @@ async fn main() -> Result<()> {
                 let ssh_target = check_ssh_target(ssh_target)?;
                 let ssh_target = check_ssh_target(ssh_target)?;
                 profile::emit(
-                    &client,
+                    client,
                     base,
                     profile::EmitOptions {
                         name,
@@ -1052,7 +1082,7 @@ async fn main() -> Result<()> {
                 _ => None,
             };
             enroll::run(
-                &client,
+                client,
                 base,
                 enroll::EnrollOptions {
                     name,
@@ -1090,7 +1120,7 @@ async fn main() -> Result<()> {
             yes,
         } => {
             app_update::run(
-                &client,
+                client,
                 base,
                 app_update::Options {
                     manifest,
@@ -1101,10 +1131,16 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Cmd::Update { yes } => update::run(yes),
+        Cmd::Update { yes, check } => {
+            if check {
+                update::check()
+            } else {
+                update::run(yes)
+            }
+        }
         Cmd::Scenario { name } => match name.as_str() {
-            "nominal" => scenario_nominal(&client, base).await,
-            "flap" => scenario_flap(&client, base).await,
+            "nominal" => scenario_nominal(client, base).await,
+            "flap" => scenario_flap(client, base).await,
             other => anyhow::bail!("unknown scenario '{other}'. Available: nominal, flap"),
         },
         Cmd::Campaign {
@@ -1122,7 +1158,7 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
             campaign::run(
-                &client,
+                client,
                 base,
                 campaign::Options {
                     client_key,

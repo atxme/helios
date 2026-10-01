@@ -7,7 +7,7 @@ param(
     [Parameter(Mandatory = $true, ParameterSetName = "Artifacts")]
     [string]$Binary,
 
-    # Optional prebuilt Windows helios-ctl.exe. Cargo is used when omitted.
+    # Optional prebuilt Windows helios.exe. Cargo is used when omitted.
     [Parameter(ParameterSetName = "Artifacts")]
     [string]$HeliosCtl,
 
@@ -116,7 +116,7 @@ $Manifest = (Resolve-Path -LiteralPath $Manifest).Path
 $Binary = (Resolve-Path -LiteralPath $Binary).Path
 if (-not [string]::IsNullOrWhiteSpace($HeliosCtl)) {
     if (-not (Test-Path -LiteralPath $HeliosCtl -PathType Leaf)) {
-        throw "helios-ctl executable not found: $HeliosCtl"
+        throw "helios executable not found: $HeliosCtl"
     }
     $HeliosCtl = (Resolve-Path -LiteralPath $HeliosCtl).Path
 }

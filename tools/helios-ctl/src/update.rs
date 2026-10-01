@@ -42,9 +42,11 @@
 //!   needed, though arming one costs nothing since a nominal unseal revokes it;
 //! - kernel or bootloader (PCR 4) — exactly what the window covers;
 //! - firmware or Secure Boot database (PCR 0/7) — **beyond** the window, which
-//!   binds those two PCRs and will not open. That upgrade falls back to reseal
-//!   ticket plus escrow, and learning it here beats learning it from a gateway
-//!   that no longer starts.
+//!   binds those two PCRs and will not open. Installation is refused on a
+//!   sealed gateway: WireGuard escrow does not preserve the negotiation vault.
+//!
+//! Firmware releases themselves are inventoried through `firmware list` or
+//! `update --check`. Updating the fwupd package is not installing firmware.
 //!
 //! Initramfs regeneration — microcode, `linux-firmware` — is deliberately not
 //! flagged: under GRUB the initrd is measured into PCR 8/9, which Helios does
@@ -84,7 +86,7 @@ const PCR_FOUR_PREFIXES: &[&str] = &[
 ];
 
 /// Packages that move PCR 0 or 7: firmware and the Secure Boot databases.
-const PCR_ZERO_SEVEN_PREFIXES: &[&str] = &["fwupd", "secureboot-db"];
+const PCR_ZERO_SEVEN_PREFIXES: &[&str] = &["secureboot-db"];
 
 pub fn classify_package(name: &str) -> BootChainImpact {
     if PCR_ZERO_SEVEN_PREFIXES
@@ -181,12 +183,28 @@ pub fn parse_window_state(output: &str) -> Result<WindowState> {
 
 // ─── The command ──────────────────────────────────────────────────────────────
 
+/// Passive plan: unlike update-readiness, this never unseals or consumes a ticket.
+pub fn check() -> Result<()> {
+    let heliosd = locate_heliosd()?;
+    let sealing = sealing_enabled(&heliosd)?;
+    println!("Local gateway maintenance (independent of --url)");
+    println!(
+        "TPM sealing: {}",
+        if sealing { "enabled" } else { "disabled" }
+    );
+    report_pending(&pending_upgrades()?);
+    println!();
+    crate::firmware::list()
+}
+
 pub fn run(yes: bool) -> Result<()> {
     let heliosd = locate_heliosd()?;
 
+    let sealing = sealing_enabled(&heliosd)?;
+
     // Refuse to stack a second window on an unfinished run: the operator would
     // otherwise never learn that a previous reboot never happened.
-    if window_state(&heliosd)? == WindowState::Armed {
+    if sealing && window_state(&heliosd)? == WindowState::Armed {
         anyhow::bail!(
             "a window is already armed — a previous run did not reboot. Reboot to \
              consume it, or `sudo {heliosd} tpm cancel-update`."
@@ -198,25 +216,23 @@ pub fn run(yes: bool) -> Result<()> {
     // whether or not a window was ever armed. So the ability to arm one is
     // established *here*, while doing nothing is still an option — an
     // unreachable TPM or a non-nominal boot is a refusal, not a warning.
-    let arm_window = match readiness(&heliosd).context(
-        "checking whether an update window can be armed — refusing to upgrade without \
+    let arm_window = if !sealing {
+        false
+    } else {
+        match readiness(&heliosd).context(
+            "checking whether an update window can be armed — refusing to upgrade without \
          that answer, since the vaults are what an unarmed reboot loses",
-    )? {
-        Readiness::Ready => true,
-        Readiness::SealingDisabled => {
-            println!(
-                "TPM sealing is disabled on this gateway — the upgrade has no sealed \
-                 secret to lose, so no window will be armed and no reboot ordered."
-            );
-            false
-        }
-        Readiness::Unavailable => anyhow::bail!(
-            "this boot cannot arm an update window (see the reason logged just \
+        )? {
+            Readiness::Ready => true,
+            Readiness::SealingDisabled => {
+                anyhow::bail!("TPM sealing status changed during preflight — refusing the upgrade")
+            }
+            Readiness::Unavailable => anyhow::bail!(
+                "this boot cannot arm an update window (see the reason logged just \
              above) — the reboot after an upgrade would lose the vaults and force \
-             every client to be re-enrolled. Repair the TPM state first (reseal \
-             ticket, escrow), or upgrade deliberately with `sudo apt upgrade` and \
-             accept that cost."
-        ),
+             every client to be re-enrolled. Repair the TPM state before upgrading."
+            ),
+        }
     };
 
     println!("==> Refreshing package lists");
@@ -230,6 +246,7 @@ pub fn run(yes: bool) -> Result<()> {
         println!("\nNothing to upgrade.");
         return Ok(());
     }
+    ensure_packages_covered(&pending, sealing)?;
     if !yes && !confirm(arm_window)? {
         println!("aborted");
         return Ok(());
@@ -276,16 +293,23 @@ fn report_pending(pending: &[(String, BootChainImpact)]) {
     }
     if !beyond.is_empty() {
         println!(
-            "  PCR 0/7 {} — {} BEYOND the window: it binds those PCRs and will not \
-             open. The gateway will fall back to the reseal ticket and lose its \
-             vaults. Hold those packages unless the escrow is ready.",
+            "  PCR 0/7 {} — {} beyond the update window; installation is refused \
+             while TPM sealing is enabled. WireGuard escrow alone does not \
+             preserve the negotiation identity.",
             beyond.join(", "),
             crate::fail()
         );
     }
     if covered.is_empty() && beyond.is_empty() {
-        println!("  nothing touches the boot chain — the PCRs will not move");
+        println!("  no package identified as changing PCR 0/4/7; firmware updates are separate");
     }
+}
+
+fn ensure_packages_covered(pending: &[(String, BootChainImpact)], sealing: bool) -> Result<()> {
+    if sealing && !names_with(pending, BootChainImpact::PcrZeroSeven).is_empty() {
+        return Err(crate::firmware::FirmwareError::RecoveryRequired.into());
+    }
+    Ok(())
 }
 
 fn names_with(pending: &[(String, BootChainImpact)], wanted: BootChainImpact) -> Vec<&str> {
@@ -325,7 +349,7 @@ fn confirm(arm_window: bool) -> Result<bool> {
 ///
 /// The fallback is what makes the command usable on a development gateway
 /// running from a build tree, without adding a flag nobody sets in production.
-fn locate_heliosd() -> Result<String> {
+pub(super) fn locate_heliosd() -> Result<String> {
     if std::path::Path::new(INSTALLED_HELIOSD).is_file() {
         return Ok(INSTALLED_HELIOSD.to_string());
     }
@@ -341,6 +365,25 @@ fn locate_heliosd() -> Result<String> {
         "heliosd not found at {INSTALLED_HELIOSD} nor on PATH — is this command \
          running on the gateway?"
     )
+}
+
+pub(super) fn sealing_enabled(heliosd: &str) -> Result<bool> {
+    let output = heliosd_tpm_output(heliosd, &["sealing-status"])?;
+    parse_sealing_status(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_sealing_status(output: &str) -> Result<bool> {
+    let mut verdicts = output.lines().filter_map(|line| match line.trim() {
+        "enabled" => Some(true),
+        "disabled" => Some(false),
+        _ => None,
+    });
+    match (verdicts.next(), verdicts.next()) {
+        (Some(enabled), None) => Ok(enabled),
+        _ => anyhow::bail!(
+            "unexpected `tpm sealing-status` output — upgrade heliosd and helios together"
+        ),
+    }
 }
 
 fn window_state(heliosd: &str) -> Result<WindowState> {
@@ -460,7 +503,7 @@ mod tests {
     /// would send an operator into a reboot the window cannot survive.
     #[test]
     fn firmware_and_secure_boot_are_beyond_the_window() {
-        for package in ["fwupd", "fwupd-signed", "secureboot-db"] {
+        for package in ["secureboot-db", "secureboot-db:amd64"] {
             assert_eq!(
                 classify_package(package),
                 BootChainImpact::PcrZeroSeven,
@@ -480,12 +523,39 @@ mod tests {
             "intel-microcode",
             "amd64-microcode",
             "linux-firmware",
+            "fwupd",
+            "fwupd-signed",
         ] {
             assert_eq!(
                 classify_package(package),
                 BootChainImpact::None,
                 "{package} must not be flagged"
             );
+        }
+    }
+
+    #[test]
+    fn secure_boot_packages_cannot_bypass_the_guard_on_a_sealed_gateway() {
+        let pending =
+            parse_simulated_upgrade("Inst secureboot-db [old] (new)\nInst openssl [old] (new)");
+        let error = ensure_packages_covered(&pending, true).unwrap_err();
+        assert!(error
+            .downcast_ref::<crate::firmware::FirmwareError>()
+            .is_some());
+        assert!(ensure_packages_covered(&pending, false).is_ok());
+        assert!(ensure_packages_covered(
+            &parse_simulated_upgrade("Inst linux-image-amd64 [old] (new)"),
+            true
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn sealing_status_requires_one_unambiguous_verdict() {
+        assert!(parse_sealing_status("2026 INFO startup\nenabled\n").unwrap());
+        assert!(!parse_sealing_status("disabled\n").unwrap());
+        for output in ["", "ready", "enabled\ndisabled", "enabled\nenabled"] {
+            assert!(parse_sealing_status(output).is_err());
         }
     }
 

@@ -290,6 +290,63 @@ impl ArtifactPayload for ResealPayload {
 
 pub type SignedResealTicket = SignedEnvelope<ResealPayload>;
 
+/// Authorizes restoration of one existing TPM root after planned firmware
+/// maintenance. This domain never authorizes creation of a replacement root.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FirmwareRecoveryPayload {
+    pub version: u64,
+    #[serde(
+        serialize_with = "serialize_digest",
+        deserialize_with = "deserialize_digest"
+    )]
+    pub sealed_blob_anchor: [u8; 32],
+    #[serde(
+        serialize_with = "serialize_digest",
+        deserialize_with = "deserialize_digest"
+    )]
+    pub secret_commitment: [u8; 32],
+    pub device_id: String,
+    pub target_version: String,
+}
+
+impl FirmwareRecoveryPayload {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.version == 0 {
+            return Err("firmware recovery version must be positive");
+        }
+        if self.device_id.len() != 40 || !self.device_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err("invalid firmware device identifier");
+        }
+        if self.target_version.is_empty()
+            || self.target_version.starts_with('-')
+            || self.target_version.len() > 128
+            || !self
+                .target_version
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b".-_+".contains(&b))
+        {
+            return Err("invalid firmware target version");
+        }
+        Ok(())
+    }
+}
+
+impl ArtifactPayload for FirmwareRecoveryPayload {
+    const DOMAIN: &'static [u8] = b"helios-firmware-recovery-v1";
+    const FORMAT_VERSION: u32 = 1;
+
+    fn encode_canonical(&self, output: &mut Vec<u8>) {
+        output.extend_from_slice(&self.version.to_be_bytes());
+        output.extend_from_slice(&self.sealed_blob_anchor);
+        output.extend_from_slice(&self.secret_commitment);
+        encode_string(output, &self.device_id);
+        encode_string(output, &self.target_version);
+    }
+}
+
+pub type SignedFirmwareRecovery = SignedEnvelope<FirmwareRecoveryPayload>;
+
 /// Signed metadata of a distributable `heliosd` binary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

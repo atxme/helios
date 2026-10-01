@@ -57,7 +57,7 @@ fn current_wireguard_status_is_deserializable() {
 #[test]
 fn command_line_keeps_peer_security_parameters() {
     let cli = Cli::try_parse_from([
-        "helios-ctl",
+        "helios",
         "--url",
         "https://100.64.0.1:8080/",
         "peer",
@@ -77,7 +77,7 @@ fn command_line_keeps_peer_security_parameters() {
     .unwrap();
     assert_eq!(cli.url, "https://100.64.0.1:8080/");
     assert!(matches!(
-        cli.command,
+        cli.command.unwrap(),
         Cmd::Peer {
             command: PeerCmd::Add {
                 name,
@@ -93,17 +93,18 @@ fn command_line_keeps_peer_security_parameters() {
     ));
 
     assert!(matches!(
-        Cli::try_parse_from(["helios-ctl", "peer", "list"])
+        Cli::try_parse_from(["helios", "peer", "list"])
             .unwrap()
-            .command,
+            .command
+            .unwrap(),
         Cmd::Peer {
             command: PeerCmd::List
         }
     ));
     assert!(matches!(
-        Cli::try_parse_from(["helios-ctl", "peer", "revoke", "--name", "old"])
+        Cli::try_parse_from(["helios", "peer", "revoke", "--name", "old"])
             .unwrap()
-            .command,
+            .command.unwrap(),
         Cmd::Peer {
             command: PeerCmd::Revoke { name }
         } if name == "old"
@@ -113,16 +114,28 @@ fn command_line_keeps_peer_security_parameters() {
 #[test]
 fn command_line_covers_offline_and_diagnostic_commands() {
     for arguments in [
-        vec!["helios-ctl", "status"],
-        vec!["helios-ctl", "connect"],
-        vec!["helios-ctl", "disconnect"],
-        vec!["helios-ctl", "watch"],
-        vec!["helios-ctl", "network", "show"],
-        vec!["helios-ctl", "network", "load", "network.toml"],
-        vec!["helios-ctl", "profile", "check", "client.orion"],
-        vec!["helios-ctl", "escrow", "keygen", "--output-dir", "keys"],
+        vec!["helios"],
+        vec!["helios", "shell"],
+        vec!["helios", "update", "--check"],
+        vec!["helios", "firmware", "list"],
         vec![
-            "helios-ctl",
+            "helios",
+            "firmware",
+            "update",
+            "--plan",
+            "firmware-plan.json",
+            "--yes",
+        ],
+        vec!["helios", "status"],
+        vec!["helios", "connect"],
+        vec!["helios", "disconnect"],
+        vec!["helios", "watch"],
+        vec!["helios", "network", "show"],
+        vec!["helios", "network", "load", "network.toml"],
+        vec!["helios", "profile", "check", "client.orion"],
+        vec!["helios", "escrow", "keygen", "--output-dir", "keys"],
+        vec![
+            "helios",
             "app-update",
             "--manifest",
             "heliosd.release.json",
@@ -130,15 +143,15 @@ fn command_line_covers_offline_and_diagnostic_commands() {
             "heliosd",
             "--yes",
         ],
-        vec!["helios-ctl", "scenario", "flap"],
-        vec!["helios-ctl", "campaign", "--generate-keys"],
+        vec!["helios", "scenario", "flap"],
+        vec!["helios", "campaign", "--generate-keys"],
     ] {
         Cli::try_parse_from(arguments).unwrap();
     }
 
     assert!(
         Cli::try_parse_from([
-            "helios-ctl",
+            "helios",
             "enroll",
             "--name",
             "client",
@@ -153,7 +166,7 @@ fn command_line_covers_offline_and_diagnostic_commands() {
         "partial offline enrollment material must be refused"
     );
     assert!(Cli::try_parse_from([
-        "helios-ctl",
+        "helios",
         "app-update",
         "--manifest",
         "heliosd.release.json",
@@ -163,6 +176,13 @@ fn command_line_covers_offline_and_diagnostic_commands() {
         "--yes",
     ])
     .is_err());
+}
+
+#[test]
+fn passive_update_check_cannot_be_combined_with_installation_confirmation() {
+    assert!(Cli::try_parse_from(["helios", "update", "--check", "--yes"]).is_err());
+    assert!(Cli::try_parse_from(["helios", "firmware", "update"]).is_err());
+    assert!(Cli::try_parse_from(["helios"]).unwrap().command.is_none());
 }
 
 #[test]

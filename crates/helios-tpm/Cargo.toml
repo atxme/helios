@@ -19,6 +19,7 @@ serde_json.workspace = true
 hex = "0.4"
 # Enveloppe hybride Ed25519 + ML-DSA-65 et trousseau éditeur compilé.
 aether.workspace = true
+helios-escrow.workspace = true
 # Effacement mémoire du secret descellé.
 zeroize = { version = "1", features = ["derive"] }
 # Empreinte d'identité de l'état PCR (liaison du billet).
@@ -33,4 +34,3 @@ tss-esapi = { version = "7.5", optional = true }
 [dev-dependencies]
 tempfile = "3"
 aether = { workspace = true, features = ["publisher-signing"] }
-helios-escrow.workspace = true

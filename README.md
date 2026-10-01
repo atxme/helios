@@ -52,7 +52,7 @@ heliosd : orchestrateur · API Axum/WS · IPAM ML-KEM · pare-feu nftables
 | `heliosd` | CLI et orchestration de la gateway |
 | `orion-core` / `apps/orion` | Cœur portable et shell Tauri du client |
 | `web` | Console d'administration React (MUI seul, polices auto-hébergées) |
-| `helios-ctl` | Outil du poste opérateur — et `update` sur la gateway |
+| `helios` (package `helios-ctl`) | Terminal du poste opérateur — et `update` sur la gateway |
 | `helios-publisher` | Outil éditeur hors gateway (Ed25519 + ML-DSA-65) |
 | `helios-installer` | Helper privilégié sans réseau : activation et rollback |
 | `xtask` | Bundles d'installation et installateur Windows d'Orion |
@@ -82,18 +82,24 @@ tests toutes features, audits Cargo/npm, Vitest et builds frontend.
 # sur la gateway
 heliosd init-identity                  # identité WireGuard scellée au TPM
 heliosd init-key-negotiation           # identité de négociation TLS + ML-DSA-87
-helios-ctl update                      # mise à jour de l'OS (ADR-007)
+helios                            # terminal d'administration interactif
+helios update --check              # inventaire OS + firmware, sans installation
+helios update                      # mise à jour de l'OS (ADR-007)
+helios firmware list               # versions proposées par fwupd
 
 # sur le poste opérateur
-helios-ctl peer add|revoke|list        # admission
-helios-ctl enroll                      # clés, certificats, admission et profil
-helios-ctl profile emit|check          # document `.orion`
-helios-ctl escrow ...                  # séquestre — jamais sur la gateway secourue
+helios peer add|revoke|list        # admission
+helios enroll                      # clés, certificats, admission et profil
+helios profile emit|check          # document `.orion`
+helios escrow ...                  # séquestre — jamais sur la gateway secourue
 
 # scripts d'enchaînement
 ./scripts/deploy.sh                    # construit, signe, copie, installe
 ./scripts/provision-client.sh nom      # CA, négociation, admission, profil
 ```
+
+Le terminal et le parcours de mise à jour firmware sont décrits dans
+[le guide de maintenance](docs/MAINTENANCE.md).
 
 La configuration unique est `/var/lib/helios/network.toml`, relue à chaud
 (modèle : [config/network.toml](config/network.toml)). `key_negotiation_port`

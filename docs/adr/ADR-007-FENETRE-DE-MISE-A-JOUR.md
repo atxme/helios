@@ -133,10 +133,49 @@ puis laisser le démarrage légitime réussir. `TPM2_PolicyCounterTimer` sur
 `resetCount`, ou un primitif matériel équivalent de lecture destructive,
 fermerait cette limite ; jusque-là, `--reboot` est obligatoire en exploitation.
 
-**Hors périmètre également** : une mise à jour qui déplace PCR 0 ou 7 — firmware,
-base Secure Boot. La fenêtre ne s'ouvrira pas et le démarrage retombe sur billet
-et séquestre, comme aujourd'hui. C'est le cas rare ; le noyau et le bootloader
-sont le cas fréquent.
+**Hors périmètre de cette fenêtre** : une mise à jour qui déplace PCR 0 ou 7
+— firmware, base Secure Boot. Le parcours firmware ci-dessous apporte une
+récupération opérateur distincte ; il ne retire aucun PCR de la politique NV.
+
+### Maintenance firmware planifiée (amendement du 1er octobre 2026)
+
+Le terminal général `helios` réutilise les commandes du package `helios-ctl`.
+Sa commande firmware suit un journal opérateur : préparation, installation
+ciblée, redémarrage, restauration et vérification. L'API ne transporte aucun
+secret ; SSH reste nécessaire indépendamment du tunnel de la gateway.
+
+Avant installation, un descellement nominal exporte le secret racine existant
+chiffré avec le séquestre HESC v1 vers le poste opérateur. Les clés privées de
+séquestre et d'éditeur restent hors gateway. Cela conserve tous les coffres,
+contrairement au séquestre WireGuard seul. HESC v1 reste une confidentialité
+classique X25519/AES-256-GCM, explicitement distincte des signatures PQ.
+
+Une autorisation `helios-firmware-recovery-v1`, signée Ed25519 **et** ML-DSA-65,
+lie compteur, ancre SHA-256 du blob nominal, engagement séparé par domaine du
+secret, périphérique et version firmware. Un billet de rescellement générique
+ne peut pas autoriser ce chemin. Après reboot, le daemon offline vérifie cette
+autorisation et le secret transmis en mémoire par SSH, puis rescelle **le même
+secret** sur les PCR 0/4/7 courants. L'autorisation permet explicitement ces
+nouveaux PCR, sans prévision de leur digest ; le boot choisi et son contrôle
+avant remise en service relèvent de l'opérateur et de l'éditeur.
+
+Une fenêtre OS ou un billet en attente est refusé avant préparation. La
+restauration révoque l'index NV par Owner sans le lire : sa politique PCR 0/7
+ancienne peut empêcher même la lecture d'un index vidé. Une erreur TPM ou
+révocation NV est fatale avant modification du compteur/blob, sans création
+d'un nouveau secret. Le compteur fichier partagé avec les billets est avancé
+avant le blob ; une coupure entre écritures impose une nouvelle autorisation
+de version supérieure. L'hypothèse de confiance de ce compteur est désormais
+explicite dans l'[amendement 5 de l'ADR-002](ADR-002-SIGNATURES-PQ.md).
+
+Le journal est non secret, sauf sa sauvegarde chiffrée ; il vit hors gateway.
+L'installation n'est jamais rejouée automatiquement après une interruption.
+Une perte de réponse SSH au reboot est suivie par comparaison de `boot_id`,
+jamais considérée comme preuve de redémarrage. La fin exige version fwupd
+attendue, service actif et disponibilité réelle du même processus. Ces
+contrôles ne remplacent pas une connexion client ni une recette matérielle.
+Le [guide de maintenance](../MAINTENANCE.md) décrit commandes, reprises et
+limites, notamment Linux qui ne démarre plus après révocation du bootloader.
 
 ### 4. Ce qui reste à mesurer sur la cible
 
@@ -156,7 +195,8 @@ Une mise à jour noyau redevient une opération ordinaire : le secret survit, do
 `wg-key.sealed`, l'identité de négociation et la table des PSK statiques
 survivent, et aucun client n'est ré-enrôlé. Le billet de rescellement reste ce
 qu'il était — le chemin de récupération pour un changement de PCR **subi**, non
-planifié.
+planifié. Le firmware planifié dispose du parcours opérateur conservant le
+secret décrit ci-dessus.
 
 L'affirmation de l'ADR-003 §1 selon laquelle l'administration de l'OS est hors
 périmètre n'est plus vraie de la partie qui touche au scellement. Elle reste

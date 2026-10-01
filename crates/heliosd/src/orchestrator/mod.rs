@@ -408,7 +408,8 @@ fn publish_readiness(dry_run: bool, firewall_mode: FirewallMode) -> anyhow::Resu
     std::fs::write(
         &temporary,
         format!(
-            "version={VERSION}\nmode_reel={}\nfirewall_enforced={}\n",
+            "version={VERSION}\npid={}\nmode_reel={}\nfirewall_enforced={}\n",
+            std::process::id(),
             !dry_run,
             !dry_run && firewall_mode.enforced()
         ),

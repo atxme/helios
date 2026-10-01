@@ -65,7 +65,7 @@ const SYSTEMD_UNITS: &[&str] = &[
 ];
 
 /// Shipped binaries, and their role.
-const BINARIES: &[&str] = &["heliosd", "helios-installer", "helios-ctl"];
+const BINARIES: &[&str] = &["heliosd", "helios-installer", "helios"];
 
 #[derive(Parser)]
 #[command(
@@ -338,7 +338,7 @@ fn bundle(target: Option<String>, skip_frontend: bool, output: Option<PathBuf>) 
 
     let heliosd = build_gateway(&root, &target, skip_frontend)?;
 
-    println!("==> helios-installer, helios-ctl");
+    println!("==> helios-installer, helios");
     run(
         &root,
         "cargo",

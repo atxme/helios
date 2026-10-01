@@ -73,6 +73,21 @@ impl BootDecision {
 pub struct BootController;
 
 impl BootController {
+    /// Passive capability check. A disabled binary with an existing sealed
+    /// identity cannot establish that maintenance has no secret to lose.
+    pub fn sealing_enabled(cfg: &TpmSettings) -> Result<bool> {
+        let exists = std::path::Path::new(&cfg.sealed_blob_path)
+            .try_exists()
+            .map_err(|error| TpmError::Io {
+                path: cfg.sealed_blob_path.clone(),
+                cause: error.to_string(),
+            })?;
+        if !cfg.enabled && exists {
+            return Err(TpmError::SealingCapabilityMismatch);
+        }
+        Ok(cfg.enabled)
+    }
+
     pub fn unlock(cfg: &TpmSettings) -> Result<BootDecision> {
         if !cfg.enabled {
             info!("TPM sealing disabled (tpm.enabled = false) — booting without verification");
@@ -305,7 +320,7 @@ fn now_unix() -> Result<u64> {
 }
 
 /// Opens the TPM backend: real on target (`feature tpm`), simulated otherwise.
-fn open_tpm(cfg: &TpmSettings) -> Result<impl TpmSealer> {
+pub(crate) fn open_tpm(cfg: &TpmSettings) -> Result<impl TpmSealer> {
     #[cfg(feature = "tpm")]
     {
         crate::tpm_interface::TpmDevice::new(cfg)
@@ -326,6 +341,26 @@ mod tests {
 
     const DEV_ED_SEED: [u8; 32] = *b"helios-sign-ed25519-dev-seed-001";
     const DEV_ML_SEED: [u8; 32] = *b"helios-sign-mldsa65-dev-seed-001";
+
+    #[test]
+    fn passive_sealing_check_refuses_a_disabled_binary_with_a_sealed_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = test_cfg(dir.path(), false);
+        cfg.enabled = false;
+        assert!(!BootController::sealing_enabled(&cfg).unwrap());
+        std::fs::write(&cfg.sealed_blob_path, b"opaque sealed identity").unwrap();
+        assert!(matches!(
+            BootController::sealing_enabled(&cfg),
+            Err(TpmError::SealingCapabilityMismatch)
+        ));
+        cfg.enabled = true;
+        assert!(BootController::sealing_enabled(&cfg).unwrap());
+        assert_eq!(
+            std::fs::read(&cfg.sealed_blob_path).unwrap(),
+            b"opaque sealed identity"
+        );
+        assert!(!std::path::Path::new(&cfg.state_path).exists());
+    }
 
     /// Builds a TPM config pointing to a temporary directory.
     fn test_cfg(dir: &std::path::Path, allow_provisioning: bool) -> TpmSettings {

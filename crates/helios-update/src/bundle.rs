@@ -300,7 +300,7 @@ pub struct BootstrapLayout {
     pub update: crate::UpdateLayout,
     /// Privileged update helper (`helios-installer`).
     pub libexec_dir: PathBuf,
-    /// Operational tools (`helios-ctl`).
+    /// Operational tools (`helios`; legacy signed bundles may contain `helios-ctl`).
     pub bin_dir: PathBuf,
     /// Systemd units.
     pub systemd_dir: PathBuf,
@@ -360,6 +360,7 @@ fn destination(path: &str, layout: &BootstrapLayout) -> Result<Destination> {
             layout.libexec_dir.join("helios-installer"),
             0o755,
         )),
+        "helios" => Ok(Destination::Replace(layout.bin_dir.join("helios"), 0o755)),
         "helios-ctl" => Ok(Destination::Replace(
             layout.bin_dir.join("helios-ctl"),
             0o755,
@@ -636,7 +637,7 @@ mod tests {
     fn full_bundle(root: &Path) {
         write_file(root, "heliosd", b"the-daemon");
         write_file(root, "helios-installer", b"the-installer");
-        write_file(root, "helios-ctl", b"the-tool");
+        write_file(root, "helios", b"the-tool");
         write_file(root, "systemd/heliosd.service", b"[Unit]");
         write_file(root, "systemd/helios-update.service", b"[Unit]");
         write_file(root, "systemd/helios-update.path", b"[Path]");
@@ -700,7 +701,7 @@ mod tests {
             b"the-installer"
         );
         assert_eq!(
-            fs::read(target.join("usr/local/bin/helios-ctl")).unwrap(),
+            fs::read(target.join("usr/local/bin/helios")).unwrap(),
             b"the-tool"
         );
         assert!(target.join("etc/systemd/system/heliosd.service").is_file());

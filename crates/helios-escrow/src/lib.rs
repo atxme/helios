@@ -110,11 +110,12 @@ pub fn seal_to_operator(operator_public_key: &[u8], plaintext: &[u8]) -> Result<
         EscrowError::Rng(format!("approved DRBG unavailable for nonce: {error}"))
     })?;
 
-    let mut in_out = plaintext.to_vec();
+    let mut in_out = Zeroizing::new(Vec::with_capacity(plaintext.len() + AES_256_GCM.tag_len()));
+    in_out.extend_from_slice(plaintext);
     key.seal_in_place_append_tag(
         Nonce::assume_unique_for_key(nonce_bytes),
         Aad::from(AAD),
-        &mut in_out,
+        &mut *in_out,
     )
     .map_err(|_| EscrowError::Encryption)?;
 
@@ -158,7 +159,7 @@ pub fn open_as_operator(operator_private_key: &[u8], blob: &[u8]) -> Result<Zero
     let shared = secret.diffie_hellman(&ephemeral_public);
     let key = derive_key(shared.as_bytes(), &ephemeral, recipient_public.as_bytes())?;
 
-    let mut in_out = blob[HEADER_LEN..].to_vec();
+    let mut in_out = Zeroizing::new(blob[HEADER_LEN..].to_vec());
     let plaintext = key
         .open_in_place(
             Nonce::assume_unique_for_key(nonce_bytes),

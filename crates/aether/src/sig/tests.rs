@@ -417,3 +417,40 @@ fn fingerprint_identifies_both_halves_of_the_keyring() {
     changed_ml.ml_dsa_65[0] ^= 1;
     assert_ne!(keys.fingerprint(), changed_ml.fingerprint());
 }
+
+#[test]
+fn firmware_authorization_is_bound_to_every_context_field_and_its_own_domain() {
+    let payload = FirmwareRecoveryPayload {
+        version: 3,
+        sealed_blob_anchor: [1; 32],
+        secret_commitment: [2; 32],
+        device_id: "5bc922b7bd1adb5b6f99592611404036bd9f42d0".into(),
+        target_version: "2023".into(),
+    };
+    let message = signing_bytes(&payload, 1);
+    let mut changed = payload.clone();
+    changed.version += 1;
+    assert_ne!(message, signing_bytes(&changed, 1));
+    changed = payload.clone();
+    changed.sealed_blob_anchor[0] ^= 1;
+    assert_ne!(message, signing_bytes(&changed, 1));
+    changed = payload.clone();
+    changed.secret_commitment[0] ^= 1;
+    assert_ne!(message, signing_bytes(&changed, 1));
+    changed = payload.clone();
+    changed.device_id.replace_range(..1, "0");
+    assert_ne!(message, signing_bytes(&changed, 1));
+    changed = payload.clone();
+    changed.target_version = "2024".into();
+    assert_ne!(message, signing_bytes(&changed, 1));
+    assert_ne!(message, signing_bytes(&payload, 2));
+    assert_ne!(FirmwareRecoveryPayload::DOMAIN, ResealPayload::DOMAIN);
+    let mut json = serde_json::to_value(&payload).unwrap();
+    json["secret"] = serde_json::json!("not allowed");
+    assert!(serde_json::from_value::<FirmwareRecoveryPayload>(json).is_err());
+    changed.target_version = "--force".into();
+    assert!(changed.validate().is_err());
+    changed = payload;
+    changed.version = 0;
+    assert!(changed.validate().is_err());
+}

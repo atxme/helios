@@ -5,6 +5,9 @@
 //! `unlock_tpm_for_offline_command` makes the process non-dumpable first.
 
 use anyhow::Context;
+use helios_tpm::firmware_recovery::{
+    decode_restore_frame as decode_firmware_frame, MAX_RESTORE_FRAME,
+};
 use helios_tpm::{BootController, BootDecision, TpmSettings};
 use tracing::{info, warn};
 
@@ -15,7 +18,54 @@ use crate::TpmCommand;
 pub(crate) fn tpm_command(command: TpmCommand) -> anyhow::Result<()> {
     let tpm = TpmSettings::default();
     match command {
+        TpmCommand::SealingStatus => {
+            println!(
+                "{}",
+                if BootController::sealing_enabled(&tpm)? {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            );
+            Ok(())
+        }
         TpmCommand::PrepareUpdate { reboot } => prepare_update(&tpm, reboot),
+        TpmCommand::ExportFirmware {
+            operator_public_key,
+            device,
+            target_version,
+        } => {
+            use base64::Engine as _;
+            forbid_core_dumps(false)?;
+            let public = base64::engine::general_purpose::STANDARD.decode(operator_public_key)?;
+            let backup =
+                helios_tpm::firmware_recovery::export(&tpm, &public, device, target_version)?;
+            println!("{}", serde_json::to_string(&backup)?);
+            Ok(())
+        }
+        TpmCommand::FirmwarePreflight => {
+            forbid_core_dumps(false)?;
+            let bytes = read_firmware_input()?;
+            let auth = serde_json::from_slice(&bytes).context("invalid firmware authorization")?;
+            helios_tpm::firmware_recovery::preflight(&tpm, &auth)?;
+            println!("ready");
+            Ok(())
+        }
+        TpmCommand::RestoreFirmware => {
+            forbid_core_dumps(false)?;
+            let status = std::process::Command::new("systemctl")
+                .args(["is-active", "--quiet", "heliosd.service"])
+                .status()?;
+            anyhow::ensure!(
+                status.code() == Some(3),
+                "stop heliosd.service before restoring its TPM root"
+            );
+            let frame = read_firmware_input()?;
+            let (auth, secret) = decode_firmware_frame(&frame)?;
+            let unchanged = helios_tpm::firmware_recovery::restore(&tpm, &auth, secret)?;
+            println!("{}", if unchanged { "unchanged" } else { "restored" });
+            Ok(())
+        }
         TpmCommand::CancelUpdate => {
             BootController::cancel_update_window(&tpm).context("revoking the update window")?;
             info!("update window revoked");
@@ -31,6 +81,21 @@ pub(crate) fn tpm_command(command: TpmCommand) -> anyhow::Result<()> {
         }
         TpmCommand::UpdateReadiness => update_readiness(&tpm),
     }
+}
+
+fn read_firmware_input() -> anyhow::Result<zeroize::Zeroizing<Vec<u8>>> {
+    use std::io::Read as _;
+    // Reserve the entire bounded frame before reading any secret; reallocating
+    // a populated Vec could leave an unwiped copy in the old allocation.
+    let mut bytes = zeroize::Zeroizing::new(Vec::with_capacity(MAX_RESTORE_FRAME + 2));
+    std::io::stdin()
+        .take((MAX_RESTORE_FRAME + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        bytes.len() <= MAX_RESTORE_FRAME,
+        "firmware input exceeds 64 KiB"
+    );
+    Ok(bytes)
 }
 
 /// Answers whether `prepare-update` would succeed, without arming anything.
@@ -185,6 +250,31 @@ pub(crate) fn unlock_tpm_for_offline_command(tpm: &TpmSettings) -> anyhow::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn firmware_stdin_frame_rejects_truncation_extra_bytes_and_oversized_lengths() {
+        for frame in [vec![], vec![0; 35], vec![255; 40], vec![0; 40]] {
+            assert!(decode_firmware_frame(&frame).is_err());
+        }
+        let auth = aether::sig::SignedFirmwareRecovery {
+            payload: aether::sig::FirmwareRecoveryPayload {
+                version: 1,
+                sealed_blob_anchor: [1; 32],
+                secret_commitment: [2; 32],
+                device_id: "5bc922b7bd1adb5b6f99592611404036bd9f42d0".into(),
+                target_version: "2023".into(),
+            },
+            key_epoch: 1,
+            signatures: vec![],
+        };
+        let json = serde_json::to_vec(&auth).unwrap();
+        let mut frame = (json.len() as u32).to_be_bytes().to_vec();
+        frame.extend_from_slice(&json);
+        frame.extend_from_slice(&[7; 32]);
+        assert_eq!(decode_firmware_frame(&frame).unwrap().1, &[7; 32]);
+        frame.push(0);
+        assert!(decode_firmware_frame(&frame).is_err());
+    }
 
     #[test]
     fn provisioning_refuses_a_disabled_tpm_and_an_existing_vault() {
