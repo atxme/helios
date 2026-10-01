@@ -2,7 +2,6 @@
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    net::{Ipv4Addr, SocketAddr},
     path::Path,
     sync::Arc,
 };
@@ -17,8 +16,9 @@ use aether::{
     InstallPskRequest, NetworkConfig, SecretString,
 };
 use aether_key_negotiation::{
-    prepare_key_material, server_endpoint, GatewayIdentity, NegotiationHandler,
-    PreparedNegotiation, PublicError, TlsIdentity, DEFAULT_CONFIRMATION_TIMEOUT,
+    dual_stack_server_endpoint, prepare_key_material, GatewayIdentity, ListenFamilies,
+    NegotiationHandler, PreparedNegotiation, PublicError, TlsIdentity,
+    DEFAULT_CONFIRMATION_TIMEOUT,
 };
 use anyhow::{Context, Result};
 use base64::Engine as _;
