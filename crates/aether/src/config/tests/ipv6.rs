@@ -327,3 +327,95 @@ fn ipv4_identity_checks_still_apply_on_a_dual_stack_gateway() {
     config.peers[1].address = config.peers[0].address.clone();
     assert!(validation_error(&config).contains("duplicate VIP"));
 }
+
+// --- Hot reload (§5.4) -------------------------------------------------------
+
+/// A peer's IPv6 VIP is public configuration: a reload takes it from the
+/// file — added, changed or removed — while the runtime secrets are still
+/// adopted from the running configuration.
+#[test]
+fn a_reload_takes_peer_ipv6_vips_from_the_file_and_keeps_the_secrets() {
+    let mut running = dual_stack();
+    running.wg_private_key = "SECRET-DE-LA-GATEWAY".into();
+    running.peers[0].preshared_key = Some("PSK-NEGOCIE".into());
+
+    let mut from_disk = dual_stack();
+    from_disk.peers[0].address_v6 = Some(host("fd3c:91a2:7e04::42"));
+    from_disk.peers[1].address_v6 = Some(host("fd3c:91a2:7e04::43"));
+    from_disk.adopt_runtime_secrets_from(&running);
+
+    from_disk
+        .check_hot_reload(&running)
+        .expect("peers reload live");
+    from_disk.validate().expect("the merged configuration");
+    assert_eq!(
+        from_disk.peers[0].address_v6,
+        Some(host("fd3c:91a2:7e04::42"))
+    );
+    assert_eq!(
+        from_disk.peers[1].address_v6,
+        Some(host("fd3c:91a2:7e04::43"))
+    );
+    assert_eq!(from_disk.wg_private_key.expose(), "SECRET-DE-LA-GATEWAY");
+    assert_eq!(
+        from_disk.peers[0]
+            .preshared_key
+            .as_ref()
+            .map(SecretString::expose),
+        Some("PSK-NEGOCIE")
+    );
+    assert_ne!(from_disk, running, "the watcher must see a change to apply");
+
+    // Removed from the file, removed from the running gateway: this is not
+    // runtime state to preserve.
+    let mut from_disk = dual_stack();
+    from_disk.peers[0].address_v6 = None;
+    from_disk.adopt_runtime_secrets_from(&running);
+    assert_eq!(from_disk.peers[0].address_v6, None);
+}
+
+/// The tunnel prefix applies at startup only: every change of it — added,
+/// removed, replaced — is refused live, naming the key and the restart.
+#[test]
+fn a_reload_that_changes_the_tunnel_prefix_requires_a_restart() {
+    let other: TunnelPrefixV6 = "fd00:1:2::1/64".parse().expect("prefix");
+    for (running, incoming) in [
+        (None, Some(prefix())),
+        (Some(prefix()), None),
+        (Some(prefix()), Some(other)),
+    ] {
+        let running = NetworkConfig {
+            wg_address_v6: running,
+            ..NetworkConfig::default()
+        };
+        let incoming = NetworkConfig {
+            wg_address_v6: incoming,
+            ..NetworkConfig::default()
+        };
+        match incoming.check_hot_reload(&running) {
+            Err(HeliosError::Config(message)) => {
+                assert!(message.contains("wg_address_v6"), "{message}");
+                assert!(message.contains("restart"), "{message}");
+            }
+            other => panic!("expected a restart requirement, got {other:?}"),
+        }
+    }
+
+    let running = dual_stack();
+    let mut incoming = dual_stack();
+    incoming.peers.pop();
+    incoming
+        .check_hot_reload(&running)
+        .expect("an unchanged prefix is not a restart");
+}
+
+/// Duplicating a configuration carries the IPv6 addresses too: the hot
+/// reload compares duplicates.
+#[test]
+fn duplicating_a_configuration_carries_the_ipv6_addresses() {
+    let original = dual_stack();
+    let copy = original.duplicate();
+    assert_eq!(copy.wg_address_v6, Some(prefix()));
+    assert_eq!(copy.peers[0].address_v6, original.peers[0].address_v6);
+    assert_eq!(copy, original);
+}

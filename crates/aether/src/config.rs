@@ -266,7 +266,7 @@ pub struct NetworkConfig {
     /// it is written back (§2.2, §5.1). Present, it is drawn once and then
     /// kept: it is never regenerated, never derived from the gateway key
     /// (§2.5). Changing it renumbers every peer's IPv6 VIP, so it applies at
-    /// startup only (§5.4).
+    /// startup only — see [`Self::check_hot_reload`].
     #[serde(default, deserialize_with = "de_wg_address_v6")]
     pub wg_address_v6: Option<TunnelPrefixV6>,
     /// UDP listen port.
@@ -709,34 +709,6 @@ impl NetworkConfig {
         Ok(())
     }
 
-    /// Restores what a configuration coming from outside the daemon cannot
-    /// carry.
-    ///
-    /// Two sources feed the running configuration, and **neither** holds the
-    /// runtime secrets: `GET /api/network` redacts them by design, and
-    /// `network.toml` is written without them for the same reason — the
-    /// WireGuard private key lives sealed in the TPM vault and the
-    /// post-quantum PSKs are renegotiated on each enrollment. Applying either
-    /// as-is would erase both: the gateway would lose the identity it brings
-    /// its interface up with, and every peer would keep a PSK slot filled on
-    /// one side only — which fails every handshake, with no recovery channel.
-    ///
-    /// The anti-downgrade floor is treated the same way, for the same reason:
-    /// it only ever goes up. Reloading a file must not become the way to
-    /// lower it.
-    ///
-    /// [`Self::WAN_IFACE_AUTO`] is a third case, and the same shape: the file
-    /// states an intent, the daemon resolved it against the kernel at startup,
-    /// and the resolved name is not written back. Letting the marker through a
-    /// reload would rebuild the ruleset around an interface literally named
-    /// `auto` — every egress rule and the masquerade bound to a device that
-    /// does not exist, which is a gateway that drops its own traffic. The name
-    /// is also one of the values that cannot change under a running data
-    /// plane, so re-resolving here would be wrong even if it worked.
-    ///
-    /// Everything else — the peer list itself, addresses, flags, ports —
-    /// comes from the incoming configuration. That is the point: this is how
-    /// a peer admitted on the console reaches the running gateway.
     /// Makes a second, independent copy of the whole configuration.
     ///
     /// Replaces the `Clone` derive. The name is the point: this copy carries
@@ -771,6 +743,37 @@ impl NetworkConfig {
         }
     }
 
+    /// Restores what a configuration coming from outside the daemon cannot
+    /// carry.
+    ///
+    /// Two sources feed the running configuration, and **neither** holds the
+    /// runtime secrets: `GET /api/network` redacts them by design, and
+    /// `network.toml` is written without them for the same reason — the
+    /// WireGuard private key lives sealed in the TPM vault and the
+    /// post-quantum PSKs are renegotiated on each enrollment. Applying either
+    /// as-is would erase both: the gateway would lose the identity it brings
+    /// its interface up with, and every peer would keep a PSK slot filled on
+    /// one side only — which fails every handshake, with no recovery channel.
+    ///
+    /// The anti-downgrade floor is treated the same way, for the same reason:
+    /// it only ever goes up. Reloading a file must not become the way to
+    /// lower it.
+    ///
+    /// [`Self::WAN_IFACE_AUTO`] is a third case, and the same shape: the file
+    /// states an intent, the daemon resolved it against the kernel at startup,
+    /// and the resolved name is not written back. Letting the marker through a
+    /// reload would rebuild the ruleset around an interface literally named
+    /// `auto` — every egress rule and the masquerade bound to a device that
+    /// does not exist, which is a gateway that drops its own traffic. The name
+    /// is also one of the values that cannot change under a running data
+    /// plane, so re-resolving here would be wrong even if it worked.
+    ///
+    /// Everything else — the peer list itself, addresses, flags, ports —
+    /// comes from the incoming configuration. That is the point: this is how
+    /// a peer admitted on the console reaches the running gateway. Peers'
+    /// `address_v6` are among them: public, they come from the file, and a
+    /// peer whose line was removed loses its IPv6 VIP. `wg_address_v6` is not
+    /// adopted either; a change of it is refused by [`Self::check_hot_reload`].
     pub fn adopt_runtime_secrets_from(&mut self, current: &Self) {
         if self.wan_iface_is_auto() && !current.wan_iface_is_auto() {
             self.wan_ifaces.clone_from(&current.wan_ifaces);
@@ -928,6 +931,35 @@ impl NetworkConfig {
             }
         }
         Ok(())
+    }
+
+    /// Refuses to apply live what only a restart may change
+    /// (`ADRESSAGE-IPV6.md` §5.4).
+    ///
+    /// `self` is the incoming configuration, `running` the one in force. The
+    /// tunnel prefix is the one value checked: changing it renumbers every
+    /// peer's IPv6 VIP, which the running data plane cannot do under itself.
+    /// A refusal concerns the **whole** incoming configuration — keeping the
+    /// old prefix while taking the new peers would pair peers renumbered into
+    /// the new prefix with a gateway still in the old one, a state
+    /// [`Self::validate`] refuses. A `network.toml` that carries the change
+    /// stays as written and applies at the next start.
+    ///
+    /// Peers' `address_v6` are not concerned: they reload live, like the
+    /// rest of the peer table.
+    pub fn check_hot_reload(&self, running: &Self) -> Result<()> {
+        if self.wg_address_v6 == running.wg_address_v6 {
+            return Ok(());
+        }
+        let describe = |prefix: Option<TunnelPrefixV6>| {
+            prefix.map_or_else(|| "absent".to_string(), |prefix| prefix.to_string())
+        };
+        Err(HeliosError::Config(format!(
+            "wg_address_v6 changes from {} to {}: the tunnel prefix is applied at startup only, \
+             restart heliosd to apply it; the running configuration is kept until then",
+            describe(running.wg_address_v6),
+            describe(self.wg_address_v6)
+        )))
     }
 
     /// Validates relationships that cannot be expressed by serde defaults.
