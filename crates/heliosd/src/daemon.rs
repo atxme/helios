@@ -324,7 +324,7 @@ pub(crate) async fn run(
         // run for good without an API: no provisioning, no telemetry, for a
         // race lost by a few dozen milliseconds.
         for attempt in 1..=API_BIND_ATTEMPTS {
-            match helios_api::serve(api_state.clone(), &api_bind.to_string()).await {
+            match helios_api::serve(api_state.clone(), api_bind).await {
                 Ok(()) => return,
                 Err(e) if attempt < API_BIND_ATTEMPTS => {
                     warn!(
@@ -364,7 +364,7 @@ pub(crate) async fn run(
             attempt = attempt.saturating_add(1);
             match helios_api::speedtest::serve_raw(
                 raw_speedtest_state.clone(),
-                &raw_speedtest_bind.to_string(),
+                raw_speedtest_bind,
                 Arc::clone(&raw_speedtest_task_shutdown),
             )
             .await
