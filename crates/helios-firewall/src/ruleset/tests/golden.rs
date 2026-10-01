@@ -72,8 +72,9 @@ fn assert_golden(name: &str, rs: &Ruleset, expected: &str) {
 /// Everything optional is off, which is what makes this case the reference for
 /// what is emitted *unconditionally*: the head-of-chain openings, the
 /// always-allowed loopback/established pairs, the Astra channel, both public
-/// listeners, the site-to-site transport and the tunnel speedtest. Nothing
-/// gated on the tunnel state appears.
+/// listeners, the site-to-site transport, the IPv6 link control of the WAN
+/// and the LAN, and the tunnel speedtest. Nothing gated on the tunnel state
+/// appears.
 const DOWN_FAIL_CLOSED: &str = "\
 default drop
 mss clamp none
@@ -95,6 +96,32 @@ output oifname \"eth0\" udp sport 51820 accept
 input iifname \"eth0\" udp dport 51821 accept
 output oifname \"eth0\" udp sport 51821 accept
 output oifname \"eth0\" ip daddr 203.0.113.10/32 udp dport 51820 accept
+input iifname \"eth0\" icmpv6 type nd-neighbor-solicit ip6 hoplimit 255 accept
+input iifname \"eth0\" icmpv6 type nd-neighbor-advert ip6 hoplimit 255 accept
+output oifname \"eth0\" icmpv6 type nd-neighbor-solicit ip6 hoplimit 255 accept
+output oifname \"eth0\" icmpv6 type nd-neighbor-advert ip6 hoplimit 255 accept
+output oifname \"eth0\" icmpv6 type nd-router-solicit ip6 hoplimit 255 accept
+input iifname \"eth0\" icmpv6 type nd-router-advert ip6 hoplimit 255 accept
+input iifname \"eth0\" meta nfproto ipv6 icmpv6 type mld-listener-query accept
+input iifname \"eth0\" meta nfproto ipv6 icmpv6 type mld-listener-report accept
+input iifname \"eth0\" meta nfproto ipv6 icmpv6 type mld-listener-done accept
+input iifname \"eth0\" meta nfproto ipv6 icmpv6 type mld2-listener-report accept
+output oifname \"eth0\" meta nfproto ipv6 icmpv6 type mld-listener-query accept
+output oifname \"eth0\" meta nfproto ipv6 icmpv6 type mld-listener-report accept
+output oifname \"eth0\" meta nfproto ipv6 icmpv6 type mld-listener-done accept
+output oifname \"eth0\" meta nfproto ipv6 icmpv6 type mld2-listener-report accept
+input iifname \"eth1\" icmpv6 type nd-neighbor-solicit ip6 hoplimit 255 accept
+input iifname \"eth1\" icmpv6 type nd-neighbor-advert ip6 hoplimit 255 accept
+output oifname \"eth1\" icmpv6 type nd-neighbor-solicit ip6 hoplimit 255 accept
+output oifname \"eth1\" icmpv6 type nd-neighbor-advert ip6 hoplimit 255 accept
+input iifname \"eth1\" meta nfproto ipv6 icmpv6 type mld-listener-query accept
+input iifname \"eth1\" meta nfproto ipv6 icmpv6 type mld-listener-report accept
+input iifname \"eth1\" meta nfproto ipv6 icmpv6 type mld-listener-done accept
+input iifname \"eth1\" meta nfproto ipv6 icmpv6 type mld2-listener-report accept
+output oifname \"eth1\" meta nfproto ipv6 icmpv6 type mld-listener-query accept
+output oifname \"eth1\" meta nfproto ipv6 icmpv6 type mld-listener-report accept
+output oifname \"eth1\" meta nfproto ipv6 icmpv6 type mld-listener-done accept
+output oifname \"eth1\" meta nfproto ipv6 icmpv6 type mld2-listener-report accept
 input iifname \"helios0\" tcp dport 55182 accept
 input iifname \"helios0\" udp dport 55182 accept
 ";
@@ -136,6 +163,32 @@ output oifname \"eth0\" udp sport 51820 accept
 input iifname \"eth0\" udp dport 51821 accept
 output oifname \"eth0\" udp sport 51821 accept
 output oifname \"eth0\" ip daddr 203.0.113.10/32 udp dport 51820 accept
+input iifname \"eth0\" icmpv6 type nd-neighbor-solicit ip6 hoplimit 255 accept
+input iifname \"eth0\" icmpv6 type nd-neighbor-advert ip6 hoplimit 255 accept
+output oifname \"eth0\" icmpv6 type nd-neighbor-solicit ip6 hoplimit 255 accept
+output oifname \"eth0\" icmpv6 type nd-neighbor-advert ip6 hoplimit 255 accept
+output oifname \"eth0\" icmpv6 type nd-router-solicit ip6 hoplimit 255 accept
+input iifname \"eth0\" icmpv6 type nd-router-advert ip6 hoplimit 255 accept
+input iifname \"eth0\" meta nfproto ipv6 icmpv6 type mld-listener-query accept
+input iifname \"eth0\" meta nfproto ipv6 icmpv6 type mld-listener-report accept
+input iifname \"eth0\" meta nfproto ipv6 icmpv6 type mld-listener-done accept
+input iifname \"eth0\" meta nfproto ipv6 icmpv6 type mld2-listener-report accept
+output oifname \"eth0\" meta nfproto ipv6 icmpv6 type mld-listener-query accept
+output oifname \"eth0\" meta nfproto ipv6 icmpv6 type mld-listener-report accept
+output oifname \"eth0\" meta nfproto ipv6 icmpv6 type mld-listener-done accept
+output oifname \"eth0\" meta nfproto ipv6 icmpv6 type mld2-listener-report accept
+input iifname \"eth1\" icmpv6 type nd-neighbor-solicit ip6 hoplimit 255 accept
+input iifname \"eth1\" icmpv6 type nd-neighbor-advert ip6 hoplimit 255 accept
+output oifname \"eth1\" icmpv6 type nd-neighbor-solicit ip6 hoplimit 255 accept
+output oifname \"eth1\" icmpv6 type nd-neighbor-advert ip6 hoplimit 255 accept
+input iifname \"eth1\" meta nfproto ipv6 icmpv6 type mld-listener-query accept
+input iifname \"eth1\" meta nfproto ipv6 icmpv6 type mld-listener-report accept
+input iifname \"eth1\" meta nfproto ipv6 icmpv6 type mld-listener-done accept
+input iifname \"eth1\" meta nfproto ipv6 icmpv6 type mld2-listener-report accept
+output oifname \"eth1\" meta nfproto ipv6 icmpv6 type mld-listener-query accept
+output oifname \"eth1\" meta nfproto ipv6 icmpv6 type mld-listener-report accept
+output oifname \"eth1\" meta nfproto ipv6 icmpv6 type mld-listener-done accept
+output oifname \"eth1\" meta nfproto ipv6 icmpv6 type mld2-listener-report accept
 input iifname \"helios0\" tcp dport 55182 accept
 input iifname \"helios0\" udp dport 55182 accept
 forward iifname \"eth1\" oifname \"eth0\" accept
@@ -155,7 +208,8 @@ fn golden_tunnel_up_without_client_internet() {
 /// This is the case that pins the *interleaving* of the capabilities, which is
 /// where a refactor of `render` can go wrong without changing any single rule:
 /// the administration API before loopback, DHCP before the gateway's own
-/// egress, the tunnel openings before the SSH sources, the out-of-band admin
+/// egress, that egress before the IPv6 link control of every uplink then of
+/// the LAN, the tunnel openings before the SSH sources, the out-of-band admin
 /// interfaces before the state-gated forwarding, and split-tunnel bypasses
 /// before the LAN forward. Two uplinks also pin the per-uplink expansion
 /// order of every WAN rule and of the masquerade.
@@ -215,6 +269,46 @@ output oifname \"enp3s0\" udp dport 123 accept
 output oifname \"wlo1\" udp dport 53 accept
 output oifname \"wlo1\" tcp dport { 53, 80, 443 } accept
 output oifname \"wlo1\" udp dport 123 accept
+input iifname \"enp3s0\" icmpv6 type nd-neighbor-solicit ip6 hoplimit 255 accept
+input iifname \"enp3s0\" icmpv6 type nd-neighbor-advert ip6 hoplimit 255 accept
+output oifname \"enp3s0\" icmpv6 type nd-neighbor-solicit ip6 hoplimit 255 accept
+output oifname \"enp3s0\" icmpv6 type nd-neighbor-advert ip6 hoplimit 255 accept
+output oifname \"enp3s0\" icmpv6 type nd-router-solicit ip6 hoplimit 255 accept
+input iifname \"enp3s0\" icmpv6 type nd-router-advert ip6 hoplimit 255 accept
+input iifname \"enp3s0\" meta nfproto ipv6 icmpv6 type mld-listener-query accept
+input iifname \"enp3s0\" meta nfproto ipv6 icmpv6 type mld-listener-report accept
+input iifname \"enp3s0\" meta nfproto ipv6 icmpv6 type mld-listener-done accept
+input iifname \"enp3s0\" meta nfproto ipv6 icmpv6 type mld2-listener-report accept
+output oifname \"enp3s0\" meta nfproto ipv6 icmpv6 type mld-listener-query accept
+output oifname \"enp3s0\" meta nfproto ipv6 icmpv6 type mld-listener-report accept
+output oifname \"enp3s0\" meta nfproto ipv6 icmpv6 type mld-listener-done accept
+output oifname \"enp3s0\" meta nfproto ipv6 icmpv6 type mld2-listener-report accept
+input iifname \"wlo1\" icmpv6 type nd-neighbor-solicit ip6 hoplimit 255 accept
+input iifname \"wlo1\" icmpv6 type nd-neighbor-advert ip6 hoplimit 255 accept
+output oifname \"wlo1\" icmpv6 type nd-neighbor-solicit ip6 hoplimit 255 accept
+output oifname \"wlo1\" icmpv6 type nd-neighbor-advert ip6 hoplimit 255 accept
+output oifname \"wlo1\" icmpv6 type nd-router-solicit ip6 hoplimit 255 accept
+input iifname \"wlo1\" icmpv6 type nd-router-advert ip6 hoplimit 255 accept
+input iifname \"wlo1\" meta nfproto ipv6 icmpv6 type mld-listener-query accept
+input iifname \"wlo1\" meta nfproto ipv6 icmpv6 type mld-listener-report accept
+input iifname \"wlo1\" meta nfproto ipv6 icmpv6 type mld-listener-done accept
+input iifname \"wlo1\" meta nfproto ipv6 icmpv6 type mld2-listener-report accept
+output oifname \"wlo1\" meta nfproto ipv6 icmpv6 type mld-listener-query accept
+output oifname \"wlo1\" meta nfproto ipv6 icmpv6 type mld-listener-report accept
+output oifname \"wlo1\" meta nfproto ipv6 icmpv6 type mld-listener-done accept
+output oifname \"wlo1\" meta nfproto ipv6 icmpv6 type mld2-listener-report accept
+input iifname \"eth1\" icmpv6 type nd-neighbor-solicit ip6 hoplimit 255 accept
+input iifname \"eth1\" icmpv6 type nd-neighbor-advert ip6 hoplimit 255 accept
+output oifname \"eth1\" icmpv6 type nd-neighbor-solicit ip6 hoplimit 255 accept
+output oifname \"eth1\" icmpv6 type nd-neighbor-advert ip6 hoplimit 255 accept
+input iifname \"eth1\" meta nfproto ipv6 icmpv6 type mld-listener-query accept
+input iifname \"eth1\" meta nfproto ipv6 icmpv6 type mld-listener-report accept
+input iifname \"eth1\" meta nfproto ipv6 icmpv6 type mld-listener-done accept
+input iifname \"eth1\" meta nfproto ipv6 icmpv6 type mld2-listener-report accept
+output oifname \"eth1\" meta nfproto ipv6 icmpv6 type mld-listener-query accept
+output oifname \"eth1\" meta nfproto ipv6 icmpv6 type mld-listener-report accept
+output oifname \"eth1\" meta nfproto ipv6 icmpv6 type mld-listener-done accept
+output oifname \"eth1\" meta nfproto ipv6 icmpv6 type mld2-listener-report accept
 input iifname \"helios0\" meta l4proto icmp accept
 input iifname \"helios0\" meta l4proto ipv6-icmp accept
 input iifname \"helios0\" tcp dport 22 accept
@@ -290,6 +384,32 @@ output ct state established,related accept
 input iifname \"astra0\" ip saddr 10.88.7.2/32 ip daddr 10.88.7.1/32 tcp dport 8444 accept
 output oifname \"astra0\" ip saddr 10.88.7.1/32 ip daddr 10.88.7.2/32 tcp dport 8445 accept
 output oifname \"astra1\" ip saddr 10.88.7.9/32 ip daddr 10.88.7.10/32 tcp dport 8443 accept
+input iifname \"eth0\" icmpv6 type nd-neighbor-solicit ip6 hoplimit 255 accept
+input iifname \"eth0\" icmpv6 type nd-neighbor-advert ip6 hoplimit 255 accept
+output oifname \"eth0\" icmpv6 type nd-neighbor-solicit ip6 hoplimit 255 accept
+output oifname \"eth0\" icmpv6 type nd-neighbor-advert ip6 hoplimit 255 accept
+output oifname \"eth0\" icmpv6 type nd-router-solicit ip6 hoplimit 255 accept
+input iifname \"eth0\" icmpv6 type nd-router-advert ip6 hoplimit 255 accept
+input iifname \"eth0\" meta nfproto ipv6 icmpv6 type mld-listener-query accept
+input iifname \"eth0\" meta nfproto ipv6 icmpv6 type mld-listener-report accept
+input iifname \"eth0\" meta nfproto ipv6 icmpv6 type mld-listener-done accept
+input iifname \"eth0\" meta nfproto ipv6 icmpv6 type mld2-listener-report accept
+output oifname \"eth0\" meta nfproto ipv6 icmpv6 type mld-listener-query accept
+output oifname \"eth0\" meta nfproto ipv6 icmpv6 type mld-listener-report accept
+output oifname \"eth0\" meta nfproto ipv6 icmpv6 type mld-listener-done accept
+output oifname \"eth0\" meta nfproto ipv6 icmpv6 type mld2-listener-report accept
+input iifname \"eth1\" icmpv6 type nd-neighbor-solicit ip6 hoplimit 255 accept
+input iifname \"eth1\" icmpv6 type nd-neighbor-advert ip6 hoplimit 255 accept
+output oifname \"eth1\" icmpv6 type nd-neighbor-solicit ip6 hoplimit 255 accept
+output oifname \"eth1\" icmpv6 type nd-neighbor-advert ip6 hoplimit 255 accept
+input iifname \"eth1\" meta nfproto ipv6 icmpv6 type mld-listener-query accept
+input iifname \"eth1\" meta nfproto ipv6 icmpv6 type mld-listener-report accept
+input iifname \"eth1\" meta nfproto ipv6 icmpv6 type mld-listener-done accept
+input iifname \"eth1\" meta nfproto ipv6 icmpv6 type mld2-listener-report accept
+output oifname \"eth1\" meta nfproto ipv6 icmpv6 type mld-listener-query accept
+output oifname \"eth1\" meta nfproto ipv6 icmpv6 type mld-listener-report accept
+output oifname \"eth1\" meta nfproto ipv6 icmpv6 type mld-listener-done accept
+output oifname \"eth1\" meta nfproto ipv6 icmpv6 type mld2-listener-report accept
 output oifname \"eth0\" meta mark 0xe1f1 accept
 output oifname \"nordlynx\" ip daddr 100.72.0.5/32 accept
 input iifname \"nordlynx\" ip saddr 100.72.0.5/32 meta l4proto icmp accept
@@ -339,6 +459,32 @@ output oifname \"eth0\" udp sport 51820 accept
 input iifname \"eth0\" udp dport 51821 accept
 output oifname \"eth0\" udp sport 51821 accept
 output oifname \"eth0\" ip daddr 203.0.113.10/32 udp dport 51820 accept
+input iifname \"eth0\" icmpv6 type nd-neighbor-solicit ip6 hoplimit 255 accept
+input iifname \"eth0\" icmpv6 type nd-neighbor-advert ip6 hoplimit 255 accept
+output oifname \"eth0\" icmpv6 type nd-neighbor-solicit ip6 hoplimit 255 accept
+output oifname \"eth0\" icmpv6 type nd-neighbor-advert ip6 hoplimit 255 accept
+output oifname \"eth0\" icmpv6 type nd-router-solicit ip6 hoplimit 255 accept
+input iifname \"eth0\" icmpv6 type nd-router-advert ip6 hoplimit 255 accept
+input iifname \"eth0\" meta nfproto ipv6 icmpv6 type mld-listener-query accept
+input iifname \"eth0\" meta nfproto ipv6 icmpv6 type mld-listener-report accept
+input iifname \"eth0\" meta nfproto ipv6 icmpv6 type mld-listener-done accept
+input iifname \"eth0\" meta nfproto ipv6 icmpv6 type mld2-listener-report accept
+output oifname \"eth0\" meta nfproto ipv6 icmpv6 type mld-listener-query accept
+output oifname \"eth0\" meta nfproto ipv6 icmpv6 type mld-listener-report accept
+output oifname \"eth0\" meta nfproto ipv6 icmpv6 type mld-listener-done accept
+output oifname \"eth0\" meta nfproto ipv6 icmpv6 type mld2-listener-report accept
+input iifname \"eth1\" icmpv6 type nd-neighbor-solicit ip6 hoplimit 255 accept
+input iifname \"eth1\" icmpv6 type nd-neighbor-advert ip6 hoplimit 255 accept
+output oifname \"eth1\" icmpv6 type nd-neighbor-solicit ip6 hoplimit 255 accept
+output oifname \"eth1\" icmpv6 type nd-neighbor-advert ip6 hoplimit 255 accept
+input iifname \"eth1\" meta nfproto ipv6 icmpv6 type mld-listener-query accept
+input iifname \"eth1\" meta nfproto ipv6 icmpv6 type mld-listener-report accept
+input iifname \"eth1\" meta nfproto ipv6 icmpv6 type mld-listener-done accept
+input iifname \"eth1\" meta nfproto ipv6 icmpv6 type mld2-listener-report accept
+output oifname \"eth1\" meta nfproto ipv6 icmpv6 type mld-listener-query accept
+output oifname \"eth1\" meta nfproto ipv6 icmpv6 type mld-listener-report accept
+output oifname \"eth1\" meta nfproto ipv6 icmpv6 type mld-listener-done accept
+output oifname \"eth1\" meta nfproto ipv6 icmpv6 type mld2-listener-report accept
 input iifname \"helios0\" tcp dport 55182 accept
 input iifname \"helios0\" udp dport 55182 accept
 output oifname \"eth0\" ip daddr 192.0.2.1/32 tcp dport { 80, 443 } accept
@@ -384,6 +530,32 @@ output oifname \"eth0\" udp sport 51820 accept
 input iifname \"eth0\" udp dport 51821 accept
 output oifname \"eth0\" udp sport 51821 accept
 output oifname \"eth0\" ip daddr 203.0.113.10/32 udp dport 51820 accept
+input iifname \"eth0\" icmpv6 type nd-neighbor-solicit ip6 hoplimit 255 accept
+input iifname \"eth0\" icmpv6 type nd-neighbor-advert ip6 hoplimit 255 accept
+output oifname \"eth0\" icmpv6 type nd-neighbor-solicit ip6 hoplimit 255 accept
+output oifname \"eth0\" icmpv6 type nd-neighbor-advert ip6 hoplimit 255 accept
+output oifname \"eth0\" icmpv6 type nd-router-solicit ip6 hoplimit 255 accept
+input iifname \"eth0\" icmpv6 type nd-router-advert ip6 hoplimit 255 accept
+input iifname \"eth0\" meta nfproto ipv6 icmpv6 type mld-listener-query accept
+input iifname \"eth0\" meta nfproto ipv6 icmpv6 type mld-listener-report accept
+input iifname \"eth0\" meta nfproto ipv6 icmpv6 type mld-listener-done accept
+input iifname \"eth0\" meta nfproto ipv6 icmpv6 type mld2-listener-report accept
+output oifname \"eth0\" meta nfproto ipv6 icmpv6 type mld-listener-query accept
+output oifname \"eth0\" meta nfproto ipv6 icmpv6 type mld-listener-report accept
+output oifname \"eth0\" meta nfproto ipv6 icmpv6 type mld-listener-done accept
+output oifname \"eth0\" meta nfproto ipv6 icmpv6 type mld2-listener-report accept
+input iifname \"eth1\" icmpv6 type nd-neighbor-solicit ip6 hoplimit 255 accept
+input iifname \"eth1\" icmpv6 type nd-neighbor-advert ip6 hoplimit 255 accept
+output oifname \"eth1\" icmpv6 type nd-neighbor-solicit ip6 hoplimit 255 accept
+output oifname \"eth1\" icmpv6 type nd-neighbor-advert ip6 hoplimit 255 accept
+input iifname \"eth1\" meta nfproto ipv6 icmpv6 type mld-listener-query accept
+input iifname \"eth1\" meta nfproto ipv6 icmpv6 type mld-listener-report accept
+input iifname \"eth1\" meta nfproto ipv6 icmpv6 type mld-listener-done accept
+input iifname \"eth1\" meta nfproto ipv6 icmpv6 type mld2-listener-report accept
+output oifname \"eth1\" meta nfproto ipv6 icmpv6 type mld-listener-query accept
+output oifname \"eth1\" meta nfproto ipv6 icmpv6 type mld-listener-report accept
+output oifname \"eth1\" meta nfproto ipv6 icmpv6 type mld-listener-done accept
+output oifname \"eth1\" meta nfproto ipv6 icmpv6 type mld2-listener-report accept
 input iifname \"helios0\" tcp dport 55182 accept
 input iifname \"helios0\" udp dport 55182 accept
 output oifname \"eth0\" tcp dport { 80, 443 } accept
