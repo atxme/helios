@@ -479,12 +479,15 @@ périmètre.
 
 Points `defguard` à connaître (`defguard_wireguard_rs-0.11.0`) :
 
-- Windows `configure_interface` **retire silencieusement** les `AllowedIPs` et
-  adresses d'une famille indisponible sur l'adaptateur
-  (`wgapi_windows.rs:356-397`). Si IPv6 est indisponible sur l'adaptateur mais
-  présent sur l'interface physique, `::/0` disparaît sans erreur : fuite. À
-  vérifier sur cible ; Orion devrait relire la configuration appliquée et
-  signaler l'écart.
+- Windows `configure_interface` transmet au pilote la liste **complète** des
+  `AllowedIPs` (`set_config`, `wgapi_windows.rs:316`), puis retire en silence,
+  sur sa copie locale, les préfixes et adresses d'une famille indisponible sur
+  l'adaptateur, avant de créer les **routes** du système
+  (`wgapi_windows.rs:356-401`). Le pilote annonce donc toujours `::/0`, mais
+  aucune route `::/0` ne passe par le tunnel : l'IPv6 sort en clair, sans
+  erreur. Relire la configuration du pilote ne suffit pas à le voir ; il faut
+  aussi lire la table de routage de l'adaptateur. C'est ce que fait T02
+  (fusionné), à valider sur VM Windows.
 - `set_endpoint` résout de façon synchrone et garde le **premier** résultat
   (`utils.rs:603-612`).
 
@@ -523,9 +526,10 @@ DHCP v4 actuelle.
 | 1, 3, 4 | Destination Unreachable, Time Exceeded, Parameter Problem | idem | `related` suffit dans la plupart des cas |
 | 128 / 129 | Echo Request / Reply | `input` sur `helios0` (existant) ; WAN : décision (RFC 4890 recommande de ne pas bloquer echo en transit) | — |
 
-Filtrage par hop-limit 255 : `rustables` expose `IPv6HeaderField`, mais le
-champ hop-limit n'a pas été vérifié ; à confirmer avant d'en faire un
-invariant.
+Filtrage par hop-limit 255 : `rustables` expose
+`IPv6HeaderField::HopLimit` (offset 7, longueur 1). T05 (fusionné) l'encode
+derrière la garde `meta nfproto ipv6` et le vérifie par un test d'octets ;
+l'application par le noyau reste à vérifier sur cible.
 
 ### 9.2 Hypothèses ARP / L2
 
@@ -736,6 +740,19 @@ Chaque ticket est autonome, respecte `AGENTS.md` (pas de `TODO`, tests au bon
 niveau, docs françaises mises à jour) et indique ce qui reste à vérifier sur
 cible.
 
+Avancement sur `feature/support-ipv6` (1er octobre 2026) :
+
+| Ticket | État | Reste à faire |
+| --- | --- | --- |
+| T00 | spécification rédigée, statut « proposée » | validation opérateur |
+| T01 | fusionné | VM Windows : `::/0` posé, `curl -6` bloqué ; texte ADR-001 §3 bis en attente de décision |
+| T02 | fusionné | VM Windows : absence de faux positif, détection, fuite réelle |
+| T03 + T04 | fusionnés | cible : batch accepté, NAT44 inchangé |
+| T05 | fusionné | cible : ND `untracked`, voisins et route par défaut IPv6 stables, renouvellement DHCPv6 |
+| T08 | fusionné | cible avec T17 : sources `::ffff:` sur socket `[::]` |
+| T06, T09 | à faire | — |
+| T07, T10–T23 | à faire | T07 et T10–T14 attendent la validation de T00 |
+
 **T00 — Spécification A : modèle d'adressage IPv6**
 - Fichiers : [`docs/specification/ADRESSAGE-IPV6.md`](../specification/ADRESSAGE-IPV6.md), index `docs/README.md`.
 - Dépend : aucune ; bloque T07, T10–T14, T16.
@@ -751,7 +768,7 @@ cible.
 
 **T01 — Orion : capturer `::/0` par défaut**
 - Fichiers : `crates/orion-core/src/config.rs` (`DEFAULT_ALLOWED_IPS`), `apps/orion/src/splitTunnel.ts` (`EVERYTHING`), `tools/helios-ctl/src/profile.rs`, `docs/adr/ADR-001-WIREGUARD.md` §3 bis.
-- Changement : `"0.0.0.0/0, ::/0"`. `matchPreset` doit reconnaître l'ancien `0.0.0.0/0` comme « full (IPv4 seulement) » et le signaler, sans réécrire le profil.
+- Changement : `"0.0.0.0/0, ::/0"`. Un profil enregistré avec `0.0.0.0/0` seul n'est jamais réécrit : `matchPreset` le lit comme `custom`, et Orion comme `helios-ctl` le signalent « tunnel complet IPv4 seulement » (décision opérateur : avertir sans réécrire).
 - Tests : unitaires Rust et Vitest ; VM Windows dual-stack : `curl -6` échoue tunnel monté.
 - Risque : moyen (apps v6-first ralenties jusqu'au repli v4).
 - Acceptation : aucun paquet v6 sur l'interface physique tunnel monté (capture sur VM).
@@ -759,7 +776,7 @@ cible.
 **T02 — Orion : vérifier les `AllowedIPs` réellement posés**
 - Fichiers : `crates/orion-core/src/backend/wireguard.rs`.
 - Dépend : T01.
-- Changement : relire la configuration après `configure_interface` ; si `::/0` demandé et absent, état explicite et événement visible.
+- Changement : relire la configuration du pilote **et** les routes portées par l'adaptateur après `configure_interface` (voir §8.2 : le pilote garde `::/0` même quand la route n'est pas créée) ; si un préfixe demandé manque, état explicite et événement visible, sans démonter l'adaptateur.
 - Tests : unitaire sur la comparaison ; VM avec IPv6 désactivé sur l'adaptateur.
 - Risque : faible. Acceptation : écart signalé à l'UI.
 
