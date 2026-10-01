@@ -27,6 +27,7 @@ pub mod key_negotiation;
 pub mod locked;
 pub(crate) mod ml_dsa;
 pub mod mtu;
+pub mod net;
 pub mod policy;
 pub mod pq;
 pub mod private_file;
