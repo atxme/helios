@@ -71,6 +71,8 @@ foi en cas de doute (voir [AGENTS.md](../AGENTS.md)).
 - [POST-QUANTUM.md](security/POST-QUANTUM.md) — mécanismes post-quantiques.
 - [PUBLISHER-SIGNING.md](security/PUBLISHER-SIGNING.md) — signature éditeur.
 - [OPERATOR-TOOLING.md](security/OPERATOR-TOOLING.md) — outillage opérateur.
+- [GATEWAY-HARDENING.md](security/GATEWAY-HARDENING.md) — authentification,
+  chiffrement Linux hors ligne et préparation du démarrage protégé.
 
 ## Tests et validation
 
