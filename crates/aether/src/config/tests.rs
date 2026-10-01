@@ -437,6 +437,33 @@ fn meshnet_rejects_ambiguous_or_unbounded_configuration() {
     );
 }
 
+/// IPv6 Meshnet peers stay refused: NordVPN hands out IPv4 Meshnet
+/// addresses, and the firewall's IPv6 Meshnet rules are only reachable from a
+/// policy built in code until accepting them is decided.
+#[test]
+fn meshnet_refuses_ipv6_peer_cidrs() {
+    let mut cfg = NetworkConfig {
+        wan_ifaces: vec!["eth0".into()],
+        allow_gateway_egress: true,
+        nordvpn_meshnet: Some(NordvpnMeshnetConfig {
+            peer_cidrs: vec!["100.70.36.212/32".into()],
+            ..NordvpnMeshnetConfig::default()
+        }),
+        ..NetworkConfig::default()
+    };
+    assert!(cfg.validate().is_ok());
+
+    let meshnet = cfg.nordvpn_meshnet.as_mut().unwrap();
+    meshnet.peer_cidrs = vec!["100.70.36.212/32".into(), "2001:db8::5/128".into()];
+    meshnet.traffic_routing_peer_cidrs = vec!["2001:db8::5/128".into()];
+    assert!(cfg.validate().is_err(), "an IPv6 peer CIDR is refused");
+
+    let meshnet = cfg.nordvpn_meshnet.as_mut().unwrap();
+    meshnet.peer_cidrs = vec!["2001:db8::/64".into()];
+    meshnet.traffic_routing_peer_cidrs.clear();
+    assert!(cfg.validate().is_err(), "an IPv6 peer network is refused");
+}
+
 #[test]
 fn repository_network_example_is_valid() {
     let cfg: NetworkConfig = toml::from_str(include_str!("../../../../config/network.toml"))

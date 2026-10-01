@@ -48,6 +48,17 @@ where
     })
 }
 
+/// Validates a NordVPN Meshnet peer CIDR, which must be IPv4.
+///
+/// # Known limitation: IPv6 Meshnet peers are refused
+///
+/// NordVPN hands out IPv4 Meshnet addresses (`100.64.0.0/10`), so an IPv6
+/// peer CIDR is refused here. The firewall side is already family-correct
+/// (`helios-firewall`, `ruleset/meshnet.rs`): an IPv6 peer gets ICMPv6 and
+/// drops toward the local IPv6 networks, `fc00::/7` and `fe80::/10`.
+/// Accepting IPv6 peers still requires an explicit decision on what counts as
+/// local for them — a global unicast prefix on the WAN's link is not covered —
+/// and a target test of an IPv6 routing peer.
 fn valid_ipv4_cidr(value: &str) -> bool {
     let Some((address, prefix)) = value.split_once('/') else {
         return false;

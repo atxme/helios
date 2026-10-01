@@ -304,6 +304,61 @@ mod tests {
         }
     }
 
+    /// An IPv6 Meshnet routing peer's local-network drops go through the
+    /// IPv6 path of `match_net` for both addresses, each behind the
+    /// `meta nfproto ipv6` guard, with no IPv4 guard. The policy is built in
+    /// code: the configuration refuses IPv6 Meshnet peers.
+    #[test]
+    fn an_ipv6_meshnet_local_network_drop_translates_behind_ipv6_guards() {
+        let mut policy = client_internet_policy();
+        policy.allow_client_internet = false;
+        policy.nordvpn_meshnet = Some(aether::NordvpnMeshnetPolicy {
+            iface: "nordlynx".into(),
+            fwmark: 0xe1f1,
+            peer_cidrs: vec!["2001:db8::5/128".into()],
+            traffic_routing_peer_cidrs: vec!["2001:db8::5/128".into()],
+            local_network_peer_cidrs: Vec::new(),
+            inbound_tcp_ports: Vec::new(),
+            inbound_udp_ports: Vec::new(),
+            allow_icmp: false,
+        });
+        let rs = render(&policy, TunnelState::Up).expect("valid test policy");
+        assert!(NetlinkBackend::new().build_batch(&rs).is_ok());
+
+        let forward = chain(ChainKind::Forward.as_str());
+        let drops: Vec<&Rule> = rs
+            .chain(ChainKind::Forward)
+            .filter(|rule| {
+                rule.verdict == Verdict::Drop
+                    && rule.matches.contains(&Match::InIface("nordlynx".into()))
+            })
+            .collect();
+        assert_eq!(drops.len(), 2, "one drop per local IPv6 network");
+        let ipv6_guard = [
+            RawExpression::from(Meta::new(MetaType::NfProto)),
+            RawExpression::from(Cmp::new(CmpOp::Eq, [10u8])),
+        ];
+        for (rule, local) in drops.into_iter().zip(["fc00::/7", "fe80::/10"]) {
+            let nf = NetlinkBackend::filter_rule(&forward, &rule.matches, rule)
+                .expect("the drop rule translates");
+            let expected = NfRule::default()
+                .iiface("nordlynx")
+                .expect("valid interface name")
+                .saddr(network("2001:db8::5/128").ip())
+                .dnetwork(network(local))
+                .expect("valid IPv6 network")
+                .drop();
+            let translated = expressions(&nf);
+            assert_eq!(translated, expressions(&expected), "{rule}");
+
+            let guards = |guard: &[RawExpression]| {
+                translated.windows(2).filter(|pair| *pair == guard).count()
+            };
+            assert_eq!(guards(&ipv6_guard), 2, "source and destination: {rule}");
+            assert_eq!(guards(&ipv4_guard()), 0, "{rule}");
+        }
+    }
+
     #[test]
     fn table_is_created_before_being_deleted() {
         // Regression test: `Del` first used to fail with `ENOENT` on a
