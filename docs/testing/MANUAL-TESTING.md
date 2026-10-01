@@ -468,6 +468,51 @@ npm run tauri build
 Le binaire est produit dans `target/release/orion` et les installateurs dans
 `target/release/bundle/` à la racine du workspace.
 
+### Capture réellement appliquée (VM Windows)
+
+Ce contrôle exige une VM Windows dual-stack et un Orion compilé avec
+`--features wireguard` : ni WSL ni le backend simulé ne l'exercent. Il vérifie
+que `::/0`, retiré silencieusement par `defguard_wireguard_rs` quand
+l'adaptateur ne porte pas l'IPv6, est signalé au lieu d'être tu.
+
+1. **Cas nominal.** Connecter un profil `0.0.0.0/0, ::/0`. Le journal doit
+   afficher « AllowedIPs appliqués vérifiés sur l'adaptateur », aucune erreur
+   ne doit apparaître et la ligne « trafic via le tunnel » du panneau de
+   posture doit rester neutre. `Get-NetRoute -InterfaceAlias orion0` doit
+   lister `0.0.0.0/0` et `::/0`. Une alerte ici serait un faux positif à
+   corriger avant tout le reste.
+2. **IPv6 indisponible sur l'adaptateur.** Déconnecter, poser
+   `DisabledComponents = 0xFF` (DWORD) sous
+   `HKLM\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters`, redémarrer,
+   puis connecter le même profil. Attendu : le tunnel monte en IPv4, l'erreur
+   « AllowedIPs non appliqués par le pilote : ::/0 — ce trafic n'est pas capté
+   par le tunnel et peut sortir en clair par l'interface physique » s'affiche
+   dans le bandeau et le journal, et la ligne « trafic via le tunnel » passe
+   en ambre : « ::/0 non appliqué par le pilote — hors tunnel ».
+   `Get-NetRoute -InterfaceAlias orion0 -AddressFamily IPv6` ne liste rien.
+   Ce réglage retire l'IPv6 de toutes les interfaces : il éprouve la
+   détection, pas la fuite. Remettre la valeur d'origine et redémarrer.
+3. **La fuite elle-même** — IPv6 présent sur l'interface physique, absent de
+   l'adaptateur. Il faut que l'adaptateur soit **reconfiguré** après
+   `Disable-NetAdapterBinding -Name orion0 -ComponentID ms_tcpip6` : le
+   backend relit à chaque configuration, mais ne recrée l'adaptateur qu'au
+   premier montage. C'est le cas du remontage post-quantique d'un profil
+   portant `heliosd_url` sans bloc de négociation : désactiver la liaison
+   entre le montage et le premier handshake (UDP 51820 bloqué le temps de la
+   commande), puis débloquer. Attendu : l'alerte de l'étape 2 après le
+   remontage, et `curl.exe -6 https://ifconfig.co` qui répond depuis
+   l'adresse IPv6 de l'interface physique — la fuite que l'alerte nomme.
+4. **Persistance.** Faire tomber le tunnel en échec, adaptateur monté : la
+   ligne ambre doit rester, les routes n'ayant pas changé. **Déconnecter**
+   doit la faire disparaître.
+
+Rien de ceci n'a encore été observé sur cible : ni l'effet de
+`DisabledComponents` ou de `Disable-NetAdapterBinding` sur un adaptateur
+WireGuard-NT, ni la présence des routes juste après la remise en service de
+l'adaptateur (`defguard` le désactive puis le réactive pour appliquer la MTU).
+L'étape 1 est celle qui écarte un faux positif, l'étape 2 celle qui prouve la
+détection.
+
 ## Test réel WireGuard sur Linux
 
 Effectuer ce scénario uniquement sur une gateway de laboratoire :
