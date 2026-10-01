@@ -90,6 +90,12 @@ pub trait VpnBackend: Send + Sync {
     /// packets is better than giving back the physical route to clear traffic.
     /// Must be idempotent: calling `up` again on an already-mounted adapter
     /// reconfigures the peer without recreating it.
+    ///
+    /// A backend able to read back what the driver applied reports it as
+    /// [`ClientEvent::Capture`] on every call. A capture narrower than the
+    /// profile is reported, not returned as an error: the adapter stays
+    /// mounted either way, so failing would not stop the leak, only drop
+    /// what *is* captured (see `wireguard`'s module documentation).
     async fn up(&self, profile: &ClientProfile, sink: &EventSink) -> anyhow::Result<()>;
 
     /// Unmounts the adapter. **Called only on explicit disconnection.**

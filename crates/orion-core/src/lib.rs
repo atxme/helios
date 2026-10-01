@@ -51,7 +51,7 @@ pub use config::{
     verify_pinned_gateway_certificate, ClientConfig, ClientProfile, KeyNegotiationSettings,
     ProfileKind, TrustMaterial, DEFAULT_ALLOWED_IPS, DEFAULT_KEEPALIVE_SECS,
 };
-pub use events::{ClientEvent, PskKind};
+pub use events::{CaptureCheck, ClientEvent, PskKind};
 pub use identity_store::{
     ClientIdentityBundle, IdentityStoreError, PreviousIdentityPhase, PreviousIdentityStatus,
     ProtectedIdentityStore,
