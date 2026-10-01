@@ -961,3 +961,27 @@ async fn a_psk_installation_keeps_the_installed_families() {
         );
     }
 }
+
+/// `heliosd status` names the prefix and, when it cannot be installed here,
+/// the degraded start and its reason.
+#[test]
+fn the_status_command_describes_the_ipv6_outcome() {
+    assert_eq!(
+        describe_ipv6(&configured_network(), Ipv6TunnelStatus::NotConfigured),
+        "not configured"
+    );
+    assert_eq!(
+        describe_ipv6(&dual_stack_network(), Ipv6TunnelStatus::Installed),
+        format!("{PREFIX} (installable on this host)")
+    );
+    let degraded = describe_ipv6(
+        &dual_stack_network(),
+        Ipv6TunnelStatus::Unavailable(Ipv6Unavailable::TunnelMtuTooSmall {
+            tunnel_mtu: 1200,
+            minimum: 1280,
+        }),
+    );
+    assert!(degraded.starts_with(PREFIX), "{degraded}");
+    assert!(degraded.contains("IPv4-only"), "{degraded}");
+    assert!(degraded.contains("1200"), "{degraded}");
+}

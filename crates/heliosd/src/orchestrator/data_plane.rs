@@ -99,7 +99,7 @@ fn peer_allowed_ips(peer: &aether::WgPeer, ipv6_installed: bool) -> Vec<String> 
 }
 
 /// MTU of the tunnel interface, derived from the primary WAN's.
-fn tunnel_mtu(network: &NetworkConfig) -> u32 {
+pub(super) fn tunnel_mtu(network: &NetworkConfig) -> u32 {
     aether::mtu::tunnel_mtu(mtu_transport(
         network.primary_wan_iface().unwrap_or_default(),
     ))
@@ -109,7 +109,7 @@ fn tunnel_mtu(network: &NetworkConfig) -> u32 {
 /// [`IP_FORWARD_PATH`]: an ordinary user cannot write the system files.
 const IPV6_CONF_PATH: &str = "/proc/sys/net/ipv6/conf";
 
-fn ipv6_conf_dir() -> std::path::PathBuf {
+pub(super) fn ipv6_conf_dir() -> std::path::PathBuf {
     std::env::var_os("HELIOS_IPV6_CONF_PATH")
         .map_or_else(|| IPV6_CONF_PATH.into(), std::path::PathBuf::from)
 }

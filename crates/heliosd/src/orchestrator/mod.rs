@@ -134,6 +134,11 @@ pub async fn run(
     // WireGuard backend and must not, so the runtime reaches it the same way
     // the tunnel state does.
     shared_peers: Arc<RwLock<Vec<PeerStatus>>>,
+    // What the last bring-up did with IPv6, published for the API like the
+    // snapshot above. Every later projection of the peers also reads it, so a
+    // PSK installation or a reload never puts back an IPv6 `/128` the
+    // interface does not carry.
+    shared_ipv6: Arc<RwLock<Ipv6TunnelStatus>>,
     // Held here and nowhere else: the TPM sealing secret must not transit
     // through the API crate. Only the orchestrator can seal.
     boot: helios_tpm::BootDecision,
@@ -148,10 +153,6 @@ pub async fn run(
         Arc::from(wireguard_backend(dry_run, &ifname)?)
     };
     let (internal_tx, mut internal_rx) = mpsc::channel::<OrchestratorCmd>(8);
-    // What the last bring-up did with IPv6. Every later projection of the
-    // peers reads it, so a PSK installation or a reload never puts back an
-    // IPv6 `/128` the interface does not carry.
-    let shared_ipv6 = Arc::new(RwLock::new(Ipv6TunnelStatus::default()));
 
     // 1. Establish the explicitly selected firewall posture before bringing
     // up WireGuard. Maintenance removes an old table; normal mode engages the
@@ -450,6 +451,13 @@ pub fn status(network: &NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
     );
     println!("  WG address   : {}", network.wg_address);
     println!(
+        "  IPv6 tunnel  : {}",
+        describe_ipv6(
+            network,
+            ipv6_installability(network, tunnel_mtu(network), &ipv6_conf_dir())
+        )
+    );
+    println!(
         "  ready        : {}",
         if network.wireguard_ready() {
             "yes"
@@ -467,6 +475,26 @@ pub fn status(network: &NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
         println!("    - {} -> {}{}", p.name, p.address, pq);
     }
     Ok(())
+}
+
+/// The IPv6 line of `heliosd status`.
+///
+/// This command runs beside the daemon, not in it: it applies the same
+/// pre-checks the bring-up applies (`ipv6_installability`), on this host, now.
+/// A refusal only the kernel could voice at bring-up is the running daemon's
+/// to report — `GET /api/status` and `helios-ctl status` carry it.
+fn describe_ipv6(network: &NetworkConfig, decided: Ipv6TunnelStatus) -> String {
+    let Some(prefix) = network.wg_address_v6 else {
+        return "not configured".into();
+    };
+    match decided {
+        Ipv6TunnelStatus::Unavailable(reason) => {
+            format!("{prefix} — unavailable, the gateway starts IPv4-only (degraded): {reason}")
+        }
+        Ipv6TunnelStatus::Installed | Ipv6TunnelStatus::NotConfigured => {
+            format!("{prefix} (installable on this host)")
+        }
+    }
 }
 
 pub async fn check_update(dry_run: bool) -> anyhow::Result<()> {

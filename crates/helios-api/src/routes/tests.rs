@@ -143,6 +143,39 @@ async fn status_publishes_the_freshness_threshold_it_is_judged_by() {
 }
 
 #[tokio::test]
+async fn a_gateway_without_ipv6_reports_it_as_not_configured() {
+    let (app, _cmd_rx) = app_state(TunnelState::Up);
+
+    let response = serde_json::to_value(status(State(app)).await.0).unwrap();
+
+    assert_eq!(response["ipv6"], serde_json::json!("not_configured"));
+}
+
+/// The degraded IPv4-only start of `ADRESSAGE-IPV6.md` §6.2 must be visible
+/// from the API, with the reason the orchestrator published.
+#[tokio::test]
+async fn status_exposes_an_unavailable_ipv6_with_its_reason() {
+    let (app, _cmd_rx) = app_state(TunnelState::Up);
+    *app.ipv6.write().await = aether::net::Ipv6TunnelStatus::Unavailable(
+        aether::net::Ipv6Unavailable::DisabledByKernel {
+            setting: "net.ipv6.conf.all.disable_ipv6".into(),
+        },
+    );
+
+    let response = serde_json::to_value(status(State(app)).await.0).unwrap();
+
+    assert_eq!(
+        response["ipv6"],
+        serde_json::json!({
+            "unavailable": {
+                "reason": "disabled_by_kernel",
+                "setting": "net.ipv6.conf.all.disable_ipv6"
+            }
+        })
+    );
+}
+
+#[tokio::test]
 async fn status_exposes_useful_data_without_the_psk() {
     let (app, _cmd_rx) = app_state(TunnelState::Up);
 

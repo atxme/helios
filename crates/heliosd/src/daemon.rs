@@ -315,6 +315,9 @@ pub(crate) async fn run(
     // The console reads the data plane through this snapshot; only the
     // orchestrator's poller writes it.
     let peer_runtime = Arc::clone(&state.peer_runtime);
+    // Same arrangement for the IPv6 outcome of the bring-up: the orchestrator
+    // writes it, the status route reads it.
+    let ipv6 = Arc::clone(&state.ipv6);
     let api_state = state.clone();
     tokio::spawn(async move {
         // Outside simulation, the API listens on the WireGuard address —
@@ -410,6 +413,7 @@ pub(crate) async fn run(
         handshake_rx,
         shared_policy,
         peer_runtime,
+        ipv6,
         boot,
         api_ready,
     )
