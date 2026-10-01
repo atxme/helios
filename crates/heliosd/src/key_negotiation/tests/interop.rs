@@ -148,6 +148,7 @@ async fn end_to_end_negotiation(leaf: GatewayLeaf) {
         name: "orion".into(),
         public_key: client_wg.public_key.clone(),
         address: "100.64.1.2/32".into(),
+        address_v6: None,
         admin: false,
         preshared_key: None,
         key_negotiation_certificate_sha256: Some(

@@ -126,6 +126,11 @@ pub fn admit_with_key_negotiation(
         name: name.to_string(),
         public_key: public_key.to_string(),
         address: format!("{vip}/32"),
+        // Known limitation: admission does not attribute an IPv6 VIP yet,
+        // even on a gateway with `wg_address_v6`. That belongs to the single
+        // attribution point of the unified IPAM (`ADRESSAGE-IPV6.md` §3 bis,
+        // ticket T11), not to a second derivation here.
+        address_v6: None,
         admin,
         // The PSK is born from the ML-KEM exchange, not from admission.
         // Setting it here would amount to inventing a secret no client

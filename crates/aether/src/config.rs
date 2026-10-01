@@ -1,6 +1,6 @@
 use std::{
-    collections::HashSet,
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    collections::{HashMap, HashSet},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4},
     path::PathBuf,
 };
 
@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::secret::SecretString;
 
 use crate::error::{HeliosError, Result};
+use crate::net::{format_vip_v6, parse_vip_v6, AddressError, TunnelPrefixV6};
 use crate::policy::{FirewallPolicy, NordvpnMeshnetPolicy, PolicyMode};
 use crate::speedtest::SPEEDTEST_PORT;
 
@@ -55,6 +56,43 @@ where
         OneOrMany::One(name) => vec![name],
         OneOrMany::Many(names) => names,
     })
+}
+
+/// Reads the optional `wg_address_v6` through [`TunnelPrefixV6`].
+///
+/// A refused prefix fails the whole read, like any malformed key, and the
+/// message names the key: TOML shows the offending line, but a JSON body
+/// (`POST /api/network`) reports only a position.
+fn de_wg_address_v6<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<TunnelPrefixV6>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let Some(text) = Option::<String>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    text.parse().map(Some).map_err(|error: AddressError| {
+        serde::de::Error::custom(format!("wg_address_v6 `{text}`: {error}"))
+    })
+}
+
+/// Reads a peer's optional `address_v6`: one host, written `…/128` (§2.3 of
+/// `ADRESSAGE-IPV6.md`), through [`parse_vip_v6`].
+///
+/// The shape is the only thing a single peer's record can be checked for.
+/// Whether the address fits the gateway's prefix, and whether another peer
+/// already holds it, is [`NetworkConfig::validate`]'s business.
+fn de_address_v6<'de, D>(deserializer: D) -> std::result::Result<Option<Ipv6Addr>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let Some(text) = Option::<String>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    parse_vip_v6(&text)
+        .map(Some)
+        .map_err(|error| serde::de::Error::custom(format!("address_v6 `{text}`: {error}")))
 }
 
 /// Validates a NordVPN Meshnet peer CIDR, which must be IPv4.
@@ -221,6 +259,16 @@ pub struct NetworkConfig {
     /// Gateway's address in the tunnel network (CGNAT, ADR-001 §4).
     #[serde(default = "default_wg_address")]
     pub wg_address: String,
+    /// Gateway's IPv6 tunnel prefix, `fdXX:XXXX:XXXX::1/64`
+    /// (`ADRESSAGE-IPV6.md` §2.4). Optional.
+    ///
+    /// Absent, the gateway behaves exactly as without IPv6, and nothing about
+    /// it is written back (§2.2, §5.1). Present, it is drawn once and then
+    /// kept: it is never regenerated, never derived from the gateway key
+    /// (§2.5). Changing it renumbers every peer's IPv6 VIP, so it applies at
+    /// startup only — see [`Self::check_hot_reload`].
+    #[serde(default, deserialize_with = "de_wg_address_v6")]
+    pub wg_address_v6: Option<TunnelPrefixV6>,
     /// UDP listen port.
     #[serde(default = "default_wg_port")]
     pub wg_listen_port: u16,
@@ -349,6 +397,15 @@ pub struct WgPeer {
     /// Assigned VIP, in CIDR notation (e.g. `100.64.1.2/32`).
     /// In WireGuard, `AllowedIPs` **is** the cryptographic routing table.
     pub address: String,
+    /// Assigned IPv6 VIP, one host inside [`NetworkConfig::wg_address_v6`]
+    /// (`ADRESSAGE-IPV6.md` §2.3). Optional.
+    ///
+    /// Persisted as `address_v6 = "…/128"`. A host rather than text: a
+    /// non-`/128` value is refused when the file is read and cannot be built
+    /// in code. Public configuration, not a secret: a reload takes it from
+    /// the file, like [`Self::address`].
+    #[serde(default, deserialize_with = "de_address_v6")]
+    pub address_v6: Option<Ipv6Addr>,
     /// Authorizes this peer to mutate the control plane and drive updates.
     /// The peer remains an ordinary WireGuard client.
     #[serde(default)]
@@ -418,6 +475,10 @@ struct PersistedNetworkConfig<'a> {
     wg_iface: &'a str,
     wg_private_key: &'a str,
     wg_address: &'a str,
+    /// Written only when present: a file without IPv6 must come back
+    /// byte for byte (`ADRESSAGE-IPV6.md` §5.1).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wg_address_v6: Option<TunnelPrefixV6>,
     wg_listen_port: u16,
     key_negotiation_port: Option<u16>,
     peers: Vec<PersistedWgPeer<'a>>,
@@ -442,6 +503,9 @@ struct PersistedWgPeer<'a> {
     name: &'a str,
     public_key: &'a str,
     address: &'a str,
+    /// Written only when present, for the same reason as `wg_address_v6`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    address_v6: Option<String>,
     admin: bool,
     key_negotiation_certificate_sha256: &'a Option<String>,
     key_negotiation_pq_certificate_sha256: &'a Option<String>,
@@ -486,6 +550,7 @@ impl<'a> PersistedNetworkConfig<'a> {
                 ""
             },
             wg_address: &config.wg_address,
+            wg_address_v6: config.wg_address_v6,
             wg_listen_port: config.wg_listen_port,
             key_negotiation_port: config.key_negotiation_port,
             peers: config
@@ -495,6 +560,7 @@ impl<'a> PersistedNetworkConfig<'a> {
                     name: &peer.name,
                     public_key: &peer.public_key,
                     address: &peer.address,
+                    address_v6: peer.address_v6.map(format_vip_v6),
                     admin: peer.admin,
                     key_negotiation_certificate_sha256: &peer.key_negotiation_certificate_sha256,
                     key_negotiation_pq_certificate_sha256: &peer
@@ -527,6 +593,7 @@ impl WgPeer {
             name: self.name.clone(),
             public_key: self.public_key.clone(),
             address: self.address.clone(),
+            address_v6: self.address_v6,
             admin: self.admin,
             preshared_key: self.preshared_key.as_ref().map(SecretString::duplicate),
             key_negotiation_certificate_sha256: self.key_negotiation_certificate_sha256.clone(),
@@ -562,18 +629,21 @@ impl NetworkConfig {
             // still carries the gateway identity in the clear, and a
             // hand-edited one a static PSK: the parse buffer holds both
             // (ADR-006 §5).
-            Ok(raw) => {
-                let config: Self =
-                    toml::from_str(&raw).map_err(|e| HeliosError::Config(e.to_string()))?;
-                config.validate()?;
-                Ok(config)
-            }
+            Ok(raw) => Self::from_toml(&raw),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(HeliosError::Config(format!(
                 "reading {}: {e}",
                 path.display()
             ))),
         }
+    }
+
+    /// Reads and validates the text of `network.toml`: what [`Self::load`]
+    /// does once the file is read.
+    fn from_toml(raw: &str) -> Result<Self> {
+        let config: Self = toml::from_str(raw).map_err(|e| HeliosError::Config(e.to_string()))?;
+        config.validate()?;
+        Ok(config)
     }
 
     /// Persists an already public network config atomically (rename).
@@ -639,6 +709,40 @@ impl NetworkConfig {
         Ok(())
     }
 
+    /// Makes a second, independent copy of the whole configuration.
+    ///
+    /// Replaces the `Clone` derive. The name is the point: this copy carries
+    /// the gateway identity and every peer PSK, so each call site is a place
+    /// to justify in review — exactly like [`SecretString::duplicate`], whose
+    /// reasoning this follows (ADR-006 §5).
+    #[must_use]
+    pub fn duplicate(&self) -> Self {
+        Self {
+            wan_ifaces: self.wan_ifaces.clone(),
+            lan_ifaces: self.lan_ifaces.clone(),
+            allow_ssh_from: self.allow_ssh_from.clone(),
+            admin_ifaces: self.admin_ifaces.clone(),
+            allow_dhcp_on_wan: self.allow_dhcp_on_wan,
+            allow_client_internet: self.allow_client_internet,
+            allow_tunnel_icmp: self.allow_tunnel_icmp,
+            allow_gateway_egress: self.allow_gateway_egress,
+            allow_ssh_over_tunnel: self.allow_ssh_over_tunnel,
+            iperf_port: self.iperf_port,
+            admin_iface: self.admin_iface.clone(),
+            split_tunnel_cidrs: self.split_tunnel_cidrs.clone(),
+            nordvpn_meshnet: self.nordvpn_meshnet.clone(),
+            wg_iface: self.wg_iface.clone(),
+            wg_private_key: self.wg_private_key.duplicate(),
+            wg_address: self.wg_address.clone(),
+            wg_address_v6: self.wg_address_v6,
+            wg_listen_port: self.wg_listen_port,
+            key_negotiation_port: self.key_negotiation_port,
+            peers: self.peers.iter().map(WgPeer::duplicate).collect(),
+            static_peer_addrs: self.static_peer_addrs.clone(),
+            escrow_public_key: self.escrow_public_key.clone(),
+        }
+    }
+
     /// Restores what a configuration coming from outside the daemon cannot
     /// carry.
     ///
@@ -666,40 +770,10 @@ impl NetworkConfig {
     ///
     /// Everything else — the peer list itself, addresses, flags, ports —
     /// comes from the incoming configuration. That is the point: this is how
-    /// a peer admitted on the console reaches the running gateway.
-    /// Makes a second, independent copy of the whole configuration.
-    ///
-    /// Replaces the `Clone` derive. The name is the point: this copy carries
-    /// the gateway identity and every peer PSK, so each call site is a place
-    /// to justify in review — exactly like [`SecretString::duplicate`], whose
-    /// reasoning this follows (ADR-006 §5).
-    #[must_use]
-    pub fn duplicate(&self) -> Self {
-        Self {
-            wan_ifaces: self.wan_ifaces.clone(),
-            lan_ifaces: self.lan_ifaces.clone(),
-            allow_ssh_from: self.allow_ssh_from.clone(),
-            admin_ifaces: self.admin_ifaces.clone(),
-            allow_dhcp_on_wan: self.allow_dhcp_on_wan,
-            allow_client_internet: self.allow_client_internet,
-            allow_tunnel_icmp: self.allow_tunnel_icmp,
-            allow_gateway_egress: self.allow_gateway_egress,
-            allow_ssh_over_tunnel: self.allow_ssh_over_tunnel,
-            iperf_port: self.iperf_port,
-            admin_iface: self.admin_iface.clone(),
-            split_tunnel_cidrs: self.split_tunnel_cidrs.clone(),
-            nordvpn_meshnet: self.nordvpn_meshnet.clone(),
-            wg_iface: self.wg_iface.clone(),
-            wg_private_key: self.wg_private_key.duplicate(),
-            wg_address: self.wg_address.clone(),
-            wg_listen_port: self.wg_listen_port,
-            key_negotiation_port: self.key_negotiation_port,
-            peers: self.peers.iter().map(WgPeer::duplicate).collect(),
-            static_peer_addrs: self.static_peer_addrs.clone(),
-            escrow_public_key: self.escrow_public_key.clone(),
-        }
-    }
-
+    /// a peer admitted on the console reaches the running gateway. Peers'
+    /// `address_v6` are among them: public, they come from the file, and a
+    /// peer whose line was removed loses its IPv6 VIP. `wg_address_v6` is not
+    /// adopted either; a change of it is refused by [`Self::check_hot_reload`].
     pub fn adopt_runtime_secrets_from(&mut self, current: &Self) {
         if self.wan_iface_is_auto() && !current.wan_iface_is_auto() {
             self.wan_ifaces.clone_from(&current.wan_ifaces);
@@ -813,9 +887,85 @@ impl NetworkConfig {
         Ok(())
     }
 
+    /// Validates the peers' IPv6 VIPs against the gateway's tunnel prefix
+    /// (`ADRESSAGE-IPV6.md` §5.2).
+    ///
+    /// The shape — one host, `/128` — is the type's: a broader `address_v6`
+    /// is refused when the file is read and never reaches this point. What
+    /// is checked here depends on the gateway or on the other peers: a prefix
+    /// to belong to, an address inside it that is neither the gateway's
+    /// `::1` nor an excluded identifier (§3.2), and no two peers on the same
+    /// address. A duplicate is refused, never renumbered (§3 bis.2, rule 5).
+    ///
+    /// Kept apart from [`Self::validate_peer_identities`]: that table is the
+    /// one the API resolves callers from, and the IPv6 VIP is not an identity
+    /// source (§2.6).
+    fn validate_peer_vips_v6(&self) -> Result<()> {
+        let mut owners: HashMap<Ipv6Addr, &str> = HashMap::new();
+        for peer in &self.peers {
+            let Some(vip) = peer.address_v6 else {
+                continue;
+            };
+            let Some(prefix) = &self.wg_address_v6 else {
+                return Err(HeliosError::Config(format!(
+                    "peer {}: address_v6 {} is declared but wg_address_v6 is absent: {}",
+                    peer.name,
+                    format_vip_v6(vip),
+                    AddressError::V6WithoutTunnelPrefix(vip)
+                )));
+            };
+            prefix.check_peer_vip(vip).map_err(|error| {
+                HeliosError::Config(format!(
+                    "peer {}: address_v6 {} is refused under wg_address_v6 {prefix}: {error}",
+                    peer.name,
+                    format_vip_v6(vip)
+                ))
+            })?;
+            if let Some(owner) = owners.insert(vip, &peer.name) {
+                return Err(HeliosError::Config(format!(
+                    "duplicate address_v6 in the peer table: {} is declared by peer {owner} and \
+                     by peer {}",
+                    format_vip_v6(vip),
+                    peer.name
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Refuses to apply live what only a restart may change
+    /// (`ADRESSAGE-IPV6.md` §5.4).
+    ///
+    /// `self` is the incoming configuration, `running` the one in force. The
+    /// tunnel prefix is the one value checked: changing it renumbers every
+    /// peer's IPv6 VIP, which the running data plane cannot do under itself.
+    /// A refusal concerns the **whole** incoming configuration — keeping the
+    /// old prefix while taking the new peers would pair peers renumbered into
+    /// the new prefix with a gateway still in the old one, a state
+    /// [`Self::validate`] refuses. A `network.toml` that carries the change
+    /// stays as written and applies at the next start.
+    ///
+    /// Peers' `address_v6` are not concerned: they reload live, like the
+    /// rest of the peer table.
+    pub fn check_hot_reload(&self, running: &Self) -> Result<()> {
+        if self.wg_address_v6 == running.wg_address_v6 {
+            return Ok(());
+        }
+        let describe = |prefix: Option<TunnelPrefixV6>| {
+            prefix.map_or_else(|| "absent".to_string(), |prefix| prefix.to_string())
+        };
+        Err(HeliosError::Config(format!(
+            "wg_address_v6 changes from {} to {}: the tunnel prefix is applied at startup only, \
+             restart heliosd to apply it; the running configuration is kept until then",
+            describe(running.wg_address_v6),
+            describe(self.wg_address_v6)
+        )))
+    }
+
     /// Validates relationships that cannot be expressed by serde defaults.
     pub fn validate(&self) -> Result<()> {
         self.validate_peer_identities()?;
+        self.validate_peer_vips_v6()?;
         // `auto` means « enumerate them all », so it cannot sit beside a name:
         // the two readings — « these, plus whatever you find » and « just
         // these » — differ, and a firewall built on the wrong one is a gateway

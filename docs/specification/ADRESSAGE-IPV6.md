@@ -305,6 +305,18 @@ réadmission, ou par une déclaration explicite.
 - `wg_address_v6` : exige un redémarrage, comme les autres paramètres que le
   plan de données ne peut pas changer en marche.
 
+Implémentation (T10) : `crates/aether/src/config.rs`. Les deux clés sont
+typées dès la lecture (`TunnelPrefixV6`, et un hôte `Ipv6Addr` écrit `…/128`),
+ce qui refuse une forme invalide avant `validate` ; `validate_peer_vips_v6`
+porte le reste du §5.2. `NetworkConfig::check_hot_reload` refuse tout
+rechargement qui change `wg_address_v6` : le veilleur de `network.toml` le
+journalise, l'orchestrateur l'émet comme événement, et `POST /api/network`
+répond `409` sans rien écrire. Le round-trip octet pour octet est vérifié sur
+le chemin d'écriture réel (`save` et `save_redacted`) avec un fichier de
+production sans IPv6 ; `config/network.toml`, commenté à la main, atteint sa
+forme normale à la première réécriture (les commentaires ne sont pas de la
+configuration), puis n'en bouge plus.
+
 ## 6. Projection vers le plan de données
 
 ### 6.1 WireGuard

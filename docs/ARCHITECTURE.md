@@ -54,7 +54,11 @@ restart. Every reload goes through `NetworkConfig::adopt_runtime_secrets_from`:
 the file holds neither the sealed private key nor the negotiated PSKs, and
 applying it verbatim would strip the gateway of its identity. What cannot change
 under a running data plane — interface name, listen port, API address — still
-requires a restart.
+requires a restart. The optional IPv6 tunnel prefix `wg_address_v6` is in that
+position and is enforced: a file or a `POST /api/network` that changes it is not
+applied at all until the next start — the watcher logs a warning, the API
+answers `409` and writes nothing. Peers' `address_v6` reload live with the peer
+table (`specification/ADRESSAGE-IPV6.md` §5.4).
 
 ## Key negotiation (v5)
 

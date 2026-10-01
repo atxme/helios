@@ -29,6 +29,7 @@ fn state_with_mode(dry_run: bool) -> (AppState, mpsc::Receiver<OrchestratorCmd>)
             name: "workstation".into(),
             public_key: "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=".into(),
             address: "100.64.1.2/32".into(),
+            address_v6: None,
             admin: true,
             preshared_key: Some(PEER_PSK.into()),
             key_negotiation_certificate_sha256: None,
@@ -723,6 +724,69 @@ async fn a_config_reload_loses_neither_identity_nor_psk() {
         }
         other => panic!("unexpected command: {other:?}"),
     }
+}
+
+/// The tunnel prefix applies at startup only (`ADRESSAGE-IPV6.md` §5.4): a
+/// full reload that changes it — here, one that simply lacks the key — is
+/// refused before anything is written, so the next start does not quietly
+/// lose the prefix either.
+#[tokio::test]
+async fn a_config_reload_cannot_change_the_tunnel_prefix() {
+    const PEER: &str = r#"{"name":"workstation",
+        "public_key":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+        "address":"100.64.1.2/32","address_v6":"fd3c:91a2:7e04::2/128","admin":true}"#;
+    let (_lock, path) = isolated_config().await;
+
+    let (state, mut cmd_rx) = state();
+    {
+        let mut network = state.network.write().await;
+        network.wg_address_v6 = Some("fd3c:91a2:7e04::1/64".parse().unwrap());
+        network.peers[0].address_v6 = Some("fd3c:91a2:7e04::2".parse().unwrap());
+    }
+    let response = router(state.clone())
+        .oneshot(admin_request(
+            "/api/network",
+            &format!(r#"{{"wan_iface":"eth1","peers":[{PEER}]}}"#),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let message = String::from_utf8(body.to_vec()).unwrap();
+    assert!(message.contains("wg_address_v6"), "{message}");
+    assert!(
+        cmd_rx.try_recv().is_err(),
+        "nothing reaches the orchestrator"
+    );
+    assert!(!path.exists(), "nothing is written");
+
+    // The same body with the running prefix is an ordinary reload, and the
+    // peer's IPv6 VIP goes through it.
+    let response = router(state)
+        .oneshot(admin_request(
+            "/api/network",
+            &format!(
+                r#"{{"wan_iface":"eth1","wg_address_v6":"fd3c:91a2:7e04::1/64",
+                    "peers":[{PEER}]}}"#
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    match cmd_rx.recv().await {
+        Some(OrchestratorCmd::LoadNetworkConfig(config)) => assert_eq!(
+            config.peers[0].address_v6,
+            Some("fd3c:91a2:7e04::2".parse().unwrap())
+        ),
+        other => panic!("unexpected command: {other:?}"),
+    }
+    let written = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        written.contains("address_v6 = \"fd3c:91a2:7e04::2/128\""),
+        "{written}"
+    );
+    assert!(!written.contains(PEER_PSK));
+    let _ = std::fs::remove_file(&path);
 }
 
 #[tokio::test]

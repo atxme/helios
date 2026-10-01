@@ -192,6 +192,7 @@ mod tests {
             name: name.into(),
             public_key: format!("{name}-public-key"),
             address: address.into(),
+            address_v6: None,
             admin,
             preshared_key: None,
             key_negotiation_certificate_sha256: None,
