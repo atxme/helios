@@ -187,11 +187,22 @@ PSKs — and it persists neither private key nor PSK. It also refuses an explici
 keep-alive of `0`: without one, an idle tunnel produces no handshake and the
 liveness thresholds would read a stale timestamp on a perfectly healthy peer.
 
+Admission is also the IPAM's only caller. One collision view covers both
+families — declared peers, the live WireGuard table when the caller has one
+(`POST /api/peers` does, `heliosd peer add` does not), and the gateway's
+reserved addresses — and one allocation point chooses the peer's IPv4 VIP and,
+when the gateway has `wg_address_v6`, its IPv6 VIP. What admission writes to
+`network.toml` is the peer's address from then on. Readmitting the same
+identity returns those addresses unchanged, adding only an IPv6 VIP the
+gateway's prefix postdates ([ADRESSAGE-IPV6.md](specification/ADRESSAGE-IPV6.md)
+§3 bis).
+
 `POST /api/provision` remains the in-tunnel ML-KEM exchange for an already
 admitted peer, deliberately without TLS: the tunnel already provides
 confidentiality and mutual authentication, and the PSK's post-quantum
-confidentiality does not depend on the channel. The deterministic CGNAT IPAM is
-independent of key negotiation.
+confidentiality does not depend on the channel. It returns the persisted VIPs
+and never derives one, so the address announced to a client is the one the
+gateway routes. The deterministic IPAM is independent of key negotiation.
 
 ## Secrets at rest
 
