@@ -245,6 +245,9 @@ Ces types exposent le rendu texte actuel (`100.64.1.2/32`, `fd…/128`) pour que
 la persistance reste compatible. Le domaine ne manipule plus d'adresse en
 `String` une fois le fichier lu.
 
+Implémentation : `crates/aether/src/net.rs` (`TunnelPrefixV6`, `PeerVips`,
+`canonical_source`, erreur `AddressError`), sans dépendance à `ipnetwork`.
+
 ## 5. Persistance
 
 ### 5.1 `network.toml`

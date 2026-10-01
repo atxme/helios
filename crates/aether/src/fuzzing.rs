@@ -7,6 +7,9 @@
 //! the substance is here, in a module that the stable build compiles and the
 //! ordinary test suite exercises.
 //!
+//! The tunnel address parsers of [`crate::net`] have their target here too,
+//! for the same reasons: hand-edited `network.toml` text is what they read.
+//!
 //! # Why here and not in the fuzz crate
 //!
 //! Code that only a nightly toolchain can build is code nobody runs on the
@@ -242,6 +245,61 @@ pub fn gateway_state_machine(data: &[u8]) {
     let _: Fingerprint = state.active_tls_fingerprint();
 }
 
+/// The tunnel address parsers of `aether::net`, fed arbitrary text.
+///
+/// Not a §14.1 object, but the same kind of input: `network.toml` is edited
+/// by hand, and what these parsers accept becomes a VIP, a route and an
+/// identity. Beyond not panicking, an accepted value must render back to text
+/// the parser accepts again as the same value, and a prefix built from any
+/// Global ID must hold exactly the peer VIPs its own checks accept.
+pub fn tunnel_addresses(data: &[u8]) {
+    use crate::net::{self, PeerVips, TunnelPrefixV6};
+
+    let mut bytes = Bytes::new(data);
+    let mut global_id = [0u8; 5];
+    for slot in &mut global_id {
+        *slot = bytes.byte();
+    }
+    let built = TunnelPrefixV6::from_global_id(global_id);
+    let iid = bytes.u64();
+    match built.peer_vip(iid) {
+        Ok(vip) => {
+            assert!(!net::is_excluded_iid(iid), "an excluded IID became a VIP");
+            assert_eq!(built.check_peer_vip(vip), Ok(()), "a built VIP must pass");
+        }
+        Err(_) => assert!(net::is_excluded_iid(iid), "a usable IID was refused"),
+    }
+    assert_eq!(built.to_string().parse::<TunnelPrefixV6>(), Ok(built));
+
+    let Ok(text) = std::str::from_utf8(data) else {
+        return;
+    };
+    if let Ok(prefix) = text.parse::<TunnelPrefixV6>() {
+        assert_eq!(prefix.to_string().parse::<TunnelPrefixV6>(), Ok(prefix));
+        assert!(prefix.contains(prefix.gateway()));
+        assert!(prefix.check_peer_vip(prefix.gateway()).is_err());
+    }
+    if let Ok(v4) = net::parse_vip_v4(text) {
+        // The IPv4 form is strict enough to be its own canonical spelling.
+        assert_eq!(PeerVips { v4, v6: None }.address(), text);
+    }
+    if let Ok(v6) = net::parse_vip_v6(text) {
+        let vips = PeerVips {
+            v4: std::net::Ipv4Addr::UNSPECIFIED,
+            v6: Some(v6),
+        };
+        let rendered = vips.address_v6().unwrap_or_default();
+        assert_eq!(net::parse_vip_v6(&rendered), Ok(v6));
+        let source = net::canonical_source(std::net::IpAddr::V6(v6));
+        assert_eq!(net::canonical_source(source), source, "canonical twice");
+    }
+    if let Some((address, address_v6)) = text.split_once('\n') {
+        if let Ok(vips) = PeerVips::parse(address, Some(address_v6)) {
+            let _ = vips.check_against(Some(&built));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,6 +320,10 @@ mod tests {
         b"{\"manifest\":{},\"chunks\":[]}",
         b"0123456789abcdef0123456789abcdef",
         b"\x30\x82\x01\x00", // a DER SEQUENCE header and nothing after it
+        b"fd3c:91a2:7e04::1/64",
+        b"100.64.98.223/32",
+        b"fd3c:91a2:7e04:0:8a1f:3b2c:9d40:e517/128",
+        b"100.64.98.223/32\nfd3c:91a2:7e04::2/128",
     ];
 
     #[test]
@@ -271,6 +333,7 @@ mod tests {
             trust_transaction(seed);
             x509_documents(seed);
             gateway_state_machine(seed);
+            tunnel_addresses(seed);
         }
     }
 

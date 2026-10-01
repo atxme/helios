@@ -47,3 +47,10 @@ path = "fuzz_targets/gateway_state_machine.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "tunnel_addresses"
+path = "fuzz_targets/tunnel_addresses.rs"
+test = false
+doc = false
+bench = false
