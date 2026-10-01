@@ -261,8 +261,12 @@ output oifname \"enp3s0\" ip daddr 203.0.113.10/32 udp dport 51820 accept
 output oifname \"wlo1\" ip daddr 203.0.113.10/32 udp dport 51820 accept
 output oifname \"enp3s0\" udp dport 67 accept
 input iifname \"enp3s0\" udp dport 68 accept
+output oifname \"enp3s0\" meta nfproto ipv6 udp dport 547 accept
+input iifname \"enp3s0\" meta nfproto ipv6 udp dport 546 accept
 output oifname \"wlo1\" udp dport 67 accept
 input iifname \"wlo1\" udp dport 68 accept
+output oifname \"wlo1\" meta nfproto ipv6 udp dport 547 accept
+input iifname \"wlo1\" meta nfproto ipv6 udp dport 546 accept
 output oifname \"enp3s0\" udp dport 53 accept
 output oifname \"enp3s0\" tcp dport { 53, 80, 443 } accept
 output oifname \"enp3s0\" udp dport 123 accept

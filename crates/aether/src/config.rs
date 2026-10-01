@@ -127,9 +127,10 @@ pub struct NetworkConfig {
     /// [`crate::FirewallPolicy::admin_ifaces`].
     #[serde(default, alias = "admin_iface_extra")]
     pub admin_ifaces: Vec<String>,
-    /// Allows DHCP (UDP 67/68) on the WAN interface, kill-switch engaged.
+    /// Allows the DHCP client on the WAN interface, kill-switch engaged:
+    /// DHCPv4 (UDP 67/68) and DHCPv6 (UDP 546/547).
     ///
-    /// Enable when the WAN address comes from a lease. See
+    /// Enable when the WAN address comes from a lease, in either family. See
     /// [`crate::FirewallPolicy::allow_dhcp_on_wan`] for the cost of forgetting it.
     #[serde(default)]
     pub allow_dhcp_on_wan: bool,

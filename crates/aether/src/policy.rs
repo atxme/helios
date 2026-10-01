@@ -113,13 +113,19 @@ pub struct FirewallPolicy {
     /// [`Self::allow_ssh_over_tunnel`], which the operator turns on
     /// deliberately. `NetworkConfig` rejects the overlap.
     pub admin_ifaces: Vec<String>,
-    /// Allows DHCP (UDP 67/68) on the WAN interface, kill-switch engaged.
+    /// Allows the DHCP client on the WAN interface, kill-switch engaged:
+    /// DHCPv4 (UDP 67/68) and DHCPv6 (UDP 546/547, IPv6 only).
     ///
     /// A gateway normally has a fixed address, hence the default of `false`.
     /// But a gateway placed behind a box often gets its address from a
     /// lease: without this opening, it loses its address at the first
     /// renewal — hence its tunnel and its administration at the same time,
     /// and several hours after a startup that seemed to succeed.
+    ///
+    /// One flag covers both families because it answers one question —
+    /// does the WAN address come from a lease — and the answer does not
+    /// change with the family. An address obtained by SLAAC needs no flag:
+    /// neighbor and router discovery are always accepted on the WAN.
     pub allow_dhcp_on_wan: bool,
     /// Routes tunnel clients' traffic to the Internet: forward
     /// `wg_iface -> wan_iface` and masquerade, **only** in a state where
