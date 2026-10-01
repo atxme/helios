@@ -1,0 +1,66 @@
+wan_iface = [
+    "enp3s0",
+    "wlo1",
+]
+lan_ifaces = []
+allow_ssh_from = []
+admin_ifaces = ["tailscale0"]
+allow_dhcp_on_wan = true
+allow_client_internet = true
+allow_tunnel_icmp = true
+allow_gateway_egress = true
+allow_ssh_over_tunnel = false
+iperf_port = 5201
+admin_iface = "helios0"
+split_tunnel_cidrs = ["192.168.1.0/24"]
+wg_iface = "helios0"
+wg_private_key = ""
+wg_address = "100.64.0.1/10"
+wg_listen_port = 51820
+key_negotiation_port = 51821
+static_peer_addrs = []
+escrow_public_key = "mR3fXQ1nY2u0dEQb4k4m7yq1JgS3o0p9bS7kZcV6x0Q="
+
+[nordvpn_meshnet]
+iface = "nordlynx"
+fwmark = 57841
+peer_cidrs = [
+    "100.70.36.212/32",
+    "100.127.32.93/32",
+]
+traffic_routing_peer_cidrs = ["100.70.36.212/32"]
+local_network_peer_cidrs = []
+inbound_tcp_ports = [
+    22,
+    49111,
+]
+inbound_udp_ports = []
+allow_icmp = true
+
+[[peers]]
+name = "poste-christophe"
+public_key = "Xk2c7m0vq1T4yH9bN3dP6sR8uW5zA1eC4gI7jL0oQ2M="
+address = "100.64.98.223/32"
+admin = true
+key_negotiation_certificate_sha256 = "3f1a9c0e7b2d4f6a8c1e3b5d7f9a0c2e4b6d8f1a3c5e7b9d0f2a4c6e8b1d3f5a"
+key_negotiation_pq_certificate_sha256 = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90"
+minimum_key_negotiation_mode = "ml_kem"
+persistent_keepalive_secs = 25
+
+[[peers]]
+name = "telephone"
+public_key = "pL9sD2fG5hJ8kZ1xC4vB7nM0qW3eR6tY9uI2oP5aS8E="
+address = "100.73.14.6/32"
+admin = false
+key_negotiation_certificate_sha256 = "0e9d8c7b6a5f4e3d2c1b0a9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c3b2a1f0e9d"
+key_negotiation_pq_certificate_sha256 = "f0e1d2c3b4a5968778695a4b3c2d1e0ff0e1d2c3b4a5968778695a4b3c2d1e0f"
+minimum_key_negotiation_mode = "ml_kem"
+persistent_keepalive_secs = 25
+
+[[peers]]
+name = "nas-site-b"
+public_key = "Zq4W7e0R3t6Y9u2I5o8P1a4S7d0F3g6H9j2K5l8Z1x4="
+address = "100.101.7.250/32"
+admin = false
+minimum_key_negotiation_mode = "classic"
+persistent_keepalive_secs = 0
