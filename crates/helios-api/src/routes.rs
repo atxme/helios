@@ -425,6 +425,10 @@ pub async fn network_get(State(s): State<AppState>) -> Json<NetworkConfigView> {
 
 /// Hot-reloads the network configuration (JSON).
 /// Persists to disk and sends `LoadNetworkConfig` to the orchestrator.
+///
+/// A body whose `wg_address_v6` differs from the running one is refused with
+/// `409 Conflict` and nothing is written: the tunnel prefix is applied at
+/// startup only, so it is changed in `network.toml` followed by a restart.
 pub async fn network_set(
     State(s): State<AppState>,
     Json(mut new_config): Json<NetworkConfig>,
@@ -436,7 +440,18 @@ pub async fn network_set(
     // the sealed vault and every negotiated PSK — the gateway would stay up,
     // then every handshake would fail with nothing tying the failure to the
     // setting that caused it.
-    new_config.adopt_runtime_secrets_from(&*s.network.read().await);
+    {
+        let running = s.network.read().await;
+        new_config.adopt_runtime_secrets_from(&running);
+        // Refused before anything is written. The orchestrator would not
+        // apply such a change anyway, and persisting it here would answer
+        // "ok" for a change that is not in force — or, from a body that
+        // simply lacks the key, silently drop the tunnel prefix from
+        // `network.toml` for the next start (`ADRESSAGE-IPV6.md` §2.5, §5.4).
+        new_config
+            .check_hot_reload(&running)
+            .map_err(|refusal| (StatusCode::CONFLICT, refusal.to_string()))?;
+    }
     apply_network(&s, new_config).await?;
     Ok(Json(CmdResponse::ok()))
 }
