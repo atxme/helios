@@ -11,30 +11,14 @@
 //!
 //! IPv6 relaying opens only with the future specification B, which decides
 //! IPv6 Internet egress (blackhole, routed prefix or NAT66, ETUDE-IPV6 §6.5).
-//! Until then no rule selects IPv6 by family: the last test fails the moment
-//! one does, so that change cannot slip in as a side effect.
+//! Until then no `forward` rule and no masquerade selects IPv6: the last two
+//! tests fail the moment one does, so that change cannot slip in as a side
+//! effect. The rules that do select IPv6 are the gateway's own link control
+//! (neighbor and router discovery, MLD, DHCPv6), in `input` and `output` on
+//! its WAN and LAN interfaces; they relay nothing.
 
 use super::super::*;
-use super::support::{policy, render};
-
-/// Every tunnel state. The `match` has no wildcard: a new state fails to
-/// compile here instead of silently escaping these invariants.
-fn every_state() -> [TunnelState; 5] {
-    let _exhaustive = |state: TunnelState| match state {
-        TunnelState::Down
-        | TunnelState::Connecting
-        | TunnelState::Up
-        | TunnelState::Failed
-        | TunnelState::CaptivePortal => {}
-    };
-    [
-        TunnelState::Down,
-        TunnelState::Connecting,
-        TunnelState::Up,
-        TunnelState::Failed,
-        TunnelState::CaptivePortal,
-    ]
-}
+use super::support::{every_state, policy, render};
 
 const UPLINKS: [&str; 2] = ["enp3s0", "wlo1"];
 
@@ -135,24 +119,69 @@ fn the_masquerade_is_ipv4_only_whenever_present() {
     }
 }
 
-/// No rule selects IPv6 by family today. Opening an IPv6 relay belongs to
-/// the future specification B; this test is meant to fail when it lands, so
-/// that the change is reviewed as the decision it is.
+/// Whether a match can only be satisfied by an IPv6 packet.
+fn selects_ipv6(m: &Match) -> bool {
+    matches!(
+        m,
+        Match::Family(AddressFamily::Ipv6) | Match::Icmpv6Type(_) | Match::Ipv6HopLimit(_)
+    )
+}
+
+/// No relay selects IPv6 today: no `forward` rule, ICMPv6 control included,
+/// and no masquerade. Opening an IPv6 relay belongs to the future
+/// specification B; this test is meant to fail when it lands, so that the
+/// change is reviewed as the decision it is.
 #[test]
-fn no_rule_selects_ipv6_by_family_today() {
-    let ipv6 = Match::Family(AddressFamily::Ipv6);
+fn no_relay_selects_ipv6_today() {
     for (state, allow_client_internet, rs) in every_rendering() {
-        for rule in &rs.rules {
+        for rule in rs.chain(ChainKind::Forward) {
             assert!(
-                !rule.matches.contains(&ipv6),
+                !rule.matches.iter().any(selects_ipv6),
                 "state {state:?}, client internet {allow_client_internet}: `{rule}`"
             );
         }
         for rule in rs.masquerade_rules() {
             assert!(
-                !rule.matches().contains(&ipv6),
+                !rule.matches().iter().any(selects_ipv6),
                 "state {state:?}, client internet {allow_client_internet}: `{rule}`"
             );
         }
+    }
+}
+
+/// The rules that do select IPv6 are the gateway's own link control: in
+/// `input` or `output`, scoped to one of its WAN or LAN interfaces. A rule
+/// selecting IPv6 anywhere else — on the tunnel, an overlay, or unscoped —
+/// fails here.
+#[test]
+fn rules_selecting_ipv6_are_link_control_on_wan_and_lan_only() {
+    let links: Vec<&str> = UPLINKS.iter().copied().chain(["eth1"]).collect();
+    for (state, allow_client_internet, rs) in every_rendering() {
+        let mut seen = 0;
+        for rule in rs
+            .rules
+            .iter()
+            .filter(|rule| rule.matches.iter().any(selects_ipv6))
+        {
+            seen += 1;
+            let on_a_link = links.iter().any(|iface| {
+                let scope = match rule.chain {
+                    ChainKind::Input => Match::InIface((*iface).into()),
+                    ChainKind::Output => Match::OutIface((*iface).into()),
+                    ChainKind::Forward => return false,
+                };
+                rule.matches.first() == Some(&scope)
+            });
+            assert!(
+                on_a_link && rule.verdict == Verdict::Accept,
+                "state {state:?}, client internet {allow_client_internet}: `{rule}`"
+            );
+        }
+        // The sweep must have seen the link-control rules, otherwise it
+        // would pass on a renderer that stopped emitting them.
+        assert!(
+            seen > 0,
+            "state {state:?}: no IPv6 link-control rule rendered"
+        );
     }
 }

@@ -10,14 +10,16 @@ use ipnetwork::IpNetwork;
 use rustables::{
     expr::{
         Bitwise, Cmp, CmpOp, ConnTrackState, Conntrack, ConntrackKey, Counter as NfCounter,
-        Log as NfLog, Meta, MetaType,
+        HighLevelPayload, ICMPv6HeaderField, IPv6HeaderField, Log as NfLog, Meta, MetaType,
+        NetworkHeaderField, TransportHeaderField,
     },
     HookClass, Protocol, Rule as NfRule,
 };
 
 use super::NetlinkBackend;
 use crate::ruleset::{
-    Action, AddressFamily, ChainKind, ConnectionState, ConnectionStates, Counter, Match, L4,
+    Action, AddressFamily, ChainKind, ConnectionState, ConnectionStates, Counter, Icmpv6Type,
+    Match, L4,
 };
 
 const IP_PROTOCOL_ICMP: u8 = 1;
@@ -57,6 +59,8 @@ impl NetlinkBackend {
             Match::DestNet(addr) => Self::match_net(rule, addr, false)?,
             Match::SourceNet(addr) => Self::match_net(rule, addr, true)?,
             Match::Icmp(family) => Self::icmp_protocol(rule, *family),
+            Match::Icmpv6Type(icmp_type) => Self::icmpv6_type(rule, *icmp_type),
+            Match::Ipv6HopLimit(hop_limit) => Self::ipv6_hop_limit(rule, *hop_limit),
             Match::PacketMark(mark) => rule
                 .with_expr(Meta::new(MetaType::Mark))
                 .with_expr(Cmp::new(CmpOp::Eq, Self::packet_mark_bytes(*mark))),
@@ -99,6 +103,34 @@ impl NetlinkBackend {
         };
         rule.with_expr(Meta::new(MetaType::L4Proto))
             .with_expr(Cmp::new(CmpOp::Eq, [protocol]))
+    }
+
+    /// `icmpv6 type <type>`: the ICMPv6 protocol, then the type octet.
+    ///
+    /// The protocol comparison comes first so that the transport payload is
+    /// only read as an ICMPv6 header; the type octet sits at offset 0 of that
+    /// header, which is the field `rustables` names `ICMPv6HeaderField::Type`.
+    fn icmpv6_type(rule: NfRule, icmp_type: Icmpv6Type) -> NfRule {
+        Self::icmp_protocol(rule, AddressFamily::Ipv6)
+            .with_expr(
+                HighLevelPayload::Transport(TransportHeaderField::ICMPv6(ICMPv6HeaderField::Type))
+                    .build(),
+            )
+            .with_expr(Cmp::new(CmpOp::Eq, [icmp_type.number()]))
+    }
+
+    /// `ip6 hoplimit <value>`, behind its `meta nfproto ipv6` guard.
+    ///
+    /// The guard is the one [`NfRule::match_ip`] emits ahead of an IPv6
+    /// address, and for the same reason: in an `inet` table the network
+    /// header may be IPv4, where offset 7 is not a hop limit.
+    fn ipv6_hop_limit(rule: NfRule, hop_limit: u8) -> NfRule {
+        Self::network_family(rule, AddressFamily::Ipv6)
+            .with_expr(
+                HighLevelPayload::Network(NetworkHeaderField::IPv6(IPv6HeaderField::HopLimit))
+                    .build(),
+            )
+            .with_expr(Cmp::new(CmpOp::Eq, [hop_limit]))
     }
 
     /// A standalone `meta nfproto` guard.
@@ -201,7 +233,10 @@ impl NetlinkBackend {
 
 #[cfg(test)]
 mod tests {
-    use rustables::{expr::RawExpression, ProtocolFamily};
+    use rustables::{
+        expr::{Payload, RawExpression, Register},
+        ProtocolFamily,
+    };
 
     use super::*;
 
@@ -305,6 +340,80 @@ mod tests {
         assert_eq!(NFPROTO_IPV6, 10);
         assert_eq!(i32::from(NFPROTO_IPV4), ProtocolFamily::Ipv4 as i32);
         assert_eq!(i32::from(NFPROTO_IPV6), ProtocolFamily::Ipv6 as i32);
+    }
+
+    /// A Neighbor Solicitation rule's matches, translated in their IR order:
+    /// the ICMPv6 protocol and type, then the hop limit behind its IPv6
+    /// guard. Every value is a literal — protocol 58, transport header base
+    /// 2 at offset 0 for one octet, type 135, `NFPROTO_IPV6` 10, network
+    /// header base 1 at offset 7 for one octet, hop limit 255 — so that a
+    /// change in `rustables`' field tables shows up here, not on a target.
+    #[test]
+    fn a_neighbor_solicitation_match_emits_the_exact_expression_sequence() {
+        let mut rule = NfRule::default();
+        for m in [
+            Match::Icmpv6Type(Icmpv6Type::NeighborSolicit),
+            Match::Ipv6HopLimit(255),
+        ] {
+            rule = NetlinkBackend::apply_match(rule, &m).expect("an ICMPv6 match translates");
+        }
+        let expressions: Vec<RawExpression> = rule
+            .get_expressions()
+            .map(|list| list.iter().cloned().collect())
+            .unwrap_or_default();
+
+        let payload = |base: u32, offset: u32| {
+            Payload::default()
+                .with_dreg(Register::Reg1)
+                .with_base(base)
+                .with_offset(offset)
+                .with_len(1u32)
+        };
+        assert_eq!(
+            expressions,
+            [
+                RawExpression::from(Meta::new(MetaType::L4Proto)),
+                RawExpression::from(Cmp::new(CmpOp::Eq, [58u8])),
+                RawExpression::from(payload(2, 0)),
+                RawExpression::from(Cmp::new(CmpOp::Eq, [135u8])),
+                RawExpression::from(Meta::new(MetaType::NfProto)),
+                RawExpression::from(Cmp::new(CmpOp::Eq, [10u8])),
+                RawExpression::from(payload(1, 7)),
+                RawExpression::from(Cmp::new(CmpOp::Eq, [255u8])),
+            ]
+        );
+        // The payload bases above are the kernel UAPI values.
+        assert_eq!(rustables::sys::NFT_PAYLOAD_NETWORK_HEADER, 1);
+        assert_eq!(rustables::sys::NFT_PAYLOAD_TRANSPORT_HEADER, 2);
+    }
+
+    /// Every typed ICMPv6 match compares the octet its type stands for, and
+    /// nothing else changes from one type to another.
+    #[test]
+    fn every_icmpv6_type_compares_its_own_number() {
+        for icmp_type in [
+            Icmpv6Type::MldListenerQuery,
+            Icmpv6Type::MldListenerReport,
+            Icmpv6Type::MldListenerDone,
+            Icmpv6Type::RouterSolicit,
+            Icmpv6Type::RouterAdvert,
+            Icmpv6Type::NeighborSolicit,
+            Icmpv6Type::NeighborAdvert,
+            Icmpv6Type::Mld2ListenerReport,
+        ] {
+            let expressions: Vec<RawExpression> =
+                NetlinkBackend::apply_match(NfRule::default(), &Match::Icmpv6Type(icmp_type))
+                    .expect("an ICMPv6 type match translates")
+                    .get_expressions()
+                    .map(|list| list.iter().cloned().collect())
+                    .unwrap_or_default();
+            assert_eq!(expressions.len(), 4, "{icmp_type:?}");
+            assert_eq!(
+                expressions[3],
+                RawExpression::from(Cmp::new(CmpOp::Eq, [icmp_type.number()])),
+                "{icmp_type:?}"
+            );
+        }
     }
 
     #[test]

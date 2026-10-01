@@ -58,14 +58,16 @@ mod administration;
 mod astra_channel;
 mod gateway_wan;
 mod kill_switch;
+mod link_ipv6;
 mod meshnet;
 mod nftables;
 mod transport;
 mod tunnel_interface;
 
 pub use nftables::{
-    Action, AddressFamily, ChainKind, ConnectionState, ConnectionStates, Counter, LogAction,
-    MasqueradeRule, Match, RateLimit, RateLimitMode, RateUnit, Rule, Ruleset, Verdict, L4,
+    Action, AddressFamily, ChainKind, ConnectionState, ConnectionStates, Counter, Icmpv6Type,
+    LogAction, MasqueradeRule, Match, RateLimit, RateLimitMode, RateUnit, Rule, Ruleset, Verdict,
+    L4,
 };
 
 use aether::{FirewallPolicy, HeliosError, Result, TunnelState, SPEEDTEST_PORT};
@@ -86,6 +88,8 @@ const PRIVATE_IPV4_CIDRS: [&str; 4] = [
 /// * loopback and established/related traffic always accepted;
 /// * the WireGuard listening port stays reachable, without which no client
 ///   could (re)establish the tunnel;
+/// * IPv6 neighbor discovery and MLD on every WAN and LAN interface, router
+///   discovery on the WANs only (module `link_ipv6`);
 /// * LAN -> WAN forwarding is only open in the `Up` state.
 pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Result<Ruleset> {
     use ChainKind::{Forward, Input, Output};
@@ -139,6 +143,7 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Result<Ruleset> {
     transport::site_to_site_peers(&mut rules, policy, &wan_ifaces)?;
     gateway_wan::dhcp_lease_renewal(&mut rules, policy, &wan_ifaces);
     gateway_wan::gateway_own_egress(&mut rules, policy, &wan_ifaces);
+    link_ipv6::link_control(&mut rules, policy, &wan_ifaces);
     meshnet::nordvpn_meshnet(&mut rules, policy, &wan_ifaces)?;
     tunnel_interface::openings(&mut rules, policy);
     administration::ssh_sources(&mut rules, policy)?;
