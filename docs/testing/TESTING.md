@@ -354,6 +354,39 @@ Valider avec accès console :
   La sélection elle-même est éprouvée hors noyau ; ce que seule la cible
   établit, c'est que les marqueurs sysfs d'un vrai pilote Wi-Fi sont ceux que
   le module lit, et qu'une bascule réelle ne coupe pas les clients.
+- **IPv6 du tunnel** (`ADRESSAGE-IPV6.md` §6 et §9, tickets T12 et T13), sur
+  une gateway avec `wg_address_v6` et un pair qui porte `address_v6`, WAN à
+  1500 :
+  - `ip -6 addr show dev helios0` montre `<préfixe>::1/64` ;
+    `wg show helios0 allowed-ips` montre, pour ce pair, **exactement** son
+    `/32` et son `/128` ;
+  - `ip -6 route show table 51820` montre un `/128` par pair, `dev helios0 src
+    <préfixe>::1` ; `ip -6 rule` montre `32000: from all to <préfixe>::/64
+    lookup 51820` ; `ip route show table 51820` et `ip rule` (IPv4) sont
+    identiques à ceux d'une gateway sans IPv6 ;
+  - avec `allow_tunnel_icmp = true`, `ping -6 <VIP6 du pair>` depuis la gateway
+    et `ping -6 <préfixe>::1` depuis le client répondent ; avec
+    `allow_tunnel_icmp = false`, ni l'un ni l'autre. Orion ne pose pas encore
+    l'adresse IPv6 sur son adaptateur (ticket T19) : le client de cet essai est
+    un `wg-quick` dont `Address` porte le `/32` et le `/128` du pair ;
+  - `helios-ctl status` affiche `IPv6 installed`, et `GET /api/status` porte
+    `"ipv6": "installed"` ; `systemctl stop heliosd` retire la règle et vide
+    la table `51820` dans **les deux** familles ;
+  - chemin dégradé : `sysctl -w net.ipv6.conf.default.disable_ipv6=1`, puis
+    redémarrer `heliosd`. La gateway doit démarrer en IPv4 seule : aucune
+    adresse IPv6 sur `helios0`, aucun `/128` dans `wg show`, aucune règle ni
+    route `ip -6` dans la table `51820`, un avertissement « IPv6 not installed »
+    dans le journal, `"ipv6": {"unavailable": {"reason": "disabled_by_kernel",
+    …}}` dans `GET /api/status`, et les clients IPv4 servis comme avant.
+    Remettre la valeur à `0` ensuite ;
+  - même essai avec une WAN à MTU 1340 (tunnel à 1260) :
+    `"reason": "tunnel_mtu_too_small"` ;
+  - le refus que seul le noyau formule (retenté sans IPv6 après démontage de
+    l'interface, raison `address_refused`) n'a pas de déclencheur connu en
+    dehors des deux cas précédents, qui sont écartés avant la montée : il
+    n'est éprouvé qu'en dry-run (`DryRunBackend::without_ipv6`).
+  Aucune ouverture ne doit apparaître : `nft list ruleset` est identique avec
+  et sans `wg_address_v6` (§6.4).
 
 Ces essais modifient le pare-feu, les routes, le TPM et le binaire installé : ne
 jamais les lancer contre une appliance de production.
