@@ -69,6 +69,10 @@ impl VpnBackend for DryRunBackend {
         // backend on purpose — a check the dry run skipped would be a check
         // nobody exercises in the regression.
         profile.validate_for_data_plane()?;
+        // Same rule as the real backend: the controller hands over a literal
+        // endpoint, and a name reaching this point is a resolution skipped.
+        crate::endpoint_resolution::literal_endpoint(&profile.endpoint)
+            .map_err(|e| anyhow::anyhow!("endpoint `{}` invalide : {e}", profile.endpoint))?;
 
         // 1. The adapter mounts BEFORE any network attempt: from this instant,
         //    AllowedIPs (by default 0.0.0.0/0, ::/0) captures traffic and
@@ -209,6 +213,19 @@ mod tests {
         let (sink, _log) = collector();
         // Empty profile: no keys → refused before any side effect.
         assert!(backend.up(&ClientProfile::default(), &sink).await.is_err());
+        assert!(!backend.adapter_is_up());
+    }
+
+    /// The simulation refuses a name like the real backend does: the
+    /// controller resolves it first, and a test that skipped that step must
+    /// not pass here only to fail on a machine with WireGuard.
+    #[tokio::test]
+    async fn a_hostname_endpoint_is_refused_before_mounting() {
+        let backend = DryRunBackend::default();
+        let (sink, _log) = collector();
+        let mut named = profile();
+        named.endpoint = "gateway.example:51820".into();
+        assert!(backend.up(&named, &sink).await.is_err());
         assert!(!backend.adapter_is_up());
     }
 }
