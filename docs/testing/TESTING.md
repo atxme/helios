@@ -35,7 +35,7 @@ vérifiée qu’au moment de la PR.
 | Éditeur | permissions 0700/0600, auto-vérification, clés cohérentes et refus d’écrasement |
 | Réseau | états, expiration de handshake, règles fail-closed et transaction préparée avant application, ouverture DHCP scopée au WAN et fermée par défaut |
 | Provisioning PQ | tour ML-KEM complet via l’endpoint, PSK posé avant d’être annoncé, refus fail-closed si la pose échoue, annulation en mémoire et restauration du PSK précédent, adaptateur client jamais démonté |
-| Key-negotiation | JSON strict et borné, anti-downgrade/rejeu, mTLS en enveloppe, certificats et transcripts ML-DSA-65, substitution `kpub`/ciphertext, trois modes, pose gateway avant réponse, handshake client frais, ACK signé, rollback |
+| Key-negotiation | JSON strict et borné, anti-downgrade/rejeu, mTLS en enveloppe, certificats et transcripts ML-DSA-65, substitution `kpub`/ciphertext, trois modes, pose gateway avant réponse, handshake client frais, ACK signé, rollback, écoute dual-stack `[::]` (interop Orion en IPv4 et en `[::1]`, source `::ffff:` comptée comme son IPv4, repli IPv4 sur `EAFNOSUPPORT` seulement) |
 | Mise à jour applicative | manifeste `helios-binary-release-v1` : signature hybride, altération du binaire, anti-rollback de `release_sequence`, staging borné et restauration du lien `current` (ADR-003) |
 | Autorisation | routes de mutation réservées aux pairs `admin`, résolution par VIP source en `/32`, refus d'un pair ordinaire, en-têtes de proxy ignorés (ADR-003) |
 | Admission | VIP dérivée de la clé publique, adresse de la gateway réservée, doublons de nom et de clé refusés, PSK des autres pairs préservés, persistance sans clé privée ni PSK (ADR-004) |
@@ -221,6 +221,17 @@ Valider avec accès console :
   trois modes, un certificat client non lié, un ciphertext altéré, la fermeture
   avant confirmation, le timeout, puis un handshake réussi avec le PSK négocié
   et l’ACK de commit ;
+- key-negotiation sur IPv6 : `ss -ulpn` sur la gateway montre l'écoute de
+  négociation sur `[::]:<port>` (une seule socket, dual-stack) ; un client
+  Orion dont le seul uplink est IPv6, ou dont le profil nomme un endpoint
+  `[v6]:port`, négocie en ML-KEM, pendant qu'un client IPv4 négocie toujours
+  sur le même port. Le journal nomme les sources IPv4 sous leur forme
+  `a.b.c.d`, jamais `::ffff:a.b.c.d`. Les tests automatisés ne
+  passent que par la boucle locale : ni le routage, ni le pare-feu `inet` sur
+  le WAN, ni la question de savoir si le noyau livre à la socket un paquet IPv6
+  dont la source est elle-même de la forme `::ffff:` n'y sont éprouvés. Sur une
+  gateway démarrée avec `ipv6.disable=1`, l'écoute doit retomber sur
+  `0.0.0.0:<port>` avec un avertissement qui en donne la raison ;
 - réparation sur redémarrage de gateway (§12.5) : tunnel `ml_kem` monté,
   `systemctl restart heliosd`, puis **ne rien faire**. Le journal client doit
   annoncer « renégociation 1/3 » en nommant le handshake vieilli, et le tunnel

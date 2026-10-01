@@ -23,6 +23,16 @@ tracing.workspace = true
 hex.workspace = true
 base64.workspace = true
 zeroize.workspace = true
+# Socket `[::]` dual-stack de l'écoute de négociation : `IPV6_V6ONLY` doit être
+# posé avant `bind`, ce que `std` ne permet pas. Déjà présente transitivement
+# via quinn et quinn-udp : aucun coût supplémentaire de chaîne
+# d'approvisionnement.
+socket2 = "0.6"
+
+# `EAFNOSUPPORT`, seule erreur qui ramène l'écoute à IPv4 au lieu de la faire
+# échouer. Déjà présente transitivement via tokio et quinn-udp.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 rcgen.workspace = true
