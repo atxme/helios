@@ -74,6 +74,32 @@ pub fn derive_cgnat_ip(pubkey: &[u8], counter: u32) -> Ipv4Addr {
     Ipv4Addr::from(CGNAT_BASE | normalize_host(host))
 }
 
+/// Domain separator of the IPv6 derivation (`ADRESSAGE-IPV6.md` §3.1).
+///
+/// The IPv4 derivation hashes `pubkey || n` with no prefix; this one hashes
+/// `"helios-ipam-v6-v1" || pubkey || n`, so the two never share an input.
+/// Frozen: changing it renumbers every peer's IPv6 VIP.
+pub const IPV6_DOMAIN: &[u8] = b"helios-ipam-v6-v1";
+
+/// Derives candidate interface identifier n° `counter` for this public key.
+///
+/// `BLAKE3(IPV6_DOMAIN || pubkey || counter_le32)[0..8]`, the eight bytes in
+/// address order: they are the low half of the VIP as written, so the
+/// identifier `fdff:ffff:ffff:ff80` of §3.2 compares as the number
+/// `0xfdff_ffff_ffff_ff80`. Deterministic like [`derive_cgnat_ip`], and on a
+/// counter of its own: an IPv4 collision does not move it (§3.3).
+pub fn derive_ula_iid(pubkey: &[u8], counter: u32) -> u64 {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(IPV6_DOMAIN);
+    hasher.update(pubkey);
+    hasher.update(&counter.to_le_bytes());
+    let digest = hasher.finalize();
+
+    let mut first8 = [0u8; 8];
+    first8.copy_from_slice(&digest.as_bytes()[..8]);
+    u64::from_be_bytes(first8)
+}
+
 /// Discards the reserved hosts of the `/10`: `.0` (network address) and the
 /// all-ones host (broadcast). These two cases are deterministically remapped
 /// to valid hosts rather than drawn again, so an unusable VIP is never assigned.
@@ -204,5 +230,60 @@ mod tests {
         assert_eq!(normalize_host(0), 1);
         assert_eq!(normalize_host(HOST_MASK), HOST_MASK - 1);
         assert_eq!(normalize_host(1234), 1234);
+    }
+
+    /// Freezes the IPv6 formula of §3.1: a change of separator, of input
+    /// order, of counter encoding or of byte order renumbers every peer, and
+    /// fails here first.
+    #[test]
+    fn the_ipv6_derivation_matches_its_known_answer() {
+        let pk = [7u8; 32];
+        assert_eq!(derive_ula_iid(&pk, 0), 0xf545_e478_0e88_7a7f);
+        assert_eq!(derive_ula_iid(&pk, 1), 0x12c2_1cf4_ff2f_77b7);
+
+        // The same value spelled out from the specification's formula, on
+        // the one-shot API rather than the incremental hasher.
+        let mut input = Vec::new();
+        input.extend_from_slice(b"helios-ipam-v6-v1");
+        input.extend_from_slice(&pk);
+        input.extend_from_slice(&0u32.to_le_bytes());
+        let digest = blake3::hash(&input);
+        let mut first8 = [0u8; 8];
+        first8.copy_from_slice(&digest.as_bytes()[..8]);
+        assert_eq!(u64::from_be_bytes(first8), derive_ula_iid(&pk, 0));
+    }
+
+    /// §9 criterion 3: no state enters the derivation, so two gateways —
+    /// or one gateway before and after a restart — derive the same identifier.
+    #[test]
+    fn the_ipv6_derivation_is_deterministic() {
+        let pk = [42u8; 32];
+        let first_instance: Vec<u64> = (0..4).map(|n| derive_ula_iid(&pk, n)).collect();
+        let second_instance: Vec<u64> = (0..4).map(|n| derive_ula_iid(&pk, n)).collect();
+        assert_eq!(first_instance, second_instance);
+        assert_ne!(derive_ula_iid(&[1u8; 32], 0), derive_ula_iid(&[2u8; 32], 0));
+        assert_ne!(derive_ula_iid(&pk, 0), derive_ula_iid(&pk, 1));
+    }
+
+    /// §9 criterion 4: the separator keeps the two families on different
+    /// inputs. Without it, the IPv6 identifier would begin with the very
+    /// bytes the IPv4 VIP is cut from.
+    #[test]
+    fn the_ipv4_and_ipv6_derivations_are_independent() {
+        for seed in 0u8..32 {
+            let pk = [seed; 32];
+            let mut unseparated = blake3::Hasher::new();
+            unseparated.update(&pk);
+            unseparated.update(&0u32.to_le_bytes());
+            let shared = unseparated.finalize();
+            let mut first8 = [0u8; 8];
+            first8.copy_from_slice(&shared.as_bytes()[..8]);
+
+            assert_ne!(
+                derive_ula_iid(&pk, 0),
+                u64::from_be_bytes(first8),
+                "the IPv6 identifier must not come from the IPv4 input"
+            );
+        }
     }
 }

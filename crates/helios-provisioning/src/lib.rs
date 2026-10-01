@@ -81,7 +81,10 @@ pub mod rotation;
 pub mod session;
 
 pub use admission::{admit_with_key_negotiation, revoke, AdmissionError};
-pub use ipam::{assign_vip, derive_cgnat_ip, IpamError, PeerTable, MAX_VIP_PROBES, POOL_SIZE};
+pub use ipam::{
+    assign_vip, derive_cgnat_ip, derive_ula_iid, IpamError, PeerTable, IPV6_DOMAIN, MAX_VIP_PROBES,
+    POOL_SIZE,
+};
 pub use rotation::{RotationAction, RotationState, REVERT_AFTER};
 pub use session::{
     handle_request, AdmittedPeers, GatewayIdentity, Provisioned, DEFAULT_PSK_LIFETIME_SECS,
