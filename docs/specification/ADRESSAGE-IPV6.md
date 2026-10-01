@@ -1,6 +1,9 @@
 # Spécification — modèle d'adressage IPv6 du tunnel
 
-**Statut** : proposée le 30 septembre 2026, **non implémentée**. Elle fixe
+**Statut** : proposée le 30 septembre 2026, **validée par l'opérateur le
+1er octobre 2026**, non implémentée. La validation porte aussi sur l'IPAM
+unifié du §3 bis, qui absorbe une partie du chantier « IPAM / adressage
+unifié ». Elle fixe
 les décisions d'adressage que l'étude
 [ETUDE-IPV6.md](../architecture/ETUDE-IPV6.md) laissait ouvertes (ticket T00).
 Les tickets T07 et T10 à T14 de l'étude l'appliquent ; aucun ne doit trancher
@@ -140,12 +143,85 @@ Un candidat est rejeté, et le compteur incrémenté, si son IID est :
 ### 3.3 Collisions
 
 - Même borne que l'IPv4 : `MAX_VIP_PROBES` (64). Au-delà : `IpamError::Exhausted`.
-- La table de collision est l'union de la table WireGuard vivante et des
-  adresses déclarées dans `network.toml`, comme pour l'IPv4.
+- La table de collision est la vue unique du §3 bis, commune aux deux
+  familles.
 - Les compteurs IPv4 et IPv6 sont **indépendants** : une collision IPv4
   n'avance pas le compteur IPv6.
 
 Sur 2^64 identifiants, une collision est un garde-fou, pas un cas nominal.
+
+## 3 bis. IPAM unifié (IPv4 et IPv6)
+
+L'IPv6 ne doit pas ajouter un second IPAM à côté du premier. Cette section
+fixe un seul mécanisme d'attribution, une seule vue des collisions et une seule
+source de vérité pour les deux familles. Elle s'applique aussi à l'IPv4
+existant.
+
+### 3 bis.1 Constat sur l'IPv4 actuel
+
+Deux vues de collision coexistent aujourd'hui :
+
+- `DeclaredPeers` (`helios-provisioning/src/admission.rs`) lit les pairs
+  déclarés dans `network.toml` et réserve l'adresse de la gateway. Elle sert à
+  l'admission.
+- `PeerAddressTable` (`helios-api/src/provision.rs`) lit la table WireGuard
+  vivante. Elle ne réserve pas l'adresse de la gateway et ne voit pas un pair
+  déclaré mais absent du plan de données. Elle sert au provisioning in-tunnel.
+
+`helios_provisioning::session` **re-dérive** le VIP à chaque provisioning
+(`assign_vip` sur la table vivante) et le renvoie dans
+`ProvisionResponse::assigned_address`. Si l'admission a dû résoudre une
+collision contre un pair déclaré qui n'est pas connecté, le provisioning
+retombe sur une autre adresse que celle qui a été déclarée :
+
+- la gateway garde l'adresse déclarée et journalise l'écart
+  (`heliosd/src/orchestrator/data_plane.rs`, installation de PSK) ;
+- Orion journalise « corriger le profil puis se reconnecter » vers l'adresse
+  dérivée (`orion-core/src/backend/mod.rs`). Suivre ce conseil casserait le
+  tunnel, puisque les `AllowedIPs` de la gateway portent l'adresse déclarée.
+
+Le cas exige une collision, il est donc rare ; mais il y a deux vérités.
+
+### 3 bis.2 Règles
+
+1. **Un seul point d'attribution.** `helios_provisioning::ipam` expose une
+   fonction qui rend un `PeerVips` complet (§4) : le VIP IPv4, et le VIP IPv6
+   si la gateway a un préfixe. Elle est appelée **uniquement à l'admission**,
+   par tous les chemins d'admission (`heliosd peer`, `helios-ctl peer`,
+   admission avec identité de négociation), conformément à l'ADR-004 §5.
+2. **Une seule vue des collisions.** Une seule fonction construit la vue, pour
+   les deux familles, comme l'union de :
+   - les adresses déclarées dans `network.toml` (`address`, `address_v6`) ;
+   - les `AllowedIPs` de la table WireGuard vivante, toutes familles ;
+   - les réservations : l'hôte de `wg_address`, `<préfixe>::1`, les IID exclus
+     du §3.2, et les hôtes réservés du `/10` déjà écartés par l'IPAM IPv4.
+
+   Le propriétaire d'une entrée est la clé publique brute ; un pair n'entre
+   jamais en collision avec lui-même.
+3. **La persistance fait foi.** L'adresse attribuée est écrite dans
+   `network.toml` à l'admission, comme aujourd'hui pour l'IPv4. La dérivation
+   sert à **choisir** une adresse, jamais à la **retrouver** : aucun chemin ne
+   re-dérive l'adresse d'un pair déjà admis.
+4. **Le provisioning rend l'adresse persistée.** `session.rs` et
+   `POST /api/provision` renvoient le `PeerVips` déclaré du pair, sans appeler
+   l'IPAM. Un pair admis sans adresse lisible est une erreur nommée, pas une
+   occasion de dériver.
+5. **Pas de résolution automatique a posteriori.** Deux pairs déclarés avec la
+   même adresse (édition manuelle) sont refusés par `NetworkConfig::validate`
+   (existant en IPv4, étendu à l'IPv6 par le §5.2). L'IPAM ne renumérote
+   jamais un pair déclaré.
+6. **Familles indépendantes.** Compteurs de sondage distincts (§3.3).
+   Attribuer l'IPv6 d'un pair existant ne touche pas à son IPv4.
+7. **Réadmission idempotente.** Réadmettre une clé déjà admise rend les mêmes
+   adresses. Si la gateway a gagné un préfixe IPv6 depuis, seule la famille
+   manquante est attribuée ; l'IPv4 déclarée reste telle quelle.
+
+### 3 bis.3 Ce qui reste hors de l'IPAM
+
+- L'adresse de la gateway (`wg_address`, `wg_address_v6`) : configuration
+  opérateur, réservée par l'IPAM mais jamais attribuée par lui.
+- Le routage VIP (§6.3) et les `AllowedIPs` (§6.1) consomment le `PeerVips`
+  persisté ; ils ne dérivent rien.
 
 ## 4. Types canoniques
 
@@ -318,7 +394,14 @@ Les implémentations des tickets T07 et T10 à T14 doivent au minimum démontrer
    absent (golden tests inchangés) ;
 7. des `AllowedIPs` gateway égaux exactement à `{v4/32, v6/128}` ;
 8. le démarrage dégradé visible du §6.2 ;
-9. l'absence de changement dans `helios_api::auth` hors canonicalisation.
+9. l'absence de changement dans `helios_api::auth` hors canonicalisation ;
+10. un seul constructeur de vue de collision et un seul point d'attribution,
+    utilisés par tous les chemins d'admission (§3 bis.2) ;
+11. le cas divergent du §3 bis.1 : un pair A déclaré mais déconnecté tient le
+    VIP naturel de B ; B est admis sur un VIP sondé ; le provisioning de B
+    renvoie **son adresse déclarée**, et aucun avertissement d'écart n'est
+    émis côté gateway ni côté Orion ;
+12. la réadmission idempotente, y compris l'ajout de la seule famille IPv6.
 
 Sur cible, en plus : ajout de l'adresse sur `helios0`, routes et règle de la
 table `51820` en IPv6, `ping -6` gateway ↔ pair avec `allow_tunnel_icmp`.
@@ -329,9 +412,9 @@ table `51820` en IPv6, `ping -6` gateway ↔ pair avec `allow_tunnel_icmp`.
 | --- | --- |
 | T07 `aether::net` | §4 |
 | T10 configuration `_v6` | §5 |
-| T11 IPAM IPv6 | §3 |
+| T11 IPAM unifié (IPv4 et IPv6) | §3, §3 bis |
 | T12 WireGuard multi-adresses | §6.1, §6.2 |
 | T13 `vip_routing` IPv6 | §6.3 |
-| T14 admission et provisioning | §5.3, §7.1 |
+| T14 admission et provisioning | §3 bis.2 (règles 1, 4 et 7), §5.3, §7.1 |
 | T16 auth API | §2.6 : canonicalisation seulement en v1 |
 | T19 Orion dual-stack | §7.2, §7.3 |

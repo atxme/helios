@@ -744,7 +744,7 @@ Avancement sur `feature/support-ipv6` (1er octobre 2026) :
 
 | Ticket | État | Reste à faire |
 | --- | --- | --- |
-| T00 | spécification rédigée, statut « proposée » | validation opérateur |
+| T00 | spécification validée le 1er octobre 2026, avec l'IPAM unifié (§3 bis) | — |
 | T01 | fusionné | VM Windows : `::/0` posé, `curl -6` bloqué ; texte ADR-001 §3 bis en attente de décision |
 | T02 | fusionné | VM Windows : absence de faux positif, détection, fuite réelle |
 | T03 + T04 | fusionnés | cible : batch accepté, NAT44 inchangé |
@@ -752,7 +752,7 @@ Avancement sur `feature/support-ipv6` (1er octobre 2026) :
 | T08 | fusionné | cible avec T17 : sources `::ffff:` sur socket `[::]` |
 | T06 | fusionné | accepter des pairs Meshnet IPv6 exige de couvrir un préfixe global du lien WAN, puis un essai sur cible |
 | T09 | fusionné | `heliosd run` refuse désormais une `wg_address` sans hôte IPv4 au lieu de basculer sur loopback |
-| T07, T10–T23 | à faire | T07 et T10–T14 attendent la validation de T00 |
+| T07, T10–T23 | à faire | T11 couvre désormais l'IPAM unifié IPv4 + IPv6 |
 
 **T00 — Spécification A : modèle d'adressage IPv6**
 - Fichiers : [`docs/specification/ADRESSAGE-IPV6.md`](../specification/ADRESSAGE-IPV6.md), index `docs/README.md`.
@@ -827,11 +827,12 @@ Avancement sur `feature/support-ipv6` (1er octobre 2026) :
 - Tests : round-trip byte-identique des fichiers v4 ; refus v6 mal formé ; hot reload.
 - Risque : élevé (persistance). Acceptation : `config/network.toml` relu et réécrit à l'identique.
 
-**T11 — IPAM v6**
-- Fichiers : `crates/helios-provisioning/src/ipam.rs`.
-- Dépend : T10 et décision préfixe (§5.4).
-- Changement : `derive_ula_host`, `PeerTable` sur `IpAddr`.
-- Tests : déterminisme, exclusions `::0`/`::1`, collisions. Risque : moyen.
+**T11 — IPAM unifié (IPv4 et IPv6)**
+- Fichiers : `crates/helios-provisioning/src/{ipam,admission,session}.rs`, `crates/helios-api/src/provision.rs` (`PeerAddressTable`).
+- Dépend : T07, T10.
+- Changement : spécification A §3 et §3 bis. Un seul point d'attribution rendant `PeerVips`, appelé à l'admission seulement ; une seule vue de collision (déclarés ∪ table vivante ∪ réservations, deux familles) remplaçant `DeclaredPeers` et `PeerAddressTable` ; dérivation ULA §3.1 avec exclusions §3.2.
+- Tests : déterminisme, exclusions, collisions par famille, vue unique utilisée par tous les chemins d'admission.
+- Risque : moyen (admission). Acceptation : spécification A §9, critères 3 à 5 et 10.
 
 **T12 — WireGuard multi-adresses**
 - Fichiers : `crates/helios-wireguard/src/{lib,kernel,dryrun}.rs`, `crates/heliosd/src/orchestrator/data_plane.rs` (`wg_config`).
@@ -846,10 +847,11 @@ Avancement sur `feature/support-ipv6` (1er octobre 2026) :
 - Tests : commandes générées. Cible : NordVPN/Tailscale actifs. Risque : moyen.
 
 **T14 — Admission et provisioning v6**
-- Fichiers : `crates/helios-provisioning/src/{admission,session}.rs`, `crates/helios-api/src/provision.rs`, `crates/aether/src/enroll.rs`.
+- Fichiers : `crates/helios-provisioning/src/{admission,session}.rs`, `crates/helios-api/src/provision.rs`, `crates/aether/src/enroll.rs`, `crates/orion-core/src/backend/mod.rs` (message d'écart).
 - Dépend : T11.
-- Changement : attribuer le v6 si la gateway en a un ; `assigned_address_v6` optionnel.
-- Tests : réadmission déterministe. Risque : moyen.
+- Changement : spécification A §3 bis.2 règles 1, 4 et 7 ; le provisioning renvoie l'adresse **persistée** (IPv4 comprise) au lieu de re-dériver ; `assigned_address_v6` optionnel (§7.1) ; réadmission idempotente qui n'ajoute que la famille manquante.
+- Tests : le cas divergent du §3 bis.1 (critère 11) ; réadmission (critère 12).
+- Risque : moyen. Corrige aussi un défaut IPv4 existant (deux vérités sur le VIP en cas de collision).
 
 **T15 — MTU et MSS par famille**
 - Fichiers : `crates/aether/src/mtu.rs`, `crates/heliosd/src/orchestrator/probes.rs`.
