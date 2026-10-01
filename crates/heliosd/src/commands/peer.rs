@@ -67,8 +67,15 @@ pub(crate) fn peer_command(mut network: NetworkConfig, command: PeerCommand) -> 
                 minimum_mode,
                 key_negotiation_pq_certificate_sha256.is_some(),
             );
-            let peer = helios_provisioning::admit_with_key_negotiation(
+            // No live table here: this process only knows the file, and the
+            // data plane belongs to the daemon. The collision view still
+            // holds every declared peer, which is what the live table mirrors;
+            // what it can miss is a peer just removed from the file that the
+            // daemon has not dropped yet, and the daemon's reload of this
+            // very file drops it before installing the new one.
+            let admission = helios_provisioning::admit_with_key_negotiation(
                 &mut network,
+                &[],
                 &name,
                 &public_key,
                 admin,
@@ -77,18 +84,40 @@ pub(crate) fn peer_command(mut network: NetworkConfig, command: PeerCommand) -> 
                 minimum_mode,
             )
             .map_err(|e| anyhow::anyhow!("admission refused: {e}"))?;
-            network
-                .save()
-                .context("writing the network configuration")?;
-            if let Some(queued) = queued {
-                certificates::queue_admission(
-                    &helios_provisioning::certificates::CertificateRegistry::path(),
-                    &queued,
-                )
-                .context("queueing the peer's first certificate generation")?;
+            let peer = &admission.peer;
+            if admission.changed_config() {
+                network
+                    .save()
+                    .context("writing the network configuration")?;
             }
-            println!("{}\t{}", peer.name, peer.address);
-            info!("peer admitted — a running heliosd applies it within seconds, without restart");
+            // Only a first admission queues a certificate generation: a
+            // readmitted peer already has one, and queueing it again would
+            // replace the registry's renewal state for that peer.
+            if admission.outcome == helios_provisioning::AdmissionOutcome::Admitted {
+                if let Some(queued) = queued {
+                    certificates::queue_admission(
+                        &helios_provisioning::certificates::CertificateRegistry::path(),
+                        &queued,
+                    )
+                    .context("queueing the peer's first certificate generation")?;
+                }
+            }
+            match peer.address_v6 {
+                Some(v6) => println!("{}\t{}\t{v6}", peer.name, peer.address),
+                None => println!("{}\t{}", peer.name, peer.address),
+            }
+            match admission.outcome {
+                helios_provisioning::AdmissionOutcome::Admitted => info!(
+                    "peer admitted — a running heliosd applies it within seconds, without restart"
+                ),
+                helios_provisioning::AdmissionOutcome::Ipv6Added => info!(
+                    "peer already admitted — IPv6 VIP added, IPv4 VIP unchanged; a running \
+                     heliosd applies it within seconds"
+                ),
+                helios_provisioning::AdmissionOutcome::Unchanged => {
+                    info!("peer already admitted with this identity — nothing changed")
+                }
+            }
             Ok(())
         }
         PeerCommand::Remove { name } => {
