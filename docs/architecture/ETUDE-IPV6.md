@@ -752,7 +752,9 @@ Avancement sur `feature/support-ipv6` (1er octobre 2026) :
 | T08 | fusionné | cible avec T17 : sources `::ffff:` sur socket `[::]` |
 | T06 | fusionné | accepter des pairs Meshnet IPv6 exige de couvrir un préfixe global du lien WAN, puis un essai sur cible |
 | T09 | fusionné | `heliosd run` refuse désormais une `wg_address` sans hôte IPv4 au lieu de basculer sur loopback |
-| T07, T10–T23 | à faire | T11 couvre désormais l'IPAM unifié IPv4 + IPv6 |
+| T07 | fusionné | — |
+| T10 | fusionné | un changement de `wg_address_v6` est refusé à chaud (API 409, rechargement ignoré avec avertissement) ; commande de génération du préfixe à créer |
+| T11–T23 | à faire | T11 couvre l'IPAM unifié IPv4 + IPv6 |
 
 **T00 — Spécification A : modèle d'adressage IPv6**
 - Fichiers : [`docs/specification/ADRESSAGE-IPV6.md`](../specification/ADRESSAGE-IPV6.md), index `docs/README.md`.

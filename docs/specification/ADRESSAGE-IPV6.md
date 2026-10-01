@@ -1,7 +1,7 @@
 # Spécification — modèle d'adressage IPv6 du tunnel
 
 **Statut** : proposée le 30 septembre 2026, **validée par l'opérateur le
-1er octobre 2026**, non implémentée. La validation porte aussi sur l'IPAM
+1er octobre 2026**, en cours d'implémentation sur `feature/support-ipv6` (§4 et §5 livrés par T07 et T10). La validation porte aussi sur l'IPAM
 unifié du §3 bis, qui absorbe une partie du chantier « IPAM / adressage
 unifié ». Elle fixe
 les décisions d'adressage que l'étude
