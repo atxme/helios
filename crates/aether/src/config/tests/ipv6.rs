@@ -419,3 +419,24 @@ fn duplicating_a_configuration_carries_the_ipv6_addresses() {
     assert_eq!(copy.peers[0].address_v6, original.peers[0].address_v6);
     assert_eq!(copy, original);
 }
+
+/// What provisioning returns is read here, from the declared pair: both
+/// families as written, and an unreadable IPv4 refused rather than guessed
+/// (`ADRESSAGE-IPV6.md` §3 bis.2, rule 4).
+#[test]
+fn a_peer_reads_back_the_vips_it_was_admitted_with() {
+    let config = dual_stack();
+    assert_eq!(
+        config.peers[0].vips(),
+        Ok(crate::net::PeerVips {
+            v4: "100.64.98.223".parse().expect("IPv4"),
+            v6: Some(host("fd3c:91a2:7e04:0:8a1f:3b2c:9d40:e517")),
+        })
+    );
+    assert_eq!(config.peers[1].vips().map(|vips| vips.v6), Ok(None));
+
+    for unreadable in ["", "100.64.98.223", "100.64.98.0/24", "fd3c::5/128"] {
+        let peer = peer("laptop", "cle-laptop", unreadable, None);
+        assert!(peer.vips().is_err(), "{unreadable:?} accepted");
+    }
+}

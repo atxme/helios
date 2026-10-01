@@ -275,6 +275,7 @@ mod tests {
             kem_ciphertext: ciphertext,
             gateway_nonce,
             assigned_address: "100.64.1.2/32".into(),
+            assigned_address_v6: None,
             gateway_wg_public_key: GATEWAY_PUB.into(),
             psk_lifetime_secs: 3600,
         };
@@ -327,6 +328,7 @@ mod tests {
             kem_ciphertext: ciphertext,
             gateway_nonce: [0; NONCE_LEN],
             assigned_address: "100.64.1.2/32".into(),
+            assigned_address_v6: None,
             // A different identity than the one expected by the profile.
             gateway_wg_public_key: "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=".into(),
             psk_lifetime_secs: 3600,
@@ -347,6 +349,7 @@ mod tests {
             kem_ciphertext: vec![0u8; 10],
             gateway_nonce: [0; NONCE_LEN],
             assigned_address: "100.64.1.2/32".into(),
+            assigned_address_v6: None,
             gateway_wg_public_key: GATEWAY_PUB.into(),
             psk_lifetime_secs: 3600,
         };

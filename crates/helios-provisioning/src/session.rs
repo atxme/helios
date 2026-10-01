@@ -13,15 +13,19 @@
 //! reach this code. Admission is **out of band** (see [`crate`] and
 //! `aether::enroll`): here, an unknown peer is refused with
 //! [`EnrollError::UnknownPeer`] rather than enrolled on the fly.
-
-use std::net::Ipv4Addr;
+//!
+//! It does not choose an address either. The IPAM runs at admission, and
+//! only there; this session returns the VIPs admission persisted
+//! (`ADRESSAGE-IPV6.md` §3 bis.2, rule 4). Deriving them again here is what
+//! once let provisioning announce one address while the gateway routed
+//! another.
 
 use aether::enroll::{
     derive_psk, EnrollError, ProvisionRequest, ProvisionResponse, Psk, NONCE_LEN, PROTOCOL_VERSION,
 };
+use aether::net::{AddressError, PeerVips};
 use aether::pq::{Kem, MlKem1024Kem};
-
-use crate::ipam::{assign_vip, PeerTable, MAX_VIP_PROBES};
+use aether::NetworkConfig;
 
 /// Default PSK validity duration, in seconds (1 hour).
 ///
@@ -32,11 +36,22 @@ pub const DEFAULT_PSK_LIFETIME_SECS: u32 = 3600;
 
 /// The registry of admitted peers, on the gateway side.
 ///
-/// Admission is out of band: this interface only *queries*. A typical
-/// implementation reads the `peers` list from `network.toml`.
+/// Admission is out of band: this interface only *queries*. The gateway's
+/// implementation is the `peers` list of `network.toml`, through
+/// [`NetworkConfig`].
 pub trait AdmittedPeers {
-    /// Has this peer been admitted (WireGuard public key, base64)?
-    fn is_admitted(&self, wg_public_key: &str) -> bool;
+    /// The VIPs persisted for the admitted peer holding this WireGuard public
+    /// key (base64), or `None` when no admitted peer holds it.
+    fn declared_vips(&self, wg_public_key: &str) -> Option<Result<PeerVips, AddressError>>;
+}
+
+impl AdmittedPeers for NetworkConfig {
+    fn declared_vips(&self, wg_public_key: &str) -> Option<Result<PeerVips, AddressError>> {
+        self.peers
+            .iter()
+            .find(|peer| peer.public_key == wg_public_key)
+            .map(aether::WgPeer::vips)
+    }
 }
 
 /// Result of a successful session.
@@ -46,8 +61,8 @@ pub struct Provisioned {
     pub response: ProvisionResponse,
     /// PSK to install on the WireGuard peer, gateway side. **Secret.**
     pub psk: Psk,
-    /// VIP retained for this peer.
-    pub address: Ipv4Addr,
+    /// The VIPs persisted for this peer, as announced in `response`.
+    pub vips: PeerVips,
 }
 
 /// The gateway's invariant parameters for a session.
@@ -63,38 +78,36 @@ pub struct GatewayIdentity<'a> {
 /// `gateway_nonce` is injected rather than drawn here: this makes the
 /// function deterministic and therefore testable end to end. In production,
 /// the caller draws it from the OS's CSPRNG — see [`fresh_nonce`].
-pub fn handle_request<P, T>(
+pub fn handle_request<P>(
     request: &ProvisionRequest,
     gateway: &GatewayIdentity<'_>,
     admitted: &P,
-    peers: &T,
     gateway_nonce: [u8; NONCE_LEN],
 ) -> Result<Provisioned, EnrollError>
 where
     P: AdmittedPeers,
-    T: PeerTable,
 {
     // 1. Structural validation before any costly or secret operation.
     request.validate()?;
 
-    // 2. Admission is a prerequisite, not a side effect of this session.
-    if !admitted.is_admitted(&request.client_wg_public_key) {
-        return Err(EnrollError::UnknownPeer);
-    }
+    // 2. Admission is a prerequisite, not a side effect of this session, and
+    //    it is what fixed the peer's VIPs: they are read back, not derived.
+    //    The gateway's `AllowedIPs` carry these very addresses, so announcing
+    //    anything else would hand the client an address its traffic is
+    //    dropped from.
+    let vips = match admitted.declared_vips(&request.client_wg_public_key) {
+        None => return Err(EnrollError::UnknownPeer),
+        Some(Err(_)) => return Err(EnrollError::UndeclaredAddress),
+        Some(Ok(vips)) => vips,
+    };
 
-    // 3. VIP derived from the client's WireGuard public key: stable across
-    //    sessions and restarts, with no state on disk.
-    let pubkey_bytes = decode_wg_key(&request.client_wg_public_key)?;
-    let address =
-        assign_vip(peers, &pubkey_bytes, MAX_VIP_PROBES).map_err(|_| EnrollError::UnknownPeer)?;
-
-    // 4. ML-KEM encapsulation towards the client's ephemeral key. It is the
+    // 3. ML-KEM encapsulation towards the client's ephemeral key. It is the
     //    gateway that encapsulates: the secret's freshness therefore does
     //    not depend on a potentially compromised client.
     let (ciphertext, kem_secret) = MlKem1024Kem::encapsulate(&request.kem_public_key)
         .map_err(|_| EnrollError::BadKemPublicKey(request.kem_public_key.len()))?;
 
-    // 5. PSK bound to both nonces and both identities.
+    // 4. PSK bound to both nonces and both identities.
     let psk = derive_psk(
         &kem_secret,
         &request.client_nonce,
@@ -108,28 +121,14 @@ where
             protocol_version: PROTOCOL_VERSION,
             kem_ciphertext: ciphertext,
             gateway_nonce,
-            assigned_address: format!("{address}/32"),
+            assigned_address: vips.address(),
+            assigned_address_v6: vips.address_v6(),
             gateway_wg_public_key: gateway.wg_public_key.to_string(),
             psk_lifetime_secs: gateway.psk_lifetime_secs,
         },
         psk,
-        address,
+        vips,
     })
-}
-
-/// Decodes a base64 WireGuard public key into its 32 raw bytes.
-///
-/// These are the bytes — not the base64 string — that feed the IPAM: VIP
-/// derivation must be independent of the encoding.
-fn decode_wg_key(b64: &str) -> Result<Vec<u8>, EnrollError> {
-    use base64::Engine as _;
-    let raw = base64::engine::general_purpose::STANDARD
-        .decode(b64.trim())
-        .map_err(|_| EnrollError::MissingClientKey)?;
-    if raw.len() != 32 {
-        return Err(EnrollError::MissingClientKey);
-    }
-    Ok(raw)
 }
 
 /// Draws a session nonce from the approved DRBG.
@@ -146,28 +145,36 @@ pub fn fresh_nonce() -> [u8; NONCE_LEN] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipam::derive_cgnat_ip;
     use aether::enroll::PROTOCOL_VERSION;
-    use std::collections::HashSet;
-
-    struct Registry(HashSet<String>);
-    impl AdmittedPeers for Registry {
-        fn is_admitted(&self, k: &str) -> bool {
-            self.0.contains(k)
-        }
-    }
-
-    struct EmptyTable;
-    impl PeerTable for EmptyTable {
-        fn is_taken_by_other(&self, _: Ipv4Addr, _: &[u8]) -> bool {
-            false
-        }
-    }
 
     const CLIENT_KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
     const GATEWAY_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    /// Deliberately not the VIP the IPAM derives for `CLIENT_KEY`: what
+    /// provisioning returns must come from the declaration.
+    const DECLARED: &str = "100.64.1.2/32";
 
-    fn registry() -> Registry {
-        Registry(HashSet::from([CLIENT_KEY.to_string()]))
+    fn peer(address: &str, address_v6: Option<&str>) -> aether::WgPeer {
+        aether::WgPeer {
+            name: "workstation".into(),
+            public_key: CLIENT_KEY.into(),
+            address: address.into(),
+            address_v6: address_v6.map(|text| text.parse().expect("IPv6 host")),
+            admin: false,
+            preshared_key: None,
+            key_negotiation_certificate_sha256: None,
+            key_negotiation_pq_certificate_sha256: None,
+            minimum_key_negotiation_mode: aether::key_negotiation::ProtectionMode::Classic,
+            persistent_keepalive_secs: aether::config::DEFAULT_PERSISTENT_KEEPALIVE_SECS,
+        }
+    }
+
+    /// The gateway's admission registry: `network.toml`'s peer table.
+    fn registry() -> NetworkConfig {
+        NetworkConfig {
+            peers: vec![peer(DECLARED, None)],
+            ..NetworkConfig::default()
+        }
     }
 
     fn gateway() -> GatewayIdentity<'static> {
@@ -202,7 +209,7 @@ mod tests {
         let gw_nonce = [7u8; NONCE_LEN];
 
         // ── Gateway side ──
-        let out = handle_request(&req, &gateway(), &registry(), &EmptyTable, gw_nonce).unwrap();
+        let out = handle_request(&req, &gateway(), &registry(), gw_nonce).unwrap();
         out.response.validate().unwrap();
 
         // ── Client side: decapsulates and derives independently ──
@@ -223,26 +230,70 @@ mod tests {
         );
     }
 
+    /// §3 bis.2, rule 4: the announced address is the persisted one, even
+    /// when the derivation would have chosen another — as it does after a
+    /// collision resolved at admission.
     #[test]
-    fn the_vip_is_stable_across_two_sessions() {
+    fn provisioning_returns_the_declared_vip_not_a_derived_one() {
+        assert_ne!(
+            format!("{}/32", derive_cgnat_ip(&[1u8; 32], 0)),
+            DECLARED,
+            "the test needs a declaration the derivation would not produce"
+        );
         let (_, _, req1) = client_request();
         let (_, _, req2) = client_request();
-        let a =
-            handle_request(&req1, &gateway(), &registry(), &EmptyTable, [1; NONCE_LEN]).unwrap();
-        let b =
-            handle_request(&req2, &gateway(), &registry(), &EmptyTable, [2; NONCE_LEN]).unwrap();
+        let a = handle_request(&req1, &gateway(), &registry(), [1; NONCE_LEN]).unwrap();
+        let b = handle_request(&req2, &gateway(), &registry(), [2; NONCE_LEN]).unwrap();
+
+        assert_eq!(a.response.assigned_address, DECLARED);
+        assert_eq!(a.vips.address(), DECLARED);
+        assert_eq!(a.vips, b.vips, "the VIP does not depend on the session");
         assert_eq!(
-            a.address, b.address,
-            "the VIP derives from the key, not from the session"
+            a.response.assigned_address_v6, None,
+            "a peer without an IPv6 VIP announces none"
         );
-        assert!(a.response.assigned_address.ends_with("/32"));
+    }
+
+    #[test]
+    fn provisioning_returns_the_declared_ipv6_vip() {
+        const DECLARED_V6: &str = "fd3c:91a2:7e04:0:8a1f:3b2c:9d40:e517";
+        let registry = NetworkConfig {
+            peers: vec![peer(DECLARED, Some(DECLARED_V6))],
+            ..NetworkConfig::default()
+        };
+        let (_, _, req) = client_request();
+        let out = handle_request(&req, &gateway(), &registry, [1; NONCE_LEN]).unwrap();
+
+        assert_eq!(out.response.assigned_address, DECLARED);
+        assert_eq!(
+            out.response.assigned_address_v6.as_deref(),
+            Some(format!("{DECLARED_V6}/128").as_str())
+        );
+    }
+
+    /// A peer admitted without a readable address is a named error, not an
+    /// occasion to derive one.
+    #[test]
+    fn an_admitted_peer_without_a_readable_address_is_refused() {
+        for unreadable in ["", "100.64.1.2", "100.64.1.0/24"] {
+            let registry = NetworkConfig {
+                peers: vec![peer(unreadable, None)],
+                ..NetworkConfig::default()
+            };
+            let (_, _, req) = client_request();
+            assert_eq!(
+                handle_request(&req, &gateway(), &registry, [0; NONCE_LEN]).unwrap_err(),
+                EnrollError::UndeclaredAddress,
+                "{unreadable:?}"
+            );
+        }
     }
 
     #[test]
     fn two_sessions_yield_different_psks() {
         let (_, _, req) = client_request();
-        let a = handle_request(&req, &gateway(), &registry(), &EmptyTable, [1; NONCE_LEN]).unwrap();
-        let b = handle_request(&req, &gateway(), &registry(), &EmptyTable, [2; NONCE_LEN]).unwrap();
+        let a = handle_request(&req, &gateway(), &registry(), [1; NONCE_LEN]).unwrap();
+        let b = handle_request(&req, &gateway(), &registry(), [2; NONCE_LEN]).unwrap();
         assert_ne!(*a.psk, *b.psk, "every session must produce a fresh PSK");
     }
 
@@ -251,7 +302,7 @@ mod tests {
     fn unadmitted_peer_refused() {
         let (_, _, mut req) = client_request();
         req.client_wg_public_key = "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=".into();
-        let err = handle_request(&req, &gateway(), &registry(), &EmptyTable, [0; NONCE_LEN]);
+        let err = handle_request(&req, &gateway(), &registry(), [0; NONCE_LEN]);
         assert_eq!(err.unwrap_err(), EnrollError::UnknownPeer);
     }
 
@@ -260,7 +311,7 @@ mod tests {
         let (_, _, mut req) = client_request();
         req.protocol_version = 99;
         assert!(matches!(
-            handle_request(&req, &gateway(), &registry(), &EmptyTable, [0; NONCE_LEN]),
+            handle_request(&req, &gateway(), &registry(), [0; NONCE_LEN]),
             Err(EnrollError::VersionMismatch { .. })
         ));
     }
@@ -270,7 +321,7 @@ mod tests {
         let (_, _, mut req) = client_request();
         req.kem_public_key = vec![0u8; 10];
         assert!(matches!(
-            handle_request(&req, &gateway(), &registry(), &EmptyTable, [0; NONCE_LEN]),
+            handle_request(&req, &gateway(), &registry(), [0; NONCE_LEN]),
             Err(EnrollError::BadKemPublicKey(10))
         ));
     }
