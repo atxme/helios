@@ -72,7 +72,7 @@ Les nouveaux concepts structurés sont :
 | `split_tunnel_cidrs` | `kill_switch::state_gated_openings` | `DestNet` | famille réseau + masque + `Cmp` |
 | `mss_clamp` | policy runtime, acceptée seulement si le backend l’annonce | `Ruleset::mss_clamp` si trafic autorisé | capacité non annoncée par Netlink ; refus défensif avant envoi |
 | `captive_portal_gateway` | `kill_switch::state_gated_openings` | WAN, destination, TCP 80/443 | `Meta`, famille réseau, `Payload`, `Cmp` |
-| `nordvpn_meshnet` | `meshnet::nordvpn_meshnet` | marque, interface, pairs, ports, ICMPv4 | `Meta`, famille réseau, `Payload`, `Cmp` |
+| `nordvpn_meshnet` | `meshnet::nordvpn_meshnet` | marque, interface, pairs, ports ; `Icmp` et drops des réseaux locaux de la famille du pair (`PRIVATE_IPV4_CIDRS` ou `PRIVATE_IPV6_CIDRS`) avant ses accepts | `Meta`, famille réseau, `Payload`, `Cmp` |
 
 Les invariants sans champ de configuration sont compilés directement :
 
@@ -133,6 +133,30 @@ site-to-site et, en portail captif sans passerelle connue, le `forward`
 HTTP/HTTPS vers le WAN. Les contournements `split_tunnel_cidrs` et les règles
 Meshnet nomment une adresse et reçoivent déjà la garde de sa famille. La
 restriction du masquerade à `iifname wg_iface` reste une décision ouverte.
+
+### Réseaux locaux Meshnet par famille
+
+Un pair Meshnet routant sans la permission « réseau local » reçoit, avant ses
+accepts, un `drop` vers chaque réseau local **de sa propre famille** :
+`PRIVATE_IPV4_CIDRS` (`10.0.0.0/8`, `169.254.0.0/16`, `172.16.0.0/12`,
+`192.168.0.0/16`) pour un pair IPv4, `PRIVATE_IPV6_CIDRS` (`fc00::/7`,
+`fe80::/10`) pour un pair IPv6. Un drop qui associerait une source IPv6 à une
+destination IPv4 ne correspondrait à aucun paquet, et l’accept suivant ouvrirait
+les réseaux locaux IPv6. L’ouverture ICMP suit de même la famille du pair
+(`Icmp(Ipv4)` ou `Icmp(Ipv6)`). Le rendu IPv4 est inchangé, golden compris.
+
+Ce chemin IPv6 n’est atteignable qu’en construisant la `FirewallPolicy` dans le
+code : `aether` refuse toujours un CIDR Meshnet IPv6 (`valid_ipv4_cidr`), car
+NordVPN attribue des adresses Meshnet IPv4. `ruleset/tests/meshnet_ipv6.rs`
+couvre ces politiques hors du balayage de `ipv6_relay.rs`, qui porte sur ce
+qu’une configuration validée produit ; le test Netlink correspondant vérifie la
+traduction IPv6 des deux adresses, chacune derrière `meta nfproto ipv6`.
+
+Limite connue : la liste IPv6 ne contient que les portées ULA et lien-local.
+Un préfixe global sur le lien du WAN n’en fait pas partie, alors que son
+équivalent IPv4 est le plus souvent RFC 1918 et donc refusé. Accepter des pairs
+Meshnet IPv6 dans la configuration demande de trancher ce point et un essai sur
+cible d’un pair routant en IPv6.
 
 ## Contrôle IPv6 des liens : ND, RA, MLD, DHCPv6
 
@@ -228,7 +252,7 @@ séquence exacte des expressions d’une règle NS.
 | compteurs inline | **SUPPORTED** | appliqués sur les drops invalides |
 | compteurs nommés | **BLOCKED BY BACKEND** | identité conservée dans l’IR ; pas d’objet compteur ni `objref` dans `rustables` |
 | ICMPv4 | **SUPPORTED** | famille explicite, règle tunnel et Meshnet, protocole Netlink 1 |
-| ICMPv6 | **SUPPORTED** | famille explicite, règle tunnel, protocole Netlink 58 ; pas d’IPAM IPv6 ajouté |
+| ICMPv6 | **SUPPORTED** | famille explicite, règle tunnel et Meshnet (pair IPv6, politique construite dans le code), protocole Netlink 58 ; pas d’IPAM IPv6 ajouté |
 | types ICMPv6 | **SUPPORTED** | `Match::Icmpv6Type`, énumération fermée (ND, RS/RA, MLD) ; `Meta(L4Proto)` + `Cmp` 58, `Payload` transport offset 0 longueur 1 + `Cmp` |
 | types ICMPv4 | **PARTIAL** | protocole seulement ; l’API haut niveau de `rustables` n’expose pas l’octet de type ICMPv4 et aucun encodeur vérifié n’existe |
 | hop limit IPv6 | **SUPPORTED** | `Match::Ipv6HopLimit`, garde `Meta(NfProto)` + `Cmp` 10 puis `Payload` réseau offset 7 longueur 1 + `Cmp` |
