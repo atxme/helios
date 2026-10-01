@@ -441,7 +441,7 @@ async fn require_json_for_mutations(request: Request<Body>, next: Next) -> Respo
 }
 
 /// Launches the HTTP server and blocks until it stops.
-pub async fn serve(state: AppState, bind: &str) -> anyhow::Result<()> {
+pub async fn serve(state: AppState, bind: std::net::SocketAddr) -> anyhow::Result<()> {
     let app = router(state.clone());
 
     let listener = tokio::net::TcpListener::bind(bind).await?;

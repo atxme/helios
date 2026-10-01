@@ -45,12 +45,11 @@ const UDP_END_GAP: Duration = Duration::from_millis(20);
 /// sits between the socket and the byte counter.
 pub async fn serve_raw(
     state: AppState,
-    bind: &str,
+    bind: SocketAddr,
     shutdown: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
-    let bind = bind.to_string();
     let handle = tokio::runtime::Handle::current();
-    tokio::task::spawn_blocking(move || serve_raw_blocking(state, &bind, handle, shutdown))
+    tokio::task::spawn_blocking(move || serve_raw_blocking(state, bind, handle, shutdown))
         .await
         .map_err(|error| anyhow::anyhow!("raw speedtest task stopped: {error}"))??;
     Ok(())
@@ -58,7 +57,7 @@ pub async fn serve_raw(
 
 fn serve_raw_blocking(
     state: AppState,
-    bind: &str,
+    bind: SocketAddr,
     runtime: tokio::runtime::Handle,
     shutdown: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
@@ -756,7 +755,7 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let served = tokio::spawn(serve_raw(
             test_state(),
-            "127.0.0.1:0",
+            SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)),
             Arc::clone(&shutdown),
         ));
         tokio::time::sleep(Duration::from_millis(50)).await;

@@ -150,7 +150,10 @@ rather than writing those keys in clear.
 
 The API listens on the host address of `wg_address` once the gateway is ready,
 otherwise on `127.0.0.1:8080`. nftables limits remote access to `admin_iface`.
-It never brings the initial tunnel up.
+It never brings the initial tunnel up. That host must be an IPv4 address: a
+ready gateway whose `wg_address` names no IPv4 host (malformed, or IPv6) stops
+`heliosd run` at startup instead of moving the API and the speedtest to
+loopback, and `heliosd status` prints the reason.
 
 - state and rule reads carry no secret;
 - `GET /api/network` returns a dedicated view that only says **whether** a

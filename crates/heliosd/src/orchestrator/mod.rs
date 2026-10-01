@@ -424,7 +424,12 @@ pub fn status(network: &NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
         if dry_run { "dry-run" } else { "real" }
     );
     println!("  transport    : WireGuard UDP {WG_PORT}");
-    println!("  web interface: http://{}", network.api_bind());
+    // Printed rather than propagated: a diagnostic command must still print
+    // the rest, and the reason is what `run` would stop on.
+    match network.api_bind() {
+        Ok(bind) => println!("  web interface: http://{bind}"),
+        Err(error) => println!("  web interface: none ({error})"),
+    }
     println!("  WAN          : {}", network.wan_ifaces.join(", "));
     println!("  LAN          : {:?}", network.lan_ifaces);
     println!(
