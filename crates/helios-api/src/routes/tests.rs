@@ -22,6 +22,7 @@ fn network() -> NetworkConfig {
             name: "test-workstation".into(),
             public_key: PEER_KEY.into(),
             address: "100.64.1.2/32".into(),
+            address_v6: None,
             admin: true,
             preshared_key: Some("pq-secret-must-not-leak".into()),
             key_negotiation_certificate_sha256: None,

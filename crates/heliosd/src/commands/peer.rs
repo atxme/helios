@@ -209,6 +209,7 @@ mod tests {
                 name: "portable".into(),
                 public_key: "public".into(),
                 address: "100.64.1.2/32".into(),
+                address_v6: None,
                 admin: true,
                 preshared_key: Some("secret".into()),
                 key_negotiation_certificate_sha256: None,

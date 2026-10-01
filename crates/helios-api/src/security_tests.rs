@@ -29,6 +29,7 @@ fn state_with_mode(dry_run: bool) -> (AppState, mpsc::Receiver<OrchestratorCmd>)
             name: "workstation".into(),
             public_key: "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=".into(),
             address: "100.64.1.2/32".into(),
+            address_v6: None,
             admin: true,
             preshared_key: Some(PEER_PSK.into()),
             key_negotiation_certificate_sha256: None,

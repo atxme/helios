@@ -35,6 +35,7 @@ fn configured_network() -> NetworkConfig {
             name: "poste-test".into(),
             public_key: PEER_KEY.into(),
             address: "100.64.1.2/32".into(),
+            address_v6: None,
             admin: false,
             preshared_key: Some("psk-test".into()),
             key_negotiation_certificate_sha256: None,

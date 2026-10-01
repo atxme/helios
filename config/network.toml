@@ -64,6 +64,14 @@ wg_private_key = ""
 # d'entreprise (10/8).
 wg_address = "100.64.0.1/10"
 
+# Optionnel : préfixe IPv6 du tunnel, un ULA `/64` dont la gateway est `::1`
+# (docs/specification/ADRESSAGE-IPV6.md §2.4). Absent, la gateway reste en IPv4
+# seule, exactement comme avant. Le Global ID (les 40 bits après `fd`) est tiré
+# au hasard une fois, puis conservé : le changer renumérote l'IPv6 de tous les
+# pairs, et ne s'applique qu'au redémarrage de heliosd. Chaque pair peut alors
+# porter `address_v6 = "<préfixe>:…/128"`, dans ce préfixe.
+# wg_address_v6 = "fdXX:XXXX:XXXX::1/64"   ← X : chiffres hexadécimaux tirés au hasard
+
 # Port UDP d'écoute. C'est la seule ouverture entrante du modèle fail-closed.
 wg_listen_port = 51820
 

@@ -257,7 +257,7 @@ impl PeerVips {
 
     /// The persisted `address_v6`, `…/128`, when the peer has one.
     pub fn address_v6(&self) -> Option<String> {
-        self.v6.map(|v6| format!("{v6}/128"))
+        self.v6.map(format_vip_v6)
     }
 
     /// Checks the IPv6 VIP against the gateway's prefix (§5.2).
@@ -307,6 +307,12 @@ pub fn parse_vip_v6(text: &str) -> Result<Ipv6Addr, AddressError> {
         });
     }
     Ok(addr)
+}
+
+/// Writes a peer's IPv6 VIP as it is persisted: `…/128`, in the RFC 5952
+/// form `std` renders, the inverse of [`parse_vip_v6`].
+pub fn format_vip_v6(vip: Ipv6Addr) -> String {
+    format!("{vip}/128")
 }
 
 /// The form a network source must take before it is compared or counted.

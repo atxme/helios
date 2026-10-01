@@ -392,6 +392,7 @@ mod tests {
                 name: "workstation".into(),
                 public_key: client_public_key(),
                 address: "100.64.1.2/32".into(),
+                address_v6: None,
                 admin: false,
                 preshared_key: None,
                 key_negotiation_certificate_sha256: None,

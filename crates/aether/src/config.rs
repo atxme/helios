@@ -1,6 +1,6 @@
 use std::{
     collections::HashSet,
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4},
     path::PathBuf,
 };
 
@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::secret::SecretString;
 
 use crate::error::{HeliosError, Result};
+use crate::net::{format_vip_v6, parse_vip_v6, AddressError, TunnelPrefixV6};
 use crate::policy::{FirewallPolicy, NordvpnMeshnetPolicy, PolicyMode};
 use crate::speedtest::SPEEDTEST_PORT;
 
@@ -55,6 +56,43 @@ where
         OneOrMany::One(name) => vec![name],
         OneOrMany::Many(names) => names,
     })
+}
+
+/// Reads the optional `wg_address_v6` through [`TunnelPrefixV6`].
+///
+/// A refused prefix fails the whole read, like any malformed key, and the
+/// message names the key: TOML shows the offending line, but a JSON body
+/// (`POST /api/network`) reports only a position.
+fn de_wg_address_v6<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<TunnelPrefixV6>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let Some(text) = Option::<String>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    text.parse().map(Some).map_err(|error: AddressError| {
+        serde::de::Error::custom(format!("wg_address_v6 `{text}`: {error}"))
+    })
+}
+
+/// Reads a peer's optional `address_v6`: one host, written `…/128` (§2.3 of
+/// `ADRESSAGE-IPV6.md`), through [`parse_vip_v6`].
+///
+/// The shape is the only thing a single peer's record can be checked for.
+/// Whether the address fits the gateway's prefix, and whether another peer
+/// already holds it, is [`NetworkConfig::validate`]'s business.
+fn de_address_v6<'de, D>(deserializer: D) -> std::result::Result<Option<Ipv6Addr>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let Some(text) = Option::<String>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    parse_vip_v6(&text)
+        .map(Some)
+        .map_err(|error| serde::de::Error::custom(format!("address_v6 `{text}`: {error}")))
 }
 
 /// Validates a NordVPN Meshnet peer CIDR, which must be IPv4.
@@ -221,6 +259,16 @@ pub struct NetworkConfig {
     /// Gateway's address in the tunnel network (CGNAT, ADR-001 §4).
     #[serde(default = "default_wg_address")]
     pub wg_address: String,
+    /// Gateway's IPv6 tunnel prefix, `fdXX:XXXX:XXXX::1/64`
+    /// (`ADRESSAGE-IPV6.md` §2.4). Optional.
+    ///
+    /// Absent, the gateway behaves exactly as without IPv6, and nothing about
+    /// it is written back (§2.2, §5.1). Present, it is drawn once and then
+    /// kept: it is never regenerated, never derived from the gateway key
+    /// (§2.5). Changing it renumbers every peer's IPv6 VIP, so it applies at
+    /// startup only (§5.4).
+    #[serde(default, deserialize_with = "de_wg_address_v6")]
+    pub wg_address_v6: Option<TunnelPrefixV6>,
     /// UDP listen port.
     #[serde(default = "default_wg_port")]
     pub wg_listen_port: u16,
@@ -349,6 +397,15 @@ pub struct WgPeer {
     /// Assigned VIP, in CIDR notation (e.g. `100.64.1.2/32`).
     /// In WireGuard, `AllowedIPs` **is** the cryptographic routing table.
     pub address: String,
+    /// Assigned IPv6 VIP, one host inside [`NetworkConfig::wg_address_v6`]
+    /// (`ADRESSAGE-IPV6.md` §2.3). Optional.
+    ///
+    /// Persisted as `address_v6 = "…/128"`. A host rather than text: a
+    /// non-`/128` value is refused when the file is read and cannot be built
+    /// in code. Public configuration, not a secret: a reload takes it from
+    /// the file, like [`Self::address`].
+    #[serde(default, deserialize_with = "de_address_v6")]
+    pub address_v6: Option<Ipv6Addr>,
     /// Authorizes this peer to mutate the control plane and drive updates.
     /// The peer remains an ordinary WireGuard client.
     #[serde(default)]
@@ -418,6 +475,10 @@ struct PersistedNetworkConfig<'a> {
     wg_iface: &'a str,
     wg_private_key: &'a str,
     wg_address: &'a str,
+    /// Written only when present: a file without IPv6 must come back
+    /// byte for byte (`ADRESSAGE-IPV6.md` §5.1).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wg_address_v6: Option<TunnelPrefixV6>,
     wg_listen_port: u16,
     key_negotiation_port: Option<u16>,
     peers: Vec<PersistedWgPeer<'a>>,
@@ -442,6 +503,9 @@ struct PersistedWgPeer<'a> {
     name: &'a str,
     public_key: &'a str,
     address: &'a str,
+    /// Written only when present, for the same reason as `wg_address_v6`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    address_v6: Option<String>,
     admin: bool,
     key_negotiation_certificate_sha256: &'a Option<String>,
     key_negotiation_pq_certificate_sha256: &'a Option<String>,
@@ -486,6 +550,7 @@ impl<'a> PersistedNetworkConfig<'a> {
                 ""
             },
             wg_address: &config.wg_address,
+            wg_address_v6: config.wg_address_v6,
             wg_listen_port: config.wg_listen_port,
             key_negotiation_port: config.key_negotiation_port,
             peers: config
@@ -495,6 +560,7 @@ impl<'a> PersistedNetworkConfig<'a> {
                     name: &peer.name,
                     public_key: &peer.public_key,
                     address: &peer.address,
+                    address_v6: peer.address_v6.map(format_vip_v6),
                     admin: peer.admin,
                     key_negotiation_certificate_sha256: &peer.key_negotiation_certificate_sha256,
                     key_negotiation_pq_certificate_sha256: &peer
@@ -527,6 +593,7 @@ impl WgPeer {
             name: self.name.clone(),
             public_key: self.public_key.clone(),
             address: self.address.clone(),
+            address_v6: self.address_v6,
             admin: self.admin,
             preshared_key: self.preshared_key.as_ref().map(SecretString::duplicate),
             key_negotiation_certificate_sha256: self.key_negotiation_certificate_sha256.clone(),
@@ -692,6 +759,7 @@ impl NetworkConfig {
             wg_iface: self.wg_iface.clone(),
             wg_private_key: self.wg_private_key.duplicate(),
             wg_address: self.wg_address.clone(),
+            wg_address_v6: self.wg_address_v6,
             wg_listen_port: self.wg_listen_port,
             key_negotiation_port: self.key_negotiation_port,
             peers: self.peers.iter().map(WgPeer::duplicate).collect(),
