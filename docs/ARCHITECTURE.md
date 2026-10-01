@@ -95,6 +95,14 @@ destroys a vanished peer's secret; `MAX_PSK_LIFETIME` (24 h) bounds a PSK's age
 on a healthy tunnel. All of it assumes a persistent keep-alive, so the gateway
 sets its own (25 s) rather than trusting one it cannot inspect.
 
+The listener is one dual-stack `[::]` UDP socket with `IPV6_V6ONLY` cleared
+(`aether_key_negotiation::dual_stack_server_endpoint`): IPv6 clients arrive
+natively and IPv4 clients as `::ffff:a.b.c.d`, which the server canonicalizes
+before counting or logging them. One socket rather than two keeps a single
+connection table, Retry key and set of budgets. A host that refuses the IPv6
+address family (`EAFNOSUPPORT`) falls back to `0.0.0.0` with a warning naming
+the reason; any other bind error still stops the service.
+
 The public QUIC port answers with three error codes only — `protocol`,
 `rejected`, `internal` — so that it cannot be used to enumerate admitted peers
 or read their floor. Its DoS bounds are Retry before any state, a budget per
@@ -102,7 +110,8 @@ IPv4 address or per IPv6 `/64` prefix (an IPv4-mapped `::ffff:a.b.c.d` source
 counts as its IPv4 address), a budget per admitted identity after
 mTLS, a 90-second absolute connection lifetime, TLS resumption and 0-RTT
 disabled on both ends, no unidirectional streams, and datagrams pinned to 1200
-bytes with MTU discovery off on both sides.
+bytes with MTU discovery off on both sides — 1248 bytes on the wire over IPv6,
+under its 1280-byte minimum link MTU.
 
 Releasing a PSK lives **inside** the tunnel, on
 `POST /api/key-negotiation/release`, and nowhere else. It is best-effort and its
