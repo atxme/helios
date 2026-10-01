@@ -141,8 +141,13 @@ impl WireGuardBackend {
 
         let mut peer = Peer::new(public_key);
 
-        peer.set_endpoint(&profile.endpoint)
+        // A literal, set as such: `Peer::set_endpoint` would run its own
+        // `getaddrinfo` and keep the first answer, which may be the other
+        // family than the address the controller chose (and, for a
+        // negotiated profile, than the one that negotiated).
+        let endpoint = crate::endpoint_resolution::literal_endpoint(&profile.endpoint)
             .map_err(|e| anyhow::anyhow!("endpoint `{}` invalide : {e}", profile.endpoint))?;
+        peer.endpoint = Some(endpoint);
 
         // Several prefixes, because `AllowedIPs` is the cryptographic routing
         // table and a split tunnel rarely reaches everything it needs through
@@ -573,6 +578,35 @@ mod tests {
         let mut p = profile();
         p.endpoint = "not-an-endpoint".into();
         assert!(WireGuardBackend::build_peer(&p).is_err());
+    }
+
+    /// The peer receives the literal as is, in either family: no resolver
+    /// is involved, so nothing can swap the address for another one.
+    #[test]
+    fn a_literal_endpoint_reaches_the_peer_unchanged() {
+        for literal in ["[2001:db8::1]:51820", "203.0.113.10:51820"] {
+            let mut p = profile();
+            p.endpoint = literal.into();
+            let peer = WireGuardBackend::build_peer(&p).unwrap();
+            assert_eq!(
+                peer.endpoint,
+                Some(literal.parse::<std::net::SocketAddr>().unwrap())
+            );
+        }
+    }
+
+    /// A name reaching the backend is a resolution the controller skipped.
+    /// It is refused rather than resolved: a second `getaddrinfo` here is
+    /// exactly what let the tunnel pick another family than the negotiation.
+    #[test]
+    fn a_hostname_endpoint_is_refused_not_resolved() {
+        let mut p = profile();
+        p.endpoint = "localhost:51820".into();
+        let error = WireGuardBackend::build_peer(&p).unwrap_err().to_string();
+        assert!(
+            error.starts_with("endpoint `localhost:51820` invalide"),
+            "{error}"
+        );
     }
 
     fn prefixes(list: &str) -> Vec<IpAddrMask> {

@@ -38,6 +38,32 @@ Un profil contient :
 - un keepalive persistant de 25 secondes par défaut ;
 - un éventuel PSK post-quantique et l’URL interne de l’API Helios.
 
+### Résolution de l’endpoint
+
+Un endpoint en FQDN est résolu **une fois** par tentative de connexion, et ses
+adresses sont ordonnées selon RFC 8305 : la famille que le résolveur du
+système place en tête (l’IPv6 sur un poste double pile), puis l’autre en
+alternance. Une adresse littérale (`[2001:db8::1]:51820`, `203.0.113.10:51820`)
+n’interroge aucun résolveur.
+
+- **Négociation de clé** : les candidats sont tentés en échelonné. Le premier
+  part aussitôt, le suivant 250 ms plus tard ou dès un échec, et le premier
+  qui obtient le challenge de la gateway l’emporte. Les autres sont annulés
+  avant toute requête signée : aucune transaction n’est ouverte pour eux.
+- **WireGuard** : le pair reçoit une adresse **littérale**, jamais le nom :
+  l’adresse qui a négocié quand les deux endpoints nomment le même hôte,
+  sinon le premier candidat de la résolution de l’endpoint WireGuard. Le
+  profil enregistré garde le nom ; seule la copie remise au plan de données
+  porte le littéral.
+
+Le journal nomme l’adresse et la famille retenues. Un candidat écarté —
+typiquement une IPv6 publiée mais injoignable depuis le réseau local,
+remplacée par l’IPv4 — y figure en avertissement, jamais en silence. Si aucun candidat ne
+répond, l’erreur nomme l’endpoint et chaque adresse essayée avec sa cause.
+Un profil classique ne peut pas faire la course : WireGuard n’accepte qu’un
+endpoint par pair, et c’est le premier candidat qui est posé. Le contrôle sur
+VM Windows est décrit dans `docs/testing/MANUAL-TESTING.md`.
+
 ### Ce qui passe par le tunnel
 
 `AllowedIPs` **est** la table de routage cryptographique de WireGuard : ce qui y

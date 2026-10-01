@@ -622,3 +622,167 @@ fn incomplete_profile_rejected_before_the_network() {
 
     assert!(profile().validate().is_ok());
 }
+
+/// Records the endpoint of every profile `up()` receives.
+#[derive(Default)]
+struct EndpointRecorder {
+    endpoints: std::sync::Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl VpnBackend for EndpointRecorder {
+    async fn up(&self, profile: &ClientProfile, _sink: &EventSink) -> anyhow::Result<()> {
+        self.endpoints
+            .lock()
+            .unwrap()
+            .push(profile.endpoint.clone());
+        Ok(())
+    }
+
+    async fn down(&self, _sink: &EventSink) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn last_handshake_age(&self) -> Option<Duration> {
+        None
+    }
+
+    fn adapter_is_up(&self) -> bool {
+        false
+    }
+
+    fn kind(&self) -> &'static str {
+        "endpoint-recorder"
+    }
+}
+
+/// Lets the connection task run to its end: classic, no URL, no PSK.
+async fn connect_classic(profile: ClientProfile) -> (Arc<EndpointRecorder>, Vec<String>) {
+    let backend = Arc::new(EndpointRecorder::default());
+    let ctrl = VpnController::new(backend.clone());
+    let (sink, lines) = logging_sink();
+    ctrl.connect(profile, sink).await;
+    if let Some(task) = ctrl.task.lock().await.take() {
+        task.await.unwrap();
+    }
+    let lines = lines.lock().unwrap().clone();
+    (backend, lines)
+}
+
+/// A literal endpoint reaches the data plane as written, in both families.
+#[tokio::test]
+async fn a_literal_endpoint_is_mounted_as_written() {
+    for literal in ["[2001:db8::1]:51820", "203.0.113.10:51820"] {
+        let mut p = profile();
+        p.endpoint = literal.into();
+        let (backend, _) = connect_classic(p).await;
+        assert_eq!(
+            *backend.endpoints.lock().unwrap(),
+            vec![literal.to_string()]
+        );
+    }
+}
+
+/// A name is resolved once by the controller, and the backend receives the
+/// literal it chose — never the name, which would be resolved a second time.
+/// `localhost` resolves from the hosts file: no network involved.
+#[tokio::test]
+async fn a_hostname_endpoint_is_mounted_as_the_literal_it_resolved_to() {
+    let mut p = profile();
+    p.endpoint = "localhost:51820".into();
+    let stored = p.clone();
+    let (backend, lines) = connect_classic(p).await;
+
+    let mounted = backend.endpoints.lock().unwrap().clone();
+    assert_eq!(mounted.len(), 1, "{mounted:?}");
+    let literal: SocketAddr = mounted[0]
+        .parse()
+        .unwrap_or_else(|_| panic!("{} is not a literal", mounted[0]));
+    assert!(literal.ip().is_loopback(), "{literal}");
+    assert_eq!(literal.port(), 51820);
+    assert_eq!(stored.endpoint, "localhost:51820");
+    let named = format!(
+        "endpoint WireGuard localhost:51820 : {} {literal} (premier candidat de sa résolution)",
+        crate::endpoint_resolution::family(&literal)
+    );
+    assert!(lines.contains(&named), "{lines:?}");
+}
+
+/// A name that cannot be resolved fails the connection explicitly, naming
+/// the endpoint, and the backend is never reached.
+#[tokio::test]
+async fn an_unresolvable_endpoint_fails_explicitly_before_the_backend() {
+    let backend = Arc::new(EndpointRecorder::default());
+    let ctrl = VpnController::new(backend.clone());
+    let errors: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+    let recorder = Arc::clone(&errors);
+    let mut p = profile();
+    // No port: refused by the resolver itself, without a DNS query.
+    p.endpoint = "not-an-endpoint".into();
+    ctrl.connect(
+        p,
+        Arc::new(move |ev: ClientEvent| {
+            if let ClientEvent::Error { message } = ev {
+                recorder.lock().unwrap().push(message);
+            }
+        }),
+    )
+    .await;
+    if let Some(task) = ctrl.task.lock().await.take() {
+        task.await.unwrap();
+    }
+
+    assert_eq!(ctrl.state(), TunnelState::Failed);
+    let errors = errors.lock().unwrap().clone();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(
+        errors[0].starts_with("échec de connexion: endpoint `not-an-endpoint` invalide"),
+        "{errors:?}"
+    );
+    assert!(backend.endpoints.lock().unwrap().is_empty());
+}
+
+/// The data-plane copy differs from the stored profile by its endpoint and
+/// nothing else, and the stored profile is left as written.
+#[test]
+fn the_data_plane_copy_only_replaces_the_endpoint() {
+    let mut stored = profile();
+    stored.endpoint = "gateway.example:51820".into();
+    stored.heliosd_url = Some("http://100.64.0.1:8080".into());
+    let copy = with_wireguard_endpoint(&stored, "[2001:db8::1]:51820".parse().unwrap());
+
+    assert_eq!(copy.endpoint, "[2001:db8::1]:51820");
+    assert_eq!(stored.endpoint, "gateway.example:51820");
+    assert_eq!(
+        format!(
+            "{:?}",
+            ClientProfile {
+                endpoint: stored.endpoint.clone(),
+                ..copy
+            }
+        ),
+        format!("{stored:?}")
+    );
+}
+
+#[test]
+fn the_wireguard_endpoint_log_names_the_family_and_its_origin() {
+    let negotiated = WireGuardEndpoint {
+        address: "203.0.113.10:51820".parse().unwrap(),
+        origin: EndpointOrigin::Negotiated,
+    };
+    assert_eq!(
+        negotiated.describe("gateway.example:51820"),
+        "endpoint WireGuard gateway.example:51820 : IPv4 203.0.113.10:51820 \
+         (l'adresse qui a négocié)"
+    );
+    let resolved = WireGuardEndpoint {
+        address: "[2001:db8::1]:51820".parse().unwrap(),
+        origin: EndpointOrigin::FirstCandidate,
+    };
+    assert_eq!(
+        resolved.describe("gateway.example:51820"),
+        "endpoint WireGuard gateway.example:51820 : IPv6 [2001:db8::1]:51820 \
+         (premier candidat de sa résolution)"
+    );
+}
