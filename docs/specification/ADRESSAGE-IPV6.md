@@ -138,7 +138,10 @@ Un candidat est rejeté, et le compteur incrémenté, si son IID est :
 
 - `0` (anycast Subnet-Router, RFC 4291) ;
 - `1` (la gateway) ;
-- `≥ 0xfdff_ffff_ffff_ff80` (anycast réservés, RFC 5453).
+- `≥ 0xfdff_ffff_ffff_ff80`. La RFC 5453 ne réserve que la plage
+  `fdff:ffff:ffff:ff80` à `fdff:ffff:ffff:ffff` (anycast de sous-réseau) ;
+  l'exclusion est volontairement plus large, d'un seul seuil, au prix de moins
+  de 1 % de l'espace. Elle est figée : la changer renumérote des pairs.
 
 ### 3.3 Collisions
 

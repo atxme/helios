@@ -1095,8 +1095,9 @@ impl NetworkConfig {
     /// the bind address: it is nftables that refuses connections coming
     /// from anywhere other than the tunnel.
     ///
-    /// Without a configured gateway, we fall back to loopback. With one, an
-    /// unusable `wg_address` is an error: see [`Self::tunnel_bind`].
+    /// Without a configured gateway, we fall back to loopback. With one, a
+    /// `wg_address` without an IPv4 host is an error rather than a silent
+    /// move to loopback (see the private `tunnel_bind`).
     pub fn api_bind(&self) -> Result<SocketAddr> {
         self.tunnel_bind(API_BIND_LOOPBACK)
     }
