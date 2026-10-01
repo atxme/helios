@@ -25,7 +25,7 @@ use crate::{InterfaceConfig, PeerConfig, PeerStatus, Result, WgError, WireguardB
 /// runs everywhere including a developer's machine (ADR-006 §5).
 struct InstalledPeer {
     public_key: String,
-    allowed_ips: String,
+    allowed_ips: Vec<String>,
 }
 
 impl From<&PeerConfig> for InstalledPeer {
@@ -41,6 +41,8 @@ impl From<&PeerConfig> for InstalledPeer {
 pub struct DryRunBackend {
     up: AtomicBool,
     iface: Mutex<Option<String>>,
+    /// Addresses of the simulated interface, empty while it is down.
+    addresses: Mutex<Vec<String>>,
     peers: Mutex<Vec<InstalledPeer>>,
     /// If `true`, the simulated peers report a recent handshake (useful for
     /// exercising state inference without a data plane).
@@ -49,6 +51,9 @@ pub struct DryRunBackend {
     /// Used to exercise the orchestrator's recovery paths — notably the
     /// rollback of a PSK application that the data plane refused.
     fail_sync: bool,
+    /// If `true`, an IPv6 interface address is refused the way a kernel
+    /// with `disable_ipv6 = 1` refuses it: after the interface was created.
+    refuse_ipv6: bool,
 }
 
 impl DryRunBackend {
@@ -71,6 +76,24 @@ impl DryRunBackend {
             fail_sync: true,
             ..Self::default()
         }
+    }
+
+    /// Variant that refuses IPv6 interface addresses: simulates a kernel
+    /// whose IPv6 is disabled, to exercise the caller's degraded bring-up.
+    pub fn without_ipv6() -> Self {
+        Self {
+            refuse_ipv6: true,
+            ..Self::default()
+        }
+    }
+
+    /// Addresses the simulated interface carries; empty while it is down.
+    ///
+    /// The trait reports peers, not the interface, because nothing on the
+    /// target needs to read the interface back. The simulation exposes it so
+    /// that what a caller decided to install can be asserted.
+    pub fn interface_addresses(&self) -> Vec<String> {
+        self.addresses.lock().unwrap().clone()
     }
 
     /// Decodes a 32-byte base64 key, reporting the failure **without** the
@@ -127,7 +150,7 @@ impl WireguardBackend for DryRunBackend {
         // Validates like the real backend would: a config that passes in
         // dry-run must pass on the target.
         Self::check_private_key(&config.private_key)?;
-        if config.address.trim().is_empty() {
+        if config.addresses.is_empty() || config.addresses.iter().any(|a| a.trim().is_empty()) {
             return Err(WgError::BadAddress("empty gateway address".into()));
         }
         for p in peers {
@@ -135,6 +158,21 @@ impl WireguardBackend for DryRunBackend {
         }
 
         *self.iface.lock().unwrap() = Some(config.name.clone());
+        if self.refuse_ipv6 {
+            if let Some(refused) = config.addresses.iter().find(|a| is_ipv6_cidr(a)) {
+                // Like the kernel backend: the interface exists by the time
+                // an address is refused, and taking it down is the caller's
+                // job.
+                self.up.store(true, Ordering::SeqCst);
+                return Err(WgError::Interface {
+                    iface: config.name.clone(),
+                    source_msg: format!(
+                        "[dry-run] address {refused} refused: IPv6 is disabled (simulated)"
+                    ),
+                });
+            }
+        }
+        *self.addresses.lock().unwrap() = config.addresses.clone();
         *self.peers.lock().unwrap() = peers.iter().map(InstalledPeer::from).collect();
         self.up.store(true, Ordering::SeqCst);
 
@@ -142,7 +180,7 @@ impl WireguardBackend for DryRunBackend {
             "[dry-run] interface {} up — UDP listener {}, address {}, {} peer(s)",
             config.name,
             config.listen_port,
-            config.address,
+            config.addresses.join(", "),
             peers.len()
         );
         Ok(())
@@ -150,6 +188,7 @@ impl WireguardBackend for DryRunBackend {
 
     async fn down(&self) -> Result<()> {
         let name = self.iface.lock().unwrap().take();
+        self.addresses.lock().unwrap().clear();
         self.peers.lock().unwrap().clear();
         self.up.store(false, Ordering::SeqCst);
         info!("[dry-run] interface {} down", name.unwrap_or_default());
@@ -180,7 +219,7 @@ impl WireguardBackend for DryRunBackend {
             .map(|p| {
                 Ok(PeerStatus {
                     public_key: Self::decode_public_key(&p.public_key)?,
-                    allowed_ips: vec![p.allowed_ips.clone()],
+                    allowed_ips: p.allowed_ips.clone(),
                     last_handshake: now,
                     endpoint: None,
                     rx_bytes: 0,
@@ -199,6 +238,14 @@ impl WireguardBackend for DryRunBackend {
     }
 }
 
+/// Whether a CIDR names an IPv6 address. Anything unparsable does not.
+fn is_ipv6_cidr(cidr: &str) -> bool {
+    cidr.split('/')
+        .next()
+        .and_then(|host| host.parse::<std::net::IpAddr>().ok())
+        .is_some_and(|host| host.is_ipv6())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,7 +258,7 @@ mod tests {
             name: "helios0".into(),
             private_key: Zeroizing::new(KEY_A.into()),
             listen_port: crate::WG_LISTEN_PORT,
-            address: "100.64.0.1/10".into(),
+            addresses: vec!["100.64.0.1/10".into()],
             mtu: None,
         }
     }
@@ -219,7 +266,7 @@ mod tests {
     fn peer(key: &str, vip: &str) -> PeerConfig {
         PeerConfig {
             public_key: key.into(),
-            allowed_ips: vip.into(),
+            allowed_ips: vec![vip.into()],
             preshared_key: None,
             persistent_keepalive_secs: 25,
         }
@@ -310,9 +357,65 @@ mod tests {
         let stored = be.peers.lock().unwrap();
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].public_key, KEY_B);
-        assert_eq!(stored[0].allowed_ips, "100.64.1.2/32");
+        assert_eq!(stored[0].allowed_ips, ["100.64.1.2/32"]);
         // What the backend kept is an `InstalledPeer`, which has no slot for
         // a PSK: the guarantee is the type's, and this test is what fails if
         // the stored shape ever goes back to `PeerConfig`.
+    }
+
+    #[tokio::test]
+    async fn every_address_and_allowed_ip_is_kept_and_reported() {
+        let be = DryRunBackend::new();
+        let mut cfg = iface();
+        cfg.addresses.push("fd3c:91a2:7e04::1/64".into());
+        let mut dual = peer(KEY_B, "100.64.1.2/32");
+        dual.allowed_ips.push("fd3c:91a2:7e04::2/128".into());
+
+        be.up(&cfg, &[dual]).await.unwrap();
+
+        assert_eq!(
+            be.interface_addresses(),
+            ["100.64.0.1/10", "fd3c:91a2:7e04::1/64"]
+        );
+        assert_eq!(
+            be.peers().await.unwrap()[0].allowed_ips,
+            ["100.64.1.2/32", "fd3c:91a2:7e04::2/128"]
+        );
+
+        be.down().await.unwrap();
+        assert!(be.interface_addresses().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_empty_address_list_is_refused() {
+        let be = DryRunBackend::new();
+        let mut cfg = iface();
+        cfg.addresses.clear();
+        assert!(matches!(
+            be.up(&cfg, &[]).await,
+            Err(WgError::BadAddress(_))
+        ));
+    }
+
+    /// The simulated `disable_ipv6` fails the way the kernel does: after the
+    /// interface exists, so the caller has something to take down.
+    #[tokio::test]
+    async fn a_kernel_without_ipv6_refuses_the_ipv6_address_only() {
+        let be = DryRunBackend::without_ipv6();
+        let mut cfg = iface();
+        cfg.addresses.push("fd3c:91a2:7e04::1/64".into());
+
+        assert!(matches!(
+            be.up(&cfg, &[]).await,
+            Err(WgError::Interface { source_msg, .. }) if source_msg.contains("fd3c:91a2:7e04::1/64")
+        ));
+        assert!(
+            be.is_up(),
+            "the interface exists when the address is refused"
+        );
+        be.down().await.unwrap();
+
+        be.up(&iface(), &[]).await.unwrap();
+        assert_eq!(be.interface_addresses(), ["100.64.0.1/10"]);
     }
 }

@@ -36,7 +36,7 @@ pub(super) fn wg_config(network: &NetworkConfig) -> (InterfaceConfig, Vec<PeerCo
         // end of the bring-up or of the peer synchronization (ADR-006 §5).
         private_key: Zeroizing::new(network.wg_private_key.expose().to_owned()),
         listen_port: network.wg_listen_port,
-        address: network.wg_address.clone(),
+        addresses: vec![network.wg_address.clone()],
         mtu: Some(aether::mtu::tunnel_mtu(mtu_transport(
             network.primary_wan_iface().unwrap_or_default(),
         ))),
@@ -46,7 +46,7 @@ pub(super) fn wg_config(network: &NetworkConfig) -> (InterfaceConfig, Vec<PeerCo
         .iter()
         .map(|p| PeerConfig {
             public_key: p.public_key.clone(),
-            allowed_ips: p.address.clone(),
+            allowed_ips: vec![p.address.clone()],
             preshared_key: p
                 .preshared_key
                 .as_ref()
@@ -306,7 +306,8 @@ pub(super) async fn do_connect(
         "info",
         &format!(
             "Interface {} active ({}) — waiting for client handshake",
-            iface.name, iface.address
+            iface.name,
+            iface.addresses.join(", ")
         ),
     );
     Ok(())
@@ -331,7 +332,9 @@ pub(super) async fn pin_peer_vips(
     if dry_run {
         return;
     }
-    let plan = match crate::vip_routing::plan(&iface.name, &iface.address, peers) {
+    // The IPv4 tunnel address comes first: `wg_config` builds the list.
+    let tunnel_address = iface.addresses.first().map_or("", String::as_str);
+    let plan = match crate::vip_routing::plan(&iface.name, tunnel_address, peers) {
         Ok(plan) => plan,
         Err(error) => {
             warn!("peer VIP routing not planned: {error}");

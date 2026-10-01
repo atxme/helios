@@ -204,7 +204,7 @@ fn wireguard_projection_keeps_the_interface_and_required_secrets() {
     assert_eq!(iface.private_key.as_str(), PRIVATE_KEY);
     assert_eq!(iface.listen_port, WG_LISTEN_PORT);
     assert_eq!(peers.len(), 1);
-    assert_eq!(peers[0].allowed_ips, "100.64.1.2/32");
+    assert_eq!(peers[0].allowed_ips, ["100.64.1.2/32"]);
     assert_eq!(
         peers[0].preshared_key.as_ref().map(|psk| psk.as_str()),
         Some("psk-test")

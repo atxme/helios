@@ -159,7 +159,7 @@ pub fn plan(iface: &str, tunnel_address: &str, peers: &[PeerConfig]) -> Result<P
         selector: format!("{}/{prefix_len}", network_of(source, prefix_len)),
         vips: peers
             .iter()
-            .filter_map(|p| host_route(&p.allowed_ips))
+            .flat_map(|p| p.allowed_ips.iter().filter_map(|a| host_route(a)))
             .collect(),
     })
 }
@@ -270,7 +270,7 @@ mod tests {
     fn peer(allowed_ips: &str) -> PeerConfig {
         PeerConfig {
             public_key: "key".into(),
-            allowed_ips: allowed_ips.into(),
+            allowed_ips: vec![allowed_ips.into()],
             preshared_key: None,
             persistent_keepalive_secs: 25,
         }
