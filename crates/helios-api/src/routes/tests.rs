@@ -181,6 +181,37 @@ async fn read_configuration_never_serializes_secrets() {
     assert!(!payload.contains("preshared_key\""));
 }
 
+/// The IPv6 addresses are public configuration: the view carries them,
+/// in their persisted text form, and `null` where there are none.
+#[tokio::test]
+async fn read_configuration_exposes_the_ipv6_addresses() {
+    let (app, _cmd_rx) = app_state(TunnelState::Up);
+    let response = network_get(State(app.clone())).await.0;
+    assert_eq!(response.wg_address_v6, None);
+    assert_eq!(response.peers[0].address_v6, None);
+    let payload = serde_json::to_value(&response).unwrap();
+    assert!(payload["wg_address_v6"].is_null());
+    assert!(payload["peers"][0]["address_v6"].is_null());
+
+    {
+        let mut network = app.network.write().await;
+        network.wg_address_v6 = Some("FD3C:91A2:7E04::1/64".parse().unwrap());
+        network.peers[0].address_v6 = Some("fd3c:91a2:7e04:0:8a1f:3b2c:9d40:e517".parse().unwrap());
+    }
+    let response = network_get(State(app)).await.0;
+    assert_eq!(
+        response.wg_address_v6.as_deref(),
+        Some("fd3c:91a2:7e04::1/64")
+    );
+    assert_eq!(
+        response.peers[0].address_v6.as_deref(),
+        Some("fd3c:91a2:7e04:0:8a1f:3b2c:9d40:e517/128")
+    );
+    let payload = serde_json::to_string(&response).unwrap();
+    assert!(!payload.contains(PRIVATE_KEY));
+    assert!(!payload.contains("pq-secret-must-not-leak"));
+}
+
 #[tokio::test]
 async fn trust_publishes_the_required_hybrid_and_never_a_full_key() {
     let response = trust().await.0;

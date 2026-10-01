@@ -148,6 +148,9 @@ pub struct NetworkConfigView {
     /// `heliosd init-identity`.
     pub wg_public_key: Option<String>,
     pub wg_address: String,
+    /// IPv6 tunnel prefix, `fdXX:XXXX:XXXX::1/64`, when the gateway has one.
+    /// Public configuration (`ADRESSAGE-IPV6.md` §5.1); `null` otherwise.
+    pub wg_address_v6: Option<String>,
     pub wg_listen_port: u16,
     pub key_negotiation_port: Option<u16>,
     pub peers: Vec<NetworkPeerView>,
@@ -160,6 +163,8 @@ pub struct NetworkPeerView {
     pub name: String,
     pub public_key: String,
     pub address: String,
+    /// IPv6 VIP, `…/128`, when the peer has one; `null` otherwise.
+    pub address_v6: Option<String>,
     pub preshared_key_configured: bool,
     pub key_negotiation_certificate_sha256: Option<String>,
     pub key_negotiation_pq_certificate_sha256: Option<String>,
@@ -184,6 +189,7 @@ impl From<&NetworkConfig> for NetworkConfigView {
             // one is exposed only to derive it and never reaches the JSON.
             wg_public_key: aether::wg::public_from_private(config.wg_private_key.expose()).ok(),
             wg_address: config.wg_address.clone(),
+            wg_address_v6: config.wg_address_v6.map(|prefix| prefix.to_string()),
             wg_listen_port: config.wg_listen_port,
             key_negotiation_port: config.key_negotiation_port,
             peers: config
@@ -193,6 +199,7 @@ impl From<&NetworkConfig> for NetworkConfigView {
                     name: peer.name.clone(),
                     public_key: peer.public_key.clone(),
                     address: peer.address.clone(),
+                    address_v6: peer.address_v6.map(aether::net::format_vip_v6),
                     preshared_key_configured: peer.preshared_key.is_some(),
                     key_negotiation_certificate_sha256: peer
                         .key_negotiation_certificate_sha256
