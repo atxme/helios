@@ -755,7 +755,11 @@ Avancement sur `feature/support-ipv6` (1er octobre 2026) :
 | T07 | fusionné | — |
 | T10 | fusionné | un changement de `wg_address_v6` est refusé à chaud (API 409, rechargement ignoré avec avertissement) ; commande de génération du préfixe à créer |
 | T11 + T14 | fusionnés (IPAM unifié) | ADR-001 §4 et ADR-004 §5 contredisent désormais le code (décision opérateur) ; `address_v6` est attribuée mais pas encore projetée (T12, T13) |
-| T12, T13, T15–T23 | à faire | — |
+| T12 + T13 | fusionnés | cible : adresse sur `helios0`, routes et règle `ip -6`, chemins dégradés (MTU, `disable_ipv6`), coexistence NordVPN/Tailscale ; `ping -6` après T19 |
+| T16 | couvert par T08 et T10 | une source IPv6 native n'est jamais un appelant ; `address_v6` exposée dans la vue redigée |
+| T17 | fusionné | cible : `ss -ulpn` montre `[::]`, client IPv6 seul, repli `ipv6.disable=1` |
+| T18 | fusionné | VM Windows : A+AAAA avec IPv6 cassée → IPv4 en ~250 ms ; un candidat perdant consomme une unité du budget par identité côté gateway |
+| T15, T19–T23 | à faire | — |
 
 **T00 — Spécification A : modèle d'adressage IPv6**
 - Fichiers : [`docs/specification/ADRESSAGE-IPV6.md`](../specification/ADRESSAGE-IPV6.md), index `docs/README.md`.
