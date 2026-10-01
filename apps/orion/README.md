@@ -76,6 +76,20 @@ post-négociation n'est envoyé qu'à une adresse couverte par `AllowedIPs`
 > réécrit : il s'ouvre en **Personnalisé**, avec l'avertissement « Tunnel
 > complet IPv4 seulement : le trafic IPv6 sort en clair », repris en ambre dans
 > le panneau de posture. Choisir « Tout » puis enregistrer le corrige.
+>
+> **Ce que le pilote applique est relu.** Sous Windows,
+> `defguard_wireguard_rs` 0.11 ne pose les routes que pour les familles
+> d'adresses que l'adaptateur porte : si l'IPv6 y est indisponible, `::/0` est
+> écarté sans erreur et l'IPv6 sort par l'interface physique alors que le
+> tunnel paraît complet. Après chaque configuration, le backend réel relit les
+> `AllowedIPs` du pair dans le pilote et, sous Windows, les routes de
+> l'adaptateur. Un préfixe manquant est signalé par une erreur « AllowedIPs non
+> appliqués par le pilote : ::/0 — … » et par la ligne « trafic via le tunnel »
+> en ambre (« ::/0 non appliqué par le pilote — hors tunnel ») ; une relecture
+> impossible est signalée comme « non vérifié ». Le tunnel reste monté avec ce
+> qu'il capte : le démonter ne supprimerait pas la fuite IPv6 et rouvrirait
+> celle de l'IPv4 (ADR-001 §3 bis). Le backend simulé ne relit rien et
+> n'affirme donc rien.
 
 ### Protection du tunnel
 

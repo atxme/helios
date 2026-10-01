@@ -133,6 +133,29 @@ describe('useClient', () => {
     })
   })
 
+  // The adapter stays mounted on failure with the routes it had, so a capture
+  // gap outlives `failed`; only unmounting, or a new connection that reads
+  // the adapter back again, ends it.
+  it('keeps the capture verdict for as long as the adapter it describes', async () => {
+    api.connect.mockResolvedValue(undefined)
+    const { result } = renderHook(() => useClient())
+    await waitFor(() => expect(result.current.selectedProfile?.name).toBe('portable'))
+    expect(result.current.capture).toBeNull()
+
+    act(() => emit({ type: 'capture', capture: { status: 'incomplete', missing: ['::/0'] } }))
+    expect(result.current.capture).toEqual({ status: 'incomplete', missing: ['::/0'] })
+
+    act(() => emit({ type: 'state_changed', state: 'failed' }))
+    expect(result.current.capture).toEqual({ status: 'incomplete', missing: ['::/0'] })
+
+    act(() => emit({ type: 'state_changed', state: 'down' }))
+    expect(result.current.capture).toBeNull()
+
+    act(() => emit({ type: 'capture', capture: { status: 'complete' } }))
+    await act(() => result.current.connect('portable'))
+    expect(result.current.capture).toBeNull()
+  })
+
   // The notification area connects a profile, which selects it. The window may
   // be open behind that menu: without this reread it would keep displaying the
   // profile the selection has just left.

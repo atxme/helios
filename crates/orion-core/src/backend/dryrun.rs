@@ -102,6 +102,9 @@ impl VpnBackend for DryRunBackend {
             "info",
             format!("[dry-run] tunnel établi — {pq}"),
         ));
+        // No `Capture` verdict: there is no adapter to read back, and a
+        // `Complete` here would be a verification that never happened. The
+        // screen then shows the requested list without any claim about it.
         Ok(())
     }
 
