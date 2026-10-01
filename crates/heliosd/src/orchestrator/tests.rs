@@ -699,6 +699,34 @@ fn an_unavailable_prefix_is_neither_on_the_interface_nor_in_allowed_ips() {
     assert_eq!(allowed, ["100.64.1.2/32"]);
 }
 
+/// The VIP routing receives the prefix — and so runs `ip -6` at all — only
+/// when the bring-up installed it.
+#[test]
+fn only_an_installed_prefix_reaches_the_vip_routing() {
+    let network = dual_stack_network();
+    assert_eq!(
+        installed_prefix(&network, &Ipv6TunnelStatus::Installed),
+        network.wg_address_v6
+    );
+    assert_eq!(
+        installed_prefix(&network, &Ipv6TunnelStatus::NotConfigured),
+        None
+    );
+    assert_eq!(
+        installed_prefix(
+            &network,
+            &Ipv6TunnelStatus::Unavailable(Ipv6Unavailable::NoKernelSupport {
+                path: "/proc/sys/net/ipv6/conf/all/disable_ipv6".into(),
+            })
+        ),
+        None
+    );
+    assert_eq!(
+        installed_prefix(&configured_network(), &Ipv6TunnelStatus::Installed),
+        None
+    );
+}
+
 /// A kernel `conf` directory with the two settings the decision reads.
 fn ipv6_conf(all: &str, default: &str) -> tempfile::TempDir {
     let directory = tempfile::tempdir().expect("tempdir");

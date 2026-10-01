@@ -44,17 +44,39 @@
 //! minutes later. The rule is therefore always present, costs one lookup, and
 //! is a no-op on a gateway that has the range to itself.
 //!
+//! # IPv6
+//!
+//! When the gateway installed its IPv6 tunnel prefix, the same plan is applied
+//! in the IPv6 family (`ADRESSAGE-IPV6.md` §6.3): one `/128` per peer in the
+//! same table, `src <prefix>::1`, and one `ip -6 rule` for `<prefix>::/64` at
+//! the same priority. The families are separate in the kernel — `ip rule del`
+//! and `route flush` only ever touch one — so each is flushed and withdrawn on
+//! its own ([`PlanV6`]). The IPv6 routes are read from the very `AllowedIPs`
+//! the gateway installed: a peer the data plane does not route in IPv6 gets no
+//! IPv6 route either. A gateway without IPv6, or whose prefix could not be
+//! installed, runs no `ip -6` command at all.
+//!
+//! Tailscale draws its IPv6 from `fd7a:115c:a1e0::/48`, and a random ULA `/64`
+//! is unlikely to meet it; the pinning is kept anyway, for the same reason as
+//! in IPv4 — the next VPN to connect is not one Helios can enumerate.
+//!
 //! # Limite connue
 //!
-//! Only IPv4 `/32` peer addresses are carried. A peer whose `AllowedIPs` is an
-//! IPv6 prefix or a wider IPv4 network is left to the main table, and will be
-//! captured by a foreign rule exactly as described above. Helios's IPAM only
-//! ever assigns single IPv4 addresses (`helios_provisioning::ipam`), so this
-//! covers what the gateway itself hands out, not what an operator may have
-//! written by hand into `network.toml`.
+//! Only single hosts are carried: IPv4 `/32` and IPv6 `/128` inside the tunnel
+//! prefix. A peer whose `AllowedIPs` holds a wider network is left to the main
+//! table, and will be captured by a foreign rule exactly as described above.
+//! Helios's IPAM only ever assigns single hosts in both families
+//! (`helios_provisioning::ipam`), so this covers what the gateway itself hands
+//! out, not what an operator may have written by hand into `network.toml`.
+//!
+//! An IPv6 rule left by a crashed run, or by a run whose successor could not
+//! install IPv6, stays until the next run that installs IPv6 flushes it. It is
+//! inert meanwhile: the routes it points at named the interface, and went with
+//! it.
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
+use aether::net::TunnelPrefixV6;
 use helios_wireguard::PeerConfig;
 
 /// Routing table Helios owns, and the only one it ever writes to.
@@ -129,7 +151,7 @@ impl Plan {
         // its route in the same pass that a new one gains it, and a diff that
         // missed a removal would keep routing to a client that is no longer
         // admitted.
-        out.push(split(&format!("route flush table {VIP_TABLE}")));
+        out.push(table_flush(Family::V4));
         for vip in &self.vips {
             out.push(split(&format!(
                 "route replace {vip} dev {} src {} table {VIP_TABLE}",
@@ -141,6 +163,45 @@ impl Plan {
         // way to install the two atomically.
         if !self.vips.is_empty() {
             out.push(split(&format!(
+                "rule add to {} lookup {VIP_TABLE} priority {VIP_RULE_PRIORITY}",
+                self.selector
+            )));
+        }
+        out
+    }
+}
+
+/// The IPv6 counterpart of [`Plan`]: same table, same priority, its own
+/// family (`ADRESSAGE-IPV6.md` §6.3).
+///
+/// Built only for a gateway that installed its IPv6 tunnel prefix, from the
+/// prefix itself rather than from text, so it cannot be malformed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanV6 {
+    /// Interface the peer routes point at.
+    pub iface: String,
+    /// Source address stamped on those routes — the gateway's `<prefix>::1`.
+    pub source: Ipv6Addr,
+    /// Selector of the single rule: the tunnel prefix, e.g. `fd3c:91a2:7e04::/64`.
+    pub selector: String,
+    /// One `/128` per peer routed in IPv6, in the order they were declared.
+    pub vips: Vec<String>,
+}
+
+impl PlanV6 {
+    /// Renders the plan as `ip -6` argument vectors, in the order to run
+    /// them: the same sequence as [`Plan::commands`], for the same reasons.
+    pub fn commands(&self) -> Vec<Vec<String>> {
+        let mut out: Vec<Vec<String>> = Vec::new();
+        out.push(table_flush(Family::V6));
+        for vip in &self.vips {
+            out.push(Family::V6.ip(&format!(
+                "route replace {vip} dev {} src {} table {VIP_TABLE}",
+                self.iface, self.source
+            )));
+        }
+        if !self.vips.is_empty() {
+            out.push(Family::V6.ip(&format!(
                 "rule add to {} lookup {VIP_TABLE} priority {VIP_RULE_PRIORITY}",
                 self.selector
             )));
@@ -164,24 +225,31 @@ pub fn plan(iface: &str, tunnel_address: &str, peers: &[PeerConfig]) -> Result<P
     })
 }
 
+/// Works out what the kernel should carry in IPv6 for `peers`, under the
+/// installed tunnel `prefix`.
+///
+/// A peer's IPv6 route is taken from its `AllowedIPs`, read with the
+/// canonical parser: what WireGuard does not route to a peer, this table does
+/// not either. Only hosts inside the prefix are kept, like the IPv4 side keeps
+/// only `/32`.
+pub fn plan_v6(iface: &str, prefix: TunnelPrefixV6, peers: &[PeerConfig]) -> PlanV6 {
+    PlanV6 {
+        iface: iface.to_string(),
+        source: prefix.gateway(),
+        selector: format!("{}/{}", prefix.network(), TunnelPrefixV6::PREFIX_LEN),
+        vips: peers
+            .iter()
+            .flat_map(|p| p.allowed_ips.iter())
+            .filter_map(|allowed| aether::net::parse_vip_v6(allowed).ok())
+            .filter(|vip| prefix.contains(*vip))
+            .map(aether::net::format_vip_v6)
+            .collect(),
+    }
+}
+
 /// Installs the plan, replacing whatever a previous run had left behind.
 pub async fn apply(plan: &Plan) -> Result<(), RoutingError> {
-    flush_rules().await?;
-    for args in plan.commands() {
-        // `route flush` on a table that was never created is a success on some
-        // kernels and an error on others, and neither says anything about the
-        // routes we are about to add. Only the rule and the routes are
-        // load-bearing.
-        let tolerated = args.first().map(String::as_str) == Some("route")
-            && args.get(1).map(String::as_str) == Some("flush");
-        match run(&args).await {
-            Ok(()) => {}
-            Err(error) if tolerated => {
-                tracing::debug!(%error, "clearing the VIP table found nothing to clear");
-            }
-            Err(error) => return Err(error),
-        }
-    }
+    install(Family::V4, &plan.commands()).await?;
     if !plan.vips.is_empty() {
         tracing::info!(
             iface = %plan.iface,
@@ -196,27 +264,105 @@ pub async fn apply(plan: &Plan) -> Result<(), RoutingError> {
     Ok(())
 }
 
+/// Installs the IPv6 plan, replacing what a previous run left in that family.
+pub async fn apply_v6(plan: &PlanV6) -> Result<(), RoutingError> {
+    install(Family::V6, &plan.commands()).await?;
+    if !plan.vips.is_empty() {
+        tracing::info!(
+            iface = %plan.iface,
+            selector = %plan.selector,
+            peers = plan.vips.len(),
+            table = VIP_TABLE,
+            priority = VIP_RULE_PRIORITY,
+            "peer IPv6 VIPs pinned to the tunnel interface"
+        );
+    }
+    Ok(())
+}
+
 /// Removes everything [`apply`] installed. Called when the interface goes down.
 pub async fn withdraw() -> Result<(), RoutingError> {
-    flush_rules().await?;
+    remove(Family::V4).await
+}
+
+/// Removes everything [`apply_v6`] installed. Called when the interface goes
+/// down on a gateway that had installed IPv6.
+pub async fn withdraw_v6() -> Result<(), RoutingError> {
+    remove(Family::V6).await
+}
+
+/// The kernel's two address families. Each has its own rules and its own
+/// copy of the table: an `ip` command reaches one only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Family {
+    V4,
+    V6,
+}
+
+impl Family {
+    /// `command` as `ip` arguments in this family. IPv4 keeps the bare form it
+    /// always had; IPv6 is selected with `-6`.
+    fn ip(self, command: &str) -> Vec<String> {
+        let mut args = match self {
+            Self::V4 => Vec::new(),
+            Self::V6 => vec!["-6".to_string()],
+        };
+        args.extend(split(command));
+        args
+    }
+}
+
+fn table_flush(family: Family) -> Vec<String> {
+    family.ip(&format!("route flush table {VIP_TABLE}"))
+}
+
+fn rule_delete(family: Family) -> Vec<String> {
+    family.ip(&format!("rule del priority {VIP_RULE_PRIORITY}"))
+}
+
+/// Whether `args` clears the table — the one command whose failure says
+/// nothing about the routes about to be added.
+fn is_table_flush(args: &[String]) -> bool {
+    args == table_flush(Family::V4).as_slice() || args == table_flush(Family::V6).as_slice()
+}
+
+/// Runs one family's commands after clearing that family's rules.
+async fn install(family: Family, commands: &[Vec<String>]) -> Result<(), RoutingError> {
+    flush_rules(family).await?;
+    for args in commands {
+        // `route flush` on a table that was never created is a success on some
+        // kernels and an error on others, and neither says anything about the
+        // routes we are about to add. Only the rule and the routes are
+        // load-bearing.
+        match run(args).await {
+            Ok(()) => {}
+            Err(error) if is_table_flush(args) => {
+                tracing::debug!(%error, "clearing the VIP table found nothing to clear");
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+async fn remove(family: Family) -> Result<(), RoutingError> {
+    flush_rules(family).await?;
     // Left for last and unchecked: with the rule gone the table is
     // unreachable, so a route that survives is inert rather than harmful.
-    if let Err(error) = run(&split(&format!("route flush table {VIP_TABLE}"))).await {
+    if let Err(error) = run(&table_flush(family)).await {
         tracing::debug!(%error, "clearing the VIP table found nothing to clear");
     }
     Ok(())
 }
 
-/// Removes every rule sitting at our priority, ours or a previous run's.
+/// Removes every rule sitting at our priority in `family`, ours or a previous
+/// run's.
 ///
 /// The priority is the ownership marker: nothing else in the system is
 /// expected to claim it, and a crashed `heliosd` leaves its rule behind.
-async fn flush_rules() -> Result<(), RoutingError> {
+async fn flush_rules(family: Family) -> Result<(), RoutingError> {
     for _ in 0..MAX_STALE_RULES {
-        if run(&split(&format!("rule del priority {VIP_RULE_PRIORITY}")))
-            .await
-            .is_err()
-        {
+        if run(&rule_delete(family)).await.is_err() {
             return Ok(());
         }
     }
@@ -379,5 +525,127 @@ mod tests {
             network_of(Ipv4Addr::new(10, 1, 2, 3), 0),
             Ipv4Addr::UNSPECIFIED
         );
+    }
+
+    fn rendered(commands: &[Vec<String>]) -> Vec<String> {
+        commands.iter().map(|c| c.join(" ")).collect()
+    }
+
+    fn dual_stack_peer(v4: &str, v6: &str) -> PeerConfig {
+        let mut peer = peer(v4);
+        peer.allowed_ips.push(v6.into());
+        peer
+    }
+
+    fn prefix() -> TunnelPrefixV6 {
+        "fd3c:91a2:7e04::1/64".parse().unwrap()
+    }
+
+    /// Criterion 6: the IPv4 sequence is the one this module always ran,
+    /// command for command, and a peer's IPv6 entry does not change it.
+    #[test]
+    fn the_ipv4_sequence_is_unchanged_by_ipv6_allowed_ips() {
+        let expected = [
+            "route flush table 51820",
+            "route replace 100.64.98.223/32 dev helios0 src 100.64.0.1 table 51820",
+            "route replace 100.65.3.7/32 dev helios0 src 100.64.0.1 table 51820",
+            "rule add to 100.64.0.0/10 lookup 51820 priority 32000",
+        ];
+        let v4_only = plan(
+            "helios0",
+            "100.64.0.1/10",
+            &[peer("100.64.98.223/32"), peer("100.65.3.7/32")],
+        )
+        .unwrap();
+        let dual = plan(
+            "helios0",
+            "100.64.0.1/10",
+            &[
+                dual_stack_peer("100.64.98.223/32", "fd3c:91a2:7e04::2/128"),
+                peer("100.65.3.7/32"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(rendered(&v4_only.commands()), expected);
+        assert_eq!(rendered(&dual.commands()), expected);
+        assert_eq!(
+            rendered(&[rule_delete(Family::V4)]),
+            ["rule del priority 32000"]
+        );
+        assert_eq!(
+            rendered(&[table_flush(Family::V4)]),
+            ["route flush table 51820"]
+        );
+    }
+
+    /// §6.3: one `/128` per peer, `src <prefix>::1`, then the rule for the
+    /// `/64` — flush first, rule last, all in the IPv6 family.
+    #[test]
+    fn the_ipv6_sequence_mirrors_the_ipv4_one_in_its_own_family() {
+        let plan = plan_v6(
+            "helios0",
+            prefix(),
+            &[
+                dual_stack_peer(
+                    "100.64.98.223/32",
+                    "fd3c:91a2:7e04:0:8a1f:3b2c:9d40:e517/128",
+                ),
+                peer("100.65.3.7/32"),
+                dual_stack_peer("100.65.3.8/32", "fd3c:91a2:7e04::3/128"),
+            ],
+        );
+        assert_eq!(
+            rendered(&plan.commands()),
+            [
+                "-6 route flush table 51820",
+                "-6 route replace fd3c:91a2:7e04:0:8a1f:3b2c:9d40:e517/128 dev helios0 \
+                 src fd3c:91a2:7e04::1 table 51820",
+                "-6 route replace fd3c:91a2:7e04::3/128 dev helios0 src fd3c:91a2:7e04::1 \
+                 table 51820",
+                "-6 rule add to fd3c:91a2:7e04::/64 lookup 51820 priority 32000",
+            ]
+        );
+    }
+
+    #[test]
+    fn each_family_is_flushed_and_withdrawn_on_its_own() {
+        assert_eq!(
+            rendered(&[rule_delete(Family::V6), table_flush(Family::V6)]),
+            ["-6 rule del priority 32000", "-6 route flush table 51820"]
+        );
+        // The flush tolerance recognises both families' table flush, and
+        // nothing else: a failed route or rule is never forgiven.
+        assert!(is_table_flush(&table_flush(Family::V4)));
+        assert!(is_table_flush(&table_flush(Family::V6)));
+        assert!(!is_table_flush(&rule_delete(Family::V6)));
+        assert!(!is_table_flush(&Family::V6.ip(
+            "route replace fd3c:91a2:7e04::3/128 dev helios0 src fd3c:91a2:7e04::1 table 51820"
+        )));
+    }
+
+    #[test]
+    fn no_ipv6_peer_means_no_ipv6_rule() {
+        let plan = plan_v6("helios0", prefix(), &[peer("100.64.98.223/32")]);
+        assert_eq!(
+            rendered(&plan.commands()),
+            ["-6 route flush table 51820"],
+            "an empty table behind a rule costs a lookup and pins nothing"
+        );
+    }
+
+    #[test]
+    fn ipv6_routes_keep_only_hosts_of_the_tunnel_prefix() {
+        let plan = plan_v6(
+            "helios0",
+            prefix(),
+            &[
+                dual_stack_peer("100.64.98.223/32", "fd3c:91a2:7e04::2/128"),
+                dual_stack_peer("100.64.98.224/32", "fd00:1:2::5/128"),
+                dual_stack_peer("100.64.98.225/32", "fd3c:91a2:7e04::/64"),
+            ],
+        );
+        assert_eq!(plan.vips, ["fd3c:91a2:7e04::2/128"]);
+        assert_eq!(plan.selector, "fd3c:91a2:7e04::/64");
+        assert_eq!(plan.source.to_string(), "fd3c:91a2:7e04::1");
     }
 }

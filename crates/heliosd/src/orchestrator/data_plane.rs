@@ -519,7 +519,14 @@ pub(super) async fn connect_with_ipv6(
     // After the interface exists — the peer routes name it — and before the
     // state is announced: a client that handshakes in between would otherwise
     // have its first replies handed to whichever VPN owns the CGNAT range.
-    pin_peer_vips(dry_run, &iface, &peers, event_tx).await;
+    pin_peer_vips(
+        dry_run,
+        &iface,
+        &peers,
+        installed_prefix(network, &ipv6),
+        event_tx,
+    )
+    .await;
 
     emit_log(
         event_tx,
@@ -543,15 +550,44 @@ pub(super) async fn connect_with_ipv6(
 /// gateways that were never at risk. The warning names the consequence
 /// instead, because the symptom on the other side is invisible: packets are
 /// not dropped, they leave through the wrong tunnel.
+///
+/// The IPv6 family is pinned only when `ipv6_prefix` says the bring-up
+/// installed it, and independently of the IPv4 one: a failure in one family
+/// does not withhold the other.
 pub(super) async fn pin_peer_vips(
     dry_run: bool,
     iface: &helios_wireguard::InterfaceConfig,
     peers: &[helios_wireguard::PeerConfig],
+    ipv6_prefix: Option<TunnelPrefixV6>,
     event_tx: &broadcast::Sender<HeliosEvent>,
 ) {
     if dry_run {
         return;
     }
+    pin_peer_vips_v4(iface, peers, event_tx).await;
+    if let Some(prefix) = ipv6_prefix {
+        let plan = crate::vip_routing::plan_v6(&iface.name, prefix, peers);
+        if let Err(error) = crate::vip_routing::apply_v6(&plan).await {
+            warn!("peer IPv6 VIP routing not installed: {error}");
+            emit_log(
+                event_tx,
+                "warn",
+                &format!(
+                    "Client IPv6 VIPs not pinned to {} ({error}). If another VPN on this host \
+                     routes {} through its own table, IPv6 traffic to clients leaves through it \
+                     and no packet is dropped to say so.",
+                    iface.name, plan.selector
+                ),
+            );
+        }
+    }
+}
+
+async fn pin_peer_vips_v4(
+    iface: &helios_wireguard::InterfaceConfig,
+    peers: &[helios_wireguard::PeerConfig],
+    event_tx: &broadcast::Sender<HeliosEvent>,
+) {
     // The IPv4 tunnel address comes first: `wg_config` builds the list.
     let tunnel_address = iface.addresses.first().map_or("", String::as_str);
     let plan = match crate::vip_routing::plan(&iface.name, tunnel_address, peers) {
@@ -577,11 +613,19 @@ pub(super) async fn pin_peer_vips(
 }
 
 /// Removes the pinning. Paired with every path that takes the interface down.
-pub(super) async fn unpin_peer_vips(dry_run: bool) {
+///
+/// The IPv6 family is withdrawn only when the bring-up had installed it: a
+/// gateway without IPv6 runs no `ip -6` command, on the way down either.
+pub(super) async fn unpin_peer_vips(dry_run: bool, ipv6: &Ipv6TunnelStatus) {
     if dry_run {
         return;
     }
     if let Err(error) = crate::vip_routing::withdraw().await {
         warn!("peer VIP routing not withdrawn: {error}");
+    }
+    if *ipv6 == Ipv6TunnelStatus::Installed {
+        if let Err(error) = crate::vip_routing::withdraw_v6().await {
+            warn!("peer IPv6 VIP routing not withdrawn: {error}");
+        }
     }
 }

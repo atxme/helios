@@ -131,7 +131,8 @@ pub(super) async fn handle_external_cmd(
                     &format!("Tearing down the interface: {e}"),
                 );
             }
-            unpin_peer_vips(dry_run).await;
+            let ipv6 = shared_ipv6.read().await.clone();
+            unpin_peer_vips(dry_run, &ipv6).await;
             sync_policy(shared_policy, policy).await;
         }
 
@@ -227,7 +228,11 @@ pub(super) async fn handle_external_cmd(
             // enrollment, or revocation).
             if wg.is_up() {
                 let ipv6 = shared_ipv6.read().await.clone();
-                let (iface, peers) = wg_config(&*shared_network.read().await, &ipv6);
+                let (iface, peers, prefix) = {
+                    let network = shared_network.read().await;
+                    let (iface, peers) = wg_config(&network, &ipv6);
+                    (iface, peers, installed_prefix(&network, &ipv6))
+                };
                 if let Err(e) = wg.sync_peers(&peers).await {
                     warn!("WireGuard peer synchronization: {e}");
                     emit_log(event_tx, "warn", &format!("Peer synchronization: {e}"));
@@ -237,7 +242,7 @@ pub(super) async fn handle_external_cmd(
                 // client is the only one still leaving through the wrong
                 // tunnel — the hardest case to diagnose, since every other
                 // client works.
-                pin_peer_vips(dry_run, &iface, &peers, event_tx).await;
+                pin_peer_vips(dry_run, &iface, &peers, prefix, event_tx).await;
             }
             emit_log(event_tx, "info", "Network configuration applied");
         }

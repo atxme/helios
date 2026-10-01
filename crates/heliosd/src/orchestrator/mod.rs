@@ -366,7 +366,8 @@ pub async fn run(
     // The interface is gone; routes naming it would linger in our table and
     // the rule would keep sending the range at an empty lookup. Harmless, but
     // it is state the daemon put there and must take back.
-    unpin_peer_vips(dry_run).await;
+    let ipv6 = shared_ipv6.read().await.clone();
+    unpin_peer_vips(dry_run, &ipv6).await;
     Ok(())
 }
 
