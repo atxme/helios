@@ -82,6 +82,26 @@ const PRIVATE_IPV4_CIDRS: [&str; 4] = [
     "192.168.0.0/16",
 ];
 
+/// The IPv6 counterpart of [`PRIVATE_IPV4_CIDRS`]: unique local addresses
+/// (RFC 4193) and link-local addresses (RFC 4291).
+///
+/// NordVPN hands out IPv4 Meshnet addresses only, so there is no NordVPN
+/// IPv6 classification to mirror: these are the two scopes IPv6 reserves for
+/// local use.
+const PRIVATE_IPV6_CIDRS: [&str; 2] = ["fc00::/7", "fe80::/10"];
+
+/// The local networks of one address family.
+///
+/// A drop pairing a source of one family with a destination of the other can
+/// never match, so a peer's local-network denial must use its own family's
+/// list: the IPv4 list alone would leave an IPv6 peer's local networks open.
+fn local_networks(family: AddressFamily) -> &'static [&'static str] {
+    match family {
+        AddressFamily::Ipv4 => &PRIVATE_IPV4_CIDRS,
+        AddressFamily::Ipv6 => &PRIVATE_IPV6_CIDRS,
+    }
+}
+
 /// Builds the ruleset for `(policy, state)`.
 ///
 /// Invariants, regardless of state:
