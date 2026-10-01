@@ -5,6 +5,9 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
+echo '==> Gateway hardening safety checks'
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/tests -p 'test_gateway_hardening.py'
+
 echo '==> Formatage Rust'
 cargo fmt --check
 
