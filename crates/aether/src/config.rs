@@ -1,4 +1,8 @@
-use std::{collections::HashSet, net::Ipv4Addr, path::PathBuf};
+use std::{
+    collections::HashSet,
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    path::PathBuf,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -20,7 +24,12 @@ pub const DEFAULT_WG_API_URL: &str = "http://100.64.0.1:8080";
 ///
 /// Loopback only: without a tunnel, the API has no reason to be reachable
 /// from the outside.
-pub const API_BIND_LOOPBACK: &str = "127.0.0.1:8080";
+pub const API_BIND_LOOPBACK: SocketAddr =
+    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, API_PORT));
+/// Listen address of the raw speedtest in degraded mode, on loopback for the
+/// same reason as [`API_BIND_LOOPBACK`].
+pub const SPEEDTEST_BIND_LOOPBACK: SocketAddr =
+    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, SPEEDTEST_PORT));
 
 /// Reads `wan_iface` as a single name or as a list.
 ///
@@ -1075,29 +1084,50 @@ impl NetworkConfig {
     /// the bind address: it is nftables that refuses connections coming
     /// from anywhere other than the tunnel.
     ///
-    /// Without a configured gateway, we fall back to loopback.
-    pub fn api_bind(&self) -> String {
-        if !self.wireguard_ready() {
-            return API_BIND_LOOPBACK.to_string();
-        }
-        // `wg_address` is in CIDR notation (`100.64.0.1/10`): keep only the host.
-        match self.wg_address.split('/').next() {
-            Some(host) if !host.trim().is_empty() => format!("{}:{}", host.trim(), API_PORT),
-            _ => API_BIND_LOOPBACK.to_string(),
-        }
+    /// Without a configured gateway, we fall back to loopback. With one, an
+    /// unusable `wg_address` is an error: see [`Self::tunnel_bind`].
+    pub fn api_bind(&self) -> Result<SocketAddr> {
+        self.tunnel_bind(API_BIND_LOOPBACK)
     }
 
     /// Address where the raw TCP/UDP speedtest service listens behind the
     /// tunnel. It follows the same gateway VIP as the HTTP API, but has its
     /// own port so no HTTP framing can enter the measurement.
-    pub fn speedtest_bind(&self) -> String {
+    pub fn speedtest_bind(&self) -> Result<SocketAddr> {
+        self.tunnel_bind(SPEEDTEST_BIND_LOOPBACK)
+    }
+
+    /// The gateway's IPv4 VIP on `loopback`'s port, or `loopback` itself
+    /// while the gateway is not configured.
+    ///
+    /// IPv4 only: the control plane listens on the IPv4 VIP and nowhere else
+    /// (`ADRESSAGE-IPV6.md` §2.6), so an IPv6 `wg_address` is refused rather
+    /// than bound.
+    ///
+    /// A host that does not parse is an error, not a fallback to loopback.
+    /// [`Self::validate`] does not check `wg_address`, so this is where a bad
+    /// one surfaces first. Falling back would leave a gateway whose tunnel may
+    /// well come up while its API, release and provisioning are out of every
+    /// client's reach, with nothing saying why. Only the host is read: the
+    /// prefix belongs to the data plane, which refuses its own bad cases.
+    fn tunnel_bind(&self, loopback: SocketAddr) -> Result<SocketAddr> {
         if !self.wireguard_ready() {
-            return format!("127.0.0.1:{SPEEDTEST_PORT}");
+            return Ok(loopback);
         }
-        match self.wg_address.split('/').next() {
-            Some(host) if !host.trim().is_empty() => format!("{}:{SPEEDTEST_PORT}", host.trim()),
-            _ => format!("127.0.0.1:{SPEEDTEST_PORT}"),
-        }
+        // `wg_address` is in CIDR notation (`100.64.0.1/10`): keep only the host.
+        let host = self
+            .wg_address
+            .split_once('/')
+            .map_or(self.wg_address.as_str(), |(host, _prefix)| host)
+            .trim();
+        let host: Ipv4Addr = host.parse().map_err(|_| {
+            HeliosError::Config(format!(
+                "wg_address `{}` has no IPv4 host to listen on: the API and the speedtest \
+                 listen on the gateway's IPv4 VIP only",
+                self.wg_address
+            ))
+        })?;
+        Ok(SocketAddr::new(host.into(), loopback.port()))
     }
 
     /// Projects the network config onto the declarative firewall policy.
