@@ -513,6 +513,64 @@ l'adaptateur (`defguard` le désactive puis le réactive pour appliquer la MTU).
 L'étape 1 est celle qui écarte un faux positif, l'étape 2 celle qui prouve la
 détection.
 
+### Endpoint en FQDN double pile : repli IPv4 visible (VM Windows)
+
+Ce contrôle exige une VM Windows disposant d'une route IPv6 par défaut et un
+Orion compilé avec `--features wireguard`. Sous WSL, seuls l'ordre des
+candidats et la course échelonnée sont exercés, avec des connecteurs simulés
+(`scripts/wsl-cargo test -p orion-core endpoint_resolution`) : ni une vraie
+résolution `A`/`AAAA`, ni un chemin IPv6 cassé, ni WireGuard-NT.
+
+Ce qu'il vérifie : le nom de la gateway est résolu **une seule fois** par
+tentative, les candidats sont essayés selon RFC 8305 (famille triée en tête par
+le résolveur, puis l'autre 250 ms plus tard, ou aussitôt après un échec), et le
+tunnel WireGuard est posé sur l'adresse **littérale** qui a négocié, jamais sur
+une seconde résolution.
+
+1. **Préparer le nom.** Profil Helios dont l'endpoint WireGuard et l'endpoint
+   de négociation nomment le même FQDN (ports 51820 et 51821). Dans
+   `C:\Windows\System32\drivers\etc\hosts`, faire porter à ce nom l'IPv4 réelle
+   de la gateway **et** une IPv6 qui ne répond pas, par exemple
+   `2001:db8::dead`. Vérifier avec `Resolve-DnsName <fqdn>` que les deux
+   réponses reviennent, et avec
+   `[System.Net.Dns]::GetHostAddresses('<fqdn>')` (ordre de `getaddrinfo`)
+   que Windows trie bien l'IPv6 en tête. Sans route IPv6 par défaut, Windows trie
+   l'IPv4 en tête (RFC 6724) : le journal affiche alors l'IPv4 retenue sans
+   candidat écarté, ce qui est le comportement attendu mais pas le cas testé.
+2. **Connecter.** Le tunnel doit monter en IPv4 avec ~250 ms de retard au
+   plus, sans attendre les 10 s du délai de connexion QUIC. Le journal doit
+   afficher, en avertissement :
+   « négociation 1/3 : endpoint `<fqdn>:51821` : IPv4 `<ip>:51821` retenu après
+   IPv6 [2001:db8::dead]:51821 sans réponse, tentative annulée » (ou « en
+   échec (…) » si Windows refuse l'envoi d'emblée), puis « endpoint WireGuard
+   `<fqdn>:51820` : IPv4 `<ip>:51820` (l'adresse qui a négocié) » et
+   « pair configuré vers `<ip>:51820` ». `orion.log` montre les deux lignes
+   « endpoint candidate: attempt started », la seconde 250 ms après la
+   première.
+3. **Profil intact.** L'endpoint affiché par le profil reste `<fqdn>:51820` :
+   seule la copie remise au plan de données porte le littéral. Une
+   reconnexion doit refaire la résolution (les lignes de l'étape 2
+   réapparaissent).
+4. **Aucune transaction orpheline.** Côté gateway,
+   `journalctl -u heliosd --since -5min` ne doit montrer qu'une seule requête
+   de négociation pour la tentative. Si la gateway écoute aussi en IPv6 et que
+   les deux candidats l'atteignent, la connexion perdante apparaît au plus
+   comme « quic: key-negotiation connection rejected » sans transaction
+   préparée : elle est abandonnée avant la requête signée.
+5. **Tous les candidats injoignables.** Remplacer l'IPv4 par une adresse
+   muette (`192.0.2.1`). Attendu : « négociation 1/3 : échec — no address of
+   `<fqdn>:51821` answered — [2001:db8::dead]:51821 (IPv6): … ;
+   192.0.2.1:51821 (IPv4): … », les trois tentatives habituelles, puis l'échec
+   final. L'adaptateur reste monté s'il l'était (ADR-001 §3 bis).
+6. **Profil classique.** Sans bloc de négociation, l'endpoint WireGuard est le
+   premier candidat de l'ordre RFC 8305 : il n'y a pas de course possible,
+   WireGuard n'acceptant qu'un endpoint par pair. Le journal affiche
+   « endpoint WireGuard `<fqdn>:51820` : IPv6 … (premier candidat de sa
+   résolution) ». Avec l'IPv6 muette de l'étape 1, ce tunnel ne monte pas :
+   c'est la limite connue du profil classique, nommée par le journal.
+
+Restaurer le fichier `hosts` à la fin.
+
 ## Test réel WireGuard sur Linux
 
 Effectuer ce scénario uniquement sur une gateway de laboratoire :
