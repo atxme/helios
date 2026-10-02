@@ -4,8 +4,8 @@
 //! or under the captive-portal derogation — and the two are exclusive, which
 //! is why they are a single `if`/`else if` and not two independent sections.
 //! A captive portal opens HTTP/HTTPS and nothing else; an operational tunnel
-//! opens the split-tunnel bypasses, the LAN forward and, on request, the
-//! road-warrior egress.
+//! opens the split-tunnel bypasses (from the LAN only), the LAN forward and,
+//! on request, the road-warrior egress.
 
 use aether::{FirewallPolicy, Result, TunnelState};
 
@@ -63,25 +63,33 @@ pub(super) fn state_gated_openings(
     } else if state.traffic_allowed() {
         // Split-tunneling: local CIDRs bypass the tunnel.
         //
-        // The bypass is for the gateway's own networks, never for traffic
-        // entering through the tunnel interface: unscoped, an IPv4 CIDR would
-        // open those destinations to the tunnel clients, and an IPv6 one would
-        // relay their IPv6 ahead of the `client_ipv6_egress` rejection
-        // (ADRESSAGE-IPV6 §6.4, SORTIE-IPV6). Hence `iifname != wg_iface`, in
+        // The bypass is for the gateway's LAN, and only for it: a packet
+        // enters by a LAN interface or the rule does not see it. Scoped any
+        // wider, an IPv4 CIDR would open those destinations to the tunnel
+        // clients, an IPv6 one would relay their IPv6 ahead of the
+        // `client_ipv6_egress` rejection (ADRESSAGE-IPV6 §6.4, SORTIE-IPV6),
+        // and either would accept new connections entering by a WAN — for a
+        // global IPv6 LAN prefix, an inbound opening from the Internet to the
+        // LAN. Hence `iifname <lan>`, one rule per LAN interface and CIDR, in
         // both families.
         //
-        // Without a tunnel interface there are no tunnel clients and nothing
-        // to exclude, so the rule keeps its unscoped form; the IR never names
-        // an empty interface.
-        let not_from_tunnel =
-            (!policy.wg_iface.is_empty()).then(|| Match::NotInIface(policy.wg_iface.clone()));
-        for cidr in &policy.split_tunnel_cidrs {
-            let matches = not_from_tunnel
-                .iter()
-                .cloned()
-                .chain([Match::DestNet(parse_network(cidr)?)])
-                .collect();
-            rules.push(Rule::new(Forward, matches, Verdict::Accept));
+        // Every CIDR is parsed before any rule is emitted, LAN interfaces or
+        // not: without a LAN no bypass is rendered (fail closed), but an
+        // invalid CIDR is still refused, so that `check_policy` rejects it
+        // whatever the topology.
+        let destinations = policy
+            .split_tunnel_cidrs
+            .iter()
+            .map(|cidr| parse_network(cidr))
+            .collect::<Result<Vec<_>>>()?;
+        for lan in &policy.lan_ifaces {
+            for destination in &destinations {
+                rules.push(Rule::new(
+                    Forward,
+                    vec![Match::InIface(lan.clone()), Match::DestNet(*destination)],
+                    Verdict::Accept,
+                ));
+            }
         }
 
         // Tunnel operational: forward the LAN. WireGuard encrypts on egress;
