@@ -65,7 +65,10 @@ foi en cas de doute (voir [AGENTS.md](../AGENTS.md)).
 - [Rotation des certificats](specification/ROTATION-CERTIFICATS.md) — cycle de
   vie cible des certificats TLS/PQ.
 - [Adressage IPv6](specification/ADRESSAGE-IPV6.md) — modèle d'adressage
-  IPv6 du tunnel (ULA `/64`, VIP `/128`), proposé, non implémenté.
+  IPv6 du tunnel (ULA `/64`, VIP `/128`) et IPAM unifié, validé, en cours
+  d'implémentation.
+- [Sortie IPv6](specification/SORTIE-IPV6.md) — politique de sortie Internet
+  IPv6 des clients du tunnel (rejet explicite, NAT66 en option), proposée.
 
 ## Sécurité
 
