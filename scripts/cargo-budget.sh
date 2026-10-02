@@ -1,4 +1,4 @@
-# Disk budget for Helios builds on WSL. Source this file; do not execute it.
+# Resource budgets for Helios builds on WSL. Source this file; do not execute it.
 #
 # WSL's VHD grows with every Cargo target directory and does not shrink after
 # a `cargo clean`. Every build therefore goes through one cache, and the total
@@ -22,6 +22,72 @@ helios_budget_over_allowed() {
 
 helios_budget_format_gib() {
     awk -v bytes="$1" 'BEGIN { printf "%.1f GiB", bytes / 1024 / 1024 / 1024 }'
+}
+
+# Available memory in KiB, constrained by both the WSL view and any cgroup
+# limit. Keep 3 GiB for WSL/Linux and budget at most 2.5 GiB per rustc job.
+helios_budget_available_memory_kib() {
+    local available_kib limit_bytes current_bytes cgroup_available_kib
+    available_kib="$(awk '/^MemAvailable:/ { print $2; exit }' /proc/meminfo)"
+
+    if [ -r /sys/fs/cgroup/memory.max ] && [ -r /sys/fs/cgroup/memory.current ]; then
+        read -r limit_bytes < /sys/fs/cgroup/memory.max
+        read -r current_bytes < /sys/fs/cgroup/memory.current
+        if [[ "$limit_bytes" =~ ^[0-9]+$ && "$current_bytes" =~ ^[0-9]+$ ]]; then
+            if [ "$current_bytes" -ge "$limit_bytes" ]; then
+                cgroup_available_kib=0
+            else
+                cgroup_available_kib=$(((limit_bytes - current_bytes) / 1024))
+            fi
+            [ "$cgroup_available_kib" -lt "$available_kib" ] && available_kib="$cgroup_available_kib"
+        fi
+    elif [ -r /sys/fs/cgroup/memory/memory.limit_in_bytes ] \
+        && [ -r /sys/fs/cgroup/memory/memory.usage_in_bytes ]; then
+        read -r limit_bytes < /sys/fs/cgroup/memory/memory.limit_in_bytes
+        read -r current_bytes < /sys/fs/cgroup/memory/memory.usage_in_bytes
+        if [[ "$limit_bytes" =~ ^[0-9]+$ && "$current_bytes" =~ ^[0-9]+$ ]] \
+            && [ "$limit_bytes" -lt 9223372036854771712 ]; then
+            if [ "$current_bytes" -ge "$limit_bytes" ]; then
+                cgroup_available_kib=0
+            else
+                cgroup_available_kib=$(((limit_bytes - current_bytes) / 1024))
+            fi
+            [ "$cgroup_available_kib" -lt "$available_kib" ] && available_kib="$cgroup_available_kib"
+        fi
+    fi
+
+    printf '%s\n' "$available_kib"
+}
+
+helios_budget_limit_cargo_jobs() {
+    local available_kib reserve_kib per_job_kib safe_jobs requested_jobs cpu_count
+    available_kib="$(helios_budget_available_memory_kib)"
+    reserve_kib=$((3 * 1024 * 1024))
+    per_job_kib=$((2560 * 1024))
+
+    # Refuse to start even one compiler when it would consume the reserve
+    # intended to keep WSL responsive under memory pressure.
+    if [ "$available_kib" -lt $((reserve_kib + per_job_kib)) ]; then
+        echo "Refus : seulement $(helios_budget_format_gib "$((available_kib * 1024))") de mémoire disponible dans WSL." >&2
+        echo "  Fermez des processus ou attendez avant de lancer une compilation Helios." >&2
+        exit 75
+    fi
+
+    safe_jobs=$(((available_kib - reserve_kib) / per_job_kib))
+    [ "$safe_jobs" -gt 4 ] && safe_jobs=4
+    cpu_count="$(nproc)"
+    [ "$safe_jobs" -gt "$cpu_count" ] && safe_jobs="$cpu_count"
+    requested_jobs="${CARGO_BUILD_JOBS:-$safe_jobs}"
+    if ! [[ "$requested_jobs" =~ ^[1-9][0-9]*$ ]]; then
+        echo "Refus : CARGO_BUILD_JOBS doit être un entier positif." >&2
+        exit 2
+    fi
+    if [ "$requested_jobs" -gt "$safe_jobs" ]; then
+        echo "Avertissement : CARGO_BUILD_JOBS=$requested_jobs réduit à $safe_jobs selon la mémoire WSL disponible." >&2
+        requested_jobs="$safe_jobs"
+    fi
+    export CARGO_BUILD_JOBS="$requested_jobs"
+    echo "==> Compilation Cargo WSL limitée à $CARGO_BUILD_JOBS job(s) ($(helios_budget_format_gib "$((available_kib * 1024))") disponibles, réserve de 3 GiB)" >&2
 }
 
 # Every Helios Cargo target this machine holds, one per line, deduplicated.
@@ -78,6 +144,8 @@ helios_budget_report_targets() {
 helios_budget_enter() {
     local repo_root="$1"
     helios_budget_on_wsl || return 0
+
+    helios_budget_limit_cargo_jobs
 
     helios_budget_target_dir="${HELIOS_WSL_TARGET_DIR:-$HOME/.cache/helios-target}"
     helios_budget_warning_gib="${HELIOS_WSL_BUILD_WARNING_GIB:-$helios_budget_default_warning_gib}"
