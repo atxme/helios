@@ -119,8 +119,12 @@ connexion à la gateway.
 ## 5. Critères d'acceptation
 
 1. Golden : une règle de rejet IPv6 par uplink, dans chaque état, avec
-   `meta nfproto ipv6` ; aucune règle `accept` IPv6 en `forward` sans le
-   drapeau NAT66 ; tests `ipv6_relay` mis à jour en conséquence.
+   `meta nfproto ipv6` ; sans le drapeau NAT66, aucune règle `accept` de
+   `forward` qu'un paquet IPv6 entrant par `wg_iface` peut atteindre, hormis
+   le retour de flux `ct state established,related` ; la seule règle
+   `accept` de `forward` qui sélectionne l'IPv6 est le contournement
+   split-tunnel, borné à `iifname <lan>` (§7) ; tests `ipv6_relay` mis à jour
+   en conséquence.
 2. Octets Netlink : `reject` `icmpx` `admin-prohibited` encodé exactement.
 3. Avec le drapeau NAT66 (si retenu) : forward et masquerade IPv6 présents
    seulement en `Up`, dans la même transaction, absents sinon.
@@ -158,14 +162,16 @@ Prises le 2 octobre 2026 :
   transaction que le reste du ruleset.
 - **Critère 1** : golden tests et `ruleset/tests/ipv6_relay.rs` (présence,
   forme exacte, ordre, aucun `accept` en `forward` ne prend l'IPv6 entrant
-  par `wg_iface`, aucun masquerade IPv6). **Critère 2** : octets de l'expression dans un `Batch` finalisé
+  par `wg_iface` ou par un WAN, aucun masquerade IPv6). **Critère 2** : octets de l'expression dans un `Batch` finalisé
   (`netlink/expressions.rs`). **Critère 4** : procédure « Sortie Internet IPv6
   refusée » de [MANUAL-TESTING.md](../testing/MANUAL-TESTING.md), non encore
   exécutée.
 - **Split-tunnel** : par décision de l'opérateur, les contournements
-  `split_tunnel_cidrs` ne s'appliquent plus au trafic entrant par
-  `wg_iface`, dans les deux familles. Un CIDR IPv6 est rendu, en `Up`,
-  `forward iifname != "<wg_iface>" ip6 daddr <cidr> accept` : il reste ouvert
-  au trafic qui n'entre pas par le tunnel, et l'IPv6 d'un client du tunnel
-  atteint le rejet. Sans `wg_iface`, la règle garde sa forme sans interface
-  d'entrée (FIREWALL-V2, « Rejet explicite de la sortie IPv6 des clients »).
+  `split_tunnel_cidrs` ne s'appliquent qu'au trafic entrant par une interface
+  LAN, dans les deux familles. En `Up`, chaque interface de `lan_ifaces` et
+  chaque CIDR IPv6 donnent
+  `forward iifname "<lan>" ip6 daddr <cidr> accept` : l'IPv6 d'un client du
+  tunnel atteint le rejet, et une nouvelle connexion entrant par un WAN vers
+  un préfixe IPv6 global du LAN n'est pas acceptée. Sans interface LAN, aucun
+  contournement n'est rendu, quel que soit `wg_iface` ; un CIDR invalide reste
+  refusé (FIREWALL-V2, « Rejet explicite de la sortie IPv6 des clients »).

@@ -16,10 +16,11 @@
 //! masquerade selects IPv6 — they fail the moment one does, so that NAT66 or
 //! any other IPv6 relay cannot slip in as a side effect — and the rejection is
 //! present, exact and last. The only `forward` acceptance of IPv6 is an
-//! operator's IPv6 split-tunnel CIDR, which never applies to traffic entering
-//! by the tunnel interface. The other rules that select IPv6 are the gateway's
-//! own link control (neighbor and router discovery, MLD, DHCPv6), in `input`
-//! and `output` on its WAN and LAN interfaces; they relay nothing.
+//! operator's IPv6 split-tunnel CIDR, which applies only to traffic entering
+//! by a LAN interface — never by the tunnel interface nor by a WAN. The other
+//! rules that select IPv6 are the gateway's own link control (neighbor and
+//! router discovery, MLD, DHCPv6), in `input` and `output` on its WAN and LAN
+//! interfaces; they relay nothing.
 
 use super::super::*;
 use super::support::{every_state, policy, render};
@@ -27,6 +28,8 @@ use aether::PolicyMode;
 
 const UPLINKS: [&str; 2] = ["enp3s0", "wlo1"];
 const TUNNEL: &str = "helios0";
+/// The fixture's LAN interface, the only one a split-tunnel bypass names.
+const LAN: &str = "eth1";
 /// An IPv6 split-tunnel CIDR, so that the sweep sees the one `forward` rule
 /// allowed to accept IPv6.
 const IPV6_SPLIT_TUNNEL: &str = "fd00:50::/64";
@@ -187,12 +190,12 @@ fn selects_ipv6(m: &Match) -> bool {
 }
 
 /// The operator's IPv6 split-tunnel bypass, exactly as `kill_switch` scopes
-/// it: off the traffic entering by the tunnel interface.
+/// it: to the traffic entering by the LAN interface.
 fn ipv6_split_tunnel_bypass() -> Rule {
     Rule::new(
         ChainKind::Forward,
         vec![
-            Match::NotInIface(TUNNEL.into()),
+            Match::InIface(LAN.into()),
             Match::DestNet(IPV6_SPLIT_TUNNEL.parse().expect("a valid IPv6 CIDR")),
         ],
         Verdict::Accept,
@@ -201,8 +204,8 @@ fn ipv6_split_tunnel_bypass() -> Rule {
 
 /// No relay accepts IPv6: every `forward` rule that selects IPv6, ICMPv6
 /// control included, is the rejection or the operator's IPv6 split-tunnel
-/// bypass — present only in `Up` and never for traffic entering by the
-/// tunnel interface — and no masquerade selects it. Opening an IPv6 relay —
+/// bypass — present only in `Up` and only for traffic entering by the LAN
+/// interface — and no masquerade selects it. Opening an IPv6 relay —
 /// NAT66 first among them, out of the scope of SORTIE-IPV6 — is meant to fail
 /// here, so that the change is reviewed as the decision it is.
 #[test]
@@ -242,37 +245,40 @@ fn selects_ipv4(m: &Match) -> bool {
     }
 }
 
-/// Whether a packet entering by the tunnel interface can satisfy the rule's
-/// interface matches: no exclusion of the tunnel, and no other input
-/// interface required.
-fn may_enter_by_the_tunnel(rule: &Rule) -> bool {
+/// Whether a packet entering by `iface` can satisfy the rule's interface
+/// matches: no other input interface required.
+fn may_enter_by(rule: &Rule, iface: &str) -> bool {
     rule.matches.iter().all(|m| match m {
-        Match::NotInIface(iface) => iface != TUNNEL,
-        Match::InIface(iface) => iface == TUNNEL,
+        Match::InIface(required) => required == iface,
         _ => true,
     })
 }
 
-/// No `forward` acceptance can take IPv6 entering by the tunnel interface,
-/// whatever its destination — an IPv6 split-tunnel CIDR included
-/// (ADRESSAGE-IPV6 §6.4, SORTIE-IPV6). Every acceptance a tunnel packet can
+/// No `forward` acceptance can take IPv6 entering by the tunnel interface or
+/// by a WAN, whatever its destination — an IPv6 split-tunnel CIDR included
+/// (ADRESSAGE-IPV6 §6.4, SORTIE-IPV6). Every acceptance such a packet can
 /// reach is IPv4-only, except the return path of an already accepted flow,
 /// `ct state established,related`. The IPv6 split-tunnel bypass is in the
-/// sweep, so a renderer that dropped its `iifname != wg_iface` fails here.
+/// sweep, so a renderer that dropped its `iifname <lan>` fails here: from the
+/// tunnel it would relay the clients' IPv6, from a WAN it would open the LAN
+/// to the Internet.
 #[test]
-fn no_forward_rule_accepts_ipv6_entering_by_the_tunnel() {
+fn no_forward_rule_accepts_ipv6_entering_by_the_tunnel_or_a_wan() {
     let return_path = [Match::ConnectionState(
         ConnectionStates::ESTABLISHED_RELATED,
     )];
+    let entries: Vec<&str> = [TUNNEL].into_iter().chain(UPLINKS).collect();
     for r in every_rendering() {
         for rule in r.ruleset.chain(ChainKind::Forward) {
             if rule.verdict != Verdict::Accept || rule.matches == return_path {
                 continue;
             }
-            assert!(
-                !may_enter_by_the_tunnel(rule) || rule.matches.iter().any(selects_ipv4),
-                "{r}: `{rule}` would accept IPv6 entering by `{TUNNEL}`"
-            );
+            for entry in &entries {
+                assert!(
+                    !may_enter_by(rule, entry) || rule.matches.iter().any(selects_ipv4),
+                    "{r}: `{rule}` would accept IPv6 entering by `{entry}`"
+                );
+            }
         }
         // The bypass the sweep guards is rendered where it exists, otherwise
         // the sweep would pass on a renderer that stopped emitting it.
@@ -375,7 +381,7 @@ fn no_rejection_without_a_tunnel_interface() {
 /// The rules that select IPv6 are the gateway's own link control, in
 /// `input` or `output` and scoped to one of its WAN or LAN interfaces, the
 /// tunnel clients' egress rejection in `forward`, and the operator's IPv6
-/// split-tunnel bypass, off the tunnel interface. A rule selecting IPv6
+/// split-tunnel bypass, scoped to the LAN interface. A rule selecting IPv6
 /// anywhere else — on the tunnel, an overlay, or unscoped — fails here.
 #[test]
 fn rules_selecting_ipv6_are_link_control_or_the_egress_rejection() {

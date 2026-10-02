@@ -224,7 +224,7 @@ fn everything_open_policy() -> FirewallPolicy {
     p.allow_tunnel_icmp = true;
     p.allow_ssh_over_tunnel = true;
     p.iperf_port = Some(5201);
-    p.split_tunnel_cidrs = vec!["192.168.50.0/24".into()];
+    p.split_tunnel_cidrs = vec!["192.168.50.0/24".into(), "2001:db8:50::/48".into()];
     p.mss_clamp = Some(1280);
     p
 }
@@ -322,7 +322,8 @@ input iifname \"helios0\" udp dport 5201 accept
 output oifname \"helios0\" udp dport 5201 accept
 input ip saddr 198.51.100.7/32 tcp dport 22 accept
 input iifname \"tailscale0\" tcp dport 22 accept
-forward iifname != \"helios0\" ip daddr 192.168.50.0/24 accept
+forward iifname \"eth1\" ip daddr 192.168.50.0/24 accept
+forward iifname \"eth1\" ip6 daddr 2001:db8:50::/48 accept
 forward iifname \"eth1\" oifname \"enp3s0\" accept
 forward iifname \"eth1\" oifname \"wlo1\" accept
 forward meta nfproto ipv4 iifname \"helios0\" oifname \"enp3s0\" accept
