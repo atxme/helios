@@ -79,7 +79,7 @@ Les nouveaux concepts structurés sont :
 | `admin_port`, `admin_iface` | `administration::admin_api` | accept borné puis drop générique | règles ordonnées dans `input` |
 | `split_tunnel_cidrs` | `kill_switch::state_gated_openings` | `InIface(lan)` + `DestNet`, une règle par interface LAN et par CIDR ; aucune sans `lan_ifaces` | `Meta` + `Cmp`, puis famille réseau + masque + `Cmp` |
 | `mss_clamp` | policy runtime, acceptée seulement si le backend l’annonce | `Ruleset::mss_clamp` si trafic autorisé | capacité non annoncée par Netlink ; refus défensif avant envoi |
-| `captive_portal_gateway` | `kill_switch::state_gated_openings` | WAN, destination, TCP 80/443 | `Meta`, famille réseau, `Payload`, `Cmp` |
+| `captive_portal_gateway` | `kill_switch::state_gated_openings` | `output` : `OutIface(wan)`, `DestNet` si la passerelle est connue, TCP 80/443, une règle par WAN ; `forward` : `InIface(lan)` + `OutIface(wan)` puis la même suite, une règle par interface LAN et par WAN ; aucune en `forward` sans `lan_ifaces` | `Meta`, famille réseau, `Payload`, `Cmp` |
 | `nordvpn_meshnet` | `meshnet::nordvpn_meshnet` | marque, interface, pairs, ports ; `Icmp` et drops des réseaux locaux de la famille du pair (`PRIVATE_IPV4_CIDRS` ou `PRIVATE_IPV6_CIDRS`) avant ses accepts | `Meta`, famille réseau, `Payload`, `Cmp` |
 
 Les invariants sans champ de configuration sont compilés directement :
@@ -126,12 +126,11 @@ IPv4 `/32` tiennent déjà l’IPv6 hors de `helios0` ; pour un pair qui en port
 une (`ADRESSAGE-IPV6.md`), la garde et le rejet ci-dessous sont ce qui empêche
 son IPv6 de sortir.
 
-Restent hors de ce lot et agnostiques à la famille : le `forward` LAN → WAN
-site-to-site et, en portail captif sans passerelle connue, le `forward`
-HTTP/HTTPS vers le WAN. Les contournements `split_tunnel_cidrs` et les règles
-Meshnet nomment une adresse et reçoivent déjà la garde de sa famille ; les
-contournements ne s’appliquent en outre qu’au trafic entrant par une interface
-LAN (section suivante). La
+Reste hors de ce lot et agnostique à la famille : le `forward` LAN → WAN
+site-to-site. Les contournements `split_tunnel_cidrs` et les règles Meshnet
+nomment une adresse et reçoivent déjà la garde de sa famille ; les
+contournements et l’ouverture relayée du portail captif ne s’appliquent en
+outre qu’au trafic entrant par une interface LAN (section suivante). La
 restriction du masquerade à `iifname wg_iface` reste une décision ouverte.
 
 ### Rejet explicite de la sortie IPv6 des clients
@@ -195,10 +194,30 @@ acceptée. Sans interface LAN, aucun contournement n’est rendu, quel que soit
 qu’un CIDR invalide reste refusé par `check_policy`. L’IR n’a pas de
 correspondance niée : la portée s’exprime avec `Match::InIface`.
 
+L’ouverture relayée du portail captif suit la même portée (décision de
+l’opérateur). En `CaptivePortal`, la gateway elle-même garde une règle par
+WAN en `output` ; en `forward`, pour chaque interface de `lan_ifaces` puis,
+pour chacune, chaque WAN dans l’ordre de la politique, le rendu est
+
+```text
+forward iifname "<lan>" oifname "<wan>" ip daddr <passerelle> tcp dport { 80, 443 } accept
+forward iifname "<lan>" oifname "<wan>" tcp dport { 80, 443 } accept
+```
+
+la seconde forme quand la passerelle du portail n’est pas connue. Bornée au
+seul WAN, cette règle relaierait en clair le HTTP/HTTPS des clients du tunnel
+vers le WAN, hors de toute décision `allow_client_internet`, et, sans
+passerelle connue, leur IPv6 avec lui, avant le rejet de
+`client_ipv6_egress`. Sans interface LAN, aucune ouverture n’est rendue en
+`forward` (fermeture par défaut) ; les règles `output` sont inchangées et
+l’adresse de la passerelle est malgré tout analysée, si bien qu’une adresse
+invalide reste refusée par `check_policy`.
+
 ### Ce que les tests verrouillent
 
 `ruleset/tests/ipv6_relay.rs` verrouille l’invariant pour chaque `TunnelState`,
-sous les deux `mode`, `allow_client_internet` actif ou non, sur deux uplinks :
+sous les deux `mode`, `allow_client_internet` actif ou non, avec une passerelle
+de portail captif connue puis inconnue, sur deux uplinks :
 toute règle `forward` acceptant de `wg_iface` vers un WAN porte `Family(Ipv4)` ;
 chaque uplink reçoit exactement la règle de rejet, dans l’ordre des uplinks ;
 ces rejets sont les dernières règles de `forward`, après l’acceptation
@@ -209,7 +228,10 @@ contournement IPv6 `iifname "<lan>"`, et aucun masquerade ne la
 sélectionne ; aucune règle `accept` de `forward` qu’un paquet entrant par
 `wg_iface` ou par un WAN peut atteindre n’accepte l’IPv6, hormis le retour de flux
 `ct state established,related` — les balayages portent un CIDR de
-split-tunnel IPv4 et un IPv6 ; hors de ces rejets et de ce contournement, les seules règles qui
+split-tunnel IPv4 et un IPv6 ; aucune ouverture HTTP/HTTPS du portail captif
+en `forward` ne peut être atteinte par un paquet entrant par `wg_iface` ou par
+un WAN, quelle que soit sa famille, et chacune commence par
+`iifname "<lan>"` ; hors de ces rejets et de ce contournement, les seules règles qui
 sélectionnent l’IPv6 sont le contrôle des liens de la gateway, en `input` et
 `output` sur ses interfaces WAN et LAN (section suivante) ; aucun rejet n’existe
 sans `wg_iface`, ni en `input` ou `output`. Le test sur `forward` doit échouer
@@ -225,7 +247,12 @@ vérifient la paire `Meta(NfProto)` + `Cmp` 2 avant l’interface et le
 n’est rendu sans interface LAN, qu’il y en a un par interface LAN et par CIDR
 dans l’ordre de la politique, qu’aucun ne peut être atteint par un paquet
 entrant par un WAN ou par `wg_iface`, et qu’un CIDR invalide est refusé par
-`check_policy` même sans interface LAN.
+`check_policy` même sans interface LAN. Pour le portail captif, il vérifie
+qu’aucune ouverture n’est rendue en `forward` sans interface LAN alors que
+celles d’`output` restent présentes, qu’il y en a une par interface LAN et par
+WAN dans l’ordre de la politique, et qu’une adresse de passerelle invalide est
+refusée même sans interface LAN. Les golden tests du portail captif, passerelle
+connue et inconnue, montrent la règle `forward` bornée à `iifname "eth1"`.
 
 ### Réseaux locaux Meshnet par famille
 

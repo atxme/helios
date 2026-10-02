@@ -175,3 +175,12 @@ Prises le 2 octobre 2026 :
   un préfixe IPv6 global du LAN n'est pas acceptée. Sans interface LAN, aucun
   contournement n'est rendu, quel que soit `wg_iface` ; un CIDR invalide reste
   refusé (FIREWALL-V2, « Rejet explicite de la sortie IPv6 des clients »).
+- **Portail captif** : par décision de l'opérateur, l'ouverture HTTP/HTTPS
+  relayée en `CaptivePortal` ne s'applique qu'au trafic entrant par une
+  interface LAN :
+  `forward iifname "<lan>" oifname "<wan>" [ip daddr <passerelle>] tcp dport { 80, 443 } accept`,
+  une règle par interface LAN et par WAN, aucune sans interface LAN ; les
+  règles `output` de la gateway elle-même sont inchangées. Sans passerelle
+  connue, la règle ne nomme aucune adresse : bornée au seul WAN, elle
+  accepterait l'IPv6 d'un client du tunnel avant le rejet. Le balayage de
+  `ipv6_relay` couvre la passerelle connue et inconnue.
