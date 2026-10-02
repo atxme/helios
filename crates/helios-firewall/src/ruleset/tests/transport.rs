@@ -5,7 +5,7 @@ use super::support::{policy, render, text};
 #[test]
 fn down_blocks_lan_forward() {
     let rs = render(&policy(), TunnelState::Down);
-    assert_eq!(rs.default_verdict, Verdict::Drop);
+    assert_eq!(rs.default_verdict, DefaultVerdict::Drop);
     assert!(!text(&rs, ChainKind::Forward)
         .iter()
         .any(|r| r.contains("iifname \"eth1\"")));

@@ -90,9 +90,9 @@ pub(super) fn state_gated_openings(
         // The opening relays the family the masquerade rewrites, and only
         // that one. The table is `inet`: without the guard, an IPv6 packet on
         // the tunnel interface would be forwarded to the WAN as soon as the
-        // gateway enables IPv6 forwarding. WireGuard's IPv4-only AllowedIPs
-        // keep IPv6 off the tunnel today; the guard makes that explicit
-        // before any IPv6 tunnel address exists (ADRESSAGE-IPV6 §6.4).
+        // gateway enables IPv6 forwarding (ADRESSAGE-IPV6 §6.4). A peer's
+        // IPv6 bound for a WAN is rejected instead, last of `forward`, by
+        // module `client_ipv6_egress`.
         if policy.allow_client_internet && !policy.wg_iface.is_empty() {
             for wan in wan_ifaces {
                 rules.push(

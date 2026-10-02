@@ -10,8 +10,8 @@ use ipnetwork::IpNetwork;
 use rustables::{
     expr::{
         Bitwise, Cmp, CmpOp, ConnTrackState, Conntrack, ConntrackKey, Counter as NfCounter,
-        HighLevelPayload, ICMPv6HeaderField, IPv6HeaderField, Log as NfLog, Meta, MetaType,
-        NetworkHeaderField, TransportHeaderField,
+        HighLevelPayload, ICMPv6HeaderField, IPv6HeaderField, IcmpCode, Log as NfLog, Meta,
+        MetaType, NetworkHeaderField, Reject, RejectType, TransportHeaderField,
     },
     HookClass, Protocol, Rule as NfRule,
 };
@@ -19,7 +19,7 @@ use rustables::{
 use super::NetlinkBackend;
 use crate::ruleset::{
     Action, AddressFamily, ChainKind, ConnectionState, ConnectionStates, Counter, Icmpv6Type,
-    Match, L4,
+    Match, Verdict, L4,
 };
 
 const IP_PROTOCOL_ICMP: u8 = 1;
@@ -87,6 +87,32 @@ impl NetlinkBackend {
                 )))
             }
         })
+    }
+
+    /// Closes a rule under construction with its terminal verdict.
+    ///
+    /// The rejection is the `reject` expression and nothing else: the kernel
+    /// sends the ICMP answer, then drops the packet itself, so no `drop`
+    /// verdict follows it — exactly what `nft` emits for
+    /// `reject with icmpx admin-prohibited`.
+    pub(super) fn apply_verdict(rule: NfRule, verdict: Verdict) -> NfRule {
+        match verdict {
+            Verdict::Accept => rule.accept(),
+            Verdict::Drop => rule.drop(),
+            Verdict::RejectAdminProhibited => rule.with_expr(Self::reject_admin_prohibited()),
+        }
+    }
+
+    /// `reject with icmpx admin-prohibited`.
+    ///
+    /// `icmpx` is the family-agnostic rejection of an `inet` table: the
+    /// kernel answers an IPv6 packet with ICMPv6 type 1 code 1, an IPv4 one
+    /// with ICMP type 3 code 13. Both values are fixed here, never taken from
+    /// a caller.
+    fn reject_admin_prohibited() -> Reject {
+        Reject::default()
+            .with_type(RejectType::IcmpxUnreach)
+            .with_icmp_code(IcmpCode::AdminProhibited)
     }
 
     /// Encodes a packet mark as the native `u32` stored in the nftables meta
@@ -235,10 +261,96 @@ impl NetlinkBackend {
 mod tests {
     use rustables::{
         expr::{Payload, RawExpression, Register},
-        ProtocolFamily,
+        Batch, Chain, ProtocolFamily, Table,
     };
 
     use super::*;
+
+    /// The octets of `reject with icmpx admin-prohibited` as the kernel
+    /// receives them, read from a finalized batch rather than from the
+    /// `rustables` structures that produce them.
+    ///
+    /// Each value is a literal: `NFTA_RULE_EXPRESSIONS` (4) holding a single
+    /// `NFTA_LIST_ELEM` (1), named `reject` (`NFTA_EXPR_NAME` 1, no
+    /// terminator, padded to four octets), whose `NFTA_EXPR_DATA` (2) carries
+    /// `NFTA_REJECT_TYPE` (1) = `NFT_REJECT_ICMPX_UNREACH` (2) as a
+    /// big-endian `u32`, then `NFTA_REJECT_ICMP_CODE` (2) =
+    /// `NFT_REJECT_ICMPX_ADMIN_PROHIBITED` (3) as one octet plus padding.
+    /// Attribute headers are in host order, as Netlink defines them. The
+    /// single list element also proves that no `drop` verdict follows the
+    /// rejection.
+    #[test]
+    fn the_admin_prohibited_rejection_is_encoded_byte_for_byte() {
+        let table = Table::new(ProtocolFamily::Inet).with_name("helios");
+        let chain = Chain::new(&table).with_name("forward");
+        let rule = NetlinkBackend::apply_verdict(
+            NfRule::new(&chain).expect("a rule of a named chain"),
+            Verdict::RejectAdminProhibited,
+        );
+        let mut batch = Batch::new();
+        rule.add_to_batch(&mut batch);
+        let sent = batch.finalize();
+
+        const NESTED: u16 = 0x8000;
+        let header = |len: u16, kind: u16| [len.to_ne_bytes(), kind.to_ne_bytes()].concat();
+        let expected = [
+            header(40, NESTED | 4),
+            header(36, NESTED | 1),
+            header(10, 1),
+            b"reject\0\0".to_vec(),
+            header(20, NESTED | 2),
+            header(8, 1),
+            vec![0, 0, 0, 2],
+            header(5, 2),
+            vec![3, 0, 0, 0],
+        ]
+        .concat();
+        let found = sent
+            .windows(expected.len())
+            .filter(|window| *window == expected.as_slice())
+            .count();
+        assert_eq!(
+            found, 1,
+            "the reject expression list must appear once, exactly\n\
+             sent:     {sent:02x?}\nexpected: {expected:02x?}"
+        );
+
+        // The literals above are the kernel UAPI values.
+        assert_eq!(rustables::sys::NLA_F_NESTED, u32::from(NESTED));
+        assert_eq!(rustables::sys::NFTA_RULE_EXPRESSIONS, 4);
+        assert_eq!(rustables::sys::NFTA_LIST_ELEM, 1);
+        assert_eq!(rustables::sys::NFTA_EXPR_NAME, 1);
+        assert_eq!(rustables::sys::NFTA_EXPR_DATA, 2);
+        assert_eq!(rustables::sys::NFTA_REJECT_TYPE, 1);
+        assert_eq!(rustables::sys::NFTA_REJECT_ICMP_CODE, 2);
+        assert_eq!(rustables::sys::NFT_REJECT_ICMPX_UNREACH, 2);
+        assert_eq!(rustables::sys::NFT_REJECT_ICMPX_ADMIN_PROHIBITED, 3);
+    }
+
+    /// Accept and drop keep the verdict expressions `rustables` emits for
+    /// them: the rejection is the only verdict built by hand.
+    #[test]
+    fn accept_and_drop_keep_the_rustables_verdicts() {
+        let expressions = |rule: NfRule| {
+            rule.get_expressions()
+                .map(|list| list.iter().cloned().collect::<Vec<RawExpression>>())
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            expressions(NetlinkBackend::apply_verdict(
+                NfRule::default(),
+                Verdict::Accept
+            )),
+            expressions(NfRule::default().accept())
+        );
+        assert_eq!(
+            expressions(NetlinkBackend::apply_verdict(
+                NfRule::default(),
+                Verdict::Drop
+            )),
+            expressions(NfRule::default().drop())
+        );
+    }
 
     #[test]
     fn port_sets_are_expanded() {

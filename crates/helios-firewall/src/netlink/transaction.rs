@@ -8,13 +8,13 @@
 use aether::{FirewallPolicy, HeliosError, Result, TunnelState};
 use async_trait::async_trait;
 use rustables::{
-    expr::Masquerade, Batch, Chain, ChainPolicy, ChainType, Hook, HookClass, MsgType,
-    ProtocolFamily, Rule as NfRule, Table,
+    expr::Masquerade, Batch, Chain, ChainPolicy as NfChainPolicy, ChainType, Hook, HookClass,
+    MsgType, ProtocolFamily, Rule as NfRule, Table,
 };
 use tracing::{info, warn};
 
 use super::TABLE_NAME;
-use crate::ruleset::{render, ChainKind, MasqueradeRule, Match, Rule, Ruleset, Verdict};
+use crate::ruleset::{render, ChainKind, DefaultVerdict, MasqueradeRule, Match, Rule, Ruleset};
 use crate::{FirewallBackend, FirewallCapabilities};
 
 pub struct NetlinkBackend {
@@ -73,8 +73,8 @@ impl NetlinkBackend {
         }
 
         let policy = match rs.default_verdict {
-            Verdict::Drop => ChainPolicy::Drop,
-            Verdict::Accept => ChainPolicy::Accept,
+            DefaultVerdict::Drop => NfChainPolicy::Drop,
+            DefaultVerdict::Accept => NfChainPolicy::Accept,
         };
 
         for kind in [ChainKind::Input, ChainKind::Forward, ChainKind::Output] {
@@ -128,10 +128,7 @@ impl NetlinkBackend {
         for action in &rule.actions {
             nf = Self::apply_action(nf, action)?;
         }
-        Ok(match rule.verdict {
-            Verdict::Accept => nf.accept(),
-            Verdict::Drop => nf.drop(),
-        })
+        Ok(Self::apply_verdict(nf, rule.verdict))
     }
 
     /// Translates a masquerade rule: its matches — the IPv4 guard first —
@@ -204,7 +201,7 @@ mod tests {
 
     use super::*;
     use crate::ruleset::{
-        Action, AddressFamily, Counter, LogAction, RateLimit, RateLimitMode, RateUnit, L4,
+        Action, AddressFamily, Counter, LogAction, RateLimit, RateLimitMode, RateUnit, Verdict, L4,
     };
 
     fn network(value: &str) -> ipnetwork::IpNetwork {
@@ -294,13 +291,60 @@ mod tests {
 
         let egress: Vec<&Rule> = rs
             .chain(ChainKind::Forward)
-            .filter(|rule| rule.matches.contains(&Match::InIface("helios0".into())))
+            .filter(|rule| {
+                rule.verdict == Verdict::Accept
+                    && rule.matches.contains(&Match::InIface("helios0".into()))
+            })
             .collect();
         assert_eq!(egress.len(), 2, "one client egress rule per uplink");
         for rule in egress {
             let nf = NetlinkBackend::filter_rule(&forward, &rule.matches, rule)
                 .expect("the egress rule translates");
             assert_eq!(expressions(&nf)[..2], ipv4_guard(), "{rule}");
+        }
+    }
+
+    /// The rejection of the tunnel clients' IPv6 egress translates, on each
+    /// uplink, to the IPv6 guard, the two interfaces and the `reject`
+    /// expression — no verdict after it — and enters the same batch as the
+    /// rest of the ruleset, in a state where traffic is not allowed too.
+    #[test]
+    fn the_ipv6_egress_rejection_translates_behind_the_ipv6_guard_on_every_uplink() {
+        let ipv6_guard = [
+            RawExpression::from(Meta::new(MetaType::NfProto)),
+            RawExpression::from(Cmp::new(CmpOp::Eq, [10u8])),
+        ];
+        let reject = RawExpression::from(
+            rustables::expr::Reject::default()
+                .with_type(rustables::expr::RejectType::IcmpxUnreach)
+                .with_icmp_code(rustables::expr::IcmpCode::AdminProhibited),
+        );
+        let forward = chain(ChainKind::Forward.as_str());
+        for state in [TunnelState::Down, TunnelState::Up] {
+            let rs = render(&client_internet_policy(), state).expect("valid test policy");
+            assert!(NetlinkBackend::new().build_batch(&rs).is_ok(), "{state:?}");
+
+            let rejects: Vec<&Rule> = rs
+                .chain(ChainKind::Forward)
+                .filter(|rule| rule.verdict == Verdict::RejectAdminProhibited)
+                .collect();
+            assert_eq!(rejects.len(), 2, "{state:?}: one rejection per uplink");
+            for (rule, uplink) in rejects.into_iter().zip(["enp3s0", "wlo1"]) {
+                let nf = NetlinkBackend::filter_rule(&forward, &rule.matches, rule)
+                    .expect("the rejection translates");
+                let interfaces = expressions(
+                    &NfRule::default()
+                        .iiface("helios0")
+                        .expect("valid interface name")
+                        .oiface(uplink)
+                        .expect("valid interface name"),
+                );
+
+                let mut expected = ipv6_guard.to_vec();
+                expected.extend(interfaces);
+                expected.push(reject.clone());
+                assert_eq!(expressions(&nf), expected, "{state:?}: {rule}");
+            }
         }
     }
 
@@ -384,7 +428,7 @@ mod tests {
     #[test]
     fn a_complete_ruleset_translates_before_any_netlink_side_effect() {
         let ruleset = Ruleset {
-            default_verdict: Verdict::Drop,
+            default_verdict: DefaultVerdict::Drop,
             rules: vec![
                 crate::ruleset::Rule {
                     chain: ChainKind::Input,
@@ -438,7 +482,7 @@ mod tests {
         assert!(NetlinkBackend::new().build_batch(&ruleset).is_ok());
 
         let mut accept_by_default = ruleset;
-        accept_by_default.default_verdict = Verdict::Accept;
+        accept_by_default.default_verdict = DefaultVerdict::Accept;
         accept_by_default.masquerade_out = Vec::new();
         assert!(NetlinkBackend::new()
             .build_batch(&accept_by_default)
@@ -448,7 +492,7 @@ mod tests {
     #[test]
     fn mss_clamping_fails_translation_instead_of_being_ignored() {
         let ruleset = Ruleset {
-            default_verdict: Verdict::Drop,
+            default_verdict: DefaultVerdict::Drop,
             rules: Vec::new(),
             mss_clamp: Some(1280),
             masquerade_out: Vec::new(),
@@ -464,7 +508,7 @@ mod tests {
     #[test]
     fn two_port_sets_are_refused_instead_of_becoming_a_partial_rule() {
         let ruleset = Ruleset {
-            default_verdict: Verdict::Drop,
+            default_verdict: DefaultVerdict::Drop,
             rules: vec![crate::ruleset::Rule {
                 chain: ChainKind::Input,
                 matches: vec![
@@ -491,7 +535,7 @@ mod tests {
     #[test]
     fn anonymous_counters_and_logs_translate_before_any_side_effect() {
         let ruleset = Ruleset {
-            default_verdict: Verdict::Drop,
+            default_verdict: DefaultVerdict::Drop,
             rules: vec![crate::ruleset::Rule {
                 chain: ChainKind::Input,
                 matches: vec![Match::ConnectionState(
@@ -517,7 +561,7 @@ mod tests {
     #[test]
     fn named_counters_fail_translation_instead_of_becoming_anonymous() {
         let ruleset = Ruleset {
-            default_verdict: Verdict::Drop,
+            default_verdict: DefaultVerdict::Drop,
             rules: vec![crate::ruleset::Rule {
                 chain: ChainKind::Input,
                 matches: Vec::new(),
@@ -539,7 +583,7 @@ mod tests {
     #[test]
     fn invalid_log_prefix_fails_translation() {
         let ruleset = Ruleset {
-            default_verdict: Verdict::Drop,
+            default_verdict: DefaultVerdict::Drop,
             rules: vec![crate::ruleset::Rule {
                 chain: ChainKind::Input,
                 matches: Vec::new(),
@@ -560,7 +604,7 @@ mod tests {
     #[test]
     fn rate_limits_fail_translation_instead_of_being_ignored() {
         let ruleset = Ruleset {
-            default_verdict: Verdict::Drop,
+            default_verdict: DefaultVerdict::Drop,
             rules: vec![crate::ruleset::Rule {
                 chain: ChainKind::Input,
                 matches: Vec::new(),

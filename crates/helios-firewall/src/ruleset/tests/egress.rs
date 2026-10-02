@@ -316,8 +316,22 @@ fn meshnet_routing_mirrors_per_peer_routing_and_local_network_permissions() {
     }
 }
 
+/// The `forward` rules naming the tunnel interface, as displayed.
+fn tunnel_forward(rs: &Ruleset) -> Vec<String> {
+    text(rs, ChainKind::Forward)
+        .into_iter()
+        .filter(|r| r.contains("iifname \"helios0\""))
+        .collect()
+}
+
+/// The IPv6 rejection of the single uplink: present in every state, it
+/// refuses and opens nothing.
+const IPV6_REJECTION: &str =
+    "meta nfproto ipv6 iifname \"helios0\" oifname \"eth0\" reject with icmpx admin-prohibited";
+
 /// Closed by default: a gateway granting access to internal resources has
-/// no reason to route Internet traffic.
+/// no reason to route Internet traffic. The only `forward` rule naming the
+/// tunnel interface is then the IPv6 rejection.
 #[test]
 fn client_internet_egress_is_closed_by_default() {
     let rs = render(&policy(), TunnelState::Up);
@@ -325,9 +339,7 @@ fn client_internet_egress_is_closed_by_default() {
         rs.masquerade_out.is_empty(),
         "NAT applied without requesting it"
     );
-    assert!(!text(&rs, ChainKind::Forward)
-        .iter()
-        .any(|r| r.contains("iifname \"helios0\"")));
+    assert_eq!(tunnel_forward(&rs), [IPV6_REJECTION]);
 }
 
 /// NAT and forward must appear **and disappear** together with the
@@ -358,10 +370,9 @@ fn client_internet_egress_follows_tunnel_state_exactly() {
             rs.masquerade_out.is_empty(),
             "state {st:?}: NAT must not exist outside the tunnel"
         );
-        assert!(
-            !text(&rs, ChainKind::Forward)
-                .iter()
-                .any(|r| r.contains("iifname \"helios0\"")),
+        assert_eq!(
+            tunnel_forward(&rs),
+            [IPV6_REJECTION],
             "state {st:?}: client traffic must not traverse"
         );
     }

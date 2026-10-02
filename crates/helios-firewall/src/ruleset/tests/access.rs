@@ -314,7 +314,7 @@ fn fail_closed_default_is_always_drop() {
         TunnelState::Failed,
         TunnelState::Connecting,
     ] {
-        assert_eq!(render(&policy(), st).default_verdict, Verdict::Drop);
+        assert_eq!(render(&policy(), st).default_verdict, DefaultVerdict::Drop);
     }
 }
 
@@ -449,7 +449,7 @@ fn captive_portal_allows_http_to_gateway() {
     assert!(!text(&rs, ChainKind::Forward)
         .iter()
         .any(|r| r.contains("iifname \"eth1\" oifname")));
-    assert_eq!(rs.default_verdict, Verdict::Drop);
+    assert_eq!(rs.default_verdict, DefaultVerdict::Drop);
 }
 
 #[test]

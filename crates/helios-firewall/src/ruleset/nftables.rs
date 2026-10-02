@@ -140,11 +140,57 @@ impl ConnectionStates {
     }
 }
 
-/// Verdict of a rule or default policy of a chain.
+/// Terminal verdict of a rule.
+///
+/// Closed on purpose: a rejection is a named variant, not a free-form
+/// `reject` whose type and code a caller picks. Each variant is a decision
+/// reviewed as such, like the messages of [`Icmpv6Type`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
     Accept,
     Drop,
+    /// `reject with icmpx admin-prohibited`: the packet is dropped and its
+    /// sender receives "administratively prohibited" — ICMPv6 type 1 code 1
+    /// for an IPv6 packet, ICMP type 3 code 13 for an IPv4 one.
+    ///
+    /// It refuses exactly like [`Verdict::Drop`] and opens nothing; the only
+    /// difference is that the sender learns it at once instead of waiting for
+    /// its own timeout. Used for the tunnel clients' IPv6 Internet egress
+    /// (SORTIE-IPV6 §3.1), so that a dual-stack application falls back to
+    /// IPv4 immediately.
+    RejectAdminProhibited,
+}
+
+impl Verdict {
+    /// The nftables statement this verdict renders as.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Accept => "accept",
+            Self::Drop => "drop",
+            Self::RejectAdminProhibited => "reject with icmpx admin-prohibited",
+        }
+    }
+}
+
+/// Default policy of the hooked chains.
+///
+/// Separate from [`Verdict`] because nftables only takes `accept` or `drop`
+/// as a chain policy: a rejecting default is not representable, rather than
+/// refused late by the backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefaultVerdict {
+    Accept,
+    Drop,
+}
+
+impl DefaultVerdict {
+    /// The keyword `nft` uses for this chain policy.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Accept => "accept",
+            Self::Drop => "drop",
+        }
+    }
 }
 
 /// Packet/byte counter attached to a rule.
@@ -416,10 +462,7 @@ impl fmt::Display for Rule {
                 }
             }
         }
-        match self.verdict {
-            Verdict::Accept => write!(f, "accept"),
-            Verdict::Drop => write!(f, "drop"),
-        }
+        write!(f, "{}", self.verdict.as_str())
     }
 }
 
@@ -427,7 +470,7 @@ impl fmt::Display for Rule {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ruleset {
     /// Default policy of hooked chains (`Drop` = fail-closed).
-    pub default_verdict: Verdict,
+    pub default_verdict: DefaultVerdict,
     pub rules: Vec<Rule>,
     /// Requested MSS clamping, if any.
     ///
@@ -492,8 +535,9 @@ impl Ruleset {
 /// rewrites IPv6: the first IPv6 packet relayed to a WAN would be NAT66-ed,
 /// a translation nobody decided. The masquerade therefore carries
 /// `meta nfproto ipv4`. That guard is a fixed invariant — NAT44 exists
-/// because tunnel addresses are non-routable CGNAT, and IPv6 egress is a
-/// separate, still open decision — not a per-uplink choice, so
+/// because tunnel addresses are non-routable CGNAT, and the tunnel clients'
+/// IPv6 egress is rejected in `forward` (SORTIE-IPV6 §3.1), NAT66 being out
+/// of scope — not a per-uplink choice, so
 /// [`Ruleset::masquerade_out`] keeps listing uplinks only and this type adds
 /// the guard. Its matches are private and only [`Ruleset::masquerade_rules`]
 /// builds it: an unguarded or IPv6 masquerade cannot be represented.
@@ -541,6 +585,25 @@ mod tests {
         assert_eq!(
             rule.to_string(),
             "ct state invalid counter log prefix \"helios invalid: \" group 7 drop"
+        );
+    }
+
+    #[test]
+    fn the_admin_prohibited_rejection_renders_the_icmpx_statement() {
+        let rule = Rule::new(
+            ChainKind::Forward,
+            vec![
+                Match::Family(AddressFamily::Ipv6),
+                Match::InIface("helios0".into()),
+                Match::OutIface("eth0".into()),
+            ],
+            Verdict::RejectAdminProhibited,
+        );
+
+        assert_eq!(
+            rule.to_string(),
+            "meta nfproto ipv6 iifname \"helios0\" oifname \"eth0\" \
+             reject with icmpx admin-prohibited"
         );
     }
 
@@ -623,7 +686,7 @@ mod tests {
     #[test]
     fn masquerade_rules_carry_the_ipv4_guard_before_the_uplink() {
         let ruleset = Ruleset {
-            default_verdict: Verdict::Drop,
+            default_verdict: DefaultVerdict::Drop,
             rules: Vec::new(),
             mss_clamp: None,
             masquerade_out: vec!["enp3s0".into(), "wlo1".into()],
