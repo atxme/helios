@@ -628,6 +628,182 @@ async fn a_tunnel_prefix_change_is_refused_until_restart() {
     assert!(message.contains("restart"), "{message}");
 }
 
+// ─── Refused policy mutations ────────────────────────────────────────────────
+
+/// A backend that refuses every ruleset, as the kernel refuses a batch.
+struct RefusingFirewall;
+
+#[async_trait::async_trait]
+impl FirewallBackend for RefusingFirewall {
+    fn capabilities(&self) -> FirewallCapabilities {
+        FirewallCapabilities::default()
+    }
+
+    async fn apply(&self, _policy: &FirewallPolicy, _state: TunnelState) -> aether::Result<()> {
+        Err(aether::HeliosError::Firewall(
+            "transaction refused by the test backend".into(),
+        ))
+    }
+
+    async fn teardown(&self) -> aether::Result<()> {
+        Ok(())
+    }
+}
+
+/// What the main loop sees of one external command: its result — an `Err`
+/// is what stops the loop — and the events it emitted.
+async fn run_command(
+    cmd: OrchestratorCmd,
+    fw: &dyn FirewallBackend,
+    state: TunnelState,
+    shared_network: &Arc<RwLock<NetworkConfig>>,
+    policy: &mut FirewallPolicy,
+    shared_policy: &Arc<RwLock<FirewallPolicy>>,
+) -> (anyhow::Result<()>, Vec<HeliosEvent>) {
+    let (events, mut received) = broadcast::channel(8);
+    let (internal_tx, _internal_rx) = mpsc::channel(1);
+    let result = handle_external_cmd(
+        cmd,
+        shared_network,
+        true,
+        &helios_wireguard::DryRunBackend::new(),
+        &Arc::new(RwLock::new(state)),
+        &events,
+        fw,
+        policy,
+        &internal_tx,
+        shared_policy,
+        // TPM disabled: none of these commands rotates the gateway key.
+        &helios_tpm::BootDecision::Disabled,
+        &Arc::new(RwLock::new(Ipv6TunnelStatus::NotConfigured)),
+    )
+    .await;
+    let mut emitted = Vec::new();
+    while let Ok(event) = received.try_recv() {
+        emitted.push(event);
+    }
+    (result, emitted)
+}
+
+/// The one error log the refusal emitted, and nothing else: in particular no
+/// `SplitTunnelChanged` announcing a list that is not in force.
+fn single_error(events: &[HeliosEvent]) -> &str {
+    match events {
+        [HeliosEvent::Log { level, message }] if level == "error" => message,
+        other => panic!("expected one error log, got {other:?}"),
+    }
+}
+
+fn policy_with_split_tunnel(cidrs: &[&str]) -> FirewallPolicy {
+    let mut policy = configured_network().firewall_policy();
+    policy.split_tunnel_cidrs = cidrs.iter().map(|cidr| cidr.to_string()).collect();
+    policy
+}
+
+/// An invalid CIDR is refused in every state, not only in `Up` where the
+/// ruleset reads it: accepted while down, it would stop the orchestrator at
+/// the next promotion instead.
+#[tokio::test]
+async fn an_invalid_split_tunnel_cidr_keeps_the_running_policy() {
+    for state in [TunnelState::Up, TunnelState::Down] {
+        let running = policy_with_split_tunnel(&["192.168.1.0/24"]);
+        let mut policy = running.clone();
+        let shared_policy = Arc::new(RwLock::new(running.clone()));
+        let shared_network = Arc::new(RwLock::new(configured_network()));
+
+        let (result, events) = run_command(
+            OrchestratorCmd::SetSplitTunnel(vec!["192.168.1.0/24".into(), "fd00::/129".into()]),
+            &DryRunBackend,
+            state,
+            &shared_network,
+            &mut policy,
+            &shared_policy,
+        )
+        .await;
+
+        result.unwrap_or_else(|error| panic!("{state:?}: the loop must continue: {error:#}"));
+        assert_eq!(policy, running, "{state:?}");
+        assert_eq!(*shared_policy.read().await, running, "{state:?}");
+        let message = single_error(&events);
+        assert!(message.contains("fd00::/129"), "{message}");
+    }
+}
+
+/// The backend refusing a valid list leaves the previous one in force, and the
+/// orchestrator still takes the next command.
+#[tokio::test]
+async fn a_split_tunnel_list_the_backend_refuses_keeps_the_running_policy() {
+    let running = policy_with_split_tunnel(&["192.168.1.0/24"]);
+    let mut policy = running.clone();
+    let shared_policy = Arc::new(RwLock::new(running.clone()));
+    let shared_network = Arc::new(RwLock::new(configured_network()));
+    let requested = vec!["10.0.0.0/8".to_string(), "fd00:1::/64".to_string()];
+
+    let (result, events) = run_command(
+        OrchestratorCmd::SetSplitTunnel(requested.clone()),
+        &RefusingFirewall,
+        TunnelState::Up,
+        &shared_network,
+        &mut policy,
+        &shared_policy,
+    )
+    .await;
+
+    result.expect("the loop must continue");
+    assert_eq!(policy, running);
+    assert_eq!(*shared_policy.read().await, running);
+    let message = single_error(&events);
+    assert!(message.contains("refused by the test backend"), "{message}");
+
+    let (result, events) = run_command(
+        OrchestratorCmd::SetSplitTunnel(requested.clone()),
+        &DryRunBackend,
+        TunnelState::Up,
+        &shared_network,
+        &mut policy,
+        &shared_policy,
+    )
+    .await;
+
+    result.expect("a valid list applies");
+    assert_eq!(policy.split_tunnel_cidrs, requested);
+    assert_eq!(shared_policy.read().await.split_tunnel_cidrs, requested);
+    assert!(matches!(
+        events.as_slice(),
+        [HeliosEvent::SplitTunnelChanged { cidrs }] if *cidrs == requested
+    ));
+}
+
+/// A reload whose policy the firewall refuses is not applied at all — neither
+/// the policy nor the rest of the configuration — and the loop continues.
+#[tokio::test]
+async fn a_reload_the_firewall_refuses_keeps_the_running_configuration() {
+    let shared_network = Arc::new(RwLock::new(configured_network()));
+    let running = configured_network().firewall_policy();
+    let mut policy = running.clone();
+    let shared_policy = Arc::new(RwLock::new(running.clone()));
+    let mut incoming = configured_network();
+    incoming.split_tunnel_cidrs = vec!["10.0.0.0/33".into()];
+    incoming.peers[0].name = "renamed".into();
+
+    let (result, events) = run_command(
+        OrchestratorCmd::LoadNetworkConfig(Box::new(incoming)),
+        &DryRunBackend,
+        TunnelState::Down,
+        &shared_network,
+        &mut policy,
+        &shared_policy,
+    )
+    .await;
+
+    result.expect("the loop must continue");
+    assert_eq!(*shared_network.read().await, configured_network());
+    assert_eq!(policy, running);
+    assert_eq!(*shared_policy.read().await, running);
+    let message = single_error(&events);
+    assert!(message.contains("10.0.0.0/33"), "{message}");
+}
+
 // ─── IPv6 on the data plane (`ADRESSAGE-IPV6.md` §6.1, §6.2) ─────────────────
 
 const PREFIX: &str = "fd3c:91a2:7e04::1/64";
