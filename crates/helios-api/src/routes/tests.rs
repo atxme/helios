@@ -175,6 +175,23 @@ async fn status_exposes_an_unavailable_ipv6_with_its_reason() {
     );
 }
 
+/// The console shows a client's IPv6 VIP next to its IPv4 one, from the row
+/// it already polls: `null` without one, the persisted `/128` form with one.
+#[tokio::test]
+async fn status_carries_each_peer_ipv6_vip() {
+    let (app, _cmd_rx) = app_state(TunnelState::Up);
+    let response = serde_json::to_value(status(State(app.clone())).await.0).unwrap();
+    assert!(response["peers"][0]["address_v6"].is_null());
+
+    app.network.write().await.peers[0].address_v6 =
+        Some("fd3c:91a2:7e04:0:8a1f:3b2c:9d40:e517".parse().unwrap());
+    let response = serde_json::to_value(status(State(app)).await.0).unwrap();
+    assert_eq!(
+        response["peers"][0]["address_v6"],
+        serde_json::json!("fd3c:91a2:7e04:0:8a1f:3b2c:9d40:e517/128")
+    );
+}
+
 #[tokio::test]
 async fn status_exposes_useful_data_without_the_psk() {
     let (app, _cmd_rx) = app_state(TunnelState::Up);
