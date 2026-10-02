@@ -247,3 +247,14 @@ fn command_responses_preserve_refusal_details() {
     .unwrap_err();
     assert!(unknown.to_string().contains("unknown error"));
 }
+
+/// heliosd serves its API on the WireGuard address (`api_bind`); loopback is
+/// only the dry-run fallback. Without `--url`, aim where a gateway listens.
+#[test]
+fn the_default_api_url_is_the_in_tunnel_gateway_address() {
+    if std::env::var_os("HELIOS_URL").is_some() {
+        return;
+    }
+    let cli = Cli::try_parse_from(["helios", "status"]).unwrap();
+    assert_eq!(cli.url, aether::DEFAULT_WG_API_URL);
+}

@@ -27,7 +27,7 @@ mod palette;
 mod presentation;
 
 use palette::{suggestions, MenuKeys, Selection};
-use presentation::{dimensions, hint_text, Appearance, Gateway};
+use presentation::{dimensions, hint_text, Appearance, Gateway, Unavailable};
 
 /// Bounds the status-line refresh so an unreachable gateway cannot stall input.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -164,8 +164,17 @@ async fn probe(client: &Client, base: &str) -> Gateway {
             version: status.version,
             dry_run: status.dry_run,
         },
-        // Shown as unavailable; the commands themselves still report errors.
-        Ok(Err(_)) | Err(_) => Gateway::Unavailable,
+        // The commands themselves still report the full error.
+        Ok(Err(error))
+            if error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<reqwest::Error>()
+                    .is_some_and(reqwest::Error::is_decode)
+            }) =>
+        {
+            Gateway::Unavailable(Unavailable::Incompatible)
+        }
+        Ok(Err(_)) | Err(_) => Gateway::Unavailable(Unavailable::NoAnswer),
     }
 }
 
@@ -186,6 +195,26 @@ fn erase_frame(line: &str, hint: Option<&str>, size: (usize, usize)) -> bool {
     };
     print!("\x1b[{rows}A\r\x1b[J");
     io::stdout().flush().is_ok()
+}
+
+/// The line editor owns SIGINT for its whole lifetime, so a stuck command
+/// (an unreachable API, a WebSocket that never connects) would otherwise
+/// swallow every Ctrl-C. `None` means the command was abandoned.
+async fn interruptible(
+    command: impl std::future::Future<Output = Result<()>>,
+    interrupt: impl std::future::Future<Output = ()>,
+) -> Option<Result<()>> {
+    tokio::select! {
+        result = command => Some(result),
+        () = interrupt => None,
+    }
+}
+
+async fn ctrl_c() {
+    if tokio::signal::ctrl_c().await.is_err() {
+        // Without a handler the command simply runs to completion, as before.
+        std::future::pending::<()>().await;
+    }
 }
 
 async fn refresh(editor: &mut Editor<Commands, DefaultHistory>, client: &Client, base: &str) {
@@ -359,12 +388,14 @@ pub async fn run(client: &Client, base: &str) -> Result<()> {
         let width = dimensions(size).0;
         println!("{}", appearance.command_header(&path, width));
         let started = Instant::now();
-        match crate::execute_command(client, cli.url.trim_end_matches('/'), command).await {
-            Ok(()) => println!("{}", appearance.command_success(started.elapsed())),
-            Err(error) => eprintln!(
+        let command = crate::execute_command(client, cli.url.trim_end_matches('/'), command);
+        match interruptible(command, ctrl_c()).await {
+            Some(Ok(())) => println!("{}", appearance.command_success(started.elapsed())),
+            Some(Err(error)) => eprintln!(
                 "{}",
                 appearance.command_failure(&format!("{error:#}"), width)
             ),
+            None => eprintln!("\n{}", appearance.command_interrupted(width)),
         }
         refresh(&mut editor, client, &base).await;
     }
@@ -436,6 +467,15 @@ mod tests {
         assert_eq!(path("firmware list --ssh-target admin@gw"), "firmware list");
         assert_eq!(path("/campaign --client-key secret"), "campaign");
         assert_eq!(path("--url http://gw status"), "status");
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_abandons_a_stuck_command_and_returns_to_the_prompt() {
+        let stuck = std::future::pending::<Result<()>>();
+        assert!(interruptible(stuck, async {}).await.is_none());
+        let done = async { Ok(()) };
+        let never = std::future::pending::<()>();
+        assert!(matches!(interruptible(done, never).await, Some(Ok(()))));
     }
 
     #[test]

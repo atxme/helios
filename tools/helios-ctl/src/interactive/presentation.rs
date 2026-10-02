@@ -12,11 +12,20 @@ const SUCCESS: &str = "\x1b[32m";
 const FAILURE: &str = "\x1b[31m";
 const RESET: &str = "\x1b[0m";
 
+/// Why the status line has no gateway state to show.
+pub(super) enum Unavailable {
+    /// Refused or timed out. The firewall drops the API port on every
+    /// interface but the tunnel, loopback included: from the gateway's own
+    /// shell this is the expected answer, not a fault.
+    NoAnswer,
+    /// Something answered, but not with a status this tool can read.
+    Incompatible,
+}
+
 /// Last gateway status seen by the shell, shown under the input.
 pub(super) enum Gateway {
     Unknown,
-    /// No usable answer: unreachable, timed out or an incompatible response.
-    Unavailable,
+    Unavailable(Unavailable),
     Reachable {
         state: String,
         version: String,
@@ -147,6 +156,14 @@ impl Appearance {
         )
     }
 
+    /// Dropping the command does not recall a request already on the wire.
+    pub fn command_interrupted(self, width: usize) -> String {
+        self.command_failure(
+            "interrupted (a request already sent may still complete)",
+            width,
+        )
+    }
+
     /// Gateway error text is untrusted: controls are dropped, and long lines
     /// wrap rather than truncate so no part of the error is hidden.
     pub fn command_failure(self, error: &str, width: usize) -> String {
@@ -227,7 +244,12 @@ pub(super) fn hint_text(
     } else {
         let status = match gateway {
             Gateway::Unknown => format!("  ○ {base}"),
-            Gateway::Unavailable => format!("  ○ status unavailable · {base}"),
+            Gateway::Unavailable(Unavailable::NoAnswer) => {
+                format!("  ○ no API answer (tunnel only) · {base}")
+            }
+            Gateway::Unavailable(Unavailable::Incompatible) => {
+                format!("  ○ incompatible API response · {base}")
+            }
             Gateway::Reachable {
                 state,
                 version,
@@ -382,6 +404,9 @@ mod tests {
             words.lines().collect::<Vec<_>>(),
             ["  ⎿ ✗ refused: tcp", "      connect error"]
         );
+        let interrupted = plain.command_interrupted(80);
+        assert!(interrupted.starts_with("  ⎿ ✗ interrupted"));
+        assert!(!interrupted.contains('\x1b'));
         let colored = Appearance { color: true };
         assert!(colored.command_header("status", 80).contains('\x1b'));
         assert!(colored.command_failure("boom", 80).contains("\x1b[31m"));
@@ -403,8 +428,12 @@ mod tests {
             dry_run: true,
         };
         assert!(hint_text(None, 0, 80, 24, &dry, "http://gw").contains("· dry-run ·"));
-        let text = hint_text(None, 0, 80, 24, &Gateway::Unavailable, "http://gw");
-        assert!(text.contains("  ○ status unavailable · http://gw"));
+        let silent = Gateway::Unavailable(Unavailable::NoAnswer);
+        let text = hint_text(None, 0, 80, 24, &silent, "http://gw");
+        assert!(text.contains("  ○ no API answer (tunnel only) · http://gw"));
+        let odd = Gateway::Unavailable(Unavailable::Incompatible);
+        let text = hint_text(None, 0, 80, 24, &odd, "http://gw");
+        assert!(text.contains("  ○ incompatible API response · http://gw"));
         let hostile = Gateway::Reachable {
             state: "up\x1b[2J".into(),
             version: "\x1b]0;x\x07".into(),

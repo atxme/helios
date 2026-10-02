@@ -19,8 +19,8 @@ largeur au terminal. `NO_COLOR=1 helios` désactive les couleurs.
 Sous la saisie, une ligne d'état rappelle l'API active, l'état du tunnel, la
 version de `heliosd` et le mode dry-run. Elle est relue sur `/api/status` au
 démarrage, après `/use` et après chaque commande, avec un délai de 2 s : une
-gateway muette ou incompatible s'affiche `○ status unavailable` sans bloquer
-la saisie. Chaque commande
+API muette s'affiche `○ no API answer (tunnel only)`, une réponse illisible
+`○ incompatible API response`, sans bloquer la saisie. Chaque commande
 s'affiche dans un bloc ouvert par `⏺ <commande>` et fermé par `⎿ ✓ <durée>`, ou
 par `⎿ ✗ <erreur>` en rouge, sans troncature. L'en-tête nomme la commande sans recopier les
 valeurs des arguments, qui peuvent contenir des clés. Le cadre de saisie ne
@@ -45,7 +45,8 @@ Toutes les commandes de l'interface scriptée sont accessibles, avec ou sans
 change l'API active ; `--url` peut la remplacer pour une commande. `/clear`
 efface l'écran et réaffiche l'accueil avec l'API active. Les arguments
 entre guillemets sont acceptés, sans expansion de variables ni exécution de
-shell. Ctrl-C efface la saisie ; dans `watch`, il rend la main. Ctrl-D ou `/quit`
+shell. Ctrl-C efface la saisie ; pendant une commande, il l'abandonne et rend
+la main (une requête déjà partie peut aboutir sur la gateway). Ctrl-D ou `/quit`
 ferme le terminal. Une erreur de commande rend la main. L'historique n'est
 jamais écrit sur disque ; les commandes `campaign`, susceptibles de contenir
 une clé privée, en sont exclues. Aucune IA n'est intégrée.
@@ -59,7 +60,14 @@ doivent utiliser `helios` après la nouvelle livraison.
 
 ## Cible de la maintenance
 
-`--url` cible seulement l'API. `update` et `update --check` agissent sur la machine
+`--url` cible seulement l'API. Par défaut, `http://100.64.0.1:8080`
+(`aether::DEFAULT_WG_API_URL`), l'adresse où heliosd sert l'API dans le
+tunnel ; un daemon en simulation (`heliosd run --dev`) écoute sur
+`http://127.0.0.1:8080`, à passer avec `--url` ou `HELIOS_URL`. Le pare-feu
+n'accepte l'API que par l'interface du tunnel, boucle locale comprise : depuis
+le shell de la gateway, seules les commandes locales (`update`, `firmware`,
+`profile check`) répondent, et la ligne d'état affiche
+`○ no API answer (tunnel only)`. `update` et `update --check` agissent sur la machine
 qui exécute le terminal. `firmware list` est local par défaut ; `--ssh-target`
 le dirige vers une gateway. L'inventaire utilise les métadonnées déjà présentes,
 sans rafraîchissement ni installation. Un échec d'inventaire est une erreur,

@@ -58,7 +58,9 @@ EXAMPLES:
   cargo run -p helios-ctl -- --url http://192.168.1.1:8080 status"
 )]
 struct Cli {
-    #[arg(long, default_value = "http://127.0.0.1:8080", env = "HELIOS_URL")]
+    /// Gateway API. heliosd serves it on its WireGuard address; a dry-run
+    /// daemon (`heliosd run --dev`) listens on http://127.0.0.1:8080 instead.
+    #[arg(long, default_value = aether::DEFAULT_WG_API_URL, env = "HELIOS_URL")]
     url: String,
 
     #[command(subcommand)]
