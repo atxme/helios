@@ -79,6 +79,9 @@ logged as an error on the event stream, and does not stop the orchestrator.
 `POST /api/split-tunnel` checks each CIDR with the ruleset compiler's parser and
 `POST /api/network` checks the whole policy: both answer `400`, naming the
 refused address, and send and write nothing.
+At startup the same check is fatal: `heliosd run` refuses a `network.toml`
+whose policy does not compile for every state, naming the address, before the
+TPM unseal and any networking.
 
 ## Key negotiation (v5)
 

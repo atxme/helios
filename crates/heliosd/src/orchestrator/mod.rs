@@ -431,6 +431,19 @@ fn publish_readiness(dry_run: bool, firewall_mode: FirewallMode) -> anyhow::Resu
     Ok(())
 }
 
+/// Refuses to start on a configuration whose firewall policy does not compile.
+///
+/// The startup ruleset is the `Down` one, which does not read every field —
+/// the split-tunnel CIDRs, for instance, only enter `Up`. Without this check a
+/// typo in `network.toml` would start cleanly and stop the gateway at the
+/// first promotion, long after the operator stopped watching the logs. Same
+/// check as a policy change at runtime ([`data_plane::commit_policy`]), but
+/// fatal here: there is no running configuration to keep.
+pub(crate) fn check_startup_policy(network: &NetworkConfig) -> anyhow::Result<()> {
+    helios_firewall::ruleset::check_policy(&network.firewall_policy())
+        .context("network.toml: the firewall policy does not compile — stopping")
+}
+
 pub fn status(network: &NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
     println!("heliosd v{VERSION}");
     println!(

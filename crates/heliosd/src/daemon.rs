@@ -53,6 +53,9 @@ pub(crate) async fn run(
     // masquerade are bound to this name, and resolving it later would mean
     // building the kill-switch around an interface we had not chosen yet.
     resolve_uplink(&mut network)?;
+    // Once the uplink names are known, since the policy is built from them,
+    // and still before the TPM unseal and any networking.
+    orchestrator::check_startup_policy(&network)?;
 
     // The guard that used to stand here — refusing to start when
     // `key_negotiation_port` was set on a binary built without the feature —

@@ -1189,3 +1189,21 @@ fn the_status_command_describes_the_ipv6_outcome() {
     assert!(degraded.contains("IPv4-only"), "{degraded}");
     assert!(degraded.contains("1200"), "{degraded}");
 }
+
+/// A `network.toml` the `Down` ruleset accepts but `Up` would refuse stops
+/// the start, naming the entry, instead of the first promotion.
+#[test]
+fn a_policy_that_does_not_compile_refuses_the_start() {
+    let mut network = dual_stack_network();
+    network.split_tunnel_cidrs = vec!["192.168.10.0/24".into(), "fd12:3456:789a::/48".into()];
+    check_startup_policy(&network).unwrap();
+
+    network.split_tunnel_cidrs.push("10.0.0.0/33".into());
+    let refusal = format!("{:#}", check_startup_policy(&network).unwrap_err());
+    assert!(refusal.contains("10.0.0.0/33"), "{refusal}");
+
+    let mut network = configured_network();
+    network.allow_ssh_from = vec!["fd00::/129".into()];
+    let refusal = format!("{:#}", check_startup_policy(&network).unwrap_err());
+    assert!(refusal.contains("fd00::/129"), "{refusal}");
+}
