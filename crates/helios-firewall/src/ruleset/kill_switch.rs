@@ -3,9 +3,10 @@
 //! Everything rendered here exists only in a state where traffic is allowed,
 //! or under the captive-portal derogation — and the two are exclusive, which
 //! is why they are a single `if`/`else if` and not two independent sections.
-//! A captive portal opens HTTP/HTTPS and nothing else; an operational tunnel
-//! opens the split-tunnel bypasses (from the LAN only), the LAN forward and,
-//! on request, the road-warrior egress.
+//! A captive portal opens HTTP/HTTPS and nothing else, for the gateway itself
+//! and, relayed, for its LAN only; an operational tunnel opens the
+//! split-tunnel bypasses (from the LAN only), the LAN forward and, on request,
+//! the road-warrior egress.
 
 use aether::{FirewallPolicy, Result, TunnelState};
 
@@ -24,40 +25,58 @@ pub(super) fn state_gated_openings(
             ports: vec![80, 443],
             proto: L4::Tcp,
         };
-        match &policy.captive_portal_gateway {
-            Some(gw) => {
-                for chain in [Output, Forward] {
-                    for wan in wan_ifaces {
-                        rules.push(
-                            Rule::new(
-                                chain,
-                                vec![
-                                    Match::OutIface(wan.clone()),
-                                    Match::DestNet(parse_network(gw)?),
-                                    ports.clone(),
-                                ],
-                                Verdict::Accept,
-                            )
-                            .with_note(format!("captive portal: HTTP/HTTPS to {gw}")),
-                        );
-                    }
-                }
-            }
-            None => {
-                // Unknown gateway: let the browser reach the portal's landing
-                // page, whatever its destination.
-                for chain in [Output, Forward] {
-                    for wan in wan_ifaces {
-                        rules.push(
-                            Rule::new(
-                                chain,
-                                vec![Match::OutIface(wan.clone()), ports.clone()],
-                                Verdict::Accept,
-                            )
-                            .with_note("captive portal: unknown gateway"),
-                        );
-                    }
-                }
+        // A known gateway narrows the opening to its address; an unknown one
+        // lets the browser reach the portal's landing page, whatever its
+        // destination. The address is parsed before any rule is emitted, LAN
+        // interfaces or not, so that an invalid gateway fails the render
+        // whatever the topology.
+        let (destination, note) = match &policy.captive_portal_gateway {
+            Some(gw) => (
+                Some(parse_network(gw)?),
+                format!("captive portal: HTTP/HTTPS to {gw}"),
+            ),
+            None => (None, "captive portal: unknown gateway".to_string()),
+        };
+        let opening = |mut matches: Vec<Match>| {
+            matches.extend(destination.map(Match::DestNet));
+            matches.push(ports.clone());
+            matches
+        };
+
+        // The gateway itself.
+        for wan in wan_ifaces {
+            rules.push(
+                Rule::new(
+                    Output,
+                    opening(vec![Match::OutIface(wan.clone())]),
+                    Verdict::Accept,
+                )
+                .with_note(note.clone()),
+            );
+        }
+
+        // The relayed opening is for the gateway's LAN, and only for it: a
+        // packet enters by a LAN interface or the rule does not see it.
+        // Scoped by the WAN alone, it would relay the tunnel clients'
+        // HTTP/HTTPS to the WAN in the clear, outside any
+        // `allow_client_internet` decision — and, without a known gateway,
+        // their IPv6 with it, ahead of the `client_ipv6_egress` rejection
+        // (ADRESSAGE-IPV6 §6.4, SORTIE-IPV6). Hence `iifname <lan>`, one rule
+        // per LAN interface and WAN; without a LAN, no relayed opening is
+        // rendered (fail closed).
+        for lan in &policy.lan_ifaces {
+            for wan in wan_ifaces {
+                rules.push(
+                    Rule::new(
+                        Forward,
+                        opening(vec![
+                            Match::InIface(lan.clone()),
+                            Match::OutIface(wan.clone()),
+                        ]),
+                        Verdict::Accept,
+                    )
+                    .with_note(note.clone()),
+                );
             }
         }
     } else if state.traffic_allowed() {

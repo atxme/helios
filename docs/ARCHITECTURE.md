@@ -54,7 +54,10 @@ nothing changes (`specification/ADRESSAGE-IPV6.md` §6).
 
 Only `TunnelState::Up` allows LAN traffic. `down`, `connecting`, `failed` and
 `captive_portal` stay fail-closed, save for the narrowly declared openings for
-the handshake, administration and the captive portal.
+the handshake, administration and the captive portal. The captive portal
+opens HTTP/HTTPS for the gateway itself and relays it only for traffic
+entering by a LAN interface, never for the tunnel clients
+(`architecture/FIREWALL-V2.md`).
 
 The Netlink backend translates the **whole** ruleset first. A translation error
 sends nothing. The batch is then applied as one atomic transaction; rule-by-rule

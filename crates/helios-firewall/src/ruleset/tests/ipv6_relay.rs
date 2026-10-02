@@ -11,13 +11,15 @@
 //! is rejected with `icmpx admin-prohibited`, one rule per uplink, in every
 //! state, last of `forward`, instead of vanishing under the `drop` policy.
 //! These tests lock both halves for every tunnel state, under both policy
-//! modes, with the road-warrior egress open and closed, on several uplinks:
+//! modes, with the road-warrior egress open and closed, with a known and an
+//! unknown captive-portal gateway, on several uplinks:
 //! no `forward` rule accepts IPv6 entering by the tunnel interface and no
 //! masquerade selects IPv6 — they fail the moment one does, so that NAT66 or
 //! any other IPv6 relay cannot slip in as a side effect — and the rejection is
 //! present, exact and last. The only `forward` acceptance of IPv6 is an
 //! operator's IPv6 split-tunnel CIDR, which applies only to traffic entering
-//! by a LAN interface — never by the tunnel interface nor by a WAN. The other
+//! by a LAN interface — never by the tunnel interface nor by a WAN; the
+//! captive portal's `forward` openings are scoped the same way. The other
 //! rules that select IPv6 are the gateway's own link control (neighbor and
 //! router discovery, MLD, DHCPv6), in `input` and `output` on its WAN and LAN
 //! interfaces; they relay nothing.
@@ -33,6 +35,11 @@ const LAN: &str = "eth1";
 /// An IPv6 split-tunnel CIDR, so that the sweep sees the one `forward` rule
 /// allowed to accept IPv6.
 const IPV6_SPLIT_TUNNEL: &str = "fd00:50::/64";
+
+/// The captive-portal gateway of the fixture. The sweep also renders the
+/// unknown-gateway case: its openings name no address, so they are the ones
+/// a missing interface scope would let IPv6 through.
+const CAPTIVE_PORTAL_GATEWAY: &str = "192.0.2.1";
 
 /// Two uplinks and every opening on, so that no rule is missing from the
 /// sweep because its flag happened to be off.
@@ -51,7 +58,7 @@ fn relay_policy(allow_client_internet: bool, mode: PolicyMode) -> FirewallPolicy
     p.allow_ssh_over_tunnel = true;
     p.iperf_port = Some(5201);
     p.split_tunnel_cidrs = vec!["192.168.50.0/24".into(), IPV6_SPLIT_TUNNEL.into()];
-    p.captive_portal_gateway = Some("192.0.2.1".into());
+    p.captive_portal_gateway = Some(CAPTIVE_PORTAL_GATEWAY.into());
     p
 }
 
@@ -60,6 +67,7 @@ struct Rendering {
     state: TunnelState,
     allow_client_internet: bool,
     mode: PolicyMode,
+    captive_portal_gateway: Option<&'static str>,
     ruleset: Ruleset,
 }
 
@@ -67,28 +75,36 @@ impl std::fmt::Display for Rendering {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "state {:?}, client internet {}, mode {:?}",
-            self.state, self.allow_client_internet, self.mode
+            "state {:?}, client internet {}, mode {:?}, captive-portal gateway {:?}",
+            self.state, self.allow_client_internet, self.mode, self.captive_portal_gateway
         )
     }
 }
 
-/// Every `(state, allow_client_internet, mode)` triple, rendered.
+/// Every `(state, allow_client_internet, mode, captive_portal_gateway)`
+/// combination, rendered.
 ///
 /// Fail-open matters here: outside the tunnel its default verdict is
 /// `accept`, so the rejection is what keeps the tunnel clients' IPv6 from
-/// being relayed at all.
+/// being relayed at all. The unknown captive-portal gateway matters too: its
+/// openings name no address, so only their interface scope keeps them away
+/// from the tunnel clients' IPv6.
 fn every_rendering() -> Vec<Rendering> {
     let mut renderings = Vec::new();
     for state in every_state() {
         for allow_client_internet in [false, true] {
             for mode in [PolicyMode::FailClosed, PolicyMode::FailOpen] {
-                renderings.push(Rendering {
-                    state,
-                    allow_client_internet,
-                    mode,
-                    ruleset: render(&relay_policy(allow_client_internet, mode), state),
-                });
+                for captive_portal_gateway in [Some(CAPTIVE_PORTAL_GATEWAY), None] {
+                    let mut p = relay_policy(allow_client_internet, mode);
+                    p.captive_portal_gateway = captive_portal_gateway.map(str::to_string);
+                    renderings.push(Rendering {
+                        state,
+                        allow_client_internet,
+                        mode,
+                        captive_portal_gateway,
+                        ruleset: render(&p, state),
+                    });
+                }
             }
         }
     }
@@ -290,6 +306,54 @@ fn no_forward_rule_accepts_ipv6_entering_by_the_tunnel_or_a_wan() {
             usize::from(r.state == TunnelState::Up),
             "{r}"
         );
+    }
+}
+
+/// Whether the rule is a captive-portal opening: an acceptance of
+/// HTTP/HTTPS.
+fn is_captive_portal_opening(rule: &Rule) -> bool {
+    rule.verdict == Verdict::Accept
+        && rule.matches.contains(&Match::DestPortSet {
+            ports: vec![80, 443],
+            proto: L4::Tcp,
+        })
+}
+
+/// The captive portal relays HTTP/HTTPS for the gateway's LAN only: no
+/// `forward` captive-portal opening can be reached by a packet entering by
+/// the tunnel interface or by a WAN, in either family, with or without a
+/// known gateway. Scoped by the WAN alone, it would relay the tunnel
+/// clients' HTTP/HTTPS to the WAN in the clear, outside any
+/// `allow_client_internet` decision.
+#[test]
+fn no_captive_portal_forward_is_reachable_from_the_tunnel_or_a_wan() {
+    for r in every_rendering() {
+        let openings: Vec<&Rule> = r
+            .ruleset
+            .chain(ChainKind::Forward)
+            .filter(|rule| is_captive_portal_opening(rule))
+            .collect();
+        for rule in &openings {
+            assert_eq!(
+                rule.matches.first(),
+                Some(&Match::InIface(LAN.into())),
+                "{r}: `{rule}` must be scoped to the LAN interface"
+            );
+            for entry in [TUNNEL].into_iter().chain(UPLINKS) {
+                assert!(
+                    !may_enter_by(rule, entry),
+                    "{r}: `{rule}` can be reached by a packet entering by `{entry}`"
+                );
+            }
+        }
+        // One opening per uplink for the fixture's single LAN, and only
+        // under the captive portal: the sweep must have seen them.
+        let expected = if r.state == TunnelState::CaptivePortal {
+            UPLINKS.len()
+        } else {
+            0
+        };
+        assert_eq!(openings.len(), expected, "{r}");
     }
 }
 

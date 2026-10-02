@@ -456,23 +456,125 @@ fn captive_portal_allows_http_to_gateway() {
     let mut p = policy();
     p.captive_portal_gateway = Some("192.168.1.1".into());
     let rs = render(&p, TunnelState::CaptivePortal);
-    assert!(rs
-        .rules
-        .iter()
-        .any(|r| r.to_string().contains("192.168.1.1") && r.to_string().contains("dport")));
+    assert_eq!(
+        captive_portal_openings(&rs, ChainKind::Output),
+        ["oifname \"eth0\" ip daddr 192.168.1.1/32 tcp dport { 80, 443 } accept"]
+    );
+    assert_eq!(
+        captive_portal_openings(&rs, ChainKind::Forward),
+        ["iifname \"eth1\" oifname \"eth0\" ip daddr 192.168.1.1/32 tcp dport { 80, 443 } accept"]
+    );
+    // The captive portal replaces the LAN forward, it does not add to it.
     assert!(!text(&rs, ChainKind::Forward)
         .iter()
-        .any(|r| r.contains("iifname \"eth1\" oifname")));
+        .any(|r| r == "iifname \"eth1\" oifname \"eth0\" accept"));
     assert_eq!(rs.default_verdict, DefaultVerdict::Drop);
 }
 
 #[test]
 fn captive_portal_without_gateway_allows_all_http() {
     let rs = render(&policy(), TunnelState::CaptivePortal);
-    assert!(rs
-        .rules
-        .iter()
-        .any(|r| r.to_string().contains("tcp dport { 80, 443 } accept")));
+    assert_eq!(
+        captive_portal_openings(&rs, ChainKind::Output),
+        ["oifname \"eth0\" tcp dport { 80, 443 } accept"]
+    );
+    assert_eq!(
+        captive_portal_openings(&rs, ChainKind::Forward),
+        ["iifname \"eth1\" oifname \"eth0\" tcp dport { 80, 443 } accept"]
+    );
+}
+
+/// The captive-portal openings of one chain, as text.
+fn captive_portal_openings(rs: &Ruleset, chain: ChainKind) -> Vec<String> {
+    let ports = Match::DestPortSet {
+        ports: vec![80, 443],
+        proto: L4::Tcp,
+    };
+    rs.chain(chain)
+        .filter(|rule| rule.matches.contains(&ports))
+        .map(|rule| rule.to_string())
+        .collect()
+}
+
+/// The relayed opening is for the LAN; without a LAN interface there is no
+/// traffic it is for, and none is rendered — with or without a known
+/// gateway, with or without a tunnel interface — rather than an opening
+/// scoped by the WAN alone, which the tunnel clients would reach. The
+/// gateway's own opening is unchanged.
+#[test]
+fn captive_portal_without_a_lan_interface_relays_nothing() {
+    for gateway in [Some("192.0.2.1"), None] {
+        for wg_iface in ["helios0", ""] {
+            let mut p = policy();
+            p.lan_ifaces = Vec::new();
+            p.wg_iface = wg_iface.into();
+            p.captive_portal_gateway = gateway.map(str::to_string);
+            let rs = render(&p, TunnelState::CaptivePortal);
+            assert!(
+                captive_portal_openings(&rs, ChainKind::Forward).is_empty(),
+                "gateway {gateway:?}, wg_iface {wg_iface:?}: {:?}",
+                text(&rs, ChainKind::Forward)
+            );
+            let expected = match gateway {
+                Some(gw) => {
+                    format!("oifname \"eth0\" ip daddr {gw}/32 tcp dport {{ 80, 443 }} accept")
+                }
+                None => "oifname \"eth0\" tcp dport { 80, 443 } accept".to_string(),
+            };
+            assert_eq!(
+                captive_portal_openings(&rs, ChainKind::Output),
+                [expected],
+                "gateway {gateway:?}, wg_iface {wg_iface:?}"
+            );
+        }
+    }
+}
+
+/// One relayed opening per LAN interface and WAN: LAN interfaces in policy
+/// order, and the WANs in policy order for each of them. The gateway's own
+/// opening stays one per WAN.
+#[test]
+fn captive_portal_relays_one_opening_per_lan_and_wan() {
+    let mut p = policy();
+    p.wan_ifaces = vec!["enp3s0".into(), "wlo1".into()];
+    p.lan_ifaces = vec!["eth1".into(), "br-lan".into()];
+    p.captive_portal_gateway = Some("192.0.2.1".into());
+    let rs = render(&p, TunnelState::CaptivePortal);
+    assert_eq!(
+        captive_portal_openings(&rs, ChainKind::Output),
+        [
+            "oifname \"enp3s0\" ip daddr 192.0.2.1/32 tcp dport { 80, 443 } accept",
+            "oifname \"wlo1\" ip daddr 192.0.2.1/32 tcp dport { 80, 443 } accept",
+        ]
+    );
+    assert_eq!(
+        captive_portal_openings(&rs, ChainKind::Forward),
+        [
+            "iifname \"eth1\" oifname \"enp3s0\" ip daddr 192.0.2.1/32 tcp dport { 80, 443 } accept",
+            "iifname \"eth1\" oifname \"wlo1\" ip daddr 192.0.2.1/32 tcp dport { 80, 443 } accept",
+            "iifname \"br-lan\" oifname \"enp3s0\" ip daddr 192.0.2.1/32 tcp dport { 80, 443 } accept",
+            "iifname \"br-lan\" oifname \"wlo1\" ip daddr 192.0.2.1/32 tcp dport { 80, 443 } accept",
+        ]
+    );
+}
+
+/// The gateway address is parsed whatever the topology: without a LAN
+/// interface no relayed opening is rendered, but an invalid address still
+/// fails the render, so that `check_policy` refuses it.
+#[test]
+fn an_invalid_captive_portal_gateway_is_refused_without_a_lan() {
+    for lan_ifaces in [vec![], vec!["eth1".to_string()]] {
+        let mut p = policy();
+        p.lan_ifaces = lan_ifaces.clone();
+        p.captive_portal_gateway = Some("192.0.2.1/33".into());
+        let error = super::super::render(&p, TunnelState::CaptivePortal)
+            .expect_err("an invalid captive-portal gateway must be refused");
+        assert!(
+            error.to_string().contains("192.0.2.1/33"),
+            "lan {lan_ifaces:?}: {error}"
+        );
+        assert!(check_policy(&p).is_err(), "lan {lan_ifaces:?}");
+    }
 }
 
 #[test]
