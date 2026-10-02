@@ -157,13 +157,15 @@ Prises le 2 octobre 2026 :
   `IcmpCode::AdminProhibited`), sans verdict après elle, dans la même
   transaction que le reste du ruleset.
 - **Critère 1** : golden tests et `ruleset/tests/ipv6_relay.rs` (présence,
-  forme exacte, ordre, aucun `accept` IPv6 en `forward`, aucun masquerade
-  IPv6). **Critère 2** : octets de l'expression dans un `Batch` finalisé
+  forme exacte, ordre, aucun `accept` en `forward` ne prend l'IPv6 entrant
+  par `wg_iface`, aucun masquerade IPv6). **Critère 2** : octets de l'expression dans un `Batch` finalisé
   (`netlink/expressions.rs`). **Critère 4** : procédure « Sortie Internet IPv6
   refusée » de [MANUAL-TESTING.md](../testing/MANUAL-TESTING.md), non encore
   exécutée.
-- **Limite connue** : un CIDR IPv6 dans `split_tunnel_cidrs` produit, en `Up`,
-  un `forward ip6 daddr <cidr> accept` sans interface d'entrée, placé avant le
-  rejet. Ce contournement d'opérateur précède ce chantier ; le restreindre
-  demande une décision séparée (FIREWALL-V2, « Rejet explicite de la sortie
-  IPv6 des clients »).
+- **Split-tunnel** : par décision de l'opérateur, les contournements
+  `split_tunnel_cidrs` ne s'appliquent plus au trafic entrant par
+  `wg_iface`, dans les deux familles. Un CIDR IPv6 est rendu, en `Up`,
+  `forward iifname != "<wg_iface>" ip6 daddr <cidr> accept` : il reste ouvert
+  au trafic qui n'entre pas par le tunnel, et l'IPv6 d'un client du tunnel
+  atteint le rejet. Sans `wg_iface`, la règle garde sa forme sans interface
+  d'entrée (FIREWALL-V2, « Rejet explicite de la sortie IPv6 des clients »).
