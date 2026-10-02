@@ -146,6 +146,10 @@ pub struct FirewallPolicy {
     pub split_tunnel_cidrs: Vec<String>,
     /// Post-PMTUD MSS clamping (bytes). `None` = no clamping.
     /// Computed automatically when the tunnel starts.
+    ///
+    /// The value is the **IPv4** MSS ([`crate::mtu::mss_ipv4`]): IPv6 TCP
+    /// needs 20 bytes less ([`crate::mtu::mss_ipv6`]), so a clamp rule must
+    /// never apply this value to IPv6 segments.
     pub mss_clamp: Option<u16>,
     /// IP of the captive portal gateway.
     /// Set upon detection; HTTP/HTTPS towards this IP are allowed.
