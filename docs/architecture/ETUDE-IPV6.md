@@ -759,7 +759,11 @@ Avancement sur `feature/support-ipv6` (1er octobre 2026) :
 | T16 | couvert par T08 et T10 | une source IPv6 native n'est jamais un appelant ; `address_v6` exposée dans la vue redigée |
 | T17 | fusionné | cible : `ss -ulpn` montre `[::]`, client IPv6 seul, repli `ipv6.disable=1` |
 | T18 | fusionné | VM Windows : A+AAAA avec IPv6 cassée → IPv4 en ~250 ms ; un candidat perdant consomme une unité du budget par identité côté gateway |
-| T15, T19–T23 | à faire | — |
+| T19 | fusionné | VM Windows : code `#[cfg(windows)]` non compilé depuis WSL ; les deux adresses sur `orion0`, `ping -6 <préfixe>::1`, avertissement d'adresse non posée (`DisabledComponents=0xFF`), profil périmé, refus par un Orion antérieur |
+| T20 | fusionné | — |
+| Correctif split-tunnel | fusionné | un CIDR invalide est refusé (API 400, orchestrateur conserve la politique) ; contrôle au démarrage d'un `network.toml` invalide en attente de décision |
+| T21 | spécification proposée ([SORTIE-IPV6.md](../specification/SORTIE-IPV6.md)) | décisions opérateur §6, puis implémentation |
+| T15, T22, T23 | à faire | — |
 
 **T00 — Spécification A : modèle d'adressage IPv6**
 - Fichiers : [`docs/specification/ADRESSAGE-IPV6.md`](../specification/ADRESSAGE-IPV6.md), index `docs/README.md`.
