@@ -762,7 +762,7 @@ Avancement sur `feature/support-ipv6` (1er octobre 2026) :
 | T19 | fusionné | VM Windows : code `#[cfg(windows)]` non compilé depuis WSL ; les deux adresses sur `orion0`, `ping -6 <préfixe>::1`, avertissement d'adresse non posée (`DisabledComponents=0xFF`), profil périmé, refus par un Orion antérieur |
 | T20 | fusionné | — |
 | Correctif split-tunnel | fusionné | un CIDR invalide est refusé (API 400, orchestrateur conserve la politique) ; `heliosd run` refuse aussi de démarrer sur un `network.toml` dont la politique ne compile pas |
-| T21 | spécification validée ([SORTIE-IPV6.md](../specification/SORTIE-IPV6.md)) : rejet explicite, pas de NAT66 | implémentation |
+| T21 | fusionné : rejet ICMPv6 « admin-prohibited » du forward IPv6 `wg_iface` → WAN dans tous les états, pas de NAT66 | cible : affichage `nft`, réponse ICMPv6 1/1, `curl -6` immédiat, navigateur dual-stack sans délai, `net.ipv6.icmp.ratelimit` ; CIDR de split-tunnel IPv6 rendu en `accept` sans interface d'entrée (décision opérateur) |
 | T15 | fusionné | MSS par famille (IPv4 = MTU − 40, IPv6 = MTU − 60) dérivé de la MTU de l'interface (surcoût 80) ; le clamp reste la valeur IPv4, une règle IPv6 attend un encodeur (`exthdr`) ; corrige aussi un MSS IPv4 trop grand de 20 octets |
 | T22, T23 | à faire | — |
 
