@@ -169,14 +169,27 @@ pub(super) async fn handle_external_cmd(
         }
 
         OrchestratorCmd::SetSplitTunnel(cidrs) => {
-            info!("split-tunneling updated: {} CIDR(s)", cidrs.len());
-            policy.split_tunnel_cidrs = cidrs.clone();
+            // Refused, not fatal: the list comes from an operator, and a
+            // typo in it must not stop the gateway. The API already refuses
+            // an entry the ruleset compiler would; this checks the whole
+            // policy again, whoever sent the command.
+            let mut candidate = policy.clone();
+            candidate.split_tunnel_cidrs = cidrs.clone();
             let state = *shared_state.read().await;
-            fw.apply(policy, state)
-                .await
-                .context("firewall split-tunnel")?;
-            let _ = event_tx.send(HeliosEvent::SplitTunnelChanged { cidrs });
-            sync_policy(shared_policy, policy).await;
+            match commit_policy(fw, policy, candidate, state).await {
+                Ok(()) => {
+                    info!("split-tunneling updated: {} CIDR(s)", cidrs.len());
+                    let _ = event_tx.send(HeliosEvent::SplitTunnelChanged { cidrs });
+                    sync_policy(shared_policy, policy).await;
+                }
+                Err(error) => emit_log(
+                    event_tx,
+                    "error",
+                    &format!(
+                        "Split-tunneling not applied, the previous list stays in force: {error:#}"
+                    ),
+                ),
+            }
         }
 
         OrchestratorCmd::SetMssClamp(mss) => {
@@ -215,13 +228,24 @@ pub(super) async fn handle_external_cmd(
                 );
                 return Ok(());
             }
-            info!("network config reloaded: {} peer(s)", new_cfg.peers.len());
-            *policy = new_cfg.firewall_policy();
-            *shared_network.write().await = *new_cfg;
+            // Same refusal for what only the firewall can judge — an address
+            // in `split_tunnel_cidrs` or `allow_ssh_from`, say. The file or
+            // API body is the operator's, and a typo in it must not stop the
+            // gateway; the configuration in force stays whole, as above.
             let state = *shared_state.read().await;
-            fw.apply(policy, state)
-                .await
-                .context("firewall after config reload")?;
+            if let Err(error) = commit_policy(fw, policy, new_cfg.firewall_policy(), state).await {
+                emit_log(
+                    event_tx,
+                    "error",
+                    &format!(
+                        "Network configuration not applied, the running one stays in force: \
+                         {error:#}"
+                    ),
+                );
+                return Ok(());
+            }
+            info!("network config reloaded: {} peer(s)", new_cfg.peers.len());
+            *shared_network.write().await = *new_cfg;
             sync_policy(shared_policy, policy).await;
 
             // Aligns the data plane with the new peer list (client
