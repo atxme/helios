@@ -72,6 +72,14 @@ struct JsonProfile {
     preshared_key: Option<String>,
     #[serde(default)]
     address: Option<String>,
+    /// IPv6 VIP, `…/128`, present only when the gateway assigned one
+    /// (`ADRESSAGE-IPV6.md` §7.2).
+    ///
+    /// The envelope is `deny_unknown_fields`, so an Orion older than this
+    /// field refuses a document carrying it — an explicit refusal, which is
+    /// why `helios-ctl` writes the key only for a peer that has one.
+    #[serde(default)]
+    address_v6: Option<String>,
     #[serde(default)]
     allowed_ips: Option<String>,
     #[serde(default)]
@@ -143,6 +151,7 @@ impl From<JsonProfile> for ClientProfile {
             preshared_key: profile.preshared_key,
             profile_type: profile.profile_type,
             address: profile.address,
+            address_v6: profile.address_v6,
             allowed_ips: profile
                 .allowed_ips
                 .unwrap_or_else(|| DEFAULT_ALLOWED_IPS.to_string()),

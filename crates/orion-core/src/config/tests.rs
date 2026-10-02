@@ -466,6 +466,32 @@ fn a_stored_ipv4_only_full_tunnel_is_not_widened_on_load() {
     assert!(profile.ipv6_uncaptured_full_tunnel());
 }
 
+/// A profile written before `address_v6` existed reads with none, and one
+/// without it serializes without the key: an absent value writes nothing.
+#[test]
+fn an_absent_ipv6_address_is_neither_invented_nor_written() {
+    let raw = r#"
+        [[profiles]]
+        name = "site-a"
+        address = "100.64.1.2/32"
+    "#;
+    let loaded: ClientConfig = toml::from_str(raw).unwrap();
+    let profile = loaded.find("site-a").unwrap();
+    assert_eq!(profile.address_v6, None);
+
+    let toml = toml::to_string(profile).unwrap();
+    assert!(!toml.contains("address_v6"), "{toml}");
+    let json = serde_json::to_string(profile).unwrap();
+    assert!(!json.contains("address_v6"), "{json}");
+
+    let dual = ClientProfile {
+        address_v6: Some("fd3c:91a2:7e04::2/128".into()),
+        ..profile.clone()
+    };
+    let reread: ClientProfile = toml::from_str(&toml::to_string(&dual).unwrap()).unwrap();
+    assert_eq!(reread.address_v6.as_deref(), Some("fd3c:91a2:7e04::2/128"));
+}
+
 #[test]
 fn secrets_masked_in_debug() {
     let p = ClientProfile {

@@ -545,6 +545,49 @@ fn a_stored_ipv4_only_full_tunnel_survives_load_and_save_unchanged() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A sealed IPv4-only profile stays IPv4-only through load and save: the
+/// IPv6 address is never invented. One that carries it keeps it, and only an
+/// edit removes it (`ADRESSAGE-IPV6.md` §8).
+#[test]
+fn the_ipv6_address_round_trips_through_the_store_only_when_present() {
+    let (dir, store) = store("address-v6");
+    store.save_profile(&profile("ipv4")).unwrap();
+    store
+        .save_profile(&ClientProfile {
+            address_v6: Some("fd3c:91a2:7e04::2/128".into()),
+            ..profile("dual")
+        })
+        .unwrap();
+
+    let loaded = store.load().unwrap();
+    let ipv4 = loaded.find("ipv4").unwrap().clone();
+    let dual = loaded.find("dual").unwrap().clone();
+    assert_eq!(ipv4.address.as_deref(), Some("100.64.1.2/32"));
+    assert_eq!(ipv4.address_v6, None, "absent, not invented");
+    assert_eq!(dual.address_v6.as_deref(), Some("fd3c:91a2:7e04::2/128"));
+
+    // Saved back for an unrelated edit: both stay what they were.
+    let mut edited = ipv4;
+    edited.endpoint = "198.51.100.7:51820".into();
+    store.save_profile(&edited).unwrap();
+    let mut edited = dual;
+    edited.endpoint = "198.51.100.7:51820".into();
+    store.save_profile(&edited).unwrap();
+    let reloaded = store.load().unwrap();
+    assert_eq!(reloaded.find("ipv4").unwrap().address_v6, None);
+    assert_eq!(
+        reloaded.find("dual").unwrap().address_v6.as_deref(),
+        Some("fd3c:91a2:7e04::2/128")
+    );
+
+    // The user's edit is what removes it.
+    let mut cleared = reloaded.find("dual").unwrap().clone();
+    cleared.address_v6 = None;
+    store.save_profile(&cleared).unwrap();
+    assert_eq!(store.load().unwrap().find("dual").unwrap().address_v6, None);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn a_legacy_file_is_migrated_and_removed() {
     let (dir, store) = store("migration");
