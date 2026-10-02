@@ -32,6 +32,8 @@ foi en cas de doute (voir [AGENTS.md](../AGENTS.md)).
 
 ## Exploitation
 
+- [Écoconception](architecture/ECOCONCEPTION.md) — diagnostic électrique de
+  la passerelle MSI, pistes matérielles/logicielles et protocole de mesure.
 - [RENOUVELLEMENT-CERTIFICATS.md](RENOUVELLEMENT-CERTIFICATS.md) — commandes de
   renouvellement et de rotation des certificats.
 - [DEPLOIEMENT-ASTRA.md](DEPLOIEMENT-ASTRA.md) — déploiement de l'autorité et
