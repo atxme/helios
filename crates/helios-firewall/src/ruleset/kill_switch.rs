@@ -62,12 +62,26 @@ pub(super) fn state_gated_openings(
         }
     } else if state.traffic_allowed() {
         // Split-tunneling: local CIDRs bypass the tunnel.
+        //
+        // The bypass is for the gateway's own networks, never for traffic
+        // entering through the tunnel interface: unscoped, an IPv4 CIDR would
+        // open those destinations to the tunnel clients, and an IPv6 one would
+        // relay their IPv6 ahead of the `client_ipv6_egress` rejection
+        // (ADRESSAGE-IPV6 §6.4, SORTIE-IPV6). Hence `iifname != wg_iface`, in
+        // both families.
+        //
+        // Without a tunnel interface there are no tunnel clients and nothing
+        // to exclude, so the rule keeps its unscoped form; the IR never names
+        // an empty interface.
+        let not_from_tunnel =
+            (!policy.wg_iface.is_empty()).then(|| Match::NotInIface(policy.wg_iface.clone()));
         for cidr in &policy.split_tunnel_cidrs {
-            rules.push(Rule::new(
-                Forward,
-                vec![Match::DestNet(parse_network(cidr)?)],
-                Verdict::Accept,
-            ));
+            let matches = not_from_tunnel
+                .iter()
+                .cloned()
+                .chain([Match::DestNet(parse_network(cidr)?)])
+                .collect();
+            rules.push(Rule::new(Forward, matches, Verdict::Accept));
         }
 
         // Tunnel operational: forward the LAN. WireGuard encrypts on egress;

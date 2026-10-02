@@ -28,6 +28,9 @@ const IP_PROTOCOL_ICMPV6: u8 = 58;
 /// `meta nfproto` loads into the register.
 const NFPROTO_IPV4: u8 = 2;
 const NFPROTO_IPV6: u8 = 10;
+/// The kernel's interface-name buffer (`IFNAMSIZ`), terminator included: the
+/// bound `rustables` applies to `iifname`/`oifname`.
+const IFNAMSIZ: usize = 16;
 
 impl NetlinkBackend {
     pub(super) fn hook_class(kind: ChainKind) -> HookClass {
@@ -48,6 +51,7 @@ impl NetlinkBackend {
         Ok(match m {
             Match::ConnectionState(states) => Self::connection_states(rule, *states)?,
             Match::InIface(i) => rule.iiface(i).map_err(Self::err)?,
+            Match::NotInIface(i) => Self::not_in_iface(rule, i)?,
             Match::OutIface(i) => rule.oiface(i).map_err(Self::err)?,
             Match::DestPort { port, proto: p } => rule.dport(*port, proto(*p)),
             Match::SourcePort { port, proto: p } => rule.sport(*port, proto(*p)),
@@ -120,6 +124,26 @@ impl NetlinkBackend {
     /// protocol field and must therefore not use network byte order.
     fn packet_mark_bytes(mark: u32) -> [u8; 4] {
         mark.to_ne_bytes()
+    }
+
+    /// `iifname != "<iface>"`.
+    ///
+    /// The two expressions [`NfRule::iiface`] emits, with the comparison
+    /// inverted: `Meta(IifName)`, then `Cmp` `Neq` on the name and its NUL
+    /// terminator — what `nft` itself sends for the negated match. The length
+    /// bound is the one `iiface` enforces, so an interface name refused by the
+    /// positive match is refused by the negated one too.
+    fn not_in_iface(rule: NfRule, iface: &str) -> Result<NfRule> {
+        if iface.len() >= IFNAMSIZ {
+            return Err(Self::err(format!(
+                "interface name `{iface}` is too long for nf_tables"
+            )));
+        }
+        let mut name = iface.as_bytes().to_vec();
+        name.push(0);
+        Ok(rule
+            .with_expr(Meta::new(MetaType::IifName))
+            .with_expr(Cmp::new(CmpOp::Neq, name)))
     }
 
     fn icmp_protocol(rule: NfRule, family: AddressFamily) -> NfRule {
@@ -325,6 +349,107 @@ mod tests {
         assert_eq!(rustables::sys::NFTA_REJECT_ICMP_CODE, 2);
         assert_eq!(rustables::sys::NFT_REJECT_ICMPX_UNREACH, 2);
         assert_eq!(rustables::sys::NFT_REJECT_ICMPX_ADMIN_PROHIBITED, 3);
+    }
+
+    /// The octets of `iifname != "helios0"` as the kernel receives them,
+    /// read from a finalized batch.
+    ///
+    /// Each value is a literal: `NFTA_RULE_EXPRESSIONS` (4) holding two
+    /// `NFTA_LIST_ELEM` (1). The first is `meta` (`NFTA_EXPR_NAME` 1, no
+    /// terminator) whose `NFTA_EXPR_DATA` (2) carries `NFTA_META_DREG` (1) =
+    /// `NFT_REG_1` (1) and `NFTA_META_KEY` (2) = `NFT_META_IIFNAME` (6), both
+    /// big-endian `u32`. The second is `cmp` (padded to four octets) whose
+    /// data carries `NFTA_CMP_SREG` (1) = `NFT_REG_1`, `NFTA_CMP_OP` (2) =
+    /// `NFT_CMP_NEQ` (1), and `NFTA_CMP_DATA` (3) nesting `NFTA_DATA_VALUE`
+    /// (1) = `helios0` and its NUL terminator. Attribute headers are in host
+    /// order. The same octets with `NFT_CMP_EQ` (0) are what the positive
+    /// `iifname "helios0"` sends: the negation changes the operator and
+    /// nothing else.
+    #[test]
+    fn the_negated_input_interface_is_encoded_byte_for_byte() {
+        let encode = |m: &Match| {
+            let table = Table::new(ProtocolFamily::Inet).with_name("helios");
+            let chain = Chain::new(&table).with_name("forward");
+            let rule = NetlinkBackend::apply_match(
+                NfRule::new(&chain).expect("a rule of a named chain"),
+                m,
+            )
+            .expect("an interface match translates");
+            let mut batch = Batch::new();
+            rule.add_to_batch(&mut batch);
+            batch.finalize()
+        };
+
+        const NESTED: u16 = 0x8000;
+        let header = |len: u16, kind: u16| [len.to_ne_bytes(), kind.to_ne_bytes()].concat();
+        let expected = |op: u8| {
+            [
+                header(84, NESTED | 4),
+                header(32, NESTED | 1),
+                header(8, 1),
+                b"meta".to_vec(),
+                header(20, NESTED | 2),
+                header(8, 1),
+                vec![0, 0, 0, 1],
+                header(8, 2),
+                vec![0, 0, 0, 6],
+                header(48, NESTED | 1),
+                header(7, 1),
+                b"cmp\0".to_vec(),
+                header(36, NESTED | 2),
+                header(8, 1),
+                vec![0, 0, 0, 1],
+                header(8, 2),
+                vec![0, 0, 0, op],
+                header(16, NESTED | 3),
+                header(12, 1),
+                b"helios0\0".to_vec(),
+            ]
+            .concat()
+        };
+        for (m, op) in [
+            (Match::NotInIface("helios0".into()), 1),
+            (Match::InIface("helios0".into()), 0),
+        ] {
+            let sent = encode(&m);
+            let expected = expected(op);
+            let found = sent
+                .windows(expected.len())
+                .filter(|window| *window == expected.as_slice())
+                .count();
+            assert_eq!(
+                found, 1,
+                "`{m}` must appear once, exactly\n\
+                 sent:     {sent:02x?}\nexpected: {expected:02x?}"
+            );
+        }
+
+        // The literals above are the kernel UAPI values.
+        assert_eq!(rustables::sys::NFTA_META_DREG, 1);
+        assert_eq!(rustables::sys::NFTA_META_KEY, 2);
+        assert_eq!(rustables::sys::NFT_META_IIFNAME, 6);
+        assert_eq!(rustables::sys::NFT_REG_1, 1);
+        assert_eq!(rustables::sys::NFTA_CMP_SREG, 1);
+        assert_eq!(rustables::sys::NFTA_CMP_OP, 2);
+        assert_eq!(rustables::sys::NFTA_CMP_DATA, 3);
+        assert_eq!(rustables::sys::NFTA_DATA_VALUE, 1);
+        assert_eq!(rustables::sys::NFT_CMP_EQ, 0);
+        assert_eq!(rustables::sys::NFT_CMP_NEQ, 1);
+    }
+
+    /// The negated match refuses exactly the interface names the positive
+    /// one refuses: fifteen octets fit beside the terminator, sixteen do not.
+    #[test]
+    fn the_negated_input_interface_keeps_the_name_length_bound() {
+        for (name, fits) in [("a".repeat(15), true), ("a".repeat(16), false)] {
+            assert_eq!(NfRule::default().iiface(&name).is_ok(), fits, "{name}");
+            assert_eq!(
+                NetlinkBackend::apply_match(NfRule::default(), &Match::NotInIface(name.clone()))
+                    .is_ok(),
+                fits,
+                "{name}"
+            );
+        }
     }
 
     /// Accept and drop keep the verdict expressions `rustables` emits for

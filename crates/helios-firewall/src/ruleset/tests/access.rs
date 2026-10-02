@@ -464,12 +464,44 @@ fn captive_portal_without_gateway_allows_all_http() {
 #[test]
 fn split_tunnel_adds_bypass_rules() {
     let mut p = policy();
-    p.split_tunnel_cidrs = vec!["192.168.1.0/24".into(), "10.0.0.0/8".into()];
+    p.split_tunnel_cidrs = vec![
+        "192.168.1.0/24".into(),
+        "10.0.0.0/8".into(),
+        "fd00:1::/64".into(),
+    ];
     let rs = render(&p, TunnelState::Up);
     let fwd = text(&rs, ChainKind::Forward);
-    assert!(fwd.iter().any(|r| r == "ip daddr 192.168.1.0/24 accept"));
-    assert!(fwd.iter().any(|r| r == "ip daddr 10.0.0.0/8 accept"));
+    let bypasses: Vec<&String> = fwd.iter().filter(|r| r.contains("daddr")).collect();
+    // The bypasses never apply to traffic entering through the tunnel
+    // interface, in either family.
+    assert_eq!(
+        bypasses,
+        [
+            "iifname != \"helios0\" ip daddr 192.168.1.0/24 accept",
+            "iifname != \"helios0\" ip daddr 10.0.0.0/8 accept",
+            "iifname != \"helios0\" ip6 daddr fd00:1::/64 accept",
+        ]
+    );
     assert!(fwd.iter().any(|r| r.contains("iifname \"eth1\"")));
+}
+
+/// Without a tunnel interface there are no tunnel clients to exclude: the
+/// bypass keeps its unscoped form rather than naming an empty interface.
+#[test]
+fn split_tunnel_without_a_tunnel_interface_stays_unscoped() {
+    let mut p = policy();
+    p.wg_iface = String::new();
+    p.split_tunnel_cidrs = vec!["192.168.1.0/24".into(), "fd00:1::/64".into()];
+    let rs = render(&p, TunnelState::Up);
+    let fwd = text(&rs, ChainKind::Forward);
+    let bypasses: Vec<&String> = fwd.iter().filter(|r| r.contains("daddr")).collect();
+    assert_eq!(
+        bypasses,
+        [
+            "ip daddr 192.168.1.0/24 accept",
+            "ip6 daddr fd00:1::/64 accept"
+        ]
+    );
 }
 
 /// MSS clamping is a mangle action, not a verdict: it lives outside of

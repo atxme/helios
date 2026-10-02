@@ -322,7 +322,7 @@ input iifname \"helios0\" udp dport 5201 accept
 output oifname \"helios0\" udp dport 5201 accept
 input ip saddr 198.51.100.7/32 tcp dport 22 accept
 input iifname \"tailscale0\" tcp dport 22 accept
-forward ip daddr 192.168.50.0/24 accept
+forward iifname != \"helios0\" ip daddr 192.168.50.0/24 accept
 forward iifname \"eth1\" oifname \"enp3s0\" accept
 forward iifname \"eth1\" oifname \"wlo1\" accept
 forward meta nfproto ipv4 iifname \"helios0\" oifname \"enp3s0\" accept

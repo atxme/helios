@@ -299,6 +299,13 @@ pub enum Match {
     ConnectionState(ConnectionStates),
     /// `iifname "<iface>"`
     InIface(String),
+    /// `iifname != "<iface>"`
+    ///
+    /// The only negated match: it keeps a rule off the traffic entering
+    /// through one interface — the split-tunnel bypasses off the tunnel
+    /// interface. A closed variant rather than a general negation, so that no
+    /// other match can be inverted by accident.
+    NotInIface(String),
     /// `oifname "<iface>"`
     OutIface(String),
     /// `<proto> dport <port>`
@@ -362,6 +369,7 @@ impl fmt::Display for Match {
                 write!(f, "ct state {list}")
             }
             Match::InIface(i) => write!(f, "iifname \"{i}\""),
+            Match::NotInIface(i) => write!(f, "iifname != \"{i}\""),
             Match::OutIface(i) => write!(f, "oifname \"{i}\""),
             Match::DestPort { port, proto } => write!(f, "{} dport {port}", proto.as_str()),
             Match::SourcePort { port, proto } => {
