@@ -1,11 +1,11 @@
 # Spécification — sortie Internet IPv6 des clients du tunnel
 
-**Statut** : proposée le 2 octobre 2026, **non validée, non implémentée**.
-C'est la spécification B annoncée par
-[ADRESSAGE-IPV6.md](ADRESSAGE-IPV6.md) (ticket T21 de
-[l'étude](../architecture/ETUDE-IPV6.md)). Tant qu'elle n'est pas validée, la
-règle de l'adressage §6.4 s'applique : **aucun paquet IPv6 n'est relayé**
-entre `wg_iface` et un WAN.
+**Statut** : validée le 2 octobre 2026 pour la V1 (rejet explicite, §3.1),
+**non implémentée**. Le NAT66 (§3.2) est écarté de ce chantier. C'est la
+spécification B annoncée par [ADRESSAGE-IPV6.md](ADRESSAGE-IPV6.md) (ticket
+T21 de [l'étude](../architecture/ETUDE-IPV6.md)). La règle de l'adressage §6.4
+reste en vigueur : **aucun paquet IPv6 n'est relayé** entre `wg_iface` et un
+WAN.
 
 Le vocabulaire normatif est « doit », « ne doit pas », « peut ». Les décisions
 qui attendent l'opérateur sont regroupées au §6.
@@ -129,9 +129,14 @@ connexion à la gateway.
    IPv6-only réussit et `nft list chain inet helios postrouting` montre le
    masquerade IPv6.
 
-## 6. Décisions attendues de l'opérateur
+## 6. Décisions de l'opérateur
 
-1. Rejet explicite (option B) en V1, ou blackhole silencieux maintenu.
-2. NAT66 opt-in (option C) : oui ou non dans ce chantier.
-3. Si oui : nom du drapeau, et portée du masquerade (uplink seul, ou aussi
-   `iifname <wg_iface>` — question également ouverte pour le masquerade IPv4).
+Prises le 2 octobre 2026 :
+
+1. **Rejet explicite (option B) en V1** : le §3.1 est normatif.
+2. **Pas de NAT66 dans ce chantier** : le §3.2 reste la condition d'un futur
+   opt-in, et les critères d'acceptation 3 et la partie NAT66 du critère 4
+   ne s'appliquent pas à la V1.
+3. Sans objet tant que le NAT66 est écarté. La portée du masquerade IPv4
+   (uplink seul, ou aussi `iifname <wg_iface>`) reste une question ouverte
+   distincte.

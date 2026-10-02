@@ -762,7 +762,7 @@ Avancement sur `feature/support-ipv6` (1er octobre 2026) :
 | T19 | fusionné | VM Windows : code `#[cfg(windows)]` non compilé depuis WSL ; les deux adresses sur `orion0`, `ping -6 <préfixe>::1`, avertissement d'adresse non posée (`DisabledComponents=0xFF`), profil périmé, refus par un Orion antérieur |
 | T20 | fusionné | — |
 | Correctif split-tunnel | fusionné | un CIDR invalide est refusé (API 400, orchestrateur conserve la politique) ; `heliosd run` refuse aussi de démarrer sur un `network.toml` dont la politique ne compile pas |
-| T21 | spécification proposée ([SORTIE-IPV6.md](../specification/SORTIE-IPV6.md)) | décisions opérateur §6, puis implémentation |
+| T21 | spécification validée ([SORTIE-IPV6.md](../specification/SORTIE-IPV6.md)) : rejet explicite, pas de NAT66 | implémentation |
 | T15, T22, T23 | à faire | — |
 
 **T00 — Spécification A : modèle d'adressage IPv6**

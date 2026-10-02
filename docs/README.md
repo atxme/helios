@@ -68,7 +68,7 @@ foi en cas de doute (voir [AGENTS.md](../AGENTS.md)).
   IPv6 du tunnel (ULA `/64`, VIP `/128`) et IPAM unifié, validé, en cours
   d'implémentation.
 - [Sortie IPv6](specification/SORTIE-IPV6.md) — politique de sortie Internet
-  IPv6 des clients du tunnel (rejet explicite, NAT66 en option), proposée.
+  IPv6 des clients du tunnel (rejet explicite en V1, NAT66 écarté), validée.
 
 ## Sécurité
 
