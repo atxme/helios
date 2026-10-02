@@ -77,7 +77,7 @@ Les nouveaux concepts structurés sont :
 | `iperf_port` | `tunnel_interface::openings` | TCP/UDP input et output | `Meta`, `Payload`, `Cmp` |
 | `wg_iface` | plusieurs modules, dont `client_ipv6_egress::reject` | `InIface` / `OutIface` ; pour le rejet IPv6, `Family(Ipv6)` + `InIface` + `OutIface` par uplink, `Verdict::RejectAdminProhibited` | `Meta` + `Cmp` ; pour le rejet, `Meta(NfProto)` + `Cmp` 10, interfaces, puis `Reject` |
 | `admin_port`, `admin_iface` | `administration::admin_api` | accept borné puis drop générique | règles ordonnées dans `input` |
-| `split_tunnel_cidrs` | `kill_switch::state_gated_openings` | `NotInIface(wg_iface)` + `DestNet` ; `DestNet` seul sans `wg_iface` | `Meta(IifName)` + `Cmp` `Neq` (`NFT_CMP_NEQ`), puis famille réseau + masque + `Cmp` |
+| `split_tunnel_cidrs` | `kill_switch::state_gated_openings` | `InIface(lan)` + `DestNet`, une règle par interface LAN et par CIDR ; aucune sans `lan_ifaces` | `Meta` + `Cmp`, puis famille réseau + masque + `Cmp` |
 | `mss_clamp` | policy runtime, acceptée seulement si le backend l’annonce | `Ruleset::mss_clamp` si trafic autorisé | capacité non annoncée par Netlink ; refus défensif avant envoi |
 | `captive_portal_gateway` | `kill_switch::state_gated_openings` | WAN, destination, TCP 80/443 | `Meta`, famille réseau, `Payload`, `Cmp` |
 | `nordvpn_meshnet` | `meshnet::nordvpn_meshnet` | marque, interface, pairs, ports ; `Icmp` et drops des réseaux locaux de la famille du pair (`PRIVATE_IPV4_CIDRS` ou `PRIVATE_IPV6_CIDRS`) avant ses accepts | `Meta`, famille réseau, `Payload`, `Cmp` |
@@ -130,8 +130,8 @@ Restent hors de ce lot et agnostiques à la famille : le `forward` LAN → WAN
 site-to-site et, en portail captif sans passerelle connue, le `forward`
 HTTP/HTTPS vers le WAN. Les contournements `split_tunnel_cidrs` et les règles
 Meshnet nomment une adresse et reçoivent déjà la garde de sa famille ; les
-contournements excluent en outre le trafic entrant par `wg_iface` (section
-suivante). La
+contournements ne s’appliquent en outre qu’au trafic entrant par une interface
+LAN (section suivante). La
 restriction du masquerade à `iifname wg_iface` reste une décision ouverte.
 
 ### Rejet explicite de la sortie IPv6 des clients
@@ -175,25 +175,25 @@ garde `meta nfproto ipv6`, seule sa forme ICMPv6 peut être émise. Le NAT66
 (SORTIE-IPV6 §3.2) n’est pas implémenté : aucune règle `forward` n’accepte
 l’IPv6 d’un client du tunnel et le masquerade reste `meta nfproto ipv4`.
 
-Les contournements `split_tunnel_cidrs` ne s’appliquent pas au trafic qui
-entre par `wg_iface`, dans les deux familles (décision de l’opérateur). En
-`Up`, chaque CIDR est rendu
+Les contournements `split_tunnel_cidrs` ne s’appliquent qu’au trafic qui
+entre par une interface LAN, dans les deux familles (décision de l’opérateur).
+En `Up`, pour chaque interface de `lan_ifaces` puis, pour chacune, chaque CIDR
+dans l’ordre de la politique, le rendu est
 
 ```text
-forward iifname != "<wg_iface>" ip daddr <cidr> accept
-forward iifname != "<wg_iface>" ip6 daddr <cidr> accept
+forward iifname "<lan>" ip daddr <cidr> accept
+forward iifname "<lan>" ip6 daddr <cidr> accept
 ```
 
-Un CIDR IPv6 reste donc accepté pour le trafic qui n’entre pas par le tunnel,
-mais l’IPv6 d’un client du tunnel n’est jamais relayé par ce biais et atteint
-le rejet ; un CIDR IPv4 n’ouvre pas non plus ces destinations aux clients du
-tunnel. La négation est une variante fermée de l’IR, `Match::NotInIface`, la
-seule : aucune autre correspondance ne peut être inversée. Le backend Netlink
-l’encode comme `iifname`, avec l’opérateur inversé : `Meta(IifName)` puis
-`Cmp` `NFT_CMP_NEQ` (1) sur le nom et son terminateur NUL, avec la même borne
-de longueur (`IFNAMSIZ`). Sans `wg_iface`, il n’y a pas de client du tunnel ni
-rien à exclure : le contournement garde sa forme sans interface d’entrée, et
-l’IR ne nomme jamais une interface vide.
+dans `forward`, juste avant le `forward` LAN → WAN.
+Ni l’IPv6 d’un client du tunnel ni un paquet entrant par un WAN ne peuvent
+donc atteindre ces règles : l’IPv6 d’un client du tunnel atteint le rejet, un
+CIDR IPv4 n’ouvre pas ces destinations aux clients du tunnel, et une nouvelle
+connexion venue d’Internet vers un préfixe IPv6 global du LAN n’est pas
+acceptée. Sans interface LAN, aucun contournement n’est rendu, quel que soit
+`wg_iface` (fermeture par défaut) ; les CIDR sont malgré tout analysés, si bien
+qu’un CIDR invalide reste refusé par `check_policy`. L’IR n’a pas de
+correspondance niée : la portée s’exprime avec `Match::InIface`.
 
 ### Ce que les tests verrouillent
 
@@ -205,9 +205,9 @@ ces rejets sont les dernières règles de `forward`, après l’acceptation
 `established,related` ; chaque masquerade commence par la garde IPv4 ; toute
 règle `forward` qui sélectionne l’IPv6 (`Family(Ipv6)`, `Icmpv6Type`,
 `Ipv6HopLimit` ou une adresse IPv6) est un rejet ou, en `Up` seulement, le
-contournement IPv6 `iifname != "<wg_iface>"`, et aucun masquerade ne la
+contournement IPv6 `iifname "<lan>"`, et aucun masquerade ne la
 sélectionne ; aucune règle `accept` de `forward` qu’un paquet entrant par
-`wg_iface` peut atteindre n’accepte l’IPv6, hormis le retour de flux
+`wg_iface` ou par un WAN peut atteindre n’accepte l’IPv6, hormis le retour de flux
 `ct state established,related` — les balayages portent un CIDR de
 split-tunnel IPv4 et un IPv6 ; hors de ces rejets et de ce contournement, les seules règles qui
 sélectionnent l’IPv6 sont le contrôle des liens de la gateway, en `input` et
@@ -221,10 +221,11 @@ Côté backend, un test compare les octets exacts de l’expression `reject` dan
 uplink : `Meta(NfProto)` + `Cmp` 10, interfaces, `Reject`. Le golden
 `UP_EVERY_CAPABILITY_OPEN` montre les deux gardes IPv4 et les tests du backend
 vérifient la paire `Meta(NfProto)` + `Cmp` 2 avant l’interface et le
-`Masquerade`. Un dernier test compare les octets exacts de
-`iifname != "helios0"` (`Meta` `NFT_META_IIFNAME` 6, puis `Cmp`
-`NFT_CMP_NEQ` 1 sur `helios0\0`) et vérifie que seule la valeur de
-l’opérateur la distingue de `iifname "helios0"`.
+`Masquerade`. `ruleset/tests/access.rs` vérifie qu’aucun contournement
+n’est rendu sans interface LAN, qu’il y en a un par interface LAN et par CIDR
+dans l’ordre de la politique, qu’aucun ne peut être atteint par un paquet
+entrant par un WAN ou par `wg_iface`, et qu’un CIDR invalide est refusé par
+`check_policy` même sans interface LAN.
 
 ### Réseaux locaux Meshnet par famille
 

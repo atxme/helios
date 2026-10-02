@@ -702,7 +702,8 @@ noyau, ni l'ICMPv6 réellement émis, ni le comportement des applications.
    `meta nfproto ipv4 iifname "helios0" oifname "<wan>" accept` si
    `allow_client_internet` est actif. Aucune règle `accept` ne porte
    `meta nfproto ipv6` ni `ip6`, hors contournement `split_tunnel_cidrs` IPv6
-   explicitement configuré, qui porte alors `iifname != "helios0"`
+   explicitement configuré, qui porte alors `iifname "<lan>"` — une règle par
+   interface LAN, aucune sans interface LAN, jamais `helios0` ni un WAN
    (FIREWALL-V2).
 3. **Échec immédiat.** Sur la gateway, `sudo tcpdump -ni helios0 icmp6`. Depuis
    le client :
