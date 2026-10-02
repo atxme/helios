@@ -443,7 +443,9 @@ pub async fn network_get(State(s): State<AppState>) -> Json<NetworkConfigView> {
 ///
 /// A body whose `wg_address_v6` differs from the running one is refused with
 /// `409 Conflict` and nothing is written: the tunnel prefix is applied at
-/// startup only, so it is changed in `network.toml` followed by a restart.
+/// startup only, so it is changed in `network.toml` followed by a restart. A
+/// body whose firewall policy does not compile — an invalid split-tunnel CIDR
+/// or SSH source — is refused with `400 Bad Request`, also before any write.
 pub async fn network_set(
     State(s): State<AppState>,
     Json(mut new_config): Json<NetworkConfig>,
@@ -467,6 +469,16 @@ pub async fn network_set(
             .check_hot_reload(&running)
             .map_err(|refusal| (StatusCode::CONFLICT, refusal.to_string()))?;
     }
+    // Same reasoning for an address the ruleset compiler refuses — a
+    // split-tunnel CIDR, an SSH source: the orchestrator keeps the running
+    // configuration, so writing this one would answer "ok" for a change that
+    // is not in force, and leave it in the file for the next start.
+    ruleset::check_policy(&new_config.firewall_policy()).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("network configuration refused: {error}"),
+        )
+    })?;
     apply_network(&s, new_config).await?;
     Ok(Json(CmdResponse::ok()))
 }
