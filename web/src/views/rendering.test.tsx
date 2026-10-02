@@ -260,6 +260,62 @@ describe('Clients', () => {
     expect(screen.getByText('jamais')).toBeTruthy()
     expect(screen.getAllByText('—').length).toBeGreaterThan(0)
   })
+
+  it('shows a client IPv6 VIP under its IPv4 one, and its IPv6 endpoint whole', () => {
+    const vip = 'fd3c:91a2:7e04:0:8a1f:3b2c:9d40:e517/128'
+    const endpoint = '[2001:db8:85a3::8a2e:370:7334]:51820'
+    mount(
+      <ClientsView
+        status={{
+          ...STATUS,
+          ipv6: 'installed',
+          peers: [peer({ address_v6: vip, endpoint }), peer({ name: 'orion-v4', public_key: 'k2' })],
+        }}
+        refresh={noop}
+        admitOpen={false}
+        onAdmitOpenChange={vi.fn()}
+      />,
+    )
+
+    // Both rows carry their IPv4 VIP; only the first has an IPv6 one.
+    expect(screen.getAllByText('100.64.0.12')).toHaveLength(2)
+    const shown = screen.getByText(vip)
+    expect(shown.getAttribute('aria-label')).toBe('VIP IPv6 du client, dans ses AllowedIPs.')
+    expect(screen.getAllByText(/\/128$/)).toHaveLength(1)
+    // Wrapped rather than cut with an ellipsis: the tail tells addresses apart.
+    const endpointText = screen.getByText(endpoint)
+    expect(getComputedStyle(endpointText).textOverflow).not.toBe('ellipsis')
+    expect(getComputedStyle(endpointText).wordBreak).toBe('break-all')
+  })
+
+  it('says an IPv6 VIP is not routed while the gateway runs IPv4-only', () => {
+    const vip = 'fd3c:91a2:7e04:0:8a1f:3b2c:9d40:e517/128'
+    mount(
+      <ClientsView
+        status={{
+          ...STATUS,
+          ipv6: { unavailable: { reason: 'disabled_by_kernel', setting: 'net.ipv6.conf.all.disable_ipv6' } },
+          peers: [peer({ address_v6: vip })],
+        }}
+        refresh={noop}
+        admitOpen={false}
+        onAdmitOpenChange={vi.fn()}
+      />,
+    )
+
+    expect(screen.getByText(vip).getAttribute('aria-label')).toMatch(
+      /^IPv6 indisponible sur la passerelle/,
+    )
+  })
+
+  it('adds nothing to a client without an IPv6 VIP', () => {
+    mount(
+      <ClientsView status={STATUS} refresh={noop} admitOpen={false} onAdmitOpenChange={vi.fn()} />,
+    )
+
+    expect(screen.queryByText(/\/128$/)).toBeNull()
+    expect(screen.queryByText(/IPv6/)).toBeNull()
+  })
 })
 
 describe('Security', () => {
