@@ -24,6 +24,7 @@ fn draft(name: &str) -> ProfileDraft {
         endpoint: "203.0.113.10:51820".into(),
         peer_public_key: "cHVibGlj".into(),
         address: None,
+        address_v6: None,
         allowed_ips: "0.0.0.0/0".into(),
         persistent_keepalive: 25,
         heliosd_url: None,
@@ -70,6 +71,7 @@ fn the_frontend_payload_deserialises() {
         "endpoint": "86.229.12.86:51820",
         "peer_public_key": "6Y8gpK+aOPbZvSnQnIbdQGTBoe5trFFWksGJVKlH3wk=",
         "address": "100.109.177.86/32",
+        "address_v6": "fd3c:91a2:7e04::2/128",
         "allowed_ips": "0.0.0.0/0",
         "persistent_keepalive": 25,
         "heliosd_url": null,
@@ -88,6 +90,7 @@ fn the_frontend_payload_deserialises() {
         "6Y8gpK+aOPbZvSnQnIbdQGTBoe5trFFWksGJVKlH3wk="
     );
     assert_eq!(draft.address.as_deref(), Some("100.109.177.86/32"));
+    assert_eq!(draft.address_v6.as_deref(), Some("fd3c:91a2:7e04::2/128"));
     assert_eq!(draft.persistent_keepalive, 25);
     assert!(draft.use_staged_key);
     assert!(!draft.clear_preshared_key);
@@ -107,6 +110,7 @@ fn a_payload_without_intents_defaults_to_touching_no_secret() {
         "key_negotiation": null,
     });
     let draft: ProfileDraft = serde_json::from_value(payload).expect("decode");
+    assert_eq!(draft.address_v6, None, "a payload without it means no IPv6");
     assert!(!draft.use_staged_key, "aucune clé adoptée sans demande");
     assert!(!draft.clear_preshared_key, "aucun PSK retiré sans demande");
 }
@@ -184,6 +188,33 @@ fn the_view_flags_an_ipv4_only_full_tunnel_and_saving_keeps_it() {
     let merged = edit.merge(Some(&legacy), None, None).expect("merge");
     assert_eq!(merged.allowed_ips, "0.0.0.0/0");
     assert!(merged.ipv6_uncaptured_full_tunnel());
+}
+
+/// The IPv6 address makes the round trip through the screen: shown as `null`
+/// for a profile without one, kept by a save that sends it back, and set or
+/// cleared only by the draft (`ADRESSAGE-IPV6.md` §8).
+#[test]
+fn the_ipv6_address_round_trips_through_the_view_and_the_draft() {
+    let ipv4 = profile("poste");
+    let json = serde_json::to_value(ProfileView::from(&ipv4)).expect("serialise");
+    assert!(json["address_v6"].is_null(), "{json}");
+
+    let dual = ClientProfile {
+        address_v6: Some("fd3c:91a2:7e04::2/128".into()),
+        ..profile("poste")
+    };
+    let view = ProfileView::from(&dual);
+    assert_eq!(view.address_v6.as_deref(), Some("fd3c:91a2:7e04::2/128"));
+
+    let mut edit = draft("poste");
+    edit.address_v6 = view.address_v6.clone();
+    let merged = edit.merge(Some(&dual), None, None).expect("merge");
+    assert_eq!(merged.address_v6.as_deref(), Some("fd3c:91a2:7e04::2/128"));
+
+    let cleared = draft("poste")
+        .merge(Some(&dual), None, None)
+        .expect("merge");
+    assert_eq!(cleared.address_v6, None, "the user's edit clears it");
 }
 
 /// A draft that never carried the secret must not erase it on save.

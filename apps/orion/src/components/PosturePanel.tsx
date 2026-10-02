@@ -62,6 +62,7 @@ export function PosturePanel({
   const posture = postureMeta(state, adapterUp)
   const protection = protectionMeta(profile, psk, state)
   const traffic = trafficFact(profile, capture)
+  const address = addressFact(profile, capture)
   const negotiation = profile?.key_negotiation
   // Nominal is silent: the block only exists when it has something to report.
   const degraded =
@@ -116,9 +117,10 @@ export function PosturePanel({
         )}
         <Row
           label="adresse"
-          value={profile?.address ?? '—'}
-          copy={profile?.address ?? undefined}
-          copyLabel="l’adresse virtuelle"
+          value={address.value}
+          tone={address.tone}
+          copy={address.copy}
+          copyLabel={address.count > 1 ? 'les adresses virtuelles' : 'l’adresse virtuelle'}
         />
         {/* Amber only for what the machine reports: see `trafficFact`. */}
         <Row label="trafic via le tunnel" value={traffic.value} tone={traffic.tone} />
@@ -182,7 +184,7 @@ function trafficFact(
   profile: ClientProfile | null,
   capture: CaptureCheck | null,
 ): { value: string; tone?: string } {
-  if (capture?.status === 'incomplete') {
+  if (capture?.status === 'incomplete' && capture.missing.length > 0) {
     const verb = capture.missing.length > 1 ? 'non appliqués' : 'non appliqué'
     return { value: `${capture.missing.join(', ')} ${verb} par le pilote — hors tunnel`, tone: AMBER }
   }
@@ -193,6 +195,36 @@ function trafficFact(
     return { value: `${profile.allowed_ips} — IPv4 seulement, l’IPv6 sort en clair`, tone: AMBER }
   }
   return { value: profile?.allowed_ips ?? '—' }
+}
+
+/**
+ * The «adresse» row: the profile's addresses, IPv4 first, then IPv6 when the
+ * profile has one — unless the machine says the driver left one off.
+ *
+ * A profile without `address_v6` reads exactly as before. The amber case is
+ * the same kind of fact as a stripped prefix: on Windows, the IPv6 address of
+ * an adapter without IPv6 is skipped without an error, and only the core's
+ * read-back knows. The copy carries what the row shows, never the gap.
+ */
+function addressFact(
+  profile: ClientProfile | null,
+  capture: CaptureCheck | null,
+): { value: string; tone?: string; copy?: string; count: number } {
+  const addresses = [profile?.address, profile?.address_v6].filter(
+    (address): address is string => Boolean(address),
+  )
+  if (addresses.length === 0) return { value: '—', count: 0 }
+  const listed = addresses.join(', ')
+  if (capture?.status === 'incomplete' && capture.missing_addresses.length > 0) {
+    const verb = capture.missing_addresses.length > 1 ? 'non posées' : 'non posée'
+    return {
+      value: `${listed} — ${capture.missing_addresses.join(', ')} ${verb} par le pilote`,
+      tone: AMBER,
+      copy: listed,
+      count: addresses.length,
+    }
+  }
+  return { value: listed, copy: listed, count: addresses.length }
 }
 
 /** One fact: its instrument label and its value. */

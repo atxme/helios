@@ -1323,6 +1323,9 @@ struct ProfileView {
     endpoint: String,
     peer_public_key: String,
     address: Option<String>,
+    /// IPv6 VIP, `…/128`. `null` for every profile without one, which is
+    /// what the screen shows as an IPv4-only tunnel.
+    address_v6: Option<String>,
     allowed_ips: String,
     persistent_keepalive: u16,
     heliosd_url: Option<String>,
@@ -1357,6 +1360,7 @@ impl From<&ClientProfile> for ProfileView {
             endpoint: profile.endpoint.clone(),
             peer_public_key: profile.peer_public_key.clone(),
             address: profile.address.clone(),
+            address_v6: profile.address_v6.clone(),
             allowed_ips: profile.allowed_ips.clone(),
             persistent_keepalive: profile.persistent_keepalive,
             heliosd_url: profile.heliosd_url.clone(),
@@ -1412,6 +1416,10 @@ struct ProfileDraft {
     endpoint: String,
     peer_public_key: String,
     address: Option<String>,
+    /// Absent from a payload means `None`, like every optional field here:
+    /// the screen always sends it, and a save without it is a profile
+    /// without IPv6.
+    address_v6: Option<String>,
     allowed_ips: String,
     persistent_keepalive: u16,
     heliosd_url: Option<String>,
@@ -1505,6 +1513,7 @@ impl ProfileDraft {
         profile.endpoint = self.endpoint;
         profile.peer_public_key = self.peer_public_key;
         profile.address = self.address;
+        profile.address_v6 = self.address_v6;
         profile.allowed_ips = self.allowed_ips;
         profile.persistent_keepalive = self.persistent_keepalive;
         profile.heliosd_url = self.heliosd_url;

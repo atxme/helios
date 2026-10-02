@@ -75,7 +75,7 @@ export const SPLIT_TUNNEL_PRESETS: Exclude<SplitTunnelPreset, 'custom'>[] = [
 ]
 
 /** What the profile needs to carry for a preset to be built from it. */
-export type SplitTunnelSource = Pick<ClientProfile, 'heliosd_url' | 'ssh_target'>
+export type SplitTunnelSource = Pick<ClientProfile, 'heliosd_url' | 'ssh_target' | 'address_v6'>
 
 /**
  * Splits a prefix list the way `orion_core::profile_import::split_cidr_list`
@@ -145,6 +145,72 @@ export function gatewayPrefix(source: SplitTunnelSource): string {
   return `${DEFAULT_GATEWAY_HOST}/32`
 }
 
+/**
+ * Groups of an IPv6 address, the `::` expanded: eight numbers, or `null`.
+ *
+ * Only the forms a tunnel address can take — hexadecimal groups and at most
+ * one `::`. No embedded IPv4, no zone: `orion-core` refuses both in an
+ * `address_v6`, so they never describe a gateway here.
+ */
+function ipv6Groups(host: string): number[] | null {
+  if (!/^[0-9a-fA-F:]+$/.test(host)) return null
+  const halves = host.split('::')
+  if (halves.length > 2) return null
+  const parse = (part: string) => (part === '' ? [] : part.split(':'))
+  const head = parse(halves[0])
+  const tail = halves.length === 2 ? parse(halves[1]) : []
+  const missing = 8 - head.length - tail.length
+  if (halves.length === 2 ? missing < 1 : missing !== 0) return null
+  const groups = [...head, ...Array<string>(halves.length === 2 ? missing : 0).fill('0'), ...tail]
+  if (!groups.every((group) => /^[0-9a-fA-F]{1,4}$/.test(group))) return null
+  return groups.map((group) => parseInt(group, 16))
+}
+
+/**
+ * The gateway's own IPv6 `/128`, when the profile has an IPv6 address.
+ *
+ * Fixed by `ADRESSAGE-IPV6.md` §2.4: the tunnel prefix is a `/64` and the
+ * gateway is its host `::1`. So the gateway is the profile's `/64` with
+ * `::1` as host — no field names it, and none has to. A missing or malformed
+ * `address_v6` gives `null`: the core reports the field, and the preset stays
+ * the IPv4 one.
+ *
+ * Written in the compressed form `std` renders on the gateway
+ * (`fd3c:91a2:7e04::1/128`), so a preset read back from the core matches.
+ */
+export function gatewayPrefixV6(addressV6: string | null): string | null {
+  if (!addressV6) return null
+  const [host, prefixLength, ...rest] = addressV6.trim().split('/')
+  if (rest.length > 0 || prefixLength !== '128') return null
+  const groups = ipv6Groups(host)
+  if (!groups) return null
+  const gateway = [...groups.slice(0, 4), 0, 0, 0, 1].map((group) => group.toString(16))
+  return `${compressIpv6(gateway)}/128`
+}
+
+/**
+ * RFC 5952 text of eight lowercase hexadecimal groups: the longest run of at
+ * least two zero groups, leftmost on a tie, becomes `::`.
+ */
+function compressIpv6(groups: string[]): string {
+  let runStart = -1
+  let runLength = 0
+  let index = 0
+  while (index < groups.length) {
+    let end = index
+    while (end < groups.length && groups[end] === '0') end += 1
+    if (end - index > runLength) {
+      runStart = index
+      runLength = end - index
+    }
+    index = Math.max(end, index + 1)
+  }
+  if (runLength < 2) return groups.join(':')
+  const before = groups.slice(0, runStart).join(':')
+  const after = groups.slice(runStart + runLength).join(':')
+  return `${before}::${after}`
+}
+
 /** The list a preset writes into the field. */
 export function presetPrefixes(
   preset: Exclude<SplitTunnelPreset, 'custom'>,
@@ -153,8 +219,14 @@ export function presetPrefixes(
   switch (preset) {
     case 'full':
       return EVERYTHING
-    case 'gateway':
-      return gatewayPrefix(source)
+    case 'gateway': {
+      // Both of the gateway's addresses when the profile has IPv6: «the
+      // gateway alone» must still reach it over IPv6 (`ping -6`), and the
+      // gateway is `::1` of the profile's `/64` (§2.4). Without `address_v6`
+      // the preset is exactly what it was.
+      const v6 = gatewayPrefixV6(source.address_v6)
+      return v6 ? `${gatewayPrefix(source)}, ${v6}` : gatewayPrefix(source)
+    }
     case 'private':
       // The gateway's own prefix leads the list: without it the key
       // negotiation's post-commit release, which `orion_core` only sends to an

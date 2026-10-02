@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import {
   gatewayPrefix,
+  gatewayPrefixV6,
   leavesIpv6Uncaptured,
   matchPreset,
   presetPrefixes,
@@ -12,6 +13,7 @@ import {
 const source = (overrides: Partial<SplitTunnelSource> = {}): SplitTunnelSource => ({
   heliosd_url: 'http://100.64.0.1:8080',
   ssh_target: null,
+  address_v6: null,
   ...overrides,
 })
 
@@ -75,6 +77,67 @@ describe('presetPrefixes', () => {
     expect(presetPrefixes('private', source())).toBe(
       '100.64.0.1/32, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16',
     )
+  })
+})
+
+// `ADRESSAGE-IPV6.md` §2.4: the gateway is `::1` of the tunnel `/64`. The
+// expected texts are the RFC 5952 form `std` gives the gateway's own address
+// (`TunnelPrefixV6::gateway`), so a preset matches what the gateway prints.
+describe('gatewayPrefixV6', () => {
+  it('takes the /64 of the address and puts the gateway at ::1', () => {
+    const cases: [string | null, string | null][] = [
+      ['fd3c:91a2:7e04::2/128', 'fd3c:91a2:7e04::1/128'],
+      ['fd3c:91a2:7e04:0:f545:e478:e88:7a7f/128', 'fd3c:91a2:7e04::1/128'],
+      ['FD3C:91A2:7E04:0000::2/128', 'fd3c:91a2:7e04::1/128'],
+      [' fd3c:91a2:7e04::2/128 ', 'fd3c:91a2:7e04::1/128'],
+      ['fd00:1:2:3::4/128', 'fd00:1:2:3::1/128'],
+      ['fd00::2/128', 'fd00::1/128'],
+      ['0:1::5/128', '0:1::1/128'],
+      // Not a /128 host, not an IPv6 address, or nothing at all: no gateway.
+      ['fd3c:91a2:7e04::/64', null],
+      ['fd3c:91a2:7e04::2', null],
+      ['100.64.1.2/32', null],
+      ['fe80::2%eth0/128', null],
+      ['fd3c::2::3/128', null],
+      ['fd3c:91a2:7e04:0:0:0:0:0:2/128', null],
+      ['', null],
+      [null, null],
+    ]
+    for (const [address, expected] of cases) {
+      expect(gatewayPrefixV6(address), JSON.stringify(address)).toBe(expected)
+    }
+  })
+})
+
+describe('the gateway preset with an IPv6 address', () => {
+  const dual = source({ address_v6: 'fd3c:91a2:7e04::2/128' })
+
+  it('reaches the gateway in both families', () => {
+    expect(presetPrefixes('gateway', dual)).toBe('100.64.0.1/32, fd3c:91a2:7e04::1/128')
+  })
+
+  // Without `address_v6` nothing changes, and a malformed one is left to the
+  // core's field message rather than turned into a route.
+  it('is the IPv4 preset without a usable IPv6 address', () => {
+    expect(presetPrefixes('gateway', source())).toBe('100.64.0.1/32')
+    expect(presetPrefixes('gateway', source({ address_v6: 'fd3c::/64' }))).toBe('100.64.0.1/32')
+  })
+
+  it('leaves the other presets as they were', () => {
+    expect(presetPrefixes('full', dual)).toBe(presetPrefixes('full', source()))
+    expect(presetPrefixes('private', dual)).toBe(presetPrefixes('private', source()))
+  })
+
+  it('is recognised by matchPreset, and only for this profile', () => {
+    for (const preset of ['full', 'gateway', 'private'] as const) {
+      expect(matchPreset(presetPrefixes(preset, dual), dual)).toBe(preset)
+    }
+    expect(matchPreset('fd3c:91a2:7e04::1/128, 100.64.0.1/32', dual)).toBe('gateway')
+    // The IPv4-only gateway list is not «the gateway alone» for a dual-stack
+    // profile, nor the dual-stack one for an IPv4-only profile.
+    expect(matchPreset('100.64.0.1/32', dual)).toBe('custom')
+    expect(matchPreset('100.64.0.1/32, fd3c:91a2:7e04::1/128', source())).toBe('custom')
+    expect(leavesIpv6Uncaptured(presetPrefixes('gateway', dual))).toBe(false)
   })
 })
 

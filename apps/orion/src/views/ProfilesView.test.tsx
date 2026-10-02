@@ -45,6 +45,7 @@ const profile = (overrides: Partial<ClientProfile> = {}): ClientProfile => {
     has_private_key: true,
     has_static_psk: false,
     address: '100.64.1.2/32',
+    address_v6: null,
     allowed_ips: '0.0.0.0/0, ::/0',
     ipv6_uncaptured_full_tunnel: false,
     persistent_keepalive: 25,
@@ -79,6 +80,7 @@ const noIssues: ProfileIssues = {
   peer_public_key: null,
   preshared_key: null,
   address: null,
+  address_v6: null,
   allowed_ips: null,
   persistent_keepalive: null,
   heliosd_url: null,
@@ -817,6 +819,77 @@ describe('ProfilesView interactions', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Enregistrer' }))
     await waitFor(() => expect(handlers.onSave).toHaveBeenCalledOnce())
     expect(handlers.onSave.mock.calls[0][0].allowed_ips).toBe('192.168.42.0/24')
+  })
+
+  /**
+   * The IPv6 address sits next to the IPv4 one, in the same field component,
+   * with the core's message under it; and «Helios seul» then reaches the
+   * gateway in both families — `::1` of the profile's `/64`.
+   */
+  it('edits the IPv6 address and follows it in the gateway preset', async () => {
+    const handlers = callbacks()
+    render(
+      <ProfilesView
+        config={{
+          profiles: [profile({ address_v6: 'fd3c:91a2:7e04::2/128' })],
+          selected: 'portable',
+        }}
+        pathImport={null}
+        {...handlers}
+      />,
+    )
+    await waitFor(() => expect(api.validateProfile).toHaveBeenCalled())
+    const ipv6 = () => screen.getByLabelText('Adresse virtuelle IPv6') as HTMLInputElement
+    expect(ipv6().value).toBe('fd3c:91a2:7e04::2/128')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Avancé' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Helios seul' }))
+    const field = () => screen.getByRole('textbox', { name: 'Trafic via le tunnel' })
+    expect((field() as HTMLInputElement).value).toBe('100.64.0.1/32, fd3c:91a2:7e04::1/128')
+
+    // The core judges the field; the screen prints what it says, where the
+    // value is typed.
+    api.validateProfile.mockResolvedValue({
+      ...noIssues,
+      address_v6: 'adresse IPv6 invalide : /64 au lieu de /128',
+    })
+    fireEvent.change(ipv6(), { target: { value: 'fd3c:91a2:7e04::/64' } })
+    expect(
+      await screen.findByText('adresse IPv6 invalide : /64 au lieu de /128', undefined, {
+        timeout: 2000,
+      }),
+    ).toBeTruthy()
+
+    api.validateProfile.mockResolvedValue(noIssues)
+    fireEvent.change(ipv6(), { target: { value: 'fd3c:91a2:7e04::9/128' } })
+    await waitFor(
+      () => expect(screen.queryByText('adresse IPv6 invalide : /64 au lieu de /128')).toBeNull(),
+      { timeout: 2000 },
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Enregistrer' }))
+    await waitFor(() => expect(handlers.onSave).toHaveBeenCalledOnce())
+    expect(handlers.onSave.mock.calls[0][0].address_v6).toBe('fd3c:91a2:7e04::9/128')
+  })
+
+  it('sends no IPv6 address for a profile without one', async () => {
+    const handlers = callbacks()
+    render(
+      <ProfilesView
+        config={{ profiles: [profile()], selected: 'portable' }}
+        pathImport={null}
+        {...handlers}
+      />,
+    )
+    await waitFor(() => expect(api.validateProfile).toHaveBeenCalled())
+    expect((screen.getByLabelText('Adresse virtuelle IPv6') as HTMLInputElement).value).toBe('')
+    fireEvent.click(screen.getByRole('button', { name: 'Avancé' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Helios seul' }))
+    expect(
+      (screen.getByRole('textbox', { name: 'Trafic via le tunnel' }) as HTMLInputElement).value,
+    ).toBe('100.64.0.1/32')
+    fireEvent.click(screen.getByRole('button', { name: 'Enregistrer' }))
+    await waitFor(() => expect(handlers.onSave).toHaveBeenCalledOnce())
+    expect(handlers.onSave.mock.calls[0][0].address_v6).toBeNull()
   })
 
   /**
