@@ -442,7 +442,9 @@ fn golden_meshnet_without_listeners() {
 ///
 /// `CaptivePortal` is the branch that *replaces* the state-gated forwarding
 /// rather than adding to it: no LAN forward, no split tunnel, no masquerade,
-/// only HTTP/HTTPS towards the portal, in `output` then `forward`.
+/// only HTTP/HTTPS towards the portal, in `output` for the gateway itself,
+/// then in `forward` for the traffic entering by the LAN interface only —
+/// never by the tunnel interface nor by a WAN.
 const CAPTIVE_PORTAL_KNOWN_GATEWAY: &str = "\
 default drop
 mss clamp none
@@ -493,7 +495,7 @@ output oifname \"eth1\" meta nfproto ipv6 icmpv6 type mld2-listener-report accep
 input iifname \"helios0\" tcp dport 55182 accept
 input iifname \"helios0\" udp dport 55182 accept
 output oifname \"eth0\" ip daddr 192.0.2.1/32 tcp dport { 80, 443 } accept
-forward oifname \"eth0\" ip daddr 192.0.2.1/32 tcp dport { 80, 443 } accept
+forward iifname \"eth1\" oifname \"eth0\" ip daddr 192.0.2.1/32 tcp dport { 80, 443 } accept
 forward meta nfproto ipv6 iifname \"helios0\" oifname \"eth0\" reject with icmpx admin-prohibited
 ";
 
@@ -565,7 +567,7 @@ output oifname \"eth1\" meta nfproto ipv6 icmpv6 type mld2-listener-report accep
 input iifname \"helios0\" tcp dport 55182 accept
 input iifname \"helios0\" udp dport 55182 accept
 output oifname \"eth0\" tcp dport { 80, 443 } accept
-forward oifname \"eth0\" tcp dport { 80, 443 } accept
+forward iifname \"eth1\" oifname \"eth0\" tcp dport { 80, 443 } accept
 forward meta nfproto ipv6 iifname \"helios0\" oifname \"eth0\" reject with icmpx admin-prohibited
 ";
 
