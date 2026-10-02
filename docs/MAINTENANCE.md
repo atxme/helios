@@ -3,24 +3,45 @@
 ## Administration interactive
 
 L'exécutable opérateur s'appelle `helios`. Sans sous-commande, ou avec `shell`,
-il ouvre un terminal à commandes avec édition de ligne, autocomplétion par Tab
-et historique en mémoire pour la session. Un terminal sans édition (`TERM=dumb`,
+il ouvre un terminal avec un écran d'accueil Helios, une zone de saisie `❯`
+encadrée de séparateurs et des raccourcis visibles. Taper `/` ouvre immédiatement
+le menu des commandes et de leurs descriptions ; la liste se filtre pendant la
+saisie. Les flèches ↑/↓ parcourent le menu, Tab ou Entrée insère la suggestion,
+Échap ferme le menu. Une suggestion n'exécute aucune action : valider ensuite
+la commande complète avec Entrée. Les sous-commandes (`/peer `, `/firmware `)
+et les options (`/peer add --`) sont proposées au même endroit. Une commande
+complète tapée directement s'exécute avec Entrée.
+
+Hors du menu, Tab complète la saisie et ↑/↓ parcourt l'historique en mémoire
+pour la session. Le menu défile pour garder la sélection visible et adapte sa
+largeur au terminal. `NO_COLOR=1 helios` désactive les couleurs.
+
+Sous la saisie, une ligne d'état rappelle l'API active, l'état du tunnel, la
+version de `heliosd` et le mode dry-run. Elle est relue sur `/api/status` au
+démarrage, après `/use` et après chaque commande, avec un délai de 2 s : une
+gateway muette ou incompatible s'affiche `○ status unavailable` sans bloquer
+la saisie. Chaque commande
+s'affiche dans un bloc ouvert par `⏺ <commande>` et fermé par `⎿ ✓ <durée>`, ou
+par `⎿ ✗ <erreur>` en rouge, sans troncature. L'en-tête nomme la commande sans recopier les
+valeurs des arguments, qui peuvent contenir des clés. Un terminal
+sans édition (`TERM=dumb`,
 `cons25` ou `emacs`) est refusé ; les commandes scriptées restent disponibles.
 Exemple :
 
 ```text
-helios> /status
-helios> /peer list
-helios> /network show
-helios> /profile check "profils/client.orion"
-helios> /firmware list --ssh-target admin@gateway
-helios> /help
-helios> /quit
+❯ /status
+❯ /peer list
+❯ /network show
+❯ /profile check "profils/client.orion"
+❯ /firmware list --ssh-target admin@gateway
+❯ /help
+❯ /quit
 ```
 
 Toutes les commandes de l'interface scriptée sont accessibles, avec ou sans
 `/` initial. `/help firmware` affiche une aide ciblée. `/use http://gateway:8080`
-change l'API active ; `--url` peut la remplacer pour une commande. Les arguments
+change l'API active ; `--url` peut la remplacer pour une commande. `/clear`
+efface l'écran et réaffiche l'accueil avec l'API active. Les arguments
 entre guillemets sont acceptés, sans expansion de variables ni exécution de
 shell. Ctrl-C efface la saisie ; dans `watch`, il rend la main. Ctrl-D ou `/quit`
 ferme le terminal. Une erreur de commande rend la main. L'historique n'est
