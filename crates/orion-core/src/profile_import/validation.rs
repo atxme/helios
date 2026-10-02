@@ -12,8 +12,8 @@ use crate::{config::validate_key_negotiation, ClientProfile};
 use super::parse_profile_import;
 
 use super::field_rules::{
-    normalize_cidr_list, validate_cidr, validate_cidr_list, validate_endpoint,
-    validate_heliosd_url, validate_ssh_target, validate_wg_key,
+    normalize_cidr_list, validate_address_pair, validate_cidr, validate_cidr_list,
+    validate_endpoint, validate_heliosd_url, validate_ssh_target, validate_wg_key,
 };
 
 /// Field-by-field diagnostic of a profile being edited.
@@ -27,6 +27,10 @@ pub struct ProfileIssues {
     pub peer_public_key: Option<String>,
     pub preshared_key: Option<String>,
     pub address: Option<String>,
+    /// Fault of the IPv6 address. The one field judged against another: an
+    /// IPv6 address next to a virtual address that is itself IPv6 is reported
+    /// here, on the field that makes the pair wrong.
+    pub address_v6: Option<String>,
     pub allowed_ips: Option<String>,
     pub persistent_keepalive: Option<String>,
     pub heliosd_url: Option<String>,
@@ -88,6 +92,11 @@ pub fn inspect_profile(profile: &ClientProfile) -> ProfileIssues {
         address: profile.address.as_deref().and_then(|value| {
             when_filled(value, |value| validate_cidr(value, "adresse virtuelle"))
         }),
+        address_v6: profile.address_v6.as_deref().and_then(|value| {
+            when_filled(value, |value| {
+                validate_address_pair(profile.address.as_deref(), value)
+            })
+        }),
         allowed_ips: when_filled(&profile.allowed_ips, |value| {
             validate_cidr_list(value, "trafic capté")
         }),
@@ -126,6 +135,7 @@ pub(super) fn validate_imported_profile(mut profile: ClientProfile) -> Result<Cl
     profile.allowed_ips = normalize_cidr_list(&profile.allowed_ips);
     profile.preshared_key = non_empty(profile.preshared_key);
     profile.address = non_empty(profile.address);
+    profile.address_v6 = non_empty(profile.address_v6);
     profile.heliosd_url = non_empty(profile.heliosd_url);
     profile.ssh_target = non_empty(profile.ssh_target);
 
@@ -158,6 +168,11 @@ pub(super) fn validate_imported_profile(mut profile: ClientProfile) -> Result<Cl
     // gateway at admission, so an invitation legitimately arrives without one.
     if let Some(address) = profile.address.as_deref() {
         validate_cidr(address, "adresse virtuelle")?;
+    }
+    // Optional for good: a gateway without an IPv6 prefix emits none, and a
+    // profile without one is exactly the IPv4-only profile it always was.
+    if let Some(address_v6) = profile.address_v6.as_deref() {
+        validate_address_pair(profile.address.as_deref(), address_v6)?;
     }
     validate_cidr_list(&profile.allowed_ips, "AllowedIPs")?;
     if profile.persistent_keepalive == 0 {

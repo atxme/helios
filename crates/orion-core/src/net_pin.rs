@@ -148,6 +148,10 @@ pub(crate) mod windows_impl {
 
     use anyhow::{anyhow, Result};
     #[cfg(feature = "wireguard")]
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GetUnicastIpAddressTable, MIB_UNICASTIPADDRESS_TABLE,
+    };
+    #[cfg(feature = "wireguard")]
     use windows_sys::Win32::Networking::WinSock::AF_UNSPEC;
     use windows_sys::Win32::{
         NetworkManagement::IpHelper::{
@@ -195,6 +199,45 @@ pub(crate) mod windows_impl {
             FreeMibTable(table.cast());
         }
         Ok(prefixes)
+    }
+
+    /// Unicast addresses carried by interface `index`, both address families,
+    /// with the on-link prefix length Windows recorded for each.
+    ///
+    /// `defguard_wireguard_rs` skips, without an error, the addresses of a
+    /// family the adapter does not carry; this is where an address the
+    /// profile asked for and the adapter does not have becomes visible. Same
+    /// table discipline as [`prefixes_routed_through`].
+    #[cfg(feature = "wireguard")]
+    pub fn unicast_addresses_on(index: u32) -> Result<Vec<(IpAddr, u8)>> {
+        let mut table: *mut MIB_UNICASTIPADDRESS_TABLE = std::ptr::null_mut();
+        let status = unsafe { GetUnicastIpAddressTable(AF_UNSPEC, &mut table) };
+        if status != 0 || table.is_null() {
+            return Err(anyhow!(
+                "GetUnicastIpAddressTable failed with status {status}"
+            ));
+        }
+        let mut addresses = Vec::new();
+        unsafe {
+            let rows =
+                std::slice::from_raw_parts((*table).Table.as_ptr(), (*table).NumEntries as usize);
+            for row in rows {
+                if row.InterfaceIndex != index {
+                    continue;
+                }
+                let raw = &row.Address;
+                let address = if raw.si_family == AF_INET {
+                    IpAddr::from(raw.Ipv4.sin_addr.S_un.S_addr.to_ne_bytes())
+                } else if raw.si_family == AF_INET6 {
+                    IpAddr::from(raw.Ipv6.sin6_addr.u.Byte)
+                } else {
+                    continue;
+                };
+                addresses.push((address, row.OnLinkPrefixLength));
+            }
+            FreeMibTable(table.cast());
+        }
+        Ok(addresses)
     }
 
     /// `IP_UNICAST_IF` / `IPV6_UNICAST_IF`, absent from `windows-sys`.

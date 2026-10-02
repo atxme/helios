@@ -59,8 +59,8 @@ pub struct ProvisionOutcome {
     pub address: String,
     /// IPv6 VIP persisted for this peer (`…/128`), when it has one.
     ///
-    /// Carried, not applied yet: putting it on the adapter belongs to the
-    /// dual-stack client (`ETUDE-IPV6.md`, ticket T19).
+    /// Only compared with the profile's `address_v6`, to report a stale profile:
+    /// the adapter carries the profile's address, never this one.
     pub address_v6: Option<String>,
     /// Gateway's WireGuard public key, as it declares itself.
     pub gateway_public_key: String,

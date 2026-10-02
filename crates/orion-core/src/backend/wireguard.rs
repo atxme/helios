@@ -45,6 +45,16 @@
 //! driver alone would read back a capture that does not exist. Any gap is
 //! reported as a [`CaptureCheck`], never retried or repaired behind the
 //! user's back.
+//!
+//! The same family check skips the **addresses** of a missing family: a
+//! profile carrying an IPv6 address (`address_v6`, `ADRESSAGE-IPV6.md` §7.3)
+//! on an adapter without IPv6 mounts with its IPv4 address alone. On Windows
+//! the read-back therefore also lists the unicast addresses the adapter
+//! carries, and an address of the profile that is not among them is part of
+//! the same verdict. On Linux and with the userspace backend, `defguard`
+//! assigns each address through netlink or `ifconfig` and returns a refusal
+//! as an error: `up()` then fails by name, adapter left mounted, so there is
+//! nothing silent to read back.
 
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -201,6 +211,7 @@ impl WireGuardBackend {
         #[allow(unused_mut)]
         let mut observations = vec![CaptureObservation {
             source: "configuration du pilote",
+            observed: Observed::AllowedIps,
             applied: driver,
         }];
         // The routes only on Windows: that is where `defguard` strips them.
@@ -209,7 +220,16 @@ impl WireGuardBackend {
         #[cfg(windows)]
         observations.push(CaptureObservation {
             source: "routes de l'adaptateur",
+            observed: Observed::AllowedIps,
             applied: routed_prefixes(&self.ifname),
+        });
+        // The addresses for the same reason: Windows is where they are
+        // skipped without an error (see the module header).
+        #[cfg(windows)]
+        observations.push(CaptureObservation {
+            source: "adresses de l'adaptateur",
+            observed: Observed::Addresses,
+            applied: carried_addresses(&self.ifname),
         });
         observations
     }
@@ -232,12 +252,52 @@ fn routed_prefixes(ifname: &str) -> Result<Vec<IpAddrMask>, String> {
         .map_err(|e| format!("{e:#}"))
 }
 
+/// The unicast addresses the adapter named `ifname` carries.
+#[cfg(windows)]
+fn carried_addresses(ifname: &str) -> Result<Vec<IpAddrMask>, String> {
+    use crate::net_pin::windows_impl;
+
+    let index = windows_impl::interface_index(ifname)
+        .ok_or_else(|| format!("adaptateur {ifname} introuvable"))?;
+    windows_impl::unicast_addresses_on(index)
+        .map(|addresses| {
+            addresses
+                .into_iter()
+                .map(|(address, cidr)| IpAddrMask::new(address, cidr))
+                .collect()
+        })
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// What a read-back is compared with.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Observed {
+    /// The prefixes the adapter captures: compared with `AllowedIPs`.
+    AllowedIps,
+    /// The addresses the adapter carries: compared with the profile's
+    /// addresses, host for host.
+    ///
+    /// Only Windows reads it back (see the module header), so elsewhere the
+    /// variant is built by the tests alone.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    Addresses,
+}
+
 /// One read-back of the capture, and where it was read.
 struct CaptureObservation {
     /// Named in the message when the read fails.
     source: &'static str,
+    /// Which requested list this read-back answers.
+    observed: Observed,
     /// The prefixes found there, or why they could not be read.
     applied: Result<Vec<IpAddrMask>, String>,
+}
+
+/// What `up()` asked the driver for: the peer's `AllowedIPs` and the
+/// adapter's addresses.
+struct RequestedCapture<'a> {
+    allowed_ips: &'a [IpAddrMask],
+    addresses: &'a [IpAddrMask],
 }
 
 /// A prefix with its host bits cleared.
@@ -279,6 +339,54 @@ fn missing_allowed_ips(requested: &[IpAddrMask], applied: &[IpAddrMask]) -> Vec<
     missing
 }
 
+/// Requested addresses the adapter does not carry, in the requested order.
+///
+/// Compared host for host: Windows reports an address with the on-link
+/// prefix length it chose, which says nothing about whether the address is
+/// there. An address read back in another spelling is the same address.
+fn missing_addresses(requested: &[IpAddrMask], carried: &[IpAddrMask]) -> Vec<IpAddrMask> {
+    let carried: HashSet<IpAddr> = carried.iter().map(|address| address.address).collect();
+    let mut missing: Vec<IpAddrMask> = Vec::new();
+    for address in requested {
+        if !carried.contains(&address.address) && !missing.contains(address) {
+            missing.push(address.clone());
+        }
+    }
+    missing
+}
+
+/// The profile's addresses, as the adapter is given them: the virtual address,
+/// then the IPv6 address when the profile has one (`ADRESSAGE-IPV6.md` §7.3).
+///
+/// Validated here, before the interface exists, like everything else that can
+/// fail without a side effect. A profile without `address_v6` yields exactly
+/// the one address it always did.
+fn adapter_addresses(profile: &ClientProfile) -> anyhow::Result<Vec<IpAddrMask>> {
+    let address = profile
+        .address
+        .as_deref()
+        .filter(|a| !a.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("adresse virtuelle absente du profil (enrôlement non effectué ?)")
+        })?;
+    let address = IpAddrMask::from_str(address)
+        .map_err(|e| anyhow::anyhow!("adresse `{address}` invalide : {e}"))?;
+    let mut addresses = vec![address];
+    if let Some(address_v6) = profile
+        .address_v6
+        .as_deref()
+        .filter(|a| !a.trim().is_empty())
+    {
+        // The import rule, not a looser parse: a profile reaching the data
+        // plane carries the `/128` host the gateway assigned, or nothing.
+        crate::profile_import::validate_address_v6(address_v6)?;
+        let host = aether::net::parse_vip_v6(address_v6.trim())
+            .map_err(|e| anyhow::anyhow!("adresse IPv6 `{address_v6}` invalide : {e}"))?;
+        addresses.push(IpAddrMask::new(IpAddr::V6(host), 128));
+    }
+    Ok(addresses)
+}
+
 /// Verdict on the capture, from every read-back available.
 ///
 /// A prefix missing from **any** source is missing: a driver that holds
@@ -286,23 +394,44 @@ fn missing_allowed_ips(requested: &[IpAddrMask], applied: &[IpAddrMask]) -> Vec<
 /// unreadable source, because it is the worse fact and it is certain; only
 /// when nothing is known to be missing does a failed read make the verdict
 /// `Unverified` — never `Complete`.
-fn assess_capture(requested: &[IpAddrMask], observations: &[CaptureObservation]) -> CaptureCheck {
+///
+/// An address the adapter does not carry is part of the same verdict: it is
+/// as much a fact about what was applied as a stripped prefix, and as silent
+/// on Windows.
+fn assess_capture(
+    requested: &RequestedCapture<'_>,
+    observations: &[CaptureObservation],
+) -> CaptureCheck {
     let mut missing: HashSet<IpAddrMask> = HashSet::new();
+    let mut absent: HashSet<IpAddrMask> = HashSet::new();
     let mut unread: Vec<String> = Vec::new();
     for observation in observations {
-        match &observation.applied {
-            Ok(applied) => missing.extend(missing_allowed_ips(requested, applied)),
-            Err(reason) => unread.push(format!("{} : {reason}", observation.source)),
+        match (&observation.applied, observation.observed) {
+            (Ok(applied), Observed::AllowedIps) => {
+                missing.extend(missing_allowed_ips(requested.allowed_ips, applied));
+            }
+            (Ok(carried), Observed::Addresses) => {
+                absent.extend(missing_addresses(requested.addresses, carried));
+            }
+            (Err(reason), _) => unread.push(format!("{} : {reason}", observation.source)),
         }
     }
-    if !missing.is_empty() {
-        // Back in the profile's order: the set only served the union.
-        let ordered = missing_allowed_ips(requested, &[])
+    if !missing.is_empty() || !absent.is_empty() {
+        // Back in the profile's order: the sets only served the union.
+        let missing = missing_allowed_ips(requested.allowed_ips, &[])
             .into_iter()
             .filter(|prefix| missing.contains(prefix))
             .map(|prefix| prefix.to_string())
             .collect();
-        return CaptureCheck::Incomplete { missing: ordered };
+        let missing_addresses = missing_addresses(requested.addresses, &[])
+            .into_iter()
+            .filter(|address| absent.contains(address))
+            .map(|address| address.to_string())
+            .collect();
+        return CaptureCheck::Incomplete {
+            missing,
+            missing_addresses,
+        };
     }
     if !unread.is_empty() {
         return CaptureCheck::Unverified {
@@ -318,27 +447,51 @@ fn assess_capture(requested: &[IpAddrMask], observations: &[CaptureObservation])
 /// `Error`: it is the one fact the screen cannot be allowed to bury in the
 /// log, since everything else about the tunnel looks healthy. An unreadable
 /// capture is a warning: nothing is known to leak, but nothing is proven.
+///
+/// A missing address is a warning, not an error: on its own it leaks nothing —
+/// the adapter simply does not speak that family. When its family's prefixes
+/// are missing too, which is the Windows case, the error already says what
+/// leaks.
 fn capture_events(check: &CaptureCheck) -> Vec<ClientEvent> {
-    let notice = match check {
-        CaptureCheck::Complete => {
-            ClientEvent::log("info", "AllowedIPs appliqués vérifiés sur l'adaptateur")
+    let mut events = vec![ClientEvent::capture(check.clone())];
+    match check {
+        CaptureCheck::Complete => events.push(ClientEvent::log(
+            "info",
+            "AllowedIPs et adresses appliqués vérifiés sur l'adaptateur",
+        )),
+        CaptureCheck::Incomplete {
+            missing,
+            missing_addresses,
+        } => {
+            if !missing.is_empty() {
+                events.push(ClientEvent::Error {
+                    message: format!(
+                        "AllowedIPs non appliqués par le pilote : {} — ce trafic n'est pas \
+                         capté par le tunnel et peut sortir en clair par l'interface physique",
+                        missing.join(", ")
+                    ),
+                });
+            }
+            if !missing_addresses.is_empty() {
+                events.push(ClientEvent::log(
+                    "warn",
+                    format!(
+                        "adresse non posée par le pilote sur l'adaptateur : {} — le tunnel ne \
+                         porte pas cette famille d'adresses",
+                        missing_addresses.join(", ")
+                    ),
+                ));
+            }
         }
-        CaptureCheck::Incomplete { missing } => ClientEvent::Error {
-            message: format!(
-                "AllowedIPs non appliqués par le pilote : {} — ce trafic n'est pas capté \
-                 par le tunnel et peut sortir en clair par l'interface physique",
-                missing.join(", ")
-            ),
-        },
-        CaptureCheck::Unverified { reason } => ClientEvent::log(
+        CaptureCheck::Unverified { reason } => events.push(ClientEvent::log(
             "warn",
             format!(
-                "capture du tunnel non vérifiée ({reason}) — les AllowedIPs réellement \
-                 appliqués sont inconnus"
+                "capture du tunnel non vérifiée ({reason}) — les AllowedIPs et adresses \
+                 réellement appliqués sont inconnus"
             ),
-        ),
-    };
-    vec![ClientEvent::capture(check.clone()), notice]
+        )),
+    }
+    events
 }
 
 #[async_trait]
@@ -355,15 +508,7 @@ impl VpnBackend for WireGuardBackend {
         //    announces would simply not be there.
         profile.validate_for_data_plane()?;
 
-        let address = profile
-            .address
-            .as_deref()
-            .filter(|a| !a.trim().is_empty())
-            .ok_or_else(|| {
-                anyhow::anyhow!("adresse virtuelle absente du profil (enrôlement non effectué ?)")
-            })?;
-        let address = IpAddrMask::from_str(address)
-            .map_err(|e| anyhow::anyhow!("adresse `{address}` invalide : {e}"))?;
+        let addresses = adapter_addresses(profile)?;
 
         // Validates the private key format NOW. `defguard` expects it
         // encoded in `InterfaceConfiguration::prvkey` and would only reject
@@ -377,7 +522,7 @@ impl VpnBackend for WireGuardBackend {
         let config = InterfaceConfiguration {
             name: self.ifname.clone(),
             prvkey: profile.private_key.clone(),
-            addresses: vec![address],
+            addresses: addresses.clone(),
             port: CLIENT_LISTEN_PORT as u32 as u16,
             peers: vec![peer.clone()],
             // WireGuard's default (1420) assumes a 1500 transport. Below
@@ -457,7 +602,10 @@ impl VpnBackend for WireGuardBackend {
         //    So the tunnel keeps what it carries, and the gap is stated where
         //    the user looks: an error on screen and an amber posture row.
         let capture = assess_capture(
-            &peer.allowed_ips,
+            &RequestedCapture {
+                allowed_ips: &peer.allowed_ips,
+                addresses: &addresses,
+            },
             &self.observe_capture(&api, &peer.public_key),
         );
         drop(api);
@@ -623,7 +771,35 @@ mod tests {
     fn read(source: &'static str, list: &str) -> CaptureObservation {
         CaptureObservation {
             source,
+            observed: Observed::AllowedIps,
             applied: Ok(prefixes(list)),
+        }
+    }
+
+    fn read_addresses(list: &str) -> CaptureObservation {
+        CaptureObservation {
+            source: "adresses de l'adaptateur",
+            observed: Observed::Addresses,
+            applied: Ok(prefixes(list)),
+        }
+    }
+
+    /// The verdict on `AllowedIPs` alone, the profile asking for no address
+    /// the observations read back.
+    fn assess(allowed_ips: &[IpAddrMask], observations: &[CaptureObservation]) -> CaptureCheck {
+        assess_capture(
+            &RequestedCapture {
+                allowed_ips,
+                addresses: &[],
+            },
+            observations,
+        )
+    }
+
+    fn gap(missing: &[&str]) -> CaptureCheck {
+        CaptureCheck::Incomplete {
+            missing: missing.iter().map(ToString::to_string).collect(),
+            missing_addresses: Vec::new(),
         }
     }
 
@@ -689,24 +865,19 @@ mod tests {
         // full tunnel, the driver holding both families, and Windows routing
         // only IPv4 — what `defguard` 0.11 leaves after its family check.
         let peer = WireGuardBackend::build_peer(&profile()).unwrap();
-        let check = assess_capture(
+        let check = assess(
             &peer.allowed_ips,
             &[
                 read("configuration du pilote", "0.0.0.0/0, ::/0"),
                 read("routes de l'adaptateur", "0.0.0.0/0, 100.64.1.2/32"),
             ],
         );
-        assert_eq!(
-            check,
-            CaptureCheck::Incomplete {
-                missing: vec!["::/0".into()]
-            }
-        );
+        assert_eq!(check, gap(&["::/0"]));
     }
 
     #[test]
     fn a_complete_read_back_is_complete() {
-        let check = assess_capture(
+        let check = assess(
             &prefixes("0.0.0.0/0, ::/0"),
             &[
                 read("configuration du pilote", "::/0, 0.0.0.0/0"),
@@ -718,42 +889,33 @@ mod tests {
 
     #[test]
     fn missing_prefixes_from_several_sources_are_merged_in_profile_order() {
-        let check = assess_capture(
+        let check = assess(
             &prefixes("0.0.0.0/0, 10.8.0.0/16, ::/0"),
             &[
                 read("configuration du pilote", "0.0.0.0/0, 10.8.0.0/16"),
                 read("routes de l'adaptateur", "0.0.0.0/0, ::/0"),
             ],
         );
-        assert_eq!(
-            check,
-            CaptureCheck::Incomplete {
-                missing: vec!["10.8.0.0/16".into(), "::/0".into()]
-            }
-        );
+        assert_eq!(check, gap(&["10.8.0.0/16", "::/0"]));
     }
 
     #[test]
     fn an_absent_peer_misses_everything() {
         // `observe_capture` reads an absent peer as an empty list.
-        let check = assess_capture(
+        let check = assess(
             &prefixes("0.0.0.0/0, ::/0"),
             &[read("configuration du pilote", "")],
         );
-        assert_eq!(
-            check,
-            CaptureCheck::Incomplete {
-                missing: vec!["0.0.0.0/0".into(), "::/0".into()]
-            }
-        );
+        assert_eq!(check, gap(&["0.0.0.0/0", "::/0"]));
     }
 
     #[test]
     fn an_unreadable_configuration_is_unverified_not_complete() {
-        let check = assess_capture(
+        let check = assess(
             &prefixes("0.0.0.0/0, ::/0"),
             &[CaptureObservation {
                 source: "configuration du pilote",
+                observed: Observed::AllowedIps,
                 applied: Err("adaptateur introuvable".into()),
             }],
         );
@@ -767,32 +929,26 @@ mod tests {
 
     #[test]
     fn a_known_gap_outranks_an_unreadable_source() {
-        let check = assess_capture(
+        let check = assess(
             &prefixes("0.0.0.0/0, ::/0"),
             &[
                 CaptureObservation {
                     source: "configuration du pilote",
+                    observed: Observed::AllowedIps,
                     applied: Err("lecture impossible".into()),
                 },
                 read("routes de l'adaptateur", "0.0.0.0/0"),
             ],
         );
-        assert_eq!(
-            check,
-            CaptureCheck::Incomplete {
-                missing: vec!["::/0".into()]
-            }
-        );
+        assert_eq!(check, gap(&["::/0"]));
     }
 
     #[test]
     fn a_gap_reaches_the_screen_as_an_error_naming_the_prefix() {
-        let events = capture_events(&CaptureCheck::Incomplete {
-            missing: vec!["::/0".into()],
-        });
+        let events = capture_events(&gap(&["::/0"]));
         assert!(matches!(
             &events[0],
-            ClientEvent::Capture { capture: CaptureCheck::Incomplete { missing } }
+            ClientEvent::Capture { capture: CaptureCheck::Incomplete { missing, .. } }
                 if missing == &["::/0".to_string()]
         ));
         match &events[1] {
@@ -839,5 +995,197 @@ mod tests {
         assert!(events
             .iter()
             .all(|event| !matches!(event, ClientEvent::Error { .. })));
+    }
+
+    fn dual_stack() -> ClientProfile {
+        ClientProfile {
+            address_v6: Some("fd3c:91a2:7e04::2/128".into()),
+            ..profile()
+        }
+    }
+
+    /// A profile without `address_v6` gives the adapter the one address it
+    /// always had (`ADRESSAGE-IPV6.md` §8).
+    #[test]
+    fn an_ipv4_profile_gives_the_adapter_one_address() {
+        assert_eq!(
+            named(adapter_addresses(&profile()).unwrap()),
+            ["100.64.1.2/32"]
+        );
+    }
+
+    /// Both addresses, IPv4 first, the IPv6 one as the `/128` host it is.
+    /// `AllowedIPs` are not touched: the peer is the same with or without it.
+    #[test]
+    fn a_dual_stack_profile_gives_the_adapter_both_addresses() {
+        assert_eq!(
+            named(adapter_addresses(&dual_stack()).unwrap()),
+            ["100.64.1.2/32", "fd3c:91a2:7e04::2/128"]
+        );
+        let ipv4 = WireGuardBackend::build_peer(&profile()).unwrap();
+        let dual = WireGuardBackend::build_peer(&dual_stack()).unwrap();
+        assert_eq!(ipv4.allowed_ips, dual.allowed_ips);
+    }
+
+    /// Refused before the interface exists, like everything that can fail
+    /// without a side effect.
+    #[test]
+    fn a_malformed_ipv6_address_is_refused_before_mounting() {
+        for value in ["fd3c:91a2:7e04::/64", "100.64.1.3/32", "fe80::2%eth0/128"] {
+            let profile = ClientProfile {
+                address_v6: Some(value.into()),
+                ..profile()
+            };
+            let error = adapter_addresses(&profile).unwrap_err().to_string();
+            assert!(
+                error.starts_with("adresse IPv6 invalide"),
+                "{value}: {error}"
+            );
+        }
+        // A blank value is no value.
+        let blank = ClientProfile {
+            address_v6: Some("  ".into()),
+            ..profile()
+        };
+        assert_eq!(named(adapter_addresses(&blank).unwrap()), ["100.64.1.2/32"]);
+    }
+
+    #[test]
+    fn missing_addresses_are_compared_host_for_host() {
+        // Windows reports the on-link length it chose: the host is what
+        // counts, and an extra link-local address is not a gap.
+        let requested = prefixes("100.64.1.2/32, fd3c:91a2:7e04::2/128");
+        assert!(missing_addresses(
+            &requested,
+            &prefixes("fe80::5/64, 100.64.1.2/32, fd3c:91a2:7e04:0:0:0:0:2/64"),
+        )
+        .is_empty());
+        assert_eq!(
+            named(missing_addresses(&requested, &prefixes("100.64.1.2/32"))),
+            ["fd3c:91a2:7e04::2/128"]
+        );
+    }
+
+    /// The `defguard` Windows case on a dual-stack profile: no IPv6 on the
+    /// adapter, so both `::/0` and the IPv6 address are skipped without an
+    /// error. Both are part of the verdict.
+    #[test]
+    fn a_skipped_ipv6_address_is_part_of_the_verdict() {
+        let profile = dual_stack();
+        let peer = WireGuardBackend::build_peer(&profile).unwrap();
+        let addresses = adapter_addresses(&profile).unwrap();
+        let check = assess_capture(
+            &RequestedCapture {
+                allowed_ips: &peer.allowed_ips,
+                addresses: &addresses,
+            },
+            &[
+                read("configuration du pilote", "0.0.0.0/0, ::/0"),
+                read("routes de l'adaptateur", "0.0.0.0/0, 100.64.1.2/32"),
+                read_addresses("100.64.1.2/32"),
+            ],
+        );
+        assert_eq!(
+            check,
+            CaptureCheck::Incomplete {
+                missing: vec!["::/0".into()],
+                missing_addresses: vec!["fd3c:91a2:7e04::2/128".into()],
+            }
+        );
+    }
+
+    /// An address missing on its own still makes the verdict incomplete: it
+    /// is a fact about the adapter, not something to infer from the routes.
+    #[test]
+    fn a_missing_address_alone_is_incomplete() {
+        let addresses = adapter_addresses(&dual_stack()).unwrap();
+        let check = assess_capture(
+            &RequestedCapture {
+                allowed_ips: &prefixes("0.0.0.0/0, ::/0"),
+                addresses: &addresses,
+            },
+            &[
+                read("configuration du pilote", "0.0.0.0/0, ::/0"),
+                read_addresses("fd3c:91a2:7e04::2/128"),
+            ],
+        );
+        assert_eq!(
+            check,
+            CaptureCheck::Incomplete {
+                missing: Vec::new(),
+                missing_addresses: vec!["100.64.1.2/32".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn both_addresses_read_back_are_complete() {
+        let addresses = adapter_addresses(&dual_stack()).unwrap();
+        let check = assess_capture(
+            &RequestedCapture {
+                allowed_ips: &prefixes("0.0.0.0/0, ::/0"),
+                addresses: &addresses,
+            },
+            &[
+                read("configuration du pilote", "0.0.0.0/0, ::/0"),
+                read_addresses("100.64.1.2/32, fe80::1/64, fd3c:91a2:7e04::2/128"),
+            ],
+        );
+        assert_eq!(check, CaptureCheck::Complete);
+    }
+
+    #[test]
+    fn an_unreadable_address_table_is_unverified() {
+        let addresses = adapter_addresses(&dual_stack()).unwrap();
+        let check = assess_capture(
+            &RequestedCapture {
+                allowed_ips: &prefixes("0.0.0.0/0, ::/0"),
+                addresses: &addresses,
+            },
+            &[
+                read("configuration du pilote", "0.0.0.0/0, ::/0"),
+                CaptureObservation {
+                    source: "adresses de l'adaptateur",
+                    observed: Observed::Addresses,
+                    applied: Err("adaptateur introuvable".into()),
+                },
+            ],
+        );
+        assert_eq!(
+            check,
+            CaptureCheck::Unverified {
+                reason: "adresses de l'adaptateur : adaptateur introuvable".into()
+            }
+        );
+    }
+
+    /// A missing address is stated, as a warning naming it: on its own it
+    /// leaks nothing, so it is not the error a stripped prefix is.
+    #[test]
+    fn a_missing_address_reaches_the_screen_as_a_warning_naming_it() {
+        let events = capture_events(&CaptureCheck::Incomplete {
+            missing: Vec::new(),
+            missing_addresses: vec!["fd3c:91a2:7e04::2/128".into()],
+        });
+        assert!(matches!(
+            &events[0],
+            ClientEvent::Capture { capture: CaptureCheck::Incomplete { missing_addresses, .. } }
+                if missing_addresses == &["fd3c:91a2:7e04::2/128".to_string()]
+        ));
+        assert!(events
+            .iter()
+            .all(|event| !matches!(event, ClientEvent::Error { .. })));
+        match &events[1] {
+            ClientEvent::Log { level, message } => {
+                assert_eq!(level, "warn");
+                assert!(
+                    message.starts_with(
+                        "adresse non posée par le pilote sur l'adaptateur : fd3c:91a2:7e04::2/128"
+                    ),
+                    "{message}"
+                );
+            }
+            other => panic!("a missing address must be a warning, got {other:?}"),
+        }
     }
 }

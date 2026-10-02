@@ -20,6 +20,7 @@ const profile = (over: Partial<ClientProfile> = {}): ClientProfile => ({
   has_private_key: false,
   has_static_psk: false,
   address: null,
+  address_v6: null,
   allowed_ips: '0.0.0.0/0, ::/0',
   ipv6_uncaptured_full_tunnel: false,
   persistent_keepalive: 25,

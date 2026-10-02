@@ -467,6 +467,39 @@ omis quand il est absent. `ProvisionResponse` n'est pas
 - `AllowedIPs` n'est pas défini par cette spécification : la capture de
   `::/0` relève du ticket T01, qui s'applique avec ou sans VIP IPv6.
 
+### 7.4 Implémentation (T19)
+
+Cette section décrit où vivent les règles ci-dessus ; elle ne change aucune
+décision.
+
+- Profil : `orion_core::ClientProfile::address_v6`, optionnel et jamais écrit
+  quand il est absent. La règle de validation est `aether::net::parse_vip_v6`
+  (§2.3), appliquée à l'import, dans l'éditeur et avant la montée ; une VIP
+  IPv6 accompagne une adresse virtuelle IPv4, jamais une adresse virtuelle
+  elle-même IPv6 (§2.6). Un fichier `wg-quick` dont `Address` porte une IPv4 et
+  un `/128` remplit les deux champs ; deux adresses d'une même famille ou une
+  IPv6 qui n'est pas un `/128` sont refusées par leur nom.
+- Coffre : le manifeste scellé passe en version 8 **seulement** pour un profil
+  qui porte `address_v6` ; un profil sans elle reste scellé octet pour octet
+  dans la version 7.
+- Émission : `helios-ctl profile emit` et `enroll` lisent `address_v6` du pair
+  admis dans `GET /api/network` (la réponse d'admission ne porte que l'IPv4) et
+  n'écrivent la clé que si elle existe ; `enroll` hors API la prend de
+  `--address-v6`.
+- Plan de données : `backend::wireguard` remet à `defguard` la VIP IPv4 puis la
+  VIP IPv6. Sous Windows, une adresse d'une famille absente de l'adaptateur est
+  écartée sans erreur par `defguard` ; la relecture de T02 lit aussi les
+  adresses unicast de l'adaptateur et nomme l'adresse manquante
+  (`CaptureCheck::Incomplete::missing_addresses`, ligne « adresse » en ambre).
+  Sous Linux, le refus est une erreur de configuration.
+- Écart : après le provisioning, `assigned_address_v6` est comparée à
+  `address_v6` du profil ; tout écart est signalé comme profil périmé, sans
+  réécriture (§3 bis.4).
+- Écran : la présélection « Helios seul » ajoute `<préfixe>::1/128`, calculé
+  depuis le `/64` de `address_v6` (§2.4).
+- Essais sur cible : [MANUAL-TESTING.md](../testing/MANUAL-TESTING.md),
+  « Profil dual-stack : deux adresses sur l'adaptateur ».
+
 ## 8. Compatibilité
 
 | Situation | Comportement attendu |
@@ -516,4 +549,4 @@ table `51820` en IPv6, `ping -6` gateway ↔ pair avec `allow_tunnel_icmp`.
 | T13 `vip_routing` IPv6 | §6.3 |
 | T14 admission et provisioning | §3 bis.2 (règles 1, 4 et 7), §5.3, §7.1 |
 | T16 auth API | §2.6 : canonicalisation seulement en v1 |
-| T19 Orion dual-stack | §7.2, §7.3 |
+| T19 Orion dual-stack | §7.2, §7.3, §7.4 |

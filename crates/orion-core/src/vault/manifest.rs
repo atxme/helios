@@ -29,9 +29,21 @@ use super::{codec, codec::Cursor, VaultError};
 use crate::config::{ClientProfile, KeyNegotiationSettings, ProfileKind};
 use aether::key_negotiation::ProtectionMode;
 
-/// Version written today. Any version not listed below is refused, never
-/// guessed.
-const MANIFEST_VERSION: u8 = 7;
+/// Version written today for a profile carrying an IPv6 address. Any
+/// version not listed below is refused, never guessed.
+///
+/// It appends `address_v6`, and it is written **only** when the profile has
+/// one: a profile without it is still sealed as
+/// [`MANIFEST_VERSION_WITHOUT_ADDRESS_V6`], byte for byte as before. The
+/// absent value writes nothing, so an IPv4-only profile stays readable by an
+/// Orion that predates the field, and only a profile that would lose an
+/// address when read by such an Orion is refused by it (`ADRESSAGE-IPV6.md`
+/// §8 — the same line the `orion-profile` document draws).
+const MANIFEST_VERSION: u8 = 8;
+
+/// Version written for a profile without an IPv6 address: everything of
+/// today except the trailing `address_v6`.
+const MANIFEST_VERSION_WITHOUT_ADDRESS_V6: u8 = 7;
 
 /// Previous version, still readable: it lacks the trailing `ssh_target`.
 ///
@@ -161,6 +173,8 @@ pub struct ProfileManifest {
     /// **Secret**, when a static PSK is in use.
     pub preshared_key: Option<Zeroizing<String>>,
     pub address: Option<String>,
+    /// Present only in a manifest of [`MANIFEST_VERSION`].
+    pub address_v6: Option<String>,
     pub allowed_ips: String,
     pub persistent_keepalive: u16,
     pub heliosd_url: Option<String>,
@@ -191,6 +205,7 @@ impl ProfileManifest {
             peer_public_key: profile.peer_public_key.clone(),
             preshared_key: profile.preshared_key.clone().map(Zeroizing::new),
             address: profile.address.clone(),
+            address_v6: profile.address_v6.clone(),
             allowed_ips: profile.allowed_ips.clone(),
             persistent_keepalive: profile.persistent_keepalive,
             heliosd_url: profile.heliosd_url.clone(),
@@ -215,6 +230,7 @@ impl ProfileManifest {
                 .as_ref()
                 .map(|psk| psk.as_str().to_string()),
             address: self.address.clone(),
+            address_v6: self.address_v6.clone(),
             allowed_ips: self.allowed_ips.clone(),
             persistent_keepalive: self.persistent_keepalive,
             heliosd_url: self.heliosd_url.clone(),
@@ -298,7 +314,11 @@ impl ProfileManifest {
     /// Encodes into a bounded, zeroizing buffer.
     pub fn encode(&self) -> Result<Zeroizing<Vec<u8>>, VaultError> {
         let mut out = Zeroizing::new(Vec::with_capacity(1024));
-        out.push(MANIFEST_VERSION);
+        out.push(if self.address_v6.is_some() {
+            MANIFEST_VERSION
+        } else {
+            MANIFEST_VERSION_WITHOUT_ADDRESS_V6
+        });
         out.extend_from_slice(&self.generation.0.to_be_bytes());
         codec::put(&mut out, self.name.as_bytes())?;
         codec::put(&mut out, self.endpoint.as_bytes())?;
@@ -345,6 +365,11 @@ impl ProfileManifest {
                 }
             }
         }
+        // Last, and only in the version that carries it: see
+        // [`MANIFEST_VERSION`].
+        if let Some(address_v6) = &self.address_v6 {
+            codec::put(&mut out, address_v6.as_bytes())?;
+        }
         if out.len() > MAX_MANIFEST_BYTES {
             return Err(VaultError::ManifestTooLarge(out.len()));
         }
@@ -359,6 +384,7 @@ impl ProfileManifest {
         let mut cursor = Cursor::new(bytes);
         let version = cursor.byte()?;
         if version != MANIFEST_VERSION
+            && version != MANIFEST_VERSION_WITHOUT_ADDRESS_V6
             && version != MANIFEST_VERSION_WITHOUT_GATEWAY_EPOCHS
             && version != MANIFEST_VERSION_WITHOUT_CREDENTIAL_BINDINGS
             && version != MANIFEST_VERSION_WITHOUT_PROFILE_KIND
@@ -478,6 +504,19 @@ impl ProfileManifest {
                 )))
             }
         };
+        // Written last, by the one version that carries it. Never empty there:
+        // that version is only chosen when the value exists.
+        let address_v6 = if version > MANIFEST_VERSION_WITHOUT_ADDRESS_V6 {
+            let text = cursor.text()?;
+            if text.is_empty() {
+                return Err(VaultError::ManifestEncoding(
+                    "empty address_v6 in a manifest that exists to carry one".into(),
+                ));
+            }
+            Some(text)
+        } else {
+            None
+        };
         // Trailing bytes mean the encoder and decoder disagree. Ignoring them
         // is how a format silently forks.
         cursor.expect_end()?;
@@ -489,6 +528,7 @@ impl ProfileManifest {
             peer_public_key,
             preshared_key,
             address,
+            address_v6,
             allowed_ips,
             persistent_keepalive,
             heliosd_url,
@@ -572,6 +612,7 @@ mod tests {
             peer_public_key: "cHVibGlj".into(),
             preshared_key: Some("cHNr".into()),
             address: Some("100.64.1.2/32".into()),
+            address_v6: None,
             allowed_ips: "0.0.0.0/0".into(),
             persistent_keepalive: 25,
             heliosd_url: Some("http://100.64.0.1:8080".into()),
@@ -643,7 +684,10 @@ mod tests {
         let resealed = ProfileManifest::from_profile(&rebuilt, SecurityGeneration(9))
             .encode()
             .expect("encode");
-        assert_eq!(resealed[0], MANIFEST_VERSION);
+        assert_eq!(
+            resealed[0], MANIFEST_VERSION_WITHOUT_ADDRESS_V6,
+            "current layout without IPv6"
+        );
     }
 
     /// The trust material of spec §19 survives a seal and an open.
@@ -748,7 +792,10 @@ mod tests {
         let resealed = ProfileManifest::from_profile(&rebuilt, SecurityGeneration(11))
             .encode()
             .expect("encode");
-        assert_eq!(resealed[0], MANIFEST_VERSION);
+        assert_eq!(
+            resealed[0], MANIFEST_VERSION_WITHOUT_ADDRESS_V6,
+            "current layout without IPv6"
+        );
     }
 
     /// Version 3 carried trust anchors but not the out-of-band Astra policy.
@@ -875,6 +922,86 @@ mod tests {
         assert!(matches!(
             ProfileManifest::decode(&future),
             Err(VaultError::UnsupportedManifest(_))
+        ));
+    }
+
+    /// A profile without an IPv6 address is sealed exactly as before the
+    /// field existed: same version byte, same bytes. Built by hand in the v7
+    /// layout, for the reason given on the v1 test — the encoder agreeing
+    /// with itself proves nothing about the bytes an older Orion reads.
+    #[test]
+    fn a_profile_without_ipv6_is_sealed_in_the_previous_layout() {
+        let source = profile();
+        let settings = negotiation();
+        let mut v7: Vec<u8> = Vec::new();
+        v7.push(MANIFEST_VERSION_WITHOUT_ADDRESS_V6);
+        v7.extend_from_slice(&3u64.to_be_bytes());
+        codec::put(&mut v7, source.name.as_bytes()).unwrap();
+        codec::put(&mut v7, source.endpoint.as_bytes()).unwrap();
+        codec::put(&mut v7, source.private_key.as_bytes()).unwrap();
+        codec::put(&mut v7, source.peer_public_key.as_bytes()).unwrap();
+        codec::put_option(&mut v7, source.preshared_key.as_deref().map(str::as_bytes)).unwrap();
+        codec::put_option(&mut v7, source.address.as_deref().map(str::as_bytes)).unwrap();
+        codec::put(&mut v7, source.allowed_ips.as_bytes()).unwrap();
+        v7.extend_from_slice(&source.persistent_keepalive.to_be_bytes());
+        codec::put_option(&mut v7, source.heliosd_url.as_deref().map(str::as_bytes)).unwrap();
+        codec::put_option(&mut v7, source.ssh_target.as_deref().map(str::as_bytes)).unwrap();
+        v7.push(2); // helios_key_negotiation
+        v7.push(1); // key-negotiation block present
+        v7.push(mode_id(settings.mode));
+        v7.push(mode_id(settings.minimum_mode));
+        codec::put(&mut v7, settings.endpoint.as_bytes()).unwrap();
+        codec::put(&mut v7, settings.server_name.as_bytes()).unwrap();
+        codec::put(&mut v7, settings.gateway_ca_der.as_bytes()).unwrap();
+        codec::put(&mut v7, settings.gateway_pq_certificate.as_bytes()).unwrap();
+        codec::put(&mut v7, settings.identity.as_bytes()).unwrap();
+        v7.push(0); // no trust material
+
+        let encoded = ProfileManifest::from_profile(&source, SecurityGeneration(3))
+            .encode()
+            .expect("encode");
+        assert_eq!(encoded.as_slice(), v7.as_slice());
+        let decoded = ProfileManifest::decode(&v7).expect("a v7 manifest still opens");
+        assert_eq!(decoded.address_v6, None, "absent, not invented");
+        assert_eq!(decoded.to_profile().address, source.address);
+    }
+
+    /// An IPv6 address moves the profile to the version that carries it, so
+    /// an Orion that cannot apply it refuses the profile instead of mounting
+    /// an IPv4-only adapter in silence.
+    #[test]
+    fn an_ipv6_address_is_sealed_in_its_own_version_and_round_trips() {
+        let mut dual = profile();
+        dual.address_v6 = Some("fd3c:91a2:7e04::2/128".into());
+        let encoded = ProfileManifest::from_profile(&dual, SecurityGeneration(4))
+            .encode()
+            .expect("encode");
+        assert_eq!(encoded[0], MANIFEST_VERSION);
+
+        let decoded = ProfileManifest::decode(&encoded).expect("decode");
+        let rebuilt = decoded.to_profile();
+        assert_eq!(rebuilt.address.as_deref(), Some("100.64.1.2/32"));
+        assert_eq!(rebuilt.address_v6.as_deref(), Some("fd3c:91a2:7e04::2/128"));
+
+        // The field is the trailing one of its version: cut it, and the
+        // manifest is refused rather than read as an IPv4-only profile.
+        let without_trailer = &encoded[..encoded.len() - 1];
+        assert!(ProfileManifest::decode(without_trailer).is_err());
+    }
+
+    /// The version that exists to carry the address never carries an empty
+    /// one: an encoder that wrote it so is a bug, not a profile.
+    #[test]
+    fn an_empty_ipv6_address_in_its_own_version_is_refused() {
+        let encoded = ProfileManifest::from_profile(&profile(), SecurityGeneration(1))
+            .encode()
+            .expect("encode");
+        let mut forged = encoded.to_vec();
+        forged[0] = MANIFEST_VERSION;
+        codec::put(&mut forged, b"").unwrap();
+        assert!(matches!(
+            ProfileManifest::decode(&forged),
+            Err(VaultError::ManifestEncoding(_))
         ));
     }
 

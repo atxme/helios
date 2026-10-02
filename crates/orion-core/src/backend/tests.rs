@@ -62,6 +62,56 @@ fn a_profile_with_another_address_is_reported_stale() {
     assert!(!warning.contains("corriger le profil"), "{warning}");
 }
 
+/// Agreement in either shape raises nothing: both without IPv6 — every
+/// profile of a gateway without it (§8) — or the same VIP in two spellings.
+#[test]
+fn a_profile_agreeing_on_the_ipv6_address_raises_no_warning() {
+    assert_eq!(stale_profile_address_v6(None, None), None);
+    assert_eq!(
+        stale_profile_address_v6(Some("fd3c:91a2:7e04::2/128"), Some("fd3c:91a2:7e04::2/128")),
+        None
+    );
+    assert_eq!(
+        stale_profile_address_v6(
+            Some("FD3C:91A2:7E04:0::2/128"),
+            Some("fd3c:91a2:7e04::2/128")
+        ),
+        None
+    );
+}
+
+/// Each IPv6 divergence names the stale profile in the IPv4 message's words
+/// and asks for a re-emitted one; none tells the user to edit it.
+#[test]
+fn a_profile_with_another_ipv6_address_is_reported_stale() {
+    for (declared, announced, names) in [
+        (
+            Some("fd3c:91a2:7e04::2/128"),
+            Some("fd3c:91a2:7e04::9/128"),
+            vec!["fd3c:91a2:7e04::2/128", "fd3c:91a2:7e04::9/128", "rejette"],
+        ),
+        (
+            Some("fd3c:91a2:7e04::2/128"),
+            None,
+            vec!["fd3c:91a2:7e04::2/128", "aucune adresse IPv6", "rejette"],
+        ),
+        (
+            None,
+            Some("fd3c:91a2:7e04::9/128"),
+            vec!["fd3c:91a2:7e04::9/128", "IPv4 seule"],
+        ),
+    ] {
+        let warning = stale_profile_address_v6(declared, announced)
+            .unwrap_or_else(|| panic!("{declared:?} / {announced:?} must be reported"));
+        assert!(warning.starts_with("Profil périmé"), "{warning}");
+        assert!(warning.contains("réémis"), "{warning}");
+        assert!(warning.contains("ne modifie pas le profil"), "{warning}");
+        for name in names {
+            assert!(warning.contains(name), "{name}: {warning}");
+        }
+    }
+}
+
 fn sink() -> EventSink {
     Arc::new(|_| {})
 }

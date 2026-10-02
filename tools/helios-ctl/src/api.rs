@@ -38,6 +38,10 @@ pub struct NetworkPeerView {
     pub name: String,
     pub public_key: String,
     pub address: String,
+    /// IPv6 VIP, `…/128`, when the peer has one. Absent on a gateway older
+    /// than the field, which is what such a gateway means: no IPv6.
+    #[serde(default)]
+    pub address_v6: Option<String>,
     pub preshared_key_configured: bool,
     pub key_negotiation_certificate_sha256: Option<String>,
     pub key_negotiation_pq_certificate_sha256: Option<String>,

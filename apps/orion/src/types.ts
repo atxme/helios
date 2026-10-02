@@ -318,6 +318,12 @@ export interface ClientProfile {
   has_static_psk: boolean
   /** CGNAT VIP assigned by the gateway at enrollment (e.g. `100.64.1.2/32`). */
   address: string | null
+  /**
+   * IPv6 VIP assigned by a gateway that has an IPv6 tunnel prefix, one `/128`
+   * host (`fd3c:91a2:7e04::2/128`). `null` = IPv4-only tunnel, which is every
+   * profile of a gateway without IPv6.
+   */
+  address_v6: string | null
   /** Traffic routed into the tunnel. Defaults to `0.0.0.0/0, ::/0`. */
   allowed_ips: string
   /**
@@ -369,6 +375,7 @@ export interface ProfileDraft {
   endpoint: string
   peer_public_key: string
   address: string | null
+  address_v6: string | null
   allowed_ips: string
   persistent_keepalive: number
   heliosd_url: string | null
@@ -406,6 +413,8 @@ export interface ProfileIssues {
   peer_public_key: string | null
   preshared_key: string | null
   address: string | null
+  /** Also judged against `address`: an IPv6 address accompanies an IPv4 one. */
+  address_v6: string | null
   allowed_ips: string | null
   persistent_keepalive: string | null
   heliosd_url: string | null
@@ -443,7 +452,17 @@ export type PskKind = 'none' | 'static' | 'ml_kem'
  */
 export type CaptureCheck =
   | { status: 'complete' }
-  | { status: 'incomplete'; missing: string[] }
+  | {
+      status: 'incomplete'
+      /** `AllowedIPs` the adapter does not capture. */
+      missing: string[]
+      /**
+       * Profile addresses the driver did not put on the adapter — on Windows,
+       * the IPv6 address of an adapter without IPv6. At least one of the two
+       * lists is non-empty.
+       */
+      missing_addresses: string[]
+    }
   | { status: 'unverified'; reason: string }
 
 // Events pushed by the Rust backend (emit "helios://event").

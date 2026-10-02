@@ -620,6 +620,58 @@ une seconde résolution.
 
 Restaurer le fichier `hosts` à la fin.
 
+### Profil dual-stack : deux adresses sur l'adaptateur (VM Windows)
+
+Ce contrôle exige une gateway dotée d'un préfixe IPv6 de tunnel
+(`wg_address_v6`, IPv6 installée : `helios-ctl status` affiche `installed`) et
+`allow_tunnel_icmp = true`, un pair admis ou réadmis depuis (il porte
+`address_v6` dans `network.toml`), une VM Windows dual-stack et un Orion
+compilé avec `--features wireguard`. Sous WSL, seuls l'import, la validation,
+le scellement, la liste d'adresses remise à `defguard`, la comparaison de
+relecture et l'écran sont exercés (`scripts/wsl-cargo test -p orion-core`,
+`--features wireguard backend::wireguard`, `npm run test:unit`).
+
+1. **Émission.** `helios-ctl profile emit --name <pair> …` puis
+   `helios-ctl profile check <fichier>` : la ligne « adresse IPv6 » donne le
+   `/128` du pair. Pour un pair sans IPv6, le document ne contient **pas** la
+   clé : `Select-String address_v6 <fichier>` ne trouve rien.
+2. **Import.** L'écran Profils montre « Adresse virtuelle IPv6 » remplie à
+   côté de l'adresse virtuelle ; la ligne « adresse » du panneau de posture
+   affiche les deux, IPv4 d'abord.
+3. **Connexion.** `Get-NetIPAddress -InterfaceAlias orion0` liste la VIP IPv4
+   en `/32` et la VIP IPv6 en `/128`. Le journal affiche « AllowedIPs et
+   adresses appliqués vérifiés sur l'adaptateur », sans avertissement.
+4. **Joindre la gateway en IPv6.** `ping -6 <préfixe>::1` répond (ICMPv6 ouvert
+   sur l'interface du tunnel par `allow_tunnel_icmp`), comme
+   `ping 100.64.0.1`. `heliosd_url` reste l'URL IPv4 de la gateway.
+5. **« Helios seul ».** Sous « Avancé », le choix écrit
+   `<VIP gateway>/32, <préfixe>::1/128`. Après reconnexion, le `ping -6` de
+   l'étape 4 répond toujours. Le même choix sur un profil sans IPv6 écrit la
+   seule VIP IPv4, comme avant.
+6. **Adaptateur sans IPv6.** Avec `DisabledComponents = 0xFF` comme dans
+   « Capture réellement appliquée », connecter le profil dual-stack. Attendu,
+   en plus de l'erreur `::/0` de ce contrôle : l'avertissement « adresse non
+   posée par le pilote sur l'adaptateur : <VIP IPv6>/128 — le tunnel ne porte
+   pas cette famille d'adresses », et la ligne « adresse » en ambre
+   (« … — <VIP IPv6>/128 non posée par le pilote »). Le tunnel IPv4 fonctionne.
+   Remettre la valeur d'origine et redémarrer.
+7. **Profil périmé.** Sur un profil portant `heliosd_url` sans bloc de
+   négociation (chemin de provisioning après montage), remplacer la VIP IPv6
+   par une autre adresse du préfixe, puis connecter. Attendu, en
+   avertissement : « Profil périmé : la gateway a enregistré … pour ce poste,
+   le profil déclare … » ; le profil enregistré n'est pas modifié.
+8. **Orion antérieur.** Importer le document de l'étape 1 dans un Orion
+   antérieur à `address_v6` : l'import est **refusé**. Le message est celui
+   de cette version, hors de notre contrôle — attendu de la forme « document
+   JSON Orion invalide : unknown field `address_v6`, … ». Le document d'un
+   pair sans IPv6 s'y importe et s'y connecte en IPv4. Un profil scellé avec
+   une `address_v6` (version de manifeste 8) n'est pas lisible non plus par
+   cet Orion ; sans elle, il reste scellé dans l'encodage précédent.
+
+Rien de ceci n'a encore été observé sur cible, en particulier la relecture
+des adresses unicast de WireGuard-NT (`GetUnicastIpAddressTable`) et l'état de
+l'adresse IPv6 juste après la remise en service de l'adaptateur.
+
 ## Test réel WireGuard sur Linux
 
 Effectuer ce scénario uniquement sur une gateway de laboratoire :

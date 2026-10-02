@@ -236,6 +236,11 @@ async fn upgrade_to_post_quantum(
     if let Some(warning) = stale_profile_address(profile.address.as_deref(), &outcome.address) {
         sink(ClientEvent::log("warn", warning));
     }
+    if let Some(warning) =
+        stale_profile_address_v6(profile.address_v6.as_deref(), outcome.address_v6.as_deref())
+    {
+        sink(ClientEvent::log("warn", warning));
+    }
 
     let upgraded = ClientProfile {
         preshared_key: Some(outcome.preshared_key.expose().to_owned()),
@@ -299,6 +304,55 @@ fn stale_profile_address(profile_address: Option<&str>, announced: &str) -> Opti
              Orion ne modifie pas le profil de lui-même."
         )
     })
+}
+
+/// The same question for the IPv6 VIP, which either side may lack.
+///
+/// The gateway announces `assigned_address_v6` from the same record as the
+/// IPv4 VIP (`ADRESSAGE-IPV6.md` §7.1), and its absence means it holds none
+/// for this peer — a gateway without IPv6, or one older than the field. All
+/// three disagreements name a stale profile, in the same words as the IPv4
+/// one, and none rewrites it:
+///
+/// - another address: the gateway drops the IPv6 traffic this profile emits;
+/// - an address the gateway does not hold: the same, for the same reason;
+/// - no address where the gateway holds one: nothing is dropped, the tunnel
+///   simply stays IPv4-only until the profile is re-emitted (§8).
+///
+/// Addresses are compared as addresses: `FD3C::2/128` and `fd3c::2/128` are
+/// one VIP, and calling that a divergence would send the user to the
+/// operator for nothing.
+fn stale_profile_address_v6(
+    profile_address: Option<&str>,
+    announced: Option<&str>,
+) -> Option<String> {
+    let same = |declared: &str, announced: &str| match (
+        aether::net::parse_vip_v6(declared.trim()),
+        aether::net::parse_vip_v6(announced.trim()),
+    ) {
+        (Ok(declared), Ok(announced)) => declared == announced,
+        _ => declared.trim() == announced.trim(),
+    };
+    let reissue = "Demander à l'opérateur un profil réémis (helios-ctl profile emit) puis le \
+                   réimporter ; Orion ne modifie pas le profil de lui-même.";
+    match (profile_address, announced) {
+        (None, None) => None,
+        (Some(declared), Some(announced)) if same(declared, announced) => None,
+        (Some(declared), Some(announced)) => Some(format!(
+            "Profil périmé : la gateway a enregistré {announced} pour ce poste, le profil \
+             déclare {declared}. La gateway rejette le trafic IPv6 émis depuis {declared}. \
+             {reissue}"
+        )),
+        (Some(declared), None) => Some(format!(
+            "Profil périmé : la gateway n'a enregistré aucune adresse IPv6 pour ce poste, le \
+             profil déclare {declared}. La gateway rejette le trafic IPv6 émis depuis \
+             {declared}. {reissue}"
+        )),
+        (None, Some(announced)) => Some(format!(
+            "Profil périmé : la gateway a enregistré {announced} pour ce poste, le profil ne \
+             déclare aucune adresse IPv6 : le tunnel reste en IPv4 seule. {reissue}"
+        )),
+    }
 }
 
 /// Connection controller: holds the tunnel's current state and orchestrates

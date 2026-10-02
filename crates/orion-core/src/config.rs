@@ -456,6 +456,16 @@ pub struct ClientProfile {
     /// Derived on the gateway side by `helios-provisioning`, received on enrollment.
     #[serde(default)]
     pub address: Option<String>,
+    /// IPv6 VIP assigned by the gateway, one host written `…/128`
+    /// (`ADRESSAGE-IPV6.md` §2.3), when the gateway has an IPv6 tunnel prefix.
+    ///
+    /// Optional on every path, and absent means exactly what it meant before
+    /// the field existed: an IPv4-only adapter. Never written when absent, so a
+    /// profile without it serializes as it always did (§8). It accompanies
+    /// [`Self::address`], never replaces it: the control plane stays IPv4
+    /// (§2.6), so a tunnel without its IPv4 address is not a target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address_v6: Option<String>,
     /// Traffic routed into the tunnel. Defaults to [`DEFAULT_ALLOWED_IPS`].
     ///
     /// One or more CIDR prefixes, comma-separated — the `wg-quick` spelling of
@@ -546,6 +556,7 @@ impl fmt::Debug for ClientProfile {
             .field("peer_public_key", &self.peer_public_key)
             .field("preshared_key", &self.preshared_key.as_ref().map(|_| "***"))
             .field("address", &self.address)
+            .field("address_v6", &self.address_v6)
             .field("allowed_ips", &self.allowed_ips)
             .field("persistent_keepalive", &self.persistent_keepalive)
             .field("heliosd_url", &self.heliosd_url)
@@ -767,6 +778,7 @@ impl Default for ClientProfile {
             peer_public_key: String::new(),
             preshared_key: None,
             address: None,
+            address_v6: None,
             allowed_ips: default_allowed_ips(),
             persistent_keepalive: DEFAULT_KEEPALIVE_SECS,
             heliosd_url: None,

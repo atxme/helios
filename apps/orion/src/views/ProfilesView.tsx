@@ -134,6 +134,9 @@ function blankProfile(): ClientProfile {
     has_static_psk: false,
     profile_type: 'classic',
     address: null,
+    // Assigned by a gateway with an IPv6 prefix, and only by one: a new
+    // profile is IPv4-only until a document says otherwise.
+    address_v6: null,
     // `orion_core::DEFAULT_ALLOWED_IPS`: the «Tout» preset, both families.
     allowed_ips: '0.0.0.0/0, ::/0',
     ipv6_uncaptured_full_tunnel: false,
@@ -393,6 +396,7 @@ export function ProfilesView({
       endpoint: profile.endpoint,
       peer_public_key: profile.peer_public_key,
       address: profile.address,
+      address_v6: profile.address_v6,
       allowed_ips: profile.allowed_ips,
       persistent_keepalive: profile.persistent_keepalive,
       heliosd_url: profile.heliosd_url,
@@ -1402,6 +1406,13 @@ export function ProfilesView({
                 placeholder="assignée à l’enrôlement"
                 value={draft.address ?? ''}
                 onChange={(value) => set('address', value || null)}
+              />
+              <Field
+                label="Adresse virtuelle IPv6"
+                error={issues.address_v6}
+                placeholder="si la gateway a l’IPv6"
+                value={draft.address_v6 ?? ''}
+                onChange={(value) => set('address_v6', value || null)}
               />
               <Field
                 label="Clé publique gateway"

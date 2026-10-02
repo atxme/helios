@@ -35,6 +35,7 @@ const portable: ClientProfile = {
   has_private_key: true,
   has_static_psk: false,
   address: '100.64.1.2/32',
+  address_v6: null,
   allowed_ips: '0.0.0.0/0, ::/0',
   ipv6_uncaptured_full_tunnel: false,
   persistent_keepalive: 25,
@@ -142,11 +143,24 @@ describe('useClient', () => {
     await waitFor(() => expect(result.current.selectedProfile?.name).toBe('portable'))
     expect(result.current.capture).toBeNull()
 
-    act(() => emit({ type: 'capture', capture: { status: 'incomplete', missing: ['::/0'] } }))
-    expect(result.current.capture).toEqual({ status: 'incomplete', missing: ['::/0'] })
+    act(() =>
+      emit({
+        type: 'capture',
+        capture: { status: 'incomplete', missing: ['::/0'], missing_addresses: [] },
+      }),
+    )
+    expect(result.current.capture).toEqual({
+      status: 'incomplete',
+      missing: ['::/0'],
+      missing_addresses: [],
+    })
 
     act(() => emit({ type: 'state_changed', state: 'failed' }))
-    expect(result.current.capture).toEqual({ status: 'incomplete', missing: ['::/0'] })
+    expect(result.current.capture).toEqual({
+      status: 'incomplete',
+      missing: ['::/0'],
+      missing_addresses: [],
+    })
 
     act(() => emit({ type: 'state_changed', state: 'down' }))
     expect(result.current.capture).toBeNull()

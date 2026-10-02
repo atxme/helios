@@ -24,6 +24,7 @@ const profile = (overrides: Partial<ClientProfile> = {}): ClientProfile => ({
   has_private_key: true,
   has_static_psk: false,
   address: '100.64.1.2/32',
+  address_v6: null,
   allowed_ips: '0.0.0.0/0, ::/0',
   ipv6_uncaptured_full_tunnel: false,
   persistent_keepalive: 25,
@@ -211,7 +212,11 @@ describe('Orion presentational branches', () => {
   /// The driver may apply less than the profile asks — on Windows, `::/0` on
   /// an adapter without IPv6 — and nothing else on screen would show it.
   it('names in amber the prefixes the driver did not apply', () => {
-    const stripped = postureHtml(profile(), null, { status: 'incomplete', missing: ['::/0'] })
+    const stripped = postureHtml(profile(), null, {
+      status: 'incomplete',
+      missing: ['::/0'],
+      missing_addresses: [],
+    })
     expect(stripped).toContain('::/0 non appliqué par le pilote — hors tunnel')
     expect(stripped).toContain('rgb(161, 98, 7)')
     // The gap outranks the profile's own list: showing «0.0.0.0/0, ::/0»
@@ -221,6 +226,7 @@ describe('Orion presentational branches', () => {
     const both = postureHtml(profile(), null, {
       status: 'incomplete',
       missing: ['0.0.0.0/0', '::/0'],
+      missing_addresses: [],
     })
     expect(both).toContain('0.0.0.0/0, ::/0 non appliqués par le pilote — hors tunnel')
 
@@ -228,9 +234,47 @@ describe('Orion presentational branches', () => {
     const legacy = postureHtml(
       profile({ allowed_ips: '0.0.0.0/0', ipv6_uncaptured_full_tunnel: true }),
       null,
-      { status: 'incomplete', missing: ['0.0.0.0/0'] },
+      { status: 'incomplete', missing: ['0.0.0.0/0'], missing_addresses: [] },
     )
     expect(legacy).toContain('0.0.0.0/0 non appliqué par le pilote — hors tunnel')
+  })
+
+  /// Both addresses on the one «adresse» row, IPv4 first; a profile without
+  /// IPv6 reads exactly as before.
+  it('shows both tunnel addresses on the address row', () => {
+    const dual = postureHtml(profile({ address_v6: 'fd3c:91a2:7e04::2/128' }), null)
+    expect(dual).toContain('100.64.1.2/32, fd3c:91a2:7e04::2/128')
+    expect(dual).toContain('Copier les adresses virtuelles')
+    expect(dual).not.toContain('non posée')
+
+    const ipv4 = postureHtml(profile(), null)
+    expect(ipv4).toContain('100.64.1.2/32')
+    expect(ipv4).not.toContain('fd3c')
+    expect(ipv4).toContain('Copier l’adresse virtuelle')
+  })
+
+  /// On Windows an adapter without IPv6 drops the IPv6 address as silently as
+  /// `::/0`: the read-back names it, in amber, on the row it belongs to.
+  it('names in amber an address the driver did not put on the adapter', () => {
+    const skipped = postureHtml(profile({ address_v6: 'fd3c:91a2:7e04::2/128' }), null, {
+      status: 'incomplete',
+      missing: ['::/0'],
+      missing_addresses: ['fd3c:91a2:7e04::2/128'],
+    })
+    expect(skipped).toContain(
+      '100.64.1.2/32, fd3c:91a2:7e04::2/128 — fd3c:91a2:7e04::2/128 non posée par le pilote',
+    )
+    expect(skipped).toContain('::/0 non appliqué par le pilote — hors tunnel')
+
+    // An address alone missing leaves the traffic row as the profile states.
+    const alone = postureHtml(profile({ address_v6: 'fd3c:91a2:7e04::2/128' }), null, {
+      status: 'incomplete',
+      missing: [],
+      missing_addresses: ['fd3c:91a2:7e04::2/128'],
+    })
+    expect(alone).toContain('fd3c:91a2:7e04::2/128 non posée par le pilote')
+    expect(alone).not.toContain('non appliqué')
+    expect(alone).toContain('0.0.0.0/0, ::/0')
   })
 
   it('does not present an unverified capture as a healthy one', () => {
