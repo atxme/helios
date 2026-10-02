@@ -24,6 +24,7 @@ function peer(overrides: Partial<PeerSummary> = {}): PeerSummary {
     name: 'orion-portable',
     public_key: 'kZ8vQ2nR4tLmXpW7yB3cF6hJ1dS5gA0eU9iO2rT4vNc=',
     address: '100.64.0.12',
+    address_v6: null,
     post_quantum: true,
     admin: false,
     minimum_key_negotiation_mode: 'ml_kem',
@@ -63,6 +64,7 @@ const STATUS: Status = {
   mss_clamp: 1380,
   captive_portal_gateway: null,
   handshake_stale_after_seconds: 150,
+  ipv6: 'not_configured',
 }
 
 const SAMPLES: TelemetrySample[] = Array.from({ length: 10 }, (_, index) => ({
