@@ -331,9 +331,8 @@ async fn unsupported_mss_clamp_does_not_mutate_policy_or_reapply_firewall() {
     assert!(!firewall.applied.load(Ordering::Relaxed));
 }
 
-#[tokio::test]
-async fn mss_discovery_rejects_missing_interfaces_and_bounds_small_mtus() {
-    assert_eq!(discover_mss("interface-that-does-not-exist").await, None);
+#[test]
+fn an_unreadable_wan_falls_back_to_ethernet() {
     assert_eq!(
         mtu_transport("interface-that-does-not-exist"),
         aether::mtu::MTU_TRANSPORT_DEFAUT
@@ -345,10 +344,59 @@ async fn mss_discovery_rejects_missing_interfaces_and_bounds_small_mtus() {
             .parse()
             .unwrap();
         assert_eq!(mtu_transport("lo"), loopback_mtu);
-        let expected = u16::try_from(loopback_mtu)
-            .ok()
-            .map(|mtu| mtu.saturating_sub(100).max(576));
-        assert_eq!(discover_mss("lo").await, expected);
+    }
+}
+
+#[test]
+fn the_probe_derives_the_mss_from_the_interface_mtu_per_family() {
+    // Ethernet. The probe used to subtract a 60-byte IPv4 outer overhead
+    // (1500 − 100 = 1400) while the interface is sized with 80: a clamp at
+    // 1400 announced segments of 1440 bytes into a 1420-byte interface.
+    assert_eq!(
+        tunnel_mss(1500),
+        TunnelMss {
+            tunnel_mtu: 1420,
+            ipv4: 1380,
+            ipv6: Some(1360),
+        }
+    );
+    // PPPoE still carries IPv6.
+    assert_eq!(
+        tunnel_mss(1492),
+        TunnelMss {
+            tunnel_mtu: 1412,
+            ipv4: 1372,
+            ipv6: Some(1352),
+        }
+    );
+    // WSL2: the tunnel is IPv4-only, so there is no IPv6 MSS.
+    assert_eq!(
+        tunnel_mss(1280),
+        TunnelMss {
+            tunnel_mtu: 1200,
+            ipv4: 1160,
+            ipv6: None,
+        }
+    );
+}
+
+#[test]
+fn the_probe_and_the_interface_agree_on_the_tunnel_mtu() {
+    // The clamp must fit the MTU `wg_config` sets, for any transport.
+    for transport in [0, 576, 1280, 1359, 1360, 1492, 1500, 9000, 65536] {
+        let probed = tunnel_mss(transport);
+        assert_eq!(
+            u32::from(probed.tunnel_mtu),
+            aether::mtu::tunnel_mtu(transport)
+        );
+        assert!(
+            u32::from(probed.ipv4) + aether::mtu::TCP_IPV4_HEADERS <= u32::from(probed.tunnel_mtu)
+        );
+        if let Some(ipv6) = probed.ipv6 {
+            assert!(
+                u32::from(ipv6) + aether::mtu::TCP_IPV6_HEADERS <= u32::from(probed.tunnel_mtu)
+            );
+        }
     }
 }
 
