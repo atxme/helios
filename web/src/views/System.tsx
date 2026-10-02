@@ -14,6 +14,8 @@ import { EventLog } from '../components/EventLog'
 import type { TimestampedEvent } from '../components/EventLog'
 import { KnownLimit } from '../components/KnownLimit'
 import { SectionCard } from '../components/SectionCard'
+import { describeIpv6 } from '../ipv6'
+import type { Ipv6Kind } from '../ipv6'
 import type { FinalizedRelease, Status, UpdateStatus } from '../types'
 
 /**
@@ -207,6 +209,16 @@ function UpdatePanel() {
   )
 }
 
+/** What each IPv6 tunnel state implies, on hover of its row. */
+const IPV6_HINT: Record<Ipv6Kind, string> = {
+  installed:
+    'Préfixe ULA posé sur l’interface ; la VIP IPv6 de chaque client est dans ses AllowedIPs.',
+  not_configured:
+    'Aucun wg_address_v6 : la passerelle fonctionne en IPv4 seule, exactement comme sans IPv6.',
+  unavailable:
+    'Un préfixe est configuré mais n’a pas pu être posé au dernier démarrage de l’interface.',
+}
+
 interface Props {
   status: Status | null
   events: TimestampedEvent[]
@@ -217,6 +229,7 @@ export function SystemView({ status, events, onSplitTunnelChange }: Props) {
   const [routes, setRoutes] = useState('')
   const [saving, setSaving] = useState(false)
   const [feedback, setFeedback] = useState<{ ok: boolean; message: string } | null>(null)
+  const ipv6 = describeIpv6(status?.ipv6)
 
   useEffect(() => {
     setRoutes(status?.split_tunnel_cidrs.join('\n') ?? '')
@@ -246,18 +259,27 @@ export function SystemView({ status, events, onSplitTunnelChange }: Props) {
       <Box sx={{ display: 'grid', gap: 2.5, gridTemplateColumns: { xs: '1fr', lg: '1fr 1fr' } }}>
         <SectionCard title="Configuration" icon={Settings2}>
           {status ? (
-            <Box>
-              {/* No icons: five identical glyphs down a column label nothing. */}
-              <DataRow label="Interface" value={status.wg_iface} />
-              <DataRow
-                label="MSS clamp"
-                value={status.mss_clamp === null ? '' : `${status.mss_clamp} octets`}
-                hint="Découvert par PMTUD et appliqué au trafic sortant du tunnel."
-              />
-              <DataRow label="Site-à-site" value={status.wg_peers.join(', ')} />
-              <DataRow label="Portail captif" value={status.captive_portal_gateway ?? ''} />
-              <DataRow label="Version" value={status.version} />
-            </Box>
+            <Stack spacing={2}>
+              <Box>
+                {/* No icons: five identical glyphs down a column label nothing. */}
+                <DataRow label="Interface" value={status.wg_iface} />
+                <DataRow label="IPv6 tunnel" value={ipv6.label} hint={IPV6_HINT[ipv6.kind]} />
+                <DataRow
+                  label="MSS clamp"
+                  value={status.mss_clamp === null ? '' : `${status.mss_clamp} octets`}
+                  hint="Découvert par PMTUD et appliqué au trafic sortant du tunnel."
+                />
+                <DataRow label="Site-à-site" value={status.wg_peers.join(', ')} />
+                <DataRow label="Portail captif" value={status.captive_portal_gateway ?? ''} />
+                <DataRow label="Version" value={status.version} />
+              </Box>
+              {ipv6.kind === 'unavailable' && (
+                <KnownLimit register="caution" title="IPv6 indisponible — passerelle en IPv4 seule">
+                  {ipv6.reason} Les VIP IPv6 des clients ne sont pas dans leurs AllowedIPs :
+                  WireGuard jette leur trafic IPv6, rien n’est ouvert.
+                </KnownLimit>
+              )}
+            </Stack>
           ) : (
             <Skeleton variant="rounded" height={180} />
           )}

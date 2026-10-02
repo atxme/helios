@@ -341,4 +341,52 @@ describe('System', () => {
       mount(<SystemView status={null} events={[]} onSplitTunnelChange={noop} />),
     ).not.toThrow()
   })
+
+  it('says discreetly that IPv6 is not configured, and raises no warning', () => {
+    mount(<SystemView status={STATUS} events={[]} onSplitTunnelChange={noop} />)
+
+    expect(screen.getByText('IPv6 tunnel')).toBeTruthy()
+    expect(screen.getByText('non configurée')).toBeTruthy()
+    expect(screen.queryByText(/IPv6 indisponible/)).toBeNull()
+  })
+
+  it('reports an installed IPv6 tunnel', () => {
+    mount(<SystemView status={{ ...STATUS, ipv6: 'installed' }} events={[]} onSplitTunnelChange={noop} />)
+
+    expect(screen.getByText('installée')).toBeTruthy()
+    expect(screen.queryByText(/IPv6 indisponible/)).toBeNull()
+  })
+
+  it('makes the degraded IPv4-only start visible, with the reason in French', () => {
+    mount(
+      <SystemView
+        status={{
+          ...STATUS,
+          ipv6: { unavailable: { reason: 'tunnel_mtu_too_small', tunnel_mtu: 1200, minimum: 1280 } },
+        }}
+        events={[]}
+        onSplitTunnelChange={noop}
+      />,
+    )
+
+    expect(screen.getByText('indisponible')).toBeTruthy()
+    expect(screen.getByText('IPv6 indisponible — passerelle en IPv4 seule')).toBeTruthy()
+    expect(screen.getByText(/Le MTU du tunnel \(1200 octets\) est inférieur aux 1280 octets/)).toBeTruthy()
+  })
+
+  it('keeps the warning for a reason this console does not know', () => {
+    mount(
+      <SystemView
+        status={{
+          ...STATUS,
+          ipv6: { unavailable: { reason: 'firmware_said_no' } } as unknown as Status['ipv6'],
+        }}
+        events={[]}
+        onSplitTunnelChange={noop}
+      />,
+    )
+
+    expect(screen.getByText('IPv6 indisponible — passerelle en IPv4 seule')).toBeTruthy()
+    expect(screen.getByText(/Raison non reconnue par cette interface/)).toBeTruthy()
+  })
 })
