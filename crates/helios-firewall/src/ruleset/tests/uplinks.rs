@@ -84,7 +84,8 @@ fn no_uplink_emits_no_wan_rule() {
             .iter()
             .any(|rule| rule.matches.iter().any(|m| matches!(
                 m,
-                Match::InIface(name) | Match::OutIface(name) if name.is_empty()
+                Match::InIface(name) | Match::NotInIface(name) | Match::OutIface(name)
+                    if name.is_empty()
             ))),
         "no rule is emitted on an empty interface name"
     );
