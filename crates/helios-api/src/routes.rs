@@ -855,20 +855,35 @@ pub async fn captive_portal_release(State(s): State<AppState>) -> Json<CmdRespon
     })
 }
 
+/// Replaces the CIDRs that bypass the tunnel.
+///
+/// `OrchestratorCmd` has no reply channel, so this check is the refusal the
+/// caller sees: each entry goes through the parser the ruleset compiler uses,
+/// and one it would refuse is answered `400`, naming it, with nothing sent.
+/// The orchestrator checks the resulting policy again before applying it.
 pub async fn split_tunnel_set(
     State(s): State<AppState>,
     Json(body): Json<SplitTunnelRequest>,
-) -> Json<CmdResponse> {
+) -> Result<Json<CmdResponse>, (StatusCode, String)> {
+    for cidr in &body.cidrs {
+        ruleset::parse_network(cidr).map_err(|error| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("split-tunnel CIDR refused: {error}"),
+            )
+        })?;
+    }
+
     let ok = s
         .cmd_tx
         .send(OrchestratorCmd::SetSplitTunnel(body.cidrs))
         .await
         .is_ok();
-    Json(if ok {
+    Ok(Json(if ok {
         CmdResponse::ok()
     } else {
         CmdResponse::err("orchestrator unreachable")
-    })
+    }))
 }
 
 /// Publisher trust anchor, as compiled into **this** binary (ADR-002).
