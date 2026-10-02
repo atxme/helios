@@ -311,6 +311,10 @@ address_v6 = "fd3c:91a2:7e04:0:8a1f:3b2c:9d40:e517/128"   # nouveau, optionnel
 - La vue API redigée (`GET /api/network`) expose `wg_address_v6` et
   `address_v6` ; elles ne sont pas secrètes. La règle « ne jamais reconstruire
   `network.toml` depuis cette vue » s'applique inchangée.
+- `GET /api/status` porte aussi `address_v6` sur chacun de ses `peers` (même
+  forme, `null` sans VIP IPv6), et `POST /api/peers` le renvoie : la console
+  l'affiche sur la ligne du client qu'elle lit déjà, sans joindre une seconde
+  requête par clé publique.
 
 ### 5.2 Validation (`NetworkConfig::validate`)
 
