@@ -104,6 +104,10 @@ pub struct OfflineInputs {
     pub gateway_pq_certificate: PathBuf,
     /// VIP printed by `heliosd peer add`, which performed the admission.
     pub address: String,
+    /// IPv6 VIP of the same peer, `…/128`, as `network.toml` records it
+    /// (`address_v6`). Absent for a peer without one — the document then
+    /// omits the key, and every Orion reads it.
+    pub address_v6: Option<String>,
     /// Internal API URL, for telemetry only. Absent is fine.
     pub heliosd_url: Option<String>,
     /// The §19 trust block, as `heliosd show-trust-enrolment` printed it.
@@ -276,9 +280,20 @@ pub async fn run(client: &Client, base: &str, options: EnrollOptions) -> Result<
 
     // Offline, the admission has already happened through `heliosd peer add`
     // on the console: the VIP it printed is what the operator passes back.
-    let address = match &options.offline {
-        Some(inputs) => inputs.address.clone(),
-        None => admit(client, base, &options, &public_key, &client_material).await?,
+    let (address, address_v6) = match &options.offline {
+        Some(inputs) => (inputs.address.clone(), inputs.address_v6.clone()),
+        None => {
+            let address = admit(client, base, &options, &public_key, &client_material).await?;
+            // The admission answer carries the IPv4 VIP only; the IPv6 one is
+            // read from the gateway's record of the peer just admitted.
+            let address_v6 = crate::profile::admitted_address_v6(
+                &api::network(client, base).await?,
+                &options.name,
+                &public_key,
+                &address,
+            )?;
+            (address, address_v6)
+        }
     };
 
     // The §19 trust block, read from the gateway once the peer is admitted —
@@ -336,6 +351,7 @@ pub async fn run(client: &Client, base: &str, options: EnrollOptions) -> Result<
         private_key: private_key.as_deref(),
         peer_public_key: &material.wireguard_public_key,
         address: &address,
+        address_v6: address_v6.as_deref(),
         allowed_ips: options.allowed_ips.as_deref(),
         ssh_target: options.ssh_target.as_deref(),
         heliosd_url,
@@ -724,6 +740,7 @@ mod tests {
             gateway_certificate: der.clone(),
             gateway_pq_certificate: json.clone(),
             address: "100.64.1.2/32".into(),
+            address_v6: None,
             heliosd_url: None,
             trust_material: None,
         };
