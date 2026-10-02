@@ -880,6 +880,37 @@ async fn a_config_reload_cannot_change_the_tunnel_prefix() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// A full reload carrying an address the firewall would refuse is answered
+/// `400`, naming it, before anything is written or sent: the orchestrator
+/// would keep the running configuration anyway.
+#[tokio::test]
+async fn a_config_reload_with_an_invalid_firewall_address_is_refused() {
+    let (_lock, path) = isolated_config().await;
+    let (state, mut cmd_rx) = state();
+
+    for field in [
+        r#""split_tunnel_cidrs":["192.168.1.0/24","fd00::/129"]"#,
+        r#""allow_ssh_from":["fd00::/129"]"#,
+    ] {
+        let response = router(state.clone())
+            .oneshot(admin_request(
+                "/api/network",
+                &format!(r#"{{"wan_iface":"eth1",{field}}}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{field}");
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let message = String::from_utf8(body.to_vec()).unwrap();
+        assert!(message.contains("`fd00::/129`"), "{message}");
+    }
+    assert!(
+        cmd_rx.try_recv().is_err(),
+        "nothing reaches the orchestrator"
+    );
+    assert!(!path.exists(), "nothing is written");
+}
+
 #[tokio::test]
 async fn cross_origin_json_mutation_is_refused_without_cors() {
     let (state, mut cmd_rx) = state();

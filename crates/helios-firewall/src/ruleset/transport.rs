@@ -8,7 +8,7 @@
 use aether::{FirewallPolicy, Result};
 
 use super::ChainKind::{Input, Output};
-use super::{network, Match, Rule, Verdict, L4};
+use super::{parse_network, Match, Rule, Verdict, L4};
 
 pub(super) fn wireguard_listener(
     rules: &mut Vec<Rule>,
@@ -115,7 +115,7 @@ pub(super) fn site_to_site_peers(
                 Output,
                 vec![
                     Match::OutIface(wan.clone()),
-                    Match::DestNet(network(peer)?),
+                    Match::DestNet(parse_network(peer)?),
                     Match::DestPort {
                         port: 51820,
                         proto: L4::Udp,

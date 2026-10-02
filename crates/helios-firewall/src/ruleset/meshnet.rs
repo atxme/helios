@@ -25,7 +25,7 @@ use aether::{FirewallPolicy, Result};
 use ipnetwork::IpNetwork;
 
 use super::ChainKind::{Forward, Input, Output};
-use super::{local_networks, network, AddressFamily, Match, Rule, Verdict, L4};
+use super::{local_networks, parse_network, AddressFamily, Match, Rule, Verdict, L4};
 
 /// The family a peer-scoped rule must select to ever match that peer.
 fn family_of(peer: &IpNetwork) -> AddressFamily {
@@ -71,7 +71,7 @@ pub(super) fn nordvpn_meshnet(
                     Output,
                     vec![
                         Match::OutIface(meshnet.iface.clone()),
-                        Match::DestNet(network(peer)?),
+                        Match::DestNet(parse_network(peer)?),
                     ],
                     Verdict::Accept,
                 )
@@ -79,7 +79,7 @@ pub(super) fn nordvpn_meshnet(
             );
 
             if meshnet.allow_icmp {
-                let source = network(peer)?;
+                let source = parse_network(peer)?;
                 rules.push(
                     Rule::new(
                         Input,
@@ -103,7 +103,7 @@ pub(super) fn nordvpn_meshnet(
                             Input,
                             vec![
                                 Match::InIface(meshnet.iface.clone()),
-                                Match::SourceNet(network(peer)?),
+                                Match::SourceNet(parse_network(peer)?),
                                 Match::DestPortSet {
                                     ports: ports.clone(),
                                     proto,
@@ -121,7 +121,7 @@ pub(super) fn nordvpn_meshnet(
             let may_reach_local_network = meshnet.local_network_peer_cidrs.contains(peer);
 
             if !may_reach_local_network {
-                let source = network(peer)?;
+                let source = parse_network(peer)?;
                 for private_network in local_networks(family_of(&source)) {
                     rules.push(
                         Rule::new(
@@ -129,7 +129,7 @@ pub(super) fn nordvpn_meshnet(
                             vec![
                                 Match::InIface(meshnet.iface.clone()),
                                 Match::SourceNet(source),
-                                Match::DestNet(network(private_network)?),
+                                Match::DestNet(parse_network(private_network)?),
                             ],
                             Verdict::Drop,
                         )
@@ -152,7 +152,7 @@ pub(super) fn nordvpn_meshnet(
                         Forward,
                         vec![
                             Match::InIface(meshnet.iface.clone()),
-                            Match::SourceNet(network(peer)?),
+                            Match::SourceNet(parse_network(peer)?),
                             Match::OutIface(out_iface),
                         ],
                         Verdict::Accept,

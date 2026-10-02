@@ -443,7 +443,9 @@ pub async fn network_get(State(s): State<AppState>) -> Json<NetworkConfigView> {
 ///
 /// A body whose `wg_address_v6` differs from the running one is refused with
 /// `409 Conflict` and nothing is written: the tunnel prefix is applied at
-/// startup only, so it is changed in `network.toml` followed by a restart.
+/// startup only, so it is changed in `network.toml` followed by a restart. A
+/// body whose firewall policy does not compile — an invalid split-tunnel CIDR
+/// or SSH source — is refused with `400 Bad Request`, also before any write.
 pub async fn network_set(
     State(s): State<AppState>,
     Json(mut new_config): Json<NetworkConfig>,
@@ -467,6 +469,16 @@ pub async fn network_set(
             .check_hot_reload(&running)
             .map_err(|refusal| (StatusCode::CONFLICT, refusal.to_string()))?;
     }
+    // Same reasoning for an address the ruleset compiler refuses — a
+    // split-tunnel CIDR, an SSH source: the orchestrator keeps the running
+    // configuration, so writing this one would answer "ok" for a change that
+    // is not in force, and leave it in the file for the next start.
+    ruleset::check_policy(&new_config.firewall_policy()).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("network configuration refused: {error}"),
+        )
+    })?;
     apply_network(&s, new_config).await?;
     Ok(Json(CmdResponse::ok()))
 }
@@ -855,20 +867,35 @@ pub async fn captive_portal_release(State(s): State<AppState>) -> Json<CmdRespon
     })
 }
 
+/// Replaces the CIDRs that bypass the tunnel.
+///
+/// `OrchestratorCmd` has no reply channel, so this check is the refusal the
+/// caller sees: each entry goes through the parser the ruleset compiler uses,
+/// and one it would refuse is answered `400`, naming it, with nothing sent.
+/// The orchestrator checks the resulting policy again before applying it.
 pub async fn split_tunnel_set(
     State(s): State<AppState>,
     Json(body): Json<SplitTunnelRequest>,
-) -> Json<CmdResponse> {
+) -> Result<Json<CmdResponse>, (StatusCode, String)> {
+    for cidr in &body.cidrs {
+        ruleset::parse_network(cidr).map_err(|error| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("split-tunnel CIDR refused: {error}"),
+            )
+        })?;
+    }
+
     let ok = s
         .cmd_tx
         .send(OrchestratorCmd::SetSplitTunnel(body.cidrs))
         .await
         .is_ok();
-    Json(if ok {
+    Ok(Json(if ok {
         CmdResponse::ok()
     } else {
         CmdResponse::err("orchestrator unreachable")
-    })
+    }))
 }
 
 /// Publisher trust anchor, as compiled into **this** binary (ADR-002).

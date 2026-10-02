@@ -300,6 +300,7 @@ async fn command_routes_forward_the_exact_intent() {
             }),
         )
         .await
+        .unwrap()
         .0
         .ok
     );
@@ -313,6 +314,65 @@ async fn command_routes_forward_the_exact_intent() {
         cmd_rx.recv().await,
         Some(OrchestratorCmd::Disconnect)
     ));
+}
+
+async fn set_split_tunnel(
+    app: &AppState,
+    cidrs: &[&str],
+) -> Result<Json<CmdResponse>, (StatusCode, String)> {
+    split_tunnel_set(
+        State(app.clone()),
+        Json(SplitTunnelRequest {
+            cidrs: cidrs.iter().map(|cidr| cidr.to_string()).collect(),
+        }),
+    )
+    .await
+}
+
+/// A CIDR the ruleset compiler would refuse is answered `400`, naming it, and
+/// never reaches the orchestrator — which has no way to report it back.
+#[tokio::test]
+async fn an_invalid_split_tunnel_cidr_is_refused_before_the_orchestrator() {
+    let (app, mut cmd_rx) = app_state(TunnelState::Up);
+
+    for (cidrs, refused) in [
+        (vec!["10.0.0.0/33"], "10.0.0.0/33"),
+        (vec!["fd00::/129"], "fd00::/129"),
+        (
+            vec!["192.168.1.0/24", "not-a-cidr", "fd00::/64"],
+            "not-a-cidr",
+        ),
+    ] {
+        let (status, message) = set_split_tunnel(&app, &cidrs)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{cidrs:?} must be refused"));
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{cidrs:?}");
+        assert!(message.contains(&format!("`{refused}`")), "{message}");
+    }
+
+    assert!(
+        cmd_rx.try_recv().is_err(),
+        "a refused list must send nothing to the orchestrator"
+    );
+}
+
+#[tokio::test]
+async fn a_valid_dual_stack_split_tunnel_list_is_sent_unchanged() {
+    let (app, mut cmd_rx) = app_state(TunnelState::Up);
+    let cidrs = [
+        "192.168.1.0/24",
+        "10.0.0.0/8",
+        "fd00:1::/64",
+        "2001:db8::/32",
+    ];
+
+    assert!(set_split_tunnel(&app, &cidrs).await.unwrap().0.ok);
+
+    match cmd_rx.try_recv() {
+        Ok(OrchestratorCmd::SetSplitTunnel(sent)) => assert_eq!(sent, cidrs),
+        other => panic!("unexpected command: {other:?}"),
+    }
 }
 
 #[tokio::test]

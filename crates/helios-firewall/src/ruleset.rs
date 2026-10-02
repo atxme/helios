@@ -205,12 +205,41 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Result<Ruleset> {
 }
 
 /// Parses a policy address before it can enter the structured IR.
-pub(super) fn network(value: &str) -> Result<IpNetwork> {
+///
+/// Public so that a caller accepting an address bound for the policy — the
+/// API's split-tunnel route — refuses it with this exact rule, rather than
+/// with a second parser that could accept what [`render`] then refuses.
+pub fn parse_network(value: &str) -> Result<IpNetwork> {
     value.parse().map_err(|error| {
         HeliosError::Firewall(format!(
             "invalid IP network `{value}` in firewall policy: {error}"
         ))
     })
+}
+
+/// Every state a policy can be rendered for, in the order of
+/// [`TunnelState`]'s declaration.
+const TUNNEL_STATES: [TunnelState; 5] = [
+    TunnelState::Down,
+    TunnelState::Connecting,
+    TunnelState::Up,
+    TunnelState::Failed,
+    TunnelState::CaptivePortal,
+];
+
+/// Compiles `policy` for every tunnel state, keeping none of the rulesets.
+///
+/// [`render`] only reads the fields the given state uses: the split-tunnel
+/// CIDRs, for instance, only in `Up`. A policy accepted by an `apply` made
+/// while the tunnel is down could therefore still be refused at the next
+/// promotion, long after the operator who supplied the bad value was told it
+/// was in force. Checking every state is what lets a caller refuse such a
+/// policy before it becomes the running one.
+pub fn check_policy(policy: &FirewallPolicy) -> Result<()> {
+    for state in TUNNEL_STATES {
+        render(policy, state)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -250,6 +250,29 @@ pub(super) async fn apply_mss_clamp(
     Ok(true)
 }
 
+/// Makes `candidate` the running policy, only once the backend applied it.
+///
+/// The candidate is first compiled for every tunnel state: a value the
+/// current state does not render — a split-tunnel CIDR while the tunnel is
+/// down — would otherwise go live here and fail at the next transition, where
+/// a firewall error stops the orchestrator. On any refusal `policy` is left as
+/// it was, and so is the ruleset in force: the backend sends nothing on a
+/// translation error, and the kernel applies a batch whole or not at all.
+pub(super) async fn commit_policy(
+    fw: &dyn FirewallBackend,
+    policy: &mut FirewallPolicy,
+    candidate: FirewallPolicy,
+    state: TunnelState,
+) -> anyhow::Result<()> {
+    helios_firewall::ruleset::check_policy(&candidate)
+        .context("compiling the candidate firewall policy")?;
+    fw.apply(&candidate, state)
+        .await
+        .context("applying the candidate firewall policy")?;
+    *policy = candidate;
+    Ok(())
+}
+
 pub(super) async fn install_peer_psk(
     request: InstallPskRequest,
     shared_network: &Arc<RwLock<NetworkConfig>>,

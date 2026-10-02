@@ -72,6 +72,14 @@ applied at all until the next start — the watcher logs a warning, the API
 answers `409` and writes nothing. Peers' `address_v6` reload live with the peer
 table (`specification/ADRESSAGE-IPV6.md` §5.4).
 
+A policy change — a reload, or a split-tunnel list — becomes the running policy
+only once it compiles for every tunnel state and the backend has applied it. A
+refused one leaves the running policy, configuration and ruleset in force, is
+logged as an error on the event stream, and does not stop the orchestrator.
+`POST /api/split-tunnel` checks each CIDR with the ruleset compiler's parser and
+`POST /api/network` checks the whole policy: both answer `400`, naming the
+refused address, and send and write nothing.
+
 ## Key negotiation (v5)
 
 Before any WireGuard packet, Orion negotiates on a dedicated UDP port and leaves
