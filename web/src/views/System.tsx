@@ -297,7 +297,8 @@ export function SystemView({ status, events, onSplitTunnelChange }: Props) {
               multiline
               minRows={4}
               fullWidth
-              placeholder={'10.0.0.0/8\n192.168.0.0/16'}
+              placeholder={'10.0.0.0/8\n192.168.0.0/16\nfd12:3456:789a::/48'}
+              helperText="Un CIDR par ligne, IPv4 ou IPv6."
               spellCheck={false}
               slotProps={{ input: { sx: { fontFamily: 'monospace', fontSize: '0.8125rem' } } }}
             />

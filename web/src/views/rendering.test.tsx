@@ -430,6 +430,31 @@ describe('System', () => {
     expect(screen.getByText(/Le MTU du tunnel \(1200 octets\) est inférieur aux 1280 octets/)).toBeTruthy()
   })
 
+  it('offers an IPv6 example in the split-tunnel editor', () => {
+    mount(<SystemView status={{ ...STATUS, split_tunnel_cidrs: [] }} events={[]} onSplitTunnelChange={noop} />)
+
+    const editor = screen.getByPlaceholderText(/10\.0\.0\.0\/8/)
+    expect(editor.getAttribute('placeholder')).toBe('10.0.0.0/8\n192.168.0.0/16\nfd12:3456:789a::/48')
+    expect(screen.getByText('Un CIDR par ligne, IPv4 ou IPv6.')).toBeTruthy()
+  })
+
+  it('sends IPv6 CIDRs as typed and reports their refusal like an IPv4 one', async () => {
+    const onSplitTunnelChange = vi.fn((cidrs: string[]) =>
+      Promise.reject(new Error(`invalid IP network \`${cidrs[0]}\``)),
+    )
+
+    for (const cidr of ['10.0.0.0/33', 'fd12:3456:789a::/129']) {
+      mount(<SystemView status={STATUS} events={[]} onSplitTunnelChange={onSplitTunnelChange} />)
+      fireEvent.change(screen.getByDisplayValue('10.0.0.0/8'), { target: { value: cidr } })
+      fireEvent.click(screen.getByRole('button', { name: 'Appliquer' }))
+      await waitFor(() => expect(screen.getByRole('status').textContent).toBe('Échec de la mise à jour.'))
+      cleanup()
+    }
+
+    // Validation stays on the gateway: the console forwards both untouched.
+    expect(onSplitTunnelChange.mock.calls).toEqual([[['10.0.0.0/33']], [['fd12:3456:789a::/129']]])
+  })
+
   it('keeps the warning for a reason this console does not know', () => {
     mount(
       <SystemView
