@@ -434,6 +434,11 @@ pub struct Ruleset {
     /// Deliberately **outside** of `rules`: it is a *mangle* action (TCP
     /// option rewrite), not a filtering verdict, and `rustables`' high-level
     /// API does not express it. See the Netlink backend.
+    ///
+    /// The value is the IPv4 MSS of the tunnel (`aether::mtu::mss_ipv4`). In
+    /// this `inet` table an unguarded clamp would also rewrite IPv6 SYNs with
+    /// a value 20 bytes too large: an encoder must emit it under
+    /// `meta nfproto ipv4`, like [`MasqueradeRule`].
     pub mss_clamp: Option<u16>,
     /// Egress interface on which to masquerade the source of client traffic.
     ///
