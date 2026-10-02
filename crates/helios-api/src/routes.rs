@@ -72,6 +72,11 @@ pub struct PeerSummary {
     pub name: String,
     pub public_key: String,
     pub address: String,
+    /// IPv6 VIP, `…/128`, when the peer has one; `null` otherwise. The same
+    /// text form as [`NetworkPeerView::address_v6`], carried here so the
+    /// console shows it on the row it already polls instead of joining a
+    /// second request on the public key.
+    pub address_v6: Option<String>,
     pub post_quantum: bool,
     pub admin: bool,
     pub minimum_key_negotiation_mode: ProtectionMode,
@@ -96,6 +101,7 @@ impl PeerSummary {
             name: peer.name.clone(),
             public_key: peer.public_key.clone(),
             address: peer.address.clone(),
+            address_v6: peer.address_v6.map(aether::net::format_vip_v6),
             post_quantum: peer.preshared_key.is_some(),
             admin: peer.admin,
             minimum_key_negotiation_mode: peer.minimum_key_negotiation_mode,

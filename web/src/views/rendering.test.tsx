@@ -24,6 +24,7 @@ function peer(overrides: Partial<PeerSummary> = {}): PeerSummary {
     name: 'orion-portable',
     public_key: 'kZ8vQ2nR4tLmXpW7yB3cF6hJ1dS5gA0eU9iO2rT4vNc=',
     address: '100.64.0.12',
+    address_v6: null,
     post_quantum: true,
     admin: false,
     minimum_key_negotiation_mode: 'ml_kem',
@@ -63,6 +64,7 @@ const STATUS: Status = {
   mss_clamp: 1380,
   captive_portal_gateway: null,
   handshake_stale_after_seconds: 150,
+  ipv6: 'not_configured',
 }
 
 const SAMPLES: TelemetrySample[] = Array.from({ length: 10 }, (_, index) => ({
@@ -258,6 +260,62 @@ describe('Clients', () => {
     expect(screen.getByText('jamais')).toBeTruthy()
     expect(screen.getAllByText('—').length).toBeGreaterThan(0)
   })
+
+  it('shows a client IPv6 VIP under its IPv4 one, and its IPv6 endpoint whole', () => {
+    const vip = 'fd3c:91a2:7e04:0:8a1f:3b2c:9d40:e517/128'
+    const endpoint = '[2001:db8:85a3::8a2e:370:7334]:51820'
+    mount(
+      <ClientsView
+        status={{
+          ...STATUS,
+          ipv6: 'installed',
+          peers: [peer({ address_v6: vip, endpoint }), peer({ name: 'orion-v4', public_key: 'k2' })],
+        }}
+        refresh={noop}
+        admitOpen={false}
+        onAdmitOpenChange={vi.fn()}
+      />,
+    )
+
+    // Both rows carry their IPv4 VIP; only the first has an IPv6 one.
+    expect(screen.getAllByText('100.64.0.12')).toHaveLength(2)
+    const shown = screen.getByText(vip)
+    expect(shown.getAttribute('aria-label')).toBe('VIP IPv6 du client, dans ses AllowedIPs.')
+    expect(screen.getAllByText(/\/128$/)).toHaveLength(1)
+    // Wrapped rather than cut with an ellipsis: the tail tells addresses apart.
+    const endpointText = screen.getByText(endpoint)
+    expect(getComputedStyle(endpointText).textOverflow).not.toBe('ellipsis')
+    expect(getComputedStyle(endpointText).wordBreak).toBe('break-all')
+  })
+
+  it('says an IPv6 VIP is not routed while the gateway runs IPv4-only', () => {
+    const vip = 'fd3c:91a2:7e04:0:8a1f:3b2c:9d40:e517/128'
+    mount(
+      <ClientsView
+        status={{
+          ...STATUS,
+          ipv6: { unavailable: { reason: 'disabled_by_kernel', setting: 'net.ipv6.conf.all.disable_ipv6' } },
+          peers: [peer({ address_v6: vip })],
+        }}
+        refresh={noop}
+        admitOpen={false}
+        onAdmitOpenChange={vi.fn()}
+      />,
+    )
+
+    expect(screen.getByText(vip).getAttribute('aria-label')).toMatch(
+      /^IPv6 indisponible sur la passerelle/,
+    )
+  })
+
+  it('adds nothing to a client without an IPv6 VIP', () => {
+    mount(
+      <ClientsView status={STATUS} refresh={noop} admitOpen={false} onAdmitOpenChange={vi.fn()} />,
+    )
+
+    expect(screen.queryByText(/\/128$/)).toBeNull()
+    expect(screen.queryByText(/IPv6/)).toBeNull()
+  })
 })
 
 describe('Security', () => {
@@ -338,5 +396,78 @@ describe('System', () => {
     expect(() =>
       mount(<SystemView status={null} events={[]} onSplitTunnelChange={noop} />),
     ).not.toThrow()
+  })
+
+  it('says discreetly that IPv6 is not configured, and raises no warning', () => {
+    mount(<SystemView status={STATUS} events={[]} onSplitTunnelChange={noop} />)
+
+    expect(screen.getByText('IPv6 tunnel')).toBeTruthy()
+    expect(screen.getByText('non configurée')).toBeTruthy()
+    expect(screen.queryByText(/IPv6 indisponible/)).toBeNull()
+  })
+
+  it('reports an installed IPv6 tunnel', () => {
+    mount(<SystemView status={{ ...STATUS, ipv6: 'installed' }} events={[]} onSplitTunnelChange={noop} />)
+
+    expect(screen.getByText('installée')).toBeTruthy()
+    expect(screen.queryByText(/IPv6 indisponible/)).toBeNull()
+  })
+
+  it('makes the degraded IPv4-only start visible, with the reason in French', () => {
+    mount(
+      <SystemView
+        status={{
+          ...STATUS,
+          ipv6: { unavailable: { reason: 'tunnel_mtu_too_small', tunnel_mtu: 1200, minimum: 1280 } },
+        }}
+        events={[]}
+        onSplitTunnelChange={noop}
+      />,
+    )
+
+    expect(screen.getByText('indisponible')).toBeTruthy()
+    expect(screen.getByText('IPv6 indisponible — passerelle en IPv4 seule')).toBeTruthy()
+    expect(screen.getByText(/Le MTU du tunnel \(1200 octets\) est inférieur aux 1280 octets/)).toBeTruthy()
+  })
+
+  it('offers an IPv6 example in the split-tunnel editor', () => {
+    mount(<SystemView status={{ ...STATUS, split_tunnel_cidrs: [] }} events={[]} onSplitTunnelChange={noop} />)
+
+    const editor = screen.getByPlaceholderText(/10\.0\.0\.0\/8/)
+    expect(editor.getAttribute('placeholder')).toBe('10.0.0.0/8\n192.168.0.0/16\nfd12:3456:789a::/48')
+    expect(screen.getByText('Un CIDR par ligne, IPv4 ou IPv6.')).toBeTruthy()
+  })
+
+  it('sends IPv6 CIDRs as typed and reports their refusal like an IPv4 one', async () => {
+    const onSplitTunnelChange = vi.fn((cidrs: string[]) =>
+      Promise.reject(new Error(`invalid IP network \`${cidrs[0]}\``)),
+    )
+
+    for (const cidr of ['10.0.0.0/33', 'fd12:3456:789a::/129']) {
+      mount(<SystemView status={STATUS} events={[]} onSplitTunnelChange={onSplitTunnelChange} />)
+      fireEvent.change(screen.getByDisplayValue('10.0.0.0/8'), { target: { value: cidr } })
+      fireEvent.click(screen.getByRole('button', { name: 'Appliquer' }))
+      await waitFor(() => expect(screen.getByRole('status').textContent).toBe('Échec de la mise à jour.'))
+      cleanup()
+    }
+
+    // Validation stays on the gateway: the console forwards both untouched.
+    expect(onSplitTunnelChange.mock.calls).toEqual([[['10.0.0.0/33']], [['fd12:3456:789a::/129']]])
+  })
+
+  it('keeps the warning for a reason this console does not know', () => {
+    mount(
+      <SystemView
+        status={{
+          ...STATUS,
+          ipv6: { unavailable: { reason: 'firmware_said_no' } } as unknown as Status['ipv6'],
+        }}
+        events={[]}
+        onSplitTunnelChange={noop}
+      />,
+    )
+
+    expect(screen.getByText('IPv6 indisponible — passerelle en IPv4 seule')).toBeTruthy()
+    expect(screen.getByText(/Raison non reconnue par cette interface/)).toBeTruthy()
   })
 })

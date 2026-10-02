@@ -93,6 +93,55 @@ Ouvrir `http://127.0.0.1:5173`. Vérifier :
 4. l'enregistrement puis la suppression de CIDR de split-tunneling ;
 5. **Arrêter l'interface**, puis le retour à `down`.
 
+#### IPv6 du tunnel
+
+La console lit l'état IPv6 dans `GET /api/status` (`ipv6`) et la VIP IPv6 de
+chaque client dans `peers[].address_v6` de la même réponse
+([ADRESSAGE-IPV6.md](../specification/ADRESSAGE-IPV6.md) §5.1, §6.2). L'état
+est celui du dernier montage de l'interface : remonter l'interface après chaque
+changement ci-dessous.
+
+1. **Sans `wg_address_v6`.** Page **Système**, carte « Configuration » : la
+   ligne « IPv6 tunnel » vaut `non configurée`, sans aucun avertissement. Page
+   **Clients** : chaque ligne ne montre que la VIP IPv4 et l'endpoint, comme
+   avant.
+2. **Installée.** Décommenter `wg_address_v6` dans le fichier temporaire avec
+   un préfixe tiré au hasard, redémarrer `heliosd`, monter l'interface : la
+   ligne vaut `installée`. Admettre un client depuis la console : sa ligne
+   porte, sous la VIP IPv4, une VIP IPv6 `…/128` en police à chasse fixe ; au
+   survol, « VIP IPv6 du client, dans ses AllowedIPs. ». Une VIP IPv6 ou un
+   endpoint `[v6]:port` trop long pour la colonne passe à la ligne au lieu
+   d'être tronqué par des points de suspension.
+3. **Indisponible.** Sans toucher aux sysctl de la machine, faire lire à
+   `heliosd` un faux répertoire de réglages noyau :
+
+   ```sh
+   mkdir -p /tmp/helios-ipv6/all /tmp/helios-ipv6/default
+   echo 1 > /tmp/helios-ipv6/all/disable_ipv6
+   echo 0 > /tmp/helios-ipv6/default/disable_ipv6
+   HELIOS_IPV6_CONF_PATH=/tmp/helios-ipv6 \
+   HELIOS_NETWORK_CONFIG=/tmp/helios-manual.toml target/debug/heliosd run --dev
+   ```
+
+   Après montage, la ligne vaut `indisponible`, et un encadré d'avertissement
+   (registre `caution`, celui des autres postures réduites) s'affiche sous les
+   lignes : « IPv6 indisponible — passerelle en IPv4 seule », puis « Le noyau a
+   désactivé IPv6 (net.ipv6.conf.all.disable_ipv6 = 1). » et le rappel que
+   WireGuard jette le trafic IPv6 des clients. Page **Clients**, la VIP IPv6
+   passe en gris ; au survol, « IPv6 indisponible sur la passerelle : cette VIP
+   n’est pas dans les AllowedIPs du client, son trafic IPv6 est jeté. ». Avec
+   un répertoire vide (`HELIOS_IPV6_CONF_PATH=/tmp/helios-ipv6-vide`), la
+   raison devient « Le noyau n’a pas de pile IPv6 (…/all/disable_ipv6 n’existe
+   pas). ». Les raisons `tunnel_mtu_too_small` et `address_refused` ne se
+   provoquent que sur une cible réelle (MTU d'uplink, refus du noyau) ; une
+   raison inconnue de la console s'affiche « Raison non reconnue par cette
+   interface ; le journal de heliosd la donne en clair. », toujours dans
+   l'encadré d'avertissement.
+4. **Split-tunneling.** Le champ propose `fd12:3456:789a::/48` en exemple à
+   côté des CIDR IPv4. Il ne valide rien lui-même : un CIDR IPv6 est transmis
+   tel quel, comme un IPv4, et un refus s'affiche de la même manière
+   (« Échec de la mise à jour. »).
+
 ### 4. Tester l'IHM réellement embarquée dans `heliosd`
 
 ```sh
