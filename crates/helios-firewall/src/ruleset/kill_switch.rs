@@ -10,7 +10,7 @@
 use aether::{FirewallPolicy, Result, TunnelState};
 
 use super::ChainKind::{Forward, Output};
-use super::{network, MasqueradeRule, Match, Rule, Verdict, L4};
+use super::{parse_network, MasqueradeRule, Match, Rule, Verdict, L4};
 
 pub(super) fn state_gated_openings(
     rules: &mut Vec<Rule>,
@@ -33,7 +33,7 @@ pub(super) fn state_gated_openings(
                                 chain,
                                 vec![
                                     Match::OutIface(wan.clone()),
-                                    Match::DestNet(network(gw)?),
+                                    Match::DestNet(parse_network(gw)?),
                                     ports.clone(),
                                 ],
                                 Verdict::Accept,
@@ -65,7 +65,7 @@ pub(super) fn state_gated_openings(
         for cidr in &policy.split_tunnel_cidrs {
             rules.push(Rule::new(
                 Forward,
-                vec![Match::DestNet(network(cidr)?)],
+                vec![Match::DestNet(parse_network(cidr)?)],
                 Verdict::Accept,
             ));
         }

@@ -8,7 +8,7 @@
 use aether::Result;
 
 use super::ChainKind::{Input, Output};
-use super::{network, Match, Rule, Verdict, L4};
+use super::{parse_network, Match, Rule, Verdict, L4};
 
 /// Fixed, host-visible bridge of the Astra private channel (spec §8.3).
 ///
@@ -47,8 +47,8 @@ pub(super) fn lifecycle_and_public_origin(rules: &mut Vec<Rule>) -> Result<()> {
             Input,
             vec![
                 Match::InIface(ASTRA_PRIVATE_IFACE.into()),
-                Match::SourceNet(network(ASTRA_PRIVATE_PEER)?),
-                Match::DestNet(network(ASTRA_PRIVATE_HOST)?),
+                Match::SourceNet(parse_network(ASTRA_PRIVATE_PEER)?),
+                Match::DestNet(parse_network(ASTRA_PRIVATE_HOST)?),
                 Match::DestPort {
                     port: HELIOS_LIFECYCLE_PORT,
                     proto: L4::Tcp,
@@ -63,8 +63,8 @@ pub(super) fn lifecycle_and_public_origin(rules: &mut Vec<Rule>) -> Result<()> {
             Output,
             vec![
                 Match::OutIface(ASTRA_PRIVATE_IFACE.into()),
-                Match::SourceNet(network(ASTRA_PRIVATE_HOST)?),
-                Match::DestNet(network(ASTRA_PRIVATE_PEER)?),
+                Match::SourceNet(parse_network(ASTRA_PRIVATE_HOST)?),
+                Match::DestNet(parse_network(ASTRA_PRIVATE_PEER)?),
                 Match::DestPort {
                     port: ASTRA_LIFECYCLE_PORT,
                     proto: L4::Tcp,
@@ -85,8 +85,8 @@ pub(super) fn lifecycle_and_public_origin(rules: &mut Vec<Rule>) -> Result<()> {
             Output,
             vec![
                 Match::OutIface(ASTRA_PUBLIC_IFACE.into()),
-                Match::SourceNet(network(ASTRA_PUBLIC_HOST)?),
-                Match::DestNet(network(ASTRA_PUBLIC_PEER)?),
+                Match::SourceNet(parse_network(ASTRA_PUBLIC_HOST)?),
+                Match::DestNet(parse_network(ASTRA_PUBLIC_PEER)?),
                 Match::DestPort {
                     port: ASTRA_ORIGIN_PORT,
                     proto: L4::Tcp,

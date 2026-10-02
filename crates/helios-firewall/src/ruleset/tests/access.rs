@@ -69,6 +69,48 @@ fn invalid_networks_never_enter_the_structured_ir() {
     }
 }
 
+/// The split-tunnel CIDRs are only read in `Up`: rendering the down state
+/// alone would let an invalid one through, to fail at the next promotion.
+#[test]
+fn a_policy_check_covers_the_states_that_do_not_read_a_field() {
+    let mut p = policy();
+    p.split_tunnel_cidrs = vec!["192.168.1.0/33".into()];
+    assert!(super::super::render(&p, TunnelState::Down).is_ok());
+
+    let error = check_policy(&p).expect_err("an invalid split-tunnel CIDR must be refused");
+    assert!(error.to_string().contains("192.168.1.0/33"), "{error}");
+}
+
+#[test]
+fn a_policy_check_accepts_valid_dual_stack_split_tunnel_cidrs() {
+    let mut p = policy();
+    p.split_tunnel_cidrs = vec!["192.168.1.0/24".into(), "fd00:1::/64".into()];
+    check_policy(&p).expect("valid split-tunnel CIDRs");
+}
+
+/// `TUNNEL_STATES` cannot be derived from the enum. The match below has no
+/// wildcard, so a new state stops this test from compiling until it is
+/// listed here and in `TUNNEL_STATES`.
+#[test]
+fn a_policy_check_renders_every_tunnel_state() {
+    use TunnelState::{CaptivePortal, Connecting, Down, Failed, Up};
+    for state in [Down, Connecting, Up, Failed, CaptivePortal] {
+        match state {
+            Down | Connecting | Up | Failed | CaptivePortal => {
+                assert!(TUNNEL_STATES.contains(&state), "{state:?} is not checked");
+            }
+        }
+    }
+}
+
+#[test]
+fn the_public_parser_names_the_refused_entry() {
+    assert!(parse_network("10.0.0.0/8").is_ok());
+    assert!(parse_network("2001:db8::/32").is_ok());
+    let error = parse_network("2001:db8::/129").expect_err("prefix beyond 128");
+    assert!(error.to_string().contains("`2001:db8::/129`"), "{error}");
+}
+
 /// The WireGuard listener is in `input` (traffic towards the gateway),
 /// LAN forward in `forward`. Confusing them would block or open the
 /// wrong traffic.
