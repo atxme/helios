@@ -763,7 +763,8 @@ Avancement sur `feature/support-ipv6` (1er octobre 2026) :
 | T20 | fusionné | — |
 | Correctif split-tunnel | fusionné | un CIDR invalide est refusé (API 400, orchestrateur conserve la politique) ; `heliosd run` refuse aussi de démarrer sur un `network.toml` dont la politique ne compile pas |
 | T21 | spécification validée ([SORTIE-IPV6.md](../specification/SORTIE-IPV6.md)) : rejet explicite, pas de NAT66 | implémentation |
-| T15, T22, T23 | à faire | — |
+| T15 | fusionné | MSS par famille (IPv4 = MTU − 40, IPv6 = MTU − 60) dérivé de la MTU de l'interface (surcoût 80) ; le clamp reste la valeur IPv4, une règle IPv6 attend un encodeur (`exthdr`) ; corrige aussi un MSS IPv4 trop grand de 20 octets |
+| T22, T23 | à faire | — |
 
 **T00 — Spécification A : modèle d'adressage IPv6**
 - Fichiers : [`docs/specification/ADRESSAGE-IPV6.md`](../specification/ADRESSAGE-IPV6.md), index `docs/README.md`.
