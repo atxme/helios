@@ -29,13 +29,7 @@ use aether::{NordvpnMeshnetPolicy, PolicyMode};
 /// boundary shows up here even when its own chain is untouched.
 fn snapshot(rs: &Ruleset) -> String {
     let mut out = String::new();
-    out.push_str(&format!(
-        "default {}\n",
-        match rs.default_verdict {
-            Verdict::Accept => "accept",
-            Verdict::Drop => "drop",
-        }
-    ));
+    out.push_str(&format!("default {}\n", rs.default_verdict.as_str()));
     out.push_str(&format!(
         "mss clamp {}\n",
         match rs.mss_clamp {
@@ -73,7 +67,8 @@ fn assert_golden(name: &str, rs: &Ruleset, expected: &str) {
 /// what is emitted *unconditionally*: the head-of-chain openings, the
 /// always-allowed loopback/established pairs, the Astra channel, both public
 /// listeners, the site-to-site transport, the IPv6 link control of the WAN
-/// and the LAN, and the tunnel speedtest. Nothing gated on the tunnel state
+/// and the LAN, the tunnel speedtest, and — last of `forward` — the rejection
+/// of the tunnel clients' IPv6 egress. Nothing gated on the tunnel state
 /// appears.
 const DOWN_FAIL_CLOSED: &str = "\
 default drop
@@ -124,6 +119,7 @@ output oifname \"eth1\" meta nfproto ipv6 icmpv6 type mld-listener-done accept
 output oifname \"eth1\" meta nfproto ipv6 icmpv6 type mld2-listener-report accept
 input iifname \"helios0\" tcp dport 55182 accept
 input iifname \"helios0\" udp dport 55182 accept
+forward meta nfproto ipv6 iifname \"helios0\" oifname \"eth0\" reject with icmpx admin-prohibited
 ";
 
 #[test]
@@ -192,6 +188,7 @@ output oifname \"eth1\" meta nfproto ipv6 icmpv6 type mld2-listener-report accep
 input iifname \"helios0\" tcp dport 55182 accept
 input iifname \"helios0\" udp dport 55182 accept
 forward iifname \"eth1\" oifname \"eth0\" accept
+forward meta nfproto ipv6 iifname \"helios0\" oifname \"eth0\" reject with icmpx admin-prohibited
 ";
 
 #[test]
@@ -210,8 +207,9 @@ fn golden_tunnel_up_without_client_internet() {
 /// the administration API before loopback, DHCP before the gateway's own
 /// egress, that egress before the IPv6 link control of every uplink then of
 /// the LAN, the tunnel openings before the SSH sources, the out-of-band admin
-/// interfaces before the state-gated forwarding, and split-tunnel bypasses
-/// before the LAN forward. Two uplinks also pin the per-uplink expansion
+/// interfaces before the state-gated forwarding, split-tunnel bypasses
+/// before the LAN forward, and the IPv6 egress rejections after the IPv4
+/// egress, closing `forward`. Two uplinks also pin the per-uplink expansion
 /// order of every WAN rule and of the masquerade.
 fn everything_open_policy() -> FirewallPolicy {
     let mut p = policy();
@@ -329,6 +327,8 @@ forward iifname \"eth1\" oifname \"enp3s0\" accept
 forward iifname \"eth1\" oifname \"wlo1\" accept
 forward meta nfproto ipv4 iifname \"helios0\" oifname \"enp3s0\" accept
 forward meta nfproto ipv4 iifname \"helios0\" oifname \"wlo1\" accept
+forward meta nfproto ipv6 iifname \"helios0\" oifname \"enp3s0\" reject with icmpx admin-prohibited
+forward meta nfproto ipv6 iifname \"helios0\" oifname \"wlo1\" reject with icmpx admin-prohibited
 postrouting meta nfproto ipv4 oifname \"enp3s0\" masquerade
 postrouting meta nfproto ipv4 oifname \"wlo1\" masquerade
 ";
@@ -493,6 +493,7 @@ input iifname \"helios0\" tcp dport 55182 accept
 input iifname \"helios0\" udp dport 55182 accept
 output oifname \"eth0\" ip daddr 192.0.2.1/32 tcp dport { 80, 443 } accept
 forward oifname \"eth0\" ip daddr 192.0.2.1/32 tcp dport { 80, 443 } accept
+forward meta nfproto ipv6 iifname \"helios0\" oifname \"eth0\" reject with icmpx admin-prohibited
 ";
 
 #[test]
@@ -564,6 +565,7 @@ input iifname \"helios0\" tcp dport 55182 accept
 input iifname \"helios0\" udp dport 55182 accept
 output oifname \"eth0\" tcp dport { 80, 443 } accept
 forward oifname \"eth0\" tcp dport { 80, 443 } accept
+forward meta nfproto ipv6 iifname \"helios0\" oifname \"eth0\" reject with icmpx admin-prohibited
 ";
 
 #[test]

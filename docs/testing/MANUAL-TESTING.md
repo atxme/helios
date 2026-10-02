@@ -672,6 +672,64 @@ Rien de ceci n'a encore été observé sur cible, en particulier la relecture
 des adresses unicast de WireGuard-NT (`GetUnicastIpAddressTable`) et l'état de
 l'adresse IPv6 juste après la remise en service de l'adaptateur.
 
+### Sortie Internet IPv6 refusée (gateway Linux et client dual-stack)
+
+Critère 4 de [SORTIE-IPV6.md](../specification/SORTIE-IPV6.md) (V1, rejet
+explicite). Ce contrôle exige la gateway du contrôle précédent (IPv6 de tunnel
+`installed`, pair portant `address_v6`), `heliosd` compilé avec
+`--features netlink`, et un client dual-stack connecté en tunnel complet
+(`0.0.0.0/0, ::/0`) : la VM Windows ci-dessus, ou un poste Linux. Le WAN de la
+gateway peut avoir ou non de l'IPv6 : le rejet ne dépend pas de lui. Sous WSL,
+seuls le rendu, l'ordre et les octets Netlink sont exercés
+(`scripts/wsl-cargo test -p helios-firewall --features netlink`) : ni le
+noyau, ni l'ICMPv6 réellement émis, ni le comportement des applications.
+
+1. **Règles, tunnel `Down`.** Avant de connecter le client :
+
+   ```sh
+   sudo nft list chain inet helios forward
+   ```
+
+   Les dernières règles de la chaîne, une par uplink, sont
+   `meta nfproto ipv6 iifname "helios0" oifname "<wan>" reject with icmpx admin-prohibited`
+   (selon la version de `nft`, `reject with icmpx type admin-prohibited`). Elles
+   suivent `ct state invalid counter drop` et
+   `ct state established,related accept`. Noter si `nft` affiche la garde
+   `meta nfproto ipv6` avant ou après les interfaces : le batch la place en
+   tête.
+2. **Règles, tunnel `Up`.** Connecter le client et relire la chaîne : les
+   mêmes règles sont toujours les dernières, après la règle IPv4
+   `meta nfproto ipv4 iifname "helios0" oifname "<wan>" accept` si
+   `allow_client_internet` est actif. Aucune règle `accept` ne porte
+   `meta nfproto ipv6` ni `ip6`, hors contournement `split_tunnel_cidrs` IPv6
+   explicitement configuré (limite connue, FIREWALL-V2).
+3. **Échec immédiat.** Sur la gateway, `sudo tcpdump -ni helios0 icmp6`. Depuis
+   le client :
+
+   ```sh
+   curl -6 -sS -o /dev/null -m 10 -w '%{time_total}\n' https://ipv6.google.com/
+   ```
+
+   (Windows : `curl.exe -6 …`). Attendu : un échec en bien moins d'une seconde,
+   pas au bout des 10 s de `-m 10` ; sous Linux, l'erreur attendue est
+   `Permission denied` (EACCES, la traduction noyau d'« administratively
+   prohibited »), à confirmer. `tcpdump` montre un
+   `destination unreachable … unreachable prohibited` (ICMPv6 type 1 code 1)
+   de la gateway vers la VIP IPv6 du client.
+4. **Repli dual-stack sans délai.** Dans un navigateur du client, charger un
+   site publié en A et AAAA (par exemple `https://www.wikipedia.org/`), cache
+   vidé. Attendu : chargement sans délai visible ; les outils de
+   développement montrent une connexion en IPv4.
+5. **La gateway reste joignable en IPv6.** `ping -6 <préfixe>::1` répond
+   toujours (règles `input`, `allow_tunnel_icmp`) : le rejet ne concerne que
+   le trafic vers un WAN.
+6. **Débit des réponses.** Relever `sysctl net.ipv6.icmp.ratelimit` (défaut
+   attendu 1000 ms) ; une rafale (`for i in $(seq 50); do curl -6 -s -m 2 …;
+   done`) doit rester bornée côté `tcpdump` par cette limite noyau, aucune
+   limite n'existant dans le ruleset (SORTIE-IPV6 §4.2).
+
+Rien de ceci n'a encore été observé sur cible.
+
 ## Test réel WireGuard sur Linux
 
 Effectuer ce scénario uniquement sur une gateway de laboratoire :

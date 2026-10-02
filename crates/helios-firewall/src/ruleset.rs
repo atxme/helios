@@ -20,8 +20,12 @@
 //! * **road-warrior**, behind `allow_client_internet`: `forward` from
 //!   `wg_iface` to `wan_iface`, plus a masquerade in `postrouting`, for a
 //!   client arriving *through* the tunnel. Both are IPv4-only
-//!   (`meta nfproto ipv4`): the table is `inet`, and relaying or NAT-ing
-//!   IPv6 is a decision not taken yet, see [`MasqueradeRule`].
+//!   (`meta nfproto ipv4`): the table is `inet`, and the gateway neither
+//!   relays nor NATs IPv6, see [`MasqueradeRule`].
+//!
+//! A tunnel client's IPv6 bound for a WAN is not left to the `drop` policy
+//! either: it is rejected with `icmpx admin-prohibited`, in every state, so
+//! that the client falls back to IPv4 at once (module `client_ipv6_egress`).
 //!
 //! The second is closed by default. A gateway granting access to internal
 //! resources has no reason to route Internet traffic, and opening it would
@@ -56,6 +60,7 @@
 
 mod administration;
 mod astra_channel;
+mod client_ipv6_egress;
 mod gateway_wan;
 mod kill_switch;
 mod link_ipv6;
@@ -65,9 +70,9 @@ mod transport;
 mod tunnel_interface;
 
 pub use nftables::{
-    Action, AddressFamily, ChainKind, ConnectionState, ConnectionStates, Counter, Icmpv6Type,
-    LogAction, MasqueradeRule, Match, RateLimit, RateLimitMode, RateUnit, Rule, Ruleset, Verdict,
-    L4,
+    Action, AddressFamily, ChainKind, ConnectionState, ConnectionStates, Counter, DefaultVerdict,
+    Icmpv6Type, LogAction, MasqueradeRule, Match, RateLimit, RateLimitMode, RateUnit, Rule,
+    Ruleset, Verdict, L4,
 };
 
 use aether::{FirewallPolicy, HeliosError, Result, TunnelState, SPEEDTEST_PORT};
@@ -110,7 +115,9 @@ fn local_networks(family: AddressFamily) -> &'static [&'static str] {
 ///   could (re)establish the tunnel;
 /// * IPv6 neighbor discovery and MLD on every WAN and LAN interface, router
 ///   discovery on the WANs only (module `link_ipv6`);
-/// * LAN -> WAN forwarding is only open in the `Up` state.
+/// * LAN -> WAN forwarding is only open in the `Up` state;
+/// * IPv6 from the tunnel interface to a WAN is rejected, last of `forward`
+///   (module `client_ipv6_egress`).
 pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Result<Ruleset> {
     use ChainKind::{Forward, Input, Output};
     let mut rules = Vec::new();
@@ -169,12 +176,15 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Result<Ruleset> {
     administration::ssh_sources(&mut rules, policy)?;
     administration::out_of_band_admin_ifaces(&mut rules, policy);
     kill_switch::state_gated_openings(&mut rules, policy, state, &wan_ifaces)?;
+    // Last of `forward`, in every state: after every opening, before the
+    // chain policy.
+    client_ipv6_egress::reject(&mut rules, policy, &wan_ifaces);
 
     // In fail-open, the default policy becomes accept outside the tunnel (not recommended).
     let default_verdict = if policy.is_fail_closed() || state.traffic_allowed() {
-        Verdict::Drop
+        DefaultVerdict::Drop
     } else {
-        Verdict::Accept
+        DefaultVerdict::Accept
     };
 
     Ok(Ruleset {

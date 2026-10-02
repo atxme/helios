@@ -170,8 +170,12 @@ default full tunnel), the adapter must stay up after a failure so WireGuard
 keeps capturing and dropping packets; `down()` is called on explicit
 disconnection only. `::/0` is captured even though the gateway routes no IPv6
 for its peers: WireGuard drops it, which is what keeps a dual-stack machine's
-IPv6 from leaving in clear. A profile stored with `0.0.0.0/0` alone is never
-rewritten; Orion and `helios-ctl profile check` flag it as an IPv4-only full
+IPv6 from leaving in clear. For a peer holding an IPv6 VIP, the gateway's
+`forward` chain rejects that traffic towards every uplink with
+`icmpx admin-prohibited`, in every tunnel state, so applications fall back to
+IPv4 at once instead of waiting for a timeout
+(`specification/SORTIE-IPV6.md`). A profile stored with `0.0.0.0/0` alone is
+never rewritten; Orion and `helios-ctl profile check` flag it as an IPv4-only full
 tunnel. A binary built with
 `orion/wireguard` refuses to start when the real backend cannot initialise, and
 never falls back to a simulation. Conversely, an Orion **for Windows** built

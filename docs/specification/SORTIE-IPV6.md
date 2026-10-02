@@ -1,7 +1,8 @@
 # Spécification — sortie Internet IPv6 des clients du tunnel
 
 **Statut** : validée le 2 octobre 2026 pour la V1 (rejet explicite, §3.1),
-**non implémentée**. Le NAT66 (§3.2) est écarté de ce chantier. C'est la
+**implémentée sur `feature/support-ipv6`** (§7) ; le critère 4 (sur cible)
+reste à observer. Le NAT66 (§3.2) est écarté de ce chantier. C'est la
 spécification B annoncée par [ADRESSAGE-IPV6.md](ADRESSAGE-IPV6.md) (ticket
 T21 de [l'étude](../architecture/ETUDE-IPV6.md)). La règle de l'adressage §6.4
 reste en vigueur : **aucun paquet IPv6 n'est relayé** entre `wg_iface` et un
@@ -140,3 +141,29 @@ Prises le 2 octobre 2026 :
 3. Sans objet tant que le NAT66 est écarté. La portée du masquerade IPv4
    (uplink seul, ou aussi `iifname <wg_iface>`) reste une question ouverte
    distincte.
+
+## 7. Implémentation de la V1
+
+- **Rendu** : `crates/helios-firewall/src/ruleset/client_ipv6_egress.rs`,
+  appelé en dernier par `ruleset::render`. Une règle par uplink, dans tous les
+  états et sous les deux `mode`, aucune sans `wg_iface` :
+  `meta nfproto ipv6 iifname "<wg_iface>" oifname "<wan>" reject with icmpx admin-prohibited`.
+  Ce sont les dernières règles de `forward`.
+- **IR** : `Verdict::RejectAdminProhibited`, variante fermée ; la politique
+  des chaînes devient `DefaultVerdict` (`Accept` ou `Drop`), si bien qu'une
+  politique de rejet n'est pas représentable
+  ([FIREWALL-V2.md](../architecture/FIREWALL-V2.md)).
+- **Netlink** : expression `Reject` (`RejectType::IcmpxUnreach`,
+  `IcmpCode::AdminProhibited`), sans verdict après elle, dans la même
+  transaction que le reste du ruleset.
+- **Critère 1** : golden tests et `ruleset/tests/ipv6_relay.rs` (présence,
+  forme exacte, ordre, aucun `accept` IPv6 en `forward`, aucun masquerade
+  IPv6). **Critère 2** : octets de l'expression dans un `Batch` finalisé
+  (`netlink/expressions.rs`). **Critère 4** : procédure « Sortie Internet IPv6
+  refusée » de [MANUAL-TESTING.md](../testing/MANUAL-TESTING.md), non encore
+  exécutée.
+- **Limite connue** : un CIDR IPv6 dans `split_tunnel_cidrs` produit, en `Up`,
+  un `forward ip6 daddr <cidr> accept` sans interface d'entrée, placé avant le
+  rejet. Ce contournement d'opérateur précède ce chantier ; le restreindre
+  demande une décision séparée (FIREWALL-V2, « Rejet explicite de la sortie
+  IPv6 des clients »).

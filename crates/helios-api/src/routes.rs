@@ -790,10 +790,7 @@ pub async fn firewall_rules_get(
     let rs = ruleset::render(&policy, state)
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
 
-    let verdict_str = match rs.default_verdict {
-        ruleset::Verdict::Drop => "drop",
-        ruleset::Verdict::Accept => "accept",
-    };
+    let verdict_str = rs.default_verdict.as_str();
 
     // Rendered faithfully to what the Netlink backend actually applies:
     // three hooked chains, each with its default policy.
