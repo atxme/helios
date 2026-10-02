@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import * as api from '../api'
 import { copyText } from '../clipboard'
 import type {
+  CaptureCheck,
   ClientConfig,
   ClientProfile,
   LogLine,
@@ -27,6 +28,9 @@ export function useClient() {
   // `null` = the ongoing connection hasn't decided yet. Definitely not
   // `'none'` by default: that would assert the absence of a PSK before knowing.
   const [psk, setPsk] = useState<PskKind | null>(null)
+  // What the mounted adapter was read back to capture. `null` = no verdict:
+  // nothing mounted, or a backend that cannot read it back.
+  const [capture, setCapture] = useState<CaptureCheck | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [pathImportedProfile, setPathImportedProfile] = useState<ClientProfile | null>(null)
   const upSinceRef = useRef<number | null>(null)
@@ -93,10 +97,17 @@ export function useClient() {
             // gets renegotiated on the next mount. Keeping it would display a
             // protection that no tunnel carries anymore.
             setPsk(null)
+            // Unlike the PSK, the capture outlives `failed`: the adapter stays
+            // mounted on failure with the routes it had (ADR-001 §3 bis), so a
+            // missing `::/0` is still missing. Only unmounting ends it.
+            if (ev.state === 'down') setCapture(null)
           }
           break
         case 'protection':
           setPsk(ev.psk)
+          break
+        case 'capture':
+          setCapture(ev.capture)
           break
         case 'log':
           pushLog(ev.level, ev.message)
@@ -139,6 +150,9 @@ export function useClient() {
     // stale handshake mid-session goes back through `connecting` without the
     // set protection having changed.
     setPsk(null)
+    // The new configuration is read back again; the previous verdict would
+    // describe a tunnel that is being replaced.
+    setCapture(null)
     try {
       await api.connect(name)
     } catch (e) {
@@ -237,6 +251,7 @@ export function useClient() {
     history,
     upSince,
     psk,
+    capture,
     error,
     selectedProfile,
     pathImportedProfile,

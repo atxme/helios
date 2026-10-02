@@ -429,6 +429,9 @@ fn upload_payload_fn(bytes: usize) -> Bytes {
 }
 
 fn reserve_bytes(counter: &AtomicU64, bytes: u64, limit: u64) -> bool {
+    // `try_update` is the new name, but the workspace's `rust-version` (1.88)
+    // predates it: the old name stays until the minimum moves.
+    #[allow(deprecated)]
     counter
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             current.checked_add(bytes).filter(|next| *next <= limit)

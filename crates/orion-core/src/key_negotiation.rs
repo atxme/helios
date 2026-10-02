@@ -4,7 +4,7 @@
 //! is supplied at connection time by the shell's protected identity store and
 //! is never serialized by this module.
 
-use std::{net::SocketAddr, time::Duration};
+use std::time::Duration;
 
 use aether::{
     key_negotiation::{
@@ -164,9 +164,26 @@ pub struct NegotiatedKey {
     server_challenge: [u8; SERVER_CHALLENGE_LEN],
     client_pq_private_key: Zeroizing<Vec<u8>>,
     gateway_pq_public_key: String,
+    /// The candidate address this negotiation was carried by.
+    selection: crate::endpoint_resolution::Selection,
 }
 
 impl NegotiatedKey {
+    /// The gateway address this negotiation reached — a literal, chosen by
+    /// the RFC 8305 race over a single resolution.
+    ///
+    /// When the WireGuard endpoint names the same host, this is the address
+    /// the tunnel must use too: a second resolution could pick the other
+    /// family, and the one that just answered is the one known to work.
+    pub fn remote(&self) -> std::net::SocketAddr {
+        self.selection.address
+    }
+
+    /// Which candidate won, and which ones were passed over and why.
+    pub fn selection(&self) -> &crate::endpoint_resolution::Selection {
+        &self.selection
+    }
+
     /// Identifier the gateway records as this slot's owner.
     ///
     /// Needed later to release it: the gateway only accepts a release naming
@@ -245,35 +262,65 @@ pub async fn prepare(
     aether::wg::validate_key(expected_gateway_wg_public_key)
         .context("invalid gateway WireGuard public key")?;
 
-    let remote = resolve_remote(&client.remote).await?;
-    // Pinned off the tunnel before anything is sent. This session opens
-    // before the WireGuard interface exists and has to outlive it coming up;
-    // a socket left on the wildcard address changes egress interface at that
-    // moment, and the gateway sees a QUIC migration mid-transaction. See
-    // `crate::net_pin`.
-    let socket = crate::net_pin::negotiation_socket(remote, crate::net_pin::TUNNEL_IFNAME)
-        .context("opening the key-negotiation socket")?;
-    let endpoint = client_endpoint_on_socket(socket, &identity, client.gateway_ca)
-        .context("building the authenticated key-negotiation client")?;
+    // One resolution for this attempt, into the RFC 8305 order. A literal
+    // endpoint is its own single candidate and asks no resolver.
+    let candidates = crate::endpoint_resolution::resolve_candidates(&client.remote)
+        .await
+        .with_context(|| format!("resolving key-negotiation endpoint {}", client.remote))?;
 
-    // The challenge comes first, and the request cannot exist without it: it
-    // is signed into the transcript and mixed into the HKDF salt. Asking for
-    // it also checks, for free and before any ML-DSA-87 work, that the
-    // gateway answering is the one this profile pins.
-    let pending = request_challenge(
-        &endpoint,
-        remote,
-        &client.server_name,
-        expected_gateway_wg_public_key,
+    // The candidates race up to the challenge, and no further.
+    //
+    // That boundary is the cancellation guarantee. Up to the challenge, the
+    // gateway holds nothing for this client but the connection itself — the
+    // challenge lives in that connection's task and dies with it — so a
+    // losing attempt dropped mid-flight leaves no transaction behind: quinn
+    // closes a connection whose last handle is dropped (`CONNECTION_CLOSE`,
+    // code 0), and the socket goes with its endpoint. The signed request,
+    // which is what reserves a slot on the gateway, is only ever sent on the
+    // winning connection, below, after the race is over.
+    let identity_ref = &identity;
+    let gateway_ca = &client.gateway_ca;
+    let server_name = client.server_name.as_str();
+    let won = crate::endpoint_resolution::race(
+        &candidates,
+        crate::endpoint_resolution::CONNECTION_ATTEMPT_DELAY,
+        move |remote| async move {
+            // Pinned off the tunnel before anything is sent. This session
+            // opens before the WireGuard interface exists and has to outlive
+            // it coming up; a socket left on the wildcard address changes
+            // egress interface at that moment, and the gateway sees a QUIC
+            // migration mid-transaction. One socket per candidate, of the
+            // candidate's family. See `crate::net_pin`.
+            let socket = crate::net_pin::negotiation_socket(remote, crate::net_pin::TUNNEL_IFNAME)
+                .context("opening the key-negotiation socket")?;
+            let endpoint = client_endpoint_on_socket(socket, identity_ref, gateway_ca.clone())
+                .context("building the authenticated key-negotiation client")?;
+            // The challenge comes first, and the request cannot exist without
+            // it: it is signed into the transcript and mixed into the HKDF
+            // salt. Asking for it also checks, for free and before any
+            // ML-DSA-87 work, that the gateway answering is the one this
+            // profile pins.
+            let pending = request_challenge(
+                &endpoint,
+                remote,
+                server_name,
+                expected_gateway_wg_public_key,
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "obtaining a key-negotiation challenge from {remote} \
+                     (server name {server_name})"
+                )
+            })?;
+            Ok((endpoint, pending))
+        },
     )
     .await
-    .with_context(|| {
-        format!(
-            "obtaining a key-negotiation challenge from {remote} \
-             (server name {})",
-            client.server_name
-        )
-    })?;
+    .map_err(|failed| failed.into_error(&client.remote))?;
+    let selection = crate::endpoint_resolution::Selection::new(&client.remote, &won);
+    let remote = won.address;
+    let (endpoint, pending) = won.value;
     let server_challenge = pending.server_challenge();
 
     let transaction_id = random_identifier()?;
@@ -413,6 +460,7 @@ pub async fn prepare(
         transaction_id,
         client_pq_private_key: Zeroizing::new(client.client_pq_private_key),
         gateway_pq_public_key: client.gateway_pq_certificate.ml_dsa_87_public_key.clone(),
+        selection,
     })
 }
 
@@ -502,15 +550,6 @@ fn unix_time_now() -> Result<u64> {
         .duration_since(std::time::UNIX_EPOCH)
         .context("system clock predates the Unix epoch")?
         .as_secs())
-}
-
-async fn resolve_remote(value: &str) -> Result<SocketAddr> {
-    let mut addresses = tokio::net::lookup_host(value)
-        .await
-        .with_context(|| format!("resolving key-negotiation endpoint {value}"))?;
-    addresses
-        .find(|address| address.port() != 0)
-        .context("key-negotiation endpoint resolved to no usable address")
 }
 
 fn random_identifier() -> Result<[u8; KEY_NEGOTIATION_NONCE_LEN]> {

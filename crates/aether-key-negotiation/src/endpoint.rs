@@ -1,4 +1,8 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 
 use quinn::{Endpoint, TokioRuntime};
 use rustls::{pki_types::CertificateDer, RootCertStore};
@@ -70,7 +74,16 @@ const RECEIVE_WINDOW: u32 =
     3 * (4 + aether::key_negotiation::MAX_KEY_NEGOTIATION_MESSAGE_BYTES as u32);
 
 /// Datagram size every QUIC path must carry (RFC 9000 §14).
+///
+/// It holds on IPv6 as well: with the 40-byte IPv6 header and the 8-byte UDP
+/// header a datagram is 1 248 bytes on the wire, under the 1 280 every IPv6
+/// link must carry (RFC 8200 §5) — so the dual-stack listener needs no second
+/// value.
 const SAFE_UDP_PAYLOAD: u16 = 1200;
+
+/// IPv6 header (40) + UDP header (8) + the pinned payload, against the IPv6
+/// minimum link MTU: checked at compile time so the value cannot drift past it.
+const _: () = assert!(40 + 8 + SAFE_UDP_PAYLOAD as usize <= 1280);
 
 /// Silence after which a **transaction** connection is abandoned.
 ///
@@ -141,6 +154,136 @@ pub fn server_endpoint(
     identity: &TlsIdentity,
     client_cas: &[Vec<u8>],
 ) -> Result<Endpoint, TransportError> {
+    let config = server_config(identity, client_cas)?;
+    let endpoint = Endpoint::server(config, bind).map_err(TransportError::Io)?;
+    log_server_ready(bind, identity, client_cas);
+    Ok(endpoint)
+}
+
+/// Which address families the gateway's negotiation listener serves.
+///
+/// A transport capability, not a security boundary: every bound on the port —
+/// Retry, the per-source and per-identity budgets, the lifetime — applies the
+/// same way whichever family a client arrives on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListenFamilies {
+    /// One `[::]` socket with `IPV6_V6ONLY` off: IPv6 clients natively, IPv4
+    /// clients as `::ffff:a.b.c.d`, which the server canonicalizes before
+    /// counting or logging them.
+    DualStack,
+    /// The host cannot open an IPv6 socket at all, so the listener serves
+    /// IPv4 alone. `reason` carries the operating system's own answer.
+    Ipv4Only { reason: String },
+}
+
+impl ListenFamilies {
+    /// What a failed attempt at the dual-stack socket means for the listener.
+    ///
+    /// Only one answer degrades instead of failing: the kernel refusing the
+    /// IPv6 address family outright (`EAFNOSUPPORT`, as on a host booted with
+    /// `ipv6.disable=1`). Refusing to start there would take IPv4 negotiation
+    /// down with it, for a capability the host never had. Every other error —
+    /// the port already in use, a permission refused — comes back unchanged
+    /// and fails the listener exactly as it did before IPv6.
+    ///
+    /// Outside Unix nothing degrades: the gateway is a Linux daemon, and no
+    /// other platform's error code is mapped here without a host to prove it.
+    pub fn after_dual_stack_error(error: std::io::Error) -> Result<Self, std::io::Error> {
+        if ipv6_is_unsupported(&error) {
+            Ok(Self::Ipv4Only {
+                reason: format!("IPv6 sockets are unavailable on this host: {error}"),
+            })
+        } else {
+            Err(error)
+        }
+    }
+}
+
+impl std::fmt::Display for ListenFamilies {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DualStack => f.write_str("IPv6 and IPv4 (dual-stack [::])"),
+            Self::Ipv4Only { reason } => write!(f, "IPv4 only ({reason})"),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn ipv6_is_unsupported(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(libc::EAFNOSUPPORT)
+}
+
+#[cfg(not(unix))]
+fn ipv6_is_unsupported(_error: &std::io::Error) -> bool {
+    false
+}
+
+/// Builds the gateway's negotiation endpoint on every family the host offers.
+///
+/// One socket, not two. A dual-stack `[::]:port` carries IPv6 natively and
+/// IPv4 as `::ffff:a.b.c.d`; quinn drives it as any other IPv6 socket, and
+/// `quinn-udp` already forbids fragmentation for mapped destinations. Two
+/// endpoints would each hold their own connection table and Retry key, and
+/// the budgets of [`crate::serve`] would have to be shared across two accept
+/// loops by hand — twice the state for no gain.
+///
+/// `IPV6_V6ONLY` is cleared explicitly rather than inherited: Linux takes the
+/// default from `net.ipv6.bindv6only`, and a host where it is `1` would
+/// silently stop answering every IPv4 client.
+///
+/// When the host has no IPv6 at all, the listener falls back to `0.0.0.0` and
+/// says so ([`ListenFamilies::after_dual_stack_error`]); the caller gets back
+/// which of the two it got, to name it in its own startup line.
+pub fn dual_stack_server_endpoint(
+    port: u16,
+    identity: &TlsIdentity,
+    client_cas: &[Vec<u8>],
+) -> Result<(Endpoint, ListenFamilies), TransportError> {
+    // The configuration first, as `server_endpoint` does: a refused identity
+    // or CA set must fail before any socket is bound.
+    let config = server_config(identity, client_cas)?;
+    let (socket, families) = match dual_stack_socket(port) {
+        Ok(socket) => (socket, ListenFamilies::DualStack),
+        Err(error) => {
+            let families =
+                ListenFamilies::after_dual_stack_error(error).map_err(TransportError::Io)?;
+            tracing::warn!(
+                port,
+                %families,
+                "quic: the key-negotiation listener cannot open IPv6 and serves IPv4 only"
+            );
+            let socket = std::net::UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)))
+                .map_err(TransportError::Io)?;
+            (socket, families)
+        }
+    };
+    let bind = socket.local_addr().map_err(TransportError::Io)?;
+    let endpoint = Endpoint::new(
+        quinn::EndpointConfig::default(),
+        Some(config),
+        socket,
+        Arc::new(TokioRuntime),
+    )
+    .map_err(TransportError::Io)?;
+    log_server_ready(bind, identity, client_cas);
+    Ok((endpoint, families))
+}
+
+/// `[::]:port`, accepting IPv4 clients as mapped addresses.
+fn dual_stack_socket(port: u16) -> std::io::Result<std::net::UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+
+    let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_only_v6(false)?;
+    socket.bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)).into())?;
+    Ok(socket.into())
+}
+
+/// The server half of the transport contract, independent of any socket.
+fn server_config(
+    identity: &TlsIdentity,
+    client_cas: &[Vec<u8>],
+) -> Result<quinn::ServerConfig, TransportError> {
     // Fail closed: an empty set would build a verifier no client can satisfy,
     // and rustls would accept the configuration.
     if client_cas.is_empty() {
@@ -184,7 +327,10 @@ pub fn server_endpoint(
     // Exactly one, opened by Orion. A second is a protocol error.
     transport.max_concurrent_bidi_streams(1u32.into());
     config.transport = Arc::new(transport);
-    let endpoint = Endpoint::server(config, bind).map_err(TransportError::Io)?;
+    Ok(config)
+}
+
+fn log_server_ready(bind: SocketAddr, identity: &TlsIdentity, client_cas: &[Vec<u8>]) {
     tracing::info!(
         %bind,
         alpn = %String::from_utf8_lossy(KEY_NEGOTIATION_ALPN),
@@ -197,7 +343,6 @@ pub fn server_endpoint(
         datagram_bytes = SAFE_UDP_PAYLOAD,
         "quic: key-negotiation server endpoint ready"
     );
-    Ok(endpoint)
 }
 
 /// Builds a client endpoint with mutual TLS credentials.

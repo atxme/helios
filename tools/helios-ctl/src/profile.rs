@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 
 use aether::key_negotiation::ProtectionMode;
 use anyhow::{bail, Context, Result};
+use orion_core::profile_import::TunnelCapture;
 use orion_core::ProfileKind;
 use reqwest::Client;
 use serde::Serialize;
@@ -85,12 +86,22 @@ pub struct Profile<'a> {
     pub private_key: Option<&'a str>,
     pub peer_public_key: &'a str,
     pub address: &'a str,
+    /// IPv6 VIP, `…/128`, written **only** when the peer has one
+    /// (`ADRESSAGE-IPV6.md` §7.2).
+    ///
+    /// The document is `deny_unknown_fields`: an Orion older than the field
+    /// refuses any profile carrying the key, even empty or `null`. Omitting it
+    /// for a peer without IPv6 is what keeps the profile of a gateway without
+    /// IPv6 readable by every Orion.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub address_v6: Option<&'a str>,
     /// Traffic the client routes into the tunnel — one or more CIDR prefixes,
     /// comma-separated.
     ///
     /// Omitted rather than defaulted, because the two are not the same thing:
-    /// an absent field lets `orion-core` apply `0.0.0.0/0`, the full tunnel,
-    /// which stays the right answer when the operator has said nothing. Only
+    /// an absent field lets `orion-core` apply its default full tunnel,
+    /// `0.0.0.0/0, ::/0`, which stays the right answer when the operator has
+    /// said nothing. Only
     /// a split tunnel needs stating, and it is stated **here** so a fleet gets
     /// it from the document rather than from each user retyping prefixes into
     /// the Advanced panel.
@@ -174,17 +185,18 @@ pub fn check(path: &Path) -> Result<()> {
         "  adresse         : {}",
         profile.address.as_deref().unwrap_or("—")
     );
+    // Only when present: a document without it is an IPv4-only profile, and
+    // a line saying « — » would suggest something was expected.
+    if let Some(address_v6) = profile.address_v6.as_deref() {
+        println!("  adresse IPv6    : {address_v6}  (Orion antérieur : profil refusé à l'import)");
+    }
     // Said whether or not the document stated it: what matters to the reader
     // is what the client will route, and an absent field means the full
     // tunnel — a fact no one should have to know the defaulting rule to learn.
     println!(
-        "  trafic capté    : {}{}",
+        "  trafic capté    : {}  {}",
         profile.allowed_ips,
-        if profile.allowed_ips == orion_core::DEFAULT_ALLOWED_IPS {
-            "  (tunnel complet)"
-        } else {
-            "  (tunnel fractionné — le reste sort en clair)"
-        }
+        capture_label(&profile.allowed_ips)
     );
     println!(
         "  API dans tunnel : {}",
@@ -237,6 +249,20 @@ pub fn check(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// What a document's `AllowedIPs` leaves outside the tunnel, in words.
+///
+/// Classified by `orion-core`, the same rule the Orion screen warns with: a
+/// document that captures `0.0.0.0/0` alone was a full tunnel before `::/0`
+/// joined the default, and calling it one still would tell the operator that
+/// a client leaking all of its IPv6 is protected.
+fn capture_label(allowed_ips: &str) -> &'static str {
+    match orion_core::profile_import::tunnel_capture(allowed_ips) {
+        TunnelCapture::Full => "(tunnel complet)",
+        TunnelCapture::Ipv4Only => "(tunnel complet IPv4 seulement — le trafic IPv6 sort en clair)",
+        TunnelCapture::Partial => "(tunnel fractionné — le reste sort en clair)",
+    }
+}
+
 pub async fn emit(client: &Client, base: &str, options: EmitOptions) -> Result<()> {
     let (public_key, private_key) = resolve_keys(&options)?;
 
@@ -251,6 +277,12 @@ pub async fn emit(client: &Client, base: &str, options: EmitOptions) -> Result<(
         )?;
 
     let address = admit_or_reuse(client, base, &options, &public_key).await?;
+    let address_v6 = admitted_address_v6(
+        &api::network(client, base).await?,
+        &options.name,
+        &public_key,
+        &address,
+    )?;
 
     let json = render(Profile {
         name: &options.name,
@@ -258,6 +290,7 @@ pub async fn emit(client: &Client, base: &str, options: EmitOptions) -> Result<(
         private_key: private_key.as_deref(),
         peer_public_key: &gateway_public_key,
         address: &address,
+        address_v6: address_v6.as_deref(),
         allowed_ips: options.allowed_ips.as_deref(),
         ssh_target: options.ssh_target.as_deref(),
         heliosd_url: heliosd_url(&view.wg_address),
@@ -341,6 +374,45 @@ async fn admit_or_reuse(
             Ok(existing.address.clone())
         }
     }
+}
+
+/// The IPv6 VIP the gateway persisted for the peer just admitted, if any.
+///
+/// Read from `GET /api/network`, the view of `network.toml`, because the
+/// admission answer carries the IPv4 VIP only. The peer is matched by name
+/// **and** key, and its IPv4 VIP must be the one admission returned: a view
+/// that disagrees is a gateway that changed in between, and emitting a
+/// profile from it would mix two records. A blank value is no value — the key
+/// is never written empty.
+pub(crate) fn admitted_address_v6(
+    view: &api::NetworkConfigView,
+    name: &str,
+    public_key: &str,
+    address: &str,
+) -> Result<Option<String>> {
+    let peer = view
+        .peers
+        .iter()
+        .find(|peer| peer.name.trim() == name.trim() && peer.public_key.trim() == public_key)
+        .with_context(|| {
+            format!(
+                "peer \"{name}\" was admitted but is absent from the gateway's network view — \
+                 re-run the command"
+            )
+        })?;
+    if peer.address != address {
+        bail!(
+            "the gateway's network view gives peer \"{name}\" the address {}, while admission \
+             returned {address} — re-run the command",
+            peer.address
+        );
+    }
+    Ok(peer
+        .address_v6
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string))
 }
 
 /// API URL as seen from the tunnel, derived from the gateway address.
@@ -475,6 +547,7 @@ mod tests {
                 private_key,
                 peer_public_key: &gateway_key.public_key,
                 address: "100.64.1.2/32",
+                address_v6: None,
                 allowed_ips: None,
                 ssh_target: None,
                 heliosd_url: heliosd_url("100.64.0.1/10"),
@@ -551,6 +624,7 @@ mod tests {
             private_key: Some(client_key.private_key.expose()),
             peer_public_key: &gateway_key.public_key,
             address: "100.64.1.2/32",
+            address_v6: None,
             allowed_ips: Some("100.64.0.0/10, 192.168.1.0/24"),
             ssh_target: Some("christophe@100.64.0.1"),
             heliosd_url: heliosd_url("100.64.0.1/10"),
@@ -597,12 +671,14 @@ mod tests {
         );
     }
 
-    /// Saying nothing is not saying `0.0.0.0/0` — but it must behave that way.
+    /// Saying nothing is not saying `0.0.0.0/0, ::/0` — but it must behave that
+    /// way.
     ///
     /// The field is omitted rather than written out, so an operator reading a
     /// document sees only what was decided. `orion-core` supplies the full
-    /// tunnel, which is the safe default: it is that prefix, with the adapter
-    /// lifecycle, that makes WireGuard drop packets rather than leak them.
+    /// tunnel, which is the safe default: it is that capture, in both
+    /// families, with the adapter lifecycle, that makes WireGuard drop packets
+    /// rather than leak them.
     #[test]
     fn an_omitted_split_tunnel_becomes_the_full_tunnel_on_the_client() {
         let client_key = aether::wg::generate_keypair().unwrap();
@@ -614,6 +690,7 @@ mod tests {
             private_key: Some(client_key.private_key.expose()),
             peer_public_key: &gateway_key.public_key,
             address: "100.64.1.2/32",
+            address_v6: None,
             allowed_ips: None,
             ssh_target: None,
             heliosd_url: None,
@@ -624,9 +701,157 @@ mod tests {
 
         assert!(!json.contains("allowed_ips"), "{json}");
         let imported = orion_core::parse_profile_import(&json, "portable.json").unwrap();
+        assert_eq!(imported.profile.allowed_ips, "0.0.0.0/0, ::/0");
         assert_eq!(
-            imported.profile.allowed_ips,
-            orion_core::DEFAULT_ALLOWED_IPS
+            capture_label(&imported.profile.allowed_ips),
+            "(tunnel complet)"
+        );
+    }
+
+    fn document(address_v6: Option<&str>) -> String {
+        let client_key = aether::wg::generate_keypair().unwrap();
+        let gateway_key = aether::wg::generate_keypair().unwrap();
+        render(Profile {
+            name: "portable",
+            endpoint: "vpn.example.net:51820",
+            private_key: Some(client_key.private_key.expose()),
+            peer_public_key: &gateway_key.public_key,
+            address: "100.64.1.2/32",
+            address_v6,
+            allowed_ips: None,
+            ssh_target: None,
+            heliosd_url: heliosd_url("100.64.0.1/10"),
+            key_negotiation: None,
+            key_negotiation_identity: None,
+        })
+        .expect("document read back by Orion")
+    }
+
+    /// A peer without IPv6 gets a document without the key — not an empty
+    /// one, not a `null`: an Orion older than the field refuses either, and
+    /// the profile of a gateway without IPv6 must stay readable by all
+    /// (`ADRESSAGE-IPV6.md` §7.2, §8).
+    #[test]
+    fn a_peer_without_ipv6_gets_no_address_v6_key() {
+        let json = document(None);
+        assert!(!json.contains("address_v6"), "{json}");
+        let imported = orion_core::parse_profile_import(&json, "portable.json").unwrap();
+        assert_eq!(imported.profile.address_v6, None);
+    }
+
+    #[test]
+    fn a_peer_with_ipv6_gets_both_addresses() {
+        let json = document(Some("fd3c:91a2:7e04::2/128"));
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["profile"]["address_v6"], "fd3c:91a2:7e04::2/128");
+        let imported = orion_core::parse_profile_import(&json, "portable.json").unwrap();
+        assert_eq!(imported.profile.address.as_deref(), Some("100.64.1.2/32"));
+        assert_eq!(
+            imported.profile.address_v6.as_deref(),
+            Some("fd3c:91a2:7e04::2/128")
+        );
+    }
+
+    fn view(peers: serde_json::Value) -> api::NetworkConfigView {
+        serde_json::from_value(serde_json::json!({
+            "wan_ifaces": ["eth0"],
+            "lan_ifaces": [],
+            "allow_ssh_from": [],
+            "admin_iface": "helios0",
+            "wg_iface": "helios0",
+            "wg_private_key_configured": true,
+            "wg_public_key": "gateway-public",
+            "wg_address": "100.64.0.1/10",
+            "wg_listen_port": 51820,
+            "key_negotiation_port": 51821,
+            "peers": peers,
+        }))
+        .unwrap()
+    }
+
+    fn peer(address_v6: serde_json::Value) -> serde_json::Value {
+        let mut peer = serde_json::json!({
+            "name": "portable",
+            "public_key": "client-public",
+            "address": "100.64.1.2/32",
+            "preshared_key_configured": false,
+            "key_negotiation_certificate_sha256": null,
+            "key_negotiation_pq_certificate_sha256": null,
+            "minimum_key_negotiation_mode": "ml_kem",
+            "admin": false
+        });
+        if !address_v6.is_null() {
+            peer["address_v6"] = address_v6;
+        }
+        peer
+    }
+
+    #[test]
+    fn the_ipv6_vip_is_read_from_the_record_of_the_admitted_peer() {
+        let read =
+            |peers| admitted_address_v6(&view(peers), "portable", "client-public", "100.64.1.2/32");
+        assert_eq!(
+            read(serde_json::json!([peer("fd3c:91a2:7e04::2/128".into())])).unwrap(),
+            Some("fd3c:91a2:7e04::2/128".into())
+        );
+        // A gateway without IPv6, or older than the field, and an explicit
+        // `null`: no address, so no key.
+        assert_eq!(
+            read(serde_json::json!([peer(serde_json::Value::Null)])).unwrap(),
+            None
+        );
+        let mut explicit_null = peer(serde_json::Value::Null);
+        explicit_null["address_v6"] = serde_json::Value::Null;
+        assert_eq!(read(serde_json::json!([explicit_null])).unwrap(), None);
+        // Never written empty.
+        assert_eq!(read(serde_json::json!([peer("  ".into())])).unwrap(), None);
+    }
+
+    #[test]
+    fn a_view_that_disagrees_with_the_admission_is_refused() {
+        let mut moved = peer("fd3c:91a2:7e04::2/128".into());
+        moved["address"] = "100.64.1.9/32".into();
+        let error = admitted_address_v6(
+            &view(serde_json::json!([moved])),
+            "portable",
+            "client-public",
+            "100.64.1.2/32",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("100.64.1.9/32"), "{error}");
+
+        let mut other_key = peer(serde_json::Value::Null);
+        other_key["public_key"] = "someone-else".into();
+        assert!(admitted_address_v6(
+            &view(serde_json::json!([other_key])),
+            "portable",
+            "client-public",
+            "100.64.1.2/32"
+        )
+        .is_err());
+    }
+
+    /// The old full tunnel is not called a full tunnel any more.
+    ///
+    /// `0.0.0.0/0` alone leaves IPv6 outside: labelled « tunnel complet », a
+    /// client leaking all of its IPv6 would read as protected to the operator
+    /// checking its document. A narrowed list keeps its own label.
+    #[test]
+    fn the_capture_label_names_an_ipv4_only_full_tunnel() {
+        assert_eq!(
+            capture_label("0.0.0.0/0"),
+            "(tunnel complet IPv4 seulement — le trafic IPv6 sort en clair)"
+        );
+        assert_eq!(capture_label("0.0.0.0/0, ::/0"), "(tunnel complet)");
+        // Order is not a decision: the same two prefixes are the same tunnel.
+        assert_eq!(capture_label("::/0, 0.0.0.0/0"), "(tunnel complet)");
+        assert_eq!(
+            capture_label("100.64.0.0/10, 192.168.1.0/24"),
+            "(tunnel fractionné — le reste sort en clair)"
+        );
+        assert_eq!(
+            capture_label("::/0"),
+            "(tunnel fractionné — le reste sort en clair)"
         );
     }
 }

@@ -29,6 +29,7 @@ pub mod certificate_recovery;
 pub mod certificate_renewal;
 pub mod certificates;
 pub mod config;
+pub mod endpoint_resolution;
 pub mod events;
 pub mod identity_store;
 pub mod key_negotiation;
@@ -51,7 +52,7 @@ pub use config::{
     verify_pinned_gateway_certificate, ClientConfig, ClientProfile, KeyNegotiationSettings,
     ProfileKind, TrustMaterial, DEFAULT_ALLOWED_IPS, DEFAULT_KEEPALIVE_SECS,
 };
-pub use events::{ClientEvent, PskKind};
+pub use events::{CaptureCheck, ClientEvent, PskKind};
 pub use identity_store::{
     ClientIdentityBundle, IdentityStoreError, PreviousIdentityPhase, PreviousIdentityStatus,
     ProtectedIdentityStore,

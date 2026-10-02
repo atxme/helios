@@ -31,7 +31,25 @@ backend n’ajoute aucune règle absente de l’IR.
 Les nouveaux concepts structurés sont :
 
 - `ConnectionState` et `ConnectionStates`, sans ensemble vide ou bit inconnu ;
-- `AddressFamily`, utilisé pour distinguer ICMPv4 et ICMPv6 ;
+- `AddressFamily`, utilisé pour distinguer ICMPv4 et ICMPv6, et par
+  `Match::Family`, garde `meta nfproto` d’une règle qui ne nomme aucune
+  adresse ;
+- `Icmpv6Type`, énumération fermée des messages ICMPv6 que Helios ouvre (ND,
+  découverte de routeur, MLD), portée par `Match::Icmpv6Type` : un type absent
+  de l’énumération, Redirect (137) en tête, n’est pas représentable ;
+- `Match::Ipv6HopLimit`, dont la garde `meta nfproto ipv6` fait partie de la
+  traduction : une lecture du hop limit sans garde n’est pas représentable ;
+- `MasqueradeRule`, dérivée de `Ruleset::masquerade_out` par
+  `Ruleset::masquerade_rules` : seule source des règles NAT, traduite par le
+  backend et affichée par le dry-run, l’API et les golden tests ;
+- `Verdict`, énumération fermée des verdicts terminaux d’une règle :
+  `Accept`, `Drop` et `RejectAdminProhibited`
+  (`reject with icmpx admin-prohibited`). Un rejet est une variante nommée,
+  jamais un `reject` dont l’appelant choisirait le type et le code ; un autre
+  rejet serait une nouvelle variante, revue comme telle ;
+- `DefaultVerdict` (`Accept` ou `Drop`), politique des chaînes accrochées,
+  distincte de `Verdict` : nftables n’accepte que ces deux politiques, donc une
+  politique de rejet n’est pas représentable ;
 - `Action`, distinct du `Verdict`, avec compteur, log et limite de débit ;
 - `RateLimit`, dont débit et burst sont nécessairement non nuls ;
 - `Counter::Anonymous` et `Counter::Named`, sans conversion silencieuse entre
@@ -43,26 +61,26 @@ Les nouveaux concepts structurés sont :
 
 | Champ `FirewallPolicy` | Compilation | IR | Traduction Netlink |
 | --- | --- | --- | --- |
-| `wan_ifaces` | `transport`, `gateway_wan`, `meshnet`, `kill_switch` | `InIface` / `OutIface` | `Meta(IifName/OifName)` + `Cmp` |
-| `lan_ifaces` | `kill_switch`, `meshnet` | `InIface` / `OutIface` | `Meta` + `Cmp` |
+| `wan_ifaces` | `transport`, `gateway_wan`, `link_ipv6`, `meshnet`, `kill_switch` | `InIface` / `OutIface` | `Meta(IifName/OifName)` + `Cmp` |
+| `lan_ifaces` | `link_ipv6`, `kill_switch`, `meshnet` | `InIface` / `OutIface` | `Meta` + `Cmp` |
 | `wg_peers` | `transport::site_to_site_peers` | `DestNet`, UDP dport | famille réseau + `Payload` + `Cmp` |
 | `wg_listen_port` | `transport::wireguard_listener` | interface, UDP dport/sport | `Meta`, `Payload`, `Cmp` |
 | `key_negotiation_port` | `transport::key_negotiation_listener` | interface, UDP dport/sport | `Meta`, `Payload`, `Cmp` |
-| `mode` | `render` | `Ruleset::default_verdict` | `ChainPolicy` des trois chaînes |
+| `mode` | `render` | `Ruleset::default_verdict` (`DefaultVerdict`) | `ChainPolicy` des trois chaînes |
 | `allow_ssh_from` | `administration::ssh_sources` | `SourceNet`, TCP dport 22 | famille réseau + `Payload` + `Cmp` |
 | `admin_ifaces` | `administration::out_of_band_admin_ifaces` | `InIface`, TCP dport 22 | `Meta`, `Payload`, `Cmp` |
-| `allow_dhcp_on_wan` | `gateway_wan::dhcp_lease_renewal` | interface, UDP 67/68 | `Meta`, `Payload`, `Cmp` |
-| `allow_client_internet` | `kill_switch::state_gated_openings` | forward WG → WAN + `masquerade_out` | règle filter + chaîne NAT/`Masquerade` |
+| `allow_dhcp_on_wan` | `gateway_wan::dhcp_lease_renewal` | DHCPv4 : interface, UDP 67/68, sans famille ; DHCPv6 : interface, `Family(Ipv6)`, UDP 547 en sortie et 546 en entrée | `Meta`, `Payload`, `Cmp` ; pour DHCPv6, `Meta(NfProto)` + `Cmp` 10 avant le port |
+| `allow_client_internet` | `kill_switch::state_gated_openings` | forward `Family(Ipv4)` WG → WAN + `masquerade_out`, rendu en `MasqueradeRule` `Family(Ipv4)` + `OutIface` | `Meta(NfProto)` + `Cmp` 2 en tête de la règle filter et de la règle NAT, puis `Masquerade` |
 | `allow_tunnel_icmp` | `tunnel_interface::openings` | deux `Icmp(AddressFamily)` | `Meta(L4Proto)` + `Cmp` 1 ou 58 |
 | `allow_gateway_egress` | `gateway_wan::gateway_own_egress` | ports DNS/NTP/HTTP(S) sur WAN | `Meta`, `Payload`, `Cmp` |
 | `allow_ssh_over_tunnel` | `tunnel_interface::openings` | interface WG, TCP dport 22 | `Meta`, `Payload`, `Cmp` |
 | `iperf_port` | `tunnel_interface::openings` | TCP/UDP input et output | `Meta`, `Payload`, `Cmp` |
-| `wg_iface` | plusieurs modules | `InIface` / `OutIface` | `Meta` + `Cmp` |
+| `wg_iface` | plusieurs modules, dont `client_ipv6_egress::reject` | `InIface` / `OutIface` ; pour le rejet IPv6, `Family(Ipv6)` + `InIface` + `OutIface` par uplink, `Verdict::RejectAdminProhibited` | `Meta` + `Cmp` ; pour le rejet, `Meta(NfProto)` + `Cmp` 10, interfaces, puis `Reject` |
 | `admin_port`, `admin_iface` | `administration::admin_api` | accept borné puis drop générique | règles ordonnées dans `input` |
-| `split_tunnel_cidrs` | `kill_switch::state_gated_openings` | `DestNet` | famille réseau + masque + `Cmp` |
+| `split_tunnel_cidrs` | `kill_switch::state_gated_openings` | `InIface(lan)` + `DestNet`, une règle par interface LAN et par CIDR ; aucune sans `lan_ifaces` | `Meta` + `Cmp`, puis famille réseau + masque + `Cmp` |
 | `mss_clamp` | policy runtime, acceptée seulement si le backend l’annonce | `Ruleset::mss_clamp` si trafic autorisé | capacité non annoncée par Netlink ; refus défensif avant envoi |
-| `captive_portal_gateway` | `kill_switch::state_gated_openings` | WAN, destination, TCP 80/443 | `Meta`, famille réseau, `Payload`, `Cmp` |
-| `nordvpn_meshnet` | `meshnet::nordvpn_meshnet` | marque, interface, pairs, ports, ICMPv4 | `Meta`, famille réseau, `Payload`, `Cmp` |
+| `captive_portal_gateway` | `kill_switch::state_gated_openings` | `output` : `OutIface(wan)`, `DestNet` si la passerelle est connue, TCP 80/443, une règle par WAN ; `forward` : `InIface(lan)` + `OutIface(wan)` puis la même suite, une règle par interface LAN et par WAN ; aucune en `forward` sans `lan_ifaces` | `Meta`, famille réseau, `Payload`, `Cmp` |
+| `nordvpn_meshnet` | `meshnet::nordvpn_meshnet` | marque, interface, pairs, ports ; `Icmp` et drops des réseaux locaux de la famille du pair (`PRIVATE_IPV4_CIDRS` ou `PRIVATE_IPV6_CIDRS`) avant ses accepts | `Meta`, famille réseau, `Payload`, `Cmp` |
 
 Les invariants sans champ de configuration sont compilés directement :
 
@@ -72,7 +90,11 @@ Les invariants sans champ de configuration sont compilés directement :
 | retour de flux | `ESTABLISHED_RELATED`, accept | même triplet conntrack avec masque `0b110` |
 | loopback | interface `lo`, accept | `Meta` + `Cmp` + verdict accept |
 | canal Astra | tuples interface/source/destination/port fixes | expressions ordinaires de l’IR |
-| NAT client | une interface par uplink, uniquement tunnel autorisé | chaîne `postrouting` dans le même `Batch` |
+| ND IPv6, tous états | `link_ipv6::link_control` : sur chaque WAN et LAN, `input` et `output`, `Icmpv6Type` NS (135) / NA (136) + `Ipv6HopLimit(255)`, accept | `Meta(L4Proto)` + `Cmp` 58, `Payload` transport 0/1 + `Cmp` type, `Meta(NfProto)` + `Cmp` 10, `Payload` réseau 7/1 + `Cmp` 255 |
+| découverte de routeur, tous états | sur chaque WAN seulement : RS (133) en `output`, RA (134) en `input`, `Ipv6HopLimit(255)` ; aucune sur un WAN qui tient aussi un autre rôle | mêmes expressions que ND |
+| MLD, tous états | sur chaque WAN et LAN, `input` et `output`, `Family(Ipv6)` + `Icmpv6Type` 130, 131, 132, 143 | `Meta(NfProto)` + `Cmp` 10, `Meta(L4Proto)` + `Cmp` 58, `Payload` transport 0/1 + `Cmp` type |
+| NAT client | une interface par uplink, garde `meta nfproto ipv4`, uniquement tunnel autorisé | chaîne `postrouting` dans le même `Batch` |
+| rejet de la sortie IPv6 des clients, tous états | `client_ipv6_egress::reject` : dernières règles de `forward`, une par uplink, `Family(Ipv6)` + `InIface(wg_iface)` + `OutIface(wan)`, `RejectAdminProhibited` ; aucune sans `wg_iface` | `Meta(NfProto)` + `Cmp` 10, `Meta(IifName)` + `Cmp`, `Meta(OifName)` + `Cmp`, puis `Reject` type `NFT_REJECT_ICMPX_UNREACH` (2), code `NFT_REJECT_ICMPX_ADMIN_PROHIBITED` (3), sans verdict après lui |
 
 ## Ordre des règles conntrack
 
@@ -84,6 +106,262 @@ avant l’acceptation générale `established,related`, afin qu’une connexion 
 établie depuis une mauvaise interface continue d’être refusée. Les golden tests
 verrouillent cet ordre complet.
 
+## Aucun relais IPv6 des clients du tunnel
+
+La table est de famille `inet` : une règle qui ne nomme aucune adresse
+s’applique à IPv4 et à IPv6. Deux règles de la sortie Internet des clients
+(`allow_client_internet`) sont dans ce cas et portent donc la garde
+`meta nfproto ipv4` (`ADRESSAGE-IPV6.md` §6.4) :
+
+- le `forward` de `wg_iface` vers chaque WAN, sans quoi l’activation de
+  `net.ipv6.conf.all.forwarding` relaierait l’IPv6 d’un client ;
+- le masquerade de `postrouting`, sans quoi le premier paquet IPv6 relayé serait
+  NAT66-é.
+
+Les uplinks masqués et les états où le NAT existe sont inchangés. La garde du
+masquerade n’est pas une donnée de `Ruleset::masquerade_out`, qui ne liste que
+des uplinks : `Ruleset::masquerade_rules` l’ajoute, et un masquerade sans garde
+ou IPv6 n’est pas représentable. Pour un pair sans VIP IPv6, ses `AllowedIPs`
+IPv4 `/32` tiennent déjà l’IPv6 hors de `helios0` ; pour un pair qui en porte
+une (`ADRESSAGE-IPV6.md`), la garde et le rejet ci-dessous sont ce qui empêche
+son IPv6 de sortir.
+
+Reste hors de ce lot et agnostique à la famille : le `forward` LAN → WAN
+site-to-site. Les contournements `split_tunnel_cidrs` et les règles Meshnet
+nomment une adresse et reçoivent déjà la garde de sa famille ; les
+contournements et l’ouverture relayée du portail captif ne s’appliquent en
+outre qu’au trafic entrant par une interface LAN (section suivante). La
+restriction du masquerade à `iifname wg_iface` reste une décision ouverte.
+
+### Rejet explicite de la sortie IPv6 des clients
+
+Sans règle dédiée, l’IPv6 qu’un client envoie vers Internet entre dans le
+tunnel (Orion capture `::/0`), ne correspond à aucune ouverture de `forward` et
+tombe sous la politique `drop`. Rien ne fuit, mais une application qui tente
+l’IPv6 en premier attend son propre délai avant de passer à l’IPv4. La V1 de
+[SORTIE-IPV6.md](../specification/SORTIE-IPV6.md) (§3.1) remplace ce silence
+par une réponse : le module `ruleset/client_ipv6_egress.rs` rend, pour chaque
+uplink,
+
+```text
+meta nfproto ipv6 iifname "<wg_iface>" oifname "<wan>" reject with icmpx admin-prohibited
+```
+
+- **Tous les états**, sans drapeau : hors `Up`, la politique `drop`
+  suffirait, mais le rejet garde le repli rapide pendant `Connecting` ; en
+  `fail-open`, dont la politique devient `accept` hors tunnel, c’est lui qui
+  empêche tout relais de l’IPv6 des clients.
+- **Dernières règles de `forward`** : après `ct state invalid drop` et
+  `ct state established,related accept` en tête de chaîne, après toutes les
+  ouvertures, avant la politique. Placé avant l’acceptation `established`, il
+  couperait le retour d’un flux ; avant une ouverture, il la masquerait.
+- **Il n’ouvre rien** : `Verdict::RejectAdminProhibited` refuse exactement ce
+  que la politique aurait jeté. Le noyau envoie l’ICMPv6 type 1 code 1
+  (« administratively prohibited ») puis jette le paquet ; la traduction
+  Netlink n’ajoute aucun verdict après l’expression `reject`.
+- **Rien sans `wg_iface`** : sans interface de tunnel, il n’y a pas de client
+  et rien à quoi borner la règle ; une variante sans `iifname` rejetterait
+  l’IPv6 du LAN.
+- **L’IPv6 vers la gateway elle-même** (`<préfixe>::1`) passe par `input` et
+  reste régi par `allow_tunnel_icmp` et les autres ouvertures du tunnel.
+- **Pas de limite de débit dans le ruleset** : `rustables 0.8.7` n’encode pas
+  `limit`. Le noyau borne l’émission par `net.ipv6.icmp.ratelimit`, et le seul
+  destinataire est le pair lui-même, à travers son tunnel authentifié
+  (SORTIE-IPV6 §4.2).
+
+`icmpx` est le rejet indépendant de la famille d’une table `inet` ; avec la
+garde `meta nfproto ipv6`, seule sa forme ICMPv6 peut être émise. Le NAT66
+(SORTIE-IPV6 §3.2) n’est pas implémenté : aucune règle `forward` n’accepte
+l’IPv6 d’un client du tunnel et le masquerade reste `meta nfproto ipv4`.
+
+Les contournements `split_tunnel_cidrs` ne s’appliquent qu’au trafic qui
+entre par une interface LAN, dans les deux familles (décision de l’opérateur).
+En `Up`, pour chaque interface de `lan_ifaces` puis, pour chacune, chaque CIDR
+dans l’ordre de la politique, le rendu est
+
+```text
+forward iifname "<lan>" ip daddr <cidr> accept
+forward iifname "<lan>" ip6 daddr <cidr> accept
+```
+
+dans `forward`, juste avant le `forward` LAN → WAN.
+Ni l’IPv6 d’un client du tunnel ni un paquet entrant par un WAN ne peuvent
+donc atteindre ces règles : l’IPv6 d’un client du tunnel atteint le rejet, un
+CIDR IPv4 n’ouvre pas ces destinations aux clients du tunnel, et une nouvelle
+connexion venue d’Internet vers un préfixe IPv6 global du LAN n’est pas
+acceptée. Sans interface LAN, aucun contournement n’est rendu, quel que soit
+`wg_iface` (fermeture par défaut) ; les CIDR sont malgré tout analysés, si bien
+qu’un CIDR invalide reste refusé par `check_policy`. L’IR n’a pas de
+correspondance niée : la portée s’exprime avec `Match::InIface`.
+
+L’ouverture relayée du portail captif suit la même portée (décision de
+l’opérateur). En `CaptivePortal`, la gateway elle-même garde une règle par
+WAN en `output` ; en `forward`, pour chaque interface de `lan_ifaces` puis,
+pour chacune, chaque WAN dans l’ordre de la politique, le rendu est
+
+```text
+forward iifname "<lan>" oifname "<wan>" ip daddr <passerelle> tcp dport { 80, 443 } accept
+forward iifname "<lan>" oifname "<wan>" tcp dport { 80, 443 } accept
+```
+
+la seconde forme quand la passerelle du portail n’est pas connue. Bornée au
+seul WAN, cette règle relaierait en clair le HTTP/HTTPS des clients du tunnel
+vers le WAN, hors de toute décision `allow_client_internet`, et, sans
+passerelle connue, leur IPv6 avec lui, avant le rejet de
+`client_ipv6_egress`. Sans interface LAN, aucune ouverture n’est rendue en
+`forward` (fermeture par défaut) ; les règles `output` sont inchangées et
+l’adresse de la passerelle est malgré tout analysée, si bien qu’une adresse
+invalide reste refusée par `check_policy`.
+
+### Ce que les tests verrouillent
+
+`ruleset/tests/ipv6_relay.rs` verrouille l’invariant pour chaque `TunnelState`,
+sous les deux `mode`, `allow_client_internet` actif ou non, avec une passerelle
+de portail captif connue puis inconnue, sur deux uplinks :
+toute règle `forward` acceptant de `wg_iface` vers un WAN porte `Family(Ipv4)` ;
+chaque uplink reçoit exactement la règle de rejet, dans l’ordre des uplinks ;
+ces rejets sont les dernières règles de `forward`, après l’acceptation
+`established,related` ; chaque masquerade commence par la garde IPv4 ; toute
+règle `forward` qui sélectionne l’IPv6 (`Family(Ipv6)`, `Icmpv6Type`,
+`Ipv6HopLimit` ou une adresse IPv6) est un rejet ou, en `Up` seulement, le
+contournement IPv6 `iifname "<lan>"`, et aucun masquerade ne la
+sélectionne ; aucune règle `accept` de `forward` qu’un paquet entrant par
+`wg_iface` ou par un WAN peut atteindre n’accepte l’IPv6, hormis le retour de flux
+`ct state established,related` — les balayages portent un CIDR de
+split-tunnel IPv4 et un IPv6 ; aucune ouverture HTTP/HTTPS du portail captif
+en `forward` ne peut être atteinte par un paquet entrant par `wg_iface` ou par
+un WAN, quelle que soit sa famille, et chacune commence par
+`iifname "<lan>"` ; hors de ces rejets et de ce contournement, les seules règles qui
+sélectionnent l’IPv6 sont le contrôle des liens de la gateway, en `input` et
+`output` sur ses interfaces WAN et LAN (section suivante) ; aucun rejet n’existe
+sans `wg_iface`, ni en `input` ou `output`. Le test sur `forward` doit échouer
+le jour où un relais IPv6, NAT66 compris, sera ouvert. Les golden tests montrent
+le rejet en fin de `forward` dans chaque cas qui a une interface de tunnel.
+Côté backend, un test compare les octets exacts de l’expression `reject` dans un
+`Batch` finalisé (`NFTA_REJECT_TYPE` 2, `NFTA_REJECT_ICMP_CODE` 3, aucun autre
+élément de liste), et un autre la séquence complète de la règle sur chaque
+uplink : `Meta(NfProto)` + `Cmp` 10, interfaces, `Reject`. Le golden
+`UP_EVERY_CAPABILITY_OPEN` montre les deux gardes IPv4 et les tests du backend
+vérifient la paire `Meta(NfProto)` + `Cmp` 2 avant l’interface et le
+`Masquerade`. `ruleset/tests/access.rs` vérifie qu’aucun contournement
+n’est rendu sans interface LAN, qu’il y en a un par interface LAN et par CIDR
+dans l’ordre de la politique, qu’aucun ne peut être atteint par un paquet
+entrant par un WAN ou par `wg_iface`, et qu’un CIDR invalide est refusé par
+`check_policy` même sans interface LAN. Pour le portail captif, il vérifie
+qu’aucune ouverture n’est rendue en `forward` sans interface LAN alors que
+celles d’`output` restent présentes, qu’il y en a une par interface LAN et par
+WAN dans l’ordre de la politique, et qu’une adresse de passerelle invalide est
+refusée même sans interface LAN. Les golden tests du portail captif, passerelle
+connue et inconnue, montrent la règle `forward` bornée à `iifname "eth1"`.
+
+### Réseaux locaux Meshnet par famille
+
+Un pair Meshnet routant sans la permission « réseau local » reçoit, avant ses
+accepts, un `drop` vers chaque réseau local **de sa propre famille** :
+`PRIVATE_IPV4_CIDRS` (`10.0.0.0/8`, `169.254.0.0/16`, `172.16.0.0/12`,
+`192.168.0.0/16`) pour un pair IPv4, `PRIVATE_IPV6_CIDRS` (`fc00::/7`,
+`fe80::/10`) pour un pair IPv6. Un drop qui associerait une source IPv6 à une
+destination IPv4 ne correspondrait à aucun paquet, et l’accept suivant ouvrirait
+les réseaux locaux IPv6. L’ouverture ICMP suit de même la famille du pair
+(`Icmp(Ipv4)` ou `Icmp(Ipv6)`). Le rendu IPv4 est inchangé, golden compris.
+
+Ce chemin IPv6 n’est atteignable qu’en construisant la `FirewallPolicy` dans le
+code : `aether` refuse toujours un CIDR Meshnet IPv6 (`valid_ipv4_cidr`), car
+NordVPN attribue des adresses Meshnet IPv4. `ruleset/tests/meshnet_ipv6.rs`
+couvre ces politiques hors du balayage de `ipv6_relay.rs`, qui porte sur ce
+qu’une configuration validée produit ; le test Netlink correspondant vérifie la
+traduction IPv6 des deux adresses, chacune derrière `meta nfproto ipv6`.
+
+Limite connue : la liste IPv6 ne contient que les portées ULA et lien-local.
+Un préfixe global sur le lien du WAN n’en fait pas partie, alors que son
+équivalent IPv4 est le plus souvent RFC 1918 et donc refusé. Accepter des pairs
+Meshnet IPv6 dans la configuration demande de trancher ce point et un essai sur
+cible d’un pair routant en IPv6.
+
+## Contrôle IPv6 des liens : ND, RA, MLD, DHCPv6
+
+### Pourquoi ND exige des règles et ARP non
+
+La table `inet` et la policy `drop` de ses chaînes s’appliquent à l’IPv6. En
+IPv4, la résolution de voisins passe par ARP, qui n’est pas un paquet IP : une
+table `inet` ne le voit pas, et la policy ne le bloque jamais. C’est pourquoi
+l’IPv4 du WAN fonctionne sans règle dédiée. En IPv6, la résolution de voisins
+(Neighbor Solicitation / Advertisement), la découverte de routeur (Router
+Solicitation / Advertisement) et MLD sont des messages ICMPv6 : ils traversent
+les chaînes filtrées. Conntrack ne les sauve pas : il les classe `untracked`,
+ni `invalid` ni `established,related` (comportement noyau, à vérifier sur
+cible). Sans règle explicite, un WAN qui obtient son IPv6 par SLAAC perd la
+résolution de voisins, puis sa route par défaut IPv6 à l’expiration de la durée
+de vie du dernier RA accepté.
+
+### Ce qui est ouvert
+
+Le module `ruleset/link_ipv6.rs` rend ces règles dans **tous** les
+`TunnelState` et quel que soit `mode` : elles relèvent du fonctionnement du
+lien, ne relaient rien, et doivent survivre au kill-switch comme le
+renouvellement DHCPv4. Elles sont placées après les ouvertures de la gateway
+sur le WAN, donc après `ct state invalid drop` en tête de chaîne, et ne sont
+portées par aucun drapeau : sur une interface sans IPv6, elles ne
+correspondent à rien.
+
+| Messages | Chaînes | Interfaces | Garde réseau |
+| --- | --- | --- | --- |
+| NS (135), NA (136) | `input`, `output` | chaque WAN et chaque LAN | `ip6 hoplimit 255` |
+| RS (133) | `output` | chaque WAN | `ip6 hoplimit 255` |
+| RA (134) | `input` | chaque WAN | `ip6 hoplimit 255` |
+| MLD query (130), report (131), done (132), MLDv2 report (143) | `input`, `output` | chaque WAN et chaque LAN | `meta nfproto ipv6` |
+| DHCPv6 client, UDP 547 sortant / 546 entrant | `output` / `input` | chaque WAN, derrière `allow_dhcp_on_wan` | `meta nfproto ipv6` |
+
+- **Portée par interface, jamais par adresse** : ND et MLD utilisent des
+  sources link-local et des destinations multicast de portée lien, qui
+  n’appartiennent à aucun réseau configuré.
+- **Hop limit 255** : la RFC 4861 impose qu’un message ND arrive avec un hop
+  limit de 255 et qu’un récepteur rejette tout autre. Un routeur décrémente ce
+  champ ; 255 prouve donc que le paquet a été émis sur le lien, ce qui rend ND
+  et la découverte de routeur infalsifiables depuis l’extérieur du lien. La
+  règle l’exige aussi, pour ne rien accepter de plus large que ce qu’une pile
+  conforme traiterait. La traduction Netlink place la garde
+  `meta nfproto ipv6` devant la lecture du champ : dans une table `inet`, le
+  même octet d’un en-tête IPv4 n’est pas un hop limit.
+- **MLD** est émis avec un hop limit de 1 (RFC 2710, RFC 3810) et n’est pas
+  comparé à 255 ; ses règles portent une garde `meta nfproto ipv6` explicite,
+  puisque rien d’autre n’y fixe la famille réseau.
+- **RA sur les WAN seulement** : la gateway est un hôte sur son uplink et un
+  routeur partout ailleurs. Un RA accepté depuis `wg_iface`, un LAN,
+  `admin_ifaces` ou l’interface Meshnet serait un RA rogue capable de lui
+  imposer une route par défaut. Un WAN déclaré aussi dans l’un de ces rôles ne
+  reçoit ni RS ni RA.
+- **Aucune règle sur les overlays** (`wg_iface`, `admin_ifaces`, Meshnet) : ce
+  sont des tunnels de niveau 3 sans adresse de lien, sur lesquels le noyau ne
+  résout pas de voisins.
+- **Aucune règle `forward`** : le trafic link-local n’est jamais routé, et la
+  gateway ne relaie pas d’IPv6 (`ADRESSAGE-IPV6.md` §6.4).
+- **DHCPv6** suit `allow_dhcp_on_wan` : le drapeau répond à « l’adresse du WAN
+  vient-elle d’un bail ? », question indépendante de la famille. La paire
+  DHCPv4 67/68 existante n’est pas modifiée et reste sans garde de famille.
+
+### Ce qui reste fermé
+
+- **Redirect (137)** n’est pas représentable dans `Icmpv6Type` : il tombe sur
+  la policy `drop`.
+- **Echo request / reply** sur le WAN, comme en IPv4.
+- **Erreurs ICMPv6** (Destination Unreachable 1, Packet Too Big 2, Time
+  Exceeded 3, Parameter Problem 4) : aucune ouverture inconditionnelle. Liées à
+  un flux suivi, elles sont `related` et déjà acceptées par
+  `ct state established,related`, Packet Too Big compris.
+
+**Limitation connue, à vérifier sur cible** : un Packet Too Big qui concerne un
+flux d’encapsulation que conntrack ne suit pas, ou plus (entrée UDP du
+transport WireGuard expirée), n’est pas `related` et tombe sur la policy
+`drop` ; la découverte de MTU de ce transport en IPv6 serait alors un trou
+noir. Ce qui la lève : observer le cas sur une gateway à WAN IPv6, puis
+décider une acceptation du type 2 scopée par interface (`ETUDE-IPV6.md` §9.1).
+
+`ruleset/tests/link_ipv6.rs` balaie les deux `mode` et chaque `TunnelState`
+sur deux uplinks, un LAN, le tunnel, un overlay d’administration et Meshnet ;
+les golden tests montrent l’ordre complet et les tests du backend vérifient la
+séquence exacte des expressions d’une règle NS.
+
 ## Capacités
 
 | Capacité | État | Détail |
@@ -94,12 +372,16 @@ verrouillent cet ordre complet.
 | compteurs inline | **SUPPORTED** | appliqués sur les drops invalides |
 | compteurs nommés | **BLOCKED BY BACKEND** | identité conservée dans l’IR ; pas d’objet compteur ni `objref` dans `rustables` |
 | ICMPv4 | **SUPPORTED** | famille explicite, règle tunnel et Meshnet, protocole Netlink 1 |
-| ICMPv6 | **SUPPORTED** | famille explicite, règle tunnel, protocole Netlink 58 ; pas d’IPAM IPv6 ajouté |
-| types ICMP | **PARTIAL** | protocole seulement ; pas encore de primitive de type commune aux deux familles |
+| ICMPv6 | **SUPPORTED** | famille explicite, règle tunnel et Meshnet (pair IPv6, politique construite dans le code), protocole Netlink 58 ; pas d’IPAM IPv6 ajouté |
+| types ICMPv6 | **SUPPORTED** | `Match::Icmpv6Type`, énumération fermée (ND, RS/RA, MLD) ; `Meta(L4Proto)` + `Cmp` 58, `Payload` transport offset 0 longueur 1 + `Cmp` |
+| types ICMPv4 | **PARTIAL** | protocole seulement ; l’API haut niveau de `rustables` n’expose pas l’octet de type ICMPv4 et aucun encodeur vérifié n’existe |
+| hop limit IPv6 | **SUPPORTED** | `Match::Ipv6HopLimit`, garde `Meta(NfProto)` + `Cmp` 10 puis `Payload` réseau offset 7 longueur 1 + `Cmp` |
 | adresses IPv4/IPv6 | **SUPPORTED** | `SourceNet`/`DestNet` portent des `IpNetwork` validés ; le backend n’analyse plus de texte |
-| MSS clamp | **BLOCKED BY BACKEND** | `exthdr`/écriture d’option TCP absents ; Netlink n’annonce pas la capacité, donc la sonde conserve la mesure mais ne modifie pas la policy ; une IR construite directement avec un clamp reste refusée avant envoi |
+| MSS clamp | **BLOCKED BY BACKEND** | `exthdr`/écriture d’option TCP absents ; Netlink n’annonce pas la capacité, donc la sonde conserve la mesure mais ne modifie pas la policy ; une IR construite directement avec un clamp reste refusée avant envoi. La valeur est le MSS IPv4 du tunnel (`aether::mtu::mss_ipv4`, MTU du tunnel − 40) : l’encodeur qui débloquera le clamp devra la garder par `meta nfproto ipv4`, l’IPv6 recevant `aether::mtu::mss_ipv6` (− 60) sous `meta nfproto ipv6` |
 | anti-spoof `fib` | **BLOCKED BY BACKEND** | expression absente et sémantique de routage à borner avant activation |
-| NAT/masquerade | **SUPPORTED** | comportement existant conservé dans la transaction atomique |
+| garde de famille `meta nfproto` | **SUPPORTED** | `Match::Family`, `Meta(NfProto)` + `Cmp` 2 ou 10, la même paire que `rustables` émet devant une adresse |
+| NAT/masquerade | **SUPPORTED** | IPv4 seulement (`meta nfproto ipv4`), aucun NAT66 ; uplinks et conditions d’état inchangés, dans la transaction atomique |
+| rejet `icmpx admin-prohibited` | **SUPPORTED** | `Verdict::RejectAdminProhibited`, seule forme de rejet représentable ; expression `Reject` (`IcmpxUnreach`, `AdminProhibited`) sans verdict après elle, octets vérifiés ; utilisé pour la sortie IPv6 des clients du tunnel |
 | remplacement atomique | **SUPPORTED** | `Add → Del → Add`, chaînes filter et NAT, un seul `Batch::send` |
 
 ## Audit de `rustables 0.8.7`
@@ -107,7 +389,9 @@ verrouillent cet ordre complet.
 La version verrouillée expose les expressions `bitwise`, `cmp`, `ct`, compteur
 inline, `immediate`, log, lookup, masquerade, meta, NAT, payload et reject. Cela
 couvre les règles actuelles, les états conntrack, ICMP par numéro de protocole,
-les compteurs inline et le logging.
+le type ICMPv6 et le hop limit IPv6 (`HighLevelPayload`, champs
+`ICMPv6HeaderField::Type` et `IPv6HeaderField::HopLimit`), les compteurs inline
+et le logging.
 
 Elle ne modélise pas :
 
@@ -196,6 +480,73 @@ sudo nft list chain inet helios postrouting
   lorsque `allow_tunnel_icmp` est actif ;
 - le masquerade n’existe que lorsque le tunnel autorise le trafic client, avec
   une règle par uplink déclaré.
+
+### NAT et sortie client limités à IPv4
+
+Tunnel `Up` et `allow_client_internet` actif :
+
+```bash
+sudo nft list chain inet helios postrouting
+sudo nft list chain inet helios forward
+```
+
+- chaque règle de `postrouting` montre `meta nfproto ipv4 oifname "<wan>"
+  masquerade`, une par uplink ;
+- chaque règle `forward` depuis `helios0` vers un WAN montre `meta nfproto ipv4`
+  avec `iifname "helios0" oifname "<wan>" accept` ;
+- aucune règle `masquerade` ni `forward` acceptant depuis `helios0` n’apparaît
+  sans cette garde ;
+- les dernières règles de `forward`, une par uplink, sont
+  `meta nfproto ipv6 iifname "helios0" oifname "<wan>" reject with icmpx
+  admin-prohibited`, en `Up` comme en `Down` (la procédure complète est dans
+  `docs/testing/MANUAL-TESTING.md`, « Sortie Internet IPv6 refusée »).
+
+L’ordre imprimé par `nft` est à vérifier sur cible : le batch place la garde
+avant les interfaces, et le noyau devrait restituer cet ordre, mais seule une
+lecture réelle le confirme. De même, vérifier que `nft` affiche bien la garde
+seule, sans l’absorber comme dépendance implicite, puisque aucune adresse ne la
+suit. Enfin, le NAT44 doit rester inchangé : depuis un client, `curl -4` vers
+une destination Internet passe par la gateway et sort avec l’adresse de
+l’uplink actif.
+
+### Contrôle IPv6 du WAN (ND, RA, MLD, DHCPv6)
+
+Gateway de laboratoire dont le WAN obtient une adresse IPv6 par SLAAC, policy
+`drop`, tunnel `Down` puis `Up` :
+
+```bash
+sudo nft list chain inet helios input
+sudo nft list chain inet helios output
+sudo nft list chain inet helios forward
+ip -6 addr show dev <wan>
+ip -6 neigh show dev <wan>
+ip -6 route show default
+```
+
+- `input` et `output` montrent, pour chaque WAN et LAN, les règles
+  `icmpv6 type nd-neighbor-solicit` / `nd-neighbor-advert` avec
+  `ip6 hoplimit 255`, et les quatre règles MLD avec `meta nfproto ipv6` ;
+  `nd-router-advert` n’apparaît qu’en `input` sur un WAN, `nd-router-solicit`
+  qu’en `output` sur un WAN ;
+- `forward` ne contient aucune règle `icmpv6` ;
+- `ip -6 neigh` est peuplé (routeur amont au moins `REACHABLE` ou `STALE`) ;
+- la route par défaut IPv6 apparaît `proto ra` et **survit au-delà de la durée
+  de vie du RA** (`router lifetime`, lisible avec `rdisc6 <wan>` ou dans
+  `ip -6 route show default` via `expires`) : la noter, attendre plus que cette
+  durée, vérifier que la route a été rafraîchie et non retirée ;
+- avec `allow_dhcp_on_wan = true` et un serveur DHCPv6 en amont, les règles
+  `meta nfproto ipv6 udp dport 547` (sortie) et `546` (entrée) sont présentes
+  et le bail IPv6 se renouvelle.
+
+À vérifier sur cible, sans conclusion possible depuis WSL :
+
+- l’ordre d’impression par `nft` : le batch place l’ICMPv6 avant la garde du
+  hop limit, et `nft` peut absorber la garde `meta nfproto ipv6` comme
+  dépendance implicite de `ip6 hoplimit` dans son affichage ;
+- la classification `untracked` des messages ND, RS/RA et MLD par conntrack
+  (par exemple avec `conntrack -E` ou une trace `nft monitor trace`) ;
+- le cas Packet Too Big hors flux suivi décrit dans la limitation connue
+  ci-dessus.
 
 ### Compteur invalide
 

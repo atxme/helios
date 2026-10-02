@@ -34,6 +34,7 @@ import { readProfileDocument } from '../profileDocument'
 import { CopyButton } from '../components/CopyButton'
 import { modeAllowed, modeLevel, modeMeta, PROTECTION_MODES } from '../components/state'
 import {
+  leavesIpv6Uncaptured,
   matchPreset,
   presetPrefixes,
   SPLIT_TUNNEL_PRESETS,
@@ -133,7 +134,12 @@ function blankProfile(): ClientProfile {
     has_static_psk: false,
     profile_type: 'classic',
     address: null,
-    allowed_ips: '0.0.0.0/0',
+    // Assigned by a gateway with an IPv6 prefix, and only by one: a new
+    // profile is IPv4-only until a document says otherwise.
+    address_v6: null,
+    // `orion_core::DEFAULT_ALLOWED_IPS`: the «Tout» preset, both families.
+    allowed_ips: '0.0.0.0/0, ::/0',
+    ipv6_uncaptured_full_tunnel: false,
     persistent_keepalive: 25,
     heliosd_url: null,
     ssh_target: null,
@@ -390,6 +396,7 @@ export function ProfilesView({
       endpoint: profile.endpoint,
       peer_public_key: profile.peer_public_key,
       address: profile.address,
+      address_v6: profile.address_v6,
       allowed_ips: profile.allowed_ips,
       persistent_keepalive: profile.persistent_keepalive,
       heliosd_url: profile.heliosd_url,
@@ -975,11 +982,16 @@ export function ProfilesView({
   const detectedPreset = matchPreset(draft.allowed_ips, draft)
   const splitTunnel: SplitTunnelPreset =
     manualPrefixes || detectedPreset === 'custom' ? 'custom' : detectedPreset
+  // The full tunnel as it was before `::/0` joined the default. Judged on the
+  // list being typed, not on the stored one, so the warning follows the edit;
+  // a list the core refuses shows its error instead.
+  const ipv6Uncaptured = !issues.allowed_ips && leavesIpv6Uncaptured(draft.allowed_ips)
   // The "Advanced" collapse must flag what it hides: otherwise a faulty field
   // would stay invisible until someone thinks to open it. A narrowed range is
-  // *not* one of those: split tunnelling is a decision, not a defect.
+  // *not* one of those: split tunnelling is a decision, not a defect. IPv6
+  // leaving in clear is — nobody chose it.
   const advancedFlagged = Boolean(
-    issues.allowed_ips || issues.persistent_keepalive || issues.ssh_target,
+    issues.allowed_ips || issues.persistent_keepalive || issues.ssh_target || ipv6Uncaptured,
   )
 
   /**
@@ -1396,6 +1408,13 @@ export function ProfilesView({
                 onChange={(value) => set('address', value || null)}
               />
               <Field
+                label="Adresse virtuelle IPv6"
+                error={issues.address_v6}
+                placeholder="si la gateway a l’IPv6"
+                value={draft.address_v6 ?? ''}
+                onChange={(value) => set('address_v6', value || null)}
+              />
+              <Field
                 label="Clé publique gateway"
                 error={issues.peer_public_key}
                 value={draft.peer_public_key}
@@ -1510,7 +1529,7 @@ export function ProfilesView({
                   <Field
                     label="Trafic via le tunnel"
                     error={issues.allowed_ips}
-                    placeholder="0.0.0.0/0  ·  100.64.0.1/32, 192.168.1.0/24"
+                    placeholder="0.0.0.0/0, ::/0  ·  100.64.0.1/32, 192.168.1.0/24"
                     value={draft.allowed_ips}
                     inputRef={allowedIpsInput}
                     onChange={(value) => set('allowed_ips', value)}
@@ -1526,6 +1545,14 @@ export function ProfilesView({
                   <Typography color="text.disabled" sx={{ fontSize: 10.5, lineHeight: 1.5 }}>
                     Liste des réseaux qui seront acheminés dans le tunnel.
                   </Typography>
+                )}
+                {/* Warned, never rewritten: widening a routing table is the
+                    user's call, and «Tout» is one click away. */}
+                {ipv6Uncaptured && (
+                  <Caution>
+                    Tunnel complet IPv4 seulement : le trafic IPv6 sort en clair. Choisir « Tout »
+                    pour le capturer aussi.
+                  </Caution>
                 )}
               </Box>
               {/* Two short fields side by side rather than one above the

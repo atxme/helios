@@ -15,6 +15,7 @@ pub(super) async fn handle_external_cmd(
     internal_tx: &mpsc::Sender<OrchestratorCmd>,
     shared_policy: &Arc<RwLock<FirewallPolicy>>,
     boot: &helios_tpm::BootDecision,
+    shared_ipv6: &Arc<RwLock<Ipv6TunnelStatus>>,
 ) -> anyhow::Result<()> {
     match cmd {
         OrchestratorCmd::Connect => {
@@ -25,7 +26,17 @@ pub(super) async fn handle_external_cmd(
                 "Connection requested via the web interface",
             );
             let network = shared_network.read().await;
-            do_connect(&network, wg, shared_state, event_tx, fw, policy, dry_run).await?;
+            do_connect(
+                &network,
+                wg,
+                shared_state,
+                event_tx,
+                fw,
+                policy,
+                dry_run,
+                shared_ipv6,
+            )
+            .await?;
             let wan = network.primary_wan_iface().unwrap_or_default().to_string();
             drop(network);
             spawn_mtu_probe_if_up(&wan, dry_run, shared_state, event_tx, internal_tx).await;
@@ -62,7 +73,17 @@ pub(super) async fn handle_external_cmd(
                         warn!("tearing down before rotation: {e}");
                     }
                     let network = shared_network.read().await;
-                    do_connect(&network, wg, shared_state, event_tx, fw, policy, dry_run).await?;
+                    do_connect(
+                        &network,
+                        wg,
+                        shared_state,
+                        event_tx,
+                        fw,
+                        policy,
+                        dry_run,
+                        shared_ipv6,
+                    )
+                    .await?;
                     drop(network);
                     sync_policy(shared_policy, policy).await;
                 }
@@ -110,7 +131,8 @@ pub(super) async fn handle_external_cmd(
                     &format!("Tearing down the interface: {e}"),
                 );
             }
-            unpin_peer_vips(dry_run).await;
+            let ipv6 = shared_ipv6.read().await.clone();
+            unpin_peer_vips(dry_run, &ipv6).await;
             sync_policy(shared_policy, policy).await;
         }
 
@@ -128,7 +150,17 @@ pub(super) async fn handle_external_cmd(
                 transition(shared_state, event_tx, next, fw, policy).await?;
                 sync_policy(shared_policy, policy).await;
                 let network = shared_network.read().await;
-                do_connect(&network, wg, shared_state, event_tx, fw, policy, dry_run).await?;
+                do_connect(
+                    &network,
+                    wg,
+                    shared_state,
+                    event_tx,
+                    fw,
+                    policy,
+                    dry_run,
+                    shared_ipv6,
+                )
+                .await?;
                 let wan = network.primary_wan_iface().unwrap_or_default().to_string();
                 drop(network);
                 spawn_mtu_probe_if_up(&wan, dry_run, shared_state, event_tx, internal_tx).await;
@@ -137,14 +169,27 @@ pub(super) async fn handle_external_cmd(
         }
 
         OrchestratorCmd::SetSplitTunnel(cidrs) => {
-            info!("split-tunneling updated: {} CIDR(s)", cidrs.len());
-            policy.split_tunnel_cidrs = cidrs.clone();
+            // Refused, not fatal: the list comes from an operator, and a
+            // typo in it must not stop the gateway. The API already refuses
+            // an entry the ruleset compiler would; this checks the whole
+            // policy again, whoever sent the command.
+            let mut candidate = policy.clone();
+            candidate.split_tunnel_cidrs = cidrs.clone();
             let state = *shared_state.read().await;
-            fw.apply(policy, state)
-                .await
-                .context("firewall split-tunnel")?;
-            let _ = event_tx.send(HeliosEvent::SplitTunnelChanged { cidrs });
-            sync_policy(shared_policy, policy).await;
+            match commit_policy(fw, policy, candidate, state).await {
+                Ok(()) => {
+                    info!("split-tunneling updated: {} CIDR(s)", cidrs.len());
+                    let _ = event_tx.send(HeliosEvent::SplitTunnelChanged { cidrs });
+                    sync_policy(shared_policy, policy).await;
+                }
+                Err(error) => emit_log(
+                    event_tx,
+                    "error",
+                    &format!(
+                        "Split-tunneling not applied, the previous list stays in force: {error:#}"
+                    ),
+                ),
+            }
         }
 
         OrchestratorCmd::SetMssClamp(mss) => {
@@ -169,19 +214,49 @@ pub(super) async fn handle_external_cmd(
         }
 
         OrchestratorCmd::LoadNetworkConfig(new_cfg) => {
-            info!("network config reloaded: {} peer(s)", new_cfg.peers.len());
-            *policy = new_cfg.firewall_policy();
-            *shared_network.write().await = *new_cfg;
+            // Both reload paths — the API and the `network.toml` watcher —
+            // converge here, so this is where a value the running data plane
+            // cannot take is refused. The whole configuration is kept, not
+            // only that value: see `NetworkConfig::check_hot_reload`.
+            let reloadable = new_cfg.check_hot_reload(&*shared_network.read().await);
+            if let Err(refusal) = reloadable {
+                // `emit_log` writes the journal line as well as the event.
+                emit_log(
+                    event_tx,
+                    "warn",
+                    &format!("Network configuration not applied: {refusal}"),
+                );
+                return Ok(());
+            }
+            // Same refusal for what only the firewall can judge — an address
+            // in `split_tunnel_cidrs` or `allow_ssh_from`, say. The file or
+            // API body is the operator's, and a typo in it must not stop the
+            // gateway; the configuration in force stays whole, as above.
             let state = *shared_state.read().await;
-            fw.apply(policy, state)
-                .await
-                .context("firewall after config reload")?;
+            if let Err(error) = commit_policy(fw, policy, new_cfg.firewall_policy(), state).await {
+                emit_log(
+                    event_tx,
+                    "error",
+                    &format!(
+                        "Network configuration not applied, the running one stays in force: \
+                         {error:#}"
+                    ),
+                );
+                return Ok(());
+            }
+            info!("network config reloaded: {} peer(s)", new_cfg.peers.len());
+            *shared_network.write().await = *new_cfg;
             sync_policy(shared_policy, policy).await;
 
             // Aligns the data plane with the new peer list (client
             // enrollment, or revocation).
             if wg.is_up() {
-                let (iface, peers) = wg_config(&*shared_network.read().await);
+                let ipv6 = shared_ipv6.read().await.clone();
+                let (iface, peers, prefix) = {
+                    let network = shared_network.read().await;
+                    let (iface, peers) = wg_config(&network, &ipv6);
+                    (iface, peers, installed_prefix(&network, &ipv6))
+                };
                 if let Err(e) = wg.sync_peers(&peers).await {
                     warn!("WireGuard peer synchronization: {e}");
                     emit_log(event_tx, "warn", &format!("Peer synchronization: {e}"));
@@ -191,7 +266,7 @@ pub(super) async fn handle_external_cmd(
                 // client is the only one still leaving through the wrong
                 // tunnel — the hardest case to diagnose, since every other
                 // client works.
-                pin_peer_vips(dry_run, &iface, &peers, event_tx).await;
+                pin_peer_vips(dry_run, &iface, &peers, prefix, event_tx).await;
             }
             emit_log(event_tx, "info", "Network configuration applied");
         }

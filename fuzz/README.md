@@ -24,7 +24,7 @@ part en production. En plaçant les harnais dans `aether` :
   un `[workspace]` vide), donc aucune commande ordinaire du projet n'hérite de
   l'exigence nightly.
 
-## Les quatre cibles
+## Les cibles
 
 | Cible | Ce qu'elle éprouve |
 | --- | --- |
@@ -32,8 +32,9 @@ part en production. En plaçant les harnais dans `aether` :
 | `trust_transaction` | L'assemblage chunké du §8.1.1 : des fragments s'assemblent en exactement la transaction que leur manifeste décrit, ou en rien. Un accumulateur partiel ne se déclare jamais complet ; un accumulateur complet rend exactement le nombre d'objets annoncé. |
 | `x509_documents` | Le DER qui arrive **à l'intérieur** d'une enveloppe signée — le cas précis où « c'est signé » ne dit rien des octets, la signature ne couvrant que l'empreinte d'un certificat que personne n'a encore parsé. |
 | `gateway_state_machine` | La machine d'état temporelle des §4 et §6, pilotée par une suite d'opérations arbitraires à des horloges arbitraires. C'est la cible qui paie : les autres vérifient qu'un parseur refuse, celle-ci vérifie qu'une suite d'opérations *d'apparence légale* ne peut pas mener l'état là où la spécification l'interdit. |
+| `tunnel_addresses` | Hors §14.1 : les parseurs d'adresses du tunnel (`aether::net`, `ADRESSAGE-IPV6.md` §4), qui lisent un `network.toml` édité à la main. Une valeur acceptée se réécrit en un texte que le parseur relit comme la même valeur (octet pour octet pour un VIP IPv4), et un préfixe construit depuis n'importe quel Global ID n'accepte comme VIP de pair que les IID non exclus du §3.2. |
 
-Les invariants assertés par la dernière cible, à chaque pas :
+Les invariants assertés par `gateway_state_machine`, à chaque pas :
 
 - un compteur de révocation consommé ne redescend jamais ;
 - `revoked` est terminal — aucune passe d'entretien ne le lève ;

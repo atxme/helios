@@ -28,6 +28,36 @@ pub enum PskKind {
     MlKem,
 }
 
+/// Whether the mounted adapter really captures what the profile asked for.
+///
+/// `AllowedIPs` is the whole of Orion's protection (ADR-001 §3 bis): what the
+/// adapter does not capture leaves through the physical interface, tunnel up
+/// or not. And the driver may apply less than it was given —
+/// `defguard_wireguard_rs` on Windows drops the prefixes of an address family
+/// the adapter does not carry, without an error. Only a read-back of what was
+/// applied tells the two situations apart, hence this event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum CaptureCheck {
+    /// Every requested prefix and address was read back from the adapter.
+    Complete,
+    /// What the adapter does not carry. At least one of the two lists is
+    /// non-empty.
+    Incomplete {
+        /// Requested prefixes the adapter does not capture, in the profile's
+        /// order and canonical form (`::/0`, `10.0.0.0/8`).
+        missing: Vec<String>,
+        /// Addresses of the profile the driver did not put on the adapter
+        /// (`fd3c:91a2:7e04::2/128`), in the profile's order. `defguard`
+        /// skips the addresses of a family the adapter lacks exactly as it
+        /// skips its prefixes, and as silently (`ADRESSAGE-IPV6.md` §7.3).
+        missing_addresses: Vec<String>,
+    },
+    /// The applied configuration could not be read back. Not "fine": the
+    /// capture is unknown, and the reason says which read failed.
+    Unverified { reason: String },
+}
+
 /// Real-time event pushed to the frontend (`emit("helios://event", …)`).
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -37,6 +67,10 @@ pub enum ClientEvent {
     /// The actual kind of PSK set, once the question is settled for the
     /// current connection. The UI can't guess it from the profile.
     Protection { psk: PskKind },
+    /// What the adapter really captures, read back after each configuration.
+    /// Only a backend able to read it back emits it: the simulation verifies
+    /// nothing, so it claims nothing.
+    Capture { capture: CaptureCheck },
     /// Log line to display in the UI.
     Log { level: String, message: String },
     /// Network counters relayed from heliosd telemetry (post-tunnel).
@@ -69,6 +103,11 @@ impl ClientEvent {
     pub fn protection(psk: PskKind) -> Self {
         ClientEvent::Protection { psk }
     }
+
+    /// Shortcut for a capture verdict.
+    pub fn capture(capture: CaptureCheck) -> Self {
+        ClientEvent::Capture { capture }
+    }
 }
 
 #[cfg(test)]
@@ -86,5 +125,31 @@ mod tests {
 
         let json = serde_json::to_value(ClientEvent::protection(PskKind::None)).unwrap();
         assert_eq!(json["psk"], "none");
+    }
+
+    #[test]
+    fn the_capture_verdict_serializes_with_its_status() {
+        let json = serde_json::to_value(ClientEvent::capture(CaptureCheck::Incomplete {
+            missing: vec!["::/0".into()],
+            missing_addresses: vec!["fd3c:91a2:7e04::2/128".into()],
+        }))
+        .unwrap();
+        assert_eq!(json["type"], "capture");
+        assert_eq!(json["capture"]["status"], "incomplete");
+        assert_eq!(json["capture"]["missing"][0], "::/0");
+        assert_eq!(
+            json["capture"]["missing_addresses"][0],
+            "fd3c:91a2:7e04::2/128"
+        );
+
+        let json = serde_json::to_value(ClientEvent::capture(CaptureCheck::Complete)).unwrap();
+        assert_eq!(json["capture"]["status"], "complete");
+
+        let json = serde_json::to_value(ClientEvent::capture(CaptureCheck::Unverified {
+            reason: "lecture impossible".into(),
+        }))
+        .unwrap();
+        assert_eq!(json["capture"]["status"], "unverified");
+        assert_eq!(json["capture"]["reason"], "lecture impossible");
     }
 }

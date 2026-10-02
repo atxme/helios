@@ -34,9 +34,74 @@ Un profil contient :
 - un nom et l’endpoint `IP:port` ou `FQDN:port` de la gateway ;
 - la clé privée Curve25519 du client et la clé publique de la gateway ;
 - la VIP CGNAT attribuée au client ;
-- `AllowedIPs` (`0.0.0.0/0` par défaut) ;
+- une éventuelle VIP IPv6 (`address_v6`, un hôte `/128`), si la gateway a un
+  préfixe IPv6 de tunnel ;
+- `AllowedIPs` (`0.0.0.0/0, ::/0` par défaut) ;
 - un keepalive persistant de 25 secondes par défaut ;
 - un éventuel PSK post-quantique et l’URL interne de l’API Helios.
+
+### Adresse IPv6 du tunnel
+
+Une gateway dotée d’un préfixe IPv6 de tunnel (`wg_address_v6`) attribue à
+chaque pair, en plus de sa VIP IPv4, une VIP IPv6 : un seul hôte `/128` de ce
+`/64`, jamais un préfixe ([ADRESSAGE-IPV6](../../docs/specification/ADRESSAGE-IPV6.md)
+§2.3). Orion la lit dans le champ `address_v6` du profil et pose **les deux
+adresses** sur l’adaptateur, IPv4 d’abord. `AllowedIPs` ne change pas. Le plan
+de contrôle reste en IPv4 : `heliosd_url` désigne toujours la VIP IPv4 de la
+gateway (§2.6).
+
+- **Sans `address_v6`**, rien ne change : adaptateur IPv4 seul, mêmes
+  présélections, même document. C’est le cas de tout profil émis par une
+  gateway sans IPv6.
+- **Validation** : la règle est celle de la gateway (`aether::net`) — un hôte
+  `/128`, sans identifiant de zone ; un `/64`, une adresse IPv4 ou une VIP IPv4
+  elle-même IPv6 sont refusés en nommant le champ, à l’import comme dans
+  l’éditeur (« Adresse virtuelle IPv6 »).
+- **Fichier `wg-quick`** : `Address = 100.64.1.2/32, fd…/128` remplit les deux
+  champs. Une seule entrée reste l’adresse virtuelle, comme avant ; deux
+  adresses de la même famille ou une IPv6 qui n’est pas un `/128` sont
+  refusées par leur nom plutôt que tranchées.
+- **Adaptateur sans IPv6** : sous Windows, `defguard_wireguard_rs` écarte sans
+  erreur l’adresse d’une famille que l’adaptateur ne porte pas, comme ses
+  routes. Orion relit les adresses unicast de l’adaptateur après chaque
+  configuration : une adresse absente est signalée par un avertissement
+  « adresse non posée par le pilote sur l’adaptateur : … » et, en ambre, sur la
+  ligne « adresse » du panneau de posture. Sous Linux, le refus est une erreur
+  de configuration nommée ; l’adaptateur reste monté (ADR-001 §3 bis).
+- **Profil périmé** : après le provisioning, la VIP IPv6 annoncée par la
+  gateway est comparée à celle du profil. Une autre adresse, une adresse que la
+  gateway ne connaît pas ou une adresse absente du profil alors que la gateway
+  en tient une sont signalées comme pour l’IPv4 ; Orion ne réécrit jamais le
+  profil, l’opérateur le réémet.
+- **Coffre** : un profil scellé sans `address_v6` garde exactement l’encodage
+  précédent ; seul un profil qui en porte une est scellé dans la version qui la
+  contient.
+
+### Résolution de l’endpoint
+
+Un endpoint en FQDN est résolu **une fois** par tentative de connexion, et ses
+adresses sont ordonnées selon RFC 8305 : la famille que le résolveur du
+système place en tête (l’IPv6 sur un poste double pile), puis l’autre en
+alternance. Une adresse littérale (`[2001:db8::1]:51820`, `203.0.113.10:51820`)
+n’interroge aucun résolveur.
+
+- **Négociation de clé** : les candidats sont tentés en échelonné. Le premier
+  part aussitôt, le suivant 250 ms plus tard ou dès un échec, et le premier
+  qui obtient le challenge de la gateway l’emporte. Les autres sont annulés
+  avant toute requête signée : aucune transaction n’est ouverte pour eux.
+- **WireGuard** : le pair reçoit une adresse **littérale**, jamais le nom :
+  l’adresse qui a négocié quand les deux endpoints nomment le même hôte,
+  sinon le premier candidat de la résolution de l’endpoint WireGuard. Le
+  profil enregistré garde le nom ; seule la copie remise au plan de données
+  porte le littéral.
+
+Le journal nomme l’adresse et la famille retenues. Un candidat écarté —
+typiquement une IPv6 publiée mais injoignable depuis le réseau local,
+remplacée par l’IPv4 — y figure en avertissement, jamais en silence. Si aucun candidat ne
+répond, l’erreur nomme l’endpoint et chaque adresse essayée avec sa cause.
+Un profil classique ne peut pas faire la course : WireGuard n’accepte qu’un
+endpoint par pair, et c’est le premier candidat qui est posé. Le contrôle sur
+VM Windows est décrit dans `docs/testing/MANUAL-TESTING.md`.
 
 ### Ce qui passe par le tunnel
 
@@ -48,9 +113,9 @@ n'importe quelle liste de préfixes.
 
 | Choix | `AllowedIPs` écrit |
 | --- | --- |
-| Tout | `0.0.0.0/0` |
+| Tout | `0.0.0.0/0, ::/0` |
 | Réseaux privés | VIP de la gateway en `/32`, puis `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` |
-| Helios seul | VIP de la gateway en `/32` |
+| Helios seul | VIP de la gateway en `/32`, plus `<préfixe>::1/128` si le profil a une `address_v6` |
 
 La VIP est lue sur le profil — l'URL interne de l'API Helios d'abord, la
 destination SSH ensuite — et non fixée en dur : un nom d'hôte n'en est pas une,
@@ -59,6 +124,10 @@ proposé, soit l'adresse que porte une gateway dont l'opérateur n'a pas changé
 `wg_address`. Elle figure aussi dans « Réseaux privés » parce que le `release`
 post-négociation n'est envoyé qu'à une adresse couverte par `AllowedIPs`
 ([NEGOCIATION-DE-CLE-V5](../../docs/specification/NEGOCIATION-DE-CLE-V5.md)).
+Pour un profil doté d’une `address_v6`, « Helios seul » ajoute l’adresse IPv6
+de la gateway, `::1` du `/64` de cette adresse (ADRESSAGE-IPV6 §2.4) : la
+gateway reste joignable dans les deux familles. Les deux autres choix ne
+changent pas.
 
 > **« Réseaux privés » capte aussi le réseau local du poste.** Les trois plages
 > RFC 1918 ne distinguent pas le `192.168.1.0/24` du bureau de celui de la box
@@ -68,6 +137,28 @@ post-négociation n'est envoyé qu'à une adresse couverte par `AllowedIPs`
 > les sous-réseaux qui vivent derrière la gateway, et la négociation ne les
 > annonce pas. Quand le sous-réseau visé est connu, **Personnalisé** et ce seul
 > préfixe valent mieux que les trois plages.
+
+> **« Tout » capte aussi l'IPv6.** La gateway ne relaie aucun IPv6 hors de son
+> préfixe de tunnel : ce que l'adaptateur capte en `::/0` est jeté, et c'est ce
+> qui empêche l'IPv6 d'un poste dual-stack de sortir en clair tunnel monté. Un
+> profil enregistré avec `0.0.0.0/0` seul — l'ancien « Tout » — n'est jamais
+> réécrit : il s'ouvre en **Personnalisé**, avec l'avertissement « Tunnel
+> complet IPv4 seulement : le trafic IPv6 sort en clair », repris en ambre dans
+> le panneau de posture. Choisir « Tout » puis enregistrer le corrige.
+>
+> **Ce que le pilote applique est relu.** Sous Windows,
+> `defguard_wireguard_rs` 0.11 ne pose les routes que pour les familles
+> d'adresses que l'adaptateur porte : si l'IPv6 y est indisponible, `::/0` est
+> écarté sans erreur et l'IPv6 sort par l'interface physique alors que le
+> tunnel paraît complet. Après chaque configuration, le backend réel relit les
+> `AllowedIPs` du pair dans le pilote et, sous Windows, les routes de
+> l'adaptateur. Un préfixe manquant est signalé par une erreur « AllowedIPs non
+> appliqués par le pilote : ::/0 — … » et par la ligne « trafic via le tunnel »
+> en ambre (« ::/0 non appliqué par le pilote — hors tunnel ») ; une relecture
+> impossible est signalée comme « non vérifié ». Le tunnel reste monté avec ce
+> qu'il capte : le démonter ne supprimerait pas la fuite IPv6 et rouvrirait
+> celle de l'IPv4 (ADR-001 §3 bis). Le backend simulé ne relit rien et
+> n'affirme donc rien.
 
 ### Protection du tunnel
 
@@ -195,7 +286,7 @@ Le format JSON courant est `orion-profile` version 1 :
     "private_key": "base64-de-32-octets",
     "peer_public_key": "base64-de-32-octets",
     "address": "100.64.1.2/32",
-    "allowed_ips": "0.0.0.0/0",
+    "allowed_ips": "0.0.0.0/0, ::/0",
     "persistent_keepalive": 25,
     "heliosd_url": "http://100.64.0.1:8080"
   }
@@ -203,12 +294,17 @@ Le format JSON courant est `orion-profile` version 1 :
 ```
 
 `allowed_ips`, `persistent_keepalive`, `heliosd_url` et `preshared_key` sont
-facultatifs. L’adresse virtuelle reste obligatoire : le tunnel initial en a
-besoin avant de pouvoir joindre l’API interne. `AllowedIPs` vaut `0.0.0.0/0` et
-le keepalive 25 secondes lorsqu’ils sont omis. Un `preshared_key` importé est
-traité comme un PSK statique et désactive la négociation ML-KEM automatique ;
-il ne doit être fourni que si les deux pairs portent déjà exactement la même
-valeur.
+facultatifs, comme `address_v6` (`"fd3c:91a2:7e04::2/128"`), que `helios-ctl`
+n’écrit que pour un pair qui en a une. Le document refusant les champs
+inconnus, un Orion antérieur à ce champ refuse à l’import un profil qui le
+porte : c’est la version d’Orion minimale à installer pour un profil IPv6, pas
+une ouverture silencieuse. L’adresse virtuelle reste obligatoire : le tunnel initial en a
+besoin avant de pouvoir joindre l’API interne. `AllowedIPs` vaut
+`0.0.0.0/0, ::/0` et le keepalive 25 secondes lorsqu’ils sont omis ; un
+`allowed_ips` explicite est importé tel quel, `0.0.0.0/0` seul compris (il est
+alors signalé, pas élargi). Un `preshared_key` importé est traité comme un PSK
+statique et désactive la négociation ML-KEM automatique ; il ne doit être
+fourni que si les deux pairs portent déjà exactement la même valeur.
 
 ## Cycle de vie et protection anti-fuite
 
@@ -217,7 +313,7 @@ WireGuard rekeyant silencieusement, il n’existe aucun état `rekeying` dans
 l’application.
 
 Orion n’installe pas de pare-feu local. Son invariant est le cycle de vie de
-l’adaptateur : avec `AllowedIPs = 0.0.0.0/0`, l’adaptateur reste monté en
+l’adaptateur : avec `AllowedIPs = 0.0.0.0/0, ::/0`, l’adaptateur reste monté en
 `connecting` et après un échec. WireGuard capture alors les routes et jette les
 paquets si aucun handshake n’est possible. Seule l’action explicite
 « Déconnecter » appelle `down()`.

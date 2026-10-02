@@ -119,17 +119,21 @@ fn source_of(request: &Request) -> Option<IpAddr> {
         .map(|ConnectInfo(address)| address.ip())
 }
 
+/// Canonicalized before anything reads it: a dual-stack `[::]` socket reports
+/// an IPv4 peer as `::ffff:a.b.c.d`, which would match no `/32` VIP and turn
+/// `::ffff:127.0.0.1` into a non-loopback address. A native IPv6 source stays
+/// IPv6 and therefore resolves to nobody: the IPv4 VIP is the only identity.
 async fn resolve(state: &AppState, source: Option<IpAddr>) -> Option<Caller> {
+    let source = source.map(|ip| ip.to_canonical());
     if state.dry_run && source.is_none_or(|ip| ip.is_loopback()) {
         return Some(Caller::dev());
     }
     let source = source?;
     let network = state.network.read().await;
-    let mut matching = network.peers.iter().filter(|peer| {
-        peer.address
-            .split_once('/')
-            .is_some_and(|(host, prefix)| prefix == "32" && host == source.to_string())
-    });
+    let mut matching = network
+        .peers
+        .iter()
+        .filter(|peer| peer_vip(&peer.address).is_some_and(|vip| IpAddr::V4(vip) == source));
     let peer = matching.next()?;
     if matching.next().is_some() {
         return None;
@@ -141,6 +145,18 @@ async fn resolve(state: &AppState, source: Option<IpAddr>) -> Option<Caller> {
         admin: peer.admin,
         dev_loopback: false,
     })
+}
+
+/// The host of a peer's identity VIP, only when it is a single `/32` IPv4.
+///
+/// Anything broader, or any other family, is not an identity and matches no
+/// source.
+fn peer_vip(address: &str) -> Option<Ipv4Addr> {
+    let (host, prefix) = address.split_once('/')?;
+    if prefix != "32" {
+        return None;
+    }
+    host.parse().ok()
 }
 
 /// For a browser request, the origin must exactly match the `Host`
@@ -171,19 +187,28 @@ mod tests {
     use axum::body::Body;
     use tokio::sync::{broadcast, mpsc, RwLock};
 
+    fn peer(name: &str, address: &str, admin: bool) -> WgPeer {
+        WgPeer {
+            name: name.into(),
+            public_key: format!("{name}-public-key"),
+            address: address.into(),
+            address_v6: None,
+            admin,
+            preshared_key: None,
+            key_negotiation_certificate_sha256: None,
+            key_negotiation_pq_certificate_sha256: None,
+            minimum_key_negotiation_mode: aether::key_negotiation::ProtectionMode::Classic,
+            persistent_keepalive_secs: aether::config::DEFAULT_PERSISTENT_KEEPALIVE_SECS,
+        }
+    }
+
     fn state(admin: bool, dry_run: bool) -> AppState {
+        state_with(vec![peer("workstation", "100.64.1.2/32", admin)], dry_run)
+    }
+
+    fn state_with(peers: Vec<WgPeer>, dry_run: bool) -> AppState {
         let network = NetworkConfig {
-            peers: vec![WgPeer {
-                name: "workstation".into(),
-                public_key: "public-key".into(),
-                address: "100.64.1.2/32".into(),
-                admin,
-                preshared_key: None,
-                key_negotiation_certificate_sha256: None,
-                key_negotiation_pq_certificate_sha256: None,
-                minimum_key_negotiation_mode: aether::key_negotiation::ProtectionMode::Classic,
-                persistent_keepalive_secs: aether::config::DEFAULT_PERSISTENT_KEEPALIVE_SECS,
-            }],
+            peers,
             ..NetworkConfig::default()
         };
         let policy = network.firewall_policy();
@@ -214,7 +239,7 @@ mod tests {
         let caller = resolve(&state(true, false), source_of(&request("100.64.1.2:4242")))
             .await
             .expect("expected peer");
-        assert_eq!(caller.public_key.as_deref(), Some("public-key"));
+        assert_eq!(caller.public_key.as_deref(), Some("workstation-public-key"));
         assert!(caller.admin);
     }
 
@@ -239,6 +264,101 @@ mod tests {
             .expect("dev identity");
         assert!(caller.admin);
         assert!(caller.dev_loopback);
+    }
+
+    /// A dual-stack `[::]` socket reports the peer as `::ffff:100.64.1.2`. It is
+    /// the same IPv4 VIP and must resolve to the same peer.
+    #[tokio::test]
+    async fn an_ipv4_mapped_source_resolves_to_its_vip() {
+        let caller = resolve(
+            &state(true, false),
+            source_of(&request("[::ffff:100.64.1.2]:4242")),
+        )
+        .await
+        .expect("expected peer");
+        assert_eq!(caller.name, "workstation");
+        assert_eq!(caller.source, IpAddr::V4(Ipv4Addr::new(100, 64, 1, 2)));
+        assert!(caller.admin);
+    }
+
+    /// The IPv4 VIP is the only identity (ADRESSAGE-IPV6 §2.6): no native
+    /// IPv6 source is ever a caller, whatever its bits.
+    #[tokio::test]
+    async fn a_native_ipv6_source_resolves_to_nobody() {
+        for source in [
+            "[fd00::100.64.1.2]:4242",
+            "[64:ff9b::100.64.1.2]:4242",
+            "[::100.64.1.2]:4242",
+            "[::1]:4242",
+        ] {
+            assert!(
+                resolve(&state(true, false), source_of(&request(source)))
+                    .await
+                    .is_none(),
+                "{source} must not resolve to a peer"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_ambiguous_vip_resolves_to_nobody() {
+        let duplicated = state_with(
+            vec![
+                peer("first", "100.64.1.2/32", true),
+                peer("second", "100.64.1.2/32", false),
+            ],
+            false,
+        );
+        for source in ["100.64.1.2:4242", "[::ffff:100.64.1.2]:4242"] {
+            assert!(
+                resolve(&duplicated, source_of(&request(source)))
+                    .await
+                    .is_none(),
+                "two peers claiming {source} must resolve to neither"
+            );
+        }
+    }
+
+    /// Only a single `/32` IPv4 VIP is an identity; a broader prefix or an
+    /// IPv6 entry matches no source.
+    #[tokio::test]
+    async fn only_a_single_ipv4_host_vip_is_an_identity() {
+        let broad = state_with(
+            vec![
+                peer("broad", "100.64.1.2/10", true),
+                peer("ipv6", "::ffff:100.64.1.3/32", true),
+                peer("ipv6-host", "fd00::1/128", true),
+            ],
+            false,
+        );
+        for source in [
+            "100.64.1.2:4242",
+            "100.64.1.3:4242",
+            "[::ffff:100.64.1.3]:4242",
+            "[fd00::1]:4242",
+        ] {
+            assert!(
+                resolve(&broad, source_of(&request(source))).await.is_none(),
+                "{source} must not resolve to a peer"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_mapped_loopback_is_the_dev_identity_only_in_dry_run() {
+        let caller = resolve(
+            &state(false, true),
+            source_of(&request("[::ffff:127.0.0.1]:4242")),
+        )
+        .await
+        .expect("dev identity");
+        assert!(caller.dev_loopback);
+        assert!(resolve(
+            &state(true, false),
+            source_of(&request("[::ffff:127.0.0.1]:4242"))
+        )
+        .await
+        .is_none());
     }
 
     #[test]

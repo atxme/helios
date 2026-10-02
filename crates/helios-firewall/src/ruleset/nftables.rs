@@ -20,6 +20,65 @@ pub enum AddressFamily {
     Ipv6,
 }
 
+/// ICMPv6 messages a typed match can select.
+///
+/// Only the messages Helios opens are listed: a type that is not here cannot
+/// enter a [`Match`], so Redirect (137) — which no rule may accept — is not
+/// representable at all, rather than merely absent from the renderer. Adding
+/// a message is a deliberate change of this enum, reviewed as such.
+///
+/// ICMPv4 has no typed counterpart. Helios matches it by protocol only, see
+/// [`Match::Icmp`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Icmpv6Type {
+    /// Multicast Listener Query (130, RFC 2710 / RFC 3810).
+    MldListenerQuery,
+    /// MLDv1 Multicast Listener Report (131, RFC 2710).
+    MldListenerReport,
+    /// Multicast Listener Done (132, RFC 2710).
+    MldListenerDone,
+    /// Router Solicitation (133, RFC 4861).
+    RouterSolicit,
+    /// Router Advertisement (134, RFC 4861).
+    RouterAdvert,
+    /// Neighbor Solicitation (135, RFC 4861).
+    NeighborSolicit,
+    /// Neighbor Advertisement (136, RFC 4861).
+    NeighborAdvert,
+    /// MLDv2 Multicast Listener Report (143, RFC 3810).
+    Mld2ListenerReport,
+}
+
+impl Icmpv6Type {
+    /// The value of the ICMPv6 `type` octet.
+    pub const fn number(self) -> u8 {
+        match self {
+            Self::MldListenerQuery => 130,
+            Self::MldListenerReport => 131,
+            Self::MldListenerDone => 132,
+            Self::RouterSolicit => 133,
+            Self::RouterAdvert => 134,
+            Self::NeighborSolicit => 135,
+            Self::NeighborAdvert => 136,
+            Self::Mld2ListenerReport => 143,
+        }
+    }
+
+    /// The keyword `nft` uses for this type.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MldListenerQuery => "mld-listener-query",
+            Self::MldListenerReport => "mld-listener-report",
+            Self::MldListenerDone => "mld-listener-done",
+            Self::RouterSolicit => "nd-router-solicit",
+            Self::RouterAdvert => "nd-router-advert",
+            Self::NeighborSolicit => "nd-neighbor-solicit",
+            Self::NeighborAdvert => "nd-neighbor-advert",
+            Self::Mld2ListenerReport => "mld2-listener-report",
+        }
+    }
+}
+
 /// Conntrack states understood by the Helios firewall IR.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionState {
@@ -81,11 +140,57 @@ impl ConnectionStates {
     }
 }
 
-/// Verdict of a rule or default policy of a chain.
+/// Terminal verdict of a rule.
+///
+/// Closed on purpose: a rejection is a named variant, not a free-form
+/// `reject` whose type and code a caller picks. Each variant is a decision
+/// reviewed as such, like the messages of [`Icmpv6Type`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
     Accept,
     Drop,
+    /// `reject with icmpx admin-prohibited`: the packet is dropped and its
+    /// sender receives "administratively prohibited" — ICMPv6 type 1 code 1
+    /// for an IPv6 packet, ICMP type 3 code 13 for an IPv4 one.
+    ///
+    /// It refuses exactly like [`Verdict::Drop`] and opens nothing; the only
+    /// difference is that the sender learns it at once instead of waiting for
+    /// its own timeout. Used for the tunnel clients' IPv6 Internet egress
+    /// (SORTIE-IPV6 §3.1), so that a dual-stack application falls back to
+    /// IPv4 immediately.
+    RejectAdminProhibited,
+}
+
+impl Verdict {
+    /// The nftables statement this verdict renders as.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Accept => "accept",
+            Self::Drop => "drop",
+            Self::RejectAdminProhibited => "reject with icmpx admin-prohibited",
+        }
+    }
+}
+
+/// Default policy of the hooked chains.
+///
+/// Separate from [`Verdict`] because nftables only takes `accept` or `drop`
+/// as a chain policy: a rejecting default is not representable, rather than
+/// refused late by the backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefaultVerdict {
+    Accept,
+    Drop,
+}
+
+impl DefaultVerdict {
+    /// The keyword `nft` uses for this chain policy.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Accept => "accept",
+            Self::Drop => "drop",
+        }
+    }
 }
 
 /// Packet/byte counter attached to a rule.
@@ -208,17 +313,41 @@ pub enum Match {
     SourceNet(IpNetwork),
     /// `meta l4proto icmp` or `meta l4proto ipv6-icmp`.
     ///
-    /// # Known limitation: ICMP type is not discriminated
+    /// # Known limitation: ICMPv4 type is not discriminated
     ///
     /// The match covers the protocol, not a narrower type such as
-    /// `echo-request`. The high-level `rustables` API has no ICMPv4 payload
-    /// field for the type octet. The widening remains interface-scoped, so
-    /// only peers already admitted by WireGuard can reach the tunnel rule.
-    /// Supporting typed ICMP messages requires a checked payload-expression
-    /// encoder for both families.
+    /// `echo-request`. ICMPv6 has a typed match, [`Match::Icmpv6Type`],
+    /// because the high-level `rustables` API exposes the ICMPv6 type octet;
+    /// it has no ICMPv4 payload field for it. The ICMPv4 widening remains
+    /// interface-scoped, so only peers already admitted by WireGuard can reach
+    /// the tunnel rule. Typing ICMPv4 messages requires a checked
+    /// payload-expression encoder for that family, which Helios does not have.
     Icmp(AddressFamily),
+    /// `icmpv6 type <type>`.
+    ///
+    /// Selects ICMPv6 by `meta l4proto ipv6-icmp`, then compares the type
+    /// octet. The network-layer family is not checked here: a rule that must
+    /// be IPv6 at the network layer also carries [`Match::Ipv6HopLimit`] or
+    /// [`Match::Family`].
+    Icmpv6Type(Icmpv6Type),
+    /// `ip6 hoplimit <value>`.
+    ///
+    /// A network-header field, so only meaningful on an IPv6 packet: the
+    /// backend emits the `meta nfproto ipv6` guard ahead of the comparison,
+    /// exactly as it does ahead of an `ip6 daddr`. Without it, the same offset
+    /// of an IPv4 header is a fragment-offset octet. The guard belongs to the
+    /// match, so an unguarded hop-limit comparison cannot be represented.
+    Ipv6HopLimit(u8),
     /// Packet mark assigned by a privileged local networking service.
     PacketMark(u32),
+    /// `meta nfproto ipv4` or `meta nfproto ipv6`.
+    ///
+    /// The table is `inet`: a rule that names no address applies to both
+    /// families. Address matches already carry their own family guard, so
+    /// this match is for rules that must stay single-family without naming an
+    /// address — the tunnel clients' Internet egress first among them, which
+    /// relays IPv4 only.
+    Family(AddressFamily),
 }
 
 impl fmt::Display for Match {
@@ -254,7 +383,11 @@ impl fmt::Display for Match {
             ),
             Match::Icmp(AddressFamily::Ipv4) => write!(f, "meta l4proto icmp"),
             Match::Icmp(AddressFamily::Ipv6) => write!(f, "meta l4proto ipv6-icmp"),
+            Match::Icmpv6Type(icmp_type) => write!(f, "icmpv6 type {}", icmp_type.as_str()),
+            Match::Ipv6HopLimit(hop_limit) => write!(f, "ip6 hoplimit {hop_limit}"),
             Match::PacketMark(mark) => write!(f, "meta mark {mark:#x}"),
+            Match::Family(AddressFamily::Ipv4) => write!(f, "meta nfproto ipv4"),
+            Match::Family(AddressFamily::Ipv6) => write!(f, "meta nfproto ipv6"),
         }
     }
 }
@@ -329,10 +462,7 @@ impl fmt::Display for Rule {
                 }
             }
         }
-        match self.verdict {
-            Verdict::Accept => write!(f, "accept"),
-            Verdict::Drop => write!(f, "drop"),
-        }
+        write!(f, "{}", self.verdict.as_str())
     }
 }
 
@@ -340,13 +470,18 @@ impl fmt::Display for Rule {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ruleset {
     /// Default policy of hooked chains (`Drop` = fail-closed).
-    pub default_verdict: Verdict,
+    pub default_verdict: DefaultVerdict,
     pub rules: Vec<Rule>,
     /// Requested MSS clamping, if any.
     ///
     /// Deliberately **outside** of `rules`: it is a *mangle* action (TCP
     /// option rewrite), not a filtering verdict, and `rustables`' high-level
     /// API does not express it. See the Netlink backend.
+    ///
+    /// The value is the IPv4 MSS of the tunnel (`aether::mtu::mss_ipv4`). In
+    /// this `inet` table an unguarded clamp would also rewrite IPv6 SYNs with
+    /// a value 20 bytes too large: an encoder must emit it under
+    /// `meta nfproto ipv4`, like [`MasqueradeRule`].
     pub mss_clamp: Option<u16>,
     /// Egress interface on which to masquerade the source of client traffic.
     ///
@@ -363,6 +498,9 @@ pub struct Ruleset {
     /// **Empty** outside of states where traffic is allowed — NAT must never
     /// survive the tunnel going down, otherwise the kill-switch would leak
     /// what it is supposed to hold back.
+    ///
+    /// Only the uplinks are stored here. The rules themselves, with their
+    /// IPv4 guard, come from [`Ruleset::masquerade_rules`].
     pub masquerade_out: Vec<String>,
 }
 
@@ -370,6 +508,60 @@ impl Ruleset {
     /// Rules of a given chain, in order.
     pub fn chain(&self, kind: ChainKind) -> impl Iterator<Item = &Rule> {
         self.rules.iter().filter(move |r| r.chain == kind)
+    }
+
+    /// The `postrouting` masquerade rules, one per entry of
+    /// [`masquerade_out`](Self::masquerade_out), in the same order.
+    ///
+    /// The single place where a masquerade gets its matches: the Netlink
+    /// backend translates exactly these, and the dry-run, the API and the
+    /// golden snapshots display exactly these, so what is shown cannot drift
+    /// from what is applied.
+    pub fn masquerade_rules(&self) -> impl Iterator<Item = MasqueradeRule> + '_ {
+        self.masquerade_out.iter().map(|out_iface| MasqueradeRule {
+            matches: vec![
+                Match::Family(MasqueradeRule::FAMILY),
+                Match::OutIface(out_iface.clone()),
+            ],
+        })
+    }
+}
+
+/// A source-NAT rule of the `postrouting` chain.
+///
+/// # Why the family is not a field of the ruleset
+///
+/// In an `inet` table a masquerade that names only an interface also
+/// rewrites IPv6: the first IPv6 packet relayed to a WAN would be NAT66-ed,
+/// a translation nobody decided. The masquerade therefore carries
+/// `meta nfproto ipv4`. That guard is a fixed invariant — NAT44 exists
+/// because tunnel addresses are non-routable CGNAT, and the tunnel clients'
+/// IPv6 egress is rejected in `forward` (SORTIE-IPV6 §3.1), NAT66 being out
+/// of scope — not a per-uplink choice, so
+/// [`Ruleset::masquerade_out`] keeps listing uplinks only and this type adds
+/// the guard. Its matches are private and only [`Ruleset::masquerade_rules`]
+/// builds it: an unguarded or IPv6 masquerade cannot be represented.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MasqueradeRule {
+    matches: Vec<Match>,
+}
+
+impl MasqueradeRule {
+    /// The only family the masquerade rewrites.
+    pub const FAMILY: AddressFamily = AddressFamily::Ipv4;
+
+    /// Matches evaluated before the `masquerade` statement, in order.
+    pub fn matches(&self) -> &[Match] {
+        &self.matches
+    }
+}
+
+impl fmt::Display for MasqueradeRule {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for m in &self.matches {
+            write!(f, "{m} ")?;
+        }
+        write!(f, "masquerade")
     }
 }
 
@@ -393,6 +585,25 @@ mod tests {
         assert_eq!(
             rule.to_string(),
             "ct state invalid counter log prefix \"helios invalid: \" group 7 drop"
+        );
+    }
+
+    #[test]
+    fn the_admin_prohibited_rejection_renders_the_icmpx_statement() {
+        let rule = Rule::new(
+            ChainKind::Forward,
+            vec![
+                Match::Family(AddressFamily::Ipv6),
+                Match::InIface("helios0".into()),
+                Match::OutIface("eth0".into()),
+            ],
+            Verdict::RejectAdminProhibited,
+        );
+
+        assert_eq!(
+            rule.to_string(),
+            "meta nfproto ipv6 iifname \"helios0\" oifname \"eth0\" \
+             reject with icmpx admin-prohibited"
         );
     }
 
@@ -432,5 +643,65 @@ mod tests {
 
         assert_eq!(Match::SourceNet(ipv4).to_string(), "ip saddr 192.0.2.1/32");
         assert_eq!(Match::DestNet(ipv6).to_string(), "ip6 daddr 2001:db8::/32");
+    }
+
+    #[test]
+    fn family_matches_render_the_nfproto_guard() {
+        assert_eq!(
+            Match::Family(AddressFamily::Ipv4).to_string(),
+            "meta nfproto ipv4"
+        );
+        assert_eq!(
+            Match::Family(AddressFamily::Ipv6).to_string(),
+            "meta nfproto ipv6"
+        );
+    }
+
+    #[test]
+    fn icmpv6_type_matches_render_the_nft_keyword_of_their_number() {
+        let expected = [
+            (Icmpv6Type::MldListenerQuery, 130, "mld-listener-query"),
+            (Icmpv6Type::MldListenerReport, 131, "mld-listener-report"),
+            (Icmpv6Type::MldListenerDone, 132, "mld-listener-done"),
+            (Icmpv6Type::RouterSolicit, 133, "nd-router-solicit"),
+            (Icmpv6Type::RouterAdvert, 134, "nd-router-advert"),
+            (Icmpv6Type::NeighborSolicit, 135, "nd-neighbor-solicit"),
+            (Icmpv6Type::NeighborAdvert, 136, "nd-neighbor-advert"),
+            (Icmpv6Type::Mld2ListenerReport, 143, "mld2-listener-report"),
+        ];
+        for (icmp_type, number, keyword) in expected {
+            assert_eq!(icmp_type.number(), number, "{keyword}");
+            assert_eq!(
+                Match::Icmpv6Type(icmp_type).to_string(),
+                format!("icmpv6 type {keyword}")
+            );
+        }
+    }
+
+    #[test]
+    fn hop_limit_matches_render_the_ip6_field() {
+        assert_eq!(Match::Ipv6HopLimit(255).to_string(), "ip6 hoplimit 255");
+    }
+
+    #[test]
+    fn masquerade_rules_carry_the_ipv4_guard_before_the_uplink() {
+        let ruleset = Ruleset {
+            default_verdict: DefaultVerdict::Drop,
+            rules: Vec::new(),
+            mss_clamp: None,
+            masquerade_out: vec!["enp3s0".into(), "wlo1".into()],
+        };
+
+        let rendered: Vec<String> = ruleset
+            .masquerade_rules()
+            .map(|rule| rule.to_string())
+            .collect();
+        assert_eq!(
+            rendered,
+            [
+                "meta nfproto ipv4 oifname \"enp3s0\" masquerade",
+                "meta nfproto ipv4 oifname \"wlo1\" masquerade",
+            ]
+        );
     }
 }

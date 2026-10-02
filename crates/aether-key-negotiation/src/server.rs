@@ -1,4 +1,5 @@
 use std::{
+    net::SocketAddr,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -219,18 +220,25 @@ pub async fn serve(endpoint: Endpoint, handler: Arc<dyn NegotiationHandler>) {
 
     while let Some(incoming) = endpoint.accept().await {
         // Before any allocation or cryptography: prove the address is real.
+        //
+        // The Retry token itself is quinn's, bound to the address exactly as
+        // this socket reports it. Issuing and checking both happen on the one
+        // dual-stack socket, so an IPv4 client is `::ffff:a.b.c.d` on both
+        // sides of that comparison and nothing here has to translate it.
         if !incoming.remote_address_validated() {
-            let remote = incoming.remote_address();
+            let remote = canonical_remote(incoming.remote_address());
             if incoming.retry().is_err() {
                 tracing::info!(%remote, "quic: retry refused for an already-validated peer");
             }
             continue;
         }
 
-        let source = incoming.remote_address().ip();
+        let source = canonical_remote(incoming.remote_address()).ip();
         let admitted = limiter
             .lock()
-            .map(|mut limiter| limiter.admit(rate_bucket(source), Instant::now()))
+            .map(|mut limiter| {
+                limiter.admit(source_bucket(incoming.remote_address()), Instant::now())
+            })
             // A poisoned lock must not open the port wide: refuse instead.
             .unwrap_or(false);
         if !admitted {
@@ -249,7 +257,7 @@ pub async fn serve(endpoint: Endpoint, handler: Arc<dyn NegotiationHandler>) {
         let handler = Arc::clone(&handler);
         let per_identity = Arc::clone(&per_identity);
         tokio::spawn(async move {
-            let remote = incoming.remote_address();
+            let remote = canonical_remote(incoming.remote_address());
             // The absolute ceiling. `handle_connection` bounds each phase it
             // waits on, but the sum of well-behaved phases is not itself
             // bounded — this is what makes it so.
@@ -274,6 +282,22 @@ pub async fn serve(endpoint: Endpoint, handler: Arc<dyn NegotiationHandler>) {
         });
     }
 }
+/// The peer's address as every consumer on this port must read it.
+///
+/// The dual-stack listener reports an IPv4 client as `::ffff:a.b.c.d`. The
+/// budget bucket canonicalizes on its own ([`rate_bucket`]); this keeps the
+/// journal on the same form, so the address a refusal names is the one an
+/// operator would look for — and the one the bucket counted.
+fn canonical_remote(remote: SocketAddr) -> SocketAddr {
+    SocketAddr::new(aether::net::canonical_source(remote.ip()), remote.port())
+}
+
+/// The per-source budget a connection from `remote` is charged to, taking
+/// `remote` exactly as the listening socket reports it.
+pub(crate) fn source_bucket(remote: SocketAddr) -> std::net::IpAddr {
+    rate_bucket(canonical_remote(remote).ip())
+}
+
 fn absolute_lifetime_reached() -> String {
     format!(
         "connection exceeded its {} s absolute lifetime",
@@ -288,7 +312,7 @@ async fn handle_connection(
 ) -> Result<(), TransportError> {
     let started = Instant::now();
     let deadline = Deadline::starting_now();
-    let remote = incoming.remote_address();
+    let remote = canonical_remote(incoming.remote_address());
     let connection = incoming.await.map_err(TransportError::Connection)?;
     let fingerprint = peer_certificate_sha256(&connection)?;
     // Resolved before anything is spent on this connection (spec §4.4, §7.3).

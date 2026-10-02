@@ -1,7 +1,7 @@
 //! Tests for the ruleset renderer, grouped by the behavior they protect.
 
 use super::super::*;
-use super::support::{policy, render, text};
+use super::support::{every_state, policy, render, text};
 
 /// The default stays closed: a gateway normally has a fixed address, and
 /// opening DHCP without reason would widen fail-closed for nothing.
@@ -48,6 +48,94 @@ fn allowed_dhcp_stays_scoped_to_wan() {
                 .iter()
                 .any(|r| r.contains("dport 67") || r.contains("dport 68")),
             "state {st:?}: DHCP must not traverse the gateway"
+        );
+    }
+}
+
+/// The DHCPv6 client follows the same flag, closed by default.
+#[test]
+fn dhcpv6_is_closed_by_default() {
+    for st in every_state() {
+        let rs = render(&policy(), st);
+        assert!(
+            !rs.rules
+                .iter()
+                .any(|rule| rule.matches.iter().any(|m| matches!(
+                    m,
+                    Match::DestPort {
+                        port: 546 | 547,
+                        ..
+                    }
+                ))),
+            "state {st:?}: DHCPv6 open without the configuration requesting it"
+        );
+    }
+}
+
+/// "The WAN address comes from a lease" holds for both families: the same
+/// flag opens the DHCPv6 client, on the WAN, IPv6 only, in every state —
+/// and never on the LAN nor through the gateway.
+#[test]
+fn allowed_dhcpv6_stays_scoped_to_wan_and_ipv6() {
+    let mut p = policy();
+    p.allow_dhcp_on_wan = true;
+
+    for st in every_state() {
+        let rs = render(&p, st);
+        let dhcpv6: Vec<&Rule> = rs
+            .rules
+            .iter()
+            .filter(|rule| {
+                rule.matches.iter().any(|m| {
+                    matches!(
+                        m,
+                        Match::DestPort {
+                            port: 546 | 547,
+                            ..
+                        }
+                    )
+                })
+            })
+            .collect();
+        assert_eq!(
+            dhcpv6
+                .iter()
+                .map(|rule| (rule.chain, rule.matches.clone()))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    ChainKind::Output,
+                    vec![
+                        Match::OutIface("eth0".into()),
+                        Match::Family(AddressFamily::Ipv6),
+                        Match::DestPort {
+                            port: 547,
+                            proto: L4::Udp
+                        },
+                    ]
+                ),
+                (
+                    ChainKind::Input,
+                    vec![
+                        Match::InIface("eth0".into()),
+                        Match::Family(AddressFamily::Ipv6),
+                        Match::DestPort {
+                            port: 546,
+                            proto: L4::Udp
+                        },
+                    ]
+                ),
+            ],
+            "state {st:?}"
+        );
+        assert!(dhcpv6.iter().all(|rule| rule.verdict == Verdict::Accept));
+        assert_eq!(
+            text(&rs, ChainKind::Output)
+                .iter()
+                .filter(|r| r.as_str() == "oifname \"eth0\" meta nfproto ipv6 udp dport 547 accept")
+                .count(),
+            1,
+            "state {st:?}: the display must show the guard the backend applies"
         );
     }
 }
@@ -228,8 +316,22 @@ fn meshnet_routing_mirrors_per_peer_routing_and_local_network_permissions() {
     }
 }
 
+/// The `forward` rules naming the tunnel interface, as displayed.
+fn tunnel_forward(rs: &Ruleset) -> Vec<String> {
+    text(rs, ChainKind::Forward)
+        .into_iter()
+        .filter(|r| r.contains("iifname \"helios0\""))
+        .collect()
+}
+
+/// The IPv6 rejection of the single uplink: present in every state, it
+/// refuses and opens nothing.
+const IPV6_REJECTION: &str =
+    "meta nfproto ipv6 iifname \"helios0\" oifname \"eth0\" reject with icmpx admin-prohibited";
+
 /// Closed by default: a gateway granting access to internal resources has
-/// no reason to route Internet traffic.
+/// no reason to route Internet traffic. The only `forward` rule naming the
+/// tunnel interface is then the IPv6 rejection.
 #[test]
 fn client_internet_egress_is_closed_by_default() {
     let rs = render(&policy(), TunnelState::Up);
@@ -237,9 +339,7 @@ fn client_internet_egress_is_closed_by_default() {
         rs.masquerade_out.is_empty(),
         "NAT applied without requesting it"
     );
-    assert!(!text(&rs, ChainKind::Forward)
-        .iter()
-        .any(|r| r.contains("iifname \"helios0\"")));
+    assert_eq!(tunnel_forward(&rs), [IPV6_REJECTION]);
 }
 
 /// NAT and forward must appear **and disappear** together with the
@@ -255,7 +355,7 @@ fn client_internet_egress_follows_tunnel_state_exactly() {
     assert!(
         text(&up, ChainKind::Forward)
             .iter()
-            .any(|r| r == "iifname \"helios0\" oifname \"eth0\" accept"),
+            .any(|r| r == "meta nfproto ipv4 iifname \"helios0\" oifname \"eth0\" accept"),
         "client forward rule missing in the Up state: {:?}",
         text(&up, ChainKind::Forward)
     );
@@ -270,10 +370,9 @@ fn client_internet_egress_follows_tunnel_state_exactly() {
             rs.masquerade_out.is_empty(),
             "state {st:?}: NAT must not exist outside the tunnel"
         );
-        assert!(
-            !text(&rs, ChainKind::Forward)
-                .iter()
-                .any(|r| r.contains("iifname \"helios0\"")),
+        assert_eq!(
+            tunnel_forward(&rs),
+            [IPV6_REJECTION],
             "state {st:?}: client traffic must not traverse"
         );
     }
@@ -288,10 +387,14 @@ fn client_internet_egress_does_not_open_lan_to_clients() {
     p.allow_client_internet = true;
     let rs = render(&p, TunnelState::Up);
 
+    // Asserted on the structured matches rather than on a text prefix: the
+    // egress rule now opens with its family guard, and a prefix check would
+    // pass vacuously.
     assert!(
-        !text(&rs, ChainKind::Forward)
-            .iter()
-            .any(|r| r.starts_with("iifname \"helios0\" oifname \"eth1\"")),
+        !rs.chain(ChainKind::Forward).any(|rule| {
+            rule.matches.contains(&Match::InIface("helios0".into()))
+                && rule.matches.contains(&Match::OutIface("eth1".into()))
+        }),
         "a client must not reach the gateway's LAN"
     );
 }

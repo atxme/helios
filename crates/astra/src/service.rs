@@ -212,9 +212,12 @@ impl SourceBudget {
         )
     }
 
+    /// The source is canonicalized first: a dual-stack `[::]` listener reports
+    /// an IPv4 client as `::ffff:a.b.c.d`, and read as IPv6 every one of them
+    /// would share the single `::/64` budget.
     fn key(source: IpAddr) -> [u8; 16] {
         let mut key = [0u8; 16];
-        match source {
+        match source.to_canonical() {
             IpAddr::V4(address) => key[..4].copy_from_slice(&address.octets()),
             // The /64 prefix, not the address: the host half is free to the
             // attacker and counting it would bound nothing.

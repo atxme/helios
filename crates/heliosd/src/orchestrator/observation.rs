@@ -19,15 +19,14 @@ use super::*;
 /// carry, otherwise a later reconnection would apply a PSK the client has
 /// already forgotten.
 ///
-/// # Known limitation: the derived VIP is not reconciled
+/// # The declared address is the one installed
 ///
-/// `helios_provisioning::assign_vip` derives the VIP from the peer's public
-/// key and never consults the address declared in `network.toml`. The two
-/// can therefore diverge. This function **keeps the declared address** and
-/// only logs the discrepancy: the operator remains the source of truth, and
-/// a silent switch of `AllowedIPs` would cut off traffic for a client that
-/// keeps its profile's address. Reconciling the two requires deciding who
-/// has authority — that is not this PSK-application function's job.
+/// The IPAM chooses a VIP at admission only, and `network.toml` keeps it;
+/// provisioning returns that persisted address rather than deriving one
+/// (`ADRESSAGE-IPV6.md` §3 bis.2). This function still **keeps the declared
+/// address** when a request names another — possible only if the file was
+/// reloaded in between — and logs the discrepancy: a silent switch of
+/// `AllowedIPs` would cut off a live session.
 ///
 /// # What is deliberately not done: persistence
 ///

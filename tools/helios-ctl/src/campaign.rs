@@ -220,6 +220,7 @@ fn response_for(kem_public: &[u8], gateway_key: &str) -> ProvisionResponse {
         kem_ciphertext: ciphertext,
         gateway_nonce: [7u8; 16],
         assigned_address: "100.64.1.2/32".into(),
+        assigned_address_v6: None,
         gateway_wg_public_key: gateway_key.into(),
         psk_lifetime_secs: 3600,
     }

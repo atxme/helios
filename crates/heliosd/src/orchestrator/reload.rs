@@ -31,6 +31,12 @@ const NETWORK_CONFIG_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// the interface comes up. Changing those in the file still requires a
 /// restart, and the daemon says so rather than pretending otherwise.
 ///
+/// The IPv6 tunnel prefix (`wg_address_v6`) is in the same position, and
+/// enforced: a file that changes it is not applied at all, with a warning,
+/// until the next start ([`NetworkConfig::check_hot_reload`],
+/// `ADRESSAGE-IPV6.md` §5.4). The peers' `address_v6` are part of the peer
+/// table and reload live.
+///
 /// The secrets never live in the file: they are restored from the running
 /// configuration by [`NetworkConfig::adopt_runtime_secrets_from`]. Skipping
 /// that step would erase the sealed private key and every negotiated PSK on
@@ -77,6 +83,12 @@ pub(super) fn spawn_network_config_watcher(
                 // every mutation through the API would be applied twice —
                 // once by the route, once by this watcher.
                 if merged == *running {
+                    continue;
+                }
+                // Refused here rather than sent: the orchestrator would refuse
+                // it too, after this loop had announced it as applied.
+                if let Err(refusal) = merged.check_hot_reload(&running) {
+                    warn!(%refusal, "network.toml changed on disk but cannot be applied live; keeping the running configuration");
                     continue;
                 }
             }

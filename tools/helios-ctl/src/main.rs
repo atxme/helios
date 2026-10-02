@@ -138,7 +138,7 @@ enum Cmd {
         /// Trafic capté par le tunnel : une ou plusieurs plages CIDR,
         /// séparées par des virgules.
         ///
-        /// Absent = tunnel complet (`0.0.0.0/0`), qui reste le bon défaut.
+        /// Absent = tunnel complet (`0.0.0.0/0, ::/0`), qui reste le bon défaut.
         /// Le préciser ici plutôt que dans chaque poste évite qu'un parc
         /// finisse avec autant de tables de routage que d'utilisateurs.
         /// Ex. : `--allowed-ips "100.64.0.0/10, 192.168.1.0/24"`
@@ -168,6 +168,10 @@ enum Cmd {
         /// VIP affichée par `heliosd peer add`, qui a fait l'admission.
         #[arg(long)]
         address: Option<String>,
+        /// VIP IPv6 du même pair (`address_v6` de `network.toml`, `…/128`),
+        /// s'il en a une. Absente, le profil n'en porte pas.
+        #[arg(long, requires = "address")]
+        address_v6: Option<String>,
         /// URL de l'API interne, pour la seule télémétrie.
         #[arg(long)]
         heliosd_url: Option<String>,
@@ -340,7 +344,7 @@ enum ProfileCmd {
         /// Trafic capté par le tunnel : une ou plusieurs plages CIDR,
         /// séparées par des virgules.
         ///
-        /// Absent = tunnel complet (`0.0.0.0/0`), qui reste le bon défaut.
+        /// Absent = tunnel complet (`0.0.0.0/0, ::/0`), qui reste le bon défaut.
         /// Le préciser ici plutôt que dans chaque poste évite qu'un parc
         /// finisse avec autant de tables de routage que d'utilisateurs.
         /// Ex. : `--allowed-ips "100.64.0.0/10, 192.168.1.0/24"`
@@ -412,6 +416,10 @@ struct Status {
     split_tunnel_cidrs: Vec<String>,
     mss_clamp: Option<u16>,
     captive_portal_gateway: Option<String>,
+    /// Absent from a gateway older than the IPv6 tunnel: read as "nothing to
+    /// report" rather than refused.
+    #[serde(default)]
+    ipv6: aether::net::Ipv6TunnelStatus,
 }
 
 #[derive(Debug, Deserialize)]
@@ -522,6 +530,14 @@ async fn cmd_status(client: &Client, base: &str) -> Result<()> {
             .map(|port| format!(" (UDP {port})"))
             .unwrap_or_else(|| " (port closed)".to_string())
     );
+    match &s.ipv6 {
+        aether::net::Ipv6TunnelStatus::NotConfigured => {}
+        aether::net::Ipv6TunnelStatus::Installed => println!("  {:<14} installed", "IPv6"),
+        aether::net::Ipv6TunnelStatus::Unavailable(reason) => println!(
+            "  {:<14} \x1b[33munavailable\x1b[0m — IPv4-only (degraded): {reason}",
+            "IPv6"
+        ),
+    }
     for peer in &s.peers {
         let pq = if peer.post_quantum { " [PQ]" } else { "" };
         let key = peer.public_key.get(..8).unwrap_or(&peer.public_key);
@@ -902,6 +918,23 @@ fn check_allowed_ips(value: Option<String>) -> Result<Option<String>> {
     )))
 }
 
+/// Checks an operator-supplied IPv6 VIP with Orion's own rule.
+///
+/// Refused here, by name, rather than by the round trip in
+/// [`profile::render`], whose message would blame the tooling for a value
+/// the operator typed. A blank value is no value: the key is never emitted
+/// empty.
+fn check_address_v6(value: Option<String>) -> Result<Option<String>> {
+    let Some(value) = value.map(|value| value.trim().to_string()) else {
+        return Ok(None);
+    };
+    if value.is_empty() {
+        return Ok(None);
+    }
+    orion_core::profile_import::validate_address_v6(&value).context("--address-v6")?;
+    Ok(Some(value))
+}
+
 /// Checks an operator-supplied SSH destination, before anything is admitted.
 ///
 /// Same placement argument as [`check_allowed_ips`], with more at stake: this
@@ -1029,6 +1062,7 @@ async fn main() -> Result<()> {
             gateway_certificate,
             gateway_pq_certificate,
             address,
+            address_v6,
             heliosd_url,
             trust_material,
         } => {
@@ -1037,12 +1071,14 @@ async fn main() -> Result<()> {
             let client_ca_dir = client_ca_dir.unwrap_or_else(key_nego::default_client_ca_dir);
             enroll::check_client_ca(&client_ca_dir)?;
             let allowed_ips = check_allowed_ips(allowed_ips)?;
+            let address_v6 = check_address_v6(address_v6)?;
             let offline = match (gateway_certificate, gateway_pq_certificate, address) {
                 (Some(gateway_certificate), Some(gateway_pq_certificate), Some(address)) => {
                     Some(enroll::OfflineInputs {
                         gateway_certificate,
                         gateway_pq_certificate,
                         address,
+                        address_v6,
                         heliosd_url,
                         trust_material,
                     })

@@ -286,6 +286,7 @@ pub(super) fn network(previous_psk: &str, pq_fingerprint: &str) -> NetworkConfig
         name: "orion".into(),
         public_key: CLIENT_KEY.into(),
         address: "100.64.1.2/32".into(),
+        address_v6: None,
         admin: false,
         preshared_key: Some(previous_psk.into()),
         key_negotiation_certificate_sha256: Some(CERTIFICATE_FINGERPRINT.into()),

@@ -39,3 +39,22 @@ pub(super) fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
 pub(super) fn text(rs: &Ruleset, kind: ChainKind) -> Vec<String> {
     rs.chain(kind).map(|r| r.to_string()).collect()
 }
+
+/// Every tunnel state. The `match` has no wildcard: a new state fails to
+/// compile here instead of silently escaping the invariants swept over it.
+pub(super) fn every_state() -> [TunnelState; 5] {
+    let _exhaustive = |state: TunnelState| match state {
+        TunnelState::Down
+        | TunnelState::Connecting
+        | TunnelState::Up
+        | TunnelState::Failed
+        | TunnelState::CaptivePortal => {}
+    };
+    [
+        TunnelState::Down,
+        TunnelState::Connecting,
+        TunnelState::Up,
+        TunnelState::Failed,
+        TunnelState::CaptivePortal,
+    ]
+}

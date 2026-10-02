@@ -6,15 +6,21 @@
 //! (ADR-001 §3 bis). Its only protection against leaking in clear is a
 //! lifecycle discipline:
 //!
-//! > The adapter (Wintun) carries `AllowedIPs = 0.0.0.0/0`. It is mounted on
-//! > connection and **is NEVER unmounted on failure** — neither in `Connecting`,
-//! > nor in `Failed`, nor after N attempts. It is removed only on **explicit
-//! > disconnection** by the user or application shutdown.
+//! > The adapter (Wintun) carries `AllowedIPs = 0.0.0.0/0, ::/0`. It is
+//! > mounted on connection and **is NEVER unmounted on failure** — neither in
+//! > `Connecting`, nor in `Failed`, nor after N attempts. It is removed only on
+//! > **explicit disconnection** by the user or application shutdown.
 //!
 //! As long as the adapter holds, packets go out toward WireGuard, which
 //! **drops** them if the session is dead: an attacker who blocks UDP 51820
 //! only gets a denial of service. If it falls, the default route falls back to
 //! the physical interface and traffic exits **in clear**.
+//!
+//! The drop covers what the adapter captures and nothing more. A profile
+//! stored with `0.0.0.0/0` alone — the default before `::/0` joined it — sends
+//! its IPv6 out of the physical interface even with the tunnel up; it is
+//! flagged by [`ClientProfile::ipv6_uncaptured_full_tunnel`], never widened
+//! behind the user's back.
 //!
 //! This is why the trait separates [`VpnBackend::up`] from
 //! [`VpnBackend::down`]: `down` is only called from
@@ -25,6 +31,7 @@
 //! real WireGuard backend (BoringTun + Wintun via `defguard_wireguard_rs`) is
 //! target-only, just like the `netlink` feature on the heliosd side.
 
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -76,13 +83,24 @@ pub type EventSink = Arc<dyn Fn(ClientEvent) + Send + Sync>;
 /// A WireGuard stack capable of mounting/unmounting a tunnel to a gateway.
 #[async_trait]
 pub trait VpnBackend: Send + Sync {
-    /// Mounts the adapter (`AllowedIPs = 0.0.0.0/0`) and configures the peer.
+    /// Mounts the adapter (the profile's `AllowedIPs`, by default
+    /// `0.0.0.0/0, ::/0`) and configures the peer.
     ///
     /// **Contract**: on failure, the implementation must **not** unmount
     /// the adapter if it succeeded in creating it — letting WireGuard drop
     /// packets is better than giving back the physical route to clear traffic.
     /// Must be idempotent: calling `up` again on an already-mounted adapter
     /// reconfigures the peer without recreating it.
+    ///
+    /// A backend able to read back what the driver applied reports it as
+    /// [`ClientEvent::Capture`] on every call. A capture narrower than the
+    /// profile is reported, not returned as an error: the adapter stays
+    /// mounted either way, so failing would not stop the leak, only drop
+    /// what *is* captured (see `wireguard`'s module documentation).
+    ///
+    /// `profile.endpoint` is a **literal** `IP:port` here, chosen by
+    /// [`VpnController`] from a single resolution; a backend refuses a name
+    /// instead of resolving it a second time (`endpoint_resolution`).
     async fn up(&self, profile: &ClientProfile, sink: &EventSink) -> anyhow::Result<()>;
 
     /// Unmounts the adapter. **Called only on explicit disconnection.**
@@ -215,20 +233,13 @@ async fn upgrade_to_post_quantum(
         }
     };
 
-    // The announced VIP must match the profile's. We don't silently correct
-    // it: the adapter's address is already set, and changing it under a live
-    // session's feet would do more harm than good.
-    if let Some(declared) = profile.address.as_deref() {
-        if declared != outcome.address {
-            sink(ClientEvent::log(
-                "warn",
-                format!(
-                    "La gateway attribue {} alors que le profil déclare {declared} — \
-                     corriger le profil puis se reconnecter",
-                    outcome.address
-                ),
-            ));
-        }
+    if let Some(warning) = stale_profile_address(profile.address.as_deref(), &outcome.address) {
+        sink(ClientEvent::log("warn", warning));
+    }
+    if let Some(warning) =
+        stale_profile_address_v6(profile.address_v6.as_deref(), outcome.address_v6.as_deref())
+    {
+        sink(ClientEvent::log("warn", warning));
     }
 
     let upgraded = ClientProfile {
@@ -267,6 +278,80 @@ async fn upgrade_to_post_quantum(
                 ),
             ));
         }
+    }
+}
+
+/// What to tell the user when the profile's VIP is not the one the gateway
+/// announced, or `None` when they agree.
+///
+/// The gateway announces the address persisted for this peer at admission —
+/// the one its `AllowedIPs` carry — and no longer a re-derivation that could
+/// disagree with it (`ADRESSAGE-IPV6.md` §3 bis.2). A difference therefore
+/// means this profile is stale: it was emitted for another address, or
+/// before the peer was readmitted. Its traffic leaves from an address the
+/// gateway drops. The fix is a profile re-emitted by the operator, from the
+/// gateway's own record; Orion neither edits the address by hand nor
+/// rewrites the profile on its own, like for `AllowedIPs`: the adapter's
+/// address is already set, and changing it under a live session's feet would
+/// do more harm than good.
+fn stale_profile_address(profile_address: Option<&str>, announced: &str) -> Option<String> {
+    let declared = profile_address?;
+    (declared != announced).then(|| {
+        format!(
+            "Profil périmé : la gateway a enregistré {announced} pour ce poste, le profil \
+             déclare {declared}. La gateway rejette le trafic émis depuis {declared}. Demander \
+             à l'opérateur un profil réémis (helios-ctl profile emit) puis le réimporter ; \
+             Orion ne modifie pas le profil de lui-même."
+        )
+    })
+}
+
+/// The same question for the IPv6 VIP, which either side may lack.
+///
+/// The gateway announces `assigned_address_v6` from the same record as the
+/// IPv4 VIP (`ADRESSAGE-IPV6.md` §7.1), and its absence means it holds none
+/// for this peer — a gateway without IPv6, or one older than the field. All
+/// three disagreements name a stale profile, in the same words as the IPv4
+/// one, and none rewrites it:
+///
+/// - another address: the gateway drops the IPv6 traffic this profile emits;
+/// - an address the gateway does not hold: the same, for the same reason;
+/// - no address where the gateway holds one: nothing is dropped, the tunnel
+///   simply stays IPv4-only until the profile is re-emitted (§8).
+///
+/// Addresses are compared as addresses: `FD3C::2/128` and `fd3c::2/128` are
+/// one VIP, and calling that a divergence would send the user to the
+/// operator for nothing.
+fn stale_profile_address_v6(
+    profile_address: Option<&str>,
+    announced: Option<&str>,
+) -> Option<String> {
+    let same = |declared: &str, announced: &str| match (
+        aether::net::parse_vip_v6(declared.trim()),
+        aether::net::parse_vip_v6(announced.trim()),
+    ) {
+        (Ok(declared), Ok(announced)) => declared == announced,
+        _ => declared.trim() == announced.trim(),
+    };
+    let reissue = "Demander à l'opérateur un profil réémis (helios-ctl profile emit) puis le \
+                   réimporter ; Orion ne modifie pas le profil de lui-même.";
+    match (profile_address, announced) {
+        (None, None) => None,
+        (Some(declared), Some(announced)) if same(declared, announced) => None,
+        (Some(declared), Some(announced)) => Some(format!(
+            "Profil périmé : la gateway a enregistré {announced} pour ce poste, le profil \
+             déclare {declared}. La gateway rejette le trafic IPv6 émis depuis {declared}. \
+             {reissue}"
+        )),
+        (Some(declared), None) => Some(format!(
+            "Profil périmé : la gateway n'a enregistré aucune adresse IPv6 pour ce poste, le \
+             profil déclare {declared}. La gateway rejette le trafic IPv6 émis depuis \
+             {declared}. {reissue}"
+        )),
+        (None, Some(announced)) => Some(format!(
+            "Profil périmé : la gateway a enregistré {announced} pour ce poste, le profil ne \
+             déclare aucune adresse IPv6 : le tunnel reste en IPv4 seule. {reissue}"
+        )),
     }
 }
 
@@ -467,7 +552,20 @@ impl VpnController {
                 return;
             }
 
-            if let Err(e) = backend.up(&profile, &sink).await {
+            // The copy the data plane receives: the endpoint is a literal,
+            // resolved once here. The profile itself keeps its name.
+            let mounted = match classic_data_plane_profile(&profile, &sink).await {
+                Ok(mounted) => mounted,
+                Err(e) => {
+                    sink(ClientEvent::state(TunnelState::Failed));
+                    sink(ClientEvent::Error {
+                        message: format!("échec de connexion: {e}"),
+                    });
+                    // Deliberately no `backend.down(...)` here either.
+                    return;
+                }
+            };
+            if let Err(e) = backend.up(&mounted, &sink).await {
                 sink(ClientEvent::state(TunnelState::Failed));
                 sink(ClientEvent::Error {
                     message: format!("échec de connexion: {e}"),
@@ -478,8 +576,9 @@ impl VpnController {
             // Classic tunnel up: attempt the post-quantum upgrade. This step
             // is long (waiting for a handshake) but stays within the
             // connection task, so it's cleanly cancelled by `abort_task` on
-            // reconnection or disconnection.
-            upgrade_to_post_quantum(&backend, &profile, &sink).await;
+            // reconnection or disconnection. It remounts from the same copy,
+            // so the peer keeps the address it was given.
+            upgrade_to_post_quantum(&backend, &mounted, &sink).await;
         });
         *self.task.lock().await = Some(handle);
     }
@@ -804,48 +903,62 @@ async fn connect_with_key_negotiation(
         // the second attempt discarded the third: the log showed one warning
         // then a final error, and the retry the user was promised never
         // happened.
-        let negotiated =
-            match crate::key_negotiation::prepare_for_profile(profile, identities).await {
-                Ok(negotiated) => negotiated,
-                Err(error) => {
-                    // Also to `tracing`, and not only to the UI: the event sink
-                    // feeds a window the user has usually already closed, while
-                    // the file is what gets pasted into a bug report. Without
-                    // this line `orion.log` showed three dial attempts two
-                    // seconds apart and not one word about why any of them
-                    // failed — the retry looked like the whole story.
-                    tracing::warn!(
-                        attempt,
-                        attempts = KEY_NEGOTIATION_ATTEMPTS,
-                        %endpoint,
-                        error = format!("{error:#}"),
-                        "key negotiation: attempt failed, nothing installed on the data plane"
-                    );
-                    sink(ClientEvent::log(
-                        "warn",
-                        format!(
-                            "négociation {attempt}/{KEY_NEGOTIATION_ATTEMPTS} : échec — \
+        let (negotiated, wireguard_endpoint) = match prepare_attempt(profile, identities).await {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                // Also to `tracing`, and not only to the UI: the event sink
+                // feeds a window the user has usually already closed, while
+                // the file is what gets pasted into a bug report. Without
+                // this line `orion.log` showed three dial attempts two
+                // seconds apart and not one word about why any of them
+                // failed — the retry looked like the whole story.
+                tracing::warn!(
+                    attempt,
+                    attempts = KEY_NEGOTIATION_ATTEMPTS,
+                    %endpoint,
+                    error = format!("{error:#}"),
+                    "key negotiation: attempt failed, nothing installed on the data plane"
+                );
+                sink(ClientEvent::log(
+                    "warn",
+                    format!(
+                        "négociation {attempt}/{KEY_NEGOTIATION_ATTEMPTS} : échec — \
                          {error:#}. Aucun PSK installé sur le plan de données."
-                        ),
-                    ));
-                    let terminal = is_terminal_negotiation_error(&error);
-                    if terminal {
-                        sink(ClientEvent::log(
-                            "error",
-                            "échec cryptographique définitif : aucune nouvelle tentative de \
+                    ),
+                ));
+                let terminal = is_terminal_negotiation_error(&error);
+                if terminal {
+                    sink(ClientEvent::log(
+                        "error",
+                        "échec cryptographique définitif : aucune nouvelle tentative de \
                          négociation ne peut réparer l’identité présentée."
-                                .to_string(),
-                        ));
-                        return Err(error);
-                    }
-                    last_error = Some(error);
-                    if attempt < KEY_NEGOTIATION_ATTEMPTS {
-                        tokio::time::sleep(KEY_NEGOTIATION_RETRY_DELAY).await;
-                    }
-                    continue;
+                            .to_string(),
+                    ));
+                    return Err(error);
                 }
-            };
+                last_error = Some(error);
+                if attempt < KEY_NEGOTIATION_ATTEMPTS {
+                    tokio::time::sleep(KEY_NEGOTIATION_RETRY_DELAY).await;
+                }
+                continue;
+            }
+        };
         let mode = negotiated.mode;
+        // Which address answered, in which family, and what was passed over
+        // on the way: a broken IPv6 path that IPv4 replaced is said here, as
+        // a warning, never absorbed in silence.
+        let (level, route) = negotiated.selection().describe();
+        sink(ClientEvent::log(
+            level,
+            format!("négociation {attempt}/{KEY_NEGOTIATION_ATTEMPTS} : {route}"),
+        ));
+        sink(ClientEvent::log(
+            "info",
+            format!(
+                "négociation {attempt}/{KEY_NEGOTIATION_ATTEMPTS} : {}",
+                wireguard_endpoint.describe(&profile.endpoint)
+            ),
+        ));
         sink(ClientEvent::log(
             "info",
             format!(
@@ -858,6 +971,11 @@ async fn connect_with_key_negotiation(
         let confirmation_timeout = negotiated.confirmation_timeout;
         let prepared_at = tokio::time::Instant::now();
         let negotiated_profile = ClientProfile {
+            // The literal chosen above, never the name: the data plane must
+            // not resolve it a second time. Only this ephemeral copy carries
+            // it; the receipt below keeps the profile as stored, so a
+            // renegotiation resolves the name afresh.
+            endpoint: wireguard_endpoint.address.to_string(),
             preshared_key: negotiated
                 .psk
                 .as_ref()
@@ -955,6 +1073,147 @@ async fn connect_with_key_negotiation(
         ),
     ));
     Err(error)
+}
+
+/// The literal address the tunnel's peer is given, and how it was chosen.
+///
+/// `defguard_wireguard_rs` resolves a name on its own, synchronously, and
+/// keeps the first answer: a second `getaddrinfo`, free to return the other
+/// family than the one the negotiation just reached. Handing it a literal is
+/// what makes the negotiation and the tunnel agree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WireGuardEndpoint {
+    address: SocketAddr,
+    origin: EndpointOrigin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EndpointOrigin {
+    /// The WireGuard endpoint names the negotiation's host: the address that
+    /// negotiated, on the WireGuard port.
+    Negotiated,
+    /// No negotiation on that host — a classic profile, or a negotiation
+    /// endpoint naming another host: the first candidate of the WireGuard
+    /// host's own single resolution. WireGuard offers one peer endpoint, so
+    /// there is nothing to race there.
+    FirstCandidate,
+}
+
+impl WireGuardEndpoint {
+    /// The log line naming the address and family, for the user.
+    fn describe(&self, endpoint: &str) -> String {
+        let origin = match self.origin {
+            EndpointOrigin::Negotiated => "l'adresse qui a négocié",
+            EndpointOrigin::FirstCandidate => "premier candidat de sa résolution",
+        };
+        format!(
+            "endpoint WireGuard {endpoint} : {} {} ({origin})",
+            crate::endpoint_resolution::family(&self.address),
+            self.address
+        )
+    }
+}
+
+/// The copy of `profile` the data plane receives: identical, but for an
+/// endpoint that is now the literal `address`.
+///
+/// A copy, never an edit: the stored profile keeps the name the operator
+/// wrote, so the next connection resolves it again — the gateway may have
+/// moved, or the network may have gained or lost a family.
+fn with_wireguard_endpoint(profile: &ClientProfile, address: SocketAddr) -> ClientProfile {
+    ClientProfile {
+        endpoint: address.to_string(),
+        ..profile.clone()
+    }
+}
+
+/// Resolves the WireGuard endpoint once and keeps its first RFC 8305
+/// candidate.
+///
+/// The error keeps the wording the backend used when it resolved the name
+/// itself, so a profile pointing nowhere reads as it always did.
+async fn resolve_wireguard_endpoint(endpoint: &str) -> anyhow::Result<SocketAddr> {
+    let candidates = crate::endpoint_resolution::resolve_candidates(endpoint)
+        .await
+        .map_err(|e| anyhow::anyhow!("endpoint `{endpoint}` invalide : {e:#}"))?;
+    candidates.first().copied().ok_or_else(|| {
+        anyhow::anyhow!("endpoint `{endpoint}` invalide : aucune adresse utilisable")
+    })
+}
+
+/// A classic connection's data-plane copy: validated, then resolved once.
+///
+/// The validation is the one `up()` starts with, made **before** the
+/// resolver is asked, so an incomplete profile is still refused before any
+/// network activity. `up()` runs it again on the copy, unchanged.
+async fn classic_data_plane_profile(
+    profile: &ClientProfile,
+    sink: &EventSink,
+) -> anyhow::Result<ClientProfile> {
+    profile.validate_for_data_plane()?;
+    let target = WireGuardEndpoint {
+        address: resolve_wireguard_endpoint(&profile.endpoint).await?,
+        origin: EndpointOrigin::FirstCandidate,
+    };
+    sink(ClientEvent::log("info", target.describe(&profile.endpoint)));
+    Ok(with_wireguard_endpoint(profile, target.address))
+}
+
+/// One negotiation attempt's preparation: each host resolved once, then the
+/// negotiation, then the WireGuard endpoint that follows from both.
+///
+/// The WireGuard host is resolved **before** negotiating when it differs
+/// from the negotiation host. A name that does not resolve is then refused
+/// with nothing prepared on the gateway; resolving it afterwards would drop
+/// a prepared transaction, and the gateway arms ten seconds of rest after
+/// every such rollback.
+async fn prepare_attempt(
+    profile: &ClientProfile,
+    identities: &dyn crate::key_negotiation::IdentityProvider,
+) -> anyhow::Result<(crate::key_negotiation::NegotiatedKey, WireGuardEndpoint)> {
+    enum Plan {
+        FromNegotiation(u16),
+        Resolved(SocketAddr),
+    }
+    let plan = match profile.key_negotiation.as_ref() {
+        // Refused by the negotiation below with its own message, before
+        // anything is resolved.
+        None => None,
+        Some(settings)
+            if crate::endpoint_resolution::same_host(&profile.endpoint, &settings.endpoint) =>
+        {
+            let port = crate::endpoint_resolution::port_of(&profile.endpoint).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "endpoint `{}` invalide : port UDP absent ou nul",
+                    profile.endpoint
+                )
+            })?;
+            Some(Plan::FromNegotiation(port))
+        }
+        // Two names are two hosts: each is resolved once, never merged.
+        Some(_) => Some(Plan::Resolved(
+            resolve_wireguard_endpoint(&profile.endpoint).await?,
+        )),
+    };
+    let negotiated = crate::key_negotiation::prepare_for_profile(profile, identities).await?;
+    let wireguard = match plan {
+        Some(Plan::FromNegotiation(port)) => {
+            // `set_port` rather than a new address: an IPv6 candidate keeps
+            // its scope identifier.
+            let mut address = negotiated.remote();
+            address.set_port(port);
+            WireGuardEndpoint {
+                address,
+                origin: EndpointOrigin::Negotiated,
+            }
+        }
+        Some(Plan::Resolved(address)) => WireGuardEndpoint {
+            address,
+            origin: EndpointOrigin::FirstCandidate,
+        },
+        None => anyhow::bail!("profile has no key-negotiation settings"),
+    };
+    Ok((negotiated, wireguard))
 }
 
 /// Installs the negotiated slot and commits it, or reports why it could not.

@@ -34,7 +34,8 @@ use std::sync::{
 };
 
 use aether::{
-    FirewallPolicy, HeliosEvent, InstallPskRequest, NetworkConfig, OrchestratorCmd, TunnelState,
+    net::Ipv6TunnelStatus, FirewallPolicy, HeliosEvent, InstallPskRequest, NetworkConfig,
+    OrchestratorCmd, TunnelState,
 };
 use axum::{
     body::Body,
@@ -122,6 +123,10 @@ pub struct AppState {
     /// the orchestrator publishes. It is emptied when the interface goes down,
     /// because a stale list of "connected" peers is worse than no list.
     pub peer_runtime: Arc<RwLock<Vec<PeerStatus>>>,
+    /// What the orchestrator's last bring-up did with the IPv6 tunnel prefix,
+    /// published the same way as [`Self::peer_runtime`]: the API reports it
+    /// and cannot change it (`ADRESSAGE-IPV6.md` §6.2).
+    pub ipv6: Arc<RwLock<Ipv6TunnelStatus>>,
 }
 
 /// Public key-negotiation material, exactly as an Orion profile pins it.
@@ -167,6 +172,7 @@ impl AppState {
             operator_campaign: None,
             tpm: None,
             peer_runtime: Arc::new(RwLock::new(Vec::new())),
+            ipv6: Arc::new(RwLock::new(Ipv6TunnelStatus::default())),
         }
     }
 
@@ -441,7 +447,7 @@ async fn require_json_for_mutations(request: Request<Body>, next: Next) -> Respo
 }
 
 /// Launches the HTTP server and blocks until it stops.
-pub async fn serve(state: AppState, bind: &str) -> anyhow::Result<()> {
+pub async fn serve(state: AppState, bind: std::net::SocketAddr) -> anyhow::Result<()> {
     let app = router(state.clone());
 
     let listener = tokio::net::TcpListener::bind(bind).await?;

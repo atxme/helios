@@ -45,7 +45,9 @@ const profile = (overrides: Partial<ClientProfile> = {}): ClientProfile => {
     has_private_key: true,
     has_static_psk: false,
     address: '100.64.1.2/32',
-    allowed_ips: '0.0.0.0/0',
+    address_v6: null,
+    allowed_ips: '0.0.0.0/0, ::/0',
+    ipv6_uncaptured_full_tunnel: false,
     persistent_keepalive: 25,
     heliosd_url: 'http://100.64.0.1:8080',
     ssh_target: null,
@@ -78,6 +80,7 @@ const noIssues: ProfileIssues = {
   peer_public_key: null,
   preshared_key: null,
   address: null,
+  address_v6: null,
   allowed_ips: null,
   persistent_keepalive: null,
   heliosd_url: null,
@@ -777,7 +780,7 @@ describe('ProfilesView interactions', () => {
     // Under a preset the list is stated, never offered for editing, and one
     // caption explains the chosen segment — not all four at once.
     expect(pressed('Tout')).toBe('true')
-    expect((field() as HTMLInputElement).value).toBe('0.0.0.0/0')
+    expect((field() as HTMLInputElement).value).toBe('0.0.0.0/0, ::/0')
     expect(field().hasAttribute('readonly')).toBe(true)
     expect(screen.getByText('Internet et réseaux privés')).toBeTruthy()
     expect(screen.queryByText('Uniquement la passerelle')).toBeNull()
@@ -802,7 +805,7 @@ describe('ProfilesView interactions', () => {
     // the caret already in it.
     fireEvent.click(screen.getByRole('button', { name: 'Personnalisé' }))
     expect(pressed('Personnalisé')).toBe('true')
-    expect((field() as HTMLInputElement).value).toBe('0.0.0.0/0')
+    expect((field() as HTMLInputElement).value).toBe('0.0.0.0/0, ::/0')
     expect(field().hasAttribute('readonly')).toBe(false)
     await waitFor(() => expect(document.activeElement).toBe(field()))
 
@@ -816,6 +819,77 @@ describe('ProfilesView interactions', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Enregistrer' }))
     await waitFor(() => expect(handlers.onSave).toHaveBeenCalledOnce())
     expect(handlers.onSave.mock.calls[0][0].allowed_ips).toBe('192.168.42.0/24')
+  })
+
+  /**
+   * The IPv6 address sits next to the IPv4 one, in the same field component,
+   * with the core's message under it; and «Helios seul» then reaches the
+   * gateway in both families — `::1` of the profile's `/64`.
+   */
+  it('edits the IPv6 address and follows it in the gateway preset', async () => {
+    const handlers = callbacks()
+    render(
+      <ProfilesView
+        config={{
+          profiles: [profile({ address_v6: 'fd3c:91a2:7e04::2/128' })],
+          selected: 'portable',
+        }}
+        pathImport={null}
+        {...handlers}
+      />,
+    )
+    await waitFor(() => expect(api.validateProfile).toHaveBeenCalled())
+    const ipv6 = () => screen.getByLabelText('Adresse virtuelle IPv6') as HTMLInputElement
+    expect(ipv6().value).toBe('fd3c:91a2:7e04::2/128')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Avancé' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Helios seul' }))
+    const field = () => screen.getByRole('textbox', { name: 'Trafic via le tunnel' })
+    expect((field() as HTMLInputElement).value).toBe('100.64.0.1/32, fd3c:91a2:7e04::1/128')
+
+    // The core judges the field; the screen prints what it says, where the
+    // value is typed.
+    api.validateProfile.mockResolvedValue({
+      ...noIssues,
+      address_v6: 'adresse IPv6 invalide : /64 au lieu de /128',
+    })
+    fireEvent.change(ipv6(), { target: { value: 'fd3c:91a2:7e04::/64' } })
+    expect(
+      await screen.findByText('adresse IPv6 invalide : /64 au lieu de /128', undefined, {
+        timeout: 2000,
+      }),
+    ).toBeTruthy()
+
+    api.validateProfile.mockResolvedValue(noIssues)
+    fireEvent.change(ipv6(), { target: { value: 'fd3c:91a2:7e04::9/128' } })
+    await waitFor(
+      () => expect(screen.queryByText('adresse IPv6 invalide : /64 au lieu de /128')).toBeNull(),
+      { timeout: 2000 },
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Enregistrer' }))
+    await waitFor(() => expect(handlers.onSave).toHaveBeenCalledOnce())
+    expect(handlers.onSave.mock.calls[0][0].address_v6).toBe('fd3c:91a2:7e04::9/128')
+  })
+
+  it('sends no IPv6 address for a profile without one', async () => {
+    const handlers = callbacks()
+    render(
+      <ProfilesView
+        config={{ profiles: [profile()], selected: 'portable' }}
+        pathImport={null}
+        {...handlers}
+      />,
+    )
+    await waitFor(() => expect(api.validateProfile).toHaveBeenCalled())
+    expect((screen.getByLabelText('Adresse virtuelle IPv6') as HTMLInputElement).value).toBe('')
+    fireEvent.click(screen.getByRole('button', { name: 'Avancé' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Helios seul' }))
+    expect(
+      (screen.getByRole('textbox', { name: 'Trafic via le tunnel' }) as HTMLInputElement).value,
+    ).toBe('100.64.0.1/32')
+    fireEvent.click(screen.getByRole('button', { name: 'Enregistrer' }))
+    await waitFor(() => expect(handlers.onSave).toHaveBeenCalledOnce())
+    expect(handlers.onSave.mock.calls[0][0].address_v6).toBeNull()
   })
 
   /**
@@ -843,6 +917,79 @@ describe('ProfilesView interactions', () => {
     const field = screen.getByRole('textbox', { name: 'Trafic via le tunnel' })
     expect((field as HTMLInputElement).value).toBe('10.9.0.0/16, 192.168.1.0/24')
     expect(field.hasAttribute('readonly')).toBe(false)
+    // A split tunnel is a decision, not a leak: no IPv6 warning for it.
+    expect(screen.queryByText(/IPv6 sort en clair/)).toBeNull()
+  })
+
+  /**
+   * The full tunnel stored before `::/0` joined the default: warned about,
+   * never rewritten.
+   *
+   * Loading it must not read as an edit — the list on screen is the list on
+   * disk — and only the user's own click on «Tout» widens it.
+   */
+  it('warns on an IPv4-only full tunnel without rewriting it', async () => {
+    const handlers = callbacks()
+    render(
+      <ProfilesView
+        config={{
+          profiles: [profile({ allowed_ips: '0.0.0.0/0', ipv6_uncaptured_full_tunnel: true })],
+          selected: 'portable',
+        }}
+        pathImport={null}
+        {...handlers}
+      />,
+    )
+    await waitFor(() => expect(api.validateProfile).toHaveBeenCalled())
+    expect(screen.getByRole('status').textContent).toBe('Profil à jour')
+    fireEvent.click(screen.getByRole('button', { name: 'Avancé' }))
+
+    const pressed = (name: string) =>
+      screen.getByRole('button', { name }).getAttribute('aria-pressed')
+    const field = () => screen.getByRole('textbox', { name: 'Trafic via le tunnel' })
+
+    // No longer «Tout»: that preset now captures IPv6 too.
+    expect(pressed('Personnalisé')).toBe('true')
+    expect(pressed('Tout')).toBe('false')
+    expect((field() as HTMLInputElement).value).toBe('0.0.0.0/0')
+    expect(screen.getByText(/Tunnel complet IPv4 seulement : le trafic IPv6 sort en clair/))
+      .toBeTruthy()
+    // Opening the fold and reading the warning is still not an edit.
+    expect(screen.getByRole('status').textContent).toBe('Profil à jour')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Tout' }))
+    expect(pressed('Tout')).toBe('true')
+    expect((field() as HTMLInputElement).value).toBe('0.0.0.0/0, ::/0')
+    expect(screen.queryByText(/IPv6 sort en clair/)).toBeNull()
+    expect(screen.getByRole('status').textContent).toBe('Modifications non enregistrées')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Enregistrer' }))
+    await waitFor(() => expect(handlers.onSave).toHaveBeenCalledOnce())
+    expect(handlers.onSave.mock.calls[0][0].allowed_ips).toBe('0.0.0.0/0, ::/0')
+  })
+
+  /**
+   * The warning follows the list being typed, not the stored one: a user who
+   * writes the old full tunnel by hand is told what it leaves out.
+   */
+  it('warns as soon as a typed list captures IPv4 alone', async () => {
+    const handlers = callbacks()
+    render(
+      <ProfilesView
+        config={{ profiles: [profile()], selected: 'portable' }}
+        pathImport={null}
+        {...handlers}
+      />,
+    )
+    await waitFor(() => expect(api.validateProfile).toHaveBeenCalled())
+    fireEvent.click(screen.getByRole('button', { name: 'Avancé' }))
+    expect(screen.queryByText(/IPv6 sort en clair/)).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Personnalisé' }))
+    fireEvent.change(screen.getByRole('textbox', { name: 'Trafic via le tunnel' }), {
+      target: { value: '0.0.0.0/0' },
+    })
+    expect(screen.getByText(/IPv6 sort en clair/)).toBeTruthy()
   })
 
   /**

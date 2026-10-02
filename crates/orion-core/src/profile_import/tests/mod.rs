@@ -1,5 +1,6 @@
 //! Import tests for the `orion-profile` v1 document, grouped by capability.
 
+mod address_v6;
 mod document_intake;
 mod field_inspection;
 mod fixtures;

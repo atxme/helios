@@ -27,6 +27,7 @@ pub mod key_negotiation;
 pub mod locked;
 pub(crate) mod ml_dsa;
 pub mod mtu;
+pub mod net;
 pub mod policy;
 pub mod pq;
 pub mod private_file;
@@ -39,7 +40,7 @@ pub mod wg;
 
 pub use config::{
     NetworkConfig, NordvpnMeshnetConfig, WgPeer, API_BIND_LOOPBACK, API_PORT, DEFAULT_WG_ADDRESS,
-    DEFAULT_WG_API_URL,
+    DEFAULT_WG_API_URL, SPEEDTEST_BIND_LOOPBACK,
 };
 pub use error::{HeliosError, Result};
 pub use events::{HeliosEvent, InstallPskRequest, ObserveHandshakeRequest, OrchestratorCmd};

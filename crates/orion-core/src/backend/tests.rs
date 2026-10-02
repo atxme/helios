@@ -37,6 +37,81 @@ fn network_timeout_remains_retryable() {
     assert!(!is_terminal_negotiation_error(&error));
 }
 
+/// §9 criterion 11, client side: the gateway now announces the address it
+/// persisted, which is the one a profile emitted from its record carries —
+/// so a connection made with that profile reports no divergence.
+#[test]
+fn a_profile_carrying_the_persisted_address_raises_no_warning() {
+    assert_eq!(
+        stale_profile_address(Some("100.64.1.2/32"), "100.64.1.2/32"),
+        None
+    );
+    assert_eq!(stale_profile_address(None, "100.64.1.2/32"), None);
+}
+
+/// A divergence names both addresses, calls the profile stale and asks for a
+/// re-emitted one, without telling the user to type the announced address in.
+#[test]
+fn a_profile_with_another_address_is_reported_stale() {
+    let warning = stale_profile_address(Some("100.98.165.218/32"), "100.124.38.30/32")
+        .expect("a divergence is reported");
+    assert!(warning.contains("100.98.165.218/32"), "{warning}");
+    assert!(warning.contains("100.124.38.30/32"), "{warning}");
+    assert!(warning.contains("périmé"), "{warning}");
+    assert!(warning.contains("réémis"), "{warning}");
+    assert!(!warning.contains("corriger le profil"), "{warning}");
+}
+
+/// Agreement in either shape raises nothing: both without IPv6 — every
+/// profile of a gateway without it (§8) — or the same VIP in two spellings.
+#[test]
+fn a_profile_agreeing_on_the_ipv6_address_raises_no_warning() {
+    assert_eq!(stale_profile_address_v6(None, None), None);
+    assert_eq!(
+        stale_profile_address_v6(Some("fd3c:91a2:7e04::2/128"), Some("fd3c:91a2:7e04::2/128")),
+        None
+    );
+    assert_eq!(
+        stale_profile_address_v6(
+            Some("FD3C:91A2:7E04:0::2/128"),
+            Some("fd3c:91a2:7e04::2/128")
+        ),
+        None
+    );
+}
+
+/// Each IPv6 divergence names the stale profile in the IPv4 message's words
+/// and asks for a re-emitted one; none tells the user to edit it.
+#[test]
+fn a_profile_with_another_ipv6_address_is_reported_stale() {
+    for (declared, announced, names) in [
+        (
+            Some("fd3c:91a2:7e04::2/128"),
+            Some("fd3c:91a2:7e04::9/128"),
+            vec!["fd3c:91a2:7e04::2/128", "fd3c:91a2:7e04::9/128", "rejette"],
+        ),
+        (
+            Some("fd3c:91a2:7e04::2/128"),
+            None,
+            vec!["fd3c:91a2:7e04::2/128", "aucune adresse IPv6", "rejette"],
+        ),
+        (
+            None,
+            Some("fd3c:91a2:7e04::9/128"),
+            vec!["fd3c:91a2:7e04::9/128", "IPv4 seule"],
+        ),
+    ] {
+        let warning = stale_profile_address_v6(declared, announced)
+            .unwrap_or_else(|| panic!("{declared:?} / {announced:?} must be reported"));
+        assert!(warning.starts_with("Profil périmé"), "{warning}");
+        assert!(warning.contains("réémis"), "{warning}");
+        assert!(warning.contains("ne modifie pas le profil"), "{warning}");
+        for name in names {
+            assert!(warning.contains(name), "{name}: {warning}");
+        }
+    }
+}
+
 fn sink() -> EventSink {
     Arc::new(|_| {})
 }
@@ -596,4 +671,168 @@ fn incomplete_profile_rejected_before_the_network() {
     assert!(p.validate().is_err());
 
     assert!(profile().validate().is_ok());
+}
+
+/// Records the endpoint of every profile `up()` receives.
+#[derive(Default)]
+struct EndpointRecorder {
+    endpoints: std::sync::Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl VpnBackend for EndpointRecorder {
+    async fn up(&self, profile: &ClientProfile, _sink: &EventSink) -> anyhow::Result<()> {
+        self.endpoints
+            .lock()
+            .unwrap()
+            .push(profile.endpoint.clone());
+        Ok(())
+    }
+
+    async fn down(&self, _sink: &EventSink) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn last_handshake_age(&self) -> Option<Duration> {
+        None
+    }
+
+    fn adapter_is_up(&self) -> bool {
+        false
+    }
+
+    fn kind(&self) -> &'static str {
+        "endpoint-recorder"
+    }
+}
+
+/// Lets the connection task run to its end: classic, no URL, no PSK.
+async fn connect_classic(profile: ClientProfile) -> (Arc<EndpointRecorder>, Vec<String>) {
+    let backend = Arc::new(EndpointRecorder::default());
+    let ctrl = VpnController::new(backend.clone());
+    let (sink, lines) = logging_sink();
+    ctrl.connect(profile, sink).await;
+    if let Some(task) = ctrl.task.lock().await.take() {
+        task.await.unwrap();
+    }
+    let lines = lines.lock().unwrap().clone();
+    (backend, lines)
+}
+
+/// A literal endpoint reaches the data plane as written, in both families.
+#[tokio::test]
+async fn a_literal_endpoint_is_mounted_as_written() {
+    for literal in ["[2001:db8::1]:51820", "203.0.113.10:51820"] {
+        let mut p = profile();
+        p.endpoint = literal.into();
+        let (backend, _) = connect_classic(p).await;
+        assert_eq!(
+            *backend.endpoints.lock().unwrap(),
+            vec![literal.to_string()]
+        );
+    }
+}
+
+/// A name is resolved once by the controller, and the backend receives the
+/// literal it chose — never the name, which would be resolved a second time.
+/// `localhost` resolves from the hosts file: no network involved.
+#[tokio::test]
+async fn a_hostname_endpoint_is_mounted_as_the_literal_it_resolved_to() {
+    let mut p = profile();
+    p.endpoint = "localhost:51820".into();
+    let stored = p.clone();
+    let (backend, lines) = connect_classic(p).await;
+
+    let mounted = backend.endpoints.lock().unwrap().clone();
+    assert_eq!(mounted.len(), 1, "{mounted:?}");
+    let literal: SocketAddr = mounted[0]
+        .parse()
+        .unwrap_or_else(|_| panic!("{} is not a literal", mounted[0]));
+    assert!(literal.ip().is_loopback(), "{literal}");
+    assert_eq!(literal.port(), 51820);
+    assert_eq!(stored.endpoint, "localhost:51820");
+    let named = format!(
+        "endpoint WireGuard localhost:51820 : {} {literal} (premier candidat de sa résolution)",
+        crate::endpoint_resolution::family(&literal)
+    );
+    assert!(lines.contains(&named), "{lines:?}");
+}
+
+/// A name that cannot be resolved fails the connection explicitly, naming
+/// the endpoint, and the backend is never reached.
+#[tokio::test]
+async fn an_unresolvable_endpoint_fails_explicitly_before_the_backend() {
+    let backend = Arc::new(EndpointRecorder::default());
+    let ctrl = VpnController::new(backend.clone());
+    let errors: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+    let recorder = Arc::clone(&errors);
+    let mut p = profile();
+    // No port: refused by the resolver itself, without a DNS query.
+    p.endpoint = "not-an-endpoint".into();
+    ctrl.connect(
+        p,
+        Arc::new(move |ev: ClientEvent| {
+            if let ClientEvent::Error { message } = ev {
+                recorder.lock().unwrap().push(message);
+            }
+        }),
+    )
+    .await;
+    if let Some(task) = ctrl.task.lock().await.take() {
+        task.await.unwrap();
+    }
+
+    assert_eq!(ctrl.state(), TunnelState::Failed);
+    let errors = errors.lock().unwrap().clone();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(
+        errors[0].starts_with("échec de connexion: endpoint `not-an-endpoint` invalide"),
+        "{errors:?}"
+    );
+    assert!(backend.endpoints.lock().unwrap().is_empty());
+}
+
+/// The data-plane copy differs from the stored profile by its endpoint and
+/// nothing else, and the stored profile is left as written.
+#[test]
+fn the_data_plane_copy_only_replaces_the_endpoint() {
+    let mut stored = profile();
+    stored.endpoint = "gateway.example:51820".into();
+    stored.heliosd_url = Some("http://100.64.0.1:8080".into());
+    let copy = with_wireguard_endpoint(&stored, "[2001:db8::1]:51820".parse().unwrap());
+
+    assert_eq!(copy.endpoint, "[2001:db8::1]:51820");
+    assert_eq!(stored.endpoint, "gateway.example:51820");
+    assert_eq!(
+        format!(
+            "{:?}",
+            ClientProfile {
+                endpoint: stored.endpoint.clone(),
+                ..copy
+            }
+        ),
+        format!("{stored:?}")
+    );
+}
+
+#[test]
+fn the_wireguard_endpoint_log_names_the_family_and_its_origin() {
+    let negotiated = WireGuardEndpoint {
+        address: "203.0.113.10:51820".parse().unwrap(),
+        origin: EndpointOrigin::Negotiated,
+    };
+    assert_eq!(
+        negotiated.describe("gateway.example:51820"),
+        "endpoint WireGuard gateway.example:51820 : IPv4 203.0.113.10:51820 \
+         (l'adresse qui a négocié)"
+    );
+    let resolved = WireGuardEndpoint {
+        address: "[2001:db8::1]:51820".parse().unwrap(),
+        origin: EndpointOrigin::FirstCandidate,
+    };
+    assert_eq!(
+        resolved.describe("gateway.example:51820"),
+        "endpoint WireGuard gateway.example:51820 : IPv6 [2001:db8::1]:51820 \
+         (premier candidat de sa résolution)"
+    );
 }

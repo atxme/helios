@@ -33,6 +33,7 @@ const STATUS: Status = {
   mss_clamp: null,
   captive_portal_gateway: null,
   handshake_stale_after_seconds: 150,
+  ipv6: 'not_configured',
 }
 
 describe('custom design tokens', () => {

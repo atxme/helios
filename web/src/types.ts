@@ -19,6 +19,12 @@ export interface PeerSummary {
   name: string
   public_key: string
   address: string
+  /**
+   * IPv6 VIP, `…/128`, when the gateway has a tunnel prefix and this peer an
+   * address in it (ADRESSAGE-IPV6.md §5.1); `null` otherwise. Configuration,
+   * not observation: whether it is actually routed depends on `Status.ipv6`.
+   */
+  address_v6: string | null
   post_quantum: boolean
   admin: boolean
   /**
@@ -32,6 +38,23 @@ export interface PeerSummary {
   rx_bytes: number | null
   tx_bytes: number | null
 }
+
+/**
+ * Why a configured IPv6 tunnel prefix was not installed
+ * (`aether::net::Ipv6Unavailable`, ADRESSAGE-IPV6.md §6.2).
+ */
+export type Ipv6Unavailable =
+  | { reason: 'tunnel_mtu_too_small'; tunnel_mtu: number; minimum: number }
+  | { reason: 'disabled_by_kernel'; setting: string }
+  | { reason: 'no_kernel_support'; path: string }
+  | { reason: 'address_refused'; address: string; detail: string }
+
+/**
+ * What the last bring-up did with the IPv6 tunnel prefix
+ * (`aether::net::Ipv6TunnelStatus`). `unavailable` is the visible degraded
+ * state: the gateway runs IPv4-only.
+ */
+export type Ipv6TunnelStatus = 'not_configured' | 'installed' | { unavailable: Ipv6Unavailable }
 
 /** Exact contract of GET /api/status. */
 export interface Status {
@@ -60,6 +83,8 @@ export interface Status {
    * the firewall had already cut it.
    */
   handshake_stale_after_seconds: number
+  /** Observed on the data plane at the last bring-up, not read from the configuration. */
+  ipv6: Ipv6TunnelStatus
 }
 
 /**

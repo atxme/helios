@@ -35,6 +35,7 @@ fn configured_network() -> NetworkConfig {
             name: "poste-test".into(),
             public_key: PEER_KEY.into(),
             address: "100.64.1.2/32".into(),
+            address_v6: None,
             admin: false,
             preshared_key: Some("psk-test".into()),
             key_negotiation_certificate_sha256: None,
@@ -55,7 +56,7 @@ fn configured_network() -> NetworkConfig {
 async fn handshake_promotion_goes_through_the_main_loop() {
     let network = Arc::new(RwLock::new(configured_network()));
     let wireguard = Arc::new(helios_wireguard::DryRunBackend::with_handshakes());
-    let (iface, peers) = wg_config(&*network.read().await);
+    let (iface, peers) = wg_config(&*network.read().await, &Ipv6TunnelStatus::NotConfigured);
     wireguard
         .up(&iface, &peers)
         .await
@@ -197,13 +198,13 @@ async fn a_session_without_psk_is_reported_as_classic() {
 fn wireguard_projection_keeps_the_interface_and_required_secrets() {
     let network = configured_network();
 
-    let (iface, peers) = wg_config(&network);
+    let (iface, peers) = wg_config(&network, &Ipv6TunnelStatus::NotConfigured);
 
     assert_eq!(iface.name, "helios0");
     assert_eq!(iface.private_key.as_str(), PRIVATE_KEY);
     assert_eq!(iface.listen_port, WG_LISTEN_PORT);
     assert_eq!(peers.len(), 1);
-    assert_eq!(peers[0].allowed_ips, "100.64.1.2/32");
+    assert_eq!(peers[0].allowed_ips, ["100.64.1.2/32"]);
     assert_eq!(
         peers[0].preshared_key.as_ref().map(|psk| psk.as_str()),
         Some("psk-test")
@@ -330,9 +331,8 @@ async fn unsupported_mss_clamp_does_not_mutate_policy_or_reapply_firewall() {
     assert!(!firewall.applied.load(Ordering::Relaxed));
 }
 
-#[tokio::test]
-async fn mss_discovery_rejects_missing_interfaces_and_bounds_small_mtus() {
-    assert_eq!(discover_mss("interface-that-does-not-exist").await, None);
+#[test]
+fn an_unreadable_wan_falls_back_to_ethernet() {
     assert_eq!(
         mtu_transport("interface-that-does-not-exist"),
         aether::mtu::MTU_TRANSPORT_DEFAUT
@@ -344,10 +344,59 @@ async fn mss_discovery_rejects_missing_interfaces_and_bounds_small_mtus() {
             .parse()
             .unwrap();
         assert_eq!(mtu_transport("lo"), loopback_mtu);
-        let expected = u16::try_from(loopback_mtu)
-            .ok()
-            .map(|mtu| mtu.saturating_sub(100).max(576));
-        assert_eq!(discover_mss("lo").await, expected);
+    }
+}
+
+#[test]
+fn the_probe_derives_the_mss_from_the_interface_mtu_per_family() {
+    // Ethernet. The probe used to subtract a 60-byte IPv4 outer overhead
+    // (1500 − 100 = 1400) while the interface is sized with 80: a clamp at
+    // 1400 announced segments of 1440 bytes into a 1420-byte interface.
+    assert_eq!(
+        tunnel_mss(1500),
+        TunnelMss {
+            tunnel_mtu: 1420,
+            ipv4: 1380,
+            ipv6: Some(1360),
+        }
+    );
+    // PPPoE still carries IPv6.
+    assert_eq!(
+        tunnel_mss(1492),
+        TunnelMss {
+            tunnel_mtu: 1412,
+            ipv4: 1372,
+            ipv6: Some(1352),
+        }
+    );
+    // WSL2: the tunnel is IPv4-only, so there is no IPv6 MSS.
+    assert_eq!(
+        tunnel_mss(1280),
+        TunnelMss {
+            tunnel_mtu: 1200,
+            ipv4: 1160,
+            ipv6: None,
+        }
+    );
+}
+
+#[test]
+fn the_probe_and_the_interface_agree_on_the_tunnel_mtu() {
+    // The clamp must fit the MTU `wg_config` sets, for any transport.
+    for transport in [0, 576, 1280, 1359, 1360, 1492, 1500, 9000, 65536] {
+        let probed = tunnel_mss(transport);
+        assert_eq!(
+            u32::from(probed.tunnel_mtu),
+            aether::mtu::tunnel_mtu(transport)
+        );
+        assert!(
+            u32::from(probed.ipv4) + aether::mtu::TCP_IPV4_HEADERS <= u32::from(probed.tunnel_mtu)
+        );
+        if let Some(ipv6) = probed.ipv6 {
+            assert!(
+                u32::from(ipv6) + aether::mtu::TCP_IPV6_HEADERS <= u32::from(probed.tunnel_mtu)
+            );
+        }
     }
 }
 
@@ -364,6 +413,15 @@ async fn request_installation(
     wg: &dyn WireguardBackend,
     public_key: &str,
 ) -> Result<(), String> {
+    request_installation_with(shared, wg, public_key, Ipv6TunnelStatus::NotConfigured).await
+}
+
+async fn request_installation_with(
+    shared: &Arc<RwLock<NetworkConfig>>,
+    wg: &dyn WireguardBackend,
+    public_key: &str,
+    ipv6: Ipv6TunnelStatus,
+) -> Result<(), String> {
     let (events, _) = broadcast::channel(8);
     let (reply, response) = tokio::sync::oneshot::channel();
     install_peer_psk(
@@ -375,6 +433,7 @@ async fn request_installation(
         },
         shared,
         wg,
+        &Arc::new(RwLock::new(ipv6)),
         &events,
     )
     .await;
@@ -484,6 +543,7 @@ async fn dry_run_connection_stays_blocked_until_handshake() {
         &firewall,
         &network.firewall_policy(),
         true,
+        &Arc::new(RwLock::new(Ipv6TunnelStatus::NotConfigured)),
     )
     .await
     .unwrap();
@@ -503,7 +563,7 @@ async fn disconnection_tears_down_wireguard_and_re_engages_the_kill_switch() {
     let (internal_tx, _internal_rx) = mpsc::channel(1);
     let firewall = DryRunBackend;
     let wireguard = helios_wireguard::DryRunBackend::new();
-    let (iface, peers) = wg_config(&network);
+    let (iface, peers) = wg_config(&network, &Ipv6TunnelStatus::NotConfigured);
     wireguard.up(&iface, &peers).await.unwrap();
     let mut current_policy = network.firewall_policy();
     current_policy.mss_clamp = Some(1380);
@@ -521,6 +581,7 @@ async fn disconnection_tears_down_wireguard_and_re_engages_the_kill_switch() {
         &policy,
         // TPM disabled: this test does not perform a key rotation.
         &helios_tpm::BootDecision::Disabled,
+        &Arc::new(RwLock::new(Ipv6TunnelStatus::NotConfigured)),
     )
     .await
     .unwrap();
@@ -529,4 +590,668 @@ async fn disconnection_tears_down_wireguard_and_re_engages_the_kill_switch() {
     assert_eq!(*state.read().await, TunnelState::Down);
     assert!(state.read().await.kill_switch_engaged());
     assert_eq!(policy.read().await.mss_clamp, None);
+}
+
+/// Hands `incoming` to the orchestrator as a reload, the way the API and the
+/// `network.toml` watcher both do, and returns the events it emitted.
+async fn reload(
+    shared_network: &Arc<RwLock<NetworkConfig>>,
+    incoming: NetworkConfig,
+) -> Vec<HeliosEvent> {
+    let running = shared_network.read().await.duplicate();
+    let state = Arc::new(RwLock::new(TunnelState::Down));
+    let policy = Arc::new(RwLock::new(running.firewall_policy()));
+    let mut current_policy = running.firewall_policy();
+    let (events, mut received) = broadcast::channel(8);
+    let (internal_tx, _internal_rx) = mpsc::channel(1);
+    let wireguard = helios_wireguard::DryRunBackend::new();
+
+    handle_external_cmd(
+        OrchestratorCmd::LoadNetworkConfig(Box::new(incoming)),
+        shared_network,
+        true,
+        &wireguard,
+        &state,
+        &events,
+        &DryRunBackend,
+        &mut current_policy,
+        &internal_tx,
+        &policy,
+        // TPM disabled: a reload performs no key rotation.
+        &helios_tpm::BootDecision::Disabled,
+        &Arc::new(RwLock::new(Ipv6TunnelStatus::NotConfigured)),
+    )
+    .await
+    .unwrap();
+
+    let mut emitted = Vec::new();
+    while let Ok(event) = received.try_recv() {
+        emitted.push(event);
+    }
+    emitted
+}
+
+fn dual_stack_network() -> NetworkConfig {
+    let mut network = configured_network();
+    network.wg_address_v6 = Some("fd3c:91a2:7e04::1/64".parse().unwrap());
+    network.peers[0].address_v6 = Some("fd3c:91a2:7e04::2".parse().unwrap());
+    network
+}
+
+/// A peer's IPv6 VIP is part of the peer table: it reloads live
+/// (`ADRESSAGE-IPV6.md` §5.4).
+#[tokio::test]
+async fn a_peer_ipv6_vip_change_is_applied_live() {
+    let shared_network = Arc::new(RwLock::new(dual_stack_network()));
+    let mut incoming = dual_stack_network();
+    incoming.peers[0].address_v6 = Some("fd3c:91a2:7e04::3".parse().unwrap());
+
+    reload(&shared_network, incoming).await;
+
+    assert_eq!(
+        shared_network.read().await.peers[0].address_v6,
+        Some("fd3c:91a2:7e04::3".parse().unwrap())
+    );
+}
+
+/// The tunnel prefix is applied at startup only: a reload that changes it is
+/// not applied at all — not even its other changes — and says so on the
+/// event stream the console reads.
+#[tokio::test]
+async fn a_tunnel_prefix_change_is_refused_until_restart() {
+    let shared_network = Arc::new(RwLock::new(dual_stack_network()));
+    let mut incoming = dual_stack_network();
+    incoming.wg_address_v6 = Some("fd00:1:2::1/64".parse().unwrap());
+    incoming.peers[0].address_v6 = Some("fd00:1:2::2".parse().unwrap());
+    incoming.peers[0].name = "renamed".into();
+
+    let events = reload(&shared_network, incoming).await;
+
+    assert_eq!(*shared_network.read().await, dual_stack_network());
+    let message = match events.as_slice() {
+        [HeliosEvent::Log { level, message }] if level == "warn" => message,
+        other => panic!("expected one warning, got {other:?}"),
+    };
+    assert!(message.contains("wg_address_v6"), "{message}");
+    assert!(message.contains("restart"), "{message}");
+}
+
+// ─── Refused policy mutations ────────────────────────────────────────────────
+
+/// A backend that refuses every ruleset, as the kernel refuses a batch.
+struct RefusingFirewall;
+
+#[async_trait::async_trait]
+impl FirewallBackend for RefusingFirewall {
+    fn capabilities(&self) -> FirewallCapabilities {
+        FirewallCapabilities::default()
+    }
+
+    async fn apply(&self, _policy: &FirewallPolicy, _state: TunnelState) -> aether::Result<()> {
+        Err(aether::HeliosError::Firewall(
+            "transaction refused by the test backend".into(),
+        ))
+    }
+
+    async fn teardown(&self) -> aether::Result<()> {
+        Ok(())
+    }
+}
+
+/// What the main loop sees of one external command: its result — an `Err`
+/// is what stops the loop — and the events it emitted.
+async fn run_command(
+    cmd: OrchestratorCmd,
+    fw: &dyn FirewallBackend,
+    state: TunnelState,
+    shared_network: &Arc<RwLock<NetworkConfig>>,
+    policy: &mut FirewallPolicy,
+    shared_policy: &Arc<RwLock<FirewallPolicy>>,
+) -> (anyhow::Result<()>, Vec<HeliosEvent>) {
+    let (events, mut received) = broadcast::channel(8);
+    let (internal_tx, _internal_rx) = mpsc::channel(1);
+    let result = handle_external_cmd(
+        cmd,
+        shared_network,
+        true,
+        &helios_wireguard::DryRunBackend::new(),
+        &Arc::new(RwLock::new(state)),
+        &events,
+        fw,
+        policy,
+        &internal_tx,
+        shared_policy,
+        // TPM disabled: none of these commands rotates the gateway key.
+        &helios_tpm::BootDecision::Disabled,
+        &Arc::new(RwLock::new(Ipv6TunnelStatus::NotConfigured)),
+    )
+    .await;
+    let mut emitted = Vec::new();
+    while let Ok(event) = received.try_recv() {
+        emitted.push(event);
+    }
+    (result, emitted)
+}
+
+/// The one error log the refusal emitted, and nothing else: in particular no
+/// `SplitTunnelChanged` announcing a list that is not in force.
+fn single_error(events: &[HeliosEvent]) -> &str {
+    match events {
+        [HeliosEvent::Log { level, message }] if level == "error" => message,
+        other => panic!("expected one error log, got {other:?}"),
+    }
+}
+
+fn policy_with_split_tunnel(cidrs: &[&str]) -> FirewallPolicy {
+    let mut policy = configured_network().firewall_policy();
+    policy.split_tunnel_cidrs = cidrs.iter().map(|cidr| cidr.to_string()).collect();
+    policy
+}
+
+/// An invalid CIDR is refused in every state, not only in `Up` where the
+/// ruleset reads it: accepted while down, it would stop the orchestrator at
+/// the next promotion instead.
+#[tokio::test]
+async fn an_invalid_split_tunnel_cidr_keeps_the_running_policy() {
+    for state in [TunnelState::Up, TunnelState::Down] {
+        let running = policy_with_split_tunnel(&["192.168.1.0/24"]);
+        let mut policy = running.clone();
+        let shared_policy = Arc::new(RwLock::new(running.clone()));
+        let shared_network = Arc::new(RwLock::new(configured_network()));
+
+        let (result, events) = run_command(
+            OrchestratorCmd::SetSplitTunnel(vec!["192.168.1.0/24".into(), "fd00::/129".into()]),
+            &DryRunBackend,
+            state,
+            &shared_network,
+            &mut policy,
+            &shared_policy,
+        )
+        .await;
+
+        result.unwrap_or_else(|error| panic!("{state:?}: the loop must continue: {error:#}"));
+        assert_eq!(policy, running, "{state:?}");
+        assert_eq!(*shared_policy.read().await, running, "{state:?}");
+        let message = single_error(&events);
+        assert!(message.contains("fd00::/129"), "{message}");
+    }
+}
+
+/// The backend refusing a valid list leaves the previous one in force, and the
+/// orchestrator still takes the next command.
+#[tokio::test]
+async fn a_split_tunnel_list_the_backend_refuses_keeps_the_running_policy() {
+    let running = policy_with_split_tunnel(&["192.168.1.0/24"]);
+    let mut policy = running.clone();
+    let shared_policy = Arc::new(RwLock::new(running.clone()));
+    let shared_network = Arc::new(RwLock::new(configured_network()));
+    let requested = vec!["10.0.0.0/8".to_string(), "fd00:1::/64".to_string()];
+
+    let (result, events) = run_command(
+        OrchestratorCmd::SetSplitTunnel(requested.clone()),
+        &RefusingFirewall,
+        TunnelState::Up,
+        &shared_network,
+        &mut policy,
+        &shared_policy,
+    )
+    .await;
+
+    result.expect("the loop must continue");
+    assert_eq!(policy, running);
+    assert_eq!(*shared_policy.read().await, running);
+    let message = single_error(&events);
+    assert!(message.contains("refused by the test backend"), "{message}");
+
+    let (result, events) = run_command(
+        OrchestratorCmd::SetSplitTunnel(requested.clone()),
+        &DryRunBackend,
+        TunnelState::Up,
+        &shared_network,
+        &mut policy,
+        &shared_policy,
+    )
+    .await;
+
+    result.expect("a valid list applies");
+    assert_eq!(policy.split_tunnel_cidrs, requested);
+    assert_eq!(shared_policy.read().await.split_tunnel_cidrs, requested);
+    assert!(matches!(
+        events.as_slice(),
+        [HeliosEvent::SplitTunnelChanged { cidrs }] if *cidrs == requested
+    ));
+}
+
+/// A reload whose policy the firewall refuses is not applied at all — neither
+/// the policy nor the rest of the configuration — and the loop continues.
+#[tokio::test]
+async fn a_reload_the_firewall_refuses_keeps_the_running_configuration() {
+    let shared_network = Arc::new(RwLock::new(configured_network()));
+    let running = configured_network().firewall_policy();
+    let mut policy = running.clone();
+    let shared_policy = Arc::new(RwLock::new(running.clone()));
+    let mut incoming = configured_network();
+    incoming.split_tunnel_cidrs = vec!["10.0.0.0/33".into()];
+    incoming.peers[0].name = "renamed".into();
+
+    let (result, events) = run_command(
+        OrchestratorCmd::LoadNetworkConfig(Box::new(incoming)),
+        &DryRunBackend,
+        TunnelState::Down,
+        &shared_network,
+        &mut policy,
+        &shared_policy,
+    )
+    .await;
+
+    result.expect("the loop must continue");
+    assert_eq!(*shared_network.read().await, configured_network());
+    assert_eq!(policy, running);
+    assert_eq!(*shared_policy.read().await, running);
+    let message = single_error(&events);
+    assert!(message.contains("10.0.0.0/33"), "{message}");
+}
+
+// ─── IPv6 on the data plane (`ADRESSAGE-IPV6.md` §6.1, §6.2) ─────────────────
+
+const PREFIX: &str = "fd3c:91a2:7e04::1/64";
+const PEER_VIP_V6: &str = "fd3c:91a2:7e04::2/128";
+
+fn addresses_and_allowed_ips(
+    network: &NetworkConfig,
+    ipv6: &Ipv6TunnelStatus,
+) -> (Vec<String>, Vec<String>) {
+    let (iface, peers) = wg_config(network, ipv6);
+    (iface.addresses, peers[0].allowed_ips.clone())
+}
+
+/// Criterion 6: without `wg_address_v6`, nothing changes — whatever the
+/// status says, since no status can conjure a prefix the file does not have.
+#[test]
+fn a_gateway_without_a_prefix_projects_exactly_the_ipv4_data_plane() {
+    let network = configured_network();
+    for ipv6 in [
+        Ipv6TunnelStatus::NotConfigured,
+        Ipv6TunnelStatus::Installed,
+        Ipv6TunnelStatus::Unavailable(Ipv6Unavailable::TunnelMtuTooSmall {
+            tunnel_mtu: 1200,
+            minimum: 1280,
+        }),
+    ] {
+        let (iface, peers) = wg_config(&network, &ipv6);
+        assert_eq!(iface.addresses, ["100.64.0.1/10"], "{ipv6:?}");
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].allowed_ips, ["100.64.1.2/32"], "{ipv6:?}");
+    }
+    assert_eq!(
+        ipv6_installability(&network, 576, std::path::Path::new("/nonexistent")),
+        Ipv6TunnelStatus::NotConfigured,
+        "a gateway without a prefix is not degraded, and nothing is read for it"
+    );
+}
+
+/// Criterion 7: exactly `{v4/32, v6/128}` per peer and `[wg_address,
+/// prefix::1/64]` on the interface.
+#[test]
+fn an_installed_prefix_adds_exactly_one_host_per_family() {
+    let (addresses, allowed) =
+        addresses_and_allowed_ips(&dual_stack_network(), &Ipv6TunnelStatus::Installed);
+    assert_eq!(addresses, ["100.64.0.1/10", PREFIX]);
+    assert_eq!(allowed, ["100.64.1.2/32", PEER_VIP_V6]);
+}
+
+/// A peer admitted before the gateway had a prefix keeps its IPv4 alone
+/// (§8): the projection adds nothing it was not given.
+#[test]
+fn a_peer_without_an_ipv6_vip_keeps_its_ipv4_alone() {
+    let mut network = dual_stack_network();
+    network.peers[0].address_v6 = None;
+    let (addresses, allowed) = addresses_and_allowed_ips(&network, &Ipv6TunnelStatus::Installed);
+    assert_eq!(addresses, ["100.64.0.1/10", PREFIX]);
+    assert_eq!(allowed, ["100.64.1.2/32"]);
+}
+
+/// Criterion 8, projection half: unavailable means absent from the interface
+/// *and* from every `AllowedIPs`, or the data plane would contradict itself.
+#[test]
+fn an_unavailable_prefix_is_neither_on_the_interface_nor_in_allowed_ips() {
+    let unavailable = Ipv6TunnelStatus::Unavailable(Ipv6Unavailable::DisabledByKernel {
+        setting: "net.ipv6.conf.all.disable_ipv6".into(),
+    });
+    let (addresses, allowed) = addresses_and_allowed_ips(&dual_stack_network(), &unavailable);
+    assert_eq!(addresses, ["100.64.0.1/10"]);
+    assert_eq!(allowed, ["100.64.1.2/32"]);
+}
+
+/// The VIP routing receives the prefix — and so runs `ip -6` at all — only
+/// when the bring-up installed it.
+#[test]
+fn only_an_installed_prefix_reaches_the_vip_routing() {
+    let network = dual_stack_network();
+    assert_eq!(
+        installed_prefix(&network, &Ipv6TunnelStatus::Installed),
+        network.wg_address_v6
+    );
+    assert_eq!(
+        installed_prefix(&network, &Ipv6TunnelStatus::NotConfigured),
+        None
+    );
+    assert_eq!(
+        installed_prefix(
+            &network,
+            &Ipv6TunnelStatus::Unavailable(Ipv6Unavailable::NoKernelSupport {
+                path: "/proc/sys/net/ipv6/conf/all/disable_ipv6".into(),
+            })
+        ),
+        None
+    );
+    assert_eq!(
+        installed_prefix(&configured_network(), &Ipv6TunnelStatus::Installed),
+        None
+    );
+}
+
+/// A kernel `conf` directory with the two settings the decision reads.
+fn ipv6_conf(all: &str, default: &str) -> tempfile::TempDir {
+    let directory = tempfile::tempdir().expect("tempdir");
+    for (scope, value) in [("all", all), ("default", default)] {
+        std::fs::create_dir(directory.path().join(scope)).expect("scope directory");
+        std::fs::write(directory.path().join(scope).join("disable_ipv6"), value).expect("setting");
+    }
+    directory
+}
+
+#[test]
+fn ipv6_is_installable_on_a_wide_enough_tunnel_with_ipv6_enabled() {
+    let conf = ipv6_conf("0\n", "0\n");
+    assert_eq!(
+        ipv6_installability(&dual_stack_network(), 1420, conf.path()),
+        Ipv6TunnelStatus::Installed
+    );
+    assert_eq!(
+        ipv6_installability(&dual_stack_network(), 1280, conf.path()),
+        Ipv6TunnelStatus::Installed,
+        "1280 is the IPv6 minimum itself, not below it"
+    );
+}
+
+#[test]
+fn a_tunnel_below_1280_bytes_cannot_carry_ipv6() {
+    let conf = ipv6_conf("0\n", "0\n");
+    assert_eq!(
+        ipv6_installability(&dual_stack_network(), 1279, conf.path()),
+        Ipv6TunnelStatus::Unavailable(Ipv6Unavailable::TunnelMtuTooSmall {
+            tunnel_mtu: 1279,
+            minimum: 1280,
+        })
+    );
+}
+
+#[test]
+fn disable_ipv6_for_new_or_all_interfaces_is_named() {
+    for (all, default, scope) in [("1\n", "0\n", "all"), ("0\n", "1\n", "default")] {
+        let conf = ipv6_conf(all, default);
+        assert_eq!(
+            ipv6_installability(&dual_stack_network(), 1420, conf.path()),
+            Ipv6TunnelStatus::Unavailable(Ipv6Unavailable::DisabledByKernel {
+                setting: format!("net.ipv6.conf.{scope}.disable_ipv6"),
+            })
+        );
+    }
+}
+
+#[test]
+fn a_kernel_without_an_ipv6_stack_is_named() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let status = ipv6_installability(&dual_stack_network(), 1420, directory.path());
+    assert!(
+        matches!(
+            &status,
+            Ipv6TunnelStatus::Unavailable(Ipv6Unavailable::NoKernelSupport { path })
+                if path.ends_with("disable_ipv6")
+        ),
+        "{status:?}"
+    );
+}
+
+/// What a bring-up left behind: the interface, the peers, the published
+/// status and the events.
+struct BringUp {
+    wireguard: helios_wireguard::DryRunBackend,
+    state: Arc<RwLock<TunnelState>>,
+    ipv6: Ipv6TunnelStatus,
+    events: Vec<HeliosEvent>,
+}
+
+async fn bring_up(
+    network: &NetworkConfig,
+    candidate: Ipv6TunnelStatus,
+    wireguard: helios_wireguard::DryRunBackend,
+) -> anyhow::Result<BringUp> {
+    let state = Arc::new(RwLock::new(TunnelState::Down));
+    let shared_ipv6 = Arc::new(RwLock::new(Ipv6TunnelStatus::default()));
+    let (event_tx, mut received) = broadcast::channel(32);
+    connect_with_ipv6(
+        network,
+        candidate,
+        &wireguard,
+        &state,
+        &event_tx,
+        &DryRunBackend,
+        &network.firewall_policy(),
+        true,
+        &shared_ipv6,
+    )
+    .await?;
+    let mut events = Vec::new();
+    while let Ok(event) = received.try_recv() {
+        events.push(event);
+    }
+    let ipv6 = shared_ipv6.read().await.clone();
+    Ok(BringUp {
+        wireguard,
+        state,
+        ipv6,
+        events,
+    })
+}
+
+fn warnings(events: &[HeliosEvent]) -> Vec<&str> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            HeliosEvent::Log { level, message } if level == "warn" => Some(message.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn an_installed_prefix_reaches_the_interface_and_the_peers() {
+    let up = bring_up(
+        &dual_stack_network(),
+        Ipv6TunnelStatus::Installed,
+        helios_wireguard::DryRunBackend::new(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        up.wireguard.interface_addresses(),
+        ["100.64.0.1/10", PREFIX]
+    );
+    assert_eq!(
+        up.wireguard.peers().await.unwrap()[0].allowed_ips,
+        ["100.64.1.2/32", PEER_VIP_V6]
+    );
+    assert_eq!(up.ipv6, Ipv6TunnelStatus::Installed);
+    assert!(warnings(&up.events).is_empty(), "{:?}", up.events);
+}
+
+/// Criterion 8: a prefix that cannot be installed leaves an IPv4-only
+/// gateway, says why on the event stream, and publishes the reason.
+#[tokio::test]
+async fn a_tunnel_too_narrow_for_ipv6_starts_ipv4_only_and_says_so() {
+    let reason = Ipv6Unavailable::TunnelMtuTooSmall {
+        tunnel_mtu: 1200,
+        minimum: 1280,
+    };
+    let up = bring_up(
+        &dual_stack_network(),
+        Ipv6TunnelStatus::Unavailable(reason.clone()),
+        helios_wireguard::DryRunBackend::new(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(up.wireguard.interface_addresses(), ["100.64.0.1/10"]);
+    assert_eq!(
+        up.wireguard.peers().await.unwrap()[0].allowed_ips,
+        ["100.64.1.2/32"]
+    );
+    assert_eq!(up.ipv6, Ipv6TunnelStatus::Unavailable(reason));
+    let warned = warnings(&up.events);
+    assert!(
+        warned
+            .iter()
+            .any(|message| message.contains("IPv6 not installed") && message.contains("1280")),
+        "{warned:?}"
+    );
+    assert!(up.state.read().await.kill_switch_engaged());
+}
+
+/// Criterion 8, kernel half: the address the pre-checks could not foresee is
+/// refused at bring-up; the half-configured interface is replaced by an
+/// IPv4-only one, and the refusal is published verbatim.
+#[tokio::test]
+async fn a_kernel_refusing_the_ipv6_address_leaves_an_ipv4_only_gateway() {
+    let up = bring_up(
+        &dual_stack_network(),
+        Ipv6TunnelStatus::Installed,
+        helios_wireguard::DryRunBackend::without_ipv6(),
+    )
+    .await
+    .unwrap();
+
+    assert!(up.wireguard.is_up());
+    assert_eq!(up.wireguard.interface_addresses(), ["100.64.0.1/10"]);
+    assert_eq!(
+        up.wireguard.peers().await.unwrap()[0].allowed_ips,
+        ["100.64.1.2/32"]
+    );
+    match &up.ipv6 {
+        Ipv6TunnelStatus::Unavailable(Ipv6Unavailable::AddressRefused { address, detail }) => {
+            assert_eq!(address, PREFIX);
+            assert!(detail.contains("IPv6 is disabled"), "{detail}");
+        }
+        other => panic!("expected AddressRefused, got {other:?}"),
+    }
+    assert!(
+        warnings(&up.events)
+            .iter()
+            .any(|message| message.contains("IPv6 not installed")),
+        "{:?}",
+        up.events
+    );
+    assert!(up.state.read().await.kill_switch_engaged());
+}
+
+/// Only a kernel-side refusal is retried: a configuration the backend
+/// refuses before touching anything fails the start, as it always did.
+#[tokio::test]
+async fn a_refusal_that_is_not_the_kernels_is_not_retried_without_ipv6() {
+    let mut network = dual_stack_network();
+    network.peers[0].public_key = "AAAA".into();
+
+    let error = bring_up(
+        &network,
+        Ipv6TunnelStatus::Installed,
+        helios_wireguard::DryRunBackend::new(),
+    )
+    .await
+    .err()
+    .expect("an invalid peer key must fail the bring-up");
+
+    assert!(
+        error
+            .to_string()
+            .contains("bringing up the WireGuard interface"),
+        "{error:#}"
+    );
+    assert!(!format!("{error:#}").contains("without IPv6"), "{error:#}");
+}
+
+/// The PSK path projects the peers again: it must keep the families the
+/// bring-up installed, no more and no fewer.
+#[tokio::test]
+async fn a_psk_installation_keeps_the_installed_families() {
+    for (ipv6, expected) in [
+        (
+            Ipv6TunnelStatus::Installed,
+            vec!["100.64.1.2/32", PEER_VIP_V6],
+        ),
+        (
+            Ipv6TunnelStatus::Unavailable(Ipv6Unavailable::DisabledByKernel {
+                setting: "net.ipv6.conf.all.disable_ipv6".into(),
+            }),
+            vec!["100.64.1.2/32"],
+        ),
+    ] {
+        let mut network = dual_stack_network();
+        network.peers[0].preshared_key = None;
+        let shared = Arc::new(RwLock::new(network));
+        let wireguard = helios_wireguard::DryRunBackend::new();
+
+        request_installation_with(&shared, &wireguard, PEER_KEY, ipv6.clone())
+            .await
+            .expect("the installation must succeed");
+
+        assert_eq!(
+            wireguard.peers().await.unwrap()[0].allowed_ips,
+            expected,
+            "{ipv6:?}"
+        );
+    }
+}
+
+/// `heliosd status` names the prefix and, when it cannot be installed here,
+/// the degraded start and its reason.
+#[test]
+fn the_status_command_describes_the_ipv6_outcome() {
+    assert_eq!(
+        describe_ipv6(&configured_network(), Ipv6TunnelStatus::NotConfigured),
+        "not configured"
+    );
+    assert_eq!(
+        describe_ipv6(&dual_stack_network(), Ipv6TunnelStatus::Installed),
+        format!("{PREFIX} (installable on this host)")
+    );
+    let degraded = describe_ipv6(
+        &dual_stack_network(),
+        Ipv6TunnelStatus::Unavailable(Ipv6Unavailable::TunnelMtuTooSmall {
+            tunnel_mtu: 1200,
+            minimum: 1280,
+        }),
+    );
+    assert!(degraded.starts_with(PREFIX), "{degraded}");
+    assert!(degraded.contains("IPv4-only"), "{degraded}");
+    assert!(degraded.contains("1200"), "{degraded}");
+}
+
+/// A `network.toml` the `Down` ruleset accepts but `Up` would refuse stops
+/// the start, naming the entry, instead of the first promotion.
+#[test]
+fn a_policy_that_does_not_compile_refuses_the_start() {
+    let mut network = dual_stack_network();
+    network.split_tunnel_cidrs = vec!["192.168.10.0/24".into(), "fd12:3456:789a::/48".into()];
+    check_startup_policy(&network).unwrap();
+
+    network.split_tunnel_cidrs.push("10.0.0.0/33".into());
+    let refusal = format!("{:#}", check_startup_policy(&network).unwrap_err());
+    assert!(refusal.contains("10.0.0.0/33"), "{refusal}");
+
+    let mut network = configured_network();
+    network.allow_ssh_from = vec!["fd00::/129".into()];
+    let refusal = format!("{:#}", check_startup_policy(&network).unwrap_err());
+    assert!(refusal.contains("fd00::/129"), "{refusal}");
 }

@@ -178,6 +178,7 @@ mod tests {
             name: "alice".into(),
             public_key: "CLE-PUBLIQUE-ALICE".into(),
             address: "100.64.1.2/32".into(),
+            address_v6: None,
             admin: false,
             preshared_key: Some(PSK.into()),
             key_negotiation_certificate_sha256: None,

@@ -93,6 +93,55 @@ Ouvrir `http://127.0.0.1:5173`. Vérifier :
 4. l'enregistrement puis la suppression de CIDR de split-tunneling ;
 5. **Arrêter l'interface**, puis le retour à `down`.
 
+#### IPv6 du tunnel
+
+La console lit l'état IPv6 dans `GET /api/status` (`ipv6`) et la VIP IPv6 de
+chaque client dans `peers[].address_v6` de la même réponse
+([ADRESSAGE-IPV6.md](../specification/ADRESSAGE-IPV6.md) §5.1, §6.2). L'état
+est celui du dernier montage de l'interface : remonter l'interface après chaque
+changement ci-dessous.
+
+1. **Sans `wg_address_v6`.** Page **Système**, carte « Configuration » : la
+   ligne « IPv6 tunnel » vaut `non configurée`, sans aucun avertissement. Page
+   **Clients** : chaque ligne ne montre que la VIP IPv4 et l'endpoint, comme
+   avant.
+2. **Installée.** Décommenter `wg_address_v6` dans le fichier temporaire avec
+   un préfixe tiré au hasard, redémarrer `heliosd`, monter l'interface : la
+   ligne vaut `installée`. Admettre un client depuis la console : sa ligne
+   porte, sous la VIP IPv4, une VIP IPv6 `…/128` en police à chasse fixe ; au
+   survol, « VIP IPv6 du client, dans ses AllowedIPs. ». Une VIP IPv6 ou un
+   endpoint `[v6]:port` trop long pour la colonne passe à la ligne au lieu
+   d'être tronqué par des points de suspension.
+3. **Indisponible.** Sans toucher aux sysctl de la machine, faire lire à
+   `heliosd` un faux répertoire de réglages noyau :
+
+   ```sh
+   mkdir -p /tmp/helios-ipv6/all /tmp/helios-ipv6/default
+   echo 1 > /tmp/helios-ipv6/all/disable_ipv6
+   echo 0 > /tmp/helios-ipv6/default/disable_ipv6
+   HELIOS_IPV6_CONF_PATH=/tmp/helios-ipv6 \
+   HELIOS_NETWORK_CONFIG=/tmp/helios-manual.toml target/debug/heliosd run --dev
+   ```
+
+   Après montage, la ligne vaut `indisponible`, et un encadré d'avertissement
+   (registre `caution`, celui des autres postures réduites) s'affiche sous les
+   lignes : « IPv6 indisponible — passerelle en IPv4 seule », puis « Le noyau a
+   désactivé IPv6 (net.ipv6.conf.all.disable_ipv6 = 1). » et le rappel que
+   WireGuard jette le trafic IPv6 des clients. Page **Clients**, la VIP IPv6
+   passe en gris ; au survol, « IPv6 indisponible sur la passerelle : cette VIP
+   n’est pas dans les AllowedIPs du client, son trafic IPv6 est jeté. ». Avec
+   un répertoire vide (`HELIOS_IPV6_CONF_PATH=/tmp/helios-ipv6-vide`), la
+   raison devient « Le noyau n’a pas de pile IPv6 (…/all/disable_ipv6 n’existe
+   pas). ». Les raisons `tunnel_mtu_too_small` et `address_refused` ne se
+   provoquent que sur une cible réelle (MTU d'uplink, refus du noyau) ; une
+   raison inconnue de la console s'affiche « Raison non reconnue par cette
+   interface ; le journal de heliosd la donne en clair. », toujours dans
+   l'encadré d'avertissement.
+4. **Split-tunneling.** Le champ propose `fd12:3456:789a::/48` en exemple à
+   côté des CIDR IPv4. Il ne valide rien lui-même : un CIDR IPv6 est transmis
+   tel quel, comme un IPv4, et un refus s'affiche de la même manière
+   (« Échec de la mise à jour. »).
+
 ### 4. Tester l'IHM réellement embarquée dans `heliosd`
 
 ```sh
@@ -421,7 +470,7 @@ Address = 100.64.1.2/32
 
 [Peer]
 PublicKey = <gateway_public>
-AllowedIPs = 0.0.0.0/0
+AllowedIPs = 0.0.0.0/0, ::/0
 Endpoint = 127.0.0.1:51820
 PersistentKeepalive = 25
 ```
@@ -432,13 +481,22 @@ le même fichier doit avertir que l’enregistrement remplacera le profil
 existant. Un fichier contenant un second `[Peer]` ou `DNS = 100.64.0.1` doit
 être refusé explicitement et ne doit modifier aucun profil enregistré.
 
+Le même fichier avec `AllowedIPs = 0.0.0.0/0` seul (l’ancien tunnel complet)
+doit s’importer tel quel : sous « Avancé », le choix « Personnalisé » est actif
+et l’avertissement « Tunnel complet IPv4 seulement : le trafic IPv6 sort en
+clair » est affiché. Une fois enregistré puis rouvert, le profil reste
+`0.0.0.0/0`, l’écran indique « Profil à jour » malgré l’avertissement, et le
+panneau de posture affiche la ligne « trafic via le tunnel » en ambre. Choisir
+« Tout » puis enregistrer écrit `0.0.0.0/0, ::/0` et fait disparaître les deux
+avertissements.
+
 Le même profil peut toujours être créé à la main avec :
 
 - endpoint : `127.0.0.1:51820` ;
 - clé privée : `client_private` ;
 - clé publique de gateway : `gateway_public` ;
 - adresse : `100.64.1.2/32` ;
-- AllowedIPs : `0.0.0.0/0` ;
+- AllowedIPs : `0.0.0.0/0, ::/0` ;
 - keepalive : `25`.
 
 Le backend par défaut est simulé. Vérifier que le profil peut être enregistré
@@ -458,6 +516,221 @@ npm run tauri build
 
 Le binaire est produit dans `target/release/orion` et les installateurs dans
 `target/release/bundle/` à la racine du workspace.
+
+### Capture réellement appliquée (VM Windows)
+
+Ce contrôle exige une VM Windows dual-stack et un Orion compilé avec
+`--features wireguard` : ni WSL ni le backend simulé ne l'exercent. Il vérifie
+que `::/0`, retiré silencieusement par `defguard_wireguard_rs` quand
+l'adaptateur ne porte pas l'IPv6, est signalé au lieu d'être tu.
+
+1. **Cas nominal.** Connecter un profil `0.0.0.0/0, ::/0`. Le journal doit
+   afficher « AllowedIPs appliqués vérifiés sur l'adaptateur », aucune erreur
+   ne doit apparaître et la ligne « trafic via le tunnel » du panneau de
+   posture doit rester neutre. `Get-NetRoute -InterfaceAlias orion0` doit
+   lister `0.0.0.0/0` et `::/0`. Une alerte ici serait un faux positif à
+   corriger avant tout le reste.
+2. **IPv6 indisponible sur l'adaptateur.** Déconnecter, poser
+   `DisabledComponents = 0xFF` (DWORD) sous
+   `HKLM\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters`, redémarrer,
+   puis connecter le même profil. Attendu : le tunnel monte en IPv4, l'erreur
+   « AllowedIPs non appliqués par le pilote : ::/0 — ce trafic n'est pas capté
+   par le tunnel et peut sortir en clair par l'interface physique » s'affiche
+   dans le bandeau et le journal, et la ligne « trafic via le tunnel » passe
+   en ambre : « ::/0 non appliqué par le pilote — hors tunnel ».
+   `Get-NetRoute -InterfaceAlias orion0 -AddressFamily IPv6` ne liste rien.
+   Ce réglage retire l'IPv6 de toutes les interfaces : il éprouve la
+   détection, pas la fuite. Remettre la valeur d'origine et redémarrer.
+3. **La fuite elle-même** — IPv6 présent sur l'interface physique, absent de
+   l'adaptateur. Il faut que l'adaptateur soit **reconfiguré** après
+   `Disable-NetAdapterBinding -Name orion0 -ComponentID ms_tcpip6` : le
+   backend relit à chaque configuration, mais ne recrée l'adaptateur qu'au
+   premier montage. C'est le cas du remontage post-quantique d'un profil
+   portant `heliosd_url` sans bloc de négociation : désactiver la liaison
+   entre le montage et le premier handshake (UDP 51820 bloqué le temps de la
+   commande), puis débloquer. Attendu : l'alerte de l'étape 2 après le
+   remontage, et `curl.exe -6 https://ifconfig.co` qui répond depuis
+   l'adresse IPv6 de l'interface physique — la fuite que l'alerte nomme.
+4. **Persistance.** Faire tomber le tunnel en échec, adaptateur monté : la
+   ligne ambre doit rester, les routes n'ayant pas changé. **Déconnecter**
+   doit la faire disparaître.
+
+Rien de ceci n'a encore été observé sur cible : ni l'effet de
+`DisabledComponents` ou de `Disable-NetAdapterBinding` sur un adaptateur
+WireGuard-NT, ni la présence des routes juste après la remise en service de
+l'adaptateur (`defguard` le désactive puis le réactive pour appliquer la MTU).
+L'étape 1 est celle qui écarte un faux positif, l'étape 2 celle qui prouve la
+détection.
+
+### Endpoint en FQDN double pile : repli IPv4 visible (VM Windows)
+
+Ce contrôle exige une VM Windows disposant d'une route IPv6 par défaut et un
+Orion compilé avec `--features wireguard`. Sous WSL, seuls l'ordre des
+candidats et la course échelonnée sont exercés, avec des connecteurs simulés
+(`scripts/wsl-cargo test -p orion-core endpoint_resolution`) : ni une vraie
+résolution `A`/`AAAA`, ni un chemin IPv6 cassé, ni WireGuard-NT.
+
+Ce qu'il vérifie : le nom de la gateway est résolu **une seule fois** par
+tentative, les candidats sont essayés selon RFC 8305 (famille triée en tête par
+le résolveur, puis l'autre 250 ms plus tard, ou aussitôt après un échec), et le
+tunnel WireGuard est posé sur l'adresse **littérale** qui a négocié, jamais sur
+une seconde résolution.
+
+1. **Préparer le nom.** Profil Helios dont l'endpoint WireGuard et l'endpoint
+   de négociation nomment le même FQDN (ports 51820 et 51821). Dans
+   `C:\Windows\System32\drivers\etc\hosts`, faire porter à ce nom l'IPv4 réelle
+   de la gateway **et** une IPv6 qui ne répond pas, par exemple
+   `2001:db8::dead`. Vérifier avec `Resolve-DnsName <fqdn>` que les deux
+   réponses reviennent, et avec
+   `[System.Net.Dns]::GetHostAddresses('<fqdn>')` (ordre de `getaddrinfo`)
+   que Windows trie bien l'IPv6 en tête. Sans route IPv6 par défaut, Windows trie
+   l'IPv4 en tête (RFC 6724) : le journal affiche alors l'IPv4 retenue sans
+   candidat écarté, ce qui est le comportement attendu mais pas le cas testé.
+2. **Connecter.** Le tunnel doit monter en IPv4 avec ~250 ms de retard au
+   plus, sans attendre les 10 s du délai de connexion QUIC. Le journal doit
+   afficher, en avertissement :
+   « négociation 1/3 : endpoint `<fqdn>:51821` : IPv4 `<ip>:51821` retenu après
+   IPv6 [2001:db8::dead]:51821 sans réponse, tentative annulée » (ou « en
+   échec (…) » si Windows refuse l'envoi d'emblée), puis « endpoint WireGuard
+   `<fqdn>:51820` : IPv4 `<ip>:51820` (l'adresse qui a négocié) » et
+   « pair configuré vers `<ip>:51820` ». `orion.log` montre les deux lignes
+   « endpoint candidate: attempt started », la seconde 250 ms après la
+   première.
+3. **Profil intact.** L'endpoint affiché par le profil reste `<fqdn>:51820` :
+   seule la copie remise au plan de données porte le littéral. Une
+   reconnexion doit refaire la résolution (les lignes de l'étape 2
+   réapparaissent).
+4. **Aucune transaction orpheline.** Côté gateway,
+   `journalctl -u heliosd --since -5min` ne doit montrer qu'une seule requête
+   de négociation pour la tentative. Si la gateway écoute aussi en IPv6 et que
+   les deux candidats l'atteignent, la connexion perdante apparaît au plus
+   comme « quic: key-negotiation connection rejected » sans transaction
+   préparée : elle est abandonnée avant la requête signée.
+5. **Tous les candidats injoignables.** Remplacer l'IPv4 par une adresse
+   muette (`192.0.2.1`). Attendu : « négociation 1/3 : échec — no address of
+   `<fqdn>:51821` answered — [2001:db8::dead]:51821 (IPv6): … ;
+   192.0.2.1:51821 (IPv4): … », les trois tentatives habituelles, puis l'échec
+   final. L'adaptateur reste monté s'il l'était (ADR-001 §3 bis).
+6. **Profil classique.** Sans bloc de négociation, l'endpoint WireGuard est le
+   premier candidat de l'ordre RFC 8305 : il n'y a pas de course possible,
+   WireGuard n'acceptant qu'un endpoint par pair. Le journal affiche
+   « endpoint WireGuard `<fqdn>:51820` : IPv6 … (premier candidat de sa
+   résolution) ». Avec l'IPv6 muette de l'étape 1, ce tunnel ne monte pas :
+   c'est la limite connue du profil classique, nommée par le journal.
+
+Restaurer le fichier `hosts` à la fin.
+
+### Profil dual-stack : deux adresses sur l'adaptateur (VM Windows)
+
+Ce contrôle exige une gateway dotée d'un préfixe IPv6 de tunnel
+(`wg_address_v6`, IPv6 installée : `helios-ctl status` affiche `installed`) et
+`allow_tunnel_icmp = true`, un pair admis ou réadmis depuis (il porte
+`address_v6` dans `network.toml`), une VM Windows dual-stack et un Orion
+compilé avec `--features wireguard`. Sous WSL, seuls l'import, la validation,
+le scellement, la liste d'adresses remise à `defguard`, la comparaison de
+relecture et l'écran sont exercés (`scripts/wsl-cargo test -p orion-core`,
+`--features wireguard backend::wireguard`, `npm run test:unit`).
+
+1. **Émission.** `helios-ctl profile emit --name <pair> …` puis
+   `helios-ctl profile check <fichier>` : la ligne « adresse IPv6 » donne le
+   `/128` du pair. Pour un pair sans IPv6, le document ne contient **pas** la
+   clé : `Select-String address_v6 <fichier>` ne trouve rien.
+2. **Import.** L'écran Profils montre « Adresse virtuelle IPv6 » remplie à
+   côté de l'adresse virtuelle ; la ligne « adresse » du panneau de posture
+   affiche les deux, IPv4 d'abord.
+3. **Connexion.** `Get-NetIPAddress -InterfaceAlias orion0` liste la VIP IPv4
+   en `/32` et la VIP IPv6 en `/128`. Le journal affiche « AllowedIPs et
+   adresses appliqués vérifiés sur l'adaptateur », sans avertissement.
+4. **Joindre la gateway en IPv6.** `ping -6 <préfixe>::1` répond (ICMPv6 ouvert
+   sur l'interface du tunnel par `allow_tunnel_icmp`), comme
+   `ping 100.64.0.1`. `heliosd_url` reste l'URL IPv4 de la gateway.
+5. **« Helios seul ».** Sous « Avancé », le choix écrit
+   `<VIP gateway>/32, <préfixe>::1/128`. Après reconnexion, le `ping -6` de
+   l'étape 4 répond toujours. Le même choix sur un profil sans IPv6 écrit la
+   seule VIP IPv4, comme avant.
+6. **Adaptateur sans IPv6.** Avec `DisabledComponents = 0xFF` comme dans
+   « Capture réellement appliquée », connecter le profil dual-stack. Attendu,
+   en plus de l'erreur `::/0` de ce contrôle : l'avertissement « adresse non
+   posée par le pilote sur l'adaptateur : <VIP IPv6>/128 — le tunnel ne porte
+   pas cette famille d'adresses », et la ligne « adresse » en ambre
+   (« … — <VIP IPv6>/128 non posée par le pilote »). Le tunnel IPv4 fonctionne.
+   Remettre la valeur d'origine et redémarrer.
+7. **Profil périmé.** Sur un profil portant `heliosd_url` sans bloc de
+   négociation (chemin de provisioning après montage), remplacer la VIP IPv6
+   par une autre adresse du préfixe, puis connecter. Attendu, en
+   avertissement : « Profil périmé : la gateway a enregistré … pour ce poste,
+   le profil déclare … » ; le profil enregistré n'est pas modifié.
+8. **Orion antérieur.** Importer le document de l'étape 1 dans un Orion
+   antérieur à `address_v6` : l'import est **refusé**. Le message est celui
+   de cette version, hors de notre contrôle — attendu de la forme « document
+   JSON Orion invalide : unknown field `address_v6`, … ». Le document d'un
+   pair sans IPv6 s'y importe et s'y connecte en IPv4. Un profil scellé avec
+   une `address_v6` (version de manifeste 8) n'est pas lisible non plus par
+   cet Orion ; sans elle, il reste scellé dans l'encodage précédent.
+
+Rien de ceci n'a encore été observé sur cible, en particulier la relecture
+des adresses unicast de WireGuard-NT (`GetUnicastIpAddressTable`) et l'état de
+l'adresse IPv6 juste après la remise en service de l'adaptateur.
+
+### Sortie Internet IPv6 refusée (gateway Linux et client dual-stack)
+
+Critère 4 de [SORTIE-IPV6.md](../specification/SORTIE-IPV6.md) (V1, rejet
+explicite). Ce contrôle exige la gateway du contrôle précédent (IPv6 de tunnel
+`installed`, pair portant `address_v6`), `heliosd` compilé avec
+`--features netlink`, et un client dual-stack connecté en tunnel complet
+(`0.0.0.0/0, ::/0`) : la VM Windows ci-dessus, ou un poste Linux. Le WAN de la
+gateway peut avoir ou non de l'IPv6 : le rejet ne dépend pas de lui. Sous WSL,
+seuls le rendu, l'ordre et les octets Netlink sont exercés
+(`scripts/wsl-cargo test -p helios-firewall --features netlink`) : ni le
+noyau, ni l'ICMPv6 réellement émis, ni le comportement des applications.
+
+1. **Règles, tunnel `Down`.** Avant de connecter le client :
+
+   ```sh
+   sudo nft list chain inet helios forward
+   ```
+
+   Les dernières règles de la chaîne, une par uplink, sont
+   `meta nfproto ipv6 iifname "helios0" oifname "<wan>" reject with icmpx admin-prohibited`
+   (selon la version de `nft`, `reject with icmpx type admin-prohibited`). Elles
+   suivent `ct state invalid counter drop` et
+   `ct state established,related accept`. Noter si `nft` affiche la garde
+   `meta nfproto ipv6` avant ou après les interfaces : le batch la place en
+   tête.
+2. **Règles, tunnel `Up`.** Connecter le client et relire la chaîne : les
+   mêmes règles sont toujours les dernières, après la règle IPv4
+   `meta nfproto ipv4 iifname "helios0" oifname "<wan>" accept` si
+   `allow_client_internet` est actif. Aucune règle `accept` ne porte
+   `meta nfproto ipv6` ni `ip6`, hors contournement `split_tunnel_cidrs` IPv6
+   explicitement configuré, qui porte alors `iifname "<lan>"` — une règle par
+   interface LAN, aucune sans interface LAN, jamais `helios0` ni un WAN
+   (FIREWALL-V2).
+3. **Échec immédiat.** Sur la gateway, `sudo tcpdump -ni helios0 icmp6`. Depuis
+   le client :
+
+   ```sh
+   curl -6 -sS -o /dev/null -m 10 -w '%{time_total}\n' https://ipv6.google.com/
+   ```
+
+   (Windows : `curl.exe -6 …`). Attendu : un échec en bien moins d'une seconde,
+   pas au bout des 10 s de `-m 10` ; sous Linux, l'erreur attendue est
+   `Permission denied` (EACCES, la traduction noyau d'« administratively
+   prohibited »), à confirmer. `tcpdump` montre un
+   `destination unreachable … unreachable prohibited` (ICMPv6 type 1 code 1)
+   de la gateway vers la VIP IPv6 du client.
+4. **Repli dual-stack sans délai.** Dans un navigateur du client, charger un
+   site publié en A et AAAA (par exemple `https://www.wikipedia.org/`), cache
+   vidé. Attendu : chargement sans délai visible ; les outils de
+   développement montrent une connexion en IPv4.
+5. **La gateway reste joignable en IPv6.** `ping -6 <préfixe>::1` répond
+   toujours (règles `input`, `allow_tunnel_icmp`) : le rejet ne concerne que
+   le trafic vers un WAN.
+6. **Débit des réponses.** Relever `sysctl net.ipv6.icmp.ratelimit` (défaut
+   attendu 1000 ms) ; une rafale (`for i in $(seq 50); do curl -6 -s -m 2 …;
+   done`) doit rester bornée côté `tcpdump` par cette limite noyau, aucune
+   limite n'existant dans le ruleset (SORTIE-IPV6 §4.2).
+
+Rien de ceci n'a encore été observé sur cible.
 
 ## Test réel WireGuard sur Linux
 

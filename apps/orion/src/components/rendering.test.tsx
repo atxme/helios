@@ -5,7 +5,7 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it, vi } from 'vitest'
 
 import App from '../App'
-import type { ClientProfile, LogLine, TunnelState, VaultPosture } from '../types'
+import type { CaptureCheck, ClientProfile, LogLine, TunnelState, VaultPosture } from '../types'
 import { ConnectView } from '../views/ConnectView'
 import { ProfilesView } from '../views/ProfilesView'
 import { CopyButton } from './CopyButton'
@@ -24,7 +24,9 @@ const profile = (overrides: Partial<ClientProfile> = {}): ClientProfile => ({
   has_private_key: true,
   has_static_psk: false,
   address: '100.64.1.2/32',
-  allowed_ips: '0.0.0.0/0',
+  address_v6: null,
+  allowed_ips: '0.0.0.0/0, ::/0',
+  ipv6_uncaptured_full_tunnel: false,
   persistent_keepalive: 25,
   heliosd_url: 'http://100.64.0.1:8080',
   ssh_target: null,
@@ -32,7 +34,11 @@ const profile = (overrides: Partial<ClientProfile> = {}): ClientProfile => ({
   ...overrides,
 })
 
-function postureHtml(selected: ClientProfile, vault: VaultPosture | null): string {
+function postureHtml(
+  selected: ClientProfile,
+  vault: VaultPosture | null,
+  capture: CaptureCheck | null = null,
+): string {
   const anchor = document.createElement('button')
   document.body.append(anchor)
   render(
@@ -43,6 +49,7 @@ function postureHtml(selected: ClientProfile, vault: VaultPosture | null): strin
       adapterUp
       profile={selected}
       psk="ml_kem"
+      capture={capture}
       vault={vault}
     />,
   )
@@ -183,6 +190,106 @@ describe('Orion presentational branches', () => {
 
     expect(html).toContain('203.0.113.10:51821')
     expect(html).toContain('100.64.0.0/10')
+    // A narrowed range is the operator's decision: stated, not warned about.
+    expect(html).not.toContain('IPv6 sort en clair')
+  })
+
+  /// The full tunnel stored before `::/0` joined the default leaks IPv6 with
+  /// the tunnel up. The core's verdict decides the row, not the panel.
+  it('warns in amber on a full tunnel that leaves IPv6 out', () => {
+    const legacy = postureHtml(
+      profile({ allowed_ips: '0.0.0.0/0', ipv6_uncaptured_full_tunnel: true }),
+      null,
+    )
+    expect(legacy).toContain('0.0.0.0/0 — IPv4 seulement, l’IPv6 sort en clair')
+    expect(legacy).toContain('rgb(161, 98, 7)')
+
+    const dual = postureHtml(profile(), null)
+    expect(dual).toContain('0.0.0.0/0, ::/0')
+    expect(dual).not.toContain('IPv6 sort en clair')
+  })
+
+  /// The driver may apply less than the profile asks — on Windows, `::/0` on
+  /// an adapter without IPv6 — and nothing else on screen would show it.
+  it('names in amber the prefixes the driver did not apply', () => {
+    const stripped = postureHtml(profile(), null, {
+      status: 'incomplete',
+      missing: ['::/0'],
+      missing_addresses: [],
+    })
+    expect(stripped).toContain('::/0 non appliqué par le pilote — hors tunnel')
+    expect(stripped).toContain('rgb(161, 98, 7)')
+    // The gap outranks the profile's own list: showing «0.0.0.0/0, ::/0»
+    // alone would state a capture the adapter does not have.
+    expect(stripped).not.toContain('0.0.0.0/0, ::/0')
+
+    const both = postureHtml(profile(), null, {
+      status: 'incomplete',
+      missing: ['0.0.0.0/0', '::/0'],
+      missing_addresses: [],
+    })
+    expect(both).toContain('0.0.0.0/0, ::/0 non appliqués par le pilote — hors tunnel')
+
+    // Even on a legacy IPv4-only profile, the measured gap is what is shown.
+    const legacy = postureHtml(
+      profile({ allowed_ips: '0.0.0.0/0', ipv6_uncaptured_full_tunnel: true }),
+      null,
+      { status: 'incomplete', missing: ['0.0.0.0/0'], missing_addresses: [] },
+    )
+    expect(legacy).toContain('0.0.0.0/0 non appliqué par le pilote — hors tunnel')
+  })
+
+  /// Both addresses on the one «adresse» row, IPv4 first; a profile without
+  /// IPv6 reads exactly as before.
+  it('shows both tunnel addresses on the address row', () => {
+    const dual = postureHtml(profile({ address_v6: 'fd3c:91a2:7e04::2/128' }), null)
+    expect(dual).toContain('100.64.1.2/32, fd3c:91a2:7e04::2/128')
+    expect(dual).toContain('Copier les adresses virtuelles')
+    expect(dual).not.toContain('non posée')
+
+    const ipv4 = postureHtml(profile(), null)
+    expect(ipv4).toContain('100.64.1.2/32')
+    expect(ipv4).not.toContain('fd3c')
+    expect(ipv4).toContain('Copier l’adresse virtuelle')
+  })
+
+  /// On Windows an adapter without IPv6 drops the IPv6 address as silently as
+  /// `::/0`: the read-back names it, in amber, on the row it belongs to.
+  it('names in amber an address the driver did not put on the adapter', () => {
+    const skipped = postureHtml(profile({ address_v6: 'fd3c:91a2:7e04::2/128' }), null, {
+      status: 'incomplete',
+      missing: ['::/0'],
+      missing_addresses: ['fd3c:91a2:7e04::2/128'],
+    })
+    expect(skipped).toContain(
+      '100.64.1.2/32, fd3c:91a2:7e04::2/128 — fd3c:91a2:7e04::2/128 non posée par le pilote',
+    )
+    expect(skipped).toContain('::/0 non appliqué par le pilote — hors tunnel')
+
+    // An address alone missing leaves the traffic row as the profile states.
+    const alone = postureHtml(profile({ address_v6: 'fd3c:91a2:7e04::2/128' }), null, {
+      status: 'incomplete',
+      missing: [],
+      missing_addresses: ['fd3c:91a2:7e04::2/128'],
+    })
+    expect(alone).toContain('fd3c:91a2:7e04::2/128 non posée par le pilote')
+    expect(alone).not.toContain('non appliqué')
+    expect(alone).toContain('0.0.0.0/0, ::/0')
+  })
+
+  it('does not present an unverified capture as a healthy one', () => {
+    const unverified = postureHtml(profile(), null, {
+      status: 'unverified',
+      reason: 'configuration du pilote : lecture impossible',
+    })
+    expect(unverified).toContain('0.0.0.0/0, ::/0 — non vérifié sur l’adaptateur')
+    expect(unverified).toContain('rgb(161, 98, 7)')
+
+    const complete = postureHtml(profile(), null, { status: 'complete' })
+    expect(complete).toContain('0.0.0.0/0, ::/0')
+    expect(complete).not.toContain('non vérifié')
+    expect(complete).not.toContain('non appliqué')
+    expect(complete).not.toContain('rgb(161, 98, 7)')
   })
 
   it('server-renders the initial application without starting platform effects', () => {
