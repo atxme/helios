@@ -40,6 +40,7 @@ struct Commands {
     dimensions: (usize, usize),
     gateway: Gateway,
     base: String,
+    last_hint: RefCell<String>,
 }
 
 impl Helper for Commands {}
@@ -54,16 +55,7 @@ impl Highlighter for Commands {
     }
 
     fn highlight<'l>(&self, line: &'l str, _: usize) -> Cow<'l, str> {
-        if line.starts_with('/') && self.appearance.color {
-            let end = line.find(char::is_whitespace).unwrap_or(line.len());
-            Cow::Owned(format!(
-                "{}{}",
-                self.appearance.prompt(&line[..end]),
-                &line[end..]
-            ))
-        } else {
-            Cow::Borrowed(line)
-        }
+        Cow::Owned(self.appearance.input(line))
     }
 
     fn highlight_char(&self, _: &str, _: usize, _: CmdKind) -> bool {
@@ -100,14 +92,16 @@ impl Hinter for Commands {
             .as_ref()
             .map_or(0, |matches| self.selection.index(matches.entries.len()));
         let (width, height) = dimensions(self.dimensions);
-        Some(MenuHint(hint_text(
+        let hint = hint_text(
             matches.as_ref(),
             selected,
             width,
             height,
             &self.gateway,
             &self.base,
-        )))
+        );
+        hint.clone_into(&mut self.last_hint.borrow_mut());
+        Some(MenuHint(hint))
     }
 }
 
@@ -175,6 +169,25 @@ async fn probe(client: &Client, base: &str) -> Gateway {
     }
 }
 
+fn erase_last_frame(editor: &Editor<Commands, DefaultHistory>, size: (usize, usize)) {
+    if let Some(helper) = editor.helper() {
+        let line = helper.previous_line.borrow().clone();
+        let hint = helper.last_hint.borrow().clone();
+        erase_frame(&line, Some(&hint), size);
+    }
+}
+
+/// Erase the divider, input and optional hint above the cursor. Returns
+/// whether the frame was erased; unmeasurable input stays on screen.
+fn erase_frame(line: &str, hint: Option<&str>, size: (usize, usize)) -> bool {
+    let width = dimensions(size).0;
+    let Some(rows) = presentation::submitted_rows(line, width, hint) else {
+        return false;
+    };
+    print!("\x1b[{rows}A\r\x1b[J");
+    io::stdout().flush().is_ok()
+}
+
 async fn refresh(editor: &mut Editor<Commands, DefaultHistory>, client: &Client, base: &str) {
     let gateway = probe(client, base).await;
     if let Some(helper) = editor.helper_mut() {
@@ -230,6 +243,7 @@ pub async fn run(client: &Client, base: &str) -> Result<()> {
         dimensions: size,
         gateway: Gateway::Unknown,
         base: base.to_owned(),
+        last_hint: RefCell::new(String::new()),
     }));
     for key in [
         KeyCode::Up,
@@ -262,9 +276,24 @@ pub async fn run(client: &Client, base: &str) -> Result<()> {
         }
         println!("{}", appearance.divider(dimensions(size).0));
         let line = match editor.readline("❯ ") {
-            Ok(line) => line,
-            Err(ReadlineError::Interrupted) => continue,
-            Err(ReadlineError::Eof) => return Ok(()),
+            Ok(line) => {
+                // Replace the input frame with a transcript line; an empty
+                // line leaves nothing behind.
+                if erase_frame(&line, None, size) && !line.trim().is_empty() {
+                    println!("{}{}", appearance.prompt("❯ "), appearance.input(&line));
+                }
+                line
+            }
+            // Ctrl-C leaves the cursor below the hint it kept on screen.
+            Err(ReadlineError::Interrupted) => {
+                erase_last_frame(&editor, size);
+                continue;
+            }
+            // Ctrl-D only ends an empty line, with the cursor under the prompt.
+            Err(ReadlineError::Eof) => {
+                erase_frame("", None, size);
+                return Ok(());
+            }
             Err(error) => return Err(error.into()),
         };
         let args = match words(&line) {
@@ -374,6 +403,7 @@ mod tests {
             dimensions: (80, 24),
             gateway: Gateway::Unknown,
             base: "http://gw".to_owned(),
+            last_hint: RefCell::new(String::new()),
         };
         let history = DefaultHistory::new();
         let ctx = LineContext::new(&history);

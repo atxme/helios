@@ -23,7 +23,9 @@ gateway muette ou incompatible s'affiche `○ status unavailable` sans bloquer
 la saisie. Chaque commande
 s'affiche dans un bloc ouvert par `⏺ <commande>` et fermé par `⎿ ✓ <durée>`, ou
 par `⎿ ✗ <erreur>` en rouge, sans troncature. L'en-tête nomme la commande sans recopier les
-valeurs des arguments, qui peuvent contenir des clés. Un terminal
+valeurs des arguments, qui peuvent contenir des clés. Le cadre de saisie ne
+s'accumule pas : une commande validée reste affichée `❯ <commande>`, une ligne
+vide, Ctrl-C ou Ctrl-D ne laissent aucune trace. Un terminal
 sans édition (`TERM=dumb`,
 `cons25` ou `emacs`) est refusé ; les commandes scriptées restent disponibles.
 Exemple :

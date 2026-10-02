@@ -92,6 +92,15 @@ impl Appearance {
         lines.join("\n")
     }
 
+    /// Input line with its leading slash command emphasized.
+    pub fn input(self, line: &str) -> String {
+        if !line.starts_with('/') || !self.color {
+            return line.to_owned();
+        }
+        let end = line.find(char::is_whitespace).unwrap_or(line.len());
+        format!("{}{}", self.prompt(&line[..end]), &line[end..])
+    }
+
     pub fn divider(self, width: usize) -> String {
         self.paint(&"─".repeat(width.saturating_sub(1).min(120)), MUTED)
     }
@@ -235,6 +244,17 @@ pub(super) fn hint_text(
         ));
     }
     lines.join("\n")
+}
+
+/// Rows left above the cursor once the editor returns: the divider, the `❯ `
+/// input and, when the editor kept it on screen, the hint. `None` when the
+/// layout cannot be measured; erasing a guess could swallow earlier output.
+pub(super) fn submitted_rows(line: &str, width: usize, hint: Option<&str>) -> Option<usize> {
+    if width == 0 || !line.is_ascii() {
+        return None;
+    }
+    let input = (2 + line.len()) / width + 1;
+    Some(1 + input + hint.map_or(0, |hint| hint.matches('\n').count()))
 }
 
 /// Break on spaces; split a word only when it alone exceeds the width.
@@ -399,6 +419,22 @@ mod tests {
         assert!(colored.contains("\x1b[32m●"));
         let plain = Appearance { color: false }.highlight_hint(&text_for(&up), &up);
         assert!(!plain.contains('\x1b'));
+    }
+
+    #[test]
+    fn submitted_frames_are_measured_before_being_erased() {
+        let hint = "\n───\n  status\n  shortcuts";
+        assert_eq!(submitted_rows("", 80, None), Some(2));
+        assert_eq!(submitted_rows("", 80, Some(hint)), Some(5));
+        assert_eq!(submitted_rows(&"x".repeat(77), 80, None), Some(2));
+        assert_eq!(submitted_rows(&"x".repeat(78), 80, None), Some(3));
+        assert_eq!(submitted_rows("/peer add --name é", 80, None), None);
+        assert_eq!(submitted_rows("", 0, None), None);
+        let plain = Appearance { color: false };
+        assert_eq!(plain.input("/status --x"), "/status --x");
+        assert!(Appearance { color: true }
+            .input("/status --x")
+            .ends_with(" --x"));
     }
 
     fn text_for(gateway: &Gateway) -> String {
