@@ -169,3 +169,65 @@ transfert signé, le refus d’une signature altérée, l’ordre des fragments,
 SHA-256 et la demande d’activation. La recette matérielle avec accès console
 valide ensuite le service systemd, la reconnexion de l’API, la version confirmée
 et le rollback. Ces scénarios restent interdits sur une gateway de production.
+
+## Amendement du 3 octobre 2026 — administration locale par socket Unix
+
+### Contexte
+
+Le terminal opérateur `helios` s'utilise sur la gateway elle-même. Or le §3
+ne connaît qu'une identité administrateur, la VIP `/32` d'un pair WireGuard
+`admin`, et le pare-feu n'accepte le port de l'API que par `admin_iface`,
+boucle locale comprise (`helios-firewall`, `ruleset/administration.rs`). Depuis
+le shell de la gateway, l'API ne répond donc pas, et la seule administration
+locale existante (`--dev`) est explicitement exclue du mode réel.
+
+Ouvrir la boucle locale TCP ne convient pas : toute connexion locale
+deviendrait administratrice, quel que soit le processus, et un filtre par uid
+dans nftables disparaîtrait avec le mode maintenance `--sans-firewall`.
+
+### Décision
+
+`heliosd` sert, en mode réel, le même routeur d'API sur un second point
+d'entrée : le socket Unix `/run/helios/admin.sock`. Le TCP reste inchangé :
+adresse du tunnel, pare-feu limité à `admin_iface`, autorisation par VIP.
+
+1. **Authentification par le noyau, pas par le réseau.** À chaque connexion,
+   `heliosd` lit les identifiants du processus appelant fournis par le noyau
+   (`SO_PEERCRED`, `SO_PEERGROUPS`). Seuls l'uid 0 et les membres du groupe
+   `sudo` sont acceptés. Ce groupe donne déjà l'élévation root sur la gateway :
+   l'accès au socket n'accorde aucun privilège nouveau. Sans groupe `sudo`,
+   seul root est accepté. Toute autre connexion est fermée avant la première
+   requête et journalisée avec son uid et son pid.
+2. **Une identité posée par le serveur.** Chaque requête reçue sur ce socket
+   porte une marque d'appelant local insérée par le serveur lui-même, après la
+   vérification ci-dessus. Aucun en-tête ni aucune donnée de la requête ne la
+   produit ; une requête TCP ne peut pas la porter. `require_admin` l'accepte
+   comme administrateur et journalise `local:<utilisateur>`.
+3. **Un emplacement que seul root contrôle.** `/run/helios` est le
+   `RuntimeDirectory` du service, propriété de root et non inscriptible par un
+   autre utilisateur ; un utilisateur ordinaire ne peut ni créer ni remplacer
+   le socket. Le service n'a pas `CAP_CHOWN` : le socket reste propriété de
+   root, et ses droits d'accès sont ouverts (`0666`) parce que l'autorisation
+   repose sur les identifiants du noyau, pas sur les droits du fichier.
+4. **Un client qui vérifie avant de parler.** `helios` n'utilise le socket que
+   si c'est bien un socket, propriété de root, dans un répertoire propriété de
+   root et non inscriptible par le groupe ou les autres. Un socket qui échoue à
+   ce contrôle est une erreur, jamais un repli silencieux vers le TCP.
+5. **Indépendant du pare-feu.** Le socket n'est pas joignable par le réseau. Le
+   mode maintenance `--sans-firewall` ne change rien à son autorisation.
+6. **Mode réel seulement.** En simulation, l'API reste sur
+   `127.0.0.1:8080` avec l'administrateur simulé du §3.
+
+`helios` choisit le socket quand il existe et que ni `--url` ni `HELIOS_URL`
+ne désignent une API TCP ; `--url` force toujours le TCP.
+
+### Conséquences
+
+- Un compte membre de `sudo` sur la gateway administre Helios sans tunnel.
+  C'était déjà le cas par `sudo` ; ce chemin le rend direct et journalisé.
+- Un processus local qui n'est ni root ni membre de `sudo` n'obtient rien, pas
+  même les routes de lecture : la connexion est fermée.
+- L'invariant du pare-feu ne change pas : le port TCP de l'API reste fermé à
+  toute interface autre que `admin_iface`.
+- Un service compromis tournant sous un compte dédié reste exclu. Un service
+  compromis tournant en root l'était déjà de toute façon.
