@@ -559,6 +559,7 @@ mod tests {
             public_key: Some("another-peers-key".into()),
             admin: false,
             dev_loopback: false,
+            local: false,
         };
         let error = provision(State(state), Some(Extension(caller)), Json(request))
             .await

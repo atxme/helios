@@ -222,6 +222,7 @@ fn operator_caller_at(admin: bool) -> crate::auth::Caller {
         public_key: Some(CLIENT_KEY.into()),
         admin,
         dev_loopback: false,
+        local: false,
     }
 }
 
@@ -259,6 +260,7 @@ async fn development_loopback_never_impersonates_a_wireguard_operator() {
             public_key: None,
             admin: true,
             dev_loopback: true,
+            local: false,
         }),
         axum::extract::Path(OPERATION_HEX.into()),
     )
@@ -362,6 +364,7 @@ fn caller(public_key: Option<&str>) -> crate::auth::Caller {
         public_key: public_key.map(str::to_string),
         admin: false,
         dev_loopback: false,
+        local: false,
     }
 }
 

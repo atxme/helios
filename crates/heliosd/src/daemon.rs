@@ -338,6 +338,26 @@ pub(crate) async fn run(
         }
     });
 
+    // Local administration for the operator terminal on the gateway itself
+    // (ADR-003, amendment of 3 October 2026). Real mode only: a simulation
+    // keeps its loopback administrator and has no root-owned /run/helios.
+    #[cfg(target_os = "linux")]
+    if !dry_run {
+        let local_state = state.clone();
+        let socket = std::env::var_os("HELIOS_ADMIN_SOCKET")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| helios_api::local::LOCAL_ADMIN_SOCKET.into());
+        tokio::spawn(async move {
+            let result = match helios_api::local::AdminPolicy::system() {
+                Ok(policy) => helios_api::local::serve_local(local_state, &socket, policy).await,
+                Err(e) => Err(anyhow::Error::from(e).context("resolving the local admin group")),
+            };
+            if let Err(e) = result {
+                error!("local administration socket unavailable: {e:#}");
+            }
+        });
+    }
+
     let raw_speedtest_state = state.clone();
     let raw_speedtest_shutdown = Arc::new(AtomicBool::new(false));
     let raw_speedtest_task_shutdown = Arc::clone(&raw_speedtest_shutdown);

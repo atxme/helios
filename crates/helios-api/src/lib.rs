@@ -22,6 +22,8 @@ pub mod certificates;
 pub mod embed;
 pub mod health;
 pub mod key_negotiation;
+#[cfg(target_os = "linux")]
+pub mod local;
 pub mod provision;
 mod routes;
 pub mod speedtest;
