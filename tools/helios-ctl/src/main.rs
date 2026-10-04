@@ -433,6 +433,27 @@ struct Status {
     split_tunnel_cidrs: Vec<String>,
     mss_clamp: Option<u16>,
     captive_portal_gateway: Option<String>,
+    /// Absent from older daemons: every observed handshake then counts.
+    #[serde(default)]
+    handshake_stale_after_seconds: Option<u64>,
+}
+
+impl Status {
+    /// Peers whose last WireGuard handshake is still fresh, out of all
+    /// admitted peers.
+    fn online_peers(&self) -> (usize, usize) {
+        let online = self
+            .peers
+            .iter()
+            .filter(|peer| {
+                peer.last_handshake_age_seconds.is_some_and(|age| {
+                    self.handshake_stale_after_seconds
+                        .is_none_or(|stale| age <= stale)
+                })
+            })
+            .count();
+        (online, self.peers.len())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -441,6 +462,8 @@ struct PeerSummary {
     public_key: String,
     address: String,
     post_quantum: bool,
+    #[serde(default)]
+    last_handshake_age_seconds: Option<u64>,
 }
 
 use crate::api::{CmdResp, NetworkConfigView};
@@ -531,7 +554,15 @@ async fn cmd_status(client: &Client, base: &str) -> Result<()> {
     println!();
     println!("  \x1b[1mheliosd v{}\x1b[0m{}", s.version, dry);
     println!();
-    println!("  {}  {}", state_dot(&s.state), colored_state(&s.state));
+    let (online, total) = s.online_peers();
+    println!(
+        "  {}  {}  \x1b[2m{online}/{total} peers online\x1b[0m",
+        state_dot(&s.state),
+        colored_state(&s.state)
+    );
+    if s.state == "connecting" {
+        println!("     \x1b[2mtunnel ready, waiting for a client WireGuard handshake\x1b[0m");
+    }
     println!();
     println!("  {:<14} {}", "WAN", s.wan_ifaces.join(", "));
     println!("  {:<14} {}", "LAN", s.lan_ifaces.join(", "));

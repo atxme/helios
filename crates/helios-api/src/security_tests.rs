@@ -828,3 +828,22 @@ async fn the_local_socket_admits_by_kernel_credentials_only() {
     assert!(format!("{error:#}").contains("not a socket"), "{error:#}");
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// `/api/status` reports the daemon's release, not this crate's version:
+/// the console and the operator terminal both label it `heliosd`.
+#[tokio::test]
+async fn status_reports_the_daemon_version() {
+    let (state, _commands) = state_real();
+    let response = router(state.with_daemon_version("9.9.9"))
+        .oneshot(
+            Request::builder()
+                .uri("/api/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let status: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(status["version"], "9.9.9");
+}

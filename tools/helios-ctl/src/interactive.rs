@@ -159,11 +159,16 @@ fn command_path(tree: &clap::Command, args: &[String]) -> String {
 
 async fn probe(client: &Client, base: &str) -> Gateway {
     match tokio::time::timeout(PROBE_TIMEOUT, crate::api_status(client, base)).await {
-        Ok(Ok(status)) => Gateway::Reachable {
-            state: status.state,
-            version: status.version,
-            dry_run: status.dry_run,
-        },
+        Ok(Ok(status)) => {
+            let (peers_online, peers_total) = status.online_peers();
+            Gateway::Reachable {
+                state: status.state,
+                version: status.version,
+                dry_run: status.dry_run,
+                peers_online,
+                peers_total,
+            }
+        }
         // The commands themselves still report the full error.
         Ok(Err(error))
             if error.chain().any(|cause| {

@@ -258,3 +258,23 @@ fn no_url_is_assumed_by_the_parser() {
     let cli = Cli::try_parse_from(["helios", "status"]).unwrap();
     assert_eq!(cli.url, None);
 }
+
+/// A peer is online when its last handshake is younger than the gateway's
+/// staleness bound; a peer that never shook hands is not.
+#[test]
+fn online_peers_follow_the_gateway_staleness_bound() {
+    let status: Status = serde_json::from_value(serde_json::json!({
+        "state": "up", "version": "1.13.0", "wan_ifaces": [], "lan_ifaces": [],
+        "wg_peers": [], "allow_ssh_from": [], "wg_iface": "helios0",
+        "wg_listen_port": 51820, "dry_run": false, "split_tunnel_cidrs": [],
+        "mss_clamp": null, "captive_portal_gateway": null,
+        "handshake_stale_after_seconds": 150,
+        "peers": [
+            {"name": "a", "public_key": "k", "address": "100.64.1.2/32", "post_quantum": false, "last_handshake_age_seconds": 12},
+            {"name": "b", "public_key": "k", "address": "100.64.1.3/32", "post_quantum": false, "last_handshake_age_seconds": 400},
+            {"name": "c", "public_key": "k", "address": "100.64.1.4/32", "post_quantum": false, "last_handshake_age_seconds": null},
+        ]
+    }))
+    .unwrap();
+    assert_eq!(status.online_peers(), (1, 3));
+}

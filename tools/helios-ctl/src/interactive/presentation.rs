@@ -30,6 +30,8 @@ pub(super) enum Gateway {
         state: String,
         version: String,
         dry_run: bool,
+        peers_online: usize,
+        peers_total: usize,
     },
 }
 
@@ -254,8 +256,13 @@ pub(super) fn hint_text(
                 state,
                 version,
                 dry_run,
+                peers_online,
+                peers_total,
             } => format!(
-                "  ● {state} · heliosd v{version} ·{} {base}",
+                "  ● {} · {peers_online}/{peers_total} peers online · heliosd v{version} ·{} {base}",
+                // heliosd's `connecting` is a ready gateway with no client
+                // handshake yet, not a gateway trying to connect somewhere.
+                if state == "connecting" { "waiting for clients" } else { state },
                 if *dry_run { " dry-run ·" } else { "" }
             ),
         };
@@ -416,18 +423,34 @@ mod tests {
     fn status_line_shows_gateway_state_and_fits_the_terminal() {
         let up = Gateway::Reachable {
             state: "up".into(),
-            version: "0.11.0".into(),
+            version: "1.13.0".into(),
             dry_run: false,
+            peers_online: 3,
+            peers_total: 17,
         };
-        let text = hint_text(None, 0, 80, 24, &up, "http://gw:8080");
-        assert!(text.contains("  ● up · heliosd v0.11.0 · http://gw:8080"));
+        let text = hint_text(None, 0, 90, 24, &up, "local");
+        assert!(text.contains("  ● up · 3/17 peers online · heliosd v1.13.0 · local"));
+        let waiting = Gateway::Reachable {
+            state: "connecting".into(),
+            version: "1.13.0".into(),
+            dry_run: false,
+            peers_online: 0,
+            peers_total: 17,
+        };
+        let text = hint_text(None, 0, 90, 24, &waiting, "local");
+        assert!(
+            text.contains("  ● waiting for clients · 0/17 peers online · heliosd v1.13.0 · local"),
+            "{text}"
+        );
         assert!(text.contains("/ commands"));
         let dry = Gateway::Reachable {
             state: "down".into(),
             version: "0.11.0".into(),
             dry_run: true,
+            peers_online: 0,
+            peers_total: 0,
         };
-        assert!(hint_text(None, 0, 80, 24, &dry, "http://gw").contains("· dry-run ·"));
+        assert!(hint_text(None, 0, 90, 24, &dry, "http://gw").contains("· dry-run ·"));
         let silent = Gateway::Unavailable(Unavailable::NoAnswer);
         let text = hint_text(None, 0, 80, 24, &silent, "http://gw");
         assert!(text.contains("  ○ no API answer (tunnel only) · http://gw"));
@@ -438,6 +461,8 @@ mod tests {
             state: "up\x1b[2J".into(),
             version: "\x1b]0;x\x07".into(),
             dry_run: false,
+            peers_online: 0,
+            peers_total: 1,
         };
         for width in [12, 40, 80] {
             let text = hint_text(None, 0, width, 24, &hostile, "http://gw");

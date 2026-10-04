@@ -124,6 +124,8 @@ pub struct AppState {
     /// the orchestrator publishes. It is emptied when the interface goes down,
     /// because a stale list of "connected" peers is worse than no list.
     pub peer_runtime: Arc<RwLock<Vec<PeerStatus>>>,
+    /// Release of the daemon serving this API, reported by `/api/status`.
+    pub daemon_version: &'static str,
 }
 
 /// Public key-negotiation material, exactly as an Orion profile pins it.
@@ -169,7 +171,16 @@ impl AppState {
             operator_campaign: None,
             tpm: None,
             peer_runtime: Arc::new(RwLock::new(Vec::new())),
+            // Visible rather than wrong when a binary forgets to name itself:
+            // this crate's own version is not the gateway's release.
+            daemon_version: "unknown",
         }
+    }
+
+    /// Names the daemon release that `/api/status` reports.
+    pub fn with_daemon_version(mut self, version: &'static str) -> Self {
+        self.daemon_version = version;
+        self
     }
 
     /// Publishes the gateway's sealing posture, without its secret.

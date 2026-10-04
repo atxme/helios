@@ -178,7 +178,9 @@ pub(crate) async fn run(
     // The sealing posture, as two non-secret facts. `boot` itself is moved
     // into the orchestrator below — it holds the unlock secret, and only the
     // orchestrator may seal.
-    state = state.with_tpm(boot.kind(), boot.preserved_vaults());
+    state = state
+        .with_tpm(boot.kind(), boot.preserved_vaults())
+        .with_daemon_version(env!("CARGO_PKG_VERSION"));
     // Started here rather than earlier because the reclamation loop reads the
     // same data-plane snapshot the console does, and that snapshot is owned
     // by `AppState`. Polling the backend a second time would risk the two
