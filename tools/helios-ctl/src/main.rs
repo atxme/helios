@@ -31,6 +31,7 @@ mod enroll;
 mod escrow;
 mod files;
 mod firmware;
+mod inspect;
 mod interactive;
 mod key_nego;
 mod peer;
@@ -87,6 +88,29 @@ enum Cmd {
     Disconnect,
     /// Real-time event stream over WebSocket. Ctrl-C to quit.
     Watch,
+    /// One-pass health check: API, tunnel, TPM, firewall, certificates, release.
+    Doctor,
+    /// Machine health: uptime, load, memory, temperature and TPM posture.
+    Health,
+    /// nftables ruleset rendered for the current tunnel state.
+    Firewall,
+    /// Trust domain and certificate lifecycle: CA, gateway identity, clients.
+    Certificates,
+    /// Publisher keys and algorithms an application update must carry.
+    Trust,
+    /// heliosd release state: active version, staged releases, pending activation.
+    Release,
+    /// Public key-negotiation material pinned by Orion profiles.
+    Negotiation,
+    /// heliosd journal on this machine (journalctl). Ctrl-C ends --follow.
+    Logs {
+        /// Number of most recent lines.
+        #[arg(short = 'n', long, default_value_t = 50)]
+        lines: usize,
+        /// Keep printing new lines.
+        #[arg(short, long)]
+        follow: bool,
+    },
     /// Network configuration management.
     Network {
         #[command(subcommand)]
@@ -1024,6 +1048,14 @@ async fn execute_command(api: &transport::Api, command: Cmd) -> Result<()> {
         Cmd::Connect => cmd_connect(client, base).await,
         Cmd::Disconnect => cmd_disconnect(client, base).await,
         Cmd::Watch => cmd_watch(api).await,
+        Cmd::Doctor => inspect::doctor(api).await,
+        Cmd::Health => inspect::health(client, base).await,
+        Cmd::Firewall => inspect::firewall(client, base).await,
+        Cmd::Certificates => inspect::certificates(client, base).await,
+        Cmd::Trust => inspect::trust(client, base).await,
+        Cmd::Release => inspect::release(client, base).await,
+        Cmd::Negotiation => inspect::negotiation(client, base).await,
+        Cmd::Logs { lines, follow } => inspect::logs(lines, follow).await,
         Cmd::Network { command } => match command {
             NetworkCmd::Show => cmd_network_show(client, base).await,
             NetworkCmd::Load { file } => cmd_network_load(client, base, &file).await,

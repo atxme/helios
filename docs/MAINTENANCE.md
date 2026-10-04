@@ -58,6 +58,19 @@ bundles installent `/usr/local/bin/helios`. Les anciens bundles signés contenan
 n'est effectuée. Les scripts qui invoquent directement l'ancien exécutable
 doivent utiliser `helios` après la nouvelle livraison.
 
+Commandes d'inspection, en lecture seule, servies par l'API (aucun secret) :
+
+| Commande | Contenu |
+|---|---|
+| `/doctor` | contrôle en une passe : API, tunnel, mode, TPM, mémoire, température, pare-feu, certificats, release ; échoue si un point est en échec |
+| `/health` | uptime, charge, mémoire disponible, température, posture TPM |
+| `/firewall` | jeu de règles nftables rendu pour l'état courant du tunnel |
+| `/certificates` | domaine de confiance Astra : CA, identité de la gateway, émetteur, certificats clients |
+| `/trust` | clés éditeur et algorithmes exigés pour une mise à jour applicative |
+| `/release` | version active, releases préparées, activation en attente |
+| `/negotiation` | matériel public de la négociation de clé épinglé par les profils Orion |
+| `/logs [-n N] [--follow]` | journal de heliosd sur la machine locale (`journalctl --namespace=helios`) |
+
 ## Cible de la maintenance
 
 `--url` cible seulement l'API. Sans `--url` ni `HELIOS_URL`, `helios` utilise
