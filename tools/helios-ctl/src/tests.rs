@@ -75,7 +75,7 @@ fn command_line_keeps_peer_security_parameters() {
         "ml-kem",
     ])
     .unwrap();
-    assert_eq!(cli.url, "https://100.64.0.1:8080/");
+    assert_eq!(cli.url.as_deref(), Some("https://100.64.0.1:8080/"));
     assert!(matches!(
         cli.command.unwrap(),
         Cmd::Peer {
@@ -248,13 +248,13 @@ fn command_responses_preserve_refusal_details() {
     assert!(unknown.to_string().contains("unknown error"));
 }
 
-/// heliosd serves its API on the WireGuard address (`api_bind`); loopback is
-/// only the dry-run fallback. Without `--url`, aim where a gateway listens.
+/// Without `--url`, the transport decides (local socket or in-tunnel API):
+/// the parser must not invent a TCP address.
 #[test]
-fn the_default_api_url_is_the_in_tunnel_gateway_address() {
+fn no_url_is_assumed_by_the_parser() {
     if std::env::var_os("HELIOS_URL").is_some() {
         return;
     }
     let cli = Cli::try_parse_from(["helios", "status"]).unwrap();
-    assert_eq!(cli.url, aether::DEFAULT_WG_API_URL);
+    assert_eq!(cli.url, None);
 }

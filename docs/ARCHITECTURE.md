@@ -144,6 +144,10 @@ rather than writing those keys in clear.
 
 The API listens on the host address of `wg_address` once the gateway is ready,
 otherwise on `127.0.0.1:8080`. nftables limits remote access to `admin_iface`.
+In real mode the same router is also served on `/run/helios/admin.sock` for
+local administration (ADR-003, amendment of 3 October 2026): the kernel's peer
+credentials admit root and members of `sudo` only, and the listener marks
+their requests as a local administrator.
 It never brings the initial tunnel up.
 
 - state and rule reads carry no secret;

@@ -20,7 +20,8 @@ use futures_util::StreamExt;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::Value;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio_tungstenite::{connect_async, tungstenite::Message, WebSocketStream};
 
 mod api;
 mod app_update;
@@ -34,6 +35,7 @@ mod interactive;
 mod key_nego;
 mod peer;
 mod profile;
+mod transport;
 mod update;
 
 // ─── CLI ──────────────────────────────────────────────────────────────────────
@@ -58,10 +60,11 @@ EXAMPLES:
   cargo run -p helios-ctl -- --url http://192.168.1.1:8080 status"
 )]
 struct Cli {
-    /// Gateway API. heliosd serves it on its WireGuard address; a dry-run
-    /// daemon (`heliosd run --dev`) listens on http://127.0.0.1:8080 instead.
-    #[arg(long, default_value = aether::DEFAULT_WG_API_URL, env = "HELIOS_URL")]
-    url: String,
+    /// Gateway API over TCP. Without it, the gateway's local administration
+    /// socket when present, else the in-tunnel API (http://100.64.0.1:8080).
+    /// A dry-run daemon (`heliosd run --dev`) listens on http://127.0.0.1:8080.
+    #[arg(long, env = "HELIOS_URL")]
+    url: Option<String>,
 
     #[command(subcommand)]
     command: Option<Cmd>,
@@ -594,14 +597,29 @@ async fn cmd_disconnect(client: &Client, base: &str) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_watch(base: &str) -> Result<()> {
-    let url = ws_url(base);
-    println!("\x1b[2m↳ {url}\x1b[0m");
-    let (mut stream, _) = connect_async(&url)
+async fn cmd_watch(api: &transport::Api) -> Result<()> {
+    let url = ws_url(&api.base);
+    println!("\x1b[2m↳ {}\x1b[0m", api.describe());
+    #[cfg(unix)]
+    if let Some(socket) = &api.socket {
+        let stream = tokio::net::UnixStream::connect(socket)
+            .await
+            .with_context(|| format!("could not connect to {}", socket.display()))?;
+        let (stream, _) = tokio_tungstenite::client_async(url.as_str(), stream)
+            .await
+            .context("WebSocket handshake over the local socket")?;
+        return watch_events(stream).await;
+    }
+    let (stream, _) = connect_async(&url)
         .await
         .context("could not connect — is heliosd running?")?;
-    println!("\x1b[2m↳ connected — Ctrl-C to quit\x1b[0m\n");
+    watch_events(stream).await
+}
 
+async fn watch_events<S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: WebSocketStream<S>,
+) -> Result<()> {
+    println!("\x1b[2m↳ connected — Ctrl-C to quit\x1b[0m\n");
     loop {
         tokio::select! {
             result = tokio::signal::ctrl_c() => { result?; return Ok(()); }
@@ -942,6 +960,13 @@ fn check_ssh_target(value: Option<String>) -> Result<Option<String>> {
 
 // ─── main ─────────────────────────────────────────────────────────────────────
 
+/// Same override as heliosd, for a non-default runtime directory.
+fn admin_socket() -> std::path::PathBuf {
+    std::env::var_os("HELIOS_ADMIN_SOCKET")
+        .map(Into::into)
+        .unwrap_or_else(|| aether::LOCAL_ADMIN_SOCKET.into())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Two rustls providers are compiled in — `ring` for the negotiation's QUIC
@@ -951,23 +976,23 @@ async fn main() -> Result<()> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     let cli = Cli::parse();
-    let client = Client::new();
-    let base = cli.url.trim_end_matches('/');
+    let api = transport::Api::resolve(cli.url.as_deref(), &admin_socket())?;
 
     match cli.command {
-        None | Some(Cmd::Shell) => interactive::run(&client, base).await,
-        Some(command) => execute_command(&client, base, command).await,
+        None | Some(Cmd::Shell) => interactive::run(api).await,
+        Some(command) => execute_command(&api, command).await,
     }
 }
 
-async fn execute_command(client: &Client, base: &str, command: Cmd) -> Result<()> {
+async fn execute_command(api: &transport::Api, command: Cmd) -> Result<()> {
+    let (client, base) = (&api.client, api.base.as_str());
     match command {
         Cmd::Shell => anyhow::bail!("open the shell at the command entry point"),
         Cmd::Firmware { command } => firmware::run(command),
         Cmd::Status => cmd_status(client, base).await,
         Cmd::Connect => cmd_connect(client, base).await,
         Cmd::Disconnect => cmd_disconnect(client, base).await,
-        Cmd::Watch => cmd_watch(base).await,
+        Cmd::Watch => cmd_watch(api).await,
         Cmd::Network { command } => match command {
             NetworkCmd::Show => cmd_network_show(client, base).await,
             NetworkCmd::Load { file } => cmd_network_load(client, base, &file).await,

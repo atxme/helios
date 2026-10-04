@@ -21,7 +21,7 @@ use rustyline::{
     Context as LineContext, Editor, EventHandler, Helper, KeyCode, KeyEvent, Modifiers,
 };
 
-use crate::{Cli, Cmd};
+use crate::{transport::Api, Cli, Cmd};
 
 mod palette;
 mod presentation;
@@ -217,11 +217,11 @@ async fn ctrl_c() {
     }
 }
 
-async fn refresh(editor: &mut Editor<Commands, DefaultHistory>, client: &Client, base: &str) {
-    let gateway = probe(client, base).await;
+async fn refresh(editor: &mut Editor<Commands, DefaultHistory>, api: &Api) {
+    let gateway = probe(&api.client, &api.base).await;
     if let Some(helper) = editor.helper_mut() {
         helper.gateway = gateway;
-        base.clone_into(&mut helper.base);
+        helper.base = api.label();
     }
 }
 
@@ -235,7 +235,7 @@ fn words(line: &str) -> Result<Vec<String>> {
     Ok(words)
 }
 
-pub async fn run(client: &Client, base: &str) -> Result<()> {
+pub async fn run(mut api: Api) -> Result<()> {
     anyhow::ensure!(
         io::stdin().is_terminal() && io::stdout().is_terminal(),
         "the interactive shell requires a terminal; use `helios --help` for scripted commands"
@@ -271,7 +271,7 @@ pub async fn run(client: &Client, base: &str) -> Result<()> {
         appearance,
         dimensions: size,
         gateway: Gateway::Unknown,
-        base: base.to_owned(),
+        base: api.label(),
         last_hint: RefCell::new(String::new()),
     }));
     for key in [
@@ -295,9 +295,11 @@ pub async fn run(client: &Client, base: &str) -> Result<()> {
             })),
         );
     }
-    let mut base = base.to_owned();
-    println!("{}", appearance.welcome(&base, dimensions(size).0));
-    refresh(&mut editor, client, &base).await;
+    println!(
+        "{}",
+        appearance.welcome(&api.describe(), dimensions(size).0)
+    );
+    refresh(&mut editor, &api).await;
     loop {
         selection.reset();
         if let Some(helper) = editor.helper_mut() {
@@ -342,7 +344,10 @@ pub async fn run(client: &Client, base: &str) -> Result<()> {
                 continue;
             }
             editor.clear_screen()?;
-            println!("{}", appearance.welcome(&base, dimensions(size).0));
+            println!(
+                "{}",
+                appearance.welcome(&api.describe(), dimensions(size).0)
+            );
             continue;
         }
         if args[0] == "use" {
@@ -352,21 +357,28 @@ pub async fn run(client: &Client, base: &str) -> Result<()> {
             }
             match reqwest::Url::parse(&args[1]) {
                 Ok(url) if matches!(url.scheme(), "http" | "https") && url.host_str().is_some() => {
-                    base = args[1].trim_end_matches('/').to_owned();
-                    println!("{}", appearance.welcome(&base, dimensions(size).0));
-                    refresh(&mut editor, client, &base).await;
+                    match Api::tcp(&args[1]) {
+                        Ok(tcp) => api = tcp,
+                        Err(error) => {
+                            eprintln!("{error:#}");
+                            continue;
+                        }
+                    }
+                    println!(
+                        "{}",
+                        appearance.welcome(&api.describe(), dimensions(size).0)
+                    );
+                    refresh(&mut editor, &api).await;
                 }
                 _ => eprintln!("expected an HTTP(S) gateway URL"),
             }
             continue;
         }
-        let mut argv = vec!["helios".to_owned()];
-        if !args
+        // `--url` on the line targets that TCP API for this command only.
+        let explicit_url = args
             .iter()
-            .any(|arg| arg == "--url" || arg.starts_with("--url="))
-        {
-            argv.extend(["--url".to_owned(), base.clone()]);
-        }
+            .any(|arg| arg == "--url" || arg.starts_with("--url="));
+        let mut argv = vec!["helios".to_owned()];
         let path = command_path(&tree, &args);
         argv.extend(args);
         let cli = match Cli::try_parse_from(argv) {
@@ -388,7 +400,20 @@ pub async fn run(client: &Client, base: &str) -> Result<()> {
         let width = dimensions(size).0;
         println!("{}", appearance.command_header(&path, width));
         let started = Instant::now();
-        let command = crate::execute_command(client, cli.url.trim_end_matches('/'), command);
+        let one_off = match (explicit_url, cli.url.as_deref()) {
+            (true, Some(url)) => match Api::tcp(url) {
+                Ok(tcp) => Some(tcp),
+                Err(error) => {
+                    eprintln!(
+                        "{}",
+                        appearance.command_failure(&format!("{error:#}"), width)
+                    );
+                    continue;
+                }
+            },
+            _ => None,
+        };
+        let command = crate::execute_command(one_off.as_ref().unwrap_or(&api), command);
         match interruptible(command, ctrl_c()).await {
             Some(Ok(())) => println!("{}", appearance.command_success(started.elapsed())),
             Some(Err(error)) => eprintln!(
@@ -397,7 +422,7 @@ pub async fn run(client: &Client, base: &str) -> Result<()> {
             ),
             None => eprintln!("\n{}", appearance.command_interrupted(width)),
         }
-        refresh(&mut editor, client, &base).await;
+        refresh(&mut editor, &api).await;
     }
 }
 

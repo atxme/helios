@@ -60,14 +60,19 @@ doivent utiliser `helios` après la nouvelle livraison.
 
 ## Cible de la maintenance
 
-`--url` cible seulement l'API. Par défaut, `http://100.64.0.1:8080`
-(`aether::DEFAULT_WG_API_URL`), l'adresse où heliosd sert l'API dans le
-tunnel ; un daemon en simulation (`heliosd run --dev`) écoute sur
-`http://127.0.0.1:8080`, à passer avec `--url` ou `HELIOS_URL`. Le pare-feu
-n'accepte l'API que par l'interface du tunnel, boucle locale comprise : depuis
-le shell de la gateway, seules les commandes locales (`update`, `firmware`,
-`profile check`) répondent, et la ligne d'état affiche
-`○ no API answer (tunnel only)`. `update` et `update --check` agissent sur la machine
+`--url` cible seulement l'API. Sans `--url` ni `HELIOS_URL`, `helios` utilise
+le socket d'administration locale `/run/helios/admin.sock` s'il existe (ADR-003,
+amendement du 3 octobre 2026) : sur la gateway, toutes les commandes répondent,
+pour root et les membres du groupe `sudo`, sans tunnel. L'accueil affiche
+`local socket /run/helios/admin.sock` et la ligne d'état `local`. Un socket qui
+n'appartient pas à root, ou dont le répertoire est inscriptible par d'autres,
+est refusé : jamais de repli silencieux vers le TCP. Sans socket, `helios` vise
+`http://100.64.0.1:8080` (`aether::DEFAULT_WG_API_URL`), l'API dans le tunnel ;
+un daemon en simulation (`heliosd run --dev`) écoute sur `http://127.0.0.1:8080`,
+à passer avec `--url`. Le port TCP de l'API reste fermé à toute interface autre
+que celle du tunnel, boucle locale comprise. Les campagnes opérateur Astra, liées
+à une identité WireGuard, refusent le socket local (403) : elles passent par le
+tunnel. `update` et `update --check` agissent sur la machine
 qui exécute le terminal. `firmware list` est local par défaut ; `--ssh-target`
 le dirige vers une gateway. L'inventaire utilise les métadonnées déjà présentes,
 sans rafraîchissement ni installation. Un échec d'inventaire est une erreur,

@@ -31,9 +31,6 @@ use crate::AppState;
 /// root through `sudo`, so the socket adds no privilege.
 pub const LOCAL_ADMIN_GROUP: &str = "sudo";
 
-/// Socket path inside the service's root-owned `RuntimeDirectory`.
-pub const LOCAL_ADMIN_SOCKET: &str = "/run/helios/admin.sock";
-
 /// Identity of a caller accepted on the local socket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LocalAdmin {

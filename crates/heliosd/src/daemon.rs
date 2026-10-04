@@ -346,7 +346,7 @@ pub(crate) async fn run(
         let local_state = state.clone();
         let socket = std::env::var_os("HELIOS_ADMIN_SOCKET")
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| helios_api::local::LOCAL_ADMIN_SOCKET.into());
+            .unwrap_or_else(|| aether::LOCAL_ADMIN_SOCKET.into());
         tokio::spawn(async move {
             let result = match helios_api::local::AdminPolicy::system() {
                 Ok(policy) => helios_api::local::serve_local(local_state, &socket, policy).await,
