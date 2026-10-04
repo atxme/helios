@@ -2,7 +2,7 @@
 
 use std::{
     borrow::Cow,
-    cell::RefCell,
+    cell::{Cell, RefCell},
     io::{self, BufRead, IsTerminal, Write},
     sync::Arc,
     time::{Duration, Instant},
@@ -27,7 +27,9 @@ mod palette;
 mod presentation;
 
 use palette::{suggestions, MenuKeys, Selection};
-use presentation::{dimensions, hint_text, Appearance, Gateway, Unavailable};
+use presentation::{
+    dimensions, hint_text, on_interrupt, Appearance, Gateway, Interrupt, Unavailable,
+};
 
 /// Bounds the status-line refresh so an unreachable gateway cannot stall input.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -41,6 +43,8 @@ struct Commands {
     gateway: Gateway,
     base: String,
     last_hint: RefCell<String>,
+    /// A first Ctrl-C on an empty line; typing anything withdraws it.
+    exit_armed: Cell<bool>,
 }
 
 impl Helper for Commands {}
@@ -83,6 +87,9 @@ impl Hinter for Commands {
             self.selection.reset();
             line.clone_into(&mut previous);
         }
+        if !line.is_empty() {
+            self.exit_armed.set(false);
+        }
         let matches = self
             .selection
             .visible(line, pos)
@@ -99,6 +106,7 @@ impl Hinter for Commands {
             height,
             &self.gateway,
             &self.base,
+            self.exit_armed.get(),
         );
         hint.clone_into(&mut self.last_hint.borrow_mut());
         Some(MenuHint(hint))
@@ -278,6 +286,7 @@ pub async fn run(mut api: Api) -> Result<()> {
         gateway: Gateway::Unknown,
         base: api.label(),
         last_hint: RefCell::new(String::new()),
+        exit_armed: Cell::new(false),
     }));
     for key in [
         KeyCode::Up,
@@ -313,6 +322,9 @@ pub async fn run(mut api: Api) -> Result<()> {
         println!("{}", appearance.divider(dimensions(size).0));
         let line = match editor.readline("❯ ") {
             Ok(line) => {
+                if let Some(helper) = editor.helper() {
+                    helper.exit_armed.set(false);
+                }
                 // Replace the input frame with a transcript line; an empty
                 // line leaves nothing behind.
                 if erase_frame(&line, None, size) && !line.trim().is_empty() {
@@ -323,6 +335,15 @@ pub async fn run(mut api: Api) -> Result<()> {
             // Ctrl-C leaves the cursor below the hint it kept on screen.
             Err(ReadlineError::Interrupted) => {
                 erase_last_frame(&editor, size);
+                let Some(helper) = editor.helper() else {
+                    continue;
+                };
+                let empty = helper.previous_line.borrow().is_empty();
+                match on_interrupt(empty, helper.exit_armed.get()) {
+                    Interrupt::Exit => return Ok(()),
+                    Interrupt::Arm => helper.exit_armed.set(true),
+                    Interrupt::Clear => helper.exit_armed.set(false),
+                }
                 continue;
             }
             // Ctrl-D only ends an empty line, with the cursor under the prompt.
@@ -465,6 +486,7 @@ mod tests {
             gateway: Gateway::Unknown,
             base: "http://gw".to_owned(),
             last_hint: RefCell::new(String::new()),
+            exit_armed: Cell::new(false),
         };
         let history = DefaultHistory::new();
         let ctx = LineContext::new(&history);

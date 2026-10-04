@@ -191,6 +191,23 @@ impl Appearance {
     }
 }
 
+/// What Ctrl-C at the prompt does, as in Claude Code: it clears typed text;
+/// on an empty line it asks for confirmation, and a second one exits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Interrupt {
+    Clear,
+    Arm,
+    Exit,
+}
+
+pub(super) fn on_interrupt(line_empty: bool, armed: bool) -> Interrupt {
+    match (line_empty, armed) {
+        (false, _) => Interrupt::Clear,
+        (true, false) => Interrupt::Arm,
+        (true, true) => Interrupt::Exit,
+    }
+}
+
 /// Keep menu text separate from completion: a footer can never become input.
 pub(super) fn hint_text(
     matches: Option<&Suggestions>,
@@ -199,6 +216,7 @@ pub(super) fn hint_text(
     height: usize,
     gateway: &Gateway,
     base: &str,
+    exit_armed: bool,
 ) -> String {
     let width = width.saturating_sub(1).min(120);
     let mut lines = vec![String::new(), "─".repeat(width)];
@@ -268,7 +286,11 @@ pub(super) fn hint_text(
         };
         lines.push(fit(&status, width));
         lines.push(fit(
-            "  / commands · Tab complete · ↑↓ history · Ctrl-D exit",
+            if exit_armed {
+                "  Press Ctrl-C again to exit"
+            } else {
+                "  / commands · Tab complete · ↑↓ history · Ctrl-C twice to exit"
+            },
             width,
         ));
     }
@@ -360,7 +382,15 @@ mod tests {
         let matches = suggestions(&tree, "/", 1);
         let selected = matches.entries.len() - 1;
         for width in [12, 40, 80] {
-            let text = hint_text(Some(&matches), selected, width, 16, &Gateway::Unknown, "");
+            let text = hint_text(
+                Some(&matches),
+                selected,
+                width,
+                16,
+                &Gateway::Unknown,
+                "",
+                false,
+            );
             assert!(text.contains("›"));
             assert!(text.contains(&format!("of {}", matches.entries.len())) || width < 20);
             assert!(text.lines().all(|line| line.chars().count() < width));
@@ -428,7 +458,7 @@ mod tests {
             peers_online: 3,
             peers_total: 17,
         };
-        let text = hint_text(None, 0, 90, 24, &up, "local");
+        let text = hint_text(None, 0, 90, 24, &up, "local", false);
         assert!(text.contains("  ● up · 3/17 peers online · heliosd v1.13.0 · local"));
         let waiting = Gateway::Reachable {
             state: "connecting".into(),
@@ -437,7 +467,7 @@ mod tests {
             peers_online: 0,
             peers_total: 17,
         };
-        let text = hint_text(None, 0, 90, 24, &waiting, "local");
+        let text = hint_text(None, 0, 90, 24, &waiting, "local", false);
         assert!(
             text.contains("  ● waiting for clients · 0/17 peers online · heliosd v1.13.0 · local"),
             "{text}"
@@ -450,12 +480,12 @@ mod tests {
             peers_online: 0,
             peers_total: 0,
         };
-        assert!(hint_text(None, 0, 90, 24, &dry, "http://gw").contains("· dry-run ·"));
+        assert!(hint_text(None, 0, 90, 24, &dry, "http://gw", false).contains("· dry-run ·"));
         let silent = Gateway::Unavailable(Unavailable::NoAnswer);
-        let text = hint_text(None, 0, 80, 24, &silent, "http://gw");
+        let text = hint_text(None, 0, 80, 24, &silent, "http://gw", false);
         assert!(text.contains("  ○ no API answer (tunnel only) · http://gw"));
         let odd = Gateway::Unavailable(Unavailable::Incompatible);
-        let text = hint_text(None, 0, 80, 24, &odd, "http://gw");
+        let text = hint_text(None, 0, 80, 24, &odd, "http://gw", false);
         assert!(text.contains("  ○ incompatible API response · http://gw"));
         let hostile = Gateway::Reachable {
             state: "up\x1b[2J".into(),
@@ -465,7 +495,7 @@ mod tests {
             peers_total: 1,
         };
         for width in [12, 40, 80] {
-            let text = hint_text(None, 0, width, 24, &hostile, "http://gw");
+            let text = hint_text(None, 0, width, 24, &hostile, "http://gw", false);
             assert!(!text.contains('\x1b'));
             assert!(text.lines().all(|line| line.chars().count() < width));
         }
@@ -491,7 +521,19 @@ mod tests {
             .ends_with(" --x"));
     }
 
+    #[test]
+    fn a_first_ctrl_c_on_an_empty_line_asks_for_a_second() {
+        let armed = hint_text(None, 0, 80, 24, &Gateway::Unknown, "local", true);
+        assert!(armed.contains("Press Ctrl-C again to exit"));
+        let idle = hint_text(None, 0, 80, 24, &Gateway::Unknown, "local", false);
+        assert!(!idle.contains("again"));
+        assert_eq!(on_interrupt(false, false), Interrupt::Clear);
+        assert_eq!(on_interrupt(false, true), Interrupt::Clear);
+        assert_eq!(on_interrupt(true, false), Interrupt::Arm);
+        assert_eq!(on_interrupt(true, true), Interrupt::Exit);
+    }
+
     fn text_for(gateway: &Gateway) -> String {
-        hint_text(None, 0, 80, 24, gateway, "http://gw")
+        hint_text(None, 0, 80, 24, gateway, "http://gw", false)
     }
 }

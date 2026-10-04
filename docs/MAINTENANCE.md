@@ -45,8 +45,9 @@ Toutes les commandes de l'interface scriptée sont accessibles, avec ou sans
 change l'API active ; `--url` peut la remplacer pour une commande. `/clear`
 efface l'écran et réaffiche l'accueil avec l'API active. Les arguments
 entre guillemets sont acceptés, sans expansion de variables ni exécution de
-shell. Ctrl-C efface la saisie ; pendant une commande, il l'abandonne et rend
-la main (une requête déjà partie peut aboutir sur la gateway). Ctrl-D ou `/quit`
+shell. Ctrl-C efface la saisie ; sur une ligne vide, il demande confirmation
+et un second Ctrl-C ferme le terminal. Pendant une commande, il l'abandonne et
+rend la main (une requête déjà partie peut aboutir sur la gateway). Ctrl-D ou `/quit`
 ferme le terminal. Une erreur de commande rend la main. L'historique n'est
 jamais écrit sur disque ; les commandes `campaign`, susceptibles de contenir
 une clé privée, en sont exclues. Aucune IA n'est intégrée.
