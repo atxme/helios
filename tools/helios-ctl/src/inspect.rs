@@ -615,131 +615,6 @@ pub fn render_health(ui: &Ui, view: &HealthView) -> String {
     out
 }
 
-/// One parsed nftables rule: verdict, match and the ruleset's own comment.
-struct Rule {
-    verdict: String,
-    matcher: String,
-    comment: String,
-}
-
-struct Chain {
-    name: String,
-    policy: String,
-    rules: Vec<Rule>,
-}
-
-const VERDICTS: &[&str] = &[
-    "accept",
-    "drop",
-    "reject",
-    "return",
-    "masquerade",
-    "snat",
-    "dnat",
-    "redirect",
-];
-
-/// Reads the ruleset text heliosd renders. Lines it does not recognise are
-/// kept as rules without a verdict rather than dropped.
-fn parse_ruleset(text: &str) -> Vec<Chain> {
-    let mut chains: Vec<Chain> = Vec::new();
-    for raw in text.lines() {
-        let line = clean(raw);
-        let line = line.trim();
-        if line.is_empty() || line == "}" || line.starts_with("table ") {
-            continue;
-        }
-        if let Some(name) = line.strip_prefix("chain ") {
-            chains.push(Chain {
-                name: name.trim_end_matches('{').trim().to_owned(),
-                policy: String::new(),
-                rules: Vec::new(),
-            });
-            continue;
-        }
-        let Some(chain) = chains.last_mut() else {
-            continue;
-        };
-        if line.starts_with("type ") {
-            if let Some(policy) = line.split("policy ").nth(1) {
-                chain.policy = policy.trim_end_matches(';').trim().to_owned();
-            }
-            continue;
-        }
-        let (rule, comment) = match line.split_once("  # ") {
-            Some((rule, comment)) => (rule.trim(), comment.trim()),
-            None => (line, ""),
-        };
-        let mut words: Vec<&str> = rule.split_whitespace().collect();
-        let verdict = match words.last() {
-            Some(last) if VERDICTS.contains(last) => words.pop().unwrap_or_default(),
-            _ => "",
-        };
-        words.retain(|word| *word != "counter");
-        chain.rules.push(Rule {
-            verdict: verdict.to_owned(),
-            matcher: words.join(" "),
-            comment: comment.to_owned(),
-        });
-    }
-    chains
-}
-
-pub fn render_firewall(ui: &Ui, view: &FirewallView) -> String {
-    let chains = parse_ruleset(&view.rules);
-    let counts: Vec<String> = chains
-        .iter()
-        .map(|chain| format!("{} {}", chain.name, chain.rules.len()))
-        .collect();
-    let mode = if view.dry_run { " · dry-run" } else { "" };
-    let mut out = ui.title(
-        "Firewall",
-        &format!(
-            "default {}{mode} · rules: {}",
-            clean(&view.default_verdict),
-            counts.join(", ")
-        ),
-    );
-    for (index, chain) in chains.iter().enumerate() {
-        if index > 0 {
-            out.push('\n');
-        }
-        out.push_str(&ui.section(
-            &chain.name,
-            &if chain.policy.is_empty() {
-                String::new()
-            } else {
-                format!("policy {}", chain.policy)
-            },
-        ));
-        // One rule per line, its reason underneath; consecutive rules that
-        // share a reason (one per uplink) show it once, after the last.
-        for (position, rule) in chain.rules.iter().enumerate() {
-            let tone = match rule.verdict.as_str() {
-                "accept" | "masquerade" | "snat" | "dnat" | "redirect" => Tone::Good,
-                "drop" | "reject" => Tone::Bad,
-                _ => Tone::Dim,
-            };
-            out.push_str(&format!(
-                "    {} {}\n",
-                ui.paint(&format!("{:<6}", rule.verdict), tone),
-                ui.fit(&rule.matcher, 11)
-            ));
-            let next = chain.rules.get(position + 1);
-            if !rule.comment.is_empty() && next.is_none_or(|next| next.comment != rule.comment) {
-                out.push_str(&format!(
-                    "           {}\n",
-                    ui.paint(&ui.fit(&rule.comment, 11), Tone::Dim)
-                ));
-            }
-        }
-    }
-    out.push('\n');
-    out.push_str(&ui.note("/firewall --raw prints the exact nftables ruleset."));
-    out.push('\n');
-    out
-}
-
 fn certificate_rank(peer: &PeerCertView) -> u8 {
     if peer.revoked {
         return 6;
@@ -1291,6 +1166,9 @@ pub fn render_doctor(ui: &Ui, checks: &[Check]) -> String {
     out.push_str(&format!("\n  {summary}\n\n"));
     out
 }
+
+mod firewall;
+pub use firewall::render_firewall;
 
 #[cfg(test)]
 mod tests;

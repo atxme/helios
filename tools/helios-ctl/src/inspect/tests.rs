@@ -226,32 +226,6 @@ const RULESET: &str = "table inet helios {
   }
 }";
 
-#[test]
-fn firewall_shows_one_line_per_rule_with_its_reason() {
-    let view = FirewallView {
-        rules: RULESET.into(),
-        default_verdict: "drop".into(),
-        dry_run: false,
-    };
-    let text = render_firewall(&ui(), &view);
-    assert!(
-        text.contains("Firewall  default drop · rules: input 5, output 1"),
-        "{text}"
-    );
-    assert!(text.contains("\n\n  input  policy drop\n"), "{text}");
-    assert!(!text.contains("\n\n\n"), "{text}");
-    assert!(text.contains("    drop   ct state invalid\n           invalid conntrack state: dropped before every opening\n"), "{text}");
-    assert!(text.contains("    accept tcp dport 8080 iifname \"helios0\"\n           administration API: only via the tunnel interface\n"), "{text}");
-    assert!(text.contains("    accept iifname \"lo\"\n    accept iifname \"enp3s0\" udp dport 51820\n    accept iifname \"wlo1\" udp dport 51820\n           WireGuard listener\n"), "{text}");
-    assert_eq!(text.matches("WireGuard listener").count(), 1, "{text}");
-    assert!(text.contains("/firewall --raw"), "{text}");
-    let narrow = render_firewall(&Ui::plain(Some(40)), &view);
-    assert!(
-        narrow.lines().all(|line| line.chars().count() < 40),
-        "{narrow}"
-    );
-}
-
 fn certificates() -> DomainView {
     let now = 1_791_400_000;
     let cert = |name: &str, key: &str, phase: ValidityPhase, days: i64| PeerCertView {
