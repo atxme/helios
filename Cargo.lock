@@ -2346,6 +2346,40 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
+name = "helios"
+version = "1.0.0"
+dependencies = [
+ "aether",
+ "aether-key-negotiation",
+ "anyhow",
+ "base64 0.22.1",
+ "clap",
+ "directories",
+ "futures-util",
+ "helios-escrow",
+ "helios-tpm",
+ "helios-update",
+ "hex",
+ "libc",
+ "orion-core",
+ "rcgen",
+ "reqwest 0.12.28",
+ "rustls",
+ "rustyline",
+ "serde",
+ "serde_json",
+ "shlex 2.0.1",
+ "tempfile",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+ "tokio-tungstenite",
+ "toml 0.8.2",
+ "x25519-dalek 2.0.1",
+ "zeroize",
+]
+
+[[package]]
 name = "helios-api"
 version = "0.5.0"
 dependencies = [
@@ -2387,40 +2421,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "windows-sys 0.59.0",
- "zeroize",
-]
-
-[[package]]
-name = "helios-ctl"
-version = "0.11.0"
-dependencies = [
- "aether",
- "aether-key-negotiation",
- "anyhow",
- "base64 0.22.1",
- "clap",
- "directories",
- "futures-util",
- "helios-escrow",
- "helios-tpm",
- "helios-update",
- "hex",
- "libc",
- "orion-core",
- "rcgen",
- "reqwest 0.12.28",
- "rustls",
- "rustyline",
- "serde",
- "serde_json",
- "shlex 2.0.1",
- "tempfile",
- "thiserror 2.0.18",
- "time",
- "tokio",
- "tokio-tungstenite",
- "toml 0.8.2",
- "x25519-dalek 2.0.1",
  "zeroize",
 ]
 

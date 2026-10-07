@@ -1196,7 +1196,7 @@ export function ProfilesView({
               ref={fileInput}
               type="file"
               // `.orion` d'abord : c'est l'extension que produit
-              // `helios-ctl enroll` et celle qu'Orion associe au double-clic.
+              // `helios enroll` et celle qu'Orion associe au double-clic.
               // Son absence ici la grisait dans le sélecteur, ce qui donnait à
               // penser que le format n'était pas supporté — alors que le
               // parseur l'accepte depuis toujours (il reconnaît le JSON à son
@@ -1747,7 +1747,7 @@ export function ProfilesView({
  * Key negotiation — the only place where the user chooses a level of
  * protection rather than an address.
  *
- * The block is normally **received**: `helios-ctl enroll` fills it, and
+ * The block is normally **received**: `helios enroll` fills it, and
  * nobody types a certificate by hand. But received is not immutable — a
  * negotiation endpoint moves, a gateway certificate gets reissued, a lab
  * differs from production — so every field is editable here, certificates
@@ -1804,7 +1804,7 @@ function KeyNegotiation({
   // explicit v5 mode — the transaction still runs and proves possession with
   // an HMAC commitment bound to the session before the gateway installs the
   // configured key (NEGOCIATION-DE-CLE-V5 §9.1) — so a document produced by
-  // `helios-ctl enroll` may legitimately carry it, and `classic` may come
+  // `helios enroll` may legitimately carry it, and `classic` may come
   // from a document older than the rule that refuses it. Displaying either
   // one as ML-KEM would be a lie about what the profile does, and hiding the
   // PSK that `static_psk` requires would leave a profile invalid with no

@@ -141,8 +141,8 @@ try {
         if ($null -eq $cargo) {
             throw "cargo was not found; install the Rust toolchain or provide -HeliosCtl."
         }
-        & $cargo.Source run --quiet -p helios-ctl -- @arguments
-        Assert-LastExitCode "helios-ctl build or application update"
+        & $cargo.Source run --quiet -p helios -- @arguments
+        Assert-LastExitCode "helios build or application update"
     } else {
         & $HeliosCtl @arguments
         Assert-LastExitCode "application update"

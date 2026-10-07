@@ -74,7 +74,7 @@ mod telemetry;
 use self::{commands::*, data_plane::*, observation::*, probes::*, reload::*, telemetry::*};
 
 /// Logs **and** broadcasts: the event channel feeds the UI and
-/// `helios-ctl watch`, `tracing` feeds the console and journald.
+/// `helios watch`, `tracing` feeds the console and journald.
 ///
 /// Writing only to the channel left a console operator blind to state
 /// changes: a peer could connect without a single line appearing in the

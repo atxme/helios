@@ -172,7 +172,7 @@ pub struct FirewallPolicy {
     /// to the LAN leaves as a **new** flow and the policy drops it.
     ///
     /// Two consequences that are worth naming, since neither announces
-    /// itself. `helios-ctl update` runs `apt-get update` **on the gateway**,
+    /// itself. `helios update` runs `apt-get update` **on the gateway**,
     /// so the product's own OS-upgrade path cannot work while its own
     /// kill-switch is applied. And without NTP the clock drifts, on the
     /// machine whose job is to check certificate validity dates.

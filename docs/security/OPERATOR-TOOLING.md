@@ -56,7 +56,7 @@ pair administrateur : c'est un chemin de rotation, pas de bootstrap.
 Sur le poste opérateur, **jamais sur la gateway** :
 
 ```sh
-helios-ctl escrow keygen --output-dir ~/helios-escrow
+helios escrow keygen --output-dir ~/helios-escrow
 ```
 
 Déclarer la clé publique affichée dans `escrow_public_key` de `network.toml`.
@@ -67,7 +67,7 @@ bootloader ou firmware — perd l'identité **définitivement**.
 Le jour où c'est arrivé : récupérer `/var/lib/helios/wg-key.escrow`, puis
 
 ```sh
-helios-ctl escrow open --escrow wg-key.escrow \
+helios escrow open --escrow wg-key.escrow \
   --private-key ~/helios-escrow/escrow-private.key \
   --output wg-key.recovery
 ```
@@ -92,11 +92,11 @@ PSK statiques sont intactes de l'autre côté : aucun client à ré-enrôler.
 
 ### En une commande, sur la gateway
 
-`helios-ctl` est livré dans le bundle, à côté de `heliosd`. Dans la session SSH
+`helios` est livré dans le bundle, à côté de `heliosd`. Dans la session SSH
 où l'on met à jour de toute façon :
 
 ```sh
-helios-ctl update
+helios update
 ```
 
 Elle rafraîchit les listes, annonce **quels paquets en attente déplacent quel
@@ -132,7 +132,7 @@ perdre : la mise à jour se fait, sans fenêtre ni redémarrage imposé.
 L'armement ne passe **pas** par l'API, et c'est délibéré (ADR-007) : l'API vit
 derrière le tunnel que la fenêtre existe précisément pour préserver, et une
 fenêtre déclenchable à distance est une exposition déclenchable à distance.
-`helios-ctl` lance donc `heliosd tpm` en sous-processus sous `sudo`.
+`helios` lance donc `heliosd tpm` en sous-processus sous `sudo`.
 
 ### À la main
 
@@ -187,9 +187,9 @@ sudo systemctl restart heliosd     # la config locale est relue au démarrage
 ## 4. Admission courante, dans le tunnel
 
 ```sh
-helios-ctl peer list
-helios-ctl peer add --name portable --public-key <clé publique du client>
-helios-ctl peer revoke --name portable
+helios peer list
+helios peer add --name portable --public-key <clé publique du client>
+helios peer revoke --name portable
 ```
 
 La VIP n'est pas un choix : elle est dérivée de la clé publique, donc identique
@@ -214,7 +214,7 @@ prochain handshake, il n'existe pas de liste de révocation.
 Créer l’autorité cliente sur le poste opérateur, jamais sur la gateway :
 
 ```sh
-helios-ctl key-nego init-client-ca \
+helios key-nego init-client-ca \
   --name helios-orion-clients --output-dir ~/.helios/certs/internal-ca
 ```
 
@@ -246,7 +246,7 @@ PQ JSON est épinglé dans le profil Orion. Émettre ensuite les deux certificat
 du client, liés à sa même clé publique WireGuard :
 
 ```sh
-helios-ctl key-nego issue-client \
+helios key-nego issue-client \
   --name portable \
   --wireguard-public-key <clé publique WireGuard> \
   --ca-certificate ./orion-client-ca/orion-client-ca.der \
@@ -254,7 +254,7 @@ helios-ctl key-nego issue-client \
   --ca-pq-private-key ./orion-client-ca/orion-client-pq-ca-private.bin \
   --output-dir ./portable-key-nego
 
-helios-ctl peer add --name portable \
+helios peer add --name portable \
   --public-key <clé publique WireGuard> \
   --key-negotiation-certificate-sha256 <empreinte TLS affichée> \
   --key-negotiation-pq-certificate-sha256 <empreinte PQ affichée> \
@@ -266,7 +266,7 @@ L'option explicite rend la politique visible dans les scripts. Une
 renégociation réseau vers `static_psk` ou `classic` sera ensuite refusée.
 
 Ces quatre commandes restent utiles pour inspecter la PKI ou réémettre un
-certificat seul ; pour admettre un client, `helios-ctl enroll` (section 6) les
+certificat seul ; pour admettre un client, `helios enroll` (section 6) les
 enchaîne et évite de recopier deux empreintes à la main.
 
 Les deux clés clientes produites en `0600` servent au transfert vers le stockage
@@ -276,7 +276,7 @@ plateforme, il refuse franchement plutôt que de les écrire en clair. Pour
 valider mTLS, ML-DSA et les messages sans modifier durablement un slot :
 
 ```sh
-helios-ctl key-nego probe \
+helios key-nego probe \
   --endpoint vpn.example.net:51821 \
   --server-name vpn.example.net \
   --gateway-certificate key-negotiation-cert.der \
@@ -299,7 +299,7 @@ Mode recommandé — le client détient déjà sa clé et communique sa moitié
 publique (visible dans Orion, écran *Profils*) :
 
 ```sh
-helios-ctl profile emit --name portable \
+helios profile emit --name portable \
   --endpoint vpn.example.net:51820 \
   --public-key <clé publique du client> \
   --output portable.json
@@ -312,7 +312,7 @@ l'importe et complète avec la clé privée du profil local de même nom.
 Mode assisté, quand l'utilisateur ne peut rien faire lui-même :
 
 ```sh
-helios-ctl profile emit --name portable \
+helios profile emit --name portable \
   --endpoint vpn.example.net:51820 \
   --with-private-key --output portable.json
 ```
@@ -333,7 +333,7 @@ ne se connecterait pas. Pour un client qui négocie avant WireGuard, une seule
 commande fait tout :
 
 ```sh
-helios-ctl enroll --name portable \
+helios enroll --name portable \
   --endpoint vpn.example.net:51820 \
   --client-ca-dir ./orion-client-ca \
   --output portable.orion

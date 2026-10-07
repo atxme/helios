@@ -10,7 +10,7 @@
 #   2. copie des CA PUBLIQUES             — vers la gateway
 #   3. `heliosd init-key-negotiation`     — SUR la gateway, scellé au TPM
 #   4. `network.toml` avec le port ouvert — chargé dans la gateway
-#   5. `helios-ctl enroll`                — profil Orion + identité cliente
+#   5. `helios enroll`                — profil Orion + identité cliente
 #
 # Les clés privées de la CA restent sur le poste opérateur ; celles de la
 # gateway naissent sur la gateway et ne sont jamais lues d'ici. Seul le fichier
@@ -210,7 +210,7 @@ elif adopter_ca; then
     :
 else
     echo "==> CA opérateur : création"
-    cargo run --quiet -p helios-ctl -- key-nego init-client-ca \
+    cargo run --quiet -p helios -- key-nego init-client-ca \
         --name "helios-orion-clients" --output-dir "$CA_DIR"
     CA_CREEE=1
 fi
@@ -489,7 +489,7 @@ FICHIER_CLE="$SORTIE/$NOM.wg-private"
 ARG_CLE_PRIVEE=""
 if [ -z "$PUBLIC_KEY" ]; then
     echo "==> Génération de la clé WireGuard du client"
-    PAIRE="$(cargo run --quiet -p helios-ctl -- campaign --generate-keys 2>/dev/null)"
+    PAIRE="$(cargo run --quiet -p helios -- campaign --generate-keys 2>/dev/null)"
     CLE_PRIVEE="$(printf '%s\n' "$PAIRE" | sed -n 's/^WG_PRIVATE_KEY=//p')"
     PUBLIC_KEY="$(printf '%s\n' "$PAIRE" | sed -n 's/^WG_PUBLIC_KEY=//p')"
     [ -n "$CLE_PRIVEE" ] && [ -n "$PUBLIC_KEY" ] || {
@@ -504,7 +504,7 @@ fi
 
 echo "==> Émission des certificats du client"
 rm -rf "$SORTIE/client-pki"
-cargo run --quiet -p helios-ctl -- key-nego issue-client \
+cargo run --quiet -p helios -- key-nego issue-client \
     --name "$NOM" \
     --wireguard-public-key "$PUBLIC_KEY" \
     --ca-certificate "$CA_DIR/orion-client-ca.der" \
@@ -626,7 +626,7 @@ fi
 PROFIL="$SORTIE/$NOM.orion"
 rm -f "$PROFIL"
 echo "==> Assemblage du profil « $NOM »"
-cargo run --quiet -p helios-ctl -- enroll \
+cargo run --quiet -p helios -- enroll \
     --name "$NOM" \
     --endpoint "$ENDPOINT" \
     --client-ca-dir "$CA_DIR" \

@@ -344,7 +344,7 @@ async fn admit_or_reuse(
             if existing.public_key.trim() != public_key {
                 bail!(
                     "a peer named \"{}\" is already admitted with a different public key. \
-                     Revoke it first (`helios-ctl peer revoke --name {}`) if the old key is \
+                     Revoke it first (`helios peer revoke --name {}`) if the old key is \
                      indeed lost: the client holding it will drop at its next handshake.",
                     existing.name,
                     existing.name

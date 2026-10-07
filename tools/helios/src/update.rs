@@ -1,10 +1,10 @@
-//! `helios-ctl update` — upgrade the gateway's OS without losing its identity.
+//! `helios update` — upgrade the gateway's OS without losing its identity.
 //!
 //! # What it does
 //!
 //! Refreshes the package lists, shows what the upgrade would touch, upgrades,
 //! then arms a TPM update window and reboots. That is the whole chain, in one
-//! command, run **on the gateway** — `helios-ctl` ships in the gateway bundle
+//! command, run **on the gateway** — `helios` ships in the gateway bundle
 //! next to `heliosd`, and an operator upgrading the OS is already in a session
 //! on that machine.
 //!

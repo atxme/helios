@@ -120,7 +120,7 @@ un **contrat à finir d'implémenter**, pas une description du système.
 >   masque. Conséquence : un PSK vit jusqu'à son échéance de 24 h, puis la
 >   gateway le retire ;
 > - l'**enrôlement sans clé privée et sa signature opérateur**
->   ([§15](#15-enrôlement)). `helios-ctl enroll` distribue encore l'identité
+>   ([§15](#15-enrôlement)). `helios enroll` distribue encore l'identité
 >   cliente comme en v4, avec le document `.orion` secret que cela implique ;
 > - tout le **cycle de vie des certificats**
 >   ([ROTATION-CERTIFICATS](ROTATION-CERTIFICATS.md)) : la leaf PQ gateway
@@ -1595,7 +1595,7 @@ La conséquence opérationnelle, elle, doit être outillée plutôt que subie :
 - le journal nomme séparément l'échec d'envoi du commit, de sorte que la
   séquence « plancher élevé, commit non livré » soit lisible d'un seul coup
   d'œil ;
-- `helios-ctl peer list` affiche le plancher courant de chaque pair, ce qui
+- `helios peer list` affiche le plancher courant de chaque pair, ce qui
   répond à la question « pourquoi ce client est-il refusé » sans avoir à lire
   `network.toml`.
 
@@ -1688,7 +1688,7 @@ les cas suivants, et seulement ceux-là :
 | --- | --- | --- |
 | `release` signé reçu dans WireGuard ([§7.5](#75-libération-signée-dans-le-tunnel)) | slot vidé | PSK zéroïsé |
 | remplacement atomique par une nouvelle négociation commitée | slot écrasé | PSK remplacé |
-| révocation d'admission (`helios-ctl peer remove`) | pair retiré | — |
+| révocation d'admission (`helios peer remove`) | pair retiré | — |
 | vieillissement du handshake ([§12.4](#124-récupération-dun-slot-sans-client)) | slot vidé après 300 s | — |
 | échéance de durée de vie ([§12.3](#123-politique-de-renouvellement)) | slot vidé | PSK zéroïsé |
 | redémarrage de `heliosd` ([§12.5](#125-redémarrage-de-la-gateway)) | tous les slots vidés | PSK conservé jusqu'à renégociation |
@@ -1928,7 +1928,7 @@ où la détection reste utile sans qu'une perte de réseau ordinaire soit trait�
 comme une disparition.
 
 Le remède opérationnel d'un poste perdu n'est ni la fenêtre ni l'échéance :
-c'est `helios-ctl peer remove`, qui coupe au handshake suivant.
+c'est `helios peer remove`, qui coupe au handshake suivant.
 
 ### 12.5 Redémarrage de la gateway
 
@@ -2208,7 +2208,7 @@ avoir été admis par une gateway Helios.
 **Aucune clé privée ne voyage, et une preuve de possession n'est pas une
 autorisation.** Ce sont les deux règles de cette section.
 
-En v4, `helios-ctl enroll` émettait la clé privée WireGuard, la clé privée TLS
+En v4, `helios enroll` émettait la clé privée WireGuard, la clé privée TLS
 et la clé privée ML-DSA du client, les plaçait dans le document `.orion` et
 comptait sur DPAPI pour les sceller à l'import et sur l'opérateur pour détruire
 le fichier. Le secret existait donc en clair, hors du poste destinataire, sur au
@@ -2236,7 +2236,7 @@ flowchart TD
     A --> B --> C --> D --> E --> F --> G --> H --> I
 ```
 
-`helios-ctl enroll invite` produit un `EnrollmentInvitation` public :
+`helios enroll invite` produit un `EnrollmentInvitation` public :
 
 | Champ | Contrainte |
 | --- | --- |
@@ -2520,7 +2520,7 @@ et non simplement improbable.
 - Il ne renouvelle pas un PSK sans interrompre brièvement le trafic
   ([§12.3](#123-politique-de-renouvellement)).
 - Il ne révoque pas par CRL ni OCSP ; retirer un accès se fait par
-  `helios-ctl peer remove`.
+  `helios peer remove`.
 - Il ne protège pas un poste compromis sous le compte de l'utilisateur.
 - Il ne tunnelle pas le DNS du client.
 - Il ne rend pas tous les chemins de rejet strictement constants en temps ; il
@@ -2608,7 +2608,7 @@ déploiements qui possèdent déjà ce secret hors bande, mais aucune admission
 automatique ne le choisit.
 
 L'audit du parc Helios est un **prérequis de bascule**, pas une échéance future :
-`helios-ctl peer list` doit montrer les invitations consommées, les empreintes
+`helios peer list` doit montrer les invitations consommées, les empreintes
 v2 et un plancher compatible pour tous les pairs avant le redémarrage v5.
 
 ## 20. Plan de validation
@@ -2718,7 +2718,7 @@ déclarer la v5 implémentée.
   renégociation converge ; un test vérifie aussi que le journal gateway nomme
   côte à côte l'élévation du plancher et l'échec d'envoi du commit ;
 - **plancher monté puis mode client abaissé** : la connexion suivante est
-  refusée par `rejected`, et `helios-ctl peer list` expose le plancher qui
+  refusée par `rejected`, et `helios peer list` expose le plancher qui
   l'explique ;
 - **redémarrage de `heliosd` au milieu d'une négociation**, et séparément
   **après le commit** : dans le second cas, tous les slots négociés doivent être
@@ -2923,7 +2923,7 @@ courant détaillé en tête de note.
 | [`aether::config`](../../crates/aether/src/config.rs) | ports, pairs, secrets runtime, planchers, longueur des PSK statiques, **keep-alive de `WgPeer`** |
 | [`helios-wireguard`](../../crates/helios-wireguard/src/lib.rs) | **keep-alive de `PeerConfig`**, séquence monotone d'observation du handshake, `HANDSHAKE_STALE_AFTER_SECS` et récupération à 300 s |
 | [`helios-provisioning::admission`](../../crates/helios-provisioning/src/admission.rs) | unicité des empreintes TLS/PQ, refus d'un pair négocié sans keep-alive, plancher `ml_kem` par défaut |
-| [`helios-ctl::enroll`](../../tools/helios-ctl/src/enroll.rs) | invitation et registre à usage unique, preuve WireGuard, émission, liaison et signature JCS du document |
+| [`helios::enroll`](../../tools/helios/src/enroll.rs) | invitation et registre à usage unique, preuve WireGuard, émission, liaison et signature JCS du document |
 
 `AGENTS.md` décrit l'implémentation v5 effectivement servie et nomme les écarts
 encore ouverts.

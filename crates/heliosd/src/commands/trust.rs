@@ -300,7 +300,7 @@ pub(crate) fn show_trust_enrolment(public_key: &str) -> anyhow::Result<()> {
     let peer = registry.peer(&key).ok_or_else(|| {
         anyhow::anyhow!(
             "no such peer in the certificate registry — admit it first, with `heliosd peer add` \
-             or `helios-ctl peer add`"
+             or `helios peer add`"
         )
     })?;
     let view = certificates::enrolment_view(registry.state(), peer);

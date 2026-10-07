@@ -543,7 +543,7 @@ async fn register_first_generation(
     ) else {
         return Err((
             StatusCode::BAD_REQUEST,
-            "this gateway holds a trust domain, so admission also takes the client's two              certificates — the registry records the leaves themselves, not their digests.              `helios-ctl enroll` sends them; a caller that cannot must admit on a gateway              without a trust domain."
+            "this gateway holds a trust domain, so admission also takes the client's two              certificates — the registry records the leaves themselves, not their digests.              `helios enroll` sends them; a caller that cannot must admit on a gateway              without a trust domain."
                 .to_string(),
         ));
     };

@@ -173,7 +173,7 @@ if [ ! -f "$ESCROW_DIR/escrow-private.key" ] ||
     [ ! -e "$ESCROW_DIR" ] ||
         { echo "incomplete escrow directory: $ESCROW_DIR" >&2; exit 1; }
     echo "==> Generating target-specific escrow identity"
-    cargo run --quiet -p helios-ctl -- escrow keygen --output-dir "$ESCROW_DIR" >/dev/null
+    cargo run --quiet -p helios -- escrow keygen --output-dir "$ESCROW_DIR" >/dev/null
 fi
 ESCROW_PUBLIC_KEY="$(tr -d '\r\n' < "$ESCROW_DIR/escrow-public.key")"
 case "$ESCROW_PUBLIC_KEY" in

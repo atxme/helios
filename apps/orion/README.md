@@ -95,7 +95,7 @@ n'utilise.
 transaction QUIC a bien lieu et le client prouve la possession de la clé par un
 engagement HMAC lié à la session avant que la gateway n'installe le PSK déjà
 configuré ([NEGOCIATION-DE-CLE-V5](../../docs/specification/NEGOCIATION-DE-CLE-V5.md)
-§9.1). Un document produit par `helios-ctl enroll` peut donc légitimement le
+§9.1). Un document produit par `helios enroll` peut donc légitimement le
 porter. Orion ne le compose plus mais l'affiche tel quel — la clé qu'il exige
 comprise — avec un bouton **Passer en ML-KEM** : le réétiqueter serait mentir
 sur ce que le profil fait, et masquer son PSK laisserait un profil invalide

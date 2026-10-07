@@ -52,12 +52,13 @@ ferme le terminal. Une erreur de commande rend la main. L'historique n'est
 jamais écrit sur disque ; les commandes `campaign`, susceptibles de contenir
 une clé privée, en sont exclues. Aucune IA n'est intégrée.
 
-Le package Cargo et son répertoire restent `helios-ctl` :
-`scripts/wsl-cargo run -p helios-ctl -- status` fonctionne toujours. Les nouveaux
-bundles installent `/usr/local/bin/helios`. Les anciens bundles signés contenant
-`helios-ctl` restent acceptés ; aucune migration de la CA opérateur ni des profils
-n'est effectuée. Les scripts qui invoquent directement l'ancien exécutable
-doivent utiliser `helios` après la nouvelle livraison.
+L'outil s'appelle `helios` partout : package Cargo, répertoire `tools/helios`,
+exécutable `/usr/local/bin/helios` (`scripts/wsl-cargo run -p helios -- status`).
+L'ancien nom `helios-ctl` est retiré : un bundle qui le contiendrait encore est
+refusé, et l'installation d'un bundle portant `helios` supprime
+`/usr/local/bin/helios-ctl` s'il existe. Seul le répertoire de données de la CA
+cliente opérateur garde l'ancien nom (`~/.local/share/helios-ctl` sous Linux) :
+le renommer rendrait introuvable une CA déjà épinglée par la gateway.
 
 Commandes d'inspection, en lecture seule, servies par l'API (aucun secret) :
 

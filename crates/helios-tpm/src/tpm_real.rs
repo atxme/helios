@@ -662,7 +662,7 @@ fn open_nv_index(ctx: &mut Context, index: u32) -> Result<Option<NvIndexHandle>>
 /// `TPM_RC_HANDLE` (`0x18b`). Both answer the same question, but the failing
 /// one makes the TSS stack print three `WARNING`/`ERROR` lines on stderr, plus
 /// one from `tss_esapi`, for the ordinary state of a gateway with no update
-/// window armed. An operator running `helios-ctl update` read those as the
+/// window armed. An operator running `helios update` read those as the
 /// diagnosis of a TPM problem; the diagnosis was that nothing was wrong.
 ///
 /// Cost: one extra TPM command on a path that only runs on operator commands

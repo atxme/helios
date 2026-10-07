@@ -7,12 +7,12 @@
 # Sur la cible, ne pas utiliser ce script : la gateway y tourne déjà et son
 # `network.toml` est celui de production. Jouer plutôt, depuis le client :
 #
-#   helios-ctl --url http://100.64.0.1:8080 campaign \
+#   helios --url http://100.64.0.1:8080 campaign \
 #     --client-key <privée du client> --gateway-key <publique gateway>
 #
 # puis, depuis la gateway, la catégorie plan de données :
 #
-#   helios-ctl campaign --only plan-de-donnees --wg-iface helios0 \
+#   helios campaign --only plan-de-donnees --wg-iface helios0 \
 #     --client-key <privée du client> --gateway-key <publique gateway>
 #
 # Voir docs/testing/TESTING.md.
@@ -49,7 +49,7 @@ echo "==> Construction"
 cargo run --quiet -p helios-publisher -- keygen \
     --key-epoch 4294967294 --output-dir "$TMP/publisher"
 export HELIOS_PUBLISHER_KEYRING_PATH="$TMP/publisher/publisher-keyring.json"
-cargo build --quiet -p heliosd -p helios-ctl -p helios-publisher -p helios-installer
+cargo build --quiet -p heliosd -p helios -p helios-publisher -p helios-installer
 
 # Artefacts de campagne : des copies **strippées** des binaires de debug.
 #
@@ -76,8 +76,8 @@ done
 # disparaissent avec le répertoire temporaire. `--generate-keys` n'écrit que des
 # lignes CLÉ=valeur sur stdout ; l'aide part sur stderr, d'où le 2>/dev/null.
 echo "==> Clés de campagne"
-cargo run --quiet -p helios-ctl -- campaign --generate-keys 2>/dev/null > "$TMP/client.env"
-cargo run --quiet -p helios-ctl -- campaign --generate-keys 2>/dev/null > "$TMP/gateway.env"
+cargo run --quiet -p helios -- campaign --generate-keys 2>/dev/null > "$TMP/client.env"
+cargo run --quiet -p helios -- campaign --generate-keys 2>/dev/null > "$TMP/gateway.env"
 CLIENT_PRIV="$(sed -n 's/^WG_PRIVATE_KEY=//p' "$TMP/client.env")"
 CLIENT_PUB="$(sed -n 's/^WG_PUBLIC_KEY=//p' "$TMP/client.env")"
 GW_PRIV="$(sed -n 's/^WG_PRIVATE_KEY=//p' "$TMP/gateway.env")"
@@ -124,7 +124,7 @@ echo "==> Campagne"
 # `--only` absent : les scénarios de plan de données se signalent d'eux-mêmes
 # comme hors de portée, sans --wg-iface. C'est voulu — la sortie rappelle à
 # chaque exécution ce que le dry-run ne prouve pas.
-cargo run --quiet -p helios-ctl -- campaign \
+cargo run --quiet -p helios -- campaign \
     --client-key "$CLIENT_PRIV" \
     --gateway-key "$GW_PUB" \
     "$@"

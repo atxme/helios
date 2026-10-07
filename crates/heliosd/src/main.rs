@@ -376,7 +376,7 @@ enum Command {
     ///
     /// Used to bootstrap the first administrator peer — without it, no
     /// remote mutation is authorized (ADR-003 §3) — and for troubleshooting.
-    /// The nominal path afterwards is `helios-ctl peer`, through the tunnel.
+    /// The nominal path afterwards is `helios peer`, through the tunnel.
     Peer {
         #[command(subcommand)]
         command: PeerCommand,
@@ -505,7 +505,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Logs go to **stderr**, never stdout: several subcommands answer on stdout
     // and are read by a machine — `tpm update-status` returns `armed`/`none` to
-    // `helios-ctl update`, `peer add` returns the assigned VIP. A log line
+    // `helios update`, `peer add` returns the assigned VIP. A log line
     // interleaved there is not noise, it is a wrong answer. systemd captures
     // both streams, so the journal is unchanged.
     //

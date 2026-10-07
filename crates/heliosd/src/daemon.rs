@@ -303,7 +303,7 @@ pub(crate) async fn run(
         // A second instance here would give one slot two writers.
         state = state.with_psk_release(handler);
     }
-    // Published for the operator tooling: `helios-ctl` builds a complete
+    // Published for the operator tooling: `helios` builds a complete
     // Orion profile from the gateway rather than making the operator copy
     // certificates out of /var/lib/helios by hand.
     if let Some(material) = key_negotiation::public_material()? {

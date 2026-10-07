@@ -55,6 +55,9 @@ pub fn default_client_ca_dir() -> PathBuf {
     if let Some(directory) = std::env::var_os(CLIENT_CA_DIR_ENV).filter(|value| !value.is_empty()) {
         return PathBuf::from(directory);
     }
+    // The tool's former name, kept on purpose: this directory holds the
+    // operator client CA the gateway already pins. Renaming it would make the
+    // tool mint a new CA and break every admitted client.
     directories::ProjectDirs::from("net", "helios", "helios-ctl")
         .map(|dirs| dirs.data_dir().join("orion-client-ca"))
         // Dernier recours seulement : sans répertoire de données, mieux vaut un
@@ -723,7 +726,7 @@ mod tests {
         let _owned = CLIENT_CA_ENV
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let elsewhere = std::env::temp_dir().join("helios-ctl-ca-ailleurs");
+        let elsewhere = std::env::temp_dir().join("helios-ca-ailleurs");
         std::env::set_var(CLIENT_CA_DIR_ENV, &elsewhere);
         assert_eq!(default_client_ca_dir(), elsewhere);
 
@@ -738,7 +741,7 @@ mod tests {
 
     fn test_directory(name: &str) -> PathBuf {
         let directory = std::env::temp_dir().join(format!(
-            "helios-ctl-key-nego-{name}-{}-{:?}",
+            "helios-key-nego-{name}-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));

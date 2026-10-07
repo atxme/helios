@@ -163,7 +163,7 @@ mod tests {
         if unsafe { libc::getuid() } == 0 {
             return;
         }
-        let dir = std::env::temp_dir().join(format!("helios-ctl-sock-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("helios-sock-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("admin.sock");
         let _listener = tokio::net::UnixListener::bind(&path).unwrap();

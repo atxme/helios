@@ -511,7 +511,7 @@ opératoires produisent exactement le même document `orion-profile` :
 
 ```mermaid
 flowchart TD
-    Start["helios-ctl enroll"]
+    Start["helios enroll"]
     Online{"API d'administration<br/>déjà joignable par l'opérateur ?"}
     Api["GET /api/network<br/>GET /api/key-negotiation"]
     Offline["Matériel public copié par SSH<br/>identité client déjà émise<br/>heliosd peer add local"]
@@ -533,7 +533,7 @@ flowchart TD
 ```
 
 **Chemin courant par API.** L'opérateur possède déjà un accès administrateur à
-`helios0`. `helios-ctl enroll` lit la clé publique WireGuard et l'adresse
+`helios0`. `helios enroll` lit la clé publique WireGuard et l'adresse
 interne par `GET /api/network`, puis le port, le nom serveur et les deux
 certificats publics par `GET /api/key-negotiation`. Il vérifie que le certificat
 PQ gateway épingle bien la clé WireGuard actuellement servie, émet les deux
@@ -797,7 +797,7 @@ Ce que l'on perd reste réel et écrit en toutes lettres dans la spécification
 (§12.4) : la détection passe de 35 secondes à cinq minutes, et disparaît
 entièrement pour un pair sans keep-alive. Le slot reste inutilisable sans la clé
 privée WireGuard du pair, et le remède d'un poste perdu n'a jamais été
-l'échéance du PSK — c'est `helios-ctl peer remove`.
+l'échéance du PSK — c'est `helios peer remove`.
 
 Conséquence de dimensionnement : la limite de 128 connexions simultanées cesse
 d'être un plafond de tunnels et redevient ce qu'elle prétendait être, un plafond

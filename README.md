@@ -52,7 +52,7 @@ heliosd : orchestrateur · API Axum/WS · IPAM ML-KEM · pare-feu nftables
 | `heliosd` | CLI et orchestration de la gateway |
 | `orion-core` / `apps/orion` | Cœur portable et shell Tauri du client |
 | `web` | Console d'administration React (MUI seul, polices auto-hébergées) |
-| `helios` (package `helios-ctl`) | Terminal du poste opérateur — et `update` sur la gateway |
+| `helios` | Terminal d'administration, sur le poste opérateur ou sur la gateway |
 | `helios-publisher` | Outil éditeur hors gateway (Ed25519 + ML-DSA-65) |
 | `helios-installer` | Helper privilégié sans réseau : activation et rollback |
 | `xtask` | Bundles d'installation et installateur Windows d'Orion |

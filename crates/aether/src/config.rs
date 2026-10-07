@@ -154,7 +154,7 @@ pub struct NetworkConfig {
     ///
     /// Closed by default. See [`crate::FirewallPolicy::allow_gateway_egress`]
     /// for what a gateway without it cannot do — starting with the OS upgrade
-    /// `helios-ctl update` is supposed to run on that very machine.
+    /// `helios update` is supposed to run on that very machine.
     #[serde(default)]
     pub allow_gateway_egress: bool,
     /// Accepts SSH arriving **through the tunnel**, on the tunnel interface.

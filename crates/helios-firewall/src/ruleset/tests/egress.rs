@@ -101,7 +101,7 @@ fn gateway_egress_opens_resolution_time_and_packages_on_the_wan() {
 /// The moment an operator needs this opening is an upgrade, and that is
 /// exactly a moment when the tunnel may be down. A flag that followed the
 /// tunnel state would be closed precisely when it is needed —
-/// `helios-ctl update` runs `apt-get` on the gateway itself.
+/// `helios update` runs `apt-get` on the gateway itself.
 #[test]
 fn gateway_egress_does_not_follow_the_tunnel_state() {
     let mut p = policy();

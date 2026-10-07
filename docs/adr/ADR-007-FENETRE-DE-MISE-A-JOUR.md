@@ -139,7 +139,7 @@ récupération opérateur distincte ; il ne retire aucun PCR de la politique NV.
 
 ### Maintenance firmware planifiée (amendement du 1er octobre 2026)
 
-Le terminal général `helios` réutilise les commandes du package `helios-ctl`.
+Le terminal général `helios` expose les mêmes commandes que son mode scripté.
 Sa commande firmware suit un journal opérateur : préparation, installation
 ciblée, redémarrage, restauration et vérification. L'API ne transporte aucun
 secret ; SSH reste nécessaire indépendamment du tunnel de la gateway.

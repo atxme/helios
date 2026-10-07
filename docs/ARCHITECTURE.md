@@ -156,7 +156,7 @@ It never brings the initial tunnel up.
 - `GET /api/trust` exposes the required algorithms and the compiled publisher
   keyring fingerprints, never whole keys;
 - `GET /api/key-negotiation` serves the public negotiation material that
-  `helios-ctl enroll` reads;
+  `helios enroll` reads;
 - every mutation requires `application/json`, and no permissive CORS is enabled;
 - the source address resolves to a WireGuard peer's single `/32` VIP, with no
   proxy header accepted, and mutations require `admin = true`;
@@ -169,7 +169,7 @@ the WireGuard peer's; no separate web login exists.
 
 Admission binds, out of band, a client's WireGuard public key and the
 fingerprints of its TLS and ML-DSA-87 certificates. `heliosd peer` and
-`helios-ctl peer` share one implementation in
+`helios peer` share one implementation in
 `helios_provisioning::admission`. Admission never does a read-modify-write of
 `network.toml` from the API's redacted view — that would erase other peers'
 PSKs — and it persists neither private key nor PSK. It also refuses an explicit
@@ -216,7 +216,7 @@ lot 3.
 
 ## Application update
 
-The UI or `helios-ctl app-update` transfers a `helios-binary-release-v1`
+The UI or `helios app-update` transfers a `helios-binary-release-v1`
 manifest and the binary in JSON chunks. `heliosd` verifies the Ed25519 and
 ML-DSA-65 signatures, the target, the channel, the size and the SHA-256, then
 stages under `/var/lib/helios/updates`.
@@ -226,7 +226,7 @@ the previous link if the daemon and its API do not become ready.
 
 This flow replaces neither kernel nor rootfs, does not reboot the machine, and
 therefore does not move TPM PCR 0/4/7. Upgrading the OS is a different path:
-`helios-ctl update`, which arms the ADR-007 window and reboots.
+`helios update`, which arms the ADR-007 window and reboots.
 
 Two ML-DSA parameter sets coexist and do not substitute for one another:
 `ml-dsa-65` signs publisher artefacts (`aether::sig`), `ml-dsa-87` carries the

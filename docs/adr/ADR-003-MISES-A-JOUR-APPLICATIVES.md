@@ -97,7 +97,7 @@ des signatures valides.
 
 ### 5. Réception par l’API
 
-Le navigateur ou `helios-ctl app-update` envoie le manifeste puis le binaire
+Le navigateur ou `helios app-update` envoie le manifeste puis le binaire
 par fragments base64 JSON. Cette forme conserve l'invariant selon lequel toute
 mutation de l'API est du JSON, borne la mémoire du daemon et n'ajoute ni
 `multipart`, ni URL distante, ni règle de sortie au kill-switch.

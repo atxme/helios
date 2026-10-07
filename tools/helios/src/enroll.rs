@@ -216,7 +216,7 @@ pub async fn run(client: &Client, base: &str, options: EnrollOptions) -> Result<
             let negotiation = api::key_negotiation(client, base).await?.context(
                 "this gateway serves no key-negotiation material — build heliosd with the \
                  `key-negotiation` feature and run `heliosd init-key-negotiation`, or fall back \
-                 to `helios-ctl profile emit` for a profile without pre-WireGuard negotiation",
+                 to `helios profile emit` for a profile without pre-WireGuard negotiation",
             )?;
 
             // The gateway certificate is pinned to a WireGuard key. If that is
@@ -268,7 +268,7 @@ pub async fn run(client: &Client, base: &str, options: EnrollOptions) -> Result<
         .with_context(|| {
             format!(
                 "issuing the client certificates from {} — was the CA created with \
-                 `helios-ctl key-nego init-client-ca`?",
+                 `helios key-nego init-client-ca`?",
                 options.client_ca_dir.display()
             )
         })?,
@@ -557,7 +557,7 @@ pub fn check_client_ca(directory: &Path) -> Result<()> {
                  CA cliente à `heliosd init-key-negotiation`, et une CA différente rend \
                  illisible tout certificat déjà émis — tous les clients admis cessent de \
                  négocier.\n  \
-                 helios-ctl key-nego init-client-ca --name <nom>",
+                 helios key-nego init-client-ca --name <nom>",
                 directory.display(),
                 path.display(),
                 CA_CERTIFICATE_FILE,

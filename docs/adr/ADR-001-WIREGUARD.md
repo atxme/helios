@@ -575,7 +575,7 @@ transporter l'identité une fois : `orion-profile` gagne un champ
 jamais `ClientProfile`, donc jamais `profiles.toml`. Un document qui le porte est
 un secret au même titre qu'un profil émis avec clé privée.
 
-Côté outillage, `helios-ctl enroll` fait l'enrôlement d'un trait : il lit sur la
+Côté outillage, `helios enroll` fait l'enrôlement d'un trait : il lit sur la
 gateway sa clé publique, ses certificats de négociation et leur port
 (`GET /api/key-negotiation`, matériel public), émet les certificats clients,
 admet le pair avec les deux empreintes et le plancher, et écrit ce document
@@ -589,7 +589,7 @@ conséquence au quotidien et absurde au premier enrôlement — la négociation 
 protège le premier handshake dépendrait d'un premier handshake. Le protocole,
 lui, n'a jamais eu cette dépendance : Orion compose le port public avant de
 monter quoi que ce soit. C'est donc l'outillage qui a été corrigé.
-`helios-ctl enroll` accepte les matériaux en fichiers
+`helios enroll` accepte les matériaux en fichiers
 (`--gateway-certificate`, `--gateway-pq-certificate`, `--address`) : l'opérateur
 tient déjà une session SSH, qui suffit à lire deux certificats publics et à
 admettre le pair par `heliosd peer add` — la commande console prévue pour

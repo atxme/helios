@@ -2,10 +2,10 @@
 //!
 //! ```sh
 //! cargo run -p heliosd -- run --dev          # daemon in dev mode
-//! cargo run -p helios-ctl -- status
-//! cargo run -p helios-ctl -- watch
-//! cargo run -p helios-ctl -- network show
-//! cargo run -p helios-ctl -- network load config/network.toml
+//! cargo run -p helios -- status
+//! cargo run -p helios -- watch
+//! cargo run -p helios -- network show
+//! cargo run -p helios -- network load config/network.toml
 //! ```
 
 use std::{
@@ -51,15 +51,15 @@ EXAMPLES:
   helios                                      # interactive terminal
   helios update --check                       # passive local plan
   helios firmware list                        # local firmware inventory
-  cargo run -p helios-ctl -- status
-  cargo run -p helios-ctl -- watch
-  cargo run -p helios-ctl -- network show
-  cargo run -p helios-ctl -- network load config/network.toml
-  cargo run -p helios-ctl -- --url http://100.64.0.1:8080 app-update \
+  cargo run -p helios -- status
+  cargo run -p helios -- watch
+  cargo run -p helios -- network show
+  cargo run -p helios -- network load config/network.toml
+  cargo run -p helios -- --url http://100.64.0.1:8080 app-update \
     --manifest heliosd.release.json --binary heliosd
-  cargo run -p helios-ctl -- scenario nominal
-  cargo run -p helios-ctl -- update                 # on the gateway
-  cargo run -p helios-ctl -- --url http://192.168.1.1:8080 status"
+  cargo run -p helios -- scenario nominal
+  cargo run -p helios -- update                 # on the gateway
+  cargo run -p helios -- --url http://192.168.1.1:8080 status"
 )]
 struct Cli {
     /// Gateway API over TCP. Without it, the gateway's local administration

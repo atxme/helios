@@ -602,9 +602,9 @@ def _build_release(ctx: Contexte):
     return Etat.OK, "target/release/heliosd"
 
 
-@scenario("build helios-ctl", "build")
+@scenario("build helios", "build")
 def _build_ctl(ctx: Contexte):
-    s = _cargo_release(ctx, "cargo build --release -p helios-ctl", timeout=1800)
+    s = _cargo_release(ctx, "cargo build --release -p helios", timeout=1800)
     return (Etat.OK, "") if s.ok else (Etat.ECHEC, s.stderr.strip()[-1000:])
 
 
@@ -826,7 +826,7 @@ def _mise_a_jour_api(ctx: Contexte):
     if not build_daemon.ok:
         return Etat.ECHEC, build_daemon.stderr.strip()[-1200:]
     if not ctx.cible.executer("test -x target/release/helios").ok:
-        build_ctl = _cargo_release(ctx, "cargo build --release -p helios-ctl", timeout=1800)
+        build_ctl = _cargo_release(ctx, "cargo build --release -p helios", timeout=1800)
         if not build_ctl.ok:
             return Etat.ECHEC, build_ctl.stderr.strip()[-1000:]
     _assurer_cles(ctx)
@@ -905,7 +905,7 @@ def _campagne_daemon_reel(ctx: Contexte):
     iface_wan = ctx.faits.get("iface_wan", "lo")
     ctx.cible.deposer(_config_reseau(ctx, iface_wan), f"{ctx.tmp}/network-reel.toml")
     # Chemins littéraux : ils doivent correspondre au mot pour mot à la règle
-    # sudoers, qui n'accepte aucun joker (sudo-rs). `helios-ctl` en a besoin
+    # sudoers, qui n'accepte aucun joker (sudo-rs). `helios` en a besoin
     # autant que le daemon : c'est lui qui lit le plan de données via
     # `wg show`, refusé sans CAP_NET_ADMIN.
     for nom in ("heliosd", "helios"):
@@ -989,7 +989,7 @@ def _campagne_psk_plan_de_donnees(ctx: Contexte):
     Le déclarer « hors portée » plutôt que de le faire échouer est délibéré :
     l'échec laisserait croire à une régression du PSK, alors que rien n'a été
     éprouvé. Ce qui débloquerait : un second hôte joignable, monté en client
-    WireGuard, d'où jouer `helios-ctl --url http://100.64.0.1:8080 campaign`
+    WireGuard, d'où jouer `helios --url http://100.64.0.1:8080 campaign`
     avant d'inspecter le slot depuis la gateway.
     """
     return Etat.HORS_PORTEE, (
@@ -1119,17 +1119,17 @@ def _tunnel_bout_en_bout(ctx: Contexte):
     # Adresse routable, jamais l'alias SSH : `wg set` ne résout pas ~/.ssh/config.
     hote = ctx.cible.adresse_ip()
 
-    # Client : helios-ctl local, il joue le vrai code d'Orion.
+    # Client : helios local, il joue le vrai code d'Orion.
     keyring = _keyring_local()
     if keyring is None:
         return Etat.ECHEC, "génération du trousseau éditeur local impossible"
     build = _local(
         f"HELIOS_PUBLISHER_KEYRING_PATH={shlex.quote(keyring)} "
-        "cargo build --release -p helios-ctl",
+        "cargo build --release -p helios",
         timeout=1800,
     )
     if not build.ok:
-        return Etat.ECHEC, f"build local de helios-ctl : {build.stderr.strip()[-800:]}"
+        return Etat.ECHEC, f"build local de helios : {build.stderr.strip()[-800:]}"
 
     ctx.cible.deposer(_config_reseau(ctx, iface_wan), f"{ctx.tmp}/network-tunnel.toml")
     binaire = f"{ctx.cible.repo}/target/release/heliosd"
@@ -1202,13 +1202,13 @@ def _tunnel_bout_en_bout(ctx: Contexte):
             ), details
 
         # Le slot client, lui, n'est pas établissable par cette campagne.
-        # `helios-ctl` emprunte le protocole d'Orion (`orion_core::provision`),
+        # `helios` emprunte le protocole d'Orion (`orion_core::provision`),
         # pas son adaptateur : seul ce dernier écrit le PSK dans l'interface
         # cliente (`orion-core/src/backend/mod.rs`). Le client monté ici l'est
         # par `wg set`, et rien ne l'y renseigne.
         #
         # Ce qui débloquerait la vérification : un mode headless d'Orion, ou une
-        # sous-commande `helios-ctl` qui applique le profil reçu au lieu de se
+        # sous-commande `helios` qui applique le profil reçu au lieu de se
         # limiter à l'inspecter.
         psk_cli = _psk_du_dump(_local(f"sudo -n wg show {IFACE_CLIENT} dump").stdout)
         if psk_cli:
@@ -1217,7 +1217,7 @@ def _tunnel_bout_en_bout(ctx: Contexte):
         details.append("— slot client non renseigné : exige l'adaptateur Orion")
         return Etat.OK, (
             "tunnel réel et PSK posé côté gateway ; le slot client exige "
-            "l'adaptateur d'Orion, hors de portée de helios-ctl"
+            "l'adaptateur d'Orion, hors de portée de helios"
         ), details
     finally:
         _demonter_client()
@@ -1495,7 +1495,7 @@ def _sans_ansi(texte: str) -> str:
 
 
 def _resume_campagne(sortie: str) -> str:
-    """Extrait la ligne de synthèse de helios-ctl, sans les codes ANSI."""
+    """Extrait la ligne de synthèse de helios, sans les codes ANSI."""
     for ligne in reversed(sortie.strip().splitlines()):
         nettoyee = _sans_ansi(ligne).strip()
         if "scénario" in nettoyee:
@@ -1504,7 +1504,7 @@ def _resume_campagne(sortie: str) -> str:
 
 
 def _details_campagne(sortie: str) -> list[str]:
-    """Remonte chaque sous-scénario joué par helios-ctl.
+    """Remonte chaque sous-scénario joué par helios.
 
     Sans cela, six vérifications distinctes disparaissent derrière un unique
     « campagne réussie » : on sait que rien n'a cassé, pas ce qui a été
@@ -1665,7 +1665,7 @@ def _regle_sudoers(utilisateur: str, repo: str) -> str:
         "/usr/sbin/ip",
         "/usr/bin/wg",
     ]
-    # `helios-ctl` interroge le plan de données via `wg show` : sans
+    # `helios` interroge le plan de données via `wg show` : sans
     # CAP_NET_ADMIN il obtient « Operation not permitted » et le scénario
     # plan-de-donnees échoue sans rien prouver.
     for binaire in binaires:

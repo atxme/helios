@@ -202,7 +202,7 @@ Valider avec accès console :
   supprimé ou renommé. `IconMenuItem` n'est exercé que là : le module est
   type-vérifié sous Linux en forçant la feature `tray-icon`, ce qui ne dit rien
   du rendu Windows ;
-- identité cliente sous Windows : un document produit par `helios-ctl enroll`
+- identité cliente sous Windows : un document produit par `helios enroll`
   est importé, l'écran *Profils* annonce l'identité **scellée**, la connexion
   négocie en ML-KEM après suppression du fichier d'enrôlement, et la même
   identité recopiée sur un autre compte Windows échoue au descellement ;
@@ -260,9 +260,9 @@ Valider avec accès console :
   coffre existant sans `--rotate`, n'écrit la clé privée nulle part en clair, et
   la gateway redémarrée retrouve la même identité — seul le scellement effectif
   distingue ce chemin d'un succès apparent, et il n'est pas observable en WSL2 ;
-- séquestre, circuit complet : `helios-ctl escrow keygen` sur le poste
+- séquestre, circuit complet : `helios escrow keygen` sur le poste
   opérateur, `escrow_public_key` déclarée, séquestre écrit par la gateway au
-  scellement, `helios-ctl escrow open` hors ligne, dépôt du fichier de
+  scellement, `helios escrow open` hors ligne, dépôt du fichier de
   récupération, redémarrage — l'identité doit être restaurée, rescellée, et le
   fichier de récupération effacé ;
 - admission : la VIP dérivée par `heliosd peer add` est bien celle que le client
@@ -393,7 +393,7 @@ Répéter pour chaque classe de paquet : noyau, `grub-efi` / `shim-signed`,
 
 - `heliosd tpm update-readiness` sur un démarrage nominal : `ready`. Le tester
   aussi hors nominal — démarrer sur un billet de rescellement, puis vérifier
-  qu'il répond `unavailable` et que `helios-ctl update` refuse **sans avoir
+  qu'il répond `unavailable` et que `helios update` refuse **sans avoir
   touché à `apt`** ;
 - sans fenêtre armée, `heliosd tpm update-status` ne doit imprimer **aucune**
   ligne `esys` : l'index NV absent se demande par `TPM2_GetCapability`, qui
@@ -436,8 +436,8 @@ marqueur disque — sans prétendre mesurer Secure Boot ni les PCR d'une cible.
 admis par l'API, profils émis, campagne jouée — puis le démonte. `--keep` laisse
 le daemon vivant pour l'exploration manuelle.
 
-Il emprunte les **mêmes outils qu'un opérateur** (`helios-ctl peer add`,
-`helios-ctl profile emit`) plutôt qu'un chemin de test parallèle : une régression
+Il emprunte les **mêmes outils qu'un opérateur** (`helios peer add`,
+`helios profile emit`) plutôt qu'un chemin de test parallèle : une régression
 de l'outillage d'exploitation y tombe immédiatement. Il contrôle aussi la forme
 des deux profils émis — l'invitation ne doit porter aucun secret, le profil
 assisté doit être importable tel quel.
@@ -473,7 +473,7 @@ trois points appartiennent à la recette matérielle.
 
 ## Campagne de provisioning post-quantique
 
-`helios-ctl campaign` joue les mêmes scénarios en dry-run et sur la cible. Il
+`helios campaign` joue les mêmes scénarios en dry-run et sur la cible. Il
 agit en **vrai client** : il emprunte `orion_core::provision`, le code
 qu'embarque Orion. Une campagne qui tombe accuse donc le daemon *ou* le client.
 
@@ -505,20 +505,20 @@ Déclarer d’abord le pair de campagne sur la gateway (l’admission reste hors
 bande — la campagne ne s’auto-admet jamais) :
 
 ```sh
-helios-ctl campaign --generate-keys     # imprime le bloc [[peers]] à coller
+helios campaign --generate-keys     # imprime le bloc [[peers]] à coller
 ```
 
 Puis, **depuis le client**, tunnel classique monté :
 
 ```sh
-helios-ctl --url http://100.64.0.1:8080 campaign \
+helios --url http://100.64.0.1:8080 campaign \
   --client-key <privée du client> --gateway-key <publique de la gateway>
 ```
 
 Enfin, **depuis la gateway**, la catégorie que le dry-run ne peut pas jouer :
 
 ```sh
-helios-ctl campaign --only plan-de-donnees --wg-iface helios0 \
+helios campaign --only plan-de-donnees --wg-iface helios0 \
   --client-key <privée du client> --gateway-key <publique de la gateway>
 ```
 
@@ -554,7 +554,7 @@ machine — puis l'installe et ajoute l'utilisateur au groupe `tss` (accès
 fait sur une session neuve, seule façon de constater que la règle porte.
 
 La règle est limitée à `modprobe wireguard`, `modprobe nf_tables`, `nft`, `ip`,
-`wg` et `setcap` sur les seuls binaires d'essai (`heliosd` et `helios-ctl`,
+`wg` et `setcap` sur les seuls binaires d'essai (`heliosd` et `helios`,
 qui lit le plan de données via `wg show`) : jamais un shell générique, ni
 `apt-get`, ni root inconditionnel. `--aide-sudoers` l'imprime pour contrôle.
 
@@ -626,13 +626,13 @@ Deux pièges de terrain méritent d'être connus, car leurs symptômes égarent 
 
 ### Limite connue : le slot PSK côté client
 
-La campagne vérifie le slot PSK de la gateway, pas celui du client. `helios-ctl`
+La campagne vérifie le slot PSK de la gateway, pas celui du client. `helios`
 emprunte le **protocole** d'Orion (`orion_core::provision`), pas son
 **adaptateur** : seul ce dernier écrit le PSK dans l'interface cliente. Le
 client monté par la campagne l'est par `wg set`, et rien ne l'y renseigne.
 
 Ce qui débloquerait la vérification : un mode headless d'Orion, ou une
-sous-commande `helios-ctl` qui applique le profil reçu au lieu de se limiter à
+sous-commande `helios` qui applique le profil reçu au lieu de se limiter à
 l'inspecter. En attendant, le scénario le déclare hors de portée plutôt que de
 le compter comme réussi.
 

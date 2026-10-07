@@ -350,7 +350,7 @@ fn bundle(target: Option<String>, skip_frontend: bool, output: Option<PathBuf>) 
             "-p",
             "helios-installer",
             "-p",
-            "helios-ctl",
+            "helios",
         ],
     )?;
 
@@ -827,7 +827,7 @@ mod tests {
                 .expect("the Windows application update launcher must exist");
 
         for required in [
-            "helios-ctl",
+            "helios",
             "app-update",
             "scripts/deploy-app.sh",
             "wsl.exe",

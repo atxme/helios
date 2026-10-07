@@ -90,7 +90,7 @@ pub struct CompletedImport {
 
 /// Suffixes of an Orion document.
 ///
-/// `.orion` is **ours**: it is what `helios-ctl enroll` writes and what Windows
+/// `.orion` is **ours**: it is what `helios enroll` writes and what Windows
 /// associates with Orion. Leaving it out made its recognition rest entirely on
 /// the first character, so the slightest disturbance at the head of the file —
 /// a byte-order mark from a copy through PowerShell, a stray blank line —
@@ -259,7 +259,7 @@ fn describe_head(trimmed: &str) -> String {
 ///
 /// `admitted_public_key` — see [`ProfileImport::admitted_public_key`] — is
 /// what designates the local profile. It is matched by **key**, not by name:
-/// `helios-ctl enroll --public-key` is normally run for a client that already
+/// `helios enroll --public-key` is normally run for a client that already
 /// exists locally under another name, and the name rule alone refused those
 /// documents. When the document names no key, the name stays the only
 /// available criterion.
