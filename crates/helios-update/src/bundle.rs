@@ -300,7 +300,7 @@ pub struct BootstrapLayout {
     pub update: crate::UpdateLayout,
     /// Privileged update helper (`helios-installer`).
     pub libexec_dir: PathBuf,
-    /// Operational tools (`helios`; legacy signed bundles may contain `helios-ctl`).
+    /// Operational tools (`helios`).
     pub bin_dir: PathBuf,
     /// Systemd units.
     pub systemd_dir: PathBuf,
@@ -335,7 +335,13 @@ pub struct InstallReport {
     pub installed: Vec<PathBuf>,
     /// The configuration already existed and was not touched.
     pub config_preserved: bool,
+    /// Files of earlier releases this installation retired.
+    pub removed: Vec<PathBuf>,
 }
+
+/// The operator tool's former name. Installing `helios` removes it, so a
+/// gateway never keeps two commands with diverging behaviour.
+const LEGACY_TOOL: &str = "helios-ctl";
 
 /// Destination of a bundle file.
 enum Destination {
@@ -361,10 +367,6 @@ fn destination(path: &str, layout: &BootstrapLayout) -> Result<Destination> {
             0o755,
         )),
         "helios" => Ok(Destination::Replace(layout.bin_dir.join("helios"), 0o755)),
-        "helios-ctl" => Ok(Destination::Replace(
-            layout.bin_dir.join("helios-ctl"),
-            0o755,
-        )),
         "network.toml.example" => Ok(Destination::ConfigIfAbsent(
             layout.config_path.clone(),
             0o600,
@@ -449,6 +451,21 @@ fn install_with_keyring(
         }
     }
 
+    let mut removed = Vec::new();
+    if payload.files.iter().any(|entry| entry.path == "helios") {
+        let legacy = layout.bin_dir.join(LEGACY_TOOL);
+        match fs::remove_file(&legacy) {
+            Ok(()) => removed.push(legacy),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(update_error(format!(
+                    "removing the legacy {}: {error}",
+                    legacy.display()
+                )))
+            }
+        }
+    }
+
     crate::switch_link(&layout.update.current_link, &release_dir)?;
     crate::write_json_atomic(
         &layout.update.state_path,
@@ -464,6 +481,7 @@ fn install_with_keyring(
         channel: payload.channel.clone(),
         installed,
         config_preserved,
+        removed,
     })
 }
 
@@ -580,12 +598,12 @@ mod tests {
     fn a_missing_file_is_rejected() {
         let dir = temp_dir("missing");
         write_file(&dir, "heliosd", b"binary");
-        write_file(&dir, "helios-ctl", b"tool");
+        write_file(&dir, "helios", b"tool");
         let payload = payload(collect(&dir).unwrap());
-        fs::remove_file(dir.join("helios-ctl")).unwrap();
+        fs::remove_file(dir.join("helios")).unwrap();
 
         let error = verify_contents(&dir, &payload).unwrap_err().to_string();
-        assert!(error.contains("helios-ctl"), "message: {error}");
+        assert!(error.contains("helios"), "message: {error}");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -726,6 +744,33 @@ mod tests {
 
         let _ = fs::remove_dir_all(&source);
         let _ = fs::remove_dir_all(&target);
+    }
+
+    /// The operator tool is `helios` now: installing it retires the old
+    /// `helios-ctl` binary, so the gateway is left with a single command.
+    #[test]
+    fn installing_the_tool_retires_the_legacy_binary() {
+        let source = temp_dir("retire-source");
+        let target = temp_dir("retire-target");
+        full_bundle(&source);
+        let keys = sign_bundle(&source, 9);
+        let layout = bootstrap_layout(&target);
+        fs::create_dir_all(&layout.bin_dir).unwrap();
+        fs::write(layout.bin_dir.join("helios-ctl"), b"old tool").unwrap();
+
+        let report = install_with_keyring(&source, &layout, &[keys]).expect("installation");
+
+        assert!(!layout.bin_dir.join("helios-ctl").exists());
+        assert_eq!(report.removed, vec![layout.bin_dir.join("helios-ctl")]);
+        let _ = fs::remove_dir_all(&source);
+        let _ = fs::remove_dir_all(&target);
+    }
+
+    #[test]
+    fn a_bundle_still_carrying_the_legacy_tool_is_refused() {
+        let layout = bootstrap_layout(Path::new("/nonexistent"));
+        let error = destination("helios-ctl", &layout).err().expect("refused");
+        assert!(error.to_string().contains("helios-ctl"), "{error}");
     }
 
     /// Reinstalling an already-applied sequence would bring back a version

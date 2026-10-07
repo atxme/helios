@@ -93,6 +93,9 @@ fn bootstrap(archive: Option<PathBuf>, dir: Option<PathBuf>) -> Result<()> {
     if report.config_preserved {
         println!("  {} kept as is", layout.config_path.display());
     }
+    for path in &report.removed {
+        println!("  {} removed (replaced by helios)", path.display());
+    }
     if let Err(error) = units_reloaded {
         // The files are laid down and verified: failing here would announce
         // a failed installation when it succeeded. We say so loudly, without
