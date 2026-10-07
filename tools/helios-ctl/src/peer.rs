@@ -137,43 +137,6 @@ pub async fn cmd_revoke(client: &Client, base: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn cmd_list(client: &Client, base: &str) -> Result<()> {
-    let view = api::network(client, base).await?;
-    if view.peers.is_empty() {
-        println!("\n  no admitted peers\n");
-        return Ok(());
-    }
-
-    println!();
-    println!("  \x1b[1mAdmitted peers\x1b[0m ({})", view.peers.len());
-    println!();
-    for peer in &view.peers {
-        let role = if peer.admin { "  [admin]" } else { "" };
-        let pq = if peer.preshared_key_configured {
-            "  [PQ]"
-        } else {
-            ""
-        };
-        let certificate = if peer.key_negotiation_certificate_sha256.is_some() {
-            "  [key-nego]"
-        } else {
-            ""
-        };
-        let pq_certificate = if peer.key_negotiation_pq_certificate_sha256.is_some() {
-            "  [ML-DSA]"
-        } else {
-            ""
-        };
-        let key = peer.public_key.get(..12).unwrap_or(&peer.public_key);
-        println!(
-            "  {:<20} {:<18} {key}…{role}{pq}{certificate}{pq_certificate}  [min={:?}]",
-            peer.name, peer.address, peer.minimum_key_negotiation_mode
-        );
-    }
-    println!();
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,23 +201,6 @@ mod tests {
             "address": "100.64.1.2/32",
             "admin": admin,
             "minimum_key_negotiation_mode": mode
-        })
-        .to_string()
-    }
-
-    fn network_view(peers: serde_json::Value) -> String {
-        serde_json::json!({
-            "wan_ifaces": ["eth0"],
-            "lan_ifaces": [],
-            "allow_ssh_from": [],
-            "admin_iface": "helios0",
-            "wg_iface": "helios0",
-            "wg_private_key_configured": true,
-            "wg_public_key": "gateway-public",
-            "wg_address": "100.64.0.1/10",
-            "wg_listen_port": 51820,
-            "key_negotiation_port": 51821,
-            "peers": peers
         })
         .to_string()
     }
@@ -338,7 +284,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn command_wrappers_cover_policy_and_empty_or_populated_lists() {
+    async fn command_wrappers_send_the_policy_and_the_revocation() {
         let client = Client::new();
         let (base, server) = response_server(peer_summary("admin", true, "ml_kem")).await;
         cmd_add(
@@ -362,24 +308,6 @@ mod tests {
 
         let (base, server) = response_server(peer_summary("admin", true, "ml_kem")).await;
         cmd_revoke(&client, &base, "admin").await.unwrap();
-        server.await.unwrap();
-
-        let (base, server) = response_server(network_view(serde_json::json!([]))).await;
-        cmd_list(&client, &base).await.unwrap();
-        server.await.unwrap();
-
-        let peer = serde_json::json!({
-            "name": "admin",
-            "public_key": "short",
-            "address": "100.64.1.2/32",
-            "preshared_key_configured": true,
-            "key_negotiation_certificate_sha256": "tls",
-            "key_negotiation_pq_certificate_sha256": "pq",
-            "minimum_key_negotiation_mode": "ml_kem",
-            "admin": true
-        });
-        let (base, server) = response_server(network_view(serde_json::json!([peer]))).await;
-        cmd_list(&client, &base).await.unwrap();
         server.await.unwrap();
     }
 }

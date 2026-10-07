@@ -37,6 +37,7 @@ mod key_nego;
 mod peer;
 mod profile;
 mod transport;
+mod ui;
 mod update;
 
 // ─── CLI ──────────────────────────────────────────────────────────────────────
@@ -93,7 +94,11 @@ enum Cmd {
     /// Machine health: uptime, load, memory, temperature and TPM posture.
     Health,
     /// nftables ruleset rendered for the current tunnel state.
-    Firewall,
+    Firewall {
+        /// The exact nftables text, for copying or diffing.
+        #[arg(long)]
+        raw: bool,
+    },
     /// Trust domain and certificate lifecycle: CA, gateway identity, clients.
     Certificates,
     /// Publisher keys and algorithms an application update must carry.
@@ -110,6 +115,9 @@ enum Cmd {
         /// Keep printing new lines.
         #[arg(short, long)]
         follow: bool,
+        /// Also show the module each line comes from.
+        #[arg(short, long)]
+        verbose: bool,
     },
     /// Network configuration management.
     Network {
@@ -454,6 +462,8 @@ struct Status {
     wg_iface: String,
     wg_listen_port: Option<u16>,
     dry_run: bool,
+    #[serde(default)]
+    key_negotiation_port: Option<u16>,
     split_tunnel_cidrs: Vec<String>,
     mss_clamp: Option<u16>,
     captive_portal_gateway: Option<String>,
@@ -488,9 +498,19 @@ struct PeerSummary {
     post_quantum: bool,
     #[serde(default)]
     last_handshake_age_seconds: Option<u64>,
+    #[serde(default)]
+    admin: bool,
+    #[serde(default)]
+    minimum_key_negotiation_mode: String,
+    #[serde(default)]
+    endpoint: Option<String>,
+    #[serde(default)]
+    rx_bytes: u64,
+    #[serde(default)]
+    tx_bytes: u64,
 }
 
-use crate::api::{CmdResp, NetworkConfigView};
+use crate::api::CmdResp;
 
 // ─── Display ──────────────────────────────────────────────────────────────────
 
@@ -568,70 +588,6 @@ fn ws_url(base: &str) -> String {
 
 // ─── Commands ─────────────────────────────────────────────────────────────────
 
-async fn cmd_status(client: &Client, base: &str) -> Result<()> {
-    let s = api_status(client, base).await?;
-    let dry = if s.dry_run {
-        "  \x1b[35m[dry-run]\x1b[0m"
-    } else {
-        ""
-    };
-    println!();
-    println!("  \x1b[1mheliosd v{}\x1b[0m{}", s.version, dry);
-    println!();
-    let (online, total) = s.online_peers();
-    println!(
-        "  {}  {}  \x1b[2m{online}/{total} peers online\x1b[0m",
-        state_dot(&s.state),
-        colored_state(&s.state)
-    );
-    if s.state == "connecting" {
-        println!("     \x1b[2mtunnel ready, waiting for a client WireGuard handshake\x1b[0m");
-    }
-    println!();
-    println!("  {:<14} {}", "WAN", s.wan_ifaces.join(", "));
-    println!("  {:<14} {}", "LAN", s.lan_ifaces.join(", "));
-    println!(
-        "  {:<14} {}{}",
-        "WireGuard",
-        s.wg_iface,
-        s.wg_listen_port
-            .map(|port| format!(" (UDP {port})"))
-            .unwrap_or_else(|| " (port closed)".to_string())
-    );
-    for peer in &s.peers {
-        let pq = if peer.post_quantum { " [PQ]" } else { "" };
-        let key = peer.public_key.get(..8).unwrap_or(&peer.public_key);
-        println!(
-            "  {:<14} {} → {} ({key}…){pq}",
-            "Peer", peer.name, peer.address
-        );
-    }
-    if !s.wg_peers.is_empty() {
-        println!("  {:<14} {}", "Site-to-site", s.wg_peers.join(", "));
-    }
-    if !s.allow_ssh_from.is_empty() {
-        println!("  {:<14} {}", "SSH allowed", s.allow_ssh_from.join(", "));
-    }
-    if !s.admin_ifaces.is_empty() {
-        println!("  {:<14} {}", "Admin access", s.admin_ifaces.join(", "));
-    }
-    if !s.split_tunnel_cidrs.is_empty() {
-        println!(
-            "  {:<14} {}",
-            "Split tunnel",
-            s.split_tunnel_cidrs.join(", ")
-        );
-    }
-    if let Some(mss) = s.mss_clamp {
-        println!("  {:<14} {}", "MSS clamp", mss);
-    }
-    if let Some(gateway) = &s.captive_portal_gateway {
-        println!("  {:<14} {}", "Captive portal", gateway);
-    }
-    println!();
-    Ok(())
-}
-
 async fn cmd_connect(client: &Client, base: &str) -> Result<()> {
     let r = api_post(client, base, "/api/tunnel/start").await?;
     if r.ok {
@@ -687,84 +643,6 @@ async fn watch_events<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
     }
-}
-
-async fn cmd_network_show(client: &Client, base: &str) -> Result<()> {
-    let cfg: NetworkConfigView = client
-        .get(format!("{base}/api/network"))
-        .send()
-        .await
-        .context("connection refused")?
-        .json()
-        .await
-        .context("unexpected JSON response")?;
-
-    println!();
-    println!("  \x1b[1mNetwork config\x1b[0m");
-    println!();
-    println!(
-        "  {:<16} {}",
-        "WAN",
-        if cfg.wan_ifaces.is_empty() {
-            "(not set)".to_string()
-        } else {
-            cfg.wan_ifaces.join(", ")
-        }
-    );
-    println!(
-        "  {:<16} {}",
-        "LAN",
-        if cfg.lan_ifaces.is_empty() {
-            "(none)".to_string()
-        } else {
-            cfg.lan_ifaces.join(", ")
-        }
-    );
-    if !cfg.allow_ssh_from.is_empty() {
-        println!(
-            "  {:<16} {}",
-            "SSH allowed from",
-            cfg.allow_ssh_from.join(", ")
-        );
-    }
-    if !cfg.admin_ifaces.is_empty() {
-        println!("  {:<16} {}", "Admin ifaces", cfg.admin_ifaces.join(", "));
-    }
-    if let Some(ref iface) = cfg.admin_iface {
-        println!("  {:<16} {}", "Admin iface", iface);
-    }
-    println!(
-        "  {:<16} {} (UDP {})",
-        "WG interface", cfg.wg_iface, cfg.wg_listen_port
-    );
-    println!(
-        "  {:<16} {}",
-        "Key negotiation",
-        cfg.key_negotiation_port
-            .map(|port| format!("UDP {port}"))
-            .unwrap_or_else(|| "disabled".to_string())
-    );
-    println!(
-        "  {:<16} {}",
-        "Private key",
-        if cfg.wg_private_key_configured {
-            "configured (hidden)"
-        } else {
-            "absent"
-        }
-    );
-    println!("  {:<16} {}", "WG address", cfg.wg_address);
-    println!("  {:<16} {}", "Peers", cfg.peers.len());
-    for p in &cfg.peers {
-        let pq = if p.preshared_key_configured {
-            "  [PQ]"
-        } else {
-            ""
-        };
-        println!("    - {} → {}{}", p.name, p.address, pq);
-    }
-    println!();
-    Ok(())
 }
 
 async fn cmd_network_load(client: &Client, base: &str, file: &PathBuf) -> Result<()> {
@@ -1044,24 +922,28 @@ async fn execute_command(api: &transport::Api, command: Cmd) -> Result<()> {
     match command {
         Cmd::Shell => anyhow::bail!("open the shell at the command entry point"),
         Cmd::Firmware { command } => firmware::run(command),
-        Cmd::Status => cmd_status(client, base).await,
+        Cmd::Status => inspect::status(client, base).await,
         Cmd::Connect => cmd_connect(client, base).await,
         Cmd::Disconnect => cmd_disconnect(client, base).await,
         Cmd::Watch => cmd_watch(api).await,
         Cmd::Doctor => inspect::doctor(api).await,
         Cmd::Health => inspect::health(client, base).await,
-        Cmd::Firewall => inspect::firewall(client, base).await,
+        Cmd::Firewall { raw } => inspect::firewall(client, base, raw).await,
         Cmd::Certificates => inspect::certificates(client, base).await,
         Cmd::Trust => inspect::trust(client, base).await,
         Cmd::Release => inspect::release(client, base).await,
         Cmd::Negotiation => inspect::negotiation(client, base).await,
-        Cmd::Logs { lines, follow } => inspect::logs(lines, follow).await,
+        Cmd::Logs {
+            lines,
+            follow,
+            verbose,
+        } => inspect::logs(lines, follow, verbose).await,
         Cmd::Network { command } => match command {
-            NetworkCmd::Show => cmd_network_show(client, base).await,
+            NetworkCmd::Show => inspect::network(client, base).await,
             NetworkCmd::Load { file } => cmd_network_load(client, base, &file).await,
         },
         Cmd::Peer { command } => match command {
-            PeerCmd::List => peer::cmd_list(client, base).await,
+            PeerCmd::List => inspect::peers(client, base).await,
             PeerCmd::Add {
                 name,
                 public_key,
