@@ -10,7 +10,10 @@ use anyhow::Result;
 use reqwest::Client;
 use serde::Serialize;
 
-use crate::api::{self, PeerSummary};
+use crate::{
+    api::{self, PeerSummary},
+    ui::{self, Ui},
+};
 
 #[derive(Serialize)]
 struct AdmitBody<'a> {
@@ -108,19 +111,29 @@ pub async fn cmd_add(
     key_negotiation: KeyNegotiationAdmission<'_>,
 ) -> Result<()> {
     let peer = admit_with_policy(client, base, name, public_key, admin, key_negotiation).await?;
-    println!(
-        "{} {} admitted → {}{}",
-        crate::ok(),
-        peer.name,
-        peer.address,
-        if peer.admin { "  [admin]" } else { "" }
-    );
-    println!("\n  \x1b[2mpublic key: {}\x1b[0m", peer.public_key);
-    println!(
-        "  \x1b[2mminimum key-negotiation mode: {:?}\x1b[0m",
-        peer.minimum_key_negotiation_mode
-    );
-    println!("  \x1b[2mVIP derived from this key: the client will find it at enrollment.\x1b[0m");
+    let ui = Ui::detect();
+    let mut out = ui.done(&format!("{} admitted", peer.name));
+    out.push('\n');
+    out.push_str(&ui.field("Address", &peer.address));
+    out.push_str(&ui.field(
+        "Role",
+        if peer.admin {
+            "administrator"
+        } else {
+            "client"
+        },
+    ));
+    out.push_str(&ui.field(
+        "Negotiation",
+        &format!(
+            "{} minimum",
+            ui::protection_mode(peer.minimum_key_negotiation_mode)
+        ),
+    ));
+    out.push_str(&ui.field("Public key", &peer.public_key));
+    out.push('\n');
+    out.push_str(&ui.note("The address derives from the key: the client learns it at enrollment."));
+    print!("{out}");
     Ok(())
 }
 
@@ -131,9 +144,14 @@ pub async fn revoke(client: &Client, base: &str, name: &str) -> Result<PeerSumma
 
 pub async fn cmd_revoke(client: &Client, base: &str, name: &str) -> Result<()> {
     let peer = revoke(client, base, name).await?;
-    println!("{} {} removed from admission", crate::ok(), peer.name);
-    println!("\n  \x1b[2mThe peer will drop at its next handshake; there is no\x1b[0m");
-    println!("  \x1b[2mcryptographic revocation (ADR-004).\x1b[0m");
+    let ui = Ui::detect();
+    print!(
+        "{}{}",
+        ui.done(&format!("{} removed from admission", peer.name)),
+        ui.note(
+            "It drops at its next handshake; WireGuard has no cryptographic revocation (ADR-004)."
+        )
+    );
     Ok(())
 }
 

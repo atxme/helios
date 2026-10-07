@@ -278,3 +278,23 @@ fn online_peers_follow_the_gateway_staleness_bound() {
     .unwrap();
     assert_eq!(status.online_peers(), (1, 3));
 }
+
+/// A refusal from the gateway is a failed command: the shell then closes its
+/// block with ✗, not with ✓ under a printed cross.
+#[test]
+fn a_gateway_refusal_fails_the_command() {
+    let refused = CmdResp {
+        ok: false,
+        error: Some("tunnel already up".into()),
+    };
+    let error = accepted(refused).expect_err("a refusal must fail");
+    assert_eq!(
+        error.to_string(),
+        "refused by the gateway: tunnel already up"
+    );
+    assert!(accepted(CmdResp {
+        ok: true,
+        error: None
+    })
+    .is_ok());
+}

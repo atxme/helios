@@ -589,23 +589,36 @@ fn ws_url(base: &str) -> String {
 // ─── Commands ─────────────────────────────────────────────────────────────────
 
 async fn cmd_connect(client: &Client, base: &str) -> Result<()> {
-    let r = api_post(client, base, "/api/tunnel/start").await?;
-    if r.ok {
-        println!("{} connect command sent", ok());
-    } else {
-        println!("{} refused: {}", fail(), r.error.as_deref().unwrap_or("?"));
-    }
+    accepted(api_post(client, base, "/api/tunnel/start").await?)?;
+    let ui = ui::Ui::detect();
+    print!(
+        "{}{}",
+        ui.done("Tunnel start requested"),
+        ui.note("Follow it with /status or /watch.")
+    );
     Ok(())
 }
 
 async fn cmd_disconnect(client: &Client, base: &str) -> Result<()> {
-    let r = api_post(client, base, "/api/tunnel/stop").await?;
-    if r.ok {
-        println!("{} disconnect sent — kill switch engaged", ok());
-    } else {
-        println!("{} refused: {}", fail(), r.error.as_deref().unwrap_or("?"));
-    }
+    accepted(api_post(client, base, "/api/tunnel/stop").await?)?;
+    let ui = ui::Ui::detect();
+    print!(
+        "{}{}",
+        ui.done("Tunnel stop requested"),
+        ui.note("The kill switch stays engaged: no traffic leaves outside the tunnel.")
+    );
     Ok(())
+}
+
+/// A refusal is a failed command, not a success that prints a cross.
+fn accepted(response: CmdResp) -> Result<()> {
+    if response.ok {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "refused by the gateway: {}",
+        response.error.as_deref().unwrap_or("no reason given")
+    )
 }
 
 async fn cmd_watch(api: &transport::Api) -> Result<()> {
@@ -676,19 +689,14 @@ async fn cmd_network_load(client: &Client, base: &str, file: &PathBuf) -> Result
         .await
         .context("unexpected JSON response")?;
 
-    if resp.ok {
-        println!(
-            "{} network config loaded ({} peer(s))",
-            ok(),
+    accepted(resp)?;
+    print!(
+        "{}",
+        ui::Ui::detect().done(&format!(
+            "Network configuration loaded · {} peer(s)",
             config.peers.len()
-        );
-    } else {
-        println!(
-            "{} refused: {}",
-            fail(),
-            resp.error.as_deref().unwrap_or("?")
-        );
-    }
+        ))
+    );
     Ok(())
 }
 

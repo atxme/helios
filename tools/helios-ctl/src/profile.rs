@@ -28,7 +28,10 @@ use orion_core::ProfileKind;
 use reqwest::Client;
 use serde::Serialize;
 
-use crate::api;
+use crate::{
+    api,
+    ui::{self, Tone, Ui},
+};
 
 /// Document identifier and version, as required by `orion-core`.
 const FORMAT: &str = "orion-profile";
@@ -156,85 +159,97 @@ pub fn render(profile: Profile<'_>) -> Result<String> {
     Ok(json)
 }
 
-/// Relit un document exactement comme Orion le fera.
+/// Reads a document exactly as Orion will.
 ///
-/// Le même code que l'import client, donc un verdict qui vaut : si cette
-/// commande accepte, Orion accepte. Rien n'est affiché du contenu secret —
-/// seulement ce qu'il faut pour situer un échec.
+/// The same code as the client's import, so the verdict holds: if this
+/// command accepts it, Orion accepts it. Nothing secret is printed — only
+/// what it takes to locate a failure.
 pub fn check(path: &Path) -> Result<()> {
     let imported = orion_core::read_profile_import_path(path)
-        .with_context(|| format!("relecture de {}", path.display()))?;
-    let profile = &imported.profile;
+        .with_context(|| format!("reading {}", path.display()))?;
+    print!("{}", render_check(&Ui::detect(), path, &imported));
+    Ok(())
+}
 
-    println!("{} document lisible par Orion", crate::ok());
-    println!();
-    println!("  profil          : {}", profile.name);
-    println!("  endpoint        : {}", profile.endpoint);
-    println!(
-        "  adresse         : {}",
-        profile.address.as_deref().unwrap_or("—")
-    );
-    // Said whether or not the document stated it: what matters to the reader
-    // is what the client will route, and an absent field means the full
-    // tunnel — a fact no one should have to know the defaulting rule to learn.
-    println!(
-        "  trafic capté    : {}{}",
-        profile.allowed_ips,
-        if profile.allowed_ips == orion_core::DEFAULT_ALLOWED_IPS {
-            "  (tunnel complet)"
-        } else {
-            "  (tunnel fractionné — le reste sort en clair)"
-        }
-    );
-    println!(
-        "  API dans tunnel : {}",
-        profile
-            .heliosd_url
-            .as_deref()
-            .unwrap_or("— absente : le profil se connecte, mais ne peut pas renouveler")
-    );
-    // Ce que l'import fera de la clé privée absente est la question qu'on
-    // pose le plus souvent à cette commande : la clé admise est ce qui
-    // désigne le profil local à compléter, et l'afficher permet de la
-    // comparer à ce qu'Orion montre dans « Votre clé publique ».
-    match (
+fn render_check(ui: &Ui, path: &Path, imported: &orion_core::ProfileImport) -> String {
+    let profile = &imported.profile;
+    let mut out = ui.done(&format!("Readable by Orion  {}", path.display()));
+    out.push('\n');
+    out.push_str(&ui.field("Profile", &profile.name));
+    out.push_str(&ui.field("Endpoint", &profile.endpoint));
+    out.push_str(&match profile.address.as_deref() {
+        Some(address) => ui.field("Address", address),
+        None => ui.field_toned("Address", "not set", Tone::Dim),
+    });
+    // Said whether or not the document stated it: what matters is what the
+    // client will route, and an absent field means the full tunnel.
+    out.push_str(&if profile.allowed_ips == orion_core::DEFAULT_ALLOWED_IPS {
+        ui.field("Routes", &format!("{} · full tunnel", profile.allowed_ips))
+    } else {
+        ui.field_toned(
+            "Routes",
+            &format!(
+                "{} · split tunnel: everything else leaves unencrypted",
+                profile.allowed_ips
+            ),
+            Tone::Warn,
+        )
+    });
+    out.push_str(&match profile.heliosd_url.as_deref() {
+        Some(url) => ui.field("Tunnel API", url),
+        None => ui.field_toned(
+            "Tunnel API",
+            "missing — the profile connects but cannot renew",
+            Tone::Warn,
+        ),
+    });
+    // What the import does with an absent private key is the question most
+    // asked of this command: the admitted key names the local profile it
+    // completes, to compare with what Orion shows as "Your public key".
+    out.push_str(&match (
         profile.private_key.is_empty(),
         imported.admitted_public_key(),
     ) {
-        (false, _) => println!("  clé privée      : présente"),
-        (true, Some(admitted)) => println!(
-            "  clé privée      : absente — Orion reprendra celle du profil local\n                    portant la clé admise {admitted}"
+        (false, _) => ui.field("Private key", "included"),
+        (true, Some(admitted)) => ui.field(
+            "Private key",
+            &format!("absent — Orion takes it from the local profile holding key {admitted}"),
         ),
-        (true, None) => println!(
-            "  clé privée      : absente — Orion reprendra celle du profil local de même nom"
+        (true, None) => ui.field(
+            "Private key",
+            "absent — Orion takes it from the local profile of the same name",
         ),
-    }
-
+    });
     match &profile.key_negotiation {
         Some(settings) => {
-            println!("  négociation     : {:?}", settings.mode);
-            println!("  plancher        : {:?}", settings.minimum_mode);
-            println!("  endpoint négo   : {}", settings.endpoint);
-            println!("  serveur épinglé : {}", settings.server_name);
-            println!(
-                "  empreinte PQ    : {}",
-                settings
-                    .gateway_pq_fingerprint()
-                    .unwrap_or_else(|| "illisible".into())
-            );
-            println!("  identité        : {}", settings.identity);
+            out.push_str(&ui.field(
+                "Negotiation",
+                &format!(
+                    "{} (minimum {}) · {} · server {}",
+                    ui::protection_mode(settings.mode),
+                    ui::protection_mode(settings.minimum_mode),
+                    settings.endpoint,
+                    settings.server_name
+                ),
+            ));
+            out.push_str(&match settings.gateway_pq_fingerprint() {
+                Some(fingerprint) => ui.field("PQ pin", &format!("sha256 {fingerprint}")),
+                None => ui.field_toned("PQ pin", "unreadable", Tone::Bad),
+            });
+            out.push_str(&ui.field("Identity", &settings.identity));
         }
-        None => println!("  négociation     : aucune (chemin hérité)"),
+        None => out.push_str(&ui.field_toned("Negotiation", "none (legacy path)", Tone::Warn)),
     }
-    println!(
-        "  identité jointe : {}",
-        if imported.identity.is_some() {
-            "oui — scellée à l'import, détruire le fichier ensuite"
-        } else {
-            "non"
-        }
-    );
-    Ok(())
+    out.push_str(&if imported.identity.is_some() {
+        ui.field_toned(
+            "Bundled id",
+            "yes — sealed on import; destroy the file afterwards",
+            Tone::Warn,
+        )
+    } else {
+        ui.field("Bundled id", "no")
+    });
+    out
 }
 
 pub async fn emit(client: &Client, base: &str, options: EmitOptions) -> Result<()> {
@@ -389,6 +404,43 @@ mod tests {
             allowed_ips: None,
             ssh_target: None,
             output: None,
+        }
+    }
+
+    #[test]
+    fn check_reads_in_english_and_flags_what_needs_attention() {
+        let pair = aether::wg::generate_keypair().unwrap();
+        let json = render(Profile {
+            name: "laptop",
+            endpoint: "vpn.example.net:51820",
+            private_key: None,
+            peer_public_key: &pair.public_key,
+            address: "100.64.1.9/32",
+            allowed_ips: Some("10.0.0.0/8"),
+            ssh_target: None,
+            heliosd_url: None,
+            key_negotiation: None,
+            key_negotiation_identity: None,
+        })
+        .unwrap();
+        let imported = orion_core::parse_profile_import(&json, "laptop.orion").unwrap();
+        let text = render_check(&Ui::plain(None), Path::new("laptop.orion"), &imported);
+        assert!(
+            text.starts_with("  ✓ Readable by Orion  laptop.orion\n"),
+            "{text}"
+        );
+        for expected in [
+            "  Profile       laptop\n",
+            "  Address       100.64.1.9/32\n",
+            "  Routes        10.0.0.0/8 · split tunnel: everything else leaves unencrypted\n",
+            "  Tunnel API    missing — the profile connects but cannot renew\n",
+            "  Negotiation   none (legacy path)\n",
+            "  Bundled id    no\n",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?} in {text}");
+        }
+        for french in ["lisible", "clé", "absente", "trafic"] {
+            assert!(!text.contains(french), "{text}");
         }
     }
 

@@ -133,6 +133,15 @@ impl Ui {
         format!("  {}\n", self.paint(&text, Tone::Dim))
     }
 
+    /// `  ✓ text` — the outcome line of a command that changed something.
+    pub fn done(&self, text: &str) -> String {
+        format!(
+            "  {} {}\n",
+            self.mark(Level::Ok),
+            self.paint(&clean(text), Tone::Bold)
+        )
+    }
+
     pub fn mark(&self, level: Level) -> String {
         match level {
             Level::Ok => self.paint("✓", Tone::Good),
@@ -202,6 +211,15 @@ impl Ui {
             .take(room - 1)
             .chain(std::iter::once('…'))
             .collect()
+    }
+}
+
+pub fn protection_mode(mode: aether::key_negotiation::ProtectionMode) -> &'static str {
+    use aether::key_negotiation::ProtectionMode;
+    match mode {
+        ProtectionMode::MlKem => "ML-KEM",
+        ProtectionMode::StaticPsk => "static PSK",
+        ProtectionMode::Classic => "classic",
     }
 }
 
