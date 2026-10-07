@@ -99,11 +99,19 @@ pub async fn require_admin(
     }
     match caller_of(&state, local_of(&request), source_of(&request)).await {
         Some(caller) if caller.admin => {
-            tracing::info!(
-                pair = %caller.name,
-                source = %caller.source,
-                "admin command authenticated via WireGuard"
-            );
+            if caller.local {
+                tracing::info!(
+                    caller = %caller.name,
+                    uri = %request.uri(),
+                    "admin command authenticated by the local socket's kernel credentials"
+                );
+            } else {
+                tracing::info!(
+                    pair = %caller.name,
+                    source = %caller.source,
+                    "admin command authenticated via WireGuard"
+                );
+            }
             request.extensions_mut().insert(caller);
             next.run(request).await
         }
