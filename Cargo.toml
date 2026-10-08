@@ -126,7 +126,7 @@ aws-lc-sys = "0.45.0"
 fips204 = { version = "=0.4.6", default-features = false, features = ["ml-dsa-65", "ml-dsa-87"] }
 # Précontrôles Ed25519 stricts (points faibles + scalaires canoniques) avant AWS-LC.
 # Déjà présent transitivement via x25519-dalek ; ce n'est pas un backend de signature.
-curve25519-dalek = "4"
+curve25519-dalek = "5"
 blake3 = "1"
 zeroize = "1"
 base64 = "0.23"
@@ -136,7 +136,7 @@ hex = "0.4"
 rpassword = "7"
 # `static_secrets` expose `StaticSecret` : une clé privée persistée (celle du
 # profil WireGuard), par opposition aux clés éphémères par défaut.
-x25519-dalek = { version = "2", features = ["static_secrets"] }
+x25519-dalek = { version = "3", features = ["static_secrets"] }
 # Backend WireGuard unifié (noyau Linux via netlink, Windows, ou userspace
 # BoringTun) derrière une seule API. Optionnel : activé par la feature
 # `wireguard` d'orion-core / heliosd.
