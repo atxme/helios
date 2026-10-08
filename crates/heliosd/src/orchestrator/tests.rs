@@ -1156,6 +1156,37 @@ async fn a_kernel_refusing_the_ipv6_address_leaves_an_ipv4_only_gateway() {
     assert!(up.state.read().await.kill_switch_engaged());
 }
 
+/// If the kernel also refuses the IPv4-only retry, startup fails closed and
+/// retains both failures in the diagnostic instead of reporting degradation.
+#[tokio::test]
+async fn a_failed_ipv4_only_retry_keeps_the_kill_switch_engaged() {
+    let network = dual_stack_network();
+    let wireguard = helios_wireguard::DryRunBackend::without_ipv6_or_retry();
+    let state = Arc::new(RwLock::new(TunnelState::Down));
+    let ipv6 = Arc::new(RwLock::new(Ipv6TunnelStatus::default()));
+    let (events, _) = broadcast::channel(16);
+
+    let error = connect_with_ipv6(
+        &network,
+        Ipv6TunnelStatus::Installed,
+        &wireguard,
+        &state,
+        &events,
+        &DryRunBackend,
+        &network.firewall_policy(),
+        true,
+        &ipv6,
+    )
+    .await
+    .expect_err("a refused IPv4-only retry must fail startup");
+
+    let message = format!("{error:#}");
+    assert!(message.contains("IPv4-only retry refused"), "{message}");
+    assert!(message.contains("IPv6 is disabled"), "{message}");
+    assert!(state.read().await.kill_switch_engaged());
+    assert_eq!(*ipv6.read().await, Ipv6TunnelStatus::default());
+}
+
 /// Only a kernel-side refusal is retried: a configuration the backend
 /// refuses before touching anything fails the start, as it always did.
 #[tokio::test]
