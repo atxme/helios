@@ -2892,12 +2892,12 @@ borné, mais une différence de coût entre validation syntaxique et ML-DSA rest
 observable. La supprimer complètement demanderait d'exécuter les opérations
 les plus coûteuses sur toute entrée hostile, ce qui contredirait la défense DoS.
 
-**Le cycle complet des certificats reste non implémenté.** La cible comprend
-désormais les formats signés, deux slots bornés, les générations anti-rollback,
-Astra, le planificateur à 80 %, la récupération expirée et les campagnes
-YubiKey définis par la [spécification de rotation](ROTATION-CERTIFICATS.md).
-Une livraison qui ne porte que les formats ou l'import manuel ne doit pas être
-présentée comme cycle de vie achevé.
+**Le cycle complet des certificats est implémenté.** Formats signés, deux
+slots bornés, générations anti-rollback, Astra, planificateur à 80 %,
+récupération expirée et campagnes YubiKey sont livrés selon la
+[spécification de rotation](ROTATION-CERTIFICATS.md), dont le §12.5 nomme ce
+qui reste : deux décisions opérateur et la validation sur les machines cibles,
+qui ne se coche pas par une compilation.
 
 **Les effets matériels ne sont pas prouvés en WSL2.** La liste de ce qui exige
 les machines cibles est au [§20.2](#202-ce-qui-exige-les-machines-cibles), et

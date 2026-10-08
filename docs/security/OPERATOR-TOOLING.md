@@ -208,8 +208,10 @@ prochain handshake, il n'existe pas de liste de révocation.
 > servi. La cible acceptée par
 > [ADR-008](../adr/ADR-008-ASTRA-AUTORITE-CERTIFICATS.md) déplace le cycle de
 > vie vers Astra, conserve les CA maîtresses chiffrées et les ouvre localement
-> avec `astra-signer` et une YubiKey. Ce lot n'est pas encore implémenté ; les
-> commandes ci-dessous restent donc nécessaires jusque-là.
+> avec `astra-signer` et une YubiKey. Ce lot est livré
+> ([DEPLOIEMENT-ASTRA](../DEPLOIEMENT-ASTRA.md)) ; les commandes ci-dessous
+> restent celles des scripts d'installation et d'un domaine qui n'est pas passé
+> sous Astra.
 
 Créer l’autorité cliente sur le poste opérateur, jamais sur la gateway :
 

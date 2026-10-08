@@ -50,8 +50,8 @@ use windows_sys::Win32::Networking::WindowsWebServices::*;
 use windows_sys::Win32::System::Console::GetConsoleWindow;
 
 use super::{
-    Approval, Authenticator, AuthenticatorError, CredentialSubject, Opened, Registration, Result,
-    HMAC_SECRET_LEN,
+    Approval, ApprovedOpening, Authenticator, AuthenticatorError, CredentialSubject, Opened,
+    Registration, Result, HMAC_SECRET_LEN,
 };
 use super::{SlotSecret, SALT_LEN};
 use aether::certificates::webauthn::WebAuthnAssertion;
@@ -493,6 +493,140 @@ impl Authenticator for WebAuthnAuthenticator {
                 authenticator_data,
                 client_data_json,
                 signature,
+            },
+        })
+    }
+
+    fn approve_and_derive(
+        &self,
+        rp_id: &str,
+        credentials: &[Vec<u8>],
+        client_data_json: &[u8],
+        salt: &[u8; SALT_LEN],
+        _pin: &str,
+    ) -> Result<ApprovedOpening> {
+        if credentials.is_empty() {
+            return Err(AuthenticatorError::UnknownCredential);
+        }
+        let rp_id_w = wide(rp_id);
+        // `approve`'s client data — the caller's bytes, unchanged — and
+        // `derive`'s salt, in the same call.
+        let mut client_data_json = client_data_json.to_vec();
+        let client = WEBAUTHN_CLIENT_DATA {
+            dwVersion: WEBAUTHN_CLIENT_DATA_CURRENT_VERSION,
+            cbClientDataJSON: client_data_json.len() as u32,
+            pbClientDataJSON: client_data_json.as_mut_ptr(),
+            pwszHashAlgId: WEBAUTHN_HASH_ALGORITHM_SHA_256,
+        };
+
+        // Raw, as in `derive`: Windows applies the PRF conversion itself.
+        let mut salt_bytes = *salt;
+        let mut global_salt = WEBAUTHN_HMAC_SECRET_SALT {
+            cbFirst: salt_bytes.len() as u32,
+            pbFirst: salt_bytes.as_mut_ptr(),
+            cbSecond: 0,
+            pbSecond: std::ptr::null_mut(),
+        };
+        let mut salt_values = WEBAUTHN_HMAC_SECRET_SALT_VALUES {
+            pGlobalHmacSalt: &mut global_salt,
+            cCredWithHmacSecretSaltList: 0,
+            pCredWithHmacSecretSaltList: std::ptr::null_mut(),
+        };
+
+        let mut allowed = CredentialList::new(credentials);
+        let options = WEBAUTHN_AUTHENTICATOR_GET_ASSERTION_OPTIONS {
+            // Same reason as `derive`: version 5 ends before
+            // `pHmacSecretSaltValues`.
+            dwVersion: WEBAUTHN_AUTHENTICATOR_GET_ASSERTION_OPTIONS_VERSION_6,
+            dwTimeoutMilliseconds: TIMEOUT_MS,
+            CredentialList: WEBAUTHN_CREDENTIALS {
+                cCredentials: 0,
+                pCredentials: std::ptr::null_mut(),
+            },
+            Extensions: WEBAUTHN_EXTENSIONS {
+                cExtensions: 0,
+                pExtensions: std::ptr::null_mut(),
+            },
+            dwAuthenticatorAttachment: WEBAUTHN_AUTHENTICATOR_ATTACHMENT_CROSS_PLATFORM,
+            dwUserVerificationRequirement: WEBAUTHN_USER_VERIFICATION_REQUIREMENT_REQUIRED,
+            dwFlags: 0,
+            pwszU2fAppId: std::ptr::null(),
+            pbU2fAppId: std::ptr::null_mut(),
+            pCancellationId: std::ptr::null_mut(),
+            pAllowCredentialList: allowed.as_ptr(),
+            dwCredLargeBlobOperation: 0,
+            cbCredLargeBlob: 0,
+            pbCredLargeBlob: std::ptr::null_mut(),
+            pHmacSecretSaltValues: &mut salt_values,
+            bBrowserInPrivateMode: FALSE,
+            pLinkedDevice: std::ptr::null_mut(),
+            bAutoFill: FALSE,
+            cbJsonExt: 0,
+            pbJsonExt: std::ptr::null_mut(),
+        };
+
+        let mut assertion: *mut WEBAUTHN_ASSERTION = std::ptr::null_mut();
+        let status = unsafe {
+            WebAuthNAuthenticatorGetAssertion(
+                self.window,
+                rp_id_w.as_ptr(),
+                &client,
+                &options,
+                &mut assertion,
+            )
+        };
+        if status != 0 || assertion.is_null() {
+            return Err(AuthenticatorError::Device(error_name(status)));
+        }
+
+        let (credential_id, authenticator_data, signature, secret) = unsafe {
+            let asserted = &*assertion;
+            let credential_id = std::slice::from_raw_parts(
+                asserted.Credential.pbId,
+                asserted.Credential.cbId as usize,
+            )
+            .to_vec();
+            let authenticator_data = std::slice::from_raw_parts(
+                asserted.pbAuthenticatorData,
+                asserted.cbAuthenticatorData as usize,
+            )
+            .to_vec();
+            let signature =
+                std::slice::from_raw_parts(asserted.pbSignature, asserted.cbSignature as usize)
+                    .to_vec();
+            let secret = if asserted.pHmacSecret.is_null() {
+                None
+            } else {
+                let output = &*asserted.pHmacSecret;
+                if output.pbFirst.is_null() || output.cbFirst as usize != HMAC_SECRET_LEN {
+                    None
+                } else {
+                    Some(
+                        std::slice::from_raw_parts(output.pbFirst, output.cbFirst as usize)
+                            .to_vec(),
+                    )
+                }
+            };
+            WebAuthNFreeAssertion(assertion);
+            (credential_id, authenticator_data, signature, secret)
+        };
+
+        let secret = secret.ok_or(AuthenticatorError::NoHmacOutput)?;
+        if !credentials.contains(&credential_id) {
+            return Err(AuthenticatorError::UnknownCredential);
+        }
+        Ok(ApprovedOpening {
+            approval: Approval {
+                credential_id: credential_id.clone(),
+                assertion: WebAuthnAssertion {
+                    authenticator_data,
+                    client_data_json,
+                    signature,
+                },
+            },
+            opened: Opened {
+                credential_id,
+                secret: SlotSecret::new(secret),
             },
         })
     }

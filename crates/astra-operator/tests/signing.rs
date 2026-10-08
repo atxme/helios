@@ -906,3 +906,159 @@ fn an_issuer_campaign_pins_the_exact_material_it_will_certify() {
     let (other, _, _) = delegation_request(2);
     assert!(result(signed(&other)).validate(&campaign).is_err());
 }
+
+/// An expired identity, asking to be recovered under the first key's
+/// credential (spec §7.5).
+fn expired_recovery_request(
+    credential_id: Vec<u8>,
+) -> aether::certificates::client::ExpiredCertificateRecoveryRequest {
+    let (expired_private, expired_public) = generate_ml_dsa_87_keypair().expect("expired key");
+    let (fresh_private, fresh_public) = generate_ml_dsa_87_keypair().expect("fresh key");
+    let client_key = WireGuardKey::from_bytes([0x33; 32]);
+    let tls = aether::certificates::test_x509::client_material("workstation");
+    let expired_pq_certificate = aether::key_negotiation::issue_pq_certificate(
+        aether::key_negotiation::PqCertificate {
+            version: aether::key_negotiation::PQ_CERTIFICATE_VERSION,
+            serial: [4; 16],
+            subject: "workstation".into(),
+            issuer: "helios-ca-pq".into(),
+            role: aether::key_negotiation::PqCertificateRole::Client,
+            wireguard_public_key: client_key.to_base64(),
+            ml_dsa_87_public_key: expired_public.to_base64(),
+            not_before_unix: NOW - 400 * 86_400,
+            not_after_unix: NOW - 86_400,
+            ml_dsa_87_signature: String::new(),
+        },
+        &expired_private,
+    )
+    .expect("expired leaf");
+    aether::certificates::client::ExpiredCertificateRecoveryRequest {
+        format_version: CERTIFICATE_FORMAT_VERSION,
+        protocol_version: aether::certificates::CERTIFICATE_PROTOCOL_VERSION,
+        trust_domain_id: domain(),
+        astra_challenge: [0x77; 32],
+        request_id: Id16::new([9; 16]).expect("request id"),
+        gateway_wg_public_key: gateway_key(),
+        server_name: SERVER_NAME.into(),
+        client_wg_public_key: client_key,
+        expired_generation: 4,
+        requested_generation: 5,
+        expired_tls_certificate: tls.leaf,
+        expired_pq_certificate,
+        tls_csr: tls.csr,
+        new_ml_dsa_87_public_key: fresh_public,
+        credential_id,
+        created_at: NOW,
+        expires_at: NOW + 120,
+        expired_pq_signature: MlDsa87Signature::placeholder(),
+        new_pq_signature: MlDsa87Signature::placeholder(),
+    }
+    .sign(&expired_private, &fresh_private)
+    .expect("signed request")
+}
+
+/// §7.5: one `GetAssertion` both approves the recovery and opens the vault.
+/// The operator touches the key once, and what comes out is an assertion
+/// over the exact request and a staging `CA-PQ` signed.
+#[test]
+fn an_expired_recovery_takes_a_single_touch() {
+    let first = FakeKey::new(1);
+    let second = FakeKey::new(2);
+    let vault = bootstrapped(&first, &second);
+    let opening = open(&first, &vault);
+    let registry = bindings(&vault, &opening);
+    let ca_tls = signing::issue_ca_tls(
+        &vault,
+        &opening,
+        &identity(),
+        NOW,
+        NOW + MAX_CA_TLS_LIFETIME_SECS,
+    )
+    .expect("CA-TLS");
+    drop(opening);
+    let request = expired_recovery_request(first.credential_ids()[0].clone());
+
+    let before = first.assertions();
+    let produced = signing::recover_expired_identity(
+        &vault,
+        &first,
+        PIN,
+        &identity(),
+        &registry,
+        &ca_tls,
+        &request,
+        "workstation",
+        TransitionWindow::new(NOW, NOW + 1, NOW + 7_200).expect("window"),
+        (NOW, NOW + 365 * 86_400),
+        Id16::new([5; 16]).expect("stage id"),
+        [6; 16],
+        ORIGIN,
+        NOW + 600,
+        NOW,
+    )
+    .expect("the recovery is authorized");
+
+    assert_eq!(
+        first.assertions() - before,
+        1,
+        "approval and derivation are one ceremony"
+    );
+    produced
+        .authorization
+        .next_pq_certificate
+        .verify(
+            ca_pq_public_key(&vault).as_bytes(),
+            aether::key_negotiation::PqCertificateRole::Client,
+            None,
+            &request.client_wg_public_key.to_base64(),
+            NOW,
+        )
+        .expect("the recovered leaf is CA-PQ's");
+    assert_eq!(
+        produced.evidence.approval.request_fingerprint,
+        request.fingerprint(),
+        "the assertion approves this request and no other"
+    );
+}
+
+/// A key that does not hold the credential the request names answers
+/// nothing: no assertion, so no secret either.
+#[test]
+fn an_expired_recovery_refuses_a_key_the_request_does_not_name() {
+    let first = FakeKey::new(1);
+    let second = FakeKey::new(2);
+    let vault = bootstrapped(&first, &second);
+    let opening = open(&first, &vault);
+    let registry = bindings(&vault, &opening);
+    let ca_tls = signing::issue_ca_tls(
+        &vault,
+        &opening,
+        &identity(),
+        NOW,
+        NOW + MAX_CA_TLS_LIFETIME_SECS,
+    )
+    .expect("CA-TLS");
+    drop(opening);
+    let request = expired_recovery_request(first.credential_ids()[0].clone());
+
+    let before = second.assertions();
+    assert!(signing::recover_expired_identity(
+        &vault,
+        &second,
+        PIN,
+        &identity(),
+        &registry,
+        &ca_tls,
+        &request,
+        "workstation",
+        TransitionWindow::new(NOW, NOW + 1, NOW + 7_200).expect("window"),
+        (NOW, NOW + 365 * 86_400),
+        Id16::new([5; 16]).expect("stage id"),
+        [6; 16],
+        ORIGIN,
+        NOW + 600,
+        NOW,
+    )
+    .is_err());
+    assert_eq!(second.assertions(), before);
+}

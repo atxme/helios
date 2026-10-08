@@ -54,6 +54,8 @@ pub struct DryRunBackend {
     /// If `true`, an IPv6 interface address is refused the way a kernel
     /// with `disable_ipv6 = 1` refuses it: after the interface was created.
     refuse_ipv6: bool,
+    /// If `true`, the IPv4-only retry after that refusal also fails.
+    fail_ipv4_retry: bool,
 }
 
 impl DryRunBackend {
@@ -83,6 +85,17 @@ impl DryRunBackend {
     pub fn without_ipv6() -> Self {
         Self {
             refuse_ipv6: true,
+            ..Self::default()
+        }
+    }
+
+    /// Variant whose IPv6 address and subsequent IPv4-only retry both fail.
+    /// Exercises the gateway's fatal second-failure path while preserving
+    /// the original IPv6 refusal in its error context.
+    pub fn without_ipv6_or_retry() -> Self {
+        Self {
+            refuse_ipv6: true,
+            fail_ipv4_retry: true,
             ..Self::default()
         }
     }
@@ -171,6 +184,13 @@ impl WireguardBackend for DryRunBackend {
                     ),
                 });
             }
+        }
+        if self.fail_ipv4_retry {
+            self.up.store(true, Ordering::SeqCst);
+            return Err(WgError::Interface {
+                iface: config.name.clone(),
+                source_msg: "[dry-run] IPv4-only retry refused (simulated)".into(),
+            });
         }
         *self.addresses.lock().unwrap() = config.addresses.clone();
         *self.peers.lock().unwrap() = peers.iter().map(InstalledPeer::from).collect();

@@ -704,11 +704,11 @@ la cause.
   couverte par les tests ; la pose réelle du slot sur WireGuard-NT et sur le
   backend noyau exige deux machines et les deux redirections
   ([TESTING](../testing/TESTING.md)).
-- **Le cycle Astra n'est pas encore implémenté.** Le code servi conserve les
-  certificats à 825 jours et ne prévient pas encore leur expiration. La cible
-  acceptée — planification à 80 %, récupération après expiration et campagnes
-  YubiKey — est fixée par l'[ADR-008](ADR-008-ASTRA-AUTORITE-CERTIFICATS.md) et
-  la spécification de rotation.
+- **Le cycle des certificats est porté par Astra.** Planification à 80 %,
+  récupération après expiration et campagnes YubiKey sont implémentées selon
+  l'[ADR-008](ADR-008-ASTRA-AUTORITE-CERTIFICATS.md) ; ce qui reste — deux
+  décisions et la validation sur cible — est au §12.5 de la
+  [spécification de rotation](../specification/ROTATION-CERTIFICATS.md#125-arbitrage-du-121-au-8-octobre-2026).
 - **Les catégories NIST ne sont pas homogènes.** Le KEM est en catégorie 5
   (ML-KEM-1024) et le KDF au-dessus, mais l'authentification reste en
   catégorie 3 (ML-DSA-65) : c'est désormais elle le maillon le plus bas du

@@ -29,17 +29,17 @@ pub struct RecoveryAuthorization {
 /// it, never the delegated issuer: a bounded online key that could revive an
 /// expired identity would be a key that can undo a validity period.
 ///
-/// # Limite connue : deux touchers plutôt qu'un
+/// # One touch
 ///
 /// §7.5 asks for a **single** `GetAssertion` carrying both the challenge and
-/// the PRF salt. [`Authenticator`] deliberately splits the two — `approve`
-/// takes no salt at all, which is what makes §14.1 hold by construction — so
-/// this gesture asks the same key, in the same session, twice. The security
-/// properties are the ones §7.5 names: same credential, same connection, and
-/// the assertion verified before the secret is used. What is missing is the
-/// convenience of one press. Merging them means a combined call in
-/// `aether-fido` and in **both** transports, neither of which can be exercised
-/// where this is built.
+/// the PRF salt, and [`Authenticator::approve_and_derive`] is that call: the
+/// assertion and the slot secret come out of the same ceremony, so the
+/// credential that approved is the credential that opens. `approve` keeps
+/// taking no salt — §14.1 still holds by construction for an ordinary
+/// renewal, which never reaches this function.
+///
+/// The secret is held, unused, until the assertion has verified under the
+/// credential's `CA-PQ`-signed row; a failed verification drops it unread.
 #[allow(clippy::too_many_arguments)]
 pub fn recover_expired_identity(
     vault: &AuthorityVault,
@@ -109,19 +109,20 @@ pub fn recover_expired_identity(
         },
     };
     let challenge = approval.challenge();
-    let answered = key.approve(
+    let answered = key.approve_and_derive(
         &vault.rp_id,
         std::slice::from_ref(&binding.credential_id),
         &client_data(&challenge, webauthn_origin),
+        &vault.salt()?,
         pin,
     )?;
-    if answered.credential_id != binding.credential_id {
+    if answered.approval.credential_id != binding.credential_id {
         return Err(GestureError::Anchors(
             "la clé a répondu pour un autre credential que celui que la demande nomme".into(),
         ));
     }
-    approval.assertion_fingerprint = answered.assertion.fingerprint();
-    approval.webauthn_assertion = answered.assertion;
+    approval.assertion_fingerprint = answered.approval.assertion.fingerprint();
+    approval.webauthn_assertion = answered.approval.assertion;
 
     // Verified before its session is trusted to unseal anything.
     verify_assertion(
@@ -134,7 +135,9 @@ pub fn recover_expired_identity(
         },
     )?;
 
-    let opening = crate::gestures::open_with_authorized_key(key, vault, pin)?;
+    // Only now is the secret of that same ceremony looked at.
+    let opening = answered.opened;
+    vault.slot_for_credential(&opening.credential_id)?;
     if opening.credential_id != binding.credential_id {
         return Err(GestureError::Anchors(
             "le key-slot ouvert n'appartient pas au credential qui a approuvé".into(),

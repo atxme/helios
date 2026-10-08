@@ -745,11 +745,11 @@ rapporter une réussite qu'il n'a pas vue. **Quatre touchers**, aussi : c'est le
 prix de l'ordonnancement, puisque la fenêtre de campagne interdit de résoudre
 les étapes suivantes d'avance.
 
-## 11. Ce qui n'a pas encore de commande
+## 11. Ce qui n'a pas de commande, par décision
 
-Nommé plutôt que passé sous silence : chacune de ces lignes est un geste qu'un
-opérateur pourrait avoir besoin de faire aujourd'hui, et qu'aucune commande ne
-fait.
+Le cycle de vie est complet ; ces trois gestes restent manuels **exprès**, et
+chacun dit pourquoi. Nommés plutôt que passés sous silence, pour qu'aucun ne
+soit pris pour un manque à combler.
 
 - **Les campagnes depuis la console** : « Renouveler les leafs du parc »,
   « toute la chaîne » et « Tourner les autorités » ouvrent une campagne Astra,

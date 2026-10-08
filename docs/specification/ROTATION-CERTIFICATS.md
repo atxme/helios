@@ -1,19 +1,19 @@
 # Spécification — cycle de vie et rotation des certificats v5
 
-**Statut** : cible spécifiée — **cycle de vie partiellement implémenté**
-(revu le 2026-08-09, amendé les 2026-08-15, 2026-08-16, 2026-08-22,
-2026-08-30, 2026-09-06 et 2026-09-29). Le protocole de négociation servi est déjà la v5. Le §12.3 nomme
-précisément ce qui est livré et ce qui ne l'est pas ; ne pas lire le reste de
-la note comme une capacité disponible, et ne pas déduire d'une liste raccourcie
-que le §12.1 est atteint — le §12.5 tranche cette question, et il répond non.
+**Statut** : **cycle de vie implémenté** (revu le 2026-08-09, amendé les
+2026-08-15, 2026-08-16, 2026-08-22, 2026-08-30, 2026-09-06 et 2026-09-29,
+clos le 2026-10-08). Le protocole de négociation servi est la v5. Le §12.3
+détaille ce qui est livré ; le §12.5 dit ce qui reste, et rien n'y est du
+développement : deux décisions prises et la validation sur les machines
+cibles du §14.2.
 
 Le chemin « demande → autorisation → persistance gateway → reçu → grant →
 commit » est fermé de bout en bout, sur les deux démons et dans les deux IHM.
 Le transport hors tunnel du compagnon (§8.2), la distribution des objets de
-transition (§0.6), la récupération d'une identité expirée (§7.5), le cycle
-complet de l'identité gateway (§5, §6, §11.1), les rotations d'ancres (§9.1,
-§9.4), les révocations d'urgence (§10) et les campagnes des quatre familles
-(§7.6) sont livrés. Ce qui manque est nommé au §12.5.
+transition (§0.6), la récupération d'une identité expirée en une seule
+cérémonie FIDO2 (§7.5), le cycle complet de l'identité gateway (§5, §6,
+§11.1), les rotations d'ancres (§9.1, §9.4), les révocations d'urgence (§10)
+et les campagnes des quatre familles (§7.6) sont livrés.
 
 ## 0. État de départ et décisions
 
@@ -3215,14 +3215,15 @@ contournés :
   n'est produisible et `RecoveryError::NoHistoricalProof` le dit — il reste la
   réadmission opérateur à deux credentials, qui crée une continuité neuve au
   lieu d'en prolonger une.
-  **Limite connue** : deux touchers plutôt qu'un. §7.5 demande une **seule**
-  cérémonie `GetAssertion` portant le challenge et le sel PRF ; `Authenticator`
-  sépare délibérément `approve` (sans sel, ce qui fait tenir §14.1 par
-  construction) et `derive`. Le compagnon interroge donc la même clé, dans la
-  même session, deux fois. Les propriétés que §7.5 nomme tiennent — même
-  credential, même connexion, assertion vérifiée avant emploi du secret ; ce
-  qui manque est le confort d'un seul appui, et le débloquer demande un appel
-  combiné dans `aether-fido` et dans **les deux** transports ;
+  L'approbation et l'ouverture du coffre sont **une seule** cérémonie
+  `GetAssertion` : `Authenticator::approve_and_derive` porte le
+  `clientDataJSON` de la récupération et le sel du coffre dans la même
+  requête, sur les deux transports (CTAP HID et `webauthn.dll`). Le secret
+  n'est employé qu'après vérification de l'assertion sous la ligne du
+  credential signée par `CA-PQ`. `approve` reste sans sel, ce qui fait
+  toujours tenir §14.1 par construction pour le renouvellement ordinaire. Le
+  grant, signé plus tard contre le reçu de la gateway, rouvre le coffre : il
+  ne tient pas le secret pendant l'attente réseau ;
 - l'**exécution d'une campagne d'autorité**. Une campagne sur les **leafs
   clientes** s'exécute désormais : quand un pair couvert envoie sa demande de
   rotation, `astra::renewal::open` retrouve l'opération approuvée par
@@ -3517,23 +3518,20 @@ Ces extensions ne peuvent augmenter le nombre de slots, ignorer une
 génération, prolonger le chevauchement, réactiver une leaf expirée ou révoquée,
 ni élargir une délégation Astra déjà signée.
 
-### 12.5 Arbitrage du §12.1, au 30 août 2026
+### 12.5 Arbitrage du §12.1, au 8 octobre 2026
 
-Le §12.1 énumère ce qu'il faut pour dire « cycle de vie implémenté ». **Ce
-n'est pas encore le cas**, et cette section existe pour que le raccourcissement
-progressif du §12.3 ne finisse pas par le faire croire.
-
-Trois points restent, et **aucun n'est du travail en attente** : la bascule du
-§13.1 est livrée, une installation neuve reçoit désormais sa feuille gateway de
-`CA-PQ`. Ce qui subsiste tient à des décisions prises, et les nommer comme des
-manques serait aussi trompeur que les taire :
+Le §12.1 est **atteint pour l'implémentation**. La cérémonie `GetAssertion`
+unique du §7.5, dernier point de développement, est livrée (§12.3). Ce qui
+subsiste n'est pas du travail en attente, et le nommer comme tel serait aussi
+trompeur que le taire :
 
 - **Le §13.2**, l'amorçage de confiance d'un parc v5 déjà déployé. La première
   installation de `CA-PQ` n'est pas la génération `N -> N+1` d'une rotation :
   elle exige une confirmation d'empreinte hors bande, faute de quoi la
   compromission de la leaf d'une seule gateway créerait une CA valable pour
   tout le parc. C'est une cérémonie humaine, et aucune commande ne peut la
-  remplacer. Elle reste une procédure opérateur documentée.
+  remplacer. Elle reste une procédure opérateur documentée. Une installation
+  neuve reçoit sa feuille gateway de `CA-PQ` (§13.1) et n'en a pas besoin.
 - **`POST /v1/campaigns`**, l'ouverture d'une campagne depuis l'origine
   publique. Le §11.6 dit pourquoi : cette route *résout* une campagne sur les
   cibles et générations courantes, donc sur un canal public non authentifié
@@ -3542,24 +3540,17 @@ manques serait aussi trompeur que les taire :
   serait construire le trou. La résolution reste locale — ce qui entraîne que
   les trois actions de campagne du §12.2 restent nommées par leur commande
   dans la console plutôt que portées par un bouton.
-- **La cérémonie `GetAssertion` unique du §7.5.** Le compagnon interroge la
-  même clé deux fois dans la même session, `approve` sans sel puis `derive`
-  avec. Les propriétés que le §7.5 nomme tiennent — même credential, même
-  connexion, assertion vérifiée avant tout emploi du secret ; ce qui manque est
-  le confort d'un seul appui. Le débloquer demande un appel combiné dans
-  `aether-fido` et dans les deux transports, sur le chemin le plus sensible du
-  produit et sans matériel pour l'éprouver.
+- **Le redémarrage après une bascule** reste un geste opérateur, par décision
+  (§12.3) : la feuille servie est descellée une seule fois, et le démon dit
+  quand un redémarrage est dû plutôt que de le faire.
 
-**Et un point ne sera pas tranché ici** : les essais d'intégration du §14.2
+**La validation sur cible reste à mener** : les essais d'intégration du §14.2
 supposent un vrai plan de données, un TPM et une clé FIDO2. Aucun ne peut
 tourner dans l'environnement de développement, et le `docs/testing/TESTING.md`
-dit quel environnement prouve quoi. Aucune revendication de validation
-matérielle n'est portée par cette note.
-
-C'est ce dernier point qui empêche de cocher le §12.1, et non les trois
-au-dessus : le §12.1 exige les tests du §14, et rien de ce qui est écrit ici ne
-les remplace. Le reste du cycle est en place ; ce qui manque est la preuve
-qu'il fonctionne sur la cible.
+dit quel environnement prouve quoi. Cette note ne porte aucune revendication
+de validation matérielle : le cycle est implémenté et testé au-dessus du
+matériel, sa preuve sur les machines cibles est une campagne d'essais, pas un
+chantier de développement.
 
 ## 13. Migration depuis la v5 actuellement servie
 

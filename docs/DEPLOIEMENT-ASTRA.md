@@ -73,7 +73,7 @@ seulement lequel des deux lots DPAPI est présenté. L'écran montre l'échéanc
 ce choix ; à `not_after`, l'ancienne feuille et ses clés sont retirées et une
 restauration de fichier ne les rend pas de nouveau sélectionnables.
 
-Ce qui **manque** encore :
+Ce qui reste **hors** de ce déploiement, et pourquoi :
 
 - l'**ouverture d'une campagne depuis l'origine publique** (`POST
   /v1/campaigns`) : cette route *résout* une campagne sur les cibles courantes,
@@ -83,9 +83,6 @@ Ce qui **manque** encore :
 - la **bascule de confiance du §13.2** pour un parc v5 déjà déployé : la
   première installation de `CA-PQ` est un amorçage, avec confirmation
   d'empreinte hors bande, et non une rotation `N -> N+1` ;
-- la **cérémonie FIDO2 unique** du §7.5 : le compagnon interroge la même clé
-  deux fois dans la même session, `approve` puis `derive`. Les propriétés de
-  sécurité tiennent ; ce qui manque est le confort d'un seul appui ;
 - le **terminateur TLS devant l'origine publique**. `astra run` sert du HTTP
   clair sur la boucle locale et ADR-008 §2 met un reverse proxy devant lui ; ce
   déploiement n'en pose aucun, et le pare-feu n'ouvre pas le port sur le WAN.

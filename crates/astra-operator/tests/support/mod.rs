@@ -20,7 +20,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use astra_operator::authenticator::{
-    Approval, Authenticator, AuthenticatorError, CredentialSubject, Opened, Registration,
+    Approval, ApprovedOpening, Authenticator, AuthenticatorError, CredentialSubject, Opened,
+    Registration,
 };
 use astra_operator::vault::SlotSecret;
 use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair as _};
@@ -50,6 +51,9 @@ pub struct FakeKey {
     serial: u8,
     credentials: RefCell<HashMap<Vec<u8>, Credential>>,
     minted: RefCell<u8>,
+    /// Every `GetAssertion` answered, whichever method asked. The number an
+    /// operator would count in touches.
+    assertions: RefCell<u32>,
 }
 
 impl FakeKey {
@@ -58,7 +62,13 @@ impl FakeKey {
             serial,
             credentials: RefCell::new(HashMap::new()),
             minted: RefCell::new(0),
+            assertions: RefCell::new(0),
         }
+    }
+
+    /// How many `GetAssertion` ceremonies this token has answered.
+    pub fn assertions(&self) -> u32 {
+        *self.assertions.borrow()
     }
 
     /// The credential identifiers this token holds, in minting order.
@@ -152,6 +162,7 @@ impl Authenticator for FakeKey {
             .ok_or(AuthenticatorError::UnknownCredential)?
             .clone();
         let secret = held[&credential_id].secret;
+        *self.assertions.borrow_mut() += 1;
 
         // `hmac-secret`, in shape if not in algorithm: a value determined by
         // the credential's secret and the salt, and by nothing else.
@@ -181,6 +192,7 @@ impl Authenticator for FakeKey {
             .find(|candidate| held.contains_key(*candidate))
             .ok_or(AuthenticatorError::UnknownCredential)?
             .clone();
+        *self.assertions.borrow_mut() += 1;
 
         // What an authenticator actually signs: `rpIdHash || flags ||
         // signCount`, then the SHA-256 of the client data appended to it.
@@ -208,5 +220,27 @@ impl Authenticator for FakeKey {
                 signature,
             },
         })
+    }
+
+    /// One ceremony, counted once: the two halves are what `approve` and
+    /// `derive` would have answered, without the second touch.
+    fn approve_and_derive(
+        &self,
+        rp_id: &str,
+        credentials: &[Vec<u8>],
+        client_data_json: &[u8],
+        salt: &[u8; 32],
+        pin: &str,
+    ) -> Result<ApprovedOpening, AuthenticatorError> {
+        let before = self.assertions();
+        let approval = self.approve(rp_id, credentials, client_data_json, pin)?;
+        let opened = self.derive(
+            rp_id,
+            std::slice::from_ref(&approval.credential_id),
+            salt,
+            pin,
+        )?;
+        *self.assertions.borrow_mut() = before + 1;
+        Ok(ApprovedOpening { approval, opened })
     }
 }
