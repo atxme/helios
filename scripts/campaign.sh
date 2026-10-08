@@ -123,8 +123,10 @@ done
 echo "==> Campagne"
 # `--only` absent : les scénarios de plan de données se signalent d'eux-mêmes
 # comme hors de portée, sans --wg-iface. C'est voulu — la sortie rappelle à
-# chaque exécution ce que le dry-run ne prouve pas.
-cargo run --quiet -p helios -- campaign \
+# chaque exécution ce que le dry-run ne prouve pas. Sans `--url`, `helios` vise
+# l'API du tunnel (100.64.0.1), absente en dry-run : la campagne parle au daemon
+# isolé ci-dessus.
+cargo run --quiet -p helios -- --url http://127.0.0.1:8080 campaign \
     --client-key "$CLIENT_PRIV" \
     --gateway-key "$GW_PUB" \
     "$@"
