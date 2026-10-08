@@ -33,7 +33,7 @@
 //! # What was asked is not what was applied
 //!
 //! The invariant protects what the adapter captures, and nothing more. On
-//! Windows, `defguard_wireguard_rs` 0.11 checks which address families the
+//! Windows, `defguard_wireguard_rs` 0.12 checks which address families the
 //! adapter carries and, for a missing one, **silently** skips its routes and
 //! addresses (`wgapi_windows.rs`, after `set_config`). A profile asking for
 //! `::/0` on an adapter without IPv6 then mounts without error, and IPv6 keeps
@@ -55,6 +55,13 @@
 //! assigns each address through netlink or `ifconfig` and returns a refusal
 //! as an error: `up()` then fails by name, adapter left mounted, so there is
 //! nothing silent to read back.
+//!
+//! The **routes** are another matter on Linux: since `defguard` 0.12, a route
+//! the kernel refuses for an `AllowedIPs` entry is a log line in
+//! `add_peer_routing`, and `configure_peer_routing` still returns `Ok`. The
+//! read-back there also lists the kernel routes through the adapter, and
+//! [`linux_expected_routes`] says which of the requested prefixes must be
+//! among them.
 
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -214,9 +221,17 @@ impl WireGuardBackend {
             observed: Observed::AllowedIps,
             applied: driver,
         }];
-        // The routes only on Windows: that is where `defguard` strips them.
-        // On Linux, a full tunnel is routed through a dedicated table and
-        // policy rules, so the main table would report a gap that is not one.
+        // The routes on Windows, where `defguard` strips them, and on Linux,
+        // where it only logs the ones the kernel refused. Linux compares a
+        // narrower list ([`linux_expected_routes`]): a full tunnel is routed
+        // through a dedicated table and policy rules, so the main table alone
+        // would report a gap that is not one.
+        #[cfg(target_os = "linux")]
+        observations.push(CaptureObservation {
+            source: "routes du noyau",
+            observed: Observed::KernelRoutes,
+            applied: kernel_routed_prefixes(&self.ifname),
+        });
         #[cfg(windows)]
         observations.push(CaptureObservation {
             source: "routes de l'adaptateur",
@@ -269,6 +284,134 @@ fn carried_addresses(ifname: &str) -> Result<Vec<IpAddrMask>, String> {
         .map_err(|e| format!("{e:#}"))
 }
 
+/// Whether `defguard` treats `prefix` as a family's default route: an
+/// unspecified address with a zero length, checked as it does.
+fn is_default_route(prefix: &IpAddrMask) -> bool {
+    prefix.address.is_unspecified() && prefix.cidr == 0
+}
+
+/// The requested prefixes a Linux read-back of the kernel routes must find.
+///
+/// Per family, as `defguard`'s `add_peer_routing` routes it: with a default
+/// route requested, the family goes through a dedicated fwmark table and no
+/// other prefix of that family gets a route; without one, each prefix is a
+/// main-table route on the adapter.
+///
+/// What the read can see sets the rest. `/proc/net/route` lists the main table
+/// only, so an IPv4 default is not observable there — and needs not be: its
+/// setup failing is an error `configure_peer_routing` returns. An IPv6 default
+/// failing is only a log line in `defguard`, and `/proc/net/ipv6_route` lists
+/// every table, so that one is expected. The read proves a route exists, not
+/// the policy rules that steer traffic to its table.
+fn linux_expected_routes(requested: &[IpAddrMask]) -> Vec<IpAddrMask> {
+    let default_v4 = requested
+        .iter()
+        .any(|prefix| prefix.address.is_ipv4() && is_default_route(prefix));
+    let default_v6 = requested
+        .iter()
+        .any(|prefix| prefix.address.is_ipv6() && is_default_route(prefix));
+    requested
+        .iter()
+        .filter(|prefix| match prefix.address {
+            IpAddr::V4(_) => !default_v4,
+            IpAddr::V6(_) => !default_v6 || is_default_route(prefix),
+        })
+        .cloned()
+        .collect()
+}
+
+/// The prefixes the Linux kernel routes through the adapter named `ifname`.
+#[cfg(target_os = "linux")]
+fn kernel_routed_prefixes(ifname: &str) -> Result<Vec<IpAddrMask>, String> {
+    let read = |path: &str| std::fs::read_to_string(path).map_err(|e| format!("{path} : {e}"));
+    let mut routed = parse_proc_net_route(&read("/proc/net/route")?, ifname)?;
+    routed.extend(parse_proc_net_ipv6_route(
+        &read("/proc/net/ipv6_route")?,
+        ifname,
+    )?);
+    Ok(routed)
+}
+
+/// The IPv4 main-table routes on `ifname`, from `/proc/net/route`.
+///
+/// Destination and mask are the kernel's big-endian words printed as native
+/// integers, hence `to_ne_bytes`. A line that does not parse makes the whole
+/// read fail: a skipped line could be the very route being checked.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_proc_net_route(text: &str, ifname: &str) -> Result<Vec<IpAddrMask>, String> {
+    let word = |field: &str| {
+        u32::from_str_radix(field, 16)
+            .map(|value| Ipv4Addr::from(value.to_ne_bytes()))
+            .map_err(|e| format!("/proc/net/route : `{field}` illisible : {e}"))
+    };
+    let mut routed = Vec::new();
+    for line in text.lines().skip(1).filter(|line| !line.trim().is_empty()) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 8 {
+            return Err(format!("/proc/net/route : ligne inattendue `{line}`"));
+        }
+        if fields[0] != ifname {
+            continue;
+        }
+        let mask = u32::from(word(fields[7])?);
+        if mask.leading_ones() != mask.count_ones() {
+            return Err(format!("/proc/net/route : masque non contigu `{line}`"));
+        }
+        let cidr = u8::try_from(mask.count_ones()).unwrap_or(u8::MAX);
+        routed.push(IpAddrMask::new(IpAddr::V4(word(fields[1])?), cidr));
+    }
+    Ok(routed)
+}
+
+/// The IPv6 routes on `ifname`, every table, from `/proc/net/ipv6_route`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_proc_net_ipv6_route(text: &str, ifname: &str) -> Result<Vec<IpAddrMask>, String> {
+    let mut routed = Vec::new();
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 10 {
+            return Err(format!("/proc/net/ipv6_route : ligne inattendue `{line}`"));
+        }
+        if fields[9] != ifname {
+            continue;
+        }
+        let destination = u128::from_str_radix(fields[0], 16)
+            .map_err(|e| format!("/proc/net/ipv6_route : `{}` illisible : {e}", fields[0]))?;
+        let cidr = u8::from_str_radix(fields[1], 16)
+            .ok()
+            .filter(|cidr| *cidr <= 128)
+            .ok_or_else(|| format!("/proc/net/ipv6_route : longueur `{}` illisible", fields[1]))?;
+        routed.push(IpAddrMask::new(
+            IpAddr::V6(Ipv6Addr::from(destination)),
+            cidr,
+        ));
+    }
+    Ok(routed)
+}
+
+/// The peers handed to `configure_peer_routing`.
+///
+/// On Linux, `defguard` 0.12 also routes each peer's endpoint through the
+/// physical default gateway — or blackholes it when there is none — in the
+/// main table, and nothing ever removes that route: it outlives `down()`, and
+/// blackholed it keeps the gateway unreachable on the next network. Linux does
+/// not need it: the full tunnel's own packets carry the fwmark that keeps them
+/// on the main table, as with `wg-quick`. Without an endpoint, a peer gets
+/// exactly the routing it had before 0.12. Elsewhere that route is what keeps
+/// a userspace full tunnel from routing its own packets into itself.
+fn routing_peers(peers: &[Peer]) -> Vec<Peer> {
+    peers
+        .iter()
+        .cloned()
+        .map(|mut peer| {
+            if cfg!(target_os = "linux") {
+                peer.endpoint = None;
+            }
+            peer
+        })
+        .collect()
+}
+
 /// What a read-back is compared with.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Observed {
@@ -281,6 +424,13 @@ enum Observed {
     /// variant is built by the tests alone.
     #[cfg_attr(not(windows), allow(dead_code))]
     Addresses,
+    /// The Linux kernel routes through the adapter: compared with the part of
+    /// `AllowedIPs` that [`linux_expected_routes`] says must be routed there.
+    ///
+    /// Only Linux reads it back, so elsewhere the variant is built by the
+    /// tests alone.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    KernelRoutes,
 }
 
 /// One read-back of the capture, and where it was read.
@@ -412,6 +562,10 @@ fn assess_capture(
             }
             (Ok(carried), Observed::Addresses) => {
                 absent.extend(missing_addresses(requested.addresses, carried));
+            }
+            (Ok(routed), Observed::KernelRoutes) => {
+                let expected = linux_expected_routes(requested.allowed_ips);
+                missing.extend(missing_allowed_ips(&expected, routed));
             }
             (Err(reason), _) => unread.push(format!("{} : {reason}", observation.source)),
         }
@@ -572,7 +726,7 @@ impl VpnBackend for WireGuardBackend {
         //    nothing, an absent interface would (ADR-001 §3 bis).
         api.configure_interface(&config)
             .map_err(|e| anyhow::anyhow!("configuration de l'interface : {e}"))?;
-        api.configure_peer_routing(&config.peers)
+        api.configure_peer_routing(&routing_peers(&config.peers))
             .map_err(|e| anyhow::anyhow!("routage du pair : {e}"))?;
 
         // The backend sees a filled or empty slot, never where the secret
@@ -863,7 +1017,7 @@ mod tests {
     fn the_profile_capture_checked_against_a_stripped_adapter() {
         // From the profile to the verdict, as `up()` chains them: the default
         // full tunnel, the driver holding both families, and Windows routing
-        // only IPv4 — what `defguard` 0.11 leaves after its family check.
+        // only IPv4 — what `defguard` 0.12 leaves after its family check.
         let peer = WireGuardBackend::build_peer(&profile()).unwrap();
         let check = assess(
             &peer.allowed_ips,
@@ -1187,5 +1341,128 @@ mod tests {
             }
             other => panic!("a missing address must be a warning, got {other:?}"),
         }
+    }
+
+    fn read_routes(list: &str) -> CaptureObservation {
+        CaptureObservation {
+            source: "routes du noyau",
+            observed: Observed::KernelRoutes,
+            applied: Ok(prefixes(list)),
+        }
+    }
+
+    #[test]
+    fn a_family_with_a_default_route_expects_no_other_route() {
+        // `defguard` routes the family through its fwmark table and skips
+        // the other prefixes; the IPv4 default lives outside the main table.
+        let expected = linux_expected_routes(&prefixes("0.0.0.0/0, 10.8.0.0/16, ::/0, fd00::/8"));
+        assert_eq!(named(expected), ["::/0"]);
+    }
+
+    #[test]
+    fn a_split_tunnel_expects_every_prefix() {
+        let expected = linux_expected_routes(&prefixes("10.8.0.0/16, 192.168.50.0/24, fd00::/8"));
+        assert_eq!(
+            named(expected),
+            ["10.8.0.0/16", "192.168.50.0/24", "fd00::/8"]
+        );
+    }
+
+    #[test]
+    fn a_route_the_kernel_refused_is_a_gap() {
+        // What `defguard` 0.12 only logs: the driver holds the prefix, the
+        // kernel never routed it.
+        let check = assess(
+            &prefixes("10.8.0.0/16, 192.168.50.0/24"),
+            &[
+                read("configuration du pilote", "10.8.0.0/16, 192.168.50.0/24"),
+                read_routes("10.8.0.0/16, 100.64.0.0/10"),
+            ],
+        );
+        assert_eq!(check, gap(&["192.168.50.0/24"]));
+    }
+
+    #[test]
+    fn the_default_full_tunnel_is_complete_with_the_ipv6_default_routed() {
+        let peer = WireGuardBackend::build_peer(&profile()).unwrap();
+        let check = assess(
+            &peer.allowed_ips,
+            &[
+                read("configuration du pilote", "0.0.0.0/0, ::/0"),
+                read_routes("::/0, fe80::/64"),
+            ],
+        );
+        assert_eq!(check, CaptureCheck::Complete);
+    }
+
+    #[test]
+    fn a_missing_ipv6_default_route_is_a_gap() {
+        // `defguard` logs a failed IPv6 default and returns `Ok`.
+        let peer = WireGuardBackend::build_peer(&profile()).unwrap();
+        let check = assess(
+            &peer.allowed_ips,
+            &[
+                read("configuration du pilote", "0.0.0.0/0, ::/0"),
+                read_routes("fe80::/64"),
+            ],
+        );
+        assert_eq!(check, gap(&["::/0"]));
+    }
+
+    #[cfg(target_endian = "little")]
+    #[test]
+    fn proc_net_route_lists_the_adapter_routes_only() {
+        let text =
+            "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n\
+            eth0\t00000000\t0102A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0\n\
+            orion0\t0000080A\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0\n\
+            orion0\t00004064\t00000000\t0001\t0\t0\t0\t0000C0FF\t0\t0\t0\n";
+        let routed = parse_proc_net_route(text, "orion0").unwrap();
+        assert_eq!(named(routed), ["10.8.0.0/16", "100.64.0.0/10"]);
+    }
+
+    #[cfg(target_endian = "little")]
+    #[test]
+    fn a_malformed_proc_net_route_line_fails_the_read() {
+        let text = "Iface\tDestination\n orion0\tzzzz\n";
+        assert!(parse_proc_net_route(text, "orion0").is_err());
+        let text = "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\n\
+            orion0\t0000080A\t00000000\t0001\t0\t0\t0\t00FF00FF\n";
+        let error = parse_proc_net_route(text, "orion0").unwrap_err();
+        assert!(error.contains("masque non contigu"), "{error}");
+    }
+
+    #[test]
+    fn proc_net_ipv6_route_lists_the_adapter_routes_from_every_table() {
+        let zero = "00000000000000000000000000000000";
+        let text = format!(
+            "{zero} 00 {zero} 00 {zero} 00000400 00000001 00000000 00000001   orion0\n\
+             fd3c91a27e0400000000000000000000 40 {zero} 00 {zero} 00000100 00000001 00000000 00000001   orion0\n\
+             fe800000000000000000000000000000 40 {zero} 00 {zero} 00000100 00000001 00000000 00000001     eth0\n"
+        );
+        let routed = parse_proc_net_ipv6_route(&text, "orion0").unwrap();
+        assert_eq!(named(routed), ["::/0", "fd3c:91a2:7e04::/64"]);
+    }
+
+    #[test]
+    fn a_malformed_proc_net_ipv6_route_line_fails_the_read() {
+        assert!(parse_proc_net_ipv6_route("short line   orion0\n", "orion0").is_err());
+        let zero = "00000000000000000000000000000000";
+        let text = format!("{zero} 99 {zero} 00 {zero} 0 0 0 0 orion0\n");
+        assert!(parse_proc_net_ipv6_route(&text, "orion0").is_err());
+    }
+
+    #[test]
+    fn the_endpoint_is_withheld_from_routing_on_linux_only() {
+        let peer = WireGuardBackend::build_peer(&profile()).unwrap();
+        let routed = routing_peers(std::slice::from_ref(&peer));
+        assert_eq!(routed[0].allowed_ips, peer.allowed_ips);
+        assert_eq!(routed[0].public_key, peer.public_key);
+        if cfg!(target_os = "linux") {
+            assert_eq!(routed[0].endpoint, None);
+        } else {
+            assert_eq!(routed[0].endpoint, peer.endpoint);
+        }
+        assert!(peer.endpoint.is_some(), "the interface keeps its endpoint");
     }
 }

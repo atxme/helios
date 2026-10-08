@@ -140,7 +140,7 @@ x25519-dalek = { version = "3", features = ["static_secrets"] }
 # Backend WireGuard unifié (noyau Linux via netlink, Windows, ou userspace
 # BoringTun) derrière une seule API. Optionnel : activé par la feature
 # `wireguard` d'orion-core / heliosd.
-defguard_wireguard_rs = "0.11"
+defguard_wireguard_rs = "0.12"
 
 aether = { path = "crates/aether" }
 astra = { path = "crates/astra" }
