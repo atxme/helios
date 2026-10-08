@@ -94,8 +94,8 @@ fn spawn_mtu_probe(
                 aether::mtu::MTU_MIN_IPV6
             ),
         }
-        // The clamp holds the IPv4 value: it is the only family the gateway
-        // forwards, and the firewall IR has no IPv6 clamp yet.
+        // The firewall derives the IPv6 clamp as IPv4 MSS - 20 and omits it
+        // when the measured tunnel MTU is below IPv6's 1280-byte minimum.
         let _ = event_tx.send(HeliosEvent::MtuDiscovered { mtu, mss });
         let _ = internal_tx.send(OrchestratorCmd::SetMssClamp(mss)).await;
     });

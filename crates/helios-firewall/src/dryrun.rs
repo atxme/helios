@@ -31,8 +31,11 @@ impl FirewallBackend for DryRunBackend {
         for rule in rs.masquerade_rules() {
             info!("  [postrouting] {rule}  # client Internet egress");
         }
-        if let Some(mss) = rs.mss_clamp {
-            info!("  (mangle) MSS clamping = {mss}");
+        for (family, mss) in rs.mss_clamps() {
+            info!(
+                "  (mangle) TCP SYN MSS clamping = {mss} for {family:?} crossing {}",
+                rs.wg_iface
+            );
         }
         Ok(())
     }

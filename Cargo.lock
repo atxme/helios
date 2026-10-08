@@ -4701,8 +4701,6 @@ dependencies = [
 [[package]]
 name = "rustables"
 version = "0.8.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9dcec6ec717f4e94e85d1a576e9ed696d933f4a89aff3d33d8363703ac97bc7d"
 dependencies = [
  "bindgen",
  "bitflags 2.13.2",

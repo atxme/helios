@@ -821,10 +821,25 @@ pub async fn firewall_rules_get(
         }
         lines.push("  }".to_string());
     }
-    if let Some(mss) = rs.mss_clamp {
-        lines.push(format!(
-            "  # MSS clamping requested ({mss}) — not applied by the Netlink backend"
-        ));
+    let mss_clamps: Vec<_> = rs.mss_clamps().collect();
+    if !mss_clamps.is_empty() {
+        lines.push("  chain mss {".to_string());
+        lines.push("    type filter hook forward priority mangle;".to_string());
+        for (family, value) in mss_clamps {
+            let family = match family {
+                helios_firewall::ruleset::AddressFamily::Ipv4 => "ipv4",
+                helios_firewall::ruleset::AddressFamily::Ipv6 => "ipv6",
+            };
+            for (iface_match, iface) in [
+                ("iifname", rs.wg_iface.as_str()),
+                ("oifname", rs.wg_iface.as_str()),
+            ] {
+                lines.push(format!(
+                    "    {iface_match} \"{iface}\" meta nfproto {family} meta l4proto tcp tcp flags & syn == syn tcp option maxseg size set {value}"
+                ));
+            }
+        }
+        lines.push("  }".to_string());
     }
     lines.push("}".to_string());
 

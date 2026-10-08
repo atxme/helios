@@ -27,13 +27,10 @@
 //! kill-switch was applied on a machine's very first startup and heliosd
 //! would stop — a behavior only a real-target trial could reveal.
 //!
-//! # Known limitation: MSS clamping
-//!
-//! Rewriting the TCP MSS option needs the nf_tables `exthdr` expression, which
-//! `rustables 0.8.7` neither models nor lets a downstream crate add. A ruleset
-//! requesting a clamp is therefore rejected during translation, before any
-//! Netlink message is sent. It must never be accepted and silently applied
-//! without the requested mangle action.
+//! MSS clamping uses a narrowly patched, vendored `rustables` expression for
+//! TCP-option writes. The write is guarded by address family, TCP protocol and
+//! SYN; Linux's `nft_exthdr` setter only lowers the advertised MSS, and updates
+//! the TCP checksum. The family-specific rules stay in the same atomic batch.
 
 mod expressions;
 mod maintenance;

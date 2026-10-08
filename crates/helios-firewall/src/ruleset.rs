@@ -194,6 +194,7 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Result<Ruleset> {
             .traffic_allowed()
             .then_some(policy.mss_clamp)
             .flatten(),
+        wg_iface: policy.wg_iface.clone(),
         // NAT follows the tunnel state exactly: applied with it, removed with
         // it. A masquerade that survived the tunnel going down would let out
         // in the clear what the kill-switch just cut off.
