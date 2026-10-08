@@ -84,7 +84,7 @@ pub mod x509;
 pub mod test_x509 {
     use super::encoding::DerCertificate;
     use rcgen::{
-        BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair,
+        BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, Issuer, KeyPair,
         KeyUsagePurpose,
     };
 
@@ -116,6 +116,7 @@ pub mod test_x509 {
         let authority = authority_params
             .self_signed(&authority_key)
             .expect("authority");
+        let authority_issuer = Issuer::from_params(&authority_params, &authority_key);
 
         let mut leaf_params = CertificateParams::new(Vec::<String>::new()).expect("params");
         leaf_params.is_ca = IsCa::NoCa;
@@ -131,7 +132,7 @@ pub mod test_x509 {
         let leaf_key = KeyPair::generate().expect("key");
         let csr = leaf_params.serialize_request(&leaf_key).expect("csr");
         let leaf = leaf_params
-            .signed_by(&leaf_key, &authority, &authority_key)
+            .signed_by(&leaf_key, &authority_issuer)
             .expect("leaf");
 
         TlsMaterial {

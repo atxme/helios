@@ -12,8 +12,8 @@ use aether::certificates::CERTIFICATE_FORMAT_VERSION;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use rcgen::{
-    CertificateParams, CertificateSigningRequestParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
-    KeyUsagePurpose,
+    CertificateParams, CertificateSigningRequestParams, ExtendedKeyUsagePurpose, IsCa, Issuer,
+    KeyPair, KeyUsagePurpose,
 };
 
 use super::fixtures::{grant, session, window};
@@ -45,7 +45,11 @@ fn delegated_grant(
     intermediate_params.not_after = seconds_since_epoch(window.not_after + 172_800);
     let intermediate_key = KeyPair::generate().expect("intermediate key");
     let intermediate = intermediate_params
-        .signed_by(&intermediate_key, &domain.tls_ca, &domain.tls_ca_key)
+        .signed_by(
+            &intermediate_key,
+            &Issuer::from_ca_cert_der(domain.tls_ca.der(), &domain.tls_ca_key)
+                .expect("CA-TLS issuer"),
+        )
         .expect("intermediate");
     let intermediate_der = DerCertificate::new(intermediate.der().to_vec()).expect("der");
 
@@ -63,7 +67,10 @@ fn delegated_grant(
         params,
         public_key: csr.public_key,
     }
-    .signed_by(&intermediate, &intermediate_key)
+    .signed_by(
+        &Issuer::from_ca_cert_der(intermediate.der(), &intermediate_key)
+            .expect("intermediate issuer"),
+    )
     .expect("delegated leaf");
 
     let (_, issuer_public) = generate_ml_dsa_87_keypair().expect("issuer key");

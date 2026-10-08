@@ -16,7 +16,7 @@ use clap::{Subcommand, ValueEnum};
 use orion_core::key_negotiation::KeyNegotiationClient;
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
-    KeyPair, KeyUsagePurpose,
+    Issuer, KeyPair, KeyUsagePurpose,
 };
 use rustls::pki_types::CertificateDer;
 use zeroize::Zeroizing;
@@ -422,17 +422,18 @@ pub fn issue_client_material_with_validity(
     check_private_permissions(ca_private_key_path)?;
     check_private_permissions(ca_pq_private_key_path)?;
     aether::wg::validate_key(wireguard_public_key).context("invalid WireGuard public key")?;
-    let ca_der = read(ca_certificate_path)?;
-    let ca_params = CertificateParams::from_ca_cert_der(&CertificateDer::from(ca_der))
+    let ca_certificate =
+        aether::certificates::encoding::DerCertificate::new(read(ca_certificate_path)?)
+            .context("parsing the client CA certificate")?;
+    let ca_facts = aether::certificates::x509::inspect(&ca_certificate)
         .context("parsing the client CA certificate")?;
     anyhow::ensure!(
-        matches!(ca_params.is_ca, IsCa::Ca(_)),
+        ca_facts.is_certificate_authority,
         "issuer certificate is not a CA"
     );
     let ca_key_der = Zeroizing::new(read(ca_private_key_path)?);
     let ca_key = KeyPair::try_from(ca_key_der.as_slice()).context("parsing the client CA key")?;
-    let ca = ca_params
-        .self_signed(&ca_key)
+    let ca = Issuer::from_ca_cert_der(&CertificateDer::from(ca_certificate.as_bytes()), &ca_key)
         .context("reconstructing the client CA issuer")?;
 
     let mut params = CertificateParams::new(Vec::<String>::new())?;
@@ -443,7 +444,7 @@ pub fn issue_client_material_with_validity(
     set_validity_secs(&mut params, validity_secs);
     let key = KeyPair::generate().context("generating the Orion client key")?;
     let certificate = params
-        .signed_by(&key, &ca, &ca_key)
+        .signed_by(&key, &ca)
         .context("issuing the Orion client certificate")?;
 
     let ca_pq_private_key = Zeroizing::new(read(ca_pq_private_key_path)?);

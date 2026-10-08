@@ -463,7 +463,7 @@ mod tests {
     use super::*;
     use rcgen::{
         BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose,
-        IsCa, KeyPair, KeyUsagePurpose,
+        IsCa, Issuer, KeyPair, KeyUsagePurpose,
     };
 
     fn name(common: &str) -> DistinguishedName {
@@ -500,7 +500,8 @@ mod tests {
         params.distinguished_name = name("workstation");
         let key = KeyPair::generate().expect("key");
         let csr = params.serialize_request(&key).expect("csr");
-        let leaf = params.signed_by(&key, issuer, issuer_key).expect("leaf");
+        let issuer = Issuer::from_ca_cert_der(issuer.der(), issuer_key).expect("issuer");
+        let leaf = params.signed_by(&key, &issuer).expect("leaf");
         (
             DerCertificate::new(leaf.der().to_vec()).expect("der"),
             DerCertificate::new(csr.der().to_vec()).expect("der"),
@@ -612,8 +613,9 @@ mod tests {
         // self-issued.
         let key = KeyPair::generate().expect("key");
         let (_, issuer, _) = authority("CA-TLS");
+        let issuer = Issuer::from_ca_cert_der(issuer.der(), &key).expect("issuer");
         let certificate = params
-            .signed_by(&key, &issuer, &key)
+            .signed_by(&key, &issuer)
             .expect("self-signed under another name");
         let der = DerCertificate::new(certificate.der().to_vec()).expect("der");
         assert!(matches!(
@@ -633,7 +635,8 @@ mod tests {
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
         params.distinguished_name = name("workstation");
         let key = KeyPair::generate().expect("key");
-        let leaf = params.signed_by(&key, &ca, &ca_key).expect("leaf");
+        let issuer = Issuer::from_ca_cert_der(ca.der(), &ca_key).expect("issuer");
+        let leaf = params.signed_by(&key, &issuer).expect("leaf");
         let leaf = DerCertificate::new(leaf.der().to_vec()).expect("der");
         let now = inside(&leaf);
         assert!(matches!(
@@ -652,8 +655,9 @@ mod tests {
         params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
         params.distinguished_name = name("astra-issuer");
         let intermediate_key = KeyPair::generate().expect("key");
+        let issuer = Issuer::from_ca_cert_der(ca.der(), &ca_key).expect("issuer");
         let intermediate = params
-            .signed_by(&intermediate_key, &ca, &ca_key)
+            .signed_by(&intermediate_key, &issuer)
             .expect("intermediate");
         let intermediate_der = DerCertificate::new(intermediate.der().to_vec()).expect("der");
 
