@@ -18,7 +18,7 @@ pub const WIREGUARD_NT_SHA256: &str =
     "dceb30a9bc4be48cce0f74160fc88a585a2c2627366e8f846fc6658f9038dace";
 pub const MAX_WIREGUARD_ARCHIVE_BYTES: u64 = 16 * 1024 * 1024;
 
-/// Output names are imposed by `defguard_wireguard_rs 0.11.0`, not by the
+/// Output names are imposed by `defguard_wireguard_rs 0.12`, not by the
 /// Orion bundler. Its Windows backend opens them relative to the current
 /// directory under `resources-windows/binaries/`.
 pub const WIREGUARD_FILES: &[(&str, &str)] = &[

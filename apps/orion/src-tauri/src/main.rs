@@ -2564,7 +2564,7 @@ fn associated_profile_paths(args: &[String], cwd: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// `defguard_wireguard_rs 0.11.0` opens WireGuardNT via a relative path fixed
+/// `defguard_wireguard_rs 0.12` opens WireGuardNT via a relative path fixed
 /// in its source. A double-click gives Orion a current directory that may
 /// be the profile's; we replace it before building the backend.
 #[cfg(all(target_os = "windows", feature = "wireguard"))]

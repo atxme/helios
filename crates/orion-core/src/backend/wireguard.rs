@@ -33,7 +33,7 @@
 //! # What was asked is not what was applied
 //!
 //! The invariant protects what the adapter captures, and nothing more. On
-//! Windows, `defguard_wireguard_rs` 0.11 checks which address families the
+//! Windows, `defguard_wireguard_rs` 0.12 checks which address families the
 //! adapter carries and, for a missing one, **silently** skips its routes and
 //! addresses (`wgapi_windows.rs`, after `set_config`). A profile asking for
 //! `::/0` on an adapter without IPv6 then mounts without error, and IPv6 keeps
@@ -863,7 +863,7 @@ mod tests {
     fn the_profile_capture_checked_against_a_stripped_adapter() {
         // From the profile to the verdict, as `up()` chains them: the default
         // full tunnel, the driver holding both families, and Windows routing
-        // only IPv4 — what `defguard` 0.11 leaves after its family check.
+        // only IPv4 — what `defguard` 0.12 leaves after its family check.
         let peer = WireGuardBackend::build_peer(&profile()).unwrap();
         let check = assess(
             &peer.allowed_ips,
