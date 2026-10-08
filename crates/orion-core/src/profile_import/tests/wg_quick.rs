@@ -176,3 +176,47 @@ fn refuses_an_unroutable_profile() {
         .to_string()
         .contains("supérieur à zéro"));
 }
+
+/// A file that states no `AllowedIPs` gets the full tunnel, both families.
+///
+/// Without `::/0` a dual-stack machine sends its IPv6 around the tunnel, in
+/// clear, while the tunnel is up.
+#[test]
+fn an_absent_allowed_ips_imports_as_the_dual_stack_full_tunnel() {
+    let contents = format!(
+        "[Interface]\nPrivateKey={CLIENT_PRIVATE}\nAddress=100.64.1.2/32\n[Peer]\nPublicKey={GATEWAY_PUBLIC}\nEndpoint=host:51820"
+    );
+    let profile = parse_profile_import(&contents, "sans-allowedips.conf")
+        .expect("import")
+        .profile;
+    assert_eq!(profile.allowed_ips, "0.0.0.0/0, ::/0");
+    assert!(!profile.ipv6_uncaptured_full_tunnel());
+}
+
+/// A file that states `0.0.0.0/0` alone is imported as written, and named.
+///
+/// Widening it on the way in would route traffic its author did not list;
+/// the import is a draft the user reviews, and the flag is what the screen
+/// warns with.
+#[test]
+fn an_ipv4_only_full_tunnel_is_imported_as_written_and_flagged() {
+    let contents = format!(
+        "[Interface]\nPrivateKey={CLIENT_PRIVATE}\nAddress=100.64.1.2/32\n[Peer]\nPublicKey={GATEWAY_PUBLIC}\nEndpoint=host:51820\nAllowedIPs=0.0.0.0/0"
+    );
+    let profile = parse_profile_import(&contents, "ipv4.conf")
+        .expect("import")
+        .profile;
+    assert_eq!(profile.allowed_ips, "0.0.0.0/0");
+    assert!(profile.ipv6_uncaptured_full_tunnel());
+
+    // The usual `wg-quick` spelling of the dual-stack tunnel lands in the
+    // canonical form, flag down.
+    let contents = format!(
+        "[Interface]\nPrivateKey={CLIENT_PRIVATE}\nAddress=100.64.1.2/32\n[Peer]\nPublicKey={GATEWAY_PUBLIC}\nEndpoint=host:51820\nAllowedIPs=0.0.0.0/0,::/0"
+    );
+    let profile = parse_profile_import(&contents, "dual.conf")
+        .expect("import")
+        .profile;
+    assert_eq!(profile.allowed_ips, crate::DEFAULT_ALLOWED_IPS);
+    assert!(!profile.ipv6_uncaptured_full_tunnel());
+}

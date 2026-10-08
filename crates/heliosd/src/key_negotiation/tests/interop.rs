@@ -91,12 +91,38 @@ impl orion_core::key_negotiation::IdentityProvider for TestIdentities {
 /// for, and nothing below the wire would say so.
 #[tokio::test]
 async fn the_gateway_and_orion_derive_the_same_psk() {
-    end_to_end_negotiation(GatewayLeaf::SelfSigned).await;
+    end_to_end_negotiation(GatewayLeaf::SelfSigned, ClientFamily::Ipv4).await;
 }
 
 #[tokio::test]
 async fn the_gateway_and_orion_derive_the_same_psk_under_a_trust_domain() {
-    end_to_end_negotiation(GatewayLeaf::IssuedByCaPq).await;
+    end_to_end_negotiation(GatewayLeaf::IssuedByCaPq, ClientFamily::Ipv4).await;
+}
+
+/// The same exchange from an Orion that reaches the gateway over IPv6: an
+/// IPv6-only uplink, or a profile naming a `[v6]:port` endpoint. The
+/// listener is the one `heliosd` opens, so the IPv4 tests above prove it
+/// still answers IPv4 and this one proves it now answers IPv6 too.
+#[tokio::test]
+async fn the_gateway_and_orion_derive_the_same_psk_over_ipv6() {
+    end_to_end_negotiation(GatewayLeaf::SelfSigned, ClientFamily::Ipv6).await;
+}
+
+/// The address family Orion reaches the dual-stack listener on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientFamily {
+    Ipv4,
+    Ipv6,
+}
+
+impl ClientFamily {
+    /// The endpoint string a profile would carry for this family.
+    fn endpoint(self, port: u16) -> String {
+        match self {
+            Self::Ipv4 => format!("127.0.0.1:{port}"),
+            Self::Ipv6 => format!("[::1]:{port}"),
+        }
+    }
 }
 
 /// Which authority signs the leaf the gateway serves.
@@ -106,7 +132,7 @@ enum GatewayLeaf {
     IssuedByCaPq,
 }
 
-async fn end_to_end_negotiation(leaf: GatewayLeaf) {
+async fn end_to_end_negotiation(leaf: GatewayLeaf, family: ClientFamily) {
     use aether::key_negotiation::PqCertificateRole;
 
     let gateway_wg = aether::wg::generate_keypair().unwrap();
@@ -148,6 +174,7 @@ async fn end_to_end_negotiation(leaf: GatewayLeaf) {
         name: "orion".into(),
         public_key: client_wg.public_key.clone(),
         address: "100.64.1.2/32".into(),
+        address_v6: None,
         admin: false,
         preshared_key: None,
         key_negotiation_certificate_sha256: Some(
@@ -177,12 +204,25 @@ async fn end_to_end_negotiation(leaf: GatewayLeaf) {
         transactions: Mutex::new(TransactionState::default()),
     });
 
-    let server = aether_key_negotiation::server_endpoint(
-        "127.0.0.1:0".parse().unwrap(),
+    // The listener `start` opens, not a loopback-only stand-in.
+    let (server, families) = aether_key_negotiation::dual_stack_server_endpoint(
+        0,
         &tls.server,
         std::slice::from_ref(&tls.ca_der),
     )
     .unwrap();
+    if family == ClientFamily::Ipv6 {
+        // Without IPv6 there is nothing to prove, and nothing must pass as if
+        // it had been proven: the skip is named on stderr.
+        if let ListenFamilies::Ipv4Only { reason } = &families {
+            eprintln!("SKIPPED: the listener serves IPv4 only on this host ({reason})");
+            return;
+        }
+        if let Err(error) = std::net::UdpSocket::bind("[::1]:0") {
+            eprintln!("SKIPPED: [::1] cannot be bound on this host ({error})");
+            return;
+        }
+    }
     let address = server.local_addr().unwrap();
     let served = tokio::spawn(aether_key_negotiation::serve(server, handler));
 
@@ -196,14 +236,14 @@ async fn end_to_end_negotiation(leaf: GatewayLeaf) {
     });
     let profile = orion_core::ClientProfile {
         name: "orion".into(),
-        endpoint: format!("127.0.0.1:{}", address.port()),
+        endpoint: family.endpoint(address.port()),
         private_key: client_wg.private_key.expose().to_string(),
         peer_public_key: gateway_wg.public_key.clone(),
         address: Some("100.64.1.2/32".into()),
         key_negotiation: Some(orion_core::KeyNegotiationSettings {
             mode: ProtectionMode::MlKem,
             minimum_mode: ProtectionMode::MlKem,
-            endpoint: format!("127.0.0.1:{}", address.port()),
+            endpoint: family.endpoint(address.port()),
             server_name: "localhost".into(),
             gateway_ca_der: base64::engine::general_purpose::STANDARD.encode(&tls.ca_der),
             gateway_pq_certificate: base64::engine::general_purpose::STANDARD

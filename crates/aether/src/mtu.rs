@@ -51,6 +51,65 @@ pub const MTU_PLANCHER: u32 = 576;
 /// Default MTU of a transport whose value could not be read.
 pub const MTU_TRANSPORT_DEFAUT: u32 = 1500;
 
+/// Smallest MTU a link must offer to carry IPv6 (RFC 8200 §5).
+///
+/// Unlike [`MTU_PLANCHER`], this is not a floor the computation applies: a
+/// tunnel narrower than this still carries IPv4. Linux removes IPv6 from an
+/// interface whose MTU drops below it, so the gateway does not install its
+/// IPv6 tunnel address on such an interface (`ADRESSAGE-IPV6.md` §6.2).
+pub const MTU_MIN_IPV6: u32 = 1280;
+
+/// Whether a tunnel of this MTU can carry IPv6.
+///
+/// ```
+/// use aether::mtu::{carries_ipv6, tunnel_mtu};
+/// assert!(carries_ipv6(tunnel_mtu(1500)));
+/// assert!(!carries_ipv6(tunnel_mtu(1280))); // WSL2: IPv4 only
+/// ```
+pub fn carries_ipv6(tunnel_mtu: u32) -> bool {
+    tunnel_mtu >= MTU_MIN_IPV6
+}
+
+/// IPv4 (20) and TCP (20) headers without options, in bytes.
+pub const TCP_IPV4_HEADERS: u32 = 40;
+
+/// IPv6 (40) and TCP (20) headers without options, in bytes.
+pub const TCP_IPV6_HEADERS: u32 = 60;
+
+/// MSS of TCP over IPv4 inside a tunnel of this MTU.
+///
+/// The argument is the **tunnel** MTU — what [`tunnel_mtu`] returns and the
+/// interface carries — not the transport's: the WireGuard overhead is already
+/// out of it. Saturates at `u16::MAX`, the largest MSS TCP can announce.
+///
+/// ```
+/// use aether::mtu::{mss_ipv4, tunnel_mtu};
+/// assert_eq!(mss_ipv4(tunnel_mtu(1500)), 1380);
+/// ```
+pub fn mss_ipv4(tunnel_mtu: u32) -> u16 {
+    saturate_mss(tunnel_mtu.saturating_sub(TCP_IPV4_HEADERS))
+}
+
+/// MSS of TCP over IPv6 inside a tunnel of this MTU, or `None` when the
+/// tunnel cannot carry IPv6 at all ([`carries_ipv6`]).
+///
+/// Twenty bytes below [`mss_ipv4`]: an IPv6 header is 40 bytes, not 20.
+/// Reusing the IPv4 value for IPv6 would announce segments 20 bytes too large
+/// for the tunnel.
+///
+/// ```
+/// use aether::mtu::{mss_ipv6, tunnel_mtu};
+/// assert_eq!(mss_ipv6(tunnel_mtu(1500)), Some(1360));
+/// assert_eq!(mss_ipv6(tunnel_mtu(1280)), None); // WSL2: IPv4 only
+/// ```
+pub fn mss_ipv6(tunnel_mtu: u32) -> Option<u16> {
+    carries_ipv6(tunnel_mtu).then(|| saturate_mss(tunnel_mtu - TCP_IPV6_HEADERS))
+}
+
+fn saturate_mss(mss: u32) -> u16 {
+    u16::try_from(mss).unwrap_or(u16::MAX)
+}
+
 /// MTU to set on the WireGuard interface, derived from the MTU of the link
 /// carrying it.
 ///
@@ -93,6 +152,63 @@ mod tests {
         // must stay under this limit to also cover IPv6.
         let measured_ipv4_limit = 1280 - 60;
         assert!(tunnel_mtu(1280) <= measured_ipv4_limit);
+    }
+
+    #[test]
+    fn ipv6_needs_a_transport_of_at_least_1360_bytes() {
+        // 1360 − 80 = 1280, the IPv6 minimum: one byte less and the tunnel
+        // is IPv4-only.
+        assert!(carries_ipv6(tunnel_mtu(1360)));
+        assert!(!carries_ipv6(tunnel_mtu(1359)));
+        assert!(carries_ipv6(tunnel_mtu(1492)), "PPPoE still carries IPv6");
+    }
+
+    #[test]
+    fn the_mss_depends_on_the_inner_family() {
+        // Ethernet: 1420 in the tunnel, 1380 over IPv4, 1360 over IPv6.
+        let mtu = tunnel_mtu(1500);
+        assert_eq!(mss_ipv4(mtu), 1380);
+        assert_eq!(mss_ipv6(mtu), Some(1360));
+        assert_eq!(
+            u32::from(mss_ipv4(mtu)) - u32::from(mss_ipv6(mtu).unwrap()),
+            20,
+            "the IPv6 header is 20 bytes larger"
+        );
+    }
+
+    #[test]
+    fn a_full_segment_fills_the_tunnel_exactly() {
+        // MSS + headers = tunnel MTU, for both families: one byte more and
+        // the segment no longer fits in the interface.
+        for transport in [1360, 1492, 1500, 9000] {
+            let mtu = tunnel_mtu(transport);
+            assert_eq!(u32::from(mss_ipv4(mtu)) + TCP_IPV4_HEADERS, mtu);
+            assert_eq!(u32::from(mss_ipv6(mtu).unwrap()) + TCP_IPV6_HEADERS, mtu);
+        }
+    }
+
+    #[test]
+    fn no_ipv6_mss_below_the_ipv6_minimum() {
+        // The threshold is the one `carries_ipv6` applies, on the tunnel MTU.
+        assert_eq!(mss_ipv6(MTU_MIN_IPV6), Some(1220));
+        assert_eq!(mss_ipv6(MTU_MIN_IPV6 - 1), None);
+        assert_eq!(mss_ipv6(tunnel_mtu(1280)), None);
+        // IPv4 still has one there.
+        assert_eq!(mss_ipv4(tunnel_mtu(1280)), 1160);
+    }
+
+    #[test]
+    fn the_floor_mtu_gives_the_classic_ipv4_mss() {
+        // 576 − 40 = 536, the default MSS of RFC 879.
+        assert_eq!(mss_ipv4(tunnel_mtu(0)), 536);
+        assert_eq!(mss_ipv6(tunnel_mtu(0)), None);
+    }
+
+    #[test]
+    fn the_mss_saturates_instead_of_wrapping() {
+        assert_eq!(mss_ipv4(0), 0);
+        assert_eq!(mss_ipv4(u32::MAX), u16::MAX);
+        assert_eq!(mss_ipv6(u32::MAX), Some(u16::MAX));
     }
 
     #[test]

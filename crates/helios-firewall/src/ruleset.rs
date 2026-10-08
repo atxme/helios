@@ -19,7 +19,13 @@
 //!   `wan_iface`, for hosts located *behind* the gateway;
 //! * **road-warrior**, behind `allow_client_internet`: `forward` from
 //!   `wg_iface` to `wan_iface`, plus a masquerade in `postrouting`, for a
-//!   client arriving *through* the tunnel.
+//!   client arriving *through* the tunnel. Both are IPv4-only
+//!   (`meta nfproto ipv4`): the table is `inet`, and the gateway neither
+//!   relays nor NATs IPv6, see [`MasqueradeRule`].
+//!
+//! A tunnel client's IPv6 bound for a WAN is not left to the `drop` policy
+//! either: it is rejected with `icmpx admin-prohibited`, in every state, so
+//! that the client falls back to IPv4 at once (module `client_ipv6_egress`).
 //!
 //! The second is closed by default. A gateway granting access to internal
 //! resources has no reason to route Internet traffic, and opening it would
@@ -54,16 +60,19 @@
 
 mod administration;
 mod astra_channel;
+mod client_ipv6_egress;
 mod gateway_wan;
 mod kill_switch;
+mod link_ipv6;
 mod meshnet;
 mod nftables;
 mod transport;
 mod tunnel_interface;
 
 pub use nftables::{
-    Action, AddressFamily, ChainKind, ConnectionState, ConnectionStates, Counter, LogAction, Match,
-    RateLimit, RateLimitMode, RateUnit, Rule, Ruleset, Verdict, L4,
+    Action, AddressFamily, ChainKind, ConnectionState, ConnectionStates, Counter, DefaultVerdict,
+    Icmpv6Type, LogAction, MasqueradeRule, Match, RateLimit, RateLimitMode, RateUnit, Rule,
+    Ruleset, Verdict, L4,
 };
 
 use aether::{FirewallPolicy, HeliosError, Result, TunnelState, SPEEDTEST_PORT};
@@ -78,13 +87,37 @@ const PRIVATE_IPV4_CIDRS: [&str; 4] = [
     "192.168.0.0/16",
 ];
 
+/// The IPv6 counterpart of [`PRIVATE_IPV4_CIDRS`]: unique local addresses
+/// (RFC 4193) and link-local addresses (RFC 4291).
+///
+/// NordVPN hands out IPv4 Meshnet addresses only, so there is no NordVPN
+/// IPv6 classification to mirror: these are the two scopes IPv6 reserves for
+/// local use.
+const PRIVATE_IPV6_CIDRS: [&str; 2] = ["fc00::/7", "fe80::/10"];
+
+/// The local networks of one address family.
+///
+/// A drop pairing a source of one family with a destination of the other can
+/// never match, so a peer's local-network denial must use its own family's
+/// list: the IPv4 list alone would leave an IPv6 peer's local networks open.
+fn local_networks(family: AddressFamily) -> &'static [&'static str] {
+    match family {
+        AddressFamily::Ipv4 => &PRIVATE_IPV4_CIDRS,
+        AddressFamily::Ipv6 => &PRIVATE_IPV6_CIDRS,
+    }
+}
+
 /// Builds the ruleset for `(policy, state)`.
 ///
 /// Invariants, regardless of state:
 /// * loopback and established/related traffic always accepted;
 /// * the WireGuard listening port stays reachable, without which no client
 ///   could (re)establish the tunnel;
-/// * LAN -> WAN forwarding is only open in the `Up` state.
+/// * IPv6 neighbor discovery and MLD on every WAN and LAN interface, router
+///   discovery on the WANs only (module `link_ipv6`);
+/// * LAN -> WAN forwarding is only open in the `Up` state;
+/// * IPv6 from the tunnel interface to a WAN is rejected, last of `forward`
+///   (module `client_ipv6_egress`).
 pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Result<Ruleset> {
     use ChainKind::{Forward, Input, Output};
     let mut rules = Vec::new();
@@ -137,17 +170,21 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Result<Ruleset> {
     transport::site_to_site_peers(&mut rules, policy, &wan_ifaces)?;
     gateway_wan::dhcp_lease_renewal(&mut rules, policy, &wan_ifaces);
     gateway_wan::gateway_own_egress(&mut rules, policy, &wan_ifaces);
+    link_ipv6::link_control(&mut rules, policy, &wan_ifaces);
     meshnet::nordvpn_meshnet(&mut rules, policy, &wan_ifaces)?;
     tunnel_interface::openings(&mut rules, policy);
     administration::ssh_sources(&mut rules, policy)?;
     administration::out_of_band_admin_ifaces(&mut rules, policy);
     kill_switch::state_gated_openings(&mut rules, policy, state, &wan_ifaces)?;
+    // Last of `forward`, in every state: after every opening, before the
+    // chain policy.
+    client_ipv6_egress::reject(&mut rules, policy, &wan_ifaces);
 
     // In fail-open, the default policy becomes accept outside the tunnel (not recommended).
     let default_verdict = if policy.is_fail_closed() || state.traffic_allowed() {
-        Verdict::Drop
+        DefaultVerdict::Drop
     } else {
-        Verdict::Accept
+        DefaultVerdict::Accept
     };
 
     Ok(Ruleset {
@@ -178,12 +215,41 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Result<Ruleset> {
 }
 
 /// Parses a policy address before it can enter the structured IR.
-pub(super) fn network(value: &str) -> Result<IpNetwork> {
+///
+/// Public so that a caller accepting an address bound for the policy — the
+/// API's split-tunnel route — refuses it with this exact rule, rather than
+/// with a second parser that could accept what [`render`] then refuses.
+pub fn parse_network(value: &str) -> Result<IpNetwork> {
     value.parse().map_err(|error| {
         HeliosError::Firewall(format!(
             "invalid IP network `{value}` in firewall policy: {error}"
         ))
     })
+}
+
+/// Every state a policy can be rendered for, in the order of
+/// [`TunnelState`]'s declaration.
+const TUNNEL_STATES: [TunnelState; 5] = [
+    TunnelState::Down,
+    TunnelState::Connecting,
+    TunnelState::Up,
+    TunnelState::Failed,
+    TunnelState::CaptivePortal,
+];
+
+/// Compiles `policy` for every tunnel state, keeping none of the rulesets.
+///
+/// [`render`] only reads the fields the given state uses: the split-tunnel
+/// CIDRs, for instance, only in `Up`. A policy accepted by an `apply` made
+/// while the tunnel is down could therefore still be refused at the next
+/// promotion, long after the operator who supplied the bad value was told it
+/// was in force. Checking every state is what lets a caller refuse such a
+/// policy before it becomes the running one.
+pub fn check_policy(policy: &FirewallPolicy) -> Result<()> {
+    for state in TUNNEL_STATES {
+        render(policy, state)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

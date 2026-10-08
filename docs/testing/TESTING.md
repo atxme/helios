@@ -35,7 +35,7 @@ vérifiée qu’au moment de la PR.
 | Éditeur | permissions 0700/0600, auto-vérification, clés cohérentes et refus d’écrasement |
 | Réseau | états, expiration de handshake, règles fail-closed et transaction préparée avant application, ouverture DHCP scopée au WAN et fermée par défaut |
 | Provisioning PQ | tour ML-KEM complet via l’endpoint, PSK posé avant d’être annoncé, refus fail-closed si la pose échoue, annulation en mémoire et restauration du PSK précédent, adaptateur client jamais démonté |
-| Key-negotiation | JSON strict et borné, anti-downgrade/rejeu, mTLS en enveloppe, certificats et transcripts ML-DSA-65, substitution `kpub`/ciphertext, trois modes, pose gateway avant réponse, handshake client frais, ACK signé, rollback |
+| Key-negotiation | JSON strict et borné, anti-downgrade/rejeu, mTLS en enveloppe, certificats et transcripts ML-DSA-65, substitution `kpub`/ciphertext, trois modes, pose gateway avant réponse, handshake client frais, ACK signé, rollback, écoute dual-stack `[::]` (interop Orion en IPv4 et en `[::1]`, source `::ffff:` comptée comme son IPv4, repli IPv4 sur `EAFNOSUPPORT` seulement) |
 | Mise à jour applicative | manifeste `helios-binary-release-v1` : signature hybride, altération du binaire, anti-rollback de `release_sequence`, staging borné et restauration du lien `current` (ADR-003) |
 | Autorisation | routes de mutation réservées aux pairs `admin`, résolution par VIP source en `/32`, refus d'un pair ordinaire, en-têtes de proxy ignorés (ADR-003) |
 | Admission | VIP dérivée de la clé publique, adresse de la gateway réservée, doublons de nom et de clé refusés, PSK des autres pairs préservés, persistance sans clé privée ni PSK (ADR-004) |
@@ -221,6 +221,17 @@ Valider avec accès console :
   trois modes, un certificat client non lié, un ciphertext altéré, la fermeture
   avant confirmation, le timeout, puis un handshake réussi avec le PSK négocié
   et l’ACK de commit ;
+- key-negotiation sur IPv6 : `ss -ulpn` sur la gateway montre l'écoute de
+  négociation sur `[::]:<port>` (une seule socket, dual-stack) ; un client
+  Orion dont le seul uplink est IPv6, ou dont le profil nomme un endpoint
+  `[v6]:port`, négocie en ML-KEM, pendant qu'un client IPv4 négocie toujours
+  sur le même port. Le journal nomme les sources IPv4 sous leur forme
+  `a.b.c.d`, jamais `::ffff:a.b.c.d`. Les tests automatisés ne
+  passent que par la boucle locale : ni le routage, ni le pare-feu `inet` sur
+  le WAN, ni la question de savoir si le noyau livre à la socket un paquet IPv6
+  dont la source est elle-même de la forme `::ffff:` n'y sont éprouvés. Sur une
+  gateway démarrée avec `ipv6.disable=1`, l'écoute doit retomber sur
+  `0.0.0.0:<port>` avec un avertissement qui en donne la raison ;
 - réparation sur redémarrage de gateway (§12.5) : tunnel `ml_kem` monté,
   `systemctl restart heliosd`, puis **ne rien faire**. Le journal client doit
   annoncer « renégociation 1/3 » en nommant le handshake vieilli, et le tunnel
@@ -354,6 +365,39 @@ Valider avec accès console :
   La sélection elle-même est éprouvée hors noyau ; ce que seule la cible
   établit, c'est que les marqueurs sysfs d'un vrai pilote Wi-Fi sont ceux que
   le module lit, et qu'une bascule réelle ne coupe pas les clients.
+- **IPv6 du tunnel** (`ADRESSAGE-IPV6.md` §6 et §9, tickets T12 et T13), sur
+  une gateway avec `wg_address_v6` et un pair qui porte `address_v6`, WAN à
+  1500 :
+  - `ip -6 addr show dev helios0` montre `<préfixe>::1/64` ;
+    `wg show helios0 allowed-ips` montre, pour ce pair, **exactement** son
+    `/32` et son `/128` ;
+  - `ip -6 route show table 51820` montre un `/128` par pair, `dev helios0 src
+    <préfixe>::1` ; `ip -6 rule` montre `32000: from all to <préfixe>::/64
+    lookup 51820` ; `ip route show table 51820` et `ip rule` (IPv4) sont
+    identiques à ceux d'une gateway sans IPv6 ;
+  - avec `allow_tunnel_icmp = true`, `ping -6 <VIP6 du pair>` depuis la gateway
+    et `ping -6 <préfixe>::1` depuis le client répondent ; avec
+    `allow_tunnel_icmp = false`, ni l'un ni l'autre. Orion ne pose pas encore
+    l'adresse IPv6 sur son adaptateur (ticket T19) : le client de cet essai est
+    un `wg-quick` dont `Address` porte le `/32` et le `/128` du pair ;
+  - `helios status` affiche `IPv6 installed`, et `GET /api/status` porte
+    `"ipv6": "installed"` ; `systemctl stop heliosd` retire la règle et vide
+    la table `51820` dans **les deux** familles ;
+  - chemin dégradé : `sysctl -w net.ipv6.conf.default.disable_ipv6=1`, puis
+    redémarrer `heliosd`. La gateway doit démarrer en IPv4 seule : aucune
+    adresse IPv6 sur `helios0`, aucun `/128` dans `wg show`, aucune règle ni
+    route `ip -6` dans la table `51820`, un avertissement « IPv6 not installed »
+    dans le journal, `"ipv6": {"unavailable": {"reason": "disabled_by_kernel",
+    …}}` dans `GET /api/status`, et les clients IPv4 servis comme avant.
+    Remettre la valeur à `0` ensuite ;
+  - même essai avec une WAN à MTU 1340 (tunnel à 1260) :
+    `"reason": "tunnel_mtu_too_small"` ;
+  - le refus que seul le noyau formule (retenté sans IPv6 après démontage de
+    l'interface, raison `address_refused`) n'a pas de déclencheur connu en
+    dehors des deux cas précédents, qui sont écartés avant la montée : il
+    n'est éprouvé qu'en dry-run (`DryRunBackend::without_ipv6`).
+  Aucune ouverture ne doit apparaître : `nft list ruleset` est identique avec
+  et sans `wg_address_v6` (§6.4).
 
 Ces essais modifient le pare-feu, les routes, le TPM et le binaire installé : ne
 jamais les lancer contre une appliance de production.

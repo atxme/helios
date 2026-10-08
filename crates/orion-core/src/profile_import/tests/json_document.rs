@@ -25,6 +25,9 @@ fn imports_versioned_json_with_defaults() {
     let profile = parse_profile_import(&raw, "portable.json").unwrap().profile;
     assert_eq!(profile.name, "portable");
     assert_eq!(profile.allowed_ips, DEFAULT_ALLOWED_IPS);
+    // A document that says nothing about routing gets the full tunnel in
+    // both families: the one `helios` emits without `--allowed-ips`.
+    assert!(!profile.ipv6_uncaptured_full_tunnel());
     assert_eq!(profile.persistent_keepalive, DEFAULT_KEEPALIVE_SECS);
     assert_eq!(profile.address.as_deref(), Some("100.64.1.2/32"));
 }

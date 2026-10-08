@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 
 use crate::{ClientProfile, DEFAULT_ALLOWED_IPS, DEFAULT_KEEPALIVE_SECS};
 
+use super::field_rules::split_interface_address;
 use super::ProfileKind;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -157,13 +158,22 @@ pub(super) fn parse_wg_quick(contents: &str, file_name: &str) -> Result<WgQuickI
         None => DEFAULT_KEEPALIVE_SECS,
     };
 
+    // `Address = 100.64.1.2/32, fd…/128` is one address per family: each
+    // lands in its own field, and anything that would leave a choice to make
+    // is refused by name rather than resolved.
+    let (address, address_v6) = match interface.get("address") {
+        Some(value) => split_interface_address(value)?,
+        None => (None, None),
+    };
+
     let profile = ClientProfile {
         name: profile_name_from_file(file_name),
         endpoint: required_field(&peer, "endpoint", "Endpoint")?,
         private_key: required_field(&interface, "privatekey", "PrivateKey")?,
         peer_public_key: required_field(&peer, "publickey", "PublicKey")?,
         preshared_key: peer.get("presharedkey").cloned(),
-        address: interface.get("address").cloned(),
+        address,
+        address_v6,
         allowed_ips: peer
             .get("allowedips")
             .cloned()

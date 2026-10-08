@@ -35,7 +35,9 @@ const portable: ClientProfile = {
   has_private_key: true,
   has_static_psk: false,
   address: '100.64.1.2/32',
-  allowed_ips: '0.0.0.0/0',
+  address_v6: null,
+  allowed_ips: '0.0.0.0/0, ::/0',
+  ipv6_uncaptured_full_tunnel: false,
   persistent_keepalive: 25,
   heliosd_url: 'http://100.64.0.1:8080',
   ssh_target: null,
@@ -130,6 +132,42 @@ describe('useClient', () => {
       expect(unlistenProfilePath).toHaveBeenCalledOnce()
       expect(unlistenConfig).toHaveBeenCalledOnce()
     })
+  })
+
+  // The adapter stays mounted on failure with the routes it had, so a capture
+  // gap outlives `failed`; only unmounting, or a new connection that reads
+  // the adapter back again, ends it.
+  it('keeps the capture verdict for as long as the adapter it describes', async () => {
+    api.connect.mockResolvedValue(undefined)
+    const { result } = renderHook(() => useClient())
+    await waitFor(() => expect(result.current.selectedProfile?.name).toBe('portable'))
+    expect(result.current.capture).toBeNull()
+
+    act(() =>
+      emit({
+        type: 'capture',
+        capture: { status: 'incomplete', missing: ['::/0'], missing_addresses: [] },
+      }),
+    )
+    expect(result.current.capture).toEqual({
+      status: 'incomplete',
+      missing: ['::/0'],
+      missing_addresses: [],
+    })
+
+    act(() => emit({ type: 'state_changed', state: 'failed' }))
+    expect(result.current.capture).toEqual({
+      status: 'incomplete',
+      missing: ['::/0'],
+      missing_addresses: [],
+    })
+
+    act(() => emit({ type: 'state_changed', state: 'down' }))
+    expect(result.current.capture).toBeNull()
+
+    act(() => emit({ type: 'capture', capture: { status: 'complete' } }))
+    await act(() => result.current.connect('portable'))
+    expect(result.current.capture).toBeNull()
   })
 
   // The notification area connects a profile, which selects it. The window may

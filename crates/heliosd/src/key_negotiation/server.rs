@@ -114,12 +114,12 @@ pub async fn start(
     // past it. Set once: a second listener in one process would be two
     // identities, which nothing here builds.
     let _ = SERVED_SLOT.set(slot);
-    let endpoint = server_endpoint(
-        SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)),
-        &identity.tls,
-        &client_cas,
-    )
-    .context("binding the key-negotiation QUIC listener")?;
+    // One dual-stack `[::]` socket: an Orion whose only uplink is IPv6, or
+    // whose profile names a `[v6]:port` endpoint, must reach the same port as
+    // an IPv4 one. A host without IPv6 keeps serving IPv4 and says so below;
+    // any other bind failure still refuses to start, as it always has.
+    let (endpoint, families) = dual_stack_server_endpoint(port, &identity.tls, &client_cas)
+        .context("binding the key-negotiation QUIC listener")?;
     let handler = Arc::new(GatewayHandler {
         network,
         psk_tx,
@@ -138,7 +138,17 @@ pub async fn start(
         static_psks: RwLock::new(static_psks),
         transactions: Mutex::new(TransactionState::default()),
     });
-    tracing::info!("key-negotiation listening on UDP {port}");
+    match &families {
+        ListenFamilies::DualStack => {
+            tracing::info!(%families, "key-negotiation listening on UDP [::]:{port}");
+        }
+        ListenFamilies::Ipv4Only { reason } => {
+            tracing::warn!(
+                %reason,
+                "key-negotiation listening on UDP 0.0.0.0:{port} only: IPv6 clients cannot negotiate with this gateway"
+            );
+        }
+    }
     spawn_psk_reclaimer(Arc::clone(&handler), peer_runtime);
     tokio::spawn(aether_key_negotiation::serve(
         endpoint,

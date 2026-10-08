@@ -75,25 +75,59 @@ fn spawn_mtu_probe(
     dry_run: bool,
 ) {
     tokio::spawn(async move {
-        let mss = if dry_run {
-            1380u16
+        let transport = if dry_run {
+            aether::mtu::MTU_TRANSPORT_DEFAUT
         } else {
-            discover_mss(&wan_iface).await.unwrap_or(1380)
+            mtu_transport(&wan_iface)
         };
-        let mtu = mss + 40;
-        info!("PMTUD: optimal MSS = {mss} bytes (estimated MTU = {mtu})");
+        let TunnelMss {
+            tunnel_mtu: mtu,
+            ipv4: mss,
+            ipv6: mss_v6,
+        } = tunnel_mss(transport);
+        match mss_v6 {
+            Some(mss_v6) => info!(
+                "PMTUD: tunnel MTU = {mtu} bytes, TCP MSS = {mss} over IPv4, {mss_v6} over IPv6"
+            ),
+            None => info!(
+                "PMTUD: tunnel MTU = {mtu} bytes, TCP MSS = {mss} over IPv4, no IPv6 below {} bytes",
+                aether::mtu::MTU_MIN_IPV6
+            ),
+        }
+        // The clamp holds the IPv4 value: it is the only family the gateway
+        // forwards, and the firewall IR has no IPv6 clamp yet.
         let _ = event_tx.send(HeliosEvent::MtuDiscovered { mtu, mss });
         let _ = internal_tx.send(OrchestratorCmd::SetMssClamp(mss)).await;
     });
 }
 
-pub(super) async fn discover_mss(wan_iface: &str) -> Option<u16> {
-    let mtu_str = tokio::fs::read_to_string(format!("/sys/class/net/{wan_iface}/mtu"))
-        .await
-        .ok()?;
-    let mtu: u16 = mtu_str.trim().parse().ok()?;
-    // WireGuard: ~60 bytes of overhead (header + UDP/IP) + 40 for the TCP/IP header.
-    Some(mtu.saturating_sub(100).max(576))
+/// What the MTU probe derives from the transport's MTU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct TunnelMss {
+    /// MTU of the tunnel interface: the value `wg_config` sets on it.
+    pub(super) tunnel_mtu: u16,
+    /// TCP MSS over IPv4 inside the tunnel.
+    pub(super) ipv4: u16,
+    /// TCP MSS over IPv6 inside the tunnel; `None` when the tunnel is too
+    /// narrow to carry IPv6.
+    pub(super) ipv6: Option<u16>,
+}
+
+/// Tunnel MTU and per-family TCP MSS for a transport of `mtu_transport`
+/// bytes.
+///
+/// The tunnel MTU comes from [`aether::mtu::tunnel_mtu`], the computation
+/// that sizes the interface: its WireGuard overhead is the 80 bytes of an
+/// IPv6 outer header, whatever family the endpoint uses. Deriving the MSS
+/// from any other estimate would announce segments the interface cannot
+/// carry. The MSS then removes the inner headers of each family.
+pub(super) fn tunnel_mss(mtu_transport: u32) -> TunnelMss {
+    let tunnel_mtu = aether::mtu::tunnel_mtu(mtu_transport);
+    TunnelMss {
+        tunnel_mtu: u16::try_from(tunnel_mtu).unwrap_or(u16::MAX),
+        ipv4: aether::mtu::mss_ipv4(tunnel_mtu),
+        ipv6: aether::mtu::mss_ipv6(tunnel_mtu),
+    }
 }
 
 /// WAN link MTU, read from sysfs.

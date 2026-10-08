@@ -318,8 +318,23 @@ export interface ClientProfile {
   has_static_psk: boolean
   /** CGNAT VIP assigned by the gateway at enrollment (e.g. `100.64.1.2/32`). */
   address: string | null
-  /** Traffic routed into the tunnel. Defaults to `0.0.0.0/0`. */
+  /**
+   * IPv6 VIP assigned by a gateway that has an IPv6 tunnel prefix, one `/128`
+   * host (`fd3c:91a2:7e04::2/128`). `null` = IPv4-only tunnel, which is every
+   * profile of a gateway without IPv6.
+   */
+  address_v6: string | null
+  /** Traffic routed into the tunnel. Defaults to `0.0.0.0/0, ::/0`. */
   allowed_ips: string
+  /**
+   * The stored list captures all of IPv4 and lets IPv6 out — the full
+   * tunnel as it was before `::/0` joined the default.
+   *
+   * Decided by `orion-core` (`ClientProfile::ipv6_uncaptured_full_tunnel`)
+   * for the **stored** list. The profile editor judges the list being typed
+   * with `splitTunnel.leavesIpv6Uncaptured`, which mirrors the same rule.
+   */
+  ipv6_uncaptured_full_tunnel: boolean
   /** Keepalive in seconds. Defaults to 25. */
   persistent_keepalive: number
   heliosd_url: string | null
@@ -360,6 +375,7 @@ export interface ProfileDraft {
   endpoint: string
   peer_public_key: string
   address: string | null
+  address_v6: string | null
   allowed_ips: string
   persistent_keepalive: number
   heliosd_url: string | null
@@ -397,6 +413,8 @@ export interface ProfileIssues {
   peer_public_key: string | null
   preshared_key: string | null
   address: string | null
+  /** Also judged against `address`: an IPv6 address accompanies an IPv4 one. */
+  address_v6: string | null
   allowed_ips: string | null
   persistent_keepalive: string | null
   heliosd_url: string | null
@@ -423,10 +441,35 @@ export interface ProfileIssues {
  */
 export type PskKind = 'none' | 'static' | 'ml_kem'
 
+/**
+ * What the mounted adapter really captures — mirror of
+ * `orion_core::events::CaptureCheck`.
+ *
+ * The profile states what was asked; the driver may apply less without
+ * failing (on Windows, a family the adapter does not carry is dropped). Only
+ * the core's read-back knows, and only the real backend sends it: no verdict
+ * means nothing was verified, never that everything was.
+ */
+export type CaptureCheck =
+  | { status: 'complete' }
+  | {
+      status: 'incomplete'
+      /** `AllowedIPs` the adapter does not capture. */
+      missing: string[]
+      /**
+       * Profile addresses the driver did not put on the adapter — on Windows,
+       * the IPv6 address of an adapter without IPv6. At least one of the two
+       * lists is non-empty.
+       */
+      missing_addresses: string[]
+    }
+  | { status: 'unverified'; reason: string }
+
 // Events pushed by the Rust backend (emit "helios://event").
 export type ClientEvent =
   | { type: 'state_changed'; state: TunnelState }
   | { type: 'protection'; psk: PskKind }
+  | { type: 'capture'; capture: CaptureCheck }
   | { type: 'log'; level: string; message: string }
   | { type: 'telemetry'; iface: string; rx_bps: number; tx_bps: number; rx_pps: number; tx_pps: number }
   | { type: 'error'; message: string }

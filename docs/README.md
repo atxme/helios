@@ -19,6 +19,8 @@ foi en cas de doute (voir [AGENTS.md](../AGENTS.md)).
   états WireGuard, kill-switch, API, secrets et validation.
 - [Firewall v2](architecture/FIREWALL-V2.md) — audit Policy/IR/Netlink,
   capacités, limites backend et recette de validation cible.
+- [Étude IPv6](architecture/ETUDE-IPV6.md) — audit des dépendances IPv4,
+  architecture dual-stack cible, risques et roadmap par tickets.
 
 ## Développement
 
@@ -30,6 +32,8 @@ foi en cas de doute (voir [AGENTS.md](../AGENTS.md)).
 
 ## Exploitation
 
+- [Écoconception](architecture/ECOCONCEPTION.md) — diagnostic électrique de
+  la passerelle MSI, pistes matérielles/logicielles et protocole de mesure.
 - [RENOUVELLEMENT-CERTIFICATS.md](RENOUVELLEMENT-CERTIFICATS.md) — commandes de
   renouvellement et de rotation des certificats.
 - [DEPLOIEMENT-ASTRA.md](DEPLOIEMENT-ASTRA.md) — déploiement de l'autorité et
@@ -62,6 +66,11 @@ foi en cas de doute (voir [AGENTS.md](../AGENTS.md)).
   avec ses lots encore ouverts.
 - [Rotation des certificats](specification/ROTATION-CERTIFICATS.md) — cycle de
   vie cible des certificats TLS/PQ.
+- [Adressage IPv6](specification/ADRESSAGE-IPV6.md) — modèle d'adressage
+  IPv6 du tunnel (ULA `/64`, VIP `/128`) et IPAM unifié, validé, en cours
+  d'implémentation.
+- [Sortie IPv6](specification/SORTIE-IPV6.md) — politique de sortie Internet
+  IPv6 des clients du tunnel (rejet explicite en V1, NAT66 écarté), validée.
 
 ## Sécurité
 

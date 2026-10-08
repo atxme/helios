@@ -17,7 +17,10 @@ mod transaction;
 mod tests;
 
 pub use client::{negotiate, request_challenge, ClientSession, PendingChallenge};
-pub use endpoint::{client_endpoint, client_endpoint_on_socket, server_endpoint};
+pub use endpoint::{
+    client_endpoint, client_endpoint_on_socket, dual_stack_server_endpoint, server_endpoint,
+    ListenFamilies,
+};
 pub use error::{PublicError, TransportError};
 pub use identity::{certificate_fingerprint_der, TlsIdentity};
 pub use server::{

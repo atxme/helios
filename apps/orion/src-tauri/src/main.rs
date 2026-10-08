@@ -1323,6 +1323,9 @@ struct ProfileView {
     endpoint: String,
     peer_public_key: String,
     address: Option<String>,
+    /// IPv6 VIP, `…/128`. `null` for every profile without one, which is
+    /// what the screen shows as an IPv4-only tunnel.
+    address_v6: Option<String>,
     allowed_ips: String,
     persistent_keepalive: u16,
     heliosd_url: Option<String>,
@@ -1341,6 +1344,13 @@ struct ProfileView {
     has_private_key: bool,
     /// Whether a **static** PSK is stored. A negotiated one is never at rest.
     has_static_psk: bool,
+    /// The stored list captures all of IPv4 and lets IPv6 out.
+    ///
+    /// Decided by `orion-core`, not by the screen: the posture panel warns on
+    /// it, and a rule re-derived in TypeScript is one more place for the two
+    /// to disagree about which profiles leak. Reported only — the stored list
+    /// is never widened on the user's behalf.
+    ipv6_uncaptured_full_tunnel: bool,
 }
 
 impl From<&ClientProfile> for ProfileView {
@@ -1350,6 +1360,7 @@ impl From<&ClientProfile> for ProfileView {
             endpoint: profile.endpoint.clone(),
             peer_public_key: profile.peer_public_key.clone(),
             address: profile.address.clone(),
+            address_v6: profile.address_v6.clone(),
             allowed_ips: profile.allowed_ips.clone(),
             persistent_keepalive: profile.persistent_keepalive,
             heliosd_url: profile.heliosd_url.clone(),
@@ -1359,6 +1370,7 @@ impl From<&ClientProfile> for ProfileView {
             public_key: profile.public_key(),
             has_private_key: !profile.private_key.trim().is_empty(),
             has_static_psk: profile.has_static_psk(),
+            ipv6_uncaptured_full_tunnel: profile.ipv6_uncaptured_full_tunnel(),
         }
     }
 }
@@ -1404,6 +1416,10 @@ struct ProfileDraft {
     endpoint: String,
     peer_public_key: String,
     address: Option<String>,
+    /// Absent from a payload means `None`, like every optional field here:
+    /// the screen always sends it, and a save without it is a profile
+    /// without IPv6.
+    address_v6: Option<String>,
     allowed_ips: String,
     persistent_keepalive: u16,
     heliosd_url: Option<String>,
@@ -1497,6 +1513,7 @@ impl ProfileDraft {
         profile.endpoint = self.endpoint;
         profile.peer_public_key = self.peer_public_key;
         profile.address = self.address;
+        profile.address_v6 = self.address_v6;
         profile.allowed_ips = self.allowed_ips;
         profile.persistent_keepalive = self.persistent_keepalive;
         profile.heliosd_url = self.heliosd_url;

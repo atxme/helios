@@ -10,18 +10,24 @@ use ipnetwork::IpNetwork;
 use rustables::{
     expr::{
         Bitwise, Cmp, CmpOp, ConnTrackState, Conntrack, ConntrackKey, Counter as NfCounter,
-        Log as NfLog, Meta, MetaType,
+        HighLevelPayload, ICMPv6HeaderField, IPv6HeaderField, IcmpCode, Log as NfLog, Meta,
+        MetaType, NetworkHeaderField, Reject, RejectType, TransportHeaderField,
     },
     HookClass, Protocol, Rule as NfRule,
 };
 
 use super::NetlinkBackend;
 use crate::ruleset::{
-    Action, AddressFamily, ChainKind, ConnectionState, ConnectionStates, Counter, Match, L4,
+    Action, AddressFamily, ChainKind, ConnectionState, ConnectionStates, Counter, Icmpv6Type,
+    Match, Verdict, L4,
 };
 
 const IP_PROTOCOL_ICMP: u8 = 1;
 const IP_PROTOCOL_ICMPV6: u8 = 58;
+/// Netfilter family numbers (`NFPROTO_IPV4`, `NFPROTO_IPV6`), the value
+/// `meta nfproto` loads into the register.
+const NFPROTO_IPV4: u8 = 2;
+const NFPROTO_IPV6: u8 = 10;
 
 impl NetlinkBackend {
     pub(super) fn hook_class(kind: ChainKind) -> HookClass {
@@ -53,9 +59,12 @@ impl NetlinkBackend {
             Match::DestNet(addr) => Self::match_net(rule, addr, false)?,
             Match::SourceNet(addr) => Self::match_net(rule, addr, true)?,
             Match::Icmp(family) => Self::icmp_protocol(rule, *family),
+            Match::Icmpv6Type(icmp_type) => Self::icmpv6_type(rule, *icmp_type),
+            Match::Ipv6HopLimit(hop_limit) => Self::ipv6_hop_limit(rule, *hop_limit),
             Match::PacketMark(mark) => rule
                 .with_expr(Meta::new(MetaType::Mark))
                 .with_expr(Cmp::new(CmpOp::Eq, Self::packet_mark_bytes(*mark))),
+            Match::Family(family) => Self::network_family(rule, *family),
         })
     }
 
@@ -80,6 +89,32 @@ impl NetlinkBackend {
         })
     }
 
+    /// Closes a rule under construction with its terminal verdict.
+    ///
+    /// The rejection is the `reject` expression and nothing else: the kernel
+    /// sends the ICMP answer, then drops the packet itself, so no `drop`
+    /// verdict follows it — exactly what `nft` emits for
+    /// `reject with icmpx admin-prohibited`.
+    pub(super) fn apply_verdict(rule: NfRule, verdict: Verdict) -> NfRule {
+        match verdict {
+            Verdict::Accept => rule.accept(),
+            Verdict::Drop => rule.drop(),
+            Verdict::RejectAdminProhibited => rule.with_expr(Self::reject_admin_prohibited()),
+        }
+    }
+
+    /// `reject with icmpx admin-prohibited`.
+    ///
+    /// `icmpx` is the family-agnostic rejection of an `inet` table: the
+    /// kernel answers an IPv6 packet with ICMPv6 type 1 code 1, an IPv4 one
+    /// with ICMP type 3 code 13. Both values are fixed here, never taken from
+    /// a caller.
+    fn reject_admin_prohibited() -> Reject {
+        Reject::default()
+            .with_type(RejectType::IcmpxUnreach)
+            .with_icmp_code(IcmpCode::AdminProhibited)
+    }
+
     /// Encodes a packet mark as the native `u32` stored in the nftables meta
     /// register. Unlike IP addresses and ports, `meta mark` is not a network
     /// protocol field and must therefore not use network byte order.
@@ -94,6 +129,48 @@ impl NetlinkBackend {
         };
         rule.with_expr(Meta::new(MetaType::L4Proto))
             .with_expr(Cmp::new(CmpOp::Eq, [protocol]))
+    }
+
+    /// `icmpv6 type <type>`: the ICMPv6 protocol, then the type octet.
+    ///
+    /// The protocol comparison comes first so that the transport payload is
+    /// only read as an ICMPv6 header; the type octet sits at offset 0 of that
+    /// header, which is the field `rustables` names `ICMPv6HeaderField::Type`.
+    fn icmpv6_type(rule: NfRule, icmp_type: Icmpv6Type) -> NfRule {
+        Self::icmp_protocol(rule, AddressFamily::Ipv6)
+            .with_expr(
+                HighLevelPayload::Transport(TransportHeaderField::ICMPv6(ICMPv6HeaderField::Type))
+                    .build(),
+            )
+            .with_expr(Cmp::new(CmpOp::Eq, [icmp_type.number()]))
+    }
+
+    /// `ip6 hoplimit <value>`, behind its `meta nfproto ipv6` guard.
+    ///
+    /// The guard is the one [`NfRule::match_ip`] emits ahead of an IPv6
+    /// address, and for the same reason: in an `inet` table the network
+    /// header may be IPv4, where offset 7 is not a hop limit.
+    fn ipv6_hop_limit(rule: NfRule, hop_limit: u8) -> NfRule {
+        Self::network_family(rule, AddressFamily::Ipv6)
+            .with_expr(
+                HighLevelPayload::Network(NetworkHeaderField::IPv6(IPv6HeaderField::HopLimit))
+                    .build(),
+            )
+            .with_expr(Cmp::new(CmpOp::Eq, [hop_limit]))
+    }
+
+    /// A standalone `meta nfproto` guard.
+    ///
+    /// The same two expressions `rustables` emits ahead of an address in
+    /// [`NfRule::match_ip`], without the address: the rule stays
+    /// single-family in the `inet` table while naming no address.
+    fn network_family(rule: NfRule, family: AddressFamily) -> NfRule {
+        let nfproto = match family {
+            AddressFamily::Ipv4 => NFPROTO_IPV4,
+            AddressFamily::Ipv6 => NFPROTO_IPV6,
+        };
+        rule.with_expr(Meta::new(MetaType::NfProto))
+            .with_expr(Cmp::new(CmpOp::Eq, [nfproto]))
     }
 
     /// A structured `ct state` match, built from the exact IR state set.
@@ -182,7 +259,98 @@ impl NetlinkBackend {
 
 #[cfg(test)]
 mod tests {
+    use rustables::{
+        expr::{Payload, RawExpression, Register},
+        Batch, Chain, ProtocolFamily, Table,
+    };
+
     use super::*;
+
+    /// The octets of `reject with icmpx admin-prohibited` as the kernel
+    /// receives them, read from a finalized batch rather than from the
+    /// `rustables` structures that produce them.
+    ///
+    /// Each value is a literal: `NFTA_RULE_EXPRESSIONS` (4) holding a single
+    /// `NFTA_LIST_ELEM` (1), named `reject` (`NFTA_EXPR_NAME` 1, no
+    /// terminator, padded to four octets), whose `NFTA_EXPR_DATA` (2) carries
+    /// `NFTA_REJECT_TYPE` (1) = `NFT_REJECT_ICMPX_UNREACH` (2) as a
+    /// big-endian `u32`, then `NFTA_REJECT_ICMP_CODE` (2) =
+    /// `NFT_REJECT_ICMPX_ADMIN_PROHIBITED` (3) as one octet plus padding.
+    /// Attribute headers are in host order, as Netlink defines them. The
+    /// single list element also proves that no `drop` verdict follows the
+    /// rejection.
+    #[test]
+    fn the_admin_prohibited_rejection_is_encoded_byte_for_byte() {
+        let table = Table::new(ProtocolFamily::Inet).with_name("helios");
+        let chain = Chain::new(&table).with_name("forward");
+        let rule = NetlinkBackend::apply_verdict(
+            NfRule::new(&chain).expect("a rule of a named chain"),
+            Verdict::RejectAdminProhibited,
+        );
+        let mut batch = Batch::new();
+        rule.add_to_batch(&mut batch);
+        let sent = batch.finalize();
+
+        const NESTED: u16 = 0x8000;
+        let header = |len: u16, kind: u16| [len.to_ne_bytes(), kind.to_ne_bytes()].concat();
+        let expected = [
+            header(40, NESTED | 4),
+            header(36, NESTED | 1),
+            header(10, 1),
+            b"reject\0\0".to_vec(),
+            header(20, NESTED | 2),
+            header(8, 1),
+            vec![0, 0, 0, 2],
+            header(5, 2),
+            vec![3, 0, 0, 0],
+        ]
+        .concat();
+        let found = sent
+            .windows(expected.len())
+            .filter(|window| *window == expected.as_slice())
+            .count();
+        assert_eq!(
+            found, 1,
+            "the reject expression list must appear once, exactly\n\
+             sent:     {sent:02x?}\nexpected: {expected:02x?}"
+        );
+
+        // The literals above are the kernel UAPI values.
+        assert_eq!(rustables::sys::NLA_F_NESTED, u32::from(NESTED));
+        assert_eq!(rustables::sys::NFTA_RULE_EXPRESSIONS, 4);
+        assert_eq!(rustables::sys::NFTA_LIST_ELEM, 1);
+        assert_eq!(rustables::sys::NFTA_EXPR_NAME, 1);
+        assert_eq!(rustables::sys::NFTA_EXPR_DATA, 2);
+        assert_eq!(rustables::sys::NFTA_REJECT_TYPE, 1);
+        assert_eq!(rustables::sys::NFTA_REJECT_ICMP_CODE, 2);
+        assert_eq!(rustables::sys::NFT_REJECT_ICMPX_UNREACH, 2);
+        assert_eq!(rustables::sys::NFT_REJECT_ICMPX_ADMIN_PROHIBITED, 3);
+    }
+
+    /// Accept and drop keep the verdict expressions `rustables` emits for
+    /// them: the rejection is the only verdict built by hand.
+    #[test]
+    fn accept_and_drop_keep_the_rustables_verdicts() {
+        let expressions = |rule: NfRule| {
+            rule.get_expressions()
+                .map(|list| list.iter().cloned().collect::<Vec<RawExpression>>())
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            expressions(NetlinkBackend::apply_verdict(
+                NfRule::default(),
+                Verdict::Accept
+            )),
+            expressions(NfRule::default().accept())
+        );
+        assert_eq!(
+            expressions(NetlinkBackend::apply_verdict(
+                NfRule::default(),
+                Verdict::Drop
+            )),
+            expressions(NfRule::default().drop())
+        );
+    }
 
     #[test]
     fn port_sets_are_expanded() {
@@ -274,5 +442,115 @@ mod tests {
         assert_eq!(IP_PROTOCOL_ICMP, 1);
         assert_eq!(IP_PROTOCOL_ICMPV6, 58);
         assert_ne!(IP_PROTOCOL_ICMP, IP_PROTOCOL_ICMPV6);
+    }
+
+    /// `rustables` binds its protocol families to the kernel UAPI values:
+    /// checking the constants against them pins what the kernel will read.
+    #[test]
+    fn nfproto_numbers_are_the_kernel_family_values() {
+        assert_eq!(NFPROTO_IPV4, 2);
+        assert_eq!(NFPROTO_IPV6, 10);
+        assert_eq!(i32::from(NFPROTO_IPV4), ProtocolFamily::Ipv4 as i32);
+        assert_eq!(i32::from(NFPROTO_IPV6), ProtocolFamily::Ipv6 as i32);
+    }
+
+    /// A Neighbor Solicitation rule's matches, translated in their IR order:
+    /// the ICMPv6 protocol and type, then the hop limit behind its IPv6
+    /// guard. Every value is a literal — protocol 58, transport header base
+    /// 2 at offset 0 for one octet, type 135, `NFPROTO_IPV6` 10, network
+    /// header base 1 at offset 7 for one octet, hop limit 255 — so that a
+    /// change in `rustables`' field tables shows up here, not on a target.
+    #[test]
+    fn a_neighbor_solicitation_match_emits_the_exact_expression_sequence() {
+        let mut rule = NfRule::default();
+        for m in [
+            Match::Icmpv6Type(Icmpv6Type::NeighborSolicit),
+            Match::Ipv6HopLimit(255),
+        ] {
+            rule = NetlinkBackend::apply_match(rule, &m).expect("an ICMPv6 match translates");
+        }
+        let expressions: Vec<RawExpression> = rule
+            .get_expressions()
+            .map(|list| list.iter().cloned().collect())
+            .unwrap_or_default();
+
+        let payload = |base: u32, offset: u32| {
+            Payload::default()
+                .with_dreg(Register::Reg1)
+                .with_base(base)
+                .with_offset(offset)
+                .with_len(1u32)
+        };
+        assert_eq!(
+            expressions,
+            [
+                RawExpression::from(Meta::new(MetaType::L4Proto)),
+                RawExpression::from(Cmp::new(CmpOp::Eq, [58u8])),
+                RawExpression::from(payload(2, 0)),
+                RawExpression::from(Cmp::new(CmpOp::Eq, [135u8])),
+                RawExpression::from(Meta::new(MetaType::NfProto)),
+                RawExpression::from(Cmp::new(CmpOp::Eq, [10u8])),
+                RawExpression::from(payload(1, 7)),
+                RawExpression::from(Cmp::new(CmpOp::Eq, [255u8])),
+            ]
+        );
+        // The payload bases above are the kernel UAPI values.
+        assert_eq!(rustables::sys::NFT_PAYLOAD_NETWORK_HEADER, 1);
+        assert_eq!(rustables::sys::NFT_PAYLOAD_TRANSPORT_HEADER, 2);
+    }
+
+    /// Every typed ICMPv6 match compares the octet its type stands for, and
+    /// nothing else changes from one type to another.
+    #[test]
+    fn every_icmpv6_type_compares_its_own_number() {
+        for icmp_type in [
+            Icmpv6Type::MldListenerQuery,
+            Icmpv6Type::MldListenerReport,
+            Icmpv6Type::MldListenerDone,
+            Icmpv6Type::RouterSolicit,
+            Icmpv6Type::RouterAdvert,
+            Icmpv6Type::NeighborSolicit,
+            Icmpv6Type::NeighborAdvert,
+            Icmpv6Type::Mld2ListenerReport,
+        ] {
+            let expressions: Vec<RawExpression> =
+                NetlinkBackend::apply_match(NfRule::default(), &Match::Icmpv6Type(icmp_type))
+                    .expect("an ICMPv6 type match translates")
+                    .get_expressions()
+                    .map(|list| list.iter().cloned().collect())
+                    .unwrap_or_default();
+            assert_eq!(expressions.len(), 4, "{icmp_type:?}");
+            assert_eq!(
+                expressions[3],
+                RawExpression::from(Cmp::new(CmpOp::Eq, [icmp_type.number()])),
+                "{icmp_type:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn family_match_emits_the_nfproto_guard_rustables_uses() {
+        let expressions = |family| {
+            NetlinkBackend::apply_match(NfRule::default(), &Match::Family(family))
+                .expect("a family match always translates")
+                .get_expressions()
+                .map(|list| list.iter().cloned().collect::<Vec<RawExpression>>())
+                .unwrap_or_default()
+        };
+
+        assert_eq!(
+            expressions(AddressFamily::Ipv4),
+            [
+                RawExpression::from(Meta::new(MetaType::NfProto)),
+                RawExpression::from(Cmp::new(CmpOp::Eq, [2u8])),
+            ]
+        );
+        assert_eq!(
+            expressions(AddressFamily::Ipv6),
+            [
+                RawExpression::from(Meta::new(MetaType::NfProto)),
+                RawExpression::from(Cmp::new(CmpOp::Eq, [10u8])),
+            ]
+        );
     }
 }

@@ -826,12 +826,7 @@ mod tests {
             std::fs::read_to_string(workspace_root().unwrap().join("scripts/deploy-app.ps1"))
                 .expect("the Windows application update launcher must exist");
 
-        for required in [
-            "helios",
-            "app-update",
-            "scripts/deploy-app.sh",
-            "wsl.exe",
-        ] {
+        for required in ["helios", "app-update", "scripts/deploy-app.sh", "wsl.exe"] {
             assert!(
                 script.contains(required),
                 "the Windows launcher must invoke `{required}`"

@@ -12,8 +12,13 @@ use crate::SOURCE_RATE_WINDOW;
 /// The trade-off is deliberate and stated: several legitimate clients behind
 /// one `/64` share one budget, exactly as several clients behind one IPv4 NAT
 /// already do.
+///
+/// The source is canonicalized first. A dual-stack `[::]` socket reports an
+/// IPv4 client as `::ffff:a.b.c.d`, whose first 64 bits are all zero: taken
+/// as IPv6, every IPv4 client on the Internet would land in the single bucket
+/// `::/64` and one of them could exhaust it for all the others.
 pub(crate) fn rate_bucket(source: IpAddr) -> IpAddr {
-    match source {
+    match source.to_canonical() {
         IpAddr::V4(v4) => IpAddr::V4(v4),
         IpAddr::V6(v6) => {
             let mut octets = v6.octets();

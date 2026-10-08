@@ -120,6 +120,55 @@ pub fn split_cidr_list(value: &str) -> Vec<&str> {
         .collect()
 }
 
+/// How much of each address family an `AllowedIPs` list sends into the tunnel.
+///
+/// Only the whole-family entries count — a prefix of length zero, `0.0.0.0/0`
+/// or `::/0` — because they are what decides whether anything of that family
+/// can still leave through the physical interface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TunnelCapture {
+    /// Both families captured whole: the full tunnel.
+    Full,
+    /// All of IPv4, but no whole-family IPv6 entry: IPv6 leaves in clear.
+    ///
+    /// Not a split tunnel. It is what the full tunnel used to be, before
+    /// [`crate::DEFAULT_ALLOWED_IPS`] added `::/0`, and a profile still holding
+    /// it believes it is protected when half of its traffic is not.
+    Ipv4Only,
+    /// Anything else: a tunnel narrowed on purpose, which is the operator's
+    /// decision and not a defect.
+    Partial,
+}
+
+/// Classifies a prefix list by what it captures whole, family by family.
+///
+/// Entries are read as [`split_cidr_list`] and [`validate_cidr`] read them, so
+/// the classification never contradicts validation; an entry validation would
+/// refuse captures nothing here. The Orion screen mirrors this rule for the
+/// draft being typed (`apps/orion/src/splitTunnel.ts`), and its tests pin the
+/// same cases as this module's.
+pub fn tunnel_capture(value: &str) -> TunnelCapture {
+    let mut ipv4 = false;
+    let mut ipv6 = false;
+    for entry in split_cidr_list(value) {
+        let Some((address, prefix)) = entry.split_once('/') else {
+            continue;
+        };
+        let (Ok(address), Ok(0)) = (address.parse::<IpAddr>(), prefix.parse::<u8>()) else {
+            continue;
+        };
+        match address {
+            IpAddr::V4(_) => ipv4 = true,
+            IpAddr::V6(_) => ipv6 = true,
+        }
+    }
+    match (ipv4, ipv6) {
+        (true, true) => TunnelCapture::Full,
+        (true, false) => TunnelCapture::Ipv4Only,
+        _ => TunnelCapture::Partial,
+    }
+}
+
 /// Validates a list of prefixes: `AllowedIPs` is one, an address is not.
 ///
 /// # Why several
@@ -271,6 +320,104 @@ pub(super) fn validate_cidr(value: &str, label: &str) -> Result<()> {
         anyhow::bail!("{label} invalide : préfixe supérieur à {max_prefix}");
     }
     Ok(())
+}
+
+/// Validates the tunnel IPv6 address: one host, written `…/128`
+/// (`ADRESSAGE-IPV6.md` §2.3).
+///
+/// The rule is [`aether::net::parse_vip_v6`], the one the gateway reads its
+/// own `address_v6` with, so a value Orion accepts is one the gateway could
+/// have written. Never a `/64`: a peer free to pick its source inside a prefix
+/// would make the source → peer association ambiguous. Only the messages are
+/// Orion's, because they are displayed as-is on screen.
+///
+/// Whether the address belongs to the gateway's prefix is not checked here:
+/// the prefix is gateway configuration, which a profile does not carry.
+pub fn validate_address_v6(value: &str) -> Result<()> {
+    use aether::net::AddressError;
+
+    let Err(error) = aether::net::parse_vip_v6(value.trim()) else {
+        return Ok(());
+    };
+    let reason = match &error {
+        AddressError::ZoneId(_) => "identifiant de zone (« % ») interdit : une adresse du \
+                                    tunnel n'appartient à aucun lien local"
+            .to_string(),
+        AddressError::MissingPrefixLength(_) => "notation …/128 attendue".to_string(),
+        AddressError::InvalidPrefixLength(_) => {
+            "longueur de préfixe illisible, /128 attendu".to_string()
+        }
+        AddressError::InvalidAddress(_) => "adresse IP illisible".to_string(),
+        AddressError::NotIpv6(v4) => {
+            format!("{v4} est une adresse IPv4, sa place est dans l'adresse virtuelle")
+        }
+        AddressError::WrongPrefixLength { found, .. } => format!(
+            "/{found} au lieu de /128 : un poste a une seule adresse IPv6, jamais un préfixe"
+        ),
+        other => other.to_string(),
+    };
+    anyhow::bail!("adresse IPv6 invalide : {reason}")
+}
+
+/// Checks the IPv6 address, and checks it against the address it accompanies.
+///
+/// The IPv6 address is the **second** address of the tunnel, never its only
+/// one: identity and control plane stay IPv4 (`ADRESSAGE-IPV6.md` §2.6), and a
+/// virtual address that is itself IPv6 would put two IPv6 addresses on the
+/// adapter with nothing to say which one the gateway knows. An absent virtual
+/// address is not judged here — an invitation arrives without one.
+pub(super) fn validate_address_pair(address: Option<&str>, address_v6: &str) -> Result<()> {
+    validate_address_v6(address_v6)?;
+    let address_is_v6 = address
+        .and_then(|value| value.split_once('/'))
+        .and_then(|(host, _)| host.trim().parse::<IpAddr>().ok())
+        .is_some_and(|host| host.is_ipv6());
+    if address_is_v6 {
+        anyhow::bail!(
+            "adresse IPv6 invalide : l'adresse virtuelle est déjà une adresse IPv6, alors que \
+             l'adresse IPv6 accompagne une adresse virtuelle IPv4"
+        );
+    }
+    Ok(())
+}
+
+/// Sorts the `Address` of a `wg-quick` file into the profile's two fields.
+///
+/// - one entry, whatever its family: the virtual address, as it was always
+///   read — a file that imported before this function still imports the same;
+/// - two entries, one IPv4 and one IPv6: the virtual address and the IPv6
+///   address, which [`validate_address_v6`] then holds to `/128`;
+/// - anything else is refused by name. Two addresses of one family leave a
+///   choice the file does not make, and the profile has one slot per family:
+///   picking one would mount a tunnel the file does not describe.
+pub(super) fn split_interface_address(value: &str) -> Result<(Option<String>, Option<String>)> {
+    let entries = split_cidr_list(value);
+    if entries.len() <= 1 {
+        return Ok((entries.first().map(|entry| entry.to_string()), None));
+    }
+    let mut ipv4: Vec<&str> = Vec::new();
+    let mut ipv6: Vec<&str> = Vec::new();
+    for entry in &entries {
+        let host = entry.split_once('/').map_or(*entry, |(host, _)| host);
+        match host.trim().parse::<IpAddr>() {
+            Ok(IpAddr::V4(_)) => ipv4.push(entry),
+            Ok(IpAddr::V6(_)) => ipv6.push(entry),
+            Err(_) => anyhow::bail!("Address invalide : « {entry} » n'est pas une adresse IP"),
+        }
+    }
+    for (family, found) in [("IPv4", &ipv4), ("IPv6", &ipv6)] {
+        if found.len() > 1 {
+            anyhow::bail!(
+                "Address porte plusieurs adresses {family} ({}) : Orion en pose une seule par \
+                 famille, et choisir laquelle reviendrait à deviner",
+                found.join(", ")
+            );
+        }
+    }
+    Ok((
+        ipv4.first().map(|entry| entry.to_string()),
+        ipv6.first().map(|entry| entry.to_string()),
+    ))
 }
 
 pub(super) fn validate_heliosd_url(url: &str) -> Result<()> {

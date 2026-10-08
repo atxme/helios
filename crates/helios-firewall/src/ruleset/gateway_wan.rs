@@ -9,7 +9,7 @@
 use aether::FirewallPolicy;
 
 use super::ChainKind::{Input, Output};
-use super::{Match, Rule, Verdict, L4};
+use super::{AddressFamily, Match, Rule, Verdict, L4};
 
 pub(super) fn dhcp_lease_renewal(
     rules: &mut Vec<Rule>,
@@ -22,6 +22,15 @@ pub(super) fn dhcp_lease_renewal(
     // The reply is not left to `ct state established` — a DHCPDISCOVER goes
     // out as a broadcast and the reply does not always attach to a tracked
     // flow.
+    //
+    // The same flag opens the DHCPv6 client: "the WAN address comes from a
+    // lease" holds for both families. The client sends to 547 — a Solicit
+    // goes to the `ff02::1:2` multicast group, so its answer, unicast from
+    // the server's link-local address, attaches to no tracked flow either —
+    // and the server replies to 546. Those two rules carry `meta nfproto
+    // ipv6`: they name no address, and DHCPv6 ports mean nothing to IPv4.
+    // The DHCPv4 pair above names no family; it predates the guard and is
+    // left as it is.
     if policy.allow_dhcp_on_wan {
         for wan in wan_ifaces {
             rules.push(
@@ -44,6 +53,33 @@ pub(super) fn dhcp_lease_renewal(
                     Match::InIface(wan.clone()),
                     Match::DestPort {
                         port: 68,
+                        proto: L4::Udp,
+                    },
+                ],
+                Verdict::Accept,
+            ));
+            rules.push(
+                Rule::new(
+                    Output,
+                    vec![
+                        Match::OutIface(wan.clone()),
+                        Match::Family(AddressFamily::Ipv6),
+                        Match::DestPort {
+                            port: 547,
+                            proto: L4::Udp,
+                        },
+                    ],
+                    Verdict::Accept,
+                )
+                .with_note("DHCPv6: the lease of an IPv6 WAN address renews the same way"),
+            );
+            rules.push(Rule::new(
+                Input,
+                vec![
+                    Match::InIface(wan.clone()),
+                    Match::Family(AddressFamily::Ipv6),
+                    Match::DestPort {
+                        port: 546,
                         proto: L4::Udp,
                     },
                 ],

@@ -22,6 +22,7 @@ fn network() -> NetworkConfig {
             name: "test-workstation".into(),
             public_key: PEER_KEY.into(),
             address: "100.64.1.2/32".into(),
+            address_v6: None,
             admin: true,
             preshared_key: Some("pq-secret-must-not-leak".into()),
             key_negotiation_certificate_sha256: None,
@@ -142,6 +143,56 @@ async fn status_publishes_the_freshness_threshold_it_is_judged_by() {
 }
 
 #[tokio::test]
+async fn a_gateway_without_ipv6_reports_it_as_not_configured() {
+    let (app, _cmd_rx) = app_state(TunnelState::Up);
+
+    let response = serde_json::to_value(status(State(app)).await.0).unwrap();
+
+    assert_eq!(response["ipv6"], serde_json::json!("not_configured"));
+}
+
+/// The degraded IPv4-only start of `ADRESSAGE-IPV6.md` §6.2 must be visible
+/// from the API, with the reason the orchestrator published.
+#[tokio::test]
+async fn status_exposes_an_unavailable_ipv6_with_its_reason() {
+    let (app, _cmd_rx) = app_state(TunnelState::Up);
+    *app.ipv6.write().await = aether::net::Ipv6TunnelStatus::Unavailable(
+        aether::net::Ipv6Unavailable::DisabledByKernel {
+            setting: "net.ipv6.conf.all.disable_ipv6".into(),
+        },
+    );
+
+    let response = serde_json::to_value(status(State(app)).await.0).unwrap();
+
+    assert_eq!(
+        response["ipv6"],
+        serde_json::json!({
+            "unavailable": {
+                "reason": "disabled_by_kernel",
+                "setting": "net.ipv6.conf.all.disable_ipv6"
+            }
+        })
+    );
+}
+
+/// The console shows a client's IPv6 VIP next to its IPv4 one, from the row
+/// it already polls: `null` without one, the persisted `/128` form with one.
+#[tokio::test]
+async fn status_carries_each_peer_ipv6_vip() {
+    let (app, _cmd_rx) = app_state(TunnelState::Up);
+    let response = serde_json::to_value(status(State(app.clone())).await.0).unwrap();
+    assert!(response["peers"][0]["address_v6"].is_null());
+
+    app.network.write().await.peers[0].address_v6 =
+        Some("fd3c:91a2:7e04:0:8a1f:3b2c:9d40:e517".parse().unwrap());
+    let response = serde_json::to_value(status(State(app)).await.0).unwrap();
+    assert_eq!(
+        response["peers"][0]["address_v6"],
+        serde_json::json!("fd3c:91a2:7e04:0:8a1f:3b2c:9d40:e517/128")
+    );
+}
+
+#[tokio::test]
 async fn status_exposes_useful_data_without_the_psk() {
     let (app, _cmd_rx) = app_state(TunnelState::Up);
 
@@ -178,6 +229,37 @@ async fn read_configuration_never_serializes_secrets() {
     assert!(!payload.contains("pq-secret-must-not-leak"));
     assert!(!payload.contains("wg_private_key\""));
     assert!(!payload.contains("preshared_key\""));
+}
+
+/// The IPv6 addresses are public configuration: the view carries them,
+/// in their persisted text form, and `null` where there are none.
+#[tokio::test]
+async fn read_configuration_exposes_the_ipv6_addresses() {
+    let (app, _cmd_rx) = app_state(TunnelState::Up);
+    let response = network_get(State(app.clone())).await.0;
+    assert_eq!(response.wg_address_v6, None);
+    assert_eq!(response.peers[0].address_v6, None);
+    let payload = serde_json::to_value(&response).unwrap();
+    assert!(payload["wg_address_v6"].is_null());
+    assert!(payload["peers"][0]["address_v6"].is_null());
+
+    {
+        let mut network = app.network.write().await;
+        network.wg_address_v6 = Some("FD3C:91A2:7E04::1/64".parse().unwrap());
+        network.peers[0].address_v6 = Some("fd3c:91a2:7e04:0:8a1f:3b2c:9d40:e517".parse().unwrap());
+    }
+    let response = network_get(State(app)).await.0;
+    assert_eq!(
+        response.wg_address_v6.as_deref(),
+        Some("fd3c:91a2:7e04::1/64")
+    );
+    assert_eq!(
+        response.peers[0].address_v6.as_deref(),
+        Some("fd3c:91a2:7e04:0:8a1f:3b2c:9d40:e517/128")
+    );
+    let payload = serde_json::to_string(&response).unwrap();
+    assert!(!payload.contains(PRIVATE_KEY));
+    assert!(!payload.contains("pq-secret-must-not-leak"));
 }
 
 #[tokio::test]
@@ -218,6 +300,7 @@ async fn command_routes_forward_the_exact_intent() {
             }),
         )
         .await
+        .unwrap()
         .0
         .ok
     );
@@ -233,6 +316,65 @@ async fn command_routes_forward_the_exact_intent() {
     ));
 }
 
+async fn set_split_tunnel(
+    app: &AppState,
+    cidrs: &[&str],
+) -> Result<Json<CmdResponse>, (StatusCode, String)> {
+    split_tunnel_set(
+        State(app.clone()),
+        Json(SplitTunnelRequest {
+            cidrs: cidrs.iter().map(|cidr| cidr.to_string()).collect(),
+        }),
+    )
+    .await
+}
+
+/// A CIDR the ruleset compiler would refuse is answered `400`, naming it, and
+/// never reaches the orchestrator — which has no way to report it back.
+#[tokio::test]
+async fn an_invalid_split_tunnel_cidr_is_refused_before_the_orchestrator() {
+    let (app, mut cmd_rx) = app_state(TunnelState::Up);
+
+    for (cidrs, refused) in [
+        (vec!["10.0.0.0/33"], "10.0.0.0/33"),
+        (vec!["fd00::/129"], "fd00::/129"),
+        (
+            vec!["192.168.1.0/24", "not-a-cidr", "fd00::/64"],
+            "not-a-cidr",
+        ),
+    ] {
+        let (status, message) = set_split_tunnel(&app, &cidrs)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{cidrs:?} must be refused"));
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{cidrs:?}");
+        assert!(message.contains(&format!("`{refused}`")), "{message}");
+    }
+
+    assert!(
+        cmd_rx.try_recv().is_err(),
+        "a refused list must send nothing to the orchestrator"
+    );
+}
+
+#[tokio::test]
+async fn a_valid_dual_stack_split_tunnel_list_is_sent_unchanged() {
+    let (app, mut cmd_rx) = app_state(TunnelState::Up);
+    let cidrs = [
+        "192.168.1.0/24",
+        "10.0.0.0/8",
+        "fd00:1::/64",
+        "2001:db8::/32",
+    ];
+
+    assert!(set_split_tunnel(&app, &cidrs).await.unwrap().0.ok);
+
+    match cmd_rx.try_recv() {
+        Ok(OrchestratorCmd::SetSplitTunnel(sent)) => assert_eq!(sent, cidrs),
+        other => panic!("unexpected command: {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn firewall_rendering_stays_fail_closed_outside_an_active_tunnel() {
     let (app, _cmd_rx) = app_state(TunnelState::Down);
@@ -242,6 +384,26 @@ async fn firewall_rendering_stays_fail_closed_outside_an_active_tunnel() {
     assert_eq!(response.default_verdict, "drop");
     assert!(response.rules.contains("udp dport 51820 accept"));
     assert!(!response.rules.contains("pq-secret-must-not-leak"));
+}
+
+/// The console shows the masquerade the Netlink backend applies, IPv4 guard
+/// included: an unguarded line would describe an `inet` NAT that also
+/// rewrites IPv6.
+#[tokio::test]
+async fn firewall_rendering_shows_the_ipv4_only_masquerade() {
+    let (app, _cmd_rx) = app_state(TunnelState::Up);
+    app.policy.write().await.allow_client_internet = true;
+
+    let response = firewall_rules_get(State(app)).await.unwrap().0;
+
+    assert!(
+        response
+            .rules
+            .contains("    meta nfproto ipv4 oifname \"eth0\" masquerade  #"),
+        "{}",
+        response.rules
+    );
+    assert!(!response.rules.contains("    oifname \"eth0\" masquerade"));
 }
 
 #[tokio::test]

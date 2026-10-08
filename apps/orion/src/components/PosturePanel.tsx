@@ -3,7 +3,7 @@ import Divider from '@mui/material/Divider'
 import Popover from '@mui/material/Popover'
 import Typography from '@mui/material/Typography'
 import { AlertTriangle } from 'lucide-react'
-import type { ClientProfile, PskKind, TunnelState, VaultPosture } from '../types'
+import type { CaptureCheck, ClientProfile, PskKind, TunnelState, VaultPosture } from '../types'
 import { modeMeta, postureMeta, protectionMeta, stateMeta } from './state'
 import { CopyButton } from './CopyButton'
 import { GUTTER } from '../theme'
@@ -33,6 +33,12 @@ interface Props {
   profile: ClientProfile | null
   psk: PskKind | null
   /**
+   * What the core read back from the mounted adapter. `null` when there is no
+   * verdict — nothing mounted, or the simulation — and the row then shows the
+   * profile's list without claiming anything about it.
+   */
+  capture: CaptureCheck | null
+  /**
    * What the vault can claim about itself. `null` while it is being read, or
    * when it could not be — in which case the rows simply do not appear.
    *
@@ -43,9 +49,20 @@ interface Props {
   vault: VaultPosture | null
 }
 
-export function PosturePanel({ anchor, onClose, state, adapterUp, profile, psk, vault }: Props) {
+export function PosturePanel({
+  anchor,
+  onClose,
+  state,
+  adapterUp,
+  profile,
+  psk,
+  capture,
+  vault,
+}: Props) {
   const posture = postureMeta(state, adapterUp)
   const protection = protectionMeta(profile, psk, state)
+  const traffic = trafficFact(profile, capture)
+  const address = addressFact(profile, capture)
   const negotiation = profile?.key_negotiation
   // Nominal is silent: the block only exists when it has something to report.
   const degraded =
@@ -100,15 +117,13 @@ export function PosturePanel({ anchor, onClose, state, adapterUp, profile, psk, 
         )}
         <Row
           label="adresse"
-          value={profile?.address ?? '—'}
-          copy={profile?.address ?? undefined}
-          copyLabel="l’adresse virtuelle"
+          value={address.value}
+          tone={address.tone}
+          copy={address.copy}
+          copyLabel={address.count > 1 ? 'les adresses virtuelles' : 'l’adresse virtuelle'}
         />
-        {/* No amber for a narrowed range. Split tunnelling is a decision the
-            operator made — routing a subnet and leaving the rest alone is the
-            normal shape of a corporate profile, not a degradation. The amber
-            rows below are for facts the machine reports about itself. */}
-        <Row label="trafic via le tunnel" value={profile?.allowed_ips ?? '—'} />
+        {/* Amber only for what the machine reports: see `trafficFact`. */}
+        <Row label="trafic via le tunnel" value={traffic.value} tone={traffic.tone} />
       </Box>
 
       {degraded && vault && (
@@ -144,6 +159,72 @@ export function PosturePanel({ anchor, onClose, state, adapterUp, profile, psk, 
       )}
     </Popover>
   )
+}
+
+/**
+ * The «trafic via le tunnel» row: what the profile asks for, unless the
+ * machine says otherwise.
+ *
+ * No amber for a narrowed range. Split tunnelling is a decision the operator
+ * made — routing a subnet and leaving the rest alone is the normal shape of a
+ * corporate profile, not a degradation. Amber is for facts the machine reports
+ * about itself, most severe first:
+ *
+ * 1. the driver applied less than asked — read back by the core after
+ *    mounting. On Windows a family the adapter does not carry is dropped
+ *    without an error, and that traffic leaves through the physical
+ *    interface while everything else looks connected;
+ * 2. the read-back failed: unknown is not fine;
+ * 3. `0.0.0.0/0` alone, the full tunnel as it was before `::/0` joined the
+ *    default: on a dual-stack machine its IPv6 leaves in clear with the tunnel
+ *    up. The core decides which profiles that is; the list is never rewritten
+ *    for the user.
+ */
+function trafficFact(
+  profile: ClientProfile | null,
+  capture: CaptureCheck | null,
+): { value: string; tone?: string } {
+  if (capture?.status === 'incomplete' && capture.missing.length > 0) {
+    const verb = capture.missing.length > 1 ? 'non appliqués' : 'non appliqué'
+    return { value: `${capture.missing.join(', ')} ${verb} par le pilote — hors tunnel`, tone: AMBER }
+  }
+  if (capture?.status === 'unverified') {
+    return { value: `${profile?.allowed_ips ?? '—'} — non vérifié sur l’adaptateur`, tone: AMBER }
+  }
+  if (profile?.ipv6_uncaptured_full_tunnel) {
+    return { value: `${profile.allowed_ips} — IPv4 seulement, l’IPv6 sort en clair`, tone: AMBER }
+  }
+  return { value: profile?.allowed_ips ?? '—' }
+}
+
+/**
+ * The «adresse» row: the profile's addresses, IPv4 first, then IPv6 when the
+ * profile has one — unless the machine says the driver left one off.
+ *
+ * A profile without `address_v6` reads exactly as before. The amber case is
+ * the same kind of fact as a stripped prefix: on Windows, the IPv6 address of
+ * an adapter without IPv6 is skipped without an error, and only the core's
+ * read-back knows. The copy carries what the row shows, never the gap.
+ */
+function addressFact(
+  profile: ClientProfile | null,
+  capture: CaptureCheck | null,
+): { value: string; tone?: string; copy?: string; count: number } {
+  const addresses = [profile?.address, profile?.address_v6].filter(
+    (address): address is string => Boolean(address),
+  )
+  if (addresses.length === 0) return { value: '—', count: 0 }
+  const listed = addresses.join(', ')
+  if (capture?.status === 'incomplete' && capture.missing_addresses.length > 0) {
+    const verb = capture.missing_addresses.length > 1 ? 'non posées' : 'non posée'
+    return {
+      value: `${listed} — ${capture.missing_addresses.join(', ')} ${verb} par le pilote`,
+      tone: AMBER,
+      copy: listed,
+      count: addresses.length,
+    }
+  }
+  return { value: listed, copy: listed, count: addresses.length }
 }
 
 /** One fact: its instrument label and its value. */

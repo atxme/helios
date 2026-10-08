@@ -337,6 +337,15 @@ pub fn render_status(ui: &Ui, status: &Status) -> String {
         tunnel.push(format!("negotiation UDP {port}"));
     }
     out.push_str(&ui.field("Tunnel", &tunnel.join(" · ")));
+    match &status.ipv6 {
+        aether::net::Ipv6TunnelStatus::NotConfigured => {}
+        aether::net::Ipv6TunnelStatus::Installed => out.push_str(&ui.field("IPv6", "installed")),
+        aether::net::Ipv6TunnelStatus::Unavailable(reason) => out.push_str(&ui.field_toned(
+            "IPv6",
+            &format!("unavailable — IPv4 only (degraded): {reason}"),
+            Tone::Warn,
+        )),
+    }
     out.push_str(&ui.field("LAN", &list_or(&status.lan_ifaces, "none")));
     let mut ssh = Vec::new();
     if !status.allow_ssh_from.is_empty() {

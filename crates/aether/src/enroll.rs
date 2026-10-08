@@ -69,6 +69,11 @@ pub enum EnrollError {
     MissingClientKey,
     #[error("unknown peer: out-of-band admission not performed")]
     UnknownPeer,
+    /// The peer is admitted but `network.toml` holds no readable VIP for it.
+    /// Provisioning returns the persisted address and never derives one in
+    /// its place (`ADRESSAGE-IPV6.md` §3 bis.2, rule 4).
+    #[error("admitted peer without a readable declared address")]
+    UndeclaredAddress,
     #[error("PSK derivation failed")]
     Kdf,
 }
@@ -96,8 +101,20 @@ pub struct ProvisionResponse {
     /// Gateway-side randomness.
     pub gateway_nonce: [u8; NONCE_LEN],
     /// VIP assigned to the client, in CIDR notation (e.g. `100.64.1.2/32`).
-    /// Derived from its WireGuard public key, hence stable without disk state.
+    ///
+    /// The address persisted for this peer at admission, read back rather
+    /// than derived again: the IPAM chooses an address once, `network.toml`
+    /// keeps it (`ADRESSAGE-IPV6.md` §3 bis.2).
     pub assigned_address: String,
+    /// IPv6 VIP persisted for the client, `…/128`, when it has one
+    /// (`ADRESSAGE-IPV6.md` §7.1).
+    ///
+    /// Omitted when absent, so a gateway without IPv6 sends exactly the
+    /// response it sent before. This structure is not `deny_unknown_fields`:
+    /// an older client ignores the field, and the protocol version is
+    /// unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assigned_address_v6: Option<String>,
     /// Gateway's WireGuard public key (base64), so the client can complete
     /// its profile without manual configuration.
     pub gateway_wg_public_key: String,
@@ -309,6 +326,7 @@ mod tests {
             kem_ciphertext: vec![0u8; crate::pq::CIPHERTEXT_LEN],
             gateway_nonce: [0; NONCE_LEN],
             assigned_address: "100.64.1.2/32".into(),
+            assigned_address_v6: None,
             gateway_wg_public_key: "Z3c=".into(),
             psk_lifetime_secs: 3600,
         };
@@ -319,5 +337,40 @@ mod tests {
             resp.validate(),
             Err(EnrollError::BadKemCiphertext(5))
         ));
+    }
+
+    /// §7.1: a response without IPv6 is the response of before, field for
+    /// field, and one from an older gateway — which has no such field — still
+    /// reads.
+    #[test]
+    fn the_ipv6_address_is_optional_on_the_wire() {
+        let response = ProvisionResponse {
+            protocol_version: PROTOCOL_VERSION,
+            kem_ciphertext: vec![1, 2],
+            gateway_nonce: [0; NONCE_LEN],
+            assigned_address: "100.64.1.2/32".into(),
+            assigned_address_v6: None,
+            gateway_wg_public_key: "Z3c=".into(),
+            psk_lifetime_secs: 3600,
+        };
+        let without = serde_json::to_value(&response).expect("encode");
+        assert!(
+            without.get("assigned_address_v6").is_none(),
+            "an absent IPv6 VIP must not appear: {without}"
+        );
+        let older: ProvisionResponse = serde_json::from_value(without).expect("decode");
+        assert_eq!(older, response);
+
+        let dual = ProvisionResponse {
+            assigned_address_v6: Some("fd3c:91a2:7e04:0:8a1f:3b2c:9d40:e517/128".into()),
+            ..response
+        };
+        let encoded = serde_json::to_value(&dual).expect("encode");
+        assert_eq!(
+            encoded["assigned_address_v6"],
+            "fd3c:91a2:7e04:0:8a1f:3b2c:9d40:e517/128"
+        );
+        let decoded: ProvisionResponse = serde_json::from_value(encoded).expect("decode");
+        assert_eq!(decoded, dual);
     }
 }

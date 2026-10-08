@@ -19,6 +19,7 @@ import { KnownLimit } from '../components/KnownLimit'
 import { Metric } from '../components/Metric'
 import { SectionCard } from '../components/SectionCard'
 import { formatAge, formatBytes, shortKey } from '../format'
+import { describeIpv6 } from '../ipv6'
 import type { PeerSummary, ProtectionMode, Status } from '../types'
 
 /**
@@ -63,13 +64,21 @@ function isOnline(peer: PeerSummary, staleAfter: number): boolean {
   return peer.last_handshake_age_seconds !== null && peer.last_handshake_age_seconds < staleAfter
 }
 
+/** Shown on hover of an IPv6 VIP, depending on whether the gateway routes it. */
+const VIP_V6_ROUTED = 'VIP IPv6 du client, dans ses AllowedIPs.'
+const VIP_V6_NOT_ROUTED =
+  'IPv6 indisponible sur la passerelle : cette VIP n’est pas dans les AllowedIPs du client, son trafic IPv6 est jeté.'
+
 function PeerRow({
   peer,
   staleAfter,
+  ipv6Routed,
   onRevoke,
 }: {
   peer: PeerSummary
   staleAfter: number
+  /** Whether the gateway's IPv6 tunnel is installed — the VIP is only routed then. */
+  ipv6Routed: boolean
   onRevoke: (peer: PeerSummary) => void
 }) {
   const online = isOnline(peer, staleAfter)
@@ -126,9 +135,30 @@ function PeerRow({
         <Typography sx={{ fontFamily: 'monospace', fontSize: '0.8125rem' }} noWrap>
           {peer.address}
         </Typography>
+        {/* An IPv6 VIP or a `[v6]:port` endpoint is wider than this column:
+            it wraps, like DataRow's long values, rather than losing its tail
+            to an ellipsis — the tail is what tells two addresses apart. */}
+        {peer.address_v6 && (
+          <Tooltip title={ipv6Routed ? VIP_V6_ROUTED : VIP_V6_NOT_ROUTED}>
+            <Typography
+              sx={{
+                fontFamily: 'monospace',
+                fontSize: '0.8125rem',
+                color: ipv6Routed ? 'text.primary' : 'text.disabled',
+                wordBreak: 'break-all',
+              }}
+            >
+              {peer.address_v6}
+            </Typography>
+          </Tooltip>
+        )}
         <Typography
-          sx={{ fontFamily: 'monospace', fontSize: '0.6875rem', color: 'text.disabled' }}
-          noWrap
+          sx={{
+            fontFamily: 'monospace',
+            fontSize: '0.6875rem',
+            color: 'text.disabled',
+            wordBreak: 'break-all',
+          }}
         >
           {peer.endpoint ?? 'endpoint inconnu'}
         </Typography>
@@ -398,6 +428,7 @@ export function ClientsView({ status, refresh, admitOpen, onAdmitOpenChange }: P
   const staleAfter = status?.handshake_stale_after_seconds ?? 150
   const online = peers.filter(peer => isOnline(peer, staleAfter)).length
   const classic = peers.filter(peer => peer.minimum_key_negotiation_mode === 'classic').length
+  const ipv6Routed = describeIpv6(status?.ipv6).kind === 'installed'
 
   return (
     <Stack spacing={2.5}>
@@ -457,6 +488,7 @@ export function ClientsView({ status, refresh, admitOpen, onAdmitOpenChange }: P
               key={peer.public_key}
               peer={peer}
               staleAfter={staleAfter}
+              ipv6Routed={ipv6Routed}
               onRevoke={setRevoking}
             />
           ))

@@ -11,7 +11,7 @@ use std::sync::{
 
 use aether::{
     HeliosEvent, InstallPskRequest, NetworkConfig, ObserveHandshakeRequest, OrchestratorCmd,
-    TunnelState, API_BIND_LOOPBACK,
+    TunnelState, API_BIND_LOOPBACK, SPEEDTEST_BIND_LOOPBACK,
 };
 use anyhow::Context;
 use helios_api::AppState;
@@ -53,6 +53,9 @@ pub(crate) async fn run(
     // masquerade are bound to this name, and resolving it later would mean
     // building the kill-switch around an interface we had not chosen yet.
     resolve_uplink(&mut network)?;
+    // Once the uplink names are known, since the policy is built from them,
+    // and still before the TPM unseal and any networking.
+    orchestrator::check_startup_policy(&network)?;
 
     // The guard that used to stand here — refusing to start when
     // `key_negotiation_port` was set on a binary built without the feature —
@@ -152,15 +155,19 @@ pub(crate) async fn run(
     // A simulation does not actually create the WireGuard address. It
     // therefore only listens locally, which makes manual testing possible
     // without exposing the development API on the machine's network.
-    let api_bind = if dry_run {
-        API_BIND_LOOPBACK.to_string()
+    // A configured gateway whose `wg_address` names no IPv4 host stops the
+    // start here, before any networking: its tunnel could come up with the
+    // API out of every client's reach.
+    let (api_bind, raw_speedtest_bind) = if dry_run {
+        (API_BIND_LOOPBACK, SPEEDTEST_BIND_LOOPBACK)
     } else {
-        shared_network.read().await.api_bind()
-    };
-    let raw_speedtest_bind = if dry_run {
-        format!("127.0.0.1:{}", aether::SPEEDTEST_PORT)
-    } else {
-        shared_network.read().await.speedtest_bind()
+        let network = shared_network.read().await;
+        (
+            network.api_bind().context("API listen address")?,
+            network
+                .speedtest_bind()
+                .context("raw speedtest listen address")?,
+        )
     };
     info!("web interface on http://{api_bind}");
     info!("raw speedtest on {raw_speedtest_bind} (WireGuard TCP/UDP)");
@@ -313,6 +320,9 @@ pub(crate) async fn run(
     // The console reads the data plane through this snapshot; only the
     // orchestrator's poller writes it.
     let peer_runtime = Arc::clone(&state.peer_runtime);
+    // Same arrangement for the IPv6 outcome of the bring-up: the orchestrator
+    // writes it, the status route reads it.
+    let ipv6 = Arc::clone(&state.ipv6);
     let api_state = state.clone();
     tokio::spawn(async move {
         // Outside simulation, the API listens on the WireGuard address —
@@ -322,7 +332,7 @@ pub(crate) async fn run(
         // run for good without an API: no provisioning, no telemetry, for a
         // race lost by a few dozen milliseconds.
         for attempt in 1..=API_BIND_ATTEMPTS {
-            match helios_api::serve(api_state.clone(), &api_bind).await {
+            match helios_api::serve(api_state.clone(), api_bind).await {
                 Ok(()) => return,
                 Err(e) if attempt < API_BIND_ATTEMPTS => {
                     warn!(
@@ -382,7 +392,7 @@ pub(crate) async fn run(
             attempt = attempt.saturating_add(1);
             match helios_api::speedtest::serve_raw(
                 raw_speedtest_state.clone(),
-                &raw_speedtest_bind,
+                raw_speedtest_bind,
                 Arc::clone(&raw_speedtest_task_shutdown),
             )
             .await
@@ -428,6 +438,7 @@ pub(crate) async fn run(
         handshake_rx,
         shared_policy,
         peer_runtime,
+        ipv6,
         boot,
         api_ready,
     )

@@ -3,10 +3,12 @@ use std::time::SystemTime;
 use aether::{
     certificates::encoding::DerCertificate,
     key_negotiation::{PqCertificate, ProtectionMode},
+    net::Ipv6TunnelStatus,
     NetworkConfig, OrchestratorCmd, SecretString, WgPeer,
 };
 use axum::{extract::State, http::StatusCode, Json};
 use helios_firewall::ruleset;
+use helios_provisioning::AdmissionOutcome;
 use helios_wireguard::PeerStatus;
 use serde::{Deserialize, Serialize};
 
@@ -45,6 +47,12 @@ pub struct StatusResponse {
     /// lifts, and an interface applying its own would eventually report a
     /// client as connected after the firewall had already cut it.
     pub handshake_stale_after_seconds: u64,
+    /// What the last bring-up did with the IPv6 tunnel prefix:
+    /// `"not_configured"`, `"installed"`, or `{"unavailable": {"reason": …}}`
+    /// when the gateway runs IPv4-only in the degraded state of
+    /// `ADRESSAGE-IPV6.md` §6.2. Observed on the data plane, like the peers'
+    /// runtime, not read from the configuration.
+    pub ipv6: Ipv6TunnelStatus,
 }
 
 /// An authorized WireGuard peer, as exposed to the UI.
@@ -64,6 +72,11 @@ pub struct PeerSummary {
     pub name: String,
     pub public_key: String,
     pub address: String,
+    /// IPv6 VIP, `…/128`, when the peer has one; `null` otherwise. The same
+    /// text form as [`NetworkPeerView::address_v6`], carried here so the
+    /// console shows it on the row it already polls instead of joining a
+    /// second request on the public key.
+    pub address_v6: Option<String>,
     pub post_quantum: bool,
     pub admin: bool,
     pub minimum_key_negotiation_mode: ProtectionMode,
@@ -88,6 +101,7 @@ impl PeerSummary {
             name: peer.name.clone(),
             public_key: peer.public_key.clone(),
             address: peer.address.clone(),
+            address_v6: peer.address_v6.map(aether::net::format_vip_v6),
             post_quantum: peer.preshared_key.is_some(),
             admin: peer.admin,
             minimum_key_negotiation_mode: peer.minimum_key_negotiation_mode,
@@ -148,6 +162,9 @@ pub struct NetworkConfigView {
     /// `heliosd init-identity`.
     pub wg_public_key: Option<String>,
     pub wg_address: String,
+    /// IPv6 tunnel prefix, `fdXX:XXXX:XXXX::1/64`, when the gateway has one.
+    /// Public configuration (`ADRESSAGE-IPV6.md` §5.1); `null` otherwise.
+    pub wg_address_v6: Option<String>,
     pub wg_listen_port: u16,
     pub key_negotiation_port: Option<u16>,
     pub peers: Vec<NetworkPeerView>,
@@ -160,6 +177,8 @@ pub struct NetworkPeerView {
     pub name: String,
     pub public_key: String,
     pub address: String,
+    /// IPv6 VIP, `…/128`, when the peer has one; `null` otherwise.
+    pub address_v6: Option<String>,
     pub preshared_key_configured: bool,
     pub key_negotiation_certificate_sha256: Option<String>,
     pub key_negotiation_pq_certificate_sha256: Option<String>,
@@ -184,6 +203,7 @@ impl From<&NetworkConfig> for NetworkConfigView {
             // one is exposed only to derive it and never reaches the JSON.
             wg_public_key: aether::wg::public_from_private(config.wg_private_key.expose()).ok(),
             wg_address: config.wg_address.clone(),
+            wg_address_v6: config.wg_address_v6.map(|prefix| prefix.to_string()),
             wg_listen_port: config.wg_listen_port,
             key_negotiation_port: config.key_negotiation_port,
             peers: config
@@ -193,6 +213,7 @@ impl From<&NetworkConfig> for NetworkConfigView {
                     name: peer.name.clone(),
                     public_key: peer.public_key.clone(),
                     address: peer.address.clone(),
+                    address_v6: peer.address_v6.map(aether::net::format_vip_v6),
                     preshared_key_configured: peer.preshared_key.is_some(),
                     key_negotiation_certificate_sha256: peer
                         .key_negotiation_certificate_sha256
@@ -343,6 +364,7 @@ pub async fn status(State(s): State<AppState>) -> Json<StatusResponse> {
         mss_clamp: policy.mss_clamp,
         captive_portal_gateway: policy.captive_portal_gateway.clone(),
         handshake_stale_after_seconds: helios_wireguard::HANDSHAKE_STALE_AFTER_SECS,
+        ipv6: s.ipv6.read().await.clone(),
     })
 }
 
@@ -418,6 +440,12 @@ pub async fn network_get(State(s): State<AppState>) -> Json<NetworkConfigView> {
 
 /// Hot-reloads the network configuration (JSON).
 /// Persists to disk and sends `LoadNetworkConfig` to the orchestrator.
+///
+/// A body whose `wg_address_v6` differs from the running one is refused with
+/// `409 Conflict` and nothing is written: the tunnel prefix is applied at
+/// startup only, so it is changed in `network.toml` followed by a restart. A
+/// body whose firewall policy does not compile — an invalid split-tunnel CIDR
+/// or SSH source — is refused with `400 Bad Request`, also before any write.
 pub async fn network_set(
     State(s): State<AppState>,
     Json(mut new_config): Json<NetworkConfig>,
@@ -429,7 +457,28 @@ pub async fn network_set(
     // the sealed vault and every negotiated PSK — the gateway would stay up,
     // then every handshake would fail with nothing tying the failure to the
     // setting that caused it.
-    new_config.adopt_runtime_secrets_from(&*s.network.read().await);
+    {
+        let running = s.network.read().await;
+        new_config.adopt_runtime_secrets_from(&running);
+        // Refused before anything is written. The orchestrator would not
+        // apply such a change anyway, and persisting it here would answer
+        // "ok" for a change that is not in force — or, from a body that
+        // simply lacks the key, silently drop the tunnel prefix from
+        // `network.toml` for the next start (`ADRESSAGE-IPV6.md` §2.5, §5.4).
+        new_config
+            .check_hot_reload(&running)
+            .map_err(|refusal| (StatusCode::CONFLICT, refusal.to_string()))?;
+    }
+    // Same reasoning for an address the ruleset compiler refuses — a
+    // split-tunnel CIDR, an SSH source: the orchestrator keeps the running
+    // configuration, so writing this one would answer "ok" for a change that
+    // is not in force, and leave it in the file for the next start.
+    ruleset::check_policy(&new_config.firewall_policy()).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("network configuration refused: {error}"),
+        )
+    })?;
     apply_network(&s, new_config).await?;
     Ok(Json(CmdResponse::ok()))
 }
@@ -488,6 +537,19 @@ pub async fn peer_admit(
     Json(body): Json<PeerAdmitRequest>,
 ) -> Result<Json<PeerSummary>, (StatusCode, String)> {
     let mut updated = s.network.read().await.duplicate();
+    // The collision view takes the live WireGuard table as well as the
+    // declared peers (`ADRESSAGE-IPV6.md` §3 bis.2, rule 2). This is the
+    // snapshot the orchestrator republishes, not a fresh read of the backend:
+    // it lags by at most one poll, and what it could miss — a peer added
+    // since — is in the declared table anyway.
+    let live_snapshot = s.peer_runtime.read().await.clone();
+    let live: Vec<helios_provisioning::LivePeer<'_>> = live_snapshot
+        .iter()
+        .map(|peer| helios_provisioning::LivePeer {
+            public_key: &peer.public_key,
+            allowed_ips: &peer.allowed_ips,
+        })
+        .collect();
     // `ml_kem` unconditionally. The v4 default fell back to `classic` when no
     // PQ certificate was supplied, which quietly produced peers whose first
     // handshake was unprotected; the admission layer now refuses such a peer
@@ -495,8 +557,9 @@ pub async fn peer_admit(
     let minimum_mode = body
         .minimum_key_negotiation_mode
         .unwrap_or(ProtectionMode::MlKem);
-    let peer = helios_provisioning::admit_with_key_negotiation(
+    let admission = helios_provisioning::admit_with_key_negotiation(
         &mut updated,
+        &live,
         &body.name,
         &body.public_key,
         body.admin,
@@ -505,18 +568,38 @@ pub async fn peer_admit(
         minimum_mode,
     )
     .map_err(admission_status)?;
+    let peer = &admission.peer;
 
     // The certificate registry **before** the configuration is written: a peer
     // in `network.toml` with no registry row is a client that connects and can
     // never renew, and nothing later says so. The reverse — a row for a peer
     // whose admission then failed to persist — is caught by the next
     // admission, which is idempotent for an unchanged peer.
-    register_first_generation(&s, &body, &peer).await?;
+    //
+    // A readmission registers nothing: the peer's generation was recorded
+    // when it was first admitted, and recording it again would replace
+    // whatever renewal state the registry has kept since.
+    if admission.outcome == AdmissionOutcome::Admitted {
+        register_first_generation(&s, &body, peer).await?;
+    }
 
-    apply_network(&s, updated).await?;
+    let summary = updated
+        .peers
+        .iter()
+        .find(|declared| declared.name == peer.name)
+        .map_or_else(|| PeerSummary::from_config(peer), PeerSummary::from_config);
+    if admission.changed_config() {
+        apply_network(&s, updated).await?;
+    }
 
-    tracing::info!(peer = %peer.name, vip = %peer.address, admin = peer.admin, "peer admitted");
-    Ok(Json(PeerSummary::from_config(&peer)))
+    tracing::info!(
+        peer = %peer.name,
+        vip = %peer.address,
+        admin = peer.admin,
+        outcome = ?admission.outcome,
+        "peer admitted"
+    );
+    Ok(Json(summary))
 }
 
 /// Hands the peer's first generation to the certificate registry.
@@ -671,9 +754,12 @@ fn admission_status(error: helios_provisioning::AdmissionError) -> (StatusCode, 
         // what v5 requires — a PQ identity, and the `ml_kem` floor.
         | E::MissingNegotiationIdentity
         | E::FloorBelowMlKem(_) => StatusCode::BAD_REQUEST,
-        E::NameTaken(_) | E::KeyTaken(_) => StatusCode::CONFLICT,
+        E::NameTaken(_) | E::KeyTaken(_) | E::ReadmissionDiffers(_) => StatusCode::CONFLICT,
         E::Unknown(_) => StatusCode::NOT_FOUND,
         E::Ipam(_) => StatusCode::INSUFFICIENT_STORAGE,
+        // The peer table holds an address the gateway cannot read: its
+        // configuration is at fault, not the request.
+        E::UndeclaredAddress { .. } => StatusCode::INTERNAL_SERVER_ERROR,
     };
     (code, error.to_string())
 }
@@ -704,10 +790,7 @@ pub async fn firewall_rules_get(
     let rs = ruleset::render(&policy, state)
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
 
-    let verdict_str = match rs.default_verdict {
-        ruleset::Verdict::Drop => "drop",
-        ruleset::Verdict::Accept => "accept",
-    };
+    let verdict_str = rs.default_verdict.as_str();
 
     // Rendered faithfully to what the Netlink backend actually applies:
     // three hooked chains, each with its default policy.
@@ -733,10 +816,8 @@ pub async fn firewall_rules_get(
     if !rs.masquerade_out.is_empty() {
         lines.push("  chain postrouting {".to_string());
         lines.push("    type nat hook postrouting priority srcnat;".to_string());
-        for out in &rs.masquerade_out {
-            lines.push(format!(
-                "    oifname \"{out}\" masquerade  # tunnel clients' Internet egress"
-            ));
+        for rule in rs.masquerade_rules() {
+            lines.push(format!("    {rule}  # tunnel clients' Internet egress"));
         }
         lines.push("  }".to_string());
     }
@@ -783,20 +864,35 @@ pub async fn captive_portal_release(State(s): State<AppState>) -> Json<CmdRespon
     })
 }
 
+/// Replaces the CIDRs that bypass the tunnel.
+///
+/// `OrchestratorCmd` has no reply channel, so this check is the refusal the
+/// caller sees: each entry goes through the parser the ruleset compiler uses,
+/// and one it would refuse is answered `400`, naming it, with nothing sent.
+/// The orchestrator checks the resulting policy again before applying it.
 pub async fn split_tunnel_set(
     State(s): State<AppState>,
     Json(body): Json<SplitTunnelRequest>,
-) -> Json<CmdResponse> {
+) -> Result<Json<CmdResponse>, (StatusCode, String)> {
+    for cidr in &body.cidrs {
+        ruleset::parse_network(cidr).map_err(|error| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("split-tunnel CIDR refused: {error}"),
+            )
+        })?;
+    }
+
     let ok = s
         .cmd_tx
         .send(OrchestratorCmd::SetSplitTunnel(body.cidrs))
         .await
         .is_ok();
-    Json(if ok {
+    Ok(Json(if ok {
         CmdResponse::ok()
     } else {
         CmdResponse::err("orchestrator unreachable")
-    })
+    }))
 }
 
 /// Publisher trust anchor, as compiled into **this** binary (ADR-002).

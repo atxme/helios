@@ -69,6 +69,62 @@ fn invalid_networks_never_enter_the_structured_ir() {
     }
 }
 
+/// The split-tunnel CIDRs are only read in `Up`: rendering the down state
+/// alone would let an invalid one through, to fail at the next promotion.
+#[test]
+fn a_policy_check_covers_the_states_that_do_not_read_a_field() {
+    let mut p = policy();
+    p.split_tunnel_cidrs = vec!["192.168.1.0/33".into()];
+    assert!(super::super::render(&p, TunnelState::Down).is_ok());
+
+    let error = check_policy(&p).expect_err("an invalid split-tunnel CIDR must be refused");
+    assert!(error.to_string().contains("192.168.1.0/33"), "{error}");
+}
+
+/// Without a LAN interface no split-tunnel bypass is rendered, but the CIDRs
+/// are still parsed: an invalid one is refused whatever the topology, so the
+/// API and startup checks that rely on `check_policy` stay fail closed.
+#[test]
+fn a_policy_check_refuses_an_invalid_split_tunnel_cidr_without_a_lan() {
+    let mut p = policy();
+    p.lan_ifaces = Vec::new();
+    p.split_tunnel_cidrs = vec!["192.168.1.0/24".into(), "fd00::/129".into()];
+
+    let error = check_policy(&p).expect_err("an invalid split-tunnel CIDR must be refused");
+    assert!(error.to_string().contains("fd00::/129"), "{error}");
+    assert!(super::super::render(&p, TunnelState::Up).is_err());
+}
+
+#[test]
+fn a_policy_check_accepts_valid_dual_stack_split_tunnel_cidrs() {
+    let mut p = policy();
+    p.split_tunnel_cidrs = vec!["192.168.1.0/24".into(), "fd00:1::/64".into()];
+    check_policy(&p).expect("valid split-tunnel CIDRs");
+}
+
+/// `TUNNEL_STATES` cannot be derived from the enum. The match below has no
+/// wildcard, so a new state stops this test from compiling until it is
+/// listed here and in `TUNNEL_STATES`.
+#[test]
+fn a_policy_check_renders_every_tunnel_state() {
+    use TunnelState::{CaptivePortal, Connecting, Down, Failed, Up};
+    for state in [Down, Connecting, Up, Failed, CaptivePortal] {
+        match state {
+            Down | Connecting | Up | Failed | CaptivePortal => {
+                assert!(TUNNEL_STATES.contains(&state), "{state:?} is not checked");
+            }
+        }
+    }
+}
+
+#[test]
+fn the_public_parser_names_the_refused_entry() {
+    assert!(parse_network("10.0.0.0/8").is_ok());
+    assert!(parse_network("2001:db8::/32").is_ok());
+    let error = parse_network("2001:db8::/129").expect_err("prefix beyond 128");
+    assert!(error.to_string().contains("`2001:db8::/129`"), "{error}");
+}
+
 /// The WireGuard listener is in `input` (traffic towards the gateway),
 /// LAN forward in `forward`. Confusing them would block or open the
 /// wrong traffic.
@@ -272,7 +328,7 @@ fn fail_closed_default_is_always_drop() {
         TunnelState::Failed,
         TunnelState::Connecting,
     ] {
-        assert_eq!(render(&policy(), st).default_verdict, Verdict::Drop);
+        assert_eq!(render(&policy(), st).default_verdict, DefaultVerdict::Drop);
     }
 }
 
@@ -400,34 +456,230 @@ fn captive_portal_allows_http_to_gateway() {
     let mut p = policy();
     p.captive_portal_gateway = Some("192.168.1.1".into());
     let rs = render(&p, TunnelState::CaptivePortal);
-    assert!(rs
-        .rules
-        .iter()
-        .any(|r| r.to_string().contains("192.168.1.1") && r.to_string().contains("dport")));
+    assert_eq!(
+        captive_portal_openings(&rs, ChainKind::Output),
+        ["oifname \"eth0\" ip daddr 192.168.1.1/32 tcp dport { 80, 443 } accept"]
+    );
+    assert_eq!(
+        captive_portal_openings(&rs, ChainKind::Forward),
+        ["iifname \"eth1\" oifname \"eth0\" ip daddr 192.168.1.1/32 tcp dport { 80, 443 } accept"]
+    );
+    // The captive portal replaces the LAN forward, it does not add to it.
     assert!(!text(&rs, ChainKind::Forward)
         .iter()
-        .any(|r| r.contains("iifname \"eth1\" oifname")));
-    assert_eq!(rs.default_verdict, Verdict::Drop);
+        .any(|r| r == "iifname \"eth1\" oifname \"eth0\" accept"));
+    assert_eq!(rs.default_verdict, DefaultVerdict::Drop);
 }
 
 #[test]
 fn captive_portal_without_gateway_allows_all_http() {
     let rs = render(&policy(), TunnelState::CaptivePortal);
-    assert!(rs
-        .rules
-        .iter()
-        .any(|r| r.to_string().contains("tcp dport { 80, 443 } accept")));
+    assert_eq!(
+        captive_portal_openings(&rs, ChainKind::Output),
+        ["oifname \"eth0\" tcp dport { 80, 443 } accept"]
+    );
+    assert_eq!(
+        captive_portal_openings(&rs, ChainKind::Forward),
+        ["iifname \"eth1\" oifname \"eth0\" tcp dport { 80, 443 } accept"]
+    );
+}
+
+/// The captive-portal openings of one chain, as text.
+fn captive_portal_openings(rs: &Ruleset, chain: ChainKind) -> Vec<String> {
+    let ports = Match::DestPortSet {
+        ports: vec![80, 443],
+        proto: L4::Tcp,
+    };
+    rs.chain(chain)
+        .filter(|rule| rule.matches.contains(&ports))
+        .map(|rule| rule.to_string())
+        .collect()
+}
+
+/// The relayed opening is for the LAN; without a LAN interface there is no
+/// traffic it is for, and none is rendered — with or without a known
+/// gateway, with or without a tunnel interface — rather than an opening
+/// scoped by the WAN alone, which the tunnel clients would reach. The
+/// gateway's own opening is unchanged.
+#[test]
+fn captive_portal_without_a_lan_interface_relays_nothing() {
+    for gateway in [Some("192.0.2.1"), None] {
+        for wg_iface in ["helios0", ""] {
+            let mut p = policy();
+            p.lan_ifaces = Vec::new();
+            p.wg_iface = wg_iface.into();
+            p.captive_portal_gateway = gateway.map(str::to_string);
+            let rs = render(&p, TunnelState::CaptivePortal);
+            assert!(
+                captive_portal_openings(&rs, ChainKind::Forward).is_empty(),
+                "gateway {gateway:?}, wg_iface {wg_iface:?}: {:?}",
+                text(&rs, ChainKind::Forward)
+            );
+            let expected = match gateway {
+                Some(gw) => {
+                    format!("oifname \"eth0\" ip daddr {gw}/32 tcp dport {{ 80, 443 }} accept")
+                }
+                None => "oifname \"eth0\" tcp dport { 80, 443 } accept".to_string(),
+            };
+            assert_eq!(
+                captive_portal_openings(&rs, ChainKind::Output),
+                [expected],
+                "gateway {gateway:?}, wg_iface {wg_iface:?}"
+            );
+        }
+    }
+}
+
+/// One relayed opening per LAN interface and WAN: LAN interfaces in policy
+/// order, and the WANs in policy order for each of them. The gateway's own
+/// opening stays one per WAN.
+#[test]
+fn captive_portal_relays_one_opening_per_lan_and_wan() {
+    let mut p = policy();
+    p.wan_ifaces = vec!["enp3s0".into(), "wlo1".into()];
+    p.lan_ifaces = vec!["eth1".into(), "br-lan".into()];
+    p.captive_portal_gateway = Some("192.0.2.1".into());
+    let rs = render(&p, TunnelState::CaptivePortal);
+    assert_eq!(
+        captive_portal_openings(&rs, ChainKind::Output),
+        [
+            "oifname \"enp3s0\" ip daddr 192.0.2.1/32 tcp dport { 80, 443 } accept",
+            "oifname \"wlo1\" ip daddr 192.0.2.1/32 tcp dport { 80, 443 } accept",
+        ]
+    );
+    assert_eq!(
+        captive_portal_openings(&rs, ChainKind::Forward),
+        [
+            "iifname \"eth1\" oifname \"enp3s0\" ip daddr 192.0.2.1/32 tcp dport { 80, 443 } accept",
+            "iifname \"eth1\" oifname \"wlo1\" ip daddr 192.0.2.1/32 tcp dport { 80, 443 } accept",
+            "iifname \"br-lan\" oifname \"enp3s0\" ip daddr 192.0.2.1/32 tcp dport { 80, 443 } accept",
+            "iifname \"br-lan\" oifname \"wlo1\" ip daddr 192.0.2.1/32 tcp dport { 80, 443 } accept",
+        ]
+    );
+}
+
+/// The gateway address is parsed whatever the topology: without a LAN
+/// interface no relayed opening is rendered, but an invalid address still
+/// fails the render, so that `check_policy` refuses it.
+#[test]
+fn an_invalid_captive_portal_gateway_is_refused_without_a_lan() {
+    for lan_ifaces in [vec![], vec!["eth1".to_string()]] {
+        let mut p = policy();
+        p.lan_ifaces = lan_ifaces.clone();
+        p.captive_portal_gateway = Some("192.0.2.1/33".into());
+        let error = super::super::render(&p, TunnelState::CaptivePortal)
+            .expect_err("an invalid captive-portal gateway must be refused");
+        assert!(
+            error.to_string().contains("192.0.2.1/33"),
+            "lan {lan_ifaces:?}: {error}"
+        );
+        assert!(check_policy(&p).is_err(), "lan {lan_ifaces:?}");
+    }
 }
 
 #[test]
 fn split_tunnel_adds_bypass_rules() {
     let mut p = policy();
-    p.split_tunnel_cidrs = vec!["192.168.1.0/24".into(), "10.0.0.0/8".into()];
+    p.split_tunnel_cidrs = vec![
+        "192.168.1.0/24".into(),
+        "10.0.0.0/8".into(),
+        "fd00:1::/64".into(),
+    ];
     let rs = render(&p, TunnelState::Up);
     let fwd = text(&rs, ChainKind::Forward);
-    assert!(fwd.iter().any(|r| r == "ip daddr 192.168.1.0/24 accept"));
-    assert!(fwd.iter().any(|r| r == "ip daddr 10.0.0.0/8 accept"));
-    assert!(fwd.iter().any(|r| r.contains("iifname \"eth1\"")));
+    let bypasses: Vec<&String> = fwd.iter().filter(|r| r.contains("daddr")).collect();
+    // The bypasses apply only to traffic entering by the LAN, in either
+    // family.
+    assert_eq!(
+        bypasses,
+        [
+            "iifname \"eth1\" ip daddr 192.168.1.0/24 accept",
+            "iifname \"eth1\" ip daddr 10.0.0.0/8 accept",
+            "iifname \"eth1\" ip6 daddr fd00:1::/64 accept",
+        ]
+    );
+    assert!(fwd.iter().any(|r| r.contains("oifname \"eth0\"")));
+}
+
+/// The bypass is scoped to the LAN; without a LAN interface there is no
+/// traffic it is for, and none is rendered — with or without a tunnel
+/// interface — rather than an unscoped acceptance.
+#[test]
+fn split_tunnel_without_a_lan_interface_renders_no_bypass() {
+    for wg_iface in ["helios0", ""] {
+        let mut p = policy();
+        p.lan_ifaces = Vec::new();
+        p.wg_iface = wg_iface.into();
+        p.split_tunnel_cidrs = vec!["192.168.1.0/24".into(), "fd00:1::/64".into()];
+        let rs = render(&p, TunnelState::Up);
+        assert!(
+            rs.chain(ChainKind::Forward)
+                .all(|rule| !rule.matches.iter().any(|m| matches!(m, Match::DestNet(_)))),
+            "wg_iface {wg_iface:?}: {:?}",
+            text(&rs, ChainKind::Forward)
+        );
+    }
+}
+
+/// One bypass per LAN interface and CIDR: LAN interfaces in policy order,
+/// and the CIDRs in policy order for each of them.
+#[test]
+fn split_tunnel_renders_one_bypass_per_lan_and_cidr() {
+    let mut p = policy();
+    p.lan_ifaces = vec!["eth1".into(), "br-lan".into()];
+    p.split_tunnel_cidrs = vec!["192.168.1.0/24".into(), "fd00:1::/64".into()];
+    let rs = render(&p, TunnelState::Up);
+    let fwd = text(&rs, ChainKind::Forward);
+    let bypasses: Vec<&String> = fwd.iter().filter(|r| r.contains("daddr")).collect();
+    assert_eq!(
+        bypasses,
+        [
+            "iifname \"eth1\" ip daddr 192.168.1.0/24 accept",
+            "iifname \"eth1\" ip6 daddr fd00:1::/64 accept",
+            "iifname \"br-lan\" ip daddr 192.168.1.0/24 accept",
+            "iifname \"br-lan\" ip6 daddr fd00:1::/64 accept",
+        ]
+    );
+}
+
+/// No split-tunnel bypass can be reached by a packet entering by a WAN —
+/// for a global IPv6 LAN prefix, that would be an inbound opening from the
+/// Internet to the LAN — nor by one entering through the tunnel interface.
+/// Every rule that names a split-tunnel destination requires a LAN input
+/// interface.
+#[test]
+fn no_split_tunnel_bypass_matches_a_packet_entering_by_a_wan() {
+    let mut p = policy();
+    p.wan_ifaces = vec!["enp3s0".into(), "wlo1".into()];
+    p.lan_ifaces = vec!["eth1".into(), "br-lan".into()];
+    p.allow_client_internet = true;
+    p.split_tunnel_cidrs = vec!["192.168.50.0/24".into(), "2001:db8:50::/48".into()];
+    let destinations: Vec<Match> = p
+        .split_tunnel_cidrs
+        .iter()
+        .map(|cidr| Match::DestNet(cidr.parse().expect("a valid CIDR")))
+        .collect();
+    let rs = render(&p, TunnelState::Up);
+    let mut bypasses = 0;
+    for rule in rs
+        .chain(ChainKind::Forward)
+        .filter(|rule| rule.matches.iter().any(|m| destinations.contains(m)))
+    {
+        bypasses += 1;
+        let inputs: Vec<&String> = rule
+            .matches
+            .iter()
+            .filter_map(|m| match m {
+                Match::InIface(iface) => Some(iface),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !inputs.is_empty() && inputs.iter().all(|iface| p.lan_ifaces.contains(iface)),
+            "`{rule}` can be reached by a packet entering by a WAN or the tunnel"
+        );
+    }
+    assert_eq!(bypasses, p.lan_ifaces.len() * destinations.len());
 }
 
 /// MSS clamping is a mangle action, not a verdict: it lives outside of

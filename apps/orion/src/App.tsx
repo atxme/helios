@@ -264,6 +264,7 @@ export default function App() {
         adapterUp={c.adapterUp}
         profile={c.selectedProfile}
         psk={c.psk}
+        capture={c.capture}
         vault={vault}
       />
 

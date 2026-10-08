@@ -8,7 +8,7 @@
 use aether::{FirewallPolicy, Result};
 
 use super::ChainKind::Input;
-use super::{network, Match, Rule, Verdict, L4};
+use super::{parse_network, Match, Rule, Verdict, L4};
 
 pub(super) fn admin_api(rules: &mut Vec<Rule>, policy: &FirewallPolicy) {
     // ── Administration: the API must only be reachable through the tunnel ──
@@ -52,7 +52,7 @@ pub(super) fn ssh_sources(rules: &mut Vec<Rule>, policy: &FirewallPolicy) -> Res
         rules.push(Rule::new(
             Input,
             vec![
-                Match::SourceNet(network(src)?),
+                Match::SourceNet(parse_network(src)?),
                 Match::DestPort {
                     port: 22,
                     proto: L4::Tcp,

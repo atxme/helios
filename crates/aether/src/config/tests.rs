@@ -1,5 +1,7 @@
 use super::*;
 
+mod ipv6;
+
 /// A configuration reloaded from disk carries no secret — by design.
 ///
 /// This is the accident the merge exists to prevent: `network.toml` is
@@ -16,6 +18,7 @@ fn a_reloaded_config_keeps_the_secrets_the_file_never_held() {
             name: "poste".into(),
             public_key: "CLE-PUBLIQUE-DU-POSTE".into(),
             address: "100.64.1.2/32".into(),
+            address_v6: None,
             admin: false,
             preshared_key: Some("PSK-NEGOCIE".into()),
             key_negotiation_certificate_sha256: Some("empreinte-tls".into()),
@@ -44,6 +47,7 @@ fn a_reloaded_config_keeps_the_secrets_the_file_never_held() {
                 name: "nouveau".into(),
                 public_key: "CLE-DU-NOUVEAU".into(),
                 address: "100.64.1.3/32".into(),
+                address_v6: None,
                 admin: false,
                 preshared_key: None,
                 key_negotiation_certificate_sha256: None,
@@ -104,6 +108,7 @@ fn the_debug_of_a_running_configuration_reveals_no_secret() {
         name: "alice".into(),
         public_key: "CLE-PUBLIQUE-ALICE".into(),
         address: "100.64.1.2/32".into(),
+        address_v6: None,
         admin: false,
         preshared_key: Some(PSK.into()),
         key_negotiation_certificate_sha256: None,
@@ -136,6 +141,7 @@ fn duplicating_a_configuration_carries_the_secrets_independently() {
         name: "alice".into(),
         public_key: "CLE-PUBLIQUE-ALICE".into(),
         address: "100.64.1.2/32".into(),
+        address_v6: None,
         admin: false,
         preshared_key: Some("psk".into()),
         key_negotiation_certificate_sha256: None,
@@ -437,6 +443,33 @@ fn meshnet_rejects_ambiguous_or_unbounded_configuration() {
     );
 }
 
+/// IPv6 Meshnet peers stay refused: NordVPN hands out IPv4 Meshnet
+/// addresses, and the firewall's IPv6 Meshnet rules are only reachable from a
+/// policy built in code until accepting them is decided.
+#[test]
+fn meshnet_refuses_ipv6_peer_cidrs() {
+    let mut cfg = NetworkConfig {
+        wan_ifaces: vec!["eth0".into()],
+        allow_gateway_egress: true,
+        nordvpn_meshnet: Some(NordvpnMeshnetConfig {
+            peer_cidrs: vec!["100.70.36.212/32".into()],
+            ..NordvpnMeshnetConfig::default()
+        }),
+        ..NetworkConfig::default()
+    };
+    assert!(cfg.validate().is_ok());
+
+    let meshnet = cfg.nordvpn_meshnet.as_mut().unwrap();
+    meshnet.peer_cidrs = vec!["100.70.36.212/32".into(), "2001:db8::5/128".into()];
+    meshnet.traffic_routing_peer_cidrs = vec!["2001:db8::5/128".into()];
+    assert!(cfg.validate().is_err(), "an IPv6 peer CIDR is refused");
+
+    let meshnet = cfg.nordvpn_meshnet.as_mut().unwrap();
+    meshnet.peer_cidrs = vec!["2001:db8::/64".into()];
+    meshnet.traffic_routing_peer_cidrs.clear();
+    assert!(cfg.validate().is_err(), "an IPv6 peer network is refused");
+}
+
 #[test]
 fn repository_network_example_is_valid() {
     let cfg: NetworkConfig = toml::from_str(include_str!("../../../../config/network.toml"))
@@ -463,6 +496,7 @@ fn identities_require_unique_host_vips() {
         name: name.into(),
         public_key: key.into(),
         address: address.into(),
+        address_v6: None,
         admin: false,
         preshared_key: None,
         key_negotiation_certificate_sha256: None,
@@ -529,10 +563,14 @@ fn the_api_listens_on_the_tunnel_address() {
         wg_address: "100.64.0.1/10".into(),
         ..NetworkConfig::default()
     };
-    assert_eq!(cfg.api_bind(), "100.64.0.1:8080");
+    let bind = cfg.api_bind().expect("an IPv4 VIP is a bind address");
+    assert_eq!(
+        bind,
+        "100.64.0.1:8080".parse::<SocketAddr>().expect("literal")
+    );
+    assert_eq!(bind.port(), API_PORT);
     assert_ne!(
-        cfg.api_bind(),
-        API_BIND_LOOPBACK,
+        bind, API_BIND_LOOPBACK,
         "on loopback, provisioning would be unreachable"
     );
 }
@@ -544,22 +582,81 @@ fn the_raw_speedtest_uses_the_fixed_in_tunnel_port() {
         wg_address: "100.64.0.1/10".into(),
         ..NetworkConfig::default()
     };
-    assert_eq!(cfg.speedtest_bind(), "100.64.0.1:55182");
-    assert_eq!(NetworkConfig::default().speedtest_bind(), "127.0.0.1:55182");
+    let bind = cfg.speedtest_bind().expect("an IPv4 VIP is a bind address");
+    assert_eq!(
+        bind,
+        "100.64.0.1:55182".parse::<SocketAddr>().expect("literal")
+    );
+    assert_eq!(bind.port(), SPEEDTEST_PORT);
+    assert_eq!(
+        NetworkConfig::default().speedtest_bind().expect("loopback"),
+        "127.0.0.1:55182".parse::<SocketAddr>().expect("literal")
+    );
+    assert_eq!(SPEEDTEST_BIND_LOOPBACK.port(), SPEEDTEST_PORT);
 }
 
 /// Without a configured gateway, no reason to expose the API: loopback.
 #[test]
 fn falls_back_to_loopback_without_a_gateway() {
-    assert_eq!(NetworkConfig::default().api_bind(), API_BIND_LOOPBACK);
+    assert_eq!(
+        NetworkConfig::default().api_bind().expect("loopback"),
+        API_BIND_LOOPBACK
+    );
+    assert_eq!(
+        API_BIND_LOOPBACK,
+        "127.0.0.1:8080".parse::<SocketAddr>().expect("literal")
+    );
 
-    // Malformed address: we fall back rather than exposing anything.
+    // A tunnel address, but no identity: the interface is not brought up,
+    // so there is no VIP to listen on yet.
     let cfg = NetworkConfig {
-        wg_private_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
-        wg_address: "/10".into(),
+        wg_address: "100.64.0.1/10".into(),
         ..NetworkConfig::default()
     };
-    assert_eq!(cfg.api_bind(), API_BIND_LOOPBACK);
+    assert!(!cfg.wireguard_ready());
+    assert_eq!(cfg.api_bind().expect("loopback"), API_BIND_LOOPBACK);
+    assert_eq!(
+        cfg.speedtest_bind().expect("loopback"),
+        SPEEDTEST_BIND_LOOPBACK
+    );
+}
+
+/// The prefix is the data plane's business: a bare host still names the VIP.
+#[test]
+fn a_wg_address_without_prefix_still_names_the_vip() {
+    let cfg = NetworkConfig {
+        wg_private_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+        wg_address: " 100.64.0.1 ".into(),
+        ..NetworkConfig::default()
+    };
+    assert_eq!(
+        cfg.api_bind().expect("a bare IPv4 host is a bind address"),
+        "100.64.0.1:8080".parse::<SocketAddr>().expect("literal")
+    );
+}
+
+/// A configured gateway whose `wg_address` names no IPv4 host is refused,
+/// not quietly moved to loopback: the tunnel could come up with its API out
+/// of every client's reach. IPv6 is refused too, because the control plane
+/// listens on the IPv4 VIP only (`ADRESSAGE-IPV6.md` §2.6).
+#[test]
+fn a_wg_address_without_an_ipv4_host_is_refused() {
+    for wg_address in ["/10", "gateway/10", "100.64.0/10", "fd00::1/64", "fd00::1"] {
+        let cfg = NetworkConfig {
+            wg_private_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+            wg_address: wg_address.into(),
+            ..NetworkConfig::default()
+        };
+        assert!(cfg.wireguard_ready(), "{wg_address}");
+        for bind in [cfg.api_bind(), cfg.speedtest_bind()] {
+            match bind {
+                Err(HeliosError::Config(message)) => {
+                    assert!(message.contains(wg_address), "{message}");
+                }
+                other => panic!("{wg_address}: expected a config error, got {other:?}"),
+            }
+        }
+    }
 }
 
 /// Serialises the tests that drive `HELIOS_NETWORK_CONFIG`.
@@ -607,6 +704,7 @@ fn production_save_excludes_runtime_secrets_and_development_keeps_only_identity(
         name: "poste".into(),
         public_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
         address: "100.64.1.2/32".into(),
+        address_v6: None,
         admin: false,
         preshared_key: Some(PSK.into()),
         key_negotiation_certificate_sha256: None,

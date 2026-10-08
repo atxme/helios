@@ -427,6 +427,71 @@ fn disk_roundtrip() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The default full tunnel captures both families, spelled canonically.
+///
+/// `0.0.0.0/0` alone let a dual-stack machine send all of its IPv6 around the
+/// tunnel, in clear. The spelling matters as much: a default the import path
+/// would rewrite reads as an unsaved change on the first reload.
+#[test]
+fn the_default_full_tunnel_captures_both_families() {
+    assert_eq!(DEFAULT_ALLOWED_IPS, "0.0.0.0/0, ::/0");
+    assert_eq!(
+        crate::profile_import::normalize_cidr_list(DEFAULT_ALLOWED_IPS),
+        DEFAULT_ALLOWED_IPS
+    );
+    assert!(crate::profile_import::validate_allowed_ips(DEFAULT_ALLOWED_IPS).is_ok());
+    let fresh = ClientProfile::default();
+    assert_eq!(fresh.allowed_ips, DEFAULT_ALLOWED_IPS);
+    assert!(!fresh.ipv6_uncaptured_full_tunnel());
+}
+
+/// A profile stored with the old IPv4-only default is read back as stored.
+///
+/// The serde default only fills an **absent** field. A stored `0.0.0.0/0` is
+/// a value, and widening it on load would change a routing table nobody
+/// edited: it is flagged instead.
+#[test]
+fn a_stored_ipv4_only_full_tunnel_is_not_widened_on_load() {
+    let raw = r#"
+        selected = "site-a"
+
+        [[profiles]]
+        name = "site-a"
+        endpoint = "203.0.113.10:51820"
+        allowed_ips = "0.0.0.0/0"
+    "#;
+    let loaded: ClientConfig = toml::from_str(raw).unwrap();
+    let profile = loaded.find("site-a").unwrap();
+    assert_eq!(profile.allowed_ips, "0.0.0.0/0");
+    assert!(profile.ipv6_uncaptured_full_tunnel());
+}
+
+/// A profile written before `address_v6` existed reads with none, and one
+/// without it serializes without the key: an absent value writes nothing.
+#[test]
+fn an_absent_ipv6_address_is_neither_invented_nor_written() {
+    let raw = r#"
+        [[profiles]]
+        name = "site-a"
+        address = "100.64.1.2/32"
+    "#;
+    let loaded: ClientConfig = toml::from_str(raw).unwrap();
+    let profile = loaded.find("site-a").unwrap();
+    assert_eq!(profile.address_v6, None);
+
+    let toml = toml::to_string(profile).unwrap();
+    assert!(!toml.contains("address_v6"), "{toml}");
+    let json = serde_json::to_string(profile).unwrap();
+    assert!(!json.contains("address_v6"), "{json}");
+
+    let dual = ClientProfile {
+        address_v6: Some("fd3c:91a2:7e04::2/128".into()),
+        ..profile.clone()
+    };
+    let reread: ClientProfile = toml::from_str(&toml::to_string(&dual).unwrap()).unwrap();
+    assert_eq!(reread.address_v6.as_deref(), Some("fd3c:91a2:7e04::2/128"));
+}
+
 #[test]
 fn secrets_masked_in_debug() {
     let p = ClientProfile {

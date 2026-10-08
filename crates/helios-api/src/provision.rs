@@ -34,25 +34,11 @@ use aether::enroll::{EnrollError, ProvisionRequest, ProvisionResponse};
 use aether::{InstallPskRequest, SecretString};
 use axum::{extract::State, http::StatusCode, Extension, Json};
 use helios_provisioning::{
-    handle_request, session::fresh_nonce, AdmittedPeers, GatewayIdentity, Provisioned,
-    DEFAULT_PSK_LIFETIME_SECS,
+    handle_request, session::fresh_nonce, GatewayIdentity, Provisioned, DEFAULT_PSK_LIFETIME_SECS,
 };
-use helios_wireguard::PeerStatus;
 use tokio::sync::oneshot;
 
 use crate::AppState;
-
-/// "Admitted peers" view backed by the network config.
-///
-/// Admission stays **out of band**: this list is the one the operator
-/// declared (`peers` in `network.toml`). Provisioning never extends it.
-struct AdmittedFromConfig(Vec<String>);
-
-impl AdmittedPeers for AdmittedFromConfig {
-    fn is_admitted(&self, wg_public_key: &str) -> bool {
-        self.0.iter().any(|k| k == wg_public_key)
-    }
-}
 
 /// Handles a provisioning request coming from a client, **inside the tunnel**.
 pub async fn provision(
@@ -94,21 +80,16 @@ pub async fn provision(
         Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, e)),
     };
 
-    let admitted = AdmittedFromConfig(network.peers.iter().map(|p| p.public_key.clone()).collect());
-
-    // The orchestrator owns the backend and publishes its latest read-only
-    // snapshot through AppState. Copy it before releasing the network lock so
-    // provisioning never reaches into, or depends on, the WireGuard backend.
-    let peer_snapshot = s.peer_runtime.read().await.clone();
-    let peers = PeerAddressTable::from_peers(&peer_snapshot);
-
     let identity = GatewayIdentity {
         wg_public_key: &gateway_public_key,
         psk_lifetime_secs: DEFAULT_PSK_LIFETIME_SECS,
     };
 
+    // Admission stays **out of band**: the admitted peers, and the VIPs they
+    // were admitted with, are the ones `network.toml` declares. Provisioning
+    // neither extends that list nor consults the IPAM.
     let provisioned =
-        handle_request(&request, &identity, &admitted, &peers, fresh_nonce()).map_err(to_http)?;
+        handle_request(&request, &identity, &*network, fresh_nonce()).map_err(to_http)?;
 
     // The config is no longer needed, and the orchestrator will want to
     // write it: release the read lock before handing over control.
@@ -122,7 +103,7 @@ pub async fn provision(
 
     tracing::info!(
         peer = %request.client_wg_public_key,
-        vip = %provisioned.address,
+        vip = %provisioned.vips.v4,
         "provisioning completed — post-quantum PSK derived and installed"
     );
 
@@ -150,7 +131,7 @@ async fn install_psk(
 
     let request = InstallPskRequest {
         public_key: client_public_key.to_string(),
-        address: format!("{}/32", provisioned.address),
+        address: provisioned.vips.address(),
         psk: Some(SecretString::new(aether::enroll::psk_to_base64(
             &provisioned.psk,
         ))),
@@ -190,7 +171,9 @@ fn to_http(e: EnrollError) -> (StatusCode, String) {
     let code = match e {
         EnrollError::UnknownPeer => StatusCode::FORBIDDEN,
         EnrollError::VersionMismatch { .. } => StatusCode::CONFLICT,
-        EnrollError::Kdf => StatusCode::INTERNAL_SERVER_ERROR,
+        // The peer is admitted but its declaration is unreadable: the
+        // gateway's configuration is at fault, not the request.
+        EnrollError::Kdf | EnrollError::UndeclaredAddress => StatusCode::INTERNAL_SERVER_ERROR,
         _ => StatusCode::BAD_REQUEST,
     };
     // A refused provisioning shows up in the log: it's the only place where
@@ -206,49 +189,6 @@ fn gateway_public_key(private_key_b64: &str) -> Result<String, String> {
         .map_err(|e| format!("unreadable gateway private key: {e}"))
 }
 
-/// Adapts a live data-plane snapshot to the IPAM collision view.
-///
-/// It lives here, with its only caller, rather than in the data plane: it is
-/// the wiring between two subsystems, and wiring belongs to whoever composes
-/// them. Keeping it in `helios-wireguard` made the data plane depend on
-/// admission for a single one-method trait.
-struct PeerAddressTable {
-    /// `(VIP, raw public key)` for each known peer.
-    entries: Vec<(std::net::Ipv4Addr, Vec<u8>)>,
-}
-
-impl PeerAddressTable {
-    /// Builds the table from a data plane snapshot.
-    ///
-    /// Non-IPv4 or malformed `allowed_ips` are ignored: they cannot collide
-    /// with a derived CGNAT VIP.
-    fn from_peers(peers: &[PeerStatus]) -> Self {
-        let mut entries = Vec::new();
-        for peer in peers {
-            for cidr in &peer.allowed_ips {
-                let host = cidr.split('/').next().unwrap_or(cidr);
-                if let Ok(addr) = host.parse::<std::net::Ipv4Addr>() {
-                    entries.push((addr, peer.public_key.clone()));
-                }
-            }
-        }
-        Self { entries }
-    }
-
-    #[cfg(test)]
-    fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-}
-
-impl helios_provisioning::PeerTable for PeerAddressTable {
-    fn is_taken_by_other(&self, addr: std::net::Ipv4Addr, pubkey: &[u8]) -> bool {
-        self.entries
-            .iter()
-            .any(|(a, owner)| *a == addr && owner.as_slice() != pubkey)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,9 +198,8 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::{broadcast, mpsc, RwLock};
 
-    use helios_provisioning::{derive_cgnat_ip, PeerTable};
-    use helios_wireguard::{DryRunBackend, InterfaceConfig, PeerConfig, WireguardBackend};
-    use std::net::Ipv4Addr;
+    use helios_provisioning::derive_cgnat_ip;
+    use helios_wireguard::PeerStatus;
 
     fn live_peer(pubkey: &[u8], vip: &str) -> PeerStatus {
         PeerStatus {
@@ -271,98 +210,6 @@ mod tests {
             rx_bytes: 0,
             tx_bytes: 0,
         }
-    }
-
-    #[test]
-    fn table_detects_collision_with_another_peer() {
-        let table = PeerAddressTable::from_peers(&[live_peer(&[1u8; 32], "100.64.1.2/32")]);
-        let vip: Ipv4Addr = "100.64.1.2".parse().unwrap();
-
-        // Another key claiming the same VIP = collision.
-        assert!(table.is_taken_by_other(vip, &[2u8; 32]));
-        // The same peer never collides with itself (reconnection).
-        assert!(!table.is_taken_by_other(vip, &[1u8; 32]));
-    }
-
-    #[test]
-    fn free_address_not_flagged() {
-        let table = PeerAddressTable::from_peers(&[live_peer(&[1u8; 32], "100.64.1.2/32")]);
-        let other: Ipv4Addr = "100.64.9.9".parse().unwrap();
-        assert!(!table.is_taken_by_other(other, &[2u8; 32]));
-    }
-
-    #[test]
-    fn non_ipv4_allowed_ips_ignored() {
-        let mut p = live_peer(&[1u8; 32], "100.64.1.2/32");
-        p.allowed_ips.push("fd00::1/128".into());
-        p.allowed_ips.push("not-an-address".into());
-        let table = PeerAddressTable::from_peers(&[p]);
-        // Only the valid IPv4 entry is retained.
-        assert!(!table.is_empty());
-        assert!(table.is_taken_by_other("100.64.1.2".parse().unwrap(), &[2u8; 32]));
-    }
-
-    #[test]
-    fn empty_and_multiple_snapshots_are_represented_correctly() {
-        let empty = PeerAddressTable::from_peers(&[]);
-        assert!(empty.is_empty());
-
-        let snapshot = vec![
-            live_peer(&[1u8; 32], "100.64.1.2/32"),
-            live_peer(&[2u8; 32], "100.64.1.3/32"),
-        ];
-        let table = PeerAddressTable::from_peers(&snapshot);
-        assert!(table.is_taken_by_other("100.64.1.2".parse().unwrap(), &[3u8; 32]));
-        assert!(table.is_taken_by_other("100.64.1.3".parse().unwrap(), &[3u8; 32]));
-        assert!(!table.is_taken_by_other("100.64.1.4".parse().unwrap(), &[3u8; 32]));
-    }
-
-    #[test]
-    fn snapshot_collision_view_leaves_the_next_address_available() {
-        let key = [7u8; 32];
-        let natural = derive_cgnat_ip(&key, 0);
-        let next = derive_cgnat_ip(&key, 1);
-        let table =
-            PeerAddressTable::from_peers(&[live_peer(&[8u8; 32], &format!("{natural}/32"))]);
-
-        assert!(table.is_taken_by_other(natural, &key));
-        assert!(!table.is_taken_by_other(next, &key));
-        assert_eq!(
-            helios_provisioning::assign_vip(&table, &key, 64).unwrap(),
-            next
-        );
-    }
-
-    #[tokio::test]
-    async fn a_wireguard_snapshot_populates_the_collision_view() {
-        const KEY_A: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
-        const KEY_B: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
-
-        let be = DryRunBackend::with_handshakes();
-        be.up(
-            &InterfaceConfig {
-                name: "helios0".into(),
-                private_key: helios_wireguard::Zeroizing::new(KEY_A.into()),
-                listen_port: helios_wireguard::WG_LISTEN_PORT,
-                address: "100.64.0.1/10".into(),
-                mtu: None,
-            },
-            &[PeerConfig {
-                public_key: KEY_B.into(),
-                allowed_ips: "100.64.1.2/32".into(),
-                preshared_key: None,
-                persistent_keepalive_secs: 25,
-            }],
-        )
-        .await
-        .unwrap();
-
-        let snapshot = be.peers().await.unwrap();
-        assert!(snapshot[0].last_handshake.is_some());
-
-        let table = PeerAddressTable::from_peers(&snapshot);
-        let vip = "100.64.1.2".parse().unwrap();
-        assert!(table.is_taken_by_other(vip, &[9u8; 32]));
     }
 
     const PRIV: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
@@ -392,6 +239,7 @@ mod tests {
                 name: "workstation".into(),
                 public_key: client_public_key(),
                 address: "100.64.1.2/32".into(),
+                address_v6: None,
                 admin: false,
                 preshared_key: None,
                 key_negotiation_certificate_sha256: None,
@@ -463,9 +311,8 @@ mod tests {
             .0;
 
         let (installed_psk, address) = orchestrator.await.unwrap();
-        // The transmitted VIP is the one the IPAM derives from the public
-        // key, and it is indeed the one announced to the client: the two
-        // must agree.
+        // The transmitted VIP is the one admission persisted, and it is
+        // indeed the one announced to the client: the two must agree.
         assert_eq!(
             address, response.assigned_address,
             "the installed VIP must be the one announced to the client"
@@ -490,19 +337,20 @@ mod tests {
         );
     }
 
+    /// Provisioning used to re-derive the VIP against the live table, and a
+    /// live peer on the client's natural VIP moved the answer to the next
+    /// candidate — away from the address the gateway routes. It now returns
+    /// the declaration, whatever the live table holds (§3 bis.2, rule 4).
     #[tokio::test]
-    async fn provisioning_uses_existing_wireguard_peers_for_ipam() {
+    async fn provisioning_returns_the_declared_vip_whatever_the_live_table_holds() {
         let (state, mut psk_rx) = provisionable_state();
         let (_, _, request) = client_request();
         use base64::Engine as _;
-        let client_key = request.client_wg_public_key.clone();
         let client_raw = base64::engine::general_purpose::STANDARD
-            .decode(&client_key)
+            .decode(&request.client_wg_public_key)
             .unwrap();
         let natural = derive_cgnat_ip(&client_raw, 0);
-
-        // This peer is not in network.toml's admission list for the request;
-        // it represents a peer already present in the live WireGuard table.
+        assert_ne!(format!("{natural}/32"), "100.64.1.2/32");
         state
             .peer_runtime
             .write()
@@ -511,17 +359,20 @@ mod tests {
 
         let orchestrator = tokio::spawn(async move {
             let demand = psk_rx.recv().await.expect("a request must arrive");
+            let address = demand.address.clone();
             demand.reply.send(Ok(())).unwrap();
+            address
         });
 
         let response = provision(State(state), None, Json(request))
             .await
             .expect("provisioning must succeed")
             .0;
-        orchestrator.await.unwrap();
+        let installed = orchestrator.await.unwrap();
 
-        let expected_next = derive_cgnat_ip(&client_raw, 1);
-        assert_eq!(response.assigned_address, format!("{expected_next}/32"));
+        assert_eq!(response.assigned_address, "100.64.1.2/32");
+        assert_eq!(installed, "100.64.1.2/32");
+        assert_eq!(response.assigned_address_v6, None);
     }
 
     /// Fail-closed: if the gateway cannot install the PSK, it does not
@@ -595,16 +446,6 @@ mod tests {
     }
 
     #[test]
-    fn only_declared_peers_are_admitted() {
-        let admitted = AdmittedFromConfig(vec!["key-a".into()]);
-        assert!(admitted.is_admitted("key-a"));
-        assert!(
-            !admitted.is_admitted("key-b"),
-            "provisioning must never extend admission"
-        );
-    }
-
-    #[test]
     fn protocol_errors_have_the_right_http_code() {
         assert_eq!(to_http(EnrollError::UnknownPeer).0, StatusCode::FORBIDDEN);
         assert_eq!(
@@ -618,6 +459,10 @@ mod tests {
         assert_eq!(
             to_http(EnrollError::BadKemPublicKey(3)).0,
             StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            to_http(EnrollError::UndeclaredAddress).0,
+            StatusCode::INTERNAL_SERVER_ERROR
         );
     }
 }
