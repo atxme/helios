@@ -39,7 +39,7 @@ time.workspace = true
 zeroize.workspace = true
 reqwest = { workspace = true }
 futures-util = { workspace = true }
-tokio-tungstenite = "0.24"
+tokio-tungstenite = "0.30"
 rustyline = { version = "17.0.2", default-features = false, features = ["custom-bindings"] }
 shlex = "2.0.1"
 
