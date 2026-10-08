@@ -117,7 +117,7 @@ pub const INTERNAL_PREFIX: &str = "/internal/v1/certificates/";
 pub const STAGE_PATH: &str = "/internal/v1/certificates/stage";
 pub const STAGE_COMMIT_PATH: &str = "/internal/v1/certificates/stage-commit";
 pub const REVOKE_PATH: &str = "/internal/v1/certificates/revoke";
-const STATE_ROUTE: &str = "/internal/v1/certificates/state/:identity";
+const STATE_ROUTE: &str = "/internal/v1/certificates/state/{identity}";
 
 /// Where the authority leaves a pre-signed transaction for one peer (§8.1.1).
 ///

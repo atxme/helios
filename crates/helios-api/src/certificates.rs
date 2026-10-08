@@ -527,7 +527,7 @@ pub async fn domain(State(s): State<AppState>) -> Response {
     }
 }
 
-/// `GET /api/key-negotiation/trust-enrolment/:public_key`, on the admin
+/// `GET /api/key-negotiation/trust-enrolment/{public_key}`, on the admin
 /// surface.
 ///
 /// `404` and not an empty body, for the same reason `/api/key-negotiation`
