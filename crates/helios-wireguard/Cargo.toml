@@ -10,7 +10,7 @@ description = "Plan de données WireGuard de la gateway Helios : trait + backend
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-base64 = "0.22"
+base64 = "0.23"
 zeroize = { workspace = true }
 defguard_wireguard_rs = { workspace = true, optional = true }
 

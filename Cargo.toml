@@ -122,7 +122,7 @@ fips204 = { version = "=0.4.6", default-features = false, features = ["ml-dsa-65
 curve25519-dalek = "4"
 blake3 = "1"
 zeroize = "1"
-base64 = "0.22"
+base64 = "0.23"
 hex = "0.4"
 # Saisie du PIN FIDO2 sans écho. Un PIN d'authentificateur affiché dans un
 # terminal se retrouve dans un scrollback, une capture d'écran ou un partage.
