@@ -499,21 +499,10 @@ mod tests {
         dir
     }
 
-    /// Serialises the tests that drive `HELIOS_NETWORK_CONFIG`.
-    ///
-    /// The variable is process-wide, so two tests setting it would point each
-    /// other's redaction at the wrong file — and a test that left it unset
-    /// would aim `strip_from_file` at the real `/var/lib/helios/network.toml`.
-    static NETWORK_CONFIG_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// Points `network.toml` inside `dir` for the duration of a test.
     fn with_network_config<T>(dir: &std::path::Path, body: impl FnOnce() -> T) -> T {
-        let _guard = NETWORK_CONFIG_ENV.lock().unwrap_or_else(|e| e.into_inner());
         let path = dir.join("network.toml");
-        std::env::set_var("HELIOS_NETWORK_CONFIG", &path);
-        let outcome = body();
-        std::env::remove_var("HELIOS_NETWORK_CONFIG");
-        outcome
+        crate::with_network_config_test(&path, body)
     }
 
     fn table(peers: &[(&str, &str)]) -> StaticPskMap {

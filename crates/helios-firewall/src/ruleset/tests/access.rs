@@ -689,5 +689,12 @@ fn mss_clamping_outside_rules_and_only_when_up() {
     let mut p = policy();
     p.mss_clamp = Some(1380);
     assert_eq!(render(&p, TunnelState::Up).mss_clamp, Some(1380));
-    assert_eq!(render(&p, TunnelState::Down).mss_clamp, None);
+    for state in [
+        TunnelState::Down,
+        TunnelState::Connecting,
+        TunnelState::Failed,
+        TunnelState::CaptivePortal,
+    ] {
+        assert_eq!(render(&p, state).mss_clamp, None);
+    }
 }

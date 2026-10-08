@@ -164,7 +164,7 @@ meta nfproto ipv6 iifname "<wg_iface>" oifname "<wan>" reject with icmpx admin-p
   l’IPv6 du LAN.
 - **L’IPv6 vers la gateway elle-même** (`<préfixe>::1`) passe par `input` et
   reste régi par `allow_tunnel_icmp` et les autres ouvertures du tunnel.
-- **Pas de limite de débit dans le ruleset** : `rustables 0.8.7` n’encode pas
+- **Pas de limite de débit dans le ruleset** : `rustables 0.8.8` n’encode pas
   `limit`. Le noyau borne l’émission par `net.ipv6.icmp.ratelimit`, et le seul
   destinataire est le pair lui-même, à travers son tunnel authentifié
   (SORTIE-IPV6 §4.2).
@@ -367,7 +367,7 @@ séquence exacte des expressions d’une règle NS.
 | Capacité | État | Détail |
 | --- | --- | --- |
 | `ct state invalid drop` | **SUPPORTED** | IR typée, rendu déterministe, compteur inline, Netlink et ordre testés |
-| rate limiting | **BLOCKED BY BACKEND** | IR complète ; `rustables 0.8.7` n’expose pas `limit`, donc traduction refusée |
+| rate limiting | **BLOCKED BY BACKEND** | IR complète ; `rustables 0.8.8` n’expose pas `limit`, donc traduction refusée |
 | logging | **PARTIAL** | IR et expression Netlink disponibles ; aucune policy active sans limite anti-flood |
 | compteurs inline | **SUPPORTED** | appliqués sur les drops invalides |
 | compteurs nommés | **BLOCKED BY BACKEND** | identité conservée dans l’IR ; pas d’objet compteur ni `objref` dans `rustables` |
@@ -377,47 +377,51 @@ séquence exacte des expressions d’une règle NS.
 | types ICMPv4 | **PARTIAL** | protocole seulement ; l’API haut niveau de `rustables` n’expose pas l’octet de type ICMPv4 et aucun encodeur vérifié n’existe |
 | hop limit IPv6 | **SUPPORTED** | `Match::Ipv6HopLimit`, garde `Meta(NfProto)` + `Cmp` 10 puis `Payload` réseau offset 7 longueur 1 + `Cmp` |
 | adresses IPv4/IPv6 | **SUPPORTED** | `SourceNet`/`DestNet` portent des `IpNetwork` validés ; le backend n’analyse plus de texte |
-| MSS clamp | **BLOCKED BY BACKEND** | `exthdr`/écriture d’option TCP absents ; Netlink n’annonce pas la capacité, donc la sonde conserve la mesure mais ne modifie pas la policy ; une IR construite directement avec un clamp reste refusée avant envoi. La valeur est le MSS IPv4 du tunnel (`aether::mtu::mss_ipv4`, MTU du tunnel − 40) : l’encodeur qui débloquera le clamp devra la garder par `meta nfproto ipv4`, l’IPv6 recevant `aether::mtu::mss_ipv6` (− 60) sous `meta nfproto ipv6` |
+| MSS clamp | **SUPPORTED** | Chaîne `forward` de type `filter`, priorité `mangle` (−150), sans verdict ; règles TCP SYN et SYN-ACK bornées à `iifname` ou `oifname` du tunnel ; MSS IPv4 puis IPv6 (−20), cette dernière absente si la MTU est sous 1280 ; une même transaction atomique que le filtre ; le noyau refuse toute augmentation et recalcule la somme TCP |
 | anti-spoof `fib` | **BLOCKED BY BACKEND** | expression absente et sémantique de routage à borner avant activation |
 | garde de famille `meta nfproto` | **SUPPORTED** | `Match::Family`, `Meta(NfProto)` + `Cmp` 2 ou 10, la même paire que `rustables` émet devant une adresse |
 | NAT/masquerade | **SUPPORTED** | IPv4 seulement (`meta nfproto ipv4`), aucun NAT66 ; uplinks et conditions d’état inchangés, dans la transaction atomique |
 | rejet `icmpx admin-prohibited` | **SUPPORTED** | `Verdict::RejectAdminProhibited`, seule forme de rejet représentable ; expression `Reject` (`IcmpxUnreach`, `AdminProhibited`) sans verdict après elle, octets vérifiés ; utilisé pour la sortie IPv6 des clients du tunnel |
 | remplacement atomique | **SUPPORTED** | `Add → Del → Add`, chaînes filter et NAT, un seul `Batch::send` |
 
-## Audit de `rustables 0.8.7`
+## Audit de `rustables 0.8.8`
 
 La version verrouillée expose les expressions `bitwise`, `cmp`, `ct`, compteur
 inline, `immediate`, log, lookup, masquerade, meta, NAT, payload et reject. Cela
 couvre les règles actuelles, les états conntrack, ICMP par numéro de protocole,
 le type ICMPv6 et le hop limit IPv6 (`HighLevelPayload`, champs
 `ICMPv6HeaderField::Type` et `IPv6HeaderField::HopLimit`), les compteurs inline
-et le logging.
+et le logging. Le petit patch Helios de `vendor/rustables` ajoute l’expression
+typée `exthdr` et le champ TCP `Flags`, enregistrés avec les autres expressions
+pour rester dans le même `Batch` atomique. Le patch ne change ni la socket ni le
+transport Netlink.
 
 Elle ne modélise pas :
 
 - `limit`, nécessaire au rate limiting et au logging borné ;
 - `fib`, nécessaire à un anti-spoof fondé sur le routage ;
-- les objets compteurs nommés et l’expression `objref` ;
-- `exthdr`, nécessaire pour localiser puis modifier l’option TCP MSS.
+- les objets compteurs nommés et l’expression `objref`.
 
-Les constantes UAPI générées existent, car le noyau sait représenter ces
-expressions. Cela ne suffit pas : `ExpressionVariant` est fermé,
-`RawExpression` ne permet pas de choisir un nom d’expression et le module de
-sérialisation Netlink est privé. Une crate consommatrice ne peut donc pas
-ajouter proprement une expression manquante.
+Les constantes UAPI seules ne suffisent pas à encoder une expression :
+l’encodeur doit aussi produire les attributs Netlink typés.
+
+Le patch vendored est nécessaire car `Batch` ne publie ni son buffer ni son
+écrivain, `RawExpression` ne permet pas de choisir un nom d’expression et le
+module de sérialisation Netlink est privé. La mise à jour amont devra réappliquer
+le petit ajout typé d’`Exthdr`, sa variante, `TCPHeaderField::Flags` et leurs
+tests ABI ; Helios conserve les mentions de licence et la provenance upstream.
 
 État amont vérifié le 20 septembre 2026 : le
 [projet GitLab](https://gitlab.com/rustwall/rustables) reste la source déclarée
 et [`rustables 0.8.8`](https://docs.rs/crate/rustables/0.8.8) a été publié le
-23 juin 2026. Le projet est donc encore publié, avec une cadence faible ; cette
-seule publication ne justifie ni une montée de version ni un fork. L’audit de
-capacités ci-dessus reste celui de la `0.8.7` verrouillée par Helios.
+23 juin 2026. Helios conserve exactement cette version et ne change que le
+support typé du TCP MSS. Toute montée de version doit reprendre les tests ABI.
 
 Les options techniques disponibles si un besoin bloquant apparaît sont, par
 ordre de proximité avec l’existant :
 
 1. contribuer ou maintenir un petit fork de `rustables` ajoutant `limit`,
-   `fib`, `objref`/objets et `exthdr`, avec tests d’octets et tests noyau ;
+   `fib` et `objref`/objets, avec tests d’octets et tests noyau ;
 2. évaluer un backend Netlink Rust plus complet, en reprouvant l’atomicité,
    les politiques de chaîne, NAT et chaque expression ;
 3. évaluer `nftnl`/`libnftnl`, au prix d’une dépendance C et d’un nouvel
@@ -426,13 +430,10 @@ ordre de proximité avec l’existant :
 La génération de commandes `nft`, le reparsing de texte et l’API JSON pilotée
 par un processus externe ne sont pas des solutions acceptées pour Helios.
 
-Helios ne maintient pas de fork dans ce lot. `fib` reste différé par sa
-sémantique multi-uplink/policy-routing, les compteurs inline couvrent le besoin
-actuel sans `objref`, et le MSS clamp est une optimisation de performance dont
-l’absence n’ouvre pas de faille. Le déclencheur retenu pour réévaluer un fork
-est une exigence de rate limiting, notamment avant d’activer le logging en
-production. À ce moment-là, l’état de maintenance amont de `rustables` devra
-être revérifié avant de choisir entre contribution, fork ou autre backend.
+`fib` reste différé par sa sémantique multi-uplink/policy-routing et les
+compteurs inline couvrent le besoin actuel sans `objref`. Le MSS clamp reste
+une optimisation de performance ; son application est maintenant disponible
+pour les SYN/SYN-ACK qui traversent l’interface WireGuard seulement.
 
 ## Anti-spoofing et routage
 
@@ -591,12 +592,25 @@ et un `nft monitor`, puis vérifier :
   le ruleset précédent ;
 - aucune application règle par règle n’apparaît dans la trace.
 
-### Capacités non validables dans ce lot
+### MSS : recette noyau requise
 
-Le rate limiting, les compteurs nommés, l’anti-spoof `fib` et le MSS clamp ne
-doivent pas être marqués comme validés sur cible : le backend ne les annonce
-pas ou les refuse encore. Vérifier en revanche qu’une sonde MTU réussie avec le
-backend Netlink journalise une seule fois l’absence de clamping, laisse
-`mss_clamp` vide et ne coupe pas la connexion. Le logging est encodable, mais
+Sur un banc isolé avec des flux TCP IPv4 et IPv6 traversant WireGuard :
+
+- après la sonde MTU, inspecter `nft list chain inet helios mss` : priorité
+  −150, gardes de famille et d’interface dans les deux sens, aucun verdict ;
+- pour une MTU de tunnel 1420, observer des SYN et SYN-ACK à MSS 1380 en IPv4
+  et 1360 en IPv6 après réécriture, avec une somme TCP correcte ; une valeur
+  annoncée déjà plus petite doit rester inchangée ;
+- vérifier qu’un flux ne traversant pas WireGuard reste inchangé, et que
+  la chaîne `mss` disparaît hors de `Up` avec la transition atomique ;
+- sous MTU 1280, vérifier l’absence des deux règles MSS IPv6.
+
+Les tests d’octets et de rendu ne remplacent pas cette recette. Le rejet de
+la sortie Internet IPv6 reste appliqué par le filtre (SORTIE-IPV6).
+
+### Capacités non encodables
+
+Le rate limiting, les compteurs nommés et l’anti-spoof `fib` restent refusés
+avant envoi par le backend. Le logging est encodable, mais
 aucune policy de production ne l’active avant de disposer d’un rate limit qui
 empêche le log flood.

@@ -40,6 +40,7 @@ Avec accès console, sur la gateway :
 ```sh
 sudo heliosd provision-tpm     # une seule fois — scelle un secret neuf
 sudo heliosd init-identity     # affiche la clé PUBLIQUE de la gateway
+sudo heliosd init-ipv6-prefix  # optionnel — génère et persiste le préfixe ULA
 ```
 
 `init-identity` génère la clé privée en mémoire et la scelle directement : elle
@@ -50,6 +51,11 @@ clients devront mettre à jour leur `peer_public_key`.
 Ce chemin est nécessairement local. `POST /api/gateway/wireguard-key` vit
 derrière `helios0`, donc derrière un tunnel qui suppose déjà une identité et un
 pair administrateur : c'est un chemin de rotation, pas de bootstrap.
+
+`init-ipv6-prefix` tire un Global ID ULA et l'écrit dans `wg_address_v6` de
+`network.toml`. La commande ne change jamais un préfixe déjà présent. Le
+préfixe est appliqué au démarrage : arrêter puis redémarrer `heliosd` après sa
+création. Il peut aussi être déclaré manuellement dans `network.toml`.
 
 ## 2. Séquestre — avant d'en avoir besoin
 

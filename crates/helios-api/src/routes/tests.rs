@@ -407,6 +407,36 @@ async fn firewall_rendering_shows_the_ipv4_only_masquerade() {
 }
 
 #[tokio::test]
+async fn firewall_rendering_describes_family_scoped_tunnel_mss_rules() {
+    let (app, _cmd_rx) = app_state(TunnelState::Up);
+    app.policy.write().await.mss_clamp = Some(1240);
+
+    let response = firewall_rules_get(State(app.clone())).await.unwrap().0;
+    assert!(response
+        .rules
+        .contains("type filter hook forward priority mangle;"));
+    assert!(response.rules.contains(
+        "iifname \"helios0\" meta nfproto ipv4 meta l4proto tcp tcp flags & syn == syn tcp option maxseg size set 1240"
+    ));
+    assert!(response.rules.contains(
+        "oifname \"helios0\" meta nfproto ipv6 meta l4proto tcp tcp flags & syn == syn tcp option maxseg size set 1220"
+    ));
+
+    app.policy.write().await.mss_clamp = Some(1239);
+    let response = firewall_rules_get(State(app.clone())).await.unwrap().0;
+    assert!(response
+        .rules
+        .contains("meta nfproto ipv4 meta l4proto tcp"));
+    assert!(!response
+        .rules
+        .contains("meta nfproto ipv6 meta l4proto tcp"));
+
+    app.policy.write().await.wg_iface.clear();
+    let response = firewall_rules_get(State(app)).await.unwrap().0;
+    assert!(!response.rules.contains("chain mss"));
+}
+
+#[tokio::test]
 async fn explicit_error_if_orchestrator_is_absent() {
     let (app, cmd_rx) = app_state(TunnelState::Down);
     drop(cmd_rx);

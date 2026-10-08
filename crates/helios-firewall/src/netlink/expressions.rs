@@ -74,7 +74,7 @@ impl NetlinkBackend {
             Action::Counter(Counter::Anonymous) => rule.with_expr(NfCounter::default()),
             Action::Counter(Counter::Named(name)) => {
                 return Err(Self::err(format!(
-                    "named counter `{name}` is not supported by rustables 0.8.7"
+                    "named counter `{name}` is not supported by rustables 0.8.8"
                 )))
             }
             Action::Log(log) => {
@@ -82,7 +82,7 @@ impl NetlinkBackend {
             }
             Action::Limit(limit) => {
                 return Err(Self::err(format!(
-                    "rate limit {}/{:?} burst {} {:?} is not supported by rustables 0.8.7",
+                    "rate limit {}/{:?} burst {} {:?} is not supported by rustables 0.8.8",
                     limit.rate, limit.unit, limit.burst, limit.mode
                 )))
             }

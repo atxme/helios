@@ -201,7 +201,7 @@ pub enum Counter {
     /// Counter state lives in a separately named nftables object.
     ///
     /// The IR can preserve the operator-facing identity, but the current
-    /// Netlink adapter rejects this variant because `rustables 0.8.7` cannot
+    /// Netlink adapter rejects this variant because `rustables 0.8.8` cannot
     /// create or reference named counter objects.
     Named(String),
 }
@@ -475,21 +475,22 @@ pub struct Ruleset {
     /// Requested MSS clamping, if any.
     ///
     /// Deliberately **outside** of `rules`: it is a *mangle* action (TCP
-    /// option rewrite), not a filtering verdict, and `rustables`' high-level
-    /// API does not express it. See the Netlink backend.
+    /// option rewrite), not a filtering verdict. See the dedicated Netlink
+    /// chain, which runs before filtering and is scoped to `wg_iface`.
     ///
     /// The value is the IPv4 MSS of the tunnel (`aether::mtu::mss_ipv4`). In
-    /// this `inet` table an unguarded clamp would also rewrite IPv6 SYNs with
-    /// a value 20 bytes too large: an encoder must emit it under
-    /// `meta nfproto ipv4`, like [`MasqueradeRule`].
+    /// this `inet` table IPv4 and IPv6 SYNs use separate values; the latter is
+    /// 20 bytes smaller and is omitted when the tunnel MTU is below 1280.
     pub mss_clamp: Option<u16>,
+    /// Interface whose ingress and egress TCP SYN packets may be MSS-clamped.
+    pub wg_iface: String,
     /// Egress interface on which to masquerade the source of client traffic.
     ///
     /// Outside of `rules` for the same reason as `mss_clamp`: it is not a
     /// filtering verdict but an address rewrite, which lives in a chain of a
-    /// different type (`nat`) and a different hook (`postrouting`). Unlike
-    /// MSS clamping, `rustables` can express it: the Netlink backend actually
-    /// applies it.
+    /// different type (`nat`) and a different hook (`postrouting`). The
+    /// upstream `rustables` API already expresses masquerade directly; the
+    /// small Helios extension handles TCP MSS writes.
     ///
     /// One entry per uplink: a gateway with a cable and a radio masquerades on
     /// whichever the kernel routes through, and neither entry matches a packet
@@ -508,6 +509,19 @@ impl Ruleset {
     /// Rules of a given chain, in order.
     pub fn chain(&self, kind: ChainKind) -> impl Iterator<Item = &Rule> {
         self.rules.iter().filter(move |r| r.chain == kind)
+    }
+
+    /// MSS values to apply on the WireGuard interface, by packet family.
+    /// IPv6 requires an internal tunnel MTU of at least 1280 bytes, equivalent
+    /// to an IPv4 MSS of at least 1240; its MSS is always 20 bytes smaller.
+    pub fn mss_clamps(&self) -> impl Iterator<Item = (AddressFamily, u16)> {
+        self.mss_clamp
+            .filter(|_| !self.wg_iface.is_empty())
+            .into_iter()
+            .flat_map(|mss| {
+                std::iter::once((AddressFamily::Ipv4, mss))
+                    .chain((mss >= 1240).then(|| (AddressFamily::Ipv6, mss - 20)))
+            })
     }
 
     /// The `postrouting` masquerade rules, one per entry of
@@ -689,6 +703,7 @@ mod tests {
             default_verdict: DefaultVerdict::Drop,
             rules: Vec::new(),
             mss_clamp: None,
+            wg_iface: "helios0".into(),
             masquerade_out: vec!["enp3s0".into(), "wlo1".into()],
         };
 
@@ -703,5 +718,37 @@ mod tests {
                 "meta nfproto ipv4 oifname \"wlo1\" masquerade",
             ]
         );
+    }
+
+    #[test]
+    fn mss_clamp_values_follow_family_threshold_and_require_tunnel_interface() {
+        for mss in [0, 19, 20, 1239] {
+            let ruleset = Ruleset {
+                default_verdict: DefaultVerdict::Drop,
+                rules: Vec::new(),
+                mss_clamp: Some(mss),
+                wg_iface: "helios0".into(),
+                masquerade_out: Vec::new(),
+            };
+            assert_eq!(
+                ruleset.mss_clamps().collect::<Vec<_>>(),
+                [(AddressFamily::Ipv4, mss)]
+            );
+        }
+        let ruleset = Ruleset {
+            default_verdict: DefaultVerdict::Drop,
+            rules: Vec::new(),
+            mss_clamp: Some(1240),
+            wg_iface: "helios0".into(),
+            masquerade_out: Vec::new(),
+        };
+        assert_eq!(
+            ruleset.mss_clamps().collect::<Vec<_>>(),
+            [(AddressFamily::Ipv4, 1240), (AddressFamily::Ipv6, 1220),]
+        );
+
+        let mut unscoped = ruleset;
+        unscoped.wg_iface.clear();
+        assert!(unscoped.mss_clamps().next().is_none());
     }
 }

@@ -5,6 +5,7 @@ members = [
     "tools/*",
     "apps/orion/src-tauri",
 ]
+exclude = ["vendor/rustables"]
 
 # `apps/orion/src-tauri` est dans le build par défaut : le client DOIT être
 # compilé à chaque `cargo build`/`cargo test`, sinon une casse du shell Tauri
@@ -172,3 +173,6 @@ strip = true
 # pas-à-pas *dans la source d'une dépendance* est perdu.
 [profile.dev.package."*"]
 debug = false
+
+[patch.crates-io]
+rustables = { path = "vendor/rustables" }

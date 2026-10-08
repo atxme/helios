@@ -8,8 +8,12 @@
 use aether::{FirewallPolicy, HeliosError, Result, TunnelState};
 use async_trait::async_trait;
 use rustables::{
-    expr::Masquerade, Batch, Chain, ChainPolicy as NfChainPolicy, ChainType, Hook, HookClass,
-    MsgType, ProtocolFamily, Rule as NfRule, Table,
+    expr::{
+        Bitwise, Cmp, CmpOp, Exthdr, HighLevelPayload, Immediate, Masquerade, Meta, MetaType,
+        Register, TransportHeaderField,
+    },
+    Batch, Chain, ChainPolicy as NfChainPolicy, ChainType, Hook, HookClass, MsgType,
+    ProtocolFamily, Rule as NfRule, Table,
 };
 use tracing::{info, warn};
 
@@ -46,12 +50,6 @@ impl NetlinkBackend {
     /// having sent anything to the kernel — the previous policy stays in
     /// place, which is the expected fail-closed behavior.
     fn build_batch(&self, rs: &Ruleset) -> Result<Batch> {
-        if let Some(mss) = rs.mss_clamp {
-            return Err(Self::err(format!(
-                "MSS clamp {mss} cannot be encoded by rustables 0.8.7; transaction not sent"
-            )));
-        }
-
         let mut batch = Batch::new();
         let table = Table::new(ProtocolFamily::Inet).with_name(self.table_name.clone());
 
@@ -91,6 +89,28 @@ impl NetlinkBackend {
             }
         }
 
+        let mss_values: Vec<_> = rs.mss_clamps().collect();
+        if !mss_values.is_empty() {
+            // A separate mangle-priority chain performs only the TCP option
+            // rewrite; it has no verdict and cannot bypass the filter chain's
+            // invalid-conntrack drop or any other policy rule.
+            let chain = Chain::new(&table)
+                .with_name("mss")
+                .with_hook(Hook::new(HookClass::Forward, -150))
+                .with_type(ChainType::Filter)
+                .add_to_batch(&mut batch);
+            for (family, mss) in mss_values {
+                let family = match family {
+                    crate::ruleset::AddressFamily::Ipv4 => 2,
+                    crate::ruleset::AddressFamily::Ipv6 => 10,
+                };
+                for incoming in [true, false] {
+                    Self::mss_clamp_rule(&chain, family, mss, &rs.wg_iface, incoming)?
+                        .add_to_batch(&mut batch);
+                }
+            }
+        }
+
         // ── Masquerade of tunnel clients ─────────────────────────────────────
         // A chain of a different type (`nat`) and a different hook
         // (`postrouting`), so outside the loop above. It lives in the
@@ -117,6 +137,41 @@ impl NetlinkBackend {
         }
 
         Ok(batch)
+    }
+
+    fn mss_clamp_rule(
+        chain: &Chain,
+        family: u8,
+        mss: u16,
+        wg_iface: &str,
+        incoming: bool,
+    ) -> Result<NfRule> {
+        let mut rule = NfRule::new(chain).map_err(Self::err)?;
+        rule = if incoming {
+            rule.iiface(wg_iface)
+        } else {
+            rule.oiface(wg_iface)
+        }
+        .map_err(Self::err)?;
+        rule = rule
+            .with_expr(Meta::new(MetaType::NfProto))
+            .with_expr(Cmp::new(CmpOp::Eq, [family]))
+            .with_expr(Meta::new(MetaType::L4Proto))
+            .with_expr(Cmp::new(CmpOp::Eq, [6]))
+            .with_expr(
+                HighLevelPayload::Transport(TransportHeaderField::Tcp(
+                    rustables::expr::TCPHeaderField::Flags,
+                ))
+                .build(),
+            )
+            .with_expr(Bitwise::new([0x02], [0x00]).map_err(Self::err)?)
+            .with_expr(Cmp::new(CmpOp::Eq, [0x02]))
+            .with_expr(Immediate::new_data(
+                mss.to_be_bytes().to_vec(),
+                Register::Reg1,
+            ))
+            .with_expr(Exthdr::tcp_mss_store(Register::Reg1));
+        Ok(rule)
     }
 
     /// Translates one port-expanded match set of `rule` into a filter rule.
@@ -173,7 +228,7 @@ impl Default for NetlinkBackend {
 #[async_trait]
 impl FirewallBackend for NetlinkBackend {
     fn capabilities(&self) -> FirewallCapabilities {
-        FirewallCapabilities::default()
+        FirewallCapabilities { mss_clamp: true }
     }
 
     async fn apply(&self, policy: &FirewallPolicy, state: TunnelState) -> Result<()> {
@@ -476,6 +531,7 @@ mod tests {
                 },
             ],
             mss_clamp: None,
+            wg_iface: "helios0".into(),
             masquerade_out: vec!["eth0".into()],
         };
 
@@ -490,19 +546,82 @@ mod tests {
     }
 
     #[test]
-    fn mss_clamping_fails_translation_instead_of_being_ignored() {
+    fn mss_clamping_is_encoded_for_ipv4_and_ipv6_in_the_whole_batch() {
         let ruleset = Ruleset {
             default_verdict: DefaultVerdict::Drop,
             rules: Vec::new(),
             mss_clamp: Some(1280),
+            wg_iface: "helios0".into(),
             masquerade_out: Vec::new(),
         };
 
-        let error = match NetlinkBackend::new().build_batch(&ruleset) {
-            Ok(_) => panic!("an unapplied MSS clamp must not produce a transaction"),
-            Err(error) => error.to_string(),
+        let bytes = NetlinkBackend::new()
+            .build_batch(&ruleset)
+            .unwrap()
+            .finalize();
+        assert!(bytes.windows(6).any(|w| w == b"exthdr"));
+        assert!(bytes.windows(7).any(|w| w == b"payload"));
+        assert!(bytes.windows(2).any(|w| w == 1280u16.to_be_bytes()));
+        assert!(bytes.windows(2).any(|w| w == 1260u16.to_be_bytes()));
+        assert_eq!(bytes.windows(7).filter(|w| *w == b"helios0").count(), 4);
+        assert!(bytes.windows(4).any(|w| w == (-150i32).to_be_bytes()));
+
+        let mut ipv4_only = ruleset.clone();
+        ipv4_only.mss_clamp = Some(1239);
+        let bytes = NetlinkBackend::new()
+            .build_batch(&ipv4_only)
+            .unwrap()
+            .finalize();
+        assert!(!bytes.windows(2).any(|w| w == 1219u16.to_be_bytes()));
+
+        ipv4_only.wg_iface.clear();
+        let bytes = NetlinkBackend::new()
+            .build_batch(&ipv4_only)
+            .unwrap()
+            .finalize();
+        assert!(!bytes.windows(6).any(|w| w == b"exthdr"));
+    }
+
+    #[test]
+    fn mss_rules_are_scoped_family_specific_syn_only_and_have_no_verdict() {
+        use rustables::expr::{
+            Bitwise, Cmp, CmpOp, Exthdr, HighLevelPayload, Immediate, Meta, MetaType,
+            RawExpression, Register, TCPHeaderField, TransportHeaderField,
         };
-        assert!(error.contains("MSS clamp 1280") && error.contains("transaction not sent"));
+
+        let table = Table::new(ProtocolFamily::Inet).with_name("helios");
+        let chain = Chain::new(&table).with_name("mss");
+        let expressions = |rule: NfRule| {
+            rule.get_expressions()
+                .map(|list| list.iter().cloned().collect::<Vec<RawExpression>>())
+                .unwrap_or_default()
+        };
+        for (family, mss, incoming) in [(2, 1280, true), (10, 1260, false)] {
+            let rule =
+                NetlinkBackend::mss_clamp_rule(&chain, family, mss, "helios0", incoming).unwrap();
+            let scoped = if incoming {
+                NfRule::new(&chain).unwrap().iiface("helios0").unwrap()
+            } else {
+                NfRule::new(&chain).unwrap().oiface("helios0").unwrap()
+            };
+            let expected = scoped
+                .with_expr(Meta::new(MetaType::NfProto))
+                .with_expr(Cmp::new(CmpOp::Eq, [family]))
+                .with_expr(Meta::new(MetaType::L4Proto))
+                .with_expr(Cmp::new(CmpOp::Eq, [6]))
+                .with_expr(
+                    HighLevelPayload::Transport(TransportHeaderField::Tcp(TCPHeaderField::Flags))
+                        .build(),
+                )
+                .with_expr(Bitwise::new([0x02], [0]).unwrap())
+                .with_expr(Cmp::new(CmpOp::Eq, [0x02]))
+                .with_expr(Immediate::new_data(
+                    mss.to_be_bytes().to_vec(),
+                    Register::Reg1,
+                ))
+                .with_expr(Exthdr::tcp_mss_store(Register::Reg1));
+            assert_eq!(expressions(rule), expressions(expected));
+        }
     }
 
     #[test]
@@ -526,6 +645,7 @@ mod tests {
                 note: None,
             }],
             mss_clamp: None,
+            wg_iface: "helios0".into(),
             masquerade_out: Vec::new(),
         };
 
@@ -552,6 +672,7 @@ mod tests {
                 note: None,
             }],
             mss_clamp: None,
+            wg_iface: "helios0".into(),
             masquerade_out: Vec::new(),
         };
 
@@ -570,6 +691,7 @@ mod tests {
                 note: None,
             }],
             mss_clamp: None,
+            wg_iface: "helios0".into(),
             masquerade_out: Vec::new(),
         };
 
@@ -595,6 +717,7 @@ mod tests {
                 note: None,
             }],
             mss_clamp: None,
+            wg_iface: "helios0".into(),
             masquerade_out: Vec::new(),
         };
 
@@ -618,6 +741,7 @@ mod tests {
                 note: None,
             }],
             mss_clamp: None,
+            wg_iface: "helios0".into(),
             masquerade_out: Vec::new(),
         };
 
@@ -625,6 +749,6 @@ mod tests {
             Ok(_) => panic!("a rate limit must not disappear during translation"),
             Err(error) => error.to_string(),
         };
-        assert!(error.contains("rate limit") && error.contains("rustables 0.8.7"));
+        assert!(error.contains("rate limit") && error.contains("rustables 0.8.8"));
     }
 }
