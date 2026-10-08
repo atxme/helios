@@ -400,9 +400,10 @@ Elle ne modélise pas :
 
 - `limit`, nécessaire au rate limiting et au logging borné ;
 - `fib`, nécessaire à un anti-spoof fondé sur le routage ;
-- les objets compteurs nommés et l’expression `objref` ;
-- les constantes UAPI seules ne suffisent pas à encoder une expression ;
-  l’encodeur doit aussi produire les attributs Netlink typés.
+- les objets compteurs nommés et l’expression `objref`.
+
+Les constantes UAPI seules ne suffisent pas à encoder une expression :
+l’encodeur doit aussi produire les attributs Netlink typés.
 
 Le patch vendored est nécessaire car `Batch` ne publie ni son buffer ni son
 écrivain, `RawExpression` ne permet pas de choisir un nom d’expression et le
@@ -591,12 +592,25 @@ et un `nft monitor`, puis vérifier :
   le ruleset précédent ;
 - aucune application règle par règle n’apparaît dans la trace.
 
-### Capacités non validables dans ce lot
+### MSS : recette noyau requise
 
-Le rate limiting, les compteurs nommés, l’anti-spoof `fib` et le MSS clamp ne
-doivent pas être marqués comme validés sur cible : le backend ne les annonce
-pas ou les refuse encore. Vérifier en revanche qu’une sonde MTU réussie avec le
-backend Netlink journalise une seule fois l’absence de clamping, laisse
-`mss_clamp` vide et ne coupe pas la connexion. Le logging est encodable, mais
+Sur un banc isolé avec des flux TCP IPv4 et IPv6 traversant WireGuard :
+
+- après la sonde MTU, inspecter `nft list chain inet helios mss` : priorité
+  −150, gardes de famille et d’interface dans les deux sens, aucun verdict ;
+- pour une MTU de tunnel 1420, observer des SYN et SYN-ACK à MSS 1380 en IPv4
+  et 1360 en IPv6 après réécriture, avec une somme TCP correcte ; une valeur
+  annoncée déjà plus petite doit rester inchangée ;
+- vérifier qu’un flux ne traversant pas WireGuard reste inchangé, et que
+  la chaîne `mss` disparaît hors de `Up` avec la transition atomique ;
+- sous MTU 1280, vérifier l’absence des deux règles MSS IPv6.
+
+Les tests d’octets et de rendu ne remplacent pas cette recette. Le rejet de
+la sortie Internet IPv6 reste appliqué par le filtre (SORTIE-IPV6).
+
+### Capacités non encodables
+
+Le rate limiting, les compteurs nommés et l’anti-spoof `fib` restent refusés
+avant envoi par le backend. Le logging est encodable, mais
 aucune policy de production ne l’active avant de disposer d’un rate limit qui
 empêche le log flood.

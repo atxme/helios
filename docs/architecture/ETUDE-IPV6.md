@@ -740,7 +740,7 @@ Chaque ticket est autonome, respecte `AGENTS.md` (pas de `TODO`, tests au bon
 niveau, docs françaises mises à jour) et indique ce qui reste à vérifier sur
 cible.
 
-Avancement sur `feature/support-ipv6` (1er octobre 2026) :
+Avancement de `feature/support-ipv6`, suivi actualisé le 8 octobre 2026 :
 
 | Ticket | État | Reste à faire |
 | --- | --- | --- |
@@ -753,9 +753,9 @@ Avancement sur `feature/support-ipv6` (1er octobre 2026) :
 | T06 | fusionné | accepter des pairs Meshnet IPv6 exige de couvrir un préfixe global du lien WAN, puis un essai sur cible |
 | T09 | fusionné | `heliosd run` refuse désormais une `wg_address` sans hôte IPv4 au lieu de basculer sur loopback |
 | T07 | fusionné | — |
-| T10 | fusionné | un changement de `wg_address_v6` est refusé à chaud (API 409, rechargement ignoré avec avertissement) ; commande de génération du préfixe à créer |
-| T11 + T14 | fusionnés (IPAM unifié) | ADR-001 §4 et ADR-004 §5 contredisent désormais le code (décision opérateur) ; `address_v6` est attribuée mais pas encore projetée (T12, T13) |
-| T12 + T13 | fusionnés | cible : adresse sur `helios0`, routes et règle `ip -6`, chemins dégradés (MTU, `disable_ipv6`), coexistence NordVPN/Tailscale ; `ping -6` après T19 |
+| T10 | fusionné ; commande livrée | `heliosd init-ipv6-prefix` génère et persiste un ULA une fois ; une répétition conserve le fichier. Changer `wg_address_v6` reste refusé à chaud (API 409) et exige un redémarrage |
+| T11 + T14 | fusionnés (IPAM unifié) | ADR-001 §4 et ADR-004 §5 contredisent désormais le code (décision opérateur) ; projection de `address_v6` livrée par T12/T13 |
+| T12 + T13 | fusionnés, chemins dégradés revus | échec de la seconde montée IPv4 couvert en simulation, avec les deux causes conservées et le kill-switch engagé. Cible : adresse sur `helios0`, routes et règle `ip -6`, MTU, `disable_ipv6`, coexistence NordVPN/Tailscale et `ping -6` |
 | T16 | couvert par T08 et T10 | une source IPv6 native n'est jamais un appelant ; `address_v6` exposée dans la vue redigée |
 | T17 | fusionné | cible : `ss -ulpn` montre `[::]`, client IPv6 seul, repli `ipv6.disable=1` |
 | T18 | fusionné | VM Windows : A+AAAA avec IPv6 cassée → IPv4 en ~250 ms ; un candidat perdant consomme une unité du budget par identité côté gateway |
@@ -765,7 +765,7 @@ Avancement sur `feature/support-ipv6` (1er octobre 2026) :
 | T21 | fusionné : rejet ICMPv6 « admin-prohibited » du forward IPv6 `wg_iface` → WAN dans tous les états, pas de NAT66 | cible : affichage `nft`, réponse ICMPv6 1/1, `curl -6` immédiat, navigateur dual-stack sans délai, `net.ipv6.icmp.ratelimit` |
 | Split-tunnel limité au LAN | fusionné : les contournements de split-tunnel portent `iifname <lan>` dans les deux familles, aucun sans interface LAN ; ni le tunnel ni un WAN ne les atteignent | cible : `nft list chain inet helios forward` |
 | Portail captif limité au LAN | fusionné : les ouvertures `forward` HTTP/HTTPS du portail portent `iifname <lan>`, aucune sans interface LAN ; `output` inchangé | cible : `nft list chain inet helios forward` en portail captif |
-| T15 | fusionné | MSS par famille (IPv4 = MTU − 40, IPv6 = MTU − 60) dérivé de la MTU de l'interface (surcoût 80) ; le clamp reste la valeur IPv4, une règle IPv6 attend un encodeur (`exthdr`) ; corrige aussi un MSS IPv4 trop grand de 20 octets |
+| T15 | encodeur livré | MSS IPv4 = MTU − 40 et IPv6 = MTU − 60 ; `exthdr` dans le même batch atomique, chaîne `mss` avant filtrage, SYN/SYN-ACK traversant WireGuard seulement. IPv6 omis sous MTU 1280 ; ABI et rendu testés. Cible : réécriture, somme TCP, valeur déjà inférieure conservée |
 | T22, T23 | à faire | — |
 
 **T00 — Spécification A : modèle d'adressage IPv6**

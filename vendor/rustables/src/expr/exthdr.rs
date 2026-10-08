@@ -6,7 +6,7 @@ use crate::sys::{
     NFTA_EXTHDR_TYPE,
 };
 
-/// nftables extension-header expression, including TCP-option read/write.
+/// nftables extension-header expression for TCP-option writes.
 #[derive(Clone, PartialEq, Eq, Default, Debug)]
 #[nfnetlink_struct]
 pub struct Exthdr {
