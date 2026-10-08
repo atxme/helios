@@ -24,6 +24,7 @@ use tracing_subscriber::EnvFilter;
 use crate::commands::identity::{
     init_astra_channel, init_identity, init_key_negotiation, show_identity,
 };
+use crate::commands::ipv6_prefix::init_ipv6_prefix;
 use crate::commands::peer::peer_command;
 use crate::commands::tpm::{provision_tpm, tpm_command};
 use crate::commands::trust::{
@@ -34,6 +35,31 @@ use crate::commands::trust::{
 use crate::commands::wan::{resolve_uplink, show_uplink};
 use crate::daemon::run;
 use crate::process_guards::resolve_dry_run;
+
+#[cfg(test)]
+pub(crate) static NETWORK_CONFIG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn with_network_config_test<T>(path: &std::path::Path, body: impl FnOnce() -> T) -> T {
+    let _guard = NETWORK_CONFIG_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    struct Restore(Option<std::ffi::OsString>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            if let Some(previous) = self.0.take() {
+                std::env::set_var("HELIOS_NETWORK_CONFIG", previous);
+            } else {
+                std::env::remove_var("HELIOS_NETWORK_CONFIG");
+            }
+        }
+    }
+    let restore = Restore(std::env::var_os("HELIOS_NETWORK_CONFIG"));
+    std::env::set_var("HELIOS_NETWORK_CONFIG", path);
+    let result = body();
+    drop(restore);
+    result
+}
 
 #[derive(Parser)]
 #[command(name = "heliosd", version, about = "Gateway VPN WireGuard Helios")]
@@ -67,6 +93,11 @@ enum Command {
     /// therefore refuses to provision on its own, and this command is the
     /// only explicit path to do so.
     ProvisionTpm,
+    /// Generates and persists the gateway's IPv6 ULA tunnel prefix.
+    ///
+    /// Run explicitly with the daemon stopped. The prefix is stable after it
+    /// is written; changing it renumbers every IPv6 peer address.
+    InitIpv6Prefix,
     /// Creates the gateway's WireGuard identity and seals it (ADR-004 §3).
     ///
     /// To be run after `provision-tpm`, with console access. The private key
@@ -563,6 +594,7 @@ async fn main() -> anyhow::Result<()> {
             orchestrator::check_update(dry_run).await
         }
         Command::ProvisionTpm => provision_tpm(),
+        Command::InitIpv6Prefix => init_ipv6_prefix(),
         Command::InitIdentity { rotate } => {
             let network = NetworkConfig::load().context("loading the network config")?;
             init_identity(&network, rotate)

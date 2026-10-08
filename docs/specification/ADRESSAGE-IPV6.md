@@ -80,6 +80,11 @@ qui garde le comportement actuel du trafic Internet.
 - Le Global ID est tiré **une fois** par `aether::random::fill_public`, par une
   commande opérateur explicite, et écrit dans `network.toml`. L'opérateur peut
   aussi l'écrire à la main.
+- La commande `heliosd init-ipv6-prefix` ne fait rien si `wg_address_v6` est
+  déjà configuré ; elle ne tire donc pas un nouveau Global ID lors d'une
+  répétition. L'opérateur l'exécute daemon arrêté ; après création, le
+  redémarrage de `heliosd` applique le préfixe sans renuméroter de pair
+  automatiquement.
 - Il n'est **jamais** régénéré automatiquement, ni dérivé à chaque démarrage.
 - Il n'est **pas** dérivé de la clé WireGuard de la gateway : une rotation de
   cette clé renumérotait sinon tous les pairs.

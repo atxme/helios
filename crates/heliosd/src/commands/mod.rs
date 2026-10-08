@@ -5,6 +5,7 @@
 //! registry, local admission, and the WAN interface.
 
 pub(crate) mod identity;
+pub(crate) mod ipv6_prefix;
 pub(crate) mod peer;
 pub(crate) mod tpm;
 pub(crate) mod trust;
