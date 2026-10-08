@@ -20,8 +20,8 @@ use aether::key_negotiation::{
 use async_trait::async_trait;
 use base64::Engine as _;
 use rcgen::{
-    BasicConstraints, Certificate, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
-    KeyUsagePurpose,
+    BasicConstraints, Certificate, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer,
+    KeyPair, KeyUsagePurpose,
 };
 
 use crate::{
@@ -138,7 +138,8 @@ pub(super) fn test_pki() -> TestPki {
         params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
         params.extended_key_usages = vec![usage];
         let key = KeyPair::generate().unwrap();
-        let cert = params.signed_by(&key, ca, ca_key).unwrap();
+        let issuer = Issuer::from_ca_cert_der(ca.der(), ca_key).unwrap();
+        let cert = params.signed_by(&key, &issuer).unwrap();
         (cert.der().to_vec(), key.serialize_der())
     }
 
@@ -194,7 +195,8 @@ pub(super) fn independent_client_identity(name: &str) -> (Vec<u8>, TlsIdentity) 
     leaf_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
     leaf_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
     let leaf_key = KeyPair::generate().unwrap();
-    let leaf = leaf_params.signed_by(&leaf_key, &ca, &ca_key).unwrap();
+    let issuer = Issuer::from_ca_cert_der(ca.der(), &ca_key).unwrap();
+    let leaf = leaf_params.signed_by(&leaf_key, &issuer).unwrap();
 
     (
         ca.der().to_vec(),

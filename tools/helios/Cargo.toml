@@ -13,7 +13,7 @@ path = "src/main.rs"
 aether.workspace = true
 helios-update.workspace = true
 # Emplacement fixe de la CA opérateur, indépendant du répertoire courant.
-directories = "5"
+directories = "6"
 # Séquestre de l'identité de la gateway : la moitié opérateur (génération de la
 # paire, ouverture du blob) vit ici, jamais sur la gateway.
 helios-escrow.workspace = true
@@ -39,8 +39,8 @@ time.workspace = true
 zeroize.workspace = true
 reqwest = { workspace = true }
 futures-util = { workspace = true }
-tokio-tungstenite = "0.24"
-rustyline = { version = "17.0.2", default-features = false, features = ["custom-bindings"] }
+tokio-tungstenite = "0.30"
+rustyline = { version = "18.0.1", default-features = false, features = ["custom-bindings"] }
 shlex = "2.0.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]

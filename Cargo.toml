@@ -43,7 +43,7 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Christophe Benedetti <christophe.benedetti15@gmail.com>"]
 repository = "https://github.com/christophe/helios"
-rust-version = "1.88"
+rust-version = "1.95"
 
 [workspace.dependencies]
 tokio = { version = "1", features = [
@@ -66,9 +66,16 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "registry", "std"] }
 clap = { version = "4", features = ["derive", "env"] }
 async-trait = "0.1"
-axum = { version = "0.7", features = ["ws"] }
+axum = { version = "0.8", features = ["ws"] }
 mime_guess = "2"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+# reqwest 0.13 : TLS uniquement en rustls, fournisseur aws-lc-rs (feature
+# `rustls`, qui a remplacé `rustls-tls`) et magasin de confiance du système
+# via rustls-platform-verifier. Ce n'est plus le couple ring + racines Mozilla
+# embarquées de 0.12 : c'est un changement délibéré. aws-lc-rs est le même
+# CSPRNG que `aether::random`. Un client qui ne doit faire confiance qu'à une
+# CA privée doit utiliser `tls_certs_only`, qui n'ajoute pas le magasin du
+# système. Pas de native-tls ni d'OpenSSL.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
 quinn = { version = "0.11.9", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "aws_lc_rs", "std", "tls12"] }
 # `aws_lc_rs` plutôt que le défaut `ring` : rcgen tire ses **clés privées X.509**
@@ -78,7 +85,7 @@ rustls = { version = "0.23.45", default-features = false, features = ["ring", "a
 # fixtures de test sur le même CTR-DRBG que le reste du protocole. Sans effet
 # sur `rustls`/`quinn`, dont le fournisseur reste `ring` : voir la « Limite
 # connue » de `aether::random`.
-rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "aws_lc_rs", "x509-parser"] }
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "aws_lc_rs", "x509-parser"] }
 # Canal privé Astra–Helios (ROTATION-CERTIFICATS §8.3). Le lien est monté à la
 # main plutôt que par `reqwest` : le transport y est le contrat — TLS 1.3 seul,
 # ALPN épinglée, ni ticket ni 0-RTT — et un client généraliste qui réécrit
@@ -119,17 +126,17 @@ aws-lc-sys = "0.45.0"
 fips204 = { version = "=0.4.6", default-features = false, features = ["ml-dsa-65", "ml-dsa-87"] }
 # Précontrôles Ed25519 stricts (points faibles + scalaires canoniques) avant AWS-LC.
 # Déjà présent transitivement via x25519-dalek ; ce n'est pas un backend de signature.
-curve25519-dalek = "4"
+curve25519-dalek = "5"
 blake3 = "1"
 zeroize = "1"
-base64 = "0.22"
+base64 = "0.23"
 hex = "0.4"
 # Saisie du PIN FIDO2 sans écho. Un PIN d'authentificateur affiché dans un
 # terminal se retrouve dans un scrollback, une capture d'écran ou un partage.
 rpassword = "7"
 # `static_secrets` expose `StaticSecret` : une clé privée persistée (celle du
 # profil WireGuard), par opposition aux clés éphémères par défaut.
-x25519-dalek = { version = "2", features = ["static_secrets"] }
+x25519-dalek = { version = "3", features = ["static_secrets"] }
 # Backend WireGuard unifié (noyau Linux via netlink, Windows, ou userspace
 # BoringTun) derrière une seule API. Optionnel : activé par la feature
 # `wireguard` d'orion-core / heliosd.

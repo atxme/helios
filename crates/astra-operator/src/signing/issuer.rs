@@ -76,13 +76,10 @@ pub fn authorize_issuer(
                 .ok_or(CertificateError::ArithmeticOverflow)?,
         )?;
 
-        let ca_params = CertificateParams::from_ca_cert_der(&ca_tls_certificate.as_bytes().into())
-            .map_err(|error| GestureError::Anchors(format!("certificat CA-TLS : {error}")))?;
-        let ca = ca_params
-            .self_signed(&ca_tls_key)
+        let ca = Issuer::from_ca_cert_der(&ca_tls_certificate.as_bytes().into(), &ca_tls_key)
             .map_err(|error| GestureError::Anchors(format!("certificat CA-TLS : {error}")))?;
         let intermediate = csr
-            .signed_by(&ca, &ca_tls_key)
+            .signed_by(&ca)
             .map_err(|error| GestureError::Anchors(format!("émission intermédiaire : {error}")))?;
         let intermediate = DerCertificate::new(intermediate.der().to_vec())?;
         aether::certificates::x509::assert_issued_by(&intermediate, ca_tls_certificate)?;

@@ -12,11 +12,11 @@ use super::*;
 pub const ASTRA_INTERNAL_PREFIX: &str = "/internal/v1/client-rotation/";
 
 pub const ROTATION_REQUEST_PATH: &str = "/internal/v1/client-rotation/request";
-pub const ROTATION_OPERATION_ROUTE: &str = "/internal/v1/client-rotation/operations/:operation";
+pub const ROTATION_OPERATION_ROUTE: &str = "/internal/v1/client-rotation/operations/{operation}";
 pub const ROTATION_SIGNER_REQUEST_ROUTE: &str =
-    "/internal/v1/client-rotation/signer-requests/:operation";
+    "/internal/v1/client-rotation/signer-requests/{operation}";
 pub const ROTATION_SIGNER_RESULT_ROUTE: &str =
-    "/internal/v1/client-rotation/signer-results/:operation";
+    "/internal/v1/client-rotation/signer-results/{operation}";
 
 /// The second prefix Astra's private listener serves (spec §0.6).
 ///
@@ -39,10 +39,10 @@ pub const TRUST_UPDATE_PREPARE_PATH: &str = "/internal/v1/trust-update/prepare";
 /// interchangeable, which is exactly the confusion §8.5 forbids.
 pub const ASTRA_OPERATOR_PREFIX: &str = "/internal/v1/operator/";
 
-pub const OPERATOR_OPERATION_ROUTE: &str = "/internal/v1/operator/operations/:operation";
-pub const OPERATOR_SIGNER_REQUEST_ROUTE: &str = "/internal/v1/operator/signer-requests/:operation";
-pub const OPERATOR_VAULT_ROUTE: &str = "/internal/v1/operator/vaults/:fingerprint";
-pub const OPERATOR_SIGNER_RESULT_ROUTE: &str = "/internal/v1/operator/signer-results/:operation";
+pub const OPERATOR_OPERATION_ROUTE: &str = "/internal/v1/operator/operations/{operation}";
+pub const OPERATOR_SIGNER_REQUEST_ROUTE: &str = "/internal/v1/operator/signer-requests/{operation}";
+pub const OPERATOR_VAULT_ROUTE: &str = "/internal/v1/operator/vaults/{fingerprint}";
+pub const OPERATOR_SIGNER_RESULT_ROUTE: &str = "/internal/v1/operator/signer-results/{operation}";
 /// Everything waiting for an operator. Carries no capability token: see
 /// [`aether::certificates::transport::OperatorPendingOperation`].
 pub const OPERATOR_PENDING_ROUTE: &str = "/internal/v1/operator/pending";

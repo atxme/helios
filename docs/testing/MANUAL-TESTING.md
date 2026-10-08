@@ -7,7 +7,7 @@ accès console : le kill-switch modifie le routage et le pare-feu.
 ## Prérequis
 
 - Rust stable et Cargo ;
-- Node.js `^20.19.0` ou `>=22.12.0`, avec npm ;
+- Node.js `^22.22.2`, `^24.15.0` ou `>=26.0.0`, avec npm ;
 - `wireguard-tools` pour générer des clés de test ;
 - pour Orion sous Linux : WebKitGTK 4.1, GTK 3, librsvg, patchelf et
   Ayatana AppIndicator.

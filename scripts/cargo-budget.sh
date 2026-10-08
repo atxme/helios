@@ -9,8 +9,8 @@
 #
 # Outside WSL (CI, target hosts, Windows) every function is a no-op.
 
-helios_budget_default_warning_gib=40
-helios_budget_default_maximum_gib=45
+helios_budget_default_warning_gib=60
+helios_budget_default_maximum_gib=65
 
 helios_budget_on_wsl() {
     grep -qiE '(microsoft|wsl)' /proc/sys/kernel/osrelease 2>/dev/null

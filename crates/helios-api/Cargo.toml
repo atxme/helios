@@ -41,4 +41,4 @@ libc = "0.2"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
-tokio-tungstenite = "0.24"
+tokio-tungstenite = "0.30"

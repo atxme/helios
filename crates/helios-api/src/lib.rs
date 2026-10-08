@@ -314,19 +314,19 @@ pub fn router(state: AppState) -> Router {
             get(certificates::operator_pending),
         )
         .route(
-            "/api/certificates/operator/operations/:operation",
+            "/api/certificates/operator/operations/{operation}",
             get(certificates::operator_operation),
         )
         .route(
-            "/api/certificates/operator/signer-requests/:operation",
+            "/api/certificates/operator/signer-requests/{operation}",
             get(certificates::operator_signer_request),
         )
         .route(
-            "/api/certificates/operator/vaults/:fingerprint",
+            "/api/certificates/operator/vaults/{fingerprint}",
             get(certificates::operator_vault),
         )
         .route(
-            "/api/certificates/operator/signer-results/:operation",
+            "/api/certificates/operator/signer-results/{operation}",
             post(certificates::operator_signer_result).layer(DefaultBodyLimit::max(
                 astra_channel::MAX_OPERATOR_REQUEST_BYTES,
             )),
@@ -389,7 +389,7 @@ pub fn router(state: AppState) -> Router {
             )),
         )
         .route(
-            "/api/key-negotiation/certificate-renewal/operations/:operation",
+            "/api/key-negotiation/certificate-renewal/operations/{operation}",
             get(certificates::renewal_operation),
         )
         // The commit of §8.1.2 is the route above under its historical path.
@@ -419,7 +419,7 @@ pub fn router(state: AppState) -> Router {
         // operator read, on the admin surface: it is consulted while the
         // client is being enrolled, hence before it has any tunnel.
         .route(
-            "/api/key-negotiation/trust-enrolment/:public_key",
+            "/api/key-negotiation/trust-enrolment/{public_key}",
             get(certificates::trust_enrolment),
         )
         // The domain as the operator console reads it. On the admin surface
