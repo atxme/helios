@@ -14,6 +14,13 @@
 //!   **no salt**, so it can obtain no `hmac-secret` output and open no
 //!   key-slot — spec §14.1 asks for exactly that separation, and here it is a
 //!   signature rather than a convention.
+//! - [`Authenticator::approve_and_derive`] is the one ceremony that does both,
+//!   for the one operation that needs both: the recovery of an expired
+//!   identity (spec §7.5). One `GetAssertion` carries the caller's
+//!   `clientDataJSON` **and** the vault's salt, so one touch produces the
+//!   assertion bound to the request and the secret that opens the key-slot.
+//!   It is a separate method rather than an optional salt on `approve`, so
+//!   that an ordinary renewal still has nowhere to put one.
 //!
 //! # What a security key does here, and what it never does
 //!
@@ -179,6 +186,18 @@ pub struct Approval {
     pub assertion: WebAuthnAssertion,
 }
 
+/// What one combined approval and derivation produced (spec §7.5).
+///
+/// Both halves of the same `GetAssertion`, and therefore of the same touch:
+/// the credential that signed the assertion is, by construction, the one whose
+/// `hmac-secret` the secret is. Neither half is meant to be used before the
+/// assertion has been verified — the caller holds the credential's public key,
+/// this module does not.
+pub struct ApprovedOpening {
+    pub approval: Approval,
+    pub opened: Opened,
+}
+
 /// How this program reaches the security key.
 ///
 /// Explicit, never inferred at runtime: which transport opened a vault decides
@@ -252,6 +271,26 @@ pub trait Authenticator {
         client_data_json: &[u8],
         pin: &str,
     ) -> Result<Approval>;
+
+    /// One `GetAssertion` over `client_data_json` that also carries `salt`,
+    /// and returns the assertion together with the slot secret (spec §7.5).
+    ///
+    /// For the recovery of an expired identity, and for nothing else: that is
+    /// the one operation where the assertion that approves the request and the
+    /// secret that opens `CA-PQ` must come from a single touch. An ordinary
+    /// renewal calls [`approve`](Self::approve), which takes no salt.
+    ///
+    /// No default implementation on purpose: one written as `approve` followed
+    /// by `derive` would silently bring back the two touches this method
+    /// exists to remove.
+    fn approve_and_derive(
+        &self,
+        rp_id: &str,
+        credentials: &[Vec<u8>],
+        client_data_json: &[u8],
+        salt: &[u8; SALT_LEN],
+        pin: &str,
+    ) -> Result<ApprovedOpening>;
 }
 
 /// One HID device, as the system exposes it.
@@ -548,8 +587,8 @@ mod webauthn;
 mod ctap {
     use super::SlotSecret;
     use super::{
-        Approval, AuthenticatorError, CredentialSubject, Opened, Registration, Result,
-        HMAC_SECRET_LEN, SALT_LEN,
+        Approval, ApprovedOpening, AuthenticatorError, CredentialSubject, Opened, Registration,
+        Result, HMAC_SECRET_LEN, SALT_LEN,
     };
     use aether::certificates::webauthn::WebAuthnAssertion;
     use ctap_hid_fido2::fidokey::get_assertion::get_assertion_params::Extension as AssertionExt;
@@ -903,6 +942,86 @@ mod ctap {
                     authenticator_data: assertion.auth_data,
                     client_data_json: client_data_json.to_vec(),
                     signature: assertion.signature,
+                },
+            })
+        }
+
+        fn approve_and_derive(
+            &self,
+            rp_id: &str,
+            credentials: &[Vec<u8>],
+            client_data_json: &[u8],
+            salt: &[u8; SALT_LEN],
+            pin: &str,
+        ) -> Result<ApprovedOpening> {
+            if credentials.is_empty() {
+                return Err(AuthenticatorError::UnknownCredential);
+            }
+            // `approve`'s client data and `derive`'s extension, in one
+            // request: the signed `clientDataHash` is the caller's, and the
+            // salt goes through the same platform conversion as `derive`, or
+            // the secret would not open a slot the other path enrolled.
+            let mut builder = GetAssertionArgsBuilder::new(rp_id, client_data_json)
+                .pin(pin)
+                .extensions(&[AssertionExt::HmacSecret(Some(super::prf_salt(salt)))]);
+            for credential in credentials {
+                builder = builder.add_credential_id(credential);
+            }
+            let assertions =
+                self.key
+                    .get_assertion_with_args(&builder.build())
+                    .map_err(|error| {
+                        let text = format!("{error:#}");
+                        if text.contains("0x2E") || text.to_lowercase().contains("no_credentials") {
+                            AuthenticatorError::UnknownCredential
+                        } else {
+                            AuthenticatorError::Device(text)
+                        }
+                    })?;
+            let assertion = assertions
+                .into_iter()
+                .next()
+                .ok_or(AuthenticatorError::UnknownCredential)?;
+
+            // Same rule as `derive` and `approve`.
+            let credential_id = if assertion.credential_id.is_empty() {
+                if credentials.len() != 1 {
+                    return Err(AuthenticatorError::Device(
+                        "la clé n'a pas nommé le credential utilisé alors que plusieurs étaient \
+                         proposés"
+                            .into(),
+                    ));
+                }
+                credentials[0].clone()
+            } else {
+                assertion.credential_id.clone()
+            };
+            if !credentials.contains(&credential_id) {
+                return Err(AuthenticatorError::UnknownCredential);
+            }
+
+            let output = assertion
+                .extensions
+                .iter()
+                .find_map(|ext| match ext {
+                    AssertionExt::HmacSecret(Some(output)) => Some(*output),
+                    _ => None,
+                })
+                .ok_or(AuthenticatorError::NoHmacOutput)?;
+            debug_assert_eq!(output.len(), HMAC_SECRET_LEN);
+
+            Ok(ApprovedOpening {
+                approval: Approval {
+                    credential_id: credential_id.clone(),
+                    assertion: WebAuthnAssertion {
+                        authenticator_data: assertion.auth_data,
+                        client_data_json: client_data_json.to_vec(),
+                        signature: assertion.signature,
+                    },
+                },
+                opened: Opened {
+                    credential_id,
+                    secret: SlotSecret::new(output.to_vec()),
                 },
             })
         }
