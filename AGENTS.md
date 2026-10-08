@@ -176,7 +176,7 @@ npm run test:unit --prefix web
 npm run test:unit --prefix apps/orion
 ```
 
-Build disk budget (WSL): every Cargo build goes through `scripts/wsl-cargo` or a script that sources `scripts/cargo-budget.sh`. They share one cache, `~/.cache/helios-target`, and refuse to build once all Helios target directories together reach 45 GiB.
+Build disk budget (WSL): every Cargo build goes through `scripts/wsl-cargo` or a script that sources `scripts/cargo-budget.sh`. They share one cache, `~/.cache/helios-target`, and refuse to build once all Helios target directories together reach 65 GiB.
 
 * Never open another target directory: no `CARGO_TARGET_DIR` override, no build inside a worktree's own `target/`.
 * Exceeding or raising the budget (`HELIOS_WSL_BUILD_OVER_BUDGET=1`) happens only on the user's explicit request. On a refusal, stop and report; run `scripts/clean-wsl-targets` only with the user's agreement.
