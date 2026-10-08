@@ -25,16 +25,25 @@ fn choose_prefix<E: std::fmt::Display>(
     Ok(PrefixAction::Generated(prefix))
 }
 
-pub(crate) fn init_ipv6_prefix() -> anyhow::Result<()> {
+fn persist_prefix<E: std::fmt::Display>(
+    fill: impl FnOnce(&mut [u8]) -> Result<(), E>,
+) -> anyhow::Result<PrefixAction> {
     let mut network = NetworkConfig::load().context("loading the network config")?;
-    match choose_prefix(&mut network, aether::random::fill_public)? {
+    let action = choose_prefix(&mut network, fill)?;
+    if matches!(action, PrefixAction::Generated(_)) {
+        network
+            .save()
+            .context("writing the network configuration")?;
+    }
+    Ok(action)
+}
+
+pub(crate) fn init_ipv6_prefix() -> anyhow::Result<()> {
+    match persist_prefix(aether::random::fill_public)? {
         PrefixAction::Existing(prefix) => {
             println!("IPv6 tunnel prefix already configured: {prefix}");
         }
         PrefixAction::Generated(prefix) => {
-            network
-                .save()
-                .context("writing the network configuration")?;
             println!("IPv6 tunnel prefix configured: {prefix}");
             println!("Restart heliosd to apply the tunnel prefix.");
         }
@@ -65,8 +74,7 @@ mod tests {
     #[test]
     fn generates_valid_prefix_and_persists_it_to_network_config() {
         with_config("", |path| {
-            let mut network = NetworkConfig::load().expect("load config");
-            let action = choose_prefix(&mut network, |out| {
+            let action = persist_prefix(|out| {
                 assert_eq!(out.len(), 5);
                 out.copy_from_slice(&[0x3c, 0x91, 0xa2, 0x7e, 0x04]);
                 Ok::<_, &'static str>(())
@@ -74,7 +82,6 @@ mod tests {
             .expect("prefix generation");
             let prefix: TunnelPrefixV6 = "fd3c:91a2:7e04::1/64".parse().expect("valid prefix");
             assert_eq!(action, PrefixAction::Generated(prefix));
-            network.save().expect("save config");
             assert!(fs::read_to_string(path)
                 .expect("read config")
                 .contains("wg_address_v6 = \"fd3c:91a2:7e04::1/64\""));
@@ -87,8 +94,7 @@ mod tests {
         let raw = "wg_address_v6 = \"fd00:1:2::1/64\"\n";
         with_config(raw, |path| {
             let before = fs::read(path).expect("read original config");
-            let mut network = NetworkConfig::load().expect("load config");
-            let action = choose_prefix(&mut network, |_| -> Result<(), &'static str> {
+            let action = persist_prefix(|_| -> Result<(), &'static str> {
                 panic!("existing prefix must not draw randomness")
             })
             .expect("existing prefix");
@@ -105,10 +111,9 @@ mod tests {
         let raw = "wg_address = \"100.64.0.1/10\"\n";
         with_config(raw, |path| {
             let before = fs::read(path).expect("read original config");
-            let mut network = NetworkConfig::load().expect("load config");
-            let action = choose_prefix(&mut network, |_| Err("unavailable"));
+            let action = persist_prefix(|_| Err("unavailable"));
             assert!(action.unwrap_err().to_string().contains("unavailable"));
-            assert_eq!(network.wg_address_v6, None);
+            assert_eq!(NetworkConfig::load().unwrap().wg_address_v6, None);
             assert_eq!(fs::read(path).expect("read config"), before);
         });
     }
@@ -118,13 +123,11 @@ mod tests {
         let raw = "wg_private_key = \"cHJpdmF0ZQ==\"\n";
         with_config(raw, |path| {
             let before = fs::read(path).expect("read original config");
-            let mut network = NetworkConfig::load().expect("load config");
-            choose_prefix(&mut network, |out| {
+            let result = persist_prefix(|out| {
                 out.copy_from_slice(&[0x3c, 0x91, 0xa2, 0x7e, 0x04]);
                 Ok::<_, &'static str>(())
-            })
-            .expect("prefix generation");
-            assert!(network.save().is_err());
+            });
+            assert!(result.is_err());
             assert_eq!(fs::read(path).expect("read config"), before);
         });
     }
