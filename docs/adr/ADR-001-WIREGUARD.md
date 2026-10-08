@@ -681,7 +681,7 @@ est instructive.
 ## Notes de vigilance
 
 **« Zéro dépendance C » n'est pas un objectif atteignable, et ne l'a jamais été.**
-`ring` 0.17.14 est déjà dans le `Cargo.lock` via `reqwest` + `rustls-tls` : c'est
+`ring` 0.17.14 reste dans le `Cargo.lock` via `quinn` et `rustls` (`rustls-ring`, négociation QUIC) : c'est
 du C et de l'assembleur dérivés de BoringSSL. Le critère utile n'est pas « C ou
 pas C » mais **« ça construit en cross-platform, ou ça exige une toolchain
 CMake/Go/Ninja »**. Ring utilise le crate `cc` avec de l'asm vendored et
