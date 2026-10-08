@@ -20,7 +20,7 @@ import shutil
 import subprocess
 import sys
 
-BINAIRES = ("heliosd", "helios-installer", "helios-ctl")
+BINAIRES = ("heliosd", "helios-installer", "helios")
 UNITES = (
     "heliosd.service",
     "helios-update.service",
@@ -225,7 +225,7 @@ def run(racine_depot: pathlib.Path, tmp: pathlib.Path, epoque: pathlib.Path,
     attendus = [
         cible / "opt/helios/releases" / str(SEQUENCE) / "heliosd",
         cible / "usr/libexec/helios-installer",
-        cible / "usr/local/bin/helios-ctl",
+        cible / "usr/local/bin/helios",
         cible / "etc/systemd/system/heliosd.service",
         cible / "etc/systemd/system/helios-update.service",
         cible / "etc/systemd/system/helios-update.path",

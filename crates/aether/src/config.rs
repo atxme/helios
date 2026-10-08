@@ -23,6 +23,9 @@ pub const API_PORT: u16 = 8080;
 pub const DEFAULT_WG_ADDRESS: &str = "100.64.0.1/10";
 /// Default in-tunnel URL of the gateway API.
 pub const DEFAULT_WG_API_URL: &str = "http://100.64.0.1:8080";
+/// Local administration socket of the gateway API (ADR-003, amendment of
+/// 3 October 2026), inside heliosd's root-owned `RuntimeDirectory`.
+pub const LOCAL_ADMIN_SOCKET: &str = "/run/helios/admin.sock";
 /// Listen address of the HTTP server in degraded mode (no tunnel interface).
 ///
 /// Loopback only: without a tunnel, the API has no reason to be reachable
@@ -212,7 +215,7 @@ pub struct NetworkConfig {
     ///
     /// Closed by default. See [`crate::FirewallPolicy::allow_gateway_egress`]
     /// for what a gateway without it cannot do — starting with the OS upgrade
-    /// `helios-ctl update` is supposed to run on that very machine.
+    /// `helios update` is supposed to run on that very machine.
     #[serde(default)]
     pub allow_gateway_egress: bool,
     /// Accepts SSH arriving **through the tunnel**, on the tunnel interface.

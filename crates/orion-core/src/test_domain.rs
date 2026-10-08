@@ -247,7 +247,7 @@ pub(crate) fn store(directory: &std::path::Path, domain: &Domain) -> TrustStore 
     )
 }
 
-/// A profile as `helios-ctl profile emit` writes one since §19.
+/// A profile as `helios profile emit` writes one since §19.
 pub(crate) fn settings(domain: &Domain) -> KeyNegotiationSettings {
     KeyNegotiationSettings {
         mode: aether::key_negotiation::ProtectionMode::MlKem,

@@ -65,7 +65,7 @@ const SYSTEMD_UNITS: &[&str] = &[
 ];
 
 /// Shipped binaries, and their role.
-const BINARIES: &[&str] = &["heliosd", "helios-installer", "helios-ctl"];
+const BINARIES: &[&str] = &["heliosd", "helios-installer", "helios"];
 
 #[derive(Parser)]
 #[command(
@@ -338,7 +338,7 @@ fn bundle(target: Option<String>, skip_frontend: bool, output: Option<PathBuf>) 
 
     let heliosd = build_gateway(&root, &target, skip_frontend)?;
 
-    println!("==> helios-installer, helios-ctl");
+    println!("==> helios-installer, helios");
     run(
         &root,
         "cargo",
@@ -350,7 +350,7 @@ fn bundle(target: Option<String>, skip_frontend: bool, output: Option<PathBuf>) 
             "-p",
             "helios-installer",
             "-p",
-            "helios-ctl",
+            "helios",
         ],
     )?;
 
@@ -826,12 +826,7 @@ mod tests {
             std::fs::read_to_string(workspace_root().unwrap().join("scripts/deploy-app.ps1"))
                 .expect("the Windows application update launcher must exist");
 
-        for required in [
-            "helios-ctl",
-            "app-update",
-            "scripts/deploy-app.sh",
-            "wsl.exe",
-        ] {
+        for required in ["helios", "app-update", "scripts/deploy-app.sh", "wsl.exe"] {
             assert!(
                 script.contains(required),
                 "the Windows launcher must invoke `{required}`"

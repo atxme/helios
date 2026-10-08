@@ -137,7 +137,7 @@ pub(super) fn gateway_own_egress(
                     ],
                     Verdict::Accept,
                 )
-                .with_note("package fetching — `helios-ctl update` runs `apt-get` on the gateway"),
+                .with_note("package fetching — `helios update` runs `apt-get` on the gateway"),
             );
             rules.push(
                 Rule::new(

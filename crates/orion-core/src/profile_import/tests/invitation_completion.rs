@@ -80,7 +80,7 @@ fn enrolling_an_existing_profile_keeps_its_wireguard_identity() {
     let settings = gateway_settings(ProtectionMode::MlKem);
     let mut document: serde_json::Value =
         serde_json::from_str(&document_with(serde_json::to_value(&settings).unwrap())).unwrap();
-    // Invitation form: `helios-ctl enroll --public-key <clé existante>`.
+    // Invitation form: `helios enroll --public-key <clé existante>`.
     document["profile"]["private_key"] = serde_json::Value::String(String::new());
 
     let imported = parse_profile_import(&document.to_string(), "portable.json").unwrap();

@@ -300,7 +300,7 @@ fn stale_profile_address(profile_address: Option<&str>, announced: &str) -> Opti
         format!(
             "Profil périmé : la gateway a enregistré {announced} pour ce poste, le profil \
              déclare {declared}. La gateway rejette le trafic émis depuis {declared}. Demander \
-             à l'opérateur un profil réémis (helios-ctl profile emit) puis le réimporter ; \
+             à l'opérateur un profil réémis (helios profile emit) puis le réimporter ; \
              Orion ne modifie pas le profil de lui-même."
         )
     })
@@ -333,7 +333,7 @@ fn stale_profile_address_v6(
         (Ok(declared), Ok(announced)) => declared == announced,
         _ => declared.trim() == announced.trim(),
     };
-    let reissue = "Demander à l'opérateur un profil réémis (helios-ctl profile emit) puis le \
+    let reissue = "Demander à l'opérateur un profil réémis (helios profile emit) puis le \
                    réimporter ; Orion ne modifie pas le profil de lui-même.";
     match (profile_address, announced) {
         (None, None) => None,

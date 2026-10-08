@@ -77,7 +77,7 @@ struct JsonProfile {
     ///
     /// The envelope is `deny_unknown_fields`, so an Orion older than this
     /// field refuses a document carrying it — an explicit refusal, which is
-    /// why `helios-ctl` writes the key only for a peer that has one.
+    /// why `helios` writes the key only for a peer that has one.
     #[serde(default)]
     address_v6: Option<String>,
     #[serde(default)]

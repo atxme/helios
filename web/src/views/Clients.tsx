@@ -28,7 +28,7 @@ import type { PeerSummary, ProtectionMode, Status } from '../types'
  * This is the screen the console exists for, and until now it did not exist:
  * peers were listed from the configuration file, with no way to tell a client
  * that handshaked a minute ago from one that has been gone for a week, and no
- * way to admit or remove one without an SSH session and `helios-ctl`.
+ * way to admit or remove one without an SSH session and `helios`.
  */
 
 /**

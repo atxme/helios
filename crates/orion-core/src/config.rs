@@ -738,7 +738,7 @@ impl ClientProfile {
     /// — widening a stored routing table is a decision for the user, taken in
     /// the editor, not a migration run on load. The rule lives in
     /// [`crate::profile_import::tunnel_capture`], once, so the screen and
-    /// `helios-ctl` cannot disagree about which profiles it names.
+    /// `helios` cannot disagree about which profiles it names.
     pub fn ipv6_uncaptured_full_tunnel(&self) -> bool {
         crate::profile_import::tunnel_capture(&self.allowed_ips)
             == crate::profile_import::TunnelCapture::Ipv4Only

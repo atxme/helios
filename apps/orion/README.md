@@ -186,7 +186,7 @@ n'utilise.
 transaction QUIC a bien lieu et le client prouve la possession de la clé par un
 engagement HMAC lié à la session avant que la gateway n'installe le PSK déjà
 configuré ([NEGOCIATION-DE-CLE-V5](../../docs/specification/NEGOCIATION-DE-CLE-V5.md)
-§9.1). Un document produit par `helios-ctl enroll` peut donc légitimement le
+§9.1). Un document produit par `helios enroll` peut donc légitimement le
 porter. Orion ne le compose plus mais l'affiche tel quel — la clé qu'il exige
 comprise — avec un bouton **Passer en ML-KEM** : le réétiqueter serait mentir
 sur ce que le profil fait, et masquer son PSK laisserait un profil invalide
@@ -294,7 +294,7 @@ Le format JSON courant est `orion-profile` version 1 :
 ```
 
 `allowed_ips`, `persistent_keepalive`, `heliosd_url` et `preshared_key` sont
-facultatifs, comme `address_v6` (`"fd3c:91a2:7e04::2/128"`), que `helios-ctl`
+facultatifs, comme `address_v6` (`"fd3c:91a2:7e04::2/128"`), que `helios`
 n’écrit que pour un pair qui en a une. Le document refusant les champs
 inconnus, un Orion antérieur à ce champ refuse à l’import un profil qui le
 porte : c’est la version d’Orion minimale à installer pour un profil IPv6, pas

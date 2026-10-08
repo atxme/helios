@@ -57,7 +57,7 @@ fn current_wireguard_status_is_deserializable() {
 #[test]
 fn command_line_keeps_peer_security_parameters() {
     let cli = Cli::try_parse_from([
-        "helios-ctl",
+        "helios",
         "--url",
         "https://100.64.0.1:8080/",
         "peer",
@@ -75,9 +75,9 @@ fn command_line_keeps_peer_security_parameters() {
         "ml-kem",
     ])
     .unwrap();
-    assert_eq!(cli.url, "https://100.64.0.1:8080/");
+    assert_eq!(cli.url.as_deref(), Some("https://100.64.0.1:8080/"));
     assert!(matches!(
-        cli.command,
+        cli.command.unwrap(),
         Cmd::Peer {
             command: PeerCmd::Add {
                 name,
@@ -93,17 +93,18 @@ fn command_line_keeps_peer_security_parameters() {
     ));
 
     assert!(matches!(
-        Cli::try_parse_from(["helios-ctl", "peer", "list"])
+        Cli::try_parse_from(["helios", "peer", "list"])
             .unwrap()
-            .command,
+            .command
+            .unwrap(),
         Cmd::Peer {
             command: PeerCmd::List
         }
     ));
     assert!(matches!(
-        Cli::try_parse_from(["helios-ctl", "peer", "revoke", "--name", "old"])
+        Cli::try_parse_from(["helios", "peer", "revoke", "--name", "old"])
             .unwrap()
-            .command,
+            .command.unwrap(),
         Cmd::Peer {
             command: PeerCmd::Revoke { name }
         } if name == "old"
@@ -113,16 +114,28 @@ fn command_line_keeps_peer_security_parameters() {
 #[test]
 fn command_line_covers_offline_and_diagnostic_commands() {
     for arguments in [
-        vec!["helios-ctl", "status"],
-        vec!["helios-ctl", "connect"],
-        vec!["helios-ctl", "disconnect"],
-        vec!["helios-ctl", "watch"],
-        vec!["helios-ctl", "network", "show"],
-        vec!["helios-ctl", "network", "load", "network.toml"],
-        vec!["helios-ctl", "profile", "check", "client.orion"],
-        vec!["helios-ctl", "escrow", "keygen", "--output-dir", "keys"],
+        vec!["helios"],
+        vec!["helios", "shell"],
+        vec!["helios", "update", "--check"],
+        vec!["helios", "firmware", "list"],
         vec![
-            "helios-ctl",
+            "helios",
+            "firmware",
+            "update",
+            "--plan",
+            "firmware-plan.json",
+            "--yes",
+        ],
+        vec!["helios", "status"],
+        vec!["helios", "connect"],
+        vec!["helios", "disconnect"],
+        vec!["helios", "watch"],
+        vec!["helios", "network", "show"],
+        vec!["helios", "network", "load", "network.toml"],
+        vec!["helios", "profile", "check", "client.orion"],
+        vec!["helios", "escrow", "keygen", "--output-dir", "keys"],
+        vec![
+            "helios",
             "app-update",
             "--manifest",
             "heliosd.release.json",
@@ -130,15 +143,15 @@ fn command_line_covers_offline_and_diagnostic_commands() {
             "heliosd",
             "--yes",
         ],
-        vec!["helios-ctl", "scenario", "flap"],
-        vec!["helios-ctl", "campaign", "--generate-keys"],
+        vec!["helios", "scenario", "flap"],
+        vec!["helios", "campaign", "--generate-keys"],
     ] {
         Cli::try_parse_from(arguments).unwrap();
     }
 
     assert!(
         Cli::try_parse_from([
-            "helios-ctl",
+            "helios",
             "enroll",
             "--name",
             "client",
@@ -153,7 +166,7 @@ fn command_line_covers_offline_and_diagnostic_commands() {
         "partial offline enrollment material must be refused"
     );
     let offline = [
-        "helios-ctl",
+        "helios",
         "enroll",
         "--name",
         "client",
@@ -178,7 +191,7 @@ fn command_line_covers_offline_and_diagnostic_commands() {
     .unwrap();
     assert!(
         Cli::try_parse_from([
-            "helios-ctl",
+            "helios",
             "enroll",
             "--name",
             "client",
@@ -193,7 +206,7 @@ fn command_line_covers_offline_and_diagnostic_commands() {
         "an IPv6 VIP alone is not offline enrollment material"
     );
     assert!(Cli::try_parse_from([
-        "helios-ctl",
+        "helios",
         "app-update",
         "--manifest",
         "heliosd.release.json",
@@ -203,6 +216,13 @@ fn command_line_covers_offline_and_diagnostic_commands() {
         "--yes",
     ])
     .is_err());
+}
+
+#[test]
+fn passive_update_check_cannot_be_combined_with_installation_confirmation() {
+    assert!(Cli::try_parse_from(["helios", "update", "--check", "--yes"]).is_err());
+    assert!(Cli::try_parse_from(["helios", "firmware", "update"]).is_err());
+    assert!(Cli::try_parse_from(["helios"]).unwrap().command.is_none());
 }
 
 #[test]
@@ -266,6 +286,57 @@ fn command_responses_preserve_refusal_details() {
     )
     .unwrap_err();
     assert!(unknown.to_string().contains("unknown error"));
+}
+
+/// Without `--url`, the transport decides (local socket or in-tunnel API):
+/// the parser must not invent a TCP address.
+#[test]
+fn no_url_is_assumed_by_the_parser() {
+    if std::env::var_os("HELIOS_URL").is_some() {
+        return;
+    }
+    let cli = Cli::try_parse_from(["helios", "status"]).unwrap();
+    assert_eq!(cli.url, None);
+}
+
+/// A peer is online when its last handshake is younger than the gateway's
+/// staleness bound; a peer that never shook hands is not.
+#[test]
+fn online_peers_follow_the_gateway_staleness_bound() {
+    let status: Status = serde_json::from_value(serde_json::json!({
+        "state": "up", "version": "1.13.0", "wan_ifaces": [], "lan_ifaces": [],
+        "wg_peers": [], "allow_ssh_from": [], "wg_iface": "helios0",
+        "wg_listen_port": 51820, "dry_run": false, "split_tunnel_cidrs": [],
+        "mss_clamp": null, "captive_portal_gateway": null,
+        "handshake_stale_after_seconds": 150,
+        "peers": [
+            {"name": "a", "public_key": "k", "address": "100.64.1.2/32", "post_quantum": false, "last_handshake_age_seconds": 12},
+            {"name": "b", "public_key": "k", "address": "100.64.1.3/32", "post_quantum": false, "last_handshake_age_seconds": 400},
+            {"name": "c", "public_key": "k", "address": "100.64.1.4/32", "post_quantum": false, "last_handshake_age_seconds": null},
+        ]
+    }))
+    .unwrap();
+    assert_eq!(status.online_peers(), (1, 3));
+}
+
+/// A refusal from the gateway is a failed command: the shell then closes its
+/// block with ✗, not with ✓ under a printed cross.
+#[test]
+fn a_gateway_refusal_fails_the_command() {
+    let refused = CmdResp {
+        ok: false,
+        error: Some("tunnel already up".into()),
+    };
+    let error = accepted(refused).expect_err("a refusal must fail");
+    assert_eq!(
+        error.to_string(),
+        "refused by the gateway: tunnel already up"
+    );
+    assert!(accepted(CmdResp {
+        ok: true,
+        error: None
+    })
+    .is_ok());
 }
 
 /// An operator-typed IPv6 VIP is judged by Orion's rule before anything is

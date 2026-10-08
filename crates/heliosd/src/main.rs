@@ -376,7 +376,7 @@ enum Command {
     ///
     /// Used to bootstrap the first administrator peer — without it, no
     /// remote mutation is authorized (ADR-003 §3) — and for troubleshooting.
-    /// The nominal path afterwards is `helios-ctl peer`, through the tunnel.
+    /// The nominal path afterwards is `helios peer`, through the tunnel.
     Peer {
         #[command(subcommand)]
         command: PeerCommand,
@@ -390,6 +390,21 @@ enum Command {
 
 #[derive(Subcommand)]
 pub(crate) enum TpmCommand {
+    /// Reports whether this binary uses TPM sealing, without opening the TPM.
+    SealingStatus,
+    /// Exports an encrypted root backup for planned firmware maintenance.
+    ExportFirmware {
+        #[arg(long)]
+        operator_public_key: String,
+        #[arg(long)]
+        device: String,
+        #[arg(long)]
+        target_version: String,
+    },
+    /// Verifies a firmware authorization supplied as JSON on stdin.
+    FirmwarePreflight,
+    /// Restores the existing root from a bounded SSH stdin frame.
+    RestoreFirmware,
     /// Arms an update window before an OS upgrade that will reboot.
     ///
     /// Run it on the running gateway, **before** `apt upgrade` or before the
@@ -490,7 +505,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Logs go to **stderr**, never stdout: several subcommands answer on stdout
     // and are read by a machine — `tpm update-status` returns `armed`/`none` to
-    // `helios-ctl update`, `peer add` returns the assigned VIP. A log line
+    // `helios update`, `peer add` returns the assigned VIP. A log line
     // interleaved there is not noise, it is a wrong answer. systemd captures
     // both streams, so the journal is unchanged.
     //

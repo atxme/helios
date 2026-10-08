@@ -2524,7 +2524,7 @@ fn export_logs(app: AppHandle, stem: String, contents: String) -> Result<String,
 
 /// Extension of an Orion profile, without the dot.
 ///
-/// It is the extension the installer registers, the one `helios-ctl` writes,
+/// It is the extension the installer registers, the one `helios` writes,
 /// and the one the import filter offers. One constant so those three cannot
 /// drift apart.
 const PROFILE_EXTENSION: &str = "orion";

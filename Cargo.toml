@@ -31,7 +31,7 @@ default-members = [
     "crates/heliosd",
     "tools/astra-signer",
     "tools/helios-astra-helper",
-    "tools/helios-ctl",
+    "tools/helios",
     "tools/helios-installer",
     "tools/xtask",
     "apps/orion/src-tauri",

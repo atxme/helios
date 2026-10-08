@@ -246,6 +246,30 @@ Le domaine actuel est `helios-tpm-reseal-v1` : conserver le préfixe complet.
 * Pas de certification FIPS 140-3 CMVP comme critère d'acceptation.
 * Pas de ML-DSA via `aws-lc-rs` `unstable`.
 
+### Amendement 5 — restauration firmware planifiée (1er octobre 2026)
+
+L'artefact `helios-firmware-recovery-v1` autorise exclusivement la restauration
+du secret racine existant depuis une sauvegarde opérateur préparée avant une
+mise à jour firmware. Il est distinct du billet et de la récupération
+WireGuard historique ; leurs domaines ne sont pas interchangeables.
+
+**Choix explicite pour ce parcours : réutiliser `TpmState.version`**, partagé
+avec les billets, avec ancre de l'ancien blob et engagement du secret. Le
+compteur doit strictement croître avant toute substitution du blob. Le système
+de fichiers qui le porte doit être protégé contre le rollback. Ce choix
+n'apporte **pas** une résistance matérielle au rejeu d'une image complète du
+disque : restaurer ensemble compteur et ancien blob contourne la monotonie.
+Une telle garantie exige un compteur NV TPM et reste absente de ce parcours.
+La signature et l'engagement empêchent cependant l'injection d'un secret
+arbitraire avec une autorisation destinée à un autre secret.
+
+Cette décision explicite l'hypothèse pour la maintenance planifiée ; elle ne
+lève pas le blocage de la récupération WireGuard historique. L'éditeur doit
+protéger ses clés et n'autoriser que les requêtes issues d'une préparation
+nominale de la gateway concernée. Voir [ADR-007](ADR-007-FENETRE-DE-MISE-A-JOUR.md)
+et [MAINTENANCE.md](../MAINTENANCE.md).
+
+
 ## Arbitrage : pourquoi ces choix (conservé pour mémoire)
 
 ### ⚠️ Conflit direct avec le plan FIPS

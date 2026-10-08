@@ -377,7 +377,7 @@ mod tests {
 
     fn directory(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
-            "helios-ctl-app-update-{name}-{}-{:?}",
+            "helios-app-update-{name}-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));

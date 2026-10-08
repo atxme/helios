@@ -116,4 +116,4 @@ else
     CTL_ARGS+=(--yes)
 fi
 HELIOS_PUBLISHER_KEYRING_PATH="$EPOCH_DIR/publisher-keyring.json" \
-    cargo run --quiet -p helios-ctl -- "${CTL_ARGS[@]}"
+    cargo run --quiet -p helios -- "${CTL_ARGS[@]}"

@@ -329,7 +329,7 @@ sudo /opt/helios/current/heliosd init-identity
 n'est jamais affichée.
 
 Sans TPM, `provision-tpm` échoue. Repli hérité, dégradé mais fonctionnel :
-générer une paire avec `cargo run -p helios-ctl -- campaign --generate-keys` sur
+générer une paire avec `cargo run -p helios -- campaign --generate-keys` sur
 le poste de développement et poser la privée dans `wg_private_key` de
 `network.toml`. Elle sera alors en clair sur le disque de la gateway.
 
@@ -375,7 +375,7 @@ joignable qu'à travers le tunnel, cette commande se joue une fois le tunnel
 monté, ou bien on recopie à la main les valeurs affichées par `peer add` :
 
 ```sh
-cargo run -p helios-ctl -- --url http://100.64.0.1:8080 profile emit \
+cargo run -p helios -- --url http://100.64.0.1:8080 profile emit \
   --name poste-windows --endpoint <ip-de-la-gateway>:51820 \
   --public-key <clé publique d'Orion> --output poste-windows.json
 ```

@@ -128,7 +128,7 @@ gateway de laboratoire ou une URL non standard :
 Le transfert seul reste utilisable avec des artefacts préparés ailleurs :
 
 ```sh
-helios-ctl --url http://100.64.0.1:8080 app-update \
+helios --url http://100.64.0.1:8080 app-update \
   --manifest heliosd.release.json --binary heliosd
 ```
 
@@ -142,7 +142,7 @@ envoie un ELF Linux déjà construit et son manifeste signé :
   -Yes
 ```
 
-`-HeliosCtl C:\outils\helios-ctl.exe` évite `cargo run` lorsqu'un binaire
+`-HeliosCtl C:\outils\helios.exe` évite `cargo run` lorsqu'un binaire
 Windows de l'outil est déjà disponible. Windows ne construit pas nativement
 le daemon Linux et ses dépendances noyau/TPM. Quand le dépôt et les clés
 éditeur vivent dans WSL, PowerShell peut lancer la chaîne complète :
@@ -158,9 +158,9 @@ Dans ce second mode, build, signature et transfert s'exécutent dans WSL ;
 ne voit pas la route installée par Orion sous Windows, produire les artefacts
 dans WSL puis employer le premier mode fait partir l'appel API de Windows.
 
-Sans `--yes`, `helios-ctl` demande confirmation après le staging. `--stage-only`
+Sans `--yes`, `helios` demande confirmation après le staging. `--stage-only`
 n’active rien. Ce chemin ne remplace pas le bundle signé : une modification de
-`helios-installer`, `helios-ctl` ou d’une unité systemd exige toujours un bundle.
+`helios-installer`, `helios` ou d’une unité systemd exige toujours un bundle.
 
 ## Signer un bundle d’installation
 

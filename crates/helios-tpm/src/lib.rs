@@ -33,6 +33,7 @@ mod blob_store;
 mod boot_controller;
 #[cfg(test)]
 mod escrow_recovery_tests;
+pub mod firmware_recovery;
 pub mod keystore;
 mod provisioning;
 mod reseal_ticket;
@@ -54,6 +55,10 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum TpmError {
+    #[error("firmware recovery refused: {0}")]
+    FirmwareRecovery(String),
+    #[error("this binary disables TPM sealing but a sealed identity exists — use the installed TPM-enabled heliosd before maintenance")]
+    SealingCapabilityMismatch,
     #[error("TPM connection failed: {0}")]
     Connection(String),
 

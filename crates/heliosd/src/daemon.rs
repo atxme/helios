@@ -185,7 +185,9 @@ pub(crate) async fn run(
     // The sealing posture, as two non-secret facts. `boot` itself is moved
     // into the orchestrator below — it holds the unlock secret, and only the
     // orchestrator may seal.
-    state = state.with_tpm(boot.kind(), boot.preserved_vaults());
+    state = state
+        .with_tpm(boot.kind(), boot.preserved_vaults())
+        .with_daemon_version(env!("CARGO_PKG_VERSION"));
     // Started here rather than earlier because the reclamation loop reads the
     // same data-plane snapshot the console does, and that snapshot is owned
     // by `AppState`. Polling the backend a second time would risk the two
@@ -308,7 +310,7 @@ pub(crate) async fn run(
         // A second instance here would give one slot two writers.
         state = state.with_psk_release(handler);
     }
-    // Published for the operator tooling: `helios-ctl` builds a complete
+    // Published for the operator tooling: `helios` builds a complete
     // Orion profile from the gateway rather than making the operator copy
     // certificates out of /var/lib/helios by hand.
     if let Some(material) = key_negotiation::public_material()? {
@@ -347,6 +349,26 @@ pub(crate) async fn run(
             }
         }
     });
+
+    // Local administration for the operator terminal on the gateway itself
+    // (ADR-003, amendment of 3 October 2026). Real mode only: a simulation
+    // keeps its loopback administrator and has no root-owned /run/helios.
+    #[cfg(target_os = "linux")]
+    if !dry_run {
+        let local_state = state.clone();
+        let socket = std::env::var_os("HELIOS_ADMIN_SOCKET")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| aether::LOCAL_ADMIN_SOCKET.into());
+        tokio::spawn(async move {
+            let result = match helios_api::local::AdminPolicy::system() {
+                Ok(policy) => helios_api::local::serve_local(local_state, &socket, policy).await,
+                Err(e) => Err(anyhow::Error::from(e).context("resolving the local admin group")),
+            };
+            if let Err(e) = result {
+                error!("local administration socket unavailable: {e:#}");
+            }
+        });
+    }
 
     let raw_speedtest_state = state.clone();
     let raw_speedtest_shutdown = Arc::new(AtomicBool::new(false));

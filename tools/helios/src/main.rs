@@ -1,11 +1,11 @@
-//! `helios-ctl` — development and control tool for heliosd.
+//! `helios` — interactive and scripted gateway administration.
 //!
 //! ```sh
 //! cargo run -p heliosd -- run --dev          # daemon in dev mode
-//! cargo run -p helios-ctl -- status
-//! cargo run -p helios-ctl -- watch
-//! cargo run -p helios-ctl -- network show
-//! cargo run -p helios-ctl -- network load config/network.toml
+//! cargo run -p helios -- status
+//! cargo run -p helios -- watch
+//! cargo run -p helios -- network show
+//! cargo run -p helios -- network load config/network.toml
 //! ```
 
 use std::{
@@ -20,7 +20,8 @@ use futures_util::StreamExt;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::Value;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio_tungstenite::{connect_async, tungstenite::Message, WebSocketStream};
 
 mod api;
 mod app_update;
@@ -29,39 +30,57 @@ mod campaign_key_nego;
 mod enroll;
 mod escrow;
 mod files;
+mod firmware;
+mod inspect;
+mod interactive;
 mod key_nego;
 mod peer;
 mod profile;
+mod transport;
+mod ui;
 mod update;
 
 // ─── CLI ──────────────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
 #[command(
-    name = "helios-ctl",
-    about = "Test and control tool for heliosd",
+    name = "helios",
+    about = "Helios gateway administration",
     after_help = "\
 EXAMPLES:
-  cargo run -p helios-ctl -- status
-  cargo run -p helios-ctl -- watch
-  cargo run -p helios-ctl -- network show
-  cargo run -p helios-ctl -- network load config/network.toml
-  cargo run -p helios-ctl -- --url http://100.64.0.1:8080 app-update \
+  helios                                      # interactive terminal
+  helios update --check                       # passive local plan
+  helios firmware list                        # local firmware inventory
+  cargo run -p helios -- status
+  cargo run -p helios -- watch
+  cargo run -p helios -- network show
+  cargo run -p helios -- network load config/network.toml
+  cargo run -p helios -- --url http://100.64.0.1:8080 app-update \
     --manifest heliosd.release.json --binary heliosd
-  cargo run -p helios-ctl -- scenario nominal
-  cargo run -p helios-ctl -- update                 # on the gateway
-  cargo run -p helios-ctl -- --url http://192.168.1.1:8080 status"
+  cargo run -p helios -- scenario nominal
+  cargo run -p helios -- update                 # on the gateway
+  cargo run -p helios -- --url http://192.168.1.1:8080 status"
 )]
 struct Cli {
-    #[arg(long, default_value = "http://127.0.0.1:8080", env = "HELIOS_URL")]
-    url: String,
+    /// Gateway API over TCP. Without it, the gateway's local administration
+    /// socket when present, else the in-tunnel API (http://100.64.0.1:8080).
+    /// A dry-run daemon (`heliosd run --dev`) listens on http://127.0.0.1:8080.
+    #[arg(long, env = "HELIOS_URL")]
+    url: Option<String>,
 
     #[command(subcommand)]
-    command: Cmd,
+    command: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Opens the interactive administration terminal.
+    Shell,
+    /// Firmware inventory, prepared updates and verified reboot/recovery through SSH.
+    Firmware {
+        #[command(subcommand)]
+        command: firmware::FirmwareCmd,
+    },
     /// Shows the daemon's current state.
     Status,
     /// Connects the VPN tunnel.
@@ -70,6 +89,36 @@ enum Cmd {
     Disconnect,
     /// Real-time event stream over WebSocket. Ctrl-C to quit.
     Watch,
+    /// One-pass health check: API, tunnel, TPM, firewall, certificates, release.
+    Doctor,
+    /// Machine health: uptime, load, memory, temperature and TPM posture.
+    Health,
+    /// nftables ruleset rendered for the current tunnel state.
+    Firewall {
+        /// The exact nftables text, for copying or diffing.
+        #[arg(long)]
+        raw: bool,
+    },
+    /// Trust domain and certificate lifecycle: CA, gateway identity, clients.
+    Certificates,
+    /// Publisher keys and algorithms an application update must carry.
+    Trust,
+    /// heliosd release state: active version, staged releases, pending activation.
+    Release,
+    /// Public key-negotiation material pinned by Orion profiles.
+    Negotiation,
+    /// heliosd journal on this machine (journalctl). Ctrl-C ends --follow.
+    Logs {
+        /// Number of most recent lines.
+        #[arg(short = 'n', long, default_value_t = 50)]
+        lines: usize,
+        /// Keep printing new lines.
+        #[arg(short, long)]
+        follow: bool,
+        /// Also show the module each line comes from.
+        #[arg(short, long)]
+        verbose: bool,
+    },
     /// Network configuration management.
     Network {
         #[command(subcommand)]
@@ -218,10 +267,14 @@ enum Cmd {
     /// window and reboots — which kills this command. Whether the window was
     /// consumed is in the journal at the next boot:
     /// `journalctl --namespace=helios -u heliosd -b | grep -i 'update window'`.
+    /// PCR 0/7 changes are refused when sealing is enabled. `--check` is passive.
     Update {
         /// Skips the confirmation.
         #[arg(long)]
         yes: bool,
+        /// Shows pending OS packages and firmware without changing the system.
+        #[arg(long, conflicts_with = "yes")]
+        check: bool,
     },
     /// Runs a predefined test scenario.
     Scenario {
@@ -413,13 +466,36 @@ struct Status {
     wg_iface: String,
     wg_listen_port: Option<u16>,
     dry_run: bool,
+    #[serde(default)]
+    key_negotiation_port: Option<u16>,
     split_tunnel_cidrs: Vec<String>,
     mss_clamp: Option<u16>,
     captive_portal_gateway: Option<String>,
+    /// Absent from older daemons: every observed handshake then counts.
+    #[serde(default)]
+    handshake_stale_after_seconds: Option<u64>,
     /// Absent from a gateway older than the IPv6 tunnel: read as "nothing to
     /// report" rather than refused.
     #[serde(default)]
     ipv6: aether::net::Ipv6TunnelStatus,
+}
+
+impl Status {
+    /// Peers whose last WireGuard handshake is still fresh, out of all
+    /// admitted peers.
+    fn online_peers(&self) -> (usize, usize) {
+        let online = self
+            .peers
+            .iter()
+            .filter(|peer| {
+                peer.last_handshake_age_seconds.is_some_and(|age| {
+                    self.handshake_stale_after_seconds
+                        .is_none_or(|stale| age <= stale)
+                })
+            })
+            .count();
+        (online, self.peers.len())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -428,9 +504,21 @@ struct PeerSummary {
     public_key: String,
     address: String,
     post_quantum: bool,
+    #[serde(default)]
+    last_handshake_age_seconds: Option<u64>,
+    #[serde(default)]
+    admin: bool,
+    #[serde(default)]
+    minimum_key_negotiation_mode: String,
+    #[serde(default)]
+    endpoint: Option<String>,
+    #[serde(default)]
+    rx_bytes: u64,
+    #[serde(default)]
+    tx_bytes: u64,
 }
 
-use crate::api::{CmdResp, NetworkConfigView};
+use crate::api::CmdResp;
 
 // ─── Display ──────────────────────────────────────────────────────────────────
 
@@ -508,183 +596,74 @@ fn ws_url(base: &str) -> String {
 
 // ─── Commands ─────────────────────────────────────────────────────────────────
 
-async fn cmd_status(client: &Client, base: &str) -> Result<()> {
-    let s = api_status(client, base).await?;
-    let dry = if s.dry_run {
-        "  \x1b[35m[dry-run]\x1b[0m"
-    } else {
-        ""
-    };
-    println!();
-    println!("  \x1b[1mheliosd v{}\x1b[0m{}", s.version, dry);
-    println!();
-    println!("  {}  {}", state_dot(&s.state), colored_state(&s.state));
-    println!();
-    println!("  {:<14} {}", "WAN", s.wan_ifaces.join(", "));
-    println!("  {:<14} {}", "LAN", s.lan_ifaces.join(", "));
-    println!(
-        "  {:<14} {}{}",
-        "WireGuard",
-        s.wg_iface,
-        s.wg_listen_port
-            .map(|port| format!(" (UDP {port})"))
-            .unwrap_or_else(|| " (port closed)".to_string())
-    );
-    match &s.ipv6 {
-        aether::net::Ipv6TunnelStatus::NotConfigured => {}
-        aether::net::Ipv6TunnelStatus::Installed => println!("  {:<14} installed", "IPv6"),
-        aether::net::Ipv6TunnelStatus::Unavailable(reason) => println!(
-            "  {:<14} \x1b[33munavailable\x1b[0m — IPv4-only (degraded): {reason}",
-            "IPv6"
-        ),
-    }
-    for peer in &s.peers {
-        let pq = if peer.post_quantum { " [PQ]" } else { "" };
-        let key = peer.public_key.get(..8).unwrap_or(&peer.public_key);
-        println!(
-            "  {:<14} {} → {} ({key}…){pq}",
-            "Peer", peer.name, peer.address
-        );
-    }
-    if !s.wg_peers.is_empty() {
-        println!("  {:<14} {}", "Site-to-site", s.wg_peers.join(", "));
-    }
-    if !s.allow_ssh_from.is_empty() {
-        println!("  {:<14} {}", "SSH allowed", s.allow_ssh_from.join(", "));
-    }
-    if !s.admin_ifaces.is_empty() {
-        println!("  {:<14} {}", "Admin access", s.admin_ifaces.join(", "));
-    }
-    if !s.split_tunnel_cidrs.is_empty() {
-        println!(
-            "  {:<14} {}",
-            "Split tunnel",
-            s.split_tunnel_cidrs.join(", ")
-        );
-    }
-    if let Some(mss) = s.mss_clamp {
-        println!("  {:<14} {}", "MSS clamp", mss);
-    }
-    if let Some(gateway) = &s.captive_portal_gateway {
-        println!("  {:<14} {}", "Captive portal", gateway);
-    }
-    println!();
-    Ok(())
-}
-
 async fn cmd_connect(client: &Client, base: &str) -> Result<()> {
-    let r = api_post(client, base, "/api/tunnel/start").await?;
-    if r.ok {
-        println!("{} connect command sent", ok());
-    } else {
-        println!("{} refused: {}", fail(), r.error.as_deref().unwrap_or("?"));
-    }
+    accepted(api_post(client, base, "/api/tunnel/start").await?)?;
+    let ui = ui::Ui::detect();
+    print!(
+        "{}{}",
+        ui.done("Tunnel start requested"),
+        ui.note("Follow it with /status or /watch.")
+    );
     Ok(())
 }
 
 async fn cmd_disconnect(client: &Client, base: &str) -> Result<()> {
-    let r = api_post(client, base, "/api/tunnel/stop").await?;
-    if r.ok {
-        println!("{} disconnect sent — kill switch engaged", ok());
-    } else {
-        println!("{} refused: {}", fail(), r.error.as_deref().unwrap_or("?"));
-    }
+    accepted(api_post(client, base, "/api/tunnel/stop").await?)?;
+    let ui = ui::Ui::detect();
+    print!(
+        "{}{}",
+        ui.done("Tunnel stop requested"),
+        ui.note("The kill switch stays engaged: no traffic leaves outside the tunnel.")
+    );
     Ok(())
 }
 
-async fn cmd_watch(base: &str) -> Result<()> {
-    let url = ws_url(base);
-    println!("\x1b[2m↳ {url}\x1b[0m");
-    let (mut stream, _) = connect_async(&url)
+/// A refusal is a failed command, not a success that prints a cross.
+fn accepted(response: CmdResp) -> Result<()> {
+    if response.ok {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "refused by the gateway: {}",
+        response.error.as_deref().unwrap_or("no reason given")
+    )
+}
+
+async fn cmd_watch(api: &transport::Api) -> Result<()> {
+    let url = ws_url(&api.base);
+    println!("\x1b[2m↳ {}\x1b[0m", api.describe());
+    #[cfg(unix)]
+    if let Some(socket) = &api.socket {
+        let stream = tokio::net::UnixStream::connect(socket)
+            .await
+            .with_context(|| format!("could not connect to {}", socket.display()))?;
+        let (stream, _) = tokio_tungstenite::client_async(url.as_str(), stream)
+            .await
+            .context("WebSocket handshake over the local socket")?;
+        return watch_events(stream).await;
+    }
+    let (stream, _) = connect_async(&url)
         .await
         .context("could not connect — is heliosd running?")?;
-    println!("\x1b[2m↳ connected — Ctrl-C to quit\x1b[0m\n");
-
-    while let Some(msg) = stream.next().await {
-        if let Ok(Message::Text(text)) = msg {
-            let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-            print_ws_event(&hh_mm_ss(), &v);
-        }
-    }
-    Ok(())
+    watch_events(stream).await
 }
 
-async fn cmd_network_show(client: &Client, base: &str) -> Result<()> {
-    let cfg: NetworkConfigView = client
-        .get(format!("{base}/api/network"))
-        .send()
-        .await
-        .context("connection refused")?
-        .json()
-        .await
-        .context("unexpected JSON response")?;
-
-    println!();
-    println!("  \x1b[1mNetwork config\x1b[0m");
-    println!();
-    println!(
-        "  {:<16} {}",
-        "WAN",
-        if cfg.wan_ifaces.is_empty() {
-            "(not set)".to_string()
-        } else {
-            cfg.wan_ifaces.join(", ")
+async fn watch_events<S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: WebSocketStream<S>,
+) -> Result<()> {
+    println!("\x1b[2m↳ connected — Ctrl-C to quit\x1b[0m\n");
+    loop {
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => { result?; return Ok(()); }
+            message = stream.next() => {
+                let Some(message) = message else { return Ok(()); };
+                if let Ok(Message::Text(text)) = message {
+                    let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+                    print_ws_event(&hh_mm_ss(), &v);
+                }
+            }
         }
-    );
-    println!(
-        "  {:<16} {}",
-        "LAN",
-        if cfg.lan_ifaces.is_empty() {
-            "(none)".to_string()
-        } else {
-            cfg.lan_ifaces.join(", ")
-        }
-    );
-    if !cfg.allow_ssh_from.is_empty() {
-        println!(
-            "  {:<16} {}",
-            "SSH allowed from",
-            cfg.allow_ssh_from.join(", ")
-        );
     }
-    if !cfg.admin_ifaces.is_empty() {
-        println!("  {:<16} {}", "Admin ifaces", cfg.admin_ifaces.join(", "));
-    }
-    if let Some(ref iface) = cfg.admin_iface {
-        println!("  {:<16} {}", "Admin iface", iface);
-    }
-    println!(
-        "  {:<16} {} (UDP {})",
-        "WG interface", cfg.wg_iface, cfg.wg_listen_port
-    );
-    println!(
-        "  {:<16} {}",
-        "Key negotiation",
-        cfg.key_negotiation_port
-            .map(|port| format!("UDP {port}"))
-            .unwrap_or_else(|| "disabled".to_string())
-    );
-    println!(
-        "  {:<16} {}",
-        "Private key",
-        if cfg.wg_private_key_configured {
-            "configured (hidden)"
-        } else {
-            "absent"
-        }
-    );
-    println!("  {:<16} {}", "WG address", cfg.wg_address);
-    println!("  {:<16} {}", "Peers", cfg.peers.len());
-    for p in &cfg.peers {
-        let pq = if p.preshared_key_configured {
-            "  [PQ]"
-        } else {
-            ""
-        };
-        println!("    - {} → {}{}", p.name, p.address, pq);
-    }
-    println!();
-    Ok(())
 }
 
 async fn cmd_network_load(client: &Client, base: &str, file: &PathBuf) -> Result<()> {
@@ -718,19 +697,14 @@ async fn cmd_network_load(client: &Client, base: &str, file: &PathBuf) -> Result
         .await
         .context("unexpected JSON response")?;
 
-    if resp.ok {
-        println!(
-            "{} network config loaded ({} peer(s))",
-            ok(),
+    accepted(resp)?;
+    print!(
+        "{}",
+        ui::Ui::detect().done(&format!(
+            "Network configuration loaded · {} peer(s)",
             config.peers.len()
-        );
-    } else {
-        println!(
-            "{} refused: {}",
-            fail(),
-            resp.error.as_deref().unwrap_or("?")
-        );
-    }
+        ))
+    );
     Ok(())
 }
 
@@ -952,6 +926,13 @@ fn check_ssh_target(value: Option<String>) -> Result<Option<String>> {
 
 // ─── main ─────────────────────────────────────────────────────────────────────
 
+/// Same override as heliosd, for a non-default runtime directory.
+fn admin_socket() -> std::path::PathBuf {
+    std::env::var_os("HELIOS_ADMIN_SOCKET")
+        .map(Into::into)
+        .unwrap_or_else(|| aether::LOCAL_ADMIN_SOCKET.into())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Two rustls providers are compiled in — `ring` for the negotiation's QUIC
@@ -961,20 +942,41 @@ async fn main() -> Result<()> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     let cli = Cli::parse();
-    let client = Client::new();
-    let base = cli.url.trim_end_matches('/');
+    let api = transport::Api::resolve(cli.url.as_deref(), &admin_socket())?;
 
     match cli.command {
-        Cmd::Status => cmd_status(&client, base).await,
-        Cmd::Connect => cmd_connect(&client, base).await,
-        Cmd::Disconnect => cmd_disconnect(&client, base).await,
-        Cmd::Watch => cmd_watch(base).await,
+        None | Some(Cmd::Shell) => interactive::run(api).await,
+        Some(command) => execute_command(&api, command).await,
+    }
+}
+
+async fn execute_command(api: &transport::Api, command: Cmd) -> Result<()> {
+    let (client, base) = (&api.client, api.base.as_str());
+    match command {
+        Cmd::Shell => anyhow::bail!("open the shell at the command entry point"),
+        Cmd::Firmware { command } => firmware::run(command),
+        Cmd::Status => inspect::status(client, base).await,
+        Cmd::Connect => cmd_connect(client, base).await,
+        Cmd::Disconnect => cmd_disconnect(client, base).await,
+        Cmd::Watch => cmd_watch(api).await,
+        Cmd::Doctor => inspect::doctor(api).await,
+        Cmd::Health => inspect::health(client, base).await,
+        Cmd::Firewall { raw } => inspect::firewall(client, base, raw).await,
+        Cmd::Certificates => inspect::certificates(client, base).await,
+        Cmd::Trust => inspect::trust(client, base).await,
+        Cmd::Release => inspect::release(client, base).await,
+        Cmd::Negotiation => inspect::negotiation(client, base).await,
+        Cmd::Logs {
+            lines,
+            follow,
+            verbose,
+        } => inspect::logs(lines, follow, verbose).await,
         Cmd::Network { command } => match command {
-            NetworkCmd::Show => cmd_network_show(&client, base).await,
-            NetworkCmd::Load { file } => cmd_network_load(&client, base, &file).await,
+            NetworkCmd::Show => inspect::network(client, base).await,
+            NetworkCmd::Load { file } => cmd_network_load(client, base, &file).await,
         },
         Cmd::Peer { command } => match command {
-            PeerCmd::List => peer::cmd_list(&client, base).await,
+            PeerCmd::List => inspect::peers(client, base).await,
             PeerCmd::Add {
                 name,
                 public_key,
@@ -995,7 +997,7 @@ async fn main() -> Result<()> {
                     }
                 });
                 peer::cmd_add(
-                    &client,
+                    client,
                     base,
                     &name,
                     &public_key,
@@ -1010,7 +1012,7 @@ async fn main() -> Result<()> {
                 )
                 .await
             }
-            PeerCmd::Revoke { name } => peer::cmd_revoke(&client, base, &name).await,
+            PeerCmd::Revoke { name } => peer::cmd_revoke(client, base, &name).await,
         },
         Cmd::Profile { command } => match command {
             ProfileCmd::Check { path } => profile::check(&path),
@@ -1028,7 +1030,7 @@ async fn main() -> Result<()> {
                 let ssh_target = check_ssh_target(ssh_target)?;
                 let ssh_target = check_ssh_target(ssh_target)?;
                 profile::emit(
-                    &client,
+                    client,
                     base,
                     profile::EmitOptions {
                         name,
@@ -1088,7 +1090,7 @@ async fn main() -> Result<()> {
                 _ => None,
             };
             enroll::run(
-                &client,
+                client,
                 base,
                 enroll::EnrollOptions {
                     name,
@@ -1126,7 +1128,7 @@ async fn main() -> Result<()> {
             yes,
         } => {
             app_update::run(
-                &client,
+                client,
                 base,
                 app_update::Options {
                     manifest,
@@ -1137,10 +1139,16 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Cmd::Update { yes } => update::run(yes),
+        Cmd::Update { yes, check } => {
+            if check {
+                update::check()
+            } else {
+                update::run(yes)
+            }
+        }
         Cmd::Scenario { name } => match name.as_str() {
-            "nominal" => scenario_nominal(&client, base).await,
-            "flap" => scenario_flap(&client, base).await,
+            "nominal" => scenario_nominal(client, base).await,
+            "flap" => scenario_flap(client, base).await,
             other => anyhow::bail!("unknown scenario '{other}'. Available: nominal, flap"),
         },
         Cmd::Campaign {
@@ -1158,7 +1166,7 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
             campaign::run(
-                &client,
+                client,
                 base,
                 campaign::Options {
                     client_key,

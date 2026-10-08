@@ -59,18 +59,18 @@ Step "compilation du client avec le backend réel" {
 }
 
 Step "compilation de l'outillage opérateur" {
-    cargo build -p helios-ctl
+    cargo build -p helios
 }
 
 # 2. Le profil, tel que ce poste le détient.
 Step "lecture du profil « $Profile »" {
-    cargo run -q -p helios-ctl -- campaign --only negociation-de-cle --profile $Profile
+    cargo run -q -p helios -- campaign --only negociation-de-cle --profile $Profile
 }
 
 # 3. La campagne complète, y compris les scénarios lents si demandés.
 if ($Soak) {
     Step "campagne complète (avec scénarios lents)" {
-        cargo run -q -p helios-ctl -- campaign --only negociation-de-cle --profile $Profile --soak
+        cargo run -q -p helios -- campaign --only negociation-de-cle --profile $Profile --soak
     }
 }
 
@@ -81,7 +81,7 @@ try {
     $status = Invoke-RestMethod -Uri "$HeliosUrl/api/status" -TimeoutSec 5
     Write-Host "  état de la gateway : $($status.state)" -ForegroundColor Green
     Step "campagne provisioning + plan de données" {
-        cargo run -q -p helios-ctl -- --url $HeliosUrl campaign --only protocole
+        cargo run -q -p helios -- --url $HeliosUrl campaign --only protocole
     }
 } catch {
     Write-Host "  ignoré : $HeliosUrl injoignable (tunnel non monté ?)" -ForegroundColor DarkGray

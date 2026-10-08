@@ -40,7 +40,7 @@
 //! accepts loopback, `established` flows, DHCP renewal and the site-to-site
 //! WireGuard transport, then drops the rest. So a gateway resolves no name,
 //! reaches no NTP server and fetches no package — including through
-//! `helios-ctl update`, which runs `apt-get` on that very machine.
+//! `helios update`, which runs `apt-get` on that very machine.
 //!
 //! `allow_gateway_egress` opens it, on the WAN interface and on those ports
 //! only. It is separate from `allow_client_internet` because it answers a

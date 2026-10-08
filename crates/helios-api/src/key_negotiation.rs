@@ -186,6 +186,7 @@ mod tests {
             public_key: public_key.map(str::to_string),
             admin: false,
             dev_loopback: false,
+            local: false,
         }
     }
 

@@ -934,3 +934,102 @@ async fn cross_origin_json_mutation_is_refused_without_cors() {
         .is_none());
     assert!(cmd_rx.try_recv().is_err());
 }
+
+/// ADR-003, amendment of 3 October 2026: the local socket serves only the
+/// callers its policy admits, as administrators, and closes on the others
+/// before reading a request.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn the_local_socket_admits_by_kernel_credentials_only() {
+    use crate::local::{serve_local, AdminPolicy};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn exchange(path: &std::path::Path, request: &str) -> String {
+        for _ in 0..100 {
+            if path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let mut stream = tokio::net::UnixStream::connect(path).await.unwrap();
+        // A refused connection may already be closed: the write can fail.
+        let _ = stream.write_all(request.as_bytes()).await;
+        let mut response = Vec::new();
+        let _ = stream.read_to_end(&mut response).await;
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    let dir = std::env::temp_dir().join(format!("helios-local-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // SAFETY: plain getters of the calling process's credentials.
+    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+
+    let admitted = dir.join("admitted.sock");
+    let (state, _commands) = state_real();
+    let policy = AdminPolicy {
+        admin_gid: Some(gid),
+    };
+    let path = admitted.clone();
+    tokio::spawn(async move { serve_local(state, &path, policy).await });
+    let status = exchange(
+        &admitted,
+        "GET /api/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+    let admin = exchange(
+        &admitted,
+        "POST /api/tunnel/stop HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+         Content-Length: 2\r\nConnection: close\r\n\r\n{}",
+    )
+    .await;
+    assert!(!admin.starts_with("HTTP/1.1 401"), "{admin}");
+    assert!(!admin.starts_with("HTTP/1.1 403"), "{admin}");
+    let mode = std::fs::metadata(&admitted).unwrap().permissions();
+    assert_eq!(
+        std::os::unix::fs::PermissionsExt::mode(&mode) & 0o777,
+        0o666
+    );
+
+    if uid != 0 {
+        let refused = dir.join("refused.sock");
+        let (state, _commands) = state_real();
+        let path = refused.clone();
+        let policy = AdminPolicy { admin_gid: None };
+        tokio::spawn(async move { serve_local(state, &path, policy).await });
+        let response = exchange(
+            &refused,
+            "GET /api/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(response.is_empty(), "a refused caller got: {response}");
+    }
+
+    let occupied = dir.join("occupied.sock");
+    std::fs::write(&occupied, b"not a socket").unwrap();
+    let (state, _commands) = state_real();
+    let error = serve_local(state, &occupied, AdminPolicy { admin_gid: None })
+        .await
+        .expect_err("a non-socket file must never be replaced");
+    assert!(format!("{error:#}").contains("not a socket"), "{error:#}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// `/api/status` reports the daemon's release, not this crate's version:
+/// the console and the operator terminal both label it `heliosd`.
+#[tokio::test]
+async fn status_reports_the_daemon_version() {
+    let (state, _commands) = state_real();
+    let response = router(state.with_daemon_version("9.9.9"))
+        .oneshot(
+            Request::builder()
+                .uri("/api/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let status: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(status["version"], "9.9.9");
+}

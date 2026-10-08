@@ -1,5 +1,5 @@
 # Configuration réseau Helios (gateway WireGuard) — chargeable via :
-#   cargo run -p helios-ctl -- network load config/network.toml
+#   cargo run -p helios -- network load config/network.toml
 # ou via POST /api/network (JSON).
 #
 # Tous les autres paramètres sont compilés dans le binaire :
@@ -117,9 +117,9 @@ admin_iface = "helios0"
 # Absente = pas de filet : la clé serait définitivement perdue.
 #
 # Générer la paire sur le poste opérateur, jamais sur la gateway :
-#   helios-ctl escrow keygen --output-dir ~/helios-escrow
+#   helios escrow keygen --output-dir ~/helios-escrow
 # puis, le jour où il faut s'en servir :
-#   helios-ctl escrow open --escrow wg-key.escrow \
+#   helios escrow open --escrow wg-key.escrow \
 #     --private-key ~/helios-escrow/escrow-private.key --output wg-key.recovery
 # escrow_public_key = "<clé publique X25519 de l'opérateur, base64>"
 
@@ -194,7 +194,7 @@ admin_iface = "helios0"
 # jette. `apt` affiche alors `Ign :` sur chaque source et se fige à 0 %.
 #
 # Deux conséquences à connaître :
-#   - `helios-ctl update` lance `apt-get update` SUR la gateway. Sans cette
+#   - `helios update` lance `apt-get update` SUR la gateway. Sans cette
 #     ligne, le chemin de mise à jour de l'OS du produit ne peut pas marcher.
 #   - sans NTP, l'horloge dérive — sur la machine dont le métier est justement
 #     de vérifier des dates de validité de certificats.
@@ -255,10 +255,10 @@ nordvpn_meshnet = { iface = "nordlynx", fwmark = 0xe1f1, peer_cidrs = ["100.70.3
 # publique (ADR-004 §5), et une adresse choisie au jugé crée une seconde vérité.
 #
 #   sudo heliosd peer add --name poste --public-key <clé> --admin  # console
-#   helios-ctl peer add --name poste --public-key <clé>            # dans le tunnel
+#   helios peer add --name poste --public-key <clé>            # dans le tunnel
 #
 # Puis émettre le profil client :
-#   helios-ctl profile emit --name poste --endpoint vpn.example.net:51820 \
+#   helios profile emit --name poste --endpoint vpn.example.net:51820 \
 #     --public-key <clé publique du client> --output poste.json
 #
 # `address` est la VIP du client : dans WireGuard, AllowedIPs EST la table de

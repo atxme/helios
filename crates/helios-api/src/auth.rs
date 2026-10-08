@@ -23,6 +23,8 @@ pub struct Caller {
     pub public_key: Option<String>,
     pub admin: bool,
     pub dev_loopback: bool,
+    /// Accepted on the local administration socket: no WireGuard identity.
+    pub local: bool,
 }
 
 impl Caller {
@@ -33,6 +35,19 @@ impl Caller {
             public_key: None,
             admin: true,
             dev_loopback: true,
+            local: false,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn local(local: crate::local::LocalAdmin) -> Self {
+        Self {
+            source: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            name: format!("local:uid={}", local.uid),
+            public_key: None,
+            admin: true,
+            dev_loopback: false,
+            local: true,
         }
     }
 }
@@ -44,7 +59,7 @@ pub async fn require_peer(
     mut request: Request,
     next: Next,
 ) -> Response {
-    match resolve(&state, source_of(&request)).await {
+    match caller_of(&state, local_of(&request), source_of(&request)).await {
         Some(caller) => {
             request.extensions_mut().insert(caller);
             next.run(request).await
@@ -82,13 +97,21 @@ pub async fn require_admin(
     if !same_origin(&request) {
         return StatusCode::FORBIDDEN.into_response();
     }
-    match resolve(&state, source_of(&request)).await {
+    match caller_of(&state, local_of(&request), source_of(&request)).await {
         Some(caller) if caller.admin => {
-            tracing::info!(
-                pair = %caller.name,
-                source = %caller.source,
-                "admin command authenticated via WireGuard"
-            );
+            if caller.local {
+                tracing::info!(
+                    caller = %caller.name,
+                    uri = %request.uri(),
+                    "admin command authenticated by the local socket's kernel credentials"
+                );
+            } else {
+                tracing::info!(
+                    pair = %caller.name,
+                    source = %caller.source,
+                    "admin command authenticated via WireGuard"
+                );
+            }
             request.extensions_mut().insert(caller);
             next.run(request).await
         }
@@ -119,6 +142,32 @@ fn source_of(request: &Request) -> Option<IpAddr> {
         .map(|ConnectInfo(address)| address.ip())
 }
 
+/// The local socket's marker, inserted by its listener only, comes first:
+/// such a request has no network source to resolve.
+async fn caller_of(
+    state: &AppState,
+    local: Option<Caller>,
+    source: Option<IpAddr>,
+) -> Option<Caller> {
+    match local {
+        Some(caller) => Some(caller),
+        None => resolve(state, source).await,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn local_of(request: &Request) -> Option<Caller> {
+    request
+        .extensions()
+        .get::<crate::local::LocalAdmin>()
+        .map(|local| Caller::local(*local))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn local_of(_: &Request) -> Option<Caller> {
+    None
+}
+
 /// Canonicalized before anything reads it: a dual-stack `[::]` socket reports
 /// an IPv4 peer as `::ffff:a.b.c.d`, which would match no `/32` VIP and turn
 /// `::ffff:127.0.0.1` into a non-loopback address. A native IPv6 source stays
@@ -144,6 +193,7 @@ async fn resolve(state: &AppState, source: Option<IpAddr>) -> Option<Caller> {
         public_key: Some(peer.public_key.clone()),
         admin: peer.admin,
         dev_loopback: false,
+        local: false,
     })
 }
 
@@ -264,6 +314,34 @@ mod tests {
             .expect("dev identity");
         assert!(caller.admin);
         assert!(caller.dev_loopback);
+    }
+
+    #[tokio::test]
+    async fn a_server_inserted_local_admin_is_an_administrator_without_a_peer_key() {
+        let mut request = Request::new(Body::empty());
+        request
+            .extensions_mut()
+            .insert(crate::local::LocalAdmin { uid: 1000, pid: 42 });
+        let caller = caller_of(
+            &state(false, false),
+            local_of(&request),
+            source_of(&request),
+        )
+        .await
+        .expect("local admin");
+        assert!(caller.admin && caller.local && !caller.dev_loopback);
+        assert_eq!(caller.public_key, None);
+        assert_eq!(caller.name, "local:uid=1000");
+    }
+
+    #[tokio::test]
+    async fn without_the_listener_marker_a_socket_request_has_no_identity() {
+        let request = Request::new(Body::empty());
+        assert!(
+            caller_of(&state(true, false), local_of(&request), source_of(&request))
+                .await
+                .is_none()
+        );
     }
 
     /// A dual-stack `[::]` socket reports the peer as `::ffff:100.64.1.2`. It is

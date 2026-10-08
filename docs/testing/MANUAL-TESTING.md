@@ -59,11 +59,11 @@ HELIOS_NETWORK_CONFIG=/tmp/helios-manual.toml \
 Terminal 2 :
 
 ```sh
-cargo run -p helios-ctl -- status
-cargo run -p helios-ctl -- network show
-cargo run -p helios-ctl -- scenario nominal
-cargo run -p helios-ctl -- scenario flap
-cargo run -p helios-ctl -- watch
+cargo run -p helios -- status
+cargo run -p helios -- network show
+cargo run -p helios -- scenario nominal
+cargo run -p helios -- scenario flap
+cargo run -p helios -- watch
 ```
 
 En simulation, une montée atteint `connecting`, pas `up` : aucun faux handshake
@@ -73,7 +73,7 @@ afficher les changements d'état et les journaux jusqu'à `Ctrl-C`.
 Pour viser une autre instance :
 
 ```sh
-HELIOS_URL=http://ADRESSE:8080 cargo run -p helios-ctl -- status
+HELIOS_URL=http://ADRESSE:8080 cargo run -p helios -- status
 ```
 
 ### 3. Tester l'IHM Helios avec rechargement à chaud
@@ -335,7 +335,7 @@ gateway reste valable, puisque la clé ne change pas.
 La correspondance se fait sur la **clé**, pas sur le nom : le poste nomme
 rarement son profil comme l'opérateur nomme le pair, et exiger l'égalité des
 deux refusait des documents pourtant valables. La clé admise est celle
-qu'affiche `helios-ctl profile check <fichier>`.
+qu'affiche `helios profile check <fichier>`.
 
 Elle crée la CA opérateur si besoin, fait naître l'identité de négociation
 **sur** la gateway (scellée au TPM), ouvre le port dans son `network.toml`, émet
@@ -360,7 +360,7 @@ Sur le poste Windows :
    aboutir sans lui, l'identité étant scellée au compte Windows ;
 4. l'écran *Connexion* doit afficher `négociation ML-KEM-1024` puis, une fois le
    handshake obtenu, la puce `PSK PQC · ML-KEM-1024` ;
-5. côté gateway, `helios-ctl peer list` doit montrer le plancher monté à
+5. côté gateway, `helios peer list` doit montrer le plancher monté à
    `ml_kem` pour ce pair ;
 6. rejouer une connexion après avoir forcé `--mode classic` dans l'écran
    *Profils* : le mode doit être **indisponible**, le plancher ayant monté ;
@@ -383,8 +383,8 @@ pwsh scripts/campaign-windows.ps1 -Profile poste-windows -Soak   # + scénarios 
 Ou directement l'outil, si l'on ne veut qu'une famille :
 
 ```powershell
-cargo run -p helios-ctl -- campaign --only negociation-de-cle
-cargo run -p helios-ctl -- campaign --only negociation-de-cle --profile poste-windows --soak
+cargo run -p helios -- campaign --only negociation-de-cle
+cargo run -p helios -- campaign --only negociation-de-cle --profile poste-windows --soak
 ```
 
 Trois familles, par ce qu'elles exigent :
@@ -435,7 +435,7 @@ garantissent pas.
 Vérifier ensuite, dans l'onglet **Profils** :
 
 - la **clé publique du client** s'affiche en lecture seule et correspond à celle
-  que `helios-ctl peer list` montre côté gateway — c'est la valeur que
+  que `helios peer list` montre côté gateway — c'est la valeur que
   l'utilisateur transmet à l'opérateur ;
 - importer `lab.invitation.orion` (sans clé privée) alors qu'un profil `lab`
   existe déjà localement : la clé privée locale doit être reprise
@@ -623,7 +623,7 @@ Restaurer le fichier `hosts` à la fin.
 ### Profil dual-stack : deux adresses sur l'adaptateur (VM Windows)
 
 Ce contrôle exige une gateway dotée d'un préfixe IPv6 de tunnel
-(`wg_address_v6`, IPv6 installée : `helios-ctl status` affiche `installed`) et
+(`wg_address_v6`, IPv6 installée : `helios status` affiche `installed`) et
 `allow_tunnel_icmp = true`, un pair admis ou réadmis depuis (il porte
 `address_v6` dans `network.toml`), une VM Windows dual-stack et un Orion
 compilé avec `--features wireguard`. Sous WSL, seuls l'import, la validation,
@@ -631,8 +631,8 @@ le scellement, la liste d'adresses remise à `defguard`, la comparaison de
 relecture et l'écran sont exercés (`scripts/wsl-cargo test -p orion-core`,
 `--features wireguard backend::wireguard`, `npm run test:unit`).
 
-1. **Émission.** `helios-ctl profile emit --name <pair> …` puis
-   `helios-ctl profile check <fichier>` : la ligne « adresse IPv6 » donne le
+1. **Émission.** `helios profile emit --name <pair> …` puis
+   `helios profile check <fichier>` : la ligne « adresse IPv6 » donne le
    `/128` du pair. Pour un pair sans IPv6, le document ne contient **pas** la
    clé : `Select-String address_v6 <fichier>` ne trouve rien.
 2. **Import.** L'écran Profils montre « Adresse virtuelle IPv6 » remplie à

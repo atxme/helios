@@ -48,7 +48,7 @@ refuses IPv6 when the tunnel MTU is below 1280 or the kernel has
 gets one IPv4-only retry after the interface is taken down. The gateway then
 starts IPv4-only in a visible degraded state: a warning on the journal and the
 event stream, `ipv6: {"unavailable": {"reason": …}}` in `GET /api/status`
-(`"installed"` or `"not_configured"` otherwise), shown by `helios-ctl status`,
+(`"installed"` or `"not_configured"` otherwise), shown by `helios status`,
 and the same pre-checks printed by `heliosd status`. Without `wg_address_v6`
 nothing changes (`specification/ADRESSAGE-IPV6.md` §6).
 
@@ -178,7 +178,7 @@ IPv6 from leaving in clear. For a peer holding an IPv6 VIP, the gateway's
 `icmpx admin-prohibited`, in every tunnel state, so applications fall back to
 IPv4 at once instead of waiting for a timeout
 (`specification/SORTIE-IPV6.md`). A profile stored with `0.0.0.0/0` alone is
-never rewritten; Orion and `helios-ctl profile check` flag it as an IPv4-only full
+never rewritten; Orion and `helios profile check` flag it as an IPv4-only full
 tunnel. A binary built with
 `orion/wireguard` refuses to start when the real backend cannot initialise, and
 never falls back to a simulation. Conversely, an Orion **for Windows** built
@@ -197,6 +197,10 @@ It never brings the initial tunnel up. That host must be an IPv4 address: a
 ready gateway whose `wg_address` names no IPv4 host (malformed, or IPv6) stops
 `heliosd run` at startup instead of moving the API and the speedtest to
 loopback, and `heliosd status` prints the reason.
+In real mode the same router is also served on `/run/helios/admin.sock` for
+local administration (ADR-003, amendment of 3 October 2026): the kernel's peer
+credentials admit root and members of `sudo` only, and the listener marks
+their requests as a local administrator.
 
 - state and rule reads carry no secret;
 - `GET /api/network` returns a dedicated view that only says **whether** a
@@ -204,7 +208,7 @@ loopback, and `heliosd status` prints the reason.
 - `GET /api/trust` exposes the required algorithms and the compiled publisher
   keyring fingerprints, never whole keys;
 - `GET /api/key-negotiation` serves the public negotiation material that
-  `helios-ctl enroll` reads;
+  `helios enroll` reads;
 - every mutation requires `application/json`, and no permissive CORS is enabled;
 - the source address, canonicalized (`::ffff:a.b.c.d` is its IPv4 address),
   resolves to a WireGuard peer's single `/32` IPv4 VIP, with no proxy header
@@ -219,7 +223,7 @@ the WireGuard peer's; no separate web login exists.
 
 Admission binds, out of band, a client's WireGuard public key and the
 fingerprints of its TLS and ML-DSA-87 certificates. `heliosd peer` and
-`helios-ctl peer` share one implementation in
+`helios peer` share one implementation in
 `helios_provisioning::admission`. Admission never does a read-modify-write of
 `network.toml` from the API's redacted view — that would erase other peers'
 PSKs — and it persists neither private key nor PSK. It also refuses an explicit
@@ -277,7 +281,7 @@ lot 3.
 
 ## Application update
 
-The UI or `helios-ctl app-update` transfers a `helios-binary-release-v1`
+The UI or `helios app-update` transfers a `helios-binary-release-v1`
 manifest and the binary in JSON chunks. `heliosd` verifies the Ed25519 and
 ML-DSA-65 signatures, the target, the channel, the size and the SHA-256, then
 stages under `/var/lib/helios/updates`.
@@ -287,7 +291,7 @@ the previous link if the daemon and its API do not become ready.
 
 This flow replaces neither kernel nor rootfs, does not reboot the machine, and
 therefore does not move TPM PCR 0/4/7. Upgrading the OS is a different path:
-`helios-ctl update`, which arms the ADR-007 window and reboots.
+`helios update`, which arms the ADR-007 window and reboots.
 
 Two ML-DSA parameter sets coexist and do not substitute for one another:
 `ml-dsa-65` signs publisher artefacts (`aether::sig`), `ml-dsa-87` carries the

@@ -1,11 +1,12 @@
 [package]
-name = "helios-ctl"
-version = "0.12.0"
+name = "helios"
+version = "1.0.0"
 edition.workspace = true
 authors.workspace = true
+default-run = "helios"
 
 [[bin]]
-name = "helios-ctl"
+name = "helios"
 path = "src/main.rs"
 
 [dependencies]
@@ -16,6 +17,7 @@ directories = "5"
 # Séquestre de l'identité de la gateway : la moitié opérateur (génération de la
 # paire, ouverture du blob) vit ici, jamais sur la gateway.
 helios-escrow.workspace = true
+helios-tpm.workspace = true
 # La campagne agit comme un **vrai** client : elle emprunte le chemin de
 # provisioning d'Orion plutôt que de le réimplémenter, sans quoi elle
 # validerait sa propre copie du protocole et non le code livré.
@@ -30,6 +32,7 @@ serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
 anyhow.workspace = true
+thiserror.workspace = true
 rcgen.workspace = true
 rustls.workspace = true
 time.workspace = true
@@ -37,3 +40,11 @@ zeroize.workspace = true
 reqwest = { workspace = true }
 futures-util = { workspace = true }
 tokio-tungstenite = "0.24"
+rustyline = { version = "17.0.2", default-features = false, features = ["custom-bindings"] }
+shlex = "2.0.1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

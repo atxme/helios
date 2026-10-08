@@ -167,6 +167,37 @@ pub async fn network(client: &Client, base: &str) -> Result<NetworkConfigView> {
     decode_response(status, &text, "/api/network")
 }
 
+/// Reads a JSON view, surfacing a refusal as-is.
+pub async fn get<T: DeserializeOwned>(client: &Client, base: &str, path: &str) -> Result<T> {
+    let response = client
+        .get(format!("{base}{path}"))
+        .send()
+        .await
+        .context("connection refused — is heliosd reachable?")?;
+    let status = response.status();
+    let text = response.text().await.context("unreadable response body")?;
+    decode_response(status, &text, path)
+}
+
+/// Like [`get`], but `404` — a feature this gateway does not have — is `None`.
+pub async fn get_optional<T: DeserializeOwned>(
+    client: &Client,
+    base: &str,
+    path: &str,
+) -> Result<Option<T>> {
+    let response = client
+        .get(format!("{base}{path}"))
+        .send()
+        .await
+        .context("connection refused — is heliosd reachable?")?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    let status = response.status();
+    let text = response.text().await.context("unreadable response body")?;
+    decode_response(status, &text, path).map(Some)
+}
+
 /// Posts a JSON body and decodes the response, surfacing the rejection as-is.
 ///
 /// Mutation routes reply in plain text on error: without this handling, a

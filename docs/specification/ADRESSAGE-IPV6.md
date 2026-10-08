@@ -190,7 +190,7 @@ Le cas exige une collision, il est donc rare ; mais il y a deux vérités.
 1. **Un seul point d'attribution.** `helios_provisioning::ipam` expose une
    fonction qui rend un `PeerVips` complet (§4) : le VIP IPv4, et le VIP IPv6
    si la gateway a un préfixe. Elle est appelée **uniquement à l'admission**,
-   par tous les chemins d'admission (`heliosd peer`, `helios-ctl peer`,
+   par tous les chemins d'admission (`heliosd peer`, `helios peer`,
    admission avec identité de négociation), conformément à l'ADR-004 §5.
 2. **Une seule vue des collisions.** Une seule fonction construit la vue, pour
    les deux familles, comme l'union de :
@@ -247,8 +247,8 @@ décision.
 - Point d'attribution unique : `AddressView::assign`, privé lui aussi, appelé
   par `admission::admit_with_key_negotiation` seulement. Il rend un `PeerVips`
   complet, garde toute adresse déclarée et n'attribue que la famille manquante.
-- Table vivante à l'admission : `POST /api/peers` (chemin de `helios-ctl peer`
-  et `helios-ctl enroll`) passe l'instantané que l'orchestrateur republie ;
+- Table vivante à l'admission : `POST /api/peers` (chemin de `helios peer`
+  et `helios enroll`) passe l'instantané que l'orchestrateur republie ;
   `heliosd peer add` n'en passe aucun, ce processus n'ayant pas de plan de
   données. Les pairs déclarés sont toujours dans la vue.
 - Réadmission : même nom, même clé et même identité (rôle, empreintes,
@@ -430,7 +430,7 @@ décision.
   (`tunnel_mtu_too_small`, `disabled_by_kernel`, `no_kernel_support`,
   `address_refused`). La raison est journalisée et diffusée en événement
   `warn`, publiée dans `GET /api/status` (champ `ipv6`) et affichée par
-  `helios-ctl status`. `heliosd status`, qui ne parle pas au démon, applique
+  `helios status`. `heliosd status`, qui ne parle pas au démon, applique
   les mêmes vérifications préalables sur l'hôte. Sans `wg_address_v6`, l'état
   est `not_configured` et rien d'autre ne change.
 - Routage VIP : `heliosd::vip_routing::plan_v6` et `apply_v6` appliquent le
@@ -456,7 +456,7 @@ omis quand il est absent. `ProvisionResponse` n'est pas
 - Nouveau champ `address_v6`, optionnel.
 - Le document est `deny_unknown_fields` : un Orion antérieur **refuse** un
   profil qui porte ce champ. C'est un refus explicite, pas une ouverture.
-- `helios-ctl` n'émet `address_v6` que si le pair en a un. Un profil émis par
+- `helios` n'émet `address_v6` que si le pair en a un. Un profil émis par
   une gateway sans IPv6 reste lisible par tous les Orion.
 - Le message de refus d'un Orion antérieur est hors de notre contrôle ; la
   documentation opérateur indique la version d'Orion minimale.
@@ -482,7 +482,7 @@ décision.
 - Coffre : le manifeste scellé passe en version 8 **seulement** pour un profil
   qui porte `address_v6` ; un profil sans elle reste scellé octet pour octet
   dans la version 7.
-- Émission : `helios-ctl profile emit` et `enroll` lisent `address_v6` du pair
+- Émission : `helios profile emit` et `enroll` lisent `address_v6` du pair
   admis dans `GET /api/network` (la réponse d'admission ne porte que l'IPv4) et
   n'écrivent la clé que si elle existe ; `enroll` hors API la prend de
   `--address-v6`.

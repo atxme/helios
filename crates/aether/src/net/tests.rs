@@ -487,7 +487,7 @@ fn loopbacks_are_recognised_after_canonicalization() {
     );
 }
 
-/// The API wire form the console and `helios-ctl` read.
+/// The API wire form the console and `helios` read.
 #[test]
 fn the_ipv6_status_serializes_to_its_documented_wire_form() {
     let render = |status: &Ipv6TunnelStatus| serde_json::to_value(status).expect("serializable");

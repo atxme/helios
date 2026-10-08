@@ -109,7 +109,7 @@ mod tests {
 
     fn test_directory(name: &str) -> std::path::PathBuf {
         let directory = std::env::temp_dir().join(format!(
-            "helios-ctl-escrow-{name}-{}-{:?}",
+            "helios-escrow-{name}-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));

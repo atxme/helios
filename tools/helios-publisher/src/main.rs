@@ -6,8 +6,8 @@ use std::{
 };
 
 use aether::sig::{
-    BinaryReleasePayload, PublisherPublicKeys, PublisherSigner, ResealPayload,
-    ED25519_PUBLIC_KEY_LEN, ML_DSA_65_PRIVATE_KEY_LEN, ML_DSA_65_PUBLIC_KEY_LEN,
+    BinaryReleasePayload, FirmwareRecoveryPayload, PublisherPublicKeys, PublisherSigner,
+    ResealPayload, ED25519_PUBLIC_KEY_LEN, ML_DSA_65_PRIVATE_KEY_LEN, ML_DSA_65_PUBLIC_KEY_LEN,
 };
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -32,6 +32,21 @@ enum Command {
         key_epoch: u32,
         #[arg(long)]
         output_dir: PathBuf,
+    },
+    /// Signs restoration of a prepared firmware backup, off the gateway.
+    FirmwareRecovery {
+        #[arg(long)]
+        request: PathBuf,
+        #[arg(long, value_parser = positive_u32)]
+        key_epoch: u32,
+        #[arg(long)]
+        ed25519_private_key: PathBuf,
+        #[arg(long)]
+        ml_dsa_65_private_key: PathBuf,
+        #[arg(long)]
+        keyring: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
     },
     /// Signs a TPM v2 resealing ticket with both algorithms.
     ResealTicket {
@@ -123,6 +138,32 @@ fn main() -> Result<()> {
             key_epoch,
             output_dir,
         } => keygen(key_epoch, &output_dir),
+        Command::FirmwareRecovery {
+            request,
+            key_epoch,
+            ed25519_private_key,
+            ml_dsa_65_private_key,
+            keyring,
+            output,
+        } => {
+            let payload: FirmwareRecoveryPayload = serde_json::from_slice(&fs::read(&request)?)
+                .context("invalid firmware recovery request")?;
+            payload.validate().map_err(anyhow::Error::msg)?;
+            let signer = load_signer(
+                key_epoch,
+                &ed25519_private_key,
+                &ml_dsa_65_private_key,
+                &keyring,
+            )?;
+            let signed = signer.sign(payload)?;
+            signed.verify(&load_keyring(&keyring)?)?;
+            write_new(&output, &serde_json::to_vec_pretty(&signed)?, true)?;
+            println!(
+                "Firmware recovery authorization written to {}",
+                output.display()
+            );
+            Ok(())
+        }
         Command::ResealTicket {
             key_epoch,
             version,

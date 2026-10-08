@@ -40,7 +40,7 @@ pub mod wg;
 
 pub use config::{
     NetworkConfig, NordvpnMeshnetConfig, WgPeer, API_BIND_LOOPBACK, API_PORT, DEFAULT_WG_ADDRESS,
-    DEFAULT_WG_API_URL, SPEEDTEST_BIND_LOOPBACK,
+    DEFAULT_WG_API_URL, LOCAL_ADMIN_SOCKET, SPEEDTEST_BIND_LOOPBACK,
 };
 pub use error::{HeliosError, Result};
 pub use events::{HeliosEvent, InstallPskRequest, ObserveHandshakeRequest, OrchestratorCmd};

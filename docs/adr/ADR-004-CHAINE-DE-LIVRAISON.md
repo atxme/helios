@@ -30,7 +30,7 @@ Le même flou existe sur les secrets. Trois manques sont concrets :
 
 État d’implémentation : la responsabilité de séquestre appartient désormais à
 la crate `helios-escrow`, consommée directement par `heliosd` et
-`helios-ctl`. La référence à `helio_tpm::escrow` ci-dessus décrit l’état qui a
+`helios`. La référence à `helio_tpm::escrow` ci-dessus décrit l’état qui a
 motivé cette décision, pas l’ownership actuel.
 
 ## Décision
@@ -40,7 +40,7 @@ motivé cette décision, pas l’ownership actuel.
 | Rôle | Outil | Ce qu’il détient |
 |---|---|---|
 | **Éditeur** | `helios-publisher` | clés de signature Ed25519 + ML-DSA-65, hors ligne |
-| **Opérateur** | `helios-ctl` | clé privée de séquestre, admission d’un parc, profils clients |
+| **Opérateur** | `helios` | clé privée de séquestre, admission d’un parc, profils clients |
 | **Gateway** | `heliosd`, `helios-installer` | sa seule identité WireGuard, scellée au TPM |
 
 Un même humain tient les trois rôles dans un déploiement personnel. Ce que cet
@@ -87,7 +87,7 @@ jetable sans TPM. Il n’est plus un chemin d’installation documenté.
   autorisée tant qu’aucun administrateur n’est déclaré.
 * **Distant** — `POST /api/peers` et `POST /api/peers/revoke`, mutation ciblée
   côté gateway, sous la même autorisation administrateur que les autres
-  mutations. C’est le chemin nominal, exercé par `helios-ctl peer`.
+  mutations. C’est le chemin nominal, exercé par `helios peer`.
 
 **Une route d’ajout ciblée est une exigence de sécurité, pas un confort.**
 `GET /api/network` renvoie une vue sciemment expurgée : ni clé privée, ni PSK.
@@ -107,7 +107,7 @@ cryptographique de WireGuard : deux pairs ne peuvent pas revendiquer la même.
 
 ### 6. Le profil client : deux modes, et le secret ne voyage pas par défaut
 
-* **Invitation** (défaut) — `helios-ctl profile emit` produit un document
+* **Invitation** (défaut) — `helios profile emit` produit un document
   `orion-profile` **sans clé privée** : endpoint, clé publique de la gateway,
   paramètres. Orion génère sa propre clé à l’import et affiche la clé publique
   correspondante, que l’opérateur admet. La clé privée du client ne quitte
@@ -201,7 +201,7 @@ dépôt. La commande de signature Tauri impose un horodatage RFC 3161 avec
 
 * Il devient possible de livrer un binaire sans livrer le dépôt : c’est le
   préalable du lot suivant, qui retire la chaîne de compilation de la gateway.
-* `helios-ctl` change de statut : ce n’était qu’un outil de diagnostic, il
+* `helios` change de statut : ce n’était qu’un outil de diagnostic, il
   devient l’outil d’exploitation d’un parc. Il peut détenir la clé privée de
   séquestre — il ne doit donc jamais être exécuté avec cette clé sur la gateway
   qu’elle est censée secourir. Sa présence dans un bundle de gateway reste

@@ -3393,7 +3393,7 @@ contournés :
   `network.toml` existant, et l'octet `mode_id = 0` du manifeste.
   Le **bloc de confiance** est livré aussi : la gateway le
   sert sur `GET /api/key-negotiation/trust-enrolment/<clé>` et l'imprime par
-  `heliosd show-trust-enrolment`, `helios-ctl enroll` le pose dans le document
+  `heliosd show-trust-enrolment`, `helios enroll` le pose dans le document
   — en ligne depuis l'API, hors ligne depuis `--trust-material` —, et
   `provision-client.sh` le rapatrie à côté des deux certificats qu'il copie
   déjà. Onze valeurs publiques lues sous un seul verrou : une époque prise à un
@@ -4020,7 +4020,7 @@ le dernier hash d'audit connu et refuser un fork de génération.
 | `orion-core::identity_store` | clés et certificats clients actifs/suivants protégés, promotion atomique |
 | IHM Orion | état local, renouvellement profil/appareil, récupération expirée et rollback borné |
 | IHM Helios | état du parc, campagnes leafs/chaîne/autorités, avortement pré-publication et rollback gateway |
-| `helios-ctl` | diagnostic, import/export hors ligne et commandes de campagne Astra non interactives |
+| `helios` | diagnostic, import/export hors ligne et commandes de campagne Astra non interactives |
 
 ## 17. Références de conception
 

@@ -31,7 +31,13 @@ anyhow.workspace = true
 async-trait = { workspace = true }
 futures-util.workspace = true
 mime_guess.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
 rust-embed = { version = "8", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Kernel peer credentials of the local administration socket.
+libc = "0.2"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

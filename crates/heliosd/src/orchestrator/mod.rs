@@ -77,7 +77,7 @@ mod telemetry;
 use self::{commands::*, data_plane::*, observation::*, probes::*, reload::*, telemetry::*};
 
 /// Logs **and** broadcasts: the event channel feeds the UI and
-/// `helios-ctl watch`, `tracing` feeds the console and journald.
+/// `helios watch`, `tracing` feeds the console and journald.
 ///
 /// Writing only to the channel left a console operator blind to state
 /// changes: a peer could connect without a single line appearing in the
@@ -422,7 +422,8 @@ fn publish_readiness(dry_run: bool, firewall_mode: FirewallMode) -> anyhow::Resu
     std::fs::write(
         &temporary,
         format!(
-            "version={VERSION}\nmode_reel={}\nfirewall_enforced={}\n",
+            "version={VERSION}\npid={}\nmode_reel={}\nfirewall_enforced={}\n",
+            std::process::id(),
             !dry_run,
             !dry_run && firewall_mode.enforced()
         ),
@@ -496,7 +497,7 @@ pub fn status(network: &NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
 /// This command runs beside the daemon, not in it: it applies the same
 /// pre-checks the bring-up applies (`ipv6_installability`), on this host, now.
 /// A refusal only the kernel could voice at bring-up is the running daemon's
-/// to report — `GET /api/status` and `helios-ctl status` carry it.
+/// to report — `GET /api/status` and `helios status` carry it.
 fn describe_ipv6(network: &NetworkConfig, decided: Ipv6TunnelStatus) -> String {
     let Some(prefix) = network.wg_address_v6 else {
         return "not configured".into();

@@ -349,7 +349,7 @@ pub async fn status(State(s): State<AppState>) -> Json<StatusResponse> {
 
     Json(StatusResponse {
         state: state.as_str().to_string(),
-        version: env!("CARGO_PKG_VERSION"),
+        version: s.daemon_version,
         wan_ifaces: network.wan_ifaces.clone(),
         lan_ifaces: network.lan_ifaces.clone(),
         wg_peers: network.wg_peers(),
@@ -626,7 +626,7 @@ async fn register_first_generation(
     ) else {
         return Err((
             StatusCode::BAD_REQUEST,
-            "this gateway holds a trust domain, so admission also takes the client's two              certificates — the registry records the leaves themselves, not their digests.              `helios-ctl enroll` sends them; a caller that cannot must admit on a gateway              without a trust domain."
+            "this gateway holds a trust domain, so admission also takes the client's two              certificates — the registry records the leaves themselves, not their digests.              `helios enroll` sends them; a caller that cannot must admit on a gateway              without a trust domain."
                 .to_string(),
         ));
     };

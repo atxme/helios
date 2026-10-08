@@ -61,7 +61,7 @@ mod tests {
 
     fn temp_dir(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "helios-ctl-{name}-{}-{:?}",
+            "helios-{name}-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));

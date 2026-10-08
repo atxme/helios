@@ -57,7 +57,7 @@ if curl -sf "$URL/api/status" > /dev/null 2>&1; then
 fi
 
 echo "==> Construction"
-cargo build --quiet -p heliosd -p helios-ctl
+cargo build --quiet -p heliosd -p helios
 
 echo "==> Identité de la gateway"
 # `heliosd init-identity` n'est PAS utilisable ici : il scelle la clé dans le
@@ -66,11 +66,11 @@ echo "==> Identité de la gateway"
 # pour le développement et les campagnes. Ne pas « corriger » cette incohérence
 # apparente avec le chemin de production : elle est la conséquence de l'absence
 # de TPM, pas un oubli.
-cargo run --quiet -p helios-ctl -- campaign --generate-keys 2>/dev/null > "$TMP/gateway.env"
+cargo run --quiet -p helios -- campaign --generate-keys 2>/dev/null > "$TMP/gateway.env"
 GW_PRIV="$(sed -n 's/^WG_PRIVATE_KEY=//p' "$TMP/gateway.env")"
 GW_PUB="$(sed -n 's/^WG_PUBLIC_KEY=//p' "$TMP/gateway.env")"
 
-cargo run --quiet -p helios-ctl -- campaign --generate-keys 2>/dev/null > "$TMP/client.env"
+cargo run --quiet -p helios -- campaign --generate-keys 2>/dev/null > "$TMP/client.env"
 CLIENT_PRIV="$(sed -n 's/^WG_PRIVATE_KEY=//p' "$TMP/client.env")"
 CLIENT_PUB="$(sed -n 's/^WG_PUBLIC_KEY=//p' "$TMP/client.env")"
 
@@ -111,7 +111,7 @@ done
 echo "==> Admission du client"
 # En dry-run, la boucle locale vaut administrateur simulé : `peer add` emprunte
 # donc le même chemin API qu'un opérateur dans le tunnel.
-cargo run --quiet -p helios-ctl -- --url "$URL" peer add \
+cargo run --quiet -p helios -- --url "$URL" peer add \
     --name lab --public-key "$CLIENT_PUB" --admin
 
 echo "==> Émission des profils client"
@@ -122,7 +122,7 @@ echo "==> Émission des profils client"
 #    fabrique aucun secret. Le pair étant déjà admis, l'outil réutilise son
 #    adresse au lieu d'échouer. Ce profil n'est PAS importable seul : Orion y
 #    complète la clé privée depuis le profil local de même nom.
-cargo run --quiet -p helios-ctl -- --url "$URL" profile emit \
+cargo run --quiet -p helios -- --url "$URL" profile emit \
     --name lab --endpoint "$ENDPOINT" \
     --public-key "$CLIENT_PUB" \
     --output "$TMP/lab.invitation.orion"
@@ -130,7 +130,7 @@ cargo run --quiet -p helios-ctl -- --url "$URL" profile emit \
 # 2. Assisté — l'opérateur génère la paire et livre un profil complet. C'est
 #    celui-là qu'on importe dans un Orion neuf pour éprouver l'IHM : il porte la
 #    clé privée, donc il fonctionne sans rien d'autre. Il admet un second pair.
-cargo run --quiet -p helios-ctl -- --url "$URL" profile emit \
+cargo run --quiet -p helios -- --url "$URL" profile emit \
     --name lab-poste --endpoint "$ENDPOINT" \
     --with-private-key \
     --output "$TMP/lab-poste.orion"
@@ -163,7 +163,7 @@ print("    ok — invitation sans secret, profil assisté importable")
 PY
 
 echo "==> Campagne de bout en bout"
-cargo run --quiet -p helios-ctl -- --url "$URL" campaign \
+cargo run --quiet -p helios -- --url "$URL" campaign \
     --client-key "$CLIENT_PRIV" \
     --gateway-key "$GW_PUB" \
     ${ARGS[@]+"${ARGS[@]}"}
@@ -190,9 +190,9 @@ if [ "$KEEP" = "1" ]; then
     echo "  Le daemon reste en vie (PID $DAEMON_PID)."
     echo
     echo "  Importer lab-poste.orion dans Orion, ou explorer :"
-    echo "    cargo run -p helios-ctl -- --url $URL status"
-    echo "    cargo run -p helios-ctl -- --url $URL peer list"
-    echo "    cargo run -p helios-ctl -- --url $URL watch"
+    echo "    cargo run -p helios -- --url $URL status"
+    echo "    cargo run -p helios -- --url $URL peer list"
+    echo "    cargo run -p helios -- --url $URL watch"
     echo
     echo "  lab-poste.orion porte une clé privée : il disparaît avec le banc."
     echo "  Pour arrêter et tout effacer :"

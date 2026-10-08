@@ -983,6 +983,17 @@ fn operator_caller(
     if caller.dev_loopback {
         return Ok(astra_channel::OperatorIdentity::DevLoopback);
     }
+    if caller.local {
+        // Known limitation (ADR-003, amendment of 3 October 2026): Astra
+        // ties an operator campaign to a WireGuard operator identity, which
+        // the local socket does not carry. Use the tunnel for these routes.
+        tracing::warn!(
+            pair = %caller.name,
+            route,
+            "operator campaign refused: the local socket carries no WireGuard identity"
+        );
+        return Err(StatusCode::FORBIDDEN);
+    }
     let Some(public_key) = caller.public_key.as_deref() else {
         tracing::error!(
             pair = %caller.name,

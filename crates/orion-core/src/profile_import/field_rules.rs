@@ -263,7 +263,7 @@ pub fn validate_ssh_target(value: &str) -> Result<()> {
 
 /// Public entry point for tooling that emits a profile document.
 ///
-/// `helios-ctl` validates the operator's `--allowed-ips` **before** admitting
+/// `helios` validates the operator's `--allowed-ips` **before** admitting
 /// a peer, so a mistyped prefix is a refusal rather than an admission with no
 /// usable profile behind it.
 pub fn validate_allowed_ips(value: &str) -> Result<()> {

@@ -201,3 +201,59 @@ fn binary_manifest_signs_exactly_the_provided_bytes() {
     );
     assert_eq!(json["signatures"].as_array().unwrap().len(), 2);
 }
+
+#[test]
+fn firmware_recovery_command_signs_the_exact_public_request_and_refuses_overwrite() {
+    use aether::sig::{FirmwareRecoveryPayload, SignedFirmwareRecovery};
+    let root = tempfile::tempdir().unwrap();
+    let keys = root.path().join("keys");
+    assert!(publisher()
+        .args(["keygen", "--key-epoch", "9", "--output-dir"])
+        .arg(&keys)
+        .output()
+        .unwrap()
+        .status
+        .success());
+    let request_path = root.path().join("request.json");
+    let output = root.path().join("authorization.json");
+    let request = FirmwareRecoveryPayload {
+        version: 4,
+        sealed_blob_anchor: [1; 32],
+        secret_commitment: [2; 32],
+        device_id: "5bc922b7bd1adb5b6f99592611404036bd9f42d0".into(),
+        target_version: "2023".into(),
+    };
+    fs::write(&request_path, serde_json::to_vec(&request).unwrap()).unwrap();
+    let sign = || {
+        publisher()
+            .args(["firmware-recovery", "--key-epoch", "9", "--request"])
+            .arg(&request_path)
+            .arg("--ed25519-private-key")
+            .arg(keys.join("ed25519-private.pk8"))
+            .arg("--ml-dsa-65-private-key")
+            .arg(keys.join("ml-dsa-65-private.bin"))
+            .arg("--keyring")
+            .arg(keys.join("publisher-keyring.json"))
+            .arg("--output")
+            .arg(&output)
+            .output()
+            .unwrap()
+    };
+    let result = sign();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let auth: SignedFirmwareRecovery = serde_json::from_slice(&fs::read(&output).unwrap()).unwrap();
+    assert_eq!(auth.payload, request);
+    assert_eq!(auth.key_epoch, 9);
+    assert_eq!(
+        auth.signatures
+            .iter()
+            .map(|sig| sig.alg.as_str())
+            .collect::<HashSet<_>>(),
+        HashSet::from(["ed25519", "ml-dsa-65"])
+    );
+    assert!(!sign().status.success());
+}

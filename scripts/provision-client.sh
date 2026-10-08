@@ -194,7 +194,7 @@ fi
 # d'un fichier là où ce script le cherchait.
 CERTS_ROOT="${HELIOS_CERTS_ROOT:-$HOME/.helios/certs}"
 CA_DIR="${HELIOS_CLIENT_CA_DIR:-$CERTS_ROOT/internal-ca}"
-CTL=(cargo run --quiet -p helios-ctl --)
+CTL=(cargo run --quiet -p helios --)
 
 ARG_TRAFIC=()
 [ -n "$TRAFIC" ] && ARG_TRAFIC=(--allowed-ips "$TRAFIC")
