@@ -156,7 +156,7 @@ For incomplete behavior: implement it; reject it explicitly with a named/typed/t
 
 ## Code conventions
 
-* Rust edition 2021; workspace MSRV is Rust 1.88.
+* Rust edition 2021; workspace MSRV is Rust 1.95.
 * Code identifiers, comments, doc-comments, logs and test names are in English.
 * Documentation under `docs/` is in French.
 * Follow existing `thiserror`/`anyhow` boundaries instead of inventing a new error convention.

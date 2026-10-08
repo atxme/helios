@@ -2,7 +2,7 @@ name: Régression
 
 # Les pull requests jouent le socle rapide ; `main` et les lancements manuels
 # jouent la campagne complète, dont les audits et couvertures coûteux. Tous les
-# jobs Rust de validation utilisent explicitement le MSRV 1.88.0.
+# jobs Rust de validation utilisent explicitement le MSRV 1.95.0.
 # `bash scripts/regression.sh` reste la référence locale de cette campagne.
 #
 # `workflow_dispatch` reste ouvert à toutes les branches : une campagne à la
@@ -31,8 +31,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - name: Toolchain Rust 1.88.0 (MSRV)
-        uses: dtolnay/rust-toolchain@1.88.0
+      - name: Toolchain Rust 1.95.0 (MSRV)
+        uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: rustfmt, clippy
       # Cache Rust standard : registre, dépendances git et artefacts de build.
@@ -66,8 +66,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - name: Toolchain Rust 1.88.0 (MSRV)
-        uses: dtolnay/rust-toolchain@1.88.0
+      - name: Toolchain Rust 1.95.0 (MSRV)
+        uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: llvm-tools-preview, rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
@@ -109,8 +109,8 @@ jobs:
     runs-on: windows-2025
     steps:
       - uses: actions/checkout@v4
-      - name: Toolchain Rust 1.88.0 (MSRV)
-        uses: dtolnay/rust-toolchain@1.88.0
+      - name: Toolchain Rust 1.95.0 (MSRV)
+        uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: llvm-tools-preview, clippy
       - uses: Swatinem/rust-cache@v2

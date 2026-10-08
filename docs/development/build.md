@@ -2,7 +2,7 @@
 
 ## Prérequis
 
-Le workspace déclare Rust 1.88 comme version minimale. Les interfaces demandent
+Le workspace déclare Rust 1.95 comme version minimale. Les interfaces demandent
 Node.js `^20.19.0 || >=22.12.0`. Sous Debian/Ubuntu, le script existant installe
 les dépendances de développement :
 
