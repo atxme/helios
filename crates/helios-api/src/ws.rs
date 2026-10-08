@@ -23,7 +23,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
     let current = *state.tunnel_state.read().await;
     let init = HeliosEvent::StateChanged { state: current };
     if let Ok(msg) = serde_json::to_string(&init) {
-        if socket.send(Message::Text(msg)).await.is_err() {
+        if socket.send(Message::Text(msg.into())).await.is_err() {
             return;
         }
     }
@@ -32,7 +32,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
         match rx.recv().await {
             Ok(event) => {
                 if let Ok(msg) = serde_json::to_string(&event) {
-                    if socket.send(Message::Text(msg)).await.is_err() {
+                    if socket.send(Message::Text(msg.into())).await.is_err() {
                         break;
                     }
                 }

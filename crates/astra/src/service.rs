@@ -351,19 +351,19 @@ pub fn router(service: Arc<AstraService>) -> Router {
         .route("/v1/client-rotation/challenge", post(status_challenge))
         .route("/v1/client-rotation/recovery", post(open_recovery))
         .route(
-            "/v1/client-rotation/recovery/:operation",
+            "/v1/client-rotation/recovery/{operation}",
             get(read_recovery),
         )
         .route(
-            "/v1/client-rotation/recovery/:operation/authorization",
+            "/v1/client-rotation/recovery/{operation}/authorization",
             post(authorize_recovery),
         )
         .route(
-            "/v1/client-rotation/recovery/:operation/grant",
+            "/v1/client-rotation/recovery/{operation}/grant",
             post(grant_recovery),
         )
         .route(
-            "/v1/client-rotation/recovery/:operation/commit",
+            "/v1/client-rotation/recovery/{operation}/commit",
             post(commit_recovery),
         )
         // The companion's three capability-bound exchanges, plus the read an
@@ -371,10 +371,10 @@ pub fn router(service: Arc<AstraService>) -> Router {
         // operations opened out of tunnel: an ordinary renewal identifier is
         // absent from this store, so it receives the same coarse refusal as an
         // identifier nobody ever issued (§8.2).
-        .route("/v1/operations/:operation", get(signing_operation))
-        .route("/v1/signer-requests/:operation", get(signer_request))
-        .route("/v1/vaults/:fingerprint", get(encrypted_vault))
-        .route("/v1/signer-results/:operation", post(signer_result))
+        .route("/v1/operations/{operation}", get(signing_operation))
+        .route("/v1/signer-requests/{operation}", get(signer_request))
+        .route("/v1/vaults/{fingerprint}", get(encrypted_vault))
+        .route("/v1/signer-results/{operation}", post(signer_result))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .with_state(service)
 }
