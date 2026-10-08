@@ -93,18 +93,18 @@
 //! adaptation only: no DRBG state, update primitive, seed derivation or health
 //! test exists in Helios.
 //!
-//! **TLS session material outside the private Astra channel is still on
-//! `ring`.** That private mTLS configuration selects AWS-LC explicitly. The
-//! public QUIC negotiation and reqwest clients still select ring, so their
-//! ephemeral (EC)DHE keys, handshake randoms and session keys do not use the
-//! DRBG above — while §4.3 names TLS among the keys the pipeline must cover.
-//! Long-lived material is unaffected: WireGuard keys, PSKs, ML-KEM, ML-DSA and
-//! every X.509 private key are on AWS-LC. What blocks the remaining swap is
-//! `reqwest` 0.12, whose only rustls provider feature is `ring`;
-//! its `-no-provider` variant compiles but then requires
-//! `CryptoProvider::install_default` in **every** binary and test that builds a
-//! client, which is a change to make deliberately rather than as a side effect
-//! of this module.
+//! **TLS session material outside the private Astra channel is not on the
+//! DRBG above.** The private mTLS configuration selects AWS-LC explicitly. The
+//! public QUIC negotiation still selects `ring` (`quinn` keeps `rustls-ring`),
+//! so its ephemeral (EC)DHE keys, handshake randoms and session keys come from
+//! `ring`'s CSPRNG. `reqwest` 0.13 clients select AWS-LC through its `rustls`
+//! feature, so their TLS session material comes from the AWS-LC provider's own
+//! RNG rather than from `aether::random`. reqwest uses the process-level
+//! provider if one is installed, and its AWS-LC provider otherwise; no Helios
+//! code installs a different one for it. §4.3 names TLS among the
+//! keys the pipeline must cover, so this remains a known limit for the public
+//! QUIC path. Long-lived material is unaffected: WireGuard keys, PSKs, ML-KEM,
+//! ML-DSA and every X.509 private key are on AWS-LC.
 //!
 //! # The rules, and what each one refuses
 //!

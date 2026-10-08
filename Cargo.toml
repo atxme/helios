@@ -68,7 +68,14 @@ clap = { version = "4", features = ["derive", "env"] }
 async-trait = "0.1"
 axum = { version = "0.7", features = ["ws"] }
 mime_guess = "2"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+# reqwest 0.13 : TLS uniquement en rustls, fournisseur aws-lc-rs (feature
+# `rustls`, qui a remplacé `rustls-tls`) et magasin de confiance du système
+# via rustls-platform-verifier. Ce n'est plus le couple ring + racines Mozilla
+# embarquées de 0.12 : c'est un changement délibéré. aws-lc-rs est le même
+# CSPRNG que `aether::random`. Un client qui ne doit faire confiance qu'à une
+# CA privée doit utiliser `tls_certs_only`, qui n'ajoute pas le magasin du
+# système. Pas de native-tls ni d'OpenSSL.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
 quinn = { version = "0.11.9", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "aws_lc_rs", "std", "tls12"] }
 # `aws_lc_rs` plutôt que le défaut `ring` : rcgen tire ses **clés privées X.509**
