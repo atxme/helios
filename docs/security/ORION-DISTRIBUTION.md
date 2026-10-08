@@ -8,7 +8,7 @@ certificat X.509.
 
 ## Dépendance WireGuardNT
 
-`defguard_wireguard_rs` 0.11.0 ouvre, sur Windows x86-64,
+`defguard_wireguard_rs` 0.12 ouvre, sur Windows x86-64,
 `resources-windows/binaries/wireguard-amd64.dll` relativement au répertoire
 courant. Sur ARM64 il ouvre `wireguard-arm64.dll`. Ces noms viennent de sa
 source ; ils ne sont pas une convention inventée par le bundle Orion.
