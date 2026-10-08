@@ -91,7 +91,7 @@ use aether_fido::authenticator::{Approval, Authenticator};
 use base64::Engine as _;
 use rcgen::{
     BasicConstraints, CertificateParams, CertificateSigningRequestParams, DistinguishedName,
-    DnType, IsCa, KeyPair, KeyUsagePurpose,
+    DnType, IsCa, Issuer, KeyPair, KeyUsagePurpose,
 };
 
 use crate::credentials::CredentialRegistry;

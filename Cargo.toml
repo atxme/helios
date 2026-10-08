@@ -78,7 +78,7 @@ rustls = { version = "0.23.45", default-features = false, features = ["ring", "a
 # fixtures de test sur le même CTR-DRBG que le reste du protocole. Sans effet
 # sur `rustls`/`quinn`, dont le fournisseur reste `ring` : voir la « Limite
 # connue » de `aether::random`.
-rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "aws_lc_rs", "x509-parser"] }
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "aws_lc_rs", "x509-parser"] }
 # Canal privé Astra–Helios (ROTATION-CERTIFICATS §8.3). Le lien est monté à la
 # main plutôt que par `reqwest` : le transport y est le contrat — TLS 1.3 seul,
 # ALPN épinglée, ni ticket ni 0-RTT — et un client généraliste qui réécrit

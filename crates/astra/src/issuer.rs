@@ -42,7 +42,7 @@ use aether::key_negotiation::{
     issue_pq_certificate, PqCertificate, PqCertificateRole, PQ_CERTIFICATE_VERSION,
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use rcgen::{CertificateParams, CertificateSigningRequestParams, KeyPair};
+use rcgen::{CertificateSigningRequestParams, Issuer, KeyPair, PublicKeyData};
 use zeroize::Zeroizing;
 
 /// Unix seconds as the X.509 encoder wants them.
@@ -132,7 +132,7 @@ impl DelegatedIssuer {
         let certified = aether::certificates::x509::subject_public_key_info(
             &authorization.tls_intermediate_certificate,
         )?;
-        if tls_key.public_key_der() != certified {
+        if tls_key.subject_public_key_info() != certified {
             return Err(IssuerError::IssuerKeyMismatch("TLS"));
         }
 
@@ -181,15 +181,15 @@ impl DelegatedIssuer {
         csr.params.not_before = to_offset_date_time(validity.0)?;
         csr.params.not_after = to_offset_date_time(validity.1)?;
         let issuer_key = KeyPair::try_from(self.tls_intermediate_key_der.as_slice())?;
-        let issuer_params = CertificateParams::from_ca_cert_der(
+        let issuer = Issuer::from_ca_cert_der(
             &self
                 .authorization
                 .tls_intermediate_certificate
                 .as_bytes()
                 .into(),
+            &issuer_key,
         )?;
-        let issuer = issuer_params.self_signed(&issuer_key)?;
-        let tls_leaf = csr.signed_by(&issuer, &issuer_key)?;
+        let tls_leaf = csr.signed_by(&issuer)?;
 
         let pq_leaf = issue_pq_certificate(
             PqCertificate {

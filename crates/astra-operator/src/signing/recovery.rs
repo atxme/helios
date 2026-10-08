@@ -161,13 +161,9 @@ pub fn recover_expired_identity(
         // it belongs to.
         csr.params.not_before = to_offset_date_time(validity.0)?;
         csr.params.not_after = to_offset_date_time(validity.1)?;
-        let issuer_params =
-            CertificateParams::from_ca_cert_der(&ca_tls_certificate.as_bytes().into())
-                .map_err(|error| GestureError::Anchors(format!("CA-TLS illisible : {error}")))?;
-        let issuer = issuer_params
-            .self_signed(&tls_key)
-            .map_err(|error| GestureError::Anchors(format!("CA-TLS : {error}")))?;
-        let signed = csr.signed_by(&issuer, &tls_key).map_err(|error| {
+        let issuer = Issuer::from_ca_cert_der(&ca_tls_certificate.as_bytes().into(), &tls_key)
+            .map_err(|error| GestureError::Anchors(format!("CA-TLS illisible : {error}")))?;
+        let signed = csr.signed_by(&issuer).map_err(|error| {
             GestureError::Anchors(format!("signature de la feuille TLS : {error}"))
         })?;
         let tls_leaf = DerCertificate::new(signed.der().to_vec())?;

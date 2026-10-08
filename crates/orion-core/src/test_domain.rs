@@ -23,7 +23,7 @@ use aether::key_negotiation::{
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use rcgen::{
-    CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
+    CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
     KeyUsagePurpose,
 };
 use zeroize::Zeroizing;
@@ -140,8 +140,7 @@ pub(crate) fn domain() -> Domain {
         leaf_params
             .signed_by(
                 &KeyPair::generate().expect("leaf key"),
-                &tls_ca,
-                &tls_ca_key,
+                &Issuer::from_ca_cert_der(tls_ca.der(), &tls_ca_key).expect("CA-TLS issuer"),
             )
             .expect("client leaf")
             .der()

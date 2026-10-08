@@ -33,7 +33,7 @@ curve25519-dalek.workspace = true
 # `clientAuth`, chaîne vers une ancre déjà détenue et liaison CSR ↔ clé
 # certifiée. `verify` apporte la vérification de signature ; le crate est déjà
 # dans l'arbre via rcgen.
-x509-parser = { version = "0.16", features = ["verify"] }
+x509-parser = { version = "0.18", features = ["verify"] }
 # Émission X.509 : seulement pour `test_x509`, le matériel de test partagé par
 # les crates qui vérifient des chaînes clientes. Une gateway qui ne fait que
 # vérifier n'active pas la feature et ne lie pas rcgen.

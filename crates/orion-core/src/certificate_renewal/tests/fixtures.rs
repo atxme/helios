@@ -11,7 +11,9 @@ use aether::certificates::{CERTIFICATE_FORMAT_VERSION, CERTIFICATE_PROTOCOL_VERS
 use aether::key_negotiation::{
     issue_pq_certificate, PqCertificate, PqCertificateRole, PQ_CERTIFICATE_VERSION,
 };
-use rcgen::{CertificateSigningRequestParams, ExtendedKeyUsagePurpose, IsCa, KeyUsagePurpose};
+use rcgen::{
+    CertificateSigningRequestParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyUsagePurpose,
+};
 use zeroize::Zeroizing;
 
 use crate::certificate_renewal::{ActiveIdentity, RenewalSession};
@@ -58,7 +60,9 @@ pub(super) fn grant(
         params,
         public_key: csr.public_key,
     }
-    .signed_by(&domain.tls_ca, &domain.tls_ca_key)
+    .signed_by(
+        &Issuer::from_ca_cert_der(domain.tls_ca.der(), &domain.tls_ca_key).expect("CA-TLS issuer"),
+    )
     .expect("client leaf");
     let next_tls = DerCertificate::new(leaf.der().to_vec()).expect("der");
 
