@@ -10,9 +10,10 @@ use tracing::{info, warn};
 
 use crate::uplink;
 
-/// Resolves `wan_iface = "auto"` against the kernel, once.
+/// Resolves `wan_iface = "auto"` against the kernel, at startup.
 ///
-/// Substituted into the in-memory configuration, so everything downstream —
+/// The orchestrator keeps the result in step with the kernel afterwards
+/// (`orchestrator::uplinks`). Substituted into the in-memory configuration, so everything downstream —
 /// the firewall policy, the hot reload, the API view — sees a real interface
 /// name rather than a marker. The file keeps `auto`: it describes the
 /// operator's intent, not the machine's current cabling.

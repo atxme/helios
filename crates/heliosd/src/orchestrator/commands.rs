@@ -277,6 +277,9 @@ pub(super) async fn handle_external_cmd(
         OrchestratorCmd::TunnelStateInferred(state) => {
             warn!("inferred state received on the external channel, ignored: {state:?}");
         }
+        OrchestratorCmd::RefreshWanIfaces { next, .. } => {
+            warn!("uplink refresh received on the external channel, ignored: {next:?}");
+        }
     }
     Ok(())
 }

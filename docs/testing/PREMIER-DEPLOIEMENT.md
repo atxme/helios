@@ -272,8 +272,10 @@ admin_iface = "helios0"
 ```
 
 `wan_iface = "auto"` fait choisir l'interface de sortie au démarrage, en
-préférant le lien filaire. `heliosd show-uplink` montre les candidats et la
-raison du choix ; nommer l'interface explicitement reste possible et reste ce
+préférant le lien filaire, puis suit le noyau : une interface qui gagne ou perd
+sa porteuse, ou un adaptateur branché après coup, entre dans le ruleset ou en
+sort sans redémarrage, par une reconstruction atomique du pare-feu.
+`heliosd show-uplink` montre les candidats et la raison du choix ; nommer l'interface explicitement reste possible et reste ce
 qu'il faut faire si la machine a plusieurs sorties dont une seule doit servir.
 
 **Un chemin de retour n'est pas optionnel ici.** Sans lui, le premier démarrage

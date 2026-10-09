@@ -1286,3 +1286,233 @@ fn a_policy_that_does_not_compile_refuses_the_start() {
     let refusal = format!("{:#}", check_startup_policy(&network).unwrap_err());
     assert!(refusal.contains("fd00::/129"), "{refusal}");
 }
+
+// ─── `wan_iface = "auto"` following the kernel (`uplinks`) ───────────────────
+
+fn names(list: &[&str]) -> Vec<String> {
+    list.iter().map(|name| name.to_string()).collect()
+}
+
+/// An adapter plugged in after startup is proposed once, and adopted as the
+/// running set once applied; nothing is proposed while the kernel agrees.
+#[test]
+fn a_new_uplink_is_proposed_once_then_owned() {
+    let mut tracker = UplinkTracker::new(names(&["eth0"]));
+    let running = names(&["eth0"]);
+    assert_eq!(
+        tracker.step(&running, Some(names(&["eth0"]))),
+        UplinkStep::Unchanged
+    );
+
+    let grown = names(&["eth0", "usb0"]);
+    assert_eq!(
+        tracker.step(&running, Some(grown.clone())),
+        UplinkStep::Propose(grown.clone())
+    );
+    // Pending: not sent a second time.
+    assert_eq!(
+        tracker.step(&running, Some(grown.clone())),
+        UplinkStep::Unchanged
+    );
+    // Applied by the main loop: it is now the watcher's own list.
+    assert_eq!(
+        tracker.step(&grown, Some(grown.clone())),
+        UplinkStep::Unchanged
+    );
+    // Unplugged again: the set shrinks the same way.
+    assert_eq!(
+        tracker.step(&grown, Some(names(&["eth0"]))),
+        UplinkStep::Propose(names(&["eth0"]))
+    );
+}
+
+/// The kernel reordering two admitted links changes no rule: nothing is sent.
+#[test]
+fn a_preference_change_alone_rebuilds_nothing() {
+    let running = names(&["eth0", "wlan0"]);
+    let mut tracker = UplinkTracker::new(running.clone());
+    assert_eq!(
+        tracker.step(&running, Some(names(&["wlan0", "eth0"]))),
+        UplinkStep::Unchanged
+    );
+}
+
+/// Every cable out: the running set stays, it is not emptied.
+#[test]
+fn no_usable_uplink_keeps_the_running_set() {
+    let running = names(&["eth0"]);
+    let mut tracker = UplinkTracker::new(running.clone());
+    assert_eq!(tracker.step(&running, None), UplinkStep::Unchanged);
+}
+
+/// A list the firewall refused is not proposed again on every tick, but a
+/// different one is, and the kernel going back to the running set clears it.
+#[test]
+fn a_refused_set_is_not_retried_until_the_kernel_moves() {
+    let running = names(&["eth0"]);
+    let mut tracker = UplinkTracker::new(running.clone());
+    let refused = names(&["eth0", "usb0"]);
+    assert_eq!(
+        tracker.step(&running, Some(refused.clone())),
+        UplinkStep::Propose(refused.clone())
+    );
+    assert_eq!(
+        tracker.step(&running, Some(refused.clone())),
+        UplinkStep::Unchanged
+    );
+    assert_eq!(
+        tracker.step(&running, Some(names(&["eth0"]))),
+        UplinkStep::Unchanged
+    );
+    assert_eq!(
+        tracker.step(&running, Some(refused.clone())),
+        UplinkStep::Propose(refused)
+    );
+}
+
+/// The operator naming the interfaces explicitly takes the list over.
+#[test]
+fn an_explicit_list_set_since_startup_stops_the_watcher() {
+    let mut tracker = UplinkTracker::new(names(&["eth0"]));
+    assert_eq!(
+        tracker.step(&names(&["enp3s0"]), Some(names(&["eth0", "usb0"]))),
+        UplinkStep::Relinquish
+    );
+}
+
+async fn refresh(
+    previous: &[&str],
+    next: &[&str],
+    fw: &dyn FirewallBackend,
+    shared_network: &Arc<RwLock<NetworkConfig>>,
+    policy: &mut FirewallPolicy,
+    shared_policy: &Arc<RwLock<FirewallPolicy>>,
+) -> Vec<HeliosEvent> {
+    let (events, mut received) = broadcast::channel(8);
+    refresh_wan_ifaces(
+        names(previous),
+        names(next),
+        shared_network,
+        &Arc::new(RwLock::new(TunnelState::Up)),
+        &events,
+        fw,
+        policy,
+        shared_policy,
+    )
+    .await;
+    let mut emitted = Vec::new();
+    while let Ok(event) = received.try_recv() {
+        emitted.push(event);
+    }
+    emitted
+}
+
+/// An accepted refresh moves the configuration, the policy and its published
+/// copy together.
+#[tokio::test]
+async fn a_refreshed_uplink_set_is_applied_to_the_firewall() {
+    let shared_network = Arc::new(RwLock::new(configured_network()));
+    let mut policy = configured_network().firewall_policy();
+    let shared_policy = Arc::new(RwLock::new(policy.clone()));
+
+    let events = refresh(
+        &["eth0"],
+        &["eth0", "usb0"],
+        &DryRunBackend,
+        &shared_network,
+        &mut policy,
+        &shared_policy,
+    )
+    .await;
+
+    let expected = names(&["eth0", "usb0"]);
+    assert_eq!(shared_network.read().await.wan_ifaces, expected);
+    assert_eq!(policy.wan_ifaces, expected);
+    assert_eq!(shared_policy.read().await.wan_ifaces, expected);
+    assert!(matches!(
+        events.as_slice(),
+        [HeliosEvent::Log { level, .. }] if level == "info"
+    ));
+}
+
+/// A ruleset the firewall refuses leaves the running one, and its interfaces,
+/// in force.
+#[tokio::test]
+async fn a_refused_uplink_set_keeps_the_running_firewall() {
+    let shared_network = Arc::new(RwLock::new(configured_network()));
+    let running = configured_network().firewall_policy();
+    let mut policy = running.clone();
+    let shared_policy = Arc::new(RwLock::new(running.clone()));
+
+    let events = refresh(
+        &["eth0"],
+        &["eth0", "usb0"],
+        &RefusingFirewall,
+        &shared_network,
+        &mut policy,
+        &shared_policy,
+    )
+    .await;
+
+    assert_eq!(*shared_network.read().await, configured_network());
+    assert_eq!(policy, running);
+    assert_eq!(*shared_policy.read().await, running);
+    let message = single_error(&events);
+    assert!(message.contains("refused by the test backend"), "{message}");
+}
+
+/// A reload that changed the list between the observation and the apply wins:
+/// the refresh is dropped, not written over it.
+#[tokio::test]
+async fn a_refresh_based_on_a_stale_list_is_dropped() {
+    // `NetworkConfig` is not `Clone` (it carries secrets): built twice.
+    let network = || {
+        let mut network = configured_network();
+        network.wan_ifaces = names(&["enp3s0"]);
+        network
+    };
+    let shared_network = Arc::new(RwLock::new(network()));
+    let running = network().firewall_policy();
+    let mut policy = running.clone();
+    let shared_policy = Arc::new(RwLock::new(running.clone()));
+
+    let events = refresh(
+        &["eth0"],
+        &["eth0", "usb0"],
+        &DryRunBackend,
+        &shared_network,
+        &mut policy,
+        &shared_policy,
+    )
+    .await;
+
+    assert_eq!(*shared_network.read().await, network());
+    assert_eq!(policy, running);
+    assert!(events.is_empty());
+}
+
+/// The API path cannot reach it: only the uplink watcher, in-process, sends it.
+#[tokio::test]
+async fn an_uplink_refresh_on_the_external_channel_is_ignored() {
+    let shared_network = Arc::new(RwLock::new(configured_network()));
+    let running = configured_network().firewall_policy();
+    let mut policy = running.clone();
+    let shared_policy = Arc::new(RwLock::new(running.clone()));
+
+    let (result, _) = run_command(
+        OrchestratorCmd::RefreshWanIfaces {
+            previous: names(&["eth0"]),
+            next: names(&["eth0", "usb0"]),
+        },
+        &DryRunBackend,
+        TunnelState::Up,
+        &shared_network,
+        &mut policy,
+        &shared_policy,
+    )
+    .await;
+
+    result.expect("the loop must continue");
+    assert_eq!(*shared_network.read().await, configured_network());
+    assert_eq!(policy, running);
+}
