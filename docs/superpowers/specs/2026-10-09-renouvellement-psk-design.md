@@ -152,7 +152,9 @@ garde-fous de routes Linux existants s'appliquent à la réinscription.
 **Adresse dans le tunnel.** L'hôte vient de `heliosd_url`, validé par
 `tunnel_routed_address` (adresse littérale, comprise dans les `AllowedIPs`,
 aucune résolution DNS) ; le port vient de l'endpoint de négociation du profil ;
-le `server_name` et tous les épinglages restent ceux du profil. Sans
+le `server_name` et tous les épinglages restent ceux du profil. La socket est liée à la VIP du client
+(`net_pin::tunnel_socket`) : la socket de la première négociation est, elle,
+épinglée **hors** du tunnel et ne peut pas servir ici. Sans
 `heliosd_url` valide, aucun renouvellement n'est tenté et l'événement le dit ;
 l'échéance mène alors au chemin de reconnexion existant.
 
@@ -204,8 +206,11 @@ binaire livré.
 | `helios-firewall` | golden : port de négociation ouvert sur chaque WAN et sur l'interface du tunnel, nulle part ailleurs |
 | `orion-core` | seuil temps, seuil volume, échéance la plus proche des deux horloges ; délais croissants plafonnés ; `rekey_peer` en simulation ; restauration de l'ancien PSK en cas d'échec et en cas d'annulation ; refus sans `heliosd_url` valide |
 | `apps/orion` | action visible seulement tunnel monté en `ml_kem` ; événements affichés |
-| campagne dry-run | un renouvellement de bout en bout dans le tunnel sur le démon isolé |
 | cible | V1 : 20 renouvellements forcés avec ping 10 ms et une connexion iperf3 unique, noyau Linux et WireGuard-NT, chemin sain puis dégradé (`netem`), verdict PASS/FAIL par critère |
+
+Le démon isolé de la campagne dry-run n'a pas de tunnel : aucune source n'y
+est une VIP, donc le chemin « tunnel » se prouve par les tests `heliosd` au
+niveau du gestionnaire et par V1 sur cible, pas par la campagne.
 
 `scripts/regression.sh` est la vérification complète. Aucune ligne cible ne se
 coche depuis WSL2.
