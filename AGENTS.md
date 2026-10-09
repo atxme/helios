@@ -72,6 +72,8 @@ Do not duplicate logic already owned by one of these components.
 
 ## Change discipline
 
+Before any edit, create or switch to a dedicated development branch or worktree; never make task changes directly on `main`.
+
 Before writing code, inspect the nearest analogous implementation, follow its naming/layering/error/state/test patterns, search for the canonical type/function, and read the relevant ADR/spec for security/protocol/persistence/trust changes.
 
 While implementing:
