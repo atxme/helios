@@ -46,7 +46,7 @@ fn imports_wg_quick_with_one_peer() {
         .profile;
     assert_eq!(profile.name, "site-labo");
     assert_eq!(profile.endpoint, "203.0.113.10:51820");
-    assert_eq!(profile.private_key, CLIENT_PRIVATE);
+    assert_eq!(profile.private_key.expose(), CLIENT_PRIVATE);
     assert_eq!(profile.peer_public_key, GATEWAY_PUBLIC);
     assert_eq!(profile.persistent_keepalive, 25);
 }

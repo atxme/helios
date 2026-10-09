@@ -199,7 +199,7 @@ pub fn open_manifest(
     .map_err(VaultError::Container)?;
     let manifest = ProfileManifest::decode(&plaintext)?;
 
-    let derived = aether::wg::public_from_private(manifest.private_key.as_str())
+    let derived = aether::wg::public_from_private(manifest.private_key.expose())
         .map_err(|_| VaultError::ContextDisagrees)?;
     if derived != client_public_key {
         return Err(VaultError::ContextDisagrees);
@@ -326,7 +326,7 @@ mod tests {
         );
 
         let opened = open_manifest(&root(), id, &public_key, &gateway_public, &blob).expect("open");
-        assert_eq!(opened.private_key.as_str(), private_key);
+        assert_eq!(opened.private_key.expose(), private_key);
         assert_eq!(opened.generation, SecurityGeneration(1));
     }
 

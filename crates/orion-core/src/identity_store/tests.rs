@@ -15,9 +15,9 @@ fn bundle() -> ClientIdentityBundle {
     ClientIdentityBundle {
         identity: "orion-portable".into(),
         certificate_chain: vec![encoder.encode([0x30, 0x82, 0x01, 0x00])],
-        private_key: encoder.encode([0x30, 0x81, 0x87, 0x02]),
+        private_key: encoder.encode([0x30, 0x81, 0x87, 0x02]).into(),
         pq_certificate: encoder.encode(br#"{"version":1}"#),
-        pq_private_key: encoder.encode([7u8; 64]),
+        pq_private_key: encoder.encode([7u8; 64]).into(),
     }
 }
 
@@ -47,7 +47,7 @@ fn an_undecodable_bundle_is_refused_before_sealing() {
             ..bundle()
         },
         ClientIdentityBundle {
-            private_key: String::new(),
+            private_key: SecretString::default(),
             ..bundle()
         },
         ClientIdentityBundle {
@@ -55,7 +55,7 @@ fn an_undecodable_bundle_is_refused_before_sealing() {
             ..bundle()
         },
         ClientIdentityBundle {
-            pq_private_key: String::new(),
+            pq_private_key: SecretString::default(),
             ..bundle()
         },
         ClientIdentityBundle {
@@ -81,19 +81,52 @@ fn debug_never_prints_private_material() {
     assert!(rendered.contains("orion-portable"));
     assert!(rendered.contains("private_key: \"***\""));
     assert!(rendered.contains("pq_private_key: \"***\""));
-    assert!(!rendered.contains(&bundle.private_key));
-    assert!(!rendered.contains(&bundle.pq_private_key));
+    assert!(!rendered.contains(bundle.private_key.expose()));
+    assert!(!rendered.contains(bundle.pq_private_key.expose()));
 }
 
 #[test]
 fn serialized_bundles_reject_unknown_fields() {
-    let mut value = serde_json::to_value(bundle()).unwrap();
+    let mut value =
+        serde_json::from_slice::<serde_json::Value>(&bundle().encode().unwrap()).unwrap();
     value
         .as_object_mut()
         .unwrap()
         .insert("unexpected".into(), serde_json::Value::Bool(true));
 
     assert!(serde_json::from_value::<ClientIdentityBundle>(value).is_err());
+}
+
+#[test]
+fn explicit_encoding_preserves_both_identity_slots_and_their_selector() {
+    let outgoing = bundle();
+    let mut incoming = outgoing.duplicate();
+    incoming.pq_private_key = base64::engine::general_purpose::STANDARD
+        .encode([9u8; 64])
+        .into();
+    let mut record = ProtectedIdentityRecord::new(outgoing);
+    record.promote(incoming, 2_000, 3_000).unwrap();
+    record.select_previous(2_500).unwrap();
+    let encoded = record.encode().unwrap();
+    let decoded: ProtectedIdentityRecord = serde_json::from_slice(&encoded).unwrap();
+    assert!(record == decoded);
+    assert!(decoded.previous_status(2_500).unwrap().selected);
+    record.retire_previous(3_000);
+    let decoded: ProtectedIdentityRecord =
+        serde_json::from_slice(&record.encode().unwrap()).unwrap();
+    assert!(record == decoded);
+}
+
+#[test]
+fn identity_encoding_escapes_public_names_and_refuses_oversized_records() {
+    let mut original = bundle();
+    original.identity = "identity\"\\\n".into();
+    let encoded = original.encode().unwrap();
+    let decoded: ClientIdentityBundle = serde_json::from_slice(&encoded).unwrap();
+    assert_eq!(original, decoded);
+    original.identity = "x".repeat(MAX_SEALED_BYTES);
+    assert!(original.encode().is_err());
+    assert!(ProtectedIdentityRecord::new(original).encode().is_err());
 }
 
 /// The identity name comes from an operator-written document: it must not
@@ -170,12 +203,14 @@ fn bounded_reads_distinguish_the_limit_from_an_oversized_blob() {
 #[test]
 fn promotion_keeps_the_outgoing_bundle_until_the_overlap_ends() {
     let outgoing = bundle();
-    let mut incoming = outgoing.clone();
-    incoming.pq_private_key = base64::engine::general_purpose::STANDARD.encode([9u8; 64]);
-    let mut record = ProtectedIdentityRecord::new(outgoing.clone());
+    let mut incoming = outgoing.duplicate();
+    incoming.pq_private_key = base64::engine::general_purpose::STANDARD
+        .encode([9u8; 64])
+        .into();
+    let mut record = ProtectedIdentityRecord::new(outgoing.duplicate());
 
     assert!(record
-        .promote(incoming.clone(), 2_000, 3_000)
+        .promote(incoming.duplicate(), 2_000, 3_000)
         .expect("promoted"));
     assert_eq!(record.current, incoming);
     assert_eq!(
@@ -201,8 +236,9 @@ fn promotion_keeps_the_outgoing_bundle_until_the_overlap_ends() {
     assert!(record.retire_previous(3_000));
     assert!(record.previous.is_none());
     assert!(!record.serve_previous);
-    let retired_record = serde_json::to_string(&record).expect("serialized tombstone");
-    assert!(!retired_record.contains(&outgoing.pq_private_key));
+    let retired_record =
+        String::from_utf8(record.encode().expect("serialized tombstone").to_vec()).unwrap();
+    assert!(!retired_record.contains(outgoing.pq_private_key.expose()));
     assert_eq!(
         record.previous_status(3_001).map(|status| status.phase),
         Some(PreviousIdentityPhase::Expired)
@@ -212,11 +248,13 @@ fn promotion_keeps_the_outgoing_bundle_until_the_overlap_ends() {
 #[test]
 fn replaying_promotion_preserves_an_explicit_service_rollback() {
     let outgoing = bundle();
-    let mut incoming = outgoing.clone();
-    incoming.pq_private_key = base64::engine::general_purpose::STANDARD.encode([9u8; 64]);
-    let mut record = ProtectedIdentityRecord::new(outgoing.clone());
+    let mut incoming = outgoing.duplicate();
+    incoming.pq_private_key = base64::engine::general_purpose::STANDARD
+        .encode([9u8; 64])
+        .into();
+    let mut record = ProtectedIdentityRecord::new(outgoing.duplicate());
     record
-        .promote(incoming.clone(), 2_000, 3_000)
+        .promote(incoming.duplicate(), 2_000, 3_000)
         .expect("promoted");
     record.select_previous(2_100).expect("selected");
 
@@ -229,10 +267,14 @@ fn replaying_promotion_preserves_an_explicit_service_rollback() {
 #[test]
 fn a_second_previous_slot_is_refused_while_the_first_is_live() {
     let outgoing = bundle();
-    let mut first = outgoing.clone();
-    first.pq_private_key = base64::engine::general_purpose::STANDARD.encode([8u8; 64]);
-    let mut second = outgoing.clone();
-    second.pq_private_key = base64::engine::general_purpose::STANDARD.encode([9u8; 64]);
+    let mut first = outgoing.duplicate();
+    first.pq_private_key = base64::engine::general_purpose::STANDARD
+        .encode([8u8; 64])
+        .into();
+    let mut second = outgoing.duplicate();
+    second.pq_private_key = base64::engine::general_purpose::STANDARD
+        .encode([9u8; 64])
+        .into();
     let mut record = ProtectedIdentityRecord::new(outgoing);
     record.promote(first, 2_000, 3_000).expect("first");
 
@@ -281,15 +323,17 @@ fn protected_store_round_trips_and_replaces_an_identity() {
     let path = store.store(&first).unwrap();
     let ciphertext = std::fs::read(&path).unwrap();
     assert!(!ciphertext
-        .windows(first.private_key.len())
-        .any(|window| { window == first.private_key.as_bytes() }));
+        .windows(first.private_key.expose().len())
+        .any(|window| { window == first.private_key.expose().as_bytes() }));
     assert!(store.contains(&first.identity));
     let loaded = store.load(&first.identity).unwrap();
     assert_eq!(loaded.private_key, first.private_key);
     assert_eq!(loaded.pq_private_key, first.pq_private_key);
 
     let mut replacement = first;
-    replacement.pq_private_key = base64::engine::general_purpose::STANDARD.encode([9u8; 64]);
+    replacement.pq_private_key = base64::engine::general_purpose::STANDARD
+        .encode([9u8; 64])
+        .into();
     store.store(&replacement).unwrap();
     assert_eq!(
         store.load(&replacement.identity).unwrap().pq_private_key,

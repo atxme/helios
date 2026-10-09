@@ -85,13 +85,13 @@ impl IdentityProvider for crate::identity_store::ProtectedIdentityStore {
                 })
                 .collect::<Result<Vec<_>>>()?,
             private_key: decoder
-                .decode(bundle.private_key.trim())
+                .decode(bundle.private_key.expose().trim())
                 .context("decoding the client private key of the protected identity")?,
             pq_certificate: decoder
                 .decode(bundle.pq_certificate.trim())
                 .context("decoding the client PQ certificate of the protected identity")?,
             pq_private_key: decoder
-                .decode(bundle.pq_private_key.trim())
+                .decode(bundle.pq_private_key.expose().trim())
                 .context("decoding the client PQ private key of the protected identity")?,
         })
     }
@@ -528,7 +528,10 @@ pub async fn prepare_for_profile(
         settings.mode,
         &client_wg_public_key,
         &profile.peer_public_key,
-        profile.preshared_key.as_deref(),
+        profile
+            .preshared_key
+            .as_ref()
+            .map(aether::SecretString::expose),
     )
     .await
 }

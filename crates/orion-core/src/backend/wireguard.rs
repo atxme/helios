@@ -190,7 +190,8 @@ impl WireGuardBackend {
         // Empty = Curve25519 only.
         if let Some(psk) = profile
             .preshared_key
-            .as_deref()
+            .as_ref()
+            .map(aether::SecretString::expose)
             .filter(|k| !k.trim().is_empty())
         {
             let psk = Key::try_from(psk).map_err(|e| anyhow::anyhow!("PSK invalide : {e}"))?;
@@ -667,7 +668,7 @@ impl VpnBackend for WireGuardBackend {
         // Validates the private key format NOW. `defguard` expects it
         // encoded in `InterfaceConfiguration::prvkey` and would only reject
         // it after the interface is created — too late to fail cleanly.
-        Key::try_from(profile.private_key.as_str())
+        Key::try_from(profile.private_key.expose())
             .map_err(|e| anyhow::anyhow!("clé privée du client invalide : {e}"))?;
 
         let peer = Self::build_peer(profile)?;
@@ -675,7 +676,7 @@ impl VpnBackend for WireGuardBackend {
 
         let config = InterfaceConfiguration {
             name: self.ifname.clone(),
-            prvkey: profile.private_key.clone(),
+            prvkey: profile.private_key.expose().to_owned(),
             addresses: addresses.clone(),
             port: CLIENT_LISTEN_PORT as u32 as u16,
             peers: vec![peer.clone()],

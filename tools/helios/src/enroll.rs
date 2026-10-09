@@ -368,9 +368,9 @@ pub async fn run(client: &Client, base: &str, options: EnrollOptions) -> Result<
         key_negotiation_identity: Some(orion_core::ClientIdentityBundle {
             identity: identity_name.clone(),
             certificate_chain: vec![encoder.encode(&client_material.certificate_der)],
-            private_key: encoder.encode(&client_material.private_key_der),
+            private_key: encoder.encode(&client_material.private_key_der).into(),
             pq_certificate: encoder.encode(&client_material.pq_certificate_json),
-            pq_private_key: encoder.encode(&client_material.pq_private_key),
+            pq_private_key: encoder.encode(&client_material.pq_private_key).into(),
         }),
     })?;
 

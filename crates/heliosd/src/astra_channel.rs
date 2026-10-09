@@ -23,6 +23,10 @@
 //! this channel is the ML-DSA-87 signature carried by every object, never this
 //! key.
 //!
+//! The record's private fields are [`SecretString`], never generic serialized
+//! values. Its explicit JSON encoder writes canonical base64 into a zeroizing
+//! buffer bounded at 256 KiB; reading enforces the same document size limit.
+//!
 //! # Absent means closed, and closed is not broken
 //!
 //! No file, no listener, and no error: the same rule `key_negotiation_port`
@@ -32,20 +36,25 @@
 //! that exists and is unusable **is** reported loudly, because that is an
 //! operator error rather than a deployment choice.
 
+use std::io::Read as _;
+use std::mem;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::{fmt, mem};
 
 use ::astra_channel::{AstraChannelHandler, ChannelIdentity};
 use aether::certificates::encoding::DerCertificate;
+use aether::{secret::json::SecretJson, SecretString};
 use anyhow::{Context, Result};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 /// Where the channel's configuration and key live.
 const ASTRA_CHANNEL_PATH: &str = "/var/lib/helios/astra-channel.json";
+
+/// Bounds both parsing and the fixed-capacity secret encoding buffer.
+const MAX_CHANNEL_DOCUMENT_BYTES: usize = 256 * 1024;
 
 /// How long a freshly created transport identity is valid.
 ///
@@ -61,7 +70,7 @@ const IDENTITY_VALIDITY_DAYS: i64 = 730;
 /// this process cannot fully read is a document written by another version, and
 /// half-reading it would start a listener whose bounds are not the ones on
 /// disk.
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StoredChannel {
     /// Address of the veth end this gateway listens on.
@@ -73,7 +82,7 @@ struct StoredChannel {
     /// This gateway's transport certificate, DER, base64. Astra pins it.
     certificate: String,
     /// Its PKCS#8 private key, DER, base64. The reason this file is `0600`.
-    private_key: String,
+    private_key: SecretString,
     /// Astra's transport certificate, DER, base64. The only client identity
     /// this listener accepts, byte for byte.
     astra_certificate: String,
@@ -96,39 +105,61 @@ struct StoredChannel {
     client_certificate: Option<String>,
     /// Its PKCS#8 private key, DER, base64.
     #[serde(default)]
-    client_private_key: Option<String>,
+    client_private_key: Option<SecretString>,
     /// Astra's **server** certificate, DER, base64. The only authority this
     /// gateway will dial, byte for byte.
     #[serde(default)]
     astra_authority_certificate: Option<String>,
 }
 
-impl fmt::Debug for StoredChannel {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let client_private_key = self.client_private_key.as_ref().map(|_| "<redacted>");
-        formatter
-            .debug_struct("StoredChannel")
-            .field("bind", &self.bind)
-            .field("certificate", &self.certificate)
-            .field("private_key", &"<redacted>")
-            .field("astra_certificate", &self.astra_certificate)
-            .field("authority", &self.authority)
-            .field("client_certificate", &self.client_certificate)
-            .field("client_private_key", &client_private_key)
-            .field(
-                "astra_authority_certificate",
-                &self.astra_authority_certificate,
-            )
-            .finish()
-    }
-}
-
-impl Drop for StoredChannel {
-    fn drop(&mut self) {
-        self.private_key.zeroize();
-        if let Some(client_private_key) = &mut self.client_private_key {
-            client_private_key.zeroize();
+impl StoredChannel {
+    /// Encodes the deployment record without making the secret type serializable.
+    /// Secrets are appended directly to a bounded buffer allocated at its final
+    /// capacity, so growth cannot leave an unwiped copy behind.
+    fn encode(&self) -> Result<Zeroizing<Vec<u8>>> {
+        #[derive(Serialize)]
+        struct PublicFields<'a> {
+            bind: SocketAddr,
+            certificate: &'a str,
+            astra_certificate: &'a str,
+            authority: Option<SocketAddr>,
+            client_certificate: Option<&'a str>,
+            astra_authority_certificate: Option<&'a str>,
         }
+
+        let public = serde_json::to_vec(&PublicFields {
+            bind: self.bind,
+            certificate: &self.certificate,
+            astra_certificate: &self.astra_certificate,
+            authority: self.authority,
+            client_certificate: self.client_certificate.as_deref(),
+            astra_authority_certificate: self.astra_authority_certificate.as_deref(),
+        })
+        .context("encoding the public Astra channel fields")?;
+        anyhow::ensure!(
+            public.len() <= MAX_CHANNEL_DOCUMENT_BYTES
+                && self.private_key.expose().len() <= MAX_CHANNEL_DOCUMENT_BYTES
+                && self
+                    .client_private_key
+                    .as_ref()
+                    .is_none_or(|key| key.expose().len() <= MAX_CHANNEL_DOCUMENT_BYTES),
+            "the Astra channel document is too large"
+        );
+        for key in std::iter::once(&self.private_key).chain(self.client_private_key.as_ref()) {
+            let decoded = Zeroizing::new(decode("the channel private key", key.expose())?);
+            anyhow::ensure!(!decoded.is_empty(), "the channel private key is empty");
+        }
+        let mut encoded = SecretJson::new(MAX_CHANNEL_DOCUMENT_BYTES);
+        encoded.append(&public[..public.len() - 1])?;
+        encoded.append(b",\"private_key\":")?;
+        encoded.secret(&self.private_key)?;
+        encoded.append(b",\"client_private_key\":")?;
+        match &self.client_private_key {
+            Some(key) => encoded.secret(key)?,
+            None => encoded.append(b"null")?,
+        }
+        encoded.append(b"}")?;
+        Ok(encoded.finish())
     }
 }
 
@@ -175,11 +206,19 @@ impl AstraChannel {
     }
 
     fn load_from(path: &Path) -> Result<Option<Self>> {
-        let bytes = match std::fs::read(path) {
-            Ok(bytes) => Zeroizing::new(bytes),
+        let file = match std::fs::File::open(path) {
+            Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
         };
+        let mut bytes = Zeroizing::new(Vec::with_capacity(MAX_CHANNEL_DOCUMENT_BYTES + 1));
+        file.take((MAX_CHANNEL_DOCUMENT_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .with_context(|| format!("reading {}", path.display()))?;
+        anyhow::ensure!(
+            bytes.len() <= MAX_CHANNEL_DOCUMENT_BYTES,
+            "the Astra channel document is too large"
+        );
         let stored: StoredChannel = serde_json::from_slice(&bytes)
             .with_context(|| format!("decoding {}", path.display()))?;
         anyhow::ensure!(
@@ -201,7 +240,7 @@ impl AstraChannel {
                 address: *address,
                 identity: ChannelIdentity {
                     certificate_der: decode("the gateway client certificate", certificate)?,
-                    private_key_der: decode("the gateway client private key", key)?,
+                    private_key_der: decode("the gateway client private key", key.expose())?,
                 },
                 astra_certificate: DerCertificate::new(decode(
                     "the Astra authority certificate",
@@ -221,7 +260,7 @@ impl AstraChannel {
             bind: stored.bind,
             identity: ChannelIdentity {
                 certificate_der: decode("the gateway certificate", &stored.certificate)?,
-                private_key_der: decode("the gateway private key", &stored.private_key)?,
+                private_key_der: decode("the gateway private key", stored.private_key.expose())?,
             },
             astra_certificate,
             authority,
@@ -470,24 +509,22 @@ pub fn initialize(
     let stored = StoredChannel {
         bind,
         certificate: certificate_der.to_base64(),
-        private_key,
+        private_key: SecretString::new(private_key),
         astra_certificate: astra_certificate.to_base64(),
         authority,
         client_certificate: dialling
             .as_ref()
             .map(|(certificate, _, _)| certificate.to_base64()),
-        client_private_key: dialling
-            .as_ref()
-            .map(|(_, key, _)| base64::engine::general_purpose::STANDARD.encode(key.as_slice())),
+        client_private_key: dialling.as_ref().map(|(_, key, _)| {
+            SecretString::new(base64::engine::general_purpose::STANDARD.encode(key.as_slice()))
+        }),
         astra_authority_certificate: dialling.as_ref().map(|(_, _, astra)| astra.to_base64()),
     };
     if let Some(parent) = path.parent() {
         aether::private_file::create_private_dir(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    let encoded = Zeroizing::new(
-        serde_json::to_vec_pretty(&stored).context("encoding the Astra channel document")?,
-    );
+    let encoded = stored.encode()?;
     aether::private_file::write_private_atomic(&path, encoded.as_ref())
         .with_context(|| format!("writing {}", path.display()))?;
 
@@ -880,24 +917,73 @@ mod tests {
         let stored = StoredChannel {
             bind: "10.88.0.1:8444".parse().unwrap(),
             certificate: "served-certificate".into(),
-            private_key: "served-private-key".into(),
+            private_key: SecretString::new(
+                base64::engine::general_purpose::STANDARD.encode(b"served-private-key"),
+            ),
             astra_certificate: "astra-certificate".into(),
             authority: Some("10.88.0.2:8444".parse().unwrap()),
             client_certificate: Some("client-certificate".into()),
-            client_private_key: Some("client-private-key".into()),
+            client_private_key: Some(SecretString::new(
+                base64::engine::general_purpose::STANDARD.encode(b"client-private-key"),
+            )),
             astra_authority_certificate: Some("astra-authority-certificate".into()),
         };
 
         let debug = format!("{stored:?}");
         assert!(debug.contains("served-certificate"));
         assert!(debug.contains("client-certificate"));
-        assert!(debug.contains("<redacted>"));
-        assert!(!debug.contains("served-private-key"));
-        assert!(!debug.contains("client-private-key"));
+        assert!(debug.contains("SecretString(***)"));
+        assert!(!debug.contains(stored.private_key.expose()));
+        assert!(!debug.contains(stored.client_private_key.as_ref().unwrap().expose()));
 
-        let json = serde_json::to_value(&stored).unwrap();
-        assert_eq!(json["private_key"], "served-private-key");
-        assert_eq!(json["client_private_key"], "client-private-key");
+        let encoded = stored.encode().unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(json["private_key"], stored.private_key.expose());
+        assert_eq!(
+            json["client_private_key"],
+            stored.client_private_key.as_ref().unwrap().expose()
+        );
+        let decoded: StoredChannel = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.bind, stored.bind);
+        assert_eq!(decoded.certificate, stored.certificate);
+        assert_eq!(decoded.astra_certificate, stored.astra_certificate);
+        assert_eq!(decoded.authority, stored.authority);
+        assert_eq!(decoded.client_certificate, stored.client_certificate);
+        assert_eq!(
+            decoded.astra_authority_certificate,
+            stored.astra_authority_certificate
+        );
+        assert_eq!(decoded.private_key, stored.private_key);
+        assert_eq!(decoded.client_private_key, stored.client_private_key);
+
+        let mut invalid = decoded;
+        invalid.private_key = SecretString::new("not-base64\"}");
+        assert!(invalid.encode().is_err());
+        invalid.private_key = SecretString::default();
+        assert!(invalid.encode().is_err());
+        invalid.private_key = stored.private_key.duplicate();
+        invalid.client_private_key = None;
+        let encoded = invalid.encode().unwrap();
+        let decoded: StoredChannel = serde_json::from_slice(&encoded).unwrap();
+        assert!(decoded.client_private_key.is_none());
+        invalid.certificate = "a".repeat(MAX_CHANNEL_DOCUMENT_BYTES);
+        assert!(invalid
+            .encode()
+            .unwrap_err()
+            .to_string()
+            .contains("too large"));
+    }
+
+    #[test]
+    fn an_oversized_channel_document_is_refused_before_parsing() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("astra-channel.json");
+        std::fs::write(&path, vec![b' '; MAX_CHANNEL_DOCUMENT_BYTES + 1]).unwrap();
+        assert!(AstraChannel::load_from(&path)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("too large"));
     }
 
     /// The round trip: create, read back, and build a server configuration

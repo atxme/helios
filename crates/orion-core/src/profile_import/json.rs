@@ -65,11 +65,11 @@ struct JsonProfile {
     /// (ADR-004 §6). [`complete_profile_import`](super::complete_profile_import) then takes it from the local
     /// profile holding the admitted key, or from a key just generated.
     #[serde(default)]
-    private_key: String,
+    private_key: aether::SecretString,
     #[serde(default)]
     peer_public_key: String,
     #[serde(default)]
-    preshared_key: Option<String>,
+    preshared_key: Option<aether::SecretString>,
     #[serde(default)]
     address: Option<String>,
     /// IPv6 VIP, `…/128`, present only when the gateway assigned one

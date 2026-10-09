@@ -22,10 +22,10 @@ fn the_shipped_identity_is_returned_apart_from_the_profile() {
 
     // The decisive property: nothing of the secret can reach the profile,
     // hence nothing can reach `profiles.toml`.
-    let persisted = toml::to_string(&imported.profile).unwrap();
+    let persisted = toml::to_string(&imported.profile.legacy_fixture()).unwrap();
     assert!(!persisted.contains("pq_private_key"), "{persisted}");
     assert!(
-        !persisted.contains(&identity.pq_private_key),
+        !persisted.contains(identity.pq_private_key.expose()),
         "the PQ private key must not be persistable"
     );
 }

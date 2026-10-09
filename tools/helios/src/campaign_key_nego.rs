@@ -407,7 +407,7 @@ pub fn load_enrolled(name: &str) -> Result<Enrolled> {
     let config = ClientConfig::load().context("lecture de la configuration Orion")?;
     let profile = config
         .find(name)
-        .cloned()
+        .map(ClientProfile::duplicate)
         .with_context(|| format!("aucun profil Orion nommé « {name} » sur ce poste"))?;
     let store = ProtectedIdentityStore::for_current_user()
         .context("ouverture du stockage protégé d'identité")?;
@@ -481,7 +481,7 @@ async fn scenario_local_downgrade(enrolled: &Enrolled) -> Outcome {
     if settings.minimum_mode == ProtectionMode::Classic {
         return Outcome::skip("plancher classique : rien à refuser");
     }
-    let mut downgraded = enrolled.profile.clone();
+    let mut downgraded = enrolled.profile.duplicate();
     if let Some(block) = downgraded.key_negotiation.as_mut() {
         block.mode = ProtectionMode::Classic;
     }

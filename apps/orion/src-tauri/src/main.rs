@@ -1368,7 +1368,7 @@ impl From<&ClientProfile> for ProfileView {
             key_negotiation: profile.key_negotiation.clone(),
             profile_type: profile.kind().as_str(),
             public_key: profile.public_key(),
-            has_private_key: !profile.private_key.trim().is_empty(),
+            has_private_key: !profile.private_key.is_empty(),
             has_static_psk: profile.has_static_psk(),
             ipv6_uncaptured_full_tunnel: profile.ipv6_uncaptured_full_tunnel(),
         }
@@ -1463,7 +1463,7 @@ impl ProfileDraft {
     ) -> Result<ClientProfile, String> {
         let stored_kind = stored.map(ClientProfile::kind);
         let mut profile = match stored {
-            Some(profile) => profile.clone(),
+            Some(profile) => profile.duplicate(),
             None => ClientProfile {
                 name: self.name.clone(),
                 ..ClientProfile::default()
@@ -1487,19 +1487,15 @@ impl ProfileDraft {
                         .into(),
                 );
             }
-            // `ClientProfile` is the existing persistence/backend contract and
-            // still owns a plain String. This is the one deliberate copy from
-            // the zeroizing staging buffer; the source remains protected until
-            // the staged value is dropped by the caller.
-            profile.private_key = staged.private_key.expose().to_owned();
+            // The draft takes its own zeroizing copy; the staged source stays
+            // protected until the caller drops it.
+            profile.private_key = staged.private_key.duplicate();
         }
         if self.use_staged_psk {
             let staged = staged_psk
                 .ok_or("aucun PSK en attente : saisir le PSK statique avant d'enregistrer")?;
-            // Same compatibility boundary as the private key above: the
-            // profile contract requires an owned String, so make the copy
-            // explicit and keep the staged SecretString zeroizing on drop.
-            profile.preshared_key = Some(staged.value.expose().to_owned());
+            // The draft owns its zeroizing PSK independently of the staging slot.
+            profile.preshared_key = Some(staged.value.duplicate());
         }
         // After adoption, never before: clearing is what the screen sends when
         // the requested mode no longer tolerates a static PSK, and that verdict
@@ -1683,7 +1679,7 @@ async fn finish_import(
     // order — generate, hand the public half over, receive an invitation,
     // import it — and left the user with "aucun profil de ce poste ne détient
     // la clé admise" naming the very key they had just produced.
-    if completed.profile.private_key.trim().is_empty() {
+    if completed.profile.private_key.is_empty() {
         let mut slot = state.staged_key.lock().await;
         match (slot.as_ref(), admitted.as_deref()) {
             // The document names the admitted key: pair on it, never on the
@@ -1691,10 +1687,9 @@ async fn finish_import(
             // profile whose handshakes fail with nothing to explain them.
             (Some(staged), Some(admitted)) if staged.public_key == admitted => {
                 if let Some(staged) = slot.take() {
-                    // The completed import still uses ClientProfile's legacy
-                    // String field; this explicit copy is the compatibility
-                    // boundary. `staged` is dropped immediately afterwards.
-                    completed.profile.private_key = staged.private_key.expose().to_owned();
+                    // Transfer an explicit zeroizing copy into the completed
+                    // import; `staged` is dropped immediately afterwards.
+                    completed.profile.private_key = staged.private_key.duplicate();
                     completed.private_key_missing = None;
                 }
             }
@@ -1715,7 +1710,7 @@ async fn finish_import(
             // they meant.
             (Some(_), None) => {
                 if let Some(staged) = slot.take() {
-                    completed.profile.private_key = staged.private_key.expose().to_owned();
+                    completed.profile.private_key = staged.private_key.duplicate();
                     completed.private_key_missing = None;
                 }
             }
@@ -2157,8 +2152,12 @@ async fn start_connection(app: AppHandle, name: Option<String>) -> Result<(), St
     let profile = {
         let cfg = state.config.lock().await;
         match name {
-            Some(n) => cfg.find(&n).cloned(),
-            None => cfg.selected.as_deref().and_then(|n| cfg.find(n)).cloned(),
+            Some(n) => cfg.find(&n).map(ClientProfile::duplicate),
+            None => cfg
+                .selected
+                .as_deref()
+                .and_then(|n| cfg.find(n))
+                .map(ClientProfile::duplicate),
         }
         .ok_or_else(|| "aucun profil sélectionné".to_string())?
     };
@@ -2362,7 +2361,7 @@ fn raise_key_negotiation_floor(
         settings.minimum_mode = reached;
         // Cloned out of the guard so the sealed write does not hold the lock
         // across an I/O the UI is waiting behind.
-        let raised = profile.clone();
+        let raised = profile.duplicate();
         drop(cfg);
         if let Err(error) = store.save_profile(&raised) {
             tracing::warn!(%error, "unable to persist the raised key-negotiation floor");
@@ -2415,7 +2414,12 @@ async fn validate_profile(
     // report a valid replacement as if its new negotiation identity belonged
     // to the old WireGuard key, then `save_profile` would persist that split.
     // Peeked, not removed: validation runs on every keystroke.
-    let pending = state.pending_imports.lock().await.get(&draft.name).cloned();
+    let pending = state
+        .pending_imports
+        .lock()
+        .await
+        .get(&draft.name)
+        .map(ClientProfile::duplicate);
     let known = cfg.find(&draft.name);
     let stored = profile_edit_base(pending.as_ref(), known);
     // Validation runs on every keystroke: the staged secrets are read, never

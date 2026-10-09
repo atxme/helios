@@ -40,6 +40,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use aether::{secret::json::SecretJson, SecretString};
 use anyhow::{Context, Result};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -71,7 +72,14 @@ const MAX_SEALED_BYTES: usize = 256 * 1024;
 /// Everything is base64: the document that carries it is JSON, and these are
 /// DER and raw byte strings. The two private halves are **secrets** — `Debug`
 /// is masked so an import failure cannot spill them into a log.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Generic serialization is deliberately unavailable; use the bounded encoder
+/// at the operator exchange boundary:
+/// ```compile_fail
+/// fn leak(bundle: &orion_core::ClientIdentityBundle) {
+///     let _ = serde_json::to_string(bundle);
+/// }
+/// ```
+#[derive(PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientIdentityBundle {
     /// Entry name under which this identity is sealed. The VPN profile
@@ -80,11 +88,11 @@ pub struct ClientIdentityBundle {
     /// Client leaf certificate first, then any intermediates (base64 DER).
     pub certificate_chain: Vec<String>,
     /// PKCS#8 client private key (base64 DER). **Secret.**
-    pub private_key: String,
+    pub private_key: SecretString,
     /// ML-DSA-65 client certificate (base64 JSON).
     pub pq_certificate: String,
     /// Raw ML-DSA-65 private key (base64). **Secret.**
-    pub pq_private_key: String,
+    pub pq_private_key: SecretString,
 }
 
 /// Whether a retained identity may still be selected for service.
@@ -115,7 +123,7 @@ pub struct IdentitySnapshot {
     pub previous: Option<PreviousIdentityStatus>,
 }
 
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PreviousIdentitySlot {
     bundle: ClientIdentityBundle,
@@ -135,7 +143,7 @@ struct RetiredIdentityWindow {
 
 /// Plaintext format inside DPAPI. Active and previous move in one sealed file,
 /// so replacing the served bundle cannot lose the only rollback copy.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProtectedIdentityRecord {
     format_version: u16,
@@ -147,6 +155,33 @@ struct ProtectedIdentityRecord {
 }
 
 impl ProtectedIdentityRecord {
+    fn encode(&self) -> Result<Zeroizing<Vec<u8>>> {
+        let mut out = SecretJson::new(MAX_SEALED_BYTES);
+        out.append(b"{\"format_version\":")?;
+        out.public(&self.format_version)?;
+        out.append(b",\"current\":")?;
+        self.current.encode_into(&mut out)?;
+        out.append(b",\"previous\":")?;
+        match &self.previous {
+            Some(previous) => {
+                out.append(b"{\"bundle\":")?;
+                previous.bundle.encode_into(&mut out)?;
+                out.append(b",\"available_from\":")?;
+                out.public(&previous.available_from)?;
+                out.append(b",\"available_until\":")?;
+                out.public(&previous.available_until)?;
+                out.append(b"}")?;
+            }
+            None => out.append(b"null")?,
+        }
+        out.append(b",\"retired_previous\":")?;
+        out.public(&self.retired_previous)?;
+        out.append(b",\"serve_previous\":")?;
+        out.public(&self.serve_previous)?;
+        out.append(b"}")?;
+        Ok(out.finish())
+    }
+
     fn new(current: ClientIdentityBundle) -> Self {
         Self {
             format_version: IDENTITY_RECORD_FORMAT_VERSION,
@@ -314,6 +349,41 @@ impl std::fmt::Debug for ClientIdentityBundle {
 }
 
 impl ClientIdentityBundle {
+    /// Copies an identity for a separate owned protocol or protected slot.
+    /// Every private-key copy stays explicit and is wiped on drop.
+    pub fn duplicate(&self) -> Self {
+        Self {
+            identity: self.identity.clone(),
+            certificate_chain: self.certificate_chain.clone(),
+            private_key: self.private_key.duplicate(),
+            pq_certificate: self.pq_certificate.clone(),
+            pq_private_key: self.pq_private_key.duplicate(),
+        }
+    }
+
+    /// Encodes the operator exchange document without implementing `Serialize`.
+    pub fn encode(&self) -> Result<Zeroizing<Vec<u8>>> {
+        self.validate()?;
+        let mut out = SecretJson::new(MAX_SEALED_BYTES);
+        self.encode_into(&mut out)?;
+        Ok(out.finish())
+    }
+
+    fn encode_into(&self, out: &mut SecretJson) -> Result<()> {
+        out.append(b"{\"identity\":")?;
+        out.public(&self.identity)?;
+        out.append(b",\"certificate_chain\":")?;
+        out.public(&self.certificate_chain)?;
+        out.append(b",\"private_key\":")?;
+        out.secret(&self.private_key)?;
+        out.append(b",\"pq_certificate\":")?;
+        out.public(&self.pq_certificate)?;
+        out.append(b",\"pq_private_key\":")?;
+        out.secret(&self.pq_private_key)?;
+        out.append(b"}")?;
+        Ok(())
+    }
+
     /// Checks that the bundle is complete and decodable.
     ///
     /// Run **before** sealing: a bundle that only fails to decode at
@@ -329,11 +399,14 @@ impl ClientIdentityBundle {
         for certificate in &self.certificate_chain {
             decode(certificate, "certificat client")?;
         }
-        decode(&self.private_key, "clé privée client")?;
+        let _private_key = Zeroizing::new(decode(self.private_key.expose(), "clé privée client")?);
         let pq_certificate = decode(&self.pq_certificate, "certificat PQ client")?;
         serde_json::from_slice::<serde_json::Value>(&pq_certificate)
             .context("le certificat PQ client n'est pas un document JSON")?;
-        decode(&self.pq_private_key, "clé privée PQ client")?;
+        let _pq_private_key = Zeroizing::new(decode(
+            self.pq_private_key.expose(),
+            "clé privée PQ client",
+        )?);
         Ok(())
     }
 }
@@ -427,7 +500,7 @@ impl ProtectedIdentityStore {
         bundle.validate()?;
         self.write_record(
             &bundle.identity,
-            &ProtectedIdentityRecord::new(bundle.clone()),
+            &ProtectedIdentityRecord::new(bundle.duplicate()),
         )
     }
 
@@ -445,7 +518,7 @@ impl ProtectedIdentityStore {
     pub fn snapshot_at(&self, identity: &str, now_unix: u64) -> Result<IdentitySnapshot> {
         let record = self.read_record(identity)?;
         Ok(IdentitySnapshot {
-            served: record.served_at(now_unix).clone(),
+            served: record.served_at(now_unix).duplicate(),
             previous: record.previous_status(now_unix),
         })
     }
@@ -460,7 +533,7 @@ impl ProtectedIdentityStore {
         available_until: u64,
     ) -> Result<bool> {
         let mut record = self.read_record(identity)?;
-        let mut promoted = candidate.clone();
+        let mut promoted = candidate.duplicate();
         promoted.identity = identity.trim().to_string();
         promoted.validate()?;
         if !record.promote(promoted, available_from, available_until)? {
@@ -536,10 +609,14 @@ impl ProtectedIdentityStore {
     fn write_record(&self, identity: &str, record: &ProtectedIdentityRecord) -> Result<PathBuf> {
         record.validate(identity)?;
         let path = self.path_of(identity)?;
-        let plaintext = Zeroizing::new(
-            serde_json::to_vec(record).context("encodage de l'identité avant scellement")?,
-        );
+        let plaintext = record
+            .encode()
+            .context("encodage de l'identité avant scellement")?;
         let sealed = seal(&plaintext)?;
+        anyhow::ensure!(
+            sealed.len() <= MAX_SEALED_BYTES,
+            "l'identité scellée dépasse la taille maximale"
+        );
 
         aether::private_file::create_private_dir(&self.directory)
             .with_context(|| format!("création de {}", self.directory.display()))?;

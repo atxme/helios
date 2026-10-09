@@ -76,16 +76,14 @@ struct TaggedProfile<'a> {
     #[serde(rename = "type")]
     profile_type: ProfileKind,
     #[serde(flatten)]
-    inner: Profile<'a>,
+    inner: PublicProfile<'a>,
 }
 
 /// The `private_key` field is omitted in invitation mode: `orion-core` treats
 /// it as absent, not empty, and completes it from the local profile.
-#[derive(Serialize)]
 pub struct Profile<'a> {
     pub name: &'a str,
     pub endpoint: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub private_key: Option<&'a str>,
     pub peer_public_key: &'a str,
     pub address: &'a str,
@@ -96,7 +94,6 @@ pub struct Profile<'a> {
     /// refuses any profile carrying the key, even empty or `null`. Omitting it
     /// for a peer without IPv6 is what keeps the profile of a gateway without
     /// IPv6 readable by every Orion.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub address_v6: Option<&'a str>,
     /// Traffic the client routes into the tunnel — one or more CIDR prefixes,
     /// comma-separated.
@@ -108,22 +105,36 @@ pub struct Profile<'a> {
     /// a split tunnel needs stating, and it is stated **here** so a fleet gets
     /// it from the document rather than from each user retyping prefixes into
     /// the Advanced panel.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_ips: Option<&'a str>,
     /// SSH destination inside the tunnel, `user@host`. Omitted = no terminal.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub ssh_target: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub heliosd_url: Option<String>,
     /// Public negotiation settings. Absent when the gateway serves none:
     /// the profile then falls back to the legacy path, whose first handshake
     /// is unprotected.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub key_negotiation: Option<KeyNegotiation>,
     /// Client identity. **Secret** — only `enroll` fills it in, and the file
     /// it produces is born at 0600.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub key_negotiation_identity: Option<orion_core::ClientIdentityBundle>,
+}
+
+/// The serializable half of an emitted profile contains public fields only.
+#[derive(Serialize)]
+struct PublicProfile<'a> {
+    name: &'a str,
+    endpoint: &'a str,
+    peer_public_key: &'a str,
+    address: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    address_v6: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    allowed_ips: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ssh_target: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    heliosd_url: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key_negotiation: Option<&'a KeyNegotiation>,
 }
 
 /// Public negotiation block, as `orion-core` reads it back.
@@ -149,22 +160,45 @@ pub struct KeyNegotiation {
 /// this tool and Orion must agree on the format, and the only way to be sure
 /// is to have the actual consumer accept the actual bytes. A document that
 /// Orion would refuse must never reach a user's machine.
-pub fn render(profile: Profile<'_>) -> Result<String> {
+pub fn render(profile: Profile<'_>) -> Result<zeroize::Zeroizing<String>> {
     let profile_type = if profile.key_negotiation.is_some() {
         ProfileKind::HeliosKeyNegotiation
     } else {
         ProfileKind::Classic
     };
-    let json = serde_json::to_string_pretty(&Document {
+    let public = serde_json::to_vec(&Document {
         format: FORMAT,
         version: VERSION,
         profile: TaggedProfile {
             profile_type,
-            inner: profile,
+            inner: PublicProfile {
+                name: profile.name,
+                endpoint: profile.endpoint,
+                peer_public_key: profile.peer_public_key,
+                address: profile.address,
+                address_v6: profile.address_v6,
+                allowed_ips: profile.allowed_ips,
+                ssh_target: profile.ssh_target,
+                heliosd_url: profile.heliosd_url.as_deref(),
+                key_negotiation: profile.key_negotiation.as_ref(),
+            },
         },
     })
-    .context("serializing the profile")?;
-
+    .context("serializing the public profile fields")?;
+    let mut encoded =
+        aether::secret::json::SecretJson::new(orion_core::profile_import::MAX_PROFILE_IMPORT_BYTES);
+    // The serializer above emits an envelope ending in the two object braces.
+    encoded.append(&public[..public.len() - 2])?;
+    if let Some(private_key) = profile.private_key {
+        encoded.append(b",\"private_key\":")?;
+        encoded.secret_str(private_key)?;
+    }
+    if let Some(identity) = &profile.key_negotiation_identity {
+        encoded.append(b",\"key_negotiation_identity\":")?;
+        encoded.append(&identity.encode()?)?;
+    }
+    encoded.append(b"}}")?;
+    let json = encoded.finish_string()?;
     orion_core::parse_profile_import(&json, "profile.json")
         .context("the emitted profile is not readable by Orion — this is a tooling bug")?;
     Ok(json)
@@ -331,7 +365,7 @@ pub async fn emit(client: &Client, base: &str, options: EmitOptions) -> Result<(
             crate::files::write_new(path, json.as_bytes(), private_key.is_some())?;
             report(path, &options, &public_key);
         }
-        None => println!("{json}"),
+        None => println!("{}", json.as_str()),
     }
     Ok(())
 }
@@ -702,9 +736,9 @@ mod tests {
             key_negotiation_identity: Some(orion_core::ClientIdentityBundle {
                 identity: "orion-portable".into(),
                 certificate_chain: vec![STANDARD.encode([0x30, 0x82, 0x02, 0x00])],
-                private_key: STANDARD.encode([0x30, 0x81, 0x87, 0x02]),
+                private_key: STANDARD.encode([0x30, 0x81, 0x87, 0x02]).into(),
                 pq_certificate: STANDARD.encode(br#"{"version":1}"#),
-                pq_private_key: STANDARD.encode([9u8; 64]),
+                pq_private_key: STANDARD.encode([9u8; 64]).into(),
             }),
         })
         .expect("enrollment document read back by Orion");
@@ -759,13 +793,13 @@ mod tests {
         })
         .expect("document read back by Orion");
 
-        assert!(!json.contains("allowed_ips"), "{json}");
+        assert!(!json.contains("allowed_ips"), "{}", json.as_str());
         let imported = orion_core::parse_profile_import(&json, "portable.json").unwrap();
         assert_eq!(imported.profile.allowed_ips, "0.0.0.0/0, ::/0");
         assert_eq!(capture_label(&imported.profile.allowed_ips), "full tunnel");
     }
 
-    fn document(address_v6: Option<&str>) -> String {
+    fn document(address_v6: Option<&str>) -> zeroize::Zeroizing<String> {
         let client_key = aether::wg::generate_keypair().unwrap();
         let gateway_key = aether::wg::generate_keypair().unwrap();
         render(Profile {
@@ -791,7 +825,7 @@ mod tests {
     #[test]
     fn a_peer_without_ipv6_gets_no_address_v6_key() {
         let json = document(None);
-        assert!(!json.contains("address_v6"), "{json}");
+        assert!(!json.contains("address_v6"), "{}", json.as_str());
         let imported = orion_core::parse_profile_import(&json, "portable.json").unwrap();
         assert_eq!(imported.profile.address_v6, None);
     }

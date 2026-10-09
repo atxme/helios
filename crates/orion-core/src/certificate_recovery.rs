@@ -272,7 +272,8 @@ pub async fn begin(
 
     let expired_pq = crate::certificate_renewal::client_pq_leaf(&bundle)?;
     let expired_tls = leaf_of(&bundle)?;
-    let expired_pq_private_key = decode_secret(&bundle.pq_private_key, "clé privée PQ expirée")?;
+    let expired_pq_private_key =
+        decode_secret(bundle.pq_private_key.expose(), "clé privée PQ expirée")?;
 
     let state = store.state();
     let authority = state.astra.authority_url.trim_end_matches('/').to_string();
@@ -448,12 +449,14 @@ async fn install(
     let candidate = ClientIdentityBundle {
         identity: candidate_identity_of(identity),
         certificate_chain: vec![encode.encode(grant.next_tls_certificate.as_bytes())],
-        private_key: encode.encode(session.keys.tls.private_key_der.as_slice()),
+        private_key: encode
+            .encode(session.keys.tls.private_key_der.as_slice())
+            .into(),
         pq_certificate: encode.encode(
             serde_json::to_vec(&grant.next_pq_certificate)
                 .map_err(|error| RecoveryError::Malformed(error.to_string()))?,
         ),
-        pq_private_key: encode.encode(session.keys.pq_private_key.as_slice()),
+        pq_private_key: encode.encode(session.keys.pq_private_key.as_slice()).into(),
     };
     candidate
         .validate()
@@ -464,7 +467,8 @@ async fn install(
 
     store.stage_verified_grant(&grant, now_unix)?;
 
-    let expired_pq_private_key = decode_secret(&bundle.pq_private_key, "clé privée PQ expirée")?;
+    let expired_pq_private_key =
+        decode_secret(bundle.pq_private_key.expose(), "clé privée PQ expirée")?;
     let receipt = &grant.stage_receipt;
     let commit = ClientCertificateStageCommit {
         format_version: CERTIFICATE_FORMAT_VERSION,

@@ -283,7 +283,7 @@ async fn starting_a_same_profile_renegotiation_keeps_the_previous_receipt() {
     });
     *ctrl.installed.lock().await = Some(InstalledNegotiation {
         transaction_id: [9; 16],
-        profile: helios.clone(),
+        profile: helios.duplicate(),
     });
 
     // No identity provider: the spawned negotiation fails, but only after
@@ -663,7 +663,7 @@ async fn the_upgrade_never_unmounts_the_adapter() {
 #[test]
 fn incomplete_profile_rejected_before_the_network() {
     let mut p = profile();
-    p.private_key = String::new();
+    p.private_key = aether::SecretString::default();
     assert!(p.validate().is_err());
 
     let mut p = profile();
@@ -740,7 +740,7 @@ async fn a_literal_endpoint_is_mounted_as_written() {
 async fn a_hostname_endpoint_is_mounted_as_the_literal_it_resolved_to() {
     let mut p = profile();
     p.endpoint = "localhost:51820".into();
-    let stored = p.clone();
+    let stored = p.duplicate();
     let (backend, lines) = connect_classic(p).await;
 
     let mounted = backend.endpoints.lock().unwrap().clone();

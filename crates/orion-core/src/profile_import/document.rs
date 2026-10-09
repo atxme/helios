@@ -289,7 +289,7 @@ pub fn complete_profile_import(
             .find(|candidate| candidate.public_key().as_deref() == Some(admitted)),
         None => config
             .find(&profile.name)
-            .filter(|candidate| !candidate.private_key.trim().is_empty()),
+            .filter(|candidate| !candidate.private_key.is_empty()),
     };
 
     let Some(existing) = local else {
@@ -317,7 +317,7 @@ pub fn complete_profile_import(
         });
     };
 
-    profile.private_key = existing.private_key.clone();
+    profile.private_key = existing.private_key.duplicate();
     let incomplete = advisory(&profile);
     Ok(CompletedImport {
         profile,

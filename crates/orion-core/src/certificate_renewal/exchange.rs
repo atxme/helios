@@ -227,8 +227,8 @@ impl ActiveIdentity {
                 .map_err(|_| RenewalError::Identity(format!("{label} : base64 illisible")))
         };
         Ok(Self {
-            pq_private_key: decode(&bundle.pq_private_key, "clé privée PQ cliente")?,
-            tls_private_key_der: decode(&bundle.private_key, "clé privée TLS cliente")?,
+            pq_private_key: decode(bundle.pq_private_key.expose(), "clé privée PQ cliente")?,
+            tls_private_key_der: decode(bundle.private_key.expose(), "clé privée TLS cliente")?,
         })
     }
 }
@@ -625,12 +625,14 @@ impl RenewalSession {
         let bundle = ClientIdentityBundle {
             identity: identity.to_string(),
             certificate_chain,
-            private_key: encode.encode(self.keys.tls.private_key_der.as_slice()),
+            private_key: encode
+                .encode(self.keys.tls.private_key_der.as_slice())
+                .into(),
             pq_certificate: encode.encode(
                 serde_json::to_vec(&grant.next_pq_certificate)
                     .map_err(|error| RenewalError::Malformed(error.to_string()))?,
             ),
-            pq_private_key: encode.encode(self.keys.pq_private_key.as_slice()),
+            pq_private_key: encode.encode(self.keys.pq_private_key.as_slice()).into(),
         };
         bundle
             .validate()

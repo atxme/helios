@@ -284,10 +284,12 @@ pub(crate) fn bundle(domain: &Domain) -> ClientIdentityBundle {
     ClientIdentityBundle {
         identity: SUBJECT.into(),
         certificate_chain: vec![STANDARD.encode(domain.active_client_tls.as_bytes())],
-        private_key: STANDARD.encode(vec![7u8; 64]),
+        private_key: STANDARD.encode(vec![7u8; 64]).into(),
         pq_certificate: STANDARD
             .encode(serde_json::to_vec(&domain.active_client_leaf).expect("client leaf")),
-        pq_private_key: STANDARD.encode(domain.active_client_private.as_slice()),
+        pq_private_key: STANDARD
+            .encode(domain.active_client_private.as_slice())
+            .into(),
     }
 }
 

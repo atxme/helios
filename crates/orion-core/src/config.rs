@@ -1,4 +1,4 @@
-//! Client VPN profile: editable in the UI, persisted locally in TOML.
+//! Runtime VPN profiles, stored in the protected vault.
 //!
 //! **WireGuard** model (ADR-001): a peer is identified by its Curve25519
 //! public key and reached via a UDP endpoint. There's no CA, no EAP, no
@@ -9,16 +9,21 @@
 //! each connection and is never persisted. What the profile can carry is a
 //! *static* PSK entered by hand, which disables this negotiation.
 //!
-//! The `private_key` / `preshared_key` fields are **secrets**: `Debug` is
-//! masked so they don't leak into logs.
+//! The retired TOML format remains readable for migration. Private keys and
+//! static PSKs are `SecretString`: copies are named, `Debug` is masked, and
+//! runtime profiles cannot be serialized through a read API or legacy writer.
 
 use std::fmt;
 use std::path::PathBuf;
 
 use aether::key_negotiation::ProtectionMode;
+use aether::SecretString;
 use anyhow::{Context, Result};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
+
+#[cfg(test)]
+mod legacy_fixture;
 
 /// Default `AllowedIPs`: all traffic goes through the tunnel, in both families.
 ///
@@ -422,7 +427,13 @@ impl ProfileKind {
 }
 
 /// A complete VPN profile, as edited by the user in the UI.
-#[derive(Clone, Serialize, Deserialize)]
+///
+/// Generic serialization is deliberately unavailable:
+/// ```compile_fail
+/// let profile = orion_core::ClientProfile::default();
+/// let _ = serde_json::to_string(&profile);
+/// ```
+#[derive(Deserialize)]
 pub struct ClientProfile {
     /// Unique friendly name (selection key in the list).
     pub name: String,
@@ -440,7 +451,7 @@ pub struct ClientProfile {
     pub endpoint: String,
     /// Client's Curve25519 private key (base64). **Secret.**
     #[serde(default)]
-    pub private_key: String,
+    pub private_key: SecretString,
     /// Gateway's Curve25519 public key (base64) — the peer's identity.
     #[serde(default)]
     pub peer_public_key: String,
@@ -451,7 +462,7 @@ pub struct ClientProfile {
     /// lands here — it isn't persisted, it's renegotiated on each connection.
     /// `None` is therefore the *normal* case for a Helios profile, not a gap.
     #[serde(default)]
-    pub preshared_key: Option<String>,
+    pub preshared_key: Option<SecretString>,
     /// Virtual address assigned by the gateway (CGNAT, e.g. `100.64.1.2/32`).
     /// Derived on the gateway side by `helios-provisioning`, received on enrollment.
     #[serde(default)]
@@ -568,6 +579,27 @@ impl fmt::Debug for ClientProfile {
 }
 
 impl ClientProfile {
+    /// Creates an owned profile for a separate connection or draft.
+    /// Secret duplication is explicit and every copy is wiped on drop.
+    pub fn duplicate(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            endpoint: self.endpoint.clone(),
+            private_key: self.private_key.duplicate(),
+            peer_public_key: self.peer_public_key.clone(),
+            preshared_key: self.preshared_key.as_ref().map(SecretString::duplicate),
+            address: self.address.clone(),
+            address_v6: self.address_v6.clone(),
+            allowed_ips: self.allowed_ips.clone(),
+            persistent_keepalive: self.persistent_keepalive,
+            heliosd_url: self.heliosd_url.clone(),
+            ssh_target: self.ssh_target.clone(),
+            profile_type: self.profile_type,
+            key_negotiation: self.key_negotiation.clone(),
+            preshared_key_is_negotiated: self.preshared_key_is_negotiated,
+        }
+    }
+
     /// Is the profile usable to mount a tunnel?
     ///
     /// An incomplete profile must not be presented as connectable: we fail
@@ -657,7 +689,7 @@ impl ClientProfile {
         if self.endpoint.trim().is_empty() {
             anyhow::bail!("l'endpoint de la gateway (IP/FQDN:port) est requis");
         }
-        if self.private_key.trim().is_empty() {
+        if self.private_key.is_empty() {
             anyhow::bail!("la clé privée du client est requise (enrôlement non effectué ?)");
         }
         if self.peer_public_key.trim().is_empty() {
@@ -751,7 +783,7 @@ impl ClientProfile {
     /// (ADR-004 §6). `None` if the profile has no private key yet, or if it
     /// is unreadable.
     pub fn public_key(&self) -> Option<String> {
-        aether::wg::public_from_private(&self.private_key).ok()
+        aether::wg::public_from_private(self.private_key.expose()).ok()
     }
 
     /// Is the `PresharedKey` slot set in this profile?
@@ -763,9 +795,7 @@ impl ClientProfile {
     /// PSK. To distinguish the two in the UI, it's
     /// [`crate::events::PskKind`] that is authoritative, not this predicate.
     pub fn has_preshared_key(&self) -> bool {
-        self.preshared_key
-            .as_deref()
-            .is_some_and(|k| !k.trim().is_empty())
+        self.preshared_key.as_ref().is_some_and(|k| !k.is_empty())
     }
 }
 
@@ -774,7 +804,7 @@ impl Default for ClientProfile {
         Self {
             name: "nouveau".to_string(),
             endpoint: String::new(),
-            private_key: String::new(),
+            private_key: SecretString::default(),
             peer_public_key: String::new(),
             preshared_key: None,
             address: None,
@@ -796,7 +826,7 @@ impl Default for ClientProfile {
 }
 
 /// Persisted client configuration: set of profiles + current selection.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default)]
 pub struct ClientConfig {
     #[serde(default)]
     pub profiles: Vec<ClientProfile>,
@@ -823,6 +853,7 @@ impl ClientConfig {
         let path = Self::path()?;
         match std::fs::read_to_string(&path) {
             Ok(raw) => {
+                let raw = zeroize::Zeroizing::new(raw);
                 toml::from_str(&raw).with_context(|| format!("config invalide: {}", path.display()))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
@@ -851,7 +882,7 @@ impl ClientConfig {
             aether::private_file::create_private_dir(parent)
                 .with_context(|| format!("création de {}", parent.display()))?;
         }
-        let raw = toml::to_string_pretty(self).context("sérialisation TOML")?;
+        let raw = self.encode_legacy_fixture()?;
         // 0600 from creation on Unix — see `aether::private_file`, including
         // why Windows gets nothing here and what actually protects it (ADR-006).
         aether::private_file::write_private_atomic(&path, raw.as_bytes())

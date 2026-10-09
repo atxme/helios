@@ -450,7 +450,7 @@ impl ProfileStore {
             .map_err(|error| VaultError::InvalidProfileKind(error.to_string()))?;
         let root = self.root()?;
         let mut registry = self.load_registry(&root)?;
-        let client_public_key = aether::wg::public_from_private(&profile.private_key)
+        let client_public_key = aether::wg::public_from_private(profile.private_key.expose())
             .map_err(|_| VaultError::ContextDisagrees)?;
 
         let previous = registry.find_by_name(&profile.name).cloned();
@@ -604,7 +604,8 @@ impl ProfileStore {
         };
 
         for profile in &legacy.profiles {
-            let Ok(client_public_key) = aether::wg::public_from_private(&profile.private_key)
+            let Ok(client_public_key) =
+                aether::wg::public_from_private(profile.private_key.expose())
             else {
                 // A profile whose key cannot even be read is not migrated, and
                 // not silently dropped either: it stays in the legacy file,

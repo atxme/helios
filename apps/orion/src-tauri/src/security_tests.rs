@@ -10,7 +10,7 @@ fn profile(name: &str) -> ClientProfile {
     ClientProfile {
         name: name.into(),
         endpoint: "203.0.113.10:51820".into(),
-        private_key: pair.private_key.expose().to_string(),
+        private_key: pair.private_key.duplicate(),
         peer_public_key: gateway.public_key,
         preshared_key: Some("cHNrLXN0YXRpcXVlLWhvcnMtYmFuZGU=".into()),
         address: Some("100.64.1.2/32".into()),
@@ -123,8 +123,12 @@ fn a_payload_without_intents_defaults_to_touching_no_secret() {
 #[test]
 fn no_secret_is_ever_serialised_towards_the_interface() {
     let profile = profile("poste");
-    let private_key = profile.private_key.clone();
-    let psk = profile.preshared_key.clone().expect("psk");
+    let private_key = profile.private_key.duplicate();
+    let psk = profile
+        .preshared_key
+        .as_ref()
+        .map(aether::SecretString::duplicate)
+        .expect("psk");
 
     let config = super::ClientConfig {
         profiles: vec![profile],
@@ -133,10 +137,13 @@ fn no_secret_is_ever_serialised_towards_the_interface() {
     let json = serde_json::to_string(&ConfigView::from(&config)).expect("serialise");
 
     assert!(
-        !json.contains(&private_key),
+        !json.contains(private_key.expose()),
         "la clé privée traverse l'IPC :\n{json}"
     );
-    assert!(!json.contains(&psk), "le PSK statique traverse l'IPC");
+    assert!(
+        !json.contains(psk.expose()),
+        "le PSK statique traverse l'IPC"
+    );
     // What the screen legitimately needs is still there.
     assert!(json.contains("publicKey") || json.contains("public_key"));
     assert!(json.contains("203.0.113.10:51820"));
@@ -225,8 +232,11 @@ fn the_ipv6_address_round_trips_through_the_view_and_the_draft() {
 #[test]
 fn editing_a_profile_keeps_the_secrets_it_never_saw() {
     let stored = profile("poste");
-    let key = stored.private_key.clone();
-    let psk = stored.preshared_key.clone();
+    let key = stored.private_key.duplicate();
+    let psk = stored
+        .preshared_key
+        .as_ref()
+        .map(aether::SecretString::duplicate);
 
     let mut edit = draft("poste");
     edit.endpoint = "198.51.100.7:51820".into();
@@ -273,7 +283,7 @@ fn only_a_staged_key_becomes_a_profile_key() {
     let mut adopting = draft("nouveau");
     adopting.use_staged_key = true;
     let created = adopting.merge(None, Some(&staged), None).expect("merge");
-    assert_eq!(created.private_key, staged.private_key.expose());
+    assert_eq!(created.private_key, staged.private_key);
     assert_eq!(
         created.public_key().as_deref(),
         Some(pair.public_key.as_str())
@@ -324,7 +334,8 @@ fn a_static_psk_is_set_or_cleared_only_on_an_explicit_intent() {
             .merge(Some(&stored), None, Some(&waiting))
             .expect("merge")
             .preshared_key
-            .as_deref(),
+            .as_ref()
+            .map(aether::SecretString::expose),
         Some(waiting.value.expose())
     );
 
