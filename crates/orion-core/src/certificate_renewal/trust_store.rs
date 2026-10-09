@@ -140,7 +140,7 @@ pub fn open_or_seed(
         .map_err(|error| RenewalError::Identity(error.to_string()))?;
     let client_wg_public_key = client_key_of(bundle)?;
 
-    if let Some(existing) = TrustStore::load(path)? {
+    if let Some(mut existing) = TrustStore::load(path)? {
         let state = existing.state();
         if state.trust_domain_id != trust_domain_id {
             return Err(RenewalError::ForeignTrustStore {
@@ -155,6 +155,15 @@ pub fn open_or_seed(
                 held: state.client_wg_public_key.to_base64(),
                 expected: client_wg_public_key.to_base64(),
             });
+        }
+        // The preceding shape already retained independently verified rows.
+        // Reconstruct a snapshot only when every row belongs to the pinned
+        // anchor and to the current registry epoch. Partial historical maps
+        // remain intact and keep their terminal revocation decisions.
+        if existing.state().credential_registry.is_none() {
+            if let Some(registry) = retained_registry(existing.state())? {
+                existing.install_credential_registry(&registry)?;
+            }
         }
         return Ok(existing);
     }
@@ -239,6 +248,7 @@ fn seed(
     // là où il peut encore le dire utilement.
 
     let mut state = TrustState {
+        credential_registry: None,
         trust_domain_id: trust
             .trust_domain()
             .map_err(|error| RenewalError::Identity(error.to_string()))?,
@@ -333,7 +343,21 @@ fn seed(
     let ca_pq = trust
         .ca_pq()
         .map_err(|error| RenewalError::Identity(error.to_string()))?;
+    if trust.astra_credential_bindings.len()
+        > aether::certificates::approval::MAX_CREDENTIAL_BINDINGS
+    {
+        return Err(aether::certificates::CertificateError::TooManyObjects.into());
+    }
+    let mut credential_ids = std::collections::HashSet::new();
     for binding in &trust.astra_credential_bindings {
+        if !credential_ids.insert(&binding.credential_id) {
+            return Err(
+                aether::certificates::CertificateError::InvalidCredentialBinding(
+                    "duplicate credential",
+                )
+                .into(),
+            );
+        }
         binding
             .verify(
                 &ca_pq,
@@ -356,5 +380,39 @@ fn seed(
         .credential_registry_epoch
         .max(trust.credential_registry_epoch);
 
+    state.credential_registry = retained_registry(&state)?;
+
     Ok(state)
+}
+
+fn retained_registry(
+    state: &TrustState,
+) -> Result<
+    Option<aether::certificates::approval::CredentialRegistry>,
+    aether::certificates::CertificateError,
+> {
+    let bindings: Vec<_> = state.astra.credential_bindings.values().cloned().collect();
+    if bindings.is_empty()
+        || bindings.iter().any(|binding| {
+            binding.ca_epoch != state.gateway.ca_epoch
+                || binding.credential_registry_epoch != state.astra.credential_registry_epoch
+        })
+    {
+        return Ok(None);
+    }
+    let registry = aether::certificates::approval::CredentialRegistry {
+        trust_domain_id: state.trust_domain_id,
+        gateway_wg_public_key: state.gateway.gateway_wg_public_key,
+        ca_epoch: state.gateway.ca_epoch,
+        credential_registry_epoch: state.astra.credential_registry_epoch,
+        bindings,
+    };
+    registry.verify(
+        &state.gateway.current_ca_public_key,
+        &state.trust_domain_id,
+        &state.gateway.gateway_wg_public_key,
+        state.gateway.ca_epoch,
+        state.astra.credential_registry_epoch,
+    )?;
+    Ok(Some(registry))
 }

@@ -182,6 +182,7 @@ pub(crate) fn store(directory: &std::path::Path, domain: &Domain) -> TrustStore 
     TrustStore::new(
         directory.join("trust.json"),
         crate::certificates::TrustState {
+            credential_registry: None,
             trust_domain_id: domain_id(),
             client_wg_public_key: client_key(),
             gateway: GatewayCertificateState {

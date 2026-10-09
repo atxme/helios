@@ -195,6 +195,7 @@ fn store(
     TrustStore::new(
         path,
         TrustState {
+            credential_registry: None,
             trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
             client_wg_public_key: key(2),
             gateway: GatewayCertificateState {

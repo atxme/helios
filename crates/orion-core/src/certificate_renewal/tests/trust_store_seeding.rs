@@ -275,3 +275,271 @@ fn the_gateway_identity_epochs_come_from_the_enrolment_block() {
     assert_eq!(gateway.active_gateway_identity_epoch, 3);
     assert_eq!(gateway.gateway_decision_epoch, 4);
 }
+
+#[test]
+fn the_verified_operator_registry_survives_a_reload_and_has_public_inventory() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let domain = domain();
+    let mut settings = settings(&domain);
+    settings
+        .trust
+        .as_mut()
+        .expect("trust")
+        .astra_credential_bindings = vec![signed_binding(&domain, vec![0xAB, 0xCD])];
+    let path = directory.path().join("trust.json");
+    let store = open_or_seed(&path, &settings, &bundle(&domain)).expect("seed");
+    assert!(store.state().credential_registry.is_some());
+    let reloaded = crate::certificates::TrustStore::load(&path)
+        .expect("load")
+        .expect("exists");
+    let inventory =
+        crate::certificate_inventory::operator_inventory(reloaded.state()).expect("verified");
+    assert_eq!(
+        inventory.detail,
+        crate::certificate_inventory::OperatorCredentialDetail::Verified
+    );
+    assert_eq!(inventory.credentials.len(), 1);
+    assert_eq!(
+        inventory.credentials[0].state,
+        aether::certificates::approval::CredentialState::Active
+    );
+    let encoded = serde_json::to_string(&inventory).expect("JSON");
+    assert!(!encoded.contains("credential_public_key"));
+    assert!(!encoded.contains("credential_id"));
+    assert!(!encoded.contains("ca_pq_signature"));
+}
+
+#[test]
+fn the_previous_trust_shape_migrates_without_losing_security_state() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let domain = domain();
+    let mut settings = settings(&domain);
+    settings
+        .trust
+        .as_mut()
+        .expect("trust")
+        .astra_credential_bindings = vec![signed_binding(&domain, vec![1, 2])];
+    let path = directory.path().join("trust.json");
+    let original = open_or_seed(&path, &settings, &bundle(&domain)).expect("seed");
+    let mut document = serde_json::to_value(original.state()).expect("JSON");
+    document
+        .as_object_mut()
+        .expect("object")
+        .remove("credential_registry");
+    std::fs::write(&path, serde_json::to_vec(&document).expect("JSON")).expect("write fixture");
+    let migrated = open_or_seed(&path, &settings, &bundle(&domain)).expect("migration");
+    assert_eq!(migrated.state(), original.state());
+    assert_eq!(
+        migrated.base_state_fingerprint().expect("fingerprint"),
+        original.base_state_fingerprint().expect("fingerprint")
+    );
+}
+
+#[test]
+fn duplicated_enrolment_credentials_are_refused_before_persistence() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let domain = domain();
+    let mut settings = settings(&domain);
+    let binding = signed_binding(&domain, vec![1, 2]);
+    settings
+        .trust
+        .as_mut()
+        .expect("trust")
+        .astra_credential_bindings = vec![binding.clone(), binding];
+    let path = directory.path().join("trust.json");
+    assert!(open_or_seed(&path, &settings, &bundle(&domain)).is_err());
+    assert!(!path.exists());
+}
+
+#[test]
+fn a_later_registry_cannot_hide_a_previously_retained_credential() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let domain = domain();
+    let mut settings = settings(&domain);
+    settings
+        .trust
+        .as_mut()
+        .expect("trust")
+        .astra_credential_bindings = vec![
+        signed_binding(&domain, vec![1]),
+        signed_binding(&domain, vec![2]),
+    ];
+    let path = directory.path().join("trust.json");
+    let mut store = open_or_seed(&path, &settings, &bundle(&domain)).expect("seed");
+    let before = store.state().clone();
+    let mut omitted = before.credential_registry.clone().expect("registry");
+    omitted.credential_registry_epoch += 1;
+    omitted.bindings.truncate(1);
+    omitted.bindings[0].credential_registry_epoch = omitted.credential_registry_epoch;
+    omitted.bindings[0] = omitted.bindings[0]
+        .clone()
+        .sign(&domain.ca_pq_private)
+        .expect("sign");
+    assert!(store.install_credential_registry(&omitted).is_err());
+    assert_eq!(store.state(), &before);
+}
+
+#[test]
+fn registry_installation_refuses_rollback_forgery_and_same_epoch_conflicts() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let domain = domain();
+    let mut settings = settings(&domain);
+    settings
+        .trust
+        .as_mut()
+        .expect("trust")
+        .astra_credential_bindings = vec![signed_binding(&domain, vec![1, 2])];
+    let path = directory.path().join("trust.json");
+    let mut store = open_or_seed(&path, &settings, &bundle(&domain)).expect("seed");
+    let before = std::fs::read(&path).expect("read");
+    let original = store.state().credential_registry.clone().expect("registry");
+    assert_eq!(
+        store
+            .install_credential_registry(&original)
+            .expect("idempotent"),
+        aether::certificates::state::InstallOutcome::AlreadyPresent
+    );
+    let mut rollback = original.clone();
+    rollback.credential_registry_epoch = 0;
+    assert!(store.install_credential_registry(&rollback).is_err());
+    let mut forged = original.clone();
+    forged.bindings[0].state = aether::certificates::approval::CredentialState::Revoked;
+    assert!(store.install_credential_registry(&forged).is_err());
+    let mut conflict = original.clone();
+    conflict.bindings[0].created_at += 1;
+    conflict.bindings[0] = conflict.bindings[0]
+        .clone()
+        .sign(&domain.ca_pq_private)
+        .expect("sign");
+    assert!(store.install_credential_registry(&conflict).is_err());
+    assert_eq!(store.state().credential_registry.as_ref(), Some(&original));
+    assert_eq!(std::fs::read(&path).expect("read"), before);
+}
+
+#[test]
+fn a_registry_write_failure_keeps_the_live_snapshot_unchanged() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let domain = domain();
+    let settings = settings(&domain);
+    let path = directory.path().join("trust.json");
+    let seeded = open_or_seed(&path, &settings, &bundle(&domain)).expect("seed");
+    let mut store = crate::certificates::TrustStore::new(
+        directory.path().to_path_buf(),
+        seeded.state().clone(),
+    );
+    let before = store.state().clone();
+    let registry = aether::certificates::approval::CredentialRegistry {
+        trust_domain_id: before.trust_domain_id,
+        gateway_wg_public_key: before.gateway.gateway_wg_public_key,
+        ca_epoch: before.gateway.ca_epoch,
+        credential_registry_epoch: 1,
+        bindings: vec![signed_binding(&domain, vec![1, 2])],
+    };
+    assert!(store.install_credential_registry(&registry).is_err());
+    assert_eq!(store.state(), &before);
+}
+
+#[test]
+fn a_later_signed_registry_cannot_restore_a_revoked_credential() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let domain = domain();
+    let mut settings = settings(&domain);
+    settings
+        .trust
+        .as_mut()
+        .expect("trust")
+        .astra_credential_bindings = vec![signed_binding(&domain, vec![1, 2])];
+    let path = directory.path().join("trust.json");
+    let mut store = open_or_seed(&path, &settings, &bundle(&domain)).expect("seed");
+    let mut revoked = store.state().credential_registry.clone().expect("registry");
+    revoked.credential_registry_epoch = 2;
+    revoked.bindings[0].credential_registry_epoch = 2;
+    revoked.bindings[0].credential_epoch = 2;
+    revoked.bindings[0].state = aether::certificates::approval::CredentialState::Revoked;
+    revoked.bindings[0] = revoked.bindings[0]
+        .clone()
+        .sign(&domain.ca_pq_private)
+        .expect("sign");
+    store.install_credential_registry(&revoked).expect("revoke");
+    let before = store.state().clone();
+    let disk = std::fs::read(&path).expect("read");
+    let mut revived = revoked;
+    revived.credential_registry_epoch = 3;
+    revived.bindings[0].credential_registry_epoch = 3;
+    revived.bindings[0].credential_epoch = 3;
+    revived.bindings[0].state = aether::certificates::approval::CredentialState::Active;
+    revived.bindings[0] = revived.bindings[0]
+        .clone()
+        .sign(&domain.ca_pq_private)
+        .expect("sign");
+    assert!(store.install_credential_registry(&revived).is_err());
+    assert_eq!(store.state(), &before);
+    assert_eq!(std::fs::read(&path).expect("read"), disk);
+}
+
+#[test]
+fn oversized_registries_and_forged_inventory_are_refused() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let domain = domain();
+    let mut settings = settings(&domain);
+    settings
+        .trust
+        .as_mut()
+        .expect("trust")
+        .astra_credential_bindings = vec![signed_binding(&domain, vec![1, 2])];
+    let path = directory.path().join("trust.json");
+    let mut store = open_or_seed(&path, &settings, &bundle(&domain)).expect("seed");
+    let before = store.state().clone();
+    let mut oversized = before.credential_registry.clone().expect("registry");
+    oversized.bindings = vec![
+        oversized.bindings[0].clone();
+        aether::certificates::approval::MAX_CREDENTIAL_BINDINGS + 1
+    ];
+    assert!(store.install_credential_registry(&oversized).is_err());
+    assert_eq!(store.state(), &before);
+    let mut forged = before;
+    forged
+        .credential_registry
+        .as_mut()
+        .expect("registry")
+        .bindings[0]
+        .state = aether::certificates::approval::CredentialState::Lost;
+    assert!(crate::certificate_inventory::operator_inventory(&forged).is_err());
+}
+
+#[test]
+fn inventory_refuses_a_truncated_snapshot_even_when_remaining_rows_verify() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let domain = domain();
+    let mut settings = settings(&domain);
+    settings
+        .trust
+        .as_mut()
+        .expect("trust")
+        .astra_credential_bindings = vec![
+        signed_binding(&domain, vec![1]),
+        signed_binding(&domain, vec![2]),
+    ];
+    let path = directory.path().join("trust.json");
+    let store = open_or_seed(&path, &settings, &bundle(&domain)).expect("seed");
+    let mut state = store.state().clone();
+    state
+        .credential_registry
+        .as_mut()
+        .expect("registry")
+        .bindings
+        .truncate(1);
+    assert!(crate::certificate_inventory::operator_inventory(&state).is_err());
+}
+
+#[test]
+fn an_oversized_trust_file_is_refused_before_deserialization() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let path = directory.path().join("trust.json");
+    std::fs::File::create(&path)
+        .expect("file")
+        .set_len(crate::certificates::MAX_TRUST_STORE_BYTES + 1)
+        .expect("sparse file");
+    assert!(matches!(crate::certificates::TrustStore::load(&path),
+        Err(crate::certificates::TrustError::Corrupt(reason)) if reason.contains("size bound")));
+}

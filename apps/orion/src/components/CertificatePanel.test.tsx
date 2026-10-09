@@ -291,3 +291,33 @@ describe('CertificatePanel', () => {
     expect(container.firstChild).toBeNull()
   })
 })
+
+
+describe('operator credential inventory', () => {
+  it('shows only verified fingerprints and the three credential states', () => {
+    render(<CertificatePanel identityName="" inventory={inventory({
+      operator_credentials: {
+        registry_epoch: 4,
+        detail: 'verified',
+        credentials: [
+          { fingerprint: 'a'.repeat(64), state: 'active', credential_epoch: 1, created_at: 0 },
+          { fingerprint: 'b'.repeat(64), state: 'lost', credential_epoch: 2, created_at: 0 },
+          { fingerprint: 'c'.repeat(64), state: 'revoked', credential_epoch: 3, created_at: 0 },
+        ],
+      },
+    })} />)
+    expect(screen.getByText('registre époque 4')).toBeTruthy()
+    expect(screen.getByText('aaaaaaaaaaaa')).toBeTruthy()
+    expect(screen.getByText('active · époque 1')).toBeTruthy()
+    expect(screen.getByText('perdue · époque 2')).toBeTruthy()
+    expect(screen.getByText('révoquée · époque 3')).toBeTruthy()
+  })
+
+  it('does not show rows when only the registry epoch is held', () => {
+    render(<CertificatePanel identityName="" inventory={inventory({
+      operator_credentials: { registry_epoch: 4, detail: 'epoch_only', credentials: [] },
+    })} />)
+    expect(screen.getByText('registre époque 4')).toBeTruthy()
+    expect(screen.queryByText(/active · époque/)).toBeNull()
+  })
+})

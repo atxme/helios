@@ -598,6 +598,41 @@ fn a_revocation_dominates_a_later_active_decision() {
 }
 
 #[test]
+fn a_revoked_decision_can_be_retained_in_a_later_registry_without_revival() {
+    let ca = key();
+    let credential = Credential::generate();
+    let revoked = binding(&ca, &credential, CredentialState::Revoked);
+    revoked
+        .supersedes(Some(&revoked))
+        .expect("identical decision");
+    let mut later = revoked.clone();
+    later.credential_registry_epoch += 1;
+    let later = later.sign(&ca.private).expect("sign");
+    later
+        .verify(
+            &ca.public,
+            &domain(),
+            &gateway(),
+            1,
+            revoked.credential_registry_epoch,
+        )
+        .expect("signature");
+    later
+        .supersedes(Some(&revoked))
+        .expect("retained revocation");
+    assert_eq!(later.state, CredentialState::Revoked);
+    assert_eq!(later.credential_epoch, revoked.credential_epoch);
+    for state in [CredentialState::Active, CredentialState::Lost] {
+        let mut restored = later.clone();
+        restored.state = state;
+        assert!(matches!(
+            restored.supersedes(Some(&revoked)),
+            Err(CertificateError::Revoked)
+        ));
+    }
+}
+
+#[test]
 fn a_registry_cannot_claim_an_epoch_its_signed_rows_do_not_carry() {
     let fixture = fixture();
     let mut registry = CredentialRegistry {
