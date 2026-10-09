@@ -24,6 +24,9 @@ export function useHelios() {
   const wsRef = useRef<WebSocket | null>(null)
   const reconnectRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const backoffRef = useRef(1000)
+  // Set on unmount so that a socket closing afterwards cannot schedule a
+  // reconnection behind the hook's back.
+  const stoppedRef = useRef(false)
 
   const pushEvent = useCallback((event: DisplayEvent) => {
     const ts = new Date().toLocaleTimeString('fr-FR', {
@@ -41,18 +44,29 @@ export function useHelios() {
   }, [])
 
   const connectWebSocket = useCallback(() => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) return
+    if (stoppedRef.current) return
+    const readyState = wsRef.current?.readyState
+    if (readyState === WebSocket.OPEN || readyState === WebSocket.CONNECTING) return
+    if (reconnectRef.current) {
+      clearTimeout(reconnectRef.current)
+      reconnectRef.current = null
+    }
     setWsStatus('connecting')
 
     const ws = createWebSocket()
     wsRef.current = ws
+    // Events from a socket that is no longer the current one (replaced, or
+    // closed on unmount) must not touch state nor schedule a reconnection.
+    const isCurrent = () => !stoppedRef.current && wsRef.current === ws
 
     ws.onopen = () => {
+      if (!isCurrent()) return
       setWsStatus('connected')
       backoffRef.current = 1000
     }
 
     ws.onmessage = (message: MessageEvent) => {
+      if (!isCurrent()) return
       const event: HeliosEvent = JSON.parse(message.data as string)
       if (event.type === 'state_changed') {
         setStatus(current => current ? { ...current, state: event.state } : current)
@@ -77,20 +91,33 @@ export function useHelios() {
     }
 
     ws.onclose = () => {
+      if (!isCurrent()) return
+      wsRef.current = null
       setWsStatus('disconnected')
       const delay = Math.min(backoffRef.current, 30_000)
       backoffRef.current = delay * 2
-      reconnectRef.current = setTimeout(connectWebSocket, delay)
+      reconnectRef.current = setTimeout(() => {
+        reconnectRef.current = null
+        connectWebSocket()
+      }, delay)
     }
     ws.onerror = () => ws.close()
   }, [pushEvent])
 
   useEffect(() => {
     refresh().catch(() => setError('Impossible de joindre heliosd sur son adresse d’administration'))
+    stoppedRef.current = false
     connectWebSocket()
     return () => {
-      if (reconnectRef.current) clearTimeout(reconnectRef.current)
+      stoppedRef.current = true
+      if (reconnectRef.current) {
+        clearTimeout(reconnectRef.current)
+        reconnectRef.current = null
+      }
+      // Closing a socket still in CONNECTING aborts the handshake; its close
+      // event is then ignored by the guard above.
       wsRef.current?.close()
+      wsRef.current = null
     }
   }, [connectWebSocket, refresh])
 

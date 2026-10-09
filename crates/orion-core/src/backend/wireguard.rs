@@ -684,7 +684,8 @@ impl VpnBackend for WireGuardBackend {
             // are silently dropped: the handshake and short requests get
             // through, only large ones disappear. A client interface only
             // carries one peer, so its MTU can hug the real path.
-            mtu: crate::mtu::mtu_transport().map(aether::mtu::tunnel_mtu),
+            mtu: crate::mtu::mtu_transport(peer.endpoint.map(|e| e.ip()), &self.ifname)
+                .map(aether::mtu::tunnel_mtu),
             fwmark: None,
         };
 
