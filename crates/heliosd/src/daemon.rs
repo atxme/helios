@@ -52,6 +52,7 @@ pub(crate) async fn run(
     // The uplink, before any ruleset is built: every egress rule and the
     // masquerade are bound to this name, and resolving it later would mean
     // building the kill-switch around an interface we had not chosen yet.
+    let wan_auto = network.wan_iface_is_auto();
     resolve_uplink(&mut network)?;
     // Once the uplink names are known, since the policy is built from them,
     // and still before the TPM unseal and any networking.
@@ -441,6 +442,7 @@ pub(crate) async fn run(
         ipv6,
         boot,
         api_ready,
+        wan_auto,
     )
     .await;
     raw_speedtest_shutdown.store(true, Ordering::Release);

@@ -71,10 +71,13 @@ mod observation;
 mod probes;
 mod reload;
 mod telemetry;
+mod uplinks;
 
 // What `run`, the sibling modules and the tests name of each other, through
 // `use super::*`.
-use self::{commands::*, data_plane::*, observation::*, probes::*, reload::*, telemetry::*};
+use self::{
+    commands::*, data_plane::*, observation::*, probes::*, reload::*, telemetry::*, uplinks::*,
+};
 
 /// Logs **and** broadcasts: the event channel feeds the UI and
 /// `helios watch`, `tracing` feeds the console and journald.
@@ -143,6 +146,9 @@ pub async fn run(
     // through the API crate. Only the orchestrator can seal.
     boot: helios_tpm::BootDecision,
     api_ready: Arc<AtomicBool>,
+    // `wan_iface = "auto"` in the file: the list in `shared_network` is then
+    // the kernel's, and keeps following it (`uplinks`).
+    wan_auto: bool,
 ) -> anyhow::Result<()> {
     let mut policy = shared_network.read().await.firewall_policy();
     sync_policy(&shared_policy, &policy).await;
@@ -217,6 +223,11 @@ pub async fn run(
     // restart — and therefore spares cutting every connected client to admit
     // one more.
     spawn_network_config_watcher(Arc::clone(&shared_network), internal_tx.clone());
+
+    // 6. Uplinks plugged in or lost after startup, under `wan_iface = "auto"`.
+    if wan_auto {
+        spawn_uplink_watcher(Arc::clone(&shared_network), internal_tx.clone());
+    }
 
     // 4. Main loop: UI commands, internal results, or shutdown signal.
     let state_str = shared_state.read().await.as_str();
@@ -339,6 +350,16 @@ pub async fn run(
                             fw.as_ref(), &mut policy, &internal_tx, &shared_policy, &boot,
                             &shared_ipv6,
                         ).await?;
+                    }
+                    // The kernel's uplinks moved under `wan_iface = "auto"`.
+                    // Here, in the loop, so the check against the running list
+                    // and the firewall transaction cannot interleave with a
+                    // reload.
+                    Some(OrchestratorCmd::RefreshWanIfaces { previous, next }) => {
+                        refresh_wan_ifaces(
+                            previous, next, &shared_network, &shared_state, &event_tx,
+                            fw.as_ref(), &mut policy, &shared_policy,
+                        ).await;
                     }
                     _ => {}
                 }

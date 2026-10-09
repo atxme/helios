@@ -34,14 +34,13 @@
 //! the firewall permits in full would change nothing at all, and the operator's
 //! lever is the metric.
 //!
-//! # Limite connue : l'ensemble ne suit pas un câble branché après coup
+//! # After startup
 //!
-//! Il est établi une fois, au démarrage. Un lien déjà présent qui perd puis
-//! retrouve sa porteuse continue de fonctionner — sa règle est là — mais une
-//! interface **apparue** depuis le démarrage n'est pas permise, et brancher un
-//! adaptateur USB demande `systemctl restart heliosd`. Reconstruire le ruleset
-//! sur un événement netlink ferait changer le kill-switch sous les clients
-//! connectés.
+//! The same selection is re-run every two seconds by the orchestrator's
+//! uplink watcher (`orchestrator::uplinks`): an interface that gains or loses
+//! its carrier, or an adapter plugged in later, enters or leaves the set, and
+//! the whole ruleset is rebuilt in one atomic transaction — the hot-reload
+//! path, never an incremental edit.
 
 use std::collections::BTreeMap;
 use std::path::Path;

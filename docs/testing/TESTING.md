@@ -359,6 +359,15 @@ Valider avec accès console :
   Vérifier aussi qu'après une relecture à chaud de `network.toml` le ruleset
   porte toujours la liste résolue et non `auto` ; et qu'un lien sans bail est
   bien permis, sinon son DHCP ne passerait jamais.
+  Suivi après le démarrage (`orchestrator::uplinks`) : démarrer câble
+  débranché, puis le brancher — en moins de quelques secondes, `nft list
+  ruleset` doit nommer l'interface et le journal porter « WAN interfaces
+  updated from the kernel ». Même chose en branchant un adaptateur USB, puis en
+  le retirant : il doit disparaître du ruleset. Pendant ces reconstructions, un
+  client connecté par l'autre lien ne doit perdre ni le tunnel ni ses
+  connexions établies. La décision et l'application atomique sont éprouvées
+  hors noyau ; la transaction nftables réelle et l'absence de coupure ne
+  s'établissent que sur cible.
   La sortie inverse — un désaccord métrique — se force en abaissant la métrique
   Wi-Fi sous celle du filaire : les deux restent permis, seul l'ordre et
   l'avertissement changent.

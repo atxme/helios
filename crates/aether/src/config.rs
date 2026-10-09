@@ -782,9 +782,10 @@ impl NetworkConfig {
     /// and the resolved name is not written back. Letting the marker through a
     /// reload would rebuild the ruleset around an interface literally named
     /// `auto` — every egress rule and the masquerade bound to a device that
-    /// does not exist, which is a gateway that drops its own traffic. The name
-    /// is also one of the values that cannot change under a running data
-    /// plane, so re-resolving here would be wrong even if it worked.
+    /// does not exist, which is a gateway that drops its own traffic. Nor is it
+    /// re-resolved here: the daemon's uplink watcher owns following the
+    /// kernel, through the orchestrator, and the list adopted is the one it
+    /// last applied.
     ///
     /// Everything else — the peer list itself, addresses, flags, ports —
     /// comes from the incoming configuration. That is the point: this is how
@@ -1312,8 +1313,9 @@ impl NetworkConfig {
 
     /// Projects the network config onto the declarative firewall policy.
     /// Mode always `fail-closed` — non-configurable security invariant.
-    /// Asks the daemon to pick the uplink from the kernel, preferring a wired
-    /// link. Resolved once at startup; see `heliosd::uplink`.
+    /// Asks the daemon to pick the uplinks from the kernel, preferring a wired
+    /// link. Resolved at startup, then kept in step with the kernel; see
+    /// `heliosd::uplink`.
     pub const WAN_IFACE_AUTO: &'static str = "auto";
 
     /// Whether the daemon is asked to enumerate the uplinks itself.

@@ -82,6 +82,16 @@ pub enum OrchestratorCmd {
     /// Reloads the network configuration hot (without restarting the daemon).
     /// Boxed: `NetworkConfig` is far larger than the other variants.
     LoadNetworkConfig(Box<NetworkConfig>),
+    /// The kernel's set of usable uplinks moved under `wan_iface = "auto"`
+    /// (**internal use**, emitted by the uplink watcher, never by the API).
+    ///
+    /// Applied only if the running list is still `previous`: a reload or an
+    /// API mutation that changed it in the meantime wins, and the refresh is
+    /// dropped rather than written over it.
+    RefreshWanIfaces {
+        previous: Vec<String>,
+        next: Vec<String>,
+    },
 }
 
 /// Request to install a post-quantum PSK on a data plane peer, emitted by
