@@ -82,13 +82,19 @@ un **contrat à finir d'implémenter**, pas une description du système.
 >   fournisseur, un refus ferme quand il échoue, et la bannière de démarrage que
 >   ce paragraphe exige. La source est `aws_lc_rs::rand::SystemRandom` — le
 >   `RAND_bytes` d'AWS-LC déjà employé pour AES-GCM, HKDF et HMAC : CTR-DRBG-AES-256
->   avec DF, état par thread, reseed toutes les 4096 générations, et
+>   sans DF, avec un seed de pleine entropie, état par thread, reseed toutes
+>   les 4096 générations, et
 >   réinstanciation avant toute sortie après fork ou reprise d'instantané, ce
 >   qui est précisément pourquoi le module n'a pas de détection de fork à lui.
 >   La validation CAVP/ACVP est hors périmètre et rien ne la revendique.
->   Reste ouverte la **résistance à la prédiction par appel**, présente dans
->   l'API C d'AWS-LC mais absente du binding Rust ; la réaliser au-dessus
->   reviendrait à détenir ici l'état DRBG que ce même paragraphe interdit ;
+>   L'adaptation native appelle `RAND_bytes_with_user_prediction_resistance`
+>   via `aws-lc-sys` avec 32 octets du DRBG public séparé. Ce matériau est
+>   injecté comme donnée additionnelle ; l'appel ne force pas un reseed avec
+>   entropie fraîche. La **résistance à la prédiction par appel** et le reseed
+>   avant chaque clé privée exigé par §4.3 restent donc une limite connue.
+>   La bannière ne revendique pas cette garantie. La levée exige une API du
+>   fournisseur qui la garantisse aussi pour ses clés internes ML-KEM/TLS,
+>   sans état DRBG applicatif ;
 >
 >   **Migration** : le `ctx` entre dans la vérification, donc tout certificat PQ
 >   émis avant ce changement cesse de vérifier. Un parc existant se ré-émet

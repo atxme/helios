@@ -3038,14 +3038,20 @@ contournés :
   un refus ferme quand il échoue, un faux fournisseur déterministe sous
   `cfg(test)` seulement, et la bannière de démarrage exigée par §2.3.2.
   La source est `aws_lc_rs::rand::SystemRandom` — le `RAND_bytes` d'AWS-LC déjà
-  employé pour AES-GCM, HKDF et HMAC : CTR-DRBG-AES-256 avec DF, état par
-  thread, reseed toutes les 4096 générations et réinstanciation avant toute
-  sortie après fork ou reprise d'instantané. La validation CAVP/ACVP est hors
+  employé pour AES-GCM, HKDF et HMAC : CTR-DRBG-AES-256 sans DF, avec un seed
+  de pleine entropie, état par thread, reseed toutes les 4096 générations et
+  réinstanciation avant toute sortie après fork ou reprise d'instantané.
+  La validation CAVP/ACVP est hors
   périmètre et rien ne la revendique.
-  La **résistance à la prédiction par appel** des tirages secrets passe par
-  l'API native AWS-LC `RAND_bytes_with_user_prediction_resistance`, alimentée
-  par les 32 octets du DRBG public séparé d'AWS-LC ; l'adaptation ne détient
-  aucun état DRBG. `astra_policy_fingerprint`, le RP ID et l'époque du registre
+  Les tirages secrets appellent l'API native AWS-LC
+  `RAND_bytes_with_user_prediction_resistance`, alimentée par les 32 octets
+  du DRBG public séparé ; l'adaptation ne détient aucun état DRBG. Cet apport
+  est une donnée additionnelle, pas un reseed avec entropie fraîche.
+  **Limite connue** : la garantie de résistance à la prédiction par appel et
+  le reseed avant chaque clé privée exigé par §2.3.2 restent non satisfaits.
+  La bannière ne les revendique pas ; leur levée exige une API fournisseur
+  garantissant le reseed, y compris pour ses clés internes ML-KEM/TLS.
+  `astra_policy_fingerprint`, le RP ID et l'époque du registre
   de credentials sont présents dans le profil et dans son manifeste scellé.
   Les jetons de capacité HKDF/HMAC sont livrés. Aucun de ces contrôles ne peut être remplacé par le seul préfixe du
   message, une signature `CA-PQ`, un UUID, un filtre de valeurs nulles ou un
