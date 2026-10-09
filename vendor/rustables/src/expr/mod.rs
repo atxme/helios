@@ -30,6 +30,12 @@ pub use self::immediate::*;
 mod exthdr;
 pub use self::exthdr::*;
 
+mod objref;
+pub use self::objref::*;
+
+mod fib;
+pub use self::fib::*;
+
 mod log;
 pub use self::log::*;
 
@@ -177,6 +183,8 @@ create_expr_variant!(
     [Counter, Counter],
     [ExpressionRaw, ExpressionRaw],
     [Exthdr, Exthdr],
+    [Objref, Objref],
+    [Fib, Fib],
     [Immediate, Immediate],
     [Log, Log],
     [Lookup, Lookup],

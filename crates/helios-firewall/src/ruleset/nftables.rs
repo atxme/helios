@@ -20,6 +20,38 @@ pub enum AddressFamily {
     Ipv6,
 }
 
+/// ICMPv4 messages a typed match can select. Redirect is deliberately absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Icmpv4Type {
+    EchoReply,
+    DestinationUnreachable,
+    EchoRequest,
+    TimeExceeded,
+    ParameterProblem,
+}
+
+impl Icmpv4Type {
+    pub const fn number(self) -> u8 {
+        match self {
+            Self::EchoReply => 0,
+            Self::DestinationUnreachable => 3,
+            Self::EchoRequest => 8,
+            Self::TimeExceeded => 11,
+            Self::ParameterProblem => 12,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::EchoReply => "echo-reply",
+            Self::DestinationUnreachable => "destination-unreachable",
+            Self::EchoRequest => "echo-request",
+            Self::TimeExceeded => "time-exceeded",
+            Self::ParameterProblem => "parameter-problem",
+        }
+    }
+}
+
 /// ICMPv6 messages a typed match can select.
 ///
 /// Only the messages Helios opens are listed: a type that is not here cannot
@@ -27,8 +59,7 @@ pub enum AddressFamily {
 /// representable at all, rather than merely absent from the renderer. Adding
 /// a message is a deliberate change of this enum, reviewed as such.
 ///
-/// ICMPv4 has no typed counterpart. Helios matches it by protocol only, see
-/// [`Match::Icmp`].
+/// ICMPv4 uses [`Icmpv4Type`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Icmpv6Type {
     /// Multicast Listener Query (130, RFC 2710 / RFC 3810).
@@ -200,9 +231,7 @@ pub enum Counter {
     Anonymous,
     /// Counter state lives in a separately named nftables object.
     ///
-    /// The IR can preserve the operator-facing identity, but the current
-    /// Netlink adapter rejects this variant because `rustables 0.8.8` cannot
-    /// create or reference named counter objects.
+    /// The object is created once before any rule references it, in the same batch.
     Named(String),
 }
 
@@ -313,16 +342,14 @@ pub enum Match {
     SourceNet(IpNetwork),
     /// `meta l4proto icmp` or `meta l4proto ipv6-icmp`.
     ///
-    /// # Known limitation: ICMPv4 type is not discriminated
-    ///
-    /// The match covers the protocol, not a narrower type such as
-    /// `echo-request`. ICMPv6 has a typed match, [`Match::Icmpv6Type`],
-    /// because the high-level `rustables` API exposes the ICMPv6 type octet;
-    /// it has no ICMPv4 payload field for it. The ICMPv4 widening remains
-    /// interface-scoped, so only peers already admitted by WireGuard can reach
-    /// the tunnel rule. Typing ICMPv4 messages requires a checked
-    /// payload-expression encoder for that family, which Helios does not have.
+    /// Both families also have explicit typed message matches.
     Icmp(AddressFamily),
+    /// `icmp type <type>`, guarded by the IPv4 family and ICMP protocol.
+    Icmpv4Type(Icmpv4Type),
+    /// `fib saddr . [mark .] iif oif exists/missing`.
+    /// Only input/forward chains are valid. Policies must scope this to an
+    /// explicitly selected ingress interface and decide whether marks apply.
+    FibSourceRoute { use_mark: bool, present: bool },
     /// `icmpv6 type <type>`.
     ///
     /// Selects ICMPv6 by `meta l4proto ipv6-icmp`, then compares the type
@@ -383,6 +410,13 @@ impl fmt::Display for Match {
             ),
             Match::Icmp(AddressFamily::Ipv4) => write!(f, "meta l4proto icmp"),
             Match::Icmp(AddressFamily::Ipv6) => write!(f, "meta l4proto ipv6-icmp"),
+            Match::Icmpv4Type(icmp_type) => write!(f, "icmp type {}", icmp_type.as_str()),
+            Match::FibSourceRoute { use_mark, present } => write!(
+                f,
+                "fib saddr . {}iif oif {}",
+                if *use_mark { "mark . " } else { "" },
+                if *present { "exists" } else { "missing" }
+            ),
             Match::Icmpv6Type(icmp_type) => write!(f, "icmpv6 type {}", icmp_type.as_str()),
             Match::Ipv6HopLimit(hop_limit) => write!(f, "ip6 hoplimit {hop_limit}"),
             Match::PacketMark(mark) => write!(f, "meta mark {mark:#x}"),
@@ -439,7 +473,7 @@ impl fmt::Display for Rule {
         for action in &self.actions {
             match action {
                 Action::Counter(Counter::Anonymous) => write!(f, "counter ")?,
-                Action::Counter(Counter::Named(name)) => write!(f, "counter name \"{name}\" ")?,
+                Action::Counter(Counter::Named(name)) => write!(f, "counter name {name:?} ")?,
                 Action::Log(LogAction { prefix, group }) => {
                     write!(f, "log prefix \"{prefix}\"")?;
                     if let Some(group) = group {

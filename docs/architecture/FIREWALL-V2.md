@@ -370,15 +370,15 @@ séquence exacte des expressions d’une règle NS.
 | rate limiting | **BLOCKED BY BACKEND** | IR complète ; `rustables 0.8.8` n’expose pas `limit`, donc traduction refusée |
 | logging | **PARTIAL** | IR et expression Netlink disponibles ; aucune policy active sans limite anti-flood |
 | compteurs inline | **SUPPORTED** | appliqués sur les drops invalides |
-| compteurs nommés | **BLOCKED BY BACKEND** | identité conservée dans l’IR ; pas d’objet compteur ni `objref` dans `rustables` |
+| compteurs nommés | **SUPPORTED** | objets `counter` dédupliqués et créés avant les références `objref`, dans le même batch atomique ; état remis à zéro lors du remplacement du ruleset |
 | ICMPv4 | **SUPPORTED** | famille explicite, règle tunnel et Meshnet, protocole Netlink 1 |
 | ICMPv6 | **SUPPORTED** | famille explicite, règle tunnel et Meshnet (pair IPv6, politique construite dans le code), protocole Netlink 58 ; pas d’IPAM IPv6 ajouté |
 | types ICMPv6 | **SUPPORTED** | `Match::Icmpv6Type`, énumération fermée (ND, RS/RA, MLD) ; `Meta(L4Proto)` + `Cmp` 58, `Payload` transport offset 0 longueur 1 + `Cmp` |
-| types ICMPv4 | **PARTIAL** | protocole seulement ; l’API haut niveau de `rustables` n’expose pas l’octet de type ICMPv4 et aucun encodeur vérifié n’existe |
+| types ICMPv4 | **SUPPORTED** | `Match::Icmpv4Type`, enum fermée sans Redirect ; garde IPv4, protocole ICMP et octet de type à l’offset transport 0 |
 | hop limit IPv6 | **SUPPORTED** | `Match::Ipv6HopLimit`, garde `Meta(NfProto)` + `Cmp` 10 puis `Payload` réseau offset 7 longueur 1 + `Cmp` |
 | adresses IPv4/IPv6 | **SUPPORTED** | `SourceNet`/`DestNet` portent des `IpNetwork` validés ; le backend n’analyse plus de texte |
 | MSS clamp | **SUPPORTED** | Chaîne `forward` de type `filter`, priorité `mangle` (−150), sans verdict ; règles TCP SYN et SYN-ACK bornées à `iifname` ou `oifname` du tunnel ; MSS IPv4 puis IPv6 (−20), cette dernière absente si la MTU est sous 1280 ; une même transaction atomique que le filtre ; le noyau refuse toute augmentation et recalcule la somme TCP |
-| anti-spoof `fib` | **BLOCKED BY BACKEND** | expression absente et sémantique de routage à borner avant activation |
+| anti-spoof `fib` | **PARTIAL** | encodeur et IR `FibSourceRoute` livrés : interface entrante obligatoire, chaînes input/forward seulement, choix explicite des marques ; activation d’une politique WAN soumise aux conditions ci-dessous |
 | garde de famille `meta nfproto` | **SUPPORTED** | `Match::Family`, `Meta(NfProto)` + `Cmp` 2 ou 10, la même paire que `rustables` émet devant une adresse |
 | NAT/masquerade | **SUPPORTED** | IPv4 seulement (`meta nfproto ipv4`), aucun NAT66 ; uplinks et conditions d’état inchangés, dans la transaction atomique |
 | rejet `icmpx admin-prohibited` | **SUPPORTED** | `Verdict::RejectAdminProhibited`, seule forme de rejet représentable ; expression `Reject` (`IcmpxUnreach`, `AdminProhibited`) sans verdict après elle, octets vérifiés ; utilisé pour la sortie IPv6 des clients du tunnel |
@@ -396,7 +396,7 @@ typée `exthdr` et le champ TCP `Flags`, enregistrés avec les autres expression
 pour rester dans le même `Batch` atomique. Le patch ne change ni la socket ni le
 transport Netlink.
 
-Elle ne modélise pas :
+La version amont ne modélise pas :
 
 - `limit`, nécessaire au rate limiting et au logging borné ;
 - `fib`, nécessaire à un anti-spoof fondé sur le routage ;
@@ -404,6 +404,11 @@ Elle ne modélise pas :
 
 Les constantes UAPI seules ne suffisent pas à encoder une expression :
 l’encodeur doit aussi produire les attributs Netlink typés.
+
+Le patch Helios ajoute aussi les objets compteurs nommés, `objref` et le test FIB
+d’existence d’une route source, avec ou sans marque. Les tests inspectent les
+attributs sérialisés, l’ordre objets/règles, la déduplication et les refus avant
+envoi. La politique existante continue à utiliser des compteurs inline.
 
 Le patch vendored est nécessaire car `Batch` ne publie ni son buffer ni son
 écrivain, `RawExpression` ne permet pas de choisir un nom d’expression et le
@@ -430,8 +435,9 @@ ordre de proximité avec l’existant :
 La génération de commandes `nft`, le reparsing de texte et l’API JSON pilotée
 par un processus externe ne sont pas des solutions acceptées pour Helios.
 
-`fib` reste différé par sa sémantique multi-uplink/policy-routing et les
-compteurs inline couvrent le besoin actuel sans `objref`. Le MSS clamp reste
+L’activation de `fib` reste différée par sa sémantique multi-uplink/policy-routing.
+Son encodeur est disponible ; les compteurs nommés et `objref` sont également
+encodés, même si les compteurs inline couvrent la politique actuelle. Le MSS clamp reste
 une optimisation de performance ; son application est maintenant disponible
 pour les SYN/SYN-ACK qui traversent l’interface WireGuard seulement.
 
@@ -448,7 +454,7 @@ L’activation exige au minimum :
 - une décision documentée sur les marques et tables de policy routing ;
 - des essais de retour asymétrique et de bascule multi-uplink ;
 - des essais WireGuard, Meshnet et Tailscale sur la cible ;
-- une expression `fib` réellement encodée par le backend.
+- l’encodeur `fib` livré, vérifié sur le noyau de la cible.
 
 Tant que ces conditions ne sont pas réunies, différer la règle évite une
 régression de disponibilité sans prétendre fournir une protection absente.
@@ -610,7 +616,8 @@ la sortie Internet IPv6 reste appliqué par le filtre (SORTIE-IPV6).
 
 ### Capacités non encodables
 
-Le rate limiting, les compteurs nommés et l’anti-spoof `fib` restent refusés
-avant envoi par le backend. Le logging est encodable, mais
+Le backend refuse le rate limiting avant tout envoi. Les compteurs nommés et
+les matches FIB sont encodables ; aucune politique générale anti-spoof n’est
+activée. Le logging est encodable, mais
 aucune policy de production ne l’active avant de disposer d’un rate limit qui
 empêche le log flood.
