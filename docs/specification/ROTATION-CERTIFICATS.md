@@ -3451,12 +3451,21 @@ contournés :
   silencieusement la cérémonie supprimée.
   La section opérateur affiche aussi l'époque du registre de credentials portée
   par le profil et la disponibilité de la récupération, avec le motif canonique
-  de son indisponibilité. **Limite connue** : Orion ne persiste encore aucun
-  registre `CredentialRegistry` vérifié ; il dit donc que le détail n'est pas
-  détenu au lieu d'inventer une liste ou de la récupérer au rendu. Lever cette
-  limite exige de conserver le registre seulement après vérification sous le
-  `CA-PQ` épinglé, avec une taille bornée et un refus de toute régression
-  d'époque.
+  de son indisponibilité. Orion conserve désormais le `CredentialRegistry`
+  vérifié dans le magasin de confiance et affiche les empreintes stables,
+  états et époques des credentials, sans identifiant brut ni clé COSE.
+  Le snapshot est reconstruit à l'enrôlement uniquement lorsque toutes les
+  liaisons appartiennent à l'ancre et à l'époque courantes ; signatures,
+  doublons et limite de 64 liaisons sont vérifiés. L'installation d'un registre
+  conserve les décisions terminales (une ligne révoquée peut être reprise dans
+  un snapshot ultérieur, jamais restaurée active ou perdue), refuse les
+  régressions, l’omission d’une liaison conservée et les conflits
+  de même époque et persiste avant adoption. Un ancien magasin sans ce seul
+  champ est migré depuis ses liaisons vérifiées, sans modifier ses compteurs
+  ni ses tombstones. Un snapshot absent ou historique ne produit jamais une
+  liste vide présentée comme le registre du domaine : l'IHM affiche l'époque
+  seule et nomme un snapshot illisible ou périmé. Le fichier de confiance est
+  borné à 8 Mio avant désérialisation. L'inventaire reste une lecture locale.
   Côté console Helios, `CertificateDomainPanel` montre le
   domaine — gateway, CA, émetteur délégué, synthèse du parc — et
   `GatewayIdentityActions` **agit** sur les gestes que cette gateway possède :

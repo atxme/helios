@@ -115,6 +115,8 @@ pub enum DecodeError {
 
 #[derive(thiserror::Error, Debug)]
 pub enum BuilderError {
+    #[error("The object name must contain 1 to 255 bytes and no NUL")]
+    InvalidObjectName,
     #[error("The length of the arguments are not compatible with each other")]
     IncompatibleLength,
 

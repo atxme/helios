@@ -303,6 +303,20 @@ export function CertificatePanel({
               </Typography>
             </Box>
           )}
+          {inventory.operator_credentials?.detail === 'verified' &&
+            inventory.operator_credentials.credentials.map((credential) => (
+              <Box key={credential.fingerprint} sx={{ display: 'flex', alignItems: 'baseline', gap: 1, minWidth: 0, pl: '118px' }}>
+                <Tooltip title={credential.fingerprint}>
+                  <Typography noWrap color="text.secondary" sx={{ fontFamily: 'monospace', fontSize: 11 }}>
+                    {credential.fingerprint.slice(0, 12)}
+                  </Typography>
+                </Tooltip>
+                <Typography color={credential.state === 'active' ? 'text.primary' : 'text.disabled'} sx={{ fontSize: 11 }}>
+                  {credential.state === 'active' ? 'active' : credential.state === 'lost' ? 'perdue' : 'révoquée'}
+                  {' · '}époque {credential.credential_epoch}
+                </Typography>
+              </Box>
+            ))}
           {recovery && (
             <>
               <Box sx={{ display: 'flex', alignItems: 'baseline', gap: 1, minWidth: 0 }}>

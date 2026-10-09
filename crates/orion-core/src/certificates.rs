@@ -20,23 +20,18 @@
 //! verifies the whole ordered set first and commits it with a single write;
 //! a failure anywhere leaves the live state untouched.
 //!
-//! # Limite connue : pas de migration de format
+//! # Persistence compatibility
 //!
-//! [`TrustState`] carries `deny_unknown_fields`, and the shape of its bounded
-//! state has changed inside this lot — `ledger` replaced two flat fields, and
-//! the committed-stage record grew. There is deliberately **no** migration
-//! path, for one reason: nothing outside tests has ever written this file.
-//! `TrustStore` is constructed by the tests and by nothing that ships, so no
-//! instance of an earlier shape can exist on any disk.
-//!
-//! That is a fact about today, not a design choice to keep. Once a released
-//! Orion writes a trust store, the format is frozen and any later change needs
-//! an explicit migration with fixtures of the previous version. Until then the
-//! behaviour is the correct one for a bounded security state: an unreadable
-//! document fails loudly as [`TrustError::Corrupt`] rather than deserializing
-//! into a store that silently dropped the revocations it could not parse.
+//! The previous shape omitted only the optional retained credential registry.
+//! Loading it preserves all mandatory counters, slots and revocation tombstones.
+//! Opening it through the renewal path reconstructs a registry only from rows
+//! verified under the existing pinned anchor and current registry epoch.
+//! Older shapes missing security state are refused as [`TrustError::Corrupt`].
 
-use std::path::{Path, PathBuf};
+use std::{
+    io::Read,
+    path::{Path, PathBuf},
+};
 
 use aether::certificates::{
     client::{ClientCertificateGeneration, ClientCertificateRotationGrant},
@@ -56,10 +51,17 @@ use aether::certificates::{
 };
 use serde::{Deserialize, Serialize};
 
+/// Bound on a trust file, including slots, retained registry and tombstones.
+pub const MAX_TRUST_STORE_BYTES: u64 = 8 * 1024 * 1024;
+
 /// Everything a `helios_key_negotiation` profile pins, in one place.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TrustState {
+    /// Verified public registry retained for inventory. Missing in the previous
+    /// on-disk shape; all authority counters and tombstones remain mandatory.
+    #[serde(default)]
+    pub credential_registry: Option<aether::certificates::approval::CredentialRegistry>,
     pub trust_domain_id: TrustDomainId,
     pub client_wg_public_key: WireGuardKey,
     pub gateway: GatewayCertificateState,
@@ -104,15 +106,77 @@ pub struct TrustStore {
 }
 
 impl TrustStore {
+    /// Retains an authenticated registry without losing any credential decision.
+    /// The complete change reaches disk before becoming visible in memory.
+    pub fn install_credential_registry(
+        &mut self,
+        registry: &aether::certificates::approval::CredentialRegistry,
+    ) -> Result<InstallOutcome, TrustError> {
+        let state = &self.state;
+        registry.verify(
+            &state.gateway.current_ca_public_key,
+            &state.trust_domain_id,
+            &state.gateway.gateway_wg_public_key,
+            state.gateway.ca_epoch,
+            state.astra.credential_registry_epoch,
+        )?;
+        if state
+            .astra
+            .credential_bindings
+            .values()
+            .any(|held| registry.binding(&held.credential_id).is_none())
+        {
+            return Err(CertificateError::InvalidCredentialBinding(
+                "registry omits a retained credential",
+            )
+            .into());
+        }
+        if state.credential_registry.as_ref() == Some(registry) {
+            return Ok(InstallOutcome::AlreadyPresent);
+        }
+        if let Some(held) = &state.credential_registry {
+            if held.ca_epoch == registry.ca_epoch
+                && held.credential_registry_epoch == registry.credential_registry_epoch
+            {
+                return Err(CertificateError::GenerationConflict {
+                    generation: registry.credential_registry_epoch,
+                }
+                .into());
+            }
+        }
+        let mut next = state.clone();
+        for binding in &registry.bindings {
+            next.astra.accept_credential_binding(binding)?;
+        }
+        next.credential_registry = Some(registry.clone());
+        self.write(&next)?;
+        self.state = next;
+        Ok(InstallOutcome::Installed)
+    }
+
     pub fn new(path: PathBuf, state: TrustState) -> Self {
         Self { path, state }
     }
 
     pub fn load(path: &Path) -> Result<Option<Self>, TrustError> {
-        match std::fs::read(path) {
-            Ok(raw) => {
+        match std::fs::File::open(path) {
+            Ok(file) => {
+                let mut raw = Vec::new();
+                file.take(MAX_TRUST_STORE_BYTES + 1).read_to_end(&mut raw)?;
+                if raw.len() as u64 > MAX_TRUST_STORE_BYTES {
+                    return Err(TrustError::Corrupt(
+                        "trust store exceeds its size bound".into(),
+                    ));
+                }
                 let state: TrustState = serde_json::from_slice(&raw)
                     .map_err(|error| TrustError::Corrupt(error.to_string()))?;
+                if let Some(registry) = &state.credential_registry {
+                    if registry.bindings.len()
+                        > aether::certificates::approval::MAX_CREDENTIAL_BINDINGS
+                    {
+                        return Err(CertificateError::TooManyObjects.into());
+                    }
+                }
                 Ok(Some(Self {
                     path: path.to_path_buf(),
                     state,
@@ -142,6 +206,11 @@ impl TrustStore {
     fn write(&self, state: &TrustState) -> Result<(), TrustError> {
         let encoded = serde_json::to_vec_pretty(state)
             .map_err(|error| TrustError::Corrupt(error.to_string()))?;
+        if encoded.len() as u64 > MAX_TRUST_STORE_BYTES {
+            return Err(TrustError::Corrupt(
+                "trust store exceeds its size bound".into(),
+            ));
+        }
         aether::private_file::write_private_atomic(&self.path, &encoded)?;
         Ok(())
     }

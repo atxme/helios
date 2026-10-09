@@ -18,17 +18,11 @@
 //!
 //! # Operator credentials
 //!
-//! The profile holds the highest `credential_registry_epoch` it accepted, but
-//! Orion does not persist the corresponding CA-PQ-signed registry. The
-//! inventory therefore reports that epoch and states that the rows are not
-//! held locally. It never fetches a registry just to draw a screen: listing
-//! operator keys would otherwise turn an authenticated trust decision into a
-//! claim made by whichever network endpoint answered last.
-//!
-//! Showing the rows later requires the trust store to retain a registry only
-//! after verifying it under the pinned CA-PQ, with the same bounded size and
-//! monotonic epoch checks as every other consumer. Until that persistence
-//! exists, an epoch-only inventory is the complete and honest local fact.
+//! The trust store retains the verified registry seeded from enrolment.
+//! Inventory rechecks its signatures, domain and epoch against the local
+//! anchors before projecting public fingerprints and credential states.
+//! Profiles and older stores without a complete snapshot report the epoch
+//! alone. No rendering operation fetches an authority or changes trust.
 //!
 //! # What a fault is, and what an absence is
 //!
@@ -80,12 +74,95 @@ pub struct CertificateFacts {
 pub struct OperatorCredentialInventory {
     pub registry_epoch: u64,
     pub detail: OperatorCredentialDetail,
+    #[serde(default)]
+    pub credentials: Vec<OperatorCredentialFacts>,
+}
+
+/// Public facts only; credential IDs, COSE keys and assertions stay internal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorCredentialFacts {
+    pub fingerprint: String,
+    pub state: aether::certificates::approval::CredentialState,
+    pub credential_epoch: u64,
+    pub created_at: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OperatorCredentialDetail {
     EpochOnly,
+    Verified,
+}
+
+fn epoch_inventory(epoch: u64) -> OperatorCredentialInventory {
+    OperatorCredentialInventory {
+        registry_epoch: epoch,
+        detail: OperatorCredentialDetail::EpochOnly,
+        credentials: Vec::new(),
+    }
+}
+
+fn verified_registry_inventory(
+    registry: &aether::certificates::approval::CredentialRegistry,
+) -> OperatorCredentialInventory {
+    let mut credentials: Vec<_> = registry
+        .bindings
+        .iter()
+        .map(|binding| OperatorCredentialFacts {
+            fingerprint: aether::certificates::encoding::Fingerprint::of(&binding.credential_id)
+                .to_hex(),
+            state: binding.state,
+            credential_epoch: binding.credential_epoch,
+            created_at: binding.created_at,
+        })
+        .collect();
+    credentials.sort_by(|left, right| left.fingerprint.cmp(&right.fingerprint));
+    OperatorCredentialInventory {
+        registry_epoch: registry.credential_registry_epoch,
+        detail: OperatorCredentialDetail::Verified,
+        credentials,
+    }
+}
+
+/// Reads the durable snapshot without trusting the clear registry header.
+pub fn operator_inventory(
+    state: &crate::certificates::TrustState,
+) -> Result<OperatorCredentialInventory, aether::certificates::CertificateError> {
+    let Some(registry) = &state.credential_registry else {
+        return Ok(epoch_inventory(state.astra.credential_registry_epoch));
+    };
+    registry.verify(
+        &state.gateway.current_ca_public_key,
+        &state.trust_domain_id,
+        &state.gateway.gateway_wg_public_key,
+        state.gateway.ca_epoch,
+        state.astra.credential_registry_epoch,
+    )?;
+    if registry.credential_registry_epoch != state.astra.credential_registry_epoch {
+        return Err(
+            aether::certificates::CertificateError::InvalidCredentialBinding(
+                "registry epoch differs from retained state",
+            ),
+        );
+    }
+    if registry.bindings.len() != state.astra.credential_bindings.len() {
+        return Err(
+            aether::certificates::CertificateError::InvalidCredentialBinding(
+                "registry omits retained decisions",
+            ),
+        );
+    }
+    for binding in &registry.bindings {
+        let key = aether::certificates::encoding::Fingerprint::of(&binding.credential_id).to_hex();
+        if state.astra.credential_bindings.get(&key) != Some(binding) {
+            return Err(
+                aether::certificates::CertificateError::InvalidCredentialBinding(
+                    "registry differs from retained decisions",
+                ),
+            );
+        }
+    }
+    Ok(verified_registry_inventory(registry))
 }
 
 impl CertificateFacts {
@@ -248,6 +325,12 @@ pub fn client_inventory(
     inventory.previous_identity = snapshot.previous;
     let bundle = snapshot.served;
 
+    if let Err(error) = retained_operator_inventory(settings, &bundle, inventory) {
+        inventory
+            .faults
+            .push(format!("registre opérateur : {error}"));
+    }
+
     match bundle
         .certificate_chain
         .first()
@@ -276,17 +359,52 @@ pub fn inventory(settings: Option<&KeyNegotiationSettings>, now_unix: u64) -> Ce
     let Some(settings) = settings else {
         return inventory;
     };
-    inventory.operator_credentials =
-        settings
-            .trust
-            .as_ref()
-            .map(|trust| OperatorCredentialInventory {
-                registry_epoch: trust.credential_registry_epoch,
-                detail: OperatorCredentialDetail::EpochOnly,
-            });
+    inventory.operator_credentials = settings
+        .trust
+        .as_ref()
+        .map(|trust| epoch_inventory(trust.credential_registry_epoch));
     gateway_inventory(settings, now_unix, &mut inventory);
     client_inventory(settings, now_unix, &mut inventory);
     inventory
+}
+
+fn retained_operator_inventory(
+    settings: &KeyNegotiationSettings,
+    bundle: &crate::identity_store::ClientIdentityBundle,
+    inventory: &mut CertificateInventory,
+) -> anyhow::Result<()> {
+    let Some(trust) = &settings.trust else {
+        return Ok(());
+    };
+    let domain = trust.trust_domain()?;
+    let leaf = crate::certificate_renewal::client_pq_leaf(bundle)?;
+    let client = aether::certificates::encoding::WireGuardKey::parse(&leaf.wireguard_public_key)?;
+    let path = crate::certificate_renewal::trust_store_path(&domain, &client)?;
+    let Some(store) = crate::certificates::TrustStore::load(&path)? else {
+        return Ok(());
+    };
+    let state = store.state();
+    let gateway = settings.gateway_pq_certificate()?;
+    let gateway_key =
+        aether::certificates::encoding::WireGuardKey::parse(&gateway.wireguard_public_key)?;
+    if state.trust_domain_id != domain
+        || state.client_wg_public_key != client
+        || state.gateway.gateway_wg_public_key != gateway_key
+    {
+        anyhow::bail!("le magasin de confiance appartient à une autre identité");
+    }
+    // The persisted epoch is authoritative, while an imported profile may
+    // still carry a newer floor. Neither can make the other move backwards.
+    let epoch = state
+        .astra
+        .credential_registry_epoch
+        .max(trust.credential_registry_epoch);
+    inventory.operator_credentials = Some(epoch_inventory(epoch));
+    if state.astra.credential_registry_epoch < epoch {
+        anyhow::bail!("le registre conservé est antérieur au profil");
+    }
+    inventory.operator_credentials = Some(operator_inventory(state)?);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -396,6 +514,7 @@ mod tests {
             Some(OperatorCredentialInventory {
                 registry_epoch: 12,
                 detail: OperatorCredentialDetail::EpochOnly,
+                credentials: Vec::new(),
             })
         );
     }

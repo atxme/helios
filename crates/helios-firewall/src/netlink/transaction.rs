@@ -12,7 +12,7 @@ use rustables::{
         Bitwise, Cmp, CmpOp, Exthdr, HighLevelPayload, Immediate, Masquerade, Meta, MetaType,
         Register, TransportHeaderField,
     },
-    Batch, Chain, ChainPolicy as NfChainPolicy, ChainType, Hook, HookClass, MsgType,
+    Batch, Chain, ChainPolicy as NfChainPolicy, ChainType, CounterObject, Hook, HookClass, MsgType,
     ProtocolFamily, Rule as NfRule, Table,
 };
 use tracing::{info, warn};
@@ -68,6 +68,22 @@ impl NetlinkBackend {
         // `Add` to start over from an empty table.
         for msg in Self::SEQUENCE_TABLE {
             batch.add(&table, msg);
+        }
+
+        let mut counters = std::collections::BTreeSet::new();
+        for rule in &rs.rules {
+            for action in &rule.actions {
+                if let crate::ruleset::Action::Counter(crate::ruleset::Counter::Named(name)) =
+                    action
+                {
+                    counters.insert(name.as_str());
+                }
+            }
+        }
+        for name in counters {
+            CounterObject::new(&table, name)
+                .map_err(Self::err)?
+                .add_to_batch(&mut batch);
         }
 
         let policy = match rs.default_verdict {
@@ -176,6 +192,16 @@ impl NetlinkBackend {
 
     /// Translates one port-expanded match set of `rule` into a filter rule.
     fn filter_rule(chain: &Chain, matches: &[Match], rule: &Rule) -> Result<NfRule> {
+        if matches
+            .iter()
+            .any(|m| matches!(m, Match::FibSourceRoute { .. }))
+            && (rule.chain == ChainKind::Output
+                || !matches.iter().any(|m| matches!(m, Match::InIface(_))))
+        {
+            return Err(Self::err(
+                "source FIB lookup requires an explicit input interface in an input/forward chain",
+            ));
+        }
         let mut nf = NfRule::new(chain).map_err(Self::err)?;
         for m in matches {
             nf = Self::apply_match(nf, m)?;
@@ -680,29 +706,6 @@ mod tests {
     }
 
     #[test]
-    fn named_counters_fail_translation_instead_of_becoming_anonymous() {
-        let ruleset = Ruleset {
-            default_verdict: DefaultVerdict::Drop,
-            rules: vec![crate::ruleset::Rule {
-                chain: ChainKind::Input,
-                matches: Vec::new(),
-                actions: vec![Action::Counter(Counter::Named("drop-invalid".into()))],
-                verdict: Verdict::Drop,
-                note: None,
-            }],
-            mss_clamp: None,
-            wg_iface: "helios0".into(),
-            masquerade_out: Vec::new(),
-        };
-
-        let error = match NetlinkBackend::new().build_batch(&ruleset) {
-            Ok(_) => panic!("a named counter must not be downgraded to an anonymous one"),
-            Err(error) => error.to_string(),
-        };
-        assert!(error.contains("named counter `drop-invalid`"));
-    }
-
-    #[test]
     fn invalid_log_prefix_fails_translation() {
         let ruleset = Ruleset {
             default_verdict: DefaultVerdict::Drop,
@@ -752,3 +755,7 @@ mod tests {
         assert!(error.contains("rate limit") && error.contains("rustables 0.8.8"));
     }
 }
+
+#[cfg(test)]
+#[path = "capabilities_tests.rs"]
+mod capabilities_tests;

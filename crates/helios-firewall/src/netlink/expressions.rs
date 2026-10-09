@@ -9,17 +9,18 @@ use aether::Result;
 use ipnetwork::IpNetwork;
 use rustables::{
     expr::{
-        Bitwise, Cmp, CmpOp, ConnTrackState, Conntrack, ConntrackKey, Counter as NfCounter,
+        Bitwise, Cmp, CmpOp, ConnTrackState, Conntrack, ConntrackKey, Counter as NfCounter, Fib,
         HighLevelPayload, ICMPv6HeaderField, IPv6HeaderField, IcmpCode, Log as NfLog, Meta,
-        MetaType, NetworkHeaderField, Reject, RejectType, TransportHeaderField,
+        MetaType, NetworkHeaderField, Objref, Payload, Register, Reject, RejectType,
+        TransportHeaderField,
     },
     HookClass, Protocol, Rule as NfRule,
 };
 
 use super::NetlinkBackend;
 use crate::ruleset::{
-    Action, AddressFamily, ChainKind, ConnectionState, ConnectionStates, Counter, Icmpv6Type,
-    Match, Verdict, L4,
+    Action, AddressFamily, ChainKind, ConnectionState, ConnectionStates, Counter, Icmpv4Type,
+    Icmpv6Type, Match, Verdict, L4,
 };
 
 const IP_PROTOCOL_ICMP: u8 = 1;
@@ -59,6 +60,10 @@ impl NetlinkBackend {
             Match::DestNet(addr) => Self::match_net(rule, addr, false)?,
             Match::SourceNet(addr) => Self::match_net(rule, addr, true)?,
             Match::Icmp(family) => Self::icmp_protocol(rule, *family),
+            Match::Icmpv4Type(icmp_type) => Self::icmpv4_type(rule, *icmp_type),
+            Match::FibSourceRoute { use_mark, present } => rule
+                .with_expr(Fib::source_route_present(Register::Reg1, *use_mark))
+                .with_expr(Cmp::new(CmpOp::Eq, [u8::from(*present)])),
             Match::Icmpv6Type(icmp_type) => Self::icmpv6_type(rule, *icmp_type),
             Match::Ipv6HopLimit(hop_limit) => Self::ipv6_hop_limit(rule, *hop_limit),
             Match::PacketMark(mark) => rule
@@ -73,9 +78,7 @@ impl NetlinkBackend {
         Ok(match action {
             Action::Counter(Counter::Anonymous) => rule.with_expr(NfCounter::default()),
             Action::Counter(Counter::Named(name)) => {
-                return Err(Self::err(format!(
-                    "named counter `{name}` is not supported by rustables 0.8.8"
-                )))
+                rule.with_expr(Objref::counter(name).map_err(Self::err)?)
             }
             Action::Log(log) => {
                 rule.with_expr(NfLog::new(log.group, Some(log.prefix.clone())).map_err(Self::err)?)
@@ -129,6 +132,21 @@ impl NetlinkBackend {
         };
         rule.with_expr(Meta::new(MetaType::L4Proto))
             .with_expr(Cmp::new(CmpOp::Eq, [protocol]))
+    }
+
+    fn icmpv4_type(rule: NfRule, icmp_type: Icmpv4Type) -> NfRule {
+        Self::icmp_protocol(
+            Self::network_family(rule, AddressFamily::Ipv4),
+            AddressFamily::Ipv4,
+        )
+        .with_expr(
+            Payload::default()
+                .with_dreg(Register::Reg1)
+                .with_base(rustables::sys::NFT_PAYLOAD_TRANSPORT_HEADER)
+                .with_offset(0u32)
+                .with_len(1u32),
+        )
+        .with_expr(Cmp::new(CmpOp::Eq, [icmp_type.number()]))
     }
 
     /// `icmpv6 type <type>`: the ICMPv6 protocol, then the type octet.

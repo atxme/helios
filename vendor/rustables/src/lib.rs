@@ -57,6 +57,9 @@ mod table;
 pub use table::Table;
 pub use table::list_tables;
 
+mod object;
+pub use object::CounterObject;
+
 mod chain;
 pub use chain::list_chains_for_table;
 pub use chain::{Chain, ChainPolicy, ChainPriority, ChainType, Hook, HookClass};

@@ -157,7 +157,7 @@ impl AstraCredentialBinding {
         if previous.credential_id != self.credential_id {
             return Err(CertificateError::InvalidCredentialBinding("credential id"));
         }
-        if previous.state == CredentialState::Revoked {
+        if previous.state == CredentialState::Revoked && self.state != CredentialState::Revoked {
             return Err(CertificateError::Revoked);
         }
         // A credential identifier names one authenticator key for its whole

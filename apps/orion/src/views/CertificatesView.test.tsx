@@ -275,7 +275,7 @@ describe('CertificatesView', () => {
       entry({
         inventory: {
           ...entry().inventory,
-          operator_credentials: { registry_epoch: 7, detail: 'epoch_only' },
+          operator_credentials: { registry_epoch: 7, detail: 'epoch_only', credentials: [] },
         },
         actions: [
           {
