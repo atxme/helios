@@ -96,16 +96,27 @@ export function HealthPanel() {
 
   useEffect(() => {
     let alive = true
+    let timer: ReturnType<typeof setTimeout> | undefined
+    // The machine's load is only meaningful if it keeps moving. The next read
+    // is scheduled once the previous one has settled, not on a fixed clock: a
+    // daemon slower than the period would otherwise pile up requests.
     const read = () =>
       fetchHealth()
-        .then(next => alive && setHealth(next))
-        .catch(() => alive && setError(true))
+        .then(next => {
+          if (!alive) return
+          setHealth(next)
+          setError(false)
+        })
+        .catch(() => {
+          if (alive) setError(true)
+        })
+        .finally(() => {
+          if (alive) timer = setTimeout(read, 5_000)
+        })
     void read()
-    // The machine's load is only meaningful if it keeps moving.
-    const id = setInterval(read, 5_000)
     return () => {
       alive = false
-      clearInterval(id)
+      clearTimeout(timer)
     }
   }, [])
 
