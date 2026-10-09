@@ -68,7 +68,7 @@ un **contrat à finir d'implémenter**, pas une description du système.
 > WireGuard de la requête étant vérifiée contre le pair résolu au lieu de
 > servir elle-même de clé de recherche.
 >
-> **Ce qui n'est pas implémenté**, au 2026-08-16 :
+> **Limites d'implémentation restantes** :
 >
 > - la **validation du fournisseur d'aléa** du §4.3. Le reste de l'alignement
 >   cryptographique du 16 août est livré : toute signature ML-DSA-87 passe par
@@ -122,10 +122,6 @@ un **contrat à finir d'implémenter**, pas une description du système.
 > - l'**enrôlement sans clé privée et sa signature opérateur**
 >   ([§15](#15-enrôlement)). `helios enroll` distribue encore l'identité
 >   cliente comme en v4, avec le document `.orion` secret que cela implique ;
-> - tout le **cycle de vie des certificats**
->   ([ROTATION-CERTIFICATS](ROTATION-CERTIFICATS.md)) : la leaf PQ gateway
->   est encore auto-signée, il n'y a ni slot actif/suivant, ni génération
->   anti-rollback, ni import manuel de transition ;
 > - l'état **`revoked`** du [§11.1](#111-états-gateway) : une révocation est
 >   exprimée par l'absence du pair dans `network.peers`, lue à chaque décision,
 >   et non par un marqueur terminal dans le slot. Hors concurrence, un pair
@@ -154,6 +150,13 @@ un **contrat à finir d'implémenter**, pas une description du système.
 > de 90 s bornant chaque phase, budget par préfixe IPv6 `/64`, budget par
 > identité admise, reprise TLS et 0-RTT désactivés, flux et fenêtres bornés des
 > deux côtés.
+>
+> Le **cycle complet des certificats est implémenté** : leaf PQ gateway
+> émise par `CA-PQ`, slots actif/suivant, générations anti-rollback, import
+> manuel de transition, Astra, renouvellement automatique, récupération
+> expirée et campagnes YubiKey. Le [§21](#21-limites-connues) et la
+> [spécification de rotation](ROTATION-CERTIFICATS.md) détaillent les
+> décisions opérateur et validations sur machines cibles restantes.
 
 **Version** : 5
 

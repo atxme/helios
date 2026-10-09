@@ -150,14 +150,19 @@ Par ailleurs :
 - le câblage PSK est validé en **dry-run seulement** — aucun essai noyau, et la
   fenêtre de mise à jour n'a jamais tourné sur un TPM réel ;
 - le **DNS d'un client n'est pas tunnelé**, même `allow_client_internet` actif ;
-- la VIP dérivée par l'IPAM n'est pas réconciliée avec l'adresse déclarée en
-  configuration : l'écart est journalisé ;
 - le fichier de récupération WireGuard reste bloqué jusqu'à l'arbitrage du
   compteur anti-rejeu (ADR-002, amendement 2) ;
 - DPAPI ne se compile ni ne s'exerce en WSL2 : hors Windows, le scellement de
   l'identité cliente échoue explicitement.
 
 Une compilation WSL2 n'est jamais une validation matérielle.
+
+L'IPAM alloue la VIP à l'admission ; l'adresse enregistrée dans `network.toml`
+fait ensuite autorité. Le provisioning retourne cette adresse, sans la
+redériver, et le plan de données la conserve. Si un rechargement de
+configuration crée un écart avec une requête en cours, l'écart est journalisé
+et l'adresse déclarée est conservée
+([adressage, §3 bis.2](docs/specification/ADRESSAGE-IPV6.md#3-bis2-règles)).
 
 ## Documentation
 
