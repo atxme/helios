@@ -334,3 +334,29 @@ pub(super) fn gateway_with(
     };
     (handler, plane)
 }
+
+/// Prepares, proves a handshake and confirms: one committed negotiation.
+pub(super) async fn commit(
+    handler: &GatewayHandler,
+    plane: &TestDataPlane,
+    fixture: &PqFixture,
+    transaction_id: [u8; 16],
+    source: std::net::IpAddr,
+) {
+    handler
+        .prepare(
+            CERTIFICATE_FINGERPRINT.into(),
+            source,
+            request(transaction_id, fixture),
+        )
+        .await
+        .expect("prepare");
+    plane.handshake_happens().await;
+    handler
+        .confirm(
+            authenticate_confirmation(TEST_CHALLENGE, transaction_id, &fixture.client_private_key)
+                .expect("confirmation"),
+        )
+        .await
+        .expect("commit");
+}
