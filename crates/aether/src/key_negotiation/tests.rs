@@ -1176,3 +1176,20 @@ fn the_negotiation_values_are_pinned() {
         ]
     );
 }
+
+#[test]
+fn renewal_thresholds_sit_at_eighty_percent_of_each_bound() {
+    assert_eq!(NEGOTIATED_PSK_BYTE_LIMIT, 100 * 1024 * 1024 * 1024);
+    assert_eq!(
+        psk_renewal_after_secs(),
+        69_120,
+        "19 h 12 of a 24 h lifetime"
+    );
+    assert_eq!(
+        psk_renewal_after_bytes(),
+        85_899_345_920,
+        "80 GiB of 100 GiB"
+    );
+    assert!(psk_renewal_after_secs() < u64::from(NEGOTIATED_PSK_LIFETIME_SECS));
+    assert!(psk_renewal_after_bytes() < NEGOTIATED_PSK_BYTE_LIMIT);
+}
