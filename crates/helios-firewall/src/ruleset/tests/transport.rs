@@ -1,7 +1,7 @@
 //! Tests for the ruleset renderer, grouped by the behavior they protect.
 
 use super::super::*;
-use super::support::{policy, render, text};
+use super::support::{every_state, policy, render, text};
 #[test]
 fn down_blocks_lan_forward() {
     let rs = render(&policy(), TunnelState::Down);
@@ -92,4 +92,40 @@ fn public_udp_listeners_can_answer_on_every_uplink() {
             }
         }
     }
+}
+
+/// The in-tunnel PSK renewal reaches the same listener through `wg_iface`.
+#[test]
+fn key_negotiation_port_is_open_on_the_tunnel_interface() {
+    for state in every_state() {
+        let rs = render(&policy(), state);
+        assert!(
+            text(&rs, ChainKind::Input)
+                .iter()
+                .any(|rule| rule == "iifname \"helios0\" udp dport 51821 accept"),
+            "state {state:?}: the renewal must reach the listener through the tunnel"
+        );
+        assert!(
+            text(&rs, ChainKind::Output)
+                .iter()
+                .any(|rule| rule == "oifname \"helios0\" udp sport 51821 accept"),
+            "state {state:?}: the listener must answer through the tunnel"
+        );
+    }
+}
+
+/// Without a tunnel interface there is nothing to scope the opening to, and
+/// an unscoped variant would be reachable from anywhere.
+#[test]
+fn the_tunnel_opening_needs_a_tunnel_interface() {
+    let mut p = policy();
+    p.wg_iface = String::new();
+    let mut rules = Vec::new();
+    super::super::transport::key_negotiation_listener(&mut rules, &p, &["eth0".to_string()]);
+    assert!(
+        rules
+            .iter()
+            .all(|rule| rule.to_string().contains("\"eth0\"")),
+        "every key-negotiation rule must name an interface: {rules:?}"
+    );
 }
