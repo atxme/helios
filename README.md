@@ -135,9 +135,10 @@ Livraison : `cargo xtask bundle`, `helios-publisher bundle`, `cargo xtask pack`,
 
 La négociation v5 est opérationnelle pour l'établissement initial d'un tunnel :
 challenge, authentification, dérivation du PSK ML-KEM, preuve WireGuard et
-rollback sont en place. Restent notamment le renouvellement de PSK en place,
-l'enrôlement sans transport de clé privée et certaines validations sur matériel
-réel ; le détail est dans la
+rollback sont en place. Le renouvellement de PSK en place, négocié dans le
+tunnel à 80 % de la durée de vie ou du volume, est livré ; sa validation sur
+cible (V1) reste à mener. Restent notamment l'enrôlement sans transport de clé
+privée et certaines validations sur matériel réel ; le détail est dans la
 [spécification v5](docs/specification/NEGOCIATION-DE-CLE-V5.md).
 
 Le cycle de vie des certificats est un chantier distinct, déjà partiellement
