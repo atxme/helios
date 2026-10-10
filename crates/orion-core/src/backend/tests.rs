@@ -905,6 +905,11 @@ fn pending(confirm: Result<(), String>) -> Box<dyn PendingRenewal> {
     })
 }
 
+/// A data plane nobody else has claimed since the renewal started.
+fn owner() -> DataPlaneOwner {
+    DataPlaneOwner::claim(&Arc::new(std::sync::atomic::AtomicU64::new(0)))
+}
+
 async fn mounted() -> (
     Arc<DryRunBackend>,
     Arc<dyn VpnBackend>,
@@ -926,7 +931,7 @@ async fn mounted() -> (
 #[tokio::test]
 async fn a_confirmed_renewal_installs_the_new_psk_and_a_new_receipt() {
     let (dry, backend, current) = mounted().await;
-    let renewed = renew_slot(&backend, &current, pending(Ok(())), &sink())
+    let renewed = renew_slot(&backend, &current, pending(Ok(())), &sink(), owner())
         .await
         .unwrap();
     assert_eq!(renewed.transaction_id, [9; 16]);
@@ -939,7 +944,7 @@ async fn a_confirmed_renewal_installs_the_new_psk_and_a_new_receipt() {
 async fn a_renewal_restarts_the_volume_count_from_the_re_registered_peer() {
     let (dry, backend, current) = mounted().await;
     dry.set_transfer_bytes(Some(70 * 1024 * 1024 * 1024));
-    let mut renewed = renew_slot(&backend, &current, pending(Ok(())), &sink())
+    let mut renewed = renew_slot(&backend, &current, pending(Ok(())), &sink(), owner())
         .await
         .unwrap();
     // `rekey_peer` restarted the client counters at zero; 80 GiB from there.
@@ -958,11 +963,15 @@ async fn a_renewal_restarts_the_volume_count_from_the_re_registered_peer() {
 #[tokio::test]
 async fn a_failed_confirmation_puts_the_previous_psk_back() {
     let (dry, backend, current) = mounted().await;
-    assert!(
-        renew_slot(&backend, &current, pending(Err("lost".into())), &sink())
-            .await
-            .is_err()
-    );
+    assert!(renew_slot(
+        &backend,
+        &current,
+        pending(Err("lost".into())),
+        &sink(),
+        owner()
+    )
+    .await
+    .is_err());
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(
         dry.rekeyed_psks(),
@@ -980,7 +989,7 @@ async fn a_cancelled_renewal_still_puts_the_previous_psk_back() {
             confirm: Ok(()),
             hang: true,
         });
-        renew_slot(&backend, &current, hanging, &sink()).await
+        renew_slot(&backend, &current, hanging, &sink(), owner()).await
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
     task.abort();
@@ -1032,4 +1041,48 @@ async fn nothing_is_renewed_before_the_threshold_or_without_a_tunnel() {
         ctrl.renew_now(sink()).await.is_err(),
         "no tunnel up: nothing to renew"
     );
+}
+
+/// A reconnection or a disconnection takes the data plane over while a
+/// renewal is in flight. The renewal's rollback must then leave the peer
+/// alone: re-registering the previous PSK would overwrite the newer tunnel.
+#[tokio::test]
+async fn a_rollback_never_touches_a_tunnel_that_changed_hands() {
+    let (dry, backend, current) = mounted().await;
+    let epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let owner = DataPlaneOwner::claim(&epoch);
+    let task = tokio::spawn(async move {
+        let hanging = Box::new(FakePending {
+            psk: aether::SecretString::new(NEW_PSK),
+            confirm: Ok(()),
+            hang: true,
+        });
+        renew_slot(&backend, &current, hanging, &sink(), owner).await
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    epoch.fetch_add(1, Ordering::SeqCst);
+    task.abort();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        dry.rekeyed_psks(),
+        vec![secret(NEW_PSK)],
+        "only the renewal's own re-registration; no restore over the newer tunnel"
+    );
+}
+
+/// A renewal that lost the data plane before installing its PSK installs
+/// nothing at all.
+#[tokio::test]
+async fn a_renewal_that_lost_the_data_plane_installs_nothing() {
+    let (dry, backend, current) = mounted().await;
+    let epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let owner = DataPlaneOwner::claim(&epoch);
+    epoch.fetch_add(1, Ordering::SeqCst);
+    assert!(
+        renew_slot(&backend, &current, pending(Ok(())), &sink(), owner)
+            .await
+            .is_err()
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(dry.rekeyed_psks().is_empty());
 }

@@ -32,7 +32,7 @@
 //! target-only, just like the `netlink` feature on the heliosd side.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -409,6 +409,10 @@ pub struct VpnController {
     stale_renegotiations: Arc<AtomicU32>,
     /// Is a PSK renewal in flight? At most one at a time.
     renewing: Arc<AtomicBool>,
+    /// The renewal in flight, so a connection or a disconnection can stop it.
+    renewal_task: Mutex<Option<JoinHandle<()>>>,
+    /// Bumped by every connection and disconnection: see [`DataPlaneOwner`].
+    data_plane_epoch: Arc<AtomicU64>,
     key_negotiation_identities: Option<Arc<dyn crate::key_negotiation::IdentityProvider>>,
 }
 
@@ -480,6 +484,8 @@ impl VpnController {
             mounted_profile: Arc::new(Mutex::new(None)),
             stale_renegotiations: Arc::new(AtomicU32::new(0)),
             renewing: Arc::new(AtomicBool::new(false)),
+            renewal_task: Mutex::new(None),
+            data_plane_epoch: Arc::new(AtomicU64::new(0)),
             key_negotiation_identities: None,
         }
     }
@@ -888,7 +894,7 @@ impl VpnController {
                 None => return,
             }
         };
-        self.start_renewal(trigger, user_sink);
+        self.start_renewal(trigger, user_sink).await;
     }
 
     /// Renews now, at the user's request (and for the V1 measurement).
@@ -899,11 +905,12 @@ impl VpnController {
         if self.key_negotiation_identities.is_none() {
             anyhow::bail!("aucun magasin d'identités protégé : renouvellement impossible");
         }
-        self.start_renewal(renewal::RenewalTrigger::Manual, user_sink);
+        self.start_renewal(renewal::RenewalTrigger::Manual, user_sink)
+            .await;
         Ok(())
     }
 
-    fn start_renewal(&self, trigger: renewal::RenewalTrigger, user_sink: EventSink) {
+    async fn start_renewal(&self, trigger: renewal::RenewalTrigger, user_sink: EventSink) {
         if self.renewing.swap(true, Ordering::SeqCst) {
             return;
         }
@@ -914,13 +921,30 @@ impl VpnController {
         let backend = Arc::clone(&self.backend);
         let installed = Arc::clone(&self.installed);
         let sink = self.wrap_sink(user_sink);
-        tokio::spawn(async move {
+        let owner = DataPlaneOwner::claim(&self.data_plane_epoch);
+        let handle = tokio::spawn(async move {
             let _flag = flag;
-            run_renewal(&backend, identities.as_ref(), &installed, trigger, &sink).await;
+            run_renewal(
+                &backend,
+                identities.as_ref(),
+                &installed,
+                trigger,
+                &sink,
+                owner,
+            )
+            .await;
         });
+        *self.renewal_task.lock().await = Some(handle);
     }
 
+    /// Stops the connection task and any renewal in flight, and takes the data
+    /// plane over: whatever either of them was about to do to the peer, the
+    /// caller — a connection or a disconnection — now decides instead.
     async fn abort_task(&self) {
+        self.data_plane_epoch.fetch_add(1, Ordering::SeqCst);
+        if let Some(handle) = self.renewal_task.lock().await.take() {
+            handle.abort();
+        }
         if let Some(handle) = self.task.lock().await.take() {
             handle.abort();
         }
@@ -1440,10 +1464,15 @@ impl PendingRenewal for crate::key_negotiation::NegotiatedKey {
 /// cancelled future runs no exit path of its own, so the restore is spawned
 /// from `Drop`. Dropping the pending negotiation closes its QUIC session and
 /// the gateway restores its own previous slot — both ends land on the old PSK.
+///
+/// Only while the renewal still owns the data plane: after a connection or a
+/// disconnection took it over, re-registering the previous peer would
+/// overwrite the newer tunnel with a PSK its gateway slot no longer holds.
 struct RestorePrevious {
     backend: Arc<dyn VpnBackend>,
     previous: Option<ClientProfile>,
     sink: EventSink,
+    owner: DataPlaneOwner,
 }
 
 impl RestorePrevious {
@@ -1459,9 +1488,17 @@ impl Drop for RestorePrevious {
         };
         let backend = Arc::clone(&self.backend);
         let sink = Arc::clone(&self.sink);
+        let owner = self.owner.clone();
         match tokio::runtime::Handle::try_current() {
             Ok(runtime) => {
                 runtime.spawn(async move {
+                    if !owner.still_held() {
+                        tracing::info!(
+                            "renewal rollback skipped: a connection or a disconnection took the \
+                             data plane over meanwhile"
+                        );
+                        return;
+                    }
                     match backend.rekey_peer(&previous, &sink).await {
                         Ok(()) => sink(ClientEvent::log(
                             "warn",
@@ -1492,7 +1529,11 @@ async fn renew_slot(
     current: &InstalledNegotiation,
     pending: Box<dyn PendingRenewal>,
     sink: &EventSink,
+    owner: DataPlaneOwner,
 ) -> anyhow::Result<InstalledNegotiation> {
+    if !owner.still_held() {
+        anyhow::bail!("a connection or a disconnection took the tunnel over before the renewal");
+    }
     let psk = pending
         .psk()
         .context("an in-tunnel renewal must derive an ml_kem PSK")?
@@ -1509,6 +1550,7 @@ async fn renew_slot(
         backend: Arc::clone(backend),
         previous: Some(current.data_plane.duplicate()),
         sink: Arc::clone(sink),
+        owner,
     };
     backend
         .rekey_peer(&renewed, sink)
@@ -1576,6 +1618,7 @@ async fn run_renewal(
     installed: &Mutex<Option<InstalledNegotiation>>,
     trigger: renewal::RenewalTrigger,
     sink: &EventSink,
+    owner: DataPlaneOwner,
 ) {
     let Some(current) = installed
         .lock()
@@ -1596,7 +1639,7 @@ async fn run_renewal(
         let negotiated =
             crate::key_negotiation::prepare_renewal_for_profile(&current.profile, identities)
                 .await?;
-        renew_slot(backend, &current, Box::new(negotiated), sink).await
+        renew_slot(backend, &current, Box::new(negotiated), sink, owner).await
     }
     .await;
     settle_renewal(
@@ -1605,6 +1648,30 @@ async fn run_renewal(
         outcome,
         sink,
     );
+}
+
+/// Which connection currently owns the data plane.
+///
+/// [`VpnController::abort_task`] bumps the epoch on every connection and
+/// disconnection. A renewal records the value it started under and touches
+/// the peer only while it still holds.
+#[derive(Clone)]
+struct DataPlaneOwner {
+    epoch: Arc<AtomicU64>,
+    held: u64,
+}
+
+impl DataPlaneOwner {
+    fn claim(epoch: &Arc<AtomicU64>) -> Self {
+        Self {
+            epoch: Arc::clone(epoch),
+            held: epoch.load(Ordering::SeqCst),
+        }
+    }
+
+    fn still_held(&self) -> bool {
+        self.epoch.load(Ordering::SeqCst) == self.held
+    }
 }
 
 /// Clears the in-flight flag however the renewal task ends.

@@ -2848,8 +2848,9 @@ déclarer la v5 implémentée.
   un slot statique ou un état `preparing` ;
 - déconnexion Orion : aucun socket QUIC nouveau, tentative HTTP bornée à deux
   secondes avant `down()`, puis démontage et zéroïsation même sans réponse ;
-- durée de vie du PSK : renouvellement déclenché à 90 %, retrait ferme à 24 h,
-  sans extension après recul d'horloge ou suspension simulée ;
+- durée de vie du PSK : renouvellement déclenché à 80 % de la durée ou du
+  plafond de 100 Gio, retrait ferme à 24 h ou 100 Gio, sans extension après
+  recul d'horloge ou suspension simulée ;
 - enrôlement : invitation expirée, rejouée, révoquée, ciblant une autre gateway
   ou déjà consommée refusée ; `allow_readmission` exigé après révocation ;
 - preuve de possession WireGuard fausse ou secret X25519 nul refusés ; CSR et
