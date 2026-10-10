@@ -106,6 +106,20 @@ pub trait VpnBackend: Send + Sync {
     /// Unmounts the adapter. **Called only on explicit disconnection.**
     async fn down(&self, sink: &EventSink) -> anyhow::Result<()>;
 
+    /// Re-registers the peer from `profile`, which resets its WireGuard session.
+    ///
+    /// The in-tunnel PSK renewal needs a handshake **after** the new PSK is in
+    /// place, and changing a peer's configuration does not reset its session:
+    /// WireGuard would only rekey after 120 s of use (spec §12.3). Removing
+    /// then re-adding the peer does. Costs one handshake of interruption.
+    ///
+    /// **Contract**: never unmounts the adapter, whatever fails.
+    async fn rekey_peer(&self, profile: &ClientProfile, sink: &EventSink) -> anyhow::Result<()>;
+
+    /// Bytes sent plus received with the peer since it was last registered,
+    /// or `None` when the data plane cannot say.
+    async fn transfer_bytes(&self) -> Option<u64>;
+
     /// Age of the last successful handshake, or `None` if none.
     /// Source of state inference (WireGuard is connectionless).
     async fn last_handshake_age(&self) -> Option<Duration>;

@@ -798,6 +798,55 @@ impl VpnBackend for WireGuardBackend {
         result.map_err(|e| anyhow::anyhow!("suppression de l'interface : {e}"))
     }
 
+    async fn rekey_peer(&self, profile: &ClientProfile, sink: &EventSink) -> anyhow::Result<()> {
+        profile.validate_for_data_plane()?;
+        let addresses = adapter_addresses(profile)?;
+        let peer = Self::build_peer(profile)?;
+        if !self.adapter_up.load(Ordering::SeqCst) {
+            anyhow::bail!(
+                "interface {} absente : aucun pair à réinscrire",
+                self.ifname
+            );
+        }
+        #[allow(unused_mut)]
+        let mut api = self.api()?;
+        // Updating the PSK in place would keep the current session, and no
+        // handshake would come to prove the new PSK (spec §12.3). Removing
+        // the peer drops its session keys; re-adding it makes the keep-alive
+        // start a handshake at once. The adapter stays mounted throughout.
+        api.remove_peer(&peer.public_key)
+            .map_err(|e| anyhow::anyhow!("retrait du pair : {e}"))?;
+        api.configure_peer(&peer)
+            .map_err(|e| anyhow::anyhow!("réinscription du pair : {e}"))?;
+        api.configure_peer_routing(&routing_peers(std::slice::from_ref(&peer)))
+            .map_err(|e| anyhow::anyhow!("routage du pair : {e}"))?;
+        let observed = self.observe_capture(&api, &peer.public_key);
+        drop(api);
+        *self.peer_key() = Some(peer.public_key.clone());
+        let capture = assess_capture(
+            &RequestedCapture {
+                allowed_ips: &peer.allowed_ips,
+                addresses: &addresses,
+            },
+            &observed,
+        );
+        for event in capture_events(&capture) {
+            sink(event);
+        }
+        sink(ClientEvent::log(
+            "info",
+            "pair réinscrit — session WireGuard réinitialisée sur le nouveau PSK".to_string(),
+        ));
+        Ok(())
+    }
+
+    async fn transfer_bytes(&self) -> Option<u64> {
+        let peer_key = self.peer_key().clone()?;
+        let host = self.api().ok()?.read_interface_data().ok()?;
+        let peer = host.peers.get(&peer_key)?;
+        Some(peer.rx_bytes.saturating_add(peer.tx_bytes))
+    }
+
     async fn last_handshake_age(&self) -> Option<Duration> {
         let peer_key = self.peer_key().clone()?;
         let host = self.api().ok()?.read_interface_data().ok()?;

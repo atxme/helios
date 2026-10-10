@@ -138,6 +138,14 @@ impl VpnBackend for RefusingDownBackend {
         anyhow::bail!("adapter is still mounted")
     }
 
+    async fn rekey_peer(&self, _profile: &ClientProfile, _sink: &EventSink) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn transfer_bytes(&self) -> Option<u64> {
+        None
+    }
+
     async fn last_handshake_age(&self) -> Option<Duration> {
         None
     }
@@ -691,6 +699,14 @@ impl VpnBackend for EndpointRecorder {
 
     async fn down(&self, _sink: &EventSink) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    async fn rekey_peer(&self, _profile: &ClientProfile, _sink: &EventSink) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn transfer_bytes(&self) -> Option<u64> {
+        None
     }
 
     async fn last_handshake_age(&self) -> Option<Duration> {
