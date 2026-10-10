@@ -19,6 +19,12 @@ pub(super) fn test_now() -> u64 {
 
 pub(super) const CLIENT_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 pub(super) const GATEWAY_KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+/// A WAN address: the public port, as every test used before renewal existed.
+pub(super) const PUBLIC_SOURCE: std::net::IpAddr =
+    std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 50));
+/// The VIP `network()` admits the test peer with: a connection through the tunnel.
+pub(super) const TUNNEL_SOURCE: std::net::IpAddr =
+    std::net::IpAddr::V4(std::net::Ipv4Addr::new(100, 64, 1, 2));
 pub(super) const CERTIFICATE_FINGERPRINT: &str =
     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 

@@ -16,7 +16,11 @@ impl NegotiationHandler for GatewayHandler {
         }
     }
 
-    async fn resolve_admitted_peer(&self, certificate_sha256: &str) -> Option<String> {
+    async fn resolve_admitted_peer(
+        &self,
+        certificate_sha256: &str,
+        _source: std::net::IpAddr,
+    ) -> Option<String> {
         // The registry first: it is the only place that knows about a leaf
         // issued after admission. The pins are the answer for a gateway with
         // no trust domain, and for a peer that has never renewed.
@@ -39,6 +43,7 @@ impl NegotiationHandler for GatewayHandler {
     async fn prepare(
         &self,
         certificate_sha256: String,
+        _source: std::net::IpAddr,
         authenticated: AuthenticatedKeyNegotiationRequest,
     ) -> Result<PreparedNegotiation, PublicError> {
         let request = &authenticated.request;
