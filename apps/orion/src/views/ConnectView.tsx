@@ -7,6 +7,7 @@ import Typography from '@mui/material/Typography'
 import {
   ArrowDown,
   ArrowUp,
+  KeyRound,
   Power,
   ShieldAlert,
   ShieldCheck,
@@ -52,6 +53,8 @@ interface Props {
   onDisconnect: () => void
   /** Opens a terminal on the gateway, de-elevated. */
   onOpenSsh: () => void
+  /** Renews the ML-KEM PSK through the tunnel. */
+  onRenewKey: () => void
 }
 
 const POSTURE_ICON = {
@@ -86,6 +89,7 @@ export function ConnectView({
   onConnect,
   onDisconnect,
   onOpenSsh,
+  onRenewKey,
 }: Props) {
   const meta = stateMeta(state)
   const posture = postureMeta(state, adapterUp)
@@ -299,6 +303,21 @@ export function ConnectView({
             sx={{ fontSize: 12, textTransform: 'none', color: 'text.secondary' }}
           >
             Terminal SSH — {profile.ssh_target}
+          </Button>
+        )}
+
+        {/* Shown only on a tunnel carrying traffic under an ML-KEM PSK: the
+            renewal rides that tunnel, and Rust refuses it otherwise. */}
+        {state === 'up' && psk === 'ml_kem' && (
+          <Button
+            fullWidth
+            variant="text"
+            color="inherit"
+            startIcon={<KeyRound size={16} aria-hidden />}
+            onClick={onRenewKey}
+            sx={{ fontSize: 12, textTransform: 'none', color: 'text.secondary' }}
+          >
+            Renouveler la clé maintenant
           </Button>
         )}
 

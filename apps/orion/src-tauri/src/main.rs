@@ -2307,6 +2307,7 @@ async fn start_connection(app: AppHandle, name: Option<String>) -> Result<(), St
                 _ => started = true,
             }
             controller.poll_handshake(sink.clone()).await;
+            controller.poll_renewal(sink.clone()).await;
         }
     });
     let previous = state.handshake_poll.lock().unwrap().replace(poll);
@@ -2372,6 +2373,20 @@ fn raise_key_negotiation_floor(
 #[tauri::command]
 async fn disconnect(app: AppHandle) -> Result<(), String> {
     stop_connection(&app).await
+}
+
+/// Renews the ML-KEM PSK now, through the tunnel (design 2026-10-09).
+///
+/// Returns once the renewal is started: it runs in the background and reports
+/// its outcome on the event stream, like the scheduled one.
+#[tauri::command]
+async fn renew_psk(app: AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    state
+        .controller
+        .renew_now(emit_sink(app.clone()))
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// Unmounts the tunnel. Shared by the `disconnect` command and the tray menu,
@@ -2934,6 +2949,7 @@ fn main() {
             select_profile,
             connect,
             disconnect,
+            renew_psk,
             export_logs,
             resize_for_view,
             validate_profile,

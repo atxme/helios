@@ -69,6 +69,18 @@ pub fn negotiation_socket(remote: SocketAddr, tunnel_ifname: &str) -> Result<Udp
     Ok(socket)
 }
 
+/// Opens the UDP socket of an in-tunnel PSK renewal, bound to the client VIP.
+///
+/// The opposite of [`negotiation_socket`]: a renewal must ride the tunnel it
+/// renews. Binding the source to the VIP selects the tunnel interface on every
+/// platform, and keeps that source across the peer re-registration of the
+/// renewal — the adapter and its address stay in place, so the gateway sees
+/// no QUIC migration.
+pub fn tunnel_socket(local_vip: IpAddr) -> Result<UdpSocket> {
+    let bind = SocketAddr::new(local_vip, 0);
+    UdpSocket::bind(bind).with_context(|| format!("binding the renewal socket on {bind}"))
+}
+
 /// Compares the first `prefix_len` bits of two addresses.
 ///
 /// Lives outside the Windows module, and is the only piece of this file the

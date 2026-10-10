@@ -22,6 +22,7 @@ import {
   continueAstraCaTlsRotation,
   deleteProfile,
   disconnect,
+  renewPsk,
   getConfig,
   getState,
   importProfile,
@@ -74,6 +75,7 @@ describe('Orion Tauri bridge', () => {
     await connect('portable')
     await connect()
     await disconnect()
+    await renewPsk()
     const astraInput = {
       vault_path: 'C:\\astra\\authority-vault.json',
       heliosd_url: 'http://100.64.0.1:8080',
@@ -118,6 +120,7 @@ describe('Orion Tauri bridge', () => {
       ['connect', { name: 'portable' }],
       ['connect', { name: null }],
       ['disconnect'],
+      ['renew_psk'],
       ['start_astra_ca_tls_rotation', { input: astraInput }],
       ['continue_astra_ca_tls_rotation'],
       ['cancel_astra_ca_tls_rotation'],
