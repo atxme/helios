@@ -16,29 +16,34 @@ impl NegotiationHandler for GatewayHandler {
         }
     }
 
-    async fn resolve_admitted_peer(&self, certificate_sha256: &str) -> Option<String> {
-        // The registry first: it is the only place that knows about a leaf
-        // issued after admission. The pins are the answer for a gateway with
-        // no trust domain, and for a peer that has never renewed.
-        if let Ok(now) = unix_time_now() {
-            if let Some(identity) = self.registered_identity(certificate_sha256, now).await {
-                return Some(identity.wg_public_key);
+    async fn resolve_admitted_peer(
+        &self,
+        certificate_sha256: &str,
+        source: std::net::IpAddr,
+    ) -> Option<String> {
+        let resolved = self.certificate_peer(certificate_sha256).await?;
+        match origin::classify(&*self.network.read().await, source) {
+            origin::Origin::Public => Some(resolved),
+            origin::Origin::Tunnel { peer_public_key } if peer_public_key == resolved => {
+                Some(resolved)
+            }
+            origin::Origin::Tunnel { peer_public_key } => {
+                tracing::warn!(
+                    %source,
+                    vip_owner = %peer_public_key,
+                    certificate_peer = %resolved,
+                    "key negotiation refused: an in-tunnel source belongs to another peer than \
+                     the presented certificate"
+                );
+                None
             }
         }
-        self.network
-            .read()
-            .await
-            .peers
-            .iter()
-            .find(|peer| {
-                peer.key_negotiation_certificate_sha256.as_deref() == Some(certificate_sha256)
-            })
-            .map(|peer| peer.public_key.clone())
     }
 
     async fn prepare(
         &self,
         certificate_sha256: String,
+        source: std::net::IpAddr,
         authenticated: AuthenticatedKeyNegotiationRequest,
     ) -> Result<PreparedNegotiation, PublicError> {
         let request = &authenticated.request;
@@ -154,6 +159,10 @@ impl NegotiationHandler for GatewayHandler {
             // port by trying one mode after another.
             return Err(PublicError::Rejected);
         }
+        let in_tunnel = matches!(
+            origin::classify(&*self.network.read().await, source),
+            origin::Origin::Tunnel { .. }
+        );
         // Every issuer the domain admits, and exactly one acceptable
         // fingerprint — the partner of the TLS half already proved. The
         // fingerprint decides before any signature is verified, so a caller
@@ -237,6 +246,22 @@ impl NegotiationHandler for GatewayHandler {
                     );
                     return Err(PublicError::Rejected);
                 }
+            }
+            if in_tunnel
+                && !origin::tunnel_renewal_allowed(
+                    request.mode,
+                    &state.slot(&request.client_wg_public_key).state,
+                )
+            {
+                state.peers.remove(&request.client_wg_public_key);
+                tracing::warn!(
+                    %transaction,
+                    peer = %peer_key,
+                    mode = ?request.mode,
+                    "key negotiation refused: through the tunnel, only a committed ml_kem slot \
+                     may be renewed"
+                );
+                return Err(PublicError::Rejected);
             }
             state.replay_set.insert(request.transaction_id);
             state.replay_order.push_back(request.transaction_id);
@@ -532,6 +557,7 @@ impl NegotiationHandler for GatewayHandler {
                     public_key: transaction.public_key.clone(),
                     address: transaction.address.clone(),
                     installed_at: std::time::Instant::now(),
+                    bytes_baseline: None,
                 }),
             };
             slot.generation += 1;
@@ -683,4 +709,28 @@ fn random_nonce() -> Result<[u8; 16]> {
     aether::random::fill_public(&mut nonce)
         .map_err(|error| anyhow::anyhow!("the approved DRBG refused: {error}"))?;
     Ok(nonce)
+}
+
+impl GatewayHandler {
+    /// The peer a certificate fingerprint is admitted for, ignoring where the
+    /// connection comes from.
+    async fn certificate_peer(&self, certificate_sha256: &str) -> Option<String> {
+        // The registry first: it is the only place that knows about a leaf
+        // issued after admission. The pins are the answer for a gateway with
+        // no trust domain, and for a peer that has never renewed.
+        if let Ok(now) = unix_time_now() {
+            if let Some(identity) = self.registered_identity(certificate_sha256, now).await {
+                return Some(identity.wg_public_key);
+            }
+        }
+        self.network
+            .read()
+            .await
+            .peers
+            .iter()
+            .find(|peer| {
+                peer.key_negotiation_certificate_sha256.as_deref() == Some(certificate_sha256)
+            })
+            .map(|peer| peer.public_key.clone())
+    }
 }
