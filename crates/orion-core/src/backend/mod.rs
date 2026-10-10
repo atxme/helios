@@ -243,11 +243,11 @@ async fn upgrade_to_post_quantum(
     }
 
     let upgraded = ClientProfile {
-        preshared_key: Some(outcome.preshared_key.expose().to_owned()),
+        preshared_key: Some(outcome.preshared_key.duplicate()),
         // Same rule as the pre-WireGuard negotiation: this PSK is the result
         // of an ML-KEM exchange, not a secret typed into the profile.
         preshared_key_is_negotiated: true,
-        ..profile.clone()
+        ..profile.duplicate()
     };
 
     match backend.up(&upgraded, sink).await {
@@ -401,13 +401,21 @@ pub struct VpnController {
 /// tunnel. v5 keeps a receipt instead: the transaction identifier the gateway
 /// recorded as the slot's owner, which is what a signed release must name to
 /// be accepted. Nothing about the tunnel depends on a connection any more.
-#[derive(Clone)]
 struct InstalledNegotiation {
     transaction_id: [u8; 16],
     /// The profile that negotiated it — the release has to be signed with the
     /// same identity and aimed at the same gateway, and the profile in use
     /// may have changed by the time the user disconnects.
     profile: ClientProfile,
+}
+
+impl InstalledNegotiation {
+    fn duplicate(&self) -> Self {
+        Self {
+            transaction_id: self.transaction_id,
+            profile: self.profile.duplicate(),
+        }
+    }
 }
 
 impl VpnController {
@@ -763,7 +771,13 @@ impl VpnController {
     /// Returns whether a renegotiation was started, so the caller does not
     /// also announce a transition `connect` has just made.
     async fn renegotiate_on_stale_handshake(&self, sink: &EventSink, raw_sink: EventSink) -> bool {
-        let Some(installed) = self.installed.lock().await.clone() else {
+        let Some(installed) = self
+            .installed
+            .lock()
+            .await
+            .as_ref()
+            .map(InstalledNegotiation::duplicate)
+        else {
             return false;
         };
         let attempt = self.stale_renegotiations.fetch_add(1, Ordering::SeqCst) + 1;
@@ -976,16 +990,13 @@ async fn connect_with_key_negotiation(
             // it; the receipt below keeps the profile as stored, so a
             // renegotiation resolves the name afresh.
             endpoint: wireguard_endpoint.address.to_string(),
-            preshared_key: negotiated
-                .psk
-                .as_ref()
-                .map(|secret| secret.expose().to_string()),
+            preshared_key: negotiated.psk.as_ref().map(aether::SecretString::duplicate),
             // Says where that PSK comes from. Without it, the copy
             // contradicted its own settings — a PSK plus a non-static mode —
             // and the `validate()` inside every `up()` refused the tunnel the
             // negotiation had just succeeded in preparing.
             preshared_key_is_negotiated: negotiated.psk.is_some(),
-            ..profile.clone()
+            ..profile.duplicate()
         };
 
         match commit_negotiated_slot(
@@ -1014,7 +1025,7 @@ async fn connect_with_key_negotiation(
                 *installed.lock().await = (mode == aether::key_negotiation::ProtectionMode::MlKem)
                     .then(|| InstalledNegotiation {
                         transaction_id,
-                        profile: profile.clone(),
+                        profile: profile.duplicate(),
                     });
                 link_lost.store(false, Ordering::SeqCst);
                 let protection = match mode {
@@ -1123,7 +1134,7 @@ impl WireGuardEndpoint {
 fn with_wireguard_endpoint(profile: &ClientProfile, address: SocketAddr) -> ClientProfile {
     ClientProfile {
         endpoint: address.to_string(),
-        ..profile.clone()
+        ..profile.duplicate()
     }
 }
 

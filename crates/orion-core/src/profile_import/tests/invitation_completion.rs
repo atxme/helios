@@ -55,7 +55,7 @@ fn a_partial_document_is_loaded_and_its_gap_named() {
 fn a_complete_document_reports_no_gap() {
     let pair = aether::wg::generate_keypair().expect("keypair");
     let profile = ClientProfile {
-        private_key: pair.private_key.expose().to_string(),
+        private_key: pair.private_key.duplicate(),
         ..complete_profile()
     };
     let completed = complete_profile_import(profile, &ClientConfig::default(), None, Vec::new())
@@ -98,7 +98,7 @@ fn enrolling_an_existing_profile_keeps_its_wireguard_identity() {
     let completed = complete_profile_import(imported.profile, &config, None, Vec::new())
         .unwrap()
         .profile;
-    assert_eq!(completed.private_key, CLIENT_PRIVATE);
+    assert_eq!(completed.private_key.expose(), CLIENT_PRIVATE);
     assert!(
         completed.key_negotiation.is_some(),
         "the negotiation block must survive completion"
@@ -153,7 +153,7 @@ fn an_invitation_is_completed_by_the_admitted_key_whatever_the_name() {
     )
     .unwrap();
     assert_eq!(completed.private_key_missing, None);
-    assert_eq!(completed.profile.private_key, CLIENT_PRIVATE);
+    assert_eq!(completed.profile.private_key.expose(), CLIENT_PRIVATE);
     assert_eq!(completed.profile.name, "portable");
 }
 
@@ -163,7 +163,7 @@ fn an_invitation_is_completed_by_the_admitted_key_whatever_the_name() {
 #[test]
 fn a_local_profile_holding_another_key_does_not_complete_an_invitation() {
     let invitation = ClientProfile {
-        private_key: String::new(),
+        private_key: aether::SecretString::default(),
         ..complete_profile()
     };
     let mut config = ClientConfig::default();
@@ -240,7 +240,7 @@ fn completes_an_invitation_with_the_local_key_of_the_same_name() {
 
     let completed = complete_profile_import(invitation, &config, None, Vec::new()).unwrap();
     assert_eq!(completed.private_key_missing, None);
-    assert_eq!(completed.profile.private_key, CLIENT_PRIVATE);
+    assert_eq!(completed.profile.private_key.expose(), CLIENT_PRIVATE);
 }
 
 #[test]

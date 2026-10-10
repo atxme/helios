@@ -181,7 +181,7 @@ fn ephemeral_profile() -> ClientProfile {
     ClientProfile {
         name: "local-campaign".into(),
         endpoint: "127.0.0.1:51820".into(),
-        private_key: engine.encode(client),
+        private_key: engine.encode(client).into(),
         peer_public_key: engine.encode(gateway_public.as_bytes()),
         ..ClientProfile::default()
     }
@@ -202,7 +202,7 @@ fn profile(opts: &Options, url: &str) -> Result<ClientProfile> {
         // The UDP endpoint is unused here: the campaign talks to the API
         // inside the tunnel, it does not bring up the tunnel itself.
         endpoint: "127.0.0.1:51820".into(),
-        private_key: client_key.to_string(),
+        private_key: client_key.into(),
         peer_public_key: gateway_key.to_string(),
         heliosd_url: Some(url.to_string()),
         ..ClientProfile::default()
@@ -361,8 +361,8 @@ async fn scenario_unadmitted_peer(profile: &ClientProfile, url: &str) -> Outcome
     }
     let engine = base64::engine::general_purpose::STANDARD;
     let intruder = ClientProfile {
-        private_key: engine.encode(raw),
-        ..profile.clone()
+        private_key: engine.encode(raw).into(),
+        ..profile.duplicate()
     };
 
     match orion_core::provision(&intruder, url).await {
@@ -579,7 +579,7 @@ pub async fn run(client: &Client, base: &str, opts: Options) -> Result<()> {
             // ephemeral profile is enough and makes the category runnable
             // everywhere.
             let p = match &profile {
-                Ok(p) => p.clone(),
+                Ok(p) => p.duplicate(),
                 Err(_) => ephemeral_profile(),
             };
             for (name, outcome) in [
@@ -646,7 +646,7 @@ pub async fn run(client: &Client, base: &str, opts: Options) -> Result<()> {
                     report("data plane", &Outcome::skip(format!("{e}")));
                 }
                 (Some(iface), Ok(p)) => {
-                    let peer = match public_from_private(&p.private_key) {
+                    let peer = match public_from_private(p.private_key.expose()) {
                         Ok(k) => k,
                         Err(e) => anyhow::bail!("{e}"),
                     };

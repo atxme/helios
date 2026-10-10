@@ -79,7 +79,7 @@ pub fn inspect_profile(profile: &ClientProfile) -> ProfileIssues {
     ProfileIssues {
         name: None,
         endpoint: when_filled(&profile.endpoint, validate_endpoint),
-        private_key: when_filled(&profile.private_key, |value| {
+        private_key: when_filled(profile.private_key.expose(), |value| {
             validate_wg_key(value, "clé privée")
         }),
         peer_public_key: when_filled(&profile.peer_public_key, |value| {
@@ -87,7 +87,8 @@ pub fn inspect_profile(profile: &ClientProfile) -> ProfileIssues {
         }),
         preshared_key: profile
             .preshared_key
-            .as_deref()
+            .as_ref()
+            .map(aether::SecretString::expose)
             .and_then(|value| when_filled(value, |value| validate_wg_key(value, "PSK"))),
         address: profile.address.as_deref().and_then(|value| {
             when_filled(value, |value| validate_cidr(value, "adresse virtuelle"))
@@ -126,14 +127,17 @@ pub fn inspect_profile(profile: &ClientProfile) -> ProfileIssues {
 pub(super) fn validate_imported_profile(mut profile: ClientProfile) -> Result<ClientProfile> {
     profile.name = profile.name.trim().to_string();
     profile.endpoint = profile.endpoint.trim().to_string();
-    profile.private_key = profile.private_key.trim().to_string();
+    profile.private_key = aether::SecretString::new(profile.private_key.expose().trim());
     profile.peer_public_key = profile.peer_public_key.trim().to_string();
     // Normalized rather than merely trimmed: a `wg-quick` file writes
     // `a/n,b/m` and the screen writes `a/n, b/m`. Same list, two spellings,
     // and a profile that came back from disk spelled differently from how it
     // was saved would show "unsaved changes" on every load.
     profile.allowed_ips = normalize_cidr_list(&profile.allowed_ips);
-    profile.preshared_key = non_empty(profile.preshared_key);
+    profile.preshared_key = profile
+        .preshared_key
+        .filter(|key| !key.is_empty())
+        .map(|key| aether::SecretString::new(key.expose().trim()));
     profile.address = non_empty(profile.address);
     profile.address_v6 = non_empty(profile.address_v6);
     profile.heliosd_url = non_empty(profile.heliosd_url);
@@ -153,13 +157,13 @@ pub(super) fn validate_imported_profile(mut profile: ClientProfile) -> Result<Cl
     // An invitation profile arrives without a private key: the operator
     // never held the client's, which is precisely what makes this mode safe.
     if !profile.private_key.is_empty() {
-        validate_wg_key(&profile.private_key, "clé privée du client")?;
+        validate_wg_key(profile.private_key.expose(), "clé privée du client")?;
     }
     if !profile.peer_public_key.is_empty() {
         validate_wg_key(&profile.peer_public_key, "clé publique de la gateway")?;
     }
     if let Some(psk) = &profile.preshared_key {
-        validate_wg_key(psk, "PresharedKey")?;
+        validate_wg_key(psk.expose(), "PresharedKey")?;
     }
     if profile.allowed_ips.is_empty() {
         anyhow::bail!("AllowedIPs ne peut pas être vide");

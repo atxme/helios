@@ -175,7 +175,9 @@ fn the_candidate_bundle_holds_the_keys_this_machine_generated() {
         .decode(&bundle.certificate_chain[0])
         .expect("leaf der");
     assert_eq!(certificate, grant.next_tls_certificate.as_bytes());
-    let pq_private = STANDARD.decode(&bundle.pq_private_key).expect("pq key");
+    let pq_private = STANDARD
+        .decode(bundle.pq_private_key.expose())
+        .expect("pq key");
     assert_eq!(
         derive_ml_dsa_87_public_key(&pq_private)
             .expect("derive public")

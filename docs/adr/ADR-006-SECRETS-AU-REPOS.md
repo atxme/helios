@@ -487,6 +487,20 @@ les **types et les flux**, puis sur `Drop` :
 * l'échec de verrouillage mémoire est visible dans la posture. Il est fatal pour
   `nomade`, averti pour `service`, où le chiffrement de volume reste obligatoire.
 
+**Types secrets et frontières d'encodage.** Les clés privées et PSK de
+`StoredChannel`, `ClientProfile`, `ProfileManifest` et `ClientIdentityBundle`
+sont des `SecretString`. Les types d'exécution ne portent ni `Clone` ni
+`Serialize` ; les copies nécessaires passent par `duplicate()`. Le manifeste
+HVLT conserve son encodage binaire existant. Pour le canal Astra, les deux
+slots de l'identité protégée et le document d'enrôlement, les seuls champs
+confiés à serde sont publics : les secrets sont encodés explicitement avec
+`aether::secret::json::SecretJson`, dans un tampon `Zeroizing` dont la capacité
+est fixée avant d'y placer un secret. La borne est de 256 Kio pour le canal
+et l'identité, et de 64 Kio pour le document d'import Orion. Les formats
+existants et les écritures privées atomiques sont conservés. Les fixtures
+TOML du format retiré sont réservées à `cfg(test)` ; aucun binaire livré ne
+dispose d'un sérialiseur TOML générique de profil secret.
+
 Durée de vie minimale : ouvrir, valider contexte et génération, installer dans le
 plan de données, effacer. Le noyau ou WireGuard-NT garde nécessairement le secret
 installé : son espace mémoire est une frontière distincte que `zeroize`

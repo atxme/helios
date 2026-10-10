@@ -48,6 +48,8 @@ use std::fmt;
 use serde::{Deserialize, Deserializer};
 use zeroize::Zeroize as _;
 
+pub mod json;
+
 /// A secret string (base64 PSK, private key…) that never prints itself.
 ///
 /// Deliberately **not** `Clone`: see the module documentation.

@@ -928,8 +928,11 @@ dernier effet exige la gateway réelle.
   seed de pleine entropie est admise par les spécifications. Les tirages
   secrets utilisent l'entrée native
   `RAND_bytes_with_user_prediction_resistance`, avec matériau issu du DRBG
-  public séparé ; le canal privé rustls sélectionne AWS-LC explicitement.
-  L’écart restant est le **matériel de session TLS** des autres chemins
+  public séparé. Cet apport additionnel ne force pas de reseed avec entropie
+  fraîche : les tests ne prouvent donc pas l'exigence de résistance à la
+  prédiction par appel des spécifications, et la bannière ne la revendique
+  pas. Le canal privé rustls sélectionne AWS-LC explicitement.
+  Un autre écart reste le **matériel de session TLS** des autres chemins
   `rustls`/`quinn`, encore sur le CSPRNG de `ring`. La **validation FIPS est hors périmètre** — la
   construction `aws-lc-fips-sys` exige Go (« Go is required for FIPS »), et aucun
   déploiement d’Helios ne revendique de certificat ;

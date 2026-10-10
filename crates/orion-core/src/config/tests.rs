@@ -345,7 +345,7 @@ fn a_negotiation_block_survives_save_and_reload() {
     enrolled.name = "poste-helios".into();
     cfg.upsert(enrolled).unwrap();
 
-    let encoded = toml::to_string_pretty(&cfg).unwrap();
+    let encoded = cfg.encode_legacy_fixture().unwrap();
     let reloaded: ClientConfig = toml::from_str(&encoded).unwrap();
     let settings = reloaded
         .find("poste-helios")
@@ -479,16 +479,17 @@ fn an_absent_ipv6_address_is_neither_invented_nor_written() {
     let profile = loaded.find("site-a").unwrap();
     assert_eq!(profile.address_v6, None);
 
-    let toml = toml::to_string(profile).unwrap();
+    let toml = toml::to_string(&profile.legacy_fixture()).unwrap();
     assert!(!toml.contains("address_v6"), "{toml}");
-    let json = serde_json::to_string(profile).unwrap();
+    let json = serde_json::to_string(&profile.legacy_fixture()).unwrap();
     assert!(!json.contains("address_v6"), "{json}");
 
     let dual = ClientProfile {
         address_v6: Some("fd3c:91a2:7e04::2/128".into()),
-        ..profile.clone()
+        ..profile.duplicate()
     };
-    let reread: ClientProfile = toml::from_str(&toml::to_string(&dual).unwrap()).unwrap();
+    let reread: ClientProfile =
+        toml::from_str(&toml::to_string(&dual.legacy_fixture()).unwrap()).unwrap();
     assert_eq!(reread.address_v6.as_deref(), Some("fd3c:91a2:7e04::2/128"));
 }
 

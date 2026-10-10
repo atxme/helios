@@ -168,10 +168,10 @@ pub struct ProfileManifest {
     pub name: String,
     pub endpoint: String,
     /// **Secret.**
-    pub private_key: Zeroizing<String>,
+    pub private_key: aether::SecretString,
     pub peer_public_key: String,
     /// **Secret**, when a static PSK is in use.
-    pub preshared_key: Option<Zeroizing<String>>,
+    pub preshared_key: Option<aether::SecretString>,
     pub address: Option<String>,
     /// Present only in a manifest of [`MANIFEST_VERSION`].
     pub address_v6: Option<String>,
@@ -201,9 +201,12 @@ impl ProfileManifest {
             generation,
             name: profile.name.clone(),
             endpoint: profile.endpoint.clone(),
-            private_key: Zeroizing::new(profile.private_key.clone()),
+            private_key: profile.private_key.duplicate(),
             peer_public_key: profile.peer_public_key.clone(),
-            preshared_key: profile.preshared_key.clone().map(Zeroizing::new),
+            preshared_key: profile
+                .preshared_key
+                .as_ref()
+                .map(aether::SecretString::duplicate),
             address: profile.address.clone(),
             address_v6: profile.address_v6.clone(),
             allowed_ips: profile.allowed_ips.clone(),
@@ -223,12 +226,12 @@ impl ProfileManifest {
         ClientProfile {
             name: self.name.clone(),
             endpoint: self.endpoint.clone(),
-            private_key: self.private_key.as_str().to_string(),
+            private_key: self.private_key.duplicate(),
             peer_public_key: self.peer_public_key.clone(),
             preshared_key: self
                 .preshared_key
                 .as_ref()
-                .map(|psk| psk.as_str().to_string()),
+                .map(aether::SecretString::duplicate),
             address: self.address.clone(),
             address_v6: self.address_v6.clone(),
             allowed_ips: self.allowed_ips.clone(),
@@ -266,7 +269,7 @@ impl ProfileManifest {
         };
         match &self.preshared_key {
             None => field(b""),
-            Some(psk) => field(psk.as_bytes()),
+            Some(psk) => field(psk.expose().as_bytes()),
         }
         match &self.key_negotiation {
             None => {
@@ -322,9 +325,12 @@ impl ProfileManifest {
         out.extend_from_slice(&self.generation.0.to_be_bytes());
         codec::put(&mut out, self.name.as_bytes())?;
         codec::put(&mut out, self.endpoint.as_bytes())?;
-        codec::put(&mut out, self.private_key.as_bytes())?;
+        codec::put(&mut out, self.private_key.expose().as_bytes())?;
         codec::put(&mut out, self.peer_public_key.as_bytes())?;
-        codec::put_option(&mut out, self.preshared_key.as_ref().map(|v| v.as_bytes()))?;
+        codec::put_option(
+            &mut out,
+            self.preshared_key.as_ref().map(|v| v.expose().as_bytes()),
+        )?;
         codec::put_option(&mut out, self.address.as_deref().map(str::as_bytes))?;
         codec::put(&mut out, self.allowed_ips.as_bytes())?;
         out.extend_from_slice(&self.persistent_keepalive.to_be_bytes());
@@ -397,9 +403,9 @@ impl ProfileManifest {
         let generation = SecurityGeneration(u64::from_be_bytes(cursor.array::<8>()?));
         let name = cursor.text()?;
         let endpoint = cursor.text()?;
-        let private_key = Zeroizing::new(cursor.text()?);
+        let private_key = aether::SecretString::new(cursor.text()?);
         let peer_public_key = cursor.text()?;
-        let preshared_key = cursor.option_text()?.map(Zeroizing::new);
+        let preshared_key = cursor.option_text()?.map(aether::SecretString::new);
         let address = cursor.option_text()?;
         let allowed_ips = cursor.text()?;
         let persistent_keepalive = u16::from_be_bytes(cursor.array::<2>()?);
@@ -662,9 +668,17 @@ mod tests {
         v1.extend_from_slice(&9u64.to_be_bytes());
         codec::put(&mut v1, source.name.as_bytes()).unwrap();
         codec::put(&mut v1, source.endpoint.as_bytes()).unwrap();
-        codec::put(&mut v1, source.private_key.as_bytes()).unwrap();
+        codec::put(&mut v1, source.private_key.expose().as_bytes()).unwrap();
         codec::put(&mut v1, source.peer_public_key.as_bytes()).unwrap();
-        codec::put_option(&mut v1, source.preshared_key.as_deref().map(str::as_bytes)).unwrap();
+        codec::put_option(
+            &mut v1,
+            source
+                .preshared_key
+                .as_ref()
+                .map(aether::SecretString::expose)
+                .map(str::as_bytes),
+        )
+        .unwrap();
         codec::put_option(&mut v1, source.address.as_deref().map(str::as_bytes)).unwrap();
         codec::put(&mut v1, source.allowed_ips.as_bytes()).unwrap();
         v1.extend_from_slice(&source.persistent_keepalive.to_be_bytes());
@@ -715,7 +729,7 @@ mod tests {
 
         let original_digest =
             ProfileManifest::from_profile(&source, SecurityGeneration(1)).security_digest();
-        let mut changed_policy = source.clone();
+        let mut changed_policy = source.duplicate();
         changed_policy
             .key_negotiation
             .as_mut()
@@ -761,9 +775,17 @@ mod tests {
         v2.extend_from_slice(&11u64.to_be_bytes());
         codec::put(&mut v2, source.name.as_bytes()).unwrap();
         codec::put(&mut v2, source.endpoint.as_bytes()).unwrap();
-        codec::put(&mut v2, source.private_key.as_bytes()).unwrap();
+        codec::put(&mut v2, source.private_key.expose().as_bytes()).unwrap();
         codec::put(&mut v2, source.peer_public_key.as_bytes()).unwrap();
-        codec::put_option(&mut v2, source.preshared_key.as_deref().map(str::as_bytes)).unwrap();
+        codec::put_option(
+            &mut v2,
+            source
+                .preshared_key
+                .as_ref()
+                .map(aether::SecretString::expose)
+                .map(str::as_bytes),
+        )
+        .unwrap();
         codec::put_option(&mut v2, source.address.as_deref().map(str::as_bytes)).unwrap();
         codec::put(&mut v2, source.allowed_ips.as_bytes()).unwrap();
         v2.extend_from_slice(&source.persistent_keepalive.to_be_bytes());
@@ -811,9 +833,17 @@ mod tests {
         v3.extend_from_slice(&12u64.to_be_bytes());
         codec::put(&mut v3, source.name.as_bytes()).unwrap();
         codec::put(&mut v3, source.endpoint.as_bytes()).unwrap();
-        codec::put(&mut v3, source.private_key.as_bytes()).unwrap();
+        codec::put(&mut v3, source.private_key.expose().as_bytes()).unwrap();
         codec::put(&mut v3, source.peer_public_key.as_bytes()).unwrap();
-        codec::put_option(&mut v3, source.preshared_key.as_deref().map(str::as_bytes)).unwrap();
+        codec::put_option(
+            &mut v3,
+            source
+                .preshared_key
+                .as_ref()
+                .map(aether::SecretString::expose)
+                .map(str::as_bytes),
+        )
+        .unwrap();
         codec::put_option(&mut v3, source.address.as_deref().map(str::as_bytes)).unwrap();
         codec::put(&mut v3, source.allowed_ips.as_bytes()).unwrap();
         v3.extend_from_slice(&source.persistent_keepalive.to_be_bytes());
@@ -868,9 +898,17 @@ mod tests {
         v4.extend_from_slice(&12u64.to_be_bytes());
         codec::put(&mut v4, source.name.as_bytes()).unwrap();
         codec::put(&mut v4, source.endpoint.as_bytes()).unwrap();
-        codec::put(&mut v4, source.private_key.as_bytes()).unwrap();
+        codec::put(&mut v4, source.private_key.expose().as_bytes()).unwrap();
         codec::put(&mut v4, source.peer_public_key.as_bytes()).unwrap();
-        codec::put_option(&mut v4, source.preshared_key.as_deref().map(str::as_bytes)).unwrap();
+        codec::put_option(
+            &mut v4,
+            source
+                .preshared_key
+                .as_ref()
+                .map(aether::SecretString::expose)
+                .map(str::as_bytes),
+        )
+        .unwrap();
         codec::put_option(&mut v4, source.address.as_deref().map(str::as_bytes)).unwrap();
         codec::put(&mut v4, source.allowed_ips.as_bytes()).unwrap();
         v4.extend_from_slice(&source.persistent_keepalive.to_be_bytes());
@@ -938,9 +976,17 @@ mod tests {
         v7.extend_from_slice(&3u64.to_be_bytes());
         codec::put(&mut v7, source.name.as_bytes()).unwrap();
         codec::put(&mut v7, source.endpoint.as_bytes()).unwrap();
-        codec::put(&mut v7, source.private_key.as_bytes()).unwrap();
+        codec::put(&mut v7, source.private_key.expose().as_bytes()).unwrap();
         codec::put(&mut v7, source.peer_public_key.as_bytes()).unwrap();
-        codec::put_option(&mut v7, source.preshared_key.as_deref().map(str::as_bytes)).unwrap();
+        codec::put_option(
+            &mut v7,
+            source
+                .preshared_key
+                .as_ref()
+                .map(aether::SecretString::expose)
+                .map(str::as_bytes),
+        )
+        .unwrap();
         codec::put_option(&mut v7, source.address.as_deref().map(str::as_bytes)).unwrap();
         codec::put(&mut v7, source.allowed_ips.as_bytes()).unwrap();
         v7.extend_from_slice(&source.persistent_keepalive.to_be_bytes());

@@ -385,7 +385,7 @@ pub async fn refresh(
     let private_key = Zeroizing::new(
         base64::Engine::decode(
             &base64::engine::general_purpose::STANDARD,
-            bundle.pq_private_key.trim(),
+            bundle.pq_private_key.expose().trim(),
         )
         .map_err(|_| {
             TrustUpdateError::Transport("clé privée PQ cliente : base64 illisible".into())

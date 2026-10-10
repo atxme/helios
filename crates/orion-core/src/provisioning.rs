@@ -210,7 +210,7 @@ impl ClientProfile {
     pub fn wg_public_key(&self) -> Result<String, ProvisionError> {
         use base64::Engine as _;
         let raw = base64::engine::general_purpose::STANDARD
-            .decode(self.private_key.trim())
+            .decode(self.private_key.expose().trim())
             .map_err(|e| ProvisionError::Profile(format!("clé privée illisible : {e}")))?;
         let raw: [u8; 32] = raw
             .try_into()

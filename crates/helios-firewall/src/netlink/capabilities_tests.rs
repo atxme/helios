@@ -58,8 +58,11 @@ fn expressions(payload: &[u8]) -> Vec<(&str, Attributes<'_>)> {
         .map(|(_, payload)| {
             let expr = attributes(payload);
             let name = attribute(&expr, sys::NFTA_EXPR_NAME);
+            // NLA_STRING allows an optional NUL; rustables omits it.
+            // https://github.com/torvalds/linux/blob/master/lib/nlattr.c
+            let name = name.strip_suffix(b"\0").unwrap_or(name);
             (
-                std::str::from_utf8(&name[..name.len() - 1]).unwrap(),
+                std::str::from_utf8(name).unwrap(),
                 attributes(attribute(&expr, sys::NFTA_EXPR_DATA)),
             )
         })
@@ -83,8 +86,8 @@ fn named_counters_are_declared_once_before_their_references() {
     assert_eq!(objects.len(), 1);
     let (index, (_, payload)) = objects[0];
     let object = attributes(payload);
-    assert_eq!(attribute(&object, sys::NFTA_OBJ_TABLE), b"helios\0");
-    assert_eq!(attribute(&object, sys::NFTA_OBJ_NAME), b"drops\0");
+    assert_eq!(attribute(&object, sys::NFTA_OBJ_TABLE), b"helios");
+    assert_eq!(attribute(&object, sys::NFTA_OBJ_NAME), b"drops");
     assert_eq!(attribute(&object, sys::NFTA_OBJ_TYPE), 1u32.to_be_bytes());
     assert!(object
         .iter()
@@ -106,10 +109,7 @@ fn named_counters_are_declared_once_before_their_references() {
             attribute(&exprs[0].1, sys::NFTA_OBJREF_IMM_TYPE),
             1u32.to_be_bytes()
         );
-        assert_eq!(
-            attribute(&exprs[0].1, sys::NFTA_OBJREF_IMM_NAME),
-            b"drops\0"
-        );
+        assert_eq!(attribute(&exprs[0].1, sys::NFTA_OBJREF_IMM_NAME), b"drops");
     }
 }
 

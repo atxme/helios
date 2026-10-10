@@ -169,9 +169,9 @@ pub(super) fn parse_wg_quick(contents: &str, file_name: &str) -> Result<WgQuickI
     let profile = ClientProfile {
         name: profile_name_from_file(file_name),
         endpoint: required_field(&peer, "endpoint", "Endpoint")?,
-        private_key: required_field(&interface, "privatekey", "PrivateKey")?,
+        private_key: required_field(&interface, "privatekey", "PrivateKey")?.into(),
         peer_public_key: required_field(&peer, "publickey", "PublicKey")?,
-        preshared_key: peer.get("presharedkey").cloned(),
+        preshared_key: peer.get("presharedkey").map(|key| key.as_str().into()),
         address,
         address_v6,
         allowed_ips: peer

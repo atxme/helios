@@ -97,7 +97,7 @@ fn profile(name: &str) -> ClientProfile {
     ClientProfile {
         name: name.into(),
         endpoint: "203.0.113.10:51820".into(),
-        private_key: pair.private_key.expose().to_string(),
+        private_key: pair.private_key.duplicate(),
         peer_public_key: gateway.public_key,
         address: Some("100.64.1.2/32".into()),
         ..ClientProfile::default()
@@ -231,7 +231,7 @@ fn a_sealed_profile_cannot_change_security_kind_in_place() {
     let classic = profile("poste");
     store.save_profile(&classic).unwrap();
 
-    let mut helios = classic.clone();
+    let mut helios = classic.duplicate();
     helios.profile_type = Some(ProfileKind::HeliosKeyNegotiation);
     helios.key_negotiation = Some(negotiation());
     let error = store.save_profile(&helios).unwrap_err();
@@ -255,8 +255,8 @@ fn no_secret_reaches_any_file_in_the_store() {
         let bytes = std::fs::read(&entry).unwrap();
         assert!(
             !bytes
-                .windows(original.private_key.len())
-                .any(|w| w == original.private_key.as_bytes()),
+                .windows(original.private_key.expose().len())
+                .any(|w| w == original.private_key.expose().as_bytes()),
             "the private key appears in {}",
             entry.display()
         );
@@ -336,7 +336,7 @@ fn raising_a_floor_writes_no_plaintext_file() {
         "une montée de plancher a recréé {}",
         LEGACY_FILE
     );
-    let secret = profile.private_key.as_bytes();
+    let secret = profile.private_key.expose().as_bytes();
     for path in walk(&dir) {
         let bytes = std::fs::read(&path).unwrap();
         assert!(
@@ -368,11 +368,7 @@ fn a_key_rotation_raises_the_generation() {
     let mut original = profile("poste");
     store.save_profile(&original).unwrap();
 
-    original.private_key = aether::wg::generate_keypair()
-        .unwrap()
-        .private_key
-        .expose()
-        .to_string();
+    original.private_key = aether::wg::generate_keypair().unwrap().private_key;
     store.save_profile(&original).unwrap();
 
     let root = store.root().unwrap();
@@ -410,11 +406,7 @@ fn every_security_change_raises_the_generation() {
     type Change = fn(&mut ClientProfile);
     let cases: [(&str, Change); 4] = [
         ("clé WireGuard", |profile| {
-            profile.private_key = aether::wg::generate_keypair()
-                .unwrap()
-                .private_key
-                .expose()
-                .to_string();
+            profile.private_key = aether::wg::generate_keypair().unwrap().private_key;
         }),
         ("PSK statique", |profile| {
             profile.preshared_key = Some("cHNrLXJlbXBsYWNhbnQtMzItb2N0ZXRz".into());
@@ -473,7 +465,12 @@ fn the_registry_records_a_digest_and_never_the_psk() {
         .clone();
     assert_ne!(entry.security_digest, [0u8; 32], "digest non calculé");
 
-    let psk = original.preshared_key.as_deref().unwrap().as_bytes();
+    let psk = original
+        .preshared_key
+        .as_ref()
+        .map(aether::SecretString::expose)
+        .unwrap()
+        .as_bytes();
     for path in walk(&dir) {
         let bytes = std::fs::read(&path).unwrap();
         assert!(
@@ -560,8 +557,8 @@ fn the_ipv6_address_round_trips_through_the_store_only_when_present() {
         .unwrap();
 
     let loaded = store.load().unwrap();
-    let ipv4 = loaded.find("ipv4").unwrap().clone();
-    let dual = loaded.find("dual").unwrap().clone();
+    let ipv4 = loaded.find("ipv4").unwrap().duplicate();
+    let dual = loaded.find("dual").unwrap().duplicate();
     assert_eq!(ipv4.address.as_deref(), Some("100.64.1.2/32"));
     assert_eq!(ipv4.address_v6, None, "absent, not invented");
     assert_eq!(dual.address_v6.as_deref(), Some("fd3c:91a2:7e04::2/128"));
@@ -581,7 +578,7 @@ fn the_ipv6_address_round_trips_through_the_store_only_when_present() {
     );
 
     // The user's edit is what removes it.
-    let mut cleared = reloaded.find("dual").unwrap().clone();
+    let mut cleared = reloaded.find("dual").unwrap().duplicate();
     cleared.address_v6 = None;
     store.save_profile(&cleared).unwrap();
     assert_eq!(store.load().unwrap().find("dual").unwrap().address_v6, None);
@@ -595,10 +592,10 @@ fn a_legacy_file_is_migrated_and_removed() {
         profiles: vec![profile("poste")],
         selected: Some("poste".into()),
     };
-    let secret = legacy.profiles[0].private_key.clone();
+    let secret = legacy.profiles[0].private_key.duplicate();
     std::fs::write(
         dir.join(LEGACY_FILE),
-        toml::to_string_pretty(&legacy).unwrap(),
+        legacy.encode_legacy_fixture().unwrap(),
     )
     .unwrap();
 
@@ -619,12 +616,12 @@ fn a_migrated_profile_stays_blocked_until_its_key_is_rotated() {
     let (dir, store) = store("rotation");
     let original = profile("poste");
     let legacy = ClientConfig {
-        profiles: vec![original.clone()],
+        profiles: vec![original.duplicate()],
         selected: None,
     };
     std::fs::write(
         dir.join(LEGACY_FILE),
-        toml::to_string_pretty(&legacy).unwrap(),
+        legacy.encode_legacy_fixture().unwrap(),
     )
     .unwrap();
     store.migrate_legacy().unwrap();
@@ -643,12 +640,8 @@ fn a_migrated_profile_stays_blocked_until_its_key_is_rotated() {
     );
 
     // A new key closes it.
-    let mut rotated = original.clone();
-    rotated.private_key = aether::wg::generate_keypair()
-        .unwrap()
-        .private_key
-        .expose()
-        .to_string();
+    let mut rotated = original.duplicate();
+    rotated.private_key = aether::wg::generate_keypair().unwrap().private_key;
     store.save_profile(&rotated).unwrap();
     assert!(
         store.rotation_required().unwrap().is_empty(),
@@ -666,7 +659,7 @@ fn migrating_twice_is_harmless() {
     };
     std::fs::write(
         dir.join(LEGACY_FILE),
-        toml::to_string_pretty(&legacy).unwrap(),
+        legacy.encode_legacy_fixture().unwrap(),
     )
     .unwrap();
     store.migrate_legacy().unwrap();
@@ -703,11 +696,7 @@ fn an_older_manifest_is_refused() {
     let old_blob = std::fs::read(store.manifest_path(id)).unwrap();
 
     // Rotate: generation 2, registry updated.
-    original.private_key = aether::wg::generate_keypair()
-        .unwrap()
-        .private_key
-        .expose()
-        .to_string();
+    original.private_key = aether::wg::generate_keypair().unwrap().private_key;
     store.save_profile(&original).unwrap();
 
     // Put the generation-1 blob back. Its context no longer matches the

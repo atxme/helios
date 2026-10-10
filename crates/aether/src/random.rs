@@ -86,12 +86,18 @@
 //!   manifest therefore pins its `aws_lc_rs` feature so these keys come from
 //!   the DRBG above.
 //!
-//! **Per-call prediction resistance uses AWS-LC's own native entry point.**
+//! **Known limitation: fresh-entropy reseeding before every secret draw.**
 //! `aws-lc-rs` does not wrap `RAND_bytes_with_user_prediction_resistance`, so
 //! this module calls the matching `aws-lc-sys` symbol for secret draws and
 //! feeds it 32 bytes from AWS-LC's separate public DRBG. This is an ABI
 //! adaptation only: no DRBG state, update primitive, seed derivation or health
-//! test exists in Helios.
+//! test exists in Helios. The native function mixes that input into generate;
+//! it does not force a reseed, and the public DRBG output is not fresh platform
+//! entropy. This therefore does not meet the specifications' reseed-before-key
+//! requirement. Unblocking it requires a provider API that guarantees that
+//! reseed, including the provider's internal ML-KEM and TLS key generation.
+//! The banner reports per-call prediction resistance as unavailable rather
+//! than treating additional input as that guarantee.
 //!
 //! **TLS session material on the public QUIC negotiation is still on
 //! `ring`.** The private Astra mTLS configuration selects AWS-LC explicitly,
@@ -212,7 +218,8 @@ pub struct ProviderDescription {
     pub use_df: bool,
     /// Generate calls the provider allows between two entropy inputs.
     pub reseed_interval_generates: u64,
-    /// Whether the provider takes per-call prediction resistance.
+    /// Whether the provider guarantees fresh-entropy prediction resistance
+    /// before each secret draw, rather than only mixing additional input.
     pub per_call_prediction_resistance: bool,
 }
 
@@ -286,7 +293,7 @@ impl DrbgProvider for AwsLcProvider {
             // §10.2.1.3.1, no derivation function. Reported exactly as it is.
             use_df: false,
             reseed_interval_generates: AWS_LC_RESEED_INTERVAL,
-            per_call_prediction_resistance: true,
+            per_call_prediction_resistance: false,
         }
     }
 
@@ -581,7 +588,10 @@ mod tests {
             description.reseed_interval_generates,
             AWS_LC_RESEED_INTERVAL
         );
-        assert!(description.per_call_prediction_resistance);
+        assert!(!description.per_call_prediction_resistance);
+        assert!(description
+            .to_string()
+            .contains("prediction_resistance=provider-profile"));
 
         // The banner carries every field, secrets excepted: a deployment reads
         // what it runs on its first journal line.

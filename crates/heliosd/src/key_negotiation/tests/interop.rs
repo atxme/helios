@@ -238,7 +238,7 @@ async fn end_to_end_negotiation(leaf: GatewayLeaf, family: ClientFamily) {
     let profile = orion_core::ClientProfile {
         name: "orion".into(),
         endpoint: family.endpoint(address.port()),
-        private_key: client_wg.private_key.expose().to_string(),
+        private_key: client_wg.private_key.duplicate(),
         peer_public_key: gateway_wg.public_key.clone(),
         address: Some("100.64.1.2/32".into()),
         key_negotiation: Some(orion_core::KeyNegotiationSettings {
