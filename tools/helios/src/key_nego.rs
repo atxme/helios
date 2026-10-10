@@ -285,6 +285,7 @@ pub async fn run(command: KeyNegoCmd) -> Result<()> {
                         .context("parsing the gateway PQ certificate")?,
                     gateway_ca_pq_public_key: ca_pq_anchor,
                     minimum_mode: mode.into(),
+                    route: orion_core::key_negotiation::NegotiationRoute::OffTunnel,
                 },
                 mode.into(),
                 &client_wg_public_key,

@@ -256,3 +256,93 @@ fn a_default_route_carries_every_address() {
         "http://[fd00::1]:8080/api/key-negotiation/release"
     );
 }
+
+// ---- In-tunnel renewal route ------------------------------------------------
+
+use super::renewal_route;
+use crate::config::{ClientProfile, KeyNegotiationSettings, ProfileKind};
+use aether::key_negotiation::ProtectionMode;
+
+fn renewal_profile() -> ClientProfile {
+    ClientProfile {
+        name: "poste".into(),
+        endpoint: "gateway.example:51820".into(),
+        private_key: "cHJpdmF0ZQ==".into(),
+        peer_public_key: "cHVibGlj".into(),
+        profile_type: Some(ProfileKind::HeliosKeyNegotiation),
+        heliosd_url: Some("http://100.64.0.1:8080".into()),
+        allowed_ips: "0.0.0.0/0, ::/0".into(),
+        address: Some("100.64.1.2/32".into()),
+        address_v6: Some("fd00::2/128".into()),
+        key_negotiation: Some(KeyNegotiationSettings {
+            mode: ProtectionMode::MlKem,
+            minimum_mode: ProtectionMode::MlKem,
+            endpoint: "gateway.example:51821".into(),
+            server_name: "gw.example".into(),
+            gateway_ca_der: "MIIB".into(),
+            gateway_pq_certificate: "e30=".into(),
+            identity: "orion-poste".into(),
+            trust: None,
+        }),
+        ..ClientProfile::default()
+    }
+}
+
+#[test]
+fn a_renewal_dials_the_gateway_inside_the_tunnel_from_the_vip() {
+    let route = renewal_route(&renewal_profile()).unwrap();
+    assert_eq!(route.remote, "100.64.0.1:51821".parse().unwrap());
+    assert_eq!(
+        route.local_vip,
+        "100.64.1.2".parse::<std::net::IpAddr>().unwrap()
+    );
+}
+
+#[test]
+fn an_ipv6_gateway_address_takes_the_ipv6_vip() {
+    let mut profile = renewal_profile();
+    profile.heliosd_url = Some("http://[fd00::1]:8080".into());
+    let route = renewal_route(&profile).unwrap();
+    assert_eq!(route.remote, "[fd00::1]:51821".parse().unwrap());
+    assert_eq!(
+        route.local_vip,
+        "fd00::2".parse::<std::net::IpAddr>().unwrap()
+    );
+}
+
+#[test]
+fn a_renewal_route_is_refused_rather_than_guessed() {
+    let mut missing = renewal_profile();
+    missing.heliosd_url = None;
+    assert!(renewal_route(&missing).is_err(), "no internal URL");
+
+    let mut named = renewal_profile();
+    named.heliosd_url = Some("http://helios.lan:8080".into());
+    assert!(
+        renewal_route(&named).is_err(),
+        "a name would be resolved in clear"
+    );
+
+    let mut outside = renewal_profile();
+    outside.allowed_ips = "10.0.0.0/8".into();
+    assert!(
+        renewal_route(&outside).is_err(),
+        "outside AllowedIPs leaves in clear"
+    );
+
+    let mut no_vip = renewal_profile();
+    no_vip.address = None;
+    assert!(
+        renewal_route(&no_vip).is_err(),
+        "no VIP of the gateway's family"
+    );
+}
+
+#[test]
+fn the_tunnel_socket_is_bound_to_the_given_source() {
+    let socket = crate::net_pin::tunnel_socket("127.0.0.1".parse().unwrap()).unwrap();
+    assert_eq!(
+        socket.local_addr().unwrap().ip(),
+        std::net::Ipv4Addr::LOCALHOST
+    );
+}
