@@ -46,6 +46,7 @@ use crate::config::ClientProfile;
 use crate::events::{ClientEvent, PskKind};
 
 pub mod dryrun;
+pub mod renewal;
 #[cfg(feature = "wireguard")]
 pub mod wireguard;
 
