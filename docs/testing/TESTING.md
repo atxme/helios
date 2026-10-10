@@ -483,6 +483,55 @@ valide alors le vrai chemin ESAPI — politique de lecture NV sans `OWNERREAD`,
 écrasement et impossibilité de ressusciter le secret avec le seul
 marqueur disque — sans prétendre mesurer Secure Boot ni les PCR d'une cible.
 
+### Renouvellement du PSK à chaud (V1)
+
+Cet essai juge le renouvellement dans le tunnel
+([§7.6](../specification/NEGOCIATION-DE-CLE-V5.md#76-renouvellement-dans-le-tunnel))
+sur les critères du [§12.3](../specification/NEGOCIATION-DE-CLE-V5.md#123-politique-de-renouvellement).
+Il se mène sur le **code de production**, sans variable qui raccourcisse la durée
+de vie : le renouvellement est forcé par l'action « Renouveler la clé
+maintenant » d'Orion. Rien n'en est mesuré à ce jour, et rien ne se coche depuis
+WSL2.
+
+À répéter sur le **noyau Linux** et sur **WireGuard-NT**, d'abord sur un chemin
+sain, puis sur un chemin dégradé :
+
+1. monter un tunnel `ml_kem` entre Orion et la gateway ; relever la VIP du
+   client `<VIP>` et le port de négociation `<port>` ;
+2. depuis la gateway, mesurer l'interruption applicative :
+   `ping -D -i 0.01 <VIP> | tee ping.log` (intervalle de 10 ms, horodatage
+   absolu) ;
+3. depuis le client, lancer **une seule** connexion TCP qui traverse tout
+   l'essai : `iperf3 -c <VIP gateway> -t 1500 -J > iperf.json` ; une connexion
+   rompue ou relancée est un échec du critère ;
+4. sur la gateway, capturer les messages de négociation :
+   `tcpdump -ttt 'udp port <port> and (udp[8]=1 or udp[8]=2)'` ;
+5. déclencher **20 renouvellements consécutifs** par « Renouveler la clé
+   maintenant », en attendant le « clé renouvelée » de chacun ;
+6. relever pour chaque renouvellement le délai jusqu'au handshake observé après
+   la réinitialisation, le plus long trou de réponses du `ping`, et l'état de la
+   connexion `iperf3` ;
+7. recommencer avec un chemin dégradé sur l'interface qui porte le trafic :
+   `tc qdisc add dev <iface> root netem delay 150ms 30ms loss 5%`, retiré
+   ensuite par `tc qdisc del dev <iface> root`.
+
+Verdict **PASS ou FAIL par critère**, pour chaque noyau et chaque chemin :
+
+| Critère (§12.3) | Seuil | Source de mesure |
+| --- | --- | --- |
+| handshake après la réinitialisation, observé sur les deux backends | < 5 s | `wg show … latest-handshakes` et journaux des deux côtés |
+| interruption du trafic applicatif | < 1 s | plus long trou du `ping` |
+| sessions TCP traversant le tunnel | aucune rompue | `iperf3` unique, sans erreur dans le JSON |
+| renouvellements consécutifs réussis | 20 sur 20 | événements « clé renouvelée » |
+
+Un seul FAIL sur le chemin sain rouvre la politique : le repli est la
+déconnexion puis la reconnexion complètes du §12.3, jamais la suppression de la
+preuve par handshake. Sur le chemin dégradé, consigner les écarts même quand le
+verdict reste PASS. Vérifier aussi, sur la gateway, que la règle du port de
+négociation n'existe que sur les WAN et sur `wg_iface` (`nft list ruleset`), et
+que `remove_peer` suivi de `configure_peer` réinscrit bien le pair avec le
+nouveau PSK sur chacun des deux backends.
+
 ## Banc de développement
 
 `scripts/lab.sh` monte un environnement complet — gateway `--dev` isolée, client
