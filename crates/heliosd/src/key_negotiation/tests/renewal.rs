@@ -91,3 +91,71 @@ async fn a_vip_belonging_to_another_peer_is_not_admitted() {
         "a certificate cannot negotiate from another peer's VIP"
     );
 }
+
+fn installed() -> InstalledPsk {
+    InstalledPsk {
+        transaction_id: [1; 16],
+        public_key: CLIENT_KEY.into(),
+        address: "100.64.1.2/32".into(),
+        installed_at: std::time::Instant::now(),
+        bytes_baseline: None,
+    }
+}
+
+const GIB: u64 = 1024 * 1024 * 1024;
+
+#[test]
+fn the_first_observation_only_sets_the_baseline() {
+    let mut psk = installed();
+    assert_eq!(psk.charge_transfer(500 * GIB), None);
+    assert_eq!(psk.bytes_baseline, Some(500 * GIB));
+    assert_eq!(psk.charge_transfer(599 * GIB), None, "99 GiB carried");
+    assert!(psk.charge_transfer(600 * GIB).is_some(), "100 GiB carried");
+}
+
+#[test]
+fn a_counter_that_went_backwards_rebases_instead_of_reclaiming() {
+    let mut psk = installed();
+    psk.charge_transfer(90 * GIB);
+    assert_eq!(
+        psk.charge_transfer(GIB),
+        None,
+        "peer re-created: counting restarts"
+    );
+    assert_eq!(psk.bytes_baseline, Some(GIB));
+}
+
+fn status(total: u64) -> helios_wireguard::PeerStatus {
+    helios_wireguard::PeerStatus {
+        public_key: base64::engine::general_purpose::STANDARD
+            .decode(CLIENT_KEY)
+            .unwrap(),
+        allowed_ips: Vec::new(),
+        last_handshake: Some(std::time::SystemTime::now()),
+        endpoint: None,
+        rx_bytes: total / 2,
+        tx_bytes: total - total / 2,
+    }
+}
+
+#[tokio::test]
+async fn a_committed_psk_is_reclaimed_at_its_byte_ceiling() {
+    let fixture = pq_fixture();
+    let (handler, plane) = gateway_with(&fixture, &psk(), ProtectionMode::MlKem);
+    commit(&handler, &plane, &fixture, [40; 16], PUBLIC_SOURCE).await;
+
+    assert!(
+        handler.reclaimable(&[status(10 * GIB)]).await.is_empty(),
+        "baseline"
+    );
+    assert!(
+        handler.reclaimable(&[status(109 * GIB)]).await.is_empty(),
+        "99 GiB"
+    );
+    let reclaimed = handler.reclaimable(&[status(110 * GIB)]).await;
+    assert_eq!(reclaimed.len(), 1);
+    assert!(
+        reclaimed[0].2.contains("ceiling"),
+        "the journal names the cause: {reclaimed:?}"
+    );
+}

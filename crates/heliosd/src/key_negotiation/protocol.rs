@@ -557,6 +557,7 @@ impl NegotiationHandler for GatewayHandler {
                     public_key: transaction.public_key.clone(),
                     address: transaction.address.clone(),
                     installed_at: std::time::Instant::now(),
+                    bytes_baseline: None,
                 }),
             };
             slot.generation += 1;

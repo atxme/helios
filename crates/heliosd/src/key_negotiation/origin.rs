@@ -117,6 +117,7 @@ mod tests {
             public_key: "laptop-key".into(),
             address: "100.64.1.2/32".into(),
             installed_at: std::time::Instant::now(),
+            bytes_baseline: None,
         });
         assert!(tunnel_renewal_allowed(ProtectionMode::MlKem, &committed));
         assert!(!tunnel_renewal_allowed(
