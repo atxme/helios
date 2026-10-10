@@ -407,6 +407,8 @@ pub struct VpnController {
     /// the only fact that proves the repair worked — a fresh handshake — never
     /// by having attempted one.
     stale_renegotiations: Arc<AtomicU32>,
+    /// Is a PSK renewal in flight? At most one at a time.
+    renewing: Arc<AtomicBool>,
     key_negotiation_identities: Option<Arc<dyn crate::key_negotiation::IdentityProvider>>,
 }
 
@@ -422,13 +424,47 @@ struct InstalledNegotiation {
     /// same identity and aimed at the same gateway, and the profile in use
     /// may have changed by the time the user disconnects.
     profile: ClientProfile,
+    /// The copy the data plane received — literal endpoint, PSK in place.
+    ///
+    /// A renewal re-registers the peer from it with the new PSK, and puts it
+    /// back as it was if the renewal does not commit.
+    data_plane: ClientProfile,
+    clock: renewal::RenewalClock,
+    /// Renewals failed since this PSK was committed.
+    failures: u32,
+    /// No automatic renewal before this instant (back-off).
+    next_attempt: Option<std::time::Instant>,
 }
 
 impl InstalledNegotiation {
+    fn new(
+        transaction_id: [u8; 16],
+        profile: ClientProfile,
+        data_plane: ClientProfile,
+        bytes: Option<u64>,
+    ) -> Self {
+        Self {
+            transaction_id,
+            profile,
+            data_plane,
+            clock: renewal::RenewalClock::start(
+                std::time::Instant::now(),
+                std::time::SystemTime::now(),
+                bytes,
+            ),
+            failures: 0,
+            next_attempt: None,
+        }
+    }
+
     fn duplicate(&self) -> Self {
         Self {
             transaction_id: self.transaction_id,
             profile: self.profile.duplicate(),
+            data_plane: self.data_plane.duplicate(),
+            clock: self.clock.clone(),
+            failures: self.failures,
+            next_attempt: self.next_attempt,
         }
     }
 }
@@ -443,6 +479,7 @@ impl VpnController {
             link_lost: Arc::new(AtomicBool::new(false)),
             mounted_profile: Arc::new(Mutex::new(None)),
             stale_renegotiations: Arc::new(AtomicU32::new(0)),
+            renewing: Arc::new(AtomicBool::new(false)),
             key_negotiation_identities: None,
         }
     }
@@ -820,6 +857,69 @@ impl VpnController {
         true
     }
 
+    /// Renews the negotiated PSK through the tunnel once it is due.
+    ///
+    /// Called by the shell's state loop beside [`Self::poll_handshake`].
+    /// Never touches the adapter beyond re-registering the peer.
+    pub async fn poll_renewal(&self, user_sink: EventSink) {
+        if self.state() != TunnelState::Up {
+            return;
+        }
+        // Read before taking the receipt lock: the counters come from the
+        // data plane, and the lock is not held across that call.
+        let bytes = self.backend.transfer_bytes().await;
+        let trigger = {
+            let mut installed = self.installed.lock().await;
+            let Some(receipt) = installed.as_mut() else {
+                return;
+            };
+            if receipt
+                .next_attempt
+                .is_some_and(|at| std::time::Instant::now() < at)
+            {
+                return;
+            }
+            match receipt.clock.due(
+                std::time::Instant::now(),
+                std::time::SystemTime::now(),
+                bytes,
+            ) {
+                Some(trigger) => trigger,
+                None => return,
+            }
+        };
+        self.start_renewal(trigger, user_sink);
+    }
+
+    /// Renews now, at the user's request (and for the V1 measurement).
+    pub async fn renew_now(&self, user_sink: EventSink) -> anyhow::Result<()> {
+        if self.state() != TunnelState::Up || self.installed.lock().await.is_none() {
+            anyhow::bail!("aucun tunnel ML-KEM monté : rien à renouveler");
+        }
+        if self.key_negotiation_identities.is_none() {
+            anyhow::bail!("aucun magasin d'identités protégé : renouvellement impossible");
+        }
+        self.start_renewal(renewal::RenewalTrigger::Manual, user_sink);
+        Ok(())
+    }
+
+    fn start_renewal(&self, trigger: renewal::RenewalTrigger, user_sink: EventSink) {
+        if self.renewing.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let flag = ClearOnDrop(Arc::clone(&self.renewing));
+        let Some(identities) = self.key_negotiation_identities.clone() else {
+            return;
+        };
+        let backend = Arc::clone(&self.backend);
+        let installed = Arc::clone(&self.installed);
+        let sink = self.wrap_sink(user_sink);
+        tokio::spawn(async move {
+            let _flag = flag;
+            run_renewal(&backend, identities.as_ref(), &installed, trigger, &sink).await;
+        });
+    }
+
     async fn abort_task(&self) {
         if let Some(handle) = self.task.lock().await.take() {
             handle.abort();
@@ -1037,10 +1137,15 @@ async fn connect_with_key_negotiation(
                 // refuses — so recording a receipt here would only schedule a
                 // round trip that announces the disconnection and changes
                 // nothing (spec §12.2).
+                let bytes = backend.transfer_bytes().await;
                 *installed.lock().await = (mode == aether::key_negotiation::ProtectionMode::MlKem)
-                    .then(|| InstalledNegotiation {
-                        transaction_id,
-                        profile: profile.duplicate(),
+                    .then(|| {
+                        InstalledNegotiation::new(
+                            transaction_id,
+                            profile.duplicate(),
+                            negotiated_profile.duplicate(),
+                            bytes,
+                        )
                     });
                 link_lost.store(false, Ordering::SeqCst);
                 let protection = match mode {
@@ -1299,6 +1404,216 @@ async fn wait_for_new_handshake(
         tokio::time::sleep(NEGOTIATION_POLL_INTERVAL).await;
     }
     false
+}
+
+/// What a renewal needs from a prepared negotiation.
+///
+/// Implemented by [`crate::key_negotiation::NegotiatedKey`]; tests substitute
+/// a fake to drive the failure and cancellation paths without a gateway.
+#[async_trait]
+pub(crate) trait PendingRenewal: Send {
+    fn psk(&self) -> Option<&aether::SecretString>;
+    fn transaction_id(&self) -> [u8; 16];
+    fn confirmation_timeout(&self) -> Duration;
+    async fn confirm(self: Box<Self>) -> anyhow::Result<()>;
+}
+
+#[async_trait]
+impl PendingRenewal for crate::key_negotiation::NegotiatedKey {
+    fn psk(&self) -> Option<&aether::SecretString> {
+        self.psk.as_ref()
+    }
+    fn transaction_id(&self) -> [u8; 16] {
+        crate::key_negotiation::NegotiatedKey::transaction_id(self)
+    }
+    fn confirmation_timeout(&self) -> Duration {
+        self.confirmation_timeout
+    }
+    async fn confirm(self: Box<Self>) -> anyhow::Result<()> {
+        crate::key_negotiation::NegotiatedKey::confirm(*self).await
+    }
+}
+
+/// Re-registers the previous peer unless disarmed.
+///
+/// On an error return **and** when the renewal future is dropped mid-way: a
+/// cancelled future runs no exit path of its own, so the restore is spawned
+/// from `Drop`. Dropping the pending negotiation closes its QUIC session and
+/// the gateway restores its own previous slot — both ends land on the old PSK.
+struct RestorePrevious {
+    backend: Arc<dyn VpnBackend>,
+    previous: Option<ClientProfile>,
+    sink: EventSink,
+}
+
+impl RestorePrevious {
+    fn disarm(mut self) {
+        self.previous = None;
+    }
+}
+
+impl Drop for RestorePrevious {
+    fn drop(&mut self) {
+        let Some(previous) = self.previous.take() else {
+            return;
+        };
+        let backend = Arc::clone(&self.backend);
+        let sink = Arc::clone(&self.sink);
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move {
+                    match backend.rekey_peer(&previous, &sink).await {
+                        Ok(()) => sink(ClientEvent::log(
+                            "warn",
+                            "renouvellement non abouti : l'ancien PSK est remis en place"
+                                .to_string(),
+                        )),
+                        Err(error) => sink(ClientEvent::log(
+                            "error",
+                            format!(
+                                "renouvellement non abouti et ancien PSK non remis en place \
+                                 ({error:#}) : la reconnexion automatique prendra le relais"
+                            ),
+                        )),
+                    }
+                });
+            }
+            Err(_) => {
+                tracing::error!("renewal rollback: no runtime left to restore the previous peer");
+            }
+        }
+    }
+}
+
+/// Installs a renewed PSK by re-registering the peer, proves it with a fresh
+/// handshake, then commits (design 2026-10-09 §3).
+async fn renew_slot(
+    backend: &Arc<dyn VpnBackend>,
+    current: &InstalledNegotiation,
+    pending: Box<dyn PendingRenewal>,
+    sink: &EventSink,
+) -> anyhow::Result<InstalledNegotiation> {
+    let psk = pending
+        .psk()
+        .context("an in-tunnel renewal must derive an ml_kem PSK")?
+        .duplicate();
+    let renewed = ClientProfile {
+        preshared_key: Some(psk),
+        preshared_key_is_negotiated: true,
+        ..current.data_plane.duplicate()
+    };
+    let timeout = pending.confirmation_timeout();
+    let transaction_id = pending.transaction_id();
+    let prepared_at = tokio::time::Instant::now();
+    let restore = RestorePrevious {
+        backend: Arc::clone(backend),
+        previous: Some(current.data_plane.duplicate()),
+        sink: Arc::clone(sink),
+    };
+    backend
+        .rekey_peer(&renewed, sink)
+        .await
+        .context("re-registering the peer with the renewed PSK")?;
+    if !wait_for_new_handshake(backend, prepared_at, timeout).await {
+        anyhow::bail!(
+            "no WireGuard handshake with the renewed PSK within {} s",
+            timeout.as_secs()
+        );
+    }
+    pending.confirm().await.context("confirming the renewal")?;
+    restore.disarm();
+    Ok(InstalledNegotiation::new(
+        transaction_id,
+        current.profile.duplicate(),
+        renewed,
+        backend.transfer_bytes().await,
+    ))
+}
+
+/// Applies a renewal outcome to the receipt it started from — and only to it.
+fn settle_renewal(
+    slot: &mut Option<InstalledNegotiation>,
+    renewed_from: [u8; 16],
+    outcome: anyhow::Result<InstalledNegotiation>,
+    sink: &EventSink,
+) {
+    // A disconnection or a reconnection meanwhile owns the slot now.
+    let Some(receipt) = slot
+        .as_mut()
+        .filter(|receipt| receipt.transaction_id == renewed_from)
+    else {
+        return;
+    };
+    match outcome {
+        Ok(renewed) => {
+            *receipt = renewed;
+            sink(ClientEvent::protection(PskKind::MlKem));
+            sink(ClientEvent::log(
+                "info",
+                "clé renouvelée — nouveau PSK ML-KEM en place, durée et volume remis à zéro"
+                    .to_string(),
+            ));
+        }
+        Err(error) => {
+            receipt.failures = receipt.failures.saturating_add(1);
+            let delay = renewal::retry_delay(receipt.failures);
+            receipt.next_attempt = Some(std::time::Instant::now() + delay);
+            sink(ClientEvent::log(
+                "warn",
+                format!(
+                    "renouvellement du PSK : échec — {error:#}. Nouvel essai dans {} min ; \
+                     l'ancien PSK reste en place jusqu'à son échéance.",
+                    delay.as_secs() / 60
+                ),
+            ));
+        }
+    }
+}
+
+async fn run_renewal(
+    backend: &Arc<dyn VpnBackend>,
+    identities: &dyn crate::key_negotiation::IdentityProvider,
+    installed: &Mutex<Option<InstalledNegotiation>>,
+    trigger: renewal::RenewalTrigger,
+    sink: &EventSink,
+) {
+    let Some(current) = installed
+        .lock()
+        .await
+        .as_ref()
+        .map(InstalledNegotiation::duplicate)
+    else {
+        return;
+    };
+    sink(ClientEvent::log(
+        "info",
+        format!(
+            "renouvellement du PSK ML-KEM déclenché ({}) — négociation dans le tunnel",
+            trigger.describe()
+        ),
+    ));
+    let outcome = async {
+        let negotiated =
+            crate::key_negotiation::prepare_renewal_for_profile(&current.profile, identities)
+                .await?;
+        renew_slot(backend, &current, Box::new(negotiated), sink).await
+    }
+    .await;
+    settle_renewal(
+        &mut *installed.lock().await,
+        current.transaction_id,
+        outcome,
+        sink,
+    );
+}
+
+/// Clears the in-flight flag however the renewal task ends.
+struct ClearOnDrop(Arc<AtomicBool>);
+
+impl Drop for ClearOnDrop {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
 }
 
 #[cfg(test)]
