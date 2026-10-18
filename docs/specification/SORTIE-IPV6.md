@@ -63,6 +63,36 @@ qui a les deux familles. Le NAT66 ne sert donc qu'aux destinations IPv6-only.
 - Le trafic IPv6 d'un client vers la gateway elle-même (`<préfixe>::1`) reste
   régi par les règles `input` existantes (`allow_tunnel_icmp`, etc.).
 
+> **Amendement du 18 octobre 2026 — le rejet vit d'abord en `prerouting`.**
+> Le banc netns (TESTING.md, « Banc netns ») a montré que la règle de
+> `forward` n'est **jamais atteinte** sur une gateway par défaut : avec
+> `net.ipv6.conf.all.forwarding = 0`, que Helios ne modifie pas (§3.2, point
+> 4), le noyau jette le paquet dans `ip6_forward`, avant le hook `forward`. Le
+> client attendait alors son propre délai (3 s mesurées) : exactement ce que
+> cette section devait éviter. Rien ne fuyait.
+>
+> - Le rejet est rendu dans une chaîne `prerouting` (type `filter`), une règle
+>   par uplink : `meta nfproto ipv6 iifname <wg_iface>
+>   fib daddr oifname <wan> reject with icmpx admin-prohibited`. Avant le
+>   routage, `oifname` n'existe pas encore : la consultation de route
+>   `fib daddr oifname` nomme l'uplink que le noyau choisirait, ce qui garde la
+>   portée « destiné à sortir par un WAN » sans viser le trafic local, un autre
+>   pair ou le LAN.
+> - La chaîne `prerouting` n'adopte **jamais** la politique par défaut du
+>   ruleset : sa politique reste `accept`, sans quoi un `drop` y couperait tout,
+>   y compris le trafic destiné à la gateway. Elle ne contient que ces rejets,
+>   dans tous les états et dans les deux modes de politique, dans la même
+>   transaction atomique que le reste.
+> - La règle de `forward` reste, en dernier, pour une gateway dont le
+>   forwarding IPv6 est activé et dont le routage réel (marques, policy
+>   routing) différerait de la consultation `fib`.
+> - Mesure : 6 ms entre l'émission et le « Destination unreachable:
+>   Administratively prohibited » sur le banc, `forwarding = 0`.
+> - **Non vérifié sur le noyau des cibles** : le banc tourne sur le noyau
+>   WSL2 6.18. Un noyau qui refuserait `reject` ou la consultation `fib` en
+>   `prerouting` ferait échouer la transaction entière, et `heliosd`
+>   refuserait de démarrer (fail-closed). À constater en V5.
+
 ### 3.2 Option NAT66 en opt-in explicite (option C)
 
 Si l'opérateur la retient (§6), elle doit respecter :

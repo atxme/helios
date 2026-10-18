@@ -406,6 +406,33 @@ async fn firewall_rendering_shows_the_ipv4_only_masquerade() {
     assert!(!response.rules.contains("    oifname \"eth0\" masquerade"));
 }
 
+/// The console shows the `prerouting` chain the Netlink backend applies,
+/// with its own `accept` policy: shown under the ruleset's `drop` default, it
+/// would describe a gateway that cuts every packet before routing.
+#[tokio::test]
+async fn firewall_rendering_shows_the_prerouting_rejection_under_an_accept_policy() {
+    let (app, _cmd_rx) = app_state(TunnelState::Down);
+
+    let response = firewall_rules_get(State(app)).await.unwrap().0;
+
+    assert_eq!(response.default_verdict, "drop");
+    assert!(
+        response.rules.contains(
+            "  chain prerouting {\n    type filter hook prerouting priority filter; policy accept;\n"
+        ),
+        "{}",
+        response.rules
+    );
+    assert!(
+        response.rules.contains(
+            "    meta nfproto ipv6 iifname \"helios0\" fib daddr oifname \"eth0\" \
+             reject with icmpx admin-prohibited  #"
+        ),
+        "{}",
+        response.rules
+    );
+}
+
 #[tokio::test]
 async fn firewall_rendering_describes_family_scoped_tunnel_mss_rules() {
     let (app, _cmd_rx) = app_state(TunnelState::Up);

@@ -562,15 +562,16 @@ Non couverts : §12.9 (PMTU), §12.12 (DNS AAAA), §12.15 (`conntrack` absent de
 machine), et tout ce qui demande du matériel ou WireGuard-NT. Le banc ne fait
 pas partie de `regression.sh`.
 
-**Défaut trouvé par le premier passage (18 octobre 2026) : le rejet IPv6 de T21
-n'est jamais atteint sur une gateway par défaut.** La règle
+**Défaut trouvé par le premier passage (18 octobre 2026), corrigé le même jour :
+le rejet IPv6 de T21 n'était jamais atteint sur une gateway par défaut.** La règle
 `reject with icmpx admin-prohibited` vit dans `forward` (SORTIE-IPV6 §3.1). Avec
 `net.ipv6.conf.all.forwarding = 0`, valeur par défaut que Helios ne modifie pas,
 le noyau jette le paquet dans `ip6_forward` avant ce hook : le client attend son
 délai (3 s mesurées) au lieu de replier immédiatement sur l'IPv4. Aucune fuite :
 le paquet est perdu. Avec `forwarding = 1`, ou avec le même rejet placé en
-`prerouting` (`fib daddr type != local`), la réponse arrive en 6 ms. Le contrôle
-reste en FAIL tant que la correction n'est pas décidée.
+`prerouting` (`fib daddr type != local`), la réponse arrive en 6 ms. Correction
+(SORTIE-IPV6 §3.1 amendé) : le rejet est rendu d'abord en `prerouting`, par
+`fib daddr oifname <wan>`, et le contrôle du banc passe.
 
 ## Campagne d'installation par bundle signé
 

@@ -105,6 +105,25 @@ impl NetlinkBackend {
             }
         }
 
+        // ── Before routing ────────────────────────────────────────────────────
+        // Never under the ruleset's default policy: a `drop` here would cut
+        // every packet, the gateway's own included. The chain only holds
+        // rejections of what `forward` refuses anyway, answered before the
+        // kernel drops them for want of IPv6 forwarding.
+        if rs.chain(ChainKind::Prerouting).next().is_some() {
+            let chain = Chain::new(&table)
+                .with_name(ChainKind::Prerouting.as_str())
+                .with_hook(Hook::new(Self::hook_class(ChainKind::Prerouting), 0))
+                .with_type(ChainType::Filter)
+                .with_policy(NfChainPolicy::Accept)
+                .add_to_batch(&mut batch);
+            for rule in rs.chain(ChainKind::Prerouting) {
+                for matches in Self::expand_port_sets(&rule.matches) {
+                    Self::filter_rule(&chain, &matches, rule)?.add_to_batch(&mut batch);
+                }
+            }
+        }
+
         let mss_values: Vec<_> = rs.mss_clamps().collect();
         if !mss_values.is_empty() {
             // A separate mangle-priority chain performs only the TCP option
@@ -200,6 +219,15 @@ impl NetlinkBackend {
         {
             return Err(Self::err(
                 "source FIB lookup requires an explicit input interface in an input/forward chain",
+            ));
+        }
+        if rule.chain == ChainKind::Output
+            && matches
+                .iter()
+                .any(|m| matches!(m, Match::FibDestinationOutIface(_)))
+        {
+            return Err(Self::err(
+                "destination FIB lookup is only valid in prerouting, input and forward",
             ));
         }
         let mut nf = NfRule::new(chain).map_err(Self::err)?;

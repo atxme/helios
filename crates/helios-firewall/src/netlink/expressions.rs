@@ -36,6 +36,7 @@ impl NetlinkBackend {
             ChainKind::Input => HookClass::In,
             ChainKind::Forward => HookClass::Forward,
             ChainKind::Output => HookClass::Out,
+            ChainKind::Prerouting => HookClass::PreRouting,
         }
     }
 
@@ -64,6 +65,9 @@ impl NetlinkBackend {
             Match::FibSourceRoute { use_mark, present } => rule
                 .with_expr(Fib::source_route_present(Register::Reg1, *use_mark))
                 .with_expr(Cmp::new(CmpOp::Eq, [u8::from(*present)])),
+            Match::FibDestinationOutIface(iface) => rule
+                .with_expr(Fib::destination_oifname(Register::Reg1))
+                .with_expr(Cmp::new(CmpOp::Eq, Self::interface_name_bytes(iface)?)),
             Match::Icmpv6Type(icmp_type) => Self::icmpv6_type(rule, *icmp_type),
             Match::Ipv6HopLimit(hop_limit) => Self::ipv6_hop_limit(rule, *hop_limit),
             Match::PacketMark(mark) => rule
@@ -71,6 +75,21 @@ impl NetlinkBackend {
                 .with_expr(Cmp::new(CmpOp::Eq, Self::packet_mark_bytes(*mark))),
             Match::Family(family) => Self::network_family(rule, *family),
         })
+    }
+
+    /// An interface name as the kernel writes it in a register: the name and
+    /// its NUL terminator, which the zero padding of the register follows.
+    /// Same bytes as `rustables`' `iiface`/`oiface`, same length bound.
+    fn interface_name_bytes(iface: &str) -> Result<Vec<u8>> {
+        // IFNAMSIZ, terminator included.
+        if iface.is_empty() || iface.len() >= 16 {
+            return Err(Self::err(format!(
+                "interface name `{iface}`: 1 to 15 bytes"
+            )));
+        }
+        let mut bytes = iface.as_bytes().to_vec();
+        bytes.push(0);
+        Ok(bytes)
     }
 
     /// Applies a non-verdict statement to a rule under construction.

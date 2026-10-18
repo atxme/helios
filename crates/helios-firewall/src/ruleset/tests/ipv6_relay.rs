@@ -9,7 +9,13 @@
 //!
 //! SORTIE-IPV6 §3.1 adds the answer: a tunnel client's IPv6 bound for a WAN
 //! is rejected with `icmpx admin-prohibited`, one rule per uplink, in every
-//! state, last of `forward`, instead of vanishing under the `drop` policy.
+//! state, instead of vanishing under the `drop` policy. The rejection sits in
+//! `prerouting`, where the route lookup `fib daddr oifname <wan>` names the
+//! uplink: a gateway without IPv6 forwarding — the default, which Helios does
+//! not change — drops the packet in `ip6_forward` before the `forward` hook,
+//! so a rejection there alone is never reached. The same rejection stays last
+//! of `forward`, for a gateway that forwards IPv6 and whose routing differs
+//! from the lookup.
 //! These tests lock both halves for every tunnel state, under both policy
 //! modes, with the road-warrior egress open and closed, with a known and an
 //! unknown captive-portal gateway, on several uplinks:
@@ -125,6 +131,43 @@ fn ipv6_rejection(uplink: &str) -> Rule {
         note: Some(
             "tunnel clients' IPv6 Internet egress: refused, without waiting for a timeout".into(),
         ),
+    }
+}
+
+/// The rejection of one uplink before routing: the uplink is the one the
+/// route lookup of the destination names, since `oifname` is not known yet.
+fn prerouting_ipv6_rejection(uplink: &str) -> Rule {
+    Rule {
+        chain: ChainKind::Prerouting,
+        matches: vec![
+            Match::Family(AddressFamily::Ipv6),
+            Match::InIface("helios0".into()),
+            Match::FibDestinationOutIface(uplink.into()),
+        ],
+        actions: Vec::new(),
+        verdict: Verdict::RejectAdminProhibited,
+        note: Some(
+            "tunnel clients' IPv6 Internet egress: refused before routing, so answered \
+             without IPv6 forwarding"
+                .into(),
+        ),
+    }
+}
+
+/// `prerouting` holds the rejections and nothing else, one per uplink, in
+/// uplink order, in every state, under both policy modes. Nothing there can
+/// accept or drop: the chain only answers what `forward` would refuse.
+#[test]
+fn prerouting_rejects_the_ipv6_routed_to_a_wan_in_every_state() {
+    for r in every_rendering() {
+        assert_eq!(
+            r.ruleset
+                .chain(ChainKind::Prerouting)
+                .cloned()
+                .collect::<Vec<_>>(),
+            UPLINKS.map(prerouting_ipv6_rejection).to_vec(),
+            "{r}"
+        );
     }
 }
 
@@ -396,9 +439,10 @@ fn the_ipv6_rejections_are_the_last_rules_of_forward() {
     }
 }
 
-/// The rejection lives in `forward` only. A client's IPv6 to the gateway
-/// itself stays under the `input` rules, the tunnel ICMPv6 opening
-/// included, and nothing the gateway emits is rejected.
+/// The rejection lives in `prerouting` and `forward` only. A client's IPv6
+/// to the gateway itself stays under the `input` rules — the `prerouting`
+/// lookup names an uplink, never the local delivery — the tunnel ICMPv6
+/// opening included, and nothing the gateway emits is rejected.
 #[test]
 fn ipv6_to_the_gateway_itself_is_left_to_input() {
     for r in every_rendering() {
@@ -450,7 +494,11 @@ fn no_rejection_without_a_tunnel_interface() {
 #[test]
 fn rules_selecting_ipv6_are_link_control_or_the_egress_rejection() {
     let links: Vec<&str> = UPLINKS.iter().copied().chain(["eth1"]).collect();
-    let rejections = UPLINKS.map(ipv6_rejection);
+    let rejections: Vec<Rule> = UPLINKS
+        .map(ipv6_rejection)
+        .into_iter()
+        .chain(UPLINKS.map(prerouting_ipv6_rejection))
+        .collect();
     let bypass = ipv6_split_tunnel_bypass();
     for r in every_rendering() {
         let mut link_control = 0;
@@ -468,7 +516,7 @@ fn rules_selecting_ipv6_are_link_control_or_the_egress_rejection() {
                 let scope = match rule.chain {
                     ChainKind::Input => Match::InIface((*iface).into()),
                     ChainKind::Output => Match::OutIface((*iface).into()),
-                    ChainKind::Forward => return false,
+                    ChainKind::Forward | ChainKind::Prerouting => return false,
                 };
                 rule.matches.first() == Some(&scope)
             });

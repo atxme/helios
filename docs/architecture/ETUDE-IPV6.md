@@ -768,7 +768,7 @@ Avancement de `feature/support-ipv6`, suivi actualisé le 8 octobre 2026 :
 | Split-tunnel limité au LAN | fusionné : les contournements de split-tunnel portent `iifname <lan>` dans les deux familles, aucun sans interface LAN ; ni le tunnel ni un WAN ne les atteignent | cible : `nft list chain inet helios forward` |
 | Portail captif limité au LAN | fusionné : les ouvertures `forward` HTTP/HTTPS du portail portent `iifname <lan>`, aucune sans interface LAN ; `output` inchangé | cible : `nft list chain inet helios forward` en portail captif |
 | T15 | encodeur livré | MSS IPv4 = MTU − 40 et IPv6 = MTU − 60 ; `exthdr` dans le même batch atomique, chaîne `mss` avant filtrage, SYN/SYN-ACK traversant WireGuard seulement. IPv6 omis sous MTU 1280 ; ABI et rendu testés. Cible : réécriture, somme TCP, valeur déjà inférieure conservée |
-| T22 | fusionnable : `scripts/netns-bench.sh` | premier passage : rejet IPv6 de T21 jamais atteint avec `forwarding = 0` (TESTING.md, « Banc netns ») |
+| T22 | fusionnable : `scripts/netns-bench.sh` | premier passage : rejet IPv6 de T21 jamais atteint avec `forwarding = 0`, corrigé par un rejet en `prerouting` (SORTIE-IPV6 §3.1 amendé) |
 | T23 | à faire | — |
 
 **T00 — Spécification A : modèle d'adressage IPv6**

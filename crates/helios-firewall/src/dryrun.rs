@@ -23,7 +23,12 @@ impl FirewallBackend for DryRunBackend {
             "table inet helios (default policy: {:?}) — tunnel state {:?}",
             rs.default_verdict, state
         );
-        for kind in [ChainKind::Input, ChainKind::Forward, ChainKind::Output] {
+        for kind in [
+            ChainKind::Prerouting,
+            ChainKind::Input,
+            ChainKind::Forward,
+            ChainKind::Output,
+        ] {
             for rule in rs.chain(kind) {
                 info!("  [{}] {}", kind.as_str(), rule);
             }

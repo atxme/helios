@@ -293,6 +293,13 @@ pub enum ChainKind {
     Forward,
     /// Traffic emitted by the gateway.
     Output,
+    /// Every packet that enters, before routing.
+    ///
+    /// Never under the ruleset's default policy: the chain's policy is always
+    /// `accept`, so a `drop` default there would cut every packet, the
+    /// gateway's own traffic included. Its rules only refuse what the other
+    /// chains would refuse anyway.
+    Prerouting,
 }
 
 impl ChainKind {
@@ -301,6 +308,7 @@ impl ChainKind {
             ChainKind::Input => "input",
             ChainKind::Forward => "forward",
             ChainKind::Output => "output",
+            ChainKind::Prerouting => "prerouting",
         }
     }
 }
@@ -350,6 +358,13 @@ pub enum Match {
     /// Only input/forward chains are valid. Policies must scope this to an
     /// explicitly selected ingress interface and decide whether marks apply.
     FibSourceRoute { use_mark: bool, present: bool },
+    /// `fib daddr oifname "<iface>"`: the interface the route lookup of the
+    /// destination names.
+    ///
+    /// The only way to name an egress interface before routing, where
+    /// `oifname` is not set yet. The kernel accepts this lookup in
+    /// `prerouting`, `input` and `forward` only.
+    FibDestinationOutIface(String),
     /// `icmpv6 type <type>`.
     ///
     /// Selects ICMPv6 by `meta l4proto ipv6-icmp`, then compares the type
@@ -417,6 +432,7 @@ impl fmt::Display for Match {
                 if *use_mark { "mark . " } else { "" },
                 if *present { "exists" } else { "missing" }
             ),
+            Match::FibDestinationOutIface(i) => write!(f, "fib daddr oifname \"{i}\""),
             Match::Icmpv6Type(icmp_type) => write!(f, "icmpv6 type {}", icmp_type.as_str()),
             Match::Ipv6HopLimit(hop_limit) => write!(f, "ip6 hoplimit {hop_limit}"),
             Match::PacketMark(mark) => write!(f, "meta mark {mark:#x}"),
@@ -651,6 +667,26 @@ mod tests {
         assert_eq!(
             rule.to_string(),
             "meta nfproto ipv6 iifname \"helios0\" oifname \"eth0\" \
+             reject with icmpx admin-prohibited"
+        );
+    }
+
+    #[test]
+    fn the_destination_route_lookup_renders_the_fib_oifname_expression() {
+        let rule = Rule::new(
+            ChainKind::Prerouting,
+            vec![
+                Match::Family(AddressFamily::Ipv6),
+                Match::InIface("helios0".into()),
+                Match::FibDestinationOutIface("eth0".into()),
+            ],
+            Verdict::RejectAdminProhibited,
+        );
+
+        assert_eq!(ChainKind::Prerouting.as_str(), "prerouting");
+        assert_eq!(
+            rule.to_string(),
+            "meta nfproto ipv6 iifname \"helios0\" fib daddr oifname \"eth0\" \
              reject with icmpx admin-prohibited"
         );
     }

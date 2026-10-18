@@ -2,7 +2,8 @@ use rustables::sys;
 
 use super::NetlinkBackend;
 use crate::ruleset::{
-    Action, ChainKind, Counter, DefaultVerdict, Icmpv4Type, Match, Rule, Ruleset, Verdict,
+    Action, AddressFamily, ChainKind, Counter, DefaultVerdict, Icmpv4Type, Match, Rule, Ruleset,
+    Verdict,
 };
 
 fn ruleset(matches: Vec<Match>, actions: Vec<Action>) -> Ruleset {
@@ -222,4 +223,103 @@ fn fib_refuses_unscoped_and_output_lookups_before_sending() {
     rs.rules[0].chain = ChainKind::Output;
     rs.rules[0].matches.insert(0, Match::InIface("eth0".into()));
     assert!(NetlinkBackend::new().build_batch(&rs).is_err());
+}
+
+/// The rejection of the tunnel clients' IPv6 egress in `prerouting`.
+fn prerouting_rejection(chain: ChainKind) -> Ruleset {
+    let mut rs = ruleset(
+        vec![
+            Match::Family(AddressFamily::Ipv6),
+            Match::InIface("helios0".into()),
+            Match::FibDestinationOutIface("enp3s0".into()),
+        ],
+        Vec::new(),
+    );
+    rs.rules[0].chain = chain;
+    rs.rules[0].verdict = Verdict::RejectAdminProhibited;
+    rs
+}
+
+#[test]
+fn fib_destination_lookup_compares_the_interface_its_route_names() {
+    let bytes = NetlinkBackend::new()
+        .build_batch(&prerouting_rejection(ChainKind::Prerouting))
+        .unwrap()
+        .finalize();
+    let messages = messages(&bytes);
+    let (_, payload) = messages
+        .iter()
+        .find(|(kind, _)| *kind == sys::NFT_MSG_NEWRULE as u16)
+        .unwrap();
+    let exprs = expressions(payload);
+    let index = exprs.iter().position(|(name, _)| *name == "fib").unwrap();
+    assert_eq!(
+        attribute(&exprs[index].1, sys::NFTA_FIB_DREG),
+        1u32.to_be_bytes()
+    );
+    assert_eq!(
+        attribute(&exprs[index].1, sys::NFTA_FIB_RESULT),
+        sys::NFT_FIB_RESULT_OIFNAME.to_be_bytes()
+    );
+    assert_eq!(
+        attribute(&exprs[index].1, sys::NFTA_FIB_FLAGS),
+        sys::NFTA_FIB_F_DADDR.to_be_bytes()
+    );
+    let cmp = attributes(attribute(&exprs[index + 1].1, sys::NFTA_CMP_DATA));
+    assert_eq!(attribute(&cmp, sys::NFTA_DATA_VALUE), b"enp3s0\0");
+    assert_eq!(exprs.last().unwrap().0, "reject");
+}
+
+// <linux/netfilter.h>: verdicts and the IPv4/IPv6 hook numbers.
+const NF_DROP: u32 = 0;
+const NF_ACCEPT: u32 = 1;
+const NF_INET_PRE_ROUTING: u32 = 0;
+
+/// A `drop` policy on `prerouting` would cut every packet, the gateway's own
+/// included: the chain keeps `accept` while the filtering chains take the
+/// ruleset's default.
+#[test]
+fn the_prerouting_chain_keeps_the_accept_policy_under_a_drop_default() {
+    let bytes = NetlinkBackend::new()
+        .build_batch(&prerouting_rejection(ChainKind::Prerouting))
+        .unwrap()
+        .finalize();
+    let chains: Vec<Attributes<'_>> = messages(&bytes)
+        .into_iter()
+        .filter(|(kind, _)| *kind == sys::NFT_MSG_NEWCHAIN as u16)
+        .map(|(_, payload)| attributes(payload))
+        .collect();
+    let named = |name: &str| {
+        chains
+            .iter()
+            .find(|chain| {
+                let value = attribute(chain, sys::NFTA_CHAIN_NAME);
+                value.strip_suffix(b"\0").unwrap_or(value) == name.as_bytes()
+            })
+            .unwrap_or_else(|| panic!("no `{name}` chain"))
+    };
+    let prerouting = named("prerouting");
+    assert_eq!(
+        attribute(prerouting, sys::NFTA_CHAIN_POLICY),
+        NF_ACCEPT.to_be_bytes()
+    );
+    let hook = attributes(attribute(prerouting, sys::NFTA_CHAIN_HOOK));
+    assert_eq!(
+        attribute(&hook, sys::NFTA_HOOK_HOOKNUM),
+        NF_INET_PRE_ROUTING.to_be_bytes()
+    );
+    assert_eq!(
+        attribute(named("input"), sys::NFTA_CHAIN_POLICY),
+        NF_DROP.to_be_bytes()
+    );
+}
+
+/// The kernel only accepts an egress-interface lookup in `prerouting`,
+/// `input` and `forward`: an `output` one is refused before sending, rather
+/// than failing the whole transaction in the kernel.
+#[test]
+fn fib_destination_lookup_is_refused_in_output() {
+    assert!(NetlinkBackend::new()
+        .build_batch(&prerouting_rejection(ChainKind::Output))
+        .is_err());
 }

@@ -793,8 +793,24 @@ pub async fn firewall_rules_get(
     let verdict_str = rs.default_verdict.as_str();
 
     // Rendered faithfully to what the Netlink backend actually applies:
-    // three hooked chains, each with its default policy.
+    // `prerouting` when it has rules, under its own `accept` policy, then
+    // three hooked chains, each with the default policy.
     let mut lines = vec!["table inet helios {".to_string()];
+    let prerouting = ruleset::ChainKind::Prerouting;
+    if rs.chain(prerouting).next().is_some() {
+        let name = prerouting.as_str();
+        lines.push(format!("  chain {name} {{"));
+        lines.push(format!(
+            "    type filter hook {name} priority filter; policy accept;"
+        ));
+        for rule in rs.chain(prerouting) {
+            match &rule.note {
+                Some(note) => lines.push(format!("    {rule}  # {note}")),
+                None => lines.push(format!("    {rule}")),
+            }
+        }
+        lines.push("  }".to_string());
+    }
     for kind in [
         ruleset::ChainKind::Input,
         ruleset::ChainKind::Forward,

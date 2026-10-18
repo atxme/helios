@@ -12,9 +12,12 @@ inherited marker comments were rewritten in `src/batch.rs` and `src/tests/mod.rs
 to meet repository conventions; they do not change behavior.
 
 The patch also adds `CounterObject` and its nested counter data, immediate
-`Objref` references and `Fib::source_route_present`. The FIB constructor fixes
-the source address, incoming interface and existence result; callers choose
-explicitly whether packet marks participate in policy routing. Object names
+`Objref` references, `Fib::source_route_present` and
+`Fib::destination_oifname`. The first FIB constructor fixes the source address,
+incoming interface and existence result; callers choose explicitly whether
+packet marks participate in policy routing. The second fixes the destination
+address and the egress interface name result (`fib daddr oifname`), the only
+way to name an uplink before routing. Object names
 are bounded to 255 bytes and refuse NUL. Socket handling and batch transport
 remain upstream. Expression decoding explicitly calls the `Expression` trait
 to avoid collision with the generated `Objref::get_name(&self)` field getter.

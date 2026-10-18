@@ -67,9 +67,9 @@ fn assert_golden(name: &str, rs: &Ruleset, expected: &str) {
 /// what is emitted *unconditionally*: the head-of-chain openings, the
 /// always-allowed loopback/established pairs, the Astra channel, both public
 /// listeners, the site-to-site transport, the IPv6 link control of the WAN
-/// and the LAN, the tunnel speedtest, and — last of `forward` — the rejection
-/// of the tunnel clients' IPv6 egress. Nothing gated on the tunnel state
-/// appears.
+/// and the LAN, the tunnel speedtest, and — last of `forward`, then in
+/// `prerouting` — the rejection of the tunnel clients' IPv6 egress. Nothing
+/// gated on the tunnel state appears.
 const DOWN_FAIL_CLOSED: &str = "\
 default drop
 mss clamp none
@@ -120,6 +120,7 @@ output oifname \"eth1\" meta nfproto ipv6 icmpv6 type mld2-listener-report accep
 input iifname \"helios0\" tcp dport 55182 accept
 input iifname \"helios0\" udp dport 55182 accept
 forward meta nfproto ipv6 iifname \"helios0\" oifname \"eth0\" reject with icmpx admin-prohibited
+prerouting meta nfproto ipv6 iifname \"helios0\" fib daddr oifname \"eth0\" reject with icmpx admin-prohibited
 ";
 
 #[test]
@@ -189,6 +190,7 @@ input iifname \"helios0\" tcp dport 55182 accept
 input iifname \"helios0\" udp dport 55182 accept
 forward iifname \"eth1\" oifname \"eth0\" accept
 forward meta nfproto ipv6 iifname \"helios0\" oifname \"eth0\" reject with icmpx admin-prohibited
+prerouting meta nfproto ipv6 iifname \"helios0\" fib daddr oifname \"eth0\" reject with icmpx admin-prohibited
 ";
 
 #[test]
@@ -330,6 +332,8 @@ forward meta nfproto ipv4 iifname \"helios0\" oifname \"enp3s0\" accept
 forward meta nfproto ipv4 iifname \"helios0\" oifname \"wlo1\" accept
 forward meta nfproto ipv6 iifname \"helios0\" oifname \"enp3s0\" reject with icmpx admin-prohibited
 forward meta nfproto ipv6 iifname \"helios0\" oifname \"wlo1\" reject with icmpx admin-prohibited
+prerouting meta nfproto ipv6 iifname \"helios0\" fib daddr oifname \"enp3s0\" reject with icmpx admin-prohibited
+prerouting meta nfproto ipv6 iifname \"helios0\" fib daddr oifname \"wlo1\" reject with icmpx admin-prohibited
 postrouting meta nfproto ipv4 oifname \"enp3s0\" masquerade
 postrouting meta nfproto ipv4 oifname \"wlo1\" masquerade
 ";
@@ -497,6 +501,7 @@ input iifname \"helios0\" udp dport 55182 accept
 output oifname \"eth0\" ip daddr 192.0.2.1/32 tcp dport { 80, 443 } accept
 forward iifname \"eth1\" oifname \"eth0\" ip daddr 192.0.2.1/32 tcp dport { 80, 443 } accept
 forward meta nfproto ipv6 iifname \"helios0\" oifname \"eth0\" reject with icmpx admin-prohibited
+prerouting meta nfproto ipv6 iifname \"helios0\" fib daddr oifname \"eth0\" reject with icmpx admin-prohibited
 ";
 
 #[test]
@@ -569,6 +574,7 @@ input iifname \"helios0\" udp dport 55182 accept
 output oifname \"eth0\" tcp dport { 80, 443 } accept
 forward iifname \"eth1\" oifname \"eth0\" tcp dport { 80, 443 } accept
 forward meta nfproto ipv6 iifname \"helios0\" oifname \"eth0\" reject with icmpx admin-prohibited
+prerouting meta nfproto ipv6 iifname \"helios0\" fib daddr oifname \"eth0\" reject with icmpx admin-prohibited
 ";
 
 #[test]

@@ -60,7 +60,9 @@ fn every_rendering() -> Vec<(PolicyMode, TunnelState, Ruleset)> {
 fn scope(chain: ChainKind, iface: &str) -> Match {
     match chain {
         ChainKind::Output => Match::OutIface(iface.into()),
-        ChainKind::Input | ChainKind::Forward => Match::InIface(iface.into()),
+        ChainKind::Input | ChainKind::Forward | ChainKind::Prerouting => {
+            Match::InIface(iface.into())
+        }
     }
 }
 

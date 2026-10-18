@@ -116,8 +116,8 @@ fn local_networks(family: AddressFamily) -> &'static [&'static str] {
 /// * IPv6 neighbor discovery and MLD on every WAN and LAN interface, router
 ///   discovery on the WANs only (module `link_ipv6`);
 /// * LAN -> WAN forwarding is only open in the `Up` state;
-/// * IPv6 from the tunnel interface to a WAN is rejected, last of `forward`
-///   (module `client_ipv6_egress`).
+/// * IPv6 from the tunnel interface to a WAN is rejected in `prerouting` and
+///   last of `forward` (module `client_ipv6_egress`).
 pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Result<Ruleset> {
     use ChainKind::{Forward, Input, Output};
     let mut rules = Vec::new();
@@ -176,8 +176,8 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Result<Ruleset> {
     administration::ssh_sources(&mut rules, policy)?;
     administration::out_of_band_admin_ifaces(&mut rules, policy);
     kill_switch::state_gated_openings(&mut rules, policy, state, &wan_ifaces)?;
-    // Last of `forward`, in every state: after every opening, before the
-    // chain policy.
+    // In `prerouting`, and last of `forward`, in every state: after every
+    // opening, before the chain policy.
     client_ipv6_egress::reject(&mut rules, policy, &wan_ifaces);
 
     // In fail-open, the default policy becomes accept outside the tunnel (not recommended).
