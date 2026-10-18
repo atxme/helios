@@ -29,3 +29,24 @@ impl Objref {
             .with_name(name))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::expr::{ExpressionVariant, RawExpression};
+    use crate::nlmsg::{NfNetlinkAttribute, NfNetlinkDeserializable};
+
+    #[test]
+    fn named_counter_references_decode_as_objref_expressions() {
+        let original = RawExpression::from(Objref::counter("drops").unwrap());
+        let mut encoded = vec![0; original.get_size()];
+        original.write_payload(&mut encoded);
+        let (decoded, remaining) = RawExpression::deserialize(&encoded).unwrap();
+        assert!(remaining.is_empty());
+        assert_eq!(decoded, original);
+        assert!(matches!(
+            decoded.get_data(),
+            Some(ExpressionVariant::Objref(_))
+        ));
+    }
+}

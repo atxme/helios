@@ -151,7 +151,7 @@ macro_rules! create_expr_variant {
                             .ok_or($crate::error::DecodeError::MissingExpressionName)?;
                         match name {
                             $(
-                                x if x == <$type>::get_name() => {
+                                x if x == <$type as Expression>::get_name() => {
                                     debug!("Calling {}::deserialize()", std::any::type_name::<$type>());
                                     let (res, remaining) =  <$type>::deserialize(buf)?;
                                     if remaining.len() != 0 {

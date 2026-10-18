@@ -16,7 +16,10 @@ The patch also adds `CounterObject` and its nested counter data, immediate
 the source address, incoming interface and existence result; callers choose
 explicitly whether packet marks participate in policy routing. Object names
 are bounded to 255 bytes and refuse NUL. Socket handling and batch transport
-remain upstream. Helios ABI tests in
+remain upstream. Expression decoding explicitly calls the `Expression` trait
+to avoid collision with the generated `Objref::get_name(&self)` field getter.
+Helios ABI tests in
 `crates/helios-firewall/src/netlink/capabilities_tests.rs` inspect actual
-serialized attributes and object ordering; rerun these and the MSS ABI tests
-when rebasing to another upstream release.
+serialized attributes and object ordering. The Objref module's unit test also
+checks typed decoding; rerun these and the MSS ABI tests when rebasing to
+another upstream release.
