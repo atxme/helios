@@ -849,7 +849,7 @@ mod tests {
         )
         .expect("the regression workflow must exist");
         let windows_job = workflow
-            .split("  orion-windows:\n")
+            .split("  orion-windows:")
             .nth(1)
             .expect("the Windows job must exist")
             .split("\n  audit:")
