@@ -68,8 +68,8 @@ pub enum AdmissionError {
     #[error("certificate fingerprint must be 64 lowercase SHA-256 hexadecimal characters")]
     CertificateFingerprint,
     #[error(
-        "admission requires both the TLS and the PQ key-negotiation certificate; the \
-         classic path leaves the first handshake unprotected and is retired on 2027-02-01"
+        "admission requires both the TLS and the PQ key-negotiation certificate; a peer \
+         without them would negotiate nothing and is not admitted"
     )]
     MissingNegotiationIdentity,
     #[error(
@@ -145,8 +145,8 @@ pub fn admit_with_key_negotiation(
     }
     wg::validate_key(public_key)?;
     // v5 admits no peer without both identities, and every admission lands on
-    // the `ml_kem` floor. The v4 default — no certificate, therefore
-    // `classic` — is gone: it produced peers whose first handshake was
+    // the `ml_kem` floor. The v4 default — no certificate, therefore no
+    // negotiation — is gone: it produced peers whose first handshake was
     // unprotected while nothing in any interface distinguished them from the
     // others. A weaker floor remains reachable, but only by editing
     // `network.toml` by hand, which is a deliberate act rather than a default.
@@ -184,7 +184,7 @@ pub fn admit_with_key_negotiation(
                 .as_deref()
                 .map(str::trim)
                 == Some(pq_certificate_sha256)
-            && existing.minimum_key_negotiation_mode == minimum_mode;
+            && existing.minimum_key_negotiation_mode == Some(minimum_mode);
         if !same_identity {
             return Err(AdmissionError::ReadmissionDiffers(existing.name.clone()));
         }
@@ -234,7 +234,7 @@ pub fn admit_with_key_negotiation(
         preshared_key: None,
         key_negotiation_certificate_sha256: Some(certificate_sha256.to_string()),
         key_negotiation_pq_certificate_sha256: Some(pq_certificate_sha256.to_string()),
-        minimum_key_negotiation_mode: minimum_mode,
+        minimum_key_negotiation_mode: Some(minimum_mode),
         // Posed by the gateway, never inherited from the client: it is what
         // makes the handshake age a readable signal on an idle tunnel, and
         // the gateway cannot inspect a client's configuration to check it.
@@ -395,7 +395,7 @@ mod tests {
         assert!(config.peers.is_empty());
     }
 
-    /// Le défaut v4 — pas de certificat, donc `classic` — produisait des pairs
+    /// Le défaut v4 — pas de certificat, donc aucune négociation — produisait des pairs
     /// dont le premier handshake était nu sans que rien ne les distingue.
     #[test]
     fn an_admission_without_a_pq_identity_is_refused() {
@@ -427,21 +427,19 @@ mod tests {
     #[test]
     fn an_admission_below_the_ml_kem_floor_is_refused() {
         let mut config = config();
-        for weaker in [ProtectionMode::Classic, ProtectionMode::StaticPsk] {
-            assert!(matches!(
-                admit_with_key_negotiation(
-                    &mut config,
-                    &[],
-                    "workstation",
-                    &key(1),
-                    false,
-                    Some(&"a".repeat(64)),
-                    Some(&"b".repeat(64)),
-                    weaker,
-                ),
-                Err(AdmissionError::FloorBelowMlKem(_))
-            ));
-        }
+        assert!(matches!(
+            admit_with_key_negotiation(
+                &mut config,
+                &[],
+                "workstation",
+                &key(1),
+                false,
+                Some(&"a".repeat(64)),
+                Some(&"b".repeat(64)),
+                ProtectionMode::StaticPsk,
+            ),
+            Err(AdmissionError::FloorBelowMlKem(_))
+        ));
         assert!(config.peers.is_empty());
     }
 

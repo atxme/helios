@@ -146,7 +146,9 @@ impl NegotiationHandler for GatewayHandler {
                 peer.minimum_key_negotiation_mode,
             )
         };
-        if !request.mode.satisfies(minimum_mode) {
+        // A peer without a floor is a plain WireGuard peer, which never
+        // negotiates: it is refused like a mode below its floor.
+        if !minimum_mode.is_some_and(|floor| request.mode.satisfies(floor)) {
             tracing::warn!(
                 %transaction,
                 peer = %peer_key,

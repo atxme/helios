@@ -550,7 +550,6 @@ impl ProfileManifest {
 /// mode is what decides the protection level.
 fn mode_id(mode: ProtectionMode) -> u8 {
     match mode {
-        ProtectionMode::Classic => 0,
         ProtectionMode::StaticPsk => 1,
         ProtectionMode::MlKem => 2,
     }
@@ -582,11 +581,19 @@ fn profile_kind_from_id(id: u8) -> Result<Option<ProfileKind>, VaultError> {
     }
 }
 
+/// Reads a stored protection mode.
+///
+/// `0` was `classic`. A manifest sealed before v5 can still carry it, and it
+/// migrates to `ml_kem` rather than failing the unlock. That is safe because a
+/// `key_negotiation` block could never have been `classic` in practice: a
+/// classic Helios profile could not carry a PSK (`config.rs`, the profile
+/// coherence check), and since v5 the gateway refuses `classic` on the wire,
+/// so `ml_kem` is the only mode such a profile can actually negotiate. The
+/// next seal writes `2`; `0` is never written again.
 fn mode_from_id(id: u8) -> Result<ProtectionMode, VaultError> {
     match id {
-        0 => Ok(ProtectionMode::Classic),
+        0 | 2 => Ok(ProtectionMode::MlKem),
         1 => Ok(ProtectionMode::StaticPsk),
-        2 => Ok(ProtectionMode::MlKem),
         other => Err(VaultError::ManifestEncoding(format!(
             "unknown protection mode {other}"
         ))),
@@ -1152,10 +1159,18 @@ mod tests {
     /// enum cannot silently reinterpret a stored profile's protection level.
     #[test]
     fn protection_modes_have_stable_identifiers() {
-        assert_eq!(mode_id(ProtectionMode::Classic), 0);
         assert_eq!(mode_id(ProtectionMode::StaticPsk), 1);
         assert_eq!(mode_id(ProtectionMode::MlKem), 2);
         assert!(mode_from_id(3).is_err());
+    }
+
+    /// A manifest sealed before v5 stored `classic` as `0`. It is read as
+    /// `ml_kem`, and the next seal writes `2`.
+    #[test]
+    fn a_pre_v5_classic_mode_identifier_migrates_to_ml_kem() {
+        assert_eq!(mode_from_id(0).unwrap(), ProtectionMode::MlKem);
+        assert_eq!(mode_from_id(2).unwrap(), ProtectionMode::MlKem);
+        assert_eq!(mode_id(mode_from_id(0).unwrap()), 2);
     }
 
     #[test]

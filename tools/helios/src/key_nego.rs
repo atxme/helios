@@ -173,7 +173,6 @@ pub enum KeyNegoCmd {
 
 #[derive(Clone, Copy, ValueEnum)]
 pub enum Mode {
-    Classic,
     StaticPsk,
     MlKem,
 }
@@ -181,7 +180,6 @@ pub enum Mode {
 impl From<Mode> for ProtectionMode {
     fn from(value: Mode) -> Self {
         match value {
-            Mode::Classic => Self::Classic,
             Mode::StaticPsk => Self::StaticPsk,
             Mode::MlKem => Self::MlKem,
         }
@@ -805,7 +803,6 @@ mod tests {
 
     #[test]
     fn cli_modes_map_one_to_one_to_protocol_modes() {
-        assert_eq!(ProtectionMode::from(Mode::Classic), ProtectionMode::Classic);
         assert_eq!(
             ProtectionMode::from(Mode::StaticPsk),
             ProtectionMode::StaticPsk

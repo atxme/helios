@@ -78,10 +78,10 @@ import type {
  * That line is not a presentation choice, and neither is the ladder. The rung
  * **is** the profile type: the first two are `classic` and differ only by
  * whether a preshared key exists, the third is the one that writes a
- * negotiation block. `classic` is refused as a negotiable mode by
- * `aether::key_negotiation` (`ClassicNotNegotiable`) — a negotiated `classic`
- * is a tunnel with no preshared key, which the lower rungs already express —
- * so it is not a mode inside the block, it is the absence of the block.
+ * negotiation block. `aether::key_negotiation` has no `classic` mode: a
+ * negotiated tunnel with no preshared key is what the lower rungs already
+ * express, so it is not a mode inside the block, it is the absence of the
+ * block.
  *
  * The ladder is also the whole of the choice: the negotiation rung writes
  * `ml_kem` and offers no mode of its own. A preshared key is the rung below,
@@ -251,7 +251,8 @@ const HISTORY_LIMIT = 50
 /**
  * Negotiation settings for a block being created by hand.
  *
- * The floor starts at `classic` because nothing has been negotiated yet: it
+ * The floor starts at `static_psk`, the lowest negotiable mode, because
+ * nothing has been negotiated yet: it
  * is raised by the first committed negotiation, and by this screen, but it
  * would be a lie to start it at the mode merely *wished for*. The mode, on
  * the other hand, starts at the strongest — that is what one comes here for.
@@ -259,7 +260,7 @@ const HISTORY_LIMIT = 50
 function blankNegotiation(): KeyNegotiationSettings {
   return {
     mode: 'ml_kem',
-    minimum_mode: 'classic',
+    minimum_mode: 'static_psk',
     endpoint: '',
     server_name: '',
     gateway_ca_der: '',
@@ -509,8 +510,8 @@ export function ProfilesView({
     // mode forbids one — so a screen that let them be set apart could only
     // produce profiles it would then have to mark invalid.
     //
-    // Choosing a mode is therefore what disposes of the PSK: ML-KEM and
-    // classic drop it, and nothing else does. It used to be dropped
+    // Choosing a mode is therefore what disposes of the PSK: every mode but
+    // `static_psk` drops it, and nothing else does. It used to be dropped
     // unconditionally, which is why this screen could only ever take a PSK
     // away.
     if (key === 'mode') dropStagedPskFor(value as ProtectionMode)
@@ -528,12 +529,13 @@ export function ProfilesView({
    * consequence that outlived its cause would make the stored PSK vanish for a
    * mode the user tried and left. Only the save is irreversible.
    *
-   * Classic is dropped as well as ML-KEM, though only ML-KEM was asked for:
-   * `orion-core` refuses a profile PSK under *any* mode but `static_psk`, so
+   * Leaving the block drops it as well, as choosing ML-KEM does, though no
+   * mode was asked for: `orion-core` refuses a profile PSK under *any* mode
+   * but `static_psk`, and a profile with no block has none, so
    * sparing it there would only move the refusal to the save, pointing at a
    * field the user had not touched.
    */
-  const dropStagedPskFor = (mode: ProtectionMode) => {
+  const dropStagedPskFor = (mode: ProtectionMode | null) => {
     if (mode === 'static_psk') {
       setClearPsk(false)
       return
@@ -971,7 +973,7 @@ export function ProfilesView({
       return
     }
     setWantsStaticPsk(false)
-    dropStagedPskFor('classic')
+    dropStagedPskFor(null)
   }
 
   const invalid = kindChanged || Object.values(issues).some(Boolean)
@@ -1831,9 +1833,8 @@ function KeyNegotiation({
   // explicit v5 mode — the transaction still runs and proves possession with
   // an HMAC commitment bound to the session before the gateway installs the
   // configured key (NEGOCIATION-DE-CLE-V5 §9.1) — so a document produced by
-  // `helios enroll` may legitimately carry it, and `classic` may come
-  // from a document older than the rule that refuses it. Displaying either
-  // one as ML-KEM would be a lie about what the profile does, and hiding the
+  // `helios enroll` may legitimately carry it. Displaying it as ML-KEM would
+  // be a lie about what the profile does, and hiding the
   // PSK that `static_psk` requires would leave a profile invalid with no
   // field to look at. Both are therefore shown as what they are, with the one
   // gesture that brings the profile back to what this screen composes.
@@ -1844,9 +1845,7 @@ function KeyNegotiation({
       {legacyMode && (
         <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.75 }}>
           <Caution>
-            {settings.mode === 'classic'
-              ? 'Ce profil négocie en mode « classique », que la gateway refuse par son nom : la connexion échouera.'
-              : 'Ce profil négocie un PSK statique. Orion ne compose plus ce mode : une clé partagée se choisit au cran « PSK statique » ci-dessus.'}
+            Ce profil négocie un PSK statique. Orion ne compose plus ce mode : une clé partagée se choisit au cran « PSK statique » ci-dessus.
           </Caution>
           <Button
             size="small"
@@ -1869,7 +1868,7 @@ function KeyNegotiation({
         label="Plancher anti-downgrade"
         modes={PROTECTION_MODES}
         value={settings.minimum_mode}
-        floor={floorBaseline ?? 'classic'}
+        floor={floorBaseline ?? 'static_psk'}
         hint="Niveau minimum exigé. Ne redescend jamais."
         onChange={onRaiseFloor}
       />
@@ -1943,7 +1942,7 @@ function ModeChoice({
   onChange,
 }: {
   label: string
-  /** Which modes this row offers. The mode row omits `classic`. */
+  /** Which modes this row offers. */
   modes: ProtectionMode[]
   value: ProtectionMode
   /** Nothing below this is selectable. */

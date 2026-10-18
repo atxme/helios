@@ -27,7 +27,7 @@ fn network() -> NetworkConfig {
             preshared_key: Some("pq-secret-must-not-leak".into()),
             key_negotiation_certificate_sha256: None,
             key_negotiation_pq_certificate_sha256: Some("aa".repeat(32)),
-            minimum_key_negotiation_mode: ProtectionMode::MlKem,
+            minimum_key_negotiation_mode: Some(ProtectionMode::MlKem),
             persistent_keepalive_secs: aether::config::DEFAULT_PERSISTENT_KEEPALIVE_SECS,
         }],
         ..NetworkConfig::default()
@@ -210,7 +210,7 @@ async fn status_exposes_useful_data_without_the_psk() {
     // can no longer fall back to.
     assert_eq!(
         response.peers[0].minimum_key_negotiation_mode,
-        ProtectionMode::MlKem
+        Some(ProtectionMode::MlKem)
     );
     let payload = serde_json::to_string(&response).unwrap();
     assert!(!payload.contains("pq-secret-must-not-leak"));

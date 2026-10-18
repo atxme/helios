@@ -4,15 +4,12 @@
 use super::*;
 
 /// Protection selected by Orion for the upcoming WireGuard session.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// A plain WireGuard peer (no preshared key) is not a protection mode: it has
+/// no negotiation at all, and the type cannot express it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProtectionMode {
-    /// WireGuard Curve25519 without a preshared key.
-    ///
-    /// Retired on 2027-02-01 (spec §19). Kept only for peers admitted before
-    /// v5; no new admission selects it.
-    #[default]
-    Classic,
     /// A preconfigured PSK proven by a transaction-bound commitment.
     StaticPsk,
     /// A fresh PSK derived from an ML-KEM-1024 encapsulation.
@@ -22,7 +19,6 @@ pub enum ProtectionMode {
 impl ProtectionMode {
     pub const fn security_level(self) -> u8 {
         match self {
-            Self::Classic => 0,
             Self::StaticPsk => 1,
             Self::MlKem => 2,
         }
@@ -458,21 +454,6 @@ impl KeyNegotiationRequest {
         }
 
         match self.mode {
-            // Refused at the v5 decoder, not merely discouraged.
-            //
-            // `classic` asks the gateway to run a challenge, an ML-DSA-87
-            // verification and a signed commit in order to arrive at **no
-            // preshared key at all** — the exact configuration a plain
-            // WireGuard profile expresses without touching this port. Keeping
-            // it as a negotiable mode meant the protocol's own floor could be
-            // satisfied by the absence of protection, and that anyone able to
-            // steer a client into it downgraded the tunnel while every
-            // signature still verified.
-            //
-            // A client that wants generic WireGuard uses a generic WireGuard
-            // profile. The variant survives in the type only so an existing
-            // `network.toml` still parses — see the module's known limitation.
-            ProtectionMode::Classic => return Err(KeyNegotiationError::ClassicNotNegotiable),
             ProtectionMode::StaticPsk => {
                 if self.kem_public_key.is_some() {
                     return Err(KeyNegotiationError::UnexpectedModeMaterial);
@@ -634,7 +615,7 @@ impl KeyNegotiationResponse {
                     });
                 }
             }
-            ProtectionMode::Classic | ProtectionMode::StaticPsk => {
+            ProtectionMode::StaticPsk => {
                 if self.kem_ciphertext.is_some() {
                     return Err(KeyNegotiationError::UnexpectedModeMaterial);
                 }

@@ -15,11 +15,11 @@ export type TunnelState =
  * Protection negotiated **before** the WireGuard handshake, on the gateway's
  * public key-negotiation port (ADR-001, amendment of 24 July 2026).
  *
- * The order is monotonic — `classic < static_psk < ml_kem` — and it is the
- * whole point: a profile carries a floor it can rise above but never fall
- * below.
+ * The order is monotonic — `static_psk < ml_kem` — and it is the whole
+ * point: a profile carries a floor it can rise above but never fall below.
+ * A plain WireGuard profile has no negotiation block, hence no mode at all.
  */
-export type ProtectionMode = 'classic' | 'static_psk' | 'ml_kem'
+export type ProtectionMode = 'static_psk' | 'ml_kem'
 
 /**
  * Public settings of the key negotiation, as the operator distributes them.

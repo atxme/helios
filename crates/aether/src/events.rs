@@ -193,7 +193,7 @@ mod tests {
             preshared_key: Some(PSK.into()),
             key_negotiation_certificate_sha256: None,
             key_negotiation_pq_certificate_sha256: None,
-            minimum_key_negotiation_mode: crate::key_negotiation::ProtectionMode::MlKem,
+            minimum_key_negotiation_mode: Some(crate::key_negotiation::ProtectionMode::MlKem),
             persistent_keepalive_secs: crate::config::DEFAULT_PERSISTENT_KEEPALIVE_SECS,
         });
 

@@ -3,9 +3,9 @@ export type TunnelState = 'down' | 'connecting' | 'up' | 'failed' | 'captive_por
 /**
  * Protection a client may negotiate before the WireGuard handshake
  * (ADR-001, amendment of 24 July 2026). The order is monotonic:
- * `classic < static_psk < ml_kem`.
+ * `static_psk < ml_kem`. A plain WireGuard peer has no mode at all.
  */
-export type ProtectionMode = 'classic' | 'static_psk' | 'ml_kem'
+export type ProtectionMode = 'static_psk' | 'ml_kem'
 
 /**
  * WireGuard peer admitted by the gateway. The PSK is never exposed.
@@ -30,9 +30,10 @@ export interface PeerSummary {
   /**
    * Floor this peer can no longer fall back below. It rises on its own after
    * each committed negotiation and never comes back down over the network —
-   * only a local edit of `network.toml` lowers it.
+   * only a local edit of `network.toml` lowers it. `null` for a plain
+   * WireGuard peer: it has no PQ identity and never negotiates.
    */
-  minimum_key_negotiation_mode: ProtectionMode
+  minimum_key_negotiation_mode: ProtectionMode | null
   last_handshake_age_seconds: number | null
   endpoint: string | null
   rx_bytes: number | null

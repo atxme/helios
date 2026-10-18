@@ -18,7 +18,7 @@ fn all_modes_prepare_exactly_one_wireguard_slot_state() {
         protocol_version: KEY_NEGOTIATION_VERSION,
         server_challenge: TEST_CHALLENGE,
         transaction_id: [1; 16],
-        mode: ProtectionMode::Classic,
+        mode: ProtectionMode::StaticPsk,
         client_wg_public_key: CLIENT_WG_KEY.into(),
         gateway_wg_public_key: GATEWAY_WG_KEY.into(),
         server_name: TEST_SERVER_NAME.into(),
@@ -28,26 +28,7 @@ fn all_modes_prepare_exactly_one_wireguard_slot_state() {
         kem_public_key: None,
         static_psk_commitment: None,
     };
-    // Every other mode prepares a slot. `classic` prepares nothing,
-    // because it no longer exists as a negotiation outcome: a tunnel with
-    // no preshared key is a plain WireGuard profile.
-    //
-    // `Protocol`, not `Rejected`: this is a decoding refusal, and it says
-    // nothing about the peer. That the mode is retired is public
-    // knowledge, unlike a peer's floor or its admission status.
-    assert!(matches!(
-        prepare_key_material(
-            &base,
-            GATEWAY_WG_KEY,
-            [3; 16],
-            Some(&static_psk),
-            DEFAULT_CONFIRMATION_TIMEOUT,
-        ),
-        Err(PublicError::Protocol)
-    ));
-
     let mut static_request = base.clone();
-    static_request.mode = ProtectionMode::StaticPsk;
     static_request.static_psk_commitment = Some(commitment(&static_psk, &static_request));
     let prepared = prepare_key_material(
         &static_request,

@@ -24,12 +24,6 @@
 //! for the normative specification and
 //! [`ADR-005`](../../../docs/adr/ADR-005-NEGOCIATION-DE-CLE.md) for the
 //! reasoning behind the reversals.
-//!
-//! # Limite connue
-//!
-//! The `Classic` mode is still accepted by the types, and removed on
-//! **2027-02-01** (spec §19). It leaves the first handshake unprotected
-//! against a future quantum adversary; no new admission selects it.
 
 use aws_lc_rs::{digest, hkdf, hmac};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -254,11 +248,6 @@ pub enum KeyNegotiationError {
         "announced PSK lifetime {received}s does not match the {expected}s this mode requires"
     )]
     PskLifetimeMismatch { received: u32, expected: u32 },
-    #[error(
-        "`classic` is not a negotiable v5 mode: a tunnel with no preshared key \
-         is a plain WireGuard profile, not a negotiation outcome"
-    )]
-    ClassicNotNegotiable,
     #[error("PSK derivation is only valid for ML-KEM mode")]
     PskDerivationOutsideMlKem,
     #[error("key derivation failed")]

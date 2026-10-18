@@ -200,13 +200,13 @@ fn scenario_psk_binding() -> Outcome {
 }
 
 /// Hors ML-KEM, la dérivation doit refuser : un PSK « dérivé » en mode
-/// classique serait une protection imaginaire.
+/// `static_psk` serait une protection imaginaire.
 fn scenario_psk_outside_ml_kem() -> Outcome {
     let (mut request, mut response, shared) = transcript();
     let shared = aether::pq::SharedSecret::new(shared.try_into().unwrap_or([0; 32]));
-    request.mode = ProtectionMode::Classic;
+    request.mode = ProtectionMode::StaticPsk;
     request.kem_public_key = None;
-    response.selected_mode = ProtectionMode::Classic;
+    response.selected_mode = ProtectionMode::StaticPsk;
     response.kem_ciphertext = None;
 
     match derive_negotiated_psk(&shared, &request, &response) {
@@ -478,12 +478,12 @@ async fn scenario_local_downgrade(enrolled: &Enrolled) -> Outcome {
     let Some(settings) = enrolled.profile.key_negotiation.as_ref() else {
         return Outcome::skip("ce profil ne négocie pas");
     };
-    if settings.minimum_mode == ProtectionMode::Classic {
-        return Outcome::skip("plancher classique : rien à refuser");
+    if settings.minimum_mode != ProtectionMode::MlKem {
+        return Outcome::skip("plancher static_psk : rien à refuser");
     }
     let mut downgraded = enrolled.profile.duplicate();
     if let Some(block) = downgraded.key_negotiation.as_mut() {
-        block.mode = ProtectionMode::Classic;
+        block.mode = ProtectionMode::StaticPsk;
     }
     match prepare_for_profile(&downgraded, enrolled.identities.as_ref()).await {
         Err(error) => Outcome::pass(format!("refusé localement : {error}")),

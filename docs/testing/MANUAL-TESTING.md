@@ -362,8 +362,9 @@ Sur le poste Windows :
    handshake obtenu, la puce `PSK PQC · ML-KEM-1024` ;
 5. côté gateway, `helios peer list` doit montrer le plancher monté à
    `ml_kem` pour ce pair ;
-6. rejouer une connexion après avoir forcé `--mode classic` dans l'écran
-   *Profils* : le mode doit être **indisponible**, le plancher ayant monté ;
+6. rejouer une connexion après avoir forcé un mode sous le plancher (par
+   exemple `static_psk`) dans l'écran *Profils* : le mode doit être
+   **indisponible**, le plancher ayant monté ;
 7. toujours dans *Profils*, éprouver l'édition du bloc : coller un certificat
    PQ tronqué doit afficher l'empreinte « illisible », signaler le bloc en
    erreur et désactiver *Enregistrer* ; le *Plancher* ne doit proposer que

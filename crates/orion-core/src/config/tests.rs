@@ -277,7 +277,7 @@ fn negotiating(mode: ProtectionMode, minimum_mode: ProtectionMode) -> ClientProf
 ///
 /// The scenario is ordinary: a screen left open before the floor was
 /// raised, saved afterwards. Without the ratchet, the stale draft would
-/// carry the whole client back down to `classic` — exactly the downgrade
+/// carry the whole client back down to `static_psk` — exactly the downgrade
 /// the gateway refuses over the network.
 #[test]
 fn saving_a_profile_never_lowers_the_key_negotiation_floor() {
@@ -285,8 +285,8 @@ fn saving_a_profile_never_lowers_the_key_negotiation_floor() {
     cfg.upsert(negotiating(ProtectionMode::MlKem, ProtectionMode::MlKem))
         .unwrap();
     cfg.upsert(negotiating(
-        ProtectionMode::Classic,
-        ProtectionMode::Classic,
+        ProtectionMode::StaticPsk,
+        ProtectionMode::StaticPsk,
     ))
     .unwrap();
 
@@ -357,13 +357,13 @@ fn a_negotiation_block_survives_save_and_reload() {
     assert_eq!(settings.identity, "orion-poste");
 }
 
-/// Even a legacy `classic` floor does not permit changing profile kind.
+/// A weaker negotiation floor does not permit changing profile kind.
 #[test]
-fn a_classic_floor_does_not_allow_reclassifying_the_profile() {
+fn a_negotiation_floor_does_not_allow_reclassifying_the_profile() {
     let mut cfg = ClientConfig::default();
     cfg.upsert(negotiating(
-        ProtectionMode::Classic,
-        ProtectionMode::Classic,
+        ProtectionMode::StaticPsk,
+        ProtectionMode::StaticPsk,
     ))
     .unwrap();
     let error = cfg

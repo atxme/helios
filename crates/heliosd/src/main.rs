@@ -515,7 +515,6 @@ pub(crate) enum PeerCommand {
 
 #[derive(Clone, Copy, ValueEnum)]
 pub(crate) enum NegotiationMode {
-    Classic,
     StaticPsk,
     MlKem,
 }
@@ -523,11 +522,29 @@ pub(crate) enum NegotiationMode {
 impl From<NegotiationMode> for aether::key_negotiation::ProtectionMode {
     fn from(value: NegotiationMode) -> Self {
         match value {
-            NegotiationMode::Classic => Self::Classic,
             NegotiationMode::StaticPsk => Self::StaticPsk,
             NegotiationMode::MlKem => Self::MlKem,
         }
     }
+}
+
+/// Rewrites the pre-v5 `minimum_key_negotiation_mode = "classic"` values of
+/// `network.toml`, logging each peer that changed.
+fn migrate_legacy_key_negotiation_floors() -> anyhow::Result<()> {
+    for migration in NetworkConfig::migrate_legacy_classic_floor()
+        .context("migrating the legacy classic key-negotiation floors")?
+    {
+        let state = match migration.floor {
+            None => "plain WireGuard, no negotiation",
+            Some(_) => "floor raised to ml_kem",
+        };
+        warn!(
+            peer = %migration.peer,
+            state,
+            "rewrote the legacy classic key-negotiation floor in network.toml"
+        );
+    }
+    Ok(())
 }
 
 #[tokio::main]
@@ -568,6 +585,9 @@ async fn main() -> anyhow::Result<()> {
             dev,
             unsafe_disable_firewall,
         } => {
+            // Before the first load: the typed load refuses a legacy `classic`
+            // floor, so it is rewritten here, and a failure stops the daemon.
+            migrate_legacy_key_negotiation_floors()?;
             let network = NetworkConfig::load().context("loading the network config")?;
             let dry_run = resolve_dry_run(dev);
             let firewall_mode = if unsafe_disable_firewall {
@@ -844,10 +864,6 @@ mod tests {
     fn negotiation_mode_conversion_is_exhaustive() {
         use aether::key_negotiation::ProtectionMode;
 
-        assert_eq!(
-            ProtectionMode::from(NegotiationMode::Classic),
-            ProtectionMode::Classic
-        );
         assert_eq!(
             ProtectionMode::from(NegotiationMode::StaticPsk),
             ProtectionMode::StaticPsk

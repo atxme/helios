@@ -62,5 +62,4 @@ name = "nas-site-b"
 public_key = "Zq4W7e0R3t6Y9u2I5o8P1a4S7d0F3g6H9j2K5l8Z1x4="
 address = "100.101.7.250/32"
 admin = false
-minimum_key_negotiation_mode = "classic"
 persistent_keepalive_secs = 0

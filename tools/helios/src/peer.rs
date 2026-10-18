@@ -100,10 +100,10 @@ pub async fn cmd_add(
     ));
     out.push_str(&ui.field(
         "Negotiation",
-        &format!(
-            "{} minimum",
-            ui::protection_mode(peer.minimum_key_negotiation_mode)
-        ),
+        &match peer.minimum_key_negotiation_mode {
+            Some(mode) => format!("{} minimum", ui::protection_mode(mode)),
+            None => "plain WireGuard, no negotiation".to_string(),
+        },
     ));
     out.push_str(&ui.field("Public key", &peer.public_key));
     out.push('\n');
@@ -208,11 +208,11 @@ mod tests {
             key_negotiation_pq_certificate_sha256: None,
             key_negotiation_certificate: None,
             key_negotiation_pq_certificate: None,
-            minimum_key_negotiation_mode: ProtectionMode::Classic,
+            minimum_key_negotiation_mode: ProtectionMode::StaticPsk,
         };
         let value = serde_json::to_value(body).unwrap();
 
-        assert_eq!(value["minimum_key_negotiation_mode"], "classic");
+        assert_eq!(value["minimum_key_negotiation_mode"], "static_psk");
         assert!(value.get("key_negotiation_certificate_sha256").is_none());
         assert!(value.get("key_negotiation_pq_certificate_sha256").is_none());
     }
@@ -266,13 +266,16 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(admitted.name, "portable");
-        assert_eq!(admitted.minimum_key_negotiation_mode, ProtectionMode::MlKem);
+        assert_eq!(
+            admitted.minimum_key_negotiation_mode,
+            Some(ProtectionMode::MlKem)
+        );
         let request = server.await.unwrap();
         assert!(request.starts_with("POST /api/peers "));
         assert!(request.contains("\"key_negotiation_certificate_sha256\":\"tls\""));
         assert!(request.contains("\"key_negotiation_pq_certificate_sha256\":\"pq\""));
 
-        let (base, server) = response_server(peer_summary("portable", false, "classic")).await;
+        let (base, server) = response_server(peer_summary("portable", false, "ml_kem")).await;
         let removed = revoke(&client, &base, "portable").await.unwrap();
         assert_eq!(removed.address, "100.64.1.2/32");
         let request = server.await.unwrap();

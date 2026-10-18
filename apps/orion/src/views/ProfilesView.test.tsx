@@ -199,7 +199,7 @@ describe('ProfilesView interactions', () => {
     await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
 
     // Back down the ladder: nothing has been negotiated, so the floor is
-    // still `classic` and the rung is reachable.
+    // still `static_psk` and the rung is reachable.
     fireEvent.click(screen.getByRole('button', { name: 'Aucune' }))
     fireEvent.click(screen.getByRole('button', { name: 'Enregistrer' }))
     await waitFor(() => expect(handlers.onSave).toHaveBeenCalledOnce())
@@ -352,7 +352,7 @@ describe('ProfilesView interactions', () => {
             profile({
               key_negotiation: {
                 mode: 'ml_kem',
-                minimum_mode: 'classic',
+                minimum_mode: 'static_psk',
                 endpoint: '203.0.113.10:51821',
                 server_name: '203.0.113.10',
                 gateway_ca_der: 'ca',
@@ -383,11 +383,9 @@ describe('ProfilesView interactions', () => {
   })
 
   /**
-   * `classic` is the absence of the block, never a mode inside it.
-   *
-   * The gateway refuses a negotiated `classic` by name
-   * (`ClassicNotNegotiable`), so offering it here would only build profiles
-   * that fail before the first handshake.
+   * A plain WireGuard profile is the absence of the block, never a mode
+   * inside it: the gateway has no `classic` mode, so offering one here would
+   * only build profiles that fail before the first handshake.
    */
   it('offers no negotiated mode and keeps an existing profile Helios', async () => {
     const handlers = callbacks()
@@ -399,7 +397,7 @@ describe('ProfilesView interactions', () => {
               profile_type: 'helios_key_negotiation',
               key_negotiation: {
                 mode: 'ml_kem',
-                minimum_mode: 'classic',
+                minimum_mode: 'static_psk',
                 endpoint: '203.0.113.10:51821',
                 server_name: '203.0.113.10',
                 gateway_ca_der: 'ca',
@@ -418,12 +416,12 @@ describe('ProfilesView interactions', () => {
 
     // No mode row: this rung writes `ml_kem` and nothing else.
     expect(screen.queryByLabelText('Mode de négociation')).toBeNull()
-    // The floor still shows all three: it is a ratchet, and seeing what one
+    // The floor still shows both modes: it is a ratchet, and seeing what one
     // has climbed past is the point. `static_psk` stays a floor one may
     // demand even though Orion no longer composes it as a mode.
     expect(
       within(screen.getByLabelText('Plancher anti-downgrade')).getAllByRole('button'),
-    ).toHaveLength(3)
+    ).toHaveLength(2)
 
     expect(screen.queryByRole('button', { name: 'Retirer' })).toBeNull()
   })
@@ -455,7 +453,7 @@ describe('ProfilesView interactions', () => {
               has_static_psk: true,
               key_negotiation: {
                 mode: 'static_psk',
-                minimum_mode: 'classic',
+                minimum_mode: 'static_psk',
                 endpoint: '203.0.113.10:51821',
                 server_name: '203.0.113.10',
                 gateway_ca_der: 'ca',
@@ -1110,7 +1108,7 @@ describe('ProfilesView interactions', () => {
     // Neither click went through: the block is still there, floor included.
     expect(
       within(screen.getByLabelText('Plancher anti-downgrade')).getAllByRole('button'),
-    ).toHaveLength(3)
+    ).toHaveLength(2)
   })
 
   it('loads an associated profile and explains a failed identity seal', async () => {

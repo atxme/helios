@@ -50,7 +50,7 @@ const STATUS: Status = {
       public_key: 'aQ7wS2eD5rF8tG1yH4jK7lM0nB3vC6xZ9pO2iU5yT8r=',
       address: '100.64.0.27',
       post_quantum: false,
-      minimum_key_negotiation_mode: 'classic',
+      minimum_key_negotiation_mode: null,
       last_handshake_age_seconds: 4_000,
       rx_bytes: 131_072,
       tx_bytes: 65_536,
@@ -188,7 +188,7 @@ describe('Clients', () => {
     )
 
     expect(screen.getByText('ML-KEM-1024')).toBeTruthy()
-    expect(screen.getByText('aucun')).toBeTruthy()
+    expect(screen.getByText('WireGuard')).toBeTruthy()
   })
 
   it('admits a client without asking for an address', async () => {

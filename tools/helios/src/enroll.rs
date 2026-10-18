@@ -199,8 +199,8 @@ pub async fn run(client: &Client, base: &str, options: EnrollOptions) -> Result<
     if options.mode == ProtectionMode::StaticPsk {
         bail!(
             "`enroll` does not set up a static PSK: that mode needs a secret shared out of band, \
-             which this command deliberately never invents. Use --mode ml-kem (recommended) or \
-             --mode classic, and configure a static PSK by hand if you really need one."
+             which this command deliberately never invents. Use --mode ml-kem, and configure a \
+             static PSK by hand if you really need one."
         );
     }
 

@@ -57,7 +57,8 @@ pub struct NetworkPeerView {
     pub preshared_key_configured: bool,
     pub key_negotiation_certificate_sha256: Option<String>,
     pub key_negotiation_pq_certificate_sha256: Option<String>,
-    pub minimum_key_negotiation_mode: ProtectionMode,
+    /// `null` for a plain WireGuard peer, which has no negotiation floor.
+    pub minimum_key_negotiation_mode: Option<ProtectionMode>,
     pub admin: bool,
 }
 

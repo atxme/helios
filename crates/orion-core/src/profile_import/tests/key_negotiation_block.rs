@@ -122,7 +122,7 @@ fn an_imported_block_without_a_floor_takes_its_selected_mode_as_floor() {
 /// import refuses it rather than silently picking a side.
 #[test]
 fn a_mode_below_the_declared_floor_is_refused_at_import() {
-    let mut settings = gateway_settings(ProtectionMode::Classic);
+    let mut settings = gateway_settings(ProtectionMode::StaticPsk);
     settings.minimum_mode = ProtectionMode::MlKem;
     let raw = document_with(serde_json::to_value(&settings).unwrap());
 
@@ -185,5 +185,22 @@ fn a_trust_block_without_the_gateway_identity_epochs_is_refused_at_import() {
     assert!(
         error.contains("matériel de confiance"),
         "the import names the trust block: {error}"
+    );
+}
+
+/// `classic` is no longer a negotiation mode, so a document that still names
+/// it is refused at import, with the French message of an invalid document.
+#[test]
+fn a_classic_negotiation_mode_is_refused_at_import() {
+    let mut settings = serde_json::to_value(gateway_settings(ProtectionMode::MlKem)).unwrap();
+    settings["mode"] = serde_json::json!("classic");
+    let raw = document_with(settings);
+
+    let error = parse_profile_import(&raw, "ancien.orion")
+        .expect_err("a classic negotiation mode must be refused")
+        .to_string();
+    assert!(
+        error.contains("document JSON Orion invalide"),
+        "message : {error}"
     );
 }

@@ -235,7 +235,6 @@ pub(super) async fn connect_with_key_negotiation(
                     });
                 link_lost.store(false, Ordering::SeqCst);
                 let protection = match mode {
-                    aether::key_negotiation::ProtectionMode::Classic => PskKind::None,
                     aether::key_negotiation::ProtectionMode::StaticPsk => PskKind::Static,
                     aether::key_negotiation::ProtectionMode::MlKem => PskKind::MlKem,
                 };

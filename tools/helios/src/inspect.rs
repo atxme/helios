@@ -2,7 +2,7 @@
 //! None of them changes any state. Rendering is separate from fetching so
 //! each layout is tested on recorded gateway data.
 
-use aether::{certificates::window::ValidityPhase, key_negotiation::ProtectionMode};
+use aether::certificates::window::ValidityPhase;
 use anyhow::{Context, Result};
 use helios_update::UpdateStatus;
 use reqwest::Client;
@@ -264,12 +264,12 @@ pub async fn doctor(target: &Api) -> Result<()> {
 
 // ─── Status, peers, network ───────────────────────────────────────────────────
 
-fn mode_label(mode: &str) -> &str {
+fn mode_label(mode: Option<&str>) -> &str {
     match mode {
-        "ml_kem" => "ML-KEM",
-        "static_psk" => "static PSK",
-        "classic" => "classic",
-        _ => "unknown",
+        Some("ml_kem") => "ML-KEM",
+        Some("static_psk") => "static PSK",
+        None => "plain WireGuard",
+        Some(_) => "unknown",
     }
 }
 
@@ -428,10 +428,10 @@ pub fn render_peers(ui: &Ui, status: &Status) -> String {
     }
     let (online, total) = status.online_peers();
     let admins = status.peers.iter().filter(|peer| peer.admin).count();
-    let modes: Vec<&str> = status
+    let modes: Vec<Option<&str>> = status
         .peers
         .iter()
-        .map(|peer| peer.minimum_key_negotiation_mode.as_str())
+        .map(|peer| peer.minimum_key_negotiation_mode.as_deref())
         .collect();
     let uniform = modes.windows(2).all(|pair| pair[0] == pair[1]);
     let mut out = ui.title(
@@ -460,18 +460,20 @@ pub fn render_peers(ui: &Ui, status: &Status) -> String {
                 Cell::new(traffic(peer.rx_bytes, peer.tx_bytes), Tone::Dim),
             ];
             if !uniform {
-                row.push(Cell::plain(mode_label(&peer.minimum_key_negotiation_mode)));
+                row.push(Cell::plain(mode_label(
+                    peer.minimum_key_negotiation_mode.as_deref(),
+                )));
             }
             row.push(Cell::new(short(&peer.public_key, 8), Tone::Dim));
             row
         })
         .collect();
     out.push_str(&ui.table(2, &headers, &rows));
-    if uniform {
+    if let Some(mode) = modes.first().copied().flatten().filter(|_| uniform) {
         out.push('\n');
         out.push_str(&ui.note(&format!(
             "Every peer requires {} key negotiation.",
-            mode_label(modes[0])
+            mode_label(Some(mode))
         )));
     }
     out.push('\n');
@@ -542,10 +544,10 @@ pub fn render_network(ui: &Ui, view: &NetworkConfigView) -> String {
         .iter()
         .filter(|peer| peer.preshared_key_configured)
         .count();
-    let classic = view
+    let plain = view
         .peers
         .iter()
-        .filter(|peer| peer.minimum_key_negotiation_mode == ProtectionMode::Classic)
+        .filter(|peer| peer.minimum_key_negotiation_mode.is_none())
         .count();
     let mut peers = vec![
         format!("{} admitted", view.peers.len()),
@@ -555,15 +557,10 @@ pub fn render_network(ui: &Ui, view: &NetworkConfigView) -> String {
     if static_psk > 0 {
         peers.push(format!("{static_psk} with a static PSK"));
     }
-    out.push_str(&ui.field("Peers", &format!("{} — /peer list", peers.join(" · "))));
-    if classic > 0 {
-        // Retired mode (spec §19): worth seeing from the configuration view.
-        out.push_str(&ui.field_toned(
-            "",
-            &format!("{classic} peer(s) still accept classic WireGuard without a PSK"),
-            Tone::Warn,
-        ));
+    if plain > 0 {
+        peers.push(format!("{plain} plain WireGuard, no negotiation"));
     }
+    out.push_str(&ui.field("Peers", &format!("{} — /peer list", peers.join(" · "))));
     out.push('\n');
     out
 }

@@ -66,7 +66,7 @@ mod tests {
             preshared_key: None,
             key_negotiation_certificate_sha256: None,
             key_negotiation_pq_certificate_sha256: None,
-            minimum_key_negotiation_mode: ProtectionMode::Classic,
+            minimum_key_negotiation_mode: None,
             persistent_keepalive_secs: aether::config::DEFAULT_PERSISTENT_KEEPALIVE_SECS,
         });
         network

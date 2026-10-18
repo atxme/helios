@@ -77,12 +77,6 @@ pub fn prepare_key_material(
     };
 
     let psk = match request.mode {
-        // Unreachable through the public port, where `validate()` refuses it
-        // before anything is prepared. Kept as an explicit refusal rather than
-        // an `unreachable!()`: this function is also reachable from tests and
-        // tooling, and a mode that yields no PSK must never silently produce a
-        // prepared slot.
-        ProtectionMode::Classic => return Err(PublicError::Rejected),
         ProtectionMode::StaticPsk => {
             // `Rejected`, not a mode-specific code: whether the peer has no
             // static PSK configured, or has one that does not match, is

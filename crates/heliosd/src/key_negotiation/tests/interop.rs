@@ -182,7 +182,7 @@ async fn end_to_end_negotiation(leaf: GatewayLeaf, family: ClientFamily) {
             aether_key_negotiation::certificate_fingerprint_der(&tls.client_certificate),
         ),
         key_negotiation_pq_certificate_sha256: Some(client_pq_certificate.fingerprint().unwrap()),
-        minimum_key_negotiation_mode: ProtectionMode::MlKem,
+        minimum_key_negotiation_mode: Some(ProtectionMode::MlKem),
         persistent_keepalive_secs: aether::config::DEFAULT_PERSISTENT_KEEPALIVE_SECS,
     });
 

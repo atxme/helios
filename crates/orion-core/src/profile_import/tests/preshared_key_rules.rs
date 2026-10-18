@@ -115,15 +115,9 @@ fn an_ml_kem_profile_without_its_negotiated_psk_never_reaches_the_data_plane() {
     );
 }
 
-/// The other two modes keep their existing contract unchanged.
+/// The other mode keeps its existing contract unchanged.
 #[test]
 fn the_data_plane_rule_only_constrains_ml_kem() {
-    let classic = ClientProfile {
-        key_negotiation: Some(gateway_settings(ProtectionMode::Classic)),
-        ..complete_profile()
-    };
-    assert!(classic.validate_for_data_plane().is_ok());
-
     let static_psk = ClientProfile {
         preshared_key: Some("cHNrLXN0YXRpcXVl".into()),
         key_negotiation: Some(gateway_settings(ProtectionMode::StaticPsk)),

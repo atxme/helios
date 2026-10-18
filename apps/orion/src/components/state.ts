@@ -242,28 +242,17 @@ export function protectionMeta(
 }
 
 /**
- * The three negotiable modes, from weakest to strongest.
+ * The negotiable modes, from weakest to strongest.
  *
  * The order isn't decorative: it's the one the gateway enforces
- * (`classic < static_psk < ml_kem`), and the screen derives from it what a
- * profile may still choose.
- */
-export const PROTECTION_MODES: ProtectionMode[] = ['classic', 'static_psk', 'ml_kem']
-
-/**
- * The modes a negotiation block may actually request.
+ * (`static_psk < ml_kem`), and the screen derives from it what a profile may
+ * still choose.
  *
- * `classic` is missing on purpose, and it is not an omission of the screen:
- * `aether::key_negotiation` refuses it at validation with
- * `ClassicNotNegotiable`. A negotiated `classic` means "no preshared key at
- * all", which is what a plain WireGuard profile already expresses without
- * touching the negotiation port — offering it here would only build profiles
- * the gateway rejects before the first handshake.
- *
- * Classic is therefore not a mode in this list: it is the **absence** of the
- * block, and the way to reach it is to remove one.
+ * There is no `classic` here, and it is not an omission of the screen: a
+ * plain WireGuard profile is the **absence** of the negotiation block, and the
+ * way to reach it is to remove one.
  */
-export const NEGOTIABLE_MODES: ProtectionMode[] = ['static_psk', 'ml_kem']
+export const PROTECTION_MODES: ProtectionMode[] = ['static_psk', 'ml_kem']
 
 export interface ModeMeta {
   /** Chip label. Only a label: what a mode does is not a caption. */
@@ -271,13 +260,12 @@ export interface ModeMeta {
 }
 
 const MODE_META: Record<ProtectionMode, ModeMeta> = {
-  classic: { label: 'Classique' },
   static_psk: { label: 'PSK' },
   ml_kem: { label: 'ML-KEM' },
 }
 
 export function modeMeta(mode: ProtectionMode): ModeMeta {
-  return MODE_META[mode] ?? MODE_META.classic
+  return MODE_META[mode]
 }
 
 /** Rank in the monotonic order. Higher = stronger. */

@@ -70,7 +70,7 @@ Usage : ./scripts/provision-client.sh <nom-client> [hôte-ssh] [options]
                        joignent la gateway. Obligatoire.
   --server-name NOM    Nom authentifié par le certificat de négociation
                        (défaut : l'hôte de --endpoint)
-  --mode MODE          classic | static-psk | ml-kem   (défaut : ml-kem)
+  --mode MODE          static-psk | ml-kem   (défaut : ml-kem)
   --trafic PLAGES      Trafic capté par le tunnel : une ou plusieurs plages
                        CIDR séparées par des virgules. Absent = tunnel
                        complet (0.0.0.0/0). Le préciser ici plutôt que dans

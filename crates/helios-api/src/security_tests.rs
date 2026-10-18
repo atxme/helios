@@ -34,7 +34,7 @@ fn state_with_mode(dry_run: bool) -> (AppState, mpsc::Receiver<OrchestratorCmd>)
             preshared_key: Some(PEER_PSK.into()),
             key_negotiation_certificate_sha256: None,
             key_negotiation_pq_certificate_sha256: None,
-            minimum_key_negotiation_mode: aether::key_negotiation::ProtectionMode::Classic,
+            minimum_key_negotiation_mode: None,
             persistent_keepalive_secs: aether::config::DEFAULT_PERSISTENT_KEEPALIVE_SECS,
         }],
         ..NetworkConfig::default()

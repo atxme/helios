@@ -432,8 +432,12 @@ pub struct WgPeer {
     pub key_negotiation_pq_certificate_sha256: Option<String>,
     /// Lowest protection mode accepted for this peer. A network negotiation
     /// can raise the mode but can never lower it below this policy.
-    #[serde(default)]
-    pub minimum_key_negotiation_mode: crate::key_negotiation::ProtectionMode,
+    ///
+    /// `None` is a plain WireGuard peer: it has no PQ identity and never
+    /// negotiates. A negotiating peer must have a floor, and a floor needs a
+    /// PQ identity (see [`NetworkConfig::validate_peer_identities`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minimum_key_negotiation_mode: Option<crate::key_negotiation::ProtectionMode>,
     /// Seconds between WireGuard keep-alives sent **by the gateway** to this
     /// peer. `0` disables them.
     ///
@@ -514,7 +518,9 @@ struct PersistedWgPeer<'a> {
     admin: bool,
     key_negotiation_certificate_sha256: &'a Option<String>,
     key_negotiation_pq_certificate_sha256: &'a Option<String>,
-    minimum_key_negotiation_mode: crate::key_negotiation::ProtectionMode,
+    /// Written only when present: a plain WireGuard peer has no floor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    minimum_key_negotiation_mode: Option<crate::key_negotiation::ProtectionMode>,
     persistent_keepalive_secs: u16,
 }
 
@@ -580,6 +586,41 @@ impl<'a> PersistedNetworkConfig<'a> {
     }
 }
 
+/// The value `minimum_key_negotiation_mode` had before v5 dropped it.
+const LEGACY_CLASSIC_MODE: &str = "classic";
+const MINIMUM_MODE_KEY: &str = "minimum_key_negotiation_mode";
+const PQ_IDENTITY_KEY: &str = "key_negotiation_pq_certificate_sha256";
+
+/// A `[[peers]]` entry rewritten by [`NetworkConfig::migrate_legacy_classic_floor`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyFloorMigration {
+    pub peer: String,
+    /// The floor the peer has now: `None` for a plain WireGuard peer.
+    pub floor: Option<crate::key_negotiation::ProtectionMode>,
+}
+
+/// Names of the `[[peers]]` entries still carrying the legacy `classic` floor.
+fn legacy_classic_peer_names(document: &toml::Value) -> Vec<String> {
+    document
+        .get("peers")
+        .and_then(toml::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(toml::Value::as_table)
+        .filter(|peer| {
+            peer.get(MINIMUM_MODE_KEY)
+                .and_then(toml::Value::as_str)
+                .is_some_and(|mode| mode == LEGACY_CLASSIC_MODE)
+        })
+        .map(|peer| {
+            peer.get("name")
+                .and_then(toml::Value::as_str)
+                .unwrap_or("<unnamed>")
+                .to_string()
+        })
+        .collect()
+}
+
 /// Gateway-side keep-alive interval, in seconds.
 ///
 /// Matches the client default. Short enough that a rekey happens well inside
@@ -641,14 +682,21 @@ impl NetworkConfig {
     /// Loads the network config from `/var/lib/helios/network.toml`.
     /// Returns an empty config if the file does not exist yet.
     pub fn load() -> Result<Self> {
-        let path = Self::path();
-        match std::fs::read_to_string(&path).map(zeroize::Zeroizing::new) {
-            // The file's text is `Zeroizing` because a legacy `network.toml`
-            // still carries the gateway identity in the clear, and a
-            // hand-edited one a static PSK: the parse buffer holds both
-            // (ADR-006 §5).
-            Ok(raw) => Self::from_toml(&raw),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+        match Self::read_file(&Self::path())? {
+            Some(raw) => Self::from_toml(&raw),
+            None => Ok(Self::default()),
+        }
+    }
+
+    /// Reads the raw text of `network.toml`, `None` when it does not exist.
+    ///
+    /// The text is `Zeroizing` because a legacy `network.toml` still carries
+    /// the gateway identity in the clear, and a hand-edited one a static PSK:
+    /// the parse buffer holds both (ADR-006 §5).
+    fn read_file(path: &std::path::Path) -> Result<Option<zeroize::Zeroizing<String>>> {
+        match std::fs::read_to_string(path).map(zeroize::Zeroizing::new) {
+            Ok(raw) => Ok(Some(raw)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(HeliosError::Config(format!(
                 "reading {}: {e}",
                 path.display()
@@ -659,9 +707,88 @@ impl NetworkConfig {
     /// Reads and validates the text of `network.toml`: what [`Self::load`]
     /// does once the file is read.
     fn from_toml(raw: &str) -> Result<Self> {
+        // Looked at before the typed parse, so a legacy file gets a message
+        // that names the peers instead of a serde error on an unknown value.
+        let document: toml::Value =
+            toml::from_str(raw).map_err(|e| HeliosError::Config(e.to_string()))?;
+        let legacy = legacy_classic_peer_names(&document);
+        if !legacy.is_empty() {
+            return Err(HeliosError::Config(format!(
+                "peer(s) {} still set minimum_key_negotiation_mode = \"classic\", which is \
+                 no longer a protection mode; heliosd rewrites network.toml at startup \
+                 (no floor for a peer without a PQ identity, ml_kem otherwise)",
+                legacy.join(", ")
+            )));
+        }
         let config: Self = toml::from_str(raw).map_err(|e| HeliosError::Config(e.to_string()))?;
         config.validate()?;
         Ok(config)
+    }
+
+    /// Rewrites the legacy `minimum_key_negotiation_mode = "classic"` of a
+    /// `network.toml` written before v5 dropped that value.
+    ///
+    /// A peer without a PQ identity was a plain WireGuard peer: its floor is
+    /// removed. A peer with one is raised to `ml_kem`, the v5 admission
+    /// default. Nothing else is changed, and a file with nothing to migrate is
+    /// not written at all. Only the file's values are rewritten, not its layout:
+    /// the TOML is re-serialized from its parsed form.
+    ///
+    /// Run by heliosd before its first load, so the typed load never sees the
+    /// legacy value. A missing file is an empty migration.
+    pub fn migrate_legacy_classic_floor() -> Result<Vec<LegacyFloorMigration>> {
+        let path = Self::path();
+        let Some(raw) = Self::read_file(&path)? else {
+            return Ok(Vec::new());
+        };
+        let mut document: toml::Value =
+            toml::from_str(&raw).map_err(|e| HeliosError::Config(e.to_string()))?;
+        let mut migrated = Vec::new();
+        if let Some(peers) = document
+            .get_mut("peers")
+            .and_then(toml::Value::as_array_mut)
+        {
+            for peer in peers.iter_mut().filter_map(toml::Value::as_table_mut) {
+                let legacy = peer
+                    .get(MINIMUM_MODE_KEY)
+                    .and_then(toml::Value::as_str)
+                    .is_some_and(|mode| mode == LEGACY_CLASSIC_MODE);
+                if !legacy {
+                    continue;
+                }
+                let name = peer
+                    .get("name")
+                    .and_then(toml::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let floor = if peer.contains_key(PQ_IDENTITY_KEY) {
+                    let floor = crate::key_negotiation::ProtectionMode::MlKem;
+                    peer.insert(
+                        MINIMUM_MODE_KEY.into(),
+                        toml::Value::String("ml_kem".into()),
+                    );
+                    Some(floor)
+                } else {
+                    peer.remove(MINIMUM_MODE_KEY);
+                    None
+                };
+                migrated.push(LegacyFloorMigration { peer: name, floor });
+            }
+        }
+        if migrated.is_empty() {
+            return Ok(migrated);
+        }
+        // Same reason as the read buffer: a legacy file carries secrets.
+        let rewritten = zeroize::Zeroizing::new(
+            toml::to_string_pretty(&document).map_err(|e| HeliosError::Config(e.to_string()))?,
+        );
+        if let Some(parent) = path.parent() {
+            crate::private_file::create_private_dir(parent)
+                .map_err(|e| HeliosError::Config(format!("creating directory: {e}")))?;
+        }
+        crate::private_file::write_private_atomic(&path, rewritten.as_bytes())
+            .map_err(|e| HeliosError::Config(format!("private atomic write: {e}")))?;
+        Ok(migrated)
     }
 
     /// Persists an already public network config atomically (rename).
@@ -822,8 +949,14 @@ impl NetworkConfig {
                 peer.key_negotiation_pq_certificate_sha256
                     .clone_from(&known.key_negotiation_pq_certificate_sha256);
             }
-            if peer.minimum_key_negotiation_mode.security_level()
-                < known.minimum_key_negotiation_mode.security_level()
+            // `None` ranks below every floor: a file that drops the floor
+            // cannot lower a negotiated one.
+            if peer
+                .minimum_key_negotiation_mode
+                .map_or(0, crate::key_negotiation::ProtectionMode::security_level)
+                < known
+                    .minimum_key_negotiation_mode
+                    .map_or(0, crate::key_negotiation::ProtectionMode::security_level)
             {
                 peer.minimum_key_negotiation_mode = known.minimum_key_negotiation_mode;
             }
@@ -881,13 +1014,23 @@ impl NetworkConfig {
                     },
                 )?;
             }
-            if peer.minimum_key_negotiation_mode != crate::key_negotiation::ProtectionMode::Classic
-                && pq_identity.is_none()
-            {
-                return Err(HeliosError::Config(format!(
-                    "peer {} requires a PQ key-negotiation identity for its security floor",
-                    peer.name
-                )));
+            // A floor and a PQ identity come together: a floor without the
+            // identity cannot be met, and an identity without a floor would
+            // negotiate with no minimum.
+            match (peer.minimum_key_negotiation_mode, pq_identity) {
+                (Some(_), None) => {
+                    return Err(HeliosError::Config(format!(
+                        "peer {} requires a PQ key-negotiation identity for its security floor",
+                        peer.name
+                    )));
+                }
+                (None, Some(_)) => {
+                    return Err(HeliosError::Config(format!(
+                        "peer {} has a PQ key-negotiation identity but no security floor",
+                        peer.name
+                    )));
+                }
+                _ => {}
             }
             // A negotiated peer without keep-alives silently loses both
             // liveness mechanisms of v5: the gateway would never reclaim its

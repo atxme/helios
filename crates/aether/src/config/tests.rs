@@ -23,7 +23,7 @@ fn a_reloaded_config_keeps_the_secrets_the_file_never_held() {
             preshared_key: Some("PSK-NEGOCIE".into()),
             key_negotiation_certificate_sha256: Some("empreinte-tls".into()),
             key_negotiation_pq_certificate_sha256: Some("empreinte-pq".into()),
-            minimum_key_negotiation_mode: crate::key_negotiation::ProtectionMode::MlKem,
+            minimum_key_negotiation_mode: Some(crate::key_negotiation::ProtectionMode::MlKem),
             persistent_keepalive_secs: DEFAULT_PERSISTENT_KEEPALIVE_SECS,
         }],
         ..NetworkConfig::default()
@@ -39,7 +39,7 @@ fn a_reloaded_config_keeps_the_secrets_the_file_never_held() {
                 key_negotiation_pq_certificate_sha256: None,
                 // A file that asks for less than what was reached: the
                 // floor must not follow it down.
-                minimum_key_negotiation_mode: crate::key_negotiation::ProtectionMode::Classic,
+                minimum_key_negotiation_mode: None,
                 persistent_keepalive_secs: DEFAULT_PERSISTENT_KEEPALIVE_SECS,
                 ..running.peers[0].duplicate()
             },
@@ -52,7 +52,7 @@ fn a_reloaded_config_keeps_the_secrets_the_file_never_held() {
                 preshared_key: None,
                 key_negotiation_certificate_sha256: None,
                 key_negotiation_pq_certificate_sha256: None,
-                minimum_key_negotiation_mode: crate::key_negotiation::ProtectionMode::MlKem,
+                minimum_key_negotiation_mode: Some(crate::key_negotiation::ProtectionMode::MlKem),
                 persistent_keepalive_secs: DEFAULT_PERSISTENT_KEEPALIVE_SECS,
             },
         ],
@@ -79,7 +79,7 @@ fn a_reloaded_config_keeps_the_secrets_the_file_never_held() {
     );
     assert_eq!(
         from_disk.peers[0].minimum_key_negotiation_mode,
-        crate::key_negotiation::ProtectionMode::MlKem,
+        Some(crate::key_negotiation::ProtectionMode::MlKem),
         "the anti-downgrade floor only ever goes up"
     );
 
@@ -113,7 +113,7 @@ fn the_debug_of_a_running_configuration_reveals_no_secret() {
         preshared_key: Some(PSK.into()),
         key_negotiation_certificate_sha256: None,
         key_negotiation_pq_certificate_sha256: None,
-        minimum_key_negotiation_mode: crate::key_negotiation::ProtectionMode::MlKem,
+        minimum_key_negotiation_mode: Some(crate::key_negotiation::ProtectionMode::MlKem),
         persistent_keepalive_secs: DEFAULT_PERSISTENT_KEEPALIVE_SECS,
     });
 
@@ -146,7 +146,7 @@ fn duplicating_a_configuration_carries_the_secrets_independently() {
         preshared_key: Some("psk".into()),
         key_negotiation_certificate_sha256: None,
         key_negotiation_pq_certificate_sha256: None,
-        minimum_key_negotiation_mode: crate::key_negotiation::ProtectionMode::MlKem,
+        minimum_key_negotiation_mode: Some(crate::key_negotiation::ProtectionMode::MlKem),
         persistent_keepalive_secs: DEFAULT_PERSISTENT_KEEPALIVE_SECS,
     });
 
@@ -501,7 +501,7 @@ fn identities_require_unique_host_vips() {
         preshared_key: None,
         key_negotiation_certificate_sha256: None,
         key_negotiation_pq_certificate_sha256: None,
-        minimum_key_negotiation_mode: crate::key_negotiation::ProtectionMode::Classic,
+        minimum_key_negotiation_mode: None,
         persistent_keepalive_secs: DEFAULT_PERSISTENT_KEEPALIVE_SECS,
     };
     let mut cfg = NetworkConfig {
@@ -709,7 +709,7 @@ fn production_save_excludes_runtime_secrets_and_development_keeps_only_identity(
         preshared_key: Some(PSK.into()),
         key_negotiation_certificate_sha256: None,
         key_negotiation_pq_certificate_sha256: None,
-        minimum_key_negotiation_mode: crate::key_negotiation::ProtectionMode::Classic,
+        minimum_key_negotiation_mode: None,
         persistent_keepalive_secs: DEFAULT_PERSISTENT_KEEPALIVE_SECS,
     });
 
@@ -861,4 +861,133 @@ fn the_auto_marker_is_recognised_regardless_of_case_and_spacing() {
         !named.wan_iface_is_auto(),
         "« auto0 » is a real interface name on some boards, not the marker"
     );
+}
+
+/// Runs `body` with `HELIOS_NETWORK_CONFIG` pointing at a fresh `network.toml`
+/// holding `content`, or at a path that does not exist when `content` is `None`.
+#[cfg(unix)]
+fn with_network_file<T>(
+    tag: &str,
+    content: Option<&str>,
+    body: impl FnOnce(&std::path::Path) -> T,
+) -> T {
+    let _guard = NETWORK_CONFIG_ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = std::env::temp_dir().join(format!(
+        "aether-legacy-{tag}-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("test directory");
+    let path = dir.join("network.toml");
+    if let Some(content) = content {
+        std::fs::write(&path, content).expect("seed network.toml");
+    }
+    std::env::set_var("HELIOS_NETWORK_CONFIG", &path);
+    let outcome = body(&path);
+    std::env::remove_var("HELIOS_NETWORK_CONFIG");
+    let _ = std::fs::remove_dir_all(&dir);
+    outcome
+}
+
+/// A pre-v5 `network.toml`: one plain peer and one negotiating peer, both
+/// still carrying `minimum_key_negotiation_mode = "classic"`.
+#[cfg(unix)]
+const LEGACY_CLASSIC_FILE: &str = r#"
+wg_address = "100.64.0.1/10"
+wg_private_key = "GATEWAY-PRIVATE-KEY-MUST-SURVIVE-THE-MIGRATION"
+
+[[peers]]
+name = "poste"
+public_key = "CLE-POSTE"
+address = "100.64.1.2/32"
+minimum_key_negotiation_mode = "classic"
+persistent_keepalive_secs = 0
+
+[[peers]]
+name = "negocie"
+public_key = "CLE-NEGOCIE"
+address = "100.64.1.3/32"
+key_negotiation_certificate_sha256 = "0e9d8c7b6a5f4e3d2c1b0a9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c3b2a1f0e9d"
+key_negotiation_pq_certificate_sha256 = "f0e1d2c3b4a5968778695a4b3c2d1e0ff0e1d2c3b4a5968778695a4b3c2d1e0f"
+minimum_key_negotiation_mode = "classic"
+persistent_keepalive_secs = 25
+"#;
+
+#[cfg(unix)]
+#[test]
+fn a_legacy_classic_floor_is_refused_at_load_and_names_the_peers() {
+    with_network_file("refused", Some(LEGACY_CLASSIC_FILE), |_| {
+        let error = NetworkConfig::load().expect_err("a classic floor must not load");
+        let message = error.to_string();
+        assert!(message.contains("poste"), "{message}");
+        assert!(message.contains("negocie"), "{message}");
+        assert!(
+            message.contains("rewrites network.toml at startup"),
+            "{message}"
+        );
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn a_legacy_classic_floor_is_migrated_per_peer_identity() {
+    with_network_file("migrated", Some(LEGACY_CLASSIC_FILE), |path| {
+        let migrated = NetworkConfig::migrate_legacy_classic_floor().expect("migration");
+        assert_eq!(
+            migrated,
+            vec![
+                LegacyFloorMigration {
+                    peer: "poste".into(),
+                    floor: None,
+                },
+                LegacyFloorMigration {
+                    peer: "negocie".into(),
+                    floor: Some(crate::key_negotiation::ProtectionMode::MlKem),
+                },
+            ]
+        );
+
+        let rewritten = std::fs::read_to_string(path).expect("read the migrated file");
+        assert!(
+            rewritten.contains("GATEWAY-PRIVATE-KEY-MUST-SURVIVE-THE-MIGRATION"),
+            "the migration must not drop the rest of the file"
+        );
+        assert!(!rewritten.contains("\"classic\""), "{rewritten}");
+
+        let loaded = NetworkConfig::load().expect("the migrated file loads");
+        assert_eq!(loaded.peers[0].minimum_key_negotiation_mode, None);
+        assert_eq!(
+            loaded.peers[1].minimum_key_negotiation_mode,
+            Some(crate::key_negotiation::ProtectionMode::MlKem)
+        );
+        assert!(
+            NetworkConfig::migrate_legacy_classic_floor()
+                .expect("second migration")
+                .is_empty(),
+            "a migrated file has nothing left to migrate"
+        );
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn nothing_to_migrate_leaves_the_file_byte_identical() {
+    let current = "wg_address = \"100.64.0.1/10\"\n\n[[peers]]\nname = \"poste\"\npublic_key = \"CLE-POSTE\"\naddress = \"100.64.1.2/32\"\npersistent_keepalive_secs = 0\n";
+    with_network_file("untouched", Some(current), |path| {
+        let migrated = NetworkConfig::migrate_legacy_classic_floor().expect("migration");
+        assert!(migrated.is_empty());
+        assert_eq!(std::fs::read_to_string(path).expect("read"), current);
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn a_missing_network_file_has_nothing_to_migrate() {
+    with_network_file("missing", None, |path| {
+        assert!(NetworkConfig::migrate_legacy_classic_floor()
+            .expect("migration")
+            .is_empty());
+        assert!(!path.exists(), "a migration must not create the file");
+    });
 }

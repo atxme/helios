@@ -349,7 +349,6 @@ pub async fn prepare(
     let client_nonce = random_identifier()?;
     let mut kem_secret = None;
     let (kem_public_key, commitment) = match mode {
-        ProtectionMode::Classic => (None, None),
         ProtectionMode::StaticPsk => {
             let psk = static_psk.context("static mode requires a profile PSK")?;
             // Bound to this transaction, so two sessions with the same PSK
@@ -451,7 +450,6 @@ pub async fn prepare(
     let response = authenticated_response.response;
 
     let psk = match mode {
-        ProtectionMode::Classic => None,
         ProtectionMode::StaticPsk => Some(SecretString::new(
             static_psk
                 .context("static PSK disappeared during negotiation")?

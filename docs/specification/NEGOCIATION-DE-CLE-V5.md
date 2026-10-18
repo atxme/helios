@@ -99,25 +99,6 @@ un **contrat à finir d'implémenter**, pas une description du système.
 >   **Migration** : le `ctx` entre dans la vérification, donc tout certificat PQ
 >   émis avant ce changement cesse de vérifier. Un parc existant se ré-émet
 >   (`scripts/provision-client.sh`, `heliosd init-key-negotiation --rotate`) ;
-> - la variante `classic` de `ProtectionMode`
->   ([§19](#19-fin-des-chemins-hérités), [§22](#22-correspondance-avec-le-code)),
->   qui subsiste dans le type. Elle est bien refusée à la validation d'une
->   requête v5 et à la préparation — serde la décode, `validate()` la rejette,
->   et aucun message v5 ne peut donc la sélectionner — et elle doit subsister
->   pour relire un `network.toml` existant. La retirer entièrement reste une
->   migration de `network.toml` (`minimum_key_negotiation_mode = "classic"`) et
->   de l'octet `mode_id = 0` du manifeste de coffre.
->
->   Le **discriminant de type de profil Orion**, lui, est livré : un profil
->   déclare `type = "classic"` ou `type = "helios_key_negotiation"`, le document
->   `.orion` le porte, le manifeste de coffre le scelle en v5, l'écran *Profils*
->   le montre, et le chemin de connexion lit le type déclaré au lieu de la
->   présence du bloc. Les deux formes sont exclusives et la contradiction est
->   refusée. L'inférence historique ne survit qu'à la lecture d'un manifeste
->   antérieur à la v5 ou d'un document antérieur à §19, s'applique une fois, et
->   le prochain scellement écrit la réponse.
->   Ce qui débloquerait : écrire cette migration et son chemin de relecture des
->   documents déjà émis ;
 > - la **mesure sur cible du renouvellement de PSK en place**
 >   ([§7.6](#76-renouvellement-dans-le-tunnel),
 >   [§12.3](#123-politique-de-renouvellement)). Le renouvellement est spécifié le
@@ -138,6 +119,25 @@ un **contrat à finir d'implémenter**, pas une description du système.
 >   périmerait en outre au hot-reload. Ce qui débloquerait : faire porter la
 >   révocation et le retrait du plan de données par le même sérialiseur que le
 >   slot, génération incrémentée comprise.
+>
+> **Amendement du 2026-10-18 — retrait de la valeur `classic`.**
+> `ProtectionMode` ne porte plus que `static_psk` et `ml_kem`
+> ([§19](#19-fin-des-chemins-hérités)) : un message v5 qui nomme `classic`
+> échoue au décodage. `classic` désignait en réalité l'absence de négociation,
+> et c'est désormais ce qu'il exprime : un pair WireGuard ordinaire n'a aucun
+> plancher (`minimum_key_negotiation_mode` absent de `network.toml`) et ne
+> négocie pas. Un pair qui négocie doit avoir un plancher, et un plancher
+> suppose une identité PQ ; le chargement refuse les deux incohérences. Un
+> `network.toml` antérieur qui porte encore `"classic"` est refusé au
+> chargement, et `heliosd run` le réécrit avant son premier chargement : un
+> pair sans identité PQ perd la clé, un pair avec identité PQ reçoit `ml_kem`.
+> La réécriture conserve les valeurs du fichier, pas ses commentaires ni
+> l'ordre de ses clés. Un manifeste de coffre Orion antérieur dont l'octet
+> `mode_id` vaut `0` se lit comme `ml_kem` et s'écrit à `2` au scellement
+> suivant. Le profil Orion `type = "classic"` — WireGuard générique — est
+> inchangé : le discriminant de type de profil, livré auparavant, est porté par
+> le document `.orion`, scellé par le manifeste v5 et lu par le chemin de
+> connexion.
 >
 > **Amendement du 2026-10-09 — renouvellement dans le tunnel.** Le
 > renouvellement automatique du PSK `ml_kem`, déclenché par Orion à 80 % de la

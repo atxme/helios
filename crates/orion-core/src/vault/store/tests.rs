@@ -382,7 +382,7 @@ fn negotiation() -> crate::config::KeyNegotiationSettings {
     use aether::key_negotiation::ProtectionMode;
     crate::config::KeyNegotiationSettings {
         mode: ProtectionMode::MlKem,
-        minimum_mode: ProtectionMode::Classic,
+        minimum_mode: ProtectionMode::StaticPsk,
         endpoint: "203.0.113.10:51821".into(),
         server_name: "gw.example".into(),
         gateway_ca_der: "Q0EtT1JJR0lORQ==".into(),

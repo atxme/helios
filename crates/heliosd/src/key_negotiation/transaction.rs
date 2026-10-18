@@ -248,14 +248,17 @@ pub(super) fn elevate_security_floor(
         .iter_mut()
         .find(|peer| peer.public_key == public_key)
         .ok_or(PublicError::Rejected)?;
-    if mode == peer.minimum_key_negotiation_mode
-        || !mode.satisfies(peer.minimum_key_negotiation_mode)
-    {
+    // A plain WireGuard peer never negotiates: the protocol refuses it before
+    // a mode is committed. Reaching here without a floor is an inconsistent
+    // state, refused rather than given a floor it was never admitted with.
+    let current = peer
+        .minimum_key_negotiation_mode
+        .ok_or(PublicError::Rejected)?;
+    if mode == current || !mode.satisfies(current) {
         return Ok(None);
     }
-    let previous = peer.minimum_key_negotiation_mode;
-    peer.minimum_key_negotiation_mode = mode;
-    Ok(Some(previous))
+    peer.minimum_key_negotiation_mode = Some(mode);
+    Ok(Some(current))
 }
 
 impl GatewayHandler {
@@ -691,7 +694,7 @@ impl GatewayHandler {
                 .iter_mut()
                 .find(|peer| peer.public_key == public_key)
             {
-                peer.minimum_key_negotiation_mode = previous;
+                peer.minimum_key_negotiation_mode = Some(previous);
             }
             return Err(PublicError::Internal);
         }

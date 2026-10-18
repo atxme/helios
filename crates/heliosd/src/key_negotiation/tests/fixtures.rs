@@ -297,7 +297,7 @@ pub(super) fn network(previous_psk: &str, pq_fingerprint: &str) -> NetworkConfig
         preshared_key: Some(previous_psk.into()),
         key_negotiation_certificate_sha256: Some(CERTIFICATE_FINGERPRINT.into()),
         key_negotiation_pq_certificate_sha256: Some(pq_fingerprint.into()),
-        minimum_key_negotiation_mode: ProtectionMode::Classic,
+        minimum_key_negotiation_mode: Some(ProtectionMode::StaticPsk),
         persistent_keepalive_secs: aether::config::DEFAULT_PERSISTENT_KEEPALIVE_SECS,
     });
     network
@@ -313,7 +313,7 @@ pub(super) fn gateway_with(
         previous_psk,
         &fixture.client_certificate.fingerprint().unwrap(),
     );
-    configured.peers[0].minimum_key_negotiation_mode = floor;
+    configured.peers[0].minimum_key_negotiation_mode = Some(floor);
     let (plane, psk_tx, handshake_tx) = TestDataPlane::spawn();
     let handler = GatewayHandler {
         network: Arc::new(RwLock::new(configured)),

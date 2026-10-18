@@ -87,7 +87,7 @@ Usage : ./scripts/key-negotiation-setup.sh [hôte-ssh] [options]
                      sur la même machine, donc ce qui joint l'un joint
                      l'autre)
   --port-nego P      Port UDP de négociation (défaut : 51821)
-  --mode M           ml-kem (défaut) ou classic
+  --mode M           ml-kem (défaut) ou static_psk
   --admin            Admit the peer as a control-plane administrator
   --gateway-only     Configure only the gateway and fetch its certificates
   --skip-network     Keep network.toml unchanged
@@ -529,7 +529,7 @@ case "$NOM:$PUBLIC_KEY:$SHA_TLS:$SHA_PQ" in
     *[!A-Za-z0-9._:+/=:-]*) echo "unsafe enrollment value" >&2; exit 1 ;;
 esac
 case "$MODE" in
-    classic|static_psk|ml-kem|ml_kem) ;;
+    static_psk|ml-kem|ml_kem) ;;
     *) echo "unsupported key-negotiation mode: $MODE" >&2; exit 1 ;;
 esac
 

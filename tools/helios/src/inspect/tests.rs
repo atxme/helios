@@ -140,10 +140,10 @@ fn peer_list_is_a_table_with_roles_handshakes_and_short_keys() {
 #[test]
 fn mixed_negotiation_modes_get_their_own_column() {
     let mut peers = gateway_peers();
-    peers[2]["minimum_key_negotiation_mode"] = json!("classic");
+    peers[2]["minimum_key_negotiation_mode"] = json!(null);
     let text = render_peers(&ui(), &status(peers));
     assert!(text.contains("MIN MODE"), "{text}");
-    assert!(text.contains("classic"), "{text}");
+    assert!(text.contains("plain WireGuard"), "{text}");
     assert!(!text.contains("Every peer requires"), "{text}");
 }
 

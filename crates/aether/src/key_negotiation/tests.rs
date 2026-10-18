@@ -28,9 +28,8 @@ fn test_static_psk() -> String {
 /// A request carrying whatever its mode requires.
 ///
 /// `static_psk` is the default of these tests because it is the cheapest
-/// mode that a v5 decoder actually accepts: `classic` is refused outright
-/// since the mode stopped being negotiable, and `ml_kem` costs a keypair
-/// on every call.
+/// mode that a v5 decoder actually accepts: `ml_kem` costs a keypair on
+/// every call.
 fn request(mode: ProtectionMode) -> KeyNegotiationRequest {
     let transaction_id = [1; KEY_NEGOTIATION_NONCE_LEN];
     let client_nonce = [2; KEY_NEGOTIATION_NONCE_LEN];
@@ -226,20 +225,6 @@ fn the_server_name_is_bound_into_the_derived_psk() {
 
 #[test]
 fn each_mode_rejects_material_from_another_mode() {
-    // `classic` is refused before its material is even looked at: it is
-    // not a mode with the wrong contents, it is not a v5 mode.
-    let mut classic = request(ProtectionMode::Classic);
-    assert_eq!(
-        classic.validate(),
-        Err(KeyNegotiationError::ClassicNotNegotiable)
-    );
-    classic.static_psk_commitment = Some("a".repeat(64));
-    assert_eq!(
-        classic.validate(),
-        Err(KeyNegotiationError::ClassicNotNegotiable),
-        "adding material must not turn a retired mode into a negotiable one"
-    );
-
     let mut static_psk = request(ProtectionMode::StaticPsk);
     static_psk.kem_public_key = Some(vec![0; crate::pq::PUBLIC_KEY_LEN]);
     assert_eq!(
@@ -421,7 +406,7 @@ fn unknown_fields_are_rejected() {
                 "protocol_version":5,
                 "server_challenge":[{challenge}],
                 "transaction_id":[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
-                "mode":"classic",
+                "mode":"static_psk",
                 "client_wg_public_key":"{CLIENT_WG_KEY}",
                 "gateway_wg_public_key":"{GATEWAY_WG_KEY}",
                 "server_name":"{SERVER_NAME}",
@@ -438,12 +423,19 @@ fn unknown_fields_are_rejected() {
 }
 
 #[test]
+fn classic_mode_is_refused_at_decoding() {
+    // A v5 message that still names the retired `classic` mode is not a
+    // weaker negotiation: it is not a message at all.
+    let mut value = serde_json::to_value(request(ProtectionMode::MlKem)).unwrap();
+    assert_eq!(value["mode"], "ml_kem");
+    value["mode"] = serde_json::json!("classic");
+    assert!(serde_json::from_value::<KeyNegotiationRequest>(value).is_err());
+}
+
+#[test]
 fn protection_floor_is_monotone() {
-    assert!(ProtectionMode::MlKem.satisfies(ProtectionMode::Classic));
     assert!(ProtectionMode::MlKem.satisfies(ProtectionMode::StaticPsk));
     assert!(ProtectionMode::MlKem.satisfies(ProtectionMode::MlKem));
-    assert!(!ProtectionMode::Classic.satisfies(ProtectionMode::StaticPsk));
-    assert!(!ProtectionMode::Classic.satisfies(ProtectionMode::MlKem));
     assert!(!ProtectionMode::StaticPsk.satisfies(ProtectionMode::MlKem));
 }
 

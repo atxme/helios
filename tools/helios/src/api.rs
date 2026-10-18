@@ -45,7 +45,8 @@ pub struct NetworkPeerView {
     pub preshared_key_configured: bool,
     pub key_negotiation_certificate_sha256: Option<String>,
     pub key_negotiation_pq_certificate_sha256: Option<String>,
-    pub minimum_key_negotiation_mode: ProtectionMode,
+    /// `None` for a plain WireGuard peer, which has no negotiation floor.
+    pub minimum_key_negotiation_mode: Option<ProtectionMode>,
     pub admin: bool,
 }
 
@@ -59,7 +60,8 @@ pub struct PeerSummary {
     pub public_key: String,
     pub address: String,
     pub admin: bool,
-    pub minimum_key_negotiation_mode: ProtectionMode,
+    /// `None` for a plain WireGuard peer, which has no negotiation floor.
+    pub minimum_key_negotiation_mode: Option<ProtectionMode>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -364,7 +366,7 @@ mod tests {
         assert!(view.peers[0].admin);
         assert_eq!(
             view.peers[0].minimum_key_negotiation_mode,
-            ProtectionMode::MlKem
+            Some(ProtectionMode::MlKem)
         );
     }
 

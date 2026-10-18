@@ -541,7 +541,7 @@ mod tests {
             preshared_key_configured: false,
             key_negotiation_certificate_sha256: None,
             key_negotiation_pq_certificate_sha256: None,
-            minimum_key_negotiation_mode: aether::key_negotiation::ProtectionMode::MlKem,
+            minimum_key_negotiation_mode: Some(aether::key_negotiation::ProtectionMode::MlKem),
             admin: false,
         }
     }

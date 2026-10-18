@@ -26,7 +26,8 @@ pub struct PeerSummary {
     pub address_v6: Option<String>,
     pub post_quantum: bool,
     pub admin: bool,
-    pub minimum_key_negotiation_mode: ProtectionMode,
+    /// `null` for a plain WireGuard peer, which has no negotiation floor.
+    pub minimum_key_negotiation_mode: Option<ProtectionMode>,
     /// Seconds since the last successful handshake. `None` = never handshaked,
     /// or the data plane has not been observed since the interface came up.
     pub last_handshake_age_seconds: Option<u64>,
@@ -141,9 +142,9 @@ pub async fn peer_admit(
             allowed_ips: &peer.allowed_ips,
         })
         .collect();
-    // `ml_kem` unconditionally. The v4 default fell back to `classic` when no
-    // PQ certificate was supplied, which quietly produced peers whose first
-    // handshake was unprotected; the admission layer now refuses such a peer
+    // `ml_kem` unconditionally. The v4 default fell back to a plain WireGuard
+    // peer when no PQ certificate was supplied, which quietly produced peers
+    // whose first handshake was unprotected; the admission layer now refuses such a peer
     // outright, and naming the floor here makes the refusal say why.
     let minimum_mode = body
         .minimum_key_negotiation_mode

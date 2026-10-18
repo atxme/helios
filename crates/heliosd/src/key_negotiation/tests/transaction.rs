@@ -137,29 +137,32 @@ async fn a_mode_below_the_peer_floor_is_refused() {
 fn committed_modes_only_raise_the_persistent_floor() {
     let mut configured = network("static", &"a".repeat(64));
     assert_eq!(
-        elevate_security_floor(&mut configured, CLIENT_KEY, ProtectionMode::StaticPsk).unwrap(),
-        Some(ProtectionMode::Classic)
-    );
-    assert_eq!(
-        configured.peers[0].minimum_key_negotiation_mode,
-        ProtectionMode::StaticPsk
-    );
-    assert_eq!(
-        elevate_security_floor(&mut configured, CLIENT_KEY, ProtectionMode::Classic).unwrap(),
-        None
-    );
-    assert_eq!(
-        configured.peers[0].minimum_key_negotiation_mode,
-        ProtectionMode::StaticPsk
-    );
-    assert_eq!(
         elevate_security_floor(&mut configured, CLIENT_KEY, ProtectionMode::MlKem).unwrap(),
         Some(ProtectionMode::StaticPsk)
     );
     assert_eq!(
         configured.peers[0].minimum_key_negotiation_mode,
-        ProtectionMode::MlKem
+        Some(ProtectionMode::MlKem)
     );
+    assert_eq!(
+        elevate_security_floor(&mut configured, CLIENT_KEY, ProtectionMode::StaticPsk).unwrap(),
+        None
+    );
+    assert_eq!(
+        configured.peers[0].minimum_key_negotiation_mode,
+        Some(ProtectionMode::MlKem)
+    );
+}
+
+#[test]
+fn a_peer_without_a_floor_is_not_given_one_by_a_negotiation() {
+    let mut configured = network("static", &"a".repeat(64));
+    configured.peers[0].minimum_key_negotiation_mode = None;
+    assert!(matches!(
+        elevate_security_floor(&mut configured, CLIENT_KEY, ProtectionMode::MlKem),
+        Err(PublicError::Rejected)
+    ));
+    assert_eq!(configured.peers[0].minimum_key_negotiation_mode, None);
 }
 
 #[tokio::test]

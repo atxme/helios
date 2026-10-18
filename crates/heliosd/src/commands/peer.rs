@@ -63,10 +63,14 @@ pub(crate) fn peer_command(mut network: NetworkConfig, command: PeerCommand) -> 
                 certificate.as_deref(),
                 pq_certificate.as_deref(),
             )?;
+            // `None` only without a PQ identity, which admission refuses before
+            // it reads the floor: the fallback names the floor that refusal
+            // would have carried, and changes nothing else.
             let minimum_mode = admission_floor(
                 minimum_mode,
                 key_negotiation_pq_certificate_sha256.is_some(),
-            );
+            )
+            .unwrap_or(aether::key_negotiation::ProtectionMode::MlKem);
             // No live table here: this process only knows the file, and the
             // data plane belongs to the daemon. The collision view still
             // holds every declared peer, which is what the live table mirrors;
@@ -199,18 +203,17 @@ fn queue_console_admission(
     }))
 }
 
-/// Derives the safe default without hiding an explicit operator floor.
+/// Derives the floor without hiding an explicit operator one.
+///
+/// `None` is a plain WireGuard peer: no explicit floor and no PQ identity to
+/// negotiate with.
 fn admission_floor(
     explicit: Option<NegotiationMode>,
     has_pq_certificate: bool,
-) -> aether::key_negotiation::ProtectionMode {
-    explicit.map(Into::into).unwrap_or_else(|| {
-        if has_pq_certificate {
-            aether::key_negotiation::ProtectionMode::MlKem
-        } else {
-            aether::key_negotiation::ProtectionMode::Classic
-        }
-    })
+) -> Option<aether::key_negotiation::ProtectionMode> {
+    explicit
+        .map(Into::into)
+        .or(has_pq_certificate.then_some(aether::key_negotiation::ProtectionMode::MlKem))
 }
 
 #[cfg(test)]
@@ -221,11 +224,11 @@ mod tests {
     fn admission_floor_defaults_to_the_strongest_available_identity() {
         use aether::key_negotiation::ProtectionMode;
 
-        assert_eq!(admission_floor(None, false), ProtectionMode::Classic);
-        assert_eq!(admission_floor(None, true), ProtectionMode::MlKem);
+        assert_eq!(admission_floor(None, false), None);
+        assert_eq!(admission_floor(None, true), Some(ProtectionMode::MlKem));
         assert_eq!(
             admission_floor(Some(NegotiationMode::StaticPsk), true),
-            ProtectionMode::StaticPsk,
+            Some(ProtectionMode::StaticPsk),
             "an explicit floor must not be replaced by inference"
         );
     }
@@ -243,7 +246,7 @@ mod tests {
                 preshared_key: Some("secret".into()),
                 key_negotiation_certificate_sha256: None,
                 key_negotiation_pq_certificate_sha256: None,
-                minimum_key_negotiation_mode: aether::key_negotiation::ProtectionMode::Classic,
+                minimum_key_negotiation_mode: None,
                 persistent_keepalive_secs: aether::config::DEFAULT_PERSISTENT_KEEPALIVE_SECS,
             }],
             ..NetworkConfig::default()

@@ -44,6 +44,13 @@ pub const DEFAULT_ALLOWED_IPS: &str = "0.0.0.0/0, ::/0";
 /// state inference would wrongly conclude the tunnel is down (ADR-001 §3).
 pub const DEFAULT_KEEPALIVE_SECS: u16 = 25;
 
+/// Floor of a stored negotiation block that does not name one: the strongest
+/// mode, which is the admission floor of v5. A block exists only for a Helios
+/// profile, and a Helios profile never negotiates below it.
+fn default_minimum_mode() -> ProtectionMode {
+    ProtectionMode::MlKem
+}
+
 /// Public settings for the pre-WireGuard key-negotiation service.
 ///
 /// The client certificate and its private key stay in a protected identity
@@ -54,7 +61,7 @@ pub struct KeyNegotiationSettings {
     pub mode: ProtectionMode,
     /// Persistent local security floor. Helios enforces its own copy, so a
     /// network attacker cannot lower both sides through negotiation.
-    #[serde(default)]
+    #[serde(default = "default_minimum_mode")]
     pub minimum_mode: ProtectionMode,
     /// Public UDP endpoint, normally the WireGuard host on port 51821.
     pub endpoint: String,
@@ -330,7 +337,7 @@ pub fn validate_key_negotiation(
         (ProtectionMode::StaticPsk, false) => {
             anyhow::bail!("le mode PSK statique exige un PSK dans le profil")
         }
-        (ProtectionMode::Classic | ProtectionMode::MlKem, true) => {
+        (ProtectionMode::MlKem, true) => {
             anyhow::bail!("un PSK de profil n'est valable qu'avec le mode PSK statique")
         }
         _ => Ok(()),
@@ -383,7 +390,6 @@ pub fn verify_pinned_gateway_certificate(
 /// Name of a mode as the user reads it on screen.
 fn mode_label(mode: ProtectionMode) -> &'static str {
     match mode {
-        ProtectionMode::Classic => "classique",
         ProtectionMode::StaticPsk => "PSK statique",
         ProtectionMode::MlKem => "ML-KEM-1024",
     }

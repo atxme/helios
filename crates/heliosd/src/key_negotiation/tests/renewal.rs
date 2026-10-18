@@ -64,7 +64,7 @@ async fn a_vip_belonging_to_another_peer_is_not_admitted() {
         preshared_key: None,
         key_negotiation_certificate_sha256: Some("ff".repeat(32)),
         key_negotiation_pq_certificate_sha256: None,
-        minimum_key_negotiation_mode: ProtectionMode::Classic,
+        minimum_key_negotiation_mode: None,
         persistent_keepalive_secs: aether::config::DEFAULT_PERSISTENT_KEEPALIVE_SECS,
     };
     handler.network.write().await.peers.push(other);

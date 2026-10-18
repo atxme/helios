@@ -39,12 +39,6 @@ import type { PeerSummary, ProtectionMode, Status } from '../types'
  * an observed state, so the label says "plancher".
  */
 const FLOOR: Record<ProtectionMode, { label: string; hint: string; bg: string; fg: string }> = {
-  classic: {
-    label: 'aucun',
-    hint: 'Hérité d’un network.toml antérieur : « classique » n’est pas un mode négociable, ce pair ne peut donc pas négocier de PSK. Le ré-admettre le place sur le plancher ML-KEM.',
-    bg: 'transparent',
-    fg: 'text.secondary',
-  },
   static_psk: {
     label: 'PSK statique',
     hint: 'Une négociation classique est refusée pour ce pair. Ce PSK ne tourne jamais.',
@@ -57,6 +51,14 @@ const FLOOR: Record<ProtectionMode, { label: string; hint: string; bg: string; f
     bg: 'tertiary.container',
     fg: 'tertiary.onContainer',
   },
+}
+
+/** A plain WireGuard peer: no PQ identity, so no negotiation and no floor. */
+const PLAIN_WIREGUARD = {
+  label: 'WireGuard',
+  hint: 'Pair WireGuard ordinaire : aucune négociation de clé avant le tunnel, donc aucun PSK. Il n’a pas d’identité PQ.',
+  bg: 'transparent',
+  fg: 'text.secondary',
 }
 
 /** A peer is online when its handshake is fresher than the daemon's threshold. */
@@ -82,7 +84,9 @@ function PeerRow({
   onRevoke: (peer: PeerSummary) => void
 }) {
   const online = isOnline(peer, staleAfter)
-  const floor = FLOOR[peer.minimum_key_negotiation_mode] ?? FLOOR.classic
+  const floor = peer.minimum_key_negotiation_mode
+    ? FLOOR[peer.minimum_key_negotiation_mode]
+    : PLAIN_WIREGUARD
 
   return (
     <Box
@@ -427,7 +431,7 @@ export function ClientsView({ status, refresh, admitOpen, onAdmitOpenChange }: P
   const peers = status?.peers ?? []
   const staleAfter = status?.handshake_stale_after_seconds ?? 150
   const online = peers.filter(peer => isOnline(peer, staleAfter)).length
-  const classic = peers.filter(peer => peer.minimum_key_negotiation_mode === 'classic').length
+  const plain = peers.filter(peer => peer.minimum_key_negotiation_mode === null).length
   const ipv6Routed = describeIpv6(status?.ipv6).kind === 'installed'
 
   return (
@@ -453,11 +457,10 @@ export function ClientsView({ status, refresh, admitOpen, onAdmitOpenChange }: P
           value={formatBytes(peers.reduce((total, peer) => total + (peer.rx_bytes ?? 0), 0))}
         />
         <Metric
-          label="Sans plancher"
-          value={String(classic)}
+          label="WireGuard simple"
+          value={String(plain)}
           icon={ShieldAlert}
-          accent={classic > 0 ? 'warning.main' : undefined}
-          hint="Clients pouvant encore négocier sans PSK. Le plancher s’élève de lui-même à leur première négociation aboutie."
+          hint="Pairs sans négociation de clé : ni plancher ni PSK. Ils ne sont pas admis avec une identité PQ."
         />
       </Box>
 

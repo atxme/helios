@@ -357,7 +357,6 @@ certificats depuis la CA opérateur, admet le pair avec les deux empreintes et
 le plancher, puis écrit **un** document qui porte le profil et l'identité.
 
 Options utiles : `--public-key` si le client détient déjà sa clé WireGuard,
-`--mode classic` pour un pair qui ne peut pas encore faire ML-KEM,
 `--negotiation-endpoint` si le port de négociation est redirigé ailleurs que le
 tunnel, `--identity` pour nommer l'entrée du stockage protégé (par défaut
 `orion-<nom>`), et `--replace` pour ré-enrôler un pair existant — ce qui révoque

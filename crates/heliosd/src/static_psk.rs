@@ -724,7 +724,7 @@ mod tests {
                 preshared_key: Some("cHNrLWFsaWNl".into()),
                 key_negotiation_certificate_sha256: None,
                 key_negotiation_pq_certificate_sha256: None,
-                minimum_key_negotiation_mode: Default::default(),
+                minimum_key_negotiation_mode: None,
                 persistent_keepalive_secs: aether::config::DEFAULT_PERSISTENT_KEEPALIVE_SECS,
             }],
             ..aether::NetworkConfig::default()
@@ -790,7 +790,7 @@ mod tests {
                 preshared_key: Some("bm91dmVhdQ==".into()),
                 key_negotiation_certificate_sha256: None,
                 key_negotiation_pq_certificate_sha256: None,
-                minimum_key_negotiation_mode: Default::default(),
+                minimum_key_negotiation_mode: None,
                 persistent_keepalive_secs: aether::config::DEFAULT_PERSISTENT_KEEPALIVE_SECS,
             }],
             ..aether::NetworkConfig::default()
@@ -835,7 +835,7 @@ mod tests {
                 preshared_key: Some("cHNrLXN0YXRpcXVlLWVuLWNsYWly".into()),
                 key_negotiation_certificate_sha256: None,
                 key_negotiation_pq_certificate_sha256: None,
-                minimum_key_negotiation_mode: Default::default(),
+                minimum_key_negotiation_mode: None,
                 persistent_keepalive_secs: aether::config::DEFAULT_PERSISTENT_KEEPALIVE_SECS,
             }],
             ..aether::NetworkConfig::default()

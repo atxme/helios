@@ -509,8 +509,9 @@ struct PeerSummary {
     last_handshake_age_seconds: Option<u64>,
     #[serde(default)]
     admin: bool,
+    /// `null` for a plain WireGuard peer.
     #[serde(default)]
-    minimum_key_negotiation_mode: String,
+    minimum_key_negotiation_mode: Option<String>,
     #[serde(default)]
     endpoint: Option<String>,
     #[serde(default)]
@@ -823,13 +824,11 @@ async fn execute_command(api: &transport::Api, command: Cmd) -> Result<()> {
                     )?;
                 let certificate = certificate.map(encode_base64);
                 let pq_certificate = pq_certificate.map(encode_base64);
-                let minimum_mode = minimum_mode.map(Into::into).unwrap_or_else(|| {
-                    if key_negotiation_pq_certificate_sha256.is_some() {
-                        aether::key_negotiation::ProtectionMode::MlKem
-                    } else {
-                        aether::key_negotiation::ProtectionMode::Classic
-                    }
-                });
+                // The gateway refuses an admission without a PQ identity whatever
+                // the floor says, so the default is simply the v5 floor.
+                let minimum_mode = minimum_mode
+                    .map(Into::into)
+                    .unwrap_or(aether::key_negotiation::ProtectionMode::MlKem);
                 peer::cmd_add(
                     client,
                     base,

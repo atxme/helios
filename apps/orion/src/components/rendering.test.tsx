@@ -182,7 +182,7 @@ describe('Orion presentational branches', () => {
       allowed_ips: '100.64.0.0/10',
       key_negotiation: {
         mode: 'ml_kem',
-        minimum_mode: 'classic',
+        minimum_mode: 'static_psk',
         endpoint: '203.0.113.10:51821',
         server_name: 'gateway.example',
         gateway_ca_der: 'ca',

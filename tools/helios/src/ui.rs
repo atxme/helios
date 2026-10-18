@@ -219,7 +219,6 @@ pub fn protection_mode(mode: aether::key_negotiation::ProtectionMode) -> &'stati
     match mode {
         ProtectionMode::MlKem => "ML-KEM",
         ProtectionMode::StaticPsk => "static PSK",
-        ProtectionMode::Classic => "classic",
     }
 }
 
