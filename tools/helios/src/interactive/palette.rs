@@ -95,7 +95,7 @@ pub(super) fn suggestions(tree: &Command, line: &str, pos: usize) -> Suggestions
         result.entries.extend(
             command
                 .get_subcommands()
-                .filter(|child| !child.is_hide_set() && !(root && child.get_name() == "shell"))
+                .filter(|child| !(child.is_hide_set() || root && child.get_name() == "shell"))
                 .map(|child| {
                     (
                         child.get_name().to_owned(),

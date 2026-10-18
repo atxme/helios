@@ -187,6 +187,16 @@ export function useClient() {
     }
   }, [pushLog])
 
+  const renewPsk = useCallback(async () => {
+    setError(null)
+    try {
+      await api.renewPsk()
+      pushLog('info', 'Renouvellement de la clé demandé.')
+    } catch (cause) {
+      pushLog('warn', `Renouvellement non lancé — ${String(cause)}`)
+    }
+  }, [pushLog])
+
   const disconnect = useCallback(async () => {
     try {
       await api.disconnect()
@@ -258,6 +268,7 @@ export function useClient() {
     connect,
     disconnect,
     openSshTerminal,
+    renewPsk,
     importProfile,
     saveProfile,
     removeProfile,

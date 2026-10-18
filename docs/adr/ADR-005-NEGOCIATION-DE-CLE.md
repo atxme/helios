@@ -3,7 +3,8 @@
 **Statut** : accepté (2026-07-25), révisé pour le protocole v4 (2026-08-04),
 **amendé les 6 et 8 août 2026** pour le protocole v5 — voir
 [l'amendement v5](#amendement-du-6-août-2026--protocole-v5) et
-[la libération dans le tunnel](#amendement-du-8-août-2026--libération-dans-le-tunnel).
+[la libération dans le tunnel](#amendement-du-8-août-2026--libération-dans-le-tunnel) et
+[le renouvellement dans le tunnel](#amendement-du-9-octobre-2026--renouvellement-dans-le-tunnel).
 
 > Le corps de cet ADR décrit le protocole **v4**, conservé comme historique.
 > Le code sert aujourd'hui une v5 partielle. Les amendements en fin de document
@@ -1082,3 +1083,28 @@ confiance définie par
 [ROTATION-CERTIFICATS](../specification/ROTATION-CERTIFICATS.md) remplace l'extension
 QUIC initialement envisagée. Le document signé hors ligne reste le secours si
 le tunnel ou l'identité applicative ne permet plus cet échange.
+
+## Amendement du 9 octobre 2026 — renouvellement dans le tunnel
+
+**Statut** : accepté. Cet amendement ne change ni les messages, ni les
+transcriptions signées, ni l'ALPN de la v5. Il ajoute un chemin réseau pour
+rejouer la transaction sur un slot `ml_kem` déjà committé.
+
+Le renouvellement du PSK est déclenché par Orion à 80 % de la durée de vie
+signée (24 h) ou du plafond de 100 Gio (constante `aether`, non signée), le
+premier atteint ; la gateway retire le slot à 100 % de l'un ou l'autre. La
+transaction est adressée à `<hôte de heliosd_url>:<port de négociation>` depuis
+une socket liée à la VIP du client, et non au port public. La gateway classe la
+connexion par sa source : une VIP de pair admis n'est acceptée que si ce pair
+est celui que mTLS a résolu, si son slot est committé en `ml_kem` et si le mode
+demandé est `ml_kem` ; tout autre cas reçoit l'erreur publique générique. Ce
+chemin ne peut donc ni amorcer un premier PSK ni abaisser le mode. Il n'existe
+aucun repli vers le port public pendant un renouvellement.
+
+Pour que la gateway écoute dans le tunnel, `helios-firewall` ouvre le port de
+négociation en entrée sur `wg_iface`, en plus de chaque WAN, et sur aucune autre
+interface. Le ruleset reste construit en entier puis appliqué de façon
+atomique. La mesure de la micro-coupure (V1) reste à faire sur cible ; le repli
+est la reconnexion complète du
+[§12.3](../specification/NEGOCIATION-DE-CLE-V5.md#123-politique-de-renouvellement).
+Détail : [§7.6](../specification/NEGOCIATION-DE-CLE-V5.md#76-renouvellement-dans-le-tunnel).

@@ -200,7 +200,7 @@ pub async fn logs(lines: usize, follow: bool, verbose: bool) -> Result<()> {
     let status = child.wait().await.context("waiting for journalctl")?;
     println!();
     // SIGINT ends `--follow`; that is the normal way out, not a failure.
-    if !status.success() && !(follow && status.code().is_none()) {
+    if !(status.success() || follow && status.code().is_none()) {
         anyhow::bail!("journalctl exited with {status}");
     }
     Ok(())

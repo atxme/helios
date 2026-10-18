@@ -118,13 +118,14 @@ un **contrat à finir d'implémenter**, pas une description du système.
 >   le prochain scellement écrit la réponse.
 >   Ce qui débloquerait : écrire cette migration et son chemin de relecture des
 >   documents déjà émis ;
-> - le **renouvellement de PSK en place** ([§12.3](#123-politique-de-renouvellement)),
->   volontairement suspendu à l'essai bloquant du [§20.0](#200-essais-bloquants) :
->   son raisonnement sur la réinitialisation forcée de session n'a pas été
->   confronté à un vrai plan de données, et l'écrire d'abord reviendrait à
->   découvrir un défaut de conception à travers une implémentation qui le
->   masque. Conséquence : un PSK vit jusqu'à son échéance de 24 h, puis la
->   gateway le retire ;
+> - la **mesure sur cible du renouvellement de PSK en place**
+>   ([§7.6](#76-renouvellement-dans-le-tunnel),
+>   [§12.3](#123-politique-de-renouvellement)). Le renouvellement est spécifié le
+>   2026-10-09 : l'essai bloquant du [§20.0](#200-essais-bloquants) est levé par
+>   décision, et la recette V1 (20 renouvellements consécutifs sous trafic, noyau
+>   Linux et WireGuard-NT, chemin sain puis dégradé) reste à exécuter sur cible
+>   avec le code de production. Aucune de ses mesures n'existe aujourd'hui ; si
+>   V1 échoue, le repli de [§12.3](#123-politique-de-renouvellement) s'applique ;
 > - l'**enrôlement sans clé privée et sa signature opérateur**
 >   ([§15](#15-enrôlement)). `helios enroll` distribue encore l'identité
 >   cliente comme en v4, avec le document `.orion` secret que cela implique ;
@@ -137,6 +138,13 @@ un **contrat à finir d'implémenter**, pas une description du système.
 >   périmerait en outre au hot-reload. Ce qui débloquerait : faire porter la
 >   révocation et le retrait du plan de données par le même sérialiseur que le
 >   slot, génération incrémentée comprise.
+>
+> **Amendement du 2026-10-09 — renouvellement dans le tunnel.** Le
+> renouvellement automatique du PSK `ml_kem`, déclenché par Orion à 80 % de la
+> durée de vie ou du plafond d'octets et négocié dans le tunnel, est spécifié au
+> [§7.6](#76-renouvellement-dans-le-tunnel) et au
+> [§12.3](#123-politique-de-renouvellement). Sa conception est dans
+> [renouvellement-psk-design](../superpowers/specs/2026-10-09-renouvellement-psk-design.md). Sa validation sur cible n'est pas faite.
 >
 > **Ce qui est en place et couvert par la régression** : challenge à usage
 > unique, liaison à la gateway visée, ML-DSA-87, engagement HMAC du PSK
@@ -688,8 +696,9 @@ casserait `aether::sig` et donc toute la chaîne de livraison.
 | idle timeout QUIC | 50 secondes |
 | repos après rollback post-installation | 10 secondes par pair |
 | durée de vie maximale d'un PSK `ml_kem` | 24 heures |
-| déclenchement du renouvellement | à 90 % de la durée de vie |
-| retrait ferme par échéance | à 24 heures, sans grâce supplémentaire |
+| plafond d'octets d'un PSK `ml_kem` | 100 Gio, constante non signée ([§12.3](#123-politique-de-renouvellement)) |
+| déclenchement du renouvellement | à 80 % de la durée de vie ou du plafond, le premier atteint (90 % de la durée avant le 2026-10-09) |
+| retrait ferme par échéance | à 24 heures ou 100 Gio, sans grâce supplémentaire |
 | keep-alive QUIC | **aucun** |
 | expiration du lien QUIC | **sans objet** |
 | keep-alive persistant WireGuard, des deux côtés | 25 secondes, posé par la gateway |
@@ -1083,6 +1092,51 @@ réseau qui tombe ou un processus tué n'en envoient aucun ; le PSK reste alors
 posé jusqu'à sa récupération par vieillissement du handshake, son remplacement,
 sa révocation ou son échéance. Voir
 [§12.4](#124-récupération-dun-slot-sans-client).
+
+### 7.6 Renouvellement dans le tunnel
+
+Le renouvellement d'un PSK `ml_kem` déjà committé rejoue la **transaction v5
+inchangée** (challenge, requête signée, réponse, confirmation, commit) : mêmes
+messages, mêmes transcriptions signées, même ALPN. Seul le chemin réseau
+diffère de la première négociation.
+
+- **Adresse.** Orion s'adresse à `<hôte de heliosd_url>:<port de négociation>`.
+  L'hôte est validé comme pour le `release` du [§7.5](#75-libération-signée-dans-le-tunnel) :
+  adresse littérale comprise dans les `AllowedIPs`, aucune résolution DNS. Le
+  port est celui de l'endpoint de négociation du profil ; `server_name` et tous
+  les épinglages restent ceux du profil.
+- **Socket.** La socket QUIC est liée à la VIP du client. La socket de la
+  première négociation, épinglée hors du tunnel, ne peut pas servir ici. Sans
+  `heliosd_url` valide, aucun renouvellement n'est tenté : l'échéance mène au
+  chemin de reconnexion existant.
+- **Classement par la gateway.** Une connexion dont l'adresse source est la VIP
+  d'un pair admis (`/32` IPv4 ou `/128` IPv6) est une connexion de tunnel. Elle
+  n'est acceptée que si le pair de cette VIP est exactement celui que mTLS a
+  résolu depuis l'état de confiance (la clé WireGuard de la requête ne sert
+  jamais de clé de recherche), si son slot est **committé en `ml_kem`**, et si
+  le mode demandé est `ml_kem`. Tout autre cas reçoit l'erreur publique
+  générique du [§5.3](#53-erreurs-publiques), sans rien révéler de l'admission.
+  Le chemin dans le tunnel ne peut donc ni amorcer un premier PSK ni abaisser le
+  mode ; le plancher du [§14](#14-plancher-anti-downgrade) est vérifié comme
+  ailleurs. Une source usurpée depuis le WAN n'aboutit pas : la réponse part
+  dans le tunnel vers le vrai pair.
+- **Aucun repli vers le port public.** Un renouvellement qui échoue est retenté
+  dans le tunnel ; il n'emprunte jamais le port public, qui reste réservé à
+  l'établissement initial et à la reconnexion.
+- **Pare-feu.** Le port de négociation est ouvert en entrée (et la sortie
+  correspondante) sur chaque interface WAN **et** sur `wg_iface`, nulle part
+  ailleurs. Le ruleset reste construit en entier puis appliqué atomiquement.
+
+La transaction, la réservation de génération, le slot `preparing` et le
+rollback sont ceux du [§11](#11-états-rollback-et-point-de-non-retour) : le
+remplacement d'un slot committé y est déjà défini. La connexion QUIC traverse la
+micro-coupure du [§12.3](#123-politique-de-renouvellement) grâce à son délai
+d'inactivité de 50 s et se ferme après le commit.
+
+Le budget par identité du [§4.5](#45-délais-et-limites) s'applique comme sur le
+port public. Le comportement du noyau et de WireGuard-NT face à la
+réinitialisation du pair, et la règle de pare-feu réelle sur `wg_iface`, ne sont
+pas mesurés : ils relèvent du [§20.2](#202-ce-qui-exige-les-machines-cibles).
 
 ## 8. Authentification des messages
 
@@ -1699,7 +1753,7 @@ les cas suivants, et seulement ceux-là :
 | remplacement atomique par une nouvelle négociation commitée | slot écrasé | PSK remplacé |
 | révocation d'admission (`helios peer remove`) | pair retiré | — |
 | vieillissement du handshake ([§12.4](#124-récupération-dun-slot-sans-client)) | slot vidé après 300 s | — |
-| échéance de durée de vie ([§12.3](#123-politique-de-renouvellement)) | slot vidé | PSK zéroïsé |
+| échéance de durée de vie ou plafond d'octets ([§12.3](#123-politique-de-renouvellement)) | slot vidé | PSK zéroïsé |
 | redémarrage de `heliosd` ([§12.5](#125-redémarrage-de-la-gateway)) | tous les slots vidés | PSK conservé jusqu'à renégociation |
 
 Une déconnexion VPN explicite en mode `ml_kem` déclenche un `release` sur l'API
@@ -1749,9 +1803,28 @@ des mois de trafic avec un unique secret ML-KEM. La v5 y met une borne.
 | Paramètre | Valeur |
 | --- | --- |
 | durée de vie maximale d'un PSK `ml_kem` | 24 heures |
-| renouvellement déclenché par Orion | à 90 % de la durée de vie, soit 21 h 36 |
-| fenêtre restante pour renouveler | 2 h 24, incluse dans les 24 heures |
-| retrait ferme gateway | à 24 heures, sans grâce supplémentaire |
+| plafond d'octets d'un PSK `ml_kem` | 100 Gio (`rx_bytes + tx_bytes` du pair), constante `aether`, **non signée** |
+| renouvellement déclenché par Orion | à 80 % de la durée de vie (19 h 12) **ou** de 80 % du plafond (80 Gio), le premier atteint |
+| fenêtre restante pour renouveler | 4 h 48 ou 20 Gio, incluses dans les limites |
+| retrait ferme gateway | à 100 % de l'un ou l'autre, sans grâce supplémentaire |
+
+Le seuil était de 90 % avant l'amendement du 2026-10-09. Le volume est le seul
+compteur d'usure que les deux bouts savent lire : le compteur anti-rejeu de
+WireGuard appartient aux clés de session, repart à zéro à chaque rekey de 120 s
+et n'est exposé ni par le noyau ni par WireGuard-NT. Le plafond est une
+constante partagée et non un champ signé : le signer changerait les octets
+authentifiés de la réponse et ferait refuser la réponse d'une gateway à jour par
+tout Orion déployé. Changer un jour cette valeur exigera de la signer, comme la
+durée de vie. Aucune variable ni option ne raccourcit la durée de vie ou le
+plafond dans un binaire livré.
+
+La gateway enregistre au commit `rx_bytes + tx_bytes` du pair comme point de
+départ et retire le slot committé à 100 % du temps ou du volume, dans la boucle
+qui applique déjà les 24 heures. Si le compteur courant est inférieur au point
+de départ (pair recréé), le point de départ prend la valeur courante. Ces
+limites ne visent jamais un candidat `preparing`. Le journal nomme la cause :
+durée ou volume. Orion applique la même règle de point de départ ; à 80 % du
+temps, il retient l'échéance la plus proche des horloges monotone et murale.
 
 La gateway mesure les 24 heures depuis la pose du candidat avec une source de
 temps écoulé monotone qui inclut la suspension du système. Orion mesure depuis
@@ -1776,7 +1849,18 @@ détaillé en [§12.5](#125-redémarrage-de-la-gateway).
 
 Chaque renouvellement est une **transaction complète** : nouveau challenge,
 nouveaux nonces, nouveau `transaction_id`, nouveau matériel ML-KEM. Rien n'est
-réutilisé d'une négociation précédente.
+réutilisé d'une négociation précédente. Le renouvellement automatique se
+négocie dans le tunnel ([§7.6](#76-renouvellement-dans-le-tunnel)) ; aucun PSK
+n'est négocié à l'avance, puisqu'un PSK négocié est posé sur le plan de données
+avant d'être annoncé et que le commit exige la preuve d'un handshake avec lui.
+
+Après un rollback ou un délai dépassé, Orion retente dans le tunnel après 1, 2,
+4, 8 puis 15 minutes, délai plafonné à 15 minutes, jusqu'à 100 % de la limite.
+Au-delà, la gateway retire le slot et le chemin existant (vieillissement du
+handshake, puis négociation publique) reprend. Orion propose aussi une action
+manuelle « Renouveler la clé maintenant », refusée hors d'un tunnel monté en
+`ml_kem` ; c'est elle qui permet de mesurer le critère ci-dessous sur le code de
+production.
 
 #### Ce qu'un renouvellement fait au plan de données
 
@@ -1823,9 +1907,10 @@ session détruit les clés de transport en cours : le trafic nouveau est
 interrompu le temps d'un handshake WireGuard, typiquement moins d'une seconde
 sur un chemin sain, et les paquets déjà en vol sont perdus comme ils le
 seraient sur un rekey manqué. Une session TCP survit, une session temps réel
-hoquette. Le renouvellement étant déclenché à 21 h 36 d'un tunnel de 24 h, cela
-représente au plus une interruption par jour et par tunnel, à un instant
-qu'Orion choisit et peut donc décaler.
+hoquette. Le renouvellement étant déclenché à 80 % de la durée de vie, cela représente
+au moins une interruption par jour et par tunnel, à un instant qu'Orion choisit
+et peut donc décaler ; un tunnel qui écoule 80 Gio plus vite en subit davantage
+(à 1 Gbit/s soutenu, environ une toutes les 11 minutes).
 
 Si le nouveau PSK ne produit pas de handshake sur **l'un ou l'autre** backend
 dans le délai de confirmation, le
@@ -1833,12 +1918,23 @@ rollback de [§11.3](#113-causes-de-rollback) restaure le PSK précédent côté
 gateway et Orion restaure le sien. Le tunnel se rétablit sur l'ancien secret, au
 prix de la même micro-coupure ; le renouvellement est retenté.
 
+**Garde de rollback côté Orion.** Si la réinscription du pair échoue, Orion
+réinscrit le pair avec l'**ancien** PSK. Cette restauration est portée par une
+garde qui survit à l'annulation de la tâche : un retour asynchrone ordinaire ne
+suffit pas, pour la même raison que la garde de la gateway. Si la restauration
+échoue aussi, l'erreur est affichée et le chemin de reconnexion existant
+s'applique. Après le commit, l'ancien PSK est effacé ; le nouveau n'est jamais
+persisté.
+
 #### Critère d'acceptation, et que faire s'il n'est pas tenu
 
 Tout ce qui précède est un raisonnement sur le comportement de WireGuard, pas
-une mesure. Il est donc **conditionnel**, et la condition est un essai bloquant
-décrit au [§20.2](#202-ce-qui-exige-les-machines-cibles) : renouvellement à
-chaud, sur cible, avec trafic actif.
+une mesure. Il reste **conditionnel** : la mesure est l'essai V1 décrit au
+[§20.2](#202-ce-qui-exige-les-machines-cibles) et dans
+[TESTING](../testing/TESTING.md), renouvellement à chaud, sur cible, avec trafic
+actif. Par décision du 2026-10-09 elle ne bloque plus l'écriture du code
+([§20.0](#200-essais-bloquants)) : elle se mène sur le code de production, via
+l'action manuelle, et rien n'est mesuré à ce jour.
 
 Le critère est explicite. Sur un chemin sain :
 
@@ -1854,16 +1950,16 @@ WireGuard réémet un handshake toutes les 5 secondes, soit environ neuf
 tentatives dans la fenêtre. C'est ce qui rend l'échec peu probable — pas ce qui
 le rend impossible sur un chemin dégradé, à forte perte ou à latence élevée.
 
-Si le critère n'est pas tenu, **la politique de renouvellement est rouverte
-avant l'écriture du code de production**, et non corrigée après. L'issue de
-repli pré-arbitrée est unique : renoncer au renouvellement en place et effectuer
-une déconnexion puis une reconnexion complètes, planifiées par Orion. La coupure
+Si le critère n'est pas tenu, **la politique de renouvellement est rouverte**,
+et non corrigée en silence. L'issue de repli pré-arbitrée est unique : renoncer
+au renouvellement en place et effectuer une déconnexion puis une reconnexion
+complètes, planifiées par Orion au même seuil de 80 %. La coupure
 devient franche et assumée de quelques secondes. Supprimer la preuve n'est pas
 une issue admise : cela réintroduirait le commit sur la seule affirmation du
 client et permettrait à une identité TLS/ML-DSA volée de remplacer le slot sans
 détenir la clé privée WireGuard.
 
-À 24 heures depuis la pose, la gateway vide le slot. Le tunnel meurt au
+À 24 heures depuis la pose, ou à 100 Gio, la gateway vide le slot. Le tunnel meurt au
 rekey WireGuard suivant, et Orion s'en aperçoit par le vieillissement du
 handshake. Le journal nomme l'échéance ; c'est le seul retrait de PSK que le
 client ne demande pas.
@@ -2627,20 +2723,21 @@ ne peut pas être déclarée implémentée sans les essais suivants.
 
 ### 20.0 Essais bloquants
 
-La plupart des essais de ce chapitre valident du code déjà écrit. **Un seul doit
-passer avant que le code de production correspondant soit écrit**, parce qu'il
-peut invalider une décision de conception plutôt qu'une implémentation :
+La plupart des essais de ce chapitre valident du code déjà écrit. Un seul avait
+été posé comme préalable à l'écriture du code correspondant, parce qu'il peut
+invalider une décision de conception plutôt qu'une implémentation :
 
 | Verrou | Ce qu'il conditionne | Si l'essai échoue |
 | --- | --- | --- |
-| renouvellement à chaud avec trafic actif ([§20.2](#202-ce-qui-exige-les-machines-cibles)) | toute la politique de renouvellement de [§12.3](#123-politique-de-renouvellement) | bascule vers la reconnexion complète pré-définie en §12.3, **avant** d'écrire le chemin de renouvellement |
+| renouvellement à chaud avec trafic actif ([§20.2](#202-ce-qui-exige-les-machines-cibles)) | toute la politique de renouvellement de [§12.3](#123-politique-de-renouvellement) | bascule vers la reconnexion complète pré-définie en §12.3 |
 
-Ce verrou existe parce que le raisonnement de §12.3 sur le comportement de
-WireGuard est solide mais non mesuré, et qu'écrire d'abord le code reviendrait à
-découvrir un défaut de conception à travers une implémentation qui le masque.
-L'essai se mène sur un prototype jetable — poser un PSK, réinitialiser la
-session, mesurer — et non sur le chemin de production, qui n'a pas besoin
-d'exister pour cela.
+**Essai bloquant levé par décision du 2026-10-09 ; la mesure V1 se fait sur le
+code de production via l'action manuelle ; le repli §12.3 reste l'issue si V1
+échoue.** Le risque que ce verrou couvrait — découvrir un défaut de conception à
+travers une implémentation qui le masque — est assumé : le chemin de production
+est écrit d'abord, et la mesure V1 le juge ensuite sur cible. Tant que V1 n'a pas
+été exécutée avec un verdict PASS sur chaque critère, le renouvellement en place
+est livré mais **non validé**.
 
 Aucun autre essai n'est bloquant en ce sens. Tous restent obligatoires avant de
 déclarer la v5 implémentée.
@@ -2751,8 +2848,9 @@ déclarer la v5 implémentée.
   un slot statique ou un état `preparing` ;
 - déconnexion Orion : aucun socket QUIC nouveau, tentative HTTP bornée à deux
   secondes avant `down()`, puis démontage et zéroïsation même sans réponse ;
-- durée de vie du PSK : renouvellement déclenché à 90 %, retrait ferme à 24 h,
-  sans extension après recul d'horloge ou suspension simulée ;
+- durée de vie du PSK : renouvellement déclenché à 80 % de la durée ou du
+  plafond de 100 Gio, retrait ferme à 24 h ou 100 Gio, sans extension après
+  recul d'horloge ou suspension simulée ;
 - enrôlement : invitation expirée, rejouée, révoquée, ciblant une autre gateway
   ou déjà consommée refusée ; `allow_readmission` exigé après révocation ;
 - preuve de possession WireGuard fausse ou secret X25519 nul refusés ; CSR et
@@ -2782,18 +2880,23 @@ une compilation WSL2.
 - pose réelle du slot sur le **noyau WireGuard** de la gateway, et lecture du
   compteur de handshake ;
 - pose réelle sur **WireGuard-NT** sous Windows ;
-- **renouvellement à chaud d'un PSK sur un tunnel monté, avec trafic actif —
-  essai bloquant ([§20.0](#200-essais-bloquants)).** C'est le seul essai de ce
-  document qui peut invalider une décision de conception plutôt qu'une
-  implémentation. Il se mène sur un prototype, **avant** d'écrire le chemin de
-  renouvellement, et se juge sur le tableau de critères de
+- **renouvellement à chaud d'un PSK sur un tunnel monté, avec trafic actif
+  (V1, [§20.0](#200-essais-bloquants)).** C'est l'essai de ce document qui peut
+  invalider une décision de conception plutôt qu'une implémentation. Levé comme
+  préalable par la décision du 2026-10-09, il se mène sur le **code de
+  production**, via l'action « Renouveler la clé maintenant », sur le noyau
+  Linux et sur WireGuard-NT, et se juge sur le tableau de critères de
   [§12.3](#123-politique-de-renouvellement) : handshake sous 5 secondes après la
   réinitialisation et observé **sur les deux backends**, interruption sous une
   seconde, aucune session TCP rompue, vingt renouvellements consécutifs réussis.
-  À défaut, le renouvellement devient la reconnexion complète définie en §12.3
-  avant toute écriture de code. L'essai doit
-  être rejoué sur un chemin dégradé — perte de paquets et latence injectées —
-  puisque c'est là que la marge du délai de confirmation se consomme ;
+  À défaut, le renouvellement devient la reconnexion complète définie en §12.3.
+  L'essai doit être rejoué sur un chemin dégradé — perte de paquets et latence
+  injectées — puisque c'est là que la marge du délai de confirmation se
+  consomme. La recette est dans
+  [TESTING](../testing/TESTING.md#renouvellement-du-psk-à-chaud-v1). Doivent
+  aussi être vus sur cible : le comportement de `remove_peer` puis
+  `configure_peer` sur le noyau et sur WireGuard-NT, et la règle de pare-feu
+  réelle du port de négociation sur `wg_iface` ;
 - **redémarrage de `heliosd` sous des tunnels montés** : chaque client doit
   renégocier de lui-même en moins de trois minutes, sans geste utilisateur, et
   le journal des deux côtés doit nommer le vieillissement du handshake ;
@@ -2861,12 +2964,15 @@ par le protocole impose de forcer un handshake, donc de réinitialiser la sessio
 WireGuard. L'interruption vaut un handshake ; la supprimer demanderait deux
 slots PSK simultanés par pair, ce que WireGuard n'offre pas.
 
-**Et cette interruption n'est pas encore mesurée.** Le raisonnement de
+**Et cette interruption n'est pas encore mesurée.** Le renouvellement en place
+est écrit depuis le 2026-10-09, mais le raisonnement de
 [§12.3](#123-politique-de-renouvellement) sur le comportement de WireGuard n'a
-pas été confronté à un plan de données réel. C'est le seul essai bloquant du
-document ([§20.0](#200-essais-bloquants)) : il précède l'écriture du chemin de
-renouvellement, et son échec choisit la reconnexion complète pré-arbitrée en
-§12.3 plutôt qu'une suppression de la preuve.
+pas été confronté à un plan de données réel : la mesure V1 reste à mener sur
+cible, sur le noyau Linux et sur WireGuard-NT, avec le code de production
+([§20.0](#200-essais-bloquants), [§20.2](#202-ce-qui-exige-les-machines-cibles)).
+Son échec choisirait la reconnexion complète pré-arbitrée en §12.3 plutôt
+qu'une suppression de la preuve. Tant qu'elle n'est pas faite, aucun chiffre
+d'interruption ne doit être cité.
 
 **Un redémarrage de `heliosd` coupe tous les tunnels négociés de cette
 gateway.** Les PSK négociés ne sont pas persistés, et ce choix est volontaire.

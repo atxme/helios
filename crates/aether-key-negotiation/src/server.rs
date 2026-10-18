@@ -1,5 +1,5 @@
 use std::{
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -158,11 +158,20 @@ pub trait NegotiationHandler: Send + Sync + 'static {
     /// get to choose which peer it probes. The WireGuard key in the request
     /// is then checked against this answer — it is never itself a lookup key
     /// into the peer table.
-    async fn resolve_admitted_peer(&self, certificate_sha256: &str) -> Option<String>;
+    ///
+    /// `source` is the canonical address the connection comes from. A source
+    /// that is a tunnel VIP lets the implementation require that the VIP and
+    /// the certificate name the same peer (in-tunnel PSK renewal).
+    async fn resolve_admitted_peer(
+        &self,
+        certificate_sha256: &str,
+        source: IpAddr,
+    ) -> Option<String>;
 
     async fn prepare(
         &self,
         certificate_sha256: String,
+        source: IpAddr,
         request: AuthenticatedKeyNegotiationRequest,
     ) -> Result<PreparedNegotiation, PublicError>;
 
@@ -321,7 +330,10 @@ async fn handle_connection(
     // is bound to **its** peer from this point on — the WireGuard key in the
     // request is checked against this answer instead of being a lookup key of
     // its own, so one admitted client cannot aim a negotiation at another.
-    let Some(admitted_peer) = handler.resolve_admitted_peer(&fingerprint).await else {
+    let Some(admitted_peer) = handler
+        .resolve_admitted_peer(&fingerprint, remote.ip())
+        .await
+    else {
         tracing::warn!(
             %remote,
             client_certificate_sha256 = %fingerprint,
@@ -505,7 +517,7 @@ async fn handle_connection(
         transaction_id,
         request.request.client_wg_public_key.clone(),
     );
-    let prepared = match handler.prepare(fingerprint, request).await {
+    let prepared = match handler.prepare(fingerprint, remote.ip(), request).await {
         Ok(prepared) => prepared,
         Err(error) => {
             guard.roll_back().await;

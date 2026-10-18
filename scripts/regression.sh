@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Campagne de non-régression reproductible, exécutable localement et en CI.
+# Campagne de non-régression complète locale ; la CI utilise des contrôles ciblés.
 # Les features noyau/TPM sont compilées et testées sans effet réel ; leur recette
 # d'exécution reste sur la cible, voir docs/testing/TESTING.md.
 set -euo pipefail

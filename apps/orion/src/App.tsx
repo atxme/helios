@@ -407,6 +407,7 @@ export default function App() {
                 onConnect={() => c.connect(c.selectedProfile?.name)}
                 onDisconnect={c.disconnect}
                 onOpenSsh={() => c.openSshTerminal(c.selectedProfile?.name)}
+                onRenewKey={c.renewPsk}
               />
             </Box>
           )}

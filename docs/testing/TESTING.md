@@ -10,16 +10,24 @@ Elle doit être verte avant fusion ou livraison. Elle utilise les lockfiles,
 interdit les avertissements Clippy et couvre les features matérielles au niveau
 compilation/tests sans exécuter d’effet réel.
 
-**En intégration continue, elle ne se déclenche que pour `main`** : sur les
-poussées vers cette branche et sur les PR qui la visent. Une branche de travail
-ne la déclenche donc plus à chaque commit — la campagne coûte plusieurs minutes
-et n’apprend rien de plus que la même commande jouée localement, qui exécute
-exactement les mêmes étapes. Pour la lancer malgré tout sur une branche :
-l’action *Régression* accepte un déclenchement manuel (`workflow_dispatch`).
+**La CI exécute des contrôles ciblés**, sur les poussées vers `main` et les PR
+qui la visent. `scripts/ci-plan.py` sélectionne les crates modifiés et leurs
+dépendants transitifs à partir des chemins déclarés par Cargo, y compris les
+dépendances optionnelles, de build, de test et propres à une plateforme. Les
+modifications des manifests racine, du lockfile Rust ou de `vendor/` couvrent
+tous les crates. Une modification documentaire seule ne lance aucun build.
 
-Cela déplace une responsabilité : sur une branche de travail, la campagne est
-**au développeur**, plus à la CI. Une branche poussée sans l’avoir jouée n’est
-vérifiée qu’au moment de la PR.
+Linux joue Clippy strict et les tests des crates concernés, toutes features,
+sans le shell Tauri. Windows compile et teste les chemins Orion/Astra concernés.
+Les interfaces sont testées et construites quand leurs sources changent ; la
+console gateway est aussi construite quand les tests Rust doivent l'embarquer.
+Les audits se déclenchent sur modification des lockfiles. Cargo utilise deux
+jobs au plus, sans compilation incrémentale ni informations de débogage Rust.
+
+L'action *Régression* accepte un déclenchement manuel (`workflow_dispatch`) pour
+jouer tous ces contrôles. Elle n'appelle ni `scripts/regression.sh`, ni
+`scripts/coverage.sh` : la campagne complète et la couverture restent locales.
+Le développeur reste responsable de la campagne complète avant fusion/livraison.
 
 ## Matrice automatisée
 
@@ -48,9 +56,13 @@ Le workflow *Fuzzing planifié* s'exécute chaque dimanche à 03:17 UTC et peut
 la toolchain nightly uniquement pour `cargo-fuzz`, qui est requis par
 libFuzzer, et conserve le build fuzzing hors de l'espace de travail principal.
 
-Les quatre targets (`signed_object`, `trust_transaction`, `x509_documents` et
-`gateway_state_machine`) sont exécutées séquentiellement avec un budget de
-120 secondes chacune. Le job est limité à 20 minutes. Les corpus générés, les
+Toutes les targets retournées par `cargo fuzz list` (`signed_object`,
+`trust_transaction`, `x509_documents`, `gateway_state_machine` et
+`tunnel_addresses`) sont compilées une fois puis exécutées séquentiellement
+avec un budget de 60 secondes chacune. Le profil `--dev` accepte le trousseau
+de développement tout en conservant l'interdiction de ce trousseau dans les
+livraisons release. AddressSanitizer reste actif. Le job est limité à 20 minutes.
+Les corpus générés, les
 artefacts de crash et les logs sont publiés comme un artefact conservé 30 jours,
 y compris lorsqu'une target échoue ; l'échec est ensuite propagé au workflow.
 
@@ -92,15 +104,13 @@ Les rapports navigables sont écrits dans
 `target/coverage/workspace.json`, ce qui permet de comparer deux campagnes sans
 dépendre d’un répertoire temporaire.
 
-La CI publie le répertoire complet comme artefact `coverage-linux`. Un second
-job, exécuté sur `windows-2025`, compile Orion avec toutes ses features, joue
-les tests Rust et React puis publie `coverage-orion-windows`. Ce rapport Windows
-est le seul pourcentage qui inclut réellement les branches `cfg(windows)` :
-DPAPI, composition du coffre logiciel explicitement autorisé, interrogation
-BitLocker, exclusion WER et sélection de route hors tunnel. Aucun seuil global
-n’est imposé : le contrôle porte sur l’exécution des branches et la conservation
-des rapports séparés, sans transformer les chemins matériels absents de la CI
-en échecs artificiels.
+La CI ne mesure plus la couverture : l'instrumentation et la recompilation
+complète sont trop coûteuses pour les runners disponibles. Le job Windows
+conserve les tests natifs sans instrumentation. Pour mesurer les branches
+`cfg(windows)` (DPAPI, coffre logiciel, BitLocker, WER et routes), lancer
+`cargo llvm-cov --package orion-core --package orion --all-features` sur un
+poste Windows disposant de `cargo-llvm-cov` et `llvm-tools-preview`. Un rapport
+Linux n'inclut pas ces branches.
 
 Cette commande mesure ce que l’hôte a réellement compilé. Sous Linux, un
 module Windows peut afficher une couverture élevée parce que seul son refus
@@ -482,6 +492,55 @@ Le même test accepte `HELIOS_TPM_TCTI=swtpm:host=127.0.0.1,port=2321`. Il
 valide alors le vrai chemin ESAPI — politique de lecture NV sans `OWNERREAD`,
 écrasement et impossibilité de ressusciter le secret avec le seul
 marqueur disque — sans prétendre mesurer Secure Boot ni les PCR d'une cible.
+
+### Renouvellement du PSK à chaud (V1)
+
+Cet essai juge le renouvellement dans le tunnel
+([§7.6](../specification/NEGOCIATION-DE-CLE-V5.md#76-renouvellement-dans-le-tunnel))
+sur les critères du [§12.3](../specification/NEGOCIATION-DE-CLE-V5.md#123-politique-de-renouvellement).
+Il se mène sur le **code de production**, sans variable qui raccourcisse la durée
+de vie : le renouvellement est forcé par l'action « Renouveler la clé
+maintenant » d'Orion. Rien n'en est mesuré à ce jour, et rien ne se coche depuis
+WSL2.
+
+À répéter sur le **noyau Linux** et sur **WireGuard-NT**, d'abord sur un chemin
+sain, puis sur un chemin dégradé :
+
+1. monter un tunnel `ml_kem` entre Orion et la gateway ; relever la VIP du
+   client `<VIP>` et le port de négociation `<port>` ;
+2. depuis la gateway, mesurer l'interruption applicative :
+   `ping -D -i 0.01 <VIP> | tee ping.log` (intervalle de 10 ms, horodatage
+   absolu) ;
+3. depuis le client, lancer **une seule** connexion TCP qui traverse tout
+   l'essai : `iperf3 -c <VIP gateway> -t 1500 -J > iperf.json` ; une connexion
+   rompue ou relancée est un échec du critère ;
+4. sur la gateway, capturer les messages de négociation :
+   `tcpdump -ttt 'udp port <port> and (udp[8]=1 or udp[8]=2)'` ;
+5. déclencher **20 renouvellements consécutifs** par « Renouveler la clé
+   maintenant », en attendant le « clé renouvelée » de chacun ;
+6. relever pour chaque renouvellement le délai jusqu'au handshake observé après
+   la réinitialisation, le plus long trou de réponses du `ping`, et l'état de la
+   connexion `iperf3` ;
+7. recommencer avec un chemin dégradé sur l'interface qui porte le trafic :
+   `tc qdisc add dev <iface> root netem delay 150ms 30ms loss 5%`, retiré
+   ensuite par `tc qdisc del dev <iface> root`.
+
+Verdict **PASS ou FAIL par critère**, pour chaque noyau et chaque chemin :
+
+| Critère (§12.3) | Seuil | Source de mesure |
+| --- | --- | --- |
+| handshake après la réinitialisation, observé sur les deux backends | < 5 s | `wg show … latest-handshakes` et journaux des deux côtés |
+| interruption du trafic applicatif | < 1 s | plus long trou du `ping` |
+| sessions TCP traversant le tunnel | aucune rompue | `iperf3` unique, sans erreur dans le JSON |
+| renouvellements consécutifs réussis | 20 sur 20 | événements « clé renouvelée » |
+
+Un seul FAIL sur le chemin sain rouvre la politique : le repli est la
+déconnexion puis la reconnexion complètes du §12.3, jamais la suppression de la
+preuve par handshake. Sur le chemin dégradé, consigner les écarts même quand le
+verdict reste PASS. Vérifier aussi, sur la gateway, que la règle du port de
+négociation n'existe que sur les WAN et sur `wg_iface` (`nft list ruleset`), et
+que `remove_peer` suivi de `configure_peer` réinscrit bien le pair avec le
+nouveau PSK sur chacun des deux backends.
 
 ## Banc de développement
 

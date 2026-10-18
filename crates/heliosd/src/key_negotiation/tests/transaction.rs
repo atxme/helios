@@ -10,7 +10,11 @@ async fn unconfirmed_transaction_restores_the_previous_slot() {
     let (handler, plane) = gateway_with(&fixture, &previous_psk, ProtectionMode::MlKem);
 
     handler
-        .prepare(CERTIFICATE_FINGERPRINT.into(), request([1; 16], &fixture))
+        .prepare(
+            CERTIFICATE_FINGERPRINT.into(),
+            PUBLIC_SOURCE,
+            request([1; 16], &fixture),
+        )
         .await
         .unwrap();
     handler.rollback([1; 16], CLIENT_KEY).await;
@@ -35,7 +39,11 @@ async fn undelivered_commit_restores_the_previous_slot() {
     let (handler, plane) = gateway_with(&fixture, &previous_psk, ProtectionMode::MlKem);
 
     handler
-        .prepare(CERTIFICATE_FINGERPRINT.into(), request([2; 16], &fixture))
+        .prepare(
+            CERTIFICATE_FINGERPRINT.into(),
+            PUBLIC_SOURCE,
+            request([2; 16], &fixture),
+        )
         .await
         .unwrap();
     // The client handshakes with the candidate PSK before confirming; the
@@ -87,7 +95,7 @@ async fn certificate_mismatch_never_reaches_the_data_plane() {
 
     assert!(matches!(
         handler
-            .prepare("b".repeat(64), request([3; 16], &fixture))
+            .prepare("b".repeat(64), PUBLIC_SOURCE, request([3; 16], &fixture))
             .await,
         // Coarse on purpose: an unknown peer and a mismatched certificate
         // must be indistinguishable from the public boundary.
@@ -109,6 +117,7 @@ async fn a_mode_below_the_peer_floor_is_refused() {
         handler
             .prepare(
                 CERTIFICATE_FINGERPRINT.into(),
+                PUBLIC_SOURCE,
                 request_in_mode(
                     [4; 16],
                     &fixture,
@@ -160,7 +169,11 @@ async fn a_confirmation_without_a_fresh_handshake_is_refused() {
     let (handler, _plane) = gateway_with(&fixture, &previous_psk, ProtectionMode::MlKem);
 
     handler
-        .prepare(CERTIFICATE_FINGERPRINT.into(), request([9; 16], &fixture))
+        .prepare(
+            CERTIFICATE_FINGERPRINT.into(),
+            PUBLIC_SOURCE,
+            request([9; 16], &fixture),
+        )
         .await
         .unwrap();
     // Everything a stolen TLS + ML-DSA identity can produce, and nothing
@@ -190,6 +203,7 @@ async fn a_committed_static_psk_is_configuration_not_an_owned_slot() {
     handler
         .prepare(
             CERTIFICATE_FINGERPRINT.into(),
+            PUBLIC_SOURCE,
             request_in_mode(
                 [10; 16],
                 &fixture,
@@ -247,7 +261,11 @@ async fn a_stale_actor_cannot_clear_a_slot_that_moved_on() {
     let (handler, plane) = gateway_with(&fixture, &previous_psk, ProtectionMode::MlKem);
 
     handler
-        .prepare(CERTIFICATE_FINGERPRINT.into(), request([11; 16], &fixture))
+        .prepare(
+            CERTIFICATE_FINGERPRINT.into(),
+            PUBLIC_SOURCE,
+            request([11; 16], &fixture),
+        )
         .await
         .unwrap();
     let stale = handler
@@ -291,6 +309,7 @@ async fn a_failed_clear_leaves_the_slot_owned_rather_than_orphaned() {
     handler
         .prepare(
             CERTIFICATE_FINGERPRINT.into(),
+            PUBLIC_SOURCE,
             request_in_mode([12; 16], &fixture, ProtectionMode::MlKem, None),
         )
         .await
@@ -349,7 +368,11 @@ async fn a_candidate_being_prepared_is_not_reclaimable() {
     let (handler, plane) = gateway_with(&fixture, &previous_psk, ProtectionMode::MlKem);
 
     handler
-        .prepare(CERTIFICATE_FINGERPRINT.into(), request([20; 16], &fixture))
+        .prepare(
+            CERTIFICATE_FINGERPRINT.into(),
+            PUBLIC_SOURCE,
+            request([20; 16], &fixture),
+        )
         .await
         .unwrap();
 
@@ -394,7 +417,11 @@ async fn a_release_naming_the_displaced_psk_cannot_wipe_the_candidate() {
 
     // First negotiation, committed: it owns the slot.
     handler
-        .prepare(CERTIFICATE_FINGERPRINT.into(), request([21; 16], &fixture))
+        .prepare(
+            CERTIFICATE_FINGERPRINT.into(),
+            PUBLIC_SOURCE,
+            request([21; 16], &fixture),
+        )
         .await
         .unwrap();
     plane.handshake_happens().await;
@@ -408,7 +435,11 @@ async fn a_release_naming_the_displaced_psk_cannot_wipe_the_candidate() {
 
     // Second negotiation, in flight: its candidate is on the data plane.
     handler
-        .prepare(CERTIFICATE_FINGERPRINT.into(), request([22; 16], &fixture))
+        .prepare(
+            CERTIFICATE_FINGERPRINT.into(),
+            PUBLIC_SOURCE,
+            request([22; 16], &fixture),
+        )
         .await
         .unwrap();
     let candidate = plane.writes().await.last().cloned().flatten();
@@ -451,7 +482,11 @@ async fn a_transaction_that_was_never_recorded_is_still_undone() {
     let (handler, plane) = gateway_with(&fixture, &previous_psk, ProtectionMode::MlKem);
 
     handler
-        .prepare(CERTIFICATE_FINGERPRINT.into(), request([23; 16], &fixture))
+        .prepare(
+            CERTIFICATE_FINGERPRINT.into(),
+            PUBLIC_SOURCE,
+            request([23; 16], &fixture),
+        )
         .await
         .unwrap();
     // Exactly what a cancellation between `install` and the insert leaves
@@ -502,7 +537,11 @@ async fn a_release_arriving_during_preparation_touches_nothing() {
     let (handler, plane) = gateway_with(&fixture, &previous_psk, ProtectionMode::MlKem);
 
     handler
-        .prepare(CERTIFICATE_FINGERPRINT.into(), request([26; 16], &fixture))
+        .prepare(
+            CERTIFICATE_FINGERPRINT.into(),
+            PUBLIC_SOURCE,
+            request([26; 16], &fixture),
+        )
         .await
         .unwrap();
     let candidate = plane.writes().await.last().cloned().flatten();
@@ -611,6 +650,7 @@ async fn a_release_after_commit_clears_the_same_transaction() {
     handler
         .prepare(
             CERTIFICATE_FINGERPRINT.into(),
+            PUBLIC_SOURCE,
             request(transaction_id, &fixture),
         )
         .await
@@ -650,13 +690,21 @@ async fn a_rolled_back_candidate_rests_the_peer() {
     let (handler, _plane) = gateway_with(&fixture, &previous_psk, ProtectionMode::MlKem);
 
     handler
-        .prepare(CERTIFICATE_FINGERPRINT.into(), request([24; 16], &fixture))
+        .prepare(
+            CERTIFICATE_FINGERPRINT.into(),
+            PUBLIC_SOURCE,
+            request([24; 16], &fixture),
+        )
         .await
         .unwrap();
     handler.rollback([24; 16], CLIENT_KEY).await;
 
     let refusal = handler
-        .prepare(CERTIFICATE_FINGERPRINT.into(), request([25; 16], &fixture))
+        .prepare(
+            CERTIFICATE_FINGERPRINT.into(),
+            PUBLIC_SOURCE,
+            request([25; 16], &fixture),
+        )
         .await;
     assert!(
         matches!(refusal, Err(PublicError::Rejected)),

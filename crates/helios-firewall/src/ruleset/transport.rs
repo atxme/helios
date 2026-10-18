@@ -98,6 +98,43 @@ pub(super) fn key_negotiation_listener(
                 ),
             );
         }
+
+        // ── The same listener, reached through the tunnel ───────────────────
+        // In-tunnel PSK renewal: Orion renegotiates through the tunnel it
+        // already holds rather than reopening the public port. Scoped by
+        // interface, never by source address: only WireGuard puts packets on
+        // `wg_iface`, and only for a peer it has authenticated. The gateway
+        // then checks that the source VIP is the peer mTLS named.
+        if !policy.wg_iface.is_empty() {
+            rules.push(
+                Rule::new(
+                    Input,
+                    vec![
+                        Match::InIface(policy.wg_iface.clone()),
+                        Match::DestPort {
+                            port,
+                            proto: L4::Udp,
+                        },
+                    ],
+                    Verdict::Accept,
+                )
+                .with_note("in-tunnel PSK renewal on the key-negotiation listener"),
+            );
+            rules.push(
+                Rule::new(
+                    Output,
+                    vec![
+                        Match::OutIface(policy.wg_iface.clone()),
+                        Match::SourcePort {
+                            port,
+                            proto: L4::Udp,
+                        },
+                    ],
+                    Verdict::Accept,
+                )
+                .with_note("in-tunnel renewal replies — the final frame can outlive conntrack"),
+            );
+        }
     }
 }
 

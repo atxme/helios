@@ -173,11 +173,13 @@ const RECLAIM_POLL: std::time::Duration = std::time::Duration::from_secs(10);
 /// the 180 s after which a session is dead — so clearing its slot destroys
 /// nothing that still worked.
 ///
-/// Two clocks, two questions. Handshake age answers «is this peer still
-/// there»; [`MAX_PSK_LIFETIME`] answers «has this secret protected traffic for
-/// long enough», and it fires even on a perfectly healthy tunnel. Orion is
-/// expected to renegotiate well before, so reaching the deadline means the
-/// renewal did not happen and the journal says so.
+/// Three questions. Handshake age answers «is this peer still there»;
+/// [`MAX_PSK_LIFETIME`] answers «has this secret protected traffic for long
+/// enough»; the byte ceiling
+/// ([`NEGOTIATED_PSK_BYTE_LIMIT`](aether::key_negotiation::NEGOTIATED_PSK_BYTE_LIMIT))
+/// answers «has it carried enough». The last two fire even on a perfectly
+/// healthy tunnel. Orion is expected to renegotiate well before, so reaching
+/// either means the renewal did not happen and the journal says so.
 ///
 /// The whole loop depends on gateway-sent keep-alives, which
 /// `NetworkConfig::validate` makes mandatory for every negotiated peer: an
