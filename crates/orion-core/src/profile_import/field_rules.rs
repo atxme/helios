@@ -142,7 +142,7 @@ pub enum TunnelCapture {
 
 /// Classifies a prefix list by what it captures whole, family by family.
 ///
-/// Entries are read as [`split_cidr_list`] and [`validate_cidr`] read them, so
+/// Entries are read as [`split_cidr_list`] and `validate_cidr` read them, so
 /// the classification never contradicts validation; an entry validation would
 /// refuse captures nothing here. The Orion screen mirrors this rule for the
 /// draft being typed (`apps/orion/src/splitTunnel.ts`), and its tests pin the

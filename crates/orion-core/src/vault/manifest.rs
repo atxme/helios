@@ -173,7 +173,7 @@ pub struct ProfileManifest {
     /// **Secret**, when a static PSK is in use.
     pub preshared_key: Option<aether::SecretString>,
     pub address: Option<String>,
-    /// Present only in a manifest of [`MANIFEST_VERSION`].
+    /// Present only in a manifest of `MANIFEST_VERSION`.
     pub address_v6: Option<String>,
     pub allowed_ips: String,
     pub persistent_keepalive: u16,

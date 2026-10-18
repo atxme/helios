@@ -39,7 +39,7 @@
 //! `::/0` on an adapter without IPv6 then mounts without error, and IPv6 keeps
 //! leaving through the physical interface while the tunnel looks complete.
 //!
-//! Hence the read-back after every configuration ([`assess_capture`]): the
+//! Hence the read-back after every configuration (`assess_capture`): the
 //! driver's peer table, and on Windows the routes the adapter really carries —
 //! the stripping happens *after* the driver received the full list, so the
 //! driver alone would read back a capture that does not exist. Any gap is
@@ -60,7 +60,7 @@
 //! the kernel refuses for an `AllowedIPs` entry is a log line in
 //! `add_peer_routing`, and `configure_peer_routing` still returns `Ok`. The
 //! read-back there also lists the kernel routes through the adapter, and
-//! [`linux_expected_routes`] says which of the requested prefixes must be
+//! `linux_expected_routes` says which of the requested prefixes must be
 //! among them.
 
 use std::collections::HashSet;

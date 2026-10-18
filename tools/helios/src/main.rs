@@ -844,7 +844,6 @@ async fn execute_command(api: &transport::Api, command: Cmd) -> Result<()> {
             } => {
                 let allowed_ips = check_allowed_ips(allowed_ips)?;
                 let ssh_target = check_ssh_target(ssh_target)?;
-                let ssh_target = check_ssh_target(ssh_target)?;
                 profile::emit(
                     client,
                     base,

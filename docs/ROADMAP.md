@@ -107,7 +107,7 @@ reste alors à faire à part.
 | F1 | **Renouvellement de PSK en place** dans le tunnel, à 80 % de 24 h ou de 100 Gio. **Fusionné dans `main` le 18 octobre 2026.** | v5 §7.6, §12.3 ; `docs/superpowers/specs/2026-10-09-renouvellement-psk-design.md` | V1 pour la mesure | Code : fait. Mesure : V1 |
 | F2 | **Enrôlement sans transport de clé privée** et signature opérateur ; `helios enroll` distribue encore l'identité cliente comme en v4 | v5 §15 | : | **Oui** |
 | F3 | État terminal `revoked` porté par le même sérialiseur que le slot, génération incrémentée | v5 §11.1 | : | **Oui** |
-| F4 | Retrait de la variante `classic` de `ProtectionMode` : migration de `network.toml` et de l'octet `mode_id = 0` du manifeste de coffre | v5 §19 | : | **Oui** |
+| F4 | Retrait de la **valeur de négociation** `classic` de `ProtectionMode` (protocole v5 côté gateway) : migration de `network.toml` et de l'octet `mode_id = 0` du bloc de négociation dans le manifeste de coffre. **Ne touche pas au profil Orion `type = classic`**, le profil WireGuard générique sans négociation, que v5 §19 conserve comme chemin produit distinct (`ProfileKind::Classic`, octet de type `1`, import wg-quick) | v5 §19 | : | **Oui** |
 | F5 | Fichier de récupération WireGuard signé ML-DSA-65 + Ed25519 | ADR-002 lot 3 | D1 | **Oui**, après D1 |
 | F6 | Profil Orion **`nomade`** : relier `ProfileMode`, IKM `profile_root_key ‖ passphrase_key`, re-saisie après veille | ADR-006 « Limites connues » | : | **Oui** |
 | F7 | DNS tunnelé côté Orion et gateway | ADR-006, `ruleset.rs` | D5 | **Oui**, après D5 |
@@ -185,7 +185,7 @@ de générations ou de délégation :
 ```text
 Faisable maintenant (sans matériel)
   outillage headless Orion · T2 · T4 compilation · T5 · T6 mesure
-  D1, D5 à D8 arbitrages · F2 enrôlement · F3 revoked · F4 retrait classic
+  D1, D5 à D8 arbitrages · F2 enrôlement · F3 revoked · F4 retrait du mode de négociation classic
   F6 nomade · F8 limit · F14 Astra · F15 reproductible
 
 Faisable en code, validation sur cible à planifier
