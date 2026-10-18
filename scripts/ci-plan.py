@@ -42,6 +42,10 @@ def plan(metadata, paths, full=False):
                 for dependency in package["dependencies"] for changed in affected
             )
         }
+        # Orion stages this executable from its build script; Cargo metadata
+        # cannot describe the dependency on a separately built binary.
+        if "helios-astra-helper" in affected and "orion" in packages:
+            dependents.add("orion")
         if dependents <= affected:
             break
         affected |= dependents
@@ -50,6 +54,10 @@ def plan(metadata, paths, full=False):
     windows = affected & WINDOWS_PACKAGES
     if any(path.startswith("scripts/") and path.endswith(".ps1") for path in paths):
         windows |= WINDOWS_PACKAGES & packages.keys()
+    # Native identity, route and PSK tests live in the portable core, rather
+    # than the Tauri shell. Exercise them whenever the Windows client is built.
+    if "orion" in windows and "orion-core" in packages:
+        windows.add("orion-core")
     return {
         "linux": " ".join(f"-p {name}" for name in sorted(linux)),
         "windows": " ".join(f"-p {name}" for name in sorted(windows)),

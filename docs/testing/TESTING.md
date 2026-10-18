@@ -19,6 +19,9 @@ tous les crates. Une modification documentaire seule ne lance aucun build.
 
 Linux joue Clippy strict et les tests des crates concernés, toutes features,
 sans le shell Tauri. Windows compile et teste les chemins Orion/Astra concernés.
+Le compagnon Astra est aussi relié explicitement au build d'Orion, qui le
+construit hors du graphe Cargo ; les tests natifs d'`orion-core` accompagnent
+toute compilation du client Windows.
 Les interfaces sont testées et construites quand leurs sources changent ; la
 console gateway est aussi construite quand les tests Rust doivent l'embarquer.
 Les audits se déclenchent sur modification des lockfiles. Cargo utilise deux

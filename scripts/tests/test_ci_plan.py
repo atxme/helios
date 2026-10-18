@@ -77,7 +77,7 @@ class SelectionTests(unittest.TestCase):
 
     def test_rust_shell_change_starts_windows_without_frontend_tests(self):
         result = self.select("apps/orion/src-tauri/src/lib.rs")
-        self.assertEqual(result["windows"], "-p orion")
+        self.assertEqual(result["windows"], "-p orion -p orion-core")
         self.assertFalse(result["linux"])
         self.assertFalse(result["orion_ui"])
 
@@ -101,6 +101,14 @@ class SelectionTests(unittest.TestCase):
 
     def test_powershell_change_keeps_windows_validation(self):
         self.assertIn("-p orion", self.select("scripts/deploy-app.ps1")["windows"])
+
+    def test_sidecar_change_covers_its_client_and_native_core_tests(self):
+        self.metadata["packages"].append(package(
+            "helios-astra-helper", "tools/helios-astra-helper", ["crates/aether"],
+        ))
+        result = self.select("tools/helios-astra-helper/src/owner.rs")
+        self.assertEqual(result["linux"], "-p helios-astra-helper")
+        self.assertEqual(result["windows"], "-p helios-astra-helper -p orion -p orion-core")
 
     def test_manual_and_ci_config_changes_exercise_all_checks(self):
         for result in [self.select(full=True), self.select(".github/workflows/regression.yml")]:
