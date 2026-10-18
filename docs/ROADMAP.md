@@ -47,7 +47,9 @@ résolus** dans les sources. Ils ne sont plus à corriger :
 | Cycle des certificats | `NEGOCIATION-DE-CLE-V5.md` annonçait le cycle absent | Le document dit « cycle complet implémenté » (en-tête et §21) ; aucune mention contraire |
 | Droits API | `SECURITY.md` disait que tout pair est administrateur | `SECURITY.md` décrit le drapeau `admin` par pair ; `helios-api/src/auth.rs` l'applique |
 | Secrets Orion | `SECURITY.md` disait un fichier local | `SECURITY.md` décrit le coffre HVLT (TPM puis DPAPI, mode dégradé explicite) |
-| VIP non réconciliée | Écart supposé avec `data_plane.rs` | `README.md` dit que l'adresse de `network.toml` fait autorité, comme le code. La discordance avec ADR-001 §4 reste traitée par D3 |
+| VIP non réconciliée | Écart supposé avec `data_plane.rs` | `README.md` dit que l'adresse de `network.toml` fait autorité, comme le code. ADR-001 §4 amendé en conséquence (ancien D3) |
+| ADR-001 §3 bis après T01 (ancien D2) | Texte en attente de décision | Amendé le 18 octobre : le tunnel complet est `0.0.0.0/0, ::/0`, l'invariante de cycle de vie couvre la liste entière |
+| ADR-001 §4, ADR-004 §5 (ancien D3) | Contredisaient l'IPAM unifié | Amendés le 18 octobre : la VIP est persistée dans `network.toml` et fait foi, la dérivation ne sert qu'à la choisir |
 | `from_peers(&[])` (ancien D4) | Table de pairs vide à l'enrôlement | Supprimé avec l'IPAM unifié (`26ac509`, 1er octobre) ; CRATE-REORGANIZATION §13.4 mis à jour |
 
 Les mentions prospectives de macOS (Keychain, cible Orion) ont été retirées
@@ -86,8 +88,6 @@ est bloqué ou risque d'être refait. Une décision ne se prend pas depuis le d�
 | # | Décision | Source | Débloque |
 | --- | --- | --- | --- |
 | D1 | **Compteur anti-rejeu** : fichier ou NV TPM (si NV TPM, validation matérielle requise) | ADR-002 amendement 2, ADR-006 « Rollback complet » | fichier de récupération WireGuard signé (F5) ; claim de fraîcheur des coffres |
-| D2 | Texte d'ADR-001 §3 bis après T01 (`::/0`) | ETUDE-IPV6 T01 | clôture de la fuite IPv6 côté ADR |
-| D3 | ADR-001 §4 et ADR-004 §5 contredisent l'IPAM unifié (à confirmer contre le code) | ETUDE-IPV6 T11 + T14 | mise en conformité ADR ↔ code |
 | D5 | **DNS des clients** non tunnelé, même avec `allow_client_internet` | README, `helios-firewall/src/ruleset.rs`, ADR-006 | confidentialité des noms résolus (F7) |
 | D6 | Activation de l'anti-spoof `fib` en multi-uplink / policy routing | FIREWALL-V2 « Capacités » | encodeur déjà livré |
 | D7 | Acceptation ICMPv6 Packet Too Big scopée par interface | FIREWALL-V2, ETUDE-IPV6 §9.1 | après observation V5 |
@@ -124,7 +124,7 @@ une distribution automatique de PSK sans l'avoir livrée.
 | --- | --- | --- | --- | --- |
 | F8 | **Rate limiting** et **logging borné** : ajouter `limit` au patch vendored de `rustables`, comme déjà fait pour `fib`, `objref` et `exthdr` | FIREWALL-V2 « Audit de `rustables` » | : | **Oui** (code), validation noyau en V5 |
 | F9 | Pairs Meshnet IPv6 : couvrir un préfixe global du lien WAN | ETUDE-IPV6 T06 | V4 | Code : **oui** ; validation : **non** (cible) |
-| F10 | Forwarding IPv6 choisi explicitement (phase 4) | ETUDE-IPV6 | V4, D2 | Code : **oui** ; validation : **non** (cible) |
+| F10 | Forwarding IPv6 choisi explicitement (phase 4) | ETUDE-IPV6 | V4 | Code : **oui** ; validation : **non** (cible) |
 
 ### Plateforme Orion
 
@@ -185,7 +185,7 @@ de générations ou de délégation :
 ```text
 Faisable maintenant (sans matériel)
   V2 banc netns · outillage headless Orion · T2 · T4 compilation · T5 · T6 mesure
-  D1, D2, D3, D5 à D8 arbitrages · F2 enrôlement · F3 revoked · F4 retrait classic
+  D1, D5 à D8 arbitrages · F2 enrôlement · F3 revoked · F4 retrait classic
   F6 nomade · F8 limit · F14 Astra · F15 reproductible
 
 Faisable en code, validation sur cible à planifier
