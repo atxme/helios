@@ -64,10 +64,10 @@ qui peut invalider une conception, ensuite ce qui valide du code existant.
 | # | Essai | Source | Faisable ici ? |
 | --- | --- | --- | --- |
 | V1 | **Renouvellement de PSK à chaud avec trafic actif**, via « Renouveler la clé maintenant », noyau Linux **et** WireGuard-NT, chemin sain puis dégradé | v5 §20.0, §12.3, `testing/TESTING.md` | **Non** : matériel requis (gateway physique, WAN réel) et cible requise (WireGuard-NT sur Windows) |
-| V2 | Banc netns reproductible (T22) | ETUDE-IPV6 T22 | **Oui** : pas de matériel, prépare V3 à V5 |
+| V2 | Banc netns reproductible (T22) — **livré** : `scripts/netns-bench.sh`, sans root, WSL2 compris | ETUDE-IPV6 T22, TESTING.md « Banc netns » | **Oui**. Premier passage : défaut T21 (rejet IPv6 non atteint avec `forwarding = 0`) |
 | V3 | Campagne v5 §20.2 : pose des slots, redémarrage `heliosd`, arrêt brutal client, `release` dans le tunnel, coupure WAN > 35 s et > 5 min | v5 §20.2 | **Non** : matériel requis (coupure WAN réelle) |
 | V4 | Campagne IPv6 (T23) et VM Windows (T01, T02, T18, T19) | ETUDE-IPV6 | **Non** : cible Windows et réseau réel |
-| V5 | Recette firewall : MSS, ICMPv6 PTB hors flux suivi, ND/RA/DHCPv6, atomicité | FIREWALL-V2 « Validation sur cible » | **Non** : cible requise (noyau Linux réel) |
+| V5 | Recette firewall : MSS, ICMPv6 PTB hors flux suivi, ND/RA/DHCPv6, atomicité | FIREWALL-V2 « Validation sur cible » | **En partie** : le banc netns exerce le noyau réel sur veth (ND, rejets, forward) ; RA/DHCPv6 d'un vrai FAI et NIC physique restent sur cible |
 | V6 | Certificats §14.2 : TPM, FIDO2 réel, cérémonie `GetAssertion` unique | ROTATION-CERTIFICATS §12.5, §14.2 | **Non** : matériel requis (TPM, clé FIDO2) |
 | V7 | Fenêtre de mise à jour TPM réelle, billets de rescellement | ADR-007, TESTING.md | **Non** : matériel requis (TPM) |
 
@@ -184,7 +184,7 @@ de générations ou de délégation :
 
 ```text
 Faisable maintenant (sans matériel)
-  V2 banc netns · outillage headless Orion · T2 · T4 compilation · T5 · T6 mesure
+  outillage headless Orion · T2 · T4 compilation · T5 · T6 mesure
   D1, D5 à D8 arbitrages · F2 enrôlement · F3 revoked · F4 retrait classic
   F6 nomade · F8 limit · F14 Astra · F15 reproductible
 

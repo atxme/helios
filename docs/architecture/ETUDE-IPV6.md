@@ -649,9 +649,11 @@ Tests à ajouter en priorité, parce qu'ils verrouillent des invariants :
 - config : un `network.toml` v4 existant se relit et se réécrit **à l'octet
   près** (tests de round-trip de `PersistedNetworkConfig`).
 
-Le banc netns n'existe pas encore dans le dépôt (aucune occurrence de
-`ip netns`/`unshare` dans `scripts/`). Il doit tourner sous Linux natif ou en
-VM, et être documenté dans `TESTING.md` comme ne prouvant pas le matériel.
+Le banc netns existe depuis le 18 octobre 2026 : `scripts/netns-bench.sh`
+(T22), documenté dans `TESTING.md` comme ne prouvant pas le matériel. Il tourne
+sans root dans un namespace utilisateur, y compris sous WSL2 : la réserve « pas
+WSL2 » ci-dessus ne vaut plus pour le noyau WSL2 actuel. Il couvre les
+scénarios 1, 3 à 8, 10, 14 et 16 ; 9, 12 et 15 restent à ajouter.
 
 ---
 
@@ -766,7 +768,8 @@ Avancement de `feature/support-ipv6`, suivi actualisé le 8 octobre 2026 :
 | Split-tunnel limité au LAN | fusionné : les contournements de split-tunnel portent `iifname <lan>` dans les deux familles, aucun sans interface LAN ; ni le tunnel ni un WAN ne les atteignent | cible : `nft list chain inet helios forward` |
 | Portail captif limité au LAN | fusionné : les ouvertures `forward` HTTP/HTTPS du portail portent `iifname <lan>`, aucune sans interface LAN ; `output` inchangé | cible : `nft list chain inet helios forward` en portail captif |
 | T15 | encodeur livré | MSS IPv4 = MTU − 40 et IPv6 = MTU − 60 ; `exthdr` dans le même batch atomique, chaîne `mss` avant filtrage, SYN/SYN-ACK traversant WireGuard seulement. IPv6 omis sous MTU 1280 ; ABI et rendu testés. Cible : réécriture, somme TCP, valeur déjà inférieure conservée |
-| T22, T23 | à faire | — |
+| T22 | fusionnable : `scripts/netns-bench.sh` | premier passage : rejet IPv6 de T21 jamais atteint avec `forwarding = 0` (TESTING.md, « Banc netns ») |
+| T23 | à faire | — |
 
 **T00 — Spécification A : modèle d'adressage IPv6**
 - Fichiers : [`docs/specification/ADRESSAGE-IPV6.md`](../specification/ADRESSAGE-IPV6.md), index `docs/README.md`.

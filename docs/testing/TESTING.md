@@ -504,6 +504,71 @@ développement et un point d'entrée pour la recette manuelle d'Orion — le pro
 Ce qu'il ne prouve pas : le plan de données. Le tunnel reste simulé, comme dans
 toute exécution `--dev`.
 
+**Limite connue, constatée le 18 octobre 2026 : le banc s'arrête à l'admission.**
+`helios peer add` sans certificats de négociation est refusé
+(`MissingNegotiationIdentity`, plancher `ml_kem`) depuis la spécification de
+rotation v5 (`a9f78a9`). Le banc n'a pas été adapté : il faut lui faire émettre
+les certificats TLS et PQ du client, ou admettre autrement. En attendant, il ne
+va pas au-delà de « Admission du client ».
+
+## Banc netns
+
+`scripts/netns-bench.sh` (ETUDE-IPV6 T22) éprouve le **plan de données réel**
+sans matériel : un `heliosd` construit avec `netlink,wireguard`, lancé **sans**
+`--dev`, face à un client WireGuard noyau piloté par `wg`. Trois network
+namespaces vivent dans un namespace utilisateur non privilégié
+(`unshare --user --map-root-user --net --mount`) : il ne faut ni root ni sudo,
+et rien ne survit à l'exécution.
+
+```text
+cl (client wg) ── veth ── net (routeur WAN, hôte « Internet ») ── veth ── gw (heliosd)
+```
+
+Contrairement à ce que ce document affirmait jusqu'ici, **WSL2 suffit** : son
+noyau (`6.18`, `CONFIG_WIREGUARD=m`, `CONFIG_NF_TABLES=y`, `CONFIG_NET_NS=y`)
+accepte veth, nftables et une interface WireGuard dans un netns utilisateur.
+Constaté le 18 octobre 2026.
+
+```sh
+bash scripts/netns-bench.sh
+```
+
+Le banc construit les binaires sous le budget Cargo partagé, puis joue, avec
+un verdict PASS ou FAIL par ligne :
+
+- démarrage de `heliosd` sur les backends réels, kill-switch posé avant le
+  réseau, table `inet helios` en politique `drop` ;
+- pair déclaré posé sur `helios0`, `AllowedIPs` = VIP `/32` + VIP `/128`, profil
+  émis portant les VIP persistées et aucune clé privée ;
+- handshake sur endpoint IPv4 puis IPv6, passage en `Up` sur preuve de
+  handshake ;
+- ETUDE-IPV6 §12 : IPv4 et IPv6 dans le tunnel, forward IPv4 vers Internet
+  (NAT44) en ICMP, TCP et UDP, rejet de l'IPv6 tunnel → WAN (T21),
+  anti-spoofing par `AllowedIPs`, résolution ND sous politique `drop` ;
+- arrêt : `heliosd` journalise l'arrêt fail-closed, la table survit et plus
+  rien ne sort vers Internet ;
+- aucune clé privée dans le journal du démon.
+
+Le pair est **déclaré dans `network.toml`**, pas admis par l'API : l'admission
+exige les certificats de négociation, dont la moitié gateway est scellée dans
+un TPM que le banc n'a pas. Le banc éprouve donc le plan de données, **pas**
+l'admission ni la négociation `ml_kem`. La clé de la gateway est la clé en clair
+héritée, comme dans `lab.sh`, et le TPM est désactivé.
+
+Non couverts : §12.9 (PMTU), §12.12 (DNS AAAA), §12.15 (`conntrack` absent de la
+machine), et tout ce qui demande du matériel ou WireGuard-NT. Le banc ne fait
+pas partie de `regression.sh`.
+
+**Défaut trouvé par le premier passage (18 octobre 2026) : le rejet IPv6 de T21
+n'est jamais atteint sur une gateway par défaut.** La règle
+`reject with icmpx admin-prohibited` vit dans `forward` (SORTIE-IPV6 §3.1). Avec
+`net.ipv6.conf.all.forwarding = 0`, valeur par défaut que Helios ne modifie pas,
+le noyau jette le paquet dans `ip6_forward` avant ce hook : le client attend son
+délai (3 s mesurées) au lieu de replier immédiatement sur l'IPv4. Aucune fuite :
+le paquet est perdu. Avec `forwarding = 1`, ou avec le même rejet placé en
+`prerouting` (`fib daddr type != local`), la réponse arrive en 6 ms. Le contrôle
+reste en FAIL tant que la correction n'est pas décidée.
+
 ## Campagne d'installation par bundle signé
 
 `scripts/campaign.sh` joue `scripts/bundle_campaign.py` après le provisioning et
