@@ -10,8 +10,9 @@
 #   bash scripts/lab.sh              # monte, éprouve, démonte
 #   bash scripts/lab.sh --keep       # laisse le banc vivant pour l'exploration
 #
-# Le profil produit est importable tel quel dans Orion : c'est le moyen le plus
-# court d'éprouver l'IHM du client contre une vraie gateway.
+# Le client est admis avec ses certificats de négociation TLS et PQ, émis par
+# une CA cliente jetable. Le profil produit est une invitation, sans clé
+# privée : il ne s'importe pas seul dans un Orion neuf.
 #
 # Rien n'est écrit hors du répertoire temporaire : ni /var/lib/helios, ni la
 # configuration de production.
@@ -108,58 +109,66 @@ for _ in $(seq 1 60); do
     sleep 0.5
 done
 
+echo "==> Certificats de négociation du client"
+# Admission requires the client's TLS and PQ key-negotiation certificates
+# (floor `ml_kem`): the classic path is refused. A throwaway client CA lives in
+# $TMP and disappears with the bench — it is never the operator's CA.
+cargo run --quiet -p helios -- key-nego init-client-ca \
+    --name lab-ca --output-dir "$TMP/client-ca" > /dev/null
+cargo run --quiet -p helios -- key-nego issue-client --name lab \
+    --ca-certificate "$TMP/client-ca/orion-client-ca.der" \
+    --ca-private-key "$TMP/client-ca/orion-client-ca-key.der" \
+    --ca-pq-private-key "$TMP/client-ca/orion-client-pq-ca-private.bin" \
+    --wireguard-public-key "$CLIENT_PUB" \
+    --output-dir "$TMP/client-cert" > "$TMP/issue-client.log"
+CLIENT_CERT_SHA256="$(sed -n 's/^sha256: //p' "$TMP/issue-client.log")"
+CLIENT_PQ_SHA256="$(sed -n 's/^PQ certificate sha256: //p' "$TMP/issue-client.log")"
+for v in CLIENT_CERT_SHA256 CLIENT_PQ_SHA256; do
+    [ -n "${!v}" ] || { echo "extraction de $v impossible" >&2; exit 1; }
+done
+
 echo "==> Admission du client"
 # En dry-run, la boucle locale vaut administrateur simulé : `peer add` emprunte
 # donc le même chemin API qu'un opérateur dans le tunnel.
 cargo run --quiet -p helios -- --url "$URL" peer add \
-    --name lab --public-key "$CLIENT_PUB" --admin
+    --name lab --public-key "$CLIENT_PUB" --admin \
+    --key-negotiation-certificate-sha256 "$CLIENT_CERT_SHA256" \
+    --key-negotiation-pq-certificate-sha256 "$CLIENT_PQ_SHA256" \
+    --certificate "$TMP/client-cert/orion-client-cert.der" \
+    --pq-certificate "$TMP/client-cert/orion-client-pq-cert.json"
 
-echo "==> Émission des profils client"
-# Deux profils, parce que les deux modes de l'ADR-004 §6 ne servent pas à la
-# même chose ici.
+echo "==> Émission du profil client"
+# Invitation (ADR-004 §6) : l'opérateur part de la clé PUBLIQUE et ne fabrique
+# aucun secret. Le pair étant déjà admis, l'outil réutilise son adresse au lieu
+# d'échouer. Ce profil n'est PAS importable seul : Orion y complète la clé
+# privée depuis le profil local de même nom.
 #
-# 1. Invitation — mode recommandé : l'opérateur part de la clé PUBLIQUE et ne
-#    fabrique aucun secret. Le pair étant déjà admis, l'outil réutilise son
-#    adresse au lieu d'échouer. Ce profil n'est PAS importable seul : Orion y
-#    complète la clé privée depuis le profil local de même nom.
+# Le mode assisté (`--with-private-key`) n'est plus joué : il admet un second
+# pair sans certificats de négociation, ce que le plancher `ml_kem` refuse
+# (TESTING.md, « Banc de développement »).
 cargo run --quiet -p helios -- --url "$URL" profile emit \
     --name lab --endpoint "$ENDPOINT" \
     --public-key "$CLIENT_PUB" \
     --output "$TMP/lab.invitation.orion"
 
-# 2. Assisté — l'opérateur génère la paire et livre un profil complet. C'est
-#    celui-là qu'on importe dans un Orion neuf pour éprouver l'IHM : il porte la
-#    clé privée, donc il fonctionne sans rien d'autre. Il admet un second pair.
-cargo run --quiet -p helios -- --url "$URL" profile emit \
-    --name lab-poste --endpoint "$ENDPOINT" \
-    --with-private-key \
-    --output "$TMP/lab-poste.orion"
-
-echo "==> Contrôle des profils émis"
-# Sans ce contrôle, le banc afficherait deux chemins sans jamais vérifier ce
-# qu'ils contiennent — et une régression de l'émission passerait inaperçue
-# jusqu'à un import manuel dans Orion.
-python3 - "$TMP/lab.invitation.orion" "$TMP/lab-poste.orion" <<'PY'
+echo "==> Contrôle du profil émis"
+# Sans ce contrôle, une régression de l'émission passerait inaperçue jusqu'à un
+# import manuel dans Orion.
+python3 - "$TMP/lab.invitation.orion" <<'PY'
 import json, sys
 
-invitation, complet = (json.load(open(p)) for p in sys.argv[1:3])
-for nom, doc in (("invitation", invitation), ("complet", complet)):
-    if doc.get("format") != "orion-profile" or doc.get("version") != 1:
-        raise SystemExit(f"ÉCHEC : en-tête inattendu dans le profil {nom} : {doc}")
-    profil = doc["profile"]
-    for champ in ("name", "endpoint", "peer_public_key", "address"):
-        if not profil.get(champ):
-            raise SystemExit(f"ÉCHEC : champ {champ} absent du profil {nom}")
-    if not profil["address"].endswith("/32"):
-        raise SystemExit(f"ÉCHEC : VIP sans /32 dans le profil {nom}")
-
-if "private_key" in invitation["profile"]:
+doc = json.load(open(sys.argv[1]))
+if doc.get("format") != "orion-profile" or doc.get("version") != 1:
+    raise SystemExit(f"ÉCHEC : en-tête inattendu dans le profil : {doc}")
+profil = doc["profile"]
+for champ in ("name", "endpoint", "peer_public_key", "address"):
+    if not profil.get(champ):
+        raise SystemExit(f"ÉCHEC : champ {champ} absent du profil")
+if not profil["address"].endswith("/32"):
+    raise SystemExit("ÉCHEC : VIP sans /32 dans le profil")
+if "private_key" in profil:
     raise SystemExit("ÉCHEC : le profil d'invitation porte une clé privée")
-if not complet["profile"].get("private_key"):
-    raise SystemExit("ÉCHEC : le profil assisté n'est pas importable tel quel")
-if invitation["profile"]["peer_public_key"] != complet["profile"]["peer_public_key"]:
-    raise SystemExit("ÉCHEC : les deux profils annoncent des gateways différentes")
-print("    ok — invitation sans secret, profil assisté importable")
+print("    ok — invitation sans secret")
 PY
 
 echo "==> Campagne de bout en bout"
@@ -183,18 +192,16 @@ echo "  Banc opérationnel."
 echo
 echo "  API gateway       $URL"
 echo "  Clé publique      $GW_PUB"
-echo "  Profil importable $TMP/lab-poste.orion"
 echo "  Profil invitation $TMP/lab.invitation.orion    (sans secret)"
 echo
 if [ "$KEEP" = "1" ]; then
     echo "  Le daemon reste en vie (PID $DAEMON_PID)."
     echo
-    echo "  Importer lab-poste.orion dans Orion, ou explorer :"
+    echo "  Explorer :"
     echo "    cargo run -p helios -- --url $URL status"
     echo "    cargo run -p helios -- --url $URL peer list"
     echo "    cargo run -p helios -- --url $URL watch"
     echo
-    echo "  lab-poste.orion porte une clé privée : il disparaît avec le banc."
     echo "  Pour arrêter et tout effacer :"
     echo "    kill $DAEMON_PID && rm -rf $TMP"
 else

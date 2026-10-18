@@ -486,30 +486,33 @@ marqueur disque — sans prétendre mesurer Secure Boot ni les PCR d'une cible.
 ## Banc de développement
 
 `scripts/lab.sh` monte un environnement complet — gateway `--dev` isolée, client
-admis par l'API, profils émis, campagne jouée — puis le démonte. `--keep` laisse
+admis par l'API, profil émis, campagne jouée — puis le démonte. `--keep` laisse
 le daemon vivant pour l'exploration manuelle.
 
-Il emprunte les **mêmes outils qu'un opérateur** (`helios peer add`,
-`helios profile emit`) plutôt qu'un chemin de test parallèle : une régression
-de l'outillage d'exploitation y tombe immédiatement. Il contrôle aussi la forme
-des deux profils émis — l'invitation ne doit porter aucun secret, le profil
-assisté doit être importable tel quel.
+Il emprunte les **mêmes outils qu'un opérateur** (`helios key-nego`,
+`helios peer add`, `helios profile emit`) plutôt qu'un chemin de test
+parallèle : une régression de l'outillage d'exploitation y tombe
+immédiatement. Le client est admis au plancher `ml_kem` avec ses certificats de
+négociation TLS et PQ, émis par une CA cliente jetable créée dans le répertoire
+temporaire. Le banc contrôle aussi que le profil d'invitation ne porte aucun
+secret.
 
 Il ne fait **pas** partie de `regression.sh` : la régression vérifie des
 invariants, elle ne lance pas d'environnements. Le banc est un outil de
-développement et un point d'entrée pour la recette manuelle d'Orion — le profil
-`lab-poste.orion` s'importe directement dans le client
-([MANUAL-TESTING.md](MANUAL-TESTING.md)).
+développement.
 
 Ce qu'il ne prouve pas : le plan de données. Le tunnel reste simulé, comme dans
-toute exécution `--dev`.
+toute exécution `--dev` ; le banc netns ci-dessous couvre ce manque.
 
-**Limite connue, constatée le 18 octobre 2026 : le banc s'arrête à l'admission.**
-`helios peer add` sans certificats de négociation est refusé
-(`MissingNegotiationIdentity`, plancher `ml_kem`) depuis la spécification de
-rotation v5 (`a9f78a9`). Le banc n'a pas été adapté : il faut lui faire émettre
-les certificats TLS et PQ du client, ou admettre autrement. En attendant, il ne
-va pas au-delà de « Admission du client ».
+**Le banc a été cassé du 6 août au 18 octobre 2026.** Depuis la
+spécification de rotation v5 (`a9f78a9`), `helios peer add` sans certificats de
+négociation est refusé (`MissingNegotiationIdentity`) et le banc s'arrêtait à
+l'admission. Il émet désormais les certificats du client. Le mode assisté
+d'ADR-004 §6 (`profile emit --with-private-key`) n'y est plus joué : il admet
+un nouveau pair sans identité de négociation, ce que le serveur refuse
+toujours. `profile emit` ne sert donc plus, pour un nouveau client, qu'à
+réémettre le profil d'un pair déjà admis : c'est un écart entre ADR-004 §6 et
+le code, ouvert.
 
 ## Banc netns
 

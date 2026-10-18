@@ -428,9 +428,12 @@ la décision ADR-004 de basculer le privilège réseau vers polkit.
 ### Le chemin court : un profil venu d'une vraie gateway
 
 `bash scripts/lab.sh --keep` monte une gateway de développement, admet un client
-et émet deux profils. Importer `lab-poste.orion` : il porte tout ce qu'il faut et
-son pair est réellement admis, ce que des clés fabriquées à la main ne
-garantissent pas.
+et émet son profil d'invitation `lab.invitation.orion`. Le profil assisté
+`lab-poste.orion`, qui portait tout ce qu'il fallait pour un Orion neuf, n'est
+plus produit depuis le 18 octobre 2026 : son émission admet un nouveau pair
+sans certificats de négociation, ce que le plancher `ml_kem` refuse
+([TESTING](TESTING.md#banc-de-développement)). Tant que cet écart avec ADR-004
+§6 n'est pas tranché, ce chemin court n'existe plus pour un Orion neuf.
 
 Vérifier ensuite, dans l'onglet **Profils** :
 
