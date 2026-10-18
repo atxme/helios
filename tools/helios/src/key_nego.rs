@@ -507,6 +507,58 @@ pub fn load_client_material(directory: &Path) -> Result<ClientMaterial> {
     })
 }
 
+/// The fingerprints an admission records, from what `peer add` was given.
+///
+/// A leaf's fingerprint is computed the canonical way, as `issue-client`
+/// prints it; a stated fingerprint without its leaf is kept as stated. When
+/// both are given they must agree: recording a digest that names another
+/// leaf would admit a client that can never negotiate, and the refusal would
+/// only come at its first connection.
+pub fn admission_fingerprints(
+    stated_tls: Option<String>,
+    stated_pq: Option<String>,
+    tls_certificate_der: Option<&[u8]>,
+    pq_certificate_json: Option<&[u8]>,
+) -> Result<(Option<String>, Option<String>)> {
+    let derived_tls = tls_certificate_der.map(aether_key_negotiation::certificate_fingerprint_der);
+    let derived_pq = pq_certificate_json
+        .map(|json| -> Result<String> {
+            let certificate: PqCertificate = serde_json::from_slice(json)
+                .context("the client PQ certificate is not a readable JSON document")?;
+            Ok(certificate.fingerprint()?)
+        })
+        .transpose()?;
+    Ok((
+        agree(
+            "--key-negotiation-certificate-sha256",
+            "--certificate",
+            stated_tls,
+            derived_tls,
+        )?,
+        agree(
+            "--key-negotiation-pq-certificate-sha256",
+            "--pq-certificate",
+            stated_pq,
+            derived_pq,
+        )?,
+    ))
+}
+
+fn agree(
+    stated_flag: &str,
+    leaf_flag: &str,
+    stated: Option<String>,
+    derived: Option<String>,
+) -> Result<Option<String>> {
+    match (stated, derived) {
+        (Some(stated), Some(derived)) if stated.trim() != derived => anyhow::bail!(
+            "{stated_flag} does not match the leaf given by {leaf_flag} ({derived}): \
+             one of them names another certificate"
+        ),
+        (stated, derived) => Ok(derived.or(stated)),
+    }
+}
+
 /// The default-validity wrapper. Only the tests below reach it: the command
 /// line always passes a validity, so gating it keeps the binary from carrying
 /// a function nothing calls.
@@ -935,5 +987,69 @@ mod tests {
         let second = random_serial().unwrap();
         assert_ne!(first, second);
         assert!(unix_time_now().unwrap() > 1_700_000_000);
+    }
+
+    /// `peer add --certificate --pq-certificate` admits with the fingerprints
+    /// of the leaves it is given: stated ones are kept, missing ones are
+    /// derived the canonical way, and a stated one that names another leaf
+    /// is refused rather than recorded.
+    #[test]
+    fn admission_fingerprints_are_derived_from_the_leaves_and_must_agree() {
+        let root = test_directory("admission-fingerprints");
+        let ca = root.join("ca");
+        let client = root.join("client");
+        init_client_ca("Orion test CA", &ca).expect("create client CA");
+        issue_client(
+            "portable",
+            &aether::wg::generate_keypair().unwrap().public_key,
+            &ca.join(CA_CERTIFICATE_FILE),
+            &ca.join(CA_PRIVATE_KEY_FILE),
+            &ca.join(PQ_CA_PRIVATE_KEY_FILE),
+            &client,
+        )
+        .expect("issue client identity");
+        let issued = load_client_material(&client).unwrap();
+        let leaves = (
+            Some(issued.certificate_der.as_slice()),
+            Some(issued.pq_certificate_json.as_slice()),
+        );
+
+        let derived = admission_fingerprints(None, None, leaves.0, leaves.1).unwrap();
+        assert_eq!(
+            derived,
+            (
+                Some(issued.certificate_sha256.clone()),
+                Some(issued.pq_certificate_sha256.clone())
+            )
+        );
+
+        let stated = admission_fingerprints(
+            Some(issued.certificate_sha256.clone()),
+            Some(issued.pq_certificate_sha256.clone()),
+            leaves.0,
+            leaves.1,
+        )
+        .unwrap();
+        assert_eq!(stated, derived);
+
+        let alone = admission_fingerprints(Some("aa".repeat(32)), None, None, None).unwrap();
+        assert_eq!(alone, (Some("aa".repeat(32)), None));
+
+        let error = admission_fingerprints(Some("aa".repeat(32)), None, leaves.0, None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("--key-negotiation-certificate-sha256"),
+            "{error}"
+        );
+        let error = admission_fingerprints(None, Some("bb".repeat(32)), None, leaves.1)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("--key-negotiation-pq-certificate-sha256"),
+            "{error}"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

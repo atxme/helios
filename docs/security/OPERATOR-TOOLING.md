@@ -269,6 +269,13 @@ helios peer add --name portable \
   --minimum-mode ml-kem
 ```
 
+Les empreintes peuvent aussi venir des feuilles elles-mêmes :
+`--certificate ./portable-key-nego/orion-client-cert.der` et
+`--pq-certificate ./portable-key-nego/orion-client-pq-cert.json` suffisent,
+`peer add` en calcule les empreintes canoniques. Données en plus, les deux
+formes doivent concorder : une empreinte qui désigne une autre feuille est
+refusée plutôt qu'enregistrée.
+
 Sans `--minimum-mode`, la présence de l'empreinte PQ choisit déjà `ml-kem`.
 L'option explicite rend la politique visible dans les scripts. Une
 renégociation réseau vers `static_psk` ou `classic` sera ensuite refusée.

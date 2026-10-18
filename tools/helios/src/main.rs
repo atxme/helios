@@ -340,9 +340,13 @@ enum PeerCmd {
         #[arg(long)]
         admin: bool,
         /// SHA-256 fingerprint of the client's key-negotiation certificate.
+        /// Derived from `--certificate` when absent; must match it when both
+        /// are given.
         #[arg(long)]
         key_negotiation_certificate_sha256: Option<String>,
         /// SHA-256 fingerprint of the client's ML-DSA-87 certificate.
+        /// Derived from `--pq-certificate` when absent; must match it when
+        /// both are given.
         #[arg(long)]
         key_negotiation_pq_certificate_sha256: Option<String>,
         /// The client's TLS leaf, DER — the file `key-nego issue-client` wrote.
@@ -689,10 +693,13 @@ fn ensure_command(response: CmdResp, action: &str) -> Result<()> {
 /// A path rather than a value on the command line: `ps` shows every process's
 /// argv, and a certificate pasted there is one more place an operator can put
 /// the wrong bytes without noticing.
-fn read_base64(path: PathBuf) -> Result<String> {
+fn read_file(path: PathBuf) -> Result<Vec<u8>> {
+    std::fs::read(&path).with_context(|| format!("reading {}", path.display()))
+}
+
+fn encode_base64(bytes: Vec<u8>) -> String {
     use base64::Engine as _;
-    let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-    Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+    base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
 fn check_allowed_ips(value: Option<String>) -> Result<Option<String>> {
@@ -805,8 +812,17 @@ async fn execute_command(api: &transport::Api, command: Cmd) -> Result<()> {
                 pq_certificate,
                 minimum_mode,
             } => {
-                let certificate = certificate.map(read_base64).transpose()?;
-                let pq_certificate = pq_certificate.map(read_base64).transpose()?;
+                let certificate = certificate.map(read_file).transpose()?;
+                let pq_certificate = pq_certificate.map(read_file).transpose()?;
+                let (key_negotiation_certificate_sha256, key_negotiation_pq_certificate_sha256) =
+                    key_nego::admission_fingerprints(
+                        key_negotiation_certificate_sha256,
+                        key_negotiation_pq_certificate_sha256,
+                        certificate.as_deref(),
+                        pq_certificate.as_deref(),
+                    )?;
+                let certificate = certificate.map(encode_base64);
+                let pq_certificate = pq_certificate.map(encode_base64);
                 let minimum_mode = minimum_mode.map(Into::into).unwrap_or_else(|| {
                     if key_negotiation_pq_certificate_sha256.is_some() {
                         aether::key_negotiation::ProtectionMode::MlKem
