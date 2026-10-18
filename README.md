@@ -65,7 +65,7 @@ WebKitGTK 4.1 et GTK3 (`scripts/setup-dev.sh`).
 ```sh
 cargo build
 cargo test --workspace --all-features
-bash scripts/regression.sh             # campagne complète locale et CI
+bash scripts/regression.sh             # campagne complète locale
 
 # Développement local
 cargo run -p heliosd -- run --dev      # gateway en simulation

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Vérifications rapides communes aux pull requests et à la campagne complète.
+# Socle local de la campagne complète ; la CI utilise des contrôles ciblés.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

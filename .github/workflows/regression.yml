@@ -1,20 +1,12 @@
 name: Régression
 
-# Les pull requests jouent le socle rapide ; `main` et les lancements manuels
-# jouent la campagne complète, dont les audits et couvertures coûteux. Tous les
-# jobs Rust de validation utilisent explicitement le MSRV 1.95.0.
-# `bash scripts/regression.sh` reste la référence locale de cette campagne.
-#
-# `workflow_dispatch` reste ouvert à toutes les branches : une campagne à la
-# demande sur une branche de travail est possible, elle n'est simplement plus
-# automatique.
+# La CI valide les composants touchés et leurs dépendants. Les campagnes
+# scripts/regression.sh et scripts/coverage.sh restent des validations locales.
 on:
   push:
-    branches:
-      - main
+    branches: [main]
   pull_request:
-    branches:
-      - main
+    branches: [main]
   workflow_dispatch:
 
 concurrency:
@@ -24,53 +16,69 @@ concurrency:
 permissions:
   contents: read
 
-jobs:
-  fast-check:
-    if: github.event_name == 'pull_request'
-    name: Vérifications rapides
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - name: Toolchain Rust 1.95.0 (MSRV)
-        uses: dtolnay/rust-toolchain@1.95.0
-        with:
-          components: rustfmt, clippy
-      # Cache Rust standard : registre, dépendances git et artefacts de build.
-      # Le toolchain et le job distinguent naturellement Linux et Windows.
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          cache: npm
-          cache-dependency-path: |
-            web/package-lock.json
-            apps/orion/package-lock.json
-      - name: Dépendances système de Tauri et TPM
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libtss2-dev libudev-dev
-      - name: Audit des dépendances Rust (Cargo.lock)
-        run: |
-          if ! command -v cargo-audit >/dev/null 2>&1; then
-            cargo install cargo-audit --version 0.22.2 --locked
-          fi
-          # cargo-audit inspecte directement le lockfile et ne fournit pas
-          # d'option `--locked` dans sa CLI.
-          cargo audit --file Cargo.lock
-      - name: Vérifications rapides
-        run: bash scripts/check.sh
+env:
+  CARGO_BUILD_JOBS: 2
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
 
-  regression:
-    if: github.event_name != 'pull_request'
-    name: Tests de non-régression complets
+jobs:
+  changes:
+    name: Sélection des contrôles
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      linux: ${{ steps.plan.outputs.linux }}
+      windows: ${{ steps.plan.outputs.windows }}
+      aether: ${{ steps.plan.outputs.aether }}
+      embed_web: ${{ steps.plan.outputs.embed_web }}
+      web: ${{ steps.plan.outputs.web }}
+      orion_ui: ${{ steps.plan.outputs.orion_ui }}
+      audit: ${{ steps.plan.outputs.audit }}
+      checks: ${{ steps.plan.outputs.checks }}
     steps:
       - uses: actions/checkout@v4
-      - name: Toolchain Rust 1.95.0 (MSRV)
-        uses: dtolnay/rust-toolchain@1.95.0
         with:
-          components: llvm-tools-preview, rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+          fetch-depth: 0
+      - name: Composants et dépendants modifiés
+        id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          PUSH_BASE: ${{ github.event.before }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          args=()
+          if [ "$EVENT" = pull_request ]; then
+            args=(--base "$(git merge-base "$PR_BASE" HEAD)")
+          elif [ "$EVENT" = push ] && [[ "$PUSH_BASE" =~ ^[0-9a-f]{40}$ ]] && [[ "$PUSH_BASE" =~ [1-9a-f] ]]; then
+            args=(--base "$PUSH_BASE")
+          fi
+          python3 scripts/ci-plan.py "${args[@]}" --output "$GITHUB_OUTPUT"
+
+  checks:
+    name: Format et tests des scripts
+    needs: changes
+    if: needs.changes.outputs.checks == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: rustfmt
+      - run: cargo fmt --check
+      - run: python3 -m unittest discover -s scripts/tests
+        env:
+          PYTHONDONTWRITEBYTECODE: 1
+
+  frontend:
+    name: Interfaces web
+    needs: changes
+    if: needs.changes.outputs.web == 'true' || needs.changes.outputs.orion_ui == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 24
@@ -78,76 +86,116 @@ jobs:
           cache-dependency-path: |
             web/package-lock.json
             apps/orion/package-lock.json
-      - name: Dépendances système de Tauri et TPM
+      - name: Console gateway
+        if: needs.changes.outputs.web == 'true'
+        run: |
+          npm ci --prefix web --no-audit --no-fund
+          npm run test:unit --prefix web
+          npm run build --prefix web
+      - name: Interface Orion
+        if: needs.changes.outputs.orion_ui == 'true'
+        run: |
+          npm ci --prefix apps/orion --no-audit --no-fund
+          npm run test:unit --prefix apps/orion
+          npm run build --prefix apps/orion
+
+  rust-linux:
+    name: Rust Linux — composants concernés
+    needs: changes
+    if: needs.changes.outputs.linux != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      PACKAGES: ${{ needs.changes.outputs.linux }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-ci
+          cache-on-failure: true
+      - name: Dépendances natives Linux (sans WebKitGTK)
         run: |
           sudo apt-get update
-          sudo apt-get install --yes libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libtss2-dev libudev-dev
-      - name: Outil d'audit Rust
-        run: |
-          if ! command -v cargo-audit >/dev/null 2>&1; then
-            cargo install cargo-audit --version 0.22.2 --locked
-          fi
-      - name: Campagne de régression
-        run: bash scripts/regression.sh
-      - name: Outil de couverture Rust
-        run: |
-          if ! command -v cargo-llvm-cov >/dev/null 2>&1; then
-            cargo install cargo-llvm-cov --locked
-          fi
-      - name: Couverture Linux complète
-        run: bash scripts/coverage.sh
-      - name: Rapports de couverture Linux
-        if: always()
-        uses: actions/upload-artifact@v4
+          sudo apt-get install --yes --no-install-recommends libtss2-dev libudev-dev libclang-dev
+      - uses: actions/setup-node@v4
+        if: needs.changes.outputs.embed_web == 'true'
         with:
-          name: coverage-linux
-          path: target/coverage
-          if-no-files-found: warn
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Interface embarquée pour les tests API
+        if: needs.changes.outputs.embed_web == 'true'
+        run: |
+          npm ci --prefix web --no-audit --no-fund
+          npm run build --prefix web
+      - name: Clippy et tests des composants concernés
+        run: |
+          read -r -a packages <<< "$PACKAGES"
+          cargo clippy --locked "${packages[@]}" --all-targets --all-features -- -D warnings
+          cargo test --locked "${packages[@]}" --all-features
+      - name: Contrat aether sans feature de signature
+        if: needs.changes.outputs.aether == 'true'
+        run: cargo test --locked -p aether --lib
 
   orion-windows:
     name: Orion et Astra — sécurité Windows
+    needs: changes
+    if: needs.changes.outputs.windows != ''
     runs-on: windows-2025
+    timeout-minutes: 25
+    env:
+      PACKAGES: ${{ needs.changes.outputs.windows }}
     steps:
       - uses: actions/checkout@v4
-      - name: Toolchain Rust 1.95.0 (MSRV)
-        uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.95.0
         with:
-          components: llvm-tools-preview, clippy
+          components: clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows-ci
+          cache-on-failure: true
       - uses: actions/setup-node@v4
         with:
           node-version: 24
           cache: npm
           cache-dependency-path: apps/orion/package-lock.json
       - name: Dépendances Orion
-        run: npm ci --prefix apps/orion
-      - name: Tests et build de l'IHM
-        run: |
-          npm run test:unit --prefix apps/orion
-          npm run build --prefix apps/orion
+        run: npm ci --prefix apps/orion --no-audit --no-fund
       - name: Validation des scripts PowerShell Windows
         shell: pwsh
         run: |
           Get-Command .\scripts\deploy-app.ps1 -Syntax | Out-Null
           Get-Command .\scripts\setup-orion-signing.ps1 -Syntax | Out-Null
-      - name: Analyse statique des chemins Windows
-        run: cargo clippy -p aether-fido -p orion-core -p orion -p astra-signer --all-targets --all-features -- -D warnings
-      - name: Tests du compagnon Astra sous Windows
-        run: cargo test -p aether-fido -p astra-signer --all-features
-      - name: Tests et couverture Orion sous Windows
-        if: github.event_name != 'pull_request'
+      - name: Clippy des chemins Windows concernés
         shell: pwsh
         run: |
-          if (-not (Get-Command cargo-llvm-cov -ErrorAction SilentlyContinue)) {
-            cargo install cargo-llvm-cov --locked
-          }
-          New-Item -ItemType Directory -Force target/coverage | Out-Null
-          cargo llvm-cov --package orion-core --package orion --all-features --json --output-path target/coverage/orion-windows.json
-          cargo llvm-cov report --html --output-dir target/coverage/orion-windows-html
-      - name: Rapport de couverture Windows
-        if: always() && github.event_name != 'pull_request'
-        uses: actions/upload-artifact@v4
+          $packages = $env:PACKAGES -split ' '
+          cargo clippy --locked @packages --all-targets --all-features -- -D warnings
+      - name: Tests des chemins Windows concernés
+        shell: pwsh
+        run: |
+          $packages = $env:PACKAGES -split ' '
+          cargo test --locked @packages --all-features
+
+  audit:
+    name: Audit des dépendances
+    needs: changes
+    if: needs.changes.outputs.audit == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
         with:
-          name: coverage-orion-windows
-          path: target/coverage
-          if-no-files-found: warn
+          shared-key: audit
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: cargo install cargo-audit --version 0.22.2 --locked
+      - run: cargo audit --file Cargo.lock
+      - run: npm audit --prefix web --audit-level=moderate
+      - run: npm audit --prefix apps/orion --audit-level=moderate

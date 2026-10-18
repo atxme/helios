@@ -151,6 +151,9 @@ jobs:
   bundle:
     name: Assemblage du bundle gateway
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: 2
     steps:
       - uses: actions/checkout@v4
 
@@ -164,7 +167,7 @@ jobs:
       - name: Dépendances système des features matérielles
         run: |
           sudo apt-get update
-          sudo apt-get install --yes libnftnl-dev libmnl-dev libtss2-dev
+          sudo apt-get install --yes libnftnl-dev libmnl-dev libtss2-dev libudev-dev
 
       # Le trousseau **public** de l'éditeur n'est pas un secret : c'est l'ancre
       # de confiance compilée dans le binaire. Il est fourni en variable de
