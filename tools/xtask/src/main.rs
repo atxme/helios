@@ -841,42 +841,44 @@ mod tests {
     }
 
     #[test]
-    fn the_regression_workflow_executes_and_measures_orion_on_windows() {
+    fn the_regression_workflow_checks_and_tests_orion_on_windows() {
         let workflow = std::fs::read_to_string(
             workspace_root()
                 .unwrap()
                 .join(".github/workflows/regression.yml"),
         )
         .expect("the regression workflow must exist");
+        let windows_job = workflow
+            .split("  orion-windows:\n")
+            .nth(1)
+            .expect("the Windows job must exist")
+            .split("\n  audit:")
+            .next()
+            .unwrap();
 
         for required in [
-            "orion-windows:",
             "runs-on: windows-2025",
             "Get-Command .\\scripts\\deploy-app.ps1 -Syntax",
-            "cargo clippy",
-            "cargo llvm-cov --package orion-core --package orion --all-features",
-            "coverage-orion-windows",
+            "needs.changes.outputs.windows",
+            "cargo clippy --locked @packages --all-targets --all-features -- -D warnings",
+            "cargo test --locked @packages --all-features",
         ] {
             assert!(
-                workflow.contains(required),
+                windows_job.contains(required),
                 "Windows security regression is missing `{required}`"
             );
         }
 
-        // The packages, not the exact command line. Pinning the whole
-        // invocation made the test fail the day `astra-signer` was added to
-        // it — a legitimate widening, since its WebAuthn transport only
-        // compiles on Windows and that job is the only place it is linted.
-        // What matters is that each package is covered, not the order or the
-        // presence of others.
-        let clippy = workflow
-            .lines()
-            .find(|line| line.contains("cargo clippy"))
-            .expect("the Windows job must run clippy");
-        for package in ["-p orion-core", "-p orion ", "-p astra-signer"] {
+        // Full campaigns and coverage remain local: CI retains the native
+        // checks without recompiling the workspace for instrumentation.
+        for expensive in [
+            "cargo llvm-cov",
+            "run: bash scripts/regression.sh",
+            "run: bash scripts/coverage.sh",
+        ] {
             assert!(
-                clippy.contains(package),
-                "the Windows clippy job must cover `{package}`: {clippy}"
+                !workflow.contains(expensive),
+                "the CI must keep full local campaigns out of its jobs: {expensive}"
             );
         }
     }
