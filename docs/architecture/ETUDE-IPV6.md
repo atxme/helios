@@ -745,7 +745,7 @@ Avancement de `feature/support-ipv6`, suivi actualisé le 8 octobre 2026 :
 | Ticket | État | Reste à faire |
 | --- | --- | --- |
 | T00 | spécification validée le 1er octobre 2026, avec l'IPAM unifié (§3 bis) | — |
-| T01 | fusionné | VM Windows : `::/0` posé, `curl -6` bloqué ; texte ADR-001 §3 bis en attente de décision |
+| T01 | fusionné | VM Windows : `::/0` posé, `curl -6` bloqué ; ADR-001 §3 bis amendé le 2026-10-18 |
 | T02 | fusionné | VM Windows : absence de faux positif, détection, fuite réelle |
 | T03 + T04 | fusionnés | cible : batch accepté, NAT44 inchangé |
 | T05 | fusionné | cible : ND `untracked`, voisins et route par défaut IPv6 stables, renouvellement DHCPv6 |
@@ -754,7 +754,7 @@ Avancement de `feature/support-ipv6`, suivi actualisé le 8 octobre 2026 :
 | T09 | fusionné | `heliosd run` refuse désormais une `wg_address` sans hôte IPv4 au lieu de basculer sur loopback |
 | T07 | fusionné | — |
 | T10 | fusionné ; commande livrée | `heliosd init-ipv6-prefix` génère et persiste un ULA une fois ; une répétition conserve le fichier. Changer `wg_address_v6` reste refusé à chaud (API 409) et exige un redémarrage |
-| T11 + T14 | fusionnés (IPAM unifié) | ADR-001 §4 et ADR-004 §5 contredisent désormais le code (décision opérateur) ; projection de `address_v6` livrée par T12/T13 |
+| T11 + T14 | fusionnés (IPAM unifié) | ADR-001 §4 et ADR-004 §5 amendés le 2026-10-18 pour décrire l'IPAM unifié ; projection de `address_v6` livrée par T12/T13 |
 | T12 + T13 | fusionnés, chemins dégradés revus | échec de la seconde montée IPv4 couvert en simulation, avec les deux causes conservées et le kill-switch engagé. Cible : adresse sur `helios0`, routes et règle `ip -6`, MTU, `disable_ipv6`, coexistence NordVPN/Tailscale et `ping -6` |
 | T16 | couvert par T08 et T10 | une source IPv6 native n'est jamais un appelant ; `address_v6` exposée dans la vue redigée |
 | T17 | fusionné | cible : `ss -ulpn` montre `[::]`, client IPv6 seul, repli `ipv6.disable=1` |

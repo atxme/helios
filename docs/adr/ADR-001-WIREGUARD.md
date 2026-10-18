@@ -64,6 +64,9 @@ On bascule sur WireGuard. Cinq points structurent la bascule.
 > | Windows | `WGApi<Kernel>`    | pilote noyau `wireguard-nt` |
 > | macOS   | `WGApi<Userspace>` | BoringTun embarqué |
 >
+> La ligne macOS décrit ce que le crate propose, pas une cible : macOS est hors
+> périmètre d'Orion (décision du 18 octobre 2026).
+>
 > **Conséquence sur l'argumentaire d'origine** : la promesse « isolation à 100 %
 > en user-space, aucun risque de BSOD » tombe pour Windows. Elle était de toute
 > façon intenable — Wintun est lui-même un pilote NDIS noyau (voir les notes de
@@ -263,6 +266,32 @@ BoringTun. D'où l'invariante :
 > ni en `Failed`, ni après N tentatives. Il n'est retiré que sur **déconnexion
 > explicite de l'utilisateur** ou fermeture de l'application.
 
+> **Amendement du 18 octobre 2026 — l'invariante couvre `::/0` (T01, T02).**
+> Une capture limitée à `0.0.0.0/0` laisse l'IPv6 sortir en clair **tunnel
+> monté**, sans aucune panne : ce n'est pas un repli, c'est une fuite
+> permanente sur tout réseau dual-stack. Le tunnel complet est donc
+> `AllowedIPs = 0.0.0.0/0, ::/0`, valeur par défaut d'Orion
+> (`orion-core::config::DEFAULT_ALLOWED_IPS`) et de l'éditeur de split-tunnel.
+> L'invariante ci-dessus s'applique à cette liste entière. Même sans VIP IPv6,
+> `::/0` est capturé puis rejeté côté gateway (ICMPv6 « admin-prohibited »,
+> aucun NAT66 — T21) : le trafic IPv6 est perdu, pas exposé.
+>
+> - **Profils existants.** Un profil enregistré avec `0.0.0.0/0` seul n'est
+>   jamais réécrit : Orion et `helios` le signalent « tunnel complet IPv4
+>   seulement, l'IPv6 sort en clair » et laissent l'utilisateur choisir
+>   « Tout ». Réécrire en silence une politique de routage choisie serait une
+>   seconde vérité.
+> - **Préfixe demandé mais non posé.** Le pilote peut accepter `::/0` sans
+>   qu'aucune route `::/0` ne passe par l'adaptateur (IPv6 désactivé sur
+>   l'interface, voir [ETUDE-IPV6 §8.2](../architecture/ETUDE-IPV6.md#82-orion)).
+>   Orion relit la configuration du pilote **et** la table de routage de
+>   l'adaptateur ; un préfixe manquant est un état explicite et visible, sans
+>   démonter l'adaptateur (T02), ce qui préserve l'invariante.
+>
+> Validé sur VM Windows dual-stack (T01 : `curl -6` bloqué tunnel monté ;
+> T02 : détection sans faux positif). La validation sur poste réel reste celle de
+> la campagne IPv6 (T23).
+
 Avec cette règle, **le drop natif de WireGuard devient le kill-switch** : pas de
 WFP, pas de sublayers, pas de BFE, pas de filtres au boot. Une discipline de
 cycle de vie dans `orion-core`, contrainte directement par la machine à états de
@@ -442,6 +471,35 @@ reconnexion pouvant différer.
 > recherché, c'est **aucun état d'adressage persistant sur disque** — pas de SQL,
 > pas de fichier, rien à sauvegarder, rien à corrompre, rien à migrer.
 
+> **Amendement du 18 octobre 2026 — la VIP est persistée, la dérivation ne
+> sert qu'à la choisir.** L'IPAM unifié (T11 + T14, fusionné le 1er octobre
+> 2026, `26ac509`) remplace « le déterminisme remplace la persistance » et la
+> « conséquence assumée » ci-dessus. Le constat qui l'impose : le provisioning
+> re-dérivait la VIP contre la table vivante, si bien qu'après une collision
+> résolue contre un pair déclaré mais déconnecté, Orion recevait une adresse que
+> la gateway ne routait pas — deux vérités.
+>
+> Ce qui reste vrai : la plage `100.64.0.0/10`, la formule BLAKE3, le sondage
+> par compteur, le refus du `/16` et de l'identifiant TPM. Ce qui change :
+>
+> - **la persistance fait foi.** L'adresse choisie à l'admission est écrite dans
+>   `network.toml`, qui fait autorité ; aucun chemin ne re-dérive l'adresse d'un
+>   pair déjà admis, et la VIP ne change plus d'un redémarrage à l'autre ;
+> - **un seul point d'attribution**, à l'admission seulement
+>   (`helios_provisioning::ipam`, `AddressView::assign`) ;
+> - **une seule vue des collisions** : union des adresses déclarées dans
+>   `network.toml`, des `AllowedIPs` de la table WireGuard vivante quand un
+>   instantané est disponible, et des réservations (hôte de `wg_address`, hôtes
+>   réservés du `/10`, réservations IPv6) ;
+> - **le provisioning rend l'adresse persistée** sans appeler l'IPAM ; un pair
+>   admis sans adresse lisible est une erreur nommée
+>   (`EnrollError::UndeclaredAddress`), jamais une occasion de dériver.
+>
+> L'adressage a donc un état sur disque : celui que `network.toml` portait déjà
+> pour chaque pair. Aucune base ni aucun fichier supplémentaire n'est introduit.
+> Les règles normatives et leur implémentation sont dans
+> [ADRESSAGE-IPV6 §3 bis](../specification/ADRESSAGE-IPV6.md#3-bis-ipam-unifié-ipv4-et-ipv6).
+
 ## Amendement du 24 juillet 2026 — port public de key-negotiation
 
 > Cet amendement est désormais détaillé, avec son modèle de menace complet,
@@ -599,7 +657,7 @@ rien n'est retapé, donc rien ne peut être mal recopié.
 **Limite connue — vérification matérielle.** DPAPI ne se compile ni ne s'exerce
 en WSL2 : hors Windows, `seal`/`unseal` échouent explicitement
 (`IdentityStoreError::UnsupportedPlatform`) plutôt que d'écrire ces clés en
-clair. Débloquer Linux suppose `libsecret`, macOS le Keychain. Voir
+clair. Débloquer Linux suppose `libsecret` ; macOS est hors périmètre. Voir
 [TESTING](../testing/TESTING.md).
 
 ## Conséquences sur le workspace

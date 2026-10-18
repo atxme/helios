@@ -105,6 +105,20 @@ liste des pairs déjà déclarés comme table de pairs. Une VIP choisie à la ma
 créerait une seconde vérité, alors que `AllowedIPs` **est** la table de routage
 cryptographique de WireGuard : deux pairs ne peuvent pas revendiquer la même.
 
+> **Amendement du 18 octobre 2026 — IPAM unifié.** `assign_vip` n'existe plus
+> depuis T11 + T14 (`26ac509`, 1er octobre 2026). Le principe de cette section
+> tient — la VIP vient de l'IPAM, jamais de la main de l'opérateur — mais son
+> mécanisme change : l'unique point d'attribution est
+> `helios_provisioning::ipam` (`AddressView::assign`), appelé par
+> `admission::admit_with_key_negotiation` pour tous les chemins d'admission. La
+> vue des collisions n'est plus la seule liste des pairs déclarés : c'est leur
+> union avec la table WireGuard vivante quand l'orchestrateur en publie un
+> instantané (`POST /api/peers`, donc `helios peer` et `helios enroll`) et avec
+> les adresses réservées ; `heliosd peer add`, sans plan de données, n'a que
+> les pairs déclarés. L'adresse attribuée est persistée dans `network.toml` et
+> fait foi ensuite ([ADR-001 §4](ADR-001-WIREGUARD.md#4-provisioning--reconstruire-ce-quikev2-donnait-gratuitement),
+> [ADRESSAGE-IPV6 §3 bis.2](../specification/ADRESSAGE-IPV6.md#3-bis2-règles)).
+
 ### 6. Le profil client : deux modes, et le secret ne voyage pas par défaut
 
 * **Invitation** (défaut) — `helios profile emit` produit un document

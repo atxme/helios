@@ -701,9 +701,9 @@ remplace pas.
   verrouillage de session. Tant que ce lot n'est pas fait, **le seul mode servi
   est `service`** et le tableau des deux profils décrit une cible, pas l'état
   livré.
-* **Orion Linux et macOS restent sans stockage protégé.** Câbler Secret Service
-  (`libsecret`) et le Keychain relève d'un lot distinct ; le refus explicite actuel
-  reste le bon comportement en attendant.
+* **Orion Linux reste sans stockage protégé.** Câbler Secret Service
+  (`libsecret`) relève d'un lot distinct ; le refus explicite actuel reste le bon
+  comportement en attendant. macOS est hors périmètre : Orion ne le cible pas.
 * **Le DNS d'un client reste hors tunnel** — limite documentée dans
   `helios-firewall::ruleset`, orthogonale à celle-ci, et qui mérite son propre
   arbitrage.
