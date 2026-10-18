@@ -143,9 +143,9 @@ echo "==> Émission du profil client"
 # d'échouer. Ce profil n'est PAS importable seul : Orion y complète la clé
 # privée depuis le profil local de même nom.
 #
-# Le mode assisté (`--with-private-key`) n'est plus joué : il admet un second
+# Le mode assisté (`--with-private-key`) a été retiré : il admettait un second
 # pair sans certificats de négociation, ce que le plancher `ml_kem` refuse
-# (TESTING.md, « Banc de développement »).
+# (ADR-004 §6, amendement du 18 octobre 2026).
 cargo run --quiet -p helios -- --url "$URL" profile emit \
     --name lab --endpoint "$ENDPOINT" \
     --public-key "$CLIENT_PUB" \

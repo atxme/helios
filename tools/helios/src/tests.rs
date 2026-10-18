@@ -353,3 +353,31 @@ fn an_offline_ipv6_address_is_checked_with_orions_rule() {
     assert!(format!("{error:#}").contains("--address-v6"), "{error:#}");
     assert!(format!("{error:#}").contains("/128"), "{error:#}");
 }
+
+/// `profile emit` re-emits the invitation of an admitted peer and nothing
+/// else: the assisted mode and the admission role are gone from the command
+/// line, not merely refused at run time (ADR-004 §6, 18 October 2026).
+#[test]
+fn profile_emit_has_neither_an_assisted_mode_nor_an_admission_role() {
+    for option in ["--with-private-key", "--admin"] {
+        let Err(error) = Cli::try_parse_from([
+            "helios",
+            "profile",
+            "emit",
+            "--name",
+            "portable",
+            "--endpoint",
+            "vpn.example.net:51820",
+            "--public-key",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            option,
+        ]) else {
+            panic!("{option} is still accepted");
+        };
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::UnknownArgument,
+            "{option}"
+        );
+    }
+}

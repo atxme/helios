@@ -148,7 +148,11 @@ représentable sans inventer un second format.
 > l’utilisateur ne peut rien faire — est couvert par `helios enroll`, qui
 > génère la paire, émet les certificats, admet et livre un document complet
 > sous le même régime (`0600`, canal maîtrisé, effacement après import).
-> La suppression de l’option, plutôt que son refus, reste à décider.
+> Décision prise le même jour : `--with-private-key` et `--admin` sont
+> **retirés** de `profile emit`, plutôt que refusés à l’exécution. Le mode
+> assisté décrit plus haut n’existe donc plus dans cette commande ; la
+> génération de la paire côté opérateur n’existe plus que dans
+> `helios enroll`.
 
 ### 7. Aucun secret ne traverse la CI hébergée
 

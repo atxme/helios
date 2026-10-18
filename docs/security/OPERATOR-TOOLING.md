@@ -322,12 +322,12 @@ l'importe et complète avec la clé privée du profil local de même nom.
 
 La commande réutilise l'adresse persistée du pair ; une clé inconnue est
 refusée avec les commandes d'admission, et changer de clé pour un nom existant
-exige une révocation explicite. `--with-private-key` (l'ancien mode assisté) et
-`--admin` sont refusés depuis le 18 octobre 2026 : le premier générait une paire
-que la gateway n'avait jamais admise, donc toujours refusée faute de
-certificats ; le second choisissait un rôle à une admission qui n'a plus lieu.
-Pour un utilisateur qui ne peut rien faire lui-même, `helios enroll` génère la
-paire et livre un document complet.
+exige une révocation explicite. Le mode assisté (`--with-private-key`) et
+`--admin` ont été retirés le 18 octobre 2026 : le premier générait une paire que
+la gateway n'avait jamais admise, donc toujours refusée faute de certificats ;
+le second choisissait un rôle à une admission qui n'a plus lieu. Pour un
+utilisateur qui ne peut rien faire lui-même, `helios enroll` génère la paire et
+livre un document complet.
 
 ### Enrôlement complet — une seule commande
 

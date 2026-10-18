@@ -384,18 +384,10 @@ enum ProfileCmd {
         /// Gateway's public UDP endpoint (`IP:port` or `FQDN:port`).
         #[arg(long)]
         endpoint: String,
-        /// Client public key, received out of band. **Recommended mode**:
-        /// the client's secret never travels.
+        /// Public key of the admitted client, received out of band: the
+        /// client's secret never travels.
         #[arg(long)]
         public_key: Option<String>,
-        /// Refused: generated a pair the gateway never admitted. Use
-        /// `helios enroll` for a new client.
-        #[arg(long)]
-        with_private_key: bool,
-        /// Refused: the role is chosen at admission (`helios peer add --admin`
-        /// or `helios enroll --admin`).
-        #[arg(long)]
-        admin: bool,
         /// Trafic capté par le tunnel : une ou plusieurs plages CIDR,
         /// séparées par des virgules.
         ///
@@ -1022,8 +1014,6 @@ async fn execute_command(api: &transport::Api, command: Cmd) -> Result<()> {
                 name,
                 endpoint,
                 public_key,
-                with_private_key,
-                admin,
                 allowed_ips,
                 ssh_target,
                 output,
@@ -1038,8 +1028,6 @@ async fn execute_command(api: &transport::Api, command: Cmd) -> Result<()> {
                         name,
                         endpoint,
                         public_key,
-                        with_private_key,
-                        admin,
                         allowed_ips,
                         ssh_target,
                         output,

@@ -570,9 +570,9 @@ toute exécution `--dev` ; le banc netns ci-dessous couvre ce manque.
 spécification de rotation v5 (`a9f78a9`), `helios peer add` sans certificats de
 négociation est refusé (`MissingNegotiationIdentity`) et le banc s'arrêtait à
 l'admission. Il émet désormais les certificats du client. Le mode assisté
-d'ADR-004 §6 (`profile emit --with-private-key`) n'y est plus joué : il est
-refusé depuis l'amendement du 18 octobre 2026, et `profile emit` ne fait plus
-que réémettre l'invitation d'un pair déjà admis.
+d'ADR-004 §6 (`profile emit --with-private-key`) n'y est plus joué : il a été
+retiré le 18 octobre 2026, et `profile emit` ne fait plus que réémettre
+l'invitation d'un pair déjà admis.
 
 ## Banc netns
 

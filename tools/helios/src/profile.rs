@@ -4,21 +4,20 @@
 //! (`orion_core::profile_import`) and no producer: the profile had to be
 //! hand-copied. This is where the loop closes.
 //!
-//! # Two modes, and why the default is the right one (ADR-004 §6)
+//! # An invitation, for an admitted peer only (ADR-004 §6)
 //!
-//! * **Invitation** — the operator starts from the **public** key the client
-//!   sent them. It admits it and returns everything except the private key,
-//!   which the operator never held. Orion completes it from the local
-//!   profile of the same name.
-//! * **Assisted** (`--with-private-key`) — the operator generates the pair
-//!   and hands over a complete profile. This is the only path where a client
-//!   private key exists outside the client workstation. It is kept because a
-//!   fleet where the user can do nothing themselves really exists, and
-//!   forbidding it would just make people redo the same thing by hand, worse.
+//! The operator starts from the **public** key the client sent them, and the
+//! command returns everything except the private key, which the operator
+//! never held. Orion completes it from the local profile of the same name.
 //!
-//! Both modes admit the peer: a profile emitted for a key the gateway does
-//! not know would bring up no tunnel, and the user would have no way to
-//! understand why.
+//! `emit` admits nobody. Admission requires the client's TLS and PQ
+//! key-negotiation certificates (floor `ml_kem`), which this command neither
+//! issues nor carries: a new client goes through `helios enroll`, or
+//! `helios peer add` with its certificates. A profile emitted for a key the
+//! gateway does not know would bring up no tunnel, so such a key is refused.
+//! The assisted mode, where the operator generated the pair, is gone: the
+//! pair it generated could never be admitted, and `helios enroll` serves the
+//! same fleet with the negotiation included.
 
 use std::path::{Path, PathBuf};
 
@@ -43,12 +42,8 @@ pub struct EmitOptions {
     pub name: String,
     /// Gateway's public UDP endpoint (`IP:port` or `FQDN:port`).
     pub endpoint: String,
-    /// Client public key, received out of band. Invitation mode.
+    /// Public key of the admitted client, received out of band.
     pub public_key: Option<String>,
-    /// Generate the pair on the operator side. Assisted mode.
-    pub with_private_key: bool,
-    /// Admit the peer as a control-plane administrator.
-    pub admin: bool,
     /// Split tunnel to ship with the profile. Absent = full tunnel.
     pub allowed_ips: Option<String>,
     /// SSH destination to ship with the profile. Absent = no terminal button.
@@ -321,7 +316,6 @@ fn capture_label(allowed_ips: &str) -> &'static str {
 
 pub async fn emit(client: &Client, base: &str, options: EmitOptions) -> Result<()> {
     let public_key = resolve_public_key(&options)?;
-    refuse_admission_options(&options)?;
 
     let view = api::network(client, base).await?;
     let gateway_public_key = view
@@ -367,23 +361,8 @@ pub async fn emit(client: &Client, base: &str, options: EmitOptions) -> Result<(
     Ok(())
 }
 
-/// The client's public key, the only mode left.
-///
-/// `emit` admits nobody: admission requires the client's TLS and PQ
-/// key-negotiation certificates (floor `ml_kem`), which this command neither
-/// issues nor carries. The assisted mode generated a pair the gateway had
-/// never seen, so it could only ever be refused there; it is refused here,
-/// before any call, with the command that issues keys, certificates,
-/// admission and profile at once.
+/// The admitted client's public key, validated before any call.
 fn resolve_public_key(options: &EmitOptions) -> Result<String> {
-    if options.with_private_key {
-        bail!(
-            "--with-private-key is refused: it generated a pair the gateway had never admitted, \
-             and admission now requires the client's key-negotiation certificates. To enroll \
-             a new client, `helios enroll` issues its keys, certificates, admission and \
-             profile at once"
-        );
-    }
     let Some(public_key) = &options.public_key else {
         bail!(
             "provide --public-key <public key of an admitted client>: `profile emit` re-emits \
@@ -394,20 +373,6 @@ fn resolve_public_key(options: &EmitOptions) -> Result<String> {
     let public_key = public_key.trim().to_string();
     aether::wg::validate_key(&public_key).context("invalid client public key")?;
     Ok(public_key)
-}
-
-/// Refuses the options that only meant something when `emit` admitted the
-/// peer: silently ignored, they would hand out a profile that is not the one
-/// asked for.
-fn refuse_admission_options(options: &EmitOptions) -> Result<()> {
-    if options.admin {
-        bail!(
-            "--admin is refused: `profile emit` admits nobody, and the role is chosen at \
-             admission — `helios peer add --admin` with the client's key-negotiation \
-             certificates, or `helios enroll --admin`"
-        );
-    }
-    Ok(())
 }
 
 /// The persisted address of the peer named `name`, which must hold
@@ -512,8 +477,6 @@ mod tests {
             name: "portable".into(),
             endpoint: "vpn.example.net:51820".into(),
             public_key: None,
-            with_private_key: false,
-            admin: false,
             allowed_ips: None,
             ssh_target: None,
             output: None,
@@ -569,22 +532,6 @@ mod tests {
         assert_eq!(public_key, pair.public_key);
     }
 
-    /// The assisted mode generated a pair the gateway had never seen, so it
-    /// had to admit it — without negotiation certificates, which the `ml_kem`
-    /// admission floor refuses every time. It is refused here, before any
-    /// call, and the message names the command that does both at once.
-    #[test]
-    fn assisted_mode_is_refused_and_points_to_enroll() {
-        let error = resolve_public_key(&EmitOptions {
-            with_private_key: true,
-            ..options()
-        })
-        .unwrap_err()
-        .to_string();
-        assert!(error.contains("helios enroll"), "message: {error}");
-        assert!(error.contains("certificates"), "message: {error}");
-    }
-
     fn admitted(name: &str, public_key: &str) -> NetworkPeerView {
         NetworkPeerView {
             name: name.into(),
@@ -638,40 +585,11 @@ mod tests {
         assert!(error.contains("different public key"), "message: {error}");
     }
 
-    /// `--admin` chose the role of the peer `emit` admitted. Now that it
-    /// admits nobody, ignoring the flag would hand out a profile whose role
-    /// is not the one asked for: it is refused, pointing to the admission.
-    #[test]
-    fn the_admin_role_is_refused_since_emit_admits_nobody() {
-        let error = refuse_admission_options(&EmitOptions {
-            admin: true,
-            public_key: Some(aether::wg::generate_keypair().unwrap().public_key),
-            ..options()
-        })
-        .unwrap_err()
-        .to_string();
-        assert!(error.contains("--admin"), "message: {error}");
-        assert!(error.contains("helios peer add"), "message: {error}");
-    }
-
-    /// The two modes are exclusive: combining them would mean admitting one
-    /// key and delivering another, hence a profile that never comes up.
-    #[test]
-    fn the_two_modes_cannot_be_combined() {
-        assert!(resolve_public_key(&EmitOptions {
-            public_key: Some(aether::wg::generate_keypair().unwrap().public_key),
-            with_private_key: true,
-            ..options()
-        })
-        .is_err());
-    }
-
     #[test]
     fn without_a_public_key_the_tool_refuses_and_points_to_enroll() {
         let error = resolve_public_key(&options()).unwrap_err().to_string();
         assert!(error.contains("--public-key"), "message: {error}");
         assert!(error.contains("helios enroll"), "message: {error}");
-        assert!(!error.contains("--with-private-key"), "message: {error}");
     }
 
     #[test]
