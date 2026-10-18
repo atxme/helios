@@ -19,6 +19,12 @@ pub(super) fn test_now() -> u64 {
 
 pub(super) const CLIENT_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 pub(super) const GATEWAY_KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+/// A WAN address: the public port, as every test used before renewal existed.
+pub(super) const PUBLIC_SOURCE: std::net::IpAddr =
+    std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 50));
+/// The VIP `network()` admits the test peer with: a connection through the tunnel.
+pub(super) const TUNNEL_SOURCE: std::net::IpAddr =
+    std::net::IpAddr::V4(std::net::Ipv4Addr::new(100, 64, 1, 2));
 pub(super) const CERTIFICATE_FINGERPRINT: &str =
     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
@@ -327,4 +333,30 @@ pub(super) fn gateway_with(
         transactions: Mutex::new(TransactionState::default()),
     };
     (handler, plane)
+}
+
+/// Prepares, proves a handshake and confirms: one committed negotiation.
+pub(super) async fn commit(
+    handler: &GatewayHandler,
+    plane: &TestDataPlane,
+    fixture: &PqFixture,
+    transaction_id: [u8; 16],
+    source: std::net::IpAddr,
+) {
+    handler
+        .prepare(
+            CERTIFICATE_FINGERPRINT.into(),
+            source,
+            request(transaction_id, fixture),
+        )
+        .await
+        .expect("prepare");
+    plane.handshake_happens().await;
+    handler
+        .confirm(
+            authenticate_confirmation(TEST_CHALLENGE, transaction_id, &fixture.client_private_key)
+                .expect("confirmation"),
+        )
+        .await
+        .expect("commit");
 }

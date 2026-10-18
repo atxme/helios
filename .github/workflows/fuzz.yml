@@ -1,8 +1,8 @@
 name: Fuzzing planifié
 
 # libFuzzer est volontairement isolé de la validation des pull requests :
-# chaque cible dispose d'un budget borné et les quatre campagnes sont exécutées
-# dans le même job afin de ne pas compiler quatre fois le workspace fuzzing.
+# chaque cible dispose d'un budget borné et les campagnes sont exécutées
+# dans le même job pour partager la compilation du workspace fuzzing.
 on:
   schedule:
     - cron: "17 3 * * 0"
@@ -20,6 +20,9 @@ jobs:
     name: Campagne libFuzzer
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@v4
 
@@ -39,20 +42,28 @@ jobs:
         working-directory: fuzz
         run: cargo +nightly fuzz list
 
+      # libFuzzer choisit release par défaut, où aether refuse le trousseau
+      # de développement. Le profil dev garde ce garde-fou de livraison intact.
+      # Compiler une fois avant les campagnes évite de répéter la même erreur
+      # pour chaque cible lorsque leur dépendance commune ne compile pas.
+      - name: Compiler les targets avec le trousseau de développement
+        run: cargo +nightly fuzz build --dev
+
       - name: Exécuter les campagnes bornées
         id: fuzz_run
         continue-on-error: true
         run: |
-          set -u
+          set -euo pipefail
           failed=0
 
-          for target in signed_object trust_transaction x509_documents gateway_state_machine; do
+          targets="$(cargo +nightly fuzz list)"
+          for target in $targets; do
             echo "::group::Fuzzing ${target}"
             mkdir -p "fuzz/ci-logs/${target}" "fuzz/artifacts/${target}"
 
             set +e
-            cargo +nightly fuzz run "${target}" -- \
-              -max_total_time=120 \
+            cargo +nightly fuzz run --dev "${target}" -- \
+              -max_total_time=60 \
               -print_final_stats=1 \
               -artifact_prefix="fuzz/artifacts/${target}/" \
               2>&1 | tee "fuzz/ci-logs/${target}/run.log"

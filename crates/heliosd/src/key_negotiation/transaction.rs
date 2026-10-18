@@ -121,6 +121,38 @@ pub struct InstalledPsk {
     pub public_key: String,
     pub address: String,
     pub installed_at: std::time::Instant,
+    /// `rx + tx` of the peer at the first snapshot after the commit.
+    ///
+    /// The gateway never re-registers a peer for a new PSK, so its counters
+    /// run on across PSKs: what this one carried is the difference. Set by the
+    /// reclaimer, whose snapshot is at most ten seconds old — negligible next
+    /// to the ceiling.
+    pub bytes_baseline: Option<u64>,
+}
+
+impl InstalledPsk {
+    /// Counts what this PSK has carried and names the ceiling once reached.
+    ///
+    /// A counter below the baseline means the peer was re-created (hot
+    /// reload): counting restarts from it rather than reading a wrap-around
+    /// as a huge transfer. The lifetime still bounds the slot meanwhile.
+    pub(super) fn charge_transfer(&mut self, total: u64) -> Option<String> {
+        let baseline = match self.bytes_baseline {
+            Some(baseline) if total >= baseline => baseline,
+            _ => {
+                self.bytes_baseline = Some(total);
+                return None;
+            }
+        };
+        let carried = total - baseline;
+        (carried >= aether::key_negotiation::NEGOTIATED_PSK_BYTE_LIMIT).then(|| {
+            format!(
+                "PSK carried {} GiB, its {} GiB ceiling, without a renewal",
+                carried >> 30,
+                aether::key_negotiation::NEGOTIATED_PSK_BYTE_LIMIT >> 30
+            )
+        })
+    }
 }
 
 /// A peer's slot, and a counter that orders every change to it.
@@ -586,12 +618,12 @@ impl GatewayHandler {
         observed: &[helios_wireguard::PeerStatus],
     ) -> Vec<(String, u64, String)> {
         let now = std::time::Instant::now();
-        let state = self.transactions.lock().await;
+        let mut state = self.transactions.lock().await;
         state
             .slots
-            .values()
+            .values_mut()
             .filter_map(|slot| {
-                let SlotState::Committed(installed) = &slot.state else {
+                let SlotState::Committed(installed) = &mut slot.state else {
                     return None;
                 };
                 let generation = slot.generation;
@@ -612,6 +644,11 @@ impl GatewayHandler {
                 let peer = observed
                     .iter()
                     .find(|peer| peer.public_key_b64() == installed.public_key)?;
+                if let Some(reason) =
+                    installed.charge_transfer(peer.rx_bytes.saturating_add(peer.tx_bytes))
+                {
+                    return Some((installed.public_key.clone(), generation, reason));
+                }
                 let handshake_age = peer
                     .last_handshake
                     .and_then(|at| std::time::SystemTime::now().duration_since(at).ok())?;

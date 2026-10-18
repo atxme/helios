@@ -101,6 +101,31 @@ pub const STATIC_PSK_LEN: usize = 32;
 /// to renegotiate before, rather than discovering it when the tunnel stops.
 pub const NEGOTIATED_PSK_LIFETIME_SECS: u32 = 24 * 3600;
 
+/// Transfer ceiling of a negotiated `ml_kem` PSK: 100 GiB, sent plus received.
+///
+/// The time bound alone lets a saturated tunnel push an unbounded volume
+/// through one ML-KEM secret. This is the *lifebytes* of IPsec next to its
+/// lifetime. Unlike the lifetime it is **not** signed in the response: both
+/// ends compile the same constant, so no v5 transcript changes. Changing the
+/// value one day means signing it, as the lifetime is.
+pub const NEGOTIATED_PSK_BYTE_LIMIT: u64 = 100 * 1024 * 1024 * 1024;
+
+/// Share of the lifetime, or of the byte ceiling, at which Orion renews.
+///
+/// The gateway enforces 100 %; the 20 % left is the window in which a failed
+/// renewal is retried before the slot is reclaimed.
+pub const PSK_RENEWAL_THRESHOLD_PERCENT: u64 = 80;
+
+/// Seconds after commit at which Orion renews: 19 h 12.
+pub const fn psk_renewal_after_secs() -> u64 {
+    NEGOTIATED_PSK_LIFETIME_SECS as u64 * PSK_RENEWAL_THRESHOLD_PERCENT / 100
+}
+
+/// Bytes carried after commit at which Orion renews: 80 GiB.
+pub const fn psk_renewal_after_bytes() -> u64 {
+    NEGOTIATED_PSK_BYTE_LIMIT / 100 * PSK_RENEWAL_THRESHOLD_PERCENT
+}
+
 /// Narrowest confirmation delay a client accepts from a gateway.
 pub const MIN_CONFIRMATION_TIMEOUT_SECS: u32 = 1;
 /// Widest confirmation delay a client accepts from a gateway.

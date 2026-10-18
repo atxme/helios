@@ -10,6 +10,8 @@ foi en cas de doute (voir [AGENTS.md](../AGENTS.md)).
 - [SECURITY](../SECURITY.md) — signalement, secrets et pratiques de sécurité.
 - [AGENTS.md](../AGENTS.md) — règles communes pour les agents et développeurs.
 - [CLAUDE.md](../CLAUDE.md) — adaptateur d'instructions spécifique à Claude.
+- [Feuille de route](ROADMAP.md) — validation cible, décisions en attente,
+  fonctionnalités et dette, par horizon (proposition).
 
 ## Architecture
 
@@ -27,6 +29,8 @@ foi en cas de doute (voir [AGENTS.md](../AGENTS.md)).
 - [Build](development/build.md) — prérequis et commandes de compilation.
 - [Tests](development/testing.md) — vérifications ciblées, régression et
   limites d'environnement.
+- [Profilage](development/profiling.md) — CPU, mémoire et latence en conditions
+  réelles sur la gateway Linux et Orion.
 - [Workflow Git](development/git-workflow.md) — branches, commits et contrôles
   avant pull request.
 

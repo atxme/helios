@@ -255,6 +255,9 @@ export const openSshTerminal = (name?: string) =>
 export const connect = (name?: string) => invoke<void>('connect', { name: name ?? null })
 export const disconnect = () => invoke<void>('disconnect')
 
+/** Renews the ML-KEM PSK now, through the tunnel. */
+export const renewPsk = () => invoke<void>('renew_psk')
+
 /** Opens the Rust-owned, two-key CA-TLS signing ceremony. */
 export const startAstraCaTlsRotation = (input: AstraRotationInput) =>
   invoke<AstraRotationStatus>('start_astra_ca_tls_rotation', { input })

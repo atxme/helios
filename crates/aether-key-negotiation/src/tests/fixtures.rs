@@ -218,6 +218,8 @@ pub(super) struct Handler {
     pub(super) rollback_gate: tokio::sync::Semaphore,
     pub(super) gateway_pq_certificate: PqCertificate,
     pub(super) gateway_pq_private_key: Vec<u8>,
+    /// Every canonical connection source the server handed to the handler.
+    pub(super) sources: std::sync::Mutex<Vec<std::net::IpAddr>>,
 }
 
 impl Handler {
@@ -240,6 +242,7 @@ impl Handler {
             rollback_gate: tokio::sync::Semaphore::new(permits),
             gateway_pq_certificate: pki.gateway_pq_certificate.clone(),
             gateway_pq_private_key: pki.gateway_pq_private_key.clone(),
+            sources: Default::default(),
         }
     }
 }
@@ -256,8 +259,10 @@ impl NegotiationHandler for Handler {
     async fn prepare(
         &self,
         certificate_sha256: String,
+        source: std::net::IpAddr,
         request: AuthenticatedKeyNegotiationRequest,
     ) -> Result<PreparedNegotiation, PublicError> {
+        self.sources.lock().unwrap().push(source);
         // A wrong TLS fingerprint is `Rejected` like every other
         // pre-installation refusal: the public boundary must not let a
         // caller tell an unknown peer from a mismatched certificate.
@@ -305,7 +310,12 @@ impl NegotiationHandler for Handler {
         .map_err(|_| PublicError::Internal)
     }
 
-    async fn resolve_admitted_peer(&self, certificate_sha256: &str) -> Option<String> {
+    async fn resolve_admitted_peer(
+        &self,
+        certificate_sha256: &str,
+        source: std::net::IpAddr,
+    ) -> Option<String> {
+        self.sources.lock().unwrap().push(source);
         (certificate_sha256 == self.expected_fingerprint).then(|| CLIENT_WG_KEY.to_string())
     }
 

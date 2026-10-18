@@ -3,4 +3,5 @@
 mod fixtures;
 mod identity;
 mod interop;
+mod renewal;
 mod transaction;

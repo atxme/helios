@@ -22,8 +22,10 @@ bash scripts/regression.sh
 
 Cette campagne exécute notamment le formatage Rust, les audits npm et Cargo,
 les tests et builds frontend, Clippy et les tests Rust toutes features, puis la
-campagne de provisioning en dry-run. Elle correspond au workflow GitHub de
-régression.
+campagne de provisioning en dry-run. Elle reste locale ; le workflow GitHub
+sélectionne les composants modifiés et leurs dépendants, sans campagne complète
+ni couverture. Le détail du découpage est dans
+[`TESTING.md`](../testing/TESTING.md).
 
 ## Limites d'environnement
 

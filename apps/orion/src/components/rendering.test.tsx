@@ -124,6 +124,7 @@ describe('Orion presentational branches', () => {
           psk={state === 'up' ? 'ml_kem' : null}
           onConnect={callback}
           onOpenSsh={callback}
+          onRenewKey={callback}
           onDisconnect={callback}
         />,
       )
@@ -148,6 +149,9 @@ describe('Orion presentational branches', () => {
     ])
     expect(active).toContain('Débit du tunnel')
     expect(active).toContain('100.64.1.2/32')
+    expect(active).toContain('Renouveler la clé maintenant')
+    expect(render('connecting', profile())).not.toContain('Renouveler la clé maintenant')
+    expect(render('down', profile())).not.toContain('Renouveler la clé maintenant')
   })
 
   it('renders the profile master-detail entry points without invoking effects', () => {

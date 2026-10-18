@@ -189,13 +189,12 @@ mod windows {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(windows)))]
 mod tests {
     use super::*;
 
     /// Off Windows the only transport is raw CTAP, which shows nothing: the
     /// owner is honestly the console, and no window is claimed.
-    #[cfg(not(windows))]
     #[test]
     fn there_is_nothing_to_own_where_there_is_no_dialog() {
         let window = create().expect("no window is needed here");

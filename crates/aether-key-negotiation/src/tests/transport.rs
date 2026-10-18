@@ -160,6 +160,12 @@ async fn a_negotiation_ends_with_a_commit_and_a_closed_connection() {
     .await
     .unwrap();
 
+    let sources = handler.sources.lock().unwrap().clone();
+    assert!(
+        !sources.is_empty() && sources.iter().all(|source| source.is_loopback()),
+        "the handler must receive the canonical source of the connection: {sources:?}"
+    );
+
     // The key v5 property: the connection is over, and that says nothing
     // about the tunnel. In v4 the same closure released the slot; here it
     // must not trigger rollback, and this port can no longer remove a PSK.

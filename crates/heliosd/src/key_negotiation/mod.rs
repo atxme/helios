@@ -84,6 +84,7 @@ const MAX_REPLAY_IDENTIFIERS: usize = 4096;
 
 mod candidate;
 mod identity;
+mod origin;
 mod protocol;
 mod server;
 mod transaction;

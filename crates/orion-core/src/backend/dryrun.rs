@@ -8,7 +8,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use aether::TunnelState;
+use aether::{SecretString, TunnelState};
 use async_trait::async_trait;
 
 use crate::config::ClientProfile;
@@ -18,6 +18,9 @@ use super::{EventSink, VpnBackend};
 
 /// Sentinel: "no handshake" (impossible as a real age).
 const NO_HANDSHAKE: u64 = u64::MAX;
+
+/// Sentinel: "transfer counter unreadable".
+const NO_COUNTER: u64 = u64::MAX;
 
 /// Backend simulating tunnel mounting and adapter state.
 pub struct DryRunBackend {
@@ -29,6 +32,12 @@ pub struct DryRunBackend {
     adapter_up: AtomicBool,
     /// Simulated age of the last handshake, in seconds.
     handshake_age_secs: AtomicU64,
+    /// PSKs the peer was re-registered with, in order.
+    rekeyed: std::sync::Mutex<Vec<Option<SecretString>>>,
+    /// `true` = every `rekey_peer` fails (rollback tests).
+    fail_rekey: AtomicBool,
+    /// Simulated bytes sent plus received since the peer was registered.
+    transfer: AtomicU64,
 }
 
 impl Default for DryRunBackend {
@@ -38,6 +47,9 @@ impl Default for DryRunBackend {
             fail_after_adapter: false,
             adapter_up: AtomicBool::new(false),
             handshake_age_secs: AtomicU64::new(NO_HANDSHAKE),
+            rekeyed: std::sync::Mutex::new(Vec::new()),
+            fail_rekey: AtomicBool::new(false),
+            transfer: AtomicU64::new(0),
         }
     }
 }
@@ -57,6 +69,30 @@ impl DryRunBackend {
     pub fn set_handshake_age(&self, age: Option<Duration>) {
         let v = age.map(|d| d.as_secs()).unwrap_or(NO_HANDSHAKE);
         self.handshake_age_secs.store(v, Ordering::SeqCst);
+    }
+
+    /// PSKs the peer was re-registered with, in order.
+    ///
+    /// Each entry is an explicit copy of a secret: for tests and the
+    /// simulation only, never logged.
+    pub fn rekeyed_psks(&self) -> Vec<Option<SecretString>> {
+        self.rekeyed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|psk| psk.as_ref().map(SecretString::duplicate))
+            .collect()
+    }
+
+    /// Makes every following `rekey_peer` fail (rollback tests).
+    pub fn fail_rekeys(&self, fail: bool) {
+        self.fail_rekey.store(fail, Ordering::SeqCst);
+    }
+
+    /// Forces the transfer counter (`None` = unreadable).
+    pub fn set_transfer_bytes(&self, bytes: Option<u64>) {
+        self.transfer
+            .store(bytes.unwrap_or(NO_COUNTER), Ordering::SeqCst);
     }
 }
 
@@ -119,6 +155,36 @@ impl VpnBackend for DryRunBackend {
         sink(ClientEvent::log("info", "[dry-run] adaptateur démonté"));
         sink(ClientEvent::state(TunnelState::Down));
         Ok(())
+    }
+
+    async fn rekey_peer(&self, profile: &ClientProfile, sink: &EventSink) -> anyhow::Result<()> {
+        profile.validate_for_data_plane()?;
+        crate::endpoint_resolution::literal_endpoint(&profile.endpoint)
+            .map_err(|e| anyhow::anyhow!("endpoint `{}` invalide : {e}", profile.endpoint))?;
+        if !self.adapter_up.load(Ordering::SeqCst) {
+            anyhow::bail!("[dry-run] aucun adaptateur monté : aucun pair à réinscrire");
+        }
+        if self.fail_rekey.load(Ordering::SeqCst) {
+            anyhow::bail!("[dry-run] réinscription du pair refusée");
+        }
+        self.rekeyed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(profile.preshared_key.as_ref().map(SecretString::duplicate));
+        self.transfer.store(0, Ordering::SeqCst);
+        self.handshake_age_secs.store(0, Ordering::SeqCst);
+        sink(ClientEvent::log(
+            "info",
+            "[dry-run] pair réinscrit — session WireGuard réinitialisée".to_string(),
+        ));
+        Ok(())
+    }
+
+    async fn transfer_bytes(&self) -> Option<u64> {
+        match self.transfer.load(Ordering::SeqCst) {
+            NO_COUNTER => None,
+            bytes => Some(bytes),
+        }
     }
 
     async fn last_handshake_age(&self) -> Option<Duration> {
@@ -227,5 +293,51 @@ mod tests {
         named.endpoint = "gateway.example:51820".into();
         assert!(backend.up(&named, &sink).await.is_err());
         assert!(!backend.adapter_is_up());
+    }
+
+    #[tokio::test]
+    async fn rekeying_re_registers_the_peer_and_restarts_its_counters() {
+        let backend = DryRunBackend {
+            negotiate_delay: Duration::ZERO,
+            ..DryRunBackend::default()
+        };
+        let (sink, _log) = collector();
+        let mut profile = profile();
+        backend.up(&profile, &sink).await.unwrap();
+        backend.set_transfer_bytes(Some(4096));
+        backend.set_handshake_age(Some(Duration::from_secs(90)));
+
+        profile.preshared_key = Some("cGVlcnBza3BlZXJwc2twZWVycHNrcGVlcnBzazEyMw==".into());
+        backend.rekey_peer(&profile, &sink).await.unwrap();
+
+        assert_eq!(
+            backend.rekeyed_psks(),
+            vec![profile.preshared_key.as_ref().map(SecretString::duplicate)]
+        );
+        assert_eq!(
+            backend.transfer_bytes().await,
+            Some(0),
+            "a re-registered peer counts from zero"
+        );
+        assert_eq!(backend.last_handshake_age().await, Some(Duration::ZERO));
+    }
+
+    #[tokio::test]
+    async fn rekeying_needs_a_mounted_adapter_and_can_be_made_to_fail() {
+        let backend = DryRunBackend::default();
+        let (sink, _log) = collector();
+        assert!(
+            backend.rekey_peer(&profile(), &sink).await.is_err(),
+            "no adapter"
+        );
+
+        let backend = DryRunBackend {
+            negotiate_delay: Duration::ZERO,
+            ..DryRunBackend::default()
+        };
+        backend.up(&profile(), &sink).await.unwrap();
+        backend.fail_rekeys(true);
+        assert!(backend.rekey_peer(&profile(), &sink).await.is_err());
+        assert!(backend.rekeyed_psks().is_empty());
     }
 }

@@ -48,9 +48,19 @@ rustup toolchain install nightly
 cargo install cargo-fuzz
 
 cd fuzz
-cargo +nightly fuzz run gateway_state_machine
-cargo +nightly fuzz run signed_object -- -max_total_time=300
+cargo +nightly fuzz run --dev gateway_state_machine
+cargo +nightly fuzz run --dev signed_object -- -max_total_time=300
 ```
+
+Le profil `--dev` est nécessaire avec le trousseau de développement :
+`cargo fuzz` choisit sinon le profil release, dans lequel `aether` refuse ce
+trousseau. AddressSanitizer reste actif. Une campagne optimisée exige un
+trousseau public de production fourni par `HELIOS_PUBLISHER_KEYRING_PATH` ;
+aucune clé privée éditeur ne doit être fournie.
+
+La [campagne CI](../docs/testing/TESTING.md#fuzzing-planifié) compile toutes les
+cibles une fois puis leur accorde 60 secondes chacune. Elle conserve les corpus,
+crashes et journaux, y compris en cas d'échec.
 
 Un refus est le résultat **attendu** : ces fonctions reçoivent des octets
 contrôlés par un attaquant et leur métier est de dire non. Ce qu'aucune ne doit
@@ -67,7 +77,6 @@ faire, c'est paniquer.
   pas pour guider un fuzzer ; celui-ci construit son propre corpus dans
   `fuzz/corpus/`, qui n'est pas suivi par Git. Un corpus issu de véritables
   documents signés accélérerait nettement la couverture, et reste à faire.
-- **Rien de tout ceci n'a tourné sur cette branche.** L'environnement de
-  développement n'a pas de nightly ; seules les fonctions de `aether::fuzzing`
-  ont été compilées et exercées sur leurs graines. La première exécution
-  réelle de `cargo fuzz` reste à faire.
+- **Le budget CI reste borné.** Une minute par cible complète les tests de
+  graines, sans remplacer une campagne longue ni les validations matérielles.
+  La durée locale se règle par `-max_total_time`.

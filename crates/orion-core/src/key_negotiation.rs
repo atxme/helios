@@ -97,6 +97,15 @@ impl IdentityProvider for crate::identity_store::ProtectedIdentityStore {
     }
 }
 
+/// Which way the negotiation socket goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NegotiationRoute {
+    /// First negotiation: before the tunnel, pinned off it (`net_pin`).
+    OffTunnel,
+    /// Renewal: through the tunnel already up, from the client VIP.
+    InTunnel { local_vip: std::net::IpAddr },
+}
+
 /// Public connection settings and protected client identity material.
 pub struct KeyNegotiationClient {
     /// Public UDP endpoint of the gateway key-negotiation service.
@@ -125,6 +134,8 @@ pub struct KeyNegotiationClient {
     pub gateway_ca_pq_public_key: Option<Vec<u8>>,
     /// Orion refuses any locally selected mode below this floor.
     pub minimum_mode: ProtectionMode,
+    /// Which path the negotiation socket takes.
+    pub route: NegotiationRoute,
 }
 
 impl std::fmt::Debug for KeyNegotiationClient {
@@ -147,6 +158,7 @@ impl std::fmt::Debug for KeyNegotiationClient {
                 &self.gateway_ca_pq_public_key.is_some(),
             )
             .field("minimum_mode", &self.minimum_mode)
+            .field("route", &self.route)
             .finish()
     }
 }
@@ -279,6 +291,7 @@ pub async fn prepare(
     // which is what reserves a slot on the gateway, is only ever sent on the
     // winning connection, below, after the race is over.
     let identity_ref = &identity;
+    let route = client.route;
     let gateway_ca = &client.gateway_ca;
     let server_name = client.server_name.as_str();
     let won = crate::endpoint_resolution::race(
@@ -291,8 +304,17 @@ pub async fn prepare(
             // egress interface at that moment, and the gateway sees a QUIC
             // migration mid-transaction. One socket per candidate, of the
             // candidate's family. See `crate::net_pin`.
-            let socket = crate::net_pin::negotiation_socket(remote, crate::net_pin::TUNNEL_IFNAME)
-                .context("opening the key-negotiation socket")?;
+            let socket = match route {
+                NegotiationRoute::OffTunnel => {
+                    crate::net_pin::negotiation_socket(remote, crate::net_pin::TUNNEL_IFNAME)
+                }
+                // A renewal rides the tunnel it renews: bound to the VIP, not
+                // pinned off the interface.
+                NegotiationRoute::InTunnel { local_vip } => {
+                    crate::net_pin::tunnel_socket(local_vip)
+                }
+            }
+            .context("opening the key-negotiation socket")?;
             let endpoint = client_endpoint_on_socket(socket, identity_ref, gateway_ca.clone())
                 .context("building the authenticated key-negotiation client")?;
             // The challenge comes first, and the request cannot exist without
@@ -473,6 +495,88 @@ pub async fn prepare_for_profile(
         .key_negotiation
         .as_ref()
         .context("profile has no key-negotiation settings")?;
+    prepare_for_profile_via(
+        profile,
+        identities,
+        settings.endpoint.clone(),
+        NegotiationRoute::OffTunnel,
+    )
+    .await
+}
+
+/// Prepares an in-tunnel renewal of the PSK in place (design 2026-10-09).
+///
+/// Same transaction, same pins, same `server_name`; only the path changes.
+/// Never falls back to the public endpoint.
+pub async fn prepare_renewal_for_profile(
+    profile: &ClientProfile,
+    identities: &dyn IdentityProvider,
+) -> Result<NegotiatedKey> {
+    let route = renewal_route(profile)?;
+    prepare_for_profile_via(
+        profile,
+        identities,
+        route.remote.to_string(),
+        NegotiationRoute::InTunnel {
+            local_vip: route.local_vip,
+        },
+    )
+    .await
+}
+
+pub(crate) struct RenewalRoute {
+    pub remote: std::net::SocketAddr,
+    pub local_vip: std::net::IpAddr,
+}
+
+/// The gateway address inside the tunnel, on the negotiation port, and the
+/// VIP of the same family to send from.
+pub(crate) fn renewal_route(profile: &ClientProfile) -> Result<RenewalRoute> {
+    let url = profile.heliosd_url.as_deref().context(
+        "no internal Helios URL in the profile: an in-tunnel renewal has no gateway address",
+    )?;
+    let gateway = tunnel_routed_address(url, &profile.allowed_ips)?;
+    let address: std::net::IpAddr = match gateway.host() {
+        Some(url::Host::Ipv4(address)) => address.into(),
+        Some(url::Host::Ipv6(address)) => address.into(),
+        _ => anyhow::bail!("the renewal is only sent to a literal gateway address"),
+    };
+    let settings = profile
+        .key_negotiation
+        .as_ref()
+        .context("profile has no key-negotiation settings")?;
+    let port = crate::endpoint_resolution::port_of(&settings.endpoint)
+        .context("the key-negotiation endpoint names no port")?;
+    let declared = match address {
+        std::net::IpAddr::V4(_) => profile.address.as_deref(),
+        std::net::IpAddr::V6(_) => profile.address_v6.as_deref(),
+    };
+    let local_vip = declared
+        .and_then(|vip| {
+            vip.trim()
+                .split('/')
+                .next()?
+                .parse::<std::net::IpAddr>()
+                .ok()
+        })
+        .filter(|vip| vip.is_ipv4() == address.is_ipv4())
+        .context("the profile declares no VIP of the gateway address family")?;
+    Ok(RenewalRoute {
+        remote: std::net::SocketAddr::new(address, port),
+        local_vip,
+    })
+}
+
+async fn prepare_for_profile_via(
+    profile: &ClientProfile,
+    identities: &dyn IdentityProvider,
+    remote: String,
+    route: NegotiationRoute,
+) -> Result<NegotiatedKey> {
+    let settings = profile
+        .key_negotiation
+        .as_ref()
+        .context("profile has no key-negotiation settings")?;
     let gateway_ca = base64::engine::general_purpose::STANDARD
         .decode(settings.gateway_ca_der.trim())
         .context("decoding the gateway CA certificate")?;
@@ -514,7 +618,7 @@ pub async fn prepare_for_profile(
     })?;
     prepare(
         KeyNegotiationClient {
-            remote: settings.endpoint.clone(),
+            remote,
             server_name: settings.server_name.clone(),
             client_certificate_chain: identity.certificate_chain,
             client_private_key: identity.private_key,
@@ -524,6 +628,7 @@ pub async fn prepare_for_profile(
             gateway_pq_certificate,
             gateway_ca_pq_public_key,
             minimum_mode: settings.minimum_mode,
+            route,
         },
         settings.mode,
         &client_wg_public_key,

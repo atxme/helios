@@ -138,6 +138,14 @@ impl VpnBackend for RefusingDownBackend {
         anyhow::bail!("adapter is still mounted")
     }
 
+    async fn rekey_peer(&self, _profile: &ClientProfile, _sink: &EventSink) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn transfer_bytes(&self) -> Option<u64> {
+        None
+    }
+
     async fn last_handshake_age(&self) -> Option<Duration> {
         None
     }
@@ -281,10 +289,12 @@ async fn starting_a_same_profile_renegotiation_keeps_the_previous_receipt() {
         identity: "test".into(),
         trust: None,
     });
-    *ctrl.installed.lock().await = Some(InstalledNegotiation {
-        transaction_id: [9; 16],
-        profile: helios.duplicate(),
-    });
+    *ctrl.installed.lock().await = Some(InstalledNegotiation::new(
+        [9; 16],
+        helios.duplicate(),
+        helios.duplicate(),
+        None,
+    ));
 
     // No identity provider: the spawned negotiation fails, but only after
     // `connect` has made its receipt-retention decision.
@@ -305,10 +315,12 @@ async fn starting_a_same_profile_renegotiation_keeps_the_previous_receipt() {
 async fn a_returning_old_handshake_recovers_a_failed_renegotiation() {
     let backend = Arc::new(DryRunBackend::default());
     let ctrl = VpnController::new(backend.clone());
-    *ctrl.installed.lock().await = Some(InstalledNegotiation {
-        transaction_id: [9; 16],
-        profile: profile(),
-    });
+    *ctrl.installed.lock().await = Some(InstalledNegotiation::new(
+        [9; 16],
+        profile(),
+        profile(),
+        None,
+    ));
     *ctrl.state.write().unwrap() = TunnelState::Failed;
     backend.set_handshake_age(Some(Duration::from_secs(1)));
 
@@ -321,10 +333,12 @@ async fn a_returning_old_handshake_recovers_a_failed_renegotiation() {
 async fn connecting_another_profile_drops_an_unrelated_receipt() {
     let backend = Arc::new(DryRunBackend::default());
     let ctrl = VpnController::new(backend);
-    *ctrl.installed.lock().await = Some(InstalledNegotiation {
-        transaction_id: [9; 16],
-        profile: profile(),
-    });
+    *ctrl.installed.lock().await = Some(InstalledNegotiation::new(
+        [9; 16],
+        profile(),
+        profile(),
+        None,
+    ));
     let mut other = profile();
     other.name = "other".into();
 
@@ -350,10 +364,12 @@ fn logging_sink() -> (EventSink, Arc<std::sync::Mutex<Vec<String>>>) {
 /// Puts the controller in the exact state §12.5 is about: a tunnel that
 /// reads as up, holding a negotiated receipt, with no handshake in sight.
 async fn stalled_with_receipt(ctrl: &VpnController, backend: &Arc<DryRunBackend>) {
-    *ctrl.installed.lock().await = Some(InstalledNegotiation {
-        transaction_id: [7; 16],
-        profile: profile(),
-    });
+    *ctrl.installed.lock().await = Some(InstalledNegotiation::new(
+        [7; 16],
+        profile(),
+        profile(),
+        None,
+    ));
     *ctrl.state.write().unwrap() = TunnelState::Up;
     backend.set_handshake_age(Some(Duration::from_secs(300)));
 }
@@ -693,6 +709,14 @@ impl VpnBackend for EndpointRecorder {
         Ok(())
     }
 
+    async fn rekey_peer(&self, _profile: &ClientProfile, _sink: &EventSink) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn transfer_bytes(&self) -> Option<u64> {
+        None
+    }
+
     async fn last_handshake_age(&self) -> Option<Duration> {
         None
     }
@@ -835,4 +859,230 @@ fn the_wireguard_endpoint_log_names_the_family_and_its_origin() {
         "endpoint WireGuard gateway.example:51820 : IPv6 [2001:db8::1]:51820 \
          (premier candidat de sa résolution)"
     );
+}
+
+// ---- In-tunnel PSK renewal ----------------------------------------------------
+
+use crate::backend::renewal::RenewalTrigger;
+
+const NEW_PSK: &str = "bmV3cHNrbmV3cHNrbmV3cHNrbmV3cHNrbmV3cHNrMTI=";
+const OLD_PSK: &str = "b2xkcHNrb2xkcHNrb2xkcHNrb2xkcHNrb2xkcHNrMTI=";
+
+fn secret(value: &str) -> Option<aether::SecretString> {
+    Some(aether::SecretString::new(value))
+}
+
+struct FakePending {
+    psk: aether::SecretString,
+    confirm: Result<(), String>,
+    hang: bool,
+}
+
+#[async_trait::async_trait]
+impl PendingRenewal for FakePending {
+    fn psk(&self) -> Option<&aether::SecretString> {
+        Some(&self.psk)
+    }
+    fn transaction_id(&self) -> [u8; 16] {
+        [9; 16]
+    }
+    fn confirmation_timeout(&self) -> Duration {
+        Duration::from_secs(1)
+    }
+    async fn confirm(self: Box<Self>) -> anyhow::Result<()> {
+        if self.hang {
+            std::future::pending::<()>().await;
+        }
+        self.confirm.map_err(|e| anyhow::anyhow!(e))
+    }
+}
+
+fn pending(confirm: Result<(), String>) -> Box<dyn PendingRenewal> {
+    Box::new(FakePending {
+        psk: aether::SecretString::new(NEW_PSK),
+        confirm,
+        hang: false,
+    })
+}
+
+/// A data plane nobody else has claimed since the renewal started.
+fn owner() -> DataPlaneOwner {
+    DataPlaneOwner::claim(&Arc::new(std::sync::atomic::AtomicU64::new(0)))
+}
+
+async fn mounted() -> (
+    Arc<DryRunBackend>,
+    Arc<dyn VpnBackend>,
+    InstalledNegotiation,
+) {
+    let mut instant = DryRunBackend::default();
+    instant.negotiate_delay = Duration::ZERO;
+    let dry = Arc::new(instant);
+    let backend: Arc<dyn VpnBackend> = dry.clone();
+    let data_plane = ClientProfile {
+        preshared_key: secret(OLD_PSK),
+        ..profile()
+    };
+    backend.up(&data_plane, &sink()).await.unwrap();
+    let receipt = InstalledNegotiation::new([7; 16], profile(), data_plane, Some(0));
+    (dry, backend, receipt)
+}
+
+#[tokio::test]
+async fn a_confirmed_renewal_installs_the_new_psk_and_a_new_receipt() {
+    let (dry, backend, current) = mounted().await;
+    let renewed = renew_slot(&backend, &current, pending(Ok(())), &sink(), owner())
+        .await
+        .unwrap();
+    assert_eq!(renewed.transaction_id, [9; 16]);
+    assert_eq!(dry.rekeyed_psks(), vec![secret(NEW_PSK)]);
+    assert_eq!(renewed.data_plane.preshared_key, secret(NEW_PSK));
+    assert!(renewed.data_plane.preshared_key_is_negotiated);
+}
+
+#[tokio::test]
+async fn a_renewal_restarts_the_volume_count_from_the_re_registered_peer() {
+    let (dry, backend, current) = mounted().await;
+    dry.set_transfer_bytes(Some(70 * 1024 * 1024 * 1024));
+    let mut renewed = renew_slot(&backend, &current, pending(Ok(())), &sink(), owner())
+        .await
+        .unwrap();
+    // `rekey_peer` restarted the client counters at zero; 80 GiB from there.
+    let now = std::time::Instant::now();
+    let wall = std::time::SystemTime::now();
+    assert_eq!(
+        renewed.clock.due(now, wall, Some(79 * 1024 * 1024 * 1024)),
+        None
+    );
+    assert_eq!(
+        renewed.clock.due(now, wall, Some(80 * 1024 * 1024 * 1024)),
+        Some(RenewalTrigger::Volume)
+    );
+}
+
+#[tokio::test]
+async fn a_failed_confirmation_puts_the_previous_psk_back() {
+    let (dry, backend, current) = mounted().await;
+    assert!(renew_slot(
+        &backend,
+        &current,
+        pending(Err("lost".into())),
+        &sink(),
+        owner()
+    )
+    .await
+    .is_err());
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        dry.rekeyed_psks(),
+        vec![secret(NEW_PSK), secret(OLD_PSK)],
+        "the rollback re-registers the peer with the PSK it had"
+    );
+}
+
+#[tokio::test]
+async fn a_cancelled_renewal_still_puts_the_previous_psk_back() {
+    let (dry, backend, current) = mounted().await;
+    let task = tokio::spawn(async move {
+        let hanging = Box::new(FakePending {
+            psk: aether::SecretString::new(NEW_PSK),
+            confirm: Ok(()),
+            hang: true,
+        });
+        renew_slot(&backend, &current, hanging, &sink(), owner()).await
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    task.abort();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(dry.rekeyed_psks().last(), Some(&secret(OLD_PSK)));
+}
+
+#[tokio::test]
+async fn a_renewal_outcome_never_overwrites_a_newer_receipt() {
+    let (_dry, _backend, current) = mounted().await;
+    let newer = InstalledNegotiation::new([8; 16], profile(), current.data_plane.duplicate(), None);
+    let mut slot = Some(newer);
+    let renewed =
+        InstalledNegotiation::new([9; 16], profile(), current.data_plane.duplicate(), None);
+    settle_renewal(&mut slot, [7; 16], Ok(renewed), &sink());
+    assert_eq!(
+        slot.unwrap().transaction_id,
+        [8; 16],
+        "a reconnection owns the slot now"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_renewal_schedules_the_next_attempt() {
+    let (_dry, _backend, current) = mounted().await;
+    let mut slot = Some(current);
+    settle_renewal(&mut slot, [7; 16], Err(anyhow::anyhow!("refused")), &sink());
+    let receipt = slot.unwrap();
+    assert_eq!(receipt.failures, 1);
+    assert!(receipt
+        .next_attempt
+        .is_some_and(|at| at > std::time::Instant::now()));
+}
+
+#[tokio::test]
+async fn nothing_is_renewed_before_the_threshold_or_without_a_tunnel() {
+    let (dry, _backend, receipt) = mounted().await;
+    let ctrl = VpnController::new(dry.clone());
+    *ctrl.installed.lock().await = Some(receipt);
+    ctrl.poll_renewal(sink()).await; // state is Down
+    *ctrl.state.write().unwrap() = TunnelState::Up;
+    ctrl.poll_renewal(sink()).await; // fresh receipt
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(dry.rekeyed_psks().is_empty());
+    assert!(!ctrl.renewing.load(Ordering::SeqCst));
+
+    *ctrl.state.write().unwrap() = TunnelState::Down;
+    assert!(
+        ctrl.renew_now(sink()).await.is_err(),
+        "no tunnel up: nothing to renew"
+    );
+}
+
+/// A reconnection or a disconnection takes the data plane over while a
+/// renewal is in flight. The renewal's rollback must then leave the peer
+/// alone: re-registering the previous PSK would overwrite the newer tunnel.
+#[tokio::test]
+async fn a_rollback_never_touches_a_tunnel_that_changed_hands() {
+    let (dry, backend, current) = mounted().await;
+    let epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let owner = DataPlaneOwner::claim(&epoch);
+    let task = tokio::spawn(async move {
+        let hanging = Box::new(FakePending {
+            psk: aether::SecretString::new(NEW_PSK),
+            confirm: Ok(()),
+            hang: true,
+        });
+        renew_slot(&backend, &current, hanging, &sink(), owner).await
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    epoch.fetch_add(1, Ordering::SeqCst);
+    task.abort();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        dry.rekeyed_psks(),
+        vec![secret(NEW_PSK)],
+        "only the renewal's own re-registration; no restore over the newer tunnel"
+    );
+}
+
+/// A renewal that lost the data plane before installing its PSK installs
+/// nothing at all.
+#[tokio::test]
+async fn a_renewal_that_lost_the_data_plane_installs_nothing() {
+    let (dry, backend, current) = mounted().await;
+    let epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let owner = DataPlaneOwner::claim(&epoch);
+    epoch.fetch_add(1, Ordering::SeqCst);
+    assert!(
+        renew_slot(&backend, &current, pending(Ok(())), &sink(), owner)
+            .await
+            .is_err()
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(dry.rekeyed_psks().is_empty());
 }

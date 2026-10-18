@@ -90,6 +90,8 @@ input iifname \"eth0\" udp dport 51820 accept
 output oifname \"eth0\" udp sport 51820 accept
 input iifname \"eth0\" udp dport 51821 accept
 output oifname \"eth0\" udp sport 51821 accept
+input iifname \"helios0\" udp dport 51821 accept
+output oifname \"helios0\" udp sport 51821 accept
 output oifname \"eth0\" ip daddr 203.0.113.10/32 udp dport 51820 accept
 input iifname \"eth0\" icmpv6 type nd-neighbor-solicit ip6 hoplimit 255 accept
 input iifname \"eth0\" icmpv6 type nd-neighbor-advert ip6 hoplimit 255 accept
@@ -159,6 +161,8 @@ input iifname \"eth0\" udp dport 51820 accept
 output oifname \"eth0\" udp sport 51820 accept
 input iifname \"eth0\" udp dport 51821 accept
 output oifname \"eth0\" udp sport 51821 accept
+input iifname \"helios0\" udp dport 51821 accept
+output oifname \"helios0\" udp sport 51821 accept
 output oifname \"eth0\" ip daddr 203.0.113.10/32 udp dport 51820 accept
 input iifname \"eth0\" icmpv6 type nd-neighbor-solicit ip6 hoplimit 255 accept
 input iifname \"eth0\" icmpv6 type nd-neighbor-advert ip6 hoplimit 255 accept
@@ -257,6 +261,8 @@ input iifname \"enp3s0\" udp dport 51821 accept
 output oifname \"enp3s0\" udp sport 51821 accept
 input iifname \"wlo1\" udp dport 51821 accept
 output oifname \"wlo1\" udp sport 51821 accept
+input iifname \"helios0\" udp dport 51821 accept
+output oifname \"helios0\" udp sport 51821 accept
 output oifname \"enp3s0\" ip daddr 203.0.113.10/32 udp dport 51820 accept
 output oifname \"wlo1\" ip daddr 203.0.113.10/32 udp dport 51820 accept
 output oifname \"enp3s0\" udp dport 67 accept
@@ -469,6 +475,8 @@ input iifname \"eth0\" udp dport 51820 accept
 output oifname \"eth0\" udp sport 51820 accept
 input iifname \"eth0\" udp dport 51821 accept
 output oifname \"eth0\" udp sport 51821 accept
+input iifname \"helios0\" udp dport 51821 accept
+output oifname \"helios0\" udp sport 51821 accept
 output oifname \"eth0\" ip daddr 203.0.113.10/32 udp dport 51820 accept
 input iifname \"eth0\" icmpv6 type nd-neighbor-solicit ip6 hoplimit 255 accept
 input iifname \"eth0\" icmpv6 type nd-neighbor-advert ip6 hoplimit 255 accept
@@ -542,6 +550,8 @@ input iifname \"eth0\" udp dport 51820 accept
 output oifname \"eth0\" udp sport 51820 accept
 input iifname \"eth0\" udp dport 51821 accept
 output oifname \"eth0\" udp sport 51821 accept
+input iifname \"helios0\" udp dport 51821 accept
+output oifname \"helios0\" udp sport 51821 accept
 output oifname \"eth0\" ip daddr 203.0.113.10/32 udp dport 51820 accept
 input iifname \"eth0\" icmpv6 type nd-neighbor-solicit ip6 hoplimit 255 accept
 input iifname \"eth0\" icmpv6 type nd-neighbor-advert ip6 hoplimit 255 accept
