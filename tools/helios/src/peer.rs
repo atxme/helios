@@ -51,31 +51,6 @@ pub struct KeyNegotiationAdmission<'a> {
 }
 
 /// Admits a peer and returns the VIP the gateway derived for it.
-pub async fn admit(
-    client: &Client,
-    base: &str,
-    name: &str,
-    public_key: &str,
-    admin: bool,
-    certificate_sha256: Option<&str>,
-) -> Result<PeerSummary> {
-    admit_with_policy(
-        client,
-        base,
-        name,
-        public_key,
-        admin,
-        KeyNegotiationAdmission {
-            tls_certificate_sha256: certificate_sha256,
-            pq_certificate_sha256: None,
-            tls_certificate: None,
-            pq_certificate: None,
-            minimum_mode: ProtectionMode::Classic,
-        },
-    )
-    .await
-}
-
 pub async fn admit_with_policy(
     client: &Client,
     base: &str,
@@ -273,25 +248,29 @@ mod tests {
     #[tokio::test]
     async fn admission_and_revocation_call_the_expected_routes() {
         let client = Client::new();
-        let (base, server) = response_server(peer_summary("portable", false, "classic")).await;
-        let admitted = admit(
+        let (base, server) = response_server(peer_summary("portable", false, "ml_kem")).await;
+        let admitted = admit_with_policy(
             &client,
             &base,
             "portable",
             "peer-public",
             false,
-            Some("tls"),
+            KeyNegotiationAdmission {
+                tls_certificate_sha256: Some("tls"),
+                pq_certificate_sha256: Some("pq"),
+                tls_certificate: None,
+                pq_certificate: None,
+                minimum_mode: ProtectionMode::MlKem,
+            },
         )
         .await
         .unwrap();
         assert_eq!(admitted.name, "portable");
-        assert_eq!(
-            admitted.minimum_key_negotiation_mode,
-            ProtectionMode::Classic
-        );
+        assert_eq!(admitted.minimum_key_negotiation_mode, ProtectionMode::MlKem);
         let request = server.await.unwrap();
         assert!(request.starts_with("POST /api/peers "));
         assert!(request.contains("\"key_negotiation_certificate_sha256\":\"tls\""));
+        assert!(request.contains("\"key_negotiation_pq_certificate_sha256\":\"pq\""));
 
         let (base, server) = response_server(peer_summary("portable", false, "classic")).await;
         let removed = revoke(&client, &base, "portable").await.unwrap();

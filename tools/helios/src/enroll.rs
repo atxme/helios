@@ -19,10 +19,10 @@
 //! # Why the result is a secret
 //!
 //! The identity's two private keys are in the file. That is what makes the
-//! import a single gesture, and it is also what makes the document as
-//! sensitive as `profile emit --with-private-key`: it is born at 0600, it
-//! travels through a controlled channel, and it is destroyed on both ends
-//! after import. `profile emit` remains the path that carries no secret.
+//! import a single gesture, and it is also what makes the document
+//! sensitive: it is born at 0600, it travels through a controlled channel,
+//! and it is destroyed on both ends after import. `profile emit` remains the
+//! path that carries no secret.
 
 use std::path::{Path, PathBuf};
 

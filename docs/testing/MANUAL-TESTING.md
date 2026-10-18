@@ -432,8 +432,9 @@ et émet son profil d'invitation `lab.invitation.orion`. Le profil assisté
 `lab-poste.orion`, qui portait tout ce qu'il fallait pour un Orion neuf, n'est
 plus produit depuis le 18 octobre 2026 : son émission admet un nouveau pair
 sans certificats de négociation, ce que le plancher `ml_kem` refuse
-([TESTING](TESTING.md#banc-de-développement)). Tant que cet écart avec ADR-004
-§6 n'est pas tranché, ce chemin court n'existe plus pour un Orion neuf.
+([TESTING](TESTING.md#banc-de-développement)) ; l'option est refusée depuis
+(ADR-004 §6, amendement du 18 octobre 2026). Pour un Orion neuf, le document
+complet vient de `helios enroll`.
 
 Vérifier ensuite, dans l'onglet **Profils** :
 

@@ -136,6 +136,20 @@ Le document reste le format v1 déjà lu par `orion-core::profile_import`. Le
 champ `private_key` y devient facultatif : c’est ce qui rend le mode invitation
 représentable sans inventer un second format.
 
+> **Amendement du 18 octobre 2026 — `profile emit` n’admet plus personne.**
+> Depuis la spécification de rotation v5 (`a9f78a9`, 6 août 2026),
+> l’admission exige les certificats de négociation TLS et PQ du client
+> (plancher `ml_kem`). `profile emit` admettait sans eux : pour un nouveau
+> client, les deux modes ci-dessus étaient refusés par la gateway. La commande
+> ne fait désormais que **réémettre** l’invitation d’un pair déjà admis, à son
+> adresse persistée ; une clé inconnue est refusée avec les commandes
+> d’admission. `--with-private-key` est refusé avant tout appel : la paire
+> qu’il générait n’était jamais admise. Le besoin qu’il servait — un parc où
+> l’utilisateur ne peut rien faire — est couvert par `helios enroll`, qui
+> génère la paire, émet les certificats, admet et livre un document complet
+> sous le même régime (`0600`, canal maîtrisé, effacement après import).
+> La suppression de l’option, plutôt que son refus, reste à décider.
+
 ### 7. Aucun secret ne traverse la CI hébergée
 
 La CI hébergée construit et publie les artefacts gateway **nus** accompagnés de

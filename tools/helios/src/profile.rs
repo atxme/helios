@@ -30,7 +30,7 @@ use reqwest::Client;
 use serde::Serialize;
 
 use crate::{
-    api,
+    api::{self, NetworkPeerView},
     ui::{self, Tone, Ui},
 };
 
@@ -320,7 +320,8 @@ fn capture_label(allowed_ips: &str) -> &'static str {
 }
 
 pub async fn emit(client: &Client, base: &str, options: EmitOptions) -> Result<()> {
-    let (public_key, private_key) = resolve_keys(&options)?;
+    let public_key = resolve_public_key(&options)?;
+    refuse_admission_options(&options)?;
 
     let view = api::network(client, base).await?;
     let gateway_public_key = view
@@ -332,18 +333,14 @@ pub async fn emit(client: &Client, base: &str, options: EmitOptions) -> Result<(
          on the gateway, with console access",
         )?;
 
-    let address = admit_or_reuse(client, base, &options, &public_key).await?;
-    let address_v6 = admitted_address_v6(
-        &api::network(client, base).await?,
-        &options.name,
-        &public_key,
-        &address,
-    )?;
+    let address = reuse_admission(&view.peers, &options.name, &public_key)?;
+    eprintln!("  \x1b[2mpeer admitted with this key — profile emitted for its address\x1b[0m");
+    let address_v6 = admitted_address_v6(&view, &options.name, &public_key, &address)?;
 
     let json = render(Profile {
         name: &options.name,
         endpoint: &options.endpoint,
-        private_key: private_key.as_deref(),
+        private_key: None,
         peer_public_key: &gateway_public_key,
         address: &address,
         address_v6: address_v6.as_deref(),
@@ -360,9 +357,9 @@ pub async fn emit(client: &Client, base: &str, options: EmitOptions) -> Result<(
 
     match &options.output {
         Some(path) => {
-            // A complete profile carries a private key: it is born at 0600,
-            // and never silently replaces an existing file.
-            crate::files::write_new(path, json.as_bytes(), private_key.is_some())?;
+            // An invitation carries no secret; it still never silently
+            // replaces an existing file.
+            crate::files::write_new(path, json.as_bytes(), false)?;
             report(path, &options, &public_key);
         }
         None => println!("{}", json.as_str()),
@@ -370,66 +367,76 @@ pub async fn emit(client: &Client, base: &str, options: EmitOptions) -> Result<(
     Ok(())
 }
 
-/// Picks the mode and returns `(public key, optional private key)`.
-fn resolve_keys(options: &EmitOptions) -> Result<(String, Option<String>)> {
-    match (&options.public_key, options.with_private_key) {
-        (Some(_), true) => bail!(
-            "--public-key and --with-private-key are mutually exclusive: either the client \
-             already holds its key and supplies its public half, or the operator generates \
-             the pair"
-        ),
-        (Some(public_key), false) => {
-            let public_key = public_key.trim().to_string();
-            aether::wg::validate_key(&public_key).context("invalid client public key")?;
-            Ok((public_key, None))
-        }
-        (None, true) => {
-            let pair = aether::wg::generate_keypair()
-                .map_err(|e| anyhow::anyhow!("generating the client key pair: {e}"))?;
-            Ok((pair.public_key, Some(pair.private_key.expose().to_string())))
-        }
-        (None, false) => bail!(
-            "provide --public-key <client public key> (recommended: the client's secret never \
-             travels), or --with-private-key so the operator generates the pair"
-        ),
+/// The client's public key, the only mode left.
+///
+/// `emit` admits nobody: admission requires the client's TLS and PQ
+/// key-negotiation certificates (floor `ml_kem`), which this command neither
+/// issues nor carries. The assisted mode generated a pair the gateway had
+/// never seen, so it could only ever be refused there; it is refused here,
+/// before any call, with the command that issues keys, certificates,
+/// admission and profile at once.
+fn resolve_public_key(options: &EmitOptions) -> Result<String> {
+    if options.with_private_key {
+        bail!(
+            "--with-private-key is refused: it generated a pair the gateway had never admitted, \
+             and admission now requires the client's key-negotiation certificates. To enroll \
+             a new client, `helios enroll` issues its keys, certificates, admission and \
+             profile at once"
+        );
     }
+    let Some(public_key) = &options.public_key else {
+        bail!(
+            "provide --public-key <public key of an admitted client>: `profile emit` re-emits \
+             the invitation of a peer the gateway already holds. To enroll a new client, use \
+             `helios enroll`"
+        );
+    };
+    let public_key = public_key.trim().to_string();
+    aether::wg::validate_key(&public_key).context("invalid client public key")?;
+    Ok(public_key)
 }
 
-/// Admits the peer, or reuses its admission if it already matches.
-///
-/// Re-emitting a lost profile is a common need. Without this fallback, the
-/// peer would have to be revoked to be re-admitted — cutting off the user to
-/// rebuild the file they misplaced.
-async fn admit_or_reuse(
-    client: &Client,
-    base: &str,
-    options: &EmitOptions,
-    public_key: &str,
-) -> Result<String> {
-    match crate::peer::admit(client, base, &options.name, public_key, options.admin, None).await {
-        Ok(peer) => Ok(peer.address),
-        Err(error) => {
-            let view = api::network(client, base).await?;
-            let existing = view
-                .peers
-                .iter()
-                .find(|peer| peer.name.trim() == options.name.trim())
-                .ok_or(error)?;
-            if existing.public_key.trim() != public_key {
-                bail!(
-                    "a peer named \"{}\" is already admitted with a different public key. \
-                     Revoke it first (`helios peer revoke --name {}`) if the old key is \
-                     indeed lost: the client holding it will drop at its next handshake.",
-                    existing.name,
-                    existing.name
-                );
-            }
-            eprintln!(
-                "  \x1b[2mpeer already admitted with the same key — profile re-emitted for its address\x1b[0m"
-            );
-            Ok(existing.address.clone())
-        }
+/// Refuses the options that only meant something when `emit` admitted the
+/// peer: silently ignored, they would hand out a profile that is not the one
+/// asked for.
+fn refuse_admission_options(options: &EmitOptions) -> Result<()> {
+    if options.admin {
+        bail!(
+            "--admin is refused: `profile emit` admits nobody, and the role is chosen at \
+             admission — `helios peer add --admin` with the client's key-negotiation \
+             certificates, or `helios enroll --admin`"
+        );
     }
+    Ok(())
+}
+
+/// The persisted address of the peer named `name`, which must hold
+/// `public_key`.
+///
+/// Re-emitting a lost invitation is the need this command still serves:
+/// without it, the peer would have to be revoked and re-admitted — cutting
+/// off the user to rebuild the file they misplaced.
+fn reuse_admission(peers: &[NetworkPeerView], name: &str, public_key: &str) -> Result<String> {
+    let Some(existing) = peers.iter().find(|peer| peer.name.trim() == name.trim()) else {
+        bail!(
+            "no peer named \"{name}\" is admitted, and `profile emit` admits nobody: \
+             admission requires the client's key-negotiation certificates. Admit it with \
+             `helios peer add --name {name} --public-key <key> \
+             --key-negotiation-certificate-sha256 <sha256> \
+             --key-negotiation-pq-certificate-sha256 <sha256>`, then re-run this command; \
+             or enroll it in one go with `helios enroll`"
+        );
+    };
+    if existing.public_key.trim() != public_key {
+        bail!(
+            "a peer named \"{}\" is already admitted with a different public key. \
+             Revoke it first (`helios peer revoke --name {}`) if the old key is \
+             indeed lost: the client holding it will drop at its next handshake.",
+            existing.name,
+            existing.name
+        );
+    }
+    Ok(existing.address.clone())
 }
 
 /// The IPv6 VIP the gateway persisted for the peer just admitted, if any.
@@ -490,15 +497,8 @@ fn report(path: &Path, options: &EmitOptions, public_key: &str) {
         path.display()
     );
     println!();
-    if options.with_private_key {
-        println!(
-            "  \x1b[33mThis file contains the client's private key.\x1b[0m Hand it over through a"
-        );
-        println!("  controlled channel, then erase it from the operator workstation.");
-    } else {
-        println!("  \x1b[2mNo private key in this file: Orion completes it from the local\x1b[0m");
-        println!("  \x1b[2mprofile of the same name, the one that holds the key.\x1b[0m");
-    }
+    println!("  \x1b[2mNo private key in this file: Orion completes it from the local\x1b[0m");
+    println!("  \x1b[2mprofile of the same name, the one that holds the key.\x1b[0m");
     println!();
     println!("  \x1b[2mAdmitted public key: {public_key}\x1b[0m");
 }
@@ -561,37 +561,104 @@ mod tests {
     #[test]
     fn invitation_mode_produces_no_private_key() {
         let pair = aether::wg::generate_keypair().unwrap();
-        let (public_key, private_key) = resolve_keys(&EmitOptions {
+        let public_key = resolve_public_key(&EmitOptions {
             public_key: Some(pair.public_key.clone()),
             ..options()
         })
         .expect("invitation mode");
         assert_eq!(public_key, pair.public_key);
+    }
+
+    /// The assisted mode generated a pair the gateway had never seen, so it
+    /// had to admit it — without negotiation certificates, which the `ml_kem`
+    /// admission floor refuses every time. It is refused here, before any
+    /// call, and the message names the command that does both at once.
+    #[test]
+    fn assisted_mode_is_refused_and_points_to_enroll() {
+        let error = resolve_public_key(&EmitOptions {
+            with_private_key: true,
+            ..options()
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("helios enroll"), "message: {error}");
+        assert!(error.contains("certificates"), "message: {error}");
+    }
+
+    fn admitted(name: &str, public_key: &str) -> NetworkPeerView {
+        NetworkPeerView {
+            name: name.into(),
+            public_key: public_key.into(),
+            address: "100.64.1.2/32".into(),
+            address_v6: None,
+            preshared_key_configured: false,
+            key_negotiation_certificate_sha256: None,
+            key_negotiation_pq_certificate_sha256: None,
+            minimum_key_negotiation_mode: aether::key_negotiation::ProtectionMode::MlKem,
+            admin: false,
+        }
+    }
+
+    /// `emit` admits nobody: a key the gateway does not know is refused, and
+    /// the message names the two ways a client is admitted.
+    #[test]
+    fn an_unadmitted_key_is_refused_with_the_admission_commands() {
+        let key = aether::wg::generate_keypair().unwrap().public_key;
+        let error = reuse_admission(&[], "portable", &key)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("helios peer add"), "message: {error}");
         assert!(
-            private_key.is_none(),
-            "the client's secret must not be manufactured by the operator"
+            error.contains("--key-negotiation-pq-certificate-sha256"),
+            "message: {error}"
+        );
+        assert!(error.contains("helios enroll"), "message: {error}");
+    }
+
+    #[test]
+    fn an_admitted_key_reuses_its_persisted_address() {
+        let key = aether::wg::generate_keypair().unwrap().public_key;
+        assert_eq!(
+            reuse_admission(&[admitted("portable", &key)], "portable", &key).unwrap(),
+            "100.64.1.2/32"
         );
     }
 
     #[test]
-    fn assisted_mode_produces_a_consistent_pair() {
-        let (public_key, private_key) = resolve_keys(&EmitOptions {
-            with_private_key: true,
+    fn a_name_admitted_with_another_key_is_refused() {
+        let admitted_key = aether::wg::generate_keypair().unwrap().public_key;
+        let other_key = aether::wg::generate_keypair().unwrap().public_key;
+        let error = reuse_admission(
+            &[admitted("portable", &admitted_key)],
+            "portable",
+            &other_key,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("different public key"), "message: {error}");
+    }
+
+    /// `--admin` chose the role of the peer `emit` admitted. Now that it
+    /// admits nobody, ignoring the flag would hand out a profile whose role
+    /// is not the one asked for: it is refused, pointing to the admission.
+    #[test]
+    fn the_admin_role_is_refused_since_emit_admits_nobody() {
+        let error = refuse_admission_options(&EmitOptions {
+            admin: true,
+            public_key: Some(aether::wg::generate_keypair().unwrap().public_key),
             ..options()
         })
-        .expect("assisted mode");
-        let private_key = private_key.expect("generated private key");
-        assert_eq!(
-            aether::wg::public_from_private(&private_key).unwrap(),
-            public_key
-        );
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("--admin"), "message: {error}");
+        assert!(error.contains("helios peer add"), "message: {error}");
     }
 
     /// The two modes are exclusive: combining them would mean admitting one
     /// key and delivering another, hence a profile that never comes up.
     #[test]
     fn the_two_modes_cannot_be_combined() {
-        assert!(resolve_keys(&EmitOptions {
+        assert!(resolve_public_key(&EmitOptions {
             public_key: Some(aether::wg::generate_keypair().unwrap().public_key),
             with_private_key: true,
             ..options()
@@ -600,15 +667,16 @@ mod tests {
     }
 
     #[test]
-    fn without_an_explicit_mode_the_tool_refuses_rather_than_choosing() {
-        let error = resolve_keys(&options()).unwrap_err().to_string();
+    fn without_a_public_key_the_tool_refuses_and_points_to_enroll() {
+        let error = resolve_public_key(&options()).unwrap_err().to_string();
         assert!(error.contains("--public-key"), "message: {error}");
-        assert!(error.contains("--with-private-key"), "message: {error}");
+        assert!(error.contains("helios enroll"), "message: {error}");
+        assert!(!error.contains("--with-private-key"), "message: {error}");
     }
 
     #[test]
     fn an_invalid_public_key_is_rejected_before_any_call() {
-        assert!(resolve_keys(&EmitOptions {
+        assert!(resolve_public_key(&EmitOptions {
             public_key: Some("not-a-key".into()),
             ..options()
         })

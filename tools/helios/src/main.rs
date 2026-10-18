@@ -374,7 +374,9 @@ enum ProfileCmd {
         /// Document à relire (`.orion`, `.json` ou `.conf`).
         path: PathBuf,
     },
-    /// Emits a client profile readable by Orion's import.
+    /// Re-emits the invitation profile of an admitted client, readable by
+    /// Orion's import. Admits nobody: a new client goes through
+    /// `helios enroll`, or `helios peer add` with its certificates.
     Emit {
         /// Profile name, also used as the peer name on the gateway.
         #[arg(long)]
@@ -386,12 +388,12 @@ enum ProfileCmd {
         /// the client's secret never travels.
         #[arg(long)]
         public_key: Option<String>,
-        /// The operator generates the pair and delivers a complete profile.
-        /// The only path where a client private key exists outside the
-        /// client workstation.
+        /// Refused: generated a pair the gateway never admitted. Use
+        /// `helios enroll` for a new client.
         #[arg(long)]
         with_private_key: bool,
-        /// Admits the peer as a control-plane administrator.
+        /// Refused: the role is chosen at admission (`helios peer add --admin`
+        /// or `helios enroll --admin`).
         #[arg(long)]
         admin: bool,
         /// Trafic capté par le tunnel : une ou plusieurs plages CIDR,

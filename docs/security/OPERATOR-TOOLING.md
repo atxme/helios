@@ -303,8 +303,11 @@ restaure donc le slot précédent.
 
 ## 6. Profil client
 
-Mode recommandé — le client détient déjà sa clé et communique sa moitié
-publique (visible dans Orion, écran *Profils*) :
+`profile emit` **réémet** l'invitation d'un client déjà admis ; il n'admet
+personne. L'admission exige les certificats de négociation TLS et PQ du client
+(plancher `ml_kem`) : un nouveau client passe par `helios enroll` (ci-dessous),
+ou par `helios peer add` avec ses deux empreintes. Le client détient sa clé et
+communique sa moitié publique (visible dans Orion, écran *Profils*) :
 
 ```sh
 helios profile emit --name portable \
@@ -317,21 +320,14 @@ Le fichier produit ne contient **aucun** secret : il porte l'endpoint, la clé
 publique de la gateway, la VIP attribuée et l'URL interne de l'API. Orion
 l'importe et complète avec la clé privée du profil local de même nom.
 
-Mode assisté, quand l'utilisateur ne peut rien faire lui-même :
-
-```sh
-helios profile emit --name portable \
-  --endpoint vpn.example.net:51820 \
-  --with-private-key --output portable.json
-```
-
-Ce fichier **contient la clé privée du client** : il naît en `0600`, se remet
-par un canal maîtrisé et s'efface du poste opérateur ensuite. C'est le seul
-chemin où une clé privée client existe hors du poste client.
-
-Les deux modes admettent le pair au passage. Réémettre un profil pour une clé
-déjà admise réutilise son adresse ; changer de clé pour un nom existant exige
-une révocation explicite.
+La commande réutilise l'adresse persistée du pair ; une clé inconnue est
+refusée avec les commandes d'admission, et changer de clé pour un nom existant
+exige une révocation explicite. `--with-private-key` (l'ancien mode assisté) et
+`--admin` sont refusés depuis le 18 octobre 2026 : le premier générait une paire
+que la gateway n'avait jamais admise, donc toujours refusée faute de
+certificats ; le second choisissait un rôle à une admission qui n'a plus lieu.
+Pour un utilisateur qui ne peut rien faire lui-même, `helios enroll` génère la
+paire et livre un document complet.
 
 ### Enrôlement complet — une seule commande
 
@@ -362,8 +358,7 @@ l'ancienne identité, donc coupe le poste qui la détenait.
 
 Le fichier produit **contient les clés privées du client**. Il naît en `0600`,
 se remet par un canal maîtrisé et s'efface des deux postes après import : Orion
-scelle l'identité au compte Windows et n'a plus besoin du fichier. C'est le même
-régime que `profile emit --with-private-key`.
+scelle l'identité au compte Windows et n'a plus besoin du fichier.
 
 La commande refuse d'avancer si la gateway ne sert aucun matériel de
 négociation, et si son certificat est épinglé à une autre identité WireGuard que
