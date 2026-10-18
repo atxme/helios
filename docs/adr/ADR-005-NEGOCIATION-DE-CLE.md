@@ -697,9 +697,9 @@ la cause.
   de backoff qui ne transforme pas une coupure WAN en boucle agressive.
 - **DPAPI ne se compile ni ne s'exerce en WSL2.** Hors Windows, le scellement
   échoue explicitement (`IdentityStoreError::UnsupportedPlatform`) plutôt que
-  d'écrire ces clés en clair. Débloquer Linux suppose `libsecret`, macOS le
-  Keychain — chacun avec sa sémantique de déverrouillage, ce qui interdit de
-  les simuler.
+  d'écrire ces clés en clair. Débloquer Linux suppose `libsecret`, avec sa
+  sémantique de déverrouillage, ce qui interdit de la simuler. macOS est hors
+  périmètre : Orion ne le cible pas.
 - **Les effets matériels ne sont pas prouvés en WSL2.** La transaction est
   couverte par les tests ; la pose réelle du slot sur WireGuard-NT et sur le
   backend noyau exige deux machines et les deux redirections

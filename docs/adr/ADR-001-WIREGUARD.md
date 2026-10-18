@@ -64,6 +64,9 @@ On bascule sur WireGuard. Cinq points structurent la bascule.
 > | Windows | `WGApi<Kernel>`    | pilote noyau `wireguard-nt` |
 > | macOS   | `WGApi<Userspace>` | BoringTun embarqué |
 >
+> La ligne macOS décrit ce que le crate propose, pas une cible : macOS est hors
+> périmètre d'Orion (décision du 18 octobre 2026).
+>
 > **Conséquence sur l'argumentaire d'origine** : la promesse « isolation à 100 %
 > en user-space, aucun risque de BSOD » tombe pour Windows. Elle était de toute
 > façon intenable — Wintun est lui-même un pilote NDIS noyau (voir les notes de
@@ -599,7 +602,7 @@ rien n'est retapé, donc rien ne peut être mal recopié.
 **Limite connue — vérification matérielle.** DPAPI ne se compile ni ne s'exerce
 en WSL2 : hors Windows, `seal`/`unseal` échouent explicitement
 (`IdentityStoreError::UnsupportedPlatform`) plutôt que d'écrire ces clés en
-clair. Débloquer Linux suppose `libsecret`, macOS le Keychain. Voir
+clair. Débloquer Linux suppose `libsecret` ; macOS est hors périmètre. Voir
 [TESTING](../testing/TESTING.md).
 
 ## Conséquences sur le workspace

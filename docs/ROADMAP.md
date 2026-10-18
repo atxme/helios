@@ -39,7 +39,7 @@ Le reste se répartit en trois natures, qu'il ne faut pas mélanger dans un mêm
 
 ## 2. Horizon 0 — Cohérence documentaire
 
-Quatre écarts relevés le 9 octobre ont été **vérifiés le 18 octobre et sont
+Les écarts relevés le 9 octobre ont été **vérifiés le 18 octobre et sont
 résolus** dans les sources. Ils ne sont plus à corriger :
 
 | Sujet | Constat du 9 octobre | Constat du 18 octobre |
@@ -48,11 +48,11 @@ résolus** dans les sources. Ils ne sont plus à corriger :
 | Droits API | `SECURITY.md` disait que tout pair est administrateur | `SECURITY.md` décrit le drapeau `admin` par pair ; `helios-api/src/auth.rs` l'applique |
 | Secrets Orion | `SECURITY.md` disait un fichier local | `SECURITY.md` décrit le coffre HVLT (TPM puis DPAPI, mode dégradé explicite) |
 | VIP non réconciliée | Écart supposé avec `data_plane.rs` | `README.md` dit que l'adresse de `network.toml` fait autorité, comme le code. La discordance avec ADR-001 §4 reste traitée par D3 |
+| `from_peers(&[])` (ancien D4) | Table de pairs vide à l'enrôlement | Supprimé avec l'IPAM unifié (`26ac509`, 1er octobre) ; CRATE-REORGANIZATION §13.4 mis à jour |
 
-Sujet encore ouvert, sans correctif de doc à ce stade : les ADR et la
-spécification de Orion mentionnent encore `libsecret` et le Keychain macOS
-(ADR-005 §, ADR-006 « Limites connues »). Ces passages devront être retirés
-lors d'une révision d'ADR, car macOS est hors périmètre.
+Les mentions prospectives de macOS (Keychain, cible Orion) ont été retirées
+d'ADR-001, ADR-005 et ADR-006 le 18 octobre ; les mentions historiques de
+l'ère IKEv2 restent.
 
 ## 3. Horizon 1 : validation sur cible
 
@@ -88,7 +88,6 @@ est bloqué ou risque d'être refait. Une décision ne se prend pas depuis le d�
 | D1 | **Compteur anti-rejeu** : fichier ou NV TPM (si NV TPM, validation matérielle requise) | ADR-002 amendement 2, ADR-006 « Rollback complet » | fichier de récupération WireGuard signé (F5) ; claim de fraîcheur des coffres |
 | D2 | Texte d'ADR-001 §3 bis après T01 (`::/0`) | ETUDE-IPV6 T01 | clôture de la fuite IPv6 côté ADR |
 | D3 | ADR-001 §4 et ADR-004 §5 contredisent l'IPAM unifié (à confirmer contre le code) | ETUDE-IPV6 T11 + T14 | mise en conformité ADR ↔ code |
-| D4 | `PeerAddressTable::from_peers(&[])` à l'enrôlement, alors qu'ADR-001 §4 exige la table vivante | CRATE-REORGANIZATION §13.4 | cohérence IPAM à l'admission |
 | D5 | **DNS des clients** non tunnelé, même avec `allow_client_internet` | README, `helios-firewall/src/ruleset.rs`, ADR-006 | confidentialité des noms résolus (F7) |
 | D6 | Activation de l'anti-spoof `fib` en multi-uplink / policy routing | FIREWALL-V2 « Capacités » | encodeur déjà livré |
 | D7 | Acceptation ICMPv6 Packet Too Big scopée par interface | FIREWALL-V2, ETUDE-IPV6 §9.1 | après observation V5 |
@@ -186,7 +185,7 @@ de générations ou de délégation :
 ```text
 Faisable maintenant (sans matériel)
   V2 banc netns · outillage headless Orion · T2 · T4 compilation · T5 · T6 mesure
-  D1 à D8 arbitrages · F2 enrôlement · F3 revoked · F4 retrait classic
+  D1, D2, D3, D5 à D8 arbitrages · F2 enrôlement · F3 revoked · F4 retrait classic
   F6 nomade · F8 limit · F14 Astra · F15 reproductible
 
 Faisable en code, validation sur cible à planifier
