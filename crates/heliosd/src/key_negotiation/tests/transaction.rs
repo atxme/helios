@@ -718,3 +718,148 @@ async fn a_rolled_back_candidate_rests_the_peer() {
         "a refusal during the rest period must not leave the peer reserved"
     );
 }
+
+/// Removes the test peer from admission, as a reload of `network.toml` does.
+async fn remove_from_admission(handler: &GatewayHandler) {
+    handler
+        .network
+        .write()
+        .await
+        .peers
+        .retain(|peer| peer.public_key != CLIENT_KEY);
+}
+
+/// §11.1 priority 1: no rollback decided before the removal recreates the
+/// peer's previous PSK.
+///
+/// The candidate is posed, then the operator removes the peer. Its
+/// connection's rollback guard fires afterwards, as it does on any timeout:
+/// without the revocation it would put the displaced PSK back on the data
+/// plane for a peer nobody admits any more.
+#[tokio::test]
+async fn a_rollback_after_removal_restores_nothing() {
+    let previous_psk = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
+    let fixture = pq_fixture();
+    let (handler, plane) = gateway_with(&fixture, &previous_psk, ProtectionMode::MlKem);
+
+    handler
+        .prepare(
+            CERTIFICATE_FINGERPRINT.into(),
+            PUBLIC_SOURCE,
+            request([40; 16], &fixture),
+        )
+        .await
+        .unwrap();
+    let reserved = handler
+        .transactions
+        .lock()
+        .await
+        .slot(CLIENT_KEY)
+        .generation;
+    remove_from_admission(&handler).await;
+    handler.rollback([40; 16], CLIENT_KEY).await;
+
+    assert_eq!(
+        plane.writes().await.len(),
+        1,
+        "only the candidate reached the data plane; the rollback must not restore anything"
+    );
+    let mut state = handler.transactions.lock().await;
+    assert!(state.active.is_empty() && !state.peers.contains(CLIENT_KEY));
+    let slot = state.slot(CLIENT_KEY);
+    assert!(matches!(slot.state, SlotState::Revoked));
+    assert!(slot.generation > reserved);
+}
+
+/// A removal between the handshake proof and the signature ends without a
+/// commit: the gateway must not sign for a peer it no longer admits.
+#[tokio::test]
+async fn a_removed_peer_is_not_committed() {
+    let previous_psk = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
+    let fixture = pq_fixture();
+    let (handler, plane) = gateway_with(&fixture, &previous_psk, ProtectionMode::MlKem);
+
+    handler
+        .prepare(
+            CERTIFICATE_FINGERPRINT.into(),
+            PUBLIC_SOURCE,
+            request([41; 16], &fixture),
+        )
+        .await
+        .unwrap();
+    plane.handshake_happens().await;
+    remove_from_admission(&handler).await;
+
+    assert!(handler
+        .confirm(
+            authenticate_confirmation(TEST_CHALLENGE, [41; 16], &fixture.client_private_key)
+                .unwrap(),
+        )
+        .await
+        .is_err());
+    let mut state = handler.transactions.lock().await;
+    assert!(matches!(state.slot(CLIENT_KEY).state, SlotState::Revoked));
+}
+
+/// The sweep revokes a slot no actor touches, and drops the static PSK
+/// baseline with it; a `release` naming the old transaction is then a no-op.
+#[tokio::test]
+async fn the_sweep_revokes_a_committed_slot_and_its_static_baseline() {
+    let previous_psk = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
+    let fixture = pq_fixture();
+    let (handler, plane) = gateway_with(&fixture, &previous_psk, ProtectionMode::MlKem);
+    commit(&handler, &plane, &fixture, [42; 16], PUBLIC_SOURCE).await;
+    remove_from_admission(&handler).await;
+
+    handler.revoke_unadmitted().await;
+
+    assert!(matches!(
+        handler.transactions.lock().await.slot(CLIENT_KEY).state,
+        SlotState::Revoked
+    ));
+    assert!(
+        !handler.static_psks.read().await.contains_key(CLIENT_KEY),
+        "a removed peer's static PSK must not slide back onto its key at re-admission"
+    );
+    let writes = plane.writes().await.len();
+    let _ = release_in_tunnel(&handler, &fixture, [42; 16]).await;
+    assert_eq!(plane.writes().await.len(), writes);
+}
+
+/// Revocation is terminal until the key is admitted again, and a new
+/// admission starts from an empty slot rather than from what the removed
+/// peer held.
+#[tokio::test]
+async fn a_readmitted_peer_negotiates_from_an_empty_slot() {
+    let previous_psk = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
+    let fixture = pq_fixture();
+    let (handler, plane) = gateway_with(&fixture, &previous_psk, ProtectionMode::MlKem);
+    commit(&handler, &plane, &fixture, [43; 16], PUBLIC_SOURCE).await;
+    let readmitted = handler.network.read().await.duplicate();
+    remove_from_admission(&handler).await;
+    handler.revoke_unadmitted().await;
+    let revoked = handler
+        .transactions
+        .lock()
+        .await
+        .slot(CLIENT_KEY)
+        .generation;
+
+    *handler.network.write().await = readmitted;
+    handler
+        .prepare(
+            CERTIFICATE_FINGERPRINT.into(),
+            PUBLIC_SOURCE,
+            request([44; 16], &fixture),
+        )
+        .await
+        .expect("a re-admitted peer negotiates again");
+
+    let mut state = handler.transactions.lock().await;
+    let slot = state.slot(CLIENT_KEY);
+    assert!(slot.generation > revoked);
+    assert!(matches!(
+        &slot.state,
+        SlotState::Preparing { previous, .. } if matches!(**previous, SlotState::Empty)
+    ));
+}

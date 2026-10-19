@@ -109,16 +109,25 @@ un **contrat à finir d'implémenter**, pas une description du système.
 >   V1 échoue, le repli de [§12.3](#123-politique-de-renouvellement) s'applique ;
 > - l'**enrôlement sans clé privée et sa signature opérateur**
 >   ([§15](#15-enrôlement)). `helios enroll` distribue encore l'identité
->   cliente comme en v4, avec le document `.orion` secret que cela implique ;
-> - l'état **`revoked`** du [§11.1](#111-états-gateway) : une révocation est
->   exprimée par l'absence du pair dans `network.peers`, lue à chaque décision,
->   et non par un marqueur terminal dans le slot. Hors concurrence, un pair
->   retiré ne négocie plus rien ; en concurrence, l'absence de transition
->   atomique entre admission, génération et plan de données ne fournit pas
->   encore la priorité normative de `revoked`. Un marqueur mis en cache se
->   périmerait en outre au hot-reload. Ce qui débloquerait : faire porter la
->   révocation et le retrait du plan de données par le même sérialiseur que le
->   slot, génération incrémentée comprise.
+>   cliente comme en v4, avec le document `.orion` secret que cela implique.
+>
+> **Amendement du 2026-10-19 — état `revoked`.** La priorité 1 du
+> [§11.1](#111-états-gateway) est portée par le sérialiseur du slot. Le retrait
+> d'un pair — `peer remove`, API ou fichier — arrive à la gateway comme un
+> nouveau `network.toml` : l'orchestrateur retire le pair du plan de données et
+> refuse dès lors toute pose de PSK pour lui. Le slot l'apprend sous le verrou
+> que tiennent toutes ses transitions : chaque section qui agit sur un slot —
+> préparation, pose du candidat, confirmation, commit, rollback, `release`,
+> récupération — confronte d'abord ce slot à l'admission courante, et le
+> balayage de récupération, toutes les 10 s, fait de même pour les slots que
+> rien ne touche. Un pair qui n'est plus admis passe en `revoked` : génération
+> incrémentée, transactions et réservation abandonnées, candidat et données de
+> rollback détruits, PSK statique de référence oublié. Aucun rollback, aucune
+> confirmation et aucun `release` décidés auparavant ne peuvent plus écrire :
+> ils présentent une génération qu'ils ne détiennent plus. L'état est terminal
+> jusqu'à une nouvelle admission de la clé, qui repart d'un slot vide sous une
+> nouvelle génération. Un pair laissé bloqué par un rollback en échec redevient
+> ainsi récupérable par un simple `peer remove` suivi d'une réadmission.
 >
 > **Amendement du 2026-10-18 — retrait de la valeur `classic`.**
 > `ProtectionMode` ne porte plus que `static_psk` et `ml_kem`

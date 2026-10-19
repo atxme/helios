@@ -193,6 +193,7 @@ fn spawn_psk_reclaimer(
         let mut ticker = tokio::time::interval(RECLAIM_POLL);
         loop {
             ticker.tick().await;
+            handler.revoke_unadmitted().await;
             let observed = peer_runtime.read().await.clone();
             for (public_key, generation, reason) in handler.reclaimable(&observed).await {
                 tracing::warn!(

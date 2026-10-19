@@ -79,6 +79,14 @@ pub(super) enum SlotState {
         /// to survive the task that began the write.
         install_attempted: bool,
     },
+    /// The peer left admission (spec §11.1, priority 1).
+    ///
+    /// Terminal until the key is admitted again. Entering it destroys the
+    /// candidate and the rollback data, and drops every transaction of the
+    /// peer, so no rollback, `release` or reclamation decided earlier can put
+    /// anything back: they all find a generation they do not hold and a slot
+    /// that is not theirs.
+    Revoked,
 }
 
 impl SlotState {
@@ -107,6 +115,7 @@ impl SlotState {
                 previous_psk: previous_psk.as_ref().map(SecretString::duplicate),
                 install_attempted: *install_attempted,
             },
+            Self::Revoked => Self::Revoked,
         }
     }
 }
@@ -201,6 +210,40 @@ pub(super) struct TransactionState {
 impl TransactionState {
     pub(super) fn slot(&mut self, public_key: &str) -> &mut PeerSlot {
         self.slots.entry(public_key.to_string()).or_default()
+    }
+
+    /// Aligns a peer's slot with whether admission still holds its key.
+    ///
+    /// A peer that left admission is revoked: generation incremented, every
+    /// transaction and reservation of the peer dropped, candidate and
+    /// rollback data destroyed. A revoked peer whose key is admitted again
+    /// starts over from an empty slot, under a new generation. Returns
+    /// whether this call revoked the slot.
+    ///
+    /// Removal reaches the gateway as a new `network.toml`, applied by the
+    /// orchestrator, which drops the peer from the data plane and refuses any
+    /// later PSK write for it. The slot learns it here, under the lock every
+    /// slot transition holds, so that no actor decides on a slot that still
+    /// describes a peer nobody admits.
+    pub(super) fn settle_admission(&mut self, public_key: &str, admitted: bool) -> bool {
+        let slot = self.slot(public_key);
+        match (admitted, matches!(slot.state, SlotState::Revoked)) {
+            (false, false) => {
+                slot.generation += 1;
+                slot.state = SlotState::Revoked;
+                slot.resting_until = None;
+                self.peers.remove(public_key);
+                self.active
+                    .retain(|_, transaction| transaction.public_key != public_key);
+                true
+            }
+            (true, true) => {
+                slot.generation += 1;
+                slot.state = SlotState::Empty;
+                false
+            }
+            _ => false,
+        }
     }
 }
 
@@ -340,6 +383,38 @@ impl GatewayHandler {
         issuers
     }
 
+    /// [`TransactionState::settle_admission`] against the live configuration.
+    ///
+    /// Called with the transaction lock held, first thing in every section
+    /// that acts on a slot. The configuration guard is released before this
+    /// returns: callers go on to the data plane, whose writer takes it.
+    pub(super) async fn settle_admission(&self, state: &mut TransactionState, public_key: &str) {
+        let admitted = self
+            .network
+            .read()
+            .await
+            .peers
+            .iter()
+            .any(|peer| peer.public_key == public_key);
+        if state.settle_admission(public_key, admitted) {
+            self.forget_revoked(public_key).await;
+        }
+    }
+
+    /// What a revocation drops beyond the slot.
+    ///
+    /// The static PSK baseline would otherwise slide back onto the key if it
+    /// were ever admitted again — the reason `peer remove` also drops it from
+    /// the table on disk.
+    async fn forget_revoked(&self, public_key: &str) {
+        self.static_psks.write().await.remove(public_key);
+        tracing::warn!(
+            peer = %public_key,
+            "peer no longer admitted: its PSK slot is revoked and nothing decided earlier \
+             may write to it"
+        );
+    }
+
     async fn install(
         &self,
         public_key: String,
@@ -408,6 +483,9 @@ impl GatewayHandler {
     /// the honest outcome — the alternative is a slot nothing points at.
     pub(super) async fn abandon(&self, transaction_id: [u8; 16], public_key: &str) {
         let mut state = self.transactions.lock().await;
+        // A revoked peer has nothing to put back: its rollback data died with
+        // the revocation, and the data plane no longer holds the peer.
+        self.settle_admission(&mut state, public_key).await;
         let (previous, address, previous_psk, install_attempted) =
             match &state.slot(public_key).state {
                 SlotState::Preparing {
@@ -473,6 +551,7 @@ impl GatewayHandler {
         transaction: Transaction,
     ) -> Result<(), PublicError> {
         let mut state = self.transactions.lock().await;
+        self.settle_admission(&mut state, public_key).await;
         let slot = state.slot(public_key);
         let still_ours = slot.generation == generation
             && matches!(
@@ -536,6 +615,7 @@ impl GatewayHandler {
         public_key: &str,
     ) -> Result<bool, PublicError> {
         let mut state = self.transactions.lock().await;
+        self.settle_admission(&mut state, public_key).await;
         let address = match &state.slot(public_key).state {
             SlotState::Committed(installed) if installed.transaction_id == transaction_id => {
                 installed.address.clone()
@@ -575,6 +655,7 @@ impl GatewayHandler {
         expected: u64,
     ) -> Result<(), PublicError> {
         let mut state = self.transactions.lock().await;
+        self.settle_admission(&mut state, public_key).await;
         let slot = state.slot(public_key);
         if slot.generation != expected {
             tracing::debug!(
@@ -597,6 +678,8 @@ impl GatewayHandler {
             // of the connection preparing it, which puts back what the
             // candidate displaced.
             SlotState::Preparing { .. } => return Ok(()),
+            // Revocation already took the peer off the data plane.
+            SlotState::Revoked => return Ok(()),
         };
         self.install(public_key.to_string(), address, None).await?;
         let slot = state.slot(public_key);
@@ -616,6 +699,35 @@ impl GatewayHandler {
     /// secret with no transactional owner: neither the handshake threshold
     /// nor the 24-hour deadline applies to it, and clearing it would destroy
     /// configuration that no renegotiation could restore.
+    /// Revokes every slot whose peer left admission (spec §11.1, priority 1).
+    ///
+    /// Each slot section already settles its own peer before acting. This
+    /// sweep covers the slots nothing touches, so that a removed peer's
+    /// rollback data and static PSK outlive its removal by one reclaimer
+    /// period at most.
+    pub(super) async fn revoke_unadmitted(&self) {
+        let mut state = self.transactions.lock().await;
+        let admitted: HashSet<String> = self
+            .network
+            .read()
+            .await
+            .peers
+            .iter()
+            .map(|peer| peer.public_key.clone())
+            .collect();
+        let removed: Vec<String> = state
+            .slots
+            .keys()
+            .filter(|key| !admitted.contains(*key))
+            .cloned()
+            .collect();
+        for public_key in removed {
+            if state.settle_admission(&public_key, false) {
+                self.forget_revoked(&public_key).await;
+            }
+        }
+    }
+
     pub(super) async fn reclaimable(
         &self,
         observed: &[helios_wireguard::PeerStatus],

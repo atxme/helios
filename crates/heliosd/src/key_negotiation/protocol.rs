@@ -216,6 +216,22 @@ impl NegotiationHandler for GatewayHandler {
 
         let generation = {
             let mut state = self.transactions.lock().await;
+            // The peer was admitted when it was looked up above; a reload may
+            // have removed it since. Settled under this lock, a removal wins
+            // over the reservation rather than racing it.
+            self.settle_admission(&mut state, &request.client_wg_public_key)
+                .await;
+            if matches!(
+                state.slot(&request.client_wg_public_key).state,
+                SlotState::Revoked
+            ) {
+                tracing::warn!(
+                    %transaction,
+                    peer = %peer_key,
+                    "key negotiation refused: this peer was removed from admission meanwhile"
+                );
+                return Err(PublicError::Rejected);
+            }
             if state.replay_set.contains(&request.transaction_id) {
                 tracing::warn!(
                     %transaction,
@@ -500,6 +516,9 @@ impl NegotiationHandler for GatewayHandler {
         // client a receipt for a secret the gateway does not have.
         {
             let mut state = self.transactions.lock().await;
+            // A peer removed since the candidate was posed is revoked here,
+            // which moves the generation: the check below then refuses.
+            self.settle_admission(&mut state, &public_key).await;
             let slot = state.slot(&public_key);
             let still_ours = slot.generation == generation
                 && matches!(
@@ -537,6 +556,9 @@ impl NegotiationHandler for GatewayHandler {
         // carried.
         let transaction = {
             let mut state = self.transactions.lock().await;
+            // Checked again at the point of no return: a removal between the
+            // check above and this lock must not end in a signed commit.
+            self.settle_admission(&mut state, &public_key).await;
             let transaction = state
                 .active
                 .remove(&transaction_id)
