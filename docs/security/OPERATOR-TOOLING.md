@@ -278,7 +278,7 @@ refusée plutôt qu'enregistrée.
 
 Sans `--minimum-mode`, la présence de l'empreinte PQ choisit déjà `ml-kem`.
 L'option explicite rend la politique visible dans les scripts. Une
-renégociation réseau vers `static_psk` ou `classic` sera ensuite refusée.
+renégociation réseau vers `static_psk` sera ensuite refusée.
 
 Ces quatre commandes restent utiles pour inspecter la PKI ou réémettre un
 certificat seul ; pour admettre un client, `helios enroll` (section 6) les
