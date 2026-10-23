@@ -277,9 +277,9 @@ fn now_unix() -> anyhow::Result<u64> {
 /// the point (ADR-008 §3).
 /// Prints one peer's §19 trust block, as an Orion profile embeds it.
 ///
-/// JSON on stdout and nothing else, so a script can capture it into a file:
-/// `provision-client.sh` carries it beside the two gateway certificates it
-/// already copies. The same block the admin API serves, from the same reading
+/// JSON on stdout and nothing else, so it can be captured into a file for
+/// `helios enroll document --trust-material`, beside the two gateway
+/// certificates fetched over SSH. The same block the admin API serves, from the same reading
 /// of the same registry — a second shape here would be a second thing to keep
 /// equal by hand.
 pub(crate) fn show_trust_enrolment(public_key: &str) -> anyhow::Result<()> {

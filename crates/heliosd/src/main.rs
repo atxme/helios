@@ -346,8 +346,8 @@ enum Command {
     /// fallback.
     ///
     /// Exists beside the API route because an enrolment happens **before** the
-    /// client has a tunnel, and `provision-client.sh` reaches this gateway over
-    /// SSH rather than over the admin API.
+    /// client has a tunnel, and the offline `helios enroll document` reads
+    /// this gateway over SSH rather than over the admin API.
     ShowTrustEnrolment {
         /// The peer's WireGuard public key, base64, as it was admitted.
         #[arg(long)]

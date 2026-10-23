@@ -111,6 +111,11 @@ pub enum KeyNegoCmd {
         output_dir: Option<PathBuf>,
     },
     /// Issues an Orion client certificate from the operator client CA.
+    ///
+    /// A laboratory tool, tied to the file CA: it holds the client's private
+    /// keys on the operator's disk. A real client is enrolled with an
+    /// enrollment v5 invitation (`astra-signer enroll invite`), whose keys
+    /// never leave the client.
     IssueClient {
         #[arg(long)]
         name: String,
@@ -364,8 +369,8 @@ fn init_client_ca(name: &str, output_dir: &Path) -> Result<()> {
 ///
 /// Kept as one value because they are only ever useful together: a
 /// certificate without its private key authenticates nothing, and a key
-/// without its certificate cannot be presented. Callers either write them to
-/// four files (`issue-client`) or seal them into one bundle (`enroll`).
+/// without its certificate cannot be presented. `issue-client` writes them to
+/// four files.
 pub struct ClientMaterial {
     pub certificate_der: Vec<u8>,
     pub private_key_der: Zeroizing<Vec<u8>>,
@@ -378,29 +383,8 @@ pub struct ClientMaterial {
     pub pq_certificate_sha256: String,
 }
 
-/// Issues a client identity from the operator CA, without touching the disk.
-///
-/// Both `issue-client` and `enroll` go through here: two issuance paths would
-/// eventually disagree on validity, on the WireGuard binding, or on the role
-/// byte — and the divergence would only show up as a refused negotiation.
-pub fn issue_client_material(
-    name: &str,
-    wireguard_public_key: &str,
-    ca_certificate_path: &Path,
-    ca_private_key_path: &Path,
-    ca_pq_private_key_path: &Path,
-) -> Result<ClientMaterial> {
-    issue_client_material_with_validity(
-        name,
-        wireguard_public_key,
-        ca_certificate_path,
-        ca_private_key_path,
-        ca_pq_private_key_path,
-        DEFAULT_CLIENT_VALIDITY_SECS,
-    )
-}
-
-/// Issues a client identity with an explicit validity, for lifecycle tests.
+/// Issues a client identity from the operator CA, without touching the disk,
+/// with an explicit validity.
 ///
 /// The TLS and PQ leaves receive the same interval. Keeping this test hook in
 /// the single issuance helper is important: generating a short PQ leaf while
@@ -483,13 +467,9 @@ pub fn issue_client_material_with_validity(
     })
 }
 
-/// Reloads an identity already written by `issue-client`.
-///
-/// Needed whenever admission and profile assembly are two separate steps: the
-/// gateway was admitted against *these* fingerprints, so reissuing fresh
-/// certificates in between would hand the client an identity the gateway does
-/// not know — and the refusal would come much later, with nothing pointing
-/// back to the reissue.
+/// Reloads an identity already written by `issue-client`, for the tests that
+/// check what it wrote.
+#[cfg(test)]
 pub fn load_client_material(directory: &Path) -> Result<ClientMaterial> {
     let certificate_der = read(&directory.join(CLIENT_CERTIFICATE_FILE))?;
     let pq_certificate_json = read(&directory.join(CLIENT_PQ_CERTIFICATE_FILE))?;

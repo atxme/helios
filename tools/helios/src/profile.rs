@@ -12,12 +12,12 @@
 //!
 //! `emit` admits nobody. Admission requires the client's TLS and PQ
 //! key-negotiation certificates (floor `ml_kem`), which this command neither
-//! issues nor carries: a new client goes through `helios enroll`, or
-//! `helios peer add` with its certificates. A profile emitted for a key the
-//! gateway does not know would bring up no tunnel, so such a key is refused.
-//! The assisted mode, where the operator generated the pair, is gone: the
-//! pair it generated could never be admitted, and `helios enroll` serves the
-//! same fleet with the negotiation included.
+//! issues nor carries: a new Helios client is enrolled from an
+//! `astra-signer enroll invite` invitation (NEGOCIATION-DE-CLE-V5 §15), whose
+//! signed document `helios enroll document` drafts. A profile emitted for a
+//! key the gateway does not know would bring up no tunnel, so such a key is
+//! refused. The assisted mode, where the operator generated the pair, is
+//! gone: the pair it generated could never be admitted.
 
 use std::path::{Path, PathBuf};
 
@@ -108,9 +108,6 @@ pub struct Profile<'a> {
     /// the profile then falls back to the legacy path, whose first handshake
     /// is unprotected.
     pub key_negotiation: Option<KeyNegotiation>,
-    /// Client identity. **Secret** — only `enroll` fills it in, and the file
-    /// it produces is born at 0600.
-    pub key_negotiation_identity: Option<orion_core::ClientIdentityBundle>,
 }
 
 /// The serializable half of an emitted profile contains public fields only.
@@ -144,40 +141,63 @@ pub struct KeyNegotiation {
     pub server_name: String,
     pub gateway_ca_der: String,
     pub gateway_pq_certificate: String,
-    pub identity: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trust: Option<orion_core::TrustMaterial>,
 }
 
-/// Renders the document, and checks it against the consumer before writing.
+/// The profile with its §19 discriminant, derived from the negotiation block.
+fn tagged<'a>(profile: &'a Profile<'a>) -> TaggedProfile<'a> {
+    TaggedProfile {
+        profile_type: if profile.key_negotiation.is_some() {
+            ProfileKind::HeliosKeyNegotiation
+        } else {
+            ProfileKind::Classic
+        },
+        inner: PublicProfile {
+            name: profile.name,
+            endpoint: profile.endpoint,
+            peer_public_key: profile.peer_public_key,
+            address: profile.address,
+            address_v6: profile.address_v6,
+            allowed_ips: profile.allowed_ips,
+            ssh_target: profile.ssh_target,
+            heliosd_url: profile.heliosd_url.as_deref(),
+            key_negotiation: profile.key_negotiation.as_ref(),
+        },
+    }
+}
+
+/// The public fields of a profile, as the v5 document carries them.
+///
+/// No private key can reach it: [`PublicProfile`] has no field for one.
+pub fn public_profile(profile: &Profile<'_>) -> Result<serde_json::Map<String, serde_json::Value>> {
+    match serde_json::to_value(tagged(profile)).context("serializing the public profile fields")? {
+        serde_json::Value::Object(map) => Ok(map),
+        _ => bail!("the public profile did not serialize as an object — this is a tooling bug"),
+    }
+}
+
+/// Renders a classic v1 document, and checks it against the consumer before
+/// writing.
 ///
 /// The round-trip through `orion_core::parse_profile_import` is the point:
 /// this tool and Orion must agree on the format, and the only way to be sure
 /// is to have the actual consumer accept the actual bytes. A document that
 /// Orion would refuse must never reach a user's machine.
+///
+/// A Helios profile is refused here: it travels as a v5 document signed under
+/// `CA-PQ` (NEGOCIATION-DE-CLE-V5 §15.3), never as an unsigned v1 one.
 pub fn render(profile: Profile<'_>) -> Result<zeroize::Zeroizing<String>> {
-    let profile_type = if profile.key_negotiation.is_some() {
-        ProfileKind::HeliosKeyNegotiation
-    } else {
-        ProfileKind::Classic
-    };
+    if profile.key_negotiation.is_some() {
+        bail!(
+            "a Helios profile travels as a signed v5 document: `helios enroll document`, then \
+             `astra-signer enroll sign-document`"
+        );
+    }
     let public = serde_json::to_vec(&Document {
         format: FORMAT,
         version: VERSION,
-        profile: TaggedProfile {
-            profile_type,
-            inner: PublicProfile {
-                name: profile.name,
-                endpoint: profile.endpoint,
-                peer_public_key: profile.peer_public_key,
-                address: profile.address,
-                address_v6: profile.address_v6,
-                allowed_ips: profile.allowed_ips,
-                ssh_target: profile.ssh_target,
-                heliosd_url: profile.heliosd_url.as_deref(),
-                key_negotiation: profile.key_negotiation.as_ref(),
-            },
-        },
+        profile: tagged(&profile),
     })
     .context("serializing the public profile fields")?;
     let mut encoded =
@@ -187,10 +207,6 @@ pub fn render(profile: Profile<'_>) -> Result<zeroize::Zeroizing<String>> {
     if let Some(private_key) = profile.private_key {
         encoded.append(b",\"private_key\":")?;
         encoded.secret_str(private_key)?;
-    }
-    if let Some(identity) = &profile.key_negotiation_identity {
-        encoded.append(b",\"key_negotiation_identity\":")?;
-        encoded.append(&identity.encode()?)?;
     }
     encoded.append(b"}}")?;
     let json = encoded.finish_string()?;
@@ -346,12 +362,9 @@ pub async fn emit(client: &Client, base: &str, options: EmitOptions) -> Result<(
         allowed_ips: options.allowed_ips.as_deref(),
         ssh_target: options.ssh_target.as_deref(),
         heliosd_url: heliosd_url(&view.wg_address),
-        // `emit` never ships an identity: it is the path that keeps the
-        // document free of secrets. Wiring the negotiation from here would
-        // therefore hand out a profile whose connection fails for lack of a
-        // certificate — `enroll` is the command that does both at once.
+        // A Helios profile is a signed v5 document, which `enroll document`
+        // drafts and `astra-signer` signs.
         key_negotiation: None,
-        key_negotiation_identity: None,
     })?;
 
     match &options.output {
@@ -371,8 +384,8 @@ fn resolve_public_key(options: &EmitOptions) -> Result<String> {
     let Some(public_key) = &options.public_key else {
         bail!(
             "provide --public-key <public key of an admitted client>: `profile emit` re-emits \
-             the invitation of a peer the gateway already holds. To enroll a new client, use \
-             `helios enroll`"
+             the invitation of a peer the gateway already holds. To enroll a new client, start \
+             from `astra-signer enroll invite`"
         );
     };
     let public_key = public_key.trim().to_string();
@@ -394,7 +407,7 @@ fn reuse_admission(peers: &[NetworkPeerView], name: &str, public_key: &str) -> R
              `helios peer add --name {name} --public-key <key> \
              --key-negotiation-certificate-sha256 <sha256> \
              --key-negotiation-pq-certificate-sha256 <sha256>`, then re-run this command; \
-             or enroll it in one go with `helios enroll`"
+             or enroll it from `astra-signer enroll invite`"
         );
     };
     if existing.public_key.trim() != public_key {
@@ -502,7 +515,6 @@ mod tests {
             ssh_target: None,
             heliosd_url: None,
             key_negotiation: None,
-            key_negotiation_identity: None,
         })
         .unwrap();
         let imported = orion_core::parse_profile_import(&json, "laptop.orion").unwrap();
@@ -517,7 +529,7 @@ mod tests {
             "  Routes        10.0.0.0/8 · split tunnel: everything else leaves unencrypted\n",
             "  Tunnel API    missing — the profile connects but cannot renew\n",
             "  Negotiation   none (legacy path)\n",
-            "  Bundled id    no\n",
+            "  Signed        no — classic v1 document\n",
         ] {
             assert!(text.contains(expected), "missing {expected:?} in {text}");
         }
@@ -564,7 +576,10 @@ mod tests {
             error.contains("--key-negotiation-pq-certificate-sha256"),
             "message: {error}"
         );
-        assert!(error.contains("helios enroll"), "message: {error}");
+        assert!(
+            error.contains("astra-signer enroll invite"),
+            "message: {error}"
+        );
     }
 
     #[test]
@@ -594,7 +609,10 @@ mod tests {
     fn without_a_public_key_the_tool_refuses_and_points_to_enroll() {
         let error = resolve_public_key(&options()).unwrap_err().to_string();
         assert!(error.contains("--public-key"), "message: {error}");
-        assert!(error.contains("helios enroll"), "message: {error}");
+        assert!(
+            error.contains("astra-signer enroll invite"),
+            "message: {error}"
+        );
     }
 
     #[test]
@@ -637,7 +655,6 @@ mod tests {
                 ssh_target: None,
                 heliosd_url: heliosd_url("100.64.0.1/10"),
                 key_negotiation: None,
-                key_negotiation_identity: None,
             })
             .expect("document read back by Orion");
             let imported = orion_core::parse_profile_import(&json, "portable.json").unwrap();
@@ -664,94 +681,6 @@ mod tests {
         }
     }
 
-    /// The full `enroll` document — profile, negotiation block and identity —
-    /// must be read back by Orion in one go.
-    ///
-    /// This is the contract that actually matters: the tooling and the client
-    /// are two binaries that never meet, and a disagreement on this document
-    /// would only surface on a user's machine, as a profile that imports and
-    /// never connects.
-    #[test]
-    fn the_enrollment_document_is_read_back_whole() {
-        use aether::key_negotiation::{
-            generate_ml_dsa_87_keypair, issue_pq_certificate, PqCertificate, PqCertificateRole,
-            PQ_CERTIFICATE_VERSION,
-        };
-        use base64::{engine::general_purpose::STANDARD, Engine as _};
-
-        let client_key = aether::wg::generate_keypair().unwrap();
-        let gateway_key = aether::wg::generate_keypair().unwrap();
-        let (gateway_pq_private, gateway_pq_public) = generate_ml_dsa_87_keypair().unwrap();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let gateway_certificate = issue_pq_certificate(
-            PqCertificate {
-                version: PQ_CERTIFICATE_VERSION,
-                serial: [3u8; 16],
-                subject: "vpn.example.net".into(),
-                issuer: "vpn.example.net".into(),
-                role: PqCertificateRole::Gateway,
-                wireguard_public_key: gateway_key.public_key.clone(),
-                ml_dsa_87_public_key: STANDARD.encode(&gateway_pq_public),
-                not_before_unix: now - 60,
-                not_after_unix: now + 3600,
-                ml_dsa_87_signature: String::new(),
-            },
-            &gateway_pq_private,
-        )
-        .unwrap();
-
-        let json = render(Profile {
-            name: "portable",
-            endpoint: "vpn.example.net:51820",
-            private_key: Some(client_key.private_key.expose()),
-            peer_public_key: &gateway_key.public_key,
-            address: "100.64.1.2/32",
-            address_v6: None,
-            allowed_ips: Some("100.64.0.0/10, 192.168.1.0/24"),
-            ssh_target: Some("christophe@100.64.0.1"),
-            heliosd_url: heliosd_url("100.64.0.1/10"),
-            key_negotiation: Some(KeyNegotiation {
-                mode: ProtectionMode::MlKem,
-                minimum_mode: ProtectionMode::MlKem,
-                endpoint: "vpn.example.net:51821".into(),
-                server_name: "vpn.example.net".into(),
-                gateway_ca_der: STANDARD.encode([0x30, 0x82, 0x01, 0x00]),
-                gateway_pq_certificate: STANDARD
-                    .encode(serde_json::to_vec(&gateway_certificate).unwrap()),
-                identity: "orion-portable".into(),
-                trust: None,
-            }),
-            key_negotiation_identity: Some(orion_core::ClientIdentityBundle {
-                identity: "orion-portable".into(),
-                certificate_chain: vec![STANDARD.encode([0x30, 0x82, 0x02, 0x00])],
-                private_key: STANDARD.encode([0x30, 0x81, 0x87, 0x02]).into(),
-                pq_certificate: STANDARD.encode(br#"{"version":1}"#),
-                pq_private_key: STANDARD.encode([9u8; 64]).into(),
-            }),
-        })
-        .expect("enrollment document read back by Orion");
-
-        let imported = orion_core::parse_profile_import(&json, "portable.json").unwrap();
-        let settings = imported.profile.key_negotiation.expect("negotiation block");
-        assert_eq!(settings.mode, ProtectionMode::MlKem);
-        assert_eq!(settings.minimum_mode, ProtectionMode::MlKem);
-        assert_eq!(settings.identity, "orion-portable");
-        // The pinned certificate must verify against the gateway key the
-        // profile talks to — that check is the whole reason it is shipped.
-        assert!(settings.gateway_pq_fingerprint().is_some());
-        // A split tunnel stated by the operator reaches the client through the
-        // document. Without this field it did not: every user had to retype
-        // the prefixes into the Advanced panel, and a fleet ended up with as
-        // many routing tables as it had people.
-        assert_eq!(
-            imported.profile.allowed_ips,
-            "100.64.0.0/10, 192.168.1.0/24"
-        );
-    }
-
     /// Saying nothing is not saying `0.0.0.0/0, ::/0` — but it must behave that
     /// way.
     ///
@@ -776,7 +705,6 @@ mod tests {
             ssh_target: None,
             heliosd_url: None,
             key_negotiation: None,
-            key_negotiation_identity: None,
         })
         .expect("document read back by Orion");
 
@@ -800,7 +728,6 @@ mod tests {
             ssh_target: None,
             heliosd_url: heliosd_url("100.64.0.1/10"),
             key_negotiation: None,
-            key_negotiation_identity: None,
         })
         .expect("document read back by Orion")
     }

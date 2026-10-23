@@ -137,103 +137,14 @@ enum Cmd {
         #[command(subcommand)]
         command: ProfileCmd,
     },
-    /// Enrolls a client in one go: keys, certificates, admission, profile.
+    /// Enrollment v5: the public draft of a client's `.orion` document.
     ///
-    /// The gateway supplies everything it knows — its WireGuard identity, its
-    /// negotiation certificates and the port they answer on — so the only
-    /// things to state are the client's name and the public endpoint. The
-    /// resulting file carries the client's private keys: it is born at 0600
-    /// and must be destroyed once Orion has imported it.
+    /// No private key travels any more (NEGOCIATION-DE-CLE-V5 §15): the
+    /// invitation, the acceptance and the signature are `astra-signer enroll`
+    /// gestures, and this command only assembles what lies between them.
     Enroll {
-        /// Profile name, also used as the peer name on the gateway.
-        #[arg(long)]
-        name: String,
-        /// Gateway's public UDP endpoint (`IP:port` or `FQDN:port`).
-        #[arg(long)]
-        endpoint: String,
-        /// Répertoire de la CA opérateur (`key-nego init-client-ca`).
-        ///
-        /// Défaut : l'emplacement fixe du compte, que `HELIOS_CLIENT_CA_DIR`
-        /// déplace. Il ne dépend **pas** du répertoire courant — voir
-        /// `key_nego::default_client_ca_dir`.
-        #[arg(long)]
-        client_ca_dir: Option<PathBuf>,
-        /// Client public key, when the client already holds its own pair.
-        #[arg(long)]
-        public_key: Option<String>,
-        /// Fichier contenant la clé privée WireGuard du client, quand
-        /// l'appelant a généré la paire lui-même. Un fichier, pas un
-        /// argument : `ps` expose l'argv de tout processus.
-        #[arg(long)]
-        private_key_file: Option<PathBuf>,
-        /// Répertoire d'une identité déjà émise par `key-nego issue-client`.
-        /// Obligatoire quand l'admission a eu lieu séparément : la gateway
-        /// connaît les empreintes de CES certificats-là.
-        #[arg(long)]
-        client_pki_dir: Option<PathBuf>,
-        /// Negotiation mode, which also becomes the peer's floor.
-        #[arg(long, value_enum, default_value = "ml-kem")]
-        mode: key_nego::Mode,
-        /// Negotiation endpoint. Defaults to the tunnel host with the port
-        /// the gateway publishes.
-        #[arg(long)]
-        negotiation_endpoint: Option<String>,
-        /// Name of the protected store entry. Defaults to `orion-<name>`.
-        #[arg(long)]
-        identity: Option<String>,
-        /// Admit the peer as a control-plane administrator.
-        #[arg(long)]
-        admin: bool,
-        /// Revoke a peer of the same name before admitting this identity.
-        #[arg(long)]
-        replace: bool,
-        /// Trafic capté par le tunnel : une ou plusieurs plages CIDR,
-        /// séparées par des virgules.
-        ///
-        /// Absent = tunnel complet (`0.0.0.0/0, ::/0`), qui reste le bon défaut.
-        /// Le préciser ici plutôt que dans chaque poste évite qu'un parc
-        /// finisse avec autant de tables de routage que d'utilisateurs.
-        /// Ex. : `--allowed-ips "100.64.0.0/10, 192.168.1.0/24"`
-        #[arg(long)]
-        allowed_ips: Option<String>,
-        /// Destination SSH à travers le tunnel, `utilisateur@hôte`.
-        ///
-        /// Active le bouton « Terminal SSH » d'Orion. La gateway doit poser
-        /// `allow_ssh_over_tunnel`. Absent = aucun terminal proposé.
-        #[arg(long)]
-        ssh_target: Option<String>,
-        /// Output file.
-        #[arg(long)]
-        output: PathBuf,
-
-        // ── Enrôlement hors API ──────────────────────────────────────────
-        // L'API vit derrière le tunnel : l'atteindre suppose déjà une
-        // connexion. Pour le PREMIER enrôlement, ces trois options prennent
-        // le relais — l'opérateur a déjà une session SSH, qui suffit à lire
-        // deux certificats publics et à admettre le pair en console.
-        /// `key-negotiation-cert.der` de la gateway, récupéré par SSH.
-        #[arg(long, requires = "gateway_pq_certificate", requires = "address")]
-        gateway_certificate: Option<PathBuf>,
-        /// `key-negotiation-pq-cert.json` de la gateway, récupéré par SSH.
-        #[arg(long, requires = "gateway_certificate")]
-        gateway_pq_certificate: Option<PathBuf>,
-        /// VIP affichée par `heliosd peer add`, qui a fait l'admission.
-        #[arg(long)]
-        address: Option<String>,
-        /// VIP IPv6 du même pair (`address_v6` de `network.toml`, `…/128`),
-        /// s'il en a une. Absente, le profil n'en porte pas.
-        #[arg(long, requires = "address")]
-        address_v6: Option<String>,
-        /// URL de l'API interne, pour la seule télémétrie.
-        #[arg(long)]
-        heliosd_url: Option<String>,
-        /// Bloc de confiance §19, tel que `heliosd show-trust-enrolment` l'imprime.
-        ///
-        /// Sans lui le profil se connecte mais ne peut pas renouveler son
-        /// certificat, et Orion le dit. Les valeurs ne sont pas devinables :
-        /// ce sont les ancres du domaine et la génération de ce pair.
-        #[arg(long, requires = "gateway_certificate")]
-        trust_material: Option<PathBuf>,
+        #[command(subcommand)]
+        command: EnrollCmd,
     },
     /// Escrow of the gateway identity — **operator workstation**.
     ///
@@ -371,6 +282,82 @@ enum PeerCmd {
 }
 
 #[derive(Subcommand)]
+enum EnrollCmd {
+    /// Writes the unsigned v5 document for an accepted request.
+    ///
+    /// Reads the gateway (through the API, or from files fetched over SSH),
+    /// checks that the leaves certify the keys the request names, and writes
+    /// a draft for `astra-signer enroll sign-document`. The draft carries no
+    /// secret.
+    Document {
+        /// The client's `.helios-request`.
+        #[arg(long)]
+        request: PathBuf,
+        /// TLS leaf written by `astra-signer enroll accept` (DER).
+        #[arg(long)]
+        tls_certificate: PathBuf,
+        /// PQ leaf written by `astra-signer enroll accept` (JSON).
+        #[arg(long)]
+        pq_certificate: PathBuf,
+        /// Gateway's public UDP endpoint (`IP:port` or `FQDN:port`).
+        #[arg(long)]
+        endpoint: String,
+        /// Negotiation endpoint. Defaults to the tunnel host with the port
+        /// the gateway publishes.
+        #[arg(long)]
+        negotiation_endpoint: Option<String>,
+        /// Trafic capté par le tunnel : une ou plusieurs plages CIDR,
+        /// séparées par des virgules.
+        ///
+        /// Absent = tunnel complet (`0.0.0.0/0, ::/0`), qui reste le bon défaut.
+        /// Ex. : `--allowed-ips "100.64.0.0/10, 192.168.1.0/24"`
+        #[arg(long)]
+        allowed_ips: Option<String>,
+        /// Destination SSH à travers le tunnel, `utilisateur@hôte`.
+        ///
+        /// Active le bouton « Terminal SSH » d'Orion. La gateway doit poser
+        /// `allow_ssh_over_tunnel`. Absent = aucun terminal proposé.
+        #[arg(long)]
+        ssh_target: Option<String>,
+        /// Draft to write. Never overwritten.
+        #[arg(long)]
+        out: PathBuf,
+
+        // ── Hors API ─────────────────────────────────────────────────────
+        // L'API vit derrière le tunnel : l'atteindre suppose déjà une
+        // connexion. Pour le PREMIER enrôlement, ces options prennent le
+        // relais — l'opérateur a déjà une session SSH, qui suffit à lire deux
+        // certificats publics et le bloc de confiance.
+        /// `key-negotiation-cert.der` de la gateway, récupéré par SSH.
+        #[arg(
+            long,
+            requires = "gateway_pq_certificate",
+            requires = "address",
+            requires = "trust_material"
+        )]
+        gateway_certificate: Option<PathBuf>,
+        /// `key-negotiation-pq-cert.json` de la gateway, récupéré par SSH.
+        #[arg(long, requires = "gateway_certificate")]
+        gateway_pq_certificate: Option<PathBuf>,
+        /// VIP affichée par `heliosd peer add`, qui a fait l'admission.
+        #[arg(long)]
+        address: Option<String>,
+        /// VIP IPv6 du même pair (`address_v6` de `network.toml`, `…/128`),
+        /// s'il en a une. Absente, le profil n'en porte pas.
+        #[arg(long, requires = "address")]
+        address_v6: Option<String>,
+        /// URL de l'API interne, pour la seule télémétrie.
+        #[arg(long)]
+        heliosd_url: Option<String>,
+        /// Bloc de confiance §19, tel que `heliosd show-trust-enrolment` l'imprime.
+        ///
+        /// Obligatoire : le document est signé sous la CA-PQ qu'il nomme.
+        #[arg(long, requires = "gateway_certificate")]
+        trust_material: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
 enum ProfileCmd {
     /// Relit un document avec le parseur d'Orion, sans rien installer.
     ///
@@ -382,8 +369,8 @@ enum ProfileCmd {
         path: PathBuf,
     },
     /// Re-emits the invitation profile of an admitted client, readable by
-    /// Orion's import. Admits nobody: a new client goes through
-    /// `helios enroll`, or `helios peer add` with its certificates.
+    /// Orion's import. Admits nobody: a new client is enrolled from an
+    /// `astra-signer enroll invite` invitation.
     Emit {
         /// Profile name, also used as the peer name on the gateway.
         #[arg(long)]
@@ -683,8 +670,7 @@ fn ensure_command(response: CmdResp, action: &str) -> Result<()> {
 /// round-trips the document through Orion's own parser, so a malformed list
 /// *would* be caught — but as "the emitted profile is not readable by Orion —
 /// this is a tooling bug", which is a lie when the operator simply mistyped a
-/// prefix. Worse, on `enroll` it would surface **after** the peer had been
-/// admitted on the gateway, leaving an admission with no profile to go with it.
+/// prefix.
 ///
 /// The normalized form is what gets written, so a document and the screen that
 /// displays it never disagree on spelling.
@@ -875,32 +861,26 @@ async fn execute_command(api: &transport::Api, command: Cmd) -> Result<()> {
             }
         },
         Cmd::Enroll {
-            name,
-            endpoint,
-            client_ca_dir,
-            public_key,
-            private_key_file,
-            client_pki_dir,
-            mode,
-            negotiation_endpoint,
-            identity,
-            admin,
-            replace,
-            allowed_ips,
-            ssh_target,
-            output,
-            gateway_certificate,
-            gateway_pq_certificate,
-            address,
-            address_v6,
-            heliosd_url,
-            trust_material,
+            command:
+                EnrollCmd::Document {
+                    request,
+                    tls_certificate,
+                    pq_certificate,
+                    endpoint,
+                    negotiation_endpoint,
+                    allowed_ips,
+                    ssh_target,
+                    out,
+                    gateway_certificate,
+                    gateway_pq_certificate,
+                    address,
+                    address_v6,
+                    heliosd_url,
+                    trust_material,
+                },
         } => {
-            // Checked before the gateway is contacted: a missing CA must not
-            // be discovered after a peer has been admitted.
-            let client_ca_dir = client_ca_dir.unwrap_or_else(key_nego::default_client_ca_dir);
-            enroll::check_client_ca(&client_ca_dir)?;
             let allowed_ips = check_allowed_ips(allowed_ips)?;
+            let ssh_target = check_ssh_target(ssh_target)?;
             let address_v6 = check_address_v6(address_v6)?;
             let offline = match (gateway_certificate, gateway_pq_certificate, address) {
                 (Some(gateway_certificate), Some(gateway_pq_certificate), Some(address)) => {
@@ -917,24 +897,18 @@ async fn execute_command(api: &transport::Api, command: Cmd) -> Result<()> {
                 // combinations; this arm is the online path.
                 _ => None,
             };
-            enroll::run(
+            enroll::document(
                 client,
                 base,
-                enroll::EnrollOptions {
-                    name,
+                enroll::DocumentOptions {
+                    request,
+                    tls_certificate,
+                    pq_certificate,
                     endpoint,
-                    client_ca_dir,
-                    public_key,
-                    private_key_file,
-                    client_pki_dir,
-                    mode: mode.into(),
                     negotiation_endpoint,
-                    identity,
-                    admin,
-                    replace,
                     allowed_ips,
                     ssh_target,
-                    output,
+                    output: out,
                     offline,
                 },
             )

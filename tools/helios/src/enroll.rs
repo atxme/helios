@@ -1,67 +1,43 @@
-//! One-shot enrollment: everything a client needs, in a single command.
+//! `enroll document`: the public half of an enrollment v5 document.
 //!
-//! Admitting a client used to take five commands and three copies between
-//! machines — generate a WireGuard key, issue two certificates, read back two
-//! fingerprints, admit the peer with them, then hand-assemble the profile
-//! around a certificate copied out of `/var/lib/helios`. Every one of those
-//! steps is a place to paste the wrong value, and the failure only shows up
-//! later, as a negotiation the gateway refuses without saying why.
+//! Enrollment no longer moves a private key (NEGOCIATION-DE-CLE-V5 §15). The
+//! client generated its three key pairs and sent a signed request;
+//! `astra-signer enroll accept` issued its two leaves under the operator's
+//! authorities and printed the `heliosd peer add` that admits it. What is left
+//! is the profile: the gateway's public material, the client's leaves, and the
+//! binding to the request — a document `astra-signer enroll sign-document`
+//! then signs under `CA-PQ`.
 //!
-//! So this command does the whole thing, and takes everything it can from the
-//! gateway itself:
-//!
-//! 1. read the gateway's WireGuard identity and negotiation certificates;
-//! 2. resolve the client's WireGuard key — supplied, or generated here;
-//! 3. issue the client's TLS and ML-DSA-87 certificates from the operator CA;
-//! 4. admit the peer with both fingerprints and the anti-downgrade floor;
-//! 5. write one Orion document carrying the profile **and** the identity.
-//!
-//! # Why the result is a secret
-//!
-//! The identity's two private keys are in the file. That is what makes the
-//! import a single gesture, and it is also what makes the document
-//! sensitive: it is born at 0600, it travels through a controlled channel,
-//! and it is destroyed on both ends after import. `profile emit` remains the
-//! path that carries no secret.
+//! This command assembles that draft. It reads the gateway (through the API,
+//! or from files fetched over SSH), checks that the leaves certify the very
+//! keys the request names, and writes an unsigned `EnrollmentDocument`. The
+//! draft carries no secret; it is still never written over an existing file.
 
 use std::path::{Path, PathBuf};
 
-use aether::key_negotiation::ProtectionMode;
+use aether::certificates::encoding::{DerCertificate, MlDsa87PublicKey};
+use aether::key_negotiation::{
+    decode_request_file, EnrollmentDocument, EnrollmentRequest, PqCertificate, PqCertificateRole,
+    ProtectionMode, ENROLLMENT_DOCUMENT_FORMAT, ENROLLMENT_DOCUMENT_VERSION,
+};
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
 use reqwest::Client;
 
-use crate::{api, key_nego, peer, profile};
+use crate::{api, profile};
 
-/// File names produced by `key-nego init-client-ca`, looked up in `--client-ca-dir`.
-const CA_CERTIFICATE_FILE: &str = "orion-client-ca.der";
-const CA_PRIVATE_KEY_FILE: &str = "orion-client-ca-key.der";
-const PQ_CA_PRIVATE_KEY_FILE: &str = "orion-client-pq-ca-private.bin";
-
-pub struct EnrollOptions {
-    /// Profile name, also the peer name on the gateway.
-    pub name: String,
+pub struct DocumentOptions {
+    /// The client's `.helios-request`.
+    pub request: PathBuf,
+    /// TLS leaf `astra-signer enroll accept` wrote, DER.
+    pub tls_certificate: PathBuf,
+    /// PQ leaf `astra-signer enroll accept` wrote, JSON.
+    pub pq_certificate: PathBuf,
     /// Gateway's public WireGuard endpoint (`IP:port` or `FQDN:port`).
     pub endpoint: String,
-    /// Directory holding the operator client CA.
-    pub client_ca_dir: PathBuf,
-    /// Client public key, when the client already holds its own pair.
-    pub public_key: Option<String>,
-    /// File holding the client's WireGuard **private** key.
-    ///
-    /// A file rather than an argument: `ps` shows every process's argv, so a
-    /// key passed on the command line is readable by any local user for as
-    /// long as the command runs.
-    pub private_key_file: Option<PathBuf>,
-    /// Negotiation mode, which is also the peer's floor.
-    pub mode: ProtectionMode,
     /// Negotiation endpoint. Defaults to the tunnel host with the port the
     /// gateway publishes.
     pub negotiation_endpoint: Option<String>,
-    /// Name of the protected store entry. Defaults to `orion-<name>`.
-    pub identity: Option<String>,
-    /// Admit the peer as a control-plane administrator.
-    pub admin: bool,
     /// Split tunnel to ship with the profile. Absent = full tunnel.
     ///
     /// Stated once by the operator and carried by the document, rather than
@@ -70,15 +46,7 @@ pub struct EnrollOptions {
     pub allowed_ips: Option<String>,
     /// SSH destination to ship with the profile. Absent = no terminal button.
     pub ssh_target: Option<String>,
-    /// Revoke an existing peer of the same name before admitting.
-    pub replace: bool,
     pub output: PathBuf,
-    /// Reuse an identity already written by `key-nego issue-client`.
-    ///
-    /// Mandatory whenever admission happened in a separate step: the gateway
-    /// holds the fingerprints of *those* certificates, and reissuing here
-    /// would build a profile the gateway refuses.
-    pub client_pki_dir: Option<PathBuf>,
     /// Enrollment without the control-plane API. See [`OfflineInputs`].
     pub offline: Option<OfflineInputs>,
 }
@@ -95,8 +63,8 @@ pub struct EnrollOptions {
 /// The protocol has no such dependency — Orion dials the public negotiation
 /// port before mounting anything. Only the tooling did, and this is where it
 /// stops: the operator already has an SSH session to the gateway, which is
-/// enough to read two public certificates and to admit the peer with
-/// `heliosd peer add`.
+/// enough to read two public certificates and the trust block, and to admit
+/// the peer with `heliosd peer add`.
 pub struct OfflineInputs {
     /// `/var/lib/helios/key-negotiation-cert.der`, fetched over SSH.
     pub gateway_certificate: PathBuf,
@@ -112,10 +80,8 @@ pub struct OfflineInputs {
     pub heliosd_url: Option<String>,
     /// The §19 trust block, as `heliosd show-trust-enrolment` printed it.
     ///
-    /// Offline there is no API to ask, and the values are not guessable: they
-    /// are the domain's anchors and this peer's generation. Absent, the
-    /// profile omits the block and Orion says renewal is unavailable — which
-    /// is true, and better than a button that fails at its last step.
+    /// Required: the document is signed under the `CA-PQ` this block names,
+    /// and a v5 profile without it has no anchor to renew under.
     pub trust_material: Option<PathBuf>,
 }
 
@@ -180,7 +146,7 @@ fn offline_material(inputs: &OfflineInputs) -> Result<GatewayMaterial> {
     // one, `CA-PQ` with one (ADR-008 §13.1) — and the anchor for the second
     // case lives in the trust block, which is only known once the peer is
     // admitted. Verifying here would therefore accept exactly one of the two
-    // shapes. `run` checks the leaf once, for both paths, against the anchor
+    // shapes. `build_draft` checks the leaf once, for both paths, against the anchor
     // the profile is about to pin.
     let encoder = base64::engine::general_purpose::STANDARD;
     Ok(GatewayMaterial {
@@ -195,188 +161,275 @@ fn offline_material(inputs: &OfflineInputs) -> Result<GatewayMaterial> {
     })
 }
 
-pub async fn run(client: &Client, base: &str, options: EnrollOptions) -> Result<()> {
-    if options.mode == ProtectionMode::StaticPsk {
-        bail!(
-            "`enroll` does not set up a static PSK: that mode needs a secret shared out of band, \
-             which this command deliberately never invents. Use --mode ml-kem, and configure a \
-             static PSK by hand if you really need one."
-        );
-    }
+/// What the gateway says about the admitted peer, however it was read.
+struct Admission {
+    address: String,
+    address_v6: Option<String>,
+    heliosd_url: Option<String>,
+    trust: Option<orion_core::TrustMaterial>,
+}
 
-    let (material, heliosd_url) = match &options.offline {
-        Some(inputs) => (offline_material(inputs)?, inputs.heliosd_url.clone()),
-        None => {
-            let network = api::network(client, base).await?;
-            let gateway_public_key = network
-                .wg_public_key
-                .clone()
-                .filter(|key| !key.is_empty())
-                .context(
-                    "the gateway has no WireGuard identity yet — run `heliosd init-identity` on \
-                     the gateway, with console access",
-                )?;
-
-            let negotiation = api::key_negotiation(client, base).await?.context(
-                "this gateway serves no key-negotiation material — build heliosd with the \
-                 `key-negotiation` feature and run `heliosd init-key-negotiation`, or fall back \
-                 to `helios profile emit` for a profile without pre-WireGuard negotiation",
-            )?;
-
-            // The gateway certificate is pinned to a WireGuard key. If that is
-            // not the identity the gateway actually runs on, every client
-            // built here would fail its pinning check — and the message would
-            // blame the client.
-            if negotiation.wireguard_public_key != gateway_public_key {
-                bail!(
-                    "the gateway negotiation certificate is bound to another WireGuard identity: \
-                     it pins {}, while the gateway runs {}. Its identity was rotated without \
-                     reissuing the certificate — re-run `heliosd init-key-negotiation --rotate`.",
-                    negotiation.wireguard_public_key,
-                    gateway_public_key
-                );
-            }
-            let url = crate::profile::heliosd_url(&network.wg_address);
-            (
-                GatewayMaterial {
-                    server_name: negotiation.server_name,
-                    gateway_ca_der: negotiation.gateway_ca_der,
-                    gateway_pq_certificate: negotiation.gateway_pq_certificate,
-                    wireguard_public_key: negotiation.wireguard_public_key,
-                    pq_certificate_sha256: negotiation.pq_certificate_sha256,
-                    negotiation_port: negotiation.port,
-                },
-                url,
-            )
-        }
-    };
-
-    let identity_name = options
-        .identity
-        .clone()
-        .unwrap_or_else(|| format!("orion-{}", options.name.trim()));
-    let negotiation_endpoint = resolve_negotiation_endpoint(&options, material.negotiation_port)?;
-
-    let (public_key, private_key) = resolve_keys(&options)?;
-    let client_material = match &options.client_pki_dir {
-        Some(directory) => key_nego::load_client_material(directory).with_context(|| {
-            format!("reloading the client identity from {}", directory.display())
-        })?,
-        None => key_nego::issue_client_material(
-            &options.name,
-            &public_key,
-            &options.client_ca_dir.join(CA_CERTIFICATE_FILE),
-            &options.client_ca_dir.join(CA_PRIVATE_KEY_FILE),
-            &options.client_ca_dir.join(PQ_CA_PRIVATE_KEY_FILE),
-        )
-        .with_context(|| {
+pub async fn document(client: &Client, base: &str, options: DocumentOptions) -> Result<()> {
+    let request = read_request(&options.request)?;
+    let tls_certificate =
+        DerCertificate::new(read_file(&options.tls_certificate)?).with_context(|| {
             format!(
-                "issuing the client certificates from {} — was the CA created with \
-                 `helios key-nego init-client-ca`?",
-                options.client_ca_dir.display()
+                "{} is not a DER certificate",
+                options.tls_certificate.display()
             )
-        })?,
-    };
-
-    // Offline, the admission has already happened through `heliosd peer add`
-    // on the console: the VIP it printed is what the operator passes back.
-    let (address, address_v6) = match &options.offline {
-        Some(inputs) => (inputs.address.clone(), inputs.address_v6.clone()),
-        None => {
-            let address = admit(client, base, &options, &public_key, &client_material).await?;
-            // The admission answer carries the IPv4 VIP only; the IPv6 one is
-            // read from the gateway's record of the peer just admitted.
-            let address_v6 = crate::profile::admitted_address_v6(
-                &api::network(client, base).await?,
-                &options.name,
-                &public_key,
-                &address,
-            )?;
-            (address, address_v6)
-        }
-    };
-
-    // The §19 trust block, read from the gateway once the peer is admitted —
-    // the generation it carries is that peer's, so it cannot be fetched
-    // earlier. Offline, there is nobody to ask: the document then omits it and
-    // Orion says so rather than offering a renewal that would fail at its last
-    // step.
-    let trust = match &options.offline {
-        Some(inputs) => match &inputs.trust_material {
-            Some(path) => Some(read_trust_material(path)?),
-            None => None,
-        },
-        None => api::trust_enrolment(client, base, &public_key).await?,
-    };
-    if trust.is_none() {
-        eprintln!(
-            "note : ce profil ne portera pas de matériel de confiance — cette gateway n'a pas de \
-             domaine amorcé (`heliosd init-trust-domain`). Le client se connectera, mais ne \
-             pourra pas renouveler son certificat."
-        );
-    }
-
-    // The one place the pinned gateway leaf is verified, under whichever
-    // authority actually issued it. It runs after the trust block is known
-    // because a `CA-PQ`-issued leaf can only be checked against the anchor
-    // that block carries — and it runs on the API path too, which until now
-    // pinned whatever the gateway returned without checking a signature.
-    {
-        let certificate: aether::key_negotiation::PqCertificate = serde_json::from_slice(
-            &base64::Engine::decode(
-                &base64::engine::general_purpose::STANDARD,
-                &material.gateway_pq_certificate,
+        })?;
+    let pq_certificate: PqCertificate =
+        serde_json::from_slice(&read_file(&options.pq_certificate)?).with_context(|| {
+            format!(
+                "{} is not a PQ certificate",
+                options.pq_certificate.display()
             )
-            .context("the gateway PQ certificate is not valid base64")?,
-        )
-        .context("the gateway PQ certificate is not a readable JSON document")?;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .context("system clock predates the Unix epoch")?
-            .as_secs();
-        orion_core::verify_pinned_gateway_certificate(
-            &certificate,
-            &material.server_name,
-            &material.wireguard_public_key,
-            trust.as_ref(),
-            now,
-        )
-        .context("the gateway PQ certificate does not verify — copied incompletely, or expired")?;
-    }
+        })?;
+    // Checked before the gateway is contacted: leaves for another request are
+    // a mix-up of files, and nothing the gateway says can repair it.
+    check_leaves(&request, &tls_certificate, &pq_certificate)?;
 
-    let encoder = base64::engine::general_purpose::STANDARD;
-    let json = profile::render(profile::Profile {
-        name: &options.name,
+    let client_key = request.client_wg_public_key.to_base64();
+    let (material, admission) = match &options.offline {
+        Some(inputs) => (
+            offline_material(inputs)?,
+            Admission {
+                address: inputs.address.clone(),
+                address_v6: inputs.address_v6.clone(),
+                heliosd_url: inputs.heliosd_url.clone(),
+                trust: inputs
+                    .trust_material
+                    .as_deref()
+                    .map(read_trust_material)
+                    .transpose()?,
+            },
+        ),
+        None => online_material(client, base, &client_key).await?,
+    };
+    let negotiation_endpoint = resolve_negotiation_endpoint(
+        &options.endpoint,
+        options.negotiation_endpoint.as_deref(),
+        material.negotiation_port,
+    )?;
+    let draft = build_draft(Draft {
+        request: &request,
+        tls_certificate,
+        pq_certificate: &pq_certificate,
+        material: &material,
+        admission,
         endpoint: &options.endpoint,
-        private_key: private_key.as_deref(),
-        peer_public_key: &material.wireguard_public_key,
-        address: &address,
-        address_v6: address_v6.as_deref(),
+        negotiation_endpoint,
         allowed_ips: options.allowed_ips.as_deref(),
         ssh_target: options.ssh_target.as_deref(),
-        heliosd_url,
+        now_unix: now_unix()?,
+    })?;
+    let json = draft.to_json().context("encoding the draft")?;
+    // The consumer reads the draft before anyone signs it: a document Orion
+    // would refuse must not cost a ceremony.
+    orion_core::parse_profile_import(&json, "draft.orion")
+        .context("the draft is not readable by Orion — this is a tooling bug")?;
+    crate::files::write_new(&options.output, json.as_bytes(), false)?;
+    report(&options, &request, &material);
+    Ok(())
+}
+
+async fn online_material(
+    client: &Client,
+    base: &str,
+    client_key: &str,
+) -> Result<(GatewayMaterial, Admission)> {
+    let network = api::network(client, base).await?;
+    let gateway_public_key = network
+        .wg_public_key
+        .clone()
+        .filter(|key| !key.is_empty())
+        .context(
+            "the gateway has no WireGuard identity yet — run `heliosd init-identity` on the \
+             gateway, with console access",
+        )?;
+    let negotiation = api::key_negotiation(client, base).await?.context(
+        "this gateway serves no key-negotiation material — build heliosd with the \
+         `key-negotiation` feature and run `heliosd init-key-negotiation`",
+    )?;
+    // The gateway certificate is pinned to a WireGuard key. If that is not
+    // the identity the gateway actually runs on, every client built here
+    // would fail its pinning check — and the message would blame the client.
+    if negotiation.wireguard_public_key != gateway_public_key {
+        bail!(
+            "the gateway negotiation certificate is bound to another WireGuard identity: it pins \
+             {}, while the gateway runs {}. Its identity was rotated without reissuing the \
+             certificate — re-run `heliosd init-key-negotiation --rotate`.",
+            negotiation.wireguard_public_key,
+            gateway_public_key
+        );
+    }
+    let peer = network
+        .peers
+        .iter()
+        .find(|peer| peer.public_key.trim() == client_key)
+        .with_context(|| {
+            format!(
+                "no peer holds the key {client_key} on this gateway: admit it first with the \
+                 `heliosd peer add` line `astra-signer enroll accept` printed"
+            )
+        })?;
+    let admission = Admission {
+        address: peer.address.clone(),
+        address_v6: peer
+            .address_v6
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        heliosd_url: profile::heliosd_url(&network.wg_address),
+        trust: api::trust_enrolment(client, base, client_key).await?,
+    };
+    Ok((
+        GatewayMaterial {
+            server_name: negotiation.server_name,
+            gateway_ca_der: negotiation.gateway_ca_der,
+            gateway_pq_certificate: negotiation.gateway_pq_certificate,
+            wireguard_public_key: negotiation.wireguard_public_key,
+            pq_certificate_sha256: negotiation.pq_certificate_sha256,
+            negotiation_port: negotiation.port,
+        },
+        admission,
+    ))
+}
+
+/// The inputs of a draft, once every file and the gateway have been read.
+struct Draft<'a> {
+    request: &'a EnrollmentRequest,
+    tls_certificate: DerCertificate,
+    pq_certificate: &'a PqCertificate,
+    material: &'a GatewayMaterial,
+    admission: Admission,
+    endpoint: &'a str,
+    negotiation_endpoint: String,
+    allowed_ips: Option<&'a str>,
+    ssh_target: Option<&'a str>,
+    now_unix: u64,
+}
+
+/// The leaves must certify the keys the request names, and nothing else.
+fn check_leaves(
+    request: &EnrollmentRequest,
+    tls_certificate: &DerCertificate,
+    pq_certificate: &PqCertificate,
+) -> Result<()> {
+    aether::certificates::x509::assert_csr_matches(&request.tls_csr, tls_certificate)
+        .map_err(|error| anyhow::anyhow!("the TLS leaf does not certify the request: {error}"))?;
+    if pq_certificate.role != PqCertificateRole::Client {
+        bail!("the PQ leaf is not a client leaf");
+    }
+    let wireguard = request.client_wg_public_key.to_base64();
+    if pq_certificate.wireguard_public_key != wireguard {
+        bail!(
+            "the PQ leaf certifies the WireGuard key {}, while the request names {wireguard}",
+            pq_certificate.wireguard_public_key
+        );
+    }
+    let ml_dsa = request.client_ml_dsa_87_public_key.to_base64();
+    if pq_certificate.ml_dsa_87_public_key != ml_dsa {
+        bail!("the PQ leaf certifies another ML-DSA-87 key than the request's");
+    }
+    Ok(())
+}
+
+fn build_draft(draft: Draft<'_>) -> Result<EnrollmentDocument> {
+    let Some(trust) = draft.admission.trust else {
+        bail!(
+            "cette gateway n'a pas de domaine de confiance : `astra-signer init` puis \
+             `heliosd init-trust-domain`. Un document v5 est signé sous la CA-PQ que ce domaine \
+             épingle."
+        );
+    };
+    let ca_pq_public_key = MlDsa87PublicKey::parse(&trust.ca_pq_public_key)
+        .context("the trust block names an unreadable CA-PQ key")?;
+    draft
+        .pq_certificate
+        .verify(
+            ca_pq_public_key.as_bytes(),
+            PqCertificateRole::Client,
+            Some(&draft.request.requested_name),
+            &draft.request.client_wg_public_key.to_base64(),
+            draft.now_unix,
+        )
+        .map_err(|error| {
+            anyhow::anyhow!("the PQ leaf does not verify under this domain's CA-PQ: {error}")
+        })?;
+
+    // The one place the pinned gateway leaf is verified, under the authority
+    // that issued it — the trust block's `CA-PQ`.
+    let gateway_certificate: PqCertificate = serde_json::from_slice(
+        &base64::engine::general_purpose::STANDARD
+            .decode(&draft.material.gateway_pq_certificate)
+            .context("the gateway PQ certificate is not valid base64")?,
+    )
+    .context("the gateway PQ certificate is not a readable JSON document")?;
+    orion_core::verify_pinned_gateway_certificate(
+        &gateway_certificate,
+        &draft.material.server_name,
+        &draft.material.wireguard_public_key,
+        Some(&trust),
+        draft.now_unix,
+    )
+    .context("the gateway PQ certificate does not verify — copied incompletely, or expired")?;
+
+    let public = profile::public_profile(&profile::Profile {
+        name: &draft.request.requested_name,
+        endpoint: draft.endpoint,
+        private_key: None,
+        peer_public_key: &draft.material.wireguard_public_key,
+        address: &draft.admission.address,
+        address_v6: draft.admission.address_v6.as_deref(),
+        allowed_ips: draft.allowed_ips,
+        ssh_target: draft.ssh_target,
+        heliosd_url: draft.admission.heliosd_url,
         key_negotiation: Some(profile::KeyNegotiation {
-            mode: options.mode,
-            minimum_mode: options.mode,
-            endpoint: negotiation_endpoint,
-            server_name: material.server_name.clone(),
-            gateway_ca_der: material.gateway_ca_der.clone(),
-            gateway_pq_certificate: material.gateway_pq_certificate.clone(),
-            identity: identity_name.clone(),
-            trust,
-        }),
-        key_negotiation_identity: Some(orion_core::ClientIdentityBundle {
-            identity: identity_name.clone(),
-            certificate_chain: vec![encoder.encode(&client_material.certificate_der)],
-            private_key: encoder.encode(&client_material.private_key_der).into(),
-            pq_certificate: encoder.encode(&client_material.pq_certificate_json),
-            pq_private_key: encoder.encode(&client_material.pq_private_key).into(),
+            mode: ProtectionMode::MlKem,
+            minimum_mode: ProtectionMode::MlKem,
+            endpoint: draft.negotiation_endpoint,
+            server_name: draft.material.server_name.clone(),
+            gateway_ca_der: draft.material.gateway_ca_der.clone(),
+            gateway_pq_certificate: draft.material.gateway_pq_certificate.clone(),
+            trust: Some(trust),
         }),
     })?;
+    Ok(EnrollmentDocument {
+        format: ENROLLMENT_DOCUMENT_FORMAT.into(),
+        format_version: ENROLLMENT_DOCUMENT_VERSION,
+        invitation_id: draft.request.invitation_id,
+        request_id: draft.request.request_id,
+        request_fingerprint: draft.request.fingerprint(),
+        operator_ca_fingerprint: ca_pq_public_key.authority_fingerprint(),
+        issued_at_unix: draft.now_unix,
+        profile: public,
+        client_tls_certificate: draft.tls_certificate,
+        client_pq_certificate: base64::engine::general_purpose::STANDARD.encode(
+            serde_json::to_vec(draft.pq_certificate).context("encoding the client PQ leaf")?,
+        ),
+        operator_signature: None,
+    })
+}
 
-    crate::files::write_new(&options.output, json.as_bytes(), true)?;
-    report(&options, &public_key, &client_material, &material);
-    Ok(())
+fn read_request(path: &Path) -> Result<EnrollmentRequest> {
+    let text = String::from_utf8(read_file(path)?)
+        .with_context(|| format!("{} is not UTF-8", path.display()))?;
+    let request = decode_request_file(&text)
+        .with_context(|| format!("{} is not an enrollment request", path.display()))?;
+    Ok(request)
+}
+
+fn read_file(path: &Path) -> Result<Vec<u8>> {
+    std::fs::read(path).with_context(|| format!("reading {}", path.display()))
+}
+
+fn now_unix() -> Result<u64> {
+    Ok(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock predates the Unix epoch")?
+        .as_secs())
 }
 
 /// Endpoint of the negotiation service, as the client will dial it.
@@ -385,225 +438,289 @@ pub async fn run(client: &Client, base: &str, options: EnrollOptions) -> Result<
 /// same host, and asking the operator to retype the address is one more place
 /// to get it wrong. The port comes from the gateway, never from a guess — a
 /// hardcoded 51821 would silently be wrong on a gateway that moved it.
-fn resolve_negotiation_endpoint(options: &EnrollOptions, port: Option<u16>) -> Result<String> {
-    if let Some(explicit) = &options.negotiation_endpoint {
+fn resolve_negotiation_endpoint(
+    endpoint: &str,
+    explicit: Option<&str>,
+    port: Option<u16>,
+) -> Result<String> {
+    if let Some(explicit) = explicit {
         return Ok(explicit.trim().to_string());
     }
     let port = port.context(
         "the gateway publishes no key-negotiation port — set `key_negotiation_port` in \
          network.toml, or pass --negotiation-endpoint",
     )?;
-    let host = options
-        .endpoint
+    let host = endpoint
         .rsplit_once(':')
         .map(|(host, _)| host)
-        .unwrap_or(&options.endpoint);
+        .unwrap_or(endpoint);
     Ok(format!("{host}:{port}"))
 }
 
-/// Picks the mode and returns `(public key, optional private key)`.
-///
-/// Unlike `profile emit`, generating the pair is the **default**: this
-/// document already carries the identity's private keys, so withholding the
-/// WireGuard one would protect nothing while forcing an extra round-trip.
-/// Supplying `--public-key` stays possible and remains better whenever the
-/// client can generate its own key.
-fn resolve_keys(options: &EnrollOptions) -> Result<(String, Option<String>)> {
-    // A supplied private key takes precedence: it means the caller generated
-    // the pair beforehand — the offline path has to, because the peer must be
-    // admitted (and its VIP known) before the profile can be assembled.
-    if let Some(path) = &options.private_key_file {
-        let private_key = std::fs::read_to_string(path)
-            .with_context(|| format!("reading the client private key {}", path.display()))?
-            .trim()
-            .to_string();
-        let public_key = aether::wg::public_from_private(&private_key)
-            .map_err(|e| anyhow::anyhow!("unreadable client private key: {e}"))?;
-        if let Some(declared) = &options.public_key {
-            anyhow::ensure!(
-                declared.trim() == public_key,
-                "the supplied private key does not match --public-key: the peer would be \
-                 admitted under one identity and the profile built on another"
-            );
-        }
-        return Ok((public_key, Some(private_key)));
-    }
-    match &options.public_key {
-        Some(public_key) => {
-            let public_key = public_key.trim().to_string();
-            aether::wg::validate_key(&public_key).context("invalid client public key")?;
-            Ok((public_key, None))
-        }
-        None => {
-            let pair = aether::wg::generate_keypair()
-                .map_err(|e| anyhow::anyhow!("generating the client key pair: {e}"))?;
-            Ok((pair.public_key, Some(pair.private_key.expose().to_string())))
-        }
-    }
-}
-
-/// Admits the peer with both fingerprints and the floor.
-///
-/// A re-enrollment always carries **new** certificates, so reusing an
-/// existing admission is not an option here: the gateway would keep matching
-/// the old fingerprints and refuse the client this very command just issued.
-/// Hence the explicit `--replace`, which says out loud that the peer holding
-/// the previous identity is about to be cut off.
-async fn admit(
-    client: &Client,
-    base: &str,
-    options: &EnrollOptions,
-    public_key: &str,
-    material: &key_nego::ClientMaterial,
-) -> Result<String> {
-    // The two leaves travel with the two fingerprints: the peer table pins the
-    // digests, the certificate registry records the objects. One admission,
-    // one pair of certificates — a peer whose registry row was written from
-    // another enrollment would hold a generation nobody can renew.
-    let encoder = base64::engine::general_purpose::STANDARD;
-    let tls_certificate = encoder.encode(&material.certificate_der);
-    let pq_certificate = encoder.encode(&material.pq_certificate_json);
-    let policy = peer::KeyNegotiationAdmission {
-        tls_certificate_sha256: Some(&material.certificate_sha256),
-        pq_certificate_sha256: Some(&material.pq_certificate_sha256),
-        tls_certificate: Some(&tls_certificate),
-        pq_certificate: Some(&pq_certificate),
-        minimum_mode: options.mode,
-    };
-
-    if options.replace {
-        // Ignored on purpose when there is nothing to revoke: `--replace` on
-        // a first enrollment should succeed, not report a missing peer.
-        let _ = peer::revoke(client, base, &options.name).await;
-    }
-
-    match peer::admit_with_policy(
-        client,
-        base,
-        &options.name,
-        public_key,
-        options.admin,
-        policy,
-    )
-    .await
-    {
-        Ok(peer) => Ok(peer.address),
-        Err(error) => {
-            let view = api::network(client, base).await?;
-            if view
-                .peers
-                .iter()
-                .any(|peer| peer.name.trim() == options.name.trim())
-            {
-                bail!(
-                    "a peer named \"{}\" is already admitted, with the certificates of a \
-                     previous enrollment. Re-run with --replace to revoke it and admit this \
-                     new identity: the client still holding the old one will stop connecting.",
-                    options.name
-                );
-            }
-            Err(error)
-        }
-    }
-}
-
-fn report(
-    options: &EnrollOptions,
-    public_key: &str,
-    material: &key_nego::ClientMaterial,
-    negotiation: &GatewayMaterial,
-) {
+fn report(options: &DocumentOptions, request: &EnrollmentRequest, material: &GatewayMaterial) {
     println!(
-        "{} {} enrolled → {}",
+        "{} draft for \"{}\" → {}",
         crate::ok(),
-        options.name,
+        request.requested_name,
         options.output.display()
     );
     println!();
-    println!("  \x1b[33mThis file contains the client's private keys.\x1b[0m Hand it over through");
-    println!("  a controlled channel, then erase it from both workstations: Orion");
-    println!("  seals the identity on import and no longer needs the file.");
-    println!();
-    println!("  \x1b[2mWireGuard public key : {public_key}\x1b[0m");
+    println!("  \x1b[2mNo private key in this file, and no signature yet. Sign it with:\x1b[0m");
     println!(
-        "  \x1b[2mclient PQ certificate: {}\x1b[0m",
-        material.pq_certificate_sha256
+        "  astra-signer enroll sign-document --draft {} --out {}.orion",
+        options.output.display(),
+        request.requested_name
     );
+    println!();
     println!(
         "  \x1b[2mgateway PQ certificate: {}\x1b[0m",
-        negotiation.pq_certificate_sha256
+        material.pq_certificate_sha256
     );
-    println!();
-    println!("  \x1b[2mOrion displays that gateway fingerprint on its Profiles screen:\x1b[0m");
-    println!("  \x1b[2mcomparing the two is what ties the profile to this gateway.\x1b[0m");
-}
-
-/// Reads the CA files the enrollment needs, before anything is issued.
-///
-/// Checked up front so a missing CA is reported before the command has
-/// admitted a peer it will not be able to hand a profile to.
-/// # Le piège que ce message évite
-///
-/// Il disait « créer la CA opérateur d'abord », avec la commande toute faite.
-/// Sur un poste où la CA existe mais n'a pas été trouvée — parce que le
-/// répertoire par défaut était relatif au dossier courant — suivre ce conseil
-/// **orphelinait toute la flotte** : `heliosd init-key-negotiation` épingle la
-/// CA client dans `/var/lib/helios/key-negotiation-client-pq-ca-public.bin`, et
-/// la gateway refuse tout certificat émis par une autre. Le remède proposé
-/// cassait ce qui marchait encore.
-///
-/// Le message dit donc d'abord de **retrouver** la CA existante, et ne propose
-/// d'en créer une qu'en nommant la conséquence.
-pub fn check_client_ca(directory: &Path) -> Result<()> {
-    for file in [
-        CA_CERTIFICATE_FILE,
-        CA_PRIVATE_KEY_FILE,
-        PQ_CA_PRIVATE_KEY_FILE,
-    ] {
-        let path = directory.join(file);
-        if !path.is_file() {
-            bail!(
-                "CA opérateur introuvable dans {} ({} manque).\n\n\
-                 Si vous avez déjà enrôlé un client, cette CA **existe** et la gateway \
-                 n'accepte qu'elle. La retrouver :\n  \
-                 find ~ -name '{}' 2>/dev/null\n\
-                 puis la désigner par --client-ca-dir, ou la déplacer à l'emplacement \
-                 par défaut ci-dessus.\n\n\
-                 N'en créer une neuve que s'il n'en existe aucune : la gateway épingle la \
-                 CA cliente à `heliosd init-key-negotiation`, et une CA différente rend \
-                 illisible tout certificat déjà émis — tous les clients admis cessent de \
-                 négocier.\n  \
-                 helios key-nego init-client-ca --name <nom>",
-                directory.display(),
-                path.display(),
-                CA_CERTIFICATE_FILE,
-            );
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aether::certificates::encoding::{Fingerprint, Id16, MlDsa87Signature, WireGuardKey};
+    use aether::key_negotiation::{
+        generate_ml_dsa_87_keypair, issue_pq_certificate, ENROLLMENT_FORMAT_VERSION,
+        ENROLLMENT_PROTOCOL_VERSION, PQ_CERTIFICATE_VERSION,
+    };
+    use base64::engine::general_purpose::STANDARD;
 
-    fn options() -> EnrollOptions {
-        EnrollOptions {
-            name: "portable".into(),
-            endpoint: "vpn.example.net:51820".into(),
-            client_ca_dir: PathBuf::from("./ca"),
-            public_key: None,
+    const SERVER_NAME: &str = "vpn.example.net";
+
+    struct Fixture {
+        request: EnrollmentRequest,
+        tls_certificate: DerCertificate,
+        pq_certificate: PqCertificate,
+        material: GatewayMaterial,
+        trust: orion_core::TrustMaterial,
+    }
+
+    fn now() -> u64 {
+        now_unix().unwrap()
+    }
+
+    fn pq_leaf(
+        ca: &[u8],
+        role: PqCertificateRole,
+        subject: &str,
+        wireguard: &str,
+        ml_dsa: &str,
+    ) -> PqCertificate {
+        issue_pq_certificate(
+            PqCertificate {
+                version: PQ_CERTIFICATE_VERSION,
+                serial: [5; 16],
+                subject: subject.into(),
+                issuer: "CA-PQ".into(),
+                role,
+                wireguard_public_key: wireguard.into(),
+                ml_dsa_87_public_key: ml_dsa.into(),
+                not_before_unix: now() - 60,
+                not_after_unix: now() + 86_400,
+                ml_dsa_87_signature: String::new(),
+            },
+            ca,
+        )
+        .unwrap()
+    }
+
+    fn tls_leaf(csr: &DerCertificate) -> (DerCertificate, DerCertificate) {
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::CrlSign,
+        ];
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let ca = params.self_signed(&ca_key).unwrap();
+        let request =
+            rcgen::CertificateSigningRequestParams::from_der(&csr.as_bytes().into()).unwrap();
+        let issuer = rcgen::Issuer::from_ca_cert_der(ca.der(), &ca_key).unwrap();
+        (
+            DerCertificate::new(request.signed_by(&issuer).unwrap().der().to_vec()).unwrap(),
+            DerCertificate::new(ca.der().to_vec()).unwrap(),
+        )
+    }
+
+    fn fixture() -> Fixture {
+        let (ca_private, ca_public) = generate_ml_dsa_87_keypair().unwrap();
+        let ca_public = MlDsa87PublicKey::new(ca_public).unwrap();
+        let (_, client_ml_dsa) = generate_ml_dsa_87_keypair().unwrap();
+        let client_ml_dsa = MlDsa87PublicKey::new(client_ml_dsa).unwrap();
+        let client_wg = aether::wg::generate_keypair().unwrap();
+        let gateway_wg = aether::wg::generate_keypair().unwrap();
+        let csr = aether::certificates::x509::client_rotation_csr("poste-windows").unwrap();
+        let request = EnrollmentRequest {
+            format_version: ENROLLMENT_FORMAT_VERSION,
+            protocol_version: ENROLLMENT_PROTOCOL_VERSION,
+            invitation_id: Id16::new([1; 16]).unwrap(),
+            invitation_fingerprint: Fingerprint::from_bytes([2; 32]),
+            request_id: Id16::new([3; 16]).unwrap(),
+            timestamp_unix: now(),
+            requested_name: "poste-windows".into(),
+            client_wg_public_key: WireGuardKey::parse(&client_wg.public_key).unwrap(),
+            tls_csr: csr.csr,
+            client_ml_dsa_87_public_key: client_ml_dsa.clone(),
+            wireguard_proof: [0; 32],
+            client_signature: MlDsa87Signature::placeholder(),
+        };
+        let (tls_certificate, tls_ca) = tls_leaf(&request.tls_csr);
+        let pq_certificate = pq_leaf(
+            &ca_private,
+            PqCertificateRole::Client,
+            "poste-windows",
+            &client_wg.public_key,
+            &client_ml_dsa.to_base64(),
+        );
+        let (_, gateway_ml_dsa) = generate_ml_dsa_87_keypair().unwrap();
+        let gateway = pq_leaf(
+            &ca_private,
+            PqCertificateRole::Gateway,
+            SERVER_NAME,
+            &gateway_wg.public_key,
+            &STANDARD.encode(&gateway_ml_dsa),
+        );
+        Fixture {
+            material: GatewayMaterial {
+                server_name: SERVER_NAME.into(),
+                gateway_ca_der: STANDARD.encode([0x30, 0x82, 0x01, 0x00]),
+                gateway_pq_certificate: STANDARD.encode(serde_json::to_vec(&gateway).unwrap()),
+                wireguard_public_key: gateway_wg.public_key,
+                pq_certificate_sha256: gateway.fingerprint().unwrap(),
+                negotiation_port: Some(51821),
+            },
+            trust: orion_core::TrustMaterial {
+                trust_domain_id: "11".repeat(16),
+                ca_epoch: 1,
+                ca_pq_public_key: ca_public.to_base64(),
+                ca_tls_epoch: 1,
+                client_tls_ca_der: STANDARD.encode(tls_ca.as_bytes()),
+                client_generation: 1,
+                astra_authority_url: "https://astra.example".into(),
+                webauthn_rp_id: "astra.example".into(),
+                astra_policy_fingerprint: Fingerprint::of(b"policy").to_hex(),
+                credential_registry_epoch: 1,
+                astra_credential_bindings: Vec::new(),
+                astra_service_key_epoch: 1,
+                astra_service_public_key: ca_public.to_base64(),
+                active_gateway_identity_epoch: 1,
+                gateway_decision_epoch: 1,
+            },
+            request,
+            tls_certificate,
+            pq_certificate,
+        }
+    }
+
+    fn draft(
+        fixture: &Fixture,
+        trust: Option<orion_core::TrustMaterial>,
+    ) -> Result<EnrollmentDocument> {
+        build_draft(Draft {
+            request: &fixture.request,
+            tls_certificate: fixture.tls_certificate.clone(),
+            pq_certificate: &fixture.pq_certificate,
+            material: &fixture.material,
+            admission: Admission {
+                address: "100.64.1.2/32".into(),
+                address_v6: None,
+                heliosd_url: None,
+                trust,
+            },
+            endpoint: "vpn.example.net:51820",
+            negotiation_endpoint: "vpn.example.net:51821".into(),
             allowed_ips: None,
             ssh_target: None,
-            private_key_file: None,
-            client_pki_dir: None,
-            mode: ProtectionMode::MlKem,
-            negotiation_endpoint: None,
-            identity: None,
-            admin: false,
-            replace: false,
-            output: PathBuf::from("portable.orion"),
-            offline: None,
+            now_unix: now(),
+        })
+    }
+
+    #[test]
+    fn a_draft_without_a_trust_domain_is_refused() {
+        let fixture = fixture();
+        let error = format!("{:#}", draft(&fixture, None).expect_err("refused"));
+        assert!(error.contains("domaine de confiance"), "{error}");
+        assert!(error.contains("heliosd init-trust-domain"), "{error}");
+    }
+
+    #[test]
+    fn a_draft_for_leaves_that_do_not_certify_the_request_is_refused() {
+        let mine = fixture();
+        let other = fixture();
+        assert!(check_leaves(&mine.request, &other.tls_certificate, &mine.pq_certificate).is_err());
+        assert!(check_leaves(&mine.request, &mine.tls_certificate, &other.pq_certificate).is_err());
+        check_leaves(&mine.request, &mine.tls_certificate, &mine.pq_certificate)
+            .expect("the leaves of this request");
+        // Leaves of this request, under another domain's CA-PQ.
+        let mut foreign = other.trust.clone();
+        foreign.client_tls_ca_der = mine.trust.client_tls_ca_der.clone();
+        assert!(draft(&mine, Some(foreign)).is_err());
+    }
+
+    #[test]
+    fn a_draft_carries_no_identity_and_no_signature() {
+        let fixture = fixture();
+        let document = draft(&fixture, Some(fixture.trust.clone())).expect("draft");
+        assert!(document.operator_signature.is_none());
+        assert_eq!(document.request_fingerprint, fixture.request.fingerprint());
+        assert_eq!(
+            document.operator_ca_fingerprint,
+            MlDsa87PublicKey::parse(&fixture.trust.ca_pq_public_key)
+                .unwrap()
+                .authority_fingerprint()
+        );
+        let json = document.to_json().unwrap();
+        for absent in [
+            "key_negotiation_identity",
+            "private_key",
+            "operator_signature",
+            "\"identity\"",
+            "preshared_key",
+        ] {
+            assert!(!json.contains(absent), "{absent} in {json}");
+        }
+        let imported =
+            orion_core::parse_profile_import(&json, "draft.orion").expect("Orion reads it");
+        assert!(imported.enrollment.is_some());
+        assert_eq!(imported.profile.name, "poste-windows");
+    }
+
+    #[test]
+    fn the_old_one_shot_options_are_gone() {
+        use clap::Parser as _;
+        let base = [
+            "helios",
+            "enroll",
+            "document",
+            "--request",
+            "r",
+            "--tls-certificate",
+            "t",
+            "--pq-certificate",
+            "p",
+            "--endpoint",
+            "vpn.example.net:51820",
+            "--out",
+            "d.json",
+        ];
+        crate::Cli::try_parse_from(base).expect("the v5 form parses");
+        for old in [
+            ["--private-key-file", "k"],
+            ["--public-key", "k"],
+            ["--client-pki-dir", "d"],
+            ["--client-ca-dir", "d"],
+            ["--identity", "i"],
+            ["--mode", "ml-kem"],
+        ] {
+            let mut argv = base.to_vec();
+            argv.extend(old);
+            assert!(
+                crate::Cli::try_parse_from(argv).is_err(),
+                "{old:?} still parses"
+            );
         }
     }
 
@@ -612,88 +729,23 @@ mod tests {
     #[test]
     fn the_negotiation_endpoint_keeps_the_host_and_takes_the_published_port() {
         assert_eq!(
-            resolve_negotiation_endpoint(&options(), Some(51821)).unwrap(),
+            resolve_negotiation_endpoint("vpn.example.net:51820", None, Some(51821)).unwrap(),
             "vpn.example.net:51821"
         );
         assert_eq!(
-            resolve_negotiation_endpoint(
-                &EnrollOptions {
-                    endpoint: "[2001:db8::1]:51820".into(),
-                    ..options()
-                },
-                Some(7777)
-            )
-            .unwrap(),
+            resolve_negotiation_endpoint("[2001:db8::1]:51820", None, Some(7777)).unwrap(),
             "[2001:db8::1]:7777"
         );
         assert_eq!(
             resolve_negotiation_endpoint(
-                &EnrollOptions {
-                    negotiation_endpoint: Some("autre.example.net:51821".into()),
-                    ..options()
-                },
+                "vpn.example.net:51820",
+                Some("autre.example.net:51821"),
                 None
             )
             .unwrap(),
             "autre.example.net:51821"
         );
-        assert!(resolve_negotiation_endpoint(&options(), None).is_err());
-    }
-
-    /// Same property as `profile emit`: the operator must not be able to
-    /// manufacture a client secret by accident.
-    #[test]
-    fn a_supplied_public_key_never_produces_a_private_one() {
-        let pair = aether::wg::generate_keypair().unwrap();
-        let (public_key, private_key) = resolve_keys(&EnrollOptions {
-            public_key: Some(pair.public_key.clone()),
-            ..options()
-        })
-        .unwrap();
-
-        assert_eq!(public_key, pair.public_key);
-        assert!(private_key.is_none());
-    }
-
-    /// The offline path generates the pair before admitting, then hands the
-    /// private half back for the profile. A mismatch between the two would
-    /// admit one identity and build the profile on another — a tunnel that
-    /// never comes up, for a reason nothing displays.
-    #[test]
-    fn a_private_key_file_must_match_the_admitted_public_key() {
-        let pair = aether::wg::generate_keypair().unwrap();
-        let other = aether::wg::generate_keypair().unwrap();
-        let path = std::env::temp_dir().join(format!("orion-enroll-{}", std::process::id()));
-        std::fs::write(&path, pair.private_key.expose()).unwrap();
-
-        let (public_key, private_key) = resolve_keys(&EnrollOptions {
-            private_key_file: Some(path.clone()),
-            public_key: Some(pair.public_key.clone()),
-            ..options()
-        })
-        .expect("consistent pair");
-        assert_eq!(public_key, pair.public_key);
-        assert_eq!(private_key.as_deref(), Some(pair.private_key.expose()));
-
-        let error = resolve_keys(&EnrollOptions {
-            private_key_file: Some(path.clone()),
-            public_key: Some(other.public_key),
-            ..options()
-        })
-        .expect_err("a mismatched pair must be refused");
-        assert!(error.to_string().contains("does not match"), "{error}");
-
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn a_generated_pair_is_consistent() {
-        let (public_key, private_key) = resolve_keys(&options()).unwrap();
-        let private_key = private_key.expect("generated key");
-        assert_eq!(
-            aether::wg::public_from_private(&private_key).unwrap(),
-            public_key
-        );
+        assert!(resolve_negotiation_endpoint("vpn.example.net:51820", None, None).is_err());
     }
 
     /// Offline, everything the profile pins comes out of the two public
@@ -760,13 +812,5 @@ mod tests {
         assert!(offline_material(&inputs).is_err());
 
         let _ = std::fs::remove_dir_all(&directory);
-    }
-
-    #[test]
-    fn a_missing_client_ca_is_reported_before_anything_is_issued() {
-        let error = check_client_ca(Path::new("/nonexistent-ca"))
-            .expect_err("a missing CA must be refused")
-            .to_string();
-        assert!(error.contains("init-client-ca"), "message: {error}");
     }
 }

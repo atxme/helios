@@ -149,39 +149,47 @@ fn command_line_covers_offline_and_diagnostic_commands() {
         Cli::try_parse_from(arguments).unwrap();
     }
 
+    let online = [
+        "helios",
+        "enroll",
+        "document",
+        "--request",
+        "client.helios-request",
+        "--tls-certificate",
+        "client-cert.der",
+        "--pq-certificate",
+        "client-pq-cert.json",
+        "--endpoint",
+        "vpn.example:51820",
+        "--out",
+        "client.json",
+    ];
+    Cli::try_parse_from(online).unwrap();
     assert!(
-        Cli::try_parse_from([
-            "helios",
-            "enroll",
-            "--name",
-            "client",
-            "--endpoint",
-            "vpn.example:51820",
-            "--output",
-            "client.orion",
-            "--gateway-certificate",
-            "gateway.der"
-        ])
+        Cli::try_parse_from(
+            online
+                .iter()
+                .copied()
+                .chain(["--gateway-certificate", "gateway.der"])
+        )
         .is_err(),
         "partial offline enrollment material must be refused"
     );
-    let offline = [
-        "helios",
-        "enroll",
-        "--name",
-        "client",
-        "--endpoint",
-        "vpn.example:51820",
-        "--output",
-        "client.orion",
-        "--gateway-certificate",
-        "gateway.der",
-        "--gateway-pq-certificate",
-        "gateway.json",
-        "--address",
-        "100.64.1.2/32",
-    ];
-    Cli::try_parse_from(offline).unwrap();
+    let offline: Vec<&str> = online
+        .iter()
+        .copied()
+        .chain([
+            "--gateway-certificate",
+            "gateway.der",
+            "--gateway-pq-certificate",
+            "gateway.json",
+            "--address",
+            "100.64.1.2/32",
+            "--trust-material",
+            "trust.json",
+        ])
+        .collect();
+    Cli::try_parse_from(&offline).unwrap();
     Cli::try_parse_from(
         offline
             .iter()
@@ -190,18 +198,23 @@ fn command_line_covers_offline_and_diagnostic_commands() {
     )
     .unwrap();
     assert!(
-        Cli::try_parse_from([
-            "helios",
-            "enroll",
-            "--name",
-            "client",
-            "--endpoint",
-            "vpn.example:51820",
-            "--output",
-            "client.orion",
-            "--address-v6",
-            "fd3c::2/128",
-        ])
+        Cli::try_parse_from(
+            offline
+                .iter()
+                .copied()
+                .filter(|argument| !argument.starts_with("trust"))
+                .filter(|argument| *argument != "--trust-material")
+        )
+        .is_err(),
+        "offline, the trust block is what the document is signed under"
+    );
+    assert!(
+        Cli::try_parse_from(
+            online
+                .iter()
+                .copied()
+                .chain(["--address-v6", "fd3c::2/128"])
+        )
         .is_err(),
         "an IPv6 VIP alone is not offline enrollment material"
     );

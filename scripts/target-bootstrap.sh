@@ -427,61 +427,15 @@ HELIOS_CLIENT_CA_DIR="$CA_DIR" \
 HELIOS_KEYNEGO_OUT="$TARGET_DIR" \
     ./scripts/key-negotiation-setup.sh "$TARGET" \
         --server-name "$SERVER_NAME" \
-        --endpoint "$WG_ENDPOINT" \
         --port-nego "$KEY_PORT" \
         --skip-network \
         --gateway-only
 
-ENROLLMENT_STATE="$TARGET_DIR/client-enrollment.conf"
-if [ ! -f "$ENROLLMENT_STATE" ]; then
-    echo "==> Selecting the first Orion administrator"
-    [ -s "$TARGET_DIR/peer-list.log" ] ||
-        { echo "gateway peer inventory is missing" >&2; exit 1; }
-    PEER_LIST="$(cat "$TARGET_DIR/peer-list.log")"
-    ADMIN_LINE="$(printf '%s\n' "$PEER_LIST" |
-        awk -F '\t' '$3 ~ /\[admin\]/ { print; exit }')"
-
-    CLIENT_NAME="$DEFAULT_CLIENT"
-    CLIENT_PUBLIC_KEY=""
-    REPLACE_ARGS=()
-    if [ -n "$ADMIN_LINE" ]; then
-        CLIENT_NAME="$(printf '%s\n' "$ADMIN_LINE" | awk -F '\t' '{print $1}')"
-        CLIENT_PUBLIC_KEY="$(printf '%s\n' "$ADMIN_LINE" |
-            awk -F '\t' '{split($3, fields, " "); print fields[1]}')"
-        case "$CLIENT_NAME" in
-            *[!A-Za-z0-9._-]*) echo "existing admin peer name is not automation-safe" >&2; exit 1 ;;
-        esac
-        case "$CLIENT_PUBLIC_KEY" in
-            *[!A-Za-z0-9+/=]*) echo "existing admin peer has an invalid public key" >&2; exit 1 ;;
-        esac
-        REPLACE_ARGS=(--public-key "$CLIENT_PUBLIC_KEY" --remplacer)
-        echo "    existing admin selected: $CLIENT_NAME"
-    else
-        echo "    no admin peer found; a new $CLIENT_NAME identity will be generated"
-    fi
-
-    HELIOS_CLIENT_CA_DIR="$CA_DIR" \
-    HELIOS_KEYNEGO_OUT="$TARGET_DIR" \
-        ./scripts/key-negotiation-setup.sh "$TARGET" \
-            --nom "$CLIENT_NAME" \
-            --server-name "$SERVER_NAME" \
-            --endpoint "$WG_ENDPOINT" \
-            --port-nego "$KEY_PORT" \
-            --mode ml-kem \
-            --admin \
-            --skip-network \
-            --client-only \
-            "${REPLACE_ARGS[@]}"
-
-    {
-        printf 'name=%s\n' "$CLIENT_NAME"
-        printf 'public_key=%s\n' "$CLIENT_PUBLIC_KEY"
-        printf 'profile=%s/%s.orion\n' "$TARGET_DIR" "$CLIENT_NAME"
-    } > "$ENROLLMENT_STATE"
-    chmod 600 "$ENROLLMENT_STATE"
-else
-    echo "==> Orion administrator already enrolled"
-fi
+# The first Orion administrator is no longer enrolled from here. Enrollment v5
+# (NEGOCIATION-DE-CLE-V5 §15) moves no private key: the operator signs an
+# invitation under CA-PQ with a hardware credential, the client produces its
+# request, and a signed document comes back — gestures a person makes at each
+# end, which a script does not make for them.
 
 echo "==> Starting deployed services and staging the encrypted escrow"
 REMOTE_ESCROW="/tmp/helios-wg-key.escrow"
@@ -586,8 +540,9 @@ Operational bootstrap complete.
 
   Target state:  $TARGET_DIR
   Target config: $TARGET_CONFIG
-  Orion profile: $(sed -n 's/^profile=//p' "$ENROLLMENT_STATE")
 
-Import the Orion profile once, then remove that profile file because it carries
-the client private identity. Keep $CERTS_ROOT backed up and off the gateway.
+Enroll the first Orion administrator with an enrollment v5 invitation
+(docs/security/OPERATOR-TOOLING.md §6), adding --admin to the
+\`heliosd peer add\` line \`astra-signer enroll accept\` prints.
+Keep $CERTS_ROOT backed up and off the gateway.
 EOF
