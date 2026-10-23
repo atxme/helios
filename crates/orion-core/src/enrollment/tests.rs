@@ -226,7 +226,11 @@ fn settling_a_saved_enrollment_removes_only_its_own_pending_record() {
     let other = Id16::new([8; 16]).expect("id");
     for id in [&saved, &other] {
         std::fs::write(
-            root.join(format!("{}{}", pending_name(id), crate::identity_store::SEALED_SUFFIX)),
+            root.join(format!(
+                "{}{}",
+                pending_name(id),
+                crate::identity_store::SEALED_SUFFIX
+            )),
             b"sealed",
         )
         .expect("record");
@@ -238,11 +242,21 @@ fn settling_a_saved_enrollment_removes_only_its_own_pending_record() {
 
     let left: Vec<_> = std::fs::read_dir(&root)
         .expect("list")
-        .map(|entry| entry.expect("entry").file_name().into_string().expect("utf-8"))
+        .map(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .into_string()
+                .expect("utf-8")
+        })
         .collect();
     assert_eq!(
         left,
-        vec![format!("{}{}", pending_name(&other), crate::identity_store::SEALED_SUFFIX)]
+        vec![format!(
+            "{}{}",
+            pending_name(&other),
+            crate::identity_store::SEALED_SUFFIX
+        )]
     );
 }
 
