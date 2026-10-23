@@ -625,6 +625,73 @@ impl ProtectedIdentityStore {
         Ok(path)
     }
 
+    /// Seals an arbitrary record under `name`, beside the identities.
+    ///
+    /// For what must survive a restart under the same protection as an
+    /// identity without being one — a pending enrollment holds three private
+    /// keys before any certificate exists for them.
+    pub(crate) fn seal_named(&self, name: &str, plaintext: &[u8]) -> Result<PathBuf> {
+        let path = self.path_of(name)?;
+        let sealed = seal(plaintext)?;
+        anyhow::ensure!(
+            sealed.len() <= MAX_SEALED_BYTES,
+            "l'enregistrement scellé dépasse la taille maximale"
+        );
+        aether::private_file::create_private_dir(&self.directory)
+            .with_context(|| format!("création de {}", self.directory.display()))?;
+        aether::private_file::write_private_atomic(&path, &sealed)
+            .with_context(|| format!("remplacement atomique de {}", path.display()))?;
+        Ok(path)
+    }
+
+    /// Opens a record sealed by [`Self::seal_named`].
+    pub(crate) fn open_named(&self, name: &str) -> Result<Zeroizing<Vec<u8>>> {
+        let path = self.path_of(name)?;
+        let sealed =
+            read_bounded(&path).map_err(|_| IdentityStoreError::NotFound(name.to_string()))?;
+        unseal(&sealed)
+    }
+
+    /// Removes a record sealed by [`Self::seal_named`]. Absent is not an error.
+    pub(crate) fn remove_named(&self, name: &str) -> Result<()> {
+        let path = self.path_of(name)?;
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).with_context(|| format!("suppression de {}", path.display())),
+        }
+    }
+
+    /// Names of the sealed records starting with `prefix`, without decrypting.
+    pub(crate) fn names_with_prefix(&self, prefix: &str) -> Result<Vec<String>> {
+        let entries = match std::fs::read_dir(&self.directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("lecture de {}", self.directory.display()))
+            }
+        };
+        let mut names = Vec::new();
+        for entry in entries {
+            let entry =
+                entry.with_context(|| format!("lecture de {}", self.directory.display()))?;
+            if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+                continue;
+            }
+            let file_name = entry.file_name();
+            if let Some(name) = file_name
+                .to_str()
+                .and_then(|name| name.strip_suffix(SEALED_SUFFIX))
+                .filter(|name| name.starts_with(prefix))
+            {
+                names.push(name.to_string());
+            }
+        }
+        names.sort();
+        Ok(names)
+    }
+
     /// Is an identity of this name already sealed on this machine?
     ///
     /// Answers without decrypting: the screen needs to know whether the

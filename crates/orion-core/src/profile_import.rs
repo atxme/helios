@@ -15,6 +15,7 @@ mod json;
 mod validation;
 mod wg_quick;
 
+pub(crate) use document::decode_document;
 pub use document::{
     complete_profile_import, parse_profile_import, read_profile_import_path, CompletedImport,
     ProfileImport, MAX_PROFILE_IMPORT_BYTES,

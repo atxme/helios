@@ -30,6 +30,7 @@ pub mod certificate_renewal;
 pub mod certificates;
 pub mod config;
 pub mod endpoint_resolution;
+pub mod enrollment;
 pub mod events;
 pub mod identity_store;
 pub mod key_negotiation;

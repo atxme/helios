@@ -195,7 +195,7 @@ pub fn read_profile_import_path(path: &Path) -> Result<ProfileImport> {
 /// never reach Rust (`apps/orion/src/profileDocument.ts`). The two must
 /// accept the same files: an import that works by double-click and fails
 /// through the button is impossible to explain to the person doing it.
-fn decode_document(bytes: &[u8]) -> Result<String> {
+pub(crate) fn decode_document(bytes: &[u8]) -> Result<String> {
     fn from_utf16(bytes: &[u8], little_endian: bool) -> Result<String> {
         if !bytes.len().is_multiple_of(2) {
             anyhow::bail!("le profil est encodé en UTF-16 mais tronqué (nombre impair d'octets)");
