@@ -434,8 +434,8 @@ et émet son profil d'invitation `lab.invitation.orion`. Le profil assisté
 plus produit depuis le 18 octobre 2026 : son émission admet un nouveau pair
 sans certificats de négociation, ce que le plancher `ml_kem` refuse
 ([TESTING](TESTING.md#banc-de-développement)) ; l'option a été retirée depuis
-(ADR-004 §6, amendement du 18 octobre 2026). Pour un Orion neuf, le document
-complet vient de `helios enroll`.
+(ADR-004 §6, amendement du 18 octobre 2026). Un Orion neuf s'enrôle en v5 :
+[parcours ci-dessous](#enrôlement-v5-de-bout-en-bout-vm-windows).
 
 Vérifier ensuite, dans l'onglet **Profils** :
 
@@ -451,6 +451,45 @@ Vérifier ensuite, dans l'onglet **Profils** :
 - importer une invitation dont **aucun** profil local ne détient la clé : le
   brouillon doit s'afficher, le champ *Clé privée* rester vide et le message
   nommer la clé attendue, sans qu'aucun profil enregistré ne soit modifié.
+
+### Enrôlement v5 de bout en bout (VM Windows)
+
+Ce parcours est le seul qui exerce DPAPI réel, une YubiKey réelle et le
+téléchargement dans WebView2 : aucun n'est joignable depuis WSL2 ni la CI.
+Prérequis : une gateway dotée d'un domaine de confiance (`astra-signer init`,
+`heliosd init-trust-domain`), un credential opérateur enregistré, Orion
+installé sur une VM Windows 11. Les commandes sont celles
+d'[OPERATOR-TOOLING §6](../security/OPERATOR-TOOLING.md#6-profil-client).
+
+1. Poste opérateur : `astra-signer enroll invite --gateway-certificate … --out
+   poste.helios-invite`. La YubiKey doit demander un toucher ; noter
+   l'empreinte affichée.
+2. Orion, *Profils* → « Importer une invitation ». Vérifier que la gateway et
+   l'échéance sont celles attendues et que « Créer la demande » reste grisé
+   tant que l'empreinte recopiée diffère — un seul caractère faux suffit.
+   Espaces et casse ne comptent pas.
+3. Saisir l'empreinte juste et un nom, « Créer la demande ». « Enregistrer la
+   demande » doit proposer un fichier `.helios-request` ; s'il ne se passe rien
+   dans WebView2, le bouton de copie reste le recours, à signaler. La demande
+   apparaît sous « Demandes en attente » et survit à un redémarrage d'Orion.
+4. Inspecter `%APPDATA%\helios\orion\data\identities` (ou
+   `ORION_IDENTITY_DIR`) : aucune clé privée en clair, les fichiers de la
+   demande en attente sont des blobs DPAPI. Les rouvrir sous un
+   autre compte Windows doit échouer.
+5. Poste opérateur : `astra-signer enroll accept`, puis la ligne
+   `heliosd peer add` imprimée, sur la gateway ; `helios enroll document`,
+   puis `astra-signer enroll sign-document`.
+6. Orion, « Importer » le `.orion` signé : le profil devient connectable, la
+   demande disparaît de la liste, et la connexion ML-KEM aboutit.
+
+À vérifier aussi, chacun refusé en clair et sans effet :
+
+- réutiliser l'invitation consommée pour une seconde demande, côté `accept` ;
+- importer le `.orion` d'un autre poste : brouillon non connectable ;
+- importer un ancien document v1 Helios portant une clé privée : refus qui
+  renvoie vers une invitation v5 ;
+- « Abandonner » une demande, puis importer son document signé : brouillon non
+  connectable, plus aucune clé de cette demande sur le disque.
 
 ### Le chemin manuel
 

@@ -157,7 +157,7 @@ L'adresse de la gateway vit dans `scripts/lib-remote.sh`, sur la ligne
 est distant, et un défaut pointant vers un réseau qu'il ne rejoindra plus
 échoue par « No route to host », ce qui se lit comme une gateway en panne.
 C'est le seul endroit à changer quand elle déménage, et
-`provision-client.sh`, `key-negotiation-setup.sh` et `target-bootstrap.sh` la
+`key-negotiation-setup.sh` et `target-bootstrap.sh` la
 lisent au même endroit. Un argument l'emporte pour l'appel en cours sans rien
 enregistrer — les scripts ne mémorisent plus d'hôte sous `~/.helios`, où une
 copie périmée finissait par gagner contre celle qu'on venait de changer.

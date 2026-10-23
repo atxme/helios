@@ -89,13 +89,13 @@ helios firmware list               # versions proposées par fwupd
 
 # sur le poste opérateur
 helios peer add|revoke|list        # admission
-helios enroll                      # clés, certificats, admission et profil
+helios enroll document             # profil v5 à signer (enrôlement, sans clé privée)
 helios profile emit|check          # document `.orion`
 helios escrow ...                  # séquestre — jamais sur la gateway secourue
 
 # scripts d'enchaînement
 ./scripts/deploy.sh                    # construit, signe, copie, installe
-./scripts/provision-client.sh nom      # CA, négociation, admission, profil
+./scripts/key-negotiation-setup.sh     # négociation côté gateway
 ```
 
 Le terminal et le parcours de mise à jour firmware sont décrits dans

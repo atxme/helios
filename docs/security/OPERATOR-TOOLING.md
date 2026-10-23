@@ -280,14 +280,14 @@ Sans `--minimum-mode`, la présence de l'empreinte PQ choisit déjà `ml-kem`.
 L'option explicite rend la politique visible dans les scripts. Une
 renégociation réseau vers `static_psk` sera ensuite refusée.
 
-Ces quatre commandes restent utiles pour inspecter la PKI ou réémettre un
-certificat seul ; pour admettre un client, `helios enroll` (section 6) les
-enchaîne et évite de recopier deux empreintes à la main.
+Ces commandes sont un outillage de **laboratoire**, lié à la CA sur fichier :
+`issue-client` fabrique les clés privées du client sur le poste opérateur. Elles
+restent utiles pour inspecter la PKI ou sonder une gateway ; un vrai client
+s'enrôle par une invitation v5 (section 6), dont les clés ne quittent jamais le
+poste.
 
-Les deux clés clientes produites en `0600` servent au transfert vers le stockage
-protégé du poste Orion, puis doivent être effacées du poste opérateur. Orion les
-scelle par DPAPI, liées au compte Windows de l'utilisateur ; sur toute autre
-plateforme, il refuse franchement plutôt que de les écrire en clair. Pour
+Les deux clés clientes que `issue-client` produit en `0600` ne servent qu'aux
+sondes ci-dessous, et s'effacent ensuite du poste opérateur. Pour
 valider mTLS, ML-DSA et les messages sans modifier durablement un slot :
 
 ```sh
@@ -310,11 +310,87 @@ restaure donc le slot précédent.
 
 ## 6. Profil client
 
-`profile emit` **réémet** l'invitation d'un client déjà admis ; il n'admet
-personne. L'admission exige les certificats de négociation TLS et PQ du client
-(plancher `ml_kem`) : un nouveau client passe par `helios enroll` (ci-dessous),
-ou par `helios peer add` avec ses deux empreintes. Le client détient sa clé et
-communique sa moitié publique (visible dans Orion, écran *Profils*) :
+### Enrôlement v5 — aucune clé privée ne voyage
+
+Un client Helios s'enrôle sans qu'aucune clé privée quitte son poste
+([NEGOCIATION-DE-CLE-V5 §15](../specification/NEGOCIATION-DE-CLE-V5.md#15-enrôlement)).
+Prérequis : un domaine de confiance (`astra-signer init`, puis
+`heliosd init-trust-domain`), donc une leaf PQ gateway émise sous `CA-PQ`, et
+un credential opérateur matériel enregistré dans le coffre.
+
+1. **Invitation** — sur le poste opérateur :
+
+   ```sh
+   astra-signer enroll invite      --gateway-certificate key-negotiation-pq-cert.json      --valid-for-hours 24      --out poste.helios-invite
+   ```
+
+   La commande demande un credential autorisé (deux distincts avec
+   `--allow-readmission`, pour réadmettre une clé retirée), écrit l'invitation
+   et affiche l'empreinte `CA-PQ` en groupes de quatre. L'invitation est
+   publique ; sa clé de preuve reste dans le registre
+   `~/.helios/enrollment-invitations` (`HELIOS_ENROLLMENT_REGISTRY` le déplace).
+
+2. **Demande** — sur le poste client, écran *Profils* → « Importer une
+   invitation ». Orion affiche la gateway, l'échéance et l'empreinte ;
+   l'utilisateur recopie celle que l'opérateur lui **lit par un autre canal**.
+   Tant qu'elles diffèrent, rien n'est généré. Orion crée alors ses trois paires
+   — WireGuard, TLS, ML-DSA-87 —, les scelle comme demande en attente et
+   seulement ensuite offre le fichier `.helios-request`. Il ne contient aucun
+   secret.
+
+3. **Acceptation** — sur le poste opérateur :
+
+   ```sh
+   astra-signer enroll accept --request poste.helios-request --out-dir ./feuilles
+   ```
+
+   L'invitation est consommée **avant** toute émission : un échec ultérieur
+   exige une nouvelle invitation. La commande écrit les feuilles TLS et PQ,
+   nommées d'après l'identifiant de la demande, et imprime la ligne
+   `heliosd peer add … --minimum-mode ml-kem` qui admet le pair ; la lancer en
+   console sur la gateway (ajouter `--admin` pour le premier administrateur).
+
+4. **Brouillon** — `helios enroll document` assemble le profil public autour
+   des feuilles :
+
+   ```sh
+   helios enroll document --request poste.helios-request \
+     --tls-certificate ./feuilles/<id>-client-cert.der \
+     --pq-certificate ./feuilles/<id>-client-pq-cert.json \
+     --endpoint vpn.example.net:51820 \
+     --out poste.draft.json
+   ```
+
+   En ligne il lit la gateway par l'API ; hors ligne, `--gateway-certificate`,
+   `--gateway-pq-certificate`, `--address` et `--trust-material` (la sortie de
+   `heliosd show-trust-enrolment`) remplacent l'API. Il vérifie que les feuilles
+   certifient les clés de la demande et refuse une gateway sans domaine.
+
+5. **Signature** — `astra-signer enroll sign-document --draft poste.draft.json
+   --out poste.orion` vérifie que le brouillon nomme les feuilles émises, la
+   `CA-PQ` et la gateway de l'invitation, puis le signe sous `CA-PQ`.
+
+6. **Import** — Orion vérifie la signature sous la `CA-PQ` épinglée à l'étape 2,
+   la liaison à sa demande en attente, les feuilles contre ses clés locales et
+   la gateway contre l'invitation ; il scelle alors l'identité et détruit la
+   demande en attente. Un document qu'aucune demande de ce poste n'attend
+   s'affiche en brouillon non connectable.
+
+`astra-signer enroll list` montre l'état des invitations ; `enroll revoke <id>`
+en annule une et détruit sa clé de preuve. Côté Orion, « Abandonner » détruit
+une demande en attente et ses clés.
+
+L'ancien `helios enroll`, qui émettait les clés du client sur le poste opérateur
+et les livrait dans le profil, n'existe plus ; Orion refuse un document v1 Helios
+en renvoyant ici. `scripts/provision-client.sh` refuse pour la même raison, et
+`scripts/key-negotiation-setup.sh` ne prépare plus que la gateway.
+
+### Profil WireGuard classique
+
+`profile emit` **réémet** l'invitation d'un client WireGuard classique déjà
+admis ; il n'admet personne et ne porte pas de bloc de négociation. Le client
+détient sa clé et communique sa moitié publique (visible dans Orion, écran
+*Profils*) :
 
 ```sh
 helios profile emit --name portable \
@@ -331,51 +407,8 @@ La commande réutilise l'adresse persistée du pair ; une clé inconnue est
 refusée avec les commandes d'admission, et changer de clé pour un nom existant
 exige une révocation explicite. Le mode assisté (`--with-private-key`) et
 `--admin` ont été retirés le 18 octobre 2026 : le premier générait une paire que
-la gateway n'avait jamais admise, donc toujours refusée faute de certificats ;
-le second choisissait un rôle à une admission qui n'a plus lieu. Pour un
-utilisateur qui ne peut rien faire lui-même, `helios enroll` génère la paire et
-livre un document complet.
-
-### Enrôlement complet — une seule commande
-
-`profile emit` ne met **pas** de bloc de négociation : c'est le chemin qui ne
-produit aucun secret, et un profil qui réclamerait un certificat sans le livrer
-ne se connecterait pas. Pour un client qui négocie avant WireGuard, une seule
-commande fait tout :
-
-```sh
-helios enroll --name portable \
-  --endpoint vpn.example.net:51820 \
-  --client-ca-dir ./orion-client-ca \
-  --output portable.orion
-```
-
-Elle enchaîne ce que la section 5 sépare : elle lit sur la gateway sa clé
-publique WireGuard, ses certificats de négociation et le port qu'ils écoutent
-(`GET /api/key-negotiation`), génère la paire WireGuard du client, émet ses deux
-certificats depuis la CA opérateur, admet le pair avec les deux empreintes et
-le plancher, puis écrit **un** document qui porte le profil et l'identité.
-
-Options utiles : `--public-key` si le client détient déjà sa clé WireGuard,
-`--negotiation-endpoint` si le port de négociation est redirigé ailleurs que le
-tunnel, `--identity` pour nommer l'entrée du stockage protégé (par défaut
-`orion-<nom>`), et `--replace` pour ré-enrôler un pair existant — ce qui révoque
-l'ancienne identité, donc coupe le poste qui la détenait.
-
-Le fichier produit **contient les clés privées du client**. Il naît en `0600`,
-se remet par un canal maîtrisé et s'efface des deux postes après import : Orion
-scelle l'identité au compte Windows et n'a plus besoin du fichier.
-
-La commande refuse d'avancer si la gateway ne sert aucun matériel de
-négociation, et si son certificat est épinglé à une autre identité WireGuard que
-celle qu'elle utilise — cas d'une identité pivotée sans réémission du
-certificat, qui ferait échouer tous les clients bâtis ensuite.
-
-Orion vérifie à l'import que le certificat PQ est bien épinglé à la clé
-WireGuard de cette gateway, scelle l'identité et affiche son empreinte sur
-l'écran *Profils* : c'est la valeur qu'a imprimée `heliosd
-init-key-negotiation`. Les comparer de vive voix est ce qui rattache le profil à
-la bonne gateway.
+la gateway n'avait jamais admise ; le second choisissait un rôle à une admission
+qui n'a plus lieu.
 
 ## Ce que cet outillage ne fait pas
 

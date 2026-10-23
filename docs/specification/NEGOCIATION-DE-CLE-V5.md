@@ -98,7 +98,7 @@ un **contrat à finir d'implémenter**, pas une description du système.
 >
 >   **Migration** : le `ctx` entre dans la vérification, donc tout certificat PQ
 >   émis avant ce changement cesse de vérifier. Un parc existant se ré-émet
->   (`scripts/provision-client.sh`, `heliosd init-key-negotiation --rotate`) ;
+>   (enrôlement v5 du [§15](#15-enrôlement), `heliosd init-key-negotiation --rotate`) ;
 > - la **mesure sur cible du renouvellement de PSK en place**
 >   ([§7.6](#76-renouvellement-dans-le-tunnel),
 >   [§12.3](#123-politique-de-renouvellement)). Le renouvellement est spécifié le
@@ -106,10 +106,45 @@ un **contrat à finir d'implémenter**, pas une description du système.
 >   décision, et la recette V1 (20 renouvellements consécutifs sous trafic, noyau
 >   Linux et WireGuard-NT, chemin sain puis dégradé) reste à exécuter sur cible
 >   avec le code de production. Aucune de ses mesures n'existe aujourd'hui ; si
->   V1 échoue, le repli de [§12.3](#123-politique-de-renouvellement) s'applique ;
-> - l'**enrôlement sans clé privée et sa signature opérateur**
->   ([§15](#15-enrôlement)). `helios enroll` distribue encore l'identité
->   cliente comme en v4, avec le document `.orion` secret que cela implique.
+>   V1 échoue, le repli de [§12.3](#123-politique-de-renouvellement) s'applique.
+>
+> **Amendement du 2026-10-23 — enrôlement sans clé privée.** Le
+> [§15](#15-enrôlement) est implémenté sur la branche `feat/v5-enrolement`, non
+> fusionnée. L'invitation, l'acceptation et la signature du document sont des
+> gestes `astra-signer enroll` (`invite`, `accept`, `sign-document`, `list`,
+> `revoke`) sous un credential opérateur matériel ; `helios enroll document`
+> n'assemble plus que le brouillon public ; Orion importe l'invitation, fait
+> recopier l'empreinte `CA-PQ`, génère et scelle ses trois paires avant
+> d'écrire la demande, puis complète le document signé. L'ancien
+> `helios enroll`, qui livrait les clés privées dans le profil, est retiré, et
+> Orion refuse un document v1 Helios en nommant la procédure qui le remplace.
+> Choix d'implémentation que ce texte ne fixait pas :
+>
+> - une invitation exige un domaine de confiance (`astra-signer init`, puis
+>   `heliosd init-trust-domain`) : elle est signée sous `CA-PQ` et nomme une
+>   leaf gateway émise sous elle ;
+> - le registre des invitations est `~/.helios/enrollment-invitations`, que
+>   `HELIOS_ENROLLMENT_REGISTRY` déplace ; chaque invitation y a son verrou ;
+> - une tolérance d'horloge de 300 s s'applique au bord d'ouverture de la
+>   fenêtre seulement, jamais à l'échéance ;
+> - l'admission passe par la ligne `heliosd peer add` qu'imprime
+>   `astra-signer enroll accept`, en console sur la gateway ;
+> - `client_pq_certificate` est le base64 du JSON de la leaf, l'encodage de
+>   `gateway_pq_certificate` ; le document refuse flottants et entiers
+>   au-delà de 2^53, que JCS ne signe pas sans ambiguïté ;
+> - l'identité scellée s'appelle `enrollment-<request_id>` : le document ne
+>   nomme aucune identité, et le profil n'en porte pas ;
+> - un document qu'aucune demande en attente n'attend s'affiche en brouillon
+>   sans clé privée, non vérifié — rien sur le poste ne permettrait de le
+>   vérifier — et n'est jamais complété par une clé locale ;
+> - le point 4 du [§15.3](#153-authentification-du-document) est appliqué
+>   strictement : la clé WireGuard gateway, le `server_name`, la leaf gateway
+>   et la `CA-PQ` du bloc de confiance doivent être ceux de l'invitation
+>   confirmée. Une transition de rotation survenue entre l'invitation et le
+>   document n'est pas acceptée : elle exige une nouvelle invitation.
+>
+> Non validé ici : le scellement DPAPI réel, une YubiKey réelle et le parcours
+> Windows complet, qui ne s'exécutent pas sous WSL2.
 >
 > **Amendement du 2026-10-19 — état `revoked`.** La priorité 1 du
 > [§11.1](#111-états-gateway) est portée par le sérialiseur du slot. Le retrait
@@ -2346,14 +2381,17 @@ flowchart TD
     D["Écrit une demande liée à l'invitation<br/>avec trois preuves de possession"]
     E["Opérateur — vérifier puis consommer<br/>l'invitation atomiquement"]
     F["Émet les certificats TLS et PQ<br/>liés aux clés publiques reçues"]
-    G["Admet le pair<br/>helios-provisioning::admission"]
+    G["Admet le pair<br/>heliosd peer add"]
     H["Écrit un .orion signé<br/>et lié au hash de la demande"]
     I["Orion — vérifier signature, liaison<br/>et clés privées locales"]
 
     A --> B --> C --> D --> E --> F --> G --> H --> I
 ```
 
-`helios enroll invite` produit un `EnrollmentInvitation` public :
+`astra-signer enroll invite` produit un `EnrollmentInvitation` public. Il
+exige un domaine de confiance — `astra-signer init`, puis
+`heliosd init-trust-domain` — et la leaf PQ que la gateway sert sous `CA-PQ` :
+sans domaine, il n'existe ni ancre à faire confirmer ni leaf à nommer.
 
 | Champ | Contrainte |
 | --- | --- |
@@ -2431,6 +2469,12 @@ l'invitation `consumed` et synchronise ce registre **avant** d'émettre un
 certificat ou de modifier l'admission. Un échec ultérieur exige une nouvelle
 invitation : il ne rouvre jamais l'ancienne. Une clé retirée par `peer remove`
 ne peut être réadmise que par une invitation portant `allow_readmission = true`.
+
+`astra-signer enroll accept` traite la demande, écrit les deux feuilles et
+imprime la ligne `heliosd peer add` qui admet le pair ; `helios enroll document`
+assemble le brouillon public autour d'elles ; `astra-signer enroll
+sign-document` le signe après avoir vérifié qu'il nomme les feuilles émises,
+la `CA-PQ` et la gateway de l'invitation.
 
 Le document `.orion` produit en retour contient le profil, le bloc public de
 négociation — endpoint, `server_name`, CA TLS, certificat PQ gateway épinglé —
@@ -3050,7 +3094,12 @@ courant détaillé en tête de note.
 | [`aether::config`](../../crates/aether/src/config.rs) | ports, pairs, secrets runtime, planchers, longueur des PSK statiques, **keep-alive de `WgPeer`** |
 | [`helios-wireguard`](../../crates/helios-wireguard/src/lib.rs) | **keep-alive de `PeerConfig`**, séquence monotone d'observation du handshake, `HANDSHAKE_STALE_AFTER_SECS` et récupération à 300 s |
 | [`helios-provisioning::admission`](../../crates/helios-provisioning/src/admission.rs) | unicité des empreintes TLS/PQ, refus d'un pair négocié sans keep-alive, plancher `ml_kem` par défaut |
-| [`helios::enroll`](../../tools/helios/src/enroll.rs) | invitation et registre à usage unique, preuve WireGuard, émission, liaison et signature JCS du document |
+| [`aether::key_negotiation::enrollment`](../../crates/aether/src/key_negotiation/enrollment.rs) | invitation, demande, preuve WireGuard, octets signés et empreintes ; document `.orion` v5 et sa forme JCS |
+| [`astra-operator::enrollment`](../../crates/astra-operator/src/enrollment.rs) | registre des invitations à usage unique, verrou par invitation, consommation avant émission, réadmission |
+| [`astra-operator::signing::enrollment`](../../crates/astra-operator/src/signing/enrollment.rs) | signature de l'invitation, acceptation de la demande et émission des feuilles, signature du document après contrôle des feuilles émises |
+| [`astra-signer enroll`](../../tools/astra-signer/src/commands/enrollment.rs) | gestes `invite`, `accept`, `sign-document`, `list`, `revoke` sous credential matériel |
+| [`helios::enroll`](../../tools/helios/src/enroll.rs) | brouillon public du document : matériel gateway, bloc de confiance, contrôle des feuilles contre la demande |
+| [`orion-core::enrollment`](../../crates/orion-core/src/enrollment.rs) | prévisualisation de l'invitation, confirmation de l'empreinte, génération et scellement de la demande en attente, vérification et complétion du document signé |
 
 `AGENTS.md` décrit l'implémentation v5 effectivement servie et nomme les écarts
 encore ouverts.

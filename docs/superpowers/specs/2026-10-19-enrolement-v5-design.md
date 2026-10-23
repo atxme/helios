@@ -1,7 +1,9 @@
 # Enrôlement v5 sans transport de clé privée — conception
 
 **Date** : 2026-10-19, révisée le 2026-10-23
-**Statut** : décisions prises, prête pour le plan d'implémentation
+**Statut** : implémentée le 2026-10-23 (branche `feat/v5-enrolement`, plan
+`docs/superpowers/plans/2026-10-23-enrolement-v5.md`) ; DPAPI réel, YubiKey et
+parcours Windows complet non validés depuis WSL2
 **Feuille de route** : F2
 **Normes** : [NEGOCIATION-DE-CLE-V5 §15](../../specification/NEGOCIATION-DE-CLE-V5.md#15-enrôlement),
 §19, §22 ; [ROTATION-CERTIFICATS §2.2, §13.1](../../specification/ROTATION-CERTIFICATS.md) ;

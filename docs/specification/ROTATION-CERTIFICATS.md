@@ -3400,10 +3400,11 @@ contournés :
   `network.toml` existant, et l'octet `mode_id = 0` du manifeste.
   Le **bloc de confiance** est livré aussi : la gateway le
   sert sur `GET /api/key-negotiation/trust-enrolment/<clé>` et l'imprime par
-  `heliosd show-trust-enrolment`, `helios enroll` le pose dans le document
-  — en ligne depuis l'API, hors ligne depuis `--trust-material` —, et
-  `provision-client.sh` le rapatrie à côté des deux certificats qu'il copie
-  déjà. Onze valeurs publiques lues sous un seul verrou : une époque prise à un
+  `heliosd show-trust-enrolment`, `helios enroll document` le pose dans le
+  brouillon d'enrôlement — en ligne depuis l'API, hors ligne depuis
+  `--trust-material`. (Avant l'enrôlement v5 du 23 octobre 2026, c'était
+  `helios enroll`, et `provision-client.sh` le rapatriait à côté des
+  certificats.) Onze valeurs publiques lues sous un seul verrou : une époque prise à un
   instant à côté d'une ancre prise à un autre épinglerait un couple qui n'a
   jamais existé ensemble, et l'écart ne se verrait qu'au premier
   renouvellement. Un profil émis avant ce lot n'en porte pas ; Orion le dit
