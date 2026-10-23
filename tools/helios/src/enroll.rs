@@ -414,8 +414,10 @@ fn build_draft(draft: Draft<'_>) -> Result<EnrollmentDocument> {
 }
 
 fn read_request(path: &Path) -> Result<EnrollmentRequest> {
-    let text = String::from_utf8(read_file(path)?)
-        .with_context(|| format!("{} is not UTF-8", path.display()))?;
+    // Decoded as Orion decodes it: the client's machine may have re-saved it
+    // in UTF-16.
+    let text = aether::transit_text::decode_transit_text(&read_file(path)?)
+        .with_context(|| format!("{} is not readable text", path.display()))?;
     let request = decode_request_file(&text)
         .with_context(|| format!("{} is not an enrollment request", path.display()))?;
     Ok(request)

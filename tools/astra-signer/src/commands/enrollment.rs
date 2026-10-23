@@ -267,9 +267,12 @@ fn list_invitations(registry: &InvitationRegistry) -> Result<()> {
     Ok(())
 }
 
+/// Reads a request or a draft as Orion reads its documents: a file re-saved by
+/// PowerShell on the client's machine arrives in UTF-16.
 fn read_text(path: &Path) -> Result<String> {
     let bytes = std::fs::read(path).with_context(|| format!("lecture de {}", path.display()))?;
-    String::from_utf8(bytes).with_context(|| format!("{} n'est pas de l'UTF-8", path.display()))
+    aether::transit_text::decode_transit_text(&bytes)
+        .with_context(|| format!("{} n'est pas un texte lisible", path.display()))
 }
 
 fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {

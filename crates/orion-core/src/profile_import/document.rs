@@ -181,33 +181,17 @@ pub fn read_profile_import_path(path: &Path) -> Result<ProfileImport> {
 /// accept the same files: an import that works by double-click and fails
 /// through the button is impossible to explain to the person doing it.
 pub(crate) fn decode_document(bytes: &[u8]) -> Result<String> {
-    fn from_utf16(bytes: &[u8], little_endian: bool) -> Result<String> {
-        if !bytes.len().is_multiple_of(2) {
-            anyhow::bail!("le profil est encodé en UTF-16 mais tronqué (nombre impair d'octets)");
-        }
-        let units: Vec<u16> = bytes
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|pair| {
-                if little_endian {
-                    u16::from_le_bytes(*pair)
-                } else {
-                    u16::from_be_bytes(*pair)
-                }
-            })
-            .collect();
-        String::from_utf16(&units).context("le profil n'est pas un texte UTF-16 valide")
-    }
+    use aether::transit_text::{decode_transit_text, TransitTextError};
 
-    match bytes {
-        [0xFF, 0xFE, rest @ ..] => from_utf16(rest, true),
-        [0xFE, 0xFF, rest @ ..] => from_utf16(rest, false),
-        [0xEF, 0xBB, 0xBF, rest @ ..] => {
-            String::from_utf8(rest.to_vec()).context("le profil n'est pas encodé en UTF-8")
-        }
-        _ => String::from_utf8(bytes.to_vec()).context("le profil n'est pas encodé en UTF-8"),
-    }
+    decode_transit_text(bytes).map_err(|error| {
+        anyhow::anyhow!(match error {
+            TransitTextError::TruncatedUtf16 => {
+                "le profil est encodé en UTF-16 mais tronqué (nombre impair d'octets)"
+            }
+            TransitTextError::InvalidUtf16 => "le profil n'est pas un texte UTF-16 valide",
+            TransitTextError::InvalidUtf8 => "le profil n'est pas encodé en UTF-8",
+        })
+    })
 }
 
 /// Says what the document starts with, for a format error.

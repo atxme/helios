@@ -36,6 +36,7 @@ pub mod secret;
 pub mod sig;
 pub mod speedtest;
 pub mod state;
+pub mod transit_text;
 pub mod wg;
 
 pub use config::{

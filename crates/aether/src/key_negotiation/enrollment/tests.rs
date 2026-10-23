@@ -605,3 +605,48 @@ fn the_canonical_form_matches_rfc8785_ordering() {
     expected.extend_from_slice(canonical.as_bytes());
     assert_eq!(document.signed_bytes().expect("signed bytes"), expected);
 }
+
+fn utf16_with_bom(text: &str, little_endian: bool) -> Vec<u8> {
+    let mut bytes = if little_endian {
+        vec![0xFF, 0xFE]
+    } else {
+        vec![0xFE, 0xFF]
+    };
+    for unit in text.encode_utf16() {
+        bytes.extend(if little_endian {
+            unit.to_le_bytes()
+        } else {
+            unit.to_be_bytes()
+        });
+    }
+    bytes
+}
+
+#[test]
+fn a_request_resaved_by_powershell_is_read_like_a_profile_document() {
+    use crate::transit_text::{decode_transit_text, TransitTextError};
+
+    let operator = operator();
+    let invitation = invitation(&operator);
+    let client = request(&invitation, "laptop-alice");
+    let text = encode_request_file(&client.request);
+
+    for bytes in [
+        utf16_with_bom(&text, true),
+        utf16_with_bom(&text, false),
+        [&[0xEF, 0xBB, 0xBF][..], text.as_bytes()].concat(),
+        text.clone().into_bytes(),
+    ] {
+        let decoded =
+            decode_request_file(&decode_transit_text(&bytes).expect("text")).expect("request");
+        assert_eq!(decoded.fingerprint(), client.request.fingerprint());
+    }
+    assert!(matches!(
+        decode_transit_text(&[0xFF, 0xFE, 0x41]),
+        Err(TransitTextError::TruncatedUtf16)
+    ));
+    assert!(matches!(
+        decode_transit_text(&[0xC3]),
+        Err(TransitTextError::InvalidUtf8)
+    ));
+}
