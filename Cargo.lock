@@ -48,6 +48,7 @@ dependencies = [
  "time",
  "tokio",
  "toml 0.8.2",
+ "unicode-normalization",
  "windows-sys 0.61.2",
  "x25519-dalek",
  "x509-parser",

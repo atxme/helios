@@ -73,6 +73,10 @@ const SUPPORTED_CONTEXTS: &[&[u8]] = &[
     b"helios-key-negotiation-pq-confirmation-v5",
     b"helios-key-negotiation-pq-commit-v5",
     b"helios-key-negotiation-pq-in-tunnel-release-v5",
+    // NEGOCIATION-DE-CLE-V5 §15.3.
+    b"helios-key-negotiation-enrollment-invitation-v5",
+    b"helios-key-negotiation-enrollment-request-v5",
+    b"helios-key-negotiation-orion-document-v5",
     // ROTATION-CERTIFICATS §2.3.1.
     b"helios-trust-base-state-v5",
     b"helios-gateway-bootstrap-request-v5",

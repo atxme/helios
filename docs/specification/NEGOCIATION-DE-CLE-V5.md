@@ -1175,6 +1175,9 @@ NUL final, normalisation ni encodage de longueur :
 | confirmation v5 | `helios-key-negotiation-pq-confirmation-v5` |
 | commit v5 | `helios-key-negotiation-pq-commit-v5` |
 | libération in-tunnel v5 | `helios-key-negotiation-pq-in-tunnel-release-v5` |
+| invitation d'enrôlement v5 | `helios-key-negotiation-enrollment-invitation-v5` |
+| demande d'enrôlement v5 | `helios-key-negotiation-enrollment-request-v5` |
+| document `.orion` v5 | `helios-key-negotiation-orion-document-v5` |
 
 Le message `M` conserve ce même domaine comme préfixe : `ctx` et le préfixe
 interne sont deux contrôles distincts. Les deux signatures d'un même type

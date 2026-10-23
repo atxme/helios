@@ -41,6 +41,9 @@ rcgen = { workspace = true, optional = true }
 # Clés Curve25519 du plan de données WireGuard (`wg`) : `StaticSecret` porte la
 # clé privée persistée d'un pair, par opposition aux clés éphémères.
 x25519-dalek.workspace = true
+# NFC check of the name an enrollment request asks for (§15.3). Already in the
+# tree through orion-core.
+unicode-normalization = "0.1"
 # `rand_core` 0.6 : l'interface que `fips204` attend pour recevoir un
 # générateur. C'est par elle que la génération de clés et la signature hedged
 # tirent du DRBG approuvé de `random` plutôt que du CSPRNG système.

@@ -134,11 +134,12 @@ pub const MAX_CONFIRMATION_TIMEOUT_SECS: u32 = 45;
 
 mod authentication;
 mod derivation;
+mod enrollment;
 mod messages;
 
 // One glob per part: several items exist only with `key-negotiation-signing`,
 // and a glob follows their `cfg` where an explicit list would have to repeat it.
-pub use self::{derivation::*, messages::*};
+pub use self::{derivation::*, enrollment::*, messages::*};
 // Everything public in `authentication` is signing-only; the canonical bytes
 // the other parts verify against exist in both builds.
 #[cfg(feature = "key-negotiation-signing")]
