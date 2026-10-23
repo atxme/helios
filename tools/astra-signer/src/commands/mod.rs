@@ -5,6 +5,7 @@ use super::*;
 mod ca_pq_rotation;
 mod ca_tls_rotation;
 mod campaign;
+mod enrollment;
 mod gateway_identity;
 mod issuer;
 mod recovery;
@@ -12,8 +13,8 @@ mod revocation;
 mod vault;
 
 pub(crate) use self::{
-    ca_pq_rotation::*, ca_tls_rotation::*, campaign::*, gateway_identity::*, issuer::*,
-    recovery::*, revocation::*, vault::*,
+    ca_pq_rotation::*, ca_tls_rotation::*, campaign::*, enrollment::*, gateway_identity::*,
+    issuer::*, recovery::*, revocation::*, vault::*,
 };
 
 /// A day, in seconds. Every window below is expressed in days on the command

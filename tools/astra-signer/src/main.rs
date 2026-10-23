@@ -40,6 +40,9 @@
 //! - `issue-gateway-bootstrap` verifies the public request of a new gateway
 //!   and issues its epoch-1 leaf under `CA-PQ`, after two distinct keys.
 //! - `rotate-ca-pq` moves the anchor, under two distinct keys.
+//! - `enroll` runs the operator half of a client enrollment (§15.2):
+//!   `invite`, `accept`, `sign-document`, `list`, `revoke`. No client private
+//!   key ever reaches this program.
 //!
 //! This file is the prompts and the printing. The sequences themselves are in
 //! [`astra_operator::gestures`], where they are exercised.
@@ -372,6 +375,7 @@ fn run() -> Result<()> {
             transport,
         ),
         Command::PromoteCaTls => promote_ca_tls(&path, transport),
+        Command::Enroll { command } => enroll(&path, command, transport),
         Command::AbortGatewayTransition {
             authority_url,
             heliosd_url,

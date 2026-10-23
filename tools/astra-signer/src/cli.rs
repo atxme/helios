@@ -614,11 +614,73 @@ pub(crate) enum Command {
         #[arg(long)]
         origin: Option<String>,
     },
+    /// Enrôle un client sans qu'aucune clé privée ne voyage (NEGOCIATION-DE-CLE-V5 §15).
+    ///
+    /// `invite` émet l'invitation à remettre au client ; `accept` vérifie sa
+    /// demande, consomme l'invitation puis émet ses deux feuilles ;
+    /// `sign-document` signe le `.orion` que `helios enroll document` a
+    /// préparé. Le registre des invitations est sous
+    /// `~/.helios/enrollment-invitations`, ou `$HELIOS_ENROLLMENT_REGISTRY`.
+    Enroll {
+        #[command(subcommand)]
+        command: EnrollCommand,
+    },
     /// Renames a slot. Needs no security key.
     Rename {
         #[arg(long)]
         slot: String,
         #[arg(long)]
         label: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum EnrollCommand {
+    /// Signe sous `CA-PQ` une invitation à usage unique pour cette gateway.
+    ///
+    /// Une clé suffit ; deux credentials distincts avec `--allow-readmission`.
+    /// L'empreinte `CA-PQ` affichée est celle que le client doit confirmer
+    /// hors bande avant de créer sa demande.
+    Invite {
+        /// Feuille PQ servie par la gateway (JSON), celle qu'Orion épinglera.
+        #[arg(long)]
+        gateway_certificate: PathBuf,
+        /// Durée de vie de l'invitation, en heures (24 au plus).
+        #[arg(long, default_value_t = 24, value_parser = clap::value_parser!(u64).range(1..=24))]
+        valid_for_hours: u64,
+        /// Autorise la réadmission d'une clé WireGuard déjà enrôlée.
+        #[arg(long)]
+        allow_readmission: bool,
+        /// Fichier `.helios-invite` à remettre au client.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Vérifie une demande, consomme son invitation, puis émet les feuilles.
+    Accept {
+        /// Fichier `.helios-request` reçu du client.
+        #[arg(long)]
+        request: PathBuf,
+        /// Durée de vie des deux feuilles clientes, en jours.
+        #[arg(long, default_value_t = 365)]
+        validity_days: u64,
+        /// Répertoire où écrire les deux feuilles.
+        #[arg(long)]
+        out_dir: PathBuf,
+    },
+    /// Signe sous `CA-PQ` le brouillon de document `.orion`.
+    SignDocument {
+        /// Brouillon écrit par `helios enroll document`.
+        #[arg(long)]
+        draft: PathBuf,
+        /// Document `.orion` signé, à remettre au client.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Liste les invitations et leur état. Ne demande aucune clé.
+    List,
+    /// Révoque une invitation encore émise. Ne demande aucune clé.
+    Revoke {
+        /// Identifiant de l'invitation, 32 caractères hexadécimaux.
+        invitation_id: String,
     },
 }

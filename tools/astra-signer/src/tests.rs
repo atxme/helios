@@ -56,3 +56,42 @@ fn a_window_bound_is_printed_as_a_date() {
     // Out of range is named rather than silently rendered as an epoch.
     assert!(horodatage(u64::MAX).contains("hors plage"));
 }
+
+/// The five enrollment gestures parse as an operator types them, and an
+/// invitation cannot outlive the 24 hours §15.2 allows.
+#[test]
+fn enroll_subcommands_parse() {
+    use clap::Parser as _;
+
+    for line in [
+        "astra-signer enroll invite --gateway-certificate gw.json --out a.helios-invite",
+        "astra-signer enroll invite --gateway-certificate gw.json --valid-for-hours 2 \
+         --allow-readmission --out a.helios-invite",
+        "astra-signer enroll accept --request a.helios-request --out-dir leaves",
+        "astra-signer enroll sign-document --draft draft.json --out a.orion",
+        "astra-signer enroll list",
+        "astra-signer enroll revoke 01010101010101010101010101010101",
+    ] {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        assert!(Cli::try_parse_from(&words).is_ok(), "{line}");
+    }
+    for refused in [
+        "astra-signer enroll invite --gateway-certificate gw.json --valid-for-hours 25 --out a",
+        "astra-signer enroll invite --gateway-certificate gw.json --valid-for-hours 0 --out a",
+        "astra-signer enroll accept --request a.helios-request",
+    ] {
+        let words: Vec<&str> = refused.split_whitespace().collect();
+        assert!(Cli::try_parse_from(&words).is_err(), "{refused}");
+    }
+}
+
+#[test]
+fn a_fingerprint_is_shown_in_groups_of_four() {
+    assert_eq!(grouped_hex("0123456789abcdef"), "0123 4567 89ab cdef");
+}
+
+#[test]
+fn a_shell_word_survives_quotes_and_spaces() {
+    assert_eq!(shell_word("laptop-alice"), "laptop-alice");
+    assert_eq!(shell_word("poste d'alice"), "'poste d'\\''alice'");
+}
