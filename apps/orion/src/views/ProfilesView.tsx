@@ -32,6 +32,7 @@ import {
 import * as api from '../api'
 import { readProfileDocument } from '../profileDocument'
 import { CopyButton } from '../components/CopyButton'
+import { EnrollmentPanel } from './EnrollmentPanel'
 import { modeAllowed, modeLevel, modeMeta, PROTECTION_MODES } from '../components/state'
 import {
   leavesIpv6Uncaptured,
@@ -867,18 +868,9 @@ export function ProfilesView({
           tone: 'error',
           message: `« ${profile.name} » chargé, à compléter : ${imported.incomplete}${dropped}`,
         })
-      }
-      // The identity failing to seal outranks the profile loading fine: the
-      // profile is visible on screen, whereas an unsealed identity only
-      // shows up much later, as a connection that fails before WireGuard.
-      else if (imported.identity_error) {
-        setNotice({
-          tone: 'error',
-          message: `« ${profile.name} » chargé, mais l’identité n’a pas pu être scellée : ${imported.identity_error}${dropped}`,
-        })
       } else {
         const sealed = imported.identity_sealed
-          ? ' Identité scellée dans le stockage protégé : le fichier peut être détruit.'
+          ? ' Enrôlement terminé : identité scellée dans le stockage protégé.'
           : ''
         setNotice({
           tone: 'success',
@@ -1232,6 +1224,7 @@ export function ProfilesView({
             >
               {importing ? 'Chargement…' : 'Importer'}
             </Button>
+            <EnrollmentPanel />
             <Button
               size="small"
               variant="text"

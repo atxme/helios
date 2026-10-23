@@ -221,23 +221,18 @@ export interface CertificateInventory {
 
 /**
  * Result of importing a document — mirror of the shell's `ImportOutcome`.
- *
- * The identity's fate is reported next to the profile rather than replacing
- * it: a profile stays importable on a machine that cannot seal, and hiding it
- * behind that failure would leave the user with nothing to look at.
  */
 export interface ImportOutcome {
   profile: ClientProfile
-  /** The document carried an identity **and** it was sealed. */
-  identity_sealed: boolean
-  /** Why sealing failed, when the document carried one and it did not. */
-  identity_error: string | null
   /**
-   * Why the draft has no private key.
-   *
-   * An invitation carries none, by design: the operator never held it. When
-   * no local profile holds the admitted half either, the draft is still
-   * shown — with this explanation — rather than refused.
+   * A signed v5 document completed the pending enrollment it answers, and the
+   * identity it yields is sealed.
+   */
+  identity_sealed: boolean
+  /**
+   * Why the draft has no private key: a classic invitation no local key
+   * completes, or a signed document no pending enrollment of this machine
+   * answers. The draft is still shown — with this explanation.
    */
   private_key_missing: string | null
   /**
@@ -852,4 +847,24 @@ export interface OperatorPendingOperation {
   campaign_fingerprint: string
   created_at: number
   expires_at: number
+}
+
+/** What the screen shows of an enrollment invitation before it is confirmed. */
+export interface InvitationPreview {
+  server_name: string
+  /** `CA-PQ` fingerprint, hexadecimal in groups of four. */
+  ca_fingerprint: string
+  expires_at_unix: number
+  /** The invitation text, sent back when the request is created. */
+  invitation_token: string
+}
+
+/** An enrollment request this machine sent and still waits an answer for. */
+export interface PendingEnrollment {
+  invitation_id: string
+  request_id: string
+  requested_name: string
+  server_name: string
+  created_at_unix: number
+  invitation_expires_at_unix: number
 }

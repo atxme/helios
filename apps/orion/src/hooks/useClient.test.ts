@@ -48,7 +48,6 @@ const config: ClientConfig = { profiles: [portable], selected: 'portable' }
 const imported = (overrides: Partial<ImportOutcome> = {}): ImportOutcome => ({
   profile: { ...portable, name: 'imported' },
   identity_sealed: false,
-  identity_error: null,
   private_key_missing: null,
   incomplete: null,
   notices: [],
@@ -194,10 +193,6 @@ describe('useClient', () => {
     expect(result.current.logs[0]?.message).toContain('scellée')
 
     act(() => result.current.clearPathImportedProfile())
-    api.importProfilePath.mockResolvedValueOnce(imported({ identity_error: 'DPAPI unavailable' }))
-    act(() => profilePath())
-    await waitFor(() => expect(result.current.error).toContain('DPAPI unavailable'))
-
     api.importProfilePath.mockResolvedValueOnce(imported({ private_key_missing: 'key expected' }))
     act(() => profilePath())
     await waitFor(() => expect(result.current.error).toBe('key expected'))

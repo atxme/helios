@@ -24,6 +24,10 @@ const api = vi.hoisted(() => ({
   discardStagedPsk: vi.fn(),
   vaultPosture: vi.fn(),
   allowUnencryptedVolume: vi.fn(),
+  listPendingEnrollments: vi.fn(),
+  previewEnrollmentInvitation: vi.fn(),
+  beginEnrollment: vi.fn(),
+  discardPendingEnrollment: vi.fn(),
 }))
 const documents = vi.hoisted(() => ({ readProfileDocument: vi.fn() }))
 
@@ -111,6 +115,7 @@ beforeEach(() => {
   api.discardStagedKey.mockResolvedValue(undefined)
   api.adoptPresharedKey.mockResolvedValue(undefined)
   api.discardStagedPsk.mockResolvedValue(undefined)
+  api.listPendingEnrollments.mockResolvedValue([])
   api.vaultPosture.mockResolvedValue({
     hardwareBacked: true,
     softwareKeystore: false,
@@ -579,7 +584,6 @@ describe('ProfilesView interactions', () => {
     handlers.onImport.mockResolvedValue({
       profile: profile({ name: 'fournisseur' }),
       identity_sealed: false,
-      identity_error: null,
       private_key_missing: null,
       incomplete: null,
       notices: ['DNS = 100.64.0.1 : Orion n’applique pas de serveur DNS.'],
@@ -607,7 +611,6 @@ describe('ProfilesView interactions', () => {
     const outcome = (overrides: Partial<ImportOutcome> = {}): ImportOutcome => ({
       profile: profile({ name: 'imported' }),
       identity_sealed: true,
-      identity_error: null,
       private_key_missing: null,
       incomplete: null,
       notices: [],
@@ -624,7 +627,7 @@ describe('ProfilesView interactions', () => {
     const input = container.querySelector('input[type="file"]') as HTMLInputElement
 
     fireEvent.change(input, { target: { files: [new File(['profile'], 'imported.orion')] } })
-    await waitFor(() => expect(screen.getByText(/Identité scellée/)).toBeTruthy())
+    await waitFor(() => expect(screen.getByText(/identité scellée/)).toBeTruthy())
     expect(handlers.onImport).toHaveBeenCalledWith('{"format":"orion-profile"}', 'imported.orion')
 
     handlers.onImport.mockResolvedValueOnce(outcome({ private_key_missing: 'private key expected' }))

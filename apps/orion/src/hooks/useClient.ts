@@ -56,8 +56,6 @@ export function useClient() {
           setError(imported.private_key_missing)
         } else if (imported.incomplete) {
           setError(`Profil à compléter : ${imported.incomplete}`)
-        } else if (imported.identity_error) {
-          setError(`Identité non scellée : ${imported.identity_error}`)
         } else if (imported.identity_sealed) {
           pushLog('info', 'identité de négociation scellée dans le stockage protégé')
         }

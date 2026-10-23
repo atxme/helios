@@ -21,6 +21,8 @@ import type {
   ClientConfig,
   ClientEvent,
   ImportOutcome,
+  InvitationPreview,
+  PendingEnrollment,
   KeyNegotiationSettings,
   KeyNegotiationSupport,
   ProfileCertificates,
@@ -48,16 +50,40 @@ export const getConfig = () => invoke<ClientConfig>('get_config')
 export const aboutOrion = () => invoke<About>('about_orion')
 
 /**
- * Imports a document and seals any identity it carries.
- *
- * The sealing happens on the Rust side, at import time: it is the only moment
- * the private material exists in the clear, and the shorter that moment is
- * the better.
+ * Imports a document. A signed v5 document is verified and completed on the
+ * Rust side against the pending enrollment it answers, before anything is
+ * shown.
  */
 export const importProfile = (contents: string, fileName: string) =>
   invoke<ImportOutcome>('import_profile', { contents, fileName })
 export const importProfilePath = (path?: string) =>
   invoke<ImportOutcome | null>('import_profile_path', { path: path ?? null })
+
+/** Reads an enrollment invitation; nothing is trusted or generated yet. */
+export const previewEnrollmentInvitation = (contents: string) =>
+  invoke<InvitationPreview>('preview_enrollment_invitation', { contents })
+
+/**
+ * Generates the keys once the `CA-PQ` fingerprint is confirmed, seals them,
+ * and returns the `.helios-request` text to hand to the operator.
+ */
+export const beginEnrollment = (
+  invitation: string,
+  confirmedCaFingerprint: string,
+  requestedName: string,
+) =>
+  invoke<string>('begin_enrollment', {
+    invitation,
+    confirmedCaFingerprint,
+    requestedName,
+  })
+
+export const listPendingEnrollments = () =>
+  invoke<PendingEnrollment[]>('list_pending_enrollments')
+
+/** Abandons a pending enrollment: its private keys are destroyed. */
+export const discardPendingEnrollment = (requestId: string) =>
+  invoke<void>('discard_pending_enrollment', { requestId })
 
 /**
  * Reports the faulty fields of a profile being edited.
