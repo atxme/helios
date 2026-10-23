@@ -459,6 +459,33 @@ fn resolve_negotiation_endpoint(
     Ok(format!("{host}:{port}"))
 }
 
+/// The command the operator is told to paste next.
+///
+/// The requested name is the client's choice and never reaches it: pasted on
+/// the machine holding the hardware credential, `$(…)` in a name would run
+/// there. The output is named after the request id, as `accept` names the
+/// leaves, and the draft path is quoted.
+fn sign_command(draft: &Path, request: &EnrollmentRequest) -> String {
+    format!(
+        "astra-signer enroll sign-document --draft {} --out {}.orion",
+        shell_word(&draft.display().to_string()),
+        request.request_id.to_hex()
+    )
+}
+
+/// One shell word, quoted only when it needs to be.
+fn shell_word(value: &str) -> String {
+    let plain = !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./=:+,@".contains(c));
+    if plain {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
 fn report(options: &DocumentOptions, request: &EnrollmentRequest, material: &GatewayMaterial) {
     println!(
         "{} draft for \"{}\" → {}",
@@ -468,11 +495,7 @@ fn report(options: &DocumentOptions, request: &EnrollmentRequest, material: &Gat
     );
     println!();
     println!("  \x1b[2mNo private key in this file, and no signature yet. Sign it with:\x1b[0m");
-    println!(
-        "  astra-signer enroll sign-document --draft {} --out {}.orion",
-        options.output.display(),
-        request.requested_name
-    );
+    println!("  {}", sign_command(&options.output, request));
     println!();
     println!(
         "  \x1b[2mgateway PQ certificate: {}\x1b[0m",
@@ -688,6 +711,22 @@ mod tests {
             orion_core::parse_profile_import(&json, "draft.orion").expect("Orion reads it");
         assert!(imported.enrollment.is_some());
         assert_eq!(imported.profile.name, "poste-windows");
+    }
+
+    #[test]
+    fn the_suggested_sign_command_never_carries_the_client_chosen_name() {
+        let mut request = fixture().request;
+        request.requested_name = "x$(touch pwned); ../../etc/y".into();
+        let command = sign_command(Path::new("brouillon de poste.json"), &request);
+        assert!(!command.contains("pwned"), "{command}");
+        assert!(!command.contains(".."), "{command}");
+        assert_eq!(
+            command,
+            format!(
+                "astra-signer enroll sign-document --draft 'brouillon de poste.json' --out {}.orion",
+                request.request_id.to_hex()
+            )
+        );
     }
 
     #[test]
