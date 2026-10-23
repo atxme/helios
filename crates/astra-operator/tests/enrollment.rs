@@ -226,7 +226,7 @@ fn document(
         "peer_public_key": invitation.gateway_wg_public_key.to_base64(),
         "key_negotiation": {
             "server_name": SERVER_NAME,
-            "gateway_pq_certificate": serde_json::to_string(&domain.gateway_leaf).expect("json"),
+            "gateway_pq_certificate": signing::encode_pq_certificate(&domain.gateway_leaf).expect("encoded"),
             "trust": { "ca_pq_public_key": domain.ca_pq().to_base64() },
         },
     });
@@ -243,7 +243,8 @@ fn document(
         issued_at_unix: NOW,
         profile,
         client_tls_certificate: leaves.tls_certificate.clone(),
-        client_pq_certificate: serde_json::to_string(&leaves.pq_certificate).expect("json"),
+        client_pq_certificate: signing::encode_pq_certificate(&leaves.pq_certificate)
+            .expect("encoded"),
         operator_signature: None,
     }
 }
@@ -422,7 +423,7 @@ fn a_document_for_leaves_this_invitation_did_not_receive_is_refused() {
 
     let mut draft = document(&domain, &invitation, &client.request, &leaves);
     draft.client_pq_certificate =
-        serde_json::to_string(&other_leaves.pq_certificate).expect("json");
+        signing::encode_pq_certificate(&other_leaves.pq_certificate).expect("encoded");
     assert!(
         signing::sign_document(&domain.vault, &domain.open(), &domain.registry, draft).is_err()
     );
@@ -492,7 +493,7 @@ fn a_document_naming_another_gateway_is_refused() {
 
     let mut draft = document(&domain, &invitation, &client.request, &leaves);
     draft.profile["key_negotiation"]["gateway_pq_certificate"] =
-        serde_json::json!(serde_json::to_string(&leaves.pq_certificate).expect("json"));
+        serde_json::json!(signing::encode_pq_certificate(&leaves.pq_certificate).expect("encoded"));
     assert!(
         signing::sign_document(&domain.vault, &domain.open(), &domain.registry, draft).is_err()
     );

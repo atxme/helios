@@ -236,8 +236,8 @@ pub use bindings::sign_credential_bindings;
 pub use ca_tls::{advance_ca_tls, issue_ca_tls, rotate_ca_tls, RotatedClientTlsCa};
 pub use campaign::{approve_campaign, CampaignApprovalSession};
 pub use enrollment::{
-    accept_request, enrollment_credentials, sign_document, sign_invitation, InvitationDraft,
-    IssuedLeaves,
+    accept_request, encode_pq_certificate, enrollment_credentials, sign_document, sign_invitation,
+    InvitationDraft, IssuedLeaves,
 };
 pub use gateway::{
     issue_gateway_bootstrap_certificate, sign_gateway_abort, sign_gateway_transition,

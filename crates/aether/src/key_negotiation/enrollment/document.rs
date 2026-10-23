@@ -49,8 +49,8 @@ pub struct EnrollmentDocument {
     #[serde(deserialize_with = "strict_object")]
     pub profile: serde_json::Map<String, serde_json::Value>,
     pub client_tls_certificate: DerCertificate,
-    /// The client PQ leaf, as the JSON text `PqCertificate` serializes to —
-    /// the same encoding as the profile's `gateway_pq_certificate`.
+    /// The client PQ leaf: base64 of the JSON `PqCertificate` serializes to,
+    /// the encoding of the profile's `gateway_pq_certificate`.
     pub client_pq_certificate: String,
     /// Absent in the draft the gateway side writes, present once `CA-PQ`
     /// has signed.

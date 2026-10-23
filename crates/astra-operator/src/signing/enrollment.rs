@@ -57,6 +57,20 @@ pub struct IssuedLeaves {
     pub pq_certificate: PqCertificate,
 }
 
+/// A PQ leaf as a profile carries it: base64 of its JSON.
+pub fn encode_pq_certificate(certificate: &PqCertificate) -> Result<String> {
+    let json = serde_json::to_vec(certificate)
+        .map_err(|_| GestureError::Anchors("encodage de la feuille PQ".into()))?;
+    Ok(encode(&json))
+}
+
+fn decode_pq_certificate(value: &str) -> Option<PqCertificate> {
+    let json = base64::engine::general_purpose::STANDARD
+        .decode(value.trim())
+        .ok()?;
+    serde_json::from_slice(&json).ok()
+}
+
 fn anchor(vault: &AuthorityVault) -> Result<MlDsa87PublicKey> {
     Ok(MlDsa87PublicKey::parse(vault.ca_pq_public_key.trim())?)
 }
@@ -289,8 +303,8 @@ pub fn sign_document(
             "le document ne nomme pas la demande qui a consommé cette invitation".into(),
         ));
     }
-    let pq_certificate: PqCertificate = serde_json::from_str(&draft.client_pq_certificate)
-        .map_err(|_| GestureError::Anchors("feuille PQ cliente illisible".into()))?;
+    let pq_certificate = decode_pq_certificate(&draft.client_pq_certificate)
+        .ok_or_else(|| GestureError::Anchors("feuille PQ cliente illisible".into()))?;
     if draft.client_tls_certificate.fingerprint() != issued.tls_certificate
         || aether::certificates::gateway::pq_certificate_fingerprint(&pq_certificate)?
             != issued.pq_certificate
@@ -335,10 +349,10 @@ pub fn sign_document(
             "le profil vise un autre nom de serveur que l'invitation".into(),
         ));
     }
-    let pinned: Option<PqCertificate> = profile
+    let pinned = profile
         .pointer("/key_negotiation/gateway_pq_certificate")
         .and_then(serde_json::Value::as_str)
-        .and_then(|text| serde_json::from_str(text).ok());
+        .and_then(decode_pq_certificate);
     let pinned = pinned
         .as_ref()
         .map(aether::certificates::gateway::pq_certificate_fingerprint)
