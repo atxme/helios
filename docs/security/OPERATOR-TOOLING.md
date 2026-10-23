@@ -375,8 +375,10 @@ un credential opérateur matériel enregistré dans le coffre.
 
 6. **Import** — Orion vérifie la signature sous la `CA-PQ` épinglée à l'étape 2,
    la liaison à sa demande en attente, les feuilles contre ses clés locales et
-   la gateway contre l'invitation ; il scelle alors l'identité et détruit la
-   demande en attente. Un document qu'aucune demande de ce poste n'attend
+   la gateway contre l'invitation ; il scelle alors l'identité. La demande en
+   attente, seule copie durable de la clé privée WireGuard jusque-là, n'est
+   détruite qu'à l'enregistrement du profil : réimporter le même document après
+   un redémarrage le complète de nouveau. Un document qu'aucune demande de ce poste n'attend
    s'affiche en brouillon non connectable.
 
 `astra-signer enroll list` montre l'état des invitations ; `enroll revoke <id>`

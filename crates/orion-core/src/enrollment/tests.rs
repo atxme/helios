@@ -216,6 +216,36 @@ fn the_request_is_not_produced_when_sealing_is_unavailable() {
     assert!(pending_enrollments(&store).expect("list").is_empty());
 }
 
+#[test]
+fn settling_a_saved_enrollment_removes_only_its_own_pending_record() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let root = directory.path().join("identities");
+    std::fs::create_dir_all(&root).expect("directory");
+    let store = ProtectedIdentityStore::at(root.clone());
+    let saved = Id16::new([7; 16]).expect("id");
+    let other = Id16::new([8; 16]).expect("id");
+    for id in [&saved, &other] {
+        std::fs::write(
+            root.join(format!("{}{}", pending_name(id), crate::identity_store::SEALED_SUFFIX)),
+            b"sealed",
+        )
+        .expect("record");
+    }
+
+    settle_enrollment(&store, "operator-chosen-name").expect("not an enrollment");
+    settle_enrollment(&store, &identity_name(&saved)).expect("settled");
+    settle_enrollment(&store, &identity_name(&saved)).expect("settling twice is harmless");
+
+    let left: Vec<_> = std::fs::read_dir(&root)
+        .expect("list")
+        .map(|entry| entry.expect("entry").file_name().into_string().expect("utf-8"))
+        .collect();
+    assert_eq!(
+        left,
+        vec![format!("{}{}", pending_name(&other), crate::identity_store::SEALED_SUFFIX)]
+    );
+}
+
 #[cfg(windows)]
 #[test]
 fn a_pending_enrollment_survives_reopening_the_store_and_can_be_discarded() {
@@ -655,6 +685,15 @@ mod completion {
         let name = identity_name(&pending.request_id);
         assert_eq!(profile.key_negotiation.expect("block").identity, name);
         assert_eq!(store.load(&name).expect("sealed").identity, name);
+        // The WireGuard private key exists nowhere else until the profile is
+        // saved: the pending record is kept so the same document completes
+        // again after a restart or a refused save.
+        assert_eq!(pending_enrollments(&store).expect("list").len(), 1);
+        let again = complete_enrollment(&store, &document, profile_of(&document), now())
+            .expect("completed again");
+        assert!(matches!(again, EnrollmentOutcome::Completed { .. }));
+
+        settle_enrollment(&store, &name).expect("settled");
         assert!(pending_enrollments(&store).expect("list").is_empty());
     }
 }

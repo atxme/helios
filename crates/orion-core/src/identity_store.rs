@@ -55,7 +55,7 @@ const SEAL_ENTROPY: &[u8] = b"helios-orion-key-negotiation-identity-v1";
 
 /// Sealed file suffix. The extension is deliberately not `.json`: what is on
 /// disk is a ciphertext, and nothing should invite opening it as text.
-const SEALED_SUFFIX: &str = ".identity";
+pub(crate) const SEALED_SUFFIX: &str = ".identity";
 
 /// Version of the plaintext record sealed by the platform backend.
 const IDENTITY_RECORD_FORMAT_VERSION: u16 = 1;

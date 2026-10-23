@@ -332,6 +332,18 @@ pub fn discard_enrollment(store: &ProtectedIdentityStore, request_id: &Id16) -> 
     store.remove_named(&pending_name(request_id))
 }
 
+/// Destroys the pending record of the enrollment that sealed `identity`.
+///
+/// Called once a profile naming that identity is saved: its WireGuard private
+/// key is then in the profile store, and the record holds nothing that is
+/// still needed. An identity no enrollment produced has no record to destroy.
+pub fn settle_enrollment(store: &ProtectedIdentityStore, identity: &str) -> Result<()> {
+    match identity.strip_prefix(IDENTITY_PREFIX) {
+        Some(request) => store.remove_named(&format!("{PENDING_PREFIX}{request}")),
+        None => Ok(()),
+    }
+}
+
 /// Opens one pending enrollment, private keys included.
 pub(crate) fn open_pending(
     store: &ProtectedIdentityStore,
@@ -526,9 +538,11 @@ pub(crate) fn match_document(
 
 /// Completes an enrollment from its signed document.
 ///
-/// The identity is sealed first and the pending record destroyed after: a
-/// failure in between leaves the keys where they were, and the same document
-/// can be imported again.
+/// The identity is sealed and the pending record **kept**: the WireGuard
+/// private key is not part of the sealed bundle, and until the profile that
+/// carries it is saved the pending record is its only durable copy. Importing
+/// the same document again, after a restart or a refused save, completes it
+/// again; [`settle_enrollment`] destroys the record once the profile is saved.
 pub fn complete_enrollment(
     store: &ProtectedIdentityStore,
     document: &EnrollmentDocument,
@@ -553,7 +567,6 @@ pub fn complete_enrollment(
         }
         DocumentMatch::Matched { profile, bundle } => {
             store.store(&bundle)?;
-            discard_enrollment(store, &document.request_id)?;
             Ok(EnrollmentOutcome::Completed { profile })
         }
     }

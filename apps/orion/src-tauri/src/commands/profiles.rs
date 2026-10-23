@@ -720,6 +720,9 @@ pub(crate) async fn save_profile(
         .store
         .save_profile(&profile)
         .map_err(|e| e.to_string())?;
+    if let Some(block) = &profile.key_negotiation {
+        settle_saved_enrollment(&block.identity);
+    }
     cfg.upsert(profile).map_err(|error| error.to_string())?;
     cfg.selected = Some(selected.clone());
     state.store.select(&selected).map_err(|e| e.to_string())?;
@@ -729,6 +732,19 @@ pub(crate) async fn save_profile(
     drop(cfg);
     tray::refresh(&app);
     Ok(view)
+}
+
+/// Destroys the pending enrollment record once its profile is saved.
+///
+/// The profile is already persisted when this runs, so a failure is not a
+/// failed save: the record left behind holds sealed keys the user can still
+/// discard from the enrollment list.
+fn settle_saved_enrollment(identity: &str) {
+    if let Err(error) = ProtectedIdentityStore::for_current_user()
+        .and_then(|store| orion_core::enrollment::settle_enrollment(&store, identity))
+    {
+        tracing::warn!(error = %format!("{error:#}"), "pending enrollment record kept after save");
+    }
 }
 
 /// Removes a profile, unmounting its tunnel first if that tunnel is the one up.

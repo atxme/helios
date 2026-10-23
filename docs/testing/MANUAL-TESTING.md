@@ -460,8 +460,10 @@ d'[OPERATOR-TOOLING §6](../security/OPERATOR-TOOLING.md#6-profil-client).
 5. Poste opérateur : `astra-signer enroll accept`, puis la ligne
    `heliosd peer add` imprimée, sur la gateway ; `helios enroll document`,
    puis `astra-signer enroll sign-document`.
-6. Orion, « Importer » le `.orion` signé : le profil devient connectable, la
-   demande disparaît de la liste, et la connexion ML-KEM aboutit.
+6. Orion, « Importer » le `.orion` signé : le profil devient connectable. Fermer
+   Orion **sans enregistrer**, le rouvrir et réimporter le même document : il
+   doit se compléter de nouveau. « Enregistrer » ensuite : la demande disparaît
+   de la liste, et la connexion ML-KEM aboutit.
 
 À vérifier aussi, chacun refusé en clair et sans effet :
 
