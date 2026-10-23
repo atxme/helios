@@ -48,6 +48,7 @@ pub use aether_fido::authenticator;
 pub mod campaign;
 pub mod credentials;
 pub mod documents;
+pub mod enrollment;
 pub mod gestures;
 pub mod handoff;
 pub mod operations;
