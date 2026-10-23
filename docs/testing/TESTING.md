@@ -215,10 +215,11 @@ Valider avec accès console :
   supprimé ou renommé. `IconMenuItem` n'est exercé que là : le module est
   type-vérifié sous Linux en forçant la feature `tray-icon`, ce qui ne dit rien
   du rendu Windows ;
-- identité cliente sous Windows : un document produit par `helios enroll`
-  est importé, l'écran *Profils* annonce l'identité **scellée**, la connexion
-  négocie en ML-KEM après suppression du fichier d'enrôlement, et la même
-  identité recopiée sur un autre compte Windows échoue au descellement ;
+- identité cliente sous Windows : le parcours d'enrôlement v5
+  ([MANUAL-TESTING](MANUAL-TESTING.md#enrôlement-v5-de-bout-en-bout-vm-windows))
+  scelle la demande puis l'identité, l'écran *Profils* annonce l'identité
+  **scellée**, la connexion négocie en ML-KEM, et la même identité recopiée sur
+  un autre compte Windows échoue au descellement ;
 - paquet Orion Debian : `getcap /usr/bin/orion` annonce
   `cap_net_admin=ep`, puis WebKitGTK démarre sans dépendre de
   `LD_LIBRARY_PATH` ;

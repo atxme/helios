@@ -321,7 +321,10 @@ un credential opérateur matériel enregistré dans le coffre.
 1. **Invitation** — sur le poste opérateur :
 
    ```sh
-   astra-signer enroll invite      --gateway-certificate key-negotiation-pq-cert.json      --valid-for-hours 24      --out poste.helios-invite
+   astra-signer enroll invite \
+     --gateway-certificate key-negotiation-pq-cert.json \
+     --valid-for-hours 24 \
+     --out poste.helios-invite
    ```
 
    La commande demande un credential autorisé (deux distincts avec

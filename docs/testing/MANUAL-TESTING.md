@@ -312,36 +312,18 @@ cas depuis que `cargo xtask bundle` l'inclut ; `./scripts/deploy.sh` la met à
 jour), et les deux ports UDP sont redirigés par la box — 51820 pour WireGuard,
 51821 pour la négociation.
 
-Depuis le poste opérateur, une seule commande produit les deux fichiers de
-configuration :
+Depuis le poste opérateur, une seule commande prépare la gateway :
 
 ```sh
-./scripts/key-negotiation-setup.sh christophe@100.72.220.76 --nom portable
+./scripts/key-negotiation-setup.sh christophe@100.72.220.76
 ```
-
-Pour **ajouter la négociation à un profil Orion déjà en place**, repartir de sa
-clé publique — celle qu'affiche l'écran *Profils* sous « Votre clé publique » :
-
-```sh
-./scripts/key-negotiation-setup.sh --nom Helios-gateway \
-  --public-key zU0Edj1phreNdcsrFujZRi+U7wrV607a...
-```
-
-Le document produit ne porte alors aucune clé privée WireGuard : à l'import,
-Orion reprend celle du profil local qui détient cette clé publique et ne fait
-que lui ajouter le bloc de négociation. L'admission déjà en place sur la
-gateway reste valable, puisque la clé ne change pas.
-
-La correspondance se fait sur la **clé**, pas sur le nom : le poste nomme
-rarement son profil comme l'opérateur nomme le pair, et exiger l'égalité des
-deux refusait des documents pourtant valables. La clé admise est celle
-qu'affiche `helios profile check <fichier>`.
 
 Elle crée la CA opérateur si besoin, fait naître l'identité de négociation
-**sur** la gateway (scellée au TPM), ouvre le port dans son `network.toml`, émet
-les certificats du client, admet le pair par `heliosd peer add` et assemble le
-profil. Le profil produit porte les clés privées du client : le transférer par
-un canal maîtrisé et le détruire des deux côtés après import.
+**sur** la gateway (scellée au TPM) et ouvre le port dans son `network.toml`.
+Elle n'enrôle plus de client : le poste s'enrôle en v5, sans qu'aucune clé
+privée voyage ([parcours](#enrôlement-v5-de-bout-en-bout-vm-windows)). Les
+anciennes options `--nom` et `--public-key` sont refusées en renvoyant vers
+[OPERATOR-TOOLING §6](../security/OPERATOR-TOOLING.md#6-profil-client).
 
 Tout passe par SSH, **jamais par l'API de contrôle** : celle-ci vit derrière le
 tunnel, et l'exiger reviendrait à faire dépendre d'une première connexion la
@@ -351,13 +333,13 @@ l'admission emprunte la console (`heliosd peer add`) plutôt que `POST
 
 Sur le poste Windows :
 
-1. importer le `.orion` ; l'écran *Profils* doit annoncer
-   **identité protégée · scellée** ;
+1. importer le `.orion` signé issu de l'enrôlement v5 ; l'écran *Profils* doit
+   annoncer **identité protégée · scellée** ;
 2. comparer l'empreinte PQ affichée avec celle qu'a imprimée
    `heliosd init-key-negotiation` — c'est ce qui rattache le profil à cette
    gateway et rien d'autre ;
-3. supprimer le fichier d'enrôlement, puis connecter : la négociation doit
-   aboutir sans lui, l'identité étant scellée au compte Windows ;
+3. connecter : la négociation doit aboutir sur la seule identité scellée au
+   compte Windows, le document ne portant aucune clé privée ;
 4. l'écran *Connexion* doit afficher `négociation ML-KEM-1024` puis, une fois le
    handshake obtenu, la puce `PSK PQC · ML-KEM-1024` ;
 5. côté gateway, `helios peer list` doit montrer le plancher monté à
@@ -368,8 +350,7 @@ Sur le poste Windows :
 7. toujours dans *Profils*, éprouver l'édition du bloc : coller un certificat
    PQ tronqué doit afficher l'empreinte « illisible », signaler le bloc en
    erreur et désactiver *Enregistrer* ; le *Plancher* ne doit proposer que
-   des valeurs supérieures ou égales à celle du profil chargé, et *Retirer*
-   doit disparaître dès que ce plancher dépasse « Classique ».
+   des valeurs supérieures ou égales à celle du profil chargé.
 
 #### La campagne automatique
 

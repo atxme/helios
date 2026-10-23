@@ -633,6 +633,12 @@ transporter l'identité une fois : `orion-profile` gagne un champ
 jamais `ClientProfile`, donc jamais `profiles.toml`. Un document qui le porte est
 un secret au même titre qu'un profil émis avec clé privée.
 
+> **Remplacé le 23 octobre 2026** par l'enrôlement v5
+> ([NEGOCIATION-DE-CLE-V5 §15](../specification/NEGOCIATION-DE-CLE-V5.md#15-enrôlement)) :
+> plus aucune clé privée ne voyage, `key_negotiation_identity` et `helios
+> enroll` d'un trait sont retirés, Orion génère ses clés et l'opérateur signe
+> un document public. Les deux paragraphes suivants décrivent l'état antérieur.
+
 Côté outillage, `helios enroll` fait l'enrôlement d'un trait : il lit sur la
 gateway sa clé publique, ses certificats de négociation et leur port
 (`GET /api/key-negotiation`, matériel public), émet les certificats clients,
