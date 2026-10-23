@@ -200,7 +200,7 @@ fn a_classic_negotiation_mode_is_refused_at_import() {
         .expect_err("a classic negotiation mode must be refused")
         .to_string();
     assert!(
-        error.contains("document JSON Orion invalide"),
+        error.contains("profil du document signé invalide"),
         "message : {error}"
     );
 }

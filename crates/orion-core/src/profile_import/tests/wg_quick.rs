@@ -153,8 +153,7 @@ fn an_absent_address_is_tolerated_but_a_malformed_one_is_not() {
     assert_eq!(imported.profile.address, None);
     // …and the gap is named rather than passed over in silence.
     let completed =
-        complete_profile_import(imported.profile, &ClientConfig::default(), None, Vec::new())
-            .unwrap();
+        complete_profile_import(imported.profile, &ClientConfig::default(), Vec::new()).unwrap();
     assert!(completed
         .incomplete
         .expect("le manque doit être nommé")

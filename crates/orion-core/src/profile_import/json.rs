@@ -3,12 +3,9 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-use aether::key_negotiation::ProtectionMode;
+use aether::key_negotiation::{EnrollmentDocument, ProtectionMode, ENROLLMENT_DOCUMENT_VERSION};
 
-use crate::{
-    identity_store::ClientIdentityBundle, ClientProfile, KeyNegotiationSettings,
-    DEFAULT_ALLOWED_IPS, DEFAULT_KEEPALIVE_SECS,
-};
+use crate::{ClientProfile, KeyNegotiationSettings, DEFAULT_ALLOWED_IPS, DEFAULT_KEEPALIVE_SECS};
 
 use super::ProfileKind;
 
@@ -27,10 +24,32 @@ struct JsonEnvelope {
     profile: JsonProfile,
 }
 
+/// The two generations of the document share a format name and differ in
+/// how they spell the version: `version` in v1, `format_version` in the
+/// signed v5 document of NEGOCIATION-DE-CLE-V5 §15.3.
 #[derive(Deserialize)]
 struct JsonHeader {
     format: String,
-    version: u16,
+    #[serde(default)]
+    version: Option<u16>,
+    #[serde(default)]
+    format_version: Option<u16>,
+}
+
+/// What the refusal of an unsigned Helios document says: the procedure that
+/// replaces it, not only the fact that it is refused.
+const UNSIGNED_HELIOS_DOCUMENT: &str = "document Helios non signé : ce format portait les clés \
+     privées du poste ou admettait une clé sans preuve de possession. Demander une invitation \
+     d'enrôlement v5 à l'opérateur";
+
+/// A decoded JSON document: the profile, and the signed envelope it came in
+/// when it is a v5 document.
+pub(super) struct ParsedJson {
+    pub(super) profile: ClientProfile,
+    /// Present for a v5 document. Its signature is **not** checked here: the
+    /// key it verifies under is the one pinned by the pending enrollment, and
+    /// only [`crate::enrollment::complete_enrollment`] holds it.
+    pub(super) enrollment: Option<EnrollmentDocument>,
 }
 
 #[derive(Deserialize)]
@@ -95,13 +114,6 @@ struct JsonProfile {
     /// names the entry to look up.
     #[serde(default)]
     key_negotiation: Option<JsonKeyNegotiation>,
-    /// Client identity, when the operator ships it with the profile.
-    ///
-    /// **Never lands in [`ClientProfile`]**: it goes to the machine's
-    /// protected store and the profile keeps only the entry name. A
-    /// document carrying it is a secret and must be destroyed after import.
-    #[serde(default)]
-    key_negotiation_identity: Option<ClientIdentityBundle>,
 }
 
 #[derive(Deserialize)]
@@ -114,7 +126,6 @@ struct JsonKeyNegotiation {
     server_name: String,
     gateway_ca_der: String,
     gateway_pq_certificate: String,
-    identity: String,
     /// Trust material of spec §19. Absent in a document written before it.
     #[serde(default)]
     trust: Option<crate::config::TrustMaterial>,
@@ -135,7 +146,10 @@ impl From<JsonKeyNegotiation> for KeyNegotiationSettings {
             server_name: value.server_name,
             gateway_ca_der: value.gateway_ca_der,
             gateway_pq_certificate: value.gateway_pq_certificate,
-            identity: value.identity,
+            // Named once the document is matched with a pending enrollment:
+            // the identity is sealed by this machine, never named by the
+            // operator.
+            identity: String::new(),
             trust: value.trust,
         }
     }
@@ -168,7 +182,7 @@ impl From<JsonProfile> for ClientProfile {
     }
 }
 
-pub(super) fn parse_json(contents: &str) -> Result<(ClientProfile, Option<ClientIdentityBundle>)> {
+pub(super) fn parse_json(contents: &str) -> Result<ParsedJson> {
     // Reading the header first guarantees an intelligible version error even
     // if a future version entirely changes the shape of `profile`.
     let header: JsonHeader =
@@ -179,20 +193,89 @@ pub(super) fn parse_json(contents: &str) -> Result<(ClientProfile, Option<Client
             header.format
         );
     }
-    if header.version != PROFILE_IMPORT_VERSION {
-        anyhow::bail!(
-            "version de profil Orion non prise en charge : {} (version attendue : {PROFILE_IMPORT_VERSION})",
-            header.version
-        );
+    match (header.version, header.format_version) {
+        (Some(PROFILE_IMPORT_VERSION), None) => parse_v1(contents),
+        (None, Some(ENROLLMENT_DOCUMENT_VERSION)) => parse_v5(contents),
+        (version, format_version) => anyhow::bail!(
+            "version de profil Orion non prise en charge : {} (versions attendues : \
+             {PROFILE_IMPORT_VERSION}, ou {ENROLLMENT_DOCUMENT_VERSION} pour un document signé)",
+            version
+                .or(format_version)
+                .map_or_else(|| "absente".to_string(), |version| version.to_string())
+        ),
+    }
+}
+
+/// The v1 document, which only a classic WireGuard profile may still use.
+fn parse_v1(contents: &str) -> Result<ParsedJson> {
+    // Decided on the raw value, before the typed parse: the fields that made
+    // a v1 document Helios no longer exist in [`JsonProfile`], and a refusal
+    // on an unknown field would not say what to do instead.
+    let raw: serde_json::Value =
+        serde_json::from_str(contents).context("document JSON Orion invalide")?;
+    if let Some(profile) = raw.get("profile").and_then(serde_json::Value::as_object) {
+        let declared_helios = profile
+            .get("type")
+            .or_else(|| profile.get("profile_type"))
+            .and_then(serde_json::Value::as_str)
+            == Some("helios_key_negotiation");
+        if declared_helios
+            || profile.contains_key("key_negotiation")
+            || profile.contains_key("key_negotiation_identity")
+        {
+            anyhow::bail!("{UNSIGNED_HELIOS_DOCUMENT}");
+        }
     }
     let envelope: JsonEnvelope =
         serde_json::from_str(contents).context("document JSON Orion invalide")?;
-    let mut profile = envelope.profile;
-    // Taken out before the conversion: `ClientProfile` has no field for it,
-    // and that is the property worth keeping — the secret cannot reach
-    // `profiles.toml` by way of a struct update.
-    let identity = profile.key_negotiation_identity.take();
+    Ok(ParsedJson {
+        profile: into_client_profile(envelope.profile)?,
+        enrollment: None,
+    })
+}
 
+/// The signed v5 document (NEGOCIATION-DE-CLE-V5 §15.3).
+///
+/// Its profile carries no secret at all: the private keys never left the
+/// machine, and the identity is named here from the request it answers.
+fn parse_v5(contents: &str) -> Result<ParsedJson> {
+    let document = EnrollmentDocument::parse(contents)
+        .map_err(|error| anyhow::anyhow!("document Orion signé illisible : {error}"))?;
+    let profile: JsonProfile =
+        serde_json::from_value(serde_json::Value::Object(document.profile.clone()))
+            .context("profil du document signé invalide")?;
+    if !profile.private_key.is_empty() {
+        anyhow::bail!(
+            "un document signé ne porte jamais de clé privée : celle de ce poste n'a pas quitté \
+             la machine"
+        );
+    }
+    if profile.preshared_key.is_some() {
+        anyhow::bail!("un document signé ne porte pas de PresharedKey : il est négocié par ML-KEM");
+    }
+    if profile.key_negotiation.as_ref().is_some_and(|block| {
+        block.mode != ProtectionMode::MlKem
+            || block
+                .minimum_mode
+                .is_some_and(|floor| floor != ProtectionMode::MlKem)
+    }) {
+        anyhow::bail!("un document signé n'admet que le mode ML-KEM, plancher compris");
+    }
+    // After the shared checks, so a document declaring Helios without a block
+    // is refused with the §19 message that names the contradiction.
+    let mut profile = into_client_profile(profile)?;
+    let Some(settings) = profile.key_negotiation.as_mut() else {
+        anyhow::bail!("un document signé porte toujours un bloc de négociation de clé");
+    };
+    settings.identity = crate::enrollment::identity_name(&document.request_id);
+    Ok(ParsedJson {
+        profile,
+        enrollment: Some(document),
+    })
+}
+
+/// The checks both generations share, and the conversion to the profile.
+fn into_client_profile(profile: JsonProfile) -> Result<ClientProfile> {
     // The discriminant of spec §19, checked against what the document
     // actually carries. A claim and a content that disagree is the case the
     // field exists for: inferring from the block would have accepted both
@@ -232,5 +315,5 @@ pub(super) fn parse_json(contents: &str) -> Result<(ClientProfile, Option<Client
     // own answer, declared by the document or resolved from it at this single
     // point.
     profile.profile_type = Some(profile.kind());
-    Ok((profile, identity))
+    Ok(profile)
 }

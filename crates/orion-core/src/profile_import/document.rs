@@ -4,9 +4,11 @@
 use std::{fs::File, io::Read, path::Path};
 
 use anyhow::{Context, Result};
-use base64::Engine as _;
 
-use crate::{identity_store::ClientIdentityBundle, ClientConfig, ClientProfile};
+use aether::key_negotiation::EnrollmentDocument;
+
+use crate::enrollment::EnrollmentOutcome;
+use crate::{ClientConfig, ClientProfile};
 
 use super::json::parse_json;
 use super::validate_imported_profile;
@@ -15,17 +17,18 @@ use super::wg_quick::parse_wg_quick;
 /// Maximum size of an imported profile. A normal profile fits in a few KB.
 pub const MAX_PROFILE_IMPORT_BYTES: usize = 64 * 1024;
 
-/// A decoded document: the profile, and the identity that came with it.
+/// A decoded document: the profile, and the signed envelope it came in.
 ///
-/// The two are returned separately because they have opposite destinies —
-/// the profile is persisted in `profiles.toml`, the identity is sealed into
-/// the protected store and the plaintext is dropped. Returning one value that
-/// mixed them would make it far too easy to write the secret to disk.
+/// No document carries a secret any more. A v5 document is signed under the
+/// operator's `CA-PQ` and answers a request this machine made; the private
+/// keys it is completed with never left the pending enrollment
+/// (NEGOCIATION-DE-CLE-V5 §15.3).
 #[derive(Debug)]
 pub struct ProfileImport {
     pub profile: ClientProfile,
-    /// Present only when the operator shipped the identity in the document.
-    pub identity: Option<ClientIdentityBundle>,
+    /// Present for a signed v5 document, which nothing may display before
+    /// [`crate::enrollment::complete_enrollment`] has verified it.
+    pub enrollment: Option<EnrollmentDocument>,
     /// What the document said that Orion read but does **not** apply.
     ///
     /// Distinct from [`CompletedImport::incomplete`], which is about a field
@@ -33,28 +36,6 @@ pub struct ProfileImport {
     /// `DNS` line, an `MTU` — and dropping one silently changes the tunnel's
     /// behaviour without changing anything the user can see.
     pub notices: Vec<String>,
-}
-
-impl ProfileImport {
-    /// WireGuard public key the gateway admitted for this document.
-    ///
-    /// Read from the client PQ certificate that travels with the identity:
-    /// admission is bound to **that** key, so it is what says which local
-    /// private key completes an invitation. The profile name never proved
-    /// anything — the same client is routinely named differently on the
-    /// operator's side and on the user's machine.
-    ///
-    /// `None` when the document ships no identity, or when its certificate
-    /// carries no key: completion then falls back to the name.
-    pub fn admitted_public_key(&self) -> Option<String> {
-        let identity = self.identity.as_ref()?;
-        let raw = base64::engine::general_purpose::STANDARD
-            .decode(identity.pq_certificate.trim())
-            .ok()?;
-        let certificate: serde_json::Value = serde_json::from_slice(&raw).ok()?;
-        let key = certificate.get("wireguard_public_key")?.as_str()?.trim();
-        (!key.is_empty()).then(|| key.to_string())
-    }
 }
 
 /// A decoded document, completed against the local configuration.
@@ -88,6 +69,27 @@ pub struct CompletedImport {
     pub incomplete: Option<String>,
 }
 
+impl CompletedImport {
+    /// The import of a signed document, once
+    /// [`crate::enrollment::complete_enrollment`] has decided.
+    ///
+    /// Never completed from a local profile or a staged key: the only key a
+    /// v5 document admits is the one generated with its request.
+    pub fn from_enrollment(outcome: EnrollmentOutcome, notices: Vec<String>) -> Self {
+        let (profile, private_key_missing) = match outcome {
+            EnrollmentOutcome::Completed { profile } => (profile, None),
+            EnrollmentOutcome::Unmatched { profile, expected } => (profile, Some(expected)),
+        };
+        let incomplete = advisory(&profile);
+        Self {
+            profile,
+            notices,
+            private_key_missing,
+            incomplete,
+        }
+    }
+}
+
 /// Suffixes of an Orion document.
 ///
 /// `.orion` is **ours**: it is what `helios enroll` writes and what Windows
@@ -119,11 +121,9 @@ pub fn parse_profile_import(contents: &str, file_name: &str) -> Result<ProfileIm
     let named_orion = ORION_SUFFIXES
         .iter()
         .any(|suffix| lower_name.ends_with(suffix));
-    // wg-quick has no notion of a client identity: only the Orion document
-    // can carry one.
-    let (profile, identity, notices) = if named_orion || trimmed.starts_with('{') {
-        let (profile, identity) = parse_json(trimmed)?;
-        (profile, identity, Vec::new())
+    let (profile, enrollment, notices) = if named_orion || trimmed.starts_with('{') {
+        let parsed = parse_json(trimmed)?;
+        (parsed.profile, parsed.enrollment, Vec::new())
     } else if lower_name.ends_with(".conf") || trimmed.starts_with('[') {
         let parsed = parse_wg_quick(trimmed, file_name)?;
         (parsed.profile, None, parsed.notices)
@@ -135,24 +135,9 @@ pub fn parse_profile_import(contents: &str, file_name: &str) -> Result<ProfileIm
     };
 
     let profile = validate_imported_profile(profile)?;
-    if let Some(identity) = &identity {
-        identity.validate()?;
-        // A document shipping an identity for an entry the profile does not
-        // name would seal a secret nothing would ever read.
-        let expected = profile
-            .key_negotiation
-            .as_ref()
-            .map(|settings| settings.identity.trim());
-        if expected != Some(identity.identity.trim()) {
-            anyhow::bail!(
-                "l'identité fournie (« {} ») ne correspond pas à celle que le profil désigne",
-                identity.identity
-            );
-        }
-    }
     Ok(ProfileImport {
         profile,
-        identity,
+        enrollment,
         notices,
     })
 }
@@ -250,23 +235,17 @@ fn describe_head(trimmed: &str) -> String {
     format!("il commence par « {head} »")
 }
 
-/// Completes an invitation document from the local profile that holds the
-/// admitted key.
+/// Completes a classic invitation document from the local profile of the
+/// same name.
 ///
 /// Both file-picker and system-association imports call this function. No
 /// private key is ever fabricated here: a new one would break the admission
-/// the gateway already granted to the original public key.
-///
-/// `admitted_public_key` — see [`ProfileImport::admitted_public_key`] — is
-/// what designates the local profile. It is matched by **key**, not by name:
-/// `helios enroll --public-key` is normally run for a client that already
-/// exists locally under another name, and the name rule alone refused those
-/// documents. When the document names no key, the name stays the only
-/// available criterion.
+/// the gateway already granted to the original public key. A signed v5
+/// document is completed by [`crate::enrollment::complete_enrollment`] instead, from the
+/// pending enrollment that holds its keys.
 pub fn complete_profile_import(
     mut profile: ClientProfile,
     config: &ClientConfig,
-    admitted_public_key: Option<&str>,
     notices: Vec<String>,
 ) -> Result<CompletedImport> {
     if !profile.private_key.is_empty() {
@@ -279,35 +258,19 @@ pub fn complete_profile_import(
         });
     }
 
-    let local = match admitted_public_key {
-        // A same-name profile holding *another* key is not a match: it was
-        // never admitted, and its tunnel would fail at the first handshake
-        // without saying why.
-        Some(admitted) => config
-            .profiles
-            .iter()
-            .find(|candidate| candidate.public_key().as_deref() == Some(admitted)),
-        None => config
-            .find(&profile.name)
-            .filter(|candidate| !candidate.private_key.is_empty()),
-    };
+    let local = config
+        .find(&profile.name)
+        .filter(|candidate| !candidate.private_key.is_empty());
 
     let Some(existing) = local else {
-        // The message names the gesture, not just the gap. It used to end on
-        // "coller la clé privée correspondante" with nothing saying where —
-        // the field is « Importer une clé privée », in the identity block of
-        // this very screen.
-        let missing = match admitted_public_key {
-            Some(admitted) => format!(
-                "ce document est une invitation : il ne porte pas de clé privée, et aucune clé de ce poste ne correspond à la clé admise « {admitted} ». \
-                 Utiliser « Importer une clé privée » si vous détenez la moitié privée de cette clé, ou demander un profil complet à l'opérateur."
-            ),
-            None => format!(
-                "ce document est une invitation : il ne porte pas de clé privée, et aucun profil local « {} » n'en fournit une. \
-                 Utiliser « Importer une clé privée », ou demander un profil complet à l'opérateur.",
-                profile.name
-            ),
-        };
+        // The message names the gesture, not just the gap: the field is
+        // « Importer une clé privée », in the identity block of this very
+        // screen.
+        let missing = format!(
+            "ce document est une invitation : il ne porte pas de clé privée, et aucun profil local « {} » n'en fournit une. \
+             Utiliser « Importer une clé privée », ou demander un profil complet à l'opérateur.",
+            profile.name
+        );
         let incomplete = advisory(&profile);
         return Ok(CompletedImport {
             profile,

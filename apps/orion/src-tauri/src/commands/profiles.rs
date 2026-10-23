@@ -260,22 +260,16 @@ pub(crate) async fn get_config(state: State<'_, AppState>) -> Result<ConfigView,
     Ok(ConfigView::from(&*state.config.lock().await))
 }
 
-/// Result of an import: the draft profile, and what became of the identity.
-///
-/// The identity's fate is reported rather than raised because the two are
-/// independent: a profile stays perfectly importable on a machine that cannot
-/// seal, and hiding the profile behind that failure would leave the user with
-/// nothing at all — not even the endpoint to check.
+/// Result of an import: the draft profile, and whether an identity was sealed.
 #[derive(serde::Serialize)]
 pub(crate) struct ImportOutcome {
     /// The draft, redacted. Its private key waits in `pending_imports`.
     profile: ProfileView,
-    /// `true` when the document carried an identity **and** it was sealed.
+    /// `true` when a signed document completed its pending enrollment and the
+    /// identity it yields is sealed.
     identity_sealed: bool,
-    /// Why sealing failed, when the document carried one and it did not.
-    identity_error: Option<String>,
-    /// Why the draft has no private key, when the document was an invitation
-    /// and no local profile held the admitted half.
+    /// Why the draft has no private key: a classic invitation no local key
+    /// completes, or a signed document no pending enrollment answers.
     private_key_missing: Option<String>,
     /// What else the document leaves to fill in, if anything.
     incomplete: Option<String>,
@@ -289,24 +283,29 @@ pub(crate) struct ImportOutcome {
     notices: Vec<String>,
 }
 
-/// Seals the identity shipped with a document, if any.
+/// Completes a signed v5 document against the pending enrollment it answers.
 ///
-/// Import is where this happens because it is the only moment the plaintext
-/// exists: from here on the material lives sealed in the store, and the
-/// profile keeps nothing but the name of the entry.
-fn seal_identity(identity: Option<orion_core::ClientIdentityBundle>) -> (bool, Option<String>) {
-    let Some(identity) = identity else {
-        return (false, None);
-    };
-    let sealed = ProtectedIdentityStore::for_current_user()
-        .and_then(|store| store.store(&identity))
-        .map(|_| ());
-    match sealed {
-        Ok(()) => (true, None),
-        // `{:#}` keeps the anyhow context chain: the platform reason is the
-        // useful half of the message.
-        Err(error) => (false, Some(format!("{error:#}"))),
-    }
+/// Its signature is verified under the `CA-PQ` key pinned when the user
+/// confirmed the invitation, and only then is anything sealed or shown.
+fn complete_signed_document(
+    document: &aether::key_negotiation::EnrollmentDocument,
+    profile: orion_core::ClientProfile,
+    notices: Vec<String>,
+) -> Result<(orion_core::CompletedImport, bool), String> {
+    let outcome = ProtectedIdentityStore::for_current_user()
+        .and_then(|store| {
+            orion_core::enrollment::complete_enrollment(&store, document, profile, now_unix())
+        })
+        // `{:#}` keeps the anyhow context chain: the reason is the useful half.
+        .map_err(|error| format!("{error:#}"))?;
+    let sealed = matches!(
+        outcome,
+        orion_core::enrollment::EnrollmentOutcome::Completed { .. }
+    );
+    Ok((
+        orion_core::CompletedImport::from_enrollment(outcome, notices),
+        sealed,
+    ))
 }
 
 /// Decodes a document chosen by the user without persisting it.
@@ -353,7 +352,7 @@ pub(crate) async fn import_profile_path(
     finish_import(&state, imported).await.map(Some)
 }
 
-/// Seals the identity, completes the draft, and reports both fates.
+/// Completes the draft and reports what became of it.
 ///
 /// Shared by the two import paths on purpose: the file picker and the system
 /// association must not differ by one gesture — a document that seals its
@@ -363,66 +362,30 @@ async fn finish_import(
     state: &State<'_, AppState>,
     imported: orion_core::ProfileImport,
 ) -> Result<ImportOutcome, String> {
-    // Read before the bundle is consumed by sealing: it is the certificate
-    // that says which key was admitted.
-    let admitted = imported.admitted_public_key();
-    let (identity_sealed, identity_error) = seal_identity(imported.identity);
+    if let Some(document) = &imported.enrollment {
+        let (completed, identity_sealed) =
+            complete_signed_document(document, imported.profile, imported.notices)?;
+        return Ok(stage_import(state, completed, identity_sealed).await);
+    }
     let mut completed = {
         let config = state.config.lock().await;
-        complete_profile_import(
-            imported.profile,
-            &config,
-            admitted.as_deref(),
-            imported.notices,
-        )
-        .map_err(|error| error.to_string())?
+        complete_profile_import(imported.profile, &config, imported.notices)
+            .map_err(|error| error.to_string())?
     };
 
     // The staged key is the missing candidate.
     //
-    // `complete_profile_import` looks for the admitted key among **saved**
-    // profiles, which is exactly where a key generated three minutes ago is
-    // not: it sits in the staging slot, waiting for a save that cannot happen
-    // until this import completes. That circle broke the normal enrolment
-    // order — generate, hand the public half over, receive an invitation,
-    // import it — and left the user with "aucun profil de ce poste ne détient
-    // la clé admise" naming the very key they had just produced.
+    // `complete_profile_import` looks among **saved** profiles, which is
+    // exactly where a key generated three minutes ago is not: it sits in the
+    // staging slot, waiting for a save that cannot happen until this import
+    // completes. The staged key is the one the user just obtained for this
+    // very purpose, so adopting it is what they meant.
     if completed.profile.private_key.is_empty() {
-        let mut slot = state.staged_key.lock().await;
-        match (slot.as_ref(), admitted.as_deref()) {
-            // The document names the admitted key: pair on it, never on the
-            // profile name. A key that was not admitted would hand the user a
-            // profile whose handshakes fail with nothing to explain them.
-            (Some(staged), Some(admitted)) if staged.public_key == admitted => {
-                if let Some(staged) = slot.take() {
-                    // Transfer an explicit zeroizing copy into the completed
-                    // import; `staged` is dropped immediately afterwards.
-                    completed.profile.private_key = staged.private_key.duplicate();
-                    completed.private_key_missing = None;
-                }
-            }
-            // A key is waiting, and it is **not** the admitted one. Saying so
-            // beats the generic "no key of this machine matches": the user is
-            // holding a key they believe is the right one, and the useful fact
-            // is that the operator admitted a different one.
-            (Some(staged), Some(admitted)) => {
-                completed.private_key_missing = Some(format!(
-                    "la clé générée sur ce poste — « {} » — n'est pas celle que ce document \
-                     déclare admise — « {admitted} ». Faire admettre la première par \
-                     l'opérateur, ou importer la moitié privée de la seconde.",
-                    staged.public_key
-                ));
-            }
-            // No certificate to compare against. The staged key is the one the
-            // user just obtained for this very purpose, so adopting it is what
-            // they meant.
-            (Some(_), None) => {
-                if let Some(staged) = slot.take() {
-                    completed.profile.private_key = staged.private_key.duplicate();
-                    completed.private_key_missing = None;
-                }
-            }
-            (None, _) => {}
+        if let Some(staged) = state.staged_key.lock().await.take() {
+            // Transfer an explicit zeroizing copy into the completed import;
+            // `staged` is dropped immediately afterwards.
+            completed.profile.private_key = staged.private_key.duplicate();
+            completed.private_key_missing = None;
         }
     }
 
@@ -438,7 +401,15 @@ async fn finish_import(
             ));
         }
     }
+    Ok(stage_import(state, completed, false).await)
+}
 
+/// Keeps the draft's private key in the backend and returns its redacted view.
+async fn stage_import(
+    state: &State<'_, AppState>,
+    completed: orion_core::CompletedImport,
+    identity_sealed: bool,
+) -> ImportOutcome {
     // The draft goes to the screen redacted; its private key stays here until
     // the user saves. Returning it whole is what put a WireGuard private key
     // into the WebView in the first place (ADR-006 §5).
@@ -449,14 +420,13 @@ async fn finish_import(
         .await
         .insert(completed.profile.name.clone(), completed.profile);
 
-    Ok(ImportOutcome {
+    ImportOutcome {
         profile: view,
         identity_sealed,
-        identity_error,
         private_key_missing: completed.private_key_missing,
         incomplete: completed.incomplete,
         notices: completed.notices,
-    })
+    }
 }
 
 /// Public key corresponding to a profile's private key.

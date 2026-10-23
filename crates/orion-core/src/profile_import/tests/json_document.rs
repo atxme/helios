@@ -78,3 +78,55 @@ fn refuses_unknown_json_or_unexpected_field() {
     );
     assert!(parse_profile_import(&unknown_field, "profile.json").is_err());
 }
+
+/// The v1 Helios document carried the client's private keys, or admitted a key
+/// with no proof of possession. Neither exists in v5, and the refusal names the
+/// procedure that replaces it.
+#[test]
+fn a_v1_helios_document_is_refused_with_the_new_procedure_named() {
+    use super::fixtures::{gateway_settings, identity_bundle, CLIENT_PRIVATE, GATEWAY_PUBLIC};
+    use aether::key_negotiation::ProtectionMode;
+
+    let settings = serde_json::to_value(gateway_settings(ProtectionMode::MlKem)).unwrap();
+    let mut with_identity = serde_json::json!({
+        "format": "orion-profile",
+        "version": 1,
+        "profile": {
+            "name": "portable",
+            "type": "helios_key_negotiation",
+            "endpoint": "vpn.example.net:51820",
+            "private_key": CLIENT_PRIVATE,
+            "peer_public_key": GATEWAY_PUBLIC,
+            "key_negotiation": settings,
+        }
+    });
+    let without_identity = with_identity.to_string();
+    with_identity["profile"]["key_negotiation_identity"] = identity_bundle("orion-portable");
+
+    for document in [without_identity, with_identity.to_string()] {
+        let error = format!(
+            "{:#}",
+            parse_profile_import(&document, "portable.orion").expect_err("refused")
+        );
+        assert!(error.contains("invitation d'enrôlement"), "{error}");
+    }
+}
+
+#[test]
+fn a_v1_classic_document_still_imports() {
+    let document = serde_json::json!({
+        "format": "orion-profile",
+        "version": 1,
+        "profile": {
+            "name": "portable",
+            "type": "classic",
+            "endpoint": "vpn.example.net:51820",
+            "private_key": super::fixtures::CLIENT_PRIVATE,
+            "peer_public_key": super::fixtures::GATEWAY_PUBLIC,
+            "address": "100.64.1.2/32",
+        }
+    });
+    let imported = parse_profile_import(&document.to_string(), "portable.orion").expect("classic");
+    assert!(imported.enrollment.is_none());
+    assert!(imported.profile.key_negotiation.is_none());
+}

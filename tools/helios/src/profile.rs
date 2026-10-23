@@ -252,22 +252,20 @@ fn render_check(ui: &Ui, path: &Path, imported: &orion_core::ProfileImport) -> S
         ),
     });
     // What the import does with an absent private key is the question most
-    // asked of this command: the admitted key names the local profile it
-    // completes, to compare with what Orion shows as "Your public key".
-    out.push_str(&match (
-        profile.private_key.is_empty(),
-        imported.admitted_public_key(),
-    ) {
-        (false, _) => ui.field("Private key", "included"),
-        (true, Some(admitted)) => ui.field(
-            "Private key",
-            &format!("absent — Orion takes it from the local profile holding key {admitted}"),
-        ),
-        (true, None) => ui.field(
-            "Private key",
-            "absent — Orion takes it from the local profile of the same name",
-        ),
-    });
+    // asked of this command.
+    out.push_str(
+        &match (profile.private_key.is_empty(), &imported.enrollment) {
+            (false, _) => ui.field("Private key", "included"),
+            (true, Some(_)) => ui.field(
+                "Private key",
+                "absent — Orion takes it from the enrollment request pending on the client",
+            ),
+            (true, None) => ui.field(
+                "Private key",
+                "absent — Orion takes it from the local profile of the same name",
+            ),
+        },
+    );
     match &profile.key_negotiation {
         Some(settings) => {
             out.push_str(&ui.field(
@@ -288,14 +286,21 @@ fn render_check(ui: &Ui, path: &Path, imported: &orion_core::ProfileImport) -> S
         }
         None => out.push_str(&ui.field_toned("Negotiation", "none (legacy path)", Tone::Warn)),
     }
-    out.push_str(&if imported.identity.is_some() {
-        ui.field_toned(
-            "Bundled id",
-            "yes — sealed on import; destroy the file afterwards",
-            Tone::Warn,
-        )
-    } else {
-        ui.field("Bundled id", "no")
+    out.push_str(&match &imported.enrollment {
+        Some(document) => ui.field(
+            "Signed",
+            &format!(
+                "v5 · request {} · CA-PQ {} · {}",
+                document.request_id,
+                document.operator_ca_fingerprint,
+                if document.operator_signature.is_some() {
+                    "verified by Orion against the CA the client pinned"
+                } else {
+                    "draft, not signed yet"
+                }
+            ),
+        ),
+        None => ui.field("Signed", "no — classic v1 document"),
     });
     out
 }
@@ -644,7 +649,7 @@ mod tests {
                 imported.profile.private_key.is_empty(),
                 private_key.is_none()
             );
-            assert!(imported.identity.is_none(), "emit ships no secret");
+            assert!(imported.enrollment.is_none(), "emit ships no secret");
             assert_eq!(
                 imported.profile.profile_type,
                 Some(ProfileKind::Classic),
@@ -737,10 +742,6 @@ mod tests {
         // The pinned certificate must verify against the gateway key the
         // profile talks to — that check is the whole reason it is shipped.
         assert!(settings.gateway_pq_fingerprint().is_some());
-        assert_eq!(
-            imported.identity.expect("identity shipped").identity,
-            "orion-portable"
-        );
         // A split tunnel stated by the operator reaches the client through the
         // document. Without this field it did not: every user had to retype
         // the prefixes into the Advanced panel, and a fleet ended up with as

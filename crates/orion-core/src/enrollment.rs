@@ -17,16 +17,19 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-use aether::certificates::encoding::{Fingerprint, Id16, MlDsa87Signature};
+use aether::certificates::encoding::{Fingerprint, Id16, MlDsa87PublicKey, MlDsa87Signature};
 use aether::key_negotiation::{
-    decode_invitation_file, encode_request_file, wireguard_proof, EnrollmentInvitation,
-    EnrollmentRequest, ENROLLMENT_FORMAT_VERSION, ENROLLMENT_PROTOCOL_VERSION,
+    decode_invitation_file, encode_request_file, wireguard_proof, EnrollmentDocument,
+    EnrollmentInvitation, EnrollmentRequest, PqCertificate, PqCertificateRole,
+    ENROLLMENT_FORMAT_VERSION, ENROLLMENT_PROTOCOL_VERSION,
 };
 use aether::{secret::json::SecretJson, SecretString};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 
-use crate::ProtectedIdentityStore;
+use crate::{ClientIdentityBundle, ClientProfile, IdentityStoreError, ProtectedIdentityStore};
 
+/// Prefix of the identity an enrollment seals.
+const IDENTITY_PREFIX: &str = "enrollment-";
 /// Prefix of a pending enrollment's sealed record.
 const PENDING_PREFIX: &str = "pending-enrollment-";
 /// Version of the sealed pending record.
@@ -200,6 +203,14 @@ fn pending_name(request_id: &Id16) -> String {
     format!("{PENDING_PREFIX}{}", request_id.to_hex())
 }
 
+/// Name of the identity sealed for the request `request_id`.
+///
+/// Derived from the request rather than chosen by the operator: the document
+/// names no identity, and two enrollments of one machine never collide.
+pub(crate) fn identity_name(request_id: &Id16) -> String {
+    format!("{IDENTITY_PREFIX}{}", request_id.to_hex())
+}
+
 /// Builds the request once the user has confirmed the `CA-PQ` fingerprint.
 ///
 /// The order is §15.2's: confirmation first, then the invitation's signature
@@ -319,6 +330,233 @@ pub fn pending_enrollments(store: &ProtectedIdentityStore) -> Result<Vec<Pending
 /// Abandons a pending enrollment: its three private keys are destroyed.
 pub fn discard_enrollment(store: &ProtectedIdentityStore, request_id: &Id16) -> Result<()> {
     store.remove_named(&pending_name(request_id))
+}
+
+/// Opens one pending enrollment, private keys included.
+pub(crate) fn open_pending(
+    store: &ProtectedIdentityStore,
+    request_id: &Id16,
+) -> Result<PendingSecrets> {
+    let secrets = PendingSecrets::decode(&store.open_named(&pending_name(request_id))?)?;
+    if &secrets.request.request_id != request_id {
+        bail!("la demande en attente {request_id} a été altérée");
+    }
+    Ok(secrets)
+}
+
+/// What importing a signed document did.
+#[derive(Debug)]
+pub enum EnrollmentOutcome {
+    /// The identity is sealed, the pending record destroyed, and the profile
+    /// carries the WireGuard private key generated with the request.
+    Completed { profile: ClientProfile },
+    /// No pending enrollment on this machine answers the document. The
+    /// profile is a draft with no private key; `expected` says which key the
+    /// document was issued for.
+    Unmatched {
+        profile: ClientProfile,
+        expected: String,
+    },
+}
+
+/// The pure half of [`complete_enrollment`]: every check of §15.3, and the
+/// identity it yields. Nothing is written.
+#[derive(Debug)]
+pub(crate) enum DocumentMatch {
+    Matched {
+        profile: ClientProfile,
+        bundle: ClientIdentityBundle,
+    },
+    Unmatched {
+        profile: ClientProfile,
+        expected: String,
+    },
+}
+
+fn decode_pq_leaf(value: &str) -> Result<PqCertificate> {
+    let json = STANDARD
+        .decode(value.trim())
+        .context("feuille PQ du document : base64 illisible")?;
+    serde_json::from_slice(&json).context("feuille PQ du document illisible")
+}
+
+/// Checks a signed document against the pending enrollment it answers, in
+/// the order of NEGOCIATION-DE-CLE-V5 §15.3.
+///
+/// The `CA-PQ` key is the one pinned when the user confirmed the invitation,
+/// never the one the document names. Every mismatch is refused before
+/// anything is sealed, and names both values.
+pub(crate) fn match_document(
+    pending: Option<&PendingSecrets>,
+    document: &EnrollmentDocument,
+    mut profile: ClientProfile,
+    now_unix: u64,
+) -> Result<DocumentMatch> {
+    let client_leaf = decode_pq_leaf(&document.client_pq_certificate)?;
+    let Some(pending) = pending else {
+        // Not trusted, and not trustable: the key that would verify it is
+        // exactly what this machine does not hold. The draft has no private
+        // key and cannot connect.
+        return Ok(DocumentMatch::Unmatched {
+            expected: format!(
+                "aucune demande d'enrôlement en attente sur ce poste ne correspond à ce document \
+                 (clé WireGuard certifiée « {} ») : il a été préparé pour un autre poste, ou la \
+                 demande a été abandonnée",
+                client_leaf.wireguard_public_key
+            ),
+            profile,
+        });
+    };
+    let invitation = &pending.invitation;
+    let request = &pending.request;
+    let pinned = &invitation.operator_ca_public_key;
+
+    if document.operator_ca_fingerprint != pinned.authority_fingerprint() {
+        bail!(
+            "document signé sous la CA-PQ {}, alors que l'invitation confirmée épingle {}",
+            format_fingerprint(&document.operator_ca_fingerprint),
+            format_fingerprint(&pinned.authority_fingerprint())
+        );
+    }
+    if document.invitation_id != invitation.invitation_id
+        || document.request_id != request.request_id
+    {
+        bail!(
+            "le document répond à l'invitation {} / demande {}, pas à {} / {}",
+            document.invitation_id,
+            document.request_id,
+            invitation.invitation_id,
+            request.request_id
+        );
+    }
+    document
+        .verify(pinned)
+        .map_err(|error| anyhow::anyhow!("signature du document refusée : {error}"))?;
+    if document.request_fingerprint != request.fingerprint() {
+        bail!(
+            "le document certifie la demande {}, alors que celle de ce poste est {}",
+            document.request_fingerprint,
+            request.fingerprint()
+        );
+    }
+    aether::certificates::x509::assert_csr_matches(
+        &request.tls_csr,
+        &document.client_tls_certificate,
+    )
+    .map_err(|error| {
+        anyhow::anyhow!("la feuille TLS ne certifie pas la clé de ce poste : {error}")
+    })?;
+    client_leaf
+        .verify(
+            pinned.as_bytes(),
+            PqCertificateRole::Client,
+            Some(&request.requested_name),
+            &request.client_wg_public_key.to_base64(),
+            now_unix,
+        )
+        .map_err(|error| anyhow::anyhow!("feuille PQ cliente refusée : {error}"))?;
+    let local_ml_dsa = request.client_ml_dsa_87_public_key.to_base64();
+    if client_leaf.ml_dsa_87_public_key != local_ml_dsa {
+        bail!(
+            "la feuille PQ certifie la clé ML-DSA {}, alors que celle de ce poste est {local_ml_dsa}",
+            client_leaf.ml_dsa_87_public_key
+        );
+    }
+
+    let gateway_key = invitation.gateway_wg_public_key.to_base64();
+    if profile.peer_public_key.trim() != gateway_key {
+        bail!(
+            "le profil désigne la gateway {}, alors que l'invitation confirmée nomme {gateway_key}",
+            profile.peer_public_key
+        );
+    }
+    let settings = profile
+        .key_negotiation
+        .as_mut()
+        .context("un document signé porte toujours un bloc de négociation de clé")?;
+    if settings.server_name.trim() != invitation.server_name {
+        bail!(
+            "le profil désigne le serveur « {} », alors que l'invitation confirmée nomme « {} »",
+            settings.server_name,
+            invitation.server_name
+        );
+    }
+    let gateway_leaf = aether::certificates::gateway::pq_certificate_fingerprint(
+        &settings.gateway_pq_certificate()?,
+    )?;
+    if gateway_leaf != invitation.gateway_certificate_fingerprint {
+        bail!(
+            "le profil épingle la feuille gateway {gateway_leaf}, alors que l'invitation confirmée \
+             nomme {}",
+            invitation.gateway_certificate_fingerprint
+        );
+    }
+    let trust_ca = settings
+        .trust
+        .as_ref()
+        .context("un document signé porte toujours son matériel de confiance")
+        .and_then(|trust| {
+            MlDsa87PublicKey::parse(&trust.ca_pq_public_key)
+                .context("clé CA-PQ du matériel de confiance illisible")
+        })?;
+    if &trust_ca != pinned {
+        bail!(
+            "le matériel de confiance épingle la CA-PQ {}, alors que l'invitation confirmée nomme {}",
+            format_fingerprint(&trust_ca.authority_fingerprint()),
+            format_fingerprint(&pinned.authority_fingerprint())
+        );
+    }
+
+    let name = identity_name(&request.request_id);
+    settings.identity = name.clone();
+    profile.private_key = pending.wg_private_key.duplicate();
+    let bundle = ClientIdentityBundle {
+        identity: name,
+        certificate_chain: vec![document.client_tls_certificate.to_base64()],
+        private_key: STANDARD
+            .encode(pending.tls_private_key_der.as_slice())
+            .into(),
+        pq_certificate: document.client_pq_certificate.clone(),
+        pq_private_key: STANDARD
+            .encode(pending.ml_dsa_private_key.as_slice())
+            .into(),
+    };
+    Ok(DocumentMatch::Matched { profile, bundle })
+}
+
+/// Completes an enrollment from its signed document.
+///
+/// The identity is sealed first and the pending record destroyed after: a
+/// failure in between leaves the keys where they were, and the same document
+/// can be imported again.
+pub fn complete_enrollment(
+    store: &ProtectedIdentityStore,
+    document: &EnrollmentDocument,
+    profile: ClientProfile,
+    now_unix: u64,
+) -> Result<EnrollmentOutcome> {
+    let pending = match open_pending(store, &document.request_id) {
+        Ok(pending) => Some(pending),
+        Err(error)
+            if matches!(
+                error.downcast_ref::<IdentityStoreError>(),
+                Some(IdentityStoreError::NotFound(_))
+            ) =>
+        {
+            None
+        }
+        Err(error) => return Err(error),
+    };
+    match match_document(pending.as_ref(), document, profile, now_unix)? {
+        DocumentMatch::Unmatched { profile, expected } => {
+            Ok(EnrollmentOutcome::Unmatched { profile, expected })
+        }
+        DocumentMatch::Matched { profile, bundle } => {
+            store.store(&bundle)?;
+            discard_enrollment(store, &document.request_id)?;
+            Ok(EnrollmentOutcome::Completed { profile })
+        }
+    }
 }
 
 #[cfg(test)]

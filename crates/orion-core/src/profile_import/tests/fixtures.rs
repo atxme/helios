@@ -1,5 +1,6 @@
-//! Shared constructors for the `orion-profile` v1 documents and profiles
-//! the import tests are written against.
+//! Shared constructors for the `orion-profile` documents and profiles the
+//! import tests are written against: v1 for a classic profile, the v5
+//! envelope for a Helios one.
 
 use aether::key_negotiation::ProtectionMode;
 use base64::Engine as _;
@@ -38,9 +39,8 @@ pub(super) fn complete_profile() -> ClientProfile {
     }
 }
 
-/// Gateway material as the operator distributes it: public certificate,
-/// public CA, and the name of the protected store entry — never the
-/// client's own private key.
+/// Gateway material as the operator distributes it: public certificate and
+/// public CA. The identity is named by the machine, never by the document.
 pub(super) fn gateway_settings(mode: ProtectionMode) -> KeyNegotiationSettings {
     use aether::key_negotiation::{
         generate_ml_dsa_87_keypair, issue_pq_certificate, PqCertificate, PqCertificateRole,
@@ -77,43 +77,73 @@ pub(super) fn gateway_settings(mode: ProtectionMode) -> KeyNegotiationSettings {
         server_name: "vpn.example.net".into(),
         gateway_ca_der: STANDARD.encode([0x30, 0x82, 0x01, 0x00]),
         gateway_pq_certificate: STANDARD.encode(serde_json::to_vec(&certificate).unwrap()),
+        // What the import names the identity, read by the tests that build a
+        // profile directly; a document never carries it.
         identity: "orion-portable".into(),
         trust: None,
     }
 }
 
-pub(super) fn document_with(settings: serde_json::Value) -> String {
+/// The settings as a v5 profile writes them: without the identity name.
+fn block_value(settings: serde_json::Value) -> serde_json::Value {
+    let mut settings = settings;
+    if let Some(block) = settings.as_object_mut() {
+        block.remove("identity");
+    }
+    settings
+}
+
+/// An unsigned v5 envelope around `profile`.
+///
+/// Parsing does not verify the signature — only the completion against a
+/// pending enrollment can — so the field rules are exercised without one.
+pub(super) fn v5_document(profile: serde_json::Value) -> String {
+    use base64::engine::general_purpose::STANDARD;
+
     serde_json::json!({
         "format": PROFILE_IMPORT_FORMAT,
-        "version": PROFILE_IMPORT_VERSION,
-        "profile": {
-            "name": "portable",
-            "endpoint": "vpn.example.net:51820",
-            "private_key": CLIENT_PRIVATE,
-            "peer_public_key": GATEWAY_PUBLIC,
-            "address": "100.64.1.2/32",
-            "key_negotiation": settings,
-        }
+        "format_version": aether::key_negotiation::ENROLLMENT_DOCUMENT_VERSION,
+        "invitation_id": "01".repeat(16),
+        "request_id": "02".repeat(16),
+        "request_fingerprint": "03".repeat(32),
+        "operator_ca_fingerprint": "04".repeat(32),
+        "issued_at_unix": 1_800_000_000u64,
+        "profile": profile,
+        "client_tls_certificate": STANDARD.encode([0x30, 0x82, 0x01, 0x00]),
+        "client_pq_certificate": STANDARD.encode(br#"{"version":1}"#),
     })
     .to_string()
 }
 
-/// A document declaring its kind, with or without a negotiation block.
+pub(super) fn document_with(settings: serde_json::Value) -> String {
+    v5_document(serde_json::json!({
+        "name": "portable",
+        "endpoint": "vpn.example.net:51820",
+        "peer_public_key": GATEWAY_PUBLIC,
+        "address": "100.64.1.2/32",
+        "key_negotiation": block_value(settings),
+    }))
+}
+
+/// A document declaring its kind, with or without a negotiation block: v5
+/// when it is Helios by either sign, v1 otherwise.
 pub(super) fn document_of_kind(kind: &str, settings: Option<serde_json::Value>) -> String {
+    let helios = kind == "helios_key_negotiation" || settings.is_some();
     let mut profile = serde_json::json!({
         "name": "portable",
         "endpoint": "vpn.example.net:51820",
-        "private_key": CLIENT_PRIVATE,
         "peer_public_key": GATEWAY_PUBLIC,
         "address": "100.64.1.2/32",
         "type": kind,
     });
+    let object = profile.as_object_mut().unwrap();
     if let Some(settings) = settings {
-        profile
-            .as_object_mut()
-            .unwrap()
-            .insert("key_negotiation".into(), settings);
+        object.insert("key_negotiation".into(), block_value(settings));
     }
+    if helios {
+        return v5_document(profile);
+    }
+    object.insert("private_key".into(), CLIENT_PRIVATE.into());
     serde_json::json!({
         "format": PROFILE_IMPORT_FORMAT,
         "version": PROFILE_IMPORT_VERSION,
