@@ -152,24 +152,13 @@ pub fn recover_expired_identity(
     let operator_approval_fingerprint = evidence.fingerprint()?;
 
     let authorization = with_anchors(vault, &opening, |secrets| {
-        let tls_key_der = decode(&secrets.ca_tls_private_key, "clé privée CA-TLS")?;
-        let tls_key = KeyPair::try_from(tls_key_der.as_slice())
-            .map_err(|error| GestureError::Anchors(format!("clé privée CA-TLS : {error}")))?;
-        let mut csr = CertificateSigningRequestParams::from_der(&request.tls_csr.as_bytes().into())
-            .map_err(|error| {
-                GestureError::Anchors(format!("demande PKCS#10 illisible : {error}"))
-            })?;
-        // The period is the issuer's decision. Left alone the leaf silently
-        // takes the library's default window and stops matching the generation
-        // it belongs to.
-        csr.params.not_before = to_offset_date_time(validity.0)?;
-        csr.params.not_after = to_offset_date_time(validity.1)?;
-        let issuer = Issuer::from_ca_cert_der(&ca_tls_certificate.as_bytes().into(), &tls_key)
-            .map_err(|error| GestureError::Anchors(format!("CA-TLS illisible : {error}")))?;
-        let signed = csr.signed_by(&issuer).map_err(|error| {
-            GestureError::Anchors(format!("signature de la feuille TLS : {error}"))
-        })?;
-        let tls_leaf = DerCertificate::new(signed.der().to_vec())?;
+        let tls_leaf = issue_tls_leaf(
+            secrets,
+            ca_tls_certificate,
+            &request.tls_csr,
+            validity,
+            |_| {},
+        )?;
 
         let ca_pq_private_key = decode(&secrets.ca_pq_private_key, "clé privée CA-PQ")?;
         let pq_leaf = aether::key_negotiation::issue_pq_certificate(

@@ -36,9 +36,14 @@ const MAX_RECORD_BYTES: u64 = 64 * 1024;
 pub enum InvitationState {
     Issued,
     Consumed {
+        request_id: Id16,
         request_fingerprint: Fingerprint,
         client_wg_public_key: WireGuardKey,
         consumed_at_unix: u64,
+        /// The leaves issued for this request, once they exist. A document is
+        /// signed only around these.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        issued: Option<IssuedLeafFingerprints>,
     },
     Revoked {
         at_unix: u64,
@@ -58,6 +63,14 @@ impl InvitationState {
             Self::Expired { .. } => "expirée",
         }
     }
+}
+
+/// The two leaves an accepted request received.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IssuedLeafFingerprints {
+    pub tls_certificate: Fingerprint,
+    pub pq_certificate: Fingerprint,
 }
 
 /// An invitation and its state. Carries no secret.
@@ -262,9 +275,11 @@ impl InvitationRegistry {
             &RecordFile {
                 invitation: invitation.clone(),
                 state: InvitationState::Consumed {
+                    request_id: request.request_id,
                     request_fingerprint,
                     client_wg_public_key: request.client_wg_public_key,
                     consumed_at_unix: now_unix,
+                    issued: None,
                 },
                 proof_private_key: None,
             },
@@ -273,6 +288,25 @@ impl InvitationRegistry {
             invitation,
             request_fingerprint,
         })
+    }
+
+    /// Records the leaves issued for a consumed invitation. Once.
+    pub fn record_issued(&self, id: &Id16, leaves: IssuedLeafFingerprints) -> Result<()> {
+        let _lock = ConsumptionLock::take(self, id)?;
+        let mut record = self.read(id)?;
+        match &mut record.state {
+            InvitationState::Consumed { issued, .. } if issued.is_none() => {
+                *issued = Some(leaves);
+            }
+            InvitationState::Consumed { .. } => {
+                bail!("des feuilles ont déjà été émises pour l'invitation {id}")
+            }
+            other => bail!(
+                "l'invitation {id} est {} : aucune feuille ne peut lui être rattachée",
+                other.label()
+            ),
+        }
+        self.write(id, &record)
     }
 
     /// Revokes an invitation that has not been consumed.

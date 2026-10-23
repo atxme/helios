@@ -41,6 +41,19 @@ pub fn require_scope_credentials(
             "la portée {scope:?} exige {required} credentials actifs distincts"
         )));
     }
+    require_distinct_credentials(required, openings)
+}
+
+/// Exactly `required` openings, each from a different credential.
+///
+/// The rule behind [`require_scope_credentials`], for the gestures that run
+/// outside any campaign — enrollment among them (ADR-008 §4).
+pub fn require_distinct_credentials(required: usize, openings: &[&Opened]) -> Result<()> {
+    if openings.len() != required {
+        return Err(GestureError::Anchors(format!(
+            "ce geste exige {required} credential(s) actif(s) distinct(s)"
+        )));
+    }
     for (index, opening) in openings.iter().enumerate() {
         if openings[..index]
             .iter()

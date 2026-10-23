@@ -191,10 +191,41 @@ fn with_anchors<T>(
     outcome
 }
 
+/// Signs a client TLS leaf on a PKCS#10 request, under `CA-TLS`.
+///
+/// `shape` lets a gesture override what the request asked for before the
+/// issuer signs it; the validity period is always the issuer's.
+fn issue_tls_leaf(
+    secrets: &AuthoritySecrets,
+    ca_tls_certificate: &DerCertificate,
+    csr: &DerCertificate,
+    validity: (u64, u64),
+    shape: impl FnOnce(&mut CertificateParams),
+) -> Result<DerCertificate> {
+    let tls_key_der = decode(&secrets.ca_tls_private_key, "clé privée CA-TLS")?;
+    let tls_key = KeyPair::try_from(tls_key_der.as_slice())
+        .map_err(|error| GestureError::Anchors(format!("clé privée CA-TLS : {error}")))?;
+    let mut request = CertificateSigningRequestParams::from_der(&csr.as_bytes().into())
+        .map_err(|error| GestureError::Anchors(format!("demande PKCS#10 illisible : {error}")))?;
+    shape(&mut request.params);
+    // The period is the issuer's decision. Left alone the leaf silently takes
+    // the library's default window and stops matching the generation it
+    // belongs to.
+    request.params.not_before = to_offset_date_time(validity.0)?;
+    request.params.not_after = to_offset_date_time(validity.1)?;
+    let issuer = Issuer::from_ca_cert_der(&ca_tls_certificate.as_bytes().into(), &tls_key)
+        .map_err(|error| GestureError::Anchors(format!("CA-TLS illisible : {error}")))?;
+    let signed = request
+        .signed_by(&issuer)
+        .map_err(|error| GestureError::Anchors(format!("signature de la feuille TLS : {error}")))?;
+    Ok(DerCertificate::new(signed.der().to_vec())?)
+}
+
 mod anchor;
 mod bindings;
 mod ca_tls;
 mod campaign;
+mod enrollment;
 mod gateway;
 mod issuer;
 mod recovery;
@@ -204,6 +235,10 @@ pub use anchor::{rotate_ca_pq, RotatedAnchor};
 pub use bindings::sign_credential_bindings;
 pub use ca_tls::{advance_ca_tls, issue_ca_tls, rotate_ca_tls, RotatedClientTlsCa};
 pub use campaign::{approve_campaign, CampaignApprovalSession};
+pub use enrollment::{
+    accept_request, enrollment_credentials, sign_document, sign_invitation, InvitationDraft,
+    IssuedLeaves,
+};
 pub use gateway::{
     issue_gateway_bootstrap_certificate, sign_gateway_abort, sign_gateway_transition,
     sign_service_rollback, GatewayAbortDecision, GatewayBootstrapDecision,
