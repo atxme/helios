@@ -24,10 +24,13 @@ use unicode_normalization::UnicodeNormalization as _;
 use zeroize::Zeroizing;
 
 use super::ProtectionMode;
+
+mod document;
 use crate::certificates::encoding::{
     verify_ml_dsa_87, CanonicalBytes, DerCertificate, Fingerprint, Id16, MlDsa87PublicKey,
     MlDsa87Signature, WireGuardKey,
 };
+pub use document::*;
 
 /// Version of the invitation and request formats.
 pub const ENROLLMENT_FORMAT_VERSION: u16 = 1;

@@ -412,3 +412,196 @@ fn a_duplicated_member_is_refused() {
     assert_ne!(duplicated, text, "the fixture must contain the member");
     assert!(decode_invitation_file(&duplicated).is_err());
 }
+
+fn unsigned_document(operator: &Operator, profile: serde_json::Value) -> EnrollmentDocument {
+    let serde_json::Value::Object(profile) = profile else {
+        panic!("profile fixture must be an object");
+    };
+    EnrollmentDocument {
+        format: ENROLLMENT_DOCUMENT_FORMAT.into(),
+        format_version: ENROLLMENT_DOCUMENT_VERSION,
+        invitation_id: Id16::new([1; 16]).expect("id"),
+        request_id: Id16::new([9; 16]).expect("id"),
+        request_fingerprint: Fingerprint::from_bytes([7; 32]),
+        operator_ca_fingerprint: operator.ca_public.authority_fingerprint(),
+        issued_at_unix: NOW,
+        profile,
+        client_tls_certificate: DerCertificate::new(vec![0x30, 0x03, 0x02, 0x01, 0x01])
+            .expect("der"),
+        client_pq_certificate: "{\"version\":2}".into(),
+        operator_signature: None,
+    }
+}
+
+impl EnrollmentDocument {
+    fn compact(&self) -> String {
+        serde_json::to_string(self).expect("json")
+    }
+}
+
+fn profile_fixture() -> serde_json::Value {
+    serde_json::json!({
+        "name": "laptop-alice",
+        "type": "helios_key_negotiation",
+        "endpoint": "vpn.example.net:51820",
+        "persistent_keepalive": 25,
+    })
+}
+
+#[test]
+fn a_document_signs_and_verifies_after_key_reordering() {
+    let operator = operator();
+    let document = unsigned_document(&operator, profile_fixture())
+        .sign(&operator.ca_private)
+        .expect("signed");
+    let text = document.to_json().expect("json");
+
+    // Same members, another order and another layout.
+    let value: serde_json::Value = serde_json::from_str(&text).expect("json");
+    let serde_json::Value::Object(members) = value else {
+        panic!("object");
+    };
+    let mut reordered = String::from("{\n");
+    let mut entries: Vec<_> = members.into_iter().collect();
+    entries.reverse();
+    let last = entries.len() - 1;
+    for (index, (key, value)) in entries.into_iter().enumerate() {
+        let separator = if index == last { "" } else { "," };
+        reordered.push_str(&format!("  {key:?} :  {value}{separator}\n"));
+    }
+    reordered.push('}');
+
+    let reparsed = EnrollmentDocument::parse(&reordered).expect("parse");
+    reparsed.verify(&operator.ca_public).expect("verifies");
+}
+
+#[test]
+fn any_byte_change_in_the_profile_invalidates_the_signature() {
+    let operator = operator();
+    let mut document = unsigned_document(&operator, profile_fixture())
+        .sign(&operator.ca_private)
+        .expect("signed");
+    document
+        .profile
+        .insert("name".into(), serde_json::json!("laptop-mallory"));
+    assert!(matches!(
+        document.verify(&operator.ca_public),
+        Err(EnrollmentError::Signature)
+    ));
+}
+
+#[test]
+fn an_unsigned_document_does_not_verify() {
+    let operator = operator();
+    let document = unsigned_document(&operator, profile_fixture());
+    assert!(matches!(
+        document.verify(&operator.ca_public),
+        Err(EnrollmentError::Signature)
+    ));
+}
+
+#[test]
+fn a_duplicate_field_is_refused() {
+    let operator = operator();
+    let text = unsigned_document(&operator, profile_fixture())
+        .sign(&operator.ca_private)
+        .expect("signed")
+        .compact();
+    let request_id = format!("\"request_id\":\"{}\"", "09".repeat(16));
+    let top = text.replacen(&request_id, &format!("{request_id},{request_id}"), 1);
+    assert!(top != text, "the fixture must contain the member");
+    assert!(EnrollmentDocument::parse(&top).is_err());
+
+    let name = "\"name\":\"laptop-alice\"";
+    let nested = text.replacen(name, &format!("{name},\"name\":\"laptop-mallory\""), 1);
+    assert!(nested != text, "the fixture must contain the member");
+    assert!(EnrollmentDocument::parse(&nested).is_err());
+}
+
+#[test]
+fn a_float_anywhere_is_refused() {
+    let operator = operator();
+    let mut profile = profile_fixture();
+    profile["persistent_keepalive"] = serde_json::json!(25.5);
+    let text = serde_json::to_string(&unsigned_document(&operator, serde_json::json!({})))
+        .expect("json")
+        .replace("\"profile\":{}", &format!("\"profile\":{profile}"));
+    assert!(EnrollmentDocument::parse(&text).is_err());
+
+    let mut deep = profile_fixture();
+    deep["key_negotiation"] = serde_json::json!({ "trust": { "epoch": 1e3 } });
+    let text = serde_json::to_string(&unsigned_document(&operator, serde_json::json!({})))
+        .expect("json")
+        .replace("\"profile\":{}", &format!("\"profile\":{deep}"));
+    assert!(EnrollmentDocument::parse(&text).is_err());
+}
+
+#[test]
+fn an_integer_beyond_two_to_the_53_is_refused() {
+    let operator = operator();
+    let text = serde_json::to_string(&unsigned_document(&operator, serde_json::json!({})))
+        .expect("json")
+        .replace("\"profile\":{}", "\"profile\":{\"n\":9007199254740993}");
+    assert!(EnrollmentDocument::parse(&text).is_err());
+}
+
+#[test]
+fn a_document_under_an_unpinned_ca_is_refused() {
+    let operator = operator();
+    let document = unsigned_document(&operator, profile_fixture())
+        .sign(&operator.ca_private)
+        .expect("signed");
+    let other = self::operator();
+    assert!(matches!(
+        document.verify(&other.ca_public),
+        Err(EnrollmentError::Binding(_))
+    ));
+}
+
+#[test]
+fn a_document_signed_by_a_key_it_does_not_name_is_refused_at_signing() {
+    let operator = operator();
+    let other = self::operator();
+    let document = unsigned_document(&operator, profile_fixture());
+    assert!(document.sign(&other.ca_private).is_err());
+}
+
+#[test]
+fn a_foreign_format_or_version_is_refused() {
+    let operator = operator();
+    let text = unsigned_document(&operator, profile_fixture())
+        .sign(&operator.ca_private)
+        .expect("signed")
+        .compact();
+    assert!(EnrollmentDocument::parse(&text.replacen(
+        "\"format_version\":5",
+        "\"format_version\":1",
+        1
+    ))
+    .is_err());
+    assert!(
+        EnrollmentDocument::parse(&text.replacen("\"orion-profile\"", "\"other\"", 1)).is_err()
+    );
+    let unknown = text.replacen('{', "{\"extra\":true,", 1);
+    assert!(EnrollmentDocument::parse(&unknown).is_err());
+    EnrollmentDocument::parse(&format!("\u{feff}{text}")).expect("a BOM is accepted");
+}
+
+#[test]
+fn the_canonical_form_matches_rfc8785_ordering() {
+    let operator = operator();
+    let document = unsigned_document(
+        &operator,
+        serde_json::json!({ "b": 1, "a": "\u{e9}\u{2028}" }),
+    );
+    let canonical = String::from_utf8(document.canonical_unsigned().expect("jcs")).expect("utf-8");
+    assert!(canonical.starts_with("{\"client_pq_certificate\":"));
+    assert!(canonical.contains("\"profile\":{\"a\":\"\u{e9}\u{2028}\",\"b\":1}"));
+    assert!(!canonical.contains("operator_signature"));
+    assert!(!canonical.contains(' ') && !canonical.contains('\n'));
+
+    let mut expected = b"helios-key-negotiation-orion-document-v5".to_vec();
+    expected.extend_from_slice(&u32::try_from(canonical.len()).expect("len").to_be_bytes());
+    expected.extend_from_slice(canonical.as_bytes());
+    assert_eq!(document.signed_bytes().expect("signed bytes"), expected);
+}
