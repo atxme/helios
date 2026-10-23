@@ -107,6 +107,100 @@ Les rapports navigables sont écrits dans
 `target/coverage/workspace.json`, ce qui permet de comparer deux campagnes sans
 dépendre d’un répertoire temporaire.
 
+### Audit Rust local et comparaison
+
+Les contrôles complémentaires sont locaux : aucun job ni temps de campagne
+supplémentaire n’est ajouté à la CI. Le pilote Bash/Python 3.9+ POSIX est prévu
+pour Linux et WSL2 ; il exige `cargo-llvm-cov`, `llvm-tools`, `rust-analyzer`
+et `rustfmt` déjà installés. Il ne les installe pas. La collecte utilise le
+cache et le budget de `scripts/wsl-cargo`, sans réseau Cargo (`--frozen`).
+
+Depuis la racine, choisir deux répertoires neufs **hors de l’arbre source** :
+
+```sh
+bash scripts/audit-rust.sh collect --view workspace --output-dir /tmp/helios-audit-global
+bash scripts/audit-rust.sh collect --view libraries --output-dir /tmp/helios-audit-libs
+bash scripts/audit-rust.sh static
+```
+
+Chaque collecte conserve `workspace.json`, `workspace.lcov`, `rust-html/`,
+`metadata.json`, `provenance.json`, `report.json` et `status.json`. Le nom des
+exports bruts est commun ; `view` dans la provenance et le rapport distingue
+les deux vues. `completed` n’est écrit qu’après les tests, les exports et
+l’analyse. Un dossier non vide est refusé, afin de préserver une référence.
+`static` lance Clippy strict et cargo-machete ; aucun audit de vulnérabilité
+réseau ou frontend n’est ajouté implicitement.
+
+L’analyseur conserve séparément les compteurs LLVM bruts, les lignes LCOV et
+la projection des lignes de production hors tests/harnais. Les fichiers,
+manifestes et lockfile sont empreintés ; le contexte de compilation et les
+versions sont consignés. Une source qui change pendant la collecte, un outil
+requis absent ou un profil incomplet empêchent une référence valide.
+
+```sh
+python3 scripts/audit-report.py compare --baseline /tmp/helios-audit-reference/report.json --current /tmp/helios-audit-global/report.json
+```
+
+La comparaison renvoie `0` si les contrôles passent, `1` pour une régression
+ou un seuil explicite non atteint, `2` pour une entrée invalide ou une
+référence non comparable. Un changement de dénominateur exige une revue et
+une nouvelle référence explicite ; il ne devient pas une réussite par défaut.
+Les totaux Linux/Windows, workspace/bibliothèques ou deux versions de
+projection ne se remplacent pas mutuellement. Aucun seuil de 80 % n’est imposé
+avant de l’avoir effectivement atteint.
+
+Les tests de ces scripts sont volontairement hors de `scripts/tests`, que la
+CI collecte déjà. Ils se lancent explicitement sans build Cargo :
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/local-tests -v
+```
+
+### Taille des artefacts livrables
+
+Le contrôle local `scripts/binary-size.py` ne construit, ne strippe et ne
+modifie aucun exécutable. Il reprend la constante canonique
+`helios_update::MAX_BINARY_SIZE` : **128 Mio / 134 217 728 octets**, pour les
+artefacts relevant du contrat update/bundle. Les profils release existants
+conservent LTO thin et strip. Une sortie instrumentée n’est jamais un livrable.
+
+Préparer un dossier contenant exactement les binaires déclarés et un JSON
+**hors de ce dossier**, avec les valeurs réelles du build. Exemple de forme :
+
+```json
+{
+  "version": 1,
+  "revision": "0000000000000000000000000000000000000000",
+  "target": "x86_64-unknown-linux-gnu",
+  "rustc": "version exacte renvoyée par rustc --version lors du build",
+  "profile": "release",
+  "features": ["netlink", "tpm", "wireguard"],
+  "instrumented": false,
+  "stripped": true,
+  "artifacts": [{"path": "heliosd", "contract": "helios-update"}]
+}
+```
+
+Le SHA nul de l’exemple est à remplacer. Cette provenance est une attestation
+du constructeur, pas une preuve que les options ont été déduites du binaire.
+`unbounded` est un contrat explicite pour un exécutable auquel la borne update
+ne s’applique pas ; ne pas l’utiliser pour contourner cette borne sur un
+livrable Helios concerné. Les archives et PDB ne sont pas des exécutables à
+comparer ici.
+
+```sh
+python3 scripts/binary-size.py --artifacts /tmp/helios-release --provenance /tmp/helios-release-provenance.json --output /tmp/helios-sizes.json
+python3 scripts/binary-size.py --artifacts /tmp/helios-release-next --provenance /tmp/helios-release-next-provenance.json --baseline /tmp/helios-sizes.json --output /tmp/helios-sizes-next.json
+```
+
+La sortie doit être un nouveau fichier hors des artefacts et des entrées. Le
+rapport fournit tailles, empreintes et deltas ; la comparaison exige même
+cible, toolchain, profil, features et contrats. Codes : `0` valide, `1` borne
+de taille dépassée, `2` entrée ou comparaison invalide. Une hausse sous la
+borne reste visible sans seuil de croissance arbitraire. Les dépendances et
+fixtures des tests restent hors des binaires livrés. Le budget de **65 Gio du
+cache Cargo** reste une contrainte indépendante.
+
 La CI ne mesure plus la couverture : l'instrumentation et la recompilation
 complète sont trop coûteuses pour les runners disponibles. Le job Windows
 conserve les tests natifs sans instrumentation. Pour mesurer les branches
