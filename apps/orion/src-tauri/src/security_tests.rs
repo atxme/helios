@@ -701,3 +701,59 @@ fn the_deelevating_launcher_checks_before_it_launches() {
         "the token must be checked **before** anything is launched"
     );
 }
+
+/// What the enrollment screen receives carries the public half only.
+///
+/// The pending record holds three private keys; the views built from it, and
+/// the invitation preview, are what crosses the IPC. Checked on the JSON the
+/// WebView actually decodes.
+#[test]
+fn enrollment_commands_never_return_private_material() {
+    use aether::certificates::encoding::{Fingerprint, Id16, MlDsa87Signature, WireGuardKey};
+    use aether::key_negotiation::{
+        encode_invitation_file, generate_ml_dsa_87_keypair, EnrollmentInvitation, ProtectionMode,
+        ENROLLMENT_FORMAT_VERSION, ENROLLMENT_PROTOCOL_VERSION,
+    };
+
+    let (ca_private, ca_public) = generate_ml_dsa_87_keypair().expect("ca");
+    let now = super::now_unix();
+    let invitation = EnrollmentInvitation {
+        format_version: ENROLLMENT_FORMAT_VERSION,
+        protocol_version: ENROLLMENT_PROTOCOL_VERSION,
+        invitation_id: Id16::new([1; 16]).expect("id"),
+        gateway_wg_public_key: WireGuardKey::from_bytes([2; 32]),
+        gateway_certificate_fingerprint: Fingerprint::from_bytes([4; 32]),
+        server_name: "vpn.example.net".into(),
+        operator_ca_public_key: aether::certificates::encoding::MlDsa87PublicKey::new(ca_public)
+            .expect("ca key"),
+        wireguard_proof_public_key: WireGuardKey::from_bytes([5; 32]),
+        not_before_unix: now - 60,
+        not_after_unix: now + 3_600,
+        minimum_mode: ProtectionMode::MlKem,
+        allow_readmission: false,
+        operator_signature: MlDsa87Signature::placeholder(),
+    }
+    .sign(&ca_private)
+    .expect("signed");
+    let token = encode_invitation_file(&invitation);
+    let preview = super::invitation_preview_view(token.as_bytes(), now).expect("preview");
+    assert_eq!(preview.invitation_token, token);
+
+    let pending = orion_core::enrollment::PendingEnrollment {
+        invitation_id: invitation.invitation_id,
+        request_id: Id16::new([6; 16]).expect("id"),
+        requested_name: "poste-windows".into(),
+        server_name: invitation.server_name.clone(),
+        created_at_unix: now,
+        invitation_expires_at_unix: invitation.not_after_unix,
+    };
+    for json in [
+        serde_json::to_value(&preview).expect("preview json"),
+        serde_json::to_value(vec![pending]).expect("pending json"),
+    ] {
+        let text = json.to_string().to_ascii_lowercase();
+        for forbidden in ["private", "secret"] {
+            assert!(!text.contains(forbidden), "{forbidden} in {text}");
+        }
+    }
+}

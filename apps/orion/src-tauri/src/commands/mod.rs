@@ -10,10 +10,12 @@ mod app;
 mod ceremonies;
 mod certificates;
 mod connection;
+mod enrollment;
 mod profiles;
 
 pub(crate) use app::*;
 pub(crate) use ceremonies::*;
 pub(crate) use certificates::*;
 pub(crate) use connection::*;
+pub(crate) use enrollment::*;
 pub(crate) use profiles::*;
