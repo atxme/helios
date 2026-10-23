@@ -408,7 +408,12 @@ pub(crate) fn match_document(
     let Some(pending) = pending else {
         // Not trusted, and not trustable: the key that would verify it is
         // exactly what this machine does not hold. The draft has no private
-        // key and cannot connect.
+        // key and cannot connect, and names no identity: the request id it
+        // was parsed with is public, and the identity sealed under that name
+        // must never be paired with anchors nobody verified.
+        if let Some(block) = profile.key_negotiation.as_mut() {
+            block.identity.clear();
+        }
         return Ok(DocumentMatch::Unmatched {
             expected: format!(
                 "aucune demande d'enrôlement en attente sur ce poste ne correspond à ce document \

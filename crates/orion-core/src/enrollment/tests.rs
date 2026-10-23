@@ -543,6 +543,9 @@ mod completion {
             panic!("expected no match");
         };
         assert!(profile.private_key.is_empty());
+        // The request id is public: an unsigned document copying it must not
+        // reach the identity sealed for that request under its own anchors.
+        assert_eq!(profile.key_negotiation.expect("block").identity, "");
         assert!(
             expected.contains(&enrolled.pending.request.client_wg_public_key.to_base64()),
             "{expected}"
