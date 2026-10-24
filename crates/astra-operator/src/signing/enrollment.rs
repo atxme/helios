@@ -154,6 +154,7 @@ pub fn sign_invitation(
     invitation
         .verify(&ca_pq_public_key, now_unix)
         .map_err(|error| GestureError::Anchors(format!("invitation : {error}")))?;
+    registry.purge_lapsed(now_unix).map_err(registry_error)?;
     registry
         .issue(&invitation, proof_private_key)
         .map_err(registry_error)?;

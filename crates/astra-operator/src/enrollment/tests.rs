@@ -228,3 +228,47 @@ fn registry_files_are_private() {
     assert_eq!(mode(registry.directory()), 0o700);
     assert_eq!(mode(&registry.path_of(&invitation.invitation_id)), 0o600);
 }
+
+/// `list` used to expire a lapsed invitation without the consumption lock. A
+/// `consume` that read it `issued` just before, and wrote it `consumed` in
+/// between, then had its state overwritten: the readmission policy forgot the
+/// key and `sign_document` refused a document whose leaves were issued.
+#[test]
+fn list_never_rewrites_an_invitation_another_command_holds() {
+    let (_dir, registry) = registry();
+    let ca = ca();
+    let invitation = issued(&registry, &ca, 1, false);
+    let held = ConsumptionLock::take(&registry, &invitation.invitation_id).expect("lock");
+
+    let listed = registry
+        .list(invitation.not_after_unix + 1)
+        .expect("list");
+    assert!(matches!(listed[0].state, InvitationState::Issued));
+    let raw = std::fs::read_to_string(registry.path_of(&invitation.invitation_id)).expect("file");
+    assert!(raw.contains("proof_private_key"), "left to its holder");
+
+    drop(held);
+    let listed = registry
+        .list(invitation.not_after_unix + 1)
+        .expect("list");
+    assert!(matches!(listed[0].state, InvitationState::Expired { .. }));
+}
+
+/// §15.2 destroys the proof key at expiry. No process watches the registry
+/// between two commands, so every command that opens it purges what lapsed.
+#[test]
+fn every_registry_command_purges_lapsed_invitations() {
+    let (_dir, registry) = registry();
+    let ca = ca();
+    let lapsed = issued(&registry, &ca, 1, false);
+    let other = issued(&registry, &ca, 2, false);
+    let later = lapsed.not_after_unix + 1;
+
+    assert!(registry.revoke(&other.invitation_id, later).is_err());
+    assert!(matches!(
+        registry.load(&lapsed.invitation_id).expect("record").state,
+        InvitationState::Expired { .. }
+    ));
+    let raw = std::fs::read_to_string(registry.path_of(&lapsed.invitation_id)).expect("file");
+    assert!(!raw.contains("proof_private_key"));
+}

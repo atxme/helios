@@ -2415,7 +2415,11 @@ sans domaine, il n'existe ni ancre à faire confirmer ni leaf à nommer.
 La clé privée X25519 d'invitation et l'état `issued / consumed / revoked` sont
 conservés sur le poste opérateur, en `0600`, sous
 `~/.helios/enrollment-invitations`. La clé est détruite à la consommation, à
-la révocation ou à l'expiration. La gateway ne reçoit jamais cette clé.
+la révocation ou à l'expiration. Aucun processus ne veille sur le registre entre
+deux commandes : une invitation expirée perd sa clé à la première commande qui
+ouvre le registre ensuite (`invite`, `accept`, `list`, `revoke`), chaque fiche
+étant réécrite sous son verrou de consommation. La gateway ne reçoit jamais
+cette clé.
 
 Orion importe l'invitation avant de générer ses clés. Il affiche l'empreinte
 SHA-256 de `operator_ca_public_key` ; sa confirmation hors bande est
@@ -3097,7 +3101,7 @@ courant détaillé en tête de note.
 | [`aether::key_negotiation::enrollment`](../../crates/aether/src/key_negotiation/enrollment.rs) | invitation, demande, preuve WireGuard, octets signés et empreintes ; document `.orion` v5 et sa forme JCS |
 | [`astra-operator::enrollment`](../../crates/astra-operator/src/enrollment.rs) | registre des invitations à usage unique, verrou par invitation, consommation avant émission, réadmission |
 | [`astra-operator::signing::enrollment`](../../crates/astra-operator/src/signing/enrollment.rs) | signature de l'invitation, acceptation de la demande et émission des feuilles, signature du document après contrôle des feuilles émises |
-| [`astra-signer enroll`](../../tools/astra-signer/src/commands/enrollment.rs) | gestes `invite`, `accept`, `sign-document`, `list`, `revoke` sous credential matériel |
+| [`astra-signer enroll`](../../tools/astra-signer/src/commands/enrollment.rs) | gestes `invite`, `accept`, `sign-document` sous credential matériel ; `list` et `revoke` sans credential, car ils ne font que restreindre |
 | [`helios::enroll`](../../tools/helios/src/enroll.rs) | brouillon public du document : matériel gateway, bloc de confiance, contrôle des feuilles contre la demande |
 | [`orion-core::enrollment`](../../crates/orion-core/src/enrollment.rs) | prévisualisation de l'invitation, confirmation de l'empreinte, génération et scellement de la demande en attente, vérification et complétion du document signé |
 

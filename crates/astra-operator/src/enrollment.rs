@@ -98,6 +98,13 @@ struct RecordFile {
     proof_private_key: Option<ProofKey>,
 }
 
+impl RecordFile {
+    /// Still `issued`, past its window.
+    fn lapsed(&self, now_unix: u64) -> bool {
+        self.state == InvitationState::Issued && now_unix > self.invitation.not_after_unix
+    }
+}
+
 /// The X25519 private key of an invitation's WireGuard proof.
 ///
 /// Serialized because the registry must hold it between `invite` and
@@ -207,14 +214,10 @@ impl InvitationRegistry {
     /// Every record, after marking the lapsed ones `expired` — which destroys
     /// their proof key.
     pub fn list(&self, now_unix: u64) -> Result<Vec<InvitationRecord>> {
+        self.purge_lapsed(now_unix)?;
         let mut records = Vec::new();
         for id in self.ids()? {
-            let mut record = self.read(&id)?;
-            if record.state == InvitationState::Issued
-                && now_unix > record.invitation.not_after_unix
-            {
-                record = self.expire(&id, record, now_unix)?;
-            }
+            let record = self.read(&id)?;
             records.push(InvitationRecord {
                 invitation: record.invitation,
                 state: record.state,
@@ -222,6 +225,31 @@ impl InvitationRegistry {
         }
         records.sort_by_key(|record| record.invitation.not_before_unix);
         Ok(records)
+    }
+
+    /// Marks every lapsed `issued` invitation `expired`, destroying its proof
+    /// key (§15.2).
+    ///
+    /// No process watches the registry between two commands, so each command
+    /// that opens it calls this first: the key outlives its invitation only
+    /// until the next one. Each record is rewritten under its consumption
+    /// lock and re-read there. One another command holds is left to it: that
+    /// command decides its state, and an `expired` written over its
+    /// `consumed` would forget a key that was enrolled.
+    pub fn purge_lapsed(&self, now_unix: u64) -> Result<()> {
+        for id in self.ids()? {
+            if !self.read(&id)?.lapsed(now_unix) {
+                continue;
+            }
+            let Ok(_lock) = ConsumptionLock::take(self, &id) else {
+                continue;
+            };
+            let record = self.read(&id)?;
+            if record.lapsed(now_unix) {
+                self.expire(&id, record, now_unix)?;
+            }
+        }
+        Ok(())
     }
 
     /// Verifies a request and consumes its invitation, in the order of §15.2.
@@ -236,6 +264,7 @@ impl InvitationRegistry {
         request: &EnrollmentRequest,
         now_unix: u64,
     ) -> Result<ConsumedInvitation> {
+        self.purge_lapsed(now_unix)?;
         let _lock = ConsumptionLock::take(self, id)?;
         let record = self.read(id)?;
         if record.state != InvitationState::Issued {
@@ -311,6 +340,7 @@ impl InvitationRegistry {
 
     /// Revokes an invitation that has not been consumed.
     pub fn revoke(&self, id: &Id16, now_unix: u64) -> Result<()> {
+        self.purge_lapsed(now_unix)?;
         let _lock = ConsumptionLock::take(self, id)?;
         let record = self.read(id)?;
         if !matches!(record.state, InvitationState::Issued) {
