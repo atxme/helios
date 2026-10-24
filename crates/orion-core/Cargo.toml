@@ -87,6 +87,12 @@ windows = { version = "0.61", features = [
   # `VARIANT` n'existe qu'avec Com **et** Ole.
   "Win32_System_Ole",
 ] }
+# Réinscription du pair au renouvellement du PSK : sous Windows, `defguard`
+# 0.12 n'implémente ni `remove_peer` ni `configure_peer` (ils ne font que
+# journaliser), et `configure_interface` redescend l'adaptateur. Les deux
+# caisses sont déjà dans le lockfile, tirées par `defguard`.
+wireguard-nt = { version = "0.5", optional = true }
+ipnet = { version = "2.11", optional = true }
 
 [features]
 default = []
@@ -94,7 +100,7 @@ default = []
 # userspace BoringTun). Compile partout, mais ne peut être *exercé* que sur une
 # machine disposant du plan de données WireGuard — comme la feature `netlink`
 # côté heliosd. Les anciens backends IKEv2 ont été supprimés avec la bascule.
-wireguard = ["dep:defguard_wireguard_rs"]
+wireguard = ["dep:defguard_wireguard_rs", "dep:wireguard-nt", "dep:ipnet"]
 # Signature ML-DSA-87 des objets de cycle de vie, pour les tests du magasin de
 # confiance. Un Orion livré ne signe aucun objet d'autorité : il en vérifie.
 certificate-signing = ["aether/key-negotiation-signing"]

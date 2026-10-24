@@ -3927,6 +3927,7 @@ dependencies = [
  "defguard_wireguard_rs",
  "directories",
  "futures-util",
+ "ipnet",
  "rcgen",
  "reqwest",
  "serde",
@@ -3941,6 +3942,7 @@ dependencies = [
  "url",
  "windows 0.61.3",
  "windows-sys 0.61.2",
+ "wireguard-nt",
  "x25519-dalek",
  "zeroize",
 ]

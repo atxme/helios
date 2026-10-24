@@ -23,6 +23,10 @@
 //! an NDIS kernel driver, the "100% user-space" goal wasn't achievable anyway
 //! — we're replacing one kernel component with another.
 //!
+//! On Windows, `defguard`'s `remove_peer` and `configure_peer` are empty: a
+//! PSK renewal replaces the peer through `wireguard-nt` directly
+//! (`replace_peer_on_adapter`).
+//!
 //! # The lifecycle invariant
 //!
 //! This backend applies the rule from [`super`]: the interface is created
@@ -249,6 +253,64 @@ impl WireGuardBackend {
         });
         observations
     }
+}
+
+/// Replaces the adapter's only peer, through `wireguard-nt` itself.
+///
+/// `defguard`'s Windows `remove_peer` and `configure_peer` only log (0.12.2
+/// and 0.12.3): a renewal went through them, announced the peer
+/// re-registered, and left the previous PSK in the driver — the gateway
+/// waited 45 s for a handshake that could not come, then rolled back.
+/// `configure_interface` is no substitute either: it resets the MTU, and
+/// restoring it takes the adapter down, which a renewal must never do.
+///
+/// `set_config` always replaces the peers: the peer is recreated, its
+/// session dropped, and its keep-alive starts the proving handshake. No
+/// private key or listen port is passed, so the driver keeps its own.
+#[cfg(windows)]
+fn replace_peer_on_adapter(ifname: &str, peer: &Peer) -> anyhow::Result<()> {
+    use ipnet::{IpNet, Ipv4Net, Ipv6Net};
+
+    // The DLL `defguard` loads, by the same relative path: the shell makes
+    // the current directory the one holding it before any backend exists.
+    #[cfg(target_arch = "x86_64")]
+    const DLL: &str = "resources-windows/binaries/wireguard-amd64.dll";
+    #[cfg(target_arch = "aarch64")]
+    const DLL: &str = "resources-windows/binaries/wireguard-arm64.dll";
+
+    let endpoint = peer
+        .endpoint
+        .ok_or_else(|| anyhow::anyhow!("réinscription du pair : endpoint absent"))?;
+    let allowed_ips = peer
+        .allowed_ips
+        .iter()
+        .map(|ip| match ip.address {
+            IpAddr::V4(address) => Ipv4Net::new(address, ip.cidr).map(IpNet::V4),
+            IpAddr::V6(address) => Ipv6Net::new(address, ip.cidr).map(IpNet::V6),
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| anyhow::anyhow!("réinscription du pair : AllowedIPs invalides ({e})"))?;
+    // SAFETY: the library `defguard` already loaded into this process for
+    // the same adapter; loading it again only takes another reference.
+    let wireguard = unsafe { wireguard_nt::load_from_path(DLL) }
+        .map_err(|e| anyhow::anyhow!("chargement de WireGuardNT ({DLL}) : {e}"))?;
+    // Opened, not created: closing this handle leaves the adapter in place.
+    let adapter = wireguard_nt::Adapter::open(&wireguard, ifname)
+        .map_err(|e| anyhow::anyhow!("ouverture de l'adaptateur {ifname} : {e}"))?;
+    adapter
+        .set_config(&wireguard_nt::SetInterface {
+            listen_port: None,
+            public_key: None,
+            private_key: None,
+            peers: vec![wireguard_nt::SetPeer {
+                public_key: Some(peer.public_key.as_array()),
+                preshared_key: peer.preshared_key.as_ref().map(Key::as_array),
+                keep_alive: peer.persistent_keepalive_interval,
+                endpoint,
+                allowed_ips,
+            }],
+        })
+        .map_err(|e| anyhow::anyhow!("réinscription du pair : {e}"))
 }
 
 /// The prefixes the routing table sends through the adapter named `ifname`.
@@ -814,10 +876,18 @@ impl VpnBackend for WireGuardBackend {
         // handshake would come to prove the new PSK (spec §12.3). Removing
         // the peer drops its session keys; re-adding it makes the keep-alive
         // start a handshake at once. The adapter stays mounted throughout.
-        api.remove_peer(&peer.public_key)
-            .map_err(|e| anyhow::anyhow!("retrait du pair : {e}"))?;
-        api.configure_peer(&peer)
-            .map_err(|e| anyhow::anyhow!("réinscription du pair : {e}"))?;
+        //
+        // The `defguard` lock is held across the Windows call too: the
+        // driver configuration is written by one caller at a time.
+        #[cfg(windows)]
+        replace_peer_on_adapter(&self.ifname, &peer)?;
+        #[cfg(not(windows))]
+        {
+            api.remove_peer(&peer.public_key)
+                .map_err(|e| anyhow::anyhow!("retrait du pair : {e}"))?;
+            api.configure_peer(&peer)
+                .map_err(|e| anyhow::anyhow!("réinscription du pair : {e}"))?;
+        }
         api.configure_peer_routing(&routing_peers(std::slice::from_ref(&peer)))
             .map_err(|e| anyhow::anyhow!("routage du pair : {e}"))?;
         let observed = self.observe_capture(&api, &peer.public_key);
