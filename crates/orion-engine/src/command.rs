@@ -1,7 +1,7 @@
-//! Commandes de l'IHM vers le moteur, et leurs réponses.
+//! Commands from the UI to the engine, and their replies.
 //!
-//! Ensemble minimal pour l'instant : l'arrêt. Les autres commandes suivent
-//! avec le moteur qui les exécute.
+//! Minimal set for now: shutdown. Further commands arrive with the engine
+//! that executes them.
 
 use serde::{Deserialize, Serialize};
 

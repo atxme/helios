@@ -1,9 +1,9 @@
-//! Canal entre le moteur privilégié d'Orion et son IHM non élevée.
+//! Channel between the privileged Orion engine and its unprivileged UI.
 //!
-//! F11 sépare le client en deux processus : un moteur élevé qui monte le
-//! tunnel, et une IHM sans privilège. Ce crate porte la seule liaison qui les
-//! relie, un objet JSON par ligne et bornée en taille, côté lecture comme
-//! côté écriture.
+//! F11 splits the client into two processes: an elevated engine that brings
+//! up the tunnel, and an unprivileged UI. This crate carries the only link
+//! between them: one JSON object per line, size-bounded on both reading and
+//! writing.
 
 pub mod command;
 pub mod wire;

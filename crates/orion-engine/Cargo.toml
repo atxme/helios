@@ -4,12 +4,16 @@ version = "0.1.0"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "Canal entre le moteur privilégié d'Orion et son IHM non élevée : protocole de trames JSON par ligne, borné en taille."
+description = "Channel between the privileged Orion engine and its unprivileged UI: bounded JSON-line frame protocol."
 
 [dependencies]
-# Les trames transportent des événements du cœur client vers l'IHM ; le même
-# type sert des deux côtés, sans second jeu de types à garder synchrone.
+# Frames carry client-core events to the UI; the same type serves both sides,
+# so there is no second set of types to keep in sync.
 orion-core = { path = "../orion-core" }
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true }
+
+[dev-dependencies]
+# `TunnelState` values for the event round-trip test.
+aether.workspace = true

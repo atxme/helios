@@ -1,7 +1,7 @@
-//! Trames du canal moteur / IHM : un objet JSON par ligne, borné en taille.
+//! Engine / UI channel frames: one JSON object per line, size-bounded.
 //!
-//! Même forme que `tools/helios-astra-helper/src/session.rs`, en asynchrone.
-//! Une ligne au-delà de sa limite est refusée sans être lue jusqu'au bout.
+//! Same shape as `tools/helios-astra-helper/src/session.rs`, but async.
+//! A line over its limit is refused without being read to the end.
 
 use std::io;
 
@@ -12,10 +12,10 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWr
 use crate::command::{EngineCommand, EngineReply};
 use orion_core::events::ClientEvent;
 
-/// Version du protocole : une IHM dont la version diffère est refusée au `Hello`.
+/// Protocol version: a UI whose version differs is refused at `Hello`.
 pub const PROTOCOL_VERSION: u16 = 1;
 
-/// Tailles maximales d'une trame, saut de ligne non compris.
+/// Maximum size of a frame, newline excluded.
 pub mod limits {
     pub const HELLO_BYTES: usize = 1024;
     pub const REQUEST_BYTES: usize = 1024 * 1024;
@@ -23,15 +23,15 @@ pub mod limits {
     pub const EVENT_BYTES: usize = 64 * 1024;
 }
 
-/// Première trame de l'IHM : elle présente le jeton que le moteur lui a remis.
+/// First frame from the UI: it presents the token the engine handed it.
 #[derive(Serialize, Deserialize)]
 pub struct Hello {
     pub protocol_version: u16,
-    /// Secret : ce type n'implémente pas `Debug` pour qu'il ne s'affiche pas.
+    /// Secret: this type does not implement `Debug`, so it is never printed.
     pub token: String,
 }
 
-/// Trames émises par l'IHM.
+/// Frames sent by the UI.
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "frame", rename_all = "snake_case")]
 pub enum ClientFrame {
@@ -39,7 +39,7 @@ pub enum ClientFrame {
     Request { id: u64, command: EngineCommand },
 }
 
-/// Trames émises par le moteur : la réponse à une requête, ou un événement poussé.
+/// Frames sent by the engine: the reply to a request, or a pushed event.
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "frame", rename_all = "snake_case")]
 pub enum EngineFrame {
@@ -50,15 +50,15 @@ pub enum EngineFrame {
     Event(ClientEvent),
 }
 
-/// Échec du canal. Toute erreur ferme la connexion : il n'y a pas de reprise
-/// au milieu d'une ligne.
+/// Channel failure. Any error closes the connection: there is no resuming
+/// in the middle of a line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WireError {
-    /// La trame dépasse la limite fixée par l'appelant.
+    /// The frame exceeds the limit set by the caller.
     TooLarge { limit: usize },
-    /// Ligne qui n'est pas une trame valide, ou flux fermé au milieu d'une ligne.
+    /// Line that is not a valid frame, or stream closed in the middle of a line.
     Malformed,
-    /// Erreur d'entrée-sortie, réduite à son genre.
+    /// I/O error, reduced to its kind.
     Io(io::ErrorKind),
 }
 
@@ -68,15 +68,15 @@ impl From<io::Error> for WireError {
     }
 }
 
-/// Lit une trame. `Ok(None)` est une fin de flux propre, avant tout octet.
+/// Reads one frame. `Ok(None)` is a clean end of stream, before any byte.
 pub async fn read_frame<R, T>(reader: &mut R, limit: usize) -> Result<Option<T>, WireError>
 where
     R: AsyncBufRead + Unpin,
     T: DeserializeOwned,
 {
     let mut line = Vec::new();
-    // Un octet de plus que la limite, saut de ligne compris : une trame à la
-    // limite passe, le premier octet au-delà est refusé sans être bufferisé.
+    // One byte more than the limit, newline included: a frame at the limit
+    // passes, and the first byte beyond it is refused without being buffered.
     let mut window = AsyncReadExt::take(&mut *reader, limit as u64 + 1);
     let read = window.read_until(b'\n', &mut line).await?;
     if read == 0 {
@@ -97,8 +97,8 @@ where
         .map_err(|_| WireError::Malformed)
 }
 
-/// Écrit une trame suivie d'un saut de ligne, refusant d'en écrire une
-/// au-delà de `limit` : rien n'est écrit dans ce cas.
+/// Writes one frame followed by a newline, refusing a frame over `limit`:
+/// nothing is written in that case.
 pub async fn write_frame<W, T>(writer: &mut W, frame: &T, limit: usize) -> Result<(), WireError>
 where
     W: AsyncWrite + Unpin,

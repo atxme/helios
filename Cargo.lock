@@ -3951,6 +3951,7 @@ dependencies = [
 name = "orion-engine"
 version = "0.1.0"
 dependencies = [
+ "aether",
  "orion-core",
  "serde",
  "serde_json",

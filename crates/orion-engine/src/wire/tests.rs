@@ -1,4 +1,6 @@
 use super::*;
+use aether::TunnelState;
+use orion_core::events::ClientEvent;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -47,7 +49,7 @@ async fn a_frame_round_trips() {
             assert_eq!(hello.protocol_version, PROTOCOL_VERSION);
             assert_eq!(hello.token, "jeton");
         }
-        _ => panic!("la trame Hello doit revenir à l'identique"),
+        _ => panic!("the Hello frame must come back unchanged"),
     }
 }
 
@@ -98,4 +100,85 @@ async fn a_writer_refuses_a_frame_over_its_limit() {
 
     assert!(matches!(result, Err(WireError::TooLarge { limit: 8 })));
     assert!(bytes.is_empty());
+}
+
+#[tokio::test]
+async fn an_event_frame_round_trips() {
+    let events = [
+        EngineFrame::Event(ClientEvent::state(TunnelState::Up)),
+        EngineFrame::Event(ClientEvent::log("info", "tunnel up")),
+    ];
+    let mut bytes = Vec::new();
+    for frame in &events {
+        write_frame(&mut bytes, frame, limits::EVENT_BYTES)
+            .await
+            .unwrap();
+    }
+
+    let mut reader = tokio::io::BufReader::new(bytes.as_slice());
+    match read_frame::<_, EngineFrame>(&mut reader, limits::EVENT_BYTES)
+        .await
+        .unwrap()
+    {
+        Some(EngineFrame::Event(ClientEvent::StateChanged { state })) => {
+            assert_eq!(state, TunnelState::Up);
+        }
+        _ => panic!("the state event must come back unchanged"),
+    }
+    match read_frame::<_, EngineFrame>(&mut reader, limits::EVENT_BYTES)
+        .await
+        .unwrap()
+    {
+        Some(EngineFrame::Event(ClientEvent::Log { level, message })) => {
+            assert_eq!(level, "info");
+            assert_eq!(message, "tunnel up");
+        }
+        _ => panic!("the log event must come back unchanged"),
+    }
+    assert!(matches!(
+        read_frame::<_, EngineFrame>(&mut reader, limits::EVENT_BYTES).await,
+        Ok(None)
+    ));
+}
+
+#[tokio::test]
+async fn a_reply_frame_round_trips() {
+    let replies = [
+        EngineFrame::Reply {
+            id: 7,
+            result: Ok(EngineReply::Unit),
+        },
+        EngineFrame::Reply {
+            id: 8,
+            result: Err("refus".into()),
+        },
+    ];
+    let mut bytes = Vec::new();
+    for frame in &replies {
+        write_frame(&mut bytes, frame, limits::REPLY_BYTES)
+            .await
+            .unwrap();
+    }
+
+    let mut reader = tokio::io::BufReader::new(bytes.as_slice());
+    match read_frame::<_, EngineFrame>(&mut reader, limits::REPLY_BYTES)
+        .await
+        .unwrap()
+    {
+        Some(EngineFrame::Reply { id, result }) => {
+            assert_eq!(id, 7);
+            assert_eq!(result, Ok(EngineReply::Unit));
+        }
+        _ => panic!("the unit reply must come back unchanged"),
+    }
+    match read_frame::<_, EngineFrame>(&mut reader, limits::REPLY_BYTES)
+        .await
+        .unwrap()
+    {
+        Some(EngineFrame::Reply { id, result }) => {
+            assert_eq!(id, 8);
+            assert_eq!(result, Err("refus".to_string()));
+        }
+        _ => panic!("the error reply must come back unchanged"),
+    }
 }
