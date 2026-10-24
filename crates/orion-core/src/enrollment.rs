@@ -137,6 +137,11 @@ struct PendingRecord {
 }
 
 impl PendingSecrets {
+    /// The request file, as [`begin_enrollment`] first returned it.
+    pub(crate) fn request_file(&self) -> String {
+        encode_request_file(&self.request)
+    }
+
     pub(crate) fn summary(&self) -> PendingEnrollment {
         PendingEnrollment {
             invitation_id: self.invitation.invitation_id,
@@ -310,7 +315,7 @@ pub fn begin_enrollment(
     )?;
     let encoded = pending.encode()?;
     store.seal_named(&pending_name(&pending.request.request_id), &encoded)?;
-    Ok((pending.summary(), encode_request_file(&pending.request)))
+    Ok((pending.summary(), pending.request_file()))
 }
 
 /// Every pending enrollment on this machine, oldest first.
@@ -330,6 +335,15 @@ pub fn pending_enrollments(store: &ProtectedIdentityStore) -> Result<Vec<Pending
 /// Abandons a pending enrollment: its three private keys are destroyed.
 pub fn discard_enrollment(store: &ProtectedIdentityStore, request_id: &Id16) -> Result<()> {
     store.remove_named(&pending_name(request_id))
+}
+
+/// The `.helios-request` of a pending enrollment, written again.
+///
+/// The request is public and is all that leaves the record: a download that
+/// failed, or a dialog closed too early, must not cost a second request on
+/// the same invitation.
+pub fn pending_request_file(store: &ProtectedIdentityStore, request_id: &Id16) -> Result<String> {
+    Ok(open_pending(store, request_id)?.request_file())
 }
 
 /// Destroys the pending record of the enrollment that sealed `identity`.

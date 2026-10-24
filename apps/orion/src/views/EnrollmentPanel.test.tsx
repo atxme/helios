@@ -10,6 +10,7 @@ const api = vi.hoisted(() => ({
   beginEnrollment: vi.fn(),
   listPendingEnrollments: vi.fn(),
   discardPendingEnrollment: vi.fn(),
+  exportPendingRequest: vi.fn(),
 }))
 const documents = vi.hoisted(() => ({ readProfileDocument: vi.fn() }))
 
@@ -49,6 +50,7 @@ describe('EnrollmentPanel', () => {
     api.previewEnrollmentInvitation.mockResolvedValue(preview)
     api.beginEnrollment.mockResolvedValue('request-text')
     api.discardPendingEnrollment.mockResolvedValue(undefined)
+    api.exportPendingRequest.mockResolvedValue('request-text')
   })
 
   afterEach(() => {
@@ -101,6 +103,20 @@ describe('EnrollmentPanel', () => {
       expect(api.discardPendingEnrollment).toHaveBeenCalledWith(pending.request_id),
     )
     await waitFor(() => expect(screen.queryByText('poste-windows')).toBeNull())
+  })
+
+  it('a_pending_request_can_be_saved_again_from_the_list', async () => {
+    api.listPendingEnrollments.mockResolvedValue([pending])
+    const createObjectURL = vi.fn(() => 'blob:request')
+    Object.assign(URL, { createObjectURL, revokeObjectURL: vi.fn() })
+    render(<EnrollmentPanel />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Enregistrer' }))
+
+    await waitFor(() =>
+      expect(api.exportPendingRequest).toHaveBeenCalledWith(pending.request_id),
+    )
+    await waitFor(() => expect(createObjectURL).toHaveBeenCalled())
   })
 
   it('an_invitation_preview_error_is_shown_in_place', async () => {

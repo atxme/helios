@@ -75,11 +75,24 @@ pub(crate) async fn list_pending_enrollments() -> Result<Vec<PendingEnrollment>,
         .map_err(|error| format!("{error:#}"))
 }
 
+/// The `.helios-request` of a pending enrollment, again: public, as
+/// `begin_enrollment` first returned it.
+#[tauri::command]
+pub(crate) async fn export_pending_request(request_id: String) -> Result<String, String> {
+    let request_id = parse_request_id(&request_id)?;
+    orion_core::enrollment::pending_request_file(&protected_store()?, &request_id)
+        .map_err(|error| format!("{error:#}"))
+}
+
+fn parse_request_id(value: &str) -> Result<aether::certificates::encoding::Id16, String> {
+    aether::certificates::encoding::Id16::parse_hex(value.trim())
+        .map_err(|_| "identifiant de demande : 32 caractères hexadécimaux attendus".to_string())
+}
+
 /// Abandons a pending enrollment: its three private keys are destroyed.
 #[tauri::command]
 pub(crate) async fn discard_pending_enrollment(request_id: String) -> Result<(), String> {
-    let request_id = aether::certificates::encoding::Id16::parse_hex(request_id.trim())
-        .map_err(|_| "identifiant de demande : 32 caractères hexadécimaux attendus".to_string())?;
+    let request_id = parse_request_id(&request_id)?;
     orion_core::enrollment::discard_enrollment(&protected_store()?, &request_id)
         .map_err(|error| format!("{error:#}"))
 }

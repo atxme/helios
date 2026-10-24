@@ -81,6 +81,10 @@ export const beginEnrollment = (
 export const listPendingEnrollments = () =>
   invoke<PendingEnrollment[]>('list_pending_enrollments')
 
+/** The `.helios-request` of a pending enrollment, written again. */
+export const exportPendingRequest = (requestId: string) =>
+  invoke<string>('export_pending_request', { requestId })
+
 /** Abandons a pending enrollment: its private keys are destroyed. */
 export const discardPendingEnrollment = (requestId: string) =>
   invoke<void>('discard_pending_enrollment', { requestId })

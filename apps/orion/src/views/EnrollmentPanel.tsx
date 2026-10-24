@@ -113,6 +113,15 @@ export function EnrollmentPanel() {
     }
   }
 
+  const saveAgain = async (entry: PendingEnrollment) => {
+    setError(null)
+    try {
+      saveRequest(entry.requested_name, await api.exportPendingRequest(entry.request_id))
+    } catch (cause) {
+      setError(String(cause))
+    }
+  }
+
   const discard = async () => {
     if (!discarding) return
     const target = discarding
@@ -176,6 +185,15 @@ export function EnrollmentPanel() {
                   {entry.server_name} · {age(entry.created_at_unix)}
                 </Typography>
               </Box>
+              <Button
+                size="small"
+                color="inherit"
+                startIcon={<Download size={13} aria-hidden />}
+                onClick={() => void saveAgain(entry)}
+                sx={{ fontSize: 11, color: 'text.secondary', minWidth: 0 }}
+              >
+                Enregistrer
+              </Button>
               <Button
                 size="small"
                 color="inherit"

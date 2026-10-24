@@ -799,6 +799,7 @@ fn main() {
             begin_enrollment,
             list_pending_enrollments,
             discard_pending_enrollment,
+            export_pending_request,
             save_profile,
             generate_private_key,
             adopt_private_key,

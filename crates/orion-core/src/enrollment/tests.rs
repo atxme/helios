@@ -566,6 +566,23 @@ mod completion {
         );
     }
 
+    /// Closing the dialog lost the request text: a failed download left the
+    /// user nothing but a second request on the same invitation.
+    #[test]
+    fn a_pending_request_is_exported_again_without_its_secrets() {
+        let pending = enrolled().pending;
+        let text = pending.request_file();
+        let request = aether::key_negotiation::decode_request_file(&text).expect("a request");
+        assert_eq!(request.fingerprint(), pending.request.fingerprint());
+        for secret in [
+            pending.wg_private_key.expose().to_string(),
+            STANDARD.encode(pending.tls_private_key_der.as_slice()),
+            STANDARD.encode(pending.ml_dsa_private_key.as_slice()),
+        ] {
+            assert!(!text.contains(&secret), "private material in the request");
+        }
+    }
+
     /// §19: a document no pending request answers is a draft, whatever it
     /// carries. A malformed client leaf used to make it an import error.
     #[test]
