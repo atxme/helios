@@ -240,17 +240,13 @@ fn list_never_rewrites_an_invitation_another_command_holds() {
     let invitation = issued(&registry, &ca, 1, false);
     let held = ConsumptionLock::take(&registry, &invitation.invitation_id).expect("lock");
 
-    let listed = registry
-        .list(invitation.not_after_unix + 1)
-        .expect("list");
+    let listed = registry.list(invitation.not_after_unix + 1).expect("list");
     assert!(matches!(listed[0].state, InvitationState::Issued));
     let raw = std::fs::read_to_string(registry.path_of(&invitation.invitation_id)).expect("file");
     assert!(raw.contains("proof_private_key"), "left to its holder");
 
     drop(held);
-    let listed = registry
-        .list(invitation.not_after_unix + 1)
-        .expect("list");
+    let listed = registry.list(invitation.not_after_unix + 1).expect("list");
     assert!(matches!(listed[0].state, InvitationState::Expired { .. }));
 }
 
