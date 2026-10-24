@@ -39,6 +39,16 @@ fn automatic_policy_fingerprint() -> Fingerprint {
 }
 
 fn client_leaf(ca: &Keys, subject: &Keys, serial: u8) -> PqCertificate {
+    client_leaf_valid_during(ca, subject, serial, 0, 100_000)
+}
+
+fn client_leaf_valid_during(
+    ca: &Keys,
+    subject: &Keys,
+    serial: u8,
+    not_before_unix: u64,
+    not_after_unix: u64,
+) -> PqCertificate {
     let certificate = PqCertificate {
         version: PQ_CERTIFICATE_VERSION,
         serial: [serial; 16],
@@ -47,8 +57,8 @@ fn client_leaf(ca: &Keys, subject: &Keys, serial: u8) -> PqCertificate {
         role: PqCertificateRole::Client,
         wireguard_public_key: client_key().to_base64(),
         ml_dsa_87_public_key: STANDARD.encode(subject.public.as_bytes()),
-        not_before_unix: 0,
-        not_after_unix: 100_000,
+        not_before_unix,
+        not_after_unix,
         ml_dsa_87_signature: String::new(),
     };
     issue_pq_certificate(certificate, &ca.private).expect("issue")
@@ -660,6 +670,18 @@ fn recovery_request(
     last_known: &ClientCertificateGeneration,
     challenge: [u8; 32],
 ) -> ExpiredCertificateRecoveryRequest {
+    let tls = tls_material();
+    recovery_request_with_tls(ca, expired, fresh, last_known, challenge, &tls)
+}
+
+fn recovery_request_with_tls(
+    ca: &Keys,
+    expired: &Keys,
+    fresh: &Keys,
+    last_known: &ClientCertificateGeneration,
+    challenge: [u8; 32],
+    tls: &crate::certificates::test_x509::TlsMaterial,
+) -> ExpiredCertificateRecoveryRequest {
     ExpiredCertificateRecoveryRequest {
         format_version: CERTIFICATE_FORMAT_VERSION,
         protocol_version: CERTIFICATE_PROTOCOL_VERSION,
@@ -671,9 +693,9 @@ fn recovery_request(
         client_wg_public_key: client_key(),
         expired_generation: last_known.generation,
         requested_generation: last_known.generation + 1,
-        expired_tls_certificate: tls_material().leaf,
+        expired_tls_certificate: tls.leaf.clone(),
         expired_pq_certificate: client_leaf(ca, expired, 4),
-        tls_csr: tls_material().csr,
+        tls_csr: tls.csr.clone(),
         new_ml_dsa_87_public_key: fresh.public.clone(),
         credential_id: vec![1, 2, 3],
         created_at: 500_000,
@@ -1067,4 +1089,475 @@ fn the_client_object_fingerprints_are_pinned() {
             "717703958f6f7a7089547c4d433d6dcdad7c18b42b6c355d85b173e866f9e167",
         ]
     );
+}
+
+fn signed_grant(issuer: &Keys, ca: &Keys) -> ClientCertificateRotationGrant {
+    let subject = keys();
+    let receipt = GatewayCertificateStageReceipt {
+        format_version: CERTIFICATE_FORMAT_VERSION,
+        protocol_version: CERTIFICATE_PROTOCOL_VERSION,
+        trust_domain_id: domain(),
+        stage_id: Id16::new([5; 16]).expect("stage"),
+        stage_authorization_fingerprint: Fingerprint::of(b"authorization"),
+        request_fingerprint: Fingerprint::of(b"request"),
+        renewal_authorization_fingerprint: Fingerprint::of(b"approval"),
+        gateway_wg_public_key: gateway_key(),
+        client_wg_public_key: client_key(),
+        active_generation: 4,
+        staged_generation: 5,
+        staged_tls_certificate_fingerprint: Fingerprint::of(b"candidate tls"),
+        staged_pq_certificate_fingerprint: Fingerprint::of(b"candidate pq"),
+        persisted_at: 1_100,
+        stage_expires_at: 4_600,
+        active_gateway_identity_epoch: 1,
+        gateway_decision_epoch: 1,
+        gateway_certificate_fingerprint: Fingerprint::of(b"gateway leaf"),
+        gateway_signature: MlDsa87Signature::placeholder(),
+    };
+    // The grant signature tests need a well-formed grant transcript. Full
+    // receipt/leaf-chain checks belong to the role-specific verification.
+    let mut grant = ClientCertificateRotationGrant {
+        format_version: CERTIFICATE_FORMAT_VERSION,
+        protocol_version: CERTIFICATE_PROTOCOL_VERSION,
+        trust_domain_id: domain(),
+        ca_epoch: 1,
+        ca_tls_epoch: 1,
+        issuer_kind: IssuerKind::Master,
+        issuer_epoch: 0,
+        issuer_authorization_fingerprint: Fingerprint::from_bytes([0; 32]),
+        issuer_authorization: None,
+        request_fingerprint: Fingerprint::of(b"request"),
+        renewal_authorization_fingerprint: Fingerprint::of(b"approval"),
+        renewal_approval: None,
+        campaign_approval: None,
+        stage_receipt_fingerprint: receipt.fingerprint(),
+        stage_receipt: receipt,
+        gateway_wg_public_key: gateway_key(),
+        server_name: SERVER_NAME.into(),
+        client_wg_public_key: client_key(),
+        active_generation: 4,
+        next_generation: 5,
+        active_tls_certificate_fingerprint: Fingerprint::of(b"active tls"),
+        active_pq_certificate_fingerprint: Fingerprint::of(b"active pq"),
+        next_tls_ca_certificate_fingerprint: Fingerprint::of(b"tls ca"),
+        next_tls_certificate: DerCertificate::new(vec![1]).expect("DER wrapper"),
+        next_pq_certificate: client_leaf(ca, &subject, 5),
+        stage_expires_at: 4_600,
+        window: TransitionWindow::new(1_000, 10_000, 20_000).expect("window"),
+        reason: RotationReason::ExpiredRecovery,
+        signature: MlDsa87Signature::placeholder(),
+    };
+    grant.signature = sign_ml_dsa_87(&issuer.private, &grant.signing_bytes().expect("transcript"))
+        .expect("grant signature");
+    grant
+}
+
+fn recovery_grant(
+    ca: &Keys,
+    gateway: &Keys,
+    request: &ExpiredCertificateRecoveryRequest,
+    tls: &crate::certificates::test_x509::TlsMaterial,
+) -> ClientCertificateRotationGrant {
+    let gateway_fingerprint = Fingerprint::of(b"pinned gateway certificate");
+    let candidate = client_leaf_valid_during(
+        ca,
+        &Keys {
+            private: Zeroizing::new(Vec::new()),
+            public: request.new_ml_dsa_87_public_key.clone(),
+        },
+        5,
+        500_000,
+        700_000,
+    );
+    // `candidate` is signed by CA-PQ and carries the new public key named by
+    // the recovery request. Its validity covers the complete transition.
+    let mut receipt = GatewayCertificateStageReceipt {
+        format_version: CERTIFICATE_FORMAT_VERSION,
+        protocol_version: CERTIFICATE_PROTOCOL_VERSION,
+        trust_domain_id: domain(),
+        stage_id: Id16::new([5; 16]).expect("stage"),
+        stage_authorization_fingerprint: Fingerprint::of(b"recovery authorization"),
+        request_fingerprint: request.fingerprint(),
+        renewal_authorization_fingerprint: Fingerprint::of(b"operator approval"),
+        gateway_wg_public_key: gateway_key(),
+        client_wg_public_key: client_key(),
+        active_generation: request.expired_generation,
+        staged_generation: request.requested_generation,
+        staged_tls_certificate_fingerprint: tls.leaf.fingerprint(),
+        staged_pq_certificate_fingerprint: pq_certificate_fingerprint(&candidate)
+            .expect("candidate fingerprint"),
+        persisted_at: 500_010,
+        stage_expires_at: 500_300,
+        active_gateway_identity_epoch: 1,
+        gateway_decision_epoch: 1,
+        gateway_certificate_fingerprint: gateway_fingerprint,
+        gateway_signature: MlDsa87Signature::placeholder(),
+    };
+    receipt = receipt.sign(&gateway.private).expect("receipt signature");
+
+    let mut grant = ClientCertificateRotationGrant {
+        format_version: CERTIFICATE_FORMAT_VERSION,
+        protocol_version: CERTIFICATE_PROTOCOL_VERSION,
+        trust_domain_id: domain(),
+        ca_epoch: 1,
+        ca_tls_epoch: 1,
+        issuer_kind: IssuerKind::Master,
+        issuer_epoch: 0,
+        issuer_authorization_fingerprint: Fingerprint::from_bytes([0; 32]),
+        issuer_authorization: None,
+        request_fingerprint: request.fingerprint(),
+        renewal_authorization_fingerprint: receipt.renewal_authorization_fingerprint,
+        renewal_approval: None,
+        campaign_approval: None,
+        stage_receipt_fingerprint: receipt.fingerprint(),
+        stage_receipt: receipt,
+        gateway_wg_public_key: gateway_key(),
+        server_name: SERVER_NAME.into(),
+        client_wg_public_key: client_key(),
+        active_generation: request.expired_generation,
+        next_generation: request.requested_generation,
+        active_tls_certificate_fingerprint: request.expired_tls_certificate.fingerprint(),
+        active_pq_certificate_fingerprint: pq_certificate_fingerprint(
+            &request.expired_pq_certificate,
+        )
+        .expect("expired PQ fingerprint"),
+        next_tls_ca_certificate_fingerprint: tls.authority.fingerprint(),
+        next_tls_certificate: tls.leaf.clone(),
+        next_pq_certificate: candidate,
+        stage_expires_at: 500_300,
+        window: TransitionWindow::new(500_000, 500_200, 700_000).expect("window"),
+        reason: RotationReason::ExpiredRecovery,
+        signature: MlDsa87Signature::placeholder(),
+    };
+    grant.signature = sign_ml_dsa_87(&ca.private, &grant.signing_bytes().expect("transcript"))
+        .expect("grant signature");
+    grant
+}
+
+fn resign_recovery_grant(
+    mut grant: ClientCertificateRotationGrant,
+    receipt_signer: &Keys,
+    ca: &Keys,
+) -> ClientCertificateRotationGrant {
+    grant.stage_receipt = grant
+        .stage_receipt
+        .clone()
+        .sign(&receipt_signer.private)
+        .expect("receipt signature");
+    grant.stage_receipt_fingerprint = grant.stage_receipt.fingerprint();
+    grant.signature = sign_ml_dsa_87(&ca.private, &grant.signing_bytes().expect("transcript"))
+        .expect("grant signature");
+    grant
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_recovery_fixture(
+    grant: &ClientCertificateRotationGrant,
+    ca: &Keys,
+    gateway: &Keys,
+    gateway_fingerprint: &Fingerprint,
+    trust_domain: &TrustDomainId,
+    gateway_wg_key: &WireGuardKey,
+    client_wg_key: &WireGuardKey,
+    request: &ExpiredCertificateRecoveryRequest,
+    tls_anchor: &DerCertificate,
+    now: u64,
+) -> Result<(), CertificateError> {
+    grant.verify_for_recovery(
+        &ca.public,
+        &gateway.public,
+        gateway_fingerprint,
+        trust_domain,
+        1,
+        1,
+        gateway_wg_key,
+        SERVER_NAME,
+        client_wg_key,
+        request,
+        &[tls_anchor],
+        None,
+        now,
+    )
+}
+
+#[test]
+fn a_relay_can_check_the_grant_signature_but_not_authorize_installation() {
+    let ca = keys();
+    let grant = signed_grant(&ca, &ca);
+    grant
+        .verify_signed_by(&ca.public)
+        .expect("issuer signature");
+    assert!(matches!(
+        grant.verify_signed_by(&keys().public),
+        Err(CertificateError::InvalidSignature)
+    ));
+
+    let mut altered = grant;
+    altered.stage_expires_at += 1;
+    assert!(matches!(
+        altered.verify_signed_by(&ca.public),
+        Err(CertificateError::InvalidSignature)
+    ));
+}
+
+#[test]
+fn a_delegated_or_ordinary_grant_cannot_enter_the_recovery_verifier() {
+    let ca = keys();
+    let request = recovery_request(&ca, &keys(), &keys(), &active_generation(), [7; 32]);
+    let mut grant = signed_grant(&ca, &ca);
+
+    grant.issuer_kind = IssuerKind::Astra;
+    assert!(matches!(
+        grant.verify_for_recovery(
+            &ca.public,
+            &keys().public,
+            &Fingerprint::of(b"gateway"),
+            &domain(),
+            1,
+            1,
+            &gateway_key(),
+            SERVER_NAME,
+            &client_key(),
+            &request,
+            &[],
+            None,
+            1_000
+        ),
+        Err(CertificateError::IssuerScopeViolation(
+            "only CA-PQ grants the recovery of an expired identity"
+        ))
+    ));
+
+    grant.issuer_kind = IssuerKind::Master;
+    grant.reason = RotationReason::Scheduled;
+    // The wrong-reason guard runs before signatures or certificate material.
+    assert!(matches!(
+        grant.verify_for_recovery(
+            &ca.public,
+            &keys().public,
+            &Fingerprint::of(b"gateway"),
+            &domain(),
+            1,
+            1,
+            &gateway_key(),
+            SERVER_NAME,
+            &client_key(),
+            &request,
+            &[],
+            None,
+            1_000
+        ),
+        Err(CertificateError::IssuerScopeViolation(
+            "this grant was issued for another reason"
+        ))
+    ));
+}
+
+#[test]
+fn a_ca_pq_recovery_grant_verifies_and_stays_bound_to_the_historical_request() {
+    let ca = keys();
+    let gateway = keys();
+    let expired = keys();
+    let fresh = keys();
+    let tls = tls_material();
+    let request =
+        recovery_request_with_tls(&ca, &expired, &fresh, &active_generation(), [7; 32], &tls);
+    let grant = recovery_grant(&ca, &gateway, &request, &tls);
+    let gateway_fingerprint = grant.stage_receipt.gateway_certificate_fingerprint;
+
+    verify_recovery_fixture(
+        &grant,
+        &ca,
+        &gateway,
+        &gateway_fingerprint,
+        &domain(),
+        &gateway_key(),
+        &client_key(),
+        &request,
+        &tls.authority,
+        500_050,
+    )
+    .expect("valid CA-PQ recovery grant");
+
+    let mut wrong_epoch = grant.clone();
+    wrong_epoch.ca_epoch = 2;
+    assert!(matches!(
+        verify_recovery_fixture(
+            &wrong_epoch,
+            &ca,
+            &gateway,
+            &gateway_fingerprint,
+            &domain(),
+            &gateway_key(),
+            &client_key(),
+            &request,
+            &tls.authority,
+            500_050
+        ),
+        Err(CertificateError::UnauthorizedIssuer)
+    ));
+
+    let other_tls = tls_material();
+    let mut wrong_csr_request = request.clone();
+    wrong_csr_request.tls_csr = other_tls.csr;
+    assert!(matches!(
+        verify_recovery_fixture(
+            &grant,
+            &ca,
+            &gateway,
+            &gateway_fingerprint,
+            &domain(),
+            &gateway_key(),
+            &client_key(),
+            &wrong_csr_request,
+            &tls.authority,
+            500_050
+        ),
+        Err(CertificateError::InvalidX509(
+            "certificate does not certify the CSR's key"
+        ))
+    ));
+
+    let mut wrong_key_request = request.clone();
+    wrong_key_request.new_ml_dsa_87_public_key = keys().public;
+    let mut wrong_key_grant = grant.clone();
+    wrong_key_grant.request_fingerprint = wrong_key_request.fingerprint();
+    wrong_key_grant.stage_receipt.request_fingerprint = wrong_key_request.fingerprint();
+    wrong_key_grant = resign_recovery_grant(wrong_key_grant, &gateway, &ca);
+    assert!(matches!(
+        verify_recovery_fixture(
+            &wrong_key_grant,
+            &ca,
+            &gateway,
+            &gateway_fingerprint,
+            &domain(),
+            &gateway_key(),
+            &client_key(),
+            &wrong_key_request,
+            &tls.authority,
+            500_050
+        ),
+        Err(CertificateError::MissingProof("new client"))
+    ));
+
+    let stranger_gateway = keys();
+    let wrong_receipt_signer = resign_recovery_grant(grant.clone(), &stranger_gateway, &ca);
+    assert!(matches!(
+        verify_recovery_fixture(
+            &wrong_receipt_signer,
+            &ca,
+            &gateway,
+            &gateway_fingerprint,
+            &domain(),
+            &gateway_key(),
+            &client_key(),
+            &request,
+            &tls.authority,
+            500_050
+        ),
+        Err(CertificateError::MissingProof("gateway receipt"))
+    ));
+
+    let other_domain = TrustDomainId::new([4; 16]).expect("other domain");
+    assert!(matches!(
+        verify_recovery_fixture(
+            &grant,
+            &ca,
+            &gateway,
+            &gateway_fingerprint,
+            &other_domain,
+            &gateway_key(),
+            &client_key(),
+            &request,
+            &tls.authority,
+            500_050
+        ),
+        Err(CertificateError::TrustDomainMismatch)
+    ));
+    let other_client = WireGuardKey::from_bytes([44; 32]);
+    assert!(matches!(
+        verify_recovery_fixture(
+            &grant,
+            &ca,
+            &gateway,
+            &gateway_fingerprint,
+            &domain(),
+            &gateway_key(),
+            &other_client,
+            &request,
+            &tls.authority,
+            500_050
+        ),
+        Err(CertificateError::ClientIdentityMismatch)
+    ));
+
+    assert!(matches!(
+        verify_recovery_fixture(
+            &grant,
+            &ca,
+            &gateway,
+            &gateway_fingerprint,
+            &domain(),
+            &gateway_key(),
+            &client_key(),
+            &request,
+            &tls.authority,
+            500_300
+        ),
+        Err(CertificateError::StageExpired)
+    ));
+
+    let mut corrupt_signature = grant.clone();
+    corrupt_signature.signature = MlDsa87Signature::new(vec![1; 4_627]).expect("signature");
+    assert!(matches!(
+        verify_recovery_fixture(
+            &corrupt_signature,
+            &ca,
+            &gateway,
+            &gateway_fingerprint,
+            &domain(),
+            &gateway_key(),
+            &client_key(),
+            &request,
+            &tls.authority,
+            500_050
+        ),
+        Err(CertificateError::InvalidSignature)
+    ));
+
+    let mut changed_request = request.clone();
+    changed_request.created_at += 1;
+    assert!(matches!(
+        verify_recovery_fixture(
+            &grant,
+            &ca,
+            &gateway,
+            &gateway_fingerprint,
+            &domain(),
+            &gateway_key(),
+            &client_key(),
+            &changed_request,
+            &tls.authority,
+            500_050
+        ),
+        Err(CertificateError::FingerprintMismatch("recovery request"))
+    ));
+
+    let mut skipped = grant;
+    skipped.next_generation = 6;
+    assert!(matches!(
+        verify_recovery_fixture(
+            &skipped,
+            &ca,
+            &gateway,
+            &gateway_fingerprint,
+            &domain(),
+            &gateway_key(),
+            &client_key(),
+            &request,
+            &tls.authority,
+            500_050
+        ),
+        Err(CertificateError::FingerprintMismatch("stage receipt"))
+    ));
 }
