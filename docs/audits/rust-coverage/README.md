@@ -6,7 +6,9 @@ Audit du **23 octobre 2026**, révision `7ebc020d0425de4a30d64a93af1ead048c3f0fc
 
 **Objectif actualisé : viser 100 % des lignes de production pertinentes, et améliorer les fonctions/branches lorsque mesurables.** Les jalons 70/75/80 restent utiles au suivi ; aucun ne constitue une fin de mission. Le reliquat initial vers 100 % est de 22 139 lignes à périmètre constant. Les résultats ci-dessous restent la baseline historique, pas la mesure du lot en cours.
 
-**Lot de développement mesuré : 58,98 % de production globale (31 287 / 53 046), 2 200 tests réussis.** La vue bibliothèques séparée atteint 66,47 %. La gateway avec features de livraison reste sous 128 Mio et diminue de 6 032 octets. La régression complète reste bloquée par les audits de dépendances ; détails, reliquats et commandes dans le [journal 09](09-implementation-progress.md).
+**Dernier lot mesuré : 60,92 % de production globale (32 339 / 53 087), 2 221 tests réussis.** La vue bibliothèques séparée atteint 69,96 %. Six cas de défaut de persistance/rejeu sont reproduits puis corrigés ; 997 lignes existantes deviennent couvertes. La régression complète et les audits passent pour cette révision, avec sept avertissements RustSec autorisés. Les trois binaires contrôlés restent sous 128 Mio ; Astra augmente de 10 984 octets. Détails et limites dans le [journal 10](10-certificate-workflows.md). Il reste 20 748 lignes non couvertes vers 100 %, et 10 131 à couvrir pour le jalon 80 % au périmètre courant.
+
+Le lot suivant traite COV-003/COV-005/COV-006 et le déblocage COV-036 : [cycles de certificats et durabilité](10-certificate-workflows.md). Le journal 09 et les chiffres ci-dessous restent historiques.
 
 ## Diagnostic et résultats de référence
 
@@ -30,7 +32,9 @@ La projection initiale conservée dans 02 retirait 14 776 lignes `DA`, dont 14 6
 
 Ces mesures proviennent de WSL2/Rust 1.99, pas de la MSRV 1.95 ni d’un environnement propre reconstruit. Elles n’incluent pas le dénominateur Win32 exclu par `cfg`. Elles ne prouvent ni TPM physique, FIDO, nftables/WireGuard réel, WireGuard-NT, installation ni sûreté cryptographique. Les couvertures JS des deux interfaces ne sont pas agrégées au Rust.
 
-## Cinq risques techniques prioritaires
+## Cinq risques techniques prioritaires de l’audit initial
+
+Cette liste décrit la référence initiale. Les corrections confirmées et les prochaines priorités figurent dans les journaux [09](09-implementation-progress.md) et [10](10-certificate-workflows.md).
 
 1. **Lecture HTTP non bornée au point de consommation.** `orion-core/src/trust_update.rs:206` lit `response.bytes()` sans le plafond protocolaire 64 KiB ; recovery lit aussi intégralement, renewal vérifie après lecture. Risque de ressource à corriger/tester avec corps chunkés, pas seulement `Content-Length` — COV-009.
 2. **Routes et orchestration Astra exposées mais peu exercées.** Routeur public et nombreux handlers ont des compteurs nuls ; les tests actuels de budget/bearer ne prouvent pas montage HTTP, limites, isolation des magasins et refus sans divulgation — COV-004/005/006.
