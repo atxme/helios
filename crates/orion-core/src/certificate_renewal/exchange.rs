@@ -51,7 +51,7 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(20);
 /// A grant carries two certificates and a receipt; 256 KiB is generous. The
 /// bound exists because the peer on the other end of a tunnel is still a peer:
 /// an unbounded read lets it choose this client's allocation.
-const MAX_ANSWER_BYTES: u64 = 256 * 1024;
+const MAX_ANSWER_BYTES: usize = 256 * 1024;
 
 /// The five in-tunnel routes, resolved against one gateway.
 ///
@@ -785,19 +785,16 @@ impl RenewalSession {
         response: reqwest::Response,
     ) -> Result<T, RenewalError> {
         Self::refuse_status(&response)?;
-        if response
-            .content_length()
-            .is_some_and(|length| length > MAX_ANSWER_BYTES)
-        {
-            return Err(RenewalError::Malformed("answer exceeds the ceiling".into()));
-        }
-        let bytes = response
-            .bytes()
+        let bytes = crate::certificate_http::read_bounded(response, MAX_ANSWER_BYTES)
             .await
-            .map_err(|error| RenewalError::Transport(error.to_string()))?;
-        if bytes.len() as u64 > MAX_ANSWER_BYTES {
-            return Err(RenewalError::Malformed("answer exceeds the ceiling".into()));
-        }
+            .map_err(|error| match error {
+                crate::certificate_http::BodyError::TooLarge => {
+                    RenewalError::Malformed("answer exceeds the ceiling".into())
+                }
+                crate::certificate_http::BodyError::Transport(error) => {
+                    RenewalError::Transport(error.to_string())
+                }
+            })?;
         serde_json::from_slice(&bytes).map_err(|error| RenewalError::Malformed(error.to_string()))
     }
 
@@ -946,4 +943,60 @@ pub async fn resume(
     session
         .advance(store, &identities, identity, &active, now_unix)
         .await
+}
+
+#[cfg(test)]
+mod http_tests {
+    use super::*;
+    use crate::certificate_http::tests::{chunked, response};
+
+    #[tokio::test]
+    async fn renewal_bounds_chunked_json_before_deserialization() {
+        for length in [MAX_ANSWER_BYTES - 1, MAX_ANSWER_BYTES, MAX_ANSWER_BYTES + 1] {
+            let mut body = b"{}".to_vec();
+            body.resize(length, b' ');
+            let (response, server) = response(chunked(&body), false).await;
+            let result = RenewalSession::decode_typed::<serde_json::Value>(response).await;
+            server.abort();
+            if length <= MAX_ANSWER_BYTES {
+                assert_eq!(result.expect("bounded JSON"), serde_json::json!({}));
+            } else {
+                assert!(
+                    matches!(result, Err(RenewalError::Malformed(ref reason)) if reason == "answer exceeds the ceiling")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn renewal_preserves_coarse_status_and_read_errors() {
+        for status in [403, 503] {
+            let wire =
+                format!("HTTP/1.1 {status} Refused\r\nContent-Length: 999999\r\n\r\n").into_bytes();
+            let (answer, server) = response(wire, true).await;
+            let result = RenewalSession::decode_typed::<serde_json::Value>(answer).await;
+            server.abort();
+            if status == 503 {
+                assert!(matches!(result, Err(RenewalError::AuthorityUnavailable)));
+            } else {
+                assert!(matches!(result, Err(RenewalError::Refused { status: 403 })));
+            }
+        }
+        let (answer, server) = response(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n{".to_vec(),
+            false,
+        )
+        .await;
+        assert!(matches!(
+            RenewalSession::decode_typed::<serde_json::Value>(answer).await,
+            Err(RenewalError::Transport(_))
+        ));
+        server.abort();
+        let (answer, server) = response(chunked(b"{"), false).await;
+        assert!(matches!(
+            RenewalSession::decode_typed::<serde_json::Value>(answer).await,
+            Err(RenewalError::Malformed(_))
+        ));
+        server.abort();
+    }
 }
