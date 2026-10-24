@@ -38,3 +38,11 @@ Le renouvellement ordinaire passe dans le tunnel d’un client vivant et utilise
 La signature hybride de release ML-DSA-65/Ed25519 et la PKI de négociation ML-DSA-87 sont deux domaines distincts. Les identités Orion DPAPI et gateway TPM ont des propriétaires, clés de contexte et menaces distincts. Les DTO peuvent rester séparés lorsqu’ils protègent la frontière client/serveur ; un partage de type ne doit pas imposer une dépendance vers une application gateway.
 
 Chaque extraction future doit avoir des tests comparant **avant/après pour les cas légaux et les refus**, un examen des dépendances et une mesure du diff. La baisse de taille n’est pas un gain de couverture. Les factorisations viennent après les scénarios protecteurs, sauf le petit point d’injection strictement nécessaire à un test.
+
+## Factorisation vérifiée pendant le troisième lot
+
+| Élément | Emplacements | Nature | Gravité | Confiance | Action |
+|---|---|---|---|---|---|
+| Mutation durable d’une opération | `crates/astra/src/operations.rs::OperationStore::update_persisted`, `crates/astra/src/renewal/companion.rs`, `crates/astra/src/renewal/stage.rs` | Exacte : copie, mutation, publication pour sérialisation, rollback | Moyenne, invariant de persistance sensible | Élevée | Factorisé au lot 11 : quatre appels internes, validation structurelle et identité immuable, aucune fusion de protocoles |
+
+La factorisation suit les reproductions et leurs oracles de rechargement, pas seulement une ressemblance textuelle. Elle ne généralise pas le writer ni ne promet le rollback disque après une erreur de synchronisation post-renommage. Résultats et limites dans le [journal 11](11-companion-journal.md).

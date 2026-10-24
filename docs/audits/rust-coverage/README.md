@@ -6,9 +6,11 @@ Audit du **23 octobre 2026**, révision `7ebc020d0425de4a30d64a93af1ead048c3f0fc
 
 **Objectif actualisé : viser 100 % des lignes de production pertinentes, et améliorer les fonctions/branches lorsque mesurables.** Les jalons 70/75/80 restent utiles au suivi ; aucun ne constitue une fin de mission. Le reliquat initial vers 100 % est de 22 139 lignes à périmètre constant. Les résultats ci-dessous restent la baseline historique, pas la mesure du lot en cours.
 
-**Dernier lot mesuré : 60,92 % de production globale (32 339 / 53 087), 2 221 tests réussis.** La vue bibliothèques séparée atteint 69,96 %. Six cas de défaut de persistance/rejeu sont reproduits puis corrigés ; 997 lignes existantes deviennent couvertes. La régression complète et les audits passent pour cette révision, avec sept avertissements RustSec autorisés. Les trois binaires contrôlés restent sous 128 Mio ; Astra augmente de 10 984 octets. Détails et limites dans le [journal 10](10-certificate-workflows.md). Il reste 20 748 lignes non couvertes vers 100 %, et 10 131 à couvrir pour le jalon 80 % au périmètre courant.
+**Dernier lot mesuré : 61,40 % de production globale (32 604 / 53 102), 2 228 tests réussis.** La vue bibliothèques séparée atteint 70,70 %. Trois défauts de journal supplémentaires sont reproduits puis corrigés ; 243 lignes existantes deviennent couvertes. La régression complète et les audits passent pour cette révision, avec sept avertissements RustSec autorisés. Les trois binaires contrôlés restent sous 128 Mio ; Astra diminue de 14 888 octets. Détails et limites dans le [journal 11](11-companion-journal.md). Il reste 20 498 lignes non couvertes vers 100 %, et 9 878 à couvrir pour le jalon 80 % au périmètre courant.
 
 Le lot suivant traite COV-003/COV-005/COV-006 et le déblocage COV-036 : [cycles de certificats et durabilité](10-certificate-workflows.md). Le journal 09 et les chiffres ci-dessous restent historiques.
+
+Poursuite COV-005/COV-006/COV-020 : [journal du compagnon](11-companion-journal.md).
 
 ## Diagnostic et résultats de référence
 

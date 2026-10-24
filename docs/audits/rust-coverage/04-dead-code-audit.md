@@ -46,3 +46,7 @@ rg -n 'cfg\(.*coverage|coverage\(off\)|allow\(dead_code\)|allow\(unused' crates 
 cargo machete --version
 cargo machete --skip-target-dir crates tools apps/orion/src-tauri
 ```
+
+## Qualification du chemin compagnon pendant le troisième lot
+
+`crates/astra/src/renewal/companion.rs::{read, signer_request, signer_result}` n’est pas du code mort confirmé. Les demandes actuelles quittent `AwaitingOperator` avant leur première écriture, mais `OperationStore::load` accepte encore des opérations historiques vivantes de ce type dans le format v1. Les tests du lot 11 construisent puis rechargent réellement ces enregistrements ; ils ne prouvent pas qu’un déploiement actuel en possède. Cette frontière de compatibilité explique les chemins auparavant non couverts (catégorie C de l’audit initial), sans autoriser leur suppression. Le validateur gateway continue de refuser leur ancien motif d’approbation de stage. La décision éventuelle de retirer cet état/ces routes doit traiter explicitement les journaux et clients externes ; elle ne se déduit pas de la couverture. Voir le [journal 11](11-companion-journal.md).
