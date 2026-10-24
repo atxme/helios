@@ -408,3 +408,28 @@ fn a_refused_seal_leaves_no_file_behind() {
         "nothing must have been created"
     );
 }
+
+/// A record that exists but cannot be read is not an absent one: the
+/// enrollment completion reads "absent" as "no pending request on this
+/// machine", and would blame the document for a permission or disk error.
+#[test]
+fn an_unreadable_named_record_is_not_reported_absent() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let store = ProtectedIdentityStore::at(directory.path().to_path_buf());
+    std::fs::create_dir(directory.path().join(format!("pending-x{SEALED_SUFFIX}")))
+        .expect("a directory where the record should be");
+
+    let error = store.open_named("pending-x").expect_err("unreadable");
+    assert!(
+        !matches!(
+            error.downcast_ref::<IdentityStoreError>(),
+            Some(IdentityStoreError::NotFound(_))
+        ),
+        "{error:#}"
+    );
+    let absent = store.open_named("pending-y").expect_err("absent");
+    assert!(matches!(
+        absent.downcast_ref::<IdentityStoreError>(),
+        Some(IdentityStoreError::NotFound(_))
+    ));
+}

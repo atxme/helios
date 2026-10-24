@@ -645,11 +645,22 @@ impl ProtectedIdentityStore {
     }
 
     /// Opens a record sealed by [`Self::seal_named`].
+    ///
+    /// Only an absent file is [`IdentityStoreError::NotFound`]: the enrollment
+    /// completion reads that as "no pending request here", so a permission or
+    /// disk error has to reach the user as itself.
     pub(crate) fn open_named(&self, name: &str) -> Result<Zeroizing<Vec<u8>>> {
         let path = self.path_of(name)?;
-        let sealed =
-            read_bounded(&path).map_err(|_| IdentityStoreError::NotFound(name.to_string()))?;
-        unseal(&sealed)
+        match std::fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(IdentityStoreError::NotFound(name.to_string()).into());
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("lecture de {}", path.display()));
+            }
+            Ok(_) => {}
+        }
+        unseal(&read_bounded(&path)?)
     }
 
     /// Removes a record sealed by [`Self::seal_named`]. Absent is not an error.
