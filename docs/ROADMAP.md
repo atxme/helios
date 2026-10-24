@@ -63,7 +63,7 @@ qui peut invalider une conception, ensuite ce qui valide du code existant.
 
 | # | Essai | Source | Faisable ici ? |
 | --- | --- | --- | --- |
-| V1 | **Renouvellement de PSK à chaud avec trafic actif**, via « Renouveler la clé maintenant », noyau Linux **et** WireGuard-NT, chemin sain puis dégradé | v5 §20.0, §12.3, `testing/TESTING.md` | **Non** : matériel requis (gateway physique, WAN réel) et cible requise (WireGuard-NT sur Windows) |
+| V1 | **Renouvellement de PSK à chaud avec trafic actif**, via « Renouveler la clé maintenant », noyau Linux **et** WireGuard-NT, chemin sain puis dégradé. **Chemin sain validé le 24 octobre 2026** (Orion sous WireGuard-NT, gateway noyau Linux), après correction de la réinscription du pair sous Windows, que `defguard` 0.12 n'implémente pas ; chemin dégradé à faire | v5 §20.0, §12.3, `testing/TESTING.md` | **Non** : matériel requis (gateway physique, WAN réel) et cible requise (WireGuard-NT sur Windows) |
 | V2 | Banc netns reproductible (T22) — **livré** : `scripts/netns-bench.sh`, sans root, WSL2 compris | ETUDE-IPV6 T22, TESTING.md « Banc netns » | **Oui**. Premier passage : défaut T21 (rejet IPv6 non atteint avec `forwarding = 0`), corrigé par un rejet en `prerouting` |
 | V3 | Campagne v5 §20.2 : pose des slots, redémarrage `heliosd`, arrêt brutal client, `release` dans le tunnel, coupure WAN > 35 s et > 5 min | v5 §20.2 | **Non** : matériel requis (coupure WAN réelle) |
 | V4 | Campagne IPv6 (T23) et VM Windows (T01, T02, T18, T19) | ETUDE-IPV6 | **Non** : cible Windows et réseau réel |
