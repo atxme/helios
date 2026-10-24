@@ -163,14 +163,23 @@ coffre est ouvert avec ses protections actuelles, rescellé sous les nouvelles,
 nouveau vérifié. Une migration qui échoue laisse l'ancien coffre intact et le
 dit. Les profils et identités existants doivent survivre sans réenrôlement.
 
-**L'installation.** `tauri.conf.json` ne fixe pas le mode NSIS, qui installe
-donc par défaut pour l'utilisateur courant, sous `%LOCALAPPDATA%`, dans un
-dossier où le compte écrit. Un programme non élevé y remplacerait `orion.exe`,
-et l'UAC suivant élèverait son code. Après F11, Orion s'installe **pour la
-machine**, dans `Program Files` (`installMode: perMachine`). L'UAC est demandé
-à l'installation. Une installation par utilisateur existante est retirée par
-la nouvelle, sans perte des données (la migration du coffre ci-dessus s'en
-charge).
+**L'installation.** Le MSI, format livré, s'installe déjà pour la machine :
+il écrit sous `HKLM` (ORION-DISTRIBUTION) et le gabarit WiX de Tauri installe
+dans `Program Files`. Le paquet NSIS facultatif (`cargo xtask orion-msi
+--with-nsis`), lui, ne fixe pas `installMode` et s'installe donc par défaut
+pour l'utilisateur courant, sous `%LOCALAPPDATA%`, dans un dossier où le compte
+écrit : un programme non élevé y remplacerait `orion.exe`, et l'UAC suivant
+élèverait son code. Après F11 :
+
+- le NSIS passe à `installMode: perMachine`, comme le MSI ;
+- le moteur, en build de release, vérifie au démarrage que le dossier de son
+  exécutable n'est pas modifiable par un compte non administrateur, et refuse
+  de s'élever sinon (*fail-closed*). La règle ne dépend plus de l'installateur
+  employé.
+
+Note : la relecture du 24 octobre 2026 avait d'abord affirmé que l'installation
+livrée était par utilisateur ; c'est faux pour le MSI, vrai pour le NSIS. La
+décision 2 a reste : installation pour la machine, quel que soit le paquet.
 
 ## 8. Canal entre l'IHM et le moteur
 
@@ -312,9 +321,10 @@ MANUAL-TESTING :
    et le moteur s'arrête ;
 10. cérémonie YubiKey depuis l'IHM, sans `helios-astra-helper` installé ;
 11. terminal SSH : le shell ouvert est non élevé ;
-12. mise à jour depuis une installation par utilisateur : Orion se retrouve
-    dans `Program Files`, le coffre migré dans le dossier réservé, profils et
-    identités intacts, ancien coffre supprimé ;
+12. mise à jour d'une installation existante : le coffre migré dans le
+    dossier réservé, profils et identités intacts, ancien coffre supprimé ;
+    `orion.exe` copié dans un dossier modifiable par l'utilisateur refuse de
+    lancer son moteur ;
 13. depuis un programme non élevé du même compte : le dossier du coffre est
     illisible et la clé TPM inutilisable ;
 14. un dossier de coffre dont on élargit la DACL à l'utilisateur : le moteur
