@@ -93,6 +93,7 @@ est bloqué ou risque d'être refait. Une décision ne se prend pas depuis le d�
 | D7 | Acceptation ICMPv6 Packet Too Big scopée par interface | FIREWALL-V2, ETUDE-IPV6 §9.1 | après observation V5 |
 | D8 | Authentification de `POST /v1/campaigns` sur l'origine publique | ROTATION-CERTIFICATS §11.6, §12.5 | boutons de campagne dans la console ; aujourd'hui volontairement refusé |
 | D9 | Certificat EV Authenticode : achat et token de signature | ADR-004 « Limites connues » | réputation SmartScreen ; **matériel requis** pour la signature, décision de coût |
+| D10 | **Compagnon non élevé sans second binaire** : `helios-astra-helper` existe parce qu'Orion tourne élevé (WireGuard-NT l'exige) alors que l'API WebAuthn de Windows ne répond qu'à intégrité moyenne dans la session de l'utilisateur. Options : (a) `orion.exe` se relance lui-même en mode compagnon sous un jeton désélevé — un binaire, deux processus, même frontière qu'aujourd'hui ; (b) F11 d'abord, l'IHM non privilégiée parle alors à WebAuthn directement et le compagnon disparaît | ADR-008, `tools/helios-astra-helper`, F11 | F14 (règle « Orion seul binaire client ») |
 
 ## 5. Horizon 3 : fonctionnalités
 
@@ -133,7 +134,7 @@ une distribution automatique de PSK sans l'avoir livrée.
 | F11 | **Séparation des privilèges Windows** : service privilégié, IPC authentifié, politique d'autorisation, pour retirer `requireAdministrator` de l'IHM | ADR-004 « Limites connues » | conception et audit conjoints | Conception : **oui** ; validation : **non** (Windows réel) |
 | F12 | **Stockage protégé Linux** (`libsecret`) : refus explicite actuel conservé d'ici là. macOS retiré du périmètre. | ADR-005, ADR-006 | : | Code : **oui** ; validation : session Linux de bureau, **non** depuis WSL2 |
 | F13 | Association `.orion` pour le paquet NSIS | ORION-DISTRIBUTION | : | Code : **oui** ; validation : **non** (Windows réel) |
-| F14 | Parité Orion des cérémonies Astra encore portées par `astra-signer` | ADR-008 | : | **Oui** |
+| F14 | **Orion seul binaire client : absorption d'`astra-signer`.** Règle posée le 24 octobre 2026 : côté poste, opérateur compris, plus aucun binaire livré à part d'Orion ; les outils peuvent vivre *dans* Orion, rien d'externe. Toutes les cérémonies d'`astra-signer` passent dans Orion, l'enrôlement v5 en premier : créer l'invitation (bouton), accepter la demande, signer le document, lister et révoquer les invitations, avec l'assemblage du brouillon que fait aujourd'hui `helios enroll document`. Puis : initialisation du domaine et credentials (`init`, `enrol`, `verify`, `list`, `remove`, `devices`), `domain`, `issue-ca-tls`, `authorize-issuer`, `bindings`, approbations et campagnes, rotations de CA, révocation, amorçage et transitions de gateway. La recette d'enrôlement v5 sur Windows (MANUAL-TESTING) attend cette étape pour se jouer depuis Orion seul | ADR-008, `tools/astra-signer/src/cli.rs` | D10 pour le compagnon | **Oui** |
 
 Pour F11, le client WireGuard Windows officiel est un modèle éprouvé : un
 service gestionnaire SYSTEM qui démarre un service par tunnel, une IHM non
@@ -185,8 +186,9 @@ de générations ou de délégation :
 ```text
 Faisable maintenant (sans matériel)
   outillage headless Orion · T2 · T4 compilation · T5 · T6 mesure
-  D1, D5 à D8 arbitrages · F2 enrôlement
-  F6 nomade · F8 limit · F14 Astra · F15 reproductible
+  D1, D5 à D8, D10 arbitrages
+  F14 Orion seul binaire client (enrôlement v5 d'abord), après D10
+  F6 nomade · F8 limit · F15 reproductible
 
 Faisable en code, validation sur cible à planifier
   F5 (après D1) · F7 (après D5) · F11 conception · F12 libsecret · F13 NSIS
