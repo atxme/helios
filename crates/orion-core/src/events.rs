@@ -4,7 +4,7 @@
 //! TypeScript types as heliosd's web app.
 
 use aether::TunnelState;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// What occupies the `PresharedKey` slot of the current tunnel.
 ///
@@ -14,7 +14,7 @@ use serde::Serialize;
 /// exchange conducted on every connection. The profile alone can't
 /// distinguish them, since the negotiated PSK is never persisted; only the
 /// client core knows which one it set, hence this event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PskKind {
     /// Empty slot: confidentiality relies on Curve25519 alone.
@@ -36,7 +36,7 @@ pub enum PskKind {
 /// `defguard_wireguard_rs` on Windows drops the prefixes of an address family
 /// the adapter does not carry, without an error. Only a read-back of what was
 /// applied tells the two situations apart, hence this event.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum CaptureCheck {
     /// Every requested prefix and address was read back from the adapter.
@@ -59,7 +59,7 @@ pub enum CaptureCheck {
 }
 
 /// Real-time event pushed to the frontend (`emit("helios://event", …)`).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientEvent {
     /// Tunnel state transition.

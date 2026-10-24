@@ -29,6 +29,7 @@ default-members = [
     "crates/aether-vault",
     "crates/aether-fido",
     "crates/orion-core",
+    "crates/orion-engine",
     "crates/heliosd",
     "tools/astra-signer",
     "tools/helios-astra-helper",
