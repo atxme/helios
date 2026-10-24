@@ -471,6 +471,7 @@ export type ClientEvent =
   | { type: 'state_changed'; state: TunnelState }
   | { type: 'protection'; psk: PskKind }
   | { type: 'capture'; capture: CaptureCheck }
+  | { type: 'renewal'; in_flight: boolean }
   | { type: 'log'; level: string; message: string }
   | { type: 'telemetry'; iface: string; rx_bps: number; tx_bps: number; rx_pps: number; tx_pps: number }
   | { type: 'error'; message: string }

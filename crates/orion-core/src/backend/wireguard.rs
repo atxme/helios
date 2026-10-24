@@ -905,7 +905,8 @@ impl VpnBackend for WireGuardBackend {
         }
         sink(ClientEvent::log(
             "info",
-            "pair réinscrit — session WireGuard réinitialisée sur le nouveau PSK".to_string(),
+            "pair réinscrit — session WireGuard réinitialisée sur la nouvelle clé post-quantique"
+                .to_string(),
         ));
         Ok(())
     }

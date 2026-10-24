@@ -1064,6 +1064,38 @@ async fn a_manual_renewal_requested_while_one_runs_is_refused_aloud() {
     assert!(dry.rekeyed_psks().is_empty());
 }
 
+/// The refusal above only answers a click; the screen has to know for the
+/// whole run, so that it never offers a second renewal at all.
+#[tokio::test]
+async fn a_renewal_announces_when_it_starts_and_when_it_ends() {
+    let (dry, _backend, receipt) = mounted().await;
+    let directory = tempfile::tempdir().expect("tempdir");
+    let store = crate::ProtectedIdentityStore::at(directory.path().join("identities"));
+    let ctrl = VpnController::new(dry.clone()).with_key_negotiation_identities(Arc::new(store));
+    *ctrl.installed.lock().await = Some(receipt);
+    *ctrl.state.write().unwrap() = TunnelState::Up;
+
+    let announced = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorder: EventSink = {
+        let announced = Arc::clone(&announced);
+        Arc::new(move |event| {
+            if let ClientEvent::Renewal { in_flight } = event {
+                announced.lock().unwrap().push(in_flight);
+            }
+        })
+    };
+    ctrl.renew_now(recorder).await.expect("the renewal starts");
+    for _ in 0..500 {
+        if !ctrl.renewing.load(Ordering::SeqCst) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    assert!(!ctrl.renewing.load(Ordering::SeqCst), "the renewal ends");
+    assert_eq!(*announced.lock().unwrap(), vec![true, false]);
+}
+
 /// A reconnection or a disconnection takes the data plane over while a
 /// renewal is in flight. The renewal's rollback must then leave the peer
 /// alone: re-registering the previous PSK would overwrite the newer tunnel.

@@ -28,6 +28,8 @@ export function useClient() {
   // `null` = the ongoing connection hasn't decided yet. Definitely not
   // `'none'` by default: that would assert the absence of a PSK before knowing.
   const [psk, setPsk] = useState<PskKind | null>(null)
+  // A PSK renewal between its start and its outcome, as Rust announces it.
+  const [renewing, setRenewing] = useState(false)
   // What the mounted adapter was read back to capture. `null` = no verdict:
   // nothing mounted, or a backend that cannot read it back.
   const [capture, setCapture] = useState<CaptureCheck | null>(null)
@@ -95,6 +97,7 @@ export function useClient() {
             // gets renegotiated on the next mount. Keeping it would display a
             // protection that no tunnel carries anymore.
             setPsk(null)
+            setRenewing(false)
             // Unlike the PSK, the capture outlives `failed`: the adapter stays
             // mounted on failure with the routes it had (ADR-001 §3 bis), so a
             // missing `::/0` is still missing. Only unmounting ends it.
@@ -106,6 +109,9 @@ export function useClient() {
           break
         case 'capture':
           setCapture(ev.capture)
+          break
+        case 'renewal':
+          setRenewing(ev.in_flight)
           break
         case 'log':
           pushLog(ev.level, ev.message)
@@ -189,7 +195,7 @@ export function useClient() {
     setError(null)
     try {
       await api.renewPsk()
-      pushLog('info', 'Renouvellement de la clé demandé.')
+      pushLog('info', 'Renouvellement de la clé post-quantique demandé.')
     } catch (cause) {
       pushLog('warn', `Renouvellement non lancé — ${String(cause)}`)
     }
@@ -259,6 +265,7 @@ export function useClient() {
     history,
     upSince,
     psk,
+    renewing,
     capture,
     error,
     selectedProfile,

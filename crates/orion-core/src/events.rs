@@ -71,6 +71,9 @@ pub enum ClientEvent {
     /// Only a backend able to read it back emits it: the simulation verifies
     /// nothing, so it claims nothing.
     Capture { capture: CaptureCheck },
+    /// A PSK renewal started (`true`) or ended, whatever its outcome
+    /// (`false`). The UI withholds its renewal action in between.
+    Renewal { in_flight: bool },
     /// Log line to display in the UI.
     Log { level: String, message: String },
     /// Network counters relayed from heliosd telemetry (post-tunnel).
@@ -125,6 +128,13 @@ mod tests {
 
         let json = serde_json::to_value(ClientEvent::protection(PskKind::None)).unwrap();
         assert_eq!(json["psk"], "none");
+    }
+
+    #[test]
+    fn a_renewal_announcement_serializes_its_flag() {
+        let json = serde_json::to_value(ClientEvent::Renewal { in_flight: true }).unwrap();
+        assert_eq!(json["type"], "renewal");
+        assert_eq!(json["in_flight"], true);
     }
 
     #[test]

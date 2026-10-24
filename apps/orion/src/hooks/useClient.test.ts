@@ -88,6 +88,23 @@ beforeEach(() => {
 afterEach(cleanup)
 
 describe('useClient', () => {
+  it('follows a renewal from its start to its end, and forgets it with the tunnel', async () => {
+    const { result } = renderHook(() => useClient())
+    await waitFor(() => expect(result.current.selectedProfile?.name).toBe('portable'))
+    expect(result.current.renewing).toBe(false)
+
+    act(() => emit({ type: 'renewal', in_flight: true }))
+    expect(result.current.renewing).toBe(true)
+    act(() => emit({ type: 'renewal', in_flight: false }))
+    expect(result.current.renewing).toBe(false)
+
+    act(() => {
+      emit({ type: 'renewal', in_flight: true })
+      emit({ type: 'state_changed', state: 'down' })
+    })
+    expect(result.current.renewing).toBe(false)
+  })
+
   it('loads state, consumes events and releases both subscriptions', async () => {
     const { result, unmount } = renderHook(() => useClient())
 

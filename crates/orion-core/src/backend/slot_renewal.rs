@@ -77,13 +77,13 @@ impl Drop for RestorePrevious {
                     match backend.rekey_peer(&previous, &sink).await {
                         Ok(()) => sink(ClientEvent::log(
                             "warn",
-                            "renouvellement non abouti : l'ancien PSK est remis en place"
+                            "renouvellement non abouti : l'ancienne clé post-quantique est remise en place"
                                 .to_string(),
                         )),
                         Err(error) => sink(ClientEvent::log(
                             "error",
                             format!(
-                                "renouvellement non abouti et ancien PSK non remis en place \
+                                "renouvellement non abouti et ancienne clé post-quantique non remise en place \
                                  ({error:#}) : la reconnexion automatique prendra le relais"
                             ),
                         )),
@@ -167,7 +167,8 @@ pub(super) fn settle_renewal(
             sink(ClientEvent::protection(PskKind::MlKem));
             sink(ClientEvent::log(
                 "info",
-                "clé renouvelée — nouveau PSK ML-KEM en place, durée et volume remis à zéro"
+                "clé post-quantique renouvelée — nouvelle clé ML-KEM en place, durée et volume \
+                 remis à zéro"
                     .to_string(),
             ));
         }
@@ -178,8 +179,8 @@ pub(super) fn settle_renewal(
             sink(ClientEvent::log(
                 "warn",
                 format!(
-                    "renouvellement du PSK : échec — {error:#}. Nouvel essai dans {} min ; \
-                     l'ancien PSK reste en place jusqu'à son échéance.",
+                    "renouvellement de la clé post-quantique : échec — {error:#}. Nouvel essai dans \
+                     {} min ; l'ancienne clé reste en place jusqu'à son échéance.",
                     delay.as_secs() / 60
                 ),
             ));
@@ -206,7 +207,8 @@ pub(super) async fn run_renewal(
     sink(ClientEvent::log(
         "info",
         format!(
-            "renouvellement du PSK ML-KEM déclenché ({}) — négociation dans le tunnel",
+            "renouvellement de la clé post-quantique déclenché ({}) — négociation ML-KEM dans \
+             le tunnel",
             trigger.describe()
         ),
     ));

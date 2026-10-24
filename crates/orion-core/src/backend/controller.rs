@@ -82,7 +82,7 @@ pub(super) async fn upgrade_to_post_quantum(
         sink(ClientEvent::log(
             "info",
             "Pas d'URL Helios interne au profil : le tunnel reste classique, \
-             Curve25519 seul, sans PSK ML-KEM"
+             Curve25519 seul, sans clé post-quantique ML-KEM"
                 .to_string(),
         ));
         return;
@@ -92,7 +92,7 @@ pub(super) async fn upgrade_to_post_quantum(
         sink(ClientEvent::protection(PskKind::None));
         sink(ClientEvent::log(
             "warn",
-            "Aucun handshake WireGuard dans le délai imparti : PSK ML-KEM reporté à la \
+            "Aucun handshake WireGuard dans le délai imparti : clé post-quantique reportée à la \
              prochaine connexion — le tunnel reste classique"
                 .to_string(),
         ));
@@ -105,7 +105,10 @@ pub(super) async fn upgrade_to_post_quantum(
             sink(ClientEvent::protection(PskKind::None));
             sink(ClientEvent::log(
                 "warn",
-                format!("Négociation du PSK ML-KEM impossible : {e} — le tunnel reste classique"),
+                format!(
+                    "Négociation de la clé post-quantique ML-KEM impossible : {e} — le tunnel \
+                     reste classique"
+                ),
             ));
             return;
         }
@@ -134,7 +137,7 @@ pub(super) async fn upgrade_to_post_quantum(
             sink(ClientEvent::log(
                 "info",
                 format!(
-                    "PSK ML-KEM-1024 installé (valable {} s) — \
+                    "clé post-quantique ML-KEM-1024 installée (valable {} s) — \
                      le prochain handshake WireGuard sera protégé",
                     outcome.lifetime.as_secs()
                 ),
@@ -150,8 +153,8 @@ pub(super) async fn upgrade_to_post_quantum(
             sink(ClientEvent::log(
                 "error",
                 format!(
-                    "PSK ML-KEM négocié mais non installé sur cette machine : {e}. La gateway \
-                     l'a déjà installé de son côté — se reconnecter pour resynchroniser \
+                    "clé post-quantique ML-KEM négociée mais non installée sur cette machine : {e}. \
+                     La gateway l'a déjà installée de son côté — se reconnecter pour resynchroniser \
                      les deux slots."
                 ),
             ));
@@ -778,7 +781,7 @@ impl VpnController {
             .await
         {
             anyhow::bail!(
-                "un renouvellement est déjà en cours : attendre son issue, qui est annoncée                  dans le journal"
+                "un renouvellement est déjà en cours : attendre son issue, qui est annoncée dans le journal"
             );
         }
         Ok(())
@@ -789,13 +792,18 @@ impl VpnController {
         if self.renewing.swap(true, Ordering::SeqCst) {
             return false;
         }
-        let flag = ClearOnDrop(Arc::clone(&self.renewing));
+        let mut flag = ClearOnDrop {
+            flag: Arc::clone(&self.renewing),
+            announce: None,
+        };
         let Some(identities) = self.key_negotiation_identities.clone() else {
             return false;
         };
         let backend = Arc::clone(&self.backend);
         let installed = Arc::clone(&self.installed);
         let sink = self.wrap_sink(user_sink);
+        sink(ClientEvent::Renewal { in_flight: true });
+        flag.announce = Some(Arc::clone(&sink));
         let owner = DataPlaneOwner::claim(&self.data_plane_epoch);
         let handle = tokio::spawn(async move {
             let _flag = flag;
@@ -851,11 +859,20 @@ impl DataPlaneOwner {
     }
 }
 
-/// Clears the in-flight flag however the renewal task ends.
-struct ClearOnDrop(Arc<AtomicBool>);
+/// Clears the in-flight flag however the renewal task ends, aborted
+/// included, and says so to the screen that was told it started.
+struct ClearOnDrop {
+    flag: Arc<AtomicBool>,
+    announce: Option<EventSink>,
+}
 
 impl Drop for ClearOnDrop {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::SeqCst);
+        // Cleared first: the screen re-offers a renewal only once a click
+        // would be accepted.
+        self.flag.store(false, Ordering::SeqCst);
+        if let Some(sink) = self.announce.take() {
+            sink(ClientEvent::Renewal { in_flight: false });
+        }
     }
 }

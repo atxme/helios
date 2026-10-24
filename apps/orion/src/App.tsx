@@ -404,6 +404,7 @@ export default function App() {
                 history={c.history}
                 adapterUp={c.adapterUp}
                 psk={c.psk}
+                renewing={c.renewing}
                 onConnect={() => c.connect(c.selectedProfile?.name)}
                 onDisconnect={c.disconnect}
                 onOpenSsh={() => c.openSshTerminal(c.selectedProfile?.name)}

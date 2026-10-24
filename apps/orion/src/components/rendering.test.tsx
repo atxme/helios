@@ -112,6 +112,7 @@ describe('Orion presentational branches', () => {
       selected: ClientProfile | null,
       history = [] as { rx_bps: number; tx_bps: number }[],
       adapterUp = state !== 'down',
+      renewing = false,
     ) =>
       renderToStaticMarkup(
         <ConnectView
@@ -122,6 +123,7 @@ describe('Orion presentational branches', () => {
           history={history}
           adapterUp={adapterUp}
           psk={state === 'up' ? 'ml_kem' : null}
+          renewing={renewing}
           onConnect={callback}
           onOpenSsh={callback}
           onRenewKey={callback}
@@ -149,9 +151,14 @@ describe('Orion presentational branches', () => {
     ])
     expect(active).toContain('Débit du tunnel')
     expect(active).toContain('100.64.1.2/32')
-    expect(active).toContain('Renouveler la clé maintenant')
-    expect(render('connecting', profile())).not.toContain('Renouveler la clé maintenant')
-    expect(render('down', profile())).not.toContain('Renouveler la clé maintenant')
+    expect(active).toContain('Renouveler la clé post-quantique')
+    expect(render('connecting', profile())).not.toContain('Renouveler la clé post-quantique')
+    expect(render('down', profile())).not.toContain('Renouveler la clé post-quantique')
+    // A renewal in flight is never offered a second one: the action stays in
+    // place, disabled, and says what it is waiting for.
+    const renewing = render('up', profile(), [], true, true)
+    expect(renewing).not.toContain('Renouveler la clé post-quantique')
+    expect(renewing).toMatch(/<button[^>]*disabled=""[^>]*>(?:(?!<\/button>).)*Renouvellement en cours/)
   })
 
   it('renders the profile master-detail entry points without invoking effects', () => {

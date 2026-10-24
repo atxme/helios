@@ -504,7 +504,7 @@ Cet essai juge le renouvellement dans le tunnel
 sur les critères du [§12.3](../specification/NEGOCIATION-DE-CLE-V5.md#123-politique-de-renouvellement).
 Il se mène sur le **code de production**, sans variable qui raccourcisse la durée
 de vie : le renouvellement est forcé par l'action « Renouveler la clé
-maintenant » d'Orion. Rien n'en est mesuré à ce jour, et rien ne se coche depuis
+post-quantique » d'Orion. Rien n'en est mesuré à ce jour, et rien ne se coche depuis
 WSL2.
 
 À répéter sur le **noyau Linux** et sur **WireGuard-NT**, d'abord sur un chemin
@@ -521,7 +521,8 @@ sain, puis sur un chemin dégradé :
 4. sur la gateway, capturer les messages de négociation :
    `tcpdump -ttt 'udp port <port> and (udp[8]=1 or udp[8]=2)'` ;
 5. déclencher **20 renouvellements consécutifs** par « Renouveler la clé
-   maintenant », en attendant le « clé renouvelée » de chacun ;
+   post-quantique », en attendant le « clé post-quantique renouvelée » de
+   chacun : l'action reste désactivée tant qu'un renouvellement est en cours ;
 6. relever pour chaque renouvellement le délai jusqu'au handshake observé après
    la réinitialisation, le plus long trou de réponses du `ping`, et l'état de la
    connexion `iperf3` ;
@@ -536,7 +537,7 @@ Verdict **PASS ou FAIL par critère**, pour chaque noyau et chaque chemin :
 | handshake après la réinitialisation, observé sur les deux backends | < 5 s | `wg show … latest-handshakes` et journaux des deux côtés |
 | interruption du trafic applicatif | < 1 s | plus long trou du `ping` |
 | sessions TCP traversant le tunnel | aucune rompue | `iperf3` unique, sans erreur dans le JSON |
-| renouvellements consécutifs réussis | 20 sur 20 | événements « clé renouvelée » |
+| renouvellements consécutifs réussis | 20 sur 20 | événements « clé post-quantique renouvelée » |
 
 Un seul FAIL sur le chemin sain rouvre la politique : le repli est la
 déconnexion puis la reconnexion complètes du §12.3, jamais la suppression de la

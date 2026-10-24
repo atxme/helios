@@ -53,6 +53,8 @@ interface Props {
   onDisconnect: () => void
   /** Opens a terminal on the gateway, de-elevated. */
   onOpenSsh: () => void
+  /** A renewal is in flight, from its start to its outcome. */
+  renewing: boolean
   /** Renews the ML-KEM PSK through the tunnel. */
   onRenewKey: () => void
 }
@@ -86,6 +88,7 @@ export function ConnectView({
   history,
   adapterUp,
   psk,
+  renewing,
   onConnect,
   onDisconnect,
   onOpenSsh,
@@ -307,7 +310,9 @@ export function ConnectView({
         )}
 
         {/* Shown only on a tunnel carrying traffic under an ML-KEM PSK: the
-            renewal rides that tunnel, and Rust refuses it otherwise. */}
+            renewal rides that tunnel, and Rust refuses it otherwise. Held
+            disabled while one runs: a second renewal on top of the first is
+            refused by Rust too, and offering it only invites the click. */}
         {state === 'up' && psk === 'ml_kem' && (
           <Button
             fullWidth
@@ -315,9 +320,12 @@ export function ConnectView({
             color="inherit"
             startIcon={<KeyRound size={16} aria-hidden />}
             onClick={onRenewKey}
+            disabled={renewing}
             sx={{ fontSize: 12, textTransform: 'none', color: 'text.secondary' }}
           >
-            Renouveler la clé maintenant
+            {renewing
+              ? 'Renouvellement en cours de la clé post-quantique…'
+              : 'Renouveler la clé post-quantique'}
           </Button>
         )}
 

@@ -1905,8 +1905,9 @@ Après un rollback ou un délai dépassé, Orion retente dans le tunnel après 1
 4, 8 puis 15 minutes, délai plafonné à 15 minutes, jusqu'à 100 % de la limite.
 Au-delà, la gateway retire le slot et le chemin existant (vieillissement du
 handshake, puis négociation publique) reprend. Orion propose aussi une action
-manuelle « Renouveler la clé maintenant », refusée hors d'un tunnel monté en
-`ml_kem` ; c'est elle qui permet de mesurer le critère ci-dessous sur le code de
+manuelle « Renouveler la clé post-quantique », refusée hors d'un tunnel monté en
+`ml_kem` et désactivée tant qu'un renouvellement est en cours, de son départ à
+son issue ; c'est elle qui permet de mesurer le critère ci-dessous sur le code de
 production.
 
 #### Ce qu'un renouvellement fait au plan de données
@@ -2953,7 +2954,7 @@ une compilation WSL2.
   (V1, [§20.0](#200-essais-bloquants)).** C'est l'essai de ce document qui peut
   invalider une décision de conception plutôt qu'une implémentation. Levé comme
   préalable par la décision du 2026-10-09, il se mène sur le **code de
-  production**, via l'action « Renouveler la clé maintenant », sur le noyau
+  production**, via l'action « Renouveler la clé post-quantique », sur le noyau
   Linux et sur WireGuard-NT, et se juge sur le tableau de critères de
   [§12.3](#123-politique-de-renouvellement) : handshake sous 5 secondes après la
   réinitialisation et observé **sur les deux backends**, interruption sous une
