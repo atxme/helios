@@ -730,7 +730,8 @@ impl NetworkConfig {
     ///
     /// A peer without a PQ identity was a plain WireGuard peer: its floor is
     /// removed. A peer with one is raised to `ml_kem`, the v5 admission
-    /// default. Nothing else is changed, and a file with nothing to migrate is
+    /// default — including one written with no floor at all, which took
+    /// `classic` by default then. Nothing else is changed, and a file with nothing to migrate is
     /// not written at all. Only the file's values are rewritten, not its layout:
     /// the TOML is re-serialized from its parsed form.
     ///
@@ -749,10 +750,12 @@ impl NetworkConfig {
             .and_then(toml::Value::as_array_mut)
         {
             for peer in peers.iter_mut().filter_map(toml::Value::as_table_mut) {
-                let legacy = peer
-                    .get(MINIMUM_MODE_KEY)
-                    .and_then(toml::Value::as_str)
-                    .is_some_and(|mode| mode == LEGACY_CLASSIC_MODE);
+                // A PQ peer written without a floor took `classic` by default
+                // before v5: the same legacy value, only implicit.
+                let legacy = match peer.get(MINIMUM_MODE_KEY) {
+                    Some(mode) => mode.as_str() == Some(LEGACY_CLASSIC_MODE),
+                    None => peer.contains_key(PQ_IDENTITY_KEY),
+                };
                 if !legacy {
                     continue;
                 }

@@ -970,6 +970,30 @@ fn a_legacy_classic_floor_is_migrated_per_peer_identity() {
     });
 }
 
+/// Before v5 a PQ peer written without a floor defaulted to `classic`. With
+/// that value gone, the same file failed startup ("no security floor") where
+/// an explicit `classic` was migrated.
+#[cfg(unix)]
+#[test]
+fn a_pq_peer_without_a_floor_is_migrated_like_a_legacy_classic_one() {
+    let file = "wg_address = \"100.64.0.1/10\"\n\n[[peers]]\nname = \"negocie\"\npublic_key = \"CLE-NEGOCIE\"\naddress = \"100.64.1.3/32\"\nkey_negotiation_certificate_sha256 = \"0e9d8c7b6a5f4e3d2c1b0a9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c3b2a1f0e9d\"\nkey_negotiation_pq_certificate_sha256 = \"f0e1d2c3b4a5968778695a4b3c2d1e0ff0e1d2c3b4a5968778695a4b3c2d1e0f\"\npersistent_keepalive_secs = 25\n";
+    with_network_file("floorless", Some(file), |_| {
+        let migrated = NetworkConfig::migrate_legacy_classic_floor().expect("migration");
+        assert_eq!(
+            migrated,
+            vec![LegacyFloorMigration {
+                peer: "negocie".into(),
+                floor: Some(crate::key_negotiation::ProtectionMode::MlKem),
+            }]
+        );
+        let loaded = NetworkConfig::load().expect("the migrated file loads");
+        assert_eq!(
+            loaded.peers[0].minimum_key_negotiation_mode,
+            Some(crate::key_negotiation::ProtectionMode::MlKem)
+        );
+    });
+}
+
 #[cfg(unix)]
 #[test]
 fn nothing_to_migrate_leaves_the_file_byte_identical() {
