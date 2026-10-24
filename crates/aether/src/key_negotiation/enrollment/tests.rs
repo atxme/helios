@@ -545,6 +545,18 @@ fn an_integer_beyond_two_to_the_53_is_refused() {
     assert!(EnrollmentDocument::parse(&text).is_err());
 }
 
+/// The bound covered the profile only; the document's own timestamp is an
+/// integer of the same I-JSON text, signed the same way.
+#[test]
+fn a_document_timestamp_beyond_two_to_the_53_is_refused() {
+    let operator = operator();
+    let mut document = unsigned_document(&operator, profile_fixture());
+    document.issued_at_unix = 9_007_199_254_740_993;
+    let text = serde_json::to_string(&document).expect("json");
+    assert!(EnrollmentDocument::parse(&text).is_err());
+    assert!(document.sign(&operator.ca_private).is_err());
+}
+
 #[test]
 fn a_document_under_an_unpinned_ca_is_refused() {
     let operator = operator();

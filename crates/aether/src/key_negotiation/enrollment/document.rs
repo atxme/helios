@@ -69,11 +69,22 @@ impl EnrollmentDocument {
         if document.format_version != ENROLLMENT_DOCUMENT_VERSION {
             return Err(EnrollmentError::Format("format_version"));
         }
+        document.check_integers()?;
         Ok(document)
+    }
+
+    /// The I-JSON bound on the document's own integers; the profile's are
+    /// bounded as they are read.
+    fn check_integers(&self) -> Result<(), EnrollmentError> {
+        if self.issued_at_unix > MAX_SAFE_INTEGER {
+            return Err(EnrollmentError::Format("issued_at_unix beyond 2^53"));
+        }
+        Ok(())
     }
 
     /// RFC 8785 form of the document **without** `operator_signature`.
     pub fn canonical_unsigned(&self) -> Result<Vec<u8>, EnrollmentError> {
+        self.check_integers()?;
         let unsigned = Self {
             operator_signature: None,
             ..self.clone()
