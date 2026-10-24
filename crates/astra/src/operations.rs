@@ -1,47 +1,29 @@
-//! Renewal operations: what the 80 % threshold prepares, and what it refuses
-//! to finish on its own — spec §7.2, §8.1.2 and the amendment of 15 August
-//! 2026.
+//! Renewal journal for automatic decisions, campaigns and legacy companions.
 //!
-//! # Why an operation exists at all
+//! Current scheduled requests are authorized automatically under the pinned
+//! policy. Manual campaigns carry their own earlier approval. The constructor
+//! starts at `AwaitingOperator`, but these two paths leave that state before
+//! their first durable write; per-request operator records remain loadable for
+//! operations created by an older Astra, without restoring their obsolete
+//! permission to stage a scheduled renewal.
 //!
-//! Before that amendment there was nothing to hold: Astra received a request,
-//! signed two leaves and staged them, all in one call. The amendment inserts a
-//! human, and a human is not a function call. So the request has to survive
-//! between the moment the threshold notices it and the moment a YubiKey
-//! answers it — under one identifier, bound to one peer, with one deadline.
-//! That is this module.
+//! `PendingGrant` durably holds the exact evidence and random issuance bytes
+//! while Astra obtains the gateway receipt. Only `PendingCommit` releases a
+//! grant. Neither state activates a candidate on the data plane.
 //!
-//! # The states, and the one that is the point
+//! The incoming companion submission fingerprint is the idempotency key.
+//! Astra's countersigned evidence has a different fingerprint, used by the
+//! stage authorization. Reload must check the right binding for each role.
+//! Capability keys are process-local; polling mints new tokens for the stored
+//! approval-request manifest after restart.
 //!
-//! [`ClientRenewalOperationState::AwaitingOperator`] is the state the
-//! threshold creates and the only state an operation is born in. No
-//! certificate exists in it, nothing has been signed by the delegated issuer,
-//! and no amount of polling moves it: only an assertion that answers the exact
-//! challenge of this operation's approval request does. That is the whole
-//! difference between "the planner decided" and "the planner may act".
-//!
-//! From there an operation reaches `pending_grant` once the approval has been
-//! consumed.  That internal, non-activable state durably holds the exact
-//! evidence and staging bytes while Astra obtains the gateway receipt.  Only
-//! then does it reach `pending_commit`, where the grant is available to the
-//! client, or `failed`.  Neither intermediate state is permission to activate.
-//!
-//! # Why the order is enforced here as well as in the issuer
-//!
-//! [`crate::DelegatedIssuer::release_grant`] already refuses to build a grant
-//! without a receipt that verifies against the authorization. This module
-//! refuses a second time, structurally: [`Operation::record_grant`] cannot be
-//! reached before [`Operation::record_receipt`]. Two controls because they fail
-//! differently — the issuer's is cryptographic and this one is a state
-//! machine, and a refactor that lost one would almost certainly keep the other.
-//!
-//! # Persistence and retries
-//!
-//! The table is an atomically replaced private file. A restart discards only
-//! capability tokens (their key is process-local); polling the same operation
-//! mints fresh ones. The exact companion submission fingerprint is persisted
-//! before issuance, an identical retry returns the same completed operation,
-//! and different bytes under the same identifier conflict.
+//! Updates prepare one public operation and restore memory on persistence
+//! failure. The atomic writer can fail during directory sync after rename:
+//! in that case disk may already contain the new complete record while memory
+//! remains at the previous record. No successful response is released on that
+//! error; retry or restart must use a structurally valid journal. Tests that
+//! obstruct publication cover pre-rename failures; post-rename sync faults
+//! require a filesystem fault harness to validate power-loss durability.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -284,6 +266,14 @@ impl Operation {
             }
         }
         if let Some(authorization) = &self.stage_authorization {
+            // The received submission remains the idempotency key, while the
+            // issuer binds the stage to the countersigned evidence. Automatic
+            // and campaign records retain their original fingerprint rule.
+            let authorization_fingerprint = self
+                .approval_evidence
+                .as_ref()
+                .map(|evidence| evidence.fingerprint())
+                .or(self.approved_with);
             if self.stage_id != Some(authorization.stage_id)
                 || authorization.client_wg_public_key != self.client_wg_public_key
                 || !authorization
@@ -291,7 +281,7 @@ impl Operation {
                     .matches(&self.request_fingerprint)
                 || authorization.renewal_approval.as_ref() != self.approval_evidence.as_deref()
                 || authorization.campaign_approval.as_deref() != self.campaign_evidence.as_deref()
-                || !self.approved_with.is_some_and(|fingerprint| {
+                || !authorization_fingerprint.is_some_and(|fingerprint| {
                     fingerprint.matches(&authorization.renewal_authorization_fingerprint)
                 })
             {
@@ -723,6 +713,37 @@ impl OperationStore {
         // Also removes expired entries from the on-disk representation.
         store.persist()?;
         Ok(store)
+    }
+
+    /// Publishes one structurally valid update under the caller's store lock.
+    ///
+    /// The synchronous closure only touches a candidate. No operation, token,
+    /// or external effect is released between replacement and persistence.
+    /// On an error memory retains the previous operation; a post-rename sync
+    /// error can still leave the complete candidate file on disk.
+    pub(crate) fn update_persisted(
+        &mut self,
+        operation_id: &Id16,
+        caller: &WireGuardKey,
+        now_unix: u64,
+        update: impl FnOnce(&mut Operation) -> Result<(), OperationError>,
+    ) -> Result<(), OperationError> {
+        let mut candidate = self.get(operation_id, caller, now_unix)?.clone();
+        let request_fingerprint = candidate.request_fingerprint;
+        update(&mut candidate)?;
+        candidate.validate_persisted()?;
+        if candidate.operation_id != *operation_id
+            || candidate.client_wg_public_key != *caller
+            || candidate.request_fingerprint != request_fingerprint
+        {
+            return Err(OperationError::Corrupt("operation update changed identity"));
+        }
+        let previous = std::mem::replace(self.get_mut(operation_id, caller, now_unix)?, candidate);
+        if let Err(error) = self.persist() {
+            *self.get_mut(operation_id, caller, now_unix)? = previous;
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Atomically publishes the complete operation journal.

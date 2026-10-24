@@ -83,18 +83,9 @@ pub(super) async fn resume_stage(
             // it. A restart replays these exact bytes and never creates a
             // second candidate under the same operator touch.
             let mut operations = service.operations.lock().await;
-            let mut candidate = operations.get(operation_id, caller, now_unix)?.clone();
-            candidate.record_stage(Box::new(authorization.clone()))?;
-            let previous = std::mem::replace(
-                operations.get_mut(operation_id, caller, now_unix)?,
-                candidate,
-            );
-            if let Err(error) = operations.persist() {
-                // Keep retries on the last durable operation. Otherwise a
-                // cached authorization could leave Astra without being saved.
-                *operations.get_mut(operation_id, caller, now_unix)? = previous;
-                return Err(RenewalError::Operation(error));
-            }
+            operations.update_persisted(operation_id, caller, now_unix, |operation| {
+                operation.record_stage(Box::new(authorization.clone()))
+            })?;
             authorization
         }
     };
@@ -155,20 +146,10 @@ pub(super) async fn resume_stage(
 
     {
         let mut operations = service.operations.lock().await;
-        let mut candidate = operations.get(operation_id, caller, now_unix)?.clone();
-        candidate.record_receipt(Box::new(receipt))?;
-        candidate.record_grant(Box::new(grant))?;
-        let previous = std::mem::replace(
-            operations.get_mut(operation_id, caller, now_unix)?,
-            candidate,
-        );
-        if let Err(error) = operations.persist() {
-            // A poll must not expose a grant absent from the durable journal.
-            // The later registry repair is deliberately outside this rollback:
-            // once this write succeeds, the grant can never be withdrawn.
-            *operations.get_mut(operation_id, caller, now_unix)? = previous;
-            return Err(RenewalError::Operation(error));
-        }
+        operations.update_persisted(operation_id, caller, now_unix, |operation| {
+            operation.record_receipt(Box::new(receipt))?;
+            operation.record_grant(Box::new(grant))
+        })?;
     }
     reconcile_released_grant(service, caller, operation_id, now_unix).await?;
     tracing::info!(

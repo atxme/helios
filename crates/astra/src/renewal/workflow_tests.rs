@@ -1,5 +1,7 @@
 //! Renewal orchestration over a real pinned private channel, with public test keys.
 
+mod companion;
+
 use super::*;
 use aether::certificates::{
     approval::{AstraIssuancePolicy, AstraPolicyPin},
@@ -28,7 +30,7 @@ use rcgen::{
 use std::{
     collections::BTreeMap,
     path::PathBuf,
-    sync::atomic::{AtomicU8, Ordering},
+    sync::atomic::{AtomicU8, AtomicUsize, Ordering},
     time::Duration,
 };
 use tokio::sync::Mutex;
@@ -114,6 +116,7 @@ struct Gateway {
     gateway_leaf: PqCertificate,
     gateway_private: Zeroizing<Vec<u8>>,
     stages: Mutex<Vec<ClientCertificateStageAuthorization>>,
+    stage_calls: AtomicUsize,
     fault: AtomicU8,
     state_path: PathBuf,
     journal_path: PathBuf,
@@ -160,6 +163,7 @@ impl AstraStageHandler for Gateway {
         &self,
         authorization: Box<ClientCertificateStageAuthorization>,
     ) -> Result<Box<GatewayCertificateStageReceipt>, TrustUpdateRefusal> {
+        self.stage_calls.fetch_add(1, Ordering::SeqCst);
         let mut view = self.view.lock().await;
         authorization
             .verify(
@@ -262,6 +266,7 @@ impl AstraChannelHandler for Gateway {
 }
 
 struct Fixture {
+    ca_private: Zeroizing<Vec<u8>>,
     service: Arc<AstraService>,
     gateway: Arc<Gateway>,
     request: ClientCertificateRotationRequest,
@@ -410,6 +415,7 @@ async fn fixture() -> Fixture {
         ),
         gateway_private,
         stages: Mutex::new(Vec::new()),
+        stage_calls: AtomicUsize::new(0),
         fault: AtomicU8::new(0),
         state_path: directory.path().join("gateway-state.json"),
         journal_path: directory.path().join("operations.json"),
@@ -471,6 +477,7 @@ async fn fixture() -> Fixture {
         gateway: Some(channel),
     });
     Fixture {
+        ca_private,
         service,
         gateway,
         request,
