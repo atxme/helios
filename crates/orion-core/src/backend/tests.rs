@@ -1043,6 +1043,27 @@ async fn nothing_is_renewed_before_the_threshold_or_without_a_tunnel() {
     );
 }
 
+/// A second request while a renewal waits for its handshake used to return
+/// `Ok` and do nothing: the screen said "requested" for a click that was
+/// swallowed, which reads as renewal being stuck after the first one.
+#[tokio::test]
+async fn a_manual_renewal_requested_while_one_runs_is_refused_aloud() {
+    let (dry, _backend, receipt) = mounted().await;
+    let directory = tempfile::tempdir().expect("tempdir");
+    let store = crate::ProtectedIdentityStore::at(directory.path().join("identities"));
+    let ctrl = VpnController::new(dry.clone()).with_key_negotiation_identities(Arc::new(store));
+    *ctrl.installed.lock().await = Some(receipt);
+    *ctrl.state.write().unwrap() = TunnelState::Up;
+    ctrl.renewing.store(true, Ordering::SeqCst);
+
+    let error = ctrl
+        .renew_now(sink())
+        .await
+        .expect_err("a renewal is already running");
+    assert!(error.to_string().contains("déjà en cours"), "{error}");
+    assert!(dry.rekeyed_psks().is_empty());
+}
+
 /// A reconnection or a disconnection takes the data plane over while a
 /// renewal is in flight. The renewal's rollback must then leave the peer
 /// alone: re-registering the previous PSK would overwrite the newer tunnel.

@@ -771,18 +771,27 @@ impl VpnController {
         if self.key_negotiation_identities.is_none() {
             anyhow::bail!("aucun magasin d'identités protégé : renouvellement impossible");
         }
-        self.start_renewal(renewal::RenewalTrigger::Manual, user_sink)
-            .await;
+        // Said, not swallowed: a click during the wait for the renewed
+        // handshake otherwise reads as "requested" and does nothing.
+        if !self
+            .start_renewal(renewal::RenewalTrigger::Manual, user_sink)
+            .await
+        {
+            anyhow::bail!(
+                "un renouvellement est déjà en cours : attendre son issue, qui est annoncée                  dans le journal"
+            );
+        }
         Ok(())
     }
 
-    async fn start_renewal(&self, trigger: renewal::RenewalTrigger, user_sink: EventSink) {
+    /// Starts a renewal unless one is in flight; says whether it started.
+    async fn start_renewal(&self, trigger: renewal::RenewalTrigger, user_sink: EventSink) -> bool {
         if self.renewing.swap(true, Ordering::SeqCst) {
-            return;
+            return false;
         }
         let flag = ClearOnDrop(Arc::clone(&self.renewing));
         let Some(identities) = self.key_negotiation_identities.clone() else {
-            return;
+            return false;
         };
         let backend = Arc::clone(&self.backend);
         let installed = Arc::clone(&self.installed);
@@ -801,6 +810,7 @@ impl VpnController {
             .await;
         });
         *self.renewal_task.lock().await = Some(handle);
+        true
     }
 
     /// Stops the connection task and any renewal in flight, and takes the data
