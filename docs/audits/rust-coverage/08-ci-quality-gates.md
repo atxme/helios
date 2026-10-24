@@ -2,7 +2,7 @@
 
 ## Décision du responsable et état vérifié
 
-**Aucun temps CI supplémentaire pour cet audit et son suivi.** La collecte de couverture, la comparaison des rapports, les contrôles de tailles et les campagnes complémentaires seront lancés localement à la demande. Les workflows existants gardent leur périmètre ; aucune nouvelle étape de couverture, campagne nocturne, publication d’artefact ou vérification supplémentaire sur PR n’est proposée.
+**Aucun temps CI supplémentaire pour cet audit et son suivi.** La collecte de couverture, la comparaison des rapports, les contrôles de tailles et les campagnes complémentaires seront lancés localement à la demande. Les tests unitaires ordinaires peuvent rejoindre les suites ciblées existantes, conformément à la clarification du responsable. Les nouvelles campagnes lourdes, dont fuzzing et couverture, restent locales. Les workflows existants gardent leur périmètre ; aucune nouvelle étape de couverture, campagne nocturne, publication d’artefact ou vérification supplémentaire sur PR n’est proposée.
 
 Le nom de ce document conserve celui du livrable demandé initialement. Son contenu remplace la proposition d’extension CI de la première version du plan.
 
@@ -40,7 +40,7 @@ Le contrôle doit vérifier la cohérence des totaux JSON et `LF/LH`, puis disti
 
 Comparer à une référence locale du même SHA de base ou merge-base, reconstruite avec le même environnement si nécessaire. Publier dans le rapport les nouvelles lignes, suppressions, gains/pertes sur lignes existantes et changements de périmètre. Ne pas comparer directement une sélection de crates à un workspace complet, ni une bibliothèque au produit global.
 
-Après stabilisation, le contrôle local bloque d’abord les régressions, puis les seuils mesurés passent à 70, 75 et 80 %. Un rapport d’échec de tests reste disponible pour diagnostic, avec statut partiel ; il ne remplace pas la référence. Comparer les compteurs entiers pour éviter qu’un arrondi masque une perte. Les lignes modifiées peuvent être affichées sans promettre qu’une simple métrique constitue une preuve de sécurité.
+Après stabilisation, le contrôle local bloque d’abord les régressions, puis les seuils mesurés passent à 70, 75, 80, 90, 95 puis 100 % visés, sans faire du franchissement de 80 % un critère d’arrêt. Un rapport d’échec de tests reste disponible pour diagnostic, avec statut partiel ; il ne remplace pas la référence. Comparer les compteurs entiers pour éviter qu’un arrondi masque une perte. Les lignes modifiées peuvent être affichées sans promettre qu’une simple métrique constitue une preuve de sécurité.
 
 Les rapports restent dans un emplacement local ignoré des builds ou hors du dépôt, choisi explicitement. Ne pas créer une autre arborescence de compilation, un autre cache Cargo ou un nettoyage automatique pour stocker les rapports. Les références utiles sont conservées selon une politique locale à décider ; aucune rétention payante ou publication CI n’est requise.
 

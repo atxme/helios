@@ -1,8 +1,10 @@
-# Roadmap priorisée vers au moins 80 %
+# Roadmap priorisée vers la couverture maximale
 
 ## Statut et unité de compte
 
-**Démarrage autorisé par le responsable.** Le premier lot a livré COV-001/COV-002 et leurs tests locaux, avec deux collectes globales et une collecte bibliothèques réussies. Les autres fiches décrivent le travail restant ; elles ne sont pas déclarées terminées par la livraison de l’outillage.
+État mesuré et limites du lot suivant : [journal de développement](09-implementation-progress.md). Les nombres historiques ci-dessous restent des références de planification. COV-036 ajoute le déblocage des audits de dépendances avant livraison.
+
+**Démarrage autorisé par le responsable.** Le premier lot a livré COV-001/COV-002 et leurs tests locaux. Le responsable demande désormais de poursuivre vers **100 % des lignes de production pertinentes** : 80 % reste un jalon symbolique, jamais un critère d’arrêt. COV-003/COV-004/COV-009 constituent le lot suivant ; leur état réel et leurs validations sont consignés dans le journal de développement. Les autres fiches restent ouvertes tant que leurs critères ne sont pas prouvés.
 
 Référence recommandée : lignes de production Linux `DA`, hors tests/fixtures/harnais selon la méthode à ratifier de COV-001 : **30 870 / 53 009 = 58,24 %**. Manque à 80 % à taille constante : **11 538 lignes**. Les résumés LLVM bruts sont suivis séparément (66,10 %, manque 9 825) ; les bibliothèques seules ne sont jamais le total projet. Windows et matériel ont des critères distincts, pas une couverture supposée.
 
@@ -14,9 +16,15 @@ Effort additionné : **135–237 jours-personne**, forte incertitude sur matéri
 
 La baseline active ci-dessus vient du collecteur `rust-ast-da-v1`. Il retire aussi les 31 lignes du module de fixture `crates/orion-core/src/config/legacy_fixture.rs`, dont la déclaration est sous `cfg(test)`. L’audit initial conservé dans 02 comptait encore ces lignes ; la révision de périmètre est explicite et ne représente aucun test métier ajouté.
 
+## Objectif au-delà de 80 %
+
+À périmètre constant de la baseline v1, 100 % demanderait de couvrir les **22 139 lignes restantes**. La réserve estimée des lots fonctionnels (13 365–17 455 lignes) ne couvre donc pas intégralement cet objectif : il resterait théoriquement **4 684–8 774 lignes** après ces gains, avant tout changement de code. Cette soustraction est un repère, pas une prévision. L’effort historique de 135–237 jours-personne ne constitue pas une estimation validée pour atteindre 100 %.
+
+Après chaque lot, COV-033 réattribue les lignes, fonctions et branches restantes à des scénarios observables, puis ouvre des sous-tâches concrètes par fichier. Les paliers 90 %, 95 % puis 100 % sont suivis avec les mêmes dénominateurs documentés. Les campagnes Windows, noyau, TPM et FIDO restent nécessaires pour leurs chemins propres ; aucune couverture Linux n’est inventée pour eux. Tout reliquat impossible à exercer est expliqué et garde son statut non couvert. Aucune exclusion, suppression ou assertion affaiblie ne sert à atteindre le chiffre. Un taux de 100 % des lignes ne prouve pas la sécurité ni la couverture des branches.
+
 ## Contraintes ajoutées au plan
 
-Le responsable du dépôt a exclu tout temps CI supplémentaire pour cette mission. Les collectes, rapports, comparaisons et contrôles de tailles seront lancés par scripts locaux à la demande ; les workflows existants restent dans leur périmètre actuel. Les campagnes complémentaires lourdes restent locales, sans nouveau job ni recompilation instrumentée en CI ; les contrôles ciblés existants restent le socle.
+Le responsable du dépôt a exclu tout temps CI supplémentaire pour cette mission. Les collectes, rapports, comparaisons et contrôles de tailles seront lancés par scripts locaux à la demande ; les workflows existants restent dans leur périmètre actuel. Les campagnes complémentaires lourdes restent locales, sans nouveau job ni recompilation instrumentée en CI ; les tests unitaires courts peuvent intégrer les suites ciblées existantes, comme le responsable l’a confirmé. Aucun workflow CI n’est modifié par ce lot.
 
 Tous les lots doivent préserver la taille des artefacts livrables. La borne canonique de **128 Mio (134 217 728 octets)** concerne les fichiers acceptés par update/bundle ; elle ne doit pas être relevée pour faire passer une campagne. Comparer aussi les tailles avant/après par binaire, même sous cette borne, avec même SHA de référence, target, toolchain, features et profil release. Toute hausse significative doit être expliquée ; aucun nouveau seuil de pourcentage n’est inventé sans décision du responsable. L’installateur compressé, le cache Cargo et un binaire instrumenté sont des objets distincts de ce contrôle.
 
@@ -48,9 +56,9 @@ COV-014, COV-034 et COV-035 sont également P0 ; ils se préparent pendant les d
 | 3 Atteindre70 | Étendre 015,017,019,020,021 | au moins6 237 **mesurées** nécessaires | 70 % | N,C recalculés ; aucune limite critique cachée |
 | 4 Atteindre75 | Compléter 011,012,016 et workflows opérateur | au moins8 887 **mesurées** nécessaires | 75 % | Intégrations réelles et négatifs ; vue Windows distincte |
 | 5 Atteindre80 | Compléter 018,022,023 puis reliquat mesuré | au moins11 538 **mesurées** nécessaires | 80 % | Deux collectes stables ; pas d’exclusion opportuniste |
-| 6 Consolider | 024–031,033 et limitations restantes | aucun gain automatique attribué | contrôle local maintenu | Refactors protégés, code mort validé, cibles/documentation à jour |
+| 6 Étendre et consolider | Tous les lots ouverts, 024–031,033 et reliquats mesurés | aucune garantie chiffrée | 90 puis 95 puis 100 % visés | Chaque chemin restant a un scénario ou une limite explicite ; contrôles locaux et cibles maintenus |
 
-Les lots ne doivent pas être exécutés entièrement pour « remplir » un palier déjà atteint. À chaque mesure, réordonner les scénarios restants par criticité et lignes réellement manquantes. Les tâches de sécurité restent nécessaires même si le seuil est franchi avant elles. Les fenêtres de renouvellement à 80 % de vie d’un certificat sont un contrat **distinct** du seuil de couverture80 %.
+Franchir un palier ne clôt aucun lot dont les scénarios restent pertinents. À chaque mesure, réordonner les scénarios restants par criticité et lignes réellement manquantes. Les tâches de sécurité restent nécessaires même si le seuil est franchi avant elles. Les fenêtres de renouvellement à 80 % de vie d’un certificat sont un contrat **distinct** du seuil de couverture80 %.
 
 ```mermaid
 flowchart TD
@@ -1090,13 +1098,13 @@ Chaque liste de fichiers désigne des chemins existants, sauf les nouveaux scrip
 
 **Constat vérifié :** Il manque actuellement 11 538 lignes DA production ; nouvelles lignes/refactors modifieront ce nombre, pas les invariants.
 
-**Travail proposé :** Après chaque lot, recalculer baseline et classement de 03 ; relever les contrôles locaux 70 puis 75 puis 80 seulement après stabilité ; établir registre des limitations cible et des lignes critiques restantes.
+**Travail proposé :** Après chaque lot, recalculer baseline et classement de 03 ; relever les contrôles locaux 70, 75, 80, 90, 95 puis 100 seulement après stabilité ; attribuer chaque reliquat par fichier/fonction à une sous-tâche vérifiable ; établir le registre des limitations cible et des lignes critiques restantes.
 
 **Scénarios à tester :** Deux campagnes mêmes versions, campagne locale Windows, tests système explicitement activés, comparaison code modifié, variation périmètre, no-regression par crate critique.
 
 **Préconditions :** COV-001/002 et jalons mesurés des lots de sécurité ; campagnes cibles disponibles.
 
-**Critères d’acceptation :** Au moins 80 % sur production globale définie et stable ; libraries affichées séparément ; aucun scénario critique reporté au seul motif du taux ; régression canonique et cibles exigées rapportées sans faux positif.
+**Critères d’acceptation :** Progression mesurée vers 100 % sur production globale définie et stable ; 80 % ne clôt pas la mission ; bibliothèques et plateformes affichées séparément ; chaque ligne restante dispose d’un scénario à implémenter ou d’une limite explicite ; aucun scénario critique reporté au seul motif du taux ; régression canonique et cibles exigées rapportées sans faux positif.
 
 **Gain de couverture estimé :** 0 ligne créditée ; tâche de mesure, plateforme distincte ou consolidation.
 
@@ -1178,3 +1186,34 @@ Chaque liste de fichiers désigne des chemins existants, sauf les nouveaux scrip
 - **Validation finale** : changements futurs transversaux/protocole/sécurité exigent `bash scripts/regression.sh`, plus cibles pertinentes selon TESTING. Une indisponibilité matérielle doit rester limitation visible, pas réussite silencieuse.
 
 Décisions humaines : définition du contrôle local de production et de Windows ; emplacement/rétention locale des rapports et acceptation des deltas de taille ; accès aux machines et clés dédiées ; suppression ou mission produit des sondes captives ; justification éventuelle de dépendance dev pour propriétés/routeur ; priorisation des prochains lots et validation des effets cible lors des campagnes.
+
+
+### COV-036 — Lever les blocages de dépendances avant livraison
+
+**Identifiant :** COV-036
+
+**Titre :** Rafraîchir la référence Rust et corriger la dépendance frontend signalée.
+
+**Objectif :** Rendre la régression canonique verte avant toute fusion ou livraison, sans masquer les audits.
+
+**Fichiers concernés :** `Cargo.lock`, `web/package-lock.json`, `apps/orion/package-lock.json`, `docs/audits/rust-coverage/09-implementation-progress.md` ; `web/package.json` et `apps/orion/package.json` seulement si les plages verrouillées rendent une correction minimale nécessaire.
+
+**Constat vérifié :** Régression du lot arrêtée par npm audit sur undici 8.11.2 dans les deux frontends ; audit Rust séparé bloquant sur ctutils 0.4.3, rustls-webpki 0.103.15, webpki-root-certs 1.0.9. `de95540` sur main contient déjà les corrections Rust. Logs et limites figurent dans le journal 09.
+
+**Travail proposé :** Reprendre les correctifs de sécurité déjà présents sur main sans écraser les autres travaux ; mettre à jour uniquement la dépendance transitive frontend concernée dans les plages compatibles, sans npm audit fix global. Vérifier le diff exact, les versions Node/Rust requises et les dépendants. Rejouer audits, tests/builds, régression et couverture locale ; publier une nouvelle référence explicite après changement de lockfile. Refaire les comparaisons release à dépendances égales.
+
+**Scénarios à tester :** Installation propre verrouillée des deux frontends, 98/162 tests actuels et builds, validation TLS négative existante, signatures et trust-update, absence des trois vulnérabilités bloquantes Rust et du high undici dans les nouveaux audits. Distinguer les avertissements acceptés des échecs bloquants.
+
+**Préconditions :** État Git sauvegardé, réseau identifié pour registres/advisories, cache unique sous 65 Gio ; aucune hausse du budget ou nouvelle dépendance directe implicite.
+
+**Critères d’acceptation :** Changements de versions justifiés et bornés, aucun avis masqué ni seuil affaibli ; `bash scripts/regression.sh` réussi ; mesures après sur les lockfiles corrigés et tailles comparables documentées ; limites matérielles toujours explicites.
+
+**Gain de couverture estimé :** 0 ligne créditée. Une mise à jour de dépendance n’est pas une preuve de nouveau scénario couvert.
+
+**Risque :** moyen.
+
+**Effort estimé :** 0,5–2 jours-personne ; incertitude sur intégration de main et validations Windows. Addition à la fourchette historique, pas une estimation de l’objectif 100 %.
+
+**Dépendances :** Lot COV-003/COV-004/COV-009 sauvegardé ; main et lockfiles inspectés ; ne bloque pas les tests métier indépendants, bloque fusion/livraison.
+
+**Priorité :** P0.

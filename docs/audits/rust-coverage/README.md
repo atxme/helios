@@ -2,9 +2,13 @@
 
 Audit du **23 octobre 2026**, révision `7ebc020d0425de4a30d64a93af1ead048c3f0fc7`, branche d’audit initiale `audit/coverage-plan-2026-10-23`. Le développement se déroule dans `/home/christophe/helios-wt/rust-audit`, branche `feat/local-rust-audit`, créée depuis `main` ; la branche locale d’audit a été supprimée après transfert des documents.
 
-**Le responsable a autorisé le démarrage du développement. Le premier lot implémente COV-001/COV-002 : mesure et scripts locaux. Les corrections métier et autres lots de la roadmap restent à réaliser.** Aucun code Rust de production, manifeste Cargo ou workflow n’est modifié par ce premier lot. Le dossier s’appelle `rust-coverage` car le motif existant `**/coverage/` de `.gitignore` ignorerait l’emplacement suggéré `docs/audits/coverage/` ; aucune règle d’exclusion du dépôt n’a été changée.
+**Le responsable a autorisé le démarrage du développement. COV-001/COV-002 ont livré la mesure et les scripts locaux. Le lot suivant corrige les réponses HTTP et l’atomicité du ledger, avec des tests supplémentaires sur les grants et routes Astra. Son état vérifié et ses limites figurent dans le [journal de développement](09-implementation-progress.md).** Aucun code Rust de production, manifeste Cargo ou workflow n’est modifié par ce premier lot. Le dossier s’appelle `rust-coverage` car le motif existant `**/coverage/` de `.gitignore` ignorerait l’emplacement suggéré `docs/audits/coverage/` ; aucune règle d’exclusion du dépôt n’a été changée.
 
-## Diagnostic et résultats
+**Objectif actualisé : viser 100 % des lignes de production pertinentes, et améliorer les fonctions/branches lorsque mesurables.** Les jalons 70/75/80 restent utiles au suivi ; aucun ne constitue une fin de mission. Le reliquat initial vers 100 % est de 22 139 lignes à périmètre constant. Les résultats ci-dessous restent la baseline historique, pas la mesure du lot en cours.
+
+**Lot de développement mesuré : 58,98 % de production globale (31 287 / 53 046), 2 200 tests réussis.** La vue bibliothèques séparée atteint 66,47 %. La gateway avec features de livraison reste sous 128 Mio et diminue de 6 032 octets. La régression complète reste bloquée par les audits de dépendances ; détails, reliquats et commandes dans le [journal 09](09-implementation-progress.md).
+
+## Diagnostic et résultats de référence
 
 Les 23 packages du workspace ont été inventoriés, manifestes et sources inspectés, ainsi que les tests, CI, campagnes et harnais fuzz. Les modules signalés dans la mission ont des tests, souvent répartis entre crates ; leurs lacunes concernent surtout **les séquences async, les reprises et les effets concrets**, pas simplement l’absence de tests unitaires.
 
@@ -74,7 +78,7 @@ Factorisations proposées après tests protecteurs : framing speedtest dans `aet
 
 ## Décisions humaines nécessaires
 
-- Valider le plan avant toute implémentation et ratifier le périmètre et les contrôles locaux Linux et Windows.
+- Le développement est autorisé ; restent à ratifier le périmètre et les contrôles locaux Linux et Windows.
 - Définir emplacement/rétention locale des rapports et référence de tailles par cible ; aucun temps CI supplémentaire n’est alloué.
 - Réserver VM/cibles à console, poste Windows, TPM et clés opérateur de test ; autoriser explicitement leurs effets matériels au moment des campagnes.
 - Décider suppression des sondes captives ou mission de raccordement séparée.
@@ -90,8 +94,9 @@ Factorisations proposées après tests protecteurs : framing speedtest dans `aet
 | [04-dead-code-audit.md](04-dead-code-audit.md) | Catégories A/B/C/D, preuves et faux positifs exclus |
 | [05-duplication-audit.md](05-duplication-audit.md) | Comparaisons exactes/sémantiques, écarts de comportement et décisions |
 | [06-test-strategy.md](06-test-strategy.md) | Oracles, unités/intégration/propriétés/fuzz/sécurité/système et isolation/nettoyage |
-| [07-roadmap-to-80.md](07-roadmap-to-80.md) | 35 fiches complètes, dépendances, priorités, estimations et critères |
+| [07-roadmap-to-80.md](07-roadmap-to-80.md) | 35 fiches initiales et COV-036, dépendances, priorités, estimations et critères |
 | [08-ci-quality-gates.md](08-ci-quality-gates.md) | Scripts locaux, comparaison, taille binaire et CI existante |
+| [09-implementation-progress.md](09-implementation-progress.md) | Lot développé, mesures avant/après, tailles et blocages réels |
 
 Les artefacts bruts restent localement dans `/tmp/helios-audit-*` ; le HTML global se lit à `/tmp/helios-audit-rust-html/html/index.html`. Ils ne sont pas committés. Un sous-agent Luna a contribué aux inventaires et à la revue, sans modifier les sources ni lancer de build.
 

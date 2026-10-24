@@ -1,5 +1,7 @@
 # Écarts de couverture et chemins critiques
 
+Les tableaux et références de lignes ci-dessous décrivent l’audit initial. Les changements et métriques du développement sont suivis dans le [journal 09](09-implementation-progress.md) ; les lectures HTTP non bornées décrites historiquement ont été corrigées dans COV-009.
+
 ## Lecture des résultats
 
 Les constats quantitatifs viennent du premier profil global réussi. « Fonction sans compteur positif » signifie qu’aucune entrée de fonction LLVM attribuée à sa plage source n’a un compteur positif dans **cette campagne** ; cela n’établit ni absence de test dans tout contexte ni code mort. Les closures/instanciations sont regroupées pour ce diagnostic, sans remplacer le résumé officiel. Les méthodes déclarées sans corps dans les traits n’ont pas de compteur et sont marquées `sans donnée`, jamais déclarées mortes.
