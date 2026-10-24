@@ -162,3 +162,751 @@ fn an_oversized_path_identifier_is_refused_before_it_is_parsed() {
     assert!(matches!(path_id("not-hex"), Err(ServiceError::Refused)));
     assert!(path_id(&"ab".repeat(16)).is_ok());
 }
+
+#[cfg(test)]
+mod http_routes {
+    use super::*;
+    use aether::certificates::{
+        approval::{AstraIssuancePolicy, AstraPolicyPin},
+        encoding::{generate_ml_dsa_87_keypair, TrustDomainId, WireGuardKey},
+    };
+    use std::{collections::BTreeMap, net::SocketAddr, sync::Arc};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+    };
+
+    struct Fixture {
+        address: SocketAddr,
+        _task: ServerTask,
+        _directory: tempfile::TempDir,
+        _service: Arc<AstraService>,
+        ca_private_key: Zeroizing<Vec<u8>>,
+    }
+
+    struct ServerTask(tokio::task::JoinHandle<()>);
+
+    impl Drop for ServerTask {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+
+    async fn fixture() -> Fixture {
+        let directory = tempfile::tempdir().expect("temporary state directory");
+        let domain = TrustDomainId::new([1; 16]).expect("domain");
+        let gateway = WireGuardKey::from_bytes([2; 32]);
+        let (ca_private_key, ca_public) = generate_ml_dsa_87_keypair().expect("CA keypair");
+        let (service_private, service_public) =
+            generate_ml_dsa_87_keypair().expect("service keypair");
+        let policy = AstraIssuancePolicy::standard(domain, gateway, "astra.example".into())
+            .fingerprint()
+            .expect("policy fingerprint");
+        let registry = AstraRegistry::new(
+            directory.path().join("astra.json"),
+            crate::registry::AstraState {
+                trust_domain_id: domain,
+                gateway_wg_public_key: gateway,
+                server_name: "astra.example".into(),
+                authority_url: "https://astra.example".into(),
+                webauthn_rp_id: "astra.example".into(),
+                astra_policy_fingerprint: AstraPolicyPin::new(policy).expect("policy pin"),
+                credential_registry_epoch: 1,
+                ca_epoch: 1,
+                ca_public_key: ca_public,
+                ca_rotation: None,
+                ca_tls_epoch: 1,
+                ca_tls_fingerprint: None,
+                ca_tls_rotation: None,
+                astra_service_key_epoch: 1,
+                astra_service_public_key: service_public.clone(),
+                issuer: None,
+                transitions: Vec::new(),
+                peers: BTreeMap::new(),
+                status_epochs: BTreeMap::new(),
+                audit: crate::audit::AuditChain::default(),
+            },
+        );
+        let state_dir = directory.path().to_path_buf();
+        let service = Arc::new(AstraService {
+            registry: tokio::sync::Mutex::new(registry),
+            issuer: None,
+            challenges: tokio::sync::Mutex::new(ChallengeStore::with_capacity(MAX_LIVE_CHALLENGES)),
+            budgets: tokio::sync::Mutex::new(SourceBudget::default()),
+            service_private_key: service_private,
+            service_public_key: service_public,
+            operations: tokio::sync::Mutex::new(crate::operations::OperationStore::new()),
+            capabilities: tokio::sync::Mutex::new(CapabilityTokens::new().expect("capability key")),
+            approval_credential_ids: Vec::new(),
+            approval_credential_registry_epoch: 1,
+            approval_credential_registry: Some(Box::new(
+                aether::certificates::approval::CredentialRegistry {
+                    trust_domain_id: domain,
+                    gateway_wg_public_key: gateway,
+                    ca_epoch: 1,
+                    credential_registry_epoch: 1,
+                    bindings: Vec::new(),
+                },
+            )),
+            signing: tokio::sync::Mutex::new(crate::signing::SigningOperationStore::new()),
+            recoveries: tokio::sync::Mutex::new(crate::recovery::RecoveryStore::new()),
+            reconciliation: tokio::sync::Mutex::new(()),
+            encrypted_vault: None,
+            state_dir,
+            gateway: None,
+        });
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback listener");
+        let address = listener.local_addr().expect("listener address");
+        let app = router(service.clone()).into_make_service_with_connect_info::<SocketAddr>();
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        Fixture {
+            address,
+            _task: ServerTask(task),
+            _directory: directory,
+            _service: service,
+            ca_private_key,
+        }
+    }
+
+    async fn request(
+        fixture: &Fixture,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+    ) -> (u16, String, Vec<u8>) {
+        let response = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let mut stream = TcpStream::connect(fixture.address).await.expect("connect");
+            let mut request = format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: {}\r\n", body.len());
+            for (name, value) in headers {
+                request.push_str(&format!("{name}: {value}\r\n"));
+            }
+            request.push_str("\r\n");
+            stream.write_all(request.as_bytes()).await.expect("write headers");
+            stream.write_all(body).await.expect("write body");
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.expect("read response");
+            response
+        })
+        .await
+        .expect("HTTP request timed out");
+        let separator = response
+            .windows(4)
+            .position(|part| part == b"\r\n\r\n")
+            .expect("HTTP headers");
+        let head = String::from_utf8_lossy(&response[..separator]);
+        let status = head
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .expect("status")
+            .parse()
+            .expect("numeric status");
+        let content_type = head
+            .lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-type: ")
+                    .map(str::to_owned)
+            })
+            .unwrap_or_default();
+        (status, content_type, response[separator + 4..].to_vec())
+    }
+
+    #[tokio::test]
+    async fn public_route_methods_and_unimplemented_campaign_are_explicit() {
+        let fixture = fixture().await;
+        assert_eq!(
+            request(&fixture, "POST", "/v1/status/challenge", &[], b"")
+                .await
+                .0,
+            200
+        );
+        assert_eq!(
+            request(&fixture, "GET", "/v1/status/challenge", &[], b"")
+                .await
+                .0,
+            405
+        );
+        let (status, content_type, body) =
+            request(&fixture, "POST", "/v1/campaigns", &[], b"{}").await;
+        assert_eq!(status, 501);
+        assert!(content_type.starts_with("application/json"));
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).expect("coarse error")["error"], "this operation needs the operator approval protocol, whose routes and signing commands are not implemented");
+        assert_eq!(
+            request(&fixture, "POST", "/v1/unknown", &[], b"").await.0,
+            404
+        );
+        assert_eq!(
+            request(&fixture, "GET", "/v1/campaigns", &[], b"").await.0,
+            405
+        );
+    }
+
+    #[tokio::test]
+    async fn public_body_limit_and_malformed_json_are_enforced_before_handlers() {
+        let fixture = fixture().await;
+        let oversized = vec![b'x'; MAX_REQUEST_BYTES + 1];
+        assert_eq!(
+            request(
+                &fixture,
+                "POST",
+                "/v1/status/query",
+                &[("content-type", "application/json")],
+                &oversized
+            )
+            .await
+            .0,
+            413
+        );
+        assert_eq!(
+            request(
+                &fixture,
+                "POST",
+                "/v1/status/query",
+                &[("content-type", "application/json")],
+                b"{"
+            )
+            .await
+            .0,
+            400
+        );
+    }
+
+    #[tokio::test]
+    async fn real_connect_info_source_budget_returns_too_many_requests() {
+        let mut observed_stable_window = false;
+        for _attempt in 0..3 {
+            let fixture = fixture().await;
+            let window_at_start = now_unix() / BUDGET_WINDOW_SECS;
+            for _ in 0..SOURCE_BUDGET {
+                assert_eq!(
+                    request(&fixture, "POST", "/v1/status/challenge", &[], b"")
+                        .await
+                        .0,
+                    200
+                );
+            }
+            let window_at_end = now_unix() / BUDGET_WINDOW_SECS;
+            if window_at_start != window_at_end {
+                continue;
+            }
+
+            let window_before_over_budget = now_unix() / BUDGET_WINDOW_SECS;
+            if window_before_over_budget != window_at_start {
+                continue;
+            }
+            let over_budget_status = request(&fixture, "POST", "/v1/status/challenge", &[], b"")
+                .await
+                .0;
+            let window_after_over_budget = now_unix() / BUDGET_WINDOW_SECS;
+            if window_after_over_budget != window_at_start {
+                continue;
+            }
+            assert_eq!(over_budget_status, 429);
+            observed_stable_window = true;
+            break;
+        }
+        assert!(
+            observed_stable_window,
+            "three attempts crossed a source-budget window before a stable HTTP assertion"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_query_consumes_challenge_and_keeps_bad_proof_and_unknown_peer_coarse() {
+        use aether::certificates::{
+            client::ClientCertificateGeneration,
+            encoding::{MlDsa87Signature, WireGuardKey},
+        };
+        use aether::key_negotiation::{PqCertificate, PqCertificateRole, PQ_CERTIFICATE_VERSION};
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+        let fixture = fixture().await;
+        let certificate_expires_at = now_unix() + 10 * 365 * 24 * 60 * 60;
+        let client = WireGuardKey::from_bytes([0x37; 32]);
+        let (_, subject_public_key) = generate_ml_dsa_87_keypair().expect("client keypair");
+        let certificate = aether::key_negotiation::issue_pq_certificate(
+            PqCertificate {
+                version: PQ_CERTIFICATE_VERSION,
+                serial: [0x52; 16],
+                subject: "workstation".into(),
+                issuer: "CA-PQ".into(),
+                role: PqCertificateRole::Client,
+                wireguard_public_key: client.to_base64(),
+                ml_dsa_87_public_key: STANDARD.encode(subject_public_key.as_bytes()),
+                not_before_unix: 0,
+                not_after_unix: certificate_expires_at,
+                ml_dsa_87_signature: String::new(),
+            },
+            &fixture.ca_private_key,
+        )
+        .expect("signed client certificate");
+        let certificate_fingerprint =
+            aether::certificates::gateway::pq_certificate_fingerprint(&certificate)
+                .expect("certificate fingerprint");
+        fixture
+            ._service
+            .registry
+            .lock()
+            .await
+            .admit(
+                crate::registry::PeerRecord {
+                    name: "workstation".into(),
+                    client_wg_public_key: client,
+                    active: ClientCertificateGeneration {
+                        generation: 4,
+                        ca_tls_epoch: 1,
+                        tls_ca_certificate_fingerprint: Fingerprint::of(b"TLS CA"),
+                        tls_certificate_fingerprint: Fingerprint::of(b"active TLS"),
+                        pq_certificate_fingerprint: certificate_fingerprint,
+                        not_before: 0,
+                        not_after: certificate_expires_at,
+                    },
+                    active_pq_certificate: certificate.clone(),
+                    pending: None,
+                    revoked: false,
+                    revocation_epoch: 0,
+                    admission_pq_ca: None,
+                },
+                1,
+            )
+            .expect("transcribe peer");
+
+        let challenge_body = request(&fixture, "POST", "/v1/status/challenge", &[], b"").await;
+        assert_eq!(challenge_body.0, 200);
+        let challenge: ChallengeResponse =
+            serde_json::from_slice(&challenge_body.2).expect("challenge response");
+        let query = |client_wg_public_key| StatusQuery {
+            astra_challenge: challenge.astra_challenge,
+            request_id: Id16::new([0x63; 16]).expect("request ID"),
+            trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+            gateway_wg_public_key: WireGuardKey::from_bytes([2; 32]),
+            client_wg_public_key,
+            certificate_fingerprint,
+            certificate: certificate.clone(),
+            signature: MlDsa87Signature::placeholder(),
+        };
+        let bad_proof_body = serde_json::to_vec(&query(client)).expect("query JSON");
+        let bad_proof = request(
+            &fixture,
+            "POST",
+            "/v1/status/query",
+            &[("content-type", "application/json")],
+            &bad_proof_body,
+        )
+        .await;
+        assert_eq!(bad_proof.0, 403);
+        assert!(
+            !fixture
+                ._service
+                .challenges
+                .lock()
+                .await
+                .consume(&challenge.astra_challenge, now_unix()),
+            "a bad proof must still spend its single-use challenge before verification"
+        );
+        let replay = request(
+            &fixture,
+            "POST",
+            "/v1/status/query",
+            &[("content-type", "application/json")],
+            &bad_proof_body,
+        )
+        .await;
+        assert_eq!(bad_proof.0, replay.0);
+        assert_eq!(bad_proof.2, replay.2);
+
+        let other_challenge: ChallengeResponse = serde_json::from_slice(
+            &request(&fixture, "POST", "/v1/status/challenge", &[], b"")
+                .await
+                .2,
+        )
+        .expect("second challenge");
+        let unknown_query = StatusQuery {
+            astra_challenge: other_challenge.astra_challenge,
+            ..query(WireGuardKey::from_bytes([0x38; 32]))
+        };
+        let unknown_body = serde_json::to_vec(&unknown_query).expect("query JSON");
+        let unknown = request(
+            &fixture,
+            "POST",
+            "/v1/status/query",
+            &[("content-type", "application/json")],
+            &unknown_body,
+        )
+        .await;
+        assert_eq!(unknown.0, bad_proof.0);
+        assert_eq!(unknown.2, bad_proof.2);
+    }
+
+    #[tokio::test]
+    async fn private_companion_routes_do_not_disclose_unknown_or_ordinary_operations() {
+        let fixture = fixture().await;
+        let ordinary_id = Id16::new([0x42; 16]).expect("operation ID");
+        let client = WireGuardKey::from_bytes([0x24; 32]);
+        let (_, new_public_key) = generate_ml_dsa_87_keypair().expect("client keypair");
+        let rotation_request = Box::new(
+            aether::certificates::client::ClientCertificateRotationRequest {
+                format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+                protocol_version: aether::certificates::CERTIFICATE_PROTOCOL_VERSION,
+                request_id: Id16::new([0x31; 16]).expect("request ID"),
+                trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+                gateway_wg_public_key: WireGuardKey::from_bytes([2; 32]),
+                server_name: "astra.example".into(),
+                client_wg_public_key: client,
+                active_generation: 4,
+                requested_generation: 5,
+                active_tls_certificate_fingerprint: Fingerprint::of(b"active TLS"),
+                active_pq_certificate_fingerprint: Fingerprint::of(b"active PQ"),
+                tls_csr: aether::certificates::encoding::DerCertificate::new(vec![7; 64])
+                    .expect("CSR"),
+                new_ml_dsa_87_public_key: new_public_key,
+                created_at: 1_000,
+                expires_at: 5_000,
+                active_pq_signature: aether::certificates::encoding::MlDsa87Signature::placeholder(
+                ),
+                new_pq_signature: aether::certificates::encoding::MlDsa87Signature::placeholder(),
+            },
+        );
+        let mut approval_request = aether::certificates::approval::AstraCredentialApprovalRequest {
+            format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+            operation_id: ordinary_id,
+            request_fingerprint: rotation_request.fingerprint(),
+            trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+            gateway_wg_public_key: WireGuardKey::from_bytes([2; 32]),
+            client_wg_public_key: client,
+            active_generation: 4,
+            requested_generation: 5,
+            credential_registry_epoch: 1,
+            webauthn_rp_id: "astra.example".into(),
+            webauthn_origin: "https://astra.example".into(),
+            allowed_credential_ids: vec![vec![1]],
+            required_credentials: 1,
+            created_at: 1_000,
+            expires_at: 1_300,
+            astra_service_key_epoch: 1,
+            astra_signature: aether::certificates::encoding::MlDsa87Signature::placeholder(),
+        };
+        approval_request.request_fingerprint = rotation_request.fingerprint();
+        let ordinary = crate::operations::Operation::awaiting_operator(
+            ordinary_id,
+            client,
+            rotation_request,
+            Box::new(approval_request),
+            1_000,
+        );
+        fixture
+            ._service
+            .operations
+            .lock()
+            .await
+            .open(ordinary, 1_001)
+            .expect("ordinary renewal operation");
+        let unknown = request(
+            &fixture,
+            "GET",
+            "/v1/operations/00000000000000000000000000000001",
+            &[],
+            b"",
+        )
+        .await;
+        let malformed = request(&fixture, "GET", "/v1/operations/not-hex", &[], b"").await;
+        let ordinary = request(
+            &fixture,
+            "GET",
+            &format!("/v1/operations/{ordinary_id}"),
+            &[],
+            b"",
+        )
+        .await;
+        assert_eq!(unknown.0, 403);
+        assert_eq!(unknown.0, malformed.0);
+        assert_eq!(unknown.0, ordinary.0);
+        assert_eq!(unknown.1, malformed.1);
+        assert_eq!(unknown.2, ordinary.2);
+        let body = String::from_utf8(unknown.2).expect("error body");
+        assert!(!body.contains("operation"));
+        assert_eq!(
+            request(
+                &fixture,
+                "POST",
+                "/v1/operations/00000000000000000000000000000001",
+                &[],
+                b"{}"
+            )
+            .await
+            .0,
+            405
+        );
+        let vault_path =
+            "/v1/vaults/0101010101010101010101010101010101010101010101010101010101010101";
+        assert_eq!(request(&fixture, "GET", vault_path, &[], b"").await.0, 400);
+        assert_eq!(
+            request(
+                &fixture,
+                "GET",
+                vault_path,
+                &[("authorization", "Bearer invalid")],
+                b""
+            )
+            .await
+            .0,
+            403
+        );
+        let signer_path = "/v1/signer-requests/00000000000000000000000000000001";
+        assert_eq!(request(&fixture, "GET", signer_path, &[], b"").await.0, 400);
+        assert_eq!(
+            request(
+                &fixture,
+                "GET",
+                signer_path,
+                &[("authorization", "Bearer invalid")],
+                b""
+            )
+            .await
+            .0,
+            403
+        );
+        assert_eq!(
+            request(
+                &fixture,
+                "POST",
+                "/v1/signer-results/00000000000000000000000000000001",
+                &[("content-type", "application/json")],
+                b"{"
+            )
+            .await
+            .0,
+            400
+        );
+    }
+
+    #[tokio::test]
+    async fn a_valid_scope_bound_capability_reads_the_operator_request() {
+        use aether::certificates::{
+            capability::{CapabilityGrant, CapabilityScope},
+            status::{
+                AstraRotationCampaign, AstraSignerRequest, CampaignScope, CampaignTarget,
+                CertificateKind,
+            },
+            CERTIFICATE_FORMAT_VERSION,
+        };
+
+        let fixture = fixture().await;
+        let now = now_unix();
+        let operation_id = Id16::new([0x61; 16]).expect("operation ID");
+        let campaign = Box::new(AstraRotationCampaign {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            campaign_id: Id16::new([0x62; 16]).expect("campaign ID"),
+            trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+            gateway_wg_public_key: WireGuardKey::from_bytes([2; 32]),
+            server_name: "astra.example".into(),
+            created_at: now,
+            expires_at: now + 3_000,
+            scope: CampaignScope::FleetLeafs,
+            targets: vec![CampaignTarget {
+                certificate_kind: CertificateKind::ClientPq,
+                identity_key: WireGuardKey::from_bytes([3; 32]),
+                epoch: 1,
+                generation: 4,
+                active_tls_certificate_fingerprint: Fingerprint::of(b"TLS"),
+                active_pq_certificate_fingerprint: Fingerprint::of(b"PQ"),
+            }],
+            reason: "rotation".into(),
+            requested_by: "operator".into(),
+            policy_fingerprint: Fingerprint::of(b"policy"),
+            required_credentials: CampaignScope::FleetLeafs.required_credentials(),
+        });
+        let vault_fingerprint = Fingerprint::of(b"encrypted vault");
+        let signer_request = Box::new(AstraSignerRequest {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            operation_id,
+            campaign_fingerprint: campaign.fingerprint(),
+            authority_url: "https://astra.example".into(),
+            encrypted_vault_fingerprint: vault_fingerprint,
+            required_credentials: campaign.required_credentials,
+            created_at: now,
+            expires_at: now + 3_000,
+            astra_service_key_epoch: 1,
+            astra_signature: aether::certificates::encoding::MlDsa87Signature::placeholder(),
+        });
+        let operation =
+            crate::signing::SigningOperation::new(campaign.clone(), signer_request, now)
+                .expect("operator operation");
+        fixture
+            ._service
+            .signing
+            .lock()
+            .await
+            .open(operation, now)
+            .expect("store operation");
+        let grant = CapabilityGrant::new(
+            CapabilityScope::SignerRequestRead,
+            operation_id,
+            campaign.fingerprint(),
+            None,
+            now,
+            now + 120,
+        )
+        .expect("scope grant");
+        let token = fixture
+            ._service
+            .capabilities
+            .lock()
+            .await
+            .issue(&grant, now + 3_000)
+            .expect("bearer token");
+        let authorization = format!("Bearer {token}");
+        let headers = [("authorization", authorization.as_str())];
+        let response = request(
+            &fixture,
+            "GET",
+            &format!("/v1/signer-requests/{operation_id}"),
+            &headers,
+            b"",
+        )
+        .await;
+        assert_eq!(response.0, 200);
+        let body: serde_json::Value = serde_json::from_slice(&response.2).expect("response JSON");
+        assert_eq!(
+            body["signer_request"]["operation_id"],
+            operation_id.to_string()
+        );
+        assert_eq!(
+            body["campaign"]["campaign_id"],
+            campaign.campaign_id.to_string()
+        );
+        assert!(!String::from_utf8_lossy(&response.2).contains(&token));
+
+        let wrong_scope_grant = CapabilityGrant::new(
+            CapabilityScope::SignerResultSubmit,
+            operation_id,
+            campaign.fingerprint(),
+            None,
+            now,
+            now + 120,
+        )
+        .expect("wrong-scope grant");
+        let wrong_scope_token = fixture
+            ._service
+            .capabilities
+            .lock()
+            .await
+            .issue(&wrong_scope_grant, now + 3_000)
+            .expect("wrong-scope bearer");
+
+        let other_operation_id = Id16::new([0x64; 16]).expect("other operation ID");
+        let wrong_operation_grant = CapabilityGrant::new(
+            CapabilityScope::SignerRequestRead,
+            other_operation_id,
+            campaign.fingerprint(),
+            None,
+            now,
+            now + 120,
+        )
+        .expect("wrong-operation grant");
+        let wrong_operation_token = fixture
+            ._service
+            .capabilities
+            .lock()
+            .await
+            .issue(&wrong_operation_grant, now + 3_000)
+            .expect("wrong-operation bearer");
+
+        let expired_grant = CapabilityGrant::new(
+            CapabilityScope::SignerRequestRead,
+            operation_id,
+            campaign.fingerprint(),
+            None,
+            now.saturating_sub(120),
+            now.saturating_sub(1),
+        )
+        .expect("expired grant");
+        let expired_token = fixture
+            ._service
+            .capabilities
+            .lock()
+            .await
+            .issue(&expired_grant, now + 3_000)
+            .expect("expired bearer");
+
+        let missing_bearer = request(
+            &fixture,
+            "GET",
+            &format!("/v1/signer-requests/{operation_id}"),
+            &[],
+            b"",
+        )
+        .await;
+        assert_eq!(missing_bearer.0, 400);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&missing_bearer.2)
+                .expect("coarse protocol error")["error"],
+            "malformed request"
+        );
+        for rejected_token in [wrong_scope_token, wrong_operation_token, expired_token] {
+            let authorization = format!("Bearer {rejected_token}");
+            let rejected = request(
+                &fixture,
+                "GET",
+                &format!("/v1/signer-requests/{operation_id}"),
+                &[("authorization", authorization.as_str())],
+                b"",
+            )
+            .await;
+            assert_eq!(rejected.0, 403);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&rejected.2)
+                    .expect("coarse capability refusal")["error"],
+                "refused"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_route_is_public_without_bearer_and_unknown_id_is_coarse() {
+        let fixture = fixture().await;
+        let known_shape = request(
+            &fixture,
+            "GET",
+            "/v1/client-rotation/recovery/00000000000000000000000000000001",
+            &[],
+            b"",
+        )
+        .await;
+        let malformed = request(
+            &fixture,
+            "GET",
+            "/v1/client-rotation/recovery/not-hex",
+            &[],
+            b"",
+        )
+        .await;
+        assert_eq!(known_shape.0, 403);
+        assert_eq!(known_shape.0, malformed.0);
+        assert_eq!(known_shape.2, malformed.2);
+        assert_eq!(
+            request(&fixture, "GET", "/v1/client-rotation/recovery", &[], b"")
+                .await
+                .0,
+            405
+        );
+        assert_eq!(
+            request(
+                &fixture,
+                "GET",
+                "/v1/client-rotation/recovery/00000000000000000000000000000001/commit",
+                &[],
+                b""
+            )
+            .await
+            .0,
+            405
+        );
+    }
+}
