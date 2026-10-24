@@ -566,6 +566,20 @@ mod completion {
         );
     }
 
+    /// §19: a document no pending request answers is a draft, whatever it
+    /// carries. A malformed client leaf used to make it an import error.
+    #[test]
+    fn a_v5_document_with_an_unreadable_leaf_and_no_pending_request_is_a_draft() {
+        let mut document = enrolled().document;
+        document.client_pq_certificate = "@@ not base64 @@".into();
+        let outcome = match_document(None, &document, profile_of(&document), now())
+            .expect("a draft, not an error");
+        let DocumentMatch::Unmatched { expected, .. } = outcome else {
+            panic!("expected no match");
+        };
+        assert!(expected.contains("illisible"), "{expected}");
+    }
+
     #[test]
     fn a_v5_document_under_an_unpinned_ca_is_refused() {
         let enrolled = enrolled();

@@ -404,7 +404,6 @@ pub(crate) fn match_document(
     mut profile: ClientProfile,
     now_unix: u64,
 ) -> Result<DocumentMatch> {
-    let client_leaf = decode_pq_leaf(&document.client_pq_certificate)?;
     let Some(pending) = pending else {
         // Not trusted, and not trustable: the key that would verify it is
         // exactly what this machine does not hold. The draft has no private
@@ -414,16 +413,22 @@ pub(crate) fn match_document(
         if let Some(block) = profile.key_negotiation.as_mut() {
             block.identity.clear();
         }
+        // Read only to name the key: an unreadable leaf changes the wording,
+        // not the verdict.
+        let certified = match decode_pq_leaf(&document.client_pq_certificate) {
+            Ok(leaf) => format!("clé WireGuard certifiée « {} »", leaf.wireguard_public_key),
+            Err(_) => "feuille PQ du document illisible".to_string(),
+        };
         return Ok(DocumentMatch::Unmatched {
             expected: format!(
                 "aucune demande d'enrôlement en attente sur ce poste ne correspond à ce document \
-                 (clé WireGuard certifiée « {} ») : il a été préparé pour un autre poste, ou la \
-                 demande a été abandonnée",
-                client_leaf.wireguard_public_key
+                 ({certified}) : il a été préparé pour un autre poste, ou la demande a été \
+                 abandonnée"
             ),
             profile,
         });
     };
+    let client_leaf = decode_pq_leaf(&document.client_pq_certificate)?;
     let invitation = &pending.invitation;
     let request = &pending.request;
     let pinned = &invitation.operator_ca_public_key;
