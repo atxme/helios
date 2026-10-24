@@ -214,6 +214,12 @@ pub const RELAYED_ISSUER_KIND: IssuerKind = IssuerKind::Astra;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
+#[cfg(test)]
+mod workflow_tests;
+
 /// Astra's private listener: the four routes the gateway relays into.
 ///
 /// It is the mirror of [`astra_channel::router`], and it carries the

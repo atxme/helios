@@ -111,6 +111,7 @@ pub struct RecoveryOperation {
     receipt: Option<Box<GatewayCertificateStageReceipt>>,
     gateway_pq_certificate: Option<Box<aether::key_negotiation::PqCertificate>>,
     grant: Option<Box<ClientCertificateRotationGrant>>,
+    accepted_commit: Option<Fingerprint>,
 }
 
 impl RecoveryOperation {
@@ -338,6 +339,7 @@ pub async fn open(
         receipt: None,
         gateway_pq_certificate: None,
         grant: None,
+        accepted_commit: None,
     };
     let view = operation.view();
     let operation_id = operation.operation_id;
@@ -591,9 +593,16 @@ pub async fn commit(
     commit: Box<ClientCertificateStageCommit>,
     now_unix: u64,
 ) -> Result<ExpiredRecoveryOperationView, RecoveryError> {
+    let commit_fingerprint = commit.fingerprint();
     let (authorization, grant, client) = {
         let recoveries = service.recoveries.lock().await;
         let operation = recoveries.get(operation_id, now_unix)?;
+        if operation.state == ExpiredRecoveryState::Committed {
+            return match operation.accepted_commit.as_ref() {
+                Some(accepted) if accepted.matches(&commit_fingerprint) => Ok(operation.view()),
+                _ => Err(RecoveryError::WrongState),
+            };
+        }
         if operation.state != ExpiredRecoveryState::Granted {
             return Err(RecoveryError::WrongState);
         }
@@ -647,6 +656,7 @@ pub async fn commit(
 
     let mut recoveries = service.recoveries.lock().await;
     let operation = recoveries.get_mut(operation_id, now_unix)?;
+    operation.accepted_commit = Some(commit_fingerprint);
     operation.state = ExpiredRecoveryState::Committed;
     tracing::warn!(
         peer = %client,
@@ -744,6 +754,8 @@ mod tests {
     };
     use aether::key_negotiation::{PqCertificate, PqCertificateRole, PQ_CERTIFICATE_VERSION};
 
+    mod workflow;
+
     /// A request whose contents the store never reads.
     ///
     /// Everything that decides anything about a recovery is checked in
@@ -799,6 +811,7 @@ mod tests {
             receipt: None,
             gateway_pq_certificate: None,
             grant: None,
+            accepted_commit: None,
         }
     }
 
