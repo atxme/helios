@@ -1353,6 +1353,264 @@ fn a_delegated_or_ordinary_grant_cannot_enter_the_recovery_verifier() {
     ));
 }
 
+/// A complete ordinary Astra renewal grant exercises the client's delegated
+/// issuer path with real PQ signatures, a gateway-signed staging receipt, and
+/// a CSR that matches the issued TLS leaf.
+#[test]
+fn an_astra_signed_renewal_grant_verifies_against_its_policy_and_receipt() {
+    use crate::certificates::authority::{AllowedUsage, AstraIssuerAuthorization};
+
+    let ca = keys();
+    let issuer = keys();
+    let gateway = keys();
+    let candidate = keys();
+    let tls = tls_material();
+    let policy = automatic_policy_fingerprint();
+    let delegation = AstraIssuerAuthorization {
+        format_version: CERTIFICATE_FORMAT_VERSION,
+        trust_domain_id: domain(),
+        ca_epoch: 1,
+        ca_tls_epoch: 1,
+        gateway_wg_public_key: gateway_key(),
+        server_name: SERVER_NAME.into(),
+        issuer_epoch: 3,
+        pq_issuer_public_key: issuer.public.clone(),
+        // The test TLS leaf is genuinely issued by this CA certificate.
+        tls_intermediate_certificate: tls.authority.clone(),
+        allowed_usage: AllowedUsage::AdmittedClientLeafRenewal,
+        maximum_leaf_lifetime_secs: 100_000,
+        policy_fingerprint: policy,
+        not_before: 0,
+        not_after: 50_000,
+        ca_pq_signature: MlDsa87Signature::placeholder(),
+    }
+    .sign(&ca.private)
+    .expect("delegation signature");
+
+    let active = keys();
+    let mut renewal_request = request(&active, &candidate);
+    renewal_request.tls_csr = tls.csr.clone();
+    let transcript = renewal_request.signing_bytes();
+    renewal_request.active_pq_signature =
+        sign_ml_dsa_87(&active.private, &transcript).expect("active proof");
+    renewal_request.new_pq_signature =
+        sign_ml_dsa_87(&candidate.private, &transcript).expect("candidate proof");
+
+    let pq_leaf = client_leaf(&issuer, &candidate, 5);
+    let mut receipt = GatewayCertificateStageReceipt {
+        format_version: CERTIFICATE_FORMAT_VERSION,
+        protocol_version: CERTIFICATE_PROTOCOL_VERSION,
+        trust_domain_id: domain(),
+        stage_id: Id16::new([5; 16]).expect("stage"),
+        stage_authorization_fingerprint: Fingerprint::of(b"stage authorization"),
+        request_fingerprint: renewal_request.fingerprint(),
+        renewal_authorization_fingerprint: renewal_request.fingerprint(),
+        gateway_wg_public_key: gateway_key(),
+        client_wg_public_key: client_key(),
+        active_generation: 4,
+        staged_generation: 5,
+        staged_tls_certificate_fingerprint: tls.leaf.fingerprint(),
+        staged_pq_certificate_fingerprint: pq_certificate_fingerprint(&pq_leaf)
+            .expect("PQ fingerprint"),
+        persisted_at: 1_100,
+        stage_expires_at: 4_600,
+        active_gateway_identity_epoch: 1,
+        gateway_decision_epoch: 1,
+        gateway_certificate_fingerprint: Fingerprint::of(b"gateway leaf"),
+        gateway_signature: MlDsa87Signature::placeholder(),
+    };
+    // The receipt's gateway signature is checked with the exact pinned key.
+    receipt = receipt.sign(&gateway.private).expect("receipt signature");
+    let mut grant = ClientCertificateRotationGrant {
+        format_version: CERTIFICATE_FORMAT_VERSION,
+        protocol_version: CERTIFICATE_PROTOCOL_VERSION,
+        trust_domain_id: domain(),
+        ca_epoch: 1,
+        ca_tls_epoch: 1,
+        issuer_kind: IssuerKind::Astra,
+        issuer_epoch: 3,
+        issuer_authorization_fingerprint: delegation.fingerprint(),
+        issuer_authorization: Some(delegation),
+        request_fingerprint: renewal_request.fingerprint(),
+        renewal_authorization_fingerprint: renewal_request.fingerprint(),
+        renewal_approval: None,
+        campaign_approval: None,
+        stage_receipt_fingerprint: receipt.fingerprint(),
+        stage_receipt: receipt,
+        gateway_wg_public_key: gateway_key(),
+        server_name: SERVER_NAME.into(),
+        client_wg_public_key: client_key(),
+        active_generation: 4,
+        next_generation: 5,
+        active_tls_certificate_fingerprint: Fingerprint::of(b"active tls"),
+        active_pq_certificate_fingerprint: Fingerprint::of(b"active pq"),
+        next_tls_ca_certificate_fingerprint: tls.authority.fingerprint(),
+        next_tls_certificate: tls.leaf,
+        next_pq_certificate: pq_leaf,
+        stage_expires_at: 4_600,
+        window: TransitionWindow::new(1_000, 1_200, 4_600).expect("window"),
+        reason: RotationReason::Scheduled,
+        signature: MlDsa87Signature::placeholder(),
+    };
+    grant.signature = sign_ml_dsa_87(&issuer.private, &grant.signing_bytes().expect("transcript"))
+        .expect("grant signature");
+
+    let pin = AstraPolicyPin::new(policy).expect("pin");
+    grant
+        .verify(
+            &ca.public,
+            &gateway.public,
+            &Fingerprint::of(b"gateway leaf"),
+            &domain(),
+            1,
+            1,
+            &gateway_key(),
+            SERVER_NAME,
+            &client_key(),
+            &renewal_request,
+            &[&tls.authority],
+            Some(&pin),
+            1_300,
+        )
+        .expect("valid delegated renewal grant");
+
+    let wrong_policy =
+        AstraPolicyPin::new(Fingerprint::of(b"superseded policy")).expect("nonzero policy pin");
+    assert!(matches!(
+        grant.verify(
+            &ca.public,
+            &gateway.public,
+            &Fingerprint::of(b"gateway leaf"),
+            &domain(),
+            1,
+            1,
+            &gateway_key(),
+            SERVER_NAME,
+            &client_key(),
+            &renewal_request,
+            &[&tls.authority],
+            Some(&wrong_policy),
+            1_300,
+        ),
+        Err(CertificateError::FingerprintMismatch(
+            "Astra issuance policy"
+        ))
+    ));
+    assert!(matches!(
+        grant.verify(
+            &ca.public,
+            &gateway.public,
+            &Fingerprint::of(b"gateway leaf"),
+            &domain(),
+            1,
+            1,
+            &gateway_key(),
+            SERVER_NAME,
+            &client_key(),
+            &renewal_request,
+            &[&tls.authority],
+            Some(&pin),
+            4_600,
+        ),
+        Err(CertificateError::StageExpired)
+    ));
+
+    let mut wrong_delegation = grant.clone();
+    wrong_delegation.issuer_authorization_fingerprint = Fingerprint::of(b"other delegation");
+    wrong_delegation.signature = sign_ml_dsa_87(
+        &issuer.private,
+        &wrong_delegation.signing_bytes().expect("transcript"),
+    )
+    .expect("grant signature");
+    assert!(matches!(
+        wrong_delegation.verify(
+            &ca.public,
+            &gateway.public,
+            &Fingerprint::of(b"gateway leaf"),
+            &domain(),
+            1,
+            1,
+            &gateway_key(),
+            SERVER_NAME,
+            &client_key(),
+            &renewal_request,
+            &[&tls.authority],
+            Some(&pin),
+            1_300,
+        ),
+        Err(CertificateError::UnauthorizedIssuer)
+    ));
+
+    let mut short_lived_delegation = grant.clone();
+    let mut delegation = short_lived_delegation
+        .issuer_authorization
+        .take()
+        .expect("delegation");
+    delegation.maximum_leaf_lifetime_secs = 99_999;
+    short_lived_delegation.issuer_authorization =
+        Some(delegation.sign(&ca.private).expect("delegation signature"));
+    short_lived_delegation.issuer_authorization_fingerprint = short_lived_delegation
+        .issuer_authorization
+        .as_ref()
+        .expect("delegation")
+        .fingerprint();
+    short_lived_delegation.signature = sign_ml_dsa_87(
+        &issuer.private,
+        &short_lived_delegation.signing_bytes().expect("transcript"),
+    )
+    .expect("grant signature");
+    assert!(matches!(
+        short_lived_delegation.verify(
+            &ca.public,
+            &gateway.public,
+            &Fingerprint::of(b"gateway leaf"),
+            &domain(),
+            1,
+            1,
+            &gateway_key(),
+            SERVER_NAME,
+            &client_key(),
+            &renewal_request,
+            &[&tls.authority],
+            Some(&pin),
+            1_300,
+        ),
+        Err(CertificateError::IssuerScopeViolation("leaf lifetime"))
+    ));
+
+    let mut skipped_generation = grant.clone();
+    skipped_generation.next_generation = 6;
+    skipped_generation.stage_receipt.staged_generation = 6;
+    skipped_generation.stage_receipt = skipped_generation
+        .stage_receipt
+        .sign(&gateway.private)
+        .expect("receipt signature");
+    skipped_generation.stage_receipt_fingerprint = skipped_generation.stage_receipt.fingerprint();
+    skipped_generation.signature = sign_ml_dsa_87(
+        &issuer.private,
+        &skipped_generation.signing_bytes().expect("transcript"),
+    )
+    .expect("grant signature");
+    assert!(matches!(
+        skipped_generation.verify(
+            &ca.public,
+            &gateway.public,
+            &Fingerprint::of(b"gateway leaf"),
+            &domain(),
+            1,
+            1,
+            &gateway_key(),
+            SERVER_NAME,
+            &client_key(),
+            &renewal_request,
+            &[&tls.authority],
+            Some(&pin),
+            1_300,
+        ),
+        Err(CertificateError::IssuerScopeViolation("generation"))
+    ));
+}
+
 #[test]
 fn a_ca_pq_recovery_grant_verifies_and_stays_bound_to_the_historical_request() {
     let ca = keys();

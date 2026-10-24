@@ -1405,6 +1405,51 @@ fn status_target_capacity_allows_updates_but_refuses_new_targets() {
     assert_eq!(ledger.last_status_for(&new_target), None);
 }
 
+#[test]
+fn schedule_refuses_one_more_pending_revocation_at_capacity() {
+    let mut ledger = TrustLedger::default();
+    let gateway = ledger_test_gateway();
+    let client = ClientCertificateState::new(generation(4, 1));
+    let queued = ScheduledRevocation {
+        scope: RevocationScope::Client,
+        revocation_epoch: 1,
+        effective_at: 10_000,
+        revoked_tls_fingerprint: None,
+        revoked_tls_not_after: None,
+        revoked_pq_fingerprint: None,
+        revoked_pq_not_after: None,
+        revocation_fingerprint: Some(Fingerprint::of(b"queued")),
+        replacement_transition_fingerprint: None,
+    };
+    ledger.scheduled_revocations = vec![queued; MAX_SCHEDULED_REVOCATIONS];
+    let before = ledger.clone();
+    let revocation = EmergencyCertificateRevocation {
+        format_version: crate::certificates::CERTIFICATE_FORMAT_VERSION,
+        trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+        ca_epoch: 1,
+        scope: RevocationScope::Client,
+        identity_key: WireGuardKey::from_bytes([9; 32]),
+        server_name: None,
+        revocation_epoch: 2,
+        revoked_tls_fingerprint: None,
+        revoked_tls_not_after: None,
+        revoked_pq_fingerprint: None,
+        revoked_pq_not_after: None,
+        effective_at: 20_000,
+        reason: crate::certificates::revocation::RevocationReason::Cessation,
+        replacement_transition_fingerprint: None,
+        ca_signature: super::super::encoding::MlDsa87Signature::placeholder(),
+    };
+
+    assert!(matches!(
+        ledger.schedule(&revocation, &gateway, &client),
+        Err(CertificateError::InvalidTransaction(
+            "too many pending revocations"
+        ))
+    ));
+    assert_eq!(ledger, before);
+}
+
 /// After the outgoing key is retired, no `status_epoch` revives it.
 #[test]
 fn a_retired_astra_service_key_is_refused_whatever_it_signs() {
@@ -1564,7 +1609,7 @@ fn the_base_state_fingerprint_is_pinned() {
         last_emergency_replacement_fingerprint: None,
     };
     let client = ClientCertificateState::new(generation(1, 7));
-    let ledger = TrustLedger::default();
+    let mut ledger = TrustLedger::default();
 
     let fingerprint = base_state_fingerprint(&TrustSnapshot {
         gateway: &gateway,
@@ -1581,4 +1626,82 @@ fn the_base_state_fingerprint_is_pinned() {
         fingerprint.to_hex(),
         "73d2a0af6597a32bbb10fe65cca280e874c621f43542e3f115b2c6e9497dc627"
     );
+
+    let baseline = fingerprint;
+    ledger.scheduled_revocations.push(ScheduledRevocation {
+        scope: RevocationScope::Client,
+        revocation_epoch: 2,
+        effective_at: 500,
+        revoked_tls_fingerprint: Some(Fingerprint::of(b"queued tls")),
+        revoked_tls_not_after: Some(900),
+        revoked_pq_fingerprint: None,
+        revoked_pq_not_after: None,
+        revocation_fingerprint: Some(Fingerprint::of(b"queued decision")),
+        replacement_transition_fingerprint: None,
+    });
+    let queued_fingerprint = base_state_fingerprint(&TrustSnapshot {
+        gateway: &gateway,
+        client_tls_ca: &client_tls_ca,
+        astra: &astra,
+        issuer_epoch: 3,
+        issuer: None,
+        client: &client,
+        ledger: &ledger,
+    })
+    .expect("queued revocation fingerprint");
+    assert_ne!(queued_fingerprint, baseline);
+    ledger.scheduled_revocations.clear();
+    ledger.revoked.push(RevocationTombstone {
+        scope: RevocationScope::Client,
+        family: RevokedFamily::Tls,
+        fingerprint: Fingerprint::of(b"revoked tls"),
+        revocation_epoch: 2,
+        expires_at: 900,
+        revocation_fingerprint: Some(Fingerprint::of(b"revoked decision")),
+    });
+    let tombstone_fingerprint = base_state_fingerprint(&TrustSnapshot {
+        gateway: &gateway,
+        client_tls_ca: &client_tls_ca,
+        astra: &astra,
+        issuer_epoch: 3,
+        issuer: None,
+        client: &client,
+        ledger: &ledger,
+    })
+    .expect("tombstone fingerprint");
+    assert_ne!(tombstone_fingerprint, baseline);
+    ledger.revoked.clear();
+
+    let issuer_state = AstraIssuerState {
+        issuer_epoch: 3,
+        authorization: crate::certificates::authority::AstraIssuerAuthorization {
+            format_version: crate::certificates::CERTIFICATE_FORMAT_VERSION,
+            trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+            ca_epoch: 1,
+            ca_tls_epoch: 1,
+            gateway_wg_public_key: WireGuardKey::from_bytes([2; 32]),
+            server_name: "gateway.example".into(),
+            issuer_epoch: 3,
+            pq_issuer_public_key: MlDsa87PublicKey::new(vec![9; 2_592]).expect("key"),
+            tls_intermediate_certificate: DerCertificate::new(vec![10; 64]).expect("DER"),
+            allowed_usage: crate::certificates::authority::AllowedUsage::AdmittedClientLeafRenewal,
+            maximum_leaf_lifetime_secs: 86_400,
+            policy_fingerprint: Fingerprint::of(b"policy"),
+            not_before: 100,
+            not_after: 1_000,
+            ca_pq_signature: super::super::encoding::MlDsa87Signature::placeholder(),
+        },
+        state: IssuerLifecycle::Active,
+    };
+    let issuer_fingerprint = base_state_fingerprint(&TrustSnapshot {
+        gateway: &gateway,
+        client_tls_ca: &client_tls_ca,
+        astra: &astra,
+        issuer_epoch: 3,
+        issuer: Some(&issuer_state),
+        client: &client,
+        ledger: &ledger,
+    })
+    .expect("issuer snapshot fingerprint");
+    assert_ne!(issuer_fingerprint, baseline);
 }
