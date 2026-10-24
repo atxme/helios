@@ -688,17 +688,6 @@ impl GatewayHandler {
         Ok(())
     }
 
-    /// PSKs that should be dropped, with the generation and reason.
-    ///
-    /// Read-only: it decides, the caller acts. Splitting the two keeps the
-    /// lock on the transaction table short and out of the data-plane call —
-    /// and the generation returned here is what makes acting later safe.
-    ///
-    /// Only [`SlotState::Committed`] slots are candidates. A
-    /// [`SlotState::ConfiguredStatic`] one holds an operator's configured
-    /// secret with no transactional owner: neither the handshake threshold
-    /// nor the 24-hour deadline applies to it, and clearing it would destroy
-    /// configuration that no renegotiation could restore.
     /// Revokes every slot whose peer left admission (spec §11.1, priority 1).
     ///
     /// Each slot section already settles its own peer before acting. This
@@ -728,6 +717,17 @@ impl GatewayHandler {
         }
     }
 
+    /// PSKs that should be dropped, with the generation and reason.
+    ///
+    /// Read-only: it decides, the caller acts. Splitting the two keeps the
+    /// lock on the transaction table short and out of the data-plane call —
+    /// and the generation returned here is what makes acting later safe.
+    ///
+    /// Only [`SlotState::Committed`] slots are candidates. A
+    /// [`SlotState::ConfiguredStatic`] one holds an operator's configured
+    /// secret with no transactional owner: neither the handshake threshold
+    /// nor the 24-hour deadline applies to it, and clearing it would destroy
+    /// configuration that no renegotiation could restore.
     pub(super) async fn reclaimable(
         &self,
         observed: &[helios_wireguard::PeerStatus],
