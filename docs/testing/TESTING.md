@@ -526,9 +526,10 @@ sain, puis sur un chemin dégradé :
 6. relever pour chaque renouvellement le délai jusqu'au handshake observé après
    la réinitialisation, le plus long trou de réponses du `ping`, et l'état de la
    connexion `iperf3` ;
-7. recommencer avec un chemin dégradé sur l'interface qui porte le trafic :
-   `tc qdisc add dev <iface> root netem delay 150ms 30ms loss 5%`, retiré
-   ensuite par `tc qdisc del dev <iface> root`.
+7. facultatif depuis la décision du 24 octobre 2026, qui écarte le chemin
+   dégradé de la recette : recommencer avec un chemin dégradé sur l'interface
+   qui porte le trafic, `tc qdisc add dev <iface> root netem delay 150ms 30ms
+   loss 5%`, retiré ensuite par `tc qdisc del dev <iface> root`.
 
 Verdict **PASS ou FAIL par critère**, pour chaque noyau et chaque chemin :
 

@@ -2960,9 +2960,11 @@ une compilation WSL2.
   réinitialisation et observé **sur les deux backends**, interruption sous une
   seconde, aucune session TCP rompue, vingt renouvellements consécutifs réussis.
   À défaut, le renouvellement devient la reconnexion complète définie en §12.3.
-  L'essai doit être rejoué sur un chemin dégradé — perte de paquets et latence
-  injectées — puisque c'est là que la marge du délai de confirmation se
-  consomme. La recette est dans
+  Le rejeu sur un chemin dégradé — perte de paquets et latence injectées, là
+  où la marge du délai de confirmation se consomme — est écarté par décision du
+  24 octobre 2026 : ce n'est pas un cas d'usage visé, et un renouvellement qui
+  n'y aboutit pas laisse l'ancienne clé en place jusqu'à son échéance et
+  reprogramme un essai. La recette est dans
   [TESTING](../testing/TESTING.md#renouvellement-du-psk-à-chaud-v1). Doivent
   aussi être vus sur cible : le comportement de `remove_peer` puis
   `configure_peer` sur le noyau et sur WireGuard-NT, et la règle de pare-feu
