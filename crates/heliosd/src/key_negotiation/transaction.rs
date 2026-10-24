@@ -764,9 +764,15 @@ impl GatewayHandler {
                 {
                     return Some((installed.public_key.clone(), generation, reason));
                 }
+                // Silence is counted from the commit at the earliest. The
+                // snapshot is up to ten seconds old and may still carry the
+                // handshake of a previous session, while the commit itself
+                // proved a fresh one: without this bound a slot committed
+                // seconds ago reads as abandoned for an hour.
                 let handshake_age = peer
                     .last_handshake
-                    .and_then(|at| std::time::SystemTime::now().duration_since(at).ok())?;
+                    .and_then(|at| std::time::SystemTime::now().duration_since(at).ok())?
+                    .min(age);
                 (handshake_age.as_secs() >= helios_wireguard::PSK_RECLAIM_AFTER_STALE_SECS).then(
                     || {
                         (

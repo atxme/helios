@@ -2038,6 +2038,15 @@ l'état du tunnel. Le même observateur récupère le slot : un pair dont aucun
 handshake n'a réussi depuis cinq minutes voit son PSK `ml_kem` retiré et
 zéroïsé, et l'événement est journalisé en nommant le pair et l'âge constaté.
 
+Ce silence se compte au plus tôt depuis le commit du slot. La confirmation a
+prouvé un handshake frais avec ce PSK, alors que l'instantané observé, vieux
+de dix secondes au plus, peut encore porter le handshake d'une session
+précédente. Sans cette borne, un pair qui revient après une heure d'absence et
+renouvelle dans la foulée voyait son slot retiré quelques secondes après le
+commit : la gateway perdait le PSK que le client venait d'installer, le tunnel
+tombait, et le renouvellement suivant était refusé faute de slot `ml_kem`
+validé.
+
 Cinq minutes n'est pas une valeur ronde choisie au hasard. WireGuard abandonne
 lui-même une session au bout de 180 secondes sans handshake : à 300 secondes,
 la gateway ne détruit jamais quelque chose qui fonctionnait encore. Elle

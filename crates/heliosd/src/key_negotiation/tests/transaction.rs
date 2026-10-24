@@ -404,6 +404,72 @@ async fn a_candidate_being_prepared_is_not_reclaimable() {
     assert_eq!(plane.writes().await.len(), 1);
 }
 
+fn handshake_aged(secs: u64) -> helios_wireguard::PeerStatus {
+    helios_wireguard::PeerStatus {
+        public_key: base64::engine::general_purpose::STANDARD
+            .decode(CLIENT_KEY)
+            .unwrap(),
+        endpoint: None,
+        last_handshake: Some(std::time::SystemTime::now() - std::time::Duration::from_secs(secs)),
+        allowed_ips: Vec::new(),
+        rx_bytes: 0,
+        tx_bytes: 0,
+    }
+}
+
+/// The field incident: Orion reconnects after an hour away and renews
+/// twice within seconds.
+///
+/// The reclaimer's snapshot predates both commits and still carries the
+/// handshake of the previous session. The generation it reads is the
+/// current one, so nothing downstream stops it: the slot was cleared three
+/// seconds after a commit that had just proved a fresh handshake, the
+/// tunnel fell, and the next renewal was refused for want of a committed
+/// slot. A handshake older than the slot says nothing about the slot.
+#[tokio::test]
+async fn a_handshake_older_than_the_slot_does_not_reclaim_it() {
+    let previous_psk = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
+    let fixture = pq_fixture();
+    let (handler, plane) = gateway_with(&fixture, &previous_psk, ProtectionMode::MlKem);
+    commit(&handler, &plane, &fixture, [21; 16], PUBLIC_SOURCE).await;
+    commit(&handler, &plane, &fixture, [22; 16], TUNNEL_SOURCE).await;
+
+    let previous_session = handshake_aged(helios_wireguard::PSK_RECLAIM_AFTER_STALE_SECS * 16);
+    assert!(
+        handler.reclaimable(&[previous_session]).await.is_empty(),
+        "a slot committed seconds ago cannot have gone without a handshake for longer"
+    );
+}
+
+#[tokio::test]
+async fn a_slot_without_a_handshake_since_its_commit_is_reclaimed() {
+    let previous_psk = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
+    let fixture = pq_fixture();
+    let (handler, plane) = gateway_with(&fixture, &previous_psk, ProtectionMode::MlKem);
+    commit(&handler, &plane, &fixture, [23; 16], PUBLIC_SOURCE).await;
+    let threshold = std::time::Duration::from_secs(helios_wireguard::PSK_RECLAIM_AFTER_STALE_SECS);
+    {
+        let mut state = handler.transactions.lock().await;
+        let SlotState::Committed(installed) = &mut state.slot(CLIENT_KEY).state else {
+            panic!("the commit must leave an owned slot");
+        };
+        installed.installed_at -= threshold;
+    }
+
+    let reclaimed = handler
+        .reclaimable(&[handshake_aged(threshold.as_secs() * 16)])
+        .await;
+    assert_eq!(
+        reclaimed.len(),
+        1,
+        "silent since its commit: the peer is gone"
+    );
+    assert!(
+        reclaimed[0].2.contains("no WireGuard handshake"),
+        "the journal names the cause: {reclaimed:?}"
+    );
+}
+
 /// The other stale actor: a `release` naming the PSK the candidate
 /// displaced.
 ///

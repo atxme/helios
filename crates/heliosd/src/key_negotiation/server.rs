@@ -202,10 +202,10 @@ fn spawn_psk_reclaimer(
                     "reclaiming a negotiated PSK"
                 );
                 // The snapshot this decision came from is up to ten seconds
-                // old, so a negotiation may have committed in between. The
-                // generation is what makes that harmless: a slot that moved
-                // on is left alone rather than cleared under a client that
-                // has just finished handshaking.
+                // old, so a negotiation may have committed in between.
+                // `reclaimable` counts silence from the commit at the
+                // earliest, which covers a commit before the decision; the
+                // generation covers one between the decision and this clear.
                 if handler.clear_slot(&public_key, generation).await.is_err() {
                     tracing::error!("could not clear a reclaimed PSK slot");
                 }
