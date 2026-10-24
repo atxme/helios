@@ -31,6 +31,7 @@ use tokio::sync::Mutex;
 struct RecoveryGateway {
     peer: aether::certificates::encoding::WireGuardKey,
     peer_view: Mutex<astra_channel::PeerCertificateStateView>,
+    stage_calls: std::sync::atomic::AtomicUsize,
     commit_fingerprints: Mutex<Vec<Fingerprint>>,
     lose_first_reply: std::sync::atomic::AtomicBool,
     gateway_leaf: aether::key_negotiation::PqCertificate,
@@ -51,6 +52,8 @@ impl astra_channel::AstraStageHandler for RecoveryGateway {
         &self,
         authorization: Box<ClientCertificateStageAuthorization>,
     ) -> Result<Box<GatewayCertificateStageReceipt>, TrustUpdateRefusal> {
+        self.stage_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if !authorization
             .fingerprint()
             .map_err(|_| TrustUpdateRefusal::Rejected)?
@@ -903,6 +906,101 @@ async fn bounded_commit(
     .expect("loopback private-channel commit completes within ten seconds")
 }
 
+struct RecoveryGatewayMaterial {
+    ca_public: aether::certificates::encoding::MlDsa87PublicKey,
+    gateway_public: aether::certificates::encoding::MlDsa87PublicKey,
+    gateway_leaf: PqCertificate,
+    old_client_public: aether::certificates::encoding::MlDsa87PublicKey,
+    candidate_client_public: aether::certificates::encoding::MlDsa87PublicKey,
+    tls_anchor: aether::certificates::encoding::DerCertificate,
+    authorization: ClientCertificateStageAuthorization,
+    receipt: GatewayCertificateStageReceipt,
+}
+
+async fn install_recovery_gateway(
+    service: &mut Arc<AstraService>,
+    directory: &tempfile::TempDir,
+    operation: &RecoveryOperation,
+    material: RecoveryGatewayMaterial,
+    revoked: bool,
+    now: u64,
+) -> (
+    Arc<RecoveryGateway>,
+    crate::renewal::test_support::ServerTask,
+) {
+    let RecoveryGatewayMaterial {
+        ca_public,
+        gateway_public,
+        gateway_leaf,
+        old_client_public,
+        candidate_client_public,
+        tls_anchor,
+        authorization,
+        receipt,
+    } = material;
+    let client = operation.request.client_wg_public_key;
+    let old_leaf = operation.request.expired_pq_certificate.clone();
+    let old_tls_leaf = operation.request.expired_tls_certificate.clone();
+    let old_generation = generation(4, &old_leaf, &tls_anchor, &old_tls_leaf);
+    let gateway_certificate_fingerprint =
+        aether::certificates::gateway::pq_certificate_fingerprint(&gateway_leaf)
+            .expect("gateway fingerprint");
+    let handler = Arc::new(RecoveryGateway {
+        peer: client,
+        peer_view: Mutex::new(astra_channel::PeerCertificateStateView {
+            name: "workstation".into(),
+            state: ClientCertificateState::new(old_generation.clone()),
+            active_pq_certificate: old_leaf.clone(),
+            admission_pq_ca: None,
+        }),
+        stage_calls: std::sync::atomic::AtomicUsize::new(0),
+        commit_fingerprints: Mutex::new(Vec::new()),
+        lose_first_reply: std::sync::atomic::AtomicBool::new(true),
+        gateway_leaf,
+        ca_public,
+        gateway_public,
+        gateway_certificate_fingerprint,
+        tls_anchor,
+        active_generation: old_generation.clone(),
+        old_client_public,
+        candidate_client_public,
+        expected_authorization: authorization,
+        stage_receipt: receipt,
+    });
+    let (gateway, server_task) =
+        crate::renewal::test_support::channel(directory.path(), handler.clone()).await;
+    Arc::get_mut(service)
+        .expect("unique service before test calls")
+        .gateway = Some(gateway);
+    {
+        let mut registry = service.registry.lock().await;
+        registry
+            .admit(
+                crate::registry::PeerRecord {
+                    name: "workstation".into(),
+                    client_wg_public_key: client,
+                    active: old_generation,
+                    active_pq_certificate: old_leaf,
+                    pending: None,
+                    revoked: false,
+                    revocation_epoch: 0,
+                    admission_pq_ca: None,
+                },
+                now,
+            )
+            .expect("record admitted identity");
+        if revoked {
+            registry
+                .revoke(&client, 1, now)
+                .expect("revoke admitted identity");
+        }
+    }
+    if revoked {
+        handler.peer_view.lock().await.state.revoke(1);
+    }
+    (handler, server_task)
+}
+
 #[tokio::test]
 async fn a_commit_applied_before_a_lost_reply_is_replayed_and_reconciled() {
     tokio::time::timeout(Duration::from_secs(15), async {
@@ -928,56 +1026,24 @@ async fn a_commit_applied_before_a_lost_reply_is_replayed_and_reconciled() {
             gateway_public.as_bytes(),
         );
         let client = operation.request.client_wg_public_key;
-        let old_leaf = operation.request.expired_pq_certificate.clone();
-        let old_tls_leaf = operation.request.expired_tls_certificate.clone();
-        let old_generation = generation(4, &old_leaf, &tls_anchor, &old_tls_leaf);
-        let gateway_certificate_fingerprint =
-            aether::certificates::gateway::pq_certificate_fingerprint(&gateway_leaf)
-                .expect("gateway fingerprint");
-        let handler = Arc::new(RecoveryGateway {
-            peer: client,
-            peer_view: Mutex::new(astra_channel::PeerCertificateStateView {
-                name: "workstation".into(),
-                state: ClientCertificateState::new(old_generation.clone()),
-                active_pq_certificate: old_leaf.clone(),
-                admission_pq_ca: None,
-            }),
-            commit_fingerprints: Mutex::new(Vec::new()),
-            lose_first_reply: std::sync::atomic::AtomicBool::new(true),
-            gateway_leaf: gateway_leaf.clone(),
-            ca_public: service_ca_public(&ca_private),
-            gateway_public,
-            gateway_certificate_fingerprint,
-            tls_anchor,
-            active_generation: old_generation.clone(),
-            old_client_public,
-            candidate_client_public,
-            expected_authorization: stage_authorization.clone(),
-            stage_receipt: stage_grant.stage_receipt.clone(),
-        });
-        let (gateway, _server) =
-            crate::renewal::test_support::channel(directory.path(), handler.clone()).await;
-        Arc::get_mut(&mut service)
-            .expect("unique service before test calls")
-            .gateway = Some(gateway);
-        {
-            let mut registry = service.registry.lock().await;
-            registry
-                .admit(
-                    crate::registry::PeerRecord {
-                        name: "workstation".into(),
-                        client_wg_public_key: client,
-                        active: old_generation,
-                        active_pq_certificate: old_leaf,
-                        pending: None,
-                        revoked: false,
-                        revocation_epoch: 0,
-                        admission_pq_ca: None,
-                    },
-                    now,
-                )
-                .expect("record admitted identity");
-        }
+        let (handler, _server_task) = install_recovery_gateway(
+            &mut service,
+            &directory,
+            &operation,
+            RecoveryGatewayMaterial {
+                ca_public: service_ca_public(&ca_private),
+                gateway_public,
+                gateway_leaf,
+                old_client_public,
+                candidate_client_public,
+                tls_anchor,
+                authorization: stage_authorization.clone(),
+                receipt: stage_grant.stage_receipt.clone(),
+            },
+            false,
+            now,
+        )
+        .await;
         assert!(service
             .challenges
             .lock()
@@ -1014,6 +1080,52 @@ async fn a_commit_applied_before_a_lost_reply_is_replayed_and_reconciled() {
                 .state,
             ExpiredRecoveryState::AwaitingOperator
         );
+        let audit_before_invalid_evidence =
+            service.registry.lock().await.state().audit.records.clone();
+        let mut wrong_origin = approval_evidence.clone();
+        wrong_origin.webauthn_origin = "https://attacker.example".into();
+        let mut wrong_domain = approval_evidence.clone();
+        wrong_domain.credential_registry.trust_domain_id =
+            TrustDomainId::new([0x77; 16]).expect("other trust domain");
+        for invalid_evidence in [wrong_origin, wrong_domain] {
+            assert!(matches!(
+                authorize(
+                    &service,
+                    &operation_id,
+                    Box::new(stage_authorization.clone()),
+                    invalid_evidence,
+                    now + 1,
+                )
+                .await,
+                Err(RecoveryError::Certificate(_))
+            ));
+        }
+        assert_eq!(
+            service
+                .recoveries
+                .lock()
+                .await
+                .get(&operation_id, now + 1)
+                .expect("invalid evidence leaves recovery awaiting the operator")
+                .state,
+            ExpiredRecoveryState::AwaitingOperator
+        );
+        assert_eq!(
+            handler
+                .stage_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "invalid approval evidence is refused before gateway staging"
+        );
+        assert_eq!(
+            service.registry.lock().await.state().audit.records,
+            audit_before_invalid_evidence,
+            "invalid approval evidence does not append an approval audit event"
+        );
+        assert!(!directory
+            .path()
+            .join(crate::reconciliation::RECONCILIATION_FILE)
+            .exists());
         let staged = authorize(
             &service,
             &operation_id,
@@ -1024,6 +1136,35 @@ async fn a_commit_applied_before_a_lost_reply_is_replayed_and_reconciled() {
         .await
         .expect("valid operator assertion authorizes recovery staging");
         assert_eq!(staged.state, ExpiredRecoveryState::Staged);
+        let audit_before_invalid_grant =
+            service.registry.lock().await.state().audit.records.clone();
+        let mut mismatched_grant = stage_grant.clone();
+        mismatched_grant.stage_receipt_fingerprint = Fingerprint::of(b"different receipt");
+        assert!(matches!(
+            grant(&service, &operation_id, Box::new(mismatched_grant), now + 1).await,
+            Err(RecoveryError::Certificate(
+                aether::certificates::CertificateError::ApprovalMismatch(_)
+            ))
+        ));
+        assert_eq!(
+            service
+                .recoveries
+                .lock()
+                .await
+                .get(&operation_id, now + 1)
+                .expect("failed grant leaves staged operation")
+                .state,
+            ExpiredRecoveryState::Staged
+        );
+        assert_eq!(
+            service.registry.lock().await.state().audit.records,
+            audit_before_invalid_grant,
+            "mismatched grant does not append an approval audit event"
+        );
+        assert!(!directory
+            .path()
+            .join(crate::reconciliation::RECONCILIATION_FILE)
+            .exists());
         let granted = grant(&service, &operation_id, Box::new(stage_grant), now)
             .await
             .expect("release signed grant after receipt");
@@ -1109,6 +1250,91 @@ async fn a_commit_applied_before_a_lost_reply_is_replayed_and_reconciled() {
     })
     .await
     .expect("the complete recovery workflow finishes within fifteen seconds");
+}
+
+#[tokio::test]
+async fn a_revoked_peer_cannot_open_expired_recovery() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let now = 12_000;
+        let (mut service, directory, ca_private) = service();
+        let (gateway_private, gateway_public) =
+            generate_ml_dsa_87_keypair().expect("gateway signing key");
+        let (
+            operation,
+            stage_grant,
+            _stage_commit,
+            gateway_leaf,
+            old_client_public,
+            candidate_client_public,
+            tls_anchor,
+            stage_authorization,
+            _approval_evidence,
+        ) = granted_recovery(
+            32,
+            now,
+            &ca_private,
+            &gateway_private,
+            gateway_public.as_bytes(),
+        );
+        let client = operation.request.client_wg_public_key;
+        let (handler, _server_task) = install_recovery_gateway(
+            &mut service,
+            &directory,
+            &operation,
+            RecoveryGatewayMaterial {
+                ca_public: service_ca_public(&ca_private),
+                gateway_public,
+                gateway_leaf,
+                old_client_public,
+                candidate_client_public,
+                tls_anchor,
+                authorization: stage_authorization.clone(),
+                receipt: stage_grant.stage_receipt.clone(),
+            },
+            true,
+            now,
+        )
+        .await;
+        let audit_before_open = service.registry.lock().await.state().audit.records.clone();
+        assert!(service
+            .challenges
+            .lock()
+            .await
+            .issue(operation.request.astra_challenge, now));
+        let open_result = open(&service, operation.request.clone(), now).await;
+        assert!(
+            matches!(open_result, Err(RecoveryError::Revoked)),
+            "revoked recovery open returned {open_result:?}"
+        );
+        assert!(service.recoveries.lock().await.is_empty());
+        assert_eq!(
+            service.registry.lock().await.state().audit.records,
+            audit_before_open,
+            "a refused recovery does not append a recovery audit event"
+        );
+        assert!(handler.peer_view.lock().await.state.revoked);
+        assert_eq!(
+            handler
+                .stage_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert!(!directory
+            .path()
+            .join(crate::reconciliation::RECONCILIATION_FILE)
+            .exists());
+        assert!(
+            service
+                .registry
+                .lock()
+                .await
+                .peer(&client)
+                .expect("revoked peer remains recorded")
+                .revoked
+        );
+    })
+    .await
+    .expect("revoked-peer recovery workflow finishes within fifteen seconds");
 }
 
 #[tokio::test]
