@@ -36,6 +36,7 @@ use aether::certificates::operator_session::{
     limits, BeginCommand, GestureState, OperationLocator, OperatorAction, OperatorCommand,
     OperatorHello, OperatorStatus, Refusal, RemoteState, StepCommand, PROTOCOL_VERSION,
 };
+use orion_engine::session::same_secret;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpListener;
@@ -277,19 +278,6 @@ async fn authenticated_helper(
     }
 }
 
-/// Compares two secrets without letting the timing say where they differ.
-fn same_secret(candidate: &str, expected: &str) -> bool {
-    let (candidate, expected) = (candidate.as_bytes(), expected.as_bytes());
-    candidate.len() == expected.len()
-        && candidate
-            .iter()
-            .zip(expected)
-            .fold(0u8, |accumulator, (left, right)| {
-                accumulator | (left ^ right)
-            })
-            == 0
-}
-
 /// Republishes every state the helper sends, until it stops sending.
 ///
 /// Two things are refused rather than forwarded, and both are the same defect
@@ -420,14 +408,6 @@ mod tests {
 
     fn session() -> Id16 {
         Id16::new([4; 16]).expect("id")
-    }
-
-    #[test]
-    fn a_wrong_secret_is_refused_whatever_its_shape() {
-        assert!(same_secret("abcd", "abcd"));
-        assert!(!same_secret("abcd", "abce"));
-        assert!(!same_secret("abcd", "abcde"));
-        assert!(!same_secret("", "a"));
     }
 
     /// The button is offered and refused from the same value, so a WebView

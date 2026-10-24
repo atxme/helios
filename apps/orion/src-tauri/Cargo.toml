@@ -25,6 +25,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 aether = { workspace = true }
 orion-core = { path = "../../../crates/orion-core" }
+orion-engine = { path = "../../../crates/orion-engine" }
 # `StagedKey` tient une clé privée entre sa création et son enregistrement :
 # elle doit être effacée au `Drop`, pas seulement libérée (ADR-006 §5).
 zeroize = { workspace = true }

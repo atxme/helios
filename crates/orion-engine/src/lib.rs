@@ -6,6 +6,7 @@
 //! writing.
 
 pub mod command;
+pub mod session;
 pub mod wire;
 
 pub use command::{EngineCommand, EngineReply};
