@@ -28,6 +28,19 @@ impl SessionToken {
         )))
     }
 
+    /// Reads a token written by [`SessionToken::generate`]: 64 lowercase hexadecimal digits.
+    /// The refusal never repeats the text it was given.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let well_formed = text.len() == 64
+            && text
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+        if !well_formed {
+            return Err("jeton de session illisible".to_owned());
+        }
+        Ok(Self(Zeroizing::new(text.to_owned())))
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }

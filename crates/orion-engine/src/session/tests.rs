@@ -156,3 +156,34 @@ fn a_wrong_secret_is_refused_whatever_its_shape() {
     assert!(!same_secret("abcd", "abcde"));
     assert!(!same_secret("", "a"));
 }
+
+#[test]
+fn a_generated_token_parses_back() {
+    let token = token();
+    let parsed = SessionToken::parse(token.as_str()).expect("a generated token parses");
+    assert_eq!(parsed.as_str(), token.as_str());
+}
+
+#[test]
+fn a_malformed_token_is_refused() {
+    let valid = "a".repeat(64);
+    let too_short = "a".repeat(63);
+    let too_long = "a".repeat(65);
+    let uppercase = "A".repeat(64);
+    let not_hex = format!("{}g", "a".repeat(63));
+    for text in [&too_short, &too_long, &uppercase, &not_hex, &String::new()] {
+        assert!(SessionToken::parse(text).is_err(), "accepted {text:?}");
+    }
+    assert!(SessionToken::parse(&valid).is_ok());
+}
+
+#[test]
+fn a_refused_token_text_is_never_echoed() {
+    let uppercase = "B".repeat(64);
+    let not_hex = format!("{}zz", "c".repeat(62));
+    for text in [&uppercase, &not_hex] {
+        let message = SessionToken::parse(text).expect_err("refused");
+        assert_eq!(message, "jeton de session illisible");
+        assert!(!message.contains(text.as_str()));
+    }
+}
