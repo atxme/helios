@@ -36,7 +36,11 @@ pub struct Hello {
 #[serde(tag = "frame", rename_all = "snake_case")]
 pub enum ClientFrame {
     Hello(Hello),
-    Request { id: u64, command: EngineCommand },
+    /// Boxed: a profile draft makes the command far larger than a hello.
+    Request {
+        id: u64,
+        command: Box<EngineCommand>,
+    },
 }
 
 /// Frames sent by the engine: the reply to a request, or a pushed event.

@@ -78,7 +78,7 @@ async fn a_request_before_the_hello_is_refused() {
         &mut client,
         &ClientFrame::Request {
             id: 1,
-            command: EngineCommand::Shutdown,
+            command: Box::new(EngineCommand::Shutdown),
         },
     )
     .await;

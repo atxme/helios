@@ -2,6 +2,7 @@
 //! volume, the SSH terminal, and validation.
 
 use super::*;
+use orion_engine::ProfileDraft;
 
 /// A profile **as the interface is allowed to see it** (ADR-006 §5).
 ///
@@ -99,148 +100,89 @@ impl From<&ClientConfig> for ConfigView {
     }
 }
 
-/// What the screen sends back when the user saves.
+/// Merges a saved draft onto what is stored, keeping every secret in Rust.
 ///
-/// The secrets are **write-only and optional**: the interface never received
-/// them, so it cannot send them back, and `None` therefore means *keep what is
-/// stored*. That asymmetry is deliberate — it is what lets a profile be edited
-/// without its private key ever making the round trip.
-/// # Naming, and the bug it caused
-///
-/// The profile fields keep serde's **snake_case**, because that is what
-/// `ClientProfile` and `KeyNegotiationSettings` use on the wire and what the
-/// screen echoes back after receiving a [`ProfileView`]. A blanket
-/// `rename_all = "camelCase"` here made every one of them a different name —
-/// `save_profile` then refused the payload with `missing field peerPublicKey`,
-/// and no test caught it: the TypeScript suite mocks the command, and the Rust
-/// suite builds the struct directly. Neither crossed the boundary where the
-/// names actually have to agree. `the_frontend_payload_deserialises` does.
-///
-/// Only the two **intents** are camelCase, because they exist nowhere else and
-/// the screen writes them by hand.
-#[derive(Debug, Clone, serde::Deserialize)]
-pub(crate) struct ProfileDraft {
-    pub(crate) name: String,
-    pub(crate) endpoint: String,
-    pub(crate) peer_public_key: String,
-    pub(crate) address: Option<String>,
-    /// Absent from a payload means `None`, like every optional field here:
-    /// the screen always sends it, and a save without it is a profile
-    /// without IPv6.
-    pub(crate) address_v6: Option<String>,
-    pub(crate) allowed_ips: String,
-    pub(crate) persistent_keepalive: u16,
-    pub(crate) heliosd_url: Option<String>,
-    pub(crate) ssh_target: Option<String>,
-    pub(crate) key_negotiation: Option<orion_core::KeyNegotiationSettings>,
-    /// Adopts the key sitting in [`AppState::staged_key`].
-    ///
-    /// Set by the screen after `generate_private_key` or `adopt_private_key`
-    /// has already produced one and shown its **public** half. The private half
-    /// never travels back: it waited in Rust the whole time.
-    #[serde(default, rename = "useStagedKey")]
-    pub(crate) use_staged_key: bool,
-    /// Clears the stored static PSK.
-    #[serde(default, rename = "clearPresharedKey")]
-    pub(crate) clear_preshared_key: bool,
-    /// Adopts the PSK sitting in [`AppState::staged_psk`].
-    ///
-    /// The enrolment document remains the ordinary way a static PSK arrives.
-    /// It is not the only one: an operator who rotates a PSK out of band, or
-    /// who runs a gateway pinned to `static_psk`, otherwise had to reissue a
-    /// whole profile to change one value the screen was already displaying the
-    /// absence of. The direction is what makes it acceptable — the secret
-    /// enters once, on an explicit gesture, and no path returns it (ADR-006
-    /// §5), exactly as for [`Self::use_staged_key`].
-    #[serde(default, rename = "useStagedPsk")]
-    pub(crate) use_staged_psk: bool,
-}
-
-impl ProfileDraft {
-    /// Merges the draft onto what is stored, keeping every secret in Rust.
-    ///
-    /// `stored` is `None` for a profile the user is creating, which is the one
-    /// case where a key must be generated: refusing instead would leave the
-    /// screen with no way at all to make a profile, and inventing an empty key
-    /// would produce one that fails `validate` with a message about enrolment.
-    pub(crate) fn merge(
-        self,
-        stored: Option<&ClientProfile>,
-        staged: Option<&StagedKey>,
-        staged_psk: Option<&StagedPsk>,
-    ) -> Result<ClientProfile, String> {
-        let stored_kind = stored.map(ClientProfile::kind);
-        let mut profile = match stored {
-            Some(profile) => profile.duplicate(),
-            None => ClientProfile {
-                name: self.name.clone(),
-                ..ClientProfile::default()
-            },
-        };
-        if self.use_staged_key {
-            let staged = staged.ok_or(
-                "aucune clé en attente : générer ou importer une clé privée avant d'enregistrer",
-            )?;
-            // The public half was shown, copied, and handed to the operator for
-            // admission. Saving a private key that derives to anything else
-            // would produce a profile whose handshakes never succeed, with
-            // nothing on either side naming the cause — the gateway admitted a
-            // key this profile does not hold. Re-deriving costs microseconds.
-            let derived = aether::wg::public_from_private(staged.private_key.expose())
-                .map_err(|error| format!("clé en attente illisible : {error}"))?;
-            if derived != staged.public_key {
-                return Err(
-                    "la clé en attente ne correspond plus à la clé publique affichée — \
-                     regénérer avant d'enregistrer"
-                        .into(),
-                );
-            }
-            // The draft takes its own zeroizing copy; the staged source stays
-            // protected until the caller drops it.
-            profile.private_key = staged.private_key.duplicate();
+/// `stored` is `None` for a profile the user is creating, which is the one
+/// case where a key must be generated: refusing instead would leave the
+/// screen with no way at all to make a profile, and inventing an empty key
+/// would produce one that fails `validate` with a message about enrolment.
+pub(crate) fn merge_draft(
+    draft: ProfileDraft,
+    stored: Option<&ClientProfile>,
+    staged: Option<&StagedKey>,
+    staged_psk: Option<&StagedPsk>,
+) -> Result<ClientProfile, String> {
+    let stored_kind = stored.map(ClientProfile::kind);
+    let mut profile = match stored {
+        Some(profile) => profile.duplicate(),
+        None => ClientProfile {
+            name: draft.name.clone(),
+            ..ClientProfile::default()
+        },
+    };
+    if draft.use_staged_key {
+        let staged = staged.ok_or(
+            "aucune clé en attente : générer ou importer une clé privée avant d'enregistrer",
+        )?;
+        // The public half was shown, copied, and handed to the operator for
+        // admission. Saving a private key that derives to anything else
+        // would produce a profile whose handshakes never succeed, with
+        // nothing on either side naming the cause — the gateway admitted a
+        // key this profile does not hold. Re-deriving costs microseconds.
+        let derived = aether::wg::public_from_private(staged.private_key.expose())
+            .map_err(|error| format!("clé en attente illisible : {error}"))?;
+        if derived != staged.public_key {
+            return Err(
+                "la clé en attente ne correspond plus à la clé publique affichée — \
+                 regénérer avant d'enregistrer"
+                    .into(),
+            );
         }
-        if self.use_staged_psk {
-            let staged = staged_psk
-                .ok_or("aucun PSK en attente : saisir le PSK statique avant d'enregistrer")?;
-            // The draft owns its zeroizing PSK independently of the staging slot.
-            profile.preshared_key = Some(staged.value.duplicate());
-        }
-        // After adoption, never before: clearing is what the screen sends when
-        // the requested mode no longer tolerates a static PSK, and that verdict
-        // has to apply to the value being adopted too. The other order let a
-        // PSK typed under `static_psk` survive a switch to ML-KEM made in the
-        // same edit.
-        if self.clear_preshared_key {
-            profile.preshared_key = None;
-        }
-        profile.name = self.name;
-        profile.endpoint = self.endpoint;
-        profile.peer_public_key = self.peer_public_key;
-        profile.address = self.address;
-        profile.address_v6 = self.address_v6;
-        profile.allowed_ips = self.allowed_ips;
-        profile.persistent_keepalive = self.persistent_keepalive;
-        profile.heliosd_url = self.heliosd_url;
-        profile.ssh_target = self.ssh_target;
-        profile.key_negotiation = self.key_negotiation;
-        // An existing stable profile keeps its declared variant. Switching
-        // between classic and Helios requires another profile identifier (spec
-        // §14, §19); deriving the kind from the edited block here made deleting
-        // that block a persistent downgrade. A new draft has no history and is
-        // stamped from the shape the user chose before its first save.
-        profile.profile_type = Some(stored_kind.unwrap_or_else(|| {
-            if profile.key_negotiation.is_some() {
-                orion_core::ProfileKind::HeliosKeyNegotiation
-            } else {
-                orion_core::ProfileKind::Classic
-            }
-        }));
-        profile.check_kind().map_err(|error| error.to_string())?;
-        // A stored profile never carries a negotiated PSK: that one only ever
-        // exists in the ephemeral copy the backend mounts.
-        profile.preshared_key_is_negotiated = false;
-        Ok(profile)
+        // The draft takes its own zeroizing copy; the staged source stays
+        // protected until the caller drops it.
+        profile.private_key = staged.private_key.duplicate();
     }
+    if draft.use_staged_psk {
+        let staged = staged_psk
+            .ok_or("aucun PSK en attente : saisir le PSK statique avant d'enregistrer")?;
+        // The draft owns its zeroizing PSK independently of the staging slot.
+        profile.preshared_key = Some(staged.value.duplicate());
+    }
+    // After adoption, never before: clearing is what the screen sends when
+    // the requested mode no longer tolerates a static PSK, and that verdict
+    // has to apply to the value being adopted too. The other order let a
+    // PSK typed under `static_psk` survive a switch to ML-KEM made in the
+    // same edit.
+    if draft.clear_preshared_key {
+        profile.preshared_key = None;
+    }
+    profile.name = draft.name;
+    profile.endpoint = draft.endpoint;
+    profile.peer_public_key = draft.peer_public_key;
+    profile.address = draft.address;
+    profile.address_v6 = draft.address_v6;
+    profile.allowed_ips = draft.allowed_ips;
+    profile.persistent_keepalive = draft.persistent_keepalive;
+    profile.heliosd_url = draft.heliosd_url;
+    profile.ssh_target = draft.ssh_target;
+    profile.key_negotiation = draft.key_negotiation;
+    // An existing stable profile keeps its declared variant. Switching
+    // between classic and Helios requires another profile identifier (spec
+    // §14, §19); deriving the kind from the edited block here made deleting
+    // that block a persistent downgrade. A new draft has no history and is
+    // stamped from the shape the user chose before its first save.
+    profile.profile_type = Some(stored_kind.unwrap_or_else(|| {
+        if profile.key_negotiation.is_some() {
+            orion_core::ProfileKind::HeliosKeyNegotiation
+        } else {
+            orion_core::ProfileKind::Classic
+        }
+    }));
+    profile.check_kind().map_err(|error| error.to_string())?;
+    // A stored profile never carries a negotiated PSK: that one only ever
+    // exists in the ephemeral copy the backend mounts.
+    profile.preshared_key_is_negotiated = false;
+    Ok(profile)
 }
 
 /// Selects the profile that is actually being edited.
@@ -709,7 +651,7 @@ pub(crate) async fn save_profile(
     // the slot would let the next profile saved adopt it too.
     let staged = state.staged_key.lock().await.take();
     let staged_psk = state.staged_psk.lock().await.take();
-    let profile = draft.merge(stored, staged.as_ref(), staged_psk.as_ref())?;
+    let profile = merge_draft(draft, stored, staged.as_ref(), staged_psk.as_ref())?;
     if let Some(known) = known {
         profile
             .check_replacement_of(known)
@@ -842,7 +784,7 @@ pub(crate) async fn validate_profile(
     // taken.
     let staged = state.staged_key.lock().await;
     let staged_psk = state.staged_psk.lock().await;
-    let profile = draft.merge(stored, staged.as_ref(), staged_psk.as_ref())?;
+    let profile = merge_draft(draft, stored, staged.as_ref(), staged_psk.as_ref())?;
     if let Some(known) = known {
         profile
             .check_replacement_of(known)
