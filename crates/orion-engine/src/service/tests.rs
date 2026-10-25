@@ -387,10 +387,10 @@ async fn pending_enrollments_answer_through_the_client() {
         .expect("the session opens");
 
     let reply = client.call(EngineCommand::ListPendingEnrollments).await;
-    // The protected store of this host decides the answer; the list's contents
-    // are not pinned, only the variant the engine returns.
+    // The identities live under the paths the service was opened on: the
+    // store is empty, whatever this host's protected store holds.
     assert!(
-        matches!(reply, Ok(EngineReply::PendingEnrollments(_))),
+        matches!(reply, Ok(EngineReply::PendingEnrollments(ref list)) if list.is_empty()),
         "reply: {reply:?}"
     );
 }

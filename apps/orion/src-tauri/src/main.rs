@@ -533,15 +533,20 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for FileWriter {
 /// *this* start, in full. A file that grows across weeks makes the operator
 /// scroll past six boots to reach the one that failed, and a VPN client that
 /// silently fills a disk is its own incident.
-fn open_log_file(file_name: &str) -> Option<FileWriter> {
-    let path = orion_core::vault::ProfileStore::default_dir()
-        .ok()?
-        .join(file_name);
+fn open_log_file(path: &Path) -> Option<FileWriter> {
     if let Some(parent) = path.parent() {
         aether::private_file::create_private_dir(parent).ok()?;
     }
-    let file = std::fs::File::create(&path).ok()?;
+    let file = std::fs::File::create(path).ok()?;
     Some(FileWriter(Arc::new(StdMutex::new(file))))
+}
+
+/// The UI's own log: in the per-user directory, which is not protected. The
+/// engine writes its log under the protected root instead.
+fn ui_log_path() -> Option<PathBuf> {
+    orion_core::protected_root::user_dir()
+        .ok()
+        .map(|dir| dir.join(if cfg!(windows) { UI_LOG_FILE } else { LOG_FILE }))
 }
 
 /// Wires stdout **and** a file.
@@ -550,17 +555,14 @@ fn open_log_file(file_name: &str) -> Option<FileWriter> {
 /// = "windows"` means an installed Orion has no console, so everything written
 /// to stdout goes nowhere. Asking a user to reproduce under `cargo run` to see
 /// a log is asking them to rebuild the product.
-fn init_logging(file_name: &str) -> Option<PathBuf> {
+fn init_logging(path: Option<PathBuf>) -> Option<PathBuf> {
     let filter = || {
         tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| DEFAULT_LOG_FILTER.into())
     };
 
-    let path = orion_core::vault::ProfileStore::default_dir()
-        .ok()
-        .map(|dir| dir.join(file_name));
-
-    match open_log_file(file_name) {
+    let file = path.as_deref().and_then(open_log_file);
+    match file {
         Some(file) => {
             use tracing_subscriber::layer::SubscriberExt as _;
             use tracing_subscriber::util::SubscriberInitExt as _;
@@ -600,7 +602,7 @@ fn main() {
         Ok(None) => {}
     }
 
-    let log_path = init_logging(if cfg!(windows) { UI_LOG_FILE } else { LOG_FILE });
+    let log_path = init_logging(ui_log_path());
     if let Some(path) = &log_path {
         tracing::info!(fichier = %path.display(), "journal d'Orion");
     } else {

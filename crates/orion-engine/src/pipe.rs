@@ -10,6 +10,9 @@ use std::path::{Path, PathBuf};
 #[cfg(windows)]
 mod windows;
 
+#[cfg(test)]
+use orion_core::protected_root::is_plain_sid;
+
 #[cfg(windows)]
 pub use windows::{
     connect_client, create_server, observe_client, observe_process, process_user_sid,
@@ -126,24 +129,6 @@ fn same_image(a: &Path, b: &Path) -> bool {
     let a = a.strip_prefix(r"\\?\").unwrap_or(a);
     let b = b.strip_prefix(r"\\?\").unwrap_or(b);
     a.eq_ignore_ascii_case(b)
-}
-
-/// A SID in string form: `S-` then at least two non-empty runs of digits
-/// separated by dashes, such as `S-1-5-18`. Nothing else is accepted.
-///
-/// It is written into an SDDL string, so anything beyond that shape (a
-/// bracket, a space, an empty segment, a trailing dash, a lowercase `s`) is
-/// refused.
-#[cfg(any(windows, test))]
-fn is_plain_sid(sid: &str) -> bool {
-    let Some(rest) = sid.strip_prefix("S-") else {
-        return false;
-    };
-    let segments: Vec<&str> = rest.split('-').collect();
-    segments.len() >= 2
-        && segments
-            .iter()
-            .all(|segment| !segment.is_empty() && segment.bytes().all(|b| b.is_ascii_digit()))
 }
 
 #[cfg(test)]

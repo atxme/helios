@@ -26,7 +26,8 @@ use windows_sys::Win32::System::Threading::{
     PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
-use super::{is_plain_sid, ObservedClient};
+use super::ObservedClient;
+use orion_core::protected_root::is_plain_sid;
 
 /// Longest image path Windows reports, in UTF-16 units, with its terminator.
 const MAX_IMAGE_PATH: usize = 32_768;

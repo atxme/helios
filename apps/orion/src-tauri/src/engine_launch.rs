@@ -14,10 +14,14 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 #[cfg(windows)]
 use std::time::Duration;
 
+#[cfg(any(windows, test))]
+use orion_core::protected_root::REFUSED_ROOT;
 #[cfg(windows)]
 use orion_core::ClientEvent;
 #[cfg(windows)]
 use orion_engine::client::{connect, EngineClient};
+#[cfg(any(windows, test))]
+use orion_engine::lifecycle::PROTECTED_ROOT_REFUSED;
 #[cfg(windows)]
 use orion_engine::lifecycle::{EngineArgs, CONNECT_TIMEOUT};
 #[cfg(windows)]
@@ -31,9 +35,13 @@ use tokio::net::windows::named_pipe::NamedPipeClient;
 #[cfg(windows)]
 use tokio::sync::mpsc;
 #[cfg(windows)]
-use windows_sys::Win32::Foundation::{GetLastError, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows_sys::Win32::Foundation::{
+    GetLastError, HANDLE, STILL_ACTIVE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+};
 #[cfg(windows)]
-use windows_sys::Win32::System::Threading::{GetProcessId, WaitForSingleObject, INFINITE};
+use windows_sys::Win32::System::Threading::{
+    GetExitCodeProcess, GetProcessId, WaitForSingleObject, INFINITE,
+};
 #[cfg(windows)]
 use windows_sys::Win32::UI::Shell::{
     ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
@@ -86,6 +94,17 @@ pub(crate) fn launch_failure(code: i32) -> String {
         return UAC_REFUSED.to_owned();
     }
     format!("Le moteur d'Orion n'a pas pu démarrer (erreur {code}).")
+}
+
+/// The message for an engine that stopped before it opened its pipe. A refused
+/// protected root is named as such; any other exit names its code.
+#[cfg(any(windows, test))]
+pub(crate) fn early_exit_message(code: Option<u32>) -> String {
+    match code {
+        Some(code) if code == PROTECTED_ROOT_REFUSED as u32 => REFUSED_ROOT.to_owned(),
+        Some(code) => format!("Le moteur d'Orion s'est arrêté avant de répondre (code {code})."),
+        None => "Le moteur d'Orion s'est arrêté avant de répondre.".to_owned(),
+    }
 }
 
 /// Shows a fatal message to the person, and logs it.
@@ -142,6 +161,16 @@ impl EngineProcess {
     pub(crate) fn has_exited(&self) -> bool {
         // SAFETY: as in `wait_for_exit`; a zero timeout only polls.
         unsafe { WaitForSingleObject(self.raw(), 0) == WAIT_OBJECT_0 }
+    }
+
+    /// The engine's exit code, once it has exited. `None` while it still runs,
+    /// or when the code cannot be read.
+    pub(crate) fn exit_code(&self) -> Option<u32> {
+        let mut code = 0u32;
+        // SAFETY: the handle stays open until `self` drops, and `code` is a
+        // valid out-parameter.
+        let read = unsafe { GetExitCodeProcess(self.raw(), &mut code) };
+        (read != 0 && code != STILL_ACTIVE as u32).then_some(code)
     }
 
     fn raw(&self) -> HANDLE {
@@ -267,7 +296,9 @@ async fn wait_for_pipe(name: &str, process: &EngineProcess) -> Result<NamedPipeC
             return Ok(stream);
         }
         if process.has_exited() {
-            return Err("Le moteur d'Orion s'est arrêté avant de répondre.".into());
+            let code = process.exit_code();
+            tracing::error!(?code, "le moteur d'Orion s'est arrêté avant de répondre");
+            return Err(early_exit_message(code));
         }
         if tokio::time::Instant::now() >= deadline {
             return Err("Le moteur d'Orion ne répond pas.".into());
@@ -376,5 +407,25 @@ mod tests {
     #[test]
     fn another_launch_failure_names_its_code() {
         assert!(launch_failure(2).contains("erreur 2"));
+    }
+
+    #[test]
+    fn another_early_exit_names_its_code() {
+        assert_eq!(
+            early_exit_message(Some(4)),
+            "Le moteur d'Orion s'est arrêté avant de répondre (code 4)."
+        );
+        assert_eq!(
+            early_exit_message(None),
+            "Le moteur d'Orion s'est arrêté avant de répondre."
+        );
+    }
+
+    #[test]
+    fn the_refused_root_exit_reads_as_the_refused_root() {
+        assert_eq!(
+            early_exit_message(Some(PROTECTED_ROOT_REFUSED as u32)),
+            REFUSED_ROOT
+        );
     }
 }

@@ -238,21 +238,20 @@ impl EngineService {
         };
         let errors = self.last_certificate_error.lock().await.clone();
         let identity_store = self.controller.key_negotiation_ready();
-        let protected_identities = orion_core::ProtectedIdentityStore::for_current_user().ok();
+        let protected_identities = orion_core::ProtectedIdentityStore::at(self.identities.clone());
         let now = now_unix();
 
         Ok(profiles
             .into_iter()
             .map(|(name, settings)| {
-                let promotion_error = settings
-                    .as_ref()
-                    .zip(protected_identities.as_ref())
-                    .and_then(|(settings, identities)| {
-                        orion_core::certificate_renewal::promote_local_identity_if_due(
-                            settings, identities, now,
-                        )
-                        .err()
-                    });
+                let promotion_error = settings.as_ref().and_then(|settings| {
+                    orion_core::certificate_renewal::promote_local_identity_if_due(
+                        settings,
+                        &protected_identities,
+                        now,
+                    )
+                    .err()
+                });
                 let mut inventory =
                     orion_core::certificate_inventory::inventory(settings.as_ref(), now);
                 if let Some(error) = promotion_error {

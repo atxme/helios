@@ -167,15 +167,18 @@ impl ProfileStore {
         super::windows::bitlocker::require_protected(&self.dir)
     }
 
-    /// Default location, beside the legacy file it replaces.
+    /// The vault directory: the installed protected root's when one is
+    /// established, else beside the legacy file it replaces.
     pub fn default_dir() -> Result<std::path::PathBuf, VaultError> {
-        let dirs = directories::ProjectDirs::from("net", "helios", "orion").ok_or_else(|| {
-            VaultError::Io {
-                path: std::path::PathBuf::new(),
-                cause: "impossible de déterminer le répertoire de configuration".into(),
-            }
-        })?;
-        Ok(dirs.config_dir().to_path_buf())
+        crate::protected_root::select(
+            None,
+            crate::protected_root::installed().map(|paths| paths.vault.clone()),
+            || crate::protected_root::platform_dirs().map(|dirs| dirs.config_dir().to_path_buf()),
+        )
+        .map_err(|cause| VaultError::Io {
+            path: std::path::PathBuf::new(),
+            cause,
+        })
     }
 
     pub fn hardware_backed(&self) -> bool {

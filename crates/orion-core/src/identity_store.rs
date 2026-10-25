@@ -455,17 +455,22 @@ pub struct ProtectedIdentityStore {
 }
 
 impl ProtectedIdentityStore {
-    /// Store located in the OS's standard per-user data directory.
+    /// Store located in the installed protected root when one is established,
+    /// else in the OS's standard per-user data directory.
     ///
-    /// `ORION_IDENTITY_DIR` overrides it, for tests and for an operator who
-    /// wants to inspect what was written.
+    /// `ORION_IDENTITY_DIR` overrides both, in development builds only, for
+    /// tests and for a developer who wants to inspect what was written.
     pub fn for_current_user() -> Result<Self> {
-        if let Ok(directory) = std::env::var("ORION_IDENTITY_DIR") {
-            return Ok(Self::at(PathBuf::from(directory)));
-        }
-        let directories = directories::ProjectDirs::from("net", "helios", "orion")
-            .context("impossible de déterminer le répertoire de données de l'OS")?;
-        Ok(Self::at(directories.data_dir().join("identities")))
+        crate::protected_root::select(
+            crate::protected_root::path_override("ORION_IDENTITY_DIR", cfg!(debug_assertions)),
+            crate::protected_root::installed().map(|paths| paths.identities.clone()),
+            || {
+                crate::protected_root::platform_dirs()
+                    .map(|dirs| dirs.data_dir().join("identities"))
+            },
+        )
+        .map(Self::at)
+        .map_err(anyhow::Error::msg)
     }
 
     pub fn at(directory: PathBuf) -> Self {

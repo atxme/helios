@@ -1,10 +1,14 @@
 //! Where the engine keeps its files on this machine.
 //!
-//! The locations the client already uses, named once. Nothing here moves a
-//! file: [`EnginePaths::for_current_user`] returns the paths the code reads and
-//! writes today.
+//! The locations the client already uses, named once, and the protected root
+//! that a Windows engine establishes for its user before it opens anything.
+//! Off Windows nothing moves: [`EnginePaths::for_current_user`] returns the
+//! paths the code reads and writes today.
 
+#[cfg(any(windows, test))]
+use std::path::Path;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use crate::config::ClientConfig;
 use crate::identity_store::ProtectedIdentityStore;
@@ -13,6 +17,49 @@ use crate::vault::ProfileStore;
 /// Log file, beside the vault it describes. Same name as the shell's log.
 pub const LOG_FILE: &str = "orion.log";
 
+/// Reported when no protected location is established for this process.
+pub const NOT_ESTABLISHED: &str = "emplacement protégé d'Orion non établi";
+
+/// Reported when a protected root is set again with other paths.
+#[cfg(any(windows, test))]
+const ALREADY_ESTABLISHED: &str = "racine protégée déjà établie";
+
+/// Reported when the protected root is reachable by a non-administrator.
+pub const REFUSED_ROOT: &str =
+    "Le dossier protégé d'Orion est accessible à un compte non administrateur : démarrage refusé.";
+
+/// Why the protected root could not be established.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RootError {
+    /// The folder is reachable by an account that is not an administrator,
+    /// or is a reparse point, or has no protected access list.
+    Refused,
+    /// The folder could not be created or read; the message is for the person.
+    Unavailable(String),
+}
+
+#[cfg(any(windows, test))]
+impl std::fmt::Display for RootError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused => formatter.write_str(REFUSED_ROOT),
+            Self::Unavailable(message) => formatter.write_str(message),
+        }
+    }
+}
+
+/// The well-known SID of the Administrators group.
+#[cfg(any(windows, test))]
+pub const ADMINISTRATORS: &str = "S-1-5-32-544";
+
+/// The well-known SID of the local system account.
+#[cfg(any(windows, test))]
+pub const SYSTEM: &str = "S-1-5-18";
+
+/// The root every engine file sits under, installed once for this process.
+static INSTALLED: OnceLock<EnginePaths> = OnceLock::new();
+
 /// Files and directories the engine uses on this machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnginePaths {
@@ -20,7 +67,8 @@ pub struct EnginePaths {
     pub root: PathBuf,
     /// Vault directory: device root, local settings, sealed profiles.
     pub vault: PathBuf,
-    /// Configuration file, or the path that `ORION_CONFIG` names.
+    /// Configuration file. `ORION_CONFIG` may name another, in development
+    /// builds only.
     pub config: PathBuf,
     /// Directory of the sealed key-negotiation identities.
     pub identities: PathBuf,
@@ -30,6 +78,7 @@ pub struct EnginePaths {
 
 impl EnginePaths {
     /// The paths of the current user, as the client resolves them today.
+    #[cfg(not(windows))]
     pub fn for_current_user() -> Result<Self, String> {
         let root = ProfileStore::default_dir().map_err(|error| error.to_string())?;
         let config = ClientConfig::path().map_err(|error| format!("{error:#}"))?;
@@ -45,7 +94,184 @@ impl EnginePaths {
             identities,
         })
     }
+
+    /// The layout of the protected root `root`: every file under it.
+    #[cfg(any(windows, test))]
+    pub fn under(root: &Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            vault: root.join("vault"),
+            config: root.join("profiles.toml"),
+            identities: root.join("identities"),
+            log: root.join(LOG_FILE),
+        }
+    }
 }
+
+/// Makes `paths` the protected root of this process.
+///
+/// Installing the same paths again is harmless; other paths are refused,
+/// because the engine's files would otherwise move under a running process.
+#[cfg(any(windows, test))]
+pub fn install(paths: EnginePaths) -> Result<(), String> {
+    let established = INSTALLED.get_or_init(|| paths.clone());
+    if *established == paths {
+        Ok(())
+    } else {
+        Err(ALREADY_ESTABLISHED.to_string())
+    }
+}
+
+/// The protected root of this process, once [`install`] has set it.
+pub fn installed() -> Option<&'static EnginePaths> {
+    INSTALLED.get()
+}
+
+/// The per-user directory of the UI's own log.
+///
+/// It is not protected: the UI runs unelevated and writes nothing secret
+/// there.
+pub fn user_dir() -> Result<PathBuf, String> {
+    directories::ProjectDirs::from("net", "helios", "orion")
+        .map(|dirs| dirs.config_dir().to_path_buf())
+        .ok_or_else(|| "impossible de déterminer le répertoire de configuration".to_string())
+}
+
+/// The directories of the client on this platform, as they were before the
+/// protected root existed.
+///
+/// Windows has none: a per-user path must never be taken for the vault, so
+/// every resolver fails there until the root is installed.
+pub(crate) fn platform_dirs() -> Result<directories::ProjectDirs, String> {
+    #[cfg(windows)]
+    {
+        Err(NOT_ESTABLISHED.to_string())
+    }
+    #[cfg(not(windows))]
+    {
+        directories::ProjectDirs::from("net", "helios", "orion")
+            .ok_or_else(|| NOT_ESTABLISHED.to_string())
+    }
+}
+
+/// The path a resolver uses: the override if one applies, else the installed
+/// root, else the platform default.
+pub(crate) fn select(
+    override_path: Option<PathBuf>,
+    installed: Option<PathBuf>,
+    platform_default: impl FnOnce() -> Result<PathBuf, String>,
+) -> Result<PathBuf, String> {
+    if let Some(path) = override_path.or(installed) {
+        return Ok(path);
+    }
+    platform_default()
+}
+
+/// The value of `variable`, read only when `allow_overrides` holds.
+///
+/// Callers pass `cfg!(debug_assertions)`: a release build never lets the
+/// environment move the engine's files.
+pub(crate) fn path_override(variable: &str, allow_overrides: bool) -> Option<PathBuf> {
+    if !allow_overrides {
+        return None;
+    }
+    std::env::var_os(variable).map(PathBuf::from)
+}
+
+/// The per-user root of `sid` under `program_data`: `helios/orion/<sid>`.
+///
+/// The SID becomes a folder name, so anything that is not a plain SID (a
+/// separator, a `..`, an SDDL bracket) is refused.
+#[cfg(any(windows, test))]
+pub fn protected_root_for(program_data: &Path, sid: &str) -> Result<PathBuf, String> {
+    if !is_plain_sid(sid) {
+        return Err("identifiant de compte invalide".to_string());
+    }
+    Ok(program_data.join("helios").join("orion").join(sid))
+}
+
+/// A SID in string form: `S-` then at least two non-empty runs of digits
+/// separated by dashes, such as `S-1-5-18`. Nothing else is accepted.
+///
+/// It is written into an SDDL string and a folder name, so anything beyond
+/// that shape (a bracket, a space, an empty segment, a trailing dash, a
+/// lowercase `s`) is refused.
+pub fn is_plain_sid(sid: &str) -> bool {
+    let Some(rest) = sid.strip_prefix("S-") else {
+        return false;
+    };
+    let segments: Vec<&str> = rest.split('-').collect();
+    segments.len() >= 2
+        && segments
+            .iter()
+            .all(|segment| !segment.is_empty() && segment.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// One entry of a discretionary access control list, reduced to what the
+/// check reads.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ace {
+    pub sid: String,
+    pub allow: bool,
+    pub mask: u32,
+    pub inherited: bool,
+}
+
+/// `ACCESS_ALLOWED_ACE_TYPE`: an entry that grants access.
+#[cfg(any(windows, test))]
+const ACCESS_ALLOWED_TYPE: u8 = 0;
+
+/// `ACCESS_DENIED_ACE_TYPE`: an entry that withholds access.
+#[cfg(any(windows, test))]
+const ACCESS_DENIED_TYPE: u8 = 1;
+
+/// Reduces one raw entry to what [`admits_only_admins`] reads.
+///
+/// An entry of any other type (an object or audit entry) is read as an allow
+/// entry with no SID, so it is refused: the check does not know what it grants.
+#[cfg(any(windows, test))]
+pub fn classify_ace(ace_type: u8, mask: u32, sid: String, inherited: bool) -> Ace {
+    match ace_type {
+        ACCESS_ALLOWED_TYPE => Ace {
+            sid,
+            allow: true,
+            mask,
+            inherited,
+        },
+        ACCESS_DENIED_TYPE => Ace {
+            sid,
+            allow: false,
+            mask,
+            inherited,
+        },
+        _ => Ace {
+            sid: String::new(),
+            allow: true,
+            mask,
+            inherited,
+        },
+    }
+}
+
+/// Whether a directory is reachable by administrators and SYSTEM alone.
+///
+/// The DACL must be protected (no inherited entry from a parent), its owner
+/// must be administrators or SYSTEM, and every allow entry must name one of
+/// them. Deny entries cannot widen access and do not count. The owner is
+/// checked too: it may rewrite the DACL whatever the entries say.
+#[cfg(any(windows, test))]
+pub fn admits_only_admins(owner: &str, aces: &[Ace], protected: bool) -> bool {
+    protected
+        && (owner == ADMINISTRATORS || owner == SYSTEM)
+        && aces
+            .iter()
+            .filter(|ace| ace.allow)
+            .all(|ace| ace.sid == ADMINISTRATORS || ace.sid == SYSTEM)
+}
+
+#[cfg(windows)]
+mod windows;
 
 #[cfg(test)]
 mod tests;

@@ -842,15 +842,19 @@ pub struct ClientConfig {
 }
 
 impl ClientConfig {
-    /// Path to the config file. Overridden by `ORION_CONFIG` (tests/dev),
-    /// otherwise the OS's standard config directory (`directories`).
+    /// Path to the config file: the installed protected root's when one is
+    /// established, else the OS's standard config directory (`directories`).
+    /// `ORION_CONFIG` overrides both, in development builds only.
     pub fn path() -> Result<PathBuf> {
-        if let Ok(p) = std::env::var("ORION_CONFIG") {
-            return Ok(PathBuf::from(p));
-        }
-        let dirs = directories::ProjectDirs::from("net", "helios", "orion")
-            .context("impossible de déterminer le répertoire de config de l'OS")?;
-        Ok(dirs.config_dir().join("profiles.toml"))
+        crate::protected_root::select(
+            crate::protected_root::path_override("ORION_CONFIG", cfg!(debug_assertions)),
+            crate::protected_root::installed().map(|paths| paths.config.clone()),
+            || {
+                crate::protected_root::platform_dirs()
+                    .map(|dirs| dirs.config_dir().join("profiles.toml"))
+            },
+        )
+        .map_err(anyhow::Error::msg)
     }
 
     /// Loads the config from disk. Returns an empty config if the file

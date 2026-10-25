@@ -3,6 +3,8 @@
 //! keys, and saving, deleting and selecting a profile. The shell reaches them
 //! through the engine.
 
+use std::path::Path;
+
 use aether::{SecretString, TunnelState};
 use orion_core::{
     complete_profile_import, inspect_profile, parse_profile_import, vault::VaultPosture,
@@ -117,16 +119,16 @@ pub fn profile_edit_base<'a>(
 /// Its signature is verified under the `CA-PQ` key pinned when the user
 /// confirmed the invitation, and only then is anything sealed or shown.
 fn complete_signed_document(
+    identities: &Path,
     document: &aether::key_negotiation::EnrollmentDocument,
     profile: orion_core::ClientProfile,
     notices: Vec<String>,
 ) -> Result<(orion_core::CompletedImport, bool), String> {
-    let outcome = ProtectedIdentityStore::for_current_user()
-        .and_then(|store| {
-            orion_core::enrollment::complete_enrollment(&store, document, profile, now_unix())
-        })
-        // `{:#}` keeps the anyhow context chain: the reason is the useful half.
-        .map_err(|error| format!("{error:#}"))?;
+    let store = ProtectedIdentityStore::at(identities.to_path_buf());
+    let outcome =
+        orion_core::enrollment::complete_enrollment(&store, document, profile, now_unix())
+            // `{:#}` keeps the anyhow context chain: the reason is the useful half.
+            .map_err(|error| format!("{error:#}"))?;
     let sealed = matches!(
         outcome,
         orion_core::enrollment::EnrollmentOutcome::Completed { .. }
@@ -142,10 +144,9 @@ fn complete_signed_document(
 /// The profile is already persisted when this runs, so a failure is not a
 /// failed save: the record left behind holds sealed keys the user can still
 /// discard from the enrollment list.
-fn settle_saved_enrollment(identity: &str) {
-    if let Err(error) = ProtectedIdentityStore::for_current_user()
-        .and_then(|store| orion_core::enrollment::settle_enrollment(&store, identity))
-    {
+fn settle_saved_enrollment(identities: &Path, identity: &str) {
+    let store = ProtectedIdentityStore::at(identities.to_path_buf());
+    if let Err(error) = orion_core::enrollment::settle_enrollment(&store, identity) {
         tracing::warn!(error = %format!("{error:#}"), "pending enrollment record kept after save");
     }
 }
@@ -182,8 +183,12 @@ impl EngineService {
         imported: orion_core::ProfileImport,
     ) -> Result<ImportOutcome, String> {
         if let Some(document) = &imported.enrollment {
-            let (completed, identity_sealed) =
-                complete_signed_document(document, imported.profile, imported.notices)?;
+            let (completed, identity_sealed) = complete_signed_document(
+                &self.identities,
+                document,
+                imported.profile,
+                imported.notices,
+            )?;
             return Ok(self.stage_import(completed, identity_sealed).await);
         }
         let mut completed = {
@@ -497,7 +502,7 @@ impl EngineService {
             .save_profile(&profile)
             .map_err(|e| e.to_string())?;
         if let Some(block) = &profile.key_negotiation {
-            settle_saved_enrollment(&block.identity);
+            settle_saved_enrollment(&self.identities, &block.identity);
         }
         cfg.upsert(profile).map_err(|error| error.to_string())?;
         cfg.selected = Some(selected.clone());

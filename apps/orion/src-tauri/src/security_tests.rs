@@ -631,6 +631,16 @@ fn the_engine_restricts_dll_search_first() {
         restriction < elevation && elevation < logging,
         "the elevation check must come after the DLL restriction and before the log"
     );
+    let establishment = body
+        .find("establish_for(")
+        .expect("the engine establishes its protected root");
+    let installation = body
+        .find("install(")
+        .expect("the engine installs its protected root");
+    assert!(
+        elevation < establishment && establishment < installation && installation < logging,
+        "the protected root must be established and installed before the log is opened"
+    );
     for later in ["configure(", "default_backend(", "for_current_user("] {
         if let Some(at) = body.find(later) {
             assert!(restriction < at, "{later} runs before the DLL restriction");

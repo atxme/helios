@@ -101,6 +101,8 @@ pub struct EngineService {
     /// file is the only trace left of a start that went wrong — and a path
     /// nobody can find is a file nobody reads. The About box states it.
     log_path: Option<PathBuf>,
+    /// Directory of the sealed identities, read from the protected root.
+    identities: PathBuf,
     /// Last certificate action that failed, per profile — the «dernière
     /// erreur» spec §12.2 asks the Certificates surface to display.
     ///
@@ -150,18 +152,12 @@ impl EngineService {
         app_version: &'static str,
     ) -> Result<Arc<Self>, String> {
         let controller = VpnController::new(backend);
-        // The protected identity store is the platform's: `orion-core` states
-        // the boundary, the platform implementation lives with the platform.
-        let controller = match ProtectedIdentityStore::for_current_user() {
-            Ok(store) => controller.with_key_negotiation_identities(Arc::new(store)),
-            Err(error) => {
-                // Not fatal: profiles without negotiation still connect, and the
-                // Profiles screen reports the missing store rather than letting
-                // the failure surface as an unexplained refused connection.
-                tracing::warn!(%error, "no protected identity store on this machine");
-                controller
-            }
-        };
+        // The identities live under the protected root the shell established
+        // (the engine's `paths`), never under a per-user directory of its own.
+        let identities = paths.identities;
+        let controller = controller.with_key_negotiation_identities(Arc::new(
+            ProtectedIdentityStore::at(identities.clone()),
+        ));
         let controller = Arc::new(controller);
 
         // Le stockage des profils passe par le coffre (ADR-006 §3) : `profiles.toml`
@@ -278,6 +274,7 @@ impl EngineService {
             handshake_poll: StdMutex::new(None),
             vault_error,
             log_path,
+            identities,
             last_certificate_error: Arc::new(Mutex::new(std::collections::HashMap::new())),
             renewals: Arc::new(Mutex::new(std::collections::HashMap::new())),
             certificate_renewal_task: Arc::new(StdMutex::new(None)),

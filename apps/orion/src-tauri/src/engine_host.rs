@@ -26,10 +26,11 @@ use std::sync::Arc;
 #[cfg(windows)]
 use orion_core::default_backend;
 #[cfg(windows)]
-use orion_core::protected_root::EnginePaths;
+use orion_core::protected_root::{EnginePaths, RootError, REFUSED_ROOT};
 #[cfg(windows)]
 use orion_engine::lifecycle::{
     exit_code, on_event, parent_matches, Action, LifecycleEvent, CONNECT_TIMEOUT,
+    PROTECTED_ROOT_REFUSED,
 };
 #[cfg(windows)]
 use orion_engine::pipe::{
@@ -90,30 +91,47 @@ pub fn run(args: EngineArgs) -> i32 {
         }
     }
 
-    let log_path = crate::init_logging(crate::LOG_FILE);
-    let drbg = match aether::random::configure() {
-        Ok(drbg) => drbg,
-        Err(error) => return startup_failed(error),
-    };
-    tracing::info!(%drbg, "randomness provider");
+    // Nothing is written to disk before the protected root is installed: until
+    // the log opens, a failure goes to stderr and to the exit code.
+    let drbg = aether::random::configure();
 
     let parent = match ParentWatch::open(args.ui_pid, args.ui_created_at) {
         Ok(parent) => parent,
-        Err(error) => return fail(LifecycleEvent::ParentMissing, error),
+        Err(error) => return refused_before_log(LifecycleEvent::ParentMissing, error),
     };
 
     let current_exe = match std::env::current_exe() {
         Ok(path) => path,
-        Err(error) => return startup_failed(error),
+        Err(error) => return failed_before_log(error),
     };
     let expected = match launcher_client(args.ui_pid, &current_exe) {
         Ok(expected) => expected,
-        Err(error) => return fail(LifecycleEvent::ClientRefused, error),
+        Err(error) => return refused_before_log(LifecycleEvent::ClientRefused, error),
     };
     let sid = match process_user_sid(args.ui_pid) {
         Ok(sid) => sid,
-        Err(error) => return fail(LifecycleEvent::ClientRefused, error),
+        Err(error) => return refused_before_log(LifecycleEvent::ClientRefused, error),
     };
+
+    // The engine never falls back to a per-user directory: when the protected
+    // root cannot be established, it stops here.
+    let paths = match EnginePaths::establish_for(&sid) {
+        Ok(paths) => paths,
+        Err(RootError::Refused) => {
+            eprintln!("{REFUSED_ROOT}");
+            return PROTECTED_ROOT_REFUSED;
+        }
+        Err(error) => return failed_before_log(error),
+    };
+    if let Err(error) = orion_core::protected_root::install(paths.clone()) {
+        return failed_before_log(error);
+    }
+    let log_path = crate::init_logging(Some(paths.log.clone()));
+    let drbg = match drbg {
+        Ok(drbg) => drbg,
+        Err(error) => return startup_failed(error),
+    };
+    tracing::info!(%drbg, "randomness provider");
 
     #[cfg(all(windows, feature = "wireguard"))]
     if let Err(error) = select_wireguard_dir(&current_exe) {
@@ -122,10 +140,6 @@ pub fn run(args: EngineArgs) -> i32 {
 
     let backend = match default_backend() {
         Ok(backend) => backend,
-        Err(error) => return startup_failed(error),
-    };
-    let paths = match EnginePaths::for_current_user() {
-        Ok(paths) => paths,
         Err(error) => return startup_failed(error),
     };
     let engine = match EngineService::open(paths, backend, log_path, env!("CARGO_PKG_VERSION")) {
@@ -188,11 +202,20 @@ fn startup_failed(error: impl Display) -> i32 {
     STARTUP_FAILED
 }
 
-/// Logs a start-up failure that has a session event, and returns its exit code.
+/// Writes a start-up failure to stderr, before the log exists, and returns the
+/// exit code of the session event it stands for.
 #[cfg(windows)]
-fn fail(event: LifecycleEvent, error: impl Display) -> i32 {
-    tracing::error!(%error, ?event, "moteur d'Orion : démarrage refusé");
-    conclude(event)
+fn refused_before_log(event: LifecycleEvent, error: impl Display) -> i32 {
+    eprintln!("moteur d'Orion : démarrage refusé : {error}");
+    exit_code(event)
+}
+
+/// Writes a start-up failure to stderr, before the log exists, and returns the
+/// start-up exit code.
+#[cfg(windows)]
+fn failed_before_log(error: impl Display) -> i32 {
+    eprintln!("moteur d'Orion impossible à démarrer : {error}");
+    STARTUP_FAILED
 }
 
 /// Logs the end of the engine and returns its exit code. The teardown has

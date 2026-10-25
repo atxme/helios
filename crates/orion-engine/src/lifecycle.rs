@@ -17,6 +17,10 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Exit code for engine arguments that cannot be read. Nothing is started.
 pub const BAD_ARGUMENTS: i32 = 2;
 
+/// Exit code for a protected root the engine refuses: its folder is reachable
+/// by an account that is not an administrator. Nothing is written under it.
+pub const PROTECTED_ROOT_REFUSED: i32 = 3;
+
 const ENGINE_FLAG: &str = "--engine";
 const PIPE_PREFIX: &str = r"\\.\pipe\orion-engine-";
 

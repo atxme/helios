@@ -66,6 +66,14 @@ windows-sys = { version = "0.61", features = [
   "Win32_Security",
   "Win32_Security_Credentials",
   "Win32_Security_Cryptography",
+  # Dossier protégé d'Orion (`protected_root`) : descripteur SDDL, DACL et
+  # propriétaire (Security::Authorization), création du dossier
+  # (Storage::FileSystem), dossier ProgramData (UI::Shell) et constantes d'ACE
+  # (System::SystemServices).
+  "Win32_Security_Authorization",
+  "Win32_Storage_FileSystem",
+  "Win32_System_SystemServices",
+  "Win32_UI_Shell",
   "Win32_System_Com",
   # `GetCurrentProcess`, pour comparer le propriétaire de la clé TPM au compte
   # qui l'utilise (vérification d'ACL, ADR-006 §3).
