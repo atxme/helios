@@ -18,7 +18,11 @@ const SECRET: &str = "SECRET-QUI-NE-DOIT-PAS-FUIR";
 
 /// The « Moteur » column of the command partition, written out here on
 /// purpose: changing the policy means changing this list too.
-const ENGINE_COMMANDS: [&str; 39] = [
+///
+/// `import_profile_path` is absent on purpose: the UI reads the file it is
+/// given and sends the engine only its text (F11 ruling), so no command of
+/// the engine names a path.
+const ENGINE_COMMANDS: [&str; 38] = [
     "get_state",
     "backend_kind",
     "adapter_is_up",
@@ -30,7 +34,6 @@ const ENGINE_COMMANDS: [&str; 39] = [
     "renew_psk",
     "get_config",
     "import_profile",
-    "import_profile_path",
     "vault_posture",
     "allow_unencrypted_volume",
     "generate_private_key",
@@ -98,9 +101,6 @@ fn every_command() -> Vec<EngineCommand> {
         EngineCommand::ImportProfile {
             contents: secret(),
             file_name: "poste.helios-profile".into(),
-        },
-        EngineCommand::ImportProfilePath {
-            path: Some("C:\\profils\\poste.helios-profile".into()),
         },
         EngineCommand::VaultPosture,
         EngineCommand::AllowUnencryptedVolume,
@@ -182,7 +182,6 @@ fn label(command: &EngineCommand) -> &'static str {
         EngineCommand::RenewPsk => "renew_psk",
         EngineCommand::GetConfig => "get_config",
         EngineCommand::ImportProfile { .. } => "import_profile",
-        EngineCommand::ImportProfilePath { .. } => "import_profile_path",
         EngineCommand::VaultPosture => "vault_posture",
         EngineCommand::AllowUnencryptedVolume => "allow_unencrypted_volume",
         EngineCommand::GeneratePrivateKey => "generate_private_key",
@@ -261,9 +260,8 @@ fn no_engine_command_names_an_output_path() {
                 key.as_str(),
                 "output" | "out" | "destination" | "path" | "exe" | "executable" | "program"
             );
-            let reads_a_profile = key == "path" && label(&command) == "import_profile_path";
             assert!(
-                !forbidden || reads_a_profile,
+                !forbidden,
                 "{} names the forbidden field {key}",
                 label(&command)
             );
@@ -357,7 +355,6 @@ fn every_reply() -> Vec<EngineReply> {
         }),
         EngineReply::Config(ConfigView::from(&config)),
         EngineReply::Imported(imported.clone()),
-        EngineReply::MaybeImported(Some(imported)),
         EngineReply::VaultPosture(orion_core::vault::VaultPosture {
             hardware_backed: true,
             software_keystore: false,
@@ -432,7 +429,6 @@ fn reply_label(reply: &EngineReply) -> &'static str {
         EngineReply::SpeedTest(_) => "speed_test",
         EngineReply::Config(_) => "config",
         EngineReply::Imported(_) => "imported",
-        EngineReply::MaybeImported(_) => "maybe_imported",
         EngineReply::VaultPosture(_) => "vault_posture",
         EngineReply::PublicKey(_) => "public_key",
         EngineReply::SshCommand(_) => "ssh_command",

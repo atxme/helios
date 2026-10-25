@@ -142,9 +142,6 @@ pub enum EngineCommand {
         contents: SecretInput,
         file_name: String,
     },
-    ImportProfilePath {
-        path: Option<String>,
-    },
     VaultPosture,
     AllowUnencryptedVolume,
     GeneratePrivateKey,
@@ -237,7 +234,6 @@ pub enum EngineReply {
     SpeedTest(SpeedTestResult),
     Config(ConfigView),
     Imported(ImportOutcome),
-    MaybeImported(Option<ImportOutcome>),
     VaultPosture(VaultPosture),
     PublicKey(String),
     SshCommand(String),

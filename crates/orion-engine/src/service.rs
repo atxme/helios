@@ -379,8 +379,7 @@ impl Engine for EngineService {
             }
             // Served by the transport before it reaches the engine.
             EngineCommand::Shutdown => Ok(EngineReply::Unit),
-            EngineCommand::ImportProfilePath { .. }
-            | EngineCommand::GeneratePrivateKey
+            EngineCommand::GeneratePrivateKey
             | EngineCommand::AdoptPrivateKey { .. }
             | EngineCommand::DiscardStagedKey
             | EngineCommand::AdoptPresharedKey { .. }
