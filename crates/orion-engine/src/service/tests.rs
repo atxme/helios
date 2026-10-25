@@ -9,9 +9,6 @@ use aether::TunnelState;
 use orion_core::backend::dryrun::DryRunBackend;
 use std::path::{Path, PathBuf};
 
-/// Answer to a command the engine does not serve yet.
-const NOT_SERVED: &str = "Cette commande n'est pas servie par le moteur.";
-
 /// A scratch directory removed when the test ends, whatever its outcome.
 struct Scratch(PathBuf);
 

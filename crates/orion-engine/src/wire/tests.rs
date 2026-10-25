@@ -142,6 +142,36 @@ async fn an_event_frame_round_trips() {
 }
 
 #[tokio::test]
+async fn a_speedtest_progress_event_round_trips() {
+    let frame = EngineFrame::Event(ClientEvent::SpeedTest {
+        progress: orion_core::SpeedTestProgress {
+            phase: orion_core::speedtest::SpeedTestPhase::TcpDownload,
+            fraction: 0.5,
+            current_mbps: 42.0,
+            bytes: 1024,
+            elapsed_ms: 300,
+            message: "téléchargement".into(),
+        },
+    });
+    let mut bytes = Vec::new();
+    write_frame(&mut bytes, &frame, limits::EVENT_BYTES)
+        .await
+        .unwrap();
+
+    let mut reader = tokio::io::BufReader::new(bytes.as_slice());
+    match read_frame::<_, EngineFrame>(&mut reader, limits::EVENT_BYTES)
+        .await
+        .unwrap()
+    {
+        Some(EngineFrame::Event(ClientEvent::SpeedTest { progress })) => {
+            assert_eq!(progress.bytes, 1024);
+            assert_eq!(progress.message, "téléchargement");
+        }
+        _ => panic!("the speedtest progress must come back unchanged"),
+    }
+}
+
+#[tokio::test]
 async fn a_reply_frame_round_trips() {
     let replies = [
         EngineFrame::Reply {

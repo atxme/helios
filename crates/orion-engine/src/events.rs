@@ -1,10 +1,11 @@
-//! Events pushed from the controller to the UI, without ever blocking the controller.
+//! Events pushed from the controller to the UI, without ever blocking the
+//! controller.
 //!
 //! The controller calls its sink from inside its own tasks, and a sink that
 //! waited for a slow UI would stall the tunnel. The queue therefore never
-//! waits: telemetry, speedtest progress and log lines are dropped when it is full, and any other
-//! event that finds no room raises a flag that ends the session. A state
-//! change is never lost silently.
+//! waits: telemetry, speedtest progress and log lines are dropped when it is
+//! full, and any other event that finds no room raises a flag that ends the
+//! session. A state change is never lost silently.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
