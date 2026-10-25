@@ -53,8 +53,8 @@ pub(crate) async fn astra_ca_tls_rotation_status(
 /// Opens an operator ceremony for the operation the WebView names.
 ///
 /// The locator is all it may name — a kind, and at most an identifier this
-/// process itself opened. Everything else the helper resolves from the hand-off
-/// pinned beside the vault it holds.
+/// process itself opened. Everything else is resolved from the hand-off pinned
+/// beside the vault the ceremony holds.
 #[tauri::command]
 pub(crate) async fn begin_operator_ceremony(
     state: State<'_, AppState>,
@@ -65,11 +65,9 @@ pub(crate) async fn begin_operator_ceremony(
 
 /// The handle of the window the press came from, or `0` where there is none.
 ///
-/// Read on the exact advance that opens a key dialog, so Orion can re-assert
-/// its own foreground right before ceding it to the helper. The click was
-/// delivered to the WebView's renderer process, and Windows grants that right
-/// to whoever received the last input — not to the process that owns the
-/// window around it.
+/// It is the owner of the WebAuthn dialog a key opens, so that dialog appears
+/// over the window the operator is looking at. Read on every advance: a press
+/// that opens no dialog carries it unused.
 fn owner_window(window: &tauri::Window) -> isize {
     #[cfg(target_os = "windows")]
     {
@@ -84,7 +82,7 @@ fn owner_window(window: &tauri::Window) -> isize {
 
 /// Takes the next step, or abandons, against the status the operator saw.
 ///
-/// The revision is not decoration: a press on a screen the helper has already
+/// The revision is not decoration: a press on a screen the ceremony has already
 /// left is refused here and again there, rather than applied to whatever
 /// replaced it.
 #[tauri::command]

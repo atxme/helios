@@ -3896,7 +3896,9 @@ name = "orion"
 version = "0.27.0"
 dependencies = [
  "aether",
+ "aether-fido",
  "anyhow",
+ "astra-operator",
  "orion-core",
  "orion-engine",
  "serde",

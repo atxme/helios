@@ -24,6 +24,8 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 aether = { workspace = true }
+astra-operator.workspace = true
+aether-fido.workspace = true
 orion-core = { path = "../../../crates/orion-core" }
 orion-engine = { path = "../../../crates/orion-engine" }
 # `StagedKey` tient une clé privée entre sa création et son enregistrement :
