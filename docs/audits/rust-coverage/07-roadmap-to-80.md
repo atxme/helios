@@ -490,17 +490,19 @@ Chaque liste de fichiers désigne des chemins existants, sauf les nouveaux scrip
 
 ### COV-013 — Compléter négociation v5, annulation et propriétaire de génération
 
+État : **partiellement réalisé**, code `a43a319` ; 16 tests supplémentaires et correction de débordement, voir le [journal 13](13-negotiation-cancellation.md). Les tests de collecte passent mais la finalisation, la régression et les tailles sont arrêtées par le budget disque ; aucun gain mesuré n’est crédité. Les chemins non exercés et les recettes système restent ouverts.
+
 **Identifiant :** COV-013
 
 **Titre :** Compléter négociation v5, annulation et propriétaire de génération.
 
 **Objectif :** Empêcher acteurs périmés, commits sans handshake frais et PSK orphelins.
 
-**Fichiers concernés :** `crates/aether-key-negotiation/src/client.rs`, `crates/aether-key-negotiation/src/endpoint.rs`, `crates/aether-key-negotiation/src/framing.rs`, `crates/aether-key-negotiation/src/identity.rs`, `crates/aether-key-negotiation/src/rate_limit.rs`, `crates/aether-key-negotiation/src/server.rs`, `crates/aether-key-negotiation/src/transaction.rs`, `crates/heliosd/src/key_negotiation/candidate.rs`, `crates/heliosd/src/key_negotiation/identity.rs`, `crates/heliosd/src/key_negotiation/mod.rs`, `crates/heliosd/src/key_negotiation/origin.rs`, `crates/heliosd/src/key_negotiation/protocol.rs`, `crates/heliosd/src/key_negotiation/server.rs`, `crates/heliosd/src/key_negotiation/transaction.rs`, `crates/orion-core/src/key_negotiation.rs`, `crates/heliosd/src/key_negotiation/tests/transaction.rs`, `crates/heliosd/src/key_negotiation/tests/interop.rs`.
+**Fichiers concernés :** `crates/aether-key-negotiation/src/client.rs`, `crates/aether-key-negotiation/src/endpoint.rs`, `crates/aether-key-negotiation/src/framing.rs`, `crates/aether-key-negotiation/src/identity.rs`, `crates/aether-key-negotiation/src/rate_limit.rs`, `crates/aether-key-negotiation/src/server.rs`, `crates/aether-key-negotiation/src/transaction.rs`, `crates/heliosd/src/key_negotiation/candidate.rs`, `crates/heliosd/src/key_negotiation/identity.rs`, `crates/heliosd/src/key_negotiation/mod.rs`, `crates/heliosd/src/key_negotiation/origin.rs`, `crates/heliosd/src/key_negotiation/protocol.rs`, `crates/heliosd/src/key_negotiation/server.rs`, `crates/heliosd/src/key_negotiation/transaction.rs`, `crates/orion-core/src/key_negotiation.rs`, `crates/heliosd/src/key_negotiation/tests/transaction.rs`, `crates/heliosd/src/key_negotiation/tests/interop.rs`, `crates/heliosd/src/key_negotiation/tests/transaction_cancellation.rs`, `crates/heliosd/src/key_negotiation/tests/generation_limits.rs`, `crates/heliosd/src/key_negotiation/tests/fixtures.rs`, `crates/heliosd/src/key_negotiation/tests/mod.rs`, `crates/aether-key-negotiation/src/tests/connection_lifecycle.rs`, `crates/aether-key-negotiation/src/tests/fixtures.rs`, `crates/aether-key-negotiation/src/tests/rollback.rs`, `crates/aether-key-negotiation/src/tests/mod.rs`.
 
-**Constat vérifié :** prepare/confirm client sont déjà exercés en interop IPv4/IPv6 ; hooks protégés et nombreuses étapes gateway restent incomplets.
+**Constat vérifié :** prepare/confirm client sont déjà exercés en interop IPv4/IPv6. Le lot 13 reproduit des débordements de génération et les corrige avant mutation ; annulation de la tâche QUIC réelle, rollback interrompu/repris, restauration du PSK négocié, handshake non avancé et no-op statique à MAX sont testés. La couverture et les recettes système restent à compléter.
 
-**Travail proposé :** Reprendre suites transaction/interop, identifier lignes restantes, barrières aux points de pose/ACK/clear pour annulation et concurrence ; tester renouvellement/release réels de l’API existante.
+**Travail proposé :** Terminer les contrôles et les deux collectes après nettoyage autorisé ; identifier les lignes restantes dans transaction/interop, compléter les entrelacements et tester renouvellement/release via les routes API existantes, puis la vraie pose sur cible.
 
 **Scénarios à tester :** Abort future avant/après pose, clear échoué, generation remplacée, handshake vieux, ACK corrompu/perdu, static PSK préservé, peer/replay/mode incorrect, renouvellement via VIP source.
 
@@ -508,7 +510,7 @@ Chaque liste de fichiers désigne des chemins existants, sauf les nouveaux scrip
 
 **Critères d’acceptation :** Rollback survit drop/abort ; ancienne génération ne modifie pas la nouvelle ; PSK posé avant annonce et jamais disque ; QUIC fermé après commit ; Classic refusé.
 
-**Gain de couverture estimé :** **Estimation** 450–620 lignes existantes, soit environ 0.85–1.17 points à N=53 009 constant. À mesurer après changement ; aucune garantie.
+**Gain de couverture estimé :** **Estimation initiale, non réalisée par le lot 13** 450–620 lignes existantes, soit environ 0.85–1.17 points à N=53 009 constant. À mesurer après changement ; aucune garantie.
 
 **Risque :** élevé.
 

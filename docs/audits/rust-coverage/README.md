@@ -6,13 +6,17 @@ Audit du **23 octobre 2026**, révision `7ebc020d0425de4a30d64a93af1ead048c3f0fc
 
 **Objectif actualisé : viser 100 % des lignes de production pertinentes, et améliorer les fonctions/branches lorsque mesurables.** Les jalons 70/75/80 restent utiles au suivi ; aucun ne constitue une fin de mission. Le reliquat initial vers 100 % est de 22 139 lignes à périmètre constant. Les résultats ci-dessous restent la baseline historique, pas la mesure du lot en cours.
 
+**Dernier développement : COV-013, annulation QUIC et générations gateway, code `a43a319`.** Les nouveaux scénarios reproduisent puis protègent le refus de débordement avant mutation, la restauration du PSK et la propriété transactionnelle. Les 2 254 tests de la collecte passent, mais le budget Cargo arrête ensuite la campagne à 66,9 Gio / 65 Gio. Pas de nouvelle baseline, régression complète ni taille release finale pour cette révision ; nettoyage soumis à accord explicite. Voir le [journal 13](13-negotiation-cancellation.md).
+
 **Dernier lot mesuré : 61,63 % de production globale (32 761 / 53 155), 2 238 tests réussis.** La vue bibliothèques séparée atteint 71,04 %. Deux défauts de publication concurrente sont reproduits puis corrigés ; 113 lignes existantes deviennent couvertes. La régression complète et les audits passent pour cette révision, avec sept avertissements RustSec autorisés. Les trois binaires contrôlés restent sous 128 Mio ; Astra augmente de 17 240 octets. Détails et limites dans le [journal 12](12-renewal-concurrency.md). Il reste 20 394 lignes non couvertes vers 100 %, et 9 763 à couvrir pour le jalon 80 % au périmètre courant.
 
 Le lot suivant traite COV-003/COV-005/COV-006 et le déblocage COV-036 : [cycles de certificats et durabilité](10-certificate-workflows.md). Le journal 09 et les chiffres ci-dessous restent historiques.
 
 Poursuite COV-005/COV-006/COV-020 : [journal du compagnon](11-companion-journal.md).
 
-Dernier lot : [annulation, concurrence et routes privées](12-renewal-concurrency.md).
+Lot 12 : [annulation, concurrence et routes privées](12-renewal-concurrency.md).
+
+Lot 13 : [négociation v5, annulation et générations](13-negotiation-cancellation.md), validation complète en attente du budget disque.
 
 ## Diagnostic et résultats de référence
 
