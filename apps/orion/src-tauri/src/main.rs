@@ -78,8 +78,6 @@ use commands::*;
 
 /// Shared application state, injected into each command via [`State`].
 struct AppState {
-    /// The tunnel-side state of the engine, built once at start-up.
-    engine: Arc<EngineService>,
     /// The shell's session with the engine. Commands go through it.
     client: orion_engine::client::EngineClient,
     pending_profile_paths: StdMutex<VecDeque<PathBuf>>,
@@ -558,7 +556,6 @@ fn main() {
         }))
         .plugin(companion_plugin())
         .manage(AppState {
-            engine,
             client,
             pending_profile_paths: StdMutex::new(pending_profile_paths),
             astra: astra::Ceremony::default(),

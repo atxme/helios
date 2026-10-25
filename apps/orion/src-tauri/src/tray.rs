@@ -84,6 +84,34 @@ pub struct TrayModel {
 /// is deliberate: a native menu is not a webview, and routing these five labels
 /// through the frontend would make the menu depend on a window that is hidden
 /// precisely when the menu is the only thing left.
+/// The menu's model from what the engine answered.
+///
+/// `state` is `None` when the answer could not be read, and `config` is `None`
+/// when the profile list could not be had. Either way the menu shows a failed
+/// tunnel with nothing to offer: it never claims to be connected on a guess.
+/// Otherwise the active profile is the selected one, or the first, which is
+/// the fallback a connection applies.
+pub fn model_from_engine(
+    state: Option<TunnelState>,
+    config: Option<(Vec<String>, Option<String>)>,
+) -> TrayModel {
+    let (Some(state), Some((profiles, selected))) = (state, config) else {
+        return TrayModel {
+            state: TunnelState::Failed,
+            profiles: Vec::new(),
+            active: None,
+        };
+    };
+    let active = selected
+        .filter(|name| profiles.iter().any(|profile| profile == name))
+        .or_else(|| profiles.first().cloned());
+    TrayModel {
+        state,
+        profiles,
+        active,
+    }
+}
+
 fn state_label(state: TunnelState) -> &'static str {
     match state {
         TunnelState::Up => "Connecté",
@@ -177,11 +205,14 @@ fn status_dot(color: [u8; 3]) -> tauri::image::Image<'static> {
 #[cfg(target_os = "windows")]
 mod windows {
     use super::{
-        profile_from_menu_id, profile_menu_id, state_color, status_dot, TrayModel, ABOUT_ID,
-        EMPTY_ID, IMPORT_ID, LOGS_ID, OPEN_ID, PROFILES_ID, QUIT_ID, STATUS_ID, TRAY_ID,
+        model_from_engine, profile_from_menu_id, profile_menu_id, state_color, status_dot,
+        TrayModel, ABOUT_ID, EMPTY_ID, IMPORT_ID, LOGS_ID, OPEN_ID, PROFILES_ID, QUIT_ID,
+        STATUS_ID, TRAY_ID,
     };
     use crate::AppState;
+    use aether::TunnelState;
     use orion_core::ClientEvent;
+    use orion_engine::{EngineCommand, EngineReply};
     use tauri::{
         image::Image,
         menu::{CheckMenuItem, IconMenuItem, IsMenuItem, Menu, MenuItem, PredefinedMenuItem},
@@ -249,28 +280,32 @@ mod windows {
         });
     }
 
-    /// Reads the state the menu displays.
+    /// Reads the state the menu displays, through the engine's session.
     async fn read_model(app: &AppHandle) -> TrayModel {
         let state = app.state::<AppState>();
-        let config = state.engine.config.lock().await;
-        let profiles: Vec<String> = config
-            .profiles
-            .iter()
-            .map(|profile| profile.name.clone())
-            .collect();
-        // Same fallback as the connection view: with nothing selected, a
-        // connection applies to the first profile. Showing another one checked
-        // than the one a click would mount is worse than showing none.
-        let active = config
-            .selected
-            .clone()
-            .filter(|name| profiles.iter().any(|profile| profile == name))
-            .or_else(|| profiles.first().cloned());
-        TrayModel {
-            state: state.engine.controller.state(),
-            profiles,
-            active,
-        }
+        let tunnel = match state.client.call(EngineCommand::GetState).await {
+            Ok(EngineReply::State(text)) => TunnelState::parse(&text),
+            Ok(_) => None,
+            Err(error) => {
+                tracing::warn!(%error, "état du tunnel illisible pour le menu");
+                None
+            }
+        };
+        let config = match state.client.call(EngineCommand::GetConfig).await {
+            Ok(EngineReply::Config(view)) => Some((
+                view.profiles
+                    .iter()
+                    .map(|profile| profile.name.clone())
+                    .collect::<Vec<String>>(),
+                view.selected,
+            )),
+            Ok(_) => None,
+            Err(error) => {
+                tracing::warn!(%error, "profils illisibles pour le menu");
+                None
+            }
+        };
+        model_from_engine(tunnel, config)
     }
 
     fn build_menu(app: &AppHandle, model: &TrayModel) -> anyhow::Result<Menu<tauri::Wry>> {
@@ -459,6 +494,40 @@ mod tests {
             profiles: profiles.iter().map(|name| name.to_string()).collect(),
             active: active.map(|name| name.to_string()),
         }
+    }
+
+    #[test]
+    fn an_engine_that_cannot_answer_shows_a_failed_tunnel_with_nothing_to_offer() {
+        let names = Some((vec!["bureau".to_string()], Some("bureau".to_string())));
+
+        let unreadable_state = model_from_engine(None, names.clone());
+        assert_eq!(unreadable_state.state, TunnelState::Failed);
+        assert!(unreadable_state.profiles.is_empty());
+        assert_eq!(unreadable_state.active, None);
+
+        let failed_config = model_from_engine(Some(TunnelState::Up), None);
+        assert_eq!(failed_config.state, TunnelState::Failed);
+        assert!(failed_config.profiles.is_empty());
+        assert_eq!(failed_config.active, None);
+    }
+
+    #[test]
+    fn the_active_profile_is_the_selected_one_or_the_first() {
+        let names = |selected: Option<&str>| {
+            Some((
+                vec!["alpha".to_string(), "bravo".to_string()],
+                selected.map(str::to_string),
+            ))
+        };
+
+        let selected = model_from_engine(Some(TunnelState::Down), names(Some("bravo")));
+        assert_eq!(selected.active.as_deref(), Some("bravo"));
+
+        let unknown = model_from_engine(Some(TunnelState::Down), names(Some("absent")));
+        assert_eq!(unknown.active.as_deref(), Some("alpha"));
+
+        let nothing = model_from_engine(Some(TunnelState::Down), Some((Vec::new(), None)));
+        assert_eq!(nothing.active, None);
     }
 
     #[test]

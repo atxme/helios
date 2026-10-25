@@ -3,6 +3,8 @@
 
 use super::*;
 
+use orion_engine::{EngineCommand, EngineReply};
+
 /// Opens the two-key CA-TLS ceremony described in ADR-008 §9.4.
 ///
 /// Everything that decides anything happens in the companion: the campaign is
@@ -120,9 +122,12 @@ pub(crate) async fn operator_pending_operations(
     state: State<'_, AppState>,
 ) -> Result<Vec<orion_core::operator_pending::OperatorPendingOperation>, String> {
     let gateways: Vec<String> = {
-        let cfg = state.engine.config.lock().await;
+        let view = match state.client.call(EngineCommand::GetConfig).await? {
+            EngineReply::Config(view) => view,
+            _ => return Err(unexpected_engine_reply()),
+        };
         let mut seen: Vec<String> = Vec::new();
-        for profile in &cfg.profiles {
+        for profile in &view.profiles {
             if let Some(url) = profile.heliosd_url.as_ref() {
                 if !seen.iter().any(|held| held == url) {
                     seen.push(url.clone());

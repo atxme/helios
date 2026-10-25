@@ -1,7 +1,7 @@
 //! Certificate work the tunnel starts on its own: the trust refresh asked
 //! once per connection, the automatic renewal that follows it, and the
-//! renewal step both share. The shell's commands reach the same renewal map
-//! through [`drive_renewal_in_map`].
+//! renewal step both share. The actions the user asks for drive the same
+//! renewal map.
 
 use std::sync::Arc;
 
@@ -85,7 +85,7 @@ pub fn spawn_trust_refresh(
 /// trust refresh finish, then waits for the locally computed threshold. A
 /// reconnect cancels this task and creates a new one from the current durable
 /// state, so no timer can act for a profile that is no longer mounted.
-pub fn spawn_automatic_certificate_renewal(
+pub(super) fn spawn_automatic_certificate_renewal(
     prerequisite: tokio::task::JoinHandle<()>,
     controller: Arc<VpnController>,
     renewals: Arc<Mutex<std::collections::HashMap<String, InFlightRenewal>>>,
@@ -156,9 +156,9 @@ pub fn spawn_automatic_certificate_renewal(
 
 /// Advances the renewal of `name` by one step, opening it if none is in flight.
 ///
-/// The renewal map is the one the shell's renewal commands also drive, so a
+/// The renewal map is the one the user's actions also drive, so a
 /// step taken by either is the step the other resumes.
-pub async fn drive_renewal_in_map(
+async fn drive_renewal_in_map(
     renewals: &Arc<Mutex<std::collections::HashMap<String, InFlightRenewal>>>,
     name: &str,
     settings: orion_core::KeyNegotiationSettings,
@@ -209,7 +209,7 @@ pub async fn drive_renewal_in_map(
 impl EngineService {
     /// The four certificates a connection depends on, with their dates.
     ///
-    /// # Why the shell reads them rather than the screen
+    /// # Why the engine reads them rather than the screen
     ///
     /// Two of them live in the protected identity store, which the WebView has no
     /// business reaching, and all four are parsed by the same validator the

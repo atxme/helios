@@ -2,7 +2,7 @@
 //!
 //! [`EngineService::open`] assembles what the tunnel needs: the controller with
 //! its protected identities, and the vault with the configuration read from it.
-//! The shell's commands reach these fields; their bodies stay where they are.
+//! The shell reaches all of it through its client, never these fields.
 
 use std::{
     path::PathBuf,
@@ -29,15 +29,14 @@ pub use app::PROFILE_EXTENSION;
 
 /// The tunnel-side state of the engine, held for the life of the process.
 ///
-/// Fields stay public while the shell's commands still reach them; each one
-/// closes when its family moves into the service.
+/// Fields are private: the shell reaches the engine only through its client.
 pub struct EngineService {
-    pub controller: Arc<VpnController>,
+    controller: Arc<VpnController>,
     /// Vault-backed store. `config` below is the in-memory view the UI reads;
     /// this is what actually persists, and it never writes a secret in the
     /// clear (ADR-006 §3).
     store: Arc<orion_core::vault::ProfileStore>,
-    pub config: Arc<Mutex<ClientConfig>>,
+    config: Arc<Mutex<ClientConfig>>,
     telemetry: Arc<TelemetryManager>,
     /// Serializes the expensive benchmark. The UI disables its button, but
     /// the Rust boundary still refuses a second IPC invocation so two tests
@@ -108,7 +107,7 @@ pub struct EngineService {
     /// In memory rather than persisted: it describes an attempt made in this
     /// session, and a message surviving a restart would outlive the situation
     /// it described — an identity imported since, a store now available.
-    pub last_certificate_error: Arc<Mutex<std::collections::HashMap<String, String>>>,
+    last_certificate_error: Arc<Mutex<std::collections::HashMap<String, String>>>,
     /// Renewals opened in this session, by profile name.
     ///
     /// Held in memory and nowhere else, because the session carries the
@@ -117,7 +116,7 @@ pub struct EngineService {
     /// operation expires on its own, and the active generation was never
     /// touched. The cost is that a restart reopens rather than resumes — the
     /// cheap failure, since nothing was committed.
-    pub renewals: Arc<Mutex<std::collections::HashMap<String, InFlightRenewal>>>,
+    renewals: Arc<Mutex<std::collections::HashMap<String, InFlightRenewal>>>,
     /// One automatic renewal timer for the mounted profile. It is cancelled
     /// with the connection so reconnecting cannot leave stale tasks racing a
     /// newer profile.
@@ -128,7 +127,7 @@ pub struct EngineService {
     /// recovery reaches past a validity period, and an identifier from one
     /// must never resolve where an ordinary renewal is resumed. Absence
     /// carries the rule; a comparison would only describe it.
-    pub recoveries: Arc<Mutex<std::collections::HashMap<String, InFlightRecovery>>>,
+    recoveries: Arc<Mutex<std::collections::HashMap<String, InFlightRecovery>>>,
     /// Version of the application the engine runs in, for the About box.
     ///
     /// Passed in by the shell: a crate-level `CARGO_PKG_VERSION` here would
@@ -289,13 +288,13 @@ impl EngineService {
 }
 
 /// One recovery in progress: the session that drives it, and its profile.
-pub struct InFlightRecovery {
+pub(crate) struct InFlightRecovery {
     pub session: orion_core::certificate_recovery::RecoverySession,
     pub settings: orion_core::KeyNegotiationSettings,
 }
 
 /// One renewal in progress: what drives it, and the state it writes into.
-pub struct InFlightRenewal {
+pub(crate) struct InFlightRenewal {
     pub session: orion_core::certificate_renewal::RenewalSession,
     pub store: orion_core::certificates::TrustStore,
     pub settings: orion_core::KeyNegotiationSettings,

@@ -86,6 +86,18 @@ impl TunnelState {
         }
     }
 
+    /// The state named by [`Self::as_str`], or `None` for any other text.
+    pub fn parse(text: &str) -> Option<TunnelState> {
+        match text {
+            "down" => Some(TunnelState::Down),
+            "connecting" => Some(TunnelState::Connecting),
+            "up" => Some(TunnelState::Up),
+            "failed" => Some(TunnelState::Failed),
+            "captive_portal" => Some(TunnelState::CaptivePortal),
+            _ => None,
+        }
+    }
+
     /// Applies an event and returns the next state, or an error if the
     /// transition makes no sense.
     pub fn on(self, event: TunnelEvent) -> Result<TunnelState> {
@@ -132,6 +144,21 @@ mod tests {
         assert!(!TunnelState::Connecting.traffic_allowed());
         assert!(!TunnelState::Down.traffic_allowed());
         assert!(!TunnelState::CaptivePortal.traffic_allowed());
+    }
+
+    #[test]
+    fn parse_is_the_inverse_of_as_str() {
+        let states = [
+            TunnelState::Down,
+            TunnelState::Connecting,
+            TunnelState::Up,
+            TunnelState::Failed,
+            TunnelState::CaptivePortal,
+        ];
+        for state in states {
+            assert_eq!(TunnelState::parse(state.as_str()), Some(state));
+        }
+        assert_eq!(TunnelState::parse("bogus"), None);
     }
 
     #[test]

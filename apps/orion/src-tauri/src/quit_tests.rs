@@ -1,13 +1,6 @@
-//! The quit path: the deadline that takes a connected tunnel down before Orion
-//! exits. Off Windows only: opening the engine there would reach the platform
-//! keystore.
-
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
-use aether::TunnelState;
-use orion_core::{
-    backend::dryrun::DryRunBackend, protected_root::EnginePaths, ClientEvent, ClientProfile,
-};
+use orion_core::{backend::dryrun::DryRunBackend, protected_root::EnginePaths};
 use orion_engine::{client::in_process, service::EngineService, EngineCommand, EngineReply};
 
 use super::take_tunnel_down_blocking;
@@ -30,9 +23,12 @@ impl Drop for Scratch {
     }
 }
 
-/// An engine on a fresh directory, holding one selected profile that mounts
-/// without key negotiation.
-fn engine_with_selected_profile(scratch: &Scratch) -> Arc<EngineService> {
+/// An engine on a fresh directory.
+///
+/// Off Windows no profile can be saved: the platform has no root key to seal
+/// one with, so the session starts with nothing to connect. The connected
+/// shutdown is covered inside the engine crate, where the tunnel can be set up.
+fn engine_on(scratch: &Scratch) -> Arc<EngineService> {
     let root = &scratch.0;
     let paths = EnginePaths {
         root: root.clone(),
@@ -41,57 +37,38 @@ fn engine_with_selected_profile(scratch: &Scratch) -> Arc<EngineService> {
         identities: root.join("identities"),
         log: root.join("orion.log"),
     };
-    let service = EngineService::open(
+    EngineService::open(
         paths,
         Arc::new(DryRunBackend::default()),
         None,
         "0.0.0-test",
     )
-    .expect("the service opens on a fresh directory");
-    {
-        let mut config = service.config.try_lock().expect("nothing holds it yet");
-        config.profiles.push(ClientProfile {
-            name: "bureau".into(),
-            endpoint: "203.0.113.10:51820".into(),
-            private_key: "cHJpdmF0ZQ==".into(),
-            peer_public_key: "cHVibGlj".into(),
-            ..ClientProfile::default()
-        });
-        config.selected = Some("bureau".into());
-    }
-    service
+    .expect("the service opens on a fresh directory")
 }
 
 /// A plain test, not a `tokio::test`: the quit path runs on a thread with no
 /// runtime entered, which is exactly the situation the deadline must survive.
 #[test]
-fn quitting_takes_a_connected_tunnel_down() {
+fn quitting_takes_the_engine_down_before_the_deadline() {
     let scratch = Scratch::new("takes-down");
-    let service = engine_with_selected_profile(&scratch);
-    let (client, mut events) =
+    let service = engine_on(&scratch);
+    let (client, _events) =
         tauri::async_runtime::block_on(in_process(Arc::clone(&service))).expect("session opens");
 
-    tauri::async_runtime::block_on(async {
-        let reply = client.call(EngineCommand::Connect { name: None }).await;
-        assert!(matches!(reply, Ok(EngineReply::Unit)), "reply: {reply:?}");
-        let up = tokio::time::timeout(Duration::from_secs(5), async {
-            while let Some(event) = events.recv().await {
-                if matches!(
-                    event,
-                    ClientEvent::StateChanged {
-                        state: TunnelState::Up
-                    }
-                ) {
-                    return true;
-                }
-            }
-            false
-        })
-        .await;
-        assert_eq!(up, Ok(true), "the tunnel never reported Up");
-    });
-
+    let started = std::time::Instant::now();
     take_tunnel_down_blocking(&client, Duration::from_secs(10));
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the shutdown waited for the whole deadline"
+    );
 
-    assert!(!service.controller.adapter_is_up());
+    // The first session ends with its shutdown. A second one on the same engine
+    // reads the adapter the engine still holds.
+    let (observer, _events) =
+        tauri::async_runtime::block_on(in_process(service)).expect("a second session opens");
+    let adapter = tauri::async_runtime::block_on(observer.call(EngineCommand::AdapterIsUp));
+    assert!(
+        matches!(adapter, Ok(EngineReply::Flag(false))),
+        "the adapter is still up: {adapter:?}"
+    );
 }
