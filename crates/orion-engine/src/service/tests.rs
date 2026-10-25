@@ -396,6 +396,31 @@ async fn pending_enrollments_answer_through_the_client() {
 }
 
 #[tokio::test]
+async fn pending_enrollments_are_read_from_the_given_identities() {
+    let scratch = Scratch::new("pending-identities");
+    // A plain file where the identities directory should be: a service that
+    // reads the paths it was opened on cannot list them and must say so. A
+    // service that reads another store would answer an empty list instead.
+    let blocked = scratch.0.join("identities-file");
+    std::fs::write(&blocked, b"not a directory").expect("the blocking file is written");
+    let mut paths = paths_under(&scratch.0);
+    paths.identities = blocked;
+    let service = EngineService::open(
+        paths,
+        Arc::new(DryRunBackend::default()),
+        None,
+        "0.0.0-test",
+    )
+    .expect("the service opens on the given paths");
+    let (client, _events) = crate::client::in_process(service)
+        .await
+        .expect("the session opens");
+
+    let reply = client.call(EngineCommand::ListPendingEnrollments).await;
+    assert!(reply.is_err(), "reply: {reply:?}");
+}
+
+#[tokio::test]
 async fn about_reports_the_injected_log_path() {
     let scratch = Scratch::new("about-log-path");
     let log = scratch.0.join("orion.log");
