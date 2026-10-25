@@ -100,7 +100,7 @@ impl OperatorCeremony {
                 .map_err(|error| format!("tirage de l'identifiant de session : {error}"))?,
         )
         .map_err(|error| format!("identifiant de session : {error}"))?;
-        let (publisher, mut status) = watch::channel(OperatorStatus::new(
+        let (publisher, status) = watch::channel(OperatorStatus::new(
             session_id,
             0,
             kind,
@@ -127,9 +127,11 @@ impl OperatorCeremony {
             })
             .map_err(|error| format!("démarrage de la cérémonie opérateur : {error}"))?;
 
-        let first = awaited(&mut status).await?;
-        *held = Some(Session { presses, status });
-        Ok(first)
+        // Held before its first state is awaited: a ceremony that is slow to
+        // speak is still running, and a second `begin` must find it here and
+        // refuse rather than open the vault a second time beside it.
+        let session = held.insert(Session { presses, status });
+        awaited(&mut session.status).await
     }
 
     /// Takes the next step of the open ceremony.
