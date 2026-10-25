@@ -472,6 +472,11 @@ impl ProtectedIdentityStore {
         Self { directory }
     }
 
+    /// The directory the sealed identities are written to.
+    pub fn directory(&self) -> &Path {
+        &self.directory
+    }
+
     /// Path of a sealed identity.
     ///
     /// The name is reduced to ordinary characters, which at once removes

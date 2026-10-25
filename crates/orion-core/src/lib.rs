@@ -38,6 +38,7 @@ pub mod mtu;
 pub mod net_pin;
 pub mod operator_pending;
 pub mod profile_import;
+pub mod protected_root;
 pub mod provisioning;
 pub mod speedtest;
 pub mod telemetry;
