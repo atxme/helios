@@ -23,7 +23,7 @@
 //!
 //! The Windows half is **unexercised in this repository**: WSL2 has no MSVC
 //! toolchain, so it compiles nowhere here. It must be tried on Windows before
-//! being relied upon — see [`docs/testing/TESTING.md`]. The refusal paths are
+//! being relied upon — see `docs/testing/TESTING.md`. The refusal paths are
 //! what to test first, not the happy one.
 
 #[cfg(windows)]
