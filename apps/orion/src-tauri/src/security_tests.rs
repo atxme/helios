@@ -488,6 +488,14 @@ fn every_launch_checks_elevation_first() {
         launches >= 2,
         "the ssh terminal and the companion must both launch through `Command`, found {launches}"
     );
+    // One launch per public function, and none anywhere else: a private helper
+    // that spawned would sit in the chunk of the function above it, behind that
+    // function's check rather than its own.
+    let total = code.matches(needle).count();
+    assert_eq!(
+        total, launches,
+        "every launch must be the only one of its own `pub fn`, found {total} for {launches}"
+    );
 
     let refusal = code
         .split("\npub fn ")
