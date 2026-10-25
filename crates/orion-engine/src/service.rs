@@ -18,7 +18,8 @@ use tokio::sync::{watch, Mutex};
 
 /// The tunnel-side state of the engine, held for the life of the process.
 ///
-/// Fields stay public while the shell's commands still reach them; each one closes when its family moves into the service.
+/// Fields stay public while the shell's commands still reach them; each one
+/// closes when its family moves into the service.
 pub struct EngineService {
     pub controller: Arc<VpnController>,
     /// Vault-backed store. `config` below is the in-memory view the UI reads;
@@ -132,8 +133,8 @@ impl EngineService {
         log_path: Option<PathBuf>,
     ) -> Result<Arc<Self>, String> {
         let controller = VpnController::new(backend);
-        // The protected store is the shell's job: `orion-core` states the
-        // boundary, the platform implementation lives with the platform.
+        // The protected identity store is the platform's: `orion-core` states
+        // the boundary, the platform implementation lives with the platform.
         let controller = match ProtectedIdentityStore::for_current_user() {
             Ok(store) => controller.with_key_negotiation_identities(Arc::new(store)),
             Err(error) => {

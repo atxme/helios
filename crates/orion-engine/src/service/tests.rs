@@ -1,3 +1,7 @@
+// Off Windows only: there the real root provider would create a key in the
+// platform keystore for every scratch directory.
+#![cfg(not(target_os = "windows"))]
+
 use super::*;
 use orion_core::backend::dryrun::DryRunBackend;
 use std::path::{Path, PathBuf};
