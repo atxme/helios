@@ -1936,6 +1936,15 @@ empreintes. Un octet différent sous le même identifiant est un conflit. Une
 reprise ne change ni génération, ni clés candidates et ne bascule vers le
 canal public.
 
+Avant de signer et journaliser le grant, Astra relit l’identité active, la
+révocation et la réservation exacte après les échanges réseau. Cette lecture
+et l’écriture du grant sont sérialisées avec les mutations du registre : une
+révocation déjà persistée interdit la création du grant. Si le grant a été
+persisté d’abord, une révocation ultérieure ne le remplace ni ne l’efface ; elle
+conserve sa dominance sur l’usage de l’identité. Deux polls concurrents pour
+la même autorisation réutilisent le grant déjà journalisé, sans en signer un
+second contre un autre reçu de retry.
+
 ### 8.2 Canal public Astra
 
 Le profil contient `authority_url`, `webauthn_rp_id` et le pin

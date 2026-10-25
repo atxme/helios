@@ -1,6 +1,8 @@
 //! Renewal orchestration over a real pinned private channel, with public test keys.
 
 mod companion;
+mod concurrency;
+mod router;
 
 use super::*;
 use aether::certificates::{
@@ -120,6 +122,45 @@ struct Gateway {
     fault: AtomicU8,
     state_path: PathBuf,
     journal_path: PathBuf,
+    stage_gate: Mutex<Option<Arc<TestGate>>>,
+    identity_gate: Mutex<Option<Arc<TestGate>>>,
+}
+
+/// A deterministic test pause with counted permits for concurrent handlers.
+/// The test can wait for entry even when a handler reaches the gate first.
+struct TestGate {
+    entered: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
+}
+
+impl TestGate {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            entered: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        })
+    }
+
+    async fn pause(&self) {
+        self.entered.add_permits(1);
+        self.release
+            .acquire()
+            .await
+            .expect("test gate semaphore remains open")
+            .forget();
+    }
+
+    async fn wait_until_entered(&self) {
+        self.entered
+            .acquire()
+            .await
+            .expect("test gate semaphore remains open")
+            .forget();
+    }
+
+    fn open(&self) {
+        self.release.add_permits(1);
+    }
 }
 
 impl Gateway {
@@ -189,7 +230,12 @@ impl AstraStageHandler for Gateway {
             &serde_json::to_vec(&view.state).expect("gateway state"),
         )
         .map_err(|_| TrustUpdateRefusal::Internal)?;
+        drop(view);
         self.stages.lock().await.push((*authorization).clone());
+        let gate = self.stage_gate.lock().await.clone();
+        if let Some(gate) = gate {
+            gate.pause().await;
+        }
         if self.fault.load(Ordering::SeqCst) == BLOCK_GRANT_JOURNAL {
             let backup = self
                 .journal_path
@@ -224,6 +270,10 @@ impl AstraChannelHandler for Gateway {
         Ok(self.view.lock().await.clone())
     }
     async fn gateway_identity(&self) -> Result<GatewayIdentityView, TrustUpdateRefusal> {
+        let gate = self.identity_gate.lock().await.clone();
+        if let Some(gate) = gate {
+            gate.pause().await;
+        }
         Ok(GatewayIdentityView {
             pq_certificate_fingerprint: if self.fault.load(Ordering::SeqCst)
                 == WRONG_SERVED_FINGERPRINT
@@ -419,6 +469,8 @@ async fn fixture() -> Fixture {
         fault: AtomicU8::new(0),
         state_path: directory.path().join("gateway-state.json"),
         journal_path: directory.path().join("operations.json"),
+        stage_gate: Mutex::new(None),
+        identity_gate: Mutex::new(None),
     });
     let handler: Arc<dyn AstraChannelHandler> = gateway.clone();
     let (channel, listener) = super::test_support::channel(directory.path(), handler).await;
