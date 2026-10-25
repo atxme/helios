@@ -219,7 +219,7 @@ impl EngineService {
 
     /// Unmounts the tunnel. The engine's `Disconnect` runs it, and so does
     /// `teardown` when the session ends, with the event side discarded. One
-    /// function for both, for the same reason as [`start_connection`]: two paths
+    /// function for both, for the same reason as [`Self::start_connection`]: two paths
     /// that differ by one step end up differing by more.
     pub async fn stop_connection(&self, sink: EventSink) -> Result<(), String> {
         self.telemetry.stop();

@@ -319,10 +319,10 @@ impl EngineService {
 
     /// The same command line, for the user to paste into their own terminal.
     ///
-    /// Kept beside [`open_ssh_terminal`] rather than replaced by it: the launcher
-    /// legitimately refuses on machines with no standard-user token — UAC off, the
-    /// built-in Administrator account, a service context — and on those the copy
-    /// is the whole feature rather than a consolation.
+    /// Kept beside the shell's `open_ssh_terminal` rather than replaced by it:
+    /// the launcher legitimately refuses on machines with no standard-user
+    /// token — UAC off, the built-in Administrator account, a service context —
+    /// and on those the copy is the whole feature rather than a consolation.
     pub async fn ssh_command(&self, name: Option<String>) -> Result<String, String> {
         let target = self.resolve_ssh_target(name).await?;
         Ok(format!("ssh {target}"))
@@ -371,9 +371,8 @@ impl EngineService {
 
     /// Draws a WireGuard key pair and returns its **public** half.
     ///
-    /// The private half stays in
-    /// [`orion_engine::service::EngineService::staged_key`] until the profile is
-    /// saved. Returning the public key straight away is what makes the enrolment
+    /// The private half stays in the engine's staged-key slot until the profile
+    /// is saved. Returning the public key straight away is what makes the enrolment
     /// workflow possible at all: the user copies it, hands it to the operator, and
     /// receives an admitted profile — none of which can happen if the key only
     /// comes into existence when the form is submitted.
@@ -412,11 +411,9 @@ impl EngineService {
     /// and a key the interface accepted but the core refuses would be a profile
     /// that fails at connection time with a message about enrolment.
     pub async fn adopt_private_key(&self, private_key: SecretInput) -> Result<String, String> {
-        // Copied into a zeroizing container at once; the `SecretInput` it came in
-        // in is zeroized when this call returns. Normalization necessarily creates
-        // a second buffer to preserve the prior trimmed-storage behavior; the
-        // original is then dropped through SecretString as soon as this binding
-        // is replaced.
+        // The `SecretInput` it came in is zeroized when this call returns;
+        // `trim().to_owned()` makes the one remaining copy, held in a zeroizing
+        // container at once.
         let normalized = SecretString::new(private_key.expose().trim().to_owned());
         let public_key = aether::wg::public_from_private(normalized.expose()).map_err(|_| {
             "clé privée invalide : une clé WireGuard est 32 octets encodés en base64 \
@@ -440,7 +437,7 @@ impl EngineService {
 
     /// Holds a static PSK the user supplies, until the profile is saved.
     ///
-    /// Validated here and not on screen, for the reason [`adopt_private_key`]
+    /// Validated here and not on screen, for the reason [`Self::adopt_private_key`]
     /// gives: `aether` owns the shape of a WireGuard secret, and a value the
     /// interface accepted but WireGuard refuses would produce a profile whose
     /// handshakes fail with nothing naming the cause. A PSK is a 32-byte base64

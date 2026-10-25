@@ -140,8 +140,8 @@ impl EngineService {
     ///
     /// Only the protected identity store is still resolved from the current
     /// user; the vault and the configuration live under `paths.vault`. A vault
-    /// that cannot be read leaves an empty configuration and records why in
-    /// [`EngineService::vault_error`]. `app_version` is the shell's version,
+    /// that cannot be read leaves an empty configuration and records why, for
+    /// the messages that would otherwise blame the document. `app_version` is the shell's version,
     /// reported by the About box.
     pub fn open(
         paths: EnginePaths,
