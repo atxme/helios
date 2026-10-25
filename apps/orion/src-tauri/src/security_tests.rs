@@ -641,9 +641,66 @@ fn the_engine_restricts_dll_search_first() {
         elevation < establishment && establishment < installation && installation < logging,
         "the protected root must be established and installed before the log is opened"
     );
-    for later in ["configure(", "default_backend(", "for_current_user("] {
+    for later in ["configure(", "default_backend("] {
         if let Some(at) = body.find(later) {
             assert!(restriction < at, "{later} runs before the DLL restriction");
+        }
+    }
+
+    let sid = body
+        .find("let sid = match process_user_sid(args.ui_pid)")
+        .expect("the UI's SID is read from its process");
+    assert!(
+        body.contains("establish_for(&sid)") && sid < establishment,
+        "the protected root is established for the SID read from the UI's process"
+    );
+}
+
+#[test]
+fn path_overrides_are_development_only() {
+    let sources = Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../crates/orion-core/src"
+    ));
+    let mut files = Vec::new();
+    collect_rust_files(sources, &mut files);
+    assert!(files.len() > 20, "the walk reaches the crate's sources");
+
+    let mut overrides = 0;
+    for file in &files {
+        let code = std::fs::read_to_string(file).expect("a source file is readable");
+        for line in code.lines() {
+            if line.contains("path_override(\"ORION_") {
+                overrides += 1;
+                assert!(
+                    line.contains("cfg!(debug_assertions)"),
+                    "{} reads an override outside development builds: {line}",
+                    file.display()
+                );
+            }
+            for reader in ["env::var(", "env::var_os("] {
+                if let Some(at) = line.find(reader) {
+                    assert!(
+                        !line[at..].contains("\"ORION_"),
+                        "{} reads an ORION_ variable from the environment: {line}",
+                        file.display()
+                    );
+                }
+            }
+        }
+    }
+    assert_eq!(overrides, 2, "the configuration and the identity store");
+}
+
+/// Every `.rs` file under `directory`, its subdirectories included.
+fn collect_rust_files(directory: &Path, found: &mut Vec<PathBuf>) {
+    let entries = std::fs::read_dir(directory).expect("the source directory is readable");
+    for entry in entries {
+        let path = entry.expect("a directory entry is readable").path();
+        if path.is_dir() {
+            collect_rust_files(&path, found);
+        } else if path.extension().is_some_and(|extension| extension == "rs") {
+            found.push(path);
         }
     }
 }
