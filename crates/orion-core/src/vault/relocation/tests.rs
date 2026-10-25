@@ -8,7 +8,9 @@ use zeroize::Zeroizing;
 
 use crate::config::{ClientConfig, ClientProfile};
 use crate::vault::keys::KEY_LEN;
-use crate::vault::store::{BOOTSTRAP_FILE, DEVICE_ROOT_FILE, LEGACY_FILE, PROFILES_DIR};
+use crate::vault::store::{
+    BOOTSTRAP_FILE, DEVICE_ROOT_FILE, LEGACY_FILE, PROFILES_DIR, REGISTRY_FILE,
+};
 use crate::vault::{Bootstrap, ProfileStore};
 
 /// The installation root of the legacy vault. The new vault wraps the same
@@ -161,6 +163,20 @@ fn legacy_root(calls: &Arc<AtomicUsize>) -> LegacyRoot {
     LegacyRoot(Arc::clone(calls))
 }
 
+/// Relocates, then runs the cleanup plan as the engine does.
+fn relocate(
+    legacy: &LegacyLayout,
+    paths: &EnginePaths,
+    legacy_root: &dyn RootKeyProvider,
+    target: &dyn RelocationTarget,
+) -> Result<Relocation, VaultError> {
+    let (relocation, cleanup) = super::relocate(legacy, paths, legacy_root, target)?;
+    if let Some(cleanup) = cleanup {
+        cleanup.run();
+    }
+    Ok(relocation)
+}
+
 fn target() -> FakeTarget {
     FakeTarget { fail_verify: false }
 }
@@ -310,7 +326,7 @@ fn an_already_relocated_vault_is_left_alone() {
     assert_eq!(
         outcome.unwrap(),
         Relocation::AlreadyDone {
-            legacy_removed: false
+            cleanup_planned: false
         }
     );
     assert_eq!(
@@ -508,7 +524,7 @@ fn a_cleanup_failure_after_the_commit_is_not_an_error() {
     assert_eq!(
         outcome.unwrap(),
         Relocation::AlreadyDone {
-            legacy_removed: true
+            cleanup_planned: true
         }
     );
     assert!(!legacy.layout.config_dir.join(DEVICE_ROOT_FILE).exists());
@@ -639,7 +655,7 @@ fn a_crash_after_the_commit_is_cleaned_up_on_the_next_start() {
     assert_eq!(
         outcome.unwrap(),
         Relocation::AlreadyDone {
-            legacy_removed: true
+            cleanup_planned: true
         }
     );
     assert!(!config.join(DEVICE_ROOT_FILE).exists());
@@ -892,7 +908,7 @@ fn a_skipped_store_survives_a_later_cleanup() {
     assert_eq!(
         outcome.unwrap(),
         Relocation::AlreadyDone {
-            legacy_removed: false
+            cleanup_planned: false
         }
     );
     assert_eq!(
@@ -938,5 +954,173 @@ fn the_failure_message_names_the_kept_vault() {
     assert_eq!(
         message,
         "La migration du coffre a échoué : l'ancien coffre est conservé. Cause : cause"
+    );
+}
+
+#[test]
+fn the_cleanup_removes_identical_stores_and_identities() {
+    let base = scratch("cleanup-identical");
+    let legacy = legacy_vault(&base, &["poste"]);
+    let paths = EnginePaths::under(&base.join("root"));
+    relocate(
+        &legacy.layout,
+        &paths,
+        &legacy_root(&legacy.calls),
+        &target(),
+    )
+    .unwrap();
+    let config = &legacy.layout.config_dir;
+    let identities = &legacy.layout.identities_dir;
+    std::fs::write(config.join("trust_update"), b"same").unwrap();
+    std::fs::write(paths.root.join("trust_update"), b"same").unwrap();
+    std::fs::write(config.join("changed.json"), b"old").unwrap();
+    std::fs::write(paths.root.join("changed.json"), b"new").unwrap();
+    std::fs::create_dir_all(identities).unwrap();
+    std::fs::write(identities.join("poste.identity"), b"sealed").unwrap();
+
+    let outcome = relocate(
+        &legacy.layout,
+        &paths,
+        &legacy_root(&legacy.calls),
+        &target(),
+    );
+
+    assert_eq!(
+        outcome.unwrap(),
+        Relocation::AlreadyDone {
+            cleanup_planned: true
+        }
+    );
+    assert!(
+        !config.join("trust_update").exists(),
+        "an identical store goes"
+    );
+    assert!(
+        !identities.join("poste.identity").exists(),
+        "an identical identity goes"
+    );
+    assert_eq!(
+        std::fs::read(config.join("changed.json")).unwrap(),
+        b"old",
+        "a store that differs stays"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[cfg(unix)]
+#[test]
+fn the_cleanup_never_recurses_through_a_directory_link() {
+    let base = scratch("cleanup-dir-link");
+    let legacy = legacy_vault(&base, &["poste"]);
+    let paths = EnginePaths::under(&base.join("root"));
+    let config = &legacy.layout.config_dir;
+    std::fs::create_dir_all(config.join("certificate_renewal")).unwrap();
+    std::fs::write(
+        config.join("certificate_renewal").join("a.json"),
+        b"renewal",
+    )
+    .unwrap();
+    let (relocation, plan) = super::relocate(
+        &legacy.layout,
+        &paths,
+        &legacy_root(&legacy.calls),
+        &target(),
+    )
+    .unwrap();
+    assert!(matches!(relocation, Relocation::Moved { .. }));
+    // Between the plan and its run, the folder becomes a link to a third-party
+    // folder that holds a file of the same name.
+    let outside = base.join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("a.json"), b"victim").unwrap();
+    std::fs::remove_dir_all(config.join("certificate_renewal")).unwrap();
+    std::os::unix::fs::symlink(&outside, config.join("certificate_renewal")).unwrap();
+
+    plan.expect("a planned cleanup").run();
+
+    assert_eq!(
+        std::fs::read(outside.join("a.json")).unwrap(),
+        b"victim",
+        "the cleanup never deletes through a link"
+    );
+    assert!(outside.is_dir(), "the link target survives");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn orion_ui_log_survives_the_already_done_cleanup() {
+    let base = scratch("ui-log");
+    let legacy = legacy_vault(&base, &["poste"]);
+    let paths = EnginePaths::under(&base.join("root"));
+    relocate(
+        &legacy.layout,
+        &paths,
+        &legacy_root(&legacy.calls),
+        &target(),
+    )
+    .unwrap();
+    let config = &legacy.layout.config_dir;
+    std::fs::write(config.join("orion-ui.log"), b"ui journal").unwrap();
+    std::fs::write(config.join("orion.log"), b"journal").unwrap();
+    std::fs::write(config.join(DEVICE_ROOT_FILE), ROOT).unwrap();
+
+    let outcome = relocate(
+        &legacy.layout,
+        &paths,
+        &legacy_root(&legacy.calls),
+        &target(),
+    );
+
+    assert_eq!(
+        outcome.unwrap(),
+        Relocation::AlreadyDone {
+            cleanup_planned: true
+        }
+    );
+    assert_eq!(
+        std::fs::read(config.join("orion-ui.log")).unwrap(),
+        b"ui journal"
+    );
+    assert_eq!(std::fs::read(config.join("orion.log")).unwrap(), b"journal");
+    assert!(!config.join(DEVICE_ROOT_FILE).exists());
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_linked_vault_entry_fails_the_migration() {
+    let base = scratch("linked-vault-entry");
+    let legacy = legacy_vault(&base, &["poste"]);
+    let paths = EnginePaths::under(&base.join("root"));
+    let config = &legacy.layout.config_dir;
+    let outside = base.join("outside.hvlt");
+    std::fs::write(&outside, b"not the registry").unwrap();
+    std::fs::remove_file(config.join(REGISTRY_FILE)).unwrap();
+    std::os::unix::fs::symlink(&outside, config.join(REGISTRY_FILE)).unwrap();
+    let before = snapshot(config);
+
+    let outcome = relocate(
+        &legacy.layout,
+        &paths,
+        &legacy_root(&legacy.calls),
+        &target(),
+    );
+
+    assert!(
+        outcome.is_err(),
+        "a linked vault entry refuses the migration"
+    );
+    assert!(!paths.vault.exists(), "no vault is committed");
+    assert_eq!(snapshot(config), before, "the legacy vault is untouched");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn a_link_is_reported_once_per_path() {
+    let path = Path::new("/nowhere/linked-once");
+    assert!(first_report_of(path), "the first report is made");
+    assert!(
+        !first_report_of(path),
+        "a second report of the same path is not"
     );
 }

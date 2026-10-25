@@ -153,7 +153,7 @@ impl EngineService {
     ) -> Result<Arc<Self>, String> {
         // Before anything reads the vault: an existing vault in the per-user
         // folder is moved under the protected root first (F11, task 12).
-        let relocation_failure = relocate_legacy_vault(&paths);
+        let relocation_failure = relocate_legacy_vault(&paths)?;
         let relocation_refused = relocation_failure.is_some();
         let controller = VpnController::new(backend);
         // The identities live under the protected root the shell established
@@ -305,66 +305,82 @@ impl EngineService {
 ///
 /// Returns the message to show when the migration failed, and the store must
 /// then refuse every root. Only the account that owns the per-user folder can
-/// read it: an elevated engine under another account leaves it alone.
+/// read it: an elevated engine under another account leaves it alone. The
+/// error is fatal for start-up: a thread still under the user's identity must
+/// not carry on.
 #[cfg(windows)]
-fn relocate_legacy_vault(paths: &EnginePaths) -> Option<String> {
+fn relocate_legacy_vault(paths: &EnginePaths) -> Result<Option<String>, String> {
     use orion_core::vault::{relocation::failure_message, VaultError};
 
-    let user_sid = paths.user_sid.as_deref()?;
+    let Some(user_sid) = paths.user_sid.as_deref() else {
+        return Ok(None);
+    };
     let token_sid = match crate::pipe::process_user_sid(std::process::id()) {
         Ok(sid) => sid,
         Err(cause) => {
             let error =
                 VaultError::Relocation(format!("identité du processus illisible : {cause}"));
             tracing::error!(%error, "migration du coffre impossible");
-            return Some(failure_message(&error));
+            return Ok(Some(failure_message(&error)));
         }
     };
     if token_sid != user_sid {
         tracing::warn!(
             "l'ancien coffre appartient au compte de l'IHM, inaccessible au moteur élevé sous un autre compte"
         );
-        return None;
+        return Ok(None);
     }
     match migrate_legacy_vault(paths, user_sid) {
-        Ok(orion_core::vault::relocation::Relocation::Moved {
-            profiles,
-            identities,
-        }) => {
+        Ok((
+            orion_core::vault::relocation::Relocation::Moved {
+                profiles,
+                identities,
+            },
+            cleanup,
+        )) => {
             tracing::warn!(
                 profils = profiles,
                 identites = identities,
                 "ancien coffre repris sous la racine protégée"
             );
-            delete_legacy_key();
-            None
+            if clean_legacy_vault(cleanup)?.is_some() {
+                delete_legacy_key();
+            }
+            Ok(None)
         }
-        Ok(orion_core::vault::relocation::Relocation::AlreadyDone {
-            legacy_removed: true,
-        }) => {
-            delete_legacy_key();
-            None
+        Ok((orion_core::vault::relocation::Relocation::AlreadyDone { .. }, cleanup)) => {
+            if clean_legacy_vault(cleanup)?.is_some_and(|removed| removed > 0) {
+                delete_legacy_key();
+            }
+            Ok(None)
         }
-        Ok(orion_core::vault::relocation::Relocation::LegacyKept) => {
+        Ok((orion_core::vault::relocation::Relocation::LegacyKept, _)) => {
             tracing::warn!(
                 "un ancien coffre subsiste dans le dossier de l'utilisateur, non repris : il n'est ni lu ni supprimé"
             );
-            None
+            Ok(None)
         }
-        Ok(_) => None,
+        Ok(_) => Ok(None),
         Err(error) => {
             tracing::error!(%error, "migration du coffre impossible");
-            Some(failure_message(&error))
+            Ok(Some(failure_message(&error)))
         }
     }
 }
 
-/// The legacy vault, moved to the machine key of `user_sid`.
+/// The legacy vault, moved to the machine key of `user_sid`, and the removal
+/// planned for the old copies, which the caller runs as the user.
 #[cfg(windows)]
 fn migrate_legacy_vault(
     paths: &EnginePaths,
     user_sid: &str,
-) -> Result<orion_core::vault::relocation::Relocation, orion_core::vault::VaultError> {
+) -> Result<
+    (
+        orion_core::vault::relocation::Relocation,
+        Option<orion_core::vault::relocation::LegacyCleanup>,
+    ),
+    orion_core::vault::VaultError,
+> {
     use orion_core::vault::{
         relocation::{relocate, LegacyLayout},
         windows::{
@@ -392,8 +408,45 @@ fn migrate_legacy_vault(
     relocate(&legacy, paths, &legacy_root, &target)
 }
 
-/// Removes the per-user TPM key once its vault has moved. A failure is logged:
-/// the key is then only a leftover, and the new vault does not use it.
+/// Runs the planned removal under the user's identity. Returns how many entries
+/// were removed, or `None` when the removal could not run: then nothing was
+/// removed, and the old vault and the user's key stay where they are.
+///
+/// An error means the engine could not give its thread back its own identity,
+/// and start-up must stop.
+#[cfg(windows)]
+fn clean_legacy_vault(
+    cleanup: Option<orion_core::vault::relocation::LegacyCleanup>,
+) -> Result<Option<usize>, String> {
+    use crate::legacy_cleanup::{run_as_user, CleanupError};
+
+    let Some(cleanup) = cleanup else {
+        return Ok(None);
+    };
+    match run_as_user(cleanup) {
+        Ok(removed) => {
+            tracing::info!(
+                entrees = removed,
+                "ancien coffre nettoyé sous l'identité de l'utilisateur"
+            );
+            Ok(Some(removed))
+        }
+        Err(CleanupError::Unavailable(cause)) => {
+            tracing::warn!(
+                %cause,
+                "ancien coffre conservé : suppression impossible sans les droits de l'utilisateur"
+            );
+            Ok(None)
+        }
+        Err(CleanupError::RevertFailed(cause)) => Err(format!(
+            "identité du moteur non restaurée après le nettoyage de l'ancien coffre : {cause}"
+        )),
+    }
+}
+
+/// Removes the per-user TPM key once its vault has moved and its old copies
+/// are gone. A failure is logged: the key is then only a leftover, and the new
+/// vault does not use it.
 #[cfg(windows)]
 fn delete_legacy_key() {
     use orion_core::vault::windows::tpm::{delete_key, KeyScope};
@@ -405,8 +458,8 @@ fn delete_legacy_key() {
 
 /// Nothing moves off Windows: the vault stays where the client keeps it.
 #[cfg(not(windows))]
-fn relocate_legacy_vault(_paths: &EnginePaths) -> Option<String> {
-    None
+fn relocate_legacy_vault(_paths: &EnginePaths) -> Result<Option<String>, String> {
+    Ok(None)
 }
 
 /// One recovery in progress: the session that drives it, and its profile.

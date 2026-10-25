@@ -13,10 +13,12 @@
 //! it was. The rename is the commit point. Removing the legacy vault comes
 //! after it, and a failure there is logged, not fatal.
 
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use super::settings::SETTINGS_FILE;
 use super::store::{
@@ -106,9 +108,9 @@ pub enum Relocation {
     NothingToMove,
     /// The legacy vault was copied, verified and committed.
     Moved { profiles: usize, identities: usize },
-    /// The new vault was already committed. `legacy_removed` says whether
-    /// anything of the old one was still there and got removed.
-    AlreadyDone { legacy_removed: bool },
+    /// The new vault was already committed. `cleanup_planned` says whether
+    /// the plan returned with it removes anything of the old one.
+    AlreadyDone { cleanup_planned: bool },
     /// A new vault exists without its marker, so the legacy one was neither
     /// read nor removed.
     LegacyKept,
@@ -144,39 +146,46 @@ impl RootKeyProvider for RefusedRoot {
 /// `legacy_root` unwraps the legacy device root, and is asked only when that
 /// root exists. `target` seals the root again and verifies the copies.
 ///
+/// `relocate` deletes nothing in the legacy folder. On `Moved`, and on an
+/// already-relocated vault, it returns the plan of what to remove there. The
+/// caller runs the plan under the identity of the user who owns that folder
+/// (see [`LegacyCleanup::run`]).
+///
 /// Up to the commit, every failure leaves the legacy vault untouched. After
-/// the commit nothing is fatal: a problem removing the old copies is logged,
-/// because the new vault already stands.
+/// the commit nothing is fatal.
 pub fn relocate(
     legacy: &LegacyLayout,
     paths: &EnginePaths,
     legacy_root: &dyn RootKeyProvider,
     target: &dyn RelocationTarget,
-) -> Result<Relocation, VaultError> {
+) -> Result<(Relocation, Option<LegacyCleanup>), VaultError> {
     let staging = paths.root.join(STAGING_DIR);
     if paths.vault.exists() && !is_vacant_dir(&paths.vault) {
         if paths.vault.join(RELOCATED_MARKER).exists() {
             discard_after_failure(&staging);
-            let legacy_removed = remove_legacy(legacy, paths);
-            return Ok(Relocation::AlreadyDone { legacy_removed });
+            let cleanup = legacy_cleanup(legacy, paths)?;
+            let cleanup_planned = !cleanup.paths.is_empty();
+            return Ok((Relocation::AlreadyDone { cleanup_planned }, Some(cleanup)));
         }
         // Without the marker the new vault is not known to be complete, so the
         // legacy one is the only trustworthy copy and stays where it is.
-        return Ok(if legacy_present(legacy)? {
+        let relocation = if legacy_present(legacy)? {
             Relocation::LegacyKept
         } else {
             Relocation::AlreadyDone {
-                legacy_removed: false,
+                cleanup_planned: false,
             }
-        });
+        };
+        return Ok((relocation, None));
     }
 
     if !legacy_present(legacy)? {
         // Nothing to migrate: a leftover transit is only noise, logged if it
         // cannot be removed.
         discard_after_failure(&staging);
-        return Ok(Relocation::NothingToMove);
+        return Ok((Relocation::NothingToMove, None));
     }
+    refuse_linked_vault_entries(legacy)?;
     // A transit directory left by an interrupted run is never trusted, and
     // here its removal is required: the migration cannot run beside it.
     discard(&staging)?;
@@ -198,22 +207,160 @@ pub fn relocate(
     };
     discard_after_failure(&staging);
 
-    // The new vault is committed and reopened. From here nothing is fatal.
-    // The copies of the vault and the entries that were merged are removed; an
-    // entry skipped by the merge stays where it is.
-    remove_paths(&entries.vault);
-    remove_paths(&sources);
-    remove_empty_dir(&legacy.identities_dir);
+    // The new vault is committed and reopened. The old copies are planned for
+    // removal: the vault files, and the entries the merge moved. An entry the
+    // merge skipped stays where it is.
+    let mut cleanup = LegacyCleanup { paths: Vec::new() };
+    for path in entries.vault.iter().chain(&sources) {
+        plan_removal(path, &mut cleanup.paths);
+    }
+    push_identities_folder(legacy, &mut cleanup.paths);
 
     tracing::info!(
         profils = staged.profiles,
         identites = staged.identities,
         "coffre repris sous la racine protégée"
     );
-    Ok(Relocation::Moved {
-        profiles: staged.profiles,
-        identities: staged.identities,
+    Ok((
+        Relocation::Moved {
+            profiles: staged.profiles,
+            identities: staged.identities,
+        },
+        Some(cleanup),
+    ))
+}
+
+/// What a migration removes from the legacy folder once the new vault stands:
+/// files first, then each folder that is empty by then.
+///
+/// The folder belongs to the user, and the engine runs elevated. Removal
+/// therefore happens under the user's own identity, so that a folder swapped
+/// for a link cannot make the engine delete anything the user could not.
+#[derive(Debug)]
+pub struct LegacyCleanup {
+    paths: Vec<PathBuf>,
+}
+
+impl LegacyCleanup {
+    /// Removes the planned entries, and returns how many were removed.
+    ///
+    /// Never through a link: an entry whose path crosses a link is skipped.
+    /// A folder is removed only when empty. A failure is logged, not fatal.
+    pub fn run(self) -> usize {
+        let mut removed = 0;
+        for path in &self.paths {
+            if is_link_on_the_way(path) {
+                tracing::warn!(
+                    chemin = %path.display(),
+                    "lien sur le chemin de l'ancien coffre : entrée ignorée"
+                );
+                continue;
+            }
+            let Ok(metadata) = path.symlink_metadata() else {
+                // Already gone.
+                continue;
+            };
+            let outcome = if metadata.is_dir() {
+                match fs::read_dir(path) {
+                    Ok(mut entries) => {
+                        // A folder with something else in it stays.
+                        if entries.next().is_some() {
+                            continue;
+                        }
+                        fs::remove_dir(path)
+                    }
+                    Err(error) => Err(error),
+                }
+            } else {
+                fs::remove_file(path)
+            };
+            match outcome {
+                Ok(()) => removed += 1,
+                Err(error) => tracing::warn!(
+                    chemin = %path.display(),
+                    %error,
+                    "suppression de l'ancien coffre impossible"
+                ),
+            }
+        }
+        removed
+    }
+}
+
+/// Whether `path`, or any folder it is under, is a link.
+fn is_link_on_the_way(path: &Path) -> bool {
+    path.ancestors().any(|ancestor| {
+        ancestor
+            .symlink_metadata()
+            .is_ok_and(|metadata| is_reparse(&metadata))
     })
+}
+
+/// Appends `path`, and for a real folder everything under it, children first.
+/// Links are neither followed nor planned.
+fn plan_removal(path: &Path, out: &mut Vec<PathBuf>) {
+    match kind_of(path) {
+        Some(Kind::Dir) => {
+            match children(path) {
+                Ok(entries) => {
+                    for entry in &entries {
+                        plan_removal(entry, out);
+                    }
+                }
+                Err(error) => tracing::warn!(%error, "dossier de l'ancien coffre illisible"),
+            }
+            out.push(path.to_path_buf());
+        }
+        Some(Kind::File) => out.push(path.to_path_buf()),
+        None => {}
+    }
+}
+
+/// The removal planned for an already-relocated vault: the vault files, and
+/// the stores and identities whose copy holds the same bytes.
+fn legacy_cleanup(legacy: &LegacyLayout, paths: &EnginePaths) -> Result<LegacyCleanup, VaultError> {
+    let entries = legacy_entries(legacy, false)?;
+    let mut planned = Vec::new();
+    for path in &entries.vault {
+        plan_removal(path, &mut planned);
+    }
+    for source in &entries.stores {
+        if copy_is_identical(source, &paths.root.join(child_name(source))) {
+            plan_removal(source, &mut planned);
+        }
+    }
+    for source in &entries.identities {
+        if copy_is_identical(source, &paths.identities.join(child_name(source))) {
+            plan_removal(source, &mut planned);
+        }
+    }
+    push_identities_folder(legacy, &mut planned);
+    Ok(LegacyCleanup { paths: planned })
+}
+
+/// The legacy identities folder goes last, and only when it is a real folder.
+/// Removal leaves it alone unless it is then empty.
+fn push_identities_folder(legacy: &LegacyLayout, out: &mut Vec<PathBuf>) {
+    if kind_of(&legacy.identities_dir) == Some(Kind::Dir) {
+        out.push(legacy.identities_dir.clone());
+    }
+}
+
+/// A vault entry that is a link refuses the migration. Its copy would silently
+/// miss it, and an empty registry would then pass for a complete one.
+fn refuse_linked_vault_entries(legacy: &LegacyLayout) -> Result<(), VaultError> {
+    for name in VAULT_ENTRIES {
+        let path = legacy.config_dir.join(name);
+        if path
+            .symlink_metadata()
+            .is_ok_and(|metadata| is_reparse(&metadata))
+        {
+            return Err(VaultError::Relocation(format!(
+                "« {name} » est un lien dans l'ancien coffre : migration refusée"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The message shown when a migration failed. The old vault is kept.
@@ -358,8 +505,8 @@ fn merge(staged: &Path, destination: &Path) -> Result<bool, VaultError> {
 }
 
 /// The kind of an entry, read without following a link. A link, a junction or
-/// any other reparse point is `None`, and logged: nothing reads through it,
-/// copies it or removes through it. A missing entry is `None` silently.
+/// any other reparse point is `None`, and reported once: nothing reads through
+/// it, copies it or removes through it. A missing entry is `None` silently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
     File,
@@ -369,7 +516,7 @@ enum Kind {
 fn kind_of(path: &Path) -> Option<Kind> {
     let metadata = path.symlink_metadata().ok()?;
     if is_reparse(&metadata) {
-        tracing::warn!(chemin = %path.display(), "lien ignoré dans l'ancien coffre");
+        report_link(path);
         return None;
     }
     if metadata.is_dir() {
@@ -379,6 +526,24 @@ fn kind_of(path: &Path) -> Option<Kind> {
     } else {
         None
     }
+}
+
+/// Logs a link in the legacy tree, once per path for the whole process.
+fn report_link(path: &Path) {
+    if first_report_of(path) {
+        tracing::warn!(chemin = %path.display(), "lien ignoré dans l'ancien coffre");
+    }
+}
+
+/// Whether `path` is reported for the first time. Each path is reported once,
+/// however many steps ask the same question about it.
+fn first_report_of(path: &Path) -> bool {
+    static REPORTED: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    let reported = REPORTED.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut reported = reported
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    reported.insert(path.to_path_buf())
 }
 
 /// A symbolic link, or a reparse point on Windows (junction included).
@@ -412,8 +577,8 @@ struct LegacyEntries {
 }
 
 /// Lists the legacy vault. A `strict` listing fails on an unreadable folder,
-/// which is what a migration must not do. A lenient one, used after the commit,
-/// logs it and sees nothing there.
+/// which is what a migration must not do. A lenient one, used for an
+/// already-relocated vault, logs it and sees nothing there.
 fn legacy_entries(legacy: &LegacyLayout, strict: bool) -> Result<LegacyEntries, VaultError> {
     let vault = VAULT_ENTRIES
         .iter()
@@ -469,35 +634,6 @@ fn legacy_present(legacy: &LegacyLayout) -> Result<bool, VaultError> {
         || listing(&legacy.identities_dir, true)?
             .iter()
             .any(|path| kind_of(path) == Some(Kind::File)))
-}
-
-/// Removes what remains of a legacy vault whose new copy is already committed.
-/// Returns whether anything was removed. Never fails: a problem is logged.
-///
-/// The vault files go unconditionally: the committed vault replaced them, and
-/// the device root is sealed again, so its bytes differ on purpose. A store or
-/// an identity goes only when its copy in the protected root holds the same
-/// bytes. A copy the merge skipped leaves the legacy file as the only one.
-fn remove_legacy(legacy: &LegacyLayout, paths: &EnginePaths) -> bool {
-    let entries = match legacy_entries(legacy, false) {
-        Ok(entries) => entries,
-        Err(_) => return false,
-    };
-    let mut removed = remove_paths(&entries.vault);
-    let stores: Vec<PathBuf> = entries
-        .stores
-        .into_iter()
-        .filter(|source| copy_is_identical(source, &paths.root.join(child_name(source))))
-        .collect();
-    removed |= remove_paths(&stores);
-    let identities: Vec<PathBuf> = entries
-        .identities
-        .into_iter()
-        .filter(|source| copy_is_identical(source, &paths.identities.join(child_name(source))))
-        .collect();
-    removed |= remove_paths(&identities);
-    removed |= remove_empty_dir(&legacy.identities_dir);
-    removed
 }
 
 /// Whether `copy` holds the same bytes as `source`, entry by entry. Anything
@@ -557,70 +693,6 @@ fn fill(reader: &mut impl Read, block: &mut [u8]) -> std::io::Result<usize> {
     Ok(filled)
 }
 
-/// Removes each path that is a file or a real directory, logging a failure
-/// without stopping. A link is never removed through. Returns whether anything
-/// was removed.
-fn remove_paths(paths: &[PathBuf]) -> bool {
-    let mut removed = false;
-    for path in paths {
-        let outcome = match kind_of(path) {
-            Some(Kind::Dir) => remove_tree(path),
-            Some(Kind::File) => fs::remove_file(path).map(|()| true),
-            None => continue,
-        };
-        match outcome {
-            Ok(done) => removed |= done,
-            Err(error) => tracing::warn!(
-                chemin = %path.display(),
-                %error,
-                "suppression de l'ancien coffre impossible"
-            ),
-        }
-    }
-    removed
-}
-
-/// Removes the files of a directory tree, then each directory that is left
-/// empty. Links are left alone, and so is anything else in a directory that
-/// is not empty afterwards.
-fn remove_tree(dir: &Path) -> std::io::Result<bool> {
-    let mut removed = false;
-    for entry in fs::read_dir(dir)? {
-        let path = entry?.path();
-        match kind_of(&path) {
-            Some(Kind::Dir) => removed |= remove_tree(&path)?,
-            Some(Kind::File) => {
-                fs::remove_file(&path)?;
-                removed = true;
-            }
-            None => {}
-        }
-    }
-    if fs::read_dir(dir)?.next().is_none() {
-        fs::remove_dir(dir)?;
-        removed = true;
-    }
-    Ok(removed)
-}
-
-/// Removes a directory once it is empty. A non-empty directory is kept. A
-/// failure is logged, not fatal.
-fn remove_empty_dir(dir: &Path) -> bool {
-    if kind_of(dir) != Some(Kind::Dir) {
-        return false;
-    }
-    match children(dir) {
-        Ok(entries) if entries.is_empty() => match fs::remove_dir(dir) {
-            Ok(()) => true,
-            Err(error) => {
-                tracing::warn!(chemin = %dir.display(), %error, "dossier d'identités non supprimé");
-                false
-            }
-        },
-        _ => false,
-    }
-}
-
 /// Copies a file or a directory tree. Every file is synced. A link is skipped.
 fn copy_entry(source: &Path, destination: &Path) -> Result<(), VaultError> {
     match kind_of(source) {
@@ -671,7 +743,7 @@ fn count_manifests(dir: &Path) -> Result<usize, VaultError> {
 fn children(dir: &Path) -> Result<Vec<PathBuf>, VaultError> {
     match dir.symlink_metadata() {
         Ok(metadata) if is_reparse(&metadata) => {
-            tracing::warn!(chemin = %dir.display(), "lien ignoré dans l'ancien coffre");
+            report_link(dir);
             return Ok(Vec::new());
         }
         Ok(_) => {}
