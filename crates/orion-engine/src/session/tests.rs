@@ -187,3 +187,9 @@ fn a_refused_token_text_is_never_echoed() {
         assert!(!message.contains(text.as_str()));
     }
 }
+
+#[test]
+fn a_hexadecimal_token_of_the_generated_shape_is_accepted() {
+    assert!(SessionToken::parse(&"0123456789abcdef".repeat(4)).is_ok());
+    assert!(SessionToken::parse(&"0123456789abcdeg".repeat(4)).is_err());
+}

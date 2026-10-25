@@ -173,7 +173,8 @@ fn engine_must_come_first() {
     let token = valid_token_text();
     let mut late = strings(&["--ui-pid", "4"]);
     late.extend(full_engine_args(&token));
-    assert!(EngineArgs::parse(&late).is_err());
+    let message = EngineArgs::parse(&late).expect_err("not first");
+    assert_eq!(message, "`--engine` doit être le premier argument.");
     assert!(EngineArgs::parse(&strings(&["--pipe", "x", "--engine"])).is_err());
 }
 
@@ -197,16 +198,136 @@ fn an_unreadable_number_is_refused() {
 fn a_refusal_never_echoes_the_token() {
     let malformed = "Z".repeat(64);
     let valid = valid_token_text();
+    let refusals = [
+        ("malformed --token", {
+            let mut args = full_engine_args(&malformed);
+            args[8] = malformed.clone();
+            args
+        }),
+        ("valid token as --pipe", {
+            let mut args = full_engine_args(&valid);
+            args[2] = valid.clone();
+            args
+        }),
+        ("valid token as --ui-pid", {
+            let mut args = full_engine_args(&valid);
+            args[4] = valid.clone();
+            args
+        }),
+        ("valid token as --ui-created", {
+            let mut args = full_engine_args(&valid);
+            args[6] = valid.clone();
+            args
+        }),
+        ("valid token as an unknown option", {
+            let mut args = full_engine_args(&valid);
+            args.push(valid.clone());
+            args
+        }),
+        ("valid token right after --engine", {
+            let mut args = full_engine_args(&valid);
+            args.insert(1, valid.clone());
+            args
+        }),
+        ("valid token as the value of an unknown option", {
+            let mut args = full_engine_args(&valid);
+            args.extend(strings(&["--bogus", &valid]));
+            args
+        }),
+        ("valid token repeated as --token", {
+            let mut args = full_engine_args(&valid);
+            args.extend(strings(&["--token", &valid]));
+            args
+        }),
+    ];
+    for (place, args) in &refusals {
+        let message = EngineArgs::parse(args).expect_err(place);
+        assert!(
+            !message.contains(&valid) && !message.contains(&malformed),
+            "{place}: {message}"
+        );
+    }
+}
 
-    let mut bad_token = full_engine_args(&malformed);
-    bad_token[8] = malformed.clone();
-    let message = EngineArgs::parse(&bad_token).expect_err("refused");
-    assert!(!message.contains(&malformed));
+#[test]
+fn a_number_must_be_plain_decimal() {
+    let token = valid_token_text();
+    for bad in ["+5", " 5", "5 ", "", "\u{0663}"] {
+        for index in [4, 6] {
+            let mut args = full_engine_args(&token);
+            args[index] = bad.to_owned();
+            assert!(
+                EngineArgs::parse(&args).is_err(),
+                "accepted {bad:?} at {index}"
+            );
+        }
+    }
+}
 
-    let mut repeated = full_engine_args(&valid);
-    repeated.extend(strings(&["--token", &valid]));
-    let message = EngineArgs::parse(&repeated).expect_err("refused");
-    assert!(!message.contains(&valid));
+#[test]
+fn a_number_out_of_range_is_refused() {
+    let token = valid_token_text();
+    let mut pid = full_engine_args(&token);
+    pid[4] = "4294967296".to_owned();
+    assert!(EngineArgs::parse(&pid).is_err());
+
+    let mut created = full_engine_args(&token);
+    created[6] = "18446744073709551616".to_owned();
+    assert!(EngineArgs::parse(&created).is_err());
+}
+
+#[test]
+fn zero_is_an_accepted_number() {
+    let token = valid_token_text();
+    let mut args = full_engine_args(&token);
+    args[4] = "0".to_owned();
+    args[6] = "0".to_owned();
+    let parsed = EngineArgs::parse(&args)
+        .expect("parses")
+        .expect("engine mode");
+    assert_eq!(parsed.ui_pid, 0);
+    assert_eq!(parsed.ui_created_at, 0);
+}
+
+#[test]
+fn an_option_without_its_value_is_refused_in_last_place() {
+    let token = valid_token_text();
+    let full = full_engine_args(&token);
+    for index in (1..full.len()).step_by(2) {
+        let name = &full[index];
+        let mut args = full[..index].to_vec();
+        args.push(name.clone());
+        let message = EngineArgs::parse(&args).expect_err(name);
+        assert!(
+            message.contains("valeur manquante") && message.contains(name.as_str()),
+            "{message}"
+        );
+    }
+}
+
+#[test]
+fn a_second_engine_flag_is_refused() {
+    let token = valid_token_text();
+    let mut args = full_engine_args(&token);
+    args.insert(1, "--engine".to_owned());
+    assert!(EngineArgs::parse(&args).is_err());
+}
+
+#[test]
+fn a_repeated_pipe_or_creation_time_is_refused() {
+    let token = valid_token_text();
+    let mut pipe = full_engine_args(&token);
+    pipe.extend(strings(&["--pipe", r"\\.\pipe\orion-engine-2"]));
+    let message = EngineArgs::parse(&pipe).expect_err("repeated --pipe");
+    assert!(message.contains("option répétée : --pipe"), "{message}");
+
+    let mut created = full_engine_args(&token);
+    created.extend(strings(&["--ui-created", "9"]));
+    let message = EngineArgs::parse(&created).expect_err("repeated --ui-created");
+    assert!(
+        message.contains("option répétée : --ui-created"),
+        "{message}"
+    );
 }
 
 #[test]

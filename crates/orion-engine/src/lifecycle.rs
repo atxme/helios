@@ -70,10 +70,11 @@ impl EngineArgs {
                     claim(&ui_created_at, name)?;
                     ui_created_at = Some(decimal::<u64>(name, value)?);
                 }
-                _ => {
+                "--token" => {
                     claim(&token, name)?;
                     token = Some(SessionToken::parse(value)?);
                 }
+                _ => return Err("argument du mode moteur inattendu.".to_owned()),
             }
         }
 
