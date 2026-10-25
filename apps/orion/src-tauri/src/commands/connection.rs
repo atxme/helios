@@ -28,23 +28,20 @@ pub(crate) async fn connect(
 /// Only the notification-area menu calls it, so outside Windows nothing does.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub(crate) async fn select_and_connect(app: &AppHandle, name: &str) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    match state
+        .client
+        .call(EngineCommand::SelectProfile {
+            name: name.to_string(),
+        })
+        .await?
     {
-        let state = app.state::<AppState>();
-        let mut config = state.engine.config.lock().await;
-        if config.find(name).is_none() {
-            return Err(format!("profil « {name} » introuvable"));
-        }
-        state
-            .engine
-            .store
-            .select(name)
-            .map_err(|error| error.to_string())?;
-        config.selected = Some(name.to_string());
+        EngineReply::Config(_) => {}
+        _ => return Err(unexpected_engine_reply()),
     }
     // The window may be open behind the menu: it reads its profile list from
     // Rust, and nothing else would tell it the selection just moved.
     let _ = app.emit("helios://config-changed", ());
-    let state = app.state::<AppState>();
     match state
         .client
         .call(EngineCommand::Connect {

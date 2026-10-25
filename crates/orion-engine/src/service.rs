@@ -25,7 +25,6 @@ pub mod certificates;
 mod connection;
 mod profiles;
 pub use app::PROFILE_EXTENSION;
-pub use profiles::{merge_draft, profile_edit_base};
 
 /// The tunnel-side state of the engine, held for the life of the process.
 ///
@@ -36,13 +35,13 @@ pub struct EngineService {
     /// Vault-backed store. `config` below is the in-memory view the UI reads;
     /// this is what actually persists, and it never writes a secret in the
     /// clear (ADR-006 §3).
-    pub store: Arc<orion_core::vault::ProfileStore>,
+    store: Arc<orion_core::vault::ProfileStore>,
     pub config: Arc<Mutex<ClientConfig>>,
-    pub telemetry: Arc<TelemetryManager>,
+    telemetry: Arc<TelemetryManager>,
     /// Serializes the expensive benchmark. The UI disables its button, but
     /// the Rust boundary still refuses a second IPC invocation so two tests
     /// cannot divide the same path and both report half of its capacity.
-    pub speedtest: Mutex<()>,
+    speedtest: Mutex<()>,
     /// Imported profiles the user has not saved yet, keyed by display name.
     ///
     /// # Why the secret waits here rather than on screen
@@ -57,7 +56,7 @@ pub struct EngineService {
     /// waits here instead, for the one gesture that follows. `save_profile`
     /// takes it; anything else drops it when Orion closes, which loses nothing:
     /// the document can be imported again.
-    pub pending_imports: Arc<Mutex<std::collections::HashMap<String, ClientProfile>>>,
+    pending_imports: Arc<Mutex<std::collections::HashMap<String, ClientProfile>>>,
     /// The key the user just generated or pasted, waiting to be saved.
     ///
     /// # The workflow this exists for
@@ -73,14 +72,14 @@ pub struct EngineService {
     /// half stays here. One slot rather than a map: the screen edits one
     /// profile at a time, and a slot that could hold two keys would eventually
     /// attach the wrong one.
-    pub staged_key: Arc<Mutex<Option<StagedKey>>>,
+    staged_key: Arc<Mutex<Option<StagedKey>>>,
     /// Static PSK entered on screen, held until the profile is saved.
     ///
     /// Same slot discipline as [`Self::staged_key`] and the same reason: the
     /// secret crosses the IPC once, at an explicit gesture, and never comes
     /// back out. `None` means "no new PSK this session" — whatever the profile
     /// already held is left alone.
-    pub staged_psk: Arc<Mutex<Option<StagedPsk>>>,
+    staged_psk: Arc<Mutex<Option<StagedPsk>>>,
     /// Why the vault could not be opened at startup, if it could not.
     ///
     /// Orion keeps running — the screen is more useful than a blank window —
@@ -88,20 +87,20 @@ pub struct EngineService {
     /// diagnosis. An import then concludes that no key of this machine matches
     /// the admitted one, which is false: the machine's keys were never read.
     /// Carrying the cause lets those messages say so.
-    pub vault_error: Option<String>,
+    vault_error: Option<String>,
     /// The handshake-inference loop of the current connection, if one runs.
     ///
     /// One at a time, like telemetry, and for the same reason: each connection
     /// starts one, and a connection that failed leaves a loop with nothing left
     /// to infer. Without this slot every attempt piled up another task polling
     /// the adapter every three seconds for the life of the process.
-    pub handshake_poll: StdMutex<Option<tokio::task::JoinHandle<()>>>,
+    handshake_poll: StdMutex<Option<tokio::task::JoinHandle<()>>>,
     /// Where this run writes its log, when it writes one.
     ///
     /// A release build has no console (`windows_subsystem = "windows"`), so the
     /// file is the only trace left of a start that went wrong — and a path
     /// nobody can find is a file nobody reads. The About box states it.
-    pub log_path: Option<PathBuf>,
+    log_path: Option<PathBuf>,
     /// Last certificate action that failed, per profile — the «dernière
     /// erreur» spec §12.2 asks the Certificates surface to display.
     ///
@@ -121,7 +120,7 @@ pub struct EngineService {
     /// One automatic renewal timer for the mounted profile. It is cancelled
     /// with the connection so reconnecting cannot leave stale tasks racing a
     /// newer profile.
-    pub certificate_renewal_task: Arc<StdMutex<Option<tokio::task::JoinHandle<()>>>>,
+    certificate_renewal_task: Arc<StdMutex<Option<tokio::task::JoinHandle<()>>>>,
     /// Recoveries of expired identities in progress (§7.5).
     ///
     /// A separate map, for the same reason Astra keeps a separate store: a
@@ -377,17 +376,37 @@ impl Engine for EngineService {
             EngineCommand::ValidateProfile { draft } => {
                 self.validate_profile(draft).await.map(EngineReply::Issues)
             }
+            EngineCommand::GeneratePrivateKey => self
+                .generate_private_key()
+                .await
+                .map(EngineReply::PublicKey),
+            EngineCommand::AdoptPrivateKey { private_key } => self
+                .adopt_private_key(private_key)
+                .await
+                .map(EngineReply::PublicKey),
+            EngineCommand::DiscardStagedKey => {
+                self.discard_staged_key().await.map(|()| EngineReply::Unit)
+            }
+            EngineCommand::AdoptPresharedKey { preshared_key } => self
+                .adopt_preshared_key(preshared_key)
+                .await
+                .map(|()| EngineReply::Unit),
+            EngineCommand::DiscardStagedPsk => {
+                self.discard_staged_psk().await.map(|()| EngineReply::Unit)
+            }
+            EngineCommand::SaveProfile { draft } => {
+                self.save_profile(draft).await.map(EngineReply::Config)
+            }
+            EngineCommand::DeleteProfile { name } => self
+                .delete_profile(name, events)
+                .await
+                .map(EngineReply::Config),
+            EngineCommand::SelectProfile { name } => {
+                self.select_profile(name).await.map(EngineReply::Config)
+            }
             // Served by the transport before it reaches the engine.
             EngineCommand::Shutdown => Ok(EngineReply::Unit),
-            EngineCommand::GeneratePrivateKey
-            | EngineCommand::AdoptPrivateKey { .. }
-            | EngineCommand::DiscardStagedKey
-            | EngineCommand::AdoptPresharedKey { .. }
-            | EngineCommand::DiscardStagedPsk
-            | EngineCommand::SaveProfile { .. }
-            | EngineCommand::DeleteProfile { .. }
-            | EngineCommand::SelectProfile { .. }
-            | EngineCommand::PreviewEnrollmentInvitation { .. }
+            EngineCommand::PreviewEnrollmentInvitation { .. }
             | EngineCommand::BeginEnrollment { .. }
             | EngineCommand::ListPendingEnrollments
             | EngineCommand::ExportPendingRequest { .. }

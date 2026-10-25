@@ -44,7 +44,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use aether::SecretString;
 use orion_core::{backend::EventSink, default_backend, ClientEvent, ProtectedIdentityStore};
 use orion_engine::client::EngineClient;
 use orion_engine::service::{certificates::now_unix, EngineService, PROFILE_EXTENSION};

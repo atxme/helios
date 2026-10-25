@@ -1,9 +1,9 @@
 //! The profiles family: reading the configuration, importing a profile, the
-//! vault's posture, the SSH command and the validation of a draft. The shell
-//! reaches them through the engine; the commands that save, delete and select
-//! a profile, and the staged keys, are still served by the shell.
+//! vault's posture, the SSH command, the validation of a draft, the staged
+//! keys, and saving, deleting and selecting a profile. The shell reaches them
+//! through the engine.
 
-use aether::TunnelState;
+use aether::{SecretString, TunnelState};
 use orion_core::{
     complete_profile_import, inspect_profile, parse_profile_import, vault::VaultPosture,
     ClientProfile, ProfileIssues, ProtectedIdentityStore,
@@ -11,7 +11,8 @@ use orion_core::{
 
 use super::certificates::now_unix;
 use super::{EngineService, StagedKey, StagedPsk};
-use crate::command::ProfileDraft;
+use crate::command::{ProfileDraft, SecretInput};
+use crate::events::EventQueue;
 use crate::view::{ConfigView, ImportOutcome, ProfileView};
 
 /// Merges a saved draft onto what is stored, keeping every secret in Rust.
@@ -134,6 +135,19 @@ fn complete_signed_document(
         orion_core::CompletedImport::from_enrollment(outcome, notices),
         sealed,
     ))
+}
+
+/// Destroys the pending enrollment record once its profile is saved.
+///
+/// The profile is already persisted when this runs, so a failure is not a
+/// failed save: the record left behind holds sealed keys the user can still
+/// discard from the enrollment list.
+fn settle_saved_enrollment(identity: &str) {
+    if let Err(error) = ProtectedIdentityStore::for_current_user()
+        .and_then(|store| orion_core::enrollment::settle_enrollment(&store, identity))
+    {
+        tracing::warn!(error = %format!("{error:#}"), "pending enrollment record kept after save");
+    }
 }
 
 impl EngineService {
@@ -353,6 +367,203 @@ impl EngineService {
             );
         }
         Ok(target)
+    }
+
+    /// Draws a WireGuard key pair and returns its **public** half.
+    ///
+    /// The private half stays in
+    /// [`orion_engine::service::EngineService::staged_key`] until the profile is
+    /// saved. Returning the public key straight away is what makes the enrolment
+    /// workflow possible at all: the user copies it, hands it to the operator, and
+    /// receives an admitted profile — none of which can happen if the key only
+    /// comes into existence when the form is submitted.
+    pub async fn generate_private_key(&self) -> Result<String, String> {
+        let pair = aether::wg::generate_keypair()
+            .map_err(|error| format!("génération de la paire de clés : {error}"))?;
+        let aether::wg::Keypair {
+            private_key,
+            public_key,
+        } = pair;
+        let returned_public_key = public_key.clone();
+        *self.staged_key.lock().await = Some(StagedKey {
+            private_key,
+            public_key,
+        });
+        Ok(returned_public_key)
+    }
+
+    /// Adopts a private key the user supplies, and returns its public half.
+    ///
+    /// # Why this exists, having been refused once
+    ///
+    /// An earlier revision removed every way of entering a key, on the grounds
+    /// that one arriving through the interface has crossed JavaScript. That is
+    /// true, and it is a real cost — but it left no path for the ordinary case of
+    /// a key produced by `wg genkey` or carried by an existing `wg-quick` file, and
+    /// a client that cannot accept an existing identity is not a client.
+    ///
+    /// The direction is what makes this acceptable. A key **entering** crosses the
+    /// IPC once, at an explicit gesture, and the field is cleared immediately
+    /// after. A key **leaving** would sit in the DOM for as long as the screen
+    /// lives, on every render, for a value nobody asked to see. ADR-006 §5 forbids
+    /// the second; this is not it.
+    ///
+    /// Validation happens here rather than on screen: `orion-core` owns the rules,
+    /// and a key the interface accepted but the core refuses would be a profile
+    /// that fails at connection time with a message about enrolment.
+    pub async fn adopt_private_key(&self, private_key: SecretInput) -> Result<String, String> {
+        // Copied into a zeroizing container at once; the `SecretInput` it came in
+        // in is zeroized when this call returns. Normalization necessarily creates
+        // a second buffer to preserve the prior trimmed-storage behavior; the
+        // original is then dropped through SecretString as soon as this binding
+        // is replaced.
+        let normalized = SecretString::new(private_key.expose().trim().to_owned());
+        let public_key = aether::wg::public_from_private(normalized.expose()).map_err(|_| {
+            "clé privée invalide : une clé WireGuard est 32 octets encodés en base64 \
+             (44 caractères finissant par « = »)"
+                .to_string()
+        })?;
+        *self.staged_key.lock().await = Some(StagedKey {
+            private_key: normalized,
+            public_key: public_key.clone(),
+        });
+        Ok(public_key)
+    }
+
+    /// Drops the staged key without saving it.
+    pub async fn discard_staged_key(&self) -> Result<(), String> {
+        // `Drop` zeroizes it: cancelling must not leave the key in memory for the
+        // rest of the session.
+        self.staged_key.lock().await.take();
+        Ok(())
+    }
+
+    /// Holds a static PSK the user supplies, until the profile is saved.
+    ///
+    /// Validated here and not on screen, for the reason [`adopt_private_key`]
+    /// gives: `aether` owns the shape of a WireGuard secret, and a value the
+    /// interface accepted but WireGuard refuses would produce a profile whose
+    /// handshakes fail with nothing naming the cause. A PSK is a 32-byte base64
+    /// value — the same shape as a key, which is why the same validator answers.
+    ///
+    /// Nothing is returned but success: unlike a key pair there is no public half
+    /// to show, and echoing the secret back would put it in the DOM for the life
+    /// of the screen.
+    pub async fn adopt_preshared_key(&self, preshared_key: SecretInput) -> Result<(), String> {
+        let value = SecretString::new(preshared_key.expose().trim().to_owned());
+        aether::wg::validate_key(value.expose()).map_err(|_| {
+            "PSK invalide : un PSK WireGuard est 32 octets encodés en base64 \
+             (44 caractères finissant par « = »), tel que le produit `wg genpsk`"
+                .to_string()
+        })?;
+        *self.staged_psk.lock().await = Some(StagedPsk { value });
+        Ok(())
+    }
+
+    /// Drops the staged PSK without saving it.
+    pub async fn discard_staged_psk(&self) -> Result<(), String> {
+        self.staged_psk.lock().await.take();
+        Ok(())
+    }
+
+    /// Merges a draft onto the stored profile and seals the result.
+    ///
+    /// The volume-encryption gate is here rather than in the store because this is
+    /// the moment a secret is about to be written: ADR-006 §3 makes BitLocker a
+    /// **verified prerequisite**, not a recommendation, because application
+    /// encryption reaches neither the old SSD blocks nor the hibernation file.
+    pub async fn save_profile(&self, draft: ProfileDraft) -> Result<ConfigView, String> {
+        let mut cfg = self.config.lock().await;
+        self.require_protected_volume()?;
+        // A pending import wins over the stored profile of the same name. An
+        // imported document may carry a *new* WireGuard private key together
+        // with a newly sealed key-negotiation identity. Keeping the old profile
+        // here would pair those two identities from different admissions: the
+        // gateway accepts the TLS certificate, then rejects the request because
+        // its WireGuard key is the old one. Ordinary edits never have a pending
+        // import, so they still use the stored profile and preserve its secrets.
+        let pending = self.pending_imports.lock().await.remove(&draft.name);
+        let known = cfg.find(&draft.name);
+        let stored = profile_edit_base(pending.as_ref(), known);
+        // Taken, not peeked: the key is now the profile's, and leaving a copy in
+        // the slot would let the next profile saved adopt it too.
+        let staged = self.staged_key.lock().await.take();
+        let staged_psk = self.staged_psk.lock().await.take();
+        let profile = merge_draft(draft, stored, staged.as_ref(), staged_psk.as_ref())?;
+        if let Some(known) = known {
+            profile
+                .check_replacement_of(known)
+                .map_err(|error| error.to_string())?;
+        }
+        let selected = profile.name.clone();
+        self.store
+            .save_profile(&profile)
+            .map_err(|e| e.to_string())?;
+        if let Some(block) = &profile.key_negotiation {
+            settle_saved_enrollment(&block.identity);
+        }
+        cfg.upsert(profile).map_err(|error| error.to_string())?;
+        cfg.selected = Some(selected.clone());
+        self.store.select(&selected).map_err(|e| e.to_string())?;
+        Ok(ConfigView::from(&*cfg))
+    }
+
+    /// Removes a profile, unmounting its tunnel first if that tunnel is the one up.
+    ///
+    /// The order is the whole point (spec §12.2). The signed `release` that frees
+    /// the gateway's PSK slot travels **inside** the tunnel and is signed by the
+    /// profile's own identity, so it has to leave before either disappears.
+    /// Deleting first left the slot held until the gateway reclaimed it on
+    /// handshake silence, five minutes later — and left the adapter mounted for a
+    /// profile that no longer existed.
+    pub async fn delete_profile(
+        &self,
+        name: String,
+        events: &EventQueue,
+    ) -> Result<ConfigView, String> {
+        // Before the configuration lock, not after: the disconnection is a network
+        // round trip, and `stop_connection` rebuilds nothing that needs the config
+        // — but holding a lock across it would stall every other command for the
+        // two seconds the release is allowed.
+        if self.controller.mounted_profile().await.as_deref() == Some(name.as_str()) {
+            self.stop_connection(events.sink()).await?;
+        }
+        let mut cfg = self.config.lock().await;
+        self.store
+            .remove_profile(&name)
+            .map_err(|e| e.to_string())?;
+        cfg.remove(&name);
+        Ok(ConfigView::from(&*cfg))
+    }
+
+    /// Selects a profile that is in the configuration.
+    ///
+    /// The tray's connect gesture selects through this command too, and it needs
+    /// the unknown name refused here: the store would otherwise accept a name it
+    /// does not hold and the connection would fail later without naming it.
+    pub async fn select_profile(&self, name: String) -> Result<ConfigView, String> {
+        let mut cfg = self.config.lock().await;
+        if cfg.find(&name).is_none() {
+            return Err(format!("profil « {name} » introuvable"));
+        }
+        self.store.select(&name).map_err(|e| e.to_string())?;
+        cfg.selected = Some(name);
+        Ok(ConfigView::from(&*cfg))
+    }
+
+    /// Refuses to write a secret onto a volume nothing encrypts (ADR-006 §3).
+    ///
+    /// `Indeterminate` refuses just like `Unprotected`: a posture we cannot
+    /// establish is a posture we cannot promise, and the failure mode of guessing
+    /// "probably fine" is a user believing their disk is protected when it is not.
+    fn require_protected_volume(&self) -> Result<(), String> {
+        self.store.may_write_secrets().map_err(|error| {
+            format!(
+                "{error} `danger_allow_unencrypted_volume = true` dans settings.toml l'autorise \
+                 explicitement, en retirant la couverture des anciens blocs disque et du fichier \
+                 d'hibernation."
+            )
+        })
     }
 }
 

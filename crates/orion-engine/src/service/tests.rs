@@ -116,7 +116,7 @@ async fn a_command_not_yet_served_is_refused() {
 
     assert_eq!(
         client
-            .call(EngineCommand::GeneratePrivateKey)
+            .call(EngineCommand::ListPendingEnrollments)
             .await
             .err()
             .as_deref(),
@@ -464,4 +464,189 @@ async fn ssh_command_without_a_target_is_refused() {
              Avancé → Destination SSH »"
         )
     );
+}
+
+#[tokio::test]
+async fn a_generated_key_stays_in_the_engine() {
+    let scratch = Scratch::new("generated-key");
+    let service = EngineService::open(
+        paths_under(&scratch.0),
+        Arc::new(DryRunBackend::default()),
+        None,
+        "0.0.0-test",
+    )
+    .expect("the service opens on a fresh directory");
+    let (client, _events) = crate::client::in_process(Arc::clone(&service))
+        .await
+        .expect("the session opens");
+
+    let reply = client
+        .call(EngineCommand::GeneratePrivateKey)
+        .await
+        .expect("a key pair is drawn");
+    let rendered = format!("{reply:?}");
+    let EngineReply::PublicKey(public_key) = reply else {
+        panic!("unexpected reply: {reply:?}");
+    };
+
+    let staged = service.staged_key.lock().await;
+    let staged = staged
+        .as_ref()
+        .expect("the private half waits in the engine");
+    assert_eq!(staged.public_key, public_key);
+    assert_eq!(
+        aether::wg::public_from_private(staged.private_key.expose())
+            .expect("the staged key derives"),
+        public_key
+    );
+    assert!(
+        !rendered.contains(staged.private_key.expose()),
+        "the private key crossed: {rendered}"
+    );
+}
+
+#[tokio::test]
+async fn an_adopted_key_answers_with_its_public_half() {
+    let scratch = Scratch::new("adopted-key");
+    let service = EngineService::open(
+        paths_under(&scratch.0),
+        Arc::new(DryRunBackend::default()),
+        None,
+        "0.0.0-test",
+    )
+    .expect("the service opens on a fresh directory");
+    let (client, _events) = crate::client::in_process(Arc::clone(&service))
+        .await
+        .expect("the session opens");
+    let pair = aether::wg::generate_keypair().expect("a key pair");
+
+    let reply = client
+        .call(EngineCommand::AdoptPrivateKey {
+            private_key: SecretInput::from(pair.private_key.expose().to_string()),
+        })
+        .await
+        .expect("the key is adopted");
+    let rendered = format!("{reply:?}");
+    let EngineReply::PublicKey(public_key) = reply else {
+        panic!("unexpected reply: {rendered}");
+    };
+    assert_eq!(public_key, pair.public_key);
+    assert!(
+        !rendered.contains(pair.private_key.expose()),
+        "the private key crossed: {rendered}"
+    );
+}
+
+#[tokio::test]
+async fn an_adopted_psk_is_never_answered() {
+    let scratch = Scratch::new("adopted-psk");
+    let service = EngineService::open(
+        paths_under(&scratch.0),
+        Arc::new(DryRunBackend::default()),
+        None,
+        "0.0.0-test",
+    )
+    .expect("the service opens on a fresh directory");
+    let (client, _events) = crate::client::in_process(Arc::clone(&service))
+        .await
+        .expect("the session opens");
+    let psk = aether::wg::generate_keypair().expect("a key of the PSK's shape");
+
+    let reply = client
+        .call(EngineCommand::AdoptPresharedKey {
+            preshared_key: SecretInput::from(psk.private_key.expose().to_string()),
+        })
+        .await
+        .expect("the PSK is held");
+    assert!(
+        matches!(reply, EngineReply::Unit),
+        "unexpected reply: {reply:?}"
+    );
+    assert!(service.staged_psk.lock().await.is_some());
+
+    let reply = client
+        .call(EngineCommand::DiscardStagedPsk)
+        .await
+        .expect("the PSK is discarded");
+    assert!(
+        matches!(reply, EngineReply::Unit),
+        "unexpected reply: {reply:?}"
+    );
+    assert!(service.staged_psk.lock().await.is_none());
+}
+
+#[tokio::test]
+async fn saving_is_refused_on_a_vault_that_cannot_write() {
+    let scratch = Scratch::new("save-refused");
+    let service = service_with_selected_profile(&scratch);
+    let (client, _events) = crate::client::in_process(Arc::clone(&service))
+        .await
+        .expect("the session opens");
+    let draft: ProfileDraft = serde_json::from_value(serde_json::json!({
+        "name": "nouveau",
+        "endpoint": "203.0.113.10:51820",
+        "peer_public_key": "cHVibGlj",
+        "allowed_ips": "0.0.0.0/0",
+        "persistent_keepalive": 25,
+    }))
+    .expect("a minimal draft deserialises");
+
+    let Err(error) = client.call(EngineCommand::SaveProfile { draft }).await else {
+        panic!("the save was accepted on a vault that cannot write");
+    };
+    assert!(
+        error.contains("danger_allow_unencrypted_volume"),
+        "unexpected refusal: {error}"
+    );
+    let config = service.config.lock().await;
+    assert_eq!(config.profiles.len(), 1);
+    assert_eq!(config.selected.as_deref(), Some("bureau"));
+}
+
+#[tokio::test]
+async fn select_profile_of_an_unknown_name_is_refused() {
+    let scratch = Scratch::new("select-unknown");
+    let service = service_with_selected_profile(&scratch);
+    let (client, _events) = crate::client::in_process(Arc::clone(&service))
+        .await
+        .expect("the session opens");
+
+    assert_eq!(
+        client
+            .call(EngineCommand::SelectProfile {
+                name: "absent".into(),
+            })
+            .await
+            .err()
+            .as_deref(),
+        Some("profil « absent » introuvable")
+    );
+    assert_eq!(
+        service.config.lock().await.selected.as_deref(),
+        Some("bureau")
+    );
+}
+
+#[tokio::test]
+async fn delete_profile_of_an_unknown_name() {
+    let scratch = Scratch::new("delete-unknown");
+    let service = service_with_selected_profile(&scratch);
+    let (client, _events) = crate::client::in_process(Arc::clone(&service))
+        .await
+        .expect("the session opens");
+
+    let outcome = client
+        .call(EngineCommand::DeleteProfile {
+            name: "absent".into(),
+        })
+        .await;
+    // Off Windows the vault has no root: the store refuses before it looks the
+    // name up, so the refusal does not name the profile.
+    assert_eq!(
+        outcome.err().as_deref(),
+        Some(
+            "aucune racine matérielle sur ce poste : Orion refuse de conserver ses secrets sans stockage protégé. Le contournement explicite est `danger_allow_software_keystore`"
+        )
+    );
+    assert_eq!(service.config.lock().await.profiles.len(), 1);
 }

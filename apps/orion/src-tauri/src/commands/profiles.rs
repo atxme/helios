@@ -3,7 +3,6 @@
 
 use super::*;
 use orion_core::{read_profile_document, ProfileIssues};
-use orion_engine::service::{merge_draft, profile_edit_base, StagedKey, StagedPsk};
 use orion_engine::{
     ConfigView, EngineCommand, EngineReply, ImportOutcome, ProfileDraft, SecretInput,
 };
@@ -129,18 +128,10 @@ pub(crate) async fn allow_unencrypted_volume(
 /// comes into existence when the form is submitted.
 #[tauri::command]
 pub(crate) async fn generate_private_key(state: State<'_, AppState>) -> Result<String, String> {
-    let pair = aether::wg::generate_keypair()
-        .map_err(|error| format!("génération de la paire de clés : {error}"))?;
-    let aether::wg::Keypair {
-        private_key,
-        public_key,
-    } = pair;
-    let returned_public_key = public_key.clone();
-    *state.engine.staged_key.lock().await = Some(StagedKey {
-        private_key,
-        public_key,
-    });
-    Ok(returned_public_key)
+    match state.client.call(EngineCommand::GeneratePrivateKey).await? {
+        EngineReply::PublicKey(value) => Ok(value),
+        _ => Err(unexpected_engine_reply()),
+    }
 }
 
 /// Adopts a private key the user supplies, and returns its public half.
@@ -167,31 +158,25 @@ pub(crate) async fn adopt_private_key(
     state: State<'_, AppState>,
     private_key: String,
 ) -> Result<String, String> {
-    // Take ownership of the IPC buffer in a zeroizing container immediately.
-    // Normalization necessarily creates a second buffer to preserve the prior
-    // trimmed-storage behavior; the original is then dropped through
-    // SecretString as soon as this binding is replaced.
-    let private_key = SecretString::new(private_key);
-    let normalized = SecretString::new(private_key.expose().trim().to_owned());
-    let public_key = aether::wg::public_from_private(normalized.expose()).map_err(|_| {
-        "clé privée invalide : une clé WireGuard est 32 octets encodés en base64 \
-         (44 caractères finissant par « = »)"
-            .to_string()
-    })?;
-    *state.engine.staged_key.lock().await = Some(StagedKey {
-        private_key: normalized,
-        public_key: public_key.clone(),
-    });
-    Ok(public_key)
+    // Zeroizing from the first instruction: the engine receives it as a secret.
+    let private_key = SecretInput::from(private_key);
+    match state
+        .client
+        .call(EngineCommand::AdoptPrivateKey { private_key })
+        .await?
+    {
+        EngineReply::PublicKey(value) => Ok(value),
+        _ => Err(unexpected_engine_reply()),
+    }
 }
 
 /// Drops the staged key without saving it.
 #[tauri::command]
 pub(crate) async fn discard_staged_key(state: State<'_, AppState>) -> Result<(), String> {
-    // `Drop` zeroizes it: cancelling must not leave the key in memory for the
-    // rest of the session.
-    state.engine.staged_key.lock().await.take();
-    Ok(())
+    match state.client.call(EngineCommand::DiscardStagedKey).await? {
+        EngineReply::Unit => Ok(()),
+        _ => Err(unexpected_engine_reply()),
+    }
 }
 
 /// Holds a static PSK the user supplies, until the profile is saved.
@@ -210,22 +195,24 @@ pub(crate) async fn adopt_preshared_key(
     state: State<'_, AppState>,
     preshared_key: String,
 ) -> Result<(), String> {
-    let preshared_key = SecretString::new(preshared_key);
-    let value = SecretString::new(preshared_key.expose().trim().to_owned());
-    aether::wg::validate_key(value.expose()).map_err(|_| {
-        "PSK invalide : un PSK WireGuard est 32 octets encodés en base64 \
-         (44 caractères finissant par « = »), tel que le produit `wg genpsk`"
-            .to_string()
-    })?;
-    *state.engine.staged_psk.lock().await = Some(StagedPsk { value });
-    Ok(())
+    let preshared_key = SecretInput::from(preshared_key);
+    match state
+        .client
+        .call(EngineCommand::AdoptPresharedKey { preshared_key })
+        .await?
+    {
+        EngineReply::Unit => Ok(()),
+        _ => Err(unexpected_engine_reply()),
+    }
 }
 
 /// Drops the staged PSK without saving it.
 #[tauri::command]
 pub(crate) async fn discard_staged_psk(state: State<'_, AppState>) -> Result<(), String> {
-    state.engine.staged_psk.lock().await.take();
-    Ok(())
+    match state.client.call(EngineCommand::DiscardStagedPsk).await? {
+        EngineReply::Unit => Ok(()),
+        _ => Err(unexpected_engine_reply()),
+    }
 }
 
 /// Opens a terminal connected to the gateway, **below** Orion's privileges.
@@ -323,68 +310,16 @@ pub(crate) async fn save_profile(
     state: State<'_, AppState>,
     draft: ProfileDraft,
 ) -> Result<ConfigView, String> {
-    let mut cfg = state.engine.config.lock().await;
-    require_protected_volume(&state)?;
-    // A pending import wins over the stored profile of the same name. An
-    // imported document may carry a *new* WireGuard private key together
-    // with a newly sealed key-negotiation identity. Keeping the old profile
-    // here would pair those two identities from different admissions: the
-    // gateway accepts the TLS certificate, then rejects the request because
-    // its WireGuard key is the old one. Ordinary edits never have a pending
-    // import, so they still use the stored profile and preserve its secrets.
-    let pending = state
-        .engine
-        .pending_imports
-        .lock()
-        .await
-        .remove(&draft.name);
-    let known = cfg.find(&draft.name);
-    let stored = profile_edit_base(pending.as_ref(), known);
-    // Taken, not peeked: the key is now the profile's, and leaving a copy in
-    // the slot would let the next profile saved adopt it too.
-    let staged = state.engine.staged_key.lock().await.take();
-    let staged_psk = state.engine.staged_psk.lock().await.take();
-    let profile = merge_draft(draft, stored, staged.as_ref(), staged_psk.as_ref())?;
-    if let Some(known) = known {
-        profile
-            .check_replacement_of(known)
-            .map_err(|error| error.to_string())?;
-    }
-    let selected = profile.name.clone();
-    state
-        .engine
-        .store
-        .save_profile(&profile)
-        .map_err(|e| e.to_string())?;
-    if let Some(block) = &profile.key_negotiation {
-        settle_saved_enrollment(&block.identity);
-    }
-    cfg.upsert(profile).map_err(|error| error.to_string())?;
-    cfg.selected = Some(selected.clone());
-    state
-        .engine
-        .store
-        .select(&selected)
-        .map_err(|e| e.to_string())?;
-    let view = ConfigView::from(&*cfg);
-    // Released before the menu is rebuilt: the rebuild reads the same lock,
-    // and holding it here would have it wait on the very command it follows.
-    drop(cfg);
+    let view = match state
+        .client
+        .call(EngineCommand::SaveProfile { draft })
+        .await?
+    {
+        EngineReply::Config(value) => value,
+        _ => return Err(unexpected_engine_reply()),
+    };
     tray::refresh(&app);
     Ok(view)
-}
-
-/// Destroys the pending enrollment record once its profile is saved.
-///
-/// The profile is already persisted when this runs, so a failure is not a
-/// failed save: the record left behind holds sealed keys the user can still
-/// discard from the enrollment list.
-fn settle_saved_enrollment(identity: &str) {
-    if let Err(error) = ProtectedIdentityStore::for_current_user()
-        .and_then(|store| orion_core::enrollment::settle_enrollment(&store, identity))
-    {
-        tracing::warn!(error = %format!("{error:#}"), "pending enrollment record kept after save");
-    }
 }
 
 /// Removes a profile, unmounting its tunnel first if that tunnel is the one up.
@@ -401,22 +336,14 @@ pub(crate) async fn delete_profile(
     state: State<'_, AppState>,
     name: String,
 ) -> Result<ConfigView, String> {
-    // Before the configuration lock, not after: the disconnection is a network
-    // round trip, and `stop_connection` rebuilds nothing that needs the config
-    // — but holding a lock across it would stall every other command for the
-    // two seconds the release is allowed.
-    if state.engine.controller.mounted_profile().await.as_deref() == Some(name.as_str()) {
-        stop_connection(&app).await?;
-    }
-    let mut cfg = state.engine.config.lock().await;
-    state
-        .engine
-        .store
-        .remove_profile(&name)
-        .map_err(|e| e.to_string())?;
-    cfg.remove(&name);
-    let view = ConfigView::from(&*cfg);
-    drop(cfg);
+    let view = match state
+        .client
+        .call(EngineCommand::DeleteProfile { name })
+        .await?
+    {
+        EngineReply::Config(value) => value,
+        _ => return Err(unexpected_engine_reply()),
+    };
     tray::refresh(&app);
     Ok(view)
 }
@@ -427,32 +354,16 @@ pub(crate) async fn select_profile(
     state: State<'_, AppState>,
     name: String,
 ) -> Result<ConfigView, String> {
-    let mut cfg = state.engine.config.lock().await;
-    state
-        .engine
-        .store
-        .select(&name)
-        .map_err(|e| e.to_string())?;
-    cfg.selected = Some(name);
-    let view = ConfigView::from(&*cfg);
-    drop(cfg);
+    let view = match state
+        .client
+        .call(EngineCommand::SelectProfile { name })
+        .await?
+    {
+        EngineReply::Config(value) => value,
+        _ => return Err(unexpected_engine_reply()),
+    };
     tray::refresh(&app);
     Ok(view)
-}
-
-/// Refuses to write a secret onto a volume nothing encrypts (ADR-006 §3).
-///
-/// `Indeterminate` refuses just like `Unprotected`: a posture we cannot
-/// establish is a posture we cannot promise, and the failure mode of guessing
-/// "probably fine" is a user believing their disk is protected when it is not.
-fn require_protected_volume(state: &State<'_, AppState>) -> Result<(), String> {
-    state.engine.store.may_write_secrets().map_err(|error| {
-        format!(
-            "{error} `danger_allow_unencrypted_volume = true` dans settings.toml l'autorise \
-             explicitement, en retirant la couverture des anciens blocs disque et du fichier \
-             d'hibernation."
-        )
-    })
 }
 
 /// Reports the faulty fields of a profile being edited.
