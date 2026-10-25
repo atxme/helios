@@ -81,6 +81,24 @@ impl KeyScope {
     }
 }
 
+/// The scope the engine uses, given the interactive user's SID when there is one.
+///
+/// A known SID selects that user's machine key. Without one, which happens only
+/// outside the engine, the user scope is the only one available.
+pub fn key_scope_for(user_sid: Option<&str>) -> KeyScope {
+    match user_sid {
+        Some(sid) => KeyScope::Machine(sid.to_string()),
+        None => KeyScope::User,
+    }
+}
+
+/// Whether the access list of the key is read and enforced for `scope`.
+///
+/// Every machine key is; the user-scope key never is.
+pub fn access_is_checked(scope: &KeyScope) -> bool {
+    matches!(scope, KeyScope::Machine(_))
+}
+
 /// What the access list of the key admits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyAccess {
@@ -200,8 +218,10 @@ fn validate_key_properties(
         }
     }
     // Observed, never refused — see `KeyOwnership`. The owner of a descriptor is
-    // not the list of principals allowed to use the key.
-    if ownership != KeyOwnership::CurrentUser {
+    // not the list of principals allowed to use the key. The message is only
+    // true of the user scope, the one `NotChecked` stands for: there the
+    // container is the binding. A checked machine key is bound by its DACL.
+    if access == KeyAccess::NotChecked && ownership != KeyOwnership::CurrentUser {
         tracing::info!(
             ?ownership,
             "propriétaire du descripteur de la clé TPM non concluant ; la liaison au compte \
@@ -223,8 +243,10 @@ mod imp {
     // exactly that. The parent module is small, private and entirely dedicated
     // to this one, so the usual argument against a glob does not apply.
     use super::*;
-    use crate::protected_root::{access_of, admits_only_admins, LocalBlock};
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, NTE_NOT_SUPPORTED};
+    use crate::protected_root::{
+        access_of, admits_only_admins, LocalBlock, ADMINISTRATORS, SYSTEM,
+    };
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, NTE_BAD_KEYSET, NTE_NOT_SUPPORTED};
     use windows_sys::Win32::Security::Authorization::{
         ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
     };
@@ -361,9 +383,10 @@ mod imp {
         };
 
         let ownership = ownership_of(key);
-        let access = match scope {
-            KeyScope::User => KeyAccess::NotChecked,
-            KeyScope::Machine(_) => access_of_key(key),
+        let access = if access_is_checked(scope) {
+            access_of_key(key)
+        } else {
+            KeyAccess::NotChecked
         };
         // The four answers, as the provider actually gave them. Three failed
         // starts were spent guessing which one was refusing.
@@ -462,12 +485,13 @@ mod imp {
         if status != 0 || needed == 0 {
             return KeyOwnership::Unverifiable;
         }
-        let mut descriptor = vec![0u8; needed as usize];
+        // Eight-byte units, for the same alignment reason as `access_of_key`.
+        let mut descriptor = vec![0u64; (needed as usize).div_ceil(8)];
         let status = unsafe {
             NCryptGetProperty(
                 key as NCRYPT_HANDLE,
                 NCRYPT_SECURITY_DESCR_PROPERTY,
-                descriptor.as_mut_ptr(),
+                descriptor.as_mut_ptr().cast(),
                 needed,
                 &mut needed,
                 OWNER_SECURITY_INFORMATION,
@@ -530,20 +554,31 @@ mod imp {
             )
         };
         if status != 0 || needed == 0 {
+            tracing::warn!(
+                status = format_args!("{status:#010x}"),
+                needed,
+                "lecture de la taille du descripteur de la clé TPM refusée"
+            );
             return KeyAccess::Unreadable;
         }
-        let mut descriptor = vec![0u8; needed as usize];
+        // Eight-byte units: the entries are read through `ACE_HEADER` and the
+        // SID pointers, which a byte buffer does not align.
+        let mut descriptor = vec![0u64; (needed as usize).div_ceil(8)];
         let status = unsafe {
             NCryptGetProperty(
                 key as NCRYPT_HANDLE,
                 NCRYPT_SECURITY_DESCR_PROPERTY,
-                descriptor.as_mut_ptr(),
+                descriptor.as_mut_ptr().cast(),
                 needed,
                 &mut needed,
                 flags,
             )
         };
         if status != 0 {
+            tracing::warn!(
+                status = format_args!("{status:#010x}"),
+                "lecture du descripteur de la clé TPM refusée"
+            );
             return KeyAccess::Unreadable;
         }
         // SAFETY: `descriptor` holds the self-relative descriptor the provider
@@ -552,8 +587,25 @@ mod imp {
             Ok((owner, aces, protected)) if admits_only_admins(&owner, &aces, protected) => {
                 KeyAccess::AdminsOnly
             }
-            Ok(_) => KeyAccess::Wider,
-            Err(_) => KeyAccess::Unreadable,
+            Ok((owner, aces, protected)) => {
+                // Counts only: the SIDs of other accounts are not written down.
+                let other_allowed = aces
+                    .iter()
+                    .filter(|ace| ace.allow && ace.sid != ADMINISTRATORS && ace.sid != SYSTEM)
+                    .count();
+                tracing::warn!(
+                    owner = %owner,
+                    protected,
+                    entrees = aces.len(),
+                    autorisations_hors_administrateurs = other_allowed,
+                    "descripteur de la clé TPM : accès hors administrateurs"
+                );
+                KeyAccess::Wider
+            }
+            Err(error) => {
+                tracing::warn!(?error, "descripteur de la clé TPM illisible");
+                KeyAccess::Unreadable
+            }
         }
     }
 
@@ -612,8 +664,14 @@ mod imp {
                 container_flag(scope) | NCRYPT_SILENT_FLAG,
             )
         };
-        if status != 0 {
+        // Only "no such key" means absent. Any other status (an access refusal
+        // among them) is an error: reading it as absence would send `create` to
+        // overwrite a key that is there, and report a lost key to the person.
+        if status == NTE_BAD_KEYSET {
             return Ok(None);
+        }
+        if status != 0 {
+            return Err(fail("opening the TPM key", status));
         }
         let key = Handle(key);
         verify(provider.0, key.0, scope)?;
@@ -875,6 +933,21 @@ mod property_tests {
         assert!(
             matches!(unreadable, VaultError::Tpm(message) if message.contains("cannot be read"))
         );
+    }
+
+    #[test]
+    fn a_known_user_sid_selects_the_machine_scope() {
+        assert_eq!(
+            key_scope_for(Some(USER)),
+            KeyScope::Machine(USER.to_string())
+        );
+        assert_eq!(key_scope_for(None), KeyScope::User);
+    }
+
+    #[test]
+    fn a_machine_key_is_always_acl_checked() {
+        assert!(access_is_checked(&KeyScope::Machine(USER.to_string())));
+        assert!(!access_is_checked(&KeyScope::User));
     }
 
     #[test]

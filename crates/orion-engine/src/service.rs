@@ -180,10 +180,9 @@ impl EngineService {
         // The interactive user's TPM key is a machine key, usable by
         // administrators and SYSTEM only. Without a SID (tests outside the
         // engine), the user scope is the only one available.
-        let key_scope = match &paths.user_sid {
-            Some(sid) => orion_core::vault::windows::tpm::KeyScope::Machine(sid.clone()),
-            None => orion_core::vault::windows::tpm::KeyScope::User,
-        };
+        let key_scope = orion_core::vault::windows::tpm::key_scope_for(paths.user_sid.as_deref());
+        // In degraded (software) mode no TPM key is used: the slot name written to
+        // the bootstrap is still informational, nothing reads it to pick a key.
         let key_slot = key_scope.key_name();
 
         let store = Arc::new(

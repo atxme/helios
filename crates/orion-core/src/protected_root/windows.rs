@@ -176,7 +176,7 @@ pub(crate) unsafe fn access_of(
         unsafe { GetSecurityDescriptorOwner(descriptor, &mut owner, &mut owner_defaulted) };
     if has_owner == 0 || owner.is_null() {
         return Err(RootError::Unavailable(
-            "propriétaire du dossier protégé illisible".to_string(),
+            "propriétaire du descripteur de sécurité illisible".to_string(),
         ));
     }
     let mut dacl_present = 0i32;
@@ -193,7 +193,7 @@ pub(crate) unsafe fn access_of(
     };
     if has_dacl == 0 {
         return Err(RootError::Unavailable(
-            "droits du dossier protégé illisibles".to_string(),
+            "droits du descripteur de sécurité illisibles".to_string(),
         ));
     }
     if dacl_present == 0 || dacl.is_null() {
@@ -207,7 +207,7 @@ pub(crate) unsafe fn access_of(
     let read = unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) };
     if read == 0 {
         return Err(RootError::Unavailable(format!(
-            "contrôle du dossier protégé illisible ({})",
+            "contrôle du descripteur de sécurité illisible ({})",
             io::Error::last_os_error()
         )));
     }
@@ -226,7 +226,7 @@ pub(crate) unsafe fn access_of(
     };
     if sized == 0 {
         return Err(RootError::Unavailable(format!(
-            "entrées du dossier protégé illisibles ({})",
+            "entrées du descripteur de sécurité illisibles ({})",
             io::Error::last_os_error()
         )));
     }
@@ -238,7 +238,7 @@ pub(crate) unsafe fn access_of(
         // valid out-pointer that points into the descriptor.
         if unsafe { GetAce(dacl, index, &mut entry) } == 0 {
             return Err(RootError::Unavailable(format!(
-                "entrée du dossier protégé illisible ({})",
+                "entrée du descripteur de sécurité illisible ({})",
                 io::Error::last_os_error()
             )));
         }

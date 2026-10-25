@@ -95,10 +95,11 @@ pub struct MigrationReport {
 pub struct ProfileStore {
     dir: std::path::PathBuf,
     provider: Box<dyn RootKeyProvider>,
+    /// Name of the TPM key in use, written to the bootstrap. Informational:
+    /// nothing reads it to choose a key.
+    key_slot: String,
     /// The operator waived the hardware requirement (ADR-006 §3).
     ///
-    /// Name of the TPM key in use, written to the bootstrap. Informational.
-    key_slot: String,
     /// Held here rather than inferred from `provider.hardware_backed()`,
     /// because the two answer different questions: the provider says whether
     /// hardware **is** backing the root, this says whether its absence was
