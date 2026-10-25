@@ -54,10 +54,10 @@ use crate::config::{ClientConfig, ClientProfile};
 /// Bootstrap format version. An unknown one is refused, never guessed.
 const BOOTSTRAP_VERSION: u32 = 1;
 
-const BOOTSTRAP_FILE: &str = "bootstrap.toml";
-const DEVICE_ROOT_FILE: &str = "device-root";
-const REGISTRY_FILE: &str = "registry.hvlt";
-const PROFILES_DIR: &str = "profiles";
+pub(crate) const BOOTSTRAP_FILE: &str = "bootstrap.toml";
+pub(crate) const DEVICE_ROOT_FILE: &str = "device-root";
+pub(crate) const REGISTRY_FILE: &str = "registry.hvlt";
+pub(crate) const PROFILES_DIR: &str = "profiles";
 /// The plaintext file this whole module exists to retire.
 pub const LEGACY_FILE: &str = "profiles.toml";
 
@@ -691,6 +691,41 @@ impl ProfileStore {
         );
         Ok(report)
     }
+}
+
+/// Rewrites the key slot of the bootstrap in `dir`, and nothing else.
+///
+/// A migration moves the root under another TPM key. Every other field of the
+/// bootstrap, the installation identifier above all, must come through
+/// unchanged. A bootstrap that does not exist yet is left absent: the store
+/// writes one on first use, naming the slot it was given.
+pub(crate) fn set_key_slot(dir: &std::path::Path, slot: &str) -> Result<(), VaultError> {
+    let path = dir.join(BOOTSTRAP_FILE);
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(VaultError::Io {
+                path,
+                cause: error.to_string(),
+            })
+        }
+    };
+    let mut bootstrap: Bootstrap = toml::from_str(&raw).map_err(|e| VaultError::Io {
+        path: path.clone(),
+        cause: e.to_string(),
+    })?;
+    bootstrap.key_slot = slot.to_string();
+    let encoded = toml::to_string_pretty(&bootstrap).map_err(|e| VaultError::Io {
+        path: path.clone(),
+        cause: e.to_string(),
+    })?;
+    aether::private_file::write_private_atomic(&path, encoded.as_bytes()).map_err(|e| {
+        VaultError::Io {
+            path,
+            cause: e.to_string(),
+        }
+    })
 }
 
 fn hex_to_bytes(hex: &str) -> Option<Vec<u8>> {

@@ -111,6 +111,14 @@ impl PlatformRootKeyProvider {
 
     fn create(&self) -> Result<DeviceRootKey, VaultError> {
         let root = DeviceRootKey::generate()?;
+        self.seal_existing(&root)?;
+        Ok(root)
+    }
+
+    /// Seals `root` under the layers of this provider and writes it to its
+    /// path. The one writer of the device root: [`Self::create`] calls it for a
+    /// fresh root, and the migration for a root that already exists.
+    pub fn seal_existing(&self, root: &DeviceRootKey) -> Result<(), VaultError> {
         let wrapped = if self.software_only {
             self.record(false);
             // `Zeroizing`: in the degraded mode this buffer *is* the root key in
@@ -138,8 +146,7 @@ impl PlatformRootKeyProvider {
                 path: self.path.clone(),
                 cause: e.to_string(),
             }
-        })?;
-        Ok(root)
+        })
     }
 
     fn open(&self) -> Result<DeviceRootKey, VaultError> {
@@ -197,6 +204,63 @@ impl RootKeyProvider for PlatformRootKeyProvider {
         // `ProfileStore::posture` therefore obtains the root before asking.
         !self.software_only
             && self.hardware.load(std::sync::atomic::Ordering::Relaxed) == HARDWARE_VERIFIED
+    }
+}
+
+/// The machine target of a migration: the device root is sealed under the
+/// machine key of the interactive user, and the copied identities are opened
+/// with the protected store.
+#[cfg(windows)]
+pub struct MachineTarget {
+    /// The machine key the root is wrapped under, named by the user's SID.
+    pub scope: tpm::KeyScope,
+    /// The `danger_allow_software_keystore` choice, carried over unchanged.
+    pub software_only: bool,
+}
+
+#[cfg(windows)]
+impl MachineTarget {
+    fn provider_for(&self, device_root_file: &std::path::Path) -> PlatformRootKeyProvider {
+        PlatformRootKeyProvider::new(device_root_file)
+            .with_scope(self.scope.clone())
+            .allowing_software_keystore(self.software_only)
+    }
+}
+
+#[cfg(windows)]
+impl super::relocation::RelocationTarget for MachineTarget {
+    fn seal_root(
+        &self,
+        root: &DeviceRootKey,
+        device_root_file: &std::path::Path,
+    ) -> Result<(), VaultError> {
+        self.provider_for(device_root_file).seal_existing(root)
+    }
+
+    fn provider(&self, device_root_file: &std::path::Path) -> Box<dyn RootKeyProvider> {
+        Box::new(self.provider_for(device_root_file))
+    }
+
+    fn key_slot(&self) -> String {
+        self.scope.key_name()
+    }
+
+    fn verify_identity(&self, file: &std::path::Path) -> Result<(), VaultError> {
+        let directory = file.parent().ok_or_else(|| VaultError::Io {
+            path: file.to_path_buf(),
+            cause: "identité sans dossier parent".into(),
+        })?;
+        let name = file
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .ok_or_else(|| VaultError::Io {
+                path: file.to_path_buf(),
+                cause: "nom d'identité illisible".into(),
+            })?;
+        crate::identity_store::ProtectedIdentityStore::at(directory.to_path_buf())
+            .open_named(name)
+            .map(|_| ())
+            .map_err(|error| VaultError::Relocation(format!("identité illisible : {error:#}")))
     }
 }
 

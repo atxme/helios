@@ -232,7 +232,7 @@ fn validate_key_properties(
 }
 
 #[cfg(windows)]
-pub use imp::{unwrap_root, wrap_root};
+pub use imp::{delete_key, unwrap_root, wrap_root};
 
 #[cfg(windows)]
 mod imp {
@@ -253,7 +253,7 @@ mod imp {
         ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
     };
     use windows_sys::Win32::Security::Cryptography::{
-        NCryptCreatePersistedKey, NCryptDecrypt, NCryptEncrypt, NCryptFinalizeKey,
+        NCryptCreatePersistedKey, NCryptDecrypt, NCryptDeleteKey, NCryptEncrypt, NCryptFinalizeKey,
         NCryptFreeObject, NCryptGetProperty, NCryptOpenKey, NCryptOpenStorageProvider,
         NCryptSetProperty, BCRYPT_OAEP_PADDING_INFO, BCRYPT_RSA_ALGORITHM, BCRYPT_SHA256_ALGORITHM,
         MS_PLATFORM_CRYPTO_PROVIDER, NCRYPT_ALLOW_EXPORT_FLAG, NCRYPT_EXPORT_POLICY_PROPERTY,
@@ -892,6 +892,37 @@ mod imp {
         let mut root = Zeroizing::new([0u8; KEY_LEN]);
         root.copy_from_slice(&plaintext[..KEY_LEN]);
         Ok(root)
+    }
+
+    /// Deletes the persisted key of `scope`. An absent key is success: the
+    /// migration removes the per-user key once, whether or not it was ever
+    /// created on this machine.
+    pub fn delete_key(scope: &KeyScope) -> Result<(), VaultError> {
+        let provider = open_provider()?;
+        let mut key = 0usize;
+        let name = wide(&scope.key_name());
+        let status = unsafe {
+            NCryptOpenKey(
+                provider.0,
+                &mut key,
+                name.as_ptr(),
+                0,
+                container_flag(scope) | NCRYPT_SILENT_FLAG,
+            )
+        };
+        if [NTE_BAD_KEYSET, NTE_NO_KEY, KEY_FILE_NOT_FOUND].contains(&status) {
+            return Ok(());
+        }
+        if status != 0 {
+            return Err(fail("opening the TPM key to delete it", status));
+        }
+        // No `Handle` guard here: NCryptDeleteKey releases the key handle
+        // whatever its outcome, so freeing it again would be a double free.
+        let status = unsafe { NCryptDeleteKey(key as NCRYPT_HANDLE, NCRYPT_SILENT_FLAG) };
+        if status != 0 {
+            return Err(fail("deleting the TPM key", status));
+        }
+        Ok(())
     }
 }
 

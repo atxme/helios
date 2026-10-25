@@ -34,6 +34,7 @@ pub mod keys;
 pub mod manifest;
 pub mod passphrase;
 pub mod registry;
+pub mod relocation;
 pub mod settings;
 pub mod store;
 pub mod windows;
@@ -277,6 +278,9 @@ pub enum VaultError {
     LocalSettings(String),
     #[error(transparent)]
     Container(aether_vault::VaultError),
+    /// A migration of the vault could not complete, or refused to start.
+    #[error("{0}")]
+    Relocation(String),
 }
 
 #[cfg(test)]
