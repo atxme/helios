@@ -447,9 +447,10 @@ pub enum IdentityStoreError {
 
 /// Per-user protected store, backed by a sealed file.
 ///
-/// The directory belongs to the user profile: DPAPI already binds the
-/// ciphertext to the account, so the file location adds convenience, not
-/// protection.
+/// Under Windows the directory sits in the protected root, whose access list
+/// (administrators and SYSTEM only) is the barrier against the other accounts
+/// of the machine. DPAPI also binds the ciphertext to the account that sealed
+/// it.
 pub struct ProtectedIdentityStore {
     directory: PathBuf,
 }
