@@ -424,17 +424,32 @@ impl Engine for EngineService {
             EngineCommand::DiscardPendingEnrollment { request_id } => self
                 .discard_pending_enrollment(&request_id)
                 .map(|()| EngineReply::Unit),
+            EngineCommand::CertificateInventory { key_negotiation } => Ok(
+                EngineReply::CertificateInventory(self.certificate_inventory(key_negotiation)),
+            ),
+            EngineCommand::CertificateOverview => self
+                .certificate_overview()
+                .await
+                .map(EngineReply::CertificateOverview),
+            EngineCommand::CertificateActions { key_negotiation } => Ok(
+                EngineReply::CertificateActions(self.certificate_actions(key_negotiation)),
+            ),
+            EngineCommand::RunCertificateAction { name, action } => self
+                .run_certificate_action(name, action)
+                .await
+                .map(EngineReply::ActionOutcome),
+            EngineCommand::ResumeCertificateRecovery { operation_id } => self
+                .resume_certificate_recovery(operation_id)
+                .await
+                .map(EngineReply::ActionOutcome),
+            EngineCommand::LastCertificateError { name } => Ok(EngineReply::LastError(
+                self.last_certificate_error(name).await,
+            )),
             // Served by the transport before it reaches the engine.
             EngineCommand::Shutdown => Ok(EngineReply::Unit),
-            EngineCommand::CertificateInventory { .. }
-            | EngineCommand::CertificateOverview
-            | EngineCommand::CertificateActions { .. }
-            | EngineCommand::RunCertificateAction { .. }
-            | EngineCommand::ResumeCertificateRecovery { .. }
-            | EngineCommand::CertificateApprovalManifest { .. }
+            EngineCommand::CertificateApprovalManifest { .. }
             | EngineCommand::ApproveCertificateRenewal { .. }
-            | EngineCommand::CertificateApprovalNeedsPin { .. }
-            | EngineCommand::LastCertificateError { .. } => Err(NOT_SERVED.into()),
+            | EngineCommand::CertificateApprovalNeedsPin { .. } => Err(NOT_SERVED.into()),
         }
     }
 

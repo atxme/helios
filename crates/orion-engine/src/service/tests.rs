@@ -116,12 +116,150 @@ async fn a_command_not_yet_served_is_refused() {
 
     assert_eq!(
         client
-            .call(EngineCommand::CertificateOverview)
+            .call(EngineCommand::CertificateApprovalNeedsPin {
+                name: "absent".into(),
+            })
             .await
             .err()
             .as_deref(),
         Some(NOT_SERVED)
     );
+}
+
+#[tokio::test]
+async fn a_certificate_action_on_an_unknown_profile_is_refused_and_recorded() {
+    let scratch = Scratch::new("certificate-action-unknown");
+    let service = EngineService::open(
+        paths_under(&scratch.0),
+        Arc::new(DryRunBackend::default()),
+        None,
+        "0.0.0-test",
+    )
+    .expect("the service opens on a fresh directory");
+    let (client, _events) = crate::client::in_process(service)
+        .await
+        .expect("the session opens");
+
+    let refusal = match client
+        .call(EngineCommand::RunCertificateAction {
+            name: "absent".into(),
+            action: orion_core::CertificateAction::RenewNow,
+        })
+        .await
+    {
+        Err(message) => message,
+        other => panic!("unexpected reply: {other:?}"),
+    };
+    assert_eq!(
+        refusal,
+        "Ce profil ne négocie pas de clé : il ne porte aucun certificat client à renouveler."
+    );
+
+    match client
+        .call(EngineCommand::LastCertificateError {
+            name: "absent".into(),
+        })
+        .await
+    {
+        Ok(EngineReply::LastError(recorded)) => assert_eq!(recorded, Some(refusal)),
+        other => panic!("unexpected reply: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn renewing_every_profile_without_a_helios_profile_is_refused() {
+    let scratch = Scratch::new("certificate-renew-every");
+    let service = EngineService::open(
+        paths_under(&scratch.0),
+        Arc::new(DryRunBackend::default()),
+        None,
+        "0.0.0-test",
+    )
+    .expect("the service opens on a fresh directory");
+    let (client, _events) = crate::client::in_process(service)
+        .await
+        .expect("the session opens");
+
+    match client
+        .call(EngineCommand::RunCertificateAction {
+            name: String::new(),
+            action: orion_core::CertificateAction::RenewEveryProfile,
+        })
+        .await
+    {
+        Err(message) => assert_eq!(message, "aucun profil Helios sur cet appareil"),
+        other => panic!("unexpected reply: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn an_unreadable_recovery_id_is_refused() {
+    let scratch = Scratch::new("certificate-recovery-id");
+    let service = EngineService::open(
+        paths_under(&scratch.0),
+        Arc::new(DryRunBackend::default()),
+        None,
+        "0.0.0-test",
+    )
+    .expect("the service opens on a fresh directory");
+    let (client, _events) = crate::client::in_process(service)
+        .await
+        .expect("the session opens");
+
+    match client
+        .call(EngineCommand::ResumeCertificateRecovery {
+            operation_id: "xyz".into(),
+        })
+        .await
+    {
+        Err(message) => assert_eq!(message, "identifiant de récupération illisible"),
+        other => panic!("unexpected reply: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn the_overview_of_an_empty_configuration_is_empty() {
+    let scratch = Scratch::new("certificate-overview-empty");
+    let service = EngineService::open(
+        paths_under(&scratch.0),
+        Arc::new(DryRunBackend::default()),
+        None,
+        "0.0.0-test",
+    )
+    .expect("the service opens on a fresh directory");
+    let (client, _events) = crate::client::in_process(service)
+        .await
+        .expect("the session opens");
+
+    match client.call(EngineCommand::CertificateOverview).await {
+        Ok(EngineReply::CertificateOverview(overview)) => assert!(overview.is_empty()),
+        other => panic!("unexpected reply: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn last_certificate_error_of_an_unknown_profile_is_none() {
+    let scratch = Scratch::new("certificate-last-error-unknown");
+    let service = EngineService::open(
+        paths_under(&scratch.0),
+        Arc::new(DryRunBackend::default()),
+        None,
+        "0.0.0-test",
+    )
+    .expect("the service opens on a fresh directory");
+    let (client, _events) = crate::client::in_process(service)
+        .await
+        .expect("the session opens");
+
+    match client
+        .call(EngineCommand::LastCertificateError {
+            name: "absent".into(),
+        })
+        .await
+    {
+        Ok(EngineReply::LastError(recorded)) => assert_eq!(recorded, None),
+        other => panic!("unexpected reply: {other:?}"),
+    }
 }
 
 #[tokio::test]
