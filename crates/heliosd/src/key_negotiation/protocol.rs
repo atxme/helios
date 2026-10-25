@@ -240,6 +240,30 @@ impl NegotiationHandler for GatewayHandler {
                 );
                 return Err(PublicError::Rejected);
             }
+            // `prepare` reserves one generation and its eventual commit or
+            // rollback consumes another. Refuse before reserving the peer or
+            // recording the replay identifier if both transitions cannot be
+            // represented.
+            let Some(reserved_generation) = state
+                .slot(&request.client_wg_public_key)
+                .generation
+                .checked_add(1)
+            else {
+                tracing::error!(
+                    %transaction,
+                    peer = %peer_key,
+                    "key negotiation refused: peer generation is exhausted"
+                );
+                return Err(PublicError::Internal);
+            };
+            if reserved_generation.checked_add(1).is_none() {
+                tracing::error!(
+                    %transaction,
+                    peer = %peer_key,
+                    "key negotiation refused: peer generation has no terminal transition available"
+                );
+                return Err(PublicError::Internal);
+            }
             if !state.peers.insert(request.client_wg_public_key.clone()) {
                 // The case that leaves a client stuck without either end
                 // saying so: a previous session died without closing, its
@@ -299,7 +323,7 @@ impl NegotiationHandler for GatewayHandler {
             // left a window in which those actors still matched: they cleared
             // the data plane under a candidate that then committed.
             let slot = state.slot(&request.client_wg_public_key);
-            slot.generation += 1;
+            slot.generation = reserved_generation;
             slot.resting_until = None;
             let previous_state = std::mem::replace(&mut slot.state, SlotState::Empty);
             slot.state = SlotState::Preparing {
@@ -535,6 +559,14 @@ impl NegotiationHandler for GatewayHandler {
                 );
                 return Err(PublicError::Rejected);
             }
+            if slot.generation.checked_add(1).is_none() {
+                tracing::error!(
+                    transaction = %hex_prefix(&transaction_id),
+                    peer = %public_key,
+                    "confirmation refused: peer generation is exhausted"
+                );
+                return Err(PublicError::Internal);
+            }
         }
 
         self.raise_security_floor(&public_key, mode).await?;
@@ -554,20 +586,32 @@ impl NegotiationHandler for GatewayHandler {
         // candidate, only for this transaction's tail to overwrite the slot
         // record with its own — describing a PSK the data plane no longer
         // carried.
-        let transaction = {
+        let (transaction, committed_generation) = {
             let mut state = self.transactions.lock().await;
             // Checked again at the point of no return: a removal between the
             // check above and this lock must not end in a signed commit.
             self.settle_admission(&mut state, &public_key).await;
+            if !state.active.contains_key(&transaction_id) {
+                return Err(PublicError::Internal);
+            }
+            let slot = state.slot(&public_key);
+            if slot.generation != generation {
+                return Err(PublicError::Internal);
+            }
+            let Some(next_generation) = slot.generation.checked_add(1) else {
+                tracing::error!(
+                    transaction = %hex_prefix(&transaction_id),
+                    peer = %public_key,
+                    "confirmation refused: peer generation is exhausted"
+                );
+                return Err(PublicError::Internal);
+            };
             let transaction = state
                 .active
                 .remove(&transaction_id)
                 .ok_or(PublicError::Internal)?;
             state.peers.remove(&transaction.public_key);
             let slot = state.slot(&transaction.public_key);
-            if slot.generation != generation {
-                return Err(PublicError::Internal);
-            }
             // Two committed states, because the two modes leave two different
             // things in the slot. `ml_kem` leaves a fresh secret this
             // transaction owns, expires and may release. `static_psk` leaves
@@ -584,14 +628,14 @@ impl NegotiationHandler for GatewayHandler {
                     bytes_baseline: None,
                 }),
             };
-            slot.generation += 1;
-            transaction
+            slot.generation = next_generation;
+            (transaction, next_generation)
         };
         tracing::info!(
             transaction = %hex_prefix(&transaction_id),
             peer = %transaction.public_key,
             mode = ?mode,
-            generation = generation + 1,
+            generation = committed_generation,
             "key negotiation committed: the floor is persisted and the slot is final"
         );
         Ok(commit)

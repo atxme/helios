@@ -510,6 +510,14 @@ impl GatewayHandler {
                     return;
                 }
             };
+        let Some(next_generation) = state.slot(public_key).generation.checked_add(1) else {
+            tracing::error!(
+                transaction = %hex_prefix(&transaction_id),
+                peer = %public_key,
+                "key-negotiation rollback refused: peer generation is exhausted; peer remains fail-closed"
+            );
+            return;
+        };
         if let Err(error) = self
             .install(public_key.to_string(), address, previous_psk)
             .await
@@ -525,7 +533,7 @@ impl GatewayHandler {
         state.peers.remove(public_key);
         let slot = state.slot(public_key);
         slot.state = previous;
-        slot.generation += 1;
+        slot.generation = next_generation;
         // Read from the slot, never from the presence of a transaction
         // record. A destroyed rollback may be retried, and the slot is the
         // ownership record that outlives every attempt to undo it.
@@ -622,10 +630,18 @@ impl GatewayHandler {
             }
             _ => return Ok(false),
         };
+        let Some(next_generation) = state.slot(public_key).generation.checked_add(1) else {
+            tracing::error!(
+                transaction = %hex_prefix(&transaction_id),
+                peer = %public_key,
+                "PSK release refused: peer generation is exhausted"
+            );
+            return Err(PublicError::Internal);
+        };
         self.install(public_key.to_string(), address, None).await?;
         let slot = state.slot(public_key);
         slot.state = SlotState::Empty;
-        slot.generation += 1;
+        slot.generation = next_generation;
         Ok(true)
     }
 
@@ -681,10 +697,17 @@ impl GatewayHandler {
             // Revocation already took the peer off the data plane.
             SlotState::Revoked => return Ok(()),
         };
+        let Some(next_generation) = slot.generation.checked_add(1) else {
+            tracing::error!(
+                peer = %public_key,
+                "peer slot clear refused: peer generation is exhausted"
+            );
+            return Err(PublicError::Internal);
+        };
         self.install(public_key.to_string(), address, None).await?;
         let slot = state.slot(public_key);
         slot.state = SlotState::Empty;
-        slot.generation += 1;
+        slot.generation = next_generation;
         Ok(())
     }
 
