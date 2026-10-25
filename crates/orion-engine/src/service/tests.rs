@@ -116,11 +116,87 @@ async fn a_command_not_yet_served_is_refused() {
 
     assert_eq!(
         client
-            .call(EngineCommand::ListPendingEnrollments)
+            .call(EngineCommand::CertificateOverview)
             .await
             .err()
             .as_deref(),
         Some(NOT_SERVED)
+    );
+}
+
+#[tokio::test]
+async fn a_malformed_invitation_is_refused() {
+    let scratch = Scratch::new("malformed-invitation");
+    let service = EngineService::open(
+        paths_under(&scratch.0),
+        Arc::new(DryRunBackend::default()),
+        None,
+        "0.0.0-test",
+    )
+    .expect("the service opens on a fresh directory");
+    let (client, _events) = crate::client::in_process(service)
+        .await
+        .expect("the session opens");
+
+    let reply = client
+        .call(EngineCommand::PreviewEnrollmentInvitation {
+            contents: "pas une invitation".into(),
+        })
+        .await;
+    let Err(message) = reply else {
+        panic!("a malformed invitation is refused");
+    };
+    assert_eq!(
+        message,
+        "invitation d'enrôlement illisible : malformed enrollment object: not an enrollment invitation"
+    );
+}
+
+#[tokio::test]
+async fn a_malformed_request_id_is_refused() {
+    let scratch = Scratch::new("malformed-request-id");
+    let service = EngineService::open(
+        paths_under(&scratch.0),
+        Arc::new(DryRunBackend::default()),
+        None,
+        "0.0.0-test",
+    )
+    .expect("the service opens on a fresh directory");
+    let (client, _events) = crate::client::in_process(service)
+        .await
+        .expect("the session opens");
+
+    let reply = client
+        .call(EngineCommand::ExportPendingRequest {
+            request_id: "xyz".into(),
+        })
+        .await;
+    assert_eq!(
+        reply.err().as_deref(),
+        Some("identifiant de demande : 32 caractères hexadécimaux attendus")
+    );
+}
+
+#[tokio::test]
+async fn pending_enrollments_answer_through_the_client() {
+    let scratch = Scratch::new("pending-enrollments");
+    let service = EngineService::open(
+        paths_under(&scratch.0),
+        Arc::new(DryRunBackend::default()),
+        None,
+        "0.0.0-test",
+    )
+    .expect("the service opens on a fresh directory");
+    let (client, _events) = crate::client::in_process(service)
+        .await
+        .expect("the session opens");
+
+    let reply = client.call(EngineCommand::ListPendingEnrollments).await;
+    // The protected store of this host decides the answer; the list's contents
+    // are not pinned, only the variant the engine returns.
+    assert!(
+        matches!(reply, Ok(EngineReply::PendingEnrollments(_))),
+        "reply: {reply:?}"
     );
 }
 

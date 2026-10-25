@@ -23,6 +23,7 @@ use crate::serve::Engine;
 mod app;
 pub mod certificates;
 mod connection;
+pub mod enrollment;
 mod profiles;
 pub use app::PROFILE_EXTENSION;
 
@@ -404,14 +405,28 @@ impl Engine for EngineService {
             EngineCommand::SelectProfile { name } => {
                 self.select_profile(name).await.map(EngineReply::Config)
             }
+            EngineCommand::PreviewEnrollmentInvitation { contents } => self
+                .preview_enrollment_invitation(&contents)
+                .map(EngineReply::InvitationPreview),
+            EngineCommand::BeginEnrollment {
+                invitation,
+                confirmed_ca_fingerprint,
+                requested_name,
+            } => self
+                .begin_enrollment(&invitation, &confirmed_ca_fingerprint, &requested_name)
+                .map(EngineReply::EnrollmentStarted),
+            EngineCommand::ListPendingEnrollments => self
+                .list_pending_enrollments()
+                .map(EngineReply::PendingEnrollments),
+            EngineCommand::ExportPendingRequest { request_id } => self
+                .export_pending_request(&request_id)
+                .map(EngineReply::RequestFile),
+            EngineCommand::DiscardPendingEnrollment { request_id } => self
+                .discard_pending_enrollment(&request_id)
+                .map(|()| EngineReply::Unit),
             // Served by the transport before it reaches the engine.
             EngineCommand::Shutdown => Ok(EngineReply::Unit),
-            EngineCommand::PreviewEnrollmentInvitation { .. }
-            | EngineCommand::BeginEnrollment { .. }
-            | EngineCommand::ListPendingEnrollments
-            | EngineCommand::ExportPendingRequest { .. }
-            | EngineCommand::DiscardPendingEnrollment { .. }
-            | EngineCommand::CertificateInventory { .. }
+            EngineCommand::CertificateInventory { .. }
             | EngineCommand::CertificateOverview
             | EngineCommand::CertificateActions { .. }
             | EngineCommand::RunCertificateAction { .. }

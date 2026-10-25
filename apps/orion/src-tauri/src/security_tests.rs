@@ -514,7 +514,8 @@ fn enrollment_commands_never_return_private_material() {
     .sign(&ca_private)
     .expect("signed");
     let token = encode_invitation_file(&invitation);
-    let preview = super::invitation_preview_view(token.as_bytes(), now).expect("preview");
+    let preview = orion_engine::service::enrollment::invitation_preview_view(token.as_bytes(), now)
+        .expect("preview");
     assert_eq!(preview.invitation_token, token);
 
     let pending = orion_core::enrollment::PendingEnrollment {
