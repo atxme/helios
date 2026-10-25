@@ -2,6 +2,7 @@
 //! volume, the SSH terminal, and validation.
 
 use super::*;
+use orion_engine::service::{StagedKey, StagedPsk};
 use orion_engine::{ConfigView, ImportOutcome, ProfileDraft, ProfileView};
 
 /// Merges a saved draft onto what is stored, keeping every secret in Rust.
@@ -103,7 +104,7 @@ pub(crate) fn profile_edit_base<'a>(
 
 #[tauri::command]
 pub(crate) async fn get_config(state: State<'_, AppState>) -> Result<ConfigView, String> {
-    Ok(ConfigView::from(&*state.config.lock().await))
+    Ok(ConfigView::from(&*state.engine.config.lock().await))
 }
 
 /// Completes a signed v5 document against the pending enrollment it answers.
@@ -191,7 +192,7 @@ async fn finish_import(
         return Ok(stage_import(state, completed, identity_sealed).await);
     }
     let mut completed = {
-        let config = state.config.lock().await;
+        let config = state.engine.config.lock().await;
         complete_profile_import(imported.profile, &config, imported.notices)
             .map_err(|error| error.to_string())?
     };
@@ -204,7 +205,7 @@ async fn finish_import(
     // completes. The staged key is the one the user just obtained for this
     // very purpose, so adopting it is what they meant.
     if completed.profile.private_key.is_empty() {
-        if let Some(staged) = state.staged_key.lock().await.take() {
+        if let Some(staged) = state.engine.staged_key.lock().await.take() {
             // Transfer an explicit zeroizing copy into the completed import;
             // `staged` is dropped immediately afterwards.
             completed.profile.private_key = staged.private_key.duplicate();
@@ -216,7 +217,7 @@ async fn finish_import(
     // is empty because nothing was read, not because nothing matches. Blaming
     // the document here sends the user to look for a key they may well have.
     if completed.private_key_missing.is_some() {
-        if let Some(cause) = &state.vault_error {
+        if let Some(cause) = &state.engine.vault_error {
             completed.private_key_missing = Some(format!(
                 "le coffre de ce poste n'a pas pu être ouvert ({cause}), donc aucun profil \
                  enregistré n'a été lu : le document n'est pas en cause. Corriger l'accès au \
@@ -238,6 +239,7 @@ async fn stage_import(
     // into the WebView in the first place (ADR-006 §5).
     let view = ProfileView::from(&completed.profile);
     state
+        .engine
         .pending_imports
         .lock()
         .await
@@ -266,7 +268,7 @@ async fn stage_import(
 pub(crate) async fn vault_posture(
     state: State<'_, AppState>,
 ) -> Result<orion_core::vault::VaultPosture, String> {
-    Ok(state.store.posture())
+    Ok(state.engine.store.posture())
 }
 
 /// Persists the user's informed choice to keep profiles on a bare volume.
@@ -278,23 +280,25 @@ pub(crate) async fn vault_posture(
 pub(crate) async fn allow_unencrypted_volume(
     state: State<'_, AppState>,
 ) -> Result<orion_core::vault::VaultPosture, String> {
-    let posture = state.store.posture();
+    let posture = state.engine.store.posture();
     if posture.volume_protected || posture.unencrypted_volume_waived {
         return Ok(posture);
     }
     state
+        .engine
         .store
         .persist_unencrypted_volume_waiver()
         .map_err(|error| error.to_string())?;
     tracing::warn!(
         "CHIFFREMENT DE VOLUME NON EXIGÉ après confirmation dans Orion — les anciens blocs disque, le fichier d'échange et celui d'hibernation ne sont pas couverts"
     );
-    Ok(state.store.posture())
+    Ok(state.engine.store.posture())
 }
 
 /// Draws a WireGuard key pair and returns its **public** half.
 ///
-/// The private half stays in [`AppState::staged_key`] until the profile is
+/// The private half stays in
+/// [`orion_engine::service::EngineService::staged_key`] until the profile is
 /// saved. Returning the public key straight away is what makes the enrolment
 /// workflow possible at all: the user copies it, hands it to the operator, and
 /// receives an admitted profile — none of which can happen if the key only
@@ -308,7 +312,7 @@ pub(crate) async fn generate_private_key(state: State<'_, AppState>) -> Result<S
         public_key,
     } = pair;
     let returned_public_key = public_key.clone();
-    *state.staged_key.lock().await = Some(StagedKey {
+    *state.engine.staged_key.lock().await = Some(StagedKey {
         private_key,
         public_key,
     });
@@ -350,7 +354,7 @@ pub(crate) async fn adopt_private_key(
          (44 caractères finissant par « = »)"
             .to_string()
     })?;
-    *state.staged_key.lock().await = Some(StagedKey {
+    *state.engine.staged_key.lock().await = Some(StagedKey {
         private_key: normalized,
         public_key: public_key.clone(),
     });
@@ -362,7 +366,7 @@ pub(crate) async fn adopt_private_key(
 pub(crate) async fn discard_staged_key(state: State<'_, AppState>) -> Result<(), String> {
     // `Drop` zeroizes it: cancelling must not leave the key in memory for the
     // rest of the session.
-    state.staged_key.lock().await.take();
+    state.engine.staged_key.lock().await.take();
     Ok(())
 }
 
@@ -389,14 +393,14 @@ pub(crate) async fn adopt_preshared_key(
          (44 caractères finissant par « = »), tel que le produit `wg genpsk`"
             .to_string()
     })?;
-    *state.staged_psk.lock().await = Some(StagedPsk { value });
+    *state.engine.staged_psk.lock().await = Some(StagedPsk { value });
     Ok(())
 }
 
 /// Drops the staged PSK without saving it.
 #[tauri::command]
 pub(crate) async fn discard_staged_psk(state: State<'_, AppState>) -> Result<(), String> {
-    state.staged_psk.lock().await.take();
+    state.engine.staged_psk.lock().await.take();
     Ok(())
 }
 
@@ -415,7 +419,7 @@ async fn resolve_ssh_target(
     state: &State<'_, AppState>,
     name: Option<String>,
 ) -> Result<String, String> {
-    let cfg = state.config.lock().await;
+    let cfg = state.engine.config.lock().await;
     let profile = match &name {
         Some(name) => cfg.find(name),
         None => cfg.selected.as_deref().and_then(|s| cfg.find(s)),
@@ -434,7 +438,7 @@ async fn resolve_ssh_target(
     let target = target.trim().to_string();
     orion_core::profile_import::validate_ssh_target(&target).map_err(|error| error.to_string())?;
 
-    if state.controller.state() != TunnelState::Up {
+    if state.engine.controller.state() != TunnelState::Up {
         return Err(
             "le tunnel n'est pas monté : la gateway n'est joignable en SSH qu'à travers lui".into(),
         );
@@ -516,7 +520,7 @@ pub(crate) async fn save_profile(
     state: State<'_, AppState>,
     draft: ProfileDraft,
 ) -> Result<ConfigView, String> {
-    let mut cfg = state.config.lock().await;
+    let mut cfg = state.engine.config.lock().await;
     require_protected_volume(&state)?;
     // A pending import wins over the stored profile of the same name. An
     // imported document may carry a *new* WireGuard private key together
@@ -525,13 +529,18 @@ pub(crate) async fn save_profile(
     // gateway accepts the TLS certificate, then rejects the request because
     // its WireGuard key is the old one. Ordinary edits never have a pending
     // import, so they still use the stored profile and preserve its secrets.
-    let pending = state.pending_imports.lock().await.remove(&draft.name);
+    let pending = state
+        .engine
+        .pending_imports
+        .lock()
+        .await
+        .remove(&draft.name);
     let known = cfg.find(&draft.name);
     let stored = profile_edit_base(pending.as_ref(), known);
     // Taken, not peeked: the key is now the profile's, and leaving a copy in
     // the slot would let the next profile saved adopt it too.
-    let staged = state.staged_key.lock().await.take();
-    let staged_psk = state.staged_psk.lock().await.take();
+    let staged = state.engine.staged_key.lock().await.take();
+    let staged_psk = state.engine.staged_psk.lock().await.take();
     let profile = merge_draft(draft, stored, staged.as_ref(), staged_psk.as_ref())?;
     if let Some(known) = known {
         profile
@@ -540,6 +549,7 @@ pub(crate) async fn save_profile(
     }
     let selected = profile.name.clone();
     state
+        .engine
         .store
         .save_profile(&profile)
         .map_err(|e| e.to_string())?;
@@ -548,7 +558,11 @@ pub(crate) async fn save_profile(
     }
     cfg.upsert(profile).map_err(|error| error.to_string())?;
     cfg.selected = Some(selected.clone());
-    state.store.select(&selected).map_err(|e| e.to_string())?;
+    state
+        .engine
+        .store
+        .select(&selected)
+        .map_err(|e| e.to_string())?;
     let view = ConfigView::from(&*cfg);
     // Released before the menu is rebuilt: the rebuild reads the same lock,
     // and holding it here would have it wait on the very command it follows.
@@ -588,11 +602,12 @@ pub(crate) async fn delete_profile(
     // round trip, and `stop_connection` rebuilds nothing that needs the config
     // — but holding a lock across it would stall every other command for the
     // two seconds the release is allowed.
-    if state.controller.mounted_profile().await.as_deref() == Some(name.as_str()) {
+    if state.engine.controller.mounted_profile().await.as_deref() == Some(name.as_str()) {
         stop_connection(&app).await?;
     }
-    let mut cfg = state.config.lock().await;
+    let mut cfg = state.engine.config.lock().await;
     state
+        .engine
         .store
         .remove_profile(&name)
         .map_err(|e| e.to_string())?;
@@ -609,8 +624,12 @@ pub(crate) async fn select_profile(
     state: State<'_, AppState>,
     name: String,
 ) -> Result<ConfigView, String> {
-    let mut cfg = state.config.lock().await;
-    state.store.select(&name).map_err(|e| e.to_string())?;
+    let mut cfg = state.engine.config.lock().await;
+    state
+        .engine
+        .store
+        .select(&name)
+        .map_err(|e| e.to_string())?;
     cfg.selected = Some(name);
     let view = ConfigView::from(&*cfg);
     drop(cfg);
@@ -624,7 +643,7 @@ pub(crate) async fn select_profile(
 /// establish is a posture we cannot promise, and the failure mode of guessing
 /// "probably fine" is a user believing their disk is protected when it is not.
 fn require_protected_volume(state: &State<'_, AppState>) -> Result<(), String> {
-    state.store.may_write_secrets().map_err(|error| {
+    state.engine.store.may_write_secrets().map_err(|error| {
         format!(
             "{error} `danger_allow_unencrypted_volume = true` dans settings.toml l'autorise \
              explicitement, en retirant la couverture des anciens blocs disque et du fichier \
@@ -647,13 +666,14 @@ pub(crate) async fn validate_profile(
     // private key by construction, so inspecting it on its own would report
     // "clé privée requise" on every profile that has one — a red field the
     // user cannot clear, on a value they are not allowed to see.
-    let cfg = state.config.lock().await;
+    let cfg = state.engine.config.lock().await;
     // The pending import is the profile being edited, even when it replaces a
     // stored profile with the same name. Looking at the stored key here would
     // report a valid replacement as if its new negotiation identity belonged
     // to the old WireGuard key, then `save_profile` would persist that split.
     // Peeked, not removed: validation runs on every keystroke.
     let pending = state
+        .engine
         .pending_imports
         .lock()
         .await
@@ -663,8 +683,8 @@ pub(crate) async fn validate_profile(
     let stored = profile_edit_base(pending.as_ref(), known);
     // Validation runs on every keystroke: the staged secrets are read, never
     // taken.
-    let staged = state.staged_key.lock().await;
-    let staged_psk = state.staged_psk.lock().await;
+    let staged = state.engine.staged_key.lock().await;
+    let staged_psk = state.engine.staged_psk.lock().await;
     let profile = merge_draft(draft, stored, staged.as_ref(), staged_psk.as_ref())?;
     if let Some(known) = known {
         profile

@@ -2,6 +2,7 @@
 //! renewal and trust refresh, recovery, and the operator's approval.
 
 use super::*;
+use orion_engine::service::{InFlightRecovery, InFlightRenewal};
 use orion_engine::{ActionOutcome, ProfileCertificates, RenewalProgress};
 
 /// The four certificates a connection depends on, with their dates.
@@ -30,14 +31,14 @@ pub(crate) async fn certificate_overview(
     state: State<'_, AppState>,
 ) -> Result<Vec<ProfileCertificates>, String> {
     let profiles: Vec<(String, Option<orion_core::KeyNegotiationSettings>)> = {
-        let cfg = state.config.lock().await;
+        let cfg = state.engine.config.lock().await;
         cfg.profiles
             .iter()
             .map(|profile| (profile.name.clone(), profile.key_negotiation.clone()))
             .collect()
     };
-    let errors = state.last_certificate_error.lock().await.clone();
-    let identity_store = state.controller.key_negotiation_ready();
+    let errors = state.engine.last_certificate_error.lock().await.clone();
+    let identity_store = state.engine.controller.key_negotiation_ready();
     let protected_identities = orion_core::ProtectedIdentityStore::for_current_user().ok();
     let now = now_unix();
 
@@ -95,7 +96,7 @@ pub(crate) fn certificate_actions(
     orion_core::certificate_actions::action_states(
         key_negotiation.as_ref(),
         &inventory,
-        state.controller.key_negotiation_ready(),
+        state.engine.controller.key_negotiation_ready(),
     )
 }
 
@@ -141,8 +142,8 @@ pub(crate) fn spawn_trust_refresh(
     settings: orion_core::KeyNegotiationSettings,
     heliosd_url: String,
     sink: EventSink,
-) -> tauri::async_runtime::JoinHandle<()> {
-    tauri::async_runtime::spawn(async move {
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
         match orion_core::trust_update::refresh(&settings, &heliosd_url, now_unix()).await {
             Ok(orion_core::trust_update::TrustUpdateOutcome::UpToDate) => {
                 tracing::debug!("mise à jour de confiance : rien à récupérer");
@@ -177,15 +178,15 @@ pub(crate) fn spawn_trust_refresh(
 /// reconnect cancels this task and creates a new one from the current durable
 /// state, so no timer can act for a profile that is no longer mounted.
 pub(crate) fn spawn_automatic_certificate_renewal(
-    prerequisite: tauri::async_runtime::JoinHandle<()>,
+    prerequisite: tokio::task::JoinHandle<()>,
     controller: Arc<VpnController>,
     renewals: Arc<Mutex<std::collections::HashMap<String, InFlightRenewal>>>,
     profile_name: String,
     settings: orion_core::KeyNegotiationSettings,
     heliosd_url: String,
     sink: EventSink,
-) -> tauri::async_runtime::JoinHandle<()> {
-    tauri::async_runtime::spawn(async move {
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
         let _ = prerequisite.await;
         let now = now_unix();
         let inventory = orion_core::certificate_inventory::inventory(Some(&settings), now);
@@ -252,7 +253,7 @@ async fn run_for_one(
     action: orion_core::CertificateAction,
 ) -> Result<RenewalProgress, String> {
     let (settings, heliosd_url) = {
-        let cfg = state.config.lock().await;
+        let cfg = state.engine.config.lock().await;
         let profile = cfg.find(name);
         (
             profile.and_then(|profile| profile.key_negotiation.clone()),
@@ -264,7 +265,7 @@ async fn run_for_one(
         action,
         settings.as_ref(),
         &inventory,
-        state.controller.key_negotiation_ready(),
+        state.engine.controller.key_negotiation_ready(),
     ) {
         return Err(record_certificate_error(state, name, block.message()).await);
     }
@@ -292,7 +293,12 @@ async fn run_for_one(
     };
     match outcome {
         Ok(progress) => {
-            state.last_certificate_error.lock().await.remove(name);
+            state
+                .engine
+                .last_certificate_error
+                .lock()
+                .await
+                .remove(name);
             Ok(progress)
         }
         Err(message) => Err(record_certificate_error(state, name, message).await),
@@ -320,7 +326,7 @@ async fn run_for_one(
 /// shows it.
 async fn renew_every_profile(state: &State<'_, AppState>) -> Result<ActionOutcome, String> {
     let profiles: Vec<String> = {
-        let cfg = state.config.lock().await;
+        let cfg = state.engine.config.lock().await;
         cfg.profiles
             .iter()
             .filter(|profile| profile.negotiates())
@@ -359,7 +365,7 @@ pub(crate) async fn launch_certificate_companion(
     name: String,
 ) -> Result<(), String> {
     let invocation = {
-        let renewals = state.renewals.lock().await;
+        let renewals = state.engine.renewals.lock().await;
         let renewal = renewals
             .get(&name)
             .ok_or_else(|| format!("aucun renouvellement en attente pour le profil « {name} »"))?;
@@ -395,7 +401,7 @@ async fn drive_renewal(
             .to_string()
     })?;
 
-    drive_renewal_in_map(&state.renewals, name, settings, url).await
+    drive_renewal_in_map(&state.engine.renewals, name, settings, url).await
 }
 
 async fn drive_renewal_in_map(
@@ -463,7 +469,7 @@ async fn drive_recovery(
 ) -> Result<RenewalProgress, String> {
     let settings = settings.ok_or_else(|| "ce profil ne négocie pas de clé".to_string())?;
 
-    let mut recoveries = state.recoveries.lock().await;
+    let mut recoveries = state.engine.recoveries.lock().await;
     if let Some(in_flight) = recoveries.get(name) {
         let step = orion_core::certificate_recovery::resume(
             &in_flight.session,
@@ -522,7 +528,7 @@ pub(crate) async fn resume_certificate_recovery(
     let operation = aether::certificates::encoding::Id16::parse_hex(&operation_id)
         .map_err(|_| "identifiant de récupération illisible".to_string())?;
     let found = {
-        let recoveries = state.recoveries.lock().await;
+        let recoveries = state.engine.recoveries.lock().await;
         recoveries
             .iter()
             .find(|(_, recovery)| recovery.session.operation_id() == operation)
@@ -534,7 +540,12 @@ pub(crate) async fn resume_certificate_recovery(
 
     match drive_recovery(&state, &name, Some(settings)).await {
         Ok(progress) => {
-            state.last_certificate_error.lock().await.remove(&name);
+            state
+                .engine
+                .last_certificate_error
+                .lock()
+                .await
+                .remove(&name);
             Ok(ActionOutcome::of(&name, progress))
         }
         Err(message) => Err(record_certificate_error(&state, &name, message).await),
@@ -547,6 +558,7 @@ async fn record_certificate_error(
     message: String,
 ) -> String {
     state
+        .engine
         .last_certificate_error
         .lock()
         .await
@@ -565,7 +577,7 @@ pub(crate) async fn certificate_approval_manifest(
     state: State<'_, AppState>,
     name: String,
 ) -> Result<orion_core::certificate_approval::ApprovalManifest, String> {
-    let mut renewals = state.renewals.lock().await;
+    let mut renewals = state.engine.renewals.lock().await;
     let in_flight = renewals
         .get_mut(&name)
         .ok_or_else(|| "aucun renouvellement ouvert pour ce profil".to_string())?;
@@ -596,7 +608,7 @@ pub(crate) async fn approve_certificate_renewal(
     pin: Option<String>,
 ) -> Result<RenewalProgress, String> {
     let verified = {
-        let mut renewals = state.renewals.lock().await;
+        let mut renewals = state.engine.renewals.lock().await;
         let in_flight = renewals
             .get_mut(&name)
             .ok_or_else(|| "aucun renouvellement ouvert pour ce profil".to_string())?;
@@ -612,7 +624,7 @@ pub(crate) async fn approve_certificate_renewal(
         .map_err(|error| format!("la cérémonie n'a pas pu être lancée : {error}"))?
         .map_err(|error| error.to_string())?;
 
-    let mut renewals = state.renewals.lock().await;
+    let mut renewals = state.engine.renewals.lock().await;
     let in_flight = renewals
         .get_mut(&name)
         .ok_or_else(|| "aucun renouvellement ouvert pour ce profil".to_string())?;
@@ -635,7 +647,7 @@ pub(crate) async fn certificate_approval_needs_pin(
     state: State<'_, AppState>,
     name: String,
 ) -> Result<bool, String> {
-    let renewals = state.renewals.lock().await;
+    let renewals = state.engine.renewals.lock().await;
     let in_flight = renewals
         .get(&name)
         .ok_or_else(|| "aucun renouvellement ouvert pour ce profil".to_string())?;
@@ -657,6 +669,7 @@ pub(crate) async fn last_certificate_error(
     name: String,
 ) -> Result<Option<String>, String> {
     Ok(state
+        .engine
         .last_certificate_error
         .lock()
         .await

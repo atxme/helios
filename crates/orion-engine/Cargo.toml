@@ -19,6 +19,8 @@ async-trait.workspace = true
 aether.workspace = true
 # The token is wiped on drop, not only freed.
 zeroize.workspace = true
+# The engine logs its start-up exactly as the shell did.
+tracing.workspace = true
 
 [dev-dependencies]
 # `tokio::time::pause` for the hello timeout test.

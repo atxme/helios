@@ -21,11 +21,12 @@ pub(crate) async fn connect(app: AppHandle, name: Option<String>) -> Result<(), 
 pub(crate) async fn select_and_connect(app: &AppHandle, name: &str) -> Result<(), String> {
     {
         let state = app.state::<AppState>();
-        let mut config = state.config.lock().await;
+        let mut config = state.engine.config.lock().await;
         if config.find(name).is_none() {
             return Err(format!("profil « {name} » introuvable"));
         }
         state
+            .engine
             .store
             .select(name)
             .map_err(|error| error.to_string())?;
@@ -43,7 +44,7 @@ pub(crate) async fn select_and_connect(app: &AppHandle, name: &str) -> Result<()
 async fn start_connection(app: AppHandle, name: Option<String>) -> Result<(), String> {
     let state = app.state::<AppState>();
     let profile = {
-        let cfg = state.config.lock().await;
+        let cfg = state.engine.config.lock().await;
         match name {
             Some(n) => cfg.find(&n).map(ClientProfile::duplicate),
             None => cfg
@@ -73,7 +74,7 @@ async fn start_connection(app: AppHandle, name: Option<String>) -> Result<(), St
     //
     // Ce qui reste : la posture le montre, le journal le dit, et l'écran
     // Profils propose la manœuvre en un clic.
-    let rotation_required = state.store.rotation_required().unwrap_or_default();
+    let rotation_required = state.engine.store.rotation_required().unwrap_or_default();
     let presumed_exposed = rotation_required.contains(&profile.name);
     if presumed_exposed {
         tracing::warn!(
@@ -86,7 +87,7 @@ async fn start_connection(app: AppHandle, name: Option<String>) -> Result<(), St
     // Sink combining relay to the frontend AND telemetry control: telemetry
     // only starts on transition to Up (web behind the tunnel).
     let base = emit_sink(app.clone());
-    let telemetry = Arc::clone(&state.telemetry);
+    let telemetry = Arc::clone(&state.engine.telemetry);
     let heliosd_url = profile.heliosd_url.clone();
     let app_for_tel = app.clone();
     let negotiating = profile.negotiates();
@@ -101,12 +102,12 @@ async fn start_connection(app: AppHandle, name: Option<String>) -> Result<(), St
     // asking again on every one would poll the gateway for the life of the
     // session.
     let trust_asked = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let renewal_task = Arc::clone(&state.certificate_renewal_task);
-    let renewal_controller = Arc::clone(&state.controller);
-    let renewal_sessions = Arc::clone(&state.renewals);
+    let renewal_task = Arc::clone(&state.engine.certificate_renewal_task);
+    let renewal_controller = Arc::clone(&state.engine.controller);
+    let renewal_sessions = Arc::clone(&state.engine.renewals);
     let negotiated_profile = profile.name.clone();
-    let config = Arc::clone(&state.config);
-    let store = Arc::clone(&state.store);
+    let config = Arc::clone(&state.engine.config);
+    let store = Arc::clone(&state.engine.store);
     let sink: EventSink = Arc::new(move |ev: ClientEvent| {
         // Mirror of the gateway rule: a committed negotiation raises this
         // profile's floor for good. Helios does the same on its side and
@@ -176,7 +177,7 @@ async fn start_connection(app: AppHandle, name: Option<String>) -> Result<(), St
         ));
     }
 
-    state.controller.connect(profile, sink.clone()).await;
+    state.engine.controller.connect(profile, sink.clone()).await;
 
     // State inference loop: WireGuard notifies nothing, we poll the age of
     // the last handshake. Never touches the adapter (ADR-001 §3 bis).
@@ -187,7 +188,7 @@ async fn start_connection(app: AppHandle, name: Option<String>) -> Result<(), St
     // loop used to end on that very tick and infer nothing for the rest of the
     // session. A lost session link then kept the screen on «Connecté» while the
     // log announced the tunnel was over.
-    let controller = Arc::clone(&state.controller);
+    let controller = Arc::clone(&state.engine.controller);
     let poll = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(HANDSHAKE_POLL_INTERVAL);
         let mut started = false;
@@ -203,7 +204,7 @@ async fn start_connection(app: AppHandle, name: Option<String>) -> Result<(), St
             controller.poll_renewal(sink.clone()).await;
         }
     });
-    let previous = state.handshake_poll.lock().unwrap().replace(poll);
+    let previous = state.engine.handshake_poll.lock().unwrap().replace(poll);
     if let Some(previous) = previous {
         previous.abort();
     }
@@ -276,6 +277,7 @@ pub(crate) async fn disconnect(app: AppHandle) -> Result<(), String> {
 pub(crate) async fn renew_psk(app: AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
     state
+        .engine
         .controller
         .renew_now(emit_sink(app.clone()))
         .await
@@ -287,15 +289,16 @@ pub(crate) async fn renew_psk(app: AppHandle) -> Result<(), String> {
 /// step end up differing by more.
 pub(crate) async fn stop_connection(app: &AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
-    state.telemetry.stop();
+    state.engine.telemetry.stop();
     // The inference stops before the state moves, not after: a poll that read
     // `Up` and lands once the tunnel is down would re-announce `Connecting`
     // behind the disconnection the user just asked for.
-    let poll = state.handshake_poll.lock().unwrap().take();
+    let poll = state.engine.handshake_poll.lock().unwrap().take();
     if let Some(poll) = poll {
         poll.abort();
     }
     state
+        .engine
         .controller
         .disconnect(emit_sink(app.clone()))
         .await

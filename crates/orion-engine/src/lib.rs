@@ -9,6 +9,7 @@ pub mod client;
 pub mod command;
 pub mod events;
 pub mod serve;
+pub mod service;
 pub mod session;
 pub mod view;
 pub mod wire;

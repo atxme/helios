@@ -120,7 +120,7 @@ pub(crate) async fn operator_pending_operations(
     state: State<'_, AppState>,
 ) -> Result<Vec<orion_core::operator_pending::OperatorPendingOperation>, String> {
     let gateways: Vec<String> = {
-        let cfg = state.config.lock().await;
+        let cfg = state.engine.config.lock().await;
         let mut seen: Vec<String> = Vec::new();
         for profile in &cfg.profiles {
             if let Some(url) = profile.heliosd_url.as_ref() {

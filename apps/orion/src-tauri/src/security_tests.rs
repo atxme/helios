@@ -1,7 +1,8 @@
 use super::{
     associated_profile_paths, merge_draft, sanitize_stem, window_size_for, ClientProfile, Path,
-    PathBuf, StagedKey, StagedPsk, LEGACY_PROFILE_EXTENSION, PROFILE_EXTENSION,
+    PathBuf, LEGACY_PROFILE_EXTENSION, PROFILE_EXTENSION,
 };
+use orion_engine::service::{StagedKey, StagedPsk};
 use orion_engine::{ConfigView, ProfileDraft, ProfileView};
 
 fn profile(name: &str) -> ClientProfile {

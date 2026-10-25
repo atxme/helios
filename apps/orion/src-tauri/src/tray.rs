@@ -252,7 +252,7 @@ mod windows {
     /// Reads the state the menu displays.
     async fn read_model(app: &AppHandle) -> TrayModel {
         let state = app.state::<AppState>();
-        let config = state.config.lock().await;
+        let config = state.engine.config.lock().await;
         let profiles: Vec<String> = config
             .profiles
             .iter()
@@ -267,7 +267,7 @@ mod windows {
             .filter(|name| profiles.iter().any(|profile| profile == name))
             .or_else(|| profiles.first().cloned());
         TrayModel {
-            state: state.controller.state(),
+            state: state.engine.controller.state(),
             profiles,
             active,
         }

@@ -6,28 +6,29 @@ use orion_engine::{AboutView, KeyNegotiationSupport};
 
 #[tauri::command]
 pub(crate) fn get_state(state: State<'_, AppState>) -> String {
-    state.controller.state().as_str().to_string()
+    state.engine.controller.state().as_str().to_string()
 }
 
 #[tauri::command]
 pub(crate) fn backend_kind(state: State<'_, AppState>) -> &'static str {
-    state.controller.backend_kind()
+    state.engine.controller.backend_kind()
 }
 
 /// Indicates whether the WireGuard adapter is still mounted. On failure, it
 /// must remain up to capture routes and prevent a clear-text leak.
 #[tauri::command]
 pub(crate) fn adapter_is_up(state: State<'_, AppState>) -> bool {
-    state.controller.adapter_is_up()
+    state.engine.controller.adapter_is_up()
 }
 
 #[tauri::command]
 pub(crate) fn about_orion(state: State<'_, AppState>) -> AboutView {
     AboutView {
         version: env!("CARGO_PKG_VERSION").to_string(),
-        backend: state.controller.backend_kind().to_string(),
+        backend: state.engine.controller.backend_kind().to_string(),
         profile_extension: PROFILE_EXTENSION.to_string(),
         log_path: state
+            .engine
             .log_path
             .as_ref()
             .map(|path| path.display().to_string()),
@@ -37,7 +38,7 @@ pub(crate) fn about_orion(state: State<'_, AppState>) -> AboutView {
 #[tauri::command]
 pub(crate) fn key_negotiation_support(state: State<'_, AppState>) -> KeyNegotiationSupport {
     KeyNegotiationSupport {
-        identity_store: state.controller.key_negotiation_ready(),
+        identity_store: state.engine.controller.key_negotiation_ready(),
     }
 }
 
@@ -56,10 +57,13 @@ pub(crate) async fn run_speed_test(
     mode: String,
 ) -> Result<orion_core::SpeedTestResult, String> {
     let _exclusive = state
+        .engine
         .speedtest
         .try_lock()
         .map_err(|_| "un speedtest est déjà en cours".to_string())?;
-    if state.controller.state() != TunnelState::Up || !state.controller.adapter_is_up() {
+    if state.engine.controller.state() != TunnelState::Up
+        || !state.engine.controller.adapter_is_up()
+    {
         return Err("le speedtest nécessite un tunnel WireGuard connecté".into());
     }
     let mode = orion_core::SpeedTestMode::parse(&mode).map_err(|error| error.to_string())?;
