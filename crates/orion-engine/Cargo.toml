@@ -13,6 +13,8 @@ orion-core = { path = "../orion-core" }
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true }
+# The engine's controller is a trait object behind `serve`; the macro is the workspace's.
+async-trait.workspace = true
 # Session token: 256 bits from the repository's one randomness entry point.
 aether.workspace = true
 # The token is wiped on drop, not only freed.

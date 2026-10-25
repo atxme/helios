@@ -5,7 +5,10 @@
 //! between them: one JSON object per line, size-bounded on both reading and
 //! writing.
 
+pub mod client;
 pub mod command;
+pub mod events;
+pub mod serve;
 pub mod session;
 pub mod view;
 pub mod wire;

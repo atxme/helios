@@ -3953,6 +3953,7 @@ name = "orion-engine"
 version = "0.1.0"
 dependencies = [
  "aether",
+ "async-trait",
  "orion-core",
  "serde",
  "serde_json",
