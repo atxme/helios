@@ -147,6 +147,10 @@ pub fn spawn_automatic_certificate_renewal(
     })
 }
 
+/// Advances the renewal of `name` by one step, opening it if none is in flight.
+///
+/// The renewal map is the one the shell's renewal commands also drive, so a
+/// step taken by either is the step the other resumes.
 pub async fn drive_renewal_in_map(
     renewals: &Arc<Mutex<std::collections::HashMap<String, InFlightRenewal>>>,
     name: &str,

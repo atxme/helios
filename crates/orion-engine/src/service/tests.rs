@@ -293,3 +293,31 @@ async fn renew_psk_without_a_tunnel_is_refused() {
         Some("aucun tunnel ML-KEM monté : rien à renouveler")
     );
 }
+
+#[tokio::test]
+async fn teardown_survives_a_poisoned_handshake_slot() {
+    let scratch = Scratch::new("poisoned-slot");
+    let service = service_with_selected_profile(&scratch);
+    let (client, mut events) = crate::client::in_process(Arc::clone(&service))
+        .await
+        .expect("the session opens");
+    client
+        .call(EngineCommand::Connect { name: None })
+        .await
+        .expect("the connection starts");
+    states_until_up(&mut events).await;
+
+    // A thread that dies holding the slot leaves it poisoned.
+    let holder = Arc::clone(&service);
+    let died = std::thread::spawn(move || {
+        let _slot = holder.handshake_poll.lock().unwrap();
+        panic!("poisoning the handshake slot on purpose");
+    })
+    .join();
+    assert!(died.is_err());
+    assert!(service.handshake_poll.is_poisoned());
+
+    service.teardown().await;
+
+    assert!(!service.controller.adapter_is_up());
+}

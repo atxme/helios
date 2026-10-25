@@ -412,13 +412,21 @@ impl TelemetryManager {
     pub fn start(&self, url: String, sink: EventSink) {
         self.stop();
         let (tx, rx) = watch::channel(false);
-        *self.cancel.lock().unwrap() = Some(tx);
+        *self
+            .cancel
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tx);
         tokio::spawn(telemetry::run(url, sink, rx));
     }
 
     /// Cancels the current telemetry loop, if any.
     pub fn stop(&self) {
-        if let Some(tx) = self.cancel.lock().unwrap().take() {
+        if let Some(tx) = self
+            .cancel
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
             let _ = tx.send(true);
         }
     }

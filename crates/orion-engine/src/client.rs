@@ -88,6 +88,11 @@ impl EngineClient {
         reply.await.unwrap_or_else(|_| Err(GONE.into()))
     }
 
+    /// Whether the session has already ended, so there is nothing left to shut down.
+    pub fn is_closed(&self) -> bool {
+        *self.closed.borrow()
+    }
+
     /// Completes once the engine has ended the session, or the reader has.
     pub async fn closed(&self) {
         let mut closed = self.closed.clone();

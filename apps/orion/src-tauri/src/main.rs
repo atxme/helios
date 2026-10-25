@@ -7,8 +7,9 @@
 //! `orion-core`). Its role is to:
 //! 1. expose `invoke` commands to the frontend (connect/disconnect, profile CRUD);
 //! 2. relay the core's [`ClientEvent`]s to the frontend (`emit`);
-//! 3. start heliosd telemetry **only** when the tunnel goes `Up`
-//!    (the web server lives behind WireGuard) and stop it on disconnection.
+//! 3. hand the tunnel's commands to the engine, which starts heliosd telemetry
+//!    **only** when the tunnel goes `Up` (the web server lives behind WireGuard)
+//!    and stops it on disconnection.
 
 /// Windows is the target platform: nothing is simulated there.
 ///
@@ -49,6 +50,7 @@ use orion_core::{
     parse_profile_import, read_profile_import_path, ClientEvent, ClientProfile, ProfileIssues,
     ProtectedIdentityStore,
 };
+use orion_engine::client::EngineClient;
 use orion_engine::service::{certificates::now_unix, EngineService, PROFILE_EXTENSION};
 use orion_engine::EngineCommand;
 #[cfg(target_os = "windows")]
@@ -239,16 +241,37 @@ const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 fn take_tunnel_down(app: &AppHandle) {
     let state = app.state::<AppState>();
     state.quitting.store(true, Ordering::Release);
-    let outcome = tauri::async_runtime::block_on(tokio::time::timeout(SHUTDOWN_GRACE, async {
-        if let Err(error) = state.client.call(EngineCommand::Shutdown).await {
-            tracing::warn!(%error, "arrêt du moteur sans réponse");
-        }
-        state.client.closed().await;
-    }));
+    take_tunnel_down_blocking(&state.client, SHUTDOWN_GRACE);
+}
+
+/// Runs the shutdown of `client` to completion, or to `grace`, on the runtime.
+///
+/// The deadline is built inside the future `block_on` drives: a `timeout`
+/// created on the event-loop thread has no runtime to register with.
+///
+/// The deadline cancels `call`, which `EngineClient::call` advises against: a
+/// cancelled write leaves a partial frame. At process exit that is acceptable,
+/// since nothing writes to this session again and the process ends right after.
+///
+/// A session that already ended has nothing left to shut down, and this says
+/// nothing: the reason it ended is logged where it happened.
+fn take_tunnel_down_blocking(client: &EngineClient, grace: std::time::Duration) {
+    if client.is_closed() {
+        return;
+    }
+    let outcome = tauri::async_runtime::block_on(async {
+        tokio::time::timeout(grace, async {
+            if let Err(error) = client.call(EngineCommand::Shutdown).await {
+                tracing::warn!(%error, "arrêt du moteur sans réponse");
+            }
+            client.closed().await;
+        })
+        .await
+    });
     if outcome.is_err() {
         tracing::warn!(
             "démontage du tunnel non terminé après {} s : Orion sort quand même",
-            SHUTDOWN_GRACE.as_secs()
+            grace.as_secs()
         );
     }
 }
@@ -623,3 +646,6 @@ fn main() {
 
 #[cfg(test)]
 mod security_tests;
+
+#[cfg(all(test, not(target_os = "windows")))]
+mod quit_tests;

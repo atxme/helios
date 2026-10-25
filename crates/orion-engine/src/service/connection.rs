@@ -30,9 +30,10 @@ use crate::events::EventQueue;
 const HANDSHAKE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
 
 impl EngineService {
-    /// Mounts the tunnel. Shared by the `connect` command and the tray menu, which
-    /// must not differ by one step: a connection started from a hidden window has
-    /// no screen to report a discrepancy on.
+    /// Mounts the tunnel. The engine's `Connect` runs it, and so does the
+    /// selection from the notification area, through the same command: the two
+    /// must not differ by one step, since a connection started from a hidden
+    /// window has no screen to report a discrepancy on.
     pub async fn start_connection(
         &self,
         events: &EventQueue,
@@ -141,14 +142,22 @@ impl EngineService {
                                 url,
                                 events.sink(),
                             );
-                            if let Some(previous) = renewal_task.lock().unwrap().replace(renewal) {
+                            if let Some(previous) = renewal_task
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .replace(renewal)
+                            {
                                 previous.abort();
                             }
                         }
                     }
                     TunnelState::Down | TunnelState::Failed => {
                         telemetry.stop();
-                        if let Some(task) = renewal_task.lock().unwrap().take() {
+                        if let Some(task) = renewal_task
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .take()
+                        {
                             task.abort();
                         }
                     }
@@ -196,7 +205,11 @@ impl EngineService {
                 controller.poll_renewal(sink.clone()).await;
             }
         });
-        let previous = self.handshake_poll.lock().unwrap().replace(poll);
+        let previous = self
+            .handshake_poll
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .replace(poll);
         if let Some(previous) = previous {
             previous.abort();
         }
@@ -204,15 +217,20 @@ impl EngineService {
         Ok(())
     }
 
-    /// Unmounts the tunnel. Shared by the `disconnect` command and the tray menu,
-    /// for the same reason as [`start_connection`]: two paths that differ by one
-    /// step end up differing by more.
+    /// Unmounts the tunnel. The engine's `Disconnect` runs it, and so does
+    /// `teardown` when the session ends, with the event side discarded. One
+    /// function for both, for the same reason as [`start_connection`]: two paths
+    /// that differ by one step end up differing by more.
     pub async fn stop_connection(&self, sink: EventSink) -> Result<(), String> {
         self.telemetry.stop();
         // The inference stops before the state moves, not after: a poll that read
         // `Up` and lands once the tunnel is down would re-announce `Connecting`
         // behind the disconnection the user just asked for.
-        let poll = self.handshake_poll.lock().unwrap().take();
+        let poll = self
+            .handshake_poll
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         if let Some(poll) = poll {
             poll.abort();
         }
