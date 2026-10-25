@@ -219,13 +219,13 @@ pub(crate) async fn discard_staged_psk(state: State<'_, AppState>) -> Result<(),
 ///
 /// # The escalation this is written against
 ///
-/// Orion runs elevated, always and by design: WireGuard-NT cannot be loaded
-/// otherwise, and the shipped manifest asks for `requireAdministrator`
-/// (`windows_manifest_requires_administrator_privileges`). A child inherits
-/// its parent's token, so the ordinary `Command::spawn` would hand out an
-/// **Administrator** shell from one click, with no UAC prompt of its own, to
-/// whoever can reach this window — or anything that can reach this command,
-/// the webview included.
+/// The UI runs at its caller's level (the manifest asks for `asInvoker`,
+/// `the_manifest_asks_for_the_invoker_level`), and only the engine is elevated.
+/// Nothing stops a UI started from an elevated shell from being elevated,
+/// though, and a child inherits its parent's token: the ordinary
+/// `Command::spawn` would then hand out an **Administrator** shell from one
+/// click, with no UAC prompt of its own, to whoever can reach this window —
+/// or anything that can reach this command, the webview included.
 ///
 /// So [`crate::launch`] refuses to start anything while Windows reports the
 /// UI's own token as elevated; otherwise the terminal inherits that

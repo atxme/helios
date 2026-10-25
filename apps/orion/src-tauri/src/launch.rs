@@ -3,13 +3,12 @@
 //!
 //! # Why this module exists
 //!
-//! The UI is meant to run at medium integrity, with a manifest asking for
-//! `asInvoker`: WireGuard-NT is driven by the engine, not by the window. A
-//! child started the ordinary way then inherits a non-elevated token, so a
-//! terminal or a companion cannot become an Administrator process by
-//! inheritance alone. Until that manifest ships, Orion still asks for
-//! `requireAdministrator`, and the refusal below is what keeps the terminal
-//! and the companion closed.
+//! The UI runs at medium integrity, with a manifest asking for `asInvoker`:
+//! WireGuard-NT is driven by the elevated engine, not by the window. A child
+//! started the ordinary way then inherits a non-elevated token, so a terminal
+//! or a companion cannot become an Administrator process by inheritance alone.
+//! The UI can still be started elevated (from an elevated shell, say), and
+//! then the refusal below is what keeps the terminal and the companion closed.
 //!
 //! # The post-condition is the actual safety property
 //!

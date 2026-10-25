@@ -10,6 +10,18 @@
 //! 3. hand the tunnel's commands to the engine, which starts heliosd telemetry
 //!    **only** when the tunnel goes `Up` (the web server lives behind WireGuard)
 //!    and stops it on disconnection.
+//!
+//! Start-up, in order:
+//! 1. `--engine` is the elevated engine's mode: dispatched before anything
+//!    else, and it never returns to the window path.
+//! 2. The single-instance plugin is registered first, so a second launch hands
+//!    its profile over and leaves, without a UAC prompt.
+//! 3. Off Windows the engine opens in this process. On Windows the UI runs at
+//!    its caller's level and `setup` starts the elevated engine
+//!    ([`engine_launch::start`]); the UI opens none of the engine's state.
+//! 4. `setup` manages the [`AppState`] and only then builds the window, which
+//!    is declared hidden in the configuration: it appears once the engine has
+//!    answered.
 
 /// Windows is the target platform: nothing is simulated there.
 ///
@@ -44,10 +56,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-use orion_core::{backend::EventSink, default_backend, ClientEvent};
+#[cfg(not(windows))]
+use orion_core::default_backend;
+use orion_core::{backend::EventSink, ClientEvent};
 use orion_engine::client::EngineClient;
 use orion_engine::lifecycle::{EngineArgs, BAD_ARGUMENTS};
-use orion_engine::service::{EngineService, PROFILE_EXTENSION};
+#[cfg(not(windows))]
+use orion_engine::service::EngineService;
+use orion_engine::service::PROFILE_EXTENSION;
 use orion_engine::EngineCommand;
 #[cfg(target_os = "windows")]
 use tauri::WindowEvent;
@@ -55,6 +71,9 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 /// Engine mode: the elevated process the UI launches, with no window.
 mod engine_host;
+
+/// Launch of the elevated engine from the UI, and the end of the UI with it.
+mod engine_launch;
 
 /// Launches from the UI (SSH terminal, Astra companion). Each one is refused
 /// while the UI's own token is elevated; only that check is Windows-specific.
@@ -97,6 +116,11 @@ struct AppState {
     /// Set when Orion is quitting: the engine's session ends on purpose, and
     /// that end is not a failure to report.
     quitting: AtomicBool,
+    /// The elevated engine's process, which Quit waits for.
+    #[cfg(windows)]
+    engine: Arc<engine_launch::EngineProcess>,
+    /// Set once the engine's loss has been reported, so it is reported once.
+    engine_lost: AtomicBool,
 }
 
 #[cfg(debug_assertions)]
@@ -210,15 +234,47 @@ fn relay_engine_events(app: AppHandle, mut events: tokio::sync::mpsc::Receiver<C
     });
 }
 
-/// Ends Orion when the engine's session ends: the window cannot act without it.
+/// Whether the loss of the engine is to be reported now.
+///
+/// Nothing is reported while quitting: the engine ends on purpose then. A
+/// loss is reported once, however many watches see it.
+pub(crate) fn should_report_engine_loss(quitting: bool, already_reported: &AtomicBool) -> bool {
+    if quitting {
+        return false;
+    }
+    !already_reported.swap(true, Ordering::AcqRel)
+}
+
+/// Ends Orion because its engine is gone: the window cannot act without it.
+fn engine_lost(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let quitting = state.quitting.load(Ordering::Acquire);
+    if !should_report_engine_loss(quitting, &state.engine_lost) {
+        return;
+    }
+    engine_launch::fatal(engine_launch::ENGINE_STOPPED);
+    app.exit(1);
+}
+
+/// Ends Orion when the engine's session ends, however it ends.
 fn exit_when_engine_closes(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         app.state::<AppState>().client.closed().await;
-        if app.state::<AppState>().quitting.load(Ordering::Acquire) {
-            return;
-        }
-        tracing::error!("le moteur d'Orion s'est arrêté");
-        app.exit(1);
+        engine_lost(&app);
+    });
+}
+
+/// Ends Orion when the elevated engine's process ends.
+///
+/// The session can end before the process does, and the process can end with
+/// the session still open: both are watched, and whichever comes first ends
+/// Orion once.
+#[cfg(windows)]
+fn exit_when_engine_process_ends(app: AppHandle) {
+    let engine = Arc::clone(&app.state::<AppState>().engine);
+    std::thread::spawn(move || {
+        engine.wait_for_exit();
+        engine_lost(&app);
     });
 }
 
@@ -237,8 +293,29 @@ const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 fn take_tunnel_down(app: &AppHandle) {
     let state = app.state::<AppState>();
     state.quitting.store(true, Ordering::Release);
+    let deadline = std::time::Instant::now() + SHUTDOWN_GRACE;
     take_tunnel_down_blocking(&state.client, SHUTDOWN_GRACE);
+    wait_for_engine_exit(&state, deadline);
 }
+
+/// Waits, until `deadline`, for the engine's process to end.
+///
+/// The session closing is not the process ending: the engine exits after it.
+/// Past the deadline Orion exits anyway, and says so in the log.
+#[cfg(windows)]
+fn wait_for_engine_exit(state: &AppState, deadline: std::time::Instant) {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    if !state.engine.wait_for_exit_within(remaining) {
+        tracing::warn!(
+            "arrêt du moteur non terminé après {} s : Orion sort quand même",
+            SHUTDOWN_GRACE.as_secs()
+        );
+    }
+}
+
+/// Off Windows there is no engine process: the session's end is the whole of it.
+#[cfg(not(windows))]
+fn wait_for_engine_exit(_state: &AppState, _deadline: std::time::Instant) {}
 
 /// Runs the shutdown of `client` to completion, or to `grace`, on the runtime.
 ///
@@ -394,8 +471,12 @@ const DEFAULT_LOG_FILTER: &str = "info,orion=debug,orion_core=debug,aether=debug
                                   aether_vault=debug,aether_key_negotiation=debug,\
                                   quinn=debug,quinn_proto=debug,rustls=debug";
 
-/// Log file, beside the vault it describes.
+/// Log file, beside the vault it describes: the engine's, and the UI's off Windows.
 const LOG_FILE: &str = "orion.log";
+
+/// The Windows UI's own log. The engine keeps `orion.log`: two processes do
+/// not write the same file.
+const UI_LOG_FILE: &str = "orion-ui.log";
 
 /// Shared handle to the log file.
 ///
@@ -434,10 +515,10 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for FileWriter {
 /// *this* start, in full. A file that grows across weeks makes the operator
 /// scroll past six boots to reach the one that failed, and a VPN client that
 /// silently fills a disk is its own incident.
-fn open_log_file() -> Option<FileWriter> {
+fn open_log_file(file_name: &str) -> Option<FileWriter> {
     let path = orion_core::vault::ProfileStore::default_dir()
         .ok()?
-        .join(LOG_FILE);
+        .join(file_name);
     if let Some(parent) = path.parent() {
         aether::private_file::create_private_dir(parent).ok()?;
     }
@@ -451,7 +532,7 @@ fn open_log_file() -> Option<FileWriter> {
 /// = "windows"` means an installed Orion has no console, so everything written
 /// to stdout goes nowhere. Asking a user to reproduce under `cargo run` to see
 /// a log is asking them to rebuild the product.
-fn init_logging() -> Option<PathBuf> {
+fn init_logging(file_name: &str) -> Option<PathBuf> {
     let filter = || {
         tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| DEFAULT_LOG_FILTER.into())
@@ -459,9 +540,9 @@ fn init_logging() -> Option<PathBuf> {
 
     let path = orion_core::vault::ProfileStore::default_dir()
         .ok()
-        .map(|dir| dir.join(LOG_FILE));
+        .map(|dir| dir.join(file_name));
 
-    match open_log_file() {
+    match open_log_file(file_name) {
         Some(file) => {
             use tracing_subscriber::layer::SubscriberExt as _;
             use tracing_subscriber::util::SubscriberInitExt as _;
@@ -501,7 +582,7 @@ fn main() {
         Ok(None) => {}
     }
 
-    let log_path = init_logging();
+    let log_path = init_logging(if cfg!(windows) { UI_LOG_FILE } else { LOG_FILE });
     if let Some(path) = &log_path {
         tracing::info!(fichier = %path.display(), "journal d'Orion");
     } else {
@@ -531,35 +612,29 @@ fn main() {
     let startup_cwd = std::env::current_dir().unwrap_or_default();
     let pending_profile_paths = associated_profile_paths(&startup_args, &startup_cwd).into();
 
-    #[cfg(all(target_os = "windows", feature = "wireguard"))]
-    prepare_wireguard_nt_working_directory(true)
-        .expect("unable to prepare the WireGuardNT DLL shipped with Orion");
-
-    let backend = default_backend().expect(
-        "real WireGuard backend unavailable — Orion refuses to start with implicit simulation",
-    );
-    // The engine's paths and its state are resolved here, once. Without them
-    // the vault would fall back to the working directory, which is not
-    // acceptable: Orion refuses to start instead.
-    let paths =
-        orion_core::protected_root::EnginePaths::for_current_user().unwrap_or_else(|error| {
-            tracing::error!(%error, "emplacements d'Orion introuvables — Orion refuse de démarrer");
-            std::process::exit(1)
-        });
-    let engine = EngineService::open(paths, backend, log_path, env!("CARGO_PKG_VERSION"))
-        .unwrap_or_else(|error| {
-            tracing::error!(%error, "moteur d'Orion impossible à construire — Orion refuse de démarrer");
-            std::process::exit(1)
-        });
-    // The shell reaches the engine through the in-process session, the same one
-    // a separate engine process would serve. Its events come back on `events`.
-    let (client, events) = tauri::async_runtime::block_on(orion_engine::client::in_process(
-        Arc::clone(&engine),
-    ))
-    .unwrap_or_else(|error| {
-        tracing::error!(%error, "session avec le moteur d'Orion impossible — Orion refuse de démarrer");
-        std::process::exit(1)
-    });
+    // Off Windows the engine is opened here, before the window exists, and
+    // runs in this process. On Windows it is a separate elevated process that
+    // `setup` starts: this process never opens the engine's state.
+    #[cfg(not(windows))]
+    let engine = {
+        let backend = default_backend().expect(
+            "real WireGuard backend unavailable — Orion refuses to start with implicit simulation",
+        );
+        // The engine's paths and its state are resolved here, once. Without them
+        // the vault would fall back to the working directory, which is not
+        // acceptable: Orion refuses to start instead.
+        let paths =
+            orion_core::protected_root::EnginePaths::for_current_user().unwrap_or_else(|error| {
+                tracing::error!(%error, "emplacements d'Orion introuvables — Orion refuse de démarrer");
+                std::process::exit(1)
+            });
+        EngineService::open(paths, backend, log_path, env!("CARGO_PKG_VERSION")).unwrap_or_else(
+            |error| {
+                tracing::error!(%error, "moteur d'Orion impossible à construire — Orion refuse de démarrer");
+                std::process::exit(1)
+            },
+        )
+    };
 
     tauri::Builder::default()
         // Must stay the first plugin registered: it intercepts the secondary
@@ -567,27 +642,66 @@ fn main() {
         .plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
             let paths = associated_profile_paths(&args, Path::new(&cwd));
             if !paths.is_empty() {
-                let state = app.state::<AppState>();
-                state.pending_profile_paths.lock().unwrap().extend(paths);
-                let _ = app.emit("helios://profile-path", ());
+                match app.try_state::<AppState>() {
+                    Some(state) => {
+                        state.pending_profile_paths.lock().unwrap().extend(paths);
+                        let _ = app.emit("helios://profile-path", ());
+                    }
+                    None => tracing::warn!("profil reçu avant la fin du démarrage : ignoré"),
+                }
             }
             if let Err(error) = reveal_main_window(app) {
                 tracing::warn!(%error, "unable to reveal Orion from the secondary instance");
             }
         }))
         .plugin(companion_plugin())
-        .manage(AppState {
-            client,
-            pending_profile_paths: StdMutex::new(pending_profile_paths),
-            astra: astra::Ceremony::default(),
-            operator: operator::OperatorCeremony::default(),
-            quitting: AtomicBool::new(false),
-        })
         .setup(move |app| {
+            #[cfg(not(windows))]
+            let (client, events) = match tauri::async_runtime::block_on(
+                orion_engine::client::in_process(engine),
+            ) {
+                Ok(session) => session,
+                Err(error) => {
+                    tracing::error!(%error, "session avec le moteur d'Orion impossible — Orion refuse de démarrer");
+                    std::process::exit(1)
+                }
+            };
+            #[cfg(windows)]
+            let (client, events, engine_process) =
+                match tauri::async_runtime::block_on(engine_launch::start()) {
+                    Ok(started) => started,
+                    Err(message) => {
+                        engine_launch::fatal(&message);
+                        std::process::exit(1)
+                    }
+                };
+
+            app.manage(AppState {
+                client,
+                pending_profile_paths: StdMutex::new(pending_profile_paths),
+                astra: astra::Ceremony::default(),
+                operator: operator::OperatorCeremony::default(),
+                quitting: AtomicBool::new(false),
+                #[cfg(windows)]
+                engine: Arc::new(engine_process),
+                engine_lost: AtomicBool::new(false),
+            });
             #[cfg(target_os = "windows")]
             tray::install(app)?;
             relay_engine_events(app.handle().clone(), events);
             exit_when_engine_closes(app.handle().clone());
+            #[cfg(windows)]
+            exit_when_engine_process_ends(app.handle().clone());
+
+            // Built here, after the state: the configuration declares it
+            // hidden, so no command can reach an unmanaged state.
+            let config = app
+                .config()
+                .app
+                .windows
+                .first()
+                .ok_or("fenêtre principale absente")?;
+            tauri::WebviewWindowBuilder::from_config(app.handle(), config)?.build()?;
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -650,10 +764,9 @@ fn main() {
         ])
         .build(tauri::generate_context!())
         .expect("error while launching Tauri")
-        .run(|app, event| {
-            if let tauri::RunEvent::Exit = event {
-                take_tunnel_down(app);
-            }
+        .run(|app, event| match event {
+            tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => take_tunnel_down(app),
+            _ => {}
         });
 }
 
@@ -662,3 +775,6 @@ mod security_tests;
 
 #[cfg(all(test, not(target_os = "windows")))]
 mod quit_tests;
+
+#[cfg(test)]
+mod engine_loss_tests;

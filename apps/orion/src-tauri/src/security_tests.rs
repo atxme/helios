@@ -392,20 +392,40 @@ fn the_extension_is_matched_without_regard_to_case() {
     );
 }
 
+/// The UI runs at the caller's level: the engine, not the window, is elevated.
+///
+/// `requireAdministrator` would make Windows start the UI elevated, and a
+/// child started from it would inherit that token. `highestAvailable` is
+/// refused for the same reason: on an administrator account it still elevates.
 #[test]
-fn windows_manifest_requires_administrator_privileges() {
+fn the_manifest_asks_for_the_invoker_level() {
     let manifest = include_str!("../windows/orion-manifest.xml");
-    assert!(manifest.contains("requireAdministrator"));
+    assert!(manifest.contains(r#"level="asInvoker""#));
+    assert!(manifest.contains(r#"uiAccess="false""#));
+    assert!(!manifest.contains("requireAdministrator"));
+    assert!(!manifest.contains("highestAvailable"));
     assert!(manifest.contains("Microsoft.Windows.Common-Controls"));
+}
+
+/// The window is built once the engine has answered, not at start-up.
+#[test]
+fn the_main_window_waits_for_the_engine() {
+    let config: serde_json::Value =
+        serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+    assert_eq!(config["app"]["windows"][0]["label"], "main");
+    assert_eq!(
+        config["app"]["windows"][0]["create"],
+        serde_json::json!(false)
+    );
 }
 
 /// The shipped client spawns nothing with its **own** token.
 ///
 /// # The escalation this forbids
 ///
-/// Orion runs elevated — the test above is what guarantees it, because
-/// WireGuard-NT cannot be loaded otherwise. A child process inherits its
-/// parent's token, so any `std::process::Command` in a release build is
+/// The manifest asks for `asInvoker`, but a UI started from an elevated shell
+/// still runs elevated. A child process inherits its parent's token, so any
+/// `std::process::Command` in a release build is
 /// an Administrator process. A terminal launched that way would hand out
 /// an admin shell for one click, with no UAC prompt of its own, to anyone
 /// who can reach this window — or anything that can reach the command,

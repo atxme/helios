@@ -41,6 +41,11 @@ windows-sys = { version = "0.61", features = [
   "Win32_Security",
   "Win32_System_LibraryLoader",
   "Win32_System_Threading",
+  # Lancement élevé du moteur (`engine_launch`) : ShellExecuteExW est gardé par
+  # `Win32_System_Registry` dans windows-sys 0.61.
+  "Win32_System_Registry",
+  "Win32_UI_Shell",
+  "Win32_UI_WindowsAndMessaging",
 ] }
 
 [features]

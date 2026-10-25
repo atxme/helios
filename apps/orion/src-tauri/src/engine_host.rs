@@ -90,7 +90,7 @@ pub fn run(args: EngineArgs) -> i32 {
         }
     }
 
-    let log_path = crate::init_logging();
+    let log_path = crate::init_logging(crate::LOG_FILE);
     let drbg = match aether::random::configure() {
         Ok(drbg) => drbg,
         Err(error) => return startup_failed(error),
