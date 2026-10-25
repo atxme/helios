@@ -104,6 +104,22 @@ fn profile(name: &str) -> ClientProfile {
     }
 }
 
+/// The bootstrap names the slot the store was given: an auditor reads the key
+/// actually in use, not the one this file was first written for.
+#[test]
+fn the_bootstrap_names_the_slot_in_use() {
+    let (dir, store) = store("bootstrap-slot");
+    let store = store.with_key_slot("Helios Orion device root v2 S-1-5-21-1-2-3-1001".to_string());
+    store.save_profile(&profile("poste")).unwrap();
+    let raw = std::fs::read_to_string(dir.join(BOOTSTRAP_FILE)).unwrap();
+    let bootstrap: Bootstrap = toml::from_str(&raw).unwrap();
+    assert_eq!(
+        bootstrap.key_slot,
+        "Helios Orion device root v2 S-1-5-21-1-2-3-1001"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A refusal and a deliberate downgrade must not look alike.
 ///
 /// Off Windows `hardware_backed()` is false either way, so the flag is the

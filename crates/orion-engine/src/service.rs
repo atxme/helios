@@ -177,6 +177,15 @@ impl EngineService {
         let waived = settings.danger_allow_software_keystore;
         let bare_volume = settings.danger_allow_unencrypted_volume;
 
+        // The interactive user's TPM key is a machine key, usable by
+        // administrators and SYSTEM only. Without a SID (tests outside the
+        // engine), the user scope is the only one available.
+        let key_scope = match &paths.user_sid {
+            Some(sid) => orion_core::vault::windows::tpm::KeyScope::Machine(sid.clone()),
+            None => orion_core::vault::windows::tpm::KeyScope::User,
+        };
+        let key_slot = key_scope.key_name();
+
         let store = Arc::new(
             orion_core::vault::ProfileStore::new(
                 store_dir.clone(),
@@ -184,9 +193,11 @@ impl EngineService {
                     orion_core::vault::windows::PlatformRootKeyProvider::new(
                         store_dir.join("device-root"),
                     )
+                    .with_scope(key_scope)
                     .allowing_software_keystore(waived),
                 ),
             )
+            .with_key_slot(key_slot)
             .allowing_software_keystore(waived)
             .allowing_unencrypted_volume(bare_volume),
         );

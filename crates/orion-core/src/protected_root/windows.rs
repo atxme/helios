@@ -20,9 +20,9 @@ use windows_sys::Win32::Security::Authorization::{
 };
 use windows_sys::Win32::Security::{
     AclSizeInformation, GetAce, GetAclInformation, GetSecurityDescriptorControl,
-    ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION,
-    INHERITED_ACE, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
-    SE_DACL_PROTECTED,
+    GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, ACCESS_ALLOWED_ACE, ACE_HEADER, ACL,
+    ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION, INHERITED_ACE, OWNER_SECURITY_INFORMATION,
+    PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, SE_DACL_PROTECTED,
 };
 use windows_sys::Win32::Storage::FileSystem::{CreateDirectoryW, FILE_ATTRIBUTE_REPARSE_POINT};
 use windows_sys::Win32::System::Com::CoTaskMemFree;
@@ -129,20 +129,18 @@ fn verify_protected_dir(path: &Path) -> Result<(), RootError> {
 /// A null DACL admits everyone, so it is refused here.
 fn read_dacl(path: &Path) -> Result<(String, Vec<Ace>, bool), RootError> {
     let wide = wide_path(path);
-    let mut owner: PSID = null_mut();
-    let mut dacl: *mut ACL = null_mut();
     let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
-    // SAFETY: `wide` is NUL-terminated and alive; the out-pointers are valid.
-    // The descriptor they return owns `owner` and `dacl`, and is freed by
+    // SAFETY: `wide` is NUL-terminated and alive; the out-pointer is valid. The
+    // descriptor it returns owns the owner and the DACL, and is freed by
     // `LocalBlock` below, after the last use of both.
     let status = unsafe {
         GetNamedSecurityInfoW(
             wide.as_ptr(),
             SE_FILE_OBJECT,
             OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
-            &mut owner,
             null_mut(),
-            &mut dacl,
+            null_mut(),
+            null_mut(),
             null_mut(),
             &mut descriptor,
         )
@@ -153,15 +151,59 @@ fn read_dacl(path: &Path) -> Result<(String, Vec<Ace>, bool), RootError> {
             "droits du dossier protégé illisibles (code {status})"
         )));
     }
-    if dacl.is_null() {
+    // SAFETY: `descriptor` is the one just read, alive until `_descriptor` drops.
+    unsafe { access_of(descriptor) }
+}
+
+/// The owner's SID in string form, the entries of the DACL of `descriptor`,
+/// and whether that DACL is protected from inheritance.
+///
+/// The one reader of access lists: the protected root and the machine TPM key
+/// both pass their descriptor here, so an entry is parsed once. A null DACL
+/// admits everyone, so it is refused.
+///
+/// # Safety
+///
+/// `descriptor` must be a self-relative security descriptor that stays alive
+/// for the whole call.
+pub(crate) unsafe fn access_of(
+    descriptor: PSECURITY_DESCRIPTOR,
+) -> Result<(String, Vec<Ace>, bool), RootError> {
+    let mut owner: PSID = null_mut();
+    let mut owner_defaulted = 0i32;
+    // SAFETY: the descriptor is valid per the contract; `owner` points into it.
+    let has_owner =
+        unsafe { GetSecurityDescriptorOwner(descriptor, &mut owner, &mut owner_defaulted) };
+    if has_owner == 0 || owner.is_null() {
+        return Err(RootError::Unavailable(
+            "propriétaire du dossier protégé illisible".to_string(),
+        ));
+    }
+    let mut dacl_present = 0i32;
+    let mut dacl: *mut ACL = null_mut();
+    let mut dacl_defaulted = 0i32;
+    // SAFETY: as above; `dacl` points into the descriptor when present.
+    let has_dacl = unsafe {
+        GetSecurityDescriptorDacl(
+            descriptor,
+            &mut dacl_present,
+            &mut dacl,
+            &mut dacl_defaulted,
+        )
+    };
+    if has_dacl == 0 {
+        return Err(RootError::Unavailable(
+            "droits du dossier protégé illisibles".to_string(),
+        ));
+    }
+    if dacl_present == 0 || dacl.is_null() {
         return Err(RootError::Refused);
     }
 
     let owner = sid_to_string(owner)?;
     let mut control = 0u16;
     let mut revision = 0u32;
-    // SAFETY: `descriptor` is the one just read, alive until `_descriptor`
-    // drops; the out-parameters are valid.
+    // SAFETY: `descriptor` is alive for the call; the out-parameters are valid.
     let read = unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) };
     if read == 0 {
         return Err(RootError::Unavailable(format!(
@@ -263,7 +305,10 @@ impl EnginePaths {
         let root = protected_root_for(&program_data, sid).map_err(RootError::Unavailable)?;
         ensure_protected_dir(&root)?;
 
-        let paths = Self::under(&root);
+        let paths = Self {
+            user_sid: Some(sid.to_string()),
+            ..Self::under(&root)
+        };
         for directory in [&paths.vault, &paths.identities] {
             std::fs::create_dir_all(directory).map_err(|error| {
                 RootError::Unavailable(format!("dossier d'Orion impossible à créer ({error})"))
@@ -274,7 +319,7 @@ impl EnginePaths {
 }
 
 /// A memory block from `LocalAlloc`, freed on drop.
-struct LocalBlock(HLOCAL);
+pub(crate) struct LocalBlock(pub(crate) HLOCAL);
 
 impl Drop for LocalBlock {
     fn drop(&mut self) {

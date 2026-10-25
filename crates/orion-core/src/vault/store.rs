@@ -73,7 +73,8 @@ pub struct Bootstrap {
     /// 128-bit installation identifier, hex. Public: it separates this
     /// installation's registry from another's, it does not protect it.
     pub install_id: String,
-    /// TPM key slot holding the wrapping key.
+    /// Name of the TPM key the root was wrapped under when the installation was
+    /// created. Informational: nothing reads it to choose a key.
     pub key_slot: String,
     /// Hardware binding was deliberately waived (`danger_allow_software_keystore`).
     #[serde(default)]
@@ -96,6 +97,8 @@ pub struct ProfileStore {
     provider: Box<dyn RootKeyProvider>,
     /// The operator waived the hardware requirement (ADR-006 §3).
     ///
+    /// Name of the TPM key in use, written to the bootstrap. Informational.
+    key_slot: String,
     /// Held here rather than inferred from `provider.hardware_backed()`,
     /// because the two answer different questions: the provider says whether
     /// hardware **is** backing the root, this says whether its absence was
@@ -118,9 +121,18 @@ impl ProfileStore {
             dir: dir.into(),
             provider,
             software_keystore: false,
+            key_slot: super::windows::tpm::KEY_NAME.to_string(),
             unencrypted_volume: AtomicBool::new(false),
             root_cache: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Names the TPM key in use. The bootstrap records it when the installation
+    /// is created; the key itself is chosen by the provider, not from this name.
+    #[must_use]
+    pub fn with_key_slot(mut self, slot: String) -> Self {
+        self.key_slot = slot;
+        self
     }
 
     /// Records that the hardware requirement was waived on purpose.
@@ -285,7 +297,7 @@ impl ProfileStore {
         self.write_bootstrap(&Bootstrap {
             version: BOOTSTRAP_VERSION,
             install_id: id.to_hex(),
-            key_slot: super::windows::tpm::KEY_NAME.to_string(),
+            key_slot: self.key_slot.clone(),
             software_keystore: self.software_keystore,
         })?;
         Ok(id.as_bytes().to_vec())

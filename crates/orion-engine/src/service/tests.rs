@@ -35,6 +35,7 @@ fn paths_under(root: &Path) -> EnginePaths {
         config: root.join("config.toml"),
         identities: root.join("identities"),
         log: root.join("orion.log"),
+        user_sid: None,
     }
 }
 

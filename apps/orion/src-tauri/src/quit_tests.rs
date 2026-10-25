@@ -36,6 +36,7 @@ fn engine_on(scratch: &Scratch) -> Arc<EngineService> {
         config: root.join("config.toml"),
         identities: root.join("identities"),
         log: root.join("orion.log"),
+        user_sid: None,
     };
     EngineService::open(
         paths,

@@ -19,11 +19,19 @@
 //! freshly finalised handle — a key created and then found wanting must not
 //! leave a file behind that a later run would adopt.
 //!
-//! The **ACL** ADR-006 §3 also names is *observed and logged*, not enforced:
-//! see [`KeyOwnership`] for why the owner SID is the wrong question on Windows,
-//! and what a real DACL walk would take. The account binding that does hold is
-//! the per-user key container these calls open, without
-//! `NCRYPT_MACHINE_KEY_FLAG`.
+//! The access list is where the account binding lives, and the **scope** of the
+//! key ([`KeyScope`]) decides which one applies:
+//!
+//! * [`KeyScope::Machine`], the engine's key, is created in the machine
+//!   container with a DACL that admits only Administrators and SYSTEM, set
+//!   before the key is finalised. That DACL is read back and **enforced**
+//!   ([`KeyAccess`]): a wider or unreadable list is refused.
+//! * [`KeyScope::User`] is the per-user container of the first version. It is
+//!   opened without `NCRYPT_MACHINE_KEY_FLAG`, so another account does not see
+//!   it, and it is not ACL-checked. It is kept so that the migration can read a
+//!   root wrapped under it.
+//!
+//! The owner SID, by contrast, is still only *observed*: see [`KeyOwnership`].
 //!
 //! OAEP-SHA-256 over RSA. The modulus is **preferred** at 3072 and **floored**
 //! at 2048 — see [`MIN_RSA_BITS`] for why the hardware settled that argument.
@@ -37,6 +45,55 @@ use crate::vault::{keys::KEY_LEN, VaultError};
 
 /// Name the key is persisted under, inside the provider's own store.
 pub const KEY_NAME: &str = "Helios Orion device root v1";
+
+/// Name of the machine key of `user_sid`, the one the engine uses.
+///
+/// Distinct from [`KEY_NAME`] and per user, so a machine key is never taken for
+/// the per-user one and two accounts never share a slot.
+pub fn machine_key_slot(user_sid: &str) -> String {
+    format!("Helios Orion device root v2 {user_sid}")
+}
+
+/// Which persisted key the root is wrapped under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyScope {
+    /// The per-user container, under [`KEY_NAME`].
+    User,
+    /// The machine container, under the name of the interactive user's SID.
+    Machine(String),
+}
+
+impl KeyScope {
+    /// The name the key is persisted under in this scope.
+    pub fn key_name(&self) -> String {
+        match self {
+            Self::User => KEY_NAME.to_string(),
+            Self::Machine(user_sid) => machine_key_slot(user_sid),
+        }
+    }
+
+    /// The scope's name for the log. Never the SID: a log line has no use for it.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::User => "User",
+            Self::Machine(_) => "Machine",
+        }
+    }
+}
+
+/// What the access list of the key admits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyAccess {
+    /// Not read. Only the user-scope key is left unchecked: its account binding
+    /// is the container it is opened from.
+    NotChecked,
+    /// Read, and only Administrators and SYSTEM may use the key.
+    AdminsOnly,
+    /// Read, and a principal other than Administrators or SYSTEM may use it.
+    Wider,
+    /// Not readable, or not exposed by the provider. Refused: fail closed.
+    Unreadable,
+}
 
 /// Modulus asked for first.
 ///
@@ -80,20 +137,10 @@ pub const MIN_RSA_BITS: u32 = 2048;
 /// still be yours to open. A mismatch therefore says nothing, and refusing on
 /// it blocked a working TPM.
 ///
-/// What actually binds the key to the account is **where it is opened from**:
-/// `NCryptOpenKey` and `NCryptCreatePersistedKey` are called without
-/// `NCRYPT_MACHINE_KEY_FLAG`, so the container searched is the current user's.
-/// Another account's key is not merely refused, it is not visible.
-///
-/// # What would restore a real check
-///
-/// Walking the **DACL** — `GetSecurityDescriptorDacl`, then every ACE — and
-/// refusing any access-allowed entry whose SID is neither the current user,
-/// `SYSTEM`, nor `Administrators`. That is the question worth asking, and it is
-/// deliberately not answered here rather than answered wrongly: it is a page of
-/// `unsafe` FFI that cannot be compiled or exercised from the development host
-/// (see `docs/testing/TESTING.md`), and shipping it untested is what produced
-/// three failed starts on the user's machine.
+/// The binding to the account does not depend on the owner. A machine key is
+/// created with a DACL that admits Administrators and SYSTEM alone, and that
+/// DACL is **read back and enforced** — see [`KeyAccess`]. The owner is kept
+/// for the log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(not(windows), allow(dead_code))]
 pub enum KeyOwnership {
@@ -122,6 +169,7 @@ fn validate_key_properties(
     export_allowed: bool,
     bits: u32,
     ownership: KeyOwnership,
+    access: KeyAccess,
 ) -> Result<(), VaultError> {
     if !hardware_backed {
         return Err(VaultError::Tpm(
@@ -138,9 +186,21 @@ fn validate_key_properties(
             "modulus of {bits} bits below the {MIN_RSA_BITS} floor — refused rather than lowered"
         )));
     }
-    // Observed, never refused — see `KeyOwnership`. The binding to the account
-    // comes from the per-user container the key is opened from, not from a
-    // descriptor whose owner is `SYSTEM` on perfectly ordinary machines.
+    match access {
+        KeyAccess::NotChecked | KeyAccess::AdminsOnly => {}
+        KeyAccess::Wider => {
+            return Err(VaultError::Tpm(
+                "the machine key admits a non-administrator account — refused".into(),
+            ))
+        }
+        KeyAccess::Unreadable => {
+            return Err(VaultError::Tpm(
+                "the machine key's access list cannot be read — refused".into(),
+            ))
+        }
+    }
+    // Observed, never refused — see `KeyOwnership`. The owner of a descriptor is
+    // not the list of principals allowed to use the key.
     if ownership != KeyOwnership::CurrentUser {
         tracing::info!(
             ?ownership,
@@ -163,21 +223,31 @@ mod imp {
     // exactly that. The parent module is small, private and entirely dedicated
     // to this one, so the usual argument against a glob does not apply.
     use super::*;
+    use crate::protected_root::{access_of, admits_only_admins, LocalBlock};
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, NTE_NOT_SUPPORTED};
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
     use windows_sys::Win32::Security::Cryptography::{
         NCryptCreatePersistedKey, NCryptDecrypt, NCryptEncrypt, NCryptFinalizeKey,
         NCryptFreeObject, NCryptGetProperty, NCryptOpenKey, NCryptOpenStorageProvider,
         NCryptSetProperty, BCRYPT_OAEP_PADDING_INFO, BCRYPT_RSA_ALGORITHM, BCRYPT_SHA256_ALGORITHM,
         MS_PLATFORM_CRYPTO_PROVIDER, NCRYPT_ALLOW_EXPORT_FLAG, NCRYPT_EXPORT_POLICY_PROPERTY,
         NCRYPT_HANDLE, NCRYPT_IMPL_HARDWARE_FLAG, NCRYPT_IMPL_TYPE_PROPERTY,
-        NCRYPT_LENGTH_PROPERTY, NCRYPT_OVERWRITE_KEY_FLAG, NCRYPT_PAD_OAEP_FLAG,
-        NCRYPT_SECURITY_DESCR_PROPERTY, NCRYPT_SILENT_FLAG,
+        NCRYPT_LENGTH_PROPERTY, NCRYPT_MACHINE_KEY_FLAG, NCRYPT_OVERWRITE_KEY_FLAG,
+        NCRYPT_PAD_OAEP_FLAG, NCRYPT_SECURITY_DESCR_PROPERTY, NCRYPT_SILENT_FLAG,
     };
     use windows_sys::Win32::Security::{
         EqualSid, GetSecurityDescriptorOwner, GetTokenInformation, TokenUser,
-        OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, TOKEN_QUERY, TOKEN_USER,
+        DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+        TOKEN_QUERY, TOKEN_USER,
     };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    /// Owner Administrators; a protected DACL with full control for
+    /// Administrators and SYSTEM and nobody else. Keys do not inherit, so no
+    /// container flags are needed.
+    const MACHINE_KEY_SDDL: &str = "O:BAD:P(A;;GA;;;BA)(A;;GA;;;SY)";
 
     /// Frees an `NCRYPT_*` handle on every exit path, including a `?`.
     struct Handle(usize);
@@ -260,7 +330,7 @@ mod imp {
     /// TPM-backed by definition — there is no software mode of it to fall into.
     /// A property that *is* readable and wrong still refuses, which is the case
     /// the check exists for.
-    fn verify(provider: usize, key: usize) -> Result<(), VaultError> {
+    fn verify(provider: usize, key: usize, scope: &KeyScope) -> Result<(), VaultError> {
         let implementation = read_u32(provider, NCRYPT_IMPL_TYPE_PROPERTY, "the provider type")?;
         let export = read_u32(key, NCRYPT_EXPORT_POLICY_PROPERTY, "the export policy")?;
         let bits = read_u32(key, NCRYPT_LENGTH_PROPERTY, "the modulus length")?;
@@ -291,16 +361,22 @@ mod imp {
         };
 
         let ownership = ownership_of(key);
+        let access = match scope {
+            KeyScope::User => KeyAccess::NotChecked,
+            KeyScope::Machine(_) => access_of_key(key),
+        };
         // The four answers, as the provider actually gave them. Three failed
         // starts were spent guessing which one was refusing.
         tracing::info!(
+            portee = scope.label(),
             materiel = hardware_backed,
             exportable = export_allowed,
             module = bits,
             ?ownership,
+            acces = ?access,
             "propriétés de la clé TPM"
         );
-        validate_key_properties(hardware_backed, export_allowed, bits, ownership)
+        validate_key_properties(hardware_backed, export_allowed, bits, ownership, access)
     }
 
     /// SID of the account this process runs as, owned for the call's duration.
@@ -428,17 +504,119 @@ mod imp {
         }
     }
 
-    fn open_existing() -> Result<Option<(Handle, Handle)>, VaultError> {
+    /// The flag that selects the machine container, or none for the user's.
+    fn container_flag(scope: &KeyScope) -> u32 {
+        match scope {
+            KeyScope::User => 0,
+            KeyScope::Machine(_) => NCRYPT_MACHINE_KEY_FLAG,
+        }
+    }
+
+    /// The key's access list, read back and judged.
+    ///
+    /// Every failure is [`KeyAccess::Unreadable`], including a null DACL: a list
+    /// that cannot be read is not a list that admits only administrators.
+    fn access_of_key(key: usize) -> KeyAccess {
+        let flags = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+        let mut needed = 0u32;
+        let status = unsafe {
+            NCryptGetProperty(
+                key as NCRYPT_HANDLE,
+                NCRYPT_SECURITY_DESCR_PROPERTY,
+                std::ptr::null_mut(),
+                0,
+                &mut needed,
+                flags,
+            )
+        };
+        if status != 0 || needed == 0 {
+            return KeyAccess::Unreadable;
+        }
+        let mut descriptor = vec![0u8; needed as usize];
+        let status = unsafe {
+            NCryptGetProperty(
+                key as NCRYPT_HANDLE,
+                NCRYPT_SECURITY_DESCR_PROPERTY,
+                descriptor.as_mut_ptr(),
+                needed,
+                &mut needed,
+                flags,
+            )
+        };
+        if status != 0 {
+            return KeyAccess::Unreadable;
+        }
+        // SAFETY: `descriptor` holds the self-relative descriptor the provider
+        // just wrote, and it outlives the call.
+        match unsafe { access_of(descriptor.as_mut_ptr().cast()) } {
+            Ok((owner, aces, protected)) if admits_only_admins(&owner, &aces, protected) => {
+                KeyAccess::AdminsOnly
+            }
+            Ok(_) => KeyAccess::Wider,
+            Err(_) => KeyAccess::Unreadable,
+        }
+    }
+
+    /// Restricts a machine key to Administrators and SYSTEM.
+    ///
+    /// Called before finalisation: the access list is then part of the key
+    /// from its first use, and never a window in which it is open.
+    fn restrict(key: usize) -> Result<(), VaultError> {
+        let sddl = wide(MACHINE_KEY_SDDL);
+        let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        let mut size = 0u32;
+        // SAFETY: `sddl` is NUL-terminated and alive for the call; the out-pointers
+        // are valid. The descriptor they return is freed by `LocalBlock` below.
+        let converted = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                &mut size,
+            )
+        };
+        let _descriptor = LocalBlock(descriptor);
+        if converted == 0 {
+            return Err(VaultError::Tpm(format!(
+                "restricting the machine key failed: its descriptor cannot be built ({})",
+                std::io::Error::last_os_error()
+            )));
+        }
+        // SAFETY: on success `descriptor` is self-relative and `size` is its
+        // length, both as the call reported them.
+        let status = unsafe {
+            NCryptSetProperty(
+                key as NCRYPT_HANDLE,
+                NCRYPT_SECURITY_DESCR_PROPERTY,
+                descriptor.cast::<u8>().cast_const(),
+                size,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            )
+        };
+        if status != 0 {
+            return Err(fail("restricting the machine key", status));
+        }
+        Ok(())
+    }
+
+    fn open_existing(scope: &KeyScope) -> Result<Option<(Handle, Handle)>, VaultError> {
         let provider = open_provider()?;
         let mut key = 0usize;
-        let name = wide(KEY_NAME);
-        let status =
-            unsafe { NCryptOpenKey(provider.0, &mut key, name.as_ptr(), 0, NCRYPT_SILENT_FLAG) };
+        let name = wide(&scope.key_name());
+        let status = unsafe {
+            NCryptOpenKey(
+                provider.0,
+                &mut key,
+                name.as_ptr(),
+                0,
+                container_flag(scope) | NCRYPT_SILENT_FLAG,
+            )
+        };
         if status != 0 {
             return Ok(None);
         }
         let key = Handle(key);
-        verify(provider.0, key.0)?;
+        verify(provider.0, key.0, scope)?;
         Ok(Some((provider, key)))
     }
 
@@ -451,10 +629,10 @@ mod imp {
     ///
     /// The fallback is announced. A degradation nobody is told about is the one
     /// failure mode ADR-006 refuses everywhere else.
-    fn create() -> Result<(Handle, Handle), VaultError> {
+    fn create(scope: &KeyScope) -> Result<(Handle, Handle), VaultError> {
         let mut last = None;
         for bits in [PREFERRED_RSA_BITS, MIN_RSA_BITS] {
-            match create_at(bits) {
+            match create_at(scope, bits) {
                 Ok(handles) => {
                     if bits < PREFERRED_RSA_BITS {
                         tracing::warn!(
@@ -484,10 +662,10 @@ mod imp {
             || message.contains("finalising"))
     }
 
-    fn create_at(bits: u32) -> Result<(Handle, Handle), VaultError> {
+    fn create_at(scope: &KeyScope, bits: u32) -> Result<(Handle, Handle), VaultError> {
         let provider = open_provider()?;
         let mut key = 0usize;
-        let name = wide(KEY_NAME);
+        let name = wide(&scope.key_name());
         let status = unsafe {
             NCryptCreatePersistedKey(
                 provider.0,
@@ -495,7 +673,7 @@ mod imp {
                 BCRYPT_RSA_ALGORITHM,
                 name.as_ptr(),
                 0,
-                NCRYPT_OVERWRITE_KEY_FLAG,
+                container_flag(scope) | NCRYPT_OVERWRITE_KEY_FLAG,
             )
         };
         if status != 0 {
@@ -532,11 +710,15 @@ mod imp {
             return Err(fail("forbidding export", status));
         }
 
+        if let KeyScope::Machine(_) = scope {
+            restrict(key.0)?;
+        }
+
         let status = unsafe { NCryptFinalizeKey(key.0, 0) };
         if status != 0 {
             return Err(fail("finalising the TPM key", status));
         }
-        verify(provider.0, key.0)?;
+        verify(provider.0, key.0, scope)?;
         Ok((provider, key))
     }
 
@@ -549,10 +731,10 @@ mod imp {
     }
 
     /// Wraps the installation root under the TPM key, creating it on first use.
-    pub fn wrap_root(root: &[u8; KEY_LEN]) -> Result<Vec<u8>, VaultError> {
-        let (_provider, key) = match open_existing()? {
+    pub fn wrap_root(scope: &KeyScope, root: &[u8; KEY_LEN]) -> Result<Vec<u8>, VaultError> {
+        let (_provider, key) = match open_existing(scope)? {
             Some(handles) => handles,
-            None => create()?,
+            None => create(scope)?,
         };
         let padding = oaep();
 
@@ -595,8 +777,11 @@ mod imp {
 
     /// Unwraps the installation root. Absence of the key is fatal: there is no
     /// second envelope to fall back on, by design.
-    pub fn unwrap_root(wrapped: &[u8]) -> Result<Zeroizing<[u8; KEY_LEN]>, VaultError> {
-        let Some((_provider, key)) = open_existing()? else {
+    pub fn unwrap_root(
+        scope: &KeyScope,
+        wrapped: &[u8],
+    ) -> Result<Zeroizing<[u8; KEY_LEN]>, VaultError> {
+        let Some((_provider, key)) = open_existing(scope)? else {
             return Err(VaultError::TpmKeyLost);
         };
         let padding = oaep();
@@ -649,21 +834,75 @@ mod imp {
 mod property_tests {
     use super::*;
 
+    const USER: &str = "S-1-5-21-1-2-3-1001";
+    const OTHER_USER: &str = "S-1-5-21-1-2-3-1002";
+
+    #[test]
+    fn machine_key_slots_are_per_user_sid() {
+        assert_eq!(
+            machine_key_slot(USER),
+            "Helios Orion device root v2 S-1-5-21-1-2-3-1001"
+        );
+        assert_ne!(machine_key_slot(USER), machine_key_slot(OTHER_USER));
+    }
+
+    #[test]
+    fn a_machine_slot_never_equals_the_user_slot() {
+        let machine = KeyScope::Machine(USER.to_string());
+        assert_eq!(KeyScope::User.key_name(), KEY_NAME);
+        assert_eq!(machine.key_name(), machine_key_slot(USER));
+        assert_ne!(machine.key_name(), KEY_NAME);
+        assert_ne!(machine.key_name(), KeyScope::User.key_name());
+    }
+
+    #[test]
+    fn a_machine_key_open_to_users_is_refused() {
+        let ours = KeyOwnership::CurrentUser;
+        let wider =
+            validate_key_properties(true, false, MIN_RSA_BITS, ours, KeyAccess::Wider).unwrap_err();
+        assert!(matches!(wider, VaultError::Tpm(message) if message.contains("non-administrator")));
+        assert!(
+            validate_key_properties(true, false, MIN_RSA_BITS, ours, KeyAccess::AdminsOnly).is_ok()
+        );
+    }
+
+    #[test]
+    fn an_unreadable_machine_key_acl_is_refused() {
+        let ours = KeyOwnership::CurrentUser;
+        let unreadable =
+            validate_key_properties(true, false, MIN_RSA_BITS, ours, KeyAccess::Unreadable)
+                .unwrap_err();
+        assert!(
+            matches!(unreadable, VaultError::Tpm(message) if message.contains("cannot be read"))
+        );
+    }
+
+    #[test]
+    fn a_user_scope_key_is_not_acl_checked() {
+        let ours = KeyOwnership::CurrentUser;
+        assert!(
+            validate_key_properties(true, false, MIN_RSA_BITS, ours, KeyAccess::NotChecked).is_ok()
+        );
+    }
+
     #[test]
     fn only_hardware_non_exportable_keys_at_the_rsa_floor_are_accepted() {
         let ours = KeyOwnership::CurrentUser;
-        assert!(validate_key_properties(true, false, MIN_RSA_BITS, ours).is_ok());
-        assert!(validate_key_properties(true, false, MIN_RSA_BITS + 1024, ours).is_ok());
+        let check = KeyAccess::NotChecked;
+        assert!(validate_key_properties(true, false, MIN_RSA_BITS, ours, check).is_ok());
+        assert!(validate_key_properties(true, false, MIN_RSA_BITS + 1024, ours, check).is_ok());
 
-        let software = validate_key_properties(false, false, MIN_RSA_BITS, ours).unwrap_err();
+        let software =
+            validate_key_properties(false, false, MIN_RSA_BITS, ours, check).unwrap_err();
         assert!(
             matches!(software, VaultError::Tpm(message) if message.contains("not hardware-backed"))
         );
 
-        let exportable = validate_key_properties(true, true, MIN_RSA_BITS, ours).unwrap_err();
+        let exportable =
+            validate_key_properties(true, true, MIN_RSA_BITS, ours, check).unwrap_err();
         assert!(matches!(exportable, VaultError::Tpm(message) if message.contains("exportable")));
 
-        let weak = validate_key_properties(true, false, MIN_RSA_BITS - 1, ours).unwrap_err();
+        let weak = validate_key_properties(true, false, MIN_RSA_BITS - 1, ours, check).unwrap_err();
         assert!(matches!(weak, VaultError::Tpm(message) if message.contains("below")));
     }
 
@@ -682,7 +921,9 @@ mod property_tests {
     /// say which one was seen.
     #[test]
     fn the_descriptor_owner_is_observed_and_never_blocks() {
-        let sound = |ownership| validate_key_properties(true, false, MIN_RSA_BITS, ownership);
+        let sound = |ownership| {
+            validate_key_properties(true, false, MIN_RSA_BITS, ownership, KeyAccess::NotChecked)
+        };
 
         for ownership in [
             KeyOwnership::CurrentUser,
@@ -706,19 +947,23 @@ mod property_tests {
     #[test]
     fn the_real_gates_still_refuse() {
         let ours = KeyOwnership::CurrentUser;
-        assert!(validate_key_properties(false, false, MIN_RSA_BITS, ours).is_err());
-        assert!(validate_key_properties(true, true, MIN_RSA_BITS, ours).is_err());
-        assert!(validate_key_properties(true, false, MIN_RSA_BITS - 1, ours).is_err());
+        let check = KeyAccess::NotChecked;
+        assert!(validate_key_properties(false, false, MIN_RSA_BITS, ours, check).is_err());
+        assert!(validate_key_properties(true, true, MIN_RSA_BITS, ours, check).is_err());
+        assert!(validate_key_properties(true, false, MIN_RSA_BITS - 1, ours, check).is_err());
     }
 }
 
 #[cfg(not(windows))]
-pub fn wrap_root(_root: &[u8; KEY_LEN]) -> Result<Vec<u8>, VaultError> {
+pub fn wrap_root(_scope: &KeyScope, _root: &[u8; KEY_LEN]) -> Result<Vec<u8>, VaultError> {
     Err(VaultError::NoHardwareRoot)
 }
 
 #[cfg(not(windows))]
-pub fn unwrap_root(_wrapped: &[u8]) -> Result<Zeroizing<[u8; KEY_LEN]>, VaultError> {
+pub fn unwrap_root(
+    _scope: &KeyScope,
+    _wrapped: &[u8],
+) -> Result<Zeroizing<[u8; KEY_LEN]>, VaultError> {
     Err(VaultError::NoHardwareRoot)
 }
 
@@ -728,13 +973,15 @@ mod tests {
 
     #[test]
     fn without_a_platform_provider_both_directions_refuse() {
-        assert!(matches!(
-            wrap_root(&[0u8; KEY_LEN]),
-            Err(VaultError::NoHardwareRoot)
-        ));
-        assert!(matches!(
-            unwrap_root(b"wrapped"),
-            Err(VaultError::NoHardwareRoot)
-        ));
+        for scope in [KeyScope::User, KeyScope::Machine(String::new())] {
+            assert!(matches!(
+                wrap_root(&scope, &[0u8; KEY_LEN]),
+                Err(VaultError::NoHardwareRoot)
+            ));
+            assert!(matches!(
+                unwrap_root(&scope, b"wrapped"),
+                Err(VaultError::NoHardwareRoot)
+            ));
+        }
     }
 }

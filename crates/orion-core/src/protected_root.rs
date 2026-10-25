@@ -74,6 +74,10 @@ pub struct EnginePaths {
     pub identities: PathBuf,
     /// Log file, truncated at each start.
     pub log: PathBuf,
+    /// The interactive user this root belongs to, when it was established for
+    /// one. It names the machine TPM key the engine uses. `None` where no root
+    /// was established for a user, such as the paths of a test.
+    pub user_sid: Option<String>,
 }
 
 impl EnginePaths {
@@ -92,6 +96,7 @@ impl EnginePaths {
             root,
             config,
             identities,
+            user_sid: None,
         })
     }
 
@@ -104,6 +109,7 @@ impl EnginePaths {
             config: root.join("profiles.toml"),
             identities: root.join("identities"),
             log: root.join(LOG_FILE),
+            user_sid: None,
         }
     }
 }
@@ -272,6 +278,10 @@ pub fn admits_only_admins(owner: &str, aces: &[Ace], protected: bool) -> bool {
 
 #[cfg(windows)]
 mod windows;
+
+/// The DACL reader and the local-memory guard, shared with the machine TPM key.
+#[cfg(windows)]
+pub(crate) use windows::{access_of, LocalBlock};
 
 #[cfg(test)]
 mod tests;

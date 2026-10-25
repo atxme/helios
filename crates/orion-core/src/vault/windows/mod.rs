@@ -40,6 +40,9 @@ pub struct PlatformRootKeyProvider {
     /// Where the doubly-wrapped root lives. Carries no secret readable without
     /// both layers.
     path: std::path::PathBuf,
+    /// The TPM key the root is wrapped under. [`tpm::KeyScope::User`] unless the
+    /// engine names the machine key with [`Self::with_scope`].
+    scope: tpm::KeyScope,
     /// Degraded mode: DPAPI alone, no hardware binding.
     ///
     /// Set only by `danger_allow_software_keystore`. It is a **downgrade**, not
@@ -73,9 +76,17 @@ impl PlatformRootKeyProvider {
     pub fn new(path: impl Into<std::path::PathBuf>) -> Self {
         Self {
             path: path.into(),
+            scope: tpm::KeyScope::User,
             software_only: false,
             hardware: std::sync::atomic::AtomicU8::new(HARDWARE_UNKNOWN),
         }
+    }
+
+    /// Names the TPM key the root is wrapped under.
+    #[must_use]
+    pub fn with_scope(mut self, scope: tpm::KeyScope) -> Self {
+        self.scope = scope;
+        self
     }
 
     /// Records what the last attempt actually established.
@@ -109,7 +120,7 @@ impl PlatformRootKeyProvider {
         } else {
             // Recorded on both outcomes: a failure here is precisely what the
             // panel must stop calling "scellés au TPM".
-            let wrapped = tpm::wrap_root(root.expose_for_wrapping());
+            let wrapped = tpm::wrap_root(&self.scope, root.expose_for_wrapping());
             self.record(wrapped.is_ok());
             Zeroizing::new(wrapped?)
         };
@@ -145,7 +156,7 @@ impl PlatformRootKeyProvider {
                 .map_err(|_| VaultError::Tpm("stored root has the wrong length".into()))?;
             return Ok(DeviceRootKey::from_unwrapped(Zeroizing::new(bytes)));
         }
-        let unwrapped = tpm::unwrap_root(&wrapped);
+        let unwrapped = tpm::unwrap_root(&self.scope, &wrapped);
         self.record(unwrapped.is_ok());
         Ok(DeviceRootKey::from_unwrapped(unwrapped?))
     }
@@ -162,6 +173,7 @@ impl RootKeyProvider for PlatformRootKeyProvider {
             racine = %self.path.display(),
             existante = existing,
             logiciel = self.software_only,
+            portee = self.scope.label(),
             "obtention de la racine d'installation"
         );
         let outcome = if existing { self.open() } else { self.create() };
