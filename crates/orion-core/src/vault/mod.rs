@@ -461,7 +461,7 @@ pub struct VaultPosture {
     /// made.
     pub software_keystore: bool,
     /// Volume-encryption posture of the disk holding the profiles.
-    pub volume: &'static str,
+    pub volume: String,
     pub volume_protected: bool,
     /// `danger_allow_unencrypted_volume` is on.
     ///
@@ -472,10 +472,10 @@ pub struct VaultPosture {
     pub unencrypted_volume_waived: bool,
     /// Whether secret pages are held out of swap and hibernation.
     pub memory_locked: bool,
-    pub memory: &'static str,
+    pub memory: String,
     /// Whether secret pages are excluded from Windows Error Reporting dumps.
     pub dumps_excluded: bool,
-    pub dumps: &'static str,
+    pub dumps: String,
     /// Profiles whose key once lived in plaintext and is presumed compromised.
     /// They stay unconnectable until a new key is admitted.
     pub rotation_required: Vec<String>,
@@ -506,13 +506,13 @@ mod posture_tests {
         VaultPosture {
             hardware_backed: true,
             software_keystore: false,
-            volume: "",
+            volume: String::new(),
             volume_protected: true,
             unencrypted_volume_waived: false,
             memory_locked: true,
-            memory: "",
+            memory: String::new(),
             dumps_excluded: true,
-            dumps: "",
+            dumps: String::new(),
             rotation_required: Vec::new(),
             legacy_present: false,
         }

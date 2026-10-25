@@ -93,7 +93,7 @@ async fn end_of_stream_is_none() {
 async fn a_writer_refuses_a_frame_over_its_limit() {
     let frame = EngineFrame::Reply {
         id: 1,
-        result: Ok(EngineReply::Unit),
+        result: Ok(Box::new(EngineReply::Unit)),
     };
     let mut bytes = Vec::new();
     let result = write_frame(&mut bytes, &frame, 8).await;
@@ -146,7 +146,7 @@ async fn a_reply_frame_round_trips() {
     let replies = [
         EngineFrame::Reply {
             id: 7,
-            result: Ok(EngineReply::Unit),
+            result: Ok(Box::new(EngineReply::Unit)),
         },
         EngineFrame::Reply {
             id: 8,
@@ -167,7 +167,7 @@ async fn a_reply_frame_round_trips() {
     {
         Some(EngineFrame::Reply { id, result }) => {
             assert_eq!(id, 7);
-            assert_eq!(result, Ok(EngineReply::Unit));
+            assert!(matches!(result.as_deref(), Ok(EngineReply::Unit)));
         }
         _ => panic!("the unit reply must come back unchanged"),
     }
@@ -177,7 +177,7 @@ async fn a_reply_frame_round_trips() {
     {
         Some(EngineFrame::Reply { id, result }) => {
             assert_eq!(id, 8);
-            assert_eq!(result, Err("refus".to_string()));
+            assert!(matches!(result, Err(message) if message == "refus"));
         }
         _ => panic!("the error reply must come back unchanged"),
     }

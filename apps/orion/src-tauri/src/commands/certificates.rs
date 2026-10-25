@@ -2,6 +2,7 @@
 //! renewal and trust refresh, recovery, and the operator's approval.
 
 use super::*;
+use orion_engine::{ActionOutcome, ProfileCertificates, RenewalProgress};
 
 /// The four certificates a connection depends on, with their dates.
 ///
@@ -22,23 +23,6 @@ pub(crate) fn certificate_inventory(
     key_negotiation: Option<orion_core::KeyNegotiationSettings>,
 ) -> orion_core::CertificateInventory {
     orion_core::certificate_inventory::inventory(key_negotiation.as_ref(), now_unix())
-}
-
-/// Everything the Certificates screen shows, for every profile at once.
-///
-/// One command rather than two per profile, and the reason is the protected
-/// store: answering unseals it, and a screen listing six profiles would
-/// otherwise make twelve DPAPI round trips to build one view.
-#[derive(Debug, Clone, serde::Serialize)]
-pub(crate) struct ProfileCertificates {
-    name: String,
-    /// Protected identity the profile names. Empty when it negotiates nothing.
-    identity: String,
-    /// The profile carries a key-negotiation block.
-    negotiates: bool,
-    inventory: orion_core::CertificateInventory,
-    actions: Vec<orion_core::CertificateActionState>,
-    last_error: Option<String>,
 }
 
 #[tauri::command]
@@ -364,70 +348,6 @@ async fn renew_every_profile(state: &State<'_, AppState>) -> Result<ActionOutcom
     Ok(outcome)
 }
 
-/// What one press produced, per profile.
-///
-/// A map and not a single step, because one of the four actions is
-/// device-wide: returning the progress of the profile the press happened to
-/// start from would have attributed five other renewals to it, and hidden the
-/// approval each of them is waiting for.
-#[derive(serde::Serialize, Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct ActionOutcome {
-    progress: std::collections::BTreeMap<String, RenewalProgress>,
-    /// Profiles that could not be advanced, and why.
-    ///
-    /// Only ever populated by the fleet action: a single-profile press reports
-    /// its refusal as an error, exactly as before.
-    refused: std::collections::BTreeMap<String, String>,
-}
-
-impl ActionOutcome {
-    fn of(name: &str, step: RenewalProgress) -> Self {
-        Self {
-            progress: [(name.to_string(), step)].into_iter().collect(),
-            refused: std::collections::BTreeMap::new(),
-        }
-    }
-}
-
-/// Where a renewal stands, as the Certificates surface states it.
-///
-/// `companion_command` is a **value**, not advice: it is the exact fallback for
-/// the invocation Orion launches automatically. It remains visible while an
-/// operator is awaited, including after a successful launch.
-#[derive(serde::Serialize, Clone, Debug, PartialEq, Eq)]
-#[serde(rename_all = "snake_case", tag = "step")]
-pub(crate) enum RenewalProgress {
-    AwaitingOperator {
-        operation_id: String,
-        companion_command: String,
-    },
-    Issuing {
-        operation_id: String,
-    },
-    Committed {
-        generation: u64,
-    },
-    /// A §7.5 recovery, waiting on an operator who is not on this machine.
-    ///
-    /// The operator runs `astra-signer` on **their** workstation, so nothing
-    /// here can be launched. `operator_command` is still carried, and for the
-    /// same reason the renewal carries its companion line: what travels
-    /// between the two people is a command to run, not an identifier to be
-    /// reassembled by hand into arguments only one of them knows.
-    RecoveryAwaitingOperator {
-        operation_id: String,
-        operator_command: String,
-    },
-    Recovered {
-        generation: u64,
-        activation_at: u64,
-    },
-    RolledBack {
-        generation: u64,
-        available_until: u64,
-    },
-}
-
 /// Launches the companion for the operation held by one renewal session.
 ///
 /// Only the profile name crosses IPC. The executable and every argument come
@@ -455,59 +375,6 @@ pub(crate) fn companion_plugin<R: tauri::Runtime>() -> tauri::plugin::TauriPlugi
     tauri::plugin::Builder::new("companion")
         .invoke_handler(tauri::generate_handler![launch_certificate_companion])
         .build()
-}
-
-impl RenewalProgress {
-    fn of_recovery(
-        step: &orion_core::certificate_recovery::RecoveryStep,
-        session: &orion_core::certificate_recovery::RecoverySession,
-    ) -> Self {
-        use orion_core::certificate_recovery::RecoveryStep;
-        match step {
-            RecoveryStep::AwaitingOperator { operation_id } => Self::RecoveryAwaitingOperator {
-                operation_id: operation_id.to_hex(),
-                operator_command: format!(
-                    "astra-signer recover --authority-url {} --operation-id {}",
-                    session.authority_url(),
-                    operation_id.to_hex()
-                ),
-            },
-            RecoveryStep::Issuing { operation_id } => Self::Issuing {
-                operation_id: operation_id.to_hex(),
-            },
-            RecoveryStep::Recovered {
-                generation,
-                activation_at,
-            } => Self::Recovered {
-                generation: *generation,
-                activation_at: *activation_at,
-            },
-        }
-    }
-}
-
-impl RenewalProgress {
-    fn of(
-        step: &orion_core::certificate_renewal::RenewalStep,
-        session: &orion_core::certificate_renewal::RenewalSession,
-    ) -> Self {
-        use orion_core::certificate_renewal::RenewalStep;
-        match step {
-            RenewalStep::AwaitingOperator { operation_id } => Self::AwaitingOperator {
-                operation_id: operation_id.to_hex(),
-                companion_command: session
-                    .companion_invocation()
-                    .map(|invocation| invocation.command_line())
-                    .unwrap_or_default(),
-            },
-            RenewalStep::Issuing { operation_id } => Self::Issuing {
-                operation_id: operation_id.to_hex(),
-            },
-            RenewalStep::Committed { generation } => Self::Committed {
-                generation: *generation,
-            },
-        }
-    }
 }
 
 /// Opens a renewal, or takes one more step on the one already open.

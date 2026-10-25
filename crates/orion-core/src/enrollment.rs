@@ -83,7 +83,7 @@ pub fn format_fingerprint(fingerprint: &Fingerprint) -> String {
 }
 
 /// A pending enrollment, as the screen lists it. Carries no secret.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingEnrollment {
     pub invitation_id: Id16,
     pub request_id: Id16,

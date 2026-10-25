@@ -560,13 +560,13 @@ impl ProfileStore {
         super::VaultPosture {
             hardware_backed: self.provider.hardware_backed(),
             software_keystore: self.software_keystore,
-            volume: volume.detail(),
+            volume: volume.detail().to_string(),
             volume_protected: volume.allows_secrets(),
             unencrypted_volume_waived: self.unencrypted_volume.load(Ordering::Acquire),
             memory_locked: lock.holds(),
-            memory: lock.detail(),
+            memory: lock.detail().to_string(),
             dumps_excluded: exclusion.holds(),
-            dumps: exclusion.detail(),
+            dumps: exclusion.detail().to_string(),
             rotation_required: self.rotation_required().unwrap_or_default(),
             legacy_present: self.legacy_present(),
         }

@@ -8,19 +8,7 @@
 use super::*;
 
 use orion_core::enrollment::PendingEnrollment;
-
-/// What the screen shows of an invitation before the user confirms it.
-#[derive(Debug, serde::Serialize)]
-pub(crate) struct InvitationPreviewView {
-    pub(crate) server_name: String,
-    /// The `CA-PQ` fingerprint, in groups of four, to compare with what the
-    /// operator reads out.
-    pub(crate) ca_fingerprint: String,
-    pub(crate) expires_at_unix: u64,
-    /// The invitation text, returned as received: the confirmation call sends
-    /// it back, so the backend keeps no state between the two.
-    pub(crate) invitation_token: String,
-}
+use orion_engine::InvitationPreviewView;
 
 pub(crate) fn invitation_preview_view(
     bytes: &[u8],

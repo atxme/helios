@@ -7,9 +7,14 @@
 
 pub mod command;
 pub mod session;
+pub mod view;
 pub mod wire;
 
 pub use command::{EngineCommand, EngineReply, ProfileDraft, SecretInput};
+pub use view::{
+    AboutView, ActionOutcome, ConfigView, ImportOutcome, InvitationPreviewView,
+    KeyNegotiationSupport, ProfileCertificates, ProfileView, RenewalProgress,
+};
 pub use wire::{
     limits, read_frame, write_frame, ClientFrame, EngineFrame, Hello, WireError, PROTOCOL_VERSION,
 };

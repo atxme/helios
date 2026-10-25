@@ -95,7 +95,7 @@ pub enum ApprovalError {
 /// Every field comes from the **verified** request, never from the envelope:
 /// showing an operator a generation or a peer that nothing vouches for is how
 /// a ceremony gets spent on a lie.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ApprovalManifest {
     pub operation_id: String,
     pub client_wg_public_key: String,

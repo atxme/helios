@@ -2,6 +2,7 @@
 //! test, the window size and the log export.
 
 use super::*;
+use orion_engine::{AboutView, KeyNegotiationSupport};
 
 #[tauri::command]
 pub(crate) fn get_state(state: State<'_, AppState>) -> String {
@@ -20,48 +21,17 @@ pub(crate) fn adapter_is_up(state: State<'_, AppState>) -> bool {
     state.controller.adapter_is_up()
 }
 
-/// What the About box states.
-///
-/// Four facts, and each one is there because a support exchange asked for it:
-/// which version is installed, whether it drives a real adapter or the dry-run
-/// backend, what a profile file looks like, and where the log is.
-#[derive(serde::Serialize)]
-pub(crate) struct AboutView {
-    version: &'static str,
-    backend: &'static str,
-    /// Extension of an Orion profile, without the dot. Read from Rust rather
-    /// than written in the interface: it is the same string the file
-    /// association and the import filter use, and three copies of it would
-    /// eventually disagree.
-    profile_extension: &'static str,
-    log_path: Option<String>,
-}
-
 #[tauri::command]
 pub(crate) fn about_orion(state: State<'_, AppState>) -> AboutView {
     AboutView {
-        version: env!("CARGO_PKG_VERSION"),
-        backend: state.controller.backend_kind(),
-        profile_extension: PROFILE_EXTENSION,
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        backend: state.controller.backend_kind().to_string(),
+        profile_extension: PROFILE_EXTENSION.to_string(),
         log_path: state
             .log_path
             .as_ref()
             .map(|path| path.display().to_string()),
     }
-}
-
-/// What this machine can do with the gateway's key-negotiation port.
-///
-/// The negotiation itself is no longer a build option — it is compiled into
-/// every Orion, because a binary that looks normal and refuses every pinned
-/// profile at connection time is indistinguishable, for the user, from a
-/// broken gateway. What remains conditional is the **machine**: the protected
-/// certificate store is supplied by the shell, and DPAPI exists only on
-/// Windows. The screen says so instead of letting the user find out when the
-/// connection fails.
-#[derive(serde::Serialize)]
-pub(crate) struct KeyNegotiationSupport {
-    identity_store: bool,
 }
 
 #[tauri::command]

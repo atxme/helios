@@ -1,6 +1,17 @@
 //! The authorization policy, checked against the enum itself.
 
-use super::{EngineCommand, ProfileDraft, SecretInput};
+use super::{EngineCommand, EngineReply, ProfileDraft, SecretInput};
+use crate::view::{
+    AboutView, ActionOutcome, ConfigView, ImportOutcome, InvitationPreviewView,
+    KeyNegotiationSupport, ProfileCertificates, ProfileView, RenewalProgress,
+};
+use aether::certificates::encoding::Id16;
+use orion_core::certificate_approval::ApprovalManifest;
+use orion_core::enrollment::PendingEnrollment;
+use orion_core::{
+    CertificateAction, CertificateActionState, CertificateInventory, ClientConfig, ClientProfile,
+    ProfileIssues, SpeedTestResult,
+};
 
 /// The secret every fixture carries: no output may ever contain it.
 const SECRET: &str = "SECRET-QUI-NE-DOIT-PAS-FUIR";
@@ -273,5 +284,208 @@ fn the_command_list_matches_the_partition() {
     for command in &commands {
         let value = serde_json::to_value(command).expect("a command serialises");
         assert_eq!(value["command"], label(command));
+    }
+}
+
+/// A profile whose private key and static PSK both carry the secret.
+fn secret_profile() -> ClientProfile {
+    ClientProfile {
+        name: "poste".into(),
+        endpoint: "203.0.113.10:51820".into(),
+        private_key: SECRET.into(),
+        peer_public_key: "cHVibGlj".into(),
+        preshared_key: Some(SECRET.into()),
+        address: Some("100.64.1.2/32".into()),
+        ..ClientProfile::default()
+    }
+}
+
+/// One reply of each variant. The fixtures that come from a profile carry the
+/// secret, through the same conversions production uses.
+fn every_reply() -> Vec<EngineReply> {
+    let config = ClientConfig {
+        profiles: vec![secret_profile()],
+        selected: Some("poste".into()),
+    };
+    let imported = ImportOutcome {
+        profile: ProfileView::from(&secret_profile()),
+        identity_sealed: false,
+        private_key_missing: None,
+        incomplete: None,
+        notices: Vec::new(),
+    };
+    let progress = RenewalProgress::AwaitingOperator {
+        operation_id: "0123".into(),
+        companion_command: "orion-companion renew --profile poste".into(),
+    };
+    vec![
+        EngineReply::Unit,
+        EngineReply::State("connected".into()),
+        EngineReply::Backend("dry-run".into()),
+        EngineReply::Flag(true),
+        EngineReply::About(AboutView {
+            version: "0.27.0".into(),
+            backend: "dry-run".into(),
+            profile_extension: "helios-profile".into(),
+            log_path: None,
+        }),
+        EngineReply::KeyNegotiation(KeyNegotiationSupport {
+            identity_store: true,
+        }),
+        EngineReply::SpeedTest(SpeedTestResult {
+            latency_ms: 12.5,
+            jitter_ms: 0.5,
+            latency_p95_ms: 14.0,
+            download_mbps: 800.0,
+            upload_mbps: 400.0,
+            download_variation_pct: 1.0,
+            upload_variation_pct: 2.0,
+            duration_ms: 9_000,
+            download_bytes: 1_000,
+            upload_bytes: 500,
+            parallel_streams: 4,
+            measurement_rounds: 3,
+            mode: orion_core::SpeedTestMode::Full,
+            tcp_download_mbps: None,
+            tcp_upload_mbps: None,
+            udp_download_mbps: None,
+            udp_upload_mbps: None,
+            udp_loss_pct: None,
+            udp_jitter_ms: None,
+            tcp_streams: 4,
+            test_duration_secs: 10,
+        }),
+        EngineReply::Config(ConfigView::from(&config)),
+        EngineReply::Imported(imported.clone()),
+        EngineReply::MaybeImported(Some(imported)),
+        EngineReply::VaultPosture(orion_core::vault::VaultPosture {
+            hardware_backed: true,
+            software_keystore: false,
+            volume: "bitlocker".to_string(),
+            volume_protected: true,
+            unencrypted_volume_waived: false,
+            memory_locked: true,
+            memory: "locked".to_string(),
+            dumps_excluded: true,
+            dumps: "excluded".to_string(),
+            rotation_required: Vec::new(),
+            legacy_present: false,
+        }),
+        EngineReply::PublicKey("cHVibGlj".into()),
+        EngineReply::SshCommand("ssh operateur@poste".into()),
+        EngineReply::Issues(ProfileIssues::default()),
+        EngineReply::InvitationPreview(InvitationPreviewView {
+            server_name: "passerelle".into(),
+            ca_fingerprint: "0123 4567".into(),
+            expires_at_unix: 1_800_000_000,
+            invitation_token: "invitation".into(),
+        }),
+        EngineReply::EnrollmentStarted("0123".into()),
+        EngineReply::PendingEnrollments(vec![PendingEnrollment {
+            invitation_id: Id16::new([1; 16]).expect("non-zero id"),
+            request_id: Id16::new([2; 16]).expect("non-zero id"),
+            requested_name: "poste".into(),
+            server_name: "passerelle".into(),
+            created_at_unix: 1_800_000_000,
+            invitation_expires_at_unix: 1_800_003_600,
+        }]),
+        EngineReply::RequestFile("request".into()),
+        EngineReply::CertificateInventory(CertificateInventory::default()),
+        EngineReply::CertificateOverview(vec![ProfileCertificates {
+            name: "poste".into(),
+            identity: "identite".into(),
+            negotiates: true,
+            inventory: CertificateInventory::default(),
+            actions: Vec::new(),
+            last_error: None,
+        }]),
+        EngineReply::CertificateActions(vec![CertificateActionState {
+            action: CertificateAction::RenewEveryProfile,
+            label: "Renouveler".into(),
+            blocked_by: None,
+            message: None,
+        }]),
+        EngineReply::ActionOutcome(ActionOutcome::default()),
+        EngineReply::ApprovalManifest(ApprovalManifest {
+            operation_id: "0123".into(),
+            client_wg_public_key: "cHVibGlj".into(),
+            active_generation: 1,
+            requested_generation: 2,
+            request_fingerprint: "abcd".into(),
+            expires_at: 1_800_000_000,
+            eligible_credentials: 1,
+        }),
+        EngineReply::RenewalProgress(progress),
+        EngineReply::LastError(Some("échec".into())),
+    ]
+}
+
+/// The wire name of each reply variant, from an exhaustive match.
+fn reply_label(reply: &EngineReply) -> &'static str {
+    match reply {
+        EngineReply::Unit => "unit",
+        EngineReply::State(_) => "state",
+        EngineReply::Backend(_) => "backend",
+        EngineReply::Flag(_) => "flag",
+        EngineReply::About(_) => "about",
+        EngineReply::KeyNegotiation(_) => "key_negotiation",
+        EngineReply::SpeedTest(_) => "speed_test",
+        EngineReply::Config(_) => "config",
+        EngineReply::Imported(_) => "imported",
+        EngineReply::MaybeImported(_) => "maybe_imported",
+        EngineReply::VaultPosture(_) => "vault_posture",
+        EngineReply::PublicKey(_) => "public_key",
+        EngineReply::SshCommand(_) => "ssh_command",
+        EngineReply::Issues(_) => "issues",
+        EngineReply::InvitationPreview(_) => "invitation_preview",
+        EngineReply::EnrollmentStarted(_) => "enrollment_started",
+        EngineReply::PendingEnrollments(_) => "pending_enrollments",
+        EngineReply::RequestFile(_) => "request_file",
+        EngineReply::CertificateInventory(_) => "certificate_inventory",
+        EngineReply::CertificateOverview(_) => "certificate_overview",
+        EngineReply::CertificateActions(_) => "certificate_actions",
+        EngineReply::ActionOutcome(_) => "action_outcome",
+        EngineReply::ApprovalManifest(_) => "approval_manifest",
+        EngineReply::RenewalProgress(_) => "renewal_progress",
+        EngineReply::LastError(_) => "last_error",
+    }
+}
+
+#[test]
+fn every_reply_serializes_without_secret_material() {
+    // The fixture must really carry the key, or the absence checked below
+    // would prove nothing.
+    let config = serde_json::to_string(&EngineReply::Config(ConfigView::from(&ClientConfig {
+        profiles: vec![secret_profile()],
+        selected: None,
+    })))
+    .expect("a reply serialises");
+    assert!(config.contains("\"has_private_key\":true"));
+
+    for reply in every_reply() {
+        let json = serde_json::to_string(&reply).expect("a reply serialises");
+        assert!(
+            !json.contains(SECRET),
+            "{} carries secret material",
+            reply_label(&reply)
+        );
+    }
+}
+
+#[test]
+fn every_reply_round_trips() {
+    assert_eq!(
+        serde_json::to_value(EngineReply::Unit).expect("a reply serialises"),
+        serde_json::json!({"reply": "unit"})
+    );
+    for reply in every_reply() {
+        let label = reply_label(&reply);
+        let json = serde_json::to_string(&reply).expect("a reply serialises");
+        let back: EngineReply = serde_json::from_str(&json)
+            .unwrap_or_else(|error| panic!("{label} does not deserialise: {error}"));
+        assert_eq!(reply_label(&back), label);
+        assert_eq!(serde_json::to_string(&back).expect("serialises"), json);
+        let value = serde_json::to_value(&reply).expect("a reply serialises");
+        assert_eq!(value["reply"], label);
     }
 }

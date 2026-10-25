@@ -47,9 +47,10 @@ pub enum ClientFrame {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "frame", rename_all = "snake_case")]
 pub enum EngineFrame {
+    /// Boxed: a configuration view makes a reply far larger than an event.
     Reply {
         id: u64,
-        result: Result<EngineReply, String>,
+        result: Result<Box<EngineReply>, String>,
     },
     Event(ClientEvent),
 }

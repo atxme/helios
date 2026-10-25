@@ -6,9 +6,20 @@
 
 use std::fmt;
 
-use orion_core::{CertificateAction, KeyNegotiationSettings};
+use orion_core::certificate_approval::ApprovalManifest;
+use orion_core::enrollment::PendingEnrollment;
+use orion_core::vault::VaultPosture;
+use orion_core::{
+    CertificateAction, CertificateActionState, CertificateInventory, KeyNegotiationSettings,
+    ProfileIssues, SpeedTestResult,
+};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
+
+use crate::view::{
+    AboutView, ActionOutcome, ConfigView, ImportOutcome, InvitationPreviewView,
+    KeyNegotiationSupport, ProfileCertificates, RenewalProgress,
+};
 
 /// A secret on its way from the UI to the engine.
 ///
@@ -208,10 +219,40 @@ pub enum EngineCommand {
     Shutdown,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "reply", rename_all = "snake_case")]
+/// What the engine answers. Each variant is the return type of one command
+/// of the partition; the frame carries `Result<EngineReply, String>`, so no
+/// variant stands for a failure.
+///
+/// No variant carries a secret: the views hold public keys and redacted
+/// profiles only, and [`SecretInput`] has no path back out.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "reply", content = "value", rename_all = "snake_case")]
 pub enum EngineReply {
     Unit,
+    State(String),
+    Backend(String),
+    Flag(bool),
+    About(AboutView),
+    KeyNegotiation(KeyNegotiationSupport),
+    SpeedTest(SpeedTestResult),
+    Config(ConfigView),
+    Imported(ImportOutcome),
+    MaybeImported(Option<ImportOutcome>),
+    VaultPosture(VaultPosture),
+    PublicKey(String),
+    SshCommand(String),
+    Issues(ProfileIssues),
+    InvitationPreview(InvitationPreviewView),
+    EnrollmentStarted(String),
+    PendingEnrollments(Vec<PendingEnrollment>),
+    RequestFile(String),
+    CertificateInventory(CertificateInventory),
+    CertificateOverview(Vec<ProfileCertificates>),
+    CertificateActions(Vec<CertificateActionState>),
+    ActionOutcome(ActionOutcome),
+    ApprovalManifest(ApprovalManifest),
+    RenewalProgress(RenewalProgress),
+    LastError(Option<String>),
 }
 
 #[cfg(test)]

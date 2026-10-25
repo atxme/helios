@@ -2,103 +2,7 @@
 //! volume, the SSH terminal, and validation.
 
 use super::*;
-use orion_engine::ProfileDraft;
-
-/// A profile **as the interface is allowed to see it** (ADR-006 §5).
-///
-/// # Why the WireGuard private key is not in here
-///
-/// It used to be. `get_config` cloned the whole `ClientProfile` across the
-/// Tauri IPC, and the Profiles screen put it in a text field with a button to
-/// reveal it. That single path defeated most of what the vault buys: the key
-/// was serialised into a JSON message, parsed into a JavaScript `String` —
-/// immutable, garbage-collected, impossible to wipe — held in a DOM node's
-/// value for as long as the screen lived, and readable by anything that could
-/// reach the WebView. Sealing a secret on disk and then handing it to a
-/// browser engine is protecting the quiet half of its life.
-///
-/// ADR-006 §5 already forbids exactly this for the `nomade` passphrase — "ni le
-/// DOM WebView2, ni JavaScript, ni un message Tauri sérialisé". The private key
-/// is the secret that actually brings the tunnel up. The same rule applies, and
-/// applies more.
-///
-/// What the screen genuinely needs is here: everything it displays or edits,
-/// plus the **public** key it exists to show the operator, plus two booleans
-/// saying whether the secrets are present. Nothing it needs requires the
-/// secret itself.
-#[derive(Debug, Clone, serde::Serialize)]
-pub(crate) struct ProfileView {
-    name: String,
-    endpoint: String,
-    peer_public_key: String,
-    address: Option<String>,
-    /// IPv6 VIP, `…/128`. `null` for every profile without one, which is
-    /// what the screen shows as an IPv4-only tunnel.
-    pub(crate) address_v6: Option<String>,
-    pub(crate) allowed_ips: String,
-    persistent_keepalive: u16,
-    heliosd_url: Option<String>,
-    ssh_target: Option<String>,
-    key_negotiation: Option<orion_core::KeyNegotiationSettings>,
-    /// Which of the two shapes of spec §19 this profile is.
-    ///
-    /// Resolved, never `null`: a profile sealed before the discriminant
-    /// existed still has a kind, and the screen shows what the connection
-    /// path will act on rather than what the file happens to record.
-    profile_type: &'static str,
-    /// Public half of the profile's WireGuard key. The one value of the pair
-    /// that is *meant* to leave the machine — it is what the operator admits.
-    pub(crate) public_key: Option<String>,
-    /// Whether a private key is stored. The screen shows a state, not a value.
-    pub(crate) has_private_key: bool,
-    /// Whether a **static** PSK is stored. A negotiated one is never at rest.
-    pub(crate) has_static_psk: bool,
-    /// The stored list captures all of IPv4 and lets IPv6 out.
-    ///
-    /// Decided by `orion-core`, not by the screen: the posture panel warns on
-    /// it, and a rule re-derived in TypeScript is one more place for the two
-    /// to disagree about which profiles leak. Reported only — the stored list
-    /// is never widened on the user's behalf.
-    pub(crate) ipv6_uncaptured_full_tunnel: bool,
-}
-
-impl From<&ClientProfile> for ProfileView {
-    fn from(profile: &ClientProfile) -> Self {
-        Self {
-            name: profile.name.clone(),
-            endpoint: profile.endpoint.clone(),
-            peer_public_key: profile.peer_public_key.clone(),
-            address: profile.address.clone(),
-            address_v6: profile.address_v6.clone(),
-            allowed_ips: profile.allowed_ips.clone(),
-            persistent_keepalive: profile.persistent_keepalive,
-            heliosd_url: profile.heliosd_url.clone(),
-            ssh_target: profile.ssh_target.clone(),
-            key_negotiation: profile.key_negotiation.clone(),
-            profile_type: profile.kind().as_str(),
-            public_key: profile.public_key(),
-            has_private_key: !profile.private_key.is_empty(),
-            has_static_psk: profile.has_static_psk(),
-            ipv6_uncaptured_full_tunnel: profile.ipv6_uncaptured_full_tunnel(),
-        }
-    }
-}
-
-/// The configuration as the interface sees it: profiles, redacted.
-#[derive(Debug, Clone, serde::Serialize)]
-pub(crate) struct ConfigView {
-    profiles: Vec<ProfileView>,
-    selected: Option<String>,
-}
-
-impl From<&ClientConfig> for ConfigView {
-    fn from(config: &ClientConfig) -> Self {
-        Self {
-            profiles: config.profiles.iter().map(ProfileView::from).collect(),
-            selected: config.selected.clone(),
-        }
-    }
-}
+use orion_engine::{ConfigView, ImportOutcome, ProfileDraft, ProfileView};
 
 /// Merges a saved draft onto what is stored, keeping every secret in Rust.
 ///
@@ -200,29 +104,6 @@ pub(crate) fn profile_edit_base<'a>(
 #[tauri::command]
 pub(crate) async fn get_config(state: State<'_, AppState>) -> Result<ConfigView, String> {
     Ok(ConfigView::from(&*state.config.lock().await))
-}
-
-/// Result of an import: the draft profile, and whether an identity was sealed.
-#[derive(serde::Serialize)]
-pub(crate) struct ImportOutcome {
-    /// The draft, redacted. Its private key waits in `pending_imports`.
-    profile: ProfileView,
-    /// `true` when a signed document completed its pending enrollment and the
-    /// identity it yields is sealed.
-    identity_sealed: bool,
-    /// Why the draft has no private key: a classic invitation no local key
-    /// completes, or a signed document no pending enrollment answers.
-    private_key_missing: Option<String>,
-    /// What else the document leaves to fill in, if anything.
-    incomplete: Option<String>,
-    /// What the document said that Orion read and does **not** apply.
-    ///
-    /// A wg-quick file routinely carries `DNS`, `MTU` or `Table`. Refusing the
-    /// file over them made Orion unable to open an ordinary WireGuard
-    /// configuration; dropping them without a word would hand back a tunnel
-    /// that differs from the one the file describes. They are imported, and
-    /// reported.
-    notices: Vec<String>,
 }
 
 /// Completes a signed v5 document against the pending enrollment it answers.
