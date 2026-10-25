@@ -246,7 +246,9 @@ mod imp {
     use crate::protected_root::{
         access_of, admits_only_admins, LocalBlock, ADMINISTRATORS, SYSTEM,
     };
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, NTE_BAD_KEYSET, NTE_NOT_SUPPORTED};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, HANDLE, NTE_BAD_KEYSET, NTE_NOT_SUPPORTED, NTE_NO_KEY,
+    };
     use windows_sys::Win32::Security::Authorization::{
         ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
     };
@@ -651,6 +653,10 @@ mod imp {
         Ok(())
     }
 
+    /// `HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)`: the key file of a persisted
+    /// key that was never created.
+    const KEY_FILE_NOT_FOUND: i32 = 0x8007_0002_u32 as i32;
+
     fn open_existing(scope: &KeyScope) -> Result<Option<(Handle, Handle)>, VaultError> {
         let provider = open_provider()?;
         let mut key = 0usize;
@@ -667,7 +673,8 @@ mod imp {
         // Only "no such key" means absent. Any other status (an access refusal
         // among them) is an error: reading it as absence would send `create` to
         // overwrite a key that is there, and report a lost key to the person.
-        if status == NTE_BAD_KEYSET {
+        // Providers spell "no such key" three ways; all three mean absent.
+        if [NTE_BAD_KEYSET, NTE_NO_KEY, KEY_FILE_NOT_FOUND].contains(&status) {
             return Ok(None);
         }
         if status != 0 {
