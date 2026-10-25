@@ -129,10 +129,17 @@ struct Session {
 }
 
 fn start(fake: Arc<Fake>, capacity: usize) -> Session {
+    start_until(fake, capacity, std::future::pending())
+}
+
+fn start_until<F>(fake: Arc<Fake>, capacity: usize, stop: F) -> Session
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
     let token = Arc::new(SessionToken::generate().expect("a session token"));
     let (ui, engine_end) = tokio::io::duplex(capacity);
     let served = token.clone();
-    let engine = tokio::spawn(async move { serve(engine_end, &served, fake).await });
+    let engine = tokio::spawn(async move { serve_until(engine_end, &served, fake, stop).await });
     Session {
         ui: BufReader::new(ui),
         token,
@@ -441,4 +448,46 @@ async fn teardown_waits_for_running_commands() {
     fake.gate.notify_one();
     tokio::task::yield_now().await;
     assert!(!fake.late.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn a_stop_tears_down_only_after_running_commands_end() {
+    let fake = Arc::new(Fake::default());
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let mut session = start_until(fake.clone(), PIPE, async {
+        let _ = stopped.await;
+    });
+    session.hello().await;
+    session
+        .request(
+            1,
+            EngineCommand::RunSpeedTest {
+                mode: "block".into(),
+            },
+        )
+        .await;
+    tokio::time::timeout(WAIT, fake.entered.notified())
+        .await
+        .expect("the command started");
+
+    stop.send(()).expect("the session is still listening");
+    assert!(matches!(
+        timeout_wait(session.engine).await,
+        ServeOutcome::Stopped
+    ));
+    assert_eq!(fake.in_flight_at_teardown.load(Ordering::SeqCst), 0);
+    assert_eq!(fake.teardowns.load(Ordering::SeqCst), 1);
+
+    fake.gate.notify_one();
+    tokio::task::yield_now().await;
+    assert!(!fake.late.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn a_stop_during_the_hello_tears_nothing_down() {
+    let fake = Arc::new(Fake::default());
+    let session = start_until(fake.clone(), PIPE, std::future::ready(()));
+
+    assert!(matches!(ended(session).await, ServeOutcome::Stopped));
+    assert_eq!(fake.teardowns.load(Ordering::SeqCst), 0);
 }

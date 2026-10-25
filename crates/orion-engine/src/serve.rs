@@ -5,7 +5,9 @@
 //! events are written by one loop only. Once the UI is authenticated, every
 //! exit runs [`Engine::teardown`], whatever ended the session.
 
+use std::future::Future;
 use std::io;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use orion_core::events::ClientEvent;
@@ -47,6 +49,8 @@ pub enum ServeOutcome {
     ShutdownRequested,
     /// The first frame did not authenticate the UI. Nothing was torn down.
     Refused(SessionRefusal),
+    /// The caller asked the session to end — its UI is gone.
+    Stopped,
     /// A critical event found no room: the UI has stopped reading.
     EventsOverflowed,
     /// The channel carried something it must not: an unreadable or oversized
@@ -65,9 +69,34 @@ where
     S: AsyncRead + AsyncWrite + Send + 'static,
     E: Engine,
 {
+    serve_until(stream, token, engine, std::future::pending()).await
+}
+
+/// [`serve`], which also ends when `stop` completes.
+///
+/// A stop during the hello returns [`ServeOutcome::Stopped`] without teardown:
+/// nothing has started. A stop once authenticated takes the same ordered path
+/// as any other exit: running commands are cancelled and awaited, then the
+/// engine is torn down.
+pub async fn serve_until<S, E, F>(
+    stream: S,
+    token: &SessionToken,
+    engine: Arc<E>,
+    stop: F,
+) -> ServeOutcome
+where
+    S: AsyncRead + AsyncWrite + Send + 'static,
+    E: Engine,
+    F: Future<Output = ()> + Send,
+{
+    tokio::pin!(stop);
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
-    if let Err(refusal) = accept_hello(&mut reader, token).await {
+    let accepted = tokio::select! {
+        accepted = accept_hello(&mut reader, token) => accepted,
+        () = &mut stop => return ServeOutcome::Stopped,
+    };
+    if let Err(refusal) = accepted {
         return ServeOutcome::Refused(refusal);
     }
 
@@ -75,7 +104,15 @@ where
     let (queue, mut events) = EventQueue::new();
     let reading = tokio::spawn(read_requests(reader, frames_tx));
 
-    let outcome = run(&mut write_half, &mut frames, &mut events, &queue, &engine).await;
+    let outcome = run(
+        &mut write_half,
+        &mut frames,
+        &mut events,
+        &queue,
+        &engine,
+        &mut stop,
+    )
+    .await;
 
     reading.abort();
     engine.teardown().await;
@@ -106,16 +143,18 @@ where
 
 /// The session loop. Each request runs in its own task, so a slow command
 /// holds back neither the other requests nor the events.
-async fn run<W, E>(
+async fn run<W, E, F>(
     writer: &mut W,
     frames: &mut mpsc::Receiver<Result<ClientFrame, WireError>>,
     events: &mut mpsc::Receiver<ClientEvent>,
     queue: &EventQueue,
     engine: &Arc<E>,
+    stop: &mut Pin<&mut F>,
 ) -> ServeOutcome
 where
     W: AsyncWrite + Unpin,
     E: Engine,
+    F: Future<Output = ()>,
 {
     let mut tasks: JoinSet<(u64, Result<EngineReply, String>)> = JoinSet::new();
     let outcome = loop {
@@ -153,6 +192,7 @@ where
                 }
             }
             () = queue.overflow() => break ServeOutcome::EventsOverflowed,
+            () = &mut *stop => break ServeOutcome::Stopped,
         }
     };
     // Abort only asks: a command stops when its future is dropped, and

@@ -78,6 +78,7 @@ fn every_serve_outcome_maps_to_an_event() {
             ServeOutcome::EventsOverflowed,
             LifecycleEvent::EventsOverflowed,
         ),
+        (ServeOutcome::Stopped, LifecycleEvent::ParentExited),
         (
             ServeOutcome::Broken(WireError::Malformed),
             LifecycleEvent::ChannelBroken,

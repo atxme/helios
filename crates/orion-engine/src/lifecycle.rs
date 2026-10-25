@@ -202,6 +202,7 @@ impl From<&ServeOutcome> for LifecycleEvent {
             ServeOutcome::Refused(_) => Self::HelloRefused,
             ServeOutcome::EventsOverflowed => Self::EventsOverflowed,
             ServeOutcome::Broken(_) => Self::ChannelBroken,
+            ServeOutcome::Stopped => Self::ParentExited,
         }
     }
 }
