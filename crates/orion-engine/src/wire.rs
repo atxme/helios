@@ -1,7 +1,8 @@
 //! Engine / UI channel frames: one JSON object per line, size-bounded.
 //!
-//! Same shape as `tools/helios-astra-helper/src/session.rs`, but async.
-//! A line over its limit is refused without being read to the end.
+//! Same shape as the operator protocol of `aether::certificates::operator_session`:
+//! one JSON object per line, capped per direction. A line over its limit is
+//! refused without being read to the end.
 
 use std::io;
 

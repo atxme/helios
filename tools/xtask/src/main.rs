@@ -26,7 +26,7 @@ use std::{
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
-use xtask::{orion_deps, orion_helper};
+use xtask::orion_deps;
 
 /// Features of the shipped gateway. A production bundle carries all of them:
 /// a `heliosd` without `netlink` or `wireguard` would refuse to start on a
@@ -81,8 +81,6 @@ struct Cli {
 enum Cmd {
     /// Downloads and verifies the WireGuardNT DLLs needed by the Orion bundle.
     OrionDeps,
-    /// Builds the private Astra helper in the sidecar location Tauri expects.
-    OrionHelper,
     /// Builds the production heliosd binary for an API application update.
     App {
         /// Target triple. Default: the host.
@@ -137,7 +135,6 @@ enum Cmd {
 fn main() -> Result<()> {
     match Cli::parse().command {
         Cmd::OrionDeps => orion_deps(),
-        Cmd::OrionHelper => prepare_orion_helper(&workspace_root()?),
         Cmd::App {
             target,
             skip_frontend,
@@ -235,9 +232,6 @@ fn orion_msi(unsigned: bool, with_nsis: bool, skip_npm_ci: bool) -> Result<()> {
     println!("==> WireGuardNT dependencies");
     orion_deps()?;
 
-    println!("==> Astra operator helper");
-    prepare_orion_helper(&root)?;
-
     // Tauri's `beforeBuildCommand` fetches those same dependencies, so that a
     // plain `npm run tauri build` also produces a complete installer. They are
     // in place by now, and letting the hook redo it would re-enter `cargo`
@@ -245,7 +239,6 @@ fn orion_msi(unsigned: bool, with_nsis: bool, skip_npm_ci: bool) -> Result<()> {
     // while it executes fails with `Access is denied (os error 5)` — minutes
     // in, after the download and the whole workspace build.
     std::env::set_var("ORION_DEPS_READY", "1");
-    std::env::set_var("ORION_HELPER_READY", "1");
 
     if skip_npm_ci && orion.join("node_modules").is_dir() {
         println!("==> npm: existing node_modules reused (--skip-npm-ci)");
@@ -274,18 +267,6 @@ fn orion_msi(unsigned: bool, with_nsis: bool, skip_npm_ci: bool) -> Result<()> {
     )?;
 
     report_installers(&root.join("target").join("release").join("bundle"))
-}
-
-/// Builds and stages the helper under Tauri's target-qualified sidecar name.
-///
-/// The installer ships the release helper, built in the workspace target
-/// directory: nothing holds its lock here, unlike inside Orion's build script.
-fn prepare_orion_helper(root: &Path) -> Result<()> {
-    if !cfg!(windows) {
-        bail!("the Orion helper sidecar is built only for a Windows installer");
-    }
-    let target = host_target()?;
-    orion_helper::prepare(root, &target, &root.join("target"), true)
 }
 
 /// Lists what was produced, with a fingerprint for each artifact.

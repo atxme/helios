@@ -32,7 +32,6 @@ default-members = [
     "crates/orion-engine",
     "crates/heliosd",
     "tools/astra-signer",
-    "tools/helios-astra-helper",
     "tools/helios",
     "tools/helios-installer",
     "tools/xtask",
@@ -150,7 +149,6 @@ aether = { path = "crates/aether" }
 astra = { path = "crates/astra" }
 astra-operator = { path = "crates/astra-operator" }
 astra-channel = { path = "crates/astra-channel" }
-helios-astra-helper = { path = "tools/helios-astra-helper" }
 helios-provisioning = { path = "crates/helios-provisioning" }
 helios-wireguard = { path = "crates/helios-wireguard" }
 aether-key-negotiation = { path = "crates/aether-key-negotiation" }

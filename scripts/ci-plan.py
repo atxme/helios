@@ -7,7 +7,7 @@ import subprocess
 from pathlib import Path
 
 WINDOWS_PACKAGES = {
-    "aether-fido", "orion-core", "orion", "astra-signer", "helios-astra-helper",
+    "aether-fido", "orion-core", "orion", "astra-signer",
 }
 
 
@@ -42,10 +42,6 @@ def plan(metadata, paths, full=False):
                 for dependency in package["dependencies"] for changed in affected
             )
         }
-        # Orion stages this executable from its build script; Cargo metadata
-        # cannot describe the dependency on a separately built binary.
-        if "helios-astra-helper" in affected and "orion" in packages:
-            dependents.add("orion")
         if dependents <= affected:
             break
         affected |= dependents

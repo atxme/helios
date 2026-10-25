@@ -240,9 +240,9 @@ fn windows_bundle_ships_wireguard_and_requires_timestamped_signtool() {
         config["bundle"]["resources"]["../../../resources-windows/"],
         "resources-windows/"
     );
-    assert_eq!(
-        config["bundle"]["externalBin"][0],
-        "binaries/helios-astra-helper"
+    assert!(
+        config["bundle"].get("externalBin").is_none(),
+        "Orion ships no sidecar: ceremonies run in the UI"
     );
     let args = config["bundle"]["windows"]["signCommand"]["args"]
         .as_array()
