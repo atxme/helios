@@ -17,8 +17,8 @@ mod wg_quick;
 
 pub(crate) use document::decode_document;
 pub use document::{
-    complete_profile_import, parse_profile_import, read_profile_import_path, CompletedImport,
-    ProfileImport, MAX_PROFILE_IMPORT_BYTES,
+    complete_profile_import, parse_profile_import, read_profile_document, read_profile_import_path,
+    CompletedImport, ProfileImport, MAX_PROFILE_IMPORT_BYTES,
 };
 pub use field_rules::{
     normalize_cidr_list, split_cidr_list, tunnel_capture, validate_address_v6,

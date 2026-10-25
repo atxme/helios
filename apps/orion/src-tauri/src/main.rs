@@ -44,12 +44,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use aether::{SecretString, TunnelState};
-use orion_core::{
-    backend::EventSink, complete_profile_import, default_backend, inspect_profile,
-    parse_profile_import, read_profile_import_path, ClientEvent, ClientProfile, ProfileIssues,
-    ProtectedIdentityStore,
-};
+use aether::SecretString;
+use orion_core::{backend::EventSink, default_backend, ClientEvent, ProtectedIdentityStore};
 use orion_engine::client::EngineClient;
 use orion_engine::service::{certificates::now_unix, EngineService, PROFILE_EXTENSION};
 use orion_engine::EngineCommand;

@@ -60,8 +60,9 @@ pub use identity_store::{
     ProtectedIdentityStore,
 };
 pub use profile_import::{
-    complete_profile_import, inspect_profile, parse_profile_import, read_profile_import_path,
-    CompletedImport, ProfileImport, ProfileIssues, MAX_PROFILE_IMPORT_BYTES,
+    complete_profile_import, inspect_profile, parse_profile_import, read_profile_document,
+    read_profile_import_path, CompletedImport, ProfileImport, ProfileIssues,
+    MAX_PROFILE_IMPORT_BYTES,
 };
 pub use provisioning::{provision, ProvisionError, ProvisionOutcome};
 pub use speedtest::{

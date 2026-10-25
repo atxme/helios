@@ -146,6 +146,17 @@ pub fn parse_profile_import(contents: &str, file_name: &str) -> Result<ProfileIm
 /// limit. The check applies to bytes actually read: a size derived from
 /// metadata wouldn't suffice against a file modified during reading.
 pub fn read_profile_import_path(path: &Path) -> Result<ProfileImport> {
+    let (contents, file_name) = read_profile_document(path)?;
+    parse_profile_import(&contents, &file_name)
+}
+
+/// Reads a document from a path and decodes it, without parsing it.
+///
+/// Returns the decoded text and the file name the parser will select on. The
+/// reading is the one [`read_profile_import_path`] has always done, split off
+/// so that the process holding the file can read it and hand the text on:
+/// the engine parses what it is sent, and never opens a path itself.
+pub fn read_profile_document(path: &Path) -> Result<(String, String)> {
     let file = File::open(path).with_context(|| format!("ouverture de {}", path.display()))?;
     let mut bytes = Vec::with_capacity(MAX_PROFILE_IMPORT_BYTES.min(4096));
     file.take((MAX_PROFILE_IMPORT_BYTES + 1) as u64)
@@ -162,7 +173,7 @@ pub fn read_profile_import_path(path: &Path) -> Result<ProfileImport> {
         .file_name()
         .and_then(|name| name.to_str())
         .context("le nom du profil n'est pas représentable en UTF-8")?;
-    parse_profile_import(&contents, file_name)
+    Ok((contents, file_name.to_string()))
 }
 
 /// Decodes a document whatever byte-order mark it carries.

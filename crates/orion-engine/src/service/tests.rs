@@ -3,7 +3,7 @@
 #![cfg(not(target_os = "windows"))]
 
 use super::*;
-use crate::command::{EngineCommand, EngineReply};
+use crate::command::{EngineCommand, EngineReply, ProfileDraft, SecretInput};
 use crate::serve::Engine;
 use aether::TunnelState;
 use orion_core::backend::dryrun::DryRunBackend;
@@ -115,7 +115,11 @@ async fn a_command_not_yet_served_is_refused() {
         .expect("the session opens");
 
     assert_eq!(
-        client.call(EngineCommand::GetConfig).await.err().as_deref(),
+        client
+            .call(EngineCommand::GeneratePrivateKey)
+            .await
+            .err()
+            .as_deref(),
         Some(NOT_SERVED)
     );
 }
@@ -320,4 +324,144 @@ async fn teardown_survives_a_poisoned_handshake_slot() {
     service.teardown().await;
 
     assert!(!service.controller.adapter_is_up());
+}
+
+#[tokio::test]
+async fn get_config_through_the_client_redacts_the_private_key() {
+    let scratch = Scratch::new("get-config");
+    let service = service_with_selected_profile(&scratch);
+    let (client, _events) = crate::client::in_process(service)
+        .await
+        .expect("the session opens");
+
+    let reply = client
+        .call(EngineCommand::GetConfig)
+        .await
+        .expect("the configuration is read");
+    let EngineReply::Config(view) = reply else {
+        panic!("unexpected reply: {reply:?}");
+    };
+    let json = serde_json::to_string(&view).expect("the view serialises");
+    assert!(
+        !json.contains("cHJpdmF0ZQ=="),
+        "the private key crossed: {json}"
+    );
+    assert!(json.contains("\"has_private_key\":true"), "{json}");
+}
+
+#[tokio::test]
+async fn an_imported_profile_waits_without_its_key() {
+    let scratch = Scratch::new("import-waits");
+    let service = EngineService::open(
+        paths_under(&scratch.0),
+        Arc::new(DryRunBackend::default()),
+        None,
+        "0.0.0-test",
+    )
+    .expect("the service opens on a fresh directory");
+    let (client, _events) = crate::client::in_process(Arc::clone(&service))
+        .await
+        .expect("the session opens");
+    let key = aether::wg::generate_keypair().expect("a key pair");
+    let gateway = aether::wg::generate_keypair().expect("a key pair");
+    let document = format!(
+        "[Interface]\nPrivateKey = {}\nAddress = 100.64.1.2/32\n\n\
+         [Peer]\nPublicKey = {}\nAllowedIPs = 0.0.0.0/0\n\
+         Endpoint = 203.0.113.10:51820\nPersistentKeepalive = 25\n",
+        key.private_key.expose(),
+        gateway.public_key
+    );
+
+    let reply = client
+        .call(EngineCommand::ImportProfile {
+            contents: SecretInput::from(document),
+            file_name: "poste.conf".into(),
+        })
+        .await
+        .expect("the document imports");
+    let EngineReply::Imported(outcome) = reply else {
+        panic!("unexpected reply: {reply:?}");
+    };
+    assert_eq!(outcome.profile.name, "poste");
+    assert!(outcome.profile.has_private_key);
+    let json = serde_json::to_string(&outcome).expect("the outcome serialises");
+    assert!(
+        !json.contains(key.private_key.expose()),
+        "the private key crossed: {json}"
+    );
+
+    let pending = service.pending_imports.lock().await;
+    let held = pending
+        .get("poste")
+        .expect("the import waits under its name");
+    assert_eq!(held.private_key.expose(), key.private_key.expose());
+}
+
+#[tokio::test]
+async fn vault_posture_answers_through_the_client() {
+    let scratch = Scratch::new("vault-posture");
+    let service = service_with_selected_profile(&scratch);
+    let expected = serde_json::to_value(service.store.posture()).expect("the posture serialises");
+    let (client, _events) = crate::client::in_process(Arc::clone(&service))
+        .await
+        .expect("the session opens");
+
+    let reply = client
+        .call(EngineCommand::VaultPosture)
+        .await
+        .expect("the posture is read");
+    let EngineReply::VaultPosture(posture) = reply else {
+        panic!("unexpected reply: {reply:?}");
+    };
+    assert_eq!(
+        serde_json::to_value(posture).expect("the posture serialises"),
+        expected
+    );
+}
+
+#[tokio::test]
+async fn validate_profile_reports_issues() {
+    let scratch = Scratch::new("validate-issues");
+    let service = service_with_selected_profile(&scratch);
+    let (client, _events) = crate::client::in_process(service)
+        .await
+        .expect("the session opens");
+    let draft: ProfileDraft = serde_json::from_value(serde_json::json!({
+        "name": "brouillon",
+        "endpoint": "adresse invalide",
+        "peer_public_key": "cHVibGlj",
+        "allowed_ips": "0.0.0.0/0",
+        "persistent_keepalive": 25,
+    }))
+    .expect("a minimal draft deserialises");
+
+    let reply = client
+        .call(EngineCommand::ValidateProfile { draft })
+        .await
+        .expect("the draft is judged");
+    let EngineReply::Issues(issues) = reply else {
+        panic!("unexpected reply: {reply:?}");
+    };
+    assert!(issues.endpoint.is_some(), "{issues:?}");
+}
+
+#[tokio::test]
+async fn ssh_command_without_a_target_is_refused() {
+    let scratch = Scratch::new("ssh-refused");
+    let service = service_with_selected_profile(&scratch);
+    let (client, _events) = crate::client::in_process(service)
+        .await
+        .expect("the session opens");
+
+    assert_eq!(
+        client
+            .call(EngineCommand::SshCommand { name: None })
+            .await
+            .err()
+            .as_deref(),
+        Some(
+            "ce profil ne déclare aucune destination SSH — la renseigner dans « Profils → \
+             Avancé → Destination SSH »"
+        )
+    );
 }

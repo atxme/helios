@@ -3,7 +3,7 @@
 
 use super::fixtures::{temp_directory, CLIENT_PRIVATE, GATEWAY_PUBLIC};
 use crate::profile_import::{
-    parse_profile_import, read_profile_import_path, MAX_PROFILE_IMPORT_BYTES,
+    parse_profile_import, read_profile_document, read_profile_import_path, MAX_PROFILE_IMPORT_BYTES,
 };
 
 /// `.orion` is the extension the tooling distributes, and `.orionprofile`
@@ -145,5 +145,35 @@ fn reading_by_path_reuses_the_parser_and_the_limit() {
         .unwrap_err()
         .to_string()
         .contains("trop volumineux"));
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+/// The UI reads the file and the engine parses what it was sent: the text
+/// read that way must be the text the by-path import would have parsed.
+#[test]
+fn read_profile_document_decodes_like_the_import() {
+    let raw = format!(
+        r#"{{"format":"orion-profile","version":1,"profile":{{"name":"portable","endpoint":"vpn.example.net:51820","private_key":"{CLIENT_PRIVATE}","peer_public_key":"{GATEWAY_PUBLIC}","address":"100.64.1.2/32"}}}}"#
+    );
+    let utf16le: Vec<u8> = [0xFF, 0xFE]
+        .into_iter()
+        .chain(raw.encode_utf16().flat_map(u16::to_le_bytes))
+        .collect();
+    let directory = temp_directory("orion-import-document");
+    let path = directory.join("portable.orion");
+    std::fs::write(&path, &utf16le).unwrap();
+
+    let (contents, file_name) = read_profile_document(&path).expect("the document is read");
+    assert_eq!(file_name, "portable.orion");
+    assert_eq!(contents, raw);
+
+    let by_path = read_profile_import_path(&path).expect("the by-path import reads it");
+    let parsed = parse_profile_import(&contents, &file_name).expect("the text parses");
+    assert_eq!(parsed.profile.name, by_path.profile.name);
+    assert_eq!(parsed.profile.endpoint, by_path.profile.endpoint);
+    assert_eq!(
+        parsed.profile.private_key.expose(),
+        by_path.profile.private_key.expose()
+    );
     std::fs::remove_dir_all(directory).unwrap();
 }

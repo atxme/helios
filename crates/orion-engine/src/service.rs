@@ -23,7 +23,9 @@ use crate::serve::Engine;
 mod app;
 pub mod certificates;
 mod connection;
+mod profiles;
 pub use app::PROFILE_EXTENSION;
+pub use profiles::{merge_draft, profile_edit_base};
 
 /// The tunnel-side state of the engine, held for the life of the process.
 ///
@@ -357,23 +359,35 @@ impl Engine for EngineService {
                 .await
                 .map(|()| EngineReply::Unit),
             EngineCommand::RenewPsk => self.renew_psk(events).await.map(|()| EngineReply::Unit),
+            EngineCommand::GetConfig => self.get_config().await.map(EngineReply::Config),
+            EngineCommand::ImportProfile {
+                contents,
+                file_name,
+            } => self
+                .import_profile(contents.expose(), &file_name)
+                .await
+                .map(EngineReply::Imported),
+            EngineCommand::VaultPosture => self.vault_posture().map(EngineReply::VaultPosture),
+            EngineCommand::AllowUnencryptedVolume => self
+                .allow_unencrypted_volume()
+                .map(EngineReply::VaultPosture),
+            EngineCommand::SshCommand { name } => {
+                self.ssh_command(name).await.map(EngineReply::SshCommand)
+            }
+            EngineCommand::ValidateProfile { draft } => {
+                self.validate_profile(draft).await.map(EngineReply::Issues)
+            }
             // Served by the transport before it reaches the engine.
             EngineCommand::Shutdown => Ok(EngineReply::Unit),
-            EngineCommand::GetConfig
-            | EngineCommand::ImportProfile { .. }
-            | EngineCommand::ImportProfilePath { .. }
-            | EngineCommand::VaultPosture
-            | EngineCommand::AllowUnencryptedVolume
+            EngineCommand::ImportProfilePath { .. }
             | EngineCommand::GeneratePrivateKey
             | EngineCommand::AdoptPrivateKey { .. }
             | EngineCommand::DiscardStagedKey
             | EngineCommand::AdoptPresharedKey { .. }
             | EngineCommand::DiscardStagedPsk
-            | EngineCommand::SshCommand { .. }
             | EngineCommand::SaveProfile { .. }
             | EngineCommand::DeleteProfile { .. }
             | EngineCommand::SelectProfile { .. }
-            | EngineCommand::ValidateProfile { .. }
             | EngineCommand::PreviewEnrollmentInvitation { .. }
             | EngineCommand::BeginEnrollment { .. }
             | EngineCommand::ListPendingEnrollments
