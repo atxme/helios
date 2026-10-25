@@ -448,9 +448,10 @@ pub enum IdentityStoreError {
 /// Per-user protected store, backed by a sealed file.
 ///
 /// Under Windows the directory sits in the protected root, whose access list
-/// (administrators and SYSTEM only) is the barrier against the other accounts
-/// of the machine. DPAPI also binds the ciphertext to the account that sealed
-/// it.
+/// (administrators and SYSTEM only) is the barrier against the unelevated
+/// programs of the account and against non-administrator accounts; the other
+/// administrators of the machine can open it (spec §7 bis). DPAPI also binds
+/// the ciphertext to the account that sealed it.
 pub struct ProtectedIdentityStore {
     directory: PathBuf,
 }
