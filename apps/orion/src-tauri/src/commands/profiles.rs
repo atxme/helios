@@ -265,6 +265,10 @@ pub(crate) async fn open_ssh_terminal(
     let target = command
         .strip_prefix("ssh ")
         .ok_or("le moteur n'a pas rendu une commande « ssh <cible> » : rien n'est ouvert")?;
+    // Checked again here, by the process that builds the command line: the
+    // engine validated the profile, but this is where a string becomes a
+    // shell invocation, and the allow-list costs nothing.
+    orion_core::profile_import::validate_ssh_target(target).map_err(|error| error.to_string())?;
     spawn_ssh_terminal(target)
 }
 

@@ -350,7 +350,7 @@ async fn get_config_through_the_client_redacts_the_private_key() {
 }
 
 #[tokio::test]
-async fn an_imported_profile_waits_without_its_key() {
+async fn an_imported_profile_keeps_its_key_in_the_engine() {
     let scratch = Scratch::new("import-waits");
     let service = EngineService::open(
         paths_under(&scratch.0),
