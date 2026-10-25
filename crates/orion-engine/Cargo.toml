@@ -25,3 +25,15 @@ tracing.workspace = true
 [dev-dependencies]
 # `tokio::time::pause` for the hello timeout test.
 tokio = { workspace = true, features = ["test-util"] }
+
+# Named pipe: DACL and SID conversion (Security::Authorization), client and
+# server process ids (System::Pipes), process image and times (System::Threading),
+# token user (Security), and the handles and LocalFree (Foundation).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_System_Pipes",
+  "Win32_System_Threading",
+] }

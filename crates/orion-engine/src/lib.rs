@@ -8,6 +8,7 @@
 pub mod client;
 pub mod command;
 pub mod events;
+pub mod pipe;
 pub mod serve;
 pub mod service;
 pub mod session;
