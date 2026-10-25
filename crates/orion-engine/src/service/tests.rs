@@ -36,6 +36,7 @@ fn paths_under(root: &Path) -> EnginePaths {
         identities: root.join("identities"),
         log: root.join("orion.log"),
         user_sid: None,
+        user_process: None,
     }
 }
 

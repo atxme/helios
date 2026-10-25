@@ -343,13 +343,13 @@ fn relocate_legacy_vault(paths: &EnginePaths) -> Result<Option<String>, String> 
                 identites = identities,
                 "ancien coffre repris sous la racine protégée"
             );
-            if clean_legacy_vault(cleanup)?.is_some() {
+            if clean_legacy_vault(cleanup, paths, user_sid)?.is_some() {
                 delete_legacy_key();
             }
             Ok(None)
         }
         Ok((orion_core::vault::relocation::Relocation::AlreadyDone { .. }, cleanup)) => {
-            if clean_legacy_vault(cleanup)?.is_some_and(|removed| removed > 0) {
+            if clean_legacy_vault(cleanup, paths, user_sid)?.is_some_and(|removed| removed > 0) {
                 delete_legacy_key();
             }
             Ok(None)
@@ -417,13 +417,21 @@ fn migrate_legacy_vault(
 #[cfg(windows)]
 fn clean_legacy_vault(
     cleanup: Option<orion_core::vault::relocation::LegacyCleanup>,
+    paths: &EnginePaths,
+    user_sid: &str,
 ) -> Result<Option<usize>, String> {
     use crate::legacy_cleanup::{run_as_user, CleanupError};
 
     let Some(cleanup) = cleanup else {
         return Ok(None);
     };
-    match run_as_user(cleanup) {
+    let Some(ui_pid) = paths.user_process else {
+        tracing::warn!(
+            "ancien coffre conservé : processus de l'IHM inconnu, suppression impossible sans les droits de l'utilisateur"
+        );
+        return Ok(None);
+    };
+    match run_as_user(cleanup, ui_pid, user_sid) {
         Ok(removed) => {
             tracing::info!(
                 entrees = removed,

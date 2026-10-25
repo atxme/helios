@@ -123,6 +123,12 @@ pub fn run(args: EngineArgs) -> i32 {
         }
         Err(error) => return failed_before_log(error),
     };
+    // The cleanup of a legacy vault runs under the UI's own token: the UI is the
+    // process of this user, and the engine knows it by its id.
+    let paths = EnginePaths {
+        user_process: Some(args.ui_pid),
+        ..paths
+    };
     if let Err(error) = orion_core::protected_root::install(paths.clone()) {
         return failed_before_log(error);
     }

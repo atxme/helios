@@ -19,6 +19,9 @@ pub use windows::{
     server_process_id,
 };
 
+#[cfg(windows)]
+pub(crate) use windows::token_user_sid;
+
 /// A process as the engine sees it: PID, executable path, creation time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExpectedClient {

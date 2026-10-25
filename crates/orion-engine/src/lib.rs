@@ -8,8 +8,7 @@
 pub mod client;
 pub mod command;
 pub mod events;
-#[cfg(windows)]
-mod legacy_cleanup;
+pub mod legacy_cleanup;
 pub mod lifecycle;
 pub mod pipe;
 pub mod serve;

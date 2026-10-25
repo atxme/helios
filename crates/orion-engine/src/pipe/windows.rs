@@ -216,12 +216,18 @@ pub fn process_user_sid(pid: u32) -> Result<String, String> {
         ));
     }
     let token = OwnedHandle(raw);
+    token_user_sid(token.0, &format!("du processus {pid}"))
+}
+
+/// The user SID of `token`, in string form (`S-1-5-…`). `what` names the token
+/// in the errors.
+pub(crate) fn token_user_sid(token: HANDLE, what: &str) -> Result<String, String> {
     let mut needed = 0u32;
     // SAFETY: a null buffer of length 0 only asks for the size; the call fails
     // and writes the size into `needed`.
-    unsafe { GetTokenInformation(token.0, TokenUser, std::ptr::null_mut(), 0, &mut needed) };
+    unsafe { GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed) };
     if needed == 0 {
-        return Err(format!("taille du jeton du processus {pid} inconnue"));
+        return Err(format!("taille du jeton {what} inconnue"));
     }
     // Pointer-aligned storage: TOKEN_USER holds a pointer.
     let mut buffer = vec![0usize; (needed as usize).div_ceil(std::mem::size_of::<usize>())];
@@ -230,7 +236,7 @@ pub fn process_user_sid(pid: u32) -> Result<String, String> {
     // TOKEN_USER; `returned` is a valid out-parameter.
     let filled = unsafe {
         GetTokenInformation(
-            token.0,
+            token,
             TokenUser,
             buffer.as_mut_ptr().cast::<c_void>(),
             needed,
@@ -239,7 +245,7 @@ pub fn process_user_sid(pid: u32) -> Result<String, String> {
     };
     if filled == 0 {
         return Err(format!(
-            "jeton du processus {pid} illisible ({})",
+            "jeton {what} illisible ({})",
             std::io::Error::last_os_error()
         ));
     }
@@ -247,7 +253,7 @@ pub fn process_user_sid(pid: u32) -> Result<String, String> {
     // of `buffer`; its SID points into that same buffer, alive here.
     let sid = unsafe { (*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid };
     if sid.is_null() {
-        return Err(format!("SID du processus {pid} absent"));
+        return Err(format!("SID {what} absent"));
     }
     let mut wide: windows_sys::core::PWSTR = std::ptr::null_mut();
     // SAFETY: `sid` points into `buffer`, alive for the call; on success `wide`
@@ -255,7 +261,7 @@ pub fn process_user_sid(pid: u32) -> Result<String, String> {
     let converted = unsafe { ConvertSidToStringSidW(sid, &mut wide) };
     if converted == 0 {
         return Err(format!(
-            "SID du processus {pid} non convertible ({})",
+            "SID {what} non convertible ({})",
             std::io::Error::last_os_error()
         ));
     }

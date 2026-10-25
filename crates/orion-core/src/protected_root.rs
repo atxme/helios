@@ -78,6 +78,10 @@ pub struct EnginePaths {
     /// one. It names the machine TPM key the engine uses. `None` where no root
     /// was established for a user, such as the paths of a test.
     pub user_sid: Option<String>,
+    /// The UI process that started this engine, when the engine runs for one.
+    /// Its token, which belongs to the user, is the one the cleanup of the
+    /// legacy vault runs under. `None` everywhere but the engine's start-up.
+    pub user_process: Option<u32>,
 }
 
 impl EnginePaths {
@@ -97,6 +101,7 @@ impl EnginePaths {
             config,
             identities,
             user_sid: None,
+            user_process: None,
         })
     }
 
@@ -110,6 +115,7 @@ impl EnginePaths {
             identities: root.join("identities"),
             log: root.join(LOG_FILE),
             user_sid: None,
+            user_process: None,
         }
     }
 }
