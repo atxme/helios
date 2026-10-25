@@ -95,6 +95,11 @@ impl RelocationTarget for FakeTarget {
         if self.fail_verify {
             return Err(VaultError::Relocation("identité refusée (factice)".into()));
         }
+        if file.extension() != Some(std::ffi::OsStr::new("identity")) {
+            return Err(VaultError::Relocation(
+                "fichier non identitaire (factice)".into(),
+            ));
+        }
         std::fs::metadata(file)
             .map(|_| ())
             .map_err(|error| VaultError::Io {
@@ -379,11 +384,12 @@ fn profiles_are_copied_not_reencrypted() {
 }
 
 #[test]
-fn a_vault_without_marker_never_deletes_the_legacy_one() {
+fn a_vault_with_content_and_no_marker_keeps_the_legacy_one() {
     let base = scratch("no-marker");
     let legacy = legacy_vault(&base, &["poste"]);
     let paths = EnginePaths::under(&base.join("root"));
     std::fs::create_dir_all(&paths.vault).unwrap();
+    std::fs::write(paths.vault.join("partial"), b"not ours").unwrap();
     let before = snapshot(&legacy.layout.config_dir);
 
     let outcome = relocate(
@@ -402,6 +408,346 @@ fn a_vault_without_marker_never_deletes_the_legacy_one() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+#[test]
+fn an_empty_vault_directory_does_not_block_the_migration() {
+    let base = scratch("empty-vault");
+    let legacy = legacy_vault(&base, &["poste"]);
+    let paths = EnginePaths::under(&base.join("root"));
+    std::fs::create_dir_all(&paths.vault).unwrap();
+
+    let outcome = relocate(
+        &legacy.layout,
+        &paths,
+        &legacy_root(&legacy.calls),
+        &target(),
+    );
+
+    assert_eq!(
+        outcome.unwrap(),
+        Relocation::Moved {
+            profiles: 1,
+            identities: 1
+        }
+    );
+    assert_eq!(reopen(&paths).profiles.len(), 1);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn an_orphan_manifest_does_not_block_the_migration() {
+    let base = scratch("orphan");
+    let legacy = legacy_vault(&base, &["poste"]);
+    let paths = EnginePaths::under(&base.join("root"));
+    let profiles = legacy.layout.config_dir.join(PROFILES_DIR);
+    let manifest = children_of(&profiles).remove(0);
+    std::fs::copy(&manifest, profiles.join("orphan.hvlt")).unwrap();
+
+    let outcome = relocate(
+        &legacy.layout,
+        &paths,
+        &legacy_root(&legacy.calls),
+        &target(),
+    );
+
+    assert!(matches!(outcome, Ok(Relocation::Moved { profiles: 1, .. })));
+    assert!(
+        paths.vault.join(PROFILES_DIR).join("orphan.hvlt").exists(),
+        "the orphan is copied, not dropped"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn a_registry_entry_without_manifest_fails_the_verification() {
+    let base = scratch("missing-manifest");
+    let legacy = legacy_vault(&base, &["poste", "bureau"]);
+    let paths = EnginePaths::under(&base.join("root"));
+    let profiles = legacy.layout.config_dir.join(PROFILES_DIR);
+    std::fs::remove_file(children_of(&profiles).remove(0)).unwrap();
+    let before = snapshot(&legacy.layout.config_dir);
+
+    let outcome = relocate(
+        &legacy.layout,
+        &paths,
+        &legacy_root(&legacy.calls),
+        &target(),
+    );
+
+    assert!(
+        outcome.is_err(),
+        "a profile without its manifest refuses the migration"
+    );
+    assert_eq!(snapshot(&legacy.layout.config_dir), before);
+    assert!(!paths.vault.exists());
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn a_cleanup_failure_after_the_commit_is_not_an_error() {
+    let base = scratch("cleanup-failure");
+    let legacy = legacy_vault(&base, &["poste"]);
+    let paths = EnginePaths::under(&base.join("root"));
+    relocate(
+        &legacy.layout,
+        &paths,
+        &legacy_root(&legacy.calls),
+        &target(),
+    )
+    .unwrap();
+    // The legacy vault reappears, and its identities folder is no longer a folder.
+    std::fs::write(legacy.layout.config_dir.join(DEVICE_ROOT_FILE), ROOT).unwrap();
+    std::fs::write(&legacy.layout.identities_dir, b"not a folder").unwrap();
+
+    let outcome = relocate(
+        &legacy.layout,
+        &paths,
+        &legacy_root(&legacy.calls),
+        &target(),
+    );
+
+    assert_eq!(
+        outcome.unwrap(),
+        Relocation::AlreadyDone {
+            legacy_removed: true
+        }
+    );
+    assert!(!legacy.layout.config_dir.join(DEVICE_ROOT_FILE).exists());
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn an_identity_name_collision_keeps_both_files() {
+    let base = scratch("identity-collision");
+    let legacy = legacy_vault(&base, &["poste"]);
+    let paths = EnginePaths::under(&base.join("root"));
+    std::fs::create_dir_all(&paths.identities).unwrap();
+    std::fs::write(paths.identities.join("poste.identity"), b"existing").unwrap();
+
+    let outcome = relocate(
+        &legacy.layout,
+        &paths,
+        &legacy_root(&legacy.calls),
+        &target(),
+    );
+
+    assert!(matches!(outcome, Ok(Relocation::Moved { .. })));
+    assert_eq!(
+        std::fs::read(paths.identities.join("poste.identity")).unwrap(),
+        b"existing"
+    );
+    assert_eq!(
+        std::fs::read(legacy.layout.identities_dir.join("poste.identity")).unwrap(),
+        b"sealed",
+        "the skipped legacy identity is kept"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn an_identities_only_legacy_is_moved() {
+    let base = scratch("identities-only");
+    let layout = LegacyLayout {
+        config_dir: base.join("config"),
+        identities_dir: base.join("data").join("identities"),
+    };
+    std::fs::create_dir_all(&layout.identities_dir).unwrap();
+    std::fs::write(layout.identities_dir.join("poste.identity"), b"sealed").unwrap();
+    let paths = EnginePaths::under(&base.join("root"));
+    let calls = Arc::new(AtomicUsize::new(0));
+
+    let outcome = relocate(&layout, &paths, &legacy_root(&calls), &target());
+
+    assert_eq!(
+        outcome.unwrap(),
+        Relocation::Moved {
+            profiles: 0,
+            identities: 1
+        }
+    );
+    assert!(paths.identities.join("poste.identity").exists());
+    assert!(!layout.identities_dir.join("poste.identity").exists());
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn a_plaintext_only_legacy_lands_in_the_new_vault() {
+    let base = scratch("plaintext-only");
+    let config = base.join("config");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(config.join(LEGACY_FILE), b"[]").unwrap();
+    let layout = LegacyLayout {
+        config_dir: config.clone(),
+        identities_dir: base.join("data").join("identities"),
+    };
+    let paths = EnginePaths::under(&base.join("root"));
+    let calls = Arc::new(AtomicUsize::new(0));
+
+    let outcome = relocate(&layout, &paths, &legacy_root(&calls), &target());
+
+    assert!(matches!(outcome, Ok(Relocation::Moved { .. })));
+    assert_eq!(std::fs::read(paths.vault.join(LEGACY_FILE)).unwrap(), b"[]");
+    assert!(!config.join(LEGACY_FILE).exists());
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn a_retry_after_a_partial_merge_succeeds() {
+    let base = scratch("partial-merge");
+    let legacy = legacy_vault(&base, &["poste"]);
+    let paths = EnginePaths::under(&base.join("root"));
+    // A previous attempt merged this store, then stopped before the commit.
+    std::fs::create_dir_all(&paths.root).unwrap();
+    std::fs::write(paths.root.join("trust_update"), b"trust").unwrap();
+    std::fs::write(legacy.layout.config_dir.join("trust_update"), b"trust").unwrap();
+
+    let outcome = relocate(
+        &legacy.layout,
+        &paths,
+        &legacy_root(&legacy.calls),
+        &target(),
+    );
+
+    assert!(matches!(outcome, Ok(Relocation::Moved { .. })));
+    assert_eq!(reopen(&paths).profiles.len(), 1);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn a_crash_after_the_commit_is_cleaned_up_on_the_next_start() {
+    let base = scratch("crash-after-commit");
+    let legacy = legacy_vault(&base, &["poste"]);
+    let paths = EnginePaths::under(&base.join("root"));
+    relocate(
+        &legacy.layout,
+        &paths,
+        &legacy_root(&legacy.calls),
+        &target(),
+    )
+    .unwrap();
+    let config = &legacy.layout.config_dir;
+    std::fs::write(config.join(DEVICE_ROOT_FILE), ROOT).unwrap();
+    std::fs::write(config.join(LEGACY_FILE), b"[]").unwrap();
+    std::fs::write(config.join("orion.log"), b"journal").unwrap();
+
+    let outcome = relocate(
+        &legacy.layout,
+        &paths,
+        &legacy_root(&legacy.calls),
+        &target(),
+    );
+
+    assert_eq!(
+        outcome.unwrap(),
+        Relocation::AlreadyDone {
+            legacy_removed: true
+        }
+    );
+    assert!(!config.join(DEVICE_ROOT_FILE).exists());
+    assert!(!config.join(LEGACY_FILE).exists());
+    assert_eq!(std::fs::read(config.join("orion.log")).unwrap(), b"journal");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn a_stray_file_beside_the_identities_does_not_block_the_migration() {
+    let base = scratch("stray-file");
+    let legacy = legacy_vault(&base, &["poste"]);
+    let paths = EnginePaths::under(&base.join("root"));
+    std::fs::write(legacy.layout.identities_dir.join("notes.txt"), b"memo").unwrap();
+
+    let outcome = relocate(
+        &legacy.layout,
+        &paths,
+        &legacy_root(&legacy.calls),
+        &target(),
+    );
+
+    assert!(matches!(outcome, Ok(Relocation::Moved { .. })));
+    assert_eq!(
+        std::fs::read(paths.identities.join("notes.txt")).unwrap(),
+        b"memo",
+        "the stray file is copied, without verification"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlink_in_the_legacy_tree_is_neither_copied_nor_followed() {
+    let base = scratch("symlink-copy");
+    let legacy = legacy_vault(&base, &["poste"]);
+    let paths = EnginePaths::under(&base.join("root"));
+    let outside = base.join("outside.txt");
+    std::fs::write(&outside, b"not the vault").unwrap();
+    let config = &legacy.layout.config_dir;
+    std::os::unix::fs::symlink(&outside, config.join("trust_update")).unwrap();
+    std::fs::create_dir_all(config.join("certificate_renewal")).unwrap();
+    std::os::unix::fs::symlink(
+        &outside,
+        config.join("certificate_renewal").join("link.json"),
+    )
+    .unwrap();
+
+    let outcome = relocate(
+        &legacy.layout,
+        &paths,
+        &legacy_root(&legacy.calls),
+        &target(),
+    );
+
+    assert!(matches!(outcome, Ok(Relocation::Moved { .. })));
+    assert!(
+        !paths.root.join("trust_update").exists(),
+        "a link is not copied"
+    );
+    assert!(!paths
+        .root
+        .join("certificate_renewal")
+        .join("link.json")
+        .exists());
+    assert_eq!(std::fs::read(&outside).unwrap(), b"not the vault");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[cfg(unix)]
+#[test]
+fn the_cleanup_never_deletes_through_a_symlink() {
+    let base = scratch("symlink-cleanup");
+    let legacy = legacy_vault(&base, &["poste"]);
+    let paths = EnginePaths::under(&base.join("root"));
+    relocate(
+        &legacy.layout,
+        &paths,
+        &legacy_root(&legacy.calls),
+        &target(),
+    )
+    .unwrap();
+    let outside = base.join("outside.txt");
+    std::fs::write(&outside, b"survivor").unwrap();
+    let config = &legacy.layout.config_dir;
+    std::os::unix::fs::symlink(&outside, config.join("trust_update")).unwrap();
+
+    let outcome = relocate(
+        &legacy.layout,
+        &paths,
+        &legacy_root(&legacy.calls),
+        &target(),
+    );
+
+    assert!(matches!(outcome, Ok(Relocation::AlreadyDone { .. })));
+    assert_eq!(std::fs::read(&outside).unwrap(), b"survivor");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Entries of a directory, sorted, for the tests.
+fn children_of(dir: &Path) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    paths.sort();
+    paths
+}
 #[test]
 fn the_logs_are_neither_moved_nor_deleted() {
     let base = scratch("logs");

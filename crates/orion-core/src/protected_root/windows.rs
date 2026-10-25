@@ -290,8 +290,13 @@ fn sid_to_string(sid: PSID) -> Result<String, RootError> {
 
 impl EnginePaths {
     /// Creates, or checks, the protected root of the user `sid`, and returns
-    /// the paths under it. The vault and the identities directories are
-    /// created in it, and inherit its access list.
+    /// the paths under it. The identities directory is created in it, and
+    /// inherits its access list.
+    ///
+    /// The vault directory is **not** created here. A vault directory present
+    /// before the migration would read as a vault already in place, and a
+    /// legacy vault in the per-user folder would then never be moved. The
+    /// store creates the vault when it first writes to it.
     pub fn establish_for(sid: &str) -> Result<Self, RootError> {
         if !is_plain_sid(sid) {
             return Err(RootError::Unavailable(
@@ -309,11 +314,9 @@ impl EnginePaths {
             user_sid: Some(sid.to_string()),
             ..Self::under(&root)
         };
-        for directory in [&paths.vault, &paths.identities] {
-            std::fs::create_dir_all(directory).map_err(|error| {
-                RootError::Unavailable(format!("dossier d'Orion impossible à créer ({error})"))
-            })?;
-        }
+        std::fs::create_dir_all(&paths.identities).map_err(|error| {
+            RootError::Unavailable(format!("dossier d'Orion impossible à créer ({error})"))
+        })?;
         Ok(paths)
     }
 }

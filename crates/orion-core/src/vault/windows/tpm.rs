@@ -916,10 +916,11 @@ mod imp {
         if status != 0 {
             return Err(fail("opening the TPM key to delete it", status));
         }
-        // No `Handle` guard here: NCryptDeleteKey releases the key handle
-        // whatever its outcome, so freeing it again would be a double free.
+        // NCryptDeleteKey releases the key handle when it succeeds. When it fails
+        // the handle is still ours, and it is freed here.
         let status = unsafe { NCryptDeleteKey(key as NCRYPT_HANDLE, NCRYPT_SILENT_FLAG) };
         if status != 0 {
+            unsafe { NCryptFreeObject(key as NCRYPT_HANDLE) };
             return Err(fail("deleting the TPM key", status));
         }
         Ok(())

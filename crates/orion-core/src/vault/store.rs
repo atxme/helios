@@ -443,6 +443,13 @@ impl ProfileStore {
         Ok(ClientConfig { profiles, selected })
     }
 
+    /// Number of entries in the registry. A migration checks the loaded
+    /// profiles against it, and cannot use [`Self::load`] to count.
+    pub(crate) fn registered_count(&self) -> Result<usize, VaultError> {
+        let root = self.root()?;
+        Ok(self.load_registry(&root)?.entries.len())
+    }
+
     /// Names of the profiles blocked until their key is rotated.
     pub fn rotation_required(&self) -> Result<Vec<String>, VaultError> {
         let root = self.root()?;
