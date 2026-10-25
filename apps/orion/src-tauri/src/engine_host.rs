@@ -97,7 +97,7 @@ pub fn run(args: EngineArgs) -> i32 {
 
     let parent = match ParentWatch::open(args.ui_pid, args.ui_created_at) {
         Ok(parent) => parent,
-        Err(error) => return refused_before_log(LifecycleEvent::ParentMissing, error),
+        Err(error) => return exit_before_log(LifecycleEvent::ParentMissing, error),
     };
 
     let current_exe = match std::env::current_exe() {
@@ -106,11 +106,11 @@ pub fn run(args: EngineArgs) -> i32 {
     };
     let expected = match launcher_client(args.ui_pid, &current_exe) {
         Ok(expected) => expected,
-        Err(error) => return refused_before_log(LifecycleEvent::ClientRefused, error),
+        Err(error) => return exit_before_log(LifecycleEvent::ClientRefused, error),
     };
     let sid = match process_user_sid(args.ui_pid) {
         Ok(sid) => sid,
-        Err(error) => return refused_before_log(LifecycleEvent::ClientRefused, error),
+        Err(error) => return exit_before_log(LifecycleEvent::ClientRefused, error),
     };
 
     // The engine never falls back to a per-user directory: when the protected
@@ -205,7 +205,7 @@ fn startup_failed(error: impl Display) -> i32 {
 /// Writes a start-up failure to stderr, before the log exists, and returns the
 /// exit code of the session event it stands for.
 #[cfg(windows)]
-fn refused_before_log(event: LifecycleEvent, error: impl Display) -> i32 {
+fn exit_before_log(event: LifecycleEvent, error: impl Display) -> i32 {
     eprintln!("moteur d'Orion : démarrage refusé : {error}");
     exit_code(event)
 }
