@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use orion_core::events::ClientEvent;
-use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, BufReader};
+use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot, watch, Mutex as AsyncMutex};
 
 use crate::command::{EngineCommand, EngineReply};
@@ -29,6 +29,9 @@ const IN_PROCESS_PIPE: usize = 64 * 1024;
 
 type Answer = oneshot::Sender<Result<EngineReply, String>>;
 
+/// The write half, shared by the calls and by the reader's exit.
+type Writer = Arc<AsyncMutex<Box<dyn AsyncWrite + Send + Unpin>>>;
+
 /// State shared by the calls and the reader task.
 #[derive(Default)]
 struct Pending {
@@ -40,7 +43,7 @@ struct Pending {
 
 /// The UI's handle on the engine. Calls may run concurrently.
 pub struct EngineClient {
-    writer: AsyncMutex<Box<dyn AsyncWrite + Send + Unpin>>,
+    writer: Writer,
     next_id: AtomicU64,
     pending: Arc<Mutex<Pending>>,
     closed: watch::Receiver<bool>,
@@ -48,6 +51,9 @@ pub struct EngineClient {
 
 impl EngineClient {
     /// Sends one command and waits for its reply.
+    ///
+    /// Not cancel-safe: dropping the future mid-write leaves a partial frame
+    /// and the engine ends the session. Do not wrap it in a cancelling timeout.
     pub async fn call(&self, command: EngineCommand) -> Result<EngineReply, String> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (answer, reply) = oneshot::channel();
@@ -111,17 +117,21 @@ where
         .map_err(|_| "Connexion au moteur impossible.".to_owned())?;
 
     let pending = Arc::new(Mutex::new(Pending::default()));
+    let writer: Writer = Arc::new(AsyncMutex::new(Box::new(write_half)));
     let (events_tx, events_rx) = mpsc::channel(EVENT_QUEUE);
     let (closed_tx, closed_rx) = watch::channel(false);
     tokio::spawn(read_frames(
         BufReader::new(read_half),
-        pending.clone(),
+        ReaderExit {
+            pending: pending.clone(),
+            writer: writer.clone(),
+            closed: closed_tx,
+        },
         events_tx,
-        closed_tx,
     ));
 
     let client = EngineClient {
-        writer: AsyncMutex::new(Box::new(write_half)),
+        writer,
         next_id: AtomicU64::new(0),
         pending,
         closed: closed_rx,
@@ -141,20 +151,45 @@ pub async fn in_process<E: Engine>(
     connect(ui_end, &token).await
 }
 
+/// What the reader does however it exits: no call may wait on a dead session,
+/// and the engine must see the UI leave. Runs in `Drop`, so a reader that
+/// panics or is aborted does it too.
+struct ReaderExit {
+    pending: Arc<Mutex<Pending>>,
+    writer: Writer,
+    closed: watch::Sender<bool>,
+}
+
+impl Drop for ReaderExit {
+    fn drop(&mut self) {
+        {
+            let mut state = lock(&self.pending);
+            state.closed = true;
+            state.waiting.clear();
+        }
+        self.closed.send_replace(true);
+        // Closing the write half needs an await: it is done in a detached task.
+        // Outside a runtime there is nothing to close it on, and the stream
+        // goes with the process.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let writer = self.writer.clone();
+            handle.spawn(async move {
+                let _ = writer.lock().await.shutdown().await;
+            });
+        }
+    }
+}
+
 /// Dispatches replies to their calls and events to the receiver, until the
 /// stream ends or breaks.
-async fn read_frames<R>(
-    mut reader: R,
-    pending: Arc<Mutex<Pending>>,
-    events: mpsc::Sender<ClientEvent>,
-    closed: watch::Sender<bool>,
-) where
+async fn read_frames<R>(mut reader: R, exit: ReaderExit, events: mpsc::Sender<ClientEvent>)
+where
     R: AsyncBufRead + Unpin,
 {
     loop {
         match read_frame::<_, EngineFrame>(&mut reader, limits::REPLY_BYTES).await {
             Ok(Some(EngineFrame::Reply { id, result })) => {
-                let answer = lock(&pending).waiting.remove(&id);
+                let answer = lock(&exit.pending).waiting.remove(&id);
                 if let Some(answer) = answer {
                     let _ = answer.send(result.map(|reply| *reply));
                 }
@@ -167,12 +202,6 @@ async fn read_frames<R>(
             Ok(None) | Err(_) => break,
         }
     }
-    {
-        let mut state = lock(&pending);
-        state.closed = true;
-        state.waiting.clear();
-    }
-    closed.send_replace(true);
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {

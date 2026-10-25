@@ -57,7 +57,9 @@ pub enum ServeOutcome {
 /// Serves one UI session on `stream` until it ends.
 ///
 /// A refused hello returns at once and never reaches the engine. Once the UI
-/// is authenticated, every exit runs [`Engine::teardown`].
+/// is authenticated, every exit runs [`Engine::teardown`], and only after
+/// every running command has stopped. Dropping this future skips teardown:
+/// callers drive it to completion.
 pub async fn serve<S, E>(stream: S, token: &SessionToken, engine: Arc<E>) -> ServeOutcome
 where
     S: AsyncRead + AsyncWrite + Send + 'static,
@@ -153,7 +155,10 @@ where
             () = queue.overflow() => break ServeOutcome::EventsOverflowed,
         }
     };
+    // Abort only asks: a command stops when its future is dropped, and
+    // teardown must not run beside one still in flight.
     tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
     outcome
 }
 

@@ -27,8 +27,31 @@ struct Fake {
     teardowns: AtomicUsize,
     release: Notify,
     flood_done: Notify,
-    slowest_push: Mutex<Duration>,
+    flood_took: Mutex<Duration>,
     overflow_seen: AtomicBool,
+    in_flight: AtomicUsize,
+    in_flight_at_teardown: AtomicUsize,
+    entered: Notify,
+    gate: Notify,
+    late: AtomicBool,
+}
+
+/// Counts a command as running from its first poll until it is dropped, so an
+/// aborted command counts as stopped only once its future is really gone.
+struct Running<'a>(&'a Fake);
+
+impl<'a> Running<'a> {
+    fn enter(fake: &'a Fake) -> Self {
+        fake.in_flight.fetch_add(1, Ordering::SeqCst);
+        fake.entered.notify_one();
+        Self(fake)
+    }
+}
+
+impl Drop for Running<'_> {
+    fn drop(&mut self) {
+        self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 fn telemetry() -> ClientEvent {
@@ -54,6 +77,12 @@ impl Engine for Fake {
                 self.release.notified().await;
                 Ok(EngineReply::Unit)
             }
+            EngineCommand::RunSpeedTest { mode } if mode == "block" => {
+                let _running = Running::enter(self);
+                self.gate.notified().await;
+                self.late.store(true, Ordering::SeqCst);
+                Ok(EngineReply::Unit)
+            }
             EngineCommand::Connect { .. } => {
                 let sink = events.sink();
                 sink(ClientEvent::state(TunnelState::Connecting));
@@ -61,13 +90,11 @@ impl Engine for Fake {
             }
             EngineCommand::GetConfig => {
                 let sink = events.sink();
-                let mut slowest = Duration::ZERO;
+                let started = Instant::now();
                 for _ in 0..10_000 {
-                    let started = Instant::now();
                     sink(telemetry());
-                    slowest = slowest.max(started.elapsed());
                 }
-                *self.slowest_push.lock().expect("the test lock") = slowest;
+                *self.flood_took.lock().expect("the test lock") = started.elapsed();
                 self.flood_done.notify_one();
                 Ok(EngineReply::Unit)
             }
@@ -87,6 +114,8 @@ impl Engine for Fake {
     }
 
     async fn teardown(&self) {
+        self.in_flight_at_teardown
+            .store(self.in_flight.load(Ordering::SeqCst), Ordering::SeqCst);
         self.teardowns.fetch_add(1, Ordering::SeqCst);
     }
 }
@@ -237,14 +266,14 @@ async fn a_stalled_client_never_blocks_the_controller() {
     session.request(1, EngineCommand::GetConfig).await;
 
     // The UI never reads. The engine must still push all its telemetry,
-    // and each push must return at once.
+    // and the 10 000 pushes must return at once.
     tokio::time::timeout(WAIT, fake.flood_done.notified())
         .await
         .expect("the flood finishes");
-    let slowest = *fake.slowest_push.lock().expect("the test lock");
+    let took = *fake.flood_took.lock().expect("the test lock");
     assert!(
-        slowest < Duration::from_millis(10),
-        "slowest sink call: {slowest:?}"
+        took < Duration::from_millis(250),
+        "10 000 sink calls took {took:?}"
     );
 
     drop(session.ui);
@@ -256,6 +285,8 @@ async fn a_stalled_client_never_blocks_the_controller() {
 
 #[tokio::test]
 async fn critical_events_are_never_dropped() {
+    // Depends on the current-thread runtime: the command never awaits, so the
+    // queue fills before the loop gets a turn to drain it.
     let fake = Arc::new(Fake::default());
     let mut session = start(fake.clone(), SMALL_PIPE);
     session.hello().await;
@@ -379,4 +410,35 @@ async fn a_slow_command_does_not_hold_back_another() {
     fake.release.notify_one();
     let (second, _) = session.reply().await;
     assert_eq!(second, 1);
+}
+
+#[tokio::test]
+async fn teardown_waits_for_running_commands() {
+    let fake = Arc::new(Fake::default());
+    let mut session = start(fake.clone(), PIPE);
+    session.hello().await;
+    session
+        .request(
+            1,
+            EngineCommand::RunSpeedTest {
+                mode: "block".into(),
+            },
+        )
+        .await;
+    tokio::time::timeout(WAIT, fake.entered.notified())
+        .await
+        .expect("the command started");
+
+    drop(session.ui);
+    assert!(matches!(
+        timeout_wait(session.engine).await,
+        ServeOutcome::ClientLeft
+    ));
+    assert_eq!(fake.in_flight_at_teardown.load(Ordering::SeqCst), 0);
+    assert_eq!(fake.teardowns.load(Ordering::SeqCst), 1);
+
+    // Opening the gate now must not resume the aborted command.
+    fake.gate.notify_one();
+    tokio::task::yield_now().await;
+    assert!(!fake.late.load(Ordering::SeqCst));
 }
