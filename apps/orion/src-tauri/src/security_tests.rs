@@ -563,3 +563,39 @@ fn enrollment_commands_never_return_private_material() {
         }
     }
 }
+
+/// The engine restricts DLL search before it does anything else.
+///
+/// Comments are ignored, so a comment cannot stand in for the call. In `run`,
+/// nothing may precede `SetDefaultDllDirectories(` but its own argument-less
+/// `unsafe` block, and the logging, randomness and backend start-up come after.
+#[test]
+fn the_engine_restricts_dll_search_first() {
+    let source = include_str!("engine_host.rs");
+    let code: String = source
+        .lines()
+        .map(|line| line.split("//").next().unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let body = code
+        .split("pub fn run(")
+        .nth(1)
+        .expect("run is defined in engine_host.rs");
+    let restriction = body
+        .find("SetDefaultDllDirectories(")
+        .expect("the engine restricts its DLL search");
+    assert!(
+        !body[..restriction].contains('('),
+        "a call precedes the DLL restriction in engine_host::run"
+    );
+    for later in [
+        "init_logging(",
+        "configure(",
+        "default_backend(",
+        "for_current_user(",
+    ] {
+        if let Some(at) = body.find(later) {
+            assert!(restriction < at, "{later} runs before the DLL restriction");
+        }
+    }
+}

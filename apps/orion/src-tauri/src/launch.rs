@@ -64,11 +64,18 @@ impl Drop for Token {
     }
 }
 
+/// Whether this process's own token is elevated. An unreadable token is an error,
+/// never "not elevated": the engine refuses to start on it.
+#[cfg(windows)]
+pub fn current_token_is_elevated() -> Result<bool, String> {
+    let token = own_token()?;
+    is_elevated(&token)
+}
+
 /// Refuses to launch anything while the UI's own token is elevated.
 #[cfg(windows)]
 pub fn refuse_if_elevated() -> Result<(), String> {
-    let token = own_token()?;
-    let elevated = is_elevated(&token)?;
+    let elevated = current_token_is_elevated()?;
     if !should_launch(elevated) {
         return Err("Orion s'exécute en administrateur : lancement refusé.".into());
     }

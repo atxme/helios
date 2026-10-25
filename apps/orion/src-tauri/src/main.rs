@@ -46,11 +46,15 @@ use std::{
 
 use orion_core::{backend::EventSink, default_backend, ClientEvent};
 use orion_engine::client::EngineClient;
+use orion_engine::lifecycle::{EngineArgs, BAD_ARGUMENTS};
 use orion_engine::service::{EngineService, PROFILE_EXTENSION};
 use orion_engine::EngineCommand;
 #[cfg(target_os = "windows")]
 use tauri::WindowEvent;
 use tauri::{AppHandle, Emitter, Manager, State};
+
+/// Engine mode: the elevated process the UI launches, with no window.
+mod engine_host;
 
 /// Launches from the UI (SSH terminal, Astra companion). Each one is refused
 /// while the UI's own token is elevated; only that check is Windows-specific.
@@ -337,8 +341,13 @@ fn associated_profile_paths(args: &[String], cwd: &Path) -> Vec<PathBuf> {
 /// `defguard_wireguard_rs 0.12` opens WireGuardNT via a relative path fixed
 /// in its source. A double-click gives Orion a current directory that may
 /// be the profile's; we replace it before building the backend.
+///
+/// Returns the directory it selected. `allow_workspace_fallback` is what the
+/// engine turns off in release builds: see [`engine_host::wireguard_source_dir`].
 #[cfg(all(target_os = "windows", feature = "wireguard"))]
-fn prepare_wireguard_nt_working_directory() -> anyhow::Result<()> {
+fn prepare_wireguard_nt_working_directory(
+    allow_workspace_fallback: bool,
+) -> anyhow::Result<PathBuf> {
     #[cfg(target_arch = "x86_64")]
     const DLL: &str = "resources-windows/binaries/wireguard-amd64.dll";
     #[cfg(target_arch = "aarch64")]
@@ -348,26 +357,24 @@ fn prepare_wireguard_nt_working_directory() -> anyhow::Result<()> {
         .parent()
         .map(Path::to_path_buf)
         .ok_or_else(|| anyhow::anyhow!("Orion binary directory not found"))?;
-    let source_dir = if executable_dir.join(DLL).is_file() {
-        executable_dir
-    } else {
-        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .ancestors()
-            .nth(3)
-            .ok_or_else(|| anyhow::anyhow!("Orion workspace root not found"))?;
-        if !workspace.join(DLL).is_file() {
-            anyhow::bail!(
-                "WireGuardNT is missing ({DLL}); rebuild Orion so its Windows dependencies are prepared"
-            );
-        }
-        workspace.to_path_buf()
-    };
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(3)
+        .ok_or_else(|| anyhow::anyhow!("Orion workspace root not found"))?;
+    let source_dir = engine_host::wireguard_source_dir(
+        &executable_dir,
+        workspace,
+        DLL,
+        allow_workspace_fallback,
+    )
+    .map_err(|message| anyhow::anyhow!(message))?;
     std::env::set_current_dir(&source_dir).map_err(|error| {
         anyhow::anyhow!(
             "unable to select WireGuardNT resources in {}: {error}",
             source_dir.display()
         )
-    })
+    })?;
+    Ok(source_dir)
 }
 
 /// Default log filter.
@@ -478,6 +485,16 @@ fn init_logging() -> Option<PathBuf> {
 }
 
 fn main() {
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    match EngineArgs::parse(&arguments) {
+        Err(message) => {
+            eprintln!("{message}");
+            std::process::exit(BAD_ARGUMENTS);
+        }
+        Ok(Some(engine)) => std::process::exit(engine_host::run(engine)),
+        Ok(None) => {}
+    }
+
     let log_path = init_logging();
     if let Some(path) = &log_path {
         tracing::info!(fichier = %path.display(), "journal d'Orion");
@@ -510,7 +527,7 @@ fn main() {
     let pending_profile_paths = associated_profile_paths(&startup_args, &startup_cwd).into();
 
     #[cfg(all(target_os = "windows", feature = "wireguard"))]
-    prepare_wireguard_nt_working_directory()
+    prepare_wireguard_nt_working_directory(true)
         .expect("unable to prepare the WireGuardNT DLL shipped with Orion");
 
     let backend = default_backend().expect(
