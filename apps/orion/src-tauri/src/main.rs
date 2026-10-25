@@ -43,14 +43,13 @@ use std::{
 use aether::{SecretString, TunnelState};
 use orion_core::{
     backend::EventSink, complete_profile_import, default_backend, inspect_profile,
-    parse_profile_import, read_profile_import_path, ClientConfig, ClientEvent, ClientProfile,
-    ProfileIssues, ProtectedIdentityStore, VpnController,
+    parse_profile_import, read_profile_import_path, ClientEvent, ClientProfile, ProfileIssues,
+    ProtectedIdentityStore,
 };
-use orion_engine::service::{EngineService, PROFILE_EXTENSION};
+use orion_engine::service::{certificates::now_unix, EngineService, PROFILE_EXTENSION};
 #[cfg(target_os = "windows")]
 use tauri::WindowEvent;
 use tauri::{AppHandle, Emitter, Manager, State};
-use tokio::sync::Mutex;
 
 /// De-elevation of the SSH terminal. Windows-only: it rests on the linked
 /// token UAC produces, which has no equivalent elsewhere.
@@ -94,20 +93,6 @@ struct AppState {
     /// rotation now runs through.
     operator: operator::OperatorCeremony,
 }
-
-/// Polling interval for the last WireGuard handshake.
-///
-/// WireGuard is connectionless: the `Up` state is inferred from handshake
-/// freshness, it's never notified (ADR-001 §3). Without this loop, the UI
-/// would stay stuck on the last known state.
-///
-/// Three seconds rather than ten: this loop is what turns a tunnel that has
-/// stopped answering into a visible state change, and ten seconds of a
-/// screen claiming a dead tunnel is alive is ten seconds too many. A
-/// negotiated connection no longer waits on it to *reach* `Up` — the
-/// negotiation announces it itself, having just observed the handshake — but it
-/// is still what makes it leave that state, a lost session link included.
-const HANDSHAKE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
 
 #[cfg(debug_assertions)]
 const FRONTEND_DEV_PORT: u16 = 1420;
@@ -259,19 +244,6 @@ fn hide_main_window_on_close(window: &tauri::Window, event: &WindowEvent) {
 // comes from the ML-KEM PSK, automatically negotiated after the classic
 // tunnel is mounted as soon as the profile carries an internal Helios URL —
 // see `orion_core::backend::upgrade_to_post_quantum`.
-
-/// Wall clock in Unix seconds, for the lifecycle's own arithmetic.
-///
-/// A clock behind the certificate's `not_before` reads as "not yet valid" and
-/// one far ahead reads as expired, which is exactly what the connection would
-/// conclude: the panel is wrong in the same direction as the failure, rather
-/// than reassuring while the handshake refuses.
-fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs())
-        .unwrap_or_default()
-}
 
 /// The extension distributed until August 2026.
 ///

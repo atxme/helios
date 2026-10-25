@@ -21,6 +21,8 @@ use crate::events::EventQueue;
 use crate::serve::Engine;
 
 mod app;
+pub mod certificates;
+mod connection;
 pub use app::PROFILE_EXTENSION;
 
 /// The tunnel-side state of the engine, held for the life of the process.
@@ -346,12 +348,18 @@ impl Engine for EngineService {
                 .run_speed_test(mode, events)
                 .await
                 .map(EngineReply::SpeedTest),
+            EngineCommand::Connect { name } => self
+                .start_connection(events, name)
+                .await
+                .map(|()| EngineReply::Unit),
+            EngineCommand::Disconnect => self
+                .stop_connection(events.sink())
+                .await
+                .map(|()| EngineReply::Unit),
+            EngineCommand::RenewPsk => self.renew_psk(events).await.map(|()| EngineReply::Unit),
             // Served by the transport before it reaches the engine.
             EngineCommand::Shutdown => Ok(EngineReply::Unit),
-            EngineCommand::Connect { .. }
-            | EngineCommand::Disconnect
-            | EngineCommand::RenewPsk
-            | EngineCommand::GetConfig
+            EngineCommand::GetConfig
             | EngineCommand::ImportProfile { .. }
             | EngineCommand::ImportProfilePath { .. }
             | EngineCommand::VaultPosture
@@ -386,17 +394,8 @@ impl Engine for EngineService {
     /// Disconnects and stops what the connection started. The event side is
     /// discarded: the UI that would have listened has gone. Idempotent.
     async fn teardown(&self) {
-        self.telemetry.stop();
-        let poll = self
-            .handshake_poll
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        if let Some(poll) = poll {
-            poll.abort();
-        }
         let discard: EventSink = Arc::new(|_| {});
-        if let Err(error) = self.controller.disconnect(discard).await {
+        if let Err(error) = self.stop_connection(discard).await {
             tracing::warn!(%error, "déconnexion à la fermeture du moteur");
         }
     }

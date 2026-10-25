@@ -130,7 +130,7 @@ fn no_secret_is_ever_serialised_towards_the_interface() {
         .map(aether::SecretString::duplicate)
         .expect("psk");
 
-    let config = super::ClientConfig {
+    let config = orion_core::ClientConfig {
         profiles: vec![profile],
         selected: Some("poste".into()),
     };
