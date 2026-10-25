@@ -588,12 +588,30 @@ fn the_engine_restricts_dll_search_first() {
         !body[..restriction].contains('('),
         "a call precedes the DLL restriction in engine_host::run"
     );
-    for later in [
-        "init_logging(",
-        "configure(",
-        "default_backend(",
-        "for_current_user(",
+    let call_end = restriction
+        + body[restriction..]
+            .find("== 0")
+            .expect("the restriction's failure is checked");
+    let call = &body[restriction..call_end];
+    for flag in [
+        "LOAD_LIBRARY_SEARCH_SYSTEM32",
+        "LOAD_LIBRARY_SEARCH_APPLICATION_DIR",
+        "LOAD_LIBRARY_SEARCH_USER_DIRS",
     ] {
+        assert!(call.contains(flag), "the restriction lacks {flag}");
+    }
+
+    let elevation = body
+        .find("current_token_is_elevated(")
+        .expect("the engine checks its elevation");
+    let logging = body
+        .find("init_logging(")
+        .expect("the engine starts its log");
+    assert!(
+        restriction < elevation && elevation < logging,
+        "the elevation check must come after the DLL restriction and before the log"
+    );
+    for later in ["configure(", "default_backend(", "for_current_user("] {
         if let Some(at) = body.find(later) {
             assert!(restriction < at, "{later} runs before the DLL restriction");
         }

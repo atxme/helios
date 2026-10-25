@@ -1,6 +1,5 @@
 use super::*;
 
-use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DLL: &str = "wireguard-test.dll";

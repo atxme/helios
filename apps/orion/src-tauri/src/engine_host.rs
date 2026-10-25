@@ -7,7 +7,9 @@
 //! `orion_engine::lifecycle` and `orion_engine::pipe`, tested under Linux.
 
 #[cfg(any(windows, test))]
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(any(all(windows, feature = "wireguard"), test))]
+use std::path::PathBuf;
 
 use orion_engine::lifecycle::EngineArgs;
 
@@ -16,7 +18,7 @@ use orion_engine::lifecycle::BAD_ARGUMENTS;
 
 #[cfg(windows)]
 use std::fmt::Display;
-#[cfg(windows)]
+#[cfg(all(windows, feature = "wireguard"))]
 use std::os::windows::ffi::OsStrExt;
 #[cfg(windows)]
 use std::sync::Arc;
@@ -35,15 +37,17 @@ use orion_engine::pipe::{
     verify_client, ExpectedClient,
 };
 #[cfg(windows)]
-use orion_engine::serve::{serve, Engine};
+use orion_engine::serve::{serve_until, Engine};
 #[cfg(windows)]
 use orion_engine::service::EngineService;
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE};
+#[cfg(all(windows, feature = "wireguard"))]
+use windows_sys::Win32::System::LibraryLoader::AddDllDirectory;
 #[cfg(windows)]
 use windows_sys::Win32::System::LibraryLoader::{
-    AddDllDirectory, SetDefaultDllDirectories, LOAD_LIBRARY_SEARCH_APPLICATION_DIR,
-    LOAD_LIBRARY_SEARCH_SYSTEM32, LOAD_LIBRARY_SEARCH_USER_DIRS,
+    SetDefaultDllDirectories, LOAD_LIBRARY_SEARCH_APPLICATION_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32,
+    LOAD_LIBRARY_SEARCH_USER_DIRS,
 };
 #[cfg(windows)]
 use windows_sys::Win32::System::Threading::{
@@ -72,18 +76,26 @@ pub fn run(args: EngineArgs) -> i32 {
         return STARTUP_FAILED;
     }
 
+    // Before the log: a `--engine` started by hand without elevation must not
+    // truncate the UI's log file. Nothing is written until this passes.
+    match crate::launch::current_token_is_elevated() {
+        Ok(true) => {}
+        Ok(false) => {
+            eprintln!("le moteur d'Orion doit être élevé.");
+            return STARTUP_FAILED;
+        }
+        Err(error) => {
+            eprintln!("le moteur d'Orion ne peut pas lire son élévation : {error}");
+            return STARTUP_FAILED;
+        }
+    }
+
     let log_path = crate::init_logging();
     let drbg = match aether::random::configure() {
         Ok(drbg) => drbg,
         Err(error) => return startup_failed(error),
     };
     tracing::info!(%drbg, "randomness provider");
-
-    match crate::launch::current_token_is_elevated() {
-        Ok(true) => {}
-        Ok(false) => return startup_failed("le moteur d'Orion doit être élevé"),
-        Err(error) => return startup_failed(error),
-    }
 
     let parent = match ParentWatch::open(args.ui_pid, args.ui_created_at) {
         Ok(parent) => parent,
@@ -103,14 +115,9 @@ pub fn run(args: EngineArgs) -> i32 {
         Err(error) => return fail(LifecycleEvent::ClientRefused, error),
     };
 
-    let source_dir = match crate::prepare_wireguard_nt_working_directory(cfg!(debug_assertions)) {
-        Ok(dir) => dir,
-        Err(error) => return startup_failed(error),
-    };
-    if current_exe.parent() != Some(source_dir.as_path()) {
-        if let Err(error) = add_dll_directory(&source_dir) {
-            return startup_failed(error);
-        }
+    #[cfg(all(windows, feature = "wireguard"))]
+    if let Err(error) = select_wireguard_dir(&current_exe) {
+        return startup_failed(error);
     }
 
     let backend = match default_backend() {
@@ -151,7 +158,7 @@ pub fn run(_args: EngineArgs) -> i32 {
 /// workspace when the caller allows that. The engine allows it in debug builds
 /// only: an elevated process must not load a DLL from a folder the user can
 /// write to.
-#[cfg(any(windows, test))]
+#[cfg(any(all(windows, feature = "wireguard"), test))]
 pub(crate) fn wireguard_source_dir(
     executable_dir: &Path,
     workspace: &Path,
@@ -217,8 +224,20 @@ fn launcher_client(ui_pid: u32, current_exe: &Path) -> Result<ExpectedClient, St
         .map_err(|refusal| refusal.to_string())
 }
 
+/// Selects WireGuardNT's directory, and adds it to the restricted DLL search
+/// when it is not the executable's own. Without the feature the backend is the
+/// dry run, and there is nothing to prepare.
+#[cfg(all(windows, feature = "wireguard"))]
+fn select_wireguard_dir(current_exe: &Path) -> anyhow::Result<()> {
+    let source_dir = crate::prepare_wireguard_nt_working_directory(cfg!(debug_assertions))?;
+    if current_exe.parent() != Some(source_dir.as_path()) {
+        add_dll_directory(&source_dir).map_err(anyhow::Error::msg)?;
+    }
+    Ok(())
+}
+
 /// Adds `directory` to the DLL search, which [`run`] has restricted.
-#[cfg(windows)]
+#[cfg(all(windows, feature = "wireguard"))]
 fn add_dll_directory(directory: &Path) -> Result<(), String> {
     let wide: Vec<u16> = directory
         .as_os_str()
@@ -282,10 +301,11 @@ async fn serve_the_ui(
     }
 
     let parent_gone = tokio::task::spawn_blocking(move || parent.wait());
-    tokio::select! {
-        outcome = serve(server, &args.token, Arc::clone(engine)) => LifecycleEvent::from(&outcome),
-        _ = parent_gone => LifecycleEvent::ParentExited,
-    }
+    let outcome = serve_until(server, &args.token, Arc::clone(engine), async move {
+        let _ = parent_gone.await;
+    })
+    .await;
+    LifecycleEvent::from(&outcome)
 }
 
 /// The UI's process handle, held for the whole session. It keeps the process

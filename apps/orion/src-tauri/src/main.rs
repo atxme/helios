@@ -485,8 +485,14 @@ fn init_logging() -> Option<PathBuf> {
 }
 
 fn main() {
-    let arguments: Vec<String> = std::env::args().skip(1).collect();
-    match EngineArgs::parse(&arguments) {
+    let Some(startup_args) = std::env::args_os()
+        .map(|argument| argument.into_string().ok())
+        .collect::<Option<Vec<String>>>()
+    else {
+        eprintln!("argument non lisible");
+        std::process::exit(BAD_ARGUMENTS);
+    };
+    match EngineArgs::parse(startup_args.get(1..).unwrap_or(&[])) {
         Err(message) => {
             eprintln!("{message}");
             std::process::exit(BAD_ARGUMENTS);
@@ -523,7 +529,6 @@ fn main() {
         ensure_frontend_dev_server().expect("unable to prepare Orion's development UI");
 
     let startup_cwd = std::env::current_dir().unwrap_or_default();
-    let startup_args: Vec<String> = std::env::args().collect();
     let pending_profile_paths = associated_profile_paths(&startup_args, &startup_cwd).into();
 
     #[cfg(all(target_os = "windows", feature = "wireguard"))]
