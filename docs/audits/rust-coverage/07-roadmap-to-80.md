@@ -2,7 +2,7 @@
 
 ## Statut et unité de compte
 
-État mesuré et limites du lot suivant : [journal de développement](09-implementation-progress.md). Les nombres historiques ci-dessous restent des références de planification. COV-036 ajoute le déblocage des audits de dépendances avant livraison. Le [deuxième lot](10-certificate-workflows.md) documente la poursuite de COV-003/COV-005/COV-006. Le [troisième lot](11-companion-journal.md) corrige les mutations du compagnon et précise les limites de durabilité restantes.
+État mesuré et limites du lot suivant : [journal de développement](09-implementation-progress.md). Les nombres historiques ci-dessous restent des références de planification. COV-036 ajoute le déblocage des audits de dépendances avant livraison. Le [deuxième lot](10-certificate-workflows.md) documente la poursuite de COV-003/COV-005/COV-006. Le [troisième lot](11-companion-journal.md) corrige les mutations du compagnon. Le [quatrième lot](12-renewal-concurrency.md) vérifie annulation, concurrence et routes privées ; les limites de durabilité et de cible restent explicites.
 
 **Démarrage autorisé par le responsable.** Le premier lot a livré COV-001/COV-002 et leurs tests locaux. Le responsable demande désormais de poursuivre vers **100 % des lignes de production pertinentes** : 80 % reste un jalon symbolique, jamais un critère d’arrêt. COV-003/COV-004/COV-009 constituent le lot suivant ; leur état réel et leurs validations sont consignés dans le journal de développement. Les autres fiches restent ouvertes tant que leurs critères ne sont pas prouvés.
 
@@ -246,7 +246,7 @@ Chaque liste de fichiers désigne des chemins existants, sauf les nouveaux scrip
 
 **Priorité :** P0.
 
-État courant : COV-036 est débloquée pour la révision testée ; COV-003/COV-005/COV-006/COV-020 progressent et restent partielles. Le [journal 11](11-companion-journal.md) mesure 61,40 % global et 70,70 % bibliothèques ; 9 878 lignes restent à couvrir pour le jalon 80 % global au nouveau dénominateur, sans en faire une fin de mission. Restent notamment annulation, concurrence, routes renewal et coupes post-renommage. Les estimations des fiches restent historiques, sans addition automatique aux gains mesurés.
+État courant : COV-036 est débloquée pour la révision testée ; COV-003/COV-005/COV-006/COV-020 progressent et restent partielles. Le [journal 12](12-renewal-concurrency.md) mesure 61,63 % global et 71,04 % bibliothèques ; 9 763 lignes restent à couvrir pour le jalon 80 % global au nouveau dénominateur, sans en faire une fin de mission. Deux courses de publication sont corrigées et l’annulation après écriture du stage est vérifiée ; autres coupes d’annulation, listener Astra mTLS complet et fautes post-renommage restent ouvertes. Les estimations des fiches restent historiques, sans addition automatique aux gains mesurés.
 
 ### COV-005 — Exercer la récupération Astra et sa réconciliation
 
@@ -286,7 +286,7 @@ Chaque liste de fichiers désigne des chemins existants, sauf les nouveaux scrip
 
 **Objectif :** Prouver l’émission déléguée et le raccordement du journal au registre.
 
-**Fichiers concernés :** `crates/astra/src/renewal/approval.rs`, `crates/astra/src/renewal/companion.rs`, `crates/astra/src/renewal/mod.rs`, `crates/astra/src/renewal/request.rs`, `crates/astra/src/renewal/router.rs`, `crates/astra/src/renewal/stage.rs`, `crates/astra/src/renewal/tests.rs`, `crates/astra/src/renewal/test_support.rs`, `crates/astra/src/renewal/workflow_tests.rs`, `crates/astra/src/renewal/workflow_tests/companion.rs`, `crates/astra/src/operations.rs`, `crates/astra/src/operations/tests.rs`, `crates/astra/tests/private_channel.rs`.
+**Fichiers concernés :** `crates/astra/src/renewal/approval.rs`, `crates/astra/src/renewal/companion.rs`, `crates/astra/src/renewal/mod.rs`, `crates/astra/src/renewal/request.rs`, `crates/astra/src/renewal/router.rs`, `crates/astra/src/renewal/stage.rs`, `crates/astra/src/renewal/tests.rs`, `crates/astra/src/renewal/test_support.rs`, `crates/astra/src/renewal/workflow_tests.rs`, `crates/astra/src/renewal/workflow_tests/companion.rs`, `crates/astra/src/renewal/workflow_tests/concurrency.rs`, `crates/astra/src/renewal/workflow_tests/router.rs`, `crates/astra/src/operations.rs`, `crates/astra/src/operations/tests.rs`, `crates/astra/tests/private_channel.rs`.
 
 **Constat vérifié :** 727 lignes production du dossier non couvertes ; request/stage/companion/router à zéro, cinq tests de fenêtre existants.
 
@@ -1196,7 +1196,7 @@ Décisions humaines : définition du contrôle local de production et de Windows
 
 **Titre :** Rafraîchir la référence Rust et corriger la dépendance frontend signalée.
 
-État : blocage levé pour `ed661fb`, confirmé sur `51dc912` au lot 11 ; régression canonique et audits réussis ; sept avertissements RustSec autorisés restent visibles. Voir le journal 10 pour les lockfiles et nouvelles références. Contrôle à rejouer après changement de dépendances et avant livraison, sans gain de couverture crédité.
+État : blocage levé pour `ed661fb`, confirmé sur `51dc912` au lot 11 et `790d559` au lot 12 ; régression canonique et audits réussis ; sept avertissements RustSec autorisés restent visibles. Voir le journal 10 pour les lockfiles et nouvelles références. Contrôle à rejouer après changement de dépendances et avant livraison, sans gain de couverture crédité.
 
 **Objectif :** Rendre la régression canonique verte avant toute fusion ou livraison, sans masquer les audits.
 
