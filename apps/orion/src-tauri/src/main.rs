@@ -46,7 +46,7 @@ use orion_core::{
     parse_profile_import, read_profile_import_path, ClientConfig, ClientEvent, ClientProfile,
     ProfileIssues, ProtectedIdentityStore, VpnController,
 };
-use orion_engine::service::EngineService;
+use orion_engine::service::{EngineService, PROFILE_EXTENSION};
 #[cfg(target_os = "windows")]
 use tauri::WindowEvent;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -80,6 +80,8 @@ use commands::*;
 struct AppState {
     /// The tunnel-side state of the engine, built once at start-up.
     engine: Arc<EngineService>,
+    /// The shell's session with the engine. Commands go through it.
+    client: orion_engine::client::EngineClient,
     pending_profile_paths: StdMutex<VecDeque<PathBuf>>,
     /// The Astra CA-TLS rotation this window is hosting, if one is open.
     ///
@@ -200,6 +202,33 @@ fn emit_sink(app: AppHandle) -> EventSink {
     })
 }
 
+/// Relays what the engine pushes to the frontend.
+///
+/// Speedtest progress goes out on its own channel, as it always did. Every
+/// other event takes the path the commands the shell still serves use.
+fn relay_engine_events(app: AppHandle, mut events: tokio::sync::mpsc::Receiver<ClientEvent>) {
+    let sink = emit_sink(app.clone());
+    tauri::async_runtime::spawn(async move {
+        while let Some(event) = events.recv().await {
+            match event {
+                ClientEvent::SpeedTest { progress } => {
+                    let _ = app.emit("helios://speedtest", &progress);
+                }
+                other => sink(other),
+            }
+        }
+    });
+}
+
+/// Ends Orion when the engine's session ends: the window cannot act without it.
+fn exit_when_engine_closes(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        app.state::<AppState>().client.closed().await;
+        tracing::error!("le moteur d'Orion s'est arrêté");
+        app.exit(1);
+    });
+}
+
 /// Shows the main window after it was hidden in the Windows notification area.
 fn reveal_main_window(app: &AppHandle) -> tauri::Result<()> {
     if let Some(window) = app.get_webview_window("main") {
@@ -243,13 +272,6 @@ fn now_unix() -> u64 {
         .map(|elapsed| elapsed.as_secs())
         .unwrap_or_default()
 }
-
-/// Extension of an Orion profile, without the dot.
-///
-/// It is the extension the installer registers, the one `helios` writes,
-/// and the one the import filter offers. One constant so those three cannot
-/// drift apart.
-const PROFILE_EXTENSION: &str = "orion";
 
 /// The extension distributed until August 2026.
 ///
@@ -476,8 +498,18 @@ fn main() {
             tracing::error!(%error, "emplacements d'Orion introuvables — Orion refuse de démarrer");
             std::process::exit(1)
         });
-    let engine = EngineService::open(paths, backend, log_path).unwrap_or_else(|error| {
-        tracing::error!(%error, "moteur d'Orion impossible à construire — Orion refuse de démarrer");
+    let engine = EngineService::open(paths, backend, log_path, env!("CARGO_PKG_VERSION"))
+        .unwrap_or_else(|error| {
+            tracing::error!(%error, "moteur d'Orion impossible à construire — Orion refuse de démarrer");
+            std::process::exit(1)
+        });
+    // The shell reaches the engine through the in-process session, the same one
+    // a separate engine process would serve. Its events come back on `events`.
+    let (client, events) = tauri::async_runtime::block_on(orion_engine::client::in_process(
+        Arc::clone(&engine),
+    ))
+    .unwrap_or_else(|error| {
+        tracing::error!(%error, "session avec le moteur d'Orion impossible — Orion refuse de démarrer");
         std::process::exit(1)
     });
 
@@ -498,13 +530,16 @@ fn main() {
         .plugin(companion_plugin())
         .manage(AppState {
             engine,
+            client,
             pending_profile_paths: StdMutex::new(pending_profile_paths),
             astra: astra::Ceremony::default(),
             operator: operator::OperatorCeremony::default(),
         })
-        .setup(|_app| {
+        .setup(move |app| {
             #[cfg(target_os = "windows")]
-            tray::install(_app)?;
+            tray::install(app)?;
+            relay_engine_events(app.handle().clone(), events);
+            exit_when_engine_closes(app.handle().clone());
             Ok(())
         })
         .on_window_event(|window, event| {

@@ -6,6 +6,8 @@
 use aether::TunnelState;
 use serde::{Deserialize, Serialize};
 
+use crate::speedtest::SpeedTestProgress;
+
 /// What occupies the `PresharedKey` slot of the current tunnel.
 ///
 /// **A PSK is not a PQC PSK.** Both live in the same WireGuard slot and look
@@ -84,6 +86,9 @@ pub enum ClientEvent {
         rx_pps: u64,
         tx_pps: u64,
     },
+    /// Progress of the raw speedtest, while it runs. Like telemetry, it is
+    /// dropped rather than waited for when the UI is not keeping up.
+    SpeedTest { progress: SpeedTestProgress },
     /// Non-fatal error surfaced to the user.
     Error { message: String },
 }

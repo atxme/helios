@@ -16,6 +16,13 @@ use orion_core::{
 };
 use tokio::sync::{watch, Mutex};
 
+use crate::command::{EngineCommand, EngineReply};
+use crate::events::EventQueue;
+use crate::serve::Engine;
+
+mod app;
+pub use app::PROFILE_EXTENSION;
+
 /// The tunnel-side state of the engine, held for the life of the process.
 ///
 /// Fields stay public while the shell's commands still reach them; each one
@@ -118,6 +125,11 @@ pub struct EngineService {
     /// must never resolve where an ordinary renewal is resumed. Absence
     /// carries the rule; a comparison would only describe it.
     pub recoveries: Arc<Mutex<std::collections::HashMap<String, InFlightRecovery>>>,
+    /// Version of the application the engine runs in, for the About box.
+    ///
+    /// Passed in by the shell: a crate-level `CARGO_PKG_VERSION` here would
+    /// report the engine's own version, not the one the user installed.
+    app_version: &'static str,
 }
 
 impl EngineService {
@@ -126,11 +138,13 @@ impl EngineService {
     /// Only the protected identity store is still resolved from the current
     /// user; the vault and the configuration live under `paths.vault`. A vault
     /// that cannot be read leaves an empty configuration and records why in
-    /// [`EngineService::vault_error`].
+    /// [`EngineService::vault_error`]. `app_version` is the shell's version,
+    /// reported by the About box.
     pub fn open(
         paths: EnginePaths,
         backend: Arc<dyn VpnBackend>,
         log_path: Option<PathBuf>,
+        app_version: &'static str,
     ) -> Result<Arc<Self>, String> {
         let controller = VpnController::new(backend);
         // The protected identity store is the platform's: `orion-core` states
@@ -265,6 +279,7 @@ impl EngineService {
             renewals: Arc::new(Mutex::new(std::collections::HashMap::new())),
             certificate_renewal_task: Arc::new(StdMutex::new(None)),
             recoveries: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            app_version,
         }))
     }
 }
@@ -305,6 +320,86 @@ pub struct StagedKey {
 /// there is none. The screen learns only that a value is waiting.
 pub struct StagedPsk {
     pub value: SecretString,
+}
+
+/// Answer to a command the engine does not serve yet. Each family that moves
+/// into the engine replaces its arms below; the generic one goes away with the
+/// last family.
+const NOT_SERVED: &str = "Cette commande n'est pas servie par le moteur.";
+
+#[async_trait::async_trait]
+impl Engine for EngineService {
+    async fn handle(
+        &self,
+        command: EngineCommand,
+        events: &EventQueue,
+    ) -> Result<EngineReply, String> {
+        match command {
+            EngineCommand::GetState => Ok(EngineReply::State(self.get_state())),
+            EngineCommand::BackendKind => Ok(EngineReply::Backend(self.backend_kind().to_string())),
+            EngineCommand::AdapterIsUp => Ok(EngineReply::Flag(self.adapter_is_up())),
+            EngineCommand::AboutOrion => Ok(EngineReply::About(self.about_orion())),
+            EngineCommand::KeyNegotiationSupport => {
+                Ok(EngineReply::KeyNegotiation(self.key_negotiation_support()))
+            }
+            EngineCommand::RunSpeedTest { mode } => self
+                .run_speed_test(mode, events)
+                .await
+                .map(EngineReply::SpeedTest),
+            // Served by the transport before it reaches the engine.
+            EngineCommand::Shutdown => Ok(EngineReply::Unit),
+            EngineCommand::Connect { .. }
+            | EngineCommand::Disconnect
+            | EngineCommand::RenewPsk
+            | EngineCommand::GetConfig
+            | EngineCommand::ImportProfile { .. }
+            | EngineCommand::ImportProfilePath { .. }
+            | EngineCommand::VaultPosture
+            | EngineCommand::AllowUnencryptedVolume
+            | EngineCommand::GeneratePrivateKey
+            | EngineCommand::AdoptPrivateKey { .. }
+            | EngineCommand::DiscardStagedKey
+            | EngineCommand::AdoptPresharedKey { .. }
+            | EngineCommand::DiscardStagedPsk
+            | EngineCommand::SshCommand { .. }
+            | EngineCommand::SaveProfile { .. }
+            | EngineCommand::DeleteProfile { .. }
+            | EngineCommand::SelectProfile { .. }
+            | EngineCommand::ValidateProfile { .. }
+            | EngineCommand::PreviewEnrollmentInvitation { .. }
+            | EngineCommand::BeginEnrollment { .. }
+            | EngineCommand::ListPendingEnrollments
+            | EngineCommand::ExportPendingRequest { .. }
+            | EngineCommand::DiscardPendingEnrollment { .. }
+            | EngineCommand::CertificateInventory { .. }
+            | EngineCommand::CertificateOverview
+            | EngineCommand::CertificateActions { .. }
+            | EngineCommand::RunCertificateAction { .. }
+            | EngineCommand::ResumeCertificateRecovery { .. }
+            | EngineCommand::CertificateApprovalManifest { .. }
+            | EngineCommand::ApproveCertificateRenewal { .. }
+            | EngineCommand::CertificateApprovalNeedsPin { .. }
+            | EngineCommand::LastCertificateError { .. } => Err(NOT_SERVED.into()),
+        }
+    }
+
+    /// Disconnects and stops what the connection started. The event side is
+    /// discarded: the UI that would have listened has gone. Idempotent.
+    async fn teardown(&self) {
+        self.telemetry.stop();
+        let poll = self
+            .handshake_poll
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(poll) = poll {
+            poll.abort();
+        }
+        let discard: EventSink = Arc::new(|_| {});
+        if let Err(error) = self.controller.disconnect(discard).await {
+            tracing::warn!(%error, "déconnexion à la fermeture du moteur");
+        }
+    }
 }
 
 /// Manages the telemetry task's lifecycle (only one active at a time).

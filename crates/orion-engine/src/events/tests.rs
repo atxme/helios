@@ -1,6 +1,7 @@
 use super::*;
 
 use aether::TunnelState;
+use orion_core::speedtest::{SpeedTestPhase, SpeedTestProgress};
 
 /// Fills the queue with log lines, which are not critical.
 fn fill(sink: &EventSink) {
@@ -47,5 +48,26 @@ fn a_critical_event_that_finds_no_room_raises_the_flag() {
 
     assert!(queue.overflowed());
     // The critical event was not placed: the queue still holds only the logs.
+    assert_eq!(drained(&mut receiver), EVENT_QUEUE);
+}
+
+#[test]
+fn speedtest_progress_is_dropped_when_full() {
+    let (queue, mut receiver) = EventQueue::new();
+    let sink = queue.sink();
+    fill(&sink);
+
+    sink(ClientEvent::SpeedTest {
+        progress: SpeedTestProgress {
+            phase: SpeedTestPhase::TcpDownload,
+            fraction: 0.5,
+            current_mbps: 120.0,
+            bytes: 1024,
+            elapsed_ms: 500,
+            message: "téléchargement TCP".into(),
+        },
+    });
+
+    assert!(!queue.overflowed());
     assert_eq!(drained(&mut receiver), EVENT_QUEUE);
 }

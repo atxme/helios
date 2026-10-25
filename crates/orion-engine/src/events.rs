@@ -2,7 +2,7 @@
 //!
 //! The controller calls its sink from inside its own tasks, and a sink that
 //! waited for a slow UI would stall the tunnel. The queue therefore never
-//! waits: telemetry and log lines are dropped when it is full, and any other
+//! waits: telemetry, speedtest progress and log lines are dropped when it is full, and any other
 //! event that finds no room raises a flag that ends the session. A state
 //! change is never lost silently.
 
@@ -21,7 +21,7 @@ pub const EVENT_QUEUE: usize = 1024;
 pub fn is_droppable(event: &ClientEvent) -> bool {
     matches!(
         event,
-        ClientEvent::Telemetry { .. } | ClientEvent::Log { .. }
+        ClientEvent::Telemetry { .. } | ClientEvent::Log { .. } | ClientEvent::SpeedTest { .. }
     )
 }
 

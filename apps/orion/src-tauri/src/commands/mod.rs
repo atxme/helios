@@ -13,6 +13,11 @@ mod connection;
 mod enrollment;
 mod profiles;
 
+/// What the shell answers when the engine replies with another family's variant.
+pub(crate) fn unexpected_engine_reply() -> String {
+    "Réponse inattendue du moteur d'Orion.".into()
+}
+
 pub(crate) use app::*;
 pub(crate) use ceremonies::*;
 pub(crate) use certificates::*;

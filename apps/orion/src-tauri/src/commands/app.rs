@@ -2,85 +2,71 @@
 //! test, the window size and the log export.
 
 use super::*;
-use orion_engine::{AboutView, KeyNegotiationSupport};
+use orion_engine::{AboutView, EngineCommand, EngineReply, KeyNegotiationSupport};
 
 #[tauri::command]
-pub(crate) fn get_state(state: State<'_, AppState>) -> String {
-    state.engine.controller.state().as_str().to_string()
+pub(crate) async fn get_state(state: State<'_, AppState>) -> Result<String, String> {
+    match state.client.call(EngineCommand::GetState).await? {
+        EngineReply::State(value) => Ok(value),
+        _ => Err(unexpected_engine_reply()),
+    }
 }
 
 #[tauri::command]
-pub(crate) fn backend_kind(state: State<'_, AppState>) -> &'static str {
-    state.engine.controller.backend_kind()
+pub(crate) async fn backend_kind(state: State<'_, AppState>) -> Result<String, String> {
+    match state.client.call(EngineCommand::BackendKind).await? {
+        EngineReply::Backend(value) => Ok(value),
+        _ => Err(unexpected_engine_reply()),
+    }
 }
 
 /// Indicates whether the WireGuard adapter is still mounted. On failure, it
 /// must remain up to capture routes and prevent a clear-text leak.
 #[tauri::command]
-pub(crate) fn adapter_is_up(state: State<'_, AppState>) -> bool {
-    state.engine.controller.adapter_is_up()
-}
-
-#[tauri::command]
-pub(crate) fn about_orion(state: State<'_, AppState>) -> AboutView {
-    AboutView {
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        backend: state.engine.controller.backend_kind().to_string(),
-        profile_extension: PROFILE_EXTENSION.to_string(),
-        log_path: state
-            .engine
-            .log_path
-            .as_ref()
-            .map(|path| path.display().to_string()),
+pub(crate) async fn adapter_is_up(state: State<'_, AppState>) -> Result<bool, String> {
+    match state.client.call(EngineCommand::AdapterIsUp).await? {
+        EngineReply::Flag(value) => Ok(value),
+        _ => Err(unexpected_engine_reply()),
     }
 }
 
 #[tauri::command]
-pub(crate) fn key_negotiation_support(state: State<'_, AppState>) -> KeyNegotiationSupport {
-    KeyNegotiationSupport {
-        identity_store: state.engine.controller.key_negotiation_ready(),
+pub(crate) async fn about_orion(state: State<'_, AppState>) -> Result<AboutView, String> {
+    match state.client.call(EngineCommand::AboutOrion).await? {
+        EngineReply::About(value) => Ok(value),
+        _ => Err(unexpected_engine_reply()),
     }
 }
 
-/// Measures the raw WireGuard data path to the active gateway.
-///
-/// This command is intentionally available only while WireGuard is `Up`: the
-/// gateway's API lives behind that tunnel, and the Rust engine targets its
-/// fixed in-tunnel address. TCP/UDP data is exchanged on a dedicated socket;
-/// this command only relays progress and keeps the expensive benchmark
-/// serialized. The transfer implementation itself lives in `orion-core`, so
-/// it remains testable without Tauri or WebView.
+#[tauri::command]
+pub(crate) async fn key_negotiation_support(
+    state: State<'_, AppState>,
+) -> Result<KeyNegotiationSupport, String> {
+    match state
+        .client
+        .call(EngineCommand::KeyNegotiationSupport)
+        .await?
+    {
+        EngineReply::KeyNegotiation(value) => Ok(value),
+        _ => Err(unexpected_engine_reply()),
+    }
+}
+
+/// Measures the raw WireGuard data path to the active gateway. The engine runs
+/// it and relays its progress as events; see the speedtest bridge in `main.rs`.
 #[tauri::command]
 pub(crate) async fn run_speed_test(
-    app: AppHandle,
     state: State<'_, AppState>,
     mode: String,
 ) -> Result<orion_core::SpeedTestResult, String> {
-    let _exclusive = state
-        .engine
-        .speedtest
-        .try_lock()
-        .map_err(|_| "un speedtest est déjà en cours".to_string())?;
-    if state.engine.controller.state() != TunnelState::Up
-        || !state.engine.controller.adapter_is_up()
+    match state
+        .client
+        .call(EngineCommand::RunSpeedTest { mode })
+        .await?
     {
-        return Err("le speedtest nécessite un tunnel WireGuard connecté".into());
+        EngineReply::SpeedTest(result) => Ok(result),
+        _ => Err(unexpected_engine_reply()),
     }
-    let mode = orion_core::SpeedTestMode::parse(&mode).map_err(|error| error.to_string())?;
-    let progress_app = app.clone();
-    let progress: orion_core::SpeedTestProgressSink = Arc::new(move |update| {
-        let _ = progress_app.emit("helios://speedtest", &update);
-    });
-    orion_core::run_speedtest_with_progress(
-        mode,
-        aether::speedtest::SPEEDTEST_DEFAULT_DURATION_SECS,
-        // No override: the UI runs `full`, where the UDP quality legs take
-        // their rate from the TCP throughput measured moments earlier.
-        None,
-        progress,
-    )
-    .await
-    .map_err(|error| error.to_string())
 }
 
 /// Window dimensions depending on the displayed view.
