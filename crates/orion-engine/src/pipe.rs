@@ -73,7 +73,9 @@ pub fn pipe_name(ui_pid: u32, nonce: &[u8; 16]) -> String {
 ///
 /// Refused when the launcher runs another image than the engine, or when it
 /// was created at or after the engine: a UI started later cannot be the
-/// launcher, so its PID must have been reused.
+/// launcher, so its PID must have been reused. A launcher whose creation time
+/// reads as zero is refused as reused too: its time is unknown, so it cannot
+/// be trusted.
 pub fn expected_from_launcher(
     launcher: ObservedClient,
     engine_image: &Path,
@@ -81,6 +83,9 @@ pub fn expected_from_launcher(
 ) -> Result<ExpectedClient, ClientRefusal> {
     if !same_image(&launcher.image, engine_image) {
         return Err(ClientRefusal::OtherImage);
+    }
+    if launcher.created_at == 0 {
+        return Err(ClientRefusal::ReusedPid);
     }
     if launcher.created_at >= engine_created_at {
         return Err(ClientRefusal::StartedAfterEngine);
@@ -110,7 +115,9 @@ pub fn verify_client(
 }
 
 /// Case-insensitive comparison of two image paths, after dropping the
-/// `\\?\` verbatim prefix on either side. A path that is not valid Unicode
+/// `\\?\` verbatim prefix on either side. Only ASCII letters fold: a
+/// non-ASCII character that lowercases to an ASCII letter (such as the Kelvin
+/// sign) does not make two paths the same. A path that is not valid Unicode
 /// is never equal: refusing is the safe answer.
 fn same_image(a: &Path, b: &Path) -> bool {
     let (Some(a), Some(b)) = (a.to_str(), b.to_str()) else {
@@ -118,24 +125,25 @@ fn same_image(a: &Path, b: &Path) -> bool {
     };
     let a = a.strip_prefix(r"\\?\").unwrap_or(a);
     let b = b.strip_prefix(r"\\?\").unwrap_or(b);
-    a.to_lowercase() == b.to_lowercase()
+    a.eq_ignore_ascii_case(b)
 }
 
-/// A SID in string form, such as `S-1-5-21-…`, with nothing else in it.
+/// A SID in string form: `S-` then at least two non-empty runs of digits
+/// separated by dashes, such as `S-1-5-18`. Nothing else is accepted.
 ///
-/// It is written into an SDDL string, so anything beyond digits and dashes
-/// is refused.
+/// It is written into an SDDL string, so anything beyond that shape (a
+/// bracket, a space, an empty segment, a trailing dash, a lowercase `s`) is
+/// refused.
 #[cfg(any(windows, test))]
 fn is_plain_sid(sid: &str) -> bool {
-    match sid.strip_prefix("S-") {
-        Some(rest) => {
-            !rest.is_empty()
-                && rest
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || byte == b'-')
-        }
-        None => false,
-    }
+    let Some(rest) = sid.strip_prefix("S-") else {
+        return false;
+    };
+    let segments: Vec<&str> = rest.split('-').collect();
+    segments.len() >= 2
+        && segments
+            .iter()
+            .all(|segment| !segment.is_empty() && segment.bytes().all(|b| b.is_ascii_digit()))
 }
 
 #[cfg(test)]

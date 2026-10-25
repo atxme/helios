@@ -20,6 +20,13 @@ fn expected() -> ExpectedClient {
     }
 }
 
+fn expected_with_created(created_at: u64) -> ExpectedClient {
+    ExpectedClient {
+        created_at,
+        ..expected()
+    }
+}
+
 #[test]
 fn the_launching_ui_is_accepted() {
     let observed = launcher(4242, IMAGE, CREATED);
@@ -52,9 +59,14 @@ fn the_same_image_in_another_case_is_accepted() {
 
 #[test]
 fn a_reused_pid_is_refused() {
-    let observed = launcher(4242, IMAGE, CREATED + 10_000_000);
+    let later = launcher(4242, IMAGE, CREATED + 10_000_000);
     assert_eq!(
-        verify_client(&expected(), &observed),
+        verify_client(&expected(), &later),
+        Err(ClientRefusal::ReusedPid)
+    );
+    let earlier = launcher(4242, IMAGE, CREATED - 10_000_000);
+    assert_eq!(
+        verify_client(&expected(), &earlier),
         Err(ClientRefusal::ReusedPid)
     );
 }
@@ -72,19 +84,46 @@ fn the_pipe_name_has_its_documented_shape() {
         pipe_name(4242, &[0xab; 16]),
         format!(r"\\.\pipe\orion-engine-4242-{}", "ab".repeat(16))
     );
+    assert_eq!(
+        pipe_name(4242, &[0x0a; 16]),
+        format!(r"\\.\pipe\orion-engine-4242-{}", "0a".repeat(16))
+    );
 }
 
 #[test]
 fn a_verbatim_prefix_does_not_change_the_image() {
-    let observed = launcher(4242, r"\\?\C:\Program Files\Orion\orion.exe", CREATED);
-    assert_eq!(verify_client(&expected(), &observed), Ok(()));
+    let plain = launcher(4242, IMAGE, CREATED);
+    let verbatim = launcher(4242, r"\\?\C:\Program Files\Orion\orion.exe", CREATED);
+    assert_eq!(verify_client(&expected(), &verbatim), Ok(()));
+    let engine_verbatim = ExpectedClient {
+        image: PathBuf::from(r"\\?\C:\Program Files\Orion\orion.exe"),
+        ..expected()
+    };
+    assert_eq!(verify_client(&engine_verbatim, &plain), Ok(()));
+    let launcher_expected = expected_from_launcher(
+        launcher(4242, r"\\?\C:\Program Files\Orion\orion.exe", CREATED - 1),
+        Path::new(IMAGE),
+        CREATED,
+    );
+    assert!(launcher_expected.is_ok());
+    let engine_expected = expected_from_launcher(
+        launcher(4242, IMAGE, CREATED - 1),
+        Path::new(r"\\?\C:\Program Files\Orion\orion.exe"),
+        CREATED,
+    );
+    assert!(engine_expected.is_ok());
 }
 
 #[test]
 fn a_launcher_started_after_the_engine_is_refused() {
-    let observed = launcher(4242, IMAGE, CREATED);
+    let same_moment = launcher(4242, IMAGE, CREATED);
     assert_eq!(
-        expected_from_launcher(observed, Path::new(IMAGE), CREATED),
+        expected_from_launcher(same_moment, Path::new(IMAGE), CREATED),
+        Err(ClientRefusal::StartedAfterEngine)
+    );
+    let just_after = launcher(4242, IMAGE, CREATED + 1);
+    assert_eq!(
+        expected_from_launcher(just_after, Path::new(IMAGE), CREATED),
         Err(ClientRefusal::StartedAfterEngine)
     );
 }
@@ -99,6 +138,15 @@ fn a_launcher_with_another_image_is_refused() {
 }
 
 #[test]
+fn a_launcher_without_a_creation_time_is_refused() {
+    let observed = launcher(4242, IMAGE, 0);
+    assert_eq!(
+        expected_from_launcher(observed, Path::new(IMAGE), CREATED),
+        Err(ClientRefusal::ReusedPid)
+    );
+}
+
+#[test]
 fn the_launcher_becomes_the_expected_client() {
     let observed = launcher(4242, IMAGE, CREATED - 1);
     let expected = expected_from_launcher(observed, Path::new(IMAGE), CREATED)
@@ -107,23 +155,32 @@ fn the_launcher_becomes_the_expected_client() {
 }
 
 #[test]
-fn a_well_formed_sid_is_accepted() {
-    assert!(is_plain_sid(
-        "S-1-5-21-1004336348-1177238915-682003330-1001"
+fn a_lookalike_kelvin_sign_is_not_the_same_image() {
+    assert!(!same_image(
+        Path::new("c:\\x\\\u{212A}.exe"),
+        Path::new("c:\\x\\k.exe")
     ));
+}
+
+#[test]
+fn a_well_formed_sid_is_accepted() {
+    assert!(is_plain_sid("S-1-5-18"));
+    assert!(is_plain_sid("S-1-5-21-1-2-3-1001"));
 }
 
 #[test]
 fn a_sid_with_sddl_syntax_is_refused() {
     assert!(!is_plain_sid("S-1-5-21-1)(A;;GA;;;WD"));
-    assert!(!is_plain_sid("S-"));
-    assert!(!is_plain_sid("1-5-21"));
     assert!(!is_plain_sid(""));
+    assert!(!is_plain_sid("1-5-21"));
 }
 
-fn expected_with_created(created_at: u64) -> ExpectedClient {
-    ExpectedClient {
-        created_at,
-        ..expected()
-    }
+#[test]
+fn a_sid_with_an_empty_or_missing_segment_is_refused() {
+    assert!(!is_plain_sid("S-"));
+    assert!(!is_plain_sid("S--"));
+    assert!(!is_plain_sid("S-1--2"));
+    assert!(!is_plain_sid("S-1-5-"));
+    assert!(!is_plain_sid("S-1"));
+    assert!(!is_plain_sid("s-1-5-18"));
 }

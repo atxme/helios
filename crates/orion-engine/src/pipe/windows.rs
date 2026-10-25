@@ -49,6 +49,9 @@ impl Drop for OwnedHandle {
 ///
 /// The DACL grants read and write to `client_sid` alone, and only the local
 /// machine may connect.
+///
+/// Must be called from inside a Tokio runtime with I/O enabled: tokio panics
+/// otherwise when it registers the pipe.
 pub fn create_server(name: &str, client_sid: &str) -> Result<NamedPipeServer, String> {
     if !is_plain_sid(client_sid) {
         return Err("SID de l'IHM invalide, tube refusé".into());
@@ -80,6 +83,8 @@ pub fn create_server(name: &str, client_sid: &str) -> Result<NamedPipeServer, St
         bInheritHandle: 0,
     };
     let mut options = ServerOptions::new();
+    // `GRGW` includes FILE_CREATE_PIPE_INSTANCE, so the allowed user could open
+    // a second instance. `max_instances(1)` is what stops that: do not remove it.
     options
         .first_pipe_instance(true)
         .max_instances(1)
@@ -328,6 +333,8 @@ mod tests {
 
     #[test]
     fn a_malformed_sid_is_refused() {
+        // Valid SDDL on its own: without the shape check it would grant GA to Everyone.
+        assert!(create_server(&unique_name(), "S-1-5-18)(A;;GA;;;WD").is_err());
         assert!(create_server(&unique_name(), "S-1)(A;;GA;;;WD").is_err());
     }
 }
