@@ -1,9 +1,8 @@
 //! Narrow launcher for the Astra operator companion.
 //!
 //! The WebView never supplies an executable or arguments. It asks the
-//! `companion` Tauri plugin to approve one profile; the command resolves that
-//! profile's in-memory renewal session and hands this module the invocation
-//! built by `orion-core`.
+//! `companion` Tauri plugin to approve one profile; the command asks the engine
+//! for the arguments of that profile's renewal session, built by `orion-core`.
 //!
 //! # Binary resolution
 //!
@@ -20,8 +19,7 @@
 
 use std::path::PathBuf;
 
-use orion_core::certificate_renewal::CompanionInvocation;
-
+#[cfg(not(target_os = "windows"))]
 const PROGRAM: &str = "astra-signer";
 
 /// The operator process of protocol 2.
@@ -31,20 +29,8 @@ const PROGRAM: &str = "astra-signer";
 /// executable. Two names it will launch, both written here.
 const HELPER: &str = "helios-astra-helper";
 
-fn arguments(invocation: &CompanionInvocation) -> Result<&[String], String> {
-    if invocation.program != PROGRAM {
-        return Err(format!(
-            "lancement refusé : le compagnon attendu est « {PROGRAM} », pas « {} »",
-            invocation.program
-        ));
-    }
-    Ok(&invocation.arguments)
-}
-
-/// Starts the exact companion invocation produced by the renewal session.
-pub fn launch(invocation: &CompanionInvocation) -> Result<(), String> {
-    let arguments = arguments(invocation)?;
-
+/// Starts the companion with the arguments the engine approved for the session.
+pub fn launch(arguments: &[String]) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
         crate::deelevate::spawn_astra_signer(arguments)
@@ -126,26 +112,4 @@ fn helper_program() -> Result<PathBuf, String> {
         ));
     }
     Ok(helper)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_launcher_accepts_only_astra_signer() {
-        let approved = CompanionInvocation {
-            program: "astra-signer",
-            arguments: vec!["approve".into()],
-        };
-        assert_eq!(arguments(&approved), Ok(approved.arguments.as_slice()));
-
-        let rejected = CompanionInvocation {
-            program: "sh",
-            arguments: vec!["-c".into(), "anything".into()],
-        };
-        assert!(arguments(&rejected)
-            .expect_err("a generic shell must be refused")
-            .contains("compagnon attendu"));
-    }
 }

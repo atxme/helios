@@ -494,7 +494,7 @@ fn enrollment_commands_never_return_private_material() {
     };
 
     let (ca_private, ca_public) = generate_ml_dsa_87_keypair().expect("ca");
-    let now = super::now_unix();
+    let now = orion_engine::service::certificates::now_unix();
     let invitation = EnrollmentInvitation {
         format_version: ENROLLMENT_FORMAT_VERSION,
         protocol_version: ENROLLMENT_PROTOCOL_VERSION,

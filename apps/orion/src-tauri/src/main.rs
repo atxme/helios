@@ -46,7 +46,7 @@ use std::{
 
 use orion_core::{backend::EventSink, default_backend, ClientEvent};
 use orion_engine::client::EngineClient;
-use orion_engine::service::{certificates::now_unix, EngineService, PROFILE_EXTENSION};
+use orion_engine::service::{EngineService, PROFILE_EXTENSION};
 use orion_engine::EngineCommand;
 #[cfg(target_os = "windows")]
 use tauri::WindowEvent;

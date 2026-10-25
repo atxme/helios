@@ -43,7 +43,6 @@ use aether::certificates::operator_ipc::{
     AstraCaTlsPhase, AstraCaTlsStatus, AstraIpcCommand, AstraIpcHello, MAX_FRAME_BYTES,
     PROTOCOL_VERSION,
 };
-use orion_core::certificate_renewal::CompanionInvocation;
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -230,24 +229,31 @@ fn launch(
     address: SocketAddr,
     token: &Zeroizing<String>,
 ) -> Result<(), String> {
-    crate::companion::launch(&CompanionInvocation {
-        program: "astra-signer",
-        arguments: vec![
-            "--vault".into(),
-            input.vault_path.clone(),
-            "orion".into(),
-            "--heliosd-url".into(),
-            input.heliosd_url.clone(),
-            "--operation-id".into(),
-            input.operation_id.clone(),
-            "--out".into(),
-            input.output_path.clone(),
-            "--ipc-address".into(),
-            address.to_string(),
-            "--ipc-token".into(),
-            token.to_string(),
-        ],
-    })
+    crate::companion::launch(&companion_arguments(input, address, token))
+}
+
+/// The arguments of the companion's rotation subcommand. The program is fixed
+/// in `companion`, never chosen here.
+fn companion_arguments(
+    input: &RotationInput,
+    address: SocketAddr,
+    token: &Zeroizing<String>,
+) -> Vec<String> {
+    vec![
+        "--vault".into(),
+        input.vault_path.clone(),
+        "orion".into(),
+        "--heliosd-url".into(),
+        input.heliosd_url.clone(),
+        "--operation-id".into(),
+        input.operation_id.clone(),
+        "--out".into(),
+        input.output_path.clone(),
+        "--ipc-address".into(),
+        address.to_string(),
+        "--ipc-token".into(),
+        token.to_string(),
+    ]
 }
 
 /// Accepts local connections until one presents the session token.
@@ -444,26 +450,9 @@ mod tests {
     fn the_companion_is_invoked_under_its_own_subcommand() {
         let address = SocketAddr::from((Ipv4Addr::LOCALHOST, 57_121));
         let token = Zeroizing::new("ab".repeat(32));
-        let invocation = CompanionInvocation {
-            program: "astra-signer",
-            arguments: vec![
-                "--vault".into(),
-                input().vault_path,
-                "orion".into(),
-                "--heliosd-url".into(),
-                input().heliosd_url,
-                "--operation-id".into(),
-                input().operation_id,
-                "--out".into(),
-                input().output_path,
-                "--ipc-address".into(),
-                address.to_string(),
-                "--ipc-token".into(),
-                token.to_string(),
-            ],
-        };
-        assert!(invocation.command_line().contains("orion --heliosd-url"));
-        assert!(invocation.command_line().contains("127.0.0.1:57121"));
+        let command_line = companion_arguments(&input(), address, &token).join(" ");
+        assert!(command_line.contains("orion --heliosd-url"));
+        assert!(command_line.contains("127.0.0.1:57121"));
     }
 
     /// A frame longer than the shared cap is refused rather than buffered.

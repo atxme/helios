@@ -326,11 +326,6 @@ pub struct StagedPsk {
     pub value: SecretString,
 }
 
-/// Answer to a command the engine does not serve yet. Each family that moves
-/// into the engine replaces its arms below; the generic one goes away with the
-/// last family.
-const NOT_SERVED: &str = "Cette commande n'est pas servie par le moteur.";
-
 #[async_trait::async_trait]
 impl Engine for EngineService {
     async fn handle(
@@ -447,9 +442,22 @@ impl Engine for EngineService {
             )),
             // Served by the transport before it reaches the engine.
             EngineCommand::Shutdown => Ok(EngineReply::Unit),
-            EngineCommand::CertificateApprovalManifest { .. }
-            | EngineCommand::ApproveCertificateRenewal { .. }
-            | EngineCommand::CertificateApprovalNeedsPin { .. } => Err(NOT_SERVED.into()),
+            EngineCommand::CertificateApprovalManifest { name } => self
+                .certificate_approval_manifest(name)
+                .await
+                .map(EngineReply::ApprovalManifest),
+            EngineCommand::ApproveCertificateRenewal { name, pin } => self
+                .approve_certificate_renewal(name, pin)
+                .await
+                .map(EngineReply::RenewalProgress),
+            EngineCommand::CertificateApprovalNeedsPin { name } => self
+                .certificate_approval_needs_pin(name)
+                .await
+                .map(EngineReply::Flag),
+            EngineCommand::CompanionArguments { name } => self
+                .companion_arguments(name)
+                .await
+                .map(EngineReply::CompanionArguments),
         }
     }
 

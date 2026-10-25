@@ -209,6 +209,9 @@ pub enum EngineCommand {
     CertificateApprovalNeedsPin {
         name: String,
     },
+    CompanionArguments {
+        name: String,
+    },
     LastCertificateError {
         name: String,
     },
@@ -248,6 +251,7 @@ pub enum EngineReply {
     ActionOutcome(ActionOutcome),
     ApprovalManifest(ApprovalManifest),
     RenewalProgress(RenewalProgress),
+    CompanionArguments(Vec<String>),
     LastError(Option<String>),
 }
 

@@ -22,7 +22,7 @@ const SECRET: &str = "SECRET-QUI-NE-DOIT-PAS-FUIR";
 /// `import_profile_path` is absent on purpose: the UI reads the file it is
 /// given and sends the engine only its text (F11 ruling), so no command of
 /// the engine names a path.
-const ENGINE_COMMANDS: [&str; 38] = [
+const ENGINE_COMMANDS: [&str; 39] = [
     "get_state",
     "backend_kind",
     "adapter_is_up",
@@ -59,6 +59,7 @@ const ENGINE_COMMANDS: [&str; 38] = [
     "certificate_approval_manifest",
     "approve_certificate_renewal",
     "certificate_approval_needs_pin",
+    "companion_arguments",
     "last_certificate_error",
     "shutdown",
 ];
@@ -161,6 +162,9 @@ fn every_command() -> Vec<EngineCommand> {
         EngineCommand::CertificateApprovalNeedsPin {
             name: "poste".into(),
         },
+        EngineCommand::CompanionArguments {
+            name: "poste".into(),
+        },
         EngineCommand::LastCertificateError {
             name: "poste".into(),
         },
@@ -207,6 +211,7 @@ fn label(command: &EngineCommand) -> &'static str {
         EngineCommand::CertificateApprovalManifest { .. } => "certificate_approval_manifest",
         EngineCommand::ApproveCertificateRenewal { .. } => "approve_certificate_renewal",
         EngineCommand::CertificateApprovalNeedsPin { .. } => "certificate_approval_needs_pin",
+        EngineCommand::CompanionArguments { .. } => "companion_arguments",
         EngineCommand::LastCertificateError { .. } => "last_certificate_error",
         EngineCommand::Shutdown => "shutdown",
     }
@@ -413,6 +418,7 @@ fn every_reply() -> Vec<EngineReply> {
             eligible_credentials: 1,
         }),
         EngineReply::RenewalProgress(progress),
+        EngineReply::CompanionArguments(vec!["approve".into()]),
         EngineReply::LastError(Some("échec".into())),
     ]
 }
@@ -443,6 +449,7 @@ fn reply_label(reply: &EngineReply) -> &'static str {
         EngineReply::ActionOutcome(_) => "action_outcome",
         EngineReply::ApprovalManifest(_) => "approval_manifest",
         EngineReply::RenewalProgress(_) => "renewal_progress",
+        EngineReply::CompanionArguments(_) => "companion_arguments",
         EngineReply::LastError(_) => "last_error",
     }
 }

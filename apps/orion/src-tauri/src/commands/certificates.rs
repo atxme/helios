@@ -4,7 +4,7 @@
 use super::*;
 
 use orion_engine::{
-    ActionOutcome, EngineCommand, EngineReply, ProfileCertificates, RenewalProgress,
+    ActionOutcome, EngineCommand, EngineReply, ProfileCertificates, RenewalProgress, SecretInput,
 };
 
 /// The four certificates a connection depends on, with their dates.
@@ -91,25 +91,24 @@ pub(crate) async fn resume_certificate_recovery(
 
 /// Launches the companion for the operation held by one renewal session.
 ///
-/// Only the profile name crosses IPC. The executable and every argument come
-/// from the session owned by `orion-core`, so the WebView cannot turn this
-/// permission into a shell or retarget an approval to another operation.
+/// Only the profile name crosses IPC. The arguments come from the session the
+/// engine owns, and the executable is fixed in `companion`, so the WebView
+/// cannot turn this permission into a shell or retarget an approval to another
+/// operation.
 #[tauri::command]
 pub(crate) async fn launch_certificate_companion(
     state: State<'_, AppState>,
     name: String,
 ) -> Result<(), String> {
-    let invocation = {
-        let renewals = state.engine.renewals.lock().await;
-        let renewal = renewals
-            .get(&name)
-            .ok_or_else(|| format!("aucun renouvellement en attente pour le profil « {name} »"))?;
-        renewal
-            .session
-            .companion_invocation()
-            .ok_or_else(|| format!("le profil « {name} » n'attend aucune approbation opérateur"))?
+    let arguments = match state
+        .client
+        .call(EngineCommand::CompanionArguments { name })
+        .await?
+    {
+        EngineReply::CompanionArguments(value) => value,
+        _ => return Err(unexpected_engine_reply()),
     };
-    companion::launch(&invocation)
+    companion::launch(&arguments)
 }
 
 pub(crate) fn companion_plugin<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
@@ -120,73 +119,43 @@ pub(crate) fn companion_plugin<R: tauri::Runtime>() -> tauri::plugin::TauriPlugi
 
 /// Reads the approval request the open renewal is waiting on (§8.1.2 step 4a).
 ///
-/// Verified before it comes back, against what the profile pins — so what the
-/// screen shows is attested rather than announced. Nothing touches a security
-/// key here: the manifest exists precisely so the user decides *before* the
-/// ceremony, not during it.
+/// The engine verifies it against what the profile pins before it comes back.
 #[tauri::command]
 pub(crate) async fn certificate_approval_manifest(
     state: State<'_, AppState>,
     name: String,
 ) -> Result<orion_core::certificate_approval::ApprovalManifest, String> {
-    let mut renewals = state.engine.renewals.lock().await;
-    let in_flight = renewals
-        .get_mut(&name)
-        .ok_or_else(|| "aucun renouvellement ouvert pour ce profil".to_string())?;
-    let verified = in_flight
-        .session
-        .fetch_approval(&in_flight.store, now_unix())
-        .await
-        .map_err(|error| error.to_string())?;
-    let manifest = verified.manifest();
-    in_flight.approval = Some(verified);
-    Ok(manifest)
+    match state
+        .client
+        .call(EngineCommand::CertificateApprovalManifest { name })
+        .await?
+    {
+        EngineReply::ApprovalManifest(value) => Ok(value),
+        _ => Err(unexpected_engine_reply()),
+    }
 }
 
 /// Runs the ceremony and posts the assertion (§8.1.2 step 4b).
 ///
-/// The blocking call lives on a blocking thread: talking to a security key
-/// puts a modal on screen and waits for a human, and holding the async runtime
-/// for that would stop every other task in Orion — the tunnel's telemetry
-/// included.
-///
-/// The verified request is **consumed**. A second run would ask for a touch
-/// against a window the authority has since closed, and the user would be
-/// standing at a prompt for nothing.
+/// The engine runs the ceremony on a blocking thread and consumes the verified
+/// request. The PIN crosses IPC once, here, and goes straight to the engine.
 #[tauri::command]
 pub(crate) async fn approve_certificate_renewal(
     state: State<'_, AppState>,
     name: String,
     pin: Option<String>,
 ) -> Result<RenewalProgress, String> {
-    let verified = {
-        let mut renewals = state.engine.renewals.lock().await;
-        let in_flight = renewals
-            .get_mut(&name)
-            .ok_or_else(|| "aucun renouvellement ouvert pour ce profil".to_string())?;
-        in_flight.approval.take().ok_or_else(|| {
-            "lire d'abord la demande d'approbation : c'est elle qui est vérifiée, et ce qui est              signé est ce qui a été montré"
-                .to_string()
-        })?
-    };
-
-    let pin = pin.unwrap_or_default();
-    let approval = tokio::task::spawn_blocking(move || verified.run(&pin, now_unix()))
-        .await
-        .map_err(|error| format!("la cérémonie n'a pas pu être lancée : {error}"))?
-        .map_err(|error| error.to_string())?;
-
-    let mut renewals = state.engine.renewals.lock().await;
-    let in_flight = renewals
-        .get_mut(&name)
-        .ok_or_else(|| "aucun renouvellement ouvert pour ce profil".to_string())?;
-    let step = in_flight
-        .session
-        .submit_approval(&approval)
-        .await
-        .map_err(|error| error.to_string())?;
-    let progress = RenewalProgress::of(&step, &in_flight.session);
-    Ok(progress)
+    match state
+        .client
+        .call(EngineCommand::ApproveCertificateRenewal {
+            name,
+            pin: pin.map(SecretInput::from),
+        })
+        .await?
+    {
+        EngineReply::RenewalProgress(value) => Ok(value),
+        _ => Err(unexpected_engine_reply()),
+    }
 }
 
 /// Whether this machine's key collects its own PIN.
@@ -199,15 +168,14 @@ pub(crate) async fn certificate_approval_needs_pin(
     state: State<'_, AppState>,
     name: String,
 ) -> Result<bool, String> {
-    let renewals = state.engine.renewals.lock().await;
-    let in_flight = renewals
-        .get(&name)
-        .ok_or_else(|| "aucun renouvellement ouvert pour ce profil".to_string())?;
-    let approval = in_flight
-        .approval
-        .as_ref()
-        .ok_or_else(|| "lire d'abord la demande d'approbation".to_string())?;
-    approval.needs_pin().map_err(|error| error.to_string())
+    match state
+        .client
+        .call(EngineCommand::CertificateApprovalNeedsPin { name })
+        .await?
+    {
+        EngineReply::Flag(value) => Ok(value),
+        _ => Err(unexpected_engine_reply()),
+    }
 }
 
 /// The last certificate action that failed on this profile, if any.

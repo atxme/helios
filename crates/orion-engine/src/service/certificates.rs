@@ -6,11 +6,18 @@
 use std::sync::Arc;
 
 use aether::TunnelState;
+use orion_core::certificate_approval::ApprovalManifest;
 use orion_core::{backend::EventSink, ClientEvent, VpnController};
 use tokio::sync::Mutex;
+use zeroize::Zeroizing;
 
 use super::{EngineService, InFlightRecovery, InFlightRenewal};
+use crate::command::SecretInput;
 use crate::view::{ActionOutcome, ProfileCertificates, RenewalProgress};
+
+/// The only executable the operator companion may name (ADR-008). The shell
+/// launches what this module approves, and nothing else.
+const COMPANION_PROGRAM: &str = "astra-signer";
 
 /// Wall clock in Unix seconds, for the lifecycle's own arithmetic.
 ///
@@ -551,5 +558,118 @@ impl EngineService {
     /// described — a missing identity imported since, a store now available.
     pub async fn last_certificate_error(&self, name: String) -> Option<String> {
         self.last_certificate_error.lock().await.get(&name).cloned()
+    }
+
+    /// Reads the approval request the open renewal is waiting on (§8.1.2 step 4a).
+    ///
+    /// Verified before it comes back, against what the profile pins — so what the
+    /// screen shows is attested rather than announced. Nothing touches a security
+    /// key here: the manifest exists precisely so the user decides *before* the
+    /// ceremony, not during it.
+    pub async fn certificate_approval_manifest(
+        &self,
+        name: String,
+    ) -> Result<ApprovalManifest, String> {
+        let mut renewals = self.renewals.lock().await;
+        let in_flight = renewals
+            .get_mut(&name)
+            .ok_or_else(|| "aucun renouvellement ouvert pour ce profil".to_string())?;
+        let verified = in_flight
+            .session
+            .fetch_approval(&in_flight.store, now_unix())
+            .await
+            .map_err(|error| error.to_string())?;
+        let manifest = verified.manifest();
+        in_flight.approval = Some(verified);
+        Ok(manifest)
+    }
+
+    /// Runs the ceremony and posts the assertion (§8.1.2 step 4b).
+    ///
+    /// The blocking call lives on a blocking thread: talking to a security key
+    /// puts a modal on screen and waits for a human, and holding the async runtime
+    /// for that would stop every other task in Orion — the tunnel's telemetry
+    /// included.
+    ///
+    /// The verified request is **consumed**. A second run would ask for a touch
+    /// against a window the authority has since closed, and the user would be
+    /// standing at a prompt for nothing.
+    pub async fn approve_certificate_renewal(
+        &self,
+        name: String,
+        pin: Option<SecretInput>,
+    ) -> Result<RenewalProgress, String> {
+        let verified = {
+            let mut renewals = self.renewals.lock().await;
+            let in_flight = renewals
+                .get_mut(&name)
+                .ok_or_else(|| "aucun renouvellement ouvert pour ce profil".to_string())?;
+            in_flight.approval.take().ok_or_else(|| {
+                "lire d'abord la demande d'approbation : c'est elle qui est vérifiée, et ce qui est              signé est ce qui a été montré"
+                    .to_string()
+            })?
+        };
+
+        let pin = Zeroizing::new(
+            pin.as_ref()
+                .map(SecretInput::expose)
+                .unwrap_or_default()
+                .to_string(),
+        );
+        let approval = tokio::task::spawn_blocking(move || verified.run(&pin, now_unix()))
+            .await
+            .map_err(|error| format!("la cérémonie n'a pas pu être lancée : {error}"))?
+            .map_err(|error| error.to_string())?;
+
+        let mut renewals = self.renewals.lock().await;
+        let in_flight = renewals
+            .get_mut(&name)
+            .ok_or_else(|| "aucun renouvellement ouvert pour ce profil".to_string())?;
+        let step = in_flight
+            .session
+            .submit_approval(&approval)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(RenewalProgress::of(&step, &in_flight.session))
+    }
+
+    /// Whether this machine's key collects its own PIN.
+    ///
+    /// Asked rather than assumed: under Windows the platform API puts up its own
+    /// dialog and the PIN never enters this process, so prompting for one would be
+    /// asking the user for a secret Orion has no use for.
+    pub async fn certificate_approval_needs_pin(&self, name: String) -> Result<bool, String> {
+        let renewals = self.renewals.lock().await;
+        let in_flight = renewals
+            .get(&name)
+            .ok_or_else(|| "aucun renouvellement ouvert pour ce profil".to_string())?;
+        let approval = in_flight
+            .approval
+            .as_ref()
+            .ok_or_else(|| "lire d'abord la demande d'approbation".to_string())?;
+        approval.needs_pin().map_err(|error| error.to_string())
+    }
+
+    /// The arguments of the companion launch for the operation of one renewal.
+    ///
+    /// Only the arguments leave the engine. The program is never a field of the
+    /// protocol: the shell launches `astra-signer` itself, and this refuses any
+    /// other name the session might ever carry.
+    pub async fn companion_arguments(&self, name: String) -> Result<Vec<String>, String> {
+        let renewals = self.renewals.lock().await;
+        let renewal = renewals
+            .get(&name)
+            .ok_or_else(|| format!("aucun renouvellement en attente pour le profil « {name} »"))?;
+        let invocation = renewal
+            .session
+            .companion_invocation()
+            .ok_or_else(|| format!("le profil « {name} » n'attend aucune approbation opérateur"))?;
+        if invocation.program != COMPANION_PROGRAM {
+            return Err(format!(
+                "lancement refusé : le compagnon attendu est « {COMPANION_PROGRAM} », pas « {} »",
+                invocation.program
+            ));
+        }
+        Ok(invocation.arguments)
     }
 }

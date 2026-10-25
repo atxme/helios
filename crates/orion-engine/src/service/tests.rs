@@ -101,32 +101,6 @@ async fn the_engine_answers_get_state_through_the_client() {
 }
 
 #[tokio::test]
-async fn a_command_not_yet_served_is_refused() {
-    let scratch = Scratch::new("refuses-unserved");
-    let service = EngineService::open(
-        paths_under(&scratch.0),
-        Arc::new(DryRunBackend::default()),
-        None,
-        "0.0.0-test",
-    )
-    .expect("the service opens on a fresh directory");
-    let (client, _events) = crate::client::in_process(service)
-        .await
-        .expect("the session opens");
-
-    assert_eq!(
-        client
-            .call(EngineCommand::CertificateApprovalNeedsPin {
-                name: "absent".into(),
-            })
-            .await
-            .err()
-            .as_deref(),
-        Some(NOT_SERVED)
-    );
-}
-
-#[tokio::test]
 async fn a_certificate_action_on_an_unknown_profile_is_refused_and_recorded() {
     let scratch = Scratch::new("certificate-action-unknown");
     let service = EngineService::open(
@@ -162,6 +136,89 @@ async fn a_certificate_action_on_an_unknown_profile_is_refused_and_recorded() {
         .await
     {
         Ok(EngineReply::LastError(recorded)) => assert_eq!(recorded, Some(refusal)),
+        other => panic!("unexpected reply: {other:?}"),
+    }
+}
+
+/// Opens a service on a scratch directory and returns its client.
+async fn client_on(scratch: &Scratch) -> crate::client::EngineClient {
+    let service = EngineService::open(
+        paths_under(&scratch.0),
+        Arc::new(DryRunBackend::default()),
+        None,
+        "0.0.0-test",
+    )
+    .expect("the service opens on a fresh directory");
+    let (client, _events) = crate::client::in_process(service)
+        .await
+        .expect("the session opens");
+    client
+}
+
+#[tokio::test]
+async fn the_approval_manifest_without_a_renewal_is_refused() {
+    let scratch = Scratch::new("approval-manifest-absent");
+    let client = client_on(&scratch).await;
+
+    match client
+        .call(EngineCommand::CertificateApprovalManifest {
+            name: "absent".into(),
+        })
+        .await
+    {
+        Err(message) => assert_eq!(message, "aucun renouvellement ouvert pour ce profil"),
+        other => panic!("unexpected reply: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn approving_without_a_renewal_is_refused() {
+    let scratch = Scratch::new("approval-absent");
+    let client = client_on(&scratch).await;
+
+    match client
+        .call(EngineCommand::ApproveCertificateRenewal {
+            name: "absent".into(),
+            pin: Some("0000".to_string().into()),
+        })
+        .await
+    {
+        Err(message) => assert_eq!(message, "aucun renouvellement ouvert pour ce profil"),
+        other => panic!("unexpected reply: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn asking_for_a_pin_without_a_renewal_is_refused() {
+    let scratch = Scratch::new("approval-pin-absent");
+    let client = client_on(&scratch).await;
+
+    match client
+        .call(EngineCommand::CertificateApprovalNeedsPin {
+            name: "absent".into(),
+        })
+        .await
+    {
+        Err(message) => assert_eq!(message, "aucun renouvellement ouvert pour ce profil"),
+        other => panic!("unexpected reply: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn companion_arguments_without_a_renewal_are_refused() {
+    let scratch = Scratch::new("companion-absent");
+    let client = client_on(&scratch).await;
+
+    match client
+        .call(EngineCommand::CompanionArguments {
+            name: "absent".into(),
+        })
+        .await
+    {
+        Err(message) => assert!(
+            message.contains("aucun renouvellement en attente pour le profil « absent »"),
+            "unexpected refusal: {message}"
+        ),
         other => panic!("unexpected reply: {other:?}"),
     }
 }
