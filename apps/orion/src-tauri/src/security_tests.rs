@@ -411,11 +411,10 @@ fn windows_manifest_requires_administrator_privileges() {
 /// who can reach this window — or anything that can reach the command,
 /// the webview included. It was written that way once.
 ///
-/// Spawning is allowed again, but only through [`crate::deelevate`],
-/// which builds the child from the standard-user token and refuses until
-/// Windows confirms it is not elevated. This test keeps the shortcut from
-/// coming back: the only `Command::new` left in this file is the dev-only
-/// Vite server, behind `debug_assertions`.
+/// Spawning is allowed again, but only through [`crate::launch`], which
+/// refuses while Windows reports this process as elevated. This test keeps
+/// the shortcut from coming back: the only `Command::new` left in this file
+/// is the dev-only Vite server, behind `debug_assertions`.
 #[test]
 fn the_shipped_client_spawns_nothing_with_its_own_token() {
     let source = include_str!("main.rs");
@@ -431,8 +430,8 @@ fn the_shipped_client_spawns_nothing_with_its_own_token() {
     assert_eq!(
         spawns.len(),
         1,
-        "a release build must spawn nothing with Orion's own token — it is an \
-             Administrator token. Use `deelevate`. Found: {spawns:?}"
+        "a release build must spawn nothing with Orion's own token. Use `launch`. \
+             Found: {spawns:?}"
     );
     let (line, _) = spawns[0];
     let before = source.lines().take(line - 1).collect::<Vec<_>>().join("\n");
@@ -445,38 +444,58 @@ fn the_shipped_client_spawns_nothing_with_its_own_token() {
     );
 }
 
-/// The de-elevating launcher keeps its post-condition, and its shape.
+/// An elevated UI launches nothing, on any platform.
+///
+/// The predicate is portable on purpose: the Windows call that reads the
+/// token cannot run here, but the decision made from its answer can.
+#[test]
+fn nothing_is_launched_from_an_elevated_ui() {
+    assert!(!crate::launch::should_launch(true));
+    assert!(crate::launch::should_launch(false));
+}
+
+/// Every launch asks Windows about elevation first.
 ///
 /// Asserted on the source text, which is crude and is the only mechanism
-/// available: the module is Windows-only, so nothing here compiles or runs
-/// it. What it protects is the one line that makes the module safe — the
-/// refusal when Windows still reports the token as elevated. Someone
-/// tidying this file could drop that check and every other test would stay
-/// green, on every platform, forever.
+/// available: the Windows half of `launch.rs` compiles nowhere here, and a
+/// launch that skipped the check would still build and pass every other test
+/// on every platform. Comments are ignored, so a comment cannot stand in for
+/// the check.
 #[test]
-fn the_deelevating_launcher_checks_before_it_launches() {
-    let source = include_str!("deelevate.rs");
+fn every_launch_checks_elevation_first() {
+    let source = include_str!("launch.rs");
     let code: String = source
         .lines()
         .filter(|line| !line.trim_start().starts_with("//"))
         .collect::<Vec<_>>()
         .join("\n");
+    let needle = concat!("Command", "::new(");
+    let check = "refuse_if_elevated()?";
 
+    let mut launches = 0;
+    for function in code.split("\npub fn ").skip(1) {
+        let Some(launch) = function.find(needle) else {
+            continue;
+        };
+        launches += 1;
+        assert!(
+            function[..launch].contains(check),
+            "a launch is not preceded by `{check}` in `{}`",
+            function.lines().next().unwrap_or("")
+        );
+    }
     assert!(
-        !code.contains(concat!("Command", "::new")),
-        "the launcher must not fall back to std::process — that inherits the \
-             elevated token, which is the whole thing it exists to avoid"
+        launches >= 2,
+        "the ssh terminal and the companion must both launch through `Command`, found {launches}"
     );
 
     let refusal = code
-        .find("if is_elevated(&token)?")
-        .expect("the elevation post-condition must be present");
-    let launch = code
-        .find("CreateProcessWithTokenW(")
-        .expect("the launcher must go through CreateProcessWithTokenW");
+        .split("\npub fn ")
+        .find(|function| function.starts_with("refuse_if_elevated()"))
+        .expect("the elevation check must be present");
     assert!(
-        refusal < launch,
-        "the token must be checked **before** anything is launched"
+        refusal.contains("should_launch("),
+        "the elevation check must decide through `should_launch`"
     );
 }
 

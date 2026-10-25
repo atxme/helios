@@ -227,10 +227,9 @@ pub(crate) async fn discard_staged_psk(state: State<'_, AppState>) -> Result<(),
 /// whoever can reach this window — or anything that can reach this command,
 /// the webview included.
 ///
-/// So the child is built from the standard-user token Windows already keeps
-/// linked to the elevated one, and [`crate::deelevate`] refuses to launch
-/// anything until Windows itself confirms that token is not elevated. See
-/// that module for why a thread impersonation would not have worked.
+/// So [`crate::launch`] refuses to start anything while Windows reports the
+/// UI's own token as elevated; otherwise the terminal inherits that
+/// non-elevated token.
 ///
 /// Failure is a refusal, never a fallback: a machine with no linked token
 /// gets an error naming the reason, and the user still has
@@ -280,23 +279,7 @@ pub(crate) async fn ssh_command(
     }
 }
 
-#[cfg(target_os = "windows")]
-use crate::deelevate::spawn_ssh_terminal;
-
-/// Refuses explicitly rather than silently doing nothing.
-///
-/// # Limite connue
-///
-/// The launcher is Windows-only because the de-elevation is: it rests on the
-/// linked token UAC produces, which has no equivalent elsewhere. A Linux or
-/// macOS build reaches this arm and fails with a message naming the reason,
-/// instead of opening a window that never appears. What would unblock it:
-/// choosing a terminal on those platforms, and a way to drop privileges that
-/// is theirs rather than Windows'.
-#[cfg(not(target_os = "windows"))]
-fn spawn_ssh_terminal(_target: &str) -> Result<(), String> {
-    Err("l'ouverture d'un terminal SSH n'est disponible que sur Windows".into())
-}
+use crate::launch::spawn_ssh_terminal;
 
 /// Merges a draft onto the stored profile and seals the result.
 ///

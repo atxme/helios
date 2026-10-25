@@ -11,7 +11,8 @@
 //! network. This keeps development and packaged installations on the same
 //! contract without embedding a platform-specific absolute path. A local user
 //! can replace a binary on their own `PATH`, but the child runs as that same
-//! user; on Windows Orion explicitly drops its Administrator token first.
+//! user; on Windows the launch is refused while Orion runs elevated (see
+//! [`crate::launch`]).
 //!
 //! The Tauri capability grants one command from one inlined plugin. There is
 //! no generic shell permission: the engine hands over arguments only, after
@@ -25,7 +26,7 @@ const PROGRAM: &str = "astra-signer";
 pub fn launch(arguments: &[String]) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
-        crate::deelevate::spawn_astra_signer(arguments)
+        crate::launch::spawn_astra_signer(arguments)
     }
 
     #[cfg(not(target_os = "windows"))]

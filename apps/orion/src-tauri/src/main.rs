@@ -52,10 +52,9 @@ use orion_engine::EngineCommand;
 use tauri::WindowEvent;
 use tauri::{AppHandle, Emitter, Manager, State};
 
-/// De-elevation of the SSH terminal. Windows-only: it rests on the linked
-/// token UAC produces, which has no equivalent elsewhere.
-#[cfg(target_os = "windows")]
-mod deelevate;
+/// Launches from the UI (SSH terminal, Astra companion). Each one is refused
+/// while the UI's own token is elevated; only that check is Windows-specific.
+mod launch;
 
 /// Process launch is isolated behind a one-command Tauri plugin and a fixed
 /// executable. Keeping it out of the application invoke handler makes the ACL
