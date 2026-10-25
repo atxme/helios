@@ -30,7 +30,10 @@ compile_error!(
 use std::{
     collections::VecDeque,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex as StdMutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex as StdMutex,
+    },
 };
 
 #[cfg(debug_assertions)]
@@ -47,6 +50,7 @@ use orion_core::{
     ProtectedIdentityStore,
 };
 use orion_engine::service::{certificates::now_unix, EngineService, PROFILE_EXTENSION};
+use orion_engine::EngineCommand;
 #[cfg(target_os = "windows")]
 use tauri::WindowEvent;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -92,6 +96,9 @@ struct AppState {
     /// The protocol-2 ceremony, which every operation but the `CA-TLS`
     /// rotation now runs through.
     operator: operator::OperatorCeremony,
+    /// Set when Orion is quitting: the engine's session ends on purpose, and
+    /// that end is not a failure to report.
+    quitting: AtomicBool,
 }
 
 #[cfg(debug_assertions)]
@@ -209,9 +216,41 @@ fn relay_engine_events(app: AppHandle, mut events: tokio::sync::mpsc::Receiver<C
 fn exit_when_engine_closes(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         app.state::<AppState>().client.closed().await;
+        if app.state::<AppState>().quitting.load(Ordering::Acquire) {
+            return;
+        }
         tracing::error!("le moteur d'Orion s'est arrêté");
         app.exit(1);
     });
+}
+
+/// How long Quit waits for the engine to take the tunnel down.
+///
+/// The engine waits for the controller, which may be mid-handshake. Past this,
+/// Orion exits anyway and says so in the log: a quit that never ends is worse
+/// than a teardown left unfinished, and the log is where that would be seen.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Takes the tunnel down before Orion exits.
+///
+/// Quitting leaves nothing behind: the engine is asked to shut down, tears the
+/// tunnel down, and only then closes the session. Whatever goes wrong here is
+/// logged, and the exit goes ahead either way.
+fn take_tunnel_down(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    state.quitting.store(true, Ordering::Release);
+    let outcome = tauri::async_runtime::block_on(tokio::time::timeout(SHUTDOWN_GRACE, async {
+        if let Err(error) = state.client.call(EngineCommand::Shutdown).await {
+            tracing::warn!(%error, "arrêt du moteur sans réponse");
+        }
+        state.client.closed().await;
+    }));
+    if outcome.is_err() {
+        tracing::warn!(
+            "démontage du tunnel non terminé après {} s : Orion sort quand même",
+            SHUTDOWN_GRACE.as_secs()
+        );
+    }
 }
 
 /// Shows the main window after it was hidden in the Windows notification area.
@@ -506,6 +545,7 @@ fn main() {
             pending_profile_paths: StdMutex::new(pending_profile_paths),
             astra: astra::Ceremony::default(),
             operator: operator::OperatorCeremony::default(),
+            quitting: AtomicBool::new(false),
         })
         .setup(move |app| {
             #[cfg(target_os = "windows")]
@@ -572,8 +612,13 @@ fn main() {
             operator_ceremony_status,
             operator_pending_operations,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while launching Tauri");
+        .build(tauri::generate_context!())
+        .expect("error while launching Tauri")
+        .run(|app, event| {
+            if let tauri::RunEvent::Exit = event {
+                take_tunnel_down(app);
+            }
+        });
 }
 
 #[cfg(test)]
