@@ -35,6 +35,7 @@ impl fmt::Debug for SecretInput {
     }
 }
 
+/// Writes the secret in clear: only the UI serializes it, toward the engine.
 impl Serialize for SecretInput {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(self.expose())
@@ -54,11 +55,19 @@ impl<'de> Deserialize<'de> for SecretInput {
 /// stored*. That asymmetry is deliberate: it is what lets a profile be edited
 /// without its private key ever making the round trip.
 ///
+/// # Naming, and the bug it caused
+///
 /// The profile fields keep serde's **snake_case**, because that is what
 /// `ClientProfile` and `KeyNegotiationSettings` use on the wire and what the
-/// screen echoes back after receiving a profile view. Only the two **intents**
-/// are camelCase, because they exist nowhere else and the screen writes them by
-/// hand.
+/// screen echoes back after receiving a profile view. A blanket
+/// `rename_all = "camelCase"` here made every one of them a different name —
+/// `save_profile` then refused the payload with `missing field peerPublicKey`,
+/// and no test caught it: the TypeScript suite mocks the command, and the Rust
+/// suite builds the struct directly. Neither crossed the boundary where the
+/// names actually have to agree. `the_frontend_payload_deserialises` does.
+///
+/// Only the two **intents** are camelCase, because they exist nowhere else and
+/// the screen writes them by hand.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProfileDraft {
     pub name: String,
@@ -74,7 +83,7 @@ pub struct ProfileDraft {
     pub heliosd_url: Option<String>,
     pub ssh_target: Option<String>,
     pub key_negotiation: Option<KeyNegotiationSettings>,
-    /// Adopts the key the engine staged for this profile.
+    /// Adopts the key sitting in the engine's single staged-key slot.
     ///
     /// Set by the screen after `generate_private_key` or `adopt_private_key`
     /// has already produced one and shown its **public** half. The private half
@@ -84,7 +93,7 @@ pub struct ProfileDraft {
     /// Clears the stored static PSK.
     #[serde(default, rename = "clearPresharedKey")]
     pub clear_preshared_key: bool,
-    /// Adopts the PSK the engine staged for this profile.
+    /// Adopts the PSK sitting in the engine's single staged-PSK slot.
     ///
     /// The enrolment document remains the ordinary way a static PSK arrives.
     /// It is not the only one: an operator who rotates a PSK out of band, or
