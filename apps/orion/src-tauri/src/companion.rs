@@ -14,8 +14,9 @@
 //! user; on Windows Orion explicitly drops its Administrator token first.
 //!
 //! The Tauri capability grants one command from one inlined plugin. There is
-//! no generic shell permission, and this module refuses if the core ever asks
-//! it to launch anything other than the companion named here.
+//! no generic shell permission: the engine hands over arguments only, after
+//! refusing any invocation that names another program, and this module
+//! launches the companion named here and nothing else.
 
 use std::path::PathBuf;
 

@@ -104,7 +104,7 @@ pub fn spawn_ssh_terminal(target: &str) -> Result<(), String> {
 
 /// Runs the fixed Astra companion as the standard user, in its own console.
 ///
-/// The arguments come from `orion-core::CompanionInvocation`; the program does
+/// The arguments come from the engine's renewal session; the program does
 /// not. Keeping the executable literal at this boundary prevents a WebView or
 /// profile value from turning this into a general process launcher.
 pub fn spawn_astra_signer(arguments: &[String]) -> Result<(), String> {

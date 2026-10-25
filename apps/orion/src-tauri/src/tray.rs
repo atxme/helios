@@ -78,12 +78,6 @@ pub struct TrayModel {
     pub active: Option<String>,
 }
 
-/// State wording.
-///
-/// The same words as `apps/orion/src/components/state.ts`, and the duplication
-/// is deliberate: a native menu is not a webview, and routing these five labels
-/// through the frontend would make the menu depend on a window that is hidden
-/// precisely when the menu is the only thing left.
 /// The menu's model from what the engine answered.
 ///
 /// `state` is `None` when the answer could not be read, and `config` is `None`
@@ -112,6 +106,12 @@ pub fn model_from_engine(
     }
 }
 
+/// State wording.
+///
+/// The same words as `apps/orion/src/components/state.ts`, and the duplication
+/// is deliberate: a native menu is not a webview, and routing these five labels
+/// through the frontend would make the menu depend on a window that is hidden
+/// precisely when the menu is the only thing left.
 fn state_label(state: TunnelState) -> &'static str {
     match state {
         TunnelState::Up => "Connecté",
