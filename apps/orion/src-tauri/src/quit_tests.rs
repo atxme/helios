@@ -3,7 +3,7 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 use orion_core::{backend::dryrun::DryRunBackend, protected_root::EnginePaths};
 use orion_engine::{client::in_process, service::EngineService, EngineCommand, EngineReply};
 
-use super::take_tunnel_down_blocking;
+use super::{first_teardown, take_tunnel_down_blocking};
 
 /// A scratch directory removed when the test ends, whatever its outcome.
 struct Scratch(PathBuf);
@@ -71,4 +71,14 @@ fn quitting_takes_the_engine_down_before_the_deadline() {
         matches!(adapter, Ok(EngineReply::Flag(false))),
         "the adapter is still up: {adapter:?}"
     );
+}
+
+/// Only the first quit takes the tunnel down. The `Exit` that follows
+/// `ExitRequested` must not send a second `Shutdown` and wait again.
+#[test]
+fn a_second_quit_does_not_wait_again() {
+    let taken_down = std::sync::atomic::AtomicBool::new(false);
+    assert!(first_teardown(&taken_down));
+    assert!(!first_teardown(&taken_down));
+    assert!(!first_teardown(&taken_down));
 }

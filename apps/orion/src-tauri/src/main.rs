@@ -19,9 +19,9 @@
 //! 3. Off Windows the engine opens in this process. On Windows the UI runs at
 //!    its caller's level and `setup` starts the elevated engine
 //!    ([`engine_launch::start`]); the UI opens none of the engine's state.
-//! 4. `setup` manages the [`AppState`] and only then builds the window, which
-//!    is declared hidden in the configuration: it appears once the engine has
-//!    answered.
+//! 4. `setup` manages the [`AppState`] and only then builds the window. The
+//!    configuration does not create it (`"create": false`), so it does not
+//!    exist before `setup`, and it appears once the engine has answered.
 
 /// Windows is the target platform: nothing is simulated there.
 ///
@@ -119,6 +119,8 @@ struct AppState {
     /// The elevated engine's process, which Quit waits for.
     #[cfg(windows)]
     engine: Arc<engine_launch::EngineProcess>,
+    /// Set once the tunnel has been taken down: only the first quit does it.
+    tunnel_taken_down: AtomicBool,
     /// Set once the engine's loss has been reported, so it is reported once.
     engine_lost: AtomicBool,
 }
@@ -273,8 +275,11 @@ fn exit_when_engine_closes(app: AppHandle) {
 fn exit_when_engine_process_ends(app: AppHandle) {
     let engine = Arc::clone(&app.state::<AppState>().engine);
     std::thread::spawn(move || {
-        engine.wait_for_exit();
-        engine_lost(&app);
+        // A failed wait is logged by `wait_for_exit`, and announces nothing:
+        // the closed session stays the other way of learning the loss.
+        if engine.wait_for_exit() {
+            engine_lost(&app);
+        }
     });
 }
 
@@ -293,9 +298,22 @@ const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 fn take_tunnel_down(app: &AppHandle) {
     let state = app.state::<AppState>();
     state.quitting.store(true, Ordering::Release);
+    if !first_teardown(&state.tunnel_taken_down) {
+        return;
+    }
     let deadline = std::time::Instant::now() + SHUTDOWN_GRACE;
     take_tunnel_down_blocking(&state.client, SHUTDOWN_GRACE);
     wait_for_engine_exit(&state, deadline);
+}
+
+/// Whether this call is the first to take the tunnel down.
+///
+/// `ExitRequested` and `Exit` both lead to a quit: only the first one shuts the
+/// engine down and waits for it. A later one would send `Shutdown` again on a
+/// stream whose first write may have been cut short, and wait the grace period
+/// a second time.
+pub(crate) fn first_teardown(tunnel_taken_down: &AtomicBool) -> bool {
+    !tunnel_taken_down.swap(true, Ordering::AcqRel)
 }
 
 /// Waits, until `deadline`, for the engine's process to end.
@@ -684,6 +702,7 @@ fn main() {
                 quitting: AtomicBool::new(false),
                 #[cfg(windows)]
                 engine: Arc::new(engine_process),
+                tunnel_taken_down: AtomicBool::new(false),
                 engine_lost: AtomicBool::new(false),
             });
             #[cfg(target_os = "windows")]
@@ -693,8 +712,8 @@ fn main() {
             #[cfg(windows)]
             exit_when_engine_process_ends(app.handle().clone());
 
-            // Built here, after the state: the configuration declares it
-            // hidden, so no command can reach an unmanaged state.
+            // Built here, after the state: the configuration does not create
+            // it, so no command can reach an unmanaged state.
             let config = app
                 .config()
                 .app

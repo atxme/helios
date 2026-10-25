@@ -31,7 +31,7 @@ use tokio::net::windows::named_pipe::NamedPipeClient;
 #[cfg(windows)]
 use tokio::sync::mpsc;
 #[cfg(windows)]
-use windows_sys::Win32::Foundation::{GetLastError, HANDLE, WAIT_OBJECT_0};
+use windows_sys::Win32::Foundation::{GetLastError, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 #[cfg(windows)]
 use windows_sys::Win32::System::Threading::{GetProcessId, WaitForSingleObject, INFINITE};
 #[cfg(windows)]
@@ -108,19 +108,34 @@ impl EngineProcess {
     }
 
     /// Blocks the calling thread until the engine process exits.
-    pub(crate) fn wait_for_exit(&self) {
+    ///
+    /// Returns whether the process exited. A failed wait is logged and reads
+    /// as not exited: the caller must not announce a loss on it.
+    pub(crate) fn wait_for_exit(&self) -> bool {
         // SAFETY: the handle stays open until `self` drops, and INFINITE
         // waits without touching memory.
-        unsafe { WaitForSingleObject(self.raw(), INFINITE) };
+        let outcome = unsafe { WaitForSingleObject(self.raw(), INFINITE) };
+        if outcome == WAIT_OBJECT_0 {
+            return true;
+        }
+        log_failed_wait();
+        false
     }
 
     /// Waits at most `timeout` for the engine process to exit.
     ///
-    /// Returns whether it has exited by then.
+    /// Returns whether it has exited by then. A failed wait is logged.
     pub(crate) fn wait_for_exit_within(&self, timeout: Duration) -> bool {
         let milliseconds = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
         // SAFETY: as in `wait_for_exit`; the timeout bounds the wait.
-        unsafe { WaitForSingleObject(self.raw(), milliseconds) == WAIT_OBJECT_0 }
+        match unsafe { WaitForSingleObject(self.raw(), milliseconds) } {
+            WAIT_OBJECT_0 => true,
+            WAIT_TIMEOUT => false,
+            _ => {
+                log_failed_wait();
+                false
+            }
+        }
     }
 
     /// Whether the engine process has already exited. Never waits.
@@ -132,6 +147,14 @@ impl EngineProcess {
     fn raw(&self) -> HANDLE {
         self.handle.as_raw_handle()
     }
+}
+
+/// Logs a wait on the engine process that failed, with the Win32 code only.
+#[cfg(windows)]
+fn log_failed_wait() {
+    // SAFETY: GetLastError reads the thread's last error, with no pointer.
+    let code = unsafe { GetLastError() };
+    tracing::error!(code, "attente du processus du moteur d'Orion en échec");
 }
 
 /// The engine's process is waited on from another thread, and shared.
@@ -168,6 +191,9 @@ pub(crate) async fn start(
     drop(args);
 
     let process = launch(&parameters)?;
+    // The token stays in `token`, which the hello needs; the joined command
+    // line, which carries it too, is erased now.
+    drop(parameters);
     let stream = wait_for_pipe(&name, &process).await?;
     if server_process_id(&stream)? != process.pid() {
         return Err("le canal n'est pas servi par le moteur lancé par Orion".into());
