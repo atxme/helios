@@ -29,13 +29,13 @@ use orion_core::default_backend;
 use orion_core::protected_root::{install_is_protected, EnginePaths, RootError, REFUSED_ROOT};
 #[cfg(windows)]
 use orion_engine::lifecycle::{
-    exit_code, on_event, parent_matches, Action, LifecycleEvent, CONNECT_TIMEOUT,
-    EXECUTABLE_DIR_WRITABLE, PROTECTED_ROOT_REFUSED,
+    exit_code, on_event, parent_matches, parent_open_exit_code, Action, LifecycleEvent,
+    CONNECT_TIMEOUT, EXECUTABLE_DIR_WRITABLE, OTHER_ACCOUNT_ELEVATION, PROTECTED_ROOT_REFUSED,
 };
 #[cfg(windows)]
 use orion_engine::pipe::{
     create_server, expected_from_launcher, observe_client, observe_process, process_user_sid,
-    verify_client, ExpectedClient,
+    verify_client, ExpectedClient, ObservedClient, ProcessError,
 };
 #[cfg(windows)]
 use orion_engine::serve::{serve_until, Engine};
@@ -112,18 +112,24 @@ pub fn run(args: EngineArgs) -> i32 {
     // the log opens, a failure goes to stderr and to the exit code.
     let drbg = aether::random::configure();
 
+    // An engine elevated under another account than the UI's is refused open
+    // access to the UI's process and token: it stops here, with its own code.
     let parent = match ParentWatch::open(args.ui_pid, args.ui_created_at) {
         Ok(parent) => parent,
-        Err(error) => return exit_before_log(LifecycleEvent::ParentMissing, error),
+        Err(error) => return parent_unreachable(LifecycleEvent::ParentMissing, error),
     };
 
-    let expected = match launcher_client(args.ui_pid, &current_exe) {
+    let launcher = match observe_process(args.ui_pid) {
+        Ok(launcher) => launcher,
+        Err(error) => return parent_unreachable(LifecycleEvent::ClientRefused, error),
+    };
+    let expected = match launcher_client(launcher, &current_exe) {
         Ok(expected) => expected,
         Err(error) => return exit_before_log(LifecycleEvent::ClientRefused, error),
     };
     let sid = match process_user_sid(args.ui_pid) {
         Ok(sid) => sid,
-        Err(error) => return exit_before_log(LifecycleEvent::ClientRefused, error),
+        Err(error) => return parent_unreachable(LifecycleEvent::ClientRefused, error),
     };
 
     // The engine never falls back to a per-user directory: when the protected
@@ -229,6 +235,22 @@ fn exit_before_log(event: LifecycleEvent, error: impl Display) -> i32 {
     exit_code(event)
 }
 
+/// Writes to stderr why the UI's process or token could not be opened, before
+/// the log exists, and returns the exit code: [`OTHER_ACCOUNT_ELEVATION`] for
+/// a refused access, the event's own code otherwise.
+#[cfg(windows)]
+fn parent_unreachable(event: LifecycleEvent, error: ProcessError) -> i32 {
+    let code = parent_open_exit_code(event, error.open_code);
+    if code == OTHER_ACCOUNT_ELEVATION {
+        eprintln!(
+            "moteur d'Orion : démarrage refusé : élevé sous un autre compte que l'IHM, il ne peut pas l'observer ({error})"
+        );
+        return code;
+    }
+    eprintln!("moteur d'Orion : démarrage refusé : {error}");
+    code
+}
+
 /// Writes a start-up failure to stderr, before the log exists, and returns the
 /// start-up exit code.
 #[cfg(windows)]
@@ -259,8 +281,7 @@ fn session_event(event: LifecycleEvent, error: impl Display) -> LifecycleEvent {
 /// The UI's launcher, as the engine expects it to be: this image, started
 /// before the engine, and the same process the UI announced.
 #[cfg(windows)]
-fn launcher_client(ui_pid: u32, current_exe: &Path) -> Result<ExpectedClient, String> {
-    let launcher = observe_process(ui_pid)?;
+fn launcher_client(launcher: ObservedClient, current_exe: &Path) -> Result<ExpectedClient, String> {
     let own_created_at = observe_process(std::process::id())?.created_at;
     expected_from_launcher(launcher, current_exe, own_created_at)
         .map_err(|refusal| refusal.to_string())
@@ -364,7 +385,8 @@ unsafe impl Send for ParentWatch {}
 #[cfg(windows)]
 impl ParentWatch {
     /// Opens the UI at `pid`, and fails unless it was created at `created_at`.
-    fn open(pid: u32, created_at: u64) -> Result<Self, String> {
+    /// A failed open carries its Win32 code.
+    fn open(pid: u32, created_at: u64) -> Result<Self, ProcessError> {
         // SAFETY: OpenProcess takes no pointer; a null result is checked below.
         let raw = unsafe {
             OpenProcess(
@@ -374,17 +396,18 @@ impl ParentWatch {
             )
         };
         if raw.is_null() {
-            return Err(format!(
-                "processus de l'IHM {pid} inaccessible ({})",
-                std::io::Error::last_os_error()
+            let error = std::io::Error::last_os_error();
+            return Err(ProcessError::opening(
+                error.raw_os_error(),
+                format!("processus de l'IHM {pid} inaccessible ({error})"),
             ));
         }
         // Owned from here on: the handle closes on drop, even when refused below.
         let watch = Self(raw);
         if !parent_matches(created_at, creation_time(raw)) {
-            return Err(format!(
+            return Err(ProcessError::other(format!(
                 "le processus {pid} n'est pas l'IHM qui a lancé le moteur"
-            ));
+            )));
         }
         Ok(watch)
     }

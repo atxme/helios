@@ -618,10 +618,16 @@ DPAPI et le TPM pour les ouvrir. Orion se compose désormais de deux processus
 * **Un programme non élevé du même compte peut piloter l'IHM** (WebView,
   entrées). Il obtient ce que l'IHM peut demander au moteur, pas le contenu du
   coffre ni les clés (ADR-004, Limites connues).
-* **Élévation par les identifiants d'un autre administrateur** (compte standard
-  à l'ouverture d'Orion) : le moteur tourne sous ce compte, et DPAPI en portée
-  utilisateur lie alors le coffre à ce compte. L'ancien coffre n'est pas migré
-  automatiquement (le moteur journalise un avertissement et ne migre pas), et un
+* **Élévation par les identifiants d'un autre administrateur : non prise en
+  charge** (compte standard à l'ouverture d'Orion). Le moteur tourne sous ce
+  compte et ne peut pas ouvrir le processus ni le jeton de l'IHM, qu'Orion
+  n'élargit pas : il s'arrête avant d'écrire quoi que ce soit, avec le code 5,
+  et l'IHM affiche « Orion doit être autorisé avec le compte de la session
+  ouverte : l'élévation avec les identifiants d'un autre administrateur n'est
+  pas prise en charge. » (ADR-004, Limites connues). **À valider en recette.**
+  Si Windows accorde malgré tout cet accès, le moteur poursuit sous ce compte :
+  DPAPI en portée utilisateur lie alors le coffre à ce compte, l'ancien coffre
+  n'est pas migré (le moteur journalise un avertissement et ne migre pas), et un
   autre administrateur à l'élévation suivante ne pourra pas ouvrir le coffre.
 * **Non éprouvé sous Windows à ce jour.** Les points suivants sont **à valider
   en recette** ([MANUAL-TESTING](../testing/MANUAL-TESTING.md), « Séparation des

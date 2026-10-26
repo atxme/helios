@@ -27,7 +27,9 @@ use orion_engine::lifecycle::EngineArgs;
 #[cfg(any(windows, test))]
 use orion_engine::lifecycle::ENGINE_START_TIMEOUT;
 #[cfg(any(windows, test))]
-use orion_engine::lifecycle::{EXECUTABLE_DIR_WRITABLE, PROTECTED_ROOT_REFUSED};
+use orion_engine::lifecycle::{
+    EXECUTABLE_DIR_WRITABLE, OTHER_ACCOUNT_ELEVATION, PROTECTED_ROOT_REFUSED,
+};
 #[cfg(windows)]
 use orion_engine::pipe::{connect_client, observe_process, pipe_name, server_process_id};
 #[cfg(windows)]
@@ -68,6 +70,12 @@ pub(crate) const UAC_REFUSED: &str =
 /// Message shown when the engine stops while the UI is running.
 pub(crate) const ENGINE_STOPPED: &str = "Le moteur d'Orion s'est arrêté : Orion va se fermer.";
 
+/// Message shown when the elevation started the engine under another account.
+#[cfg(any(windows, test))]
+pub(crate) const OTHER_ACCOUNT_REFUSED: &str =
+    "Orion doit être autorisé avec le compte de la session ouverte : \
+     l'élévation avec les identifiants d'un autre administrateur n'est pas prise en charge.";
+
 /// `ERROR_CANCELLED`: the person refused the elevation prompt.
 #[cfg(any(windows, test))]
 const ERROR_CANCELLED: i32 = 1223;
@@ -101,12 +109,14 @@ pub(crate) fn launch_failure(code: i32) -> String {
 }
 
 /// The message for an engine that stopped before it opened its pipe. A refused
-/// protected root is named as such; any other exit names its code.
+/// protected root, a writable install and an engine under another account are
+/// named as such; any other exit names its code.
 #[cfg(any(windows, test))]
 pub(crate) fn early_exit_message(code: Option<u32>) -> String {
     match code {
         Some(code) if code == PROTECTED_ROOT_REFUSED as u32 => REFUSED_ROOT.to_owned(),
         Some(code) if code == EXECUTABLE_DIR_WRITABLE as u32 => WRITABLE_INSTALL.to_owned(),
+        Some(code) if code == OTHER_ACCOUNT_ELEVATION as u32 => OTHER_ACCOUNT_REFUSED.to_owned(),
         Some(code) => format!("Le moteur d'Orion s'est arrêté avant de répondre (code {code})."),
         None => "Le moteur d'Orion s'est arrêté avant de répondre.".to_owned(),
     }
@@ -488,8 +498,8 @@ mod tests {
     #[test]
     fn another_early_exit_names_its_code() {
         assert_eq!(
-            early_exit_message(Some(5)),
-            "Le moteur d'Orion s'est arrêté avant de répondre (code 5)."
+            early_exit_message(Some(6)),
+            "Le moteur d'Orion s'est arrêté avant de répondre (code 6)."
         );
         assert_eq!(
             early_exit_message(None),
@@ -525,6 +535,19 @@ mod tests {
                 Duration::from_secs(1)
             ),
             StartWait::GiveUp(REFUSED_ROOT.to_owned())
+        );
+    }
+
+    #[test]
+    fn an_engine_under_another_account_reads_as_unsupported() {
+        assert_eq!(
+            early_exit_message(Some(OTHER_ACCOUNT_ELEVATION as u32)),
+            OTHER_ACCOUNT_REFUSED
+        );
+        assert_eq!(
+            OTHER_ACCOUNT_REFUSED,
+            "Orion doit être autorisé avec le compte de la session ouverte : \
+             l'élévation avec les identifiants d'un autre administrateur n'est pas prise en charge."
         );
     }
 

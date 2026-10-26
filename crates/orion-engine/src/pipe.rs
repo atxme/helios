@@ -63,6 +63,48 @@ impl std::fmt::Display for ClientRefusal {
 
 impl std::error::Error for ClientRefusal {}
 
+/// A process, or its token, that could not be opened or read.
+///
+/// Carries the Win32 code of a failed open, so the engine can tell a refused
+/// access from a process that is gone. The message names the process and the
+/// step that failed, and nothing else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessError {
+    /// Win32 code of a failed `OpenProcess` or `OpenProcessToken`. `None` when
+    /// another step failed.
+    pub open_code: Option<i32>,
+    message: String,
+}
+
+impl ProcessError {
+    /// A failed open, with the Win32 code it returned.
+    pub fn opening(open_code: Option<i32>, message: String) -> Self {
+        Self { open_code, message }
+    }
+
+    /// Any failure other than an open.
+    pub fn other(message: String) -> Self {
+        Self {
+            open_code: None,
+            message,
+        }
+    }
+}
+
+impl std::fmt::Display for ProcessError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ProcessError {}
+
+impl From<ProcessError> for String {
+    fn from(error: ProcessError) -> Self {
+        error.message
+    }
+}
+
 /// The pipe name: `\\.\pipe\orion-engine-<ui_pid>-<nonce in lowercase hex>`.
 ///
 /// The nonce comes from the system's random source, so two engines never

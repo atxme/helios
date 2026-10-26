@@ -280,13 +280,24 @@ dépôt. La commande de signature Tauri impose un horodatage RFC 3161 avec
     du coffre ni les clés (qui ne quittent pas le moteur).
   * **Les autres administrateurs de la machine** peuvent ouvrir le coffre
     (ADR-006 §7).
-  * **Élévation par les identifiants d'un autre administrateur** : le moteur
-    tourne sous ce compte ; le coffre est lié à ce compte (ADR-006 §7).
+  * **Élévation par les identifiants d'un autre administrateur : non prise en
+    charge.** Quand un compte standard saisit à l'UAC les identifiants d'un
+    administrateur, le moteur tourne sous ce compte, dans une autre session
+    d'ouverture. La DACL par défaut du processus et du jeton de l'IHM ne lui
+    accorde pas l'accès, et le moteur n'active pas `SeDebugPrivilege` : Orion
+    n'élargit aucun de ces droits. Le moteur sort alors avant d'ouvrir son
+    journal, sans rien écrire, avec le code 5 (`OTHER_ACCOUNT_ELEVATION`), et
+    l'IHM affiche « Orion doit être autorisé avec le compte de la session
+    ouverte : l'élévation avec les identifiants d'un autre administrateur n'est
+    pas prise en charge. ». **À valider en recette.** Si Windows accorde
+    malgré tout cet accès, le moteur poursuit sous l'autre compte, sans migrer
+    l'ancien coffre (ADR-006 §7).
   * **`EngineService::open`** (nettoyage d'un adaptateur orphelin) s'exécute
     avant l'authentification du client.
   * **Les échecs du moteur avant l'ouverture de son journal** n'arrivent à l'IHM
     que comme code de sortie (par exemple 3 pour la racine protégée refusée, 4
-    pour une installation modifiable).
+    pour une installation modifiable, 5 pour un moteur élevé sous un autre
+    compte).
   * **En release, l'IHM puis le moteur refusent** un exécutable, une DLL, un
     dossier ou un parent modifiable par un compte non administrateur, ainsi
     qu'un dossier ou un exécutable atteint par un point d'analyse ; un ancêtre

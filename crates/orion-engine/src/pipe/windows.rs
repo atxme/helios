@@ -26,7 +26,7 @@ use windows_sys::Win32::System::Threading::{
     PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
-use super::ObservedClient;
+use super::{ObservedClient, ProcessError};
 use orion_core::protected_root::is_plain_sid;
 
 /// Longest image path Windows reports, in UTF-16 units, with its terminator.
@@ -104,14 +104,16 @@ pub fn create_server(name: &str, client_sid: &str) -> Result<NamedPipeServer, St
     created.map_err(|error| format!("tube nommé refusé ({error})"))
 }
 
-/// Opens a process with the limited right to query it, or fails.
-fn open_process(pid: u32) -> Result<OwnedHandle, String> {
+/// Opens a process with the limited right to query it, or fails with the
+/// Win32 code of the refusal.
+fn open_process(pid: u32) -> Result<OwnedHandle, ProcessError> {
     // SAFETY: OpenProcess takes no pointer; a null result is checked below.
     let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
     if raw.is_null() {
-        return Err(format!(
-            "processus {pid} inaccessible ({})",
-            std::io::Error::last_os_error()
+        let error = std::io::Error::last_os_error();
+        return Err(ProcessError::opening(
+            error.raw_os_error(),
+            format!("processus {pid} inaccessible ({error})"),
         ));
     }
     Ok(OwnedHandle(raw))
@@ -120,8 +122,9 @@ fn open_process(pid: u32) -> Result<OwnedHandle, String> {
 /// Reads the PID, image path and creation time of a running process.
 ///
 /// Fails rather than guessing: a zero creation time is refused, since it
-/// could not be compared against the engine's own.
-pub fn observe_process(pid: u32) -> Result<ObservedClient, String> {
+/// could not be compared against the engine's own. Only a failed open carries
+/// its Win32 code.
+pub fn observe_process(pid: u32) -> Result<ObservedClient, ProcessError> {
     let process = open_process(pid)?;
     let mut buffer = vec![0u16; MAX_IMAGE_PATH];
     let mut length = MAX_IMAGE_PATH as u32;
@@ -136,14 +139,14 @@ pub fn observe_process(pid: u32) -> Result<ObservedClient, String> {
         )
     };
     if named == 0 {
-        return Err(format!(
+        return Err(ProcessError::other(format!(
             "chemin de l'image du processus {pid} illisible ({})",
             std::io::Error::last_os_error()
-        ));
+        )));
     }
-    let units = buffer
-        .get(..length as usize)
-        .ok_or_else(|| format!("chemin de l'image du processus {pid} illisible"))?;
+    let units = buffer.get(..length as usize).ok_or_else(|| {
+        ProcessError::other(format!("chemin de l'image du processus {pid} illisible"))
+    })?;
     let image = PathBuf::from(OsString::from_wide(units));
     let mut creation = FILETIME::default();
     let mut exit = FILETIME::default();
@@ -153,14 +156,16 @@ pub fn observe_process(pid: u32) -> Result<ObservedClient, String> {
     let timed =
         unsafe { GetProcessTimes(process.0, &mut creation, &mut exit, &mut kernel, &mut user) };
     if timed == 0 {
-        return Err(format!(
+        return Err(ProcessError::other(format!(
             "date de création du processus {pid} illisible ({})",
             std::io::Error::last_os_error()
-        ));
+        )));
     }
     let created_at = (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime);
     if created_at == 0 {
-        return Err(format!("date de création du processus {pid} nulle"));
+        return Err(ProcessError::other(format!(
+            "date de création du processus {pid} nulle"
+        )));
     }
     Ok(ObservedClient {
         pid,
@@ -181,7 +186,7 @@ pub fn observe_client(server: &NamedPipeServer) -> Result<ObservedClient, String
             std::io::Error::last_os_error()
         ));
     }
-    observe_process(pid)
+    observe_process(pid).map_err(String::from)
 }
 
 /// The PID of the process that created the pipe, as seen from a client.
@@ -203,20 +208,23 @@ pub fn server_process_id(client: &NamedPipeClient) -> Result<u32, String> {
 }
 
 /// The user SID of a process's token, in string form (`S-1-5-…`).
-pub fn process_user_sid(pid: u32) -> Result<String, String> {
+///
+/// A failed open of the process or of its token carries its Win32 code.
+pub fn process_user_sid(pid: u32) -> Result<String, ProcessError> {
     let process = open_process(pid)?;
     let mut raw: HANDLE = std::ptr::null_mut();
     // SAFETY: `process` is a valid handle; `raw` receives a token handle that
     // OwnedHandle closes.
     let opened = unsafe { OpenProcessToken(process.0, TOKEN_QUERY, &mut raw) };
     if opened == 0 {
-        return Err(format!(
-            "jeton du processus {pid} illisible ({})",
-            std::io::Error::last_os_error()
+        let error = std::io::Error::last_os_error();
+        return Err(ProcessError::opening(
+            error.raw_os_error(),
+            format!("jeton du processus {pid} illisible ({error})"),
         ));
     }
     let token = OwnedHandle(raw);
-    token_user_sid(token.0, &format!("du processus {pid}"))
+    token_user_sid(token.0, &format!("du processus {pid}")).map_err(ProcessError::other)
 }
 
 /// The user SID of `token`, in string form (`S-1-5-…`). `what` names the token

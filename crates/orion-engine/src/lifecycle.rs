@@ -34,6 +34,12 @@ pub const PROTECTED_ROOT_REFUSED: i32 = 3;
 /// can change. The engine refuses to elevate from there, and writes nothing.
 pub const EXECUTABLE_DIR_WRITABLE: i32 = 4;
 
+/// Exit code for an engine the elevation started under another account than
+/// the UI's: an administrator's credentials typed at the prompt of a standard
+/// session. That engine cannot open the UI's process or token to observe it,
+/// so it stops before writing anything. This case is not supported.
+pub const OTHER_ACCOUNT_ELEVATION: i32 = 5;
+
 const ENGINE_FLAG: &str = "--engine";
 const PIPE_PREFIX: &str = r"\\.\pipe\orion-engine-";
 
@@ -228,6 +234,21 @@ impl From<&ServeOutcome> for LifecycleEvent {
 /// the engine. A missing process or a different creation time means it is not.
 pub fn parent_matches(expected_created_at: u64, observed: Option<u64>) -> bool {
     observed == Some(expected_created_at)
+}
+
+/// `ERROR_ACCESS_DENIED`, as Windows reports it.
+const ERROR_ACCESS_DENIED: i32 = 5;
+
+/// Exit code when the engine cannot open the UI's process or its token.
+///
+/// `open_code` is the Win32 code of the failed open, when there is one. A
+/// refused access means the engine runs under another account than the UI:
+/// [`OTHER_ACCOUNT_ELEVATION`]. Any other failure keeps the event's own code.
+pub fn parent_open_exit_code(event: LifecycleEvent, open_code: Option<i32>) -> i32 {
+    if open_code == Some(ERROR_ACCESS_DENIED) {
+        return OTHER_ACCOUNT_ELEVATION;
+    }
+    exit_code(event)
 }
 
 #[cfg(test)]

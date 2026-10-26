@@ -355,3 +355,49 @@ fn a_parent_gone_before_the_engine_starts_stops_it() {
 fn the_connect_timeout_is_ten_seconds() {
     assert_eq!(CONNECT_TIMEOUT, std::time::Duration::from_secs(10));
 }
+
+#[test]
+fn an_access_denied_parent_reads_as_another_account() {
+    // ERROR_ACCESS_DENIED, on the UI's process or on its token.
+    for event in [LifecycleEvent::ParentMissing, LifecycleEvent::ClientRefused] {
+        assert_eq!(
+            parent_open_exit_code(event, Some(5)),
+            OTHER_ACCOUNT_ELEVATION
+        );
+    }
+}
+
+#[test]
+fn a_missing_parent_keeps_its_code() {
+    // ERROR_INVALID_PARAMETER is what a PID with no process gives.
+    assert_eq!(
+        parent_open_exit_code(LifecycleEvent::ParentMissing, Some(87)),
+        exit_code(LifecycleEvent::ParentMissing)
+    );
+    assert_eq!(
+        parent_open_exit_code(LifecycleEvent::ClientRefused, None),
+        exit_code(LifecycleEvent::ClientRefused)
+    );
+    assert_ne!(
+        exit_code(LifecycleEvent::ParentMissing),
+        OTHER_ACCOUNT_ELEVATION
+    );
+}
+
+#[test]
+fn the_engine_exit_codes_are_distinct() {
+    let codes = [
+        BAD_ARGUMENTS,
+        PROTECTED_ROOT_REFUSED,
+        EXECUTABLE_DIR_WRITABLE,
+        OTHER_ACCOUNT_ELEVATION,
+        exit_code(LifecycleEvent::ParentMissing),
+        exit_code(LifecycleEvent::ShutdownRequested),
+    ];
+    for (index, code) in codes.iter().enumerate() {
+        assert!(
+            !codes[index + 1..].contains(code),
+            "code {code} is used twice"
+        );
+    }
+}
