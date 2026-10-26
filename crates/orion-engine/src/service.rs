@@ -154,6 +154,20 @@ impl EngineService {
         // Before anything reads the vault: an existing vault in the per-user
         // folder is moved under the protected root first (F11, task 12).
         let relocation_failure = relocate_legacy_vault(&paths)?;
+        Self::assemble(paths, backend, log_path, app_version, relocation_failure)
+    }
+
+    /// Builds the service once the legacy vault has been dealt with.
+    ///
+    /// `relocation_failure` is the message of a migration that failed: the
+    /// store then refuses every root, and the message is what the screen shows.
+    fn assemble(
+        paths: EnginePaths,
+        backend: Arc<dyn VpnBackend>,
+        log_path: Option<PathBuf>,
+        app_version: &'static str,
+        relocation_failure: Option<String>,
+    ) -> Result<Arc<Self>, String> {
         let relocation_refused = relocation_failure.is_some();
         let controller = VpnController::new(backend);
         // The identities live under the protected root the shell established

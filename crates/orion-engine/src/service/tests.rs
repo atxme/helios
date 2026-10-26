@@ -81,6 +81,33 @@ fn open_keeps_running_on_a_vault_it_cannot_read() {
 }
 
 #[tokio::test]
+async fn a_failed_relocation_is_visible_in_the_first_view() {
+    let scratch = Scratch::new("failed-relocation-view");
+    let failure = orion_core::vault::relocation::failure_message(
+        &orion_core::vault::VaultError::Relocation("dossier neuf non écrivable".into()),
+    );
+    let service = EngineService::assemble(
+        paths_under(&scratch.0),
+        Arc::new(DryRunBackend::default()),
+        None,
+        "0.0.0-test",
+        Some(failure.clone()),
+    )
+    .expect("a failed migration does not stop the service");
+    let (client, _events) = crate::client::in_process(service)
+        .await
+        .expect("the session opens");
+
+    match client.call(EngineCommand::GetConfig).await {
+        Ok(EngineReply::Config(view)) => {
+            assert!(view.profiles.is_empty());
+            assert_eq!(view.vault_error, Some(failure));
+        }
+        other => panic!("unexpected reply: {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn the_engine_answers_get_state_through_the_client() {
     let scratch = Scratch::new("answers-state");
     let service = EngineService::open(

@@ -126,6 +126,11 @@ impl From<&ClientProfile> for ProfileView {
 pub struct ConfigView {
     pub profiles: Vec<ProfileView>,
     pub selected: Option<String>,
+    /// Why the vault could not be opened at start-up, when it could not.
+    ///
+    /// An empty list says nothing about its cause: after a failed migration,
+    /// this is the message that says the legacy vault was kept, and why.
+    pub vault_error: Option<String>,
 }
 
 impl From<&ClientConfig> for ConfigView {
@@ -133,6 +138,7 @@ impl From<&ClientConfig> for ConfigView {
         Self {
             profiles: config.profiles.iter().map(ProfileView::from).collect(),
             selected: config.selected.clone(),
+            vault_error: None,
         }
     }
 }

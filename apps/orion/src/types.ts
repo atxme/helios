@@ -358,6 +358,12 @@ export interface ClientProfile {
 export interface ClientConfig {
   profiles: ClientProfile[]
   selected: string | null
+  /**
+   * Why the vault could not be opened at start-up, when it could not. An empty
+   * list says nothing about its cause: after a failed migration, this is the
+   * message that says the legacy vault was kept, and why.
+   */
+  vault_error?: string | null
 }
 
 /**

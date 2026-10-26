@@ -152,8 +152,18 @@ fn settle_saved_enrollment(identities: &Path, identity: &str) {
 }
 
 impl EngineService {
+    /// The configuration as the screen sees it, with why the vault could not
+    /// be opened, when it could not. Every view carries it, so a reply that
+    /// replaces the screen's configuration never drops the cause.
+    fn config_view(&self, config: &orion_core::ClientConfig) -> ConfigView {
+        ConfigView {
+            vault_error: self.vault_error.clone(),
+            ..ConfigView::from(config)
+        }
+    }
+
     pub async fn get_config(&self) -> Result<ConfigView, String> {
-        Ok(ConfigView::from(&*self.config.lock().await))
+        Ok(self.config_view(&*self.config.lock().await))
     }
 
     /// Decodes a document chosen by the user without persisting it.
@@ -507,7 +517,7 @@ impl EngineService {
         cfg.upsert(profile).map_err(|error| error.to_string())?;
         cfg.selected = Some(selected.clone());
         self.store.select(&selected).map_err(|e| e.to_string())?;
-        Ok(ConfigView::from(&*cfg))
+        Ok(self.config_view(&cfg))
     }
 
     /// Removes a profile, unmounting its tunnel first if that tunnel is the one up.
@@ -535,7 +545,7 @@ impl EngineService {
             .remove_profile(&name)
             .map_err(|e| e.to_string())?;
         cfg.remove(&name);
-        Ok(ConfigView::from(&*cfg))
+        Ok(self.config_view(&cfg))
     }
 
     /// Selects a profile that is in the configuration.
@@ -550,7 +560,7 @@ impl EngineService {
         }
         self.store.select(&name).map_err(|e| e.to_string())?;
         cfg.selected = Some(name);
-        Ok(ConfigView::from(&*cfg))
+        Ok(self.config_view(&cfg))
     }
 
     /// Refuses to write a secret onto a volume nothing encrypts (ADR-006 §3).

@@ -1246,6 +1246,19 @@ export function ProfilesView({
             Vertical scrolling is allowed here, and only here: a clipped
             certificate warning would be worse than a scrollbar. */}
         <Box sx={{ minWidth: 0, overflowX: 'hidden', overflowY: 'auto', px: GUTTER, py: 1.5 }}>
+          {/* The vault did not open: the list is empty because nothing was
+              read, and the cause says so — after a failed migration, that the
+              legacy vault was kept. */}
+          {config.vault_error && (
+            <Alert
+              severity="error"
+              variant="outlined"
+              role="alert"
+              sx={{ mb: 1.5, py: 0, fontSize: 12 }}
+            >
+              {config.vault_error}
+            </Alert>
+          )}
           {notice && (
             <Alert
               severity={notice.tone}

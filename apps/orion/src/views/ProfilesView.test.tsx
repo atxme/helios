@@ -136,6 +136,37 @@ beforeEach(() => {
 afterEach(cleanup)
 
 describe('ProfilesView interactions', () => {
+  it('states why the vault could not be opened, on an empty list', async () => {
+    const failure =
+      "La migration du coffre a échoué : l'ancien coffre est conservé. Cause : dossier neuf non écrivable"
+    render(
+      <ProfilesView
+        config={{ profiles: [], selected: null, vault_error: failure }}
+        pathImport={null}
+        {...callbacks()}
+      />,
+    )
+
+    expect((await screen.findByText(failure)).closest('[role="alert"]')).toBeTruthy()
+  })
+
+  it('shows no vault message when the vault opened', async () => {
+    render(
+      <ProfilesView
+        config={{ profiles: [profile()], selected: 'portable', vault_error: null }}
+        pathImport={null}
+        {...callbacks()}
+      />,
+    )
+
+    await waitFor(() =>
+      expect((screen.getByLabelText('Votre clé publique') as HTMLInputElement).value).toBe(
+        'client-public',
+      ),
+    )
+    expect(screen.queryByText(/La migration du coffre/)).toBeNull()
+  })
+
   it('edits, undoes, saves and exposes advanced security choices', async () => {
     const handlers = callbacks()
     render(
