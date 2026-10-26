@@ -338,7 +338,11 @@ Repères communs :
   2 pour des arguments illisibles, **3** pour une racine protégée refusée,
   **4** pour une installation modifiable, **5** pour un moteur élevé sous un
   autre compte que l'IHM ;
-- aucun journal ne doit contenir de clé privée, de PSK, de PIN ni de jeton.
+- aucun journal **d'Orion** (`orion.log`, `orion-ui.log`) ne doit contenir de
+  clé privée, de PSK, de PIN ni de jeton ; les journaux système qui
+  enregistrent la ligne de commande des processus (événement 4688, Sysmon, EDR)
+  contiennent, eux, le jeton de session du moteur, qui n'est pas un secret
+  (ADR-004, Limites connues).
 
 **1. Lancement.** Lancer Orion depuis l'icône, avec un compte standard.
 Attendu : un seul UAC, puis la fenêtre ; deux processus `orion.exe` (IHM non

@@ -271,8 +271,14 @@ dépôt. La commande de signature Tauri impose un horodatage RFC 3161 avec
   `\\.\pipe\orion-engine-<pid>-<nonce>` dont la DACL n'accorde l'accès qu'au
   SID de l'IHM (une instance, clients distants refusés) ; le moteur vérifie le
   PID, l'image et l'heure de création du client, l'IHM vérifie que le serveur
-  est le moteur qu'elle a lancé, et un jeton de session de 32 octets ouvre la
-  session. Aucun des deux processus ne survit à l'autre. Spec :
+  est le moteur qu'elle a lancé, et un jeton de session de 32 octets lie la
+  session à ce lancement. Ce jeton n'est **pas un secret** face à l'adversaire
+  de la spec (§8, un programme du même compte) : il passe sur la ligne de
+  commande du moteur, qu'un processus du même compte peut lire, et que l'audit
+  de création de processus (événement 4688 avec ligne de commande), Sysmon ou
+  un EDR enregistrent. La preuve que le client est l'IHM est la vérification
+  du PID, de l'image et de l'heure de création, pas le jeton. Aucun des deux
+  processus ne survit à l'autre. Spec :
   [séparation des privilèges Windows](../superpowers/specs/2026-10-24-separation-privileges-windows-design.md).
   Limites :
   * **Un programme non élevé du même compte peut piloter l'IHM** (WebView,
