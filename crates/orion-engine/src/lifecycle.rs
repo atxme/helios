@@ -14,6 +14,15 @@ use crate::session::SessionToken;
 /// Time the engine waits for its client to connect to the pipe.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Time the UI waits for the engine it launched to create its pipe.
+///
+/// Much longer than [`CONNECT_TIMEOUT`], because the engine creates the pipe
+/// only once it has opened its state. On a first start that includes
+/// generating the machine's RSA key on the TPM (3072 bits, then 2048), which
+/// a discrete TPM can take tens of seconds to do, and the migration of the
+/// legacy vault. The UI stops sooner when the engine process exits.
+pub const ENGINE_START_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Exit code for engine arguments that cannot be read. Nothing is started.
 pub const BAD_ARGUMENTS: i32 = 2;
 

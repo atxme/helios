@@ -11,7 +11,7 @@
 use std::os::windows::ffi::OsStrExt;
 #[cfg(windows)]
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 use std::time::Duration;
 
 #[cfg(windows)]
@@ -23,7 +23,9 @@ use orion_core::ClientEvent;
 #[cfg(windows)]
 use orion_engine::client::{connect, EngineClient};
 #[cfg(windows)]
-use orion_engine::lifecycle::{EngineArgs, CONNECT_TIMEOUT};
+use orion_engine::lifecycle::EngineArgs;
+#[cfg(any(windows, test))]
+use orion_engine::lifecycle::ENGINE_START_TIMEOUT;
 #[cfg(any(windows, test))]
 use orion_engine::lifecycle::{EXECUTABLE_DIR_WRITABLE, PROTECTED_ROOT_REFUSED};
 #[cfg(windows)]
@@ -299,27 +301,77 @@ fn launch(parameters: &str) -> Result<EngineProcess, String> {
     Ok(EngineProcess { handle, pid })
 }
 
+/// Message shown when the engine neither opens its pipe nor exits in time.
+#[cfg(any(windows, test))]
+const ENGINE_SILENT: &str = "Le moteur d'Orion ne répond pas.";
+
+/// The engine's process, as the UI sees it while its pipe does not exist yet.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EngineStatus {
+    Running,
+    /// Exited, with its code when it could be read.
+    Exited(Option<u32>),
+}
+
+/// What the UI does next while it waits for the engine's pipe.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StartWait {
+    /// Try to open the pipe again.
+    Retry,
+    /// Stop waiting, with the message to show.
+    GiveUp(String),
+}
+
+/// Decides the next step of the wait for the engine's pipe, `elapsed` after
+/// the launch, once the pipe could not be opened.
+///
+/// The engine creates its pipe only after its first-start work, so the UI
+/// waits for it as long as the process lives, up to [`ENGINE_START_TIMEOUT`].
+/// An engine that has exited is reported at once, with its exit code.
+#[cfg(any(windows, test))]
+pub(crate) fn while_the_engine_starts(status: EngineStatus, elapsed: Duration) -> StartWait {
+    if let EngineStatus::Exited(code) = status {
+        return StartWait::GiveUp(early_exit_message(code));
+    }
+    if elapsed >= ENGINE_START_TIMEOUT {
+        return StartWait::GiveUp(ENGINE_SILENT.to_owned());
+    }
+    StartWait::Retry
+}
+
 /// Opens the engine's pipe, retrying until it exists and is free.
 ///
-/// Stops early when the engine has already exited, and after
-/// [`CONNECT_TIMEOUT`]. Any failure of the open is retried: the open's error
-/// does not expose the Win32 code, and the deadline bounds the wait.
+/// Each failed attempt goes through [`while_the_engine_starts`]. Any failure
+/// of the open is retried: the open's error does not expose the Win32 code,
+/// and the decision bounds the wait.
 #[cfg(windows)]
 async fn wait_for_pipe(name: &str, process: &EngineProcess) -> Result<NamedPipeClient, String> {
-    let deadline = tokio::time::Instant::now() + CONNECT_TIMEOUT;
+    let launched = tokio::time::Instant::now();
     loop {
         if let Ok(stream) = connect_client(name) {
             return Ok(stream);
         }
-        if process.has_exited() {
-            let code = process.exit_code();
-            tracing::error!(?code, "le moteur d'Orion s'est arrêté avant de répondre");
-            return Err(early_exit_message(code));
+        let status = if process.has_exited() {
+            EngineStatus::Exited(process.exit_code())
+        } else {
+            EngineStatus::Running
+        };
+        match while_the_engine_starts(status, launched.elapsed()) {
+            StartWait::Retry => tokio::time::sleep(POLL_INTERVAL).await,
+            StartWait::GiveUp(message) => {
+                match status {
+                    EngineStatus::Exited(code) => {
+                        tracing::error!(?code, "le moteur d'Orion s'est arrêté avant de répondre");
+                    }
+                    EngineStatus::Running => {
+                        tracing::error!("le moteur d'Orion n'a pas ouvert son tube à temps");
+                    }
+                }
+                return Err(message);
+            }
         }
-        if tokio::time::Instant::now() >= deadline {
-            return Err("Le moteur d'Orion ne répond pas.".into());
-        }
-        tokio::time::sleep(POLL_INTERVAL).await;
     }
 }
 
@@ -359,7 +411,7 @@ fn wide(text: &str) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use orion_engine::lifecycle::EngineArgs;
+    use orion_engine::lifecycle::{EngineArgs, CONNECT_TIMEOUT};
     use orion_engine::session::SessionToken;
 
     fn engine_args() -> EngineArgs {
@@ -442,6 +494,37 @@ mod tests {
         assert_eq!(
             early_exit_message(None),
             "Le moteur d'Orion s'est arrêté avant de répondre."
+        );
+    }
+
+    #[test]
+    fn the_ui_waits_for_a_slow_engine_start_past_the_connect_timeout() {
+        let slow = CONNECT_TIMEOUT + Duration::from_secs(20);
+        assert_eq!(
+            while_the_engine_starts(EngineStatus::Running, slow),
+            StartWait::Retry
+        );
+        assert_eq!(
+            while_the_engine_starts(EngineStatus::Running, ENGINE_START_TIMEOUT),
+            StartWait::GiveUp(ENGINE_SILENT.to_owned())
+        );
+        assert_eq!(ENGINE_START_TIMEOUT, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn an_engine_that_exits_while_starting_is_reported_at_once() {
+        assert_eq!(
+            while_the_engine_starts(EngineStatus::Exited(Some(1)), Duration::ZERO),
+            StartWait::GiveUp(
+                "Le moteur d'Orion s'est arrêté avant de répondre (code 1).".to_owned()
+            )
+        );
+        assert_eq!(
+            while_the_engine_starts(
+                EngineStatus::Exited(Some(PROTECTED_ROOT_REFUSED as u32)),
+                Duration::from_secs(1)
+            ),
+            StartWait::GiveUp(REFUSED_ROOT.to_owned())
         );
     }
 

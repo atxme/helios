@@ -346,7 +346,11 @@ Attendu : un seul UAC, puis la fenêtre ; deux processus `orion.exe` (IHM non
 (héritage désactivé), `vault\` et `identities\` en héritent ; le début de
 `orion.log` montre `randomness provider` ; le journal du moteur contient
 `propriétés de la clé TPM` avec `portee = Machine` et `acces = AdminsOnly`, et
-`bootstrap.toml` porte `key_slot = "Helios Orion device root v2 <SID>"`. Points
+`bootstrap.toml` porte `key_slot = "Helios Orion device root v2 <SID>"`. Au
+premier démarrage, la fenêtre peut tarder après l'UAC (génération de la clé RSA
+sur le TPM, migration) : l'IHM attend le tube du moteur tant que celui-ci vit,
+au plus 120 s (`ENGINE_START_TIMEOUT`), et noter la durée observée ; un moteur
+qui s'arrête pendant cette attente est signalé aussitôt avec son code. Points
 de vigilance : le retour de `GetProcessId` sur le processus d'un `runas` ; un
 second lancement pendant l'UAC du premier (son rappel attend la fin de `setup` :
 ses chemins de profil sont ignorés et journalisés, aucune fenêtre n'apparaît
