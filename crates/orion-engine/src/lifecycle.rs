@@ -21,6 +21,10 @@ pub const BAD_ARGUMENTS: i32 = 2;
 /// by an account that is not an administrator. Nothing is written under it.
 pub const PROTECTED_ROOT_REFUSED: i32 = 3;
 
+/// Exit code for an executable whose folder, parent, or files a non-administrator
+/// can change. The engine refuses to elevate from there, and writes nothing.
+pub const EXECUTABLE_DIR_WRITABLE: i32 = 4;
+
 const ENGINE_FLAG: &str = "--engine";
 const PIPE_PREFIX: &str = r"\\.\pipe\orion-engine-";
 

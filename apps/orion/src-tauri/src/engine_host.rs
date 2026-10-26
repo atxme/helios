@@ -26,11 +26,11 @@ use std::sync::Arc;
 #[cfg(windows)]
 use orion_core::default_backend;
 #[cfg(windows)]
-use orion_core::protected_root::{EnginePaths, RootError, REFUSED_ROOT};
+use orion_core::protected_root::{install_is_protected, EnginePaths, RootError, REFUSED_ROOT};
 #[cfg(windows)]
 use orion_engine::lifecycle::{
     exit_code, on_event, parent_matches, Action, LifecycleEvent, CONNECT_TIMEOUT,
-    PROTECTED_ROOT_REFUSED,
+    EXECUTABLE_DIR_WRITABLE, PROTECTED_ROOT_REFUSED,
 };
 #[cfg(windows)]
 use orion_engine::pipe::{
@@ -77,6 +77,23 @@ pub fn run(args: EngineArgs) -> i32 {
         return STARTUP_FAILED;
     }
 
+    let current_exe = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(error) => return failed_before_log(error),
+    };
+    // Release builds refuse to elevate from a folder a non-administrator can
+    // change, before anything else: the UI checks the same, before the prompt.
+    if !cfg!(debug_assertions) {
+        match install_is_protected(&current_exe) {
+            Ok(()) => {}
+            Err(error @ RootError::WritableInstall) => {
+                eprintln!("{error}");
+                return EXECUTABLE_DIR_WRITABLE;
+            }
+            Err(error) => return failed_before_log(error),
+        }
+    }
+
     // Before the log: a `--engine` started by hand without elevation must not
     // truncate the UI's log file. Nothing is written until this passes.
     match crate::launch::current_token_is_elevated() {
@@ -100,10 +117,6 @@ pub fn run(args: EngineArgs) -> i32 {
         Err(error) => return exit_before_log(LifecycleEvent::ParentMissing, error),
     };
 
-    let current_exe = match std::env::current_exe() {
-        Ok(path) => path,
-        Err(error) => return failed_before_log(error),
-    };
     let expected = match launcher_client(args.ui_pid, &current_exe) {
         Ok(expected) => expected,
         Err(error) => return exit_before_log(LifecycleEvent::ClientRefused, error),

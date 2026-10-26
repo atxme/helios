@@ -621,6 +621,9 @@ fn the_engine_restricts_dll_search_first() {
         assert!(call.contains(flag), "the restriction lacks {flag}");
     }
 
+    let installation_check = body
+        .find("install_is_protected(")
+        .expect("the engine checks the directory it runs from");
     let elevation = body
         .find("current_token_is_elevated(")
         .expect("the engine checks its elevation");
@@ -628,7 +631,11 @@ fn the_engine_restricts_dll_search_first() {
         .find("init_logging(")
         .expect("the engine starts its log");
     assert!(
-        restriction < elevation && elevation < logging,
+        restriction < installation_check && installation_check < elevation,
+        "the install check must come after the DLL restriction and before the elevation check"
+    );
+    assert!(
+        elevation < logging,
         "the elevation check must come after the DLL restriction and before the log"
     );
     let establishment = body

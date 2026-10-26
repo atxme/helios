@@ -14,16 +14,18 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 #[cfg(windows)]
 use std::time::Duration;
 
+#[cfg(windows)]
+use orion_core::protected_root::install_is_protected;
 #[cfg(any(windows, test))]
-use orion_core::protected_root::REFUSED_ROOT;
+use orion_core::protected_root::{REFUSED_ROOT, WRITABLE_INSTALL};
 #[cfg(windows)]
 use orion_core::ClientEvent;
 #[cfg(windows)]
 use orion_engine::client::{connect, EngineClient};
-#[cfg(any(windows, test))]
-use orion_engine::lifecycle::PROTECTED_ROOT_REFUSED;
 #[cfg(windows)]
 use orion_engine::lifecycle::{EngineArgs, CONNECT_TIMEOUT};
+#[cfg(any(windows, test))]
+use orion_engine::lifecycle::{EXECUTABLE_DIR_WRITABLE, PROTECTED_ROOT_REFUSED};
 #[cfg(windows)]
 use orion_engine::pipe::{connect_client, observe_process, pipe_name, server_process_id};
 #[cfg(windows)]
@@ -102,6 +104,7 @@ pub(crate) fn launch_failure(code: i32) -> String {
 pub(crate) fn early_exit_message(code: Option<u32>) -> String {
     match code {
         Some(code) if code == PROTECTED_ROOT_REFUSED as u32 => REFUSED_ROOT.to_owned(),
+        Some(code) if code == EXECUTABLE_DIR_WRITABLE as u32 => WRITABLE_INSTALL.to_owned(),
         Some(code) => format!("Le moteur d'Orion s'est arrêté avant de répondre (code {code})."),
         None => "Le moteur d'Orion s'est arrêté avant de répondre.".to_owned(),
     }
@@ -200,6 +203,9 @@ fn assert_send_and_sync<T: Send + Sync>() {}
 #[cfg(windows)]
 pub(crate) async fn start(
 ) -> Result<(EngineClient, mpsc::Receiver<ClientEvent>, EngineProcess), String> {
+    if !cfg!(debug_assertions) {
+        refuse_writable_install()?;
+    }
     let ui_pid = std::process::id();
     let nonce = aether::random::secret_bytes::<16>()
         .map_err(|error| format!("tirage du nom du tube : {error}"))?;
@@ -232,6 +238,16 @@ pub(crate) async fn start(
     // proves it was accepted.
     client.call(EngineCommand::GetState).await?;
     Ok((client, events, process))
+}
+
+/// Refuses to elevate from a folder a non-administrator can change: the engine
+/// would refuse after the prompt, so the prompt is not shown. The engine checks
+/// the same again, because this check can be bypassed.
+#[cfg(windows)]
+fn refuse_writable_install() -> Result<(), String> {
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("exécutable d'Orion introuvable ({error})"))?;
+    install_is_protected(&executable).map_err(|error| error.to_string())
 }
 
 /// Starts `orion.exe --engine <parameters>` elevated, hidden, and not waited for.
@@ -410,10 +426,18 @@ mod tests {
     }
 
     #[test]
+    fn a_writable_install_reads_as_the_install_refusal() {
+        assert_eq!(
+            early_exit_message(Some(EXECUTABLE_DIR_WRITABLE as u32)),
+            WRITABLE_INSTALL
+        );
+    }
+
+    #[test]
     fn another_early_exit_names_its_code() {
         assert_eq!(
-            early_exit_message(Some(4)),
-            "Le moteur d'Orion s'est arrêté avant de répondre (code 4)."
+            early_exit_message(Some(5)),
+            "Le moteur d'Orion s'est arrêté avant de répondre (code 5)."
         );
         assert_eq!(
             early_exit_message(None),

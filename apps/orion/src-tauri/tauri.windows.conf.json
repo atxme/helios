@@ -9,6 +9,9 @@
     },
     "windows": {
       "digestAlgorithm": "sha256",
+      "nsis": {
+        "installMode": "perMachine"
+      },
       "wix": {
         "fragmentPaths": [
           "windows/orion-profile-icon.wxs"

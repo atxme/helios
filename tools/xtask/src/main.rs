@@ -864,6 +864,23 @@ mod tests {
         }
     }
 
+    /// The NSIS installer must install for the machine. A per-user install
+    /// lands in a folder the user can rewrite, which the engine refuses to
+    /// elevate from.
+    #[test]
+    fn the_nsis_bundle_installs_per_machine() {
+        let path = workspace_root()
+            .expect("root")
+            .join("apps/orion/src-tauri/tauri.windows.conf.json");
+        let text = std::fs::read_to_string(&path).expect("tauri.windows.conf.json is readable");
+        let config: serde_json::Value =
+            serde_json::from_str(&text).expect("tauri.windows.conf.json is JSON");
+        assert_eq!(
+            config["bundle"]["windows"]["nsis"]["installMode"],
+            "perMachine"
+        );
+    }
+
     /// The units and the example configuration must exist in the repo: a
     /// dead reference would break the factory at the worst moment.
     #[test]

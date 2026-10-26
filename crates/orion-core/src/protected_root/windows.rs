@@ -29,8 +29,9 @@ use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::UI::Shell::{FOLDERID_ProgramData, SHGetKnownFolderPath};
 
 use super::{
-    admits_only_admins, classify_ace, is_plain_sid, protected_root_for, Ace, EnginePaths,
-    RootError, ACCESS_ALLOWED_TYPE, ACCESS_DENIED_TYPE,
+    admits_only_admins, classify_ace, grants_user_write, is_plain_sid, protected_root_for, Ace,
+    EnginePaths, RootError, ACCESS_ALLOWED_TYPE, ACCESS_DENIED_TYPE, DIRECTORY_WRITE_MASK,
+    FILE_WRITE_MASK, PARENT_WRITE_MASK,
 };
 
 /// Owner Administrators, protected DACL, full control for Administrators and
@@ -115,7 +116,7 @@ fn verify_protected_dir(path: &Path) -> Result<(), RootError> {
     if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return Err(RootError::Refused);
     }
-    let (owner, aces, protected) = read_dacl(path)?;
+    let (owner, aces, protected) = read_access(path)?;
     if admits_only_admins(&owner, &aces, protected) {
         Ok(())
     } else {
@@ -123,11 +124,60 @@ fn verify_protected_dir(path: &Path) -> Result<(), RootError> {
     }
 }
 
+/// Refuses an install that a non-administrator can change: the folder of
+/// `executable`, its parent, the executable, and every `*.dll` beside it
+/// (WireGuardNT is loaded from there). A check that cannot be read is an error
+/// of its own: the engine stops rather than guess.
+pub fn install_is_protected(executable: &Path) -> Result<(), RootError> {
+    let directory = executable
+        .parent()
+        .ok_or_else(|| RootError::Unavailable("dossier de l'exécutable introuvable".to_string()))?;
+    let parent = directory.parent().ok_or_else(|| {
+        RootError::Unavailable("dossier parent de l'exécutable introuvable".to_string())
+    })?;
+    refuse_if_writable(directory, DIRECTORY_WRITE_MASK)?;
+    refuse_if_writable(parent, PARENT_WRITE_MASK)?;
+    refuse_if_writable(executable, FILE_WRITE_MASK)?;
+
+    let entries = std::fs::read_dir(directory).map_err(|error| {
+        RootError::Unavailable(format!("dossier de l'exécutable illisible ({error})"))
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            RootError::Unavailable(format!("dossier de l'exécutable illisible ({error})"))
+        })?;
+        let path = entry.path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("dll"))
+        {
+            refuse_if_writable(&path, FILE_WRITE_MASK)?;
+        }
+    }
+    Ok(())
+}
+
+/// Refuses `path` when an account that is not an administrator holds one of
+/// the rights in `write_mask`. A null DACL admits everyone: [`read_access`]
+/// reports it as refused, and here that means a writable install.
+fn refuse_if_writable(path: &Path, write_mask: u32) -> Result<(), RootError> {
+    let (owner, aces, _) = match read_access(path) {
+        Ok(access) => access,
+        Err(RootError::Refused) => return Err(RootError::WritableInstall),
+        Err(error) => return Err(error),
+    };
+    if grants_user_write(&owner, &aces, write_mask) {
+        Err(RootError::WritableInstall)
+    } else {
+        Ok(())
+    }
+}
+
 /// The owner's SID in string form, the entries of the DACL, and whether the
 /// DACL is protected from inheritance.
 ///
 /// A null DACL admits everyone, so it is refused here.
-fn read_dacl(path: &Path) -> Result<(String, Vec<Ace>, bool), RootError> {
+pub fn read_access(path: &Path) -> Result<(String, Vec<Ace>, bool), RootError> {
     let wide = wide_path(path);
     let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
     // SAFETY: `wide` is NUL-terminated and alive; the out-pointer is valid. The

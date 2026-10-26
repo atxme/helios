@@ -7295,6 +7295,7 @@ dependencies = [
  "clap",
  "helios-update",
  "reqwest",
+ "serde_json",
  "zip",
 ]
 

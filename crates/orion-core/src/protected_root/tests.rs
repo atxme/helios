@@ -2,6 +2,7 @@ use super::*;
 
 const USER: &str = "S-1-5-21-1-2-3-1001";
 const OTHER_USER: &str = "S-1-5-21-1-2-3-1002";
+const USERS: &str = "S-1-5-32-545";
 const FULL: u32 = 0x001F_01FF;
 
 fn ace(sid: &str, allow: bool) -> Ace {
@@ -174,4 +175,109 @@ fn an_unknown_ace_type_is_refused() {
     ];
 
     assert!(!admits_only_admins(ADMINISTRATORS, &aces, true));
+}
+
+fn ace_with(sid: &str, mask: u32) -> Ace {
+    Ace {
+        sid: sid.to_string(),
+        allow: true,
+        mask,
+        inherited: false,
+    }
+}
+
+#[test]
+fn an_executable_directory_writable_by_a_user_is_refused() {
+    let aces = vec![
+        ace(ADMINISTRATORS, true),
+        ace(SYSTEM, true),
+        ace_with(USERS, FILE_ADD_FILE),
+    ];
+
+    assert!(grants_user_write(
+        ADMINISTRATORS,
+        &aces,
+        DIRECTORY_WRITE_MASK
+    ));
+}
+
+#[test]
+fn a_program_files_like_dacl_is_accepted() {
+    let aces = vec![
+        ace(ADMINISTRATORS, true),
+        ace(SYSTEM, true),
+        ace(TRUSTED_INSTALLER, true),
+        ace_with(USERS, 0x0012_00A9),
+        ace_with(CREATOR_OWNER, GENERIC_ALL),
+    ];
+
+    for mask in [DIRECTORY_WRITE_MASK, FILE_WRITE_MASK, PARENT_WRITE_MASK] {
+        assert!(
+            !grants_user_write(TRUSTED_INSTALLER, &aces, mask),
+            "mask {mask:#x} is writable"
+        );
+    }
+}
+
+#[test]
+fn a_user_owned_install_is_refused() {
+    assert!(grants_user_write(
+        USER,
+        &admins_and_system(),
+        FILE_WRITE_MASK
+    ));
+}
+
+#[test]
+fn a_parent_that_lets_users_delete_children_is_refused() {
+    let aces = vec![
+        ace(ADMINISTRATORS, true),
+        ace(SYSTEM, true),
+        ace_with(USERS, FILE_DELETE_CHILD),
+    ];
+
+    assert!(grants_user_write(ADMINISTRATORS, &aces, PARENT_WRITE_MASK));
+}
+
+#[test]
+fn a_writable_dll_is_refused() {
+    let aces = vec![
+        ace(ADMINISTRATORS, true),
+        ace(SYSTEM, true),
+        ace_with(USERS, FILE_WRITE_DATA),
+    ];
+
+    assert!(grants_user_write(ADMINISTRATORS, &aces, FILE_WRITE_MASK));
+}
+
+#[test]
+fn deny_aces_do_not_make_an_install_writable() {
+    let mut aces = admins_and_system();
+    aces.push(Ace {
+        sid: USERS.to_string(),
+        allow: false,
+        mask: FULL,
+        inherited: false,
+    });
+
+    assert!(!grants_user_write(
+        ADMINISTRATORS,
+        &aces,
+        DIRECTORY_WRITE_MASK
+    ));
+    assert!(!grants_user_write(ADMINISTRATORS, &aces, FILE_WRITE_MASK));
+    assert!(!grants_user_write(ADMINISTRATORS, &aces, PARENT_WRITE_MASK));
+}
+
+#[test]
+fn an_unknown_ace_type_in_an_install_is_refused() {
+    let mut aces = admins_and_system();
+    aces.push(classify_ace(0x05, 0, String::new(), false));
+
+    assert!(grants_user_write(ADMINISTRATORS, &aces, FILE_WRITE_MASK));
+}
+
+#[test]
+fn the_writable_install_error_reads_as_its_message() {
+    assert_eq!(RootError::WritableInstall.to_string(), WRITABLE_INSTALL);
 }

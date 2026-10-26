@@ -28,6 +28,10 @@ const ALREADY_ESTABLISHED: &str = "racine protégée déjà établie";
 pub const REFUSED_ROOT: &str =
     "Le dossier protégé d'Orion est accessible à un compte non administrateur : démarrage refusé.";
 
+/// Reported when the install can be changed by a non-administrator.
+pub const WRITABLE_INSTALL: &str =
+    "Orion est installé dans un dossier modifiable sans droits administrateur : démarrage refusé.";
+
 /// Why the protected root could not be established.
 #[cfg(any(windows, test))]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +41,9 @@ pub enum RootError {
     Refused,
     /// The folder could not be created or read; the message is for the person.
     Unavailable(String),
+    /// The folder of the executable, its parent, the executable or one of its
+    /// DLLs can be changed by an account that is not an administrator.
+    WritableInstall,
 }
 
 #[cfg(any(windows, test))]
@@ -45,6 +52,7 @@ impl std::fmt::Display for RootError {
         match self {
             Self::Refused => formatter.write_str(REFUSED_ROOT),
             Self::Unavailable(message) => formatter.write_str(message),
+            Self::WritableInstall => formatter.write_str(WRITABLE_INSTALL),
         }
     }
 }
@@ -56,6 +64,92 @@ pub const ADMINISTRATORS: &str = "S-1-5-32-544";
 /// The well-known SID of the local system account.
 #[cfg(any(windows, test))]
 pub const SYSTEM: &str = "S-1-5-18";
+
+/// The well-known SID of the Windows module installer, which owns `Program Files`.
+#[cfg(any(windows, test))]
+pub const TRUSTED_INSTALLER: &str =
+    "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
+
+/// The well-known SID of the creator-owner placeholder. Only an administrator
+/// can create a child under a folder that grants it, so only one inherits it.
+#[cfg(any(windows, test))]
+pub const CREATOR_OWNER: &str = "S-1-3-0";
+
+/// `FILE_ADD_FILE`: create a file in a folder.
+#[cfg(any(windows, test))]
+pub const FILE_ADD_FILE: u32 = 0x2;
+
+/// `FILE_ADD_SUBDIRECTORY`: create a folder in a folder.
+#[cfg(any(windows, test))]
+pub const FILE_ADD_SUBDIRECTORY: u32 = 0x4;
+
+/// `FILE_DELETE_CHILD`: delete an entry of a folder, whatever its own rights.
+#[cfg(any(windows, test))]
+pub const FILE_DELETE_CHILD: u32 = 0x40;
+
+/// `FILE_WRITE_DATA`: write the contents of a file.
+#[cfg(any(windows, test))]
+pub const FILE_WRITE_DATA: u32 = 0x2;
+
+/// `FILE_APPEND_DATA`: append to a file.
+#[cfg(any(windows, test))]
+pub const FILE_APPEND_DATA: u32 = 0x4;
+
+/// `FILE_WRITE_EA`: write the extended attributes of a file.
+#[cfg(any(windows, test))]
+pub const FILE_WRITE_EA: u32 = 0x10;
+
+/// `FILE_WRITE_ATTRIBUTES`: write the attributes of a file.
+#[cfg(any(windows, test))]
+pub const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
+
+/// `DELETE`: delete the object.
+#[cfg(any(windows, test))]
+pub const DELETE: u32 = 0x1_0000;
+
+/// `WRITE_DAC`: replace the access list of the object.
+#[cfg(any(windows, test))]
+pub const WRITE_DAC: u32 = 0x4_0000;
+
+/// `WRITE_OWNER`: take ownership of the object.
+#[cfg(any(windows, test))]
+pub const WRITE_OWNER: u32 = 0x8_0000;
+
+/// `GENERIC_WRITE`: the generic write right.
+#[cfg(any(windows, test))]
+pub const GENERIC_WRITE: u32 = 0x4000_0000;
+
+/// `GENERIC_ALL`: every right.
+#[cfg(any(windows, test))]
+pub const GENERIC_ALL: u32 = 0x1000_0000;
+
+/// The rights that change a folder that holds the executable.
+#[cfg(any(windows, test))]
+pub const DIRECTORY_WRITE_MASK: u32 = FILE_ADD_FILE
+    | FILE_ADD_SUBDIRECTORY
+    | FILE_DELETE_CHILD
+    | DELETE
+    | WRITE_DAC
+    | WRITE_OWNER
+    | GENERIC_WRITE
+    | GENERIC_ALL;
+
+/// The rights that change a file: the executable or one of its DLLs.
+#[cfg(any(windows, test))]
+pub const FILE_WRITE_MASK: u32 = FILE_WRITE_DATA
+    | FILE_APPEND_DATA
+    | FILE_WRITE_EA
+    | FILE_WRITE_ATTRIBUTES
+    | DELETE
+    | WRITE_DAC
+    | WRITE_OWNER
+    | GENERIC_WRITE
+    | GENERIC_ALL;
+
+/// The rights that let a holder rename or delete the folder of the executable
+/// through its parent.
+#[cfg(any(windows, test))]
+pub const PARENT_WRITE_MASK: u32 = FILE_DELETE_CHILD | WRITE_DAC | WRITE_OWNER | GENERIC_ALL;
 
 /// The root every engine file sits under, installed once for this process.
 static INSTALLED: OnceLock<EnginePaths> = OnceLock::new();
@@ -282,12 +376,39 @@ pub fn admits_only_admins(owner: &str, aces: &[Ace], protected: bool) -> bool {
             .all(|ace| ace.sid == ADMINISTRATORS || ace.sid == SYSTEM)
 }
 
+/// Whether an account that is not an administrator can change an object with
+/// one of the rights in `write_mask`.
+///
+/// The owner is a non-administrator unless it is trusted, and it may rewrite
+/// the access list whatever the entries say. Otherwise an allow entry of an
+/// untrusted SID counts when it grants a bit of `write_mask`. Deny entries
+/// cannot widen access and do not count. An entry of unknown type has no SID
+/// and no readable mask, so it counts: the check fails closed.
+#[cfg(any(windows, test))]
+pub fn grants_user_write(owner: &str, aces: &[Ace], write_mask: u32) -> bool {
+    !is_trusted(owner)
+        || aces.iter().any(|ace| {
+            ace.allow
+                && (ace.sid.is_empty() || (!is_trusted(&ace.sid) && ace.mask & write_mask != 0))
+        })
+}
+
+/// Whether `sid` belongs to the trusted SIDs of an install.
+#[cfg(any(windows, test))]
+fn is_trusted(sid: &str) -> bool {
+    [ADMINISTRATORS, SYSTEM, TRUSTED_INSTALLER, CREATOR_OWNER].contains(&sid)
+}
+
 #[cfg(windows)]
 mod windows;
 
 /// The DACL reader and the local-memory guard, shared with the machine TPM key.
 #[cfg(windows)]
 pub(crate) use windows::{access_of, LocalBlock};
+
+/// The install check the UI and the engine both run before elevation.
+#[cfg(windows)]
+pub use windows::install_is_protected;
 
 #[cfg(test)]
 mod tests;
