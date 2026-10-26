@@ -634,6 +634,18 @@ fn the_engine_restricts_dll_search_first() {
         restriction < installation_check && installation_check < elevation,
         "the install check must come after the DLL restriction and before the elevation check"
     );
+    let guard = body[..installation_check]
+        .rfind("if !cfg!(debug_assertions)")
+        .expect("the install check runs only in release builds");
+    assert!(
+        !body[guard..installation_check].contains('}'),
+        "the install check is not the first statement under the release guard"
+    );
+    let refusal = &body[installation_check..elevation];
+    assert!(
+        refusal.contains("RootError::WritableInstall") && refusal.contains("EXECUTABLE_DIR_WRITABLE"),
+        "a writable install must be refused with EXECUTABLE_DIR_WRITABLE before the elevation check"
+    );
     assert!(
         elevation < logging,
         "the elevation check must come after the DLL restriction and before the log"

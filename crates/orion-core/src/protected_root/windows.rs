@@ -135,6 +135,8 @@ pub fn install_is_protected(executable: &Path) -> Result<(), RootError> {
     let parent = directory.parent().ok_or_else(|| {
         RootError::Unavailable("dossier parent de l'exécutable introuvable".to_string())
     })?;
+    refuse_reparse_point(directory)?;
+    refuse_reparse_point(executable)?;
     refuse_if_writable(directory, DIRECTORY_WRITE_MASK)?;
     refuse_if_writable(parent, PARENT_WRITE_MASK)?;
     refuse_if_writable(executable, FILE_WRITE_MASK)?;
@@ -155,6 +157,25 @@ pub fn install_is_protected(executable: &Path) -> Result<(), RootError> {
         }
     }
     Ok(())
+}
+
+/// Refuses `path` when it is a reparse point (a junction or a symbolic link).
+///
+/// The access list of such a path is the list of its target: a link placed in
+/// a folder a user can write to would make the check read a protected target
+/// and pass, while the user controls the link. The link itself is read here,
+/// without following it.
+fn refuse_reparse_point(path: &Path) -> Result<(), RootError> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        RootError::Unavailable(format!(
+            "point d'analyse de l'installation illisible ({error})"
+        ))
+    })?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        Err(RootError::WritableInstall)
+    } else {
+        Ok(())
+    }
 }
 
 /// Refuses `path` when an account that is not an administrator holds one of
