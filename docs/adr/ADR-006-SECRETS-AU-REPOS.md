@@ -562,6 +562,76 @@ swap, accès brut et débogage. `systemd-analyze security` et un démarrage avec
 Netlink et WireGuard réels deviennent des contrôles de release ; une compilation
 WSL2 ne valide pas ce durcissement.
 
+### 7. Orion Windows — coffre réservé à l'élévation (amendement du 26 octobre 2026, F11)
+
+Spec : [séparation des privilèges Windows](../superpowers/specs/2026-10-24-separation-privileges-windows-design.md)
+§7 bis. Jusqu'ici, le coffre vivait dans `%APPDATA%\helios\orion`, scellé par
+DPAPI en portée utilisateur et par une clé TPM du conteneur de l'utilisateur :
+tout programme du compte, même non élevé, pouvait lire ces fichiers et appeler
+DPAPI et le TPM pour les ouvrir. Orion se compose désormais de deux processus
+(ADR-004 §9) et **seul le moteur élevé ouvre le coffre**.
+
+* **Emplacement.** `%ProgramData%\helios\orion\<SID de l'utilisateur
+  interactif>\` porte `vault\`, `profiles.toml`, `identities\` et `orion.log`.
+  Le dossier est lu par `SHGetKnownFolderPath`, jamais dans l'environnement. Sa
+  DACL est protégée et n'accorde l'accès qu'aux Administrateurs et à SYSTEM ;
+  le propriétaire est vérifié à chaque niveau (`helios`, `orion`, `<SID>`), et un
+  point d'analyse est refusé. Une DACL plus large ou illisible, ou un
+  propriétaire inattendu, fait refuser le démarrage du moteur (code de sortie 3,
+  *fail-closed*) ; rien n'est écrit sous la racine refusée. Le journal de l'IHM
+  (`orion-ui.log`) reste dans le dossier par utilisateur.
+* **Clé TPM machine.** Le nom devient `Helios Orion device root v2 <SID>`. La
+  clé est créée et ouverte avec `NCRYPT_MACHINE_KEY_FLAG` ; son descripteur
+  `O:BAD:P(A;;GA;;;BA)(A;;GA;;;SY)` est posé avant finalisation, puis relu et
+  vérifié. Une DACL illisible ou plus large que ce descripteur fait refuser la
+  clé. Cela corrige l'amendement du 2 août 2026 ci-dessus : la DACL redevient
+  une garde, et le conteneur machine, non plus le conteneur de l'utilisateur,
+  est ce qui rend la clé inutilisable pour un processus non élevé.
+* **DPAPI** reste une couche du coffre, en portée utilisateur, mais ce n'est
+  plus lui qui fait la barrière : ce sont la DACL des fichiers et celle de la
+  clé.
+* **Variables de développement.** `ORION_CONFIG` et `ORION_IDENTITY_DIR` ne sont
+  lues qu'en build de développement (`cfg(debug_assertions)`). Le moteur ne
+  reçoit aucun chemin de coffre, d'identité ou de journal de l'IHM.
+* **Migration.** Au premier démarrage du moteur, quand le jeton du moteur est
+  celui de l'utilisateur de l'IHM, l'ancien coffre est copié sans
+  rechiffrement, `device-root` est rescellé sous la clé machine, le résultat
+  est relu, puis validé par un renommage qui pose le marqueur `.relocated`. Seul
+  un coffre portant ce marqueur autorise le nettoyage de l'ancien emplacement,
+  exécuté **sous le jeton non élevé de l'IHM** (copie du jeton, après
+  vérification de son SID et de sa non-élévation) : une jonction plantée dans
+  l'ancien arbre ne donne pas au moteur élevé le pouvoir de supprimer ce que
+  l'utilisateur ne pourrait pas supprimer. Les liens de l'ancien arbre ne sont
+  ni copiés, ni suivis, ni supprimés ; un lien sur une entrée du coffre lui-même
+  fait échouer la migration. Un échec laisse l'ancien coffre intact, ne crée
+  aucun nouveau coffre et affiche « La migration du coffre a échoué : l'ancien
+  coffre est conservé. Cause : … ».
+
+**Limites acceptées.**
+
+* **Les autres comptes administrateurs de la machine peuvent ouvrir ce coffre.**
+  C'est le prix de la barrière contre les programmes non élevés du compte
+  (spec §7 bis, « Limite acceptée »). Ce que cet amendement garantit : un
+  programme **non élevé** du même compte ne lit ni le dossier du coffre ni la
+  clé TPM. Il ne garantit rien contre un administrateur actif (T10 reste hors
+  garantie).
+* **Un programme non élevé du même compte peut piloter l'IHM** (WebView,
+  entrées). Il obtient ce que l'IHM peut demander au moteur, pas le contenu du
+  coffre ni les clés (ADR-004, Limites connues).
+* **Élévation par les identifiants d'un autre administrateur** (compte standard
+  à l'ouverture d'Orion) : le moteur tourne sous ce compte, et DPAPI en portée
+  utilisateur lie alors le coffre à ce compte. L'ancien coffre n'est pas migré
+  automatiquement (le moteur journalise un avertissement et ne migre pas), et un
+  autre administrateur à l'élévation suivante ne pourra pas ouvrir le coffre.
+* **Non éprouvé sous Windows à ce jour.** Les points suivants sont **à valider
+  en recette** ([MANUAL-TESTING](../testing/MANUAL-TESTING.md), « Séparation des
+  privilèges (F11) ») : que le *Platform Crypto Provider* accepte un
+  descripteur de sécurité posé sur une clé machine avant finalisation (sinon
+  Orion ne démarre plus) ; qu'il ne normalise ni le propriétaire ni le drapeau
+  protégé du descripteur relu (sinon la clé est refusée comme plus large) ; que
+  le moteur élevé peut ouvrir le jeton de l'IHM pour le nettoyage de l'ancien
+  emplacement (sinon l'ancien coffre est conservé).
+
 ## Modèle de menace
 
 Le modèle distingue l'accès **hors ligne**, un utilisateur local non privilégié,
@@ -572,7 +642,7 @@ produisait la garantie intenable de la décision initiale.
 |---|---|---|
 | T1 | Disque volé, machine éteinte, volume chiffré | secrets courants protégés par TPM + AEAD ; anciennes copies protégées seulement après rotation |
 | T2 | Sauvegarde, image système, profil itinérant AD | confidentialité conservée par la liaison TPM ; restauration ancienne détectée seulement dans les limites anti-rejeu déclarées |
-| T3 | Autre utilisateur local non privilégié | protégé par ACL, DPAPI, TPM et AEAD |
+| T3 | Autre utilisateur local non privilégié, ou programme non élevé du même compte (Windows, §7) | protégé par la DACL du dossier et de la clé machine, DPAPI, TPM et AEAD ; les autres administrateurs de la machine ne sont pas exclus |
 | T4 | Copie ou échange de blobs entre machines/profils/pairs | refusé par TPM et `object_context` |
 | T5 | Altération d'un blob ou des paramètres de tunnel | refusée par l'AEAD du manifeste complet |
 | T6 | Rollback hors ligne du blob et de tout son état | **non résolu sans compteur non restaurable** ; aucun downgrade permis, disponibilité seulement |
@@ -589,10 +659,11 @@ ou injecter le processus au bon instant peut les copier. DPAPI ne protège pas
 contre du code exécuté sous le même compte, et les clés de sauvegarde DPAPI du
 domaine font partie du pouvoir d'un administrateur de domaine.
 
-Une séparation ultérieure dans un service Windows sous SID distinct réduirait le
-risque d'un malware utilisateur ; VBS ou une enclave est nécessaire pour viser un
-adversaire noyau. Ces architectures ne sont pas requises par cet amendement et
-aucune propriété qui en dépend n'est annoncée aujourd'hui.
+La séparation moteur élevé / IHM non élevée (§7, F11) réduit le risque d'un
+malware du compte **non élevé** : le coffre et la clé machine lui sont fermés.
+Elle ne change pas T9 pour un code qui obtient l'élévation, ni T10. VBS ou une
+enclave est nécessaire pour viser un adversaire noyau ; cette architecture n'est
+pas requise ici et aucune propriété qui en dépend n'est annoncée.
 
 ## Validation
 
@@ -721,9 +792,10 @@ remplace pas.
   client ne bloque pas la connexion pour autant : il constate l'historique d'un
   fichier, pas une fuite, et la révocation d'une admission appartient à
   l'opérateur.
-* **VBS n'est pas implémenté.** Un service sous SID distinct serait une première
-  réduction contre le malware utilisateur ; VBS est la suite identifiée contre
-  un adversaire noyau. Aucune propriété de la présente version n'en dépend.
+* **VBS n'est pas implémenté.** La séparation des privilèges de §7 est la
+  première réduction contre le malware utilisateur non élevé ; VBS est la suite
+  identifiée contre un adversaire noyau. Aucune propriété de la présente version
+  n'en dépend.
 
 ## Arbitrage consolidé (2026-07-28, amendé le 2026-08-01)
 

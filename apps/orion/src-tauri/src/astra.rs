@@ -5,10 +5,11 @@
 //! `astra-signer` owns the authority vault, the FIDO2 gesture and every
 //! signature: none of that moves here, and none of it is reachable from the
 //! WebView. Orion owns the window the operator is already looking at. The two
-//! cannot share a process — Orion runs elevated so WireGuard-NT will load,
-//! while the WebAuthn platform API answers only inside the interactive user's
-//! session — so the companion is spawned **below** Orion's token and talks
-//! back over a loopback socket.
+//! cannot share a process — the WebAuthn platform API answers only inside the
+//! interactive user's session, so the companion is spawned by the UI, which is
+//! not elevated (the elevated engine alone loads WireGuard-NT; the launch is
+//! refused if the UI's token is elevated) — and it talks back over a loopback
+//! socket.
 //!
 //! Orion is the server of that socket, not the client: it binds before the
 //! child exists, so there is no window in which something else could be

@@ -8,6 +8,10 @@
 > constat daté qui a motivé chaque décision ; l’état réel du dépôt est en
 > [§13](#13-état-dimplémentation), relevé à `HEAD = b9380ca`. Lire §13 avant
 > de se fier à une description d’arbre ou de graphe des sections précédentes.
+>
+> **F11 (octobre 2026).** Les sections 1 à 12 citent encore `helios-astra-helper`
+> et `deelevate.rs` : l’un a été supprimé et l’autre renommé, et `orion-engine`
+> a été ajouté. Voir [§13.6](#136-f11--orion-engine-ajouté-helios-astra-helper-retiré).
 
 ## Périmètre et méthode
 
@@ -153,8 +157,10 @@ transport in-tunnel. Il dépend encore directement de `astra` pour
 déjà depuis Aether. C’est une dépendance de contrat mal placée, pas une raison
 de fusionner les deux crates.
 
-`astra-signer` et `helios-astra-helper` sont des processus distincts avec des
-privilèges et des chemins de vie différents. Ils doivent rester des outils.
+`astra-signer` et `helios-astra-helper` étaient des processus distincts avec des
+privilèges et des chemins de vie différents. `helios-astra-helper` a depuis été
+supprimé (F11, [§13.6](#136-f11--orion-engine-ajouté-helios-astra-helper-retiré)) ;
+`astra-signer` reste un outil.
 
 ### Firewall, WireGuard et sécurité
 
@@ -204,7 +210,7 @@ helios-api
   -> helios-update
   -> helios-wireguard
 
-helios-astra-helper
+helios-astra-helper   # retiré par F11
   -> aether
   -> astra-operator
   -> helios-fido
@@ -293,7 +299,7 @@ de production.
 | `astra-signer` | 0 | 3 |
 | `helios-tpm` | 1 | 2 |
 | `helios-api` | 2 | 5 |
-| `helios-astra-helper` | 0 | 3 |
+| `helios-astra-helper` (retiré par F11) | 0 | 3 |
 | `helios-ctl` | 0 | 5 |
 | `helios-escrow` | 2 | 1 |
 | `helios-fido` | 4 | 1 |
@@ -408,7 +414,7 @@ pas une preuve matérielle.
 | `orion-core` | `windows`, `windows-sys`, `defguard_wireguard_rs` | DPAPI/CNG, BitLocker/WMI, Wintun/route pinning client |
 | `heliosd` | `libc` Unix | protection des core dumps du daemon |
 | `orion` | Tauri, WebView/GTK ou WebView2 | shell graphique uniquement |
-| `helios-astra-helper` | Win32/GDI | propriété de fenêtre et désélévation du compagnon |
+| `helios-astra-helper` (retiré par F11) | Win32/GDI | propriété de fenêtre et désélévation du compagnon |
 | `xtask` | téléchargement WireGuardNT et packaging | build workstation, jamais runtime |
 
 Les contrats partagés ne dépendent pas directement de Tauri, Netlink, TPM,
@@ -451,7 +457,7 @@ de tests dans les sous-systèmes.
 | `orion-core` | Logique client portable, coffre, provisioning, certificats et backend VPN | **KEEP** | cycle de vie client cohérent ; pas de troisième crate prouvée |
 | `heliosd` | CLI gateway, lifecycle et composition des sous-systèmes | **KEEP** | composition root à amincir ; `helios-runtime` non démontré |
 | `astra-signer` | CLI d’approbation/signature opérateur | **KEEP** | processus hors ligne et privilège distincts |
-| `helios-astra-helper` | Compagnon interactif Windows | **KEEP** | processus et intégration Win32 propres |
+| `helios-astra-helper` (retiré par F11) | Compagnon interactif Windows | **KEEP** | processus et intégration Win32 propres |
 | `helios-ctl` | CLI opérateur : admission, campagnes, escrow, update, profils | **KEEP** | composition root d’outil |
 | `helios-installer` | Helper privilégié d’installation/rollback | **KEEP** | frontière de privilège distincte |
 | `helios-publisher` | Clés et signatures de releases/bundles | **KEEP** | doit rester hors gateway et hors client |
@@ -508,7 +514,7 @@ tools/
   helios-installer/
   helios-publisher/
   astra-signer/
-  helios-astra-helper/
+  helios-astra-helper/   # retiré par F11
   xtask/
 ```
 
@@ -1007,6 +1013,24 @@ question au niveau du type, dans le même sens.
 
 L’extraction est livrée (13.1), et le §0.8 de la spécification le dit.
 
+### 13.6 F11 : `orion-engine` ajouté, `helios-astra-helper` retiré
+
+La séparation des privilèges d’Orion sous Windows
+([spec](../superpowers/specs/2026-10-24-separation-privileges-windows-design.md))
+change la composition de l’arbre, sans changer le nombre de binaires livrés
+(`orion.exe` seul côté poste).
+
+| Élément | État | Détail |
+| --- | --- | --- |
+| `crates/orion-engine/` | **ajouté** | Crate portable partagée par l’IHM et le moteur : protocole de trames JSON bornées (`wire`, `command`, `events`), jeton de session, cycle de vie du moteur (`lifecycle`), service du moteur (`service`), serveur et client du canal (`serve`, `client`), tube nommé Windows (`pipe`), nettoyage de l’ancien coffre (`legacy_cleanup`). Dépend d’`orion-core` et d’`aether`. |
+| `tools/helios-astra-helper/` | **retiré** | Les cérémonies opérateur s’exécutent dans l’IHM non élevée (`apps/orion/src-tauri/src/operator/`) ; aucun compagnon n’est livré. |
+| `apps/orion/src-tauri/src/deelevate.rs` | **renommé `launch.rs`** | Il ne désélève plus : l’IHM est non élevée, et `launch.rs` refuse de lancer un enfant (terminal SSH, `astra-signer`) si son propre jeton est élevé. |
+| `apps/orion/src-tauri/src/engine_host.rs`, `engine_launch.rs` | **ajoutés** | Le moteur (`orion.exe --engine`, élevé) et son lancement par l’IHM (`ShellExecuteExW` `runas`). |
+| `orion-core::protected_root` | **ajouté** | Racine protégée sous `%ProgramData%`, contrôle de l’installation ; la migration de l’ancien coffre est `vault/relocation.rs`. |
+
+Aucun de ces éléments `cfg(windows)` n’est compilé ni exécuté depuis WSL2 :
+voir MANUAL-TESTING, « Séparation des privilèges (F11) ».
+
 ## Internal Module Organization
 
 Cette analyse porte sur la structure interne des packages, indépendamment des
@@ -1153,7 +1177,7 @@ pas une crate runtime supplémentaire.
 | `astra-signer` | `src/main.rs` | 3 991 (3 931 + 60) | commandes, cérémonies, vault, signatures et transport | vrai monolithe de binaire | `SPLIT` | haute |
 | `helios-ctl` | `src/main.rs` | 1 325 (1 131 + 194) | dispatch CLI, affichage et suivi WebSocket | commandes métier déjà en modules ; extraire seulement le monitoring | `SPLIT` | basse |
 | `xtask` | `src/main.rs` | 946 (624 + 322) | dispatch build/package et tests | taille de production modérée, support déjà séparé | `KEEP` | basse |
-| `helios-astra-helper` | `src/main.rs` | 627 | protocole interactif et composition helper | cohésion acceptable avec modules voisins | `KEEP` | basse |
+| `helios-astra-helper` (retiré par F11) | `src/main.rs` | 627 | protocole interactif et composition helper | cohésion acceptable avec modules voisins | `KEEP` | basse |
 | `helios-publisher` | `src/main.rs` | 570 | CLI release, validation et signature | outil cohérent | `KEEP` | basse |
 | `helios-installer` | `src/main.rs` | 422 | installation, activation et rollback | workflow privilégié cohérent | `KEEP` | basse |
 

@@ -261,11 +261,10 @@ export const selectProfile = (name: string) =>
 /**
  * The SSH command line for the gateway, to paste into your own terminal.
  *
- * Orion does **not** run it, and must not: it runs elevated to load the
- * WireGuard driver, so any terminal it spawned would be an Administrator
- * terminal — an escalation one click away from the UI. Rust still owns the
- * gates: the tunnel must be up, and the destination is re-validated before it
- * reaches a clipboard.
+ * This command only returns the line; {@link openSshTerminal} is the one that
+ * opens a terminal. Only the engine is elevated, so a shell the UI starts is
+ * not an Administrator shell. Rust still owns the gates: the tunnel must be
+ * up, and the destination is re-validated before it reaches a clipboard.
  */
 export const sshCommand = (name?: string) =>
   invoke<string>('ssh_command', { name: name ?? null })
@@ -273,11 +272,10 @@ export const sshCommand = (name?: string) =>
 /**
  * Opens a terminal connected to the gateway, **below** Orion's privileges.
  *
- * Orion runs elevated to load the WireGuard driver, so the child is built from
- * the standard-user token Windows keeps linked to the elevated one. Rust
- * refuses to launch anything until Windows confirms that token is not
- * elevated — on a machine with no such token the call fails, and the caller
- * falls back to {@link sshCommand}.
+ * The UI runs at its caller's level and only the engine is elevated, so the
+ * child inherits a non-elevated token. Rust refuses to launch anything while
+ * Windows reports the UI's own token as elevated, or cannot say — then the
+ * call fails, and the caller falls back to {@link sshCommand}.
  */
 export const openSshTerminal = (name?: string) =>
   invoke<void>('open_ssh_terminal', { name: name ?? null })

@@ -1,8 +1,8 @@
 //! Bounded local protocol between Orion and the Astra companion.
 //!
-//! Orion runs elevated on Windows while the companion must use the interactive
-//! user's WebAuthn session. They therefore cannot share the authority vault or
-//! rely on inherited standard handles. The companion connects back to a
+//! The companion must use the interactive user's WebAuthn session, and the
+//! authority vault stays on its side: Orion never opens it, and no inherited
+//! standard handle carries anything between them. The companion connects back to a
 //! loopback listener and authenticates the one short-lived session before any
 //! command is accepted.
 

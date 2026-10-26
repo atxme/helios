@@ -9,12 +9,12 @@
 //! It is a crate of its own so that the boundary is a dependency edge rather
 //! than a convention. **Astra does not depend on it** — the server holds the
 //! encrypted vault as opaque bytes and never opens it, which is the whole
-//! point of §4. **Orion does not depend on it either**: Orion runs elevated so
-//! WireGuard-NT will load, and pulling the master-signing primitives into that
-//! process would put them one bug away from a privilege the operator never
-//! granted. Orion speaks to the process that holds them, through the typed
-//! session of [`aether::certificates::operator_session`], and knows nothing
-//! else.
+//! point of §4. **The elevated engine does not depend on it either**: the
+//! engine loads WireGuard-NT with administrator rights, and pulling the
+//! master-signing primitives into that process would put them one bug away from
+//! a privilege the operator never granted. The ceremony runs in the Orion UI,
+//! which is not elevated, and speaks through the typed session of
+//! [`aether::certificates::operator_session`].
 //!
 //! The terminal is not here either. Prompts, paths and arguments belong to
 //! whatever drives this — a helper launched by Orion, or the compatibility CLI

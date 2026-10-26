@@ -2689,13 +2689,14 @@ supprime jamais l'ancien pin avant la fin du chevauchement.
    les nouvelles clés.
 2. Il produit `ExpiredCertificateRecoveryRequest` avec les preuves ancienne et
    nouvelle.
-3. Orion lance son sidecar désélevé `helios-astra-helper`, qui affiche dans
+3. L'IHM d'Orion, non élevée, exécute la cérémonie dans son propre processus
+   (le sidecar `helios-astra-helper` a disparu avec F11) et affiche dans
    l'onglet Astra le manifeste vérifié ; une seule cérémonie `GetAssertion` de
    la YubiKey opérateur approuve le hash exact et dérive le secret qui ouvre
-   localement le coffre maître. Le jeton de session et l'état passent par le
-   canal IPC local borné, jamais par la WebView.
+   localement le coffre maître. L'état et les actions passent par un canal interne
+   borné, jamais par la WebView.
 4. Astra vérifie la dernière génération historique et l'absence de révocation,
-   puis le compagnon signe l'autorisation exacte par `CA-PQ`.
+   puis la cérémonie signe l'autorisation exacte par `CA-PQ`.
 5. Astra remet l'autorisation à Helios par le veth privé.
 6. Helios persiste le candidat en `pending_grant`, sans créer de slot `next`,
    et signe le reçu.
@@ -4014,7 +4015,7 @@ le dernier hash d'audit connu et refuser un fork de génération.
 | `aether::config` | états bornés, pending/next, tombstones, générations, profil Astra et invariants temporels |
 | `astra` | coordinateur public HTTPS et privé veth, statut authentifié, renouvellements automatiques, campagnes, contrôle des approbations sensibles, émetteur délégué, transactions chunkées, registre et audit |
 | bibliothèque `astra-operator` | vérification et exécution des cérémonies sans dépendre d'une ligne de commande |
-| sidecar `helios-astra-helper` | assertions FIDO2 des récupérations/campagnes lancées par Orion ; ouverture locale du coffre par PRF, puis zéroïsation |
+| cérémonie opérateur dans l'IHM d'Orion (non élevée) | assertions FIDO2 des récupérations/campagnes lancées par Orion ; ouverture locale du coffre par PRF, puis zéroïsation (le sidecar `helios-astra-helper` a été supprimé) |
 | adaptateur `astra-signer` | flux portables et hors ligne tant que leur parité Orion n'est pas validée sur Windows |
 | `aether-vault` | coffre maître et key-slots multiples liés aux credentials YubiKey |
 | `helios-api` | routes typées dans WireGuard, relais vers l'API Astra du veth, authentification de source et limites HTTP |

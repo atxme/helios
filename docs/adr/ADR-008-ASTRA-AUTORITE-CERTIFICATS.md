@@ -320,12 +320,20 @@ l'assertion avant d'ouvrir le coffre. Une opération exigeant deux credentials
 répète cette cérémonie avec deux clés distinctes. Cette combinaison ne vaut
 jamais pour le renouvellement ordinaire, qui n'ouvre aucun coffre maître.
 
-Orion ne parle pas directement à CTAP pour une cérémonie qui ouvre le coffre
-maître. Il lance le sidecar désélevé `helios-astra-helper`, installé à côté de
-lui, et ne lui transmet par IPC qu'un genre d'opération et son identifiant
-opaque. Le sidecar résout lui-même l'origine, le RP ID, le domaine et la clé de
-service depuis le hand-off épinglé au coffre, puis renvoie des états et un
-manifeste typés. `astra-signer` reste l'adaptateur portable des flux hors ligne
+Depuis F11 (séparation des privilèges Windows, ADR-004 §9), le sidecar
+`helios-astra-helper` **a disparu** : `orion.exe` n'est plus un processus élevé
+unique, mais une IHM non élevée et un moteur élevé qui seul charge WireGuardNT et
+ouvre le coffre du client. La cérémonie opérateur vit dans l'IHM non élevée,
+qui est déjà dans la session interactive de l'utilisateur, au niveau
+d'intégrité où l'API WebAuthn de Windows répond ; la boîte de dialogue est
+rattachée à la fenêtre Orion. Le moteur n'y participe pas et ne dépend pas de
+`astra-operator`. La WebView ne transmet à la cérémonie qu'un genre d'opération
+et son identifiant opaque : la cérémonie résout elle-même l'origine, le RP ID,
+le domaine et la clé de service depuis le hand-off épinglé au coffre, puis
+publie des états et un manifeste typés (`operator_session`). Aucun secret ni PIN
+ne traverse vers la WebView. Le comportement sous Windows réel de cette
+cérémonie dans l'IHM est **à valider en recette** (MANUAL-TESTING, point 10 de
+« Séparation des privilèges (F11) »). `astra-signer` reste l'adaptateur portable des flux hors ligne
 et des cérémonies qui n'ont pas encore atteint cette parité dans Orion.
 
 Règles de gestion :

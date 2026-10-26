@@ -152,7 +152,20 @@ décision de coût reste hors de ce lot.
 
 ## Privilèges des paquets
 
-Sous Windows, le manifeste de l'exécutable demande `requireAdministrator`.
+Sous Windows, depuis F11, le manifeste de `orion.exe` demande `asInvoker` : la
+fenêtre n'est pas élevée. Le plan de données est confié à `orion.exe --engine`,
+que l'IHM lance par `ShellExecuteExW` `runas` ; l'UAC apparaît donc une fois, au
+lancement, et un refus s'affiche comme « Orion a besoin de l'autorisation
+administrateur pour monter le tunnel. ». Le MSI et le paquet NSIS
+(`installMode: perMachine`) s'installent pour la machine. En release, l'IHM
+(avant l'UAC) puis le moteur refusent de démarrer si l'exécutable, une DLL, son
+dossier ou le parent de ce dossier sont modifiables par un compte non
+administrateur, ou si le dossier ou l'exécutable est atteint par un point
+d'analyse (code de sortie 4, « Orion est installé dans un dossier modifiable sans
+droits administrateur : démarrage refusé. ») ; un ancêtre au-delà du parent n'est
+pas contrôlé. La mise à jour passe par l'arrêt complet d'Orion. Le coffre vit sous
+`%ProgramData%\helios\orion\<SID>` (ADR-006 §7). Rien de cela n'a été observé
+sous Windows : voir MANUAL-TESTING, « Séparation des privilèges (F11) ».
 Sous Linux, le `postinst` du paquet `.deb` pose seulement
 `cap_net_admin=ep` sur `/usr/bin/orion`; `libcap2-bin` est une dépendance du
 paquet. La recette cible doit vérifier le tunnel réel, les routes et le

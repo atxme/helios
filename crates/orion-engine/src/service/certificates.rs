@@ -441,7 +441,7 @@ impl EngineService {
     ) -> Result<RenewalProgress, String> {
         let settings = settings.ok_or_else(|| "ce profil ne négocie pas de clé".to_string())?;
         let url = heliosd_url.ok_or_else(|| {
-            "ce profil ne porte pas l'adresse de l'API de la gateway dans le tunnel : sans elle il n'y          a aucune route de renouvellement à appeler."
+            "ce profil ne porte pas l'adresse de l'API de la gateway dans le tunnel : sans elle il n'y a aucune route de renouvellement à appeler."
                 .to_string()
         })?;
 
@@ -604,7 +604,7 @@ impl EngineService {
                 .get_mut(&name)
                 .ok_or_else(|| "aucun renouvellement ouvert pour ce profil".to_string())?;
             in_flight.approval.take().ok_or_else(|| {
-                "lire d'abord la demande d'approbation : c'est elle qui est vérifiée, et ce qui est              signé est ce qui a été montré"
+                "lire d'abord la demande d'approbation : c'est elle qui est vérifiée, et ce qui est signé est ce qui a été montré"
                     .to_string()
             })?
         };

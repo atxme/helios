@@ -204,7 +204,7 @@ Deux refus sont énoncés sur le cran lui-même plutôt qu'après coup :
 Les clés privées et PSK sont scellés dans le coffre ([ADR-006](../../docs/adr/ADR-006-SECRETS-AU-REPOS.md)) :
 ni l’IHM ni un message Tauri ne les transportent, et l’écran n’affiche que la clé
 **publique**. Le stockage vit dans le répertoire applicatif de l’OS sous
-`net/helios/orion` ; `ORION_CONFIG` surcharge le chemin du fichier hérité en test.
+`net/helios/orion` sur Linux. Sous Windows, le coffre, le registre des profils et les identités vivent sous `%ProgramData%\helios\orion\<SID>`, réservé aux administrateurs et à SYSTEM, et seul le moteur élevé y accède ([ADR-006](../../docs/adr/ADR-006-SECRETS-AU-REPOS.md) §7). `ORION_CONFIG` et `ORION_IDENTITY_DIR` surchargent ces chemins en test ; elles ne sont lues qu'en build de développement.
 
 ## Construire et lancer
 
@@ -422,7 +422,12 @@ un binaire réel ne retombe jamais implicitement sur la simulation. L’IHM affi
 toujours le type de backend actif.
 
 Le paquet Windows embarque les DLL AMD64 et ARM64 sous le chemin exact ouvert
-par `defguard_wireguard_rs`; son manifeste demande `requireAdministrator`. Le
+par `defguard_wireguard_rs`; son manifeste demande `asInvoker` : l'IHM n'est pas
+élevée, et le plan de données tourne dans `orion.exe --engine`, que l'IHM lance
+élevé (un seul UAC, au lancement). Le MSI et le NSIS s'installent pour la
+machine, et Orion refuse de démarrer depuis un dossier modifiable sans droits
+administrateur. La validation de cette séparation sous Windows reste à faire
+(`docs/testing/MANUAL-TESTING.md`). Le
 paquet Debian dépend de `libcap2-bin` et son `postinst` pose
 `cap_net_admin=ep` sur `/usr/bin/orion`. Les limites de ces choix et la chaîne
 Authenticode sont détaillées dans

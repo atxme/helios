@@ -198,8 +198,14 @@ Valider avec accès console :
 - Orion : adaptateur/routes maintenus sur panne UDP, retrait sur déconnexion ;
 - installateur Orion Windows : `wireguard.dll` présente et signée par son
   éditeur dans un bundle produit après `cargo xtask orion-deps`, manifeste
-  `requireAdministrator`, et horodatage RFC 3161 valide sur l'exécutable comme
-  sur l'installateur ;
+  `asInvoker` (le moteur élevé est lancé par `ShellExecuteExW` `runas`), et
+  horodatage RFC 3161 valide sur l'exécutable comme sur l'installateur ;
+- séparation des privilèges d'Orion (F11) : WSL2 n'éprouve que la logique
+  portable (protocole et autorisation du canal, cycle de vie modélisé, prédicats
+  de DACL, plan de migration) ; tout le code `cfg(windows)` (tube nommé, `runas`,
+  DACL réelles, clé TPM machine, migration, jeton de l'IHM) n'est ni compilé ni
+  exécuté ici. Sa preuve est la recette « Séparation des privilèges (F11) » de
+  [MANUAL-TESTING](MANUAL-TESTING.md), sur un Windows réel avec TPM ;
 - association Orion : double-clic sur `.orion` au premier lancement puis
   avec l'application déjà ouverte, une seule instance et reprise de la clé
   privée locale de même nom ;
@@ -1027,14 +1033,13 @@ dernier effet exige la gateway réelle.
   ce que la chaîne `[feuille, intermédiaire]` scellée par `candidate_bundle` et
   l’ensemble d’émetteurs lu dans le registre existent pour éviter, et hors
   matériel on n’en prouve que la logique ;
-- **le sidecar opérateur d'Orion ne s'exerce pas en WSL2** : aucun passthrough
+- **la cérémonie opérateur d'Orion ne s'exerce pas en WSL2** : aucun passthrough
   USB, et le transport plateforme est propre à Windows. Hors matériel, les
   tests couvrent le protocole IPC borné, le manifeste typé, l'ordre strict des
   révisions et la collecte de chaque assertion pendant que sa clé physique est
   encore branchée. La recette Windows part de l'installateur produit, vérifie
-  que `helios-astra-helper.exe` est installé à côté d'Orion et absent du
-  `PATH`, puis exerce d'abord les refus : sidecar absent, fenêtre propriétaire
-  impossible, jeton absent, session périmée et seconde clé identique. Elle
+  qu'aucun `helios-astra-helper.exe` n'est livré (supprimé avec F11), puis
+  exerce d'abord les refus : fenêtre propriétaire impossible, jeton absent, session périmée et seconde clé identique. Elle
   termine par une récupération complète et une campagne de certificats clients,
   avec apparition au premier plan de chaque boîte WebAuthn. Pour éprouver le
   séquençage réel, la recette laisse d'abord Orion afficher le manifeste, puis

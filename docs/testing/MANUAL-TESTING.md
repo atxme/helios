@@ -209,7 +209,10 @@ cd apps/orion
 ORION_CONFIG=/tmp/orion-manual/profiles.toml npm run tauri dev
 ```
 
-`ORION_CONFIG` empêche le test de modifier les profils habituels.
+`ORION_CONFIG` empêche le test de modifier les profils habituels. Elle n'est
+lue qu'en build de développement (`cfg(debug_assertions)`) : un binaire de
+release l'ignore, et sous Windows le moteur élevé ne reçoit aucun chemin de
+l'IHM (voir « Séparation des privilèges (F11) »).
 
 ### Accessibilité et interactions
 
@@ -304,6 +307,190 @@ Après installation sur une machine propre :
    l'écran *Profils*, et « À propos » annonce la version, le backend et le
    chemin du journal. Enregistrer, supprimer puis renommer un profil pendant que
    le menu existe : la liste doit suivre sans redémarrage.
+
+### Séparation des privilèges (F11)
+
+Recette de la séparation de `orion.exe` en une IHM non élevée et un moteur élevé
+([spec](../superpowers/specs/2026-10-24-separation-privileges-windows-design.md)
+§13, [ADR-004](../adr/ADR-004-CHAINE-DE-LIVRAISON.md) §9,
+[ADR-006](../adr/ADR-006-SECRETS-AU-REPOS.md) §7). Elle se déroule sur un
+Windows réel, avec le TPM et le paquet de **release** produit par
+`cargo xtask orion-msi`, installé pour la machine (sous `Program Files`).
+
+**Rien de ce qui suit n'a été observé sous Windows à ce jour.** Chaque
+« attendu » décrit ce que le code de la branche produit ; il est **à valider en
+recette**, jamais acquis. Les tests Windows de la branche
+(`cargo test -p orion --features wireguard` et
+`cargo test -p orion-core --features wireguard`, depuis un dépôt cloné sous
+Windows) sont à lancer avant, et leur résultat est à noter ici.
+
+Repères communs :
+
+- le journal de l'IHM est `orion-ui.log`, dans
+  `%APPDATA%\helios\orion\config` ; celui du moteur est `orion.log`, sous la
+  racine protégée `%ProgramData%\helios\orion\<SID>\` (lisible depuis un
+  terminal administrateur seulement) ;
+- le moteur est le processus `orion.exe` dont la ligne de commande commence par
+  `--engine` ; dans le Gestionnaire des tâches (onglet Détails, colonne
+  « Élévation »), l'IHM doit être **non élevée** et le moteur **élevé** ;
+- codes de sortie du moteur (`crates/orion-engine/src/lifecycle.rs`) : 0 pour un
+  arrêt demandé, 1 pour toute autre fin de session ou échec de démarrage,
+  2 pour des arguments illisibles, **3** pour une racine protégée refusée,
+  **4** pour une installation modifiable ;
+- aucun journal ne doit contenir de clé privée, de PSK, de PIN ni de jeton.
+
+**1. Lancement.** Lancer Orion depuis l'icône, avec un compte standard.
+Attendu : un seul UAC, puis la fenêtre ; deux processus `orion.exe` (IHM non
+élevée, moteur élevé caché) ; au premier démarrage, `%ProgramData%\helios`,
+`orion` et `<SID>` existent, `icacls` n'y liste que Administrateurs et SYSTEM
+(héritage désactivé), `vault\` et `identities\` en héritent ; le début de
+`orion.log` montre `randomness provider` ; le journal du moteur contient
+`propriétés de la clé TPM` avec `portee = Machine` et `acces = AdminsOnly`, et
+`bootstrap.toml` porte `key_slot = "Helios Orion device root v2 <SID>"`. Points
+de vigilance : le retour de `GetProcessId` sur le processus d'un `runas` ; un
+second lancement pendant l'UAC du premier (son rappel attend la fin de `setup` :
+ses chemins de profil sont ignorés et journalisés, aucune fenêtre n'apparaît
+avant la fin de l'UAC).
+
+**2. Connexion, renouvellement, déconnexion.** Connecter un profil ML-KEM,
+renouveler la clé, déconnecter. Attendu : mêmes états qu'avant F11 ; l'adaptateur
+`orion0` apparaît à la connexion et disparaît à la déconnexion.
+
+**3. Fermer la fenêtre, la rouvrir.** Fermer la fenêtre pendant une connexion,
+puis rouvrir depuis l'icône de la zone de notification. Attendu : le tunnel n'a
+pas bougé, aucun nouvel UAC.
+
+**4. Quitter.** « Quitter » depuis l'icône. Attendu : plus aucun processus
+`orion.exe`, plus d'adaptateur `orion0` ; l'attente du moteur est bornée à 10 s
+(`SHUTDOWN_GRACE`), au-delà de quoi `orion-ui.log` contient « arrêt du moteur non
+terminé après 10 s : Orion sort quand même ». Le journal du moteur se termine par
+`moteur d'Orion arrêté` avec `event=ShutdownRequested` et `code=0`. Point de
+vigilance : `ExitRequested` puis `Exit` ne doivent produire qu'un seul démontage
+(une seule attente).
+
+**5. Tuer l'IHM.** Terminer le processus de l'IHM (non élevé) depuis le
+Gestionnaire des tâches. Attendu : le moteur démonte le tunnel puis s'arrête ;
+plus d'adaptateur ; `orion.log` contient `moteur d'Orion arrêté` avec
+`event=ParentExited` (ou `ClientLeft`) et `code=1`.
+
+**6. Tuer le moteur.** Terminer le processus élevé. Attendu : l'IHM affiche
+« Le moteur d'Orion s'est arrêté : Orion va se fermer. » puis se ferme ; le
+lancement suivant supprime l'adaptateur orphelin (nettoyage à l'ouverture du
+moteur). Panne volontaire d'une commande du moteur (panique) : la session et
+l'IHM se terminent, jamais de moteur qui continue seul (*fail-closed*).
+
+**7. Refuser l'UAC.** Attendu : message « Orion a besoin de l'autorisation
+administrateur pour monter le tunnel. » (erreur Win32 1223), aucun processus
+`orion.exe` restant.
+
+**8. Moteur lancé à la main, sans IHM.** Depuis un terminal administrateur,
+lancer `orion.exe --engine` sans IHM. Attendu : sans les quatre options
+(`--pipe`, `--ui-pid`, `--ui-created`, `--token`), sortie immédiate avec le
+code 2 ; avec des options bien formées mais sans IHM correspondante, le moteur
+s'arrête seul (processus parent absent, ou aucun client dans les 10 s de
+`CONNECT_TIMEOUT`) avec le code 1. Lancé sans élévation : « le moteur d'Orion
+doit être élevé. » sur stderr, code 1, et `orion-ui.log` n'est pas tronqué.
+Aucun adaptateur `orion0` ne doit rester.
+
+**9. Tube ouvert par un tiers.** Depuis un programme lancé sous le même compte
+(une autre image que `orion.exe`), ouvrir `\\.\pipe\orion-engine-<pid>-<nonce>`
+pendant le démarrage du moteur, avant l'IHM. Attendu : le tiers est refusé
+(PID, image ou heure de création du client différents, ou jeton de session
+absent), et le moteur s'arrête (`ClientRefused` ou `HelloRefused`, code 1, visible
+dans `orion.log`) ; l'IHM affiche alors le message d'arrêt du moteur. Le tube est
+créé en instance unique et n'accepte aucun client distant.
+
+**10. Cérémonie YubiKey depuis l'IHM.** Récupération ou campagne de certificats
+depuis Orion, **sans** `helios-astra-helper` installé (il n'est plus livré).
+Attendu : la boîte WebAuthn de Windows apparaît au premier plan, rattachée à la
+fenêtre Orion, et la cérémonie aboutit. Point de vigilance : le dialogue est
+ouvert depuis un fil qui n'est pas celui de l'IHM ; aucun transfert de premier
+plan n'est fait.
+
+**11. Terminal SSH.** L'action d'ouverture d'un terminal SSH d'Orion. Attendu : le
+shell ouvert est **non élevé** (`whoami /groups` n'indique pas
+« Mandatory Label\High Mandatory Level »). Si l'IHM était lancée élevée, le
+lancement est refusé.
+
+**12. Mise à jour d'une installation existante.** Installer la version
+précédente, créer un profil et une identité, noter le SHA-256 de `registry.hvlt`
+et de chaque `profiles\*.hvlt` de `%APPDATA%\helios\orion\config`, puis
+installer cette version et lancer Orion.
+
+- Attendu : le journal du moteur contient « coffre repris sous la racine
+  protégée » (nombres de profils et d'identités) puis « ancien coffre nettoyé
+  sous l'identité de l'utilisateur » ; sous `...\<SID>\vault\`, les SHA-256 sont
+  identiques, `.relocated` existe, `bootstrap.toml` porte la clé
+  `Helios Orion device root v2 <SID>` et le même `install_id` ; profils et
+  identités sont intacts, sans réenrôlement ; l'ancien coffre a disparu
+  (`device-root`, `registry.hvlt`, `profiles\`, `profiles.toml`, magasins) mais
+  `orion.log` et `orion-ui.log` restent ; l'ancienne clé TPM `v1` n'existe plus.
+  Un second démarrage ne migre rien.
+- Échec simulé (dossier neuf non écrivable, identité copiée corrompue) :
+  message « La migration du coffre a échoué : l'ancien coffre est conservé.
+  Cause : … », ancien coffre intact (mêmes SHA-256), aucun `device-root` sous le
+  nouveau `vault\`, aucun `.relocating` restant.
+- Reprise après arrêt brutal : un `.relocating` factice laissé sous la racine est
+  supprimé et la migration aboutit.
+- Un lien (jonction) planté dans l'ancien dossier est ignoré avec un
+  avertissement (« lien ignoré dans l'ancien coffre ») ; un lien sur une entrée
+  du coffre lui-même fait échouer la migration.
+- Élévation par les identifiants d'un **autre** administrateur : le journal
+  contient « l'ancien coffre appartient au compte de l'IHM, inaccessible au
+  moteur élevé sous un autre compte », rien n'est migré ni lu, et le coffre
+  créé est lié à ce compte (un autre administrateur ne pourra pas l'ouvrir la
+  fois suivante).
+- À valider : que le moteur élevé puisse ouvrir le jeton de l'IHM (nettoyage
+  sous ce jeton) ; sinon « ancien coffre conservé : suppression impossible sans
+  les droits de l'utilisateur » et l'ancien coffre ainsi que la clé `v1` restent.
+- **Installation modifiable.** Copier le dossier d'installation de la release
+  (`orion.exe`, `wireguard.dll`, ressources) dans un dossier que l'utilisateur
+  peut modifier, et lancer `orion.exe` de là. Attendu : la boîte d'erreur
+  affiche « Orion est installé dans un dossier modifiable sans droits
+  administrateur : démarrage refusé. » **avant toute invite UAC**. Depuis un
+  terminal administrateur, `orion.exe --engine …` lancé de ce dossier sort avec
+  le code **4** et écrit le même message sur stderr, sans créer de fichier sous
+  la racine protégée. Une installation sous `Program Files` démarre sans ce
+  message.
+- **Installation atteinte par un lien.** Avec `mklink /J`, une jonction placée
+  dans un dossier modifiable et pointant vers le dossier d'installation protégé,
+  ou un lien symbolique vers `orion.exe` : le démarrage est refusé de la même
+  façon (message, avant l'UAC, code 4 côté moteur). Limite connue, non
+  contrôlée : une jonction placée sur un ancêtre au-delà du dossier parent n'est
+  pas détectée (ADR-004, Limites connues).
+
+**13. Depuis un programme non élevé du même compte.** Lister et lire
+`%ProgramData%\helios\orion\<SID>\vault` ; tenter d'ouvrir la clé machine
+`Helios Orion device root v2 <SID>` du *Microsoft Platform Crypto Provider*
+(par `NCryptOpenKey` avec `NCRYPT_MACHINE_KEY_FLAG`, depuis un petit programme
+de test). Attendu : accès refusé au dossier ; clé inutilisable ;
+rien n'est écrit dans le dossier protégé. Aucun secret ni racine dans le
+journal.
+
+**14. Dossier de coffre élargi.** Avec un terminal administrateur, donner à
+l'utilisateur un droit sur `%ProgramData%\helios\orion\<SID>` (ou pré-créer ce
+dossier depuis un compte standard, ou le remplacer par une jonction), puis lancer
+Orion. Attendu : l'IHM affiche « Le dossier protégé d'Orion est accessible à un
+compte non administrateur : démarrage refusé. » ; le moteur sort avec le code
+**3**, et `orion-ui.log` contient `code=Some(3)` ; rien n'est écrit sous la
+racine refusée (ni coffre, ni journal). Un dossier `ProgramData\helios` créé par
+un compte non administrateur est refusé de même (propriétaire).
+
+Points de vigilance supplémentaires, à constater pendant la recette :
+
+- **Clé TPM machine** : que le *Microsoft Platform Crypto Provider* accepte un
+  descripteur posé sur une clé machine avant finalisation (« restricting the
+  machine key failed » sinon, et Orion ne démarre plus sous Windows) ; qu'il ne
+  normalise ni le propriétaire ni le drapeau protégé (sinon `acces = Wider` ou
+  `Unreadable` et le démarrage est refusé, ce qui est correct mais bloquant sur
+  ce matériel). Le journal du moteur indique ce qui est lu.
+- **Échec du moteur avant son journal** : l'IHM ne reçoit alors que le code de
+  sortie ; vérifier que « Le moteur d'Orion s'est arrêté avant de répondre (code
+  N). » s'affiche avec le bon code.
+- **COM** : `ShellExecuteExW` est appelé sur le fil de `setup`, qui suppose COM
+  initialisé (WebView2 le fait) ; à confirmer.
+- **Journal de l'IHM** : un second lancement tronque `orion-ui.log` de
+  l'instance qui tourne (comportement hérité de `orion.log`).
 
 ### Négociation de clé PQC, de bout en bout
 
@@ -453,8 +640,10 @@ d'[OPERATOR-TOOLING §6](../security/OPERATOR-TOOLING.md#6-profil-client).
    demande » doit proposer un fichier `.helios-request` ; s'il ne se passe rien
    dans WebView2, le bouton de copie reste le recours, à signaler. La demande
    apparaît sous « Demandes en attente » et survit à un redémarrage d'Orion.
-4. Inspecter `%APPDATA%\helios\orion\data\identities` (ou
-   `ORION_IDENTITY_DIR`) : aucune clé privée en clair, les fichiers de la
+4. Inspecter, depuis un terminal administrateur,
+   `%ProgramData%\helios\orion\<SID>\identities` (sous Linux, le dossier de
+   données par défaut ; `ORION_IDENTITY_DIR` n'est lue qu'en build de
+   développement) : aucune clé privée en clair, les fichiers de la
    demande en attente sont des blobs DPAPI. Les rouvrir sous un
    autre compte Windows doit échouer.
 5. Poste opérateur : `astra-signer enroll accept`, puis la ligne

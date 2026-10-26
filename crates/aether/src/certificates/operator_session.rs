@@ -2,11 +2,12 @@
 //!
 //! # Why there is a session at all
 //!
-//! Orion runs elevated so WireGuard-NT will load; the platform WebAuthn API
-//! answers only inside the interactive user's session, at medium integrity.
-//! The two therefore cannot share a process, and the ceremony runs in a child
-//! launched **below** Orion's token. This module is everything the two are
-//! allowed to say to each other, and nothing else crosses.
+//! The platform WebAuthn API answers only inside the interactive user's
+//! session, at medium integrity. Since F11 the Orion UI runs there, and only
+//! the engine is elevated (to load WireGuard-NT), so the operator ceremony
+//! lives in the UI process and never in the engine. This module is everything
+//! the ceremony and the window are allowed to say to each other, and nothing
+//! else crosses.
 //!
 //! # What changed from protocol 1, and why
 //!

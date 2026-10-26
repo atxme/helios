@@ -218,8 +218,12 @@ ressources du bundle ; Orion sélectionne ce répertoire avant d'initialiser le
 backend, car une association de fichier peut fournir un autre répertoire
 courant.
 
-Le manifeste Windows demande `requireAdministrator`. Le paquet Debian pose
-`cap_net_admin=ep` dans son `postinst`. L'association `.orion` passe par
+Sous Windows, le manifeste de `orion.exe` demande `asInvoker` (F11) : la
+fenêtre tourne au niveau de l'utilisateur, et le plan de données est confié à un
+second processus du même binaire, `orion.exe --engine`, que l'IHM lance élevé par
+`ShellExecuteExW` `runas` (un seul UAC, au lancement). Les deux paquets
+Windows, MSI et NSIS (`installMode: perMachine`), s'installent pour la machine.
+Le paquet Debian pose `cap_net_admin=ep` dans son `postinst`. L'association `.orion` passe par
 le plugin single-instance et une lecture Rust bornée à 64 Kio ; l'import manuel
 et le double-clic partagent le parseur et la reprise de clé privée du profil
 local de même nom.
@@ -259,11 +263,39 @@ dépôt. La commande de signature Tauri impose un horodatage RFC 3161 avec
   des empreintes différentes. La signature reste vérifiable, mais un tiers ne
   peut pas reconstruire l’artefact pour le confronter. Ce qui débloquerait :
   `--remap-path-prefix`, `SOURCE_DATE_EPOCH` et un conteneur de build figé.
-* **Orion s'exécute entièrement en administrateur sous Windows.** Séparer l'IHM
-  du plan de données exigerait un service privilégié, un IPC authentifié et une
-  politique d'autorisation ; ces trois éléments doivent être conçus et audités
-  ensemble. Ce découplage est hors du lot installateurs et constitue ce qui
-  débloquerait la suppression de `requireAdministrator` sur l'IHM.
+* **Frontière moteur / IHM d'Orion sous Windows (F11).** Orion n'est plus
+  entièrement administrateur : seul le moteur (`orion.exe --engine`) est élevé et
+  porte WireGuardNT, le coffre et les identités ; l'IHM, sa WebView et les
+  cérémonies opérateur (YubiKey) restent non élevées. Le canal est un tube nommé
+  `\\.\pipe\orion-engine-<pid>-<nonce>` dont la DACL n'accorde l'accès qu'au
+  SID de l'IHM (une instance, clients distants refusés) ; le moteur vérifie le
+  PID, l'image et l'heure de création du client, l'IHM vérifie que le serveur
+  est le moteur qu'elle a lancé, et un jeton de session de 32 octets ouvre la
+  session. Aucun des deux processus ne survit à l'autre. Spec :
+  [séparation des privilèges Windows](../superpowers/specs/2026-10-24-separation-privileges-windows-design.md).
+  Limites :
+  * **Un programme non élevé du même compte peut piloter l'IHM** (WebView,
+    entrées) : il obtient ce que l'IHM peut demander au moteur, pas le contenu
+    du coffre ni les clés (qui ne quittent pas le moteur).
+  * **Les autres administrateurs de la machine** peuvent ouvrir le coffre
+    (ADR-006 §7).
+  * **Élévation par les identifiants d'un autre administrateur** : le moteur
+    tourne sous ce compte ; le coffre est lié à ce compte (ADR-006 §7).
+  * **`EngineService::open`** (nettoyage d'un adaptateur orphelin) s'exécute
+    avant l'authentification du client.
+  * **Les échecs du moteur avant l'ouverture de son journal** n'arrivent à l'IHM
+    que comme code de sortie (par exemple 3 pour la racine protégée refusée, 4
+    pour une installation modifiable).
+  * **En release, l'IHM puis le moteur refusent** un exécutable, une DLL, un
+    dossier ou un parent modifiable par un compte non administrateur, ainsi
+    qu'un dossier ou un exécutable atteint par un point d'analyse ; un ancêtre
+    au-delà du parent n'est pas contrôlé. Le contrôle de l'IHM précède l'UAC,
+    celui du moteur est la barrière.
+  * **La mise à jour applicative** passe par l'arrêt complet d'Orion : le moteur
+    ne peut pas être remplacé pendant qu'il tourne.
+  * Rien de tout cela n'a été observé sous Windows : la validation est la
+    recette de [MANUAL-TESTING](../testing/MANUAL-TESTING.md), « Séparation des
+    privilèges (F11) ».
 * **Les capabilities Linux peuvent neutraliser `LD_LIBRARY_PATH`.** Le chargeur
   traite un binaire doté de capabilities comme une exécution sécurisée ; une
   distribution dont WebKitGTK dépend d'un chemin dynamique non standard peut
