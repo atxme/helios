@@ -237,6 +237,9 @@ pub(crate) async fn start(
     let parameters = engine_parameters(&args)?;
     drop(args);
 
+    // Before the prompt: an engine elevated under another administrator's
+    // account must be able to observe this process and read its token's user.
+    crate::ui_access::let_administrators_observe_the_ui();
     let process = launch(&parameters)?;
     // The token stays in `token`, which the hello needs; the joined command
     // line, which carries it too, is erased now.

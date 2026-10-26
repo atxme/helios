@@ -157,6 +157,19 @@ lire ces fichiers et appeler DPAPI et le TPM pour les ouvrir. Après F11 :
 eux aussi ouvrir ce coffre. C'est le prix de la barrière contre les programmes
 non élevés du compte, et l'ADR-006 doit le dire.
 
+**Élévation par les identifiants d'un autre administrateur.** Décidé le
+26 octobre 2026 (revue finale, I2) : ce cas est **pris en charge**. Quand un
+compte standard saisit à l'UAC les identifiants d'un administrateur, le moteur
+tourne sous ce compte, que la DACL par défaut du processus et du jeton de l'IHM
+n'autorise pas. Avant l'UAC, l'IHM accorde donc au groupe Administrateurs
+(`S-1-5-32-544`), par fusion dans la DACL existante, `SYNCHRONIZE |
+PROCESS_QUERY_LIMITED_INFORMATION` sur son processus et `TOKEN_QUERY` sur son
+jeton, et rien d'autre. Les autres administrateurs peuvent ainsi observer le
+processus de l'IHM et lire l'identité de son jeton, ce que `SeDebugPrivilege`
+leur permet déjà. Le moteur tourne sous l'autre compte, sans migrer l'ancien
+coffre, et DPAPI lie le coffre à ce compte. Si l'accès reste refusé, le moteur
+s'arrête avec le code 5 et l'IHM le dit.
+
 **Migration.** Au premier lancement du moteur après la mise à jour, l'ancien
 coffre est ouvert avec ses protections actuelles, rescellé sous les nouvelles,
 écrit dans le nouveau dossier et relu. L'ancien n'est supprimé qu'une fois le

@@ -286,18 +286,23 @@ dépôt. La commande de signature Tauri impose un horodatage RFC 3161 avec
     du coffre ni les clés (qui ne quittent pas le moteur).
   * **Les autres administrateurs de la machine** peuvent ouvrir le coffre
     (ADR-006 §7).
-  * **Élévation par les identifiants d'un autre administrateur : non prise en
-    charge.** Quand un compte standard saisit à l'UAC les identifiants d'un
-    administrateur, le moteur tourne sous ce compte, dans une autre session
-    d'ouverture. La DACL par défaut du processus et du jeton de l'IHM ne lui
-    accorde pas l'accès, et le moteur n'active pas `SeDebugPrivilege` : Orion
-    n'élargit aucun de ces droits. Le moteur sort alors avant d'ouvrir son
-    journal, sans rien écrire, avec le code 5 (`OTHER_ACCOUNT_ELEVATION`), et
-    l'IHM affiche « Orion doit être autorisé avec le compte de la session
-    ouverte : l'élévation avec les identifiants d'un autre administrateur n'est
-    pas prise en charge. ». **À valider en recette.** Si Windows accorde
-    malgré tout cet accès, le moteur poursuit sous l'autre compte, sans migrer
-    l'ancien coffre (ADR-006 §7).
+  * **Élévation par les identifiants d'un autre administrateur** (compte
+    standard qui saisit à l'UAC les identifiants d'un administrateur) : prise
+    en charge par un octroi limité. Le moteur tourne sous l'autre compte, que la
+    DACL par défaut du processus et du jeton de l'IHM n'autorise pas. Avant
+    l'UAC, l'IHM accorde donc aux Administrateurs (`S-1-5-32-544`), par fusion
+    dans la DACL existante, `SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION`
+    sur son processus et `TOKEN_QUERY` sur son jeton, rien d'autre. Les autres
+    administrateurs de la machine peuvent ainsi attendre le processus de
+    l'IHM, lire son image, son heure de création et l'identité de son jeton, ce
+    que `SeDebugPrivilege` leur permet déjà. Un octroi qui échoue est
+    journalisé et garde les droits plus étroits. Le moteur sous l'autre compte
+    ne migre pas l'ancien coffre, et le coffre est lié à ce compte
+    (ADR-006 §7). Si l'accès reste refusé, le moteur sort avant son journal,
+    sans rien écrire, avec le code 5 (`OTHER_ACCOUNT_ELEVATION`), et l'IHM
+    affiche « Orion doit être autorisé avec le compte de la session ouverte :
+    l'élévation avec les identifiants d'un autre administrateur n'est pas prise
+    en charge. ». **À valider en recette**, dans les deux branches.
   * **`EngineService::open`** (nettoyage d'un adaptateur orphelin) s'exécute
     avant l'authentification du client.
   * **Les échecs du moteur avant l'ouverture de son journal** n'arrivent à l'IHM

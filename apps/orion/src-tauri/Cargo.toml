@@ -39,6 +39,9 @@ tauri = { version = "2", features = ["tray-icon", "image-png"] }
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
   "Win32_Security",
+  # Octroi aux Administrateurs sur le processus et le jeton de l'IHM avant
+  # l'élévation (`ui_access`) : GetSecurityInfo, SetEntriesInAclW, SetSecurityInfo.
+  "Win32_Security_Authorization",
   "Win32_System_LibraryLoader",
   "Win32_System_Threading",
   # Lancement élevé du moteur (`engine_launch`) : ShellExecuteExW est gardé par

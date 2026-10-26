@@ -584,6 +584,92 @@ fn enrollment_commands_never_return_private_material() {
     }
 }
 
+/// Source with its line comments removed, so a comment cannot stand in for code.
+fn without_line_comments(source: &str) -> String {
+    source
+        .lines()
+        .map(|line| line.split("//").next().unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The UI grants Administrators what an engine under another account reads,
+/// before the elevation prompt, and nothing that changes the UI.
+///
+/// In `start`, the grant precedes `launch(`, the only function that calls
+/// `ShellExecuteExW(`. The granted masks name no right that writes to, ends,
+/// duplicates or re-permissions the process or its token.
+#[test]
+fn the_ui_grants_administrators_read_rights_before_the_prompt() {
+    let launcher = without_line_comments(include_str!("engine_launch.rs"));
+    let start = launcher
+        .split("async fn start(")
+        .nth(1)
+        .and_then(|rest| rest.split("\nfn ").next())
+        .expect("start is defined in engine_launch.rs");
+    let launch = start
+        .find("launch(&parameters)")
+        .expect("start launches the engine");
+    let grant = start
+        .find("ui_access::let_administrators_observe_the_ui()")
+        .expect("start grants Administrators their read rights");
+    assert!(
+        grant < launch,
+        "the grant must come before the elevation prompt"
+    );
+    assert_eq!(
+        launcher.matches("ShellExecuteExW(").count(),
+        1,
+        "one elevation call"
+    );
+    let shell = launcher
+        .find("ShellExecuteExW(")
+        .expect("the elevation call");
+    let launch_fn = launcher.find("fn launch(").expect("launch is defined");
+    assert!(launch_fn < shell, "the elevation call lives in launch");
+
+    let access = without_line_comments(include_str!("ui_access.rs"));
+    let granted: Vec<&str> = access
+        .lines()
+        .filter(|line| line.contains("UI_PROCESS_GRANT") || line.contains("UI_TOKEN_GRANT"))
+        .collect();
+    assert!(
+        granted.len() >= 4,
+        "the masks are defined and used: {granted:?}"
+    );
+    for line in &granted {
+        for forbidden in [
+            "PROCESS_ALL_ACCESS",
+            "PROCESS_VM_",
+            "PROCESS_TERMINATE",
+            "PROCESS_DUP_HANDLE",
+            "PROCESS_CREATE_",
+            "PROCESS_SET_",
+            "TOKEN_ADJUST",
+            "TOKEN_DUPLICATE",
+            "TOKEN_IMPERSONATE",
+            "TOKEN_ASSIGN_PRIMARY",
+            "GENERIC_ALL",
+            "GENERIC_WRITE",
+            "WRITE_DAC",
+            "WRITE_OWNER",
+            "MAXIMUM_ALLOWED",
+        ] {
+            assert!(!line.contains(forbidden), "{forbidden} is granted: {line}");
+        }
+    }
+    for call in access.split("grant_administrators(").skip(1) {
+        let line = call.lines().next().unwrap_or("");
+        if line.contains("rights: u32") {
+            continue;
+        }
+        assert!(
+            line.contains("UI_PROCESS_GRANT)") || line.contains("UI_TOKEN_GRANT)"),
+            "a grant passes another mask: {line}"
+        );
+    }
+}
+
 /// The engine restricts DLL search before it does anything else.
 ///
 /// Comments are ignored, so a comment cannot stand in for the call. In `run`,

@@ -75,6 +75,10 @@ mod engine_host;
 /// Launch of the elevated engine from the UI, and the end of the UI with it.
 mod engine_launch;
 
+/// Rights the UI grants Administrators on its process and token before the
+/// launch, so an engine elevated under another account can observe it.
+mod ui_access;
+
 /// Launches from the UI (SSH terminal, Astra companion). Each one is refused
 /// while the UI's own token is elevated; only that check is Windows-specific.
 mod launch;

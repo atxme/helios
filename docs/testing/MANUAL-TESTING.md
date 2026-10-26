@@ -444,8 +444,8 @@ installer cette version et lancer Orion.
 - Un lien (jonction) planté dans l'ancien dossier est ignoré avec un
   avertissement (« lien ignoré dans l'ancien coffre ») ; un lien sur une entrée
   du coffre lui-même fait échouer la migration.
-- Élévation par les identifiants d'un **autre** administrateur : cas non pris
-  en charge, vérifié à l'étape 15.
+- Élévation par les identifiants d'un **autre** administrateur : vérifiée à
+  l'étape 15.
 - À valider : que le moteur élevé puisse ouvrir le jeton de l'IHM (nettoyage
   sous ce jeton) ; sinon « ancien coffre conservé : suppression impossible sans
   les droits de l'utilisateur » et l'ancien coffre ainsi que la clé `v1` restent.
@@ -484,20 +484,33 @@ compte non administrateur : démarrage refusé. » ; le moteur sort avec le code
 racine refusée (ni coffre, ni journal). Un dossier `ProgramData\helios` créé par
 un compte non administrateur est refusé de même (propriétaire).
 
-**15. Élévation par les identifiants d'un autre administrateur (non prise en
-charge).** Ouvrir une session avec un compte **standard**, lancer Orion et
-saisir à l'UAC les identifiants d'un administrateur. Attendu, **à valider en
-recette** : le moteur ne peut ouvrir ni le processus ni le jeton de l'IHM
-(refus d'accès) et sort avec le code **5**, et `orion-ui.log` contient
-`code=Some(5)` ; l'IHM affiche « Orion doit être autorisé avec le
-compte de la session ouverte : l'élévation avec les identifiants d'un autre
-administrateur n'est pas prise en charge. » ; rien n'est créé sous
-`%ProgramData%\helios\orion\` pour ce compte, et aucun processus `orion.exe`
-ne reste. Si Windows accorde au contraire l'accès (code 5 absent, fenêtre
-ouverte), le noter : le journal du moteur doit alors contenir « l'ancien coffre
-appartient au compte de l'IHM, inaccessible au moteur élevé sous un autre
-compte », rien n'est migré ni lu, et le coffre créé est lié à ce compte (un
-autre administrateur ne pourra pas l'ouvrir la fois suivante).
+**15. Élévation par les identifiants d'un autre administrateur.** Ouvrir une
+session avec un compte **standard**, lancer Orion et saisir à l'UAC les
+identifiants d'un administrateur. Avant l'UAC, l'IHM accorde aux
+Administrateurs `SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION` sur son
+processus et `TOKEN_QUERY` sur son jeton. Constater laquelle des deux branches
+se produit, **à valider en recette** :
+
+- *Accès accordé* (attendu) : la fenêtre s'ouvre, le moteur tourne sous le
+  compte administrateur (Gestionnaire des tâches, colonne « Nom d'utilisateur ») ;
+  le journal du moteur contient « l'ancien coffre appartient au compte de l'IHM,
+  inaccessible au moteur élevé sous un autre compte », rien n'est migré ni lu,
+  et le coffre créé est lié à ce compte (un autre administrateur ne pourra pas
+  l'ouvrir la fois suivante). Connexion et déconnexion fonctionnent ; quitter
+  ne laisse aucun processus `orion.exe`. Depuis un terminal administrateur,
+  vérifier la DACL du processus de l'IHM (par exemple avec Process Explorer,
+  onglet Sécurité, ou `Get-NtProcess`/`Get-NtToken` de NtObjectManager) : une
+  entrée Administrateurs avec seulement `Synchronize` et `Query limited
+  information` sur le processus, `Query` sur le jeton, les entrées d'origine
+  intactes.
+- *Accès refusé* (repli) : le moteur sort avec le code **5**, `orion-ui.log`
+  contient `code=Some(5)` et l'IHM affiche « Orion doit être autorisé avec le
+  compte de la session ouverte : l'élévation avec les identifiants d'un autre
+  administrateur n'est pas prise en charge. » ; rien n'est créé sous
+  `%ProgramData%\helios\orion\` pour ce compte, et aucun processus `orion.exe`
+  ne reste. `orion-ui.log` contient alors, s'il a échoué, « droits des
+  administrateurs sur le processus de l'IHM non accordés » ou « … sur le jeton
+  de l'IHM non accordés », avec la cause.
 
 Points de vigilance supplémentaires, à constater pendant la recette :
 
