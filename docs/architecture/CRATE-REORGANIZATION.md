@@ -323,7 +323,7 @@ de build ne créent pas de cycle Cargo, mais `heliosd -> orion-core` brouille la
 lecture produit Helios/client Orion.
 
 Packages à zéro consommateur normal : les outils/apps feuilles
-(`astra-signer`, `helios-astra-helper`, `helios-ctl`, `helios-installer`,
+(`astra-signer`, `helios-astra-helper` [retiré par F11], `helios-ctl`, `helios-installer`,
 `helios-publisher`, `heliosd`, `orion`, `xtask`). Package de sous-système à un
 consommateur : `astra` n’est utilisé normalement que par `astra-operator` ;
 cela renforce le besoin de découpler ses contrats sans imposer une fusion.
@@ -1123,7 +1123,6 @@ crates/orion-core/src/
   telemetry.rs test_domain.rs trust_update.rs
 
 tools/astra-signer/src/             main.rs
-tools/helios-astra-helper/src/      main.rs owner.rs session.rs
 tools/helios-ctl/src/               main.rs api.rs app_update.rs campaign.rs
                                     campaign_key_nego.rs enroll.rs escrow.rs
                                     files.rs key_nego.rs peer.rs profile.rs update.rs
@@ -1639,7 +1638,7 @@ d’état et d’événement.
 #### Outils et tests
 
 Les petits packages `helios-installer`, `helios-publisher` et
-`helios-astra-helper` restent en fichiers courts. Les outils plus grands
+`helios-astra-helper` (retiré par F11) restent en fichiers courts. Les outils plus grands
 peuvent suivre cette organisation sans devenir de nouvelles crates :
 
 ```text

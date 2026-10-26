@@ -17,7 +17,7 @@
 //! [`aether::certificates::operator_session`].
 //!
 //! The terminal is not here either. Prompts, paths and arguments belong to
-//! whatever drives this — a helper launched by Orion, or the compatibility CLI
+//! whatever drives this — the ceremony in the Orion UI, or the compatibility CLI
 //! kept while §8.5 still requires an offline transport.
 //!
 //! See [`authenticator`] for what a security key does here, and what it never

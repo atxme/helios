@@ -2,9 +2,9 @@
 //!
 //! The companion must use the interactive user's WebAuthn session, and the
 //! authority vault stays on its side: Orion never opens it, and no inherited
-//! standard handle carries anything between them. The companion connects back to a
-//! loopback listener and authenticates the one short-lived session before any
-//! command is accepted.
+//! standard handle carries anything between them. The companion connects back
+//! to a loopback listener and authenticates the one short-lived session before
+//! any command is accepted.
 
 use serde::{Deserialize, Serialize};
 

@@ -1,4 +1,4 @@
-//! The local session between Orion and the operator helper (protocol 2).
+//! The local session between the Orion window and the operator ceremony (protocol 2).
 //!
 //! # Why there is a session at all
 //!
@@ -17,7 +17,7 @@
 //!
 //! * **One phase could not describe two machines.** A recovery is held by two
 //!   parties at once — Orion owns the client's private keys and signs the
-//!   commit, the helper owns the vault and signs the grant (§11.3). «Awaiting
+//!   commit, the ceremony owns the vault and signs the grant (§11.3). «Awaiting
 //!   key» and «staged at the gateway» are not two points on one line; they are
 //!   two coordinates. [`RemoteState`] and [`GestureState`] are those.
 //! * **`can_continue` duplicated the phase** and could disagree with it. What
@@ -29,19 +29,19 @@
 //!   closed enum of typed records ([`AstraManifest`]): the mandatory fields of
 //!   an operation are its struct fields, and a variant that lost one would not
 //!   compile. The **words** shown to the operator are chosen by Orion, from the
-//!   variant — never carried as text by the helper or the network.
+//!   variant — never carried as text by the ceremony or the network.
 //! * **One frame ceiling fitted nothing.** 16 KiB was below what a campaign
 //!   manifest or a recovery needs. Ceilings are per message type now.
 //! * **A stale command could land.** Statuses carry a strictly increasing
 //!   [`OperatorStatus::revision`], and `Continue`/`Cancel` name the revision
-//!   they answer, so a click on a screen the helper has already left is
+//!   they answer, so a click on a screen the ceremony has already left is
 //!   refused instead of applied to whatever came next.
 //!
 //! # What the WebView may ask for
 //!
 //! An [`OperationLocator`] — a kind and, when the authority already opened
 //! one, an operation id. Not a request, not a path, not a URL. Everything else
-//! the helper resolves from the hand-off it pins itself, so a stolen session
+//! the ceremony resolves from the hand-off it pins itself, so a stolen session
 //! token buys the ability to *watch* a ceremony the operator started, not to
 //! choose one.
 
@@ -73,10 +73,10 @@ pub mod limits {
     const _: () = assert!(COMMAND_BYTES < STATUS_BYTES);
 }
 
-/// First frame sent by the helper.
+/// First frame sent by the ceremony.
 ///
 /// The session id is checked as well as the token: a token alone authenticates
-/// *something* to this listener, while the pair says it is the child of the
+/// *something* to this listener, while the pair says it belongs to the
 /// session this Orion actually opened.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -90,7 +90,7 @@ pub struct OperatorHello {
 ///
 /// Closed, and named by what it does rather than by the command line it used
 /// to be. `RenewCertificate` is deliberately absent: since the amendment of
-/// §8.1.2 an ordinary renewal employs neither this helper, nor a FIDO
+/// §8.1.2 an ordinary renewal employs neither this ceremony, nor a FIDO
 /// assertion, nor the vault, and offering it here would re-create the
 /// per-request ceremony that amendment removed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,7 +113,7 @@ pub enum OperationKind {
 
 /// What the WebView is allowed to name.
 ///
-/// Minimal on purpose. The helper resolves the authority origin, the RP ID,
+/// Minimal on purpose. The ceremony resolves the authority origin, the RP ID,
 /// the service key and the domain from its own pinned hand-off, and compares
 /// them; taking them from here would mean the process holding the vault
 /// learned where to send its signatures from the process that does not.
@@ -131,7 +131,7 @@ pub struct OperationLocator {
     pub operation_id: Option<Id16>,
 }
 
-/// The only things Orion may ask of the helper.
+/// The only things Orion may ask of the ceremony.
 ///
 /// The payloads are named structs rather than inline variant fields, and each
 /// one denies what it does not declare: `deny_unknown_fields` has no effect on
@@ -172,7 +172,7 @@ pub enum OperatorAction {
 
 /// Where the ceremony stands **at the authority**.
 ///
-/// The half Orion cannot observe on its own: it is what the helper learned
+/// The half Orion cannot observe on its own: it is what the ceremony learned
 /// from Astra and the gateway. Ordered as the exchange runs, and the order is
 /// what [`RemoteState::is_past_no_return`] reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -182,7 +182,7 @@ pub enum RemoteState {
     Local,
     /// The authority holds the request and is waiting for an operator.
     AwaitingOperator,
-    /// The helper signed the objects; nothing has left this machine.
+    /// The ceremony signed the objects; nothing has left this machine.
     Prepared,
     /// The signed objects reached the authority. **Past the point of no
     /// return**: they may already have been acted upon.
@@ -297,7 +297,7 @@ pub fn allowed_actions(remote: RemoteState, gesture: GestureState) -> Vec<Operat
 /// Why a ceremony stopped.
 ///
 /// A closed class rather than a sentence: the words an operator reads are
-/// Orion's, in Orion's language, and a helper that could write them could also
+/// Orion's, in Orion's language, and a ceremony that could write them could also
 /// write a reassuring one over a refusal that mattered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "refusal")]
@@ -316,7 +316,7 @@ pub enum Refusal {
     WindowExpired,
     /// The authority declined; its own reason stays in its protected log.
     AuthorityRefused { status: u16 },
-    /// What the authority offered does not match what this helper pins.
+    /// What the authority offered does not match what this ceremony pins.
     HandoffMismatch,
     /// The answer did not describe the request that was sent.
     ManifestMismatch,
@@ -324,7 +324,7 @@ pub enum Refusal {
     ProtocolViolation,
     /// The operator abandoned before the point of no return.
     Cancelled,
-    /// Anything the helper could not classify. Deliberately last and
+    /// Anything the ceremony could not classify. Deliberately last and
     /// deliberately opaque: an unclassified failure must not become a channel
     /// for text.
     Internal,

@@ -228,7 +228,7 @@ pub fn install(paths: EnginePaths) -> Result<(), String> {
     }
 }
 
-/// The protected root of this process, once [`install`] has set it.
+/// The protected root of this process, once `install` has set it.
 pub fn installed() -> Option<&'static EnginePaths> {
     INSTALLED.get()
 }

@@ -116,7 +116,7 @@ impl PlatformRootKeyProvider {
     }
 
     /// Seals `root` under the layers of this provider and writes it to its
-    /// path. The one writer of the device root: [`Self::create`] calls it for a
+    /// path. The one writer of the device root: `create` calls it for a
     /// fresh root, and the migration for a root that already exists.
     pub fn seal_existing(&self, root: &DeviceRootKey) -> Result<(), VaultError> {
         let wrapped = if self.software_only {

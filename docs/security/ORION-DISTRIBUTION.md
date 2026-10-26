@@ -156,8 +156,9 @@ Sous Windows, depuis F11, le manifeste de `orion.exe` demande `asInvoker` : la
 fenêtre n'est pas élevée. Le plan de données est confié à `orion.exe --engine`,
 que l'IHM lance par `ShellExecuteExW` `runas` ; l'UAC apparaît donc une fois, au
 lancement, et un refus s'affiche comme « Orion a besoin de l'autorisation
-administrateur pour monter le tunnel. ». Le MSI et le paquet NSIS
-(`installMode: perMachine`) s'installent pour la machine. En release, l'IHM
+administrateur pour monter le tunnel. ». Le paquet NSIS fixe
+`installMode: perMachine` ; le MSI de Tauri s'installe pour la machine par défaut,
+ce qui n'est pas constaté dans le dépôt (**à valider en recette**). En release, l'IHM
 (avant l'UAC) puis le moteur refusent de démarrer si l'exécutable, une DLL, son
 dossier ou le parent de ce dossier sont modifiables par un compte non
 administrateur, ou si le dossier ou l'exécutable est atteint par un point

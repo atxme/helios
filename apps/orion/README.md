@@ -424,8 +424,8 @@ toujours le type de backend actif.
 Le paquet Windows embarque les DLL AMD64 et ARM64 sous le chemin exact ouvert
 par `defguard_wireguard_rs`; son manifeste demande `asInvoker` : l'IHM n'est pas
 élevée, et le plan de données tourne dans `orion.exe --engine`, que l'IHM lance
-élevé (un seul UAC, au lancement). Le MSI et le NSIS s'installent pour la
-machine, et Orion refuse de démarrer depuis un dossier modifiable sans droits
+élevé (un seul UAC, au lancement). Le NSIS fixe `installMode: perMachine` ; le MSI s'installe pour la
+machine par défaut de Tauri (à valider en recette), et Orion refuse de démarrer depuis un dossier modifiable sans droits
 administrateur. La validation de cette séparation sous Windows reste à faire
 (`docs/testing/MANUAL-TESTING.md`). Le
 paquet Debian dépend de `libcap2-bin` et son `postinst` pose

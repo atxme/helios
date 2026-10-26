@@ -451,7 +451,9 @@ installer cette version et lancer Orion.
   terminal administrateur, `orion.exe --engine …` lancé de ce dossier sort avec
   le code **4** et écrit le même message sur stderr, sans créer de fichier sous
   la racine protégée. Une installation sous `Program Files` démarre sans ce
-  message.
+  message. Constater aussi que le MSI s'installe bien pour la machine (sous
+  `Program Files`, `HKLM`) : seul le `installMode` du NSIS est vérifié dans le
+  dépôt.
 - **Installation atteinte par un lien.** Avec `mklink /J`, une jonction placée
   dans un dossier modifiable et pointant vers le dossier d'installation protégé,
   ou un lien symbolique vers `orion.exe` : le démarrage est refusé de la même

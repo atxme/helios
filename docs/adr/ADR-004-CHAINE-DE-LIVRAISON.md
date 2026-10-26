@@ -221,8 +221,9 @@ courant.
 Sous Windows, le manifeste de `orion.exe` demande `asInvoker` (F11) : la
 fenêtre tourne au niveau de l'utilisateur, et le plan de données est confié à un
 second processus du même binaire, `orion.exe --engine`, que l'IHM lance élevé par
-`ShellExecuteExW` `runas` (un seul UAC, au lancement). Les deux paquets
-Windows, MSI et NSIS (`installMode: perMachine`), s'installent pour la machine.
+`ShellExecuteExW` `runas` (un seul UAC, au lancement). Le paquet NSIS
+fixe `installMode: perMachine` ; le MSI de Tauri s'installe pour la machine par
+défaut, ce qui n'est pas constaté dans le dépôt et reste **à valider en recette**.
 Le paquet Debian pose `cap_net_admin=ep` dans son `postinst`. L'association `.orion` passe par
 le plugin single-instance et une lecture Rust bornée à 64 Kio ; l'import manuel
 et le double-clic partagent le parseur et la reprise de clé privée du profil
