@@ -189,6 +189,49 @@ pub(crate) async fn operator_overview() -> Result<astra_operator::overview::Vaul
     astra_operator::overview::read(&path).map_err(|error| error.to_string())
 }
 
+/// The invitations of this machine's registry, with whether each device is
+/// admitted on the connected gateway.
+///
+/// The gateway is asked on the runtime, with a wait, and only when one is
+/// connected: without it the invitations still list, with `peer_admitted`
+/// unknown. No key is involved.
+#[tauri::command]
+pub(crate) async fn operator_invitations(
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::operator::invitations::InvitationView>, String> {
+    use orion_core::gateway_admin as admin;
+
+    let registry = astra_operator::enrollment::InvitationRegistry::default_location()
+        .map_err(|error| format!("{error:#}"))?;
+    let admitted = match connected_gateway(&state).await {
+        Ok(base) => match admin::orion_client() {
+            Ok(client) => admin::admitted_keys(&client, &base).await.ok(),
+            Err(_) => None,
+        },
+        Err(_) => None,
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    crate::operator::invitations::list(&registry, now, admitted.as_deref())
+}
+
+/// Revokes an invitation still issued. No key: the registry refuses anything
+/// that is not issued, and the revocation destroys its proof key.
+#[tauri::command]
+pub(crate) async fn revoke_invitation(invitation_id: String) -> Result<(), String> {
+    let id = aether::certificates::encoding::Id16::parse_hex(invitation_id.trim())
+        .map_err(|error| error.to_string())?;
+    let registry = astra_operator::enrollment::InvitationRegistry::default_location()
+        .map_err(|error| format!("{error:#}"))?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    crate::operator::invitations::revoke(&registry, &id, now)
+}
+
 const NO_CONNECTED_GATEWAY: &str = "Connectez d'abord le profil de la gateway, avec un pair \
                                     administrateur : l'admission passe par le tunnel.";
 

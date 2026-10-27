@@ -15,6 +15,8 @@ import { Check, KeyRound } from 'lucide-react'
 import * as api from '../api'
 import { OperatorCeremonyPanel } from './OperatorCeremony'
 import { DomainPanel } from './astra/DomainPanel'
+import { ArtifactDownloads } from './astra/ArtifactDownloads'
+import { EnrollmentOperatorPanel } from './astra/EnrollmentOperatorPanel'
 import { VaultPanel } from './astra/VaultPanel'
 import { GUTTER, MINT, PINE, RULE } from '../theme'
 import type {
@@ -140,7 +142,7 @@ export function AstraView({
   // read on mount rather than only created here.
   const [ceremony, setCeremony] = useState<OperatorStatus | null>(null)
   const [pending, setPending] = useState<OperatorPendingOperation[]>([])
-  const [tab, setTab] = useState<AstraTab>('Coffre et clés')
+  const [tab, setTab] = useState<AstraTab>('Enrôlement')
   const [finishingRecovery, setFinishingRecovery] = useState(false)
   const recoveryAttempt = useRef<string | null>(null)
 
@@ -342,6 +344,10 @@ export function AstraView({
           onStatus={setCeremony}
           onDismiss={() => void dismissCeremony()}
         />
+        {(ceremony.operation === 'invite_enrollment' ||
+          ceremony.operation === 'accept_enrollment') && (
+          <ArtifactDownloads gesture={ceremony.gesture} />
+        )}
         {finishingRecovery && (
           <Alert severity="info" variant="outlined" sx={{ mt: 1.25, fontSize: 11.5 }}>
             Grant reçu : installation et commit de la nouvelle identité…
@@ -608,9 +614,7 @@ export function AstraView({
   )
 
   const panels: Record<AstraTab, ReactNode> = {
-    'Enrôlement': (
-      <WaitingNote>L’enrôlement d’un poste arrivera dans une prochaine version d’Orion.</WaitingNote>
-    ),
+    'Enrôlement': <EnrollmentOperatorPanel onCeremony={setCeremony} />,
     'Coffre et clés': <VaultPanel onCeremony={setCeremony} />,
     'Domaine': <DomainPanel />,
     'Approbations': approvals,

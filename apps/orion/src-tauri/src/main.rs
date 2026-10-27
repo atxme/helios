@@ -784,6 +784,8 @@ fn main() {
             begin_operator_ceremony,
             begin_enrollment_ceremony,
             operator_artifacts,
+            operator_invitations,
+            revoke_invitation,
             advance_operator_ceremony,
             dismiss_operator_ceremony,
             operator_ceremony_status,

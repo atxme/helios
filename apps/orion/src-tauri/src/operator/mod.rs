@@ -32,6 +32,7 @@
 //! it does not buy the ability to choose one.
 
 mod ceremony;
+pub mod invitations;
 
 use std::time::Duration;
 

@@ -196,13 +196,30 @@ fn run_enrollment_with(
                 gateway: gateway.as_deref(),
             },
         ),
-        // Named rather than swallowed, as for the other ceremonies: a gesture
-        // this build does not carry yet is said so, not left silent.
-        EnrollmentGesture::Resume { .. } => {
-            ceremony.refuse(Refusal::Internal);
-            publish(ceremony.status());
-            Err("ce geste d'enrôlement n'est pas encore porté dans ce processus".to_string())
-        }
+        EnrollmentGesture::Resume {
+            invitation_id,
+            endpoint,
+            allowed_ips,
+            ssh_target,
+        } => resume(
+            &mut ceremony,
+            &presses,
+            publish,
+            deposit,
+            vault_path,
+            registry,
+            Resume {
+                invitation_id,
+                delivery: Delivery {
+                    endpoint: &endpoint,
+                    allowed_ips: allowed_ips.as_deref(),
+                    ssh_target: ssh_target.as_deref(),
+                    gateway: gateway.as_deref(),
+                },
+            },
+            &read_negotiation,
+            &read_admitted_keys,
+        ),
     }
 }
 
@@ -374,6 +391,34 @@ struct Accept<'a> {
     gateway: Option<&'a str>,
 }
 
+impl Accept<'_> {
+    fn delivery(&self) -> Delivery<'_> {
+        Delivery {
+            endpoint: self.endpoint,
+            allowed_ips: self.allowed_ips,
+            ssh_target: self.ssh_target,
+            gateway: self.gateway,
+        }
+    }
+}
+
+/// What the document of an accepted device is built from, beyond the leaves:
+/// the part an acceptance and its resumption have in common.
+struct Delivery<'a> {
+    /// The gateway's public WireGuard endpoint, as the document will carry it.
+    endpoint: &'a str,
+    allowed_ips: Option<&'a str>,
+    ssh_target: Option<&'a str>,
+    /// The connected gateway's control-plane address, when a tunnel is up.
+    gateway: Option<&'a str>,
+}
+
+/// What the operator decided about the resumption of one acceptance.
+struct Resume<'a> {
+    invitation_id: Id16,
+    delivery: Delivery<'a>,
+}
+
 const DAY_SECS: u64 = 86_400;
 
 /// How far back the leaves start, so a device whose clock runs a little slow
@@ -493,46 +538,17 @@ fn accept(
         pin,
     } = accepting;
 
-    // Shown before any key is asked for anything, and it states what the
-    // consumption and the leaves will be.
-    ceremony.remote = RemoteState::AwaitingOperator;
-    ceremony.manifest = Some(AstraManifest::EnrollmentAcceptance(AcceptanceManifest {
+    let manifest = AcceptanceManifest {
         invitation_id: request.invitation_id,
         request_fingerprint: request.fingerprint(),
         requested_name: request.requested_name.clone(),
         client_wg_public_key: request.client_wg_public_key,
         leaves_not_after_unix: leaf_validity.1,
         endpoint: accept.endpoint.trim().to_string(),
-    }));
-    ceremony.gesture = GestureState::AwaitingKey {
-        index: 1,
-        of: 1,
-        purpose: KeyPurpose::OpenVault,
     };
-    let offered = ceremony.status();
-    publish(offered.clone());
-
-    let Some(key) = open_key(ceremony, presses, publish, &offered)? else {
+    let Some(opened) = open_for_delivery(ceremony, presses, publish, &vault, manifest)? else {
         return Ok(());
     };
-    let opened = match astra_operator::gestures::open_with_authorized_key(key.as_ref(), &vault, "")
-    {
-        Ok(opened) => opened,
-        Err(error) => {
-            ceremony.refuse(Refusal::KeyNotEnrolled);
-            publish(ceremony.status());
-            return Err(format!("{error:#}"));
-        }
-    };
-    if let Ok(slot) = vault.slot_for_credential(&opened.credential_id) {
-        ceremony.keys.push(KeySlotLabel {
-            slot: "1".to_string(),
-            label: slot.label.clone(),
-        });
-    }
-
-    ceremony.gesture = GestureState::Signing;
-    publish(ceremony.status());
 
     // One opening for the issuance and for the document: the operator touches
     // the key once for the whole gesture.
@@ -559,6 +575,102 @@ fn accept(
     };
 
     keep_leaves(ceremony, publish, deposit, registry, &accepted)?;
+    deliver(
+        ceremony,
+        publish,
+        deposit,
+        Delivering {
+            registry,
+            vault: &vault,
+            opened: &opened,
+            accepted: &accepted,
+            delivery: &accept.delivery(),
+            pin: &pin,
+            admit: true,
+        },
+    )
+}
+
+/// Shows what is about to be signed, asks for one key and opens the vault with
+/// it. `None` is an abandonment at the prompt, already published; an `Err` has
+/// been published as a refusal.
+///
+/// Shared by the acceptance and its resumption, so the manifest is shown and
+/// the key checked the same way before anything is signed.
+fn open_for_delivery(
+    ceremony: &mut Ceremony,
+    presses: &Receiver<Press>,
+    publish: &mut dyn FnMut(OperatorStatus),
+    vault: &AuthorityVault,
+    manifest: AcceptanceManifest,
+) -> Result<Option<astra_operator::authenticator::Opened>, String> {
+    // Shown before any key is asked for anything, and it states what the
+    // consumption and the leaves will be.
+    ceremony.remote = RemoteState::AwaitingOperator;
+    ceremony.manifest = Some(AstraManifest::EnrollmentAcceptance(manifest));
+    ceremony.gesture = GestureState::AwaitingKey {
+        index: 1,
+        of: 1,
+        purpose: KeyPurpose::OpenVault,
+    };
+    let offered = ceremony.status();
+    publish(offered.clone());
+
+    let Some(key) = open_key(ceremony, presses, publish, &offered)? else {
+        return Ok(None);
+    };
+    let opened = match astra_operator::gestures::open_with_authorized_key(key.as_ref(), vault, "") {
+        Ok(opened) => opened,
+        Err(error) => {
+            ceremony.refuse(Refusal::KeyNotEnrolled);
+            publish(ceremony.status());
+            return Err(format!("{error:#}"));
+        }
+    };
+    if let Ok(slot) = vault.slot_for_credential(&opened.credential_id) {
+        ceremony.keys.push(KeySlotLabel {
+            slot: "1".to_string(),
+            label: slot.label.clone(),
+        });
+    }
+    ceremony.gesture = GestureState::Signing;
+    publish(ceremony.status());
+    Ok(Some(opened))
+}
+
+/// What steps 4 to 6 work from: the leaves of an accepted request, the opening
+/// that may sign, and the gateway they are delivered to.
+struct Delivering<'a> {
+    registry: &'a InvitationRegistry,
+    vault: &'a AuthorityVault,
+    opened: &'a astra_operator::authenticator::Opened,
+    accepted: &'a AcceptedEnrollment,
+    delivery: &'a Delivery<'a>,
+    pin: &'a GatewayPin,
+    /// False when the gateway already lists the peer.
+    admit: bool,
+}
+
+/// Steps 4 to 6, from leaves that exist: check them, admit the peer unless it
+/// is admitted, sign the document and hand it over.
+///
+/// The one place both the acceptance and its resumption deliver from, and
+/// nothing here issues a leaf: the leaves are an argument.
+fn deliver(
+    ceremony: &mut Ceremony,
+    publish: &mut dyn FnMut(OperatorStatus),
+    deposit: &mut dyn FnMut(OperatorArtifact),
+    delivering: Delivering<'_>,
+) -> Result<(), String> {
+    let Delivering {
+        registry,
+        vault,
+        opened,
+        accepted,
+        delivery,
+        pin,
+        admit,
+    } = delivering;
     if let Err(error) = orion_core::enrollment_draft::check_leaves(
         &accepted.request,
         &accepted.tls_certificate,
@@ -568,17 +680,19 @@ fn accept(
         publish(ceremony.status());
         return Err(format!("{error:#}"));
     }
-    admit_or_stop(
-        ceremony,
-        publish,
-        deposit,
-        &accepted,
-        accept.gateway,
-        &pin,
-        &read_negotiation,
-    )?;
+    if admit {
+        admit_or_stop(
+            ceremony,
+            publish,
+            deposit,
+            accepted,
+            delivery.gateway,
+            pin,
+            &read_negotiation,
+        )?;
+    }
 
-    match sign_delivery(registry, &vault, &opened, &accepted, &accept, &pin) {
+    match sign_delivery(registry, vault, opened, accepted, delivery, pin) {
         Ok(artifact) => {
             deposit(artifact);
             ceremony.gesture = GestureState::Done;
@@ -591,6 +705,213 @@ fn accept(
             Err(message)
         }
     }
+}
+
+type AdmittedReader<'a> =
+    &'a dyn Fn(&str) -> Result<Vec<String>, orion_core::gateway_admin::GatewayAdminError>;
+
+/// Reads the keys of the peers the gateway has admitted, with the Orion client.
+fn read_admitted_keys(
+    base: &str,
+) -> Result<Vec<String>, orion_core::gateway_admin::GatewayAdminError> {
+    use orion_core::gateway_admin as admin;
+    let client = admin::orion_client()?;
+    tauri::async_runtime::block_on(admin::admitted_keys(&client, base))
+}
+
+/// What a resumption is made of, once everything that needs no key has been
+/// verified.
+struct Resuming {
+    vault: AuthorityVault,
+    accepted: AcceptedEnrollment,
+    pin: GatewayPin,
+    /// The gateway lists the device's key already: admission is skipped.
+    admitted: bool,
+    /// Why no gateway can be used: none is connected, or it did not answer.
+    /// The resumption then stops before any key.
+    gateway_error: Option<(Refusal, String)>,
+}
+
+/// Step 5 and 6 again, §15.2: finishes an acceptance whose invitation is
+/// consumed and whose leaves are kept, without issuing anything.
+///
+/// Everything before the key is a refusal that changes nothing. Without a
+/// reachable gateway it stops before any key, handing over the leaves kept and
+/// the line that admits the peer by hand: the same files the acceptance would
+/// have handed over. Otherwise one key signs the document, and the peer is
+/// admitted first only when the gateway does not list it.
+#[allow(clippy::too_many_arguments)]
+fn resume(
+    ceremony: &mut Ceremony,
+    presses: &Receiver<Press>,
+    publish: &mut dyn FnMut(OperatorStatus),
+    deposit: &mut dyn FnMut(OperatorArtifact),
+    vault_path: &Path,
+    registry: &InvitationRegistry,
+    resume: Resume<'_>,
+    read: GatewayReader<'_>,
+    admitted: AdmittedReader<'_>,
+) -> Result<(), String> {
+    let resuming = match prepare_resumption(vault_path, registry, &resume, read, admitted) {
+        Ok(resuming) => resuming,
+        Err((refusal, message)) => {
+            ceremony.refuse(refusal);
+            publish(ceremony.status());
+            return Err(message);
+        }
+    };
+    let Resuming {
+        vault,
+        accepted,
+        pin,
+        admitted,
+        gateway_error,
+    } = resuming;
+
+    if let Some((refusal, message)) = gateway_error {
+        return stop_with_leaves(ceremony, publish, deposit, &accepted, refusal, message);
+    }
+
+    let request = &accepted.request;
+    let manifest = AcceptanceManifest {
+        invitation_id: request.invitation_id,
+        request_fingerprint: request.fingerprint(),
+        requested_name: request.requested_name.clone(),
+        client_wg_public_key: request.client_wg_public_key,
+        leaves_not_after_unix: accepted.pq_certificate.not_after_unix,
+        endpoint: resume.delivery.endpoint.trim().to_string(),
+    };
+    let Some(opened) = open_for_delivery(ceremony, presses, publish, &vault, manifest)? else {
+        return Ok(());
+    };
+    deliver(
+        ceremony,
+        publish,
+        deposit,
+        Delivering {
+            registry,
+            vault: &vault,
+            opened: &opened,
+            accepted: &accepted,
+            delivery: &resume.delivery,
+            pin: &pin,
+            admit: !admitted,
+        },
+    )
+}
+
+/// Everything a resumption needs before a key: the kept acceptance, the vault,
+/// and what the gateway says. Anything doubtful is a refusal, and the registry
+/// has not been written.
+fn prepare_resumption(
+    vault_path: &Path,
+    registry: &InvitationRegistry,
+    resume: &Resume<'_>,
+    read: GatewayReader<'_>,
+    admitted: AdmittedReader<'_>,
+) -> Result<Resuming, (Refusal, String)> {
+    use astra_operator::enrollment::InvitationState;
+
+    let mismatch = |message: String| (Refusal::HandoffMismatch, message);
+    if resume.delivery.endpoint.trim().is_empty() {
+        return Err((
+            Refusal::ManifestMismatch,
+            "l'adresse publique de la gateway est vide".to_string(),
+        ));
+    }
+    let record = registry.load(&resume.invitation_id).map_err(|error| {
+        (
+            Refusal::InvitationUnknown,
+            format!("cette invitation est inconnue de ce poste : {error:#}"),
+        )
+    })?;
+    match &record.state {
+        InvitationState::Consumed { .. } => {}
+        InvitationState::Issued => {
+            return Err((
+                Refusal::Internal,
+                "cette invitation n'a pas encore été acceptée : il n'y a rien à reprendre"
+                    .to_string(),
+            ))
+        }
+        other => {
+            return Err((
+                Refusal::InvitationExpired,
+                format!(
+                    "cette invitation est {} : elle n'admet plus aucune reprise",
+                    other.label()
+                ),
+            ))
+        }
+    }
+    let accepted = match registry.accepted(&resume.invitation_id) {
+        Ok(Some(accepted)) => accepted,
+        Ok(None) => {
+            return Err((
+                Refusal::AcceptedElsewhere,
+                "cette invitation a été acceptée hors d'Orion : ses feuilles ne sont pas ici"
+                    .to_string(),
+            ))
+        }
+        Err(error) => return Err((Refusal::Internal, format!("{error:#}"))),
+    };
+    let vault = astra_operator::store::load(vault_path)
+        .map_err(|error| (Refusal::VaultUnavailable, format!("{error:#}")))?;
+    let ca_pq_public_key = MlDsa87PublicKey::parse(vault.ca_pq_public_key.trim())
+        .map_err(|error| mismatch(error.to_string()))?;
+    if record.invitation.operator_ca_public_key != ca_pq_public_key {
+        return Err(mismatch(
+            "cette invitation n'a pas été signée par le CA-PQ de ce coffre".to_string(),
+        ));
+    }
+    // The same pin as the acceptance, checked before a key is touched.
+    let pin = GatewayPin::of(&record.invitation);
+    let mut peer_admitted = false;
+    let gateway_error = match resume.delivery.gateway {
+        None => Some((
+            Refusal::GatewayUnavailable,
+            NO_GATEWAY_CONNECTED.to_string(),
+        )),
+        Some(base) => match read(base) {
+            Ok(material) => {
+                pin.check(&material)?;
+                // A list that cannot be read is not a reason to skip the
+                // admission: the gateway refuses a peer it already holds.
+                if let Ok(keys) = admitted(base) {
+                    let device = accepted.request.client_wg_public_key.to_base64();
+                    peer_admitted = keys.iter().any(|held| held.trim() == device);
+                }
+                None
+            }
+            Err(error) => Some((gateway_refusal(&error), error.to_string())),
+        },
+    };
+    Ok(Resuming {
+        vault,
+        accepted,
+        pin,
+        admitted: peer_admitted,
+        gateway_error,
+    })
+}
+
+/// Hands over the kept leaves and the line that admits the peer by hand, then
+/// stops with the typed refusal.
+fn stop_with_leaves(
+    ceremony: &mut Ceremony,
+    publish: &mut dyn FnMut(OperatorStatus),
+    deposit: &mut dyn FnMut(OperatorArtifact),
+    accepted: &AcceptedEnrollment,
+    refusal: Refusal,
+    message: String,
+) -> Result<(), String> {
+    let handed = hand_over_leaves(deposit, accepted);
+    ceremony.refuse(refusal);
+    publish(ceremony.status());
+    Err(match handed {
+        Ok(()) => message,
+        Err(second) => format!("{message} ; {second}"),
+    })
 }
 
 /// Everything that needs no key: the vault and its relay, the request, the
@@ -732,6 +1053,9 @@ fn keep_leaves(
     }
 }
 
+const NO_GATEWAY_CONNECTED: &str = "aucune gateway n'est connectée : admettre le pair avec la \
+                                    ligne fournie, puis reprendre depuis la liste des invitations";
+
 /// Steps 4 and 5: admits the peer on the connected gateway, or stops after the
 /// leaves with the line that admits it by hand.
 ///
@@ -751,9 +1075,7 @@ fn admit_or_stop(
     let admitted: Result<(), (Refusal, String)> = match gateway {
         None => Err((
             Refusal::GatewayUnavailable,
-            "aucune gateway n'est connectée : admettre le pair avec la ligne fournie, puis \
-             reprendre depuis la liste des invitations"
-                .to_string(),
+            NO_GATEWAY_CONNECTED.to_string(),
         )),
         Some(base) => read(base)
             .map_err(|error| (gateway_refusal(&error), error.to_string()))
@@ -770,13 +1092,7 @@ fn admit_or_stop(
     let Err((refusal, message)) = admitted else {
         return Ok(());
     };
-    let handed = hand_over_leaves(deposit, accepted);
-    ceremony.refuse(refusal);
-    publish(ceremony.status());
-    Err(match handed {
-        Ok(()) => message,
-        Err(second) => format!("{message} ; {second}"),
-    })
+    stop_with_leaves(ceremony, publish, deposit, accepted, refusal, message)
 }
 
 /// The admission of the device: a plain peer, never an administrator, held to
@@ -838,7 +1154,7 @@ fn sign_delivery(
     vault: &AuthorityVault,
     opened: &astra_operator::authenticator::Opened,
     accepted: &AcceptedEnrollment,
-    accept: &Accept<'_>,
+    delivery: &Delivery<'_>,
     pin: &GatewayPin,
 ) -> Result<OperatorArtifact, (Refusal, String)> {
     use orion_core::enrollment_draft::{build_draft, resolve_negotiation_endpoint, DraftInput};
@@ -847,7 +1163,7 @@ fn sign_delivery(
     let unavailable =
         |error: admin::GatewayAdminError| (Refusal::GatewayUnavailable, error.to_string());
     let internal = |error: String| (Refusal::Internal, error);
-    let base = accept.gateway.ok_or_else(|| {
+    let base = delivery.gateway.ok_or_else(|| {
         internal("aucune gateway n'est connectée pour lire sa matière".to_string())
     })?;
     let request = &accepted.request;
@@ -860,7 +1176,7 @@ fn sign_delivery(
     .map_err(unavailable)?;
     pin.check(&material)?;
     let negotiation_endpoint =
-        resolve_negotiation_endpoint(accept.endpoint.trim(), None, material.negotiation_port)
+        resolve_negotiation_endpoint(delivery.endpoint.trim(), None, material.negotiation_port)
             .map_err(|error| internal(format!("{error:#}")))?;
     let draft = build_draft(DraftInput {
         request,
@@ -868,10 +1184,10 @@ fn sign_delivery(
         pq_certificate: &accepted.pq_certificate,
         material: &material,
         admission,
-        endpoint: accept.endpoint.trim(),
+        endpoint: delivery.endpoint.trim(),
         negotiation_endpoint,
-        allowed_ips: accept.allowed_ips,
-        ssh_target: accept.ssh_target,
+        allowed_ips: delivery.allowed_ips,
+        ssh_target: delivery.ssh_target,
         now_unix: now_unix(),
     })
     .map_err(|error| internal(format!("{error:#}")))?;

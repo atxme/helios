@@ -713,6 +713,7 @@ export type Refusal =
   | { refusal: 'gateway_forbidden' }
   | { refusal: 'gateway_refused'; status: number }
   | { refusal: 'acceptance_not_kept' }
+  | { refusal: 'accepted_elsewhere' }
   | { refusal: 'handoff_mismatch' }
   | { refusal: 'manifest_mismatch' }
   | { refusal: 'protocol_violation' }
@@ -929,6 +930,19 @@ export interface OperatorPendingOperation {
   campaign_fingerprint: string
   created_at: number
   expires_at: number
+}
+
+/** Une invitation du registre de ce poste, telle que l'écran Enrôlement la liste. */
+export interface InvitationView {
+  invitation_id: string
+  /** Libellé français : émise, consommée, révoquée ou expirée. */
+  state: string
+  not_after_unix: number
+  requested_name: string | null
+  /** `null` quand aucune gateway connectée n'a répondu, ou qu'il n'y a pas encore de poste. */
+  peer_admitted: boolean | null
+  /** Une acceptation conservée ici peut être reprise ; le registre ne dit pas si le document existe. */
+  resumable: boolean
 }
 
 /** What the screen shows of an enrollment invitation before it is confirmed. */

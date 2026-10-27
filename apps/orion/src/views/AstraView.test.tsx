@@ -14,6 +14,11 @@ const api = vi.hoisted(() => ({
   operatorPendingOperations: vi.fn(),
   dismissOperatorCeremony: vi.fn(),
   operatorOverview: vi.fn(),
+  operatorInvitations: vi.fn(),
+  operatorArtifacts: vi.fn(),
+  getState: vi.fn(),
+  getConfig: vi.fn(),
+  beginEnrollmentCeremony: vi.fn(),
 }))
 vi.mock('../api', () => api)
 
@@ -50,6 +55,10 @@ beforeEach(() => {
   vi.clearAllMocks()
   api.operatorCeremonyStatus.mockResolvedValue(null)
   api.operatorPendingOperations.mockResolvedValue([])
+  api.operatorInvitations.mockResolvedValue([])
+  api.operatorArtifacts.mockResolvedValue([])
+  api.getState.mockResolvedValue('down')
+  api.getConfig.mockResolvedValue({ profiles: [], selected: null })
   api.operatorOverview.mockResolvedValue({
     vault_path: 'C:\\astra\\vault.json',
     exists: false,
@@ -112,10 +121,16 @@ describe('AstraView', () => {
       'Rotations',
       'Gateways',
     ])
-    openTab('Enrôlement')
-    expect(screen.getByText(/arrivera dans une prochaine version/)).toBeTruthy()
     openTab('Gateways')
     expect(screen.getByText(/arrivera dans une prochaine version/)).toBeTruthy()
+  })
+
+  it('the_enrolment_tab_is_the_default_and_offers_both_gestures', async () => {
+    render(<AstraView />)
+    expect(screen.getByRole('tab', { name: 'Enrôlement' }).getAttribute('aria-selected')).toBe('true')
+    expect(await screen.findByText(/Aucun coffre opérateur/)).toBeTruthy()
+    expect(screen.getByRole('button', { name: /Inviter un poste/ })).toBeTruthy()
+    expect(screen.getByRole('button', { name: /Accepter une demande/ })).toBeTruthy()
   })
 
   it('the_rotation_flow_still_renders_under_rotations', () => {
@@ -143,6 +158,7 @@ describe('AstraView', () => {
       allowed: ['continue', 'cancel'],
     })
     render(<AstraView />)
+    openTab('Coffre et clés')
     fireEvent.click(await screen.findByRole('button', { name: 'Vérifier une clé' }))
     await waitFor(() => expect(screen.queryByRole('tab')).toBeNull())
     expect(screen.getByText('Une opération attend l’opérateur.')).toBeTruthy()

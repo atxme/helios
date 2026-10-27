@@ -351,6 +351,9 @@ pub enum Refusal {
     /// The leaves were issued and handed out, but could not be kept: the
     /// acceptance cannot be resumed.
     AcceptanceNotKept,
+    /// The invitation was consumed with no accepted request kept here: it was
+    /// accepted outside Orion, so its leaves are not on this machine to resume.
+    AcceptedElsewhere,
     /// Anything the ceremony could not classify. Deliberately last and
     /// deliberately opaque: an unclassified failure must not become a channel
     /// for text.
@@ -889,6 +892,10 @@ mod tests {
             (
                 Refusal::AcceptanceNotKept,
                 serde_json::json!({ "refusal": "acceptance_not_kept" }),
+            ),
+            (
+                Refusal::AcceptedElsewhere,
+                serde_json::json!({ "refusal": "accepted_elsewhere" }),
             ),
         ] {
             assert_eq!(serde_json::to_value(refusal).expect("refusal"), expected);

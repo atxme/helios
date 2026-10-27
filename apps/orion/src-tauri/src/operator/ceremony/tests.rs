@@ -1085,3 +1085,313 @@ fn accept_of<'a>(
         gateway,
     }
 }
+
+/// What the registry holds for one invitation, byte for byte: the record's
+/// state and the accepted file, which a resumption must leave as it found them.
+fn registry_snapshot(domain: &Domain, id: &Id16) -> (String, Vec<u8>) {
+    let state = format!("{:?}", domain.registry.load(id).expect("record").state);
+    let accepted = std::fs::read(
+        domain
+            .registry
+            .directory()
+            .join(format!("{}.accepted.json", id.to_hex())),
+    )
+    .unwrap_or_default();
+    (state, accepted)
+}
+
+/// An invitation consumed and accepted here: leaves issued and kept, as an
+/// interrupted acceptance leaves them.
+fn kept_acceptance(
+    domain: &Domain,
+    name: &str,
+) -> (Enrolment, astra_operator::enrollment::AcceptedEnrollment) {
+    let enrolment = domain.enrolment(name, true);
+    let accepted = issued_leaves(domain, &enrolment);
+    domain
+        .registry
+        .store_accepted(&enrolment.invitation.invitation_id, &accepted)
+        .expect("kept");
+    (enrolment, accepted)
+}
+
+fn resume_of<'a>(id: Id16, gateway: Option<&'a str>) -> Resume<'a> {
+    Resume {
+        invitation_id: id,
+        delivery: Delivery {
+            endpoint: "198.51.100.7:51820",
+            allowed_ips: None,
+            ssh_target: None,
+            gateway,
+        },
+    }
+}
+
+fn run_resume(
+    domain: &Domain,
+    id: Id16,
+    gateway: Option<&str>,
+    read: GatewayReader<'_>,
+    admitted: AdmittedReader<'_>,
+) -> (
+    Result<(), String>,
+    Vec<OperatorStatus>,
+    Vec<OperatorArtifact>,
+) {
+    let (presses, received) = std::sync::mpsc::channel::<Press>();
+    drop(presses);
+    let mut ceremony = Ceremony::new(
+        Id16::new([2; 16]).expect("id"),
+        OperationLocator {
+            kind: OperationKind::AcceptEnrollment,
+            operation_id: None,
+        },
+    );
+    let mut published = Vec::new();
+    let mut artifacts = Vec::new();
+    let outcome = resume(
+        &mut ceremony,
+        &received,
+        &mut |status| published.push(status),
+        &mut |artifact| artifacts.push(artifact),
+        &domain.vault_path,
+        &domain.registry,
+        resume_of(id, gateway),
+        read,
+        admitted,
+    );
+    (outcome, published, artifacts)
+}
+
+fn nothing_admitted(_: &str) -> Result<Vec<String>, orion_core::gateway_admin::GatewayAdminError> {
+    Ok(Vec::new())
+}
+
+/// A resumption finishes the delivery around the leaves already kept: it
+/// issues nothing, writes nothing to the registry, and with no gateway it
+/// stops before any key with the very files the acceptance would have handed
+/// over. The vault of these tests holds no issuer key a resumption could use,
+/// so a path that issued would not even compile a leaf: the registry state is
+/// what proves it.
+#[test]
+fn a_resumed_enrollment_never_reissues_leaves() {
+    let domain = Domain::new("resume-no-reissue").with_ca_tls();
+    let (enrolment, accepted) = kept_acceptance(&domain, "laptop");
+    let id = enrolment.invitation.invitation_id;
+    let before = registry_snapshot(&domain, &id);
+
+    let gesture_run = {
+        let (presses, received) = std::sync::mpsc::channel::<Press>();
+        drop(presses);
+        let mut published = Vec::new();
+        let mut artifacts = Vec::new();
+        let outcome = run_enrollment_with(
+            Id16::new([2; 16]).expect("id"),
+            EnrollmentGesture::Resume {
+                invitation_id: id,
+                endpoint: "198.51.100.7:51820".into(),
+                allowed_ips: None,
+                ssh_target: None,
+            },
+            None,
+            received,
+            &mut |status| published.push(status),
+            &mut |artifact| artifacts.push(artifact),
+            &domain.vault_path,
+            &domain.registry,
+        );
+        (outcome, published, artifacts)
+    };
+    let (outcome, published, artifacts) = gesture_run;
+    let error = outcome.expect_err("no gateway: the resumption stops");
+    assert!(!error.contains("pas encore porté"), "{error}");
+    let last = published.last().expect("a status");
+    assert_eq!(last.refusal, Some(Refusal::GatewayUnavailable));
+    assert_eq!(last.gesture, GestureState::Failed);
+    assert!(no_key_was_asked(&published));
+
+    let stem = enrolment.request.request_id.to_hex();
+    let names: Vec<&str> = artifacts.iter().map(|a| a.file_name.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            format!("{stem}-client-cert.der"),
+            format!("{stem}-client-pq-cert.json"),
+            "admission.txt".to_string()
+        ]
+    );
+    // The leaves handed over are the kept ones, not new ones.
+    let decoded = DerCertificate::parse(&artifacts[0].contents).expect("base64 of a DER");
+    assert_eq!(decoded.as_bytes(), accepted.tls_certificate.as_bytes());
+
+    assert_eq!(registry_snapshot(&domain, &id), before);
+    assert!(
+        domain
+            .registry
+            .consume(&id, &enrolment.request, now_unix())
+            .is_err(),
+        "the invitation stays consumed"
+    );
+}
+
+/// An invitation the command line accepted has no accepted request here: the
+/// resumption says so and asks for nothing.
+#[test]
+fn resuming_a_cli_acceptance_is_refused_with_a_reason() {
+    let domain = Domain::new("resume-cli").with_ca_tls();
+    let enrolment = domain.enrolment("laptop", true);
+    let id = enrolment.invitation.invitation_id;
+    domain
+        .registry
+        .consume(&id, &enrolment.request, now_unix())
+        .expect("consumed");
+    let (outcome, published, artifacts) = run_resume(
+        &domain,
+        id,
+        None,
+        &|_| unreachable_gateway(),
+        &nothing_admitted,
+    );
+    outcome.expect_err("nothing to resume");
+    assert_eq!(
+        published.last().expect("a status").refusal,
+        Some(Refusal::AcceptedElsewhere)
+    );
+    assert!(no_key_was_asked(&published));
+    assert!(artifacts.is_empty());
+}
+
+fn unreachable_gateway() -> Result<
+    orion_core::enrollment_draft::GatewayMaterial,
+    orion_core::gateway_admin::GatewayAdminError,
+> {
+    Err(orion_core::gateway_admin::GatewayAdminError::Unreachable)
+}
+
+#[test]
+fn resuming_an_unknown_or_unfinished_invitation_is_refused() {
+    let domain = Domain::new("resume-unknown").with_ca_tls();
+    let unknown = domain.enrolment("laptop", false);
+    let (_, published, artifacts) = run_resume(
+        &domain,
+        unknown.invitation.invitation_id,
+        None,
+        &|_| unreachable_gateway(),
+        &nothing_admitted,
+    );
+    assert_eq!(
+        published.last().expect("a status").refusal,
+        Some(Refusal::InvitationUnknown)
+    );
+    assert!(artifacts.is_empty());
+
+    let issued = domain.enrolment("tablet", true);
+    let (outcome, published, _) = run_resume(
+        &domain,
+        issued.invitation.invitation_id,
+        None,
+        &|_| unreachable_gateway(),
+        &nothing_admitted,
+    );
+    outcome.expect_err("an issued invitation has nothing to resume");
+    assert_eq!(
+        published.last().expect("a status").refusal,
+        Some(Refusal::Internal)
+    );
+    assert!(no_key_was_asked(&published));
+}
+
+/// The pin is checked as in the acceptance, before any key.
+#[test]
+fn a_resumption_against_another_gateway_is_refused_before_the_key() {
+    let domain = Domain::new("resume-pin").with_ca_tls();
+    let (enrolment, _) = kept_acceptance(&domain, "laptop");
+    let id = enrolment.invitation.invitation_id;
+    let other = aether::wg::generate_keypair().expect("keys").public_key;
+    let before = registry_snapshot(&domain, &id);
+    let (outcome, published, artifacts) = run_resume(
+        &domain,
+        id,
+        Some("http://gateway.invalid"),
+        &|_| answer(SERVER_NAME, &other),
+        &nothing_admitted,
+    );
+    outcome.expect_err("refused");
+    assert_eq!(
+        published.last().expect("a status").refusal,
+        Some(Refusal::HandoffMismatch)
+    );
+    assert!(no_key_was_asked(&published));
+    assert!(artifacts.is_empty());
+    assert_eq!(registry_snapshot(&domain, &id), before);
+}
+
+/// A peer the gateway already lists is not admitted again: the resumption goes
+/// straight to the key for the document. Declining there leaves everything as
+/// it was.
+#[test]
+fn an_admitted_peer_goes_straight_to_the_document_key() {
+    let domain = Domain::new("resume-admitted").with_ca_tls();
+    let (enrolment, accepted) = kept_acceptance(&domain, "laptop");
+    let id = enrolment.invitation.invitation_id;
+    let device = accepted.request.client_wg_public_key.to_base64();
+    let before = registry_snapshot(&domain, &id);
+
+    let (outcome, published, artifacts) = run_resume(
+        &domain,
+        id,
+        Some("http://gateway.invalid"),
+        &|_| answer(SERVER_NAME, &domain.gateway_key),
+        &|_| Ok(vec![device.clone()]),
+    );
+    outcome.expect("an abandonment is not a failure");
+    let asked = published
+        .iter()
+        .find(|status| matches!(status.gesture, GestureState::AwaitingKey { .. }))
+        .expect("the key is asked for");
+    assert!(matches!(
+        asked.manifest,
+        Some(AstraManifest::EnrollmentAcceptance(_))
+    ));
+    assert_eq!(
+        published.last().expect("a status").gesture,
+        GestureState::Cancelled
+    );
+    assert!(artifacts.is_empty());
+    assert_eq!(registry_snapshot(&domain, &id), before);
+
+    let resuming = prepare_resumption(
+        &domain.vault_path,
+        &domain.registry,
+        &resume_of(id, Some("http://gateway.invalid")),
+        &|_| answer(SERVER_NAME, &domain.gateway_key),
+        &|_| Ok(vec![device.clone()]),
+    )
+    .map_err(|(refusal, _)| refusal)
+    .expect("prepared");
+    assert!(resuming.admitted);
+    let resuming = prepare_resumption(
+        &domain.vault_path,
+        &domain.registry,
+        &resume_of(id, Some("http://gateway.invalid")),
+        &|_| answer(SERVER_NAME, &domain.gateway_key),
+        &nothing_admitted,
+    )
+    .map_err(|(refusal, _)| refusal)
+    .expect("prepared");
+    assert!(!resuming.admitted);
+}
+
+#[test]
+fn revoking_an_issued_invitation() {
+    let domain = Domain::new("revoke-issued").with_ca_tls();
+    let enrolment = domain.enrolment("laptop", true);
+    let id = enrolment.invitation.invitation_id;
+    crate::operator::invitations::revoke(&domain.registry, &id, now_unix()).expect("revoked");
+    assert_eq!(
+        domain.registry.load(&id).expect("record").state.label(),
+        "révoquée"
+    );
+    // Nothing is left to revoke twice, and a consumed invitation is not revocable.
+    assert!(crate::operator::invitations::revoke(&domain.registry, &id, now_unix()).is_err());
+}

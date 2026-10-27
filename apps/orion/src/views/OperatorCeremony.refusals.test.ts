@@ -19,4 +19,10 @@ describe('refusalSentence for the acceptance', () => {
     expect(refusalSentence({ refusal: 'gateway_unavailable' })).toMatch(/admission\.txt/)
     expect(refusalSentence({ refusal: 'acceptance_not_kept' })).toMatch(/reprise/)
   })
+
+  it('names_an_acceptance_made_outside_orion', () => {
+    expect(refusalSentence({ refusal: 'accepted_elsewhere' })).toBe(
+      "Cette invitation a été acceptée hors d'Orion : ses feuilles ne sont pas ici.",
+    )
+  })
 })

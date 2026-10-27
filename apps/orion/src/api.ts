@@ -16,6 +16,7 @@ import type {
   OperatorStatus,
   OperatorArtifact,
   EnrollmentGesture,
+  InvitationView,
   CertificateAction,
   CertificateActionState,
   ActionOutcome,
@@ -328,6 +329,13 @@ export const dismissOperatorCeremony = () => invoke<void>('dismiss_operator_cere
 
 export const operatorCeremonyStatus = () =>
   invoke<OperatorStatus | null>('operator_ceremony_status')
+
+/** Les invitations de ce poste ; `peer_admitted` vient de la gateway connectée, si elle répond. */
+export const operatorInvitations = () => invoke<InvitationView[]>('operator_invitations')
+
+/** Révoque une invitation émise. Aucune clé. */
+export const revokeInvitation = (invitationId: string) =>
+  invoke<void>('revoke_invitation', { invitationId })
 
 /** The operator vault and its trust domain, read without any key or PIN. */
 export const operatorOverview = () => invoke<VaultOverview>('operator_overview')

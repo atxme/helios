@@ -298,6 +298,8 @@ export function refusalSentence(refusal: Refusal): string {
         'acceptation ne pourra pas être reprise. Admettre le pair avec la ligne de ' +
         'admission.txt.'
       )
+    case 'accepted_elsewhere':
+      return "Cette invitation a été acceptée hors d'Orion : ses feuilles ne sont pas ici."
     case 'handoff_mismatch':
       return 'La proposition ne correspond pas à ce que ce coffre épingle.'
     case 'manifest_mismatch':
