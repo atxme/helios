@@ -308,3 +308,6 @@ impl RenewalProgress {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

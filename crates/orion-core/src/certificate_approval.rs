@@ -257,18 +257,4 @@ impl VerifiedApproval {
 }
 
 #[cfg(all(test, feature = "certificate-signing"))]
-mod tests {
-    use super::*;
-
-    /// Windows is where Orion actually runs, and there raw HID needs an
-    /// elevated process. A VPN client asking for administrator to renew a
-    /// certificate is the privilege nobody should grant.
-    #[test]
-    fn windows_speaks_to_the_key_through_the_platform() {
-        if cfg!(windows) {
-            assert_eq!(transport(), Transport::Platform);
-        } else {
-            assert_eq!(transport(), Transport::Hid);
-        }
-    }
-}
+mod tests;

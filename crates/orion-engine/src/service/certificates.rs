@@ -672,3 +672,7 @@ impl EngineService {
         Ok(invocation.arguments)
     }
 }
+
+#[cfg(test)]
+#[path = "certificates/tests.rs"]
+mod tests;
