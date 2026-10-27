@@ -16,8 +16,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use aether::certificates::encoding::{Fingerprint, Id16, WireGuardKey};
-use aether::key_negotiation::{verify_wireguard_proof, EnrollmentInvitation, EnrollmentRequest};
+use aether::certificates::encoding::{DerCertificate, Fingerprint, Id16, WireGuardKey};
+use aether::key_negotiation::{
+    verify_wireguard_proof, EnrollmentInvitation, EnrollmentRequest, PqCertificate,
+};
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -29,6 +31,9 @@ pub const REGISTRY_ENV: &str = "HELIOS_ENROLLMENT_REGISTRY";
 
 /// Largest record the registry reads back: an invitation is about 7 KiB.
 const MAX_RECORD_BYTES: u64 = 64 * 1024;
+
+/// Largest accepted-enrollment file read back: a request and two certificates.
+const MAX_ACCEPTED_BYTES: u64 = 256 * 1024;
 
 /// Where an invitation stands.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,6 +76,28 @@ impl InvitationState {
 pub struct IssuedLeafFingerprints {
     pub tls_certificate: Fingerprint,
     pub pq_certificate: Fingerprint,
+}
+
+/// An accepted request and the two leaves issued for it, kept so a gesture
+/// interrupted after issuance resumes without issuing again. Public material
+/// only: the request and public certificates carry no private key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcceptedEnrollment {
+    pub request: EnrollmentRequest,
+    pub tls_certificate: DerCertificate,
+    pub pq_certificate: PqCertificate,
+}
+
+impl AcceptedEnrollment {
+    fn fingerprints(&self) -> Result<IssuedLeafFingerprints> {
+        Ok(IssuedLeafFingerprints {
+            tls_certificate: self.tls_certificate.fingerprint(),
+            pq_certificate: aether::certificates::gateway::pq_certificate_fingerprint(
+                &self.pq_certificate,
+            )?,
+        })
+    }
 }
 
 /// An invitation and its state. Carries no secret.
@@ -339,6 +366,75 @@ impl InvitationRegistry {
     }
 
     /// Revokes an invitation that has not been consumed.
+    /// Keeps the accepted request and its leaves beside the invitation.
+    ///
+    /// Refused unless the invitation is `consumed` with `issued` equal to the
+    /// fingerprints of these very leaves.
+    pub fn store_accepted(&self, id: &Id16, accepted: &AcceptedEnrollment) -> Result<()> {
+        let _lock = ConsumptionLock::take(self, id)?;
+        self.check_accepted(id, accepted)?;
+        let path = self.accepted_path_of(id);
+        let bytes =
+            serde_json::to_vec_pretty(accepted).context("sérialisation de la demande acceptée")?;
+        aether::private_file::write_private_atomic(&path, &bytes)
+            .with_context(|| format!("écriture de {}", path.display()))
+    }
+
+    /// The accepted request and leaves kept for this invitation, if any.
+    ///
+    /// A file that does not match the record is an error, never an offer.
+    pub fn accepted(&self, id: &Id16) -> Result<Option<AcceptedEnrollment>> {
+        let path = self.accepted_path_of(id);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error).with_context(|| format!("lecture de {}", path.display()))
+            }
+        };
+        if !metadata.is_file() || metadata.len() > MAX_ACCEPTED_BYTES {
+            bail!(
+                "{} n'est pas une demande acceptée du registre",
+                path.display()
+            );
+        }
+        let bytes = fs::read(&path).with_context(|| format!("lecture de {}", path.display()))?;
+        let accepted: AcceptedEnrollment = serde_json::from_slice(&bytes).with_context(|| {
+            format!("{} n'est pas une demande acceptée lisible", path.display())
+        })?;
+        self.check_accepted(id, &accepted)?;
+        Ok(Some(accepted))
+    }
+
+    fn accepted_path_of(&self, id: &Id16) -> PathBuf {
+        self.directory
+            .join(format!("{}.accepted.json", id.to_hex()))
+    }
+
+    fn check_accepted(&self, id: &Id16, accepted: &AcceptedEnrollment) -> Result<()> {
+        let record = self.read(id)?;
+        let InvitationState::Consumed {
+            request_fingerprint,
+            issued,
+            ..
+        } = &record.state
+        else {
+            bail!(
+                "l'invitation {id} est {} : aucune demande acceptée ne peut lui être rattachée",
+                record.state.label()
+            );
+        };
+        if accepted.request.invitation_id != *id
+            || accepted.request.fingerprint() != *request_fingerprint
+        {
+            bail!("la demande acceptée ne correspond pas à l'invitation {id}");
+        }
+        if *issued != Some(accepted.fingerprints()?) {
+            bail!("les feuilles de l'invitation {id} ne correspondent pas à l'enregistrement");
+        }
+        Ok(())
+    }
+
     pub fn revoke(&self, id: &Id16, now_unix: u64) -> Result<()> {
         self.purge_lapsed(now_unix)?;
         let _lock = ConsumptionLock::take(self, id)?;

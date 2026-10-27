@@ -268,3 +268,155 @@ fn every_registry_command_purges_lapsed_invitations() {
     let raw = std::fs::read_to_string(registry.path_of(&lapsed.invitation_id)).expect("file");
     assert!(!raw.contains("proof_private_key"));
 }
+
+fn leaves(
+    seed: u8,
+) -> (
+    aether::certificates::encoding::DerCertificate,
+    aether::key_negotiation::PqCertificate,
+) {
+    let tls = aether::certificates::encoding::DerCertificate::new(vec![seed; 64]).expect("der");
+    let pq = aether::key_negotiation::PqCertificate {
+        version: aether::key_negotiation::PQ_CERTIFICATE_VERSION,
+        serial: [seed; aether::key_negotiation::KEY_NEGOTIATION_NONCE_LEN],
+        subject: "laptop-alice".into(),
+        issuer: "helios-ca-pq".into(),
+        role: aether::key_negotiation::PqCertificateRole::Client,
+        wireguard_public_key: STANDARD.encode([seed; 32]),
+        ml_dsa_87_public_key: STANDARD.encode(
+            vec![seed; aether::key_negotiation::ML_DSA_87_PUBLIC_KEY_LEN],
+        ),
+        not_before_unix: NOW,
+        not_after_unix: NOW + 100,
+        ml_dsa_87_signature: STANDARD
+            .encode(vec![seed; aether::key_negotiation::ML_DSA_87_SIGNATURE_LEN]),
+    };
+    (tls, pq)
+}
+
+fn fingerprints_of(
+    tls: &aether::certificates::encoding::DerCertificate,
+    pq: &aether::key_negotiation::PqCertificate,
+) -> IssuedLeafFingerprints {
+    IssuedLeafFingerprints {
+        tls_certificate: tls.fingerprint(),
+        pq_certificate: aether::certificates::gateway::pq_certificate_fingerprint(pq)
+            .expect("pq fingerprint"),
+    }
+}
+
+/// A consumed invitation whose leaves are recorded; returns what to store.
+fn accepted_invitation(
+    registry: &InvitationRegistry,
+    ca: &Ca,
+    id: u8,
+) -> (Id16, AcceptedEnrollment) {
+    let invitation = issued(registry, ca, id, false);
+    let client = request(&invitation, "laptop-alice");
+    registry
+        .consume(&invitation.invitation_id, &client.request, NOW)
+        .expect("consumed");
+    let (tls, pq) = leaves(id);
+    registry
+        .record_issued(&invitation.invitation_id, fingerprints_of(&tls, &pq))
+        .expect("recorded");
+    (
+        invitation.invitation_id,
+        AcceptedEnrollment {
+            request: client.request,
+            tls_certificate: tls,
+            pq_certificate: pq,
+        },
+    )
+}
+
+#[test]
+fn accepted_leaves_round_trip() {
+    let (_dir, registry) = registry();
+    let ca = ca();
+    let (id, accepted) = accepted_invitation(&registry, &ca, 1);
+    registry.store_accepted(&id, &accepted).expect("stored");
+    assert_eq!(registry.accepted(&id).expect("read"), Some(accepted));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = registry
+            .directory()
+            .join(format!("{}.accepted.json", id.to_hex()));
+        let mode = std::fs::metadata(path).expect("meta").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+}
+
+#[test]
+fn accepted_leaves_must_match_the_recorded_fingerprints() {
+    let (_dir, registry) = registry();
+    let ca = ca();
+    let (id, accepted) = accepted_invitation(&registry, &ca, 1);
+    let (other_tls, _) = leaves(9);
+    let mismatched = AcceptedEnrollment {
+        tls_certificate: other_tls,
+        ..accepted.clone()
+    };
+    assert!(registry.store_accepted(&id, &mismatched).is_err());
+    assert_eq!(registry.accepted(&id).expect("absent"), None);
+
+    registry.store_accepted(&id, &accepted).expect("stored");
+    let path = registry
+        .directory()
+        .join(format!("{}.accepted.json", id.to_hex()));
+    let mut tampered = serde_json::to_value(&accepted).expect("json");
+    tampered["tls_certificate"] = serde_json::to_value(leaves(9).0).expect("json");
+    std::fs::write(&path, serde_json::to_vec(&tampered).expect("bytes")).expect("write");
+    assert!(registry.accepted(&id).is_err());
+}
+
+#[test]
+fn an_issued_invitation_cannot_store_leaves() {
+    let (_dir, registry) = registry();
+    let ca = ca();
+    let (id, accepted) = accepted_invitation(&registry, &ca, 1);
+    let invitation = issued(&registry, &ca, 2, false);
+    assert!(registry
+        .store_accepted(&invitation.invitation_id, &accepted)
+        .is_err());
+    assert!(registry
+        .accepted(&invitation.invitation_id)
+        .expect("none")
+        .is_none());
+
+    // A stray file beside an invitation that is not consumed is never offered.
+    let stray = registry.directory().join(format!(
+        "{}.accepted.json",
+        invitation.invitation_id.to_hex()
+    ));
+    std::fs::write(&stray, serde_json::to_vec(&accepted).expect("bytes")).expect("write");
+    assert!(registry.accepted(&invitation.invitation_id).is_err());
+    let _ = id;
+}
+
+#[test]
+fn listing_ignores_accepted_files() {
+    let (_dir, registry) = registry();
+    let ca = ca();
+    let (id, accepted) = accepted_invitation(&registry, &ca, 1);
+    registry.store_accepted(&id, &accepted).expect("stored");
+    let listed = registry.list(NOW).expect("list");
+    assert_eq!(listed.len(), 1);
+}
+
+#[test]
+fn an_invitation_accepted_by_the_cli_lists_without_resume() {
+    let (_dir, registry) = registry();
+    let ca = ca();
+    let (id, _) = accepted_invitation(&registry, &ca, 1);
+    let listed = registry.list(NOW).expect("list");
+    assert!(matches!(
+        listed[0].state,
+        InvitationState::Consumed {
+            issued: Some(_),
+            ..
+        }
+    ));
+    assert_eq!(registry.accepted(&id).expect("none"), None);
+}
