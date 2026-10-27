@@ -512,6 +512,53 @@ slot encore actif dans un chevauchement existant, conserve le slot suivant et
 expire au plus tard à `not_after`. Après promotion, révocation ou suppression
 de l'ancien slot, il est refusé.
 
+#### Amendement du 27 octobre 2026 — l'enrôlement v5 se joue dans Orion (F14, lots 1 et 2)
+
+L'onglet *Astra* d'Orion devient l'espace opérateur. Les gestes d'enrôlement y
+sont servis par la cérémonie du processus opérateur, sous les mêmes invariants
+que les autres opérations : le moteur élevé n'ouvre pas le coffre et ne dépend
+pas d'`astra-operator` ; la WebView ne choisit pas ce qui est signé (genre de
+geste fermé, paramètres typés et validés en Rust, contenu public d'un fichier
+choisi, tout revérifié et montré dans le manifeste avant le toucher).
+
+- **Inviter un poste** (`invitation`) : lit la feuille PQ de la gateway connectée,
+  ou d'un fichier fourni si aucune gateway ne répond, et la vérifie sous `CA-PQ`
+  contre le relais du domaine avant toute clé. Une clé ; deux, dont la seconde
+  est un credential distinct, pour une réadmission. Produit `<nom>.helios-invite`.
+- **Accepter une demande** (`enrollment_acceptance`) : un seul geste. L'étape 1,
+  avant toute clé, porte les refus et le contrôle de la gateway connectée contre
+  l'identité épinglée par l'invitation. Puis, sous une ouverture de clé :
+  consommation de l'invitation avant l'émission (NEGOCIATION-DE-CLE-V5 §15.2),
+  émission des feuilles, conservation de l'acceptation (`<id>.accepted.json`),
+  admission du pair par l'API d'administration dans le tunnel avec `admin: false`
+  et le plancher ML-KEM, puis signature du document `.orion` avec la même
+  ouverture. Sans gateway, ou si elle refuse, le geste s'arrête après les feuilles
+  et remet `admission.txt` (la ligne `heliosd peer add …`) : l'URL d'administration
+  est toujours celle du profil connecté, jamais une saisie.
+- **Reprendre** : ne réémet jamais les feuilles ; revérifie la gateway, saute
+  l'admission d'un pair déjà admis, demande une clé pour signer le document. Une
+  acceptation faite hors d'Orion est refusée.
+- **Révoquer** une invitation émise : sans clé (la révocation ne fait que
+  restreindre), avec confirmation.
+- `verify_key` (« Vérifier une clé ») complète les genres d'opération.
+
+Ces gestes ajoutent trois genres à `OperationKind` (`verify_key`, `invitation`,
+`enrollment_acceptance`) et un champ `encoding` (`text` | `base64`) à
+`OperatorArtifact`, la feuille `.der` étant remise en octets bruts.
+
+La classe fermée `Refusal` reste sans texte : l'IHM porte la phrase française de
+chaque variante. Elle gagne `InvitationUnknown`, `InvitationConsumed`,
+`InvitationExpired`, `CaTlsMissing`, `GatewayForbidden` (401 ou 403 : le pair du
+poste opérateur doit porter le drapeau `admin`), `GatewayRefused { status }`,
+`AcceptanceNotKept` (feuilles remises mais non conservées : pas de reprise) et
+`AcceptedElsewhere`. `GatewayUnavailable` couvre « injoignable ou aucune gateway ».
+Ce que la gateway accorde au pair opérateur ne se vérifie pas dans le dépôt : à
+valider en recette (MANUAL-TESTING).
+
+`astra-signer` et `helios enroll document` restent livrés, à titre transitoire,
+jusqu'au lot 7 de F14. Les mentions de `astra-signer` plus haut dans cet ADR
+décrivent l'outil tel qu'il reste jusque-là.
+
 ### 8. Avortement, leases et atomicité logique
 
 Une transition gateway peut être avortée sans révocation seulement tant

@@ -658,41 +658,104 @@ Vérifier ensuite, dans l'onglet **Profils** :
 
 ### Enrôlement v5 de bout en bout (VM Windows)
 
-Ce parcours est le seul qui exerce DPAPI réel, une YubiKey réelle et le
-téléchargement dans WebView2 : aucun n'est joignable depuis WSL2 ni la CI.
-Prérequis : une gateway dotée d'un domaine de confiance (`astra-signer init`,
-`heliosd init-trust-domain`), un credential opérateur enregistré, Orion
-installé sur une VM Windows 11. Les commandes sont celles
-d'[OPERATOR-TOOLING §6](../security/OPERATOR-TOOLING.md#6-profil-client).
+Ce parcours est le seul qui exerce DPAPI réel, une YubiKey réelle, WebAuthn dans
+l'IHM non élevée, l'API d'administration d'une vraie gateway et le téléchargement
+dans WebView2 : aucun n'est joignable depuis WSL2 ni la CI. Tout ce qui suit est
+**à valider en recette** : rien n'en a été constaté sous Windows à ce jour.
 
-1. Poste opérateur : `astra-signer enroll invite --gateway-certificate … --out
-   poste.helios-invite`. La YubiKey doit demander un toucher ; noter
-   l'empreinte affichée.
-2. Orion, *Profils* → « Importer une invitation ». Vérifier que la gateway et
-   l'échéance sont celles attendues et que « Créer la demande » reste grisé
+Il se joue depuis Orion seul, côté opérateur comme côté client. Prérequis : une
+gateway dotée d'un domaine de confiance (`heliosd init-trust-domain`), un coffre
+opérateur avec au moins un credential enregistré (deux distincts pour le cas de
+réadmission), Orion installé sur une VM Windows 11 pour l'opérateur et sur une
+seconde pour le client (ou deux comptes). Le parcours est décrit dans
+[OPERATOR-TOOLING §6](../security/OPERATOR-TOOLING.md#6-profil-client).
+
+**A. Lot 1 : espace opérateur (sans enrôlement)**
+
+1. Orion, onglet *Astra* : six sous-onglets, « Enrôlement » ouvert par défaut
+   (« Gateways » n'affiche qu'un texte d'attente). Aucune clé n'est demandée à
+   l'ouverture.
+2. « Coffre et clés » : l'état du coffre (chemin, key-slots) s'affiche sans
+   toucher. Avec un coffre absent ou illisible, un message en français le dit,
+   et rien ne plante.
+3. « Vérifier une clé » : la YubiKey demande un toucher ; la clé enrôlée est
+   reconnue. Avec une clé non enrôlée, le refus est clair (clé non enrôlée) ;
+   en refusant le toucher, le refus est « clé déclinée ». Dans les deux cas
+   le coffre est inchangé.
+4. « Domaine » : le domaine de confiance affiché (identifiant, empreinte
+   `CA-PQ`) est celui du relais de la gateway.
+
+**B. Lot 2 : enrôlement**
+
+5. Orion opérateur, « Enrôlement » → « Inviter un poste… » : nom, durée par
+   défaut 24 h. Gateway connectée : la feuille PQ est lue d'elle, aucun fichier
+   à fournir. Un toucher ; enregistrer `poste.helios-invite` ; noter l'empreinte
+   affichée. Gateway déconnectée : le formulaire demande le fichier de la feuille
+   PQ (une feuille qui ne vérifie pas sous `CA-PQ` est refusée avant tout
+   toucher).
+6. Orion client, *Profils* → « Importer une invitation ». Vérifier que la gateway
+   et l'échéance sont celles attendues et que « Créer la demande » reste grisé
    tant que l'empreinte recopiée diffère — un seul caractère faux suffit.
    Espaces et casse ne comptent pas.
-3. Saisir l'empreinte juste et un nom, « Créer la demande ». « Enregistrer la
+7. Saisir l'empreinte juste et un nom, « Créer la demande ». « Enregistrer la
    demande » doit proposer un fichier `.helios-request` ; s'il ne se passe rien
    dans WebView2, le bouton de copie reste le recours, à signaler. La demande
    apparaît sous « Demandes en attente » et survit à un redémarrage d'Orion.
-4. Inspecter, depuis un terminal administrateur,
+8. Inspecter, depuis un terminal administrateur,
    `%ProgramData%\helios\orion\<SID>\identities` (sous Linux, le dossier de
    données par défaut ; `ORION_IDENTITY_DIR` n'est lue qu'en build de
    développement) : aucune clé privée en clair, les fichiers de la
    demande en attente sont des blobs DPAPI. Les rouvrir sous un
    autre compte Windows doit échouer.
-5. Poste opérateur : `astra-signer enroll accept`, puis la ligne
-   `heliosd peer add` imprimée, sur la gateway ; `helios enroll document`,
-   puis `astra-signer enroll sign-document`.
-6. Orion, « Importer » le `.orion` signé : le profil devient connectable. Fermer
-   Orion **sans enregistrer**, le rouvrir et réimporter le même document : il
-   doit se compléter de nouveau. « Enregistrer » ensuite : la demande disparaît
-   de la liste, et la connexion ML-KEM aboutit.
+9. Orion opérateur, « Accepter une demande… » : choisir le `.helios-request`,
+   renseigner l'adresse publique de la gateway, « Vérifier et accepter ». Pour
+   le cas nominal (gateway connectée, pair opérateur `admin`, voir l'étape 13) :
+   **un seul toucher** enchaîne consommation de l'invitation, émission des
+   feuilles, admission du pair et signature ; l'IHM propose le `.orion`.
+   Constater sur la gateway que le pair du client est admis, sans `admin`, avec
+   le plancher ML-KEM.
+10. Orion client, « Importer » le `.orion` signé : le profil devient
+    connectable. Fermer Orion **sans enregistrer**, le rouvrir et réimporter le
+    même document : il doit se compléter de nouveau. « Enregistrer » ensuite :
+    la demande disparaît de la liste, et la connexion ML-KEM aboutit.
+11. **Gateway injoignable** (arrêter `heliosd` ou déconnecter le profil
+    opérateur), puis refaire une invitation et « Accepter une demande… » : le
+    geste s'arrête après les feuilles avec une phrase qui renvoie à
+    `admission.txt`. Les artefacts proposés sont les deux feuilles et
+    `admission.txt`. Vérifier que la feuille `.der` téléchargée est du DER brut
+    (`openssl x509 -inform der -in <id>-client-cert.der -noout -subject`), pas du
+    texte base64. Rétablir la gateway, coller la ligne `heliosd peer add …` de
+    `admission.txt` en console sur la gateway, constater que le pair est admis.
+12. **Reprise** : dans la liste des invitations, « Reprendre » sur l'invitation
+    de l'étape 11. Orion revérifie la gateway, saute l'admission si le pair est
+    déjà admis (cas après l'étape 11), demande **une** seule clé et produit le
+    `.orion` ; aucune feuille n'est réémise (comparer leurs empreintes à celles
+    de l'étape 11). Importer le `.orion` côté client comme à l'étape 10. Refaire
+    « Reprendre » sans collage préalable de la ligne : Orion admet alors le pair
+    lui-même.
+13. **Drapeau `admin` du poste opérateur** — non vérifiable dans le dépôt : ce
+    que la gateway exige exactement de ce pair se constate en recette. Observer
+    avant l'étape 9, en console sur la gateway, la liste des pairs
+    (`helios peer list` ; que la liste montre le drapeau `admin` est à confirmer sur la version installée) : le pair du
+    poste opérateur doit porter `admin`. Preuve par l'absurde : avec un pair
+    opérateur **sans** `admin`, « Accepter une demande… » doit s'arrêter après
+    les feuilles et Orion afficher la phrase du refus `GatewayForbidden`
+    (« le pair de ce poste doit porter le drapeau `admin` … admission.txt »),
+    puis se terminer comme à l'étape 11.
 
 À vérifier aussi, chacun refusé en clair et sans effet :
 
-- réutiliser l'invitation consommée pour une seconde demande, côté `accept` ;
+- réutiliser l'invitation consommée pour une seconde demande : refus « déjà
+  consommée » avant tout toucher, qui oriente vers « Reprendre » ;
+- une invitation expirée ou inconnue de ce poste : refus nommé, rien consommé ;
+- « Reprendre » sur une acceptation faite par la CLI (`astra-signer enroll
+  accept`, transitoire) : refus « acceptée hors d'Orion » ;
+- gateway connectée dont l'identité diffère de celle épinglée par l'invitation :
+  refus avant tout toucher, invitation intacte ;
+- « Révoquer » une invitation émise : confirmation demandée, aucun toucher,
+  puis l'acceptation de sa demande est refusée ;
+- une réadmission avec un seul credential, ou deux fois le même : refusée
+  (clé répétée) ;
 - importer le `.orion` d'un autre poste : brouillon non connectable ;
 - importer un ancien document v1 Helios portant une clé privée : refus qui
   renvoie vers une invitation v5 ;

@@ -108,6 +108,16 @@ un **contrat à finir d'implémenter**, pas une description du système.
 >   avec le code de production. Aucune de ses mesures n'existe aujourd'hui ; si
 >   V1 échoue, le repli de [§12.3](#123-politique-de-renouvellement) s'applique.
 >
+> **Amendement du 2026-10-27 — l'enrôlement opérateur passe par Orion (F14, lots 1
+> et 2).** Sur la branche `feat/f14-orion-seul-client`, non fusionnée, les gestes
+> `invite`, `accept` (avec l'admission du pair par l'API d'administration dans le
+> tunnel, `admin: false`, plancher ML-KEM), la signature du document, la reprise et
+> la révocation se font dans Orion, onglet *Astra* ; voir
+> [OPERATOR-TOOLING §6](../security/OPERATOR-TOOLING.md#6-profil-client). Les
+> mentions de `astra-signer enroll` et de `helios enroll document` ci-dessous
+> décrivent la CLI, **transitoire** jusqu'au lot 7. Le parcours Orion est à valider
+> en recette sous Windows.
+>
 > **Amendement du 2026-10-23 — enrôlement sans clé privée.** Le
 > [§15](#15-enrôlement) est implémenté sur la branche `feat/v5-enrolement`, non
 > fusionnée. L'invitation, l'acceptation et la signature du document sont des

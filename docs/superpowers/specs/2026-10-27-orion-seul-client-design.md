@@ -266,3 +266,49 @@ reste celle d'`InvitationRegistry`.
   qu'Orion ne dépend pas du binaire `tools/helios`.
 - La forme exacte des écrans au sein de la direction artistique actuelle.
 - Le découpage de chaque lot en tâches.
+
+## 11. Amendements du 27 octobre 2026 (lots 1 et 2 réalisés)
+
+Précisions issues de la réalisation ; elles priment sur le §6 là où elles
+diffèrent. Validation sous Windows : à valider en recette.
+
+- **Onglet par défaut** : « Enrôlement » ouvre l'onglet *Astra*. « Coffre et clés »
+  montre l'état du coffre et « Vérifier une clé » (`verify_key`) ; « Domaine »
+  montre le domaine ; « Gateways » n'est qu'un texte d'attente.
+- **Étape 1 avant toute clé** : en plus des refus de la demande, si la gateway
+  connectée répond, son identité (clé WireGuard, et `server_name` s'il est épinglé)
+  est comparée à celle que l'invitation épingle ; une différence est refusée
+  `HandoffMismatch` sans rien consommer. Injoignable : on continue et le geste
+  s'arrête après les feuilles. L'identité est recomparée à l'admission.
+- **Inviter** : la feuille PQ vient de la gateway connectée, ou d'un fichier si
+  aucune gateway ne répond (et non « du relais » seul) ; elle est vérifiée sous
+  `CA-PQ` contre le relais avant toute clé.
+- **Admission** : `admin: false` et plancher ML-KEM. Sans gateway ou sur refus, le
+  geste s'arrête après les feuilles ; les artefacts sont les deux feuilles et
+  `admission.txt` (la ligne `heliosd peer add …`). Sinon le `.orion` est signé
+  avec la même ouverture de clé.
+- **Reprendre** : ne réémet jamais les feuilles, revérifie la gateway, saute
+  l'admission d'un pair déjà admis, demande une clé. Est reprenable toute
+  invitation dont l'acceptation est conservée ici (`<id>.accepted.json`) ; le
+  registre ne sait pas si un document a déjà été produit, donc « Reprendre » sur
+  une acceptation achevée ne fait que re-signer un document. Une acceptation faite
+  par la CLI est refusée (`AcceptedElsewhere`).
+- **Contrat** : la classe fermée `Refusal` gagne, sans texte, `InvitationUnknown`,
+  `InvitationConsumed`, `InvitationExpired`, `CaTlsMissing`, `GatewayForbidden`,
+  `GatewayRefused { status }`, `AcceptanceNotKept` et `AcceptedElsewhere` (la
+  phrase française de chacune est dans l'IHM) ; `GatewayUnavailable` reste pour
+  « injoignable ou aucune gateway ». `OperationKind` gagne `verify_key`,
+  `invitation` et `enrollment_acceptance`. `OperatorArtifact` gagne `encoding`
+  (`text` | `base64`) : la feuille `.der` est remise en base64 marqué, décodée
+  par l'IHM avant l'écriture, pour que `heliosd peer add --certificate` lise le
+  DER brut.
+- **Lecture du coffre** : une clé `CA-PQ` illisible rend une erreur (fail-closed),
+  pas un domaine vide.
+- **Réseau** : `orion_core::gateway_admin` (admission, lecture de la gateway) est
+  appelé par le client d'Orion (10 s de connexion, 20 s au total) ; la cérémonie,
+  sur un fil standard, passe par `tauri::async_runtime::block_on`, jamais depuis
+  un fil du runtime. `Refused { status, reason }` borne la raison de la gateway
+  (200 caractères, sans caractère de contrôle). L'assemblage du brouillon
+  (`orion_core::enrollment_draft`) est partagé avec `helios enroll document`.
+  `shell_word` et la ligne d'admission vivent dans `astra_operator::admission`.
+- **`helios enroll document`** : reste construit et fonctionnel jusqu'au lot 7.
