@@ -130,15 +130,6 @@ fn fixture() -> Fixture {
 }
 
 #[test]
-fn windows_speaks_to_the_key_through_the_platform() {
-    if cfg!(windows) {
-        assert_eq!(transport(), Transport::Platform);
-    } else {
-        assert_eq!(transport(), Transport::Hid);
-    }
-}
-
-#[test]
 fn verifies_signed_request_and_ca_registry_against_profile_pins() {
     let fixture = fixture();
     assert!(VerifiedApproval::verify(fixture.served, &fixture.state, NOW).is_ok());

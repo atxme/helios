@@ -243,7 +243,7 @@ async fn failed_resume_keeps_the_existing_renewal_session_and_candidate_intact()
     let scratch = Scratch::new("renewal-resume-retains-session");
     let service = service(&scratch);
     let original_settings = key_negotiation("original-sealed-identity");
-    let mut store = prepared_renewal_store(scratch.0.join("trust.json"));
+    let store = prepared_renewal_store(scratch.0.join("trust.json"));
     store.save().expect("initial trust state persists");
     let persisted_before = std::fs::read(scratch.0.join("trust.json")).expect("trust bytes");
     let session = orion_core::certificate_renewal::RenewalSession::prepare(
