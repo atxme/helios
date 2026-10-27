@@ -127,7 +127,8 @@ fn off_windows_the_dialog_belongs_to_the_console() {
 fn verify_key_is_served() {
     let missing =
         std::env::temp_dir().join(format!("orion-verify-key-{}-absent", std::process::id()));
-    let (_presses, received) = std::sync::mpsc::channel::<Press>();
+    let (presses, received) = std::sync::mpsc::channel::<Press>();
+    drop(presses);
     let mut published = Vec::new();
     let outcome = run_with_vault(
         Id16::new([1; 16]).expect("id"),
@@ -292,7 +293,8 @@ impl Drop for Domain {
 #[test]
 fn an_invitation_needs_a_gateway_leaf() {
     let domain = Domain::new("no-leaf");
-    let (_presses, received) = std::sync::mpsc::channel::<Press>();
+    let (presses, received) = std::sync::mpsc::channel::<Press>();
+    drop(presses);
     let (outcome, published, artifacts) = domain.invite(false, None, received);
     outcome.expect_err("no leaf, no invitation");
     let last = published.last().expect("a status");
@@ -316,7 +318,8 @@ fn a_leaf_for_another_gateway_is_refused() {
         domain.leaf(SERVER_NAME, &other_key),
         "not a leaf".to_string(),
     ] {
-        let (_presses, received) = std::sync::mpsc::channel::<Press>();
+        let (presses, received) = std::sync::mpsc::channel::<Press>();
+        drop(presses);
         let (outcome, published, artifacts) = domain.invite(false, Some(leaf), received);
         outcome.expect_err("another gateway's leaf is refused");
         let last = published.last().expect("a status");
@@ -379,4 +382,103 @@ fn readmission_asks_for_two_distinct_keys() {
 fn the_second_key_is_a_second_approval() {
     assert_eq!(invitation_key_purpose(1), KeyPurpose::OpenVault);
     assert_eq!(invitation_key_purpose(2), KeyPurpose::SecondApproval);
+}
+
+fn material(
+    server_name: &str,
+    key: &str,
+    leaf: &str,
+) -> orion_core::enrollment_draft::GatewayMaterial {
+    orion_core::enrollment_draft::GatewayMaterial {
+        server_name: server_name.into(),
+        gateway_ca_der: String::new(),
+        gateway_pq_certificate: leaf.into(),
+        wireguard_public_key: key.into(),
+        pq_certificate_sha256: String::new(),
+        negotiation_port: None,
+    }
+}
+
+/// A connected gateway that answers for another identity than the relay names
+/// is refused, and the leaf the operator supplied is not a way around it.
+#[test]
+fn a_connected_gateway_for_another_identity_is_refused_without_fallback() {
+    let domain = Domain::new("connected-other");
+    let leaf = domain.leaf(SERVER_NAME, &domain.gateway_key);
+    let key = WireGuardKey::parse(&domain.gateway_key).expect("key");
+    let other_key = aether::wg::generate_keypair().expect("key").public_key;
+    for answered in [
+        material("elsewhere.example", &domain.gateway_key, &leaf),
+        material(SERVER_NAME, &other_key, &leaf),
+    ] {
+        let refused = leaf_from(Some(&leaf), Some(Ok(answered)), SERVER_NAME, &key)
+            .expect_err("another identity is refused");
+        assert_eq!(refused.0, Refusal::HandoffMismatch);
+    }
+    let accepted = leaf_from(
+        None,
+        Some(Ok(material(SERVER_NAME, &domain.gateway_key, &leaf))),
+        SERVER_NAME,
+        &key,
+    );
+    assert!(accepted.is_ok());
+}
+
+/// An unreachable connected gateway falls back to the supplied leaf, which is
+/// still verified under `CA-PQ` afterwards: a bad one is refused before a key.
+#[test]
+fn an_unreachable_gateway_falls_back_to_the_supplied_leaf_and_it_is_verified() {
+    let domain = Domain::new("unreachable");
+    // A port nothing listens on: the real client fails to connect.
+    let closed = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        format!("http://127.0.0.1:{port}")
+    };
+    let run = |leaf: Option<String>| {
+        let (presses, received) = std::sync::mpsc::channel::<Press>();
+        drop(presses);
+        let mut published = Vec::new();
+        let outcome = run_enrollment_with(
+            Id16::new([2; 16]).expect("id"),
+            EnrollmentGesture::Invite {
+                valid_for_hours: 2,
+                allow_readmission: false,
+                name: "laptop".into(),
+                gateway_pq_certificate: leaf,
+            },
+            Some(closed.clone()),
+            received,
+            &mut |status| published.push(status),
+            &mut |_| {},
+            &domain.vault_path,
+            &domain.registry,
+        );
+        (outcome, published)
+    };
+
+    let good = domain.leaf(SERVER_NAME, &domain.gateway_key);
+    let (outcome, published) = run(Some(good));
+    // Accepted as far as a key being asked for; the sender is dropped, so the
+    // ceremony ends cancelled rather than failed.
+    outcome.expect("the supplied leaf is used");
+    assert!(published
+        .iter()
+        .any(|status| matches!(status.gesture, GestureState::AwaitingKey { .. })));
+
+    let bad = domain.leaf("elsewhere.example", &domain.gateway_key);
+    let (outcome, published) = run(Some(bad));
+    outcome.expect_err("the fallback leaf is verified");
+    assert_eq!(
+        published.last().expect("status").refusal,
+        Some(Refusal::HandoffMismatch)
+    );
+
+    let (outcome, published) = run(None);
+    outcome.expect_err("nothing to fall back to");
+    assert_eq!(
+        published.last().expect("status").refusal,
+        Some(Refusal::GatewayUnavailable)
+    );
+    assert!(domain.registry_is_empty());
 }

@@ -410,29 +410,45 @@ fn gateway_leaf(
 ) -> Result<PqCertificate, (Refusal, String)> {
     use orion_core::gateway_admin as admin;
 
+    let read = invite.gateway.map(|base| {
+        admin::orion_client()
+            .and_then(|client| {
+                tauri::async_runtime::block_on(admin::gateway_negotiation(&client, base))
+            })
+            .map_err(|error| error.to_string())
+    });
+    leaf_from(invite.sheet, read, server_name, gateway_key)
+}
+
+/// The decision of [`gateway_leaf`], on what the connected gateway answered
+/// (`None` when no gateway is connected).
+fn leaf_from(
+    sheet: Option<&str>,
+    read: Option<Result<orion_core::enrollment_draft::GatewayMaterial, String>>,
+    server_name: &str,
+    gateway_key: &WireGuardKey,
+) -> Result<PqCertificate, (Refusal, String)> {
+    use orion_core::gateway_admin as admin;
+
     let mut unreadable = None;
-    if let Some(base) = invite.gateway {
-        let read = admin::orion_client().and_then(|client| {
-            tauri::async_runtime::block_on(admin::gateway_negotiation(&client, base))
-        });
-        match read {
-            Ok(material) => {
-                let same_key = WireGuardKey::parse(material.wireguard_public_key.trim())
-                    .map(|key| key == *gateway_key)
-                    .unwrap_or(false);
-                if material.server_name.trim() != server_name || !same_key {
-                    return Err((
-                        Refusal::HandoffMismatch,
-                        "la gateway connectée n'est pas celle que le domaine nomme".to_string(),
-                    ));
-                }
-                return admin::decode_pq_certificate(&material.gateway_pq_certificate)
-                    .map_err(|error| (Refusal::HandoffMismatch, error.to_string()));
+    match read {
+        Some(Ok(material)) => {
+            let same_key = WireGuardKey::parse(material.wireguard_public_key.trim())
+                .map(|key| key == *gateway_key)
+                .unwrap_or(false);
+            if material.server_name.trim() != server_name || !same_key {
+                return Err((
+                    Refusal::HandoffMismatch,
+                    "la gateway connectée n'est pas celle que le domaine nomme".to_string(),
+                ));
             }
-            Err(error) => unreadable = Some(error.to_string()),
+            return admin::decode_pq_certificate(&material.gateway_pq_certificate)
+                .map_err(|error| (Refusal::HandoffMismatch, error.to_string()));
         }
+        Some(Err(message)) => unreadable = Some(message),
+        None => {}
     }
-    match (invite.sheet, unreadable) {
+    match (sheet, unreadable) {
         (Some(sheet), _) => admin::decode_pq_certificate(sheet)
             .map_err(|error| (Refusal::HandoffMismatch, error.to_string())),
         (None, Some(message)) => Err((Refusal::GatewayUnavailable, message)),

@@ -175,6 +175,17 @@ pub struct OperatorArtifact {
 /// The files of one session, written by its ceremony and read by the window.
 type Artifacts = std::sync::Arc<std::sync::Mutex<Vec<OperatorArtifact>>>;
 
+/// Keeps a produced file for the window.
+///
+/// A poisoned lock is recovered, not skipped: the list holds plain values, and
+/// dropping here would lose an invitation already signed and recorded.
+fn deposit(artifacts: &Artifacts, artifact: OperatorArtifact) {
+    artifacts
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(artifact);
+}
+
 /// The live ceremony, for as long as one is open.
 struct Session {
     presses: std::sync::mpsc::Sender<Press>,
@@ -236,11 +247,7 @@ impl OperatorCeremony {
                 gateway,
                 presses,
                 publish,
-                &mut |artifact| {
-                    if let Ok(mut held) = artifacts.lock() {
-                        held.push(artifact);
-                    }
-                },
+                &mut |artifact| deposit(artifacts, artifact),
             )
         })
         .await
@@ -252,8 +259,8 @@ impl OperatorCeremony {
             Some(session) => session
                 .artifacts
                 .lock()
-                .map(|held| held.clone())
-                .unwrap_or_default(),
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
             None => Vec::new(),
         }
     }
@@ -594,5 +601,30 @@ mod tests {
     #[tokio::test]
     async fn artifacts_are_empty_without_a_session() {
         assert!(OperatorCeremony::default().artifacts().await.is_empty());
+    }
+
+    /// A thread that panicked holding the list must not cost the operator an
+    /// invitation that is already signed and recorded.
+    #[test]
+    fn a_poisoned_artifact_list_still_keeps_the_invitation() {
+        let artifacts = Artifacts::default();
+        let poisoner = artifacts.clone();
+        let _ = std::thread::spawn(move || {
+            let _held = poisoner.lock().expect("lock");
+            panic!("poisoning on purpose");
+        })
+        .join();
+        assert!(artifacts.is_poisoned());
+        deposit(
+            &artifacts,
+            OperatorArtifact {
+                file_name: "a.helios-invite".into(),
+                contents: "x".into(),
+            },
+        );
+        let held = artifacts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(held.len(), 1);
     }
 }
