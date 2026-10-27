@@ -521,11 +521,11 @@ pas d'`astra-operator` ; la WebView ne choisit pas ce qui est signé (genre de
 geste fermé, paramètres typés et validés en Rust, contenu public d'un fichier
 choisi, tout revérifié et montré dans le manifeste avant le toucher).
 
-- **Inviter un poste** (`invitation`) : lit la feuille PQ de la gateway connectée,
+- **Inviter un poste** (`invite_enrollment`) : lit la feuille PQ de la gateway connectée,
   ou d'un fichier fourni si aucune gateway ne répond, et la vérifie sous `CA-PQ`
   contre le relais du domaine avant toute clé. Une clé ; deux, dont la seconde
   est un credential distinct, pour une réadmission. Produit `<nom>.helios-invite`.
-- **Accepter une demande** (`enrollment_acceptance`) : un seul geste. L'étape 1,
+- **Accepter une demande** (`accept_enrollment`) : un seul geste. L'étape 1,
   avant toute clé, porte les refus et le contrôle de la gateway connectée contre
   l'identité épinglée par l'invitation. Puis, sous une ouverture de clé :
   consommation de l'invitation avant l'émission (NEGOCIATION-DE-CLE-V5 §15.2),
@@ -542,7 +542,8 @@ choisi, tout revérifié et montré dans le manifeste avant le toucher).
   restreindre), avec confirmation.
 - `verify_key` (« Vérifier une clé ») complète les genres d'opération.
 
-Ces gestes ajoutent trois genres à `OperationKind` (`verify_key`, `invitation`,
+Ces gestes ajoutent trois genres à `OperationKind` (`verify_key`,
+`invite_enrollment`, `accept_enrollment` ; manifestes `key_check`, `invitation`,
 `enrollment_acceptance`) et un champ `encoding` (`text` | `base64`) à
 `OperatorArtifact`, la feuille `.der` étant remise en octets bruts.
 

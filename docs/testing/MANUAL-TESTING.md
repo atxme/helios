@@ -735,9 +735,9 @@ seconde pour le client (ou deux comptes). Le parcours est décrit dans
     lui-même.
 13. **Drapeau `admin` du poste opérateur** — non vérifiable dans le dépôt : ce
     que la gateway exige exactement de ce pair se constate en recette. Observer
-    avant l'étape 9, en console sur la gateway, la liste des pairs
-    (`helios peer list` ; que la liste montre le drapeau `admin` est à confirmer sur la version installée) : le pair du
-    poste opérateur doit porter `admin`. Preuve par l'absurde : avec un pair
+    avant d'accepter la demande (étape 9), en console sur la gateway, la liste
+    des pairs (`helios peer list`, qui marque les pairs administrateurs) : le pair
+    du poste opérateur doit porter `admin`. Preuve par l'absurde : avec un pair
     opérateur **sans** `admin`, « Accepter une demande… » doit s'arrêter après
     les feuilles et Orion afficher la phrase du refus `GatewayForbidden`
     (« le pair de ce poste doit porter le drapeau `admin` … admission.txt »),

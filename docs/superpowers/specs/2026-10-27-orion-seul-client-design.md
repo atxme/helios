@@ -298,7 +298,8 @@ diffèrent. Validation sous Windows : à valider en recette.
   `GatewayRefused { status }`, `AcceptanceNotKept` et `AcceptedElsewhere` (la
   phrase française de chacune est dans l'IHM) ; `GatewayUnavailable` reste pour
   « injoignable ou aucune gateway ». `OperationKind` gagne `verify_key`,
-  `invitation` et `enrollment_acceptance`. `OperatorArtifact` gagne `encoding`
+  `invite_enrollment` et `accept_enrollment` (manifestes `key_check`,
+  `invitation` et `enrollment_acceptance`). `OperatorArtifact` gagne `encoding`
   (`text` | `base64`) : la feuille `.der` est remise en base64 marqué, décodée
   par l'IHM avant l'écriture, pour que `heliosd peer add --certificate` lise le
   DER brut.
