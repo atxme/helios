@@ -64,10 +64,11 @@ fn key_negotiation(identity: &str) -> orion_core::KeyNegotiationSettings {
 }
 
 fn profile(name: &str, kind: ProfileKind) -> ClientProfile {
-    let mut profile = ClientProfile::default();
-    profile.name = name.into();
-    profile.profile_type = Some(kind);
-    profile
+    ClientProfile {
+        name: name.into(),
+        profile_type: Some(kind),
+        ..ClientProfile::default()
+    }
 }
 
 fn prepared_renewal_store(path: PathBuf) -> orion_core::certificates::TrustStore {
