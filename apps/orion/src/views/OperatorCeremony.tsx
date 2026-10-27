@@ -246,7 +246,7 @@ function gestureSentence(gesture: GestureState, operation: OperationKind): strin
 }
 
 /** Why it stopped. Typed, so the words are ours. */
-function refusalSentence(refusal: Refusal): string {
+export function refusalSentence(refusal: Refusal): string {
   switch (refusal.refusal) {
     case 'vault_unavailable':
       return 'Coffre d’autorité absent, illisible, ou étranger à ce domaine.'
@@ -266,7 +266,38 @@ function refusalSentence(refusal: Refusal): string {
     case 'authority_refused':
       return `L’autorité a décliné${refusal.status ? ` (${refusal.status})` : ''}.`
     case 'gateway_unavailable':
-      return 'La gateway n’a pas admis l’invitation, ou n’a pas pu être lue.'
+      return (
+        'La gateway n’est pas connectée ou n’a pas pu être lue. Les feuilles sont émises : ' +
+        'admettre le pair avec la ligne de admission.txt, puis reprendre depuis la liste des ' +
+        'invitations.'
+      )
+    case 'invitation_unknown':
+      return 'Cette invitation est inconnue de ce poste : la demande n’a rien consommé.'
+    case 'invitation_consumed':
+      return 'Cette invitation est déjà consommée : la reprendre depuis la liste des invitations.'
+    case 'invitation_expired':
+      return 'Cette invitation a expiré ou n’est plus ouverte : en émettre une nouvelle.'
+    case 'ca_tls_missing':
+      return (
+        'Le relais de domaine ne porte aucun CA-TLS : l’émission de CA-TLS doit précéder ' +
+        'l’acceptation des demandes.'
+      )
+    case 'gateway_forbidden':
+      return (
+        'La gateway refuse cette machine : le pair de ce poste doit porter le drapeau `admin`. ' +
+        'Les feuilles sont émises : admettre le pair avec la ligne de admission.txt.'
+      )
+    case 'gateway_refused':
+      return (
+        `La gateway a refusé l’admission (HTTP ${refusal.status}). Les feuilles sont émises : ` +
+        'admettre le pair avec la ligne de admission.txt.'
+      )
+    case 'acceptance_not_kept':
+      return (
+        'Les feuilles sont émises et remises, mais n’ont pas pu être conservées : cette ' +
+        'acceptation ne pourra pas être reprise. Admettre le pair avec la ligne de ' +
+        'admission.txt.'
+      )
     case 'handoff_mismatch':
       return 'La proposition ne correspond pas à ce que ce coffre épingle.'
     case 'manifest_mismatch':

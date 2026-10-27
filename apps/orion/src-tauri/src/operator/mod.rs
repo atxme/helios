@@ -170,6 +170,21 @@ impl EnrollmentGesture {
 pub struct OperatorArtifact {
     pub file_name: String,
     pub contents: String,
+    pub encoding: ArtifactEncoding,
+}
+
+/// How `contents` is to be written to disk.
+///
+/// The IPC contract stays textual; a file of raw bytes (a DER leaf, which
+/// `heliosd peer add` reads as is) travels as base64 and is decoded by the
+/// window before it writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactEncoding {
+    /// Written as is.
+    Text,
+    /// Base64 of the bytes to write.
+    Base64,
 }
 
 /// The files of one session, written by its ceremony and read by the window.
@@ -620,6 +635,7 @@ mod tests {
             OperatorArtifact {
                 file_name: "a.helios-invite".into(),
                 contents: "x".into(),
+                encoding: ArtifactEncoding::Text,
             },
         );
         let held = artifacts

@@ -334,6 +334,23 @@ pub enum Refusal {
     /// The gateway did not admit the invitation or could not be read. It
     /// carries no text: whatever the gateway said stays in its own log.
     GatewayUnavailable,
+    /// The invitation a request names is not in this machine's registry.
+    InvitationUnknown,
+    /// The invitation was already consumed: the acceptance is resumed, not redone.
+    InvitationConsumed,
+    /// The invitation is past its window or no longer open.
+    InvitationExpired,
+    /// The domain relay carries no `CA-TLS`: its issuance must come first.
+    CaTlsMissing,
+    /// The gateway answered 401 or 403: this machine's peer lacks the `admin`
+    /// flag.
+    GatewayForbidden,
+    /// The gateway refused the request with this HTTP status. It carries no
+    /// text: whatever the gateway said stays in its own log.
+    GatewayRefused { status: u16 },
+    /// The leaves were issued and handed out, but could not be kept: the
+    /// acceptance cannot be resumed.
+    AcceptanceNotKept,
     /// Anything the ceremony could not classify. Deliberately last and
     /// deliberately opaque: an unclassified failure must not become a channel
     /// for text.
@@ -848,5 +865,33 @@ mod tests {
             serde_json::to_value(Refusal::GatewayUnavailable).expect("refusal"),
             serde_json::json!({ "refusal": "gateway_unavailable" })
         );
+    }
+
+    #[test]
+    fn the_acceptance_refusals_carry_no_text() {
+        for (refusal, expected) in [
+            (
+                Refusal::InvitationUnknown,
+                serde_json::json!({ "refusal": "invitation_unknown" }),
+            ),
+            (
+                Refusal::CaTlsMissing,
+                serde_json::json!({ "refusal": "ca_tls_missing" }),
+            ),
+            (
+                Refusal::GatewayForbidden,
+                serde_json::json!({ "refusal": "gateway_forbidden" }),
+            ),
+            (
+                Refusal::GatewayRefused { status: 409 },
+                serde_json::json!({ "refusal": "gateway_refused", "status": 409 }),
+            ),
+            (
+                Refusal::AcceptanceNotKept,
+                serde_json::json!({ "refusal": "acceptance_not_kept" }),
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(refusal).expect("refusal"), expected);
+        }
     }
 }

@@ -627,7 +627,7 @@ fn a_request_for_an_unknown_invitation_is_refused_before_the_key() {
     outcome.expect_err("an unknown invitation is refused");
     let last = published.last().expect("a status");
     assert_eq!(last.gesture, GestureState::Failed);
-    assert_eq!(last.refusal, Some(Refusal::HandoffMismatch));
+    assert_eq!(last.refusal, Some(Refusal::InvitationUnknown));
     assert!(no_key_was_asked(&published));
     assert!(artifacts.is_empty());
     assert!(domain.registry_is_empty());
@@ -644,6 +644,10 @@ fn a_relay_without_ca_tls_is_refused_before_the_key() {
     let (outcome, published, _) = domain.accept(&enrolment.request, None, received);
     let error = outcome.expect_err("no CA-TLS, no leaf");
     assert!(error.contains("CA-TLS"), "{error}");
+    assert_eq!(
+        published.last().expect("a status").refusal,
+        Some(Refusal::CaTlsMissing)
+    );
     assert!(no_key_was_asked(&published));
     let record = domain
         .registry
@@ -676,6 +680,10 @@ fn accepting_a_consumed_invitation_points_to_resume() {
     assert_eq!(
         error,
         "Cette invitation est déjà consommée : la reprendre depuis la liste des invitations."
+    );
+    assert_eq!(
+        published.last().expect("a status").refusal,
+        Some(Refusal::InvitationConsumed)
     );
     assert!(no_key_was_asked(&published));
     assert!(artifacts.is_empty());
@@ -809,6 +817,8 @@ fn keep_and_admit_on(
             &mut |artifact| artifacts.push(artifact),
             accepted,
             gateway,
+            &pin_of(domain, accepted),
+            &read_negotiation,
         )
     });
     (outcome, published, artifacts)
@@ -845,7 +855,21 @@ fn an_unreachable_gateway_stops_after_the_leaves() {
                 "admission.txt".to_string()
             ]
         );
-        assert_eq!(artifacts[0].contents, accepted.tls_certificate.to_base64());
+        assert_eq!(
+            artifacts[0].encoding,
+            crate::operator::ArtifactEncoding::Base64
+        );
+        assert_eq!(
+            artifacts[1].encoding,
+            crate::operator::ArtifactEncoding::Text
+        );
+        assert_eq!(
+            artifacts[2].encoding,
+            crate::operator::ArtifactEncoding::Text
+        );
+        // Decoded, the first artifact is the DER `heliosd peer add` reads raw.
+        let decoded = DerCertificate::parse(&artifacts[0].contents).expect("base64 of a DER");
+        assert_eq!(decoded.as_bytes(), accepted.tls_certificate.as_bytes());
         let leaf: aether::key_negotiation::PqCertificate =
             serde_json::from_str(&artifacts[1].contents).expect("the PQ leaf is JSON");
         assert_eq!(leaf, accepted.pq_certificate);
@@ -904,5 +928,160 @@ fn the_document_is_named_after_a_safe_requested_name() {
             document_file_name(hostile, &id),
             format!("{}.orion", id.to_hex())
         );
+    }
+}
+
+fn pin_of(
+    domain: &Domain,
+    accepted: &astra_operator::enrollment::AcceptedEnrollment,
+) -> GatewayPin {
+    let record = domain
+        .registry
+        .load(&accepted.request.invitation_id)
+        .expect("record");
+    GatewayPin::of(&record.invitation)
+}
+
+fn answer(
+    server_name: &str,
+    key: &str,
+) -> Result<
+    orion_core::enrollment_draft::GatewayMaterial,
+    orion_core::gateway_admin::GatewayAdminError,
+> {
+    Ok(material(server_name, key, ""))
+}
+
+/// The connected gateway is the one the invitation pins, or nothing is
+/// consumed: a gateway for another identity is refused before the key.
+#[test]
+fn a_gateway_other_than_the_pinned_one_is_refused_before_the_key() {
+    let domain = Domain::new("accept-pin").with_ca_tls();
+    let enrolment = domain.enrolment("laptop", true);
+    let other_key = aether::wg::generate_keypair().expect("key").public_key;
+    let gateway_key = domain.gateway_key.clone();
+    for (name, key) in [
+        (SERVER_NAME, other_key.as_str()),
+        ("elsewhere.example", gateway_key.as_str()),
+    ] {
+        let refused = prepare_acceptance(
+            &domain.vault_path,
+            &domain.registry,
+            &accept_of(&enrolment.request, Some("http://gateway.invalid")),
+            now_unix(),
+            &|_| answer(name, key),
+        )
+        .err()
+        .expect("another identity is refused");
+        assert_eq!(refused.0, Refusal::HandoffMismatch);
+        assert_eq!(
+            domain
+                .registry
+                .load(&enrolment.invitation.invitation_id)
+                .expect("record")
+                .state,
+            astra_operator::enrollment::InvitationState::Issued
+        );
+    }
+    let accepted = prepare_acceptance(
+        &domain.vault_path,
+        &domain.registry,
+        &accept_of(&enrolment.request, Some("http://gateway.invalid")),
+        now_unix(),
+        &|_| answer(SERVER_NAME, &gateway_key),
+    );
+    assert!(accepted.is_ok());
+}
+
+/// A gateway that does not answer is not a reason to refuse: the acceptance
+/// goes on to the key, and stops after the leaves.
+#[test]
+fn an_unreachable_gateway_still_reaches_the_key() {
+    let domain = Domain::new("accept-pin-unreachable").with_ca_tls();
+    let enrolment = domain.enrolment("laptop", true);
+    let closed = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        format!(
+            "http://127.0.0.1:{}",
+            listener.local_addr().expect("addr").port()
+        )
+    };
+    let (presses, received) = std::sync::mpsc::channel::<Press>();
+    drop(presses);
+    let (outcome, published, _) = domain.accept(&enrolment.request, Some(closed), received);
+    outcome.expect("abandoned at the key, not refused");
+    assert!(!no_key_was_asked(&published));
+}
+
+/// At admission the gateway is compared to the pin again: a mismatch stops
+/// after the leaves, with the line to admit the peer by hand, and admits nothing.
+#[test]
+fn a_gateway_that_changed_identity_is_not_admitted_to() {
+    let domain = Domain::new("accept-readmit-pin").with_ca_tls();
+    let enrolment = domain.enrolment("laptop", true);
+    let accepted = issued_leaves(&domain, &enrolment);
+    let other_key = aether::wg::generate_keypair().expect("key").public_key;
+    let mut ceremony = Ceremony::new(
+        Id16::new([2; 16]).expect("id"),
+        OperationLocator {
+            kind: OperationKind::AcceptEnrollment,
+            operation_id: None,
+        },
+    );
+    let mut published = Vec::new();
+    let mut artifacts = Vec::new();
+    let outcome = admit_or_stop(
+        &mut ceremony,
+        &mut |status| published.push(status),
+        &mut |artifact| artifacts.push(artifact),
+        &accepted,
+        Some("http://gateway.invalid"),
+        &pin_of(&domain, &accepted),
+        &|_| answer(SERVER_NAME, &other_key),
+    );
+    outcome.expect_err("refused");
+    assert_eq!(
+        published.last().expect("status").refusal,
+        Some(Refusal::HandoffMismatch)
+    );
+    assert_eq!(artifacts.len(), 3);
+}
+
+/// Each way the gateway can say no is its own typed refusal.
+#[test]
+fn the_gateway_errors_are_told_apart() {
+    use orion_core::gateway_admin::GatewayAdminError as E;
+    assert_eq!(gateway_refusal(&E::Forbidden), Refusal::GatewayForbidden);
+    assert_eq!(
+        gateway_refusal(&E::Refused {
+            status: 409,
+            reason: None
+        }),
+        Refusal::GatewayRefused { status: 409 }
+    );
+    assert_eq!(
+        gateway_refusal(&E::Unreachable),
+        Refusal::GatewayUnavailable
+    );
+    assert_eq!(
+        gateway_refusal(&E::Invalid("x".into())),
+        Refusal::GatewayUnavailable
+    );
+}
+
+fn accept_of<'a>(
+    request: &aether::key_negotiation::EnrollmentRequest,
+    gateway: Option<&'a str>,
+) -> Accept<'a> {
+    // Leaked for the test's length: `Accept` borrows the request text.
+    let text: &'static str =
+        Box::leak(aether::key_negotiation::encode_request_file(request).into_boxed_str());
+    Accept {
+        request: text,
+        validity_days: 365,
+        endpoint: "198.51.100.7:51820",
+        allowed_ips: None,
+        ssh_target: None,
+        gateway,
     }
 }

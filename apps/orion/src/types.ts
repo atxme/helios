@@ -706,6 +706,13 @@ export type Refusal =
   | { refusal: 'window_expired' }
   | { refusal: 'authority_refused'; status: number }
   | { refusal: 'gateway_unavailable' }
+  | { refusal: 'invitation_unknown' }
+  | { refusal: 'invitation_consumed' }
+  | { refusal: 'invitation_expired' }
+  | { refusal: 'ca_tls_missing' }
+  | { refusal: 'gateway_forbidden' }
+  | { refusal: 'gateway_refused'; status: number }
+  | { refusal: 'acceptance_not_kept' }
   | { refusal: 'handoff_mismatch' }
   | { refusal: 'manifest_mismatch' }
   | { refusal: 'protocol_violation' }
@@ -896,6 +903,8 @@ export type EnrollmentGesture =
 export interface OperatorArtifact {
   file_name: string
   contents: string
+  /** `base64` : `contents` est l'encodage d'octets bruts (feuille DER) à décoder avant d'écrire. */
+  encoding: 'text' | 'base64'
 }
 
 /**

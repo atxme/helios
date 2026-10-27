@@ -32,7 +32,7 @@ use aether_fido::authenticator::{Authenticator, DialogOwner};
 use astra_operator::enrollment::{AcceptedEnrollment, InvitationRegistry};
 use astra_operator::vault::AuthorityVault;
 
-use super::{EnrollmentGesture, OperatorArtifact};
+use super::{ArtifactEncoding, EnrollmentGesture, OperatorArtifact};
 
 /// One button pressed in the window: what it asks, the status it answers, and
 /// the window the press came from.
@@ -347,6 +347,7 @@ fn invite(
             deposit(OperatorArtifact {
                 file_name: format!("{}.helios-invite", invite.name),
                 contents: encode_invitation_file(&invitation),
+                encoding: ArtifactEncoding::Text,
             });
             ceremony.gesture = GestureState::Done;
             publish(ceremony.status());
@@ -386,6 +387,75 @@ struct Accepting {
     ca_tls_certificate: DerCertificate,
     request: EnrollmentRequest,
     leaf_validity: (u64, u64),
+    pin: GatewayPin,
+}
+
+/// The gateway an invitation was issued for: what a connected gateway must
+/// answer to before anything is consumed on its account or admitted to it.
+struct GatewayPin {
+    wg_public_key: WireGuardKey,
+    server_name: String,
+}
+
+impl GatewayPin {
+    fn of(invitation: &aether::key_negotiation::EnrollmentInvitation) -> Self {
+        Self {
+            wg_public_key: invitation.gateway_wg_public_key,
+            server_name: invitation.server_name.clone(),
+        }
+    }
+
+    /// Whether `material` is the pinned gateway. An unreadable key is a
+    /// mismatch, never a pass.
+    fn matches(&self, material: &orion_core::enrollment_draft::GatewayMaterial) -> bool {
+        let same_key = WireGuardKey::parse(material.wireguard_public_key.trim())
+            .map(|key| key == self.wg_public_key)
+            .unwrap_or(false);
+        same_key && material.server_name.trim() == self.server_name
+    }
+
+    fn check(
+        &self,
+        material: &orion_core::enrollment_draft::GatewayMaterial,
+    ) -> Result<(), (Refusal, String)> {
+        if self.matches(material) {
+            Ok(())
+        } else {
+            Err((
+                Refusal::HandoffMismatch,
+                "la gateway connectée n'est pas celle que l'invitation épingle".to_string(),
+            ))
+        }
+    }
+}
+
+type GatewayReader<'a> = &'a dyn Fn(
+    &str,
+) -> Result<
+    orion_core::enrollment_draft::GatewayMaterial,
+    orion_core::gateway_admin::GatewayAdminError,
+>;
+
+/// Reads the gateway's negotiation material with the Orion client.
+fn read_negotiation(
+    base: &str,
+) -> Result<
+    orion_core::enrollment_draft::GatewayMaterial,
+    orion_core::gateway_admin::GatewayAdminError,
+> {
+    use orion_core::gateway_admin as admin;
+    let client = admin::orion_client()?;
+    tauri::async_runtime::block_on(admin::gateway_negotiation(&client, base))
+}
+
+/// The typed refusal of a gateway error. The French sentence is the window's.
+fn gateway_refusal(error: &orion_core::gateway_admin::GatewayAdminError) -> Refusal {
+    use orion_core::gateway_admin::GatewayAdminError as E;
+    match error {
+        E::Forbidden => Refusal::GatewayForbidden,
+        E::Refused { status, .. } => Refusal::GatewayRefused { status: *status },
+        E::Unreachable | E::Invalid(_) => Refusal::GatewayUnavailable,
+    }
 }
 
 /// §15.2, the acceptance: verify the request, consume its invitation and issue
@@ -406,7 +476,8 @@ fn accept(
     accept: Accept<'_>,
 ) -> Result<(), String> {
     let now = now_unix();
-    let accepting = match prepare_acceptance(vault_path, registry, &accept, now) {
+    let accepting = match prepare_acceptance(vault_path, registry, &accept, now, &read_negotiation)
+    {
         Ok(accepting) => accepting,
         Err((refusal, message)) => {
             ceremony.refuse(refusal);
@@ -419,6 +490,7 @@ fn accept(
         ca_tls_certificate,
         request,
         leaf_validity,
+        pin,
     } = accepting;
 
     // Shown before any key is asked for anything, and it states what the
@@ -496,9 +568,17 @@ fn accept(
         publish(ceremony.status());
         return Err(format!("{error:#}"));
     }
-    admit_or_stop(ceremony, publish, deposit, &accepted, accept.gateway)?;
+    admit_or_stop(
+        ceremony,
+        publish,
+        deposit,
+        &accepted,
+        accept.gateway,
+        &pin,
+        &read_negotiation,
+    )?;
 
-    match sign_delivery(registry, &vault, &opened, &accepted, &accept) {
+    match sign_delivery(registry, &vault, &opened, &accepted, &accept, &pin) {
         Ok(artifact) => {
             deposit(artifact);
             ceremony.gesture = GestureState::Done;
@@ -521,6 +601,7 @@ fn prepare_acceptance(
     registry: &InvitationRegistry,
     accept: &Accept<'_>,
     now: u64,
+    read: GatewayReader<'_>,
 ) -> Result<Accepting, (Refusal, String)> {
     use astra_operator::enrollment::InvitationState;
 
@@ -533,7 +614,8 @@ fn prepare_acceptance(
         .ca_tls_certificate
         .as_deref()
         .ok_or_else(|| {
-            mismatch(
+            (
+                Refusal::CaTlsMissing,
                 "le relais de domaine ne porte aucun CA-TLS : l'émission de CA-TLS doit précéder \
                  l'acceptation des demandes"
                     .to_string(),
@@ -560,9 +642,10 @@ fn prepare_acceptance(
         .ok_or_else(|| mismatch("durée de validité hors bornes".to_string()))?;
 
     let record = registry.load(&request.invitation_id).map_err(|error| {
-        mismatch(format!(
-            "cette invitation est inconnue de ce poste : {error:#}"
-        ))
+        (
+            Refusal::InvitationUnknown,
+            format!("cette invitation est inconnue de ce poste : {error:#}"),
+        )
     })?;
     let ca_pq_public_key = MlDsa87PublicKey::parse(vault.ca_pq_public_key.trim())
         .map_err(|error| mismatch(error.to_string()))?;
@@ -574,21 +657,26 @@ fn prepare_acceptance(
     match &record.state {
         InvitationState::Issued => {}
         InvitationState::Consumed { .. } => {
-            return Err(mismatch(
+            return Err((
+                Refusal::InvitationConsumed,
                 "Cette invitation est déjà consommée : la reprendre depuis la liste des \
                  invitations."
                     .to_string(),
             ))
         }
         other => {
-            return Err(mismatch(format!(
-                "cette invitation est {} : elle n'admet plus aucune demande",
-                other.label()
-            )))
+            return Err((
+                Refusal::InvitationExpired,
+                format!(
+                    "cette invitation est {} : elle n'admet plus aucune demande",
+                    other.label()
+                ),
+            ))
         }
     }
     if !record.invitation.is_open_at(now) {
-        return Err(mismatch(
+        return Err((
+            Refusal::InvitationExpired,
             "cette invitation a expiré : en émettre une nouvelle".to_string(),
         ));
     }
@@ -598,11 +686,20 @@ fn prepare_acceptance(
         ))
     })?;
 
+    // A connected gateway must be the one the invitation names, before a key
+    // is touched. One that does not answer is not a reason to refuse: the
+    // acceptance then stops after the leaves.
+    let pin = GatewayPin::of(&record.invitation);
+    if let Some(Ok(material)) = accept.gateway.map(read) {
+        pin.check(&material)?;
+    }
+
     Ok(Accepting {
         vault,
         ca_tls_certificate,
         request,
         leaf_validity: (now.saturating_sub(LEAF_BACKDATE_SECS), not_after),
+        pin,
     })
 }
 
@@ -622,7 +719,7 @@ fn keep_leaves(
         Ok(()) => Ok(()),
         Err(error) => {
             let handed = hand_over_leaves(deposit, accepted);
-            ceremony.refuse(Refusal::Internal);
+            ceremony.refuse(Refusal::AcceptanceNotKept);
             publish(ceremony.status());
             Err(match handed {
                 Ok(()) => format!(
@@ -638,36 +735,43 @@ fn keep_leaves(
 /// Steps 4 and 5: admits the peer on the connected gateway, or stops after the
 /// leaves with the line that admits it by hand.
 ///
-/// `Err` is a stop, already published as [`Refusal::GatewayUnavailable`] with
-/// the gateway's reason in French as the message.
+/// `Err` is a stop, already published as a typed refusal (the gateway's, or a
+/// pin mismatch), with the reason as the message for the log.
 fn admit_or_stop(
     ceremony: &mut Ceremony,
     publish: &mut dyn FnMut(OperatorStatus),
     deposit: &mut dyn FnMut(OperatorArtifact),
     accepted: &AcceptedEnrollment,
     gateway: Option<&str>,
+    pin: &GatewayPin,
+    read: GatewayReader<'_>,
 ) -> Result<(), String> {
     use orion_core::gateway_admin as admin;
 
-    let admitted = match gateway {
-        None => Err(
-            "aucune gateway n'est connectée : admettre le pair avec la ligne fournie, \
-                     puis reprendre depuis la liste des invitations"
+    let admitted: Result<(), (Refusal, String)> = match gateway {
+        None => Err((
+            Refusal::GatewayUnavailable,
+            "aucune gateway n'est connectée : admettre le pair avec la ligne fournie, puis \
+             reprendre depuis la liste des invitations"
                 .to_string(),
-        ),
-        Some(base) => admission_of(accepted).and_then(|admission| {
-            admin::orion_client()
-                .and_then(|client| {
-                    tauri::async_runtime::block_on(admin::admit_peer(&client, base, &admission))
-                })
-                .map_err(|error| error.to_string())
-        }),
+        )),
+        Some(base) => read(base)
+            .map_err(|error| (gateway_refusal(&error), error.to_string()))
+            .and_then(|material| pin.check(&material))
+            .and_then(|()| admission_of(accepted).map_err(|message| (Refusal::Internal, message)))
+            .and_then(|admission| {
+                admin::orion_client()
+                    .and_then(|client| {
+                        tauri::async_runtime::block_on(admin::admit_peer(&client, base, &admission))
+                    })
+                    .map_err(|error| (gateway_refusal(&error), error.to_string()))
+            }),
     };
-    let Err(message) = admitted else {
+    let Err((refusal, message)) = admitted else {
         return Ok(());
     };
     let handed = hand_over_leaves(deposit, accepted);
-    ceremony.refuse(Refusal::GatewayUnavailable);
+    ceremony.refuse(refusal);
     publish(ceremony.status());
     Err(match handed {
         Ok(()) => message,
@@ -712,14 +816,17 @@ fn hand_over_leaves(
     deposit(OperatorArtifact {
         file_name: tls_name,
         contents: accepted.tls_certificate.to_base64(),
+        encoding: ArtifactEncoding::Base64,
     });
     deposit(OperatorArtifact {
         file_name: pq_name,
         contents: pq,
+        encoding: ArtifactEncoding::Text,
     });
     deposit(OperatorArtifact {
         file_name: "admission.txt".to_string(),
         contents: format!("{line}\n"),
+        encoding: ArtifactEncoding::Text,
     });
     Ok(())
 }
@@ -732,6 +839,7 @@ fn sign_delivery(
     opened: &astra_operator::authenticator::Opened,
     accepted: &AcceptedEnrollment,
     accept: &Accept<'_>,
+    pin: &GatewayPin,
 ) -> Result<OperatorArtifact, (Refusal, String)> {
     use orion_core::enrollment_draft::{build_draft, resolve_negotiation_endpoint, DraftInput};
     use orion_core::gateway_admin as admin;
@@ -750,6 +858,7 @@ fn sign_delivery(
         &request.client_wg_public_key.to_base64(),
     ))
     .map_err(unavailable)?;
+    pin.check(&material)?;
     let negotiation_endpoint =
         resolve_negotiation_endpoint(accept.endpoint.trim(), None, material.negotiation_port)
             .map_err(|error| internal(format!("{error:#}")))?;
@@ -785,6 +894,7 @@ fn sign_delivery(
     Ok(OperatorArtifact {
         file_name: document_file_name(&request.requested_name, &request.request_id),
         contents,
+        encoding: ArtifactEncoding::Text,
     })
 }
 
