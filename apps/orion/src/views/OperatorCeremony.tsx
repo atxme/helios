@@ -38,6 +38,9 @@ const TITLES: Record<OperationKind, string> = {
   rotate_client_tls_ca: 'Renouveler la CA-TLS cliente',
   rotate_anchor: 'Renouveler l’ancre du domaine',
   revoke_certificate: 'Révoquer un certificat',
+  verify_key: 'Vérifier la clé opérateur',
+  invite_enrollment: 'Inviter un poste',
+  accept_enrollment: 'Accepter une invitation',
 }
 
 /** The verb of the button that goes through with it, per operation. */
@@ -48,6 +51,9 @@ const VERBS: Record<OperationKind, string> = {
   rotate_client_tls_ca: 'Signer avec la clé',
   rotate_anchor: 'Signer avec la clé',
   revoke_certificate: 'Révoquer avec la clé',
+  verify_key: 'Vérifier avec la clé',
+  invite_enrollment: 'Inviter avec la clé',
+  accept_enrollment: 'Accepter avec la clé',
 }
 
 function instant(unix: number): string {
@@ -153,6 +159,25 @@ function rowsOf(manifest: AstraManifest): [string, string][] {
         ['effet', instant(manifest.effective_at)],
         ['domaine', manifest.trust_domain_id],
       ]
+    case 'key_check':
+      return [['coffre', manifest.vault_fingerprint]]
+    case 'invitation':
+      return [
+        ['nom serveur', manifest.server_name],
+        ['gateway', manifest.gateway_wg_public_key],
+        ['échéance', instant(manifest.not_after_unix)],
+        ['réadmission', manifest.allow_readmission ? 'autorisée' : 'refusée'],
+        ['CA-PQ', manifest.ca_pq_fingerprint],
+      ]
+    case 'enrollment_acceptance':
+      return [
+        ['invitation', manifest.invitation_id],
+        ['nom demandé', manifest.requested_name],
+        ['clé publique', manifest.client_wg_public_key],
+        ['empreinte', manifest.request_fingerprint],
+        ['échéance des certificats', instant(manifest.leaves_not_after_unix)],
+        ['point d’accès', manifest.endpoint],
+      ]
   }
 }
 
@@ -240,6 +265,8 @@ function refusalSentence(refusal: Refusal): string {
       return 'La fenêtre de l’opération s’est refermée. En rouvrir une.'
     case 'authority_refused':
       return `L’autorité a décliné${refusal.status ? ` (${refusal.status})` : ''}.`
+    case 'gateway_unavailable':
+      return 'La gateway n’a pas admis l’invitation, ou n’a pas pu être lue.'
     case 'handoff_mismatch':
       return 'La proposition ne correspond pas à ce que ce coffre épingle.'
     case 'manifest_mismatch':

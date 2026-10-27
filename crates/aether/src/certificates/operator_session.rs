@@ -47,7 +47,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::encoding::{Fingerprint, Id16, TrustDomainId};
+use super::encoding::{Fingerprint, Id16, TrustDomainId, WireGuardKey};
 use super::status::AstraRotationCampaign;
 
 /// Protocol version carried by the first frame.
@@ -109,6 +109,13 @@ pub enum OperationKind {
     RotateAnchor,
     /// §10.2: a certificate withdrawn before its term.
     RevokeCertificate,
+    /// A touch of the operator key that opens the vault and proves it is the
+    /// one this workstation expects; nothing leaves the machine.
+    VerifyKey,
+    /// §15.2: an invitation a gateway admits, signed with the vault.
+    InviteEnrollment,
+    /// §15.2: the acceptance of an invitation, which issues the first leaves.
+    AcceptEnrollment,
 }
 
 /// What the WebView is allowed to name.
@@ -324,6 +331,9 @@ pub enum Refusal {
     ProtocolViolation,
     /// The operator abandoned before the point of no return.
     Cancelled,
+    /// The gateway did not admit the invitation or could not be read. It
+    /// carries no text: whatever the gateway said stays in its own log.
+    GatewayUnavailable,
     /// Anything the ceremony could not classify. Deliberately last and
     /// deliberately opaque: an unclassified failure must not become a channel
     /// for text.
@@ -343,6 +353,9 @@ pub enum AstraManifest {
     IssuerAuthorization(IssuerManifest),
     CaRotation(CaRotationManifest),
     Revocation(RevocationManifest),
+    KeyCheck(KeyCheckManifest),
+    Invitation(InvitationManifest),
+    EnrollmentAcceptance(AcceptanceManifest),
 }
 
 impl AstraManifest {
@@ -353,20 +366,59 @@ impl AstraManifest {
             Self::IssuerAuthorization(_) => OperationKind::AuthorizeIssuer,
             Self::CaRotation(manifest) => manifest.kind(),
             Self::Revocation(_) => OperationKind::RevokeCertificate,
+            Self::KeyCheck(_) => OperationKind::VerifyKey,
+            Self::Invitation(_) => OperationKind::InviteEnrollment,
+            Self::EnrollmentAcceptance(_) => OperationKind::AcceptEnrollment,
         }
     }
 
-    /// The domain every manifest names, so Orion can refuse one that belongs
-    /// to another domain before showing a single field of it.
-    pub fn trust_domain_id(&self) -> TrustDomainId {
+    /// The domain a manifest names, so Orion can refuse one that belongs to
+    /// another domain before showing a single field of it. The enrollment
+    /// manifests name none — the vault and the invitation bind them — so they
+    /// return `None` and the caller must not read that as a match.
+    pub fn trust_domain_id(&self) -> Option<TrustDomainId> {
         match self {
-            Self::Recovery(manifest) => manifest.trust_domain_id,
-            Self::Campaign(manifest) => manifest.campaign.trust_domain_id,
-            Self::IssuerAuthorization(manifest) => manifest.trust_domain_id,
-            Self::CaRotation(manifest) => manifest.trust_domain_id,
-            Self::Revocation(manifest) => manifest.trust_domain_id,
+            Self::Recovery(manifest) => Some(manifest.trust_domain_id),
+            Self::Campaign(manifest) => Some(manifest.campaign.trust_domain_id),
+            Self::IssuerAuthorization(manifest) => Some(manifest.trust_domain_id),
+            Self::CaRotation(manifest) => Some(manifest.trust_domain_id),
+            Self::Revocation(manifest) => Some(manifest.trust_domain_id),
+            Self::KeyCheck(_) | Self::Invitation(_) | Self::EnrollmentAcceptance(_) => None,
         }
     }
+}
+
+/// The key check: what the touch proves, and nothing it signs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeyCheckManifest {
+    /// The vault the key opened, so the operator sees which one answered.
+    pub vault_fingerprint: Fingerprint,
+}
+
+/// §15.2, the invitation a gateway is asked to admit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InvitationManifest {
+    pub server_name: String,
+    pub gateway_wg_public_key: WireGuardKey,
+    pub not_after_unix: u64,
+    /// Whether a peer already known to the gateway may be admitted again.
+    pub allow_readmission: bool,
+    pub ca_pq_fingerprint: Fingerprint,
+}
+
+/// §15.2, the acceptance that consumes an invitation and issues the first
+/// leaves.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcceptanceManifest {
+    pub invitation_id: Id16,
+    pub request_fingerprint: Fingerprint,
+    pub requested_name: String,
+    pub client_wg_public_key: WireGuardKey,
+    pub leaves_not_after_unix: u64,
+    pub endpoint: String,
 }
 
 /// §7.5, and the only ceremony held by two parties at once.
@@ -533,7 +585,6 @@ impl OperatorStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::certificates::encoding::WireGuardKey;
     use crate::certificates::status::{CampaignScope, CampaignTarget, CertificateKind};
 
     fn session() -> Id16 {
@@ -688,7 +739,7 @@ mod tests {
         assert_eq!(manifest.kind(), OperationKind::RotateClientTlsCa);
         assert_eq!(
             manifest.trust_domain_id(),
-            Id16::new([1; 16]).expect("domain")
+            Some(Id16::new([1; 16]).expect("domain"))
         );
     }
 
@@ -725,7 +776,7 @@ mod tests {
             fingerprint,
         });
 
-        assert_eq!(manifest.trust_domain_id(), domain);
+        assert_eq!(manifest.trust_domain_id(), Some(domain));
         let encoded = serde_json::to_value(&manifest).expect("manifest");
         assert_eq!(
             encoded["campaign"]["targets"].as_array().map(Vec::len),
@@ -735,6 +786,67 @@ mod tests {
         assert_eq!(
             encoded["campaign"]["targets"][0]["identity_key"],
             campaign.targets[0].identity_key.to_string()
+        );
+    }
+
+    #[test]
+    fn enrollment_kinds_round_trip() {
+        for (kind, wire) in [
+            (OperationKind::VerifyKey, "verify_key"),
+            (OperationKind::InviteEnrollment, "invite_enrollment"),
+            (OperationKind::AcceptEnrollment, "accept_enrollment"),
+        ] {
+            let encoded = serde_json::to_value(kind).expect("kind");
+            assert_eq!(encoded, serde_json::json!(wire));
+            assert_eq!(
+                serde_json::from_value::<OperationKind>(encoded).expect("back"),
+                kind
+            );
+        }
+    }
+
+    #[test]
+    fn enrollment_manifests_name_their_kind() {
+        let key_check = AstraManifest::KeyCheck(KeyCheckManifest {
+            vault_fingerprint: Fingerprint::of(b"vault"),
+        });
+        assert_eq!(key_check.kind(), OperationKind::VerifyKey);
+        let invitation = AstraManifest::Invitation(InvitationManifest {
+            server_name: "gateway.example".into(),
+            gateway_wg_public_key: WireGuardKey::from_bytes([5; 32]),
+            not_after_unix: 100,
+            allow_readmission: false,
+            ca_pq_fingerprint: Fingerprint::of(b"ca-pq"),
+        });
+        assert_eq!(invitation.kind(), OperationKind::InviteEnrollment);
+        let acceptance = AstraManifest::EnrollmentAcceptance(acceptance_manifest());
+        assert_eq!(acceptance.kind(), OperationKind::AcceptEnrollment);
+    }
+
+    fn acceptance_manifest() -> AcceptanceManifest {
+        AcceptanceManifest {
+            invitation_id: Id16::new([6; 16]).expect("invitation"),
+            request_fingerprint: Fingerprint::of(b"request"),
+            requested_name: "laptop".into(),
+            client_wg_public_key: WireGuardKey::from_bytes([7; 32]),
+            leaves_not_after_unix: 200,
+            endpoint: "gateway.example:51820".into(),
+        }
+    }
+
+    #[test]
+    fn a_manifest_with_an_unknown_field_is_refused() {
+        let mut encoded = serde_json::to_value(acceptance_manifest()).expect("manifest");
+        assert!(serde_json::from_value::<AcceptanceManifest>(encoded.clone()).is_ok());
+        encoded["extra"] = serde_json::json!(1);
+        assert!(serde_json::from_value::<AcceptanceManifest>(encoded).is_err());
+    }
+
+    #[test]
+    fn gateway_unavailable_carries_no_text() {
+        assert_eq!(
+            serde_json::to_value(Refusal::GatewayUnavailable).expect("refusal"),
+            serde_json::json!({ "refusal": "gateway_unavailable" })
         );
     }
 }

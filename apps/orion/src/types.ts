@@ -659,6 +659,9 @@ export type OperationKind =
   | 'rotate_client_tls_ca'
   | 'rotate_anchor'
   | 'revoke_certificate'
+  | 'verify_key'
+  | 'invite_enrollment'
+  | 'accept_enrollment'
 
 /** Ce que le WebView a le droit de nommer : un genre, au plus un identifiant. */
 export interface OperationLocator {
@@ -702,6 +705,7 @@ export type Refusal =
   | { refusal: 'key_repeated' }
   | { refusal: 'window_expired' }
   | { refusal: 'authority_refused'; status: number }
+  | { refusal: 'gateway_unavailable' }
   | { refusal: 'handoff_mismatch' }
   | { refusal: 'manifest_mismatch' }
   | { refusal: 'protocol_violation' }
@@ -805,12 +809,39 @@ export interface RevocationManifest {
   effective_at: number
 }
 
+export interface KeyCheckManifest {
+  operation: 'key_check'
+  vault_fingerprint: string
+}
+
+export interface InvitationManifest {
+  operation: 'invitation'
+  server_name: string
+  gateway_wg_public_key: string
+  not_after_unix: number
+  allow_readmission: boolean
+  ca_pq_fingerprint: string
+}
+
+export interface AcceptanceManifest {
+  operation: 'enrollment_acceptance'
+  invitation_id: string
+  request_fingerprint: string
+  requested_name: string
+  client_wg_public_key: string
+  leaves_not_after_unix: number
+  endpoint: string
+}
+
 export type AstraManifest =
   | RecoveryManifest
   | CampaignManifest
   | IssuerManifest
   | CaRotationManifest
   | RevocationManifest
+  | KeyCheckManifest
+  | InvitationManifest
+  | AcceptanceManifest
 
 export interface KeySlotLabel {
   slot: string
