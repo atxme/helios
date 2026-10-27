@@ -1532,6 +1532,13 @@ aucune réadmission ni écriture backend décidée par une ancienne transaction 
 peut le réutiliser. Une réconciliation de plusieurs pairs continue de retirer
 les autres pairs après avoir rapporté cette erreur.
 
+La transition de révocation et l'effacement du cache PSK runtime sont une seule
+étape sans point d'annulation intermédiaire : les verrous nécessaires sont
+acquis avant la mutation. Une réadmission ne réutilise jamais la baseline de
+l'ancienne admission. À la réservation d'une préparation, le mode minimal et
+les PSK courants sont relus sous le sérialiseur du slot ; les attentes de
+verrous précèdent la prise de propriété et l'enregistrement anti-rejeu.
+
 | État | Données minimales | Slot |
 | --- | --- | --- |
 | `empty` | `generation` | vide |

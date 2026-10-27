@@ -55,6 +55,8 @@ serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+# Paused time makes cache-lock cancellation tests deterministic, as in Orion.
+tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3"
 # The gateway does not depend on the client — but their interoperability has to
 # be proven somewhere, and the only honest place is against the real client
