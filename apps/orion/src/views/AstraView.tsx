@@ -1,3 +1,4 @@
+import type { ReactNode } from 'react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import Alert from '@mui/material/Alert'
 import Box from '@mui/material/Box'
@@ -5,12 +6,16 @@ import Button from '@mui/material/Button'
 import CircularProgress from '@mui/material/CircularProgress'
 import Paper from '@mui/material/Paper'
 import Stack from '@mui/material/Stack'
+import Tab from '@mui/material/Tab'
+import Tabs from '@mui/material/Tabs'
 import TextField from '@mui/material/TextField'
 import Typography from '@mui/material/Typography'
 import { Check, KeyRound } from 'lucide-react'
 
 import * as api from '../api'
 import { OperatorCeremonyPanel } from './OperatorCeremony'
+import { DomainPanel } from './astra/DomainPanel'
+import { VaultPanel } from './astra/VaultPanel'
 import { GUTTER, MINT, PINE, RULE } from '../theme'
 import type {
   AstraRotationInput,
@@ -33,6 +38,24 @@ const HELPER_CAMPAIGN_SCOPES = new Set<CampaignScope>([
   'orion_device',
   'fleet_leafs',
 ])
+
+const TABS = [
+  'Enrôlement',
+  'Coffre et clés',
+  'Domaine',
+  'Approbations',
+  'Rotations',
+  'Gateways',
+] as const
+type AstraTab = (typeof TABS)[number]
+
+function WaitingNote({ children }: { children: string }) {
+  return (
+    <Alert severity="info" variant="outlined" sx={{ fontSize: 11.5 }}>
+      {children}
+    </Alert>
+  )
+}
 
 type StepState = 'pending' | 'active' | 'done'
 
@@ -117,6 +140,7 @@ export function AstraView({
   // read on mount rather than only created here.
   const [ceremony, setCeremony] = useState<OperatorStatus | null>(null)
   const [pending, setPending] = useState<OperatorPendingOperation[]>([])
+  const [tab, setTab] = useState<AstraTab>('Coffre et clés')
   const [finishingRecovery, setFinishingRecovery] = useState(false)
   const recoveryAttempt = useRef<string | null>(null)
 
@@ -357,14 +381,12 @@ export function AstraView({
   // Campaigns the domain opened and nobody has approved yet. Read from the
   // gateway in the tunnel: they are how an operator finds work without being
   // handed an identifier by whoever ran the command that created it.
-  if (pending.length > 0) {
-    return (
-      <Box sx={{ height: '100%', overflowY: 'auto', px: GUTTER, py: 1.5 }}>
-        <Typography component="h2" sx={{ fontSize: 13, fontWeight: 700, mb: 0.5 }}>
-          Astra
-        </Typography>
+  const approvals = (
+    <>
         <Typography color="text.secondary" sx={{ fontSize: 11.5, lineHeight: 1.55, mb: 1.5 }}>
-          {pending.length === 1
+          {pending.length === 0
+            ? 'Aucune opération n’attend l’opérateur.'
+            : pending.length === 1
             ? 'Une opération attend l’opérateur.'
             : `${pending.length} opérations attendent l’opérateur.`}
         </Typography>
@@ -415,15 +437,11 @@ export function AstraView({
             {error}
           </Alert>
         )}
-      </Box>
-    )
-  }
+    </>
+  )
 
-  return (
-    <Box sx={{ height: '100%', overflowY: 'auto', px: GUTTER, py: 1.5 }}>
-      <Typography component="h2" sx={{ fontSize: 13, fontWeight: 700, mb: 0.5 }}>
-        Astra
-      </Typography>
+  const rotations = (
+    <>
       <Typography color="text.secondary" sx={{ fontSize: 11.5, lineHeight: 1.55, mb: 1.5 }}>
         Rotation de l’autorité CA-TLS cliente.
       </Typography>
@@ -586,6 +604,39 @@ export function AstraView({
           )}
         </Box>
       </Paper>
+    </>
+  )
+
+  const panels: Record<AstraTab, ReactNode> = {
+    'Enrôlement': (
+      <WaitingNote>L’enrôlement d’un poste arrivera dans une prochaine version d’Orion.</WaitingNote>
+    ),
+    'Coffre et clés': <VaultPanel onCeremony={setCeremony} />,
+    'Domaine': <DomainPanel />,
+    'Approbations': approvals,
+    'Rotations': rotations,
+    'Gateways': (
+      <WaitingNote>La gestion des gateways arrivera dans une prochaine version d’Orion.</WaitingNote>
+    ),
+  }
+
+  return (
+    <Box sx={{ height: '100%', overflowY: 'auto', px: GUTTER, py: 1.5 }}>
+      <Typography component="h2" sx={{ fontSize: 13, fontWeight: 700, mb: 0.5 }}>
+        Astra
+      </Typography>
+      <Tabs
+        value={tab}
+        onChange={(_, value: AstraTab) => setTab(value)}
+        variant="scrollable"
+        scrollButtons="auto"
+        sx={{ mb: 1.5, minHeight: 34 }}
+      >
+        {TABS.map((name) => (
+          <Tab key={name} value={name} label={name} sx={{ minHeight: 34, fontSize: 12 }} />
+        ))}
+      </Tabs>
+      {panels[tab]}
     </Box>
   )
 }

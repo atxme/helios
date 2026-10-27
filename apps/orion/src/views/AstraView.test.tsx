@@ -13,6 +13,7 @@ const api = vi.hoisted(() => ({
   beginOperatorCeremony: vi.fn(),
   operatorPendingOperations: vi.fn(),
   dismissOperatorCeremony: vi.fn(),
+  operatorOverview: vi.fn(),
 }))
 vi.mock('../api', () => api)
 
@@ -29,6 +30,8 @@ const fillForm = () => {
     target: { value: 'C:\\astra\\ca-tls-transition.json' },
   })
 }
+
+const openTab = (name: string) => fireEvent.click(screen.getByRole('tab', { name }))
 
 const manifest = {
   reason: 'rotation planifiée',
@@ -47,6 +50,14 @@ beforeEach(() => {
   vi.clearAllMocks()
   api.operatorCeremonyStatus.mockResolvedValue(null)
   api.operatorPendingOperations.mockResolvedValue([])
+  api.operatorOverview.mockResolvedValue({
+    vault_path: 'C:\\astra\\vault.json',
+    exists: false,
+    vault_fingerprint: null,
+    slots: [],
+    max_slots: 8,
+    domain: null,
+  })
   api.dismissOperatorCeremony.mockResolvedValue(undefined)
   api.astraCaTlsRotationStatus.mockResolvedValue({
     phase: 'idle',
@@ -91,8 +102,55 @@ beforeEach(() => {
 afterEach(cleanup)
 
 describe('AstraView', () => {
+  it('the_astra_tab_lists_six_sections_in_order', () => {
+    render(<AstraView />)
+    expect(screen.getAllByRole('tab').map((tab) => tab.textContent)).toEqual([
+      'Enrôlement',
+      'Coffre et clés',
+      'Domaine',
+      'Approbations',
+      'Rotations',
+      'Gateways',
+    ])
+    openTab('Enrôlement')
+    expect(screen.getByText(/arrivera dans une prochaine version/)).toBeTruthy()
+    openTab('Gateways')
+    expect(screen.getByText(/arrivera dans une prochaine version/)).toBeTruthy()
+  })
+
+  it('the_rotation_flow_still_renders_under_rotations', () => {
+    render(<AstraView />)
+    openTab('Rotations')
+    expect(screen.getByRole('button', { name: 'Démarrer la rotation' })).toBeTruthy()
+  })
+
+  it('verify_key_opens_the_ceremony_over_the_tabs', async () => {
+    api.operatorOverview.mockResolvedValue({
+      vault_path: 'v.json',
+      exists: true,
+      vault_fingerprint: 'ab12',
+      slots: [],
+      max_slots: 8,
+      domain: null,
+    })
+    api.beginOperatorCeremony.mockResolvedValue({
+      session_id: 'd'.repeat(32),
+      revision: 1,
+      operation: 'verify_key',
+      operation_id: null,
+      remote: 'not_required',
+      gesture: { awaiting_key: { index: 1, of: 1, purpose: 'verify_key' } },
+      allowed: ['continue', 'cancel'],
+    })
+    render(<AstraView />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Vérifier une clé' }))
+    await waitFor(() => expect(screen.queryByRole('tab')).toBeNull())
+    expect(screen.getByText('Une opération attend l’opérateur.')).toBeTruthy()
+  })
+
   it('starts from an existing operation and sends the four typed fields', async () => {
     render(<AstraView />)
+    openTab('Rotations')
 
     expect(screen.getByRole('button', { name: 'Démarrer la rotation' }).hasAttribute('disabled')).toBe(true)
     fillForm()
@@ -114,6 +172,7 @@ describe('AstraView', () => {
 
   it('separates both key gestures and describes the deposited transition precisely', async () => {
     render(<AstraView />)
+    openTab('Rotations')
     fillForm()
     fireEvent.click(screen.getByRole('button', { name: 'Démarrer la rotation' }))
 
@@ -133,6 +192,7 @@ describe('AstraView', () => {
 
   it('can cancel an open ceremony and reports backend failures', async () => {
     const { unmount } = render(<AstraView />)
+    openTab('Rotations')
     fillForm()
     fireEvent.click(screen.getByRole('button', { name: 'Démarrer la rotation' }))
     fireEvent.click(await screen.findByRole('button', { name: 'Annuler' }))
@@ -143,6 +203,7 @@ describe('AstraView', () => {
     unmount()
     api.startAstraCaTlsRotation.mockRejectedValue('coffre illisible')
     render(<AstraView />)
+    openTab('Rotations')
     fillForm()
     fireEvent.click(screen.getByRole('button', { name: 'Démarrer la rotation' }))
     expect(await screen.findByText('coffre illisible')).toBeTruthy()
@@ -195,6 +256,7 @@ describe('AstraView', () => {
     ])
 
     render(<AstraView />)
+    openTab('Approbations')
 
     expect(await screen.findByText('rotation des ancres')).toBeTruthy()
     const open = screen.getByRole('button', { name: 'Ouvrir la cérémonie' })
