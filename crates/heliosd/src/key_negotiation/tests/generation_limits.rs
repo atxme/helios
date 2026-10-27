@@ -232,7 +232,7 @@ async fn confirm_at_max_refuses_before_raising_the_floor_or_committing() {
     );
     assert_eq!(
         handler.network.read().await.peers[0].minimum_key_negotiation_mode,
-        ProtectionMode::StaticPsk,
+        Some(ProtectionMode::StaticPsk),
         "generation exhaustion must not raise the persistent security floor"
     );
 

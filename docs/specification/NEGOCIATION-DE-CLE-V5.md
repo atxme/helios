@@ -1524,6 +1524,14 @@ jamais un retour à zéro. La génération n'a pas besoin de survivre au
 redémarrage : celui-ci vide tous les slots négociés et annule toutes les
 transactions.
 
+Si le compteur est épuisé au moment d'une révocation, le retrait reste
+prioritaire : l'état devient terminal `revoked` sans retour à zéro, le candidat,
+le précédent, les réservations et le PSK statique retenu en mémoire sont détruits,
+et une erreur ferme est rapportée. Le compteur reste à sa valeur maximale ;
+aucune réadmission ni écriture backend décidée par une ancienne transaction ne
+peut le réutiliser. Une réconciliation de plusieurs pairs continue de retirer
+les autres pairs après avoir rapporté cette erreur.
+
 | État | Données minimales | Slot |
 | --- | --- | --- |
 | `empty` | `generation` | vide |

@@ -220,7 +220,7 @@ impl NegotiationHandler for GatewayHandler {
             // have removed it since. Settled under this lock, a removal wins
             // over the reservation rather than racing it.
             self.settle_admission(&mut state, &request.client_wg_public_key)
-                .await;
+                .await?;
             if matches!(
                 state.slot(&request.client_wg_public_key).state,
                 SlotState::Revoked
@@ -542,7 +542,7 @@ impl NegotiationHandler for GatewayHandler {
             let mut state = self.transactions.lock().await;
             // A peer removed since the candidate was posed is revoked here,
             // which moves the generation: the check below then refuses.
-            self.settle_admission(&mut state, &public_key).await;
+            self.settle_admission(&mut state, &public_key).await?;
             let slot = state.slot(&public_key);
             let still_ours = slot.generation == generation
                 && matches!(
@@ -590,7 +590,7 @@ impl NegotiationHandler for GatewayHandler {
             let mut state = self.transactions.lock().await;
             // Checked again at the point of no return: a removal between the
             // check above and this lock must not end in a signed commit.
-            self.settle_admission(&mut state, &public_key).await;
+            self.settle_admission(&mut state, &public_key).await?;
             if !state.active.contains_key(&transaction_id) {
                 return Err(PublicError::Internal);
             }
