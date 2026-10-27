@@ -21,9 +21,10 @@
 
 use std::path::{Path, PathBuf};
 
-use aether::key_negotiation::ProtectionMode;
 use anyhow::{bail, Context, Result};
+use orion_core::enrollment_draft::{tagged, Profile, TaggedProfile};
 use orion_core::profile_import::TunnelCapture;
+#[cfg(test)]
 use orion_core::ProfileKind;
 use reqwest::Client;
 use serde::Serialize;
@@ -57,124 +58,6 @@ struct Document<'a> {
     format: &'a str,
     version: u16,
     profile: TaggedProfile<'a>,
-}
-
-/// The profile, plus the §19 discriminant [`render`] derives for it.
-///
-/// Kept out of [`Profile`] on purpose: the kind is not something a caller
-/// chooses beside the negotiation block, it is what the presence of that block
-/// *means*. Deriving it at the single point that renders a document makes the
-/// two impossible to contradict — which is the failure the field exists to
-/// stop, and it would be a poor joke to reintroduce it in the emitter.
-#[derive(Serialize)]
-struct TaggedProfile<'a> {
-    #[serde(rename = "type")]
-    profile_type: ProfileKind,
-    #[serde(flatten)]
-    inner: PublicProfile<'a>,
-}
-
-/// The `private_key` field is omitted in invitation mode: `orion-core` treats
-/// it as absent, not empty, and completes it from the local profile.
-pub struct Profile<'a> {
-    pub name: &'a str,
-    pub endpoint: &'a str,
-    pub private_key: Option<&'a str>,
-    pub peer_public_key: &'a str,
-    pub address: &'a str,
-    /// IPv6 VIP, `…/128`, written **only** when the peer has one
-    /// (`ADRESSAGE-IPV6.md` §7.2).
-    ///
-    /// The document is `deny_unknown_fields`: an Orion older than the field
-    /// refuses any profile carrying the key, even empty or `null`. Omitting it
-    /// for a peer without IPv6 is what keeps the profile of a gateway without
-    /// IPv6 readable by every Orion.
-    pub address_v6: Option<&'a str>,
-    /// Traffic the client routes into the tunnel — one or more CIDR prefixes,
-    /// comma-separated.
-    ///
-    /// Omitted rather than defaulted, because the two are not the same thing:
-    /// an absent field lets `orion-core` apply its default full tunnel,
-    /// `0.0.0.0/0, ::/0`, which stays the right answer when the operator has
-    /// said nothing. Only
-    /// a split tunnel needs stating, and it is stated **here** so a fleet gets
-    /// it from the document rather than from each user retyping prefixes into
-    /// the Advanced panel.
-    pub allowed_ips: Option<&'a str>,
-    /// SSH destination inside the tunnel, `user@host`. Omitted = no terminal.
-    pub ssh_target: Option<&'a str>,
-    pub heliosd_url: Option<String>,
-    /// Public negotiation settings. Absent when the gateway serves none:
-    /// the profile then falls back to the legacy path, whose first handshake
-    /// is unprotected.
-    pub key_negotiation: Option<KeyNegotiation>,
-}
-
-/// The serializable half of an emitted profile contains public fields only.
-#[derive(Serialize)]
-struct PublicProfile<'a> {
-    name: &'a str,
-    endpoint: &'a str,
-    peer_public_key: &'a str,
-    address: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    address_v6: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    allowed_ips: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    ssh_target: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    heliosd_url: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    key_negotiation: Option<&'a KeyNegotiation>,
-}
-
-/// Public negotiation block, as `orion-core` reads it back.
-#[derive(Serialize)]
-pub struct KeyNegotiation {
-    pub mode: ProtectionMode,
-    /// Written explicitly even though `orion-core` would default it to
-    /// `mode`: a floor that is visible in the document is one an operator can
-    /// audit without knowing the defaulting rule.
-    pub minimum_mode: ProtectionMode,
-    pub endpoint: String,
-    pub server_name: String,
-    pub gateway_ca_der: String,
-    pub gateway_pq_certificate: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub trust: Option<orion_core::TrustMaterial>,
-}
-
-/// The profile with its §19 discriminant, derived from the negotiation block.
-fn tagged<'a>(profile: &'a Profile<'a>) -> TaggedProfile<'a> {
-    TaggedProfile {
-        profile_type: if profile.key_negotiation.is_some() {
-            ProfileKind::HeliosKeyNegotiation
-        } else {
-            ProfileKind::Classic
-        },
-        inner: PublicProfile {
-            name: profile.name,
-            endpoint: profile.endpoint,
-            peer_public_key: profile.peer_public_key,
-            address: profile.address,
-            address_v6: profile.address_v6,
-            allowed_ips: profile.allowed_ips,
-            ssh_target: profile.ssh_target,
-            heliosd_url: profile.heliosd_url.as_deref(),
-            key_negotiation: profile.key_negotiation.as_ref(),
-        },
-    }
-}
-
-/// The public fields of a profile, as the v5 document carries them.
-///
-/// No private key can reach it: [`PublicProfile`] has no field for one.
-pub fn public_profile(profile: &Profile<'_>) -> Result<serde_json::Map<String, serde_json::Value>> {
-    match serde_json::to_value(tagged(profile)).context("serializing the public profile fields")? {
-        serde_json::Value::Object(map) => Ok(map),
-        _ => bail!("the public profile did not serialize as an object — this is a tooling bug"),
-    }
 }
 
 /// Renders a classic v1 document, and checks it against the consumer before
