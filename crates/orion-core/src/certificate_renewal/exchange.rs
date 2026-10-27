@@ -925,8 +925,8 @@ pub(super) fn assert_active_can_prove_continuity(
 
 /// Takes one more step on a renewal already opened.
 ///
-/// Idempotent by the operation: called while the operator is still absent it
-/// reports [`RenewalStep::AwaitingOperator`] again and changes nothing.
+/// Idempotent by operation while its grant is pending. The obsolete per-request
+/// ceremony is refused with [`RenewalError::ObsoleteOperatorApproval`].
 pub async fn resume(
     session: &mut RenewalSession,
     store: &mut TrustStore,
