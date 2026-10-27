@@ -371,3 +371,19 @@ async fn the_callers_client_is_the_one_used() {
     let _ = admitted_keys(&caller, &base).await;
     assert!(server.await.unwrap().contains("x-caller-client: marker"));
 }
+
+/// A leaf is read from the JSON a gateway writes or from the base64 a profile
+/// carries, and from nothing else.
+#[test]
+fn a_pq_leaf_is_read_from_json_or_base64_only() {
+    let leaf = leaves().pq;
+    let json = serde_json::to_string(&leaf).unwrap();
+    assert_eq!(decode_pq_certificate(&json).unwrap(), leaf);
+    assert_eq!(
+        decode_pq_certificate(&format!("  {}\n", STANDARD.encode(&json))).unwrap(),
+        leaf
+    );
+    assert!(decode_pq_certificate("").is_err());
+    assert!(decode_pq_certificate("{\"version\":1}").is_err());
+    assert!(decode_pq_certificate(&STANDARD.encode("not json")).is_err());
+}

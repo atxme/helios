@@ -12,6 +12,8 @@
 //! through a bound; a refusal keeps only the gateway's own error text, trimmed
 //! of control characters and cut short.
 
+use std::time::Duration;
+
 use aether::certificates::encoding::DerCertificate;
 use aether::key_negotiation::{PqCertificate, ProtectionMode};
 use base64::Engine as _;
@@ -24,8 +26,40 @@ use crate::TrustMaterial;
 /// The longest refusal reason kept, in characters.
 const MAX_REASON_CHARS: usize = 200;
 
+/// How long Orion waits for a gateway to accept a connection.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long one request may take in all, from connection to the last byte.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// The largest answer read: far above any real view, far below a memory risk.
 const MAX_BODY_BYTES: usize = 1024 * 1024;
+
+/// The client every Orion gateway-admin call goes through.
+///
+/// Bounded twice, so a gateway that accepts the connection and then says
+/// nothing cannot hold a ceremony: 10 seconds to connect and 20 in all for a
+/// request. It carries no credential — the tunnel is the caller's identity.
+pub fn orion_client() -> Result<Client, GatewayAdminError> {
+    Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .map_err(|_| invalid("le client HTTP de l'administration ne peut pas être construit"))
+}
+
+/// A PQ leaf as it is handed over: the JSON document the gateway writes, or the
+/// base64 of that document as a profile and the negotiation route carry it.
+pub fn decode_pq_certificate(text: &str) -> Result<PqCertificate, GatewayAdminError> {
+    let text = text.trim();
+    if let Ok(certificate) = serde_json::from_str::<PqCertificate>(text) {
+        return Ok(certificate);
+    }
+    let json = base64::engine::general_purpose::STANDARD
+        .decode(text)
+        .map_err(|_| invalid("la feuille PQ n'est ni un document JSON ni son encodage base64"))?;
+    serde_json::from_slice(&json).map_err(|_| invalid("la feuille PQ n'est pas lisible"))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum GatewayAdminError {

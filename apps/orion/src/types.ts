@@ -863,6 +863,41 @@ export interface OperatorStatus {
   refusal?: Refusal
 }
 
+/** Un geste d'enrôlement (§15.2), fermé : la page ne choisit que parmi ces trois. */
+export type EnrollmentGesture =
+  | {
+      gesture: 'invite'
+      /** 1 à 24. */
+      valid_for_hours: number
+      allow_readmission: boolean
+      /** `[A-Za-z0-9._-]{1,64}` ; devient `<name>.helios-invite`. */
+      name: string
+      /** Contenu du fichier de la feuille PQ de la gateway, si aucune n'est connectée. */
+      gateway_pq_certificate?: string
+    }
+  | {
+      gesture: 'accept'
+      request: string
+      /** 1 à 1825 ; 365 par défaut. */
+      validity_days?: number
+      endpoint: string
+      allowed_ips?: string
+      ssh_target?: string
+    }
+  | {
+      gesture: 'resume'
+      invitation_id: string
+      endpoint: string
+      allowed_ips?: string
+      ssh_target?: string
+    }
+
+/** Un fichier produit par la cérémonie, à enregistrer par l'IHM. Contenu public. */
+export interface OperatorArtifact {
+  file_name: string
+  contents: string
+}
+
 /**
  * Une opération qui attend l'opérateur, telle qu'une liste peut la nommer.
  *

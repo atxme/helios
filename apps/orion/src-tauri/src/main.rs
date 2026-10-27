@@ -782,6 +782,8 @@ fn main() {
             cancel_astra_ca_tls_rotation,
             astra_ca_tls_rotation_status,
             begin_operator_ceremony,
+            begin_enrollment_ceremony,
+            operator_artifacts,
             advance_operator_ceremony,
             dismiss_operator_ceremony,
             operator_ceremony_status,

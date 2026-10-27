@@ -18,13 +18,17 @@
 use std::path::Path;
 use std::sync::mpsc::Receiver;
 
-use aether::certificates::encoding::Id16;
+use aether::certificates::encoding::{Id16, MlDsa87PublicKey, WireGuardKey};
 use aether::certificates::operator_session::{
-    AstraManifest, GestureState, KeyCheckManifest, KeyPurpose, KeySlotLabel, OperationKind,
-    OperationLocator, OperatorAction, OperatorStatus, Refusal, RemoteState,
+    AstraManifest, GestureState, InvitationManifest, KeyCheckManifest, KeyPurpose, KeySlotLabel,
+    OperationKind, OperationLocator, OperatorAction, OperatorStatus, Refusal, RemoteState,
 };
+use aether::key_negotiation::{encode_invitation_file, PqCertificate, PqCertificateRole};
 use aether_fido::authenticator::{Authenticator, DialogOwner};
+use astra_operator::enrollment::InvitationRegistry;
 use astra_operator::vault::AuthorityVault;
+
+use super::{EnrollmentGesture, OperatorArtifact};
 
 /// One button pressed in the window: what it asks, the status it answers, and
 /// the window the press came from.
@@ -82,6 +86,362 @@ fn run_with_vault(
                 "la cérémonie « {other:?} » n'est pas encore portée dans ce processus"
             ))
         }
+    }
+}
+
+/// Runs one enrollment gesture to its end, publishing every state it reaches
+/// and handing each file it produces to `deposit`.
+///
+/// Called from the ceremony's own thread, which is what lets the gateway be
+/// read from it with a blocking wait: that thread is not a runtime worker.
+pub fn run_enrollment(
+    session_id: Id16,
+    gesture: EnrollmentGesture,
+    gateway: Option<String>,
+    presses: Receiver<Press>,
+    publish: &mut dyn FnMut(OperatorStatus),
+    deposit: &mut dyn FnMut(OperatorArtifact),
+) -> Result<(), String> {
+    let resolved = astra_operator::store::default_path()
+        .and_then(|path| InvitationRegistry::default_location().map(|registry| (path, registry)));
+    let (vault_path, registry) = match resolved {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            let mut ceremony = Ceremony::new(session_id, enrollment_locator(&gesture));
+            publish(ceremony.status());
+            ceremony.refuse(Refusal::VaultUnavailable);
+            publish(ceremony.status());
+            return Err(format!("{error:#}"));
+        }
+    };
+    run_enrollment_with(
+        session_id,
+        gesture,
+        gateway,
+        presses,
+        publish,
+        deposit,
+        &vault_path,
+        &registry,
+    )
+}
+
+fn enrollment_locator(gesture: &EnrollmentGesture) -> OperationLocator {
+    OperationLocator {
+        kind: gesture.operation(),
+        operation_id: None,
+    }
+}
+
+/// [`run_enrollment`], with the vault and the registry named, so a test can
+/// point it at a directory of its own.
+#[allow(clippy::too_many_arguments)]
+fn run_enrollment_with(
+    session_id: Id16,
+    gesture: EnrollmentGesture,
+    gateway: Option<String>,
+    presses: Receiver<Press>,
+    publish: &mut dyn FnMut(OperatorStatus),
+    deposit: &mut dyn FnMut(OperatorArtifact),
+    vault_path: &Path,
+    registry: &InvitationRegistry,
+) -> Result<(), String> {
+    let mut ceremony = Ceremony::new(session_id, enrollment_locator(&gesture));
+    publish(ceremony.status());
+
+    match gesture {
+        EnrollmentGesture::Invite {
+            valid_for_hours,
+            allow_readmission,
+            name,
+            gateway_pq_certificate,
+        } => invite(
+            &mut ceremony,
+            &presses,
+            publish,
+            deposit,
+            vault_path,
+            registry,
+            Invite {
+                valid_for_hours,
+                allow_readmission,
+                name: &name,
+                gateway: gateway.as_deref(),
+                sheet: gateway_pq_certificate.as_deref(),
+            },
+        ),
+        // Named rather than swallowed, as for the other ceremonies: a gesture
+        // this build does not carry yet is said so, not left silent.
+        EnrollmentGesture::Accept { .. } | EnrollmentGesture::Resume { .. } => {
+            ceremony.refuse(Refusal::Internal);
+            publish(ceremony.status());
+            Err("ce geste d'enrôlement n'est pas encore porté dans ce processus".to_string())
+        }
+    }
+}
+
+/// What the operator decided about one invitation, already range-checked.
+struct Invite<'a> {
+    valid_for_hours: u8,
+    allow_readmission: bool,
+    name: &'a str,
+    /// The connected gateway's control-plane address, when a tunnel is up.
+    gateway: Option<&'a str>,
+    /// The contents of a leaf file the operator chose.
+    sheet: Option<&'a str>,
+}
+
+/// The purpose of the `index`-th key (from 1) of an invitation: the first
+/// opens the vault, the following approve beside it.
+fn invitation_key_purpose(index: u8) -> KeyPurpose {
+    if index <= 1 {
+        KeyPurpose::OpenVault
+    } else {
+        KeyPurpose::SecondApproval
+    }
+}
+
+/// §15.2, the invitation: checked in full, shown, then signed under the
+/// operator's key or keys.
+///
+/// The order is the safety: the window and the gateway's identity are checked,
+/// and the manifest is shown, before a key is asked for anything; and the
+/// registry is written by the signing and by nothing earlier, so a ceremony
+/// abandoned or refused before it leaves no record behind.
+fn invite(
+    ceremony: &mut Ceremony,
+    presses: &Receiver<Press>,
+    publish: &mut dyn FnMut(OperatorStatus),
+    deposit: &mut dyn FnMut(OperatorArtifact),
+    vault_path: &Path,
+    registry: &InvitationRegistry,
+    invite: Invite<'_>,
+) -> Result<(), String> {
+    let now = now_unix();
+    let not_after = now + u64::from(invite.valid_for_hours) * 3_600;
+
+    let prepared = match prepare_invitation(vault_path, &invite, now) {
+        Ok(prepared) => prepared,
+        Err((refusal, message)) => {
+            ceremony.refuse(refusal);
+            publish(ceremony.status());
+            return Err(message);
+        }
+    };
+    let Prepared {
+        vault,
+        certificate,
+        gateway_wg_public_key,
+        server_name,
+        ca_pq_public_key,
+    } = prepared;
+    let required = u8::try_from(astra_operator::signing::enrollment_credentials(
+        invite.allow_readmission,
+    ))
+    .unwrap_or(2);
+
+    // Shown before any key is asked for anything, and it states what the
+    // signed invitation will say.
+    ceremony.remote = RemoteState::AwaitingOperator;
+    ceremony.manifest = Some(AstraManifest::Invitation(InvitationManifest {
+        server_name: server_name.clone(),
+        gateway_wg_public_key,
+        not_after_unix: not_after,
+        allow_readmission: invite.allow_readmission,
+        ca_pq_fingerprint: ca_pq_public_key.authority_fingerprint(),
+    }));
+
+    let mut openings = Vec::with_capacity(usize::from(required));
+    for index in 1..=required {
+        ceremony.gesture = GestureState::AwaitingKey {
+            index,
+            of: required,
+            purpose: invitation_key_purpose(index),
+        };
+        let offered = ceremony.status();
+        publish(offered.clone());
+
+        let Some(key) = open_key(ceremony, presses, publish, &offered)? else {
+            return Ok(());
+        };
+        let opened =
+            match astra_operator::gestures::open_with_authorized_key(key.as_ref(), &vault, "") {
+                Ok(opened) => opened,
+                Err(error) => {
+                    ceremony.refuse(Refusal::KeyNotEnrolled);
+                    publish(ceremony.status());
+                    return Err(format!("{error:#}"));
+                }
+            };
+        // Said at this key rather than after the last: the operator can still
+        // swap the token, and nothing has been signed.
+        if openings
+            .iter()
+            .any(|earlier: &astra_operator::authenticator::Opened| {
+                earlier.credential_id == opened.credential_id
+            })
+        {
+            ceremony.refuse(Refusal::KeyRepeated);
+            publish(ceremony.status());
+            return Err(
+                "le même credential a été présenté deux fois : une réadmission en exige deux \
+                 distincts"
+                    .to_string(),
+            );
+        }
+        if let Ok(slot) = vault.slot_for_credential(&opened.credential_id) {
+            ceremony.keys.push(KeySlotLabel {
+                slot: index.to_string(),
+                label: slot.label.clone(),
+            });
+        }
+        openings.push(opened);
+    }
+
+    ceremony.gesture = GestureState::Signing;
+    publish(ceremony.status());
+
+    let references: Vec<&astra_operator::authenticator::Opened> = openings.iter().collect();
+    let signed = astra_operator::signing::sign_invitation(
+        &vault,
+        &references,
+        &astra_operator::signing::InvitationDraft {
+            gateway_certificate: &certificate,
+            gateway_wg_public_key,
+            server_name: &server_name,
+            not_before_unix: now,
+            not_after_unix: not_after,
+            allow_readmission: invite.allow_readmission,
+        },
+        registry,
+        now,
+    );
+    match signed {
+        Ok(invitation) => {
+            deposit(OperatorArtifact {
+                file_name: format!("{}.helios-invite", invite.name),
+                contents: encode_invitation_file(&invitation),
+            });
+            ceremony.gesture = GestureState::Done;
+            publish(ceremony.status());
+            Ok(())
+        }
+        Err(error) => {
+            ceremony.refuse(Refusal::Internal);
+            publish(ceremony.status());
+            Err(format!("{error:#}"))
+        }
+    }
+}
+
+/// What an invitation is made of, once everything that needs no key has been
+/// verified.
+struct Prepared {
+    vault: AuthorityVault,
+    certificate: PqCertificate,
+    gateway_wg_public_key: WireGuardKey,
+    server_name: String,
+    ca_pq_public_key: MlDsa87PublicKey,
+}
+
+/// Reads the vault and the relay beside it, finds the gateway's leaf and
+/// verifies it under `CA-PQ` for the gateway the relay names — all without a
+/// key. Anything doubtful is a refusal.
+fn prepare_invitation(
+    vault_path: &Path,
+    invite: &Invite<'_>,
+    now: u64,
+) -> Result<Prepared, (Refusal, String)> {
+    let mismatch = |message: String| (Refusal::HandoffMismatch, message);
+    let vault = astra_operator::store::load(vault_path)
+        .map_err(|error| (Refusal::VaultUnavailable, format!("{error:#}")))?;
+    let relay = astra_operator::handoff::DomainHandoff::beside(vault_path, &vault)
+        .map_err(|error| mismatch(format!("{error:#}")))?;
+    let (Some(gateway_key), Some(server_name)) = (
+        relay.gateway_wg_public_key.as_deref(),
+        relay.server_name.as_deref(),
+    ) else {
+        return Err(mismatch(
+            "le relais de domaine ne nomme encore aucune gateway : l'amorçage de la gateway \
+             doit précéder les invitations"
+                .to_string(),
+        ));
+    };
+    let gateway_wg_public_key =
+        WireGuardKey::parse(gateway_key).map_err(|error| mismatch(error.to_string()))?;
+    let ca_pq_public_key = MlDsa87PublicKey::parse(&relay.ca_pq_public_key)
+        .map_err(|error| mismatch(error.to_string()))?;
+
+    let certificate = gateway_leaf(invite, server_name, &gateway_wg_public_key)?;
+    certificate
+        .verify(
+            ca_pq_public_key.as_bytes(),
+            PqCertificateRole::Gateway,
+            Some(server_name),
+            &gateway_wg_public_key.to_base64(),
+            now,
+        )
+        .map_err(|error| {
+            mismatch(format!(
+                "la feuille PQ de la gateway ne vérifie pas sous CA-PQ pour la gateway de ce \
+                 domaine : {error}"
+            ))
+        })?;
+
+    Ok(Prepared {
+        vault,
+        certificate,
+        gateway_wg_public_key,
+        server_name: server_name.to_string(),
+        ca_pq_public_key,
+    })
+}
+
+/// The gateway's leaf: read from the connected gateway, else taken from the
+/// sheet the operator chose.
+///
+/// A gateway that answers for another identity than the relay names is a
+/// refusal, not a reason to look elsewhere. One that does not answer falls back
+/// to the sheet when there is one. Either way the leaf is verified afterwards.
+fn gateway_leaf(
+    invite: &Invite<'_>,
+    server_name: &str,
+    gateway_key: &WireGuardKey,
+) -> Result<PqCertificate, (Refusal, String)> {
+    use orion_core::gateway_admin as admin;
+
+    let mut unreadable = None;
+    if let Some(base) = invite.gateway {
+        let read = admin::orion_client().and_then(|client| {
+            tauri::async_runtime::block_on(admin::gateway_negotiation(&client, base))
+        });
+        match read {
+            Ok(material) => {
+                let same_key = WireGuardKey::parse(material.wireguard_public_key.trim())
+                    .map(|key| key == *gateway_key)
+                    .unwrap_or(false);
+                if material.server_name.trim() != server_name || !same_key {
+                    return Err((
+                        Refusal::HandoffMismatch,
+                        "la gateway connectée n'est pas celle que le domaine nomme".to_string(),
+                    ));
+                }
+                return admin::decode_pq_certificate(&material.gateway_pq_certificate)
+                    .map_err(|error| (Refusal::HandoffMismatch, error.to_string()));
+            }
+            Err(error) => unreadable = Some(error.to_string()),
+        }
+    }
+    match (invite.sheet, unreadable) {
+        (Some(sheet), _) => admin::decode_pq_certificate(sheet)
+            .map_err(|error| (Refusal::HandoffMismatch, error.to_string())),
+        (None, Some(message)) => Err((Refusal::GatewayUnavailable, message)),
+        (None, None) => Err((
+            Refusal::HandoffMismatch,
+            "aucune gateway connectée et aucune feuille PQ fournie : l'invitation n'a rien à \
+             épingler"
+                .to_string(),
+        )),
     }
 }
 

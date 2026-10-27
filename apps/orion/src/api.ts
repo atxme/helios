@@ -14,6 +14,8 @@ import type {
   OperatorAction,
   OperatorPendingOperation,
   OperatorStatus,
+  OperatorArtifact,
+  EnrollmentGesture,
   CertificateAction,
   CertificateActionState,
   ActionOutcome,
@@ -308,6 +310,16 @@ export const astraCaTlsRotationStatus = () =>
  * le processus opérateur épingle lui-même. */
 export const beginOperatorCeremony = (locator: OperationLocator) =>
   invoke<OperatorStatus>('begin_operator_ceremony', { locator })
+
+/**
+ * Opens an enrollment gesture. La passerelle est lue côté Rust (profil
+ * sélectionné et connecté) ; le contenu d'un fichier choisi voyage tel quel.
+ */
+export const beginEnrollmentCeremony = (gesture: EnrollmentGesture) =>
+  invoke<OperatorStatus>('begin_enrollment_ceremony', { gesture })
+
+/** Les fichiers produits par la session courante, que l'IHM enregistre. */
+export const operatorArtifacts = () => invoke<OperatorArtifact[]>('operator_artifacts')
 
 export const advanceOperatorCeremony = (action: OperatorAction, revision: number) =>
   invoke<OperatorStatus>('advance_operator_ceremony', { action, revision })

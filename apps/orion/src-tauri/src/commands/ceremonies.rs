@@ -146,6 +146,30 @@ pub(crate) async fn operator_pending_operations(
     Ok(pending)
 }
 
+/// Opens an enrollment gesture: inviting a device, accepting its request, or
+/// resuming an acceptance.
+///
+/// The gateway is the connected profile's, read here from the engine. Without
+/// one the gesture goes on with what the operator supplied — an invitation can
+/// be pinned from a leaf file — rather than failing for a tunnel it may not
+/// need.
+#[tauri::command]
+pub(crate) async fn begin_enrollment_ceremony(
+    state: State<'_, AppState>,
+    gesture: crate::operator::EnrollmentGesture,
+) -> Result<aether::certificates::operator_session::OperatorStatus, String> {
+    let gateway = connected_gateway(&state).await.ok();
+    state.operator.begin_enrollment(gesture, gateway).await
+}
+
+/// The files the current session produced, for the window to save.
+#[tauri::command]
+pub(crate) async fn operator_artifacts(
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::operator::OperatorArtifact>, String> {
+    Ok(state.operator.artifacts().await)
+}
+
 /// The ceremony's current state, for a view opened after it started.
 #[tauri::command]
 pub(crate) async fn operator_ceremony_status(
@@ -175,8 +199,6 @@ const NO_CONNECTED_GATEWAY: &str = "Connectez d'abord le profil de la gateway, a
 /// the selected one and its tunnel up, because the admission rides the tunnel
 /// and a gateway reached any other way would not be the one the operator
 /// connected to.
-// The admission gestures that call it arrive in the next tasks of the lot.
-#[allow(dead_code)]
 async fn connected_gateway(state: &AppState) -> Result<String, String> {
     let tunnel = match state.client.call(EngineCommand::GetState).await? {
         EngineReply::State(value) => value,
