@@ -482,3 +482,427 @@ fn an_unreachable_gateway_falls_back_to_the_supplied_leaf_and_it_is_verified() {
     );
     assert!(domain.registry_is_empty());
 }
+
+/// A signed invitation recorded in the domain's registry, and the device's
+/// request for it, built from real keys.
+struct Enrolment {
+    invitation: aether::key_negotiation::EnrollmentInvitation,
+    request: aether::key_negotiation::EnrollmentRequest,
+}
+
+impl Domain {
+    /// Names a CA-TLS in the relay, as an accepted request needs one.
+    fn with_ca_tls(self) -> Self {
+        let csr = aether::certificates::x509::client_rotation_csr("stand-in-ca-tls")
+            .expect("csr")
+            .csr;
+        let vault = astra_operator::store::load(&self.vault_path).expect("vault");
+        let mut relay = astra_operator::handoff::DomainHandoff::beside(&self.vault_path, &vault)
+            .expect("relay");
+        relay.ca_tls_certificate = Some(csr.to_base64());
+        astra_operator::handoff::save(
+            &astra_operator::handoff::path_beside(&self.vault_path),
+            &relay,
+        )
+        .expect("save relay");
+        self
+    }
+
+    /// An invitation this domain signed, recorded as issued, and the request a
+    /// device makes for it. `recorded` is false for an invitation the registry
+    /// has never seen.
+    fn enrolment(&self, name: &str, recorded: bool) -> Enrolment {
+        use aether::certificates::encoding::{Fingerprint, MlDsa87Signature, WireGuardKey};
+        use aether::key_negotiation::{
+            wireguard_proof, EnrollmentInvitation, EnrollmentRequest, ProtectionMode,
+            ENROLLMENT_FORMAT_VERSION, ENROLLMENT_PROTOCOL_VERSION, MAX_INVITATION_LIFETIME_SECS,
+        };
+
+        let now = now_unix();
+        let proof = aether::wg::generate_keypair().expect("proof keys");
+        let proof_private = *WireGuardKey::parse(proof.private_key.expose())
+            .expect("proof private")
+            .as_bytes();
+        let invitation = EnrollmentInvitation {
+            format_version: ENROLLMENT_FORMAT_VERSION,
+            protocol_version: ENROLLMENT_PROTOCOL_VERSION,
+            invitation_id: Id16::new(aether::random::public_bytes().expect("random")).expect("id"),
+            gateway_wg_public_key: WireGuardKey::parse(&self.gateway_key).expect("gateway"),
+            gateway_certificate_fingerprint: Fingerprint::from_bytes([4; 32]),
+            server_name: SERVER_NAME.into(),
+            operator_ca_public_key: self.ca_public_key.clone(),
+            wireguard_proof_public_key: WireGuardKey::parse(&proof.public_key).expect("proof"),
+            not_before_unix: now - 60,
+            not_after_unix: now - 60 + MAX_INVITATION_LIFETIME_SECS,
+            minimum_mode: ProtectionMode::MlKem,
+            allow_readmission: false,
+            operator_signature: MlDsa87Signature::placeholder(),
+        }
+        .sign(&self.ca_private_key)
+        .expect("signed invitation");
+        if recorded {
+            self.registry
+                .issue(&invitation, zeroize::Zeroizing::new(proof_private))
+                .expect("recorded");
+        }
+
+        let device = aether::wg::generate_keypair().expect("device keys");
+        let device_private = *WireGuardKey::parse(device.private_key.expose())
+            .expect("device private")
+            .as_bytes();
+        let (ml_dsa_private, ml_dsa_public) =
+            aether::certificates::encoding::generate_ml_dsa_87_keypair().expect("ml-dsa");
+        let mut request = EnrollmentRequest {
+            format_version: ENROLLMENT_FORMAT_VERSION,
+            protocol_version: ENROLLMENT_PROTOCOL_VERSION,
+            invitation_id: invitation.invitation_id,
+            invitation_fingerprint: invitation.fingerprint(),
+            request_id: Id16::new(aether::random::public_bytes().expect("random")).expect("id"),
+            timestamp_unix: now,
+            requested_name: name.into(),
+            client_wg_public_key: WireGuardKey::parse(&device.public_key).expect("device"),
+            tls_csr: aether::certificates::x509::client_rotation_csr(name)
+                .expect("csr")
+                .csr,
+            client_ml_dsa_87_public_key: ml_dsa_public,
+            wireguard_proof: [0; 32],
+            client_signature: MlDsa87Signature::placeholder(),
+        };
+        request.wireguard_proof =
+            wireguard_proof(&device_private, &invitation, &request).expect("proof");
+        let request = request.sign(&ml_dsa_private).expect("signed request");
+        Enrolment {
+            invitation,
+            request,
+        }
+    }
+
+    fn accept(
+        &self,
+        request: &aether::key_negotiation::EnrollmentRequest,
+        gateway: Option<String>,
+        presses: Receiver<Press>,
+    ) -> (
+        Result<(), String>,
+        Vec<OperatorStatus>,
+        Vec<OperatorArtifact>,
+    ) {
+        let mut published = Vec::new();
+        let mut artifacts = Vec::new();
+        let outcome = run_enrollment_with(
+            Id16::new([2; 16]).expect("id"),
+            EnrollmentGesture::Accept {
+                request: aether::key_negotiation::encode_request_file(request),
+                validity_days: 365,
+                endpoint: "198.51.100.7:51820".into(),
+                allowed_ips: None,
+                ssh_target: None,
+            },
+            gateway,
+            presses,
+            &mut |status| published.push(status),
+            &mut |artifact| artifacts.push(artifact),
+            &self.vault_path,
+            &self.registry,
+        );
+        (outcome, published, artifacts)
+    }
+}
+
+fn no_key_was_asked(published: &[OperatorStatus]) -> bool {
+    published
+        .iter()
+        .all(|status| !matches!(status.gesture, GestureState::AwaitingKey { .. }))
+}
+
+/// An invitation the registry does not know is refused before any key is
+/// asked for, and nothing is written.
+#[test]
+fn a_request_for_an_unknown_invitation_is_refused_before_the_key() {
+    let domain = Domain::new("accept-unknown").with_ca_tls();
+    let unknown = domain.enrolment("laptop", false);
+    let (presses, received) = std::sync::mpsc::channel::<Press>();
+    drop(presses);
+    let (outcome, published, artifacts) = domain.accept(&unknown.request, None, received);
+    outcome.expect_err("an unknown invitation is refused");
+    let last = published.last().expect("a status");
+    assert_eq!(last.gesture, GestureState::Failed);
+    assert_eq!(last.refusal, Some(Refusal::HandoffMismatch));
+    assert!(no_key_was_asked(&published));
+    assert!(artifacts.is_empty());
+    assert!(domain.registry_is_empty());
+}
+
+/// A relay with no CA-TLS cannot issue a client leaf: refused before a key,
+/// naming what is missing.
+#[test]
+fn a_relay_without_ca_tls_is_refused_before_the_key() {
+    let domain = Domain::new("accept-no-ca-tls");
+    let enrolment = domain.enrolment("laptop", true);
+    let (presses, received) = std::sync::mpsc::channel::<Press>();
+    drop(presses);
+    let (outcome, published, _) = domain.accept(&enrolment.request, None, received);
+    let error = outcome.expect_err("no CA-TLS, no leaf");
+    assert!(error.contains("CA-TLS"), "{error}");
+    assert!(no_key_was_asked(&published));
+    let record = domain
+        .registry
+        .load(&enrolment.invitation.invitation_id)
+        .expect("record");
+    assert_eq!(
+        record.state,
+        astra_operator::enrollment::InvitationState::Issued
+    );
+}
+
+/// A consumed invitation is the resumption's business: the refusal says so and
+/// no key is asked for.
+#[test]
+fn accepting_a_consumed_invitation_points_to_resume() {
+    let domain = Domain::new("accept-consumed").with_ca_tls();
+    let enrolment = domain.enrolment("laptop", true);
+    domain
+        .registry
+        .consume(
+            &enrolment.invitation.invitation_id,
+            &enrolment.request,
+            now_unix(),
+        )
+        .expect("consumed");
+    let (presses, received) = std::sync::mpsc::channel::<Press>();
+    drop(presses);
+    let (outcome, published, artifacts) = domain.accept(&enrolment.request, None, received);
+    let error = outcome.expect_err("a consumed invitation is refused");
+    assert_eq!(
+        error,
+        "Cette invitation est déjà consommée : la reprendre depuis la liste des invitations."
+    );
+    assert!(no_key_was_asked(&published));
+    assert!(artifacts.is_empty());
+}
+
+/// The operator can walk away at the key prompt: the manifest was shown, and
+/// the invitation is still issued.
+#[test]
+fn cancelling_before_the_key_consumes_nothing() {
+    let domain = Domain::new("accept-cancel").with_ca_tls();
+    let enrolment = domain.enrolment("laptop", true);
+    let (presses, received) = std::sync::mpsc::channel::<Press>();
+    drop(presses);
+    let (outcome, published, artifacts) = domain.accept(&enrolment.request, None, received);
+    outcome.expect("a cancellation is not a failure");
+    let offered = published
+        .iter()
+        .find(|status| matches!(status.gesture, GestureState::AwaitingKey { .. }))
+        .expect("a key is asked for");
+    match offered.manifest.as_ref().expect("manifest shown first") {
+        AstraManifest::EnrollmentAcceptance(manifest) => {
+            assert_eq!(manifest.invitation_id, enrolment.invitation.invitation_id);
+            assert_eq!(manifest.requested_name, "laptop");
+            assert_eq!(
+                manifest.request_fingerprint,
+                enrolment.request.fingerprint()
+            );
+            assert_eq!(
+                manifest.client_wg_public_key,
+                enrolment.request.client_wg_public_key
+            );
+            assert_eq!(manifest.endpoint, "198.51.100.7:51820");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        published.last().expect("a status").gesture,
+        GestureState::Cancelled
+    );
+    assert!(artifacts.is_empty());
+    let id = enrolment.invitation.invitation_id;
+    assert_eq!(
+        domain.registry.load(&id).expect("record").state,
+        astra_operator::enrollment::InvitationState::Issued
+    );
+    assert!(domain.registry.accepted(&id).expect("readable").is_none());
+}
+
+/// Leaves for a request, with the registry recording them as the invitation's
+/// issuance: what `accept_request` leaves behind, minus the key.
+fn issued_leaves(
+    domain: &Domain,
+    enrolment: &Enrolment,
+) -> astra_operator::enrollment::AcceptedEnrollment {
+    use aether::key_negotiation::{PqCertificate, PqCertificateRole, PQ_CERTIFICATE_VERSION};
+
+    let request = &enrolment.request;
+    domain
+        .registry
+        .consume(&request.invitation_id, request, now_unix())
+        .expect("consumed");
+    let now = now_unix();
+    let pq_certificate = aether::key_negotiation::issue_pq_certificate(
+        PqCertificate {
+            version: PQ_CERTIFICATE_VERSION,
+            serial: [5; 16],
+            subject: request.requested_name.clone(),
+            issuer: "helios-ca-pq".into(),
+            role: PqCertificateRole::Client,
+            wireguard_public_key: request.client_wg_public_key.to_base64(),
+            ml_dsa_87_public_key: request.client_ml_dsa_87_public_key.to_base64(),
+            not_before_unix: now - 60,
+            not_after_unix: now + 86_400,
+            ml_dsa_87_signature: String::new(),
+        },
+        &domain.ca_private_key,
+    )
+    .expect("pq leaf");
+    // The CSR stands in for the TLS leaf: these tests do not parse it.
+    let accepted = astra_operator::enrollment::AcceptedEnrollment {
+        request: request.clone(),
+        tls_certificate: request.tls_csr.clone(),
+        pq_certificate,
+    };
+    domain
+        .registry
+        .record_issued(
+            &request.invitation_id,
+            astra_operator::enrollment::IssuedLeafFingerprints {
+                tls_certificate: accepted.tls_certificate.fingerprint(),
+                pq_certificate: aether::certificates::gateway::pq_certificate_fingerprint(
+                    &accepted.pq_certificate,
+                )
+                .expect("fingerprint"),
+            },
+        )
+        .expect("recorded");
+    accepted
+}
+
+/// Runs the part of an acceptance that follows the issuance, on leaves given.
+fn keep_and_admit_on(
+    domain: &Domain,
+    accepted: &astra_operator::enrollment::AcceptedEnrollment,
+    gateway: Option<&str>,
+) -> (
+    Result<(), String>,
+    Vec<OperatorStatus>,
+    Vec<OperatorArtifact>,
+) {
+    let mut ceremony = Ceremony::new(
+        Id16::new([2; 16]).expect("id"),
+        OperationLocator {
+            kind: OperationKind::AcceptEnrollment,
+            operation_id: None,
+        },
+    );
+    let mut published = Vec::new();
+    let mut artifacts = Vec::new();
+    let kept = keep_leaves(
+        &mut ceremony,
+        &mut |status| published.push(status),
+        &mut |artifact| artifacts.push(artifact),
+        &domain.registry,
+        accepted,
+    );
+    let outcome = kept.and_then(|()| {
+        admit_or_stop(
+            &mut ceremony,
+            &mut |status| published.push(status),
+            &mut |artifact| artifacts.push(artifact),
+            accepted,
+            gateway,
+        )
+    });
+    (outcome, published, artifacts)
+}
+
+/// With the gateway out of reach the acceptance stops after the leaves: they
+/// are kept for the resumption, handed over with the line that admits the
+/// peer by hand, and the refusal is the gateway's.
+#[test]
+fn an_unreachable_gateway_stops_after_the_leaves() {
+    let domain = Domain::new("accept-unreachable").with_ca_tls();
+    let enrolment = domain.enrolment("laptop", true);
+    let accepted = issued_leaves(&domain, &enrolment);
+    let closed = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        format!(
+            "http://127.0.0.1:{}",
+            listener.local_addr().expect("addr").port()
+        )
+    };
+    for gateway in [Some(closed.as_str()), None] {
+        let (outcome, published, artifacts) = keep_and_admit_on(&domain, &accepted, gateway);
+        outcome.expect_err("the acceptance stops here");
+        let last = published.last().expect("a status");
+        assert_eq!(last.refusal, Some(Refusal::GatewayUnavailable));
+        assert_eq!(last.gesture, GestureState::Failed);
+        let stem = enrolment.request.request_id.to_hex();
+        let names: Vec<&str> = artifacts.iter().map(|a| a.file_name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                format!("{stem}-client-cert.der"),
+                format!("{stem}-client-pq-cert.json"),
+                "admission.txt".to_string()
+            ]
+        );
+        assert_eq!(artifacts[0].contents, accepted.tls_certificate.to_base64());
+        let leaf: aether::key_negotiation::PqCertificate =
+            serde_json::from_str(&artifacts[1].contents).expect("the PQ leaf is JSON");
+        assert_eq!(leaf, accepted.pq_certificate);
+    }
+    let id = enrolment.invitation.invitation_id;
+    assert_eq!(
+        domain.registry.accepted(&id).expect("readable"),
+        Some(accepted)
+    );
+    assert!(domain
+        .registry
+        .directory()
+        .join(format!("{}.accepted.json", id.to_hex()))
+        .is_file());
+}
+
+/// The line to paste names the files the operator is handed, not paths of this
+/// machine, and the device's own key.
+#[test]
+fn the_admission_line_names_the_written_leaves() {
+    let domain = Domain::new("accept-line").with_ca_tls();
+    let enrolment = domain.enrolment("laptop $(id)", true);
+    let accepted = issued_leaves(&domain, &enrolment);
+    let (_, _, artifacts) = keep_and_admit_on(&domain, &accepted, None);
+    let stem = enrolment.request.request_id.to_hex();
+    let line = artifacts
+        .iter()
+        .find(|artifact| artifact.file_name == "admission.txt")
+        .expect("the line is handed over");
+    assert_eq!(
+        line.contents.trim_end(),
+        astra_operator::admission::admission_command_line(
+            "laptop $(id)",
+            &enrolment.request.client_wg_public_key.to_base64(),
+            &format!("{stem}-client-cert.der"),
+            &format!("{stem}-client-pq-cert.json"),
+        )
+    );
+    assert!(line.contents.contains("'laptop $(id)'"));
+    assert!(line.contents.contains(&format!("{stem}-client-cert.der")));
+    assert!(line
+        .contents
+        .contains(&format!("{stem}-client-pq-cert.json")));
+}
+
+/// The device names its file; the file name is not the device's to choose.
+#[test]
+fn the_document_is_named_after_a_safe_requested_name() {
+    let id = Id16::new([7; 16]).expect("id");
+    assert_eq!(
+        document_file_name("laptop-alice", &id),
+        "laptop-alice.orion"
+    );
+    for hostile in ["../escape", "a b", "", &"x".repeat(65)] {
+        assert_eq!(
+            document_file_name(hostile, &id),
+            format!("{}.orion", id.to_hex())
+        );
+    }
+}

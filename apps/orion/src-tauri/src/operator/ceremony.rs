@@ -18,14 +18,18 @@
 use std::path::Path;
 use std::sync::mpsc::Receiver;
 
-use aether::certificates::encoding::{Id16, MlDsa87PublicKey, WireGuardKey};
+use aether::certificates::encoding::{DerCertificate, Id16, MlDsa87PublicKey, WireGuardKey};
 use aether::certificates::operator_session::{
-    AstraManifest, GestureState, InvitationManifest, KeyCheckManifest, KeyPurpose, KeySlotLabel,
-    OperationKind, OperationLocator, OperatorAction, OperatorStatus, Refusal, RemoteState,
+    AcceptanceManifest, AstraManifest, GestureState, InvitationManifest, KeyCheckManifest,
+    KeyPurpose, KeySlotLabel, OperationKind, OperationLocator, OperatorAction, OperatorStatus,
+    Refusal, RemoteState,
 };
-use aether::key_negotiation::{encode_invitation_file, PqCertificate, PqCertificateRole};
+use aether::key_negotiation::{
+    decode_request_file, encode_invitation_file, EnrollmentRequest, PqCertificate,
+    PqCertificateRole, ProtectionMode,
+};
 use aether_fido::authenticator::{Authenticator, DialogOwner};
-use astra_operator::enrollment::InvitationRegistry;
+use astra_operator::enrollment::{AcceptedEnrollment, InvitationRegistry};
 use astra_operator::vault::AuthorityVault;
 
 use super::{EnrollmentGesture, OperatorArtifact};
@@ -170,9 +174,31 @@ fn run_enrollment_with(
                 sheet: gateway_pq_certificate.as_deref(),
             },
         ),
+        EnrollmentGesture::Accept {
+            request,
+            validity_days,
+            endpoint,
+            allowed_ips,
+            ssh_target,
+        } => accept(
+            &mut ceremony,
+            &presses,
+            publish,
+            deposit,
+            vault_path,
+            registry,
+            Accept {
+                request: &request,
+                validity_days,
+                endpoint: &endpoint,
+                allowed_ips: allowed_ips.as_deref(),
+                ssh_target: ssh_target.as_deref(),
+                gateway: gateway.as_deref(),
+            },
+        ),
         // Named rather than swallowed, as for the other ceremonies: a gesture
         // this build does not carry yet is said so, not left silent.
-        EnrollmentGesture::Accept { .. } | EnrollmentGesture::Resume { .. } => {
+        EnrollmentGesture::Resume { .. } => {
             ceremony.refuse(Refusal::Internal);
             publish(ceremony.status());
             Err("ce geste d'enrôlement n'est pas encore porté dans ce processus".to_string())
@@ -331,6 +357,445 @@ fn invite(
             publish(ceremony.status());
             Err(format!("{error:#}"))
         }
+    }
+}
+
+/// What the operator decided about one acceptance.
+struct Accept<'a> {
+    /// The contents of the `.helios-request` file the operator chose.
+    request: &'a str,
+    validity_days: u16,
+    /// The gateway's public WireGuard endpoint, as the document will carry it.
+    endpoint: &'a str,
+    allowed_ips: Option<&'a str>,
+    ssh_target: Option<&'a str>,
+    /// The connected gateway's control-plane address, when a tunnel is up.
+    gateway: Option<&'a str>,
+}
+
+const DAY_SECS: u64 = 86_400;
+
+/// How far back the leaves start, so a device whose clock runs a little slow
+/// does not find them "not yet valid".
+const LEAF_BACKDATE_SECS: u64 = 300;
+
+/// What an acceptance is made of, once everything that needs no key has been
+/// verified.
+struct Accepting {
+    vault: AuthorityVault,
+    ca_tls_certificate: DerCertificate,
+    request: EnrollmentRequest,
+    leaf_validity: (u64, u64),
+}
+
+/// §15.2, the acceptance: verify the request, consume its invitation and issue
+/// the two leaves under one key opening, keep them, admit the peer, then sign
+/// the device's document under the same opening.
+///
+/// Everything before the key is a refusal that leaves the registry untouched.
+/// From the consumption on, the invitation stays consumed whatever happens: a
+/// failure is published, the leaves are kept for the resumption, and no leaf
+/// is ever issued twice.
+fn accept(
+    ceremony: &mut Ceremony,
+    presses: &Receiver<Press>,
+    publish: &mut dyn FnMut(OperatorStatus),
+    deposit: &mut dyn FnMut(OperatorArtifact),
+    vault_path: &Path,
+    registry: &InvitationRegistry,
+    accept: Accept<'_>,
+) -> Result<(), String> {
+    let now = now_unix();
+    let accepting = match prepare_acceptance(vault_path, registry, &accept, now) {
+        Ok(accepting) => accepting,
+        Err((refusal, message)) => {
+            ceremony.refuse(refusal);
+            publish(ceremony.status());
+            return Err(message);
+        }
+    };
+    let Accepting {
+        vault,
+        ca_tls_certificate,
+        request,
+        leaf_validity,
+    } = accepting;
+
+    // Shown before any key is asked for anything, and it states what the
+    // consumption and the leaves will be.
+    ceremony.remote = RemoteState::AwaitingOperator;
+    ceremony.manifest = Some(AstraManifest::EnrollmentAcceptance(AcceptanceManifest {
+        invitation_id: request.invitation_id,
+        request_fingerprint: request.fingerprint(),
+        requested_name: request.requested_name.clone(),
+        client_wg_public_key: request.client_wg_public_key,
+        leaves_not_after_unix: leaf_validity.1,
+        endpoint: accept.endpoint.trim().to_string(),
+    }));
+    ceremony.gesture = GestureState::AwaitingKey {
+        index: 1,
+        of: 1,
+        purpose: KeyPurpose::OpenVault,
+    };
+    let offered = ceremony.status();
+    publish(offered.clone());
+
+    let Some(key) = open_key(ceremony, presses, publish, &offered)? else {
+        return Ok(());
+    };
+    let opened = match astra_operator::gestures::open_with_authorized_key(key.as_ref(), &vault, "")
+    {
+        Ok(opened) => opened,
+        Err(error) => {
+            ceremony.refuse(Refusal::KeyNotEnrolled);
+            publish(ceremony.status());
+            return Err(format!("{error:#}"));
+        }
+    };
+    if let Ok(slot) = vault.slot_for_credential(&opened.credential_id) {
+        ceremony.keys.push(KeySlotLabel {
+            slot: "1".to_string(),
+            label: slot.label.clone(),
+        });
+    }
+
+    ceremony.gesture = GestureState::Signing;
+    publish(ceremony.status());
+
+    // One opening for the issuance and for the document: the operator touches
+    // the key once for the whole gesture.
+    let leaves = match astra_operator::signing::accept_request(
+        &vault,
+        &opened,
+        registry,
+        &ca_tls_certificate,
+        &request,
+        leaf_validity,
+        now,
+    ) {
+        Ok(leaves) => leaves,
+        Err(error) => {
+            ceremony.refuse(Refusal::Internal);
+            publish(ceremony.status());
+            return Err(format!("{error:#}"));
+        }
+    };
+    let accepted = AcceptedEnrollment {
+        request,
+        tls_certificate: leaves.tls_certificate,
+        pq_certificate: leaves.pq_certificate,
+    };
+
+    keep_leaves(ceremony, publish, deposit, registry, &accepted)?;
+    if let Err(error) = orion_core::enrollment_draft::check_leaves(
+        &accepted.request,
+        &accepted.tls_certificate,
+        &accepted.pq_certificate,
+    ) {
+        ceremony.refuse(Refusal::ManifestMismatch);
+        publish(ceremony.status());
+        return Err(format!("{error:#}"));
+    }
+    admit_or_stop(ceremony, publish, deposit, &accepted, accept.gateway)?;
+
+    match sign_delivery(registry, &vault, &opened, &accepted, &accept) {
+        Ok(artifact) => {
+            deposit(artifact);
+            ceremony.gesture = GestureState::Done;
+            publish(ceremony.status());
+            Ok(())
+        }
+        Err((refusal, message)) => {
+            ceremony.refuse(refusal);
+            publish(ceremony.status());
+            Err(message)
+        }
+    }
+}
+
+/// Everything that needs no key: the vault and its relay, the request, the
+/// invitation it answers. Anything doubtful is a refusal, and the registry has
+/// not been written.
+fn prepare_acceptance(
+    vault_path: &Path,
+    registry: &InvitationRegistry,
+    accept: &Accept<'_>,
+    now: u64,
+) -> Result<Accepting, (Refusal, String)> {
+    use astra_operator::enrollment::InvitationState;
+
+    let mismatch = |message: String| (Refusal::HandoffMismatch, message);
+    let vault = astra_operator::store::load(vault_path)
+        .map_err(|error| (Refusal::VaultUnavailable, format!("{error:#}")))?;
+    let relay = astra_operator::handoff::DomainHandoff::beside(vault_path, &vault)
+        .map_err(|error| mismatch(format!("{error:#}")))?;
+    let ca_tls_certificate = relay
+        .ca_tls_certificate
+        .as_deref()
+        .ok_or_else(|| {
+            mismatch(
+                "le relais de domaine ne porte aucun CA-TLS : l'émission de CA-TLS doit précéder \
+                 l'acceptation des demandes"
+                    .to_string(),
+            )
+        })
+        .and_then(|encoded| {
+            DerCertificate::parse(encoded).map_err(|error| mismatch(error.to_string()))
+        })?;
+
+    if accept.endpoint.trim().is_empty() {
+        return Err((
+            Refusal::ManifestMismatch,
+            "l'adresse publique de la gateway est vide".to_string(),
+        ));
+    }
+    let request = decode_request_file(accept.request).map_err(|error| {
+        mismatch(format!(
+            "ce fichier n'est pas une demande d'enrôlement : {error}"
+        ))
+    })?;
+    let not_after = u64::from(accept.validity_days)
+        .checked_mul(DAY_SECS)
+        .and_then(|seconds| now.checked_add(seconds))
+        .ok_or_else(|| mismatch("durée de validité hors bornes".to_string()))?;
+
+    let record = registry.load(&request.invitation_id).map_err(|error| {
+        mismatch(format!(
+            "cette invitation est inconnue de ce poste : {error:#}"
+        ))
+    })?;
+    let ca_pq_public_key = MlDsa87PublicKey::parse(vault.ca_pq_public_key.trim())
+        .map_err(|error| mismatch(error.to_string()))?;
+    if record.invitation.operator_ca_public_key != ca_pq_public_key {
+        return Err(mismatch(
+            "cette invitation n'a pas été signée par le CA-PQ de ce coffre".to_string(),
+        ));
+    }
+    match &record.state {
+        InvitationState::Issued => {}
+        InvitationState::Consumed { .. } => {
+            return Err(mismatch(
+                "Cette invitation est déjà consommée : la reprendre depuis la liste des \
+                 invitations."
+                    .to_string(),
+            ))
+        }
+        other => {
+            return Err(mismatch(format!(
+                "cette invitation est {} : elle n'admet plus aucune demande",
+                other.label()
+            )))
+        }
+    }
+    if !record.invitation.is_open_at(now) {
+        return Err(mismatch(
+            "cette invitation a expiré : en émettre une nouvelle".to_string(),
+        ));
+    }
+    request.verify(&record.invitation).map_err(|error| {
+        mismatch(format!(
+            "la demande ne correspond pas à cette invitation : {error}"
+        ))
+    })?;
+
+    Ok(Accepting {
+        vault,
+        ca_tls_certificate,
+        request,
+        leaf_validity: (now.saturating_sub(LEAF_BACKDATE_SECS), not_after),
+    })
+}
+
+/// Keeps the accepted request and its leaves beside the invitation, so a
+/// gesture interrupted from here on resumes without issuing again.
+///
+/// A leaf that cannot be kept is still handed over: the operator holds the only
+/// copy of public material that cost a consumed invitation.
+fn keep_leaves(
+    ceremony: &mut Ceremony,
+    publish: &mut dyn FnMut(OperatorStatus),
+    deposit: &mut dyn FnMut(OperatorArtifact),
+    registry: &InvitationRegistry,
+    accepted: &AcceptedEnrollment,
+) -> Result<(), String> {
+    match registry.store_accepted(&accepted.request.invitation_id, accepted) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let handed = hand_over_leaves(deposit, accepted);
+            ceremony.refuse(Refusal::Internal);
+            publish(ceremony.status());
+            Err(match handed {
+                Ok(()) => format!(
+                    "les feuilles sont émises mais n'ont pas pu être conservées pour la \
+                     reprise : {error:#}"
+                ),
+                Err(second) => format!("{error:#} ; {second}"),
+            })
+        }
+    }
+}
+
+/// Steps 4 and 5: admits the peer on the connected gateway, or stops after the
+/// leaves with the line that admits it by hand.
+///
+/// `Err` is a stop, already published as [`Refusal::GatewayUnavailable`] with
+/// the gateway's reason in French as the message.
+fn admit_or_stop(
+    ceremony: &mut Ceremony,
+    publish: &mut dyn FnMut(OperatorStatus),
+    deposit: &mut dyn FnMut(OperatorArtifact),
+    accepted: &AcceptedEnrollment,
+    gateway: Option<&str>,
+) -> Result<(), String> {
+    use orion_core::gateway_admin as admin;
+
+    let admitted = match gateway {
+        None => Err(
+            "aucune gateway n'est connectée : admettre le pair avec la ligne fournie, \
+                     puis reprendre depuis la liste des invitations"
+                .to_string(),
+        ),
+        Some(base) => admission_of(accepted).and_then(|admission| {
+            admin::orion_client()
+                .and_then(|client| {
+                    tauri::async_runtime::block_on(admin::admit_peer(&client, base, &admission))
+                })
+                .map_err(|error| error.to_string())
+        }),
+    };
+    let Err(message) = admitted else {
+        return Ok(());
+    };
+    let handed = hand_over_leaves(deposit, accepted);
+    ceremony.refuse(Refusal::GatewayUnavailable);
+    publish(ceremony.status());
+    Err(match handed {
+        Ok(()) => message,
+        Err(second) => format!("{message} ; {second}"),
+    })
+}
+
+/// The admission of the device: a plain peer, never an administrator, held to
+/// ML-KEM at least.
+fn admission_of(
+    accepted: &AcceptedEnrollment,
+) -> Result<orion_core::gateway_admin::PeerAdmission, String> {
+    let pq = astra_operator::signing::encode_pq_certificate(&accepted.pq_certificate)
+        .map_err(|error| format!("{error:#}"))?;
+    Ok(orion_core::gateway_admin::PeerAdmission {
+        name: accepted.request.requested_name.clone(),
+        public_key: accepted.request.client_wg_public_key.to_base64(),
+        admin: false,
+        minimum_key_negotiation_mode: ProtectionMode::MlKem,
+        key_negotiation_certificate: accepted.tls_certificate.to_base64(),
+        key_negotiation_pq_certificate: pq,
+    })
+}
+
+/// Deposits the two leaves and the line that admits the peer by hand. The line
+/// names the files deposited, under the names they are saved by.
+fn hand_over_leaves(
+    deposit: &mut dyn FnMut(OperatorArtifact),
+    accepted: &AcceptedEnrollment,
+) -> Result<(), String> {
+    let stem = accepted.request.request_id.to_hex();
+    let tls_name = format!("{stem}-client-cert.der");
+    let pq_name = format!("{stem}-client-pq-cert.json");
+    let pq = serde_json::to_string_pretty(&accepted.pq_certificate)
+        .map_err(|_| "encodage de la feuille PQ".to_string())?;
+    let line = astra_operator::admission::admission_command_line(
+        &accepted.request.requested_name,
+        &accepted.request.client_wg_public_key.to_base64(),
+        &tls_name,
+        &pq_name,
+    );
+    deposit(OperatorArtifact {
+        file_name: tls_name,
+        contents: accepted.tls_certificate.to_base64(),
+    });
+    deposit(OperatorArtifact {
+        file_name: pq_name,
+        contents: pq,
+    });
+    deposit(OperatorArtifact {
+        file_name: "admission.txt".to_string(),
+        contents: format!("{line}\n"),
+    });
+    Ok(())
+}
+
+/// Step 6: reads the gateway, builds the device's document and signs it under
+/// the opening that issued the leaves. Every failure is a published refusal.
+fn sign_delivery(
+    registry: &InvitationRegistry,
+    vault: &AuthorityVault,
+    opened: &astra_operator::authenticator::Opened,
+    accepted: &AcceptedEnrollment,
+    accept: &Accept<'_>,
+) -> Result<OperatorArtifact, (Refusal, String)> {
+    use orion_core::enrollment_draft::{build_draft, resolve_negotiation_endpoint, DraftInput};
+    use orion_core::gateway_admin as admin;
+
+    let unavailable =
+        |error: admin::GatewayAdminError| (Refusal::GatewayUnavailable, error.to_string());
+    let internal = |error: String| (Refusal::Internal, error);
+    let base = accept.gateway.ok_or_else(|| {
+        internal("aucune gateway n'est connectée pour lire sa matière".to_string())
+    })?;
+    let request = &accepted.request;
+    let client = admin::orion_client().map_err(unavailable)?;
+    let (material, admission) = tauri::async_runtime::block_on(admin::gateway_material(
+        &client,
+        base,
+        &request.client_wg_public_key.to_base64(),
+    ))
+    .map_err(unavailable)?;
+    let negotiation_endpoint =
+        resolve_negotiation_endpoint(accept.endpoint.trim(), None, material.negotiation_port)
+            .map_err(|error| internal(format!("{error:#}")))?;
+    let draft = build_draft(DraftInput {
+        request,
+        tls_certificate: accepted.tls_certificate.clone(),
+        pq_certificate: &accepted.pq_certificate,
+        material: &material,
+        admission,
+        endpoint: accept.endpoint.trim(),
+        negotiation_endpoint,
+        allowed_ips: accept.allowed_ips,
+        ssh_target: accept.ssh_target,
+        now_unix: now_unix(),
+    })
+    .map_err(|error| internal(format!("{error:#}")))?;
+    // Read as Orion will read it before anyone signs it: a document Orion
+    // would refuse must not cost a signature.
+    let json = draft
+        .to_json()
+        .map_err(|error| internal(format!("encodage du brouillon : {error}")))?;
+    orion_core::parse_profile_import(&json, "draft.orion").map_err(|error| {
+        internal(format!(
+            "le brouillon n'est pas lisible par Orion : {error:#}"
+        ))
+    })?;
+
+    let signed = astra_operator::signing::sign_document(vault, opened, registry, draft)
+        .map_err(|error| internal(format!("{error:#}")))?;
+    let contents = signed
+        .to_json()
+        .map_err(|error| internal(format!("encodage du document : {error}")))?;
+    Ok(OperatorArtifact {
+        file_name: document_file_name(&request.requested_name, &request.request_id),
+        contents,
+    })
+}
+
+/// `<requested_name>.orion` when the name is one a file can safely carry, else
+/// `<request_id>.orion`: the name is the device's choice, and the file name is
+/// not.
+fn document_file_name(requested_name: &str, request_id: &Id16) -> String {
+    if super::valid_invitation_name(requested_name) {
+        format!("{requested_name}.orion")
+    } else {
+        format!("{}.orion", request_id.to_hex())
     }
 }
 
