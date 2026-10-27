@@ -33,6 +33,7 @@ pub mod endpoint_resolution;
 pub mod enrollment;
 pub mod enrollment_draft;
 pub mod events;
+pub mod gateway_admin;
 pub mod identity_store;
 pub mod key_negotiation;
 pub mod mtu;

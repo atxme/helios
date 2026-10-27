@@ -5,6 +5,7 @@ use super::*;
 use aether::key_negotiation::{
     decode_request_file, encode_invitation_file, EnrollmentDocument, PqCertificate,
 };
+use astra_operator::admission::admission_command_line;
 use astra_operator::enrollment::{InvitationRegistry, InvitationState};
 use astra_operator::overview::grouped_hex;
 
@@ -204,12 +205,13 @@ fn accept(
     println!();
     println!("Admettre le pair sur la gateway :");
     println!(
-        "  heliosd peer add --name {} --public-key {} --certificate {} --pq-certificate {} \
-         --minimum-mode ml-kem",
-        shell_word(&request.requested_name),
-        request.client_wg_public_key,
-        shell_word(&tls_path.display().to_string()),
-        shell_word(&pq_path.display().to_string()),
+        "  {}",
+        admission_command_line(
+            &request.requested_name,
+            &request.client_wg_public_key.to_string(),
+            &tls_path.display().to_string(),
+            &pq_path.display().to_string(),
+        )
     );
     println!("puis préparer le document : helios enroll document --request …");
     Ok(())
@@ -279,17 +281,4 @@ fn read_text(path: &Path) -> Result<String> {
 fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     aether::private_file::write_private_atomic(path, bytes)
         .with_context(|| format!("écriture de {}", path.display()))
-}
-
-/// One POSIX shell word, quoted only when it needs to be.
-pub(crate) fn shell_word(value: &str) -> String {
-    let plain = !value.is_empty()
-        && value
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "-_./=:+,@".contains(c));
-    if plain {
-        value.to_string()
-    } else {
-        format!("'{}'", value.replace('\'', "'\\''"))
-    }
 }

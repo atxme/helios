@@ -84,9 +84,3 @@ fn enroll_subcommands_parse() {
         assert!(Cli::try_parse_from(&words).is_err(), "{refused}");
     }
 }
-
-#[test]
-fn a_shell_word_survives_quotes_and_spaces() {
-    assert_eq!(shell_word("laptop-alice"), "laptop-alice");
-    assert_eq!(shell_word("poste d'alice"), "'poste d'\\''alice'");
-}

@@ -3,7 +3,7 @@
 
 use super::*;
 
-use orion_engine::{EngineCommand, EngineReply};
+use orion_engine::{ConfigView, EngineCommand, EngineReply};
 
 /// Opens the two-key CA-TLS ceremony described in ADR-008 §9.4.
 ///
@@ -164,3 +164,45 @@ pub(crate) async fn operator_overview() -> Result<astra_operator::overview::Vaul
     let path = astra_operator::store::default_path().map_err(|error| error.to_string())?;
     astra_operator::overview::read(&path).map_err(|error| error.to_string())
 }
+
+const NO_CONNECTED_GATEWAY: &str = "Connectez d'abord le profil de la gateway, avec un pair \
+                                    administrateur : l'admission passe par le tunnel.";
+
+/// The control-plane address the operator gestures reach the gateway at.
+///
+/// Read here, from the engine, and never taken from the WebView: the page names
+/// a gesture, not the machine it is carried out against. The profile must be
+/// the selected one and its tunnel up, because the admission rides the tunnel
+/// and a gateway reached any other way would not be the one the operator
+/// connected to.
+// The admission gestures that call it arrive in the next tasks of the lot.
+#[allow(dead_code)]
+async fn connected_gateway(state: &AppState) -> Result<String, String> {
+    let tunnel = match state.client.call(EngineCommand::GetState).await? {
+        EngineReply::State(value) => value,
+        _ => return Err(unexpected_engine_reply()),
+    };
+    let view = match state.client.call(EngineCommand::GetConfig).await? {
+        EngineReply::Config(value) => value,
+        _ => return Err(unexpected_engine_reply()),
+    };
+    gateway_url(&tunnel, &view)
+}
+
+/// The decision of [`connected_gateway`], on what the engine answered.
+fn gateway_url(state: &str, view: &ConfigView) -> Result<String, String> {
+    if aether::TunnelState::parse(state) != Some(aether::TunnelState::Up) {
+        return Err(NO_CONNECTED_GATEWAY.to_string());
+    }
+    view.selected
+        .as_deref()
+        .and_then(|name| view.profiles.iter().find(|profile| profile.name == name))
+        .and_then(|profile| profile.heliosd_url.as_deref())
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| NO_CONNECTED_GATEWAY.to_string())
+}
+
+#[cfg(test)]
+mod tests;
