@@ -86,11 +86,6 @@ fn enroll_subcommands_parse() {
 }
 
 #[test]
-fn a_fingerprint_is_shown_in_groups_of_four() {
-    assert_eq!(grouped_hex("0123456789abcdef"), "0123 4567 89ab cdef");
-}
-
-#[test]
 fn a_shell_word_survives_quotes_and_spaces() {
     assert_eq!(shell_word("laptop-alice"), "laptop-alice");
     assert_eq!(shell_word("poste d'alice"), "'poste d'\\''alice'");

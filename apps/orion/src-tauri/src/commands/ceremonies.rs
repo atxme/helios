@@ -153,3 +153,14 @@ pub(crate) async fn operator_ceremony_status(
 ) -> Result<Option<aether::certificates::operator_session::OperatorStatus>, String> {
     Ok(state.operator.status().await)
 }
+
+/// The operator vault and its trust domain, read without any key.
+///
+/// Nothing is unwrapped: the slots come back as identifier, label and role, and
+/// the domain as the public values of the relay beside the vault. No PIN and no
+/// security key are involved, so this is safe to call whenever the tab opens.
+#[tauri::command]
+pub(crate) async fn operator_overview() -> Result<astra_operator::overview::VaultOverview, String> {
+    let path = astra_operator::store::default_path().map_err(|error| error.to_string())?;
+    astra_operator::overview::read(&path).map_err(|error| error.to_string())
+}

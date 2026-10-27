@@ -785,6 +785,7 @@ fn main() {
             advance_operator_ceremony,
             dismiss_operator_ceremony,
             operator_ceremony_status,
+            operator_overview,
             operator_pending_operations,
         ])
         .build(tauri::generate_context!())

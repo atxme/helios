@@ -6,6 +6,7 @@ use aether::key_negotiation::{
     decode_request_file, encode_invitation_file, EnrollmentDocument, PqCertificate,
 };
 use astra_operator::enrollment::{InvitationRegistry, InvitationState};
+use astra_operator::overview::grouped_hex;
 
 pub(crate) fn enroll(path: &Path, command: EnrollCommand, transport: Transport) -> Result<()> {
     let registry = InvitationRegistry::default_location()?;
@@ -278,15 +279,6 @@ fn read_text(path: &Path) -> Result<String> {
 fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     aether::private_file::write_private_atomic(path, bytes)
         .with_context(|| format!("écriture de {}", path.display()))
-}
-
-/// A hexadecimal fingerprint in groups of four, as it is read aloud.
-pub(crate) fn grouped_hex(hex: &str) -> String {
-    hex.as_bytes()
-        .chunks(4)
-        .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 /// One POSIX shell word, quoted only when it needs to be.

@@ -906,3 +906,30 @@ export interface PendingEnrollment {
   created_at_unix: number
   invitation_expires_at_unix: number
 }
+
+/* Le coffre opérateur lu sans clé : aucun matériel chiffré n'y figure. */
+export interface SlotView {
+  slot_id: string
+  label: string
+  role: 'principale' | 'recuperation'
+}
+
+export interface DomainView {
+  trust_domain_id: string
+  rp_id: string
+  ca_pq_fingerprint: string
+  ca_epoch: number | null
+  ca_tls_epoch: number | null
+  ca_tls_present: boolean
+  server_name: string | null
+  gateway_wg_public_key: string | null
+}
+
+export interface VaultOverview {
+  vault_path: string
+  exists: boolean
+  vault_fingerprint: string | null
+  slots: SlotView[]
+  max_slots: number
+  domain: DomainView | null
+}

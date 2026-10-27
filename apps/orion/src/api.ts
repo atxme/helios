@@ -5,6 +5,7 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import type {
+  VaultOverview,
   About,
   ApprovalManifest,
   AstraRotationInput,
@@ -315,6 +316,9 @@ export const dismissOperatorCeremony = () => invoke<void>('dismiss_operator_cere
 
 export const operatorCeremonyStatus = () =>
   invoke<OperatorStatus | null>('operator_ceremony_status')
+
+/** The operator vault and its trust domain, read without any key or PIN. */
+export const operatorOverview = () => invoke<VaultOverview>('operator_overview')
 
 /** Installs and commits the grant released by the matching §7.5 ceremony. */
 export const resumeCertificateRecovery = (operationId: string) =>
