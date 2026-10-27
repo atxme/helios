@@ -17,15 +17,12 @@ use std::path::{Path, PathBuf};
 
 use aether::certificates::encoding::DerCertificate;
 use aether::key_negotiation::{decode_request_file, EnrollmentRequest, PqCertificate};
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use base64::Engine as _;
-use reqwest::Client;
 
 use orion_core::enrollment_draft::{
     build_draft, check_leaves, resolve_negotiation_endpoint, Admission, DraftInput, GatewayMaterial,
 };
-
-use crate::{api, profile};
 
 pub struct DocumentOptions {
     /// The client's `.helios-request`.
@@ -150,7 +147,7 @@ fn offline_material(inputs: &OfflineInputs) -> Result<GatewayMaterial> {
     })
 }
 
-pub async fn document(client: &Client, base: &str, options: DocumentOptions) -> Result<()> {
+pub async fn document(base: &str, options: DocumentOptions) -> Result<()> {
     let request = read_request(&options.request)?;
     let tls_certificate =
         DerCertificate::new(read_file(&options.tls_certificate)?).with_context(|| {
@@ -185,7 +182,7 @@ pub async fn document(client: &Client, base: &str, options: DocumentOptions) -> 
                     .transpose()?,
             },
         ),
-        None => online_material(client, base, &client_key).await?,
+        None => online_material(base, &client_key).await?,
     };
     let negotiation_endpoint = resolve_negotiation_endpoint(
         &options.endpoint,
@@ -214,68 +211,13 @@ pub async fn document(client: &Client, base: &str, options: DocumentOptions) -> 
     Ok(())
 }
 
-async fn online_material(
-    client: &Client,
-    base: &str,
-    client_key: &str,
-) -> Result<(GatewayMaterial, Admission)> {
-    let network = api::network(client, base).await?;
-    let gateway_public_key = network
-        .wg_public_key
-        .clone()
-        .filter(|key| !key.is_empty())
-        .context(
-            "the gateway has no WireGuard identity yet — run `heliosd init-identity` on the \
-             gateway, with console access",
-        )?;
-    let negotiation = api::key_negotiation(client, base).await?.context(
-        "this gateway serves no key-negotiation material — build heliosd with the \
-         `key-negotiation` feature and run `heliosd init-key-negotiation`",
-    )?;
-    // The gateway certificate is pinned to a WireGuard key. If that is not
-    // the identity the gateway actually runs on, every client built here
-    // would fail its pinning check — and the message would blame the client.
-    if negotiation.wireguard_public_key != gateway_public_key {
-        bail!(
-            "the gateway negotiation certificate is bound to another WireGuard identity: it pins \
-             {}, while the gateway runs {}. Its identity was rotated without reissuing the \
-             certificate — re-run `heliosd init-key-negotiation --rotate`.",
-            negotiation.wireguard_public_key,
-            gateway_public_key
-        );
-    }
-    let peer = network
-        .peers
-        .iter()
-        .find(|peer| peer.public_key.trim() == client_key)
-        .with_context(|| {
-            format!(
-                "no peer holds the key {client_key} on this gateway: admit it first with the \
-                 `heliosd peer add` line `astra-signer enroll accept` printed"
-            )
-        })?;
-    let admission = Admission {
-        address: peer.address.clone(),
-        address_v6: peer
-            .address_v6
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string),
-        heliosd_url: profile::heliosd_url(&network.wg_address),
-        trust: api::trust_enrolment(client, base, client_key).await?,
-    };
-    Ok((
-        GatewayMaterial {
-            server_name: negotiation.server_name,
-            gateway_ca_der: negotiation.gateway_ca_der,
-            gateway_pq_certificate: negotiation.gateway_pq_certificate,
-            wireguard_public_key: negotiation.wireguard_public_key,
-            pq_certificate_sha256: negotiation.pq_certificate_sha256,
-            negotiation_port: negotiation.port,
-        },
-        admission,
-    ))
+/// The gateway's material and the admission of a client it already holds.
+///
+/// One copy of this logic, shared with Orion: `orion_core::gateway_admin`.
+async fn online_material(base: &str, client_key: &str) -> Result<(GatewayMaterial, Admission)> {
+    orion_core::gateway_admin::gateway_material(base, client_key)
+        .await
+        .map_err(anyhow::Error::from)
 }
 
 fn read_request(path: &Path) -> Result<EnrollmentRequest> {

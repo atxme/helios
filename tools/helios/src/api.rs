@@ -80,8 +80,6 @@ pub struct CmdResp {
 pub struct KeyNegotiationView {
     pub port: Option<u16>,
     pub server_name: String,
-    pub gateway_ca_der: String,
-    pub gateway_pq_certificate: String,
     pub pq_certificate_sha256: String,
     pub wireguard_public_key: String,
 }
@@ -103,59 +101,6 @@ pub async fn key_negotiation(client: &Client, base: &str) -> Result<Option<KeyNe
     let status = response.status();
     let text = response.text().await.context("unreadable response body")?;
     decode_response(status, &text, "/api/key-negotiation").map(Some)
-}
-
-/// Trust material for one admitted peer, from
-/// `GET /api/key-negotiation/trust-enrolment/<public key>` (spec §19).
-///
-/// The whole block, read in one call and under one lock on the gateway. An
-/// epoch taken from one moment beside an anchor from another would pin a pair
-/// that never existed together, and the mismatch surfaces at the first
-/// renewal — 80 % into a leaf's life, on a client with no fallback.
-///
-/// Deserialized into `orion_core::TrustMaterial` directly: the profile writes
-/// exactly what the gateway serves, and a struct in between would be a second
-/// place for these eleven values to drift.
-pub async fn trust_enrolment(
-    client: &Client,
-    base: &str,
-    peer_public_key: &str,
-) -> Result<Option<orion_core::TrustMaterial>> {
-    let path = format!(
-        "/api/key-negotiation/trust-enrolment/{}",
-        urlencoding(peer_public_key)
-    );
-    let response = client
-        .get(format!("{base}{path}"))
-        .send()
-        .await
-        .context("connection refused — is heliosd reachable?")?;
-    if response.status() == reqwest::StatusCode::NOT_FOUND {
-        // Legitimate: a gateway whose trust domain is not bootstrapped, or a
-        // peer admitted before it was. The caller decides whether it can emit
-        // a profile without renewal rather than being stopped here.
-        return Ok(None);
-    }
-    let status = response.status();
-    let text = response.text().await.context("unreadable response body")?;
-    decode_response(status, &text, &path).map(Some)
-}
-
-/// Percent-encodes what a WireGuard key can contain and a path segment cannot.
-///
-/// Base64 keys carry `+` and `/`, and `/` would silently split the segment —
-/// the gateway would then look up a truncated key and answer «no such peer»,
-/// which points at the admission rather than at the encoding.
-fn urlencoding(value: &str) -> String {
-    value
-        .bytes()
-        .map(|byte| match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                (byte as char).to_string()
-            }
-            _ => format!("%{byte:02X}"),
-        })
-        .collect()
 }
 
 pub async fn network(client: &Client, base: &str) -> Result<NetworkConfigView> {

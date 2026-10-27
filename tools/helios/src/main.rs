@@ -898,7 +898,6 @@ async fn execute_command(api: &transport::Api, command: Cmd) -> Result<()> {
                 _ => None,
             };
             enroll::document(
-                client,
                 base,
                 enroll::DocumentOptions {
                     request,
