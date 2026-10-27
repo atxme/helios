@@ -147,7 +147,11 @@ fn offline_material(inputs: &OfflineInputs) -> Result<GatewayMaterial> {
     })
 }
 
-pub async fn document(base: &str, options: DocumentOptions) -> Result<()> {
+pub async fn document(
+    client: &reqwest::Client,
+    base: &str,
+    options: DocumentOptions,
+) -> Result<()> {
     let request = read_request(&options.request)?;
     let tls_certificate =
         DerCertificate::new(read_file(&options.tls_certificate)?).with_context(|| {
@@ -182,7 +186,7 @@ pub async fn document(base: &str, options: DocumentOptions) -> Result<()> {
                     .transpose()?,
             },
         ),
-        None => online_material(base, &client_key).await?,
+        None => online_material(client, base, &client_key).await?,
     };
     let negotiation_endpoint = resolve_negotiation_endpoint(
         &options.endpoint,
@@ -214,8 +218,12 @@ pub async fn document(base: &str, options: DocumentOptions) -> Result<()> {
 /// The gateway's material and the admission of a client it already holds.
 ///
 /// One copy of this logic, shared with Orion: `orion_core::gateway_admin`.
-async fn online_material(base: &str, client_key: &str) -> Result<(GatewayMaterial, Admission)> {
-    orion_core::gateway_admin::gateway_material(base, client_key)
+async fn online_material(
+    client: &reqwest::Client,
+    base: &str,
+    client_key: &str,
+) -> Result<(GatewayMaterial, Admission)> {
+    orion_core::gateway_admin::gateway_material(client, base, client_key)
         .await
         .map_err(anyhow::Error::from)
 }

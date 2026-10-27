@@ -105,15 +105,21 @@ fn an_admission_with_unreadable_leaves_is_refused_before_any_request() {
 
 #[test]
 fn the_status_decides_the_error() {
-    assert_eq!(status_error(401), GatewayAdminError::Forbidden);
-    assert_eq!(status_error(403), GatewayAdminError::Forbidden);
+    assert_eq!(status_error(401, b""), GatewayAdminError::Forbidden);
+    assert_eq!(status_error(403, b""), GatewayAdminError::Forbidden);
     assert_eq!(
-        status_error(409),
-        GatewayAdminError::Refused { status: 409 }
+        status_error(409, b"name taken"),
+        GatewayAdminError::Refused {
+            status: 409,
+            reason: Some("name taken".into())
+        }
     );
     assert_eq!(
-        status_error(500),
-        GatewayAdminError::Refused { status: 500 }
+        status_error(500, b""),
+        GatewayAdminError::Refused {
+            status: 500,
+            reason: None
+        }
     );
 }
 
@@ -122,6 +128,10 @@ fn a_forbidden_admission_names_the_admin_flag() {
     let message = GatewayAdminError::Forbidden.to_string();
     assert!(message.contains("`admin`"), "{message}");
     assert!(message.contains("pair"), "{message}");
+}
+
+fn client() -> reqwest::Client {
+    reqwest::Client::new()
 }
 
 type Routes = Vec<(&'static str, u16, String)>;
@@ -172,11 +182,13 @@ async fn an_unreachable_gateway_is_its_own_error() {
     drop(listener);
     let base = format!("http://127.0.0.1:{port}");
     assert_eq!(
-        admitted_keys(&base).await.unwrap_err(),
+        admitted_keys(&client(), &base).await.unwrap_err(),
         GatewayAdminError::Unreachable
     );
     assert_eq!(
-        admit_peer(&base, &admission()).await.unwrap_err(),
+        admit_peer(&client(), &base, &admission())
+            .await
+            .unwrap_err(),
         GatewayAdminError::Unreachable
     );
 }
@@ -184,7 +196,9 @@ async fn an_unreachable_gateway_is_its_own_error() {
 #[tokio::test]
 async fn a_gateway_refusing_the_peer_is_forbidden() {
     let (base, _) = fake_gateway(vec![("/api/peers", 403, "secret detail".into())]).await;
-    let error = admit_peer(&base, &admission()).await.unwrap_err();
+    let error = admit_peer(&client(), &base, &admission())
+        .await
+        .unwrap_err();
     assert_eq!(error, GatewayAdminError::Forbidden);
     assert!(!format!("{error:?}{error}").contains("secret detail"));
 }
@@ -192,7 +206,9 @@ async fn a_gateway_refusing_the_peer_is_forbidden() {
 #[tokio::test]
 async fn an_admission_the_gateway_accepts_returns_nothing() {
     let (base, seen) = fake_gateway(vec![("/api/peers", 200, "{}".into())]).await;
-    admit_peer(&format!("{base}/"), &admission()).await.unwrap();
+    admit_peer(&client(), &format!("{base}/"), &admission())
+        .await
+        .unwrap();
     assert_eq!(
         seen.lock().unwrap().as_slice(),
         ["POST /api/peers HTTP/1.1"]
@@ -209,7 +225,10 @@ async fn the_admitted_keys_are_those_of_the_peers() {
         ]
     });
     let (base, _) = fake_gateway(vec![("/api/network", 200, network.to_string())]).await;
-    assert_eq!(admitted_keys(&base).await.unwrap(), ["AAA", "BBB"]);
+    assert_eq!(
+        admitted_keys(&client(), &base).await.unwrap(),
+        ["AAA", "BBB"]
+    );
 }
 
 fn negotiation_view(bound_to: &str) -> String {
@@ -237,7 +256,7 @@ async fn the_negotiation_needs_no_client_key() {
         ("/api/key-negotiation", 200, negotiation_view(GATEWAY_KEY)),
     ])
     .await;
-    let material = gateway_negotiation(&base).await.unwrap();
+    let material = gateway_negotiation(&client(), &base).await.unwrap();
     assert_eq!(material.server_name, "vpn.example.net");
     assert_eq!(material.negotiation_port, Some(51821));
     assert_eq!(seen.lock().unwrap().len(), 2);
@@ -251,7 +270,7 @@ async fn a_certificate_bound_to_another_identity_is_refused() {
     ])
     .await;
     assert!(matches!(
-        gateway_negotiation(&base).await,
+        gateway_negotiation(&client(), &base).await,
         Err(GatewayAdminError::Invalid(_))
     ));
     let (base, _) = fake_gateway(vec![
@@ -260,7 +279,7 @@ async fn a_certificate_bound_to_another_identity_is_refused() {
     ])
     .await;
     assert!(matches!(
-        gateway_negotiation(&base).await,
+        gateway_negotiation(&client(), &base).await,
         Err(GatewayAdminError::Invalid(_))
     ));
 }
@@ -275,7 +294,9 @@ async fn the_material_names_the_peer_and_tolerates_a_missing_trust_block() {
         (trust_path, 404, String::new()),
     ])
     .await;
-    let (material, admission) = gateway_material(&base, CLIENT_KEY).await.unwrap();
+    let (material, admission) = gateway_material(&client(), &base, CLIENT_KEY)
+        .await
+        .unwrap();
     assert_eq!(material.wireguard_public_key, GATEWAY_KEY);
     assert_eq!(admission.address, "100.64.1.2/32");
     assert_eq!(admission.address_v6, None);
@@ -285,6 +306,68 @@ async fn the_material_names_the_peer_and_tolerates_a_missing_trust_block() {
     );
     assert!(admission.trust.is_none());
 
-    let error = gateway_material(&base, "UnknownKey").await.err().unwrap();
+    let error = gateway_material(&client(), &base, "UnknownKey")
+        .await
+        .err()
+        .unwrap();
     assert!(matches!(error, GatewayAdminError::Invalid(_)), "{error:?}");
+}
+
+#[test]
+fn a_reason_is_bounded_and_stripped_of_control_characters() {
+    let long = "x".repeat(500);
+    let reason = reason_of(format!("  peer\u{1b}[31m {long}\n").as_bytes()).unwrap();
+    assert_eq!(reason.chars().count(), MAX_REASON_CHARS);
+    assert!(reason.starts_with("peer[31m x"), "{reason}");
+    assert_eq!(reason_of(b" \n "), None);
+}
+
+#[tokio::test]
+async fn a_conflicting_admission_shows_the_gateways_reason() {
+    let (base, _) = fake_gateway(vec![(
+        "/api/peers",
+        409,
+        "peer name 'alice' is already taken".into(),
+    )])
+    .await;
+    let error = admit_peer(&client(), &base, &admission())
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error,
+        GatewayAdminError::Refused {
+            status: 409,
+            reason: Some("peer name 'alice' is already taken".into())
+        }
+    );
+    assert_eq!(
+        error.to_string(),
+        "La gateway a refusé la demande (HTTP 409) : peer name 'alice' is already taken"
+    );
+}
+
+/// The caller's client is the one that talks: its default header reaches the
+/// gateway, which a client built inside the module could never carry.
+#[tokio::test]
+async fn the_callers_client_is_the_one_used() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buffer = vec![0u8; 4096];
+        let read = stream.read(&mut buffer).await.unwrap();
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 17\r\nConnection: close\r\n\r\n{\"peers\":[],\"wg_address\":\"\"}")
+            .await
+            .unwrap();
+        String::from_utf8_lossy(&buffer[..read]).to_ascii_lowercase()
+    });
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert("x-caller-client", "marker".parse().unwrap());
+    let caller = reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .unwrap();
+    let _ = admitted_keys(&caller, &base).await;
+    assert!(server.await.unwrap().contains("x-caller-client: marker"));
 }

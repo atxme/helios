@@ -6,10 +6,11 @@
 //! WireGuard peer, so the only credential is the tunnel itself: nothing in this
 //! module holds, sends or logs a token.
 //!
-//! Bodies are read through a bound and never copied into an error. A refusal
-//! carries its status and nothing the gateway wrote.
-
-use std::time::Duration;
+//! The caller supplies the HTTP client: the operator CLI reaches the gateway
+//! through its local administration socket, Orion through the tunnel, and a
+//! client built here would silently take the wrong road. Bodies are read
+//! through a bound; a refusal keeps only the gateway's own error text, trimmed
+//! of control characters and cut short.
 
 use aether::certificates::encoding::DerCertificate;
 use aether::key_negotiation::{PqCertificate, ProtectionMode};
@@ -20,8 +21,8 @@ use serde::{Deserialize, Serialize};
 use crate::enrollment_draft::{Admission, GatewayMaterial};
 use crate::TrustMaterial;
 
-/// A control-plane call that outlives this has lost its tunnel.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+/// The longest refusal reason kept, in characters.
+const MAX_REASON_CHARS: usize = 200;
 
 /// The largest answer read: far above any real view, far below a memory risk.
 const MAX_BODY_BYTES: usize = 1024 * 1024;
@@ -38,9 +39,10 @@ pub enum GatewayAdminError {
         "La gateway refuse cette machine : le pair de ce poste doit porter le drapeau `admin`."
     )]
     Forbidden,
-    /// Any other refusal. The status is kept; the body is not.
-    #[error("La gateway a refusé la demande (HTTP {status}).")]
-    Refused { status: u16 },
+    /// Any other refusal: the status, and the reason the gateway gave when its
+    /// answer was a readable error text.
+    #[error("{}", refusal_message(*status, reason.as_deref()))]
+    Refused { status: u16, reason: Option<String> },
     /// An answer the gateway should not have given, or a body that cannot be sent.
     #[error("Réponse de la gateway inacceptable : {0}")]
     Invalid(String),
@@ -100,22 +102,36 @@ struct NegotiationView {
     wireguard_public_key: String,
 }
 
-fn status_error(status: u16) -> GatewayAdminError {
+fn refusal_message(status: u16, reason: Option<&str>) -> String {
+    match reason {
+        Some(reason) => format!("La gateway a refusé la demande (HTTP {status}) : {reason}"),
+        None => format!("La gateway a refusé la demande (HTTP {status})."),
+    }
+}
+
+/// The gateway's error text, safe to show: no control characters, bounded.
+/// The gateway's mutation routes answer a refusal in plain text.
+fn reason_of(body: &[u8]) -> Option<String> {
+    let text: String = String::from_utf8_lossy(body)
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect();
+    let text: String = text.trim().chars().take(MAX_REASON_CHARS).collect();
+    (!text.is_empty()).then_some(text)
+}
+
+fn status_error(status: u16, body: &[u8]) -> GatewayAdminError {
     match status {
         401 | 403 => GatewayAdminError::Forbidden,
-        status => GatewayAdminError::Refused { status },
+        status => GatewayAdminError::Refused {
+            status,
+            reason: reason_of(body),
+        },
     }
 }
 
 fn invalid(reason: &str) -> GatewayAdminError {
     GatewayAdminError::Invalid(reason.to_string())
-}
-
-fn http_client() -> Result<Client, GatewayAdminError> {
-    Client::builder()
-        .timeout(REQUEST_TIMEOUT)
-        .build()
-        .map_err(|_| invalid("le client HTTP n'a pas pu être construit"))
 }
 
 fn url(base: &str, path: &str) -> String {
@@ -153,7 +169,7 @@ async fn get(
     match status {
         200..=299 => Ok(Some(body)),
         404 => Ok(None),
-        status => Err(status_error(status)),
+        status => Err(status_error(status, &body)),
     }
 }
 
@@ -244,9 +260,11 @@ async fn negotiate(
 /// An invitation is issued before the client exists, so it can ask nothing
 /// about a peer: only the network, the negotiation, and the check that the two
 /// name the same WireGuard identity.
-pub async fn gateway_negotiation(base: &str) -> Result<GatewayMaterial, GatewayAdminError> {
-    let client = http_client()?;
-    negotiate(&client, base).await.map(|(material, _)| material)
+pub async fn gateway_negotiation(
+    client: &Client,
+    base: &str,
+) -> Result<GatewayMaterial, GatewayAdminError> {
+    negotiate(client, base).await.map(|(material, _)| material)
 }
 
 /// The material and the admission of a client the gateway already holds.
@@ -254,11 +272,11 @@ pub async fn gateway_negotiation(base: &str) -> Result<GatewayMaterial, GatewayA
 /// The peer must be admitted first: its address is derived by the gateway and
 /// is the only thing that cannot be computed here.
 pub async fn gateway_material(
+    client: &Client,
     base: &str,
     client_key: &str,
 ) -> Result<(GatewayMaterial, Admission), GatewayAdminError> {
-    let client = http_client()?;
-    let (material, network) = negotiate(&client, base).await?;
+    let (material, network) = negotiate(client, base).await?;
     let peer = network
         .peers
         .iter()
@@ -274,7 +292,7 @@ pub async fn gateway_material(
     );
     // `404` is legitimate: a trust domain not bootstrapped yet, or a peer
     // admitted before it was. The caller decides whether it can go on.
-    let trust = match get(&client, base, &trust_path).await? {
+    let trust = match get(client, base, &trust_path).await? {
         Some(body) => Some(decode::<TrustMaterial>(&body, "le bloc de confiance")?),
         None => None,
     };
@@ -293,9 +311,8 @@ pub async fn gateway_material(
 }
 
 /// The public keys of every peer the gateway has admitted.
-pub async fn admitted_keys(base: &str) -> Result<Vec<String>, GatewayAdminError> {
-    let client = http_client()?;
-    let network = network_view(&client, base).await?;
+pub async fn admitted_keys(client: &Client, base: &str) -> Result<Vec<String>, GatewayAdminError> {
+    let network = network_view(client, base).await?;
     Ok(network
         .peers
         .into_iter()
@@ -328,10 +345,13 @@ fn admission_body(admission: &PeerAdmission) -> Result<Vec<u8>, GatewayAdminErro
 
 /// Admits a peer. The gateway derives its address; read it back with
 /// [`gateway_material`].
-pub async fn admit_peer(base: &str, admission: &PeerAdmission) -> Result<(), GatewayAdminError> {
+pub async fn admit_peer(
+    client: &Client,
+    base: &str,
+    admission: &PeerAdmission,
+) -> Result<(), GatewayAdminError> {
     let body = admission_body(admission)?;
-    let client = http_client()?;
-    let (status, _) = exchange(
+    let (status, response) = exchange(
         client
             .post(url(base, "/api/peers"))
             .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -340,7 +360,7 @@ pub async fn admit_peer(base: &str, admission: &PeerAdmission) -> Result<(), Gat
     .await?;
     match status {
         200..=299 => Ok(()),
-        status => Err(status_error(status)),
+        status => Err(status_error(status, &response)),
     }
 }
 
