@@ -15,14 +15,16 @@
 //! vault is opened and the key is asked for in this function, and nothing it
 //! holds is handed to the caller.
 
+use std::path::Path;
 use std::sync::mpsc::Receiver;
 
 use aether::certificates::encoding::Id16;
 use aether::certificates::operator_session::{
-    AstraManifest, GestureState, KeyPurpose, KeySlotLabel, OperationKind, OperationLocator,
-    OperatorAction, OperatorStatus, Refusal, RemoteState,
+    AstraManifest, GestureState, KeyCheckManifest, KeyPurpose, KeySlotLabel, OperationKind,
+    OperationLocator, OperatorAction, OperatorStatus, Refusal, RemoteState,
 };
-use aether_fido::authenticator::DialogOwner;
+use aether_fido::authenticator::{Authenticator, DialogOwner};
+use astra_operator::vault::AuthorityVault;
 
 /// One button pressed in the window: what it asks, the status it answers, and
 /// the window the press came from.
@@ -48,12 +50,28 @@ pub fn run(
     presses: Receiver<Press>,
     publish: &mut dyn FnMut(OperatorStatus),
 ) -> Result<(), String> {
+    let vault_path = astra_operator::store::default_path().map_err(|error| format!("{error:#}"))?;
+    run_with_vault(session_id, locator, presses, publish, &vault_path)
+}
+
+/// [`run`], with the vault named instead of looked up, so a test can point it
+/// at a path of its own.
+fn run_with_vault(
+    session_id: Id16,
+    locator: OperationLocator,
+    presses: Receiver<Press>,
+    publish: &mut dyn FnMut(OperatorStatus),
+    vault_path: &Path,
+) -> Result<(), String> {
     let mut ceremony = Ceremony::new(session_id, locator);
     publish(ceremony.status());
 
     match ceremony.operation {
-        OperationKind::RecoverIdentity => recover(&mut ceremony, &presses, publish),
-        OperationKind::ApproveCampaign => approve_campaign(&mut ceremony, &presses, publish),
+        OperationKind::RecoverIdentity => recover(&mut ceremony, &presses, publish, vault_path),
+        OperationKind::ApproveCampaign => {
+            approve_campaign(&mut ceremony, &presses, publish, vault_path)
+        }
+        OperationKind::VerifyKey => verify_key(&mut ceremony, &presses, publish, vault_path),
         // Named rather than swallowed: an operator whose tab offered a
         // ceremony this build cannot run must be told that, and not left
         // watching a status that never moves.
@@ -76,14 +94,13 @@ fn recover(
     ceremony: &mut Ceremony,
     presses: &Receiver<Press>,
     publish: &mut dyn FnMut(OperatorStatus),
+    vault_path: &Path,
 ) -> Result<(), String> {
     let operation = ceremony.operation_id.ok_or_else(|| {
         "une récupération est désignée par l'identifiant qu'Orion détient".to_string()
     })?;
-    let vault_path = astra_operator::store::default_path().map_err(|error| format!("{error:#}"))?;
-
     let verified = match astra_operator::operations::recovery::begin(
-        &vault_path,
+        vault_path,
         operation,
         None,
         None,
@@ -110,50 +127,9 @@ fn recover(
     let offered = ceremony.status();
     publish(offered.clone());
 
-    let press = match awaited_action(presses, &offered) {
-        Some(press) if press.action == OperatorAction::Continue => press,
-        _ => {
-            ceremony.cancel();
-            publish(ceremony.status());
-            return Ok(());
-        }
+    let Some(key) = open_key(ceremony, presses, publish, &offered)? else {
+        return Ok(());
     };
-
-    ceremony.gesture = GestureState::ProcessingKey { index: 1, of: 1 };
-    publish(ceremony.status());
-
-    let owner = match dialog_owner(press.owner) {
-        Ok(owner) => owner,
-        Err(error) => {
-            ceremony.refuse(Refusal::ForegroundUnavailable);
-            publish(ceremony.status());
-            return Err(error);
-        }
-    };
-    let key = match aether_fido::authenticator::connect_owned(
-        aether_fido::authenticator::Transport::default(),
-        owner,
-    ) {
-        Ok(key) => key,
-        Err(error) => {
-            ceremony.refuse(Refusal::KeyDeclined);
-            publish(ceremony.status());
-            return Err(format!("{error:#}"));
-        }
-    };
-    // The platform collects the PIN in its own dialog, so it never enters this
-    // process. A transport that needs one has no way to ask from here — there
-    // is no console — and saying so is better than an empty string that fails
-    // three steps later as «clé refusée».
-    if key.needs_pin() {
-        ceremony.refuse(Refusal::ProtocolViolation);
-        publish(ceremony.status());
-        return Err(
-            "ce transport demande que le PIN soit saisi par le programme, et ce processus n'a \
-             aucune interface pour le demander"
-                .to_string(),
-        );
-    }
 
     ceremony.gesture = GestureState::Signing;
     publish(ceremony.status());
@@ -191,14 +167,13 @@ fn approve_campaign(
     ceremony: &mut Ceremony,
     presses: &Receiver<Press>,
     publish: &mut dyn FnMut(OperatorStatus),
+    vault_path: &Path,
 ) -> Result<(), String> {
     let operation = ceremony.operation_id.ok_or_else(|| {
         "une campagne est désignée par l'opération que l'autorité a ouverte".to_string()
     })?;
-    let vault_path = astra_operator::store::default_path().map_err(|error| format!("{error:#}"))?;
-
     let verified = match astra_operator::operations::campaign::begin(
-        &vault_path,
+        vault_path,
         operation,
         None,
         None,
@@ -233,48 +208,9 @@ fn approve_campaign(
         let offered = ceremony.status();
         publish(offered.clone());
 
-        let press = match awaited_action(presses, &offered) {
-            Some(press) if press.action == OperatorAction::Continue => press,
-            _ => {
-                ceremony.cancel();
-                publish(ceremony.status());
-                return Ok(());
-            }
+        let Some(key) = open_key(ceremony, presses, publish, &offered)? else {
+            return Ok(());
         };
-
-        ceremony.gesture = GestureState::ProcessingKey {
-            index,
-            of: required,
-        };
-        publish(ceremony.status());
-        let owner = match dialog_owner(press.owner) {
-            Ok(owner) => owner,
-            Err(error) => {
-                ceremony.refuse(Refusal::ForegroundUnavailable);
-                publish(ceremony.status());
-                return Err(error);
-            }
-        };
-        let key = match aether_fido::authenticator::connect_owned(
-            aether_fido::authenticator::Transport::default(),
-            owner,
-        ) {
-            Ok(key) => key,
-            Err(error) => {
-                ceremony.refuse(Refusal::KeyDeclined);
-                publish(ceremony.status());
-                return Err(format!("{error:#}"));
-            }
-        };
-        if key.needs_pin() {
-            ceremony.refuse(Refusal::ProtocolViolation);
-            publish(ceremony.status());
-            return Err(
-                "ce transport demande que le PIN soit saisi par le programme, et ce processus \
-                 n'a aucune interface pour le demander"
-                    .to_string(),
-            );
-        }
         match approval.approve_key(key.as_ref(), "", now_unix()) {
             Ok(label) => ceremony.keys.push(KeySlotLabel {
                 slot: index.to_string(),
@@ -309,6 +245,149 @@ fn approve_campaign(
             Err(format!("{error:#}"))
         }
     }
+}
+
+/// The key check: the vault opens under a touch, and nothing is written.
+///
+/// It proves that the token in hand still opens this vault and names the
+/// key-slot that answered. The manifest carries the vault's fingerprint and
+/// nothing a key signs, because nothing is signed.
+fn verify_key(
+    ceremony: &mut Ceremony,
+    presses: &Receiver<Press>,
+    publish: &mut dyn FnMut(OperatorStatus),
+    vault_path: &Path,
+) -> Result<(), String> {
+    let (vault, fingerprint) = match load_with_fingerprint(vault_path) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            ceremony.refuse(Refusal::HandoffMismatch);
+            publish(ceremony.status());
+            return Err(format!("{error:#}"));
+        }
+    };
+
+    ceremony.remote = RemoteState::AwaitingOperator;
+    ceremony.gesture = GestureState::AwaitingKey {
+        index: 1,
+        of: 1,
+        purpose: KeyPurpose::OpenVault,
+    };
+    ceremony.manifest = Some(AstraManifest::KeyCheck(KeyCheckManifest {
+        vault_fingerprint: fingerprint,
+    }));
+    let offered = ceremony.status();
+    publish(offered.clone());
+
+    let Some(key) = open_key(ceremony, presses, publish, &offered)? else {
+        return Ok(());
+    };
+
+    // The PIN is empty for the reason `open_key` refused a transport that
+    // wants one: the platform collects it in its own dialog.
+    let checked = prove_key_opens(key.as_ref(), &vault);
+    match checked {
+        Ok(label) => {
+            ceremony.keys.push(KeySlotLabel {
+                slot: "1".to_string(),
+                label,
+            });
+            ceremony.gesture = GestureState::Done;
+            publish(ceremony.status());
+            Ok(())
+        }
+        Err(error) => {
+            ceremony.refuse(Refusal::KeyDeclined);
+            publish(ceremony.status());
+            Err(format!("{error:#}"))
+        }
+    }
+}
+
+fn load_with_fingerprint(
+    vault_path: &Path,
+) -> anyhow::Result<(AuthorityVault, aether::certificates::encoding::Fingerprint)> {
+    let vault = astra_operator::store::load(vault_path)?;
+    let fingerprint = vault.fingerprint()?;
+    Ok((vault, fingerprint))
+}
+
+/// Opens the vault under `key`, proves the anchors are readable, and returns
+/// the label of the key-slot that answered — never any secret.
+fn prove_key_opens(key: &dyn Authenticator, vault: &AuthorityVault) -> anyhow::Result<String> {
+    let opened = astra_operator::gestures::open_with_authorized_key(key, vault, "")?;
+    astra_operator::gestures::prove_anchors_open(vault, &opened)?;
+    Ok(vault
+        .slot_for_credential(&opened.credential_id)?
+        .label
+        .clone())
+}
+
+/// Waits for the operator's Continue, then connects the key it asks for.
+///
+/// The one copy of the sequence every key-asking ceremony shares: wait for the
+/// press answering `offered`, attach the dialog to the window it came from,
+/// connect the key, and refuse a transport that wants a PIN this process has
+/// no way to ask for. `None` is an abandonment, already published as such.
+/// An `Err` has been published as a refusal.
+///
+/// The position of the key (`index` of `of`) is read from the gesture the
+/// ceremony is waiting in, so the caller sets it before offering.
+fn open_key(
+    ceremony: &mut Ceremony,
+    presses: &Receiver<Press>,
+    publish: &mut dyn FnMut(OperatorStatus),
+    offered: &OperatorStatus,
+) -> Result<Option<Box<dyn Authenticator>>, String> {
+    let GestureState::AwaitingKey { index, of, .. } = ceremony.gesture else {
+        ceremony.refuse(Refusal::Internal);
+        publish(ceremony.status());
+        return Err("aucune clé n'est attendue à cette étape de la cérémonie".to_string());
+    };
+    let press = match awaited_action(presses, offered) {
+        Some(press) if press.action == OperatorAction::Continue => press,
+        _ => {
+            ceremony.cancel();
+            publish(ceremony.status());
+            return Ok(None);
+        }
+    };
+
+    ceremony.gesture = GestureState::ProcessingKey { index, of };
+    publish(ceremony.status());
+    let owner = match dialog_owner(press.owner) {
+        Ok(owner) => owner,
+        Err(error) => {
+            ceremony.refuse(Refusal::ForegroundUnavailable);
+            publish(ceremony.status());
+            return Err(error);
+        }
+    };
+    let key = match aether_fido::authenticator::connect_owned(
+        aether_fido::authenticator::Transport::default(),
+        owner,
+    ) {
+        Ok(key) => key,
+        Err(error) => {
+            ceremony.refuse(Refusal::KeyDeclined);
+            publish(ceremony.status());
+            return Err(format!("{error:#}"));
+        }
+    };
+    // The platform collects the PIN in its own dialog, so it never enters this
+    // process. A transport that needs one has no way to ask from here — there
+    // is no console — and saying so is better than an empty string that fails
+    // three steps later as «clé refusée».
+    if key.needs_pin() {
+        ceremony.refuse(Refusal::ProtocolViolation);
+        publish(ceremony.status());
+        return Err(
+            "ce transport demande que le PIN soit saisi par le programme, et ce processus n'a \
+             aucune interface pour le demander"
+                .to_string(),
+        );
+    }
+    Ok(Some(key))
 }
 
 /// Waits for the operator's answer to one rendered status.

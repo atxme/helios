@@ -118,3 +118,29 @@ fn off_windows_the_dialog_belongs_to_the_console() {
 
     assert_eq!(dialog_owner(0), Ok(DialogOwner::Console));
 }
+
+/// A key check on a vault that is not there is refused with a typed reason,
+/// not answered by the arm that says the ceremony is not carried here.
+#[test]
+fn verify_key_is_served() {
+    let missing =
+        std::env::temp_dir().join(format!("orion-verify-key-{}-absent", std::process::id()));
+    let (_presses, received) = std::sync::mpsc::channel::<Press>();
+    let mut published = Vec::new();
+    let outcome = run_with_vault(
+        Id16::new([1; 16]).expect("id"),
+        OperationLocator {
+            kind: OperationKind::VerifyKey,
+            operation_id: None,
+        },
+        received,
+        &mut |status| published.push(status),
+        &missing,
+    );
+    let error = outcome.expect_err("an absent vault is refused");
+    assert!(!error.contains("pas encore portée"), "{error}");
+    let last = published.last().expect("a status was published");
+    assert_eq!(last.refusal, Some(Refusal::HandoffMismatch));
+    assert_eq!(last.gesture, GestureState::Failed);
+    assert!(last.keys.is_empty());
+}
