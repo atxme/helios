@@ -130,7 +130,7 @@ fn verify_key_is_served() {
     let (presses, received) = std::sync::mpsc::channel::<Press>();
     drop(presses);
     let mut published = Vec::new();
-    let outcome = run_with_vault(
+    let outcome = run(
         Id16::new([1; 16]).expect("id"),
         OperationLocator {
             kind: OperationKind::VerifyKey,

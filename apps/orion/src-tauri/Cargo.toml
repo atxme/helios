@@ -47,6 +47,8 @@ windows-sys = { version = "0.61", features = [
   # Lancement élevé du moteur (`engine_launch`) : ShellExecuteExW est gardé par
   # `Win32_System_Registry` dans windows-sys 0.61.
   "Win32_System_Registry",
+  # Choix de l'emplacement du coffre opérateur (`operator::location`) : GetSaveFileNameW.
+  "Win32_UI_Controls_Dialogs",
   "Win32_UI_Shell",
   "Win32_UI_WindowsAndMessaging",
 ] }

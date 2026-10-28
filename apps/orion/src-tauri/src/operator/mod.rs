@@ -33,7 +33,9 @@
 
 mod ceremony;
 pub mod invitations;
+pub mod location;
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use aether::certificates::encoding::Id16;
@@ -232,13 +234,17 @@ impl OperatorCeremony {
             .map(|session| session.status.borrow_and_update().clone())
     }
 
-    /// Starts the ceremony in its own thread and returns the first state it
-    /// publishes.
-    pub async fn begin(&self, locator: OperationLocator) -> Result<OperatorStatus, String> {
+    /// Starts the ceremony in its own thread, against the vault at
+    /// `vault_path`, and returns the first state it publishes.
+    pub async fn begin(
+        &self,
+        locator: OperationLocator,
+        vault_path: PathBuf,
+    ) -> Result<OperatorStatus, String> {
         self.open(
             locator.kind,
             move |session_id, presses, publish, _artifacts| {
-                ceremony::run(session_id, locator, presses, publish)
+                ceremony::run(session_id, locator, presses, publish, &vault_path)
             },
         )
         .await
@@ -253,6 +259,7 @@ impl OperatorCeremony {
         &self,
         gesture: EnrollmentGesture,
         gateway: Option<String>,
+        vault_path: PathBuf,
     ) -> Result<OperatorStatus, String> {
         gesture.validate()?;
         let kind = gesture.operation();
@@ -264,6 +271,7 @@ impl OperatorCeremony {
                 presses,
                 publish,
                 &mut |artifact| deposit(artifacts, artifact),
+                &vault_path,
             )
         })
         .await
@@ -603,6 +611,7 @@ mod tests {
                         gateway_pq_certificate: None,
                     },
                     None,
+                    PathBuf::from(location::VAULT_FILE_NAME),
                 )
                 .await;
             assert!(refused.is_err(), "{name:?}");

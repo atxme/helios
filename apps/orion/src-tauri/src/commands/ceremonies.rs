@@ -60,7 +60,8 @@ pub(crate) async fn begin_operator_ceremony(
     state: State<'_, AppState>,
     locator: aether::certificates::operator_session::OperationLocator,
 ) -> Result<aether::certificates::operator_session::OperatorStatus, String> {
-    state.operator.begin(locator).await
+    let vault_path = state.vault_location.path()?;
+    state.operator.begin(locator, vault_path).await
 }
 
 /// The handle of the window the press came from, or `0` where there is none.
@@ -158,8 +159,12 @@ pub(crate) async fn begin_enrollment_ceremony(
     state: State<'_, AppState>,
     gesture: crate::operator::EnrollmentGesture,
 ) -> Result<aether::certificates::operator_session::OperatorStatus, String> {
+    let vault_path = state.vault_location.path()?;
     let gateway = connected_gateway(&state).await.ok();
-    state.operator.begin_enrollment(gesture, gateway).await
+    state
+        .operator
+        .begin_enrollment(gesture, gateway, vault_path)
+        .await
 }
 
 /// The files the current session produced, for the window to save.
@@ -184,9 +189,60 @@ pub(crate) async fn operator_ceremony_status(
 /// the domain as the public values of the relay beside the vault. No PIN and no
 /// security key are involved, so this is safe to call whenever the tab opens.
 #[tauri::command]
-pub(crate) async fn operator_overview() -> Result<astra_operator::overview::VaultOverview, String> {
-    let path = astra_operator::store::default_path().map_err(|error| error.to_string())?;
+pub(crate) async fn operator_overview(
+    state: State<'_, AppState>,
+) -> Result<astra_operator::overview::VaultOverview, String> {
+    let path = state.vault_location.path()?;
     astra_operator::overview::read(&path).map_err(|error| error.to_string())
+}
+
+/// Where the operator vault is, and whether it is the default place.
+#[tauri::command]
+pub(crate) async fn operator_vault_location(
+    state: State<'_, AppState>,
+) -> Result<crate::operator::location::VaultLocationView, String> {
+    state.vault_location.view()
+}
+
+/// Asks the operator, in a dialog over this window, where the vault is.
+///
+/// The path comes from the dialog and never from the WebView, which only asks
+/// for the dialog to open. `None` when the operator cancels.
+#[tauri::command]
+pub(crate) async fn choose_vault_location(
+    state: State<'_, AppState>,
+    window: tauri::Window,
+) -> Result<Option<crate::operator::location::VaultLocationView>, String> {
+    #[cfg(target_os = "windows")]
+    {
+        let owner = owner_window(&window);
+        // An unreadable setting must still be replaceable: the dialog then
+        // opens where it would by default.
+        let current = state.vault_location.path().unwrap_or_default();
+        let picked =
+            tokio::task::spawn_blocking(move || crate::operator::location::pick(owner, &current))
+                .await
+                .map_err(|error| {
+                    format!("boîte de choix de l'emplacement du coffre : {error}")
+                })??;
+        match picked {
+            Some(path) => state.vault_location.choose(path).map(Some),
+            None => Ok(None),
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (state, window);
+        Err("le choix d'emplacement n'existe que sous Windows".to_string())
+    }
+}
+
+/// Goes back to the default vault location.
+#[tauri::command]
+pub(crate) async fn reset_vault_location(
+    state: State<'_, AppState>,
+) -> Result<crate::operator::location::VaultLocationView, String> {
+    state.vault_location.reset()
 }
 
 /// The invitations of this machine's registry, with whether each device is

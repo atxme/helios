@@ -47,24 +47,13 @@ pub struct Press {
     pub owner: isize,
 }
 
-/// Runs one ceremony to its end, publishing every state it reaches.
+/// Runs one ceremony to its end against the vault at `vault_path`, publishing
+/// every state it reaches.
 ///
 /// Returns when the ceremony is over, whatever the reason. A `Err` has
 /// already been published as a refusal before it is returned, except when the
 /// ceremony could not start at all.
 pub fn run(
-    session_id: Id16,
-    locator: OperationLocator,
-    presses: Receiver<Press>,
-    publish: &mut dyn FnMut(OperatorStatus),
-) -> Result<(), String> {
-    let vault_path = astra_operator::store::default_path().map_err(|error| format!("{error:#}"))?;
-    run_with_vault(session_id, locator, presses, publish, &vault_path)
-}
-
-/// [`run`], with the vault named instead of looked up, so a test can point it
-/// at a path of its own.
-fn run_with_vault(
     session_id: Id16,
     locator: OperationLocator,
     presses: Receiver<Press>,
@@ -93,8 +82,9 @@ fn run_with_vault(
     }
 }
 
-/// Runs one enrollment gesture to its end, publishing every state it reaches
-/// and handing each file it produces to `deposit`.
+/// Runs one enrollment gesture to its end against the vault at `vault_path`,
+/// publishing every state it reaches and handing each file it produces to
+/// `deposit`.
 ///
 /// Called from the ceremony's own thread, which is what lets the gateway be
 /// read from it with a blocking wait: that thread is not a runtime worker.
@@ -105,11 +95,10 @@ pub fn run_enrollment(
     presses: Receiver<Press>,
     publish: &mut dyn FnMut(OperatorStatus),
     deposit: &mut dyn FnMut(OperatorArtifact),
+    vault_path: &Path,
 ) -> Result<(), String> {
-    let resolved = astra_operator::store::default_path()
-        .and_then(|path| InvitationRegistry::default_location().map(|registry| (path, registry)));
-    let (vault_path, registry) = match resolved {
-        Ok(resolved) => resolved,
+    let registry = match InvitationRegistry::default_location() {
+        Ok(registry) => registry,
         Err(error) => {
             let mut ceremony = Ceremony::new(session_id, enrollment_locator(&gesture));
             publish(ceremony.status());
@@ -119,14 +108,7 @@ pub fn run_enrollment(
         }
     };
     run_enrollment_with(
-        session_id,
-        gesture,
-        gateway,
-        presses,
-        publish,
-        deposit,
-        &vault_path,
-        &registry,
+        session_id, gesture, gateway, presses, publish, deposit, vault_path, &registry,
     )
 }
 
@@ -137,8 +119,8 @@ fn enrollment_locator(gesture: &EnrollmentGesture) -> OperationLocator {
     }
 }
 
-/// [`run_enrollment`], with the vault and the registry named, so a test can
-/// point it at a directory of its own.
+/// [`run_enrollment`], with the registry named, so a test can point it at a
+/// directory of its own.
 #[allow(clippy::too_many_arguments)]
 fn run_enrollment_with(
     session_id: Id16,

@@ -117,6 +117,8 @@ struct AppState {
     /// The protocol-2 ceremony, which every operation but the `CA-TLS`
     /// rotation now runs through.
     operator: operator::OperatorCeremony,
+    /// Where every operator gesture opens the vault, as the operator chose it.
+    vault_location: operator::location::VaultLocation,
     /// Set when Orion is quitting: the engine's session ends on purpose, and
     /// that end is not a failure to report.
     quitting: AtomicBool,
@@ -705,6 +707,7 @@ fn main() {
                 pending_profile_paths: StdMutex::new(pending_profile_paths),
                 astra: astra::Ceremony::default(),
                 operator: operator::OperatorCeremony::default(),
+                vault_location: operator::location::VaultLocation::load(),
                 quitting: AtomicBool::new(false),
                 #[cfg(windows)]
                 engine: Arc::new(engine_process),
@@ -791,6 +794,9 @@ fn main() {
             operator_ceremony_status,
             operator_overview,
             operator_pending_operations,
+            operator_vault_location,
+            choose_vault_location,
+            reset_vault_location,
         ])
         .build(tauri::generate_context!())
         .expect("error while launching Tauri")
