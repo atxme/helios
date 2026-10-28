@@ -1,5 +1,7 @@
 # Audit des duplications
 
+Inventaire initial figé au 23 octobre 2026 ; les mises à jour explicites suivent les lots. F14 a depuis partagé draft/profil v5 et gateway-admin dans Core ; voir les comparaisons actuelles du [journal 16](16-f14-integration.md). Ne pas traiter les anciens emplacements déplacés comme des copies encore présentes.
+
 ## Détection et portée
 
 Recherche de blocs de 12 lignes non vides, après retrait des commentaires de ligne et attributs, avec au moins 220 caractères, puis lecture des candidats et des appelants. Le balayage intégral des **472 fichiers Rust** de `crates`, `tools` et `apps/orion/src-tauri` (tests inclus, sans arrêter la lecture au premier module de test) a produit **36 groupes de fichiers candidats** ; ce n’est ni un taux de duplication ni 36 défauts. Les groupes sont dédupliqués par ensemble de chemins partageant au moins un bloc. Les fixtures et initialisations de structures contribuent fortement aux faux positifs. Cette normalisation détecte les similitudes de structure, sans prouver l’équivalence sémantique. Elle ne traite pas les macros comme un parseur Rust.

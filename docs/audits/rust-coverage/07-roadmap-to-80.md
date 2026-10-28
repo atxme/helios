@@ -18,6 +18,8 @@ La baseline historique ci-dessus vient du collecteur `rust-ast-da-v1`. Il retire
 
 Baseline suivante : [F11, code d41835e](15-f11-file-baseline.md), **36 131 / 56 421 = 64,04 %**, reliquat 20 290 lignes vers 100 % et 9 006 vers 80 %. Les réserves et gains ci-dessous restent historiques, ne sont pas additionnés à cette nouvelle baseline et ne constituent pas une estimation du travail restant après F14. Les 137–240 jours-personne incluent du travail déjà réalisé ; COV-036 et la disponibilité matérielle doivent être estimés séparément.
 
+Mise à jour après intégration F14 sur main `5ab3670` : [baseline courante](17-f14-file-baseline.md), **37 200 / 57 886 = 64,26 %**, reliquat **20 686** vers 100 % et **9 109** vers 80 %. Les jalons 70/75 demandent 3 321/6 215 lignes à ce périmètre constant. [Journal et validations](16-f14-integration.md) : trois nouveaux tests de profils, rebase identique et régression réussie. Les gains/efforts des fiches restent des réserves historiques à réattribuer ; ils ne sont pas un total restant validé après F14.
+
 ## Objectif au-delà de 80 %
 
 À périmètre constant de la baseline v1, 100 % demanderait de couvrir les **22 139 lignes restantes**. La réserve estimée des lots fonctionnels (13 365–17 455 lignes) ne couvre donc pas intégralement cet objectif : il resterait théoriquement **4 684–8 774 lignes** après ces gains, avant tout changement de code. Cette soustraction est un repère, pas une prévision. L’effort historique de 135–237 jours-personne ne constitue pas une estimation validée pour atteindre 100 %.
@@ -891,6 +893,8 @@ Chaque liste de fichiers désigne des chemins existants, sauf les nouveaux scrip
 **Priorité :** P2.
 
 ### COV-026 — Tester IPC du moteur et cérémonies opérateur F11
+
+État après F14 : draft/profil v5 et accès HTTP gateway-admin sont déjà partagés dans Core entre CLI et Orion ; ne pas reconstruire ces responsabilités. Voir le [journal 16](16-f14-integration.md).
 
 État F11 : `helios-astra-helper` a déjà été supprimé de main. Le moteur, ses protocoles et les cérémonies IHM remplacent ce périmètre ; aucun gain du helper disparu n'est conservé dans l'estimation ci-dessous.
 
