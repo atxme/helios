@@ -43,6 +43,17 @@ pub(super) fn run_raw_blocking_at(
         "Mesure de la latence UDP",
     );
     let (latency_ms, jitter_ms, latency_p95_ms) = measure_raw_latency(target)?;
+    // From here on every frame carries the ping, the first one included.
+    let progress = with_latency(progress, latency_ms);
+    emit_progress(
+        &progress,
+        SpeedTestPhase::Latency,
+        1.0,
+        0.0,
+        0,
+        started,
+        "Mesure de la latence UDP",
+    );
 
     let tcp_download = if matches!(mode, SpeedTestMode::Tcp | SpeedTestMode::Full) {
         Some(measure_raw_tcp(
@@ -437,7 +448,16 @@ pub(super) fn emit_progress(
         bytes,
         elapsed_ms: saturating_millis(started.elapsed()),
         message: message.to_string(),
+        latency_ms: None,
     });
+}
+
+/// The same sink, with the measured ping stamped on every frame it forwards.
+fn with_latency(sink: SpeedTestProgressSink, latency_ms: f64) -> SpeedTestProgressSink {
+    Arc::new(move |mut update: SpeedTestProgress| {
+        update.latency_ms = Some(latency_ms);
+        sink(update)
+    })
 }
 
 pub(super) fn phase_message(phase: SpeedTestPhase) -> &'static str {

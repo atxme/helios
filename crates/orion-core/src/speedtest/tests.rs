@@ -163,6 +163,29 @@ fn raw_tcp_engine_counts_persistent_socket_bytes_and_reports_progress() {
         .unwrap()
         .iter()
         .any(|update| update.phase == SpeedTestPhase::TcpDownload));
+    // The ping is known from the first step: it is published as soon as it is
+    // measured, and every later frame keeps it, so the screen never has to
+    // wait for the result to show it.
+    let frames = progress.lock().unwrap();
+    let first_known = frames
+        .iter()
+        .position(|update| update.latency_ms.is_some())
+        .expect("a frame carries the measured latency");
+    assert_eq!(frames[first_known].phase, SpeedTestPhase::Latency);
+    assert_eq!(frames[first_known].latency_ms, Some(result.latency_ms));
+    assert!(frames[first_known..]
+        .iter()
+        .all(|update| update.latency_ms == Some(result.latency_ms)));
+}
+
+/// A frame from an engine that predates the field still reads, without a ping.
+#[test]
+fn a_progress_frame_without_latency_still_parses() {
+    let frame: SpeedTestProgress = serde_json::from_str(
+        r#"{"phase":"tcp_download","fraction":0.5,"current_mbps":10.0,"bytes":1,"elapsed_ms":2,"message":"m"}"#,
+    )
+    .expect("legacy frame");
+    assert_eq!(frame.latency_ms, None);
 }
 
 /// A lost HELLO must not end the run.

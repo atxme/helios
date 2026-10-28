@@ -512,6 +512,8 @@ export interface SpeedTestProgress {
   bytes: number
   elapsed_ms: number
   message: string
+  /** The ping, once the first step has measured it; repeated on every later frame. */
+  latency_ms?: number
 }
 
 /** One raw WireGuard data-path measurement. */

@@ -66,6 +66,11 @@ pub struct SpeedTestProgress {
     pub bytes: u64,
     pub elapsed_ms: u64,
     pub message: String,
+    /// The ping, once the first step has measured it; every later frame
+    /// repeats it so a screen joining mid-run shows it too. Absent before the
+    /// measurement, and from an engine that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<f64>,
 }
 
 /// A phase is intentionally explicit so the UI never infers direction from

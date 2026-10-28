@@ -151,6 +151,7 @@ async fn a_speedtest_progress_event_round_trips() {
             bytes: 1024,
             elapsed_ms: 300,
             message: "téléchargement".into(),
+            latency_ms: None,
         },
     });
     let mut bytes = Vec::new();

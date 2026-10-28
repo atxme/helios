@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
 import CircularProgress from '@mui/material/CircularProgress'
+import LinearProgress from '@mui/material/LinearProgress'
 import Paper from '@mui/material/Paper'
 import Stack from '@mui/material/Stack'
 import Typography from '@mui/material/Typography'
@@ -188,6 +189,16 @@ function isDownloadPhase(phase: SpeedTestPhase): boolean {
 
 function isUploadPhase(phase: SpeedTestPhase): boolean {
   return phase === 'tcp_upload'
+}
+
+/**
+ * The step that judges the line rather than its rate.
+ *
+ * Its legs run below the capacity just found, to observe loss and jitter, so
+ * no throughput figure belongs in its headline: it shows the ping instead.
+ */
+function isQualityPhase(phase: SpeedTestPhase): boolean {
+  return phase === 'udp_download' || phase === 'udp_upload'
 }
 
 /**
@@ -615,15 +626,24 @@ export function SpeedTestView({ state, profile }: Props) {
    */
   const ceiling = Math.max(ceilingFor(downRate ?? 0), ceilingFor(upRate ?? 0))
 
-  // The headline carries the live rate while a throughput leg runs, and holds
-  // the reception figure through the quality legs — the number a line is
-  // usually judged by.
+  // The headline carries the live rate while a throughput leg runs. The
+  // quality step shows the ping instead: its legs are paced, not measured for
+  // speed, and a rate there would only repeat the reception card.
+  const quality = running && isQualityPhase(phase)
   const headline =
     running && isThroughputPhase(phase) ? (progress?.current_mbps ?? 0) : downRate
-  const smoothHeadline = useSmoothed(headline)
+  // Not smoothed across the switch to the ping: walking from Mb/s to ms would
+  // animate between two different quantities.
+  const smoothHeadline = useSmoothed(quality ? null : headline)
   const upload = isUploadPhase(phase)
   const accent = accentFor(upload ? 'upload' : 'download')
-  const latency = result ? milliseconds(result.latency_ms) : '—'
+  const latencyValue = result ? result.latency_ms : live.latency
+  const latency = latencyValue === null ? '—' : milliseconds(latencyValue)
+  const headlineText = quality
+    ? latency
+    : smoothHeadline === null
+      ? '—'
+      : decimal(smoothHeadline)
 
   /**
    * The launch, wherever the state puts it.
@@ -760,24 +780,44 @@ export function SpeedTestView({ state, profile }: Props) {
                   lineHeight: 1.05,
                   letterSpacing: '-0.045em',
                   color:
-                    smoothHeadline === null ? 'text.disabled' : upload ? VIOLET : INK,
+                    headlineText === '—' ? 'text.disabled' : quality ? PINE : upload ? VIOLET : INK,
                   transition: 'color 240ms ease',
                   fontVariantNumeric: 'tabular-nums',
                 }}
               >
-                {smoothHeadline === null ? '—' : decimal(smoothHeadline)}
+                {headlineText}
               </Typography>
               <Typography color="text.secondary" sx={{ fontSize: 12, fontWeight: 650 }}>
-                Mb/s
+                {quality ? 'ms de ping' : 'Mb/s'}
               </Typography>
             </Stack>
 
-            {/* Keyed on the direction too: the emission curve starts empty,
-                and fading it in reads as a new measurement rather than as the
-                reception curve collapsing. */}
-            <Box key={upload ? 'up' : 'down'} sx={RISE}>
-              <LiveChart points={upload ? samples.up : samples.down} ceiling={ceiling} color={accent} label={upload ? 'Émission' : 'Réception'} />
-            </Box>
+            {quality ? (
+              // No curve here: the quality legs are paced below the line's
+              // capacity, so plotting their rate would draw a drop the line
+              // never had. What the step is doing is said instead.
+              <Box key="quality" sx={RISE}>
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, mb: 0.75 }}>
+                  <Activity size={13} aria-hidden style={{ color: PINE }} />
+                  <Typography color="text.secondary" sx={{ fontSize: 11.5 }}>
+                    Gigue et pertes en cours de mesure
+                  </Typography>
+                </Box>
+                <LinearProgress
+                  variant="determinate"
+                  value={Math.min(1, Math.max(0, progress?.fraction ?? 0)) * 100}
+                  aria-label="Avancement de la mesure de la qualité"
+                  sx={{ height: 4, borderRadius: 2, bgcolor: RULE, '& .MuiLinearProgress-bar': { bgcolor: PINE } }}
+                />
+              </Box>
+            ) : (
+              // Keyed on the direction too: the emission curve starts empty,
+              // and fading it in reads as a new measurement rather than as the
+              // reception curve collapsing.
+              <Box key={upload ? 'up' : 'down'} sx={RISE}>
+                <LiveChart points={upload ? samples.up : samples.down} ceiling={ceiling} color={accent} label={upload ? 'Émission' : 'Réception'} />
+              </Box>
+            )}
 
             <Box sx={{ display: 'flex', gap: 1 }}>
               <MetricCard
@@ -802,6 +842,7 @@ export function SpeedTestView({ state, profile }: Props) {
                 value={latency}
                 unit="ms"
                 accent={PINE}
+                active={quality}
               />
             </Box>
           </>

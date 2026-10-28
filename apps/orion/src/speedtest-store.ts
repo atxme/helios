@@ -74,7 +74,7 @@ export interface SpeedTestState {
    * screen once emission takes over, otherwise the row the user was just
    * watching blanks out halfway through the run.
    */
-  live: { down: number | null; up: number | null }
+  live: { down: number | null; up: number | null; latency: number | null }
   /**
    * Rates seen during each throughput leg, oldest first.
    *
@@ -96,7 +96,7 @@ const EMPTY: SpeedTestState = {
   result: null,
   progress: null,
   error: null,
-  live: { down: null, up: null },
+  live: { down: null, up: null, latency: null },
   samples: { down: [], up: [] },
   history: [],
 }
@@ -156,9 +156,12 @@ export function liveAfter(
   live: SpeedTestState['live'],
   update: SpeedTestProgress,
 ): SpeedTestState['live'] {
-  if (update.phase === 'tcp_download') return { ...live, down: update.current_mbps }
-  if (update.phase === 'tcp_upload') return { ...live, up: update.current_mbps }
-  return live
+  // The ping is not a rate: it is measured once, before the first leg, and
+  // every later frame repeats it, so any frame may carry it.
+  const latency = update.latency_ms ?? live.latency
+  if (update.phase === 'tcp_download') return { ...live, latency, down: update.current_mbps }
+  if (update.phase === 'tcp_upload') return { ...live, latency, up: update.current_mbps }
+  return { ...live, latency }
 }
 
 /**
@@ -204,7 +207,7 @@ export async function start(mode: SpeedTestMode): Promise<void> {
     error: null,
     result: null,
     progress: null,
-    live: { down: null, up: null },
+    live: { down: null, up: null, latency: null },
     samples: { down: [], up: [] },
   })
   try {
@@ -225,7 +228,7 @@ export async function start(mode: SpeedTestMode): Promise<void> {
       error: String(cause),
       // The dial falls back to «—» on failure; leaving the rows on the last
       // frames received would have the screen state a rate it just disowned.
-      live: { down: null, up: null },
+      live: { down: null, up: null, latency: null },
       samples: { down: [], up: [] },
       progress: null,
     })

@@ -166,9 +166,12 @@ describe('SpeedTestView', () => {
       bytes: 1024,
       elapsed_ms: 5_000,
       message: 'TCP descendant · flux continus',
+      latency_ms: 8.4,
     })
     // Twice: the headline meters the leg, the «Réception» card holds it.
     await waitFor(() => expect(screen.getAllByText('90,5')).toHaveLength(2))
+    // The ping is measured before the first leg: its card is filled from step 1.
+    expect(screen.getByText('8,4')).toBeTruthy()
     expect(screen.getByText('Test de réception')).toBeTruthy()
     expect(screen.getByText('Étape 1/3')).toBeTruthy()
 
@@ -179,6 +182,7 @@ describe('SpeedTestView', () => {
       bytes: 2048,
       elapsed_ms: 12_000,
       message: 'TCP montant · flux continus',
+      latency_ms: 8.4,
     })
 
     // Reception keeps the figure it reached; emission shows its own. The
@@ -200,15 +204,18 @@ describe('SpeedTestView', () => {
       bytes: 4096,
       elapsed_ms: 24_000,
       message: 'UDP montant · perte et jitter',
+      latency_ms: 8.4,
     })
     expect(screen.queryByText('25,7')).toBeNull()
-    // The headline goes back to holding the reception figure, and the
-    // «Émission» card keeps the rate its own leg found.
-    // Twice again once the headline has walked back up to it: the reception
-    // card never stopped showing it.
-    await waitFor(() => expect(screen.getAllByText('90,5')).toHaveLength(2))
+    // The quality step is about the line's latency, not its rate: the
+    // headline shows the ping, in ms, and no throughput curve is drawn. The
+    // two direction cards keep the rates their own legs found.
+    await waitFor(() => expect(screen.getAllByText('8,4')).toHaveLength(2))
+    expect(screen.getByText('90,5')).toBeTruthy()
     expect(screen.getByText('30,3')).toBeTruthy()
     expect(screen.getByText('Mesure de la qualité')).toBeTruthy()
+    expect(screen.getByText('Gigue et pertes en cours de mesure')).toBeTruthy()
+    expect(screen.queryByRole('img', { name: /débit/ })).toBeNull()
     expect(screen.getByText('Étape 3/3')).toBeTruthy()
   })
 

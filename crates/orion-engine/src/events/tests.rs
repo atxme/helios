@@ -65,6 +65,7 @@ fn speedtest_progress_is_dropped_when_full() {
             bytes: 1024,
             elapsed_ms: 500,
             message: "téléchargement TCP".into(),
+            latency_ms: None,
         },
     });
 
