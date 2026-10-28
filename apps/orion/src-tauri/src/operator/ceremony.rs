@@ -545,6 +545,8 @@ fn accept(
         client_wg_public_key: request.client_wg_public_key,
         leaves_not_after_unix: leaf_validity.1,
         endpoint: accept.endpoint.trim().to_string(),
+        allowed_ips: accept.allowed_ips.map(str::to_string),
+        ssh_target: accept.ssh_target.map(str::to_string),
     };
     let Some(opened) = open_for_delivery(ceremony, presses, publish, &vault, manifest)? else {
         return Ok(());
@@ -780,6 +782,8 @@ fn resume(
         client_wg_public_key: request.client_wg_public_key,
         leaves_not_after_unix: accepted.pq_certificate.not_after_unix,
         endpoint: resume.delivery.endpoint.trim().to_string(),
+        allowed_ips: resume.delivery.allowed_ips.map(str::to_string),
+        ssh_target: resume.delivery.ssh_target.map(str::to_string),
     };
     let Some(opened) = open_for_delivery(ceremony, presses, publish, &vault, manifest)? else {
         return Ok(());
@@ -978,12 +982,21 @@ fn prepare_acceptance(
     match &record.state {
         InvitationState::Issued => {}
         InvitationState::Consumed { .. } => {
+            // Only an acceptance kept here can be resumed: one made outside
+            // Orion has no « Reprendre » to point to.
+            if !matches!(registry.accepted(&request.invitation_id), Ok(Some(_))) {
+                return Err((
+                    Refusal::AcceptedElsewhere,
+                    "cette invitation a été acceptée hors d'Orion : ses feuilles ne sont pas ici"
+                        .to_string(),
+                ));
+            }
             return Err((
                 Refusal::InvitationConsumed,
                 "Cette invitation est déjà consommée : la reprendre depuis la liste des \
                  invitations."
                     .to_string(),
-            ))
+            ));
         }
         other => {
             return Err((
@@ -1148,7 +1161,9 @@ fn hand_over_leaves(
 }
 
 /// Step 6: reads the gateway, builds the device's document and signs it under
-/// the opening that issued the leaves. Every failure is a published refusal.
+/// the opening that issued the leaves. Every failure is a published refusal,
+/// and every one is `DocumentNotSigned`: the peer is admitted by now, so the
+/// operator resumes rather than admitting again.
 fn sign_delivery(
     registry: &InvitationRegistry,
     vault: &AuthorityVault,
@@ -1157,27 +1172,48 @@ fn sign_delivery(
     delivery: &Delivery<'_>,
     pin: &GatewayPin,
 ) -> Result<OperatorArtifact, (Refusal, String)> {
+    let not_signed = |error: String| (Refusal::DocumentNotSigned, error);
+    let draft = draft_delivery(accepted, delivery, pin)?;
+    let request = &accepted.request;
+    let signed = astra_operator::signing::sign_document(vault, opened, registry, draft)
+        .map_err(|error| not_signed(format!("{error:#}")))?;
+    let contents = signed
+        .to_json()
+        .map_err(|error| not_signed(format!("encodage du document : {error}")))?;
+    Ok(OperatorArtifact {
+        file_name: document_file_name(&request.requested_name, &request.request_id),
+        contents,
+        encoding: ArtifactEncoding::Text,
+    })
+}
+
+/// The part of step 6 that needs no key: reads the gateway and builds the
+/// document Orion will be asked to import. Every failure is `DocumentNotSigned`.
+fn draft_delivery(
+    accepted: &AcceptedEnrollment,
+    delivery: &Delivery<'_>,
+    pin: &GatewayPin,
+) -> Result<aether::key_negotiation::EnrollmentDocument, (Refusal, String)> {
     use orion_core::enrollment_draft::{build_draft, resolve_negotiation_endpoint, DraftInput};
     use orion_core::gateway_admin as admin;
 
-    let unavailable =
-        |error: admin::GatewayAdminError| (Refusal::GatewayUnavailable, error.to_string());
-    let internal = |error: String| (Refusal::Internal, error);
+    let not_signed = |error: String| (Refusal::DocumentNotSigned, error);
     let base = delivery.gateway.ok_or_else(|| {
-        internal("aucune gateway n'est connectée pour lire sa matière".to_string())
+        not_signed("aucune gateway n'est connectée pour lire sa matière".to_string())
     })?;
     let request = &accepted.request;
-    let client = admin::orion_client().map_err(unavailable)?;
+    let client = admin::orion_client().map_err(|error| not_signed(error.to_string()))?;
     let (material, admission) = tauri::async_runtime::block_on(admin::gateway_material(
         &client,
         base,
         &request.client_wg_public_key.to_base64(),
     ))
-    .map_err(unavailable)?;
-    pin.check(&material)?;
+    .map_err(|error| not_signed(error.to_string()))?;
+    pin.check(&material)
+        .map_err(|(_, message)| not_signed(message))?;
     let negotiation_endpoint =
         resolve_negotiation_endpoint(delivery.endpoint.trim(), None, material.negotiation_port)
-            .map_err(|error| internal(format!("{error:#}")))?;
+            .map_err(|error| not_signed(format!("{error:#}")))?;
     let draft = build_draft(DraftInput {
         request,
         tls_certificate: accepted.tls_certificate.clone(),
@@ -1190,28 +1226,18 @@ fn sign_delivery(
         ssh_target: delivery.ssh_target,
         now_unix: now_unix(),
     })
-    .map_err(|error| internal(format!("{error:#}")))?;
+    .map_err(|error| not_signed(format!("{error:#}")))?;
     // Read as Orion will read it before anyone signs it: a document Orion
     // would refuse must not cost a signature.
     let json = draft
         .to_json()
-        .map_err(|error| internal(format!("encodage du brouillon : {error}")))?;
+        .map_err(|error| not_signed(format!("encodage du brouillon : {error}")))?;
     orion_core::parse_profile_import(&json, "draft.orion").map_err(|error| {
-        internal(format!(
+        not_signed(format!(
             "le brouillon n'est pas lisible par Orion : {error:#}"
         ))
     })?;
-
-    let signed = astra_operator::signing::sign_document(vault, opened, registry, draft)
-        .map_err(|error| internal(format!("{error:#}")))?;
-    let contents = signed
-        .to_json()
-        .map_err(|error| internal(format!("encodage du document : {error}")))?;
-    Ok(OperatorArtifact {
-        file_name: document_file_name(&request.requested_name, &request.request_id),
-        contents,
-        encoding: ArtifactEncoding::Text,
-    })
+    Ok(draft)
 }
 
 /// `<requested_name>.orion` when the name is one a file can safely carry, else
@@ -1342,7 +1368,7 @@ fn leaf_from(
     match (sheet, unreadable) {
         (Some(sheet), _) => admin::decode_pq_certificate(sheet)
             .map_err(|error| (Refusal::HandoffMismatch, error.to_string())),
-        (None, Some(message)) => Err((Refusal::GatewayUnavailable, message)),
+        (None, Some(message)) => Err((Refusal::GatewayLeafUnavailable, message)),
         (None, None) => Err((
             Refusal::HandoffMismatch,
             "aucune gateway connectée et aucune feuille PQ fournie : l'invitation n'a rien à \

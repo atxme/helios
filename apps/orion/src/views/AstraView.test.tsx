@@ -36,7 +36,7 @@ const fillForm = () => {
   })
 }
 
-const openTab = (name: string) => fireEvent.click(screen.getByRole('tab', { name }))
+const openTab = (name: string | RegExp) => fireEvent.click(screen.getByRole('tab', { name }))
 
 const manifest = {
   reason: 'rotation planifiée',
@@ -256,6 +256,28 @@ describe('AstraView', () => {
     ).toBeTruthy()
   })
 
+  it('badges_the_approvals_tab_with_the_pending_count', async () => {
+    const operation = {
+      operation_id: 'f'.repeat(32),
+      scope: 'trust_authorities',
+      reason: 'rotation des ancres',
+      requested_by: 'operator',
+      target_count: 2,
+      required_credentials: 2,
+      campaign_fingerprint: 'a'.repeat(64),
+      created_at: 1_800_000_000,
+      expires_at: 1_800_000_300,
+    }
+    api.operatorPendingOperations.mockResolvedValue([
+      operation,
+      { ...operation, operation_id: 'e'.repeat(32) },
+    ])
+    render(<AstraView />)
+    const tab = await screen.findByRole('tab', { name: /Approbations/ })
+    await waitFor(() => expect(tab.textContent).toBe('Approbations2'))
+    expect(screen.getByRole('tab', { name: /Enrôlement/ }).textContent).toBe('Enrôlement')
+  })
+
   it('shows but never launches a campaign the helper cannot execute', async () => {
     api.operatorPendingOperations.mockResolvedValue([
       {
@@ -272,7 +294,7 @@ describe('AstraView', () => {
     ])
 
     render(<AstraView />)
-    openTab('Approbations')
+    openTab(/Approbations/)
 
     expect(await screen.findByText('rotation des ancres')).toBeTruthy()
     const open = screen.getByRole('button', { name: 'Ouvrir la cérémonie' })

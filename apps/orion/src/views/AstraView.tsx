@@ -1,6 +1,7 @@
 import type { ReactNode } from 'react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import Alert from '@mui/material/Alert'
+import Badge from '@mui/material/Badge'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
 import CircularProgress from '@mui/material/CircularProgress'
@@ -637,7 +638,20 @@ export function AstraView({
         sx={{ mb: 1.5, minHeight: 34 }}
       >
         {TABS.map((name) => (
-          <Tab key={name} value={name} label={name} sx={{ minHeight: 34, fontSize: 12 }} />
+          <Tab
+            key={name}
+            value={name}
+            label={
+              name === 'Approbations' && pending.length > 0 ? (
+                <Badge badgeContent={pending.length} color="primary" sx={{ '& .MuiBadge-badge': { right: -14 } }}>
+                  {name}
+                </Badge>
+              ) : (
+                name
+              )
+            }
+            sx={{ minHeight: 34, fontSize: 12 }}
+          />
         ))}
       </Tabs>
       {panels[tab]}

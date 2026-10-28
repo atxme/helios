@@ -40,8 +40,13 @@ const MAX_BODY_BYTES: usize = 1024 * 1024;
 /// Bounded twice, so a gateway that accepts the connection and then says
 /// nothing cannot hold a ceremony: 10 seconds to connect and 20 in all for a
 /// request. It carries no credential — the tunnel is the caller's identity.
+///
+/// It ignores environment proxies and follows no redirect: admin traffic must
+/// stay in the tunnel, to the address the profile names and to no other.
 pub fn orion_client() -> Result<Client, GatewayAdminError> {
     Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(REQUEST_TIMEOUT)
         .build()

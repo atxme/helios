@@ -92,7 +92,12 @@ const CERTIFICATE_KINDS = {
 } as const
 
 /** The rows of one manifest, named here and never carried as text. */
-function rowsOf(manifest: AstraManifest): [string, string][] {
+/** Hexadecimal read aloud, four digits at a time, as the Domaine panel shows it. */
+function groupedHex(hex: string): string {
+  return hex.replace(/\s+/g, '').replace(/(.{4})(?=.)/g, '$1 ')
+}
+
+export function rowsOf(manifest: AstraManifest): [string, string][] {
   switch (manifest.operation) {
     case 'recovery':
       return [
@@ -167,7 +172,7 @@ function rowsOf(manifest: AstraManifest): [string, string][] {
         ['gateway', manifest.gateway_wg_public_key],
         ['échéance', instant(manifest.not_after_unix)],
         ['réadmission', manifest.allow_readmission ? 'autorisée' : 'refusée'],
-        ['CA-PQ', manifest.ca_pq_fingerprint],
+        ['CA-PQ', groupedHex(manifest.ca_pq_fingerprint)],
       ]
     case 'enrollment_acceptance':
       return [
@@ -177,6 +182,8 @@ function rowsOf(manifest: AstraManifest): [string, string][] {
         ['empreinte', manifest.request_fingerprint],
         ['échéance des certificats', instant(manifest.leaves_not_after_unix)],
         ['point d’accès', manifest.endpoint],
+        ...(manifest.allowed_ips ? [['routes autorisées', manifest.allowed_ips] as [string, string]] : []),
+        ...(manifest.ssh_target ? [['cible SSH', manifest.ssh_target] as [string, string]] : []),
       ]
   }
 }
@@ -270,6 +277,18 @@ export function refusalSentence(refusal: Refusal): string {
         'La gateway n’est pas connectée ou n’a pas pu être lue. Les feuilles sont émises : ' +
         'admettre le pair avec la ligne de admission.txt, puis reprendre depuis la liste des ' +
         'invitations.'
+      )
+    case 'gateway_leaf_unavailable':
+      return (
+        'Aucune feuille PQ de la gateway n’a pu être lue : la gateway ne répond pas. ' +
+        'Fournir le fichier de la feuille PQ de la gateway, ou rétablir la gateway, puis ' +
+        'refaire l’invitation.'
+      )
+    case 'document_not_signed':
+      return (
+        'Le pair est admis, mais son document n’a pas pu être signé. Ne pas l’admettre ' +
+        'de nouveau : reprendre cette invitation depuis la liste des invitations pour ' +
+        'signer le document.'
       )
     case 'invitation_unknown':
       return 'Cette invitation est inconnue de ce poste : la demande n’a rien consommé.'

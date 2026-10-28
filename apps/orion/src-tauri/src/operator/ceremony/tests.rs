@@ -307,6 +307,21 @@ fn an_invitation_needs_a_gateway_leaf() {
     assert!(domain.registry_is_empty());
 }
 
+/// A connected gateway that cannot be read, with no leaf file, is its own
+/// refusal: not « admit the peer by hand », for there is no peer yet.
+#[test]
+fn an_unreadable_gateway_without_a_leaf_file_names_the_missing_leaf() {
+    let domain = Domain::new("unreadable-no-leaf");
+    let refused = leaf_from(
+        None,
+        Some(Err("injoignable".to_string())),
+        SERVER_NAME,
+        &WireGuardKey::parse(&domain.gateway_key).expect("key"),
+    )
+    .expect_err("no leaf to pin");
+    assert_eq!(refused.0, Refusal::GatewayLeafUnavailable);
+}
+
 /// A leaf this domain issued, but for another gateway, would pin the wrong
 /// machine: refused before a key is asked for, and nothing is recorded.
 #[test]
@@ -478,7 +493,7 @@ fn an_unreachable_gateway_falls_back_to_the_supplied_leaf_and_it_is_verified() {
     outcome.expect_err("nothing to fall back to");
     assert_eq!(
         published.last().expect("status").refusal,
-        Some(Refusal::GatewayUnavailable)
+        Some(Refusal::GatewayLeafUnavailable)
     );
     assert!(domain.registry_is_empty());
 }
@@ -664,6 +679,29 @@ fn a_relay_without_ca_tls_is_refused_before_the_key() {
 #[test]
 fn accepting_a_consumed_invitation_points_to_resume() {
     let domain = Domain::new("accept-consumed").with_ca_tls();
+    // Accepted here, leaves kept: a resumption exists to point to.
+    let (enrolment, _) = kept_acceptance(&domain, "laptop");
+    let (presses, received) = std::sync::mpsc::channel::<Press>();
+    drop(presses);
+    let (outcome, published, artifacts) = domain.accept(&enrolment.request, None, received);
+    let error = outcome.expect_err("a consumed invitation is refused");
+    assert_eq!(
+        error,
+        "Cette invitation est déjà consommée : la reprendre depuis la liste des invitations."
+    );
+    assert_eq!(
+        published.last().expect("a status").refusal,
+        Some(Refusal::InvitationConsumed)
+    );
+    assert!(no_key_was_asked(&published));
+    assert!(artifacts.is_empty());
+}
+
+/// Consumed outside Orion, nothing is kept here: no « Reprendre » exists, so
+/// the refusal must not send the operator to it.
+#[test]
+fn accepting_a_cli_accepted_invitation_is_refused_as_accepted_elsewhere() {
+    let domain = Domain::new("accept-cli-consumed").with_ca_tls();
     let enrolment = domain.enrolment("laptop", true);
     domain
         .registry
@@ -676,14 +714,10 @@ fn accepting_a_consumed_invitation_points_to_resume() {
     let (presses, received) = std::sync::mpsc::channel::<Press>();
     drop(presses);
     let (outcome, published, artifacts) = domain.accept(&enrolment.request, None, received);
-    let error = outcome.expect_err("a consumed invitation is refused");
-    assert_eq!(
-        error,
-        "Cette invitation est déjà consommée : la reprendre depuis la liste des invitations."
-    );
+    outcome.expect_err("a consumed invitation is refused");
     assert_eq!(
         published.last().expect("a status").refusal,
-        Some(Refusal::InvitationConsumed)
+        Some(Refusal::AcceptedElsewhere)
     );
     assert!(no_key_was_asked(&published));
     assert!(artifacts.is_empty());
@@ -1048,6 +1082,79 @@ fn a_gateway_that_changed_identity_is_not_admitted_to() {
 }
 
 /// Each way the gateway can say no is its own typed refusal.
+#[test]
+fn a_document_that_cannot_be_drafted_after_admission_is_not_signed() {
+    let domain = Domain::new("draft-fails");
+    let (_, accepted) = kept_acceptance(&domain, "laptop");
+    let closed = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        format!(
+            "http://127.0.0.1:{}",
+            listener.local_addr().expect("addr").port()
+        )
+    };
+    let pin = pin_of(&domain, &accepted);
+    for gateway in [Some(closed.as_str()), None] {
+        let delivery = Delivery {
+            endpoint: "198.51.100.7:51820",
+            allowed_ips: None,
+            ssh_target: None,
+            gateway,
+        };
+        let (refusal, message) =
+            draft_delivery(&accepted, &delivery, &pin).expect_err("the gateway cannot be read");
+        assert_eq!(refusal, Refusal::DocumentNotSigned);
+        assert!(!message.contains("admission.txt"), "{message}");
+    }
+}
+
+/// What is signed into the document is shown before the touch.
+#[test]
+fn the_acceptance_manifest_shows_the_signed_routes() {
+    let domain = Domain::new("manifest-routes").with_ca_tls();
+    let (enrolment, accepted) = kept_acceptance(&domain, "laptop");
+    let id = enrolment.invitation.invitation_id;
+    let device = accepted.request.client_wg_public_key.to_base64();
+    let (presses, received) = std::sync::mpsc::channel::<Press>();
+    drop(presses);
+    let mut ceremony = Ceremony::new(
+        Id16::new([2; 16]).expect("id"),
+        OperationLocator {
+            kind: OperationKind::AcceptEnrollment,
+            operation_id: None,
+        },
+    );
+    let mut published = Vec::new();
+    let _ = resume(
+        &mut ceremony,
+        &received,
+        &mut |status| published.push(status),
+        &mut |_| {},
+        &domain.vault_path,
+        &domain.registry,
+        Resume {
+            invitation_id: id,
+            delivery: Delivery {
+                endpoint: "198.51.100.7:51820",
+                allowed_ips: Some("10.0.0.0/24"),
+                ssh_target: Some("root@10.0.0.1"),
+                gateway: Some("http://gateway.invalid"),
+            },
+        },
+        &|_| answer(SERVER_NAME, &domain.gateway_key),
+        &|_| Ok(vec![device.clone()]),
+    );
+    let asked = published
+        .iter()
+        .find(|status| matches!(status.gesture, GestureState::AwaitingKey { .. }))
+        .expect("the key is asked for");
+    let Some(AstraManifest::EnrollmentAcceptance(manifest)) = &asked.manifest else {
+        panic!("an acceptance manifest");
+    };
+    assert_eq!(manifest.allowed_ips.as_deref(), Some("10.0.0.0/24"));
+    assert_eq!(manifest.ssh_target.as_deref(), Some("root@10.0.0.1"));
+}
+
 #[test]
 fn the_gateway_errors_are_told_apart() {
     use orion_core::gateway_admin::GatewayAdminError as E;

@@ -344,7 +344,7 @@ function InviteForm({
           }
           label={<Typography sx={{ fontSize: 12 }}>Autoriser la réadmission d’une clé déjà enrôlée</Typography>}
         />
-        {!connected && (
+        {(
           <Box>
             <TextField
               size="small"
@@ -357,7 +357,9 @@ function InviteForm({
               fullWidth
             />
             <Typography color="text.secondary" sx={{ fontSize: 10.5, mt: 0.5 }}>
-              Aucune gateway n’est connectée : la feuille de la gateway épingle l’invitation.
+              {connected
+                ? 'Facultatif : la gateway connectée est lue ; ce fichier sert si elle ne répond pas.'
+                : 'Aucune gateway n’est connectée : la feuille de la gateway épingle l’invitation.'}
             </Typography>
             {fileError && (
               <Alert severity="error" variant="outlined" sx={{ mt: 0.75, fontSize: 11.5 }}>
@@ -383,7 +385,7 @@ function InviteForm({
                 valid_for_hours: duration,
                 allow_readmission: readmission,
                 name: name.trim(),
-                ...(!connected && leaf !== null ? { gateway_pq_certificate: leaf } : {}),
+                ...(leaf !== null ? { gateway_pq_certificate: leaf } : {}),
               })
             }
             sx={{ minHeight: 30, fontSize: 11.5 }}

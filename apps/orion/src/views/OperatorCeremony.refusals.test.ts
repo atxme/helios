@@ -25,4 +25,17 @@ describe('refusalSentence for the acceptance', () => {
       "Cette invitation a été acceptée hors d'Orion : ses feuilles ne sont pas ici.",
     )
   })
+
+  it('names_a_gateway_leaf_that_cannot_be_read_without_pointing_to_admission_txt', () => {
+    const sentence = refusalSentence({ refusal: 'gateway_leaf_unavailable' })
+    expect(sentence).toMatch(/feuille PQ de la gateway/)
+    expect(sentence).not.toMatch(/admission\.txt/)
+  })
+
+  it('names_an_admitted_peer_whose_document_was_not_signed', () => {
+    const sentence = refusalSentence({ refusal: 'document_not_signed' })
+    expect(sentence).toMatch(/admis/)
+    expect(sentence).toMatch(/reprendre/)
+    expect(sentence).not.toMatch(/admission\.txt/)
+  })
 })

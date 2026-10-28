@@ -354,6 +354,13 @@ pub enum Refusal {
     /// The invitation was consumed with no accepted request kept here: it was
     /// accepted outside Orion, so its leaves are not on this machine to resume.
     AcceptedElsewhere,
+    /// An invitation was asked for, but no PQ leaf of the gateway could be read:
+    /// the connected gateway did not answer (or has no `heliosd_url`) and no
+    /// leaf file was supplied.
+    GatewayLeafUnavailable,
+    /// The peer is admitted, but its document could not be built or signed:
+    /// the acceptance is resumed, not redone.
+    DocumentNotSigned,
     /// Anything the ceremony could not classify. Deliberately last and
     /// deliberately opaque: an unclassified failure must not become a channel
     /// for text.
@@ -439,6 +446,12 @@ pub struct AcceptanceManifest {
     pub client_wg_public_key: WireGuardKey,
     pub leaves_not_after_unix: u64,
     pub endpoint: String,
+    /// The routes the document will carry, shown because they are signed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_ips: Option<String>,
+    /// The SSH target the document will carry, shown because it is signed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_target: Option<String>,
 }
 
 /// §7.5, and the only ceremony held by two parties at once.
@@ -851,7 +864,42 @@ mod tests {
             client_wg_public_key: WireGuardKey::from_bytes([7; 32]),
             leaves_not_after_unix: 200,
             endpoint: "gateway.example:51820".into(),
+            allowed_ips: None,
+            ssh_target: None,
         }
+    }
+
+    #[test]
+    fn the_signed_routes_are_shown_when_present_and_absent_otherwise() {
+        let bare = serde_json::to_value(acceptance_manifest()).expect("manifest");
+        assert!(bare.get("allowed_ips").is_none());
+        assert!(bare.get("ssh_target").is_none());
+        // A manifest written before the fields existed still reads.
+        let old = serde_json::from_value::<AcceptanceManifest>(bare).expect("old manifest");
+        assert_eq!(old, acceptance_manifest());
+
+        let mut routed = acceptance_manifest();
+        routed.allowed_ips = Some("10.0.0.0/24".into());
+        routed.ssh_target = Some("root@10.0.0.1".into());
+        let encoded = serde_json::to_value(&routed).expect("manifest");
+        assert_eq!(encoded["allowed_ips"], "10.0.0.0/24");
+        assert_eq!(encoded["ssh_target"], "root@10.0.0.1");
+        assert_eq!(
+            serde_json::from_value::<AcceptanceManifest>(encoded).expect("round trip"),
+            routed
+        );
+    }
+
+    #[test]
+    fn the_document_and_leaf_refusals_carry_no_text() {
+        assert_eq!(
+            serde_json::to_value(Refusal::GatewayLeafUnavailable).expect("refusal"),
+            serde_json::json!({ "refusal": "gateway_leaf_unavailable" })
+        );
+        assert_eq!(
+            serde_json::to_value(Refusal::DocumentNotSigned).expect("refusal"),
+            serde_json::json!({ "refusal": "document_not_signed" })
+        );
     }
 
     #[test]

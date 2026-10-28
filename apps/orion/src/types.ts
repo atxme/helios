@@ -714,6 +714,8 @@ export type Refusal =
   | { refusal: 'gateway_refused'; status: number }
   | { refusal: 'acceptance_not_kept' }
   | { refusal: 'accepted_elsewhere' }
+  | { refusal: 'gateway_leaf_unavailable' }
+  | { refusal: 'document_not_signed' }
   | { refusal: 'handoff_mismatch' }
   | { refusal: 'manifest_mismatch' }
   | { refusal: 'protocol_violation' }
@@ -839,6 +841,9 @@ export interface AcceptanceManifest {
   client_wg_public_key: string
   leaves_not_after_unix: number
   endpoint: string
+  /** Signés dans le document : montrés avant le toucher quand ils y figurent. */
+  allowed_ips?: string
+  ssh_target?: string
 }
 
 export type AstraManifest =

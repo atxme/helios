@@ -86,7 +86,7 @@ describe('EnrollmentOperatorPanel', () => {
     expect(onCeremony).toHaveBeenCalledWith(status)
   })
 
-  it('invite_asks_for_the_gateway_leaf_only_without_a_connected_gateway', async () => {
+  it('invite_always_offers_the_gateway_leaf_because_a_connected_gateway_can_fail_to_answer', async () => {
     api.getState.mockResolvedValue('down')
     render(<EnrollmentOperatorPanel onCeremony={vi.fn()} />)
     fireEvent.click(await screen.findByRole('button', { name: /Inviter un poste/ }))
@@ -97,7 +97,7 @@ describe('EnrollmentOperatorPanel', () => {
     render(<EnrollmentOperatorPanel onCeremony={vi.fn()} />)
     fireEvent.click(await screen.findByRole('button', { name: /Inviter un poste/ }))
     await waitFor(() => expect(api.getConfig).toHaveBeenCalled())
-    await waitFor(() => expect(screen.queryByLabelText('Feuille PQ de la gateway')).toBeNull())
+    expect(screen.getByLabelText('Feuille PQ de la gateway')).toBeTruthy()
   })
 
   it('accept_prefills_the_endpoint_of_the_connected_profile', async () => {
