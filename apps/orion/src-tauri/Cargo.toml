@@ -42,6 +42,8 @@ windows-sys = { version = "0.61", features = [
   # Octroi aux Administrateurs sur le processus et le jeton de l'IHM avant
   # l'élévation (`ui_access`) : GetSecurityInfo, SetEntriesInAclW, SetSecurityInfo.
   "Win32_Security_Authorization",
+  # Appartement COM du fil de la boîte de choix du coffre (`operator::location`).
+  "Win32_System_Com",
   "Win32_System_LibraryLoader",
   "Win32_System_Threading",
   # Lancement élevé du moteur (`engine_launch`) : ShellExecuteExW est gardé par

@@ -215,16 +215,25 @@ pub(crate) async fn choose_vault_location(
 ) -> Result<Option<crate::operator::location::VaultLocationView>, String> {
     #[cfg(target_os = "windows")]
     {
+        // Held until this command returns, whatever the path: one dialog at a
+        // time.
+        let _picker = state.vault_location.begin_pick()?;
         let owner = owner_window(&window);
         // An unreadable setting must still be replaceable: the dialog then
         // opens where it would by default.
         let current = state.vault_location.path().unwrap_or_default();
-        let picked =
-            tokio::task::spawn_blocking(move || crate::operator::location::pick(owner, &current))
-                .await
-                .map_err(|error| {
-                    format!("boîte de choix de l'emplacement du coffre : {error}")
-                })??;
+        // A thread of its own: the dialog sets that thread's COM apartment,
+        // which a pooled worker would carry into unrelated work.
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        std::thread::Builder::new()
+            .name("orion-vault-picker".into())
+            .spawn(move || {
+                let _ = sender.send(crate::operator::location::pick(owner, &current));
+            })
+            .map_err(|error| format!("boîte de choix de l'emplacement du coffre : {error}"))?;
+        let picked = receiver.await.map_err(|_| {
+            "la boîte de choix de l'emplacement du coffre s'est arrêtée".to_string()
+        })??;
         match picked {
             Some(path) => state.vault_location.choose(path).map(Some),
             None => Ok(None),

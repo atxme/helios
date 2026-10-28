@@ -104,3 +104,42 @@ fn an_unreadable_setting_is_an_error_not_the_default() {
         );
     }
 }
+
+/// Windows ignores the case of a file name, so a dialog answer in another case
+/// still names the vault there; elsewhere only the exact name does.
+#[test]
+fn the_vault_name_ignores_case_only_where_the_file_system_does() {
+    let typed = std::ffi::OsStr::new("Authority-Vault.JSON");
+    let exact = std::ffi::OsStr::new(VAULT_FILE_NAME);
+    let other = std::ffi::OsStr::new("authority-vault.json.bak");
+    assert!(names_a_vault(typed, true));
+    assert!(!names_a_vault(typed, false));
+    assert!(names_a_vault(exact, true));
+    assert!(names_a_vault(exact, false));
+    assert!(!names_a_vault(other, true));
+    assert!(!names_a_vault(other, false));
+}
+
+/// One dialog at a time: a second is refused while the first is open, and the
+/// place is free again once it closes.
+#[test]
+fn only_one_picker_is_open_at_a_time() {
+    let scratch = Scratch::new("picker");
+    let location = VaultLocation::at(scratch.settings());
+    let first = location.begin_pick().expect("first picker");
+    assert_eq!(
+        location.begin_pick().err().as_deref(),
+        Some(PICKER_ALREADY_OPEN)
+    );
+    drop(first);
+    let again = location.begin_pick().expect("free once the first closed");
+    drop(again);
+
+    // A return through an error releases it the same way.
+    let failed = || -> Result<(), String> {
+        let _picker = location.begin_pick()?;
+        Err("cancelled".into())
+    };
+    assert!(failed().is_err());
+    assert!(location.begin_pick().is_ok());
+}

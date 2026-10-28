@@ -11,6 +11,8 @@
 //! default, replaces it.
 
 use std::path::{Path, PathBuf};
+#[cfg(any(windows, test))]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, PoisonError};
 
 use anyhow::Context;
@@ -25,6 +27,10 @@ const SETTINGS_FILE_NAME: &str = "orion-operator.json";
 /// A setting holds one path: anything longer was not written by Orion.
 const MAX_SETTINGS_BYTES: u64 = 16 * 1024;
 
+/// Said when a second dialog is asked for while one is open.
+#[cfg(any(windows, test))]
+const PICKER_ALREADY_OPEN: &str = "un sélecteur d'emplacement est déjà ouvert";
+
 /// What is written on disk.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -35,10 +41,24 @@ struct Settings {
 /// The vault location this process opens, and the setting it comes from.
 ///
 /// `choice` is what the setting said when it was last read or written: a
-/// path, none, or why it could not be read.
+/// path, none, or why it could not be read. `picking` is set while a dialog
+/// is open, so a second one is refused rather than stacked over it.
 pub struct VaultLocation {
     settings: Result<PathBuf, String>,
     choice: Mutex<Result<Option<PathBuf>, String>>,
+    #[cfg(any(windows, test))]
+    picking: AtomicBool,
+}
+
+/// Holds the one open dialog; dropping it, on whatever path, frees the place.
+#[cfg(any(windows, test))]
+pub struct PickerGuard<'a>(&'a AtomicBool);
+
+#[cfg(any(windows, test))]
+impl Drop for PickerGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 /// What the WebView is shown. A path to display, not one it may send back.
@@ -59,6 +79,8 @@ impl VaultLocation {
                 Self {
                     settings: Err(message.clone()),
                     choice: Mutex::new(Err(message)),
+                    #[cfg(any(windows, test))]
+                    picking: AtomicBool::new(false),
                 }
             }
         }
@@ -70,6 +92,8 @@ impl VaultLocation {
         Self {
             settings: Ok(settings),
             choice: Mutex::new(choice),
+            #[cfg(any(windows, test))]
+            picking: AtomicBool::new(false),
         }
     }
 
@@ -94,6 +118,15 @@ impl VaultLocation {
         write(settings, &path)?;
         *choice = Ok(Some(path));
         view_of(&choice)
+    }
+
+    /// Takes the place of the one dialog, or refuses when it is taken.
+    #[cfg(any(windows, test))]
+    pub fn begin_pick(&self) -> Result<PickerGuard<'_>, String> {
+        self.picking
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .map(|_| PickerGuard(&self.picking))
+            .map_err(|_| PICKER_ALREADY_OPEN.to_string())
     }
 
     /// Goes back to the default location by removing the setting.
@@ -147,13 +180,28 @@ fn validate(path: &Path) -> Result<(), String> {
             path.display()
         ));
     }
-    if path.file_name() != Some(std::ffi::OsStr::new(VAULT_FILE_NAME)) {
+    if !path
+        .file_name()
+        .is_some_and(|name| names_a_vault(name, cfg!(windows)))
+    {
         return Err(format!(
             "le coffre opérateur se nomme {VAULT_FILE_NAME}, pas {}",
             path.display()
         ));
     }
     Ok(())
+}
+
+/// Whether `name` is [`VAULT_FILE_NAME`]: exactly, or regardless of ASCII
+/// case where the file system ignores it (Windows, `ignore_case`), so a name
+/// the operator typed in another case still names the same file.
+fn names_a_vault(name: &std::ffi::OsStr, ignore_case: bool) -> bool {
+    if ignore_case {
+        name.to_str()
+            .is_some_and(|name| name.eq_ignore_ascii_case(VAULT_FILE_NAME))
+    } else {
+        name == VAULT_FILE_NAME
+    }
 }
 
 /// The choice the setting records: none when there is no setting, an error
@@ -216,21 +264,46 @@ fn settings_path() -> anyhow::Result<PathBuf> {
 /// A save dialog rather than an open one: the vault may not exist yet, and
 /// choosing an existing one is the usual case, so the dialog does not ask
 /// before «overwriting» it — nothing is written here. `None` when the
-/// operator cancels. Blocking: run it off the async runtime.
+/// operator cancels.
+///
+/// Blocking, and it sets the calling thread's COM apartment: call it from a
+/// thread of its own, not from a runtime or pooled worker.
 #[cfg(windows)]
 pub fn pick(owner: isize, current: &Path) -> Result<Option<PathBuf>, String> {
     use std::ffi::OsString;
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use windows_sys::Win32::System::Com::{
+        CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED,
+    };
     use windows_sys::Win32::UI::Controls::Dialogs::{
         CommDlgExtendedError, GetSaveFileNameW, OFN_NOREADONLYRETURN, OFN_PATHMUSTEXIST,
         OPENFILENAMEW,
     };
 
+    /// Balances a successful `CoInitializeEx`, on every return below.
+    struct Apartment;
+    impl Drop for Apartment {
+        fn drop(&mut self) {
+            // SAFETY: only built after `CoInitializeEx` succeeded on this
+            // thread, and dropped on it.
+            unsafe { CoUninitialize() };
+        }
+    }
+
     // The longest path the dialog may return, with its terminating NUL.
     const FILE_BUFFER: usize = 32_768;
 
+    // SAFETY: no pointer is passed; the dialog's shell views want a
+    // single-threaded apartment on the thread that shows it.
+    let initialized = unsafe { CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32) };
+    // S_OK and S_FALSE both count and both must be balanced; a failure leaves
+    // nothing to undo, and the dialog is still tried without it.
+    let _apartment = (initialized >= 0).then_some(Apartment);
+
     let wide = |text: &str| -> Vec<u16> { text.encode_utf16().chain(std::iter::once(0)).collect() };
     let title = wide("Emplacement du coffre opérateur");
+    // Appended when the operator types a name without an extension.
+    let extension = wide("json");
     // Pairs of NUL-terminated strings, ended by an empty one.
     let filter: Vec<u16> = "Coffre opérateur (authority-vault.json)\0authority-vault.json\0\0"
         .encode_utf16()
@@ -255,10 +328,11 @@ pub fn pick(owner: isize, current: &Path) -> Result<Option<PathBuf>, String> {
         nMaxFile: FILE_BUFFER as u32,
         lpstrInitialDir: directory.as_ptr(),
         lpstrTitle: title.as_ptr(),
+        lpstrDefExt: extension.as_ptr(),
         Flags: OFN_PATHMUSTEXIST | OFN_NOREADONLYRETURN,
         ..Default::default()
     };
-    // SAFETY: `dialog` and the four buffers it points at are alive for the
+    // SAFETY: `dialog` and the five buffers it points at are alive for the
     // call; the strings are NUL-terminated, the filter doubly, and `nMaxFile`
     // is the length of `file`. A null owner is allowed.
     let chosen = unsafe { GetSaveFileNameW(&mut dialog) };
