@@ -10,15 +10,21 @@ mod support;
 use std::path::{Path, PathBuf};
 
 use aether::certificates::approval::CredentialState;
-use aether::certificates::encoding::{TrustDomainId, WireGuardKey};
+use aether::certificates::encoding::{
+    generate_ml_dsa_87_keypair, MlDsa87PublicKey, MlDsa87Signature, TrustDomainId, WireGuardKey,
+};
+use aether::certificates::gateway::GatewayBootstrapRequest;
+use aether::certificates::CERTIFICATE_FORMAT_VERSION;
+use aether::key_negotiation::{PqCertificate, PqCertificateRole, PQ_CERTIFICATE_VERSION};
 use astra_operator::authenticator::Opened;
 use astra_operator::gestures::{NewAuthority, NewKey};
 use astra_operator::vault::{SlotRole, MAX_SLOTS};
 use astra_operator::vault_gestures::{
-    add_key_with, check_addition, check_creation, check_marking, check_removal, create_first_key,
-    mark_key_with, prove_opens, remove_key_with, rename_key, SetupRefusal,
+    add_key_with, adopt_gateway, check_addition, check_creation, check_document, check_marking,
+    check_removal, create_first_key, finalization, finalize_with, mark_key_with, prove_opens,
+    remove_key_with, rename_key, write_relay, RelayUpdate, SetupRefusal,
 };
-use astra_operator::{credentials, handoff, signing, store};
+use astra_operator::{credentials, handoff, overview, signing, store};
 use support::{FakeKey, PIN, RP_ID};
 
 const NOW: u64 = 1_800_000_000;
@@ -499,4 +505,349 @@ fn addition_refuses_a_document_it_cannot_resign_before_the_key() {
     );
     assert_eq!(key2.assertions(), 0);
     assert_eq!(std::fs::read(&path).expect("vault bytes"), vault_bytes);
+}
+
+// --- Domain -----------------------------------------------------------------
+
+fn relay(path: &Path) -> handoff::DomainHandoff {
+    handoff::load(&handoff::path_beside(path)).expect("relay")
+}
+
+/// A gateway leaf issued under this domain's `CA-PQ`, through the bootstrap
+/// gesture that issues the real one.
+fn domain_leaf(
+    path: &Path,
+    opening: &Opened,
+    server_name: &str,
+    gateway: WireGuardKey,
+) -> PqCertificate {
+    let vault = store::load(path).expect("vault");
+    let (gateway_private, gateway_public) = generate_ml_dsa_87_keypair().expect("gateway key");
+    let request = GatewayBootstrapRequest {
+        format_version: CERTIFICATE_FORMAT_VERSION,
+        gateway_wg_public_key: gateway,
+        server_name: server_name.into(),
+        ml_dsa_87_public_key: gateway_public,
+        key_possession_proof: MlDsa87Signature::placeholder(),
+    }
+    .sign(&gateway_private)
+    .expect("bootstrap request");
+    signing::issue_gateway_bootstrap_certificate(
+        &vault,
+        opening,
+        &MlDsa87PublicKey::parse(vault.ca_pq_public_key.trim()).expect("anchor"),
+        &signing::GatewayBootstrapDecision {
+            request: &request,
+            leaf_validity: (NOW - 60, NOW + 86_400),
+            serial: [9; 16],
+        },
+    )
+    .expect("gateway leaf")
+}
+
+/// The same leaf, signed by a CA that is not this domain's.
+fn foreign_leaf(server_name: &str, gateway: WireGuardKey) -> PqCertificate {
+    let (ca_private, _) = generate_ml_dsa_87_keypair().expect("foreign CA");
+    let (_, subject) = generate_ml_dsa_87_keypair().expect("subject");
+    aether::key_negotiation::issue_pq_certificate(
+        PqCertificate {
+            version: PQ_CERTIFICATE_VERSION,
+            serial: [9; 16],
+            subject: server_name.into(),
+            issuer: "helios-ca-pq".into(),
+            role: PqCertificateRole::Gateway,
+            wireguard_public_key: gateway.to_base64(),
+            ml_dsa_87_public_key: subject.to_base64(),
+            not_before_unix: NOW - 60,
+            not_after_unix: NOW + 86_400,
+            ml_dsa_87_signature: String::new(),
+        },
+        &ca_private,
+    )
+    .expect("foreign leaf")
+}
+
+/// A domain with its two keys and the gateway recorded on the relay.
+fn domain_with_gateway(path: &Path, key1: &FakeKey, key2: &FakeKey) -> Opened {
+    let first = create(path, key1);
+    add(path, &first, key2, "YubiKey du sac");
+    complete_relay(path);
+    first
+}
+
+#[test]
+fn the_relay_takes_only_valid_values() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = vault_path(&directory);
+    let key1 = FakeKey::new(1);
+    create(&path, &key1);
+    let relay_path = handoff::path_beside(&path);
+    let before = std::fs::read(&relay_path).expect("relay bytes");
+
+    let invalid = RelayUpdate {
+        server_name: Some(SERVER_NAME.into()),
+        astra_authority_url: Some("http://x".into()),
+        ..RelayUpdate::default()
+    };
+    assert!(write_relay(&path, &invalid).is_err());
+    assert_eq!(std::fs::read(&relay_path).expect("relay bytes"), before);
+    for invalid in [
+        RelayUpdate {
+            gateway_wg_public_key: Some("not a key".into()),
+            ..RelayUpdate::default()
+        },
+        RelayUpdate {
+            server_name: Some("not a name!".into()),
+            ..RelayUpdate::default()
+        },
+        RelayUpdate {
+            astra_service_key_epoch: Some(0),
+            ..RelayUpdate::default()
+        },
+        RelayUpdate {
+            astra_service_public_key: Some("bm9wZQ==".into()),
+            ..RelayUpdate::default()
+        },
+    ] {
+        assert!(write_relay(&path, &invalid).is_err(), "{invalid:?}");
+        assert_eq!(std::fs::read(&relay_path).expect("relay bytes"), before);
+    }
+
+    let gateway = WireGuardKey::from_bytes([0x11; 32]).to_base64();
+    let written = write_relay(
+        &path,
+        &RelayUpdate {
+            gateway_wg_public_key: Some(format!("  {gateway} ")),
+            server_name: Some(format!(" {SERVER_NAME}")),
+            ..RelayUpdate::default()
+        },
+    )
+    .expect("valid values are recorded");
+
+    let read = relay(&path);
+    assert_eq!(read, written);
+    assert_eq!(
+        read.gateway_wg_public_key.as_deref(),
+        Some(gateway.as_str())
+    );
+    assert_eq!(read.server_name.as_deref(), Some(SERVER_NAME));
+    assert_eq!(
+        read.astra_authority_url.as_deref(),
+        Some("https://astra.helios.test"),
+        "what was recorded before is kept"
+    );
+}
+
+#[test]
+fn adopting_takes_the_gateway_the_domain_signed() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = vault_path(&directory);
+    let (key1, key2) = (FakeKey::new(1), FakeKey::new(2));
+    let first = create(&path, &key1);
+    add(&path, &first, &key2, "YubiKey du sac");
+    let gateway = WireGuardKey::from_bytes([0x11; 32]);
+    let relay_path = handoff::path_beside(&path);
+    let before = std::fs::read(&relay_path).expect("relay bytes");
+
+    assert!(adopt_gateway(&path, &foreign_leaf(SERVER_NAME, gateway), NOW).is_err());
+    assert_eq!(std::fs::read(&relay_path).expect("relay bytes"), before);
+
+    let leaf = domain_leaf(&path, &first, SERVER_NAME, gateway);
+    let adopted = adopt_gateway(&path, &leaf, NOW).expect("the domain's own leaf");
+    assert_eq!(relay(&path), adopted);
+    assert_eq!(
+        adopted.gateway_wg_public_key.as_deref(),
+        Some(gateway.to_base64().as_str())
+    );
+    assert_eq!(adopted.server_name.as_deref(), Some(SERVER_NAME));
+
+    let adopted_bytes = std::fs::read(&relay_path).expect("relay bytes");
+    adopt_gateway(&path, &leaf, NOW).expect("the same gateway again changes nothing");
+    assert_eq!(
+        std::fs::read(&relay_path).expect("relay bytes"),
+        adopted_bytes
+    );
+
+    let other = domain_leaf(
+        &path,
+        &first,
+        "other.helios.test",
+        WireGuardKey::from_bytes([0x22; 32]),
+    );
+    let error = adopt_gateway(&path, &other, NOW).expect_err("another gateway is a transition");
+    assert!(
+        error.to_string().contains("transition de gateway"),
+        "{error}"
+    );
+    assert_eq!(
+        std::fs::read(&relay_path).expect("relay bytes"),
+        adopted_bytes
+    );
+}
+
+#[test]
+fn finalizing_issues_what_is_missing_in_one_touch() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = vault_path(&directory);
+    let (key1, key2) = (FakeKey::new(1), FakeKey::new(2));
+    let first = domain_with_gateway(&path, &key1, &key2);
+
+    let plan = finalization(&path).expect("something to finalize");
+    assert!(plan.issues_ca_tls);
+    assert!(plan.issues_credentials);
+    assert_eq!(plan.server_name, SERVER_NAME);
+    assert_eq!(
+        plan.gateway_wg_public_key,
+        WireGuardKey::from_bytes([0x11; 32])
+    );
+
+    let finalized = finalize_with(&path, &first, NOW).expect("finalized");
+
+    assert_eq!(
+        key1.assertions(),
+        1,
+        "the opening already held is the one touch"
+    );
+    let relay = relay(&path);
+    assert!(relay.ca_tls_certificate.is_some());
+    assert_eq!(relay.ca_tls_epoch, Some(1));
+    let registry = document(&path);
+    assert_eq!(registry.bindings.len(), 2);
+    assert_eq!(
+        finalized.credentials_epoch,
+        Some(registry.credential_registry_epoch)
+    );
+    let pem = finalized.ca_tls_pem.expect("CA-TLS issued");
+    assert!(pem.starts_with("-----BEGIN CERTIFICATE-----\n"), "{pem}");
+    assert!(pem.ends_with("-----END CERTIFICATE-----\n"), "{pem}");
+    let body: String = pem
+        .lines()
+        .filter(|line| !line.starts_with("-----"))
+        .collect();
+    assert!(pem.lines().all(|line| line.len() <= 64));
+    assert_eq!(Some(body), relay.ca_tls_certificate);
+}
+
+#[test]
+fn finalizing_twice_never_reissues_ca_tls() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = vault_path(&directory);
+    let (key1, key2) = (FakeKey::new(1), FakeKey::new(2));
+    let first = domain_with_gateway(&path, &key1, &key2);
+    finalize_with(&path, &first, NOW).expect("first finalization");
+    let certificate = relay(&path).ca_tls_certificate;
+    std::fs::remove_file(credentials::path_beside(&path)).expect("document removed");
+
+    let plan = finalization(&path).expect("the document is missing");
+    assert!(!plan.issues_ca_tls);
+    assert!(plan.issues_credentials);
+
+    let second = finalize_with(&path, &first, NOW).expect("second finalization");
+    assert_eq!(second.ca_tls_pem, None);
+    assert!(second.credentials_epoch.is_some());
+    assert_eq!(relay(&path).ca_tls_certificate, certificate);
+    document(&path);
+
+    assert_eq!(
+        finalization(&path).err(),
+        Some(SetupRefusal::DomainComplete)
+    );
+    assert_eq!(
+        refusal(finalize_with(&path, &first, NOW)),
+        Some(SetupRefusal::DomainComplete)
+    );
+    assert_eq!(relay(&path).ca_tls_certificate, certificate);
+}
+
+#[test]
+fn finalization_needs_the_gateway() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = vault_path(&directory);
+    let (key1, key2) = (FakeKey::new(1), FakeKey::new(2));
+    let first = create(&path, &key1);
+    add(&path, &first, &key2, "YubiKey du sac");
+    let relay_bytes = std::fs::read(handoff::path_beside(&path)).expect("relay bytes");
+
+    assert_eq!(
+        finalization(&path).err(),
+        Some(SetupRefusal::GatewayIdentityMissing)
+    );
+    assert_eq!(
+        refusal(finalize_with(&path, &first, NOW)),
+        Some(SetupRefusal::GatewayIdentityMissing)
+    );
+    assert_eq!(
+        std::fs::read(handoff::path_beside(&path)).expect("relay bytes"),
+        relay_bytes
+    );
+    assert!(!credentials::path_beside(&path).exists());
+}
+
+/// What a gesture would find unable to re-sign is refused before any press.
+#[test]
+fn a_document_the_relay_cannot_resign_is_refused_before_the_press() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = vault_path(&directory);
+    let (key1, key2) = (FakeKey::new(1), FakeKey::new(2));
+    let first = create(&path, &key1);
+    add(&path, &first, &key2, "YubiKey du sac");
+    check_document(&path).expect("no document yet, nothing to re-sign");
+
+    complete_relay(&path);
+    emit_document(&path, &first);
+    check_document(&path).expect("a document the relay names");
+
+    clear_gateway(&path);
+    assert_eq!(
+        check_document(&path),
+        Err(SetupRefusal::GatewayIdentityMissing)
+    );
+
+    complete_relay(&path);
+    let registry_path = credentials::path_beside(&path);
+    let mut registry = document(&path);
+    registry.bindings[0].state = CredentialState::Lost;
+    credentials::save(&registry_path, &registry).expect("altered document");
+    assert_eq!(
+        check_document(&path),
+        Err(SetupRefusal::GatewayIdentityMissing)
+    );
+    assert_eq!(
+        finalization(&path).err(),
+        Some(SetupRefusal::GatewayIdentityMissing)
+    );
+}
+
+/// A key's state is shown only as a document that verifies says it: a row
+/// read from an altered one would describe a decision nobody signed.
+#[test]
+fn the_overview_shows_states_only_from_a_verified_document() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = vault_path(&directory);
+    let (key1, key2) = (FakeKey::new(1), FakeKey::new(2));
+    let first = domain_with_gateway(&path, &key1, &key2);
+    let view = overview::read(&path).expect("overview");
+    assert!(view.bootstrapped);
+    assert!(view.location_available);
+    assert!(!view.credentials_complete, "no document yet");
+    assert!(view.slots.iter().all(|slot| slot.state.is_none()));
+
+    let lost = store::load(&path).expect("vault").slots[1].slot_id;
+    mark_key_with(&path, &first, &lost, true, NOW).expect("marked lost");
+
+    let view = overview::read(&path).expect("overview");
+    assert!(view.credentials_complete);
+    assert_eq!(view.slots[0].state.as_deref(), Some("active"));
+    assert_eq!(view.slots[1].state.as_deref(), Some("lost"));
+
+    let registry_path = credentials::path_beside(&path);
+    let mut altered = document(&path);
+    for binding in &mut altered.bindings {
+        binding.state = CredentialState::Active;
+    }
+    credentials::save(&registry_path, &altered).expect("altered document");
+
+    let view = overview::read(&path).expect("overview");
+    assert!(!view.credentials_complete);
+    assert!(view.slots.iter().all(|slot| slot.state.is_none()));
 }

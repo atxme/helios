@@ -10,7 +10,7 @@
 //! be a press nobody announced.
 //!
 //! The sequences are those of `astra-signer` (`init`, `enrol`, `remove`,
-//! `bindings`, `rename`), without the terminal.
+//! `bindings`, `rename`, `domain`, `issue-ca-tls`), without the terminal.
 //!
 //! # Checks, then gestures
 //!
@@ -26,8 +26,11 @@
 use std::path::Path;
 
 use aether::certificates::approval::CredentialState;
-use aether::certificates::encoding::MlDsa87PublicKey;
-use anyhow::{bail, Result};
+use aether::certificates::encoding::{
+    validate_server_name, DerCertificate, MlDsa87PublicKey, WireGuardKey,
+};
+use aether::key_negotiation::{PqCertificate, PqCertificateRole};
+use anyhow::{bail, Context, Result};
 
 use crate::authenticator::{Authenticator, Opened};
 use crate::gestures::{self, AddedKey, NewAuthority, NewKey};
@@ -263,7 +266,284 @@ pub fn rename_key(vault_path: &Path, slot_id: &[u8; 16], label: &str) -> Result<
     store::save(vault_path, &vault)
 }
 
+// --- Domain -----------------------------------------------------------------
+
+/// Values an operator records on the relay — `astra-signer domain`'s flags.
+///
+/// Each absent field leaves what the relay already records.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelayUpdate {
+    pub gateway_wg_public_key: Option<String>,
+    pub server_name: Option<String>,
+    pub astra_service_public_key: Option<String>,
+    pub astra_service_key_epoch: Option<u64>,
+    pub astra_authority_url: Option<String>,
+}
+
+/// Records values on the relay beside the vault — `astra-signer domain`.
+///
+/// The relay is read first and refreshed from the vault, so what was recorded
+/// earlier stays. Every value is checked before anything is written: a key
+/// that is not a key would be carried into every object signed afterwards.
+pub fn write_relay(vault_path: &Path, update: &RelayUpdate) -> Result<handoff::DomainHandoff> {
+    let vault = store::load(vault_path)?;
+    let mut relay = handoff::DomainHandoff::beside(vault_path, &vault)?;
+    if let Some(value) = &update.gateway_wg_public_key {
+        WireGuardKey::parse(value).context("clé publique WireGuard de la gateway")?;
+        relay.gateway_wg_public_key = Some(value.trim().to_string());
+    }
+    if let Some(value) = &update.server_name {
+        validate_server_name(value.trim()).context("nom de service de la gateway")?;
+        relay.server_name = Some(value.trim().to_string());
+    }
+    if let Some(value) = &update.astra_service_public_key {
+        MlDsa87PublicKey::parse(value.trim()).context("clé publique de service d'Astra")?;
+        relay.astra_service_public_key = Some(value.trim().to_string());
+    }
+    if let Some(epoch) = update.astra_service_key_epoch {
+        if epoch == 0 {
+            bail!("l'époque de la clé de service Astra doit être non nulle");
+        }
+        relay.astra_service_key_epoch = Some(epoch);
+    }
+    if let Some(value) = &update.astra_authority_url {
+        relay.astra_authority_url = Some(authority_origin(value)?);
+    }
+    handoff::save(&handoff::path_beside(vault_path), &relay)?;
+    Ok(relay)
+}
+
+/// Records the gateway a leaf of this domain names: its server name and its
+/// WireGuard key.
+///
+/// The leaf must verify under the domain's `CA-PQ` for exactly that identity,
+/// so the relay only ever names a gateway the authority itself certified. A
+/// relay that already names it is left as it is; one that names another, or a
+/// document bound to another, is refused: moving a domain to another gateway
+/// is a gateway transition, not an adoption.
+pub fn adopt_gateway(
+    vault_path: &Path,
+    leaf: &PqCertificate,
+    now_unix: u64,
+) -> Result<handoff::DomainHandoff> {
+    let vault = store::load(vault_path)?;
+    let mut relay = handoff::DomainHandoff::beside(vault_path, &vault)?;
+    let gateway = WireGuardKey::parse(&leaf.wireguard_public_key)
+        .context("clé publique WireGuard de la feuille gateway")?;
+    validate_server_name(&leaf.subject).context("nom de service de la feuille gateway")?;
+    let ca_pq = MlDsa87PublicKey::parse(relay.ca_pq_public_key.trim())?;
+    leaf.verify(
+        ca_pq.as_bytes(),
+        PqCertificateRole::Gateway,
+        Some(&leaf.subject),
+        &gateway.to_base64(),
+        now_unix,
+    )
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "la feuille de la gateway ne vérifie pas sous le CA-PQ du domaine : {error}"
+        )
+    })?;
+
+    let recorded_gateway = relay
+        .gateway_wg_public_key
+        .as_deref()
+        .map(WireGuardKey::parse)
+        .transpose()?;
+    let document_gateway = credentials::load(&credentials::path_beside(vault_path))?
+        .map(|document| document.gateway_wg_public_key);
+    let other_gateway = recorded_gateway.is_some_and(|recorded| recorded != gateway)
+        || document_gateway.is_some_and(|bound| bound != gateway)
+        || relay
+            .server_name
+            .as_deref()
+            .is_some_and(|recorded| recorded != leaf.subject);
+    if other_gateway {
+        bail!("le domaine nomme déjà une autre gateway ; en changer est une transition de gateway");
+    }
+    if recorded_gateway.is_some() && relay.server_name.is_some() {
+        return Ok(relay);
+    }
+    relay.gateway_wg_public_key = Some(gateway.to_base64());
+    relay.server_name = Some(leaf.subject.clone());
+    handoff::save(&handoff::path_beside(vault_path), &relay)?;
+    Ok(relay)
+}
+
+/// Lifetime of the `CA-TLS` a finalization self-signs, in days: the longest
+/// [`signing::MAX_CA_TLS_LIFETIME_SECS`] allows.
+pub const CA_TLS_DAYS: u64 = 3650;
+
+const DAY_SECS: u64 = 86_400;
+
+/// What finalizing the domain will issue, shown before the press.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Finalization {
+    pub server_name: String,
+    pub gateway_wg_public_key: WireGuardKey,
+    /// The relay carries no `CA-TLS` yet.
+    pub issues_ca_tls: bool,
+    /// No credential document verifies under `CA-PQ` with a row for every
+    /// slot of the vault.
+    pub issues_credentials: bool,
+}
+
+/// What finalizing the domain issues, or why there is nothing to.
+///
+/// The gateway's identity comes first: both objects name it. A document in
+/// place that cannot be re-signed is refused here, as
+/// [`check_document`] refuses it, rather than found so after the press —
+/// and after a `CA-TLS` was already written.
+pub fn finalization(vault_path: &Path) -> std::result::Result<Finalization, SetupRefusal> {
+    let vault = store::load(vault_path).map_err(|_| SetupRefusal::LocationUnavailable)?;
+    check_document_of(vault_path, &vault)?;
+    let relay = handoff::DomainHandoff::beside(vault_path, &vault)
+        .map_err(|_| SetupRefusal::GatewayIdentityMissing)?;
+    let identity =
+        handoff::identity_of(&relay).map_err(|_| SetupRefusal::GatewayIdentityMissing)?;
+    let issues_ca_tls = relay.ca_tls_certificate.is_none();
+    let issues_credentials = !verified_document(vault_path, &vault)
+        .is_some_and(|document| describes_every_slot(&document, &vault));
+    if !issues_ca_tls && !issues_credentials {
+        return Err(SetupRefusal::DomainComplete);
+    }
+    Ok(Finalization {
+        server_name: identity.server_name,
+        gateway_wg_public_key: identity.gateway_wg_public_key,
+        issues_ca_tls,
+        issues_credentials,
+    })
+}
+
+/// What a finalization issued.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Finalized {
+    /// The public `CA-TLS` certificate, PEM, when this finalization issued it.
+    pub ca_tls_pem: Option<String>,
+    /// Epoch of the credential document, when this finalization signed one.
+    pub credentials_epoch: Option<u64>,
+}
+
+/// Issues what [`finalization`] found missing, with the opening the ceremony
+/// already holds — `astra-signer issue-ca-tls`, then the credential document.
+///
+/// `CA-TLS` is never issued twice: a relay that carries one keeps it, and
+/// replacing it is the §9.4 transition. The document is settled before
+/// anything is written, so only a write or a signature can still fail once
+/// `CA-TLS` is on the relay; a second call then issues the document alone.
+pub fn finalize_with(vault_path: &Path, opening: &Opened, now_unix: u64) -> Result<Finalized> {
+    let plan = finalization(vault_path)?;
+    let vault = store::load(vault_path)?;
+    let document = if plan.issues_credentials {
+        Some(pending_document(vault_path, &vault)?.ok_or(SetupRefusal::GatewayIdentityMissing)?)
+    } else {
+        None
+    };
+
+    let mut ca_tls_pem = None;
+    if plan.issues_ca_tls {
+        let mut relay = handoff::DomainHandoff::beside(vault_path, &vault)?;
+        let identity = handoff::identity_of(&relay)?;
+        let not_after = CA_TLS_DAYS
+            .checked_mul(DAY_SECS)
+            .and_then(|lifetime| now_unix.checked_add(lifetime))
+            .context("durée hors bornes")?;
+        let certificate = signing::issue_ca_tls(&vault, opening, &identity, now_unix, not_after)?;
+        // The epoch moves with the certificate, in the same write, as
+        // `astra-signer issue-ca-tls` does: a relay naming one epoch and
+        // carrying another would have every later delegation refused.
+        relay.ca_tls_epoch = Some(identity.ca_tls_epoch);
+        relay.ca_tls_certificate = Some(certificate.to_base64());
+        handoff::save(&handoff::path_beside(vault_path), &relay)?;
+        ca_tls_pem = Some(pem_of(&certificate));
+    }
+
+    let credentials_epoch = document
+        .map(|document| document.resign(&vault, opening, &[], now_unix))
+        .transpose()?;
+    Ok(Finalized {
+        ca_tls_pem,
+        credentials_epoch,
+    })
+}
+
+/// Whether the credential document in place could be re-signed by the next
+/// gesture.
+///
+/// Refuses, as [`SetupRefusal::GatewayIdentityMissing`], a document whose
+/// gateway the relay does not name — absent, unreadable or incomplete — and a
+/// document that does not verify under the vault's `CA-PQ`. No document yet
+/// is no refusal. The rule is the one every key gesture applies before it
+/// writes, so the ceremony can refuse before the press.
+pub fn check_document(vault_path: &Path) -> std::result::Result<(), SetupRefusal> {
+    let vault = store::load(vault_path).map_err(|_| SetupRefusal::LocationUnavailable)?;
+    check_document_of(vault_path, &vault)
+}
+
+fn check_document_of(
+    vault_path: &Path,
+    vault: &AuthorityVault,
+) -> std::result::Result<(), SetupRefusal> {
+    match pending_document(vault_path, vault) {
+        Ok(_) => Ok(()),
+        Err(error) => Err(error
+            .downcast_ref::<SetupRefusal>()
+            .copied()
+            .unwrap_or(SetupRefusal::GatewayIdentityMissing)),
+    }
+}
+
+/// The credential document beside the vault, when it verifies under the
+/// vault's `CA-PQ` for the gateway the relay names.
+///
+/// `None` for every other case — absent, unreadable, forged, or a relay that
+/// names no gateway — because a row read from a document that does not verify
+/// says nothing about the key it describes.
+pub(crate) fn verified_document(
+    vault_path: &Path,
+    vault: &AuthorityVault,
+) -> Option<credentials::CredentialRegistry> {
+    let relay = handoff::DomainHandoff::beside(vault_path, vault).ok()?;
+    let identity = handoff::identity_of(&relay).ok()?;
+    let document = credentials::load(&credentials::path_beside(vault_path)).ok()??;
+    let ca_pq = MlDsa87PublicKey::parse(vault.ca_pq_public_key.trim()).ok()?;
+    document
+        .verify(
+            &ca_pq,
+            &identity.trust_domain_id,
+            &identity.gateway_wg_public_key,
+            identity.ca_epoch,
+            document.credential_registry_epoch,
+        )
+        .ok()?;
+    Some(document)
+}
+
+/// Whether `document` has a row for every slot of `vault`.
+pub(crate) fn describes_every_slot(
+    document: &credentials::CredentialRegistry,
+    vault: &AuthorityVault,
+) -> bool {
+    vault.slots.iter().all(|slot| {
+        slot.credential_id()
+            .is_ok_and(|credential_id| document.binding(&credential_id).is_some())
+    })
+}
+
 // --- Shared -----------------------------------------------------------------
+
+/// The PEM form of a certificate, as `astra-signer` writes one.
+fn pem_of(certificate: &DerCertificate) -> String {
+    let body = certificate.to_base64();
+    let mut pem = String::from("-----BEGIN CERTIFICATE-----\n");
+    for line in body.as_bytes().chunks(64) {
+        pem.push_str(&String::from_utf8_lossy(line));
+        pem.push('\n');
+    }
+    pem.push_str("-----END CERTIFICATE-----\n");
+    pem
+}
 
 /// The authority origin as the relay records it: `https://`, no trailing `/`.
 fn authority_origin(value: &str) -> Result<String> {

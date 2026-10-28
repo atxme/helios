@@ -179,3 +179,18 @@ fn the_overview_carries_no_secret() {
 fn a_fingerprint_is_shown_in_groups_of_four() {
     assert_eq!(grouped_hex("0123456789abcdef"), "0123 4567 89ab cdef");
 }
+
+#[test]
+fn a_missing_folder_is_not_an_absent_vault() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let overview = read(&directory.path().join("authority-vault.json")).expect("absent");
+    assert!(!overview.exists);
+    assert!(overview.location_available);
+    assert!(!overview.bootstrapped);
+
+    let missing = directory.path().join("absent").join("authority-vault.json");
+    let overview = read(&missing).expect("a missing folder is a state");
+    assert!(!overview.exists);
+    assert!(!overview.location_available);
+    assert!(!overview.credentials_complete);
+}
