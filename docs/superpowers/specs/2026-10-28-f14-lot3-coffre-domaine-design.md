@@ -221,3 +221,25 @@ l'IHM ne reçoit jamais qu'empreintes, libellés, rôles et états.
 - « Finaliser le domaine » regroupe `CA-TLS` et document de credentials en un
   toucher.
 - Sélecteur natif côté Rust pour l'emplacement du coffre.
+
+## 9. Précisions du plan (28 octobre 2026)
+
+Issues de la lecture du code au moment du plan ; elles priment sur les sections
+ci-dessus là où elles diffèrent.
+
+- **Ouvertures réutilisées** : la clé maîtresse du coffre ne change ni à l'ajout
+  ni au retrait d'un key-slot, donc une ouverture obtenue reste valable pour la
+  suite du geste. Touchers attendus : création 4 dialogues Windows (clé 1 :
+  enregistrement et dérivation ; clé 2 : idem), ajout 3, retrait, état et
+  finalisation 1 chacun. À constater en recette.
+- **Retrait** : la clé qui ouvre le coffre ne peut pas être celle qu'on retire
+  (refus `KeyBeingRemoved`, rien n'est écrit), comme `astra-signer remove` en
+  pratique. Le plancher est de deux clés (règle du coffre), pas seulement « la
+  dernière clé de récupération ».
+- **« Reprendre la gateway connectée »** écrit directement l'identité vérifiée
+  sous `CA-PQ` quand le relais n'en a pas ; une identité différente de celle déjà
+  enregistrée est refusée (c'est une transition de gateway, lot 6).
+- **Emplacement** : le fichier choisi s'appelle obligatoirement
+  `authority-vault.json`, pour que relais et document de credentials, rangés à
+  côté, n'appartiennent qu'à un domaine. Un réglage d'emplacement illisible est
+  une erreur affichée, jamais un retour silencieux à l'emplacement par défaut.
