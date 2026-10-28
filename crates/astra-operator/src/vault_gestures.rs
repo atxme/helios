@@ -26,6 +26,7 @@
 use std::path::Path;
 
 use aether::certificates::approval::CredentialState;
+use aether::certificates::encoding::MlDsa87PublicKey;
 use anyhow::{bail, Result};
 
 use crate::authenticator::{Authenticator, Opened};
@@ -105,9 +106,11 @@ pub fn create_first_key(
     let authority_url = authority_origin(authority_url)?;
 
     let created = gestures::create_authority(key, request, pin, now_unix)?;
-    store::save_new(vault_path, &created.vault)?;
+    // Built before the vault is written, so a relay that cannot be derived
+    // leaves no one-key vault behind it.
     let mut relay = handoff::DomainHandoff::of(&created.vault)?;
     relay.astra_authority_url = Some(authority_url);
+    store::save_new(vault_path, &created.vault)?;
     handoff::save(&handoff::path_beside(vault_path), &relay)?;
     Ok(created.opening)
 }
@@ -125,8 +128,12 @@ pub fn check_addition(vault: &AuthorityVault) -> std::result::Result<(), SetupRe
 ///
 /// One assertion on `key`, none on the key behind `opening`: the vault is
 /// saved, then the credential document is re-signed with `opening` when the
-/// relay names the gateway. The slots keep the master key and the salt, so an
-/// opening obtained before the table moved still opens it after.
+/// domain has one. The slots keep the master key and the salt, so an opening
+/// obtained before the table moved still opens it after.
+///
+/// Whether a document follows, and whether the one in place verifies, is
+/// settled before the new key is asked anything: once the vault is saved,
+/// only a write or the signature itself can still fail.
 pub fn add_key_with(
     vault_path: &Path,
     opening: &Opened,
@@ -137,9 +144,12 @@ pub fn add_key_with(
 ) -> Result<AddedKey> {
     let mut vault = store::load(vault_path)?;
     check_addition(&vault)?;
+    let document = pending_document(vault_path, &vault)?;
     let added = gestures::add_key_opened(key, &mut vault, opening, request, pin, now_unix)?;
     store::save(vault_path, &vault)?;
-    resign_if_known(vault_path, &vault, opening, &[], now_unix)?;
+    if let Some(document) = document {
+        document.resign(&vault, opening, &[], now_unix)?;
+    }
     Ok(added)
 }
 
@@ -176,7 +186,8 @@ pub fn check_removal<'v>(
 ///
 /// The key behind `opening` cannot be the one withdrawn: it would sign the
 /// document that revokes itself, with nothing left to prove another key still
-/// opens the vault. Nothing is written in that case.
+/// opens the vault. Nothing is written in that case, nor when the domain has
+/// a document that can no longer be re-signed.
 pub fn remove_key_with(
     vault_path: &Path,
     opening: &Opened,
@@ -192,7 +203,9 @@ pub fn remove_key_with(
     // The document first, as `astra-signer remove` does: a crash between the
     // two writes then leaves a credential revoked that the old vault still
     // holds (fail closed), never an absent slot still marked active.
-    resign_if_known(vault_path, &vault, opening, &[], now_unix)?;
+    if let Some(document) = pending_document(vault_path, &vault)? {
+        document.resign(&vault, opening, &[], now_unix)?;
+    }
     store::save(vault_path, &vault)?;
     Ok(())
 }
@@ -234,14 +247,11 @@ pub fn mark_key_with(
     } else {
         CredentialState::Active
     };
-    resign_if_known(
-        vault_path,
-        &vault,
-        opening,
-        &[(credential_id, state)],
-        now_unix,
-    )?
-    .ok_or_else(|| SetupRefusal::GatewayIdentityMissing.into())
+    // `check_marking` proved the identity, so a domain with no document yet
+    // gets its first one here.
+    let document =
+        pending_document(vault_path, &vault)?.ok_or(SetupRefusal::GatewayIdentityMissing)?;
+    document.resign(&vault, opening, &[(credential_id, state)], now_unix)
 }
 
 /// Renames a key. No key is asked anything: the label is outside the slot
@@ -265,34 +275,71 @@ fn authority_origin(value: &str) -> Result<String> {
     }
 }
 
-/// Re-signs the credential document from the vault's slot table, when the
-/// relay names the gateway; `None` when it does not, and nothing is written.
+/// The credential document a gesture is about to re-sign, settled before it
+/// writes anything.
 ///
-/// Every gesture that moves the table, or a key's state, calls this in the
-/// same operation (spec §2.4): a document describing a slot the vault no
-/// longer holds is a signed lie nothing downstream can catch. Signing uses the
-/// opening the gesture already holds.
-fn resign_if_known(
-    vault_path: &Path,
-    vault: &AuthorityVault,
-    opening: &Opened,
-    overrides: &[(Vec<u8>, CredentialState)],
-    now_unix: u64,
-) -> Result<Option<u64>> {
+/// Every gesture that moves the slot table, or a key's state, re-signs the
+/// document in the same operation (spec §2.4): a document describing a slot
+/// the vault no longer holds is a signed lie nothing downstream can catch.
+struct PendingDocument {
+    identity: signing::DomainIdentity,
+    registry_path: std::path::PathBuf,
+    previous: Option<credentials::CredentialRegistry>,
+}
+
+/// Whether the gesture re-signs a document, and what it builds on.
+///
+/// `None` only while the domain has no document **and** the relay does not
+/// name the gateway yet — the bootstrap, where there is nothing to keep
+/// current. A document already in place whose gateway the relay no longer
+/// names is refused as [`SetupRefusal::GatewayIdentityMissing`] (fail closed):
+/// carrying on would leave its rows describing a table that moved. The
+/// document in place is verified under the vault's `CA-PQ` here, so it is not
+/// found unreadable after the vault has moved.
+fn pending_document(vault_path: &Path, vault: &AuthorityVault) -> Result<Option<PendingDocument>> {
     let relay = handoff::DomainHandoff::beside(vault_path, vault)?;
-    let Ok(identity) = handoff::identity_of(&relay) else {
-        return Ok(None);
-    };
     let registry_path = credentials::path_beside(vault_path);
     let previous = credentials::load(&registry_path)?;
-    let registry = signing::sign_credential_bindings(
-        vault,
-        opening,
-        &identity,
-        previous.as_ref(),
-        overrides,
-        now_unix,
-    )?;
-    credentials::save(&registry_path, &registry)?;
-    Ok(Some(registry.credential_registry_epoch))
+    let identity = match (handoff::identity_of(&relay), &previous) {
+        (Ok(identity), _) => identity,
+        (Err(_), None) => return Ok(None),
+        (Err(_), Some(_)) => return Err(SetupRefusal::GatewayIdentityMissing.into()),
+    };
+    if let Some(previous) = &previous {
+        previous.verify(
+            &MlDsa87PublicKey::parse(vault.ca_pq_public_key.trim())?,
+            &identity.trust_domain_id,
+            &identity.gateway_wg_public_key,
+            identity.ca_epoch,
+            previous.credential_registry_epoch,
+        )?;
+    }
+    Ok(Some(PendingDocument {
+        identity,
+        registry_path,
+        previous,
+    }))
+}
+
+impl PendingDocument {
+    /// Signs the document from `vault`'s slot table with the opening the
+    /// gesture already holds, writes it, and returns its epoch.
+    fn resign(
+        self,
+        vault: &AuthorityVault,
+        opening: &Opened,
+        overrides: &[(Vec<u8>, CredentialState)],
+        now_unix: u64,
+    ) -> Result<u64> {
+        let registry = signing::sign_credential_bindings(
+            vault,
+            opening,
+            &self.identity,
+            self.previous.as_ref(),
+            overrides,
+            now_unix,
+        )?;
+        credentials::save(&self.registry_path, &registry)?;
+        Ok(registry.credential_registry_epoch)
+    }
 }

@@ -71,6 +71,15 @@ fn complete_relay(path: &Path) {
     handoff::save(&relay_path, &relay).expect("relay saved");
 }
 
+/// Forgets the gateway on the relay, as a hand-edited or stale relay would.
+fn clear_gateway(path: &Path) {
+    let relay_path = handoff::path_beside(path);
+    let mut relay = handoff::load(&relay_path).expect("relay");
+    relay.gateway_wg_public_key = None;
+    relay.server_name = None;
+    handoff::save(&relay_path, &relay).expect("relay saved");
+}
+
 /// Emits the credential document the way a finished domain holds one.
 fn emit_document(path: &Path, opening: &Opened) {
     let vault = store::load(path).expect("vault");
@@ -428,4 +437,66 @@ fn a_blank_or_long_label_is_refused_and_nothing_moves() {
     let vault = store::load(&path).expect("vault");
     assert_eq!(vault.slot(&slot_id).expect("slot").label, "Bureau");
     assert_eq!(key1.assertions(), 1, "renaming asks no key");
+}
+
+/// A document already in place cannot be left describing a table that moved:
+/// with the gateway gone from the relay, the removal is refused before it
+/// writes anything.
+#[test]
+fn removal_refuses_a_document_it_cannot_resign() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = vault_path(&directory);
+    let (key1, key2, key3) = (FakeKey::new(1), FakeKey::new(2), FakeKey::new(3));
+    let first = create(&path, &key1);
+    add(&path, &first, &key2, "YubiKey du sac");
+    let (slot3, _) = add(&path, &first, &key3, "YubiKey perdue");
+    complete_relay(&path);
+    emit_document(&path, &first);
+    clear_gateway(&path);
+    let vault_bytes = std::fs::read(&path).expect("vault bytes");
+    let document_bytes = std::fs::read(credentials::path_beside(&path)).expect("document bytes");
+
+    assert_eq!(
+        refusal(remove_key_with(&path, &first, &slot3, NOW)),
+        Some(SetupRefusal::GatewayIdentityMissing)
+    );
+
+    assert_eq!(std::fs::read(&path).expect("vault bytes"), vault_bytes);
+    assert_eq!(
+        std::fs::read(credentials::path_beside(&path)).expect("document bytes"),
+        document_bytes
+    );
+}
+
+/// The same rule for an addition, settled before the new key is asked to
+/// register: no orphan credential on the token, no slot in the vault.
+#[test]
+fn addition_refuses_a_document_it_cannot_resign_before_the_key() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = vault_path(&directory);
+    let (key1, key2) = (FakeKey::new(1), FakeKey::new(2));
+    let first = create(&path, &key1);
+    complete_relay(&path);
+    emit_document(&path, &first);
+    clear_gateway(&path);
+    let vault_bytes = std::fs::read(&path).expect("vault bytes");
+
+    assert_eq!(
+        refusal(add_key_with(
+            &path,
+            &first,
+            &key2,
+            &new_key("YubiKey du sac"),
+            PIN,
+            NOW
+        )),
+        Some(SetupRefusal::GatewayIdentityMissing)
+    );
+
+    assert!(
+        key2.credential_ids().is_empty(),
+        "the new key registered nothing"
+    );
+    assert_eq!(key2.assertions(), 0);
+    assert_eq!(std::fs::read(&path).expect("vault bytes"), vault_bytes);
 }
