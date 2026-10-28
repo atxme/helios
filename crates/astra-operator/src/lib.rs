@@ -61,3 +61,4 @@ pub mod signing;
 pub mod store;
 pub mod tunnel;
 pub mod vault;
+pub mod vault_gestures;

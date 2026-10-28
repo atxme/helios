@@ -101,6 +101,22 @@ pub struct Created {
     /// The half of the anchor that leaves this program: what `astra bootstrap`
     /// is given, and the only `CA-PQ` value anything else ever sees.
     pub ca_pq_public_key: MlDsa87PublicKey,
+    /// What the first key released while the vault was being created.
+    ///
+    /// Handed back so a ceremony that goes on to register the second key can
+    /// open the vault with it, rather than asking the same key for a second
+    /// press. Secret: never logged, serialized nor shown.
+    pub opening: Opened,
+}
+
+/// A key just registered, and what it released while registering.
+///
+/// The new key's opening is a valid opening of the vault it now belongs to: a
+/// ceremony that has to try that key afterwards uses it instead of asking for
+/// another press. Secret, like every [`Opened`].
+pub struct AddedKey {
+    pub slot_id: [u8; 16],
+    pub opening: Opened,
 }
 
 /// Creates the vault around fresh anchors and registers the first key.
@@ -156,6 +172,7 @@ pub fn create_authority(
     Ok(Created {
         vault,
         ca_pq_public_key,
+        opening: opened,
     })
 }
 
@@ -191,6 +208,21 @@ pub fn add_key(
     pin: &str,
     now_unix: u64,
 ) -> Result<[u8; 16]> {
+    add_key_opened(new, vault, opening, request, pin, now_unix).map(|added| added.slot_id)
+}
+
+/// [`add_key`], keeping what the new key released.
+///
+/// The same single assertion on the new key: its derivation is what wraps the
+/// master key for it, and it is handed back rather than dropped.
+pub fn add_key_opened(
+    new: &dyn Authenticator,
+    vault: &mut AuthorityVault,
+    opening: &Opened,
+    request: &NewKey,
+    pin: &str,
+    now_unix: u64,
+) -> Result<AddedKey> {
     let known = vault.credential_ids()?;
     let salt = vault.salt()?;
     let registration = new.register(&vault.rp_id, &subject(&vault.trust_domain_id), &known, pin)?;
@@ -213,7 +245,10 @@ pub fn add_key(
         },
         &new_secret.secret,
     )?;
-    Ok(slot_id)
+    Ok(AddedKey {
+        slot_id,
+        opening: new_secret,
+    })
 }
 
 /// Withdraws a key, re-sealing the body under the table it leaves behind.
