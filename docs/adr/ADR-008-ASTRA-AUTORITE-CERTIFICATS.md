@@ -552,7 +552,20 @@ chaque variante. Elle gagne `InvitationUnknown`, `InvitationConsumed`,
 `InvitationExpired`, `CaTlsMissing`, `GatewayForbidden` (401 ou 403 : le pair du
 poste opérateur doit porter le drapeau `admin`), `GatewayRefused { status }`,
 `AcceptanceNotKept` (feuilles remises mais non conservées : pas de reprise) et
-`AcceptedElsewhere`. `GatewayUnavailable` couvre « injoignable ou aucune gateway ».
+`AcceptedElsewhere`. `GatewayUnavailable` couvre « injoignable ou aucune gateway »
+pour les chemins qui ont remis `admission.txt`. Deux variantes, elles aussi sans
+texte, nomment les échecs que l'opérateur peut traiter : `GatewayLeafUnavailable`
+(Inviter : aucune feuille PQ lisible et aucun fichier fourni) et
+`DocumentNotSigned` (le pair est admis, le document n'a pas pu être signé : on
+reprend l'invitation, on n'admet pas de nouveau). Une invitation consommée hors
+d'Orion est refusée `AcceptedElsewhere`, jamais renvoyée à une reprise qui
+n'existe pas.
+
+Le client HTTP d'administration d'Orion (`orion_client`) ne suit aucune
+redirection et ignore les proxys d'environnement : le trafic d'administration
+reste dans le tunnel, vers l'adresse du profil et nulle autre. Le fichier de
+demande est lu par la WebView, qui en envoie le contenu public ; aucun chemin ne
+passe de la WebView à Rust.
 Ce que la gateway accorde au pair opérateur ne se vérifie pas dans le dépôt : à
 valider en recette (MANUAL-TESTING).
 

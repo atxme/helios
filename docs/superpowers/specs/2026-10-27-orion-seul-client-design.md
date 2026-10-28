@@ -143,8 +143,9 @@ opérateur (récupération d'identité, approbation de campagne).
    remplace de la même façon.
 10. **Cérémonie d'acceptation** (choix du contrôleur) : « Inviter » et
     « Accepter » sont deux nouveaux genres de la liste fermée de l'IHM. Le
-    fichier de demande est choisi par la boîte de dialogue côté Rust, pas par
-    un chemin venu de la WebView. Une acceptation est **une** session et
+    fichier de demande est lu par la WebView, qui en envoie le contenu (public) au
+    geste : aucun chemin ne passe de la WebView à Rust (correction du
+    27 octobre 2026, passe finale). Une acceptation est **une** session et
     **un** toucher : le coffre, ouvert après la consommation, sert à émettre
     les deux feuilles puis à signer le document, et se referme à la fin de la
     session. « Annuler » est possible jusqu'à la consommation ; après, le geste
@@ -241,9 +242,10 @@ reste celle d'`InvitationRegistry`.
 - Les genres d'opération servis restent une liste fermée côté IHM : chaque lot
   ajoute ses genres à `OperationKind` (ou à une liste parallèle si un geste
   n'est pas une opération Astra), jamais un genre générique.
-- Les fichiers lus (demande, brouillon, feuilles) le sont depuis un fichier
-  choisi par la personne dans la boîte de dialogue ; les fichiers écrits, par
-  la boîte d'enregistrement. Aucun chemin ne vient du réseau.
+- Les fichiers lus (demande, brouillon, feuilles) le sont par la WebView, depuis
+  un fichier choisi par la personne, et leur contenu public est envoyé au geste ;
+  les fichiers écrits, par la boîte d'enregistrement. Aucun chemin ne vient du
+  réseau.
 - L'API de la gateway est appelée sur l'adresse du tunnel lue dans le profil
   actif (`heliosd_url`), jamais sur une URL saisie librement pour l'admission.
 - Les opérations à deux clés (réadmission, rotations, amorçage gateway)
@@ -303,6 +305,23 @@ diffèrent. Validation sous Windows : à valider en recette.
   (`text` | `base64`) : la feuille `.der` est remise en base64 marqué, décodée
   par l'IHM avant l'écriture, pour que `heliosd peer add --certificate` lise le
   DER brut.
+- **Passe finale (revue de branche)** : `Refusal` gagne encore, sans texte,
+  `GatewayLeafUnavailable` (Inviter : aucune feuille PQ lisible, la gateway ne
+  répond pas ou n'a pas de `heliosd_url`, et aucun fichier n'est fourni ; le
+  champ « Feuille PQ de la gateway » est donc toujours proposé, facultatif quand
+  une gateway est connectée) et `DocumentNotSigned` (le pair est admis, mais le
+  document n'a pas pu être construit ou signé : toute défaillance après une
+  admission réussie ; la phrase dit de reprendre l'invitation et ne renvoie
+  jamais à `admission.txt`). `GatewayUnavailable` ne garde que les chemins qui
+  ont réellement remis `admission.txt`. Accepter une invitation consommée hors
+  d'Orion (aucun `.accepted.json`) est refusé `AcceptedElsewhere`, pas
+  `InvitationConsumed`, puisqu'aucun « Reprendre » n'existe. Le manifeste
+  d'acceptation montre `allowed_ips` et `ssh_target` quand ils figurent dans le
+  document signé ; celui de l'invitation montre l'empreinte `CA-PQ` en groupes
+  de quatre ; l'onglet « Approbations » porte une pastille de compte.
+- **`orion_client`** : ne suit aucune redirection et ignore les proxys
+  d'environnement (`no_proxy`), car le trafic d'administration doit rester dans
+  le tunnel, vers l'adresse du profil et nulle autre.
 - **Lecture du coffre** : une clé `CA-PQ` illisible rend une erreur (fail-closed),
   pas un domaine vide.
 - **Réseau** : `orion_core::gateway_admin` (admission, lecture de la gateway) est
