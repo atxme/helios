@@ -34,6 +34,9 @@ use astra_operator::vault::AuthorityVault;
 
 use super::{ArtifactEncoding, EnrollmentGesture, OperatorArtifact};
 
+mod vault;
+pub use vault::run_vault;
+
 /// One button pressed in the window: what it asks, the status it answers, and
 /// the window the press came from.
 ///
@@ -69,6 +72,20 @@ pub fn run(
             approve_campaign(&mut ceremony, &presses, publish, vault_path)
         }
         OperationKind::VerifyKey => verify_key(&mut ceremony, &presses, publish, vault_path),
+        // Opened by their gesture, which carries what they fix, and never by
+        // a locator, which carries nothing.
+        OperationKind::CreateDomain
+        | OperationKind::AddKey
+        | OperationKind::RemoveKey
+        | OperationKind::MarkKey
+        | OperationKind::FinalizeDomain => {
+            ceremony.refuse(Refusal::Internal);
+            publish(ceremony.status());
+            Err(format!(
+                "la cérémonie « {:?} » s'ouvre par son geste, pas par un localisateur",
+                ceremony.operation
+            ))
+        }
         // Named rather than swallowed: an operator whose tab offered a
         // ceremony this build cannot run must be told that, and not left
         // watching a status that never moves.

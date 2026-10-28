@@ -167,6 +167,106 @@ pub(crate) async fn begin_enrollment_ceremony(
         .await
 }
 
+/// Opens a vault or domain gesture: creating the domain, adding, removing or
+/// marking a key, finalizing the domain.
+#[tauri::command]
+pub(crate) async fn begin_vault_ceremony(
+    state: State<'_, AppState>,
+    gesture: crate::operator::VaultGesture,
+) -> Result<aether::certificates::operator_session::OperatorStatus, String> {
+    let vault_path = state.vault_location.path()?;
+    state.operator.begin_vault(gesture, vault_path).await
+}
+
+/// Renames a key. No key is asked anything: the label is outside what the
+/// vault seals.
+#[tauri::command]
+pub(crate) async fn rename_operator_key(
+    state: State<'_, AppState>,
+    slot_id: String,
+    label: String,
+) -> Result<(), String> {
+    let vault_path = state.vault_location.path()?;
+    crate::operator::rename_key(&vault_path, &slot_id, &label)
+}
+
+/// Records values on the domain relay beside the vault. No key: the relay is
+/// public, and every value is checked before anything is written.
+#[tauri::command]
+pub(crate) async fn write_domain_relay(
+    state: State<'_, AppState>,
+    update: astra_operator::vault_gestures::RelayUpdate,
+) -> Result<(), String> {
+    let vault_path = state.vault_location.path()?;
+    astra_operator::vault_gestures::write_relay(&vault_path, &update)
+        .map(|_| ())
+        .map_err(|error| format!("{error:#}"))
+}
+
+/// Records the connected gateway on the relay, from the leaf it serves.
+///
+/// The leaf must verify under the domain's `CA-PQ` for the identity it names,
+/// and that identity must be the one the gateway answers with: the relay only
+/// ever names a gateway this authority certified and the operator is
+/// connected to.
+#[tauri::command]
+pub(crate) async fn adopt_connected_gateway(state: State<'_, AppState>) -> Result<(), String> {
+    use orion_core::gateway_admin as admin;
+
+    let vault_path = state.vault_location.path()?;
+    let base = connected_gateway(&state).await?;
+    let client = admin::orion_client().map_err(|error| error.to_string())?;
+    let material = admin::gateway_negotiation(&client, &base)
+        .await
+        .map_err(|error| error.to_string())?;
+    let leaf = admin::decode_pq_certificate(&material.gateway_pq_certificate)
+        .map_err(|error| error.to_string())?;
+    if leaf.subject != material.server_name.trim()
+        || leaf.wireguard_public_key != material.wireguard_public_key.trim()
+    {
+        return Err(
+            "la feuille servie par la gateway connectée nomme une autre gateway".to_string(),
+        );
+    }
+    // Its own thread, with the stack the post-quantum verification needs.
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("orion-gateway-adoption".into())
+        .stack_size(astra_operator::WORK_STACK_BYTES)
+        .spawn(move || {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let adopted = astra_operator::vault_gestures::adopt_gateway(&vault_path, &leaf, now)
+                .map(|_| ())
+                .map_err(|error| format!("{error:#}"));
+            let _ = sender.send(adopted);
+        })
+        .map_err(|error| format!("adoption de la gateway : {error}"))?;
+    receiver
+        .await
+        .map_err(|_| "l'adoption de la gateway s'est arrêtée".to_string())?
+}
+
+/// What the domain creation form starts from: the RP ID the selected
+/// profile's endpoint suggests, when it is a name.
+#[tauri::command]
+pub(crate) async fn operator_domain_defaults(
+    state: State<'_, AppState>,
+) -> Result<crate::operator::DomainDefaults, String> {
+    let view = match state.client.call(EngineCommand::GetConfig).await? {
+        EngineReply::Config(value) => value,
+        _ => return Err(unexpected_engine_reply()),
+    };
+    let rp_id = view
+        .selected
+        .as_deref()
+        .and_then(|name| view.profiles.iter().find(|profile| profile.name == name))
+        .and_then(|profile| crate::operator::suggested_rp_id(&profile.endpoint));
+    Ok(crate::operator::DomainDefaults { rp_id })
+}
+
 /// The files the current session produced, for the window to save.
 #[tauri::command]
 pub(crate) async fn operator_artifacts(

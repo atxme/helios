@@ -19,9 +19,9 @@
 //!
 //! # Files
 //!
-//! A ceremony that produces a file — an invitation — deposits it in its
-//! session, and the window fetches it once with [`OperatorCeremony::artifacts`]
-//! and saves it. It never rides the status.
+//! A ceremony that produces a file — an invitation, a `CA-TLS` — deposits it
+//! in its session, and the window fetches it once with
+//! [`OperatorCeremony::artifacts`] and saves it. It never rides the status.
 //!
 //! # Why the WebView names so little
 //!
@@ -164,6 +164,191 @@ impl EnrollmentGesture {
     }
 }
 
+/// A gesture on the vault or the domain, as the WebView names it.
+///
+/// Typed and closed like [`EnrollmentGesture`]: one kind per gesture, every
+/// value validated here before a ceremony opens. A key is named by its slot
+/// identifier, never by a path or a secret.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "gesture", rename_all = "snake_case", deny_unknown_fields)]
+pub enum VaultGesture {
+    /// The first vault of a domain, with its two keys.
+    CreateDomain {
+        rp_id: String,
+        authority_url: String,
+        first_label: String,
+        second_label: String,
+    },
+    /// A further key, registered with a key the vault already opens for.
+    AddKey { label: String, role: KeyRole },
+    /// A key withdrawn from the vault.
+    RemoveKey { slot_id: String },
+    /// A key signed lost, or active again.
+    MarkKey { slot_id: String, lost: bool },
+    /// The domain's `CA-TLS` and credential document, issued once.
+    FinalizeDomain,
+}
+
+/// The role of a key, under the names the overview gives it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub enum KeyRole {
+    #[serde(rename = "principale")]
+    Primary,
+    #[serde(rename = "recuperation")]
+    Recovery,
+}
+
+impl KeyRole {
+    fn slot_role(self) -> astra_operator::vault::SlotRole {
+        match self {
+            Self::Primary => astra_operator::vault::SlotRole::Primary,
+            Self::Recovery => astra_operator::vault::SlotRole::Recovery,
+        }
+    }
+
+    fn of(role: astra_operator::vault::SlotRole) -> Self {
+        match role {
+            astra_operator::vault::SlotRole::Primary => Self::Primary,
+            astra_operator::vault::SlotRole::Recovery => Self::Recovery,
+        }
+    }
+
+    /// The name a manifest carries.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Primary => "principale",
+            Self::Recovery => "recuperation",
+        }
+    }
+}
+
+/// Longest RP ID: a DNS name.
+const MAX_RP_ID_CHARS: usize = 253;
+/// Longest authority origin.
+const MAX_AUTHORITY_URL_CHARS: usize = 256;
+
+/// A WebAuthn RP ID this domain can be created under: a lowercase DNS name of
+/// at least two labels, never an address — a credential is bound to it for
+/// good.
+fn valid_rp_id(rp_id: &str) -> bool {
+    (1..=MAX_RP_ID_CHARS).contains(&rp_id.len())
+        && rp_id.contains('.')
+        && rp_id.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'.')
+        })
+        && rp_id
+            .split('.')
+            .all(|label| !label.is_empty() && !label.starts_with('-') && !label.ends_with('-'))
+        && rp_id.parse::<std::net::IpAddr>().is_err()
+}
+
+/// An `https://` origin with a host, as the relay will record it.
+fn valid_authority_url(url: &str) -> bool {
+    url.chars().count() <= MAX_AUTHORITY_URL_CHARS
+        && !url.chars().any(char::is_whitespace)
+        && url
+            .strip_prefix("https://")
+            .is_some_and(|host| !host.trim_end_matches('/').is_empty())
+}
+
+/// A key label the vault accepts: not blank, `MAX_LABEL_CHARS` at most.
+fn check_key_label(label: &str) -> Result<(), String> {
+    if !label.trim().is_empty() && label.chars().count() <= astra_operator::vault::MAX_LABEL_CHARS {
+        Ok(())
+    } else {
+        Err(format!(
+            "le nom d'une clé tient en 1 à {} caractères",
+            astra_operator::vault::MAX_LABEL_CHARS
+        ))
+    }
+}
+
+/// The slot identifier the overview prints: 32 lowercase hexadecimals.
+fn parse_slot_id(slot_id: &str) -> Result<[u8; 16], String> {
+    Id16::parse_hex(slot_id)
+        .map(|id| *id.as_bytes())
+        .map_err(|_| "l'identifiant de la clé tient en 32 caractères hexadécimaux".to_string())
+}
+
+impl VaultGesture {
+    /// Refuses what no ceremony should be opened for.
+    fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::CreateDomain {
+                rp_id,
+                authority_url,
+                first_label,
+                second_label,
+            } => {
+                if !valid_rp_id(rp_id) {
+                    return Err(
+                        "l'identifiant WebAuthn du domaine est un nom DNS en minuscules, d'au \
+                         moins deux libellés, et jamais une adresse IP"
+                            .to_string(),
+                    );
+                }
+                if !valid_authority_url(authority_url) {
+                    return Err(format!(
+                        "l'origine de l'autorité est une URL https:// sans espace, de \
+                         {MAX_AUTHORITY_URL_CHARS} caractères au plus"
+                    ));
+                }
+                check_key_label(first_label)?;
+                check_key_label(second_label)
+            }
+            Self::AddKey { label, .. } => check_key_label(label),
+            Self::RemoveKey { slot_id } | Self::MarkKey { slot_id, .. } => {
+                parse_slot_id(slot_id).map(|_| ())
+            }
+            Self::FinalizeDomain => Ok(()),
+        }
+    }
+
+    fn operation(&self) -> OperationKind {
+        match self {
+            Self::CreateDomain { .. } => OperationKind::CreateDomain,
+            Self::AddKey { .. } => OperationKind::AddKey,
+            Self::RemoveKey { .. } => OperationKind::RemoveKey,
+            Self::MarkKey { .. } => OperationKind::MarkKey,
+            Self::FinalizeDomain => OperationKind::FinalizeDomain,
+        }
+    }
+}
+
+/// Renames the key `slot_id` of the vault at `vault_path`. No key is asked
+/// anything; the label is checked as a gesture's would be.
+pub fn rename_key(vault_path: &std::path::Path, slot_id: &str, label: &str) -> Result<(), String> {
+    let slot = parse_slot_id(slot_id)?;
+    check_key_label(label)?;
+    astra_operator::vault_gestures::rename_key(vault_path, &slot, label.trim())
+        .map_err(|error| format!("{error:#}"))
+}
+
+/// What the creation form starts from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DomainDefaults {
+    /// The host of the selected profile's endpoint, when it is a name the
+    /// domain could be created under.
+    pub rp_id: Option<String>,
+}
+
+/// The RP ID an endpoint suggests: its host, without the port, in lowercase,
+/// and only when it is a name [`valid_rp_id`] accepts.
+pub fn suggested_rp_id(endpoint: &str) -> Option<String> {
+    let endpoint = endpoint.trim();
+    // A bracketed host is an IPv6 address.
+    if endpoint.starts_with('[') {
+        return None;
+    }
+    let host = match endpoint.rsplit_once(':') {
+        Some((host, port)) if port.bytes().all(|byte| byte.is_ascii_digit()) => host,
+        Some(_) => return None,
+        None => endpoint,
+    };
+    let host = host.to_ascii_lowercase();
+    valid_rp_id(&host).then_some(host)
+}
+
 /// A file the ceremony produced, for the WebView to save.
 ///
 /// Public content only (an invitation, an issued leaf). It is kept out of the
@@ -268,6 +453,28 @@ impl OperatorCeremony {
                 session_id,
                 gesture,
                 gateway,
+                presses,
+                publish,
+                &mut |artifact| deposit(artifacts, artifact),
+                &vault_path,
+            )
+        })
+        .await
+    }
+
+    /// Starts a vault or domain gesture the same way, under the same rule of
+    /// one ceremony at a time.
+    pub async fn begin_vault(
+        &self,
+        gesture: VaultGesture,
+        vault_path: PathBuf,
+    ) -> Result<OperatorStatus, String> {
+        gesture.validate()?;
+        let kind = gesture.operation();
+        self.open(kind, move |session_id, presses, publish, artifacts| {
+            ceremony::run_vault(
+                session_id,
+                gesture,
                 presses,
                 publish,
                 &mut |artifact| deposit(artifacts, artifact),
@@ -652,5 +859,88 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(held.len(), 1);
+    }
+
+    fn creation(rp_id: &str, authority_url: &str, label: &str) -> VaultGesture {
+        VaultGesture::CreateDomain {
+            rp_id: rp_id.into(),
+            authority_url: authority_url.into(),
+            first_label: label.into(),
+            second_label: "secours".into(),
+        }
+    }
+
+    /// Every value is checked on arrival: a gesture the vault would refuse
+    /// after a press never opens a ceremony.
+    #[tokio::test]
+    async fn gestures_with_invalid_values_open_no_ceremony() {
+        let url = "https://astra.example";
+        assert_eq!(
+            creation("astra.example", url, "quotidienne").validate(),
+            Ok(())
+        );
+        let invalid = [
+            creation("192.168.1.1", url, "quotidienne"),
+            creation("Astra.Example", url, "quotidienne"),
+            creation("astra", url, "quotidienne"),
+            creation("astra.example", "http://astra.example", "quotidienne"),
+            creation("astra.example", url, " "),
+            VaultGesture::AddKey {
+                label: " ".into(),
+                role: KeyRole::Primary,
+            },
+            VaultGesture::RemoveKey {
+                slot_id: "xyz".into(),
+            },
+            VaultGesture::MarkKey {
+                slot_id: "xyz".into(),
+                lost: true,
+            },
+        ];
+        let ceremony = OperatorCeremony::default();
+        for gesture in invalid {
+            assert!(gesture.validate().is_err(), "{gesture:?}");
+            assert!(ceremony
+                .begin_vault(gesture, PathBuf::from(location::VAULT_FILE_NAME))
+                .await
+                .is_err());
+        }
+        assert!(ceremony.status().await.is_none());
+    }
+
+    /// The roles travel under the names the overview gives them.
+    #[test]
+    fn a_key_role_reads_as_the_overview_writes_it() {
+        let added: VaultGesture = serde_json::from_str(
+            r#"{"gesture":"add_key","label":"secours","role":"recuperation"}"#,
+        )
+        .expect("an addition");
+        assert_eq!(
+            added,
+            VaultGesture::AddKey {
+                label: "secours".into(),
+                role: KeyRole::Recovery,
+            }
+        );
+        assert!(serde_json::from_str::<VaultGesture>(
+            r#"{"gesture":"add_key","label":"secours","role":"recovery"}"#
+        )
+        .is_err());
+    }
+
+    /// Only a name can be a WebAuthn RP ID: an address suggests nothing.
+    #[test]
+    fn the_rp_id_is_suggested_only_from_a_name() {
+        assert_eq!(
+            suggested_rp_id("gw.tail1234.ts.net:51820"),
+            Some("gw.tail1234.ts.net".to_string())
+        );
+        assert_eq!(
+            suggested_rp_id("GW.Example.NET:51820"),
+            Some("gw.example.net".to_string())
+        );
+        assert_eq!(suggested_rp_id("10.0.0.1:51820"), None);
+        assert_eq!(suggested_rp_id("[fd00::1]:51820"), None);
+        assert_eq!(suggested_rp_id("gateway:51820"), None);
     }
 }
