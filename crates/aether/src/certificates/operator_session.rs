@@ -116,6 +116,16 @@ pub enum OperationKind {
     InviteEnrollment,
     /// §15.2: the acceptance of an invitation, which issues the first leaves.
     AcceptEnrollment,
+    /// The first vault of a domain, created with two operator keys.
+    CreateDomain,
+    /// A further operator key registered in the vault.
+    AddKey,
+    /// An operator key withdrawn from the vault.
+    RemoveKey,
+    /// An operator key marked lost, or found again.
+    MarkKey,
+    /// The domain's first gateway identity and certificates, issued once.
+    FinalizeDomain,
 }
 
 /// What the WebView is allowed to name.
@@ -244,6 +254,8 @@ pub enum KeyPurpose {
     SecondApproval,
     /// Promoting an object already prepared.
     Promotion,
+    /// A new key to register in the vault.
+    RegisterKey,
 }
 
 /// Where the ceremony stands **on this machine**.
@@ -361,6 +373,20 @@ pub enum Refusal {
     /// The peer is admitted, but its document could not be built or signed:
     /// the acceptance is resumed, not redone.
     DocumentNotSigned,
+    /// A vault already exists where a new one would be created.
+    VaultExists,
+    /// The place the vault would be kept cannot be reached or written.
+    LocationUnavailable,
+    /// The vault holds as many keys as it may.
+    VaultFull,
+    /// The change would leave fewer keys than the vault requires.
+    MinimumKeys,
+    /// The key is already being removed.
+    KeyBeingRemoved,
+    /// The gateway has no identity to anchor the domain on.
+    GatewayIdentityMissing,
+    /// The domain is already complete: nothing is left to finalize.
+    DomainComplete,
     /// Anything the ceremony could not classify. Deliberately last and
     /// deliberately opaque: an unclassified failure must not become a channel
     /// for text.
@@ -383,6 +409,11 @@ pub enum AstraManifest {
     KeyCheck(KeyCheckManifest),
     Invitation(InvitationManifest),
     EnrollmentAcceptance(AcceptanceManifest),
+    DomainCreation(DomainCreationManifest),
+    KeyAddition(KeyAdditionManifest),
+    KeyRemoval(KeyRemovalManifest),
+    KeyMarking(KeyMarkingManifest),
+    DomainFinalization(DomainFinalizationManifest),
 }
 
 impl AstraManifest {
@@ -396,6 +427,11 @@ impl AstraManifest {
             Self::KeyCheck(_) => OperationKind::VerifyKey,
             Self::Invitation(_) => OperationKind::InviteEnrollment,
             Self::EnrollmentAcceptance(_) => OperationKind::AcceptEnrollment,
+            Self::DomainCreation(_) => OperationKind::CreateDomain,
+            Self::KeyAddition(_) => OperationKind::AddKey,
+            Self::KeyRemoval(_) => OperationKind::RemoveKey,
+            Self::KeyMarking(_) => OperationKind::MarkKey,
+            Self::DomainFinalization(_) => OperationKind::FinalizeDomain,
         }
     }
 
@@ -410,7 +446,14 @@ impl AstraManifest {
             Self::IssuerAuthorization(manifest) => Some(manifest.trust_domain_id),
             Self::CaRotation(manifest) => Some(manifest.trust_domain_id),
             Self::Revocation(manifest) => Some(manifest.trust_domain_id),
-            Self::KeyCheck(_) | Self::Invitation(_) | Self::EnrollmentAcceptance(_) => None,
+            Self::KeyCheck(_)
+            | Self::Invitation(_)
+            | Self::EnrollmentAcceptance(_)
+            | Self::DomainCreation(_)
+            | Self::KeyAddition(_)
+            | Self::KeyRemoval(_)
+            | Self::KeyMarking(_)
+            | Self::DomainFinalization(_) => None,
         }
     }
 }
@@ -421,6 +464,57 @@ impl AstraManifest {
 pub struct KeyCheckManifest {
     /// The vault the key opened, so the operator sees which one answered.
     pub vault_fingerprint: Fingerprint,
+}
+
+/// The first vault of a domain: where it answers and what its two keys are called.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DomainCreationManifest {
+    pub rp_id: String,
+    pub authority_url: String,
+    pub first_label: String,
+    pub second_label: String,
+}
+
+/// A key added to the vault; `role` is `principale` or `recuperation`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeyAdditionManifest {
+    pub vault_fingerprint: Fingerprint,
+    pub label: String,
+    pub role: String,
+}
+
+/// A key removed from the vault; `role` is `principale` or `recuperation`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeyRemovalManifest {
+    pub vault_fingerprint: Fingerprint,
+    pub slot_id: String,
+    pub label: String,
+    pub role: String,
+}
+
+/// A key marked lost (`lost`) or found again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeyMarkingManifest {
+    pub vault_fingerprint: Fingerprint,
+    pub slot_id: String,
+    pub label: String,
+    pub lost: bool,
+}
+
+/// The domain's first gateway identity and what is issued under it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DomainFinalizationManifest {
+    pub vault_fingerprint: Fingerprint,
+    pub server_name: String,
+    pub gateway_wg_public_key: WireGuardKey,
+    pub issues_ca_tls: bool,
+    pub ca_tls_days: u64,
+    pub issues_credentials: bool,
 }
 
 /// §15.2, the invitation a gateway is asked to admit.
@@ -622,6 +716,78 @@ mod tests {
 
     fn session() -> Id16 {
         Id16::new([3; 16]).expect("id")
+    }
+
+    #[test]
+    fn the_vault_gestures_have_their_kinds() {
+        let fp = Fingerprint::of(b"vault");
+        let cases = [
+            (
+                AstraManifest::DomainCreation(DomainCreationManifest {
+                    rp_id: "astra.example".into(),
+                    authority_url: "https://astra.example".into(),
+                    first_label: "a".into(),
+                    second_label: "b".into(),
+                }),
+                OperationKind::CreateDomain,
+            ),
+            (
+                AstraManifest::KeyAddition(KeyAdditionManifest {
+                    vault_fingerprint: fp.clone(),
+                    label: "c".into(),
+                    role: "recuperation".into(),
+                }),
+                OperationKind::AddKey,
+            ),
+            (
+                AstraManifest::KeyRemoval(KeyRemovalManifest {
+                    vault_fingerprint: fp.clone(),
+                    slot_id: "00".repeat(16),
+                    label: "c".into(),
+                    role: "principale".into(),
+                }),
+                OperationKind::RemoveKey,
+            ),
+            (
+                AstraManifest::KeyMarking(KeyMarkingManifest {
+                    vault_fingerprint: fp.clone(),
+                    slot_id: "00".repeat(16),
+                    label: "c".into(),
+                    lost: true,
+                }),
+                OperationKind::MarkKey,
+            ),
+        ];
+        for (manifest, kind) in cases {
+            assert_eq!(manifest.kind(), kind);
+            assert_eq!(manifest.trust_domain_id(), None);
+        }
+    }
+
+    #[test]
+    fn the_new_refusals_and_purpose_are_spelled_for_the_window() {
+        assert_eq!(
+            serde_json::to_value(Refusal::KeyBeingRemoved).unwrap(),
+            serde_json::json!({"refusal": "key_being_removed"})
+        );
+        assert_eq!(
+            serde_json::to_value(Refusal::LocationUnavailable).unwrap(),
+            serde_json::json!({"refusal": "location_unavailable"})
+        );
+        assert_eq!(
+            serde_json::to_value(KeyPurpose::RegisterKey).unwrap(),
+            serde_json::json!("register_key")
+        );
+        assert_eq!(
+            serde_json::to_value(OperationKind::FinalizeDomain).unwrap(),
+            serde_json::json!("finalize_domain")
+        );
+    }
+
+    #[test]
+    fn a_creation_manifest_with_an_extra_field_is_refused() {
+        let text = r#"{"operation":"domain_creation","rp_id":"a.example","authority_url":"https://a.example","first_label":"a","second_label":"b","extra":1}"#;
+        assert!(serde_json::from_str::<AstraManifest>(text).is_err());
     }
 
     #[test]
