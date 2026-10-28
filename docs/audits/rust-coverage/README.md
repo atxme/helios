@@ -6,19 +6,19 @@ Audit du **23 octobre 2026**, révision `7ebc020d0425de4a30d64a93af1ead048c3f0fc
 
 **Objectif actualisé : viser 100 % des lignes de production pertinentes, et améliorer les fonctions/branches lorsque mesurables.** Les jalons 70/75/80 restent utiles au suivi ; aucun ne constitue une fin de mission. Le reliquat initial vers 100 % est de 22 139 lignes à périmètre constant. Les résultats ci-dessous restent la baseline historique, pas la mesure du lot en cours.
 
-**Dernier développement : COV-013, annulation QUIC et générations gateway, code `a43a319`.** Les nouveaux scénarios reproduisent puis protègent le refus de débordement avant mutation, la restauration du PSK et la propriété transactionnelle. Les 2 254 tests de la collecte passent, mais le budget Cargo arrête ensuite la campagne à 66,9 Gio / 65 Gio. Pas de nouvelle baseline, régression complète ni taille release finale pour cette révision ; nettoyage soumis à accord explicite. Voir le [journal 13](13-negotiation-cancellation.md).
+**Dernier lot mesuré : F11, code `d41835e` rebasé sur `cb6d1ae`.** La production globale Linux atteint **64,04 % (36 131 / 56 421)** ; la vue bibliothèques séparée atteint **71,72 %**. La collecte globale compte 2 596 tests réussis. Il reste 20 290 lignes non couvertes et 9 006 à couvrir pour le jalon 80 % à périmètre constant. La comparaison brute des trois crates Orion passe de 71,20 à 72,63 % ; elle n’est pas le total projet. Voir le [journal F11](14-f11-engine.md) et la [baseline des 23 crates et 370 fichiers](15-f11-file-baseline.md).
 
-**Dernier lot mesuré : 61,63 % de production globale (32 761 / 53 155), 2 238 tests réussis.** La vue bibliothèques séparée atteint 71,04 %. Deux défauts de publication concurrente sont reproduits puis corrigés ; 113 lignes existantes deviennent couvertes. La régression complète et les audits passent pour cette révision, avec sept avertissements RustSec autorisés. Les trois binaires contrôlés restent sous 128 Mio ; Astra augmente de 17 240 octets. Détails et limites dans le [journal 12](12-renewal-concurrency.md). Il reste 20 394 lignes non couvertes vers 100 %, et 9 763 à couvrir pour le jalon 80 % au périmètre courant.
+Ce lot ajoute 27 tests et corrige l’épuisement de génération, l’annulation de réconciliation du cache PSK, la relecture de politique et une écriture tardive du cache. Régression canonique et compilation MSVC Core/Engine ont réussi ; sept avertissements RustSec autorisés et les validations matérielles restent ouverts. Le blocage disque du lot 13 est historique. Les exports temporaires et le build de taille après F11 ne sont plus disponibles à la reprise du 28 octobre ; aucune comparaison de taille finale n’est revendiquée. Les révisions F14 arrivées ensuite sur main nécessitent une nouvelle validation et ne sont pas incluses dans ces chiffres.
 
-Le lot suivant traite COV-003/COV-005/COV-006 et le déblocage COV-036 : [cycles de certificats et durabilité](10-certificate-workflows.md). Le journal 09 et les chiffres ci-dessous restent historiques.
+Le lot historique suivant l’audit initial traite COV-003/COV-005/COV-006 et le déblocage COV-036 : [cycles de certificats et durabilité](10-certificate-workflows.md). Le journal 09 et les chiffres ci-dessous restent historiques.
 
 Poursuite COV-005/COV-006/COV-020 : [journal du compagnon](11-companion-journal.md).
 
 Lot 12 : [annulation, concurrence et routes privées](12-renewal-concurrency.md).
 
-Lot 13 : [négociation v5, annulation et générations](13-negotiation-cancellation.md), validation complète en attente du budget disque.
+Lot 13 : [négociation v5, annulation et générations](13-negotiation-cancellation.md), blocage disque historique ; reprise et validation dans le lot F11.
 
-## Diagnostic et résultats de référence
+## Diagnostic et résultats de référence du 23 octobre
 
 Les 23 packages du workspace ont été inventoriés, manifestes et sources inspectés, ainsi que les tests, CI, campagnes et harnais fuzz. Les modules signalés dans la mission ont des tests, souvent répartis entre crates ; leurs lacunes concernent surtout **les séquences async, les reprises et les effets concrets**, pas simplement l’absence de tests unitaires.
 

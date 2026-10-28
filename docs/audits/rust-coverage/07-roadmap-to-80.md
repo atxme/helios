@@ -12,9 +12,11 @@ Les gains sont des **fourchettes d’estimation**, pas des mesures ni garanties.
 
 Somme des potentiels des lots fonctionnels : **13 365–17 455 lignes**. C’est une réserve de scénarios au-delà du besoin 11 538, pas une promesse d’atteindre un taux sans mesurer. Les profils cible Linux ne peuvent être combinés qu’avec même source, toolchain, features et conventions ; sinon publier une vue cible séparée. Les gains matériels seront reclassés si cette combinaison n’est pas valide.
 
-Effort additionné : **135–237 jours-personne**, forte incertitude sur matériel, GUI, frontières de test et outillage local. Inclut assurance au-delà de 80 % et consolidation ; les jours de disponibilité de cible ou validation humaine ne sont pas inclus. Ordre de grandeur pour deux développeurs : environ 4–8 mois, selon parallélisation et disponibilité des environnements ; cette conversion calendaire reste une estimation, pas une date contractuelle.
+Effort historique des 35 premières fiches, révisé pour F11 : **137–240 jours-personne**, forte incertitude sur matériel, GUI, frontières de test et outillage local. Inclut assurance au-delà de 80 % et consolidation ; les jours de disponibilité de cible ou validation humaine ne sont pas inclus. Ordre de grandeur pour deux développeurs : environ 4–8 mois, selon parallélisation et disponibilité des environnements ; cette conversion calendaire reste une estimation, pas une date contractuelle.
 
-La baseline active ci-dessus vient du collecteur `rust-ast-da-v1`. Il retire aussi les 31 lignes du module de fixture `crates/orion-core/src/config/legacy_fixture.rs`, dont la déclaration est sous `cfg(test)`. L’audit initial conservé dans 02 comptait encore ces lignes ; la révision de périmètre est explicite et ne représente aucun test métier ajouté.
+La baseline historique ci-dessus vient du collecteur `rust-ast-da-v1`. Il retire aussi les 31 lignes du module de fixture `crates/orion-core/src/config/legacy_fixture.rs`, dont la déclaration est sous `cfg(test)`. L’audit initial conservé dans 02 comptait encore ces lignes ; la révision de périmètre est explicite et ne représente aucun test métier ajouté.
+
+Baseline suivante : [F11, code d41835e](15-f11-file-baseline.md), **36 131 / 56 421 = 64,04 %**, reliquat 20 290 lignes vers 100 % et 9 006 vers 80 %. Les réserves et gains ci-dessous restent historiques, ne sont pas additionnés à cette nouvelle baseline et ne constituent pas une estimation du travail restant après F14. Les 137–240 jours-personne incluent du travail déjà réalisé ; COV-036 et la disponibilité matérielle doivent être estimés séparément.
 
 ## Objectif au-delà de 80 %
 
@@ -30,7 +32,7 @@ Tous les lots doivent préserver la taille des artefacts livrables. La borne can
 
 Le matériel de test reste dans tests/fixtures et dépendances dev ; aucun framework de test, générateur ou bibliothèque de propriétés n’entre dans les dépendances runtime pour faciliter la couverture. Préserver `lto = "thin"` et `strip = true`, sans modifier le profil d’optimisation pour masquer une hausse. Ne jamais distribuer/signer une sortie llvm-cov. COV-002 définit les scripts correspondants ; chaque tâche qui modifie du Rust livrable doit produire un relevé local de taille ou dire précisément pourquoi la comparaison ne peut pas être obtenue.
 
-## Dix tâches à engager d’abord
+## Dix tâches initiales (ordre historique)
 
 | Ordre | ID | Motif |
 |---|---|---|
@@ -47,7 +49,7 @@ Le matériel de test reste dans tests/fixtures et dépendances dev ; aucun frame
 
 COV-014, COV-034 et COV-035 sont également P0 ; ils se préparent pendant les dépendances des dix premières tâches. P0 indique un risque d’assurance à traiter en premier, pas une exploitation démontrée. COV-002 prépare tôt la conservation des résultats.
 
-## Paliers et chemin critique
+## Paliers et chemin critique initiaux
 
 | Palier | Lots indicatifs | Gain cumulé bas estimé | Résultat théorique à N constant | Critère réel |
 |---|---|---:|---:|---|
@@ -88,7 +90,7 @@ flowchart TD
 Le blocage matériel le plus probable est la disponibilité simultanée Windows/DPAPI/WireGuard-NT, gateway Linux/TPM et clés opérateur. Provisionner ces environnements tôt ; développer d’abord les oracles portables, sans présenter les doubles comme preuve matériel. Aucun backend obligatoire ne devient best-effort pour faciliter un test.
 
 
-## Attribution vérifiable des estimations
+## Attribution historique des estimations
 
 Les fourchettes sont des **estimations expertes**, fondées sur le volume restant et les scénarios proposés, pas une attribution ligne→scénario déjà démontrée. Le tableau borne chaque estimation par les lignes non exécutées mesurées de sa famille principale, sans chevauchement de fichiers entre familles créditées. Les fichiers supplémentaires cités dans une tâche sont des dépendances/test seams ; ils ne lui donnent pas un crédit additionnel. Les scénarios d’une même famille peuvent exercer les mêmes helpers : un seul crédit final mesuré reste autorisé. Les faibles bornes ne sont pas des engagements contractuels.
 
@@ -119,6 +121,8 @@ Les fourchettes sont des **estimations expertes**, fondées sur le volume restan
 | COV-026 | 250 | 150–220 |
 | COV-034 | 370 | 200–300 |
 | COV-035 | 1437 | 1000–1200 |
+
+COV-026 a changé de périmètre depuis F11 : les 150–220 lignes de l’ancien helper ne sont plus créditées. Sa nouvelle réserve estimée de 60–120 lignes portables reste à mesurer et ne remplace pas automatiquement l’ancienne dans la somme historique.
 
 Les COV sans ligne dans ce tableau ne s’attribuent aucun gain Linux. Cette convention se vérifie avec les chemins du tableau par fichier de 02 et les familles décrites dans chaque objectif ; elle ne certifie pas qu’un test donné pourra couvrir toute la réserve.
 
@@ -310,17 +314,19 @@ Chaque liste de fichiers désigne des chemins existants, sauf les nouveaux scrip
 
 ### COV-007 — Tester la séquence complète de renouvellement Orion
 
+État F11 : reprise et refus de session testés dans le moteur ; cycle positif complet encore ouvert. Voir le [journal 14](14-f11-engine.md). Les nombres de lignes ci-dessous sont les estimations historiques, pas une mesure du lot F11.
+
 **Identifiant :** COV-007
 
 **Titre :** Tester la séquence complète de renouvellement Orion.
 
 **Objectif :** Vérifier l’ordre de scellement, staging, commit et promotion.
 
-**Fichiers concernés :** `crates/orion-core/src/certificate_renewal/exchange.rs`, `crates/orion-core/src/certificate_renewal/promotion.rs`, `crates/orion-core/src/certificate_renewal/trust_store.rs`, `crates/orion-core/src/certificate_renewal/tests/gateway_exchange.rs`, `crates/orion-core/src/certificate_renewal/tests/candidate_identity.rs`.
+**Fichiers concernés :** `crates/orion-core/src/certificate_renewal/exchange.rs`, `crates/orion-core/src/certificate_renewal/promotion.rs`, `crates/orion-core/src/certificate_renewal/trust_store.rs`, `crates/orion-core/src/certificate_renewal/tests/gateway_exchange.rs`, `crates/orion-core/src/certificate_renewal/tests/candidate_identity.rs`, `crates/orion-engine/src/service/certificates.rs`, `crates/orion-engine/src/service/certificates/tests.rs`.
 
-**Constat vérifié :** 503 lignes production non couvertes ; open/advance/commit/promote_due sans hits malgré tests de demande/grant/store.
+**Constat vérifié :** Baseline initiale : 503 lignes de production non couvertes. Depuis F11, la map de renouvellement appartient au moteur ; le lot 14 vérifie sa conservation sur erreur de reprise, sans changer la demande ni les octets persistés. La préparation publique est testable sous Linux ; `begin/resume` lisent un magasin protégé concret et les succès complets restent à isoler.
 
-**Travail proposé :** Introduire le plus petit point d’injection interne magasin/chemin si requis, utiliser HTTP loopback et vrais grants ; tests de coupures et rejeu exact du commit ; garder tests DPAPI séparés.
+**Travail proposé :** Introduire le plus petit point d’injection interne du magasin existant, sans élargir les API cryptographiques ni livrer de backend plaintext. Utiliser HTTP loopback et vrais grants ; vérifier insertion/reprise/suppression de la session moteur, ordonnancement de la tâche automatique après le rafraîchissement de confiance, annulation et rejeu exact du commit ; garder DPAPI sur cible. Mesurer les binaires après tout changement de testabilité.
 
 **Scénarios à tester :** Candidat -next, aucune écriture avant vérification, stage puis réponse perdue, identité store refusée, commit distant réussi/local échoué, promotion avant/à/après activation, rollback borné, corps HTTP chunké hors borne.
 
@@ -340,17 +346,19 @@ Chaque liste de fichiers désigne des chemins existants, sauf les nouveaux scrip
 
 ### COV-008 — Tester la récupération Orion hors tunnel et ses reprises
 
+État F11 : sélection d’un identifiant absent et absence de mutation testées ; les sessions positives restent à exercer. Voir le [journal 14](14-f11-engine.md).
+
 **Identifiant :** COV-008
 
 **Titre :** Tester la récupération Orion hors tunnel et ses reprises.
 
 **Objectif :** Restaurer une identité expirée sans perdre la continuité de clés.
 
-**Fichiers concernés :** `crates/orion-core/src/certificate_recovery.rs`, `crates/orion-core/src/certificate_renewal/exchange.rs`, `crates/orion-core/src/certificate_renewal/promotion.rs`.
+**Fichiers concernés :** `crates/orion-core/src/certificate_recovery.rs`, `crates/orion-core/src/certificate_renewal/exchange.rs`, `crates/orion-core/src/certificate_renewal/promotion.rs`, `crates/orion-engine/src/service/certificates.rs`, `crates/orion-engine/src/service/certificates/tests.rs`.
 
-**Constat vérifié :** 273 lignes recovery non couvertes ; tous les échanges async à zéro, cinq tests synchrones existants ; réponse Committed conduit encore au chemin install.
+**Constat vérifié :** La baseline initiale signalait 273 lignes recovery non couvertes. Après F11, le moteur possède une map de récupération distincte et sélectionne une session par identifiant opaque. `RecoverySession` n’a pas de constructeur public comparable à `RenewalSession::prepare` ; un succès réel de `begin` exige identité protégée et challenge distant. Le lot 14 ne prouve pas le cycle de récupération positif.
 
-**Travail proposé :** Serveur Astra contrôlé, vraie preuve historique et grant ; fixture de magasin isolée selon COV-007 ; reproduire perte réponse commit, échec promotion et poll/reprise.
+**Travail proposé :** Serveur Astra contrôlé, vraie preuve historique et grant ; fixture de magasin isolée selon COV-007. Tester sélection entre plusieurs récupérations et refus d’un identifiant de renouvellement, maintien de la session non terminale, suppression après `Recovered`, perte de réponse commit et reprise après échec de promotion. Ne pas rendre publics les champs privés de session uniquement pour fabriquer des tests.
 
 **Scénarios à tester :** Opérateur absent, ancienne preuve incorrecte, ID/fingerprint/état étranger, HTTP 4xx/5xx/timeout/JSON altéré, candidat scellé puis crash, commit confirmé perdu, local déjà committé non promu, nouvelle connexion sans tunnel.
 
@@ -400,17 +408,19 @@ Chaque liste de fichiers désigne des chemins existants, sauf les nouveaux scrip
 
 ### COV-010 — Valider DPAPI et reconnexion après promotion sur Windows
 
+État F11 : les protections Windows restent hors mesure WSL ; la compilation MSVC ne remplace pas cette recette native. Voir le [journal 14](14-f11-engine.md).
+
 **Identifiant :** COV-010
 
 **Titre :** Valider DPAPI et reconnexion après promotion sur Windows.
 
 **Objectif :** Prouver l’effet concret du magasin protégé dans le cycle client.
 
-**Fichiers concernés :** `crates/orion-core/src/identity_store.rs`, `crates/orion-core/src/identity_store/tests.rs`, `crates/orion-core/src/certificate_renewal/promotion.rs`, `crates/orion-core/src/certificate_recovery.rs`, `scripts/campaign-windows.ps1`, `docs/testing/MANUAL-TESTING.md`.
+**Fichiers concernés :** `crates/orion-core/src/identity_store.rs`, `crates/orion-core/src/identity_store/tests.rs`, `crates/orion-core/src/certificate_renewal/promotion.rs`, `crates/orion-core/src/certificate_recovery.rs`, `scripts/campaign-windows.ps1`, `docs/testing/MANUAL-TESTING.md`, `crates/orion-engine/src/pipe/windows.rs`, `crates/orion-core/src/protected_root/windows.rs`, `crates/orion-core/src/vault/windows/tpm.rs`, `crates/orion-core/src/vault/relocation.rs`, `apps/orion/src-tauri/src/engine_host.rs`, `apps/orion/src-tauri/src/ui_access.rs`.
 
 **Constat vérifié :** Trois tests Windows de primitive/store existent ; Linux exerce le refus ; cycle renouvellement/récupération puis reconnexion non démontré par cette campagne.
 
-**Travail proposé :** Automatiser cycle même compte avec identité et profil jetables ; conserver recette deux SID distincts et poste WireGuard-NT avec cérémonie.
+**Travail proposé :** Automatiser cycle même compte avec identité et profil jetables sous le moteur élevé F11 ; garder recette deux SID et WireGuard-NT. Vérifier refus du mauvais processus/SID sur le pipe, DACL et points d’analyse, clé TPM machine, nettoyage sous le jeton IHM et échec de migration sans destruction de l’ancien coffre. Respecter l’accès accepté des autres administrateurs : ne pas inventer une protection contre eux.
 
 **Scénarios à tester :** Scellement/tamper, candidat distinct, promotion répétée, previous slot expiré, import puis suppression fichier source, reconnect après activation, copie vers autre compte refusée.
 
@@ -422,7 +432,7 @@ Chaque liste de fichiers désigne des chemins existants, sauf les nouveaux scrip
 
 **Risque :** élevé.
 
-**Effort estimé :** 4–7 jours-personne ; incertitude plus forte si dépendances cible indisponibles.
+**Effort estimé :** 6–10 jours-personne après extension F11 ; incertitude forte sur la disponibilité des comptes, TPM et cibles.
 
 **Dépendances :** COV-007, COV-008.
 
@@ -490,7 +500,7 @@ Chaque liste de fichiers désigne des chemins existants, sauf les nouveaux scrip
 
 ### COV-013 — Compléter négociation v5, annulation et propriétaire de génération
 
-État : **partiellement réalisé**, code `a43a319` ; 16 tests supplémentaires et correction de débordement, voir le [journal 13](13-negotiation-cancellation.md). Les tests de collecte passent mais la finalisation, la régression et les tailles sont arrêtées par le budget disque ; aucun gain mesuré n’est crédité. Les chemins non exercés et les recettes système restent ouverts.
+État : **partiellement réalisé**, code `a43a319` ; 16 tests supplémentaires et correction de débordement, voir le [journal 13](13-negotiation-cancellation.md). Les tests de collecte passent mais la finalisation, la régression et les tailles sont arrêtées par le budget disque ; aucun gain mesuré n’est crédité. Les chemins non exercés et les recettes système restent ouverts. Après rebase F11, `2f3d17b` couvre aussi révocation/réadmission à MAX et nettoyage de plusieurs pairs ; voir le [journal 14](14-f11-engine.md). Le blocage disque du lot 13 est historique, le cache étant revenu sous le seuil le 27 octobre. `d41835e` ajoute sérialisation du cache, relecture de politique et protection contre les écritures tardives ; 58 tests ciblés et la régression canonique passent. Les exports temporaires ont disparu à la reprise suivante ; voir les limites du journal 14.
 
 **Identifiant :** COV-013
 
@@ -880,33 +890,35 @@ Chaque liste de fichiers désigne des chemins existants, sauf les nouveaux scrip
 
 **Priorité :** P2.
 
-### COV-026 — Tester compagnon opérateur et IPC de session
+### COV-026 — Tester IPC du moteur et cérémonies opérateur F11
+
+État F11 : `helios-astra-helper` a déjà été supprimé de main. Le moteur, ses protocoles et les cérémonies IHM remplacent ce périmètre ; aucun gain du helper disparu n'est conservé dans l'estimation ci-dessous.
 
 **Identifiant :** COV-026
 
-**Titre :** Tester compagnon opérateur et IPC de session.
+**Titre :** Tester IPC du moteur et cérémonies opérateur F11.
 
-**Objectif :** Vérifier le transport local et le séquençage des cérémonies.
+**Objectif :** Vérifier l'attribution des commandes à une session IHM et le séquençage des cérémonies.
 
-**Fichiers concernés :** `tools/helios-astra-helper/src/main.rs`, `tools/helios-astra-helper/src/owner.rs`, `tools/helios-astra-helper/src/session.rs`, `apps/orion/src-tauri/src/operator.rs`, `apps/orion/src-tauri/src/astra.rs`.
+**Fichiers concernés :** `crates/orion-engine/src/client.rs`, `crates/orion-engine/src/serve.rs`, `crates/orion-engine/src/session.rs`, `crates/orion-engine/src/lifecycle.rs`, `crates/orion-engine/src/pipe/windows.rs`, `apps/orion/src-tauri/src/operator/ceremony.rs`, `apps/orion/src-tauri/src/operator/mod.rs`, `apps/orion/src-tauri/src/engine_host.rs`, `apps/orion/src-tauri/src/ui_access.rs`.
 
-**Constat vérifié :** 250 lignes helper Linux non couvertes ; protocoles sidecar proches mais hello/session différents ; foreground WebAuthn non prouvable sous WSL.
+**Constat vérifié :** Les protocoles portables sont déjà fortement exercés ; les effets pipe/processus/jetons Windows et la cérémonie matérielle restent hors preuve WSL. Les relais certificats Tauri transmettent les commandes au moteur sans répliquer son magasin de confiance. L'ancienne approbation ordinaire reste exposée dans des API, mais Core refuse son état obsolète.
 
-**Travail proposé :** Serveur/client loopback bornés pour hello/commande/status et processus qui meurt ; tests de révision/session et erreurs lancement ; recette Windows du focus à chaque clic.
+**Travail proposé :** Étendre les suites client/serve/lifecycle existantes pour commande interrompue, mauvaise variante de réponse, fin de l'IHM pendant une commande et arrêt ordonné. Sur Windows, vérifier les liaisons processus/SID/image et le focus à chaque geste opérateur. Traiter le retrait coordonné des anciennes API d'approbation après décision de compatibilité ; conserver leur refus explicite.
 
-**Scénarios à tester :** Token absent/faux, version/session stale, frame tronquée/trop grosse, révision répétée, deuxième connexion parasite, annulation avant/entre les deux clés, sidecar absent.
+**Scénarios à tester :** Frame tronquée/hors borne, séquence rejouée, deuxième client, fermeture pendant commande, mauvais processus/SID/image, erreur ou annulation entre deux gestes matériels, libération du verrou de cérémonie en échec.
 
-**Préconditions :** Loopback pour IPC ; Windows interactif et clé dédiée pour focus/ceremony.
+**Préconditions :** Duplex local et backend de test existants pour le protocole ; Windows interactif, deux comptes et clés dédiées pour pipe/ceremony. Le token de session ne constitue pas à lui seul une frontière de privilège.
 
-**Critères d’acceptation :** Aucun résultat étranger accepté ; secrets jamais dans logs/argv persistants ; état Failed visible après décès ; focus transmis de nouveau lors du second geste ; ABI hello conservée par protocole.
+**Critères d’acceptation :** Aucun résultat attribué à une autre commande/session ; une fin d'IHM déclenche le teardown prévu ; aucune clé privée/PIN dans les vues, logs ou argv ; les protections natives et le deuxième geste sont prouvés séparément de la compilation.
 
-**Gain de couverture estimé :** **Estimation** 150–220 lignes existantes, soit environ 0.28–0.41 points à N=53 009 constant. À mesurer après changement ; aucune garantie.
+**Gain de couverture estimé :** **Estimation F11** 60–120 lignes portables existantes, à confirmer par mesure. Aucun gain Windows n'est crédité dans la vue Linux ; les anciennes 150–220 lignes du helper retiré ne sont plus additionnées.
 
 **Risque :** élevé.
 
-**Effort estimé :** 4–7 jours-personne ; incertitude plus forte si dépendances cible indisponibles.
+**Effort estimé :** 4–7 jours-personne ; incertitude plus forte si la cible interactive ou les clés sont indisponibles.
 
-**Dépendances :** COV-034, COV-035.
+**Dépendances :** COV-010, COV-034, COV-035.
 
 **Priorité :** P1.
 
