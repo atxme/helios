@@ -125,6 +125,20 @@ describe('AstraView', () => {
     expect(screen.getByText(/arrivera dans une prochaine version/)).toBeTruthy()
   })
 
+  it('the_section_menu_fits_the_base_window_in_two_rows', () => {
+    render(<AstraView />)
+    const menu = screen.getByRole('tablist', { name: 'Sections Astra' })
+    // A fixed three-column grid: the six sections take two rows whatever the
+    // labels, and the menu never scrolls nor widens the view.
+    expect(menu.style.gridTemplateColumns || getComputedStyle(menu).gridTemplateColumns).toBe(
+      'repeat(3, minmax(0, 1fr))',
+    )
+    expect(screen.queryByRole('button', { name: /scroll/i })).toBeNull()
+    openTab('Domaine')
+    expect(screen.getByRole('tab', { name: 'Domaine' }).getAttribute('aria-selected')).toBe('true')
+    expect(screen.getByRole('tab', { name: 'Enrôlement' }).getAttribute('aria-selected')).toBe('false')
+  })
+
   it('the_enrolment_tab_is_the_default_and_offers_both_gestures', async () => {
     render(<AstraView />)
     expect(screen.getByRole('tab', { name: 'Enrôlement' }).getAttribute('aria-selected')).toBe('true')

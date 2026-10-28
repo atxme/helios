@@ -1,14 +1,12 @@
 import type { ReactNode } from 'react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import Alert from '@mui/material/Alert'
-import Badge from '@mui/material/Badge'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
+import ButtonBase from '@mui/material/ButtonBase'
 import CircularProgress from '@mui/material/CircularProgress'
 import Paper from '@mui/material/Paper'
 import Stack from '@mui/material/Stack'
-import Tab from '@mui/material/Tab'
-import Tabs from '@mui/material/Tabs'
 import TextField from '@mui/material/TextField'
 import Typography from '@mui/material/Typography'
 import { Check, KeyRound } from 'lucide-react'
@@ -630,30 +628,67 @@ export function AstraView({
       <Typography component="h2" sx={{ fontSize: 13, fontWeight: 700, mb: 0.5 }}>
         Astra
       </Typography>
-      <Tabs
-        value={tab}
-        onChange={(_, value: AstraTab) => setTab(value)}
-        variant="scrollable"
-        scrollButtons="auto"
-        sx={{ mb: 1.5, minHeight: 34 }}
+      {/* A fixed grid rather than a tab strip: six labels in one row overflow
+          the window Orion is drawn for, and a scrolling strip hides sections
+          the operator must see. Three columns keep every section in view, in
+          two rows, at the base size. */}
+      <Box
+        role="tablist"
+        aria-label="Sections Astra"
+        style={{ gridTemplateColumns: 'repeat(3, minmax(0, 1fr))' }}
+        sx={{ display: 'grid', gap: 0.75, mb: 1.5 }}
       >
-        {TABS.map((name) => (
-          <Tab
-            key={name}
-            value={name}
-            label={
-              name === 'Approbations' && pending.length > 0 ? (
-                <Badge badgeContent={pending.length} color="primary" sx={{ '& .MuiBadge-badge': { right: -14 } }}>
-                  {name}
-                </Badge>
-              ) : (
-                name
-              )
-            }
-            sx={{ minHeight: 34, fontSize: 12 }}
-          />
-        ))}
-      </Tabs>
+        {TABS.map((name) => {
+          const selected = name === tab
+          const count = name === 'Approbations' ? pending.length : 0
+          return (
+            <ButtonBase
+              key={name}
+              role="tab"
+              aria-selected={selected}
+              onClick={() => setTab(name)}
+              sx={{
+                minWidth: 0,
+                minHeight: 32,
+                px: 0.75,
+                gap: 0.5,
+                borderRadius: 1.5,
+                border: `1px solid ${selected ? PINE : RULE}`,
+                bgcolor: selected ? MINT : 'background.paper',
+                color: selected ? PINE : 'text.secondary',
+                fontSize: 12,
+                fontWeight: selected ? 700 : 600,
+                transition: 'background-color 150ms ease, border-color 150ms ease',
+                '&:hover': { borderColor: PINE },
+                '&.Mui-focusVisible': { outline: `2px solid ${PINE}`, outlineOffset: 1 },
+              }}
+            >
+              <Box component="span" sx={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                {name}
+              </Box>
+              {count > 0 && (
+                <Box
+                  component="span"
+                  sx={{
+                    flexShrink: 0,
+                    minWidth: 16,
+                    height: 16,
+                    px: 0.5,
+                    borderRadius: 8,
+                    bgcolor: PINE,
+                    color: '#fff',
+                    fontSize: 10,
+                    fontWeight: 700,
+                    lineHeight: '16px',
+                  }}
+                >
+                  {count}
+                </Box>
+              )}
+            </ButtonBase>
+          )
+        })}
+      </Box>
       {panels[tab]}
     </Box>
   )
