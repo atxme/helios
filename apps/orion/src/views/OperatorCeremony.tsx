@@ -278,9 +278,9 @@ export function gestureSentence(gesture: GestureState, operation: OperationKind)
           ? 'pour ouvrir le coffre d’autorité'
           : purpose === 'approve_campaign'
             ? 'pour approuver la campagne affichée'
-            : purpose === 'second_approval'
-              ? 'pour la seconde approbation'
-              : 'pour promouvoir ce qui a été préparé'
+          : purpose === 'second_approval'
+            ? 'pour la seconde approbation'
+            : 'pour promouvoir ce qui a été préparé'
       return `Brancher la clé autorisée${which}, ${why}.`
     }
     const { index, of } = gesture.processing_key

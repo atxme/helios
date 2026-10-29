@@ -1044,7 +1044,7 @@ export interface SlotView {
   label: string
   role: KeyRole
   /** Lu d'un document de credentials qui se vérifie ; absent sinon. */
-  state?: 'active' | 'lost' | 'revoked'
+  state: 'active' | 'lost' | 'revoked' | null
 }
 
 export interface DomainView {

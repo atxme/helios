@@ -4,17 +4,35 @@ import type { DomainFinalizationManifest, Refusal } from '../types'
 
 describe('the vault gestures in the ceremony window', () => {
   it('every_new_refusal_has_its_sentence', () => {
-    const cases: [Refusal['refusal'], RegExp][] = [
-      ['vault_exists', /^Un coffre existe déjà à cet emplacement : ajouter une clé/],
-      ['location_unavailable', /^L’emplacement du coffre est introuvable/],
-      ['vault_full', /^Le coffre porte déjà huit clés/],
-      ['minimum_keys', /^Le coffre doit garder au moins deux clés/],
-      ['key_being_removed', /^La clé qui a ouvert le coffre est celle à retirer/],
-      ['gateway_identity_missing', /ne nomme pas encore la gateway, ou le document de credentials/],
-      ['domain_complete', /^Le domaine est déjà finalisé/],
+    const cases: [Refusal['refusal'], string][] = [
+      [
+        'vault_exists',
+        'Un coffre existe déjà à cet emplacement : ajouter une clé plutôt que créer un second domaine.',
+      ],
+      [
+        'location_unavailable',
+        'L’emplacement du coffre est introuvable : rebrancher son support ou choisir un autre emplacement.',
+      ],
+      ['vault_full', 'Le coffre porte déjà huit clés : en retirer une avant d’en ajouter.'],
+      [
+        'minimum_keys',
+        'Le coffre doit garder au moins deux clés : en ajouter une avant d’en retirer.',
+      ],
+      [
+        'key_being_removed',
+        'La clé qui a ouvert le coffre est celle à retirer : recommencer avec une autre clé.',
+      ],
+      [
+        'gateway_identity_missing',
+        'Le relais ne nomme pas encore la gateway, ou le document de credentials en place ne se vérifie pas : reprendre la gateway connectée, ou restaurer le document de credentials depuis une sauvegarde.',
+      ],
+      [
+        'domain_complete',
+        'Le domaine est déjà finalisé : CA-TLS et document de credentials sont en place.',
+      ],
     ]
-    for (const [refusal, pattern] of cases) {
-      expect(refusalSentence({ refusal } as Refusal)).toMatch(pattern)
+    for (const [refusal, sentence] of cases) {
+      expect(refusalSentence({ refusal } as Refusal)).toBe(sentence)
     }
   })
 
