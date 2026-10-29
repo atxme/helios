@@ -664,6 +664,11 @@ export type OperationKind =
   | 'verify_key'
   | 'invite_enrollment'
   | 'accept_enrollment'
+  | 'create_domain'
+  | 'add_key'
+  | 'remove_key'
+  | 'mark_key'
+  | 'finalize_domain'
 
 /** Ce que le WebView a le droit de nommer : un genre, au plus un identifiant. */
 export interface OperationLocator {
@@ -686,7 +691,12 @@ export type RemoteState =
   | { activation_deferred: { activation_at: number } }
   | 'refused'
 
-export type KeyPurpose = 'open_vault' | 'approve_campaign' | 'second_approval' | 'promotion'
+export type KeyPurpose =
+  | 'open_vault'
+  | 'approve_campaign'
+  | 'second_approval'
+  | 'promotion'
+  | 'register_key'
 
 /** Où en est la cérémonie **sur ce poste**. */
 export type GestureState =
@@ -718,6 +728,13 @@ export type Refusal =
   | { refusal: 'accepted_elsewhere' }
   | { refusal: 'gateway_leaf_unavailable' }
   | { refusal: 'document_not_signed' }
+  | { refusal: 'vault_exists' }
+  | { refusal: 'location_unavailable' }
+  | { refusal: 'vault_full' }
+  | { refusal: 'minimum_keys' }
+  | { refusal: 'key_being_removed' }
+  | { refusal: 'gateway_identity_missing' }
+  | { refusal: 'domain_complete' }
   | { refusal: 'handoff_mismatch' }
   | { refusal: 'manifest_mismatch' }
   | { refusal: 'protocol_violation' }
@@ -848,6 +865,50 @@ export interface AcceptanceManifest {
   ssh_target?: string
 }
 
+/** Rôle d'une clé, sous les noms que donne l'aperçu du coffre. */
+export type KeyRole = 'principale' | 'recuperation'
+
+export interface DomainCreationManifest {
+  operation: 'domain_creation'
+  rp_id: string
+  authority_url: string
+  first_label: string
+  second_label: string
+}
+
+export interface KeyAdditionManifest {
+  operation: 'key_addition'
+  vault_fingerprint: string
+  label: string
+  role: KeyRole
+}
+
+export interface KeyRemovalManifest {
+  operation: 'key_removal'
+  vault_fingerprint: string
+  slot_id: string
+  label: string
+  role: KeyRole
+}
+
+export interface KeyMarkingManifest {
+  operation: 'key_marking'
+  vault_fingerprint: string
+  slot_id: string
+  label: string
+  lost: boolean
+}
+
+export interface DomainFinalizationManifest {
+  operation: 'domain_finalization'
+  vault_fingerprint: string
+  server_name: string
+  gateway_wg_public_key: string
+  issues_ca_tls: boolean
+  ca_tls_days: number
+  issues_credentials: boolean
+}
+
 export type AstraManifest =
   | RecoveryManifest
   | CampaignManifest
@@ -857,6 +918,11 @@ export type AstraManifest =
   | KeyCheckManifest
   | InvitationManifest
   | AcceptanceManifest
+  | DomainCreationManifest
+  | KeyAdditionManifest
+  | KeyRemovalManifest
+  | KeyMarkingManifest
+  | DomainFinalizationManifest
 
 export interface KeySlotLabel {
   slot: string
@@ -976,7 +1042,9 @@ export interface PendingEnrollment {
 export interface SlotView {
   slot_id: string
   label: string
-  role: 'principale' | 'recuperation'
+  role: KeyRole
+  /** Lu d'un document de credentials qui se vérifie ; absent sinon. */
+  state?: 'active' | 'lost' | 'revoked'
 }
 
 export interface DomainView {
@@ -993,8 +1061,49 @@ export interface DomainView {
 export interface VaultOverview {
   vault_path: string
   exists: boolean
+  /** Le dossier choisi existe : un coffre peut y être créé s'il n'y en a pas. */
+  location_available: boolean
+  /** Le coffre porte les clés qu'exige l'amorçage. */
+  bootstrapped: boolean
+  /** Un document de credentials se vérifie et porte une ligne par clé. */
+  credentials_complete: boolean
   vault_fingerprint: string | null
   slots: SlotView[]
   max_slots: number
   domain: DomainView | null
+}
+
+/** Un geste de coffre ou de domaine ; le chemin du coffre est lu côté Rust. */
+export type VaultGesture =
+  | {
+      gesture: 'create_domain'
+      rp_id: string
+      authority_url: string
+      first_label: string
+      second_label: string
+    }
+  | { gesture: 'add_key'; label: string; role: KeyRole }
+  | { gesture: 'remove_key'; slot_id: string }
+  | { gesture: 'mark_key'; slot_id: string; lost: boolean }
+  | { gesture: 'finalize_domain' }
+
+/** Valeurs inscrites sur le relais du domaine ; un champ absent laisse l'existant. */
+export interface RelayUpdate {
+  gateway_wg_public_key?: string
+  server_name?: string
+  astra_service_public_key?: string
+  astra_service_key_epoch?: number
+  astra_authority_url?: string
+}
+
+/** Où est le coffre : un chemin à afficher, jamais à renvoyer. */
+export interface VaultLocationView {
+  path: string
+  is_default: boolean
+  picker_available: boolean
+}
+
+/** Ce dont part le formulaire de création de domaine. */
+export interface DomainDefaults {
+  rp_id: string | null
 }

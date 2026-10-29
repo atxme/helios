@@ -15,7 +15,11 @@ import type {
   OperatorPendingOperation,
   OperatorStatus,
   OperatorArtifact,
+  DomainDefaults,
   EnrollmentGesture,
+  RelayUpdate,
+  VaultGesture,
+  VaultLocationView,
   InvitationView,
   CertificateAction,
   CertificateActionState,
@@ -318,6 +322,34 @@ export const beginOperatorCeremony = (locator: OperationLocator) =>
  */
 export const beginEnrollmentCeremony = (gesture: EnrollmentGesture) =>
   invoke<OperatorStatus>('begin_enrollment_ceremony', { gesture })
+
+/** Opens a vault or domain gesture; the vault path is read on the Rust side. */
+export const beginVaultCeremony = (gesture: VaultGesture) =>
+  invoke<OperatorStatus>('begin_vault_ceremony', { gesture })
+
+/** Renames a key. No key is asked anything. */
+export const renameOperatorKey = (slotId: string, label: string) =>
+  invoke<void>('rename_operator_key', { slotId, label })
+
+/** Records values on the domain relay beside the vault. No key. */
+export const writeDomainRelay = (update: RelayUpdate) =>
+  invoke<void>('write_domain_relay', { update })
+
+/** Records the connected gateway's identity on the relay, after checking it. */
+export const adoptConnectedGateway = () => invoke<void>('adopt_connected_gateway')
+
+/** What the domain creation form starts from. */
+export const operatorDomainDefaults = () => invoke<DomainDefaults>('operator_domain_defaults')
+
+/** Where the operator vault is kept. */
+export const operatorVaultLocation = () => invoke<VaultLocationView>('operator_vault_location')
+
+/** Opens the folder dialog; `null` when the operator cancels. */
+export const chooseVaultLocation = () =>
+  invoke<VaultLocationView | null>('choose_vault_location')
+
+/** Goes back to the default vault location. */
+export const resetVaultLocation = () => invoke<VaultLocationView>('reset_vault_location')
 
 /** Les fichiers produits par la session courante, que l'IHM enregistre. */
 export const operatorArtifacts = () => invoke<OperatorArtifact[]>('operator_artifacts')

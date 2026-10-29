@@ -41,6 +41,11 @@ const TITLES: Record<OperationKind, string> = {
   verify_key: 'Vérifier la clé opérateur',
   invite_enrollment: 'Inviter un poste',
   accept_enrollment: 'Accepter une invitation',
+  create_domain: 'Créer un domaine',
+  add_key: 'Ajouter une clé',
+  remove_key: 'Retirer une clé',
+  mark_key: 'Changer l’état d’une clé',
+  finalize_domain: 'Finaliser le domaine',
 }
 
 /** The verb of the button that goes through with it, per operation. */
@@ -54,6 +59,11 @@ const VERBS: Record<OperationKind, string> = {
   verify_key: 'Vérifier avec la clé',
   invite_enrollment: 'Inviter avec la clé',
   accept_enrollment: 'Accepter avec la clé',
+  create_domain: 'Créer avec les clés',
+  add_key: 'Ajouter avec les clés',
+  remove_key: 'Retirer avec la clé',
+  mark_key: 'Signer avec la clé',
+  finalize_domain: 'Finaliser avec la clé',
 }
 
 function instant(unix: number): string {
@@ -185,6 +195,42 @@ export function rowsOf(manifest: AstraManifest): [string, string][] {
         ...(manifest.allowed_ips ? [['routes autorisées', manifest.allowed_ips] as [string, string]] : []),
         ...(manifest.ssh_target ? [['cible SSH', manifest.ssh_target] as [string, string]] : []),
       ]
+    case 'domain_creation':
+      return [
+        ['nom WebAuthn', manifest.rp_id],
+        ['origine d’Astra', manifest.authority_url],
+        ['première clé', manifest.first_label],
+        ['seconde clé', manifest.second_label],
+      ]
+    case 'key_addition':
+      return [
+        ['coffre', manifest.vault_fingerprint],
+        ['libellé', manifest.label],
+        ['rôle', manifest.role],
+      ]
+    case 'key_removal':
+      return [
+        ['coffre', manifest.vault_fingerprint],
+        ['clé', manifest.label],
+        ['rôle', manifest.role],
+      ]
+    case 'key_marking':
+      return [
+        ['coffre', manifest.vault_fingerprint],
+        ['clé', manifest.label],
+        ['nouvel état', manifest.lost ? 'perdue' : 'active'],
+      ]
+    case 'domain_finalization':
+      return [
+        ['coffre', manifest.vault_fingerprint],
+        ['nom serveur', manifest.server_name],
+        ['gateway', manifest.gateway_wg_public_key],
+        [
+          'CA-TLS',
+          manifest.issues_ca_tls ? `émise, ${manifest.ca_tls_days} jours` : 'déjà en place',
+        ],
+        ['credentials', manifest.issues_credentials ? 'émis' : 'à jour'],
+      ]
   }
 }
 
@@ -218,19 +264,23 @@ function remoteSentence(remote: RemoteState): string {
 }
 
 /** What this machine is doing, said plainly. */
-function gestureSentence(gesture: GestureState, operation: OperationKind): string {
+export function gestureSentence(gesture: GestureState, operation: OperationKind): string {
   if (typeof gesture === 'object') {
     if ('awaiting_key' in gesture) {
       const { index, of, purpose } = gesture.awaiting_key
       const which = of > 1 ? ` (${index} sur ${of})` : ''
+      if (purpose === 'register_key') {
+        const previous = index > 1 ? 'Débrancher la clé précédente. ' : ''
+        return `${previous}Brancher la nouvelle clé${which}, pour l’enregistrer dans le coffre.`
+      }
       const why =
         purpose === 'open_vault'
           ? 'pour ouvrir le coffre d’autorité'
           : purpose === 'approve_campaign'
             ? 'pour approuver la campagne affichée'
-          : purpose === 'second_approval'
-            ? 'pour la seconde approbation'
-            : 'pour promouvoir ce qui a été préparé'
+            : purpose === 'second_approval'
+              ? 'pour la seconde approbation'
+              : 'pour promouvoir ce qui a été préparé'
       return `Brancher la clé autorisée${which}, ${why}.`
     }
     const { index, of } = gesture.processing_key
@@ -319,6 +369,24 @@ export function refusalSentence(refusal: Refusal): string {
       )
     case 'accepted_elsewhere':
       return "Cette invitation a été acceptée hors d'Orion : ses feuilles ne sont pas ici."
+    case 'vault_exists':
+      return 'Un coffre existe déjà à cet emplacement : ajouter une clé plutôt que créer un second domaine.'
+    case 'location_unavailable':
+      return 'L’emplacement du coffre est introuvable : rebrancher son support ou choisir un autre emplacement.'
+    case 'vault_full':
+      return 'Le coffre porte déjà huit clés : en retirer une avant d’en ajouter.'
+    case 'minimum_keys':
+      return 'Le coffre doit garder au moins deux clés : en ajouter une avant d’en retirer.'
+    case 'key_being_removed':
+      return 'La clé qui a ouvert le coffre est celle à retirer : recommencer avec une autre clé.'
+    case 'gateway_identity_missing':
+      return (
+        'Le relais ne nomme pas encore la gateway, ou le document de credentials en place ne se ' +
+        'vérifie pas : reprendre la gateway connectée, ou restaurer le document de credentials ' +
+        'depuis une sauvegarde.'
+      )
+    case 'domain_complete':
+      return 'Le domaine est déjà finalisé : CA-TLS et document de credentials sont en place.'
     case 'handoff_mismatch':
       return 'La proposition ne correspond pas à ce que ce coffre épingle.'
     case 'manifest_mismatch':
