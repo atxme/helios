@@ -14,6 +14,8 @@ const api = vi.hoisted(() => ({
   operatorPendingOperations: vi.fn(),
   dismissOperatorCeremony: vi.fn(),
   operatorOverview: vi.fn(),
+  operatorVaultLocation: vi.fn(),
+  operatorDomainDefaults: vi.fn(),
   operatorInvitations: vi.fn(),
   operatorArtifacts: vi.fn(),
   getState: vi.fn(),
@@ -62,11 +64,20 @@ beforeEach(() => {
   api.operatorOverview.mockResolvedValue({
     vault_path: 'C:\\astra\\vault.json',
     exists: false,
+    location_available: true,
+    bootstrapped: false,
+    credentials_complete: false,
     vault_fingerprint: null,
     slots: [],
     max_slots: 8,
     domain: null,
   })
+  api.operatorVaultLocation.mockResolvedValue({
+    path: 'C:\\astra',
+    is_default: true,
+    picker_available: false,
+  })
+  api.operatorDomainDefaults.mockResolvedValue({ rp_id: null })
   api.dismissOperatorCeremony.mockResolvedValue(undefined)
   api.astraCaTlsRotationStatus.mockResolvedValue({
     phase: 'idle',
@@ -157,6 +168,9 @@ describe('AstraView', () => {
     api.operatorOverview.mockResolvedValue({
       vault_path: 'v.json',
       exists: true,
+      location_available: true,
+      bootstrapped: true,
+      credentials_complete: true,
       vault_fingerprint: 'ab12',
       slots: [],
       max_slots: 8,
