@@ -188,24 +188,38 @@ impl VaultRun<'_> {
         });
     }
 
-    /// Opens the vault with the `index`-th key of `of`. The key is let go
-    /// before this returns, so the next one can be plugged in its place.
+    /// Opens the vault with the `index`-th key of `of`, any enrolled key but
+    /// the one `removing` names. The key is let go before this returns, so
+    /// the next one can be plugged in its place.
     fn open_vault(
         &mut self,
         vault: &AuthorityVault,
         index: u8,
         of: u8,
+        removing: Option<&[u8; 16]>,
     ) -> Result<Option<Opened>, String> {
         let Some(key) = self.ask_key(index, of, KeyPurpose::OpenVault)? else {
             return Ok(None);
         };
         // The PIN is empty for the reason `open_key` refused a transport that
         // wants one: the platform collects it in its own dialog.
-        let opened =
-            match astra_operator::gestures::open_with_authorized_key(key.as_ref(), vault, "") {
-                Ok(opened) => opened,
-                Err(error) => return self.refuse(Refusal::KeyDeclined, format!("{error:#}")),
-            };
+        let opening = match removing {
+            Some(slot) => gestures::open_for_removal(key.as_ref(), vault, slot, ""),
+            None => astra_operator::gestures::open_with_authorized_key(key.as_ref(), vault, "")
+                .map_err(anyhow::Error::from),
+        };
+        let opened = match opening {
+            Ok(opened) => opened,
+            Err(error) => {
+                // A check the opening carries is named; anything else is the
+                // key that did not open.
+                let refusal = match refusal_of(&error) {
+                    Refusal::Internal => Refusal::KeyDeclined,
+                    refusal => refusal,
+                };
+                return self.refuse(refusal, format!("{error:#}"));
+            }
+        };
         drop(key);
         if let Ok(slot) = vault.slot_for_credential(&opened.credential_id) {
             let label = slot.label.clone();
@@ -303,7 +317,7 @@ impl VaultRun<'_> {
             role: role.name().to_string(),
         }));
 
-        let Some(opening) = self.open_vault(&vault, 1, 2)? else {
+        let Some(opening) = self.open_vault(&vault, 1, 2, None)? else {
             return Ok(());
         };
         let Some(key) = self.ask_key(2, 2, KeyPurpose::RegisterKey)? else {
@@ -313,7 +327,7 @@ impl VaultRun<'_> {
             label: label.to_string(),
             role: role.slot_role(),
         };
-        if let Err(error) = gestures::add_key_with(
+        let added = match gestures::add_key_with(
             self.vault_path,
             &opening,
             key.as_ref(),
@@ -321,10 +335,18 @@ impl VaultRun<'_> {
             "",
             now_unix(),
         ) {
-            return self.refuse(refusal_of(&error), format!("{error:#}"));
-        }
+            Ok(added) => added,
+            Err(error) => return self.refuse(refusal_of(&error), format!("{error:#}")),
+        };
         drop(key);
         self.answered(2, label);
+
+        // As at creation, both openings already held are proved to read the
+        // anchors: the second key of a one-key vault, added from its banner,
+        // gets the trial ADR-008 §4 asks for. No press.
+        if let Err(error) = gestures::prove_opens(self.vault_path, &[&opening, &added.opening]) {
+            return self.refuse(refusal_of(&error), format!("{error:#}"));
+        }
         self.done()
     }
 
@@ -344,7 +366,9 @@ impl VaultRun<'_> {
         self.check_document()?;
         self.show(AstraManifest::KeyRemoval(manifest));
 
-        let Some(opening) = self.open_vault(&vault, 1, 1)? else {
+        // The key being removed is left out of what the platform asks for:
+        // presenting it costs no PIN and no touch for a refusal.
+        let Some(opening) = self.open_vault(&vault, 1, 1, Some(&slot))? else {
             return Ok(());
         };
         self.signing();
@@ -370,7 +394,7 @@ impl VaultRun<'_> {
         self.check_document()?;
         self.show(AstraManifest::KeyMarking(manifest));
 
-        let Some(opening) = self.open_vault(&vault, 1, 1)? else {
+        let Some(opening) = self.open_vault(&vault, 1, 1, None)? else {
             return Ok(());
         };
         self.signing();
@@ -399,7 +423,7 @@ impl VaultRun<'_> {
             },
         ));
 
-        let Some(opening) = self.open_vault(&vault, 1, 1)? else {
+        let Some(opening) = self.open_vault(&vault, 1, 1, None)? else {
             return Ok(());
         };
         self.signing();

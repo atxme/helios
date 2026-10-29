@@ -227,25 +227,41 @@ pub(crate) async fn adopt_connected_gateway(state: State<'_, AppState>) -> Resul
     let leaf = admin::decode_pq_certificate(&material.gateway_pq_certificate)
         .map_err(|error| error.to_string())?;
     check_tunnel_leaf(&leaf, &material, &tunnel_peer_key)?;
-    // Its own thread, with the stack the post-quantum verification needs.
-    let (sender, receiver) = tokio::sync::oneshot::channel();
-    std::thread::Builder::new()
-        .name("orion-gateway-adoption".into())
-        .stack_size(astra_operator::WORK_STACK_BYTES)
-        .spawn(move || {
+    on_work_stack(
+        "orion-gateway-adoption",
+        "l'adoption de la gateway",
+        move || {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            let adopted = astra_operator::vault_gestures::adopt_gateway(&vault_path, &leaf, now)
+            astra_operator::vault_gestures::adopt_gateway(&vault_path, &leaf, now)
                 .map(|_| ())
-                .map_err(|error| format!("{error:#}"));
-            let _ = sender.send(adopted);
+                .map_err(|error| format!("{error:#}"))
+        },
+    )
+    .await
+}
+
+/// Runs `work` on a thread of its own, with the stack the post-quantum
+/// verifications need, and waits for its answer without holding a runtime
+/// worker. `what` names the work in the two errors of the thread itself.
+async fn on_work_stack<T, F>(name: &str, what: &str, work: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name(name.into())
+        .stack_size(astra_operator::WORK_STACK_BYTES)
+        .spawn(move || {
+            let _ = sender.send(work());
         })
-        .map_err(|error| format!("adoption de la gateway : {error}"))?;
+        .map_err(|error| format!("{what} : {error}"))?;
     receiver
         .await
-        .map_err(|_| "l'adoption de la gateway s'est arrêtée".to_string())?
+        .map_err(|_| format!("{what} s'est arrêtée"))?
 }
 
 /// What the domain creation form starts from: the RP ID the selected
@@ -287,20 +303,28 @@ pub(crate) async fn operator_ceremony_status(
 /// Nothing is unwrapped: the slots come back as identifier, label and role, and
 /// the domain as the public values of the relay beside the vault. No PIN and no
 /// security key are involved, so this is safe to call whenever the tab opens.
+///
+/// The credential document is verified under `CA-PQ` on the way, so the read
+/// runs on a work stack, as the adoption does.
 #[tauri::command]
 pub(crate) async fn operator_overview(
     state: State<'_, AppState>,
 ) -> Result<astra_operator::overview::VaultOverview, String> {
     let path = state.vault_location.path()?;
-    astra_operator::overview::read(&path).map_err(|error| error.to_string())
+    on_work_stack("orion-vault-overview", "la lecture du coffre", move || {
+        astra_operator::overview::read(&path).map_err(|error| error.to_string())
+    })
+    .await
 }
 
-/// Where the operator vault is, and whether it is the default place.
+/// Where the operator vault is, and whether it is the default place. A
+/// location that cannot be resolved is a view that says why, not an error:
+/// the window must still offer to choose again or go back to the default.
 #[tauri::command]
 pub(crate) async fn operator_vault_location(
     state: State<'_, AppState>,
 ) -> Result<crate::operator::location::VaultLocationView, String> {
-    state.vault_location.view()
+    Ok(state.vault_location.view())
 }
 
 /// Asks the operator, in a dialog over this window, where the vault is.

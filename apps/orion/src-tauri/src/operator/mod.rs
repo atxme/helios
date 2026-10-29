@@ -247,13 +247,13 @@ fn valid_rp_id(rp_id: &str) -> bool {
         && rp_id.parse::<std::net::IpAddr>().is_err()
 }
 
-/// An `https://` origin with a host, as the relay will record it.
+/// An origin the relay will record: `https://host[:port]`, nothing after the
+/// host but a trailing `/`. The rule is the relay's own, applied on arrival so
+/// a value it would refuse after the press opens no ceremony.
 fn valid_authority_url(url: &str) -> bool {
     url.chars().count() <= MAX_AUTHORITY_URL_CHARS
         && !url.chars().any(char::is_whitespace)
-        && url
-            .strip_prefix("https://")
-            .is_some_and(|host| !host.trim_end_matches('/').is_empty())
+        && astra_operator::vault_gestures::authority_origin(url).is_ok()
 }
 
 /// A key label the vault accepts: not blank, `MAX_LABEL_CHARS` at most.
@@ -294,8 +294,8 @@ impl VaultGesture {
                 }
                 if !valid_authority_url(authority_url) {
                     return Err(format!(
-                        "l'origine de l'autorité est une URL https:// sans espace, de \
-                         {MAX_AUTHORITY_URL_CHARS} caractères au plus"
+                        "l'origine de l'autorité est https://hôte[:port], sans chemin ni \
+                         espace, de {MAX_AUTHORITY_URL_CHARS} caractères au plus"
                     ));
                 }
                 check_key_label(first_label)?;
@@ -880,10 +880,13 @@ mod tests {
     #[tokio::test]
     async fn gestures_with_invalid_values_open_no_ceremony() {
         let url = "https://astra.example";
-        assert_eq!(
-            creation("astra.example", url, "quotidienne").validate(),
-            Ok(())
-        );
+        for origin in [url, "https://astra.example/", "https://astra.example:8443"] {
+            assert_eq!(
+                creation("astra.example", origin, "quotidienne").validate(),
+                Ok(()),
+                "{origin}"
+            );
+        }
         let invalid = [
             creation("192.168.1.1", url, "quotidienne"),
             creation("Astra.Example", url, "quotidienne"),
@@ -891,6 +894,19 @@ mod tests {
             creation("1.2.3", url, "quotidienne"),
             creation("astra.123", url, "quotidienne"),
             creation("astra.example", "http://astra.example", "quotidienne"),
+            creation(
+                "astra.example",
+                "https://astra.example/astra",
+                "quotidienne",
+            ),
+            creation("astra.example", "https://astra.example?x=1", "quotidienne"),
+            creation("astra.example", "https://astra.example#x", "quotidienne"),
+            creation("astra.example", "https://user@astra.example", "quotidienne"),
+            creation(
+                "astra.example",
+                "https://astra.example:99999",
+                "quotidienne",
+            ),
             creation("astra.example", url, " "),
             VaultGesture::AddKey {
                 label: " ".into(),

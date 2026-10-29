@@ -8,7 +8,11 @@
 //! A setting that cannot be read is an error, not the default: the operator
 //! chose a vault, and a ceremony that silently opened another one would sign
 //! under a domain they did not mean. Choosing again, or going back to the
-//! default, replaces it.
+//! default, replaces it — so the view still offers both, beside the error.
+//!
+//! The default folder is created, privately, when a gesture resolves the
+//! vault there: nothing else creates it before the first vault. A chosen
+//! folder never is.
 
 use std::path::{Path, PathBuf};
 #[cfg(any(windows, test))]
@@ -45,6 +49,8 @@ struct Settings {
 /// is open, so a second one is refused rather than stacked over it.
 pub struct VaultLocation {
     settings: Result<PathBuf, String>,
+    /// The tooling's own vault, opened while no choice is recorded.
+    default: Result<PathBuf, String>,
     choice: Mutex<Result<Option<PathBuf>, String>>,
     #[cfg(any(windows, test))]
     picking: AtomicBool,
@@ -62,11 +68,17 @@ impl Drop for PickerGuard<'_> {
 }
 
 /// What the WebView is shown. A path to display, not one it may send back.
+///
+/// `path` is absent, and `error` says why, when the location cannot be
+/// resolved — a setting that cannot be read, most often. The view is still
+/// served, so the window keeps the two ways out: choosing again, and going
+/// back to the default.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct VaultLocationView {
-    pub path: String,
+    pub path: Option<String>,
     pub is_default: bool,
     pub picker_available: bool,
+    pub error: Option<String>,
 }
 
 impl VaultLocation {
@@ -78,6 +90,7 @@ impl VaultLocation {
                 let message = format!("{error:#}");
                 Self {
                     settings: Err(message.clone()),
+                    default: default_vault(),
                     choice: Mutex::new(Err(message)),
                     #[cfg(any(windows, test))]
                     picking: AtomicBool::new(false),
@@ -88,9 +101,16 @@ impl VaultLocation {
 
     /// Reads the setting at `settings`.
     pub fn at(settings: PathBuf) -> Self {
+        Self::with_default(settings, default_vault())
+    }
+
+    /// Reads the setting at `settings`, with `default` as the vault opened
+    /// while no choice is recorded.
+    fn with_default(settings: PathBuf, default: Result<PathBuf, String>) -> Self {
         let choice = read(&settings);
         Self {
             settings: Ok(settings),
+            default,
             choice: Mutex::new(choice),
             #[cfg(any(windows, test))]
             picking: AtomicBool::new(false),
@@ -98,12 +118,26 @@ impl VaultLocation {
     }
 
     /// The vault every gesture opens.
+    ///
+    /// At the default location, its folder is created first, privately: on a
+    /// fresh machine nothing else does before the first vault, and the
+    /// creation would be refused for a folder the operator never chose. A
+    /// chosen folder is never created — an unplugged medium or a mistyped
+    /// choice must stay visible. A default folder that cannot be created is
+    /// left absent, and the vault's own check refuses it as
+    /// `LocationUnavailable` (fail closed).
     pub fn path(&self) -> Result<PathBuf, String> {
-        resolved(&self.held())
+        let choice = self.held();
+        let path = resolved(&choice, &self.default)?;
+        if matches!(choice, Ok(None)) {
+            create_default_folder(&path);
+        }
+        Ok(path)
     }
 
-    pub fn view(&self) -> Result<VaultLocationView, String> {
-        view_of(&self.held())
+    /// Where the vault is, or why that cannot be said, for the window.
+    pub fn view(&self) -> VaultLocationView {
+        view_of(&self.held(), &self.default)
     }
 
     /// Records `path` as the vault, once it is an absolute path to a file named
@@ -117,7 +151,7 @@ impl VaultLocation {
         let mut choice = self.lock();
         write(settings, &path)?;
         *choice = Ok(Some(path));
-        view_of(&choice)
+        Ok(view_of(&choice, &self.default))
     }
 
     /// Takes the place of the one dialog, or refuses when it is taken.
@@ -141,7 +175,7 @@ impl VaultLocation {
             }
         }
         *choice = Ok(None);
-        view_of(&choice)
+        Ok(view_of(&choice, &self.default))
     }
 
     fn held(&self) -> Result<Option<PathBuf>, String> {
@@ -154,21 +188,51 @@ impl VaultLocation {
     }
 }
 
-fn resolved(choice: &Result<Option<PathBuf>, String>) -> Result<PathBuf, String> {
+fn default_vault() -> Result<PathBuf, String> {
+    astra_operator::store::default_path().map_err(|error| format!("{error:#}"))
+}
+
+fn resolved(
+    choice: &Result<Option<PathBuf>, String>,
+    default: &Result<PathBuf, String>,
+) -> Result<PathBuf, String> {
     match choice {
         Ok(Some(path)) => Ok(path.clone()),
-        Ok(None) => astra_operator::store::default_path().map_err(|error| format!("{error:#}")),
+        Ok(None) => default.clone(),
         Err(error) => Err(error.clone()),
     }
 }
 
-fn view_of(choice: &Result<Option<PathBuf>, String>) -> Result<VaultLocationView, String> {
-    let path = resolved(choice)?;
-    Ok(VaultLocationView {
-        path: path.display().to_string(),
+/// Creates the folder of the default vault, private from creation, as the
+/// vault store creates the folder it writes in. A failure is only logged: the
+/// folder stays absent, which the creation check refuses.
+fn create_default_folder(vault_path: &Path) {
+    let Some(folder) = vault_path.parent() else {
+        return;
+    };
+    if let Err(error) = aether::private_file::create_private_dir(folder) {
+        tracing::warn!(
+            folder = %folder.display(),
+            %error,
+            "dossier du coffre par défaut impossible à créer"
+        );
+    }
+}
+
+fn view_of(
+    choice: &Result<Option<PathBuf>, String>,
+    default: &Result<PathBuf, String>,
+) -> VaultLocationView {
+    let (path, error) = match resolved(choice, default) {
+        Ok(path) => (Some(path.display().to_string()), None),
+        Err(error) => (None, Some(error)),
+    };
+    VaultLocationView {
+        path,
         is_default: matches!(choice, Ok(None)),
         picker_available: cfg!(windows),
-    })
+        error,
+    }
 }
 
 /// Absolute, so it does not follow the working directory; named as the
@@ -276,8 +340,8 @@ pub fn pick(owner: isize, current: &Path) -> Result<Option<PathBuf>, String> {
         CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED,
     };
     use windows_sys::Win32::UI::Controls::Dialogs::{
-        CommDlgExtendedError, GetSaveFileNameW, OFN_NOREADONLYRETURN, OFN_PATHMUSTEXIST,
-        OPENFILENAMEW,
+        CommDlgExtendedError, GetSaveFileNameW, OFN_NOCHANGEDIR, OFN_NOREADONLYRETURN,
+        OFN_PATHMUSTEXIST, OPENFILENAMEW,
     };
 
     /// Balances a successful `CoInitializeEx`, on every return below.
@@ -329,7 +393,11 @@ pub fn pick(owner: isize, current: &Path) -> Result<Option<PathBuf>, String> {
         lpstrInitialDir: directory.as_ptr(),
         lpstrTitle: title.as_ptr(),
         lpstrDefExt: extension.as_ptr(),
-        Flags: OFN_PATHMUSTEXIST | OFN_NOREADONLYRETURN,
+        // `OFN_NOCHANGEDIR`: without it the dialog leaves this process's
+        // working directory in the folder browsed, and a process whose
+        // working directory is on a removable medium holds that medium — the
+        // one the vault is often chosen on could then not be ejected.
+        Flags: OFN_PATHMUSTEXIST | OFN_NOREADONLYRETURN | OFN_NOCHANGEDIR,
         ..Default::default()
     };
     // SAFETY: `dialog` and the five buffers it points at are alive for the
