@@ -762,6 +762,65 @@ seconde pour le client (ou deux comptes). Le parcours est décrit dans
 - « Abandonner » une demande, puis importer son document signé : brouillon non
   connectable, plus aucune clé de cette demande sur le disque.
 
+**C. Lot 3 : coffre, clés et domaine**
+
+Rien de ce qui suit n'a été constaté sous Windows : la création, l'ajout, le
+retrait et la finalisation passent par WebAuthn, et le sélecteur de fichier est
+une boîte Windows ; tout cela est **non vérifié sous WSL2 et à jouer sur
+Windows**. Jouer le parcours sur un **coffre d'essai**, jamais sur le coffre du
+domaine réel : onglet *Astra*, « Coffre et clés », « Changer… », choisir un
+dossier vide. Le fichier choisi s'appelle obligatoirement `authority-vault.json`.
+Prévoir deux YubiKey, et une troisième si possible.
+
+14. Dans le dossier vide, aucun coffre : le panneau propose « Créer un domaine ».
+    Le nom de domaine (RP ID) est prérempli depuis le profil sélectionné s'il y en
+    a un, et l'origine suit (`https://` + le nom). Une origine tapée à la main
+    n'est plus réécrite. Renseigner le domaine d'essai, laisser « Clé principale »
+    et « Clé de récupération » comme libellés, puis « Créer le domaine ».
+15. **Compter les dialogues Windows : 4 attendus**, deux par clé, dans cet ordre.
+    Clé 1 : la création du credential (enregistrement), puis l'obtention de son
+    secret de key-slot (dérivation) ; clé 2 : les mêmes deux dialogues, après
+    avoir débranché la première comme Orion le demande. Un nombre différent est
+    une anomalie à consigner. Le coffre est écrit et le relais public à côté
+    (`astra-domain.json`) ; le panneau liste deux clés.
+16. « Ajouter une clé » (libellé, rôle) avec la troisième YubiKey : **3 dialogues**
+    attendus (une clé déjà enrôlée ouvre le coffre ; la nouvelle s'enregistre
+    puis dérive son secret). Sans troisième clé, ajouter une seconde fois une
+    des deux clés existantes doit être refusé. Le compteur « n sur 8 emplacements
+    utilisés » monte.
+17. « Renommer » une clé : le champ s'édite en place, Entrée enregistre, Échap
+    annule. Aucun toucher n'est demandé.
+18. « Marquer perdue » sur une clé : refusé tant que le relais ne nomme pas la
+    gateway (« La gateway n’est pas encore dans le relais. ») ; sinon un toucher,
+    la clé passe à « perdue » et le document de credentials est réémis. Puis
+    « Réactiver » : retour à l'état actif. Une clé « révoquée » s'affiche
+    « révoquée » et n'offre plus ce geste.
+19. « Retirer » : la confirmation rappelle que le retrait est définitif et
+    qu'une sauvegarde antérieure du coffre reste ouvrable par cette clé.
+    D'abord **présenter la clé visée** : refus « La clé qui a ouvert le coffre
+    est celle à retirer : recommencer avec une autre clé. », rien n'est écrit.
+    Recommencer avec une autre clé : le retrait réussit. Avec deux clés restantes,
+    « Retirer » est grisé (« Le coffre doit garder au moins deux clés. »).
+20. **Emplacement introuvable** : placer un coffre d'essai sur un support amovible,
+    le choisir par « Changer… », puis débrancher le support et rouvrir le
+    panneau. Attendu : « Emplacement introuvable », sans formulaire de création
+    (pas de second coffre créé par erreur) ; rebrancher rétablit l'état.
+21. **Finaliser** — seulement si une gateway d'essai est connectée au profil.
+    « Domaine » : « Reprendre la gateway connectée » enregistre son identité dans
+    le relais (une identité différente de celle déjà enregistrée est refusée) ;
+    « Modifier » complète les autres valeurs, avec la confirmation « Enregistrer
+    dans le relais » qui montre « avant → après ». Puis « Finaliser le domaine » :
+    un toucher, `CA-TLS` émise (`ca-tls.pem` à enregistrer) et document de
+    credentials écrit à côté du coffre. Un second « Finaliser le domaine » est
+    refusé (domaine déjà finalisé).
+22. **Retour** : « Emplacement par défaut » rend l'emplacement habituel
+    (`%APPDATA%\astra\`) ; le coffre d'essai reste intact dans son dossier.
+
+À vérifier aussi : un coffre existant à l'emplacement choisi refuse la création
+(« Un coffre existe déjà à cet emplacement… ») ; un nom de domaine dont le
+dernier label est numérique est refusé ; l'annulation du sélecteur de fichier ne
+change rien ; le sélecteur ne s'ouvre qu'une fois à la fois.
+
 ### Le chemin manuel
 
 Dans un autre terminal, générer deux identités de test :

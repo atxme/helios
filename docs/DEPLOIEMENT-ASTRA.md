@@ -7,11 +7,37 @@ qui le suit.
 
 ## Amorçage en deux passages
 
+Les gestes du coffre et du domaine se jouent **dans Orion**, onglet *Astra*
+(le lot 3 de F14, livré sur la branche `feat/f14-lot3-coffre-domaine`, validation
+Windows à faire). `astra-signer` reste livré comme voie transitoire, jusqu'au
+lot 7 ; `issue-gateway-bootstrap` n'est pas encore dans Orion et reste en ligne
+de commande jusqu'au lot 6.
+
+1. Orion, « Coffre et clés » : « Créer un domaine ». Nom du domaine (RP ID) et
+   origine, libellés des deux clés, « Créer le domaine » : deux YubiKey, branchées
+   une à la fois (quatre dialogues Windows en tout). Ce nom ne se change plus :
+   prendre le nom Tailscale de la gateway si elle est dans un tailnet.
+2. `./scripts/deploy.sh` : le premier passage rapatrie la demande publique.
+3. Orion, « Domaine » : « Reprendre la gateway connectée » inscrit son identité
+   dans le relais (ou « Modifier » pour saisir clé WireGuard, nom de service, clé
+   de service Astra, époque et origine d'Astra), puis « Finaliser le domaine » :
+   un toucher, qui émet la `CA-TLS` (à enregistrer : `ca-tls.pem`) et écrit le
+   document de credentials à côté du coffre.
+4. `issue-gateway-bootstrap`, toujours en ligne de commande (lot 6) :
+
+```sh
+astra-signer issue-gateway-bootstrap \
+  --request ~/.helios/astra/gateway-bootstrap-request.json \
+  --out ~/.helios/astra/gateway-bootstrap-certificate.json
+./scripts/deploy.sh --astra
+```
+
+Voie transitoire, équivalente aux étapes 1 à 3 tant que `astra-signer` est livré :
+
 ```sh
 astra-signer init --rp-id <gateway>.<tailnet>.ts.net --label "YubiKey du bureau"
 astra-signer enrol --label "YubiKey de récupération"
 ./scripts/deploy.sh
-# Le premier passage rapatrie la demande publique et indique exactement :
 astra-signer issue-gateway-bootstrap \
   --request ~/.helios/astra/gateway-bootstrap-request.json \
   --out ~/.helios/astra/gateway-bootstrap-certificate.json
@@ -21,21 +47,23 @@ astra-signer issue-ca-tls
 ./scripts/deploy.sh --astra
 ```
 
-C'est tout. Chaque geste `astra-signer` exige les clés de sécurité et ne peut
+C'est tout. Chaque geste à clé exige les clés de sécurité et ne peut
 pas être automatisé — c'est le but des objets physiques. Le premier
 passage du déploiement installe la gateway, puis rapatrie la demande publique
 créée et signée par sa clé ML-DSA-87 scellée. Il s'arrête **avant** de créer un
 registre Astra. La cérémonie hors ligne émet la leaf sous `CA-PQ` ; la reprise
 la reporte sur la gateway, amorce Astra et le registre gateway, puis redémarre.
 
-`issue-ca-tls` vient **après** `issue-gateway-bootstrap` et non avant : l'ancre
+La `CA-TLS` vient **après** l'identité de la gateway et non avant : l'ancre
 TLS cliente est émise sous la politique d'émission du domaine, qui nomme la
 gateway. La cérémonie d'amorçage est ce qui apprend cette identité, depuis une
 demande que la gateway a signée, et l'inscrit dans le relais — un domaine sert
 une gateway et une seule, donc une demande qui en nommerait une autre arrête la
-cérémonie au lieu de l'adopter.
+cérémonie au lieu de l'adopter. Dans Orion, l'identité déjà enregistrée ne se
+change pas (c'est une transition de gateway, lot 6), et « Reprendre la gateway
+connectée » refuse celle d'une autre gateway que le profil connecté.
 
-Aucune valeur n'est recopiée à la main. `init` écrit un **relais** public à côté
+Aucune valeur n'est recopiée à la main. La création du domaine (Orion, ou `init`) écrit un **relais** public à côté
 du coffre (`~/.helios/astra/astra-domain.json`, `%APPDATA%\astra\` sous Windows) :
 domaine, RP ID, ancre `CA-PQ`. Les cérémonies suivantes y ajoutent ce qu'elles
 apprennent — identité de la gateway, ancre `CA-TLS` et son époque.
@@ -265,17 +293,24 @@ n'oblige pas Orion à ouvrir une connexion HTTPS directe vers Astra.
 
 ## Le détail, si quelque chose casse
 
-### `astra-signer init`
+### Créer le domaine : « Créer un domaine » dans Orion, ou `astra-signer init`
 
-Génère `CA-PQ` (ML-DSA-87) et `CA-TLS`, les scelle sous un key-slot ouvert par
+Orion fait ce que fait `init`, voie transitoire jusqu'au lot 7. Génère `CA-PQ` (ML-DSA-87) et `CA-TLS`, les scelle sous un key-slot ouvert par
 la clé branchée, écrit le coffre et le relais.
 
 Le coffre est à `~/.helios/astra/authority-vault.json`, et sous Windows à
-`%APPDATA%\astra\authority-vault.json`. **Sauvegardez-le.** Le perdre entièrement, c'est perdre le domaine ;
+`%APPDATA%\astra\authority-vault.json`. Orion peut le ranger ailleurs
+(« Changer… » dans « Coffre et clés » ; le fichier choisi s'appelle
+obligatoirement `authority-vault.json`, pour que relais et document de
+credentials, rangés à côté, n'appartiennent qu'à un domaine), puis « Emplacement
+par défaut » revient à l'emplacement habituel. Si le support est débranché,
+Orion affiche « Emplacement introuvable » au lieu de proposer un second domaine.
+**Sauvegardez-le.** Le perdre entièrement, c'est perdre le domaine ;
 il est déjà chiffré, donc une copie hors ligne ne coûte rien.
 
-Le relais, à côté, ne contient que du public. `astra-signer domain` le réécrit
-depuis le coffre, sans clé de sécurité.
+Le relais, à côté, ne contient que du public. Orion (« Domaine », « Modifier »)
+ou `astra-signer domain` l'écrit sans clé de sécurité ; la clé WireGuard et le
+nom de service de la gateway ne se remplissent que s'ils sont vides.
 
 Une valeur à y enregistrer une fois pour toutes : l'origine que le domaine
 déclare.
@@ -290,7 +325,10 @@ composée jouait ce rôle ; dans le tunnel aucune URL n'est composée, donc une
 campagne portée par le tunnel s'arrête tant que cette valeur manque — en
 nommant cette commande.
 
-Quand la seconde clé est en main :
+Quand la seconde clé est en main, Orion propose « Ajouter une clé » (libellé,
+rôle), « Renommer », « Marquer perdue » / « Réactiver » et « Retirer ». Le
+retrait refuse la clé qui vient d'ouvrir le coffre (en présenter une autre) et
+le coffre garde au moins deux clés. Équivalent en ligne de commande :
 
 ```sh
 astra-signer enrol --label "YubiKey de récupération"
@@ -476,6 +514,16 @@ Astra n'approuve rien sans liste d'autorisation. `astra-signer bindings` émet
 le document signé par `CA-PQ` — et le réémet tout seul à chaque geste qui
 déplace la table de key-slots. L'étape 7 le recopie dans le volume d'Astra,
 depuis `~/.helios/astra/astra-credentials.json`, à côté du coffre.
+
+Orion le réémet à chaque geste qui déplace la table de key-slots (ajout,
+retrait, perdue / réactivée) et l'écrit lors de « Finaliser le domaine ».
+Si le relais ne nomme pas encore la gateway, ou si le document en place ne se
+vérifie pas (altéré, ou signé par une autre ancre), l'ajout et le retrait sont
+refusés avant tout toucher : « Le relais ne nomme pas encore la gateway, ou le
+document de credentials en place ne se vérifie pas : reprendre la gateway
+connectée, ou restaurer le document de credentials depuis une sauvegarde. »
+Il n'existe aucun chemin dans Orion pour réparer un document illisible :
+restaurer `astra-credentials.json` depuis une sauvegarde, à côté du coffre.
 
 Il ne porte rien de secret : ce sont les liaisons publiques des credentials,
 et c'est le **consommateur** qui les vérifie sous son ancre — Orion sous le

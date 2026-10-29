@@ -243,3 +243,39 @@ ci-dessus là où elles diffèrent.
   `authority-vault.json`, pour que relais et document de credentials, rangés à
   côté, n'appartiennent qu'à un domaine. Un réglage d'emplacement illisible est
   une erreur affichée, jamais un retour silencieux à l'emplacement par défaut.
+
+## 10. Amendements (écarts pris pendant l'exécution)
+
+Ils priment sur les sections ci-dessus là où elles diffèrent.
+
+1. **Pas de `CaTlsAlreadyIssued`** : sept nouveaux refus et non huit
+   (`VaultExists`, `LocationUnavailable`, `VaultFull`, `MinimumKeys`,
+   `KeyBeingRemoved`, `GatewayIdentityMissing`, `DomainComplete`). Aucun geste ne
+   peut le produire : la finalisation traite une `CA-TLS` existante comme « rien à
+   émettre », et `DomainComplete` couvre le tout-fait.
+2. **`resign` échoue fermé** : si un document de credentials existe alors que
+   l'identité du relais est absente ou illisible, refus `GatewayIdentityMissing`
+   (ajout et retrait refusés jusqu'à réparation du relais ou restauration du
+   document). `check_document` est vérifié **avant** le toucher. La phrase du
+   refus couvre aussi le document qui ne se vérifie pas.
+3. **Retrait** refusé avec la clé qu'on retire (`KeyBeingRemoved`) ; plancher de
+   deux clés (`MinimumKeys`).
+4. **Clé WireGuard et nom de service de la gateway** : remplissage seul dans
+   `write_relay`, affichés en lecture seule dans le formulaire du domaine ; la
+   reprise de la gateway est liée à la `peer_public_key` du profil connecté.
+5. **Écritures sans clé** (renommer, écrire le relais, reprendre la gateway)
+   refusées tant qu'une cérémonie opérateur est ouverte.
+6. **`refusal_of`** : `KeyDeclined` seulement pour une erreur d'authentificateur,
+   `Internal` sinon, pour ne pas inviter à réessayer après un échec survenu une
+   fois l'écriture faite.
+7. **RP ID** refusé si son dernier label est numérique ; origine normalisée.
+8. **`DomainView`** porte les champs publics `astra_service_public_key`,
+   `astra_service_key_epoch` et `astra_authority_url`, pour que la confirmation
+   d'écrasement montre « avant → après » ; l'époque doit être un entier sûr.
+9. **`SlotView.state`** peut valoir `revoked`, affiché « révoquée ».
+10. **Sélecteur Windows** : fil dédié avec son propre appartement COM STA,
+    `lpstrDefExt` « json », nom comparé sans casse, un seul sélecteur à la fois.
+    `cfg(windows)` n'est pas vérifiable sous WSL2 : à constater en recette.
+11. **Écart connu laissé au lot 5** : l'écran de rotation de la `CA-TLS` prend
+    encore un chemin de coffre tapé dans la WebView et ignore l'emplacement
+    choisi ; le lot 5 remplace ce chemin.
