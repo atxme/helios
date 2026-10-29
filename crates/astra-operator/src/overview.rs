@@ -63,6 +63,9 @@ pub struct DomainView {
     pub ca_tls_present: bool,
     pub server_name: Option<String>,
     pub gateway_wg_public_key: Option<String>,
+    pub astra_service_public_key: Option<String>,
+    pub astra_service_key_epoch: Option<u64>,
+    pub astra_authority_url: Option<String>,
 }
 
 /// Reads the vault at `vault_path` and the domain relay beside it.
@@ -152,6 +155,9 @@ fn domain_view(vault_path: &Path, vault: &AuthorityVault) -> Result<Option<Domai
         ca_tls_present: relay.ca_tls_certificate.is_some(),
         server_name: relay.server_name,
         gateway_wg_public_key: relay.gateway_wg_public_key,
+        astra_service_public_key: relay.astra_service_public_key,
+        astra_service_key_epoch: relay.astra_service_key_epoch,
+        astra_authority_url: relay.astra_authority_url,
     }))
 }
 

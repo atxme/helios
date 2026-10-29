@@ -31,6 +31,9 @@ const domain = {
   ca_tls_present: true,
   server_name: 'gw.example' as string | null,
   gateway_wg_public_key: 'wgkey=' as string | null,
+  astra_service_public_key: null as string | null,
+  astra_service_key_epoch: null as number | null,
+  astra_authority_url: null as string | null,
 }
 const withDomain = (over: Partial<typeof domain>, credentials_complete = true) => ({
   ...base,
@@ -62,6 +65,9 @@ describe('DomainPanel', () => {
         ca_tls_present: true,
         server_name: 'gw.example',
         gateway_wg_public_key: 'wgkey=',
+        astra_service_public_key: null,
+        astra_service_key_epoch: null,
+        astra_authority_url: null,
       },
     })
     render(<DomainPanel onCeremony={onCeremony} />)
@@ -90,7 +96,7 @@ describe('DomainPanel', () => {
     fireEvent.change(screen.getByLabelText('Époque de la clé de service'), { target: { value: '4' } })
     fireEvent.click(screen.getByRole('button', { name: 'Enregistrer' }))
     // Not yet recorded: the confirmation lists what will be written.
-    expect(await screen.findByText(/Époque de la clé de service/, { selector: 'li' })).toBeTruthy()
+    expect(await screen.findByText('Époque de la clé de service : 4')).toBeTruthy()
     expect(api.writeDomainRelay).not.toHaveBeenCalled()
     fireEvent.click(screen.getByRole('button', { name: 'Confirmer' }))
     await waitFor(() =>
@@ -99,6 +105,41 @@ describe('DomainPanel', () => {
         astra_service_key_epoch: 4,
       }),
     )
+  })
+
+  it('an_overwrite_shows_the_old_and_new_values_and_waits_for_confirmation', async () => {
+    api.operatorOverview.mockResolvedValue(
+      withDomain({
+        astra_service_public_key: 'oldkey=',
+        astra_authority_url: 'https://old.example',
+      }),
+    )
+    render(<DomainPanel onCeremony={onCeremony} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Modifier' }))
+    fireEvent.change(screen.getByLabelText('Clé de service Astra'), { target: { value: 'newkey=' } })
+    fireEvent.change(screen.getByLabelText('Origine d’Astra'), { target: { value: 'https://new.example' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Enregistrer' }))
+    expect(await screen.findByText('Clé de service Astra : oldkey= → newkey=')).toBeTruthy()
+    expect(screen.getByText('Origine d’Astra : https://old.example → https://new.example')).toBeTruthy()
+    expect(api.writeDomainRelay).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('button', { name: 'Confirmer' }))
+    await waitFor(() =>
+      expect(api.writeDomainRelay).toHaveBeenCalledWith({
+        astra_service_public_key: 'newkey=',
+        astra_authority_url: 'https://new.example',
+      }),
+    )
+  })
+
+  it('refuses_an_epoch_beyond_the_safe_integers', async () => {
+    api.operatorOverview.mockResolvedValue(withDomain({}))
+    render(<DomainPanel onCeremony={onCeremony} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Modifier' }))
+    fireEvent.change(screen.getByLabelText('Époque de la clé de service'), {
+      target: { value: '99999999999999999999' },
+    })
+    expect(screen.getByText('Un entier positif.')).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Enregistrer' }).hasAttribute('disabled')).toBe(true)
   })
 
   it('a_recorded_gateway_identity_is_read_only_in_the_form', async () => {

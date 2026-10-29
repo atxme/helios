@@ -1056,6 +1056,9 @@ export interface DomainView {
   ca_tls_present: boolean
   server_name: string | null
   gateway_wg_public_key: string | null
+  astra_service_public_key: string | null
+  astra_service_key_epoch: number | null
+  astra_authority_url: string | null
 }
 
 export interface VaultOverview {

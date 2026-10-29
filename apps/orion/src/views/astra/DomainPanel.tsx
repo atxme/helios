@@ -29,6 +29,10 @@ interface FormValues {
 }
 const EMPTY_FORM: FormValues = { gatewayKey: '', serverName: '', serviceKey: '', epoch: '', origin: '' }
 
+/** « Libellé : avant → après » over a recorded value, « Libellé : après » for a first fill. */
+const line = (label: string, before: string | number | null, after: string) =>
+  before === null ? `${label} : ${after}` : `${label} : ${before} → ${after}`
+
 /**
  * The values the operator changed. The gateway key and the server name only
  * fill an empty relay (changing them is a gateway transition), so the form
@@ -40,27 +44,27 @@ function changes(form: FormValues, domain: DomainView): { update: RelayUpdate; l
   const gatewayKey = form.gatewayKey.trim()
   if (!domain.gateway_wg_public_key && gatewayKey) {
     update.gateway_wg_public_key = gatewayKey
-    lines.push(`Clé WireGuard de la gateway → ${gatewayKey}`)
+    lines.push(line('Clé WireGuard de la gateway', null, gatewayKey))
   }
   const serverName = form.serverName.trim()
   if (!domain.server_name && serverName) {
     update.server_name = serverName
-    lines.push(`Nom de service → ${serverName}`)
+    lines.push(line('Nom de service', null, serverName))
   }
   const serviceKey = form.serviceKey.trim()
-  if (serviceKey) {
+  if (serviceKey && serviceKey !== domain.astra_service_public_key) {
     update.astra_service_public_key = serviceKey
-    lines.push(`Clé de service Astra → ${serviceKey}`)
+    lines.push(line('Clé de service Astra', domain.astra_service_public_key, serviceKey))
   }
   const epoch = form.epoch.trim()
-  if (epoch) {
+  if (epoch && Number(epoch) !== domain.astra_service_key_epoch) {
     update.astra_service_key_epoch = Number(epoch)
-    lines.push(`Époque de la clé de service → ${epoch}`)
+    lines.push(line('Époque de la clé de service', domain.astra_service_key_epoch, epoch))
   }
   const origin = form.origin.trim()
-  if (origin) {
+  if (origin && origin !== domain.astra_authority_url) {
     update.astra_authority_url = origin
-    lines.push(`Origine d’Astra → ${origin}`)
+    lines.push(line('Origine d’Astra', domain.astra_authority_url, origin))
   }
   return { update, lines }
 }
@@ -153,7 +157,10 @@ export function DomainPanel({ onCeremony }: { onCeremony: (status: OperatorStatu
   const gatewayKnown = Boolean(domain.server_name && domain.gateway_wg_public_key)
   const needsFinalizing = !domain.ca_tls_present || !overview.credentials_complete
   const pendingChange = changes(form, domain)
-  const epochInvalid = form.epoch.trim() !== '' && !/^\d+$/.test(form.epoch.trim())
+  const epochInvalid =
+    form.epoch.trim() !== '' &&
+    (!/^\d+$/.test(form.epoch.trim()) ||
+    !Number.isSafeInteger(Number(form.epoch.trim())))
   return (
     <Paper variant="outlined" sx={{ p: 1.75 }}>
       <Typography component="h3" sx={{ fontSize: 12.5, fontWeight: 700, mb: 1.25 }}>
@@ -235,7 +242,7 @@ export function DomainPanel({ onCeremony }: { onCeremony: (status: OperatorStatu
             label="Époque de la clé de service"
             value={form.epoch}
             error={epochInvalid}
-            helperText={epochInvalid ? 'Un nombre entier.' : undefined}
+            helperText={epochInvalid ? 'Un entier positif.' : undefined}
             onChange={(event) => setField('epoch')(event.target.value)}
             sx={fieldSx}
           />

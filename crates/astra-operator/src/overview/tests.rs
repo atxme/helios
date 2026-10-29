@@ -111,6 +111,9 @@ fn the_domain_comes_from_the_relay_beside_the_vault() {
     relay.ca_tls_certificate = Some("Y2VydA==".into());
     relay.server_name = Some("gw.example".into());
     relay.gateway_wg_public_key = Some("d2c=".into());
+    relay.astra_service_public_key = Some("svc=".into());
+    relay.astra_service_key_epoch = Some(7);
+    relay.astra_authority_url = Some("https://astra.example".into());
     handoff::save(&handoff::path_beside(&path), &relay).expect("save relay");
 
     let domain = read(&path).expect("read").domain.expect("domain");
@@ -121,6 +124,12 @@ fn the_domain_comes_from_the_relay_beside_the_vault() {
     assert!(domain.ca_tls_present);
     assert_eq!(domain.server_name.as_deref(), Some("gw.example"));
     assert_eq!(domain.gateway_wg_public_key.as_deref(), Some("d2c="));
+    assert_eq!(domain.astra_service_public_key.as_deref(), Some("svc="));
+    assert_eq!(domain.astra_service_key_epoch, Some(7));
+    assert_eq!(
+        domain.astra_authority_url.as_deref(),
+        Some("https://astra.example")
+    );
     let ungrouped = domain.ca_pq_fingerprint.replace(' ', "");
     assert_eq!(ungrouped.len(), 64);
     assert_eq!(domain.ca_pq_fingerprint, grouped_hex(&ungrouped));

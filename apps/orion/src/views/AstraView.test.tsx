@@ -212,6 +212,9 @@ describe('AstraView', () => {
         ca_tls_present: false,
         server_name: 'gw',
         gateway_wg_public_key: 'KEY',
+        astra_service_public_key: null,
+        astra_service_key_epoch: null,
+        astra_authority_url: null,
       },
     })
     api.beginVaultCeremony.mockResolvedValue({
