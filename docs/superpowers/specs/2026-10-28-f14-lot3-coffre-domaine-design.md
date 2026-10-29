@@ -253,10 +253,11 @@ Ils priment sur les sections ci-dessus là où elles diffèrent.
    `KeyBeingRemoved`, `GatewayIdentityMissing`, `DomainComplete`). Aucun geste ne
    peut le produire : la finalisation traite une `CA-TLS` existante comme « rien à
    émettre », et `DomainComplete` couvre le tout-fait.
-2. **`resign` échoue fermé** : si un document de credentials existe alors que
-   l'identité du relais est absente ou illisible, refus `GatewayIdentityMissing`
-   (ajout et retrait refusés jusqu'à réparation du relais ou restauration du
-   document). `check_document` est vérifié **avant** le toucher. La phrase du
+2. **`resign` échoue fermé** : si l'identité du relais est absente ou illisible
+   alors qu'un document de credentials existe, refus `GatewayIdentityMissing`
+   (ajout, retrait et marquage refusés jusqu'à réparation du relais ou
+   restauration du document). Sans document, ajout et retrait passent ; le
+   marquage exige toujours que le relais nomme la gateway. `check_document` est vérifié **avant** le toucher. La phrase du
    refus couvre aussi le document qui ne se vérifie pas.
 3. **Retrait** refusé avec la clé qu'on retire (`KeyBeingRemoved`) ; plancher de
    deux clés (`MinimumKeys`).

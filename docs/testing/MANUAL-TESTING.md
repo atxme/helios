@@ -780,7 +780,8 @@ Prévoir deux YubiKey, et une troisième si possible.
 15. **Compter les dialogues Windows : 4 attendus**, deux par clé, dans cet ordre.
     Clé 1 : la création du credential (enregistrement), puis l'obtention de son
     secret de key-slot (dérivation) ; clé 2 : les mêmes deux dialogues, après
-    avoir débranché la première comme Orion le demande. Un nombre différent est
+    avoir débranché la première : Orion affiche alors « Débrancher la clé précédente.
+    Brancher la nouvelle clé (2 sur 2), pour l’enregistrer dans le coffre. » Un nombre différent est
     une anomalie à consigner. Le coffre est écrit et le relais public à côté
     (`astra-domain.json`) ; le panneau liste deux clés.
 16. « Ajouter une clé » (libellé, rôle) avec la troisième YubiKey : **3 dialogues**
@@ -808,11 +809,12 @@ Prévoir deux YubiKey, et une troisième si possible.
 21. **Finaliser** — seulement si une gateway d'essai est connectée au profil.
     « Domaine » : « Reprendre la gateway connectée » enregistre son identité dans
     le relais (une identité différente de celle déjà enregistrée est refusée) ;
-    « Modifier » complète les autres valeurs, avec la confirmation « Enregistrer
-    dans le relais » qui montre « avant → après ». Puis « Finaliser le domaine » :
+    « Modifier » complète les autres valeurs ; « Enregistrer » ouvre la
+    confirmation « Enregistrer dans le relais », qui montre « avant → après »
+    (« Confirmer » écrit, « Annuler » abandonne). Puis « Finaliser le domaine » :
     un toucher, `CA-TLS` émise (`ca-tls.pem` à enregistrer) et document de
-    credentials écrit à côté du coffre. Un second « Finaliser le domaine » est
-    refusé (domaine déjà finalisé).
+    credentials écrit à côté du coffre. Une fois le domaine complet (`CA-TLS` et
+    credentials en place), le bouton « Finaliser le domaine » disparaît.
 22. **Retour** : « Emplacement par défaut » rend l'emplacement habituel
     (`%APPDATA%\astra\`) ; le coffre d'essai reste intact dans son dossier.
 

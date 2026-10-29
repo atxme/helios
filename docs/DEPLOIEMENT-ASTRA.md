@@ -517,9 +517,12 @@ depuis `~/.helios/astra/astra-credentials.json`, à côté du coffre.
 
 Orion le réémet à chaque geste qui déplace la table de key-slots (ajout,
 retrait, perdue / réactivée) et l'écrit lors de « Finaliser le domaine ».
-Si le relais ne nomme pas encore la gateway, ou si le document en place ne se
-vérifie pas (altéré, ou signé par une autre ancre), l'ajout et le retrait sont
-refusés avant tout toucher : « Le relais ne nomme pas encore la gateway, ou le
+« Marquer perdue » et « Réactiver » exigent que le relais nomme la gateway
+(sinon il n'y a aucun document à signer). Sur un coffre sans document, l'ajout
+et le retrait passent. Mais lorsqu'un document est déjà en place et que le
+relais ne nomme plus la gateway, ou que ce document ne se vérifie pas (altéré,
+ou signé par une autre ancre), l'ajout, le retrait et le marquage sont refusés
+avant tout toucher : « Le relais ne nomme pas encore la gateway, ou le
 document de credentials en place ne se vérifie pas : reprendre la gateway
 connectée, ou restaurer le document de credentials depuis une sauvegarde. »
 Il n'existe aucun chemin dans Orion pour réparer un document illisible :
