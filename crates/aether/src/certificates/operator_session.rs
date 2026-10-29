@@ -733,7 +733,7 @@ mod tests {
             ),
             (
                 AstraManifest::KeyAddition(KeyAdditionManifest {
-                    vault_fingerprint: fp.clone(),
+                    vault_fingerprint: fp,
                     label: "c".into(),
                     role: "recuperation".into(),
                 }),
@@ -741,7 +741,7 @@ mod tests {
             ),
             (
                 AstraManifest::KeyRemoval(KeyRemovalManifest {
-                    vault_fingerprint: fp.clone(),
+                    vault_fingerprint: fp,
                     slot_id: "00".repeat(16),
                     label: "c".into(),
                     role: "principale".into(),
@@ -750,7 +750,7 @@ mod tests {
             ),
             (
                 AstraManifest::KeyMarking(KeyMarkingManifest {
-                    vault_fingerprint: fp.clone(),
+                    vault_fingerprint: fp,
                     slot_id: "00".repeat(16),
                     label: "c".into(),
                     lost: true,
