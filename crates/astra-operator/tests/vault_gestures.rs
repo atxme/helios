@@ -20,9 +20,10 @@ use astra_operator::authenticator::Opened;
 use astra_operator::gestures::{NewAuthority, NewKey};
 use astra_operator::vault::{SlotRole, MAX_SLOTS};
 use astra_operator::vault_gestures::{
-    add_key_with, adopt_gateway, check_addition, check_creation, check_document, check_marking,
-    check_removal, create_first_key, finalization, finalize_with, mark_key_with, prove_opens,
-    remove_key_with, rename_key, write_relay, RelayUpdate, SetupRefusal,
+    add_key_with, adopt_gateway, authority_origin, check_addition, check_creation, check_document,
+    check_marking, check_removal, create_first_key, finalization, finalize_with, mark_key_with,
+    open_for_removal, prove_opens, remove_key_with, rename_key, write_relay, RelayUpdate,
+    SetupRefusal,
 };
 use astra_operator::{credentials, handoff, overview, signing, store};
 use support::{FakeKey, PIN, RP_ID};
@@ -324,6 +325,14 @@ fn the_opening_key_cannot_remove_itself() {
     );
 }
 
+/// The document is written first: a vault save that fails after it leaves the
+/// credential revoked while the old vault still holds it (fail closed), never
+/// an absent slot still marked active.
+///
+/// The save is made to fail by putting a symbolic link where the vault is:
+/// the vault still reads through it, and the private writer refuses to
+/// replace a link. Unix only, where a test may create one.
+#[cfg(unix)]
 #[test]
 fn removal_writes_the_document_before_the_vault() {
     let directory = tempfile::tempdir().expect("tempdir");
@@ -341,6 +350,32 @@ fn removal_writes_the_document_before_the_vault() {
         .credential_id()
         .expect("credential");
 
+    let held = directory.path().join("held-vault.json");
+    std::fs::rename(&path, &held).expect("vault moved aside");
+    std::os::unix::fs::symlink(&held, &path).expect("link in the vault's place");
+    let vault_bytes = std::fs::read(&held).expect("vault bytes");
+
+    remove_key_with(&path, &first, &slot3, NOW).expect_err("the vault cannot be saved");
+
+    assert_eq!(
+        std::fs::read(&held).expect("vault bytes"),
+        vault_bytes,
+        "the vault is unchanged"
+    );
+    assert_eq!(store::load(&path).expect("vault").slots.len(), 3);
+    assert_eq!(
+        document(&path)
+            .binding(&removed_credential)
+            .expect("the withdrawn credential has a row")
+            .state,
+        CredentialState::Revoked,
+        "the revocation was signed before the vault was written"
+    );
+
+    // Once the vault can be written, the removal completes over the document
+    // it left.
+    std::fs::remove_file(&path).expect("link removed");
+    std::fs::rename(&held, &path).expect("vault back in place");
     remove_key_with(&path, &first, &slot3, NOW).expect("the third key goes");
 
     assert_eq!(
@@ -359,6 +394,46 @@ fn removal_writes_the_document_before_the_vault() {
         CredentialState::Revoked
     );
     assert_eq!(registry.bindings.len(), 3);
+}
+
+/// The key being withdrawn is left out of the opening's allow-list: it is not
+/// asked for a touch the removal would refuse, and another key opens.
+#[test]
+fn the_removal_opening_never_asks_the_key_being_removed() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = vault_path(&directory);
+    let (key1, key2, key3) = (FakeKey::new(1), FakeKey::new(2), FakeKey::new(3));
+    let first = create(&path, &key1);
+    let (slot2, _) = add(&path, &first, &key2, "YubiKey du sac");
+    let (slot3, _) = add(&path, &first, &key3, "YubiKey du coffre-fort");
+    let vault = store::load(&path).expect("vault");
+    let asked_before = key3.assertions();
+
+    assert!(open_for_removal(&key3, &vault, &slot3, PIN).is_err());
+    assert_eq!(
+        key3.assertions(),
+        asked_before,
+        "the removed key answered nothing"
+    );
+
+    let opened = open_for_removal(&key2, &vault, &slot3, PIN).expect("another key opens");
+    let slot3_credential = vault
+        .slot(&slot3)
+        .expect("slot")
+        .credential_id()
+        .expect("credential");
+    assert_ne!(opened.credential_id, slot3_credential);
+    assert_eq!(
+        vault
+            .slot_for_credential(&opened.credential_id)
+            .expect("an enrolled key")
+            .slot_id,
+        slot2
+    );
+    assert_eq!(
+        refusal(open_for_removal(&key2, &vault, &[0xFF; 16], PIN)),
+        Some(SetupRefusal::UnknownSlot)
+    );
 }
 
 #[test]
@@ -420,6 +495,53 @@ fn marking_needs_the_gateway_and_moves_the_state() {
     assert_eq!(state_of(&path, &slot2), CredentialState::Active);
     assert!(found_epoch > lost_epoch);
     assert_eq!(key1.assertions(), 1);
+}
+
+/// A key the document already revokes — a removal stopped after its
+/// document — is not marked lost or active again: that would take back a
+/// signed revocation.
+#[test]
+fn a_revoked_key_is_not_marked_again() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = vault_path(&directory);
+    let (key1, key2, key3) = (FakeKey::new(1), FakeKey::new(2), FakeKey::new(3));
+    let first = create(&path, &key1);
+    add(&path, &first, &key2, "YubiKey du sac");
+    let (slot3, _) = add(&path, &first, &key3, "YubiKey perdue");
+    complete_relay(&path);
+    let vault = store::load(&path).expect("vault");
+    let revoked = vault
+        .slot(&slot3)
+        .expect("slot")
+        .credential_id()
+        .expect("credential");
+    let identity = handoff::identity_of(&relay(&path)).expect("the relay names the gateway");
+    let registry = signing::sign_credential_bindings(
+        &vault,
+        &first,
+        &identity,
+        None,
+        &[(revoked, CredentialState::Revoked)],
+        NOW,
+    )
+    .expect("document signed");
+    credentials::save(&credentials::path_beside(&path), &registry).expect("document saved");
+    let document_bytes = std::fs::read(credentials::path_beside(&path)).expect("document bytes");
+
+    assert_eq!(
+        check_marking(&path, &vault, &slot3).err(),
+        Some(SetupRefusal::KeyRevoked)
+    );
+    for lost in [true, false] {
+        assert_eq!(
+            refusal(mark_key_with(&path, &first, &slot3, lost, NOW)),
+            Some(SetupRefusal::KeyRevoked)
+        );
+    }
+    assert_eq!(
+        std::fs::read(credentials::path_beside(&path)).expect("document bytes"),
+        document_bytes
+    );
 }
 
 #[test]
@@ -727,6 +849,117 @@ fn adopting_takes_the_gateway_the_domain_signed() {
         std::fs::read(&relay_path).expect("relay bytes"),
         adopted_bytes
     );
+}
+
+/// A relay that lost the gateway still belongs to the gateway its document
+/// is bound to: neither adoption nor a typed key moves it to another.
+#[test]
+fn a_document_bound_to_another_gateway_keeps_the_domain() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = vault_path(&directory);
+    let (key1, key2) = (FakeKey::new(1), FakeKey::new(2));
+    let first = domain_with_gateway(&path, &key1, &key2);
+    emit_document(&path, &first);
+    clear_gateway(&path);
+    let relay_path = handoff::path_beside(&path);
+    let before = std::fs::read(&relay_path).expect("relay bytes");
+    let other = WireGuardKey::from_bytes([0x22; 32]);
+
+    let error = adopt_gateway(&path, &domain_leaf(&path, &first, SERVER_NAME, other), NOW)
+        .expect_err("the document names another gateway");
+    assert!(
+        error.to_string().contains("transition de gateway"),
+        "{error}"
+    );
+    let error = write_relay(
+        &path,
+        &RelayUpdate {
+            gateway_wg_public_key: Some(other.to_base64()),
+            ..RelayUpdate::default()
+        },
+    )
+    .expect_err("the document names another gateway");
+    assert!(
+        error.to_string().contains("transition de gateway"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read(&relay_path).expect("relay bytes"), before);
+
+    let bound = WireGuardKey::from_bytes([0x11; 32]);
+    let written = write_relay(
+        &path,
+        &RelayUpdate {
+            gateway_wg_public_key: Some(bound.to_base64()),
+            ..RelayUpdate::default()
+        },
+    )
+    .expect("the gateway the document is bound to");
+    assert_eq!(
+        written.gateway_wg_public_key.as_deref(),
+        Some(bound.to_base64().as_str())
+    );
+}
+
+/// The same WireGuard key under another server name is another gateway too.
+#[test]
+fn adopting_refuses_the_same_key_under_another_name() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = vault_path(&directory);
+    let (key1, key2) = (FakeKey::new(1), FakeKey::new(2));
+    let first = domain_with_gateway(&path, &key1, &key2);
+    let relay_path = handoff::path_beside(&path);
+    let before = std::fs::read(&relay_path).expect("relay bytes");
+
+    let renamed = domain_leaf(
+        &path,
+        &first,
+        "other.helios.test",
+        WireGuardKey::from_bytes([0x11; 32]),
+    );
+    let error = adopt_gateway(&path, &renamed, NOW).expect_err("another server name");
+    assert!(
+        error.to_string().contains("transition de gateway"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read(&relay_path).expect("relay bytes"), before);
+}
+
+/// The relay records an origin: a host and its port, nothing after them.
+#[test]
+fn the_authority_origin_is_an_origin_and_nothing_more() {
+    for (typed, recorded) in [
+        ("https://astra.helios.test", "https://astra.helios.test"),
+        (" https://astra.helios.test/ ", "https://astra.helios.test"),
+        (
+            "https://astra.helios.test:8443",
+            "https://astra.helios.test:8443",
+        ),
+        ("https://[fd00::1]:8443/", "https://[fd00::1]:8443"),
+    ] {
+        assert_eq!(authority_origin(typed).expect(typed), recorded, "{typed}");
+    }
+    for refused in [
+        "",
+        "https://",
+        "http://astra.helios.test",
+        "astra.helios.test",
+        "https:astra.helios.test",
+        "https://astra.helios.test/astra",
+        "https://astra.helios.test?x=1",
+        "https://astra.helios.test#here",
+        "https://user@astra.helios.test",
+        "https://user:secret@astra.helios.test",
+        "https://astra.helios.test:99999",
+        "https://astra.helios.test:",
+        "https://astra.helios.test:0",
+        "https://astra.helios.test:08443",
+        "https://[fd00::1",
+        "https://astra .helios.test",
+        "https://astra\\helios.test",
+        "https://astra%2Ehelios.test",
+    ] {
+        assert!(authority_origin(refused).is_err(), "{refused}");
+    }
 }
 
 #[test]

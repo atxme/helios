@@ -59,6 +59,8 @@ pub enum SetupRefusal {
         "la clé qui ouvre le coffre ne peut pas se retirer elle-même : brancher une autre clé"
     )]
     KeyBeingRemoved,
+    #[error("le document de credentials révoque cette clé : son retrait est à terminer, pas son état à changer")]
+    KeyRevoked,
     #[error("le relais de domaine ne porte pas encore la clé WireGuard et le nom de la gateway")]
     GatewayIdentityMissing,
     #[error("le domaine est complet : il ne reste rien à finaliser")]
@@ -185,6 +187,32 @@ pub fn check_removal<'v>(
     Ok(slot)
 }
 
+/// Opens the vault to withdraw `slot_id`, with any enrolled key but that one.
+///
+/// The allow-list leaves the withdrawn credential out, so the key being
+/// removed is not asked for a PIN and a touch that [`remove_key_with`] would
+/// then refuse. A key that answers for it anyway is refused as
+/// [`SetupRefusal::KeyBeingRemoved`], and [`remove_key_with`] checks again.
+pub fn open_for_removal(
+    key: &dyn Authenticator,
+    vault: &AuthorityVault,
+    slot_id: &[u8; 16],
+    pin: &str,
+) -> Result<Opened> {
+    let removed = check_removal(vault, slot_id)?.credential_id()?;
+    let others: Vec<Vec<u8>> = vault
+        .credential_ids()?
+        .into_iter()
+        .filter(|credential_id| *credential_id != removed)
+        .collect();
+    let opened = key.derive(&vault.rp_id, &others, &vault.salt()?, pin)?;
+    if opened.credential_id == removed {
+        return Err(SetupRefusal::KeyBeingRemoved.into());
+    }
+    vault.slot_for_credential(&opened.credential_id)?;
+    Ok(opened)
+}
+
 /// Withdraws a key — `astra-signer remove`.
 ///
 /// The key behind `opening` cannot be the one withdrawn: it would sign the
@@ -217,7 +245,9 @@ pub fn remove_key_with(
 ///
 /// The state lives in the credential document, which names the gateway: a
 /// relay that cannot name it — absent, unreadable or incomplete — has no
-/// document to sign.
+/// document to sign. A key the verified document already revokes — a removal
+/// interrupted after its document was written — is refused: marking it lost
+/// or active would take back a revocation already signed.
 pub fn check_marking<'v>(
     vault_path: &Path,
     vault: &'v AuthorityVault,
@@ -228,6 +258,15 @@ pub fn check_marking<'v>(
         .is_ok_and(|relay| handoff::identity_of(&relay).is_ok());
     if !identity_known {
         return Err(SetupRefusal::GatewayIdentityMissing);
+    }
+    let revoked = verified_document(vault_path, vault)
+        .zip(slot.credential_id().ok())
+        .and_then(|(document, credential_id)| {
+            document.binding(&credential_id).map(|row| row.state)
+        })
+        == Some(CredentialState::Revoked);
+    if revoked {
+        return Err(SetupRefusal::KeyRevoked);
     }
     Ok(slot)
 }
@@ -301,6 +340,11 @@ pub fn write_relay(vault_path: &Path, update: &RelayUpdate) -> Result<handoff::D
                 bail!(GATEWAY_TRANSITION);
             }
         }
+        // As `adopt_gateway`: a document already bound to another gateway
+        // names the domain's gateway too, whatever the relay lost.
+        if bound_to_another_gateway(vault_path, &key)? {
+            bail!(GATEWAY_TRANSITION);
+        }
         relay.gateway_wg_public_key = Some(value.trim().to_string());
     }
     if let Some(value) = &update.server_name {
@@ -333,6 +377,13 @@ pub fn write_relay(vault_path: &Path, update: &RelayUpdate) -> Result<handoff::D
 
 const GATEWAY_TRANSITION: &str =
     "le domaine nomme déjà une gateway ; en changer est une transition de gateway";
+
+/// Whether the credential document beside the vault, when there is one, is
+/// bound to a gateway other than `gateway`.
+fn bound_to_another_gateway(vault_path: &Path, gateway: &WireGuardKey) -> Result<bool> {
+    Ok(credentials::load(&credentials::path_beside(vault_path))?
+        .is_some_and(|document| document.gateway_wg_public_key != *gateway))
+}
 
 /// Records the gateway a leaf of this domain names: its server name and its
 /// WireGuard key.
@@ -371,10 +422,8 @@ pub fn adopt_gateway(
         .as_deref()
         .map(WireGuardKey::parse)
         .transpose()?;
-    let document_gateway = credentials::load(&credentials::path_beside(vault_path))?
-        .map(|document| document.gateway_wg_public_key);
     let other_gateway = recorded_gateway.is_some_and(|recorded| recorded != gateway)
-        || document_gateway.is_some_and(|bound| bound != gateway)
+        || bound_to_another_gateway(vault_path, &gateway)?
         || relay
             .server_name
             .as_deref()
@@ -565,14 +614,50 @@ fn pem_of(certificate: &DerCertificate) -> String {
     pem
 }
 
-/// The authority origin as the relay records it: `https://`, no trailing `/`.
-fn authority_origin(value: &str) -> Result<String> {
+/// The authority origin as the relay records it: `https://host[:port]`, no
+/// trailing `/`.
+///
+/// An origin and nothing more: no path, query, fragment nor user information,
+/// which a relay would otherwise carry into every URL built on it. Only the
+/// trailing `/` an operator may type is trimmed; any other character outside
+/// a host and its port is refused rather than dropped.
+pub fn authority_origin(value: &str) -> Result<String> {
     let value = value.trim();
     let origin = value.trim_end_matches('/');
-    match origin.strip_prefix("https://") {
-        Some(host) if !host.is_empty() => Ok(origin.to_string()),
-        _ => bail!("l'origine de l'autorité doit être une URL https:// : {value}"),
+    let authority_chars = origin.strip_prefix("https://").is_some_and(|authority| {
+        !authority.is_empty()
+            && authority.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b':' | b'[' | b']')
+            })
+            && port_of(authority).is_none_or(|port| {
+                port.parse::<u16>().is_ok_and(|port| port != 0) && !port.starts_with('0')
+            })
+    });
+    // The parser settles what the characters alone do not: one host, a valid
+    // address between brackets, nothing after it.
+    let parsed = authority_chars
+        && reqwest::Url::parse(origin).is_ok_and(|url| {
+            url.scheme() == "https"
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.host().is_some()
+                && url.path() == "/"
+                && url.query().is_none()
+                && url.fragment().is_none()
+        });
+    if !parsed {
+        bail!("l'origine de l'autorité doit être https://hôte[:port], sans chemin : {value}");
     }
+    Ok(origin.to_string())
+}
+
+/// What follows the host's `:` in `authority`, when it names a port. The `:`
+/// inside a bracketed IPv6 address does not.
+fn port_of(authority: &str) -> Option<&str> {
+    let after_host = authority
+        .rfind(']')
+        .map_or(authority, |end| &authority[end + 1..]);
+    after_host.rsplit_once(':').map(|(_, port)| port)
 }
 
 /// The credential document a gesture is about to re-sign, settled before it

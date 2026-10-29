@@ -381,7 +381,8 @@ pub enum Refusal {
     VaultFull,
     /// The change would leave fewer keys than the vault requires.
     MinimumKeys,
-    /// The key is already being removed.
+    /// The key that opened the vault is the key the gesture removes: a key
+    /// cannot sign its own withdrawal.
     KeyBeingRemoved,
     /// The gateway has no identity to anchor the domain on.
     GatewayIdentityMissing,

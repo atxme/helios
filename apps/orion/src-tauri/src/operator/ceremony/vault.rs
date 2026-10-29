@@ -84,6 +84,9 @@ fn refusal_of_setup(refusal: SetupRefusal) -> Refusal {
         // The slot the window named is not this vault's: it was showing
         // another one.
         SetupRefusal::UnknownSlot => Refusal::HandoffMismatch,
+        // The window offers no state change on a revoked key: a gesture asking
+        // for one did not come from what it showed.
+        SetupRefusal::KeyRevoked => Refusal::HandoffMismatch,
         SetupRefusal::KeyBeingRemoved => Refusal::KeyBeingRemoved,
         SetupRefusal::GatewayIdentityMissing => Refusal::GatewayIdentityMissing,
         SetupRefusal::DomainComplete => Refusal::DomainComplete,
