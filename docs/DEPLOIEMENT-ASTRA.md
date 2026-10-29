@@ -349,8 +349,9 @@ nommant cette commande.
 
 Quand la seconde clé est en main, Orion propose « Ajouter une clé » (libellé,
 rôle), « Renommer », « Marquer perdue » / « Réactiver » et « Retirer ». Le
-retrait ouvre le coffre avec une autre clé que celle retirée : Windows ne propose
-pas la clé retirée pour ce geste (en présenter une autre), et le coffre garde au
+retrait ouvre le coffre avec une autre clé que celle retirée : la clé retirée
+n'est pas demandée pour ce geste (en présenter une autre ; comportement de
+Windows non vérifié, à constater en recette), et le coffre garde au
 moins deux clés. Une clé que le document de credentials révoque déjà (retrait
 interrompu entre le document et le coffre) ne se marque plus : refaire le
 retrait. Équivalent en ligne de commande :

@@ -957,6 +957,10 @@ fn the_authority_origin_is_an_origin_and_nothing_more() {
         "https://astra .helios.test",
         "https://astra\\helios.test",
         "https://astra%2Ehelios.test",
+        "https://Astra.helios.test",
+        "https://astra.helios.test:443",
+        "https://[FD00::1]:8443",
+        "https://[fd00:0::1]:8443",
     ] {
         assert!(authority_origin(refused).is_err(), "{refused}");
     }

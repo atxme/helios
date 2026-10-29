@@ -644,9 +644,15 @@ pub fn authority_origin(value: &str) -> Result<String> {
                 && url.path() == "/"
                 && url.query().is_none()
                 && url.fragment().is_none()
+                // Recorded as typed and later compared byte for byte: only the
+                // spelling the parser itself gives back can ever match.
+                && url.origin().ascii_serialization() == origin
         });
     if !parsed {
-        bail!("l'origine de l'autorité doit être https://hôte[:port], sans chemin : {value}");
+        bail!(
+            "l'origine de l'autorité doit être https://hôte[:port], en minuscules, sans chemin \
+             ni port 443 : {value}"
+        );
     }
     Ok(origin.to_string())
 }

@@ -300,4 +300,6 @@ Ils priment sur les sections ci-dessus là où elles diffèrent.
 16. **Origine d'Astra** : une vraie origine, `https://hôte[:port]` et rien
     d'autre (ni chemin, ni requête, ni fragment, ni identifiants ; seul le `/`
     final est retiré), vérifiée par la même fonction à l'arrivée dans Orion et
-    dans `vault_gestures`.
+    dans `vault_gestures`. Elle s'écrit comme l'analyseur la rend (minuscules,
+    sans port 443) : enregistrée telle quelle puis comparée octet à octet, une
+    autre graphie ne correspondrait jamais.
