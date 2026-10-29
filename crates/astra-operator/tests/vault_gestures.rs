@@ -638,6 +638,50 @@ fn the_relay_takes_only_valid_values() {
     );
 }
 
+/// The gateway's identity is filled in once: the same value again is no
+/// change, another one is a gateway transition and is refused.
+#[test]
+fn the_relay_never_moves_to_another_gateway() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = vault_path(&directory);
+    let key1 = FakeKey::new(1);
+    create(&path, &key1);
+    complete_relay(&path);
+    let relay_path = handoff::path_beside(&path);
+    let before = std::fs::read(&relay_path).expect("relay bytes");
+
+    for moved in [
+        RelayUpdate {
+            gateway_wg_public_key: Some(WireGuardKey::from_bytes([0x22; 32]).to_base64()),
+            ..RelayUpdate::default()
+        },
+        RelayUpdate {
+            server_name: Some("other.helios.test".into()),
+            ..RelayUpdate::default()
+        },
+    ] {
+        let error = write_relay(&path, &moved).expect_err("another gateway is refused");
+        assert!(
+            error.to_string().contains("transition de gateway"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&relay_path).expect("relay bytes"), before);
+    }
+
+    let same = write_relay(
+        &path,
+        &RelayUpdate {
+            gateway_wg_public_key: Some(WireGuardKey::from_bytes([0x11; 32]).to_base64()),
+            server_name: Some(SERVER_NAME.into()),
+            astra_service_key_epoch: Some(3),
+            ..RelayUpdate::default()
+        },
+    )
+    .expect("the recorded gateway again is no change");
+    assert_eq!(same.server_name.as_deref(), Some(SERVER_NAME));
+    assert_eq!(same.astra_service_key_epoch, Some(3));
+}
+
 #[test]
 fn adopting_takes_the_gateway_the_domain_signed() {
     let directory = tempfile::tempdir().expect("tempdir");

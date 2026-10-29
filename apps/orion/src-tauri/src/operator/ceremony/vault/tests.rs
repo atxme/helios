@@ -1,0 +1,467 @@
+//! The vault and domain gestures, up to the first key: every refusal they
+//! can name before a press, and the manifests they show first.
+//!
+//! Each test drops its press sender, so a gesture that reaches a key prompt
+//! ends there as an abandonment: the platform key cannot be faked here, and
+//! the key sequences themselves are astra-operator's tests.
+
+use super::*;
+use crate::operator::ceremony::run;
+use crate::operator::ceremony::tests::{no_key_was_asked, Domain};
+use aether::certificates::operator_session::OperationKind;
+
+/// Runs one vault gesture with the presses already abandoned.
+fn run_vault_gesture(
+    gesture: crate::operator::VaultGesture,
+    vault_path: &Path,
+) -> (
+    Result<(), String>,
+    Vec<OperatorStatus>,
+    Vec<OperatorArtifact>,
+) {
+    let (presses, received) = std::sync::mpsc::channel::<Press>();
+    drop(presses);
+    let mut published = Vec::new();
+    let mut artifacts = Vec::new();
+    let outcome = run_vault(
+        Id16::new([5; 16]).expect("id"),
+        gesture,
+        received,
+        &mut |status| published.push(status),
+        &mut |artifact| artifacts.push(artifact),
+        vault_path,
+    );
+    (outcome, published, artifacts)
+}
+
+fn creation() -> crate::operator::VaultGesture {
+    crate::operator::VaultGesture::CreateDomain {
+        rp_id: "astra.example".into(),
+        // A trailing `/`, as an operator may type it.
+        authority_url: "https://astra.example/".into(),
+        first_label: "quotidienne".into(),
+        second_label: "coffre-fort".into(),
+    }
+}
+
+/// An empty folder of its own, removed when the test ends.
+struct Folder(std::path::PathBuf);
+
+impl Folder {
+    fn new(label: &str) -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "orion-vault-{label}-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("folder");
+        Self(path)
+    }
+
+    fn vault_path(&self) -> std::path::PathBuf {
+        self.0.join(crate::operator::location::VAULT_FILE_NAME)
+    }
+
+    fn is_empty(&self) -> bool {
+        std::fs::read_dir(&self.0)
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(false)
+    }
+}
+
+impl Drop for Folder {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn refused_before_the_key(published: &[OperatorStatus], refusal: Refusal) {
+    let last = published.last().expect("a status");
+    assert_eq!(last.gesture, GestureState::Failed);
+    assert_eq!(last.refusal, Some(refusal));
+    assert!(no_key_was_asked(published));
+    assert!(last.keys.is_empty());
+}
+
+fn first_slot_id(domain: &Domain) -> String {
+    let vault = astra_operator::store::load(&domain.vault_path).expect("vault");
+    Id16::new(vault.slots[0].slot_id).expect("slot").to_hex()
+}
+
+impl Domain {
+    /// Forgets the gateway on the relay, as a relay written before the
+    /// gateway was known holds it.
+    fn without_gateway(self) -> Self {
+        let relay_path = astra_operator::handoff::path_beside(&self.vault_path);
+        let mut relay = astra_operator::handoff::load(&relay_path).expect("relay");
+        relay.gateway_wg_public_key = None;
+        relay.server_name = None;
+        astra_operator::handoff::save(&relay_path, &relay).expect("save relay");
+        self
+    }
+
+    /// The credential document of a finished domain: one active row per
+    /// slot, signed by this domain's `CA-PQ` for the gateway the relay names.
+    fn with_document(self) -> Self {
+        use aether::certificates::approval::{
+            AstraCredentialBinding, CredentialRegistry, CredentialState,
+        };
+        use aether::certificates::encoding::{MlDsa87Signature, WireGuardKey};
+
+        let vault = astra_operator::store::load(&self.vault_path).expect("vault");
+        let gateway = WireGuardKey::parse(&self.gateway_key).expect("gateway key");
+        let bindings = vault
+            .slots
+            .iter()
+            .map(|slot| {
+                AstraCredentialBinding {
+                    format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+                    credential_id: slot.credential_id().expect("credential"),
+                    credential_public_key: cose_es256_key(),
+                    aaguid: [0; 16],
+                    trust_domain_id: vault.trust_domain_id,
+                    gateway_wg_public_key: gateway,
+                    state: CredentialState::Active,
+                    credential_epoch: 1,
+                    credential_registry_epoch: 1,
+                    ca_epoch: 1,
+                    created_at: now_unix(),
+                    ca_pq_signature: MlDsa87Signature::placeholder(),
+                }
+                .sign(&self.ca_private_key)
+                .expect("signed under CA-PQ")
+            })
+            .collect();
+        let document = CredentialRegistry {
+            trust_domain_id: vault.trust_domain_id,
+            gateway_wg_public_key: gateway,
+            ca_epoch: 1,
+            credential_registry_epoch: 1,
+            bindings,
+        };
+        astra_operator::credentials::save(
+            &astra_operator::credentials::path_beside(&self.vault_path),
+            &document,
+        )
+        .expect("save document");
+        self
+    }
+
+    /// Fills the vault up to its ceiling with stand-in keys.
+    fn full(self) -> Self {
+        use astra_operator::vault::{SlotEnrolment, SlotRole, SlotSecret, MAX_SLOTS};
+
+        let mut vault = astra_operator::store::load(&self.vault_path).expect("vault");
+        let mut next = 2u8;
+        while vault.slots.len() < MAX_SLOTS {
+            vault
+                .add_slot(
+                    &[1; 64],
+                    &SlotSecret::new(vec![1; 32]),
+                    SlotEnrolment {
+                        role: SlotRole::Recovery,
+                        label: format!("clé {next}"),
+                        credential_id: vec![next; 64],
+                        credential_public_key: vec![0xa5, next],
+                        aaguid: [next; 16],
+                        enrolled_at: 2_000,
+                    },
+                    &SlotSecret::new(vec![next; 32]),
+                )
+                .expect("slot added");
+            next += 1;
+        }
+        astra_operator::store::save(&self.vault_path, &vault).expect("save vault");
+        self
+    }
+}
+
+/// A COSE ES256 public key, as an authenticator publishes one: the
+/// document's own verification parses it.
+fn cose_es256_key() -> Vec<u8> {
+    let mut key = vec![0xA5, 0x01, 0x02, 0x03, 0x26, 0x20, 0x01, 0x21, 0x58, 0x20];
+    key.extend_from_slice(&[3u8; 32]);
+    key.extend_from_slice(&[0x22, 0x58, 0x20]);
+    key.extend_from_slice(&[5u8; 32]);
+    key
+}
+
+/// A vault is never replaced: the creation stops before any key.
+#[test]
+fn a_creation_over_an_existing_vault_asks_for_no_key() {
+    let domain = Domain::new("create-existing");
+    let before = std::fs::read(&domain.vault_path).expect("vault bytes");
+    let (outcome, published, _) = run_vault_gesture(creation(), &domain.vault_path);
+    outcome.expect_err("an existing vault is refused");
+    refused_before_the_key(&published, Refusal::VaultExists);
+    assert_eq!(
+        std::fs::read(&domain.vault_path).expect("vault bytes"),
+        before
+    );
+}
+
+/// A folder that is not there is a mistyped choice, not one to create.
+#[test]
+fn a_creation_in_a_missing_folder_asks_for_no_key() {
+    let folder = Folder::new("create-missing");
+    let missing = folder.0.join("absent").join("authority-vault.json");
+    let (outcome, published, _) = run_vault_gesture(creation(), &missing);
+    outcome.expect_err("a missing folder is refused");
+    refused_before_the_key(&published, Refusal::LocationUnavailable);
+    assert!(!folder.0.join("absent").exists());
+}
+
+/// The operator can walk away at the first key: nothing has been written.
+#[test]
+fn abandoning_before_the_first_key_creates_nothing() {
+    let folder = Folder::new("create-abandon");
+    let (outcome, published, artifacts) = run_vault_gesture(creation(), &folder.vault_path());
+    outcome.expect("an abandonment is not a failure");
+    let last = published.last().expect("a status");
+    assert_eq!(last.gesture, GestureState::Cancelled);
+    assert!(last.keys.is_empty());
+    assert!(artifacts.is_empty());
+    assert!(folder.is_empty());
+}
+
+/// What the domain will answer as is shown before the first key registers.
+#[test]
+fn the_creation_manifest_shows_what_will_be_fixed() {
+    let folder = Folder::new("create-manifest");
+    let (_, published, _) = run_vault_gesture(creation(), &folder.vault_path());
+    let offered = published
+        .iter()
+        .find(|status| matches!(status.gesture, GestureState::AwaitingKey { .. }))
+        .expect("a key is asked for");
+    assert_eq!(
+        offered.gesture,
+        GestureState::AwaitingKey {
+            index: 1,
+            of: 2,
+            purpose: KeyPurpose::RegisterKey,
+        }
+    );
+    assert_eq!(offered.operation, OperationKind::CreateDomain);
+    match offered.manifest.as_ref().expect("manifest shown first") {
+        AstraManifest::DomainCreation(manifest) => {
+            assert_eq!(manifest.rp_id, "astra.example");
+            assert_eq!(manifest.authority_url, "https://astra.example");
+            assert_eq!(manifest.first_label, "quotidienne");
+            assert_eq!(manifest.second_label, "coffre-fort");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A vault at its ceiling takes no other key, and says so before a press.
+#[test]
+fn a_full_vault_refuses_an_addition_before_the_key() {
+    let domain = Domain::new("add-full").full();
+    let (outcome, published, _) = run_vault_gesture(
+        crate::operator::VaultGesture::AddKey {
+            label: "neuve".into(),
+            role: crate::operator::KeyRole::Recovery,
+        },
+        &domain.vault_path,
+    );
+    outcome.expect_err("a full vault is refused");
+    refused_before_the_key(&published, Refusal::VaultFull);
+}
+
+/// A document the next gesture could not re-sign is found before the press,
+/// not after the new key registered.
+#[test]
+fn an_addition_whose_document_cannot_be_resigned_asks_for_no_key() {
+    use aether::certificates::approval::CredentialRegistry;
+    use aether::certificates::encoding::WireGuardKey;
+
+    let domain = Domain::new("add-document");
+    let vault = astra_operator::store::load(&domain.vault_path).expect("vault");
+    astra_operator::credentials::save(
+        &astra_operator::credentials::path_beside(&domain.vault_path),
+        &CredentialRegistry {
+            trust_domain_id: vault.trust_domain_id,
+            gateway_wg_public_key: WireGuardKey::parse(&domain.gateway_key).expect("key"),
+            ca_epoch: 1,
+            credential_registry_epoch: 1,
+            bindings: Vec::new(),
+        },
+    )
+    .expect("save document");
+    let domain = domain.without_gateway();
+    let (outcome, published, _) = run_vault_gesture(
+        crate::operator::VaultGesture::AddKey {
+            label: "neuve".into(),
+            role: crate::operator::KeyRole::Primary,
+        },
+        &domain.vault_path,
+    );
+    outcome.expect_err("the document cannot follow the vault");
+    refused_before_the_key(&published, Refusal::GatewayIdentityMissing);
+}
+
+/// The vault keeps at least two keys: the removal is refused before a press.
+#[test]
+fn removing_down_to_one_key_is_refused_before_the_key() {
+    let domain = Domain::new("remove-minimum");
+    let slot_id = first_slot_id(&domain);
+    let (outcome, published, _) = run_vault_gesture(
+        crate::operator::VaultGesture::RemoveKey { slot_id },
+        &domain.vault_path,
+    );
+    outcome.expect_err("the last keys are kept");
+    refused_before_the_key(&published, Refusal::MinimumKeys);
+}
+
+/// A key's state lives in a document that names the gateway: without it,
+/// there is nothing to sign.
+#[test]
+fn marking_without_the_gateway_is_refused_before_the_key() {
+    let domain = Domain::new("mark-no-gateway").without_gateway();
+    let slot_id = first_slot_id(&domain);
+    let (outcome, published, _) = run_vault_gesture(
+        crate::operator::VaultGesture::MarkKey {
+            slot_id,
+            lost: true,
+        },
+        &domain.vault_path,
+    );
+    outcome.expect_err("no gateway, no document");
+    refused_before_the_key(&published, Refusal::GatewayIdentityMissing);
+}
+
+/// A domain carrying its CA-TLS and a document for every key has nothing
+/// left to issue.
+#[test]
+fn a_finished_domain_has_nothing_to_finalize() {
+    let domain = Domain::new("finalize-complete")
+        .with_ca_tls()
+        .with_document();
+    let (outcome, published, artifacts) = run_vault_gesture(
+        crate::operator::VaultGesture::FinalizeDomain,
+        &domain.vault_path,
+    );
+    outcome.expect_err("nothing to finalize");
+    refused_before_the_key(&published, Refusal::DomainComplete);
+    assert!(artifacts.is_empty());
+}
+
+/// The vault gestures name their own ceremony: a locator naming one of them
+/// is refused, not run.
+#[test]
+fn a_locator_does_not_open_a_vault_gesture() {
+    let folder = Folder::new("locator");
+    for kind in [
+        OperationKind::CreateDomain,
+        OperationKind::AddKey,
+        OperationKind::RemoveKey,
+        OperationKind::MarkKey,
+        OperationKind::FinalizeDomain,
+    ] {
+        let (presses, received) = std::sync::mpsc::channel::<Press>();
+        drop(presses);
+        let mut published = Vec::new();
+        let outcome = run(
+            Id16::new([1; 16]).expect("id"),
+            OperationLocator {
+                kind,
+                operation_id: None,
+            },
+            received,
+            &mut |status| published.push(status),
+            &folder.vault_path(),
+        );
+        let error = outcome.expect_err("refused");
+        assert!(!error.contains("pas encore portée"), "{kind:?}: {error}");
+        refused_before_the_key(&published, Refusal::Internal);
+    }
+    assert!(folder.is_empty());
+}
+
+/// A slot the vault does not hold means the window showed another vault.
+#[test]
+fn an_unknown_slot_is_refused_before_the_key() {
+    let domain = Domain::new("remove-unknown");
+    let (outcome, published, _) = run_vault_gesture(
+        crate::operator::VaultGesture::RemoveKey {
+            slot_id: "0123456789abcdef0123456789abcdef".into(),
+        },
+        &domain.vault_path,
+    );
+    outcome.expect_err("an unknown slot is refused");
+    refused_before_the_key(&published, Refusal::HandoffMismatch);
+}
+
+/// The addition names the key it will register, then asks first for a key
+/// the vault already opens for.
+#[test]
+fn an_addition_shows_its_manifest_before_the_key() {
+    let domain = Domain::new("add-manifest");
+    let (outcome, published, _) = run_vault_gesture(
+        crate::operator::VaultGesture::AddKey {
+            label: " secours ".into(),
+            role: crate::operator::KeyRole::Recovery,
+        },
+        &domain.vault_path,
+    );
+    outcome.expect("an abandonment is not a failure");
+    let offered = published
+        .iter()
+        .find(|status| matches!(status.gesture, GestureState::AwaitingKey { .. }))
+        .expect("a key is asked for");
+    assert_eq!(
+        offered.gesture,
+        GestureState::AwaitingKey {
+            index: 1,
+            of: 2,
+            purpose: KeyPurpose::OpenVault,
+        }
+    );
+    match offered.manifest.as_ref().expect("manifest shown first") {
+        AstraManifest::KeyAddition(manifest) => {
+            assert_eq!(manifest.label, "secours");
+            assert_eq!(manifest.role, "recuperation");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        published.last().expect("a status").gesture,
+        GestureState::Cancelled
+    );
+}
+
+/// A key that refused, or a platform call that failed, is `KeyDeclined`; a
+/// failure after the key answered is not the key's, and is `Internal`.
+#[test]
+fn only_a_key_failure_reads_as_a_declined_key() {
+    use astra_operator::gestures::GestureError;
+
+    let declined = [
+        anyhow::Error::from(GestureError::Authenticator(AuthenticatorError::NoPin)),
+        anyhow::Error::from(AuthenticatorError::UnknownCredential).context("enregistrement"),
+        anyhow::Error::from(GestureError::Authenticator(AuthenticatorError::Device(
+            "délai".into(),
+        )))
+        .context("création du coffre"),
+    ];
+    for error in &declined {
+        assert_eq!(refusal_of(error), Refusal::KeyDeclined, "{error:#}");
+    }
+    let internal = [
+        anyhow::anyhow!("écriture du coffre impossible"),
+        anyhow::Error::from(GestureError::Anchors("tirage".into())),
+        anyhow::anyhow!("signature du document").context("ajout de la clé"),
+    ];
+    for error in &internal {
+        assert_eq!(refusal_of(error), Refusal::Internal, "{error:#}");
+    }
+    assert_eq!(
+        refusal_of(&anyhow::Error::from(SetupRefusal::KeyBeingRemoved).context("retrait")),
+        Refusal::KeyBeingRemoved
+    );
+    assert_eq!(
+        refusal_of(&anyhow::Error::from(SetupRefusal::UnknownSlot)),
+        Refusal::HandoffMismatch
+    );
+}

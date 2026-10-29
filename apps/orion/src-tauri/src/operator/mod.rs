@@ -229,9 +229,14 @@ const MAX_AUTHORITY_URL_CHARS: usize = 256;
 
 /// A WebAuthn RP ID this domain can be created under: a lowercase DNS name of
 /// at least two labels, never an address — a credential is bound to it for
-/// good.
+/// good. A last label of digits only is refused too: a browser's URL parser
+/// reads such a host as an IPv4 address (`1.2.3`, `astra.123`).
 fn valid_rp_id(rp_id: &str) -> bool {
     (1..=MAX_RP_ID_CHARS).contains(&rp_id.len())
+        && !rp_id
+            .rsplit('.')
+            .next()
+            .is_some_and(|last| last.bytes().all(|byte| byte.is_ascii_digit()))
         && rp_id.contains('.')
         && rp_id.bytes().all(|byte| {
             byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'.')
@@ -883,6 +888,8 @@ mod tests {
             creation("192.168.1.1", url, "quotidienne"),
             creation("Astra.Example", url, "quotidienne"),
             creation("astra", url, "quotidienne"),
+            creation("1.2.3", url, "quotidienne"),
+            creation("astra.123", url, "quotidienne"),
             creation("astra.example", "http://astra.example", "quotidienne"),
             creation("astra.example", url, " "),
             VaultGesture::AddKey {

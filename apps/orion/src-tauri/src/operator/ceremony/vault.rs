@@ -19,9 +19,9 @@ use aether::certificates::operator_session::{
     KeyAdditionManifest, KeyMarkingManifest, KeyPurpose, KeyRemovalManifest, KeySlotLabel,
     OperationLocator, OperatorStatus, Refusal, RemoteState,
 };
-use aether_fido::authenticator::Authenticator;
+use aether_fido::authenticator::{Authenticator, AuthenticatorError};
 use astra_operator::authenticator::Opened;
-use astra_operator::gestures::{NewAuthority, NewKey};
+use astra_operator::gestures::{GestureError, NewAuthority, NewKey};
 use astra_operator::vault::{AuthorityVault, SlotRole};
 use astra_operator::vault_gestures::{self as gestures, SetupRefusal};
 
@@ -62,7 +62,8 @@ pub fn run_vault(
             second_label,
         } => run.create_domain(DomainCreationManifest {
             rp_id,
-            authority_url,
+            // As the relay will record it.
+            authority_url: authority_url.trim_end_matches('/').to_string(),
             first_label: first_label.trim().to_string(),
             second_label: second_label.trim().to_string(),
         }),
@@ -89,13 +90,28 @@ fn refusal_of_setup(refusal: SetupRefusal) -> Refusal {
     }
 }
 
-/// The refusal a gesture's error carries, or `otherwise` when it carries none.
-fn refusal_of(error: &anyhow::Error, otherwise: Refusal) -> Refusal {
-    error
-        .downcast_ref::<SetupRefusal>()
-        .copied()
-        .map(refusal_of_setup)
-        .unwrap_or(otherwise)
+/// The refusal a gesture's error stands for.
+///
+/// The check it carries, when it carries one. Else `KeyDeclined` only when the
+/// key itself, or the platform call to it, failed. Anything else failed after
+/// the key answered — a write, a signature, the proof of the anchors — and is
+/// `Internal`: telling the operator the key refused would send them to retry
+/// a key that did its part, over a vault that may already have moved.
+fn refusal_of(error: &anyhow::Error) -> Refusal {
+    for cause in error.chain() {
+        if let Some(refusal) = cause.downcast_ref::<SetupRefusal>() {
+            return refusal_of_setup(*refusal);
+        }
+        if cause.downcast_ref::<AuthenticatorError>().is_some()
+            || matches!(
+                cause.downcast_ref::<GestureError>(),
+                Some(GestureError::Authenticator(_))
+            )
+        {
+            return Refusal::KeyDeclined;
+        }
+    }
+    Refusal::Internal
 }
 
 /// One gesture in progress: the ceremony, its presses and its publisher.
@@ -243,12 +259,7 @@ impl VaultRun<'_> {
             now_unix(),
         ) {
             Ok(opening) => opening,
-            Err(error) => {
-                return self.refuse(
-                    refusal_of(&error, Refusal::KeyDeclined),
-                    format!("{error:#}"),
-                )
-            }
+            Err(error) => return self.refuse(refusal_of(&error), format!("{error:#}")),
         };
         drop(key);
         self.answered(1, &request.label);
@@ -265,18 +276,13 @@ impl VaultRun<'_> {
             now_unix(),
         ) {
             Ok(added) => added,
-            Err(error) => {
-                return self.refuse(
-                    refusal_of(&error, Refusal::KeyDeclined),
-                    format!("{error:#}"),
-                )
-            }
+            Err(error) => return self.refuse(refusal_of(&error), format!("{error:#}")),
         };
         drop(key);
         self.answered(2, &second.label);
 
         if let Err(error) = gestures::prove_opens(self.vault_path, &[&first, &added.opening]) {
-            return self.refuse(Refusal::KeyDeclined, format!("{error:#}"));
+            return self.refuse(refusal_of(&error), format!("{error:#}"));
         }
         self.done()
     }
@@ -312,10 +318,7 @@ impl VaultRun<'_> {
             "",
             now_unix(),
         ) {
-            return self.refuse(
-                refusal_of(&error, Refusal::KeyDeclined),
-                format!("{error:#}"),
-            );
+            return self.refuse(refusal_of(&error), format!("{error:#}"));
         }
         drop(key);
         self.answered(2, label);
@@ -344,7 +347,7 @@ impl VaultRun<'_> {
         self.signing();
         match gestures::remove_key_with(self.vault_path, &opening, &slot, now_unix()) {
             Ok(()) => self.done(),
-            Err(error) => self.refuse(refusal_of(&error, Refusal::Internal), format!("{error:#}")),
+            Err(error) => self.refuse(refusal_of(&error), format!("{error:#}")),
         }
     }
 
@@ -370,7 +373,7 @@ impl VaultRun<'_> {
         self.signing();
         match gestures::mark_key_with(self.vault_path, &opening, &slot, lost, now_unix()) {
             Ok(_) => self.done(),
-            Err(error) => self.refuse(refusal_of(&error, Refusal::Internal), format!("{error:#}")),
+            Err(error) => self.refuse(refusal_of(&error), format!("{error:#}")),
         }
     }
 
@@ -408,7 +411,7 @@ impl VaultRun<'_> {
                 }
                 self.done()
             }
-            Err(error) => self.refuse(refusal_of(&error, Refusal::Internal), format!("{error:#}")),
+            Err(error) => self.refuse(refusal_of(&error), format!("{error:#}")),
         }
     }
 
@@ -427,3 +430,6 @@ impl VaultRun<'_> {
         (self.publish)(self.ceremony.status());
     }
 }
+
+#[cfg(test)]
+mod tests;

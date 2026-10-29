@@ -186,6 +186,7 @@ pub(crate) async fn rename_operator_key(
     slot_id: String,
     label: String,
 ) -> Result<(), String> {
+    ensure_no_open_ceremony(&state).await?;
     let vault_path = state.vault_location.path()?;
     crate::operator::rename_key(&vault_path, &slot_id, &label)
 }
@@ -197,6 +198,7 @@ pub(crate) async fn write_domain_relay(
     state: State<'_, AppState>,
     update: astra_operator::vault_gestures::RelayUpdate,
 ) -> Result<(), String> {
+    ensure_no_open_ceremony(&state).await?;
     let vault_path = state.vault_location.path()?;
     astra_operator::vault_gestures::write_relay(&vault_path, &update)
         .map(|_| ())
@@ -205,29 +207,26 @@ pub(crate) async fn write_domain_relay(
 
 /// Records the connected gateway on the relay, from the leaf it serves.
 ///
-/// The leaf must verify under the domain's `CA-PQ` for the identity it names,
-/// and that identity must be the one the gateway answers with: the relay only
-/// ever names a gateway this authority certified and the operator is
-/// connected to.
+/// Before anything is written, three WireGuard keys must be one: the key the
+/// leaf certifies, the key the gateway answers with, and the peer key of the
+/// connected profile — the one the tunnel is up to. The leaf's subject must
+/// also be the server name the gateway answers with. `adopt_gateway` then
+/// verifies the leaf under the domain's `CA-PQ` for that identity, and refuses
+/// a relay or document that already names another gateway.
 #[tauri::command]
 pub(crate) async fn adopt_connected_gateway(state: State<'_, AppState>) -> Result<(), String> {
     use orion_core::gateway_admin as admin;
 
+    ensure_no_open_ceremony(&state).await?;
     let vault_path = state.vault_location.path()?;
-    let base = connected_gateway(&state).await?;
+    let (base, tunnel_peer_key) = connected_profile(&state).await?;
     let client = admin::orion_client().map_err(|error| error.to_string())?;
     let material = admin::gateway_negotiation(&client, &base)
         .await
         .map_err(|error| error.to_string())?;
     let leaf = admin::decode_pq_certificate(&material.gateway_pq_certificate)
         .map_err(|error| error.to_string())?;
-    if leaf.subject != material.server_name.trim()
-        || leaf.wireguard_public_key != material.wireguard_public_key.trim()
-    {
-        return Err(
-            "la feuille servie par la gateway connectée nomme une autre gateway".to_string(),
-        );
-    }
+    check_tunnel_leaf(&leaf, &material, &tunnel_peer_key)?;
     // Its own thread, with the stack the post-quantum verification needs.
     let (sender, receiver) = tokio::sync::oneshot::channel();
     std::thread::Builder::new()
@@ -315,6 +314,7 @@ pub(crate) async fn choose_vault_location(
 ) -> Result<Option<crate::operator::location::VaultLocationView>, String> {
     #[cfg(target_os = "windows")]
     {
+        ensure_no_open_ceremony(&state).await?;
         // Held until this command returns, whatever the path: one dialog at a
         // time.
         let _picker = state.vault_location.begin_pick()?;
@@ -335,7 +335,12 @@ pub(crate) async fn choose_vault_location(
             "la boîte de choix de l'emplacement du coffre s'est arrêtée".to_string()
         })??;
         match picked {
-            Some(path) => state.vault_location.choose(path).map(Some),
+            // Asked again: the dialog may have stayed open while a ceremony
+            // began.
+            Some(path) => {
+                ensure_no_open_ceremony(&state).await?;
+                state.vault_location.choose(path).map(Some)
+            }
             None => Ok(None),
         }
     }
@@ -351,7 +356,54 @@ pub(crate) async fn choose_vault_location(
 pub(crate) async fn reset_vault_location(
     state: State<'_, AppState>,
 ) -> Result<crate::operator::location::VaultLocationView, String> {
+    ensure_no_open_ceremony(&state).await?;
     state.vault_location.reset()
+}
+
+const CEREMONY_OPEN: &str =
+    "une cérémonie opérateur est ouverte : la terminer ou l'annuler d'abord";
+
+/// Refuses a key-less write to the vault, its relay or its location while a
+/// ceremony is open: that ceremony checked them before its key, and writes
+/// them after it.
+async fn ensure_no_open_ceremony(state: &AppState) -> Result<(), String> {
+    no_open_ceremony(state.operator.status().await.as_ref())
+}
+
+/// The decision of [`ensure_no_open_ceremony`], on the last status published.
+fn no_open_ceremony(
+    status: Option<&aether::certificates::operator_session::OperatorStatus>,
+) -> Result<(), String> {
+    match status {
+        Some(status) if !status.gesture.is_terminal() => Err(CEREMONY_OPEN.to_string()),
+        _ => Ok(()),
+    }
+}
+
+const NOT_THE_TUNNEL_GATEWAY: &str = "la gateway qui répond n'est pas celle du profil connecté";
+
+/// Whether the leaf a gateway served names that gateway, and the gateway is
+/// the one the tunnel is up to: the leaf's key, the key the gateway answers
+/// with and the connected profile's peer key are one parsed WireGuard key, and
+/// the leaf's subject is the server name the gateway answers with. Any key
+/// that does not parse is a mismatch.
+fn check_tunnel_leaf(
+    leaf: &aether::key_negotiation::PqCertificate,
+    material: &orion_core::enrollment_draft::GatewayMaterial,
+    tunnel_peer_key: &str,
+) -> Result<(), String> {
+    use aether::certificates::encoding::WireGuardKey;
+
+    let parse = |value: &str| WireGuardKey::parse(value.trim()).ok();
+    let leaf_key = parse(&leaf.wireguard_public_key);
+    let one_key = leaf_key.is_some()
+        && leaf_key == parse(&material.wireguard_public_key)
+        && leaf_key == parse(tunnel_peer_key);
+    if one_key && leaf.subject == material.server_name.trim() {
+        Ok(())
+    } else {
+        Err(NOT_THE_TUNNEL_GATEWAY.to_string())
+    }
 }
 
 /// The invitations of this machine's registry, with whether each device is
@@ -408,6 +460,12 @@ const NO_CONNECTED_GATEWAY: &str = "Connectez d'abord le profil de la gateway, a
 /// and a gateway reached any other way would not be the one the operator
 /// connected to.
 async fn connected_gateway(state: &AppState) -> Result<String, String> {
+    connected_profile(state).await.map(|(url, _)| url)
+}
+
+/// [`connected_gateway`], with the peer key of the connected profile read
+/// from the same answer of the engine.
+async fn connected_profile(state: &AppState) -> Result<(String, String), String> {
     let tunnel = match state.client.call(EngineCommand::GetState).await? {
         EngineReply::State(value) => value,
         _ => return Err(unexpected_engine_reply()),
@@ -416,21 +474,30 @@ async fn connected_gateway(state: &AppState) -> Result<String, String> {
         EngineReply::Config(value) => value,
         _ => return Err(unexpected_engine_reply()),
     };
-    gateway_url(&tunnel, &view)
+    gateway_profile(&tunnel, &view)
+        .map(|(url, profile)| (url, profile.peer_public_key.trim().to_string()))
 }
 
-/// The decision of [`connected_gateway`], on what the engine answered.
-fn gateway_url(state: &str, view: &ConfigView) -> Result<String, String> {
+/// The decision of [`connected_gateway`], on what the engine answered: the
+/// control-plane address of the connected profile, and that profile.
+fn gateway_profile<'v>(
+    state: &str,
+    view: &'v ConfigView,
+) -> Result<(String, &'v orion_engine::ProfileView), String> {
     if aether::TunnelState::parse(state) != Some(aether::TunnelState::Up) {
         return Err(NO_CONNECTED_GATEWAY.to_string());
     }
     view.selected
         .as_deref()
         .and_then(|name| view.profiles.iter().find(|profile| profile.name == name))
-        .and_then(|profile| profile.heliosd_url.as_deref())
-        .map(str::trim)
-        .filter(|url| !url.is_empty())
-        .map(str::to_string)
+        .and_then(|profile| {
+            profile
+                .heliosd_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|url| !url.is_empty())
+                .map(|url| (url.to_string(), profile))
+        })
         .ok_or_else(|| NO_CONNECTED_GATEWAY.to_string())
 }
 

@@ -286,15 +286,32 @@ pub struct RelayUpdate {
 /// The relay is read first and refreshed from the vault, so what was recorded
 /// earlier stays. Every value is checked before anything is written: a key
 /// that is not a key would be carried into every object signed afterwards.
+///
+/// The gateway's identity — its WireGuard key and its server name — is only
+/// ever filled in: a relay that already records another value refuses the
+/// change, because every document and leaf of the domain names that gateway,
+/// and moving to another is a gateway transition, not an edit.
 pub fn write_relay(vault_path: &Path, update: &RelayUpdate) -> Result<handoff::DomainHandoff> {
     let vault = store::load(vault_path)?;
     let mut relay = handoff::DomainHandoff::beside(vault_path, &vault)?;
     if let Some(value) = &update.gateway_wg_public_key {
-        WireGuardKey::parse(value).context("clé publique WireGuard de la gateway")?;
+        let key = WireGuardKey::parse(value).context("clé publique WireGuard de la gateway")?;
+        if let Some(recorded) = relay.gateway_wg_public_key.as_deref() {
+            if WireGuardKey::parse(recorded).ok() != Some(key) {
+                bail!(GATEWAY_TRANSITION);
+            }
+        }
         relay.gateway_wg_public_key = Some(value.trim().to_string());
     }
     if let Some(value) = &update.server_name {
         validate_server_name(value.trim()).context("nom de service de la gateway")?;
+        if relay
+            .server_name
+            .as_deref()
+            .is_some_and(|recorded| recorded != value.trim())
+        {
+            bail!(GATEWAY_TRANSITION);
+        }
         relay.server_name = Some(value.trim().to_string());
     }
     if let Some(value) = &update.astra_service_public_key {
@@ -313,6 +330,9 @@ pub fn write_relay(vault_path: &Path, update: &RelayUpdate) -> Result<handoff::D
     handoff::save(&handoff::path_beside(vault_path), &relay)?;
     Ok(relay)
 }
+
+const GATEWAY_TRANSITION: &str =
+    "le domaine nomme déjà une gateway ; en changer est une transition de gateway";
 
 /// Records the gateway a leaf of this domain names: its server name and its
 /// WireGuard key.
