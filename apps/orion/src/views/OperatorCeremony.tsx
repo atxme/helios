@@ -12,6 +12,7 @@ import { RULE } from '../theme'
 import type {
   AstraManifest,
   GestureState,
+  KeyRole,
   OperationKind,
   OperatorStatus,
   RemoteState,
@@ -101,12 +102,18 @@ const CERTIFICATE_KINDS = {
   astra_service_key: 'clé de service Astra',
 } as const
 
-/** The rows of one manifest, named here and never carried as text. */
+/** The role of a key, as the vault gestures name it. */
+const KEY_ROLES: Record<KeyRole, string> = {
+  principale: 'principale',
+  recuperation: 'de récupération',
+}
+
 /** Hexadecimal read aloud, four digits at a time, as the Domaine panel shows it. */
-function groupedHex(hex: string): string {
+export function groupedHex(hex: string): string {
   return hex.replace(/\s+/g, '').replace(/(.{4})(?=.)/g, '$1 ')
 }
 
+/** The rows of one manifest, named here and never carried as text. */
 export function rowsOf(manifest: AstraManifest): [string, string][] {
   switch (manifest.operation) {
     case 'recovery':
@@ -206,13 +213,13 @@ export function rowsOf(manifest: AstraManifest): [string, string][] {
       return [
         ['coffre', manifest.vault_fingerprint],
         ['libellé', manifest.label],
-        ['rôle', manifest.role],
+        ['rôle', KEY_ROLES[manifest.role]],
       ]
     case 'key_removal':
       return [
         ['coffre', manifest.vault_fingerprint],
         ['clé', manifest.label],
-        ['rôle', manifest.role],
+        ['rôle', KEY_ROLES[manifest.role]],
       ]
     case 'key_marking':
       return [

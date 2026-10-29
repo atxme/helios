@@ -16,6 +16,7 @@ import { DomainPanel } from './DomainPanel'
 const base = {
   vault_path: 'v.json',
   exists: true,
+  location_available: true,
   vault_fingerprint: null,
   slots: [],
   max_slots: 8,
@@ -82,6 +83,35 @@ describe('DomainPanel', () => {
     expect(await screen.findByText(/Aucun relais n’est enregistré/)).toBeTruthy()
   })
 
+  it('says_when_the_location_is_missing_or_holds_no_vault', async () => {
+    api.operatorOverview.mockResolvedValue({
+      ...base,
+      exists: false,
+      location_available: false,
+      domain: null,
+    })
+    render(<DomainPanel onCeremony={onCeremony} />)
+    expect(await screen.findByText(/Emplacement introuvable/)).toBeTruthy()
+    expect(screen.queryByText(/Aucun relais/)).toBeNull()
+    cleanup()
+
+    api.operatorOverview.mockResolvedValue({ ...base, exists: false, domain: null })
+    render(<DomainPanel onCeremony={onCeremony} />)
+    expect(await screen.findByText(/Aucun coffre à cet emplacement/)).toBeTruthy()
+    expect(screen.queryByText(/Aucun relais/)).toBeNull()
+  })
+
+  it('refuses_an_epoch_of_zero_inline', async () => {
+    api.operatorOverview.mockResolvedValue(withDomain({}))
+    render(<DomainPanel onCeremony={onCeremony} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Modifier' }))
+    fireEvent.change(screen.getByLabelText('Époque de la clé de service'), {
+      target: { value: '0' },
+    })
+    expect(screen.getByText('Un entier supérieur à zéro.')).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Enregistrer' }).hasAttribute('disabled')).toBe(true)
+  })
+
   it('shows_the_error_when_the_overview_fails', async () => {
     api.operatorOverview.mockRejectedValue('lecture impossible')
     render(<DomainPanel onCeremony={onCeremony} />)
@@ -138,7 +168,7 @@ describe('DomainPanel', () => {
     fireEvent.change(screen.getByLabelText('Époque de la clé de service'), {
       target: { value: '99999999999999999999' },
     })
-    expect(screen.getByText('Un entier positif.')).toBeTruthy()
+    expect(screen.getByText('Un entier supérieur à zéro.')).toBeTruthy()
     expect(screen.getByRole('button', { name: 'Enregistrer' }).hasAttribute('disabled')).toBe(true)
   })
 

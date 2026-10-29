@@ -1099,11 +1099,16 @@ export interface RelayUpdate {
   astra_authority_url?: string
 }
 
-/** Où est le coffre : un chemin à afficher, jamais à renvoyer. */
+/**
+ * Où est le coffre : un chemin à afficher, jamais à renvoyer. Sans chemin,
+ * `error` dit pourquoi (réglage illisible) ; la vue reste servie pour garder
+ * « Changer… » et « Emplacement par défaut ».
+ */
 export interface VaultLocationView {
-  path: string
+  path: string | null
   is_default: boolean
   picker_available: boolean
+  error: string | null
 }
 
 /** Ce dont part le formulaire de création de domaine. */

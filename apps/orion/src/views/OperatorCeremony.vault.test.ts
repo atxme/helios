@@ -51,6 +51,24 @@ describe('the vault gestures in the ceremony window', () => {
     expect(first).toBe('Brancher la nouvelle clé, pour l’enregistrer dans le coffre.')
   })
 
+  it('a_key_role_is_named_in_words', () => {
+    const added = rowsOf({
+      operation: 'key_addition',
+      vault_fingerprint: 'a'.repeat(64),
+      label: 'Clé voyage',
+      role: 'recuperation',
+    })
+    expect(added).toContainEqual(['rôle', 'de récupération'])
+    const removed = rowsOf({
+      operation: 'key_removal',
+      vault_fingerprint: 'a'.repeat(64),
+      slot_id: '01',
+      label: 'Clé bureau',
+      role: 'principale',
+    })
+    expect(removed).toContainEqual(['rôle', 'principale'])
+  })
+
   it('the_finalization_manifest_says_what_it_issues', () => {
     const manifest: DomainFinalizationManifest = {
       operation: 'domain_finalization',

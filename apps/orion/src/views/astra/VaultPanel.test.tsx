@@ -58,6 +58,7 @@ beforeEach(() => {
     path: 'C:\\astra',
     is_default: true,
     picker_available: true,
+    error: null,
   })
   api.operatorDomainDefaults.mockResolvedValue({ rp_id: 'gw.tail.ts.net' })
 })
@@ -88,6 +89,44 @@ describe('VaultPanel', () => {
     api.operatorOverview.mockRejectedValue('coffre illisible')
     render(<VaultPanel onCeremony={vi.fn()} />)
     expect(await screen.findByText(/coffre illisible/)).toBeTruthy()
+  })
+
+  it('an_unreadable_setting_keeps_the_ways_out_beside_its_error', async () => {
+    const unreadable = 'le réglage de l’emplacement du coffre est illisible'
+    api.operatorOverview.mockRejectedValueOnce(unreadable).mockResolvedValue(overview)
+    api.operatorVaultLocation.mockResolvedValue({
+      path: null,
+      is_default: false,
+      picker_available: true,
+      error: unreadable,
+    })
+    api.resetVaultLocation.mockResolvedValue({
+      path: 'C:\\astra',
+      is_default: true,
+      picker_available: true,
+      error: null,
+    })
+    render(<VaultPanel onCeremony={vi.fn()} />)
+    expect(await screen.findByText(unreadable)).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Changer…' })).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Emplacement par défaut' }))
+    await waitFor(() => expect(api.resetVaultLocation).toHaveBeenCalled())
+    expect(await screen.findByText('YubiKey bureau')).toBeTruthy()
+    expect(screen.queryByText(unreadable)).toBeNull()
+  })
+
+  it('a_failed_read_still_offers_the_location_buttons', async () => {
+    api.operatorOverview.mockRejectedValue('coffre illisible')
+    api.operatorVaultLocation.mockResolvedValue({
+      path: 'D:\\x',
+      is_default: false,
+      picker_available: true,
+      error: null,
+    })
+    render(<VaultPanel onCeremony={vi.fn()} />)
+    expect(await screen.findByText(/Lecture du coffre impossible : coffre illisible/)).toBeTruthy()
+    expect(await screen.findByRole('button', { name: 'Changer…' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Emplacement par défaut' })).toBeTruthy()
   })
 
   it('an_absent_vault_offers_the_domain_creation_with_a_suggested_name', async () => {
@@ -147,6 +186,7 @@ describe('VaultPanel', () => {
       path: 'D:\\x',
       is_default: false,
       picker_available: true,
+      error: null,
     })
     api.resetVaultLocation.mockRejectedValue('une cérémonie opérateur est ouverte')
     render(<VaultPanel onCeremony={vi.fn()} />)
@@ -198,6 +238,9 @@ describe('VaultPanel', () => {
       within(dialog).getByText(
         'Retirer « Clé 3 » ? Le retrait est définitif. Une sauvegarde antérieure du coffre reste ouvrable par cette clé.',
       ),
+    ).toBeTruthy()
+    expect(
+      within(dialog).getByText('Pour ouvrir le coffre, présentez une autre clé que « Clé 3 ».'),
     ).toBeTruthy()
     expect(api.beginVaultCeremony).not.toHaveBeenCalled()
     fireEvent.click(within(dialog).getByRole('button', { name: 'Retirer' }))

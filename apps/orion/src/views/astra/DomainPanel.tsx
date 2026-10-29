@@ -133,6 +133,21 @@ export function DomainPanel({ onCeremony }: { onCeremony: (status: OperatorStatu
     )
   }
   if (!overview) return <CircularProgress size={16} aria-label="Lecture du domaine" />
+  if (!overview.location_available) {
+    return (
+      <Alert severity="warning" variant="outlined" sx={{ fontSize: 11.5 }}>
+        Emplacement introuvable : rebrancher le support du coffre, ou choisir un autre
+        emplacement dans « Coffre et clés ».
+      </Alert>
+    )
+  }
+  if (!overview.exists) {
+    return (
+      <Alert severity="info" variant="outlined" sx={{ fontSize: 11.5 }}>
+        Aucun coffre à cet emplacement : créer le domaine depuis « Coffre et clés ».
+      </Alert>
+    )
+  }
   const domain = overview.domain
   if (!domain) {
     return (
@@ -157,10 +172,12 @@ export function DomainPanel({ onCeremony }: { onCeremony: (status: OperatorStatu
   const gatewayKnown = Boolean(domain.server_name && domain.gateway_wg_public_key)
   const needsFinalizing = !domain.ca_tls_present || !overview.credentials_complete
   const pendingChange = changes(form, domain)
+  // Zero is refused here as the relay refuses it: an epoch counts from one.
   const epochInvalid =
     form.epoch.trim() !== '' &&
     (!/^\d+$/.test(form.epoch.trim()) ||
-    !Number.isSafeInteger(Number(form.epoch.trim())))
+      !Number.isSafeInteger(Number(form.epoch.trim())) ||
+      Number(form.epoch.trim()) === 0)
   return (
     <Paper variant="outlined" sx={{ p: 1.75 }}>
       <Typography component="h3" sx={{ fontSize: 12.5, fontWeight: 700, mb: 1.25 }}>
@@ -242,7 +259,7 @@ export function DomainPanel({ onCeremony }: { onCeremony: (status: OperatorStatu
             label="Époque de la clé de service"
             value={form.epoch}
             error={epochInvalid}
-            helperText={epochInvalid ? 'Un entier positif.' : undefined}
+            helperText={epochInvalid ? 'Un entier supérieur à zéro.' : undefined}
             onChange={(event) => setField('epoch')(event.target.value)}
             sx={fieldSx}
           />

@@ -77,27 +77,29 @@ export function VaultPanel({ onCeremony }: { onCeremony: (status: OperatorStatus
     }
   }
 
-  if (error) {
-    return (
-      <Alert severity="error" variant="outlined" sx={{ fontSize: 11.5 }}>
-        Lecture du coffre impossible : {error}
-      </Alert>
-    )
-  }
-  if (!overview) return <CircularProgress size={16} aria-label="Lecture du coffre" />
-
+  // The location block comes first and always renders: an unreadable setting
+  // or a failed read must still leave « Changer… » and « Emplacement par
+  // défaut » within reach, or the operator has no way out of it.
+  const shownPath = location ? location.path : (overview?.vault_path ?? null)
   const locationPanel = (
     <Paper variant="outlined" sx={{ p: 1.75 }}>
       <Typography component="h3" sx={{ fontSize: 12.5, fontWeight: 700, mb: 1 }}>
         Coffre opérateur
       </Typography>
-      <Typography color="text.secondary" sx={{ fontSize: 10.5, overflowWrap: 'anywhere' }}>
-        {location?.path ?? overview.vault_path}
-      </Typography>
-      {overview.vault_fingerprint && (
+      {shownPath && (
+        <Typography color="text.secondary" sx={{ fontSize: 10.5, overflowWrap: 'anywhere' }}>
+          {shownPath}
+        </Typography>
+      )}
+      {overview?.vault_fingerprint && (
         <Typography sx={{ mt: 0.5, fontSize: 10.5, fontFamily: 'monospace', overflowWrap: 'anywhere' }}>
           {overview.vault_fingerprint}
         </Typography>
+      )}
+      {location?.error && (
+        <Alert severity="error" variant="outlined" sx={{ mt: 1, fontSize: 11.5 }}>
+          {location.error}
+        </Alert>
       )}
       {location && (location.picker_available || !location.is_default) && (
         <Stack direction="row" spacing={1} sx={{ mt: 1 }}>
@@ -128,6 +130,21 @@ export function VaultPanel({ onCeremony }: { onCeremony: (status: OperatorStatus
       )}
     </Paper>
   )
+
+  if (error) {
+    return (
+      <Stack spacing={1.25}>
+        {locationPanel}
+        {/* An unresolved location already says why, in its own block. */}
+        {!location?.error && (
+          <Alert severity="error" variant="outlined" sx={{ fontSize: 11.5 }}>
+            Lecture du coffre impossible : {error}
+          </Alert>
+        )}
+      </Stack>
+    )
+  }
+  if (!overview) return <CircularProgress size={16} aria-label="Lecture du coffre" />
 
   if (!overview.location_available) {
     return (
@@ -274,6 +291,9 @@ export function VaultPanel({ onCeremony }: { onCeremony: (status: OperatorStatus
         <DialogContent>
           <DialogContentText sx={{ fontSize: 12 }}>
             {`Retirer « ${removing?.label ?? ''} » ? Le retrait est définitif. Une sauvegarde antérieure du coffre reste ouvrable par cette clé.`}
+          </DialogContentText>
+          <DialogContentText sx={{ mt: 1, fontSize: 12 }}>
+            {`Pour ouvrir le coffre, présentez une autre clé que « ${removing?.label ?? ''} ».`}
           </DialogContentText>
         </DialogContent>
         <DialogActions>

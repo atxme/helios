@@ -77,6 +77,7 @@ beforeEach(() => {
     path: 'C:\\astra',
     is_default: true,
     picker_available: false,
+    error: null,
   })
   api.operatorDomainDefaults.mockResolvedValue({ rp_id: null })
   api.dismissOperatorCeremony.mockResolvedValue(undefined)
@@ -373,6 +374,48 @@ describe('AstraView', () => {
     expect(screen.getByText(/n’est pas encore disponible dans Orion/)).toBeTruthy()
     fireEvent.click(open)
     expect(api.beginOperatorCeremony).not.toHaveBeenCalled()
+  })
+
+  it('ends a domain creation on its fingerprints and next steps', async () => {
+    api.operatorCeremonyStatus.mockResolvedValue({
+      session_id: 'd'.repeat(32),
+      revision: 9,
+      operation: 'create_domain',
+      operation_id: null,
+      remote: 'awaiting_operator',
+      gesture: 'done',
+      allowed: [],
+    })
+    api.operatorOverview.mockResolvedValue({
+      vault_path: 'C:\\astra\\authority-vault.json',
+      exists: true,
+      location_available: true,
+      bootstrapped: true,
+      credentials_complete: false,
+      vault_fingerprint: 'abcdef0123456789',
+      slots: [],
+      max_slots: 8,
+      domain: {
+        trust_domain_id: 'td',
+        rp_id: 'gw',
+        ca_pq_fingerprint: '9999 8888',
+        ca_epoch: 1,
+        ca_tls_epoch: null,
+        ca_tls_present: false,
+        server_name: null,
+        gateway_wg_public_key: null,
+        astra_service_public_key: null,
+        astra_service_key_epoch: null,
+        astra_authority_url: null,
+      },
+    })
+
+    render(<AstraView />)
+
+    expect(await screen.findByText('Domaine créé')).toBeTruthy()
+    expect(screen.getByText('abcd ef01 2345 6789')).toBeTruthy()
+    expect(screen.getByText('9999 8888')).toBeTruthy()
+    expect(screen.getByText(/Sauvegardez le coffre/)).toBeTruthy()
   })
 
   it('names a WebAuthn foreground refusal instead of blaming the key', async () => {

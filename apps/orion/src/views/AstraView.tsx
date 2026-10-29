@@ -13,6 +13,7 @@ import { Check, KeyRound } from 'lucide-react'
 
 import * as api from '../api'
 import { OperatorCeremonyPanel } from './OperatorCeremony'
+import { DomainCreated } from './astra/DomainCreated'
 import { DomainPanel } from './astra/DomainPanel'
 import { ArtifactDownloads } from './astra/ArtifactDownloads'
 import { EnrollmentOperatorPanel } from './astra/EnrollmentOperatorPanel'
@@ -348,6 +349,7 @@ export function AstraView({
           ceremony.operation === 'finalize_domain') && (
           <ArtifactDownloads gesture={ceremony.gesture} />
         )}
+        {ceremony.operation === 'create_domain' && ceremony.gesture === 'done' && <DomainCreated />}
         {finishingRecovery && (
           <Alert severity="info" variant="outlined" sx={{ mt: 1.25, fontSize: 11.5 }}>
             Grant reçu : installation et commit de la nouvelle identité…
