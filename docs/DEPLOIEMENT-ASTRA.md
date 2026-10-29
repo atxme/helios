@@ -16,23 +16,42 @@ de commande jusqu'au lot 6.
 1. Orion, « Coffre et clés » : « Créer un domaine ». Nom du domaine (RP ID) et
    origine, libellés des deux clés, « Créer le domaine » : deux YubiKey, branchées
    une à la fois (quatre dialogues Windows en tout). Ce nom ne se change plus :
-   prendre le nom Tailscale de la gateway si elle est dans un tailnet.
-2. `./scripts/deploy.sh` : le premier passage rapatrie la demande publique.
-3. Orion, « Domaine » : « Reprendre la gateway connectée » inscrit son identité
-   dans le relais (ou « Modifier » pour saisir clé WireGuard, nom de service, clé
-   de service Astra, époque et origine d'Astra), puis « Finaliser le domaine » :
-   un toucher, qui émet la `CA-TLS` (à enregistrer : `ca-tls.pem`) et écrit le
-   document de credentials à côté du coffre.
-4. `issue-gateway-bootstrap`, toujours en ligne de commande (lot 6) :
+   prendre le nom Tailscale de la gateway si elle est dans un tailnet. L'écran de
+   fin montre l'empreinte du coffre et celle de `CA-PQ` : les noter, et
+   sauvegarder le coffre.
+2. `./scripts/deploy.sh` : le premier passage installe la gateway et rapatrie sa
+   demande publique d'amorçage.
+3. `issue-gateway-bootstrap`, toujours en ligne de commande (lot 6) : il émet la
+   feuille PQ de la gateway sous `CA-PQ` et inscrit son identité (clé WireGuard,
+   nom de service) dans le relais. Ajouter `--vault <chemin>`, avant la
+   sous-commande, quand le coffre n'est pas à l'emplacement par défaut (celui que
+   « Coffre et clés » affiche) :
 
 ```sh
 astra-signer issue-gateway-bootstrap \
   --request ~/.helios/astra/gateway-bootstrap-request.json \
   --out ~/.helios/astra/gateway-bootstrap-certificate.json
-./scripts/deploy.sh --astra
+# coffre ailleurs :
+# astra-signer --vault 'E:\astra\authority-vault.json' issue-gateway-bootstrap ...
 ```
 
-Voie transitoire, équivalente aux étapes 1 à 3 tant que `astra-signer` est livré :
+4. Orion, « Domaine » : « Finaliser le domaine ». Un toucher, qui émet la
+   `CA-TLS` (à enregistrer : `ca-tls.pem`) et écrit le document de credentials à
+   côté du coffre. Il exige que le relais nomme la gateway : c'est l'étape 3 qui
+   l'y a inscrite.
+5. `./scripts/deploy.sh --astra` : la reprise reporte la feuille sur la gateway,
+   amorce Astra en épinglant la `CA-TLS`, puis redémarre.
+
+« Reprendre la gateway connectée » et « Modifier », dans « Domaine », ne font pas
+partie de ce parcours : ce sont des outils de **réparation**, pour un relais qui a
+perdu l'identité de la gateway (restauré d'une sauvegarde ancienne, réécrit à la
+main). « Reprendre » lit la feuille PQ de la gateway connectée au profil, la
+vérifie sous le `CA-PQ` du relais et n'inscrit l'identité que si elle y vérifie ;
+« Modifier » saisit clé WireGuard, nom de service, clé de service Astra, époque et
+origine d'Astra. Ni l'un ni l'autre ne remplace une identité déjà inscrite, ni
+celle à laquelle le document de credentials est lié.
+
+Voie transitoire, équivalente aux étapes 1 à 5 tant que `astra-signer` est livré :
 
 ```sh
 astra-signer init --rp-id <gateway>.<tailnet>.ts.net --label "YubiKey du bureau"
@@ -303,8 +322,11 @@ Le coffre est à `~/.helios/astra/authority-vault.json`, et sous Windows à
 (« Changer… » dans « Coffre et clés » ; le fichier choisi s'appelle
 obligatoirement `authority-vault.json`, pour que relais et document de
 credentials, rangés à côté, n'appartiennent qu'à un domaine), puis « Emplacement
-par défaut » revient à l'emplacement habituel. Si le support est débranché,
-Orion affiche « Emplacement introuvable » au lieu de proposer un second domaine.
+par défaut » revient à l'emplacement habituel. À l'emplacement par défaut, Orion
+crée le dossier, privé, s'il n'existe pas encore ; un dossier choisi n'est jamais
+créé. Si le support est débranché, Orion affiche « Emplacement introuvable » au
+lieu de proposer un second domaine. Un réglage d'emplacement illisible s'affiche
+comme une erreur, avec « Changer… » et « Emplacement par défaut » pour en sortir.
 **Sauvegardez-le.** Le perdre entièrement, c'est perdre le domaine ;
 il est déjà chiffré, donc une copie hors ligne ne coûte rien.
 
@@ -327,8 +349,11 @@ nommant cette commande.
 
 Quand la seconde clé est en main, Orion propose « Ajouter une clé » (libellé,
 rôle), « Renommer », « Marquer perdue » / « Réactiver » et « Retirer ». Le
-retrait refuse la clé qui vient d'ouvrir le coffre (en présenter une autre) et
-le coffre garde au moins deux clés. Équivalent en ligne de commande :
+retrait ouvre le coffre avec une autre clé que celle retirée : Windows ne propose
+pas la clé retirée pour ce geste (en présenter une autre), et le coffre garde au
+moins deux clés. Une clé que le document de credentials révoque déjà (retrait
+interrompu entre le document et le coffre) ne se marque plus : refaire le
+retrait. Équivalent en ligne de commande :
 
 ```sh
 astra-signer enrol --label "YubiKey de récupération"

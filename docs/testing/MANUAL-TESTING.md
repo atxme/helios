@@ -783,7 +783,10 @@ Prévoir deux YubiKey, et une troisième si possible.
     avoir débranché la première : Orion affiche alors « Débrancher la clé précédente.
     Brancher la nouvelle clé (2 sur 2), pour l’enregistrer dans le coffre. » Un nombre différent est
     une anomalie à consigner. Le coffre est écrit et le relais public à côté
-    (`astra-domain.json`) ; le panneau liste deux clés.
+    (`astra-domain.json`) ; le panneau liste deux clés. L'écran de fin montre
+    l'empreinte du coffre et celle de `CA-PQ`, groupées par quatre, le rappel
+    « Sauvegardez le coffre » et les étapes suivantes (déploiement, amorçage par
+    `astra-signer issue-gateway-bootstrap`, « Finaliser le domaine »).
 16. « Ajouter une clé » (libellé, rôle) avec la troisième YubiKey : **3 dialogues**
     attendus (une clé déjà enrôlée ouvre le coffre ; la nouvelle s'enregistre
     puis dérive son secret). Sans troisième clé, ajouter une seconde fois une
@@ -796,32 +799,47 @@ Prévoir deux YubiKey, et une troisième si possible.
     la clé passe à « perdue » et le document de credentials est réémis. Puis
     « Réactiver » : retour à l'état actif. Une clé « révoquée » s'affiche
     « révoquée » et n'offre plus ce geste.
-19. « Retirer » : la confirmation rappelle que le retrait est définitif et
-    qu'une sauvegarde antérieure du coffre reste ouvrable par cette clé.
-    D'abord **présenter la clé visée** : refus « La clé qui a ouvert le coffre
-    est celle à retirer : recommencer avec une autre clé. », rien n'est écrit.
-    Recommencer avec une autre clé : le retrait réussit. Avec deux clés restantes,
-    « Retirer » est grisé (« Le coffre doit garder au moins deux clés. »).
+19. « Retirer » : la confirmation rappelle que le retrait est définitif,
+    qu'une sauvegarde antérieure du coffre reste ouvrable par cette clé, et
+    demande de présenter une autre clé que celle visée. D'abord **présenter la
+    clé visée** : elle est hors de la liste que Windows demande, donc le dialogue
+    ne l'accepte pas (sans lui demander son PIN : à constater) et la cérémonie
+    s'arrête sur « Aucune clé n’a répondu, ou le geste a été refusé. » ; rien
+    n'est écrit. Recommencer avec une autre clé : **1 dialogue**, le retrait
+    réussit. Avec deux clés restantes, « Retirer » est grisé (« Le coffre doit
+    garder au moins deux clés. »).
 20. **Emplacement introuvable** : placer un coffre d'essai sur un support amovible,
     le choisir par « Changer… », puis débrancher le support et rouvrir le
     panneau. Attendu : « Emplacement introuvable », sans formulaire de création
     (pas de second coffre créé par erreur) ; rebrancher rétablit l'état.
-21. **Finaliser** — seulement si une gateway d'essai est connectée au profil.
-    « Domaine » : « Reprendre la gateway connectée » enregistre son identité dans
-    le relais (une identité différente de celle déjà enregistrée est refusée) ;
-    « Modifier » complète les autres valeurs ; « Enregistrer » ouvre la
-    confirmation « Enregistrer dans le relais », qui montre « avant → après »
-    (« Confirmer » écrit, « Annuler » abandonne). Puis « Finaliser le domaine » :
-    un toucher, `CA-TLS` émise (`ca-tls.pem` à enregistrer) et document de
-    credentials écrit à côté du coffre. Une fois le domaine complet (`CA-TLS` et
-    credentials en place), le bouton « Finaliser le domaine » disparaît.
+21. **Finaliser**, sur le coffre d'essai. La gateway connectée a sa feuille sous
+    le `CA-PQ` du domaine réel, pas sous celui du coffre d'essai : « Domaine »,
+    « Reprendre la gateway connectée » doit donc **échouer** sur « la feuille de
+    la gateway ne vérifie pas sous le CA-PQ du domaine : … », relais inchangé
+    (sans profil connecté : « Connectez d'abord le profil de la gateway… »). La
+    reprise réussie ne se constate que sur le coffre du domaine réel, en
+    réparation d'un relais qui a perdu l'identité. Ce qui se joue ici :
+    « Modifier », saisir la clé WireGuard et le nom de service de la gateway
+    (puis les autres valeurs) ; « Enregistrer » ouvre la confirmation
+    « Enregistrer dans le relais », qui montre « avant → après » (« Confirmer »
+    écrit, « Annuler » abandonne). Puis « Finaliser le domaine » : un toucher,
+    `CA-TLS` du domaine d'essai émise (`ca-tls.pem` à enregistrer, à ne déployer
+    nulle part) et document de credentials écrit à côté du coffre d'essai. Une
+    fois le domaine complet (`CA-TLS` et credentials en place), le bouton
+    « Finaliser le domaine » disparaît.
 22. **Retour** : « Emplacement par défaut » rend l'emplacement habituel
     (`%APPDATA%\astra\`) ; le coffre d'essai reste intact dans son dossier.
 
 À vérifier aussi : un coffre existant à l'emplacement choisi refuse la création
 (« Un coffre existe déjà à cet emplacement… ») ; un nom de domaine dont le
 dernier label est numérique est refusé ; l'annulation du sélecteur de fichier ne
-change rien ; le sélecteur ne s'ouvre qu'une fois à la fois.
+change rien ; le sélecteur ne s'ouvre qu'une fois à la fois. Sur un poste neuf
+(`%APPDATA%\astra\` absent), l'emplacement par défaut propose « Créer un
+domaine », jamais « Emplacement introuvable », et le dossier est créé ; un réglage
+`%APPDATA%\helios\orion-operator.json` rendu illisible s'affiche en erreur avec
+« Changer… » et « Emplacement par défaut », qui en sortent ; après « Changer… »,
+le support du coffre choisi s'éjecte encore (Orion n'y garde pas son dossier
+courant).
 
 ### Le chemin manuel
 

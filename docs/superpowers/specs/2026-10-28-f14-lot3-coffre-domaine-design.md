@@ -280,3 +280,24 @@ Ils priment sur les sections ci-dessus là où elles diffèrent.
 11. **Écart connu laissé au lot 5** : l'écran de rotation de la `CA-TLS` prend
     encore un chemin de coffre tapé dans la WebView et ignore l'emplacement
     choisi ; le lot 5 remplace ce chemin.
+12. **Dossier de l'emplacement par défaut** : Orion le crée, privé
+    (`create_private_dir`), avant la lecture du coffre et avant tout geste qui
+    résout l'emplacement ; sans cela un poste neuf affichait « Emplacement
+    introuvable » et ne pouvait créer aucun domaine. Un dossier **choisi** n'est
+    jamais créé, et `check_creation` reste strict. Un dossier par défaut
+    impossible à créer reste absent : refus `LocationUnavailable`, comme avant.
+13. **Réglage d'emplacement illisible** : la vue de l'emplacement porte un état
+    d'erreur (`path` absent, `error` en français, `is_default` faux) au lieu
+    d'échouer ; « Coffre et clés » affiche l'erreur **et** « Changer… » /
+    « Emplacement par défaut », y compris quand la lecture du coffre échoue.
+14. **Retrait** : la clé retirée est absente de la liste d'autorisation de
+    l'ouverture (`open_for_removal`), donc elle ne coûte ni PIN ni toucher pour
+    un refus ; la confirmation demande une autre clé. `KeyBeingRemoved` reste le
+    garde-fou si une clé répond quand même pour elle.
+15. **Identité de la gateway saisie à la main** : `write_relay` applique la règle
+    de la reprise — un document de credentials lié à une autre gateway refuse la
+    clé WireGuard saisie (transition de gateway).
+16. **Origine d'Astra** : une vraie origine, `https://hôte[:port]` et rien
+    d'autre (ni chemin, ni requête, ni fragment, ni identifiants ; seul le `/`
+    final est retiré), vérifiée par la même fonction à l'arrivée dans Orion et
+    dans `vault_gestures`.
