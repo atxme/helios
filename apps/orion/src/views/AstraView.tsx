@@ -344,7 +344,8 @@ export function AstraView({
           onDismiss={() => void dismissCeremony()}
         />
         {(ceremony.operation === 'invite_enrollment' ||
-          ceremony.operation === 'accept_enrollment') && (
+          ceremony.operation === 'accept_enrollment' ||
+          ceremony.operation === 'finalize_domain') && (
           <ArtifactDownloads gesture={ceremony.gesture} />
         )}
         {finishingRecovery && (
@@ -615,7 +616,7 @@ export function AstraView({
   const panels: Record<AstraTab, ReactNode> = {
     'Enrôlement': <EnrollmentOperatorPanel onCeremony={setCeremony} />,
     'Coffre et clés': <VaultPanel onCeremony={setCeremony} />,
-    'Domaine': <DomainPanel />,
+    'Domaine': <DomainPanel onCeremony={setCeremony} />,
     'Approbations': approvals,
     'Rotations': rotations,
     'Gateways': (

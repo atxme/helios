@@ -18,6 +18,7 @@ const api = vi.hoisted(() => ({
   operatorDomainDefaults: vi.fn(),
   operatorInvitations: vi.fn(),
   operatorArtifacts: vi.fn(),
+  beginVaultCeremony: vi.fn(),
   getState: vi.fn(),
   getConfig: vi.fn(),
   beginEnrollmentCeremony: vi.fn(),
@@ -190,6 +191,45 @@ describe('AstraView', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Vérifier une clé' }))
     await waitFor(() => expect(screen.queryByRole('tab')).toBeNull())
     expect(screen.getByText('Une opération attend l’opérateur.')).toBeTruthy()
+  })
+
+  it('a_finished_finalization_offers_the_ca_tls_pem_for_saving', async () => {
+    api.operatorOverview.mockResolvedValue({
+      vault_path: 'v.json',
+      exists: true,
+      location_available: true,
+      bootstrapped: true,
+      credentials_complete: false,
+      vault_fingerprint: 'ab12',
+      slots: [],
+      max_slots: 8,
+      domain: {
+        trust_domain_id: 'td',
+        rp_id: 'gw',
+        ca_pq_fingerprint: 'ff',
+        ca_epoch: 1,
+        ca_tls_epoch: null,
+        ca_tls_present: false,
+        server_name: 'gw',
+        gateway_wg_public_key: 'KEY',
+      },
+    })
+    api.beginVaultCeremony.mockResolvedValue({
+      session_id: 'e'.repeat(32),
+      revision: 3,
+      operation: 'finalize_domain',
+      operation_id: null,
+      remote: 'not_required',
+      gesture: 'done',
+      allowed: [],
+    })
+    api.operatorArtifacts.mockResolvedValue([
+      { file_name: 'ca-tls.pem', encoding: 'text', contents: '-----BEGIN CERTIFICATE-----' },
+    ])
+    render(<AstraView />)
+    openTab('Domaine')
+    fireEvent.click(await screen.findByRole('button', { name: 'Finaliser le domaine' }))
+    expect(await screen.findByRole('button', { name: 'Enregistrer ca-tls.pem' })).toBeTruthy()
   })
 
   it('starts from an existing operation and sends the four typed fields', async () => {
