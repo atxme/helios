@@ -8,8 +8,8 @@ qui le suit.
 ## Amorçage en deux passages
 
 Les gestes du coffre et du domaine se jouent **dans Orion**, onglet *Astra*
-(le lot 3 de F14, livré sur la branche `feat/f14-lot3-coffre-domaine`, validation
-Windows à faire). `astra-signer` reste livré comme voie transitoire, jusqu'au
+(le lot 3 de F14, fusionné dans `main` le 31 octobre 2026, validation Windows
+à faire). `astra-signer` reste livré comme voie transitoire, jusqu'au
 lot 7 ; `issue-gateway-bootstrap` n'est pas encore dans Orion et reste en ligne
 de commande jusqu'au lot 6.
 
