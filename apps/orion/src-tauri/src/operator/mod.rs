@@ -187,6 +187,10 @@ pub enum VaultGesture {
     MarkKey { slot_id: String, lost: bool },
     /// The domain's `CA-TLS` and credential document, issued once.
     FinalizeDomain,
+    /// A gateway's leaf at epoch 1, from its public request, then whatever the
+    /// domain still lacks. Only the request's text travels: a path never
+    /// crosses from the WebView.
+    BootstrapGateway { request: String },
 }
 
 /// The role of a key, under the names the overview gives it.
@@ -306,6 +310,17 @@ impl VaultGesture {
                 parse_slot_id(slot_id).map(|_| ())
             }
             Self::FinalizeDomain => Ok(()),
+            Self::BootstrapGateway { request } => {
+                if request.trim().is_empty()
+                    || request.len() > astra_operator::bootstrap::MAX_BOOTSTRAP_REQUEST_BYTES
+                {
+                    return Err(
+                        "la demande d'amorçage est vide ou trop grande (256 Kio au plus)"
+                            .to_string(),
+                    );
+                }
+                Ok(())
+            }
         }
     }
 
@@ -316,6 +331,7 @@ impl VaultGesture {
             Self::RemoveKey { .. } => OperationKind::RemoveKey,
             Self::MarkKey { .. } => OperationKind::MarkKey,
             Self::FinalizeDomain => OperationKind::FinalizeDomain,
+            Self::BootstrapGateway { .. } => OperationKind::IssueGatewayBootstrap,
         }
     }
 }
@@ -949,6 +965,42 @@ mod tests {
             r#"{"gesture":"add_key","label":"secours","role":"recovery"}"#
         )
         .is_err());
+    }
+
+    /// The bootstrap carries the request's text and nothing else.
+    #[test]
+    fn a_bootstrap_gesture_carries_only_the_request_text() {
+        let gesture: VaultGesture =
+            serde_json::from_str(r#"{"gesture":"bootstrap_gateway","request":"{}"}"#)
+                .expect("a bootstrap");
+        assert_eq!(
+            gesture,
+            VaultGesture::BootstrapGateway {
+                request: "{}".into()
+            }
+        );
+        assert_eq!(gesture.operation(), OperationKind::IssueGatewayBootstrap);
+        assert!(gesture.validate().is_ok());
+        assert!(serde_json::from_str::<VaultGesture>(
+            r#"{"gesture":"bootstrap_gateway","request":"{}","path":"/etc/passwd"}"#
+        )
+        .is_err());
+
+        let largest = astra_operator::bootstrap::MAX_BOOTSTRAP_REQUEST_BYTES;
+        for request in [String::new(), "  \n".into(), "x".repeat(largest + 1)] {
+            let message = VaultGesture::BootstrapGateway { request }
+                .validate()
+                .expect_err("refused");
+            assert_eq!(
+                message,
+                "la demande d'amorçage est vide ou trop grande (256 Kio au plus)"
+            );
+        }
+        assert!(VaultGesture::BootstrapGateway {
+            request: "x".repeat(largest)
+        }
+        .validate()
+        .is_ok());
     }
 
     /// Only a name can be a WebAuthn RP ID: an address suggests nothing.

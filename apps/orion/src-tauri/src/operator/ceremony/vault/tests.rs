@@ -358,6 +358,7 @@ fn a_locator_does_not_open_a_vault_gesture() {
         OperationKind::RemoveKey,
         OperationKind::MarkKey,
         OperationKind::FinalizeDomain,
+        OperationKind::IssueGatewayBootstrap,
     ] {
         let (presses, received) = std::sync::mpsc::channel::<Press>();
         drop(presses);
@@ -464,4 +465,169 @@ fn only_a_key_failure_reads_as_a_declined_key() {
         refusal_of(&anyhow::Error::from(SetupRefusal::UnknownSlot)),
         Refusal::HandoffMismatch
     );
+}
+
+/// A gateway's bootstrap request, signed by a key of its own, as the text the
+/// window sends.
+fn bootstrap_request(server_name: &str) -> (String, BootstrapPlan) {
+    use aether::certificates::encoding::{generate_ml_dsa_87_keypair, MlDsa87Signature};
+    use aether::certificates::gateway::GatewayBootstrapRequest;
+
+    let (private_key, public_key) = generate_ml_dsa_87_keypair().expect("gateway key");
+    let wireguard = aether::wg::generate_keypair().expect("wireguard key");
+    let request = GatewayBootstrapRequest {
+        format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+        gateway_wg_public_key: aether::certificates::encoding::WireGuardKey::parse(
+            &wireguard.public_key,
+        )
+        .expect("key"),
+        server_name: server_name.into(),
+        ml_dsa_87_public_key: public_key,
+        key_possession_proof: MlDsa87Signature::placeholder(),
+    }
+    .sign(&private_key)
+    .expect("signed");
+    let text = serde_json::to_string(&request).expect("request text");
+    let plan = BootstrapPlan {
+        request,
+        records_identity: true,
+        issues_ca_tls: true,
+        issues_credentials: true,
+    };
+    (text, plan)
+}
+
+fn opening(credential: u8) -> Opened {
+    Opened {
+        credential_id: vec![credential; 64],
+        secret: astra_operator::vault::SlotSecret::new(vec![credential; 32]),
+    }
+}
+
+/// A request that does not parse, or does not verify, is refused before any
+/// key, and nothing is written.
+#[test]
+fn a_wrong_request_is_refused_before_any_key() {
+    let domain = Domain::new("bootstrap-wrong");
+    let before = std::fs::read_dir(domain.vault_path.parent().expect("folder"))
+        .expect("folder")
+        .count();
+    let (text, _) = bootstrap_request("gateway.example");
+    let forged = text.replace("gateway.example", "gateway.other");
+    for request in ["not a request".to_string(), forged] {
+        let (outcome, published, artifacts) = run_vault_gesture(
+            crate::operator::VaultGesture::BootstrapGateway { request },
+            &domain.vault_path,
+        );
+        outcome.expect_err("a wrong request is refused");
+        refused_before_the_key(&published, Refusal::BootstrapRequestInvalid);
+        assert!(artifacts.is_empty());
+    }
+    let after = std::fs::read_dir(domain.vault_path.parent().expect("folder"))
+        .expect("folder")
+        .count();
+    assert_eq!(before, after);
+}
+
+/// A key presented twice is one approval: refused at the second press, with
+/// nothing signed nor written.
+#[test]
+fn the_second_key_must_be_another_credential() {
+    let domain = Domain::new("bootstrap-repeated");
+    let relay_path = astra_operator::handoff::path_beside(&domain.vault_path);
+    let relay_before = std::fs::read(&relay_path).expect("relay");
+    let (_, plan) = bootstrap_request("gateway.example");
+
+    let (presses, received) = std::sync::mpsc::channel::<Press>();
+    drop(presses);
+    let mut ceremony = Ceremony::new(
+        Id16::new([5; 16]).expect("id"),
+        OperationLocator {
+            kind: OperationKind::IssueGatewayBootstrap,
+            operation_id: None,
+        },
+    );
+    let mut published = Vec::new();
+    let mut artifacts = Vec::new();
+    let mut publish = |status| published.push(status);
+    let mut run = VaultRun {
+        ceremony: &mut ceremony,
+        presses: &received,
+        publish: &mut publish,
+        vault_path: &domain.vault_path,
+    };
+    run.answered(1, "quotidienne");
+    run.answered(2, "quotidienne");
+    let outcome = run.issue_bootstrap(&plan, &opening(1), &opening(1), &mut |artifact| {
+        artifacts.push(artifact)
+    });
+
+    outcome.expect_err("one key twice is refused");
+    let last = published.last().expect("a status");
+    assert_eq!(last.gesture, GestureState::Failed);
+    assert_eq!(last.refusal, Some(Refusal::KeyRepeated));
+    assert!(published
+        .iter()
+        .all(|status| status.gesture != GestureState::Signing));
+    assert_eq!(last.keys.len(), 1);
+    assert!(artifacts.is_empty());
+    assert_eq!(std::fs::read(&relay_path).expect("relay"), relay_before);
+    assert!(!astra_operator::bootstrap::path_beside(&domain.vault_path).exists());
+}
+
+/// The leaf is handed over first, then the `CA-TLS` when one was issued.
+#[test]
+fn the_bootstrap_deposits_the_leaf_and_the_ca_tls() {
+    use astra_operator::vault_gestures::Finalized;
+
+    let mut artifacts = Vec::new();
+    deposit_bootstrapped(
+        Bootstrapped {
+            leaf_json: "{\"leaf\":true}".into(),
+            leaf_fingerprint: "fp".into(),
+            finalized: Some(Finalized {
+                ca_tls_pem: Some("-----BEGIN CERTIFICATE-----".into()),
+                credentials_epoch: Some(1),
+            }),
+        },
+        &mut |artifact| artifacts.push(artifact),
+    );
+    let names: Vec<&str> = artifacts
+        .iter()
+        .map(|artifact| artifact.file_name.as_str())
+        .collect();
+    assert_eq!(names, ["gateway-bootstrap-certificate.json", "ca-tls.pem"]);
+    assert_eq!(artifacts[0].contents, "{\"leaf\":true}");
+    assert!(artifacts
+        .iter()
+        .all(|artifact| artifact.encoding == ArtifactEncoding::Text));
+
+    // A domain that already carried its CA-TLS deposits the leaf alone.
+    let mut artifacts = Vec::new();
+    deposit_bootstrapped(
+        Bootstrapped {
+            leaf_json: "{}".into(),
+            leaf_fingerprint: "fp".into(),
+            finalized: None,
+        },
+        &mut |artifact| artifacts.push(artifact),
+    );
+    assert_eq!(artifacts.len(), 1);
+}
+
+/// What the bootstrap adds to the checks a vault gesture names.
+#[test]
+fn refusals_of_the_bootstrap_are_named() {
+    for (setup, window) in [
+        (SetupRefusal::OtherGateway, Refusal::OtherGateway),
+        (
+            SetupRefusal::BootstrapRequestInvalid,
+            Refusal::BootstrapRequestInvalid,
+        ),
+        (SetupRefusal::SignerRevoked, Refusal::KeyNotEnrolled),
+        (SetupRefusal::PlanChanged, Refusal::ManifestMismatch),
+    ] {
+        assert_eq!(refusal_of_setup(setup), window);
+        assert_eq!(refusal_of(&anyhow::Error::from(setup)), window);
+    }
 }

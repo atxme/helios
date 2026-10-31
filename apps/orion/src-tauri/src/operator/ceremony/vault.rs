@@ -15,12 +15,15 @@ use std::sync::mpsc::Receiver;
 
 use aether::certificates::encoding::{Fingerprint, Id16, TrustDomainId};
 use aether::certificates::operator_session::{
-    AstraManifest, DomainCreationManifest, DomainFinalizationManifest, GestureState,
-    KeyAdditionManifest, KeyMarkingManifest, KeyPurpose, KeyRemovalManifest, KeySlotLabel,
-    OperationLocator, OperatorStatus, Refusal, RemoteState,
+    AstraManifest, DomainCreationManifest, DomainFinalizationManifest, GatewayBootstrapManifest,
+    GestureState, KeyAdditionManifest, KeyMarkingManifest, KeyPurpose, KeyRemovalManifest,
+    KeySlotLabel, OperationLocator, OperatorStatus, Refusal, RemoteState,
 };
 use aether_fido::authenticator::{Authenticator, AuthenticatorError};
 use astra_operator::authenticator::Opened;
+use astra_operator::bootstrap::{
+    self, BootstrapPlan, Bootstrapped, BOOTSTRAP_CERTIFICATE_FILE, BOOTSTRAP_LEAF_DAYS,
+};
 use astra_operator::gestures::{GestureError, NewAuthority, NewKey};
 use astra_operator::vault::{AuthorityVault, SlotRole};
 use astra_operator::vault_gestures::{self as gestures, SetupRefusal};
@@ -71,6 +74,7 @@ pub fn run_vault(
         VaultGesture::RemoveKey { slot_id } => run.remove_key(&slot_id),
         VaultGesture::MarkKey { slot_id, lost } => run.mark_key(&slot_id, lost),
         VaultGesture::FinalizeDomain => run.finalize(deposit),
+        VaultGesture::BootstrapGateway { request } => run.bootstrap_gateway(&request, deposit),
     }
 }
 
@@ -204,7 +208,19 @@ impl VaultRun<'_> {
         of: u8,
         removing: Option<&[u8; 16]>,
     ) -> Result<Option<Opened>, String> {
-        let Some(key) = self.ask_key(index, of, KeyPurpose::OpenVault)? else {
+        self.open_vault_for(vault, index, of, removing, KeyPurpose::OpenVault)
+    }
+
+    /// [`Self::open_vault`], the key asked for under `purpose`.
+    fn open_vault_for(
+        &mut self,
+        vault: &AuthorityVault,
+        index: u8,
+        of: u8,
+        removing: Option<&[u8; 16]>,
+        purpose: KeyPurpose,
+    ) -> Result<Option<Opened>, String> {
+        let Some(key) = self.ask_key(index, of, purpose)? else {
             return Ok(None);
         };
         // The PIN is empty for the reason `open_key` refused a transport that
@@ -448,6 +464,71 @@ impl VaultRun<'_> {
         }
     }
 
+    /// A gateway's leaf, under two keys, then whatever the domain still lacks.
+    ///
+    /// The request is checked as a plan before any key is asked anything. Both
+    /// openings are proved to read the anchors by `bootstrap_with`, which this
+    /// relies on rather than repeating the trial.
+    fn bootstrap_gateway(
+        &mut self,
+        request: &str,
+        deposit: &mut dyn FnMut(OperatorArtifact),
+    ) -> Result<(), String> {
+        let (vault, fingerprint) = self.load()?;
+        let plan = match bootstrap::bootstrap_plan(self.vault_path, request) {
+            Ok(plan) => plan,
+            Err(refusal) => return self.refuse_setup(refusal),
+        };
+        self.show(AstraManifest::GatewayBootstrap(GatewayBootstrapManifest {
+            vault_fingerprint: fingerprint,
+            server_name: plan.request.server_name.clone(),
+            gateway_wg_public_key: plan.request.gateway_wg_public_key,
+            request_fingerprint: plan.request.fingerprint(),
+            leaf_days: BOOTSTRAP_LEAF_DAYS,
+            issues_ca_tls: plan.issues_ca_tls,
+            ca_tls_days: gestures::CA_TLS_DAYS,
+            issues_credentials: plan.issues_credentials,
+        }));
+
+        let Some(first) = self.open_vault(&vault, 1, 2, None)? else {
+            return Ok(());
+        };
+        let Some(second) = self.open_vault_for(&vault, 2, 2, None, KeyPurpose::SecondApproval)?
+        else {
+            return Ok(());
+        };
+        self.issue_bootstrap(&plan, &first, &second, deposit)
+    }
+
+    /// Issues the bootstrap with the two openings, once the second key has
+    /// answered. One key presented twice is refused here, before the signing
+    /// state and with nothing written.
+    fn issue_bootstrap(
+        &mut self,
+        plan: &BootstrapPlan,
+        first: &Opened,
+        second: &Opened,
+        deposit: &mut dyn FnMut(OperatorArtifact),
+    ) -> Result<(), String> {
+        if first.credential_id == second.credential_id {
+            // The repeated key is not a second approver: it is not listed.
+            self.ceremony.keys.pop();
+            return self.refuse(
+                Refusal::KeyRepeated,
+                "le même credential a été présenté deux fois : l'amorçage en exige deux distincts"
+                    .to_string(),
+            );
+        }
+        self.signing();
+        match bootstrap::bootstrap_with(self.vault_path, plan, first, second, now_unix()) {
+            Ok(bootstrapped) => {
+                deposit_bootstrapped(bootstrapped, deposit);
+                self.done()
+            }
+            Err(error) => self.refuse(refusal_of(&error), format!("{error:#}")),
+        }
+    }
+
     /// The slot the gesture names. Validated on arrival, so a failure here is
     /// a gesture that did not come through the window.
     fn slot_id(&mut self, slot_id: &str) -> Result<[u8; 16], String> {
@@ -461,6 +542,23 @@ impl VaultRun<'_> {
     fn signing(&mut self) {
         self.ceremony.gesture = GestureState::Signing;
         (self.publish)(self.ceremony.status());
+    }
+}
+
+/// Hands over the public files a bootstrap produced: the leaf, then the
+/// `CA-TLS` when the finalization issued it.
+fn deposit_bootstrapped(bootstrapped: Bootstrapped, deposit: &mut dyn FnMut(OperatorArtifact)) {
+    deposit(OperatorArtifact {
+        file_name: BOOTSTRAP_CERTIFICATE_FILE.to_string(),
+        contents: bootstrapped.leaf_json,
+        encoding: ArtifactEncoding::Text,
+    });
+    if let Some(pem) = bootstrapped.finalized.and_then(|done| done.ca_tls_pem) {
+        deposit(OperatorArtifact {
+            file_name: "ca-tls.pem".to_string(),
+            contents: pem,
+            encoding: ArtifactEncoding::Text,
+        });
     }
 }
 

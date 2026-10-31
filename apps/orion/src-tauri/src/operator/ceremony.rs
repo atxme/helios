@@ -78,7 +78,8 @@ pub fn run(
         | OperationKind::AddKey
         | OperationKind::RemoveKey
         | OperationKind::MarkKey
-        | OperationKind::FinalizeDomain => {
+        | OperationKind::FinalizeDomain
+        | OperationKind::IssueGatewayBootstrap => {
             ceremony.refuse(Refusal::Internal);
             publish(ceremony.status());
             Err(format!(
