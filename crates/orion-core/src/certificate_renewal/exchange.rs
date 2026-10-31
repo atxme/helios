@@ -128,36 +128,6 @@ pub enum RenewalStep {
     Committed { generation: u64 },
 }
 
-/// The companion invocation this operation is waiting on (spec §12.2).
-///
-/// Built here rather than in the shell for one reason: the two arguments are
-/// the *only* thing `astra-signer` needs, and both come from state this crate
-/// owns. A screen that assembled the command itself would be a second place
-/// where the route, the identifier and the gateway address have to agree.
-///
-/// Neither field is a secret. The operation identifier is public — it is what
-/// the gateway prints in its own log — and the capability tokens the companion
-/// will need are minted on the read it makes, never carried here.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompanionInvocation {
-    /// `astra-signer`, unqualified and fixed: installation chooses its location
-    /// through `PATH`, while neither a profile field nor a network response can
-    /// select another executable. A platform-specific absolute path would make
-    /// development and packaged layouts disagree.
-    pub program: &'static str,
-    pub arguments: Vec<String>,
-}
-
-impl CompanionInvocation {
-    /// One line, for a screen that shows a value the operator can copy.
-    pub fn command_line(&self) -> String {
-        std::iter::once(self.program.to_string())
-            .chain(self.arguments.iter().cloned())
-            .collect::<Vec<_>>()
-            .join(" ")
-    }
-}
-
 /// Candidate key material, alive only for the duration of one renewal.
 ///
 /// Not `Clone`, not `Serialize`: there is exactly one holder, and the only
@@ -357,29 +327,6 @@ impl RenewalSession {
     /// The operation this session opened, once it has one.
     pub fn operation_id(&self) -> Option<Id16> {
         self.operation_id
-    }
-
-    /// What to launch so an operator can approve this renewal.
-    ///
-    /// `None` until an operation exists: there is nothing to approve before
-    /// the authority has opened one, and offering the command earlier would
-    /// have the companion fail on an identifier that names nothing.
-    ///
-    /// The companion runs **on this machine**, because the routes it will call
-    /// authenticate the peer by its WireGuard source address. That is also why
-    /// it needs no credential of its own here — the tunnel is the credential.
-    pub fn companion_invocation(&self) -> Option<CompanionInvocation> {
-        let operation_id = self.operation_id?;
-        Some(CompanionInvocation {
-            program: "astra-signer",
-            arguments: vec![
-                "approve".into(),
-                "--heliosd-url".into(),
-                self.routes.base.clone(),
-                "--operation-id".into(),
-                operation_id.to_hex(),
-            ],
-        })
     }
 
     /// Step 1: hands the signed request to the gateway.

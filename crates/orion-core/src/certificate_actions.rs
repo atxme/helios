@@ -33,14 +33,11 @@
 //! That material now has a home — `KeyNegotiationSettings::trust`, carried by
 //! the `.orion` document and the vault manifest — so a profile enrolled since
 //! §19 holds it, and [`crate::certificate_renewal`] signs the request, drives
-//! the operation and commits the grant. The operator's companion closes the
-//! chain over the same tunnel (`astra-signer approve --heliosd-url`), so the
-//! ordinary renewal has no missing link left and is no longer blocked here.
-//!
-//! `RenewalSession::companion_invocation` hands the shell the exact companion
-//! invocation. Launch remains a surface concern and not an action refusal: a
-//! machine whose policy blocks process creation still has a valid operation
-//! and the copyable command as its explicit fallback.
+//! the operation and commits the grant. Orion closes the
+//! chain over the same tunnel: its engine verifies the approval request, and
+//! its interface process performs the operator's assertion itself
+//! (`certificate_approval`). The ordinary renewal has no missing link left and
+//! is no longer blocked here, and no companion program is launched for it.
 //!
 //! Either way the refusal happens **before** a key pair is generated or an
 //! authority is asked to certify anything: a button that produced a key and
@@ -117,11 +114,12 @@ pub enum CertificateActionBlock {
     /// The trust material is there and the client half of §7 is wired; what
     /// is missing is the operator companion's own transport.
     ///
-    /// **Plus émis** depuis que `astra-signer approve --heliosd-url` existe :
+    /// **Plus émis** depuis qu'Orion approuve lui-même le renouvellement :
     /// la variante survit pour qu'un état sérialisé antérieur se relise, et
     /// `renewal_block` ne la rend plus.
     CompanionTransportMissing,
-    /// Needs a hardware credential and the `astra-signer` companion.
+    /// Needs a hardware credential and the `astra-signer` companion (not the
+    /// ordinary renewal, which Orion approves itself).
     OperatorCredentialRequired,
 }
 
@@ -230,13 +228,9 @@ fn renewal_block(
         return Some(CertificateActionBlock::TrustMaterialMissing);
     }
     // Nothing blocks it any more. `certificate_renewal` signs the rotation
-    // request, drives the operation and commits the grant; `astra-signer
-    // approve --heliosd-url` fetches its own request through the same tunnel
-    // and posts the operator's assertion back. The chain closes.
-    //
-    // Launching the companion is a surface concern rather than a refusal:
-    // `RenewalSession::companion_invocation` hands the shell the exact value,
-    // and a launch failure still leaves the copyable fallback usable.
+    // request, drives the operation and commits the grant, and Orion approves
+    // the request itself: the engine verifies it, the interface process
+    // performs the assertion. No companion is launched.
     None
 }
 

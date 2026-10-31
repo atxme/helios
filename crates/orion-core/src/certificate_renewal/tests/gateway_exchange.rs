@@ -263,19 +263,13 @@ fn a_failed_operation_is_reported_as_such() {
 /// The amendment of 6 September 2026 removed the per-request approval from
 /// the scheduled path, so `AwaitingOperator` can only come from an Astra
 /// that has not been migrated. The client says which of the two ends is
-/// behind rather than launching a companion for a ceremony that no longer
-/// exists — and the companion is never offered for it.
+/// behind rather than waiting on a ceremony that no longer exists.
 #[test]
 fn an_authority_still_awaiting_an_operator_is_reported_as_obsolete() {
     let directory = tempfile::tempdir().expect("temp dir");
     let domain = domain();
     let store = store(directory.path(), &domain);
     let mut session = session(&store, &domain);
-    assert!(
-        session.companion_invocation().is_none(),
-        "nothing to approve before an operation exists"
-    );
-
     let operation_id = Id16::new([6; 16]).expect("id");
     let adopted = session.adopt(ClientRenewalOperationView {
         operation_id,
@@ -294,9 +288,7 @@ fn an_authority_still_awaiting_an_operator_is_reported_as_obsolete() {
         adopted,
         Err(RenewalError::ObsoleteOperatorApproval)
     ));
-    // Limite connue : `companion_invocation` reste offert dès qu'une
-    // opération existe, alors que la cérémonie qu'il lancerait n'a plus de
-    // rôle dans le chemin planifié. Le remède que nomme l'erreur est de
-    // migrer l'autorité, pas d'approuver une demande à la main.
-    assert!(session.companion_invocation().is_some());
+    // L'état reste en attente d'opérateur : le remède que nomme l'erreur est
+    // de migrer l'autorité, pas d'approuver une demande à la main.
+    assert_eq!(session.operation_id(), Some(operation_id));
 }

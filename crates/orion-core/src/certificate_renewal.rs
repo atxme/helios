@@ -60,8 +60,8 @@ mod promotion;
 mod trust_store;
 
 pub use exchange::{
-    begin, resume, ActiveIdentity, CandidateKeys, CompanionInvocation, RenewalRoutes,
-    RenewalSession, RenewalStep, REQUEST_LIFETIME_SECS,
+    begin, resume, ActiveIdentity, CandidateKeys, RenewalRoutes, RenewalSession, RenewalStep,
+    REQUEST_LIFETIME_SECS,
 };
 pub use promotion::{
     candidate_identity_of, promote_due, promote_local_identity_if_due, rollback_to_previous,
