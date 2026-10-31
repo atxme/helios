@@ -31,10 +31,12 @@ transitoire.
    demande **deux clés distinctes**, branchées l'une après l'autre (deux
    dialogues Windows, un par ouverture du coffre ; non vérifié sous WSL2). Il
    émet la feuille PQ de la gateway sous `CA-PQ` et inscrit son identité (clé
-   WireGuard, nom de service) dans le relais. À la fin, « Enregistrer
-   gateway-bootstrap-certificate.json » : l'enregistrer **à côté du coffre**, au
-   chemin que `deploy.sh` imprime (par défaut
-   `~/.helios/astra/gateway-bootstrap-certificate.json`). Sur un domaine neuf,
+   WireGuard, nom de service) dans le relais. À la fin, Orion a **déjà écrit la
+   feuille à côté du coffre** (`gateway-bootstrap-certificate.json`) et en affiche
+   l'empreinte ; si `deploy.sh` la lit dans un autre dossier (le chemin qu'il
+   imprime, par défaut `~/.helios/astra/gateway-bootstrap-certificate.json`),
+   l'y enregistrer aussi par « Enregistrer gateway-bootstrap-certificate.json ».
+   Sur un domaine neuf,
    le même geste émet aussi la `CA-TLS` (`ca-tls.pem`, à enregistrer) et signe le
    document de credentials : l'étape 4 est alors faite. Le bouton reste
    disponible ensuite ; réémettre la feuille de la **même** gateway ne change
@@ -44,6 +46,8 @@ transitoire.
    interrompu avant la `CA-TLS` ou le document de credentials). Un toucher, qui
    émet la `CA-TLS` (à enregistrer : `ca-tls.pem`) et écrit le document de
    credentials à côté du coffre. Il exige que le relais nomme la gateway.
+   Un amorçage interrompu après la feuille le dit à sa fin : la feuille est émise
+   et enregistrée à côté du coffre, et ce bouton reprend ce qui manque.
 5. `./scripts/deploy.sh --astra` : la reprise reporte la feuille sur la gateway,
    amorce Astra en épinglant la `CA-TLS`, puis redémarre.
 

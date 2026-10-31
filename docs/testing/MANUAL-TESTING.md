@@ -852,19 +852,21 @@ d'amorçage de gateway (`gateway-bootstrap-request.json`, rapatrié par
 `deploy.sh` ou copié d'une gateway d'essai).
 
 23. Onglet *Astra*, « Domaine », sur un coffre d'essai à deux clés actives et
-    domaine neuf : « Amorcer la gateway… », choisir la demande valide. Orion montre
-    le manifeste (Gateway, Identité WireGuard, Demande (empreinte), Validité de la
-    feuille, Émettre la CA-TLS, Signer le document de credentials). Avec moins de
-    deux clés actives, le bouton est grisé : « Il faut deux clés actives pour
-    amorcer la gateway. »
+    domaine neuf : « Amorcer la gateway… » est le bouton principal, « Finaliser le
+    domaine » grisé avec « Amorcer d’abord la gateway (« Amorcer la gateway… »). ».
+    Choisir la demande valide. Orion montre le manifeste (coffre, gateway, identité
+    WireGuard, demande, époque `1`, validité de la feuille, approbations « deux
+    clés distinctes », émettre la CA-TLS, signer le document de credentials). Avec
+    moins de deux clés actives, le bouton est grisé : « Il faut deux clés actives
+    pour amorcer la gateway. »
 24. « Amorcer avec les deux clés » : **2 dialogues Windows attendus**, un par
     ouverture du coffre. Orion affiche « Brancher une clé du coffre (1 sur 2), pour
     ouvrir le coffre. », puis « Débrancher la clé précédente. Brancher une autre clé
     du coffre (2 sur 2), pour approuver l’amorçage. » Un nombre différent est une
     anomalie à consigner.
-25. À la fin : « Enregistrer gateway-bootstrap-certificate.json » et
-    « Enregistrer ca-tls.pem » (domaine neuf), et « Portez la feuille sur la
-    gateway… ». Enregistrer les deux fichiers : la feuille est aussi écrite à côté
+25. À la fin : « Enregistrer gateway-bootstrap-certificate.json », avec
+    « empreinte : … » sous le bouton, et « Enregistrer ca-tls.pem » (domaine neuf),
+    et « Portez la feuille sur la gateway… ». Enregistrer les deux fichiers : la feuille est aussi écrite à côté
     du coffre, sous ce nom. Le relais nomme maintenant la gateway ; le document de
     credentials est à côté du coffre ; « Finaliser le domaine » n'est plus proposé.
 26. **Demande altérée** : modifier un caractère de la demande, la choisir.

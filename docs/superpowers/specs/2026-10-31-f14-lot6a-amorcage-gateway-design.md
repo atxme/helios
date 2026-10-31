@@ -219,15 +219,15 @@ change ce qui est construit) :
 
 ## 10. Amendements (écarts pris pendant l'exécution)
 
-1. **`SetupRefusal::PlanChanged` devient `ManifestMismatch`** : le refus dit ce
-   qu'il constate, le plan montré à l'opérateur ne correspond plus à celui que
-   recalcule la touche.
-2. **L'analyse de `CA-PQ` passe dans le plan** : un coffre ou un relais dont
-   `CA-PQ` ne s'analyse pas est refusé `LocationUnavailable` avant toute clé, et
-   non après les deux touchers.
-3. **`SignerRevoked` devient `KeyNotEnrolled`** : la clé qui signe n'est pas
-   enrôlée dans le coffre (ou y est révoquée), ce qui est le même refus pour
-   l'opérateur.
+1. **`SetupRefusal::PlanChanged` est rendu comme `Refusal::DomainChanged`** : le
+   refus dit ce qu'il constate, le plan montré à l'opérateur ne correspond plus
+   à celui que recalcule la touche ; rien n'a été signé (amendement 11).
+2. **L'analyse de `CA-PQ` passe dans le plan** : un coffre dont `CA-PQ` ne
+   s'analyse pas est refusé `LocationUnavailable` avant toute clé, et non après
+   les deux touchers.
+3. **`SetupRefusal::SignerRevoked` est rendu comme `Refusal::SignerRevoked`** :
+   la clé qui a répondu est révoquée par le document de credentials ; il faut en
+   présenter une autre (amendement 11).
 4. **Clé répétée refusée par la cérémonie** (`KeyRepeated`) dès la seconde
    ouverture, avec un filet dans `bootstrap_with` si une autre voie l'appelle.
 5. **L'identité n'est écrite au relais qu'après les deux preuves d'ancres**, plus
@@ -236,3 +236,26 @@ change ce qui est construit) :
    signature n'a rien laissé sur le disque.
 7. **`readFileText` est partagé avec « Accepter une demande »** (un seul lecteur
    de fichier de la WebView, une seule borne de taille).
+8. **L'empreinte de la feuille est un champ de l'artefact** (§4.1 étape 6) :
+   `OperatorArtifact` porte une `fingerprint` facultative et publique, absente de
+   la sérialisation quand elle manque ; seule la feuille d'amorçage la porte, et
+   l'écran de fin l'affiche sous son bouton (« empreinte : … »).
+9. **Une finalisation en échec après la feuille ne cache pas la feuille**
+   (§4.1 étape 5) : `bootstrap_with` ne rend une erreur que si aucune feuille
+   n'est écrite ; ensuite il rend `Bootstrapped`, dont `finalization` vaut
+   `NotNeeded`, `Issued(Finalized)` ou `Failed(chaîne d'erreur, pour le
+   journal)`. La cérémonie dépose d'abord la feuille, puis refuse `Internal`
+   quand la finalisation a échoué ; l'écran dit alors « La feuille est émise et
+   enregistrée à côté du coffre ; « Finaliser le domaine » reprend ce qui
+   manque. ».
+10. **Sur un domaine neuf, l'amorçage est le geste principal** : tant que le
+    relais ne nomme pas la gateway, « Amorcer la gateway… » est le bouton
+    principal et « Finaliser le domaine », grisé, dit « Amorcer d'abord la
+    gateway (« Amorcer la gateway… »). » ; une fois la gateway connue, la
+    disposition du lot 3 revient.
+11. **Deux refus nouveaux au contrat** (§4.3, §9.3) : `DomainChanged` et
+    `SignerRevoked`, avant `Internal`, chacun avec sa phrase (« Le domaine a
+    changé depuis l'affichage de ce qui allait être signé : recommencer le geste.
+    Rien n'a été signé. », « Le document de credentials révoque cette clé : en
+    présenter une autre. »), plutôt que `ManifestMismatch` et `KeyNotEnrolled`,
+    dont les phrases décrivent autre chose.
