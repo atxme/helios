@@ -11,8 +11,7 @@ Les gestes du coffre et du domaine se jouent **dans Orion**, onglet *Astra*
 (le lot 3 de F14, fusionné dans `main` le 31 octobre 2026, validation Windows
 à faire). `astra-signer` reste livré comme voie transitoire, jusqu'au
 lot 7. L'amorçage de la gateway se joue lui aussi dans Orion (le lot 6a de F14,
-sur la branche `feat/f14-lot6a-amorcage-gateway`, pas encore fusionné, validation
-Windows à faire) ; `astra-signer issue-gateway-bootstrap` en est la voie
+fusionné dans `main` le 31 octobre 2026, validation Windows à faire) ; `astra-signer issue-gateway-bootstrap` en est la voie
 transitoire.
 
 1. Orion, « Coffre et clés » : « Créer un domaine ». Nom du domaine (RP ID) et
