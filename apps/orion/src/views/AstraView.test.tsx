@@ -236,6 +236,28 @@ describe('AstraView', () => {
     expect(await screen.findByRole('button', { name: 'Enregistrer ca-tls.pem' })).toBeTruthy()
   })
 
+  it('the_bootstrap_offers_its_artifacts', async () => {
+    api.operatorCeremonyStatus.mockResolvedValue({
+      session_id: 'e'.repeat(32),
+      revision: 3,
+      operation: 'issue_gateway_bootstrap',
+      operation_id: null,
+      remote: 'not_required',
+      gesture: 'done',
+      allowed: [],
+    })
+    api.operatorArtifacts.mockResolvedValue([
+      { file_name: 'gateway-bootstrap-certificate.json', encoding: 'text', contents: '{}' },
+      { file_name: 'ca-tls.pem', encoding: 'text', contents: '-----BEGIN CERTIFICATE-----' },
+    ])
+    render(<AstraView />)
+    expect(
+      await screen.findByRole('button', { name: 'Enregistrer gateway-bootstrap-certificate.json' }),
+    ).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Enregistrer ca-tls.pem' })).toBeTruthy()
+    expect(screen.getByText(/Portez la feuille sur la gateway/)).toBeTruthy()
+  })
+
   it('starts from an existing operation and sends the four typed fields', async () => {
     render(<AstraView />)
     openTab('Rotations')

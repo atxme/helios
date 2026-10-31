@@ -17,6 +17,7 @@ import Typography from '@mui/material/Typography'
 
 import * as api from '../../api'
 import type { EnrollmentGesture, InvitationView, OperatorStatus } from '../../types'
+import { readFileText } from './readFileText'
 import { useOverview } from './useOverview'
 
 /** An invitation is a short window, not a standing right (Rust enforces the same bound). */
@@ -25,23 +26,8 @@ const MAX_INVITE_HOURS = 24
 const DEFAULT_VALIDITY_DAYS = 365
 const MAX_VALIDITY_DAYS = 1825
 
-/** Same bound as the other pasted documents: a request or a leaf is a few kilobytes. */
-const MAX_FILE_BYTES = 256 * 1024
-
 const date = (unix: number) =>
   new Date(unix * 1000).toLocaleString('fr-FR', { dateStyle: 'short', timeStyle: 'short' })
-
-/** Reads a chosen file in the WebView; the content is what travels, never a path. */
-async function readText(file: File): Promise<string> {
-  if (file.size > MAX_FILE_BYTES) throw new Error('Fichier trop volumineux (maximum 256 Kio).')
-  if (typeof file.text === 'function') return file.text()
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader()
-    reader.onload = () => resolve(String(reader.result))
-    reader.onerror = () => reject(new Error('Lecture du fichier impossible.'))
-    reader.readAsText(file)
-  })
-}
 
 const integerIn = (text: string, min: number, max: number): number | null => {
   if (!/^\d+$/.test(text.trim())) return null
@@ -308,7 +294,7 @@ function InviteForm({
     setFileError(null)
     if (!file) return
     try {
-      setLeaf(await readText(file))
+      setLeaf(await readFileText(file))
     } catch (cause) {
       setLeaf(null)
       setFileError(String(cause instanceof Error ? cause.message : cause))
@@ -468,7 +454,7 @@ function AcceptForm({
     setFileError(null)
     if (!file) return
     try {
-      setRequest(await readText(file))
+      setRequest(await readFileText(file))
     } catch (cause) {
       setRequest(null)
       setFileError(String(cause instanceof Error ? cause.message : cause))

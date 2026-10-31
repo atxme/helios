@@ -47,6 +47,7 @@ const TITLES: Record<OperationKind, string> = {
   remove_key: 'Retirer une clé',
   mark_key: 'Changer l’état d’une clé',
   finalize_domain: 'Finaliser le domaine',
+  issue_gateway_bootstrap: 'Amorcer la gateway',
 }
 
 /** The verb of the button that goes through with it, per operation. */
@@ -65,6 +66,7 @@ const VERBS: Record<OperationKind, string> = {
   remove_key: 'Retirer avec la clé',
   mark_key: 'Signer avec la clé',
   finalize_domain: 'Finaliser avec la clé',
+  issue_gateway_bootstrap: 'Amorcer avec les deux clés',
 }
 
 function instant(unix: number): string {
@@ -238,6 +240,21 @@ export function rowsOf(manifest: AstraManifest): [string, string][] {
         ],
         ['credentials', manifest.issues_credentials ? 'émis' : 'à jour'],
       ]
+    case 'gateway_bootstrap': {
+      const rows: [string, string][] = [
+        ['Gateway', manifest.server_name],
+        ['Identité WireGuard', manifest.gateway_wg_public_key],
+        ['Demande (empreinte)', manifest.request_fingerprint],
+        ['Validité de la feuille', `${manifest.leaf_days} jours`],
+      ]
+      if (manifest.issues_ca_tls) {
+        rows.push([`Émettre la CA-TLS`, `${manifest.ca_tls_days} jours`])
+      }
+      if (manifest.issues_credentials) {
+        rows.push(['Signer le document de credentials', 'oui'])
+      }
+      return rows
+    }
   }
 }
 
@@ -276,6 +293,11 @@ export function gestureSentence(gesture: GestureState, operation: OperationKind)
     if ('awaiting_key' in gesture) {
       const { index, of, purpose } = gesture.awaiting_key
       const which = of > 1 ? ` (${index} sur ${of})` : ''
+      if (operation === 'issue_gateway_bootstrap') {
+        return purpose === 'second_approval'
+          ? `Débrancher la clé précédente. Brancher une autre clé du coffre${which}, pour approuver l’amorçage.`
+          : `Brancher une clé du coffre${which}, pour ouvrir le coffre.`
+      }
       if (purpose === 'register_key') {
         const previous = index > 1 ? 'Débrancher la clé précédente. ' : ''
         return `${previous}Brancher la nouvelle clé${which}, pour l’enregistrer dans le coffre.`
@@ -396,6 +418,16 @@ export function refusalSentence(refusal: Refusal): string {
       return 'Le domaine est déjà finalisé : CA-TLS et document de credentials sont en place.'
     case 'handoff_mismatch':
       return 'La proposition ne correspond pas à ce que ce coffre épingle.'
+    case 'bootstrap_request_invalid':
+      return (
+        'Ce fichier n’est pas une demande d’amorçage de gateway valide, ou sa signature ne se ' +
+        'vérifie pas. Rien n’a été signé.'
+      )
+    case 'other_gateway':
+      return (
+        'Le domaine nomme déjà une autre gateway : en changer est une transition de gateway. ' +
+        'Rien n’a été écrit.'
+      )
     case 'manifest_mismatch':
       return 'La réponse ne décrit pas la demande envoyée.'
     case 'protocol_violation':

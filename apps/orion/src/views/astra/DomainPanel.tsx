@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import Alert from '@mui/material/Alert'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
@@ -15,9 +15,12 @@ import Typography from '@mui/material/Typography'
 
 import * as api from '../../api'
 import type { DomainView, OperatorStatus, RelayUpdate } from '../../types'
+import { readFileText } from './readFileText'
 import { useOverview } from './useOverview'
 
 const WAIT_GATEWAY = 'La gateway n’est pas encore dans le relais.'
+const NEEDS_TWO_KEYS = 'Il faut deux clés actives pour amorcer la gateway.'
+const BAD_FILE = 'Ce fichier est illisible ou trop grand (256 Kio au plus).'
 const fieldSx = { '& input': { fontSize: 11.5 }, '& label': { fontSize: 11.5 } }
 
 interface FormValues {
@@ -79,6 +82,8 @@ export function DomainPanel({ onCeremony }: { onCeremony: (status: OperatorStatu
   const [formError, setFormError] = useState<string | null>(null)
   const [adoptError, setAdoptError] = useState<string | null>(null)
   const [finalizeError, setFinalizeError] = useState<string | null>(null)
+  const [bootstrapError, setBootstrapError] = useState<string | null>(null)
+  const requestInput = useRef<HTMLInputElement>(null)
   const setField = (key: keyof FormValues) => (value: string) =>
     setForm((current) => ({ ...current, [key]: value }))
 
@@ -120,6 +125,27 @@ export function DomainPanel({ onCeremony }: { onCeremony: (status: OperatorStatu
       onCeremony(await api.beginVaultCeremony({ gesture: 'finalize_domain' }))
     } catch (cause) {
       setFinalizeError(String(cause))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  /** The file's text travels to the ceremony; a path never does, and a bad file stops here. */
+  const bootstrap = async (file: File | undefined) => {
+    if (!file) return
+    setBootstrapError(null)
+    let request: string
+    try {
+      request = await readFileText(file)
+    } catch {
+      setBootstrapError(BAD_FILE)
+      return
+    }
+    setBusy(true)
+    try {
+      onCeremony(await api.beginVaultCeremony({ gesture: 'bootstrap_gateway', request }))
+    } catch (cause) {
+      setBootstrapError(String(cause))
     } finally {
       setBusy(false)
     }
@@ -170,6 +196,7 @@ export function DomainPanel({ onCeremony }: { onCeremony: (status: OperatorStatu
     ['Clé WireGuard de la gateway', domain.gateway_wg_public_key ?? '—', true],
   ]
   const gatewayKnown = Boolean(domain.server_name && domain.gateway_wg_public_key)
+  const usableKeys = overview.slots.filter((slot) => slot.state !== 'revoked').length
   const needsFinalizing = !domain.ca_tls_present || !overview.credentials_complete
   const pendingChange = changes(form, domain)
   // Zero is refused here as the relay refuses it: an epoch counts from one.
@@ -221,6 +248,42 @@ export function DomainPanel({ onCeremony }: { onCeremony: (status: OperatorStatu
             </Button>
           )}
         </Stack>
+      )}
+      {!editing && (
+        <Box sx={{ mt: 1.5 }}>
+          <Button
+            size="small"
+            variant="outlined"
+            disabled={busy || usableKeys < 2}
+            onClick={() => requestInput.current?.click()}
+            sx={{ minHeight: 30, fontSize: 11.5 }}
+          >
+            Amorcer la gateway…
+          </Button>
+          <input
+            ref={requestInput}
+            type="file"
+            hidden
+            accept=".json,application/json,text/plain"
+            aria-label="Demande d’amorçage de la gateway"
+            onChange={(event) => {
+              const input = event.target
+              void bootstrap(input.files?.[0]).finally(() => {
+                input.value = ''
+              })
+            }}
+          />
+          {usableKeys < 2 && (
+            <Typography color="text.secondary" sx={{ mt: 0.75, fontSize: 10.5 }}>
+              {NEEDS_TWO_KEYS}
+            </Typography>
+          )}
+          {bootstrapError && (
+            <Alert severity="error" variant="outlined" sx={{ mt: 1, fontSize: 11.5 }}>
+              {bootstrapError}
+            </Alert>
+          )}
+        </Box>
       )}
       {adoptError && (
         <Alert severity="error" variant="outlined" sx={{ mt: 1, fontSize: 11.5 }}>

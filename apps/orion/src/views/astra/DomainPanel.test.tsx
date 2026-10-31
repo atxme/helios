@@ -236,4 +236,60 @@ describe('DomainPanel', () => {
     await screen.findByRole('button', { name: 'Modifier' })
     expect(screen.queryByRole('button', { name: 'Finaliser le domaine' })).toBeNull()
   })
+
+  describe('the gateway bootstrap', () => {
+    const slot = (slot_id: string, state: 'active' | 'lost' | 'revoked' | null) => ({
+      slot_id,
+      label: `Clé ${slot_id}`,
+      role: 'principale' as const,
+      state,
+    })
+    const open = async (slots: ReturnType<typeof slot>[]) => {
+      api.operatorOverview.mockResolvedValue({ ...withDomain({}), slots })
+      render(<DomainPanel onCeremony={onCeremony} />)
+      return screen.findByRole('button', { name: 'Amorcer la gateway…' })
+    }
+    const pick = (file: File) =>
+      fireEvent.change(screen.getByLabelText('Demande d’amorçage de la gateway'), {
+        target: { files: [file] },
+      })
+    const NEEDS = 'Il faut deux clés actives pour amorcer la gateway.'
+
+    it('the_bootstrap_button_needs_two_usable_keys', async () => {
+      const one = await open([slot('01', 'active')])
+      expect(one.hasAttribute('disabled')).toBe(true)
+      expect(screen.getByText(NEEDS)).toBeTruthy()
+      cleanup()
+      const revoked = await open([slot('01', 'active'), slot('02', 'revoked')])
+      expect(revoked.hasAttribute('disabled')).toBe(true)
+      expect(screen.getByText(NEEDS)).toBeTruthy()
+      cleanup()
+      const two = await open([slot('01', 'active'), slot('02', null)])
+      expect(two.hasAttribute('disabled')).toBe(false)
+      expect(screen.queryByText(NEEDS)).toBeNull()
+    })
+
+    it('the_bootstrap_sends_the_file_text_only', async () => {
+      await open([slot('01', 'active'), slot('02', 'active')])
+      pick(new File(['{"request":1}'], 'gateway.json', { type: 'application/json' }))
+      await waitFor(() =>
+        expect(api.beginVaultCeremony).toHaveBeenCalledWith({
+          gesture: 'bootstrap_gateway',
+          request: '{"request":1}',
+        }),
+      )
+      expect(api.beginVaultCeremony).toHaveBeenCalledTimes(1)
+      await waitFor(() => expect(onCeremony).toHaveBeenCalledWith(status))
+    })
+
+    it('a_wrong_file_is_refused_inline', async () => {
+      await open([slot('01', 'active'), slot('02', 'active')])
+      pick(new File(['x'.repeat(256 * 1024 + 1)], 'big.json'))
+      expect(
+        await screen.findByText('Ce fichier est illisible ou trop grand (256 Kio au plus).'),
+      ).toBeTruthy()
+      expect(api.beginVaultCeremony).not.toHaveBeenCalled()
+      expect(onCeremony).not.toHaveBeenCalled()
+    })
+  })
 })

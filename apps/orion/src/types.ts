@@ -669,6 +669,7 @@ export type OperationKind =
   | 'remove_key'
   | 'mark_key'
   | 'finalize_domain'
+  | 'issue_gateway_bootstrap'
 
 /** Ce que le WebView a le droit de nommer : un genre, au plus un identifiant. */
 export interface OperationLocator {
@@ -736,6 +737,8 @@ export type Refusal =
   | { refusal: 'gateway_identity_missing' }
   | { refusal: 'domain_complete' }
   | { refusal: 'handoff_mismatch' }
+  | { refusal: 'bootstrap_request_invalid' }
+  | { refusal: 'other_gateway' }
   | { refusal: 'manifest_mismatch' }
   | { refusal: 'protocol_violation' }
   | { refusal: 'cancelled' }
@@ -909,6 +912,18 @@ export interface DomainFinalizationManifest {
   issues_credentials: boolean
 }
 
+export interface GatewayBootstrapManifest {
+  operation: 'gateway_bootstrap'
+  vault_fingerprint: string
+  server_name: string
+  gateway_wg_public_key: string
+  request_fingerprint: string
+  leaf_days: number
+  issues_ca_tls: boolean
+  ca_tls_days: number
+  issues_credentials: boolean
+}
+
 export type AstraManifest =
   | RecoveryManifest
   | CampaignManifest
@@ -923,6 +938,7 @@ export type AstraManifest =
   | KeyRemovalManifest
   | KeyMarkingManifest
   | DomainFinalizationManifest
+  | GatewayBootstrapManifest
 
 export interface KeySlotLabel {
   slot: string
@@ -1089,6 +1105,8 @@ export type VaultGesture =
   | { gesture: 'remove_key'; slot_id: string }
   | { gesture: 'mark_key'; slot_id: string; lost: boolean }
   | { gesture: 'finalize_domain' }
+  /** Le texte du fichier de demande, jamais son chemin. */
+  | { gesture: 'bootstrap_gateway'; request: string }
 
 /** Valeurs inscrites sur le relais du domaine ; un champ absent laisse l'existant. */
 export interface RelayUpdate {

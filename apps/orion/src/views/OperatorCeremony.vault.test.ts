@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { refusalSentence, rowsOf, gestureSentence } from './OperatorCeremony'
-import type { DomainFinalizationManifest, Refusal } from '../types'
+import type { DomainFinalizationManifest, GatewayBootstrapManifest, Refusal } from '../types'
 
 describe('the vault gestures in the ceremony window', () => {
   it('every_new_refusal_has_its_sentence', () => {
@@ -85,5 +85,62 @@ describe('the vault gestures in the ceremony window', () => {
     const kept = rowsOf({ ...manifest, issues_ca_tls: false, issues_credentials: false })
     expect(kept).toContainEqual(['CA-TLS', 'déjà en place'])
     expect(kept).toContainEqual(['credentials', 'à jour'])
+  })
+
+  const bootstrap: GatewayBootstrapManifest = {
+    operation: 'gateway_bootstrap',
+    vault_fingerprint: 'a'.repeat(64),
+    server_name: 'gw.example.net',
+    gateway_wg_public_key: 'k'.repeat(44),
+    request_fingerprint: 'f'.repeat(64),
+    leaf_days: 90,
+    issues_ca_tls: true,
+    ca_tls_days: 3650,
+    issues_credentials: true,
+  }
+
+  it('the_bootstrap_manifest_lists_what_it_will_issue', () => {
+    const issued = rowsOf(bootstrap)
+    expect(issued).toEqual([
+      ['Gateway', 'gw.example.net'],
+      ['Identité WireGuard', 'k'.repeat(44)],
+      ['Demande (empreinte)', 'f'.repeat(64)],
+      ['Validité de la feuille', '90 jours'],
+      ['Émettre la CA-TLS', '3650 jours'],
+      ['Signer le document de credentials', 'oui'],
+    ])
+    const leafOnly = rowsOf({ ...bootstrap, issues_ca_tls: false, issues_credentials: false })
+    expect(leafOnly.map(([label]) => label)).toEqual([
+      'Gateway',
+      'Identité WireGuard',
+      'Demande (empreinte)',
+      'Validité de la feuille',
+    ])
+  })
+
+  it('the_bootstrap_refusals_have_their_sentences', () => {
+    expect(refusalSentence({ refusal: 'bootstrap_request_invalid' })).toBe(
+      'Ce fichier n’est pas une demande d’amorçage de gateway valide, ou sa signature ne se vérifie pas. Rien n’a été signé.',
+    )
+    expect(refusalSentence({ refusal: 'other_gateway' })).toBe(
+      'Le domaine nomme déjà une autre gateway : en changer est une transition de gateway. Rien n’a été écrit.',
+    )
+  })
+
+  it('the_bootstrap_asks_for_its_two_keys_in_words', () => {
+    expect(
+      gestureSentence(
+        { awaiting_key: { index: 1, of: 2, purpose: 'open_vault' } },
+        'issue_gateway_bootstrap',
+      ),
+    ).toBe('Brancher une clé du coffre (1 sur 2), pour ouvrir le coffre.')
+    expect(
+      gestureSentence(
+        { awaiting_key: { index: 2, of: 2, purpose: 'second_approval' } },
+        'issue_gateway_bootstrap',
+      ),
+    ).toBe(
+      'Débrancher la clé précédente. Brancher une autre clé du coffre (2 sur 2), pour approuver l’amorçage.',
+    )
   })
 })

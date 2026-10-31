@@ -346,8 +346,15 @@ export function AstraView({
         />
         {(ceremony.operation === 'invite_enrollment' ||
           ceremony.operation === 'accept_enrollment' ||
-          ceremony.operation === 'finalize_domain') && (
+          ceremony.operation === 'finalize_domain' ||
+          ceremony.operation === 'issue_gateway_bootstrap') && (
           <ArtifactDownloads gesture={ceremony.gesture} />
+        )}
+        {ceremony.operation === 'issue_gateway_bootstrap' && ceremony.gesture === 'done' && (
+          <Typography color="text.secondary" sx={{ mt: 1, fontSize: 11.5 }}>
+            Portez la feuille sur la gateway : elle s’installe à son amorçage (voir
+            DEPLOIEMENT-ASTRA).
+          </Typography>
         )}
         {ceremony.operation === 'create_domain' && ceremony.gesture === 'done' && <DomainCreated />}
         {finishingRecovery && (
