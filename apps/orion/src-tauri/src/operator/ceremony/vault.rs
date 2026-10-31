@@ -90,6 +90,10 @@ fn refusal_of_setup(refusal: SetupRefusal) -> Refusal {
         SetupRefusal::KeyBeingRemoved => Refusal::KeyBeingRemoved,
         SetupRefusal::GatewayIdentityMissing => Refusal::GatewayIdentityMissing,
         SetupRefusal::DomainComplete => Refusal::DomainComplete,
+        SetupRefusal::OtherGateway => Refusal::OtherGateway,
+        SetupRefusal::BootstrapRequestInvalid => Refusal::BootstrapRequestInvalid,
+        // A key the document revokes is no longer one of the domain's signers.
+        SetupRefusal::SignerRevoked => Refusal::KeyNotEnrolled,
     }
 }
 

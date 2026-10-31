@@ -65,6 +65,12 @@ pub enum SetupRefusal {
     GatewayIdentityMissing,
     #[error("le domaine est complet : il ne reste rien à finaliser")]
     DomainComplete,
+    #[error("le domaine nomme déjà une autre gateway ; en changer est une transition de gateway")]
+    OtherGateway,
+    #[error("ce fichier n'est pas une demande d'amorçage de gateway qui se vérifie")]
+    BootstrapRequestInvalid,
+    #[error("le document de credentials révoque cette clé : en présenter une autre")]
+    SignerRevoked,
 }
 
 // --- Keys -------------------------------------------------------------------
@@ -337,13 +343,13 @@ pub fn write_relay(vault_path: &Path, update: &RelayUpdate) -> Result<handoff::D
         let key = WireGuardKey::parse(value).context("clé publique WireGuard de la gateway")?;
         if let Some(recorded) = relay.gateway_wg_public_key.as_deref() {
             if WireGuardKey::parse(recorded).ok() != Some(key) {
-                bail!(GATEWAY_TRANSITION);
+                return Err(GATEWAY_TRANSITION.into());
             }
         }
         // As `adopt_gateway`: a document already bound to another gateway
         // names the domain's gateway too, whatever the relay lost.
         if bound_to_another_gateway(vault_path, &key)? {
-            bail!(GATEWAY_TRANSITION);
+            return Err(GATEWAY_TRANSITION.into());
         }
         relay.gateway_wg_public_key = Some(value.trim().to_string());
     }
@@ -354,7 +360,7 @@ pub fn write_relay(vault_path: &Path, update: &RelayUpdate) -> Result<handoff::D
             .as_deref()
             .is_some_and(|recorded| recorded != value.trim())
         {
-            bail!(GATEWAY_TRANSITION);
+            return Err(GATEWAY_TRANSITION.into());
         }
         relay.server_name = Some(value.trim().to_string());
     }
@@ -375,12 +381,13 @@ pub fn write_relay(vault_path: &Path, update: &RelayUpdate) -> Result<handoff::D
     Ok(relay)
 }
 
-const GATEWAY_TRANSITION: &str =
-    "le domaine nomme déjà une gateway ; en changer est une transition de gateway";
+/// Moving a domain to another gateway is a gateway transition, never an edit
+/// of its relay.
+const GATEWAY_TRANSITION: SetupRefusal = SetupRefusal::OtherGateway;
 
 /// Whether the credential document beside the vault, when there is one, is
 /// bound to a gateway other than `gateway`.
-fn bound_to_another_gateway(vault_path: &Path, gateway: &WireGuardKey) -> Result<bool> {
+pub(crate) fn bound_to_another_gateway(vault_path: &Path, gateway: &WireGuardKey) -> Result<bool> {
     Ok(credentials::load(&credentials::path_beside(vault_path))?
         .is_some_and(|document| document.gateway_wg_public_key != *gateway))
 }
@@ -429,7 +436,7 @@ pub fn adopt_gateway(
             .as_deref()
             .is_some_and(|recorded| recorded != leaf.subject);
     if other_gateway {
-        bail!("le domaine nomme déjà une autre gateway ; en changer est une transition de gateway");
+        return Err(GATEWAY_TRANSITION.into());
     }
     if recorded_gateway.is_some() && relay.server_name.is_some() {
         return Ok(relay);
@@ -444,7 +451,7 @@ pub fn adopt_gateway(
 /// [`signing::MAX_CA_TLS_LIFETIME_SECS`] allows.
 pub const CA_TLS_DAYS: u64 = 3650;
 
-const DAY_SECS: u64 = 86_400;
+pub(crate) const DAY_SECS: u64 = 86_400;
 
 /// What finalizing the domain will issue, shown before the press.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -576,17 +583,26 @@ pub(crate) fn verified_document(
     let relay = handoff::DomainHandoff::beside(vault_path, vault).ok()?;
     let identity = handoff::identity_of(&relay).ok()?;
     let document = credentials::load(&credentials::path_beside(vault_path)).ok()??;
-    let ca_pq = MlDsa87PublicKey::parse(vault.ca_pq_public_key.trim()).ok()?;
-    document
-        .verify(
-            &ca_pq,
-            &identity.trust_domain_id,
-            &identity.gateway_wg_public_key,
-            identity.ca_epoch,
-            document.credential_registry_epoch,
-        )
-        .ok()?;
-    Some(document)
+    verifies_for(&document, vault, &identity).then_some(document)
+}
+
+/// Whether `document` verifies under `vault`'s `CA-PQ` for `identity`.
+pub(crate) fn verifies_for(
+    document: &credentials::CredentialRegistry,
+    vault: &AuthorityVault,
+    identity: &signing::DomainIdentity,
+) -> bool {
+    MlDsa87PublicKey::parse(vault.ca_pq_public_key.trim()).is_ok_and(|ca_pq| {
+        document
+            .verify(
+                &ca_pq,
+                &identity.trust_domain_id,
+                &identity.gateway_wg_public_key,
+                identity.ca_epoch,
+                document.credential_registry_epoch,
+            )
+            .is_ok()
+    })
 }
 
 /// Whether `document` has a row for every slot of `vault`.

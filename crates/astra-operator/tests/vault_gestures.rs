@@ -782,10 +782,9 @@ fn the_relay_never_moves_to_another_gateway() {
             ..RelayUpdate::default()
         },
     ] {
-        let error = write_relay(&path, &moved).expect_err("another gateway is refused");
-        assert!(
-            error.to_string().contains("transition de gateway"),
-            "{error}"
+        assert_eq!(
+            refusal(write_relay(&path, &moved)),
+            Some(SetupRefusal::OtherGateway)
         );
         assert_eq!(std::fs::read(&relay_path).expect("relay bytes"), before);
     }
@@ -840,10 +839,9 @@ fn adopting_takes_the_gateway_the_domain_signed() {
         "other.helios.test",
         WireGuardKey::from_bytes([0x22; 32]),
     );
-    let error = adopt_gateway(&path, &other, NOW).expect_err("another gateway is a transition");
-    assert!(
-        error.to_string().contains("transition de gateway"),
-        "{error}"
+    assert_eq!(
+        refusal(adopt_gateway(&path, &other, NOW)),
+        Some(SetupRefusal::OtherGateway)
     );
     assert_eq!(
         std::fs::read(&relay_path).expect("relay bytes"),
@@ -865,23 +863,23 @@ fn a_document_bound_to_another_gateway_keeps_the_domain() {
     let before = std::fs::read(&relay_path).expect("relay bytes");
     let other = WireGuardKey::from_bytes([0x22; 32]);
 
-    let error = adopt_gateway(&path, &domain_leaf(&path, &first, SERVER_NAME, other), NOW)
-        .expect_err("the document names another gateway");
-    assert!(
-        error.to_string().contains("transition de gateway"),
-        "{error}"
+    assert_eq!(
+        refusal(adopt_gateway(
+            &path,
+            &domain_leaf(&path, &first, SERVER_NAME, other),
+            NOW
+        )),
+        Some(SetupRefusal::OtherGateway)
     );
-    let error = write_relay(
-        &path,
-        &RelayUpdate {
-            gateway_wg_public_key: Some(other.to_base64()),
-            ..RelayUpdate::default()
-        },
-    )
-    .expect_err("the document names another gateway");
-    assert!(
-        error.to_string().contains("transition de gateway"),
-        "{error}"
+    assert_eq!(
+        refusal(write_relay(
+            &path,
+            &RelayUpdate {
+                gateway_wg_public_key: Some(other.to_base64()),
+                ..RelayUpdate::default()
+            },
+        )),
+        Some(SetupRefusal::OtherGateway)
     );
     assert_eq!(std::fs::read(&relay_path).expect("relay bytes"), before);
 
@@ -917,9 +915,14 @@ fn adopting_refuses_the_same_key_under_another_name() {
         WireGuardKey::from_bytes([0x11; 32]),
     );
     let error = adopt_gateway(&path, &renamed, NOW).expect_err("another server name");
-    assert!(
-        error.to_string().contains("transition de gateway"),
-        "{error}"
+    assert_eq!(
+        error.downcast_ref::<SetupRefusal>(),
+        Some(&SetupRefusal::OtherGateway)
+    );
+    // What the operator reads, in the CLI and the logs.
+    assert_eq!(
+        error.to_string(),
+        "le domaine nomme déjà une autre gateway ; en changer est une transition de gateway"
     );
     assert_eq!(std::fs::read(&relay_path).expect("relay bytes"), before);
 }

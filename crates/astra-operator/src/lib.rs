@@ -46,6 +46,7 @@ pub const WORK_STACK_BYTES: usize = 32 * 1024 * 1024;
 /// second copy of a security boundary.
 pub use aether_fido::authenticator;
 pub mod admission;
+pub mod bootstrap;
 pub mod campaign;
 pub mod credentials;
 pub mod documents;
