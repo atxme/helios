@@ -216,3 +216,23 @@ change ce qui est construit) :
    deux touchers en tout, aucun troisième.
 6. **Borne de taille** : 256 KiB, celle d'« Accepter une demande »
    (`EnrollmentOperatorPanel.tsx`), appliquée aussi côté Rust, avec un test.
+
+## 10. Amendements (écarts pris pendant l'exécution)
+
+1. **`SetupRefusal::PlanChanged` devient `ManifestMismatch`** : le refus dit ce
+   qu'il constate, le plan montré à l'opérateur ne correspond plus à celui que
+   recalcule la touche.
+2. **L'analyse de `CA-PQ` passe dans le plan** : un coffre ou un relais dont
+   `CA-PQ` ne s'analyse pas est refusé `LocationUnavailable` avant toute clé, et
+   non après les deux touchers.
+3. **`SignerRevoked` devient `KeyNotEnrolled`** : la clé qui signe n'est pas
+   enrôlée dans le coffre (ou y est révoquée), ce qui est le même refus pour
+   l'opérateur.
+4. **Clé répétée refusée par la cérémonie** (`KeyRepeated`) dès la seconde
+   ouverture, avec un filet dans `bootstrap_with` si une autre voie l'appelle.
+5. **L'identité n'est écrite au relais qu'après les deux preuves d'ancres**, plus
+   strict qu'`astra-signer`, qui l'écrit avant les clés.
+6. **La feuille est signée en mémoire avant la première écriture** : un échec de
+   signature n'a rien laissé sur le disque.
+7. **`readFileText` est partagé avec « Accepter une demande »** (un seul lecteur
+   de fichier de la WebView, une seule borne de taille).

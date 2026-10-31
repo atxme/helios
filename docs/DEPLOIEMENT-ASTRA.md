@@ -10,8 +10,10 @@ qui le suit.
 Les gestes du coffre et du domaine se jouent **dans Orion**, onglet *Astra*
 (le lot 3 de F14, fusionné dans `main` le 31 octobre 2026, validation Windows
 à faire). `astra-signer` reste livré comme voie transitoire, jusqu'au
-lot 7 ; `issue-gateway-bootstrap` n'est pas encore dans Orion et reste en ligne
-de commande jusqu'au lot 6.
+lot 7. L'amorçage de la gateway se joue lui aussi dans Orion (le lot 6a de F14,
+sur la branche `feat/f14-lot6a-amorcage-gateway`, pas encore fusionné, validation
+Windows à faire) ; `astra-signer issue-gateway-bootstrap` en est la voie
+transitoire.
 
 1. Orion, « Coffre et clés » : « Créer un domaine ». Nom du domaine (RP ID) et
    origine, libellés des deux clés, « Créer le domaine » : deux YubiKey, branchées
@@ -21,24 +23,27 @@ de commande jusqu'au lot 6.
    sauvegarder le coffre.
 2. `./scripts/deploy.sh` : le premier passage installe la gateway et rapatrie sa
    demande publique d'amorçage.
-3. `issue-gateway-bootstrap`, toujours en ligne de commande (lot 6) : il émet la
-   feuille PQ de la gateway sous `CA-PQ` et inscrit son identité (clé WireGuard,
-   nom de service) dans le relais. Ajouter `--vault <chemin>`, avant la
-   sous-commande, quand le coffre n'est pas à l'emplacement par défaut (celui que
-   « Coffre et clés » affiche) :
-
-```sh
-astra-signer issue-gateway-bootstrap \
-  --request ~/.helios/astra/gateway-bootstrap-request.json \
-  --out ~/.helios/astra/gateway-bootstrap-certificate.json
-# coffre ailleurs :
-# astra-signer --vault 'E:\astra\authority-vault.json' issue-gateway-bootstrap ...
-```
-
-4. Orion, « Domaine » : « Finaliser le domaine ». Un toucher, qui émet la
-   `CA-TLS` (à enregistrer : `ca-tls.pem`) et écrit le document de credentials à
-   côté du coffre. Il exige que le relais nomme la gateway : c'est l'étape 3 qui
-   l'y a inscrite.
+3. Orion, « Domaine » : « Amorcer la gateway… ». Choisir le fichier de demande
+   que `deploy.sh` a rapatrié (`~/.helios/astra/gateway-bootstrap-request.json`) ;
+   Orion en vérifie la signature et le compare au relais avant toute clé, puis
+   montre ce qui va être signé (gateway, identité WireGuard, empreinte de la
+   demande, validité de la feuille). Le bouton « Amorcer avec les deux clés »
+   demande **deux clés distinctes**, branchées l'une après l'autre (deux
+   dialogues Windows, un par ouverture du coffre ; non vérifié sous WSL2). Il
+   émet la feuille PQ de la gateway sous `CA-PQ` et inscrit son identité (clé
+   WireGuard, nom de service) dans le relais. À la fin, « Enregistrer
+   gateway-bootstrap-certificate.json » : l'enregistrer **à côté du coffre**, au
+   chemin que `deploy.sh` imprime (par défaut
+   `~/.helios/astra/gateway-bootstrap-certificate.json`). Sur un domaine neuf,
+   le même geste émet aussi la `CA-TLS` (`ca-tls.pem`, à enregistrer) et signe le
+   document de credentials : l'étape 4 est alors faite. Le bouton reste
+   disponible ensuite ; réémettre la feuille de la **même** gateway ne change
+   rien au domaine, une autre gateway est refusée.
+4. Orion, « Domaine » : « Finaliser le domaine » ne sert plus que pour un domaine
+   où **seule la finalisation manque** (l'amorçage a été fait mais a été
+   interrompu avant la `CA-TLS` ou le document de credentials). Un toucher, qui
+   émet la `CA-TLS` (à enregistrer : `ca-tls.pem`) et écrit le document de
+   credentials à côté du coffre. Il exige que le relais nomme la gateway.
 5. `./scripts/deploy.sh --astra` : la reprise reporte la feuille sur la gateway,
    amorce Astra en épinglant la `CA-TLS`, puis redémarre.
 
@@ -51,7 +56,9 @@ vérifie sous le `CA-PQ` du relais et n'inscrit l'identité que si elle y vérif
 origine d'Astra. Ni l'un ni l'autre ne remplace une identité déjà inscrite, ni
 celle à laquelle le document de credentials est lié.
 
-Voie transitoire, équivalente aux étapes 1 à 5 tant que `astra-signer` est livré :
+Voie transitoire, équivalente aux étapes 1 à 5 tant que `astra-signer` est livré
+(jusqu'au lot 7 ; `astra-signer issue-gateway-bootstrap` y reste la voie en ligne
+de commande de l'étape 3) :
 
 ```sh
 astra-signer init --rp-id <gateway>.<tailnet>.ts.net --label "YubiKey du bureau"

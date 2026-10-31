@@ -570,8 +570,11 @@ Ce que la gateway accorde au pair opérateur ne se vérifie pas dans le dépôt 
 valider en recette (MANUAL-TESTING).
 
 `astra-signer` et `helios enroll document` restent livrés, à titre transitoire,
-jusqu'au lot 7 de F14. Les mentions de `astra-signer` plus haut dans cet ADR
-décrivent l'outil tel qu'il reste jusque-là.
+jusqu'au lot 7 de F14. L'amorçage de la gateway se joue dans Orion (lot 6a) :
+par fichiers (la demande de la gateway en entrée, la feuille PQ en sortie), avec
+deux clés distinctes, sans route nouvelle sur la gateway. Les mentions de
+`astra-signer` plus haut dans cet ADR décrivent l'outil tel qu'il reste
+jusque-là.
 
 ### 8. Avortement, leases et atomicité logique
 

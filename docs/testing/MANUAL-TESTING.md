@@ -841,6 +841,45 @@ domaine », jamais « Emplacement introuvable », et le dossier est créé ; un 
 le support du coffre choisi s'éjecte encore (Orion n'y garde pas son dossier
 courant).
 
+**D. F14 lot 6a : amorcer la gateway**
+
+Rien de ce qui suit n'a été constaté sous Windows : les deux ouvertures du coffre
+passent par WebAuthn et le sélecteur de fichier est une boîte Windows ; tout cela
+est **non vérifié sous WSL2 et à jouer sur Windows**. Jouer le parcours sur un
+**coffre d'essai** (onglet *Astra*, « Coffre et clés », « Changer… »), jamais sur
+le coffre du domaine réel, avec deux YubiKey et un fichier de demande
+d'amorçage de gateway (`gateway-bootstrap-request.json`, rapatrié par
+`deploy.sh` ou copié d'une gateway d'essai).
+
+23. Onglet *Astra*, « Domaine », sur un coffre d'essai à deux clés actives et
+    domaine neuf : « Amorcer la gateway… », choisir la demande valide. Orion montre
+    le manifeste (Gateway, Identité WireGuard, Demande (empreinte), Validité de la
+    feuille, Émettre la CA-TLS, Signer le document de credentials). Avec moins de
+    deux clés actives, le bouton est grisé : « Il faut deux clés actives pour
+    amorcer la gateway. »
+24. « Amorcer avec les deux clés » : **2 dialogues Windows attendus**, un par
+    ouverture du coffre. Orion affiche « Brancher une clé du coffre (1 sur 2), pour
+    ouvrir le coffre. », puis « Débrancher la clé précédente. Brancher une autre clé
+    du coffre (2 sur 2), pour approuver l’amorçage. » Un nombre différent est une
+    anomalie à consigner.
+25. À la fin : « Enregistrer gateway-bootstrap-certificate.json » et
+    « Enregistrer ca-tls.pem » (domaine neuf), et « Portez la feuille sur la
+    gateway… ». Enregistrer les deux fichiers : la feuille est aussi écrite à côté
+    du coffre, sous ce nom. Le relais nomme maintenant la gateway ; le document de
+    credentials est à côté du coffre ; « Finaliser le domaine » n'est plus proposé.
+26. **Demande altérée** : modifier un caractère de la demande, la choisir.
+    Attendu : « Ce fichier n’est pas une demande d’amorçage de gateway valide, ou sa
+    signature ne se vérifie pas. Rien n’a été signé. », **avant toute clé** (aucun
+    dialogue Windows).
+27. **Même clé deux fois** : refaire le geste en présentant la même YubiKey aux deux
+    ouvertures. Attendu : refus (clé répétée), rien d'écrit.
+28. **Demande d'une autre gateway** : sur le coffre amorcé, choisir la demande d'une
+    gateway différente. Attendu : « Le domaine nomme déjà une autre gateway : en
+    changer est une transition de gateway. Rien n’a été écrit. », sans clé.
+29. **Second amorçage** (même gateway, domaine complet) : le bouton reste
+    disponible ; le manifeste n'annonce ni CA-TLS ni document de credentials ; deux
+    dialogues ; seule la feuille est réécrite.
+
 ### Le chemin manuel
 
 Dans un autre terminal, générer deux identités de test :
