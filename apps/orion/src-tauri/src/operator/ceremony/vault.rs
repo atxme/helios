@@ -94,6 +94,8 @@ fn refusal_of_setup(refusal: SetupRefusal) -> Refusal {
         SetupRefusal::BootstrapRequestInvalid => Refusal::BootstrapRequestInvalid,
         // A key the document revokes is no longer one of the domain's signers.
         SetupRefusal::SignerRevoked => Refusal::KeyNotEnrolled,
+        // What would be written is no longer what the window showed.
+        SetupRefusal::PlanChanged => Refusal::ManifestMismatch,
     }
 }
 

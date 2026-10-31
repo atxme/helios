@@ -71,6 +71,10 @@ pub enum SetupRefusal {
     BootstrapRequestInvalid,
     #[error("le document de credentials révoque cette clé : en présenter une autre")]
     SignerRevoked,
+    #[error(
+        "le domaine a changé depuis l'affichage de ce qui allait être signé : recommencer le geste"
+    )]
+    PlanChanged,
 }
 
 // --- Keys -------------------------------------------------------------------

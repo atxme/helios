@@ -106,8 +106,9 @@ pub fn bootstrap_plan(
 /// approval [`CampaignScope::GatewayBootstrap`] requires. No key is asked
 /// anything here: both openings were obtained before.
 ///
-/// What is written is settled again from the domain as it is now, not from
-/// `plan`: only its request is taken from it.
+/// The plan is settled again from the domain as it is now, and must be the
+/// one shown: a domain that moved between the manifest and the press is
+/// refused as [`SetupRefusal::PlanChanged`] before anything is written.
 pub fn bootstrap_with(
     vault_path: &Path,
     plan: &BootstrapPlan,
@@ -121,9 +122,13 @@ pub fn bootstrap_with(
     let Assessed {
         plan: current,
         vault,
+        ca_pq,
         mut relay,
         document,
     } = plan_for(vault_path, &plan.request)?;
+    if current != *plan {
+        return Err(SetupRefusal::PlanChanged.into());
+    }
 
     // One key presented twice is one approval, whatever the scope's policy
     // says: refused here as well, so no change to that policy relaxes it.
@@ -154,7 +159,7 @@ pub fn bootstrap_with(
     let leaf = signing::issue_gateway_bootstrap_certificate(
         &vault,
         first,
-        &MlDsa87PublicKey::parse(vault.ca_pq_public_key.trim())?,
+        &ca_pq,
         &signing::GatewayBootstrapDecision {
             request,
             leaf_validity: (now_unix.saturating_sub(LEAF_BACKDATE_SECS), not_after),
@@ -195,6 +200,8 @@ pub fn bootstrap_with(
 struct Assessed {
     plan: BootstrapPlan,
     vault: AuthorityVault,
+    /// The vault's `CA-PQ`, which the leaf is checked under once signed.
+    ca_pq: MlDsa87PublicKey,
     relay: handoff::DomainHandoff,
     /// The credential document in place, when there is one: it verifies for
     /// the request's gateway.
@@ -213,6 +220,10 @@ fn plan_for(
     request: &GatewayBootstrapRequest,
 ) -> std::result::Result<Assessed, SetupRefusal> {
     let vault = store::load(vault_path).map_err(|_| SetupRefusal::LocationUnavailable)?;
+    // A vault whose anchor does not parse is as unreadable as one that does
+    // not load: refused here, not after both keys were pressed.
+    let ca_pq = MlDsa87PublicKey::parse(vault.ca_pq_public_key.trim())
+        .map_err(|_| SetupRefusal::LocationUnavailable)?;
     let relay = handoff::DomainHandoff::beside(vault_path, &vault)
         .map_err(|_| SetupRefusal::GatewayIdentityMissing)?;
     let mut named = relay.clone();
@@ -274,6 +285,7 @@ fn plan_for(
     Ok(Assessed {
         plan,
         vault,
+        ca_pq,
         relay,
         document,
     })

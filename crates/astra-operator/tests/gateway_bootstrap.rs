@@ -24,7 +24,7 @@ use astra_operator::bootstrap::{
 };
 use astra_operator::gestures::{NewAuthority, NewKey};
 use astra_operator::vault::SlotRole;
-use astra_operator::vault_gestures::{add_key_with, create_first_key, SetupRefusal};
+use astra_operator::vault_gestures::{add_key_with, create_first_key, finalize_with, SetupRefusal};
 use astra_operator::{credentials, handoff, signing, store};
 use support::{FakeKey, PIN, RP_ID};
 
@@ -439,12 +439,78 @@ fn the_same_key_cannot_approve_twice() {
     )
     .expect("a plan");
 
-    assert!(bootstrap_with(&path, &plan, &first, &first, NOW).is_err());
+    let before = folder(&path);
 
+    let error = bootstrap_with(&path, &plan, &first, &first, NOW).expect_err("one key twice");
+    // The bootstrap's own check, not only the scope policy's.
+    assert_eq!(
+        error.to_string(),
+        "le même credential a été présenté deux fois : l'amorçage en exige deux distincts"
+    );
+    assert_eq!(folder(&path), before);
     let relay = relay(&path);
     assert!(relay.gateway_wg_public_key.is_none());
     assert!(relay.server_name.is_none());
     assert!(!path_beside(&path).exists());
+}
+
+/// What the press would write must be what the manifest showed: a domain that
+/// moved in between is refused before anything is written.
+#[test]
+fn a_domain_that_changed_since_the_plan_is_refused() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = vault_path(&directory);
+    let (key1, key2) = (FakeKey::new(1), FakeKey::new(2));
+    let (first, second) = fresh_domain(&path, &key1, &key2);
+    let gateway = WireGuardKey::from_bytes(GATEWAY);
+    record_gateway(&path, gateway, SERVER_NAME);
+    finalize_with(&path, &first, NOW).expect("the domain is finished");
+    let plan =
+        bootstrap_plan(&path, &json_of(&gateway_request(SERVER_NAME, gateway))).expect("a plan");
+    assert!(!plan.issues_ca_tls);
+
+    let relay_path = handoff::path_beside(&path);
+    let mut moved = relay(&path);
+    moved.ca_tls_certificate = None;
+    handoff::save(&relay_path, &moved).expect("relay saved");
+    let before = folder(&path);
+
+    assert_eq!(
+        refusal(bootstrap_with(&path, &plan, &first, &second, NOW)),
+        Some(SetupRefusal::PlanChanged)
+    );
+    assert_eq!(folder(&path), before);
+    assert!(!path_beside(&path).exists());
+}
+
+/// An anchor that does not parse is refused before any key, as a vault that
+/// does not load is.
+#[test]
+fn a_vault_whose_anchor_does_not_parse_is_refused() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = vault_path(&directory);
+    let (key1, key2) = (FakeKey::new(1), FakeKey::new(2));
+    fresh_domain(&path, &key1, &key2);
+    let mut vault: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("vault bytes")).expect("vault JSON");
+    vault["ca_pq_public_key"] = serde_json::Value::String("bm9wZQ==".into());
+    std::fs::write(&path, serde_json::to_vec(&vault).expect("vault JSON")).expect("vault written");
+    // The vault itself still loads: it is the anchor that refuses.
+    store::load(&path).expect("the vault loads");
+    let before = folder(&path);
+
+    assert_eq!(
+        bootstrap_plan(
+            &path,
+            &json_of(&gateway_request(
+                SERVER_NAME,
+                WireGuardKey::from_bytes(GATEWAY)
+            ))
+        )
+        .err(),
+        Some(SetupRefusal::LocationUnavailable)
+    );
+    assert_eq!(folder(&path), before);
 }
 
 #[test]
