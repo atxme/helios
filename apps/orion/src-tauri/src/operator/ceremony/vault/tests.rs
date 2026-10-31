@@ -557,7 +557,7 @@ fn the_second_key_must_be_another_credential() {
         vault_path: &domain.vault_path,
     };
     run.answered(1, "quotidienne");
-    run.answered(2, "quotidienne");
+    run.answered(2, "secours");
     let outcome = run.issue_bootstrap(&plan, &opening(1), &opening(1), &mut |artifact| {
         artifacts.push(artifact)
     });
@@ -570,6 +570,8 @@ fn the_second_key_must_be_another_credential() {
         .iter()
         .all(|status| status.gesture != GestureState::Signing));
     assert_eq!(last.keys.len(), 1);
+    assert_eq!(last.keys[0].slot, "1");
+    assert_eq!(last.keys[0].label, "quotidienne");
     assert!(artifacts.is_empty());
     assert_eq!(std::fs::read(&relay_path).expect("relay"), relay_before);
     assert!(!astra_operator::bootstrap::path_beside(&domain.vault_path).exists());
@@ -630,4 +632,54 @@ fn refusals_of_the_bootstrap_are_named() {
         assert_eq!(refusal_of_setup(setup), window);
         assert_eq!(refusal_of(&anyhow::Error::from(setup)), window);
     }
+}
+
+/// The bootstrap names the gateway and what it will issue, then asks first
+/// for a key the vault opens for.
+#[test]
+fn a_bootstrap_shows_its_manifest_before_the_key() {
+    use astra_operator::bootstrap::{bootstrap_plan, BOOTSTRAP_LEAF_DAYS};
+
+    let domain = Domain::new("bootstrap-manifest").full().without_gateway();
+    let (text, _) = bootstrap_request("gateway.example");
+    let plan = bootstrap_plan(&domain.vault_path, &text).expect("a plan");
+    assert!(plan.records_identity);
+
+    let (outcome, published, artifacts) = run_vault_gesture(
+        crate::operator::VaultGesture::BootstrapGateway { request: text },
+        &domain.vault_path,
+    );
+    outcome.expect("an abandonment is not a failure");
+    assert!(artifacts.is_empty());
+    let offered = published
+        .iter()
+        .find(|status| matches!(status.gesture, GestureState::AwaitingKey { .. }))
+        .expect("a key is asked for");
+    assert_eq!(
+        offered.gesture,
+        GestureState::AwaitingKey {
+            index: 1,
+            of: 2,
+            purpose: KeyPurpose::OpenVault,
+        }
+    );
+    match offered.manifest.as_ref().expect("manifest shown first") {
+        AstraManifest::GatewayBootstrap(manifest) => {
+            assert_eq!(manifest.leaf_days, BOOTSTRAP_LEAF_DAYS);
+            assert_eq!(manifest.ca_tls_days, gestures::CA_TLS_DAYS);
+            assert_eq!(manifest.issues_ca_tls, plan.issues_ca_tls);
+            assert_eq!(manifest.issues_credentials, plan.issues_credentials);
+            assert_eq!(manifest.request_fingerprint, plan.request.fingerprint());
+            assert_eq!(manifest.server_name, plan.request.server_name);
+            assert_eq!(
+                manifest.gateway_wg_public_key,
+                plan.request.gateway_wg_public_key
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        published.last().expect("a status").gesture,
+        GestureState::Cancelled
+    );
 }

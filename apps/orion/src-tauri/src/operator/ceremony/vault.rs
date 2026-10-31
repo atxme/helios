@@ -511,8 +511,9 @@ impl VaultRun<'_> {
         deposit: &mut dyn FnMut(OperatorArtifact),
     ) -> Result<(), String> {
         if first.credential_id == second.credential_id {
-            // The repeated key is not a second approver: it is not listed.
-            self.ceremony.keys.pop();
+            // The repeated key is not a second approver: its entry, and only
+            // its, is withdrawn.
+            self.ceremony.keys.retain(|key| key.slot != "2");
             return self.refuse(
                 Refusal::KeyRepeated,
                 "le même credential a été présenté deux fois : l'amorçage en exige deux distincts"
