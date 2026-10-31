@@ -114,9 +114,9 @@ pub enum CertificateActionBlock {
     /// The trust material is there and the client half of §7 is wired; what
     /// is missing is the operator companion's own transport.
     ///
-    /// **Plus émis** depuis qu'Orion approuve lui-même le renouvellement :
-    /// la variante survit pour qu'un état sérialisé antérieur se relise, et
-    /// `renewal_block` ne la rend plus.
+    /// **No longer emitted** since Orion approves the renewal itself: the
+    /// variant survives so that an earlier serialized state still reads back,
+    /// and `renewal_block` no longer returns it.
     CompanionTransportMissing,
     /// Needs a hardware credential and the `astra-signer` companion (not the
     /// ordinary renewal, which Orion approves itself).

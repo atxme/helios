@@ -34,7 +34,9 @@
 //! The engine stops there: [`VerifiedApproval::material`] hands out what the
 //! assertion needs, and the process that owns the window performs it with
 //! [`ApprovalMaterial::approve`]. That function re-verifies everything before
-//! the key, so a caller that built the material by other means gains nothing.
+//! the key, but against anchors carried in the same material: the material is
+//! trusted for where it comes from. It must come from the engine and never from
+//! the WebView, which only relays it.
 //!
 //! Only then is the user asked to touch anything. A ceremony spent to reach a
 //! refusal is the one cost that cannot be retried casually — the person is
@@ -124,8 +126,12 @@ pub struct ApprovalManifest {
 /// domain's identity and the keys this profile pins. No PIN, no vault, no
 /// secret — which is what lets it cross to the process that owns the window.
 /// [`approve`](Self::approve) re-verifies all of it before the key is asked
-/// for anything, so the material is not trusted for having been verified once.
+/// for anything, but against the anchors this same material carries (service
+/// key, `CA-PQ`, RP ID). That catches corruption and tampering of the signed
+/// objects, not a substituted set of anchors: the material is trusted for where
+/// it comes from, the engine, never the WebView.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ApprovalMaterial {
     pub request: Box<AstraCredentialApprovalRequest>,
     pub registry: Box<CredentialRegistry>,
@@ -215,7 +221,8 @@ impl ApprovalMaterial {
 /// A request that has been verified, and is ready for the key.
 ///
 /// Not `Clone`: it is the engine's own proof that verification happened. What
-/// leaves it is the [`ApprovalMaterial`], which re-verifies on use.
+/// leaves it is the [`ApprovalMaterial`], which re-verifies its signed objects
+/// on use but vouches for nothing about its own origin.
 pub struct VerifiedApproval {
     material: ApprovalMaterial,
 }
@@ -416,6 +423,7 @@ mod tests {
         domain: Domain,
         verified: VerifiedApproval,
         binding: AstraCredentialBinding,
+        persisted_generation: u64,
     }
 
     /// A COSE ES256 key shape the verifier accepts. The point is not checked
@@ -438,6 +446,8 @@ mod tests {
         let mut state = state;
         state.astra.active_astra_service_public_key = domain.service_public.clone();
         state.astra.webauthn_rp_id = RP_ID.into();
+        // Distinct values, so a round trip that swapped the two would show.
+        state.client_tls_ca.ca_tls_epoch = 2;
 
         let binding = AstraCredentialBinding {
             format_version: CERTIFICATE_FORMAT_VERSION,
@@ -500,6 +510,7 @@ mod tests {
             domain,
             verified,
             binding,
+            persisted_generation: state.certificates.active.generation,
         }
     }
 
@@ -550,10 +561,7 @@ mod tests {
             setup.verified.manifest().operation_id
         );
         assert_eq!(material.rp_id, RP_ID);
-        assert_eq!(
-            material.active_generation,
-            material.request.active_generation
-        );
+        assert_eq!(material.active_generation, setup.persisted_generation);
         assert_eq!(material.identity.server_name, SERVER_NAME);
         assert_eq!(material.identity.trust_domain_id, domain_id());
         assert_eq!(material.ca_pq, setup.domain.ca_pq_public);
@@ -565,6 +573,8 @@ mod tests {
         assert_eq!(back.request, material.request);
         assert_eq!(back.registry, material.registry);
         assert_eq!(back.identity, material.identity);
+        assert_eq!(back.identity.ca_epoch, 1);
+        assert_eq!(back.identity.ca_tls_epoch, 2);
         assert_eq!(back.service_key, material.service_key);
         assert_eq!(back.ca_pq, material.ca_pq);
         assert_eq!(back.rp_id, material.rp_id);
@@ -621,5 +631,25 @@ mod tests {
         // test, so an `Err` here is an `Err` raised before the touch.
         let outcome = material.approve(&KeyThatMustNotBeAsked, "0000", NOW);
         assert!(matches!(outcome, Err(ApprovalError::Ceremony(_))));
+    }
+
+    /// Positive control: with nothing tampered the same call reaches the key,
+    /// which proves the refusal above is not a vacuous pass.
+    #[test]
+    #[should_panic(expected = "the key was asked for an assertion")]
+    fn an_untampered_material_reaches_the_key() {
+        let setup = setup();
+        let _ = setup
+            .verified
+            .material()
+            .approve(&KeyThatMustNotBeAsked, "0000", NOW);
+    }
+
+    #[test]
+    fn material_with_an_unknown_field_is_refused() {
+        let setup = setup();
+        let mut value = serde_json::to_value(setup.verified.material()).expect("value");
+        value["extra"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<ApprovalMaterial>(value).is_err());
     }
 }

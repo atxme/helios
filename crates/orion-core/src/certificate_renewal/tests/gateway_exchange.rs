@@ -288,7 +288,7 @@ fn an_authority_still_awaiting_an_operator_is_reported_as_obsolete() {
         adopted,
         Err(RenewalError::ObsoleteOperatorApproval)
     ));
-    // L'état reste en attente d'opérateur : le remède que nomme l'erreur est
-    // de migrer l'autorité, pas d'approuver une demande à la main.
+    // The session stays on the operation: the remedy the error names is to
+    // migrate the authority, not to approve a request by hand.
     assert_eq!(session.operation_id(), Some(operation_id));
 }
