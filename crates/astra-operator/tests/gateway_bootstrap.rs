@@ -19,7 +19,7 @@ use aether::certificates::CERTIFICATE_FORMAT_VERSION;
 use aether::key_negotiation::{PqCertificate, PqCertificateRole};
 use astra_operator::authenticator::Opened;
 use astra_operator::bootstrap::{
-    bootstrap_plan, bootstrap_with, path_beside, BootstrapPlan, Bootstrapped,
+    bootstrap_plan, bootstrap_with, path_beside, BootstrapPlan, Bootstrapped, Finalization,
     MAX_BOOTSTRAP_REQUEST_BYTES,
 };
 use astra_operator::gestures::{NewAuthority, NewKey};
@@ -200,7 +200,7 @@ fn a_fresh_domain_is_bootstrapped_and_finalized_in_one_gesture() {
     let Bootstrapped {
         leaf_json,
         leaf_fingerprint,
-        finalized,
+        finalization,
     } = bootstrap_with(&path, &plan, &first, &second, NOW).expect("bootstrapped");
 
     assert_eq!(key1.assertions(), 1, "one press to create, none here");
@@ -225,7 +225,9 @@ fn a_fresh_domain_is_bootstrapped_and_finalized_in_one_gesture() {
     );
     assert_eq!(leaf.not_before_unix, NOW - 300);
     assert_eq!(leaf.not_after_unix, NOW + 365 * 86_400);
-    let finalized = finalized.expect("the domain was finished");
+    let Finalization::Issued(finalized) = finalization else {
+        panic!("the domain was finished: {finalization:?}");
+    };
     assert!(finalized.ca_tls_pem.is_some());
     assert!(finalized.credentials_epoch.is_some());
     assert!(relay.ca_tls_certificate.is_some());
@@ -533,7 +535,7 @@ fn bootstrapping_again_issues_a_leaf_and_nothing_else() {
     assert!(!again.issues_credentials);
     let bootstrapped = bootstrap_with(&path, &again, &first, &second, NOW).expect("again");
 
-    assert!(bootstrapped.finalized.is_none());
+    assert_eq!(bootstrapped.finalization, Finalization::NotNeeded);
     let second_leaf = leaf_beside(&path);
     assert_ne!(second_leaf.serial, first_leaf.serial);
     assert!(verifies(&path, &second_leaf, SERVER_NAME, gateway));
@@ -545,7 +547,8 @@ fn bootstrapping_again_issues_a_leaf_and_nothing_else() {
 }
 
 /// The leaf is written before the domain is finished: a finalization that
-/// fails leaves the leaf in place, and « Finaliser le domaine » resumes.
+/// fails leaves the leaf in place and still returns it, so the window hands it
+/// over, and « Finaliser le domaine » resumes.
 ///
 /// The document's write is made to fail by a symbolic link where it goes: the
 /// document reads as absent through a dangling link, and the private writer
@@ -567,10 +570,28 @@ fn a_failed_finalization_keeps_the_leaf() {
         bootstrap_plan(&path, &json_of(&gateway_request(SERVER_NAME, gateway))).expect("a plan");
     assert!(plan.issues_credentials);
 
-    bootstrap_with(&path, &plan, &first, &second, NOW).expect_err("the document cannot be written");
+    let Bootstrapped {
+        leaf_json,
+        leaf_fingerprint,
+        finalization,
+    } = bootstrap_with(&path, &plan, &first, &second, NOW).expect("the leaf is returned");
 
+    let Finalization::Failed(chain) = finalization else {
+        panic!("the document cannot be written: {finalization:?}");
+    };
+    assert!(!chain.is_empty());
     let leaf = leaf_beside(&path);
     assert!(verifies(&path, &leaf, SERVER_NAME, gateway));
+    assert_eq!(
+        serde_json::from_str::<PqCertificate>(&leaf_json).expect("leaf JSON"),
+        leaf
+    );
+    assert_eq!(
+        leaf_fingerprint,
+        aether::certificates::gateway::pq_certificate_fingerprint(&leaf)
+            .expect("fingerprint")
+            .to_string()
+    );
     assert_eq!(
         relay(&path).gateway_wg_public_key.as_deref(),
         Some(gateway.to_base64().as_str())

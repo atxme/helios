@@ -380,6 +380,11 @@ pub struct OperatorArtifact {
     pub file_name: String,
     pub contents: String,
     pub encoding: ArtifactEncoding,
+    /// The file's fingerprint, shown under its button for the operator to
+    /// compare where the file is installed (the gateway's bootstrap leaf).
+    /// Public, as the file is; absent for every other file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
 }
 
 /// How `contents` is to be written to disk.
@@ -874,6 +879,7 @@ mod tests {
                 file_name: "a.helios-invite".into(),
                 contents: "x".into(),
                 encoding: ArtifactEncoding::Text,
+                fingerprint: None,
             },
         );
         let held = artifacts

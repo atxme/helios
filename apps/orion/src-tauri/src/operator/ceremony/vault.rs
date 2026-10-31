@@ -22,7 +22,8 @@ use aether::certificates::operator_session::{
 use aether_fido::authenticator::{Authenticator, AuthenticatorError};
 use astra_operator::authenticator::Opened;
 use astra_operator::bootstrap::{
-    self, BootstrapPlan, Bootstrapped, BOOTSTRAP_CERTIFICATE_FILE, BOOTSTRAP_LEAF_DAYS,
+    self, BootstrapPlan, Bootstrapped, Finalization, BOOTSTRAP_CERTIFICATE_FILE,
+    BOOTSTRAP_LEAF_DAYS,
 };
 use astra_operator::gestures::{GestureError, NewAuthority, NewKey};
 use astra_operator::vault::{AuthorityVault, SlotRole};
@@ -96,10 +97,9 @@ fn refusal_of_setup(refusal: SetupRefusal) -> Refusal {
         SetupRefusal::DomainComplete => Refusal::DomainComplete,
         SetupRefusal::OtherGateway => Refusal::OtherGateway,
         SetupRefusal::BootstrapRequestInvalid => Refusal::BootstrapRequestInvalid,
-        // A key the document revokes is no longer one of the domain's signers.
-        SetupRefusal::SignerRevoked => Refusal::KeyNotEnrolled,
+        SetupRefusal::SignerRevoked => Refusal::SignerRevoked,
         // What would be written is no longer what the window showed.
-        SetupRefusal::PlanChanged => Refusal::ManifestMismatch,
+        SetupRefusal::PlanChanged => Refusal::DomainChanged,
     }
 }
 
@@ -456,6 +456,7 @@ impl VaultRun<'_> {
                         file_name: "ca-tls.pem".to_string(),
                         contents: pem,
                         encoding: ArtifactEncoding::Text,
+                        fingerprint: None,
                     });
                 }
                 self.done()
@@ -522,11 +523,25 @@ impl VaultRun<'_> {
         }
         self.signing();
         match bootstrap::bootstrap_with(self.vault_path, plan, first, second, now_unix()) {
-            Ok(bootstrapped) => {
-                deposit_bootstrapped(bootstrapped, deposit);
-                self.done()
-            }
+            Ok(bootstrapped) => self.conclude_bootstrap(bootstrapped, deposit),
             Err(error) => self.refuse(refusal_of(&error), format!("{error:#}")),
+        }
+    }
+
+    /// Hands over what a bootstrap wrote, then ends the ceremony: done, or
+    /// `Internal` when the finalization failed after the leaf. The leaf is
+    /// deposited first either way, so a late failure never hides it.
+    fn conclude_bootstrap(
+        &mut self,
+        bootstrapped: Bootstrapped,
+        deposit: &mut dyn FnMut(OperatorArtifact),
+    ) -> Result<(), String> {
+        match deposit_bootstrapped(bootstrapped, deposit) {
+            None => self.done(),
+            Some(chain) => self.refuse(
+                Refusal::Internal,
+                format!("feuille émise et écrite, finalisation du domaine en échec : {chain}"),
+            ),
         }
     }
 
@@ -546,20 +561,33 @@ impl VaultRun<'_> {
     }
 }
 
-/// Hands over the public files a bootstrap produced: the leaf, then the
-/// `CA-TLS` when the finalization issued it.
-fn deposit_bootstrapped(bootstrapped: Bootstrapped, deposit: &mut dyn FnMut(OperatorArtifact)) {
+/// Hands over the public files a bootstrap produced: the leaf with its
+/// fingerprint, then the `CA-TLS` when the finalization issued it. Returns the
+/// finalization's error chain when it failed after the leaf.
+fn deposit_bootstrapped(
+    bootstrapped: Bootstrapped,
+    deposit: &mut dyn FnMut(OperatorArtifact),
+) -> Option<String> {
     deposit(OperatorArtifact {
         file_name: BOOTSTRAP_CERTIFICATE_FILE.to_string(),
         contents: bootstrapped.leaf_json,
         encoding: ArtifactEncoding::Text,
+        fingerprint: Some(bootstrapped.leaf_fingerprint),
     });
-    if let Some(pem) = bootstrapped.finalized.and_then(|done| done.ca_tls_pem) {
-        deposit(OperatorArtifact {
-            file_name: "ca-tls.pem".to_string(),
-            contents: pem,
-            encoding: ArtifactEncoding::Text,
-        });
+    match bootstrapped.finalization {
+        Finalization::NotNeeded => None,
+        Finalization::Issued(finalized) => {
+            if let Some(pem) = finalized.ca_tls_pem {
+                deposit(OperatorArtifact {
+                    file_name: "ca-tls.pem".to_string(),
+                    contents: pem,
+                    encoding: ArtifactEncoding::Text,
+                    fingerprint: None,
+                });
+            }
+            None
+        }
+        Finalization::Failed(chain) => Some(chain),
     }
 }
 

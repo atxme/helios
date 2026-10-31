@@ -365,6 +365,7 @@ fn invite(
                 file_name: format!("{}.helios-invite", invite.name),
                 contents: encode_invitation_file(&invitation),
                 encoding: ArtifactEncoding::Text,
+                fingerprint: None,
             });
             ceremony.gesture = GestureState::Done;
             publish(ceremony.status());
@@ -1146,16 +1147,19 @@ fn hand_over_leaves(
         file_name: tls_name,
         contents: accepted.tls_certificate.to_base64(),
         encoding: ArtifactEncoding::Base64,
+        fingerprint: None,
     });
     deposit(OperatorArtifact {
         file_name: pq_name,
         contents: pq,
         encoding: ArtifactEncoding::Text,
+        fingerprint: None,
     });
     deposit(OperatorArtifact {
         file_name: "admission.txt".to_string(),
         contents: format!("{line}\n"),
         encoding: ArtifactEncoding::Text,
+        fingerprint: None,
     });
     Ok(())
 }
@@ -1184,6 +1188,7 @@ fn sign_delivery(
         file_name: document_file_name(&request.requested_name, &request.request_id),
         contents,
         encoding: ArtifactEncoding::Text,
+        fingerprint: None,
     })
 }
 

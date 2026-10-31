@@ -577,44 +577,112 @@ fn the_second_key_must_be_another_credential() {
     assert!(!astra_operator::bootstrap::path_beside(&domain.vault_path).exists());
 }
 
-/// The leaf is handed over first, then the `CA-TLS` when one was issued.
+/// The leaf is handed over first, with its fingerprint, then the `CA-TLS`
+/// when one was issued.
 #[test]
 fn the_bootstrap_deposits_the_leaf_and_the_ca_tls() {
     use astra_operator::vault_gestures::Finalized;
 
     let mut artifacts = Vec::new();
-    deposit_bootstrapped(
+    let failed = deposit_bootstrapped(
         Bootstrapped {
             leaf_json: "{\"leaf\":true}".into(),
             leaf_fingerprint: "fp".into(),
-            finalized: Some(Finalized {
+            finalization: Finalization::Issued(Finalized {
                 ca_tls_pem: Some("-----BEGIN CERTIFICATE-----".into()),
                 credentials_epoch: Some(1),
             }),
         },
         &mut |artifact| artifacts.push(artifact),
     );
+    assert_eq!(failed, None);
     let names: Vec<&str> = artifacts
         .iter()
         .map(|artifact| artifact.file_name.as_str())
         .collect();
     assert_eq!(names, ["gateway-bootstrap-certificate.json", "ca-tls.pem"]);
     assert_eq!(artifacts[0].contents, "{\"leaf\":true}");
+    assert_eq!(artifacts[0].fingerprint.as_deref(), Some("fp"));
+    assert_eq!(artifacts[1].fingerprint, None);
     assert!(artifacts
         .iter()
         .all(|artifact| artifact.encoding == ArtifactEncoding::Text));
 
     // A domain that already carried its CA-TLS deposits the leaf alone.
     let mut artifacts = Vec::new();
-    deposit_bootstrapped(
+    let failed = deposit_bootstrapped(
         Bootstrapped {
             leaf_json: "{}".into(),
             leaf_fingerprint: "fp".into(),
-            finalized: None,
+            finalization: Finalization::NotNeeded,
         },
         &mut |artifact| artifacts.push(artifact),
     );
+    assert_eq!(failed, None);
     assert_eq!(artifacts.len(), 1);
+}
+
+/// Only the bootstrap leaf carries a fingerprint to the window: every other
+/// file is serialized as before, without the field.
+#[test]
+fn only_the_leaf_carries_a_fingerprint_to_the_window() {
+    let leaf = OperatorArtifact {
+        file_name: "gateway-bootstrap-certificate.json".into(),
+        contents: "{}".into(),
+        encoding: ArtifactEncoding::Text,
+        fingerprint: Some("fp".into()),
+    };
+    let encoded = serde_json::to_value(&leaf).expect("leaf");
+    assert_eq!(encoded["fingerprint"], "fp");
+    let other = OperatorArtifact {
+        fingerprint: None,
+        file_name: "ca-tls.pem".into(),
+        ..leaf
+    };
+    let encoded = serde_json::to_value(&other).expect("other");
+    assert!(encoded.get("fingerprint").is_none());
+}
+
+/// A finalization that failed after the leaf still hands the leaf over, then
+/// ends the ceremony as `Internal`: « Finaliser le domaine » resumes the rest.
+#[test]
+fn a_late_finalization_failure_still_hands_over_the_leaf() {
+    let (presses, received) = std::sync::mpsc::channel::<Press>();
+    drop(presses);
+    let mut ceremony = Ceremony::new(
+        Id16::new([5; 16]).expect("id"),
+        OperationLocator {
+            kind: OperationKind::IssueGatewayBootstrap,
+            operation_id: None,
+        },
+    );
+    let vault_path = Path::new("unused-authority-vault.json");
+    let mut published = Vec::new();
+    let mut artifacts = Vec::new();
+    let mut publish = |status| published.push(status);
+    let mut run = VaultRun {
+        ceremony: &mut ceremony,
+        presses: &received,
+        publish: &mut publish,
+        vault_path,
+    };
+    let outcome = run.conclude_bootstrap(
+        Bootstrapped {
+            leaf_json: "{\"leaf\":true}".into(),
+            leaf_fingerprint: "fp".into(),
+            finalization: Finalization::Failed("écriture du document".into()),
+        },
+        &mut |artifact| artifacts.push(artifact),
+    );
+
+    let message = outcome.expect_err("the domain is not finished");
+    assert!(message.contains("écriture du document"));
+    let last = published.last().expect("a status");
+    assert_eq!(last.gesture, GestureState::Failed);
+    assert_eq!(last.refusal, Some(Refusal::Internal));
+    assert_eq!(artifacts.len(), 1);
+    assert_eq!(artifacts[0].file_name, "gateway-bootstrap-certificate.json");
+    assert_eq!(artifacts[0].fingerprint.as_deref(), Some("fp"));
 }
 
 /// What the bootstrap adds to the checks a vault gesture names.
@@ -626,8 +694,8 @@ fn refusals_of_the_bootstrap_are_named() {
             SetupRefusal::BootstrapRequestInvalid,
             Refusal::BootstrapRequestInvalid,
         ),
-        (SetupRefusal::SignerRevoked, Refusal::KeyNotEnrolled),
-        (SetupRefusal::PlanChanged, Refusal::ManifestMismatch),
+        (SetupRefusal::SignerRevoked, Refusal::SignerRevoked),
+        (SetupRefusal::PlanChanged, Refusal::DomainChanged),
     ] {
         assert_eq!(refusal_of_setup(setup), window);
         assert_eq!(refusal_of(&anyhow::Error::from(setup)), window);

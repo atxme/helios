@@ -13,7 +13,9 @@
 //! disabling a button is not a guarantee), proves both keys open the anchors,
 //! and only then writes, in this order: the gateway's identity on the relay,
 //! the leaf beside the vault, then the finalization. A failure after the leaf
-//! leaves the leaf in place, and « Finaliser le domaine » resumes the rest.
+//! leaves the leaf in place and is not an error: the leaf is returned with a
+//! [`Finalization::Failed`], so the window still hands it over, and
+//! « Finaliser le domaine » resumes the rest.
 //!
 //! The request, the leaf and `CA-TLS` are public. Every [`Opened`] handled
 //! here is secret: none is logged, serialized nor shown.
@@ -64,13 +66,29 @@ pub struct BootstrapPlan {
 }
 
 /// What a bootstrap wrote. Public, every field of it.
+///
+/// Returned as soon as the leaf is written, whatever the finalization did
+/// after it: a leaf already beside the vault is never hidden behind an error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Bootstrapped {
     /// The leaf, as written at [`path_beside`].
     pub leaf_json: String,
     pub leaf_fingerprint: String,
-    /// What the finalization issued, when the domain still lacked something.
-    pub finalized: Option<Finalized>,
+    /// What became of the domain's finalization once the leaf was written.
+    pub finalization: Finalization,
+}
+
+/// The finalization a bootstrap chains after the leaf.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Finalization {
+    /// The domain already had its `CA-TLS` and a complete credential document.
+    NotNeeded,
+    /// What the finalization issued.
+    Issued(Finalized),
+    /// The finalization failed after the leaf was written: the domain is not
+    /// finished, and « Finaliser le domaine » resumes it. The error chain, for
+    /// the log: the text a failed « Finaliser le domaine » logs.
+    Failed(String),
 }
 
 /// Where the leaf is written: beside the vault, whatever the vault's path.
@@ -109,6 +127,9 @@ pub fn bootstrap_plan(
 /// The plan is settled again from the domain as it is now, and must be the
 /// one shown: a domain that moved between the manifest and the press is
 /// refused as [`SetupRefusal::PlanChanged`] before anything is written.
+///
+/// An error means no leaf was written. Once it is, the result is `Ok`, and a
+/// finalization that failed after it is a [`Finalization::Failed`].
 pub fn bootstrap_with(
     vault_path: &Path,
     plan: &BootstrapPlan,
@@ -180,19 +201,21 @@ pub fn bootstrap_with(
     aether::private_file::write_private_atomic(&leaf_path, leaf_json.as_bytes())
         .with_context(|| format!("écriture de {}", leaf_path.display()))?;
 
-    let finalized = if current.issues_ca_tls || current.issues_credentials {
+    let finalization = if current.issues_ca_tls || current.issues_credentials {
         match finalize_with(vault_path, first, now_unix) {
-            Ok(finalized) => Some(finalized),
-            Err(error) if error.downcast_ref() == Some(&SetupRefusal::DomainComplete) => None,
-            Err(error) => return Err(error),
+            Ok(finalized) => Finalization::Issued(finalized),
+            Err(error) if error.downcast_ref() == Some(&SetupRefusal::DomainComplete) => {
+                Finalization::NotNeeded
+            }
+            Err(error) => Finalization::Failed(format!("{error:#}")),
         }
     } else {
-        None
+        Finalization::NotNeeded
     };
     Ok(Bootstrapped {
         leaf_json,
         leaf_fingerprint,
-        finalized,
+        finalization,
     })
 }
 

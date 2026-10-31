@@ -394,6 +394,12 @@ pub enum Refusal {
     BootstrapRequestInvalid,
     /// The request comes from a gateway other than the one the domain names.
     OtherGateway,
+    /// The domain moved between the manifest shown and the press: what would
+    /// be signed is no longer what the operator saw. Nothing was signed.
+    DomainChanged,
+    /// The credential document revokes the key that answered: it cannot
+    /// approve.
+    SignerRevoked,
     /// Anything the ceremony could not classify. Deliberately last and
     /// deliberately opaque: an unclassified failure must not become a channel
     /// for text.
@@ -1179,6 +1185,14 @@ mod tests {
         assert_eq!(
             serde_json::to_value(Refusal::OtherGateway).expect("refusal"),
             serde_json::json!({ "refusal": "other_gateway" })
+        );
+        assert_eq!(
+            serde_json::to_value(Refusal::DomainChanged).expect("refusal"),
+            serde_json::json!({ "refusal": "domain_changed" })
+        );
+        assert_eq!(
+            serde_json::to_value(Refusal::SignerRevoked).expect("refusal"),
+            serde_json::json!({ "refusal": "signer_revoked" })
         );
     }
 
