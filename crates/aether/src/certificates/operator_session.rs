@@ -126,6 +126,8 @@ pub enum OperationKind {
     MarkKey,
     /// The domain's first gateway identity and certificates, issued once.
     FinalizeDomain,
+    /// A gateway's first identity and leaves, issued from its bootstrap request.
+    IssueGatewayBootstrap,
 }
 
 /// What the WebView is allowed to name.
@@ -388,6 +390,10 @@ pub enum Refusal {
     GatewayIdentityMissing,
     /// The domain is already complete: nothing is left to finalize.
     DomainComplete,
+    /// The bootstrap request is malformed, or does not hold what it must.
+    BootstrapRequestInvalid,
+    /// The request comes from a gateway other than the one the domain names.
+    OtherGateway,
     /// Anything the ceremony could not classify. Deliberately last and
     /// deliberately opaque: an unclassified failure must not become a channel
     /// for text.
@@ -415,6 +421,7 @@ pub enum AstraManifest {
     KeyRemoval(KeyRemovalManifest),
     KeyMarking(KeyMarkingManifest),
     DomainFinalization(DomainFinalizationManifest),
+    GatewayBootstrap(GatewayBootstrapManifest),
 }
 
 impl AstraManifest {
@@ -433,6 +440,7 @@ impl AstraManifest {
             Self::KeyRemoval(_) => OperationKind::RemoveKey,
             Self::KeyMarking(_) => OperationKind::MarkKey,
             Self::DomainFinalization(_) => OperationKind::FinalizeDomain,
+            Self::GatewayBootstrap(_) => OperationKind::IssueGatewayBootstrap,
         }
     }
 
@@ -454,7 +462,8 @@ impl AstraManifest {
             | Self::KeyAddition(_)
             | Self::KeyRemoval(_)
             | Self::KeyMarking(_)
-            | Self::DomainFinalization(_) => None,
+            | Self::DomainFinalization(_)
+            | Self::GatewayBootstrap(_) => None,
         }
     }
 }
@@ -513,6 +522,20 @@ pub struct DomainFinalizationManifest {
     pub vault_fingerprint: Fingerprint,
     pub server_name: String,
     pub gateway_wg_public_key: WireGuardKey,
+    pub issues_ca_tls: bool,
+    pub ca_tls_days: u64,
+    pub issues_credentials: bool,
+}
+
+/// A gateway's bootstrap request and what is issued from it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayBootstrapManifest {
+    pub vault_fingerprint: Fingerprint,
+    pub server_name: String,
+    pub gateway_wg_public_key: WireGuardKey,
+    pub request_fingerprint: Fingerprint,
+    pub leaf_days: u64,
     pub issues_ca_tls: bool,
     pub ca_tls_days: u64,
     pub issues_credentials: bool,
@@ -1115,5 +1138,55 @@ mod tests {
         ] {
             assert_eq!(serde_json::to_value(refusal).expect("refusal"), expected);
         }
+    }
+
+    fn bootstrap_manifest() -> GatewayBootstrapManifest {
+        GatewayBootstrapManifest {
+            vault_fingerprint: Fingerprint::of(b"vault"),
+            server_name: "gateway.example".into(),
+            gateway_wg_public_key: WireGuardKey::from_bytes([8; 32]),
+            request_fingerprint: Fingerprint::of(b"request"),
+            leaf_days: 90,
+            issues_ca_tls: true,
+            ca_tls_days: 365,
+            issues_credentials: true,
+        }
+    }
+
+    #[test]
+    fn the_bootstrap_manifest_has_its_kind() {
+        let manifest = AstraManifest::GatewayBootstrap(bootstrap_manifest());
+        assert_eq!(manifest.kind(), OperationKind::IssueGatewayBootstrap);
+        assert_eq!(manifest.trust_domain_id(), None);
+        assert_eq!(
+            serde_json::to_value(OperationKind::IssueGatewayBootstrap).expect("kind"),
+            serde_json::json!("issue_gateway_bootstrap")
+        );
+        let encoded = serde_json::to_value(&manifest).expect("manifest");
+        assert_eq!(encoded["operation"], "gateway_bootstrap");
+        assert_eq!(
+            serde_json::from_value::<AstraManifest>(encoded).expect("round trip"),
+            manifest
+        );
+    }
+
+    #[test]
+    fn the_bootstrap_refusals_spell_in_snake_case() {
+        assert_eq!(
+            serde_json::to_value(Refusal::BootstrapRequestInvalid).expect("refusal"),
+            serde_json::json!({ "refusal": "bootstrap_request_invalid" })
+        );
+        assert_eq!(
+            serde_json::to_value(Refusal::OtherGateway).expect("refusal"),
+            serde_json::json!({ "refusal": "other_gateway" })
+        );
+    }
+
+    #[test]
+    fn the_bootstrap_manifest_refuses_unknown_fields() {
+        let mut encoded = serde_json::to_value(bootstrap_manifest()).expect("manifest");
+        assert!(serde_json::from_value::<GatewayBootstrapManifest>(encoded.clone()).is_ok());
+        encoded["extra"] = serde_json::json!(1);
+        assert!(serde_json::from_value::<GatewayBootstrapManifest>(encoded).is_err());
     }
 }
