@@ -400,6 +400,12 @@ pub enum Refusal {
     /// The credential document revokes the key that answered: it cannot
     /// approve.
     SignerRevoked,
+    /// The file is not a delegation request that can be read: nothing was
+    /// signed.
+    DelegationRequestInvalid,
+    /// The campaign does not name this delegation request: its epoch or one
+    /// of its keys was substituted. Refused before any key.
+    DelegationRequestMismatch,
     /// Anything the ceremony could not classify. Deliberately last and
     /// deliberately opaque: an unclassified failure must not become a channel
     /// for text.
@@ -622,6 +628,17 @@ pub struct IssuerManifest {
     pub allowed_usages: Vec<String>,
     pub policy_fingerprint: Fingerprint,
     pub request_fingerprint: Fingerprint,
+    /// Longest leaf the delegated issuer may sign, already capped by the
+    /// pinned policy: the value shown is the value signed.
+    pub maximum_leaf_lifetime_secs: u64,
+    /// The ML-DSA-87 key the delegation certifies.
+    pub pq_public_key_fingerprint: Fingerprint,
+    /// The `SubjectPublicKeyInfo` the request's PKCS#10 proves possession of.
+    pub tls_public_key_info_fingerprint: Fingerprint,
+    /// The campaign the key also approves, when there is one. Absent for the
+    /// offline form, which nothing ties to the authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub campaign: Option<CampaignManifest>,
 }
 
 /// Which CA a rotation moves.
@@ -1202,5 +1219,57 @@ mod tests {
         assert!(serde_json::from_value::<GatewayBootstrapManifest>(encoded.clone()).is_ok());
         encoded["extra"] = serde_json::json!(1);
         assert!(serde_json::from_value::<GatewayBootstrapManifest>(encoded).is_err());
+    }
+
+    fn issuer_manifest() -> IssuerManifest {
+        IssuerManifest {
+            trust_domain_id: Id16::new([7; 16]).expect("domain"),
+            issuer_epoch: 2,
+            not_before: 10,
+            not_after: 20,
+            allowed_usages: vec!["client_leaf_renewal".into()],
+            policy_fingerprint: Fingerprint::of(b"policy"),
+            request_fingerprint: Fingerprint::of(b"request"),
+            maximum_leaf_lifetime_secs: 90 * 86_400,
+            pq_public_key_fingerprint: Fingerprint::of(b"pq"),
+            tls_public_key_info_fingerprint: Fingerprint::of(b"spki"),
+            campaign: None,
+        }
+    }
+
+    #[test]
+    fn the_delegation_refusals_spell_in_snake_case() {
+        assert_eq!(
+            serde_json::to_value(Refusal::DelegationRequestInvalid).expect("refusal"),
+            serde_json::json!({ "refusal": "delegation_request_invalid" })
+        );
+        assert_eq!(
+            serde_json::to_value(Refusal::DelegationRequestMismatch).expect("refusal"),
+            serde_json::json!({ "refusal": "delegation_request_mismatch" })
+        );
+    }
+
+    #[test]
+    fn an_issuer_manifest_without_campaign_omits_it() {
+        let encoded = serde_json::to_value(issuer_manifest()).expect("manifest");
+        assert!(encoded.get("campaign").is_none());
+        let decoded: IssuerManifest = serde_json::from_value(encoded).expect("decoded");
+        assert_eq!(decoded.campaign, None);
+        assert_eq!(decoded, issuer_manifest());
+    }
+
+    #[test]
+    fn an_issuer_manifest_refuses_unknown_fields() {
+        let mut encoded = serde_json::to_value(issuer_manifest()).expect("manifest");
+        encoded["extra"] = serde_json::json!(1);
+        assert!(serde_json::from_value::<IssuerManifest>(encoded).is_err());
+    }
+
+    #[test]
+    fn the_issuer_manifest_has_its_kind() {
+        assert_eq!(
+            AstraManifest::IssuerAuthorization(issuer_manifest()).kind(),
+            OperationKind::AuthorizeIssuer
+        );
     }
 }
