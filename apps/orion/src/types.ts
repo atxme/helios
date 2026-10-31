@@ -739,6 +739,8 @@ export type Refusal =
   | { refusal: 'handoff_mismatch' }
   | { refusal: 'bootstrap_request_invalid' }
   | { refusal: 'other_gateway' }
+  | { refusal: 'domain_changed' }
+  | { refusal: 'signer_revoked' }
   | { refusal: 'manifest_mismatch' }
   | { refusal: 'protocol_violation' }
   | { refusal: 'cancelled' }
@@ -995,6 +997,8 @@ export interface OperatorArtifact {
   contents: string
   /** `base64` : `contents` est l'encodage d'octets bruts (feuille DER) à décoder avant d'écrire. */
   encoding: 'text' | 'base64'
+  /** Empreinte publique à comparer là où le fichier s'installe (feuille d'amorçage) ; absente sinon. */
+  fingerprint?: string | null
 }
 
 /**

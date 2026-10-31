@@ -242,16 +242,19 @@ export function rowsOf(manifest: AstraManifest): [string, string][] {
       ]
     case 'gateway_bootstrap': {
       const rows: [string, string][] = [
-        ['Gateway', manifest.server_name],
-        ['Identité WireGuard', manifest.gateway_wg_public_key],
-        ['Demande (empreinte)', manifest.request_fingerprint],
-        ['Validité de la feuille', `${manifest.leaf_days} jours`],
+        ['coffre', manifest.vault_fingerprint],
+        ['gateway', manifest.server_name],
+        ['identité WireGuard', manifest.gateway_wg_public_key],
+        ['demande', manifest.request_fingerprint],
+        ['époque', '1'],
+        ['validité de la feuille', `${manifest.leaf_days} jours`],
+        ['approbations', 'deux clés distinctes'],
       ]
       if (manifest.issues_ca_tls) {
-        rows.push([`Émettre la CA-TLS`, `${manifest.ca_tls_days} jours`])
+        rows.push(['émettre la CA-TLS', `${manifest.ca_tls_days} jours`])
       }
       if (manifest.issues_credentials) {
-        rows.push(['Signer le document de credentials', 'oui'])
+        rows.push(['signer le document de credentials', 'oui'])
       }
       return rows
     }
@@ -428,6 +431,13 @@ export function refusalSentence(refusal: Refusal): string {
         'Le domaine nomme déjà une autre gateway : en changer est une transition de gateway. ' +
         'Rien n’a été écrit.'
       )
+    case 'domain_changed':
+      return (
+        'Le domaine a changé depuis l’affichage de ce qui allait être signé : recommencer le ' +
+        'geste. Rien n’a été signé.'
+      )
+    case 'signer_revoked':
+      return 'Le document de credentials révoque cette clé : en présenter une autre.'
     case 'manifest_mismatch':
       return 'La réponse ne décrit pas la demande envoyée.'
     case 'protocol_violation':

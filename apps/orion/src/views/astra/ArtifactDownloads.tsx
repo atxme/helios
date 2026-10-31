@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import Alert from '@mui/material/Alert'
+import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
 import Paper from '@mui/material/Paper'
 import Stack from '@mui/material/Stack'
@@ -37,13 +38,23 @@ function saveArtifact(artifact: OperatorArtifact) {
 const ENDED: GestureState[] = ['done', 'failed']
 
 /**
- * The files an enrollment ceremony produced, each saved by its own button.
+ * The files a ceremony produced, each saved by its own button, with its
+ * fingerprint under it when the file carries one.
  *
  * Fetched once the ceremony has ended, including when it stopped short: an
- * acceptance that could not admit the peer still hands over its leaves. The
- * files are public material held for this session only, hence the reminder.
+ * acceptance that could not admit the peer still hands over its leaves, and a
+ * bootstrap whose finalization failed still hands over its leaf, which
+ * `failedNote` then explains. The files are public material held for this
+ * session only, hence the reminder; the gateway's bootstrap leaf alone is also
+ * written beside the vault.
  */
-export function ArtifactDownloads({ gesture }: { gesture: GestureState }) {
+export function ArtifactDownloads({
+  gesture,
+  failedNote,
+}: {
+  gesture: GestureState
+  failedNote?: string
+}) {
   const [artifacts, setArtifacts] = useState<OperatorArtifact[]>([])
   const [error, setError] = useState<string | null>(null)
   const ended = typeof gesture === 'string' && ENDED.includes(gesture)
@@ -80,23 +91,38 @@ export function ArtifactDownloads({ gesture }: { gesture: GestureState }) {
         Fichiers produits
       </Typography>
       <Typography color="text.secondary" sx={{ fontSize: 11, mb: 1 }}>
-        Enregistrez-les avant de quitter cet écran : ils ne sont pas conservés.
+        Enregistrez-les avant de quitter cet écran, qui ne les garde pas (seule la feuille
+        d’amorçage de la gateway est aussi écrite à côté du coffre).
       </Typography>
       <Stack spacing={0.75} sx={{ alignItems: 'flex-start' }}>
         {artifacts.map((artifact) => (
-          <Button
-            key={artifact.file_name}
-            size="small"
-            variant="outlined"
-            color="inherit"
-            startIcon={<Download size={14} aria-hidden />}
-            onClick={() => save(artifact)}
-            sx={{ minHeight: 30, fontSize: 11.5, textTransform: 'none' }}
-          >
-            {`Enregistrer ${artifact.file_name}`}
-          </Button>
+          <Box key={artifact.file_name} sx={{ minWidth: 0, maxWidth: '100%' }}>
+            <Button
+              size="small"
+              variant="outlined"
+              color="inherit"
+              startIcon={<Download size={14} aria-hidden />}
+              onClick={() => save(artifact)}
+              sx={{ minHeight: 30, fontSize: 11.5, textTransform: 'none' }}
+            >
+              {`Enregistrer ${artifact.file_name}`}
+            </Button>
+            {artifact.fingerprint && (
+              <Typography
+                color="text.secondary"
+                sx={{ mt: 0.5, fontSize: 10.5, fontFamily: 'monospace', overflowWrap: 'anywhere' }}
+              >
+                {`empreinte : ${artifact.fingerprint}`}
+              </Typography>
+            )}
+          </Box>
         ))}
       </Stack>
+      {gesture === 'failed' && failedNote && artifacts.length > 0 && (
+        <Typography color="text.secondary" sx={{ mt: 1, fontSize: 11.5 }}>
+          {failedNote}
+        </Typography>
+      )}
       {error && (
         <Alert severity="error" variant="outlined" sx={{ mt: 1, fontSize: 11.5 }}>
           {error}

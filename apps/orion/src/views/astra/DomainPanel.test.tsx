@@ -219,7 +219,7 @@ describe('DomainPanel', () => {
     const { unmount } = render(<DomainPanel onCeremony={onCeremony} />)
     const waiting = await screen.findByRole('button', { name: 'Finaliser le domaine' })
     expect(waiting.hasAttribute('disabled')).toBe(true)
-    expect(screen.getByText('La gateway n’est pas encore dans le relais.')).toBeTruthy()
+    expect(screen.getByText('Amorcer d’abord la gateway (« Amorcer la gateway… »).')).toBeTruthy()
     unmount()
 
     api.operatorOverview.mockResolvedValue(withDomain({ ca_tls_present: false }, false))
@@ -280,6 +280,31 @@ describe('DomainPanel', () => {
       )
       expect(api.beginVaultCeremony).toHaveBeenCalledTimes(1)
       await waitFor(() => expect(onCeremony).toHaveBeenCalledWith(status))
+    })
+
+    it('a_fresh_domain_points_at_the_bootstrap_first', async () => {
+      const contained = (button: HTMLElement) => button.className.includes('MuiButton-contained')
+      api.operatorOverview.mockResolvedValue({
+        ...withDomain({ server_name: null, gateway_wg_public_key: null, ca_tls_present: false }, false),
+        slots: [slot('01', 'active'), slot('02', 'active')],
+      })
+      const fresh = render(<DomainPanel onCeremony={onCeremony} />)
+      const amorcer = await screen.findByRole('button', { name: 'Amorcer la gateway…' })
+      const finaliser = screen.getByRole('button', { name: 'Finaliser le domaine' })
+      expect(contained(amorcer)).toBe(true)
+      expect(contained(finaliser)).toBe(false)
+      expect(finaliser.hasAttribute('disabled')).toBe(true)
+      fresh.unmount()
+
+      // Once the gateway is known, finalizing is the primary step again.
+      api.operatorOverview.mockResolvedValue({
+        ...withDomain({ ca_tls_present: false }, false),
+        slots: [slot('01', 'active'), slot('02', 'active')],
+      })
+      render(<DomainPanel onCeremony={onCeremony} />)
+      const known = await screen.findByRole('button', { name: 'Amorcer la gateway…' })
+      expect(contained(known)).toBe(false)
+      expect(contained(screen.getByRole('button', { name: 'Finaliser le domaine' }))).toBe(true)
     })
 
     it('a_wrong_file_is_refused_inline', async () => {

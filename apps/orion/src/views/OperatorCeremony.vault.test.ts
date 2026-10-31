@@ -102,19 +102,25 @@ describe('the vault gestures in the ceremony window', () => {
   it('the_bootstrap_manifest_lists_what_it_will_issue', () => {
     const issued = rowsOf(bootstrap)
     expect(issued).toEqual([
-      ['Gateway', 'gw.example.net'],
-      ['Identité WireGuard', 'k'.repeat(44)],
-      ['Demande (empreinte)', 'f'.repeat(64)],
-      ['Validité de la feuille', '90 jours'],
-      ['Émettre la CA-TLS', '3650 jours'],
-      ['Signer le document de credentials', 'oui'],
+      ['coffre', 'a'.repeat(64)],
+      ['gateway', 'gw.example.net'],
+      ['identité WireGuard', 'k'.repeat(44)],
+      ['demande', 'f'.repeat(64)],
+      ['époque', '1'],
+      ['validité de la feuille', '90 jours'],
+      ['approbations', 'deux clés distinctes'],
+      ['émettre la CA-TLS', '3650 jours'],
+      ['signer le document de credentials', 'oui'],
     ])
     const leafOnly = rowsOf({ ...bootstrap, issues_ca_tls: false, issues_credentials: false })
     expect(leafOnly.map(([label]) => label)).toEqual([
-      'Gateway',
-      'Identité WireGuard',
-      'Demande (empreinte)',
-      'Validité de la feuille',
+      'coffre',
+      'gateway',
+      'identité WireGuard',
+      'demande',
+      'époque',
+      'validité de la feuille',
+      'approbations',
     ])
   })
 
@@ -124,6 +130,12 @@ describe('the vault gestures in the ceremony window', () => {
     )
     expect(refusalSentence({ refusal: 'other_gateway' })).toBe(
       'Le domaine nomme déjà une autre gateway : en changer est une transition de gateway. Rien n’a été écrit.',
+    )
+    expect(refusalSentence({ refusal: 'domain_changed' })).toBe(
+      'Le domaine a changé depuis l’affichage de ce qui allait être signé : recommencer le geste. Rien n’a été signé.',
+    )
+    expect(refusalSentence({ refusal: 'signer_revoked' })).toBe(
+      'Le document de credentials révoque cette clé : en présenter une autre.',
     )
   })
 

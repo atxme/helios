@@ -247,7 +247,12 @@ describe('AstraView', () => {
       allowed: [],
     })
     api.operatorArtifacts.mockResolvedValue([
-      { file_name: 'gateway-bootstrap-certificate.json', encoding: 'text', contents: '{}' },
+      {
+        file_name: 'gateway-bootstrap-certificate.json',
+        encoding: 'text',
+        contents: '{}',
+        fingerprint: 'c'.repeat(64),
+      },
       { file_name: 'ca-tls.pem', encoding: 'text', contents: '-----BEGIN CERTIFICATE-----' },
     ])
     render(<AstraView />)
@@ -255,7 +260,59 @@ describe('AstraView', () => {
       await screen.findByRole('button', { name: 'Enregistrer gateway-bootstrap-certificate.json' }),
     ).toBeTruthy()
     expect(screen.getByRole('button', { name: 'Enregistrer ca-tls.pem' })).toBeTruthy()
+    expect(screen.getByText(`empreinte : ${'c'.repeat(64)}`)).toBeTruthy()
+    expect(screen.getAllByText(/^empreinte : /)).toHaveLength(1)
     expect(screen.getByText(/Portez la feuille sur la gateway/)).toBeTruthy()
+    expect(screen.getByText(/seule la feuille\s+d’amorçage de la gateway est aussi écrite/)).toBeTruthy()
+    expect(screen.queryByText(/reprend ce qui manque/)).toBeNull()
+  })
+
+  it('a_bootstrap_that_failed_after_its_leaf_still_offers_it', async () => {
+    api.operatorCeremonyStatus.mockResolvedValue({
+      session_id: 'e'.repeat(32),
+      revision: 4,
+      operation: 'issue_gateway_bootstrap',
+      operation_id: null,
+      remote: 'not_required',
+      gesture: 'failed',
+      allowed: [],
+      refusal: { refusal: 'internal' },
+    })
+    api.operatorArtifacts.mockResolvedValue([
+      {
+        file_name: 'gateway-bootstrap-certificate.json',
+        encoding: 'text',
+        contents: '{}',
+        fingerprint: 'c'.repeat(64),
+      },
+    ])
+    render(<AstraView />)
+    expect(
+      await screen.findByRole('button', { name: 'Enregistrer gateway-bootstrap-certificate.json' }),
+    ).toBeTruthy()
+    expect(screen.getByText(`empreinte : ${'c'.repeat(64)}`)).toBeTruthy()
+    expect(
+      screen.getByText(
+        'La feuille est émise et enregistrée à côté du coffre ; « Finaliser le domaine » reprend ce qui manque.',
+      ),
+    ).toBeTruthy()
+    expect(screen.queryByText(/Portez la feuille sur la gateway/)).toBeNull()
+  })
+
+  it('a_bootstrap_that_failed_before_its_leaf_says_nothing_of_it', async () => {
+    api.operatorCeremonyStatus.mockResolvedValue({
+      session_id: 'e'.repeat(32),
+      revision: 4,
+      operation: 'issue_gateway_bootstrap',
+      operation_id: null,
+      remote: 'not_required',
+      gesture: 'failed',
+      allowed: [],
+      refusal: { refusal: 'key_repeated' },
+    })
+    render(<AstraView />)
+    await waitFor(() => expect(api.operatorArtifacts).toHaveBeenCalled())
+    expect(screen.queryByText(/reprend ce qui manque/)).toBeNull()
   })
 
   it('starts from an existing operation and sends the four typed fields', async () => {

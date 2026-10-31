@@ -28,6 +28,10 @@ import type {
   OperatorStatus,
 } from '../types'
 
+/** Under the files of a bootstrap that failed after its leaf was written. */
+const BOOTSTRAP_LEAF_KEPT =
+  'La feuille est émise et enregistrée à côté du coffre ; « Finaliser le domaine » reprend ce qui manque.'
+
 const EMPTY_INPUT: AstraRotationInput = {
   vault_path: '',
   heliosd_url: 'http://100.64.0.1:8080',
@@ -348,7 +352,12 @@ export function AstraView({
           ceremony.operation === 'accept_enrollment' ||
           ceremony.operation === 'finalize_domain' ||
           ceremony.operation === 'issue_gateway_bootstrap') && (
-          <ArtifactDownloads gesture={ceremony.gesture} />
+          <ArtifactDownloads
+            gesture={ceremony.gesture}
+            failedNote={
+              ceremony.operation === 'issue_gateway_bootstrap' ? BOOTSTRAP_LEAF_KEPT : undefined
+            }
+          />
         )}
         {ceremony.operation === 'issue_gateway_bootstrap' && ceremony.gesture === 'done' && (
           <Typography color="text.secondary" sx={{ mt: 1, fontSize: 11.5 }}>

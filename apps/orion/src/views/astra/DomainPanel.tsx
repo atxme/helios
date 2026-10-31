@@ -18,7 +18,7 @@ import type { DomainView, OperatorStatus, RelayUpdate } from '../../types'
 import { readFileText } from './readFileText'
 import { useOverview } from './useOverview'
 
-const WAIT_GATEWAY = 'La gateway n’est pas encore dans le relais.'
+const WAIT_GATEWAY = 'Amorcer d’abord la gateway (« Amorcer la gateway… »).'
 const NEEDS_TWO_KEYS = 'Il faut deux clés actives pour amorcer la gateway.'
 const BAD_FILE = 'Ce fichier est illisible ou trop grand (256 Kio au plus).'
 const fieldSx = { '& input': { fontSize: 11.5 }, '& label': { fontSize: 11.5 } }
@@ -251,9 +251,11 @@ export function DomainPanel({ onCeremony }: { onCeremony: (status: OperatorStatu
       )}
       {!editing && (
         <Box sx={{ mt: 1.5 }}>
+          {/* The first step of a fresh domain is the primary one; once the
+              gateway is known, finalizing is. */}
           <Button
             size="small"
-            variant="outlined"
+            variant={gatewayKnown ? 'outlined' : 'contained'}
             disabled={busy || usableKeys < 2}
             onClick={() => requestInput.current?.click()}
             sx={{ minHeight: 30, fontSize: 11.5 }}
@@ -371,7 +373,7 @@ export function DomainPanel({ onCeremony }: { onCeremony: (status: OperatorStatu
         <Box sx={{ mt: 1.5 }}>
           <Button
             size="small"
-            variant="contained"
+            variant={gatewayKnown ? 'contained' : 'outlined'}
             disabled={busy || !gatewayKnown}
             onClick={() => void finalize()}
             sx={{ minHeight: 30, fontSize: 11.5 }}
