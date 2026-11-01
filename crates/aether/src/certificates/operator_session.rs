@@ -406,6 +406,10 @@ pub enum Refusal {
     /// The campaign does not name this delegation request: its epoch or one
     /// of its keys was substituted. Refused before any key.
     DelegationRequestMismatch,
+    /// The domain's `CA-TLS` cannot back the delegation: it is not a
+    /// certificate authority, or it does not cover the whole delegation
+    /// window. Refused before any key.
+    CaTlsUnusable,
     /// Anything the ceremony could not classify. Deliberately last and
     /// deliberately opaque: an unclassified failure must not become a channel
     /// for text.
@@ -627,6 +631,11 @@ pub struct IssuerManifest {
     /// than summarised: this is the whole of what the signature widens.
     pub allowed_usages: Vec<String>,
     pub policy_fingerprint: Fingerprint,
+    /// SHA-256 of the compact JSON re-encoding of the parsed
+    /// `IssuerDelegationRequest` (fields in declaration order). Not the hash
+    /// of the file as read: whitespace around the document does not move it,
+    /// whitespace inside a value does. It identifies the request; the values
+    /// that bind what is certified are the two key fingerprints below.
     pub request_fingerprint: Fingerprint,
     /// Longest leaf the delegated issuer may sign, already capped by the
     /// pinned policy: the value shown is the value signed.
@@ -1246,6 +1255,10 @@ mod tests {
         assert_eq!(
             serde_json::to_value(Refusal::DelegationRequestMismatch).expect("refusal"),
             serde_json::json!({ "refusal": "delegation_request_mismatch" })
+        );
+        assert_eq!(
+            serde_json::to_value(Refusal::CaTlsUnusable).expect("refusal"),
+            serde_json::json!({ "refusal": "ca_tls_unusable" })
         );
     }
 
