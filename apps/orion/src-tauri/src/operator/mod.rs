@@ -336,6 +336,69 @@ impl VaultGesture {
     }
 }
 
+/// The delegation of Astra's issuer (§9.5), as the WebView names it.
+///
+/// Typed and closed like [`VaultGesture`]. Only the request's text travels,
+/// never a path; in a campaign, with the operation the authority opened. The
+/// origin the campaign is fetched from is the relay's, never the window's.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "gesture", rename_all = "snake_case", deny_unknown_fields)]
+pub enum IssuerGesture {
+    /// The ordinary path: the campaign `operation_id` names approves the
+    /// request, and the same key opens the vault.
+    AuthorizeIssuer {
+        operation_id: String,
+        request: String,
+    },
+    /// The last resort, for a domain whose relay names no Astra origin: the
+    /// authorization is handed over as a file.
+    AuthorizeIssuerOffline { request: String },
+}
+
+impl IssuerGesture {
+    /// Refuses what no ceremony should be opened for.
+    fn validate(&self) -> Result<(), String> {
+        let request = match self {
+            Self::AuthorizeIssuer { request, .. } | Self::AuthorizeIssuerOffline { request } => {
+                request
+            }
+        };
+        if request.trim().is_empty()
+            || request.len() > astra_operator::operations::issuer::MAX_DELEGATION_REQUEST_BYTES
+        {
+            return Err(
+                "la demande de délégation est vide ou trop grande (256 Kio au plus)".to_string(),
+            );
+        }
+        self.operation_id().map(|_| ())
+    }
+
+    fn operation(&self) -> OperationKind {
+        OperationKind::AuthorizeIssuer
+    }
+
+    /// The campaign's operation, `None` offline.
+    fn operation_id(&self) -> Result<Option<Id16>, String> {
+        match self {
+            Self::AuthorizeIssuer { operation_id, .. } => {
+                Id16::parse_hex(operation_id).map(Some).map_err(|_| {
+                    "l'identifiant de l'opération tient en 32 caractères hexadécimaux".to_string()
+                })
+            }
+            Self::AuthorizeIssuerOffline { .. } => Ok(None),
+        }
+    }
+
+    /// The text of the delegation request.
+    fn request(&self) -> &str {
+        match self {
+            Self::AuthorizeIssuer { request, .. } | Self::AuthorizeIssuerOffline { request } => {
+                request
+            }
+        }
+    }
+}
+
 /// Renames the key `slot_id` of the vault at `vault_path`. No key is asked
 /// anything; the label is checked as a gesture's would be.
 pub fn rename_key(vault_path: &std::path::Path, slot_id: &str, label: &str) -> Result<(), String> {
@@ -499,6 +562,28 @@ impl OperatorCeremony {
         let kind = gesture.operation();
         self.open(kind, move |session_id, presses, publish, artifacts| {
             ceremony::run_vault(
+                session_id,
+                gesture,
+                presses,
+                publish,
+                &mut |artifact| deposit(artifacts, artifact),
+                &vault_path,
+            )
+        })
+        .await
+    }
+
+    /// Starts the delegation of Astra's issuer the same way, under the same
+    /// rule of one ceremony at a time.
+    pub async fn begin_issuer(
+        &self,
+        gesture: IssuerGesture,
+        vault_path: PathBuf,
+    ) -> Result<OperatorStatus, String> {
+        gesture.validate()?;
+        let kind = gesture.operation();
+        self.open(kind, move |session_id, presses, publish, artifacts| {
+            ceremony::run_issuer(
                 session_id,
                 gesture,
                 presses,
@@ -1007,6 +1092,87 @@ mod tests {
         }
         .validate()
         .is_ok());
+    }
+
+    /// A delegation carries the request's text and, in a campaign, the
+    /// operation the authority opened: never a path, never anything else.
+    #[test]
+    fn an_issuer_gesture_carries_only_the_request_text() {
+        let operation = "0123456789abcdef0123456789abcdef";
+        let gesture: IssuerGesture = serde_json::from_str(&format!(
+            r#"{{"gesture":"authorize_issuer","operation_id":"{operation}","request":"{{}}"}}"#
+        ))
+        .expect("a campaign delegation");
+        assert_eq!(
+            gesture,
+            IssuerGesture::AuthorizeIssuer {
+                operation_id: operation.into(),
+                request: "{}".into(),
+            }
+        );
+        assert_eq!(gesture.operation(), OperationKind::AuthorizeIssuer);
+        assert!(gesture.validate().is_ok());
+        assert_eq!(
+            gesture.operation_id(),
+            Ok(Some(Id16::parse_hex(operation).expect("id")))
+        );
+
+        let offline: IssuerGesture =
+            serde_json::from_str(r#"{"gesture":"authorize_issuer_offline","request":"{}"}"#)
+                .expect("an offline delegation");
+        assert_eq!(
+            offline,
+            IssuerGesture::AuthorizeIssuerOffline {
+                request: "{}".into()
+            }
+        );
+        assert_eq!(offline.operation(), OperationKind::AuthorizeIssuer);
+        assert!(offline.validate().is_ok());
+        assert_eq!(offline.operation_id(), Ok(None));
+
+        for unknown in [
+            r#"{"gesture":"authorize_issuer_offline","request":"{}","path":"/etc/passwd"}"#,
+            r#"{"gesture":"authorize_issuer","operation_id":"0123456789abcdef0123456789abcdef","request":"{}","authority_url":"https://elsewhere"}"#,
+            // An offline delegation names no operation.
+            r#"{"gesture":"authorize_issuer_offline","operation_id":"0123456789abcdef0123456789abcdef","request":"{}"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<IssuerGesture>(unknown).is_err(),
+                "{unknown}"
+            );
+        }
+
+        let largest = astra_operator::operations::issuer::MAX_DELEGATION_REQUEST_BYTES;
+        for request in [String::new(), "  \n".into(), "x".repeat(largest + 1)] {
+            for gesture in [
+                IssuerGesture::AuthorizeIssuerOffline {
+                    request: request.clone(),
+                },
+                IssuerGesture::AuthorizeIssuer {
+                    operation_id: operation.into(),
+                    request: request.clone(),
+                },
+            ] {
+                assert_eq!(
+                    gesture.validate().expect_err("refused"),
+                    "la demande de délégation est vide ou trop grande (256 Kio au plus)"
+                );
+            }
+        }
+        assert!(IssuerGesture::AuthorizeIssuerOffline {
+            request: "x".repeat(largest)
+        }
+        .validate()
+        .is_ok());
+
+        for operation_id in ["", "not-hex", "0123456789abcdef", &"g".repeat(32)] {
+            let gesture = IssuerGesture::AuthorizeIssuer {
+                operation_id: operation_id.into(),
+                request: "{}".into(),
+            };
+            assert!(gesture.validate().is_err(), "{operation_id}");
+            assert!(gesture.operation_id().is_err(), "{operation_id}");
+        }
     }
 
     /// Only a name can be a WebAuthn RP ID: an address suggests nothing.

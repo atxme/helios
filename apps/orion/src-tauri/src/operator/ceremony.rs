@@ -34,7 +34,9 @@ use astra_operator::vault::AuthorityVault;
 
 use super::{ArtifactEncoding, EnrollmentGesture, OperatorArtifact};
 
+mod issuer;
 mod vault;
+pub use issuer::run_issuer;
 pub use vault::run_vault;
 
 /// One button pressed in the window: what it asks, the status it answers, and
@@ -79,7 +81,8 @@ pub fn run(
         | OperationKind::RemoveKey
         | OperationKind::MarkKey
         | OperationKind::FinalizeDomain
-        | OperationKind::IssueGatewayBootstrap => {
+        | OperationKind::IssueGatewayBootstrap
+        | OperationKind::AuthorizeIssuer => {
             ceremony.refuse(Refusal::Internal);
             publish(ceremony.status());
             Err(format!(

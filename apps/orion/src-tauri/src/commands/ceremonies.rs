@@ -178,6 +178,17 @@ pub(crate) async fn begin_vault_ceremony(
     state.operator.begin_vault(gesture, vault_path).await
 }
 
+/// Opens the delegation of Astra's issuer, in a campaign or offline. Only the
+/// request's text crosses: the file was read by the window.
+#[tauri::command]
+pub(crate) async fn begin_issuer_ceremony(
+    state: State<'_, AppState>,
+    gesture: crate::operator::IssuerGesture,
+) -> Result<aether::certificates::operator_session::OperatorStatus, String> {
+    let vault_path = state.vault_location.path()?;
+    state.operator.begin_issuer(gesture, vault_path).await
+}
+
 /// Renames a key. No key is asked anything: the label is outside what the
 /// vault seals.
 #[tauri::command]
