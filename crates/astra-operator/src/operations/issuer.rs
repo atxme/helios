@@ -43,7 +43,8 @@
 //!
 //! `tests/issuer_delegation.rs` exercises the plan, the offline signature,
 //! the campaign verification ([`CampaignDelegation::from_request`]), the
-//! one-key approval and restricted opening
+//! checks before the key ([`check_request`], [`CampaignDelegation::ready`]),
+//! the one-key approval and restricted opening
 //! ([`CampaignDelegation::sign_in_campaign`]) against simulated keys. What
 //! remains untested is the network itself — [`CampaignDelegation::begin`]'s
 //! fetch and the deposit in [`CampaignDelegation::approve_and_sign`] — as in
@@ -63,6 +64,7 @@ use anyhow::{bail, Context, Result};
 use base64::Engine as _;
 
 use crate::authenticator::{Authenticator, Opened};
+use crate::gestures::GestureError;
 use crate::signing::{DelegationBounds, DomainIdentity, IssuerDelegationRequest};
 use crate::vault::AuthorityVault;
 use crate::vault_gestures::DAY_SECS;
@@ -123,6 +125,24 @@ pub enum IssuerRefusal {
     Vault(String),
 }
 
+/// The `CA-PQ` signature of a delegation failed once the vault was open.
+///
+/// Typed so a ceremony tells it apart from the key's own failure: the key
+/// answered, the vault opened, and retrying with it would change nothing.
+/// The source names what failed, never a secret.
+#[derive(Debug, thiserror::Error)]
+#[error("signature de la délégation")]
+pub struct DelegationSignatureFailed(#[source] pub GestureError);
+
+/// What a delegation signed in a campaign produced, before its deposit.
+#[derive(Debug)]
+pub struct SignedInCampaign {
+    pub approval: CampaignApproval,
+    pub authorization: AstraIssuerAuthorization,
+    /// The label of the key-slot whose credential approved and opened.
+    pub key_label: String,
+}
+
 /// What a delegation will sign, settled before any key is asked anything.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IssuerPlan {
@@ -161,12 +181,34 @@ pub fn plan(
     now_unix: u64,
 ) -> std::result::Result<IssuerPlan, IssuerRefusal> {
     let domain = read_domain(vault_path)?;
+    let request = parse_request(request_json)?;
+    plan_for(&domain, request, campaign, now_unix)
+}
+
+/// The checks of [`plan`] that need no campaign: the vault and the relay
+/// readable, `CA-TLS` present and able to back the delegation, the request
+/// decodable and for this domain. Asks no key and no network anything.
+///
+/// [`CampaignDelegation::begin`] runs them before it fetches, so an origin
+/// that does not answer cannot hide a refusal the domain alone settles.
+pub fn check_request(
+    vault_path: &Path,
+    request_json: &str,
+    now_unix: u64,
+) -> std::result::Result<(), IssuerRefusal> {
+    let domain = read_domain(vault_path)?;
+    let request = parse_request(request_json)?;
+    let material = material_of(&request)?;
+    local_plan(&domain, request, &material, now_unix).map(|_| ())
+}
+
+fn parse_request(
+    request_json: &str,
+) -> std::result::Result<IssuerDelegationRequest, IssuerRefusal> {
     if request_json.len() > MAX_DELEGATION_REQUEST_BYTES {
         return Err(IssuerRefusal::RequestInvalid);
     }
-    let request: IssuerDelegationRequest =
-        serde_json::from_str(request_json).map_err(|_| IssuerRefusal::RequestInvalid)?;
-    plan_for(&domain, request, campaign, now_unix)
+    serde_json::from_str(request_json).map_err(|_| IssuerRefusal::RequestInvalid)
 }
 
 /// Signs the delegation of an offline plan, with an opening the ceremony
@@ -197,7 +239,8 @@ pub fn sign_offline(
         &plan.request,
         &plan.bounds,
         now_unix,
-    )?)
+    )
+    .map_err(DelegationSignatureFailed)?)
 }
 
 /// A delegation campaign fetched from the relay's origin and verified,
@@ -207,16 +250,28 @@ pub struct CampaignDelegation {
     client: origin::Origin,
     operation: Id16,
     result_token: String,
+    /// When the signed request stops being one the authority answers.
+    request_expires_at: u64,
 }
 
 impl CampaignDelegation {
-    /// Fetches the campaign from the relay's origin and verifies it, as
+    /// Checks the domain and `request_json` ([`check_request`]), then
+    /// fetches the campaign from the relay's origin and verifies it, as
     /// [`Self::from_request`] does.
     ///
-    /// The origin is the relay's and nobody else's: a process holding
-    /// `CA-PQ` that learned where to send its signatures from whoever asked
-    /// would authenticate nothing. Opens nothing and asks for nothing.
-    pub fn begin(vault_path: &Path, operation: Id16, now_unix: u64) -> Result<CampaignDelegation> {
+    /// The local checks come first (spec §6.3, steps 1 to 3): a refusal the
+    /// domain alone settles is named even when the origin does not answer,
+    /// and an unreadable file costs no fetch. The origin is the relay's and
+    /// nobody else's: a process holding `CA-PQ` that learned where to send
+    /// its signatures from whoever asked would authenticate nothing. Opens
+    /// nothing and asks for nothing.
+    pub fn begin(
+        vault_path: &Path,
+        operation: Id16,
+        request_json: &str,
+        now_unix: u64,
+    ) -> Result<CampaignDelegation> {
+        check_request(vault_path, request_json, now_unix)?;
         let (_, _, authority_url) = relay_authority(vault_path)?;
         let request = origin::Origin::new(&authority_url)?.fetch(&operation)?;
         Self::from_request(vault_path, request, now_unix)
@@ -259,6 +314,7 @@ impl CampaignDelegation {
             client: origin::Origin::new(&authority_url)?,
             operation: request.operation_id,
             result_token: request.result_token,
+            request_expires_at: request.signer_request.expires_at,
         })
     }
 
@@ -267,8 +323,25 @@ impl CampaignDelegation {
         &self.campaign
     }
 
+    /// Whether `plan` can be approved and signed in this campaign, settled
+    /// before any key is asked anything.
+    ///
+    /// Everything [`Self::sign_in_campaign`] refuses before its key: the plan
+    /// settled again against this campaign, the signed request still open,
+    /// one credential required, the credential document, the `CA-PQ`
+    /// anchor, the whole validation of the approval session (campaign
+    /// expiry and shape, document signature, domain and gateway, policy pin,
+    /// origin) and at least one approvable credential that holds a slot of
+    /// this vault. A ceremony calls it between the manifest and the key; the
+    /// signature runs it again.
+    pub fn ready(&self, vault_path: &Path, plan: &IssuerPlan, now_unix: u64) -> Result<()> {
+        let domain = settle_again(vault_path, plan, Some(&*self.campaign), now_unix)?;
+        self.approval_session(vault_path, &domain, now_unix)
+            .map(|_| ())
+    }
+
     /// [`Self::sign_in_campaign`], then the deposit of the approval and the
-    /// delegation on the origin.
+    /// delegation on the origin. Returns the label of the key that approved.
     pub fn approve_and_sign(
         self,
         vault_path: &Path,
@@ -277,32 +350,30 @@ impl CampaignDelegation {
         pin: &str,
         now_unix: u64,
         progress: &mut dyn FnMut(RemoteState),
-    ) -> Result<()> {
-        let (approval, authorization) =
-            self.sign_in_campaign(vault_path, plan, key, pin, now_unix)?;
+    ) -> Result<String> {
+        let signed = self.sign_in_campaign(vault_path, plan, key, pin, now_unix)?;
         progress(RemoteState::Prepared);
 
-        let mut result = super::campaign_result(&approval, Vec::new(), None);
-        result.issuer_authorization = Some(Box::new(authorization));
+        let mut result = super::campaign_result(&signed.approval, Vec::new(), None);
+        result.issuer_authorization = Some(Box::new(signed.authorization));
         self.client
             .submit(&self.operation, &self.result_token, &result)
             .context("dépôt de la délégation")?;
         progress(RemoteState::Deposited);
-        Ok(())
+        Ok(signed.key_label)
     }
 
     /// Approves the campaign with one key, opens the vault with that same
     /// credential and signs the delegation. Deposits nothing.
     ///
-    /// Everything that can be refused without the key is refused first: a
-    /// campaign asking for more than one credential, a plan that does not
-    /// settle again against this campaign, the credential document and the
-    /// policy pin. Only credentials that hold a slot of this vault are
-    /// offered, so a binding the vault no longer knows cannot spend a press
-    /// on an approval that could never open it. The vault then opens only
-    /// for the credential that approved: under a platform transport the two
-    /// are two dialogs, and another key presented to the second cannot
-    /// answer it.
+    /// Everything [`Self::ready`] checks is checked again first, so a caller
+    /// that skipped it still spends no press on a refusal. Only credentials
+    /// that hold a slot of this vault are offered, so a binding the vault no
+    /// longer knows cannot spend a press on an approval that could never
+    /// open it. The vault then opens only for the credential that approved:
+    /// under a platform transport the two are two dialogs, and another key
+    /// presented to the second cannot answer it. A failure of the `CA-PQ`
+    /// signature itself is a [`DelegationSignatureFailed`].
     pub fn sign_in_campaign(
         &self,
         vault_path: &Path,
@@ -310,7 +381,59 @@ impl CampaignDelegation {
         key: &dyn Authenticator,
         pin: &str,
         now_unix: u64,
-    ) -> Result<(CampaignApproval, AstraIssuerAuthorization)> {
+    ) -> Result<SignedInCampaign> {
+        let domain = settle_again(vault_path, plan, Some(&*self.campaign), now_unix)?;
+        let (mut session, offered) = self.approval_session(vault_path, &domain, now_unix)?;
+
+        let assertion = key.approve(
+            session.webauthn_rp_id(),
+            &offered,
+            session.client_data_json(),
+            pin,
+        )?;
+        let approving_credential_id = assertion.credential_id.clone();
+        session.accept(assertion, now_unix)?;
+        let approval = session.finish(now_unix)?;
+
+        let opened =
+            gestures::open_with_credential(key, &domain.vault, &approving_credential_id, pin)?;
+        let key_label = domain
+            .vault
+            .slot_for_credential(&opened.credential_id)?
+            .label
+            .clone();
+        let authorization = signing::authorize_issuer(
+            &domain.vault,
+            &opened,
+            &domain.identity,
+            &domain.ca_tls,
+            &plan.request,
+            &plan.bounds,
+            now_unix,
+        )
+        .map_err(DelegationSignatureFailed)?;
+        drop(opened);
+        Ok(SignedInCampaign {
+            approval,
+            authorization,
+            key_label,
+        })
+    }
+
+    /// The approval session of this campaign over `domain`, and the
+    /// credentials it may offer: every check that precedes the key.
+    fn approval_session(
+        &self,
+        vault_path: &Path,
+        domain: &Domain,
+        now_unix: u64,
+    ) -> Result<(signing::CampaignApprovalSession, Vec<Vec<u8>>)> {
+        if now_unix >= self.request_expires_at {
+            bail!(
+                "la demande signée de cette campagne a expiré : l'autorité n'accepterait plus \
+                 son résultat. Rien n'a été signé."
+            );
+        }
         if self.campaign.required_credentials != 1 {
             bail!(
                 "cette campagne exige {} credentials : une délégation d'émetteur s'approuve avec \
@@ -318,7 +441,6 @@ impl CampaignDelegation {
                 self.campaign.required_credentials
             );
         }
-        let domain = settle_again(vault_path, plan, Some(&*self.campaign), now_unix)?;
         let registry =
             credentials::load(&credentials::path_beside(vault_path))?.ok_or_else(|| {
                 anyhow::anyhow!(
@@ -328,7 +450,7 @@ impl CampaignDelegation {
             })?;
         let ca_pq_public_key = MlDsa87PublicKey::parse(&domain.relay.ca_pq_public_key)?;
         let webauthn_origin = format!("https://{}", domain.relay.rp_id);
-        let mut session = signing::CampaignApprovalSession::new(
+        let session = signing::CampaignApprovalSession::new(
             &self.campaign,
             &registry,
             &domain.identity,
@@ -349,30 +471,7 @@ impl CampaignDelegation {
                  été signé."
             );
         }
-
-        let assertion = key.approve(
-            session.webauthn_rp_id(),
-            &offered,
-            session.client_data_json(),
-            pin,
-        )?;
-        let approving_credential_id = assertion.credential_id.clone();
-        session.accept(assertion, now_unix)?;
-        let approval = session.finish(now_unix)?;
-
-        let opened =
-            gestures::open_with_credential(key, &domain.vault, &approving_credential_id, pin)?;
-        let authorization = signing::authorize_issuer(
-            &domain.vault,
-            &opened,
-            &domain.identity,
-            &domain.ca_tls,
-            &plan.request,
-            &plan.bounds,
-            now_unix,
-        )?;
-        drop(opened);
-        Ok((approval, authorization))
+        Ok((session, offered))
     }
 }
 
@@ -443,10 +542,23 @@ fn plan_for(
             None
         }
     };
+    let mut plan = local_plan(domain, request, &material, now_unix)?;
+    plan.manifest.campaign = campaign;
+    Ok(plan)
+}
+
+/// The checks of [`plan_for`] that need no campaign, and the plan they
+/// settle, with no campaign named.
+fn local_plan(
+    domain: &Domain,
+    request: IssuerDelegationRequest,
+    material: &Material,
+    now_unix: u64,
+) -> std::result::Result<IssuerPlan, IssuerRefusal> {
     if material.trust_domain_id != domain.identity.trust_domain_id {
         return Err(IssuerRefusal::RequestMismatch);
     }
-    let plan = describe(request, &material, &domain.policy, campaign, now_unix)?;
+    let plan = describe(request, material, &domain.policy, now_unix)?;
     // `signing::authorize_issuer` runs both again once the vault is open;
     // here they refuse before the key, which is when they are predictable.
     aether::certificates::x509::assert_certificate_authority(&domain.ca_tls)
@@ -486,7 +598,7 @@ fn material_of(request: &IssuerDelegationRequest) -> std::result::Result<Materia
     })
 }
 
-/// The bounds and the manifest, under `policy`.
+/// The bounds and the manifest, under `policy`, naming no campaign.
 ///
 /// The leaf lifetime is [`LEAF_DAYS`] brought down to the policy's cap, so
 /// the manifest shows the value [`signing::authorize_issuer`] signs and
@@ -495,7 +607,6 @@ fn describe(
     request: IssuerDelegationRequest,
     material: &Material,
     policy: &AstraIssuancePolicy,
-    campaign: Option<CampaignManifest>,
     now_unix: u64,
 ) -> std::result::Result<IssuerPlan, IssuerRefusal> {
     let bounds = DelegationBounds {
@@ -517,7 +628,7 @@ fn describe(
         maximum_leaf_lifetime_secs: bounds.maximum_leaf_lifetime_secs,
         pq_public_key_fingerprint: material.pq_fingerprint,
         tls_public_key_info_fingerprint: material.spki_fingerprint,
-        campaign,
+        campaign: None,
     };
     Ok(IssuerPlan {
         request,
@@ -545,8 +656,8 @@ fn settle_again(
     now_unix: u64,
 ) -> Result<Domain> {
     // A plan settled for a later instant than the signature is not one this
-    // domain produced.
-    if plan.bounds.not_before > now_unix {
+    // domain produced; one whose window has closed delegates nothing.
+    if plan.bounds.not_before > now_unix || now_unix >= plan.bounds.not_after {
         return Err(IssuerRefusal::PlanChanged.into());
     }
     let domain = read_domain(vault_path)?;
@@ -597,12 +708,12 @@ mod tests {
     /// settles the bounds.
     #[test]
     fn the_leaf_cap_follows_a_stricter_policy() {
-        let standard = describe(request(), &material(), &policy(), None, 1_000).expect("plan");
+        let standard = describe(request(), &material(), &policy(), 1_000).expect("plan");
         assert_eq!(standard.bounds.maximum_leaf_lifetime_secs, LEAF_SECS);
 
         let mut strict = policy();
         strict.maximum_leaf_lifetime_secs = 30 * DAY_SECS;
-        let capped = describe(request(), &material(), &strict, None, 1_000).expect("plan");
+        let capped = describe(request(), &material(), &strict, 1_000).expect("plan");
         assert_eq!(capped.bounds.maximum_leaf_lifetime_secs, 30 * DAY_SECS);
         assert_eq!(capped.manifest.maximum_leaf_lifetime_secs, 30 * DAY_SECS);
         assert_eq!(

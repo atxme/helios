@@ -26,7 +26,8 @@ use aether::certificates::operator_session::{
 use aether_fido::authenticator::Authenticator;
 use astra_operator::authenticator::Opened;
 use astra_operator::operations::issuer::{
-    self, CampaignDelegation, IssuerPlan, IssuerRefusal, AUTHORIZATION_FILE,
+    self, CampaignDelegation, DelegationSignatureFailed, IssuerPlan, IssuerRefusal,
+    AUTHORIZATION_FILE,
 };
 use astra_operator::vault::AuthorityVault;
 
@@ -99,6 +100,13 @@ fn refusal_of_campaign(error: &anyhow::Error) -> Refusal {
     plan_refusal_in(error).unwrap_or(Refusal::HandoffMismatch)
 }
 
+/// A campaign this domain cannot approve with one key, found before the key:
+/// the refusal it names, else what the campaign asks is not what this domain
+/// can sign — as `start_approval` is refused in `approve_campaign`.
+fn refusal_of_readiness(error: &anyhow::Error) -> Refusal {
+    plan_refusal_in(error).unwrap_or(Refusal::ManifestMismatch)
+}
+
 /// An offline signature that failed after the key answered: the refusal it
 /// names, else `Internal` — the key did its part.
 fn refusal_of_signature(error: &anyhow::Error) -> Refusal {
@@ -107,13 +115,23 @@ fn refusal_of_signature(error: &anyhow::Error) -> Refusal {
 
 /// The gesture in a campaign that failed: the deposit once the approval and
 /// the delegation were prepared, else the refusal the error names, else the
-/// key — its approval, or the opening restricted to the credential that
-/// approved.
+/// `CA-PQ` signature once the vault was open (`Internal`: the key did its
+/// part), else the key — its approval, or the opening restricted to the
+/// credential that approved.
 fn refusal_of_gesture(error: &anyhow::Error, prepared: bool) -> Refusal {
     if prepared {
         return Refusal::AuthorityRefused { status: 0 };
     }
-    plan_refusal_in(error).unwrap_or(Refusal::KeyDeclined)
+    if let Some(refusal) = plan_refusal_in(error) {
+        return refusal;
+    }
+    if error
+        .chain()
+        .any(|cause| cause.is::<DelegationSignatureFailed>())
+    {
+        return Refusal::Internal;
+    }
+    Refusal::KeyDeclined
 }
 
 /// One delegation in progress: the ceremony, its presses and its publisher.
@@ -164,14 +182,28 @@ impl IssuerRun<'_> {
         (self.publish)(self.ceremony.status());
     }
 
-    /// The ordinary path: the campaign is fetched from the relay's origin and
-    /// verified, the request is checked against it, then one key approves,
-    /// opens and signs, and the result is deposited on the origin.
+    /// The ordinary path: the domain and the request are checked, the
+    /// campaign is fetched from the relay's origin and verified, then
+    /// [`Self::approve_in_campaign`].
     fn in_campaign(&mut self, operation: Id16, request: &str) -> Result<(), String> {
-        let delegation = match CampaignDelegation::begin(self.vault_path, operation, now_unix()) {
-            Ok(delegation) => delegation,
-            Err(error) => return self.refuse(refusal_of_campaign(&error), format!("{error:#}")),
-        };
+        let delegation =
+            match CampaignDelegation::begin(self.vault_path, operation, request, now_unix()) {
+                Ok(delegation) => delegation,
+                Err(error) => {
+                    return self.refuse(refusal_of_campaign(&error), format!("{error:#}"))
+                }
+            };
+        self.approve_in_campaign(delegation, request)
+    }
+
+    /// A verified campaign: the request is checked against it and the
+    /// manifest shown, everything the approval will refuse is refused, then
+    /// one key approves, opens and signs, and the result is deposited.
+    fn approve_in_campaign(
+        &mut self,
+        delegation: CampaignDelegation,
+        request: &str,
+    ) -> Result<(), String> {
         let plan = match issuer::plan(
             self.vault_path,
             request,
@@ -182,6 +214,9 @@ impl IssuerRun<'_> {
             Err(refusal) => return self.refuse(refusal_of_plan(&refusal), refusal.to_string()),
         };
         self.show(&plan);
+        if let Err(error) = delegation.ready(self.vault_path, &plan, now_unix()) {
+            return self.refuse(refusal_of_readiness(&error), format!("{error:#}"));
+        }
 
         let Some(key) = self.ask_key(KeyPurpose::ApproveCampaign)? else {
             return Ok(());
@@ -209,7 +244,13 @@ impl IssuerRun<'_> {
         );
         drop(key);
         match outcome {
-            Ok(()) => self.done(),
+            Ok(label) => {
+                self.ceremony.keys.push(KeySlotLabel {
+                    slot: "1".to_string(),
+                    label,
+                });
+                self.done()
+            }
             Err(error) => self.refuse(refusal_of_gesture(&error, prepared), format!("{error:#}")),
         }
     }

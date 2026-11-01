@@ -28,13 +28,13 @@ use astra_operator::authenticator::{
 };
 use astra_operator::gestures::{self, NewAuthority, NewKey};
 use astra_operator::operations::issuer::{
-    self, CampaignDelegation, IssuerRefusal, DELEGATION_DAYS, LEAF_DAYS,
+    self, CampaignDelegation, DelegationSignatureFailed, IssuerRefusal, DELEGATION_DAYS, LEAF_DAYS,
     MAX_DELEGATION_REQUEST_BYTES,
 };
 use astra_operator::signing::IssuerDelegationRequest;
 use astra_operator::vault::SlotRole;
 use astra_operator::vault_gestures::{add_key_with, create_first_key, finalize_with};
-use astra_operator::{handoff, origin, signing, store};
+use astra_operator::{credentials, handoff, origin, signing, store};
 use base64::Engine as _;
 use support::{FakeKey, ORIGIN, PIN, RP_ID};
 
@@ -581,6 +581,16 @@ fn campaign_request(
     campaign: &AstraRotationCampaign,
     service_key: &[u8],
 ) -> origin::CampaignRequest {
+    campaign_request_until(path, campaign, service_key, NOW + 300)
+}
+
+/// [`campaign_request`], the signed request open until `expires_at`.
+fn campaign_request_until(
+    path: &Path,
+    campaign: &AstraRotationCampaign,
+    service_key: &[u8],
+    expires_at: u64,
+) -> origin::CampaignRequest {
     let authority_url = handoff::load(&handoff::path_beside(path))
         .expect("relay")
         .astra_authority_url
@@ -594,7 +604,7 @@ fn campaign_request(
         encrypted_vault_fingerprint: Fingerprint::of(b"vault"),
         required_credentials: campaign.required_credentials,
         created_at: NOW,
-        expires_at: NOW + 300,
+        expires_at,
         astra_service_key_epoch: 1,
         astra_signature: MlDsa87Signature::placeholder(),
     }
@@ -740,10 +750,16 @@ fn a_campaign_delegation_is_approved_and_signed_with_one_key() {
     .expect("planned");
     let presses = key1.assertions();
 
-    let (approval, authorization) = delegation
+    delegation
+        .ready(&path, &plan, NOW)
+        .expect("approvable before any key");
+    assert_eq!(key1.assertions(), presses, "readiness asks no key anything");
+    let signed = delegation
         .sign_in_campaign(&path, &plan, &key1, PIN, NOW)
         .expect("approved and signed");
+    let (approval, authorization) = (signed.approval, signed.authorization);
     assert_eq!(key1.assertions(), presses + 2, "one approval, one opening");
+    assert_eq!(signed.key_label, "YubiKey du bureau");
     assert_eq!(approval.approvals.len(), 1);
     assert_eq!(
         approval.approvals[0].credential_id,
@@ -820,6 +836,13 @@ fn a_plan_for_another_campaign_is_refused_in_the_campaign() {
     other.reason = "autre motif".into();
     let foreign = issuer::plan(&path, &json(&named.request), Some(&other), NOW).expect("planned");
     let presses = key1.assertions();
+    assert_eq!(
+        delegation
+            .ready(&path, &foreign, NOW)
+            .expect_err("refused")
+            .downcast_ref::<IssuerRefusal>(),
+        Some(&IssuerRefusal::PlanChanged)
+    );
     let error = delegation
         .sign_in_campaign(&path, &foreign, &key1, PIN, NOW)
         .expect_err("refused");
@@ -855,6 +878,7 @@ fn a_campaign_asking_for_two_credentials_is_refused_before_any_key() {
     .expect("planned");
 
     let presses = (key1.assertions(), key2.assertions());
+    assert!(delegation.ready(&path, &plan, NOW).is_err());
     assert!(delegation
         .sign_in_campaign(&path, &plan, &key1, PIN, NOW)
         .is_err());
@@ -902,6 +926,8 @@ fn a_credential_without_a_slot_is_not_offered() {
     .expect("planned");
 
     let presses = key3.assertions();
+    // Still approvable by the two keys the vault holds.
+    delegation.ready(&path, &plan, NOW).expect("ready");
     assert!(delegation
         .sign_in_campaign(&path, &plan, &key3, PIN, NOW)
         .is_err());
@@ -910,4 +936,174 @@ fn a_credential_without_a_slot_is_not_offered() {
         presses,
         "a key the vault cannot open for is not asked to approve"
     );
+}
+
+/// The campaign's plan for `named`, settled at `NOW`.
+fn campaign_plan(
+    path: &Path,
+    delegation: &CampaignDelegation,
+    named: &Delegation,
+) -> issuer::IssuerPlan {
+    issuer::plan(
+        path,
+        &json(&named.request),
+        Some(delegation.campaign()),
+        NOW,
+    )
+    .expect("planned")
+}
+
+/// `ready` and the gesture both refuse, and no key is asked anything.
+fn refused_before_any_key(
+    path: &Path,
+    delegation: &CampaignDelegation,
+    plan: &issuer::IssuerPlan,
+    keys: (&FakeKey, &FakeKey),
+    now: u64,
+) {
+    let presses = (keys.0.assertions(), keys.1.assertions());
+    assert!(delegation.ready(path, plan, now).is_err());
+    assert!(delegation
+        .sign_in_campaign(path, plan, keys.0, PIN, now)
+        .is_err());
+    assert_eq!((keys.0.assertions(), keys.1.assertions()), presses);
+}
+
+#[test]
+fn a_domain_without_its_credential_document_is_not_ready() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = vault_path(&directory);
+    let (key1, key2) = (FakeKey::new(1), FakeKey::new(2));
+    let named = delegation(1);
+    let delegation = campaign_domain(&path, &key1, &key2, &named);
+    let plan = campaign_plan(&path, &delegation, &named);
+    std::fs::remove_file(credentials::path_beside(&path)).expect("document removed");
+    refused_before_any_key(&path, &delegation, &plan, (&key1, &key2), NOW);
+}
+
+#[test]
+fn an_expired_campaign_is_not_ready() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = vault_path(&directory);
+    let (key1, key2) = (FakeKey::new(1), FakeKey::new(2));
+    finished_domain(&path, &key1, &key2);
+    let service_key = pin_service_key(&path);
+    let named = delegation(1);
+    let mut campaign = campaign_for(&named, CampaignScope::IssuerDelegation);
+    campaign.expires_at = NOW + 100;
+    let delegation = CampaignDelegation::from_request(
+        &path,
+        campaign_request(&path, &campaign, &service_key),
+        NOW,
+    )
+    .expect("verified");
+    let plan = campaign_plan(&path, &delegation, &named);
+    delegation.ready(&path, &plan, NOW).expect("open at NOW");
+    // The signed request is still open; the campaign is not.
+    refused_before_any_key(&path, &delegation, &plan, (&key1, &key2), NOW + 150);
+}
+
+#[test]
+fn an_expired_signer_request_is_not_ready() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = vault_path(&directory);
+    let (key1, key2) = (FakeKey::new(1), FakeKey::new(2));
+    finished_domain(&path, &key1, &key2);
+    let service_key = pin_service_key(&path);
+    let named = delegation(1);
+    let campaign = campaign_for(&named, CampaignScope::IssuerDelegation);
+    let delegation = CampaignDelegation::from_request(
+        &path,
+        campaign_request_until(&path, &campaign, &service_key, NOW + 100),
+        NOW,
+    )
+    .expect("verified");
+    let plan = campaign_plan(&path, &delegation, &named);
+    delegation.ready(&path, &plan, NOW).expect("open at NOW");
+    // The campaign is still open; the request that carries it is not.
+    refused_before_any_key(&path, &delegation, &plan, (&key1, &key2), NOW + 150);
+}
+
+#[test]
+fn a_plan_whose_window_has_closed_is_refused() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = vault_path(&directory);
+    let (key1, key2) = (FakeKey::new(1), FakeKey::new(2));
+    finished_domain(&path, &key1, &key2);
+    set_origin(&path, None);
+    let plan = issuer::plan(&path, &json(&delegation(1).request), None, NOW).expect("planned");
+    let vault = store::load(&path).expect("vault");
+    let opened = gestures::open_with_authorized_key(&key1, &vault, PIN).expect("opens");
+
+    let error =
+        issuer::sign_offline(&path, &plan, &opened, plan.bounds.not_after).expect_err("refused");
+    assert_eq!(
+        error.downcast_ref::<IssuerRefusal>(),
+        Some(&IssuerRefusal::PlanChanged)
+    );
+    assert!(issuer::sign_offline(&path, &plan, &opened, plan.bounds.not_after - 1).is_ok());
+}
+
+#[test]
+fn the_local_checks_need_no_campaign_and_no_origin() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = vault_path(&directory);
+    let (key1, key2) = (FakeKey::new(1), FakeKey::new(2));
+    domain_with_two_keys(&path, &key1, &key2);
+    let request = json(&delegation(1).request);
+    // An origin is recorded and nothing answers there: the domain alone
+    // settles these.
+    assert_eq!(
+        issuer::check_request(&path, &request, NOW),
+        Err(IssuerRefusal::CaTlsMissing)
+    );
+    assert_eq!(
+        CampaignDelegation::begin(&path, Id16::new([0x0B; 16]).expect("id"), &request, NOW)
+            .err()
+            .expect("refused before the fetch")
+            .downcast_ref::<IssuerRefusal>(),
+        Some(&IssuerRefusal::CaTlsMissing)
+    );
+
+    finalize_with(&path, &opening_of(&path, &key1), NOW).expect("finished");
+    assert_eq!(issuer::check_request(&path, &request, NOW), Ok(()));
+    assert_eq!(
+        issuer::check_request(&path, "not a request", NOW),
+        Err(IssuerRefusal::RequestInvalid)
+    );
+    assert_eq!(
+        CampaignDelegation::begin(&path, Id16::new([0x0B; 16]).expect("id"), "{}", NOW)
+            .err()
+            .expect("refused before the fetch")
+            .downcast_ref::<IssuerRefusal>(),
+        Some(&IssuerRefusal::RequestInvalid)
+    );
+}
+
+/// The opening of `key`, which holds a slot of the vault at `path`.
+fn opening_of(path: &Path, key: &FakeKey) -> Opened {
+    let vault = store::load(path).expect("vault");
+    gestures::open_with_authorized_key(key, &vault, PIN).expect("opens")
+}
+
+#[test]
+fn a_signature_failure_is_typed_apart_from_the_key() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = vault_path(&directory);
+    let (key1, key2) = (FakeKey::new(1), FakeKey::new(2));
+    finished_domain(&path, &key1, &key2);
+    set_origin(&path, None);
+    let plan = issuer::plan(&path, &json(&delegation(1).request), None, NOW).expect("planned");
+
+    // An opening of a credential the vault holds, with a secret that opens
+    // nothing: the plan settles, the signature cannot.
+    let vault = store::load(&path).expect("vault");
+    let mut opened = gestures::open_with_authorized_key(&key1, &vault, PIN).expect("opens");
+    opened.secret = astra_operator::vault::SlotSecret::new(vec![0; 32]);
+    let error = issuer::sign_offline(&path, &plan, &opened, NOW).expect_err("refused");
+    assert!(
+        error.downcast_ref::<DelegationSignatureFailed>().is_some(),
+        "{error:#}"
+    );
+    assert!(error.downcast_ref::<IssuerRefusal>().is_none());
 }

@@ -1,9 +1,9 @@
-//! The delegation of Astra's issuer, offline form: every refusal it names
-//! before a press, and what it hands over once the vault is open.
+//! The delegation of Astra's issuer: every refusal it names before a press,
+//! and what the offline form hands over once the vault is open.
 //!
-//! The campaign form needs the origin to fetch its campaign from, and is not
-//! run here: its verification, its one-key approval and its restricted
-//! opening are astra-operator's tests. Each test that runs a ceremony drops
+//! The campaign form is run up to its fetch, and from a campaign verified
+//! here up to its key; the fetch itself needs the origin. Its one-key
+//! approval and its restricted opening are astra-operator's tests. Each test that runs a ceremony drops
 //! its press sender, so a gesture that reaches a key prompt ends there as an
 //! abandonment: the ceremony connects the platform transport, which no test
 //! can stand in for. The signature after the key is run on the opening the
@@ -12,7 +12,9 @@
 use super::*;
 use crate::operator::ceremony::run;
 use crate::operator::ceremony::tests::{no_key_was_asked, Domain};
-use aether::certificates::encoding::{generate_ml_dsa_87_keypair, MlDsa87PublicKey, TrustDomainId};
+use aether::certificates::encoding::{
+    generate_ml_dsa_87_keypair, Fingerprint, MlDsa87PublicKey, TrustDomainId,
+};
 use aether::certificates::operator_session::OperationKind;
 use aether_fido::authenticator::{
     Approval, ApprovedOpening, AuthenticatorError, CredentialSubject, Registration, SALT_LEN,
@@ -60,17 +62,35 @@ fn refused_before_the_key(published: &[OperatorStatus], refusal: Refusal) {
 /// What `astra issuer request` writes for the domain `trust_domain_id`:
 /// fresh issuer keys, their public halves.
 fn delegation_request(trust_domain_id: TrustDomainId) -> String {
+    delegation_material(trust_domain_id).text
+}
+
+/// A delegation request, and the fingerprints a campaign pins for it.
+struct Material {
+    text: String,
+    pq_fingerprint: Fingerprint,
+    spki_fingerprint: Fingerprint,
+}
+
+fn delegation_material(trust_domain_id: TrustDomainId) -> Material {
     let (_, issuer_public) = generate_ml_dsa_87_keypair().expect("issuer keypair");
     let csr = aether::certificates::x509::client_rotation_csr("astra delegated issuer 1")
         .expect("csr")
         .csr;
-    serde_json::to_string_pretty(&IssuerDelegationRequest {
+    let spki =
+        aether::certificates::x509::certification_request_public_key_info(&csr).expect("spki");
+    let text = serde_json::to_string_pretty(&IssuerDelegationRequest {
         trust_domain_id: trust_domain_id.to_hex(),
         issuer_epoch: 1,
         pq_issuer_public_key: issuer_public.to_base64(),
         tls_intermediate_csr: csr.to_base64(),
     })
-    .expect("request")
+    .expect("request");
+    Material {
+        text,
+        pq_fingerprint: Fingerprint::of(issuer_public.as_bytes()),
+        spki_fingerprint: Fingerprint::of(&spki),
+    }
 }
 
 /// The domain [`Domain::new`] creates.
@@ -447,6 +467,11 @@ fn refusals_of_the_delegation_are_named() {
     ];
     for (issuer, window) in &cases {
         assert_eq!(refusal_of_plan(issuer), *window, "{issuer:?}");
+        assert_eq!(
+            refusal_of_readiness(&anyhow::Error::from(issuer.clone())),
+            *window,
+            "{issuer:?}"
+        );
         let wrapped = anyhow::Error::from(issuer.clone()).context("signature de la délégation");
         assert_eq!(refusal_of_signature(&wrapped), *window, "{issuer:?}");
         assert_eq!(refusal_of_campaign(&wrapped), *window, "{issuer:?}");
@@ -463,6 +488,20 @@ fn refusals_of_the_delegation_are_named() {
         refusal_of_signature(&anyhow::anyhow!("signature impossible")),
         Refusal::Internal
     );
+    // A campaign this domain cannot approve with one key, found before it.
+    assert_eq!(
+        refusal_of_readiness(&anyhow::anyhow!("aucun document de credentials")),
+        Refusal::ManifestMismatch
+    );
+    // The CA-PQ signature failed once the vault was open: not the key's.
+    let signature = anyhow::Error::from(DelegationSignatureFailed(
+        astra_operator::gestures::GestureError::Anchors("certificat CA-TLS".into()),
+    ));
+    assert_eq!(refusal_of_gesture(&signature, false), Refusal::Internal);
+    assert_eq!(
+        refusal_of_gesture(&signature.context("délégation"), false),
+        Refusal::Internal
+    );
     // In a campaign: the key, the approval or the restricted opening failed.
     for error in [
         anyhow::Error::from(AuthenticatorError::UnknownCredential),
@@ -477,4 +516,160 @@ fn refusals_of_the_delegation_are_named() {
         refusal_of_gesture(&anyhow::anyhow!("dépôt de la délégation"), true),
         Refusal::AuthorityRefused { status: 0 }
     );
+}
+
+fn campaign_gesture(request: String) -> crate::operator::IssuerGesture {
+    crate::operator::IssuerGesture::AuthorizeIssuer {
+        operation_id: Id16::new([0x0B; 16]).expect("id").to_hex(),
+        request,
+    }
+}
+
+/// In a campaign too, what the domain alone settles is refused before the
+/// campaign is fetched: no origin needs to answer for it.
+#[test]
+fn a_campaign_delegation_checks_the_domain_before_the_origin() {
+    let domain = Domain::new("issuer-campaign-local");
+    set_origin(&domain.vault_path, Some("https://astra.invalid"));
+    let (outcome, published, _) = run_issuer_gesture(
+        campaign_gesture(delegation_request(stand_in_domain())),
+        &domain.vault_path,
+    );
+    outcome.expect_err("no CA-TLS");
+    refused_before_the_key(&published, Refusal::CaTlsMissing);
+
+    let domain = domain.with_ca_tls();
+    let (outcome, published, _) =
+        run_issuer_gesture(campaign_gesture("not a request".into()), &domain.vault_path);
+    outcome.expect_err("not a request");
+    refused_before_the_key(&published, Refusal::DelegationRequestInvalid);
+    assert_eq!(
+        published.last().expect("a status").operation_id,
+        Some(Id16::new([0x0B; 16]).expect("id"))
+    );
+}
+
+/// The verified campaign for `material` on `domain`, as `begin` would hand
+/// it over: the relay pins an origin and a service key that signed it.
+fn verified_campaign(domain: &IssuingDomain, material: &Material) -> CampaignDelegation {
+    use aether::certificates::encoding::MlDsa87Signature;
+    use aether::certificates::status::{
+        AstraRotationCampaign, AstraSignerRequest, CampaignScope, CampaignTarget, CertificateKind,
+    };
+    use aether::certificates::CERTIFICATE_FORMAT_VERSION;
+
+    let now = now_unix();
+    let (service_private, service_public) = generate_ml_dsa_87_keypair().expect("service key");
+    let relay_path = astra_operator::handoff::path_beside(&domain.vault_path);
+    let mut relay = astra_operator::handoff::load(&relay_path).expect("relay");
+    relay.astra_authority_url = Some("https://astra.example".into());
+    relay.astra_service_public_key = Some(service_public.to_base64());
+    relay.astra_service_key_epoch = Some(1);
+    astra_operator::handoff::save(&relay_path, &relay).expect("save relay");
+    let identity = astra_operator::handoff::identity_of(&relay).expect("identity");
+
+    let campaign = AstraRotationCampaign {
+        format_version: CERTIFICATE_FORMAT_VERSION,
+        campaign_id: Id16::new([9; 16]).expect("id"),
+        trust_domain_id: identity.trust_domain_id,
+        gateway_wg_public_key: identity.gateway_wg_public_key,
+        server_name: identity.server_name.clone(),
+        created_at: now,
+        expires_at: now + 300,
+        scope: CampaignScope::IssuerDelegation,
+        targets: vec![CampaignTarget {
+            certificate_kind: CertificateKind::AstraIssuer,
+            identity_key: identity.gateway_wg_public_key,
+            epoch: 1,
+            generation: 1,
+            active_tls_certificate_fingerprint: material.spki_fingerprint,
+            active_pq_certificate_fingerprint: material.pq_fingerprint,
+        }],
+        reason: "délégation trimestrielle".into(),
+        requested_by: "operator".into(),
+        policy_fingerprint: identity
+            .policy()
+            .expect("policy")
+            .fingerprint()
+            .expect("fingerprint"),
+        required_credentials: CampaignScope::IssuerDelegation.required_credentials(),
+    };
+    let operation_id = Id16::new([0x0B; 16]).expect("operation");
+    let signer_request = AstraSignerRequest {
+        format_version: CERTIFICATE_FORMAT_VERSION,
+        operation_id,
+        campaign_fingerprint: campaign.fingerprint(),
+        authority_url: "https://astra.example".into(),
+        encrypted_vault_fingerprint: Fingerprint::of(b"vault"),
+        required_credentials: campaign.required_credentials,
+        created_at: now,
+        expires_at: now + 300,
+        astra_service_key_epoch: 1,
+        astra_signature: MlDsa87Signature::placeholder(),
+    }
+    .sign(&service_private)
+    .expect("signed request");
+    CampaignDelegation::from_request(
+        &domain.vault_path,
+        astra_operator::origin::CampaignRequest {
+            operation_id,
+            signer_request: Box::new(signer_request),
+            campaign: Box::new(campaign),
+            webauthn_rp_id: "astra.example".into(),
+            webauthn_origin: "https://astra.example".into(),
+            result_token: "submit".into(),
+            vault_token: None,
+        },
+        now,
+    )
+    .expect("a verified delegation campaign")
+}
+
+/// A campaign the domain cannot approve — here, no credential document to
+/// tie an approval to an enrolled key — is refused once the manifest is
+/// shown, before the key is asked for.
+#[test]
+fn a_campaign_that_cannot_be_approved_is_refused_before_any_key() {
+    let domain = IssuingDomain::new("campaign-not-ready");
+    let material = delegation_material(stand_in_domain());
+    let delegation = verified_campaign(&domain, &material);
+
+    let (presses, received) = std::sync::mpsc::channel::<Press>();
+    drop(presses);
+    let mut ceremony = Ceremony::new(
+        Id16::new([6; 16]).expect("id"),
+        OperationLocator {
+            kind: OperationKind::AuthorizeIssuer,
+            operation_id: Some(Id16::new([0x0B; 16]).expect("id")),
+        },
+    );
+    let mut published = Vec::new();
+    let mut publish = |status| published.push(status);
+    let mut run = IssuerRun {
+        ceremony: &mut ceremony,
+        presses: &received,
+        publish: &mut publish,
+        vault_path: &domain.vault_path,
+    };
+    let message = run
+        .approve_in_campaign(delegation, &material.text)
+        .expect_err("not approvable");
+    assert!(
+        message.contains("aucun document de credentials"),
+        "{message}"
+    );
+
+    refused_before_the_key(&published, Refusal::ManifestMismatch);
+    match published
+        .last()
+        .expect("a status")
+        .manifest
+        .as_ref()
+        .expect("the manifest was shown first")
+    {
+        AstraManifest::IssuerAuthorization(manifest) => {
+            assert!(manifest.campaign.is_some(), "the campaign is shown with it");
+        }
+        other => panic!("{other:?}"),
+    }
 }
