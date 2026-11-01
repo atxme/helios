@@ -33,13 +33,14 @@ expiration, nombre de clés éligibles), puis propose « Approuver avec la clé 
 **Brancher la clé de sécurité d'un opérateur sur ce même poste** : l'opération
 appartient au poste qui l'a ouverte, aucun autre ne peut la lire ni y déposer
 d'approbation. Le dialogue de la clé s'ouvre au-dessus de la fenêtre d'Orion ;
-Orion n'a plus de champ PIN et ne l'envoie jamais au moteur. Le poste
+Sous Windows, Orion n'a plus de champ PIN (le dialogue de la plateforme le demande) ; avec une clé HID (Linux) le champ PIN reste, et le PIN ne va jamais au moteur. Le poste
 committe ensuite. Il n'y a plus de compagnon ni de commande à recopier.
 
-Si la clé est absente, si le geste est annulé ou si le PIN est faux, un nouvel
-essai est un clic, sans relire la demande. « Relire la demande » n'apparaît que
-si la demande a expiré, ou si le dépôt de l'approbation a échoué : un dépôt qui
-échoue consomme la demande vérifiée. Un second clic sur « Renouveler maintenant »
+Après tout échec d'approbation (clé absente, geste annulé, PIN faux, demande
+expirée, dépôt échoué), la demande reste affichée, « Approuver avec la clé »
+redevient actif et « Relire la demande » est proposé à côté : un nouvel essai est
+un clic, et la relecture n'est nécessaire que si l'essai est refusé, car un
+dépôt qui échoue consomme la demande vérifiée. Un second clic sur « Renouveler maintenant »
 ne rouvre jamais une deuxième opération — c'est ce que la session en mémoire
 garantit.
 

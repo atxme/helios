@@ -175,7 +175,8 @@ et le chemin : sur le poste de l'opérateur, Astra › Approbations › « Appro
 une récupération », avec cet identifiant. Ce second Orion approuve sans achever
 la récupération ; le poste expiré reprend de son côté. L'adaptateur
 `astra-signer recover --authority-url … --operation-id …` subsiste, à titre
-transitoire, pour le transport hors ligne du §8.5 ; il exécute la même
+transitoire, sur le transport HTTPS (origine publique, sans tunnel) ; la
+récupération n'a pas de mode hors ligne. Il exécute la même
 cérémonie.
 
 Une seule clé suffit, et §7.5 dit pourquoi : elle n'est pas la seule preuve —

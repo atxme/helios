@@ -902,9 +902,10 @@ enrôlée dans le coffre d'essai.
     dialogue seulement. Le poste committe et la génération avance.
 31. **Échec puis nouvel essai.** Relancer un renouvellement, puis : présenter une
     clé absente, annuler le dialogue, saisir un faux PIN. Attendu à chaque fois :
-    un refus lisible, le bouton redevient actif, **sans** « Relire la demande » ;
-    réessayer est un clic. Laisser ensuite la demande expirer : « Relire la
-    demande » apparaît. Couper le tunnel entre l'assertion et le dépôt : le dépôt
+    un refus lisible, la demande reste affichée, « Approuver avec la clé » redevient
+    actif et « Relire la demande » est proposé à côté ; réessayer est un clic, et
+    la relecture n'est nécessaire que si l'essai est refusé (demande consommée
+    ou expirée). Laisser ensuite la demande expirer et relire. Couper le tunnel entre l'assertion et le dépôt : le dépôt
     échoue, la demande est consommée, l'opérateur la relit (comportement à
     consigner).
 32. **Récupération approuvée depuis un second poste.** Sur le poste client, laisser
@@ -937,8 +938,9 @@ enrôlée dans le coffre d'essai.
     sous la nouvelle délégation. Refus à constater **sans aucun dialogue** : une
     demande modifiée (« La campagne ne nomme pas cette demande… »), un fichier
     illisible, une CA-TLS expirée ou proche de l'expiration (« La CA-TLS du
-    domaine expire avant la fin de cette délégation… »), une campagne d'une autre
-    famille.
+    domaine expire avant la fin de cette délégation… »). Le refus d'une campagne d'une
+    autre famille n'est pas atteignable depuis l'IHM : il est couvert par les
+    tests Rust.
 34. **Délégation hors campagne, domaine sans origine.** Sur un coffre d'essai dont
     le relais ne nomme aucune origine Astra : le bloc « Signer une délégation sans
     campagne… » est offert, avec l'avertissement « Rien ne rattache ce fichier à

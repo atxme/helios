@@ -651,8 +651,8 @@ manifeste ait été montré, ni sur un autre objet que celui montré.
   `DelegationRequestInvalid`, `DelegationRequestMismatch`, `CaTlsUnusable`
   (CA-TLS expirée, trop proche de son expiration pour la durée de la délégation,
   ou qui n'est pas une autorité ; contrôlée avant la clé, car la phrase de
-  `CaTlsMissing` serait fausse) et `DomainChanged` (le plan a changé entre
-  l'affichage et la signature).
+  `CaTlsMissing` serait fausse). La campagne réemploie `DomainChanged` (le plan
+  a changé entre l'affichage et la signature), qui existait déjà.
 - **`approve-campaign` hors ligne n'est pas porté.** Aucun composant du dépôt ne
   lit un fichier `CampaignApproval` (ni `astra`, ni `heliosd`, ni Orion) ; le
   porter produirait un fichier que rien n'installe. La récupération n'a pas de
