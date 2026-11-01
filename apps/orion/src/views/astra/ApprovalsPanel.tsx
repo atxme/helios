@@ -31,11 +31,6 @@ const OPERATION_ID = /^[0-9a-f]{32}$/
 
 const UNREADABLE_REQUEST = 'Ce fichier est illisible ou trop grand (256 Kio au plus).'
 
-/** What the parent learns when a ceremony opens: a recovery opened here is not finished here. */
-export interface OpenedCeremony {
-  remoteRecovery: boolean
-}
-
 /**
  * A button that asks for a file and hands back its text; the content is what
  * travels, never a path. A file that cannot be read says so and opens nothing.
@@ -101,7 +96,7 @@ export function ApprovalsPanel({
   onCeremony,
 }: {
   pending: OperatorPendingOperation[]
-  onCeremony: (status: OperatorStatus, opened?: OpenedCeremony) => void
+  onCeremony: (status: OperatorStatus) => void
 }) {
   const { overview, error: overviewError } = useOverview()
   const [busy, setBusy] = useState(false)
@@ -111,14 +106,11 @@ export function ApprovalsPanel({
   const normalised = recoveryId.trim().toLowerCase()
   const recoveryValid = OPERATION_ID.test(normalised)
 
-  const begin = async (
-    open: () => Promise<OperatorStatus>,
-    opened: OpenedCeremony = { remoteRecovery: false },
-  ) => {
+  const begin = async (open: () => Promise<OperatorStatus>) => {
     setBusy(true)
     setError(null)
     try {
-      onCeremony(await open(), opened)
+      onCeremony(await open())
     } catch (cause) {
       setError(String(cause))
     } finally {
@@ -227,10 +219,8 @@ export function ApprovalsPanel({
           disabled={busy || !recoveryValid}
           startIcon={<KeyRound size={14} aria-hidden />}
           onClick={() =>
-            void begin(
-              () =>
-                api.beginOperatorCeremony({ kind: 'recover_identity', operation_id: normalised }),
-              { remoteRecovery: true },
+            void begin(() =>
+              api.beginOperatorCeremony({ kind: 'recover_identity', operation_id: normalised }),
             )
           }
           sx={{ mt: 1, minHeight: 30, fontSize: 11.5 }}

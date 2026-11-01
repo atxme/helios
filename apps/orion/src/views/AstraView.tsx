@@ -15,7 +15,7 @@ import * as api from '../api'
 import { OperatorCeremonyPanel } from './OperatorCeremony'
 import { DomainCreated } from './astra/DomainCreated'
 import { DomainPanel } from './astra/DomainPanel'
-import { ApprovalsPanel, type OpenedCeremony } from './astra/ApprovalsPanel'
+import { ApprovalsPanel } from './astra/ApprovalsPanel'
 import { ArtifactDownloads } from './astra/ArtifactDownloads'
 import { EnrollmentOperatorPanel } from './astra/EnrollmentOperatorPanel'
 import { VaultPanel } from './astra/VaultPanel'
@@ -127,9 +127,12 @@ function CeremonyStep({
 /** Operator surface for the two distinct credentials required by ADR-008 §7.6. */
 export function AstraView({
   onRecoveryReady,
+  localRecoveryId = null,
 }: {
   /** Resumes the client-owned half once Astra has released the recovery grant. */
   onRecoveryReady?: (operationId: string) => Promise<void>
+  /** The one recovery opened from this machine's Certificats screen; any other is remote. */
+  localRecoveryId?: string | null
 } = {}) {
   const [input, setInput] = useState<AstraRotationInput>(EMPTY_INPUT)
   const [status, setStatus] = useState<AstraRotationStatus | null>(null)
@@ -143,7 +146,6 @@ export function AstraView({
   const [tab, setTab] = useState<AstraTab>('Enrôlement')
   const [finishingRecovery, setFinishingRecovery] = useState(false)
   const recoveryAttempt = useRef<string | null>(null)
-  const remoteRecoverySession = useRef<string | null>(null)
 
   const finishRecovery = useCallback(
     (operationId: string, attempt: string, force = false) => {
@@ -209,13 +211,13 @@ export function AstraView({
       ceremony?.operation !== 'recover_identity' ||
       ceremony.gesture !== 'done' ||
       !ceremony.operation_id ||
-      remoteRecoverySession.current === ceremony.session_id
+      ceremony.operation_id !== localRecoveryId
     ) {
       return
     }
     const attempt = `${ceremony.session_id}:${ceremony.operation_id}`
     finishRecovery(ceremony.operation_id, attempt)
-  }, [ceremony, finishRecovery, onRecoveryReady])
+  }, [ceremony, finishRecovery, onRecoveryReady, localRecoveryId])
 
   const dismissCeremony = async () => {
     setBusy(true)
@@ -231,13 +233,7 @@ export function AstraView({
     }
   }
 
-  // A recovery opened from the approvals field belongs to another machine: this
-  // one approves it and is done. Only the session that was opened here is
-  // remembered; a ceremony found on mount keeps the local finalization.
-  const openCeremony = (next: OperatorStatus, opened?: OpenedCeremony) => {
-    remoteRecoverySession.current = opened?.remoteRecovery ? next.session_id : null
-    setCeremony(next)
-  }
+  const openCeremony = (next: OperatorStatus) => setCeremony(next)
 
   const phase = status?.phase ?? 'idle'
   const cancellable = status?.can_cancel === true
@@ -356,7 +352,7 @@ export function AstraView({
         )}
         {ceremony.operation === 'recover_identity' &&
           ceremony.gesture === 'done' &&
-          remoteRecoverySession.current === ceremony.session_id && (
+          ceremony.operation_id !== localRecoveryId && (
             <Typography color="text.secondary" sx={{ mt: 1, fontSize: 11.5 }}>
               Récupération approuvée. Le poste concerné reprend de son côté.
             </Typography>

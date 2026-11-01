@@ -158,8 +158,14 @@ export function rowsOf(manifest: AstraManifest): [string, string][] {
       const rows: [string, string][] = [
         ['domaine', manifest.trust_domain_id],
         ['époque de l’émetteur', String(manifest.issuer_epoch)],
-        ['valide du / jusqu’au', `${instant(manifest.not_before)} → ${instant(manifest.not_after)}`],
-        ['leaf au plus (jours)', String(Number((manifest.maximum_leaf_lifetime_secs / 86_400).toFixed(2)))],
+        [
+          'valide du / jusqu’au',
+          `${instant(manifest.not_before)} → ${instant(manifest.not_after)}`,
+        ],
+        [
+          'leaf au plus (jours)',
+          String(Number((manifest.maximum_leaf_lifetime_secs / 86_400).toFixed(2))),
+        ],
         ['usages', manifest.allowed_usages.join(', ')],
         ['clé PQ (empreinte)', manifest.pq_public_key_fingerprint],
         ['clé TLS (empreinte)', manifest.tls_public_key_info_fingerprint],

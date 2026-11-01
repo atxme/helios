@@ -114,9 +114,15 @@ export default function App() {
   /// Opens the §7.5 ceremony for one operation, and goes to where it shows.
   const approveRecovery = async (operationId: string) => {
     await api.beginOperatorCeremony({ kind: 'recover_identity', operation_id: operationId })
+    setLocalRecoveryId(operationId)
     setAstraPending(true)
     setView('astra')
   }
+
+  // The one recovery this machine opened itself. It lives here, not in AstraView,
+  // so it survives that view being unmounted; every other recovery is another
+  // machine's and is never finished here.
+  const [localRecoveryId, setLocalRecoveryId] = useState<string | null>(null)
 
   const finishRecovery = useCallback(async (operationId: string) => {
     const outcome = await api.resumeCertificateRecovery(operationId)
@@ -439,7 +445,7 @@ export default function App() {
 
           {view === 'astra' && (
             <Box role="region" aria-label="Astra" sx={{ height: '100%' }}>
-              <AstraView onRecoveryReady={finishRecovery} />
+              <AstraView onRecoveryReady={finishRecovery} localRecoveryId={localRecoveryId} />
             </Box>
           )}
 

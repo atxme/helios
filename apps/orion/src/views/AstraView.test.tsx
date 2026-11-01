@@ -528,7 +528,7 @@ describe('AstraView', () => {
       allowed: [],
     })
 
-    render(<AstraView onRecoveryReady={onRecoveryReady} />)
+    render(<AstraView onRecoveryReady={onRecoveryReady} localRecoveryId={operationId} />)
 
     await waitFor(() => expect(onRecoveryReady).toHaveBeenCalledWith(operationId))
     expect(onRecoveryReady).toHaveBeenCalledTimes(1)
@@ -550,7 +550,7 @@ describe('AstraView', () => {
       allowed: [],
     })
 
-    render(<AstraView onRecoveryReady={onRecoveryReady} />)
+    render(<AstraView onRecoveryReady={onRecoveryReady} localRecoveryId={operationId} />)
 
     expect(await screen.findByText(/commit temporairement indisponible/)).toBeTruthy()
     fireEvent.click(screen.getByRole('button', { name: 'Réessayer la finalisation' }))

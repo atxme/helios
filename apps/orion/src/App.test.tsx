@@ -44,9 +44,16 @@ vi.mock('./views/SpeedTestView', () => ({
   SpeedTestView: () => <div>speedtest-view</div>,
 }))
 vi.mock('./views/AstraView', () => ({
-  AstraView: ({ onRecoveryReady }: { onRecoveryReady?: (operationId: string) => Promise<void> }) => (
+  AstraView: ({
+    onRecoveryReady,
+    localRecoveryId,
+  }: {
+    onRecoveryReady?: (operationId: string) => Promise<void>
+    localRecoveryId?: string | null
+  }) => (
     <div>
       astra-view
+      <span>local-recovery-{localRecoveryId ?? 'none'}</span>
       <button onClick={() => void onRecoveryReady?.('e'.repeat(32))}>test-finish-recovery</button>
     </div>
   ),
@@ -214,6 +221,7 @@ describe('App interactions', () => {
       }),
     )
     expect(screen.getByText('astra-view')).toBeTruthy()
+    expect(screen.getByText(`local-recovery-${'e'.repeat(32)}`)).toBeTruthy()
 
     fireEvent.click(screen.getByRole('button', { name: 'test-finish-recovery' }))
 

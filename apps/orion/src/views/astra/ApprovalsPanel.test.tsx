@@ -134,6 +134,48 @@ describe('the recovery block', () => {
   })
 })
 
+describe('a recovery that belongs to another machine', () => {
+  const sentence = 'Récupération approuvée. Le poste concerné reprend de son côté.'
+  const recovery = (gesture: unknown) => status('recover_identity', gesture, { remote: 'granted' })
+
+  it('is_never_finished_here_when_the_view_remounts_while_open_then_done', async () => {
+    const onRecoveryReady = vi.fn().mockResolvedValue(undefined)
+    api.operatorCeremonyStatus.mockResolvedValue(
+      recovery({ awaiting_key: { index: 1, of: 1, purpose: 'open_vault' } }),
+    )
+    const first = render(<AstraView onRecoveryReady={onRecoveryReady} localRecoveryId={null} />)
+    await screen.findByText(/Brancher la clé autorisée/)
+    first.unmount()
+
+    api.operatorCeremonyStatus.mockResolvedValue(recovery('done'))
+    render(<AstraView onRecoveryReady={onRecoveryReady} localRecoveryId={null} />)
+    expect(await screen.findByText(sentence)).toBeTruthy()
+    expect(onRecoveryReady).not.toHaveBeenCalled()
+  })
+
+  it('is_never_finished_here_when_it_is_done_before_the_view_remounts', async () => {
+    const onRecoveryReady = vi.fn().mockResolvedValue(undefined)
+    api.operatorCeremonyStatus.mockResolvedValue(recovery('done'))
+    const first = render(<AstraView onRecoveryReady={onRecoveryReady} localRecoveryId={null} />)
+    await screen.findByText(sentence)
+    first.unmount()
+
+    render(
+      <AstraView onRecoveryReady={onRecoveryReady} localRecoveryId={'b'.repeat(32)} />,
+    )
+    expect(await screen.findByText(sentence)).toBeTruthy()
+    expect(onRecoveryReady).not.toHaveBeenCalled()
+  })
+
+  it('a_recovery_opened_here_still_finishes_locally_and_has_no_remote_sentence', async () => {
+    const onRecoveryReady = vi.fn().mockResolvedValue(undefined)
+    api.operatorCeremonyStatus.mockResolvedValue(recovery('done'))
+    render(<AstraView onRecoveryReady={onRecoveryReady} localRecoveryId={'a'.repeat(32)} />)
+    await waitFor(() => expect(onRecoveryReady).toHaveBeenCalledWith('a'.repeat(32)))
+    expect(screen.queryByText(sentence)).toBeNull()
+  })
+})
+
 describe('the delegation', () => {
   it('an_issuer_campaign_asks_for_the_request_file', async () => {
     api.operatorPendingOperations.mockResolvedValue([campaign('issuer_delegation')])
