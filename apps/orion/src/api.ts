@@ -167,16 +167,6 @@ export const runCertificateAction = (name: string, action: CertificateAction) =>
   invoke<ActionOutcome>('run_certificate_action', { name, action })
 
 /**
- * Launches the operator companion for this profile's in-memory operation.
- *
- * The inlined Tauri plugin accepts only the profile name. Rust resolves the
- * session and its core-built invocation; no executable or argument crosses
- * from the WebView.
- */
-export const launchCertificateCompanion = (name: string) =>
-  invoke<void>('plugin:companion|launch_certificate_companion', { name })
-
-/**
  * Reads the approval request the open renewal is waiting on.
  *
  * Verified on the Rust side before it comes back. Nothing touches a security
@@ -190,13 +180,14 @@ export const certificateApprovalManifest = (name: string) =>
  *
  * Asked rather than assumed: under Windows the platform dialog collects it and
  * it never enters Orion, so prompting would be asking for a secret Orion has
- * no use for.
+ * no use for. Rust answers from the key plugged into this workstation; `name`
+ * is kept for the command's signature and is not used there.
  */
 export const certificateApprovalNeedsPin = (name: string) =>
   invoke<boolean>('certificate_approval_needs_pin', { name })
 
 /**
- * Runs the ceremony and posts the assertion.
+ * Runs the key ceremony in this process and has the engine deposit the assertion.
  *
  * Resolves with where the renewal reached. The manifest must have been read
  * first: what is signed is what was shown.

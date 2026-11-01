@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import Alert from '@mui/material/Alert'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
@@ -19,11 +19,6 @@ import type {
   ProfileCertificates,
   RenewalProgress,
 } from '../types'
-
-type CompanionLaunch =
-  | { state: 'launching' }
-  | { state: 'launched' }
-  | { state: 'failed'; reason: string }
 
 /**
  * Certificates — its own destination, between Profiles and the log.
@@ -71,9 +66,6 @@ export function CertificatesView({
   const [profiles, setProfiles] = useState<ProfileCertificates[] | null>(null)
   const [failed, setFailed] = useState(false)
   const [busy, setBusy] = useState(false)
-  // Process launch is separate from the certificate action: the operation may
-  // be validly waiting even when this machine cannot start its companion.
-  const [companion, setCompanion] = useState<Record<string, CompanionLaunch>>({})
   // Where each profile's renewal stopped, from the press that opened it.
   // Not persisted and not refreshed: it describes one attempt made here, and a
   // step surviving a reload would outlive the operation it names.
@@ -113,19 +105,6 @@ export function CertificatesView({
     return () => window.clearTimeout(timer)
   }, [completedRecovery, refresh])
 
-  const launchCompanion = async (name: string) => {
-    setCompanion((current) => ({ ...current, [name]: { state: 'launching' } }))
-    try {
-      await api.launchCertificateCompanion(name)
-      setCompanion((current) => ({ ...current, [name]: { state: 'launched' } }))
-    } catch (cause) {
-      setCompanion((current) => ({
-        ...current,
-        [name]: { state: 'failed', reason: String(cause) },
-      }))
-    }
-  }
-
   const run = async (name: string, action: CertificateAction) => {
     setBusy(true)
     try {
@@ -140,19 +119,6 @@ export function CertificatesView({
         for (const refused of Object.keys(outcome.refused)) delete merged[refused]
         return merged
       })
-      setCompanion((current) => {
-        const next = { ...current }
-        for (const [profile, step] of Object.entries(outcome.progress)) {
-          if (step.step !== 'awaiting_operator') delete next[profile]
-        }
-        for (const refused of Object.keys(outcome.refused)) delete next[refused]
-        return next
-      })
-      await Promise.all(
-        Object.entries(outcome.progress)
-          .filter(([, step]) => step.step === 'awaiting_operator')
-          .map(([profile]) => launchCompanion(profile)),
-      )
     } catch {
       // The refusal is recorded on the Rust side and comes back with the
       // refreshed overview: showing it from the rejection as well would print
@@ -162,10 +128,6 @@ export function CertificatesView({
       // has now failed, and leaving it on screen beside the new error would
       // show a renewal as progressing and refused at once.
       setProgress((current) => {
-        const { [name]: _dropped, ...rest } = current
-        return rest
-      })
-      setCompanion((current) => {
         const { [name]: _dropped, ...rest } = current
         return rest
       })
@@ -252,8 +214,6 @@ export function CertificatesView({
             <RenewalStep
               name={profile.name}
               step={progress[profile.name]}
-              launch={companion[profile.name]}
-              onLaunch={() => void launchCompanion(profile.name)}
               onApprove={onApprove}
               onApproved={(step) => {
                 setProgress((current) => ({ ...current, [profile.name]: step }))
@@ -282,36 +242,30 @@ export function CertificatesView({
  * every renewal legitimately waits — so what the row carries is the operation,
  * what is about to be approved, and the way to approve it.
  *
- * # Two doors, and why the ceremony is the first
+ * # One door: the key on this machine
  *
- * A renewal parked here needs one touch on a security key. That key is very
- * often plugged into *this* machine, and Orion has held the whole ceremony
- * since §8.1.2 — read the request, verify it against what the profile pins,
- * run the assertion, post it. Sending the user to a separate companion for a
- * key already in front of them was making them leave the screen that told them
- * to act. So the ceremony is here, and the companion stays as what it is: the
- * way in when the key is on another machine, or when policy stops Orion from
- * talking to it.
+ * A renewal parked here needs one touch on a security key, and the whole
+ * ceremony runs in this process. There is no companion to launch: an ordinary
+ * renewal belongs to the peer that opened it, so only this workstation can
+ * answer it.
  *
  * # The manifest is read before anything is signed
  *
- * `certificateApprovalManifest` returns fields taken from the **verified**
- * request, never from the envelope, and the shell refuses to run the ceremony
- * until it has been read: what is signed is what was shown. Which is why the
- * button that reads it and the button that touches the key are two buttons.
+ * The request is read on its own as soon as the step appears — once per
+ * operation — and shown before the key is asked for anything. It carries fields
+ * taken from the **verified** request, never from the envelope, and the shell
+ * refuses to run the ceremony until it has been read: what is signed is what
+ * was shown. A failed approval keeps the manifest and the button: the request
+ * is consumed only at the deposit, so retrying is one click.
  */
 function RenewalStep({
   name,
   step,
-  launch,
-  onLaunch,
   onApproved,
   onApprove,
 }: {
   name: string
   step: RenewalProgress | undefined
-  launch: CompanionLaunch | undefined
-  onLaunch: () => void
   onApproved: (step: RenewalProgress) => void
   /** Opens the §7.5 ceremony in the Astra tab, when the key is on this machine. */
   onApprove?: (operationId: string) => Promise<void>
@@ -319,45 +273,68 @@ function RenewalStep({
   const [manifest, setManifest] = useState<ApprovalManifest | null>(null)
   const [needsPin, setNeedsPin] = useState(false)
   const [pin, setPin] = useState('')
-  const [ceremony, setCeremony] = useState<null | 'reading' | 'signing'>(null)
+  const [reading, setReading] = useState(false)
+  const [signing, setSigning] = useState(false)
   const [refusal, setRefusal] = useState<string | null>(null)
   const [approving, setApproving] = useState(false)
-  // The command line is a fallback, not the offer. An operator whose key is
-  // on this machine must never have to read one; the one whose key is
-  // elsewhere still needs it whole, so it is folded rather than removed.
+  // Folded: on the workstation that holds the key, the button is the gesture.
   const [manualPath, setManualPath] = useState(false)
+  // The operation whose request was last read: one automatic read per
+  // operation, whatever re-renders the step goes through.
+  const readFor = useRef<string | null>(null)
+  const operationId =
+    step?.step === 'awaiting_operator' ? step.operation_id : null
 
-  const readManifest = async () => {
-    setCeremony('reading')
-    setRefusal(null)
-    try {
-      setManifest(await api.certificateApprovalManifest(name))
-      // Asked, never assumed: under Windows the platform dialog collects the
-      // PIN and it never enters Orion, so a field here would be asking for a
-      // secret nothing in this process can use.
-      setNeedsPin(await api.certificateApprovalNeedsPin(name))
-    } catch (cause) {
-      setRefusal(String(cause))
-    } finally {
-      setCeremony(null)
+  const readManifest = useCallback(
+    async (operation: string) => {
+      readFor.current = operation
+      setReading(true)
+      setRefusal(null)
+      try {
+        const read = await api.certificateApprovalManifest(name)
+        // Asked, never assumed: under Windows the platform dialog collects the
+        // PIN and it never enters Orion, so a field here would be asking for a
+        // secret nothing in this process can use.
+        const pinWanted = await api.certificateApprovalNeedsPin(name)
+        if (readFor.current !== operation) return
+        setManifest(read)
+        setNeedsPin(pinWanted)
+      } catch (cause) {
+        if (readFor.current === operation) setRefusal(String(cause))
+      } finally {
+        if (readFor.current === operation) setReading(false)
+      }
+    },
+    [name],
+  )
+
+  useEffect(() => {
+    if (operationId === null) {
+      readFor.current = null
+      return
     }
-  }
+    if (readFor.current === operationId) return
+    setManifest(null)
+    setPin('')
+    void readManifest(operationId)
+  }, [operationId, readManifest])
 
   const approve = async () => {
-    setCeremony('signing')
+    setSigning(true)
     setRefusal(null)
     try {
       const reached = await api.approveCertificateRenewal(name, needsPin ? pin : undefined)
-      // The verified request is consumed by the ceremony: keeping the manifest
-      // on screen would offer a second touch against a window the authority
-      // has already closed.
       setManifest(null)
       setPin('')
       onApproved(reached)
     } catch (cause) {
+      // The manifest stays: the request is consumed only at the deposit, so a
+      // key that was absent, a wrong PIN or a cancelled dialog is retried with
+      // one click. If the failure came after the deposit, « Relire la demande »
+      // is the way to find out.
       setRefusal(String(cause))
     } finally {
-      setCeremony(null)
+      setSigning(false)
     }
   }
 
@@ -396,11 +373,6 @@ function RenewalStep({
           <Row label="opération" value={step.operation_id} copyable />
         )}
 
-      {/* A §7.5 recovery has no door on this machine: the active leaf has
-          expired, so there is no request this poste can offer to a key plugged
-          in here. What the surface owes the user is therefore the whole of what
-          remains to be done, in the form it has to be done in — the command,
-          entire, rather than an identifier to reassemble by hand. */}
       {step?.step === 'recovery_awaiting_operator' && (
         <>
           <Typography color="text.secondary" sx={{ mt: 0.75, fontSize: 11.5, lineHeight: 1.55 }}>
@@ -445,11 +417,6 @@ function RenewalStep({
               {refusal}
             </Alert>
           )}
-          {/* The way out when the key is on another machine. Kept whole —
-              command included — because §8.5 still requires a portable
-              companion, and an operator on another workstation has no other
-              channel than this line. Folded, because on the machine that holds
-              the key the button above is the whole of the gesture. */}
           <Button
             size="small"
             variant="text"
@@ -460,36 +427,22 @@ function RenewalStep({
             {manualPath ? 'Masquer le chemin manuel' : 'La clé est sur un autre poste ?'}
           </Button>
           {manualPath && (
-            <>
-              <Typography color="text.disabled" sx={{ mt: 0.5, fontSize: 11, lineHeight: 1.5 }}>
-                Lancer cette commande sur le poste qui porte la clé, puis relancer
-                « Récupérer le certificat expiré » ici.
-              </Typography>
-              <Row label="commande" value={step.operator_command} copyable />
-            </>
+            <Typography color="text.disabled" sx={{ mt: 0.5, fontSize: 11, lineHeight: 1.5 }}>
+              Sur le poste de l’opérateur : Astra › Approbations › « Approuver une
+              récupération », avec cet identifiant. Puis relancez « Récupérer le
+              certificat expiré » ici.
+            </Typography>
           )}
         </>
       )}
       {step?.step === 'awaiting_operator' && (
         <>
-          {manifest === null ? (
-            <Button
-              size="small"
-              variant="contained"
-              disabled={ceremony !== null}
-              startIcon={
-                ceremony === 'reading' ? (
-                  <CircularProgress size={13} color="inherit" />
-                ) : (
-                  <Fingerprint size={14} aria-hidden />
-                )
-              }
-              onClick={() => void readManifest()}
-              sx={{ mt: 0.75, minHeight: 30, fontSize: 11.5 }}
-            >
-              {ceremony === 'reading' ? 'Lecture…' : 'Lire la demande d’approbation'}
-            </Button>
-          ) : (
+          {reading && (
+            <Typography color="text.secondary" sx={{ mt: 0.75, fontSize: 11.5 }}>
+              Lecture de la demande…
+            </Typography>
+          )}
+          {manifest !== null && (
             <Box sx={{ mt: 0.75 }}>
               <Row label="pair" value={manifest.client_wg_public_key} copyable />
               <Row
@@ -534,9 +487,9 @@ function RenewalStep({
                     <Button
                       size="small"
                       variant="contained"
-                      disabled={ceremony !== null || (needsPin && pin === '')}
+                      disabled={signing || (needsPin && pin === '')}
                       startIcon={
-                        ceremony === 'signing' ? (
+                        signing ? (
                           <CircularProgress size={13} color="inherit" />
                         ) : (
                           <KeyRound size={14} aria-hidden />
@@ -545,7 +498,7 @@ function RenewalStep({
                       onClick={() => void approve()}
                       sx={{ mt: 0.75, minHeight: 30, fontSize: 11.5 }}
                     >
-                      {ceremony === 'signing' ? 'Touchez la clé…' : 'Approuver avec la clé'}
+                      {signing ? 'Touchez la clé…' : 'Approuver avec la clé'}
                     </Button>
                   </Box>
                 </>
@@ -564,37 +517,21 @@ function RenewalStep({
             </Alert>
           )}
 
-          <Button
-            size="small"
-            variant="outlined"
-            color="inherit"
-            disabled={launch?.state === 'launching'}
-            startIcon={
-              launch?.state === 'launching' ? (
-                <CircularProgress size={13} color="inherit" />
-              ) : (
-                <KeyRound size={14} aria-hidden />
-              )
-            }
-            onClick={onLaunch}
-            sx={{ mt: 0.75, minHeight: 30, fontSize: 11.5 }}
-          >
-            {launch?.state === 'launching' ? 'Lancement…' : 'Relancer le compagnon'}
-          </Button>
-          {launch?.state === 'launched' && (
-            <Alert severity="info" variant="outlined" sx={{ mt: 0.75, fontSize: 11.5 }}>
-              Compagnon lancé : l’approbation se poursuit dans sa fenêtre.
-            </Alert>
+          {/* After a failed read, and after a failed approval: the second case
+              covers a retry refused because the request was consumed. */}
+          {refusal && !reading && !signing && operationId !== null && (
+            <Button
+              size="small"
+              variant="outlined"
+              color="inherit"
+              startIcon={<Fingerprint size={14} aria-hidden />}
+              onClick={() => void readManifest(operationId)}
+              sx={{ mt: 0.75, minHeight: 30, fontSize: 11.5 }}
+            >
+              Relire la demande
+            </Button>
           )}
-          {launch?.state === 'failed' && (
-            <Alert severity="error" variant="outlined" sx={{ mt: 0.75, fontSize: 11.5 }}>
-              Lancement du compagnon impossible : {launch.reason}
-            </Alert>
-          )}
-          {/* The way in when the key is not on this machine. Kept whole —
-              command included — because a failed launch must still leave the
-              operation recoverable by hand. Folded below the button, because
-              here the companion is launched from Orion. */}
+
           <Button
             size="small"
             variant="text"
@@ -605,12 +542,10 @@ function RenewalStep({
             {manualPath ? 'Masquer le chemin manuel' : 'La clé est sur un autre poste ?'}
           </Button>
           {manualPath && (
-            <>
-              <Typography color="text.disabled" sx={{ mt: 0.5, fontSize: 11, lineHeight: 1.5 }}>
-                Sur le poste qui porte la clé, l’approbation s’y fait par le compagnon.
-              </Typography>
-              <Row label="compagnon" value={step.companion_command} copyable />
-            </>
+            <Typography color="text.disabled" sx={{ mt: 0.5, fontSize: 11, lineHeight: 1.5 }}>
+              Cette approbation se fait sur ce poste : la gateway n’accepte la réponse que
+              du poste qui a demandé le renouvellement. Branchez ici la clé d’un opérateur.
+            </Typography>
           )}
         </>
       )}

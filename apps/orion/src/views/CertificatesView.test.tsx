@@ -8,7 +8,6 @@ import type { ProfileCertificates } from '../types'
 const api = vi.hoisted(() => ({
   certificateOverview: vi.fn(),
   runCertificateAction: vi.fn(),
-  launchCertificateCompanion: vi.fn(),
   certificateApprovalManifest: vi.fn(),
   certificateApprovalNeedsPin: vi.fn(),
   approveCertificateRenewal: vi.fn(),
@@ -71,7 +70,6 @@ const renewEvery = () => ({
 const awaiting = () => ({
   step: 'awaiting_operator' as const,
   operation_id: 'f'.repeat(32),
-  companion_command: 'astra-signer approve --operation-id ' + 'f'.repeat(32),
 })
 
 /** One press's result, keyed by profile as the command returns it. */
@@ -105,16 +103,11 @@ const manifest = (overrides: Record<string, unknown> = {}) => ({
 
 beforeEach(() => {
   vi.clearAllMocks()
-  api.launchCertificateCompanion.mockResolvedValue(undefined)
   api.certificateApprovalManifest.mockResolvedValue(manifest())
   api.certificateApprovalNeedsPin.mockResolvedValue(false)
   api.approveCertificateRenewal.mockResolvedValue({ step: 'committed', generation: 5 })
   api.runCertificateAction.mockResolvedValue(
-    outcome({
-      step: 'awaiting_operator',
-      operation_id: 'f'.repeat(32),
-      companion_command: 'astra-signer approve --heliosd-url http://100.64.0.1:8080',
-    }),
+    outcome({ step: 'awaiting_operator', operation_id: 'f'.repeat(32) }),
   )
 })
 
@@ -228,45 +221,99 @@ describe('CertificatesView', () => {
     expect(api.certificateOverview).toHaveBeenCalledTimes(2)
   })
 
-  /** The shell launches from its session; the WebView supplies only a name.
-   *
-   * The command is no longer on screen by default — on the machine that holds
-   * the key, Orion launches the companion itself — but it stays whole, one
-   * press away, for the operator whose key is elsewhere. */
-  it('launches the companion and keeps the exact fallback command one press away', async () => {
+  /** The request is read as the step appears: no button stands between them. */
+  it('the_request_is_read_when_an_operator_is_awaited', async () => {
     api.certificateOverview.mockResolvedValue([entry({ actions: [renewNow()] })])
     api.runCertificateAction.mockResolvedValue(outcome(awaiting()))
     render(<CertificatesView />)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Renouveler maintenant' }))
 
-    await waitFor(() => expect(screen.getByText('f'.repeat(32))).toBeTruthy())
-    await waitFor(() => expect(api.launchCertificateCompanion).toHaveBeenCalledWith('portable'))
-    expect(screen.queryByText(awaiting().companion_command)).toBeNull()
-    fireEvent.click(screen.getByRole('button', { name: 'La clé est sur un autre poste ?' }))
-    expect(screen.getByText(awaiting().companion_command)).toBeTruthy()
-    expect(screen.getByRole('button', { name: 'Copier compagnon' })).toBeTruthy()
-    expect(await screen.findByText(/Compagnon lancé/)).toBeTruthy()
+    await waitFor(() =>
+      expect(api.certificateApprovalManifest).toHaveBeenCalledWith('portable'),
+    )
+    expect(await screen.findByText('4 → 5')).toBeTruthy()
+    expect(api.certificateApprovalNeedsPin).toHaveBeenCalledWith('portable')
+    expect(screen.queryByRole('button', { name: 'Lire la demande d’approbation' })).toBeNull()
+    expect(api.certificateApprovalManifest).toHaveBeenCalledOnce()
   })
 
-  /** A missing binary is named, while the copyable command remains the exit. */
-  it('shows a launch failure and lets the operator retry', async () => {
-    const command =
-      'astra-signer approve --heliosd-url http://100.64.0.1:8080 --operation-id ' + 'f'.repeat(32)
-    api.certificateOverview.mockResolvedValue([entry({ actions: [renewNow()] })])
-    api.runCertificateAction.mockResolvedValue(
-      outcome({ ...awaiting(), companion_command: command }),
+  /** Reading shows its own state, and a failed read can be redone. */
+  it('says the request is being read, then offers to read it again after a failure', async () => {
+    let fail: (cause: string) => void = () => {}
+    api.certificateApprovalManifest.mockReturnValueOnce(
+      new Promise((_resolve, reject) => {
+        fail = reject
+      }),
     )
-    api.launchCertificateCompanion.mockRejectedValue('fichier introuvable')
+    api.certificateOverview.mockResolvedValue([entry({ actions: [renewNow()] })])
+    api.runCertificateAction.mockResolvedValue(outcome(awaiting()))
     render(<CertificatesView />)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Renouveler maintenant' }))
-    expect(await screen.findByText(/fichier introuvable/)).toBeTruthy()
-    fireEvent.click(screen.getByRole('button', { name: 'La clé est sur un autre poste ?' }))
-    await waitFor(() => expect(screen.getByText(command)).toBeTruthy())
-    expect(screen.getByRole('button', { name: 'Copier compagnon' })).toBeTruthy()
-    fireEvent.click(screen.getByRole('button', { name: 'Relancer le compagnon' }))
-    await waitFor(() => expect(api.launchCertificateCompanion).toHaveBeenCalledTimes(2))
+    expect(await screen.findByText('Lecture de la demande…')).toBeTruthy()
+    fail('la gateway ne répond pas')
+    expect(await screen.findByText(/la gateway ne répond pas/)).toBeTruthy()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Relire la demande' }))
+    expect(await screen.findByText('4 → 5')).toBeTruthy()
+    expect(api.certificateApprovalManifest).toHaveBeenCalledTimes(2)
+  })
+
+  /** The companion is gone: nothing is launched and nothing names it. */
+  it('no_companion_is_launched', async () => {
+    api.certificateOverview.mockResolvedValue([entry({ actions: [renewNow()] })])
+    api.runCertificateAction.mockResolvedValue(outcome(awaiting()))
+    const { container } = render(<CertificatesView />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Renouveler maintenant' }))
+    await screen.findByText('4 → 5')
+
+    // The api module is mocked whole and has no launcher left to call.
+    expect('launchCertificateCompanion' in api).toBe(false)
+    expect(container.textContent?.toLowerCase()).not.toContain('compagnon')
+    expect(screen.queryByRole('button', { name: /compagnon/i })).toBeNull()
+  })
+
+  /**
+   * An ordinary renewal belongs to the peer that opened it: the fallback says
+   * so and names no command.
+   */
+  it('the_other_workstation_note_names_no_command', async () => {
+    api.certificateOverview.mockResolvedValue([entry({ actions: [renewNow()] })])
+    api.runCertificateAction.mockResolvedValue(outcome(awaiting()))
+    const { container } = render(<CertificatesView />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Renouveler maintenant' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'La clé est sur un autre poste ?' }))
+
+    expect(
+      screen.getByText(
+        'Cette approbation se fait sur ce poste : la gateway n’accepte la réponse que du poste qui a demandé le renouvellement. Branchez ici la clé d’un opérateur.',
+      ),
+    ).toBeTruthy()
+    expect(container.textContent).not.toContain('astra-signer')
+  })
+
+  it('the_recovery_note_gives_the_identifier_and_the_operator_path', async () => {
+    api.certificateOverview.mockResolvedValue([entry({ actions: [renewNow()] })])
+    api.runCertificateAction.mockResolvedValue(
+      outcome({ step: 'recovery_awaiting_operator', operation_id: 'd'.repeat(32) }),
+    )
+    const { container } = render(<CertificatesView />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Renouveler maintenant' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'La clé est sur un autre poste ?' }))
+
+    expect(screen.getByText('d'.repeat(32))).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Copier opération' })).toBeTruthy()
+    expect(
+      screen.getByText(
+        'Sur le poste de l’opérateur : Astra › Approbations › « Approuver une récupération », avec cet identifiant. Puis relancez « Récupérer le certificat expiré » ici.',
+      ),
+    ).toBeTruthy()
+    expect(container.textContent).not.toContain('astra-signer')
+    expect(api.certificateApprovalManifest).not.toHaveBeenCalled()
   })
 
   /** Epoch and recovery are local facts; no registry fetch is implied. */
@@ -371,30 +418,29 @@ describe('CertificatesView', () => {
 
     await waitFor(() => expect(screen.getByText('f'.repeat(32))).toBeTruthy())
     expect(screen.getByText('e'.repeat(32))).toBeTruthy()
-    await waitFor(() => expect(api.launchCertificateCompanion).toHaveBeenCalledTimes(2))
-    expect(api.launchCertificateCompanion).toHaveBeenCalledWith('portable')
-    expect(api.launchCertificateCompanion).toHaveBeenCalledWith('bureau')
+    await waitFor(() => expect(api.certificateApprovalManifest).toHaveBeenCalledTimes(2))
   })
 
   /**
-   * The ceremony is on this screen because the key usually is on this machine.
-   * What is signed is what was shown, so the manifest is read first — and its
-   * fields come from the verified request, not from the envelope.
+   * What is signed is what was shown: the fields come from the verified
+   * request, and nothing can be signed before they are on screen.
    */
-  it('reads the verified request before offering the key', async () => {
+  it('shows the verified request before offering the key', async () => {
+    let release: (value: unknown) => void = () => {}
+    api.certificateApprovalManifest.mockReturnValueOnce(
+      new Promise((resolve) => {
+        release = resolve
+      }),
+    )
     api.certificateOverview.mockResolvedValue([entry({ actions: [renewNow()] })])
     api.runCertificateAction.mockResolvedValue(outcome(awaiting()))
     render(<CertificatesView />)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Renouveler maintenant' }))
-    const read = await screen.findByRole('button', { name: 'Lire la demande d’approbation' })
-    // Nothing may be signed before it has been read.
+    await screen.findByText('Lecture de la demande…')
     expect(screen.queryByRole('button', { name: 'Approuver avec la clé' })).toBeNull()
 
-    fireEvent.click(read)
-    await waitFor(() =>
-      expect(api.certificateApprovalManifest).toHaveBeenCalledWith('portable'),
-    )
+    release(manifest())
     expect(await screen.findByText('4 → 5')).toBeTruthy()
     expect(screen.getByText('c'.repeat(64))).toBeTruthy()
     expect(screen.getByText('2 clés du domaine peuvent répondre')).toBeTruthy()
@@ -408,7 +454,6 @@ describe('CertificatesView', () => {
     render(<CertificatesView />)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Renouveler maintenant' }))
-    fireEvent.click(await screen.findByRole('button', { name: 'Lire la demande d’approbation' }))
     fireEvent.click(await screen.findByRole('button', { name: 'Approuver avec la clé' }))
 
     await waitFor(() =>
@@ -427,7 +472,6 @@ describe('CertificatesView', () => {
     render(<CertificatesView />)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Renouveler maintenant' }))
-    fireEvent.click(await screen.findByRole('button', { name: 'Lire la demande d’approbation' }))
 
     const field = await screen.findByLabelText('PIN de la clé')
     // An empty PIN would spend the ceremony on a refusal the key answers with.
@@ -450,28 +494,55 @@ describe('CertificatesView', () => {
     render(<CertificatesView />)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Renouveler maintenant' }))
-    fireEvent.click(await screen.findByRole('button', { name: 'Lire la demande d’approbation' }))
 
     expect(
       await screen.findByText(/Aucune clé du domaine n’est autorisée à répondre/),
     ).toBeTruthy()
     expect(screen.queryByRole('button', { name: 'Approuver avec la clé' })).toBeNull()
     // And the other door stays open: the key may be elsewhere.
-    expect(screen.getByRole('button', { name: 'Relancer le compagnon' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'La clé est sur un autre poste ?' })).toBeTruthy()
   })
 
-  /** A refused ceremony is named, and the operation stays approvable. */
-  it('names a refused ceremony without losing the operation', async () => {
+  /**
+   * The request is consumed only at the deposit, so a key that was absent is
+   * retried with one click and without reading again. « Relire la demande » sits
+   * next to it for a retry the engine refuses.
+   */
+  it('a_failed_approval_can_be_retried_without_reading_again', async () => {
     api.certificateOverview.mockResolvedValue([entry({ actions: [renewNow()] })])
     api.runCertificateAction.mockResolvedValue(outcome(awaiting()))
-    api.approveCertificateRenewal.mockRejectedValue('aucune clé détectée')
+    api.approveCertificateRenewal.mockRejectedValueOnce('aucune clé détectée')
     render(<CertificatesView />)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Renouveler maintenant' }))
-    fireEvent.click(await screen.findByRole('button', { name: 'Lire la demande d’approbation' }))
     fireEvent.click(await screen.findByRole('button', { name: 'Approuver avec la clé' }))
 
     expect(await screen.findByText(/aucune clé détectée/)).toBeTruthy()
+    // The manifest stays, the button is live again, and re-reading is offered.
+    expect(screen.getByText('4 → 5')).toBeTruthy()
+    const retry = screen.getByRole('button', { name: 'Approuver avec la clé' })
+    expect(retry.hasAttribute('disabled')).toBe(false)
+    expect(screen.getByRole('button', { name: 'Relire la demande' })).toBeTruthy()
+
+    fireEvent.click(retry)
+    expect(await screen.findByText('génération suivante')).toBeTruthy()
+    expect(api.approveCertificateRenewal).toHaveBeenCalledTimes(2)
+    expect(api.certificateApprovalManifest).toHaveBeenCalledOnce()
+  })
+
+  /** A retry refused for a consumed request is answered by reading again. */
+  it('a_failed_approval_can_be_read_again', async () => {
+    api.certificateOverview.mockResolvedValue([entry({ actions: [renewNow()] })])
+    api.runCertificateAction.mockResolvedValue(outcome(awaiting()))
+    api.approveCertificateRenewal.mockRejectedValueOnce('lire d’abord la demande d’approbation')
+    render(<CertificatesView />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Renouveler maintenant' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Approuver avec la clé' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Relire la demande' }))
+
+    await waitFor(() => expect(api.certificateApprovalManifest).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(screen.queryByText(/lire d’abord/)).toBeNull())
     expect(screen.getByRole('button', { name: 'Approuver avec la clé' })).toBeTruthy()
   })
 
