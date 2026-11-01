@@ -998,8 +998,8 @@ export type EnrollmentGesture =
     }
 
 /**
- * La délégation de l'émetteur d'Astra (§9.5). Seul le texte de la demande
- * voyage, jamais un chemin ; en campagne, avec l'opération que l'autorité a ouverte.
+ * Delegation of the Astra issuer (§9.5). Only the request text travels, never
+ * a path; in a campaign, together with the operation the authority opened.
  */
 export type IssuerGesture =
   | { gesture: 'authorize_issuer'; operation_id: string; request: string }

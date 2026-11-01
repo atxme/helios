@@ -300,12 +300,15 @@ function RenewalStep({
       setRefusal(null)
       try {
         const fetched = await api.certificateApprovalManifest(name)
+        if (readFor.current !== operation) return
+        // The request is shown before the key is probed: a missing key must
+        // not hide what the operator is about to approve.
+        setRead({ operation, manifest: fetched })
         // Asked, never assumed: under Windows the platform dialog collects the
         // PIN and it never enters Orion, so a field here would be asking for a
         // secret nothing in this process can use.
         const pinWanted = await api.certificateApprovalNeedsPin(name)
         if (readFor.current !== operation) return
-        setRead({ operation, manifest: fetched })
         setNeedsPin(pinWanted)
       } catch (cause) {
         if (readFor.current === operation) setRefusal(String(cause))

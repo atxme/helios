@@ -486,6 +486,19 @@ describe('CertificatesView', () => {
     )
   })
 
+  /** A key that cannot be probed must not hide the request it would approve. */
+  it('keeps the request shown when the PIN probe fails', async () => {
+    api.certificateOverview.mockResolvedValue([entry({ actions: [renewNow()] })])
+    api.runCertificateAction.mockResolvedValue(outcome(awaiting()))
+    api.certificateApprovalNeedsPin.mockRejectedValue('no key')
+    render(<CertificatesView />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Renouveler maintenant' }))
+
+    expect(await screen.findByText('4 → 5')).toBeTruthy()
+    expect(await screen.findByText(/no key/)).toBeTruthy()
+  })
+
   /** A touch nobody's key can answer is a touch not worth asking for. */
   it('offers no touch when no credential of the domain may answer', async () => {
     api.certificateOverview.mockResolvedValue([entry({ actions: [renewNow()] })])
