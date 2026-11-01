@@ -133,8 +133,8 @@ pub const ANCHOR_ROTATION_CREDENTIALS: usize = 2;
 /// coordinator to read one document.
 pub use aether::certificates::authority::IssuerDelegationRequest;
 
-/// n   The bounds an operator sets on one delegation.
-#[derive(Debug, Clone, Copy)]
+/// The bounds an operator sets on one delegation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DelegationBounds {
     pub maximum_leaf_lifetime_secs: u64,
     pub not_before: u64,

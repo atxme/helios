@@ -194,6 +194,33 @@ pub fn open_with_authorized_key(
     Ok(opened)
 }
 
+/// Opens the vault with one named credential, and with no other.
+///
+/// For the ceremony that has just obtained an approval from `credential_id`
+/// and must open the vault with that same key. The allow-list carries that
+/// identifier alone, so another token presented in its place holds nothing it
+/// may answer for; and a token that answered anyway, for a credential it was
+/// not offered, is refused here rather than trusted.
+pub fn open_with_credential(
+    key: &dyn Authenticator,
+    vault: &AuthorityVault,
+    credential_id: &[u8],
+    pin: &str,
+) -> Result<Opened> {
+    // A credential this vault does not hold is refused before the press.
+    vault.slot_for_credential(credential_id)?;
+    let opened = key.derive(&vault.rp_id, &[credential_id.to_vec()], &vault.salt()?, pin)?;
+    if opened.credential_id != credential_id {
+        return Err(GestureError::Anchors(
+            "la clé qui ouvre le coffre n'est pas celle qui vient d'approuver ; recommencer avec \
+             une seule clé branchée"
+                .into(),
+        ));
+    }
+    vault.slot_for_credential(&opened.credential_id)?;
+    Ok(opened)
+}
+
 /// Registers another security key, using a secret an authorized one released.
 ///
 /// `new` is a **different** device from the one that produced `opening`. The

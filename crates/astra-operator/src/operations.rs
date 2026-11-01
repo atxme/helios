@@ -7,6 +7,7 @@
 //! window can both do so without either shape leaking into the other.
 
 pub mod campaign;
+pub mod issuer;
 pub mod recovery;
 
 use aether::certificates::status::{AstraSignerResult, CampaignApproval};
