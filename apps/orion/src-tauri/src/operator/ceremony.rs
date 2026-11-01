@@ -28,11 +28,11 @@ use aether::key_negotiation::{
     decode_request_file, encode_invitation_file, EnrollmentRequest, PqCertificate,
     PqCertificateRole, ProtectionMode,
 };
-use aether_fido::authenticator::{Authenticator, DialogOwner};
+use aether_fido::authenticator::Authenticator;
 use astra_operator::enrollment::{AcceptedEnrollment, InvitationRegistry};
 use astra_operator::vault::AuthorityVault;
 
-use super::{ArtifactEncoding, EnrollmentGesture, OperatorArtifact};
+use super::{dialog_owner, now_unix, ArtifactEncoding, EnrollmentGesture, OperatorArtifact};
 
 mod issuer;
 mod vault;
@@ -1704,39 +1704,6 @@ fn awaited_action(presses: &Receiver<Press>, offered: &OperatorStatus) -> Option
             return Some(press);
         }
     }
-}
-
-/// The window the platform dialog belongs to, from the press that opened it.
-///
-/// Orion's own window: the press came from it, and it is the window the
-/// operator is looking at. A press that carries no handle is refused rather
-/// than opened unowned — an unowned dialog may appear behind the window the
-/// operator is reading, with nothing to say why the key never answers.
-#[cfg(windows)]
-fn dialog_owner(owner: isize) -> Result<DialogOwner, String> {
-    if owner == 0 {
-        return Err(
-            "la fenêtre d'Orion est introuvable : la boîte de la clé n'aurait pas de propriétaire"
-                .to_string(),
-        );
-    }
-    Ok(DialogOwner::Window(owner))
-}
-
-/// Off Windows the only transport is raw CTAP, whose gesture is on the token
-/// and shows no dialog: the console is the honest owner, and nothing is
-/// claimed.
-#[cfg(not(windows))]
-fn dialog_owner(owner: isize) -> Result<DialogOwner, String> {
-    let _ = owner;
-    Ok(DialogOwner::Console)
-}
-
-fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
 
 /// One ceremony, and the revision counter that orders what it says.

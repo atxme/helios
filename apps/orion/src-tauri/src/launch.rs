@@ -120,9 +120,10 @@ pub fn spawn_ssh_terminal(_target: &str) -> Result<(), String> {
 /// Starts the fixed Astra companion, in its own console.
 ///
 /// Its only caller is the CA-TLS rotation (`astra.rs`) until lot 5. The
-/// arguments come from that rotation; the program does not. Keeping the executable literal at this boundary prevents a WebView or
-/// profile value from turning this into a general process launcher. The child
-/// is not waited for: Windows keeps no zombie.
+/// arguments come from that rotation; the program does not. Keeping the
+/// executable literal at this boundary prevents a WebView or profile value from
+/// turning this into a general process launcher. The child is not waited for:
+/// Windows keeps no zombie.
 #[cfg(windows)]
 pub fn spawn_astra_signer(arguments: &[String]) -> Result<(), String> {
     refuse_if_elevated()?;

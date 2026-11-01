@@ -43,6 +43,7 @@ use aether::certificates::operator_session::{
     GestureState, OperationKind, OperationLocator, OperatorAction, OperatorStatus, Refusal,
     RemoteState,
 };
+use aether_fido::authenticator::DialogOwner;
 use ceremony::Press;
 use serde::{Deserialize, Deserializer, Serialize};
 use tokio::sync::{watch, Mutex};
@@ -778,6 +779,39 @@ async fn awaited(status: &mut watch::Receiver<OperatorStatus>) -> Result<Operato
         .map_err(|_| NOT_ANSWERING.to_string())?
         .map_err(|_| STOPPED.to_string())?;
     Ok(status.borrow_and_update().clone())
+}
+
+/// The window the platform dialog belongs to, from the press that opened it.
+///
+/// Orion's own window: the press came from it, and it is the window the
+/// operator is looking at. A press that carries no handle is refused rather
+/// than opened unowned — an unowned dialog may appear behind the window the
+/// operator is reading, with nothing to say why the key never answers.
+#[cfg(windows)]
+pub(crate) fn dialog_owner(owner: isize) -> Result<DialogOwner, String> {
+    if owner == 0 {
+        return Err(
+            "la fenêtre d'Orion est introuvable : la boîte de la clé n'aurait pas de propriétaire"
+                .to_string(),
+        );
+    }
+    Ok(DialogOwner::Window(owner))
+}
+
+/// Off Windows the only transport is raw CTAP, whose gesture is on the token
+/// and shows no dialog: the console is the honest owner, and nothing is
+/// claimed.
+#[cfg(not(windows))]
+pub(crate) fn dialog_owner(owner: isize) -> Result<DialogOwner, String> {
+    let _ = owner;
+    Ok(DialogOwner::Console)
+}
+
+pub(crate) fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 #[cfg(test)]

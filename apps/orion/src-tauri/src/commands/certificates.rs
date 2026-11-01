@@ -3,7 +3,7 @@
 
 use super::*;
 
-use aether_fido::authenticator::{connect_owned, DialogOwner};
+use aether_fido::authenticator::connect_owned;
 use orion_core::certificate_approval::ApprovalError;
 use orion_engine::{
     ActionOutcome, EngineCommand, EngineReply, ProfileCertificates, RenewalProgress,
@@ -111,35 +111,6 @@ pub(crate) async fn certificate_approval_manifest(
     }
 }
 
-/// The owner of the WebAuthn dialog a key opens from this window.
-///
-/// Where the platform API shows a dialog, an unowned one may appear behind the
-/// window the operator is reading, so a missing handle is refused. Elsewhere
-/// the only transport is raw CTAP, which shows nothing.
-#[cfg(windows)]
-fn dialog_owner(window: &tauri::Window) -> Result<DialogOwner, String> {
-    match ceremonies::owner_window(window) {
-        0 => Err(
-            "la fenêtre d'Orion est introuvable : la boîte de la clé n'aurait pas de propriétaire"
-                .to_string(),
-        ),
-        handle => Ok(DialogOwner::Window(handle)),
-    }
-}
-
-#[cfg(not(windows))]
-fn dialog_owner(window: &tauri::Window) -> Result<DialogOwner, String> {
-    let _ = ceremonies::owner_window(window);
-    Ok(DialogOwner::Console)
-}
-
-fn unix_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs())
-        .unwrap_or(0)
-}
-
 /// Runs the key ceremony in this process and hands the assertion to the engine
 /// (spec §6.1).
 ///
@@ -155,7 +126,7 @@ pub(crate) async fn approve_certificate_renewal(
     name: String,
     pin: Option<String>,
 ) -> Result<RenewalProgress, String> {
-    let owner = dialog_owner(&window)?;
+    let owner = crate::operator::dialog_owner(ceremonies::owner_window(&window))?;
     let material = match state
         .client
         .call(EngineCommand::CertificateApprovalMaterial { name: name.clone() })
@@ -169,7 +140,7 @@ pub(crate) async fn approve_certificate_renewal(
         let key = connect_owned(orion_core::certificate_approval::transport(), owner)
             .map_err(|_| ApprovalError::NoAuthenticator.to_string())?;
         material
-            .approve(key.as_ref(), &pin, unix_now())
+            .approve(key.as_ref(), &pin, crate::operator::now_unix())
             .map_err(|error| error.to_string())
     })
     .await
@@ -198,7 +169,7 @@ pub(crate) async fn certificate_approval_needs_pin(
     name: String,
 ) -> Result<bool, String> {
     let _ = name;
-    let owner = dialog_owner(&window)?;
+    let owner = crate::operator::dialog_owner(ceremonies::owner_window(&window))?;
     tauri::async_runtime::spawn_blocking(move || {
         connect_owned(orion_core::certificate_approval::transport(), owner)
             .map(|key| key.needs_pin())
