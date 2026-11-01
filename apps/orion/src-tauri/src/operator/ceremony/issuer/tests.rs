@@ -459,6 +459,7 @@ fn refusals_of_the_delegation_are_named() {
         (IssuerRefusal::OriginRecorded, Refusal::ManifestMismatch),
         (IssuerRefusal::CaTlsMissing, Refusal::CaTlsMissing),
         (IssuerRefusal::CaTlsUnusable, Refusal::CaTlsUnusable),
+        (IssuerRefusal::Expired, Refusal::ManifestMismatch),
         (IssuerRefusal::PlanChanged, Refusal::DomainChanged),
         (
             IssuerRefusal::Vault("coffre illisible".into()),

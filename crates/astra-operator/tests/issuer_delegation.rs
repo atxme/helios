@@ -982,6 +982,26 @@ fn a_domain_without_its_credential_document_is_not_ready() {
 }
 
 #[test]
+fn an_unreadable_credential_document_is_a_vault_refusal() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = vault_path(&directory);
+    let (key1, key2) = (FakeKey::new(1), FakeKey::new(2));
+    let named = delegation(1);
+    let delegation = campaign_domain(&path, &key1, &key2, &named);
+    let plan = campaign_plan(&path, &delegation, &named);
+    // A directory where the document should be: present, but not readable.
+    let document = credentials::path_beside(&path);
+    std::fs::remove_file(&document).expect("document removed");
+    std::fs::create_dir(&document).expect("directory in its place");
+    refused_before_any_key(&path, &delegation, &plan, (&key1, &key2), NOW);
+    let error = delegation.ready(&path, &plan, NOW).expect_err("unreadable");
+    assert!(matches!(
+        error.downcast_ref::<IssuerRefusal>(),
+        Some(IssuerRefusal::Vault(_))
+    ));
+}
+
+#[test]
 fn an_expired_campaign_is_not_ready() {
     let directory = tempfile::tempdir().expect("tempdir");
     let path = vault_path(&directory);
@@ -1001,6 +1021,13 @@ fn an_expired_campaign_is_not_ready() {
     delegation.ready(&path, &plan, NOW).expect("open at NOW");
     // The signed request is still open; the campaign is not.
     refused_before_any_key(&path, &delegation, &plan, (&key1, &key2), NOW + 150);
+    let error = delegation
+        .ready(&path, &plan, NOW + 150)
+        .expect_err("expired");
+    assert_eq!(
+        error.downcast_ref::<IssuerRefusal>(),
+        Some(&IssuerRefusal::Expired)
+    );
 }
 
 #[test]
@@ -1022,6 +1049,13 @@ fn an_expired_signer_request_is_not_ready() {
     delegation.ready(&path, &plan, NOW).expect("open at NOW");
     // The campaign is still open; the request that carries it is not.
     refused_before_any_key(&path, &delegation, &plan, (&key1, &key2), NOW + 150);
+    let error = delegation
+        .ready(&path, &plan, NOW + 150)
+        .expect_err("expired");
+    assert_eq!(
+        error.downcast_ref::<IssuerRefusal>(),
+        Some(&IssuerRefusal::Expired)
+    );
 }
 
 #[test]

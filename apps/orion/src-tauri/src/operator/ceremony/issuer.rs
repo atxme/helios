@@ -78,6 +78,9 @@ fn refusal_of_plan(refusal: &IssuerRefusal) -> Refusal {
         // A campaign of another family, or a file for a domain that has a
         // campaign path: what was asked is not what this domain signs.
         IssuerRefusal::NotADelegation | IssuerRefusal::OriginRecorded => Refusal::ManifestMismatch,
+        // The signed request or the campaign ran out after the manifest was
+        // shown: what was shown can no longer be signed.
+        IssuerRefusal::Expired => Refusal::ManifestMismatch,
         IssuerRefusal::CaTlsMissing => Refusal::CaTlsMissing,
         IssuerRefusal::CaTlsUnusable => Refusal::CaTlsUnusable,
         // What would be signed is no longer what the window showed.
@@ -132,6 +135,16 @@ fn refusal_of_gesture(error: &anyhow::Error, prepared: bool) -> Refusal {
         return Refusal::Internal;
     }
     Refusal::KeyDeclined
+}
+
+/// Records the label of the key that answered, once.
+fn record_key(ceremony: &mut Ceremony, label: Option<String>) {
+    if let Some(label) = label {
+        ceremony.keys.push(KeySlotLabel {
+            slot: "1".to_string(),
+            label,
+        });
+    }
 }
 
 /// One delegation in progress: the ceremony, its presses and its publisher.
@@ -226,6 +239,7 @@ impl IssuerRun<'_> {
         // Published as they are reached: the deposit is a network call, and
         // the operator sees that the delegation was signed before it.
         let mut prepared = false;
+        let answered = std::cell::RefCell::new(None::<String>);
         let ceremony = &mut *self.ceremony;
         let publish = &mut *self.publish;
         // The PIN is empty for the reason `open_key` refused a transport that
@@ -236,21 +250,20 @@ impl IssuerRun<'_> {
             key.as_ref(),
             "",
             now_unix(),
+            // The key answered: a refusal later on still says which one.
+            &mut |label| *answered.borrow_mut() = Some(label.to_string()),
             &mut |state| {
                 prepared |= state == RemoteState::Prepared;
+                record_key(ceremony, answered.borrow_mut().take());
                 ceremony.remote = state;
                 publish(ceremony.status());
             },
         );
         drop(key);
+        // A refusal before the first progress report still names the key.
+        record_key(self.ceremony, answered.borrow_mut().take());
         match outcome {
-            Ok(label) => {
-                self.ceremony.keys.push(KeySlotLabel {
-                    slot: "1".to_string(),
-                    label,
-                });
-                self.done()
-            }
+            Ok(_) => self.done(),
             Err(error) => self.refuse(refusal_of_gesture(&error, prepared), format!("{error:#}")),
         }
     }

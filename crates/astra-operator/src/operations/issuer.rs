@@ -121,6 +121,11 @@ pub enum IssuerRefusal {
          recommencer le geste. Rien n'a été signé."
     )]
     PlanChanged,
+    #[error(
+        "la demande signée de cette campagne, ou la campagne elle-même, a expiré : l'autorité \
+         n'accepterait plus son résultat. Rien n'a été signé."
+    )]
+    Expired,
     #[error("coffre ou relais de domaine illisible : {0}")]
     Vault(String),
 }
@@ -342,6 +347,11 @@ impl CampaignDelegation {
 
     /// [`Self::sign_in_campaign`], then the deposit of the approval and the
     /// delegation on the origin. Returns the label of the key that approved.
+    ///
+    /// `approved` receives that label as soon as the key has approved, before
+    /// the vault opens and long before the deposit: a failure after the press
+    /// still says which key answered.
+    #[allow(clippy::too_many_arguments)]
     pub fn approve_and_sign(
         self,
         vault_path: &Path,
@@ -349,9 +359,10 @@ impl CampaignDelegation {
         key: &dyn Authenticator,
         pin: &str,
         now_unix: u64,
+        approved: &mut dyn FnMut(&str),
         progress: &mut dyn FnMut(RemoteState),
     ) -> Result<String> {
-        let signed = self.sign_in_campaign(vault_path, plan, key, pin, now_unix)?;
+        let signed = self.sign_with_approval(vault_path, plan, key, pin, now_unix, approved)?;
         progress(RemoteState::Prepared);
 
         let mut result = super::campaign_result(&signed.approval, Vec::new(), None);
@@ -382,6 +393,20 @@ impl CampaignDelegation {
         pin: &str,
         now_unix: u64,
     ) -> Result<SignedInCampaign> {
+        self.sign_with_approval(vault_path, plan, key, pin, now_unix, &mut |_| {})
+    }
+
+    /// [`Self::sign_in_campaign`], reporting the approving key's label to
+    /// `approved` the moment its assertion is accepted.
+    fn sign_with_approval(
+        &self,
+        vault_path: &Path,
+        plan: &IssuerPlan,
+        key: &dyn Authenticator,
+        pin: &str,
+        now_unix: u64,
+        approved: &mut dyn FnMut(&str),
+    ) -> Result<SignedInCampaign> {
         let domain = settle_again(vault_path, plan, Some(&*self.campaign), now_unix)?;
         let (mut session, offered) = self.approval_session(vault_path, &domain, now_unix)?;
 
@@ -393,6 +418,9 @@ impl CampaignDelegation {
         )?;
         let approving_credential_id = assertion.credential_id.clone();
         session.accept(assertion, now_unix)?;
+        if let Ok(slot) = domain.vault.slot_for_credential(&approving_credential_id) {
+            approved(&slot.label);
+        }
         let approval = session.finish(now_unix)?;
 
         let opened =
@@ -428,11 +456,8 @@ impl CampaignDelegation {
         domain: &Domain,
         now_unix: u64,
     ) -> Result<(signing::CampaignApprovalSession, Vec<Vec<u8>>)> {
-        if now_unix >= self.request_expires_at {
-            bail!(
-                "la demande signée de cette campagne a expiré : l'autorité n'accepterait plus \
-                 son résultat. Rien n'a été signé."
-            );
+        if now_unix >= self.request_expires_at || now_unix >= self.campaign.expires_at {
+            return Err(IssuerRefusal::Expired.into());
         }
         if self.campaign.required_credentials != 1 {
             bail!(
@@ -441,8 +466,9 @@ impl CampaignDelegation {
                 self.campaign.required_credentials
             );
         }
-        let registry =
-            credentials::load(&credentials::path_beside(vault_path))?.ok_or_else(|| {
+        let registry = credentials::load(&credentials::path_beside(vault_path))
+            .map_err(|error| IssuerRefusal::Vault(format!("{error:#}")))?
+            .ok_or_else(|| {
                 anyhow::anyhow!(
                     "aucun document de credentials à côté du coffre : sans lui, aucune \
                      approbation ne peut être rattachée à une clé enrôlée"
