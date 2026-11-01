@@ -69,7 +69,7 @@ pub(crate) async fn begin_operator_ceremony(
 /// It is the owner of the WebAuthn dialog a key opens, so that dialog appears
 /// over the window the operator is looking at. Read on every advance: a press
 /// that opens no dialog carries it unused.
-fn owner_window(window: &tauri::Window) -> isize {
+pub(crate) fn owner_window(window: &tauri::Window) -> isize {
     #[cfg(target_os = "windows")]
     {
         window.hwnd().map(|handle| handle.0 as isize).unwrap_or(0)

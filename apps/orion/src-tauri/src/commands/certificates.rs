@@ -3,9 +3,13 @@
 
 use super::*;
 
+use aether_fido::authenticator::{connect_owned, DialogOwner};
+use orion_core::certificate_approval::ApprovalError;
 use orion_engine::{
-    ActionOutcome, EngineCommand, EngineReply, ProfileCertificates, RenewalProgress, SecretInput,
+    ActionOutcome, EngineCommand, EngineReply, ProfileCertificates, RenewalProgress,
+    SubmittedApproval,
 };
+use zeroize::Zeroizing;
 
 /// The four certificates a connection depends on, with their dates.
 ///
@@ -89,34 +93,6 @@ pub(crate) async fn resume_certificate_recovery(
     }
 }
 
-/// Launches the companion for the operation held by one renewal session.
-///
-/// Only the profile name crosses IPC. The arguments come from the session the
-/// engine owns, and the executable is fixed in `companion`, so the WebView
-/// cannot turn this permission into a shell or retarget an approval to another
-/// operation.
-#[tauri::command]
-pub(crate) async fn launch_certificate_companion(
-    state: State<'_, AppState>,
-    name: String,
-) -> Result<(), String> {
-    let arguments = match state
-        .client
-        .call(EngineCommand::CompanionArguments { name })
-        .await?
-    {
-        EngineReply::CompanionArguments(value) => value,
-        _ => return Err(unexpected_engine_reply()),
-    };
-    companion::launch(&arguments)
-}
-
-pub(crate) fn companion_plugin<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
-    tauri::plugin::Builder::new("companion")
-        .invoke_handler(tauri::generate_handler![launch_certificate_companion])
-        .build()
-}
-
 /// Reads the approval request the open renewal is waiting on (§8.1.2 step 4a).
 ///
 /// The engine verifies it against what the profile pins before it comes back.
@@ -135,21 +111,74 @@ pub(crate) async fn certificate_approval_manifest(
     }
 }
 
-/// Runs the ceremony and posts the assertion (§8.1.2 step 4b).
+/// The owner of the WebAuthn dialog a key opens from this window.
 ///
-/// The engine runs the ceremony on a blocking thread and consumes the verified
-/// request. The PIN crosses IPC once, here, and goes straight to the engine.
+/// Where the platform API shows a dialog, an unowned one may appear behind the
+/// window the operator is reading, so a missing handle is refused. Elsewhere
+/// the only transport is raw CTAP, which shows nothing.
+#[cfg(windows)]
+fn dialog_owner(window: &tauri::Window) -> Result<DialogOwner, String> {
+    match ceremonies::owner_window(window) {
+        0 => Err(
+            "la fenêtre d'Orion est introuvable : la boîte de la clé n'aurait pas de propriétaire"
+                .to_string(),
+        ),
+        handle => Ok(DialogOwner::Window(handle)),
+    }
+}
+
+#[cfg(not(windows))]
+fn dialog_owner(window: &tauri::Window) -> Result<DialogOwner, String> {
+    let _ = ceremonies::owner_window(window);
+    Ok(DialogOwner::Console)
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
+}
+
+/// Runs the key ceremony in this process and hands the assertion to the engine
+/// (spec §6.1).
+///
+/// The engine gives back public material only. The key is opened here, over
+/// this window, on a blocking thread, and the PIN never leaves this process:
+/// it is neither logged nor sent to the engine. The engine consumes the
+/// verified request only when the assertion is submitted, so a failed attempt
+/// can be retried.
 #[tauri::command]
 pub(crate) async fn approve_certificate_renewal(
+    window: tauri::Window,
     state: State<'_, AppState>,
     name: String,
     pin: Option<String>,
 ) -> Result<RenewalProgress, String> {
+    let owner = dialog_owner(&window)?;
+    let material = match state
+        .client
+        .call(EngineCommand::CertificateApprovalMaterial { name: name.clone() })
+        .await?
+    {
+        EngineReply::ApprovalMaterial(value) => value,
+        _ => return Err(unexpected_engine_reply()),
+    };
+    let pin = Zeroizing::new(pin.unwrap_or_default());
+    let approval = tauri::async_runtime::spawn_blocking(move || {
+        let key = connect_owned(orion_core::certificate_approval::transport(), owner)
+            .map_err(|_| ApprovalError::NoAuthenticator.to_string())?;
+        material
+            .approve(key.as_ref(), &pin, unix_now())
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|_| "la cérémonie de la clé s'est interrompue".to_string())??;
     match state
         .client
-        .call(EngineCommand::ApproveCertificateRenewal {
+        .call(EngineCommand::SubmitCertificateApproval {
             name,
-            pin: pin.map(SecretInput::from),
+            approval: SubmittedApproval::new(approval),
         })
         .await?
     {
@@ -165,17 +194,18 @@ pub(crate) async fn approve_certificate_renewal(
 /// asking the user for a secret Orion has no use for.
 #[tauri::command]
 pub(crate) async fn certificate_approval_needs_pin(
-    state: State<'_, AppState>,
+    window: tauri::Window,
     name: String,
 ) -> Result<bool, String> {
-    match state
-        .client
-        .call(EngineCommand::CertificateApprovalNeedsPin { name })
-        .await?
-    {
-        EngineReply::Flag(value) => Ok(value),
-        _ => Err(unexpected_engine_reply()),
-    }
+    let _ = name;
+    let owner = dialog_owner(&window)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        connect_owned(orion_core::certificate_approval::transport(), owner)
+            .map(|key| key.needs_pin())
+            .map_err(|_| ApprovalError::NoAuthenticator.to_string())
+    })
+    .await
+    .map_err(|_| "la cérémonie de la clé s'est interrompue".to_string())?
 }
 
 /// The last certificate action that failed on this profile, if any.

@@ -338,10 +338,25 @@ fn tauri_capabilities_stay_minimal() {
     assert_eq!(capabilities["windows"], serde_json::json!(["main"]));
     assert_eq!(
         capabilities["permissions"],
-        serde_json::json!([
-            "core:default",
-            "companion:allow-launch-certificate-companion"
-        ])
+        serde_json::json!(["core:default"])
+    );
+}
+
+#[test]
+fn no_capability_launches_the_renewal_companion() {
+    let capabilities = include_str!("../capabilities/default.json");
+    assert!(
+        !capabilities.contains("companion"),
+        "no capability may grant the companion"
+    );
+    let main = include_str!("main.rs");
+    assert!(
+        !main.contains(&format!("{}_{}", "launch_certificate", "companion")),
+        "the invoke handler must not register a companion launch"
+    );
+    assert!(
+        !main.contains(&format!("{}_{}", "companion", "plugin")),
+        "the companion plugin must not be installed"
     );
 }
 

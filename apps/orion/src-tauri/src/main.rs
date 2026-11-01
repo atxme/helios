@@ -83,9 +83,9 @@ mod ui_access;
 /// while the UI's own token is elevated; only that check is Windows-specific.
 mod launch;
 
-/// Process launch is isolated behind a one-command Tauri plugin and a fixed
-/// executable. Keeping it out of the application invoke handler makes the ACL
-/// visible and prevents this shell from acquiring a generic process right.
+/// Fixed launcher of `astra-signer`. Its only caller is the CA-TLS rotation in
+/// `astra`, until lot 5 brings that rotation into Orion; renewal approval no
+/// longer uses it.
 mod companion;
 
 /// Notification-area menu. Its model and labels are portable and tested
@@ -680,7 +680,6 @@ fn main() {
                 tracing::warn!(%error, "unable to reveal Orion from the secondary instance");
             }
         }))
-        .plugin(companion_plugin())
         .setup(move |app| {
             #[cfg(not(windows))]
             let (client, events) = match tauri::async_runtime::block_on(
