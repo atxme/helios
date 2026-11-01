@@ -591,11 +591,7 @@ impl EngineService {
         let in_flight = renewals
             .get(&name)
             .ok_or_else(|| NO_OPEN_RENEWAL.to_string())?;
-        in_flight
-            .approval
-            .as_ref()
-            .map(VerifiedApproval::material)
-            .ok_or_else(|| READ_THE_REQUEST_FIRST.to_string())
+        read_verified(&in_flight.approval, VerifiedApproval::material)
     }
 
     /// Checks the approval the interface process obtained, then posts it
@@ -606,6 +602,10 @@ impl EngineService {
     /// it is accepted the verified request is **consumed**, so a second
     /// deposit is refused rather than posted against a window the authority
     /// has since closed. The approval is never logged.
+    ///
+    /// A `submit_approval` that fails after the request was taken consumes it
+    /// too: that is fail-closed, one approval per verification, so the
+    /// interface must re-read the request before it can try again.
     pub async fn submit_certificate_approval(
         &self,
         name: String,
@@ -629,6 +629,14 @@ impl EngineService {
 
 const NO_OPEN_RENEWAL: &str = "aucun renouvellement ouvert pour ce profil";
 const READ_THE_REQUEST_FIRST: &str = "lire d'abord la demande d'approbation : c'est elle qui est vérifiée, et ce qui est signé est ce qui a été montré";
+
+/// Reads the verified request without emptying its slot, so the same request
+/// can be read as often as the interface needs until an approval is deposited.
+fn read_verified<V, T>(slot: &Option<V>, read: impl FnOnce(&V) -> T) -> Result<T, String> {
+    slot.as_ref()
+        .map(read)
+        .ok_or_else(|| READ_THE_REQUEST_FIRST.to_string())
+}
 
 /// Takes the verified request out of its slot once `accepts` agrees with the
 /// approval; a refusal, or an empty slot, leaves the slot as it was.

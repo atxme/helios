@@ -1,6 +1,6 @@
 //! The authorization policy, checked against the enum itself.
 
-use super::{EngineCommand, EngineReply, ProfileDraft, SecretInput};
+use super::{EngineCommand, EngineReply, ProfileDraft, SecretInput, SubmittedApproval};
 use crate::view::{
     AboutView, ActionOutcome, ConfigView, ImportOutcome, InvitationPreviewView,
     KeyNegotiationSupport, ProfileCertificates, ProfileView, RenewalProgress,
@@ -256,7 +256,7 @@ fn every_command() -> Vec<EngineCommand> {
         },
         EngineCommand::SubmitCertificateApproval {
             name: "poste".into(),
-            approval: Box::new(approval_fixture()),
+            approval: SubmittedApproval::new(approval_fixture()),
         },
         EngineCommand::LastCertificateError {
             name: "poste".into(),
@@ -588,7 +588,7 @@ fn the_approval_commands_round_trip() {
         },
         EngineCommand::SubmitCertificateApproval {
             name: "poste".into(),
-            approval: Box::new(approval_fixture()),
+            approval: SubmittedApproval::new(approval_fixture()),
         },
     ] {
         let json = serde_json::to_string(&command).expect("a command serialises");
@@ -607,4 +607,21 @@ fn the_retired_approval_commands_no_longer_deserialise() {
     ] {
         assert!(serde_json::from_value::<EngineCommand>(retired).is_err());
     }
+}
+
+#[test]
+fn a_submitted_approval_never_shows_in_debug() {
+    let approval = approval_fixture();
+    let command = EngineCommand::SubmitCertificateApproval {
+        name: "poste".into(),
+        approval: SubmittedApproval::new(approval.clone()),
+    };
+    let rendered = format!("{command:?}");
+    // The fixture must carry what the assertions below look for.
+    let plain = format!("{approval:?}");
+    assert!(plain.contains(&format!("{:?}", approval.assertion_fingerprint)));
+    assert!(!rendered.contains(&format!("{:?}", approval.assertion_fingerprint)));
+    assert!(!rendered.contains(&format!("{:?}", approval.request_fingerprint)));
+    assert!(!rendered.contains("webauthn_assertion"));
+    assert!(!rendered.contains("authenticator_data"));
 }

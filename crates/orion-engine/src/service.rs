@@ -647,7 +647,7 @@ impl Engine for EngineService {
                 .await
                 .map(|material| EngineReply::ApprovalMaterial(Box::new(material))),
             EngineCommand::SubmitCertificateApproval { name, approval } => self
-                .submit_certificate_approval(name, *approval)
+                .submit_certificate_approval(name, approval.into_inner())
                 .await
                 .map(EngineReply::RenewalProgress),
         }

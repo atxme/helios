@@ -22,6 +22,31 @@ use crate::view::{
     KeyNegotiationSupport, ProfileCertificates, RenewalProgress,
 };
 
+/// The assertion the interface process hands back, on its way to the engine.
+///
+/// Transparent on the wire, but its `Debug` output is masked: the assertion is
+/// never logged, and a derived `Debug` on [`EngineCommand`] must not be the
+/// way it would end up in a log.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SubmittedApproval(Box<AstraRenewalApproval>);
+
+impl SubmittedApproval {
+    pub fn new(approval: AstraRenewalApproval) -> Self {
+        Self(Box::new(approval))
+    }
+
+    pub fn into_inner(self) -> AstraRenewalApproval {
+        *self.0
+    }
+}
+
+impl fmt::Debug for SubmittedApproval {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SubmittedApproval(…)")
+    }
+}
+
 /// A secret on its way from the UI to the engine.
 ///
 /// The only type through which a secret enters the engine. Its `Debug` output
@@ -208,7 +233,7 @@ pub enum EngineCommand {
     },
     SubmitCertificateApproval {
         name: String,
-        approval: Box<AstraRenewalApproval>,
+        approval: SubmittedApproval,
     },
     LastCertificateError {
         name: String,

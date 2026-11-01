@@ -17,7 +17,7 @@ pub mod session;
 pub mod view;
 pub mod wire;
 
-pub use command::{EngineCommand, EngineReply, ProfileDraft, SecretInput};
+pub use command::{EngineCommand, EngineReply, ProfileDraft, SecretInput, SubmittedApproval};
 pub use view::{
     AboutView, ActionOutcome, ConfigView, ImportOutcome, InvitationPreviewView,
     KeyNegotiationSupport, ProfileCertificates, ProfileView, RenewalProgress,
