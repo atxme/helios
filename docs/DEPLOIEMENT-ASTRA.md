@@ -170,15 +170,13 @@ combien de temps elle est expirée, puis demande le toucher. Rien n'est saisi �
 l'origine de l'autorité, le RP ID et les durées viennent du relais de domaine
 épinglé à côté du coffre.
 
-**Si la clé est sur un autre poste**, Orion affiche la ligne à y exécuter :
-
-```sh
-astra-signer recover --authority-url https://astra.exemple \
-  --operation-id <identifiant>
-```
-
-L'adaptateur en ligne de commande subsiste pour ce cas, et pour le transport
-hors ligne du §8.5. Il exécute exactement la même cérémonie que l'onglet.
+**Si la clé est sur un autre poste**, Orion affiche l'identifiant d'opération
+et le chemin : sur le poste de l'opérateur, Astra › Approbations › « Approuver
+une récupération », avec cet identifiant. Ce second Orion approuve sans achever
+la récupération ; le poste expiré reprend de son côté. L'adaptateur
+`astra-signer recover --authority-url … --operation-id …` subsiste, à titre
+transitoire, pour le transport hors ligne du §8.5 ; il exécute la même
+cérémonie.
 
 Une seule clé suffit, et §7.5 dit pourquoi : elle n'est pas la seule preuve —
 la clé privée de la dernière génération admise signe aussi la demande, et une
@@ -634,7 +632,9 @@ ssh <gateway> "cd ~/astra-build && sudo docker compose -f deploy/astra/compose.y
     > delegation-request.json
 
 # 2. sur le poste opérateur, clé branchée : CA-TLS d'abord si le domaine n'en
-#    a pas encore, puis la délégation elle-même. Le compagnon récupère la
+#    a pas encore, puis la délégation elle-même. Orion sait la signer (Astra >
+#    Approbations, campagne `issuer_delegation`) ; la commande ci-dessous reste
+#    livrée, à titre transitoire, jusqu'au lot 7. Le signataire récupère la
 #    campagne, compare la demande à la matière qu'elle épingle, et redépose la
 #    délégation signée.
 astra-signer issue-ca-tls

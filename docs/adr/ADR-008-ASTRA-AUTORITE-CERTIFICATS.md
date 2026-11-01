@@ -477,7 +477,9 @@ chemin ; une politique plus stricte peut en exiger deux, jamais zéro.
 Orion et la console Helios exposent une surface « Certificats ». Les deux IHM
 créent une campagne Astra, lancent le compagnon `astra-signer` et vérifient
 ensuite les objets signés ; elles ne manipulent pas elles-mêmes une YubiKey et
-ne font pas confiance à un simple callback de navigateur.
+ne font pas confiance à un simple callback de navigateur. (Pour Orion, l'amendement
+du 31 octobre 2026 ci-dessous remplace le compagnon par une cérémonie dans
+l'IHM non élevée.)
 
 Orion expose :
 
@@ -575,6 +577,95 @@ par fichiers (la demande de la gateway en entrée, la feuille PQ en sortie), ave
 deux clés distinctes, sans route nouvelle sur la gateway. Les mentions de
 `astra-signer` plus haut dans cet ADR décrivent l'outil tel qu'il reste
 jusque-là.
+
+#### Amendement du 31 octobre 2026 : les approbations se jouent dans Orion (F14, lot 4)
+
+Orion n'envoie plus l'opérateur vers `astra-signer` pour approuver. Les mêmes
+invariants valent : le moteur élevé n'ouvre pas le coffre et ne parle à aucune
+clé ; la WebView ne choisit pas ce qui est signé ; rien n'est signé avant que le
+manifeste ait été montré, ni sur un autre objet que celui montré.
+
+- **Approbation ordinaire d'un renouvellement.** La cérémonie WebAuthn/FIDO2 se
+  joue dans l'IHM non élevée, dialogue rattaché à la fenêtre d'Orion
+  (`DialogOwner::Window`), parce que l'API WebAuthn de Windows ne répond qu'à un
+  processus d'intégrité moyenne dans la session de l'utilisateur. Le moteur garde
+  la session de renouvellement, la lecture et la vérification de la demande dans
+  le tunnel, le jeton de dépôt et le dépôt. Il remet à l'IHM un matériel
+  d'approbation composé d'objets publics (la demande signée par Astra, le
+  registre de credentials, l'identité du domaine, la clé de service et son
+  époque, `CA-PQ` public, le RP ID épinglé, la génération active), et seulement
+  pour une demande qu'il a vérifiée. L'IHM exécute `aether_fido::approve_renewal`,
+  qui revérifie tout avant de parler à la clé, puis rend l'assertion au moteur ;
+  celui-ci contrôle qu'elle porte l'identifiant d'opération et l'empreinte de la
+  demande vérifiée, consomme cette demande (une approbation par vérification) et
+  la dépose. Elle n'est consommée qu'à ce dépôt : tant qu'il n'a pas eu lieu, un
+  échec de la clé se réessaie sans relire la demande ; un dépôt qui échoue la
+  consomme, et l'opérateur relit la demande. Le PIN ne traverse plus l'IPC : le
+  protocole moteur passe à la version 2 (`PROTOCOL_VERSION`) et la variante qui
+  le portait disparaît de cette commande. Une opération ordinaire appartient au
+  pair qui l'a ouverte (§8.1.2) : la clé de l'opérateur se branche sur ce poste,
+  et aucune commande à recopier n'existe plus.
+- **Plus de compagnon de renouvellement.** Le plugin Tauri `companion`, le
+  lancement automatique, la ligne de commande de repli et la commande moteur qui
+  les fournissait sont retirés. Il ne reste d'appelant à `astra-signer` que la
+  rotation CA-TLS (écran *Rotations*), qui garde ce chemin jusqu'au lot 5.
+- **Récupération approuvée depuis un autre poste.** L'onglet *Approbations* ouvre
+  la cérémonie de récupération à partir de l'identifiant d'opération saisi sur
+  le poste de l'opérateur (les récupérations ne sont pas énumérables). L'origine
+  d'Astra vient du relais, jamais d'un champ. Le poste expiré n'affiche plus de
+  commande `astra-signer recover`, mais l'identifiant et le chemin dans Orion.
+  Une récupération ne s'achève localement (`resume_certificate_recovery`) que si
+  cet Orion l'a ouverte depuis l'écran *Certificats* : l'IHM mémorise
+  l'identifiant d'opération qu'elle a ouvert et ne finalise que si la cérémonie
+  porte le même ; par défaut, la récupération est « pas locale », et un
+  rechargement complet de l'IHM perd la mémoire et échoue fermé.
+- **Délégation de l'émetteur d'Astra** (`authorize-issuer`, cérémonie
+  `AuthorizeIssuer`). En campagne (portée `issuer_delegation`, chemin ordinaire),
+  l'opérateur fournit le fichier de demande de `astra issuer request` (texte
+  seul, 256 Kio au plus, aucun chemin ne passe à Rust). La cérémonie lit le coffre
+  et le relais, récupère et vérifie la campagne contre le relais, décode la
+  demande et vérifie que la campagne la couvre (époque, clé PQ,
+  `SubjectPublicKeyInfo`), tout cela **avant toute clé**. Les refus prévisibles
+  sont tous vérifiés avant la clé, y compris les contrôles de disponibilité de la
+  campagne (`CampaignDelegation::ready`, côté `astra-operator`), même quand
+  l'IHM désactive le bouton. Une seule clé : l'ouverture du coffre est restreinte
+  au credential qui vient d'approuver la campagne, si bien qu'une autre clé
+  présentée au second dialogue donne `KeyDeclined`. Le résultat (approbation et
+  autorisation) est déposé sur l'origine ; Astra redémarre ensuite pour émettre
+  sous la délégation. Durées : délégation de 30 jours, leaf de 90 jours au plus,
+  ramenée au plafond de la politique épinglée avant la clé ; la valeur ramenée est
+  celle qui est affichée puis signée.
+- **Délégation hors campagne** (dernier recours). Elle n'est offerte que si le
+  relais ne nomme aucune origine Astra ; sinon la cérémonie refuse
+  `ManifestMismatch` avant le choix de clé. La demande ne porte aucune signature :
+  rien ne rattache ce fichier à Astra, il vaut ce que vaut son transport. Aucun
+  dépôt ; Orion remet `issuer-authorization.json`, à installer sur l'hôte d'Astra
+  par `astra issuer install`.
+- **`IssuerManifest` étendu** (contrat partagé) : `maximum_leaf_lifetime_secs`, les empreintes de la clé PQ et du
+  `SubjectPublicKeyInfo` de la demande, et un champ facultatif `campaign` (le
+  `CampaignManifest`, absent hors campagne). L'opérateur voit ainsi tout ce que
+  la clé signe. `request_fingerprint` est le SHA-256 du réencodage JSON compact
+  de la demande de délégation analysée, pas de ses octets bruts : deux fichiers
+  qui ne diffèrent que par la mise en forme portent la même empreinte.
+- **Refus nouveaux** (classe fermée `Refusal`, phrase française dans l'IHM) :
+  `DelegationRequestInvalid`, `DelegationRequestMismatch`, `CaTlsUnusable`
+  (CA-TLS expirée, trop proche de son expiration pour la durée de la délégation,
+  ou qui n'est pas une autorité ; contrôlée avant la clé, car la phrase de
+  `CaTlsMissing` serait fausse) et `DomainChanged` (le plan a changé entre
+  l'affichage et la signature).
+- **`approve-campaign` hors ligne n'est pas porté.** Aucun composant du dépôt ne
+  lit un fichier `CampaignApproval` (ni `astra`, ni `heliosd`, ni Orion) ; le
+  porter produirait un fichier que rien n'installe. La récupération n'a pas de
+  mode hors ligne : elle exige un aller-retour avec l'autorité.
+- **Reste sur `astra-signer`** : la rotation CA-TLS jusqu'au lot 5 ; les campagnes
+  d'ancre, de révocation, d'identité de gateway et d'amorçage (lots 5 et 6b) sont
+  listées dans *Approbations* comme « pas encore disponibles ». `astra-signer`
+  disparaît au lot 7.
+
+Ce que le dialogue WebAuthn rattaché à la fenêtre produit sous Windows, une
+récupération approuvée depuis un second poste et une délégation suivie du
+redémarrage d'Astra ne se vérifient pas dans le dépôt : à valider en recette
+(MANUAL-TESTING, « E. Lot 4 »).
 
 ### 8. Avortement, leases et atomicité logique
 

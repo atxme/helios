@@ -442,6 +442,38 @@ exige une révocation explicite. Le mode assisté (`--with-private-key`) et
 la gateway n'avait jamais admise ; le second choisissait un rôle à une admission
 qui n'a plus lieu.
 
+## Approbations depuis Orion (F14, lot 4)
+
+Orion approuve lui-même ; ni compagnon de renouvellement ni commande à recopier.
+Tout le parcours est **à valider en recette sous Windows** (MANUAL-TESTING,
+« E. Lot 4 »). Le raisonnement et les invariants sont dans l'amendement du
+31 octobre 2026 de [ADR-008](../adr/ADR-008-ASTRA-AUTORITE-CERTIFICATS.md).
+
+* **Renouvellement ordinaire.** Écran *Certificats* : la demande se lit toute
+  seule, « Approuver avec la clé » joue l'assertion dans l'IHM non élevée, dialogue
+  rattaché à la fenêtre. La clé de l'opérateur se branche **sur le poste qui a
+  ouvert l'opération** (aucun autre poste ne peut l'approuver). Le PIN ne
+  traverse plus l'IPC vers le moteur. Une clé absente, un geste annulé ou un PIN
+  faux se réessaient sans relire ; un dépôt qui échoue consomme la demande, et
+  l'opérateur la relit.
+* **Récupération d'une identité expirée.** Sur le poste de l'opérateur : Astra ›
+  Approbations › « Approuver une récupération », avec l'identifiant d'opération
+  affiché par le poste expiré. Cet Orion n'achève pas la récupération (il ne
+  l'a pas ouverte depuis *Certificats*) ; le poste expiré reprend de son côté.
+* **Délégation de l'émetteur d'Astra.** Astra › Approbations. En campagne
+  (`issuer_delegation`) : fichier de demande de `astra issuer request`, une seule
+  clé, dépôt sur l'origine, puis redémarrage d'Astra. Hors campagne, dernier
+  recours : seulement si le relais ne nomme aucune origine Astra ; avertissement
+  « Rien ne rattache ce fichier à Astra… », aucun dépôt, `issuer-authorization.json`
+  à installer sur l'hôte d'Astra par `astra issuer install`. Une CA-TLS expirée,
+  trop proche de l'expiration ou qui n'est pas une autorité est refusée avant la
+  clé.
+* **Hors périmètre.** La rotation CA-TLS reste sur `astra-signer` jusqu'au
+  lot 5. `approve-campaign` hors ligne n'est pas porté : aucun composant du dépôt
+  ne lit un fichier `CampaignApproval`. Les campagnes d'ancre, de révocation,
+  d'identité de gateway et d'amorçage restent « pas encore disponibles » dans
+  *Approbations* (lots 5 et 6b). `astra-signer` disparaît au lot 7.
+
 ## Ce que cet outillage ne fait pas
 
 * Il ne construit ni ne signe de release — c'est le poste éditeur.

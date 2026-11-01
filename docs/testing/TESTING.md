@@ -1023,9 +1023,9 @@ dernier effet exige la gateway réelle.
   `<identité>-next` et sa promotion à l’activation : les deux passent par
   `ProtectedIdentityStore`, donc par DPAPI. Un renouvellement complet est donc
   une recette cible : Orion sous Windows, tunnel monté, gateway avec Astra
-  déployé, et `astra-signer approve --heliosd-url … --operation-id …` lancé sur
-  la même machine avec la clé branchée. Le transport du compagnon, lui,
-  s’éprouve hors matériel contre une gateway factice
+  déployé, et l'approbation jouée dans Orion lui-même (« Approuver avec la clé »,
+  F14 lot 4, MANUAL-TESTING « E. Lot 4 ») sur la même machine avec la clé
+  branchée. Le transport de `astra-signer`, lui, s’éprouve hors matériel contre une gateway factice
   (`tools/astra-signer/tests/tunnel.rs`). **Ce que cette recette doit vérifier
   en dernier**, et qui est l’acceptation réelle du renouvellement : que le
   client **rouvre le tunnel après l’activation**. Tout le reste peut réussir et

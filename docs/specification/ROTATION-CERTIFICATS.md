@@ -1665,10 +1665,11 @@ credentials du §13.1. `AstraRotationCampaign::validate` le refuse : avant le
 premier registre il n'existe ni campagne en ligne, ni état sortant à figer, ni
 clé de service capable de signer `AstraSignerRequest`.
 
-Astra signe ensuite `AstraSignerRequest` de §2.4. Pour un profil actif, Orion
-ouvre le compagnon avec `heliosd_url` et `operation_id`; la requête et le
-résultat suivent le relais de §8.1.2. Une récupération ou une console opérateur
-hors tunnel emploie `authority_url`. Le compagnon récupère lui-même la requête
+Astra signe ensuite `AstraSignerRequest` de §2.4. Pour un profil actif, la
+requête et le résultat suivent le relais de §8.1.2 ; Orion n'ouvre plus de
+compagnon pour l'approuver : sa cérémonie tourne dans l'IHM non élevée (§12.2).
+Une récupération ou une console opérateur hors tunnel emploie `authority_url`.
+`astra-signer` (le compagnon des cérémonies qui n'ont pas encore migré) récupère lui-même la requête
 et le manifeste, vérifie leurs signatures et affiche au minimum le scope, le
 nombre de cibles, les empreintes actives, les générations et les autorités
 touchées. Pour une simple opération déléguée, il renvoie l'assertion FIDO liée
@@ -2844,28 +2845,34 @@ l'époque et qu'elle n'est plus disponible dès que la transition a pu être
 distribuée.
 
 Chaque renouvellement, planifié ou manuel, crée une opération ; chaque action
-globale crée une campagne. L'approbation a deux chemins, et l'IHM les offre
-tous les deux. Quand la clé de sécurité est sur le poste, **Orion mène la
-cérémonie lui-même** : il lit d'abord le manifeste vérifié — pair, générations
+globale crée une campagne. Pour un renouvellement ordinaire, **Orion mène la
+cérémonie lui-même**, sur le poste où la clé de sécurité est branchée : il lit
+d'abord le manifeste vérifié — pair, générations
 active et demandée, empreinte de la demande, échéance, nombre de credentials
 du domaine habilités à répondre — puis exécute l'unique `GetAssertion` et
 dépose l'assertion. L'ordre est la garantie, pas une commodité : ce qui est
 signé est ce qui a été montré, et la cérémonie est refusée tant que le
-manifeste n'a pas été lu. Quand la clé est ailleurs, ou que la politique du
-poste refuse à Orion l'accès au transport, l'IHM lance `astra-signer` avec
-`heliosd_url` et `operation_id`; hors tunnel elle emploie l'origine Astra. Le
-compagnon dialogue alors directement avec la YubiKey et affiche le même
-manifeste ; l'IHM ignore un callback non signé, interroge l'état, vérifie le
-résultat sous la clé de service Astra puis vérifie chaque objet sous sa propre
-autorité. Le
+manifeste n'a pas été lu. Depuis le lot 4 de F14, cette cérémonie se joue dans
+l'IHM non élevée, pas dans le moteur élevé : le moteur vérifie la demande dans le
+tunnel et en remet le matériel public à l'IHM, qui revérifie tout, joue
+l'assertion avec un dialogue rattaché à sa fenêtre, puis rend l'approbation au
+moteur ; celui-ci la confronte à la demande vérifiée et la dépose. Le PIN ne
+quitte pas l'IHM (protocole moteur en version 2). Aucun compagnon n'est lancé. Une
+opération ordinaire appartenant au pair qui l'a ouverte (§8.1.2), la clé de
+l'opérateur se branche sur ce poste ; l'écran n'affiche plus de commande à
+recopier. Pour une récupération, l'onglet *Approbations* d'Orion, sur le poste de
+l'opérateur, ouvre la cérémonie à partir de l'identifiant d'opération. L'IHM
+ignore un callback non signé, interroge l'état, vérifie le résultat sous la clé de
+service Astra puis vérifie chaque objet sous sa propre autorité. Le
 libellé montre avant approbation le nombre de cibles, les générations et si une
 CA sera tournée. Aucune action globale n'est placée derrière un bouton au
 libellé ambigu « Renouveler ».
 
 Les actions d'autorité de cette console — rotation des autorités, annulation
 d'une transition préparée, rollback gateway — sont des campagnes opérateur et
-suivent §8.5 : le compagnon est lancé avec `heliosd_url` et `operation_id`, et
-l'origine publique n'est proposée que si aucun tunnel n'existe. La console
+suivent §8.5 : `astra-signer` (transitoire, jusqu'au lot 7 de F14) est lancé avec
+`heliosd_url` et `operation_id`, et l'origine publique n'est proposée que si
+aucun tunnel n'existe. La console
 n'offre pas de bascule automatique entre les deux.
 
 ### 12.3 État de l'implémentation au 30 août 2026
@@ -3098,8 +3105,18 @@ contournés :
   `SubjectPublicKeyInfo` dont la PKCS#10 prouve la possession — la même valeur
   se dérive de la demande avant la signature et de l'intermédiaire après elle.
   Une demande de délégation ne porte aucune signature ; hors campagne, le
-  compagnon signe donc le fichier qu'on lui présente, et cette forme survit
-  pour un domaine sans origine joignable, en le disant. Réinstaller la même
+  signataire signe donc le fichier qu'on lui présente, et cette forme survit
+  pour un domaine sans origine joignable, en le disant. **Orion signe désormais
+  cette délégation** (F14 lot 4, cérémonie `AuthorizeIssuer`) : en campagne, sur
+  la même matière exacte, avec une seule clé (l'ouverture du coffre est
+  restreinte au credential qui a approuvé la campagne) ; hors campagne,
+  seulement quand le relais ne nomme aucune origine Astra, avec l'avertissement
+  que rien ne rattache le fichier à Astra, et sans dépôt (Orion remet
+  `issuer-authorization.json` pour `astra issuer install`). `request_fingerprint`
+  est le SHA-256 du réencodage JSON compact de la demande analysée. Une CA-TLS
+  expirée, trop proche de son expiration ou qui n'est pas une autorité est un
+  refus propre (`CaTlsUnusable`), contrôlé avant la clé ; `approve-campaign` hors
+  ligne n'est pas porté dans Orion (aucun composant ne lit un `CampaignApproval`). Réinstaller la même
   délégation est un rejeu du §8.2, pas un retour en arrière : seule une
   délégation *différente* à une époque dépensée est refusée ;
 - la **production** des transactions de transition, pour les objets qu'aucune
@@ -3206,8 +3223,10 @@ contournés :
   le pair que le registre enregistre déjà, consomme le challenge, et ouvre une
   opération de récupération dans un **troisième** magasin — un identifiant de
   récupération ne doit jamais se résoudre là où un renouvellement ordinaire
-  s'autorise. `astra-signer recover --authority-url … --operation-id …` lit la
-  demande, l'affiche, prend l'assertion de l'opérateur, la **vérifie avant**
+  s'autorise. La cérémonie de récupération (`astra-signer recover --authority-url
+  … --operation-id …`, ou l'onglet *Approbations* d'Orion depuis le lot 4 de F14,
+  qui n'enchaîne sur la finalisation locale que si cet Orion a ouvert la
+  récupération depuis *Certificats*) lit la demande, l'affiche, prend l'assertion de l'opérateur, la **vérifie avant**
   d'employer la sortie PRF de la même session pour ouvrir le coffre, émet les
   deux feuilles sous `CA-TLS` et `CA-PQ`, signe l'autorisation de staging sous
   `IssuerKind::Master`, la dépose ; Astra la relaie par le veth, récupère le

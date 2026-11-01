@@ -882,6 +882,72 @@ d'amorçage de gateway (`gateway-bootstrap-request.json`, rapatrié par
     disponible ; le manifeste n'annonce ni CA-TLS ni document de credentials ; deux
     dialogues ; seule la feuille est réécrite.
 
+**E. Lot 4 : approbations dans Orion**
+
+Rien de ce qui suit n'a été constaté sous Windows : le dialogue WebAuthn rattaché
+à la fenêtre d'Orion, la récupération depuis un second poste et la délégation
+suivie du redémarrage d'Astra sont **non vérifiables sous WSL2 et à jouer sur
+Windows**. Tout est **à valider en recette**. Prérequis : un domaine d'essai avec
+Astra déployé sur une gateway d'essai (jamais le domaine réel), un poste client
+Orion connecté, un second poste Orion pour l'opérateur, et au moins une YubiKey
+enrôlée dans le coffre d'essai.
+
+30. **Renouvellement approuvé depuis *Certificats*.** Sur le poste client, ouvrir
+    *Certificats* : « Renouveler maintenant ». Attendu : la demande s'affiche
+    d'elle-même (pair, génération, empreinte, expiration, nombre de clés
+    éligibles), sans bouton « Lire la demande d'approbation », sans compagnon
+    lancé, sans ligne de commande ni champ PIN. Brancher la clé, « Approuver avec
+    la clé » : le dialogue Windows s'ouvre **au-dessus de la fenêtre d'Orion**
+    (et non derrière, ni dans une autre session). Le PIN est demandé par ce
+    dialogue seulement. Le poste committe et la génération avance.
+31. **Échec puis nouvel essai.** Relancer un renouvellement, puis : présenter une
+    clé absente, annuler le dialogue, saisir un faux PIN. Attendu à chaque fois :
+    un refus lisible, le bouton redevient actif, **sans** « Relire la demande » ;
+    réessayer est un clic. Laisser ensuite la demande expirer : « Relire la
+    demande » apparaît. Couper le tunnel entre l'assertion et le dépôt : le dépôt
+    échoue, la demande est consommée, l'opérateur la relit (comportement à
+    consigner).
+32. **Récupération approuvée depuis un second poste.** Sur le poste client, laisser
+    sa feuille expirer, puis « Récupérer le certificat expiré » : l'identifiant
+    d'opération s'affiche avec « Sur le poste de l'opérateur : Astra ›
+    Approbations › « Approuver une récupération »… », **aucune commande
+    `astra-signer`**. Sur le second poste (celui de l'opérateur), onglet *Astra* ›
+    *Approbations* › « Approuver une récupération » : saisir l'identifiant
+    (espaces de bord et majuscules acceptés ; « Ouvrir la cérémonie » reste grisé
+    sur une valeur qui n'a pas 32 caractères hexadécimaux), puis un toucher.
+    Attendu : « Récupération approuvée. Le poste concerné reprend de son côté. »,
+    **sans** finalisation locale sur le poste de l'opérateur. Relancer ensuite
+    « Récupérer le certificat expiré » sur le poste client : il installe sa
+    nouvelle génération. Un identifiant inconnu ou expiré : refus sans toucher.
+    Variante : ouvrir la récupération depuis *Certificats* du poste de
+    l'opérateur lui-même (« Approuver ici avec la clé ») : cette fois la
+    finalisation locale s'enchaîne. Recharger l'IHM en pleine cérémonie fait
+    perdre ce lien : la finalisation ne s'enchaîne pas (échec fermé).
+33. **Délégation en campagne, puis redémarrage d'Astra.** Sur la gateway d'essai,
+    `astra issuer request --reason … --requested-by …` (conserver la demande et
+    l'identifiant d'opération). Sur le poste de l'opérateur, *Approbations* : la
+    campagne `issuer_delegation` est ouvrable (les autres portées d'ancre, de
+    révocation, de gateway et d'amorçage restent « pas encore disponible »).
+    « Ouvrir la cérémonie » demande le fichier de demande. Attendu : manifeste
+    complet (domaine, époque, validité, durée de leaf, empreintes de la clé PQ et
+    du `SubjectPublicKeyInfo`, campagne avec motif et demandeur), puis **une seule
+    clé** : deux dialogues Windows, et une autre clé présentée au second est
+    refusée (`KeyDeclined`). Fin : « Délégation enregistrée par Astra. Redémarrer
+    Astra pour qu'il émette sous elle. » Redémarrer Astra et constater qu'il émet
+    sous la nouvelle délégation. Refus à constater **sans aucun dialogue** : une
+    demande modifiée (« La campagne ne nomme pas cette demande… »), un fichier
+    illisible, une CA-TLS expirée ou proche de l'expiration (« La CA-TLS du
+    domaine expire avant la fin de cette délégation… »), une campagne d'une autre
+    famille.
+34. **Délégation hors campagne, domaine sans origine.** Sur un coffre d'essai dont
+    le relais ne nomme aucune origine Astra : le bloc « Signer une délégation sans
+    campagne… » est offert, avec l'avertissement « Rien ne rattache ce fichier à
+    Astra : il vaut ce que vaut son transport. » avant le choix du fichier. La
+    cérémonie ne dépose rien et remet `issuer-authorization.json`, avec la
+    consigne `astra issuer install --authorization <fichier>` à jouer sur l'hôte
+    d'Astra. Sur un domaine dont le relais **nomme** une origine, le bloc dit
+    qu'une délégation passe par une campagne et ne propose pas le bouton.
+
 ### Le chemin manuel
 
 Dans un autre terminal, générer deux identités de test :

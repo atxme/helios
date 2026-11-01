@@ -27,20 +27,21 @@ Tout le reste ci-dessous est une action délibérée.
 
 Le cas courant. Rien à faire côté gateway.
 
-**Sur le poste**, dans Orion, destination *Certificats* : « Renouveler
-maintenant ». Orion affiche un identifiant d'opération et la ligne de commande
-exacte du compagnon.
+Dans Orion, destination *Certificats* : « Renouveler maintenant ». Orion ouvre
+l'opération, lit et affiche tout seul la demande (pair, génération, empreinte,
+expiration, nombre de clés éligibles), puis propose « Approuver avec la clé ».
+**Brancher la clé de sécurité d'un opérateur sur ce même poste** : l'opération
+appartient au poste qui l'a ouverte, aucun autre ne peut la lire ni y déposer
+d'approbation. Le dialogue de la clé s'ouvre au-dessus de la fenêtre d'Orion ;
+Orion n'a plus de champ PIN et ne l'envoie jamais au moteur. Le poste
+committe ensuite. Il n'y a plus de compagnon ni de commande à recopier.
 
-**Sur le poste de l'opérateur**, avec la clé de sécurité :
-
-```sh
-astra-signer approve --heliosd-url https://<gateway-dans-le-tunnel> \
-  --operation-id <identifiant>
-```
-
-Puis, dans Orion, cliquer une seconde fois sur « Renouveler maintenant » : la
-session reprend et committe. Un second clic ne rouvre jamais une deuxième
-opération — c'est ce que la session en mémoire garantit.
+Si la clé est absente, si le geste est annulé ou si le PIN est faux, un nouvel
+essai est un clic, sans relire la demande. « Relire la demande » n'apparaît que
+si la demande a expiré, ou si le dépôt de l'approbation a échoué : un dépôt qui
+échoue consomme la demande vérifiée. Un second clic sur « Renouveler maintenant »
+ne rouvre jamais une deuxième opération — c'est ce que la session en mémoire
+garantit.
 
 Pour avancer **tous** les profils Helios de l'appareil d'un pas :
 « Renouveler tous les profils Helios de cet appareil ». Chaque profil garde sa
@@ -157,18 +158,20 @@ La demande sort sur la sortie standard et dans le fichier ; l'identifiant
 d'opération s'affiche sur l'erreur standard, avec la commande à recopier. Les
 deux clés privées naissent dans le volume d'Astra et n'en sortent pas.
 
-**Sur le poste de l'opérateur**, clé branchée :
+**Sur le poste de l'opérateur**, dans Orion : onglet Astra › Approbations, la
+campagne `issuer_delegation` › « Ouvrir la cérémonie », puis choisir le fichier
+`issuer-request.json` (256 Kio au plus). Délégation de 30 jours, leaf de 90 jours
+au plus, ramenée au plafond de la politique épinglée avant la clé ; une seule clé,
+qui approuve la campagne puis ouvre le coffre. Avant de la demander, Orion refuse
+une CA-TLS expirée, trop proche de son expiration ou qui n'est pas une autorité
+(« la renouveler d'abord »), et une demande que la campagne ne nomme pas.
+`astra-signer authorize-issuer` reste livré à titre transitoire, jusqu'au lot 7.
 
-```sh
-astra-signer authorize-issuer --request issuer-request.json \
-  --authority-url https://astra.example --operation-id <identifiant> \
-  --days 30 --leaf-days 90
-```
-
-Le compagnon vérifie la campagne sous la clé de service qu'il épingle déjà,
+Orion vérifie la campagne sous la clé de service qu'il épingle déjà,
 compare la demande à ce que la campagne nomme — l'époque, la clé ML-DSA-87 et
 la clé publique dont la PKCS#10 prouve la possession —, affiche le tout, prend
-l'assertion, signe et **redépose** la délégation. Astra l'enregistre après
+l'assertion, signe et **redépose** la délégation (« Délégation enregistrée par
+Astra. Redémarrer Astra pour qu'il émette sous elle. »). Astra l'enregistre après
 avoir prouvé que les deux moitiés privées scellées dans son volume
 correspondent. Il reste à le redémarrer pour qu'il émette dessous.
 
@@ -181,19 +184,20 @@ déjà employée avec une *autre* délégation ferait revenir un intermédiaire
 retiré sous une signature encore parfaitement valide. Redéposer la **même**
 délégation est un rejeu sans effet, ce qui répare une réponse perdue.
 
-**Hors campagne**, pour un domaine dont l'origine publique n'est pas
-joignable :
+**Hors campagne**, pour un domaine dont le relais ne nomme aucune origine Astra :
 
 ```sh
 astra issuer request --out issuer-request.json
-astra-signer authorize-issuer --request issuer-request.json \
-  --out issuer-authorization.json --days 30 --leaf-days 90
+# dans Orion : Approbations › « Signer une délégation sans campagne… »,
+# choisir issuer-request.json, enregistrer issuer-authorization.json
 astra issuer install --authorization issuer-authorization.json
 ```
 
-Une demande de délégation ne porte **aucune signature**. Par ce chemin, le
-compagnon signe donc le fichier qu'on lui présente, et rien ne le rattache à
-cette autorité : c'est la forme de repli, pas la forme ordinaire.
+Orion n'offre ce bouton que sans origine Astra dans le relais ; sinon le passage
+par une campagne s'impose. Une demande de délégation ne porte **aucune
+signature**. Par ce chemin, Orion signe donc le fichier qu'on lui présente, et
+rien ne le rattache à cette autorité (« il vaut ce que vaut son transport ») :
+c'est la forme de repli, pas la forme ordinaire.
 
 ## 5. Récupérer une identité expirée (§7.5)
 
@@ -208,15 +212,14 @@ l'opérateur — l'identifiant se lit à voix haute, se copie dans un message, p
 importe : il n'autorise rien à lui seul.
 
 **Sur le poste de l'opérateur**, si c'est le même poste, la ligne « Approuver
-ici avec la clé » ouvre la cérémonie dans l'onglet Astra. Sinon, l'adaptateur
-en ligne de commande fait la même chose :
+ici avec la clé » ouvre la cérémonie dans l'onglet Astra. Sinon, dans l'Orion de
+l'opérateur : onglet Astra › Approbations › « Approuver une récupération »,
+saisir l'identifiant d'opération (32 caractères hexadécimaux), « Ouvrir la
+cérémonie ». Cet Orion approuve sans finaliser : « Récupération approuvée. Le
+poste concerné reprend de son côté. » Seul l'Orion qui a ouvert la récupération
+depuis *Certificats* l'achève localement.
 
-```sh
-astra-signer recover --authority-url https://astra.exemple \
-  --operation-id <identifiant>
-```
-
-L'un comme l'autre affichent le pair, la génération et depuis combien de temps
+La cérémonie affiche le pair, la génération et depuis combien de temps
 elle est expirée, **avant** de demander le toucher. Les durées ne sont plus
 demandées : une génération récupérée vit un an et ne recouvre qu'un jour —
 l'ancienne a déjà expiré, il n'y a rien à recouvrir. Puis, dans Orion, cliquer une
