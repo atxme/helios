@@ -10,12 +10,14 @@ mod support;
 
 use std::path::{Path, PathBuf};
 
+use aether::certificates::encoding::MlDsa87Signature;
 use aether::certificates::encoding::{
     generate_ml_dsa_87_keypair, Fingerprint, Id16, MlDsa87PublicKey, TrustDomainId, WireGuardKey,
 };
 use aether::certificates::operator_session::CampaignManifest;
 use aether::certificates::status::{
-    AstraRotationCampaign, CampaignScope, CampaignTarget, CertificateKind,
+    AstraRotationCampaign, AstraSignerRequest, AstraSignerResult, CampaignScope, CampaignTarget,
+    CertificateKind,
 };
 use aether::certificates::x509::certification_request_public_key_info;
 use aether::certificates::CERTIFICATE_FORMAT_VERSION;
@@ -26,14 +28,15 @@ use astra_operator::authenticator::{
 };
 use astra_operator::gestures::{self, NewAuthority, NewKey};
 use astra_operator::operations::issuer::{
-    self, IssuerRefusal, DELEGATION_DAYS, LEAF_DAYS, MAX_DELEGATION_REQUEST_BYTES,
+    self, CampaignDelegation, IssuerRefusal, DELEGATION_DAYS, LEAF_DAYS,
+    MAX_DELEGATION_REQUEST_BYTES,
 };
 use astra_operator::signing::IssuerDelegationRequest;
 use astra_operator::vault::SlotRole;
 use astra_operator::vault_gestures::{add_key_with, create_first_key, finalize_with};
-use astra_operator::{handoff, store};
+use astra_operator::{handoff, origin, signing, store};
 use base64::Engine as _;
-use support::{FakeKey, PIN, RP_ID};
+use support::{FakeKey, ORIGIN, PIN, RP_ID};
 
 const NOW: u64 = 1_800_000_000;
 const DAY: u64 = 86_400;
@@ -370,6 +373,14 @@ fn a_campaign_of_another_family_is_refused() {
         issuer::plan(&path, &json(&named.request), Some(&campaign), NOW).err(),
         Some(IssuerRefusal::NotADelegation)
     );
+
+    // The family decides before the request's own domain is compared.
+    let mut foreign = named.request.clone();
+    foreign.trust_domain_id = TrustDomainId::new([0x33; 16]).expect("domain").to_hex();
+    assert_eq!(
+        issuer::plan(&path, &json(&foreign), Some(&campaign), NOW).err(),
+        Some(IssuerRefusal::NotADelegation)
+    );
 }
 
 #[test]
@@ -489,4 +500,414 @@ fn only_the_approving_credential_can_open_the_vault() {
         gestures::open_with_credential(&key1, &vault, &approving, PIN).expect("the approving key");
     assert_eq!(opened.credential_id, approving);
     gestures::prove_anchors_open(&vault, &opened).expect("and it opens the anchors");
+}
+
+#[test]
+fn a_ca_tls_that_ends_inside_the_window_is_refused_before_any_key() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = vault_path(&directory);
+    let (key1, key2) = (FakeKey::new(1), FakeKey::new(2));
+    let first = domain_with_two_keys(&path, &key1, &key2);
+    set_origin(&path, None);
+
+    // A CA-TLS that ends ten days in: the delegation would outlive it.
+    let relay_path = handoff::path_beside(&path);
+    let mut relay = handoff::load(&relay_path).expect("relay");
+    let identity = handoff::identity_of(&relay).expect("identity");
+    let vault = store::load(&path).expect("vault");
+    let ca_tls = signing::issue_ca_tls(&vault, &first, &identity, NOW, NOW + 10 * DAY)
+        .expect("short CA-TLS");
+    relay.ca_tls_epoch = Some(identity.ca_tls_epoch);
+    relay.ca_tls_certificate = Some(ca_tls.to_base64());
+    handoff::save(&relay_path, &relay).expect("relay saved");
+
+    let presses = (key1.assertions(), key2.assertions());
+    assert_eq!(
+        issuer::plan(&path, &json(&delegation(1).request), None, NOW).err(),
+        Some(IssuerRefusal::CaTlsUnusable)
+    );
+    assert_eq!((key1.assertions(), key2.assertions()), presses);
+}
+
+#[test]
+fn a_plan_the_domain_no_longer_produces_is_refused() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = vault_path(&directory);
+    let (key1, key2) = (FakeKey::new(1), FakeKey::new(2));
+    finished_domain(&path, &key1, &key2);
+    set_origin(&path, None);
+    let plan = issuer::plan(&path, &json(&delegation(1).request), None, NOW).expect("planned");
+    let vault = store::load(&path).expect("vault");
+    let opened = gestures::open_with_authorized_key(&key1, &vault, PIN).expect("opens");
+
+    // Settled for a later instant than the signature.
+    let error = issuer::sign_offline(&path, &plan, &opened, NOW - 1).expect_err("refused");
+    assert_eq!(
+        error.downcast_ref::<IssuerRefusal>(),
+        Some(&IssuerRefusal::PlanChanged)
+    );
+
+    // The gateway's server name moved: the pinned policy, and so the plan,
+    // moved with it, and every check still passes on its own.
+    let relay_path = handoff::path_beside(&path);
+    let mut relay = handoff::load(&relay_path).expect("relay");
+    relay.server_name = Some("other.helios.test".into());
+    handoff::save(&relay_path, &relay).expect("relay saved");
+    assert!(issuer::plan(&path, &json(&plan.request), None, NOW).is_ok());
+    let error = issuer::sign_offline(&path, &plan, &opened, NOW).expect_err("refused");
+    assert_eq!(
+        error.downcast_ref::<IssuerRefusal>(),
+        Some(&IssuerRefusal::PlanChanged)
+    );
+}
+
+// --- In a campaign -----------------------------------------------------------
+
+/// Pins a service key on the relay, as `astra-signer domain` does, and
+/// returns its private half.
+fn pin_service_key(path: &Path) -> zeroize::Zeroizing<Vec<u8>> {
+    let (private, public) = generate_ml_dsa_87_keypair().expect("service key");
+    let relay_path = handoff::path_beside(path);
+    let mut relay = handoff::load(&relay_path).expect("relay");
+    relay.astra_service_public_key = Some(public.to_base64());
+    relay.astra_service_key_epoch = Some(1);
+    handoff::save(&relay_path, &relay).expect("relay saved");
+    private
+}
+
+/// What the origin serves for `campaign`, signed by `service_key`.
+fn campaign_request(
+    path: &Path,
+    campaign: &AstraRotationCampaign,
+    service_key: &[u8],
+) -> origin::CampaignRequest {
+    let authority_url = handoff::load(&handoff::path_beside(path))
+        .expect("relay")
+        .astra_authority_url
+        .expect("the relay pins an origin");
+    let operation_id = Id16::new([0x0B; 16]).expect("operation");
+    let signer_request = AstraSignerRequest {
+        format_version: CERTIFICATE_FORMAT_VERSION,
+        operation_id,
+        campaign_fingerprint: campaign.fingerprint(),
+        authority_url,
+        encrypted_vault_fingerprint: Fingerprint::of(b"vault"),
+        required_credentials: campaign.required_credentials,
+        created_at: NOW,
+        expires_at: NOW + 300,
+        astra_service_key_epoch: 1,
+        astra_signature: MlDsa87Signature::placeholder(),
+    }
+    .sign(service_key)
+    .expect("signed request");
+    origin::CampaignRequest {
+        operation_id,
+        signer_request: Box::new(signer_request),
+        campaign: Box::new(campaign.clone()),
+        webauthn_rp_id: RP_ID.into(),
+        webauthn_origin: ORIGIN.into(),
+        result_token: "submit".into(),
+        vault_token: None,
+    }
+}
+
+/// A finished domain whose relay pins an origin and a service key, and the
+/// verified campaign naming `named`.
+fn campaign_domain(
+    path: &Path,
+    key1: &FakeKey,
+    key2: &FakeKey,
+    named: &Delegation,
+) -> CampaignDelegation {
+    finished_domain(path, key1, key2);
+    let service_key = pin_service_key(path);
+    let campaign = campaign_for(named, CampaignScope::IssuerDelegation);
+    CampaignDelegation::from_request(path, campaign_request(path, &campaign, &service_key), NOW)
+        .expect("a verified delegation campaign")
+}
+
+/// Approves with one token and answers the vault's derivation with another:
+/// the key swap two platform dialogs allow.
+struct Swapped<'a> {
+    approves: &'a FakeKey,
+    opens: &'a FakeKey,
+}
+
+impl Authenticator for Swapped<'_> {
+    fn register(
+        &self,
+        rp_id: &str,
+        subject: &CredentialSubject,
+        exclude: &[Vec<u8>],
+        pin: &str,
+    ) -> Result<Registration, AuthenticatorError> {
+        self.opens.register(rp_id, subject, exclude, pin)
+    }
+
+    fn derive(
+        &self,
+        rp_id: &str,
+        credentials: &[Vec<u8>],
+        salt: &[u8; 32],
+        pin: &str,
+    ) -> Result<Opened, AuthenticatorError> {
+        self.opens.derive(rp_id, credentials, salt, pin)
+    }
+
+    fn approve(
+        &self,
+        rp_id: &str,
+        credentials: &[Vec<u8>],
+        client_data_json: &[u8],
+        pin: &str,
+    ) -> Result<Approval, AuthenticatorError> {
+        self.approves
+            .approve(rp_id, credentials, client_data_json, pin)
+    }
+
+    fn approve_and_derive(
+        &self,
+        _rp_id: &str,
+        _credentials: &[Vec<u8>],
+        _client_data_json: &[u8],
+        _salt: &[u8; 32],
+        _pin: &str,
+    ) -> Result<ApprovedOpening, AuthenticatorError> {
+        Err(AuthenticatorError::Device("not used here".into()))
+    }
+}
+
+#[test]
+fn a_campaign_request_is_verified_before_it_is_kept() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = vault_path(&directory);
+    let (key1, key2) = (FakeKey::new(1), FakeKey::new(2));
+    finished_domain(&path, &key1, &key2);
+    let service_key = pin_service_key(&path);
+    let named = delegation(1);
+    let campaign = campaign_for(&named, CampaignScope::IssuerDelegation);
+
+    let kept = CampaignDelegation::from_request(
+        &path,
+        campaign_request(&path, &campaign, &service_key),
+        NOW,
+    )
+    .expect("verified");
+    assert_eq!(kept.campaign(), &campaign);
+
+    // Another campaign under the request signed for this one.
+    let mut served = campaign_request(&path, &campaign, &service_key);
+    served.campaign.reason = "autre motif".into();
+    assert!(CampaignDelegation::from_request(&path, served, NOW).is_err());
+
+    // Signed by a key the relay does not pin.
+    let (stranger, _) = generate_ml_dsa_87_keypair().expect("other key");
+    assert!(CampaignDelegation::from_request(
+        &path,
+        campaign_request(&path, &campaign, &stranger),
+        NOW
+    )
+    .is_err());
+
+    // Properly signed, of another family.
+    let profile = campaign_for(&named, CampaignScope::OrionProfile);
+    let error = CampaignDelegation::from_request(
+        &path,
+        campaign_request(&path, &profile, &service_key),
+        NOW,
+    )
+    .err()
+    .expect("refused");
+    assert_eq!(
+        error.downcast_ref::<IssuerRefusal>(),
+        Some(&IssuerRefusal::NotADelegation)
+    );
+}
+
+#[test]
+fn a_campaign_delegation_is_approved_and_signed_with_one_key() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = vault_path(&directory);
+    let (key1, key2) = (FakeKey::new(1), FakeKey::new(2));
+    let named = delegation(1);
+    let delegation = campaign_domain(&path, &key1, &key2, &named);
+    let plan = issuer::plan(
+        &path,
+        &json(&named.request),
+        Some(delegation.campaign()),
+        NOW,
+    )
+    .expect("planned");
+    let presses = key1.assertions();
+
+    let (approval, authorization) = delegation
+        .sign_in_campaign(&path, &plan, &key1, PIN, NOW)
+        .expect("approved and signed");
+    assert_eq!(key1.assertions(), presses + 2, "one approval, one opening");
+    assert_eq!(approval.approvals.len(), 1);
+    assert_eq!(
+        approval.approvals[0].credential_id,
+        key1.credential_ids().remove(0)
+    );
+    assert_eq!(authorization.not_after, plan.manifest.not_after);
+
+    let relay = handoff::load(&handoff::path_beside(&path)).expect("relay");
+    let identity = handoff::identity_of(&relay).expect("identity");
+    authorization
+        .verify(
+            &MlDsa87PublicKey::parse(&relay.ca_pq_public_key).expect("anchor"),
+            &identity.trust_domain_id,
+            identity.ca_epoch,
+            identity.ca_tls_epoch,
+            &identity.gateway_wg_public_key,
+            &identity.server_name,
+            NOW,
+        )
+        .expect("the delegation verifies under the relay's CA-PQ");
+    // What Astra checks on deposit: the approval is for this campaign, and
+    // the delegation is for the material it names.
+    AstraSignerResult {
+        format_version: CERTIFICATE_FORMAT_VERSION,
+        approval: Box::new(approval),
+        objects: Vec::new(),
+        credential_registry: None,
+        issuer_authorization: Some(Box::new(authorization)),
+    }
+    .validate(delegation.campaign())
+    .expect("the result the campaign accepts");
+}
+
+#[test]
+fn a_second_key_cannot_open_what_the_first_approved() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = vault_path(&directory);
+    let (key1, key2) = (FakeKey::new(1), FakeKey::new(2));
+    let named = delegation(1);
+    let delegation = campaign_domain(&path, &key1, &key2, &named);
+    let plan = issuer::plan(
+        &path,
+        &json(&named.request),
+        Some(delegation.campaign()),
+        NOW,
+    )
+    .expect("planned");
+    let opening_presses = key1.assertions();
+
+    let swapped = Swapped {
+        approves: &key2,
+        opens: &key1,
+    };
+    assert!(delegation
+        .sign_in_campaign(&path, &plan, &swapped, PIN, NOW)
+        .is_err());
+    assert_eq!(
+        key1.assertions(),
+        opening_presses,
+        "the other key holds nothing the restricted opening may answer for"
+    );
+}
+
+#[test]
+fn a_plan_for_another_campaign_is_refused_in_the_campaign() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = vault_path(&directory);
+    let (key1, key2) = (FakeKey::new(1), FakeKey::new(2));
+    let named = delegation(1);
+    let delegation = campaign_domain(&path, &key1, &key2, &named);
+
+    // A plan settled against another campaign naming the same material.
+    let mut other = delegation.campaign().clone();
+    other.reason = "autre motif".into();
+    let foreign = issuer::plan(&path, &json(&named.request), Some(&other), NOW).expect("planned");
+    let presses = key1.assertions();
+    let error = delegation
+        .sign_in_campaign(&path, &foreign, &key1, PIN, NOW)
+        .expect_err("refused");
+    assert_eq!(
+        error.downcast_ref::<IssuerRefusal>(),
+        Some(&IssuerRefusal::PlanChanged)
+    );
+    assert_eq!(key1.assertions(), presses, "before any key");
+}
+
+#[test]
+fn a_campaign_asking_for_two_credentials_is_refused_before_any_key() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = vault_path(&directory);
+    let (key1, key2) = (FakeKey::new(1), FakeKey::new(2));
+    finished_domain(&path, &key1, &key2);
+    let service_key = pin_service_key(&path);
+    let named = delegation(1);
+    let mut campaign = campaign_for(&named, CampaignScope::IssuerDelegation);
+    campaign.required_credentials = 2;
+    let delegation = CampaignDelegation::from_request(
+        &path,
+        campaign_request(&path, &campaign, &service_key),
+        NOW,
+    )
+    .expect("verified");
+    let plan = issuer::plan(
+        &path,
+        &json(&named.request),
+        Some(delegation.campaign()),
+        NOW,
+    )
+    .expect("planned");
+
+    let presses = (key1.assertions(), key2.assertions());
+    assert!(delegation
+        .sign_in_campaign(&path, &plan, &key1, PIN, NOW)
+        .is_err());
+    assert_eq!((key1.assertions(), key2.assertions()), presses);
+}
+
+#[test]
+fn a_credential_without_a_slot_is_not_offered() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = vault_path(&directory);
+    let (key1, key2, key3) = (FakeKey::new(1), FakeKey::new(2), FakeKey::new(3));
+    let first = domain_with_two_keys(&path, &key1, &key2);
+    let two_slots = std::fs::read(&path).expect("vault bytes");
+    add_key_with(
+        &path,
+        &first,
+        &key3,
+        &NewKey {
+            label: "YubiKey du coffre-fort".into(),
+            role: SlotRole::Recovery,
+        },
+        PIN,
+        NOW,
+    )
+    .expect("third key");
+    // The document describes three keys; the vault is put back to two.
+    finalize_with(&path, &first, NOW).expect("finished");
+    std::fs::write(&path, two_slots).expect("vault restored");
+
+    let service_key = pin_service_key(&path);
+    let named = delegation(1);
+    let campaign = campaign_for(&named, CampaignScope::IssuerDelegation);
+    let delegation = CampaignDelegation::from_request(
+        &path,
+        campaign_request(&path, &campaign, &service_key),
+        NOW,
+    )
+    .expect("verified");
+    let plan = issuer::plan(
+        &path,
+        &json(&named.request),
+        Some(delegation.campaign()),
+        NOW,
+    )
+    .expect("planned");
+
+    let presses = key3.assertions();
+    assert!(delegation
+        .sign_in_campaign(&path, &plan, &key3, PIN, NOW)
+        .is_err());
+    assert_eq!(
+        key3.assertions(),
+        presses,
+        "a key the vault cannot open for is not asked to approve"
+    );
 }

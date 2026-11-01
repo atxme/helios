@@ -3,16 +3,24 @@
 //! # Plan, then gesture
 //!
 //! [`plan`] reads the domain and the delegation request and refuses, as an
-//! [`IssuerRefusal`], everything predictable — a domain without `CA-TLS`, a
-//! file that is not a request, a campaign of another family or that does not
-//! name this request, an offline delegation for a domain that has an origin —
-//! before any key is asked anything. It settles the bounds, the leaf lifetime
+//! [`IssuerRefusal`], everything predictable — a domain without a `CA-TLS`
+//! able to back the whole delegation window, a file that is not a request, a
+//! campaign of another family or that does not name this request, an offline
+//! delegation for a domain that has an origin — before any key is asked
+//! anything. It settles the bounds, the leaf lifetime
 //! already capped by the pinned policy, and the [`IssuerManifest`] the
 //! operator reads: the value shown is the value signed.
 //!
 //! The gesture settles the plan again from the domain as it is when the key
-//! is pressed, and refuses one that moved. A plan is engine state, not proof:
-//! the interface disabling a button guarantees nothing.
+//! is pressed, and refuses one that moved ([`IssuerRefusal::PlanChanged`]). A
+//! plan is engine state, not proof: the interface disabling a button
+//! guarantees nothing.
+//!
+//! The manifest's `request_fingerprint` is the SHA-256 of the compact JSON
+//! re-encoding of the parsed request, fields in declaration order — not the
+//! hash of the file as read, which `settle_again` could not reproduce from
+//! the plan. The values that bind what is certified are the two key
+//! fingerprints beside it.
 //!
 //! # Two paths, and why the campaign is the ordinary one
 //!
@@ -31,15 +39,16 @@
 //! Every [`Opened`] handled here is secret: none is logged, serialized nor
 //! shown.
 //!
-//! # Où sont les tests
+//! # Where the tests are
 //!
-//! `tests/issuer_delegation.rs` exerce le plan, la signature hors campagne et
-//! l'ouverture restreinte contre des clés simulées. Le chemin réseau
-//! ([`CampaignDelegation::begin`] et le dépôt) n'a pas de test d'intégration,
-//! comme [`super::campaign`] : il n'assemble que des entrées déjà vérifiées
-//! ailleurs — la campagne par [`handoff::verify_campaign_request`],
-//! l'assertion par [`signing::CampaignApprovalSession`], la délégation par
-//! [`signing::authorize_issuer`], tous éprouvés dans `tests/signing.rs`.
+//! `tests/issuer_delegation.rs` exercises the plan, the offline signature,
+//! the campaign verification ([`CampaignDelegation::from_request`]), the
+//! one-key approval and restricted opening
+//! ([`CampaignDelegation::sign_in_campaign`]) against simulated keys. What
+//! remains untested is the network itself — [`CampaignDelegation::begin`]'s
+//! fetch and the deposit in [`CampaignDelegation::approve_and_sign`] — as in
+//! [`super::campaign`]: both only carry values verified by the functions
+//! above.
 
 use std::path::Path;
 
@@ -49,7 +58,7 @@ use aether::certificates::encoding::{
     DerCertificate, Fingerprint, Id16, MlDsa87PublicKey, TrustDomainId,
 };
 use aether::certificates::operator_session::{CampaignManifest, IssuerManifest, RemoteState};
-use aether::certificates::status::{AstraRotationCampaign, CampaignFamily};
+use aether::certificates::status::{AstraRotationCampaign, CampaignApproval, CampaignFamily};
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
 
@@ -100,6 +109,16 @@ pub enum IssuerRefusal {
     OriginRecorded,
     #[error("ce domaine ne porte pas encore de CA-TLS : finaliser le domaine avant de déléguer")]
     CaTlsMissing,
+    #[error(
+        "la CA-TLS de ce domaine ne peut pas porter cette délégation : elle n'est pas une \
+         autorité de certification, ou ne couvre pas toute la fenêtre de délégation"
+    )]
+    CaTlsUnusable,
+    #[error(
+        "le domaine ou la campagne a changé depuis l'affichage de ce qui allait être signé : \
+         recommencer le geste. Rien n'a été signé."
+    )]
+    PlanChanged,
     #[error("coffre ou relais de domaine illisible : {0}")]
     Vault(String),
 }
@@ -155,7 +174,8 @@ pub fn plan(
 ///
 /// The plan is settled again from the domain as it is now, at the instant it
 /// was shown for, and must be the one shown: a relay that gained an origin in
-/// between is refused as [`IssuerRefusal::OriginRecorded`].
+/// between is refused as [`IssuerRefusal::OriginRecorded`], any other change
+/// as [`IssuerRefusal::PlanChanged`].
 pub fn sign_offline(
     vault_path: &Path,
     plan: &IssuerPlan,
@@ -190,19 +210,43 @@ pub struct CampaignDelegation {
 }
 
 impl CampaignDelegation {
-    /// Fetches the campaign, verifies it against the pinned relay, and
-    /// requires it to be a delegation.
+    /// Fetches the campaign from the relay's origin and verifies it, as
+    /// [`Self::from_request`] does.
     ///
     /// The origin is the relay's and nobody else's: a process holding
     /// `CA-PQ` that learned where to send its signatures from whoever asked
     /// would authenticate nothing. Opens nothing and asks for nothing.
     pub fn begin(vault_path: &Path, operation: Id16, now_unix: u64) -> Result<CampaignDelegation> {
-        let vault = store::load(vault_path)?;
-        let relay = handoff::DomainHandoff::beside(vault_path, &vault)?;
-        let authority_url =
-            super::resolve_authority_url(relay.astra_authority_url.as_deref(), None)?;
-        let client = origin::Origin::new(&authority_url)?;
-        let request = client.fetch(&operation)?;
+        let (_, _, authority_url) = relay_authority(vault_path)?;
+        let request = origin::Origin::new(&authority_url)?.fetch(&operation)?;
+        Self::from_request(vault_path, request, now_unix)
+    }
+
+    /// Verifies a campaign request against the pinned relay, and requires it
+    /// to be a delegation.
+    ///
+    /// The request is authenticated by the service key the relay pins, not by
+    /// the channel it came through: the signed request must name the relay's
+    /// origin and this exact campaign. Both bindings [`origin::Origin::fetch`]
+    /// checks are checked again here, so a request that did not come through
+    /// it is held to the same rule. Opens nothing and asks for nothing.
+    pub fn from_request(
+        vault_path: &Path,
+        request: origin::CampaignRequest,
+        now_unix: u64,
+    ) -> Result<CampaignDelegation> {
+        let (vault, relay, authority_url) = relay_authority(vault_path)?;
+        if request.signer_request.operation_id != request.operation_id {
+            bail!(
+                "la demande signée porte l'opération {} et non {}",
+                request.signer_request.operation_id.to_hex(),
+                request.operation_id.to_hex()
+            );
+        }
+        request
+            .campaign
+            .assert_unchanged(&request.signer_request.campaign_fingerprint)
+            .context("la campagne n'est pas celle que la demande signée nomme")?;
         handoff::verify_campaign_request(&relay, &vault, &request, &authority_url, now_unix)?;
         if !matches!(
             request.campaign.scope.family(),
@@ -212,7 +256,7 @@ impl CampaignDelegation {
         }
         Ok(CampaignDelegation {
             campaign: request.campaign,
-            client,
+            client: origin::Origin::new(&authority_url)?,
             operation: request.operation_id,
             result_token: request.result_token,
         })
@@ -223,15 +267,8 @@ impl CampaignDelegation {
         &self.campaign
     }
 
-    /// Approves the campaign with one key, opens the vault with that same
-    /// credential, signs the delegation and deposits both.
-    ///
-    /// Everything that can be refused without the key is refused first: the
-    /// plan is settled again against this campaign, the credential document
-    /// and the policy pin are checked, and a campaign asking for more than one
-    /// credential is refused. The vault then opens only for the credential
-    /// that approved: under a platform transport the two are two dialogs, and
-    /// another key presented to the second cannot answer it.
+    /// [`Self::sign_in_campaign`], then the deposit of the approval and the
+    /// delegation on the origin.
     pub fn approve_and_sign(
         self,
         vault_path: &Path,
@@ -241,6 +278,46 @@ impl CampaignDelegation {
         now_unix: u64,
         progress: &mut dyn FnMut(RemoteState),
     ) -> Result<()> {
+        let (approval, authorization) =
+            self.sign_in_campaign(vault_path, plan, key, pin, now_unix)?;
+        progress(RemoteState::Prepared);
+
+        let mut result = super::campaign_result(&approval, Vec::new(), None);
+        result.issuer_authorization = Some(Box::new(authorization));
+        self.client
+            .submit(&self.operation, &self.result_token, &result)
+            .context("dépôt de la délégation")?;
+        progress(RemoteState::Deposited);
+        Ok(())
+    }
+
+    /// Approves the campaign with one key, opens the vault with that same
+    /// credential and signs the delegation. Deposits nothing.
+    ///
+    /// Everything that can be refused without the key is refused first: a
+    /// campaign asking for more than one credential, a plan that does not
+    /// settle again against this campaign, the credential document and the
+    /// policy pin. Only credentials that hold a slot of this vault are
+    /// offered, so a binding the vault no longer knows cannot spend a press
+    /// on an approval that could never open it. The vault then opens only
+    /// for the credential that approved: under a platform transport the two
+    /// are two dialogs, and another key presented to the second cannot
+    /// answer it.
+    pub fn sign_in_campaign(
+        &self,
+        vault_path: &Path,
+        plan: &IssuerPlan,
+        key: &dyn Authenticator,
+        pin: &str,
+        now_unix: u64,
+    ) -> Result<(CampaignApproval, AstraIssuerAuthorization)> {
+        if self.campaign.required_credentials != 1 {
+            bail!(
+                "cette campagne exige {} credentials : une délégation d'émetteur s'approuve avec \
+                 une seule clé, celle qui ouvre ensuite le coffre. Rien n'a été signé.",
+                self.campaign.required_credentials
+            );
+        }
         let domain = settle_again(vault_path, plan, Some(&*self.campaign), now_unix)?;
         let registry =
             credentials::load(&credentials::path_beside(vault_path))?.ok_or_else(|| {
@@ -260,17 +337,22 @@ impl CampaignDelegation {
             &webauthn_origin,
             now_unix,
         )?;
-        if session.required() != 1 {
+        let offered: Vec<Vec<u8>> = session
+            .offered_credentials()
+            .into_iter()
+            .filter(|credential_id| domain.vault.slot_for_credential(credential_id).is_ok())
+            .collect();
+        if offered.is_empty() {
             bail!(
-                "cette campagne exige {} credentials : une délégation d'émetteur s'approuve avec \
-                 une seule clé, celle qui ouvre ensuite le coffre. Rien n'a été signé.",
-                session.required()
+                "aucune clé approuvable du document de credentials ne détient de place dans ce \
+                 coffre : le document et le coffre ne décrivent plus les mêmes clés. Rien n'a \
+                 été signé."
             );
         }
 
         let assertion = key.approve(
             session.webauthn_rp_id(),
-            &session.offered_credentials(),
+            &offered,
             session.client_data_json(),
             pin,
         )?;
@@ -290,16 +372,16 @@ impl CampaignDelegation {
             now_unix,
         )?;
         drop(opened);
-        progress(RemoteState::Prepared);
-
-        let mut result = super::campaign_result(&approval, Vec::new(), None);
-        result.issuer_authorization = Some(Box::new(authorization));
-        self.client
-            .submit(&self.operation, &self.result_token, &result)
-            .context("dépôt de la délégation")?;
-        progress(RemoteState::Deposited);
-        Ok(())
+        Ok((approval, authorization))
     }
+}
+
+/// The vault, the relay, and the origin the relay pins.
+fn relay_authority(vault_path: &Path) -> Result<(AuthorityVault, handoff::DomainHandoff, String)> {
+    let vault = store::load(vault_path)?;
+    let relay = handoff::DomainHandoff::beside(vault_path, &vault)?;
+    let authority_url = super::resolve_authority_url(relay.astra_authority_url.as_deref(), None)?;
+    Ok((vault, relay, authority_url))
 }
 
 /// The vault, the relay, the identity, `CA-TLS` and the pinned policy.
@@ -334,9 +416,6 @@ fn plan_for(
     now_unix: u64,
 ) -> std::result::Result<IssuerPlan, IssuerRefusal> {
     let material = material_of(&request)?;
-    if material.trust_domain_id != domain.identity.trust_domain_id {
-        return Err(IssuerRefusal::RequestMismatch);
-    }
     let campaign = match campaign {
         Some(campaign) => {
             if !matches!(campaign.scope.family(), CampaignFamily::IssuerDelegation) {
@@ -364,7 +443,21 @@ fn plan_for(
             None
         }
     };
-    describe(request, &material, &domain.policy, campaign, now_unix)
+    if material.trust_domain_id != domain.identity.trust_domain_id {
+        return Err(IssuerRefusal::RequestMismatch);
+    }
+    let plan = describe(request, &material, &domain.policy, campaign, now_unix)?;
+    // `signing::authorize_issuer` runs both again once the vault is open;
+    // here they refuse before the key, which is when they are predictable.
+    aether::certificates::x509::assert_certificate_authority(&domain.ca_tls)
+        .map_err(|_| IssuerRefusal::CaTlsUnusable)?;
+    aether::certificates::x509::assert_covers(
+        &domain.ca_tls,
+        plan.bounds.not_before,
+        plan.bounds.not_after,
+    )
+    .map_err(|_| IssuerRefusal::CaTlsUnusable)?;
+    Ok(plan)
 }
 
 /// Reads what the request asks to be certified, the way the signature will.
@@ -451,8 +544,10 @@ fn settle_again(
     campaign: Option<&AstraRotationCampaign>,
     now_unix: u64,
 ) -> Result<Domain> {
+    // A plan settled for a later instant than the signature is not one this
+    // domain produced.
     if plan.bounds.not_before > now_unix {
-        bail!("ce plan commence après l'instant de la signature : recommencer le geste");
+        return Err(IssuerRefusal::PlanChanged.into());
     }
     let domain = read_domain(vault_path)?;
     let current = plan_for(
@@ -462,10 +557,7 @@ fn settle_again(
         plan.bounds.not_before,
     )?;
     if current != *plan {
-        bail!(
-            "le domaine ou la campagne a changé depuis l'affichage de ce qui allait être signé : \
-             recommencer le geste. Rien n'a été signé."
-        );
+        return Err(IssuerRefusal::PlanChanged.into());
     }
     Ok(domain)
 }
