@@ -6,7 +6,8 @@
 
 use std::fmt;
 
-use orion_core::certificate_approval::ApprovalManifest;
+use aether::certificates::approval::AstraRenewalApproval;
+use orion_core::certificate_approval::{ApprovalManifest, ApprovalMaterial};
 use orion_core::enrollment::PendingEnrollment;
 use orion_core::vault::VaultPosture;
 use orion_core::{
@@ -202,15 +203,12 @@ pub enum EngineCommand {
     CertificateApprovalManifest {
         name: String,
     },
-    ApproveCertificateRenewal {
-        name: String,
-        pin: Option<SecretInput>,
-    },
-    CertificateApprovalNeedsPin {
+    CertificateApprovalMaterial {
         name: String,
     },
-    CompanionArguments {
+    SubmitCertificateApproval {
         name: String,
+        approval: Box<AstraRenewalApproval>,
     },
     LastCertificateError {
         name: String,
@@ -251,7 +249,7 @@ pub enum EngineReply {
     ActionOutcome(ActionOutcome),
     ApprovalManifest(ApprovalManifest),
     RenewalProgress(RenewalProgress),
-    CompanionArguments(Vec<String>),
+    ApprovalMaterial(Box<ApprovalMaterial>),
     LastError(Option<String>),
 }
 

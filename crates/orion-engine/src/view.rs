@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use orion_core::certificate_renewal::{RenewalSession, RenewalStep};
+use orion_core::certificate_renewal::RenewalStep;
 use orion_core::{ClientConfig, ClientProfile};
 use serde::{Deserialize, Serialize};
 
@@ -222,16 +222,11 @@ impl ActionOutcome {
 }
 
 /// Where a renewal stands, as the Certificates surface states it.
-///
-/// `companion_command` is a **value**, not advice: it is the exact fallback for
-/// the invocation Orion launches automatically. It remains visible while an
-/// operator is awaited, including after a successful launch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "step")]
 pub enum RenewalProgress {
     AwaitingOperator {
         operation_id: String,
-        companion_command: String,
     },
     Issuing {
         operation_id: String,
@@ -241,14 +236,11 @@ pub enum RenewalProgress {
     },
     /// A §7.5 recovery, waiting on an operator who is not on this machine.
     ///
-    /// The operator runs `astra-signer` on **their** workstation, so nothing
-    /// here can be launched. `operator_command` is still carried, and for the
-    /// same reason the renewal carries its companion line: what travels
-    /// between the two people is a command to run, not an identifier to be
-    /// reassembled by hand into arguments only one of them knows.
+    /// The operator works on **their** workstation, so nothing here can be
+    /// launched: the operation identifier is what travels between the two
+    /// people.
     RecoveryAwaitingOperator {
         operation_id: String,
-        operator_command: String,
     },
     Recovered {
         generation: u64,
@@ -261,19 +253,11 @@ pub enum RenewalProgress {
 }
 
 impl RenewalProgress {
-    pub fn of_recovery(
-        step: &orion_core::certificate_recovery::RecoveryStep,
-        session: &orion_core::certificate_recovery::RecoverySession,
-    ) -> Self {
+    pub fn of_recovery(step: &orion_core::certificate_recovery::RecoveryStep) -> Self {
         use orion_core::certificate_recovery::RecoveryStep;
         match step {
             RecoveryStep::AwaitingOperator { operation_id } => Self::RecoveryAwaitingOperator {
                 operation_id: operation_id.to_hex(),
-                operator_command: format!(
-                    "astra-signer recover --authority-url {} --operation-id {}",
-                    session.authority_url(),
-                    operation_id.to_hex()
-                ),
             },
             RecoveryStep::Issuing { operation_id } => Self::Issuing {
                 operation_id: operation_id.to_hex(),
@@ -290,14 +274,10 @@ impl RenewalProgress {
 }
 
 impl RenewalProgress {
-    pub fn of(step: &RenewalStep, session: &RenewalSession) -> Self {
+    pub fn of(step: &RenewalStep) -> Self {
         match step {
             RenewalStep::AwaitingOperator { operation_id } => Self::AwaitingOperator {
                 operation_id: operation_id.to_hex(),
-                companion_command: session
-                    .companion_invocation()
-                    .map(|invocation| invocation.command_line())
-                    .unwrap_or_default(),
             },
             RenewalStep::Issuing { operation_id } => Self::Issuing {
                 operation_id: operation_id.to_hex(),

@@ -5,8 +5,15 @@ use crate::view::{
     AboutView, ActionOutcome, ConfigView, ImportOutcome, InvitationPreviewView,
     KeyNegotiationSupport, ProfileCertificates, ProfileView, RenewalProgress,
 };
-use aether::certificates::encoding::Id16;
-use orion_core::certificate_approval::ApprovalManifest;
+use aether::certificates::approval::{
+    AstraCredentialApprovalRequest, AstraCredentialBinding, AstraRenewalApproval,
+    CredentialRegistry, CredentialState,
+};
+use aether::certificates::encoding::{
+    generate_ml_dsa_87_keypair, Fingerprint, Id16, MlDsa87Signature, WireGuardKey,
+};
+use aether::certificates::WebAuthnAssertion;
+use orion_core::certificate_approval::{ApprovalManifest, ApprovalMaterial};
 use orion_core::enrollment::PendingEnrollment;
 use orion_core::{
     CertificateAction, CertificateActionState, CertificateInventory, ClientConfig, ClientProfile,
@@ -22,7 +29,7 @@ const SECRET: &str = "SECRET-QUI-NE-DOIT-PAS-FUIR";
 /// `import_profile_path` is absent on purpose: the UI reads the file it is
 /// given and sends the engine only its text (F11 ruling), so no command of
 /// the engine names a path.
-const ENGINE_COMMANDS: [&str; 39] = [
+const ENGINE_COMMANDS: [&str; 38] = [
     "get_state",
     "backend_kind",
     "adapter_is_up",
@@ -57,12 +64,101 @@ const ENGINE_COMMANDS: [&str; 39] = [
     "run_certificate_action",
     "resume_certificate_recovery",
     "certificate_approval_manifest",
-    "approve_certificate_renewal",
-    "certificate_approval_needs_pin",
-    "companion_arguments",
+    "certificate_approval_material",
+    "submit_certificate_approval",
     "last_certificate_error",
     "shutdown",
 ];
+
+fn approval_fixture() -> AstraRenewalApproval {
+    let binding = binding_fixture();
+    AstraRenewalApproval {
+        format_version: 1,
+        operation_id: Id16::new([3; 16]).expect("non-zero id"),
+        request_fingerprint: Fingerprint::of(b"request"),
+        approval_request_fingerprint: Fingerprint::of(b"signed request"),
+        credential_fingerprint: Fingerprint::of(b"credential"),
+        assertion_fingerprint: Fingerprint::of(b"assertion"),
+        credential_binding: binding,
+        webauthn_assertion: WebAuthnAssertion {
+            authenticator_data: vec![1],
+            client_data_json: vec![2],
+            signature: vec![3],
+        },
+        approved_at: 1_000,
+        expires_at: 1_200,
+        astra_service_key_epoch: 1,
+        astra_signature: MlDsa87Signature::placeholder(),
+    }
+}
+
+fn binding_fixture() -> AstraCredentialBinding {
+    AstraCredentialBinding {
+        format_version: 1,
+        credential_id: b"credential-one".to_vec(),
+        credential_public_key: vec![4],
+        aaguid: [0; 16],
+        trust_domain_id: Id16::new([1; 16]).expect("non-zero id"),
+        gateway_wg_public_key: WireGuardKey::from_bytes([5; 32]),
+        state: CredentialState::Active,
+        credential_epoch: 1,
+        credential_registry_epoch: 1,
+        ca_epoch: 1,
+        created_at: 900,
+        ca_pq_signature: MlDsa87Signature::placeholder(),
+    }
+}
+
+/// A material assembled from unsigned public objects: nothing is verified
+/// when it is deserialised, which is all the wire tests need.
+fn material_fixture() -> ApprovalMaterial {
+    let domain = Id16::new([1; 16]).expect("non-zero id");
+    let gateway = WireGuardKey::from_bytes([5; 32]);
+    let (_, key) = generate_ml_dsa_87_keypair().expect("a key pair");
+    let request = AstraCredentialApprovalRequest {
+        format_version: 1,
+        operation_id: Id16::new([3; 16]).expect("non-zero id"),
+        request_fingerprint: Fingerprint::of(b"request"),
+        trust_domain_id: domain,
+        gateway_wg_public_key: gateway,
+        client_wg_public_key: WireGuardKey::from_bytes([6; 32]),
+        active_generation: 1,
+        requested_generation: 2,
+        credential_registry_epoch: 1,
+        webauthn_rp_id: "astra.example".into(),
+        webauthn_origin: "https://astra.example".into(),
+        allowed_credential_ids: vec![b"credential-one".to_vec()],
+        required_credentials: 1,
+        created_at: 1_000,
+        expires_at: 1_200,
+        astra_service_key_epoch: 1,
+        astra_signature: MlDsa87Signature::placeholder(),
+    };
+    let registry = CredentialRegistry {
+        trust_domain_id: domain,
+        gateway_wg_public_key: gateway,
+        ca_epoch: 1,
+        credential_registry_epoch: 1,
+        bindings: vec![binding_fixture()],
+    };
+    serde_json::from_value(serde_json::json!({
+        "request": request,
+        "registry": registry,
+        "identity": {
+            "trust_domain_id": domain,
+            "gateway_wg_public_key": gateway,
+            "server_name": "gateway.example",
+            "ca_epoch": 1,
+            "ca_tls_epoch": 1,
+        },
+        "service_key": key,
+        "service_key_epoch": 1,
+        "ca_pq": key,
+        "rp_id": "astra.example",
+        "active_generation": 1,
+    }))
+    .expect("a material deserialises")
+}
 
 fn secret() -> SecretInput {
     SecretInput::from(SECRET.to_string())
@@ -155,15 +251,12 @@ fn every_command() -> Vec<EngineCommand> {
         EngineCommand::CertificateApprovalManifest {
             name: "poste".into(),
         },
-        EngineCommand::ApproveCertificateRenewal {
-            name: "poste".into(),
-            pin: Some(secret()),
-        },
-        EngineCommand::CertificateApprovalNeedsPin {
+        EngineCommand::CertificateApprovalMaterial {
             name: "poste".into(),
         },
-        EngineCommand::CompanionArguments {
+        EngineCommand::SubmitCertificateApproval {
             name: "poste".into(),
+            approval: Box::new(approval_fixture()),
         },
         EngineCommand::LastCertificateError {
             name: "poste".into(),
@@ -209,9 +302,8 @@ fn label(command: &EngineCommand) -> &'static str {
         EngineCommand::RunCertificateAction { .. } => "run_certificate_action",
         EngineCommand::ResumeCertificateRecovery { .. } => "resume_certificate_recovery",
         EngineCommand::CertificateApprovalManifest { .. } => "certificate_approval_manifest",
-        EngineCommand::ApproveCertificateRenewal { .. } => "approve_certificate_renewal",
-        EngineCommand::CertificateApprovalNeedsPin { .. } => "certificate_approval_needs_pin",
-        EngineCommand::CompanionArguments { .. } => "companion_arguments",
+        EngineCommand::CertificateApprovalMaterial { .. } => "certificate_approval_material",
+        EngineCommand::SubmitCertificateApproval { .. } => "submit_certificate_approval",
         EngineCommand::LastCertificateError { .. } => "last_certificate_error",
         EngineCommand::Shutdown => "shutdown",
     }
@@ -229,10 +321,6 @@ fn secret_input_never_shows_in_debug() {
         EngineCommand::ImportProfile {
             contents: secret(),
             file_name: "poste.helios-profile".into(),
-        },
-        EngineCommand::ApproveCertificateRenewal {
-            name: "poste".into(),
-            pin: Some(secret()),
         },
     ];
     for command in &commands {
@@ -319,7 +407,6 @@ fn every_reply() -> Vec<EngineReply> {
     };
     let progress = RenewalProgress::AwaitingOperator {
         operation_id: "0123".into(),
-        companion_command: "orion-companion renew --profile poste".into(),
     };
     vec![
         EngineReply::Unit,
@@ -418,7 +505,7 @@ fn every_reply() -> Vec<EngineReply> {
             eligible_credentials: 1,
         }),
         EngineReply::RenewalProgress(progress),
-        EngineReply::CompanionArguments(vec!["approve".into()]),
+        EngineReply::ApprovalMaterial(Box::new(material_fixture())),
         EngineReply::LastError(Some("échec".into())),
     ]
 }
@@ -449,7 +536,7 @@ fn reply_label(reply: &EngineReply) -> &'static str {
         EngineReply::ActionOutcome(_) => "action_outcome",
         EngineReply::ApprovalManifest(_) => "approval_manifest",
         EngineReply::RenewalProgress(_) => "renewal_progress",
-        EngineReply::CompanionArguments(_) => "companion_arguments",
+        EngineReply::ApprovalMaterial(_) => "approval_material",
         EngineReply::LastError(_) => "last_error",
     }
 }
@@ -490,5 +577,34 @@ fn every_reply_round_trips() {
         assert_eq!(serde_json::to_string(&back).expect("serialises"), json);
         let value = serde_json::to_value(&reply).expect("a reply serialises");
         assert_eq!(value["reply"], label);
+    }
+}
+
+#[test]
+fn the_approval_commands_round_trip() {
+    for command in [
+        EngineCommand::CertificateApprovalMaterial {
+            name: "poste".into(),
+        },
+        EngineCommand::SubmitCertificateApproval {
+            name: "poste".into(),
+            approval: Box::new(approval_fixture()),
+        },
+    ] {
+        let json = serde_json::to_string(&command).expect("a command serialises");
+        let back: EngineCommand = serde_json::from_str(&json).expect("it deserialises");
+        assert_eq!(label(&back), label(&command));
+        assert_eq!(serde_json::to_string(&back).expect("serialises"), json);
+    }
+}
+
+#[test]
+fn the_retired_approval_commands_no_longer_deserialise() {
+    for retired in [
+        serde_json::json!({"command": "approve_certificate_renewal", "name": "poste", "pin": null}),
+        serde_json::json!({"command": "certificate_approval_needs_pin", "name": "poste"}),
+        serde_json::json!({"command": "companion_arguments", "name": "poste"}),
+    ] {
+        assert!(serde_json::from_value::<EngineCommand>(retired).is_err());
     }
 }

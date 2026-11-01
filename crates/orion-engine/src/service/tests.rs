@@ -201,53 +201,17 @@ async fn the_approval_manifest_without_a_renewal_is_refused() {
 }
 
 #[tokio::test]
-async fn approving_without_a_renewal_is_refused() {
-    let scratch = Scratch::new("approval-absent");
+async fn the_material_without_a_renewal_is_refused() {
+    let scratch = Scratch::new("material-absent");
     let client = client_on(&scratch).await;
 
     match client
-        .call(EngineCommand::ApproveCertificateRenewal {
-            name: "absent".into(),
-            pin: Some("0000".to_string().into()),
-        })
-        .await
-    {
-        Err(message) => assert_eq!(message, "aucun renouvellement ouvert pour ce profil"),
-        other => panic!("unexpected reply: {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn asking_for_a_pin_without_a_renewal_is_refused() {
-    let scratch = Scratch::new("approval-pin-absent");
-    let client = client_on(&scratch).await;
-
-    match client
-        .call(EngineCommand::CertificateApprovalNeedsPin {
+        .call(EngineCommand::CertificateApprovalMaterial {
             name: "absent".into(),
         })
         .await
     {
         Err(message) => assert_eq!(message, "aucun renouvellement ouvert pour ce profil"),
-        other => panic!("unexpected reply: {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn companion_arguments_without_a_renewal_are_refused() {
-    let scratch = Scratch::new("companion-absent");
-    let client = client_on(&scratch).await;
-
-    match client
-        .call(EngineCommand::CompanionArguments {
-            name: "absent".into(),
-        })
-        .await
-    {
-        Err(message) => assert!(
-            message.contains("aucun renouvellement en attente pour le profil « absent »"),
-            "unexpected refusal: {message}"
-        ),
         other => panic!("unexpected reply: {other:?}"),
     }
 }

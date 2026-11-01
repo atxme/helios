@@ -14,7 +14,7 @@ use crate::command::{EngineCommand, EngineReply};
 use orion_core::events::ClientEvent;
 
 /// Protocol version: a UI whose version differs is refused at `Hello`.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Maximum size of a frame, newline excluded.
 pub mod limits {

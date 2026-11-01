@@ -497,7 +497,7 @@ pub(crate) struct InFlightRenewal {
     pub settings: orion_core::KeyNegotiationSettings,
     /// The approval request, once read and verified.
     ///
-    /// Held between the read and the ceremony so that what is signed is what
+    /// Held between the read and the deposit so that what is signed is what
     /// was shown: a screen that displayed one manifest and then re-fetched
     /// before touching the key would be asking for a touch on something the
     /// user never saw.
@@ -642,18 +642,14 @@ impl Engine for EngineService {
                 .certificate_approval_manifest(name)
                 .await
                 .map(EngineReply::ApprovalManifest),
-            EngineCommand::ApproveCertificateRenewal { name, pin } => self
-                .approve_certificate_renewal(name, pin)
+            EngineCommand::CertificateApprovalMaterial { name } => self
+                .certificate_approval_material(name)
+                .await
+                .map(|material| EngineReply::ApprovalMaterial(Box::new(material))),
+            EngineCommand::SubmitCertificateApproval { name, approval } => self
+                .submit_certificate_approval(name, *approval)
                 .await
                 .map(EngineReply::RenewalProgress),
-            EngineCommand::CertificateApprovalNeedsPin { name } => self
-                .certificate_approval_needs_pin(name)
-                .await
-                .map(EngineReply::Flag),
-            EngineCommand::CompanionArguments { name } => self
-                .companion_arguments(name)
-                .await
-                .map(EngineReply::CompanionArguments),
         }
     }
 
