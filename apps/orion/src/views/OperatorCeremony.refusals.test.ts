@@ -39,3 +39,17 @@ describe('refusalSentence for the acceptance', () => {
     expect(sentence).not.toMatch(/admission\.txt/)
   })
 })
+
+describe('refusalSentence for the issuer delegation', () => {
+  it('the_delegation_refusals_have_their_sentences', () => {
+    expect(refusalSentence({ refusal: 'delegation_request_invalid' })).toBe(
+      'Ce fichier n’est pas une demande de délégation lisible. Rien n’a été signé.',
+    )
+    expect(refusalSentence({ refusal: 'delegation_request_mismatch' })).toBe(
+      'La campagne ne nomme pas cette demande, ou elle vise un autre domaine : époque ou clé substituée. Rien n’a été signé.',
+    )
+    expect(refusalSentence({ refusal: 'ca_tls_unusable' })).toBe(
+      'La CA-TLS du domaine expire avant la fin de cette délégation, ou n’est pas une autorité : la renouveler d’abord. Rien n’a été signé.',
+    )
+  })
+})

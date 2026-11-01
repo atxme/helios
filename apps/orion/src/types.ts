@@ -735,6 +735,9 @@ export type Refusal =
   | { refusal: 'domain_complete' }
   | { refusal: 'handoff_mismatch' }
   | { refusal: 'bootstrap_request_invalid' }
+  | { refusal: 'delegation_request_invalid' }
+  | { refusal: 'delegation_request_mismatch' }
+  | { refusal: 'ca_tls_unusable' }
   | { refusal: 'other_gateway' }
   | { refusal: 'domain_changed' }
   | { refusal: 'signer_revoked' }
@@ -815,6 +818,12 @@ export interface IssuerManifest {
   allowed_usages: string[]
   policy_fingerprint: string
   request_fingerprint: string
+  /** Longest leaf the delegated issuer may sign, already capped by the pinned policy. */
+  maximum_leaf_lifetime_secs: number
+  pq_public_key_fingerprint: string
+  tls_public_key_info_fingerprint: string
+  /** The campaign the same key approves; absent for the offline form. */
+  campaign?: { campaign: CampaignManifest['campaign']; fingerprint: string }
 }
 
 export interface CaRotationManifest {
@@ -987,6 +996,14 @@ export type EnrollmentGesture =
       allowed_ips?: string
       ssh_target?: string
     }
+
+/**
+ * La délégation de l'émetteur d'Astra (§9.5). Seul le texte de la demande
+ * voyage, jamais un chemin ; en campagne, avec l'opération que l'autorité a ouverte.
+ */
+export type IssuerGesture =
+  | { gesture: 'authorize_issuer'; operation_id: string; request: string }
+  | { gesture: 'authorize_issuer_offline'; request: string }
 
 /** Un fichier produit par la cérémonie, à enregistrer par l'IHM. Contenu public. */
 export interface OperatorArtifact {

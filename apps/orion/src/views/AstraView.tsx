@@ -15,6 +15,7 @@ import * as api from '../api'
 import { OperatorCeremonyPanel } from './OperatorCeremony'
 import { DomainCreated } from './astra/DomainCreated'
 import { DomainPanel } from './astra/DomainPanel'
+import { ApprovalsPanel, type OpenedCeremony } from './astra/ApprovalsPanel'
 import { ArtifactDownloads } from './astra/ArtifactDownloads'
 import { EnrollmentOperatorPanel } from './astra/EnrollmentOperatorPanel'
 import { VaultPanel } from './astra/VaultPanel'
@@ -23,7 +24,6 @@ import type {
   AstraRotationInput,
   AstraRotationPhase,
   AstraRotationStatus,
-  CampaignScope,
   OperatorPendingOperation,
   OperatorStatus,
 } from '../types'
@@ -38,12 +38,6 @@ const EMPTY_INPUT: AstraRotationInput = {
   operation_id: '',
   output_path: '',
 }
-
-const HELPER_CAMPAIGN_SCOPES = new Set<CampaignScope>([
-  'orion_profile',
-  'orion_device',
-  'fleet_leafs',
-])
 
 const TABS = [
   'Enrôlement',
@@ -149,6 +143,7 @@ export function AstraView({
   const [tab, setTab] = useState<AstraTab>('Enrôlement')
   const [finishingRecovery, setFinishingRecovery] = useState(false)
   const recoveryAttempt = useRef<string | null>(null)
+  const remoteRecoverySession = useRef<string | null>(null)
 
   const finishRecovery = useCallback(
     (operationId: string, attempt: string, force = false) => {
@@ -213,7 +208,8 @@ export function AstraView({
       !onRecoveryReady ||
       ceremony?.operation !== 'recover_identity' ||
       ceremony.gesture !== 'done' ||
-      !ceremony.operation_id
+      !ceremony.operation_id ||
+      remoteRecoverySession.current === ceremony.session_id
     ) {
       return
     }
@@ -235,21 +231,12 @@ export function AstraView({
     }
   }
 
-  const openCampaign = async (operationId: string) => {
-    setBusy(true)
-    setError(null)
-    try {
-      setCeremony(
-        await api.beginOperatorCeremony({
-          kind: 'approve_campaign',
-          operation_id: operationId,
-        }),
-      )
-    } catch (cause) {
-      setError(String(cause))
-    } finally {
-      setBusy(false)
-    }
+  // A recovery opened from the approvals field belongs to another machine: this
+  // one approves it and is done. Only the session that was opened here is
+  // remembered; a ceremony found on mount keeps the local finalization.
+  const openCeremony = (next: OperatorStatus, opened?: OpenedCeremony) => {
+    remoteRecoverySession.current = opened?.remoteRecovery ? next.session_id : null
+    setCeremony(next)
   }
 
   const phase = status?.phase ?? 'idle'
@@ -335,6 +322,8 @@ export function AstraView({
   // beside the CA-TLS form: an operator holding a security key must not be
   // shown, in the same view, a second ceremony they could start by mistake.
   if (ceremony) {
+    const inCampaign =
+      ceremony.manifest?.operation === 'issuer_authorization' && ceremony.manifest.campaign != null
     return (
       <Box sx={{ height: '100%', overflowY: 'auto', px: GUTTER, py: 1.5 }}>
         <Typography component="h2" sx={{ fontSize: 13, fontWeight: 700, mb: 0.5 }}>
@@ -363,6 +352,23 @@ export function AstraView({
           <Typography color="text.secondary" sx={{ mt: 1, fontSize: 11.5 }}>
             Portez la feuille sur la gateway : elle s’installe à son amorçage (voir
             DEPLOIEMENT-ASTRA).
+          </Typography>
+        )}
+        {ceremony.operation === 'recover_identity' &&
+          ceremony.gesture === 'done' &&
+          remoteRecoverySession.current === ceremony.session_id && (
+            <Typography color="text.secondary" sx={{ mt: 1, fontSize: 11.5 }}>
+              Récupération approuvée. Le poste concerné reprend de son côté.
+            </Typography>
+          )}
+        {ceremony.operation === 'authorize_issuer' && !inCampaign && (
+          <ArtifactDownloads gesture={ceremony.gesture} />
+        )}
+        {ceremony.operation === 'authorize_issuer' && ceremony.gesture === 'done' && (
+          <Typography color="text.secondary" sx={{ mt: 1, fontSize: 11.5 }}>
+            {inCampaign
+              ? 'Délégation enregistrée par Astra. Redémarrer Astra pour qu’il émette sous elle.'
+              : 'À installer sur l’hôte d’Astra : astra issuer install --authorization <fichier>.'}
           </Typography>
         )}
         {ceremony.operation === 'create_domain' && ceremony.gesture === 'done' && <DomainCreated />}
@@ -405,64 +411,7 @@ export function AstraView({
   // Campaigns the domain opened and nobody has approved yet. Read from the
   // gateway in the tunnel: they are how an operator finds work without being
   // handed an identifier by whoever ran the command that created it.
-  const approvals = (
-    <>
-        <Typography color="text.secondary" sx={{ fontSize: 11.5, lineHeight: 1.55, mb: 1.5 }}>
-          {pending.length === 0
-            ? 'Aucune opération n’attend l’opérateur.'
-            : pending.length === 1
-            ? 'Une opération attend l’opérateur.'
-            : `${pending.length} opérations attendent l’opérateur.`}
-        </Typography>
-        <Stack spacing={1.25}>
-          {pending.map((operation) => {
-            const supported = HELPER_CAMPAIGN_SCOPES.has(operation.scope)
-            return (
-              <Paper key={operation.operation_id} variant="outlined" sx={{ px: 1.75, py: 1.5 }}>
-                <Typography sx={{ fontSize: 12.5, fontWeight: 650 }}>
-                  {operation.reason}
-                </Typography>
-                <Typography color="text.secondary" sx={{ mt: 0.25, fontSize: 11.5 }}>
-                  Demandée par {operation.requested_by} — {operation.target_count} pair
-                  {operation.target_count > 1 ? 's' : ''}, {operation.required_credentials} clé
-                  {operation.required_credentials > 1 ? 's' : ''} distincte
-                  {operation.required_credentials > 1 ? 's' : ''}
-                </Typography>
-                <Typography
-                  color="text.disabled"
-                  sx={{ mt: 0.25, fontSize: 10.5, fontFamily: 'monospace' }}
-                >
-                  {operation.operation_id}
-                </Typography>
-                <Typography color="text.disabled" sx={{ mt: 0.25, fontSize: 11 }}>
-                  jusqu’au {new Date(operation.expires_at * 1000).toLocaleString()}
-                </Typography>
-                <Button
-                  size="small"
-                  variant="contained"
-                  disabled={busy || !supported}
-                  startIcon={<KeyRound size={14} aria-hidden />}
-                  onClick={() => void openCampaign(operation.operation_id)}
-                  sx={{ mt: 1, minHeight: 30, fontSize: 11.5 }}
-                >
-                  Ouvrir la cérémonie
-                </Button>
-                {!supported && (
-                  <Alert severity="warning" variant="outlined" sx={{ mt: 1, fontSize: 11.5 }}>
-                    Cette cérémonie n’est pas encore disponible dans Orion.
-                  </Alert>
-                )}
-              </Paper>
-            )
-          })}
-        </Stack>
-        {error && (
-          <Alert severity="error" variant="outlined" sx={{ mt: 1.25, fontSize: 11.5 }}>
-            {error}
-          </Alert>
-        )}
-    </>
-  )
+  const approvals = <ApprovalsPanel pending={pending} onCeremony={openCeremony} />
 
   const rotations = (
     <>

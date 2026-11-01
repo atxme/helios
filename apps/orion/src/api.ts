@@ -17,6 +17,7 @@ import type {
   OperatorArtifact,
   DomainDefaults,
   EnrollmentGesture,
+  IssuerGesture,
   RelayUpdate,
   VaultGesture,
   VaultLocationView,
@@ -313,6 +314,10 @@ export const beginOperatorCeremony = (locator: OperationLocator) =>
  */
 export const beginEnrollmentCeremony = (gesture: EnrollmentGesture) =>
   invoke<OperatorStatus>('begin_enrollment_ceremony', { gesture })
+
+/** Opens the delegation of Astra's issuer; only the request's text travels. */
+export const beginIssuerCeremony = (gesture: IssuerGesture) =>
+  invoke<OperatorStatus>('begin_issuer_ceremony', { gesture })
 
 /** Opens a vault or domain gesture; the vault path is read on the Rust side. */
 export const beginVaultCeremony = (gesture: VaultGesture) =>

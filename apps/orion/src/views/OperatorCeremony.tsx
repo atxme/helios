@@ -35,7 +35,7 @@ import type {
 const TITLES: Record<OperationKind, string> = {
   recover_identity: 'Récupérer une identité expirée',
   approve_campaign: 'Approuver une campagne',
-  authorize_issuer: 'Autoriser l’émetteur délégué',
+  authorize_issuer: 'Autoriser l’émetteur d’Astra',
   rotate_client_tls_ca: 'Renouveler la CA-TLS cliente',
   rotate_anchor: 'Renouveler l’ancre du domaine',
   revoke_certificate: 'Révoquer un certificat',
@@ -154,15 +154,28 @@ export function rowsOf(manifest: AstraManifest): [string, string][] {
         ['empreinte', manifest.fingerprint],
         ['domaine', manifest.campaign.trust_domain_id],
       ]
-    case 'issuer_authorization':
-      return [
-        ['époque de délégation', String(manifest.issuer_epoch)],
-        ['validité', `${instant(manifest.not_before)} → ${instant(manifest.not_after)}`],
-        ['usages autorisés', manifest.allowed_usages.join(', ')],
-        ['politique', manifest.policy_fingerprint],
-        ['empreinte', manifest.request_fingerprint],
+    case 'issuer_authorization': {
+      const rows: [string, string][] = [
         ['domaine', manifest.trust_domain_id],
+        ['époque de l’émetteur', String(manifest.issuer_epoch)],
+        ['valide du / jusqu’au', `${instant(manifest.not_before)} → ${instant(manifest.not_after)}`],
+        ['leaf au plus (jours)', String(Number((manifest.maximum_leaf_lifetime_secs / 86_400).toFixed(2)))],
+        ['usages', manifest.allowed_usages.join(', ')],
+        ['clé PQ (empreinte)', manifest.pq_public_key_fingerprint],
+        ['clé TLS (empreinte)', manifest.tls_public_key_info_fingerprint],
+        ['demande (empreinte)', manifest.request_fingerprint],
+        ['politique', manifest.policy_fingerprint],
       ]
+      if (manifest.campaign) {
+        rows.push(
+          ['campagne', manifest.campaign.campaign.campaign_id],
+          ['motif', manifest.campaign.campaign.reason],
+          ['demandée par', manifest.campaign.campaign.requested_by],
+          ['empreinte de campagne', manifest.campaign.fingerprint],
+        )
+      }
+      return rows
+    }
     case 'ca_rotation':
       return [
         ['autorité visée', CA_NAMES[manifest.affected_ca]],
@@ -425,6 +438,18 @@ export function refusalSentence(refusal: Refusal): string {
       return (
         'Ce fichier n’est pas une demande d’amorçage de gateway valide, ou sa signature ne se ' +
         'vérifie pas. Rien n’a été signé.'
+      )
+    case 'delegation_request_invalid':
+      return 'Ce fichier n’est pas une demande de délégation lisible. Rien n’a été signé.'
+    case 'delegation_request_mismatch':
+      return (
+        'La campagne ne nomme pas cette demande, ou elle vise un autre domaine : époque ou clé ' +
+        'substituée. Rien n’a été signé.'
+      )
+    case 'ca_tls_unusable':
+      return (
+        'La CA-TLS du domaine expire avant la fin de cette délégation, ou n’est pas une ' +
+        'autorité : la renouveler d’abord. Rien n’a été signé.'
       )
     case 'other_gateway':
       return (

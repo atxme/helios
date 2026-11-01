@@ -448,7 +448,7 @@ describe('AstraView', () => {
     openTab(/Approbations/)
 
     expect(await screen.findByText('rotation des ancres')).toBeTruthy()
-    const open = screen.getByRole('button', { name: 'Ouvrir la cérémonie' })
+    const [open] = screen.getAllByRole('button', { name: 'Ouvrir la cérémonie' })
     expect(open.hasAttribute('disabled')).toBe(true)
     expect(screen.getByText(/n’est pas encore disponible dans Orion/)).toBeTruthy()
     fireEvent.click(open)
