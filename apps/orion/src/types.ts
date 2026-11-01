@@ -112,7 +112,6 @@ export type CertificateActionBlockKind =
   | 'no_previous_identity'
   | 'previous_identity_expired'
   | 'trust_material_missing'
-  | 'companion_transport_missing'
   | 'operator_credential_required'
 
 /** One action and whether it may run, as the shell decides. */

@@ -546,6 +546,61 @@ describe('CertificatesView', () => {
     expect(screen.getByRole('button', { name: 'Approuver avec la clé' })).toBeTruthy()
   })
 
+  it('a_new_operation_id_triggers_a_new_read_and_a_same_id_rerender_does_not', async () => {
+    api.certificateOverview.mockResolvedValue([entry({ actions: [renewNow()] })])
+    api.runCertificateAction.mockResolvedValueOnce(outcome(awaiting()))
+    render(<CertificatesView />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Renouveler maintenant' }))
+    await screen.findByText('4 → 5')
+    // Same operation again: the step is re-rendered, not re-read.
+    api.runCertificateAction.mockResolvedValueOnce(outcome(awaiting()))
+    fireEvent.click(screen.getByRole('button', { name: 'Renouveler maintenant' }))
+    await waitFor(() => expect(api.runCertificateAction).toHaveBeenCalledTimes(2))
+    await screen.findByText('4 → 5')
+    expect(api.certificateApprovalManifest).toHaveBeenCalledOnce()
+
+    api.certificateApprovalManifest.mockResolvedValueOnce(manifest({ requested_generation: 9 }))
+    api.runCertificateAction.mockResolvedValueOnce(
+      outcome({ ...awaiting(), operation_id: 'e'.repeat(32) }),
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Renouveler maintenant' }))
+    expect(await screen.findByText('4 → 9')).toBeTruthy()
+    expect(api.certificateApprovalManifest).toHaveBeenCalledTimes(2)
+  })
+
+  it('a_failed_reread_leaves_nothing_approvable', async () => {
+    api.certificateOverview.mockResolvedValue([entry({ actions: [renewNow()] })])
+    api.runCertificateAction.mockResolvedValue(outcome(awaiting()))
+    api.approveCertificateRenewal.mockRejectedValueOnce('aucune clé détectée')
+    render(<CertificatesView />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Renouveler maintenant' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Approuver avec la clé' }))
+    const again = await screen.findByRole('button', { name: 'Relire la demande' })
+    api.certificateApprovalManifest.mockRejectedValueOnce('la gateway ne répond pas')
+    fireEvent.click(again)
+
+    expect(await screen.findByText(/la gateway ne répond pas/)).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Approuver avec la clé' })).toBeNull()
+    expect(screen.queryByText('4 → 5')).toBeNull()
+  })
+
+  it('clears_the_pin_after_a_failed_approval', async () => {
+    api.certificateOverview.mockResolvedValue([entry({ actions: [renewNow()] })])
+    api.runCertificateAction.mockResolvedValue(outcome(awaiting()))
+    api.certificateApprovalNeedsPin.mockResolvedValue(true)
+    api.approveCertificateRenewal.mockRejectedValueOnce('PIN erroné')
+    render(<CertificatesView />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Renouveler maintenant' }))
+    fireEvent.change(await screen.findByLabelText('PIN de la clé'), { target: { value: '1234' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Approuver avec la clé' }))
+
+    expect(await screen.findByText(/PIN erroné/)).toBeTruthy()
+    expect((screen.getByLabelText('PIN de la clé') as HTMLInputElement).value).toBe('')
+  })
+
   it('drops the previous step when a later press is refused', async () => {
     api.certificateOverview.mockResolvedValue([entry({ actions: [renewNow()] })])
     api.runCertificateAction.mockResolvedValueOnce(outcome(awaiting()))

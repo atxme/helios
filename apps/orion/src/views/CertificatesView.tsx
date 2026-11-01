@@ -270,7 +270,7 @@ function RenewalStep({
   /** Opens the §7.5 ceremony in the Astra tab, when the key is on this machine. */
   onApprove?: (operationId: string) => Promise<void>
 }) {
-  const [manifest, setManifest] = useState<ApprovalManifest | null>(null)
+  const [read, setRead] = useState<{ operation: string; manifest: ApprovalManifest } | null>(null)
   const [needsPin, setNeedsPin] = useState(false)
   const [pin, setPin] = useState('')
   const [reading, setReading] = useState(false)
@@ -285,19 +285,27 @@ function RenewalStep({
   const operationId =
     step?.step === 'awaiting_operator' ? step.operation_id : null
 
+  // Keyed by operation, so the render that brings a new operation_id already
+  // shows no manifest: no frame carries the previous request.
+  const manifest = read !== null && read.operation === operationId ? read.manifest : null
+
   const readManifest = useCallback(
     async (operation: string) => {
       readFor.current = operation
+      // Nothing approvable survives a re-read: a failed one must not leave the
+      // previous request beside its error.
+      setRead(null)
+      setPin('')
       setReading(true)
       setRefusal(null)
       try {
-        const read = await api.certificateApprovalManifest(name)
+        const fetched = await api.certificateApprovalManifest(name)
         // Asked, never assumed: under Windows the platform dialog collects the
         // PIN and it never enters Orion, so a field here would be asking for a
         // secret nothing in this process can use.
         const pinWanted = await api.certificateApprovalNeedsPin(name)
         if (readFor.current !== operation) return
-        setManifest(read)
+        setRead({ operation, manifest: fetched })
         setNeedsPin(pinWanted)
       } catch (cause) {
         if (readFor.current === operation) setRefusal(String(cause))
@@ -314,8 +322,6 @@ function RenewalStep({
       return
     }
     if (readFor.current === operationId) return
-    setManifest(null)
-    setPin('')
     void readManifest(operationId)
   }, [operationId, readManifest])
 
@@ -324,7 +330,7 @@ function RenewalStep({
     setRefusal(null)
     try {
       const reached = await api.approveCertificateRenewal(name, needsPin ? pin : undefined)
-      setManifest(null)
+      setRead(null)
       setPin('')
       onApproved(reached)
     } catch (cause) {
@@ -332,6 +338,7 @@ function RenewalStep({
       // key that was absent, a wrong PIN or a cancelled dialog is retried with
       // one click. If the failure came after the deposit, « Relire la demande »
       // is the way to find out.
+      setPin('')
       setRefusal(String(cause))
     } finally {
       setSigning(false)
