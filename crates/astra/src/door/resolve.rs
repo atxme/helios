@@ -15,7 +15,7 @@ use aether::certificates::transport::RevocationExpiries;
 use astra_channel::GatewayIdentityView;
 
 use super::open::Resolved;
-use super::DoorRefusal;
+use super::{DoorRefusal, OpenedSubject};
 use crate::registry::AstraState;
 
 /// One row per admitted peer, pinned to the generation it is actually at.
@@ -125,6 +125,11 @@ pub(crate) fn client_revocation(
             tls_not_after: Some(not_after),
             pq_not_after: Some(not_after),
         }),
+        subject: OpenedSubject::Client {
+            name: record.name.clone(),
+            generation: record.active.generation,
+            revocation_epoch: record.revocation_epoch,
+        },
     })
 }
 
@@ -153,6 +158,15 @@ pub(crate) fn gateway_row(state: &AstraState, identity: &GatewayIdentityView) ->
     }
 }
 
+/// The gateway identity in service, frozen for a signed transition.
+pub(crate) fn gateway_identity(state: &AstraState, identity: &GatewayIdentityView) -> Resolved {
+    Resolved {
+        targets: vec![gateway_row(state, identity)],
+        revocation_expiries: None,
+        subject: gateway_subject(identity),
+    }
+}
+
 /// The gateway revocation: the row, and the two leaves' own expiries.
 pub(crate) fn gateway_revocation(state: &AstraState, identity: &GatewayIdentityView) -> Resolved {
     Resolved {
@@ -161,5 +175,15 @@ pub(crate) fn gateway_revocation(state: &AstraState, identity: &GatewayIdentityV
             tls_not_after: Some(identity.tls_certificate_not_after),
             pq_not_after: Some(identity.pq_certificate.not_after_unix),
         }),
+        subject: gateway_subject(identity),
+    }
+}
+
+/// What the console names about the gateway: the leaves the daemon serves.
+fn gateway_subject(identity: &GatewayIdentityView) -> OpenedSubject {
+    OpenedSubject::Gateway {
+        decision_epoch: identity.gateway_decision_epoch,
+        tls_certificate_fingerprint: identity.tls_certificate_fingerprint,
+        pq_certificate_fingerprint: identity.pq_certificate_fingerprint,
     }
 }

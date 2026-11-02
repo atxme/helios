@@ -7,17 +7,17 @@
 //! [`AstraService::open_issuer_delegation`] also opens the campaign the
 //! operator reads before touching.
 //!
-//! The caller holds [`super::chain::VOLUME_WRITES`]: the key files are named by
-//! epoch, so two requests for the same epoch would overwrite each other's keys,
-//! and an install at the door, which reads them, holds it too.
+//! Both take the proof that the caller holds [`AstraService::volume_writes`]:
+//! the key files are named by epoch, so two requests for the same epoch would
+//! overwrite each other's keys, and an install at the door, which reads them,
+//! holds it too.
 
 use aether::certificates::encoding::{generate_ml_dsa_87_keypair, Fingerprint};
 use aether::certificates::status::{CampaignScope, CampaignTarget, CertificateKind};
-use aether::certificates::transport::OperatorOpened;
 use base64::Engine as _;
 
 use super::open::{self, Resolved};
-use super::{DoorConnector, DoorRefusal, OpeningText};
+use super::{DoorConnector, DoorRefusal, Opening, OpeningText, VolumeWritesHeld};
 use crate::service::AstraService;
 
 /// A request whose keys are on disk, and the target that pins its material.
@@ -61,9 +61,13 @@ impl AstraService {
     /// Refused while a delegation campaign is waiting for its operator: that
     /// campaign pins the public keys of the files on disk, and a second draw
     /// for the same epoch would overwrite them under it.
-    pub(super) async fn issuer_request_only(&self, now_unix: u64) -> Result<String, DoorRefusal> {
+    pub(super) async fn issuer_request_only(
+        &self,
+        volume: &VolumeWritesHeld<'_>,
+        now_unix: u64,
+    ) -> Result<String, DoorRefusal> {
         self.refuse_live_delegation(now_unix).await?;
-        Ok(self.prepare_issuer_material().await?.request)
+        Ok(self.prepare_issuer_material(volume).await?.request)
     }
 
     /// Prepares the material, then opens the campaign that pins it.
@@ -75,15 +79,16 @@ impl AstraService {
     /// the request itself carries no signature, so nothing else could.
     pub(super) async fn open_issuer_delegation(
         &self,
+        volume: &VolumeWritesHeld<'_>,
         connector: &DoorConnector,
         text: OpeningText,
         now_unix: u64,
-    ) -> Result<(String, OperatorOpened), DoorRefusal> {
+    ) -> Result<(String, Opening), DoorRefusal> {
         // Before any key is drawn: a refused opening must not overwrite the
         // keys a live one pins.
         open::check_text(&text)?;
         self.refuse_live_delegation(now_unix).await?;
-        let Material { request, target } = self.prepare_issuer_material().await?;
+        let Material { request, target } = self.prepare_issuer_material(volume).await?;
         let opened = open::open_campaign(
             self,
             connector,
@@ -107,7 +112,12 @@ impl AstraService {
         }
     }
 
-    async fn prepare_issuer_material(&self) -> Result<Material, DoorRefusal> {
+    /// Draws the keys and writes them at their epoch's names: the reason the
+    /// gate must be held.
+    async fn prepare_issuer_material(
+        &self,
+        _volume: &VolumeWritesHeld<'_>,
+    ) -> Result<Material, DoorRefusal> {
         let (trust_domain_id, gateway_wg_public_key, issuer_epoch) = {
             let registry = self.registry.lock().await;
             let state = registry.state();

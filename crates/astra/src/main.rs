@@ -24,8 +24,8 @@
 //! pinned ML-DSA-87 service key is (spec §9.6). Deployments that expose
 //! `astra_port` directly must place a terminator in the same container.
 
-mod campaign_deposit;
 mod commands;
+mod console;
 mod daemon;
 mod private_channel;
 
@@ -264,18 +264,11 @@ enum ChainCommand {
     /// a step whose approval was taken but whose object never landed has not
     /// moved the domain, and resolving the next campaign against it would
     /// freeze a state nobody reached.
+    ///
+    /// The gateway-identity step is resolved from the leaves the daemon
+    /// actually serves, over the running service's own channel
+    /// (`ASTRA_GATEWAY_CHANNEL` of `astra run`).
     Next {
-        /// Address of the gateway's private lifecycle listener, on the veth.
-        ///
-        /// Required only when the chain reaches its gateway-identity step:
-        /// that campaign is resolved from the leaves the daemon actually
-        /// serves, which this registry has never held.
-        #[arg(long, env = "ASTRA_GATEWAY_CHANNEL")]
-        gateway_channel: Option<SocketAddr>,
-        /// The gateway's transport certificate, DER base64 — the same value
-        /// `astra run` is given.
-        #[arg(long, env = "ASTRA_GATEWAY_CERTIFICATE")]
-        gateway_certificate: Option<String>,
         /// Where to write the delegation request, on the issuer step.
         #[arg(long)]
         issuer_request_out: Option<PathBuf>,
@@ -297,6 +290,10 @@ pub(crate) enum RevocationScopeArg {
 #[derive(Subcommand)]
 enum RevocationCommand {
     /// Resolves one active identity into a short-lived signing campaign.
+    ///
+    /// For `--scope gateway`, the leaves' fingerprints and signed expiries are
+    /// read from the daemon that serves them, over the running service's own
+    /// channel (`ASTRA_GATEWAY_CHANNEL` of `astra run`).
     Open {
         #[arg(long, value_enum)]
         scope: RevocationScopeArg,
@@ -310,16 +307,6 @@ enum RevocationCommand {
         requested_by: String,
         #[arg(long, default_value_t = 300)]
         window_secs: u64,
-        /// Address of the gateway's private lifecycle listener, on the veth.
-        ///
-        /// Required for `--scope gateway`: this registry holds no gateway
-        /// leaf, so their fingerprints and signed expiries are read from the
-        /// daemon that serves them.
-        #[arg(long, env = "ASTRA_GATEWAY_CHANNEL")]
-        gateway_channel: Option<SocketAddr>,
-        /// The gateway's transport certificate, DER base64.
-        #[arg(long, env = "ASTRA_GATEWAY_CERTIFICATE")]
-        gateway_certificate: Option<String>,
     },
 }
 
@@ -350,13 +337,6 @@ enum GatewayIdentityCommand {
         requested_by: String,
         #[arg(long, default_value_t = 300)]
         window_secs: u64,
-        /// Address of the gateway's private lifecycle listener, on the veth.
-        #[arg(long, env = "ASTRA_GATEWAY_CHANNEL")]
-        gateway_channel: SocketAddr,
-        /// The gateway's transport certificate, DER base64 — the same value
-        /// `astra run` is given.
-        #[arg(long, env = "ASTRA_GATEWAY_CERTIFICATE")]
-        gateway_certificate: String,
     },
     /// Laisse partir la transition déjà signée (§11.1 étape 6).
     ///
@@ -367,14 +347,13 @@ enum GatewayIdentityCommand {
     ///
     /// Rejouable : la marque est persistée avant le relais, et une seconde
     /// exécution termine un relais que la première n'a pas pu confirmer.
+    ///
+    /// Le relais part par le canal du service (`ASTRA_GATEWAY_CHANNEL` et
+    /// `ASTRA_GATEWAY_CERTIFICATE` d'`astra run`), qu'il tourne ou non.
     Publish {
         /// L'époque de la transition à publier.
         #[arg(long)]
         epoch: u64,
-        #[arg(long, env = "ASTRA_GATEWAY_CHANNEL")]
-        gateway_channel: SocketAddr,
-        #[arg(long, env = "ASTRA_GATEWAY_CERTIFICATE")]
-        gateway_certificate: String,
     },
 }
 
@@ -497,8 +476,7 @@ fn main() -> Result<()> {
                 out.as_deref(),
                 reason.as_deref().zip(requested_by.as_deref()),
                 window_secs,
-            )
-            .map(|_| ()),
+            ),
             IssuerCommand::Install { authorization } => {
                 issuer_install(&cli.state_dir, authorization.as_deref())
             }
@@ -524,16 +502,9 @@ fn main() -> Result<()> {
                 window_secs,
                 issuer_request_out.as_deref(),
             ),
-            ChainCommand::Next {
-                gateway_channel,
-                gateway_certificate,
-                issuer_request_out,
-            } => chain_next(
-                &cli.state_dir,
-                gateway_channel,
-                gateway_certificate.as_deref(),
-                issuer_request_out.as_deref(),
-            ),
+            ChainCommand::Next { issuer_request_out } => {
+                chain_next(&cli.state_dir, issuer_request_out.as_deref())
+            }
             ChainCommand::Status => chain_status(&cli.state_dir),
             ChainCommand::Abandon => chain_abandon(&cli.state_dir),
         },
@@ -544,8 +515,6 @@ fn main() -> Result<()> {
                 reason,
                 requested_by,
                 window_secs,
-                gateway_channel,
-                gateway_certificate,
             } => revocation_open(
                 &cli.state_dir,
                 scope,
@@ -553,8 +522,6 @@ fn main() -> Result<()> {
                 &reason,
                 &requested_by,
                 window_secs,
-                gateway_channel,
-                gateway_certificate.as_deref(),
             ),
         },
         Command::GatewayIdentity { command } => match command {
@@ -562,27 +529,10 @@ fn main() -> Result<()> {
                 reason,
                 requested_by,
                 window_secs,
-                gateway_channel,
-                gateway_certificate,
-            } => gateway_identity_open(
-                &cli.state_dir,
-                &reason,
-                &requested_by,
-                window_secs,
-                gateway_channel,
-                &gateway_certificate,
-            )
-            .map(|_| ()),
-            GatewayIdentityCommand::Publish {
-                epoch,
-                gateway_channel,
-                gateway_certificate,
-            } => gateway_identity_publish(
-                &cli.state_dir,
-                epoch,
-                gateway_channel,
-                &gateway_certificate,
-            ),
+            } => gateway_identity_open(&cli.state_dir, &reason, &requested_by, window_secs),
+            GatewayIdentityCommand::Publish { epoch } => {
+                gateway_identity_publish(&cli.state_dir, epoch)
+            }
         },
         Command::Status {
             expected_audit_head,

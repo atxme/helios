@@ -148,6 +148,7 @@ fn build_service(
         reconciliation: Mutex::new(()),
         encrypted_vault: Some(b"placeholder encrypted vault".to_vec()),
         gateway,
+        volume_writes: VolumeWrites::new(),
     }
 }
 
@@ -181,7 +182,7 @@ fn tunnel() -> DoorConnector {
 
 fn opened(outcome: Result<DoorOutcome, DoorRefusal>) -> OperatorOpened {
     match outcome.expect("the door opens") {
-        DoorOutcome::Opened(opened) => opened,
+        DoorOutcome::Opened(opening) => opening.opened,
         other => panic!("expected a campaign, got {other:?}"),
     }
 }
@@ -989,7 +990,12 @@ fn chain_step(
             opened,
             delegation_request,
             remaining,
-        } => (opened, delegation_request, remaining),
+            ..
+        } => (
+            opened.map(|opening| opening.opened),
+            delegation_request,
+            remaining,
+        ),
         other => panic!("expected a chain step, got {other:?}"),
     }
 }
@@ -1184,7 +1190,7 @@ async fn a_chain_can_be_abandoned_once() {
         service
             .door(console(), DoorRequest::ChainAbandon {}, NOW + 1)
             .await,
-        Ok(DoorOutcome::ChainAbandoned)
+        Ok(DoorOutcome::ChainAbandoned { .. })
     ));
     assert!(!plan_path(dir.path()).exists());
 }
@@ -1240,7 +1246,7 @@ async fn an_issuer_delegation_pins_the_material_it_returns() {
         .expect("the delegation opens");
     let DoorOutcome::IssuerRequested {
         request,
-        opened: Some(opened),
+        opened: Some(Opening { opened, .. }),
     } = outcome
     else {
         panic!("expected a request and a campaign");
@@ -1464,7 +1470,11 @@ async fn a_pinned_ca_tls_is_a_target_without_restart() {
         .door(console(), DoorRequest::PinCaTls { fingerprint }, NOW)
         .await
         .expect("pinned");
-    let DoorOutcome::Pinned { audit_head } = outcome else {
+    let DoorOutcome::Pinned {
+        audit_head,
+        changed: true,
+    } = outcome
+    else {
         panic!("expected a pin, got {outcome:?}");
     };
     assert_eq!(audit_head, service.registry.lock().await.audit_head());
@@ -1495,7 +1505,13 @@ async fn a_pinned_anchor_is_never_replaced() {
         .door(console(), DoorRequest::PinCaTls { fingerprint: held }, NOW)
         .await
         .expect("idempotent");
-    assert_eq!(outcome, DoorOutcome::Pinned { audit_head: before });
+    assert_eq!(
+        outcome,
+        DoorOutcome::Pinned {
+            audit_head: before,
+            changed: false
+        }
+    );
 
     let refusal = service
         .door(
@@ -1667,23 +1683,26 @@ async fn a_publication_is_marked_before_the_relay() {
     let dir = tempfile::tempdir().expect("temp dir");
     // A gateway that refuses every publication: the relay fails.
     let service = fixture_with_gateway(dir.path()).await;
-    rewrite_registry(&service, |state| {
-        state.transitions.push(stored_gateway_transition(5))
-    })
-    .await;
+    let stored = stored_gateway_transition(5);
+    let aether::certificates::transport::TrustUpdateObject::GatewayIdentityTransition(transition) =
+        &stored.object
+    else {
+        panic!("a gateway transition");
+    };
+    let marked = DoorOutcome::Published {
+        epoch: 5,
+        transition_fingerprint: transition.fingerprint().expect("fingerprint"),
+        activation_at: transition.window.activation_at,
+        confirmed: false,
+    };
+    rewrite_registry(&service, |state| state.transitions.push(stored.clone())).await;
 
     let request = DoorRequest::GatewayIdentityPublish { epoch: 5 };
     let outcome = service
         .door(console(), request.clone(), NOW)
         .await
         .expect("marked although the relay failed");
-    assert_eq!(
-        outcome,
-        DoorOutcome::Published {
-            epoch: 5,
-            confirmed: false
-        }
-    );
+    assert_eq!(outcome, marked);
     assert!(published_on_disk(dir.path()));
     let head = registry_on_disk(dir.path()).audit_head();
 
@@ -1692,13 +1711,7 @@ async fn a_publication_is_marked_before_the_relay() {
         .door(console(), request, NOW + 1)
         .await
         .expect("replayed");
-    assert_eq!(
-        outcome,
-        DoorOutcome::Published {
-            epoch: 5,
-            confirmed: false
-        }
-    );
+    assert_eq!(outcome, marked);
     assert_eq!(registry_on_disk(dir.path()).audit_head(), head);
 }
 

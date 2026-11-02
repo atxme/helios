@@ -15,26 +15,19 @@
 //!
 //! Every step opens through [`open::open_campaign`], so the bounds and the
 //! one-live-operation-per-family rule are the ones of every other opening.
-//! The plan stays in the state volume under [`crate::chain::CHAIN_PLAN_FILE`].
+//! The plan stays in the state volume under [`crate::chain::CHAIN_PLAN_FILE`],
+//! and every command on it holds [`AstraService::volume_writes`].
 
 use std::path::PathBuf;
 
 use crate::chain::{ChainError, ChainPlan};
 use aether::certificates::status::CampaignScope;
-use aether::certificates::transport::OperatorOpened;
 
 use super::open::{self, Resolved};
-use super::{resolve, DoorConnector, DoorOutcome, DoorRefusal, OpeningText};
+use super::{
+    resolve, DoorConnector, DoorOutcome, DoorRefusal, Opening, OpeningText, VolumeWritesHeld,
+};
 use crate::service::AstraService;
-
-/// One writer of the plan and of the delegation key files at a time.
-///
-/// A plan is read, changed and written back around a number of `.await`s, and
-/// the key files are named by epoch: two requests interleaving would each
-/// act on a state the other is changing. Neither the registry nor the
-/// operation store may be taken to hold this, and neither is held under it
-/// across an `.await`.
-pub(super) static VOLUME_WRITES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn plan_path(service: &AstraService) -> PathBuf {
     service.state_dir.join(crate::chain::CHAIN_PLAN_FILE)
@@ -112,7 +105,7 @@ impl AstraService {
         now_unix: u64,
     ) -> Result<DoorOutcome, DoorRefusal> {
         open::check_text(&text)?;
-        let _volume = VOLUME_WRITES.lock().await;
+        let volume = self.volume_writes.lock().await;
         if let Some(existing) = load_plan(self)? {
             return Err(DoorRefusal::ChainAlreadyOpen {
                 remaining: existing.remaining(),
@@ -130,7 +123,8 @@ impl AstraService {
                 now_unix,
             )
         };
-        self.chain_deposit_current(connector, plan, now_unix).await
+        self.chain_deposit_current(&volume, connector, plan, now_unix)
+            .await
     }
 
     /// Opens the next campaign, once the previous one has taken effect.
@@ -139,7 +133,7 @@ impl AstraService {
         connector: &DoorConnector,
         now_unix: u64,
     ) -> Result<DoorOutcome, DoorRefusal> {
-        let _volume = VOLUME_WRITES.lock().await;
+        let volume = self.volume_writes.lock().await;
         let mut plan = load_plan(self)?.ok_or(DoorRefusal::NoChain)?;
         {
             let registry = self.registry.lock().await;
@@ -157,24 +151,27 @@ impl AstraService {
                 opened: None,
                 delegation_request: None,
                 remaining: 0,
+                plan: None,
             });
         }
-        self.chain_deposit_current(connector, plan, now_unix).await
+        self.chain_deposit_current(&volume, connector, plan, now_unix)
+            .await
     }
 
     /// Drops the plan. Campaigns already approved keep their effect: a
     /// campaign spent does not come back.
     pub(super) async fn chain_abandon(&self) -> Result<DoorOutcome, DoorRefusal> {
-        let _volume = VOLUME_WRITES.lock().await;
-        load_plan(self)?.ok_or(DoorRefusal::NoChain)?;
+        let _volume = self.volume_writes.lock().await;
+        let plan = load_plan(self)?.ok_or(DoorRefusal::NoChain)?;
         remove_plan(self)?;
-        Ok(DoorOutcome::ChainAbandoned)
+        Ok(DoorOutcome::ChainAbandoned { plan })
     }
 
     /// Opens the campaign of the step the plan currently points at, records
     /// it, and saves the plan.
     async fn chain_deposit_current(
         &self,
+        volume: &VolumeWritesHeld<'_>,
         connector: &DoorConnector,
         mut plan: ChainPlan,
         now_unix: u64,
@@ -185,15 +182,15 @@ impl AstraService {
             requested_by: plan.requested_by.clone(),
             window_secs: plan.window_secs,
         };
-        let (opened, delegation_request): (OperatorOpened, Option<String>) = match scope {
+        let (opening, delegation_request): (Opening, Option<String>) = match scope {
             // The delegation's target does not exist until this call creates
             // it: the epoch, the ML-DSA-87 key and the PKCS#10 request are
             // produced here, beside the private halves they name.
             CampaignScope::IssuerDelegation => {
-                let (request, opened) = self
-                    .open_issuer_delegation(connector, text, now_unix)
+                let (request, opening) = self
+                    .open_issuer_delegation(volume, connector, text, now_unix)
                     .await?;
-                (opened, Some(request))
+                (opening, Some(request))
             }
             // Read live from the daemon that serves the leaves: this registry
             // has never held them, and a retyped value would produce a
@@ -245,17 +242,18 @@ impl AstraService {
             }
         };
         plan.record_deposit(
-            opened.operation_id,
-            opened.campaign_id,
-            opened.campaign_fingerprint,
+            opening.opened.operation_id,
+            opening.opened.campaign_id,
+            opening.opened.campaign_fingerprint,
             now_unix,
         )
         .map_err(plan_refusal)?;
         save_plan(self, &plan)?;
         Ok(DoorOutcome::ChainStep {
-            opened: Some(opened),
+            opened: Some(opening),
             delegation_request,
             remaining: plan.remaining(),
+            plan: Some(plan),
         })
     }
 }

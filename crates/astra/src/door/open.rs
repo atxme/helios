@@ -13,7 +13,7 @@ use aether::certificates::status::{
 };
 use aether::certificates::transport::{OperatorOpened, RevocationExpiries};
 
-use super::{DoorConnector, DoorRefusal, OpeningText};
+use super::{DoorConnector, DoorRefusal, OpenedSubject, Opening, OpeningText};
 use crate::registry::AstraState;
 use crate::service::AstraService;
 use crate::signing::SigningOperation;
@@ -59,19 +59,22 @@ impl Domain {
     }
 }
 
-/// What a resolution hands the opening: the targets, and for a revocation the
-/// signed expiries of the halves it withdraws (§5.7).
+/// What a resolution hands the opening: the targets, for a revocation the
+/// signed expiries of the halves it withdraws (§5.7), and what the console
+/// names about the subject.
 pub(super) struct Resolved {
     pub targets: Vec<CampaignTarget>,
     pub revocation_expiries: Option<RevocationExpiries>,
+    pub subject: OpenedSubject,
 }
 
 impl Resolved {
-    /// A resolution that is not a revocation: targets alone.
+    /// Rows of the domain, and nothing more: targets alone.
     pub fn targets(targets: Vec<CampaignTarget>) -> Self {
         Self {
             targets,
             revocation_expiries: None,
+            subject: OpenedSubject::Domain,
         }
     }
 }
@@ -101,7 +104,7 @@ pub(super) async fn open_campaign(
     text: OpeningText,
     resolve: impl FnOnce(&AstraState) -> Result<Resolved, DoorRefusal>,
     now_unix: u64,
-) -> Result<OperatorOpened, DoorRefusal> {
+) -> Result<Opening, DoorRefusal> {
     check_text(&text)?;
 
     let (
@@ -109,6 +112,7 @@ pub(super) async fn open_campaign(
         Resolved {
             targets,
             revocation_expiries,
+            subject,
         },
     ) = {
         let registry = service.registry.lock().await;
@@ -159,11 +163,12 @@ pub(super) async fn open_campaign(
         .validate(now_unix)
         .map_err(|error| DoorRefusal::Store(error.into()))?;
 
+    let authority_url = domain.authority_url;
     let signer_request = AstraSignerRequest {
         format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
         operation_id: fresh_id()?,
         campaign_fingerprint: campaign.fingerprint(),
-        authority_url: domain.authority_url,
+        authority_url: authority_url.clone(),
         encrypted_vault_fingerprint: vault_fingerprint,
         required_credentials: campaign.required_credentials,
         created_at: now_unix,
@@ -197,7 +202,11 @@ pub(super) async fn open_campaign(
     store
         .open(operation, now_unix)
         .map_err(DoorRefusal::Store)?;
-    Ok(opened)
+    Ok(Opening {
+        opened,
+        authority_url,
+        subject,
+    })
 }
 
 /// The requester the operator reads, with the identity the tunnel resolved.

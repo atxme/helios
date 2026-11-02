@@ -1,13 +1,14 @@
-//! Everything `astra run` brings up, and the two tasks it leaves running.
+//! Everything `astra run` brings up, and the tasks it leaves running.
 //!
-//! One entry point, `run`, which never returns until the public endpoint
-//! does: the volume lock first, then the pinned channel, then the registry and
-//! the secrets a served authority needs, then the listener the gateway dials,
-//! then the runtime that carries the public endpoint, the reconciliation
-//! repair and the campaign inbox drain.
+//! One entry point, `run`, which returns when the public endpoint or the door
+//! socket fails, or when the process is asked to stop: the volume lock first,
+//! then the pinned channel, then the registry and the secrets a served
+//! authority needs, then the listener the gateway dials, then the runtime
+//! that carries the public endpoint, the door's local socket, the
+//! reconciliation repair and the sweep of expired anchor transitions.
 
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use aether::certificates::encoding::Fingerprint;
@@ -18,7 +19,6 @@ use astra::DelegatedIssuer;
 use tokio::sync::Mutex;
 use zeroize::Zeroizing;
 
-use crate::campaign_deposit::load_encrypted_vault;
 use crate::private_channel::{open_gateway_channel, private_listener};
 use crate::{now_unix, REGISTRY_FILE, SERVICE_KEY_FILE};
 
@@ -39,6 +39,23 @@ const OPERATIONS_FILE: &str = "client-renewal-operations.json";
 const CREDENTIALS_FILE: &str = "astra-credentials.json";
 /// Largest credential document read, in bytes.
 const MAX_CREDENTIALS_BYTES: u64 = 1024 * 1024;
+/// The encrypted authority vault, as the companion wrote it.
+///
+/// Astra transports and backs it up; it does not open it, and nothing in this
+/// container can — the key-slots unwrap under a FIDO2 `hmac-secret` output
+/// that never leaves the operator's token. Copied in by an operator, exactly
+/// like the credential document.
+const VAULT_FILE: &str = "authority-vault.json";
+/// Largest vault file read, in bytes.
+///
+/// The same ceiling the companion applies to its own copy: a file larger than
+/// this is not a vault with more key-slots, it is a mistake or a wedge.
+const MAX_VAULT_BYTES: u64 = 4 * 1024 * 1024;
+/// How often anchor transitions past their window are forgotten.
+///
+/// Two seconds, the period of the campaign inbox drain this sweep used to
+/// share a loop with.
+const TRANSITION_SWEEP_INTERVAL_SECS: u64 = 2;
 
 pub(crate) fn run(
     state_dir: &Path,
@@ -119,6 +136,7 @@ pub(crate) fn run(
         reconciliation: Mutex::new(()),
         encrypted_vault,
         gateway,
+        volume_writes: astra::door::VolumeWrites::new(),
     });
 
     // Built before the runtime, and fatal when unusable: a listener whose pin
@@ -150,18 +168,85 @@ pub(crate) fn run(
             });
         }
         spawn_reconciliation_repair(service.clone());
-        spawn_campaign_drain(service.clone(), state_dir.to_path_buf());
+        spawn_transition_sweep(service.clone());
         let listener = tokio::net::TcpListener::bind(bind)
             .await
             .with_context(|| format!("binding {bind}"))?;
         tracing::info!(%bind, "Astra public endpoint listening");
-        axum::serve(
-            listener,
-            astra::service::router(service).into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .await
-        .context("serving the Astra public endpoint")
+        let socket = state_dir.join(astra::door::DOOR_SOCKET_FILE);
+        // Three ways out, and each ends the process. The door is fatal like
+        // the public endpoint: a service the console cannot reach opens
+        // nothing, and refusing to start says so where an operator looks. A
+        // stop request ends both; dropping the door's future removes its
+        // socket, while this process still holds the volume.
+        tokio::select! {
+            served = axum::serve(
+                listener,
+                astra::service::router(service.clone())
+                    .into_make_service_with_connect_info::<SocketAddr>(),
+            ) => served.context("serving the Astra public endpoint"),
+            served = astra::door::local::serve(&socket, service) => {
+                served.context("serving Astra's door on its local socket")
+            }
+            stopped = shutdown_signal() => {
+                stopped?;
+                tracing::info!("Astra stopping");
+                Ok(())
+            }
+        }
     })
+}
+
+/// Waits for `SIGTERM` (a container stop) or `SIGINT`.
+async fn shutdown_signal() -> Result<()> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("installing the SIGTERM handler")?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result.context("waiting for SIGINT"),
+        signal = terminate.recv() => {
+            anyhow::ensure!(signal.is_some(), "the SIGTERM handler closed unexpectedly");
+            Ok(())
+        }
+    }
+}
+
+/// Reads the encrypted vault, if an operator has copied one into the volume.
+///
+/// The bytes are kept exactly as written and never parsed: Astra serves them
+/// to a companion that holds the key-slots, and a value it had opinions about
+/// would be a value it could substitute. Its fingerprint is what the signed
+/// `AstraSignerRequest` names, so a wrong file is refused by the companion —
+/// not by this read.
+///
+/// Absent is a supported state, and the ordinary one: only a ceremony that
+/// makes a master key sign needs it. Saying so at start-up beats discovering
+/// it in the middle of a ceremony.
+fn load_encrypted_vault(state_dir: &Path) -> Result<Option<Vec<u8>>> {
+    let path = state_dir.join(VAULT_FILE);
+    let Ok(metadata) = std::fs::metadata(&path) else {
+        tracing::info!(
+            path = %path.display(),
+            "no encrypted vault in the state volume: anchor rotations and revocations are \
+             refused by name; every other scope is unaffected"
+        );
+        return Ok(None);
+    };
+    if metadata.len() > MAX_VAULT_BYTES {
+        anyhow::bail!(
+            "{} is {} bytes, over the {MAX_VAULT_BYTES}-byte ceiling: this is not a vault",
+            path.display(),
+            metadata.len()
+        );
+    }
+    let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+    let fingerprint = Fingerprint::of(&bytes);
+    tracing::info!(
+        path = %path.display(),
+        vault_sha256 = %fingerprint,
+        bytes = bytes.len(),
+        "encrypted vault held for the companion — this process cannot open it"
+    );
+    Ok(Some(bytes))
 }
 
 /// Finishes recoveries whose promotions this authority never adopted.
@@ -217,28 +302,18 @@ fn spawn_reconciliation_repair(service: std::sync::Arc<astra::service::AstraServ
     });
 }
 
-/// Adopts the campaigns a local operator command deposited.
+/// Forgets anchor transitions that can no longer authorize anything.
 ///
-/// The store lives in this process, in memory; `astra campaign open` runs in
-/// another one. This is the same arrangement `heliosd` uses for console
-/// admissions, and for the same reason: one owner of the state, and a second
-/// process that may only leave something for it.
-///
-/// A deposit that does not verify is **removed**, not retried. It sat between
-/// two processes on disk, and re-reading it every two seconds until its window
-/// closes would turn one bad file into a log the operator has to scroll past.
-fn spawn_campaign_drain(service: Arc<AstraService>, state_dir: PathBuf) {
+/// Its own loop, on its own interval: a bounded store that only ever grows
+/// refuses the next rotation, and it would refuse it during a ceremony.
+fn spawn_transition_sweep(service: Arc<AstraService>) {
     tokio::spawn(async move {
-        let directory = state_dir.join(astra::signing::CAMPAIGN_INBOX_DIR);
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
-            astra::signing::INBOX_POLL_INTERVAL_SECS,
+            TRANSITION_SWEEP_INTERVAL_SECS,
         ));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
-            // Anchor transitions that can no longer authorize anything, on the
-            // same tick. A bounded store that only ever grows refuses the next
-            // rotation, and it would refuse it during a ceremony.
             match service
                 .registry
                 .lock()
@@ -256,63 +331,8 @@ fn spawn_campaign_drain(service: Arc<AstraService>, state_dir: PathBuf) {
                     "could not sweep the expired anchor transitions"
                 ),
             }
-            let Ok(entries) = std::fs::read_dir(&directory) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
-                    continue;
-                }
-                match adopt_campaign_file(&service, &path).await {
-                    Ok(operation_id) => tracing::info!(
-                        %operation_id,
-                        "manual campaign adopted; the companion may fetch it"
-                    ),
-                    Err(error) => tracing::error!(
-                        file = %path.display(),
-                        %error,
-                        "manual campaign refused: nothing was opened, and the operator has to \
-                         run `astra campaign open` again"
-                    ),
-                }
-                let _ = std::fs::remove_file(&path);
-            }
         }
     });
-}
-
-/// Reads one deposit and opens the operation it describes.
-async fn adopt_campaign_file(
-    service: &Arc<AstraService>,
-    path: &Path,
-) -> Result<aether::certificates::encoding::Id16> {
-    let metadata = std::fs::metadata(path)?;
-    if metadata.len() > astra::signing::MAX_INBOX_ENTRY_BYTES {
-        anyhow::bail!("{} bytes: this is not a campaign", metadata.len());
-    }
-    let bytes = std::fs::read(path)?;
-    let deposit: astra::signing::CampaignDeposit =
-        serde_json::from_slice(&bytes).context("decoding the campaign")?;
-    let (service_public_key, service_key_epoch, authority_url) = {
-        let registry = service.registry.lock().await;
-        let state = registry.state();
-        (
-            state.astra_service_public_key.clone(),
-            state.astra_service_key_epoch,
-            state.authority_url.clone(),
-        )
-    };
-    let mut store = service.signing.lock().await;
-    astra::signing::adopt_deposit(
-        &mut store,
-        deposit,
-        &service_public_key,
-        service_key_epoch,
-        &authority_url,
-        now_unix(),
-    )
-    .map_err(|error| anyhow::anyhow!("{error}"))
 }
 
 /// The credentials an ordinary renewal may be approved by.

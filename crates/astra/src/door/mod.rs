@@ -41,6 +41,7 @@
 
 mod chain;
 mod issuer;
+pub mod local;
 mod lock;
 mod open;
 mod resolve;
@@ -56,12 +57,16 @@ use aether::certificates::transport::{OperatorOpenAction, OperatorOpenRequest, O
 use astra_channel::OperatorIdentity;
 use serde::{Deserialize, Serialize};
 
+use crate::chain::ChainPlan;
 use crate::service::{AstraService, ServiceError};
 use crate::signing::SigningError;
 
-pub use lock::{VolumeLock, VOLUME_LOCK_FILE};
+pub use lock::{VolumeLock, VolumeWrites, VolumeWritesHeld, VOLUME_LOCK_FILE};
 use open::Resolved;
 pub use open::MAX_OPENING_WINDOW_SECS;
+
+/// The service's Unix socket in the state volume, the console's connector.
+pub const DOOR_SOCKET_FILE: &str = "operator.sock";
 
 /// The gateway leaf in service, exported for the operator companion.
 ///
@@ -200,32 +205,80 @@ impl From<OperatorOpenRequest> for DoorRequest {
     }
 }
 
+/// A campaign the door opened, and what the console prints about it.
+///
+/// `opened` is what the tunnel answers with; the rest is for the local
+/// console, which prints the companion's command line and the facts the
+/// operator checks before the touch, exactly as it always has, without
+/// reading the registry itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Opening {
+    pub opened: OperatorOpened,
+    /// Where the companion fetches the operation: the domain's own URL.
+    pub authority_url: String,
+    pub subject: OpenedSubject,
+}
+
+/// What a campaign froze, beyond its rows, as the console names it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum OpenedSubject {
+    /// Rows of the domain, with nothing more to say about them.
+    Domain,
+    /// One admitted client, at the generation and counter it is withdrawn at.
+    Client {
+        name: String,
+        generation: u64,
+        /// The counter the registry holds; the revocation advances it by one.
+        revocation_epoch: u64,
+    },
+    /// The gateway identity the daemon serves, read live.
+    Gateway {
+        /// The decision epoch the daemon reports; a decision advances it by
+        /// one.
+        decision_epoch: u64,
+        tls_certificate_fingerprint: Fingerprint,
+        pq_certificate_fingerprint: Fingerprint,
+    },
+}
+
 /// What the door produced.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serializable because it is the answer of the local socket.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum DoorOutcome {
     /// A campaign waiting for its operator.
-    Opened(OperatorOpened),
+    Opened(Opening),
     /// A step of the certificate chain.
     ///
-    /// `opened` is `None` when the step just taken finished the chain.
-    /// `delegation_request` is the public request of the issuer step, which
-    /// the console writes where its `--out` says. `remaining` counts the
-    /// steps left, the one just opened included.
+    /// `opened` is `None` when the step just taken finished the chain, and
+    /// `plan` is then `None` too: the plan is gone. `delegation_request` is
+    /// the public request of the issuer step, which the console writes where
+    /// its `--out` says. `remaining` counts the steps left, the one just
+    /// opened included. `plan` is the plan as saved, for the console to print.
     ChainStep {
-        opened: Option<OperatorOpened>,
+        opened: Option<Opening>,
         delegation_request: Option<String>,
         remaining: usize,
+        plan: Option<ChainPlan>,
     },
-    /// The plan is gone; what was approved keeps its effect.
-    ChainAbandoned,
+    /// The plan is gone; what was approved keeps its effect. `plan` is the
+    /// plan as it stood when it was dropped.
+    ChainAbandoned { plan: ChainPlan },
     /// A delegation's public request, exactly the JSON `issuer request`
     /// prints, and the campaign it was opened under when it has one.
     IssuerRequested {
         request: String,
-        opened: Option<OperatorOpened>,
+        opened: Option<Opening>,
     },
-    /// The client `CA-TLS` is pinned, now or before; the audit head after it.
-    Pinned { audit_head: Fingerprint },
+    /// The client `CA-TLS` is pinned; the audit head after it. `changed` is
+    /// `false` when it was pinned already, which is not a refusal.
+    Pinned {
+        audit_head: Fingerprint,
+        changed: bool,
+    },
     /// A delegation is recorded. Astra issues under it once restarted: the
     /// delegated issuer is read at start-up, beside its private keys.
     IssuerInstalled {
@@ -236,7 +289,44 @@ pub enum DoorOutcome {
     /// The transition is marked published here, durably. `confirmed` says
     /// whether the gateway acknowledged it; when it did not, the same request
     /// relays it again.
-    Published { epoch: u64, confirmed: bool },
+    Published {
+        epoch: u64,
+        transition_fingerprint: Fingerprint,
+        /// When the transition takes effect, from its signed window.
+        activation_at: u64,
+        confirmed: bool,
+    },
+}
+
+impl From<write::AnchorPinned> for DoorOutcome {
+    fn from(pinned: write::AnchorPinned) -> Self {
+        Self::Pinned {
+            audit_head: pinned.audit_head,
+            changed: pinned.changed,
+        }
+    }
+}
+
+impl From<write::IssuerInstalled> for DoorOutcome {
+    fn from(installed: write::IssuerInstalled) -> Self {
+        Self::IssuerInstalled {
+            issuer_epoch: installed.issuer_epoch,
+            not_after: installed.not_after,
+            audit_head: installed.audit_head,
+        }
+    }
+}
+
+impl DoorOutcome {
+    /// A publication, from its durable mark and whether the gateway confirmed.
+    pub fn published(mark: write::PublicationMark, confirmed: bool) -> Self {
+        Self::Published {
+            epoch: mark.epoch,
+            transition_fingerprint: mark.transition_fingerprint,
+            activation_at: mark.activation_at,
+            confirmed,
+        }
+    }
 }
 
 /// Why the door refused, as a complete sentence for the local console.
@@ -437,13 +527,13 @@ impl AstraService {
             Err(DoorRefusal::NotAllowedHere)
         };
         match &outcome {
-            Ok(DoorOutcome::Opened(opened))
+            Ok(DoorOutcome::Opened(Opening { opened, .. }))
             | Ok(DoorOutcome::ChainStep {
-                opened: Some(opened),
+                opened: Some(Opening { opened, .. }),
                 ..
             })
             | Ok(DoorOutcome::IssuerRequested {
-                opened: Some(opened),
+                opened: Some(Opening { opened, .. }),
                 ..
             }) => tracing::info!(
                 connector = %connector,
@@ -455,17 +545,21 @@ impl AstraService {
             ),
             Ok(
                 DoorOutcome::ChainStep { opened: None, .. }
-                | DoorOutcome::ChainAbandoned
+                | DoorOutcome::ChainAbandoned { .. }
                 | DoorOutcome::IssuerRequested { opened: None, .. },
             ) => tracing::info!(
                 connector = %connector,
                 action,
                 "operator action performed through the door"
             ),
-            Ok(DoorOutcome::Pinned { audit_head }) => tracing::info!(
+            Ok(DoorOutcome::Pinned {
+                audit_head,
+                changed,
+            }) => tracing::info!(
                 connector = %connector,
                 action,
                 %audit_head,
+                changed,
                 "client CA-TLS anchor pinned through the door"
             ),
             Ok(DoorOutcome::IssuerInstalled {
@@ -480,7 +574,9 @@ impl AstraService {
                 %audit_head,
                 "delegation recorded through the door; restart Astra to issue under it"
             ),
-            Ok(DoorOutcome::Published { epoch, confirmed }) => tracing::info!(
+            Ok(DoorOutcome::Published {
+                epoch, confirmed, ..
+            }) => tracing::info!(
                 connector = %connector,
                 action,
                 epoch,
@@ -557,9 +653,9 @@ impl AstraService {
             DoorRequest::ChainNext {} => self.chain_next(connector, now_unix).await,
             DoorRequest::ChainAbandon {} => self.chain_abandon().await,
             DoorRequest::IssuerDelegation { text } => {
-                let _volume = chain::VOLUME_WRITES.lock().await;
+                let volume = self.volume_writes.lock().await;
                 let (request, opened) = self
-                    .open_issuer_delegation(connector, text, now_unix)
+                    .open_issuer_delegation(&volume, connector, text, now_unix)
                     .await?;
                 Ok(DoorOutcome::IssuerRequested {
                     request,
@@ -567,8 +663,8 @@ impl AstraService {
                 })
             }
             DoorRequest::IssuerRequest {} => {
-                let _volume = chain::VOLUME_WRITES.lock().await;
-                let request = self.issuer_request_only(now_unix).await?;
+                let volume = self.volume_writes.lock().await;
+                let request = self.issuer_request_only(&volume, now_unix).await?;
                 Ok(DoorOutcome::IssuerRequested {
                     request,
                     opened: None,
@@ -576,25 +672,15 @@ impl AstraService {
             }
             DoorRequest::PinCaTls { fingerprint } => {
                 let mut registry = self.registry.lock().await;
-                let audit_head = write::pin_ca_tls(&mut registry, fingerprint, now_unix)?;
-                Ok(DoorOutcome::Pinned { audit_head })
+                write::pin_ca_tls(&mut registry, fingerprint, now_unix).map(DoorOutcome::from)
             }
             DoorRequest::IssuerInstall { authorization } => {
                 // The key files an install reads are the ones an issuer
                 // request writes, by epoch: the two never interleave.
-                let _volume = chain::VOLUME_WRITES.lock().await;
+                let _volume = self.volume_writes.lock().await;
                 let mut registry = self.registry.lock().await;
-                let installed = write::issuer_install(
-                    &mut registry,
-                    &self.state_dir,
-                    *authorization,
-                    now_unix,
-                )?;
-                Ok(DoorOutcome::IssuerInstalled {
-                    issuer_epoch: installed.issuer_epoch,
-                    not_after: installed.not_after,
-                    audit_head: installed.audit_head,
-                })
+                write::issuer_install(&mut registry, &self.state_dir, *authorization, now_unix)
+                    .map(DoorOutcome::from)
             }
             DoorRequest::GatewayIdentityPublish { epoch } => {
                 self.publish_gateway_transition(epoch, now_unix).await
@@ -623,7 +709,7 @@ impl AstraService {
             write::mark_gateway_transition_published(&mut registry, epoch, now_unix)?
         };
         let confirmed = write::relay_gateway_publication(channel, &mark).await;
-        Ok(DoorOutcome::Published { epoch, confirmed })
+        Ok(DoorOutcome::published(mark, confirmed))
     }
 
     /// Freezes the gateway identity in service into a campaign.
@@ -634,7 +720,7 @@ impl AstraService {
         connector: &DoorConnector,
         text: OpeningText,
         now_unix: u64,
-    ) -> Result<OperatorOpened, DoorRefusal> {
+    ) -> Result<Opening, DoorRefusal> {
         open::check_text(&text)?;
         let identity = self.read_gateway_identity().await?;
         // Exported because the companion cannot verify the §5 request's
@@ -648,11 +734,7 @@ impl AstraService {
             connector,
             CampaignScope::GatewayIdentity,
             text,
-            |state| {
-                Ok(Resolved::targets(vec![resolve::gateway_row(
-                    state, &identity,
-                )]))
-            },
+            |state| Ok(resolve::gateway_identity(state, &identity)),
             now_unix,
         )
         .await

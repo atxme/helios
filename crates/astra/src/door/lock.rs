@@ -47,3 +47,36 @@ impl VolumeLock {
         }
     }
 }
+
+/// One writer of the volume's own files inside the service at a time.
+///
+/// The cross-process half is [`VolumeLock`]; this is the in-process half. The
+/// chain plan is read, changed and written back around a number of `.await`s,
+/// and the delegation key files are named by epoch: two requests interleaving
+/// would each act on a state the other is changing. Neither the registry nor
+/// the operation store may be taken to hold this, and neither is held under
+/// it across an `.await`.
+#[derive(Debug, Default)]
+pub struct VolumeWrites(tokio::sync::Mutex<()>);
+
+/// Proof that [`VolumeWrites`] is held, for the functions that require it.
+///
+/// Taken as a parameter rather than stated in a comment, so that calling one
+/// of them without the gate is a compile error.
+#[derive(Debug)]
+pub struct VolumeWritesHeld<'a> {
+    _guard: tokio::sync::MutexGuard<'a, ()>,
+}
+
+impl VolumeWrites {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Waits for the gate, and holds it until the proof is dropped.
+    pub async fn lock(&self) -> VolumeWritesHeld<'_> {
+        VolumeWritesHeld {
+            _guard: self.0.lock().await,
+        }
+    }
+}

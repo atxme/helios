@@ -1,10 +1,11 @@
 //! The private veth channel to `heliosd`, in both directions (spec §8.3).
 //!
-//! One identity pair and three ways to use it: `astra init-channel` creates
-//! the pair and prints what the gateway must pin, `astra run` opens the
-//! direction Astra dials and the listener the gateway dials, and the operator
-//! commands that need the gateway's own leaves open a channel for that single
-//! question. Nothing else in this binary builds a transport.
+//! One identity pair and two ways to use it: `astra init-channel` creates the
+//! pair and prints what the gateway must pin, and `astra run` opens the
+//! direction Astra dials and the listener the gateway dials. The operator
+//! commands that need the gateway's own leaves ask the running service, which
+//! holds the channel; only `gateway-identity publish` with the service stopped
+//! opens one of its own, from the service's configuration.
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -124,23 +125,4 @@ pub(crate) fn private_listener(
         "private renewal listener ready"
     );
     Ok(Some((bind, config)))
-}
-
-/// Reads the identity the daemon **serves**, over the private channel.
-pub(crate) fn read_gateway_identity(
-    state_dir: &Path,
-    gateway_channel: SocketAddr,
-    gateway_certificate: &str,
-) -> Result<astra_channel::GatewayIdentityView> {
-    let pinned = aether::certificates::encoding::DerCertificate::parse(gateway_certificate)
-        .map_err(|error| anyhow::anyhow!("--gateway-certificate: {error}"))?;
-    let channel = astra::gateway::GatewayChannel::open(state_dir, gateway_channel, &pinned)
-        .map_err(|error| anyhow::anyhow!("opening the private gateway channel: {error}"))?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("starting a runtime for the private channel")?;
-    runtime
-        .block_on(channel.gateway_identity())
-        .context("reading the identity the gateway serves")
 }

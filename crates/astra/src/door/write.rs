@@ -25,21 +25,31 @@ use crate::gateway::GatewayChannel;
 use crate::issuer::AdoptionError;
 use crate::registry::{AstraRegistry, RegistryError};
 
+/// What pinning the client `CA-TLS` did, as `pin-ca-tls` prints it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnchorPinned {
+    /// The audit head after the write, or as it was when nothing changed.
+    pub audit_head: Fingerprint,
+    /// `false` when this anchor was pinned already.
+    pub changed: bool,
+}
+
 /// Records the client `CA-TLS` in service, once (spec §9.4).
 ///
 /// Pinning the anchor already held changes nothing and is not a refusal, so a
 /// deployment may run it on every pass. Another anchor is refused: replacing a
 /// pinned anchor is a rotation, and a rotation is signed.
-///
-/// Returns the audit head after the write.
 pub fn pin_ca_tls(
     registry: &mut AstraRegistry,
     fingerprint: Fingerprint,
     now_unix: u64,
-) -> Result<Fingerprint, DoorRefusal> {
+) -> Result<AnchorPinned, DoorRefusal> {
     if let Some(held) = registry.state().ca_tls_fingerprint {
         return if held.matches(&fingerprint) {
-            Ok(registry.audit_head())
+            Ok(AnchorPinned {
+                audit_head: registry.audit_head(),
+                changed: false,
+            })
         } else {
             Err(DoorRefusal::ClientTlsAnchorAlreadyPinned)
         };
@@ -47,7 +57,10 @@ pub fn pin_ca_tls(
     registry
         .write_or_restore(|registry| registry.pin_client_tls_ca(fingerprint, now_unix))
         .map_err(|error| not_recorded("pin the client CA-TLS anchor", &error))?;
-    Ok(registry.audit_head())
+    Ok(AnchorPinned {
+        audit_head: registry.audit_head(),
+        changed: true,
+    })
 }
 
 /// What an installed delegation is, as `issuer install` prints it.

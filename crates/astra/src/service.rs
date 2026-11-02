@@ -313,6 +313,9 @@ pub struct AstraService {
     /// the public companion transport of §8.2 is the separate out-of-tunnel
     /// path served below.
     pub gateway: Option<crate::gateway::GatewayChannel>,
+    /// One writer of the chain plan and of the delegation key files at a
+    /// time, inside this service (see [`crate::door::VolumeWrites`]).
+    pub volume_writes: crate::door::VolumeWrites,
 }
 
 impl AstraService {
