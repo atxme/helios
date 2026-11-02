@@ -141,8 +141,10 @@ Les sous-lots 5b et 5c y brancheront les écrans d'Orion.
   `admin`, aucune identité relayée ne remplace le toucher des clés.
 - Deux chemins d'ouverture qui décident différemment : la console et le tunnel
   appellent la même fonction, avec la même résolution et les mêmes bornes.
-- Un repli silencieux : si le service ne tourne pas, la console refuse ; elle
-  ne retombe jamais sur l'écriture directe des fichiers.
+- Un repli silencieux : une ouverture sans service en marche est refusée,
+  jamais déposée sur disque ; une écriture ne choisit jamais son chemin selon
+  qu'une connexion a réussi, mais selon le verrou du volume (§5.9).
+- Deux écrivains à la fois sur `/var/lib/astra`, quel que soit le chemin.
 - Une route publique d'ouverture : `/v1/campaigns` reste refusée.
 - Une ouverture qui expose l'inventaire à un pair non administrateur.
 
@@ -272,8 +274,12 @@ une action est un changement explicite de cette table, pas un effet de bord.
   dont la ligne `astra-signer revoke …` complète qu'elles impriment déjà (les
   docs et `astra-signer`, livré jusqu'au lot 7, s'en servent) : elles envoient
   la requête, attendent la réponse et impriment.
-- Service arrêté ou socket absent : refus clair (« le service Astra ne tourne
-  pas : rien n'a été ouvert »), code de sortie non nul, aucune écriture.
+- **Ouvertures** (campagnes, révocations, chaîne, délégation) avec le service
+  arrêté : refus clair (« le service Astra ne tourne pas : rien n'a été
+  ouvert »), code de sortie non nul, aucune écriture. Une campagne vit dans la
+  mémoire du service : sans lui, il n'y a rien à ouvrir.
+- **Écritures** du §5.6 avec le service arrêté : chemin local, sous le verrou
+  du volume (§5.9).
 - La console s'emploie par `compose exec` (DEPLOIEMENT-ASTRA, tableau « en
   marche ») : c'est le même conteneur, donc le même socket.
 - **Retirés** : `campaign-inbox/`, `spawn_campaign_drain`,
@@ -324,19 +330,32 @@ concepteur.*
   `CampaignCommand::Open`, `daemon.rs`).
 - **ROADMAP** (F14) et **MANUAL-TESTING** (« F. Lot 5a »).
 
-### 5.9 Le service seul écrivain
+### 5.9 Un seul écrivain à la fois : le verrou du volume
 
-- Avec le service en marche, plus aucune commande de la console n'ouvre
-  `registry.json` en écriture. Un test (ou un contrôle par recherche dans le
-  code) le garantit pour chaque sous-commande hormis `bootstrap`.
-- **`bootstrap` reste une commande locale** : c'est l'acte fondateur, il crée
-  le registre avant qu'aucun service n'existe, et il refuse déjà un registre
-  présent. Il refuse aussi quand le socket de la porte répond (service en
-  marche).
-- **`init-channel` reste une commande locale** : il écrit l'identité de
-  transport du canal privé, que le service ne lit qu'au démarrage et qui exige
-  de toute façon de réépingler la gateway. Il refuse quand le service est en
-  marche.
+**Correction après approbation, trouvée en écrivant le plan.**
+`scripts/deploy.sh` arrête exprès le service avant d'amorcer, puis lance
+`pin-ca-tls` dans un conteneur jetable monté sur le volume
+(`scripts/deploy.sh:704-720` : « deux processus sur `/var/lib/astra` sont une
+corruption de registre »). Une écriture qui exigerait le service casserait le
+déploiement, que ce lot ne modifie pas. La règle devient donc « un seul
+écrivain à la fois », tenue par un verrou plutôt que par une convention :
+
+- `astra run` prend au démarrage un **verrou exclusif** sur un fichier du
+  volume (par exemple `<state_dir>/astra.lock`, `std::fs::File::try_lock`) et
+  le garde toute sa vie. Verrou déjà tenu : démarrage refusé par son nom.
+- Une écriture de la console (`PinCaTls`, `IssuerInstall`,
+  `GatewayIdentityPublish`) tente le même verrou :
+  - **obtenu** : aucun service ne tourne ; elle écrit localement, comme
+    aujourd'hui, en gardant le verrou jusqu'à la fin ;
+  - **tenu** : le service tourne ; elle passe par la porte (§5.5) ;
+  - **tenu et socket muet** : refus (« un autre processus tient le volume »).
+- `bootstrap` exige le verrou et refuse sinon ; il refuse déjà un registre
+  présent.
+- Avec le service en marche, aucune commande de la console n'ouvre donc
+  `registry.json` en écriture ; un test le garantit par sous-commande.
+- **`init-channel` est inchangé** : il n'écrit pas le registre mais
+  l'identité de transport, lue au démarrage seulement, et `deploy.sh` peut le
+  lancer par `exec` sur un service en marche.
 - `status` reste une lecture ; le constructeur choisit s'il lit par la porte
   ou le fichier (§9).
 
