@@ -10,8 +10,11 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+#[cfg(not(windows))]
 use crate::config::ClientConfig;
+#[cfg(not(windows))]
 use crate::identity_store::ProtectedIdentityStore;
+#[cfg(not(windows))]
 use crate::vault::ProfileStore;
 
 /// Log file, beside the vault it describes. Same name as the shell's log.
