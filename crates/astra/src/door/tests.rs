@@ -10,6 +10,9 @@ use aether::certificates::status::CertificateKind;
 use aether::key_negotiation::{PqCertificate, PqCertificateRole, PQ_CERTIFICATE_VERSION};
 use tokio::sync::Mutex;
 
+use aether::certificates::status::CampaignScope;
+use aether::certificates::transport::RevocationExpiries;
+
 use super::*;
 use crate::registry::{AstraRegistry, AstraState, ChallengeStore, PeerRecord};
 use crate::service::{SourceBudget, MAX_LIVE_CHALLENGES};
@@ -152,6 +155,10 @@ fn console() -> DoorConnector {
     DoorConnector::Console { uid: 1000 }
 }
 
+fn peer_key(seed: u8) -> WireGuardKey {
+    WireGuardKey::from_bytes([seed; 32])
+}
+
 fn tunnel_key() -> WireGuardKey {
     WireGuardKey::from_bytes([9; 32])
 }
@@ -194,6 +201,9 @@ fn specified(request: &DoorRequest) -> (bool, bool) {
     match request {
         DoorRequest::FleetLeafs { .. } => (true, true),
         DoorRequest::TrustAuthorities { .. } => (true, true),
+        DoorRequest::ClientRevocation { .. } => (true, true),
+        DoorRequest::GatewayRevocation { .. } => (true, false),
+        DoorRequest::GatewayIdentity { .. } => (true, false),
     }
 }
 
@@ -202,6 +212,12 @@ fn the_policy_table_is_exactly_the_specification() {
     let requests = [
         DoorRequest::FleetLeafs { text: text() },
         DoorRequest::TrustAuthorities { text: text() },
+        DoorRequest::ClientRevocation {
+            peer: peer_key(2),
+            text: text(),
+        },
+        DoorRequest::GatewayRevocation { text: text() },
+        DoorRequest::GatewayIdentity { text: text() },
     ];
     let tunnels = [
         tunnel(),
@@ -229,19 +245,23 @@ fn the_policy_table_is_exactly_the_specification() {
 }
 
 #[test]
-fn a_tunnel_request_for_a_client_revocation_is_refused_until_the_door_has_it() {
+fn a_tunnel_request_is_the_doors_own() {
     let request = OperatorOpenRequest {
-        action: OperatorOpenAction::ClientRevocation {
-            peer: WireGuardKey::from_bytes([2; 32]),
-        },
+        action: OperatorOpenAction::ClientRevocation { peer: peer_key(2) },
         reason: "stolen".into(),
         requested_by: "alice".into(),
         window_secs: 300,
     };
-    assert!(matches!(
-        DoorRequest::try_from(request),
-        Err(DoorRefusal::NotAllowedHere)
-    ));
+    assert_eq!(
+        DoorRequest::from(request),
+        DoorRequest::ClientRevocation {
+            peer: peer_key(2),
+            text: OpeningText {
+                reason: "stolen".into(),
+                ..text()
+            }
+        }
+    );
 
     let request = OperatorOpenRequest {
         action: OperatorOpenAction::FleetLeafs,
@@ -250,7 +270,7 @@ fn a_tunnel_request_for_a_client_revocation_is_refused_until_the_door_has_it() {
         window_secs: 120,
     };
     assert_eq!(
-        DoorRequest::try_from(request).expect("fleet leafs"),
+        DoorRequest::from(request),
         DoorRequest::FleetLeafs {
             text: OpeningText {
                 window_secs: 120,
@@ -614,4 +634,119 @@ async fn the_signer_request_verifies_under_the_service_key() {
         .signer_request
         .encrypted_vault_fingerprint
         .matches(&Fingerprint::of(b"placeholder encrypted vault")));
+}
+
+fn revocation(seed: u8) -> DoorRequest {
+    DoorRequest::ClientRevocation {
+        peer: peer_key(seed),
+        text: text(),
+    }
+}
+
+#[tokio::test]
+async fn a_client_revocation_carries_its_signed_expiry() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let service = fixture(dir.path());
+    let opened = opened(service.door(console(), revocation(2), NOW).await);
+    assert_eq!(opened.scope, CampaignScope::EmergencyRevocation);
+    assert_eq!(opened.target_count, 1);
+    let active = service.registry.lock().await.state().peers[&peer_key(2).to_base64()]
+        .active
+        .not_after;
+    assert_eq!(active, NOW * 2);
+    assert_eq!(
+        opened.revocation_expiries,
+        Some(RevocationExpiries {
+            tls_not_after: Some(active),
+            pq_not_after: Some(active),
+        })
+    );
+    let campaign = campaign_of(&service, &opened).await;
+    assert_eq!(campaign.targets[0].identity_key, peer_key(2));
+    assert_eq!(campaign.targets[0].generation, 4);
+}
+
+#[tokio::test]
+async fn two_peers_can_be_revoked_at_once() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let service = fixture(dir.path());
+    let first = opened(service.door(console(), revocation(2), NOW).await);
+    let second = opened(service.door(tunnel(), revocation(3), NOW).await);
+    assert_ne!(first.operation_id, second.operation_id);
+}
+
+#[tokio::test]
+async fn the_same_peer_cannot_be_revoked_twice_at_once() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let service = fixture(dir.path());
+    let first = opened(service.door(console(), revocation(2), NOW).await);
+    match service.door(console(), revocation(2), NOW).await {
+        Err(DoorRefusal::AlreadyOpen { operation_id }) => {
+            assert_eq!(operation_id, first.operation_id)
+        }
+        other => panic!("expected AlreadyOpen, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn an_unknown_peer_is_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let service = fixture(dir.path());
+    let refusal = service
+        .door(console(), revocation(77), NOW)
+        .await
+        .expect_err("unknown");
+    assert!(matches!(refusal, DoorRefusal::PeerUnknown));
+    assert!(matches!(refusal.class(), ServiceError::Refused));
+}
+
+#[tokio::test]
+async fn a_revoked_peer_is_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let service = fixture(dir.path());
+    service
+        .registry
+        .lock()
+        .await
+        .revoke(&peer_key(2), 1, NOW - 10)
+        .expect("revoked");
+    let refusal = service
+        .door(console(), revocation(2), NOW)
+        .await
+        .expect_err("revoked");
+    assert!(matches!(refusal, DoorRefusal::PeerRevoked));
+}
+
+#[tokio::test]
+async fn a_revocation_obeys_the_same_bounds_as_every_opening() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let service = fixture(dir.path());
+    let request = DoorRequest::ClientRevocation {
+        peer: peer_key(2),
+        text: OpeningText {
+            window_secs: 301,
+            ..text()
+        },
+    };
+    assert!(matches!(
+        service.door(console(), request, NOW).await,
+        Err(DoorRefusal::WindowOutOfRange)
+    ));
+}
+
+#[tokio::test]
+async fn gateway_openings_need_the_service_channel() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let service = fixture(dir.path());
+    for request in [
+        DoorRequest::GatewayRevocation { text: text() },
+        DoorRequest::GatewayIdentity { text: text() },
+    ] {
+        let refusal = service
+            .door(console(), request, NOW)
+            .await
+            .expect_err("no channel");
+        assert!(matches!(refusal, DoorRefusal::GatewayChannelUnavailable));
+    }
+    assert!(!dir.path().join(GATEWAY_ACTIVE_CERTIFICATE_FILE).exists());
 }

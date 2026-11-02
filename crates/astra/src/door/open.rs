@@ -11,7 +11,7 @@ use aether::certificates::encoding::{Fingerprint, MlDsa87Signature};
 use aether::certificates::status::{
     AstraRotationCampaign, AstraSignerRequest, CampaignScope, CampaignTarget, MAX_CAMPAIGN_TARGETS,
 };
-use aether::certificates::transport::OperatorOpened;
+use aether::certificates::transport::{OperatorOpened, RevocationExpiries};
 
 use super::{DoorConnector, DoorRefusal, OpeningText};
 use crate::registry::AstraState;
@@ -59,6 +59,35 @@ impl Domain {
     }
 }
 
+/// What a resolution hands the opening: the targets, and for a revocation the
+/// signed expiries of the halves it withdraws (§5.7).
+pub(super) struct Resolved {
+    pub targets: Vec<CampaignTarget>,
+    pub revocation_expiries: Option<RevocationExpiries>,
+}
+
+impl Resolved {
+    /// A resolution that is not a revocation: targets alone.
+    pub fn targets(targets: Vec<CampaignTarget>) -> Self {
+        Self {
+            targets,
+            revocation_expiries: None,
+        }
+    }
+}
+
+/// The bounds on what the operator reads, checked before anything is resolved
+/// or dialed.
+pub(super) fn check_text(text: &OpeningText) -> Result<(), DoorRefusal> {
+    if text.reason.trim().is_empty() || text.requested_by.trim().is_empty() {
+        return Err(DoorRefusal::TextMissing);
+    }
+    if text.window_secs == 0 || text.window_secs > MAX_OPENING_WINDOW_SECS {
+        return Err(DoorRefusal::WindowOutOfRange);
+    }
+    Ok(())
+}
+
 /// Opens one campaign over the targets `resolve` reads from the registry.
 ///
 /// The registry and the operation store are never held together: the targets
@@ -70,17 +99,18 @@ pub(super) async fn open_campaign(
     connector: &DoorConnector,
     scope: CampaignScope,
     text: OpeningText,
-    resolve: impl FnOnce(&AstraState) -> Result<Vec<CampaignTarget>, DoorRefusal>,
+    resolve: impl FnOnce(&AstraState) -> Result<Resolved, DoorRefusal>,
     now_unix: u64,
 ) -> Result<OperatorOpened, DoorRefusal> {
-    if text.reason.trim().is_empty() || text.requested_by.trim().is_empty() {
-        return Err(DoorRefusal::TextMissing);
-    }
-    if text.window_secs == 0 || text.window_secs > MAX_OPENING_WINDOW_SECS {
-        return Err(DoorRefusal::WindowOutOfRange);
-    }
+    check_text(&text)?;
 
-    let (domain, targets) = {
+    let (
+        domain,
+        Resolved {
+            targets,
+            revocation_expiries,
+        },
+    ) = {
         let registry = service.registry.lock().await;
         let state = registry.state();
         (Domain::of(state), resolve(state)?)
@@ -162,7 +192,7 @@ pub(super) async fn open_campaign(
         target_count: operation.campaign.targets.len(),
         required_credentials: operation.campaign.required_credentials,
         expires_at: operation.expires_at,
-        revocation_expiries: None,
+        revocation_expiries,
     };
     store
         .open(operation, now_unix)

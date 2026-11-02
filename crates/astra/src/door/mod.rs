@@ -36,7 +36,7 @@ mod resolve;
 #[cfg(test)]
 mod tests;
 
-use aether::certificates::encoding::Id16;
+use aether::certificates::encoding::{Id16, WireGuardKey};
 use aether::certificates::status::CampaignScope;
 use aether::certificates::transport::{OperatorOpenAction, OperatorOpenRequest, OperatorOpened};
 use astra_channel::OperatorIdentity;
@@ -45,7 +45,13 @@ use serde::{Deserialize, Serialize};
 use crate::service::{AstraService, ServiceError};
 use crate::signing::SigningError;
 
+use open::Resolved;
 pub use open::MAX_OPENING_WINDOW_SECS;
+
+/// The gateway leaf in service, exported for the operator companion.
+///
+/// Public by construction, and rewritten on every gateway-identity campaign.
+pub const GATEWAY_ACTIVE_CERTIFICATE_FILE: &str = "gateway-active-certificate.json";
 
 /// Who carried a request to the door, as the transport established it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,6 +103,15 @@ pub enum DoorRequest {
     FleetLeafs { text: OpeningText },
     /// `CA-PQ`, and the client `CA-TLS` when the domain pins one.
     TrustAuthorities { text: OpeningText },
+    /// One admitted client identity, withdrawn for good.
+    ClientRevocation {
+        peer: WireGuardKey,
+        text: OpeningText,
+    },
+    /// The gateway's own leaves, read live from the daemon.
+    GatewayRevocation { text: OpeningText },
+    /// The gateway identity in service, frozen for a signed transition.
+    GatewayIdentity { text: OpeningText },
 }
 
 impl DoorRequest {
@@ -105,28 +120,28 @@ impl DoorRequest {
         match self {
             Self::FleetLeafs { .. } => "fleet_leafs",
             Self::TrustAuthorities { .. } => "trust_authorities",
+            Self::ClientRevocation { .. } => "client_revocation",
+            Self::GatewayRevocation { .. } => "gateway_revocation",
+            Self::GatewayIdentity { .. } => "gateway_identity",
         }
     }
 }
 
-impl TryFrom<OperatorOpenRequest> for DoorRequest {
-    type Error = DoorRefusal;
-
+impl From<OperatorOpenRequest> for DoorRequest {
     /// The tunnel's wire request, as the door's own.
     ///
-    /// A client revocation is refused by name until the door implements it:
-    /// translating it to anything else would open a campaign the
-    /// administrator did not ask for.
-    fn try_from(request: OperatorOpenRequest) -> Result<Self, Self::Error> {
+    /// Total: every action the wire names is one the door implements. Whether
+    /// the tunnel may ask for it is [`allowed`]'s decision, not this one's.
+    fn from(request: OperatorOpenRequest) -> Self {
         let text = OpeningText {
             reason: request.reason,
             requested_by: request.requested_by,
             window_secs: request.window_secs,
         };
         match request.action {
-            OperatorOpenAction::FleetLeafs => Ok(Self::FleetLeafs { text }),
-            OperatorOpenAction::TrustAuthorities => Ok(Self::TrustAuthorities { text }),
-            OperatorOpenAction::ClientRevocation { .. } => Err(DoorRefusal::NotAllowedHere),
+            OperatorOpenAction::FleetLeafs => Self::FleetLeafs { text },
+            OperatorOpenAction::TrustAuthorities => Self::TrustAuthorities { text },
+            OperatorOpenAction::ClientRevocation { peer } => Self::ClientRevocation { peer, text },
         }
     }
 }
@@ -172,6 +187,15 @@ pub enum DoorRefusal {
          et CA-PQ ne signerait jamais"
     )]
     NoVault,
+    #[error("ce registre ne contient aucune identité admise pour ce poste : rien n'a été ouvert")]
+    PeerUnknown,
+    #[error("ce poste est déjà révoqué, et la révocation est terminale : rien n'a été ouvert")]
+    PeerRevoked,
+    #[error(
+        "le canal privé vers la gateway n'est pas disponible : les feuilles et les échéances de la \
+         gateway ne se lisent qu'auprès d'elle, et rien n'a été ouvert"
+    )]
+    GatewayChannelUnavailable,
     #[error("le magasin des opérations refuse cette ouverture : {0}")]
     Store(SigningError),
     #[error(
@@ -193,9 +217,13 @@ impl DoorRefusal {
             | Self::AlreadyOpen { .. }
             | Self::NoTarget
             | Self::TooManyTargets
-            | Self::NoVault => ServiceError::Refused,
+            | Self::NoVault
+            | Self::PeerUnknown
+            | Self::PeerRevoked => ServiceError::Refused,
             Self::Store(SigningError::Full) => ServiceError::Throttled,
-            Self::Store(_) | Self::Internal => ServiceError::Internal,
+            Self::Store(_) | Self::GatewayChannelUnavailable | Self::Internal => {
+                ServiceError::Internal
+            }
         }
     }
 
@@ -217,6 +245,9 @@ pub fn allowed(connector: &DoorConnector, request: &DoorRequest) -> bool {
     let (console, tunnel) = match request {
         DoorRequest::FleetLeafs { .. } => (true, true),
         DoorRequest::TrustAuthorities { .. } => (true, true),
+        DoorRequest::ClientRevocation { .. } => (true, true),
+        DoorRequest::GatewayRevocation { .. } => (true, false),
+        DoorRequest::GatewayIdentity { .. } => (true, false),
     };
     match connector {
         DoorConnector::Console { .. } => console,
@@ -274,7 +305,7 @@ impl AstraService {
                 connector,
                 CampaignScope::FleetLeafs,
                 text,
-                |state| Ok(resolve::fleet_leaf_rows(state)),
+                |state| Ok(Resolved::targets(resolve::fleet_leaf_rows(state))),
                 now_unix,
             )
             .await
@@ -284,11 +315,95 @@ impl AstraService {
                 connector,
                 CampaignScope::TrustAuthorities,
                 text,
-                |state| Ok(resolve::trust_authority_rows(state)),
+                |state| Ok(Resolved::targets(resolve::trust_authority_rows(state))),
                 now_unix,
             )
             .await
             .map(DoorOutcome::Opened),
+            DoorRequest::ClientRevocation { peer, text } => open::open_campaign(
+                self,
+                connector,
+                CampaignScope::EmergencyRevocation,
+                text,
+                |state| resolve::client_revocation(state, &peer),
+                now_unix,
+            )
+            .await
+            .map(DoorOutcome::Opened),
+            DoorRequest::GatewayRevocation { text } => {
+                open::check_text(&text)?;
+                let identity = self.read_gateway_identity().await?;
+                open::open_campaign(
+                    self,
+                    connector,
+                    CampaignScope::EmergencyRevocation,
+                    text,
+                    |state| Ok(resolve::gateway_revocation(state, &identity)),
+                    now_unix,
+                )
+                .await
+                .map(DoorOutcome::Opened)
+            }
+            DoorRequest::GatewayIdentity { text } => {
+                open::check_text(&text)?;
+                let identity = self.read_gateway_identity().await?;
+                // Exported because the companion cannot verify the §5
+                // request's continuity signature without the leaf in
+                // service, and it holds no copy of it. Public material: the
+                // same leaf every admitted client pins. Written before the
+                // opening, so that a write that fails leaves nothing pending.
+                self.export_active_gateway_certificate(&identity)?;
+                open::open_campaign(
+                    self,
+                    connector,
+                    CampaignScope::GatewayIdentity,
+                    text,
+                    |state| {
+                        Ok(Resolved::targets(vec![resolve::gateway_row(
+                            state, &identity,
+                        )]))
+                    },
+                    now_unix,
+                )
+                .await
+                .map(DoorOutcome::Opened)
+            }
         }
+    }
+
+    /// What the daemon serves right now, read before any lock is taken.
+    ///
+    /// Neither the registry nor the operation store is held across the call:
+    /// a slow gateway would otherwise stall every other request.
+    async fn read_gateway_identity(
+        &self,
+    ) -> Result<astra_channel::GatewayIdentityView, DoorRefusal> {
+        let channel = self
+            .gateway
+            .as_ref()
+            .ok_or(DoorRefusal::GatewayChannelUnavailable)?;
+        channel.gateway_identity().await.map_err(|error| {
+            tracing::error!(%error, "the door could not read the gateway identity");
+            DoorRefusal::GatewayChannelUnavailable
+        })
+    }
+
+    /// Writes the leaf in service where the companion expects to find it.
+    ///
+    /// Rewritten on every campaign, at a fixed name in the state volume: the
+    /// caller never chooses the path.
+    fn export_active_gateway_certificate(
+        &self,
+        identity: &astra_channel::GatewayIdentityView,
+    ) -> Result<(), DoorRefusal> {
+        let bytes = serde_json::to_vec_pretty(&identity.pq_certificate).map_err(|error| {
+            tracing::error!(%error, "the door could not encode the gateway leaf in service");
+            DoorRefusal::Internal
+        })?;
+        let path = self.state_dir.join(GATEWAY_ACTIVE_CERTIFICATE_FILE);
+        std::fs::write(&path, bytes).map_err(|error| {
+            tracing::error!(%error, path = %path.display(), "the door could not export the gateway leaf");
+            DoorRefusal::Internal
+        })
     }
 }

@@ -11,6 +11,11 @@
 
 use aether::certificates::status::{CampaignTarget, CertificateKind};
 
+use aether::certificates::transport::RevocationExpiries;
+use astra_channel::GatewayIdentityView;
+
+use super::open::Resolved;
+use super::DoorRefusal;
 use crate::registry::AstraState;
 
 /// One row per admitted peer, pinned to the generation it is actually at.
@@ -83,4 +88,78 @@ pub(crate) fn client_tls_ca_row(state: &AstraState) -> Option<CampaignTarget> {
             active_tls_certificate_fingerprint: client_tls_ca,
             active_pq_certificate_fingerprint: client_tls_ca,
         })
+}
+
+/// One admitted client into an emergency revocation.
+///
+/// The peer must be an admitted, unrevoked identity: `revoked` is terminal, so
+/// a second revocation would be a campaign every downstream step refuses. The
+/// target is pinned to the generation this registry records as active, and
+/// its counter is the peer's own revocation epoch.
+///
+/// A client's two halves share one generation, hence one signed expiry: it is
+/// the value `astra revocation open` has always printed as `--not-after`, and
+/// the registry refuses the deposit when it disagrees with the generation.
+pub(crate) fn client_revocation(
+    state: &AstraState,
+    peer: &aether::certificates::encoding::WireGuardKey,
+) -> Result<Resolved, DoorRefusal> {
+    let record = state
+        .peers
+        .get(&peer.to_base64())
+        .ok_or(DoorRefusal::PeerUnknown)?;
+    if record.revoked {
+        return Err(DoorRefusal::PeerRevoked);
+    }
+    let not_after = record.active.not_after;
+    Ok(Resolved {
+        targets: vec![CampaignTarget {
+            certificate_kind: CertificateKind::ClientPq,
+            identity_key: record.client_wg_public_key,
+            epoch: record.revocation_epoch,
+            generation: record.active.generation,
+            active_tls_certificate_fingerprint: record.active.tls_certificate_fingerprint,
+            active_pq_certificate_fingerprint: record.active.pq_certificate_fingerprint,
+        }],
+        revocation_expiries: Some(RevocationExpiries {
+            tls_not_after: Some(not_after),
+            pq_not_after: Some(not_after),
+        }),
+    })
+}
+
+/// The gateway identity in service, as the daemon reports it.
+///
+/// # Why the gateway is read, not the registry
+///
+/// The gateway's own leaves were never recorded here: Astra transcribes
+/// admissions, it does not hold the identity every client pins. Their
+/// fingerprints and, above all, their **signed expiries** come from the
+/// daemon that serves them. §10.1 makes each expiry exact: a value retyped or
+/// inferred produces an object every recipient refuses, during the incident
+/// that motivated it. A campaign built from anything but the leaf the daemon
+/// presents would freeze a state no client has ever pinned.
+///
+/// The counter is the gateway's own axis (§4.2): the decision epoch the
+/// daemon reports, which a revocation or a rotation then advances by one.
+pub(crate) fn gateway_row(state: &AstraState, identity: &GatewayIdentityView) -> CampaignTarget {
+    CampaignTarget {
+        certificate_kind: CertificateKind::GatewayPq,
+        identity_key: state.gateway_wg_public_key,
+        epoch: identity.gateway_decision_epoch,
+        generation: identity.active_gateway_identity_epoch,
+        active_tls_certificate_fingerprint: identity.tls_certificate_fingerprint,
+        active_pq_certificate_fingerprint: identity.pq_certificate_fingerprint,
+    }
+}
+
+/// The gateway revocation: the row, and the two leaves' own expiries.
+pub(crate) fn gateway_revocation(state: &AstraState, identity: &GatewayIdentityView) -> Resolved {
+    Resolved {
+        targets: vec![gateway_row(state, identity)],
+        revocation_expiries: Some(RevocationExpiries {
+            tls_not_after: Some(identity.tls_certificate_not_after),
+            pq_not_after: Some(identity.pq_certificate.not_after_unix),
+        }),
+    }
 }
