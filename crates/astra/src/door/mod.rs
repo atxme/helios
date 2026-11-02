@@ -30,6 +30,8 @@
 //! and the operation, when there is one. An opening is not a durable mutation
 //! of the registry, so it does not advance the hash-chained audit.
 
+mod chain;
+mod issuer;
 mod open;
 mod resolve;
 
@@ -112,6 +114,26 @@ pub enum DoorRequest {
     GatewayRevocation { text: OpeningText },
     /// The gateway identity in service, frozen for a signed transition.
     GatewayIdentity { text: OpeningText },
+    /// Resolves the four-campaign chain of §7.6 and opens its first step.
+    ///
+    /// The plan stays in the state volume. The text is the one the operator
+    /// reads before every touch of this chain.
+    ChainOpen { text: OpeningText },
+    /// Opens the next step, once the previous one has taken effect.
+    ///
+    /// Carries nothing: the text is the plan's, and the gateway is the one
+    /// the service already holds a channel to. An empty struct variant and
+    /// not a unit one, so that `deny_unknown_fields` still refuses a body
+    /// that names a field (a unit variant would ignore it).
+    ChainNext {},
+    /// Drops the plan. Campaigns already approved keep their effect.
+    ChainAbandon {},
+    /// Draws a delegation's keys, returns its public request, and opens the
+    /// campaign the operator signs it under.
+    IssuerDelegation { text: OpeningText },
+    /// Draws a delegation's keys and returns its public request. Opens
+    /// nothing, so it has no text and no window.
+    IssuerRequest {},
 }
 
 impl DoorRequest {
@@ -123,6 +145,11 @@ impl DoorRequest {
             Self::ClientRevocation { .. } => "client_revocation",
             Self::GatewayRevocation { .. } => "gateway_revocation",
             Self::GatewayIdentity { .. } => "gateway_identity",
+            Self::ChainOpen { .. } => "chain_open",
+            Self::ChainNext {} => "chain_next",
+            Self::ChainAbandon {} => "chain_abandon",
+            Self::IssuerDelegation { .. } => "issuer_delegation",
+            Self::IssuerRequest {} => "issuer_request",
         }
     }
 }
@@ -151,6 +178,25 @@ impl From<OperatorOpenRequest> for DoorRequest {
 pub enum DoorOutcome {
     /// A campaign waiting for its operator.
     Opened(OperatorOpened),
+    /// A step of the certificate chain.
+    ///
+    /// `opened` is `None` when the step just taken finished the chain.
+    /// `delegation_request` is the public request of the issuer step, which
+    /// the console writes where its `--out` says. `remaining` counts the
+    /// steps left, the one just opened included.
+    ChainStep {
+        opened: Option<OperatorOpened>,
+        delegation_request: Option<String>,
+        remaining: usize,
+    },
+    /// The plan is gone; what was approved keeps its effect.
+    ChainAbandoned,
+    /// A delegation's public request, exactly the JSON `issuer request`
+    /// prints, and the campaign it was opened under when it has one.
+    IssuerRequested {
+        request: String,
+        opened: Option<OperatorOpened>,
+    },
 }
 
 /// Why the door refused, as a complete sentence for the local console.
@@ -196,6 +242,27 @@ pub enum DoorRefusal {
          gateway ne se lisent qu'auprès d'elle, et rien n'a été ouvert"
     )]
     GatewayChannelUnavailable,
+    #[error(
+        "une chaîne de certificats est déjà ouverte, avec {remaining} étape(s) restante(s) : la \
+         terminer par `chain next`, ou l'abandonner par `chain abandon`"
+    )]
+    ChainAlreadyOpen { remaining: usize },
+    #[error(
+        "aucune chaîne de certificats n'est ouverte dans ce volume : `chain open` en ouvre une"
+    )]
+    NoChain,
+    #[error("cette chaîne est terminée : il ne reste rien à ouvrir")]
+    ChainFinished,
+    #[error(
+        "l'étape en cours n'a pas pris effet ({0}) : l'approuver avant d'avancer, ou abandonner la \
+         chaîne"
+    )]
+    ChainStepIncomplete(String),
+    #[error(
+        "ce domaine n'épingle aucune CA TLS cliente : `pin-ca-tls` l'enregistre une fois, et une \
+         rotation ne se vérifie pas sans elle"
+    )]
+    NoClientTlsAnchor,
     #[error("le magasin des opérations refuse cette ouverture : {0}")]
     Store(SigningError),
     #[error(
@@ -219,7 +286,12 @@ impl DoorRefusal {
             | Self::TooManyTargets
             | Self::NoVault
             | Self::PeerUnknown
-            | Self::PeerRevoked => ServiceError::Refused,
+            | Self::PeerRevoked
+            | Self::ChainAlreadyOpen { .. }
+            | Self::NoChain
+            | Self::ChainFinished
+            | Self::ChainStepIncomplete(_)
+            | Self::NoClientTlsAnchor => ServiceError::Refused,
             Self::Store(SigningError::Full) => ServiceError::Throttled,
             Self::Store(_) | Self::GatewayChannelUnavailable | Self::Internal => {
                 ServiceError::Internal
@@ -248,6 +320,11 @@ pub fn allowed(connector: &DoorConnector, request: &DoorRequest) -> bool {
         DoorRequest::ClientRevocation { .. } => (true, true),
         DoorRequest::GatewayRevocation { .. } => (true, false),
         DoorRequest::GatewayIdentity { .. } => (true, false),
+        DoorRequest::ChainOpen { .. } => (true, false),
+        DoorRequest::ChainNext {} => (true, false),
+        DoorRequest::ChainAbandon {} => (true, false),
+        DoorRequest::IssuerDelegation { .. } => (true, false),
+        DoorRequest::IssuerRequest {} => (true, false),
     };
     match connector {
         DoorConnector::Console { .. } => console,
@@ -274,13 +351,30 @@ impl AstraService {
             Err(DoorRefusal::NotAllowedHere)
         };
         match &outcome {
-            Ok(DoorOutcome::Opened(opened)) => tracing::info!(
+            Ok(DoorOutcome::Opened(opened))
+            | Ok(DoorOutcome::ChainStep {
+                opened: Some(opened),
+                ..
+            })
+            | Ok(DoorOutcome::IssuerRequested {
+                opened: Some(opened),
+                ..
+            }) => tracing::info!(
                 connector = %connector,
                 action,
                 operation = %opened.operation_id,
                 campaign = %opened.campaign_id,
                 targets = opened.target_count,
                 "operator campaign opened through the door"
+            ),
+            Ok(
+                DoorOutcome::ChainStep { opened: None, .. }
+                | DoorOutcome::ChainAbandoned
+                | DoorOutcome::IssuerRequested { opened: None, .. },
+            ) => tracing::info!(
+                connector = %connector,
+                action,
+                "operator action performed through the door"
             ),
             Err(refusal) => tracing::warn!(
                 connector = %connector,
@@ -344,31 +438,64 @@ impl AstraService {
                 .await
                 .map(DoorOutcome::Opened)
             }
-            DoorRequest::GatewayIdentity { text } => {
-                open::check_text(&text)?;
-                let identity = self.read_gateway_identity().await?;
-                // Exported because the companion cannot verify the §5
-                // request's continuity signature without the leaf in
-                // service, and it holds no copy of it. Public material: the
-                // same leaf every admitted client pins. Written before the
-                // opening, so that a write that fails leaves nothing pending.
-                self.export_active_gateway_certificate(&identity)?;
-                open::open_campaign(
-                    self,
-                    connector,
-                    CampaignScope::GatewayIdentity,
-                    text,
-                    |state| {
-                        Ok(Resolved::targets(vec![resolve::gateway_row(
-                            state, &identity,
-                        )]))
-                    },
-                    now_unix,
-                )
+            DoorRequest::GatewayIdentity { text } => self
+                .open_gateway_identity(connector, text, now_unix)
                 .await
-                .map(DoorOutcome::Opened)
+                .map(DoorOutcome::Opened),
+            DoorRequest::ChainOpen { text } => self.chain_open(connector, text, now_unix).await,
+            DoorRequest::ChainNext {} => self.chain_next(connector, now_unix).await,
+            DoorRequest::ChainAbandon {} => self.chain_abandon().await,
+            DoorRequest::IssuerDelegation { text } => {
+                let _volume = chain::VOLUME_WRITES.lock().await;
+                let (request, opened) = self
+                    .open_issuer_delegation(connector, text, now_unix)
+                    .await?;
+                Ok(DoorOutcome::IssuerRequested {
+                    request,
+                    opened: Some(opened),
+                })
+            }
+            DoorRequest::IssuerRequest {} => {
+                let _volume = chain::VOLUME_WRITES.lock().await;
+                let request = self.issuer_request_only(now_unix).await?;
+                Ok(DoorOutcome::IssuerRequested {
+                    request,
+                    opened: None,
+                })
             }
         }
+    }
+
+    /// Freezes the gateway identity in service into a campaign.
+    ///
+    /// Shared by the isolated action and the gateway step of the chain.
+    async fn open_gateway_identity(
+        &self,
+        connector: &DoorConnector,
+        text: OpeningText,
+        now_unix: u64,
+    ) -> Result<OperatorOpened, DoorRefusal> {
+        open::check_text(&text)?;
+        let identity = self.read_gateway_identity().await?;
+        // Exported because the companion cannot verify the §5 request's
+        // continuity signature without the leaf in service, and it holds no
+        // copy of it. Public material: the same leaf every admitted client
+        // pins. Written before the opening, so that a write that fails leaves
+        // nothing pending.
+        self.export_active_gateway_certificate(&identity)?;
+        open::open_campaign(
+            self,
+            connector,
+            CampaignScope::GatewayIdentity,
+            text,
+            |state| {
+                Ok(Resolved::targets(vec![resolve::gateway_row(
+                    state, &identity,
+                )]))
+            },
+            now_unix,
+        )
+        .await
     }
 
     /// What the daemon serves right now, read before any lock is taken.

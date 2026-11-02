@@ -217,7 +217,7 @@ fn requested_by(connector: &DoorConnector, written: &str) -> String {
 }
 
 /// A non-zero identifier from the approved DRBG, or a refusal by name.
-fn fresh_id() -> Result<aether::certificates::encoding::Id16, DoorRefusal> {
+pub(super) fn fresh_id() -> Result<aether::certificates::encoding::Id16, DoorRefusal> {
     crate::renewal::fresh_id().map_err(|error| {
         tracing::error!(%error, "the door could not draw an identifier");
         DoorRefusal::Internal

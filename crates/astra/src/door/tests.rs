@@ -182,6 +182,7 @@ fn tunnel() -> DoorConnector {
 fn opened(outcome: Result<DoorOutcome, DoorRefusal>) -> OperatorOpened {
     match outcome.expect("the door opens") {
         DoorOutcome::Opened(opened) => opened,
+        other => panic!("expected a campaign, got {other:?}"),
     }
 }
 
@@ -212,6 +213,11 @@ fn specified(request: &DoorRequest) -> (bool, bool) {
         DoorRequest::ClientRevocation { .. } => (true, true),
         DoorRequest::GatewayRevocation { .. } => (true, false),
         DoorRequest::GatewayIdentity { .. } => (true, false),
+        DoorRequest::ChainOpen { .. } => (true, false),
+        DoorRequest::ChainNext {} => (true, false),
+        DoorRequest::ChainAbandon {} => (true, false),
+        DoorRequest::IssuerDelegation { .. } => (true, false),
+        DoorRequest::IssuerRequest {} => (true, false),
     }
 }
 
@@ -226,6 +232,11 @@ fn the_policy_table_is_exactly_the_specification() {
         },
         DoorRequest::GatewayRevocation { text: text() },
         DoorRequest::GatewayIdentity { text: text() },
+        DoorRequest::ChainOpen { text: text() },
+        DoorRequest::ChainNext {},
+        DoorRequest::ChainAbandon {},
+        DoorRequest::IssuerDelegation { text: text() },
+        DoorRequest::IssuerRequest {},
     ];
     let tunnels = [
         tunnel(),
@@ -949,4 +960,346 @@ async fn a_gateway_identity_opening_freezes_the_leaf_and_exports_it() {
         .expect("the leaf in service is exported");
     let leaf: PqCertificate = serde_json::from_slice(&exported).expect("a PQ certificate");
     assert_eq!(leaf.not_after_unix, GATEWAY_LEAF_NOT_AFTER);
+}
+
+fn plan_path(dir: &Path) -> std::path::PathBuf {
+    dir.join(crate::chain::CHAIN_PLAN_FILE)
+}
+
+fn read_plan(dir: &Path) -> crate::chain::ChainPlan {
+    serde_json::from_slice(&std::fs::read(plan_path(dir)).expect("plan present"))
+        .expect("plan decodes")
+}
+
+fn chain_step(
+    outcome: Result<DoorOutcome, DoorRefusal>,
+) -> (Option<OperatorOpened>, Option<String>, usize) {
+    match outcome.expect("the door answers") {
+        DoorOutcome::ChainStep {
+            opened,
+            delegation_request,
+            remaining,
+        } => (opened, delegation_request, remaining),
+        other => panic!("expected a chain step, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_tunnel_cannot_reach_a_console_action() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture(dir.path());
+    let refusal = service
+        .door(tunnel(), DoorRequest::ChainOpen { text: text() }, NOW)
+        .await
+        .expect_err("the tunnel is refused");
+    assert!(matches!(refusal, DoorRefusal::NotAllowedHere));
+    assert!(service.signing.lock().await.pending(NOW).is_empty());
+    assert!(!plan_path(dir.path()).exists());
+}
+
+#[tokio::test]
+async fn the_chain_opens_its_first_step_and_records_the_plan() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture(dir.path());
+    let (opened, request, remaining) = chain_step(
+        service
+            .door(console(), DoorRequest::ChainOpen { text: text() }, NOW)
+            .await,
+    );
+    let opened = opened.expect("the first step opens a campaign");
+    assert_eq!(opened.scope, CampaignScope::IssuerDelegation);
+    assert_eq!(remaining, 4);
+    let request: crate::issuer::IssuerDelegationRequest =
+        serde_json::from_str(&request.expect("the issuer step returns its request"))
+            .expect("the request is JSON");
+    assert_eq!(request.issuer_epoch, 1);
+
+    let plan = read_plan(dir.path());
+    assert_eq!(plan.current, 0);
+    assert_eq!(plan.steps[0].operation_id, Some(opened.operation_id));
+    assert_eq!(plan.reason, "quarterly rotation");
+    assert!(crate::issuer::pq_key_path(dir.path(), 1).exists());
+    assert!(crate::issuer::tls_key_path(dir.path(), 1).exists());
+    let campaign = campaign_of(&service, &opened).await;
+    assert_eq!(campaign.targets.len(), 1);
+    assert_eq!(
+        campaign.targets[0].certificate_kind,
+        CertificateKind::AstraIssuer
+    );
+
+    let again = service
+        .door(console(), DoorRequest::ChainOpen { text: text() }, NOW + 1)
+        .await;
+    assert!(matches!(
+        again,
+        Err(DoorRefusal::ChainAlreadyOpen { remaining: 4 })
+    ));
+}
+
+#[tokio::test]
+async fn a_chain_step_and_a_fleet_campaign_block_each_other() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture(dir.path());
+    let (step, ..) = chain_step(
+        service
+            .door(console(), DoorRequest::ChainOpen { text: text() }, NOW)
+            .await,
+    );
+    let step = step.expect("opened");
+    // The first step is of the issuer family: an isolated delegation is its
+    // twin, and is refused while the step waits.
+    let refused = service
+        .door(
+            console(),
+            DoorRequest::IssuerDelegation { text: text() },
+            NOW + 1,
+        )
+        .await;
+    match refused {
+        Err(DoorRefusal::AlreadyOpen { operation_id }) => {
+            assert_eq!(operation_id, step.operation_id)
+        }
+        other => panic!("expected AlreadyOpen, got {other:?}"),
+    }
+    // A bare request would overwrite the keys the waiting step pins.
+    assert!(matches!(
+        service
+            .door(console(), DoorRequest::IssuerRequest {}, NOW + 1)
+            .await,
+        Err(DoorRefusal::AlreadyOpen { .. })
+    ));
+
+    // The last step is of the fleet family: an isolated campaign blocks it,
+    // and the plan does not move when the step is refused.
+    let mut plan = read_plan(dir.path());
+    plan.current = 2;
+    plan.steps[2].operation_id = None;
+    std::fs::write(
+        plan_path(dir.path()),
+        serde_json::to_vec(&plan).expect("encodes"),
+    )
+    .expect("plan rewritten");
+    let fleet = opened(
+        service
+            .door(console(), DoorRequest::FleetLeafs { text: text() }, NOW + 2)
+            .await,
+    );
+    match service
+        .door(console(), DoorRequest::ChainNext {}, NOW + 3)
+        .await
+    {
+        Err(DoorRefusal::AlreadyOpen { operation_id }) => {
+            assert_eq!(operation_id, fleet.operation_id)
+        }
+        other => panic!("expected AlreadyOpen, got {other:?}"),
+    }
+    assert_eq!(read_plan(dir.path()).current, 2);
+}
+
+#[tokio::test]
+async fn chain_next_refuses_a_step_that_has_not_landed() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture(dir.path());
+    assert!(matches!(
+        service
+            .door(console(), DoorRequest::ChainNext {}, NOW)
+            .await,
+        Err(DoorRefusal::NoChain)
+    ));
+    chain_step(
+        service
+            .door(console(), DoorRequest::ChainOpen { text: text() }, NOW)
+            .await,
+    );
+    let refused = service
+        .door(console(), DoorRequest::ChainNext {}, NOW + 1)
+        .await;
+    assert!(
+        matches!(refused, Err(DoorRefusal::ChainStepIncomplete(_))),
+        "{refused:?}"
+    );
+    assert_eq!(read_plan(dir.path()).current, 0);
+}
+
+#[tokio::test]
+async fn chain_next_opens_the_following_step_once_the_previous_has_landed() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture_with_ca_tls(dir.path());
+    chain_step(
+        service
+            .door(console(), DoorRequest::ChainOpen { text: text() }, NOW)
+            .await,
+    );
+    // The issuer effect cannot be produced without a companion; stand in for
+    // it by naming an effect the registry already shows.
+    let mut plan = read_plan(dir.path());
+    plan.steps[0].effect = crate::chain::ChainEffect::SpentByPeers;
+    std::fs::write(
+        plan_path(dir.path()),
+        serde_json::to_vec(&plan).expect("encodes"),
+    )
+    .expect("plan rewritten");
+
+    let (opened, request, remaining) = chain_step(
+        service
+            .door(console(), DoorRequest::ChainNext {}, NOW + 1)
+            .await,
+    );
+    let opened = opened.expect("the second step opens");
+    assert_eq!(opened.scope, CampaignScope::TrustAuthorities);
+    assert_eq!(request, None);
+    assert_eq!(remaining, 3);
+    let campaign = campaign_of(&service, &opened).await;
+    assert_eq!(campaign.targets.len(), 1);
+    assert_eq!(campaign.targets[0].certificate_kind, CertificateKind::CaTls);
+    assert_eq!(read_plan(dir.path()).current, 1);
+}
+
+#[tokio::test]
+async fn a_chain_can_be_abandoned_once() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture(dir.path());
+    assert!(matches!(
+        service
+            .door(console(), DoorRequest::ChainAbandon {}, NOW)
+            .await,
+        Err(DoorRefusal::NoChain)
+    ));
+    chain_step(
+        service
+            .door(console(), DoorRequest::ChainOpen { text: text() }, NOW)
+            .await,
+    );
+    assert!(matches!(
+        service
+            .door(console(), DoorRequest::ChainAbandon {}, NOW + 1)
+            .await,
+        Ok(DoorOutcome::ChainAbandoned)
+    ));
+    assert!(!plan_path(dir.path()).exists());
+}
+
+#[tokio::test]
+async fn an_issuer_request_writes_its_keys_and_returns_the_public_request() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture(dir.path());
+    let outcome = service
+        .door(console(), DoorRequest::IssuerRequest {}, NOW)
+        .await
+        .expect("the request is drawn");
+    let DoorOutcome::IssuerRequested { request, .. } = outcome else {
+        panic!("expected an issuer request");
+    };
+    let request: crate::issuer::IssuerDelegationRequest =
+        serde_json::from_str(&request).expect("the request is JSON");
+    assert_eq!(request.issuer_epoch, 1);
+    assert_eq!(
+        request.trust_domain_id,
+        TrustDomainId::new([1; 16]).expect("domain").to_hex()
+    );
+    assert!(crate::issuer::pq_key_path(dir.path(), 1).exists());
+    assert!(crate::issuer::tls_key_path(dir.path(), 1).exists());
+}
+
+#[tokio::test]
+async fn an_issuer_request_without_text_opens_nothing() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture(dir.path());
+    let outcome = service
+        .door(console(), DoorRequest::IssuerRequest {}, NOW)
+        .await
+        .expect("the request is drawn");
+    assert!(matches!(
+        outcome,
+        DoorOutcome::IssuerRequested { opened: None, .. }
+    ));
+    assert!(service.signing.lock().await.pending(NOW).is_empty());
+}
+
+#[tokio::test]
+async fn an_issuer_delegation_pins_the_material_it_returns() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture(dir.path());
+    let outcome = service
+        .door(
+            console(),
+            DoorRequest::IssuerDelegation { text: text() },
+            NOW,
+        )
+        .await
+        .expect("the delegation opens");
+    let DoorOutcome::IssuerRequested {
+        request,
+        opened: Some(opened),
+    } = outcome
+    else {
+        panic!("expected a request and a campaign");
+    };
+    let request: crate::issuer::IssuerDelegationRequest =
+        serde_json::from_str(&request).expect("the request is JSON");
+    let campaign = campaign_of(&service, &opened).await;
+    assert_eq!(campaign.scope, CampaignScope::IssuerDelegation);
+    assert_eq!(campaign.targets[0].epoch, request.issuer_epoch);
+    let public_key =
+        aether::certificates::encoding::MlDsa87PublicKey::parse(&request.pq_issuer_public_key)
+            .expect("public key");
+    assert_eq!(
+        campaign.targets[0].active_pq_certificate_fingerprint,
+        Fingerprint::of(public_key.as_bytes())
+    );
+}
+
+#[tokio::test]
+async fn a_refused_delegation_leaves_the_keys_it_would_have_replaced() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture(dir.path());
+    service
+        .door(
+            console(),
+            DoorRequest::IssuerDelegation { text: text() },
+            NOW,
+        )
+        .await
+        .expect("the delegation opens");
+    let before = std::fs::read(crate::issuer::pq_key_path(dir.path(), 1)).expect("key");
+    let mut empty = text();
+    empty.reason.clear();
+    for request in [
+        DoorRequest::IssuerDelegation { text: empty },
+        DoorRequest::IssuerDelegation { text: text() },
+        DoorRequest::IssuerRequest {},
+    ] {
+        service
+            .door(console(), request, NOW + 1)
+            .await
+            .expect_err("refused");
+    }
+    assert_eq!(
+        std::fs::read(crate::issuer::pq_key_path(dir.path(), 1)).expect("key"),
+        before
+    );
+}
+
+#[test]
+fn the_requests_without_text_are_a_bare_action_on_the_socket() {
+    for (body, expected) in [
+        (r#"{"action":"chain_next"}"#, DoorRequest::ChainNext {}),
+        (
+            r#"{"action":"chain_abandon"}"#,
+            DoorRequest::ChainAbandon {},
+        ),
+        (
+            r#"{"action":"issuer_request"}"#,
+            DoorRequest::IssuerRequest {},
+        ),
+    ] {
+        assert_eq!(
+            serde_json::from_str::<DoorRequest>(body).expect("decodes"),
+            expected
+        );
+    }
+    assert!(serde_json::from_str::<DoorRequest>(
+        r#"{"action":"issuer_request","out":"/etc/passwd"}"#
+    )
+    .is_err());
 }
