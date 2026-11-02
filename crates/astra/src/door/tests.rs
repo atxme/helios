@@ -1401,6 +1401,40 @@ async fn rewrite_registry(service: &AstraService, change: impl FnOnce(&mut Astra
     registry.save().expect("registry saved");
 }
 
+/// A domain under `delegated`'s `CA-PQ`, holding the private keys of its
+/// epoch-1 delegation where an issuer request leaves them.
+async fn ready_to_install(service: &AstraService) -> Delegated {
+    let delegated = delegated_material();
+    let ca_public = delegated.ca_public.clone();
+    rewrite_registry(service, |state| state.ca_public_key = ca_public).await;
+    std::fs::write(
+        crate::issuer::pq_key_path(&service.state_dir, 1),
+        delegated.issuer_private.as_slice(),
+    )
+    .expect("pq key");
+    std::fs::write(
+        crate::issuer::tls_key_path(&service.state_dir, 1),
+        &delegated.intermediate_key,
+    )
+    .expect("tls key");
+    delegated
+}
+
+/// Points the service's registry at a file no save can write, keeping the
+/// state it holds.
+async fn make_registry_unwritable(service: &AstraService) {
+    let mut registry = service.registry.lock().await;
+    let state = registry.state().clone();
+    *registry = AstraRegistry::new(
+        service.state_dir.join("absent").join("registry.json"),
+        state,
+    );
+}
+
+async fn memory_of(service: &AstraService) -> AstraState {
+    service.registry.lock().await.state().clone()
+}
+
 fn registry_on_disk(dir: &Path) -> AstraRegistry {
     AstraRegistry::load(&dir.join("registry.json"), None).expect("registry on disk")
 }
@@ -1484,19 +1518,7 @@ async fn a_pinned_anchor_is_never_replaced() {
 async fn an_installed_delegation_is_recorded_in_memory_and_on_disk() {
     let dir = tempfile::tempdir().expect("temp dir");
     let service = fixture(dir.path());
-    let delegated = delegated_material();
-    let ca_public = delegated.ca_public.clone();
-    rewrite_registry(&service, |state| state.ca_public_key = ca_public).await;
-    std::fs::write(
-        crate::issuer::pq_key_path(dir.path(), 1),
-        delegated.issuer_private.as_slice(),
-    )
-    .expect("pq key");
-    std::fs::write(
-        crate::issuer::tls_key_path(dir.path(), 1),
-        &delegated.intermediate_key,
-    )
-    .expect("tls key");
+    let delegated = ready_to_install(&service).await;
 
     let outcome = service
         .door(
@@ -1696,7 +1718,10 @@ async fn a_publication_without_the_service_channel_marks_nothing() {
         )
         .await
         .expect_err("nowhere to relay");
-    assert!(matches!(refusal, DoorRefusal::GatewayChannelUnavailable));
+    assert!(matches!(
+        refusal,
+        DoorRefusal::PublicationChannelUnavailable
+    ));
     assert!(!published_on_disk(dir.path()));
 }
 
@@ -1742,4 +1767,104 @@ fn the_writes_are_bodies_of_the_socket() {
         r#"{"action":"gateway_identity_publish","epoch":5,"gateway_channel":"127.0.0.1:1"}"#
     )
     .is_err());
+}
+
+#[tokio::test]
+async fn a_pin_whose_save_fails_leaves_memory_as_it_was() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture(dir.path());
+    make_registry_unwritable(&service).await;
+    let before = memory_of(&service).await;
+    let refusal = service
+        .door(
+            console(),
+            DoorRequest::PinCaTls {
+                fingerprint: Fingerprint::of(b"client tls ca"),
+            },
+            NOW,
+        )
+        .await
+        .expect_err("the save fails");
+    assert!(matches!(refusal, DoorRefusal::NotRecorded));
+    assert_eq!(memory_of(&service).await, before);
+
+    // The next opening sees the domain the file describes: one target.
+    let request = DoorRequest::TrustAuthorities { text: text() };
+    assert_eq!(
+        opened(service.door(console(), request, NOW).await).target_count,
+        1
+    );
+}
+
+#[tokio::test]
+async fn an_install_whose_save_fails_leaves_memory_as_it_was() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture(dir.path());
+    let delegated = ready_to_install(&service).await;
+    make_registry_unwritable(&service).await;
+    let before = memory_of(&service).await;
+    let refusal = service
+        .door(
+            console(),
+            DoorRequest::IssuerInstall {
+                authorization: Box::new(delegation(&delegated, 1)),
+            },
+            NOW,
+        )
+        .await
+        .expect_err("the save fails");
+    assert!(matches!(refusal, DoorRefusal::NotRecorded));
+    assert_eq!(memory_of(&service).await, before);
+    assert!(before.issuer.is_none());
+}
+
+#[tokio::test]
+async fn a_publication_whose_save_fails_is_not_relayed() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture_with_gateway(dir.path()).await;
+    rewrite_registry(&service, |state| {
+        state.transitions.push(stored_gateway_transition(5))
+    })
+    .await;
+    make_registry_unwritable(&service).await;
+    let before = memory_of(&service).await;
+    let request = DoorRequest::GatewayIdentityPublish { epoch: 5 };
+
+    // Refused before the relay, which only ever follows a saved mark; and
+    // memory still says unpublished, so a replay marks again rather than
+    // relaying a mark the file does not hold.
+    for at in [NOW, NOW + 1] {
+        let refusal = service
+            .door(console(), request.clone(), at)
+            .await
+            .expect_err("the save fails");
+        assert!(matches!(refusal, DoorRefusal::NotPublished));
+        assert_eq!(memory_of(&service).await, before);
+    }
+    assert!(!published_on_disk(dir.path()));
+}
+
+#[tokio::test]
+async fn a_replayed_publication_is_saved_before_it_is_relayed() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture_with_gateway(dir.path()).await;
+    rewrite_registry(&service, |state| {
+        let mut stored = stored_gateway_transition(5);
+        stored.published = true;
+        state.transitions.push(stored)
+    })
+    .await;
+    make_registry_unwritable(&service).await;
+
+    // Already marked in memory: the replay still has to land the mark on
+    // disk, and refuses rather than relaying when it cannot.
+    let refusal = service
+        .door(
+            console(),
+            DoorRequest::GatewayIdentityPublish { epoch: 5 },
+            NOW,
+        )
+        .await
+        .expect_err("the save fails");
+    assert!(matches!(refusal, DoorRefusal::NotPublished));
 }

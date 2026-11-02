@@ -325,6 +325,19 @@ pub enum DoorRefusal {
          rien n'a été publié"
     )]
     GatewayTransitionAborted { epoch: u64 },
+    #[error(
+        "le canal privé vers la gateway n'est pas disponible : une publication ne se relaie qu'à \
+         elle, et rien n'a été publié"
+    )]
+    PublicationChannelUnavailable,
+    #[error(
+        "erreur interne d'Astra : rien n'a été enregistré, le détail est dans le journal du service"
+    )]
+    NotRecorded,
+    #[error(
+        "erreur interne d'Astra : rien n'a été publié, le détail est dans le journal du service"
+    )]
+    NotPublished,
     #[error("le magasin des opérations refuse cette ouverture : {0}")]
     Store(SigningError),
     #[error(
@@ -360,9 +373,12 @@ impl DoorRefusal {
             | Self::NoGatewayTransition { .. }
             | Self::GatewayTransitionAborted { .. } => ServiceError::Refused,
             Self::Store(SigningError::Full) => ServiceError::Throttled,
-            Self::Store(_) | Self::GatewayChannelUnavailable | Self::Internal => {
-                ServiceError::Internal
-            }
+            Self::Store(_)
+            | Self::GatewayChannelUnavailable
+            | Self::PublicationChannelUnavailable
+            | Self::NotRecorded
+            | Self::NotPublished
+            | Self::Internal => ServiceError::Internal,
         }
     }
 
@@ -440,14 +456,36 @@ impl AstraService {
             Ok(
                 DoorOutcome::ChainStep { opened: None, .. }
                 | DoorOutcome::ChainAbandoned
-                | DoorOutcome::IssuerRequested { opened: None, .. }
-                | DoorOutcome::Pinned { .. }
-                | DoorOutcome::IssuerInstalled { .. }
-                | DoorOutcome::Published { .. },
+                | DoorOutcome::IssuerRequested { opened: None, .. },
             ) => tracing::info!(
                 connector = %connector,
                 action,
                 "operator action performed through the door"
+            ),
+            Ok(DoorOutcome::Pinned { audit_head }) => tracing::info!(
+                connector = %connector,
+                action,
+                %audit_head,
+                "client CA-TLS anchor pinned through the door"
+            ),
+            Ok(DoorOutcome::IssuerInstalled {
+                issuer_epoch,
+                not_after,
+                audit_head,
+            }) => tracing::info!(
+                connector = %connector,
+                action,
+                issuer_epoch,
+                not_after,
+                %audit_head,
+                "delegation recorded through the door; restart Astra to issue under it"
+            ),
+            Ok(DoorOutcome::Published { epoch, confirmed }) => tracing::info!(
+                connector = %connector,
+                action,
+                epoch,
+                confirmed,
+                "gateway transition marked published through the door"
             ),
             Err(refusal) => tracing::warn!(
                 connector = %connector,
@@ -579,7 +617,7 @@ impl AstraService {
         let channel = self
             .gateway
             .as_ref()
-            .ok_or(DoorRefusal::GatewayChannelUnavailable)?;
+            .ok_or(DoorRefusal::PublicationChannelUnavailable)?;
         let mark = {
             let mut registry = self.registry.lock().await;
             write::mark_gateway_transition_published(&mut registry, epoch, now_unix)?

@@ -319,6 +319,27 @@ impl AstraRegistry {
         self.state.audit.append(event, now_unix);
         self.save()
     }
+
+    /// Runs one write, and leaves memory exactly as it was if the write fails.
+    ///
+    /// A write changes the state and then saves it, so a save that fails
+    /// leaves memory ahead of the file. A command that exits on the error
+    /// throws that memory away; a service that keeps running would act on it —
+    /// relay a publication the file does not hold, or persist an anchor with
+    /// the next unrelated save. Restored, memory is what the file says, or at
+    /// worst behind it when a save failed after its rename, which the same
+    /// write asked again repairs.
+    pub fn write_or_restore<T, E>(
+        &mut self,
+        write: impl FnOnce(&mut Self) -> Result<T, E>,
+    ) -> Result<T, E> {
+        let before = self.state.clone();
+        let outcome = write(self);
+        if outcome.is_err() {
+            self.state = before;
+        }
+        outcome
+    }
 }
 
 #[cfg(test)]

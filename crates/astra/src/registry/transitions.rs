@@ -426,6 +426,10 @@ impl AstraRegistry {
             return Err(RegistryError::UnknownPeer);
         };
         if self.state.transitions[position].published {
+            // Saved again rather than trusted: the relay that follows closes
+            // the gateway's abort window, so it may only ever follow a mark
+            // the file holds.
+            self.save()?;
             return Ok(*transition);
         }
         // An aborted decision never becomes publishable: the tombstone that

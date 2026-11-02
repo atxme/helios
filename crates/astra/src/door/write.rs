@@ -8,6 +8,12 @@
 //! verified under the anchor, the policy and the keys on disk, a publication
 //! marked before it is relayed — so which path a write arrived by decides
 //! nothing about whether it is allowed.
+//!
+//! Every write runs through [`AstraRegistry::write_or_restore`]: one that
+//! fails, its save included, leaves the registry in memory exactly as it was.
+//! The service keeps that memory for its whole life, and a change the file
+//! never received must not be relayed, nor persisted later by an unrelated
+//! save.
 
 use std::path::Path;
 
@@ -39,8 +45,8 @@ pub fn pin_ca_tls(
         };
     }
     registry
-        .pin_client_tls_ca(fingerprint, now_unix)
-        .map_err(|error| internal("pin the client CA-TLS anchor", &error))?;
+        .write_or_restore(|registry| registry.pin_client_tls_ca(fingerprint, now_unix))
+        .map_err(|error| not_recorded("pin the client CA-TLS anchor", &error))?;
     Ok(registry.audit_head())
 }
 
@@ -69,24 +75,27 @@ pub fn issuer_install(
 ) -> Result<IssuerInstalled, DoorRefusal> {
     let issuer_epoch = authorization.issuer_epoch;
     let not_after = authorization.not_after;
-    crate::issuer::adopt(
-        registry,
-        authorization,
-        &crate::issuer::pq_key_path(state_dir, issuer_epoch),
-        &crate::issuer::tls_key_path(state_dir, issuer_epoch),
-        now_unix,
-    )
-    .map_err(|error| match error {
-        // The registry could not be written: nothing the operator sent is at
-        // fault. A delegation that does not advance the epoch is a refusal of
-        // the document, and stays one.
-        AdoptionError::Registry(error)
-            if !matches!(error, RegistryError::IssuerEpochNotAdvancing { .. }) =>
-        {
-            internal("record the delegation", &error)
-        }
-        refused => DoorRefusal::DelegationRefused(refused),
-    })?;
+    registry
+        .write_or_restore(|registry| {
+            crate::issuer::adopt(
+                registry,
+                authorization,
+                &crate::issuer::pq_key_path(state_dir, issuer_epoch),
+                &crate::issuer::tls_key_path(state_dir, issuer_epoch),
+                now_unix,
+            )
+        })
+        .map_err(|error| match error {
+            // The registry could not be written: nothing the operator sent is at
+            // fault. A delegation that does not advance the epoch is a refusal of
+            // the document, and stays one.
+            AdoptionError::Registry(error)
+                if !matches!(error, RegistryError::IssuerEpochNotAdvancing { .. }) =>
+            {
+                not_recorded("record the delegation", &error)
+            }
+            refused => DoorRefusal::DelegationRefused(refused),
+        })?;
     Ok(IssuerInstalled {
         issuer_epoch,
         not_after,
@@ -108,23 +117,24 @@ pub struct PublicationMark {
 /// Persisted first, and irreversibly. A marker written after the relay would
 /// leave a gateway that has closed its abort window while this authority still
 /// believes the decision cancellable — and §6.3 makes the gateway's belief the
-/// one clients act on. Idempotent: a mark already written is returned again,
-/// so a relay that failed is retried by asking for the same publication.
+/// one clients act on. Idempotent: a mark already written is saved and
+/// returned again, so a relay that failed is retried by asking for the same
+/// publication, and a mark the file does not hold is never relayed.
 pub fn mark_gateway_transition_published(
     registry: &mut AstraRegistry,
     epoch: u64,
     now_unix: u64,
 ) -> Result<PublicationMark, DoorRefusal> {
     let transition = registry
-        .publish_gateway_transition(epoch, now_unix)
+        .write_or_restore(|registry| registry.publish_gateway_transition(epoch, now_unix))
         .map_err(|error| match error {
             RegistryError::UnknownPeer => DoorRefusal::NoGatewayTransition { epoch },
             RegistryError::Transition(_) => DoorRefusal::GatewayTransitionAborted { epoch },
-            other => internal("mark the gateway transition published", &other),
+            other => not_published("mark the gateway transition published", &other),
         })?;
     let transition_fingerprint = transition
         .fingerprint()
-        .map_err(|error| internal("fingerprint the published transition", &error))?;
+        .map_err(|error| not_published("fingerprint the published transition", &error))?;
     Ok(PublicationMark {
         epoch,
         transition_fingerprint,
@@ -174,7 +184,12 @@ pub async fn publish_gateway_transition(
     Ok((mark, confirmed))
 }
 
-fn internal(what: &'static str, error: &dyn std::fmt::Display) -> DoorRefusal {
+fn not_recorded(what: &'static str, error: &dyn std::fmt::Display) -> DoorRefusal {
     tracing::error!(%error, "the door could not {what}");
-    DoorRefusal::Internal
+    DoorRefusal::NotRecorded
+}
+
+fn not_published(what: &'static str, error: &dyn std::fmt::Display) -> DoorRefusal {
+    tracing::error!(%error, "the door could not {what}");
+    DoorRefusal::NotPublished
 }
