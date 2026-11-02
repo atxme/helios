@@ -37,7 +37,10 @@ use std::collections::BTreeMap;
 use aether::certificates::{
     approval::CredentialRegistry,
     encoding::{Fingerprint, Id16, WireGuardKey},
-    status::{AstraRotationCampaign, AstraSignerRequest, AstraSignerResult},
+    status::{
+        AstraRotationCampaign, AstraSignerRequest, AstraSignerResult, CampaignFamily,
+        CampaignScope, CampaignTarget,
+    },
     transport::TrustUpdateObject,
     CertificateError,
 };
@@ -295,6 +298,45 @@ impl SigningOperationStore {
         // has least time to reach.
         pending.sort_by_key(|operation| operation.expires_at);
         pending
+    }
+
+    /// The live operation a new opening over these targets would duplicate.
+    ///
+    /// «Live» is what [`Self::pending`] lists: waiting for its operator and
+    /// not expired. A ceremony that failed or finished does not block the
+    /// next attempt, and one whose window closed is over.
+    ///
+    /// One per [`CampaignFamily`], so a chain step and an isolated
+    /// `fleet_leafs` campaign block each other, on purpose. A revocation is
+    /// the exception: one per identity it names, so that two stolen
+    /// workstations can be revoked within the same minute.
+    pub fn live_conflict(
+        &self,
+        scope: CampaignScope,
+        targets: &[CampaignTarget],
+        now_unix: u64,
+    ) -> Option<Id16> {
+        let family = scope.family();
+        self.operations
+            .values()
+            .filter(|operation| {
+                !operation.is_expired(now_unix)
+                    && operation.state == SigningOperationState::AwaitingOperator
+                    && operation.campaign.scope.family() == family
+            })
+            .find(|operation| match family {
+                CampaignFamily::Revocation => operation.campaign.targets.iter().any(|held| {
+                    targets
+                        .iter()
+                        .any(|asked| asked.identity_key == held.identity_key)
+                }),
+                CampaignFamily::ClientLeaves
+                | CampaignFamily::Authorities
+                | CampaignFamily::GatewayIdentity
+                | CampaignFamily::IssuerDelegation
+                | CampaignFamily::GatewayBootstrap => true,
+            })
+            .map(|operation| operation.operation_id)
     }
 
     /// Admits a new operation, dropping the ones the clock has ended.
@@ -860,6 +902,66 @@ mod tests {
             SigningOperationState::AwaitingOperator,
             "a refused result must not spend the approval"
         );
+    }
+
+    fn awaiting(scope: CampaignScope, identity: u8, operation: u8) -> SigningOperation {
+        let mut campaign = campaign(scope);
+        campaign.targets[0].identity_key = WireGuardKey::from_bytes([identity; 32]);
+        let mut request = request(&campaign, Fingerprint::of(b"vault"));
+        request.operation_id = Id16::new([operation; 16]).expect("id");
+        SigningOperation::new(campaign, request, 1_050).expect("open")
+    }
+
+    /// One live operation per family: what is waiting blocks, what was
+    /// approved or has expired does not.
+    #[test]
+    fn a_live_operation_blocks_its_family_and_only_while_it_waits() {
+        let mut store = SigningOperationStore::new();
+        store
+            .open(awaiting(CampaignScope::FleetLeafs, 3, 8), 1_050)
+            .expect("opened");
+        let targets = campaign(CampaignScope::FleetLeafs).targets;
+
+        assert_eq!(
+            store.live_conflict(CampaignScope::FleetLeafs, &targets, 1_100),
+            Some(Id16::new([8; 16]).expect("id"))
+        );
+        // Same family, another scope: a chain step and an isolated
+        // `fleet_leafs` campaign block each other.
+        assert!(store
+            .live_conflict(CampaignScope::OrionDevice, &targets, 1_100)
+            .is_some());
+        assert!(store
+            .live_conflict(CampaignScope::TrustAuthorities, &targets, 1_100)
+            .is_none());
+        assert!(store
+            .live_conflict(CampaignScope::FleetLeafs, &targets, 1_300)
+            .is_none());
+
+        let approved = approved_store(CampaignScope::FleetLeafs);
+        assert!(approved
+            .live_conflict(CampaignScope::FleetLeafs, &targets, 1_100)
+            .is_none());
+    }
+
+    /// Two stolen workstations can be revoked within the same minute.
+    #[test]
+    fn a_revocation_blocks_only_the_identity_it_names() {
+        let mut store = SigningOperationStore::new();
+        store
+            .open(awaiting(CampaignScope::EmergencyRevocation, 3, 8), 1_050)
+            .expect("opened");
+        let same = campaign(CampaignScope::EmergencyRevocation).targets;
+        let mut other = same.clone();
+        other[0].identity_key = WireGuardKey::from_bytes([4; 32]);
+
+        assert_eq!(
+            store.live_conflict(CampaignScope::EmergencyRevocation, &same, 1_100),
+            Some(Id16::new([8; 16]).expect("id"))
+        );
+        assert!(store
+            .live_conflict(CampaignScope::EmergencyRevocation, &other, 1_100)
+            .is_none());
     }
 
     /// A store that never dropped an abandoned ceremony would let a burst of

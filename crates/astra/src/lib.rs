@@ -52,6 +52,7 @@
 pub mod audit;
 pub mod chain;
 pub mod distribution;
+pub mod door;
 pub mod gateway;
 pub mod issuer;
 pub mod operations;
