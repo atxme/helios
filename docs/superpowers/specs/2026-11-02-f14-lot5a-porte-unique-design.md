@@ -394,7 +394,9 @@ déploiement, que ce lot ne modifie pas. La règle devient donc « un seul
 - Écritures : `pin-ca-tls` puis `campaign open --scope trust-authorities`,
   sans redémarrage, donne une campagne avec la ligne CA-TLS ; `issuer install`
   et `gateway-identity publish` gardent leurs refus et leur rejouabilité
-  actuels ; `bootstrap` et `init-channel` refusent quand le service tourne.
+  actuels ; `bootstrap` refuse quand le verrou est tenu ; service arrêté,
+  `pin-ca-tls` écrit localement sous le verrou (chemin de `deploy.sh`) ; un
+  second `astra run` sur le même volume refuse de démarrer.
 - Bout en bout existant inchangé : une campagne `fleet_leafs` ouverte par le
   tunnel apparaît dans `pending` et s'approuve dans Orion par le chemin du
   lot 4.
