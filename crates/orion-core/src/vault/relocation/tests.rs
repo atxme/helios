@@ -8,9 +8,9 @@ use zeroize::Zeroizing;
 
 use crate::config::{ClientConfig, ClientProfile};
 use crate::vault::keys::KEY_LEN;
-use crate::vault::store::{
-    BOOTSTRAP_FILE, DEVICE_ROOT_FILE, LEGACY_FILE, PROFILES_DIR, REGISTRY_FILE,
-};
+#[cfg(unix)]
+use crate::vault::store::REGISTRY_FILE;
+use crate::vault::store::{BOOTSTRAP_FILE, DEVICE_ROOT_FILE, LEGACY_FILE, PROFILES_DIR};
 use crate::vault::{Bootstrap, ProfileStore};
 
 /// The installation root of the legacy vault. The new vault wraps the same
