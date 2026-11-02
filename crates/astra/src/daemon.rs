@@ -1,10 +1,10 @@
 //! Everything `astra run` brings up, and the two tasks it leaves running.
 //!
 //! One entry point, `run`, which never returns until the public endpoint
-//! does: the pinned channel first, then the registry and the secrets a served
-//! authority needs, then the listener the gateway dials, then the runtime that
-//! carries the public endpoint, the reconciliation repair and the campaign
-//! inbox drain.
+//! does: the volume lock first, then the pinned channel, then the registry and
+//! the secrets a served authority needs, then the listener the gateway dials,
+//! then the runtime that carries the public endpoint, the reconciliation
+//! repair and the campaign inbox drain.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -49,6 +49,23 @@ pub(crate) fn run(
     private_bind: Option<SocketAddr>,
     gateway_client_certificate: Option<&str>,
 ) -> Result<()> {
+    // First of all, and held until this function returns, which is the end of
+    // the process: from here on this service is the only writer of the volume
+    // (§5.9). Taken before anything is read, so that a service started while
+    // a console holds the volume touches nothing and says why.
+    let _volume = astra::door::VolumeLock::try_acquire(state_dir)
+        .with_context(|| {
+            format!(
+                "locking {}",
+                state_dir.join(astra::door::VOLUME_LOCK_FILE).display()
+            )
+        })?
+        .with_context(|| {
+            format!(
+                "un autre processus tient {} : rien n'a démarré",
+                state_dir.display()
+            )
+        })?;
     // Before the registry is touched: a mispinned channel is a deployment
     // error, and reporting it after "Astra ready" buries it under a success.
     let gateway = open_gateway_channel(state_dir, gateway_channel, gateway_certificate)?;

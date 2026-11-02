@@ -218,6 +218,9 @@ fn specified(request: &DoorRequest) -> (bool, bool) {
         DoorRequest::ChainAbandon {} => (true, false),
         DoorRequest::IssuerDelegation { .. } => (true, false),
         DoorRequest::IssuerRequest {} => (true, false),
+        DoorRequest::PinCaTls { .. } => (true, false),
+        DoorRequest::IssuerInstall { .. } => (true, false),
+        DoorRequest::GatewayIdentityPublish { .. } => (true, false),
     }
 }
 
@@ -237,6 +240,13 @@ fn the_policy_table_is_exactly_the_specification() {
         DoorRequest::ChainAbandon {},
         DoorRequest::IssuerDelegation { text: text() },
         DoorRequest::IssuerRequest {},
+        DoorRequest::PinCaTls {
+            fingerprint: Fingerprint::of(b"client tls ca"),
+        },
+        DoorRequest::IssuerInstall {
+            authorization: Box::new(delegation(&delegated_material(), 1)),
+        },
+        DoorRequest::GatewayIdentityPublish { epoch: 5 },
     ];
     let tunnels = [
         tunnel(),
@@ -1300,6 +1310,436 @@ fn the_requests_without_text_are_a_bare_action_on_the_socket() {
     }
     assert!(serde_json::from_str::<DoorRequest>(
         r#"{"action":"issuer_request","out":"/etc/passwd"}"#
+    )
+    .is_err());
+}
+
+/// What `CA-PQ` signs for a delegation, and the private halves it names.
+struct Delegated {
+    ca_private: zeroize::Zeroizing<Vec<u8>>,
+    ca_public: aether::certificates::encoding::MlDsa87PublicKey,
+    issuer_private: zeroize::Zeroizing<Vec<u8>>,
+    issuer_public: aether::certificates::encoding::MlDsa87PublicKey,
+    intermediate: aether::certificates::encoding::DerCertificate,
+    intermediate_key: Vec<u8>,
+}
+
+fn delegated_material() -> Delegated {
+    use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
+    let (ca_private, ca_public) = generate_ml_dsa_87_keypair().expect("CA-PQ keypair");
+    let (issuer_private, issuer_public) = generate_ml_dsa_87_keypair().expect("issuer keypair");
+    let mut params = CertificateParams::new(Vec::<String>::new()).expect("params");
+    params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+    params.key_usages = vec![
+        KeyUsagePurpose::KeyCertSign,
+        KeyUsagePurpose::DigitalSignature,
+    ];
+    params
+        .distinguished_name
+        .push(DnType::CommonName, "astra delegated issuer 1");
+    // The chain is read against the clock, and these tests drive a synthetic
+    // one near the Unix epoch.
+    params.not_before = rcgen::date_time_ymd(1970, 1, 1);
+    params.not_after = rcgen::date_time_ymd(4096, 1, 1);
+    let key = KeyPair::generate().expect("intermediate key");
+    let certificate = params.self_signed(&key).expect("intermediate");
+    Delegated {
+        ca_private,
+        ca_public,
+        issuer_private,
+        issuer_public,
+        intermediate: aether::certificates::encoding::DerCertificate::new(
+            certificate.der().to_vec(),
+        )
+        .expect("der"),
+        intermediate_key: key.serialize_der(),
+    }
+}
+
+/// A delegation of `epoch`, signed under `delegated.ca_private` for the
+/// fixture's domain and policy.
+fn delegation(
+    delegated: &Delegated,
+    epoch: u64,
+) -> aether::certificates::authority::AstraIssuerAuthorization {
+    let trust_domain_id = TrustDomainId::new([1; 16]).expect("domain");
+    let gateway_wg_public_key = WireGuardKey::from_bytes([1; 32]);
+    aether::certificates::authority::AstraIssuerAuthorization {
+        format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+        trust_domain_id,
+        ca_epoch: 1,
+        ca_tls_epoch: 1,
+        gateway_wg_public_key,
+        server_name: "gateway.example".into(),
+        issuer_epoch: epoch,
+        pq_issuer_public_key: delegated.issuer_public.clone(),
+        tls_intermediate_certificate: delegated.intermediate.clone(),
+        allowed_usage: aether::certificates::authority::AllowedUsage::AdmittedClientLeafRenewal,
+        maximum_leaf_lifetime_secs: 200_000,
+        policy_fingerprint: AstraIssuancePolicy::standard(
+            trust_domain_id,
+            gateway_wg_public_key,
+            "gateway.example".into(),
+        )
+        .fingerprint()
+        .expect("policy"),
+        not_before: 0,
+        not_after: NOW * 2,
+        ca_pq_signature: aether::certificates::encoding::MlDsa87Signature::placeholder(),
+    }
+    .sign(&delegated.ca_private)
+    .expect("signed delegation")
+}
+
+/// Rewrites the service's registry in memory and on disk, as if it had been
+/// bootstrapped that way.
+async fn rewrite_registry(service: &AstraService, change: impl FnOnce(&mut AstraState)) {
+    let mut registry = service.registry.lock().await;
+    let mut state = registry.state().clone();
+    change(&mut state);
+    *registry = AstraRegistry::new(service.state_dir.join("registry.json"), state);
+    registry.save().expect("registry saved");
+}
+
+fn registry_on_disk(dir: &Path) -> AstraRegistry {
+    AstraRegistry::load(&dir.join("registry.json"), None).expect("registry on disk")
+}
+
+#[test]
+fn the_lock_is_exclusive() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let held = VolumeLock::try_acquire(dir.path())
+        .expect("lockable")
+        .expect("the first taker holds it");
+    assert!(dir.path().join(VOLUME_LOCK_FILE).exists());
+    assert!(VolumeLock::try_acquire(dir.path())
+        .expect("lockable")
+        .is_none());
+    drop(held);
+    assert!(VolumeLock::try_acquire(dir.path())
+        .expect("lockable")
+        .is_some());
+}
+
+#[tokio::test]
+async fn a_pinned_ca_tls_is_a_target_without_restart() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture(dir.path());
+    let fingerprint = Fingerprint::of(b"client tls ca");
+    let outcome = service
+        .door(console(), DoorRequest::PinCaTls { fingerprint }, NOW)
+        .await
+        .expect("pinned");
+    let DoorOutcome::Pinned { audit_head } = outcome else {
+        panic!("expected a pin, got {outcome:?}");
+    };
+    assert_eq!(audit_head, service.registry.lock().await.audit_head());
+    let on_disk = registry_on_disk(dir.path());
+    assert_eq!(on_disk.state().ca_tls_fingerprint, Some(fingerprint));
+    assert_eq!(on_disk.audit_head(), audit_head);
+
+    // The same service, never reloaded.
+    let request = DoorRequest::TrustAuthorities { text: text() };
+    let opened = opened(service.door(console(), request, NOW).await);
+    assert_eq!(opened.target_count, 2);
+    let campaign = campaign_of(&service, &opened).await;
+    assert!(campaign
+        .targets
+        .iter()
+        .any(|target| target.certificate_kind == CertificateKind::CaTls));
+}
+
+#[tokio::test]
+async fn a_pinned_anchor_is_never_replaced() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture_with_ca_tls(dir.path());
+    let held = Fingerprint::of(b"client tls ca");
+    let before = service.registry.lock().await.audit_head();
+
+    // The anchor already held: nothing changes, and it is not a refusal.
+    let outcome = service
+        .door(console(), DoorRequest::PinCaTls { fingerprint: held }, NOW)
+        .await
+        .expect("idempotent");
+    assert_eq!(outcome, DoorOutcome::Pinned { audit_head: before });
+
+    let refusal = service
+        .door(
+            console(),
+            DoorRequest::PinCaTls {
+                fingerprint: Fingerprint::of(b"another client tls ca"),
+            },
+            NOW,
+        )
+        .await
+        .expect_err("a pinned anchor is not replaced");
+    assert!(matches!(refusal, DoorRefusal::ClientTlsAnchorAlreadyPinned));
+    let registry = service.registry.lock().await;
+    assert_eq!(registry.state().ca_tls_fingerprint, Some(held));
+    assert_eq!(registry.audit_head(), before);
+    assert_eq!(registry_on_disk(dir.path()).audit_head(), before);
+}
+
+#[tokio::test]
+async fn an_installed_delegation_is_recorded_in_memory_and_on_disk() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture(dir.path());
+    let delegated = delegated_material();
+    let ca_public = delegated.ca_public.clone();
+    rewrite_registry(&service, |state| state.ca_public_key = ca_public).await;
+    std::fs::write(
+        crate::issuer::pq_key_path(dir.path(), 1),
+        delegated.issuer_private.as_slice(),
+    )
+    .expect("pq key");
+    std::fs::write(
+        crate::issuer::tls_key_path(dir.path(), 1),
+        &delegated.intermediate_key,
+    )
+    .expect("tls key");
+
+    let outcome = service
+        .door(
+            console(),
+            DoorRequest::IssuerInstall {
+                authorization: Box::new(delegation(&delegated, 1)),
+            },
+            NOW,
+        )
+        .await
+        .expect("installed");
+    let DoorOutcome::IssuerInstalled {
+        issuer_epoch,
+        not_after,
+        audit_head,
+    } = outcome
+    else {
+        panic!("expected an installed delegation, got {outcome:?}");
+    };
+    assert_eq!((issuer_epoch, not_after), (1, NOW * 2));
+    {
+        let registry = service.registry.lock().await;
+        assert_eq!(
+            registry
+                .state()
+                .issuer
+                .as_ref()
+                .map(|issuer| issuer.issuer_epoch),
+            Some(1)
+        );
+        assert_eq!(registry.audit_head(), audit_head);
+    }
+    let on_disk = registry_on_disk(dir.path());
+    assert_eq!(
+        on_disk
+            .state()
+            .issuer
+            .as_ref()
+            .map(|issuer| issuer.issuer_epoch),
+        Some(1)
+    );
+    assert_eq!(on_disk.audit_head(), audit_head);
+
+    // The next request draws the epoch after it, without a restart.
+    let DoorOutcome::IssuerRequested { request, .. } = service
+        .door(console(), DoorRequest::IssuerRequest {}, NOW)
+        .await
+        .expect("the next request")
+    else {
+        panic!("expected an issuer request");
+    };
+    let request: crate::issuer::IssuerDelegationRequest =
+        serde_json::from_str(&request).expect("the request is JSON");
+    assert_eq!(request.issuer_epoch, 2);
+}
+
+#[tokio::test]
+async fn a_delegation_under_another_anchor_is_refused_and_records_nothing() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture(dir.path());
+    let delegated = delegated_material();
+    let before = service.registry.lock().await.audit_head();
+    let refusal = service
+        .door(
+            console(),
+            DoorRequest::IssuerInstall {
+                authorization: Box::new(delegation(&delegated, 1)),
+            },
+            NOW,
+        )
+        .await
+        .expect_err("not signed by this domain's CA-PQ");
+    assert!(matches!(refusal, DoorRefusal::DelegationRefused(_)));
+    assert!(service.registry.lock().await.state().issuer.is_none());
+    assert_eq!(registry_on_disk(dir.path()).audit_head(), before);
+}
+
+#[test]
+fn an_issuer_campaign_for_a_passed_epoch_is_refused() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = build_service(dir.path(), None, None);
+    let mut registry = service.registry.into_inner();
+    super::issuer::still_next_epoch(registry.state(), 1).expect("epoch 1 follows none");
+
+    // A delegation of epoch 1 lands between the draw and the opening.
+    let delegated = delegated_material();
+    let mut state = registry.state().clone();
+    state.issuer = Some(aether::certificates::state::AstraIssuerState {
+        issuer_epoch: 1,
+        authorization: delegation(&delegated, 1),
+        state: aether::certificates::state::IssuerLifecycle::Active,
+    });
+    registry = AstraRegistry::new(dir.path().join("registry.json"), state);
+    assert!(matches!(
+        super::issuer::still_next_epoch(registry.state(), 1),
+        Err(DoorRefusal::IssuerEpochMoved { epoch: 1 })
+    ));
+    super::issuer::still_next_epoch(registry.state(), 2).expect("epoch 2 follows 1");
+}
+
+/// The gateway transition of `epoch`, stored as an approved campaign leaves
+/// it: accepted, not yet published.
+fn stored_gateway_transition(epoch: u64) -> crate::registry::StoredTransition {
+    use aether::certificates::gateway::GatewayIdentityTransition;
+    let (ca_private, _) = generate_ml_dsa_87_keypair().expect("CA-PQ keypair");
+    let transition = GatewayIdentityTransition {
+        format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+        protocol_version: aether::certificates::CERTIFICATE_PROTOCOL_VERSION,
+        trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+        ca_epoch: 1,
+        gateway_identity_epoch: epoch,
+        gateway_wg_public_key: WireGuardKey::from_bytes([1; 32]),
+        server_name: "gateway.example".into(),
+        active_gateway_tls_certificate_fingerprint: Fingerprint::of(b"gateway tls in service"),
+        next_gateway_tls_certificate: None,
+        active_gateway_certificate_fingerprint: Fingerprint::of(b"gateway pq in service"),
+        next_gateway_certificate: Some(served_leaf()),
+        window: aether::certificates::window::TransitionWindow::new(NOW, NOW + 100, NOW + 200)
+            .expect("window"),
+        reason: aether::certificates::authority::RotationReason::Scheduled,
+        ca_signature: aether::certificates::encoding::MlDsa87Signature::placeholder(),
+    }
+    .sign(&ca_private)
+    .expect("signed transition");
+    crate::registry::StoredTransition {
+        campaign_id: aether::certificates::encoding::Id16::new([5; 16]).expect("id"),
+        accepted_at: NOW - 10,
+        published: false,
+        object: aether::certificates::transport::TrustUpdateObject::GatewayIdentityTransition(
+            Box::new(transition),
+        ),
+        credential_registry: None,
+    }
+}
+
+fn published_on_disk(dir: &Path) -> bool {
+    registry_on_disk(dir)
+        .state()
+        .transitions
+        .iter()
+        .any(|stored| stored.published)
+}
+
+#[tokio::test]
+async fn a_publication_is_marked_before_the_relay() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    // A gateway that refuses every publication: the relay fails.
+    let service = fixture_with_gateway(dir.path()).await;
+    rewrite_registry(&service, |state| {
+        state.transitions.push(stored_gateway_transition(5))
+    })
+    .await;
+
+    let request = DoorRequest::GatewayIdentityPublish { epoch: 5 };
+    let outcome = service
+        .door(console(), request.clone(), NOW)
+        .await
+        .expect("marked although the relay failed");
+    assert_eq!(
+        outcome,
+        DoorOutcome::Published {
+            epoch: 5,
+            confirmed: false
+        }
+    );
+    assert!(published_on_disk(dir.path()));
+    let head = registry_on_disk(dir.path()).audit_head();
+
+    // Replayable: the same request relays again and marks nothing twice.
+    let outcome = service
+        .door(console(), request, NOW + 1)
+        .await
+        .expect("replayed");
+    assert_eq!(
+        outcome,
+        DoorOutcome::Published {
+            epoch: 5,
+            confirmed: false
+        }
+    );
+    assert_eq!(registry_on_disk(dir.path()).audit_head(), head);
+}
+
+#[tokio::test]
+async fn a_publication_without_the_service_channel_marks_nothing() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture(dir.path());
+    rewrite_registry(&service, |state| {
+        state.transitions.push(stored_gateway_transition(5))
+    })
+    .await;
+    let refusal = service
+        .door(
+            console(),
+            DoorRequest::GatewayIdentityPublish { epoch: 5 },
+            NOW,
+        )
+        .await
+        .expect_err("nowhere to relay");
+    assert!(matches!(refusal, DoorRefusal::GatewayChannelUnavailable));
+    assert!(!published_on_disk(dir.path()));
+}
+
+#[tokio::test]
+async fn a_publication_names_a_stored_transition() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture_with_gateway(dir.path()).await;
+    let refusal = service
+        .door(
+            console(),
+            DoorRequest::GatewayIdentityPublish { epoch: 5 },
+            NOW,
+        )
+        .await
+        .expect_err("nothing stored at this epoch");
+    assert!(matches!(
+        refusal,
+        DoorRefusal::NoGatewayTransition { epoch: 5 }
+    ));
+}
+
+#[test]
+fn the_writes_are_bodies_of_the_socket() {
+    let fingerprint = Fingerprint::of(b"client tls ca");
+    let body = format!(r#"{{"action":"pin_ca_tls","fingerprint":"{fingerprint}"}}"#);
+    assert_eq!(
+        serde_json::from_str::<DoorRequest>(&body).expect("decodes"),
+        DoorRequest::PinCaTls { fingerprint }
+    );
+    assert_eq!(
+        serde_json::from_str::<DoorRequest>(r#"{"action":"gateway_identity_publish","epoch":5}"#)
+            .expect("decodes"),
+        DoorRequest::GatewayIdentityPublish { epoch: 5 }
+    );
+    let delegated = delegated_material();
+    let install = DoorRequest::IssuerInstall {
+        authorization: Box::new(delegation(&delegated, 1)),
+    };
+    let round_trip: DoorRequest =
+        serde_json::from_slice(&serde_json::to_vec(&install).expect("encoded")).expect("decoded");
+    assert_eq!(round_trip, install);
+    assert!(serde_json::from_str::<DoorRequest>(
+        r#"{"action":"gateway_identity_publish","epoch":5,"gateway_channel":"127.0.0.1:1"}"#
     )
     .is_err());
 }

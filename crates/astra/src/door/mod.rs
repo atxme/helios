@@ -29,16 +29,28 @@
 //! Every opening and every refusal is logged with the connector, the action
 //! and the operation, when there is one. An opening is not a durable mutation
 //! of the registry, so it does not advance the hash-chained audit.
+//!
+//! # The writes that are not openings
+//!
+//! Pinning the client `CA-TLS`, installing a delegation and publishing a
+//! gateway transition change the registry itself (§5.6). Through the door
+//! they run on the registry this service holds, so the next opening sees
+//! them without a restart; with the service stopped, the console runs the
+//! same [`write`] functions on the file, under the [`VolumeLock`] that a
+//! running service holds for its whole life (§5.9).
 
 mod chain;
 mod issuer;
+mod lock;
 mod open;
 mod resolve;
+pub mod write;
 
 #[cfg(test)]
 mod tests;
 
-use aether::certificates::encoding::{Id16, WireGuardKey};
+use aether::certificates::authority::AstraIssuerAuthorization;
+use aether::certificates::encoding::{Fingerprint, Id16, WireGuardKey};
 use aether::certificates::status::CampaignScope;
 use aether::certificates::transport::{OperatorOpenAction, OperatorOpenRequest, OperatorOpened};
 use astra_channel::OperatorIdentity;
@@ -47,6 +59,7 @@ use serde::{Deserialize, Serialize};
 use crate::service::{AstraService, ServiceError};
 use crate::signing::SigningError;
 
+pub use lock::{VolumeLock, VOLUME_LOCK_FILE};
 use open::Resolved;
 pub use open::MAX_OPENING_WINDOW_SECS;
 
@@ -134,6 +147,17 @@ pub enum DoorRequest {
     /// Draws a delegation's keys and returns its public request. Opens
     /// nothing, so it has no text and no window.
     IssuerRequest {},
+    /// Records the client `CA-TLS` in service, once.
+    PinCaTls { fingerprint: Fingerprint },
+    /// Installs a `CA-PQ`-signed delegation whose keys this volume holds.
+    ///
+    /// The console reads the document from a file or standard input and
+    /// sends its content; the service never reads a path the caller names.
+    IssuerInstall {
+        authorization: Box<AstraIssuerAuthorization>,
+    },
+    /// Lets the signed gateway transition of this epoch leave the authority.
+    GatewayIdentityPublish { epoch: u64 },
 }
 
 impl DoorRequest {
@@ -150,6 +174,9 @@ impl DoorRequest {
             Self::ChainAbandon {} => "chain_abandon",
             Self::IssuerDelegation { .. } => "issuer_delegation",
             Self::IssuerRequest {} => "issuer_request",
+            Self::PinCaTls { .. } => "pin_ca_tls",
+            Self::IssuerInstall { .. } => "issuer_install",
+            Self::GatewayIdentityPublish { .. } => "gateway_identity_publish",
         }
     }
 }
@@ -197,6 +224,19 @@ pub enum DoorOutcome {
         request: String,
         opened: Option<OperatorOpened>,
     },
+    /// The client `CA-TLS` is pinned, now or before; the audit head after it.
+    Pinned { audit_head: Fingerprint },
+    /// A delegation is recorded. Astra issues under it once restarted: the
+    /// delegated issuer is read at start-up, beside its private keys.
+    IssuerInstalled {
+        issuer_epoch: u64,
+        not_after: u64,
+        audit_head: Fingerprint,
+    },
+    /// The transition is marked published here, durably. `confirmed` says
+    /// whether the gateway acknowledged it; when it did not, the same request
+    /// relays it again.
+    Published { epoch: u64, confirmed: bool },
 }
 
 /// Why the door refused, as a complete sentence for the local console.
@@ -263,6 +303,28 @@ pub enum DoorRefusal {
          rotation ne se vérifie pas sans elle"
     )]
     NoClientTlsAnchor,
+    #[error(
+        "une délégation a été installée pendant cette demande : l'époque {epoch} n'est plus la \
+         suivante, et rien n'a été ouvert ; refaire la demande"
+    )]
+    IssuerEpochMoved { epoch: u64 },
+    #[error(
+        "une autre ancre CA-TLS est déjà épinglée ici : remplacer une ancre épinglée est une \
+         rotation, et une rotation se signe (`astra campaign open --scope trust-authorities`, \
+         puis `astra-signer rotate-ca-tls`)"
+    )]
+    ClientTlsAnchorAlreadyPinned,
+    #[error("cette délégation ne s'installe pas ici, et rien n'a été enregistré : {0}")]
+    DelegationRefused(crate::issuer::AdoptionError),
+    #[error(
+        "aucune transition gateway n'est enregistrée à l'époque {epoch} : rien n'a été publié"
+    )]
+    NoGatewayTransition { epoch: u64 },
+    #[error(
+        "la transition gateway de l'époque {epoch} a été avortée : l'époque reste consommée, et \
+         rien n'a été publié"
+    )]
+    GatewayTransitionAborted { epoch: u64 },
     #[error("le magasin des opérations refuse cette ouverture : {0}")]
     Store(SigningError),
     #[error(
@@ -291,7 +353,12 @@ impl DoorRefusal {
             | Self::NoChain
             | Self::ChainFinished
             | Self::ChainStepIncomplete(_)
-            | Self::NoClientTlsAnchor => ServiceError::Refused,
+            | Self::NoClientTlsAnchor
+            | Self::IssuerEpochMoved { .. }
+            | Self::ClientTlsAnchorAlreadyPinned
+            | Self::DelegationRefused(_)
+            | Self::NoGatewayTransition { .. }
+            | Self::GatewayTransitionAborted { .. } => ServiceError::Refused,
             Self::Store(SigningError::Full) => ServiceError::Throttled,
             Self::Store(_) | Self::GatewayChannelUnavailable | Self::Internal => {
                 ServiceError::Internal
@@ -325,6 +392,9 @@ pub fn allowed(connector: &DoorConnector, request: &DoorRequest) -> bool {
         DoorRequest::ChainAbandon {} => (true, false),
         DoorRequest::IssuerDelegation { .. } => (true, false),
         DoorRequest::IssuerRequest {} => (true, false),
+        DoorRequest::PinCaTls { .. } => (true, false),
+        DoorRequest::IssuerInstall { .. } => (true, false),
+        DoorRequest::GatewayIdentityPublish { .. } => (true, false),
     };
     match connector {
         DoorConnector::Console { .. } => console,
@@ -370,7 +440,10 @@ impl AstraService {
             Ok(
                 DoorOutcome::ChainStep { opened: None, .. }
                 | DoorOutcome::ChainAbandoned
-                | DoorOutcome::IssuerRequested { opened: None, .. },
+                | DoorOutcome::IssuerRequested { opened: None, .. }
+                | DoorOutcome::Pinned { .. }
+                | DoorOutcome::IssuerInstalled { .. }
+                | DoorOutcome::Published { .. },
             ) => tracing::info!(
                 connector = %connector,
                 action,
@@ -463,7 +536,56 @@ impl AstraService {
                     opened: None,
                 })
             }
+            DoorRequest::PinCaTls { fingerprint } => {
+                let mut registry = self.registry.lock().await;
+                let audit_head = write::pin_ca_tls(&mut registry, fingerprint, now_unix)?;
+                Ok(DoorOutcome::Pinned { audit_head })
+            }
+            DoorRequest::IssuerInstall { authorization } => {
+                // The key files an install reads are the ones an issuer
+                // request writes, by epoch: the two never interleave.
+                let _volume = chain::VOLUME_WRITES.lock().await;
+                let mut registry = self.registry.lock().await;
+                let installed = write::issuer_install(
+                    &mut registry,
+                    &self.state_dir,
+                    *authorization,
+                    now_unix,
+                )?;
+                Ok(DoorOutcome::IssuerInstalled {
+                    issuer_epoch: installed.issuer_epoch,
+                    not_after: installed.not_after,
+                    audit_head: installed.audit_head,
+                })
+            }
+            DoorRequest::GatewayIdentityPublish { epoch } => {
+                self.publish_gateway_transition(epoch, now_unix).await
+            }
         }
+    }
+
+    /// Marks the transition published, then relays it with no lock held.
+    ///
+    /// The two halves of [`write::publish_gateway_transition`], split around
+    /// the registry lock: the mark is persisted under it, and the relay — a
+    /// call to a gateway that may be slow — happens after it is released.
+    async fn publish_gateway_transition(
+        &self,
+        epoch: u64,
+        now_unix: u64,
+    ) -> Result<DoorOutcome, DoorRefusal> {
+        // Before anything is marked, like the console that opened its channel
+        // first: a publication with nowhere to go stays unmarked.
+        let channel = self
+            .gateway
+            .as_ref()
+            .ok_or(DoorRefusal::GatewayChannelUnavailable)?;
+        let mark = {
+            let mut registry = self.registry.lock().await;
+            write::mark_gateway_transition_published(&mut registry, epoch, now_unix)?
+        };
+        let confirmed = write::relay_gateway_publication(channel, &mark).await;
+        Ok(DoorOutcome::Published { epoch, confirmed })
     }
 
     /// Freezes the gateway identity in service into a campaign.

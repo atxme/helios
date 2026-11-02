@@ -8,7 +8,8 @@
 //! operator reads before touching.
 //!
 //! The caller holds [`super::chain::VOLUME_WRITES`]: the key files are named by
-//! epoch, so two requests for the same epoch would overwrite each other's keys.
+//! epoch, so two requests for the same epoch would overwrite each other's keys,
+//! and an install at the door, which reads them, holds it too.
 
 use aether::certificates::encoding::{generate_ml_dsa_87_keypair, Fingerprint};
 use aether::certificates::status::{CampaignScope, CampaignTarget, CertificateKind};
@@ -24,6 +25,29 @@ struct Material {
     /// The public request, pretty JSON: what `issuer request` prints.
     request: String,
     target: CampaignTarget,
+}
+
+/// Refuses a delegation campaign for an epoch the registry has moved past.
+///
+/// The epoch is read under one registry lock and the campaign opened under
+/// another, with the key generation in between. A delegation installed in
+/// that gap would leave this campaign pinning an epoch that is no longer the
+/// next one: an operator would sign a delegation the registry then refuses as
+/// not advancing.
+pub(super) fn still_next_epoch(
+    state: &crate::registry::AstraState,
+    epoch: u64,
+) -> Result<(), DoorRefusal> {
+    let installed = state
+        .issuer
+        .as_ref()
+        .map(|installed| installed.issuer_epoch)
+        .unwrap_or(0);
+    if installed.checked_add(1) == Some(epoch) {
+        Ok(())
+    } else {
+        Err(DoorRefusal::IssuerEpochMoved { epoch })
+    }
 }
 
 impl AstraService {
@@ -65,7 +89,10 @@ impl AstraService {
             connector,
             CampaignScope::IssuerDelegation,
             text,
-            |_| Ok(Resolved::targets(vec![target])),
+            |state| {
+                still_next_epoch(state, target.epoch)?;
+                Ok(Resolved::targets(vec![target]))
+            },
             now_unix,
         )
         .await?;

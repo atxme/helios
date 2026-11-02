@@ -9,10 +9,11 @@
 //!
 //! # Limite connue
 //!
-//! `run` is not exercised: it binds a socket and serves until killed, so a
-//! test of it would be a test of `axum::serve`. What `run` adds on top of
-//! `status` — loading the delegated issuer and refusing incoherent private
-//! material — is covered by `issuer::tests` on the function that does it.
+//! `run` is exercised only where it refuses to start: once up, it binds a
+//! socket and serves until killed, so a test of it would be a test of
+//! `axum::serve`. What `run` adds on top of `status` — loading the delegated
+//! issuer and refusing incoherent private material — is covered by
+//! `issuer::tests` on the function that does it.
 
 use std::path::Path;
 use std::process::{Command, Output};
@@ -271,5 +272,75 @@ fn an_unsigned_delegation_is_refused_and_records_nothing() {
     assert!(
         printed.contains("delegated issuer : absent"),
         "nothing is recorded by a refused install: {printed}"
+    );
+}
+
+/// The files of a state directory, with their bytes.
+fn snapshot(state_dir: &Path) -> Vec<(std::ffi::OsString, Vec<u8>)> {
+    let mut files: Vec<_> = std::fs::read_dir(state_dir)
+        .expect("state dir")
+        .map(|entry| {
+            let entry = entry.expect("entry");
+            (
+                entry.file_name(),
+                std::fs::read(entry.path()).expect("readable file"),
+            )
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+/// A service started while a console holds the volume — the bootstrap of
+/// `deploy.sh`, then an `up -d` too early — refuses by name and writes
+/// nothing: two writers of `/var/lib/astra` are a registry corruption.
+#[test]
+fn the_service_does_not_start_while_the_volume_is_held() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    assert!(bootstrap(directory.path(), &ca_public_key())
+        .status
+        .success());
+    let _held = astra::door::VolumeLock::try_acquire(directory.path())
+        .expect("lockable")
+        .expect("the test holds the volume");
+    let before = snapshot(directory.path());
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_astra"))
+        .arg("--state-dir")
+        .arg(directory.path())
+        .args(["run", "--bind", "127.0.0.1:0"])
+        .env_remove("ASTRA_GATEWAY_CHANNEL")
+        .env_remove("ASTRA_PRIVATE_BIND")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("running the astra binary");
+    // A service that ignored the lock would serve until killed: bounded, so
+    // that the failure is a refusal of this test rather than a hang.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while child.try_wait().expect("waiting").is_none() {
+        if std::time::Instant::now() > deadline {
+            child
+                .kill()
+                .expect("stopping the service this test started");
+            let _ = child.wait();
+            panic!("astra run started although the volume is held");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let output = child.wait_with_output().expect("output");
+    assert!(!output.status.success());
+    let printed = String::from_utf8(output.stderr).expect("utf-8");
+    assert!(
+        printed.contains(&format!(
+            "un autre processus tient {} : rien n'a démarré",
+            directory.path().display()
+        )),
+        "the refusal names the volume: {printed}"
+    );
+    assert_eq!(
+        snapshot(directory.path()),
+        before,
+        "nothing in the volume is touched"
     );
 }
