@@ -649,3 +649,86 @@ fn an_offline_document_carrying_two_ca_transitions_is_refused() {
         Err(CertificateError::InvalidTransaction("two CA transitions"))
     ));
 }
+
+#[test]
+fn an_open_request_spells_its_action() {
+    let peer = client_key();
+    let request = OperatorOpenRequest {
+        action: OperatorOpenAction::ClientRevocation { peer },
+        reason: "lost laptop".to_owned(),
+        requested_by: "alice".to_owned(),
+        window_secs: 600,
+    };
+    let value = serde_json::to_value(&request).expect("serialize");
+    assert_eq!(value["action"], "client_revocation");
+    assert_eq!(value["peer"], serde_json::to_value(peer).expect("peer"));
+    let back: OperatorOpenRequest = serde_json::from_value(value).expect("round trip");
+    assert_eq!(back.action, request.action);
+
+    let fleet = serde_json::to_value(OperatorOpenAction::FleetLeafs).expect("serialize");
+    assert_eq!(fleet, serde_json::json!({"action": "fleet_leafs"}));
+    let trust = serde_json::to_value(OperatorOpenAction::TrustAuthorities).expect("serialize");
+    assert_eq!(trust, serde_json::json!({"action": "trust_authorities"}));
+}
+
+#[test]
+fn an_open_request_defaults_its_window_to_300() {
+    let request: OperatorOpenRequest = serde_json::from_value(serde_json::json!({
+        "action": "fleet_leafs",
+        "reason": "scheduled",
+        "requested_by": "alice",
+    }))
+    .expect("parse");
+    assert_eq!(request.window_secs, 300);
+}
+
+#[test]
+fn an_opened_answer_omits_absent_expiries() {
+    let mut opened = OperatorOpened {
+        operation_id: Id16::new([1; 16]).expect("id"),
+        campaign_id: Id16::new([2; 16]).expect("id"),
+        campaign_fingerprint: Fingerprint::from_bytes([3; 32]),
+        scope: CampaignScope::FleetLeafs,
+        target_count: 4,
+        required_credentials: 2,
+        expires_at: 1_000,
+        revocation_expiries: None,
+    };
+    let value = serde_json::to_value(&opened).expect("serialize");
+    assert!(value.get("revocation_expiries").is_none());
+
+    opened.revocation_expiries = Some(RevocationExpiries {
+        tls_not_after: Some(10),
+        pq_not_after: None,
+    });
+    let value = serde_json::to_value(&opened).expect("serialize");
+    assert_eq!(value["revocation_expiries"]["tls_not_after"], 10);
+    let back: OperatorOpened = serde_json::from_value(value).expect("round trip");
+    assert_eq!(back.revocation_expiries, opened.revocation_expiries);
+}
+
+#[test]
+fn an_open_request_refuses_unknown_fields() {
+    let outcome = serde_json::from_value::<OperatorOpenRequest>(serde_json::json!({
+        "action": "fleet_leafs",
+        "reason": "scheduled",
+        "requested_by": "alice",
+        "window_secs": 300,
+        "extra": true,
+    }));
+    assert!(outcome.is_err());
+
+    let stray_peer = serde_json::from_value::<OperatorOpenRequest>(serde_json::json!({
+        "action": "fleet_leafs",
+        "peer": serde_json::to_value(client_key()).expect("peer"),
+        "reason": "scheduled",
+        "requested_by": "alice",
+    }));
+    assert!(stray_peer.is_err());
+    let missing_peer = serde_json::from_value::<OperatorOpenRequest>(serde_json::json!({
+        "action": "client_revocation",
+        "reason": "lost",
+        "requested_by": "alice",
+    }));
+    assert!(missing_peer.is_err());
+}

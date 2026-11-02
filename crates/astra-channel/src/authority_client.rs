@@ -175,6 +175,21 @@ impl AstraLifecycleClient {
         .await
     }
 
+    /// Opens a campaign for a relayed administrator. No bearer token: opening
+    /// carries no capability.
+    pub async fn operator_open(
+        &self,
+        relayed: &RelayedOperatorOpen,
+    ) -> Result<OperatorOpened, ChannelError> {
+        self.post_bounded(
+            OPERATOR_OPEN_ROUTE,
+            relayed,
+            None,
+            MAX_OPERATOR_ANSWER_BYTES,
+        )
+        .await
+    }
+
     async fn post<B: Serialize, R: serde::de::DeserializeOwned>(
         &self,
         path: &str,
