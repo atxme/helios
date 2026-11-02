@@ -74,6 +74,14 @@ pub(crate) fn fixture_with_ca_tls(dir: &Path) -> Arc<AstraService> {
 }
 
 fn build(dir: &Path, ca_tls: Option<Fingerprint>) -> Arc<AstraService> {
+    Arc::new(build_service(dir, ca_tls, None))
+}
+
+fn build_service(
+    dir: &Path,
+    ca_tls: Option<Fingerprint>,
+    gateway: Option<crate::gateway::GatewayChannel>,
+) -> AstraService {
     let (_, ca_public_key) = generate_ml_dsa_87_keypair().expect("CA-PQ keypair");
     let (service_private_key, service_public_key) =
         generate_ml_dsa_87_keypair().expect("service keypair");
@@ -120,7 +128,7 @@ fn build(dir: &Path, ca_tls: Option<Fingerprint>) -> Arc<AstraService> {
     for (name, seed) in PEERS {
         registry.admit(peer(name, seed), NOW - 80).expect("admit");
     }
-    Arc::new(AstraService {
+    AstraService {
         state_dir: dir.to_path_buf(),
         registry: Mutex::new(registry),
         issuer: None,
@@ -139,8 +147,8 @@ fn build(dir: &Path, ca_tls: Option<Fingerprint>) -> Arc<AstraService> {
         recoveries: Mutex::new(crate::recovery::RecoveryStore::new()),
         reconciliation: Mutex::new(()),
         encrypted_vault: Some(b"placeholder encrypted vault".to_vec()),
-        gateway: None,
-    })
+        gateway,
+    }
 }
 
 fn text() -> OpeningText {
@@ -664,6 +672,10 @@ async fn a_client_revocation_carries_its_signed_expiry() {
     let campaign = campaign_of(&service, &opened).await;
     assert_eq!(campaign.targets[0].identity_key, peer_key(2));
     assert_eq!(campaign.targets[0].generation, 4);
+    assert_eq!(
+        campaign.targets[0].epoch,
+        service.registry.lock().await.state().peers[&peer_key(2).to_base64()].revocation_epoch
+    );
 }
 
 #[tokio::test]
@@ -749,4 +761,192 @@ async fn gateway_openings_need_the_service_channel() {
         assert!(matches!(refusal, DoorRefusal::GatewayChannelUnavailable));
     }
     assert!(!dir.path().join(GATEWAY_ACTIVE_CERTIFICATE_FILE).exists());
+}
+
+/// What the fake gateway serves, and what the door must read back.
+const GATEWAY_TLS_NOT_AFTER: u64 = 100_000;
+const GATEWAY_LEAF_NOT_AFTER: u64 = 1_000_000;
+const GATEWAY_GENERATION: u64 = 3;
+const GATEWAY_DECISION_EPOCH: u64 = 7;
+
+fn served_leaf() -> PqCertificate {
+    use base64::Engine as _;
+    let (ca_private, _) = aether::key_negotiation::generate_ml_dsa_87_keypair().expect("keygen");
+    let (_, subject_public) =
+        aether::key_negotiation::generate_ml_dsa_87_keypair().expect("keygen");
+    aether::key_negotiation::issue_pq_certificate(
+        PqCertificate {
+            version: PQ_CERTIFICATE_VERSION,
+            serial: [0x31; 16],
+            subject: "gateway".into(),
+            issuer: "CA-PQ".into(),
+            role: PqCertificateRole::Gateway,
+            wireguard_public_key: WireGuardKey::from_bytes([1; 32]).to_base64(),
+            ml_dsa_87_public_key: base64::engine::general_purpose::STANDARD.encode(&subject_public),
+            not_before_unix: 0,
+            not_after_unix: GATEWAY_LEAF_NOT_AFTER,
+            ml_dsa_87_signature: String::new(),
+        },
+        &ca_private,
+    )
+    .expect("signed leaf")
+}
+
+/// A gateway that answers the identity read and refuses everything else.
+struct FakeGateway;
+
+#[async_trait::async_trait]
+impl astra_channel::AstraStageHandler for FakeGateway {
+    async fn stage_from_astra(
+        &self,
+        _: Box<aether::certificates::client::ClientCertificateStageAuthorization>,
+    ) -> Result<
+        Box<aether::certificates::client::GatewayCertificateStageReceipt>,
+        aether::certificates::transport::TrustUpdateRefusal,
+    > {
+        Err(aether::certificates::transport::TrustUpdateRefusal::Rejected)
+    }
+}
+
+#[async_trait::async_trait]
+impl astra_channel::AstraChannelHandler for FakeGateway {
+    async fn revoke(
+        &self,
+        _: Box<aether::certificates::revocation::EmergencyCertificateRevocation>,
+    ) -> Result<(), aether::certificates::transport::TrustUpdateRefusal> {
+        Err(aether::certificates::transport::TrustUpdateRefusal::Rejected)
+    }
+
+    async fn distribute(
+        &self,
+        _: Box<astra_channel::TrustDistribution>,
+    ) -> Result<(), aether::certificates::transport::TrustUpdateRefusal> {
+        Err(aether::certificates::transport::TrustUpdateRefusal::Rejected)
+    }
+
+    async fn commit_recovery(
+        &self,
+        _: Box<astra_channel::RelayedStageCommit>,
+    ) -> Result<(), aether::certificates::transport::TrustUpdateRefusal> {
+        Err(aether::certificates::transport::TrustUpdateRefusal::Rejected)
+    }
+
+    async fn gateway_transition_published(
+        &self,
+        _: astra_channel::GatewayTransitionPublished,
+    ) -> Result<(), aether::certificates::transport::TrustUpdateRefusal> {
+        Err(aether::certificates::transport::TrustUpdateRefusal::Rejected)
+    }
+
+    async fn gateway_identity(
+        &self,
+    ) -> Result<
+        astra_channel::GatewayIdentityView,
+        aether::certificates::transport::TrustUpdateRefusal,
+    > {
+        let pq_certificate = served_leaf();
+        Ok(astra_channel::GatewayIdentityView {
+            pq_certificate_fingerprint: aether::certificates::gateway::pq_certificate_fingerprint(
+                &pq_certificate,
+            )
+            .expect("fingerprint"),
+            pq_certificate,
+            tls_certificate_fingerprint: Fingerprint::of(b"gateway tls in service"),
+            tls_certificate_not_after: GATEWAY_TLS_NOT_AFTER,
+            active_gateway_identity_epoch: GATEWAY_GENERATION,
+            gateway_decision_epoch: GATEWAY_DECISION_EPOCH,
+        })
+    }
+
+    async fn peer_state(
+        &self,
+        _: &WireGuardKey,
+    ) -> Result<
+        astra_channel::PeerCertificateStateView,
+        aether::certificates::transport::TrustUpdateRefusal,
+    > {
+        Err(aether::certificates::transport::TrustUpdateRefusal::Rejected)
+    }
+}
+
+/// The fixture, with its gateway channel dialing a fake gateway on loopback.
+async fn fixture_with_gateway(dir: &Path) -> Arc<AstraService> {
+    use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose};
+    let astra_certificate = crate::gateway::initialize(dir, false).expect("astra identity");
+    let mut params = CertificateParams::new(vec![astra_channel::INTERNAL_SERVER_NAME.to_string()])
+        .expect("params");
+    params.is_ca = IsCa::NoCa;
+    params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    params.not_before = time::OffsetDateTime::now_utc() - time::Duration::minutes(5);
+    params.not_after = time::OffsetDateTime::now_utc() + time::Duration::days(30);
+    let key_pair = KeyPair::generate().expect("keygen");
+    let certificate = params.self_signed(&key_pair).expect("self-signed");
+    let der = certificate.der().to_vec();
+    let identity = astra_channel::ChannelIdentity {
+        certificate_der: der.clone(),
+        private_key_der: key_pair.serialize_der(),
+    };
+    let gateway_certificate =
+        aether::certificates::encoding::DerCertificate::new(der).expect("der");
+
+    let config = astra_channel::server_config(&identity, &astra_certificate).expect("server");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let address = listener.local_addr().expect("address");
+    drop(listener);
+    let router = astra_channel::router(Arc::new(FakeGateway));
+    tokio::spawn(async move {
+        let _ = astra_channel::serve(address, config, router, astra_channel::INTERNAL_PREFIX).await;
+    });
+    for _ in 0..100 {
+        if tokio::net::TcpStream::connect(address).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let channel = crate::gateway::GatewayChannel::open(dir, address, &gateway_certificate)
+        .expect("channel opens");
+    Arc::new(build_service(dir, None, Some(channel)))
+}
+
+#[tokio::test]
+async fn a_gateway_revocation_reads_both_expiries_live() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let service = fixture_with_gateway(dir.path()).await;
+    let request = DoorRequest::GatewayRevocation { text: text() };
+    let opened = opened(service.door(console(), request, NOW).await);
+    assert_eq!(opened.scope, CampaignScope::EmergencyRevocation);
+    assert_eq!(
+        opened.revocation_expiries,
+        Some(RevocationExpiries {
+            tls_not_after: Some(GATEWAY_TLS_NOT_AFTER),
+            pq_not_after: Some(GATEWAY_LEAF_NOT_AFTER),
+        })
+    );
+    let campaign = campaign_of(&service, &opened).await;
+    assert_eq!(
+        campaign.targets[0].certificate_kind,
+        CertificateKind::GatewayPq
+    );
+    assert_eq!(campaign.targets[0].epoch, GATEWAY_DECISION_EPOCH);
+    assert_eq!(campaign.targets[0].generation, GATEWAY_GENERATION);
+}
+
+#[tokio::test]
+async fn a_gateway_identity_opening_freezes_the_leaf_and_exports_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let service = fixture_with_gateway(dir.path()).await;
+    let request = DoorRequest::GatewayIdentity { text: text() };
+    let opened = opened(service.door(console(), request, NOW).await);
+    assert_eq!(opened.scope, CampaignScope::GatewayIdentity);
+    assert_eq!(opened.revocation_expiries, None);
+    let campaign = campaign_of(&service, &opened).await;
+    assert_eq!(campaign.targets[0].epoch, GATEWAY_DECISION_EPOCH);
+    assert_eq!(campaign.targets[0].generation, GATEWAY_GENERATION);
+    let exported = std::fs::read(dir.path().join(GATEWAY_ACTIVE_CERTIFICATE_FILE))
+        .expect("the leaf in service is exported");
+    let leaf: PqCertificate = serde_json::from_slice(&exported).expect("a PQ certificate");
+    assert_eq!(leaf.not_after_unix, GATEWAY_LEAF_NOT_AFTER);
 }
