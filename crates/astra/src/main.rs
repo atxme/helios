@@ -5,7 +5,9 @@
 //! - `bootstrap` creates the registry of a trust domain. It never creates
 //!   `CA-PQ`: the anchor is produced by the operator companion and confirmed
 //!   out of band, and Astra only ever learns its **public** half.
-//! - `run` serves the public HTTPS endpoint.
+//! - `run` serves the public HTTPS endpoint, and the door every opening goes
+//!   through on a Unix socket of the state volume; the other subcommands are
+//!   the door's console connector.
 //! - `status` prints what the authority currently believes, including the head
 //!   of the audit chain — the value an operator records so a restore can be
 //!   told apart from a fork.
@@ -192,17 +194,20 @@ pub(crate) enum CampaignScopeArg {
 
 #[derive(Subcommand)]
 enum CampaignCommand {
-    /// Resolves a campaign over the current fleet and deposits it.
+    /// Asks the running service's door to open a campaign over the current
+    /// fleet.
     ///
-    /// # Why a local command and not a public route
+    /// # Why the door and not a public route
     ///
     /// §11.6 has an interface ask Astra to resolve a campaign over the
     /// **current** targets and generations. On the public origin that would be
     /// an unauthenticated route answering every caller with the domain's
     /// inventory, and the authentication such a route would need is not
-    /// settled anywhere. So the resolution happens here, on the machine that
-    /// already runs Astra, and the result is deposited for the running service
-    /// to adopt — the shape `heliosd peer add` uses for the same reason.
+    /// settled anywhere. So the resolution happens in the service, at its
+    /// door, which only connectors that establish their caller reach: this
+    /// console, over the service's local socket, and an administrator peer
+    /// relayed by the gateway. The command resolves, signs and writes nothing
+    /// itself; with the service stopped, it opens nothing.
     ///
     /// What it prints is an opaque operation identifier. Everything else — the
     /// capability tokens, the campaign itself — the companion fetches from the
@@ -225,7 +230,7 @@ enum CampaignCommand {
 
 #[derive(Subcommand)]
 enum ChainCommand {
-    /// Resolves the chain and deposits its first campaign.
+    /// Has the service's door resolve the chain and open its first campaign.
     ///
     /// # Why four campaigns and not one
     ///
@@ -256,11 +261,12 @@ enum ChainCommand {
         #[arg(long)]
         issuer_request_out: Option<PathBuf>,
     },
-    /// Deposits the next campaign, once the previous one has taken effect.
+    /// Opens the next campaign through the door, once the previous one has
+    /// taken effect.
     ///
-    /// «Taken effect» is read from this registry, not from an approval: the
-    /// plan lives in the state volume and the operations live in the running
-    /// service's memory. Observing the effect is also the stronger question —
+    /// «Taken effect» is read from the registry, not from an approval: the
+    /// plan outlives the operations, which live in the service's memory for
+    /// five minutes at most. Observing the effect is also the stronger question —
     /// a step whose approval was taken but whose object never landed has not
     /// moved the domain, and resolving the next campaign against it would
     /// freeze a state nobody reached.
@@ -372,17 +378,17 @@ enum IssuerCommand {
         out: Option<PathBuf>,
         /// Free text shown to the operator before the touch.
         ///
-        /// With `--requested-by`, the request is also deposited as an
-        /// `issuer_delegation` campaign (§7.6): the companion then fetches it
+        /// With `--requested-by`, the service also opens an
+        /// `issuer_delegation` campaign over it (§7.6): the companion then fetches it
         /// over the §8.2 transport, reads the exact material it is about to
         /// certify, and deposits the delegation back here. Without the two,
         /// the request is only written to a file, and the companion signs it
         /// with nothing tying it to this authority.
         ///
         /// Not a `campaign open --scope` variant, because the target of this
-        /// campaign does not exist until this command creates it: the epoch,
-        /// the ML-DSA-87 key and the PKCS#10 request are produced here, beside
-        /// the private halves they name.
+        /// campaign does not exist until this request creates it: the epoch,
+        /// the ML-DSA-87 key and the PKCS#10 request are produced by the
+        /// service, beside the private halves they name.
         #[arg(long, requires = "requested_by")]
         reason: Option<String>,
         /// Who asked for it. Shown to the operator, and audited.

@@ -220,7 +220,9 @@ pub(crate) mod test_support;
 #[cfg(test)]
 mod workflow_tests;
 
-/// Astra's private listener: the four routes the gateway relays into.
+/// Astra's private listener: the routes the gateway relays into — the client
+/// renewal, the trust-update preparation and the operator campaign, opening
+/// included (spec §8.1.2, §0.6, §8.5).
 ///
 /// It is the mirror of [`astra_channel::router`], and it carries the
 /// same three properties. Everything outside

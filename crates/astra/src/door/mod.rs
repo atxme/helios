@@ -36,7 +36,7 @@
 //! gateway transition change the registry itself (§5.6). Through the door
 //! they run on the registry this service holds, so the next opening sees
 //! them without a restart; with the service stopped, the console runs the
-//! same [`write`] functions on the file, under the [`VolumeLock`] that a
+//! same [`write`](mod@write) functions on the file, under the [`VolumeLock`] that a
 //! running service holds for its whole life (§5.9).
 
 mod chain;

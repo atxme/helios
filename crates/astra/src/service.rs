@@ -23,15 +23,16 @@
 //! renewals; an ordinary renewal identifier is therefore absent rather than
 //! filtered out, and receives the same coarse refusal as one nobody issued.
 //!
-//! # Limite connue : ouvrir une campagne reste une commande locale
+//! # Limite connue : l'origine publique n'ouvre aucune campagne
 //!
 //! `POST /v1/campaigns` still answers `501`. §11.6 has an interface ask Astra
 //! to **resolve** a campaign over the fleet's current targets, and on an
 //! unauthenticated public route that would answer every caller with the
 //! domain's inventory. The authentication such a route needs is not settled
 //! anywhere in the specification, and inventing one here is how a hole gets
-//! built. Campaigns are opened by `astra campaign open`, on the machine that
-//! already runs Astra, and deposited for this process to adopt.
+//! built. Campaigns are opened by this process's door ([`crate::door`]), which
+//! only the local console socket and the administrator tunnel reach — two
+//! connectors whose caller is established by the transport, not claimed.
 //!
 //! # The one route reachable without any live certificate
 //!
@@ -345,8 +346,9 @@ pub fn router(service: Arc<AstraService>) -> Router {
         // fleet's current targets, and an unauthenticated route that did that
         // would answer every caller with the domain's inventory. The
         // authentication that route needs is not settled, and inventing one
-        // here is how a hole gets built. Campaigns are opened locally, by
-        // `astra campaign open`, on the machine that already runs Astra.
+        // here is how a hole gets built. Campaigns are opened by the door
+        // (`crate::door`), from the local console socket or from an
+        // administrator relayed over the private channel — never from here.
         .route("/v1/campaigns", post(operator_credential_required))
         // The recovery of an expired identity (§7.5). Reachable without a
         // tunnel by construction — the tunnel is what expired — and therefore

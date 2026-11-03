@@ -326,7 +326,9 @@ pub async fn operator_signer_result(
 
 /// `POST /api/certificates/operator/campaigns`.
 ///
-/// The caller is an administrator before anything is read, the body is
+/// The caller is an administrator before the body is read: the route sits
+/// behind the `require_admin` layer, which refuses any other caller, and this
+/// handler checks the flag again through `operator_caller`. The body is
 /// bounded before it is parsed, and the authority is reached only with a
 /// request this gateway could read. The answer is the opening; a refusal is
 /// its class, the sentence staying in Astra's log.

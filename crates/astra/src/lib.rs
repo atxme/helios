@@ -33,8 +33,10 @@
 //! because §11.6 has that route *resolve* a campaign over the fleet's current
 //! targets: on an unauthenticated public route, that answers every caller with
 //! the domain's inventory, and the authentication it would need is not settled
-//! anywhere. `astra campaign open` and `astra revocation open` do the
-//! resolution locally instead.
+//! anywhere. Campaigns are opened by [`door`] instead, inside this service,
+//! for the two connectors that already establish who is asking: the local
+//! console over the service's Unix socket, and an administrator peer relayed
+//! by the gateway over the private channel ([`operator`]).
 //!
 //! Both directions of the private veth channel are served. [`gateway`] dials
 //! `heliosd`'s `/internal/v1/certificates/*` listener under mutually

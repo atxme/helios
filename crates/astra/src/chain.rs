@@ -26,9 +26,10 @@
 //!
 //! # What «done» means for a step
 //!
-//! Not «the operator approved it». The plan lives in this state volume and the
-//! operations live in the running service's memory, so a local command cannot
-//! ask whether an approval arrived — and asking would be the weaker question.
+//! Not «the operator approved it». The plan lives in the state volume and
+//! outlives the operations, which live in the service's memory for five
+//! minutes at most — and asking whether an approval arrived would be the
+//! weaker question anyway.
 //! What [`ChainStep::completed_by`] checks is the **effect**: the issuer epoch
 //! moved, the client TLS anchor has a successor, the gateway decision was
 //! stored. A step whose approval was taken but whose object never landed is
@@ -37,7 +38,7 @@
 //! The last step, the fleet's client leaves, has no registry effect by
 //! construction: a campaign authorizes rotations and each peer spends that
 //! authorization when it comes back (§7.6). It therefore closes the plan when
-//! it is deposited, and the limit is the one that scope already carries.
+//! it is opened, and the limit is the one that scope already carries.
 
 use aether::certificates::{
     encoding::{Fingerprint, Id16},
