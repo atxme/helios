@@ -111,7 +111,7 @@ pub(super) fn print_issuer_request(
     opened: Option<&Opening>,
 ) -> Result<()> {
     let parsed: astra::issuer::IssuerDelegationRequest =
-        serde_json::from_str(request).context("reading the delegation request")?;
+        serde_json::from_str(request).context("lire la demande de délégation")?;
     if let Some(out) = out {
         let path = out.path;
         out.write(request)?;
@@ -204,7 +204,7 @@ pub(crate) fn issuer_install(state_dir: &Path, authorization: Option<&Path>) -> 
 /// by what the door accepts.
 fn read_authorization(path: Option<&Path>) -> Result<Vec<u8>> {
     let limit = u64::try_from(MAX_DOOR_BODY_BYTES)
-        .context("door bound")?
+        .context("convertir la borne de la porte")?
         .saturating_add(1);
     let mut buffer = Vec::new();
     match path {

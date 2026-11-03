@@ -79,12 +79,12 @@ pub(crate) enum CallError {
 /// Sends one request to the running service's door and waits for its answer.
 pub(crate) fn call(state_dir: &Path, request: &DoorRequest) -> Result<DoorOutcome, CallError> {
     let body = serde_json::to_vec(request)
-        .context("encoding the request")
+        .context("encoder la requête")
         .map_err(CallError::Broken)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .context("starting a runtime for the door")
+        .context("démarrer l'exécuteur asynchrone de la console")
         .map_err(CallError::Broken)?;
     runtime.block_on(exchange(
         &state_dir.join(DOOR_SOCKET_FILE),
@@ -180,7 +180,7 @@ pub(crate) fn write(
 ) -> Result<DoorOutcome> {
     let lock = VolumeLock::try_acquire(state_dir).with_context(|| {
         format!(
-            "locking {}",
+            "verrouiller {}",
             state_dir.join(astra::door::VOLUME_LOCK_FILE).display()
         )
     })?;
@@ -202,7 +202,7 @@ fn write_locally(
     local: impl FnOnce(&mut AstraRegistry) -> Result<DoorOutcome>,
 ) -> Result<DoorOutcome> {
     let mut registry = AstraRegistry::load(&state_dir.join(REGISTRY_FILE), None)
-        .context("loading the Astra registry")?;
+        .context("charger le registre d'Astra")?;
     local(&mut registry)
 }
 

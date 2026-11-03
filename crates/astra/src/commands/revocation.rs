@@ -50,7 +50,7 @@ pub(crate) fn revocation_open(
         .opened
         .revocation_expiries
         .and_then(|expiries| expiries.pq_not_after)
-        .context("the door answered a client revocation without its signed expiry")?;
+        .context("la porte a répondu à la révocation d'un client sans son échéance signée")?;
     let next_epoch = revocation_epoch
         .checked_add(1)
         .context("revocation counter overflow")?;
@@ -90,13 +90,13 @@ fn gateway_revocation_open(state_dir: &Path, text: OpeningText) -> Result<()> {
     let expiries = opening
         .opened
         .revocation_expiries
-        .context("the door answered a gateway revocation without its signed expiries")?;
-    let pq_not_after = expiries
-        .pq_not_after
-        .context("the door answered a gateway revocation without the PQ leaf's expiry")?;
-    let tls_not_after = expiries
-        .tls_not_after
-        .context("the door answered a gateway revocation without the TLS leaf's expiry")?;
+        .context("la porte a répondu à la révocation de la gateway sans ses échéances signées")?;
+    let pq_not_after = expiries.pq_not_after.context(
+        "la porte a répondu à la révocation de la gateway sans l'échéance de la feuille PQ",
+    )?;
+    let tls_not_after = expiries.tls_not_after.context(
+        "la porte a répondu à la révocation de la gateway sans l'échéance de la feuille TLS",
+    )?;
     // The counter is the gateway's own axis (§4.2): the decision epoch the
     // daemon reports, advanced by one.
     let next_epoch = decision_epoch

@@ -43,7 +43,7 @@ pub(crate) fn bootstrap(
     let _volume = VolumeLock::try_acquire(state_dir)
         .with_context(|| {
             format!(
-                "locking {}",
+                "verrouiller {}",
                 state_dir.join(astra::door::VOLUME_LOCK_FILE).display()
             )
         })?

@@ -52,7 +52,8 @@ fn print_step(
     match opening.opened.scope {
         CampaignScope::IssuerDelegation => print_issuer_request(
             issuer_request_out,
-            delegation_request.context("the door answered the issuer step without its request")?,
+            delegation_request
+                .context("la porte a répondu à l'étape de délégation sans sa demande")?,
             Some(opening),
         ),
         CampaignScope::GatewayIdentity => {

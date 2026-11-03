@@ -140,9 +140,9 @@ fn configured_gateway_channel(state_dir: &Path) -> Result<astra::gateway::Gatewa
     };
     let address: SocketAddr = address
         .parse()
-        .context("ASTRA_GATEWAY_CHANNEL is not an address")?;
+        .context("ASTRA_GATEWAY_CHANNEL n'est pas une adresse")?;
     let pinned = aether::certificates::encoding::DerCertificate::parse(&certificate)
-        .map_err(|error| anyhow::anyhow!("ASTRA_GATEWAY_CERTIFICATE: {error}"))?;
+        .map_err(|error| anyhow::anyhow!("ASTRA_GATEWAY_CERTIFICATE illisible : {error}"))?;
     astra::gateway::GatewayChannel::open(state_dir, address, &pinned)
-        .map_err(|error| anyhow::anyhow!("opening the private gateway channel: {error}"))
+        .map_err(|error| anyhow::anyhow!("ouvrir le canal privé vers la gateway : {error}"))
 }
