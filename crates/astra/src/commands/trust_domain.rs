@@ -36,12 +36,6 @@ pub(crate) fn bootstrap(
         .transpose()
         .context("--ca-tls-fingerprint")?;
     let registry_path = state_dir.join(REGISTRY_FILE);
-    anyhow::ensure!(
-        !registry_path.exists(),
-        "a registry already exists at {}: bootstrapping over it would start a second history \
-         for the same domain",
-        registry_path.display()
-    );
     aether::private_file::create_private_dir(state_dir)
         .with_context(|| format!("creating {}", state_dir.display()))?;
     // Held until the registry is written: bootstrapping a volume another
@@ -59,6 +53,15 @@ pub(crate) fn bootstrap(
                 state_dir.display()
             )
         })?;
+    // Looked for under the lock, not before it: two bootstraps that both
+    // looked first could both find nothing, and the second would overwrite
+    // the service key and the registry the first had just written.
+    anyhow::ensure!(
+        !registry_path.exists(),
+        "a registry already exists at {}: bootstrapping over it would start a second history \
+         for the same domain",
+        registry_path.display()
+    );
 
     let ca_public_key =
         MlDsa87PublicKey::parse(ca_public_key).context("reading the CA-PQ public key")?;

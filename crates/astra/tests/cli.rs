@@ -631,6 +631,37 @@ fn bootstrap_refuses_while_the_volume_is_held() {
     assert!(!directory.path().join("service-key.bin").exists());
 }
 
+/// The registry is looked for under the volume lock, not before it: two
+/// bootstraps that both looked first could both find nothing, and the second
+/// would overwrite the domain the first had just created. With the volume
+/// held, the refusal is the lock's, whatever the volume holds.
+#[test]
+fn bootstrap_looks_for_a_registry_only_once_it_holds_the_volume() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let key = ca_public_key();
+    assert!(bootstrap(directory.path(), &key).status.success());
+    let _held = astra::door::VolumeLock::try_acquire(directory.path())
+        .expect("lockable")
+        .expect("the test holds the volume");
+    let before = snapshot(directory.path());
+
+    let output = bootstrap(directory.path(), &key);
+    assert!(!output.status.success());
+    let printed = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        printed.contains(&format!(
+            "un autre processus tient {} : rien n'a été amorcé",
+            directory.path().display()
+        )),
+        "the registry was looked for before the lock was taken: {printed}"
+    );
+    assert_eq!(
+        snapshot(directory.path()),
+        before,
+        "nothing in the volume is touched"
+    );
+}
+
 /// The opening reaches the running service: the identifier comes back, and a
 /// second identical opening is refused because the first one is in the
 /// service's own store.
