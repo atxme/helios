@@ -27,9 +27,9 @@ async-trait.workspace = true
 axum.workspace = true
 base64.workspace = true
 clap.workspace = true
-# The local socket of the door (`door::local`) and the console that calls it
-# (`src/console.rs`): HTTP/1 over a Unix stream, the shape of `helios-api`'s
-# local administration socket.
+# Le socket local de la porte (`door::local`) et la console qui l'appelle
+# (`src/console.rs`) : HTTP/1 sur un flux Unix, comme le socket local
+# d'administration de `helios-api`.
 hyper.workspace = true
 hyper-util.workspace = true
 rcgen.workspace = true
