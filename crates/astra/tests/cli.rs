@@ -697,6 +697,72 @@ fn a_write_while_a_mute_process_holds_the_volume_is_refused() {
     );
 }
 
+/// The `--out` of a delegation request is opened before the door is called.
+/// Written only after the answer, an unwritable path would leave a live
+/// delegation campaign in the service, blocking its family for nothing; and
+/// an opening refused leaves no empty file behind.
+#[test]
+fn an_unwritable_issuer_request_out_opens_nothing() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    assert!(bootstrap(directory.path(), &ca_public_key())
+        .status
+        .success());
+    copy_a_vault(directory.path());
+    let elsewhere = tempfile::tempdir().expect("temp dir");
+    let out = elsewhere.path().join("request.json");
+    let out = out.to_str().expect("utf-8 path");
+    let request = [
+        "issuer",
+        "request",
+        "--reason",
+        "annual delegation",
+        "--requested-by",
+        "alice",
+    ];
+
+    let output = astra(directory.path(), &[&request[..], &["--out", out]].concat());
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains(SERVICE_STOPPED));
+    assert!(
+        !Path::new(out).exists(),
+        "a refused opening leaves no file at --out"
+    );
+
+    let service = RunningService::start(directory.path());
+    let unwritable = elsewhere.path().join("missing").join("request.json");
+    let output = astra(
+        directory.path(),
+        &[
+            &request[..],
+            &["--out", unwritable.to_str().expect("utf-8 path")],
+        ]
+        .concat(),
+    );
+    assert!(!output.status.success(), "an unwritable --out was accepted");
+    let printed = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        printed.contains(&format!("writing {}", unwritable.display())),
+        "the refusal names the path: {printed}"
+    );
+    assert!(output.stdout.is_empty());
+
+    let output = astra(directory.path(), &[&request[..], &["--out", out]].concat());
+    assert!(
+        output.status.success(),
+        "the refused --out left a campaign behind: {} — service: {}",
+        String::from_utf8_lossy(&output.stderr),
+        service.log()
+    );
+    assert_eq!(
+        std::fs::read(out).expect("the request is written"),
+        String::from_utf8(output.stdout)
+            .expect("utf-8")
+            .trim_end()
+            .as_bytes(),
+        "--out holds the request printed on standard output"
+    );
+}
+
 /// The opening reaches the running service: the identifier comes back, and a
 /// second identical opening is refused because the first one is in the
 /// service's own store.

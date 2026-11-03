@@ -19,7 +19,7 @@ use astra::registry::AstraRegistry;
 
 use super::campaign::print_approval;
 use super::gateway_identity::print_gateway_identity;
-use super::issuer::print_issuer_request;
+use super::issuer::{print_issuer_request, RequestOut};
 use crate::{console, REGISTRY_FILE};
 
 fn chain_plan_path(state_dir: &Path) -> PathBuf {
@@ -47,7 +47,7 @@ fn print_step(
     plan: &ChainPlan,
     opening: &Opening,
     delegation_request: Option<&str>,
-    issuer_request_out: Option<&Path>,
+    issuer_request_out: Option<RequestOut<'_>>,
 ) -> Result<()> {
     match opening.opened.scope {
         CampaignScope::IssuerDelegation => print_issuer_request(
@@ -98,6 +98,9 @@ pub(crate) fn chain_open(
     issuer_request_out: Option<&Path>,
 ) -> Result<()> {
     let text = console::opening_text(reason, requested_by, window_secs);
+    // Before the door, as `issuer request` does: the step it opens may be
+    // the delegation, whose request has to land somewhere.
+    let issuer_request_out = issuer_request_out.map(RequestOut::open).transpose()?;
     let outcome = console::open(state_dir, DoorRequest::ChainOpen { text })?;
     let DoorOutcome::ChainStep {
         opened: Some(opening),
@@ -124,6 +127,7 @@ pub(crate) fn chain_open(
 }
 
 pub(crate) fn chain_next(state_dir: &Path, issuer_request_out: Option<&Path>) -> Result<()> {
+    let issuer_request_out = issuer_request_out.map(RequestOut::open).transpose()?;
     let outcome = console::open(state_dir, DoorRequest::ChainNext {})?;
     match &outcome {
         DoorOutcome::ChainStep { opened: None, .. } => {
