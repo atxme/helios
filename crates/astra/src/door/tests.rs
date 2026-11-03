@@ -18,6 +18,8 @@ use crate::registry::{AstraRegistry, AstraState, ChallengeStore, PeerRecord};
 use crate::service::{SourceBudget, MAX_LIVE_CHALLENGES};
 use crate::AuditEvent;
 
+mod tunnel;
+
 /// The instant every test opens at.
 const NOW: u64 = 1_000_000;
 
