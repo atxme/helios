@@ -39,11 +39,64 @@ impl AstraRegistry {
         Self::load_with(path, expected_head, true)
     }
 
+    /// Reads the registry's state for display, and never writes the file.
+    ///
+    /// The same migration, rotation recovery and audit check as
+    /// [`Self::load`], kept in memory. A reader must not write: the volume has
+    /// one writer at a time (spec §5.9), and a console reader runs while the
+    /// service may hold the registry. Writing back a migration or a recovered
+    /// rotation window from a read taken before the service's last save would
+    /// put back what the service had since cleared, behind its back. The file
+    /// is completed by the next writer that loads it instead. Returning the
+    /// state, not an [`AstraRegistry`], leaves a reader nothing to save with.
+    pub fn read_state(
+        path: &Path,
+        expected_head: Option<&Fingerprint>,
+    ) -> Result<AstraState, RegistryError> {
+        Self::verified_state(path, expected_head, false).map(|(state, _)| state)
+    }
+
+    /// [`Self::read_state`], accepting the unattended per-peer lifecycle
+    /// appended since the operator recorded the witness, as
+    /// [`Self::load_allowing_unattended_tail`] does.
+    pub fn read_state_allowing_unattended_tail(
+        path: &Path,
+        expected_head: Option<&Fingerprint>,
+    ) -> Result<AstraState, RegistryError> {
+        Self::verified_state(path, expected_head, true).map(|(state, _)| state)
+    }
+
     fn load_with(
         path: &Path,
         expected_head: Option<&Fingerprint>,
         allow_unattended_tail: bool,
     ) -> Result<Self, RegistryError> {
+        let (state, migrated) = Self::verified_state(path, expected_head, allow_unattended_tail)?;
+        let registry = Self {
+            path: path.to_path_buf(),
+            state,
+        };
+        if migrated {
+            // Written back so this happens once. The audit chain is untouched:
+            // nothing was decided here, and appending an event for a field
+            // that was always implied would fork the head an operator holds.
+            registry.save()?;
+            tracing::info!(
+                path = %path.display(),
+                "registry migrated: derived state was restored from the identity and signed \
+                 transitions already recorded"
+            );
+        }
+        Ok(registry)
+    }
+
+    /// Reads, migrates, recovers and verifies the file, writing nothing.
+    /// Returns whether migration or recovery changed anything.
+    fn verified_state(
+        path: &Path,
+        expected_head: Option<&Fingerprint>,
+        allow_unattended_tail: bool,
+    ) -> Result<(AstraState, bool), RegistryError> {
         let raw = std::fs::read(path)?;
         let mut document: serde_json::Value = serde_json::from_slice(&raw)
             .map_err(|error| RegistryError::Corrupt(error.to_string()))?;
@@ -66,22 +119,7 @@ impl AstraRegistry {
             }
             _ => state.audit.verify(expected_head)?,
         }
-        let registry = Self {
-            path: path.to_path_buf(),
-            state,
-        };
-        if migrated {
-            // Written back so this happens once. The audit chain is untouched:
-            // nothing was decided here, and appending an event for a field
-            // that was always implied would fork the head an operator holds.
-            registry.save()?;
-            tracing::info!(
-                path = %path.display(),
-                "registry migrated: derived state was restored from the identity and signed \
-                 transitions already recorded"
-            );
-        }
-        Ok(registry)
+        Ok((state, migrated))
     }
 
     /// Fills the two fields a registry written before them does not carry.

@@ -159,10 +159,11 @@ pub(crate) fn chain_next(state_dir: &Path, issuer_request_out: Option<&Path>) ->
 
 pub(crate) fn chain_status(state_dir: &Path) -> Result<()> {
     let plan = load_chain_plan(state_dir)?;
-    let registry = AstraRegistry::load(&state_dir.join(REGISTRY_FILE), None)
+    // A read: the service may be running, and it is the volume's one writer.
+    let state = AstraRegistry::read_state(&state_dir.join(REGISTRY_FILE), None)
         .context("loading the Astra registry")?;
     print_chain_plan(&plan);
-    match plan.assert_current_landed(registry.state()) {
+    match plan.assert_current_landed(&state) {
         Ok(()) => eprintln!("étape en cours   : prête pour `astra chain next`"),
         Err(error) => eprintln!("étape en cours   : {error}"),
     }

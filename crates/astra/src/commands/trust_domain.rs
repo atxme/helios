@@ -179,12 +179,12 @@ pub(crate) fn status(state_dir: &Path, expected_audit_head: Option<&str>) -> Res
         .map(Fingerprint::parse_hex)
         .transpose()
         .context("reading the expected audit head")?;
-    let registry = AstraRegistry::load_allowing_unattended_tail(
+    // A read: the service may be running, and it is the volume's one writer.
+    let state = AstraRegistry::read_state_allowing_unattended_tail(
         &state_dir.join(REGISTRY_FILE),
         expected.as_ref(),
     )
     .context("loading the Astra registry")?;
-    let state = registry.state();
     println!("trust domain     : {}", state.trust_domain_id);
     println!("gateway          : {}", state.gateway_wg_public_key);
     println!("server name      : {}", state.server_name);
@@ -205,7 +205,7 @@ pub(crate) fn status(state_dir: &Path, expected_audit_head: Option<&str>) -> Res
             None => "absent".to_string(),
         }
     );
-    println!("audit head       : {}", registry.audit_head());
+    println!("audit head       : {}", state.audit.head());
     println!("peers            : {}", state.peers.len());
 
     let now = now_unix();

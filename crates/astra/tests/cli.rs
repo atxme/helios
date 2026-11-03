@@ -180,6 +180,130 @@ fn status_accepts_only_a_legacy_status_suffix_after_the_witness() {
     );
 }
 
+/// Rewrites the registry in the shape an older Astra left: no policy pin and
+/// no credential epoch, the two fields loading derives rather than refuses.
+/// Returns the bytes now on disk.
+fn age_the_registry(state_dir: &Path) -> Vec<u8> {
+    let path = state_dir.join("registry.json");
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("registry")).expect("json");
+    let object = document.as_object_mut().expect("object");
+    object.remove("astra_policy_fingerprint");
+    object.remove("credential_registry_epoch");
+    let aged = serde_json::to_vec_pretty(&document).expect("encode");
+    std::fs::write(&path, &aged).expect("write");
+    aged
+}
+
+/// `status` is a reader: with the service possibly running, it must not
+/// write the registry behind it (spec §5.9), even when the file it reads
+/// still needs the migration loading performs. It prints the same domain.
+#[test]
+fn status_reads_a_registry_that_needs_migration_without_writing_it() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    assert!(bootstrap(directory.path(), &ca_public_key())
+        .status
+        .success());
+    let current = astra(directory.path(), &["status"]);
+    assert!(current.status.success());
+
+    let aged = age_the_registry(directory.path());
+    let output = astra(directory.path(), &["status"]);
+    assert!(
+        output.status.success(),
+        "status refused an older registry: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&current.stdout),
+        "the migrated domain reads as the current one"
+    );
+    assert_eq!(
+        std::fs::read(directory.path().join("registry.json")).expect("registry"),
+        aged,
+        "status wrote the registry"
+    );
+}
+
+/// `astra chain status`, with the service's log silenced: what it prints for
+/// the operator goes to stderr too, and log lines carry their timestamp.
+fn chain_status(state_dir: &Path) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_astra"))
+        .env("RUST_LOG", "off")
+        .arg("--state-dir")
+        .arg(state_dir)
+        .args(["chain", "status"])
+        .output()
+        .expect("running the astra binary")
+}
+
+/// `chain status` is a reader too, and is held to the same rule as `status`.
+/// The plan's current step is deposited, so the registry is actually
+/// consulted for whether it landed.
+#[test]
+fn chain_status_reads_a_registry_that_needs_migration_without_writing_it() {
+    use aether::certificates::encoding::{Fingerprint, Id16};
+    use astra::chain::{ChainPlan, CHAIN_PLAN_FILE};
+
+    let directory = tempfile::tempdir().expect("temp dir");
+    assert!(bootstrap(directory.path(), &ca_public_key())
+        .status
+        .success());
+    let registry =
+        AstraRegistry::load(&directory.path().join("registry.json"), None).expect("registry");
+    let mut plan = ChainPlan::resolve(
+        Id16::new([3; 16]).expect("id"),
+        registry.state(),
+        "annual rotation".into(),
+        "operator".into(),
+        300,
+        1,
+    );
+    plan.record_deposit(
+        Id16::new([4; 16]).expect("id"),
+        Id16::new([5; 16]).expect("id"),
+        Fingerprint::of(b"campaign"),
+        2,
+    )
+    .expect("deposit");
+    std::fs::write(
+        directory.path().join(CHAIN_PLAN_FILE),
+        serde_json::to_vec(&plan).expect("plan"),
+    )
+    .expect("write plan");
+    let current = chain_status(directory.path());
+    assert!(
+        current.status.success(),
+        "chain status: {}",
+        String::from_utf8_lossy(&current.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&current.stderr).contains("has not taken effect yet"),
+        "the registry was read for the deposited step: {}",
+        String::from_utf8_lossy(&current.stderr)
+    );
+
+    let aged = age_the_registry(directory.path());
+    let output = chain_status(directory.path());
+    assert!(
+        output.status.success(),
+        "chain status refused an older registry: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&current.stderr),
+        "the migrated domain reads as the current one"
+    );
+    assert_eq!(output.stdout, current.stdout);
+    assert_eq!(
+        std::fs::read(directory.path().join("registry.json")).expect("registry"),
+        aged,
+        "chain status wrote the registry"
+    );
+}
+
 /// The delegation request is public, and it is the whole handover: an operator
 /// pipes it out of the container and hands it to the companion. What must be
 /// true of it is that the private halves exist here **before** it is printed —
@@ -974,9 +1098,10 @@ const REGISTRY_AND_KEY_NAMES: [&str; 6] = [
 ];
 
 /// The only functions that may name them, and which: `bootstrap` creates the
-/// volume under its lock, `status` and `chain status` read it, and the
-/// console's local writer runs `door::write` under the volume lock.
-const ALLOWED_USES: [(&str, &str, &str); 9] = [
+/// volume under its lock, `status` and `chain status` read it through
+/// `AstraRegistry::read_state*`, never `load`, which writes back a migration,
+/// and the console's local writer runs `door::write` under the volume lock.
+const ALLOWED_USES: [(&str, &str, &str); 7] = [
     (
         "src/commands/trust_domain.rs",
         "bootstrap",
@@ -988,17 +1113,7 @@ const ALLOWED_USES: [(&str, &str, &str); 9] = [
         "AstraRegistry::new",
     ),
     ("src/commands/trust_domain.rs", "bootstrap", "REGISTRY_FILE"),
-    (
-        "src/commands/trust_domain.rs",
-        "status",
-        "AstraRegistry::load",
-    ),
     ("src/commands/trust_domain.rs", "status", "REGISTRY_FILE"),
-    (
-        "src/commands/chain.rs",
-        "chain_status",
-        "AstraRegistry::load",
-    ),
     ("src/commands/chain.rs", "chain_status", "REGISTRY_FILE"),
     ("src/console.rs", "write_locally", "AstraRegistry::load"),
     ("src/console.rs", "write_locally", "REGISTRY_FILE"),

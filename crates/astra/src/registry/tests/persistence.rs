@@ -84,3 +84,55 @@ fn a_registry_with_nothing_to_recompute_the_pin_from_is_refused() {
         Err(RegistryError::Corrupt(_))
     ));
 }
+
+/// A reader sees the migrated state and leaves the file exactly as it was.
+///
+/// The console's readers run while the service may hold the registry; one
+/// that wrote back a migration would be a second writer behind it (spec §5.9).
+/// Both reading paths keep the head check of the load they mirror.
+#[test]
+fn a_read_migrates_in_memory_and_leaves_the_file_untouched() {
+    let (registry, directory) = registry();
+    registry.save().expect("save");
+    let path = directory.path().join("astra.json");
+    let head = registry.audit_head();
+
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let object = document.as_object_mut().unwrap();
+    object.remove("astra_policy_fingerprint");
+    object.remove("credential_registry_epoch");
+    let aged = serde_json::to_vec(&document).unwrap();
+    std::fs::write(&path, &aged).unwrap();
+
+    let expected_pin = AstraIssuancePolicy::standard(
+        registry.state().trust_domain_id,
+        registry.state().gateway_wg_public_key,
+        registry.state().server_name.clone(),
+    )
+    .pin()
+    .expect("pin");
+    for state in [
+        AstraRegistry::read_state(&path, Some(&head)).expect("read"),
+        AstraRegistry::read_state_allowing_unattended_tail(&path, Some(&head)).expect("read"),
+    ] {
+        assert_eq!(state.credential_registry_epoch, 0);
+        assert_eq!(state.astra_policy_fingerprint, expected_pin);
+        assert_eq!(state.audit.head(), head);
+    }
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        aged,
+        "a read wrote the registry"
+    );
+
+    let forked = Fingerprint::of(b"another history");
+    assert!(matches!(
+        AstraRegistry::read_state(&path, Some(&forked)),
+        Err(RegistryError::Audit(AuditError::Forked))
+    ));
+    assert!(matches!(
+        AstraRegistry::read_state_allowing_unattended_tail(&path, Some(&forked)),
+        Err(RegistryError::Audit(_))
+    ));
+}
