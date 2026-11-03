@@ -22,6 +22,7 @@
 //! that died, and the write is local.
 
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use astra::door::local::{DoorRefused, DOOR_ROUTE, MAX_DOOR_BODY_BYTES};
@@ -40,6 +41,18 @@ const SERVICE_STOPPED: &str = "le service Astra ne tourne pas : rien n'a été o
 /// answer at the door.
 const VOLUME_HELD: &str =
     "un autre processus tient le volume, et le service Astra n'y répond pas : rien n'a été écrit";
+
+/// How long the console waits for the whole exchange with the door, from the
+/// connection to the last byte of the answer.
+///
+/// Without a bound, a service that accepts the connection and never answers —
+/// wedged, or stuck mid-request — would leave the console waiting forever, in
+/// a `compose exec` as in `deploy.sh`. A minute leaves room for the slowest
+/// request the door serves: an opening or a publication that asks the gateway
+/// over the private channel, one mTLS round trip on the local veth link.
+/// Past it the console gives up waiting, not the request: what the service
+/// did, if anything, is in its log, as for any exchange cut short.
+const DOOR_EXCHANGE_BOUND: Duration = Duration::from_secs(60);
 
 /// Why a call to the door produced no outcome.
 #[derive(Debug, thiserror::Error)]
@@ -66,10 +79,27 @@ pub(crate) fn call(state_dir: &Path, request: &DoorRequest) -> Result<DoorOutcom
         .build()
         .context("starting a runtime for the door")
         .map_err(CallError::Broken)?;
-    runtime.block_on(exchange(&state_dir.join(DOOR_SOCKET_FILE), body))
+    runtime.block_on(exchange(
+        &state_dir.join(DOOR_SOCKET_FILE),
+        body,
+        DOOR_EXCHANGE_BOUND,
+    ))
 }
 
-async fn exchange(socket: &Path, body: Vec<u8>) -> Result<DoorOutcome, CallError> {
+/// The exchange, cut short at `bound`: a wait that ends there is a broken
+/// exchange, not a refusal, since the service may still be acting on it.
+async fn exchange(socket: &Path, body: Vec<u8>, bound: Duration) -> Result<DoorOutcome, CallError> {
+    match tokio::time::timeout(bound, exchange_unbounded(socket, body)).await {
+        Ok(result) => result,
+        Err(_) => Err(CallError::Broken(anyhow::anyhow!(
+            "la porte du service Astra n'a pas répondu en {} s : ce qui a été fait, s'il y a \
+             lieu, est dans le journal du service",
+            bound.as_secs()
+        ))),
+    }
+}
+
+async fn exchange_unbounded(socket: &Path, body: Vec<u8>) -> Result<DoorOutcome, CallError> {
     let stream = match tokio::net::UnixStream::connect(socket).await {
         Ok(stream) => stream,
         Err(error)
@@ -191,4 +221,40 @@ pub(crate) fn unexpected(outcome: &DoorOutcome) -> anyhow::Error {
     anyhow::anyhow!(
         "la porte du service Astra a répondu autre chose que ce qui était demandé : {outcome:?}"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::*;
+
+    /// A door that accepts and never answers — a service wedged mid-request —
+    /// ends the console's wait at the bound, as a broken exchange.
+    #[tokio::test]
+    async fn a_door_that_never_answers_is_broken_at_the_bound() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let socket = directory.path().join(DOOR_SOCKET_FILE);
+        let listener = tokio::net::UnixListener::bind(&socket).expect("listener");
+        let mute = tokio::spawn(async move {
+            let (connection, _) = listener.accept().await.expect("accepted");
+            // Held open, never read, never answered.
+            std::future::pending::<()>().await;
+            drop(connection);
+        });
+
+        let started = Instant::now();
+        let error = exchange(&socket, b"{}".to_vec(), Duration::from_millis(200))
+            .await
+            .expect_err("a mute door produces no outcome");
+        assert!(
+            matches!(error, CallError::Broken(_)),
+            "a wait cut short is a broken exchange: {error:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the wait ended at the bound"
+        );
+        mute.abort();
+    }
 }
