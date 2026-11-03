@@ -92,6 +92,30 @@ impl TrustLedger {
         client: &mut ClientCertificateState,
         now_unix: u64,
     ) -> Result<bool, CertificateError> {
+        if self.scheduled_revocations.is_empty() {
+            return Ok(false);
+        }
+        // Applying a due revocation updates three pieces of durable state:
+        // the queue, the target identity and the tombstones. Treat them as a
+        // single transaction so a capacity or consistency error cannot lose
+        // the current item (or leave an identity revoked without its ledger
+        // evidence).
+        let mut ledger = self.clone();
+        let mut gateway_state = gateway.clone();
+        let mut client_state = client.clone();
+        let moved = ledger.apply_due_inner(&mut gateway_state, &mut client_state, now_unix)?;
+        *self = ledger;
+        *gateway = gateway_state;
+        *client = client_state;
+        Ok(moved)
+    }
+
+    fn apply_due_inner(
+        &mut self,
+        gateway: &mut GatewayCertificateState,
+        client: &mut ClientCertificateState,
+        now_unix: u64,
+    ) -> Result<bool, CertificateError> {
         let mut moved = false;
         let mut remaining = Vec::with_capacity(self.scheduled_revocations.len());
         for revocation in std::mem::take(&mut self.scheduled_revocations) {

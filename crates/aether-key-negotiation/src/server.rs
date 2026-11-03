@@ -25,6 +25,10 @@ use crate::{
     MAX_HANDSHAKES_PER_SOURCE, MAX_NEGOTIATIONS_PER_IDENTITY,
 };
 
+#[cfg(test)]
+#[path = "tests/connection_lifecycle.rs"]
+mod connection_lifecycle;
+
 /// Secret configuration prepared for the WireGuard peer.
 ///
 /// Since `classic` stopped being a negotiable mode, every negotiation that

@@ -31,7 +31,7 @@ use std::time::Duration;
 use aether::certificates::encoding::{Fingerprint, Id16};
 use aether::certificates::transport::{
     AuthenticatedTrustUpdateRequest, PendingTrustTransaction, TrustUpdateRequest,
-    MAX_TRUST_UPDATE_OBJECTS,
+    MAX_TRUST_UPDATE_OBJECTS, MAX_TRUST_UPDATE_RESPONSE_BYTES,
 };
 use aether::certificates::{CertificateError, CERTIFICATE_PROTOCOL_VERSION};
 use aether::key_negotiation::PqCertificate;
@@ -220,10 +220,17 @@ impl TrustUpdateSession {
                 status: status.as_u16(),
             });
         }
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|error| TrustUpdateError::Transport(error.to_string()))?;
+        let bytes =
+            crate::certificate_http::read_bounded(response, MAX_TRUST_UPDATE_RESPONSE_BYTES)
+                .await
+                .map_err(|error| match error {
+                    crate::certificate_http::BodyError::TooLarge => {
+                        TrustUpdateError::Malformed("answer exceeds the ceiling".into())
+                    }
+                    crate::certificate_http::BodyError::Transport(error) => {
+                        TrustUpdateError::Transport(error.to_string())
+                    }
+                })?;
         serde_json::from_slice(&bytes)
             .map_err(|error| TrustUpdateError::Malformed(error.to_string()))
     }
@@ -324,7 +331,12 @@ impl Collection {
 /// gateway's crate, and a client that could only be built against the server's
 /// own types would be a client that cannot be tested without one.
 #[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TrustUpdateAnswer {
+    // The gateway may include a freshness statement alongside the transaction.
+    // It does not authorize any store mutation on its own.
+    #[serde(default, rename = "status")]
+    _status: Option<aether::certificates::status::AstraCertificateStatus>,
     #[serde(default)]
     manifest: Option<aether::certificates::transport::TrustUpdateTransactionManifest>,
     #[serde(default)]
@@ -487,6 +499,7 @@ mod tests {
         chunk: Option<TrustUpdateChunk>,
     ) -> TrustUpdateAnswer {
         TrustUpdateAnswer {
+            _status: None,
             manifest: manifest.cloned(),
             chunk,
         }
@@ -731,7 +744,7 @@ mod tests {
     /// The body carries a PQ certificate and an ML-DSA-87 signature — some ten
     /// kilobytes — so answering before it has all arrived would make the
     /// client see a broken pipe instead of the status under test.
-    async fn read_request(stream: &mut tokio::net::TcpStream) -> String {
+    pub(super) async fn read_request(stream: &mut tokio::net::TcpStream) -> String {
         use tokio::io::AsyncReadExt as _;
 
         let mut buffer = Vec::new();
@@ -856,3 +869,7 @@ mod tests {
         assert!(matches!(step, Step::Poll));
     }
 }
+
+#[cfg(all(test, feature = "certificate-signing"))]
+#[path = "trust_update/http_tests.rs"]
+mod http_tests;

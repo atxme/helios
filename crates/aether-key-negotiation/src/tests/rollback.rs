@@ -8,6 +8,14 @@ use aether::key_negotiation::{authenticate_request, KEY_NEGOTIATION_NONCE_LEN};
 use super::fixtures::{bench, simple_request, test_pki, Handler, CLIENT_WG_KEY, GATEWAY_WG_KEY};
 use crate::{negotiate, request_challenge, server::NegotiationHandler, transaction::RollbackGuard};
 
+async fn wait_for_signal(signal: &tokio::sync::Semaphore) {
+    tokio::time::timeout(Duration::from_secs(5), signal.acquire())
+        .await
+        .expect("bounded synchronization wait")
+        .expect("signal semaphore remains open")
+        .forget();
+}
+
 /// The rollback survives the destruction of the task that owned it.
 ///
 /// This is what the absolute-lifetime timeout does to a connection still
@@ -26,8 +34,9 @@ async fn a_destroyed_connection_still_rolls_its_candidate_back() {
         CLIENT_WG_KEY.into(),
     ));
 
-    // `Drop` cannot await, so it spawns; yielding is what lets that run.
-    tokio::task::yield_now().await;
+    // `Drop` cannot await, so it spawns a task to perform the backend write.
+    wait_for_signal(&handler.rollback_started).await;
+    wait_for_signal(&handler.rollback_completed).await;
 
     assert!(
         handler.rolled_back.load(Ordering::SeqCst),
@@ -47,8 +56,12 @@ async fn a_disarmed_guard_never_undoes_a_signed_commit() {
     guard.disarm();
     drop(guard);
 
-    tokio::task::yield_now().await;
-
+    assert_eq!(
+        Arc::strong_count(&handler),
+        1,
+        "a disarmed guard must not leave a rollback task retaining the handler"
+    );
+    assert!(handler.rollback_events.lock().unwrap().is_empty());
     assert!(
         !handler.rolled_back.load(Ordering::SeqCst),
         "past the point of no return there is nothing to undo, and undoing it would hand a \
@@ -77,11 +90,14 @@ async fn a_rollback_destroyed_inside_its_own_await_is_run_again() {
             guard.roll_back().await;
         }
     });
-    // Let it reach the suspension point inside `rollback`, then destroy
-    // it there — which is exactly what the absolute ceiling does.
-    tokio::task::yield_now().await;
+    // Wait until rollback is actually blocked in its backend await, then
+    // destroy the owner — the interruption the ceiling and task abort cause.
+    wait_for_signal(&handler.rollback_started).await;
     task.abort();
-    let _ = task.await;
+    let join_error = task
+        .await
+        .expect_err("the first rollback task was cancelled while blocked");
+    assert!(join_error.is_cancelled());
     assert_eq!(
         handler.rollbacks.load(std::sync::atomic::Ordering::SeqCst),
         0,
@@ -89,13 +105,16 @@ async fn a_rollback_destroyed_inside_its_own_await_is_run_again() {
     );
 
     handler.rollback_gate.add_permits(1);
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while handler.rollbacks.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("a rollback destroyed part-way through must be retried by the guard");
+    wait_for_signal(&handler.rollback_started).await;
+    wait_for_signal(&handler.rollback_completed).await;
+    assert_eq!(
+        handler.rollback_events.lock().unwrap().as_slice(),
+        &[
+            ([4; 16], CLIENT_WG_KEY.to_string()),
+            ([4; 16], CLIENT_WG_KEY.to_string()),
+        ],
+        "Drop retries the exact transaction rollback after its first future is cancelled"
+    );
 }
 
 /// No phase may outlive the connection that carries it.
@@ -115,7 +134,8 @@ async fn closing_an_unconfirmed_session_requests_rollback() {
     let pending = request_challenge(&client, server_addr, "localhost", GATEWAY_WG_KEY)
         .await
         .unwrap();
-    let mut request = simple_request([4; KEY_NEGOTIATION_NONCE_LEN]);
+    let transaction_id = [4; KEY_NEGOTIATION_NONCE_LEN];
+    let mut request = simple_request(transaction_id);
     request.server_challenge = pending.server_challenge();
     request.server_name = "localhost".into();
     let authenticated_request = authenticate_request(
@@ -129,14 +149,14 @@ async fn closing_an_unconfirmed_session_requests_rollback() {
         .unwrap();
     drop(session);
 
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !handler.rolled_back.load(Ordering::SeqCst) {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
+    wait_for_signal(&handler.rollback_started).await;
+    wait_for_signal(&handler.rollback_completed).await;
     assert!(!handler.confirmed.load(Ordering::SeqCst));
+    assert_eq!(
+        handler.rollback_events.lock().unwrap().as_slice(),
+        &[(transaction_id, CLIENT_WG_KEY.to_string())],
+        "the real connection handler rolls back only its prepared peer and transaction"
+    );
     client.close(0u32.into(), b"test complete");
     task.abort();
 }

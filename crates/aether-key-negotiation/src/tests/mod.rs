@@ -1,5 +1,5 @@
 mod dual_stack;
-mod fixtures;
+pub(crate) mod fixtures;
 mod limits;
 mod material;
 mod protocol;

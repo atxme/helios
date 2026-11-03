@@ -83,15 +83,14 @@ pub(super) async fn resume_stage(
             // it. A restart replays these exact bytes and never creates a
             // second candidate under the same operator touch.
             let mut operations = service.operations.lock().await;
-            operations
-                .get_mut(operation_id, caller, now_unix)?
-                .record_stage(Box::new(authorization.clone()))?;
-            operations.persist()?;
+            operations.update_persisted(operation_id, caller, now_unix, |operation| {
+                operation.record_stage(Box::new(authorization.clone()))
+            })?;
             authorization
         }
     };
     let stage_id = authorization.stage_id;
-    let candidate =
+    let expected_candidate =
         crate::DelegatedIssuer::candidate(&authorization).map_err(RenewalError::Internal)?;
 
     // Reserved before the object leaves this process: a staging the gateway
@@ -104,7 +103,7 @@ pub(super) async fn resume_stage(
             PendingRotation {
                 stage_id,
                 request_fingerprint: authorization.request_fingerprint,
-                candidate,
+                candidate: expected_candidate.clone(),
                 window: authorization.window,
                 stage_expires_at: authorization.stage_expires_at,
                 granted: false,
@@ -131,30 +130,93 @@ pub(super) async fn resume_stage(
         }
     };
 
+    // Publication is the point after which Astra cannot withhold the grant.
+    // Serialize competing polls in the established operations -> registry
+    // order, recheck revocation and ownership after all network awaits, then
+    // sign and persist while both views remain stable. No channel call occurs
+    // under either lock.
+    let mut operations = service.operations.lock().await;
+    let operation = operations.get(operation_id, caller, now_unix)?;
+    if !matches!(
+        operation.state,
+        aether::certificates::transport::ClientRenewalOperationState::PendingGrant
+            | aether::certificates::transport::ClientRenewalOperationState::PendingCommit
+    ) {
+        return Ok(());
+    }
+    if operation.stage_authorization() != Some(&authorization)
+        || !operation
+            .request_fingerprint
+            .matches(&authorization.request_fingerprint)
+    {
+        return Err(OperationError::Corrupt(
+            "stage authorization changed before grant publication",
+        )
+        .into());
+    }
+    if operation.state
+        == aether::certificates::transport::ClientRenewalOperationState::PendingCommit
+    {
+        drop(operations);
+        reconcile_released_grant(service, caller, operation_id, now_unix).await?;
+        return Ok(());
+    }
+
+    let registry = service.registry.lock().await;
+    let peer = registry.peer(caller).ok_or(RenewalError::UnknownPeer)?;
+    if peer.revoked {
+        return Err(RenewalError::Revoked);
+    }
+    if peer.active.generation != authorization.active_generation
+        || !peer
+            .active
+            .tls_certificate_fingerprint
+            .matches(&authorization.active_tls_certificate_fingerprint)
+        || !peer
+            .active
+            .pq_certificate_fingerprint
+            .matches(&authorization.active_pq_certificate_fingerprint)
+    {
+        return Err(
+            OperationError::Corrupt("active generation changed before grant publication").into(),
+        );
+    }
+    let pending = peer.pending.as_ref().ok_or(RegistryError::NoRotation)?;
+    if pending.stage_id != authorization.stage_id
+        || !pending
+            .request_fingerprint
+            .matches(&authorization.request_fingerprint)
+        || pending.granted
+        || pending.candidate != expected_candidate
+        || pending.window != authorization.window
+        || pending.stage_expires_at != authorization.stage_expires_at
+    {
+        return Err(OperationError::Corrupt(
+            "registry reservation changed before grant publication",
+        )
+        .into());
+    }
+    let peer_name = peer.name.clone();
+
     // The grant exists only against a receipt that verifies against this exact
     // authorization — every field, not only the identifier.
-    let grant = match issuer.release_grant(
-        &authorization,
-        &receipt,
-        &gateway_pq_key,
-        &gateway_leaf_fingerprint,
-    ) {
-        Ok(grant) => grant,
-        Err(error) => {
-            return Err(RenewalError::Issuer(error));
-        }
-    };
-
-    {
-        let mut operations = service.operations.lock().await;
-        let operation = operations.get_mut(operation_id, caller, now_unix)?;
+    let grant = issuer
+        .release_grant(
+            &authorization,
+            &receipt,
+            &gateway_pq_key,
+            &gateway_leaf_fingerprint,
+        )
+        .map_err(RenewalError::Issuer)?;
+    operations.update_persisted(operation_id, caller, now_unix, |operation| {
         operation.record_receipt(Box::new(receipt))?;
-        operation.record_grant(Box::new(grant))?;
-        operations.persist()?;
-    }
+        operation.record_grant(Box::new(grant))
+    })?;
+    drop(registry);
+    drop(operations);
     reconcile_released_grant(service, caller, operation_id, now_unix).await?;
     tracing::info!(
-        peer = %peer.name,
+        peer = %peer_name,
         operation = %operation_id,
         stage = %stage_id,
         "grant released against the gateway's signed receipt"

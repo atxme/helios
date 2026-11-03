@@ -201,7 +201,12 @@ pub async fn open(
     };
     let mut operations = service.operations.lock().await;
     operations.open(operation, now_unix)?;
-    operations.persist()?;
+    if let Err(error) = operations.persist() {
+        // No request is accepted until the journal is durable. In particular,
+        // an unwritten operation must not reserve this peer on the next retry.
+        operations.remove(&operation_id);
+        return Err(RenewalError::Operation(error));
+    }
     let requested_generation = operations
         .get(&operation_id, caller, now_unix)
         .map_err(RenewalError::Operation)?

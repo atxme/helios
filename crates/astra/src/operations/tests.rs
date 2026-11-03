@@ -576,3 +576,157 @@ fn a_record_carrying_two_approval_families_is_refused() {
         Err(OperationError::Corrupt("two approval families"))
     ));
 }
+
+/// Structural journal fixtures do not claim certificate/signature validity.
+fn staged_journal_record(operation: &Operation) -> Box<ClientCertificateStageAuthorization> {
+    let template = *grant();
+    Box::new(ClientCertificateStageAuthorization {
+        format_version: template.format_version,
+        protocol_version: template.protocol_version,
+        trust_domain_id: template.trust_domain_id,
+        ca_epoch: template.ca_epoch,
+        ca_tls_epoch: template.ca_tls_epoch,
+        issuer_kind: template.issuer_kind,
+        issuer_epoch: template.issuer_epoch,
+        issuer_authorization_fingerprint: template.issuer_authorization_fingerprint,
+        issuer_authorization: template.issuer_authorization,
+        stage_id: Id16::new([8; 16]).expect("stage ID"),
+        request_fingerprint: operation.request_fingerprint,
+        renewal_authorization_fingerprint: operation.approved_with().expect("authorized operation"),
+        renewal_approval: None,
+        campaign_approval: operation.campaign_evidence.clone(),
+        gateway_wg_public_key: template.gateway_wg_public_key,
+        server_name: template.server_name,
+        client_wg_public_key: operation.client_wg_public_key,
+        active_generation: template.active_generation,
+        next_generation: template.next_generation,
+        active_tls_certificate_fingerprint: template.active_tls_certificate_fingerprint,
+        active_pq_certificate_fingerprint: template.active_pq_certificate_fingerprint,
+        next_tls_ca_certificate_fingerprint: template.next_tls_ca_certificate_fingerprint,
+        next_tls_certificate: template.next_tls_certificate,
+        next_pq_certificate: template.next_pq_certificate,
+        issued_at: 1_100,
+        stage_expires_at: template.stage_expires_at,
+        window: template.window,
+        reason: operation.approval().expect("authorization family").reason(),
+        signature: template.signature,
+    })
+}
+
+#[test]
+fn automatic_and_campaign_journals_keep_their_exact_stage_binding_on_reload() {
+    for manual_campaign in [false, true] {
+        let mut operation = operation(1, key(2));
+        if manual_campaign {
+            let evidence = campaign_evidence(key(2), 4);
+            let fingerprint = evidence.fingerprint().expect("campaign fingerprint");
+            operation
+                .consume_campaign_approval(fingerprint, evidence)
+                .expect("campaign authorization");
+        } else {
+            operation
+                .authorize_automatic()
+                .expect("due automatic request");
+        }
+        operation
+            .record_stage(staged_journal_record(&operation))
+            .expect("stage recorded");
+        let directory = tempfile::tempdir().expect("directory");
+        let path = directory.path().join("operations.json");
+        let id = operation.operation_id;
+        let mut store = OperationStore::load(&path, 1_100).expect("empty journal");
+        store.open(operation.clone(), 1_100).expect("open record");
+        store.persist().expect("durable stage");
+        let loaded = OperationStore::load(&path, 1_101).expect("valid stage reloads");
+        assert_eq!(
+            loaded
+                .get(&id, &key(2), 1_101)
+                .expect("record")
+                .stage_authorization(),
+            operation.stage_authorization()
+        );
+        // Neither a changed authorization nor a changed consumed decision may
+        // be accepted in automatic/campaign records after the legacy fix.
+        for change_stage in [false, true] {
+            let mut corrupted = operation.clone();
+            if change_stage {
+                corrupted
+                    .stage_authorization
+                    .as_mut()
+                    .expect("stage")
+                    .renewal_authorization_fingerprint = Fingerprint::of(b"other decision");
+            } else {
+                corrupted.approved_with = Some(Fingerprint::of(b"other consumed decision"));
+            }
+            let mut bad = OperationStore::load(&path, 1_101).expect("valid journal");
+            *bad.get_mut(&id, &key(2), 1_101).expect("record") = corrupted;
+            bad.persist().expect("model corrupted journal");
+            assert!(matches!(
+                OperationStore::load(&path, 1_101),
+                Err(OperationError::Corrupt("stage authorization binding"))
+            ));
+            store.persist().expect("restore valid journal");
+        }
+    }
+}
+
+#[test]
+fn a_rejected_journal_update_keeps_the_original_identity_and_durable_state() {
+    let directory = tempfile::tempdir().expect("directory");
+    let path = directory.path().join("operations.json");
+    let operation = operation(1, key(2));
+    let id = operation.operation_id;
+    let mut store = OperationStore::load(&path, 1_100).expect("empty journal");
+    store.open(operation, 1_100).expect("record");
+    store.persist().expect("durable awaiting record");
+    let bytes = std::fs::read(&path).expect("journal");
+    let snapshot =
+        serde_json::to_value(store.get(&id, &key(2), 1_100).expect("record")).expect("snapshot");
+    assert!(matches!(
+        store.update_persisted(&id, &key(2), 1_100, |candidate| {
+            candidate.client_wg_public_key = key(3);
+            Ok(())
+        }),
+        Err(OperationError::Corrupt("identity or request binding"))
+    ));
+    assert!(matches!(
+        store.update_persisted(&id, &key(2), 1_100, |candidate| {
+            candidate.authorize_automatic()?;
+            Err(OperationError::ApprovalConflict)
+        }),
+        Err(OperationError::ApprovalConflict)
+    ));
+    assert!(matches!(
+        store.update_persisted(&id, &key(2), 1_100, |candidate| {
+            let replacement = Id16::new([3; 16]).expect("other operation ID");
+            candidate.operation_id = replacement;
+            candidate.approval_request.operation_id = replacement;
+            Ok(())
+        }),
+        Err(OperationError::Corrupt("operation update changed identity"))
+    ));
+    assert!(matches!(
+        store.update_persisted(&id, &key(2), 1_100, |candidate| {
+            candidate.request.created_at -= 1;
+            candidate.request_fingerprint = candidate.request.fingerprint();
+            candidate.approval_request.request_fingerprint = candidate.request_fingerprint;
+            Ok(())
+        }),
+        Err(OperationError::Corrupt("operation update changed identity"))
+    ));
+    assert_eq!(
+        serde_json::to_value(store.get(&id, &key(2), 1_100).expect("record")).expect("snapshot"),
+        snapshot
+    );
+    assert_eq!(std::fs::read(&path).expect("journal unchanged"), bytes);
+    store
+        .update_persisted(&id, &key(2), 1_100, Operation::authorize_automatic)
+        .expect("valid candidate published");
+    let loaded = OperationStore::load(&path, 1_101).expect("reload accepted update");
+    let operation = loaded.get(&id, &key(2), 1_101).expect("record");
+    assert_eq!(operation.state, ClientRenewalOperationState::PendingGrant);
+    assert_eq!(
+        operation.approved_with(),
+        Some(operation.request_fingerprint)
+    );
+}

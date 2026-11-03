@@ -216,6 +216,9 @@ pub(super) struct TestDataPlane {
     /// When set, every write is acknowledged as a failure.
     pub(super) failing: Arc<Mutex<bool>>,
     pub(super) handshake: Arc<Mutex<Option<std::time::SystemTime>>>,
+    /// Optional deterministic pause after a numbered backend write has taken
+    /// effect but before the handler receives its acknowledgement.
+    write_gate: Arc<Mutex<Option<Arc<BackendWriteGate>>>>,
     /// Fed from a counter rather than the wall clock: two calls to
     /// `SystemTime::now()` can return the same instant on a coarse clock,
     /// and "strictly newer" would then be false for a handshake that did
@@ -223,8 +226,65 @@ pub(super) struct TestDataPlane {
     pub(super) tick: Arc<Mutex<u64>>,
 }
 
+pub(super) struct BackendWriteGate {
+    write_number: usize,
+    entered: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
+}
+
+impl BackendWriteGate {
+    fn new(write_number: usize) -> Arc<Self> {
+        Arc::new(Self {
+            write_number,
+            entered: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        })
+    }
+
+    async fn pause_after_side_effect(&self) {
+        self.entered.add_permits(1);
+        self.release
+            .acquire()
+            .await
+            .expect("test write gate remains open")
+            .forget();
+    }
+
+    pub(super) async fn wait_until_entered(&self) {
+        self.entered
+            .acquire()
+            .await
+            .expect("test write gate remains open")
+            .forget();
+    }
+
+    pub(super) fn open(&self) {
+        self.release.add_permits(1);
+    }
+}
+
 impl TestDataPlane {
     pub(super) fn spawn() -> (
+        Self,
+        mpsc::Sender<InstallPskRequest>,
+        mpsc::Sender<aether::ObserveHandshakeRequest>,
+    ) {
+        Self::spawn_inner(None)
+    }
+
+    fn spawn_with_network(
+        network: Arc<RwLock<NetworkConfig>>,
+    ) -> (
+        Self,
+        mpsc::Sender<InstallPskRequest>,
+        mpsc::Sender<aether::ObserveHandshakeRequest>,
+    ) {
+        Self::spawn_inner(Some(network))
+    }
+
+    fn spawn_inner(
+        shared_network: Option<Arc<RwLock<NetworkConfig>>>,
+    ) -> (
         Self,
         mpsc::Sender<InstallPskRequest>,
         mpsc::Sender<aether::ObserveHandshakeRequest>,
@@ -235,18 +295,62 @@ impl TestDataPlane {
         let (psk_tx, mut psk_rx) = mpsc::channel::<InstallPskRequest>(8);
         let writes = Arc::clone(&applied);
         let refuse = Arc::clone(&failing);
+        let write_gate = Arc::new(Mutex::new(None::<Arc<BackendWriteGate>>));
+        let paused_write_gate = Arc::clone(&write_gate);
         tokio::spawn(async move {
             while let Some(request) = psk_rx.recv().await {
-                writes
-                    .lock()
-                    .await
-                    .push(request.psk.map(|secret| secret.expose().to_string()));
+                let aether::InstallPskRequest {
+                    public_key,
+                    address: _,
+                    psk,
+                    reply,
+                } = request;
+                let previous = if let Some(network) = &shared_network {
+                    let mut network = network.write().await;
+                    match network
+                        .peers
+                        .iter_mut()
+                        .find(|peer| peer.public_key == public_key)
+                    {
+                        Some(peer) => {
+                            let previous = peer.preshared_key.take();
+                            peer.preshared_key = psk.as_ref().map(aether::SecretString::duplicate);
+                            previous
+                        }
+                        None => {
+                            let _ = reply.send(Err("peer missing from test network".into()));
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                };
+                let write_number = {
+                    let mut writes = writes.lock().await;
+                    writes.push(psk.as_ref().map(|secret| secret.expose().to_string()));
+                    writes.len()
+                };
+                let gate = paused_write_gate.lock().await.clone();
+                if let Some(gate) = gate.filter(|gate| gate.write_number == write_number) {
+                    gate.pause_after_side_effect().await;
+                }
                 let answer = if *refuse.lock().await {
+                    if let Some(network) = &shared_network {
+                        if let Some(peer) = network
+                            .write()
+                            .await
+                            .peers
+                            .iter_mut()
+                            .find(|peer| peer.public_key == public_key)
+                        {
+                            peer.preshared_key = previous;
+                        }
+                    }
                     Err("data plane refused".to_string())
                 } else {
                     Ok(())
                 };
-                let _ = request.reply.send(answer);
+                let _ = reply.send(answer);
             }
         });
         let (handshake_tx, mut handshake_rx) = mpsc::channel::<aether::ObserveHandshakeRequest>(8);
@@ -262,6 +366,7 @@ impl TestDataPlane {
                 applied,
                 failing,
                 handshake,
+                write_gate,
                 tick: Arc::new(Mutex::new(0)),
             },
             psk_tx,
@@ -271,6 +376,10 @@ impl TestDataPlane {
 
     pub(super) async fn start_failing(&self) {
         *self.failing.lock().await = true;
+    }
+
+    pub(super) async fn stop_failing(&self) {
+        *self.failing.lock().await = false;
     }
 
     /// Reports a handshake strictly newer than any reported before.
@@ -283,6 +392,12 @@ impl TestDataPlane {
 
     pub(super) async fn writes(&self) -> Vec<Option<String>> {
         self.applied.lock().await.clone()
+    }
+
+    pub(super) async fn pause_after_write(&self, write_number: usize) -> Arc<BackendWriteGate> {
+        let gate = BackendWriteGate::new(write_number);
+        *self.write_gate.lock().await = Some(gate.clone());
+        gate
     }
 }
 
@@ -314,9 +429,11 @@ pub(super) fn gateway_with(
         &fixture.client_certificate.fingerprint().unwrap(),
     );
     configured.peers[0].minimum_key_negotiation_mode = Some(floor);
-    let (plane, psk_tx, handshake_tx) = TestDataPlane::spawn();
+    let shared_network = Arc::new(RwLock::new(configured));
+    let (plane, psk_tx, handshake_tx) =
+        TestDataPlane::spawn_with_network(Arc::clone(&shared_network));
     let handler = GatewayHandler {
-        network: Arc::new(RwLock::new(configured)),
+        network: shared_network,
         psk_tx,
         handshake_tx,
         gateway_public_key: GATEWAY_KEY.into(),

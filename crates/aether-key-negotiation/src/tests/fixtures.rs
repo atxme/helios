@@ -37,8 +37,8 @@ pub(super) fn test_now() -> u64 {
         .unwrap()
         .as_secs()
 }
-pub(super) const CLIENT_WG_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
-pub(super) const GATEWAY_WG_KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+pub(crate) const CLIENT_WG_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+pub(crate) const GATEWAY_WG_KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
 pub(super) const TEST_SERVER_NAME: &str = "gateway.test";
 pub(super) const TEST_CHALLENGE: [u8; SERVER_CHALLENGE_LEN] = [5; SERVER_CHALLENGE_LEN];
 pub(super) const GATEWAY_CERT_FINGERPRINT: &str =
@@ -48,7 +48,7 @@ pub(super) const GATEWAY_CERT_FINGERPRINT: &str =
 ///
 /// Was a `classic` request until that mode stopped being negotiable.
 /// `static_psk` costs one HMAC to build, where `ml_kem` costs a keypair.
-pub(super) fn simple_request(
+pub(crate) fn simple_request(
     transaction_id: [u8; KEY_NEGOTIATION_NONCE_LEN],
 ) -> KeyNegotiationRequest {
     let mut request = KeyNegotiationRequest {
@@ -81,15 +81,15 @@ pub(super) fn commitment(psk: &str, request: &KeyNegotiationRequest) -> String {
     )
     .unwrap()
 }
-pub(super) struct TestPki {
-    pub(super) ca_der: Vec<u8>,
-    pub(super) server: TlsIdentity,
-    pub(super) client: TlsIdentity,
-    pub(super) client_fingerprint: String,
-    pub(super) client_pq_certificate: PqCertificate,
-    pub(super) client_pq_private_key: Vec<u8>,
-    pub(super) gateway_pq_certificate: PqCertificate,
-    pub(super) gateway_pq_private_key: Vec<u8>,
+pub(crate) struct TestPki {
+    pub(crate) ca_der: Vec<u8>,
+    pub(crate) server: TlsIdentity,
+    pub(crate) client: TlsIdentity,
+    pub(crate) client_fingerprint: String,
+    pub(crate) client_pq_certificate: PqCertificate,
+    pub(crate) client_pq_private_key: Vec<u8>,
+    pub(crate) gateway_pq_certificate: PqCertificate,
+    pub(crate) gateway_pq_private_key: Vec<u8>,
 }
 
 pub(super) fn pq_identity(
@@ -117,7 +117,7 @@ pub(super) fn pq_identity(
     (certificate, private_key.to_vec())
 }
 
-pub(super) fn test_pki() -> TestPki {
+pub(crate) fn test_pki() -> TestPki {
     let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     ca_params.key_usages = vec![
@@ -206,16 +206,27 @@ pub(super) fn independent_client_identity(name: &str) -> (Vec<u8>, TlsIdentity) 
         },
     )
 }
-pub(super) struct Handler {
+pub(crate) struct Handler {
     pub(super) expected_fingerprint: String,
     pub(super) reject_prepare: AtomicBool,
-    pub(super) confirmed: AtomicBool,
+    pub(crate) confirmed: AtomicBool,
     pub(super) rolled_back: AtomicBool,
     /// How many rollbacks actually ran to completion.
     pub(super) rollbacks: std::sync::atomic::AtomicUsize,
+    /// Signals each rollback as it enters the backend, before it can block.
+    pub(crate) rollback_started: tokio::sync::Semaphore,
+    /// Signals each backend rollback that has returned.
+    pub(crate) rollback_completed: tokio::sync::Semaphore,
+    /// Exact ownership claims passed by the real connection handler.
+    pub(crate) rollback_events: std::sync::Mutex<Vec<([u8; 16], String)>>,
     /// Held open by default; a test can close it to park a rollback on an
     /// `await` and then destroy the task sitting there.
-    pub(super) rollback_gate: tokio::sync::Semaphore,
+    pub(crate) rollback_gate: tokio::sync::Semaphore,
+    /// Lets a transport test close the client after confirmation is accepted
+    /// but before the handler returns the signed commit.
+    pub(crate) confirm_started: tokio::sync::Semaphore,
+    pub(crate) confirm_returned: tokio::sync::Semaphore,
+    pub(crate) confirm_gate: tokio::sync::Semaphore,
     pub(super) gateway_pq_certificate: PqCertificate,
     pub(super) gateway_pq_private_key: Vec<u8>,
     /// Every canonical connection source the server handed to the handler.
@@ -223,23 +234,39 @@ pub(super) struct Handler {
 }
 
 impl Handler {
-    pub(super) fn new(pki: &TestPki) -> Self {
-        Self::with_rollback_permits(pki, tokio::sync::Semaphore::MAX_PERMITS)
+    pub(crate) fn new(pki: &TestPki) -> Self {
+        Self::with_permits(
+            pki,
+            tokio::sync::Semaphore::MAX_PERMITS,
+            tokio::sync::Semaphore::MAX_PERMITS,
+        )
     }
 
     /// A handler whose `rollback` blocks until the test lets it through.
-    pub(super) fn with_blocked_rollback(pki: &TestPki) -> Self {
-        Self::with_rollback_permits(pki, 0)
+    pub(crate) fn with_blocked_rollback(pki: &TestPki) -> Self {
+        Self::with_permits(pki, 0, tokio::sync::Semaphore::MAX_PERMITS)
     }
 
-    fn with_rollback_permits(pki: &TestPki, permits: usize) -> Self {
+    /// A handler whose authenticated confirmation waits for an explicit test
+    /// signal before producing the signed commit.
+    pub(crate) fn with_blocked_confirm(pki: &TestPki) -> Self {
+        Self::with_permits(pki, tokio::sync::Semaphore::MAX_PERMITS, 0)
+    }
+
+    fn with_permits(pki: &TestPki, rollback_permits: usize, confirm_permits: usize) -> Self {
         Self {
             expected_fingerprint: pki.client_fingerprint.clone(),
             reject_prepare: AtomicBool::new(false),
             confirmed: AtomicBool::new(false),
             rolled_back: AtomicBool::new(false),
             rollbacks: std::sync::atomic::AtomicUsize::new(0),
-            rollback_gate: tokio::sync::Semaphore::new(permits),
+            rollback_started: tokio::sync::Semaphore::new(0),
+            rollback_completed: tokio::sync::Semaphore::new(0),
+            rollback_events: std::sync::Mutex::new(Vec::new()),
+            rollback_gate: tokio::sync::Semaphore::new(rollback_permits),
+            confirm_started: tokio::sync::Semaphore::new(0),
+            confirm_returned: tokio::sync::Semaphore::new(0),
+            confirm_gate: tokio::sync::Semaphore::new(confirm_permits),
             gateway_pq_certificate: pki.gateway_pq_certificate.clone(),
             gateway_pq_private_key: pki.gateway_pq_private_key.clone(),
             sources: Default::default(),
@@ -302,12 +329,20 @@ impl NegotiationHandler for Handler {
         confirmation: AuthenticatedKeyNegotiationConfirmation,
     ) -> Result<AuthenticatedKeyNegotiationCommit, PublicError> {
         self.confirmed.store(true, Ordering::SeqCst);
-        authenticate_commit(
+        self.confirm_started.add_permits(1);
+        let _permit = self
+            .confirm_gate
+            .acquire()
+            .await
+            .expect("confirm gate closed");
+        let commit = authenticate_commit(
             confirmation.confirmation.server_challenge,
             confirmation.confirmation.transaction_id,
             &self.gateway_pq_private_key,
         )
-        .map_err(|_| PublicError::Internal)
+        .map_err(|_| PublicError::Internal)?;
+        self.confirm_returned.add_permits(1);
+        Ok(commit)
     }
 
     async fn resolve_admitted_peer(
@@ -319,13 +354,19 @@ impl NegotiationHandler for Handler {
         (certificate_sha256 == self.expected_fingerprint).then(|| CLIENT_WG_KEY.to_string())
     }
 
-    async fn rollback(&self, _transaction_id: [u8; 16], _public_key: &str) {
+    async fn rollback(&self, transaction_id: [u8; 16], public_key: &str) {
+        self.rollback_events
+            .lock()
+            .unwrap()
+            .push((transaction_id, public_key.to_string()));
+        self.rollback_started.add_permits(1);
         // The suspension point a real rollback has — it writes to the
         // data plane — and the one a cancelled task can be destroyed in.
         let _permit = self.rollback_gate.acquire().await;
         self.rolled_back.store(true, Ordering::SeqCst);
         self.rollbacks
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.rollback_completed.add_permits(1);
     }
 }
 /// Monte le service et rend l'endpoint client, pour ne pas répéter huit

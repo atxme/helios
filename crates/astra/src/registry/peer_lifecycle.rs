@@ -159,10 +159,11 @@ impl AstraRegistry {
         rotation: PendingRotation,
         now_unix: u64,
     ) -> Result<(), RegistryError> {
+        let peer_key = key.to_base64();
         let peer = self
             .state
             .peers
-            .get_mut(&key.to_base64())
+            .get(&peer_key)
             .ok_or(RegistryError::UnknownPeer)?;
         if peer.revoked {
             return Err(RegistryError::Revoked);
@@ -179,15 +180,25 @@ impl AstraRegistry {
         }
         let generation = rotation.candidate.generation;
         let name = peer.name.clone();
-        peer.pending = Some(rotation);
-        self.state.audit.append(
+        // Reserve durably before publishing in memory. Otherwise a failed
+        // save leaves an idempotent retry skipping the write entirely.
+        let mut candidate = Self::new(self.path.clone(), self.state.clone());
+        candidate
+            .state
+            .peers
+            .get_mut(&peer_key)
+            .ok_or(RegistryError::UnknownPeer)?
+            .pending = Some(rotation);
+        candidate.state.audit.append(
             AuditEvent::ClientStageAuthorized {
                 peer: name,
                 generation,
             },
             now_unix,
         );
-        self.save()
+        candidate.save()?;
+        self.state = candidate.state;
+        Ok(())
     }
 
     /// Un-reserves a rotation the gateway refused, before its lease runs out.
@@ -232,26 +243,40 @@ impl AstraRegistry {
     /// Marks a rotation as granted — the point past which Astra has released
     /// the leaves and can no longer withhold them.
     pub fn mark_granted(&mut self, key: &WireGuardKey, now_unix: u64) -> Result<(), RegistryError> {
+        let peer_key = key.to_base64();
         let peer = self
             .state
             .peers
-            .get_mut(&key.to_base64())
+            .get(&peer_key)
             .ok_or(RegistryError::UnknownPeer)?;
         let name = peer.name.clone();
-        let rotation = peer.pending.as_mut().ok_or(RegistryError::NoRotation)?;
+        let rotation = peer.pending.as_ref().ok_or(RegistryError::NoRotation)?;
         if rotation.granted {
             return Ok(());
         }
-        rotation.granted = true;
         let generation = rotation.candidate.generation;
-        self.state.audit.append(
+        // The released grant already lives in the operation journal. A failed
+        // registry write must remain retryable rather than become a no-op.
+        let mut candidate = Self::new(self.path.clone(), self.state.clone());
+        candidate
+            .state
+            .peers
+            .get_mut(&peer_key)
+            .ok_or(RegistryError::UnknownPeer)?
+            .pending
+            .as_mut()
+            .ok_or(RegistryError::NoRotation)?
+            .granted = true;
+        candidate.state.audit.append(
             AuditEvent::ClientGrantReleased {
                 peer: name,
                 generation,
             },
             now_unix,
         );
-        self.save()
+        candidate.save()?;
+        self.state = candidate.state;
+        Ok(())
     }
 
     /// Promotes the candidate once the client has committed it.

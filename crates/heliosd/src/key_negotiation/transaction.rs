@@ -218,31 +218,52 @@ impl TransactionState {
     /// transaction and reservation of the peer dropped, candidate and
     /// rollback data destroyed. A revoked peer whose key is admitted again
     /// starts over from an empty slot, under a new generation. Returns
-    /// whether this call revoked the slot.
+    /// whether this call revoked the slot. If revocation reaches `u64::MAX`,
+    /// it still destroys the old ownership state and leaves the slot terminal,
+    /// but returns `Internal`; re-admission at that generation is refused.
     ///
     /// Removal reaches the gateway as a new `network.toml`, applied by the
     /// orchestrator, which drops the peer from the data plane and refuses any
     /// later PSK write for it. The slot learns it here, under the lock every
     /// slot transition holds, so that no actor decides on a slot that still
     /// describes a peer nobody admits.
-    pub(super) fn settle_admission(&mut self, public_key: &str, admitted: bool) -> bool {
+    pub(super) fn settle_admission(
+        &mut self,
+        public_key: &str,
+        admitted: bool,
+    ) -> Result<bool, PublicError> {
         let slot = self.slot(public_key);
         match (admitted, matches!(slot.state, SlotState::Revoked)) {
             (false, false) => {
-                slot.generation += 1;
+                let next_generation = slot.generation.checked_add(1);
                 slot.state = SlotState::Revoked;
                 slot.resting_until = None;
+                if let Some(generation) = next_generation {
+                    slot.generation = generation;
+                }
                 self.peers.remove(public_key);
                 self.active
                     .retain(|_, transaction| transaction.public_key != public_key);
-                true
+                if next_generation.is_some() {
+                    Ok(true)
+                } else {
+                    // Revocation is terminal even when its generation cannot
+                    // advance. Keeping the peer revoked and deleting its
+                    // reservations is safer than wrapping and reviving stale
+                    // owners; the caller also receives the firm exhaustion
+                    // error and clears the static PSK baseline.
+                    Err(PublicError::Internal)
+                }
             }
             (true, true) => {
-                slot.generation += 1;
+                let Some(generation) = slot.generation.checked_add(1) else {
+                    return Err(PublicError::Internal);
+                };
+                slot.generation = generation;
                 slot.state = SlotState::Empty;
-                false
+                Ok(false)
             }
-            _ => false,
+            _ => Ok(false),
         }
     }
 }
@@ -388,7 +409,11 @@ impl GatewayHandler {
     /// Called with the transaction lock held, first thing in every section
     /// that acts on a slot. The configuration guard is released before this
     /// returns: callers go on to the data plane, whose writer takes it.
-    pub(super) async fn settle_admission(&self, state: &mut TransactionState, public_key: &str) {
+    pub(super) async fn settle_admission(
+        &self,
+        state: &mut TransactionState,
+        public_key: &str,
+    ) -> Result<(), PublicError> {
         let admitted = self
             .network
             .read()
@@ -396,23 +421,35 @@ impl GatewayHandler {
             .peers
             .iter()
             .any(|peer| peer.public_key == public_key);
-        if state.settle_admission(public_key, admitted) {
-            self.forget_revoked(public_key).await;
+        let was_revoked = matches!(&state.slot(public_key).state, SlotState::Revoked);
+        let newly_revoked = !admitted && !was_revoked;
+        let (result, removed_static_psk) = if !admitted || was_revoked {
+            // Acquire the cache lock before changing the slot. Cancellation
+            // while waiting therefore leaves the old state intact; once both
+            // are held, settlement and cache removal have no await between
+            // them. Repeated sweeps also clear a cache left by an interrupted
+            // older attempt, and readmission clears it before reviving a slot.
+            let mut static_psks = self.static_psks.write().await;
+            let result = state.settle_admission(public_key, admitted);
+            (result, static_psks.remove(public_key).is_some())
+        } else {
+            (state.settle_admission(public_key, admitted), false)
+        };
+        if newly_revoked || removed_static_psk {
+            tracing::warn!(
+                peer = %public_key,
+                "peer no longer admitted or is being readmitted: its cached PSK baseline was discarded"
+            );
         }
-    }
-
-    /// What a revocation drops beyond the slot.
-    ///
-    /// The static PSK baseline would otherwise slide back onto the key if it
-    /// were ever admitted again — the reason `peer remove` also drops it from
-    /// the table on disk.
-    async fn forget_revoked(&self, public_key: &str) {
-        self.static_psks.write().await.remove(public_key);
-        tracing::warn!(
-            peer = %public_key,
-            "peer no longer admitted: its PSK slot is revoked and nothing decided earlier \
-             may write to it"
-        );
+        if let Err(error) = result {
+            tracing::error!(
+                peer = %public_key,
+                admitted,
+                "admission settlement refused: peer generation is exhausted"
+            );
+            return Err(error);
+        }
+        Ok(())
     }
 
     async fn install(
@@ -485,7 +522,15 @@ impl GatewayHandler {
         let mut state = self.transactions.lock().await;
         // A revoked peer has nothing to put back: its rollback data died with
         // the revocation, and the data plane no longer holds the peer.
-        self.settle_admission(&mut state, public_key).await;
+        if let Err(error) = self.settle_admission(&mut state, public_key).await {
+            tracing::error!(
+                transaction = %hex_prefix(&transaction_id),
+                peer = %public_key,
+                ?error,
+                "rollback stopped: admission settlement failed; peer remains fail-closed"
+            );
+            return;
+        }
         let (previous, address, previous_psk, install_attempted) =
             match &state.slot(public_key).state {
                 SlotState::Preparing {
@@ -510,6 +555,14 @@ impl GatewayHandler {
                     return;
                 }
             };
+        let Some(next_generation) = state.slot(public_key).generation.checked_add(1) else {
+            tracing::error!(
+                transaction = %hex_prefix(&transaction_id),
+                peer = %public_key,
+                "key-negotiation rollback refused: peer generation is exhausted; peer remains fail-closed"
+            );
+            return;
+        };
         if let Err(error) = self
             .install(public_key.to_string(), address, previous_psk)
             .await
@@ -525,7 +578,7 @@ impl GatewayHandler {
         state.peers.remove(public_key);
         let slot = state.slot(public_key);
         slot.state = previous;
-        slot.generation += 1;
+        slot.generation = next_generation;
         // Read from the slot, never from the presence of a transaction
         // record. A destroyed rollback may be retried, and the slot is the
         // ownership record that outlives every attempt to undo it.
@@ -536,22 +589,24 @@ impl GatewayHandler {
 
     /// Installs a prepared candidate only while the reservation still owns it.
     ///
-    /// The ownership check, the backend write and the `active` insertion are
-    /// one serialized operation. Connection cancellation can roll the
-    /// reservation back while material is being derived; without this final
-    /// check that cancelled task would resume, install its candidate, and
-    /// record a transaction for a slot it no longer owned.
+    /// The ownership check, backend write, static-PSK cache learning and the
+    /// `active` insertion are one serialized operation. Connection
+    /// cancellation can roll the reservation back while material is being
+    /// derived; without this final check that cancelled task would resume,
+    /// install its candidate, and record a transaction for a slot it no
+    /// longer owned. Learning the cache here also prevents a delayed writer
+    /// from restoring a baseline after admission revocation.
     pub(super) async fn install_candidate(
         &self,
         transaction_id: [u8; 16],
         public_key: &str,
         generation: u64,
-        address: String,
         psk: Option<SecretString>,
+        learned_static_psk: Option<SecretString>,
         transaction: Transaction,
     ) -> Result<(), PublicError> {
         let mut state = self.transactions.lock().await;
-        self.settle_admission(&mut state, public_key).await;
+        self.settle_admission(&mut state, public_key).await?;
         let slot = state.slot(public_key);
         let still_ours = slot.generation == generation
             && matches!(
@@ -582,7 +637,14 @@ impl GatewayHandler {
         // Keep the state lock across the backend write. `release`, rollback,
         // reclamation and another preparation all use the same lock, so none
         // can observe ownership and then act on a different physical slot.
-        self.install(public_key.to_string(), address, psk).await?;
+        self.install(public_key.to_string(), transaction.address.clone(), psk)
+            .await?;
+        if let Some(static_psk) = learned_static_psk {
+            self.static_psks
+                .write()
+                .await
+                .insert(public_key.to_string(), static_psk);
+        }
         state.active.insert(transaction_id, transaction);
         Ok(())
     }
@@ -615,17 +677,25 @@ impl GatewayHandler {
         public_key: &str,
     ) -> Result<bool, PublicError> {
         let mut state = self.transactions.lock().await;
-        self.settle_admission(&mut state, public_key).await;
+        self.settle_admission(&mut state, public_key).await?;
         let address = match &state.slot(public_key).state {
             SlotState::Committed(installed) if installed.transaction_id == transaction_id => {
                 installed.address.clone()
             }
             _ => return Ok(false),
         };
+        let Some(next_generation) = state.slot(public_key).generation.checked_add(1) else {
+            tracing::error!(
+                transaction = %hex_prefix(&transaction_id),
+                peer = %public_key,
+                "PSK release refused: peer generation is exhausted"
+            );
+            return Err(PublicError::Internal);
+        };
         self.install(public_key.to_string(), address, None).await?;
         let slot = state.slot(public_key);
         slot.state = SlotState::Empty;
-        slot.generation += 1;
+        slot.generation = next_generation;
         Ok(true)
     }
 
@@ -655,7 +725,7 @@ impl GatewayHandler {
         expected: u64,
     ) -> Result<(), PublicError> {
         let mut state = self.transactions.lock().await;
-        self.settle_admission(&mut state, public_key).await;
+        self.settle_admission(&mut state, public_key).await?;
         let slot = state.slot(public_key);
         if slot.generation != expected {
             tracing::debug!(
@@ -681,10 +751,17 @@ impl GatewayHandler {
             // Revocation already took the peer off the data plane.
             SlotState::Revoked => return Ok(()),
         };
+        let Some(next_generation) = slot.generation.checked_add(1) else {
+            tracing::error!(
+                peer = %public_key,
+                "peer slot clear refused: peer generation is exhausted"
+            );
+            return Err(PublicError::Internal);
+        };
         self.install(public_key.to_string(), address, None).await?;
         let slot = state.slot(public_key);
         slot.state = SlotState::Empty;
-        slot.generation += 1;
+        slot.generation = next_generation;
         Ok(())
     }
 
@@ -711,8 +788,15 @@ impl GatewayHandler {
             .cloned()
             .collect();
         for public_key in removed {
-            if state.settle_admission(&public_key, false) {
-                self.forget_revoked(&public_key).await;
+            match self.settle_admission(&mut state, &public_key).await {
+                Ok(()) => {}
+                Err(error) => {
+                    tracing::error!(
+                        peer = %public_key,
+                        ?error,
+                        "revocation sweep found generation exhaustion; peer remains terminal and sweep continues"
+                    );
+                }
             }
         }
     }
