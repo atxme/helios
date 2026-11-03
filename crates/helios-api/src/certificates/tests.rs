@@ -128,6 +128,8 @@ fn state_with(handler: Option<Arc<SpyHandler>>) -> AppState {
 struct SpyCampaign {
     answer: Result<astra_channel::SigningOperationView, TrustUpdateRefusal>,
     seen: Mutex<Option<astra_channel::OperatorIdentity>>,
+    /// The opening request the relay was handed, if one reached it.
+    opened: Mutex<Option<astra_channel::OperatorOpenRequest>>,
 }
 
 impl SpyCampaign {
@@ -135,6 +137,7 @@ impl SpyCampaign {
         Arc::new(Self {
             answer: Ok(campaign_view()),
             seen: Mutex::new(None),
+            opened: Mutex::new(None),
         })
     }
 
@@ -142,6 +145,7 @@ impl SpyCampaign {
         Arc::new(Self {
             answer: Err(TrustUpdateRefusal::Rejected),
             seen: Mutex::new(None),
+            opened: Mutex::new(None),
         })
     }
 }
@@ -196,6 +200,27 @@ impl OperatorCampaignRelay for SpyCampaign {
     ) -> Result<astra_channel::SigningOperationView, TrustUpdateRefusal> {
         *self.seen.lock().unwrap() = Some(operator.clone());
         self.answer.clone()
+    }
+
+    async fn open(
+        &self,
+        operator: &astra_channel::OperatorIdentity,
+        request: astra_channel::OperatorOpenRequest,
+    ) -> Result<astra_channel::OperatorOpened, TrustUpdateRefusal> {
+        *self.seen.lock().unwrap() = Some(operator.clone());
+        *self.opened.lock().unwrap() = Some(request);
+        self.answer
+            .clone()
+            .map(|view| astra_channel::OperatorOpened {
+                operation_id: view.operation_id,
+                campaign_id: Id16::new([8; 16]).unwrap(),
+                campaign_fingerprint: view.campaign_fingerprint,
+                scope: view.scope,
+                target_count: view.target_count,
+                required_credentials: view.required_credentials,
+                expires_at: view.expires_at,
+                revocation_expiries: None,
+            })
     }
 }
 
@@ -355,6 +380,118 @@ async fn a_campaign_route_never_falls_back_onto_the_client_renewal_relay() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+/// An opening an administrator could send: a fleet campaign, nothing named.
+fn open_request() -> astra_channel::OperatorOpenRequest {
+    astra_channel::OperatorOpenRequest {
+        action: astra_channel::OperatorOpenAction::FleetLeafs,
+        reason: "quarterly rotation".into(),
+        requested_by: "alice".into(),
+        window_secs: 300,
+    }
+}
+
+fn open_body() -> Bytes {
+    Bytes::from(serde_json::to_vec(&open_request()).unwrap())
+}
+
+/// An admitted peer opens nothing, and the authority never hears of it.
+#[tokio::test]
+async fn a_non_admin_cannot_open_and_nothing_is_relayed() {
+    let relay = SpyCampaign::granting();
+    let state = state_with(None).with_operator_campaign(Arc::clone(&relay) as Arc<_>);
+    let response = operator_open(
+        State(state),
+        Extension(operator_caller_at(false)),
+        open_body(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(relay.seen.lock().unwrap().is_none());
+    assert!(
+        relay.opened.lock().unwrap().is_none(),
+        "the caller is checked before anything reaches the authority"
+    );
+}
+
+/// The relay receives the request as sent and the administrator the
+/// gateway resolved, never a name the body could choose.
+#[tokio::test]
+async fn an_open_is_relayed_with_the_resolved_admin() {
+    let relay = SpyCampaign::granting();
+    let state = state_with(None).with_operator_campaign(Arc::clone(&relay) as Arc<_>);
+    let response = operator_open(
+        State(state),
+        Extension(operator_caller_at(true)),
+        open_body(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        relay.seen.lock().unwrap().as_ref(),
+        Some(&astra_channel::OperatorIdentity::WireGuard {
+            public_key: WireGuardKey::parse(CLIENT_KEY).unwrap(),
+        })
+    );
+    assert_eq!(relay.opened.lock().unwrap().as_ref(), Some(&open_request()));
+    let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+    let opened: astra_channel::OperatorOpened = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(opened.operation_id, Id16::new([7; 16]).unwrap());
+}
+
+/// The bound is held before the body is read, and long before the relay.
+#[tokio::test]
+async fn an_oversized_open_is_refused_before_the_relay() {
+    let relay = SpyCampaign::granting();
+    let state = state_with(None).with_operator_campaign(Arc::clone(&relay) as Arc<_>);
+    let response = operator_open(
+        State(state.clone()),
+        Extension(operator_caller_at(true)),
+        Bytes::from(vec![b' '; astra_channel::MAX_OPERATOR_REQUEST_BYTES + 1]),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+    let unreadable = operator_open(
+        State(state),
+        Extension(operator_caller_at(true)),
+        Bytes::from_static(br#"{"action":"chain_open","reason":"x","requested_by":"y"}"#),
+    )
+    .await;
+    assert_eq!(unreadable.status(), StatusCode::BAD_REQUEST);
+    assert!(relay.seen.lock().unwrap().is_none());
+    assert!(relay.opened.lock().unwrap().is_none());
+}
+
+/// A gateway with no private channel says so, and nothing else.
+#[tokio::test]
+async fn an_open_without_a_relay_is_503() {
+    let state = state_with(None);
+    assert!(state.operator_campaign.is_none());
+    let response = operator_open(
+        State(state),
+        Extension(operator_caller_at(true)),
+        open_body(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+/// What the authority refused stays its class: no sentence, no inventory.
+#[tokio::test]
+async fn a_refused_open_answers_its_class_alone() {
+    let relay = SpyCampaign::refusing();
+    let state = state_with(None).with_operator_campaign(Arc::clone(&relay) as Arc<_>);
+    let response = operator_open(
+        State(state),
+        Extension(operator_caller_at(true)),
+        open_body(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+    assert!(bytes.is_empty(), "{bytes:?}");
 }
 
 fn caller(public_key: Option<&str>) -> crate::auth::Caller {

@@ -303,12 +303,13 @@ pub fn router(state: AppState) -> Router {
             post(certificates::ca_transition_install),
         )
         // The operator campaign, relayed from inside the tunnel (spec §8.5).
-        // Four routes, image of the four surfaces Astra's public origin
-        // exposes, and on the **admin** surface rather than the peer one: a
-        // campaign belongs to no peer, and letting any admitted peer make one
-        // circulate is the distinction this placement exists to draw. None of
-        // them is a proxy — each accepts one type, one size, and relays an
-        // object this gateway built itself.
+        // The surfaces Astra's public origin exposes, plus the opening, which
+        // that origin refuses and Astra's door serves privately (lot 5a). On
+        // the **admin** surface rather than the peer one: a campaign belongs
+        // to no peer, and letting any admitted peer make one circulate is the
+        // distinction this placement exists to draw. None of them is a proxy —
+        // each accepts one type, one size, and relays an object this gateway
+        // built itself.
         .route(
             "/api/certificates/operator/pending",
             get(certificates::operator_pending),
@@ -328,6 +329,12 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/certificates/operator/signer-results/{operation}",
             post(certificates::operator_signer_result).layer(DefaultBodyLimit::max(
+                astra_channel::MAX_OPERATOR_REQUEST_BYTES,
+            )),
+        )
+        .route(
+            "/api/certificates/operator/campaigns",
+            post(certificates::operator_open).layer(DefaultBodyLimit::max(
                 astra_channel::MAX_OPERATOR_REQUEST_BYTES,
             )),
         )
