@@ -204,7 +204,10 @@ depuis `astra init-channel` et `heliosd init-astra-channel`. Les options
 `gateway-identity publish`, sont retirées : une adresse choisie par l'appelant
 élargirait la porte. Un déploiement qui ne passait l'adresse qu'à la console
 doit la renseigner dans le `.env` et redémarrer Astra ; sans elle, ces
-ouvertures sont refusées par leur nom.
+ouvertures sont refusées par leur nom. Le service attend la gateway 20 s au
+plus par appel : une gateway qui accepte la connexion sans jamais répondre fait
+refuser l'ouverture (« le canal privé vers la gateway n'est pas disponible »)
+sans retenir les commandes suivantes.
 
 **Le tunnel** ouvre aussi, pour un pair **administrateur** : `POST
 /api/certificates/operator/campaigns` sur l'API d'administration de la gateway,
@@ -239,8 +242,10 @@ non :
 
 `gateway-identity publish` service arrêté relaie par le canal que le service
 emploierait : il lit `ASTRA_GATEWAY_CHANNEL` et `ASTRA_GATEWAY_CERTIFICATE`
-dans son environnement, et refuse sans eux. `init-channel` ne touche pas le
-registre et reste inchangé.
+dans son environnement, et refuse sans eux. Service arrêté comme en marche, le
+relais attend la gateway 20 s au plus : sans réponse, la publication reste
+marquée, la commande dit que la gateway ne l'a pas confirmée, et il suffit de
+la relancer. `init-channel` ne touche pas le registre et reste inchangé.
 
 ## Récupérer une identité expirée
 

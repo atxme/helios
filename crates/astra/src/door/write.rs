@@ -16,6 +16,7 @@
 //! save.
 
 use std::path::Path;
+use std::time::Duration;
 
 use aether::certificates::authority::AstraIssuerAuthorization;
 use aether::certificates::encoding::Fingerprint;
@@ -157,24 +158,36 @@ pub fn mark_gateway_transition_published(
 
 /// Tells the gateway a transition has left the authority.
 ///
-/// `true` when the gateway confirmed it. A refusal or a silent gateway is
-/// logged and answered `false`, never undone: the mark stays, and the same
-/// publication asked again relays it again.
-pub async fn relay_gateway_publication(channel: &GatewayChannel, mark: &PublicationMark) -> bool {
-    match channel
-        .gateway_transition_published(&astra_channel::GatewayTransitionPublished {
-            gateway_identity_epoch: mark.epoch,
-            transition_fingerprint: mark.transition_fingerprint,
-        })
-        .await
-    {
-        Ok(()) => true,
-        Err(error) => {
+/// `true` when the gateway confirmed it. A refusal, or a gateway silent past
+/// `gateway_bound`, is logged and answered `false`, never undone: the mark
+/// stays, and the same publication asked again relays it again.
+pub(super) async fn relay_gateway_publication(
+    channel: &GatewayChannel,
+    mark: &PublicationMark,
+    gateway_bound: Duration,
+) -> bool {
+    let published = astra_channel::GatewayTransitionPublished {
+        gateway_identity_epoch: mark.epoch,
+        transition_fingerprint: mark.transition_fingerprint,
+    };
+    let relay = channel.gateway_transition_published(&published);
+    match tokio::time::timeout(gateway_bound, relay).await {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
             tracing::warn!(
                 epoch = mark.epoch,
                 %error,
                 "the publication is recorded but the gateway did not confirm it; ask for the \
                  same publication again"
+            );
+            false
+        }
+        Err(_) => {
+            tracing::warn!(
+                epoch = mark.epoch,
+                bound_ms = gateway_bound.as_millis(),
+                "the publication is recorded but the gateway did not answer within the bound; \
+                 ask for the same publication again"
             );
             false
         }
@@ -185,7 +198,9 @@ pub async fn relay_gateway_publication(channel: &GatewayChannel, mark: &Publicat
 ///
 /// For a caller that owns its registry outright, the console under the volume
 /// lock. The door cannot hold its registry lock across the relay, so it calls
-/// the two halves itself, in the same order.
+/// the two halves itself, in the same order. The relay ends at
+/// [`GATEWAY_CALL_BOUND`](super::GATEWAY_CALL_BOUND): the console holds the
+/// volume lock across it, and `astra run` cannot start while it does.
 pub async fn publish_gateway_transition(
     registry: &mut AstraRegistry,
     channel: &GatewayChannel,
@@ -193,7 +208,7 @@ pub async fn publish_gateway_transition(
     now_unix: u64,
 ) -> Result<(PublicationMark, bool), DoorRefusal> {
     let mark = mark_gateway_transition_published(registry, epoch, now_unix)?;
-    let confirmed = relay_gateway_publication(channel, &mark).await;
+    let confirmed = relay_gateway_publication(channel, &mark, super::GATEWAY_CALL_BOUND).await;
     Ok((mark, confirmed))
 }
 

@@ -352,7 +352,11 @@ voit sans redémarrage ; tenu par un processus qui ne répond pas à la porte, e
 est refusée. Une écriture ne choisit jamais son chemin selon qu'une connexion a
 réussi. `bootstrap` exige le verrou. `status` et `chain status` sont des
 lectures pures : elles n'écrivent jamais le registre, même pour le migrer —
-c'est l'écrivain suivant qui le fait. `init-channel` est inchangé.
+c'est l'écrivain suivant qui le fait. `init-channel` est inchangé. Chaque appel
+de la porte à la gateway — lecture de son identité, relais d'une publication —
+est borné à 20 s, sous les 60 s qu'attend la console : une gateway muette ne
+retient ni le verrou du volume ni les commandes qui l'attendent, et une
+publication sans réponse reste marquée, à relancer.
 
 **Ce qui ne change pas.** `POST /v1/campaigns` reste refusée sur l'origine
 publique, pour la raison du §11.6. Capacités bearer, fenêtres de cinq minutes,

@@ -50,6 +50,8 @@ pub mod write;
 #[cfg(test)]
 mod tests;
 
+use std::time::Duration;
+
 use aether::certificates::authority::AstraIssuerAuthorization;
 use aether::certificates::encoding::{Fingerprint, Id16, WireGuardKey};
 use aether::certificates::status::CampaignScope;
@@ -72,6 +74,20 @@ pub const DOOR_SOCKET_FILE: &str = "operator.sock";
 ///
 /// Public by construction, and rewritten on every gateway-identity campaign.
 pub const GATEWAY_ACTIVE_CERTIFICATE_FILE: &str = "gateway-active-certificate.json";
+
+/// How long the door waits for the gateway, per call on the private channel.
+///
+/// The channel has no request timeout of its own, and the door holds things
+/// across these calls: `chain next` holds the volume gate across its live read
+/// of the gateway identity, and the console, with the service stopped, holds
+/// the volume lock across a publication's relay. A gateway that accepted and
+/// never answered would otherwise wedge every later chain step, issuer
+/// request and install, or keep `astra run` from starting. One mTLS round trip
+/// on the local veth takes far less than this. A third of the console's
+/// 60 s exchange bound, so that a door call that gives up here still answers
+/// the console with its own sentence long before the console stops waiting
+/// and can only report a broken exchange.
+pub const GATEWAY_CALL_BOUND: Duration = Duration::from_secs(20);
 
 /// Who carried a request to the door, as the transport established it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -520,9 +536,26 @@ impl AstraService {
         request: DoorRequest,
         now_unix: u64,
     ) -> Result<DoorOutcome, DoorRefusal> {
+        self.door_within(connector, request, now_unix, GATEWAY_CALL_BOUND)
+            .await
+    }
+
+    /// The door, with each call to the gateway cut short at `gateway_bound`.
+    ///
+    /// [`Self::door`] always passes [`GATEWAY_CALL_BOUND`]; the argument
+    /// exists so that a test can watch a mute gateway give up without waiting
+    /// the production bound out.
+    async fn door_within(
+        &self,
+        connector: DoorConnector,
+        request: DoorRequest,
+        now_unix: u64,
+        gateway_bound: Duration,
+    ) -> Result<DoorOutcome, DoorRefusal> {
         let action = request.action();
         let outcome = if allowed(&connector, &request) {
-            self.perform(&connector, request, now_unix).await
+            self.perform(&connector, request, now_unix, gateway_bound)
+                .await
         } else {
             Err(DoorRefusal::NotAllowedHere)
         };
@@ -599,6 +632,7 @@ impl AstraService {
         connector: &DoorConnector,
         request: DoorRequest,
         now_unix: u64,
+        gateway_bound: Duration,
     ) -> Result<DoorOutcome, DoorRefusal> {
         match request {
             DoorRequest::FleetLeafs { text } => open::open_campaign(
@@ -633,7 +667,7 @@ impl AstraService {
             .map(DoorOutcome::Opened),
             DoorRequest::GatewayRevocation { text } => {
                 open::check_text(&text)?;
-                let identity = self.read_gateway_identity().await?;
+                let identity = self.read_gateway_identity(gateway_bound).await?;
                 open::open_campaign(
                     self,
                     connector,
@@ -646,11 +680,14 @@ impl AstraService {
                 .map(DoorOutcome::Opened)
             }
             DoorRequest::GatewayIdentity { text } => self
-                .open_gateway_identity(connector, text, now_unix)
+                .open_gateway_identity(connector, text, now_unix, gateway_bound)
                 .await
                 .map(DoorOutcome::Opened),
-            DoorRequest::ChainOpen { text } => self.chain_open(connector, text, now_unix).await,
-            DoorRequest::ChainNext {} => self.chain_next(connector, now_unix).await,
+            DoorRequest::ChainOpen { text } => {
+                self.chain_open(connector, text, now_unix, gateway_bound)
+                    .await
+            }
+            DoorRequest::ChainNext {} => self.chain_next(connector, now_unix, gateway_bound).await,
             DoorRequest::ChainAbandon {} => self.chain_abandon().await,
             DoorRequest::IssuerDelegation { text } => {
                 let volume = self.volume_writes.lock().await;
@@ -683,7 +720,8 @@ impl AstraService {
                     .map(DoorOutcome::from)
             }
             DoorRequest::GatewayIdentityPublish { epoch } => {
-                self.publish_gateway_transition(epoch, now_unix).await
+                self.publish_gateway_transition(epoch, now_unix, gateway_bound)
+                    .await
             }
         }
     }
@@ -697,6 +735,7 @@ impl AstraService {
         &self,
         epoch: u64,
         now_unix: u64,
+        gateway_bound: Duration,
     ) -> Result<DoorOutcome, DoorRefusal> {
         // Before anything is marked, like the console that opened its channel
         // first: a publication with nowhere to go stays unmarked.
@@ -708,7 +747,7 @@ impl AstraService {
             let mut registry = self.registry.lock().await;
             write::mark_gateway_transition_published(&mut registry, epoch, now_unix)?
         };
-        let confirmed = write::relay_gateway_publication(channel, &mark).await;
+        let confirmed = write::relay_gateway_publication(channel, &mark, gateway_bound).await;
         Ok(DoorOutcome::published(mark, confirmed))
     }
 
@@ -720,9 +759,10 @@ impl AstraService {
         connector: &DoorConnector,
         text: OpeningText,
         now_unix: u64,
+        gateway_bound: Duration,
     ) -> Result<Opening, DoorRefusal> {
         open::check_text(&text)?;
-        let identity = self.read_gateway_identity().await?;
+        let identity = self.read_gateway_identity(gateway_bound).await?;
         // Exported because the companion cannot verify the §5 request's
         // continuity signature without the leaf in service, and it holds no
         // copy of it. Public material: the same leaf every admitted client
@@ -743,18 +783,30 @@ impl AstraService {
     /// What the daemon serves right now, read before any lock is taken.
     ///
     /// Neither the registry nor the operation store is held across the call:
-    /// a slow gateway would otherwise stall every other request.
+    /// a slow gateway would otherwise stall every other request. The volume
+    /// gate a chain step holds is, so the call ends at `gateway_bound`.
     async fn read_gateway_identity(
         &self,
+        gateway_bound: Duration,
     ) -> Result<astra_channel::GatewayIdentityView, DoorRefusal> {
         let channel = self
             .gateway
             .as_ref()
             .ok_or(DoorRefusal::GatewayChannelUnavailable)?;
-        channel.gateway_identity().await.map_err(|error| {
-            tracing::error!(%error, "the door could not read the gateway identity");
-            DoorRefusal::GatewayChannelUnavailable
-        })
+        match tokio::time::timeout(gateway_bound, channel.gateway_identity()).await {
+            Ok(Ok(identity)) => Ok(identity),
+            Ok(Err(error)) => {
+                tracing::error!(%error, "the door could not read the gateway identity");
+                Err(DoorRefusal::GatewayChannelUnavailable)
+            }
+            Err(_) => {
+                tracing::error!(
+                    bound_ms = gateway_bound.as_millis(),
+                    "the gateway did not answer the identity read within the bound"
+                );
+                Err(DoorRefusal::GatewayChannelUnavailable)
+            }
+        }
     }
 
     /// Writes the leaf in service where the companion expects to find it.

@@ -893,8 +893,16 @@ impl astra_channel::AstraChannelHandler for FakeGateway {
     }
 }
 
-/// The fixture, with its gateway channel dialing a fake gateway on loopback.
-async fn fixture_with_gateway(dir: &Path) -> Arc<AstraService> {
+/// Astra's transport identity, written in `dir`, and a gateway server
+/// identity for the channel to pin: the two halves every loopback gateway
+/// below is built from.
+fn channel_identities(
+    dir: &Path,
+) -> (
+    aether::certificates::encoding::DerCertificate,
+    astra_channel::ChannelIdentity,
+    aether::certificates::encoding::DerCertificate,
+) {
     use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose};
     let astra_certificate = crate::gateway::initialize(dir, false).expect("astra identity");
     let mut params = CertificateParams::new(vec![astra_channel::INTERNAL_SERVER_NAME.to_string()])
@@ -913,7 +921,12 @@ async fn fixture_with_gateway(dir: &Path) -> Arc<AstraService> {
     };
     let gateway_certificate =
         aether::certificates::encoding::DerCertificate::new(der).expect("der");
+    (astra_certificate, identity, gateway_certificate)
+}
 
+/// The fixture, with its gateway channel dialing a fake gateway on loopback.
+async fn fixture_with_gateway(dir: &Path) -> Arc<AstraService> {
+    let (astra_certificate, identity, gateway_certificate) = channel_identities(dir);
     let config = astra_channel::server_config(&identity, &astra_certificate).expect("server");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -1756,6 +1769,128 @@ async fn a_publication_names_a_stored_transition() {
         refusal,
         DoorRefusal::NoGatewayTransition { epoch: 5 }
     ));
+}
+
+/// The bound a test gives the door's gateway calls, in place of
+/// [`GATEWAY_CALL_BOUND`]: short, so the test does not wait twenty seconds.
+const MUTE_GATEWAY_BOUND: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// How long a test waits before it calls a wedged door wedged.
+const WEDGE_GUARD: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The fixture, with its gateway channel dialing a gateway that accepts every
+/// connection and never answers: no handshake, no byte, no close.
+async fn fixture_with_mute_gateway(dir: &Path) -> Arc<AstraService> {
+    let (_, _, gateway_certificate) = channel_identities(dir);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let address = listener.local_addr().expect("address");
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((connection, _)) = listener.accept().await {
+            held.push(connection);
+        }
+    });
+    let channel = crate::gateway::GatewayChannel::open(dir, address, &gateway_certificate)
+        .expect("channel opens");
+    Arc::new(build_service(dir, None, Some(channel)))
+}
+
+/// `chain next` holds the volume gate across its live read of the gateway
+/// identity. A gateway that never answers must not hold it with it: the read
+/// gives up at the bound, the step is refused by its name, and a command
+/// waiting on the gate proceeds.
+#[tokio::test]
+async fn a_mute_gateway_releases_the_volume_gate_at_the_bound() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture_with_mute_gateway(dir.path()).await;
+    chain_step(
+        service
+            .door(console(), DoorRequest::ChainOpen { text: text() }, NOW)
+            .await,
+    );
+    // The second step stands as never deposited: `next` passes it and opens
+    // the gateway's, which is read live.
+    let mut plan = read_plan(dir.path());
+    plan.current = 1;
+    plan.steps[1].operation_id = None;
+    std::fs::write(
+        plan_path(dir.path()),
+        serde_json::to_vec(&plan).expect("encodes"),
+    )
+    .expect("plan rewritten");
+
+    let wedged = {
+        let service = Arc::clone(&service);
+        tokio::spawn(async move {
+            service
+                .door_within(
+                    console(),
+                    DoorRequest::ChainNext {},
+                    NOW + 1,
+                    MUTE_GATEWAY_BOUND,
+                )
+                .await
+        })
+    };
+    // On this single-threaded runtime the spawned step runs up to its first
+    // wait — the gateway — with the gate taken.
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let abandoned = tokio::time::timeout(
+        WEDGE_GUARD,
+        service.door(console(), DoorRequest::ChainAbandon {}, NOW + 2),
+    )
+    .await
+    .expect("the gate is released once the gateway read gives up");
+    assert!(
+        matches!(abandoned, Ok(DoorOutcome::ChainAbandoned { .. })),
+        "{abandoned:?}"
+    );
+    let refused = tokio::time::timeout(WEDGE_GUARD, wedged)
+        .await
+        .expect("the step ends at the bound")
+        .expect("joined");
+    assert!(
+        matches!(refused, Err(DoorRefusal::GatewayChannelUnavailable)),
+        "the step held the gate first, and was refused by the gateway's silence: {refused:?}"
+    );
+}
+
+/// A publication the gateway never answers is recorded and unconfirmed at the
+/// bound: the mark is already persisted, and the operator asks again.
+#[tokio::test]
+async fn a_publication_to_a_mute_gateway_is_unconfirmed_at_the_bound() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture_with_mute_gateway(dir.path()).await;
+    rewrite_registry(&service, |state| {
+        state.transitions.push(stored_gateway_transition(5))
+    })
+    .await;
+    let outcome = tokio::time::timeout(
+        WEDGE_GUARD,
+        service.door_within(
+            console(),
+            DoorRequest::GatewayIdentityPublish { epoch: 5 },
+            NOW,
+            MUTE_GATEWAY_BOUND,
+        ),
+    )
+    .await
+    .expect("the relay ends at the bound")
+    .expect("marked although the gateway said nothing");
+    assert!(
+        matches!(
+            outcome,
+            DoorOutcome::Published {
+                epoch: 5,
+                confirmed: false,
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+    assert!(published_on_disk(dir.path()));
 }
 
 #[test]

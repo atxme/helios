@@ -54,6 +54,13 @@ const VOLUME_HELD: &str =
 /// did, if anything, is in its log, as for any exchange cut short.
 const DOOR_EXCHANGE_BOUND: Duration = Duration::from_secs(60);
 
+// The door's own wait on the gateway ends well inside the console's: a mute
+// gateway produces the door's sentence, not a broken exchange.
+const _: () = assert!(
+    astra::door::GATEWAY_CALL_BOUND.as_secs() * 2 <= DOOR_EXCHANGE_BOUND.as_secs(),
+    "the door's gateway bound must leave the console time to read its answer"
+);
+
 /// Why a call to the door produced no outcome.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum CallError {

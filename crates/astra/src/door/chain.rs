@@ -19,6 +19,7 @@
 //! and every command on it holds [`AstraService::volume_writes`].
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use crate::chain::{ChainError, ChainPlan};
 use aether::certificates::status::CampaignScope;
@@ -103,6 +104,7 @@ impl AstraService {
         connector: &DoorConnector,
         text: OpeningText,
         now_unix: u64,
+        gateway_bound: Duration,
     ) -> Result<DoorOutcome, DoorRefusal> {
         open::check_text(&text)?;
         let volume = self.volume_writes.lock().await;
@@ -123,7 +125,7 @@ impl AstraService {
                 now_unix,
             )
         };
-        self.chain_deposit_current(&volume, connector, plan, now_unix)
+        self.chain_deposit_current(&volume, connector, plan, now_unix, gateway_bound)
             .await
     }
 
@@ -132,6 +134,7 @@ impl AstraService {
         &self,
         connector: &DoorConnector,
         now_unix: u64,
+        gateway_bound: Duration,
     ) -> Result<DoorOutcome, DoorRefusal> {
         let volume = self.volume_writes.lock().await;
         let mut plan = load_plan(self)?.ok_or(DoorRefusal::NoChain)?;
@@ -154,7 +157,7 @@ impl AstraService {
                 plan: None,
             });
         }
-        self.chain_deposit_current(&volume, connector, plan, now_unix)
+        self.chain_deposit_current(&volume, connector, plan, now_unix, gateway_bound)
             .await
     }
 
@@ -175,6 +178,7 @@ impl AstraService {
         connector: &DoorConnector,
         mut plan: ChainPlan,
         now_unix: u64,
+        gateway_bound: Duration,
     ) -> Result<DoorOutcome, DoorRefusal> {
         let scope = plan.pending().ok_or(DoorRefusal::ChainFinished)?.scope;
         let text = OpeningText {
@@ -196,7 +200,7 @@ impl AstraService {
             // has never held them, and a retyped value would produce a
             // campaign the companion signs and the gateway then refuses.
             CampaignScope::GatewayIdentity => (
-                self.open_gateway_identity(connector, text, now_unix)
+                self.open_gateway_identity(connector, text, now_unix, gateway_bound)
                     .await?,
                 None,
             ),
