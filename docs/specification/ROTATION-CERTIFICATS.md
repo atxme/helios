@@ -2,7 +2,7 @@
 
 **Statut** : **cycle de vie implémenté** (revu le 2026-08-09, amendé les
 2026-08-15, 2026-08-16, 2026-08-22, 2026-08-30, 2026-09-06 et 2026-09-29,
-clos le 2026-10-08). Le protocole de négociation servi est la v5. Le §12.3
+clos le 2026-10-08, amendé le 2026-11-02 par le §0.9). Le protocole de négociation servi est la v5. Le §12.3
 détaille ce qui est livré ; le §12.5 dit ce qui reste, et rien n'y est du
 développement : deux décisions prises et la validation sur les machines
 cibles du §14.2.
@@ -263,6 +263,103 @@ valeur de protocole et garde son nom.
 La bibliothèque est livrée dans `crates/astra-channel` : elle reprend tel quel
 l'ancien module `helios_api::internal`, tests compris. L'état du découpage est
 tenu au §13 de CRATE-REORGANIZATION.md, pas dans cette spécification.
+
+### 0.9 Amendement de la porte unique du 2 novembre 2026
+
+Décidé par l'utilisateur le 2 novembre 2026 (F14, lot 5a). **Astra tient la
+porte, le reste est connecteur.** Une seule fonction du service Astra ouvre une
+campagne opérateur : elle résout les cibles depuis le registre que le service
+tient en mémoire, signe `AstraSignerRequest` avec la clé de service qu'il est
+seul à lire, applique les bornes du §7.6 et journalise. La console locale et le
+tunnel administrateur sont des connecteurs : ils portent une requête typée
+jusqu'à elle et en rapportent la réponse, et aucun ne résout, ne signe ni ne
+dépose rien. Un outil futur sera un connecteur de plus, pas un second ouvreur.
+
+**Ouvrir n'autorise rien.** Une campagne ouverte est un brouillon de cinq
+minutes au plus. L'autorisation reste le toucher des clés de sécurité sur le
+manifeste vérifié, puis les signatures `CA-PQ` ; aucun connecteur, aucun
+drapeau `admin`, aucune identité relayée ne la remplace.
+
+**La requête est fermée.** Elle compte une variante par action, et aucune ne
+porte de cible : la porte les résout toujours elle-même. Le connecteur est
+établi par le transport, jamais lu dans le corps. Ce que chaque connecteur peut
+demander est une donnée de la porte, testée ligne par ligne :
+
+| Action | Console locale | Tunnel (pair admin) | Origine publique |
+| --- | --- | --- | --- |
+| `fleet_leafs` | oui | oui | non |
+| `trust_authorities` | oui | oui | non |
+| révocation d'un client | oui | oui | non |
+| révocation de la gateway | oui | non (lot 6b) | non |
+| identité gateway | oui | non (lot 6b) | non |
+| chaîne : ouvrir, avancer, abandonner | oui | non | non |
+| délégation d'émetteur, avec ou sans campagne | oui | non | non |
+| `pin-ca-tls`, `issuer install`, `gateway-identity publish` | oui | non | non |
+
+Élargir le tunnel à une action est un changement explicite de cette table, pas
+un effet de bord.
+
+**Bornes.** `reason` et `requested_by` non vides ; fenêtre de 1 à 300 s, 300
+par défaut ; au moins une cible et au plus 256 ; coffre chiffré exigé pour une
+portée qui l'ouvre ; **une opération vivante par famille**, et
+pour une révocation une par identité visée, afin que deux postes volés dans la
+même minute se révoquent l'un et l'autre. « Vivante » veut dire en attente de
+l'opérateur : une cérémonie échouée ou terminée ne bloque pas un nouvel essai.
+Une ouverture en double est refusée ; l'opération existante reste visible par
+`pending` (§8.5.1). Par le tunnel, la porte ajoute à `requested_by` l'identité
+qu'elle a réellement reçue (`… — pair wireguard:<clé>`), pour qu'un pair
+administrateur compromis ne puisse pas afficher un autre nom devant le toucher ;
+par la console, le texte reste libre et l'utilisateur local va au journal.
+Chaque ouverture et chaque refus sont journalisés avec le connecteur, l'action
+et l'opération. Une ouverture n'avance pas l'audit chaîné : ce n'est pas une
+mutation durable du registre. Un pair administrateur compromis peut donc ouvrir
+au plus une campagne par famille, qui expire seule et ne fait rien sans clé.
+
+**Échéances de révocation.** La réponse d'ouverture d'une révocation porte les
+`not_after` signés des moitiés figées — un pour un client, deux pour la
+gateway —, hors des octets signés de la campagne : `SigningOperationView`, qui
+refuse tout champ inconnu, ne change pas, faute de quoi les `astra-signer` et
+Orion déjà livrés ne le liraient plus. Une valeur altérée en route ne révoque
+pas la mauvaise chose : Astra refuse le dépôt en la comparant à la génération
+active, comme avant.
+
+**Connecteur tunnel.** `heliosd` relaie l'ouverture d'un pair administrateur
+par une route de plus du canal opérateur (§8.5.1), sous les mêmes barrières que
+les autres.
+
+**Connecteur console.** `astra run` sert la porte sur un socket Unix de son
+volume d'état, `operator.sock`, mode `0600`, retiré à l'arrêt propre ; aucune
+autre route n'y est montée, et l'utilisateur local, lu par `SO_PEERCRED`, va au
+journal. Les ouvreurs de la console — `astra campaign open`, `revocation open`,
+`gateway-identity open`, `chain open|next|abandon` et `issuer request` — gardent
+leurs arguments et leur sortie, sauf `--gateway-channel` et
+`--gateway-certificate`, retirés : une adresse fournie par l'appelant
+élargirait la porte, et la gateway se lit par le canal privé du service
+(`ASTRA_GATEWAY_CHANNEL`). Service arrêté, une ouverture est refusée et rien
+n'est écrit. Le dépôt sur disque que le service drainait toutes les deux
+secondes disparaît, et avec lui toute lecture de `service-key.bin` ou de
+`registry.json` par un ouvreur.
+
+**Un seul écrivain du volume à la fois.** `astra run` prend au démarrage un
+verrou exclusif sur `astra.lock`, dans son volume d'état, et le garde toute sa
+vie ; un second service sur le même volume refuse de démarrer. Les trois
+écritures de la console qui ne sont pas des ouvertures — `pin-ca-tls`,
+`issuer install`, `gateway-identity publish` — gardent leurs vérifications et
+tentent ce verrou : obtenu, aucun service ne tourne et l'écriture se fait
+localement sous lui, comme le fait `scripts/deploy.sh` service arrêté ; tenu,
+elle passe par la porte, sur le registre en mémoire, et l'ouverture suivante la
+voit sans redémarrage ; tenu par un processus qui ne répond pas à la porte, elle
+est refusée. Une écriture ne choisit jamais son chemin selon qu'une connexion a
+réussi. `bootstrap` exige le verrou. `status` et `chain status` sont des
+lectures pures : elles n'écrivent jamais le registre, même pour le migrer —
+c'est l'écrivain suivant qui le fait. `init-channel` est inchangé.
+
+**Ce qui ne change pas.** `POST /v1/campaigns` reste refusée sur l'origine
+publique, pour la raison du §11.6. Capacités bearer, fenêtres de cinq minutes,
+vérification par Orion du manifeste sous la clé de service épinglée, assertion
+WebAuthn, signatures `CA-PQ` et refus de dépôt par Astra sont inchangés. Les
+§7.6, §8.5, §11.6 et §12.3 sont alignés sur cet amendement ; ADR-008 §7 porte
+le même.
 
 ## 1. Périmètre
 
@@ -1674,6 +1771,17 @@ credentials du §13.1. `AstraRotationCampaign::validate` le refuse : avant le
 premier registre il n'existe ni campagne en ligne, ni état sortant à figer, ni
 clé de service capable de signer `AstraSignerRequest`.
 
+**Qui ouvre une campagne** (amendement du 2 novembre 2026, §0.9) : la porte du
+service Astra, et elle seule. Elle résout les cibles ci-dessus sur le registre
+que le service tient en mémoire — et, pour les portées qui visent la gateway,
+sur les feuilles que le démon sert, lues en direct par le canal privé du
+service —, applique les bornes de §0.9 et fait entrer l'opération dans le
+magasin des opérations opérateur sans passer par le disque. La console locale
+(`astra campaign open` et les autres ouvreurs, par le socket du service) et le
+tunnel administrateur (§8.5.1) n'en sont que des connecteurs, et la table du
+§0.9 dit lesquelles de ces portées chacun peut demander. L'origine publique
+n'en ouvre aucune.
+
 Astra signe ensuite `AstraSignerRequest` de §2.4. Pour un profil actif, la
 requête et le résultat suivent le relais de §8.1.2 ; Orion n'ouvre plus de
 compagnon pour l'approuver : sa cérémonie tourne dans l'IHM non élevée (§12.2).
@@ -2235,25 +2343,52 @@ n'en a aucun ; le document hors ligne de §8.4 reste le dernier recours.
 
 #### 8.5.1 Routes
 
-`heliosd` sert quatre routes typées, image exacte des quatre surfaces
-opérateur d'Astra et d'aucune autre :
+`heliosd` sert six routes typées, image exacte des six routes opérateur de
+l'API privée d'Astra, et aucune autre :
 
 ```text
+GET  /api/certificates/operator/pending
 GET  /api/certificates/operator/operations/<operation_id>
 GET  /api/certificates/operator/signer-requests/<operation_id>
 GET  /api/certificates/operator/vaults/<encrypted_vault_fingerprint>
 POST /api/certificates/operator/signer-results/<operation_id>
+POST /api/certificates/operator/campaigns
 ```
 
 Elles relaient vers un préfixe privé propre, distinct de celui du
 renouvellement client et de celui de la mise à jour de confiance :
 
 ```text
+POST /internal/v1/operator/pending
 POST /internal/v1/operator/operations/<operation_id>
 POST /internal/v1/operator/signer-requests/<operation_id>
 POST /internal/v1/operator/vaults/<encrypted_vault_fingerprint>
 POST /internal/v1/operator/signer-results/<operation_id>
+POST /internal/v1/operator/campaigns
 ```
+
+Les quatre routes du milieu sont les surfaces compagnon de l'origine publique
+(§8.2), servies par les mêmes fonctions qu'elle : les deux canaux ne peuvent
+pas décider différemment. Les deux autres n'ont pas de pendant public :
+
+- `pending` liste ce qui attend un opérateur — identifiant, portée, motif et
+  demandeur, nombre de cibles, empreinte de campagne, échéance —, sans jeton
+  de capacité, pour qu'une campagne ouverte se **trouve** au lieu de se
+  recopier. Les récupérations n'y figurent pas : leur absence est le contrôle
+  d'accès du §7.5 ;
+- `campaigns` est l'**ouverture** par le tunnel (amendement du 2 novembre 2026,
+  §0.9). Elle appelle la porte que la console locale appelle ; l'origine
+  publique, elle, refuse toujours `POST /v1/campaigns`. Le corps est une
+  requête fermée — `action` (`fleet_leafs`, `trust_authorities` ou
+  `client_revocation`), `peer` (la clé WireGuard visée, pour
+  `client_revocation` seulement), `reason`, `requested_by`, `window_secs`
+  (300 par défaut) — qui refuse tout champ inconnu et ne nomme aucune cible.
+  La réponse donne `operation_id`, `campaign_id`, `campaign_fingerprint`,
+  `scope`, `target_count`, `required_credentials`, `expires_at` et, pour une
+  révocation, `revocation_expiries` (`tls_not_after`, `pq_not_after`), les
+  échéances signées que l'opérateur n'a plus à recopier. Ni la liste ni
+  l'ouverture ne portent de jeton : ouvrir ne confère rien, et les capacités
+  restent émises par les routes qui ouvrent l'opération à son opérateur.
 
 Un préfixe séparé et non une cinquième route sous celui de la rotation : un
 renouvellement est un pair qui demande à être recertifié, une campagne est
@@ -2288,6 +2423,9 @@ Une opération de campagne n'appartient à aucun pair, et rien ici ne prétend l
 contraire : l'autorisation normative reste l'assertion WebAuthn de la YubiKey
 et les signatures applicatives ML-DSA-87 que les objets portent. Le drapeau
 `admin` borne qui peut faire circuler la cérémonie, pas qui peut l'approuver.
+Il en va de même de l'ouverture : le drapeau borne qui peut demander une
+campagne par le tunnel, et la campagne ouverte n'autorise rien tant qu'aucune
+clé n'a été touchée (§0.9).
 
 Ces routes ne donnent accès à aucune opération de renouvellement client. La
 séparation est structurelle : le préfixe `/internal/v1/operator/` adresse le
@@ -2319,6 +2457,14 @@ lecture n'avance pas l'audit chaîné : sa tête témoigne des mutations durable
 du registre, pas des sondes réseau. Une gateway sans canal privé répond
 `503` et le dit dans son journal, comme en §8.1.2 : la route existe et
 l'appelant a raison de l'employer.
+
+L'ouverture suit la même règle. Seule l'entrée de l'appelant se distingue — un
+corps illisible, un motif ou un demandeur vide, une fenêtre hors de 1 à 300 s
+reçoivent `400`, qui ne dit rien du domaine. Toute décision sur le domaine —
+ouverture en double, aucune cible, plus de 256 cibles, coffre absent, pair
+inconnu ou déjà révoqué — reçoit le même refus indistinct. La phrase complète de
+la porte va au journal structuré d'Astra ; seule la console locale, qui n'est
+pas une surface réseau, la reçoit en réponse.
 
 #### 8.5.5 Choix du transport, sans repli
 
@@ -2356,6 +2502,15 @@ une obligation de cette section.
 
 La récupération d'une identité expirée (§7.5) reste sur l'origine publique par
 construction : ce qui a expiré est précisément le tunnel.
+
+Depuis l'amendement du 2 novembre 2026 (§0.9), le tunnel couvre aussi
+l'**ouverture**, pour les trois actions que la table de la porte lui accorde :
+`fleet_leafs`, `trust_authorities` et la révocation d'un client. Les autres
+ouvertures — révocation et identité de la gateway (lot 6b de F14), chaîne,
+délégation d'émetteur — et les trois écritures de la console restent réservées
+à la console locale : les élargir est un changement de cette table. Les écrans
+d'Orion qui emploieront la route viennent avec les lots 5b et 5c ; jusque-là,
+elle s'appelle directement depuis un poste administrateur du tunnel.
 
 ## 9. Rotation de `CA-PQ`
 
@@ -2753,7 +2908,10 @@ point 3 et devient une réadmission à deux YubiKeys.
 ### 11.6 Campagne manuelle globale
 
 1. L'IHM Orion ou Helios demande à Astra un manifeste de campagne résolu sur
-   les cibles et générations actuelles.
+   les cibles et générations actuelles. Cette demande est un connecteur de la
+   porte du §0.9 : par le tunnel, `POST /api/certificates/operator/campaigns`
+   (§8.5.1) ; sur l'hôte d'Astra, la console locale. L'origine publique ne
+   résout aucune campagne.
 2. L'utilisateur vérifie le résumé sur l'origine Astra et approuve avec la ou
    les YubiKeys exigées.
 3. Astra fige le manifeste ; toute évolution concurrente d'une cible la marque
@@ -3100,19 +3258,25 @@ contournés :
   inconnu » : il y est absent, pas écarté. `astra campaign open` résout la
   campagne sur les cibles courantes et la dépose ; `astra-signer
   approve-campaign --authority-url --operation-id` la récupère, l'affiche,
-  recueille les assertions et les dépose.
+  recueille les assertions et les dépose. (Depuis le lot 5a de F14, c'est la
+  porte du service qui résout et ouvre la campagne, §0.9 ; la commande n'en est
+  plus que le connecteur local, et rien n'est déposé sur disque.)
   Ce qui manque est `POST /v1/campaigns`, et le §11.6 dit pourquoi : cette
   route **résout** une campagne sur les cibles et générations courantes, donc
   sur un canal public non authentifié elle répondrait l'inventaire du domaine à
   n'importe quel appelant. L'authentification qu'elle exige — « les budgets
   s'appliquent par IPv4 ou préfixe IPv6 `/64`, credential, pair et domaine » —
   n'est décrite nulle part pour ce cas, et l'inventer serait construire le
-  trou. La résolution se fait donc localement.
+  trou. La résolution se fait donc localement. Depuis le lot 5a de F14,
+  « localement » veut dire dans le service Astra lui-même, par sa porte, que
+  la console de son hôte et le tunnel administrateur (§8.5.1) atteignent ; la
+  route publique reste refusée.
   `rotate-ca-pq` porte désormais une campagne (`--authority-url`,
   `--operation-id`) et emprunte les quatre routes du §8.2 comme
   `approve-campaign`. `authorize-issuer` aussi : `astra issuer request
   --reason --requested-by` résout la campagne `issuer_delegation` sur la
-  demande qu'il vient de produire et la dépose, le compagnon la récupère, la
+  demande qu'il vient de produire et la dépose (depuis le lot 5a, le service
+  tire les clés et ouvre la campagne à sa porte), le compagnon la récupère, la
   montre, prend l'assertion et **redépose la délégation signée**, qu'Astra
   enregistre après avoir prouvé la possession des deux moitiés privées
   scellées à côté de son registre. Ce n'est pas une portée de `astra campaign
@@ -3312,8 +3476,9 @@ contournés :
   vérifient sous l'ancre qu'ils épinglent déjà. La replier dans l'une des trois
   autres aurait laissé une campagne de celles-ci le livrer, ou l'inverse.
   La **chaîne complète** s'exécute enfin, et pas comme une campagne :
-  `astra chain open`, puis `astra chain next` entre chaque étape, déposent
-  quatre campagnes ordinaires dans l'ordre du §12.2 — émetteur, CA TLS,
+  `astra chain open`, puis `astra chain next` entre chaque étape, ouvrent —
+  par la porte du service depuis le lot 5a de F14 (§0.9) — quatre campagnes
+  ordinaires dans l'ordre du §12.2 — émetteur, CA TLS,
   identité gateway, leafs du parc —, chacune avec sa propre famille, ses
   propres cibles et son propre toucher. `CampaignFamily` est totale, chaque
   famille refusant les trois autres dans les deux sens ; une campagne portant
@@ -3542,7 +3707,11 @@ contournés :
   chaîne » et « Tourner les autorités » ouvrent une campagne **Astra**, dont
   §11.6 garde la résolution locale parce qu'une campagne est l'inventaire du
   domaine ; la console les nomme avec leur commande — `astra campaign open`,
-  `astra chain open` — plutôt que d'inventer la surface qui les porterait ;
+  `astra chain open` — plutôt que d'inventer la surface qui les porterait.
+  Depuis le lot 5a de F14, cette surface existe dans le tunnel (§8.5.1) pour
+  « Renouveler les leafs du parc » et « Tourner les autorités » ; aucune IHM ne
+  l'emploie encore, et « Renouveler toute la chaîne » reste une commande de la
+  console locale ;
 - les **essais d'intégration** du §14.2, qui supposent un vrai plan de données ;
 - toute **migration de format** des états persistés. `TrustState` et
   `RegistryState` portent `deny_unknown_fields`, et la forme de leur état borné
@@ -3593,7 +3762,11 @@ trompeur que le taire :
   L'authentification qu'elle exigerait n'est décrite nulle part, et l'inventer
   serait construire le trou. La résolution reste locale — ce qui entraîne que
   les trois actions de campagne du §12.2 restent nommées par leur commande
-  dans la console plutôt que portées par un bouton.
+  dans la console plutôt que portées par un bouton. L'amendement du
+  2 novembre 2026 (§0.9) place cette résolution dans le service Astra, derrière
+  une porte unique, et l'ouvre au tunnel administrateur pour deux de ces trois
+  actions ; les boutons viennent avec les écrans d'Orion (lots 5b et 5c de
+  F14).
 - **Le redémarrage après une bascule** reste un geste opérateur, par décision
   (§12.3) : la feuille servie est descellée une seule fois, et le démon dit
   quand un redémarrage est dû plutôt que de le faire.

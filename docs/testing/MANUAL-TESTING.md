@@ -950,6 +950,84 @@ enrôlée dans le coffre d'essai.
     d'Astra. Sur un domaine dont le relais **nomme** une origine, le bloc dit
     qu'une délégation passe par une campagne et ne propose pas le bouton.
 
+**F. Lot 5a : la porte unique d'Astra**
+
+Rien de ce qui suit n'a été constaté sur une vraie gateway : le socket local
+dans le conteneur, le verrou du volume entre deux conteneurs, le relais du
+tunnel par le veth et l'approbation dans Orion sont **non vérifiables sous
+WSL2**, où seuls les tests Rust les exercent (`crates/astra/tests/cli.rs`,
+`crates/astra/src/door/tests.rs`, `crates/helios-api/src/security_tests.rs`).
+Tout est **à valider en recette**. Prérequis : la gateway et le domaine d'essai
+de « E », Astra déployé par `deploy.sh` (donc `ASTRA_GATEWAY_CHANNEL` et
+`ASTRA_PRIVATE_BIND` renseignés), un poste opérateur Orion pair
+**administrateur** du tunnel, un second pair **non administrateur**, et un
+client admis à révoquer. Sur la gateway, depuis `~/astra-build`, on note :
+
+```sh
+astra_exec='sudo docker compose -f deploy/astra/compose.yaml
+  --env-file /var/lib/helios/astra-compose.env exec -T astra /usr/local/bin/astra'
+```
+
+35. **Console, service en marche puis arrêté.** `$astra_exec campaign open
+    --scope fleet-leafs --reason "recette 5a" --requested-by "prénom.nom"`.
+    Attendu : l'identifiant d'opération sur la sortie standard, l'empreinte et
+    la ligne `astra-signer approve-campaign …` sur l'erreur standard, comme
+    avant le lot. La même commande une seconde fois, tant que la première
+    attend : refus « une opération de la même famille attend déjà l'opérateur
+    (…) », rien d'ouvert. Puis `sudo docker compose … stop astra` : le journal
+    dit « Astra's door closed » et `operator.sock` disparaît du volume. Lancer
+    alors la même commande dans un conteneur jetable monté sur le volume
+    (`sudo docker run --rm --network none -v <volume>:/var/lib/astra
+    helios/astra:latest campaign open …`, le nom du volume se lit par `docker
+    inspect` sur le conteneur arrêté). Attendu : « le service Astra ne tourne
+    pas : rien n'a été ouvert », code de sortie non nul, aucun fichier nouveau
+    dans le volume. Variante : pendant qu'Astra tourne, un second `astra run`
+    dans un conteneur jetable sur le même volume refuse de démarrer (« un autre
+    processus tient /var/lib/astra : rien n'a démarré »). Redémarrer Astra.
+36. **Ouverture par le tunnel, approuvée dans Orion.** Depuis le poste
+    administrateur, tunnel monté :
+    `curl --fail --request POST --header 'Content-Type: application/json'
+    --data '{"action":"fleet_leafs","reason":"recette 5a","requested_by":"prénom.nom"}'
+    http://<VIP de la gateway>:8080/api/certificates/operator/campaigns`.
+    Attendu : `200` et un JSON avec `operation_id`, `campaign_fingerprint`,
+    `scope` `fleet_leafs`, `target_count`, `expires_at`, sans aucun jeton.
+    Dans Orion, onglet *Astra* › *Approbations* : la campagne apparaît, avec la
+    même empreinte, et s'approuve par le chemin du lot 4. Une seconde
+    ouverture identique pendant que la première attend : `403`, sans détail ;
+    le journal d'Astra porte la phrase « une opération de la même famille
+    attend déjà l'opérateur ».
+37. **Pair non administrateur.** La même requête depuis le second pair.
+    Attendu : `403`, sans détail ; le refus figure au journal de `heliosd`, et
+    **rien** n'apparaît au journal d'Astra (la gateway refuse avant tout
+    relais). Une requête portant un en-tête `Origin` différent de l'hôte, depuis
+    le poste administrateur : `403` également.
+38. **Révocation d'un client par le tunnel.** Depuis le poste administrateur,
+    même requête avec `"action":"client_revocation","peer":"<clé WireGuard du
+    client>"`. Attendu : `operation_id` et `revocation_expiries` dont
+    `pq_not_after` et `tls_not_after` valent l'échéance de la génération
+    active du client. Sur le poste opérateur : `astra-signer revoke
+    --authority-url <origine d'Astra> --operation-id <operation_id> --not-after
+    <pq_not_after>`, sans rien retaper d'autre. Attendu : la révocation aboutit
+    et le client est révoqué (écran *Certificats* de la gateway). Une révocation du **même** client rouverte pendant que la
+    première attend : refusée ; celle d'un **autre** client : acceptée.
+    Variantes : `"action":"gateway_identity"` ou une `peer` sur
+    `fleet_leafs` : `400`, rien de relayé à la porte.
+39. **Le demandeur porte le pair.** Dans *Approbations* (ou par `curl
+    http://<VIP de la gateway>:8080/api/certificates/operator/pending`), la
+    campagne de l'étape 36 affiche `requested_by` sous la forme
+    `prénom.nom — pair wireguard:<clé publique du poste administrateur>`. Celle
+    de l'étape 35, ouverte par la console, affiche le texte tel quel.
+40. **Une écriture visible sans redémarrage.** Sur un domaine d'essai amorcé
+    **sans** `--ca-tls-fingerprint` : `$astra_exec pin-ca-tls --fingerprint
+    <sha256 de ca-tls.pem>`, service en marche. Puis, sans redémarrer Astra,
+    `$astra_exec campaign open --scope trust-authorities --reason …
+    --requested-by …`. Attendu : la campagne vise **deux** cibles, CA-PQ et
+    CA-TLS (`target_count` `2` dans `pending`, deux lignes dans le manifeste
+    d'Orion). Variante, chemin de `deploy.sh` : service arrêté, `pin-ca-tls`
+    dans un conteneur jetable écrit localement et réussit ; `astra status`,
+    service arrêté, lit le registre sans le modifier (la date de modification
+    de `registry.json` ne bouge pas).
+
 ### Le chemin manuel
 
 Dans un autre terminal, générer deux identités de test :

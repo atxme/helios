@@ -136,7 +136,9 @@ Ce qui reste **hors** de ce déploiement, et pourquoi :
   /v1/campaigns`) : cette route *résout* une campagne sur les cibles courantes,
   donc sur un canal public non authentifié elle répondrait l'inventaire du
   domaine à n'importe quel appelant, et l'authentification qu'elle exigerait
-  n'est décrite nulle part. La résolution reste locale, dans ce conteneur ;
+  n'est décrite nulle part. La résolution reste dans ce conteneur, à la porte
+  du service, que la console locale et le tunnel administrateur atteignent
+  (« Ouvrir une campagne : la porte d'Astra », ci-dessous) ;
 - la **bascule de confiance du §13.2** pour un parc v5 déjà déployé : la
   première installation de `CA-PQ` est un amorçage, avec confirmation
   d'empreinte hors bande, et non une rotation `N -> N+1` ;
@@ -154,6 +156,91 @@ moitiés du domaine, et toute la séquence au-dessus du matériel. Ce qui ne l'e
 pas en WSL2 : le veth noyau réel, la clé de sécurité (aucun passthrough USB) et
 DPAPI — donc un renouvellement complet s'exerce sur Windows, contre une vraie
 gateway. Voir [TESTING.md](testing/TESTING.md).
+
+## Ouvrir une campagne : la porte d'Astra
+
+Depuis le lot 5a de F14 (ROTATION-CERTIFICATS §0.9), une seule fonction du
+service Astra ouvre une campagne. Elle résout les cibles sur le registre que le
+service tient en mémoire et signe la demande sous la clé de service qu'il est
+seul à lire. La console et le tunnel ne sont que des **connecteurs** : ils lui
+portent une demande typée et rapportent sa réponse.
+
+**La console** parle au service par un socket Unix de son volume d'état,
+`/var/lib/astra/operator.sock`, mode `0600`, qu'`astra run` crée au démarrage
+et retire à l'arrêt propre (`compose stop` envoie `SIGTERM`, qu'Astra traite
+désormais). Un socket laissé par un arrêt brutal est remplacé au démarrage
+suivant ; un fichier ordinaire à cet emplacement est refusé, jamais effacé. Le
+socket ne sert que la porte, et l'utilisateur local qui s'y connecte va au
+journal. Les commandes `astra` s'emploient donc par `compose exec`, dans le
+conteneur en marche — le même conteneur, donc le même socket :
+
+```sh
+ssh <gateway> "cd ~/astra-build && sudo docker compose -f deploy/astra/compose.yaml \
+    --env-file /var/lib/helios/astra-compose.env exec -T astra \
+    /usr/local/bin/astra campaign open --scope fleet-leafs \
+    --reason 'campagne trimestrielle' --requested-by 'prénom.nom'"
+```
+
+- **Les ouvertures exigent le service en marche** : `campaign open`,
+  `revocation open`, `gateway-identity open`, `chain open|next|abandon`,
+  `issuer request`. Service arrêté : « le service Astra ne tourne pas : rien
+  n'a été ouvert », code de sortie non nul, rien d'écrit. Une campagne vit dans
+  la mémoire du service ; sans lui il n'y a rien à ouvrir, et rien n'est plus
+  déposé sur disque pour un démarrage ultérieur.
+- **Les refus sont les phrases de la porte**, en français et entières. La
+  console attend la réponse 60 s au plus ; au-delà elle dit que l'échange
+  s'est interrompu, et ce qui a été fait, s'il y a lieu, est dans le journal du
+  service (`compose logs astra`).
+- **`status` et `chain status` sont des lectures pures**, service en marche ou
+  non : elles n'écrivent jamais le registre, même pour le migrer vers un format
+  plus récent — l'écrivain suivant s'en charge.
+
+**Les ouvertures qui visent la gateway** — `revocation open --scope gateway`,
+`gateway-identity open` et l'étape gateway de `chain next` — lisent ses
+feuilles par le canal privé **du service** : `ASTRA_GATEWAY_CHANNEL` et
+`ASTRA_GATEWAY_CERTIFICATE` du `.env` de compose, que `deploy.sh` renseigne
+depuis `astra init-channel` et `heliosd init-astra-channel`. Les options
+`--gateway-channel` et `--gateway-certificate` de ces commandes, et de
+`gateway-identity publish`, sont retirées : une adresse choisie par l'appelant
+élargirait la porte. Un déploiement qui ne passait l'adresse qu'à la console
+doit la renseigner dans le `.env` et redémarrer Astra ; sans elle, ces
+ouvertures sont refusées par leur nom.
+
+**Le tunnel** ouvre aussi, pour un pair **administrateur** : `POST
+/api/certificates/operator/campaigns` sur l'API d'administration de la gateway,
+que `heliosd` relaie à la porte par le veth (sens `10.88.7.2:8445`, donc
+`ASTRA_PRIVATE_BIND`). Seules trois actions y sont ouvertes — `fleet_leafs`,
+`trust_authorities` et la révocation d'un client ; les autres restent à la
+console. La réponse d'une révocation porte son échéance signée. Une gateway
+sans canal privé répond `503` ; les autres refus sont grossiers et le détail
+est dans les journaux de la gateway et d'Astra. Le demandeur affiché devant le
+toucher porte la clé WireGuard du pair qui a ouvert. Exemples :
+[RENOUVELLEMENT-CERTIFICATS](RENOUVELLEMENT-CERTIFICATS.md), §2, §3 et §7.
+
+### Un seul écrivain du volume : `astra.lock`
+
+`astra run` prend au démarrage un verrou exclusif sur
+`/var/lib/astra/astra.lock` et le garde toute sa vie ; le noyau le relâche à
+la fin du processus, quelle qu'elle soit. Un second service sur le même volume
+refuse de démarrer (« un autre processus tient /var/lib/astra : rien n'a
+démarré »), et `astra bootstrap` refuse de même. C'est la règle que `deploy.sh`
+tenait déjà par convention — « deux processus sur `/var/lib/astra` sont une
+corruption de registre » —, désormais tenue par le volume.
+
+Les trois écritures de la console qui ne sont pas des ouvertures choisissent
+leur chemin d'après ce verrou, jamais d'après une connexion qui réussit ou
+non :
+
+| Verrou | `pin-ca-tls`, `issuer install`, `gateway-identity publish` |
+| --- | --- |
+| obtenu | aucun service ne tourne : écriture locale sous le verrou, comme le fait `deploy.sh` dans son conteneur jetable |
+| tenu | le service tourne : l'écriture passe par sa porte, et l'ouverture suivante la voit sans redémarrage |
+| tenu, socket muet | refus : « un autre processus tient le volume, et le service Astra n'y répond pas : rien n'a été écrit » |
+
+`gateway-identity publish` service arrêté relaie par le canal que le service
+emploierait : il lit `ASTRA_GATEWAY_CHANNEL` et `ASTRA_GATEWAY_CERTIFICATE`
+dans son environnement, et refuse sans eux. `init-channel` ne touche pas le
+registre et reste inchangé.
 
 ## Récupérer une identité expirée
 
@@ -198,7 +285,8 @@ réadmission opérateur à deux clés.
 Deux commandes, sur deux machines, et rien à recopier entre elles.
 
 ```sh
-# sur la gateway, dans le conteneur Astra
+# sur la gateway, dans le conteneur Astra en marche (ou par le tunnel,
+# depuis un poste administrateur : voir « Ouvrir une campagne »)
 astra campaign open --scope trust-authorities \
   --reason "rotation annuelle" --requested-by "prénom.nom"
 # → imprime un identifiant d'opération
@@ -606,7 +694,9 @@ ssh cible 'rm -f /tmp/vault.json'
 ```
 
 Il est lu au démarrage, comme le document de credentials, et pour la même
-raison : ce sont des octets qu'Astra transporte, jamais qu'il interprète.
+raison : ce sont des octets qu'Astra transporte, jamais qu'il interprète. La
+porte vérifie sa présence sur cette copie de démarrage : un coffre copié dans
+un service déjà en marche n'existe pour elle qu'après le redémarrage.
 Son empreinte apparaît au journal de démarrage — c'est elle que la demande
 signée nomme, et que le compagnon compare avant d'ouvrir quoi que ce soit.
 
@@ -624,8 +714,9 @@ Trois commandes, dans cet ordre :
 
 ```sh
 # 1. sur la gateway : les deux clés privées naissent dans le volume d'Astra,
-#    adressées par époque. Rien n'est installé, rien n'est annoncé. La
-#    campagne est déposée dans le même geste, et son identifiant s'affiche.
+#    adressées par époque, tirées par le service en marche. Rien n'est
+#    installé, rien n'est annoncé. La campagne est ouverte dans le même geste,
+#    et son identifiant s'affiche.
 ssh <gateway> "cd ~/astra-build && sudo docker compose -f deploy/astra/compose.yaml \
     --env-file /var/lib/helios/astra-compose.env exec -T astra \
     /usr/local/bin/astra issuer request \
@@ -650,7 +741,7 @@ ssh <gateway> "cd ~/astra-build && sudo docker compose -f deploy/astra/compose.y
 
 La demande sort sur la **sortie standard** — d'où le `>` de l'étape 1 — et
 tout le reste, l'identifiant d'opération compris, sur l'erreur standard. Sans
-`--reason` ni `--requested-by`, aucune campagne n'est déposée : le compagnon
+`--reason` ni `--requested-by`, aucune campagne n'est ouverte : le compagnon
 écrit alors son autorisation avec `--out` et `astra issuer install` la relit
 sur l'entrée standard quand `--authorization` est absent. Cette forme de repli
 existe pour un domaine dont l'origine publique n'est pas joignable : une

@@ -667,6 +667,67 @@ récupération approuvée depuis un second poste et une délégation suivie du
 redémarrage d'Astra ne se vérifient pas dans le dépôt : à valider en recette
 (MANUAL-TESTING, « E. Lot 4 »).
 
+#### Amendement du 2 novembre 2026 : Astra tient la porte (F14, lot 5a)
+
+Ouvrir une campagne obligeait à entrer dans le conteneur Astra, à y lancer un
+second processus qui relisait le registre et la clé de service du premier,
+puis à recopier un identifiant d'opération — et, pour une révocation, des
+échéances — vers le poste qui tient les clés. Décidé par l'utilisateur le
+2 novembre 2026 :
+
+- **Une porte, plusieurs outils.** Une seule fonction du service Astra ouvre
+  une campagne opérateur. Elle résout les cibles depuis le registre que le
+  service tient en mémoire, signe la demande sous la clé de service qu'il est
+  seul à lire, applique les bornes et journalise. C'est le seul endroit
+  critique à renforcer.
+- **Le reste est connecteur.** Ni `heliosd`, ni Orion, ni la console : ce sont
+  des moyens d'accès. Le connecteur est établi par le transport, jamais par le
+  corps de la requête, et ce que chacun peut demander est une table de la porte
+  (spécification §0.9). Un outil futur est un connecteur de plus.
+- **Ouvrir n'autorise rien.** Une campagne ouverte est un brouillon de cinq
+  minutes au plus, et une seule opération vivante par famille — une par
+  identité pour une révocation — peut attendre l'opérateur. L'autorisation
+  reste le toucher des clés de sécurité sur le manifeste vérifié puis les
+  signatures `CA-PQ`, et cette cérémonie est une fonction d'Orion, pas de la
+  porte. Un pair administrateur compromis peut ouvrir au plus une campagne par
+  famille, qui expire seule et ne fait rien sans clé ; il ne peut pas faire
+  afficher un autre nom que le sien, car la porte ajoute au demandeur l'identité
+  WireGuard qu'elle a réellement reçue.
+- **Le tunnel ouvre, pour un pair administrateur.** `heliosd` relaie
+  l'ouverture comme les autres routes opérateur de l'amendement du
+  4 septembre 2026 (§2) : identité établie avant tout relais, cohérence
+  d'origine, refus publics grossiers. Le tunnel peut ouvrir `fleet_leafs`,
+  `trust_authorities` et la révocation d'un client ; le reste demeure à la
+  console locale. La réponse d'une révocation porte ses échéances signées, que
+  l'opérateur ne recopie plus. L'origine publique n'ouvre toujours rien.
+- **La console devient un connecteur.** Ses ouvreurs parlent au service par un
+  socket Unix de son volume d'état (`operator.sock`, mode `0600`) et
+  n'écrivent plus rien eux-mêmes ; service arrêté, une ouverture est refusée,
+  jamais déposée sur disque pour plus tard. Ils ne prennent plus d'adresse de
+  gateway : les lectures de la gateway passent par le canal privé que le
+  service tient déjà.
+- **Un seul écrivain du volume à la fois.** `astra run` tient un verrou
+  exclusif sur son volume d'état toute sa vie. Les trois écritures de la
+  console qui ne sont pas des ouvertures — épingler `CA-TLS`, installer une
+  délégation, publier une transition gateway — suivent ce verrou : obtenu,
+  aucun service ne tourne et elles écrivent localement, comme le déploiement le
+  fait service arrêté ; tenu, elles passent par la porte, et leur effet est
+  visible à l'ouverture suivante sans redémarrage. Avec le service en marche,
+  aucune commande de la console n'écrit le registre ; `bootstrap` exige le
+  verrou, et les lectures (`status`, `chain status`) n'écrivent jamais.
+
+Ce que cet amendement ne fait **pas** : il n'ajoute aucun écran — ceux d'Orion
+qui ouvriront une rotation ou une révocation sont les lots 5b et 5c — et ne
+touche ni aux capacités bearer, ni aux fenêtres, ni à la vérification par
+Orion du manifeste sous la clé de service épinglée, ni au refus de dépôt par
+Astra. `SigningOperationView` est inchangé, pour que les `astra-signer` et
+Orion déjà livrés continuent de le lire. La forme normative est au §0.9 de la
+spécification.
+
+Ce qu'un pair administrateur réel obtient en ouvrant par le tunnel, et la suite
+jusqu'à l'approbation dans Orion, ne se vérifient pas dans le dépôt : à valider
+en recette (MANUAL-TESTING, « F. Lot 5a »).
+
 ### 8. Avortement, leases et atomicité logique
 
 Une transition gateway peut être avortée sans révocation seulement tant
