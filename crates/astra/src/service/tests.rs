@@ -254,6 +254,7 @@ mod http_routes {
             encrypted_vault: None,
             state_dir,
             gateway: None,
+            volume_writes: crate::door::VolumeWrites::new(),
         });
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
