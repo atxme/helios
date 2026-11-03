@@ -85,7 +85,7 @@ impl NegotiationHandler for GatewayHandler {
         // with. Consulting the registry first is what keeps a renewed client
         // able to negotiate at all.
         let registered = self.registered_identity(&certificate_sha256, now).await;
-        let (address, previous_psk, pq_fingerprint, minimum_mode) = {
+        let (admitted_public_key, pq_fingerprint, minimum_mode) = {
             let network = self.network.read().await;
             // Found by the **TLS fingerprint**, never by the key the request
             // carries (spec §7.3). Searching on the request's field and then
@@ -138,10 +138,7 @@ impl NegotiationHandler for GatewayHandler {
                     .ok_or(PublicError::Rejected)?,
             };
             (
-                peer.address.clone(),
-                peer.preshared_key
-                    .as_ref()
-                    .map(aether::SecretString::duplicate),
+                peer.public_key.clone(),
                 pq_fingerprint,
                 peer.minimum_key_negotiation_mode,
             )
@@ -183,14 +180,155 @@ impl NegotiationHandler for GatewayHandler {
                 );
                 PublicError::Rejected
             })?;
-        let baseline_static_psk = self
-            .static_psks
-            .read()
-            .await
-            .get(&request.client_wg_public_key)
-            .map(SecretString::duplicate);
-        // Recomputed against this transaction's context, so a match proves
-        // possession now rather than agreeing with a stable identifier.
+        // The transaction lock serializes admission settlement, the latest
+        // configured PSK snapshot, the runtime baseline snapshot, and the
+        // reservation. Reading either secret before settlement could carry an
+        // old cached baseline into a newly admitted slot.
+        let (generation, address, previous_psk, baseline_static_psk) = {
+            let mut state = self.transactions.lock().await;
+            // The peer was admitted when it was looked up above; a reload may
+            // have removed it since. Settled under this lock, a removal wins
+            // over the reservation rather than racing it.
+            self.settle_admission(&mut state, &admitted_public_key)
+                .await?;
+            if matches!(state.slot(&admitted_public_key).state, SlotState::Revoked) {
+                tracing::warn!(
+                    %transaction,
+                    peer = %peer_key,
+                    "key negotiation refused: this peer was removed from admission meanwhile"
+                );
+                return Err(PublicError::Rejected);
+            }
+            if state.replay_set.contains(&request.transaction_id) {
+                tracing::warn!(
+                    %transaction,
+                    peer = %peer_key,
+                    "key negotiation refused: transaction identifier already seen (replay)"
+                );
+                return Err(PublicError::Rejected);
+            }
+            if state.peers.contains(&admitted_public_key) {
+                tracing::warn!(
+                    %transaction,
+                    peer = %peer_key,
+                    "key negotiation refused: a transaction is already in flight for this peer — \
+                     the previous session has not been released yet"
+                );
+                return Err(PublicError::Rejected);
+            }
+            if let Some(until) = state.slot(&admitted_public_key).resting_until {
+                if std::time::Instant::now() < until {
+                    tracing::warn!(
+                        %transaction,
+                        peer = %peer_key,
+                        "key negotiation refused: this peer is in the rest period a rolled-back \
+                         candidate armed"
+                    );
+                    return Err(PublicError::Rejected);
+                }
+            }
+            if in_tunnel
+                && !origin::tunnel_renewal_allowed(
+                    request.mode,
+                    &state.slot(&admitted_public_key).state,
+                )
+            {
+                tracing::warn!(
+                    %transaction,
+                    peer = %peer_key,
+                    mode = ?request.mode,
+                    "key negotiation refused: through the tunnel, only a committed ml_kem slot \
+                     may be renewed"
+                );
+                return Err(PublicError::Rejected);
+            }
+            // `prepare` reserves one generation and its eventual commit or
+            // rollback consumes another. Refuse before reserving the peer or
+            // recording the replay identifier if both transitions cannot be
+            // represented.
+            let Some(reserved_generation) =
+                state.slot(&admitted_public_key).generation.checked_add(1)
+            else {
+                tracing::error!(
+                    %transaction,
+                    peer = %peer_key,
+                    "key negotiation refused: peer generation is exhausted"
+                );
+                return Err(PublicError::Internal);
+            };
+            if reserved_generation.checked_add(1).is_none() {
+                tracing::error!(
+                    %transaction,
+                    peer = %peer_key,
+                    "key negotiation refused: peer generation has no terminal transition available"
+                );
+                return Err(PublicError::Internal);
+            }
+
+            let baseline_static_psk = self
+                .static_psks
+                .read()
+                .await
+                .get(&admitted_public_key)
+                .map(SecretString::duplicate);
+            // Keep the current configuration stable through reservation. All
+            // awaited cache locks precede this read guard, and the backend is
+            // called only after the enclosing block drops it.
+            let network = self.network.read().await;
+            let Some(peer) = network
+                .peers
+                .iter()
+                .find(|peer| peer.public_key == admitted_public_key)
+            else {
+                return Err(PublicError::Rejected);
+            };
+            if !peer
+                .minimum_key_negotiation_mode
+                .is_some_and(|minimum| request.mode.satisfies(minimum))
+            {
+                return Err(PublicError::Rejected);
+            }
+            let address = peer.address.clone();
+            let previous_psk = peer.preshared_key.as_ref().map(SecretString::duplicate);
+
+            // Admission, policy and ownership are now checked under the slot
+            // lock. No actor can reserve the peer between that check and this
+            // insertion, and no await follows before the slot is preparing.
+            state.peers.insert(admitted_public_key.clone());
+            state.replay_set.insert(request.transaction_id);
+            state.replay_order.push_back(request.transaction_id);
+            while state.replay_order.len() > MAX_REPLAY_IDENTIFIERS {
+                if let Some(expired) = state.replay_order.pop_front() {
+                    state.replay_set.remove(&expired);
+                }
+            }
+            // Reserved, not merely observed. Incrementing the generation and
+            // claiming the slot happen under the **same** lock that reserved
+            // the peer, so from here on every other actor — a delayed
+            // `release`, the reclaimer, a rollback from an earlier
+            // transaction — sees a generation it does not hold and a slot it
+            // does not own, and is a no-op instead of a write.
+            //
+            // Reading the generation without taking it, as this did before,
+            // left a window in which those actors still matched: they cleared
+            // the data plane under a candidate that then committed.
+            let slot = state.slot(&admitted_public_key);
+            slot.generation = reserved_generation;
+            slot.resting_until = None;
+            let previous_state = std::mem::replace(&mut slot.state, SlotState::Empty);
+            slot.state = SlotState::Preparing {
+                transaction_id: request.transaction_id,
+                previous: Box::new(previous_state),
+                address: address.clone(),
+                previous_psk: previous_psk.as_ref().map(SecretString::duplicate),
+                install_attempted: false,
+            };
+            (slot.generation, address, previous_psk, baseline_static_psk)
+        };
+
+        // The request proves a fresh commitment to the configured PSK when
+        // it matches. Otherwise, only the settled runtime baseline may satisfy
+        // a request that is continuing the existing static-PSK arrangement.
         let current_matches_static_request = request
             .static_psk_commitment
             .as_deref()
@@ -212,104 +350,6 @@ impl NegotiationHandler for GatewayHandler {
             previous_psk.as_ref().map(SecretString::expose)
         } else {
             baseline_static_psk.as_ref().map(SecretString::expose)
-        };
-
-        let generation = {
-            let mut state = self.transactions.lock().await;
-            // The peer was admitted when it was looked up above; a reload may
-            // have removed it since. Settled under this lock, a removal wins
-            // over the reservation rather than racing it.
-            self.settle_admission(&mut state, &request.client_wg_public_key)
-                .await;
-            if matches!(
-                state.slot(&request.client_wg_public_key).state,
-                SlotState::Revoked
-            ) {
-                tracing::warn!(
-                    %transaction,
-                    peer = %peer_key,
-                    "key negotiation refused: this peer was removed from admission meanwhile"
-                );
-                return Err(PublicError::Rejected);
-            }
-            if state.replay_set.contains(&request.transaction_id) {
-                tracing::warn!(
-                    %transaction,
-                    peer = %peer_key,
-                    "key negotiation refused: transaction identifier already seen (replay)"
-                );
-                return Err(PublicError::Rejected);
-            }
-            if !state.peers.insert(request.client_wg_public_key.clone()) {
-                // The case that leaves a client stuck without either end
-                // saying so: a previous session died without closing, its
-                // transaction still holds the peer, and every new attempt is
-                // refused until that one is released.
-                tracing::warn!(
-                    %transaction,
-                    peer = %peer_key,
-                    "key negotiation refused: a transaction is already in flight for this peer — \
-                     the previous session has not been released yet"
-                );
-                return Err(PublicError::Rejected);
-            }
-            if let Some(until) = state.slot(&request.client_wg_public_key).resting_until {
-                if std::time::Instant::now() < until {
-                    state.peers.remove(&request.client_wg_public_key);
-                    tracing::warn!(
-                        %transaction,
-                        peer = %peer_key,
-                        "key negotiation refused: this peer is in the rest period a rolled-back \
-                         candidate armed"
-                    );
-                    return Err(PublicError::Rejected);
-                }
-            }
-            if in_tunnel
-                && !origin::tunnel_renewal_allowed(
-                    request.mode,
-                    &state.slot(&request.client_wg_public_key).state,
-                )
-            {
-                state.peers.remove(&request.client_wg_public_key);
-                tracing::warn!(
-                    %transaction,
-                    peer = %peer_key,
-                    mode = ?request.mode,
-                    "key negotiation refused: through the tunnel, only a committed ml_kem slot \
-                     may be renewed"
-                );
-                return Err(PublicError::Rejected);
-            }
-            state.replay_set.insert(request.transaction_id);
-            state.replay_order.push_back(request.transaction_id);
-            while state.replay_order.len() > MAX_REPLAY_IDENTIFIERS {
-                if let Some(expired) = state.replay_order.pop_front() {
-                    state.replay_set.remove(&expired);
-                }
-            }
-            // Reserved, not merely observed. Incrementing the generation and
-            // claiming the slot happen under the **same** lock that reserved
-            // the peer, so from here on every other actor — a delayed
-            // `release`, the reclaimer, a rollback from an earlier
-            // transaction — sees a generation it does not hold and a slot it
-            // does not own, and is a no-op instead of a write.
-            //
-            // Reading the generation without taking it, as this did before,
-            // left a window in which those actors still matched: they cleared
-            // the data plane under a candidate that then committed.
-            let slot = state.slot(&request.client_wg_public_key);
-            slot.generation += 1;
-            slot.resting_until = None;
-            let previous_state = std::mem::replace(&mut slot.state, SlotState::Empty);
-            slot.state = SlotState::Preparing {
-                transaction_id: request.transaction_id,
-                previous: Box::new(previous_state),
-                address: address.clone(),
-                previous_psk: previous_psk.as_ref().map(SecretString::duplicate),
-                install_attempted: false,
-            };
-            slot.generation
         };
 
         // Read **before** the candidate is posed, because the commit compares
@@ -374,7 +414,7 @@ impl NegotiationHandler for GatewayHandler {
         };
 
         let transaction_record = Transaction {
-            public_key: request.client_wg_public_key.clone(),
+            public_key: admitted_public_key.clone(),
             address: address.clone(),
             client_pq_public_key: authenticated.certificate.ml_dsa_87_public_key.clone(),
             mode: request.mode,
@@ -382,13 +422,19 @@ impl NegotiationHandler for GatewayHandler {
             generation,
             handshake_before_install,
         };
+        let learned_static_psk =
+            if request.mode == ProtectionMode::StaticPsk && current_matches_static_request {
+                previous_psk.as_ref().map(SecretString::duplicate)
+            } else {
+                None
+            };
         if let Err(error) = self
             .install_candidate(
                 request.transaction_id,
-                &request.client_wg_public_key,
+                &admitted_public_key,
                 generation,
-                address.clone(),
                 material.psk,
+                learned_static_psk,
                 transaction_record,
             )
             .await
@@ -412,15 +458,6 @@ impl NegotiationHandler for GatewayHandler {
             confirmation_timeout_s = DEFAULT_CONFIRMATION_TIMEOUT.as_secs(),
             "key negotiation prepared: PSK installed, awaiting the client's confirmation"
         );
-        if request.mode == ProtectionMode::StaticPsk && current_matches_static_request {
-            if let Some(static_psk) = previous_psk.as_ref().map(SecretString::duplicate) {
-                self.static_psks
-                    .write()
-                    .await
-                    .insert(request.client_wg_public_key.clone(), static_psk);
-            }
-        }
-
         Ok(PreparedNegotiation {
             response,
             confirmation_timeout: DEFAULT_CONFIRMATION_TIMEOUT,
@@ -518,7 +555,7 @@ impl NegotiationHandler for GatewayHandler {
             let mut state = self.transactions.lock().await;
             // A peer removed since the candidate was posed is revoked here,
             // which moves the generation: the check below then refuses.
-            self.settle_admission(&mut state, &public_key).await;
+            self.settle_admission(&mut state, &public_key).await?;
             let slot = state.slot(&public_key);
             let still_ours = slot.generation == generation
                 && matches!(
@@ -534,6 +571,14 @@ impl NegotiationHandler for GatewayHandler {
                     "confirmation refused: this peer's slot moved on since the candidate was posed"
                 );
                 return Err(PublicError::Rejected);
+            }
+            if slot.generation.checked_add(1).is_none() {
+                tracing::error!(
+                    transaction = %hex_prefix(&transaction_id),
+                    peer = %public_key,
+                    "confirmation refused: peer generation is exhausted"
+                );
+                return Err(PublicError::Internal);
             }
         }
 
@@ -554,20 +599,32 @@ impl NegotiationHandler for GatewayHandler {
         // candidate, only for this transaction's tail to overwrite the slot
         // record with its own — describing a PSK the data plane no longer
         // carried.
-        let transaction = {
+        let (transaction, committed_generation) = {
             let mut state = self.transactions.lock().await;
             // Checked again at the point of no return: a removal between the
             // check above and this lock must not end in a signed commit.
-            self.settle_admission(&mut state, &public_key).await;
+            self.settle_admission(&mut state, &public_key).await?;
+            if !state.active.contains_key(&transaction_id) {
+                return Err(PublicError::Internal);
+            }
+            let slot = state.slot(&public_key);
+            if slot.generation != generation {
+                return Err(PublicError::Internal);
+            }
+            let Some(next_generation) = slot.generation.checked_add(1) else {
+                tracing::error!(
+                    transaction = %hex_prefix(&transaction_id),
+                    peer = %public_key,
+                    "confirmation refused: peer generation is exhausted"
+                );
+                return Err(PublicError::Internal);
+            };
             let transaction = state
                 .active
                 .remove(&transaction_id)
                 .ok_or(PublicError::Internal)?;
             state.peers.remove(&transaction.public_key);
             let slot = state.slot(&transaction.public_key);
-            if slot.generation != generation {
-                return Err(PublicError::Internal);
-            }
             // Two committed states, because the two modes leave two different
             // things in the slot. `ml_kem` leaves a fresh secret this
             // transaction owns, expires and may release. `static_psk` leaves
@@ -584,14 +641,14 @@ impl NegotiationHandler for GatewayHandler {
                     bytes_baseline: None,
                 }),
             };
-            slot.generation += 1;
-            transaction
+            slot.generation = next_generation;
+            (transaction, next_generation)
         };
         tracing::info!(
             transaction = %hex_prefix(&transaction_id),
             peer = %transaction.public_key,
             mode = ?mode,
-            generation = generation + 1,
+            generation = committed_generation,
             "key negotiation committed: the floor is persisted and the slot is final"
         );
         Ok(commit)

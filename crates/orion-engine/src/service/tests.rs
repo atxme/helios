@@ -432,7 +432,31 @@ async fn about_reports_the_injected_log_path() {
         Ok(EngineReply::About(about)) => {
             assert_eq!(about.log_path, Some(log.display().to_string()));
             assert_eq!(about.version, "0.0.0-test");
+            assert_eq!(about.backend, "dry-run");
+            assert_eq!(about.profile_extension, "orion");
         }
+        other => panic!("unexpected reply: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn about_without_a_log_and_key_negotiation_reports_the_configured_provider() {
+    let scratch = Scratch::new("about-capabilities");
+    let client = client_on(&scratch).await;
+
+    match client.call(EngineCommand::AboutOrion).await {
+        Ok(EngineReply::About(about)) => {
+            assert_eq!(about.log_path, None);
+            assert_eq!(about.backend, "dry-run");
+            assert_eq!(about.profile_extension, "orion");
+        }
+        other => panic!("unexpected reply: {other:?}"),
+    }
+
+    match client.call(EngineCommand::KeyNegotiationSupport).await {
+        // The capability reports that the shell supplied an identity provider;
+        // it does not claim that a key was unsealed or hardware was exercised.
+        Ok(EngineReply::KeyNegotiation(support)) => assert!(support.identity_store),
         other => panic!("unexpected reply: {other:?}"),
     }
 }

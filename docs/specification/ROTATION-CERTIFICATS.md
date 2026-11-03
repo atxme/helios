@@ -1612,6 +1612,15 @@ paire scellée sans attendre l'expiration de la demande. Si l'ancienne clé
 privée a disparu avec le stockage DPAPI/TPM, cette procédure ne s'applique pas :
 il faut une réadmission opérateur à deux YubiKeys.
 
+Pendant la durée de vie en mémoire de l’opération Astra, un commit déjà
+confirmé par Helios peut être redemandé après une réponse perdue : seul le
+commit signé strictement identique, identifié par son empreinte canonique
+incluant les deux signatures, retourne de nouveau l’état `Committed`, sans
+nouvel envoi au gateway. Un contenu différent ou une opération expirée reste
+refusé. Ce souvenir n’est pas persistant et ne garantit pas le rejeu de
+l’opération après redémarrage d’Astra ; l’intent de réconciliation durable
+couvre séparément l’adoption de la génération déjà installée par Helios.
+
 Une seule YubiKey suffit ici parce qu'elle ne constitue pas l'unique preuve :
 la clé PQ privée de la dernière génération admise signe aussi le challenge, la
 clé WireGuard et les nouvelles clés, et la récupération ne peut changer ni le
@@ -1927,6 +1936,15 @@ Une coupure après une étape se reprend par le même `operation_id` et les mêm
 empreintes. Un octet différent sous le même identifiant est un conflit. Une
 reprise ne change ni génération, ni clés candidates et ne bascule vers le
 canal public.
+
+Avant de signer et journaliser le grant, Astra relit l’identité active, la
+révocation et la réservation exacte après les échanges réseau. Cette lecture
+et l’écriture du grant sont sérialisées avec les mutations du registre : une
+révocation déjà persistée interdit la création du grant. Si le grant a été
+persisté d’abord, une révocation ultérieure ne le remplace ni ne l’efface ; elle
+conserve sa dominance sur l’usage de l’identité. Deux polls concurrents pour
+la même autorisation réutilisent le grant déjà journalisé, sans en signer un
+second contre un autre reçu de retry.
 
 ### 8.2 Canal public Astra
 

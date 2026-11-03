@@ -182,6 +182,72 @@ fn only_a_staged_key_becomes_a_profile_key() {
     assert_eq!(kept.expect("merge").private_key, created.private_key);
 }
 
+#[test]
+fn a_staged_key_with_a_changed_public_half_is_refused_without_touching_the_stored_key() {
+    let stored = profile("poste");
+    let stored_key = stored.private_key.duplicate();
+    let staged_pair = aether::wg::generate_keypair().expect("keypair");
+    let other_pair = aether::wg::generate_keypair().expect("keypair");
+    let staged = StagedKey {
+        private_key: aether::SecretString::new(staged_pair.private_key.expose().to_owned()),
+        public_key: other_pair.public_key,
+    };
+    let mut edit = draft("poste");
+    edit.use_staged_key = true;
+
+    let error = merge_draft(edit, Some(&stored), Some(&staged), None)
+        .expect_err("the staged private key must still match the public key shown to the user");
+
+    assert!(
+        error.contains("ne correspond plus à la clé publique affichée"),
+        "{error}"
+    );
+    assert_eq!(
+        stored.private_key, stored_key,
+        "the rejected edit leaves stored identity intact"
+    );
+}
+
+#[test]
+fn an_unreadable_staged_private_key_is_refused() {
+    let staged = StagedKey {
+        private_key: aether::SecretString::new("not-a-wireguard-key"),
+        public_key: "public-key-that-cannot-match".into(),
+    };
+    let mut edit = draft("nouveau");
+    edit.use_staged_key = true;
+
+    let error = merge_draft(edit, None, Some(&staged), None)
+        .expect_err("an unreadable staged key cannot be saved");
+
+    assert!(error.contains("clé en attente illisible"), "{error}");
+    assert!(
+        !error.contains("not-a-wireguard-key"),
+        "secret leaked in error: {error}"
+    );
+}
+
+#[test]
+fn an_existing_classic_profile_cannot_be_upgraded_by_editing_its_negotiation_block() {
+    let stored = profile("poste");
+    let mut edit = draft("poste");
+    edit.key_negotiation = Some(orion_core::KeyNegotiationSettings {
+        mode: aether::key_negotiation::ProtectionMode::MlKem,
+        minimum_mode: aether::key_negotiation::ProtectionMode::MlKem,
+        endpoint: "gateway.example:51821".into(),
+        server_name: "gateway.example".into(),
+        gateway_ca_der: "Q0E=".into(),
+        gateway_pq_certificate: "Q0VSVA==".into(),
+        identity: "poste".into(),
+        trust: None,
+    });
+
+    let error = merge_draft(edit, Some(&stored), None, None)
+        .expect_err("changing the durable profile kind requires a new profile");
+
+    assert!(error.contains("classic"), "{error}");
+}
+
 /// Touching a static PSK is explicit in both directions.
 #[test]
 fn a_static_psk_is_set_or_cleared_only_on_an_explicit_intent() {

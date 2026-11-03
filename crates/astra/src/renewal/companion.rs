@@ -23,9 +23,9 @@ pub async fn read(
     if needs_refresh {
         let refreshed =
             refresh_challenge(service, &mut operations, caller, operation_id, now_unix).await?;
-        let operation = operations.get_mut(operation_id, caller, now_unix)?;
-        operation.refresh_approval_request(Box::new(refreshed))?;
-        operations.persist()?;
+        operations.update_persisted(operation_id, caller, now_unix, |operation| {
+            operation.refresh_approval_request(Box::new(refreshed))
+        })?;
     }
     let state = operations.get(operation_id, caller, now_unix)?.state;
     drop(operations);
@@ -208,10 +208,9 @@ pub async fn signer_result(
     // Recorded before anything is issued. The exact same companion document
     // can retrieve the completed operation after a lost response; different
     // bytes under this identifier can never authorize a second issuance.
-    operations
-        .get_mut(operation_id, caller, now_unix)?
-        .consume_approval(submission_fingerprint, Box::new(evidence))?;
-    operations.persist()?;
+    operations.update_persisted(operation_id, caller, now_unix, |operation| {
+        operation.consume_approval(submission_fingerprint, Box::new(evidence))
+    })?;
     drop(operations);
 
     resume_stage(service, caller, operation_id, now_unix).await?;

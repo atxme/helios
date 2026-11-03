@@ -214,11 +214,23 @@ async fn a_redirect_is_never_followed() {
 /// An environment proxy would send the release to a host the profile
 /// never named, in clear on the physical interface.
 ///
-/// The variables are set for the duration of this test only. It is the
-/// single test in this crate that touches them, and no other test here
-/// builds an HTTP client, so nothing else can observe them.
+/// A dedicated subprocess isolates proxy variables from concurrent HTTP tests.
 #[tokio::test]
 async fn an_environment_proxy_is_ignored() {
+    const CHILD: &str = "HELIOS_TEST_RELEASE_PROXY_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "key_negotiation::tests::an_environment_proxy_is_ignored",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .status()
+            .expect("isolated proxy test starts");
+        assert!(status.success(), "isolated proxy test must succeed");
+        return;
+    }
     let (proxy, proxied) = release_server(
         "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
     )

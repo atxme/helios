@@ -62,7 +62,7 @@ Read only the documents relevant to the touched area:
 * `helios-provisioning` / `aether-key-negotiation`: admission, IPAM, ML-KEM orchestration and authenticated QUIC transport.
 * `helios-api`: Axum REST/WebSocket API and embedded-web integration.
 * `helios-update` / `aether-vault` / `helios-escrow` / `helios-tpm`: signed updates, encrypted secrets, operator-held recovery and TPM support.
-* `orion-core` / `apps/orion`: portable client logic and Tauri/React desktop shell.
+* `orion-core` / `orion-engine` / `apps/orion`: portable client logic, elevated engine/state, and unprivileged Tauri/React desktop shell.
 * `heliosd`: gateway CLI and orchestration.
 * `web`: React/MUI gateway administration console.
 * `astra-signer`, `helios`, `helios-publisher`, `helios-installer`, `xtask`: operator, publisher, installer and build tooling.

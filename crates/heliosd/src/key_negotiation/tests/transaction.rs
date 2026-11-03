@@ -675,8 +675,8 @@ async fn a_rolled_back_preparation_cannot_install_its_candidate_late() {
             transaction_id,
             CLIENT_KEY,
             generation,
-            "100.64.1.2/32".into(),
             Some(SecretString::new(candidate)),
+            None,
             Transaction {
                 public_key: CLIENT_KEY.into(),
                 address: "100.64.1.2/32".into(),

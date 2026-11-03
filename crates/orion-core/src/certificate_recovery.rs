@@ -58,6 +58,9 @@ use crate::identity_store::{ClientIdentityBundle, ProtectedIdentityStore};
 /// How long one call to the public origin may take.
 const CALL_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Public Astra responses are bounded at 128 KiB (spec §8.2).
+const MAX_ANSWER_BYTES: usize = 128 * 1024;
+
 #[derive(Debug, thiserror::Error)]
 pub enum RecoveryError {
     #[error("recovery transport: {0}")]
@@ -584,10 +587,16 @@ async fn decode_response<T: serde::de::DeserializeOwned>(
             status: status.as_u16(),
         });
     }
-    let bytes = response
-        .bytes()
+    let bytes = crate::certificate_http::read_bounded(response, MAX_ANSWER_BYTES)
         .await
-        .map_err(|error| RecoveryError::Transport(error.to_string()))?;
+        .map_err(|error| match error {
+            crate::certificate_http::BodyError::TooLarge => {
+                RecoveryError::Malformed("answer exceeds the ceiling".into())
+            }
+            crate::certificate_http::BodyError::Transport(error) => {
+                RecoveryError::Transport(error.to_string())
+            }
+        })?;
     serde_json::from_slice(&bytes).map_err(|error| RecoveryError::Malformed(error.to_string()))
 }
 
@@ -889,5 +898,59 @@ mod tests {
             leaf_of(&bundle),
             Err(RecoveryError::NoHistoricalProof)
         ));
+    }
+}
+
+#[cfg(test)]
+mod http_tests {
+    use super::*;
+    use crate::certificate_http::tests::{chunked, response};
+
+    #[tokio::test]
+    async fn recovery_applies_the_public_limit_to_chunked_json() {
+        for length in [MAX_ANSWER_BYTES - 1, MAX_ANSWER_BYTES, MAX_ANSWER_BYTES + 1] {
+            let mut body = b"{}".to_vec();
+            body.resize(length, b' ');
+            let (response, server) = response(chunked(&body), false).await;
+            let result = decode_response::<serde_json::Value>(response).await;
+            server.abort();
+            if length <= MAX_ANSWER_BYTES {
+                assert_eq!(result.expect("bounded JSON"), serde_json::json!({}));
+            } else {
+                assert!(
+                    matches!(result, Err(RecoveryError::Malformed(ref reason)) if reason == "answer exceeds the ceiling")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_preserves_status_and_transport_errors_before_json_decoding() {
+        let (answer, server) = response(
+            b"HTTP/1.1 403 Forbidden\r\nContent-Length: 999999\r\n\r\n".to_vec(),
+            true,
+        )
+        .await;
+        assert!(matches!(
+            decode_response::<serde_json::Value>(answer).await,
+            Err(RecoveryError::Status { status: 403 })
+        ));
+        server.abort();
+        let (answer, server) = response(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n{".to_vec(),
+            false,
+        )
+        .await;
+        assert!(matches!(
+            decode_response::<serde_json::Value>(answer).await,
+            Err(RecoveryError::Transport(_))
+        ));
+        server.abort();
+        let (answer, server) = response(chunked(b"{"), false).await;
+        assert!(matches!(
+            decode_response::<serde_json::Value>(answer).await,
+            Err(RecoveryError::Malformed(_))
+        ));
+        server.abort();
     }
 }

@@ -653,3 +653,7 @@ mod tests {
         assert!(serde_json::from_value::<ApprovalMaterial>(value).is_err());
     }
 }
+
+#[cfg(all(test, feature = "certificate-signing"))]
+#[path = "certificate_approval/tests.rs"]
+mod verification_tests;
