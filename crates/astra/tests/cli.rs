@@ -662,6 +662,41 @@ fn bootstrap_looks_for_a_registry_only_once_it_holds_the_volume() {
     );
 }
 
+/// A write whose volume is held by a process that does not answer at the
+/// door — a console mid-write, or a service that has not opened its socket —
+/// is refused by name, and the registry is left as it was.
+#[test]
+fn a_write_while_a_mute_process_holds_the_volume_is_refused() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    assert!(bootstrap(directory.path(), &ca_public_key())
+        .status
+        .success());
+    let _held = astra::door::VolumeLock::try_acquire(directory.path())
+        .expect("lockable")
+        .expect("the test holds the volume");
+    let before = snapshot(directory.path());
+
+    let output = astra(
+        directory.path(),
+        &["pin-ca-tls", "--fingerprint", &"ab".repeat(32)],
+    );
+    assert!(!output.status.success(), "the write went through");
+    let printed = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        printed.contains(
+            "un autre processus tient le volume, et le service Astra n'y répond pas : rien \
+             n'a été écrit"
+        ),
+        "the refusal names the held volume: {printed}"
+    );
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        snapshot(directory.path()),
+        before,
+        "the registry is left byte for byte"
+    );
+}
+
 /// The opening reaches the running service: the identifier comes back, and a
 /// second identical opening is refused because the first one is in the
 /// service's own store.
