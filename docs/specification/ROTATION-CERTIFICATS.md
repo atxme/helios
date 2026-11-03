@@ -299,7 +299,12 @@ demander est une donnée de la porte, testée ligne par ligne :
 Élargir le tunnel à une action est un changement explicite de cette table, pas
 un effet de bord.
 
-**Bornes.** `reason` et `requested_by` non vides ; fenêtre de 1 à 300 s, 300
+**Bornes.** `reason` et `requested_by` non vides, de 1 024 et 256 caractères
+au plus, sans saut de ligne, caractère de contrôle (`Cc`) ni caractère de mise
+en forme (`Cf` : marques bidirectionnelles, caractères de largeur nulle), pour
+que l'opérateur lise exactement ce qui est écrit et que l'identité ajoutée par
+le tunnel reste visible ; un texte refusé l'est par la console en clair et par
+le tunnel en `400` grossier ; fenêtre de 1 à 300 s, 300
 par défaut ; au moins une cible et au plus 256 ; coffre chiffré exigé pour une
 portée qui l'ouvre ; **une opération vivante par famille**, et
 pour une révocation une par identité visée, afin que deux postes volés dans la

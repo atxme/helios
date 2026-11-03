@@ -25,6 +25,21 @@ use crate::signing::SigningOperation;
 /// capturing.
 pub const MAX_OPENING_WINDOW_SECS: u64 = 300;
 
+/// The longest requester an opening may carry, in characters.
+///
+/// A name, read on the ceremony screen before the touch. Through the tunnel
+/// the door appends the identity it resolved (`— pair wireguard:<key>`), and
+/// a requester long enough to push that suffix out of view would be a way to
+/// hide it.
+pub const MAX_REQUESTED_BY_CHARS: usize = 256;
+
+/// The longest motive an opening may carry, in characters.
+///
+/// A paragraph at most. It is read before the touch, and it travels in every
+/// view of the operation: padded to the tunnel's request bound, it would push
+/// an operation listing past the ceiling of the tunnel's answers.
+pub const MAX_REASON_CHARS: usize = 1024;
+
 /// What the signed companion request names when no vault is held.
 ///
 /// Only a scope that makes a master key sign has the companion fetch the
@@ -81,14 +96,75 @@ impl Resolved {
 
 /// The bounds on what the operator reads, checked before anything is resolved
 /// or dialed.
+///
+/// The same for every connector: this is the door. The motive and the
+/// requester are shown before the touch, the requester with the tunnel's
+/// resolved identity after it, so neither may be empty, long enough to push
+/// what follows out of view, or carry a character that is not read as
+/// written.
 pub(super) fn check_text(text: &OpeningText) -> Result<(), DoorRefusal> {
     if text.reason.trim().is_empty() || text.requested_by.trim().is_empty() {
         return Err(DoorRefusal::TextMissing);
+    }
+    if text.reason.chars().count() > MAX_REASON_CHARS
+        || text.requested_by.chars().count() > MAX_REQUESTED_BY_CHARS
+    {
+        return Err(DoorRefusal::TextTooLong);
+    }
+    if text
+        .reason
+        .chars()
+        .chain(text.requested_by.chars())
+        .any(misleads_the_reader)
+    {
+        return Err(DoorRefusal::TextUnprintable);
     }
     if text.window_secs == 0 || text.window_secs > MAX_OPENING_WINDOW_SECS {
         return Err(DoorRefusal::WindowOutOfRange);
     }
     Ok(())
+}
+
+/// Whether a character changes what the operator reads without being seen.
+///
+/// Controls (`Cc`) break or erase the line; the line and paragraph separators
+/// break it too; format characters (`Cf`) reorder the text around them
+/// (U+202E) or are invisible (U+200B), so a requester could end in what looks
+/// like another peer's identity.
+fn misleads_the_reader(character: char) -> bool {
+    character.is_control() || matches!(character, '\u{2028}' | '\u{2029}') || is_format(character)
+}
+
+/// Unicode general category `Cf`, as of Unicode 16.0.
+///
+/// `char` knows `Cc` (`is_control`) but no other category, and no crate of
+/// the workspace exposes them; the category is short and rarely extended, so
+/// it is spelled out here rather than bought with a dependency.
+fn is_format(character: char) -> bool {
+    matches!(
+        character,
+        '\u{AD}'
+            | '\u{600}'..='\u{605}'
+            | '\u{61C}'
+            | '\u{6DD}'
+            | '\u{70F}'
+            | '\u{890}'..='\u{891}'
+            | '\u{8E2}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{110BD}'
+            | '\u{110CD}'
+            | '\u{13430}'..='\u{1343F}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0001}'
+            | '\u{E0020}'..='\u{E007F}'
+    )
 }
 
 /// Opens one campaign over the targets `resolve` reads from the registry.

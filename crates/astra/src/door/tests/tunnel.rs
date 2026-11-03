@@ -155,6 +155,47 @@ async fn a_tunnel_open_of_a_console_action_is_refused_coarsely() {
     assert!(!plan_path(dir.path()).exists());
 }
 
+/// A text the door refuses is the caller's own malformed input: the tunnel
+/// answers it as a coarse `400`, like an empty one.
+#[tokio::test]
+async fn a_tunnel_open_with_a_hidden_character_is_refused_coarsely() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture(dir.path());
+    let listener = listen(Arc::clone(&service)).await;
+
+    for (reason, requested_by) in [
+        (
+            "quarterly rotation".to_string(),
+            "alice\u{202E}".to_string(),
+        ),
+        ("a".repeat(MAX_REASON_CHARS + 1), "alice".to_string()),
+    ] {
+        let body = serde_json::to_vec(&RelayedOperatorOpen {
+            operator: administrator(),
+            request: OperatorOpenRequest {
+                action: OperatorOpenAction::FleetLeafs,
+                reason,
+                requested_by,
+                window_secs: 300,
+            },
+        })
+        .expect("relayed opening");
+        let (status, answer) = post_open(&listener, &body).await;
+        assert_eq!(status, 400);
+        assert!(
+            coarse(&answer, ServiceError::Protocol),
+            "{}",
+            String::from_utf8_lossy(&answer)
+        );
+    }
+    assert!(service
+        .signing
+        .lock()
+        .await
+        .pending(wall_clock())
+        .is_empty());
+}
+
 /// A refusal at the door crosses back as its class; the sentence that says
 /// which campaign is already open stays in the service log.
 #[tokio::test]

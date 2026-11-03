@@ -65,7 +65,7 @@ use crate::signing::SigningError;
 
 pub use lock::{VolumeLock, VolumeWrites, VolumeWritesHeld, VOLUME_LOCK_FILE};
 use open::Resolved;
-pub use open::MAX_OPENING_WINDOW_SECS;
+pub use open::{MAX_OPENING_WINDOW_SECS, MAX_REASON_CHARS, MAX_REQUESTED_BY_CHARS};
 
 /// The service's Unix socket in the state volume, the console's connector.
 pub const DOOR_SOCKET_FILE: &str = "operator.sock";
@@ -358,6 +358,17 @@ pub enum DoorRefusal {
          l'autre ne peut être vide"
     )]
     TextMissing,
+    #[error(
+        "le motif est borné à {MAX_REASON_CHARS} caractères et le demandeur à \
+         {MAX_REQUESTED_BY_CHARS} : rien n'a été ouvert"
+    )]
+    TextTooLong,
+    #[error(
+        "le motif et le demandeur ne peuvent contenir ni saut de ligne, ni caractère de contrôle, \
+         ni caractère de mise en forme invisible : l'opérateur doit lire avant le toucher \
+         exactement ce qui est écrit, et rien n'a été ouvert"
+    )]
+    TextUnprintable,
     #[error("la fenêtre d'une campagne doit être comprise entre 1 et {MAX_OPENING_WINDOW_SECS} s")]
     WindowOutOfRange,
     #[error(
@@ -460,7 +471,10 @@ impl DoorRefusal {
     /// policy, uniqueness, targets, vault — is the same indistinct refusal.
     pub fn class(&self) -> ServiceError {
         match self {
-            Self::TextMissing | Self::WindowOutOfRange => ServiceError::Protocol,
+            Self::TextMissing
+            | Self::TextTooLong
+            | Self::TextUnprintable
+            | Self::WindowOutOfRange => ServiceError::Protocol,
             Self::NotAllowedHere
             | Self::AlreadyOpen { .. }
             | Self::NoTarget

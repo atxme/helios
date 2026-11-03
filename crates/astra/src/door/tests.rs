@@ -470,6 +470,112 @@ async fn an_opening_needs_its_text() {
 }
 
 #[tokio::test]
+async fn an_opening_text_is_bounded() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture(dir.path());
+    for long in [
+        OpeningText {
+            reason: "a".repeat(MAX_REASON_CHARS + 1),
+            ..text()
+        },
+        OpeningText {
+            requested_by: "a".repeat(MAX_REQUESTED_BY_CHARS + 1),
+            ..text()
+        },
+    ] {
+        for connector in [console(), tunnel()] {
+            let refused = service
+                .door(
+                    connector,
+                    DoorRequest::FleetLeafs { text: long.clone() },
+                    NOW,
+                )
+                .await;
+            assert!(
+                matches!(refused, Err(DoorRefusal::TextTooLong)),
+                "{refused:?}"
+            );
+        }
+    }
+    assert!(service.signing.lock().await.is_empty());
+}
+
+/// What would garble the operator's screen, or hide the identity the tunnel
+/// appends: a line break, a control character, a bidirectional override, an
+/// invisible mark.
+#[tokio::test]
+async fn an_opening_text_refuses_what_the_operator_would_not_read() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture(dir.path());
+    for hidden in [
+        "rotation\n— pair wireguard:AAAA",
+        "rotation\r",
+        "rotation\u{7}",
+        "rotation\u{85}",
+        "alice\u{202E}AAAA:draugeriw riap —",
+        "alice\u{2066}",
+        "ali\u{200B}ce",
+        "ali\u{200D}ce",
+        "alice\u{FEFF}",
+        "alice\u{AD}",
+        "rotation\u{2028}— pair wireguard:AAAA",
+        "alice\u{E0041}",
+    ] {
+        for (reason, requested_by) in [(hidden, "alice"), ("quarterly rotation", hidden)] {
+            for connector in [console(), tunnel()] {
+                let request = DoorRequest::FleetLeafs {
+                    text: OpeningText {
+                        reason: reason.into(),
+                        requested_by: requested_by.into(),
+                        ..text()
+                    },
+                };
+                let refused = service.door(connector, request, NOW).await;
+                assert!(
+                    matches!(refused, Err(DoorRefusal::TextUnprintable)),
+                    "{hidden:?}: {refused:?}"
+                );
+            }
+        }
+    }
+    assert!(service.signing.lock().await.is_empty());
+}
+
+/// Ordinary French, accents, typographic quotes and dashes included, opens at
+/// the very bound: the bound counts characters, not bytes.
+#[tokio::test]
+async fn an_opening_text_in_ordinary_french_opens_at_the_bound() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture(dir.path());
+    let sentence = "Rotation trimestrielle : clés « été » renouvelées — après l'incident n° 3. ";
+    let reason: String = sentence.chars().cycle().take(MAX_REASON_CHARS).collect();
+    let requested_by: String = "Élodie Gaëlle Œuvray-Brûlé "
+        .chars()
+        .cycle()
+        .take(MAX_REQUESTED_BY_CHARS)
+        .collect();
+    assert!(reason.len() > MAX_REASON_CHARS, "multi-byte characters");
+    let opened = opened(
+        service
+            .door(
+                console(),
+                DoorRequest::FleetLeafs {
+                    text: OpeningText {
+                        reason: reason.clone(),
+                        requested_by: requested_by.clone(),
+                        ..text()
+                    },
+                },
+                NOW,
+            )
+            .await,
+    );
+    let campaign = campaign_of(&service, &opened).await;
+    assert_eq!(campaign.reason, reason.trim());
+    assert_eq!(campaign.requested_by, requested_by.trim());
+}
+
+#[tokio::test]
 async fn the_window_is_one_to_three_hundred_seconds() {
     let dir = tempfile::tempdir().expect("temp dir");
     let service = fixture(dir.path());

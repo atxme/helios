@@ -53,6 +53,12 @@ réponse, comme avant. D'où trois règles :
 
 `status` et `chain status` restent des lectures, service arrêté ou non.
 
+Le motif (`--reason`) et le demandeur (`--requested-by`) tiennent sur une
+ligne : 1 024 et 256 caractères au plus, sans caractère de contrôle ni de mise
+en forme invisible (marques bidirectionnelles, largeur nulle). Les accents et
+la ponctuation française passent ; le reste est refusé, quel que soit le
+connecteur.
+
 Trois ouvertures se font aussi **depuis un poste administrateur du tunnel**,
 sans entrer dans le conteneur : `fleet_leafs` (§2), `trust_authorities` (§3,
 §9) et la révocation d'un client (§7), par `POST
