@@ -86,8 +86,11 @@ Dans cet ordre, une ligne par action, avec son état et un bouton :
 | Remplacer la CA TLS | expiration, « 2 clés », ou date de fin d'une rotation en cours | Remplacer |
 
 Une ligne à faire passe en premier et se distingue visuellement. Une action
-impossible (une rotation de même nature déjà en cours) a son bouton désactivé et dit
-pourquoi en quelques mots. Les données viennent de `GET /api/certificates`
+impossible a son bouton désactivé et dit pourquoi en quelques mots. **Une seule rotation
+de CA à la fois** : pendant le recouvrement de l'une, les deux boutons « Remplacer » sont
+désactivés. Pendant un recouvrement CA-PQ, le coffre est déjà sous la nouvelle ancre alors
+qu'Astra et la gateway vérifient sous l'ancienne : une transition CA TLS y serait refusée
+après les touchers. Renouveler les postes reste possible. Les données viennent de `GET /api/certificates`
 (`CertificateDomainView` : `peers[].not_after`, `client_tls_ca_transition_pending`,
 `ca_retire_active_at`, `next_ca_fingerprint`…), du coffre local et du journal de
 rotation (§5.4). Style : palette et composants existants d'Orion.
@@ -105,7 +108,7 @@ n'est ouvert et l'étape suivante est désactivée.
 | Service Astra | la même lecture ne répond pas `503` |
 | Coffre présent | `VaultOverview` |
 | Deux clés enregistrées (rotations de CA) | `VaultOverview.slots`, `credentials_complete` |
-| Domaine concordant | l'ancre du coffre et celle de `CertificateDomainView` sont les mêmes |
+| Domaine concordant | l'ancre du coffre est celle de `CertificateDomainView`, ou sa suivante (`next_ca_fingerprint`) pendant un recouvrement CA-PQ |
 
 **2. Clés** (rotations de CA ; décidé par l'utilisateur le 4 novembre 2026). Chaque
 clé est validée avant toute opération, l'une après l'autre, et l'écran montre l'état de
@@ -118,10 +121,12 @@ chacune :
 
 La validation prouve que la clé ouvre le coffre (`prove_key_opens`, déjà utilisé par
 « Vérifier une clé »). Aucune campagne n'existe encore : tant que les deux ne sont pas
-validées, rien n'est ouvert. **Aucun toucher de plus au total** : l'ouverture du coffre
-obtenue à la validation est gardée en mémoire jusqu'à la signature, ce qui remplace le
-toucher d'ouverture de la cérémonie. Il reste un toucher d'approbation par clé, qui ne peut
-pas être avancé puisqu'il porte sur le défi de la campagne. Ces ouvertures vivent dans le
+validées, rien n'est ouvert. **Aucun toucher de plus au total, mais un changement de clé de
+plus** : l'ouverture du coffre obtenue à la validation est gardée en mémoire jusqu'à la
+signature, ce qui remplace le toucher d'ouverture de la cérémonie. Il reste un toucher
+d'approbation par clé, qui ne peut pas être avancé puisqu'il porte sur le défi de la
+campagne. Quatre touchers donc, comme aujourd'hui, mais la clé 1 doit revenir après la clé 2,
+alors qu'`astra-signer` fait les deux gestes de chaque clé sans la débrancher. Ces ouvertures vivent dans le
 processus de la cérémonie, effacées à son abandon, à son échec, à sa fin, ou après cinq
 minutes sans suite ; `astra-signer` les garde déjà ainsi le temps de la seconde clé.
 
@@ -132,12 +137,16 @@ qu'une clé.
 **3. Approbation.** Récapitulatif : action, motif (pré-rempli, modifiable), durées
 par défaut. Les durées (préparation 7 jours, recouvrement 30 jours, validité CA TLS
 1825 jours) sont repliées derrière « Modifier ». Le bouton « Approuver » ouvre alors
-la campagne (§5.2), affiche le manifeste vérifié et enchaîne les touchers d'approbation, en
-demandant de rebrancher chaque clé validée. **La campagne s'ouvre à ce clic et non avant**, parce qu'elle expire en cinq
-minutes. L'empreinte de la CA-PQ entrante reste montrée, c'est le contrôle du §9.1.
+la campagne (§5.2), affiche le manifeste vérifié et enchaîne les touchers d'approbation.
+**La campagne s'ouvre à ce clic et non avant**, parce qu'elle expire en cinq minutes.
+L'approbation accepte les clés validées **dans n'importe quel ordre**, pour que la clé 2,
+encore branchée, réponde d'abord : sous Windows, WebAuthn répond avec la clé présente et
+non celle que l'on attend (`ca_tls_rotation.rs`). Seuls les credentials validés sont proposés,
+et la réponse est rapprochée de l'ouverture correspondante ; une autre clé est refusée. L'empreinte de la CA-PQ entrante reste montrée, c'est le contrôle du §9.1.
 
 **4. Suivi.** La liste des étapes franchies et de la suivante : signée, déposée,
-installée sur la gateway, fin de recouvrement. Fermer Orion ne perd rien.
+installée sur la gateway, fin de recouvrement, avec la date limite d'installation tant
+qu'elle n'est pas faite. Fermer Orion ne perd rien, dans les limites du §5.4.
 
 ### 5.2 Ouverture
 
@@ -168,9 +177,25 @@ La décision est écrite avant d'être annoncée, comme aujourd'hui, à côté d
 (`astra_operator::prepared`, journal CA-PQ). Ce journal doit désormais conserver la
 transition elle-même jusqu'à ce que la gateway ait confirmé l'installation : sans
 fichier `--out`, c'est la seule copie. Il porte quatre états, reprenables dans
-l'ordre sans redemander de clé : signé, déposé auprès d'Astra, installé sur la
-gateway, terminé. Le dépôt et l'installation sont idempotents : Astra traite un
-résultat identique comme le même, la gateway répond `already_present`.
+l'ordre : signé, déposé auprès d'Astra, installé sur la gateway, terminé. Le dépôt et
+l'installation sont idempotents : Astra traite un résultat identique comme le même, la
+gateway répond `already_present`.
+
+Deux délais bornent cette reprise :
+
+- **Dépôt, cinq minutes.** L'idempotence d'Astra ne vaut que dans la fenêtre de la campagne :
+  passé ce délai, ou après un redémarrage d'Astra qui perd l'opération, le dépôt est refusé.
+  La reprise sans clé n'est donc garantie que dans la fenêtre. Au-delà, « Reprendre » ouvre
+  une nouvelle campagne qui porte **le même objet signé**, et demande une approbation par clé ;
+  le coffre n'est pas rouvert et rien n'est re-signé. La fenêtre de cinq minutes d'Astra ne
+  change pas. Le constructeur vérifie que la campagne couvre bien cet objet
+  (`covers_authority_object`) ; si ce n'est pas le cas, retour au concepteur avant d'aller plus loin.
+- **Installation, sept jours par défaut.** La gateway refuse une transition une fois
+  `activation_at` passé. Orion installe juste après le dépôt, affiche cette date dans le suivi et
+  ne dépose plus rien si elle est passée. Une rotation qui la manque passe à l'état « Délai
+  dépassé », avec l'action à mener. Ce lot ne construit pas d'abandon : le constructeur documente
+  la réparation existante pour chaque CA, ou signale qu'il n'y en a pas. Pour la CA-PQ, le risque
+  est un domaine coupé en deux à `not_after` : Astra avance seule, la gateway reste sur l'ancienne.
 
 ### 5.5 Installation sur la gateway
 
@@ -222,7 +247,8 @@ pas fait.
 ## 7. Tests et recette
 
 - **Rust** : une clé validée n'est pas redemandée pour ouvrir le coffre, ouverture effacée à
-  l'abandon ; chaque état du journal et sa reprise, y compris un arrêt entre chaque étape ;
+  l'abandon ; approbation dans les deux ordres, clé non validée refusée ; dépôt après expiration
+  de la campagne, repris par une nouvelle approbation sans re-signature ; date d'installation passée ; chaque état du journal et sa reprise, y compris un arrêt entre chaque étape ;
   aucune clé redemandée à la reprise ; refus d'une seconde rotation ; route CA TLS (`403`,
   corps illisible, objet mal signé, idempotence) ; `pending` aux bornes ; 429 relayé.
 - **IHM** (Vitest, comme `ApprovalsPanel.test.tsx`) : ordre des lignes, ligne à faire en tête,
@@ -251,4 +277,6 @@ avec `ca_rotation` : la corriger si elle est périmée.
 *Choix du concepteur, à relire :* troncature de `pending` à 128 caractères plutôt qu'une
 pagination ; ordre dépôt puis installation, repris d'aujourd'hui ; contrôles de prérequis du
 §5.1 ; route CA TLS plutôt qu'une distribution par Astra ; ouverture du coffre gardée en mémoire
-entre validation et signature pour ne pas ajouter de toucher.
+entre validation et signature pour ne pas ajouter de toucher ; approbation dans n'importe quel
+ordre ; une seule rotation de CA à la fois ; reprise d'un dépôt expiré par une nouvelle
+approbation ; « Délai dépassé » sans abandon construit dans ce lot.
