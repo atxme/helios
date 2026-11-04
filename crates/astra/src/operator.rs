@@ -36,11 +36,12 @@ use std::sync::Arc;
 
 use aether::certificates::encoding::{Fingerprint, Id16};
 use astra_channel::{
-    OperatorAuthorityStatus, OperatorIdentity, OperatorIssuerStatus, RelayedOperatorCampaign,
-    RelayedOperatorOpen, RelayedOperatorSignerResult, MAX_OPERATOR_RELAY_BODY_BYTES,
-    OPERATOR_OPEN_ROUTE, OPERATOR_OPERATION_ROUTE, OPERATOR_PENDING_ROUTE,
-    OPERATOR_SIGNER_REQUEST_ROUTE, OPERATOR_SIGNER_RESULT_ROUTE, OPERATOR_STATUS_ROUTE,
-    OPERATOR_VAULT_ROUTE,
+    OperatorAuthorityStatus, OperatorIdentity, OperatorIssuerStatus, OperatorVaultCopied,
+    RelayedOperatorCampaign, RelayedOperatorOpen, RelayedOperatorSignerResult,
+    RelayedOperatorVaultCopy, MAX_OPERATOR_RELAY_BODY_BYTES,
+    MAX_OPERATOR_VAULT_COPY_RELAY_BODY_BYTES, OPERATOR_OPEN_ROUTE, OPERATOR_OPERATION_ROUTE,
+    OPERATOR_PENDING_ROUTE, OPERATOR_SIGNER_REQUEST_ROUTE, OPERATOR_SIGNER_RESULT_ROUTE,
+    OPERATOR_STATUS_ROUTE, OPERATOR_VAULT_COPY_ROUTE, OPERATOR_VAULT_ROUTE,
 };
 use axum::{
     extract::{rejection::JsonRejection, DefaultBodyLimit, Path, State},
@@ -49,13 +50,13 @@ use axum::{
     Json, Router,
 };
 
-use crate::door::{DoorConnector, DoorOutcome};
+use crate::door::{DoorConnector, DoorOutcome, DoorRequest};
 use crate::service::{
     operator_encrypted_vault, operator_operation, operator_signer_request, operator_signer_result,
     AstraService, ServiceError,
 };
 
-/// The seven private operator routes, for the listener of §8.3 to merge.
+/// The eight private operator routes, for the listener of §8.3 to merge.
 pub fn private_routes() -> Router<Arc<AstraService>> {
     Router::new()
         .route(
@@ -67,6 +68,12 @@ pub fn private_routes() -> Router<Arc<AstraService>> {
         .route(OPERATOR_OPERATION_ROUTE, post(operation))
         .route(OPERATOR_SIGNER_REQUEST_ROUTE, post(signer_request))
         .route(OPERATOR_VAULT_ROUTE, post(vault))
+        .route(
+            OPERATOR_VAULT_COPY_ROUTE,
+            post(vault_copy).layer(DefaultBodyLimit::max(
+                MAX_OPERATOR_VAULT_COPY_RELAY_BODY_BYTES,
+            )),
+        )
         .route(
             OPERATOR_SIGNER_RESULT_ROUTE,
             post(signer_result).layer(DefaultBodyLimit::max(MAX_OPERATOR_RELAY_BODY_BYTES)),
@@ -334,5 +341,82 @@ async fn open(
             refuse(&operator, "open", ServiceError::Internal)
         }
         Err(refusal) => refuse(&operator, "open", refusal.class()),
+    }
+}
+
+/// Replaces the vault copy, and the credential document when one travels with
+/// it, for an administrator relayed from the tunnel (§5.9).
+///
+/// The door decides and writes; this carries the request in and the
+/// fingerprint back. Spawned like the opening, for the same reason: a dropped
+/// connection must not release the volume gate while a file is being written.
+/// What is logged is the operator and the fingerprint, never the content.
+async fn vault_copy(
+    State(service): State<Arc<AstraService>>,
+    relayed: Result<Json<RelayedOperatorVaultCopy>, JsonRejection>,
+) -> Response {
+    use base64::Engine as _;
+
+    let Json(relayed) = match relayed {
+        Ok(relayed) => relayed,
+        Err(rejection) => {
+            tracing::warn!(
+                route = "vault-copy",
+                %rejection,
+                "private operator route refused an unreadable vault copy"
+            );
+            // The one rejection with a meaning of its own: a body over the
+            // bound, which the sender can tell apart from a malformed one.
+            if rejection.status() == axum::http::StatusCode::PAYLOAD_TOO_LARGE {
+                return rejection.status().into_response();
+            }
+            return ServiceError::Protocol.into_response();
+        }
+    };
+    let operator = relayed.operator;
+    let Ok(vault) =
+        base64::engine::general_purpose::STANDARD.decode(relayed.copy.vault_base64.as_bytes())
+    else {
+        return refuse(&operator, "vault-copy", ServiceError::Protocol);
+    };
+    let connector = DoorConnector::Tunnel {
+        operator: operator.clone(),
+    };
+    let copy = tokio::spawn({
+        let service = Arc::clone(&service);
+        let request = DoorRequest::VaultCopy {
+            vault: vault.into(),
+            credentials: relayed.copy.credentials,
+        };
+        async move { service.door(connector, request, now_unix()).await }
+    })
+    .await;
+    let copy = match copy {
+        Ok(copy) => copy,
+        Err(error) => {
+            tracing::error!(operator = %operator, %error, "the door task did not finish");
+            return refuse(&operator, "vault-copy", ServiceError::Internal);
+        }
+    };
+    match copy {
+        Ok(DoorOutcome::VaultCopied {
+            fingerprint,
+            credential_registry_epoch,
+        }) => (
+            axum::http::StatusCode::OK,
+            Json(OperatorVaultCopied {
+                fingerprint,
+                credential_registry_epoch,
+            }),
+        )
+            .into_response(),
+        Ok(_) => {
+            tracing::error!(
+                operator = %operator,
+                "the door answered a vault copy with something other than a copy"
+            );
+            refuse(&operator, "vault-copy", ServiceError::Internal)
+        }
+        Err(refusal) => refuse(&operator, "vault-copy", refusal.class()),
     }
 }

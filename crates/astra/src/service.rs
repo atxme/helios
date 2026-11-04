@@ -228,6 +228,43 @@ impl SourceBudget {
     }
 }
 
+/// The signed credential decisions of the domain, as the companion emits them.
+///
+/// It holds no secret: every row is public and signed by `CA-PQ`, which is why
+/// it can travel by hand, or through the tunnel, at all.
+pub const CREDENTIALS_FILE: &str = "astra-credentials.json";
+
+/// The encrypted authority vault, as the companion wrote it.
+///
+/// Astra transports and backs it up; it does not open it, and nothing in this
+/// container can — the key-slots unwrap under a FIDO2 `hmac-secret` output
+/// that never leaves the operator's token.
+pub const VAULT_FILE: &str = "authority-vault.json";
+
+/// The vault copy a replacement displaced, kept beside it.
+///
+/// One generation only: it limits what a replaced backup costs, it does not
+/// make the replacement reversible.
+pub const PREVIOUS_VAULT_FILE: &str = "authority-vault.previous.json";
+
+/// Checks a credential document under the `CA-PQ` and epochs the registry pins.
+///
+/// Shared by start-up, the adoption of a rotated document and the copy an
+/// administrator sends: the three must agree on what a valid document is.
+pub fn verify_credentials(
+    document: &aether::certificates::approval::CredentialRegistry,
+    registry: &AstraRegistry,
+) -> Result<(), aether::certificates::CertificateError> {
+    let state = registry.state();
+    document.verify(
+        &state.ca_public_key,
+        &state.trust_domain_id,
+        &state.gateway_wg_public_key,
+        state.ca_epoch,
+        state.credential_registry_epoch,
+    )
+}
+
 /// The approval credentials Astra serves, replaced whole.
 pub struct ApprovalCredentials {
     /// Read from the signed credential document the companion emits, and

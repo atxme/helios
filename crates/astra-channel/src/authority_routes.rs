@@ -49,6 +49,9 @@ pub const OPERATOR_PENDING_ROUTE: &str = "/internal/v1/operator/pending";
 /// What Astra reports of its authority state. A read: no capability token,
 /// none minted.
 pub const OPERATOR_STATUS_ROUTE: &str = "/internal/v1/operator/status";
+/// Replaces the encrypted vault copy, and optionally the credential document,
+/// for an administrator relayed from the tunnel (spec §5.9).
+pub const OPERATOR_VAULT_COPY_ROUTE: &str = "/internal/v1/operator/vault-copy";
 /// Opens a campaign for an administrator relayed from the tunnel. Carries no
 /// capability token: opening grants nothing, the operator's credential does.
 pub const OPERATOR_OPEN_ROUTE: &str = "/internal/v1/operator/campaigns";
@@ -76,6 +79,31 @@ pub const MAX_OPERATOR_REQUEST_BYTES: usize = 64 * 1024;
 /// public bound without making a valid boundary-sized result impossible to
 /// relay.
 pub const MAX_OPERATOR_RELAY_BODY_BYTES: usize = MAX_OPERATOR_REQUEST_BYTES + 256;
+
+/// Largest vault copy accepted, in decoded bytes.
+///
+/// Twice the 128 KiB Astra serves a vault under ([`MAX_OPERATOR_ANSWER_BYTES`]):
+/// a copy a companion could not then download would be a copy that breaks the
+/// next ceremony, so nothing larger than what the download can carry is worth
+/// accepting, and the margin is for the key-slots a vault may grow.
+pub const MAX_OPERATOR_VAULT_COPY_BYTES: usize = 256 * 1024;
+
+/// Room kept for the credential document that may travel with the vault.
+const MAX_OPERATOR_VAULT_COPY_CREDENTIALS_BYTES: usize = 128 * 1024;
+
+/// Largest body of the vault copy on the gateway's route and in the relay.
+///
+/// Its own bound, and not [`MAX_OPERATOR_RELAY_BODY_BYTES`]: the vault travels
+/// in base64, a third larger than its bytes, and carries the credential
+/// document beside it. The 1 KiB left over is the JSON envelope.
+pub const MAX_OPERATOR_VAULT_COPY_BODY_BYTES: usize = MAX_OPERATOR_VAULT_COPY_BYTES.div_ceil(3) * 4
+    + MAX_OPERATOR_VAULT_COPY_CREDENTIALS_BYTES
+    + 1024;
+
+/// Largest private body carrying a vault copy: the public one, plus the
+/// gateway-resolved operator identity and the field name around it.
+pub const MAX_OPERATOR_VAULT_COPY_RELAY_BODY_BYTES: usize =
+    MAX_OPERATOR_VAULT_COPY_BODY_BYTES + 256;
 
 /// Administrator identity established from the request's WireGuard source.
 ///
@@ -137,6 +165,39 @@ pub struct RelayedOperatorSignerResult {
 pub struct RelayedOperatorOpen {
     pub operator: OperatorIdentity,
     pub request: OperatorOpenRequest,
+}
+
+/// What an administrator sends to replace Astra's vault copy (spec §5.9).
+///
+/// The vault stays encrypted: this carries bytes neither the gateway nor Astra
+/// can open. The credential document, when present, is signed under `CA-PQ`
+/// and Astra verifies it itself before taking it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorVaultCopy {
+    pub vault_base64: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credentials: Option<Box<aether::certificates::approval::CredentialRegistry>>,
+}
+
+/// What Astra holds after a vault copy, for Orion to read back.
+///
+/// `credential_registry_epoch` has the meaning it has in
+/// [`OperatorAuthorityStatus`]: `None` when no document is served.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorVaultCopied {
+    pub fingerprint: Fingerprint,
+    pub credential_registry_epoch: Option<u64>,
+}
+
+/// What the gateway relays for a vault copy: the administrator it resolved,
+/// for the structured log, and the copy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelayedOperatorVaultCopy {
+    pub operator: OperatorIdentity,
+    pub copy: OperatorVaultCopy,
 }
 
 /// The two operator shapes both ends parse, defined once in `aether`.

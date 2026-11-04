@@ -213,6 +213,15 @@ impl OperatorCampaignRelay for SpyCampaign {
         }
     }
 
+    async fn vault_copy(
+        &self,
+        operator: &astra_channel::OperatorIdentity,
+        _copy: astra_channel::OperatorVaultCopy,
+    ) -> Result<astra_channel::OperatorVaultCopied, TrustUpdateRefusal> {
+        *self.seen.lock().unwrap() = Some(operator.clone());
+        Err(TrustUpdateRefusal::Rejected)
+    }
+
     async fn open(
         &self,
         operator: &astra_channel::OperatorIdentity,

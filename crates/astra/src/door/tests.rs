@@ -19,6 +19,7 @@ use crate::service::{SourceBudget, MAX_LIVE_CHALLENGES};
 use crate::AuditEvent;
 
 mod tunnel;
+mod vault_copy;
 
 /// The instant every test opens at.
 const NOW: u64 = 1_000_000;
@@ -84,7 +85,17 @@ fn build_service(
     ca_tls: Option<Fingerprint>,
     gateway: Option<crate::gateway::GatewayChannel>,
 ) -> AstraService {
-    let (_, ca_public_key) = generate_ml_dsa_87_keypair().expect("CA-PQ keypair");
+    build_service_with_ca(dir, ca_tls, gateway).0
+}
+
+/// The same authority, with the private half of its `CA-PQ` for a test that
+/// has to sign a document under it.
+fn build_service_with_ca(
+    dir: &Path,
+    ca_tls: Option<Fingerprint>,
+    gateway: Option<crate::gateway::GatewayChannel>,
+) -> (AstraService, zeroize::Zeroizing<Vec<u8>>) {
+    let (ca_private_key, ca_public_key) = generate_ml_dsa_87_keypair().expect("CA-PQ keypair");
     let (service_private_key, service_public_key) =
         generate_ml_dsa_87_keypair().expect("service keypair");
     let trust_domain_id = TrustDomainId::new([1; 16]).expect("domain");
@@ -131,7 +142,7 @@ fn build_service(
     for (name, seed) in PEERS {
         registry.admit(peer(name, seed), NOW - 80).expect("admit");
     }
-    AstraService {
+    let service = AstraService {
         state_dir: dir.to_path_buf(),
         registry: Mutex::new(registry),
         issuer: RwLock::new(None),
@@ -154,7 +165,8 @@ fn build_service(
         encrypted_vault: RwLock::new(Some(Arc::new(b"placeholder encrypted vault".to_vec()))),
         gateway,
         volume_writes: VolumeWrites::new(),
-    }
+    };
+    (service, ca_private_key)
 }
 
 fn text() -> OpeningText {
@@ -227,6 +239,7 @@ fn specified(request: &DoorRequest) -> (bool, bool) {
         DoorRequest::PinCaTls { .. } => (true, false),
         DoorRequest::IssuerInstall { .. } => (true, false),
         DoorRequest::GatewayIdentityPublish { .. } => (true, false),
+        DoorRequest::VaultCopy { .. } => (false, true),
     }
 }
 
@@ -253,6 +266,10 @@ fn the_policy_table_is_exactly_the_specification() {
             authorization: Box::new(delegation(&delegated_material(), 1)),
         },
         DoorRequest::GatewayIdentityPublish { epoch: 5 },
+        DoorRequest::VaultCopy {
+            vault: Vec::new().into(),
+            credentials: None,
+        },
     ];
     let tunnels = [
         tunnel(),

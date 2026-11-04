@@ -214,6 +214,53 @@ async fn operator_results_use_the_operator_body_bound() {
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }
 
+/// The vault copy has a bound of its own: a vault is larger than an operator
+/// result, and the 64 KiB bound would refuse every real one.
+#[tokio::test]
+async fn vault_copy_route_refuses_a_non_admin_and_an_oversized_body() {
+    const URI: &str = "/api/certificates/operator/vault-copy";
+    const BODY: &str = r#"{"vault_base64":"e30="}"#;
+
+    let (non_admin_state, _cmd_rx) = state();
+    non_admin_state.network.write().await.peers[0].admin = false;
+    let response = router(non_admin_state)
+        .oneshot(admin_request(URI, BODY))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    let (within_state, _cmd_rx) = state();
+    let within = " ".repeat(astra_channel::MAX_OPERATOR_REQUEST_BYTES + 1024);
+    let response = router(within_state)
+        .oneshot(admin_request(URI, &within))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "above the operator result bound, within the vault copy bound: the parser is reached"
+    );
+
+    let (oversized_state, _cmd_rx) = state();
+    let oversized = " ".repeat(astra_channel::MAX_OPERATOR_VAULT_COPY_BODY_BYTES + 1);
+    let response = router(oversized_state)
+        .oneshot(admin_request(URI, &oversized))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+    let (admin_state, _cmd_rx) = state();
+    let response = router(admin_state)
+        .oneshot(admin_request(URI, BODY))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "the administrator is admitted; what is missing is the private channel"
+    );
+}
+
 /// Opening a campaign is an administrative mutation like any other.
 ///
 /// Mounted beside the signer results, it inherits the same barriers in the

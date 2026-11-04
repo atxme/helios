@@ -14,7 +14,10 @@ use std::sync::{Arc, RwLock};
 use aether::certificates::encoding::Fingerprint;
 use anyhow::{Context, Result};
 use astra::registry::{AstraRegistry, ChallengeStore};
-use astra::service::{AstraService, SourceBudget, MAX_LIVE_CHALLENGES};
+use astra::service::{
+    verify_credentials, AstraService, SourceBudget, CREDENTIALS_FILE, MAX_LIVE_CHALLENGES,
+    VAULT_FILE,
+};
 use tokio::sync::Mutex;
 use zeroize::Zeroizing;
 
@@ -30,21 +33,8 @@ use crate::{now_unix, REGISTRY_FILE, SERVICE_KEY_FILE};
 /// than a live delegation whose keys were overwritten by a candidate nobody
 /// signed.
 const OPERATIONS_FILE: &str = "client-renewal-operations.json";
-/// The signed credential decisions of the domain, as the companion emits them.
-///
-/// Copied into Astra's state volume by an operator (spec §8.2 would carry it,
-/// and answers `501`). It holds no secret: every row is public and signed by
-/// `CA-PQ`, which is why it can travel by hand at all.
-const CREDENTIALS_FILE: &str = "astra-credentials.json";
 /// Largest credential document read, in bytes.
 const MAX_CREDENTIALS_BYTES: u64 = 1024 * 1024;
-/// The encrypted authority vault, as the companion wrote it.
-///
-/// Astra transports and backs it up; it does not open it, and nothing in this
-/// container can — the key-slots unwrap under a FIDO2 `hmac-secret` output
-/// that never leaves the operator's token. Copied in by an operator, exactly
-/// like the credential document.
-const VAULT_FILE: &str = "authority-vault.json";
 /// Largest vault file read, in bytes.
 ///
 /// The same ceiling the companion applies to its own copy: a file larger than
@@ -400,21 +390,6 @@ fn load_approval_credentials(
         "credential document loaded"
     );
     Ok(credentials)
-}
-
-/// Checks a credential document under the `CA-PQ` and epochs the registry pins.
-fn verify_credentials(
-    document: &aether::certificates::approval::CredentialRegistry,
-    registry: &AstraRegistry,
-) -> Result<(), aether::certificates::CertificateError> {
-    let state = registry.state();
-    document.verify(
-        &state.ca_public_key,
-        &state.trust_domain_id,
-        &state.gateway_wg_public_key,
-        state.ca_epoch,
-        state.credential_registry_epoch,
-    )
 }
 
 /// Writes the credential document where a crash leaves the old file or the new

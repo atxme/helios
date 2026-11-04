@@ -72,6 +72,15 @@ pub trait OperatorCampaignRelay: Send + Sync {
         result: Box<aether::certificates::status::AstraSignerResult>,
     ) -> Result<astra_channel::SigningOperationView, TrustUpdateRefusal>;
 
+    /// Sends Astra the encrypted vault copy, and the credential document when
+    /// one travels with it (§5.9). The vault stays encrypted: nothing here
+    /// can open it, and Astra checks what it can read without a key.
+    async fn vault_copy(
+        &self,
+        operator: &astra_channel::OperatorIdentity,
+        copy: astra_channel::OperatorVaultCopy,
+    ) -> Result<astra_channel::OperatorVaultCopied, TrustUpdateRefusal>;
+
     /// Asks Astra's door to open a campaign for this administrator.
     ///
     /// The door resolves the targets and appends this identity to
@@ -389,6 +398,46 @@ pub async fn operator_status(
     };
     match relay.status(&operator).await {
         Ok(report) => (StatusCode::OK, Json(report)).into_response(),
+        Err(refusal) => refusal.status().into_response(),
+    }
+}
+
+/// `POST /api/certificates/operator/vault-copy`.
+///
+/// The caller is an administrator before the body is read, as for the opening.
+/// The body is bounded by [`astra_channel::MAX_OPERATOR_VAULT_COPY_BODY_BYTES`]
+/// and not by the operator result bound: a vault is larger than a result.
+/// Neither the vault nor the document is logged here or relayed beyond what the
+/// authority reads; a refusal is its class, the sentence staying in Astra's log.
+pub async fn operator_vault_copy(
+    State(s): State<AppState>,
+    Extension(caller): Extension<crate::auth::Caller>,
+    body: Bytes,
+) -> Response {
+    let operator = match operator_caller(&caller, "vault-copy") {
+        Ok(operator) => operator,
+        Err(status) => return status.into_response(),
+    };
+    if body.len() > astra_channel::MAX_OPERATOR_VAULT_COPY_BODY_BYTES {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    }
+    let copy: astra_channel::OperatorVaultCopy = match serde_json::from_slice(&body) {
+        Ok(copy) => copy,
+        Err(error) => {
+            // The parser's message can quote the input: only that it failed.
+            tracing::warn!(
+                operator = %operator,
+                kind = ?error.classify(),
+                "operator vault copy refused: unreadable body"
+            );
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+    };
+    let Some(relay) = s.operator_campaign.as_ref() else {
+        return operator_unavailable(&operator, "vault-copy");
+    };
+    match relay.vault_copy(&operator, copy).await {
+        Ok(copied) => (StatusCode::OK, Json(copied)).into_response(),
         Err(refusal) => refusal.status().into_response(),
     }
 }

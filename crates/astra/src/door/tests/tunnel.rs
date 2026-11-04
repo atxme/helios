@@ -13,8 +13,8 @@ use tokio::net::{TcpListener, TcpStream};
 
 use super::*;
 
-struct PrivateListener {
-    address: SocketAddr,
+pub(super) struct PrivateListener {
+    pub(super) address: SocketAddr,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -25,7 +25,7 @@ impl Drop for PrivateListener {
 }
 
 /// Astra's private router, the one `astra run` serves the gateway.
-async fn listen(service: Arc<AstraService>) -> PrivateListener {
+pub(super) async fn listen(service: Arc<AstraService>) -> PrivateListener {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("loopback listener");
@@ -42,7 +42,11 @@ async fn post_open(listener: &PrivateListener, body: &[u8]) -> (u16, Vec<u8>) {
     post_to(listener, astra_channel::OPERATOR_OPEN_ROUTE, body).await
 }
 
-async fn post_to(listener: &PrivateListener, route: &str, body: &[u8]) -> (u16, Vec<u8>) {
+pub(super) async fn post_to(
+    listener: &PrivateListener,
+    route: &str,
+    body: &[u8],
+) -> (u16, Vec<u8>) {
     let answer = tokio::time::timeout(Duration::from_secs(5), async {
         let mut stream = TcpStream::connect(listener.address).await.expect("connect");
         let head = format!(

@@ -766,6 +766,23 @@ impl helios_api::certificates::OperatorCampaignRelay for AstraRenewalRelay {
             .map_err(|error| Self::refuse("operator-signer-result", error))
     }
 
+    /// Relays the vault copy to Astra's door, with the administrator it came
+    /// through. The content is never logged: only the refusal class is.
+    async fn vault_copy(
+        &self,
+        operator: &::astra_channel::OperatorIdentity,
+        copy: ::astra_channel::OperatorVaultCopy,
+    ) -> Result<::astra_channel::OperatorVaultCopied, helios_api::certificates::TrustUpdateRefusal>
+    {
+        self.client
+            .operator_vault_copy(&::astra_channel::RelayedOperatorVaultCopy {
+                operator: operator.clone(),
+                copy,
+            })
+            .await
+            .map_err(|error| Self::refuse("operator-vault-copy", error))
+    }
+
     /// Relays an opening to Astra's door, with the administrator it came
     /// through. The door decides what the tunnel may open; this end only
     /// carries the request and maps the answer onto its coarse class.

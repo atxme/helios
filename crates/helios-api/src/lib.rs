@@ -340,6 +340,14 @@ pub fn router(state: AppState) -> Router {
                 astra_channel::MAX_OPERATOR_REQUEST_BYTES,
             )),
         )
+        // Its own body bound: the vault travels in base64 beside the
+        // credential document, and 64 KiB would refuse every real one.
+        .route(
+            "/api/certificates/operator/vault-copy",
+            post(certificates::operator_vault_copy).layer(DefaultBodyLimit::max(
+                astra_channel::MAX_OPERATOR_VAULT_COPY_BODY_BYTES,
+            )),
+        )
         .route(
             "/api/certificates/operator/campaigns",
             post(certificates::operator_open).layer(DefaultBodyLimit::max(
