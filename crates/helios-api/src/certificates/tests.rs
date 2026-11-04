@@ -252,7 +252,7 @@ fn authority_status() -> astra_channel::OperatorAuthorityStatus {
             not_after: 99,
         }),
         vault_copy_fingerprint: Some(Fingerprint::of(b"vault")),
-        credential_registry_epoch: 4,
+        credential_registry_epoch: Some(4),
     }
 }
 
@@ -714,7 +714,7 @@ async fn an_administrator_reads_the_authority_status() {
         .await
         .unwrap();
     let report: astra_channel::OperatorAuthorityStatus = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(report.credential_registry_epoch, 4);
+    assert_eq!(report.credential_registry_epoch, Some(4));
     assert_eq!(report.issuer.unwrap().serving_epoch, Some(2));
     assert!(relay.seen.lock().unwrap().is_some());
 }

@@ -254,6 +254,24 @@ async fn tunnel_may_open_a_delegation_and_gets_its_request() {
     assert!(crate::issuer::pq_key_path(dir.path(), 1).exists());
     assert_eq!(service.signing.lock().await.pending(wall_clock()).len(), 1);
 
+    let campaign = service
+        .signing
+        .lock()
+        .await
+        .get(&opened.operation_id, wall_clock())
+        .expect("operation held")
+        .campaign
+        .as_ref()
+        .clone();
+    assert_eq!(campaign.targets[0].epoch, request.issuer_epoch);
+    let public_key =
+        aether::certificates::encoding::MlDsa87PublicKey::parse(&request.pq_issuer_public_key)
+            .expect("public key");
+    assert_eq!(
+        campaign.targets[0].active_pq_certificate_fingerprint,
+        Fingerprint::of(public_key.as_bytes())
+    );
+
     // Nothing private rides along: the answer holds the public request only.
     assert!(!String::from_utf8_lossy(&body).contains("PRIVATE"));
 }
@@ -332,6 +350,20 @@ async fn status_reports_a_rotation_in_flight_and_the_serving_issuer() {
             zeroize::Zeroizing::new(Vec::new()),
             zeroize::Zeroizing::new(Vec::new()),
         )));
+    // The served document, at an epoch the registry's bootstrap floor (1) is
+    // not: the status must report what Astra serves.
+    *service
+        .approval_credentials
+        .write()
+        .expect("credentials lock") = Arc::new(crate::service::ApprovalCredentials::from_document(
+        Box::new(aether::certificates::approval::CredentialRegistry {
+            trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+            gateway_wg_public_key: WireGuardKey::from_bytes([1; 32]),
+            ca_epoch: 1,
+            credential_registry_epoch: 7,
+            bindings: Vec::new(),
+        }),
+    ));
     let listener = listen(Arc::clone(&service)).await;
 
     let (status, body) = read_status(&listener).await;
@@ -364,7 +396,7 @@ async fn status_reports_a_rotation_in_flight_and_the_serving_issuer() {
         report.vault_copy_fingerprint,
         Some(Fingerprint::of(b"placeholder encrypted vault"))
     );
-    assert_eq!(report.credential_registry_epoch, 1);
+    assert_eq!(report.credential_registry_epoch, Some(7));
     let issuer = report.issuer.expect("a delegation is recorded");
     assert_eq!(issuer.recorded_epoch, 2);
     assert_eq!(issuer.serving_epoch, Some(1));
@@ -388,6 +420,9 @@ async fn status_without_a_delegation_or_vault_says_so() {
     assert_eq!(report.vault_copy_fingerprint, None);
     assert_eq!(report.next_ca_fingerprint, None);
     assert_eq!(report.ca_tls_fingerprint, None);
+    // The fixture serves no credential document: no epoch to report, which is
+    // not the registry's floor of 1.
+    assert_eq!(report.credential_registry_epoch, None);
 }
 
 #[tokio::test]
@@ -408,4 +443,25 @@ async fn status_carries_nothing_secret() {
     // Fingerprints and epochs only: every value is a number, a hex string,
     // an object of those, or null.
     assert!(value.get("vault_copy_fingerprint").is_some());
+}
+
+/// A refused opening must not rewrite the files of the epoch: with no vault
+/// copy the door refuses before it draws a key.
+#[tokio::test]
+async fn a_delegation_opening_refused_for_lack_of_a_vault_leaves_the_key_files() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture(dir.path());
+    *service.encrypted_vault.write().expect("vault lock") = None;
+    let listener = listen(Arc::clone(&service)).await;
+
+    let (status, body) = post_open(&listener, &relayed_delegation_opening()).await;
+    assert_ne!(status, 200, "{}", String::from_utf8_lossy(&body));
+    assert!(!crate::issuer::pq_key_path(dir.path(), 1).exists());
+    assert!(!crate::issuer::tls_key_path(dir.path(), 1).exists());
+    assert!(service
+        .signing
+        .lock()
+        .await
+        .pending(wall_clock())
+        .is_empty());
 }

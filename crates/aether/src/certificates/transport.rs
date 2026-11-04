@@ -1287,8 +1287,8 @@ pub struct OperatorAuthorityStatus {
     /// Fingerprint of the encrypted vault copy Astra holds, if any.
     pub vault_copy_fingerprint: Option<Fingerprint>,
     /// The epoch of the credential document Astra serves, not the registry's
-    /// bootstrap floor.
-    pub credential_registry_epoch: u64,
+    /// bootstrap floor. `None` when Astra serves no document.
+    pub credential_registry_epoch: Option<u64>,
 }
 
 /// The delegation: what the registry records and what Astra serves.

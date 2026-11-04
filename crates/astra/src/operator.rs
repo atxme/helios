@@ -129,25 +129,31 @@ async fn pending(
 
 /// What this authority holds, for Orion to decide what is left to do (§5.9).
 ///
-/// A read: no capability token, no volume lock, nothing minted. Each of the
-/// three service values is copied out of its lock before the registry's is
-/// taken, so no guard crosses an `.await`.
+/// A read: no capability token, no volume lock, nothing minted. The service
+/// values are read after the registry, in the order `adopt_recorded_issuer`
+/// takes them, so the report is one snapshot; the accessors are synchronous
+/// and copy their `Arc` out, so no guard crosses an `.await`.
 async fn status(
     State(service): State<Arc<AstraService>>,
     Json(relayed): Json<RelayedOperatorCampaign>,
 ) -> Response {
     let _ = &relayed.operator;
-    // What Astra serves, not `state.credential_registry_epoch`, which is only
-    // the floor the registry was bootstrapped with.
-    let credential_registry_epoch = service.approval_credentials().epoch;
+    let registry = service.registry.lock().await;
+    let state = registry.state();
+    // What Astra serves, from the document it holds: neither
+    // `state.credential_registry_epoch`, which is only the floor the registry
+    // was bootstrapped with, nor a number when no document is served.
+    let credential_registry_epoch = service
+        .approval_credentials()
+        .registry
+        .as_ref()
+        .map(|document| document.credential_registry_epoch);
     let serving_epoch = service
         .issuer()
         .map(|issuer| issuer.authorization.issuer_epoch);
     let vault_copy_fingerprint = service
         .encrypted_vault()
         .map(|bytes| Fingerprint::of(&bytes));
-    let registry = service.registry.lock().await;
-    let state = registry.state();
     let report = OperatorAuthorityStatus {
         ca_epoch: state.ca_epoch,
         ca_fingerprint: state.ca_public_key.authority_fingerprint(),
@@ -289,10 +295,24 @@ async fn open(
     let connector = DoorConnector::Tunnel {
         operator: operator.clone(),
     };
-    match service
-        .door(connector, relayed.request.into(), now_unix())
-        .await
-    {
+    // Detached from this handler: a dropped tunnel connection drops the
+    // handler's future, and with it the volume gate, while the blocking key
+    // write goes on. Spawned, the opening and its gate end together.
+    let opening = tokio::spawn({
+        let service = Arc::clone(&service);
+        let connector = connector.clone();
+        let request = relayed.request.into();
+        async move { service.door(connector, request, now_unix()).await }
+    })
+    .await;
+    let opening = match opening {
+        Ok(opening) => opening,
+        Err(error) => {
+            tracing::error!(operator = %operator, %error, "the door task did not finish");
+            return refuse(&operator, "open", ServiceError::Internal);
+        }
+    };
+    match opening {
         Ok(DoorOutcome::Opened(opening)) => {
             (axum::http::StatusCode::OK, Json(opening.opened)).into_response()
         }
