@@ -95,11 +95,15 @@ pub(super) fn build_approval_request(
     trust_domain_id: aether::certificates::encoding::TrustDomainId,
     gateway_wg_public_key: WireGuardKey,
     webauthn_rp_id: &str,
-    credential_registry_epoch: u64,
+    credentials: &crate::service::ApprovalCredentials,
     astra_service_key_epoch: u64,
     now_unix: u64,
 ) -> Result<AstraCredentialApprovalRequest, RenewalError> {
-    let allowed_credential_ids = service.approval_credentials().ids.clone();
+    // The identifiers and the epoch come from one snapshot the caller took: an
+    // adoption between two reads would sign an epoch the identifiers do not
+    // belong to.
+    let credential_registry_epoch = credentials.epoch;
+    let allowed_credential_ids = credentials.ids.clone();
     if allowed_credential_ids.is_empty() {
         // No credential may approve, so no operator can. Named rather than
         // producing a request nothing can answer.
@@ -166,7 +170,7 @@ pub(super) async fn refresh_challenge(
         domain,
         gateway,
         &rp_id,
-        service.approval_credentials().epoch,
+        &service.approval_credentials(),
         service_epoch,
         now_unix,
     )

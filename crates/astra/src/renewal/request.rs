@@ -171,7 +171,7 @@ pub async fn open(
         trust_domain_id,
         gateway_key,
         &rp_id,
-        service.approval_credentials().epoch,
+        &service.approval_credentials(),
         service_epoch,
         now_unix,
     )?;

@@ -107,7 +107,19 @@ pub(crate) fn run(
     );
 
     let issuer = astra::issuer::load_from_registry(state_dir, &registry)?;
-    let (ids, epoch, credential_registry) = load_approval_credentials(state_dir, &registry)?;
+    // A promotion that crashed before the file followed puts its document in
+    // place first: the file on disk is signed under the previous anchor and
+    // would not verify.
+    let mut registry = registry;
+    if let Some(document) = registry.state().promoted_credentials.clone() {
+        verify_credentials(&document, &registry)
+            .context("verifying the credential document a promotion left")?;
+        write_credentials_file(state_dir, &document)?;
+        registry
+            .take_promoted_credentials()
+            .context("clearing the adopted credential document")?;
+    }
+    let credentials = load_approval_credentials(state_dir, &registry)?;
     let service_public_key = registry.state().astra_service_public_key.clone();
     let operations =
         astra::operations::OperationStore::load(&state_dir.join(OPERATIONS_FILE), now_unix())
@@ -126,11 +138,7 @@ pub(crate) fn run(
             aether::certificates::capability::CapabilityTokens::new()
                 .context("drawing the capability key")?,
         ),
-        approval_credentials: RwLock::new(Arc::new(astra::service::ApprovalCredentials {
-            ids,
-            epoch,
-            registry: credential_registry,
-        })),
+        approval_credentials: RwLock::new(Arc::new(credentials)),
         signing: Mutex::new(astra::signing::SigningOperationStore::new()),
         recoveries: Mutex::new(astra::recovery::RecoveryStore::new()),
         reconciliation: Mutex::new(()),
@@ -331,6 +339,14 @@ fn spawn_transition_sweep(service: Arc<AstraService>) {
                     "could not sweep the expired anchor transitions"
                 ),
             }
+            // After the promotion, in the same pass; a failure stays pending
+            // and is retried at the next one.
+            if let Err(error) = adopt_promoted_credentials(&service).await {
+                tracing::error!(
+                    %error,
+                    "could not adopt the rotated credential document; it stays pending"
+                );
+            }
         }
     });
 }
@@ -350,22 +366,10 @@ fn spawn_transition_sweep(service: Arc<AstraService>) {
 /// A missing document is not fatal: the authority still serves statuses and
 /// still holds the channel. Every ordinary renewal is then refused by name,
 /// which is what an incomplete install should look like.
-/// What the credential document yields at start-up.
-///
-/// The identifiers, the epoch they came from, and the document itself — the
-/// last because whoever runs an approval verifies it under `CA-PQ`, and an
-/// allow-list this process merely asserted would be an allow-list a compromised
-/// Astra chooses.
-type LoadedCredentials = (
-    Vec<Vec<u8>>,
-    u64,
-    Option<Box<aether::certificates::approval::CredentialRegistry>>,
-);
-
 fn load_approval_credentials(
     state_dir: &Path,
     registry: &AstraRegistry,
-) -> Result<LoadedCredentials> {
+) -> Result<astra::service::ApprovalCredentials> {
     let path = state_dir.join(CREDENTIALS_FILE);
     let Ok(metadata) = std::fs::metadata(&path) else {
         tracing::warn!(
@@ -373,7 +377,11 @@ fn load_approval_credentials(
             "no credential document: no operator credential can approve a renewal, so every \
              ordinary rotation will be refused until `astra-signer bindings` is copied here"
         );
-        return Ok((Vec::new(), registry.state().credential_registry_epoch, None));
+        return Ok(astra::service::ApprovalCredentials {
+            ids: Vec::new(),
+            epoch: registry.state().credential_registry_epoch,
+            registry: None,
+        });
     };
     if metadata.len() > MAX_CREDENTIALS_BYTES {
         anyhow::bail!(
@@ -387,28 +395,293 @@ fn load_approval_credentials(
         serde_json::from_slice(&bytes)
             .with_context(|| format!("reading the credential document {}", path.display()))?;
 
-    let state = registry.state();
-    document
-        .verify(
-            &state.ca_public_key,
-            &state.trust_domain_id,
-            &state.gateway_wg_public_key,
-            state.ca_epoch,
-            state.credential_registry_epoch,
-        )
+    verify_credentials(&document, registry)
         .with_context(|| format!("verifying the credential document {}", path.display()))?;
 
-    let approvable: Vec<Vec<u8>> = document
-        .approvable()
-        .into_iter()
-        .map(|binding| binding.credential_id.clone())
-        .collect();
+    let credentials = astra::service::ApprovalCredentials::from_document(Box::new(document));
     tracing::info!(
-        credentials = approvable.len(),
-        rows = document.bindings.len(),
-        registry_epoch = document.credential_registry_epoch,
+        credentials = credentials.ids.len(),
+        rows = credentials
+            .registry
+            .as_ref()
+            .map_or(0, |document| document.bindings.len()),
+        registry_epoch = credentials.epoch,
         "credential document loaded"
     );
-    let epoch = document.credential_registry_epoch;
-    Ok((approvable, epoch, Some(Box::new(document))))
+    Ok(credentials)
+}
+
+/// Checks a credential document under the `CA-PQ` and epochs the registry pins.
+fn verify_credentials(
+    document: &aether::certificates::approval::CredentialRegistry,
+    registry: &AstraRegistry,
+) -> Result<(), aether::certificates::CertificateError> {
+    let state = registry.state();
+    document.verify(
+        &state.ca_public_key,
+        &state.trust_domain_id,
+        &state.gateway_wg_public_key,
+        state.ca_epoch,
+        state.credential_registry_epoch,
+    )
+}
+
+/// Writes the credential document where a crash leaves the old file or the new
+/// one, never half of it: start-up refuses a document it cannot parse.
+fn write_credentials_file(
+    state_dir: &Path,
+    document: &aether::certificates::approval::CredentialRegistry,
+) -> Result<()> {
+    let path = state_dir.join(CREDENTIALS_FILE);
+    let temporary = path.with_extension("tmp");
+    let encoded =
+        serde_json::to_vec_pretty(document).context("encoding the credential document")?;
+    std::fs::write(&temporary, encoded)
+        .and_then(|()| std::fs::rename(&temporary, &path))
+        .with_context(|| format!("writing {}", path.display()))
+}
+
+/// Puts the credential document a `CA-PQ` promotion left into service.
+///
+/// The order is the crash contract: the registry already holds the document
+/// (written with the promotion), then the file, then memory, and only then is
+/// the pending copy cleared. Replaying any suffix after a restart is harmless.
+/// A failed file write keeps the pending copy for the next pass and leaves the
+/// previous document serving.
+pub(crate) async fn adopt_promoted_credentials(service: &AstraService) -> Result<()> {
+    let pending = service
+        .registry
+        .lock()
+        .await
+        .state()
+        .promoted_credentials
+        .clone();
+    let Some(document) = pending else {
+        return Ok(());
+    };
+    {
+        let registry = service.registry.lock().await;
+        verify_credentials(&document, &registry)
+            .context("verifying the credential document a promotion left")?;
+    }
+    write_credentials_file(&service.state_dir, &document)?;
+    let credentials = astra::service::ApprovalCredentials::from_document(document);
+    let epoch = credentials.epoch;
+    *service
+        .approval_credentials
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(credentials);
+    service
+        .registry
+        .lock()
+        .await
+        .take_promoted_credentials()
+        .context("clearing the adopted credential document")?;
+    tracing::info!(
+        registry_epoch = epoch,
+        "rotated credential document adopted"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aether::certificates::approval::CredentialRegistry;
+    use aether::certificates::encoding::WireGuardKey;
+    use aether::certificates::encoding::{generate_ml_dsa_87_keypair, TrustDomainId};
+    use astra::registry::{AstraState, CaPqRotation};
+
+    const DOMAIN: [u8; 16] = [1; 16];
+    const GATEWAY: [u8; 32] = [1; 32];
+
+    /// A well-formed COSE key; the document is verified, never asserted with.
+    fn cose_key() -> Vec<u8> {
+        let mut key = vec![0xa5, 0x01, 0x02, 0x03, 0x26, 0x20, 0x01, 0x21, 0x58, 0x20];
+        key.extend_from_slice(&[1; 32]);
+        key.extend_from_slice(&[0x22, 0x58, 0x20]);
+        key.extend_from_slice(&[2; 32]);
+        key
+    }
+
+    fn document(ca_private: &[u8], ca_epoch: u64, registry_epoch: u64) -> Box<CredentialRegistry> {
+        let binding = aether::certificates::approval::AstraCredentialBinding {
+            format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+            credential_id: vec![7; 16],
+            credential_public_key: cose_key(),
+            aaguid: [0; 16],
+            trust_domain_id: TrustDomainId::new(DOMAIN).expect("domain"),
+            gateway_wg_public_key: WireGuardKey::from_bytes(GATEWAY),
+            state: aether::certificates::approval::CredentialState::Active,
+            credential_epoch: 1,
+            credential_registry_epoch: registry_epoch,
+            ca_epoch,
+            created_at: 500,
+            ca_pq_signature: aether::certificates::encoding::MlDsa87Signature::placeholder(),
+        }
+        .sign(ca_private)
+        .expect("sign");
+        Box::new(CredentialRegistry {
+            trust_domain_id: TrustDomainId::new(DOMAIN).expect("domain"),
+            gateway_wg_public_key: WireGuardKey::from_bytes(GATEWAY),
+            ca_epoch,
+            credential_registry_epoch: registry_epoch,
+            bindings: vec![binding],
+        })
+    }
+
+    fn service(
+        state_dir: &Path,
+        ca_public: aether::certificates::encoding::MlDsa87PublicKey,
+        ca_epoch: u64,
+        rotation: Option<CaPqRotation>,
+        pending: Option<Box<CredentialRegistry>>,
+    ) -> AstraService {
+        let (service_private, service_public) = generate_ml_dsa_87_keypair().expect("keygen");
+        let state = AstraState {
+            trust_domain_id: TrustDomainId::new(DOMAIN).expect("domain"),
+            gateway_wg_public_key: WireGuardKey::from_bytes(GATEWAY),
+            server_name: "gateway.example".into(),
+            authority_url: "https://astra.example".into(),
+            webauthn_rp_id: "astra.example".into(),
+            astra_policy_fingerprint: aether::certificates::approval::AstraPolicyPin::new(
+                Fingerprint::of(b"policy"),
+            )
+            .expect("policy pin"),
+            credential_registry_epoch: 1,
+            ca_epoch,
+            ca_public_key: ca_public,
+            ca_rotation: rotation,
+            ca_tls_epoch: 1,
+            ca_tls_fingerprint: None,
+            ca_tls_rotation: None,
+            astra_service_key_epoch: 1,
+            astra_service_public_key: service_public.clone(),
+            issuer: None,
+            transitions: Vec::new(),
+            promoted_credentials: pending,
+            peers: Default::default(),
+            status_epochs: Default::default(),
+            audit: Default::default(),
+        };
+        AstraService {
+            state_dir: state_dir.to_path_buf(),
+            registry: Mutex::new(AstraRegistry::new(state_dir.join(REGISTRY_FILE), state)),
+            issuer: RwLock::new(None),
+            challenges: Mutex::new(ChallengeStore::with_capacity(MAX_LIVE_CHALLENGES)),
+            budgets: Mutex::new(SourceBudget::default()),
+            service_private_key: service_private,
+            service_public_key: service_public,
+            operations: Mutex::new(astra::operations::OperationStore::new()),
+            capabilities: Mutex::new(
+                aether::certificates::capability::CapabilityTokens::new().expect("capability key"),
+            ),
+            approval_credentials: RwLock::new(Arc::new(
+                astra::service::ApprovalCredentials::from_document(Box::new(CredentialRegistry {
+                    trust_domain_id: TrustDomainId::new(DOMAIN).expect("domain"),
+                    gateway_wg_public_key: WireGuardKey::from_bytes(GATEWAY),
+                    ca_epoch: 1,
+                    credential_registry_epoch: 1,
+                    bindings: Vec::new(),
+                })),
+            )),
+            signing: Mutex::new(astra::signing::SigningOperationStore::new()),
+            recoveries: Mutex::new(astra::recovery::RecoveryStore::new()),
+            reconciliation: Mutex::new(()),
+            encrypted_vault: RwLock::new(None),
+            gateway: None,
+            volume_writes: astra::door::VolumeWrites::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_overlap_keeps_serving_the_outgoing_document() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let (_, next) = generate_ml_dsa_87_keypair().expect("keygen");
+        let rotation = CaPqRotation {
+            next_ca_epoch: 2,
+            next_ca_public_key: next,
+            activation_at: 1_000,
+            retire_active_at: 5_000,
+        };
+        let (_, ca_public) = generate_ml_dsa_87_keypair().expect("keygen");
+        let service = service(directory.path(), ca_public, 1, Some(rotation), None);
+
+        service
+            .registry
+            .lock()
+            .await
+            .forget_expired_transitions(4_999)
+            .expect("sweep");
+        adopt_promoted_credentials(&service).await.expect("pass");
+
+        assert_eq!(service.approval_credentials().epoch, 1);
+        assert!(!directory.path().join(CREDENTIALS_FILE).exists());
+    }
+
+    #[tokio::test]
+    async fn a_promoted_document_is_written_served_then_cleared() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let (ca_private, ca_public) = generate_ml_dsa_87_keypair().expect("keygen");
+        let rotated = document(&ca_private, 2, 2);
+        let service = service(directory.path(), ca_public, 2, None, Some(rotated.clone()));
+        // The file is the one the previous anchor signed, and must be replaced.
+        std::fs::write(directory.path().join(CREDENTIALS_FILE), b"{}").expect("old file");
+
+        adopt_promoted_credentials(&service).await.expect("adopted");
+
+        assert_eq!(service.approval_credentials().epoch, 2);
+        assert_eq!(service.approval_credentials().ids, vec![vec![7; 16]]);
+        let written: CredentialRegistry = serde_json::from_slice(
+            &std::fs::read(directory.path().join(CREDENTIALS_FILE)).expect("file"),
+        )
+        .expect("document");
+        assert_eq!(written, *rotated);
+        let mut registry = service.registry.lock().await;
+        assert!(registry.state().promoted_credentials.is_none());
+        assert!(registry
+            .take_promoted_credentials()
+            .expect("take")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn a_failed_file_write_keeps_the_document_pending_and_the_old_one_serving() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let missing = directory.path().join("absent");
+        let (ca_private, ca_public) = generate_ml_dsa_87_keypair().expect("keygen");
+        let service = service(
+            &missing,
+            ca_public,
+            2,
+            None,
+            Some(document(&ca_private, 2, 2)),
+        );
+
+        assert!(adopt_promoted_credentials(&service).await.is_err());
+
+        assert_eq!(service.approval_credentials().epoch, 1);
+        assert!(service
+            .registry
+            .lock()
+            .await
+            .state()
+            .promoted_credentials
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn replaying_an_adoption_is_harmless() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let (ca_private, ca_public) = generate_ml_dsa_87_keypair().expect("keygen");
+        let rotated = document(&ca_private, 2, 2);
+        let service = service(directory.path(), ca_public, 2, None, Some(rotated.clone()));
+        // A crash after the file write: the file already holds the document.
+        write_credentials_file(directory.path(), &rotated).expect("file");
+
+        adopt_promoted_credentials(&service).await.expect("first");
+        adopt_promoted_credentials(&service).await.expect("second");
+
+        assert_eq!(service.approval_credentials().epoch, 2);
+    }
 }

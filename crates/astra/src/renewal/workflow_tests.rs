@@ -498,6 +498,7 @@ async fn fixture() -> Fixture {
             astra_service_public_key: service_public.clone(),
             issuer: None,
             transitions: Vec::new(),
+            promoted_credentials: None,
             peers: BTreeMap::new(),
             status_epochs: BTreeMap::new(),
             audit: crate::audit::AuditChain::default(),
@@ -1254,7 +1255,7 @@ async fn pending_before_issuance(fixture: &Fixture) -> Id16 {
         domain(),
         gateway_key(),
         "astra.example",
-        1,
+        &fixture.service.approval_credentials(),
         1,
         NOW,
     )

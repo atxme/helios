@@ -254,6 +254,28 @@ pub struct ApprovalCredentials {
     pub registry: Option<Box<aether::certificates::approval::CredentialRegistry>>,
 }
 
+impl ApprovalCredentials {
+    /// What a verified credential document yields: the identifiers of its
+    /// `active` rows, its epoch, and the document itself.
+    ///
+    /// The one derivation shared by start-up and by the adoption of a rotated
+    /// document, so the two cannot drift on what an operator may be asked for.
+    pub fn from_document(
+        document: Box<aether::certificates::approval::CredentialRegistry>,
+    ) -> Self {
+        let ids = document
+            .approvable()
+            .into_iter()
+            .map(|binding| binding.credential_id.clone())
+            .collect();
+        Self {
+            ids,
+            epoch: document.credential_registry_epoch,
+            registry: Some(document),
+        }
+    }
+}
+
 /// Everything a request handler may touch.
 pub struct AstraService {
     pub registry: Mutex<AstraRegistry>,

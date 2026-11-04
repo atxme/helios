@@ -54,6 +54,7 @@ fn registry() -> (AstraRegistry, tempfile::TempDir) {
         astra_service_public_key: service,
         issuer: None,
         transitions: Vec::new(),
+        promoted_credentials: None,
         peers: BTreeMap::new(),
         status_epochs: BTreeMap::new(),
         audit: AuditChain::default(),

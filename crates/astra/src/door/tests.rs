@@ -114,6 +114,7 @@ fn build_service(
         astra_service_public_key: service_public_key.clone(),
         issuer: None,
         transitions: Vec::new(),
+        promoted_credentials: None,
         peers: Default::default(),
         status_epochs: Default::default(),
         audit: Default::default(),

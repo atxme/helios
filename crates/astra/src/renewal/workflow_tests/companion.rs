@@ -66,7 +66,7 @@ async fn legacy() -> Legacy {
         domain(),
         gateway_key(),
         "astra.example",
-        1,
+        &fixture.service.approval_credentials(),
         1,
         NOW,
     )

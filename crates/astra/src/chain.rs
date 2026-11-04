@@ -340,6 +340,7 @@ mod tests {
             astra_service_public_key: MlDsa87PublicKey::new(vec![1; 2592]).expect("key"),
             issuer: None,
             transitions: Vec::new(),
+            promoted_credentials: None,
             peers: Default::default(),
             status_epochs: Default::default(),
             audit: Default::default(),

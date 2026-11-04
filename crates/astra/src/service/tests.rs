@@ -222,6 +222,7 @@ mod http_routes {
                 astra_service_public_key: service_public.clone(),
                 issuer: None,
                 transitions: Vec::new(),
+                promoted_credentials: None,
                 peers: BTreeMap::new(),
                 status_epochs: BTreeMap::new(),
                 audit: crate::audit::AuditChain::default(),
