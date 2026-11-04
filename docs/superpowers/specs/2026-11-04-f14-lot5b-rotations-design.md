@@ -30,6 +30,11 @@ bloque.
   de ton familier. Exemples retenus : « Prérequis », « Clé 2 : toucher la clé »,
   « Fin de rotation le 4 déc. ».
 - **« Tout renouveler » attend le lot 6b** : il est retiré de l'écran du 5b.
+- **Validation des clés avant l'opération** : une clé après l'autre, avec l'état de chacune.
+- **Re-délégation de l'émetteur dans le 5b** : plus aucun terminal après un remplacement de
+  CA. Cette décision élargit la table de la porte (spec 5a §5.2).
+- **Copie du coffre envoyée par Orion** : Astra garde son exigence, et sa copie suit chaque
+  rotation.
 
 ## 3. Objectifs
 
@@ -48,14 +53,17 @@ bloque.
    `astra-signer orion`, `crates/astra-operator/src/orion.rs` et ce qui ne sert plus
    qu'à eux dans `aether::certificates::operator_ipc`.
 7. Les deux suivis du 5a sur la route d'Orion (§5.6).
+8. **Renouveler la délégation** de l'émetteur depuis Orion, sans fichier ni redémarrage
+   (§5.8).
+9. **Copie du coffre et document de credentials** envoyés par Orion, sans redémarrage (§5.9).
 
 ## 4. Non-objectifs et anti-objectifs
 
 **Non-objectifs**
 - La révocation d'un poste (5c).
-- « Tout renouveler », la délégation de l'émetteur et l'identité de la gateway :
-  la table de la porte (spec 5a §5.2) les réserve à la console ou au 6b. Elle n'est
-  pas élargie ici.
+- « Tout renouveler » et l'identité de la gateway : la table de la porte (spec 5a §5.2) les
+  réserve à la console ou au 6b. Elle n'est élargie ici que pour §5.8 et §5.9.
+- Une sauvegarde du coffre ailleurs que sur la gateway.
 - Le retrait des commandes d'`astra-signer` (lot 7), qui restent utilisables.
 - Un rappel hors d'Orion : ni notification système, ni tâche de fond.
 
@@ -84,6 +92,7 @@ Dans cet ordre, une ligne par action, avec son état et un bouton :
 | Renouveler les postes | nombre de postes, échéance la plus proche | Renouveler |
 | Remplacer la CA-PQ | « 2 clés », ou date de fin d'une rotation en cours | Remplacer |
 | Remplacer la CA TLS | expiration, « 2 clés », ou date de fin d'une rotation en cours | Remplacer |
+| Renouveler la délégation | échéance ; « À faire » si elle expire bientôt ou ne suit plus la CA | Renouveler |
 
 Une ligne à faire passe en premier et se distingue visuellement. Une action
 impossible a son bouton désactivé et dit pourquoi en quelques mots. **Une seule rotation
@@ -108,6 +117,7 @@ n'est ouvert et l'étape suivante est désactivée.
 | Service Astra | la même lecture ne répond pas `503` |
 | Coffre présent | `VaultOverview` |
 | Deux clés enregistrées (rotations de CA) | `VaultOverview.slots`, `credentials_complete` |
+| Copie du coffre (rotations de CA) | empreinte lue par la route du §5.9 ; « Absente » ou « Ancienne », bouton « Envoyer », sans clé |
 | Domaine concordant | l'ancre du coffre est celle de `CertificateDomainView`, ou sa suivante (`next_ca_fingerprint`) pendant un recouvrement CA-PQ |
 
 **2. Clés** (rotations de CA ; décidé par l'utilisateur le 4 novembre 2026). Chaque
@@ -130,9 +140,9 @@ alors qu'`astra-signer` fait les deux gestes de chaque clé sans la débrancher.
 processus de la cérémonie, effacées à son abandon, à son échec, à sa fin, ou après cinq
 minutes sans suite ; `astra-signer` les garde déjà ainsi le temps de la seconde clé.
 
-Une validation ne vaut que pour la cérémonie en cours. Renouveler les postes et Terminer
-n'ont pas cette étape : le premier suit le nombre de clés de sa campagne, le second n'exige
-qu'une clé.
+Une validation ne vaut que pour la cérémonie en cours. Renouveler les postes, Terminer et
+Renouveler la délégation n'ont pas cette étape : le premier suit le nombre de clés de sa
+campagne, les deux autres n'exigent qu'une clé.
 
 **3. Approbation.** Récapitulatif : action, motif (pré-rempli, modifiable), durées
 par défaut. Les durées (préparation 7 jours, recouvrement 30 jours, validité CA TLS
@@ -173,8 +183,9 @@ en choisissant ce qu'elle remplace.
 
 ### 5.4 Journal de rotation
 
-La décision est écrite avant d'être annoncée, comme aujourd'hui, à côté du coffre
-(`astra_operator::prepared`, journal CA-PQ). Ce journal doit désormais conserver la
+La décision est écrite avant d'être annoncée, à côté du coffre (`astra_operator::prepared`,
+journal CA-PQ). La CA TLS le fait déjà ; `astra-signer` dépose la CA-PQ avant d'écrire, ce
+qu'Orion ne reproduit pas. Ce journal doit désormais conserver la
 transition elle-même jusqu'à ce que la gateway ait confirmé l'installation : sans
 fichier `--out`, c'est la seule copie. Il porte quatre états, reprenables dans
 l'ordre : signé, déposé auprès d'Astra, installé sur la gateway, terminé. Le dépôt et
@@ -230,11 +241,60 @@ qu'Orion est fermé attend sa prochaine ouverture. Jusque-là, la gateway a avan
 la lever, l'écran doit la rendre visible : la ligne reste « À faire » tant que ce n'est
 pas fait.
 
+### 5.8 Délégation de l'émetteur
+
+Après un remplacement de CA, les époques portées par la délégation ne suivent plus celles de
+la gateway, et Astra ne peut plus émettre pour les postes (`RENOUVELLEMENT-CERTIFICATS.md` §9).
+La ligne « Renouveler la délégation » remplace la commande et son fichier.
+
+- **Ouverture** : `DoorRequest::IssuerDelegation` passe à `(true, true)` dans `allowed`. La porte
+  génère les clés dans le volume et renvoie la demande publique, qu'Orion reçoit dans la réponse
+  au lieu d'un fichier choisi. `IssuerRequest` et `IssuerInstall` restent à la console. Les
+  gardes existantes tiennent : verrou d'écriture, une délégation vivante à la fois, époque suivante.
+- **Cérémonie** : `ceremony/issuer.rs` existe déjà ; une clé approuve puis ouvre le coffre.
+  Seule l'entrée change.
+- **Sans redémarrage** : Astra adopte la délégation à son enregistrement. `service.issuer` devient
+  remplaçable en place et le contrôle de `load_issuer` (clés contre délégation, politique) est
+  réutilisé. **Orion ne redémarre pas Astra** : Astra n'a pas accès à Docker (ADR-008), et sortir du
+  processus perdrait les opérations en mémoire. Si l'adoption échoue, l'émetteur en place reste
+  servi et Orion l'affiche.
+- **Moment** : la ligne passe « À faire » après « Terminer » pour la CA TLS, et après `not_after`
+  pour la CA-PQ. Avant, les époques ne correspondent pas encore ; le bouton reste désactivé et dit
+  pourquoi. Le constructeur vérifie ce moment sur les deux CA, en particulier pour la CA-PQ, où le
+  document de référence ne le décrit pas.
+
+### 5.9 Copie du coffre et document de credentials
+
+Astra exige toujours une copie du coffre pour ouvrir une rotation (`DoorRefusal::NoVault`). Elle
+sert aussi de sauvegarde hors du poste. Astra la lit au démarrage, comme le document de credentials.
+
+- **Lecture** : `GET /api/certificates/operator/status`, administrateur, sans secret : empreinte
+  de la copie, époque du document de credentials, époque, échéance et époques CA de la délégation.
+  Elle alimente le prérequis du §5.1 et la ligne du §5.8.
+- **Écriture** : `POST /api/certificates/operator/vault-copy`, administrateur, nouvelle variante
+  de porte `(false, true)` : la console garde sa procédure. Elle écrit sous le verrou du volume, de
+  façon atomique, garde la copie précédente, remplace la valeur en mémoire et journalise l'empreinte
+  et l'opérateur. Corps borné. Le coffre reste chiffré : ni Astra ni le tunnel ne l'ouvrent.
+- **Contrôles** : Astra refuse un contenu qui n'est pas un coffre de ce domaine, dans la mesure où
+  il peut le lire sans clé. Un administrateur du tunnel peut donc remplacer la sauvegarde, mais pas
+  ouvrir le coffre ni signer. La copie précédente et le journal limitent ce risque ; il n'est pas
+  supprimé. Orion relit l'empreinte après l'envoi.
+- **Moment** : au prérequis si elle manque ou diffère, puis après chaque rotation, comme dernière
+  étape du suivi. Un échec ne remet pas la rotation en cause : la ligne reste « À faire ».
+- **Document de credentials** : même envoi et même adoption en mémoire, parce que la rotation CA-PQ
+  le réémet et qu'Astra ne le lit qu'au démarrage. Le constructeur vérifie à quel moment Astra doit
+  servir le nouveau document pendant le recouvrement ; une erreur là bloquerait la campagne suivante.
+
 ## 6. Sécurité
 
 - **Ce qui s'ajoute** : une route d'installation CA TLS, derrière `require_admin` et le
   contrôle d'origine, qui n'accepte qu'un objet que la gateway vérifie elle-même sous sa
   `CA-PQ`.
+- **Ce qui s'élargit (décision de l'utilisateur)** : le tunnel peut ouvrir une délégation, ce qui
+  fait générer des clés dans le volume sans rien autoriser sans toucher ; il peut aussi écrire la
+  copie du coffre, sans rien pouvoir ouvrir ni signer. Le coffre traverse le tunnel, chiffré.
+- **Ce qui change d'exploitation** : Astra se met à jour sans redémarrage pour la délégation, la
+  copie et le document de credentials.
 - **Ce qui sort** : le lancement d'un binaire externe depuis Orion, son canal loopback et
   son jeton sur la ligne de commande.
 - **Ce qui ne change pas** : fenêtre de cinq minutes, une opération vivante par famille,
@@ -250,20 +310,27 @@ pas fait.
   l'abandon ; approbation dans les deux ordres, clé non validée refusée ; dépôt après expiration
   de la campagne, repris par une nouvelle approbation sans re-signature ; date d'installation passée ; chaque état du journal et sa reprise, y compris un arrêt entre chaque étape ;
   aucune clé redemandée à la reprise ; refus d'une seconde rotation ; route CA TLS (`403`,
-  corps illisible, objet mal signé, idempotence) ; `pending` aux bornes ; 429 relayé.
+  corps illisible, objet mal signé, idempotence) ; table de la porte aux nouvelles entrées ; une
+  émission sous la nouvelle délégation sans redémarrage, échec d'adoption, délégation vivante ;
+  copie du coffre (`403`, trop gros, autre domaine, écriture atomique, copie précédente gardée,
+  disponible aussitôt pour la porte) ; `pending` aux bornes ; 429 relayé.
 - **IHM** (Vitest, comme `ApprovalsPanel.test.tsx`) : ordre des lignes, ligne à faire en tête,
-  prérequis rouge bloquant et ouverture jamais appelée, clés validées une à une avec leur état,
+  prérequis rouge bloquant et ouverture jamais appelée, copie du coffre absente puis envoyée,
+  ligne de délégation et ses états, clés validées une à une avec leur état,
   clé répétée refusée, `AlreadyOpen` repris, durées
   repliées, libellés.
 - **Recette** : `MANUAL-TESTING`, section « G. Lot 5b » : renouveler les postes, remplacer
-  chaque CA, couper Orion à chaque étape, terminer une rotation. Rien ne se valide en WSL : la
+  chaque CA, couper Orion à chaque étape, terminer une rotation, renouveler la délégation puis
+  un poste, partir d'une gateway sans copie du coffre. Rien ne se valide en WSL : la
   cible et Windows sont requis, et le 5a n'a pas encore été joué sur cible.
 
 ## 8. Documentation
 
 `RENOUVELLEMENT-CERTIFICATS.md` : Orion devient le chemin par défaut aux §2, §3, §9, les
 commandes restant décrites comme recours. Amendement daté dans
-`ROTATION-CERTIFICATS.md` et ADR-008. `ROADMAP.md`, `MANUAL-TESTING.md`. Vérifier la « limite
+`ROTATION-CERTIFICATS.md`, ADR-008 (tunnel, délégation, copie du coffre, adoption sans
+redémarrage) et la spec 5a §5.2. `DEPLOIEMENT-ASTRA.md` : la copie par Orion devient le chemin par
+défaut, les commandes restent en recours. `ROADMAP.md`, `MANUAL-TESTING.md`. Vérifier la « limite
 connue » du §3 (registre d'Astra resté sur l'ancre sortante), que le code semble avoir levée
 avec `ca_rotation` : la corriger si elle est périmée.
 
@@ -279,4 +346,6 @@ pagination ; ordre dépôt puis installation, repris d'aujourd'hui ; contrôles 
 §5.1 ; route CA TLS plutôt qu'une distribution par Astra ; ouverture du coffre gardée en mémoire
 entre validation et signature pour ne pas ajouter de toucher ; approbation dans n'importe quel
 ordre ; une seule rotation de CA à la fois ; reprise d'un dépôt expiré par une nouvelle
-approbation ; « Délai dépassé » sans abandon construit dans ce lot.
+approbation ; « Délai dépassé » sans abandon construit dans ce lot ; adoption en mémoire plutôt
+qu'un redémarrage par Orion ; route de lecture unique `operator/status` ; copie précédente gardée
+sur la gateway, sans historique plus long ; document de credentials envoyé avec le coffre.
