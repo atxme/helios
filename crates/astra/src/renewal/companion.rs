@@ -72,7 +72,8 @@ pub async fn signer_request(
     // allow-list this service merely asserted would let a compromised Astra
     // name a credential nobody ever enrolled.
     let credential_registry = service
-        .approval_credential_registry
+        .approval_credentials()
+        .registry
         .clone()
         .ok_or(RenewalError::NoOperatorCredential)?;
     Ok(ClientRenewalSignerRequest {
@@ -156,7 +157,7 @@ pub async fn signer_result(
             state.ca_public_key.clone(),
             state.ca_epoch,
             state.astra_service_key_epoch,
-            service.approval_credential_registry_epoch,
+            service.approval_credentials().epoch,
             peer,
         )
     };

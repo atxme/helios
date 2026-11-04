@@ -9,13 +9,12 @@
 
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use aether::certificates::encoding::Fingerprint;
 use anyhow::{Context, Result};
 use astra::registry::{AstraRegistry, ChallengeStore};
 use astra::service::{AstraService, SourceBudget, MAX_LIVE_CHALLENGES};
-use astra::DelegatedIssuer;
 use tokio::sync::Mutex;
 use zeroize::Zeroizing;
 
@@ -107,9 +106,8 @@ pub(crate) fn run(
         "Astra ready"
     );
 
-    let issuer = load_issuer(state_dir, &registry)?;
-    let (approval_credential_ids, approval_credential_registry_epoch, approval_credential_registry) =
-        load_approval_credentials(state_dir, &registry)?;
+    let issuer = astra::issuer::load_from_registry(state_dir, &registry)?;
+    let (ids, epoch, credential_registry) = load_approval_credentials(state_dir, &registry)?;
     let service_public_key = registry.state().astra_service_public_key.clone();
     let operations =
         astra::operations::OperationStore::load(&state_dir.join(OPERATIONS_FILE), now_unix())
@@ -118,7 +116,7 @@ pub(crate) fn run(
     let service = Arc::new(AstraService {
         state_dir: state_dir.to_path_buf(),
         registry: Mutex::new(registry),
-        issuer,
+        issuer: RwLock::new(issuer.map(Arc::new)),
         challenges: Mutex::new(ChallengeStore::with_capacity(MAX_LIVE_CHALLENGES)),
         budgets: Mutex::new(SourceBudget::default()),
         service_private_key,
@@ -128,13 +126,15 @@ pub(crate) fn run(
             aether::certificates::capability::CapabilityTokens::new()
                 .context("drawing the capability key")?,
         ),
-        approval_credential_ids,
-        approval_credential_registry_epoch,
-        approval_credential_registry,
+        approval_credentials: RwLock::new(Arc::new(astra::service::ApprovalCredentials {
+            ids,
+            epoch,
+            registry: credential_registry,
+        })),
         signing: Mutex::new(astra::signing::SigningOperationStore::new()),
         recoveries: Mutex::new(astra::recovery::RecoveryStore::new()),
         reconciliation: Mutex::new(()),
-        encrypted_vault,
+        encrypted_vault: RwLock::new(encrypted_vault.map(Arc::new)),
         gateway,
         volume_writes: astra::door::VolumeWrites::new(),
     });
@@ -356,7 +356,7 @@ fn spawn_transition_sweep(service: Arc<AstraService>) {
 /// last because whoever runs an approval verifies it under `CA-PQ`, and an
 /// allow-list this process merely asserted would be an allow-list a compromised
 /// Astra chooses.
-type ApprovalCredentials = (
+type LoadedCredentials = (
     Vec<Vec<u8>>,
     u64,
     Option<Box<aether::certificates::approval::CredentialRegistry>>,
@@ -365,7 +365,7 @@ type ApprovalCredentials = (
 fn load_approval_credentials(
     state_dir: &Path,
     registry: &AstraRegistry,
-) -> Result<ApprovalCredentials> {
+) -> Result<LoadedCredentials> {
     let path = state_dir.join(CREDENTIALS_FILE);
     let Ok(metadata) = std::fs::metadata(&path) else {
         tracing::warn!(
@@ -411,59 +411,4 @@ fn load_approval_credentials(
     );
     let epoch = document.credential_registry_epoch;
     Ok((approvable, epoch, Some(Box::new(document))))
-}
-
-/// Builds the delegated issuer, when the domain has one **and** its private
-/// material is on disk.
-///
-/// The three parts are independent on purpose: the authorization is public and
-/// travels in the registry, while the two private keys are generated and
-/// sealed locally. A registry that names a delegation whose keys are missing is
-/// an incomplete install, and it is reported as such — an issuer silently
-/// forced to `None` would refuse every ordinary renewal with no explanation,
-/// at 80 % of a leaf's life.
-fn load_issuer(state_dir: &Path, registry: &AstraRegistry) -> Result<Option<DelegatedIssuer>> {
-    let Some(installed) = registry.state().issuer.as_ref() else {
-        tracing::warn!(
-            "no delegated issuer in the registry: ordinary renewals stay refused until \
-             `AstraIssuerAuthorization` is signed by the operator companion"
-        );
-        return Ok(None);
-    };
-    let pq_key = astra::issuer::pq_key_path(state_dir, installed.issuer_epoch);
-    let tls_key = astra::issuer::tls_key_path(state_dir, installed.issuer_epoch);
-    if !pq_key.exists() || !tls_key.exists() {
-        tracing::error!(
-            issuer_epoch = installed.issuer_epoch,
-            pq_key = %pq_key.display(),
-            tls_key = %tls_key.display(),
-            "the registry names a delegated issuer but its private material is missing: \
-             ordinary renewals will be refused"
-        );
-        return Ok(None);
-    }
-    let pq_private_key =
-        Zeroizing::new(std::fs::read(&pq_key).context("reading the delegated issuer PQ key")?);
-    let tls_private_key =
-        Zeroizing::new(std::fs::read(&tls_key).context("reading the delegated issuer TLS key")?);
-    registry
-        .state()
-        .astra_policy_fingerprint
-        .assert_authorizes(&installed.authorization)
-        .context("the delegated issuer does not match the pinned Astra policy")?;
-    // Present is not the same as correct: the keys and the delegation come
-    // from two different places, and a mismatch would only show up at the
-    // first renewal.
-    let issuer = DelegatedIssuer::load(
-        installed.authorization.clone(),
-        pq_private_key,
-        tls_private_key,
-    )
-    .context("checking the delegated issuer's private material against the registry")?;
-    tracing::info!(
-        issuer_epoch = installed.issuer_epoch,
-        not_after = installed.authorization.not_after,
-        "delegated issuer loaded"
-    );
-    Ok(Some(issuer))
 }

@@ -47,7 +47,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock};
 
 use aether::certificates::{
     capability::CapabilityTokens,
@@ -228,10 +228,40 @@ impl SourceBudget {
     }
 }
 
+/// The approval credentials Astra serves, replaced whole.
+pub struct ApprovalCredentials {
+    /// Read from the signed credential document the companion emits, and
+    /// **only** the `active` ones: a request naming a lost or revoked
+    /// credential would ask an operator for a touch the verifier then refuses.
+    /// Empty means no operator can approve anything, and every renewal is
+    /// refused by name rather than left to time out.
+    pub ids: Vec<Vec<u8>>,
+    /// Epoch of the signed credential registry those identifiers came from.
+    ///
+    /// This is deliberately not inferred from Astra's general registry: the
+    /// companion advances the credential document whenever a key is enrolled,
+    /// lost or revoked.  A challenge naming rows from epoch N while signing
+    /// epoch N-1 would make the verifier and the authenticator describe two
+    /// different allow-lists.
+    pub epoch: u64,
+    /// The signed document those identifiers came from, whole.
+    ///
+    /// Whoever runs the approval verifies it under `CA-PQ` themselves, so it
+    /// has to travel — an allow-list this service merely asserts would let a
+    /// compromised Astra name a credential nobody enrolled. `None` when no
+    /// credential document has been copied here, which is also when `ids` is
+    /// empty.
+    pub registry: Option<Box<aether::certificates::approval::CredentialRegistry>>,
+}
+
 /// Everything a request handler may touch.
 pub struct AstraService {
     pub registry: Mutex<AstraRegistry>,
-    pub issuer: Option<DelegatedIssuer>,
+    /// Replaceable in memory: a delegation recorded while this process runs is
+    /// adopted without a restart, because the operator has no terminal to
+    /// restart it from. Read through [`AstraService::issuer`]; never hold the
+    /// guard across an `.await`.
+    pub issuer: RwLock<Option<Arc<DelegatedIssuer>>>,
     pub challenges: Mutex<ChallengeStore>,
     pub budgets: Mutex<SourceBudget>,
     /// Signs statuses, challenges and operational answers. Never a leaf.
@@ -250,31 +280,10 @@ pub struct AstraService {
     pub operations: Mutex<crate::operations::OperationStore>,
     /// `K_capability`, drawn at start-up (spec §8.2).
     pub capabilities: Mutex<CapabilityTokens>,
-    /// The credentials an ordinary renewal may be approved by.
-    ///
-    /// Read from the signed credential document the companion emits, and
-    /// **only** the `active` ones: a request naming a lost or revoked
-    /// credential would ask an operator for a touch the verifier then refuses.
-    /// Empty means no operator can approve anything, and every renewal is
-    /// refused by name rather than left to time out.
-    pub approval_credential_ids: Vec<Vec<u8>>,
-    /// Epoch of the signed credential registry those identifiers came from.
-    ///
-    /// This is deliberately not inferred from Astra's general registry: the
-    /// companion advances the credential document whenever a key is enrolled,
-    /// lost or revoked.  A challenge naming rows from epoch N while signing
-    /// epoch N-1 would make the verifier and the authenticator describe two
-    /// different allow-lists.
-    pub approval_credential_registry_epoch: u64,
-    /// The signed document those identifiers came from, whole.
-    ///
-    /// Whoever runs the approval verifies it under `CA-PQ` themselves, so it
-    /// has to travel — an allow-list this service merely asserts would let a
-    /// compromised Astra name a credential nobody enrolled. `None` when no
-    /// credential document has been copied here, which is also when
-    /// `approval_credential_ids` is empty.
-    pub approval_credential_registry:
-        Option<Box<aether::certificates::approval::CredentialRegistry>>,
+    /// The credentials an ordinary renewal may be approved by, as one value so
+    /// that the identifiers, their epoch and the document always describe the
+    /// same registry. Read through [`AstraService::approval_credentials`].
+    pub approval_credentials: RwLock<Arc<ApprovalCredentials>>,
     /// Manual campaigns waiting for an operator who has no tunnel (§7.6).
     ///
     /// A store of its own, next to `operations` rather than merged into it,
@@ -297,7 +306,7 @@ pub struct AstraService {
     /// this container can. `None` when no vault has been copied into the state
     /// volume, which is also when a campaign that rotates an anchor is refused
     /// by name rather than left to fail at the download.
-    pub encrypted_vault: Option<Vec<u8>>,
+    pub encrypted_vault: RwLock<Option<Arc<Vec<u8>>>>,
     /// Where this authority's state volume is mounted.
     ///
     /// Held because one operator ceremony writes into it: a delegation the
@@ -320,6 +329,52 @@ pub struct AstraService {
 }
 
 impl AstraService {
+    /// The delegated issuer in service. The `Arc` is copied out so no guard
+    /// lives across an `.await`; an adoption in between does not disturb an
+    /// issuance already holding the previous one.
+    pub fn issuer(&self) -> Option<Arc<DelegatedIssuer>> {
+        self.issuer
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The credential allow-list, identifiers, epoch and document together.
+    pub fn approval_credentials(&self) -> Arc<ApprovalCredentials> {
+        self.approval_credentials
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The encrypted vault copy, when the state volume holds one.
+    pub fn encrypted_vault(&self) -> Option<Arc<Vec<u8>>> {
+        self.encrypted_vault
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Puts the delegation just recorded in the registry into service.
+    ///
+    /// A failure, or a registry whose key files are missing, leaves the issuer
+    /// in service untouched and returns `false`: replacing it with nothing
+    /// would stop every renewal over an install that did not complete.
+    pub fn adopt_recorded_issuer(&self, registry: &AstraRegistry) -> bool {
+        match crate::issuer::load_from_registry(&self.state_dir, registry) {
+            Ok(Some(issuer)) => {
+                *self.issuer.write().unwrap_or_else(PoisonError::into_inner) =
+                    Some(Arc::new(issuer));
+                true
+            }
+            Ok(None) => false,
+            Err(error) => {
+                tracing::error!(%error, "delegation recorded but not adopted");
+                false
+            }
+        }
+    }
+
     async fn charge(&self, source: IpAddr, now_unix: u64) -> Result<(), ServiceError> {
         if self.budgets.lock().await.charge(source, now_unix) {
             Ok(())
@@ -736,7 +791,8 @@ pub(crate) async fn operator_signer_request(
 
     let (webauthn_rp_id, webauthn_origin) = relying_party(service).await;
     let credential_registry = service
-        .approval_credential_registry
+        .approval_credentials()
+        .registry
         .clone()
         .ok_or(ServiceError::Refused)?;
 
@@ -799,10 +855,7 @@ pub(crate) async fn operator_encrypted_vault(
 ) -> Result<Vec<u8>, ServiceError> {
     use aether::certificates::capability::CapabilityScope;
 
-    let vault = service
-        .encrypted_vault
-        .as_ref()
-        .ok_or(ServiceError::Refused)?;
+    let vault = service.encrypted_vault().ok_or(ServiceError::Refused)?;
     if vault.len() > MAX_RESPONSE_BYTES {
         // A deployment fault, not a caller's: refusing it here beats a
         // truncated vault the companion would fail to open with a message
@@ -835,17 +888,17 @@ pub(crate) async fn operator_encrypted_vault(
         }
     }
     authorized.ok_or(ServiceError::Refused)?;
-    if !Fingerprint::of(vault).matches(requested) {
+    if !Fingerprint::of(&vault).matches(requested) {
         // The operation names a vault this volume does not hold: the operator
         // copied an older file, or none. Naming it is the whole content.
         tracing::error!(
             requested = %requested,
-            held = %Fingerprint::of(vault),
+            held = %Fingerprint::of(&vault),
             "the vault this campaign names is not the one in the state volume"
         );
         return Err(ServiceError::Internal);
     }
-    Ok(vault.clone())
+    Ok(vault.as_ref().clone())
 }
 
 /// `POST /v1/signer-results/<operation_id>`, scope `signer_result_submit`.
@@ -897,7 +950,8 @@ pub(crate) async fn operator_signer_result(
     let operation_id = *operation_id;
     let (webauthn_rp_id, webauthn_origin) = relying_party(service).await;
     let registry = service
-        .approval_credential_registry
+        .approval_credentials()
+        .registry
         .clone()
         .ok_or(ServiceError::Refused)?;
 
@@ -1011,11 +1065,14 @@ pub(crate) async fn operator_signer_result(
             );
             ServiceError::Refused
         })?;
-        tracing::info!(
-            %operation_id,
-            issuer_epoch,
-            "delegation recorded; restart this authority to issue under it"
-        );
+        match service.adopt_recorded_issuer(&domain) {
+            true => tracing::info!(%operation_id, issuer_epoch, "delegation adopted"),
+            false => tracing::error!(
+                %operation_id,
+                issuer_epoch,
+                "delegation recorded but not adopted: the previous issuer keeps serving"
+            ),
+        }
     }
 
     let mut operations = service.signing.lock().await;

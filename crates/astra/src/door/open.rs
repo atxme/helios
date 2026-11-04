@@ -201,8 +201,8 @@ pub(super) async fn open_campaign(
     if targets.len() > MAX_CAMPAIGN_TARGETS {
         return Err(DoorRefusal::TooManyTargets);
     }
-    let vault_fingerprint = match &service.encrypted_vault {
-        Some(bytes) => Fingerprint::of(bytes),
+    let vault_fingerprint = match service.encrypted_vault() {
+        Some(bytes) => Fingerprint::of(&bytes),
         // The companion needs the vault to open `CA-PQ`, and it fetches it
         // from here. Opening the campaign anyway would spend an operator's
         // window on a ceremony that cannot reach a private key.

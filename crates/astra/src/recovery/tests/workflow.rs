@@ -24,7 +24,7 @@ use rcgen::{
     KeyUsagePurpose, SigningKey, PKCS_ECDSA_P256_SHA256,
 };
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::Mutex;
 
@@ -275,7 +275,7 @@ fn service() -> (
     let state_dir = directory.path().to_path_buf();
     let service = Arc::new(AstraService {
         registry: Mutex::new(registry),
-        issuer: None,
+        issuer: RwLock::new(None),
         challenges: Mutex::new(crate::registry::ChallengeStore::with_capacity(
             crate::service::MAX_LIVE_CHALLENGES,
         )),
@@ -284,13 +284,15 @@ fn service() -> (
         service_public_key: service_public,
         operations: Mutex::new(crate::operations::OperationStore::new()),
         capabilities: Mutex::new(CapabilityTokens::new().expect("capability key")),
-        approval_credential_ids: Vec::new(),
-        approval_credential_registry_epoch: 1,
-        approval_credential_registry: None,
+        approval_credentials: RwLock::new(Arc::new(crate::service::ApprovalCredentials {
+            ids: Vec::new(),
+            epoch: 1,
+            registry: None,
+        })),
         signing: Mutex::new(crate::signing::SigningOperationStore::new()),
         recoveries: Mutex::new(RecoveryStore::new()),
         reconciliation: Mutex::new(()),
-        encrypted_vault: None,
+        encrypted_vault: RwLock::new(None),
         state_dir,
         gateway: None,
         volume_writes: crate::door::VolumeWrites::new(),

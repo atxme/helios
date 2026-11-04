@@ -99,7 +99,7 @@ pub(super) fn build_approval_request(
     astra_service_key_epoch: u64,
     now_unix: u64,
 ) -> Result<AstraCredentialApprovalRequest, RenewalError> {
-    let allowed_credential_ids = service.approval_credential_ids.clone();
+    let allowed_credential_ids = service.approval_credentials().ids.clone();
     if allowed_credential_ids.is_empty() {
         // No credential may approve, so no operator can. Named rather than
         // producing a request nothing can answer.
@@ -166,7 +166,7 @@ pub(super) async fn refresh_challenge(
         domain,
         gateway,
         &rp_id,
-        service.approval_credential_registry_epoch,
+        service.approval_credentials().epoch,
         service_epoch,
         now_unix,
     )

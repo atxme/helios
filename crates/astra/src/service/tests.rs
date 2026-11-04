@@ -230,28 +230,30 @@ mod http_routes {
         let state_dir = directory.path().to_path_buf();
         let service = Arc::new(AstraService {
             registry: tokio::sync::Mutex::new(registry),
-            issuer: None,
+            issuer: RwLock::new(None),
             challenges: tokio::sync::Mutex::new(ChallengeStore::with_capacity(MAX_LIVE_CHALLENGES)),
             budgets: tokio::sync::Mutex::new(SourceBudget::default()),
             service_private_key: service_private,
             service_public_key: service_public,
             operations: tokio::sync::Mutex::new(crate::operations::OperationStore::new()),
             capabilities: tokio::sync::Mutex::new(CapabilityTokens::new().expect("capability key")),
-            approval_credential_ids: Vec::new(),
-            approval_credential_registry_epoch: 1,
-            approval_credential_registry: Some(Box::new(
-                aether::certificates::approval::CredentialRegistry {
-                    trust_domain_id: domain,
-                    gateway_wg_public_key: gateway,
-                    ca_epoch: 1,
-                    credential_registry_epoch: 1,
-                    bindings: Vec::new(),
-                },
-            )),
+            approval_credentials: RwLock::new(Arc::new(crate::service::ApprovalCredentials {
+                ids: Vec::new(),
+                epoch: 1,
+                registry: Some(Box::new(
+                    aether::certificates::approval::CredentialRegistry {
+                        trust_domain_id: domain,
+                        gateway_wg_public_key: gateway,
+                        ca_epoch: 1,
+                        credential_registry_epoch: 1,
+                        bindings: Vec::new(),
+                    },
+                )),
+            })),
             signing: tokio::sync::Mutex::new(crate::signing::SigningOperationStore::new()),
             recoveries: tokio::sync::Mutex::new(crate::recovery::RecoveryStore::new()),
             reconciliation: tokio::sync::Mutex::new(()),
-            encrypted_vault: None,
+            encrypted_vault: RwLock::new(None),
             state_dir,
             gateway: None,
             volume_writes: crate::door::VolumeWrites::new(),

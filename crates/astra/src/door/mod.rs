@@ -295,8 +295,8 @@ pub enum DoorOutcome {
         audit_head: Fingerprint,
         changed: bool,
     },
-    /// A delegation is recorded. Astra issues under it once restarted: the
-    /// delegated issuer is read at start-up, beside its private keys.
+    /// A delegation is recorded, and adopted by the running service when its
+    /// key files check out; a standalone console only records it.
     IssuerInstalled {
         issuer_epoch: u64,
         not_after: u64,
@@ -619,7 +619,7 @@ impl AstraService {
                 issuer_epoch,
                 not_after,
                 %audit_head,
-                "delegation recorded through the door; restart Astra to issue under it"
+                "delegation recorded through the door"
             ),
             Ok(DoorOutcome::Published {
                 epoch, confirmed, ..
@@ -730,8 +730,21 @@ impl AstraService {
                 // request writes, by epoch: the two never interleave.
                 let _volume = self.volume_writes.lock().await;
                 let mut registry = self.registry.lock().await;
-                write::issuer_install(&mut registry, &self.state_dir, *authorization, now_unix)
-                    .map(DoorOutcome::from)
+                let installed = write::issuer_install(
+                    &mut registry,
+                    &self.state_dir,
+                    *authorization,
+                    now_unix,
+                )?;
+                if self.adopt_recorded_issuer(&registry) {
+                    tracing::info!(issuer_epoch = installed.issuer_epoch, "delegation adopted");
+                } else {
+                    tracing::error!(
+                        issuer_epoch = installed.issuer_epoch,
+                        "delegation recorded but not adopted: the previous issuer keeps serving"
+                    );
+                }
+                Ok(DoorOutcome::from(installed))
             }
             DoorRequest::GatewayIdentityPublish { epoch } => {
                 self.publish_gateway_transition(epoch, now_unix, gateway_bound)

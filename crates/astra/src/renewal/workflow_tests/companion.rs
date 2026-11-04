@@ -42,14 +42,18 @@ async fn legacy() -> Legacy {
     .sign(&fixture.ca_private)
     .expect("CA signed credential");
     let service = Arc::get_mut(&mut fixture.service).expect("unique fixture");
-    service.approval_credential_ids = vec![binding.credential_id.clone()];
-    service.approval_credential_registry = Some(Box::new(CredentialRegistry {
-        trust_domain_id: domain(),
-        gateway_wg_public_key: gateway_key(),
-        ca_epoch: 1,
-        credential_registry_epoch: 1,
-        bindings: vec![binding.clone()],
-    }));
+    service.approval_credentials =
+        std::sync::RwLock::new(Arc::new(crate::service::ApprovalCredentials {
+            ids: vec![binding.credential_id.clone()],
+            epoch: 1,
+            registry: Some(Box::new(CredentialRegistry {
+                trust_domain_id: domain(),
+                gateway_wg_public_key: gateway_key(),
+                ca_epoch: 1,
+                credential_registry_epoch: 1,
+                bindings: vec![binding.clone()],
+            })),
+        }));
     transcribe_peer(&fixture.service, &client_key(), NOW)
         .await
         .expect("transcribe authenticated peer");

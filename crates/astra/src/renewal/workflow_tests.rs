@@ -29,6 +29,7 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use rcgen::{
     BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
 };
+use std::sync::RwLock;
 use std::{
     collections::BTreeMap,
     path::PathBuf,
@@ -317,6 +318,9 @@ impl AstraChannelHandler for Gateway {
 
 struct Fixture {
     ca_private: Zeroizing<Vec<u8>>,
+    /// The private half of the pinned TLS intermediate, kept so a later
+    /// delegation can reuse the chain the gateway already trusts.
+    intermediate_private: Zeroizing<Vec<u8>>,
     service: Arc<AstraService>,
     gateway: Arc<Gateway>,
     request: ClientCertificateRotationRequest,
@@ -505,11 +509,11 @@ async fn fixture() -> Fixture {
             .expect("initial operations");
     let service = Arc::new(AstraService {
         registry: Mutex::new(registry),
-        issuer: Some(crate::DelegatedIssuer::new(
+        issuer: RwLock::new(Some(Arc::new(crate::DelegatedIssuer::new(
             authorization,
             issuer_private,
-            intermediate_private,
-        )),
+            intermediate_private.clone(),
+        )))),
         challenges: Mutex::new(crate::registry::ChallengeStore::with_capacity(4)),
         budgets: Mutex::new(crate::service::SourceBudget::default()),
         service_private_key: service_private,
@@ -518,25 +522,125 @@ async fn fixture() -> Fixture {
         capabilities: Mutex::new(
             aether::certificates::capability::CapabilityTokens::new().expect("capability key"),
         ),
-        approval_credential_ids: vec![vec![1]],
-        approval_credential_registry_epoch: 1,
-        approval_credential_registry: None,
+        approval_credentials: RwLock::new(Arc::new(crate::service::ApprovalCredentials {
+            ids: vec![vec![1]],
+            epoch: 1,
+            registry: None,
+        })),
         signing: Mutex::new(crate::signing::SigningOperationStore::new()),
         recoveries: Mutex::new(crate::recovery::RecoveryStore::new()),
         reconciliation: Mutex::new(()),
-        encrypted_vault: None,
+        encrypted_vault: RwLock::new(None),
         state_dir: directory.path().to_path_buf(),
         gateway: Some(channel),
         volume_writes: crate::door::VolumeWrites::new(),
     });
     Fixture {
         ca_private,
+        intermediate_private,
         service,
         gateway,
         request,
         _listener: listener,
         directory,
     }
+}
+
+/// Seals fresh private halves for `epoch` under the fixture's state volume and
+/// records a delegation naming them, as a campaign deposit does.
+async fn record_delegation(fixture: &Fixture, epoch: u64) {
+    let (issuer_private, issuer_public) = generate_ml_dsa_87_keypair().expect("issuer key");
+    let authorization = AstraIssuerAuthorization {
+        format_version: CERTIFICATE_FORMAT_VERSION,
+        trust_domain_id: domain(),
+        ca_epoch: 1,
+        ca_tls_epoch: 1,
+        gateway_wg_public_key: gateway_key(),
+        server_name: SERVER_NAME.into(),
+        issuer_epoch: epoch,
+        pq_issuer_public_key: issuer_public,
+        tls_intermediate_certificate: fixture.gateway.anchor.clone(),
+        allowed_usage: AllowedUsage::AdmittedClientLeafRenewal,
+        maximum_leaf_lifetime_secs: 2_000_000,
+        policy_fingerprint: *fixture.gateway.policy.fingerprint(),
+        not_before: 0,
+        not_after: 10_000_000,
+        ca_pq_signature: MlDsa87Signature::placeholder(),
+    }
+    .sign(&fixture.ca_private)
+    .expect("delegation");
+    let dir = fixture.directory.path();
+    std::fs::write(
+        crate::issuer::pq_key_path(dir, epoch),
+        issuer_private.as_slice(),
+    )
+    .expect("pq key");
+    std::fs::write(
+        crate::issuer::tls_key_path(dir, epoch),
+        fixture.intermediate_private.as_slice(),
+    )
+    .expect("tls key");
+    crate::issuer::adopt(
+        &mut *fixture.service.registry.lock().await,
+        authorization,
+        &crate::issuer::pq_key_path(dir, epoch),
+        &crate::issuer::tls_key_path(dir, epoch),
+        NOW,
+    )
+    .expect("delegation recorded");
+}
+
+#[tokio::test]
+async fn a_campaign_delegation_issues_without_a_restart() {
+    let fixture = fixture().await;
+    assert_eq!(
+        fixture
+            .service
+            .issuer()
+            .expect("issuer")
+            .authorization
+            .issuer_epoch,
+        1
+    );
+    record_delegation(&fixture, 2).await;
+    let adopted = {
+        let registry = fixture.service.registry.lock().await;
+        fixture.service.adopt_recorded_issuer(&registry)
+    };
+    assert!(adopted);
+    let view = fixture
+        .open(NOW)
+        .await
+        .expect("issuance under the new epoch");
+    assert_eq!(view.grant.as_ref().expect("grant").issuer_epoch, 2);
+}
+
+#[tokio::test]
+async fn a_failed_adoption_keeps_the_issuer_in_service() {
+    let fixture = fixture().await;
+    record_delegation(&fixture, 2).await;
+    let dir = fixture.directory.path();
+    std::fs::remove_file(crate::issuer::pq_key_path(dir, 2)).expect("remove key");
+    std::fs::remove_file(crate::issuer::tls_key_path(dir, 2)).expect("remove key");
+    let adopted = {
+        let registry = fixture.service.registry.lock().await;
+        fixture.service.adopt_recorded_issuer(&registry)
+    };
+    assert!(!adopted);
+    assert_eq!(
+        fixture
+            .service
+            .issuer()
+            .expect("still serving")
+            .authorization
+            .issuer_epoch,
+        1
+    );
+    let view = fixture
+        .open(NOW)
+        .await
+        .expect("issuance under the old epoch");
+    assert_eq!(view.grant.as_ref().expect("grant").issuer_epoch, 1);
 }
 
 #[tokio::test]
@@ -695,8 +799,7 @@ async fn released_before_registry(fixture: &Fixture) -> Id16 {
         .expect("gateway public");
     let grant = fixture
         .service
-        .issuer
-        .as_ref()
+        .issuer()
         .expect("issuer")
         .release_grant(
             &authorization,
@@ -980,8 +1083,11 @@ async fn an_unconfigured_approval_allow_list_is_refused_before_issuance() {
     let mut fixture = fixture().await;
     Arc::get_mut(&mut fixture.service)
         .expect("unique service fixture")
-        .approval_credential_ids
-        .clear();
+        .approval_credentials = RwLock::new(Arc::new(crate::service::ApprovalCredentials {
+        ids: Vec::new(),
+        epoch: 1,
+        registry: None,
+    }));
     assert!(matches!(
         fixture.open(NOW).await,
         Err(RenewalError::Approval(CertificateError::UnknownCredential))
