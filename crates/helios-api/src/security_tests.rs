@@ -1085,3 +1085,46 @@ async fn status_reports_the_daemon_version() {
     let status: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(status["version"], "9.9.9");
 }
+
+/// The CA-TLS rotation moves the anchor every client chain is judged against:
+/// an admitted peer that is not an administrator must not even reach the
+/// handler.
+#[tokio::test]
+async fn client_tls_ca_route_refuses_a_non_admin() {
+    let (non_admin_state, _cmd_rx) = state();
+    non_admin_state.network.write().await.peers[0].admin = false;
+
+    let response = router(non_admin_state)
+        .oneshot(admin_request(
+            "/api/certificates/client-tls-ca-transition",
+            "{}",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+/// A body that is not a transition stops at the extractor: the gateway never
+/// guesses what an unreadable document meant.
+#[tokio::test]
+async fn client_tls_ca_route_refuses_an_unreadable_body() {
+    let (admin_state, _cmd_rx) = state();
+
+    let response = router(admin_state)
+        .oneshot(admin_request(
+            "/api/certificates/client-tls-ca-transition",
+            r#"{"not":"a transition"}"#,
+        ))
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(
+            response.status(),
+            StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY
+        ),
+        "got {}",
+        response.status()
+    );
+}

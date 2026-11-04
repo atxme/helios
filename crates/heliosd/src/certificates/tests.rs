@@ -1118,3 +1118,133 @@ fn the_issuer_set_does_not_repeat_an_authority_it_already_holds() {
         1
     );
 }
+
+/// A service whose anchor is a key the test holds, so it can sign a
+/// transition the way the companion does.
+fn service_with_known_anchor() -> (
+    CertificateService,
+    tempfile::TempDir,
+    zeroize::Zeroizing<Vec<u8>>,
+) {
+    let (private, public) = generate_ml_dsa_87_keypair().expect("keygen");
+    let mut state = state();
+    state.gateway.current_ca_public_key = public;
+    let (service, directory) = service(state);
+    (service, directory, private)
+}
+
+/// A rotation of the client CA-TLS from epoch 2 (the fixture's) to 3,
+/// activating after the real clock the handler reads.
+fn client_tls_ca_transition(
+    service: &CertificateService,
+    signer: &[u8],
+) -> aether::certificates::authority::ClientTlsCaTransition {
+    use aether::certificates::window::TransitionWindow;
+
+    let now = now_unix();
+    let registry = service.registry.try_lock().expect("registry");
+    let active = registry
+        .state()
+        .client_tls_ca
+        .active_client_tls_ca_certificate
+        .fingerprint();
+    aether::certificates::authority::ClientTlsCaTransition {
+        format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+        trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+        ca_epoch: 1,
+        current_ca_tls_epoch: 2,
+        next_ca_tls_epoch: 3,
+        active_client_tls_ca_fingerprint: active,
+        next_client_tls_ca_certificate: aether::certificates::test_x509::client_material(
+            "successor",
+        )
+        .authority,
+        window: TransitionWindow {
+            not_before: now,
+            activation_at: now + 600,
+            not_after: now + 900,
+        },
+        ca_pq_signature: aether::certificates::encoding::MlDsa87Signature::placeholder(),
+    }
+    .sign(signer)
+    .expect("sign")
+}
+
+/// The console route installs what the offline command installs, under the
+/// daemon's own registry, and says what it staged.
+#[tokio::test]
+async fn client_tls_ca_install_stages_the_rotation_and_reads_it_back() {
+    use helios_api::certificates::GatewayIdentityHandler;
+
+    let (service, _directory, private) = service_with_known_anchor();
+    let transition = client_tls_ca_transition(&service, &private);
+
+    let view = service
+        .install_client_tls_ca_transition(Box::new(transition.clone()))
+        .await
+        .expect("installed");
+
+    assert_eq!(view.ca_tls_epoch, 2);
+    assert_eq!(view.next_ca_tls_epoch, 3);
+    assert_eq!(
+        view.next_ca_tls_fingerprint,
+        transition
+            .next_client_tls_ca_certificate
+            .fingerprint()
+            .to_hex()
+    );
+    assert_eq!(view.activation_at, transition.window.activation_at);
+    assert_eq!(view.not_after, transition.window.not_after);
+    assert!(!view.already_present);
+    let registry = service.registry.lock().await;
+    assert!(registry
+        .state()
+        .client_tls_ca
+        .next_client_tls_ca_certificate
+        .is_some());
+}
+
+/// The gateway verifies, not the console: a transition signed by another key
+/// is refused and the registry keeps its state.
+#[tokio::test]
+async fn client_tls_ca_install_refuses_a_transition_badly_signed() {
+    use helios_api::certificates::GatewayIdentityHandler;
+
+    let (service, _directory, _private) = service_with_known_anchor();
+    let (stranger, _) = generate_ml_dsa_87_keypair().expect("keygen");
+    let transition = client_tls_ca_transition(&service, &stranger);
+    let before = service.registry.lock().await.state().clone();
+
+    let refusal = service
+        .install_client_tls_ca_transition(Box::new(transition))
+        .await;
+
+    assert!(refusal.is_err());
+    assert_eq!(
+        service.registry.lock().await.state().client_tls_ca,
+        before.client_tls_ca,
+        "a refused transition leaves the registry unchanged"
+    );
+}
+
+/// Carrying the same document twice must not consume a second epoch, and the
+/// operator is told it was already there.
+#[tokio::test]
+async fn client_tls_ca_install_replay_answers_already_present() {
+    use helios_api::certificates::GatewayIdentityHandler;
+
+    let (service, _directory, private) = service_with_known_anchor();
+    let transition = client_tls_ca_transition(&service, &private);
+
+    let first = service
+        .install_client_tls_ca_transition(Box::new(transition.clone()))
+        .await
+        .expect("first");
+    let replay = service
+        .install_client_tls_ca_transition(Box::new(transition))
+        .await
+        .expect("replay");
+
+    assert!(!first.already_present);
+    assert!(replay.already_present);
+}

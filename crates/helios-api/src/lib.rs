@@ -302,6 +302,10 @@ pub fn router(state: AppState) -> Router {
             "/api/certificates/ca-transition",
             post(certificates::ca_transition_install),
         )
+        .route(
+            "/api/certificates/client-tls-ca-transition",
+            post(certificates::client_tls_ca_transition_install),
+        )
         // The operator campaign, relayed from inside the tunnel (spec §8.5).
         // The surfaces Astra's public origin exposes, plus the opening, which
         // that origin refuses and Astra's door serves privately (lot 5a). On
