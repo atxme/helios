@@ -36,9 +36,10 @@ use std::sync::Arc;
 
 use aether::certificates::encoding::{Fingerprint, Id16};
 use astra_channel::{
-    OperatorIdentity, RelayedOperatorCampaign, RelayedOperatorOpen, RelayedOperatorSignerResult,
-    MAX_OPERATOR_RELAY_BODY_BYTES, OPERATOR_OPEN_ROUTE, OPERATOR_OPERATION_ROUTE,
-    OPERATOR_PENDING_ROUTE, OPERATOR_SIGNER_REQUEST_ROUTE, OPERATOR_SIGNER_RESULT_ROUTE,
+    OperatorAuthorityStatus, OperatorIdentity, OperatorIssuerStatus, RelayedOperatorCampaign,
+    RelayedOperatorOpen, RelayedOperatorSignerResult, MAX_OPERATOR_RELAY_BODY_BYTES,
+    OPERATOR_OPEN_ROUTE, OPERATOR_OPERATION_ROUTE, OPERATOR_PENDING_ROUTE,
+    OPERATOR_SIGNER_REQUEST_ROUTE, OPERATOR_SIGNER_RESULT_ROUTE, OPERATOR_STATUS_ROUTE,
     OPERATOR_VAULT_ROUTE,
 };
 use axum::{
@@ -54,7 +55,7 @@ use crate::service::{
     AstraService, ServiceError,
 };
 
-/// The six private operator routes, for the listener of §8.3 to merge.
+/// The seven private operator routes, for the listener of §8.3 to merge.
 pub fn private_routes() -> Router<Arc<AstraService>> {
     Router::new()
         .route(
@@ -62,6 +63,7 @@ pub fn private_routes() -> Router<Arc<AstraService>> {
             post(open).layer(DefaultBodyLimit::max(MAX_OPERATOR_RELAY_BODY_BYTES)),
         )
         .route(OPERATOR_PENDING_ROUTE, post(pending))
+        .route(OPERATOR_STATUS_ROUTE, post(status))
         .route(OPERATOR_OPERATION_ROUTE, post(operation))
         .route(OPERATOR_SIGNER_REQUEST_ROUTE, post(signer_request))
         .route(OPERATOR_VAULT_ROUTE, post(vault))
@@ -123,6 +125,54 @@ async fn pending(
         Json(aether::certificates::transport::OperatorPendingList { operations }),
     )
         .into_response()
+}
+
+/// What this authority holds, for Orion to decide what is left to do (§5.9).
+///
+/// A read: no capability token, no volume lock, nothing minted. Each of the
+/// three service values is copied out of its lock before the registry's is
+/// taken, so no guard crosses an `.await`.
+async fn status(
+    State(service): State<Arc<AstraService>>,
+    Json(relayed): Json<RelayedOperatorCampaign>,
+) -> Response {
+    let _ = &relayed.operator;
+    // What Astra serves, not `state.credential_registry_epoch`, which is only
+    // the floor the registry was bootstrapped with.
+    let credential_registry_epoch = service.approval_credentials().epoch;
+    let serving_epoch = service
+        .issuer()
+        .map(|issuer| issuer.authorization.issuer_epoch);
+    let vault_copy_fingerprint = service
+        .encrypted_vault()
+        .map(|bytes| Fingerprint::of(&bytes));
+    let registry = service.registry.lock().await;
+    let state = registry.state();
+    let report = OperatorAuthorityStatus {
+        ca_epoch: state.ca_epoch,
+        ca_fingerprint: state.ca_public_key.authority_fingerprint(),
+        next_ca_fingerprint: state
+            .ca_rotation
+            .as_ref()
+            .map(|rotation| rotation.next_ca_public_key.authority_fingerprint()),
+        ca_tls_epoch: state.ca_tls_epoch,
+        ca_tls_fingerprint: state.ca_tls_fingerprint,
+        next_ca_tls_fingerprint: state
+            .ca_tls_rotation
+            .as_ref()
+            .map(|rotation| rotation.next_ca_tls_fingerprint),
+        issuer: state.issuer.as_ref().map(|issuer| OperatorIssuerStatus {
+            recorded_epoch: issuer.issuer_epoch,
+            serving_epoch,
+            ca_epoch: issuer.authorization.ca_epoch,
+            ca_tls_epoch: issuer.authorization.ca_tls_epoch,
+            not_after: issuer.authorization.not_after,
+        }),
+        vault_copy_fingerprint,
+        credential_registry_epoch,
+    };
+    drop(registry);
+    (axum::http::StatusCode::OK, Json(report)).into_response()
 }
 
 async fn operation(
@@ -245,6 +295,16 @@ async fn open(
     {
         Ok(DoorOutcome::Opened(opening)) => {
             (axum::http::StatusCode::OK, Json(opening.opened)).into_response()
+        }
+        // The delegation's public request replaces the file the console
+        // writes: the tunnel has no `--out`, so it travels in the answer.
+        Ok(DoorOutcome::IssuerRequested {
+            request,
+            opened: Some(opening),
+        }) => {
+            let mut opened = opening.opened;
+            opened.delegation_request = Some(request);
+            (axum::http::StatusCode::OK, Json(opened)).into_response()
         }
         Ok(_) => {
             tracing::error!(

@@ -693,6 +693,7 @@ fn an_opened_answer_omits_absent_expiries() {
         required_credentials: 2,
         expires_at: 1_000,
         revocation_expiries: None,
+        delegation_request: None,
     };
     let value = serde_json::to_value(&opened).expect("serialize");
     assert!(value.get("revocation_expiries").is_none());
@@ -705,6 +706,26 @@ fn an_opened_answer_omits_absent_expiries() {
     assert_eq!(value["revocation_expiries"]["tls_not_after"], 10);
     let back: OperatorOpened = serde_json::from_value(value).expect("round trip");
     assert_eq!(back.revocation_expiries, opened.revocation_expiries);
+}
+
+#[test]
+fn a_delegation_opening_names_no_peer_and_its_request_is_optional_on_the_wire() {
+    let request: OperatorOpenRequest = serde_json::from_value(serde_json::json!({
+        "action": "issuer_delegation",
+        "reason": "after a CA replacement",
+        "requested_by": "alice",
+    }))
+    .expect("parse");
+    assert_eq!(request.action, OperatorOpenAction::IssuerDelegation);
+    assert!(
+        serde_json::from_value::<OperatorOpenRequest>(serde_json::json!({
+            "action": "issuer_delegation",
+            "peer": WireGuardKey::from_bytes([2; 32]),
+            "reason": "r",
+            "requested_by": "alice",
+        }))
+        .is_err()
+    );
 }
 
 #[test]

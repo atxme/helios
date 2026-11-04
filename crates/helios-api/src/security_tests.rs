@@ -156,6 +156,28 @@ async fn the_operator_campaign_routes_live_behind_the_admin_barrier() {
     );
 }
 
+/// The status read sits on the admin surface like the rest of the campaign.
+#[tokio::test]
+async fn the_operator_status_is_an_admin_read() {
+    const URI: &str = "/api/certificates/operator/status";
+
+    let (unknown_state, _cmd_rx) = state();
+    let mut unknown = Request::builder().uri(URI).body(Body::empty()).unwrap();
+    unknown.extensions_mut().insert(ConnectInfo(
+        "100.64.9.9:4242".parse::<SocketAddr>().unwrap(),
+    ));
+    let response = router(unknown_state).oneshot(unknown).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let (admin_state, _cmd_rx) = state();
+    let mut administrator = Request::builder().uri(URI).body(Body::empty()).unwrap();
+    administrator.extensions_mut().insert(ConnectInfo(
+        "100.64.1.2:4242".parse::<SocketAddr>().unwrap(),
+    ));
+    let response = router(admin_state).oneshot(administrator).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
 /// Operator results have their own 64 KiB contract.
 ///
 /// The trust-update protocol is chunked and uses a smaller 32 KiB request

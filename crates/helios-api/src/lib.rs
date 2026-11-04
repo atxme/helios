@@ -319,6 +319,10 @@ pub fn router(state: AppState) -> Router {
             get(certificates::operator_pending),
         )
         .route(
+            "/api/certificates/operator/status",
+            get(certificates::operator_status),
+        )
+        .route(
             "/api/certificates/operator/operations/{operation}",
             get(certificates::operator_operation),
         )

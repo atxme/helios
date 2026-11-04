@@ -116,6 +116,21 @@ impl AstraLifecycleClient {
         .await
     }
 
+    /// Reads what Astra holds of its authority state. No capability token
+    /// crosses.
+    pub async fn operator_status(
+        &self,
+        relayed: &RelayedOperatorCampaign,
+    ) -> Result<OperatorAuthorityStatus, ChannelError> {
+        self.post_bounded(
+            OPERATOR_STATUS_ROUTE,
+            relayed,
+            None,
+            MAX_OPERATOR_ANSWER_BYTES,
+        )
+        .await
+    }
+
     /// Fetches what the companion has to display before it asks for a touch.
     pub async fn operator_signer_request(
         &self,

@@ -33,6 +33,13 @@ pub trait OperatorCampaignRelay: Send + Sync {
         operator: &astra_channel::OperatorIdentity,
     ) -> Result<astra_channel::OperatorPendingList, TrustUpdateRefusal>;
 
+    /// Reads what Astra holds of its authority state. A read: no capability
+    /// token, and nothing secret in the answer.
+    async fn status(
+        &self,
+        operator: &astra_channel::OperatorIdentity,
+    ) -> Result<astra_channel::OperatorAuthorityStatus, TrustUpdateRefusal>;
+
     /// Reads one campaign operation.
     async fn operation(
         &self,
@@ -360,6 +367,28 @@ pub async fn operator_open(
     };
     match relay.open(&operator, request).await {
         Ok(opened) => (StatusCode::OK, Json(opened)).into_response(),
+        Err(refusal) => refusal.status().into_response(),
+    }
+}
+
+/// `GET /api/certificates/operator/status`.
+///
+/// On the admin surface beside the other operator routes. A read: it carries
+/// no capability token and returns none, and what it answers is epochs and
+/// fingerprints.
+pub async fn operator_status(
+    State(s): State<AppState>,
+    Extension(caller): Extension<crate::auth::Caller>,
+) -> Response {
+    let operator = match operator_caller(&caller, "status") {
+        Ok(operator) => operator,
+        Err(status) => return status.into_response(),
+    };
+    let Some(relay) = s.operator_campaign.as_ref() else {
+        return operator_unavailable(&operator, "status");
+    };
+    match relay.status(&operator).await {
+        Ok(report) => (StatusCode::OK, Json(report)).into_response(),
         Err(refusal) => refusal.status().into_response(),
     }
 }

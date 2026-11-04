@@ -222,7 +222,7 @@ fn specified(request: &DoorRequest) -> (bool, bool) {
         DoorRequest::ChainOpen { .. } => (true, false),
         DoorRequest::ChainNext {} => (true, false),
         DoorRequest::ChainAbandon {} => (true, false),
-        DoorRequest::IssuerDelegation { .. } => (true, false),
+        DoorRequest::IssuerDelegation { .. } => (true, true),
         DoorRequest::IssuerRequest {} => (true, false),
         DoorRequest::PinCaTls { .. } => (true, false),
         DoorRequest::IssuerInstall { .. } => (true, false),
@@ -1122,6 +1122,28 @@ fn chain_step(
         ),
         other => panic!("expected a chain step, got {other:?}"),
     }
+}
+
+/// The user's decision of 4 November 2026 widens one entry only: a tunnel
+/// opens a delegation, and still neither reads a bare request nor installs.
+#[tokio::test]
+async fn tunnel_still_cannot_request_or_install_a_delegation() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture(dir.path());
+    let delegated = delegated_material();
+    for request in [
+        DoorRequest::IssuerRequest {},
+        DoorRequest::IssuerInstall {
+            authorization: Box::new(delegation(&delegated, 1)),
+        },
+    ] {
+        let refusal = service
+            .door(tunnel(), request, NOW)
+            .await
+            .expect_err("the tunnel is refused");
+        assert!(matches!(refusal, DoorRefusal::NotAllowedHere));
+    }
+    assert!(!crate::issuer::pq_key_path(dir.path(), 1).exists());
 }
 
 #[tokio::test]

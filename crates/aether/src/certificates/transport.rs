@@ -1160,7 +1160,12 @@ pub struct OperatorPendingOperation {
 pub enum OperatorOpenAction {
     FleetLeafs,
     TrustAuthorities,
-    ClientRevocation { peer: WireGuardKey },
+    ClientRevocation {
+        peer: WireGuardKey,
+    },
+    /// The next delegation of Astra's issuer (lot 5b, §5.8). It draws keys in
+    /// the volume, which grants nothing: the operator's touch does.
+    IssuerDelegation,
 }
 
 const DEFAULT_OPEN_WINDOW_SECS: u64 = 300;
@@ -1194,6 +1199,7 @@ enum OperatorOpenActionTag {
     FleetLeafs,
     TrustAuthorities,
     ClientRevocation,
+    IssuerDelegation,
 }
 
 #[derive(Deserialize)]
@@ -1214,6 +1220,7 @@ impl TryFrom<OperatorOpenRequestWire> for OperatorOpenRequest {
         let action = match (wire.action, wire.peer) {
             (OperatorOpenActionTag::FleetLeafs, None) => OperatorOpenAction::FleetLeafs,
             (OperatorOpenActionTag::TrustAuthorities, None) => OperatorOpenAction::TrustAuthorities,
+            (OperatorOpenActionTag::IssuerDelegation, None) => OperatorOpenAction::IssuerDelegation,
             (OperatorOpenActionTag::ClientRevocation, Some(peer)) => {
                 OperatorOpenAction::ClientRevocation { peer }
             }
@@ -1255,6 +1262,47 @@ pub struct OperatorOpened {
     pub expires_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revocation_expiries: Option<RevocationExpiries>,
+    /// The public request of an issuer delegation, as the console's
+    /// `issuer request` prints it. Present only for that scope: the keys it
+    /// names were just drawn in the volume, and this is their public half.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation_request: Option<String>,
+}
+
+/// What Astra reports of its own authority state, for Orion to decide what is
+/// left to do (lot 5b, §5.9).
+///
+/// Fingerprints and epochs only: no token, no key, no document. It is a read,
+/// so it needs no capability and mints none.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorAuthorityStatus {
+    pub ca_epoch: u64,
+    pub ca_fingerprint: Fingerprint,
+    pub next_ca_fingerprint: Option<Fingerprint>,
+    pub ca_tls_epoch: u64,
+    pub ca_tls_fingerprint: Option<Fingerprint>,
+    pub next_ca_tls_fingerprint: Option<Fingerprint>,
+    pub issuer: Option<OperatorIssuerStatus>,
+    /// Fingerprint of the encrypted vault copy Astra holds, if any.
+    pub vault_copy_fingerprint: Option<Fingerprint>,
+    /// The epoch of the credential document Astra serves, not the registry's
+    /// bootstrap floor.
+    pub credential_registry_epoch: u64,
+}
+
+/// The delegation: what the registry records and what Astra serves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorIssuerStatus {
+    /// The registry's epoch.
+    pub recorded_epoch: u64,
+    /// The epoch of the issuer in service; differs from the recorded one when
+    /// an adoption failed, and is absent when none is loaded.
+    pub serving_epoch: Option<u64>,
+    pub ca_epoch: u64,
+    pub ca_tls_epoch: u64,
+    pub not_after: u64,
 }
 
 /// Everything waiting for an operator, at one instant.

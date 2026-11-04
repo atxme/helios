@@ -674,6 +674,21 @@ impl helios_api::certificates::OperatorCampaignRelay for AstraRenewalRelay {
             .map_err(|error| Self::refuse("operator-pending", error))
     }
 
+    async fn status(
+        &self,
+        operator: &::astra_channel::OperatorIdentity,
+    ) -> Result<
+        ::astra_channel::OperatorAuthorityStatus,
+        helios_api::certificates::TrustUpdateRefusal,
+    > {
+        self.client
+            .operator_status(&::astra_channel::RelayedOperatorCampaign {
+                operator: operator.clone(),
+            })
+            .await
+            .map_err(|error| Self::refuse("operator-status", error))
+    }
+
     async fn operation(
         &self,
         operator: &::astra_channel::OperatorIdentity,

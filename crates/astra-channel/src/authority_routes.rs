@@ -46,6 +46,9 @@ pub const OPERATOR_SIGNER_RESULT_ROUTE: &str = "/internal/v1/operator/signer-res
 /// Everything waiting for an operator. Carries no capability token: see
 /// [`aether::certificates::transport::OperatorPendingOperation`].
 pub const OPERATOR_PENDING_ROUTE: &str = "/internal/v1/operator/pending";
+/// What Astra reports of its authority state. A read: no capability token,
+/// none minted.
+pub const OPERATOR_STATUS_ROUTE: &str = "/internal/v1/operator/status";
 /// Opens a campaign for an administrator relayed from the tunnel. Carries no
 /// capability token: opening grants nothing, the operator's credential does.
 pub const OPERATOR_OPEN_ROUTE: &str = "/internal/v1/operator/campaigns";
@@ -138,9 +141,9 @@ pub struct RelayedOperatorOpen {
 
 /// The two operator shapes both ends parse, defined once in `aether`.
 pub use aether::certificates::transport::{
-    OperatorOpenAction, OperatorOpenRequest, OperatorOpened, OperatorPendingList,
-    OperatorPendingOperation, OperatorSignerRequestResponse, RevocationExpiries,
-    SigningOperationState, SigningOperationView,
+    OperatorAuthorityStatus, OperatorIssuerStatus, OperatorOpenAction, OperatorOpenRequest,
+    OperatorOpened, OperatorPendingList, OperatorPendingOperation, OperatorSignerRequestResponse,
+    RevocationExpiries, SigningOperationState, SigningOperationView,
 };
 
 /// The name the gateway puts in SNI when it dials Astra.

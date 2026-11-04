@@ -274,6 +274,7 @@ pub(super) async fn open_campaign(
         required_credentials: operation.campaign.required_credentials,
         expires_at: operation.expires_at,
         revocation_expiries,
+        delegation_request: None,
     };
     store
         .open(operation, now_unix)

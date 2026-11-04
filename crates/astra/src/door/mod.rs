@@ -217,6 +217,7 @@ impl From<OperatorOpenRequest> for DoorRequest {
             OperatorOpenAction::FleetLeafs => Self::FleetLeafs { text },
             OperatorOpenAction::TrustAuthorities => Self::TrustAuthorities { text },
             OperatorOpenAction::ClientRevocation { peer } => Self::ClientRevocation { peer, text },
+            OperatorOpenAction::IssuerDelegation => Self::IssuerDelegation { text },
         }
     }
 }
@@ -526,7 +527,7 @@ pub fn allowed(connector: &DoorConnector, request: &DoorRequest) -> bool {
         DoorRequest::ChainOpen { .. } => (true, false),
         DoorRequest::ChainNext {} => (true, false),
         DoorRequest::ChainAbandon {} => (true, false),
-        DoorRequest::IssuerDelegation { .. } => (true, false),
+        DoorRequest::IssuerDelegation { .. } => (true, true),
         DoorRequest::IssuerRequest {} => (true, false),
         DoorRequest::PinCaTls { .. } => (true, false),
         DoorRequest::IssuerInstall { .. } => (true, false),
