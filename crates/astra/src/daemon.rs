@@ -107,19 +107,8 @@ pub(crate) fn run(
     );
 
     let issuer = astra::issuer::load_from_registry(state_dir, &registry)?;
-    // A promotion that crashed before the file followed puts its document in
-    // place first: the file on disk is signed under the previous anchor and
-    // would not verify.
     let mut registry = registry;
-    if let Some(document) = registry.state().promoted_credentials.clone() {
-        verify_credentials(&document, &registry)
-            .context("verifying the credential document a promotion left")?;
-        write_credentials_file(state_dir, &document)?;
-        registry
-            .take_promoted_credentials()
-            .context("clearing the adopted credential document")?;
-    }
-    let credentials = load_approval_credentials(state_dir, &registry)?;
+    let credentials = startup_credentials(state_dir, &mut registry)?;
     let service_public_key = registry.state().astra_service_public_key.clone();
     let operations =
         astra::operations::OperationStore::load(&state_dir.join(OPERATIONS_FILE), now_unix())
@@ -322,11 +311,13 @@ fn spawn_transition_sweep(service: Arc<AstraService>) {
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
+            // Restored on a failed save: otherwise a promotion only memory
+            // knows would be adopted into the file and forgotten by a restart.
             match service
                 .registry
                 .lock()
                 .await
-                .forget_expired_transitions(now_unix())
+                .write_or_restore(|registry| registry.forget_expired_transitions(now_unix()))
             {
                 Ok(0) => {}
                 Ok(dropped) => tracing::info!(
@@ -427,18 +418,67 @@ fn verify_credentials(
 }
 
 /// Writes the credential document where a crash leaves the old file or the new
-/// one, never half of it: start-up refuses a document it cannot parse.
+/// one, durably: the pending copy in the registry is cleared right after, so
+/// this must be on disk first.
 fn write_credentials_file(
     state_dir: &Path,
     document: &aether::certificates::approval::CredentialRegistry,
 ) -> Result<()> {
     let path = state_dir.join(CREDENTIALS_FILE);
-    let temporary = path.with_extension("tmp");
     let encoded =
         serde_json::to_vec_pretty(document).context("encoding the credential document")?;
-    std::fs::write(&temporary, encoded)
-        .and_then(|()| std::fs::rename(&temporary, &path))
+    aether::private_file::write_private_atomic(&path, &encoded)
         .with_context(|| format!("writing {}", path.display()))
+}
+
+/// Adopts, at start-up, the document a promotion left pending: verify, write
+/// the file, then clear the pending copy.
+fn adopt_pending_at_start(state_dir: &Path, registry: &mut AstraRegistry) -> Result<()> {
+    let Some(document) = registry.state().promoted_credentials.clone() else {
+        return Ok(());
+    };
+    verify_credentials(&document, registry)
+        .context("verifying the credential document a promotion left")?;
+    write_credentials_file(state_dir, &document)?;
+    registry
+        .take_promoted_credentials()
+        .context("clearing the adopted credential document")?;
+    Ok(())
+}
+
+/// The credentials to serve at start-up.
+///
+/// A pending document is adopted first: the file on disk is signed under the
+/// previous anchor and would not verify. A failed adoption must not stop the
+/// service, because a service that cannot start cannot be repaired without a
+/// terminal: it is logged, and when the stale file then fails to load the
+/// service starts with no operator credential (every approval refused by
+/// name) and the sweep retries. A failure with nothing pending keeps its
+/// meaning and still aborts.
+fn startup_credentials(
+    state_dir: &Path,
+    registry: &mut AstraRegistry,
+) -> Result<astra::service::ApprovalCredentials> {
+    if let Err(error) = adopt_pending_at_start(state_dir, registry) {
+        tracing::error!(
+            %error,
+            "could not adopt the rotated credential document at start; it stays pending"
+        );
+    }
+    match load_approval_credentials(state_dir, registry) {
+        Err(error) if registry.state().promoted_credentials.is_some() => {
+            tracing::error!(
+                %error,
+                "the credential file predates the promotion and its document is still                  pending: starting without operator credentials until the sweep adopts it"
+            );
+            Ok(astra::service::ApprovalCredentials {
+                ids: Vec::new(),
+                epoch: registry.state().credential_registry_epoch,
+                registry: None,
+            })
+        }
+        loaded => loaded,
+    }
 }
 
 /// Puts the credential document a `CA-PQ` promotion left into service.
@@ -449,21 +489,25 @@ fn write_credentials_file(
 /// A failed file write keeps the pending copy for the next pass and leaves the
 /// previous document serving.
 pub(crate) async fn adopt_promoted_credentials(service: &AstraService) -> Result<()> {
-    let pending = service
-        .registry
-        .lock()
-        .await
-        .state()
-        .promoted_credentials
-        .clone();
-    let Some(document) = pending else {
+    // One critical section for the read, the check, the write and the clear.
+    // The file write under it is bounded the way `AstraRegistry::save` already
+    // is under this lock, and the sweep is the only adopter, so nothing waits
+    // on it for long nor can the pending copy change in between.
+    let mut registry = service.registry.lock().await;
+    let Some(document) = registry.state().promoted_credentials.clone() else {
         return Ok(());
     };
-    {
-        let registry = service.registry.lock().await;
-        verify_credentials(&document, &registry)
-            .context("verifying the credential document a promotion left")?;
-    }
+    verify_credentials(&document, &registry)
+        .context("verifying the credential document a promotion left")?;
+    // The registry's own epoch is only the bootstrap minimum (nothing here
+    // advances it), so the epoch in service is the floor that matters: a
+    // rotated document must never walk the allow-list backwards.
+    let served = service.approval_credentials().epoch;
+    anyhow::ensure!(
+        document.credential_registry_epoch >= served,
+        "the rotated credential document is at epoch {}, below the {served} in service",
+        document.credential_registry_epoch
+    );
     write_credentials_file(&service.state_dir, &document)?;
     let credentials = astra::service::ApprovalCredentials::from_document(document);
     let epoch = credentials.epoch;
@@ -471,10 +515,7 @@ pub(crate) async fn adopt_promoted_credentials(service: &AstraService) -> Result
         .approval_credentials
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(credentials);
-    service
-        .registry
-        .lock()
-        .await
+    registry
         .take_promoted_credentials()
         .context("clearing the adopted credential document")?;
     tracing::info!(
@@ -683,5 +724,106 @@ mod tests {
         adopt_promoted_credentials(&service).await.expect("second");
 
         assert_eq!(service.approval_credentials().epoch, 2);
+    }
+
+    fn registry_of(service: AstraService) -> AstraRegistry {
+        service.registry.into_inner()
+    }
+
+    #[test]
+    fn a_pending_document_that_cannot_be_written_does_not_stop_the_start() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let (ca_private, ca_public) = generate_ml_dsa_87_keypair().expect("keygen");
+        let mut registry = registry_of(service(
+            directory.path(),
+            ca_public,
+            2,
+            None,
+            Some(document(&ca_private, 2, 2)),
+        ));
+        // A symlink at the destination makes the atomic write refuse, and the
+        // stale file behind it does not parse under the promoted anchor.
+        let stale = directory.path().join("stale.json");
+        std::fs::write(&stale, b"{}").expect("stale file");
+        std::os::unix::fs::symlink(&stale, directory.path().join(CREDENTIALS_FILE))
+            .expect("symlink");
+
+        let credentials =
+            startup_credentials(directory.path(), &mut registry).expect("service still starts");
+
+        assert!(credentials.ids.is_empty());
+        assert!(credentials.registry.is_none());
+        assert!(registry.state().promoted_credentials.is_some());
+    }
+
+    #[test]
+    fn a_pending_document_that_fails_verification_does_not_stop_the_start() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let (ca_private, ca_public) = generate_ml_dsa_87_keypair().expect("keygen");
+        // Signed for epoch 3 while the registry pins epoch 2.
+        let mut registry = registry_of(service(
+            directory.path(),
+            ca_public,
+            2,
+            None,
+            Some(document(&ca_private, 3, 2)),
+        ));
+        std::fs::write(directory.path().join(CREDENTIALS_FILE), b"{}").expect("stale file");
+
+        let credentials =
+            startup_credentials(directory.path(), &mut registry).expect("service still starts");
+
+        assert!(credentials.registry.is_none());
+        assert!(registry.state().promoted_credentials.is_some());
+    }
+
+    #[test]
+    fn a_broken_file_with_nothing_pending_still_aborts_the_start() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let (_, ca_public) = generate_ml_dsa_87_keypair().expect("keygen");
+        let mut registry = registry_of(service(directory.path(), ca_public, 2, None, None));
+        std::fs::write(directory.path().join(CREDENTIALS_FILE), b"{}").expect("broken file");
+
+        assert!(startup_credentials(directory.path(), &mut registry).is_err());
+    }
+
+    #[test]
+    fn a_pending_document_is_adopted_at_start() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let (ca_private, ca_public) = generate_ml_dsa_87_keypair().expect("keygen");
+        let mut registry = registry_of(service(
+            directory.path(),
+            ca_public,
+            2,
+            None,
+            Some(document(&ca_private, 2, 2)),
+        ));
+
+        let credentials = startup_credentials(directory.path(), &mut registry).expect("start");
+
+        assert_eq!(credentials.epoch, 2);
+        assert!(registry.state().promoted_credentials.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_rotated_document_below_the_served_epoch_is_refused() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let (ca_private, ca_public) = generate_ml_dsa_87_keypair().expect("keygen");
+        let service = service(
+            directory.path(),
+            ca_public,
+            2,
+            None,
+            Some(document(&ca_private, 2, 1)),
+        );
+        *service.approval_credentials.write().expect("lock") =
+            Arc::new(astra::service::ApprovalCredentials {
+                ids: Vec::new(),
+                epoch: 5,
+                registry: None,
+            });
+
+        assert!(adopt_promoted_credentials(&service).await.is_err());
+        assert_eq!(service.approval_credentials().epoch, 5);
     }
 }
