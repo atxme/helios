@@ -66,7 +66,7 @@ tempfile = "3"
 # is one Orion accepts (`certificates.rs`).
 orion-core = { workspace = true }
 rcgen = { workspace = true }
-# `StatusCode` de `ChannelError::Status`, pour éprouver le relais des statuts.
+# `StatusCode` for `ChannelError::Status`, to test how statuses are relayed.
 axum = { workspace = true }
 
 # `prctl(PR_SET_DUMPABLE, 0)` avant le chargement de la première clé

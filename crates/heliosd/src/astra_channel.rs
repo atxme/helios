@@ -921,8 +921,6 @@ mod tests {
         guard
     }
 
-    /// A gateway with no channel document is a gateway without an authority,
-    /// which is a supported state — not an error.
     /// A full store on the authority is a `429`, relayed as such: collapsing
     /// it to `Internal` would show an operator a gateway fault for what is a
     /// queue to drain.
@@ -936,6 +934,8 @@ mod tests {
         assert_eq!(refusal, TrustUpdateRefusal::Throttled);
     }
 
+    /// A gateway with no channel document is a gateway without an authority,
+    /// which is a supported state — not an error.
     #[test]
     fn an_absent_document_is_not_an_error() {
         let directory = tempfile::tempdir().unwrap();
