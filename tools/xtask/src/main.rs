@@ -594,13 +594,13 @@ fn cargo_target_dir_from(root: &Path, configured: Option<std::ffi::OsString>) ->
 
 /// The version the bundle is labeled with, read from the `heliosd` crate.
 ///
-/// It must be the daemon's own version, not the workspace's. `heliosd` does
-/// not inherit `version.workspace`, and the readiness marker it writes after
-/// an update carries `env!("CARGO_PKG_VERSION")` — its crate version. The
-/// installer compares that marker to the manifest before confirming, so a
-/// bundle labeled with the workspace version cannot be confirmed by the
-/// binary it ships: the health check reads two different numbers for the same
-/// release, times out, and rolls back a daemon that had in fact started.
+/// It must be the daemon's own version, which is the Helios product version.
+/// The readiness marker `heliosd` writes after an update carries
+/// `env!("CARGO_PKG_VERSION")` — its crate version. The installer compares
+/// that marker to the manifest before confirming, so a bundle labeled with any
+/// other number cannot be confirmed by the binary it ships: the health check
+/// reads two different numbers for the same release, times out, and rolls back
+/// a daemon that had in fact started.
 fn release_version(root: &Path) -> Result<String> {
     let manifest = std::fs::read_to_string(root.join("crates").join("heliosd").join("Cargo.toml"))
         .context("reading crates/heliosd/Cargo.toml")?;
