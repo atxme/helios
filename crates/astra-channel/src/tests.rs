@@ -582,3 +582,27 @@ fn the_state_view_serializes_no_secret() {
         );
     }
 }
+
+#[test]
+fn a_relayed_open_carries_the_operator_and_the_request() {
+    let relayed = RelayedOperatorOpen {
+        operator: OperatorIdentity::DevLoopback,
+        request: OperatorOpenRequest {
+            action: OperatorOpenAction::TrustAuthorities,
+            reason: "rotation".to_owned(),
+            requested_by: "alice".to_owned(),
+            window_secs: 300,
+        },
+    };
+    let value = serde_json::to_value(&relayed).expect("serialize");
+    assert_eq!(value["operator"]["kind"], "dev_loopback");
+    assert_eq!(value["request"]["action"], "trust_authorities");
+    assert_eq!(OPERATOR_OPEN_ROUTE, "/internal/v1/operator/campaigns");
+    assert!(OPERATOR_OPEN_ROUTE.starts_with(ASTRA_OPERATOR_PREFIX));
+    let back: RelayedOperatorOpen = serde_json::from_value(value).expect("round trip");
+    assert_eq!(back.operator, relayed.operator);
+
+    let mut extra = serde_json::to_value(&relayed).expect("serialize");
+    extra["path"] = serde_json::json!("/x");
+    assert!(serde_json::from_value::<RelayedOperatorOpen>(extra).is_err());
+}

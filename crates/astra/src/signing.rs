@@ -37,40 +37,13 @@ use std::collections::BTreeMap;
 use aether::certificates::{
     approval::CredentialRegistry,
     encoding::{Fingerprint, Id16, WireGuardKey},
-    status::{AstraRotationCampaign, AstraSignerRequest, AstraSignerResult},
+    status::{
+        AstraRotationCampaign, AstraSignerRequest, AstraSignerResult, CampaignFamily,
+        CampaignScope, CampaignTarget,
+    },
     transport::TrustUpdateObject,
     CertificateError,
 };
-use serde::{Deserialize, Serialize};
-
-/// Directory a local operator command deposits a campaign into.
-///
-/// # Why an inbox and not a call
-///
-/// The store above lives in the process that serves the endpoint, in memory.
-/// `astra campaign open` runs in a **different** process — it is a shell
-/// command on the machine, deliberately, because opening a campaign from the
-/// public origin would mean an unauthenticated route that resolves and returns
-/// the fleet's inventory. So the command deposits, and the server drains.
-///
-/// It is the shape `heliosd peer add` already uses for admissions, and for the
-/// same reason: one owner of the state, and a second process that may only
-/// leave something for it.
-pub const CAMPAIGN_INBOX_DIR: &str = "campaign-inbox";
-
-/// Largest campaign file drained from the inbox, in bytes.
-///
-/// A campaign is bounded at 256 targets, each a handful of fixed-width fields.
-/// Anything above this is not a campaign.
-pub const MAX_INBOX_ENTRY_BYTES: u64 = 512 * 1024;
-
-/// What a local command leaves for the running service.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CampaignDeposit {
-    pub campaign: Box<AstraRotationCampaign>,
-    pub signer_request: Box<AstraSignerRequest>,
-}
 
 /// Largest number of operator operations alive at once.
 ///
@@ -295,6 +268,45 @@ impl SigningOperationStore {
         // has least time to reach.
         pending.sort_by_key(|operation| operation.expires_at);
         pending
+    }
+
+    /// The live operation a new opening over these targets would duplicate.
+    ///
+    /// «Live» is what [`Self::pending`] lists: waiting for its operator and
+    /// not expired. A ceremony that failed or finished does not block the
+    /// next attempt, and one whose window closed is over.
+    ///
+    /// One per [`CampaignFamily`], so a chain step and an isolated
+    /// `fleet_leafs` campaign block each other, on purpose. A revocation is
+    /// the exception: one per identity it names, so that two stolen
+    /// workstations can be revoked within the same minute.
+    pub fn live_conflict(
+        &self,
+        scope: CampaignScope,
+        targets: &[CampaignTarget],
+        now_unix: u64,
+    ) -> Option<Id16> {
+        let family = scope.family();
+        self.operations
+            .values()
+            .filter(|operation| {
+                !operation.is_expired(now_unix)
+                    && operation.state == SigningOperationState::AwaitingOperator
+                    && operation.campaign.scope.family() == family
+            })
+            .find(|operation| match family {
+                CampaignFamily::Revocation => operation.campaign.targets.iter().any(|held| {
+                    targets
+                        .iter()
+                        .any(|asked| asked.identity_key == held.identity_key)
+                }),
+                CampaignFamily::ClientLeaves
+                | CampaignFamily::Authorities
+                | CampaignFamily::GatewayIdentity
+                | CampaignFamily::IssuerDelegation
+                | CampaignFamily::GatewayBootstrap => true,
+            })
+            .map(|operation| operation.operation_id)
     }
 
     /// Admits a new operation, dropping the ones the clock has ended.
@@ -531,40 +543,6 @@ pub struct VerifiedResult {
         Option<Box<aether::certificates::authority::AstraIssuerAuthorization>>,
     /// `true` when these exact bytes were already accepted.
     pub already_accepted: bool,
-}
-
-/// Drains the campaign inbox into the running service's store.
-///
-/// Two seconds, like the gateway's admission drain: an operator who has just
-/// run `astra campaign open` is looking at the terminal, and the campaign they
-/// opened carries a five-minute window — a slower sweep would spend a
-/// noticeable share of it doing nothing.
-pub const INBOX_POLL_INTERVAL_SECS: u64 = 2;
-
-/// Reads one deposit, checks it against the domain, and opens the operation.
-///
-/// The service key signature on the request is **re-verified** here even
-/// though the same machine produced it: the file sat on disk between two
-/// processes, and a check that trusts a path rather than a signature is a
-/// check that trusts whoever can write to that path.
-pub fn adopt_deposit(
-    store: &mut SigningOperationStore,
-    deposit: CampaignDeposit,
-    service_public_key: &aether::certificates::encoding::MlDsa87PublicKey,
-    service_key_epoch: u64,
-    authority_url: &str,
-    now_unix: u64,
-) -> Result<Id16, SigningError> {
-    deposit.signer_request.verify(
-        service_public_key,
-        service_key_epoch,
-        authority_url,
-        now_unix,
-    )?;
-    let operation = SigningOperation::new(deposit.campaign, deposit.signer_request, now_unix)?;
-    let operation_id = operation.operation_id;
-    store.open(operation, now_unix)?;
-    Ok(operation_id)
 }
 
 #[cfg(test)]
@@ -860,6 +838,66 @@ mod tests {
             SigningOperationState::AwaitingOperator,
             "a refused result must not spend the approval"
         );
+    }
+
+    fn awaiting(scope: CampaignScope, identity: u8, operation: u8) -> SigningOperation {
+        let mut campaign = campaign(scope);
+        campaign.targets[0].identity_key = WireGuardKey::from_bytes([identity; 32]);
+        let mut request = request(&campaign, Fingerprint::of(b"vault"));
+        request.operation_id = Id16::new([operation; 16]).expect("id");
+        SigningOperation::new(campaign, request, 1_050).expect("open")
+    }
+
+    /// One live operation per family: what is waiting blocks, what was
+    /// approved or has expired does not.
+    #[test]
+    fn a_live_operation_blocks_its_family_and_only_while_it_waits() {
+        let mut store = SigningOperationStore::new();
+        store
+            .open(awaiting(CampaignScope::FleetLeafs, 3, 8), 1_050)
+            .expect("opened");
+        let targets = campaign(CampaignScope::FleetLeafs).targets;
+
+        assert_eq!(
+            store.live_conflict(CampaignScope::FleetLeafs, &targets, 1_100),
+            Some(Id16::new([8; 16]).expect("id"))
+        );
+        // Same family, another scope: a chain step and an isolated
+        // `fleet_leafs` campaign block each other.
+        assert!(store
+            .live_conflict(CampaignScope::OrionDevice, &targets, 1_100)
+            .is_some());
+        assert!(store
+            .live_conflict(CampaignScope::TrustAuthorities, &targets, 1_100)
+            .is_none());
+        assert!(store
+            .live_conflict(CampaignScope::FleetLeafs, &targets, 1_300)
+            .is_none());
+
+        let approved = approved_store(CampaignScope::FleetLeafs);
+        assert!(approved
+            .live_conflict(CampaignScope::FleetLeafs, &targets, 1_100)
+            .is_none());
+    }
+
+    /// Two stolen workstations can be revoked within the same minute.
+    #[test]
+    fn a_revocation_blocks_only_the_identity_it_names() {
+        let mut store = SigningOperationStore::new();
+        store
+            .open(awaiting(CampaignScope::EmergencyRevocation, 3, 8), 1_050)
+            .expect("opened");
+        let same = campaign(CampaignScope::EmergencyRevocation).targets;
+        let mut other = same.clone();
+        other[0].identity_key = WireGuardKey::from_bytes([4; 32]);
+
+        assert_eq!(
+            store.live_conflict(CampaignScope::EmergencyRevocation, &same, 1_100),
+            Some(Id16::new([8; 16]).expect("id"))
+        );
+        assert!(store
+            .live_conflict(CampaignScope::EmergencyRevocation, &other, 1_100)
+            .is_none());
     }
 
     /// A store that never dropped an abandoned ceremony would let a burst of

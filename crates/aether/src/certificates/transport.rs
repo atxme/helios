@@ -1148,6 +1148,112 @@ pub struct OperatorPendingOperation {
     pub expires_at: u64,
 }
 
+/// Which campaign an administrator asks to open from the tunnel.
+///
+/// Only the scopes the tunnel may open appear here: the others carry material
+/// (a device, a profile) that no administrator names from this surface.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum OperatorOpenAction {
+    FleetLeafs,
+    TrustAuthorities,
+    ClientRevocation { peer: WireGuardKey },
+}
+
+const DEFAULT_OPEN_WINDOW_SECS: u64 = 300;
+
+fn default_open_window_secs() -> u64 {
+    DEFAULT_OPEN_WINDOW_SECS
+}
+
+/// What the administrator sends to open a campaign.
+///
+/// Opening carries no capability: the operation is authorized later, by the
+/// operator's hardware credential, never by who asked for it.
+///
+/// The action is flattened on the wire (`{"action": …, "reason": …}`). serde
+/// cannot refuse unknown fields on a struct with a flattened member, so the
+/// body is read through [`OperatorOpenRequestWire`], which can.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "OperatorOpenRequestWire")]
+pub struct OperatorOpenRequest {
+    #[serde(flatten)]
+    pub action: OperatorOpenAction,
+    pub reason: String,
+    pub requested_by: String,
+    #[serde(default = "default_open_window_secs")]
+    pub window_secs: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum OperatorOpenActionTag {
+    FleetLeafs,
+    TrustAuthorities,
+    ClientRevocation,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OperatorOpenRequestWire {
+    action: OperatorOpenActionTag,
+    peer: Option<WireGuardKey>,
+    reason: String,
+    requested_by: String,
+    #[serde(default = "default_open_window_secs")]
+    window_secs: u64,
+}
+
+impl TryFrom<OperatorOpenRequestWire> for OperatorOpenRequest {
+    type Error = &'static str;
+
+    fn try_from(wire: OperatorOpenRequestWire) -> Result<Self, Self::Error> {
+        let action = match (wire.action, wire.peer) {
+            (OperatorOpenActionTag::FleetLeafs, None) => OperatorOpenAction::FleetLeafs,
+            (OperatorOpenActionTag::TrustAuthorities, None) => OperatorOpenAction::TrustAuthorities,
+            (OperatorOpenActionTag::ClientRevocation, Some(peer)) => {
+                OperatorOpenAction::ClientRevocation { peer }
+            }
+            (OperatorOpenActionTag::ClientRevocation, None) => {
+                return Err("client_revocation names a peer")
+            }
+            _ => return Err("only client_revocation names a peer"),
+        };
+        Ok(Self {
+            action,
+            reason: wire.reason,
+            requested_by: wire.requested_by,
+            window_secs: wire.window_secs,
+        })
+    }
+}
+
+/// The `notAfter` of the leaves a revocation withdraws, when they are known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RevocationExpiries {
+    pub tls_not_after: Option<u64>,
+    pub pq_not_after: Option<u64>,
+}
+
+/// The operation an opening produced.
+///
+/// Like [`OperatorPendingOperation`] it carries no capability token: those are
+/// minted by the routes that open the operation for its operator.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorOpened {
+    pub operation_id: Id16,
+    pub campaign_id: Id16,
+    pub campaign_fingerprint: Fingerprint,
+    pub scope: CampaignScope,
+    pub target_count: usize,
+    pub required_credentials: u8,
+    pub expires_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revocation_expiries: Option<RevocationExpiries>,
+}
+
 /// Everything waiting for an operator, at one instant.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

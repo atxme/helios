@@ -46,6 +46,9 @@ pub const OPERATOR_SIGNER_RESULT_ROUTE: &str = "/internal/v1/operator/signer-res
 /// Everything waiting for an operator. Carries no capability token: see
 /// [`aether::certificates::transport::OperatorPendingOperation`].
 pub const OPERATOR_PENDING_ROUTE: &str = "/internal/v1/operator/pending";
+/// Opens a campaign for an administrator relayed from the tunnel. Carries no
+/// capability token: opening grants nothing, the operator's credential does.
+pub const OPERATOR_OPEN_ROUTE: &str = "/internal/v1/operator/campaigns";
 
 /// Ceiling on every operator answer, including the encrypted vault.
 ///
@@ -122,9 +125,21 @@ pub struct RelayedOperatorSignerResult {
     pub result: Box<aether::certificates::status::AstraSignerResult>,
 }
 
+/// What the gateway relays when an administrator opens a campaign.
+///
+/// The resolved administrator and the request, nothing of the caller's path,
+/// method or headers. The identity is for the log, not an authorization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelayedOperatorOpen {
+    pub operator: OperatorIdentity,
+    pub request: OperatorOpenRequest,
+}
+
 /// The two operator shapes both ends parse, defined once in `aether`.
 pub use aether::certificates::transport::{
-    OperatorPendingList, OperatorPendingOperation, OperatorSignerRequestResponse,
+    OperatorOpenAction, OperatorOpenRequest, OperatorOpened, OperatorPendingList,
+    OperatorPendingOperation, OperatorSignerRequestResponse, RevocationExpiries,
     SigningOperationState, SigningOperationView,
 };
 

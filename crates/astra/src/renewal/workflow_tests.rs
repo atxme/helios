@@ -527,6 +527,7 @@ async fn fixture() -> Fixture {
         encrypted_vault: None,
         state_dir: directory.path().to_path_buf(),
         gateway: Some(channel),
+        volume_writes: crate::door::VolumeWrites::new(),
     });
     Fixture {
         ca_private,

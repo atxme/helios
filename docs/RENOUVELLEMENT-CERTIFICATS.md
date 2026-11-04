@@ -23,6 +23,49 @@ Quatre choses tournent sans qu'un opérateur intervienne, et c'est voulu :
 
 Tout le reste ci-dessous est une action délibérée.
 
+## Les commandes `astra` de ce document
+
+Elles se lancent **dans le conteneur Astra en marche**, par `compose exec`
+(tableau « en marche » de [DEPLOIEMENT-ASTRA](DEPLOIEMENT-ASTRA.md)) :
+
+```sh
+cd ~/astra-build && sudo docker compose -f deploy/astra/compose.yaml \
+  --env-file /var/lib/helios/astra-compose.env \
+  exec -T astra /usr/local/bin/astra campaign open …
+```
+
+Depuis le lot 5a de F14, Astra tient **une seule porte** d'ouverture
+(ROTATION-CERTIFICATS §0.9) : ces commandes n'ouvrent plus rien elles-mêmes,
+elles portent la demande au service par son socket local et impriment sa
+réponse, comme avant. D'où trois règles :
+
+- **Une ouverture exige le service en marche** — `campaign open`,
+  `revocation open`, `gateway-identity open`, `chain open|next|abandon`,
+  `issuer request`. Service arrêté, elle répond « le service Astra ne tourne
+  pas : rien n'a été ouvert » et n'écrit rien.
+- **Une écriture suit le verrou du volume** — `pin-ca-tls`, `issuer install`,
+  `gateway-identity publish`. Service arrêté, elle écrit localement ; service en
+  marche, elle passe par lui et l'ouverture suivante la voit sans redémarrage.
+- **Les refus sont les phrases de la porte**, en français, et la console
+  attend la réponse 60 s au plus : au-delà, elle dit que l'échange s'est
+  interrompu, et ce qui a été fait, s'il y a lieu, est dans le journal
+  d'Astra.
+
+`status` et `chain status` restent des lectures, service arrêté ou non.
+
+Le motif (`--reason`) et le demandeur (`--requested-by`) tiennent sur une
+ligne : 1 024 et 256 caractères au plus, sans caractère de contrôle ni de mise
+en forme invisible (marques bidirectionnelles, largeur nulle). Les accents et
+la ponctuation française passent ; le reste est refusé, quel que soit le
+connecteur.
+
+Trois ouvertures se font aussi **depuis un poste administrateur du tunnel**,
+sans entrer dans le conteneur : `fleet_leafs` (§2), `trust_authorities` (§3,
+§9) et la révocation d'un client (§7), par `POST
+/api/certificates/operator/campaigns`. Les écrans d'Orion qui emploieront
+cette route viennent avec les lots 5b et 5c ; d'ici là, elle s'appelle
+directement.
+
 ## 1. Renouveler la feuille d'un poste (§7.1 → §7.3)
 
 Le cas courant. Rien à faire côté gateway.
@@ -62,6 +105,22 @@ astra campaign open --scope fleet-leafs \
 # → imprime un identifiant d'opération
 ```
 
+Ou, **depuis un poste administrateur du tunnel**, la même ouverture :
+
+```sh
+curl --fail --request POST --header 'Content-Type: application/json' \
+  --data '{"action":"fleet_leafs","reason":"campagne trimestrielle","requested_by":"prénom.nom"}' \
+  http://<VIP de la gateway>:8080/api/certificates/operator/campaigns
+# → operation_id, campaign_fingerprint, target_count, expires_at…
+```
+
+Le demandeur affiché devant le toucher devient alors
+`prénom.nom — pair wireguard:<clé>` : la porte y ajoute la clé WireGuard du
+pair qui a réellement ouvert. Un pair non administrateur est refusé avant que
+la gateway ne relaie quoi que ce soit. Une seconde campagne de parc ouverte
+pendant que la première attend l'opérateur est refusée ; la première figure
+dans l'onglet *Approbations*.
+
 **Sur le poste de l'opérateur**, l'onglet Astra d'Orion s'allume et montre le
 motif, le demandeur, les cibles et l'empreinte avant de demander les clés — une
 à la fois, parce que deux touchers d'un même jeton sont refusés et qu'il vaut
@@ -96,6 +155,8 @@ astra campaign open --scope trust-authorities \
   --reason "rotation annuelle de l'ancre" --requested-by "prénom.nom"
 # → imprime un identifiant d'opération
 ```
+
+Ou par le tunnel, comme au §2, avec `"action":"trust_authorities"`.
 
 **Sur le poste de l'opérateur** :
 
@@ -157,7 +218,10 @@ astra issuer request --out issuer-request.json \
 
 La demande sort sur la sortie standard et dans le fichier ; l'identifiant
 d'opération s'affiche sur l'erreur standard, avec la commande à recopier. Les
-deux clés privées naissent dans le volume d'Astra et n'en sortent pas.
+deux clés privées sont tirées par le service Astra, dans son volume, et n'en
+sortent pas : la commande exige donc le service en marche, avec ou sans
+campagne. `--out` est ouvert avant la demande, si bien qu'un chemin où l'on ne
+peut pas écrire est refusé avant qu'aucune campagne ne soit ouverte.
 
 **Sur le poste de l'opérateur**, dans Orion : onglet Astra › Approbations, la
 campagne `issuer_delegation` › « Ouvrir la cérémonie », puis choisir le fichier
@@ -259,6 +323,10 @@ astra revocation open --scope client --peer <clé-wg-base64> \
 # → imprime l'identifiant et la commande complète à coller
 ```
 
+Ou, depuis un poste administrateur du tunnel, comme au §2 avec
+`"action":"client_revocation","peer":"<clé-wg-base64>"` : la réponse porte
+l'identifiant d'opération et l'échéance signée (`revocation_expiries`).
+
 Astra résout la cible contre son registre. La campagne courte fige l'identité,
 la génération, les deux empreintes actives et le prochain compteur de
 révocation. Une autorité en ligne compromise ne peut donc pas substituer une
@@ -285,10 +353,16 @@ gateway sur le canal privé et la distribue aux clients qui reviennent jusqu'à
 la dernière échéance signée. Un dépôt identique est idempotent et peut rejouer
 le relais après une panne transitoire du canal privé.
 
-`--not-after` est recopié depuis la commande produite par Astra parce que le
-format partagé `CampaignTarget` ne porte pas l'échéance. Une valeur altérée ne
-révoque pas la mauvaise chose : Astra refuse le dépôt entier en la comparant à
-la génération active.
+`--not-after` n'est plus retapé : la réponse d'ouverture porte l'échéance
+signée, et la console l'imprime dans la ligne à coller ; par le tunnel, elle
+est dans `revocation_expiries`. Elle voyage hors de la campagne signée, parce
+que le format partagé `CampaignTarget` ne porte pas l'échéance. Une valeur
+altérée en route ne révoque pas la mauvaise chose : Astra refuse le dépôt
+entier en la comparant à la génération active.
+
+Deux révocations de deux postes différents peuvent attendre l'opérateur en
+même temps ; une seconde révocation du **même** poste est refusée tant que la
+première attend.
 
 **Révoquer la gateway elle-même** — même cérémonie, une résolution en plus :
 
@@ -306,6 +380,12 @@ Elles sont donc lues **en direct** sur le canal privé, auprès du démon qui le
 sert, avec leurs échéances signées : §10.1 les exige exactes, et une valeur
 retapée produirait un objet refusé par tous ses destinataires pendant
 l'incident.
+
+Ce canal est celui du service (`ASTRA_GATEWAY_CHANNEL` et
+`ASTRA_GATEWAY_CERTIFICATE` d'`astra run`, que `deploy.sh` renseigne) : la
+commande ne prend plus d'adresse, et sans canal privé dans le service elle est
+refusée par son nom. Cette révocation ne s'ouvre que depuis la console de
+l'hôte d'Astra, pas par le tunnel (lot 6b de F14).
 
 Les deux feuilles gateway n'expirent pas ensemble, contrairement à une
 génération cliente : leurs échéances se nomment séparément, et une moitié sans
@@ -466,10 +546,10 @@ astra gateway-identity open --reason "rotation annuelle" --requested-by "prénom
 #   lignes de commande à coller
 ```
 
-La campagne lit l'identité **en direct sur le canal privé**, auprès du démon
-qui la sert. Astra enregistre la génération de chaque client ; elle n'a jamais
-détenu les feuilles de la gateway, et le §11.1 étape 3 en exige les empreintes
-exactes. Une valeur retapée produirait une campagne que le compagnon signe et
+La campagne lit l'identité **en direct sur le canal privé** du service
+(`ASTRA_GATEWAY_CHANNEL`, comme au §7), auprès du démon qui la sert. Astra
+enregistre la génération de chaque client ; elle n'a jamais détenu les feuilles
+de la gateway, et le §11.1 étape 3 en exige les empreintes exactes. Une valeur retapée produirait une campagne que le compagnon signe et
 que la gateway refuse — au moment précis où un renouvellement est en cours.
 
 La commande exporte aussi la feuille en service : le compagnon ne peut pas
@@ -503,7 +583,13 @@ est **avant** cette commande. Après, un client peut détenir la décision,
 repartir hors ligne et promouvoir seul à `not_after` : annuler sur la seule
 gateway laisserait deux vérités dans le parc. La marque est persistée avant
 d'être relayée, et la commande est rejouable — une seconde exécution termine
-un relais que la première n'a pas pu confirmer.
+un relais que la première n'a pas pu confirmer ; tant que la gateway n'a pas
+confirmé, la commande se termine en erreur et demande d'être relancée.
+
+Service en marche, la publication passe par lui. Service arrêté, elle s'écrit
+localement sous le verrou du volume et relaie par le canal que le service
+emploierait : elle lit alors `ASTRA_GATEWAY_CHANNEL` et
+`ASTRA_GATEWAY_CERTIFICATE` dans son environnement, et refuse sans eux.
 
 Pour annuler, tant que rien n'est publié : rouvrir une campagne
 (`astra gateway-identity open`), puis
@@ -594,7 +680,10 @@ l'ancre : elle ne pourrait vérifier une transition que contre une empreinte
 portée par l'objet lui-même, ce qui ne vérifie rien. La commande refuse de
 remplacer une ancre déjà épinglée — remplacer une ancre est une rotation, et
 une rotation se signe. Les domaines neufs la reçoivent par
-`astra bootstrap --ca-tls-fingerprint`.
+`astra bootstrap --ca-tls-fingerprint`. Service en marche, l'épinglage passe
+par lui, et la campagne `trust-authorities` suivante montre la ligne CA-TLS
+sans redémarrage ; service arrêté, il s'écrit localement, sous le verrou du
+volume — c'est le chemin de `deploy.sh`.
 
 **La rotation** :
 
@@ -708,7 +797,7 @@ astra chain open --reason "renouvellement annuel" --requested-by "prénom.nom" \
   --issuer-request-out issuer-request.json
 ```
 
-La première étape est déposée. Ensuite, pour chacune des suivantes :
+La première étape est ouverte. Ensuite, pour chacune des suivantes :
 
 ```sh
 # depuis le poste opérateur : approuver l'étape en cours, avec sa commande
@@ -716,8 +805,7 @@ La première étape est déposée. Ensuite, pour chacune des suivantes :
 # sign-gateway-transition, approve-campaign).
 
 # puis, sur la gateway :
-astra chain next \
-  --gateway-channel <adresse-veth> --gateway-certificate <certificat>
+astra chain next
 ```
 
 `astra chain next` **refuse d'avancer** tant que l'effet de l'étape en cours
@@ -727,9 +815,10 @@ approuvé » — une approbation dont l'objet n'a jamais atterri n'a pas déplac
 domaine, et résoudre la campagne suivante contre cet état figerait une
 situation que personne n'a atteinte.
 
-`--gateway-channel` et `--gateway-certificate` ne servent qu'à l'étape
-d'identité gateway : cette campagne est résolue sur les feuilles que le démon
-sert réellement, qu'Astra n'a jamais détenues.
+L'étape d'identité gateway est résolue sur les feuilles que le démon sert
+réellement, qu'Astra n'a jamais détenues, lues par le canal privé du service
+(`ASTRA_GATEWAY_CHANNEL`, comme au §7) : `chain next` ne prend plus d'adresse
+de gateway. Le plan reste dans le volume d'état, et le service seul l'écrit.
 
 ```sh
 astra chain status     # où en est le plan
@@ -757,10 +846,12 @@ soit pris pour un manque à combler.
 
 - **Les campagnes depuis la console** : « Renouveler les leafs du parc »,
   « toute la chaîne » et « Tourner les autorités » ouvrent une campagne Astra,
-  et §11.6 garde cette résolution locale — une campagne est l'inventaire du
+  et §11.6 garde cette résolution dans Astra — une campagne est l'inventaire du
   domaine, et une route publique non authentifiée qui la résoudrait la
   répondrait à n'importe quel appelant. La console les nomme avec leur
-  commande ; elles se lancent dans le conteneur Astra.
+  commande ; elles se lancent dans le conteneur Astra, ou, pour le parc et les
+  autorités, par la route du tunnel (voir « Les commandes `astra` de ce
+  document »).
 - **Le redémarrage après une bascule.** L'identité servie est descellée une
   seule fois et tenue pour la vie du processus : la recharger reconstruirait le
   point d'accès QUIC pendant que des négociations y détiennent des PSK. Toute
@@ -783,4 +874,6 @@ astra-signer list          # les key-slots du coffre, sans clé de sécurité
 
 `astra status` refuse une chaîne d'audit qui bifurque : une sauvegarde qui se
 vérifie toute seule mais finit ailleurs est une fourche, et une autorité qui la
-continuerait émettrait sous deux histoires à la fois.
+continuerait émettrait sous deux histoires à la fois. C'est une lecture pure :
+service en marche ou non, elle n'écrit jamais le registre, même pour le migrer
+vers un format plus récent — l'écrivain suivant s'en charge.

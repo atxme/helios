@@ -5,9 +5,11 @@ use super::*;
 
 /// The gateway's half of the in-tunnel operator campaign (spec §8.5).
 ///
-/// Four operations, one per surface Astra's public origin exposes, and no
-/// fifth. Every one takes the **resolved** administrator as its first
-/// argument — the identity `require_admin` derived from the source VIP.
+/// One operation per surface Astra's public origin exposes, plus the
+/// opening, which that origin refuses and Astra's door serves through the
+/// private channel alone (lot 5a, §5.4). Every one takes the **resolved**
+/// administrator as its first argument — the identity `require_admin`
+/// derived from the source VIP.
 ///
 /// # Why this is not [`ClientRenewalRelay`]
 ///
@@ -62,6 +64,16 @@ pub trait OperatorCampaignRelay: Send + Sync {
         capability_token: &str,
         result: Box<aether::certificates::status::AstraSignerResult>,
     ) -> Result<astra_channel::SigningOperationView, TrustUpdateRefusal>;
+
+    /// Asks Astra's door to open a campaign for this administrator.
+    ///
+    /// The door resolves the targets and appends this identity to
+    /// `requested_by`; the opening confers nothing, the operator's touch does.
+    async fn open(
+        &self,
+        operator: &astra_channel::OperatorIdentity,
+        request: astra_channel::OperatorOpenRequest,
+    ) -> Result<astra_channel::OperatorOpened, TrustUpdateRefusal>;
 }
 
 /// The administrator behind an operator route, or nothing.
@@ -308,6 +320,46 @@ pub async fn operator_signer_result(
         .await
     {
         Ok(view) => (StatusCode::OK, Json(view)).into_response(),
+        Err(refusal) => refusal.status().into_response(),
+    }
+}
+
+/// `POST /api/certificates/operator/campaigns`.
+///
+/// The caller is an administrator before the body is read: the route sits
+/// behind the `require_admin` layer, which refuses any other caller, and this
+/// handler checks the flag again through `operator_caller`. The body is
+/// bounded before it is parsed, and the authority is reached only with a
+/// request this gateway could read. The answer is the opening; a refusal is
+/// its class, the sentence staying in Astra's log.
+pub async fn operator_open(
+    State(s): State<AppState>,
+    Extension(caller): Extension<crate::auth::Caller>,
+    body: Bytes,
+) -> Response {
+    let operator = match operator_caller(&caller, "open") {
+        Ok(operator) => operator,
+        Err(status) => return status.into_response(),
+    };
+    if body.len() > astra_channel::MAX_OPERATOR_REQUEST_BYTES {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    }
+    let request: astra_channel::OperatorOpenRequest = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(error) => {
+            tracing::warn!(
+                operator = %operator,
+                %error,
+                "operator campaign refused: unreadable opening"
+            );
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+    };
+    let Some(relay) = s.operator_campaign.as_ref() else {
+        return operator_unavailable(&operator, "open");
+    };
+    match relay.open(&operator, request).await {
+        Ok(opened) => (StatusCode::OK, Json(opened)).into_response(),
         Err(refusal) => refusal.status().into_response(),
     }
 }

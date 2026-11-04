@@ -5,7 +5,9 @@
 //! - `bootstrap` creates the registry of a trust domain. It never creates
 //!   `CA-PQ`: the anchor is produced by the operator companion and confirmed
 //!   out of band, and Astra only ever learns its **public** half.
-//! - `run` serves the public HTTPS endpoint.
+//! - `run` serves the public HTTPS endpoint, and the door every opening goes
+//!   through on a Unix socket of the state volume; the other subcommands are
+//!   the door's console connector.
 //! - `status` prints what the authority currently believes, including the head
 //!   of the audit chain — the value an operator records so a restore can be
 //!   told apart from a fork.
@@ -24,8 +26,8 @@
 //! pinned ML-DSA-87 service key is (spec §9.6). Deployments that expose
 //! `astra_port` directly must place a terminator in the same container.
 
-mod campaign_deposit;
 mod commands;
+mod console;
 mod daemon;
 mod private_channel;
 
@@ -192,17 +194,20 @@ pub(crate) enum CampaignScopeArg {
 
 #[derive(Subcommand)]
 enum CampaignCommand {
-    /// Resolves a campaign over the current fleet and deposits it.
+    /// Asks the running service's door to open a campaign over the current
+    /// fleet.
     ///
-    /// # Why a local command and not a public route
+    /// # Why the door and not a public route
     ///
     /// §11.6 has an interface ask Astra to resolve a campaign over the
     /// **current** targets and generations. On the public origin that would be
     /// an unauthenticated route answering every caller with the domain's
     /// inventory, and the authentication such a route would need is not
-    /// settled anywhere. So the resolution happens here, on the machine that
-    /// already runs Astra, and the result is deposited for the running service
-    /// to adopt — the shape `heliosd peer add` uses for the same reason.
+    /// settled anywhere. So the resolution happens in the service, at its
+    /// door, which only connectors that establish their caller reach: this
+    /// console, over the service's local socket, and an administrator peer
+    /// relayed by the gateway. The command resolves, signs and writes nothing
+    /// itself; with the service stopped, it opens nothing.
     ///
     /// What it prints is an opaque operation identifier. Everything else — the
     /// capability tokens, the campaign itself — the companion fetches from the
@@ -225,7 +230,7 @@ enum CampaignCommand {
 
 #[derive(Subcommand)]
 enum ChainCommand {
-    /// Resolves the chain and deposits its first campaign.
+    /// Has the service's door resolve the chain and open its first campaign.
     ///
     /// # Why four campaigns and not one
     ///
@@ -256,26 +261,20 @@ enum ChainCommand {
         #[arg(long)]
         issuer_request_out: Option<PathBuf>,
     },
-    /// Deposits the next campaign, once the previous one has taken effect.
+    /// Opens the next campaign through the door, once the previous one has
+    /// taken effect.
     ///
-    /// «Taken effect» is read from this registry, not from an approval: the
-    /// plan lives in the state volume and the operations live in the running
-    /// service's memory. Observing the effect is also the stronger question —
+    /// «Taken effect» is read from the registry, not from an approval: the
+    /// plan outlives the operations, which live in the service's memory for
+    /// five minutes at most. Observing the effect is also the stronger question —
     /// a step whose approval was taken but whose object never landed has not
     /// moved the domain, and resolving the next campaign against it would
     /// freeze a state nobody reached.
+    ///
+    /// The gateway-identity step is resolved from the leaves the daemon
+    /// actually serves, over the running service's own channel
+    /// (`ASTRA_GATEWAY_CHANNEL` of `astra run`).
     Next {
-        /// Address of the gateway's private lifecycle listener, on the veth.
-        ///
-        /// Required only when the chain reaches its gateway-identity step:
-        /// that campaign is resolved from the leaves the daemon actually
-        /// serves, which this registry has never held.
-        #[arg(long, env = "ASTRA_GATEWAY_CHANNEL")]
-        gateway_channel: Option<SocketAddr>,
-        /// The gateway's transport certificate, DER base64 — the same value
-        /// `astra run` is given.
-        #[arg(long, env = "ASTRA_GATEWAY_CERTIFICATE")]
-        gateway_certificate: Option<String>,
         /// Where to write the delegation request, on the issuer step.
         #[arg(long)]
         issuer_request_out: Option<PathBuf>,
@@ -297,6 +296,10 @@ pub(crate) enum RevocationScopeArg {
 #[derive(Subcommand)]
 enum RevocationCommand {
     /// Resolves one active identity into a short-lived signing campaign.
+    ///
+    /// For `--scope gateway`, the leaves' fingerprints and signed expiries are
+    /// read from the daemon that serves them, over the running service's own
+    /// channel (`ASTRA_GATEWAY_CHANNEL` of `astra run`).
     Open {
         #[arg(long, value_enum)]
         scope: RevocationScopeArg,
@@ -310,16 +313,6 @@ enum RevocationCommand {
         requested_by: String,
         #[arg(long, default_value_t = 300)]
         window_secs: u64,
-        /// Address of the gateway's private lifecycle listener, on the veth.
-        ///
-        /// Required for `--scope gateway`: this registry holds no gateway
-        /// leaf, so their fingerprints and signed expiries are read from the
-        /// daemon that serves them.
-        #[arg(long, env = "ASTRA_GATEWAY_CHANNEL")]
-        gateway_channel: Option<SocketAddr>,
-        /// The gateway's transport certificate, DER base64.
-        #[arg(long, env = "ASTRA_GATEWAY_CERTIFICATE")]
-        gateway_certificate: Option<String>,
     },
 }
 
@@ -350,13 +343,6 @@ enum GatewayIdentityCommand {
         requested_by: String,
         #[arg(long, default_value_t = 300)]
         window_secs: u64,
-        /// Address of the gateway's private lifecycle listener, on the veth.
-        #[arg(long, env = "ASTRA_GATEWAY_CHANNEL")]
-        gateway_channel: SocketAddr,
-        /// The gateway's transport certificate, DER base64 — the same value
-        /// `astra run` is given.
-        #[arg(long, env = "ASTRA_GATEWAY_CERTIFICATE")]
-        gateway_certificate: String,
     },
     /// Laisse partir la transition déjà signée (§11.1 étape 6).
     ///
@@ -367,14 +353,13 @@ enum GatewayIdentityCommand {
     ///
     /// Rejouable : la marque est persistée avant le relais, et une seconde
     /// exécution termine un relais que la première n'a pas pu confirmer.
+    ///
+    /// Le relais part par le canal du service (`ASTRA_GATEWAY_CHANNEL` et
+    /// `ASTRA_GATEWAY_CERTIFICATE` d'`astra run`), qu'il tourne ou non.
     Publish {
         /// L'époque de la transition à publier.
         #[arg(long)]
         epoch: u64,
-        #[arg(long, env = "ASTRA_GATEWAY_CHANNEL")]
-        gateway_channel: SocketAddr,
-        #[arg(long, env = "ASTRA_GATEWAY_CERTIFICATE")]
-        gateway_certificate: String,
     },
 }
 
@@ -393,17 +378,17 @@ enum IssuerCommand {
         out: Option<PathBuf>,
         /// Free text shown to the operator before the touch.
         ///
-        /// With `--requested-by`, the request is also deposited as an
-        /// `issuer_delegation` campaign (§7.6): the companion then fetches it
+        /// With `--requested-by`, the service also opens an
+        /// `issuer_delegation` campaign over it (§7.6): the companion then fetches it
         /// over the §8.2 transport, reads the exact material it is about to
         /// certify, and deposits the delegation back here. Without the two,
         /// the request is only written to a file, and the companion signs it
         /// with nothing tying it to this authority.
         ///
         /// Not a `campaign open --scope` variant, because the target of this
-        /// campaign does not exist until this command creates it: the epoch,
-        /// the ML-DSA-87 key and the PKCS#10 request are produced here, beside
-        /// the private halves they name.
+        /// campaign does not exist until this request creates it: the epoch,
+        /// the ML-DSA-87 key and the PKCS#10 request are produced by the
+        /// service, beside the private halves they name.
         #[arg(long, requires = "requested_by")]
         reason: Option<String>,
         /// Who asked for it. Shown to the operator, and audited.
@@ -497,8 +482,7 @@ fn main() -> Result<()> {
                 out.as_deref(),
                 reason.as_deref().zip(requested_by.as_deref()),
                 window_secs,
-            )
-            .map(|_| ()),
+            ),
             IssuerCommand::Install { authorization } => {
                 issuer_install(&cli.state_dir, authorization.as_deref())
             }
@@ -524,16 +508,9 @@ fn main() -> Result<()> {
                 window_secs,
                 issuer_request_out.as_deref(),
             ),
-            ChainCommand::Next {
-                gateway_channel,
-                gateway_certificate,
-                issuer_request_out,
-            } => chain_next(
-                &cli.state_dir,
-                gateway_channel,
-                gateway_certificate.as_deref(),
-                issuer_request_out.as_deref(),
-            ),
+            ChainCommand::Next { issuer_request_out } => {
+                chain_next(&cli.state_dir, issuer_request_out.as_deref())
+            }
             ChainCommand::Status => chain_status(&cli.state_dir),
             ChainCommand::Abandon => chain_abandon(&cli.state_dir),
         },
@@ -544,8 +521,6 @@ fn main() -> Result<()> {
                 reason,
                 requested_by,
                 window_secs,
-                gateway_channel,
-                gateway_certificate,
             } => revocation_open(
                 &cli.state_dir,
                 scope,
@@ -553,8 +528,6 @@ fn main() -> Result<()> {
                 &reason,
                 &requested_by,
                 window_secs,
-                gateway_channel,
-                gateway_certificate.as_deref(),
             ),
         },
         Command::GatewayIdentity { command } => match command {
@@ -562,27 +535,10 @@ fn main() -> Result<()> {
                 reason,
                 requested_by,
                 window_secs,
-                gateway_channel,
-                gateway_certificate,
-            } => gateway_identity_open(
-                &cli.state_dir,
-                &reason,
-                &requested_by,
-                window_secs,
-                gateway_channel,
-                &gateway_certificate,
-            )
-            .map(|_| ()),
-            GatewayIdentityCommand::Publish {
-                epoch,
-                gateway_channel,
-                gateway_certificate,
-            } => gateway_identity_publish(
-                &cli.state_dir,
-                epoch,
-                gateway_channel,
-                &gateway_certificate,
-            ),
+            } => gateway_identity_open(&cli.state_dir, &reason, &requested_by, window_secs),
+            GatewayIdentityCommand::Publish { epoch } => {
+                gateway_identity_publish(&cli.state_dir, epoch)
+            }
         },
         Command::Status {
             expected_audit_head,

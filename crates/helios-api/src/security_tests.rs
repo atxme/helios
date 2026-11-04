@@ -192,6 +192,58 @@ async fn operator_results_use_the_operator_body_bound() {
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }
 
+/// Opening a campaign is an administrative mutation like any other.
+///
+/// Mounted beside the signer results, it inherits the same barriers in the
+/// real router: an inconsistent browser origin is refused, a form post is
+/// refused, the operator body bound holds, and an administrator whose gateway
+/// has no authority is told only that.
+#[tokio::test]
+async fn an_operator_opening_is_an_administrative_mutation() {
+    const URI: &str = "/api/certificates/operator/campaigns";
+    const BODY: &str = r#"{"action":"fleet_leafs","reason":"r","requested_by":"alice"}"#;
+
+    let (cross_state, _cmd_rx) = state();
+    let mut cross_origin = admin_request(URI, BODY);
+    cross_origin
+        .headers_mut()
+        .insert(header::HOST, "100.64.0.1:8080".parse().expect("header"));
+    cross_origin.headers_mut().insert(
+        header::ORIGIN,
+        "https://hostile.example".parse().expect("header"),
+    );
+    let response = router(cross_state).oneshot(cross_origin).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    let (form_state, _cmd_rx) = state();
+    let mut form = admin_request(URI, BODY);
+    form.headers_mut().insert(
+        header::CONTENT_TYPE,
+        "application/x-www-form-urlencoded".parse().expect("header"),
+    );
+    let response = router(form_state).oneshot(form).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+    let (oversized_state, _cmd_rx) = state();
+    let oversized = " ".repeat(astra_channel::MAX_OPERATOR_REQUEST_BYTES + 1);
+    let response = router(oversized_state)
+        .oneshot(admin_request(URI, &oversized))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+    let (admin_state, _cmd_rx) = state();
+    let response = router(admin_state)
+        .oneshot(admin_request(URI, BODY))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "the administrator is admitted; what is missing is the private channel"
+    );
+}
+
 #[tokio::test]
 async fn orion_cannot_relay_astra_stage_authorizations() {
     let (state, _cmd_rx) = state();

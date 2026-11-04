@@ -18,9 +18,11 @@
 //!
 //! It is not a second implementation. Every route here calls the same function
 //! the public handler calls, so the two channels cannot drift into deciding
-//! differently. What it does not carry is the §8.2 rate budget: that is charged
-//! per real source address, and on a link whose only caller is the gateway it
-//! would be one shared bucket every administrator queued behind.
+//! differently. The opening has no public counterpart — `/v1/campaigns` stays
+//! refused — and calls the door the local console calls, for the same reason.
+//! What it does not carry is the §8.2 rate budget: that is charged per real
+//! source address, and on a link whose only caller is the gateway it would be
+//! one shared bucket every administrator queued behind.
 //!
 //! # What the authority is told, and what it is not
 //!
@@ -34,25 +36,31 @@ use std::sync::Arc;
 
 use aether::certificates::encoding::{Fingerprint, Id16};
 use astra_channel::{
-    OperatorIdentity, RelayedOperatorCampaign, RelayedOperatorSignerResult,
-    MAX_OPERATOR_RELAY_BODY_BYTES, OPERATOR_OPERATION_ROUTE, OPERATOR_PENDING_ROUTE,
-    OPERATOR_SIGNER_REQUEST_ROUTE, OPERATOR_SIGNER_RESULT_ROUTE, OPERATOR_VAULT_ROUTE,
+    OperatorIdentity, RelayedOperatorCampaign, RelayedOperatorOpen, RelayedOperatorSignerResult,
+    MAX_OPERATOR_RELAY_BODY_BYTES, OPERATOR_OPEN_ROUTE, OPERATOR_OPERATION_ROUTE,
+    OPERATOR_PENDING_ROUTE, OPERATOR_SIGNER_REQUEST_ROUTE, OPERATOR_SIGNER_RESULT_ROUTE,
+    OPERATOR_VAULT_ROUTE,
 };
 use axum::{
-    extract::{DefaultBodyLimit, Path, State},
+    extract::{rejection::JsonRejection, DefaultBodyLimit, Path, State},
     response::{IntoResponse, Response},
     routing::post,
     Json, Router,
 };
 
+use crate::door::{DoorConnector, DoorOutcome};
 use crate::service::{
     operator_encrypted_vault, operator_operation, operator_signer_request, operator_signer_result,
     AstraService, ServiceError,
 };
 
-/// The five private operator routes, for the listener of §8.3 to merge.
+/// The six private operator routes, for the listener of §8.3 to merge.
 pub fn private_routes() -> Router<Arc<AstraService>> {
     Router::new()
+        .route(
+            OPERATOR_OPEN_ROUTE,
+            post(open).layer(DefaultBodyLimit::max(MAX_OPERATOR_RELAY_BODY_BYTES)),
+        )
         .route(OPERATOR_PENDING_ROUTE, post(pending))
         .route(OPERATOR_OPERATION_ROUTE, post(operation))
         .route(OPERATOR_SIGNER_REQUEST_ROUTE, post(signer_request))
@@ -198,5 +206,53 @@ async fn signer_result(
             (axum::http::StatusCode::OK, Json(view)).into_response()
         }
         Err(error) => refuse(&relayed.operator, "signer-result", error),
+    }
+}
+
+/// The tunnel's connector to the door (lot 5a, §5.4).
+///
+/// It carries the request and the identity the gateway resolved, and decides
+/// nothing: what the tunnel may open, and on which targets, is the door's.
+/// The answer is the opening alone — the console's facts about it stay with
+/// the console. A refusal crosses back as its class: the door has already
+/// logged the full sentence with this connector, and the domain it describes
+/// is not the caller's to read.
+///
+/// An unreadable body, a console action among them (the tunnel's request has
+/// no such variant), is the same malformed request whatever was wrong with it.
+async fn open(
+    State(service): State<Arc<AstraService>>,
+    relayed: Result<Json<RelayedOperatorOpen>, JsonRejection>,
+) -> Response {
+    let Json(relayed) = match relayed {
+        Ok(relayed) => relayed,
+        Err(rejection) => {
+            tracing::warn!(
+                route = "open",
+                %rejection,
+                "private operator route refused an unreadable opening"
+            );
+            return ServiceError::Protocol.into_response();
+        }
+    };
+    let operator = relayed.operator;
+    let connector = DoorConnector::Tunnel {
+        operator: operator.clone(),
+    };
+    match service
+        .door(connector, relayed.request.into(), now_unix())
+        .await
+    {
+        Ok(DoorOutcome::Opened(opening)) => {
+            (axum::http::StatusCode::OK, Json(opening.opened)).into_response()
+        }
+        Ok(_) => {
+            tracing::error!(
+                operator = %operator,
+                "the door answered a tunnel opening with something other than a campaign"
+            );
+            refuse(&operator, "open", ServiceError::Internal)
+        }
+        Err(refusal) => refuse(&operator, "open", refusal.class()),
     }
 }

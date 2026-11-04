@@ -293,6 +293,7 @@ fn service() -> (
         encrypted_vault: None,
         state_dir,
         gateway: None,
+        volume_writes: crate::door::VolumeWrites::new(),
     });
     (service, directory, ca_private)
 }

@@ -749,6 +749,23 @@ impl helios_api::certificates::OperatorCampaignRelay for AstraRenewalRelay {
             .await
             .map_err(|error| Self::refuse("operator-signer-result", error))
     }
+
+    /// Relays an opening to Astra's door, with the administrator it came
+    /// through. The door decides what the tunnel may open; this end only
+    /// carries the request and maps the answer onto its coarse class.
+    async fn open(
+        &self,
+        operator: &::astra_channel::OperatorIdentity,
+        request: ::astra_channel::OperatorOpenRequest,
+    ) -> Result<::astra_channel::OperatorOpened, helios_api::certificates::TrustUpdateRefusal> {
+        self.client
+            .operator_open(&::astra_channel::RelayedOperatorOpen {
+                operator: operator.clone(),
+                request,
+            })
+            .await
+            .map_err(|error| Self::refuse("operator-open", error))
+    }
 }
 
 #[async_trait::async_trait]

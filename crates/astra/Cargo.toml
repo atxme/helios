@@ -27,6 +27,11 @@ async-trait.workspace = true
 axum.workspace = true
 base64.workspace = true
 clap.workspace = true
+# Le socket local de la porte (`door::local`) et la console qui l'appelle
+# (`src/console.rs`) : HTTP/1 sur un flux Unix, comme le socket local
+# d'administration de `helios-api`.
+hyper.workspace = true
+hyper-util.workspace = true
 rcgen.workspace = true
 # La configuration TLS du listener privé. Le type traverse l'API de
 # `astra-channel`, qui la construit ; `astra` doit pouvoir la nommer

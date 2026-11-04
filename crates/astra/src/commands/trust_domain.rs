@@ -3,8 +3,10 @@
 //! `bootstrap` creates the registry of a trust domain, `pin-ca-tls` completes
 //! it with the one anchor §9.4 needs and bootstrap may have left unnamed, and
 //! `status` prints what the authority currently holds. None of the three opens
-//! a campaign or contacts the gateway: each reads or writes `registry.json`
-//! directly.
+//! a campaign or contacts the gateway. `bootstrap` writes a volume no service
+//! can be running on, and takes its lock to be sure; `pin-ca-tls` is a write
+//! of the console, which follows that lock (§5.9); `status` reads
+//! `registry.json`, with the service running or not.
 
 use std::path::Path;
 
@@ -12,10 +14,11 @@ use aether::certificates::encoding::{
     generate_ml_dsa_87_keypair, Fingerprint, MlDsa87PublicKey, TrustDomainId, WireGuardKey,
 };
 use anyhow::{Context, Result};
+use astra::door::{DoorOutcome, DoorRequest, VolumeLock};
 use astra::registry::{AstraRegistry, AstraState};
 use astra::AuditEvent;
 
-use crate::{now_unix, REGISTRY_FILE, SERVICE_KEY_FILE};
+use crate::{console, now_unix, REGISTRY_FILE, SERVICE_KEY_FILE};
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn bootstrap(
@@ -33,14 +36,32 @@ pub(crate) fn bootstrap(
         .transpose()
         .context("--ca-tls-fingerprint")?;
     let registry_path = state_dir.join(REGISTRY_FILE);
+    aether::private_file::create_private_dir(state_dir)
+        .with_context(|| format!("creating {}", state_dir.display()))?;
+    // Held until the registry is written: bootstrapping a volume another
+    // process writes is the corruption the lock exists to prevent (§5.9).
+    let _volume = VolumeLock::try_acquire(state_dir)
+        .with_context(|| {
+            format!(
+                "verrouiller {}",
+                state_dir.join(astra::door::VOLUME_LOCK_FILE).display()
+            )
+        })?
+        .with_context(|| {
+            format!(
+                "un autre processus tient {} : rien n'a été amorcé",
+                state_dir.display()
+            )
+        })?;
+    // Looked for under the lock, not before it: two bootstraps that both
+    // looked first could both find nothing, and the second would overwrite
+    // the service key and the registry the first had just written.
     anyhow::ensure!(
         !registry_path.exists(),
         "a registry already exists at {}: bootstrapping over it would start a second history \
          for the same domain",
         registry_path.display()
     );
-    aether::private_file::create_private_dir(state_dir)
-        .with_context(|| format!("creating {}", state_dir.display()))?;
 
     let ca_public_key =
         MlDsa87PublicKey::parse(ca_public_key).context("reading the CA-PQ public key")?;
@@ -121,23 +142,27 @@ pub(crate) fn bootstrap(
 }
 
 /// Records the client `CA-TLS` in service, once (spec §9.4).
+///
+/// Pinning the anchor already held changes nothing and is not a refusal;
+/// another anchor is refused, because replacing a pinned anchor is a signed
+/// rotation.
 pub(crate) fn pin_ca_tls(state_dir: &Path, fingerprint: &str) -> Result<()> {
     let fingerprint = parse_fingerprint(fingerprint).context("--fingerprint")?;
-    let mut registry = AstraRegistry::load(&state_dir.join(REGISTRY_FILE), None)
-        .context("loading the Astra registry")?;
-
-    if let Some(held) = registry.state().ca_tls_fingerprint {
-        if held.matches(&fingerprint) {
-            eprintln!("cette ancre CA-TLS est déjà épinglée ; rien n'a changé");
-            return Ok(());
-        }
-        anyhow::bail!(
-            "another CA-TLS anchor is already pinned here. Replacing a pinned anchor is a \
-             rotation, and a rotation is signed: `astra campaign open --scope trust-authorities` \
-             then `astra-signer rotate-ca-tls`"
-        );
+    let outcome = console::write(
+        state_dir,
+        DoorRequest::PinCaTls { fingerprint },
+        |registry| {
+            let pinned = astra::door::write::pin_ca_tls(registry, fingerprint, now_unix())?;
+            Ok(pinned.into())
+        },
+    )?;
+    let DoorOutcome::Pinned { changed, .. } = outcome else {
+        return Err(console::unexpected(&outcome));
+    };
+    if !changed {
+        eprintln!("cette ancre CA-TLS est déjà épinglée ; rien n'a changé");
+        return Ok(());
     }
-    registry.pin_client_tls_ca(fingerprint, now_unix())?;
     println!("{fingerprint}");
     eprintln!("ancre CA-TLS épinglée : la rotation du §9.4 est désormais vérifiable ici");
     Ok(())
@@ -154,12 +179,12 @@ pub(crate) fn status(state_dir: &Path, expected_audit_head: Option<&str>) -> Res
         .map(Fingerprint::parse_hex)
         .transpose()
         .context("reading the expected audit head")?;
-    let registry = AstraRegistry::load_allowing_unattended_tail(
+    // A read: the service may be running, and it is the volume's one writer.
+    let state = AstraRegistry::read_state_allowing_unattended_tail(
         &state_dir.join(REGISTRY_FILE),
         expected.as_ref(),
     )
     .context("loading the Astra registry")?;
-    let state = registry.state();
     println!("trust domain     : {}", state.trust_domain_id);
     println!("gateway          : {}", state.gateway_wg_public_key);
     println!("server name      : {}", state.server_name);
@@ -180,7 +205,7 @@ pub(crate) fn status(state_dir: &Path, expected_audit_head: Option<&str>) -> Res
             None => "absent".to_string(),
         }
     );
-    println!("audit head       : {}", registry.audit_head());
+    println!("audit head       : {}", state.audit.head());
     println!("peers            : {}", state.peers.len());
 
     let now = now_unix();
