@@ -82,11 +82,12 @@ pub const MAX_OPERATOR_RELAY_BODY_BYTES: usize = MAX_OPERATOR_REQUEST_BYTES + 25
 
 /// Largest vault copy accepted, in decoded bytes.
 ///
-/// Twice the 128 KiB Astra serves a vault under ([`MAX_OPERATOR_ANSWER_BYTES`]):
-/// a copy a companion could not then download would be a copy that breaks the
-/// next ceremony, so nothing larger than what the download can carry is worth
-/// accepting, and the margin is for the key-slots a vault may grow.
-pub const MAX_OPERATOR_VAULT_COPY_BYTES: usize = 256 * 1024;
+/// What the download carries, and not more: Astra serves the vault raw, under
+/// [`MAX_OPERATOR_ANSWER_BYTES`] on this channel and under its §8.2 response
+/// ceiling on the public one (the same 128 KiB, which Astra's own tests pin
+/// together). A copy above it would be accepted here and then fail every later
+/// download, breaking each anchor ceremony until it was replaced.
+pub const MAX_OPERATOR_VAULT_COPY_BYTES: usize = MAX_OPERATOR_ANSWER_BYTES;
 
 /// Room kept for the credential document that may travel with the vault.
 const MAX_OPERATOR_VAULT_COPY_CREDENTIALS_BYTES: usize = 128 * 1024;
@@ -172,12 +173,24 @@ pub struct RelayedOperatorOpen {
 /// The vault stays encrypted: this carries bytes neither the gateway nor Astra
 /// can open. The credential document, when present, is signed under `CA-PQ`
 /// and Astra verifies it itself before taking it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OperatorVaultCopy {
     pub vault_base64: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credentials: Option<Box<aether::certificates::approval::CredentialRegistry>>,
+}
+
+/// Prints what the copy is made of and never its content: the vault is the
+/// field a `{:?}` in a log would otherwise carry whole.
+impl std::fmt::Debug for OperatorVaultCopy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OperatorVaultCopy")
+            .field("vault_base64_chars", &self.vault_base64.len())
+            .field("credentials", &self.credentials.is_some())
+            .finish()
+    }
 }
 
 /// What Astra holds after a vault copy, for Orion to read back.

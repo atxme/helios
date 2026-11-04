@@ -360,9 +360,11 @@ async fn vault_copy(
     let Json(relayed) = match relayed {
         Ok(relayed) => relayed,
         Err(rejection) => {
+            // The status alone: serde's text quotes the string it choked on,
+            // and that string is the vault.
             tracing::warn!(
                 route = "vault-copy",
-                %rejection,
+                status = %rejection.status(),
                 "private operator route refused an unreadable vault copy"
             );
             // The one rejection with a meaning of its own: a body over the

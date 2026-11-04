@@ -394,6 +394,32 @@ impl SigningOperationStore {
             .collect()
     }
 
+    /// Test-only: approves one held operation without a ceremony.
+    #[cfg(test)]
+    pub(crate) fn approve_without_ceremony(&mut self, id: &Id16) {
+        self.operations
+            .get_mut(id.as_bytes())
+            .expect("operation held")
+            .approve_without_ceremony();
+    }
+
+    /// A live operation still waiting for its operator to open the vault, if
+    /// any.
+    ///
+    /// Not [`Self::awaiting_vault`]: that one ignores the state, and an
+    /// approved operation that has not yet expired no longer downloads
+    /// anything, so it must not hold a vault replacement back.
+    pub fn awaiting_operator_with_vault(&self, now_unix: u64) -> Option<Id16> {
+        self.operations
+            .values()
+            .find(|operation| {
+                !operation.is_expired(now_unix)
+                    && operation.state == SigningOperationState::AwaitingOperator
+                    && operation.vault_fingerprint().is_some()
+            })
+            .map(|operation| operation.operation_id)
+    }
+
     /// The approved campaign that authorizes rotating one client's generation.
     ///
     /// # Why this is a lookup and not a flag on the peer

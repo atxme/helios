@@ -359,3 +359,178 @@ async fn the_private_route_adopts_a_copy_and_refuses_the_rest_coarsely() {
     let (status, _) = post_to(&listener, OPERATOR_VAULT_COPY_ROUTE, &oversized).await;
     assert_eq!(status, 413);
 }
+
+#[tokio::test]
+async fn resending_the_same_vault_keeps_the_previous_copy() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (service, ca_private) = build_service_with_ca(dir.path(), None, None);
+    let held = service.encrypted_vault().expect("fixture vault");
+    let vault = vault_of(DOMAIN, "retried");
+    tunnel_send(&service, vault.clone(), None)
+        .await
+        .expect("first");
+    tunnel_send(&service, vault.clone(), None)
+        .await
+        .expect("retry");
+    assert_eq!(on_disk(&service, PREVIOUS_VAULT_FILE), Some(held.to_vec()));
+    assert_eq!(on_disk(&service, VAULT_FILE), Some(vault.clone()));
+
+    // The credential document still goes through on an identical vault.
+    let outcome = tunnel_send(&service, vault, Some(credentials_at(&ca_private, 2)))
+        .await
+        .expect("credentials alone");
+    assert!(matches!(
+        outcome,
+        DoorOutcome::VaultCopied {
+            credential_registry_epoch: Some(2),
+            ..
+        }
+    ));
+    assert_eq!(on_disk(&service, PREVIOUS_VAULT_FILE), Some(held.to_vec()));
+    assert!(on_disk(&service, CREDENTIALS_FILE).is_some());
+}
+
+async fn open_vault_operation(service: &AstraService) -> OperatorOpened {
+    opened(
+        service
+            .door(
+                tunnel(),
+                DoorRequest::TrustAuthorities { text: text() },
+                NOW,
+            )
+            .await,
+    )
+}
+
+#[tokio::test]
+async fn a_live_vault_operation_holds_a_replacement_back() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture(dir.path());
+    *service.encrypted_vault.write().expect("vault lock") =
+        Some(Arc::new(vault_of(DOMAIN, "held")));
+    let held = service.encrypted_vault().expect("held vault");
+    let operation = open_vault_operation(&service).await;
+
+    let refusal = service
+        .door(tunnel(), send(vault_of(DOMAIN, "later"), None), NOW + 1)
+        .await;
+    assert!(
+        matches!(refusal, Err(DoorRefusal::AlreadyOpen { operation_id }) if operation_id == operation.operation_id),
+        "{refusal:?}"
+    );
+    assert_eq!(on_disk(&service, VAULT_FILE), None);
+    assert_eq!(service.encrypted_vault().as_deref(), Some(&*held));
+
+    // An identical resend replaces nothing, so it passes.
+    service
+        .door(tunnel(), send(held.to_vec(), None), NOW + 1)
+        .await
+        .expect("identical resend");
+
+    // Expired: it holds nothing back any more.
+    service
+        .door(
+            tunnel(),
+            send(vault_of(DOMAIN, "after expiry"), None),
+            operation.expires_at,
+        )
+        .await
+        .expect("expired");
+}
+
+#[tokio::test]
+async fn an_approved_vault_operation_does_not_hold_a_replacement_back() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture(dir.path());
+    let operation = open_vault_operation(&service).await;
+    service
+        .signing
+        .lock()
+        .await
+        .approve_without_ceremony(&operation.operation_id);
+
+    service
+        .door(
+            tunnel(),
+            send(vault_of(DOMAIN, "after rotation"), None),
+            NOW + 1,
+        )
+        .await
+        .expect("the post-rotation copy passes");
+}
+
+#[tokio::test]
+async fn credentials_are_refused_while_a_promotion_document_is_pending() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (service, ca_private) = build_service_with_ca(dir.path(), None, None);
+    let pending = credentials_at(&ca_private, 2);
+    rewrite_registry(&service, |state| state.promoted_credentials = Some(pending)).await;
+
+    let refusal = tunnel_send(
+        &service,
+        vault_of(DOMAIN, "pending"),
+        Some(credentials_at(&ca_private, 3)),
+    )
+    .await;
+    assert!(
+        matches!(refusal, Err(DoorRefusal::CredentialsDuringRotation)),
+        "{refusal:?}"
+    );
+    assert_eq!(on_disk(&service, VAULT_FILE), None);
+    assert_eq!(on_disk(&service, CREDENTIALS_FILE), None);
+}
+
+#[test]
+fn the_largest_accepted_vault_passes_the_download_check() {
+    assert_eq!(
+        MAX_OPERATOR_VAULT_COPY_BYTES,
+        crate::service::MAX_RESPONSE_BYTES,
+        "what is accepted is what the public download carries"
+    );
+    assert_eq!(
+        MAX_OPERATOR_VAULT_COPY_BYTES,
+        astra_channel::MAX_OPERATOR_ANSWER_BYTES,
+        "and what the private download carries"
+    );
+}
+
+#[tokio::test]
+async fn the_largest_accepted_vault_is_downloadable() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture(dir.path());
+    let mut vault = vault_of(DOMAIN, "");
+    let padding = MAX_OPERATOR_VAULT_COPY_BYTES - vault.len();
+    vault = vault_of(DOMAIN, &"x".repeat(padding));
+    assert_eq!(vault.len(), MAX_OPERATOR_VAULT_COPY_BYTES);
+    tunnel_send(&service, vault.clone(), None)
+        .await
+        .expect("accepted");
+    // The download's own size check, the first thing it does.
+    let held = service.encrypted_vault().expect("held");
+    assert!(held.len() <= crate::service::MAX_RESPONSE_BYTES);
+}
+
+#[test]
+fn the_relayed_copy_never_prints_the_vault() {
+    let relayed: RelayedOperatorVaultCopy =
+        serde_json::from_slice(&relayed_copy(b"{\"SECRETVAULT\":1}")).expect("relayed copy");
+    let rendered = format!("{relayed:?}");
+    let encoded = base64::engine::general_purpose::STANDARD.encode(b"{\"SECRETVAULT\":1}");
+    assert!(!rendered.contains(&encoded), "{rendered}");
+    assert!(!rendered.contains("SECRET"), "{rendered}");
+}
+
+#[tokio::test]
+async fn the_private_route_takes_a_copy_above_the_ordinary_private_bound() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture(dir.path());
+    let listener = listen(Arc::clone(&service)).await;
+
+    let probe = vault_of(DOMAIN, "");
+    let vault = vault_of(DOMAIN, &"x".repeat(100 * 1024 - probe.len()));
+    let body = relayed_copy(&vault);
+    assert!(body.len() > crate::renewal::router::MAX_PRIVATE_BODY_BYTES);
+    let (status, answer) = post_to(&listener, OPERATOR_VAULT_COPY_ROUTE, &body).await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&answer));
+    assert_eq!(on_disk(&service, VAULT_FILE), Some(vault));
+}

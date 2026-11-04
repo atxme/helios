@@ -800,7 +800,7 @@ impl AstraService {
                     .await
             }
             DoorRequest::VaultCopy { vault, credentials } => {
-                self.copy_vault(vault, credentials).await
+                self.copy_vault(vault, credentials, now_unix).await
             }
         }
     }
