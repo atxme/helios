@@ -1,6 +1,6 @@
 [package]
 name = "orion"
-version = "2.78.8"
+version = "2.79.0"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
