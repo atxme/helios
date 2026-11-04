@@ -300,6 +300,7 @@ fn every_refusal_maps_to_one_bounded_status() {
             InternalRefusal::Unavailable,
             StatusCode::SERVICE_UNAVAILABLE,
         ),
+        (InternalRefusal::Throttled, StatusCode::TOO_MANY_REQUESTS),
         (InternalRefusal::Internal, StatusCode::INTERNAL_SERVER_ERROR),
     ] {
         assert_eq!(refusal.status(), expected, "{refusal:?}");

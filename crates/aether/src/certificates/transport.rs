@@ -768,7 +768,7 @@ impl OrionTrustUpdateDocument {
 /// `astra` must not depend on it (`docs/architecture/CRATE-REORGANIZATION.md`
 /// §7). Same reason [`ClientRenewalOperationView`] is here.
 ///
-/// The four shapes are deliberately coarse. The detailed reason goes to the
+/// The shapes are deliberately coarse. The detailed reason goes to the
 /// gateway's protected log: an error taxonomy served to an
 /// authenticated-but-hostile caller is an oracle on other peers' generations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -783,6 +783,9 @@ pub enum TrustUpdateRefusal {
     /// empty update to a client that is provably out of date would tell it the
     /// opposite of the truth, and it would stop asking.
     Unavailable,
+    /// The authority holds as many live operations as it accepts. Retrying
+    /// later is the right advice, and unlike `Unavailable` it says why.
+    Throttled,
     /// The gateway failed on its own side.
     Internal,
 }

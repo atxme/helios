@@ -18,6 +18,8 @@ pub enum InternalRefusal {
     Rejected,
     /// Known identity, nothing to answer with.
     Unavailable,
+    /// The authority holds as many live operations as it accepts.
+    Throttled,
     /// The gateway failed on its own side.
     Internal,
 }
@@ -28,6 +30,7 @@ impl InternalRefusal {
             Self::Protocol => StatusCode::BAD_REQUEST,
             Self::Rejected => StatusCode::FORBIDDEN,
             Self::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+            Self::Throttled => StatusCode::TOO_MANY_REQUESTS,
             Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -39,6 +42,7 @@ impl From<TrustUpdateRefusal> for InternalRefusal {
             TrustUpdateRefusal::Protocol => Self::Protocol,
             TrustUpdateRefusal::Rejected => Self::Rejected,
             TrustUpdateRefusal::Unavailable => Self::Unavailable,
+            TrustUpdateRefusal::Throttled => Self::Throttled,
             TrustUpdateRefusal::Internal => Self::Internal,
         }
     }

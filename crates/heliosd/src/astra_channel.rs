@@ -612,10 +612,11 @@ impl AstraRenewalRelay {
             // reporting it as `500` would send an Orion into retrying
             // something that will never succeed.
             ChannelError::Status(status) => {
-                tracing::warn!(route, %status, "the authority refused a relayed renewal");
+                tracing::warn!(route, %status, "the authority refused a relayed request");
                 match status.as_u16() {
                     400 => TrustUpdateRefusal::Protocol,
                     403 => TrustUpdateRefusal::Rejected,
+                    429 => TrustUpdateRefusal::Throttled,
                     501 | 503 => TrustUpdateRefusal::Unavailable,
                     _ => TrustUpdateRefusal::Internal,
                 }
@@ -922,6 +923,19 @@ mod tests {
 
     /// A gateway with no channel document is a gateway without an authority,
     /// which is a supported state — not an error.
+    /// A full store on the authority is a `429`, relayed as such: collapsing
+    /// it to `Internal` would show an operator a gateway fault for what is a
+    /// queue to drain.
+    #[test]
+    fn relayed_429_is_throttled_and_not_internal() {
+        use helios_api::certificates::TrustUpdateRefusal;
+        let refusal = AstraRenewalRelay::refuse(
+            "operator-open",
+            ::astra_channel::ChannelError::Status(axum::http::StatusCode::TOO_MANY_REQUESTS),
+        );
+        assert_eq!(refusal, TrustUpdateRefusal::Throttled);
+    }
+
     #[test]
     fn an_absent_document_is_not_an_error() {
         let directory = tempfile::tempdir().unwrap();
