@@ -191,7 +191,7 @@ class RepositoryTests(unittest.TestCase):
         self.change("web/src/a.ts", "feat(web): a")
         self.change("web/src/b.ts", "fix(web): b")
         self.git("switch", "-q", "main")
-        version.merge("topic", self.metadata)
+        version.merge("topic", self.fresh_metadata)
         self.assertEqual(self.git("log", "-1", "--format=%s"), "chore(release): bump helios 2.41.0")
         fresh = self.fresh_metadata()
         self.assertEqual(version.consistency_errors(self.root, fresh), [])
@@ -201,16 +201,29 @@ class RepositoryTests(unittest.TestCase):
         self.assertEqual(self.git("status", "--porcelain"), "")
         self.assertEqual(version.check("HEAD~3", self.root, fresh), [])
 
+    def test_merge_reads_the_workspace_after_the_merge(self):
+        self.git("switch", "-q", "-c", "topic")
+        self.change("tools/new/src/main.rs", "feat(new): a")
+        self.git("switch", "-q", "main")
+        seen = []
+
+        def load():
+            seen.append((self.root / "tools/new/src/main.rs").exists())
+            return self.fresh_metadata()
+
+        version.merge("topic", load)
+        self.assertEqual(seen, [True])
+
     def test_merge_refuses_outside_main(self):
         self.git("switch", "-q", "-c", "topic")
         with self.assertRaises(version.VersionError):
-            version.merge("main", self.metadata)
+            version.merge("main", self.fresh_metadata)
 
     def test_merge_of_documentation_commits_nothing_more(self):
         self.git("switch", "-q", "-c", "topic")
         self.change("docs/a.md", "docs: a")
         self.git("switch", "-q", "main")
-        version.merge("topic", self.metadata)
+        version.merge("topic", self.fresh_metadata)
         self.assertEqual(self.git("log", "-1", "--format=%s"), "docs: a")
 
     def test_the_check_refuses_code_without_a_new_version(self):

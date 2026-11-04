@@ -264,8 +264,11 @@ def bump(base, metadata, trailers=()):
     return numbers
 
 
-def merge(branch, metadata, trailers=()):
-    """Merges a branch into main, then commits the versions it asks for."""
+def merge(branch, load, trailers=()):
+    """Merges a branch into main, then commits the versions it asks for.
+
+    `load` runs after the merge: a branch may add a crate or a dependency.
+    """
     current = git("branch", "--show-current").strip()
     if current != "main":
         raise VersionError(f"la fusion se fait depuis main, pas depuis {current or 'un HEAD détaché'}")
@@ -274,7 +277,7 @@ def merge(branch, metadata, trailers=()):
         git("merge", "--no-edit", branch)
     except subprocess.CalledProcessError as error:
         raise VersionError(f"la fusion de {branch} a échoué, à résoudre à la main :\n{error.stdout}{error.stderr}") from error
-    return bump(base, metadata, trailers)
+    return bump(base, load(), trailers)
 
 
 def check(base, root, metadata):
@@ -315,12 +318,13 @@ def main():
     args = parser.parse_args()
 
     os.chdir(Path(__file__).resolve().parents[1])
-    metadata = load_metadata()
-    root = metadata["workspace_root"]
     try:
         if args.command == "merge":
-            merge(args.branch, metadata, args.trailer)
-        elif args.command == "bump":
+            merge(args.branch, load_metadata, args.trailer)
+            return 0
+        metadata = load_metadata()
+        root = metadata["workspace_root"]
+        if args.command == "bump":
             bump(args.base, metadata, args.trailer)
         else:
             errors = check(args.base, root, metadata) if args.command == "check" else consistency_errors(root, metadata)
