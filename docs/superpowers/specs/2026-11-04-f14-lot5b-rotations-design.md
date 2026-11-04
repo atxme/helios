@@ -92,7 +92,7 @@ pourquoi en quelques mots. Les données viennent de `GET /api/certificates`
 `ca_retire_active_at`, `next_ca_fingerprint`…), du coffre local et du journal de
 rotation (§5.4). Style : palette et composants existants d'Orion.
 
-Un clic mène à trois étapes dans le même panneau.
+Un clic mène à ces étapes dans le même panneau.
 
 **1. Prérequis.** Une ligne par contrôle, verte ou rouge, avec l'action corrective
 en un mot. Un bouton « Vérifier » rejoue le tout. Tant qu'une ligne est rouge, rien
@@ -107,19 +107,36 @@ n'est ouvert et l'étape suivante est désactivée.
 | Deux clés enregistrées (rotations de CA) | `VaultOverview.slots`, `credentials_complete` |
 | Domaine concordant | l'ancre du coffre et celle de `CertificateDomainView` sont les mêmes |
 
-**Pas de contrôle « clé branchée ».** Sous Windows, la clé n'est interrogée qu'à
-l'intérieur du dialogue WebAuthn, et les deux clés d'une rotation se branchent l'une
-après l'autre : aucune des deux n'a à être présente avant le toucher. La première
-maquette, qui montrait « Seconde clé absente », ne tient donc pas.
+**2. Clés** (rotations de CA ; décidé par l'utilisateur le 4 novembre 2026). Chaque
+clé est validée avant toute opération, l'une après l'autre, et l'écran montre l'état de
+chacune :
 
-**2. Approbation.** Récapitulatif : action, motif (pré-rempli, modifiable), durées
+- « Clé 1 : à valider », bouton « Valider » ; un toucher, puis « Clé 1 : validée » et le
+  libellé de la clé dans le coffre ;
+- « Clé 2 : à valider », de même. La même clé deux fois est refusée (`key_repeated`), une
+  clé hors du coffre aussi (`key_not_enrolled`), et l'on peut réessayer.
+
+La validation prouve que la clé ouvre le coffre (`prove_key_opens`, déjà utilisé par
+« Vérifier une clé »). Aucune campagne n'existe encore : tant que les deux ne sont pas
+validées, rien n'est ouvert. **Aucun toucher de plus au total** : l'ouverture du coffre
+obtenue à la validation est gardée en mémoire jusqu'à la signature, ce qui remplace le
+toucher d'ouverture de la cérémonie. Il reste un toucher d'approbation par clé, qui ne peut
+pas être avancé puisqu'il porte sur le défi de la campagne. Ces ouvertures vivent dans le
+processus de la cérémonie, effacées à son abandon, à son échec, à sa fin, ou après cinq
+minutes sans suite ; `astra-signer` les garde déjà ainsi le temps de la seconde clé.
+
+Une validation ne vaut que pour la cérémonie en cours. Renouveler les postes et Terminer
+n'ont pas cette étape : le premier suit le nombre de clés de sa campagne, le second n'exige
+qu'une clé.
+
+**3. Approbation.** Récapitulatif : action, motif (pré-rempli, modifiable), durées
 par défaut. Les durées (préparation 7 jours, recouvrement 30 jours, validité CA TLS
 1825 jours) sont repliées derrière « Modifier ». Le bouton « Approuver » ouvre alors
-la campagne (§5.2), affiche le manifeste vérifié et enchaîne les touchers. **La
-campagne s'ouvre à ce clic et non à l'étape 1**, parce qu'elle expire en cinq
+la campagne (§5.2), affiche le manifeste vérifié et enchaîne les touchers d'approbation, en
+demandant de rebrancher chaque clé validée. **La campagne s'ouvre à ce clic et non avant**, parce qu'elle expire en cinq
 minutes. L'empreinte de la CA-PQ entrante reste montrée, c'est le contrôle du §9.1.
 
-**3. Suivi.** La liste des étapes franchies et de la suivante : signée, déposée,
+**4. Suivi.** La liste des étapes franchies et de la suivante : signée, déposée,
 installée sur la gateway, fin de recouvrement. Fermer Orion ne perd rien.
 
 ### 5.2 Ouverture
@@ -197,16 +214,20 @@ pas fait.
   son jeton sur la ligne de commande.
 - **Ce qui ne change pas** : fenêtre de cinq minutes, une opération vivante par famille,
   deux clés distinctes, manifeste vérifié sous la clé de service épinglée.
+- **Ce qui change de place** : l'ouverture du coffre est faite avant l'ouverture de la campagne,
+  et non pendant. Elle reste en mémoire, jamais dans la WebView, et ne signe rien sans l'approbation.
 - **Sous Windows**, la cérémonie reste dans le processus non élevé de l'IHM, là où WebAuthn
   répond (lot 4).
 
 ## 7. Tests et recette
 
-- **Rust** : chaque état du journal et sa reprise, y compris un arrêt entre chaque étape ;
+- **Rust** : une clé validée n'est pas redemandée pour ouvrir le coffre, ouverture effacée à
+  l'abandon ; chaque état du journal et sa reprise, y compris un arrêt entre chaque étape ;
   aucune clé redemandée à la reprise ; refus d'une seconde rotation ; route CA TLS (`403`,
   corps illisible, objet mal signé, idempotence) ; `pending` aux bornes ; 429 relayé.
 - **IHM** (Vitest, comme `ApprovalsPanel.test.tsx`) : ordre des lignes, ligne à faire en tête,
-  prérequis rouge bloquant et ouverture jamais appelée, `AlreadyOpen` repris, durées
+  prérequis rouge bloquant et ouverture jamais appelée, clés validées une à une avec leur état,
+  clé répétée refusée, `AlreadyOpen` repris, durées
   repliées, libellés.
 - **Recette** : `MANUAL-TESTING`, section « G. Lot 5b » : renouveler les postes, remplacer
   chaque CA, couper Orion à chaque étape, terminer une rotation. Rien ne se valide en WSL : la
@@ -229,4 +250,5 @@ avec `ca_rotation` : la corriger si elle est périmée.
 
 *Choix du concepteur, à relire :* troncature de `pending` à 128 caractères plutôt qu'une
 pagination ; ordre dépôt puis installation, repris d'aujourd'hui ; contrôles de prérequis du
-§5.1 ; route CA TLS plutôt qu'une distribution par Astra ; maquette sans ligne « clé branchée ».
+§5.1 ; route CA TLS plutôt qu'une distribution par Astra ; ouverture du coffre gardée en mémoire
+entre validation et signature pour ne pas ajouter de toucher.
