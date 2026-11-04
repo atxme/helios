@@ -55,6 +55,23 @@ jobs:
           fi
           python3 scripts/ci-plan.py "${args[@]}" --output "$GITHUB_OUTPUT"
 
+  version:
+    name: Version des produits
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Le code arrive sur main avec son numéro
+        env:
+          PUSH_BASE: ${{ github.event.before }}
+        run: |
+          if [[ "$PUSH_BASE" =~ ^[0-9a-f]{40}$ ]] && [[ "$PUSH_BASE" =~ [1-9a-f] ]]; then
+            python3 scripts/version.py check --base "$PUSH_BASE"
+          fi
+
   checks:
     name: Format et tests des scripts
     needs: changes

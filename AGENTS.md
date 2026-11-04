@@ -166,6 +166,18 @@ For incomplete behavior: implement it; reject it explicitly with a named/typed/t
 * Keep protocol/domain validation close to canonical types.
 * Keep ownership of secrets and state explicit; do not duplicate caches/stores across layers without an architectural reason.
 
+## Versions
+
+Two software versions: **Helios** (`heliosd`, `tools/helios`, `web`) and **Orion** (`apps/orion`). Every other crate keeps its own number. `python3 scripts/version.py show` prints them.
+
+Every update reaching `main` changes the version of each product and crate it touches, from its commits: `feat` raises the minor; `type!:` or a `BREAKING CHANGE` footer raises the major; anything else raises the patch. The highest level wins, once per update, and what follows resets to zero. Markdown alone changes nothing. A product ships its binaries' non-test workspace dependencies, plus `web/` and `deploy/` for Helios, `apps/orion/` for Orion, and `Cargo.lock` or the root `Cargo.toml` for both.
+
+* Merge with `python3 scripts/version.py merge <branch>` from `main`. For commits already on `main`, run `python3 scripts/version.py bump --base <previous main>` before pushing.
+* Never edit a version by hand, except a major the script refuses to infer. Mark a breaking change with `!`.
+* Do not create a `v*` tag per merge: it starts the release build and Orion's signing.
+
+CI (`version` job) fails on a push to `main` when code changed without a new number or when the files disagree.
+
 ## Validation
 
 Run the narrowest relevant checks while iterating, then broaden according to impact:
