@@ -97,7 +97,11 @@ pub(crate) fn rotate_ca_pq(
             // the domain disagree about what is current — and a rotation is
             // the last thing that should reconcile them.
             campaign
-                .covers_authority_object(&anchor_probe(&identity, &current_ca_public_key, window)?)
+                .covers_authority_object(&signing::anchor_probe(
+                    &identity,
+                    &current_ca_public_key,
+                    window,
+                )?)
                 .context(
                     "la campagne ne nomme pas l'ancre que ce coffre détient : l'autorité et le \
                      compagnon ne décrivent pas le même domaine",
@@ -249,36 +253,6 @@ pub(crate) fn rotate_ca_pq(
         );
     }
     Ok(())
-}
-
-/// The object a campaign target is compared against, before anything signs.
-///
-/// A placeholder transition carrying the outgoing epoch and fingerprint: what
-/// [`AstraRotationCampaign::covers_authority_object`](aether::certificates::status::AstraRotationCampaign::covers_authority_object) reads is exactly those
-/// two values, so comparing here costs no signature and answers the only
-/// question that matters before a key is touched — does the authority name the
-/// anchor this vault holds.
-fn anchor_probe(
-    identity: &signing::DomainIdentity,
-    current: &MlDsa87PublicKey,
-    window: TransitionWindow,
-) -> Result<aether::certificates::transport::TrustUpdateObject> {
-    use aether::certificates::authority::CaTransition;
-
-    Ok(
-        aether::certificates::transport::TrustUpdateObject::CaTransition(Box::new(CaTransition {
-            format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
-            trust_domain_id: identity.trust_domain_id,
-            current_ca_epoch: identity.ca_epoch,
-            next_ca_epoch: identity.ca_epoch + 1,
-            current_ca_fingerprint: current.authority_fingerprint(),
-            next_ca_public_key: current.clone(),
-            next_ca_fingerprint: current.authority_fingerprint(),
-            window,
-            current_ca_signature: aether::certificates::encoding::MlDsa87Signature::placeholder(),
-            next_ca_signature: aether::certificates::encoding::MlDsa87Signature::placeholder(),
-        })),
-    )
 }
 
 fn absolute_path(path: &Path) -> Result<PathBuf> {

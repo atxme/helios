@@ -9,6 +9,7 @@
 pub mod campaign;
 pub mod issuer;
 pub mod recovery;
+pub mod rotation;
 
 use aether::certificates::status::{AstraSignerResult, CampaignApproval};
 use anyhow::{bail, Result};

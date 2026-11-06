@@ -231,7 +231,7 @@ mod issuer;
 mod recovery;
 mod revocation;
 
-pub use anchor::{rotate_ca_pq, RotatedAnchor};
+pub use anchor::{anchor_probe, client_tls_probe, rotate_ca_pq, RotatedAnchor};
 pub use bindings::sign_credential_bindings;
 pub use ca_tls::{advance_ca_tls, issue_ca_tls, rotate_ca_tls, RotatedClientTlsCa};
 pub use campaign::{approve_campaign, CampaignApprovalSession};
