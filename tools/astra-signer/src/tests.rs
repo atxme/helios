@@ -124,6 +124,79 @@ fn neither_rotation_opens_over_a_rotation_journal() {
     );
 }
 
+/// What Orion leaves beside the vault once a client TLS rotation has landed: the
+/// deposit is behind it, so no token.
+fn record_left_by_orion(path: &Path) -> astra_operator::prepared::PreparedRotation {
+    use aether::certificates::encoding::Id16;
+    use aether::certificates::status::{AstraSignerResult, CampaignApproval};
+
+    let record = astra_operator::prepared::PreparedRotation {
+        kind: astra_operator::prepared::PreparedKind::CaTls,
+        operation_id: "01".repeat(16),
+        result_token: None,
+        result: AstraSignerResult {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            approval: Box::new(CampaignApproval {
+                campaign_id: Id16::new([3; 16]).expect("id"),
+                campaign_fingerprint: Fingerprint::of(b"campagne"),
+                required_credentials: 2,
+                approved_at: 9,
+                approvals: Vec::new(),
+            }),
+            objects: Vec::new(),
+            credential_registry: None,
+            issuer_authorization: None,
+        },
+        transition_path: String::new(),
+        next_ca_tls_epoch: 2,
+        next_ca_tls_certificate: "REVS".into(),
+        activation_at: 100,
+        not_after: 200,
+        submitted: true,
+        prepared_at: 10,
+        manifest: None,
+        adopted: true,
+    };
+    astra_operator::prepared::save(path, &record).expect("record");
+    record
+}
+
+/// The command reads what Orion left, and goes on to ask for a key.
+#[test]
+fn promote_reads_the_record_orion_leaves() {
+    let directory = tempfile::tempdir().expect("dir");
+    let path = astra_operator::prepared::path_beside(&directory.path().join("vault.json"));
+    let record = record_left_by_orion(&path);
+
+    assert_eq!(commands::record_to_promote(&path).expect("read"), record);
+}
+
+/// Nothing to deposit again, so nothing to ask of the channel, which is out of
+/// reach here. A record that does want a deposit and holds no token says so.
+#[test]
+fn resume_has_nothing_to_replay_from_a_record_with_no_token() {
+    let directory = tempfile::tempdir().expect("dir");
+    let vault = directory.path().join("vault.json");
+    let path = astra_operator::prepared::path_beside(&vault);
+    let record = record_left_by_orion(&path);
+    let channel = || {
+        astra_operator::campaign::Campaign::select(None, Some("http://127.0.0.1:9"))
+            .expect("channel")
+    };
+    commands::resume_rotation(&vault, channel()).expect("already deposited");
+
+    astra_operator::prepared::save(
+        &path,
+        &astra_operator::prepared::PreparedRotation {
+            submitted: false,
+            ..record
+        },
+    )
+    .expect("record");
+    let refused = commands::resume_rotation(&vault, channel()).expect_err("refused");
+    assert!(format!("{refused:#}").contains("jeton"), "{refused:#}");
+}
+
 /// A real rotation, signed with slot secrets in place of a security key: this
 /// binary's own journal, in the format the operator library adopts.
 fn interrupted_ca_pq_rotation(

@@ -469,3 +469,209 @@ async fn a_delegation_opening_refused_for_lack_of_a_vault_leaves_the_key_files()
         .pending(wall_clock())
         .is_empty());
 }
+
+/// One approving credential of the fixture's document: a software ES256 key, which
+/// proves the protocol and says nothing of a physical authenticator.
+fn approving_credential(
+    ca_private: &[u8],
+    serial: u8,
+) -> (
+    rcgen::KeyPair,
+    aether::certificates::approval::AstraCredentialBinding,
+) {
+    use aether::certificates::approval::{AstraCredentialBinding, CredentialState};
+
+    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("ES256 key");
+    let point = key.public_key_raw();
+    assert_eq!(point.len(), 65, "uncompressed ES256 point");
+    let mut cose = vec![0xa5, 0x01, 0x02, 0x03, 0x26, 0x20, 0x01, 0x21, 0x58, 0x20];
+    cose.extend_from_slice(&point[1..33]);
+    cose.extend_from_slice(&[0x22, 0x58, 0x20]);
+    cose.extend_from_slice(&point[33..65]);
+    let binding = AstraCredentialBinding {
+        format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+        credential_id: vec![serial; 16],
+        credential_public_key: cose,
+        aaguid: [0; 16],
+        trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+        gateway_wg_public_key: WireGuardKey::from_bytes([1; 32]),
+        state: CredentialState::Active,
+        credential_epoch: 1,
+        credential_registry_epoch: 1,
+        ca_epoch: 1,
+        created_at: NOW - 10,
+        ca_pq_signature: aether::certificates::encoding::MlDsa87Signature::placeholder(),
+    }
+    .sign(ca_private)
+    .expect("signed binding");
+    (key, binding)
+}
+
+/// A credential's real answer to a campaign, as `verify` will check it.
+fn assertion_for(
+    key: &rcgen::KeyPair,
+    binding: &aether::certificates::approval::AstraCredentialBinding,
+    campaign: &aether::certificates::status::AstraRotationCampaign,
+) -> aether::certificates::status::CredentialAssertion {
+    use base64::Engine as _;
+    use rcgen::SigningKey as _;
+
+    let mut authenticator_data = Fingerprint::of(b"astra.example").as_bytes().to_vec();
+    authenticator_data.push(0x05);
+    authenticator_data.extend_from_slice(&1u32.to_be_bytes());
+    let client_data_json = format!(
+        r#"{{"type":"webauthn.get","challenge":"{}","origin":"https://astra.example","crossOrigin":false}}"#,
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(campaign.fingerprint().as_bytes()),
+    )
+    .into_bytes();
+    let mut message = authenticator_data.clone();
+    message.extend_from_slice(Fingerprint::of(&client_data_json).as_bytes());
+    let assertion = aether::certificates::webauthn::WebAuthnAssertion {
+        authenticator_data,
+        client_data_json,
+        signature: key.sign(&message).expect("ES256 assertion"),
+    };
+    aether::certificates::status::CredentialAssertion {
+        credential_id: binding.credential_id.clone(),
+        credential_fingerprint: binding.fingerprint(),
+        assertion_fingerprint: assertion.fingerprint(),
+        assertion,
+    }
+}
+
+/// A deposit Astra has every reason to accept, up to the write. A failed save
+/// answers 403 and an identical deposit is to be retried, so memory must still say
+/// what the file says: otherwise the status read reports the rotation as held, the
+/// operator's vault moves on that word, and a restart of Astra forgets it.
+#[tokio::test]
+async fn a_failed_save_of_a_deposit_leaves_nothing_in_flight() {
+    use aether::certificates::approval::CredentialRegistry;
+    use aether::certificates::authority::ClientTlsCaTransition;
+    use aether::certificates::capability::{CapabilityGrant, CapabilityScope};
+    use aether::certificates::status::{AstraSignerResult, CampaignApproval};
+    use aether::certificates::transport::TrustUpdateObject;
+    use aether::certificates::window::TransitionWindow;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let active = Fingerprint::of(b"client tls ca");
+    let (mut built, ca_private) = build_service_with_ca(dir.path(), Some(active), None);
+    let (first_key, first) = approving_credential(&ca_private, 1);
+    let (second_key, second) = approving_credential(&ca_private, 2);
+    let registry = CredentialRegistry {
+        trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+        gateway_wg_public_key: WireGuardKey::from_bytes([1; 32]),
+        ca_epoch: 1,
+        credential_registry_epoch: 1,
+        bindings: vec![first.clone(), second.clone()],
+    };
+    built.approval_credentials = RwLock::new(Arc::new(crate::service::ApprovalCredentials {
+        ids: vec![first.credential_id.clone(), second.credential_id.clone()],
+        epoch: 1,
+        registry: Some(Box::new(registry)),
+    }));
+    let service = Arc::new(built);
+
+    let opened = opened(
+        service
+            .door(
+                console(),
+                DoorRequest::TrustAuthorities { text: text() },
+                NOW,
+            )
+            .await,
+    );
+    let campaign = campaign_of(&service, &opened).await;
+    let operation_id = opened.operation_id;
+
+    let transition = ClientTlsCaTransition {
+        format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+        trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+        ca_epoch: 1,
+        current_ca_tls_epoch: 1,
+        next_ca_tls_epoch: 2,
+        active_client_tls_ca_fingerprint: active,
+        next_client_tls_ca_certificate: aether::certificates::test_x509::client_material(
+            "successor",
+        )
+        .authority,
+        window: TransitionWindow::new(NOW, NOW + 1_000, NOW + 2_000).expect("window"),
+        ca_pq_signature: aether::certificates::encoding::MlDsa87Signature::placeholder(),
+    }
+    .sign(&ca_private)
+    .expect("signed transition");
+    let incoming = transition.next_client_tls_ca_certificate.fingerprint();
+    let result = Box::new(AstraSignerResult {
+        format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+        approval: Box::new(CampaignApproval {
+            campaign_id: campaign.campaign_id,
+            campaign_fingerprint: campaign.fingerprint(),
+            required_credentials: campaign.required_credentials,
+            approved_at: NOW,
+            approvals: vec![
+                assertion_for(&first_key, &first, &campaign),
+                assertion_for(&second_key, &second, &campaign),
+            ],
+        }),
+        objects: vec![TrustUpdateObject::ClientTlsCaTransition(Box::new(
+            transition,
+        ))],
+        credential_registry: None,
+        issuer_authorization: None,
+    });
+    let token = {
+        let operations = service.signing.lock().await;
+        let operation = operations.get(&operation_id, NOW).expect("operation held");
+        let grant = CapabilityGrant::new(
+            CapabilityScope::SignerResultSubmit,
+            operation_id,
+            operation.manifest_fingerprint(),
+            None,
+            NOW,
+            NOW + 120,
+        )
+        .expect("grant");
+        service
+            .capabilities
+            .lock()
+            .await
+            .issue(&grant, operation.expires_at)
+            .expect("token")
+    };
+
+    let state_of = || async {
+        serde_json::to_vec(service.registry.lock().await.state()).expect("state encoded")
+    };
+    let before = state_of().await;
+    // Something in the way of the rename: the write fails, whoever runs this.
+    let registry_path = dir.path().join("registry.json");
+    std::fs::remove_file(&registry_path).expect("registry file");
+    std::fs::create_dir(&registry_path).expect("in the way");
+
+    let refused = crate::service::operator_signer_result(
+        &service,
+        &operation_id,
+        &token,
+        result.clone(),
+        NOW,
+    )
+    .await;
+
+    assert_eq!(refused.err(), Some(crate::service::ServiceError::Refused));
+    assert_eq!(state_of().await, before, "memory says what the file says");
+    let listener = listen(Arc::clone(&service)).await;
+    let (status, body) = read_status(&listener).await;
+    assert_eq!(status, 200);
+    let report: astra_channel::OperatorAuthorityStatus =
+        serde_json::from_slice(&body).expect("the status");
+    assert_eq!(report.next_ca_tls_fingerprint, None);
+
+    // The volume comes back: the identical deposit is what was promised to work.
+    std::fs::remove_dir(&registry_path).expect("out of the way");
+    crate::service::operator_signer_result(&service, &operation_id, &token, result, NOW)
+        .await
+        .expect("the identical deposit lands");
+    let (_, body) = read_status(&listener).await;
+    let report: astra_channel::OperatorAuthorityStatus =
+        serde_json::from_slice(&body).expect("the status");
+    assert_eq!(report.next_ca_tls_fingerprint, Some(incoming));
+}

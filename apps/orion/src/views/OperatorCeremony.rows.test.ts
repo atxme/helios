@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest'
 import { rowsOf } from './OperatorCeremony'
-import type { AcceptanceManifest, InvitationManifest, IssuerManifest } from '../types'
+import type {
+  AcceptanceManifest,
+  CaRotationManifest,
+  InvitationManifest,
+  IssuerManifest,
+} from '../types'
 
 const acceptance: AcceptanceManifest = {
   operation: 'enrollment_acceptance',
@@ -101,6 +106,65 @@ describe('rowsOf for the issuer delegation', () => {
     expect(rows.slice(-4)).toEqual([
       ['campagne', 'c'.repeat(32)],
       ['motif', 'déléguer'],
+      ['demandée par', 'operator'],
+      ['empreinte de campagne', 'f'.repeat(64)],
+    ])
+  })
+})
+
+describe('rowsOf for a CA rotation', () => {
+  const rotation: CaRotationManifest = {
+    operation: 'ca_rotation',
+    trust_domain_id: 'td',
+    affected_ca: 'ca_tls',
+    current_epoch: 1,
+    next_epoch: 2,
+    activation_at: 1_800_000_000,
+    not_after: 1_802_000_000,
+    outgoing_anchor_fingerprint: 'o'.repeat(64),
+    target_count: 1,
+  }
+
+  it('the_incoming_anchor_is_named_as_still_to_come_at_the_touch', () => {
+    const rows = rowsOf(rotation)
+    expect(rows).toContainEqual(['autorité visée', 'CA-TLS cliente'])
+    expect(rows).toContainEqual(['époque', '1 → 2'])
+    expect(rows).toContainEqual(['ancre sortante', 'o'.repeat(64)])
+    expect(rows).toContainEqual(['ancre entrante', 'créée à la signature'])
+    expect(rows.map(([label]) => label)).not.toContain('campagne')
+  })
+
+  it('the_incoming_anchor_is_shown_once_it_exists', () => {
+    const rows = rowsOf({ ...rotation, next_anchor_fingerprint: 'n'.repeat(64) })
+    expect(rows).toContainEqual(['ancre entrante', 'n'.repeat(64)])
+  })
+
+  it('the_campaign_rows_follow_without_listing_its_targets', () => {
+    const rows = rowsOf({
+      ...rotation,
+      campaign: {
+        campaign: {
+          format_version: 1,
+          campaign_id: 'c'.repeat(32),
+          trust_domain_id: 'td',
+          gateway_wg_public_key: 'k',
+          server_name: 'gw',
+          created_at: 1,
+          expires_at: 2,
+          scope: 'trust_authorities',
+          targets: [],
+          reason: 'renouveler',
+          requested_by: 'operator',
+          policy_fingerprint: 'p'.repeat(64),
+          required_credentials: 2,
+        },
+        fingerprint: 'f'.repeat(64),
+      },
+    })
+    expect(rows.slice(-5)).toEqual([
+      ['campagne', 'c'.repeat(32)],
+      ['portée', 'les ancres du domaine'],
+      ['motif', 'renouveler'],
       ['demandée par', 'operator'],
       ['empreinte de campagne', 'f'.repeat(64)],
     ])

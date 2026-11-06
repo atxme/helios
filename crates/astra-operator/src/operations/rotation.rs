@@ -5,17 +5,19 @@
 //!
 //! A campaign blocks its family for five minutes, so the two keys are proved
 //! first and nothing is opened until both answered. What each one released is
-//! kept in memory until the signature: that replaces the touch that would open
-//! the vault at the ceremony, and leaves one approval per key to go, four touches
-//! in all. These openings never leave this process, and neither of the two types
+//! kept in memory until the signature, or until the campaign expires: that replaces
+//! the touch that would open the vault at the ceremony, and leaves one approval per
+//! key to go, four touches in all. These openings never leave this process, and neither of the two types
 //! holding them is `Debug` or `Serialize`.
 //!
 //! # Why the journal comes between the signature and the deposit
 //!
 //! See [`crate::rotation_journal`]. Signing here moves nothing on disk but the
-//! journal. The vault in place moves in [`advance`], once Astra has accepted.
-//! `apply_local` does not check that for itself: [`next_step`] is the only barrier,
-//! which is why [`advance`] is the only caller.
+//! journal. The vault in place moves in [`advance`], once Astra has accepted, and a
+//! client TLS rotation leaves its prepared record with it: that record outlives the
+//! journal, names the incoming certificate for « Terminer », and holds any other
+//! rotation until then. `apply_local` does not check the acceptance for itself:
+//! [`next_step`] is the only barrier, which is why [`advance`] is the only caller.
 //!
 //! # What the words are
 //!
@@ -28,8 +30,10 @@ use std::path::Path;
 use aether::certificates::approval::CredentialRegistry;
 use aether::certificates::authority::{CaTransition, ClientTlsCaTransition};
 use aether::certificates::encoding::{DerCertificate, Fingerprint, Id16, MlDsa87PublicKey};
-use aether::certificates::operator_session::{AstraManifest, CampaignManifest};
-use aether::certificates::status::AstraSignerResult;
+use aether::certificates::operator_session::{
+    AffectedCa, AstraManifest, CaRotationManifest, CampaignManifest,
+};
+use aether::certificates::status::{AstraRotationCampaign, AstraSignerResult, CertificateKind};
 use aether::certificates::transport::{
     OperatorAuthorityStatus, OperatorOpenAction, OperatorOpenRequest, OperatorOpened,
     OperatorVaultCopy, SigningOperationState, TrustUpdateObject,
@@ -363,7 +367,9 @@ pub fn open(
     let domain = LocalDomain::read(vault_path, &keys.vault, kind)?;
     ensure_keys_may_approve(&keys, &domain.registry)?;
     ensure_no_window_open(&keys)?;
-    ensure_no_overlap(&remote.authority_status()?)?;
+    let authority = remote.authority_status()?;
+    ensure_no_overlap(&authority)?;
+    ensure_same_anchors(&authority, &domain)?;
 
     let operation_id = match terms.existing_operation {
         Some(operation_id) => operation_id,
@@ -390,9 +396,8 @@ pub fn open(
     if !campaign.scope.rotates_authority() {
         bail!("cette campagne ne fait tourner aucune ancre. Rien n'a été signé.");
     }
-    // Astra resolved the campaign from its registry. If it names another anchor
-    // than this vault holds, the two halves of the domain disagree about what is
-    // current, and a rotation is the last thing that should reconcile them.
+    // The status said so a moment ago, and this is the signed word on the same
+    // question: what the keys approve must name the anchor this vault holds.
     campaign
         .covers_authority_object(&domain.probe(schedule.window)?)
         .context("la campagne ne nomme pas l'ancre de ce coffre")?;
@@ -406,13 +411,7 @@ pub fn open(
         &format!("https://{}", keys.vault.rp_id),
         now,
     )?;
-    // Not `CaRotationManifest`: it names the incoming anchor, and that does not
-    // exist until the signature, which waits for the approvals. The journal gives
-    // it once signed, and `window` the dates shown here.
-    let manifest = AstraManifest::Campaign(CampaignManifest {
-        campaign: Box::new(campaign.clone()),
-        fingerprint: campaign.fingerprint(),
-    });
+    let manifest = rotation_manifest(&domain, schedule.window, campaign);
     Ok(OpenedRotation {
         kind,
         keys,
@@ -421,6 +420,50 @@ pub fn open(
         request: Box::new(request),
         manifest,
         approval,
+    })
+}
+
+/// What the touch does: the one authority replaced, though the campaign has a row
+/// for each. The incoming anchor does not exist before the signature, which waits
+/// for the approvals, so it is absent here and the journal gives it once signed.
+fn rotation_manifest(
+    domain: &LocalDomain,
+    window: TransitionWindow,
+    campaign: &AstraRotationCampaign,
+) -> AstraManifest {
+    let (affected_ca, certificate_kind, current_epoch, outgoing_anchor_fingerprint) =
+        match &domain.active_certificate {
+            None => (
+                AffectedCa::CaPq,
+                CertificateKind::CaPq,
+                domain.identity.ca_epoch,
+                domain.current_ca.authority_fingerprint(),
+            ),
+            Some(active) => (
+                AffectedCa::CaTls,
+                CertificateKind::CaTls,
+                domain.identity.ca_tls_epoch,
+                active.fingerprint(),
+            ),
+        };
+    AstraManifest::CaRotation(CaRotationManifest {
+        trust_domain_id: domain.identity.trust_domain_id,
+        affected_ca,
+        current_epoch,
+        next_epoch: current_epoch + 1,
+        activation_at: window.activation_at,
+        not_after: window.not_after,
+        outgoing_anchor_fingerprint,
+        next_anchor_fingerprint: None,
+        target_count: campaign
+            .targets
+            .iter()
+            .filter(|target| target.certificate_kind == certificate_kind)
+            .count(),
+        campaign: Some(CampaignManifest {
+            campaign: Box::new(campaign.clone()),
+            fingerprint: campaign.fingerprint(),
+        }),
     })
 }
 
@@ -484,10 +527,34 @@ fn ensure_no_overlap(authority: &OperatorAuthorityStatus) -> Result<()> {
     Ok(())
 }
 
+/// Astra and this vault must name the same anchors before a campaign exists: one
+/// opened over a disagreement blocks its family for five minutes, and a rotation is
+/// the last thing that should reconcile the two halves of a domain.
+///
+/// The client TLS anchor is compared only for the rotation that replaces it. A CA-PQ
+/// rotation does not depend on it, and a domain may not have pinned one yet.
+fn ensure_same_anchors(authority: &OperatorAuthorityStatus, domain: &LocalDomain) -> Result<()> {
+    let ca_pq_agrees = authority.ca_epoch == domain.identity.ca_epoch
+        && authority.ca_fingerprint == domain.current_ca.authority_fingerprint();
+    let client_tls_agrees = domain.active_certificate.as_ref().is_none_or(|active| {
+        authority.ca_tls_epoch == domain.identity.ca_tls_epoch
+            && authority.ca_tls_fingerprint == Some(active.fingerprint())
+    });
+    if !(ca_pq_agrees && client_tls_agrees) {
+        bail!("Astra et ce coffre ne nomment pas la même ancre. Rien n'a été signé.");
+    }
+    Ok(())
+}
+
 impl OpenedRotation {
     /// What the operator approves. Shown before any approval.
     pub fn manifest(&self) -> &AstraManifest {
         &self.manifest
+    }
+
+    /// Which CA this rotation replaces.
+    pub fn kind(&self) -> RotationKind {
+        self.kind
     }
 
     /// The dates the transition will carry.
@@ -510,6 +577,9 @@ impl OpenedRotation {
     /// A refusal loses nothing, and the same or another key can try again.
     pub fn approve(&mut self, key: &dyn Authenticator, now: u64) -> Result<String, KeyStep> {
         if now >= self.request.campaign.expires_at {
+            // A dead campaign has no use for them, and they must not wait on the
+            // caller dropping this value.
+            self.keys.openings.clear();
             return Err(KeyStep::Expired);
         }
         let offered = self.offered();
@@ -557,7 +627,9 @@ impl OpenedRotation {
             approval,
             ..
         } = self;
-        if now >= request.campaign.expires_at {
+        // No openings means `approve` already saw this campaign dead, whatever the
+        // clock says now.
+        if now >= request.campaign.expires_at || keys.openings.is_empty() {
             return Err(KeyStep::Expired.into());
         }
         // A rotation resumed or a vault changed while the keys were being touched.
@@ -671,7 +743,8 @@ pub fn vault_copy(vault_path: &Path) -> Result<OperatorVaultCopy> {
 ///
 /// - [`ResumeStep::Finished`]: the copy was attempted and the journal is gone. A
 ///   copy that failed does not undo anything: the prerequisite reads it and the
-///   screen offers to send it (spec §5.9).
+///   screen offers to send it (spec §5.9). A client TLS rotation still has its
+///   prepared record, until « Terminer ».
 /// - [`ResumeStep::SendVaultCopy`]: Astra holds the copy back. The same copy passes
 ///   later, so the journal stays and the next look retries it.
 /// - [`ResumeStep::Discard`]: nothing was announced, and the journal is gone.

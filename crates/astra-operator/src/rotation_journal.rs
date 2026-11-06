@@ -412,6 +412,11 @@ fn prepared_record_of(
 /// [`JournalStage::Accepted`] it changes nothing, so as not to overwrite a vault
 /// that has moved on since.
 ///
+/// A client TLS rotation also leaves its [`prepared::PreparedRotation`] here. The
+/// vault has just moved, which is what that record has always meant, and it is the
+/// only copy of the incoming certificate once the journal ends: `promote-ca-tls`
+/// and « Terminer » name it on the relay from there.
+///
 /// For an adoption with no deposit, the caller holds Astra's confirmation from
 /// [`next_step`], and the older file ends here: the journal now says everything it
 /// said, and past this point `rotate-ca-pq` must not resume from it. A stop before
@@ -425,11 +430,16 @@ pub fn apply_local(vault_path: &Path, journal: &mut RotationJournal) -> Result<(
         JournalStage::Applied | JournalStage::Installed => return Ok(()),
     }
     if let Some(next) = &journal.next {
+        // Built first: a journal that cannot name it moves nothing.
+        let record = promotion_record(journal)?;
         store::save(vault_path, &next.vault)?;
         if let Some(registry) = &next.credentials {
             credentials::save(&credentials::path_beside(vault_path), registry)?;
         }
         handoff::save(&handoff::path_beside(vault_path), &next.handoff)?;
+        if let Some(record) = record {
+            prepared::save(&prepared::path_beside(vault_path), &record)?;
+        }
     }
     let applied = RotationJournal {
         stage: JournalStage::Applied,
@@ -443,6 +453,37 @@ pub fn apply_local(vault_path: &Path, journal: &mut RotationJournal) -> Result<(
         remove_legacy_ca_pq(vault_path)?;
     }
     Ok(())
+}
+
+/// What a client TLS rotation leaves for its promotion, and `None` for a CA-PQ one,
+/// which has no certificate to name.
+///
+/// Born adopted, so that no later look turns it back into a journal, and with no
+/// token: the deposit is behind it, nothing reads one again, and this file outlives
+/// `not_after`. Nothing in it comes from the clock, so a replay writes the same bytes.
+fn promotion_record(journal: &RotationJournal) -> Result<Option<prepared::PreparedRotation>> {
+    let RotationTransition::CaTls(transition) = &journal.transition else {
+        return Ok(None);
+    };
+    let deposit = journal
+        .deposit
+        .as_ref()
+        .context("le journal de rotation CA-TLS n'a aucun dépôt")?;
+    Ok(Some(prepared::PreparedRotation {
+        kind: prepared::PreparedKind::CaTls,
+        operation_id: deposit.operation_id.to_hex(),
+        result_token: None,
+        result: deposit.result.clone(),
+        transition_path: String::new(),
+        next_ca_tls_epoch: transition.next_ca_tls_epoch,
+        next_ca_tls_certificate: transition.next_client_tls_ca_certificate.to_base64(),
+        activation_at: journal.activation_at,
+        not_after: journal.not_after,
+        submitted: true,
+        prepared_at: journal.signed_at,
+        manifest: None,
+        adopted: true,
+    }))
 }
 
 fn remove_legacy_ca_pq(vault_path: &Path) -> Result<()> {
@@ -575,6 +616,8 @@ fn adopted_prepared(record: prepared::PreparedRotation) -> Result<RotationJourna
     } = record;
     let operation_id = Id16::parse_hex(&operation_id)
         .map_err(|error| anyhow::anyhow!("rotation préparée illisible : {error}"))?;
+    let result_token =
+        result_token.context("la rotation préparée ne porte aucun jeton de dépôt")?;
     let transition = result
         .objects
         .iter()
@@ -1796,7 +1839,7 @@ mod tests {
         let record = crate::prepared::PreparedRotation {
             kind: crate::prepared::PreparedKind::CaTls,
             operation_id: deposit.operation_id.to_hex(),
-            result_token: deposit.result_token.clone(),
+            result_token: Some(deposit.result_token.clone()),
             result: AstraSignerResult {
                 objects: Vec::new(),
                 ..deposit.result

@@ -14,6 +14,7 @@ use aether::certificates::encoding::{
     generate_ml_dsa_87_keypair, DerCertificate, MlDsa87PublicKey, MlDsa87Signature, TrustDomainId,
     WireGuardKey,
 };
+use aether::certificates::operator_session::AffectedCa;
 use aether::certificates::status::{
     AstraRotationCampaign, AstraSignerRequest, CampaignScope, CampaignTarget, CertificateKind,
 };
@@ -392,13 +393,19 @@ fn terms() -> RotationTerms {
     }
 }
 
-fn nothing_in_flight() -> OperatorAuthorityStatus {
+/// What Astra says of a domain in step with the vault at `vault_path`.
+fn nothing_in_flight(vault_path: &Path) -> OperatorAuthorityStatus {
+    let relay = handoff::load(&handoff::path_beside(vault_path)).expect("relay");
+    let identity = handoff::identity_of(&relay).expect("identity");
+    let anchor = MlDsa87PublicKey::parse(relay.ca_pq_public_key.trim()).expect("anchor");
+    let client_tls = DerCertificate::parse(relay.ca_tls_certificate.as_ref().expect("CA-TLS"))
+        .expect("certificate");
     OperatorAuthorityStatus {
-        ca_epoch: 1,
-        ca_fingerprint: Fingerprint::of(b"ca en service"),
+        ca_epoch: identity.ca_epoch,
+        ca_fingerprint: anchor.authority_fingerprint(),
         next_ca_fingerprint: None,
-        ca_tls_epoch: 1,
-        ca_tls_fingerprint: Some(Fingerprint::of(b"ca tls en service")),
+        ca_tls_epoch: identity.ca_tls_epoch,
+        ca_tls_fingerprint: Some(client_tls.fingerprint()),
         next_ca_tls_fingerprint: None,
         issuer: None,
         vault_copy_fingerprint: None,
@@ -406,16 +413,16 @@ fn nothing_in_flight() -> OperatorAuthorityStatus {
     }
 }
 
-fn holding(journal: &RotationJournal) -> OperatorAuthorityStatus {
+fn holding(vault_path: &Path, journal: &RotationJournal) -> OperatorAuthorityStatus {
     let next = Some(journal.next_anchor_fingerprint);
     match journal.kind {
         RotationKind::CaPq => OperatorAuthorityStatus {
             next_ca_fingerprint: next,
-            ..nothing_in_flight()
+            ..nothing_in_flight(vault_path)
         },
         RotationKind::CaTls => OperatorAuthorityStatus {
             next_ca_tls_fingerprint: next,
-            ..nothing_in_flight()
+            ..nothing_in_flight(vault_path)
         },
     }
 }
@@ -452,7 +459,7 @@ impl Remote {
             request: RefCell::default(),
             opened_with: RefCell::default(),
             deposits: RefCell::default(),
-            authority: RefCell::new(Some(nothing_in_flight())),
+            authority: RefCell::new(Some(nothing_in_flight(vault_path))),
             gateway_anchor: RefCell::new(Some(Fingerprint::of(b"ancre sortante"))),
             gateway_read_fails: Cell::new(false),
             install_ignored: Cell::new(false),
@@ -845,7 +852,7 @@ fn a_rotation_is_refused_over_a_prepared_record() {
         &crate::prepared::PreparedRotation {
             kind: crate::prepared::PreparedKind::CaTls,
             operation_id: deposit.operation_id.to_hex(),
-            result_token: deposit.result_token,
+            result_token: Some(deposit.result_token),
             result: deposit.result,
             transition_path: "/tmp/transition-ca-tls.json".into(),
             next_ca_tls_epoch: 2,
@@ -910,26 +917,118 @@ fn a_validated_key_the_document_marks_lost_opens_nothing() {
 /// what a new signature would be checked under.
 #[test]
 fn a_rotation_is_refused_while_the_authority_has_one_in_flight() {
-    let overlaps = [
-        OperatorAuthorityStatus {
-            next_ca_fingerprint: Some(Fingerprint::of(b"suivante")),
-            ..nothing_in_flight()
-        },
-        OperatorAuthorityStatus {
-            next_ca_tls_fingerprint: Some(Fingerprint::of(b"suivante")),
-            ..nothing_in_flight()
-        },
+    let overlaps: [fn(&mut OperatorAuthorityStatus); 2] = [
+        |status| status.next_ca_fingerprint = Some(Fingerprint::of(b"suivante")),
+        |status| status.next_ca_tls_fingerprint = Some(Fingerprint::of(b"suivante")),
     ];
     for overlap in overlaps {
         for kind in [RotationKind::CaPq, RotationKind::CaTls] {
             let domain = domain();
             let remote = domain.armed_remote();
-            *remote.authority.borrow_mut() = Some(overlap.clone());
+            let mut status = nothing_in_flight(&domain.path);
+            overlap(&mut status);
+            *remote.authority.borrow_mut() = Some(status);
             let keys = domain.validated(&[0, 1]);
             assert!(open(&remote, &domain.path, kind, keys, &terms(), NOW).is_err());
             assert!(!remote.called("open_campaign"));
         }
     }
+}
+
+/// The campaign would block its family for five minutes, and Astra's own word on
+/// the anchors was there to read first. Each row moves one thing, so a comparison
+/// that forgot it would let that row through.
+#[test]
+fn a_vault_out_of_step_with_astra_opens_no_campaign() {
+    type Shift = fn(&mut OperatorAuthorityStatus);
+    let both = [RotationKind::CaPq, RotationKind::CaTls];
+    let client_tls = [RotationKind::CaTls];
+    let rows: [(&str, &[RotationKind], Shift); 8] = [
+        ("vault ahead on CA-PQ", &both, |status| {
+            status.ca_epoch -= 1;
+            status.ca_fingerprint = Fingerprint::of(b"une autre ancre");
+        }),
+        ("vault behind on CA-PQ", &both, |status| {
+            status.ca_epoch += 1;
+            status.ca_fingerprint = Fingerprint::of(b"une autre ancre");
+        }),
+        ("CA-PQ epoch alone", &both, |status| status.ca_epoch += 1),
+        ("CA-PQ anchor alone", &both, |status| {
+            status.ca_fingerprint = Fingerprint::of(b"une autre ancre");
+        }),
+        ("vault ahead on client TLS", &client_tls, |status| {
+            status.ca_tls_epoch -= 1;
+            status.ca_tls_fingerprint = Some(Fingerprint::of(b"une autre ancre"));
+        }),
+        ("vault behind on client TLS", &client_tls, |status| {
+            status.ca_tls_epoch += 1;
+            status.ca_tls_fingerprint = Some(Fingerprint::of(b"une autre ancre"));
+        }),
+        ("client TLS epoch alone", &client_tls, |status| {
+            status.ca_tls_epoch += 1;
+        }),
+        ("client TLS anchor alone", &client_tls, |status| {
+            status.ca_tls_fingerprint = Some(Fingerprint::of(b"une autre ancre"));
+        }),
+    ];
+    for (label, kinds, shift) in rows {
+        for kind in kinds {
+            let domain = domain();
+            let remote = domain.armed_remote();
+            let mut status = nothing_in_flight(&domain.path);
+            shift(&mut status);
+            *remote.authority.borrow_mut() = Some(status);
+            let keys = domain.validated(&[0, 1]);
+            let refused = open(&remote, &domain.path, *kind, keys, &terms(), NOW);
+            assert!(refused.is_err(), "{label}, {kind:?}");
+            assert!(!remote.called("open_campaign"), "{label}, {kind:?}");
+            assert!(!remote.called("fetch_campaign"), "{label}, {kind:?}");
+        }
+    }
+}
+
+/// A campaign already open is not read either: the disagreement is the same.
+#[test]
+fn a_vault_out_of_step_with_astra_does_not_read_an_open_campaign() {
+    let domain = domain();
+    let remote = domain.armed_remote();
+    let mut status = nothing_in_flight(&domain.path);
+    status.ca_epoch += 1;
+    *remote.authority.borrow_mut() = Some(status);
+    let keys = domain.validated(&[0, 1]);
+    let terms = RotationTerms {
+        existing_operation: Some(operation()),
+        ..terms()
+    };
+    let refused = open(&remote, &domain.path, RotationKind::CaPq, keys, &terms, NOW);
+    assert!(refused.is_err());
+    assert!(!remote.called("fetch_campaign"));
+}
+
+/// Astra pins no client TLS CA yet: replacing one is refused, and the CA-PQ
+/// rotation, which does not depend on it, still opens.
+#[test]
+fn an_authority_pinning_no_client_tls_ca_refuses_that_rotation_alone() {
+    let domain = domain();
+    let remote = domain.armed_remote();
+    let mut status = nothing_in_flight(&domain.path);
+    status.ca_tls_fingerprint = None;
+    *remote.authority.borrow_mut() = Some(status);
+
+    let keys = domain.validated(&[0, 1]);
+    let refused = open(
+        &remote,
+        &domain.path,
+        RotationKind::CaTls,
+        keys,
+        &terms(),
+        NOW,
+    );
+    assert!(refused.is_err());
+    assert!(!remote.called("open_campaign"));
+
+    domain.opened(RotationKind::CaPq, &remote);
+    assert!(remote.called("open_campaign"));
 }
 
 /// Astra forgets a window once it promotes at `not_after`, and the vault keeps it
@@ -971,16 +1070,58 @@ fn a_vault_with_a_client_tls_window_still_open_opens_nothing() {
     assert!(!remote.called("open_campaign"));
 }
 
+/// What the touch does, stated before it: the authority replaced, not both rows
+/// of the campaign, and the incoming anchor absent since it does not exist yet.
 #[test]
-fn the_manifest_is_the_verified_campaign_and_the_window_the_one_signed() {
+fn the_manifest_states_what_the_touch_does() {
+    for (kind, affected_ca) in [
+        (RotationKind::CaPq, AffectedCa::CaPq),
+        (RotationKind::CaTls, AffectedCa::CaTls),
+    ] {
+        let domain = domain();
+        let relay = domain.relay();
+        let identity = handoff::identity_of(&relay).expect("identity");
+        let (current_epoch, outgoing) = match kind {
+            RotationKind::CaPq => (
+                identity.ca_epoch,
+                MlDsa87PublicKey::parse(relay.ca_pq_public_key.trim())
+                    .expect("anchor")
+                    .authority_fingerprint(),
+            ),
+            RotationKind::CaTls => (
+                identity.ca_tls_epoch,
+                DerCertificate::parse(relay.ca_tls_certificate.as_ref().expect("CA-TLS"))
+                    .expect("certificate")
+                    .fingerprint(),
+            ),
+        };
+        let remote = domain.armed_remote();
+        let rotation = domain.opened(kind, &remote);
+        assert_eq!(rotation.kind(), kind);
+        let AstraManifest::CaRotation(manifest) = rotation.manifest() else {
+            panic!("a rotation manifest, {kind:?}");
+        };
+        assert_eq!(manifest.trust_domain_id, trust_domain());
+        assert_eq!(manifest.affected_ca, affected_ca);
+        assert_eq!(manifest.current_epoch, current_epoch);
+        assert_eq!(manifest.next_epoch, current_epoch + 1);
+        assert_eq!(manifest.activation_at, rotation.window().activation_at);
+        assert_eq!(manifest.not_after, rotation.window().not_after);
+        assert_eq!(manifest.outgoing_anchor_fingerprint, outgoing);
+        assert_eq!(manifest.next_anchor_fingerprint, None);
+        assert_eq!(manifest.target_count, 1, "{kind:?}");
+
+        let campaign = manifest.campaign.as_ref().expect("the campaign");
+        assert_eq!(campaign.fingerprint, campaign.campaign.fingerprint());
+        assert_eq!(campaign.campaign.scope, CampaignScope::TrustAuthorities);
+    }
+}
+
+#[test]
+fn the_window_shown_is_the_one_signed() {
     let domain = domain();
     let remote = domain.armed_remote();
     let mut rotation = domain.opened(RotationKind::CaTls, &remote);
-    let AstraManifest::Campaign(manifest) = rotation.manifest() else {
-        panic!("a campaign manifest");
-    };
-    assert_eq!(manifest.fingerprint, manifest.campaign.fingerprint());
-    assert_eq!(manifest.campaign.scope, CampaignScope::TrustAuthorities);
 
     let window = rotation.window();
     assert_eq!(window.not_before, NOW);
@@ -1159,6 +1300,56 @@ fn expiry_between_two_approvals_signs_nothing() {
     assert_eq!(std::fs::read(&domain.path).expect("vault"), vault_before);
 }
 
+/// A campaign that died has no use for what the keys released, and a caller that
+/// holds on to the value must not hold on to the secrets with it.
+#[test]
+fn expiry_lets_go_of_the_openings_at_once() {
+    let domain = domain();
+    let remote = domain.armed_remote();
+    let mut rotation = domain.opened(RotationKind::CaPq, &remote);
+    rotation.approve(&domain.keys[0], NOW).expect("first");
+    assert_eq!(rotation.keys.count(), 2);
+
+    assert_eq!(
+        rotation.approve(&domain.keys[1], EXPIRES),
+        Err(KeyStep::Expired)
+    );
+
+    assert_eq!(rotation.keys.count(), 0);
+    assert!(rotation.offered().is_empty());
+    assert_eq!(
+        rotation.approve(&domain.keys[1], EXPIRES),
+        Err(KeyStep::Expired),
+        "still expired, and no panic over the openings gone"
+    );
+    let refused = rotation
+        .sign_and_journal(&domain.path, EXPIRES)
+        .expect_err("nothing signed");
+    assert_eq!(refused.downcast_ref::<KeyStep>(), Some(&KeyStep::Expired));
+}
+
+/// Both approvals in, the openings gone, and a clock that went back: the signature
+/// has nothing to sign with, and says so rather than reaching for them.
+#[test]
+fn a_clock_moving_back_after_the_expiry_signs_nothing() {
+    let domain = domain();
+    let remote = domain.armed_remote();
+    let mut rotation = domain.opened(RotationKind::CaPq, &remote);
+    rotation.approve(&domain.keys[0], NOW).expect("first");
+    rotation.approve(&domain.keys[1], NOW).expect("second");
+    assert_eq!(
+        rotation.approve(&domain.keys[2], EXPIRES),
+        Err(KeyStep::Expired)
+    );
+
+    let refused = rotation
+        .sign_and_journal(&domain.path, NOW + 1)
+        .expect_err("nothing signed");
+
+    assert_eq!(refused.downcast_ref::<KeyStep>(), Some(&KeyStep::Expired));
+    assert_eq!(domain.journal_on_disk(), None);
+}
+
 #[test]
 fn signing_with_one_approval_signs_nothing() {
     let domain = domain();
@@ -1291,6 +1482,168 @@ fn a_rotation_goes_from_its_signature_to_the_end_with_no_key() {
     }
 }
 
+fn prepared_record_on_disk(domain: &Domain) -> Option<prepared::PreparedRotation> {
+    prepared::load(&prepared::path_beside(&domain.path)).expect("record")
+}
+
+/// `Finished` removes the journal, and with it the only other copy of the incoming
+/// certificate. The record keeps what « Terminer » needs, and no token.
+#[test]
+fn a_finished_client_tls_rotation_leaves_the_incoming_anchor_for_the_promotion() {
+    let domain = domain();
+    let mut journal = domain.signed(RotationKind::CaTls);
+    let RotationTransition::CaTls(transition) = journal.transition.clone() else {
+        panic!("a client TLS transition");
+    };
+    let deposit = journal.deposit.clone().expect("deposit");
+    let remote = Remote::watching(&domain.path);
+
+    let step = advance(&remote, &domain.path, &mut journal, NOW).expect("advanced");
+    assert_eq!(step, ResumeStep::Finished);
+    assert_eq!(domain.journal_on_disk(), None);
+
+    let record = prepared_record_on_disk(&domain).expect("the record");
+    assert_eq!(
+        record,
+        prepared::PreparedRotation {
+            kind: prepared::PreparedKind::CaTls,
+            operation_id: deposit.operation_id.to_hex(),
+            result_token: None,
+            result: deposit.result,
+            transition_path: String::new(),
+            next_ca_tls_epoch: transition.next_ca_tls_epoch,
+            next_ca_tls_certificate: transition.next_client_tls_ca_certificate.to_base64(),
+            activation_at: journal.activation_at,
+            not_after: journal.not_after,
+            submitted: true,
+            prepared_at: journal.signed_at,
+            manifest: None,
+            adopted: true,
+        }
+    );
+    let bytes = std::fs::read(prepared::path_beside(&domain.path)).expect("bytes");
+    let text = String::from_utf8(bytes).expect("text");
+    assert!(!text.contains(&deposit.result_token));
+    assert!(!text.contains("result_token"));
+
+    // The promotion, as `promote-ca-tls` runs it: the record names what the vault
+    // puts in service.
+    let mut vault = store::load(&domain.path).expect("vault");
+    let opening = gestures::open_with_authorized_key(&domain.keys[0], &vault, "").expect("opened");
+    let advanced =
+        signing::advance_ca_tls(&mut vault, &opening, record.not_after).expect("promoted");
+    let crate::vault::CaTlsAdvance::Rotated {
+        certificate_fingerprint,
+        ..
+    } = advanced
+    else {
+        panic!("the window closes at not_after");
+    };
+    let named = DerCertificate::parse(&record.next_ca_tls_certificate).expect("certificate");
+    assert_eq!(certificate_fingerprint, named.fingerprint().to_string());
+}
+
+/// Any prefix of `apply_local` is replayed from the top, and the record is part of
+/// it: a stop before it writes it at the replay, and a stop after it writes the same.
+#[test]
+fn a_stop_inside_apply_local_replays_to_the_same_record() {
+    let domain = domain();
+    let mut journal = domain.signed(RotationKind::CaTls);
+    let next = journal.next.clone().expect("next");
+    rotation_journal::record_accepted(&domain.path, &mut journal).expect("accepted");
+    let accepted = journal.clone();
+    let journal_path = rotation_journal::path_beside(&domain.path);
+
+    // A write that fails where the record goes: the vault has moved, the journal
+    // keeps `next`, and nothing says the rotation went past this.
+    let record_path = prepared::path_beside(&domain.path);
+    std::fs::create_dir(&record_path).expect("in the way");
+    let remote = Remote::watching(&domain.path);
+    advance(&remote, &domain.path, &mut journal, NOW).expect_err("stopped");
+    assert_eq!(domain.journal_on_disk(), Some(accepted.clone()));
+    assert_eq!(store::load(&domain.path).expect("vault"), next.vault);
+    assert!(!remote.called("install_client_tls_ca_transition"));
+    std::fs::remove_dir(&record_path).expect("out of the way");
+
+    let mut resumed = domain.journal_on_disk().expect("journal");
+    let step = advance(&remote, &domain.path, &mut resumed, NOW).expect("advanced");
+    assert_eq!(step, ResumeStep::Finished);
+    let record = std::fs::read(&record_path).expect("the record");
+
+    // A stop after the record and before the journal says `Applied`.
+    rotation_journal::save(&journal_path, &accepted).expect("back to Accepted");
+    let mut replayed = accepted;
+    rotation_journal::apply_local(&domain.path, &mut replayed).expect("replayed");
+    assert_eq!(std::fs::read(&record_path).expect("the record"), record);
+}
+
+/// `Discard` is only reached with the vault unmoved, and the record means the vault
+/// moved.
+#[test]
+fn a_discarded_client_tls_rotation_leaves_no_record() {
+    let domain = domain();
+    let mut journal = domain.signed(RotationKind::CaTls);
+    let remote = Remote::watching(&domain.path);
+    remote.deposits.borrow_mut().push_back(Err(403));
+
+    let step = advance(&remote, &domain.path, &mut journal, NOW).expect("advanced");
+
+    assert_eq!(step, ResumeStep::Discard);
+    assert_eq!(prepared_record_on_disk(&domain), None);
+}
+
+/// A journal that has ended stays ended: the record is for `promote-ca-tls`.
+#[test]
+fn the_record_of_a_finished_rotation_is_not_adopted_into_a_journal() {
+    let domain = domain();
+    let mut journal = domain.signed(RotationKind::CaTls);
+    let remote = Remote::watching(&domain.path);
+    advance(&remote, &domain.path, &mut journal, NOW).expect("advanced");
+    let record = prepared_record_on_disk(&domain).expect("the record");
+
+    assert_eq!(
+        rotation_journal::adopt_legacy(&domain.path).expect("read"),
+        None
+    );
+
+    assert_eq!(domain.journal_on_disk(), None);
+    assert_eq!(prepared_record_on_disk(&domain), Some(record));
+}
+
+/// Until « Terminer », the window this record describes is still open.
+#[test]
+fn a_finished_client_tls_rotation_holds_the_next_one_until_the_promotion() {
+    let domain = domain();
+    let mut journal = domain.signed(RotationKind::CaTls);
+    let remote = Remote::watching(&domain.path);
+    advance(&remote, &domain.path, &mut journal, NOW).expect("advanced");
+
+    let refused = open(
+        &domain.armed_remote(),
+        &domain.path,
+        RotationKind::CaPq,
+        domain.validated(&[0, 1]),
+        &terms(),
+        NOW,
+    )
+    .err()
+    .expect("refused");
+    assert!(format!("{refused:#}").contains("préparée"), "{refused:#}");
+}
+
+/// The record names a client TLS certificate, and a CA-PQ rotation has none.
+#[test]
+fn a_ca_pq_rotation_leaves_no_record() {
+    let domain = domain();
+    let mut journal = domain.signed(RotationKind::CaPq);
+    let remote = Remote::watching(&domain.path);
+
+    let step = advance(&remote, &domain.path, &mut journal, NOW).expect("advanced");
+
+    assert_eq!(step, ResumeStep::Finished);
+    assert_eq!(prepared_record_on_disk(&domain), None);
+}
+
 #[test]
 fn accepted_runs_apply_install_copy_in_that_order() {
     for (kind, install) in [
@@ -1365,7 +1718,7 @@ fn a_refused_deposit_astra_turns_out_to_hold_continues() {
         let mut journal = domain.signed(RotationKind::CaTls);
         let remote = Remote::watching(&domain.path);
         remote.deposits.borrow_mut().push_back(Err(status));
-        *remote.authority.borrow_mut() = Some(holding(&journal));
+        *remote.authority.borrow_mut() = Some(holding(&domain.path, &journal));
 
         let step = advance(&remote, &domain.path, &mut journal, NOW).expect("advanced");
         assert_eq!(step, ResumeStep::Finished, "{status}");
@@ -1442,7 +1795,7 @@ fn a_dead_campaign_is_decided_by_the_authority_and_never_deposited() {
     let domain_held = domain();
     let mut journal = domain_held.signed(RotationKind::CaPq);
     let remote = Remote::watching(&domain_held.path);
-    *remote.authority.borrow_mut() = Some(holding(&journal));
+    *remote.authority.borrow_mut() = Some(holding(&domain_held.path, &journal));
     let step = advance(&remote, &domain_held.path, &mut journal, EXPIRES).expect("advanced");
     assert_eq!(step, ResumeStep::Finished);
     assert!(!remote.called("submit_campaign"));
@@ -1463,7 +1816,7 @@ fn a_dead_campaign_is_decided_by_the_authority_and_never_deposited() {
     let remote = Remote::watching(&domain_other.path);
     *remote.authority.borrow_mut() = Some(OperatorAuthorityStatus {
         next_ca_fingerprint: Some(Fingerprint::of(b"une autre")),
-        ..nothing_in_flight()
+        ..nothing_in_flight(&domain_other.path)
     });
     let step = advance(&remote, &domain_other.path, &mut journal, EXPIRES).expect("advanced");
     assert_eq!(step, ResumeStep::DomainConflict);
@@ -1562,7 +1915,7 @@ fn an_adoption_astra_holds_runs_to_the_end() {
     let mut journal = adopted_legacy_journal(&domain);
     let next = journal.next.clone().expect("next");
     let remote = Remote::watching(&domain.path);
-    *remote.authority.borrow_mut() = Some(holding(&journal));
+    *remote.authority.borrow_mut() = Some(holding(&domain.path, &journal));
 
     let step = advance(&remote, &domain.path, &mut journal, NOW).expect("advanced");
 

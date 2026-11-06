@@ -182,17 +182,28 @@ export function rowsOf(manifest: AstraManifest): [string, string][] {
       }
       return rows
     }
-    case 'ca_rotation':
-      return [
+    case 'ca_rotation': {
+      const rows: [string, string][] = [
         ['autorité visée', CA_NAMES[manifest.affected_ca]],
         ['époque', `${manifest.current_epoch} → ${manifest.next_epoch}`],
         ['activation', instant(manifest.activation_at)],
         ['échéance', instant(manifest.not_after)],
         ['ancre sortante', manifest.outgoing_anchor_fingerprint],
-        ['ancre entrante', manifest.next_anchor_fingerprint],
+        ['ancre entrante', manifest.next_anchor_fingerprint ?? 'créée à la signature'],
         ['pairs concernés', String(manifest.target_count)],
         ['domaine', manifest.trust_domain_id],
       ]
+      if (manifest.campaign) {
+        rows.push(
+          ['campagne', manifest.campaign.campaign.campaign_id],
+          ['portée', CAMPAIGN_SCOPES[manifest.campaign.campaign.scope]],
+          ['motif', manifest.campaign.campaign.reason],
+          ['demandée par', manifest.campaign.campaign.requested_by],
+          ['empreinte de campagne', manifest.campaign.fingerprint],
+        )
+      }
+      return rows
+    }
     case 'revocation':
       return [
         ['cible', manifest.target],

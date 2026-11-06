@@ -671,8 +671,15 @@ pub struct CaRotationManifest {
     pub activation_at: u64,
     pub not_after: u64,
     pub outgoing_anchor_fingerprint: Fingerprint,
-    pub next_anchor_fingerprint: Fingerprint,
+    /// Absent at the touch: the incoming anchor does not exist before the
+    /// signature, which the approvals come before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_anchor_fingerprint: Option<Fingerprint>,
     pub target_count: usize,
+    /// The campaign the keys approve, when there is one. Absent for a rotation
+    /// signed offline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub campaign: Option<CampaignManifest>,
 }
 
 impl CaRotationManifest {
@@ -988,13 +995,53 @@ mod tests {
             activation_at: 10,
             not_after: 20,
             outgoing_anchor_fingerprint: Fingerprint::of(b"outgoing"),
-            next_anchor_fingerprint: Fingerprint::of(b"next"),
+            next_anchor_fingerprint: Some(Fingerprint::of(b"next")),
             target_count: 3,
+            campaign: None,
         });
         assert_eq!(manifest.kind(), OperationKind::RotateClientTlsCa);
         assert_eq!(
             manifest.trust_domain_id(),
             Some(Id16::new([1; 16]).expect("domain"))
+        );
+    }
+
+    /// At the touch there is no incoming anchor to name. A manifest that does name
+    /// one, written before these two fields were optional, still reads.
+    #[test]
+    fn a_rotation_manifest_may_name_no_incoming_anchor_and_no_campaign() {
+        let manifest = CaRotationManifest {
+            trust_domain_id: Id16::new([1; 16]).expect("domain"),
+            affected_ca: AffectedCa::CaPq,
+            current_epoch: 1,
+            next_epoch: 2,
+            activation_at: 10,
+            not_after: 20,
+            outgoing_anchor_fingerprint: Fingerprint::of(b"outgoing"),
+            next_anchor_fingerprint: None,
+            target_count: 1,
+            campaign: None,
+        };
+        let encoded = serde_json::to_value(&manifest).expect("encoding");
+        assert!(encoded.get("next_anchor_fingerprint").is_none());
+        assert!(encoded.get("campaign").is_none());
+        assert_eq!(
+            serde_json::from_value::<CaRotationManifest>(encoded).expect("decoding"),
+            manifest
+        );
+
+        let named = CaRotationManifest {
+            next_anchor_fingerprint: Some(Fingerprint::of(b"next")),
+            ..manifest
+        };
+        let encoded = serde_json::to_value(&named).expect("encoding");
+        assert_eq!(
+            encoded["next_anchor_fingerprint"],
+            serde_json::to_value(Fingerprint::of(b"next")).expect("fingerprint")
+        );
+        assert_eq!(
+            serde_json::from_value::<CaRotationManifest>(encoded).expect("decoding"),
+            named
         );
     }
 

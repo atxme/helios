@@ -155,7 +155,7 @@ fn legacy_prepared(domain: &Domain, submitted: bool) -> (PreparedRotation, Autho
     let record = PreparedRotation {
         kind: PreparedKind::CaTls,
         operation_id: Id16::new([4; 16]).expect("id").to_hex(),
-        result_token: "jeton-de-depot".into(),
+        result_token: Some("jeton-de-depot".into()),
         result: AstraSignerResult {
             format_version: CERTIFICATE_FORMAT_VERSION,
             approval: Box::new(CampaignApproval {
@@ -528,7 +528,7 @@ fn a_submitted_prepared_record_is_accepted_with_no_next() {
     assert_eq!(journal.next, None, "the vault already moved");
     let deposit = journal.deposit.as_ref().expect("the deposit is kept");
     assert_eq!(deposit.operation_id.to_hex(), record.operation_id);
-    assert_eq!(deposit.result_token, record.result_token);
+    assert_eq!(Some(&deposit.result_token), record.result_token.as_ref());
     assert_eq!(deposit.result, record.result);
     assert_eq!(journal.signed_at, NOW);
     assert_eq!(
@@ -637,6 +637,21 @@ fn recording_acceptance_tells_the_prepared_record() {
     assert_eq!(
         rotation_journal::load(&rotation_journal::path_beside(&domain.path)).expect("load"),
         Some(journal)
+    );
+}
+
+/// A record with no token has nothing to replay, and a journal could not resume it.
+#[test]
+fn a_record_with_no_token_is_not_adopted() {
+    let domain = domain();
+    let (mut record, _) = legacy_prepared(&domain, false);
+    record.result_token = None;
+    prepared::save(&prepared::path_beside(&domain.path), &record).expect("record");
+
+    assert!(rotation_journal::adopt_legacy(&domain.path).is_err());
+    assert_eq!(
+        rotation_journal::load(&rotation_journal::path_beside(&domain.path)).expect("load"),
+        None
     );
 }
 

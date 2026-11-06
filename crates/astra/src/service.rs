@@ -1048,13 +1048,17 @@ pub(crate) async fn operator_signer_result(
 
     if !verified.objects.is_empty() {
         let mut domain = service.registry.lock().await;
+        // Restored on a failed write: this answer says « not held », the status read
+        // must say the same, and the operator's vault moves on that word.
         let accepted = domain
-            .accept_transitions(
-                &verified.campaign,
-                &verified.objects,
-                verified.credential_registry.clone(),
-                now,
-            )
+            .write_or_restore(|registry| {
+                registry.accept_transitions(
+                    &verified.campaign,
+                    &verified.objects,
+                    verified.credential_registry.clone(),
+                    now,
+                )
+            })
             .map_err(|error| {
                 tracing::error!(
                     %operation_id,

@@ -214,7 +214,7 @@ impl CaTlsCeremony {
         let record = prepared::PreparedRotation {
             kind: prepared::PreparedKind::CaTls,
             operation_id: self.request.operation_id.to_hex(),
-            result_token: self.request.result_token.clone(),
+            result_token: Some(self.request.result_token.clone()),
             result,
             transition_path: self.output_path.display().to_string(),
             next_ca_tls_epoch: self.manifest.next_ca_tls_epoch,
@@ -458,7 +458,11 @@ fn submit_prepared(
 ) -> Result<()> {
     let operation = Id16::parse_hex(&record.operation_id)
         .map_err(|error| anyhow::anyhow!("rotation préparée illisible : {error}"))?;
-    channel.submit(&operation, &record.result_token, &record.result)?;
+    let token = record
+        .result_token
+        .as_deref()
+        .context("cette rotation préparée ne porte aucun jeton de dépôt : elle ne se rejoue pas")?;
+    channel.submit(&operation, token, &record.result)?;
     record.submitted = true;
     prepared::save(&prepared::path_beside(vault_path), record)
 }
@@ -522,7 +526,7 @@ fn status_for(
 
 fn status_from_record(record: &prepared::PreparedRotation) -> AstraCaTlsStatus {
     let mut status = AstraCaTlsStatus::new(AstraCaTlsPhase::Prepared, "Transition préparée.");
-    status.output_path = Some(record.transition_path.clone());
+    status.output_path = Some(record.transition_path.clone()).filter(|path| !path.is_empty());
     status.next_ca_tls_epoch = Some(record.next_ca_tls_epoch);
     status.activation_at = Some(record.activation_at);
     status.not_after = Some(record.not_after);
@@ -587,6 +591,49 @@ fn now_unix() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A rotation that went through the tunnel left no file, and an empty path must
+    /// not read as one.
+    #[test]
+    fn a_record_with_no_transition_file_names_no_path() {
+        let record = prepared::PreparedRotation {
+            kind: prepared::PreparedKind::CaTls,
+            operation_id: "01".repeat(16),
+            result_token: None,
+            result: AstraSignerResult {
+                format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+                approval: Box::new(CampaignApproval {
+                    campaign_id: Id16::new([3; 16]).expect("id"),
+                    campaign_fingerprint: aether::certificates::encoding::Fingerprint::of(b"c"),
+                    required_credentials: 2,
+                    approved_at: 9,
+                    approvals: Vec::new(),
+                }),
+                objects: Vec::new(),
+                credential_registry: None,
+                issuer_authorization: None,
+            },
+            transition_path: String::new(),
+            next_ca_tls_epoch: 2,
+            next_ca_tls_certificate: "REVS".into(),
+            activation_at: 100,
+            not_after: 200,
+            submitted: true,
+            prepared_at: 10,
+            manifest: None,
+            adopted: true,
+        };
+        assert_eq!(status_from_record(&record).output_path, None);
+
+        let with_file = prepared::PreparedRotation {
+            transition_path: "/tmp/transition.json".into(),
+            ..record
+        };
+        assert_eq!(
+            status_from_record(&with_file).output_path.as_deref(),
+            Some("/tmp/transition.json")
+        );
+    }
 
     #[test]
     fn helper_endpoint_must_be_loopback_and_token_is_exactly_256_bits() {

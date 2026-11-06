@@ -22,7 +22,9 @@
 //! thing on this machine built to hold one. What this file does carry that is
 //! not public is the operation's result token — a bearer credential for one
 //! deposit — so it is written with the same private permissions as the vault
-//! beside it, and removed as soon as the deposit lands.
+//! beside it. The token stays in a record written before the deposit, until the
+//! promotion clears the file. A record written once the deposit has landed
+//! ([`crate::rotation_journal::apply_local`]) never holds one.
 //!
 //! # Why it is not the vault
 //!
@@ -60,13 +62,17 @@ pub struct PreparedRotation {
     /// The operation the deposit answers, 32 hex characters.
     pub operation_id: String,
     /// Bearer token for that one deposit.
-    pub result_token: String,
+    ///
+    /// Absent from a record written once the deposit has landed: nothing would
+    /// read it again, and this file outlives the window the token was for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_token: Option<String>,
     /// The exact result to deposit. Replaying identical bytes is idempotent;
     /// different bytes under the same identifier are a conflict Astra decides,
     /// which is why this is stored rather than rebuilt.
     pub result: AstraSignerResult,
     /// Where the transition file was written, for the operator to carry to the
-    /// gateway.
+    /// gateway. Empty when the rotation went through the tunnel: no file exists.
     pub transition_path: String,
     /// The `CA-TLS` generation this rotation opens.
     pub next_ca_tls_epoch: u64,
@@ -84,8 +90,8 @@ pub struct PreparedRotation {
     /// decision after the companion or Orion restarted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest: Option<AstraCaTlsManifest>,
-    /// Carried over into the rotation journal. The record stays, for
-    /// `promote-ca-tls`, and this keeps it from being adopted again: a journal
+    /// Carried over into the rotation journal, or born from one. The record stays,
+    /// for `promote-ca-tls`, and this keeps it from being adopted again: a journal
     /// that has ended must not come back holding the token.
     ///
     /// Optional on disk, so a record written before this field still reads.
@@ -150,7 +156,7 @@ mod tests {
         PreparedRotation {
             kind: PreparedKind::CaTls,
             operation_id: "0".repeat(32),
-            result_token: "jeton".into(),
+            result_token: Some("jeton".into()),
             result: AstraSignerResult {
                 format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
                 approval: Box::new(CampaignApproval {
@@ -192,6 +198,25 @@ mod tests {
         };
         let value = serde_json::to_value(&adopted).expect("value");
         assert_eq!(value["adopted"], serde_json::json!(true));
+    }
+
+    /// A record written before the token became optional still reads, and one
+    /// holding none does not say so with a value.
+    #[test]
+    fn the_token_is_optional_on_disk() {
+        let value = serde_json::to_value(record()).expect("value");
+        assert_eq!(value["result_token"], serde_json::json!("jeton"));
+        let read: PreparedRotation = serde_json::from_value(value).expect("read");
+        assert_eq!(read.result_token.as_deref(), Some("jeton"));
+
+        let tokenless = PreparedRotation {
+            result_token: None,
+            ..record()
+        };
+        let value = serde_json::to_value(&tokenless).expect("value");
+        assert!(value.get("result_token").is_none());
+        let read: PreparedRotation = serde_json::from_value(value).expect("read");
+        assert_eq!(read, tokenless);
     }
 
     #[test]

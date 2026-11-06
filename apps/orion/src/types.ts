@@ -835,8 +835,11 @@ export interface CaRotationManifest {
   activation_at: number
   not_after: number
   outgoing_anchor_fingerprint: string
-  next_anchor_fingerprint: string
+  /** Absent at the touch: the incoming anchor does not exist before the signature. */
+  next_anchor_fingerprint?: string
   target_count: number
+  /** The campaign the keys approve; absent for a rotation signed offline. */
+  campaign?: { campaign: CampaignManifest['campaign']; fingerprint: string }
 }
 
 export interface RevocationManifest {
