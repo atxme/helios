@@ -74,12 +74,14 @@ const MAX_DOMAIN_ANSWER_BYTES: usize = 8 * 1024 * 1024;
 const NO_AUTHORITY: &str = "la gateway ne relaie aucune autorité (503) : Astra n'est pas déployé, \
                             ou son canal privé est tombé.";
 
-/// The gateway answered, and the answer was no.
+/// The gateway answered with a status other than success.
 ///
-/// A type and not only a sentence, because a resume decides from it: a refusal
-/// is the domain's answer about a journal, while a lost connection says nothing
-/// and leaves it for the next attempt. Reached by `downcast_ref` on the error
-/// any call on the operator routes returns.
+/// Having an answer is all this type says, and a lost connection stays apart from
+/// it. What the answer means is in [`status`](Self::status): a deposit's 403 or
+/// 409 is the domain's word about a journal, while 429, 500 or 503 only say that
+/// the gateway or the authority could not answer, and say nothing about it. So a
+/// resume must not set `deposit_refused` from the type alone. Reached by
+/// `downcast_ref` on the error any call on the operator routes returns.
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
 pub struct TunnelRefusal {

@@ -123,3 +123,179 @@ fn neither_rotation_opens_over_a_rotation_journal() {
         "{ca_tls:#}"
     );
 }
+
+/// A real rotation, signed with slot secrets in place of a security key: this
+/// binary's own journal, in the format the operator library adopts.
+fn interrupted_ca_pq_rotation(
+    directory: &Path,
+) -> (
+    PathBuf,
+    PathBuf,
+    astra_operator::rotation_journal::LegacyCaPqJournal,
+) {
+    use aether::certificates::encoding::{generate_ml_dsa_87_keypair, WireGuardKey};
+    use astra_operator::vault::{draw_salt, AuthoritySecrets, SlotEnrolment, SlotSecret};
+    use base64::Engine as _;
+
+    let domain = TrustDomainId::new([1; 16]).expect("domain");
+    let (private, public) = generate_ml_dsa_87_keypair().expect("keys");
+    let encoder = base64::engine::general_purpose::STANDARD;
+    let secrets = AuthoritySecrets {
+        ca_pq_private_key: encoder.encode(&*private),
+        ca_pq_public_key: public.to_base64(),
+        ca_tls_private_key: encoder.encode(b"tls"),
+        retained_ca_tls: None,
+    };
+    let enrolment = |seed: u8, role| SlotEnrolment {
+        role,
+        label: format!("clé {seed}"),
+        credential_id: vec![seed; 64],
+        // An Ed25519 COSE key: the registry parses it, nothing here verifies with it.
+        credential_public_key: [
+            &[0xA4, 0x01, 0x01, 0x03, 0x27, 0x20, 0x06, 0x21, 0x58, 0x20][..],
+            &[seed; 32],
+        ]
+        .concat(),
+        aaguid: [seed; 16],
+        enrolled_at: 1_000,
+    };
+    let secret = |seed: u8| SlotSecret::new(vec![seed; 32]);
+    let mut vault = AuthorityVault::create(
+        domain,
+        "astra.helios.test",
+        draw_salt().expect("salt"),
+        &secrets,
+        enrolment(1, SlotRole::Primary),
+        &secret(1),
+        1_000,
+    )
+    .expect("vault");
+    vault
+        .add_slot(
+            &[1; 64],
+            &secret(1),
+            enrolment(2, SlotRole::Recovery),
+            &secret(2),
+        )
+        .expect("second slot");
+
+    let path = directory.join("authority-vault.json");
+    store::save(&path, &vault).expect("vault");
+    let mut relay = handoff::DomainHandoff::of(&vault).expect("relay");
+    relay.gateway_wg_public_key = Some(WireGuardKey::from_bytes([9; 32]).to_base64());
+    relay.server_name = Some("gateway.helios.test".into());
+    handoff::save(&handoff::path_beside(&path), &relay).expect("relay");
+    let identity = handoff::identity_of(&relay).expect("identity");
+
+    let first = Opened {
+        credential_id: vec![1; 64],
+        secret: secret(1),
+    };
+    let second = Opened {
+        credential_id: vec![2; 64],
+        secret: secret(2),
+    };
+    let window = TransitionWindow::new(2_000, 3_000, 4_000).expect("window");
+    let rotated = signing::rotate_ca_pq(
+        &mut vault,
+        &[&first, &second],
+        &identity,
+        None,
+        window,
+        2_000,
+    )
+    .expect("rotated");
+    relay.adopt(&vault).expect("adopt");
+    relay.ca_epoch = Some(identity.ca_epoch + 1);
+    let out = directory.join("transition.json");
+    let journal = astra_operator::rotation_journal::LegacyCaPqJournal {
+        format_version: astra_operator::rotation_journal::LEGACY_CA_PQ_JOURNAL_VERSION,
+        output_path: out.clone(),
+        current_ca_public_key: public,
+        vault,
+        bindings: rotated.bindings,
+        transition: rotated.transition,
+        handoff: relay,
+    };
+    documents::write(
+        &astra_operator::rotation_journal::legacy_ca_pq_path_beside(&path),
+        &journal,
+    )
+    .expect("journal");
+    (path, out, journal)
+}
+
+fn resume_ca_pq(path: &Path, out: &Path) -> Result<()> {
+    commands::rotate_ca_pq(path, out, 7, 30, None, None, None, Transport::default())
+}
+
+/// The way back for an offline rotation, which Orion refuses: while Astra has
+/// not confirmed the adoption, the command that wrote the file may finish it, and
+/// it leaves neither file behind.
+#[test]
+fn the_ca_pq_command_finishes_a_rotation_astra_has_not_confirmed() {
+    let directory = tempfile::tempdir().expect("dir");
+    let (path, out, journal) = interrupted_ca_pq_rotation(directory.path());
+    let journal_path = astra_operator::rotation_journal::path_beside(&path);
+    let legacy_path = astra_operator::rotation_journal::legacy_ca_pq_path_beside(&path);
+    astra_operator::rotation_journal::adopt_legacy(&path)
+        .expect("adopted")
+        .expect("a journal");
+    assert!(journal_path.exists());
+
+    resume_ca_pq(&path, &out).expect("resumed");
+
+    assert!(!journal_path.exists());
+    assert!(!legacy_path.exists());
+    assert!(out.exists());
+    assert_eq!(store::load(&path).expect("vault"), journal.vault);
+}
+
+/// Past the apply the journal carries the rotation, and the command stays out.
+#[test]
+fn the_ca_pq_command_refuses_a_journal_astra_has_confirmed() {
+    let directory = tempfile::tempdir().expect("dir");
+    let (path, out, journal) = interrupted_ca_pq_rotation(directory.path());
+    let legacy_path = astra_operator::rotation_journal::legacy_ca_pq_path_beside(&path);
+    let mut adopted = astra_operator::rotation_journal::adopt_legacy(&path)
+        .expect("adopted")
+        .expect("a journal");
+    astra_operator::rotation_journal::apply_local(&path, &mut adopted).expect("applied");
+    documents::write(&legacy_path, &journal).expect("left behind by a stop");
+
+    let refusal = resume_ca_pq(&path, &out).expect_err("refused");
+
+    assert!(
+        format!("{refusal:#}").contains("rotation est en cours"),
+        "{refusal:#}"
+    );
+    assert!(!out.exists());
+}
+
+/// The exception is for that command alone: the CA-TLS one still refuses.
+#[test]
+fn the_ca_tls_command_refuses_an_unconfirmed_adoption_too() {
+    let directory = tempfile::tempdir().expect("dir");
+    let (path, out, _) = interrupted_ca_pq_rotation(directory.path());
+    astra_operator::rotation_journal::adopt_legacy(&path)
+        .expect("adopted")
+        .expect("a journal");
+    let channel = astra_operator::campaign::Campaign::select(None, Some("http://127.0.0.1:9"))
+        .expect("channel");
+
+    let refusal = commands::rotate_ca_tls(
+        &path,
+        channel,
+        &"0".repeat(32),
+        None,
+        &out,
+        (7, 30, 1825),
+        Transport::default(),
+    )
+    .expect_err("refused");
+
+    assert!(
+        format!("{refusal:#}").contains("rotation est en cours"),
+        "{refusal:#}"
+    );
+}

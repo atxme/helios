@@ -196,6 +196,7 @@ pub(crate) fn rotate_ca_tls(
             &active_certificate,
             window,
         )?),
+        adopted: false,
     };
     // Written before the deposit is attempted, and holding the exact bytes of
     // it. A crash after this point is a replay; a crash before it is a

@@ -224,6 +224,7 @@ impl CaTlsCeremony {
             submitted: false,
             prepared_at: now,
             manifest: Some(self.manifest.clone()),
+            adopted: false,
         };
         let prepared_path = prepared::path_beside(&self.vault_path);
         prepared::save(&prepared_path, &record)?;

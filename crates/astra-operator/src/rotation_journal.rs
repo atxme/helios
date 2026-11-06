@@ -14,17 +14,21 @@
 //! transition and the result to deposit. **No private key in the clear.** The
 //! transition stays until the gateway confirms it: with no `--out` file, this is
 //! its only copy, and past `activation_at` the vault cannot sign another. What
-//! is not public is the result token, a bearer credential for one deposit, so
-//! the file is as private as the vault beside it and `Debug` does not print it.
+//! is not public is the result token, a bearer credential for one deposit, and
+//! the sealed vault, so the file is as private as the vault beside it. `Debug`
+//! prints neither, which is what makes `{journal:?}` safe in a log.
 //!
 //! # The older records
 //!
 //! `astra-signer` left two others, and an operator may hold one from an
-//! interrupted rotation: its CA-PQ journal, written after its deposit with the
-//! next vault still to apply, and the prepared CA-TLS record, written after the
-//! vault moved. [`adopt_legacy`] turns either into this one. Neither may be
-//! discarded when Astra knows nothing of it: the vault in place is the only copy
-//! of the keys that record was signed with.
+//! interrupted rotation: its CA-PQ journal, with the next vault still to apply,
+//! and the prepared CA-TLS record, written after the vault moved. [`adopt_legacy`]
+//! turns either into this one. Neither may be discarded when Astra knows nothing
+//! of it: the vault in place may be the only copy of the keys it was signed with.
+//!
+//! That CA-PQ journal does not say whether a deposit went out: with no
+//! `--authority-url` there was none, and the file is the same. So nothing moves
+//! on its word alone. Astra has to name its anchor first (see [`next_step`]).
 
 use std::path::{Path, PathBuf};
 
@@ -83,7 +87,8 @@ pub enum RotationKind {
 pub enum JournalStage {
     /// Signed and written; Astra may not have heard of it.
     Signed,
-    /// Astra holds it; the vault in place may not have moved yet.
+    /// Astra holds it; the vault in place may not have moved yet. An adoption
+    /// with no deposit sits here too, unconfirmed until Astra names its anchor.
     Accepted,
     /// The vault, the credentials and the relay are in place.
     Applied,
@@ -121,18 +126,39 @@ impl RotationTransition {
             Self::CaTls(transition) => transition.window,
         }
     }
+
+    fn is_carried_by(&self, object: &TrustUpdateObject) -> bool {
+        match (self, object) {
+            (Self::CaPq(ours), TrustUpdateObject::CaTransition(theirs)) => ours == theirs,
+            (Self::CaTls(ours), TrustUpdateObject::ClientTlsCaTransition(theirs)) => ours == theirs,
+            _ => false,
+        }
+    }
 }
 
 /// What replaces the files beside the vault once Astra accepted.
 ///
 /// `handoff.vault_fingerprint` must name `vault`: [`save`] refuses a relay that
 /// describes another vault than the one it lands with.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NextLocal {
     pub vault: AuthorityVault,
     pub credentials: Option<CredentialRegistry>,
     pub handoff: DomainHandoff,
+}
+
+/// Names the vault by its fingerprint: a sealed payload and its wrapped master
+/// keys have no business in a log, whoever can open them.
+impl std::fmt::Debug for NextLocal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NextLocal")
+            .field("vault", &self.vault.fingerprint().ok())
+            .field("credentials", &self.credentials)
+            .field("handoff", &self.handoff)
+            .finish()
+    }
 }
 
 /// The deposit a rotation still owes, or has made.
@@ -166,8 +192,8 @@ pub struct RotationJournal {
     pub format_version: u16,
     pub kind: RotationKind,
     pub stage: JournalStage,
-    /// `None` only for an adopted CA-PQ journal: written after its deposit, that
-    /// format holds no token and no result, and Astra already has them.
+    /// `None` only for an adopted CA-PQ journal: that format holds no token and
+    /// no result, and does not say whether a deposit ever went out.
     pub deposit: Option<JournalDeposit>,
     pub transition: RotationTransition,
     /// `None` once applied, or for an adopted record whose vault had already
@@ -197,8 +223,24 @@ impl RotationJournal {
         {
             bail!("le journal de rotation ne décrit pas la transition qu'il porte");
         }
-        if self.stage == JournalStage::Signed && self.deposit.is_none() {
-            bail!("le journal de rotation n'a aucun dépôt à rejouer");
+        match &self.deposit {
+            None if self.stage == JournalStage::Signed => {
+                bail!("le journal de rotation n'a aucun dépôt à rejouer");
+            }
+            None if self.kind != RotationKind::CaPq => {
+                bail!("un journal de rotation CA-TLS porte toujours son dépôt");
+            }
+            None => {}
+            Some(deposit) => {
+                let carried = deposit
+                    .result
+                    .objects
+                    .iter()
+                    .any(|object| self.transition.is_carried_by(object));
+                if !carried {
+                    bail!("le dépôt du journal de rotation ne porte pas sa transition");
+                }
+            }
         }
         if matches!(self.stage, JournalStage::Applied | JournalStage::Installed)
             && self.next.is_some()
@@ -213,6 +255,12 @@ impl RotationJournal {
             }
         }
         Ok(())
+    }
+
+    /// An adoption nothing has confirmed: no deposit to show for it, and Astra
+    /// has not been heard naming its anchor.
+    fn awaits_confirmation(&self) -> bool {
+        self.deposit.is_none() && self.stage == JournalStage::Accepted
     }
 }
 
@@ -293,6 +341,68 @@ pub fn ensure_none_in_flight(vault_path: &Path) -> Result<()> {
     }
 }
 
+/// What `rotate-ca-pq` checks in place of [`ensure_none_in_flight`].
+///
+/// Its one exception is the rotation it wrote itself, adopted and not confirmed:
+/// finishing it is the way back for a rotation Astra never heard of, which Orion
+/// refuses to move. Once Astra has confirmed, the journal carries the rotation
+/// alone, even if a stop left the older file behind.
+pub fn ensure_ca_pq_may_run(vault_path: &Path) -> Result<()> {
+    // A journal it cannot read is not that exception, and is refused by presence.
+    let unconfirmed = matches!(
+        load(&path_beside(vault_path)),
+        Ok(Some(journal)) if journal.awaits_confirmation()
+    );
+    if unconfirmed && legacy_ca_pq_path_beside(vault_path).exists() {
+        return Ok(());
+    }
+    ensure_none_in_flight(vault_path)
+}
+
+/// Records that Astra holds the rotation. Past [`JournalStage::Signed`] it
+/// changes nothing.
+///
+/// A prepared record of the same operation is told first. `promote-ca-tls` refuses
+/// a record marked as never deposited, and this is the only moment that mark can
+/// change: in that order a stop replays the deposit, while in the other it would
+/// leave the mark false for good.
+pub fn record_accepted(vault_path: &Path, journal: &mut RotationJournal) -> Result<()> {
+    if journal.stage != JournalStage::Signed {
+        return Ok(());
+    }
+    let accepted = RotationJournal {
+        stage: JournalStage::Accepted,
+        ..journal.clone()
+    };
+    if let Some(record) = prepared_record_of(vault_path, journal) {
+        prepared::save(
+            &prepared::path_beside(vault_path),
+            &prepared::PreparedRotation {
+                submitted: true,
+                ..record
+            },
+        )?;
+    }
+    save(&path_beside(vault_path), &accepted)?;
+    *journal = accepted;
+    Ok(())
+}
+
+/// The prepared record of this journal's operation.
+///
+/// One that cannot be read stops nothing here: the journal does not depend on it,
+/// and `promote-ca-tls` reports it when it comes to read it.
+fn prepared_record_of(
+    vault_path: &Path,
+    journal: &RotationJournal,
+) -> Option<prepared::PreparedRotation> {
+    let deposit = journal.deposit.as_ref()?;
+    prepared::load(&prepared::path_beside(vault_path))
+        .ok()
+        .flatten()
+        .filter(|record| record.operation_id == deposit.operation_id.to_hex())
+}
+
 /// Puts the next vault, its credentials and its relay in place.
 ///
 /// Every write is atomic and the journal keeps `next` until all have landed, so
@@ -301,6 +411,11 @@ pub fn ensure_none_in_flight(vault_path: &Path) -> Result<()> {
 /// was accepted records [`JournalStage::Accepted`] first. Past
 /// [`JournalStage::Accepted`] it changes nothing, so as not to overwrite a vault
 /// that has moved on since.
+///
+/// For an adoption with no deposit, the caller holds Astra's confirmation from
+/// [`next_step`], and the older file ends here: the journal now says everything it
+/// said, and past this point `rotate-ca-pq` must not resume from it. A stop before
+/// the removal is finished by [`adopt_legacy`].
 pub fn apply_local(vault_path: &Path, journal: &mut RotationJournal) -> Result<()> {
     match journal.stage {
         JournalStage::Signed => {
@@ -322,8 +437,21 @@ pub fn apply_local(vault_path: &Path, journal: &mut RotationJournal) -> Result<(
         ..journal.clone()
     };
     save(&path_beside(vault_path), &applied)?;
+    let unconfirmed = journal.awaits_confirmation();
     *journal = applied;
+    if unconfirmed {
+        remove_legacy_ca_pq(vault_path)?;
+    }
     Ok(())
+}
+
+fn remove_legacy_ca_pq(vault_path: &Path) -> Result<()> {
+    let path = legacy_ca_pq_path_beside(vault_path);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("suppression de {}", path.display())),
+    }
 }
 
 /// The CA-PQ journal `astra-signer` writes before replacing the four files of a
@@ -378,8 +506,27 @@ impl LegacyCaPqJournal {
         Ok(())
     }
 
-    /// Accepted with its vault still to apply: this format is written after the
-    /// deposit, and it holds nothing to replay one with.
+    /// Refuses a file for a vault this machine does not hold: `validate` only
+    /// checks the file against itself, and applying it would replace the vault
+    /// in place with a stranger.
+    ///
+    /// The next key is as good as the current one: a stop inside `astra-signer`
+    /// may have moved the vault before it removed this file.
+    fn ensure_describes_vault_at(&self, vault_path: &Path) -> Result<()> {
+        let vault = store::load(vault_path)?;
+        let held = MlDsa87PublicKey::parse(vault.ca_pq_public_key.trim())?;
+        if held != self.current_ca_public_key && held != self.transition.next_ca_public_key {
+            bail!(
+                "le journal CA-PQ décrit une rotation d'un autre coffre que celui en place. Rien \
+                 n'a été modifié."
+            );
+        }
+        Ok(())
+    }
+
+    /// At [`JournalStage::Accepted`], with its vault still to apply and no
+    /// deposit: this format holds nothing to replay one with, and does not say
+    /// whether one went out, so that stage stands only once Astra confirms it.
     fn adopted(self) -> Result<RotationJournal> {
         self.validate()?;
         let window = self.transition.window;
@@ -467,16 +614,16 @@ fn adopted_prepared(record: prepared::PreparedRotation) -> Result<RotationJourna
 /// Turns what `astra-signer` left behind into the journal, and returns the
 /// journal to resume: the adopted one, or the one already in place.
 ///
-/// The CA-PQ journal goes first, because its vault is the one not yet applied.
-/// It is removed once carried over: everything in it now lives in the journal
-/// but `output_path`, a file the gateway no longer needs since the transition
-/// travels through the tunnel.
+/// The CA-PQ journal goes first, because its vault is the one not yet applied. It
+/// stays until Astra confirms ([`apply_local`]): while it is there, the command
+/// that wrote it can still finish a rotation Astra never heard of.
 ///
-/// The prepared record **stays**: `promote-ca-tls` reads it until `not_after`,
-/// and it is what names the incoming certificate on the relay at that moment.
-/// Adopting it again once its journal has ended replays a few idempotent calls,
-/// with no key. A journal already in place wins over it, so it waits its turn
-/// rather than overwriting a rotation further along.
+/// The prepared record stays too: `promote-ca-tls` reads it until `not_after`, and
+/// it is what names the incoming certificate on the relay at that moment. It is
+/// adopted **once**, and marked so. Its token must not come back in a new journal
+/// each time, and outliving its window it would read as a permanent "Délai
+/// dépassé". A journal already in place wins over it, so it waits its turn rather
+/// than overwriting a rotation further along.
 ///
 /// A CA-PQ journal and a journal in place naming different anchors are two
 /// rotations this machine cannot reconcile: refused, with both files intact.
@@ -493,39 +640,58 @@ pub fn adopt_legacy(vault_path: &Path) -> Result<Option<RotationJournal>> {
         }
     };
     if let Some(legacy) = legacy_ca_pq {
+        legacy.ensure_describes_vault_at(vault_path)?;
         let adopted = legacy.adopted()?;
-        let journal = match in_place {
-            None => {
-                save(&journal_path, &adopted)?;
-                adopted
-            }
-            // A stop between the two writes of an earlier adoption: the journal
-            // may be further along, and the legacy file is what remains to go.
-            Some(in_place) if in_place.next_anchor_fingerprint == adopted.next_anchor_fingerprint => {
-                in_place
-            }
-            Some(in_place) => bail!(
+        let Some(in_place) = in_place else {
+            save(&journal_path, &adopted)?;
+            return Ok(Some(adopted));
+        };
+        if in_place.next_anchor_fingerprint != adopted.next_anchor_fingerprint {
+            bail!(
                 "{} et {} décrivent deux rotations différentes (vers {} et vers {}) : les concilier \
                  n'est pas à Orion. Rien n'a été modifié.",
                 ca_pq_path.display(),
                 journal_path.display(),
                 adopted.next_anchor_fingerprint,
                 in_place.next_anchor_fingerprint
-            ),
-        };
-        std::fs::remove_file(&ca_pq_path)
-            .with_context(|| format!("suppression de {}", ca_pq_path.display()))?;
-        return Ok(Some(journal));
+            );
+        }
+        // A stop between the apply and the removal: the journal is further along,
+        // and the older file is what remains to go.
+        if !in_place.awaits_confirmation() {
+            remove_legacy_ca_pq(vault_path)?;
+        }
+        return Ok(Some(in_place));
     }
 
-    if in_place.is_some() {
-        return Ok(in_place);
+    let prepared_path = prepared::path_beside(vault_path);
+    if let Some(in_place) = in_place {
+        // A stop between saving this journal and marking its record.
+        if let Some(record) = prepared_record_of(vault_path, &in_place) {
+            if !record.adopted {
+                prepared::save(
+                    &prepared_path,
+                    &prepared::PreparedRotation {
+                        adopted: true,
+                        ..record
+                    },
+                )?;
+            }
+        }
+        return Ok(Some(in_place));
     }
-    let Some(record) = prepared::load(&prepared::path_beside(vault_path))? else {
+    let Some(record) = prepared::load(&prepared_path)?.filter(|record| !record.adopted) else {
         return Ok(None);
     };
-    let adopted = adopted_prepared(record)?;
+    let adopted = adopted_prepared(record.clone())?;
     save(&journal_path, &adopted)?;
+    prepared::save(
+        &prepared_path,
+        &prepared::PreparedRotation {
+            adopted: true,
+            ..record
+        },
+    )?;
     Ok(Some(adopted))
 }
 
@@ -538,11 +704,30 @@ pub struct ResumeFacts {
     /// Astra's status, once read. `None` means not read yet, and
     /// [`ResumeStep::ReadAuthority`] asks for it.
     pub authority: Option<OperatorAuthorityStatus>,
-    /// `Tunnel::gateway_next_anchor` of the rotation's kind: the next anchor, or
-    /// the current one when none is in flight. Read before asking about a
-    /// rotation at [`JournalStage::Applied`]: a failed read is a failure to
-    /// report, and `None` here means the gateway named no such anchor.
-    pub gateway_next: Option<Fingerprint>,
+    /// What the gateway said, once read. A failed read is a failure to report,
+    /// not one of these states.
+    pub gateway_next: GatewayAnchor,
+}
+
+/// `Tunnel::gateway_next_anchor` of the rotation's kind, as far as it is known.
+///
+/// Three states because "no anchor" meant two things, and past `activation_at`
+/// each read as a transition lost for good: a gateway that was not asked, and one
+/// that has nothing to say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GatewayAnchor {
+    /// Not asked yet: [`ResumeStep::ReadGateway`] asks for it.
+    NotRead,
+    /// Asked, and it names no anchor of this kind: it says nothing of the rotation.
+    NotNamed,
+    /// The next anchor, or the current one when none is in flight.
+    Named(Fingerprint),
+}
+
+impl From<Option<Fingerprint>> for GatewayAnchor {
+    fn from(read: Option<Fingerprint>) -> Self {
+        read.map_or(Self::NotNamed, Self::Named)
+    }
 }
 
 /// What a resume does next.
@@ -552,21 +737,29 @@ pub enum ResumeStep {
     Deposit,
     /// Read `operator/status`, and ask again.
     ReadAuthority,
-    /// Record [`JournalStage::Accepted`] if need be, then [`apply_local`].
+    /// [`record_accepted`], then [`apply_local`].
     ApplyLocal,
     /// Send the transition to the gateway, which answers `already_present` to a
     /// replay.
     Install,
+    /// Read `Tunnel::gateway_next_anchor`, and ask again.
+    ReadGateway,
+    /// The gateway names no anchor of this kind, so it cannot confirm anything:
+    /// it has to be updated first. Nothing is lost and nothing is cleared, and
+    /// the same journal resumes afterwards.
+    GatewayOutdated,
     /// Send the vault copy. A failure does not undo the rotation.
     SendVaultCopy,
     /// The driver's own answer once the copy was attempted and the journal
     /// cleared. [`next_step`] never returns it: a journal in place is not done.
     Finished,
     /// Astra knows nothing of it and the vault in place never moved: clear the
-    /// journal, and nothing is lost but the touches.
+    /// journal, and nothing is lost but the touches. Never for an adoption with no
+    /// deposit, whose vault may have moved already.
     Discard,
-    /// The domain contradicts this journal. Nothing is cleared: it is not for
-    /// this machine to choose.
+    /// The domain contradicts this journal, or does not hold the rotation it
+    /// adopted. Nothing is cleared and nothing moves: it is not for this machine
+    /// to choose.
     DomainConflict,
     /// `activation_at` passed with the transition not on the gateway. It refuses
     /// it from now on, and no repair exists (spec §5.4).
@@ -577,18 +770,22 @@ pub enum ResumeStep {
 pub fn next_step(journal: &RotationJournal, facts: &ResumeFacts) -> ResumeStep {
     match journal.stage {
         JournalStage::Signed => next_step_of_signed(journal, facts),
-        JournalStage::Accepted => ResumeStep::ApplyLocal,
-        JournalStage::Applied => {
+        JournalStage::Accepted => next_step_of_accepted(journal, facts),
+        JournalStage::Applied => match facts.gateway_next {
+            GatewayAnchor::NotRead => ResumeStep::ReadGateway,
+            // Never the dead end: this says nothing of the transition, which the
+            // gateway may well hold.
+            GatewayAnchor::NotNamed => ResumeStep::GatewayOutdated,
             // Checked before the clock: past `activation_at` the gateway refuses
             // a first installation, but one it already holds is not lost.
-            if facts.gateway_next == Some(journal.next_anchor_fingerprint) {
+            GatewayAnchor::Named(anchor) if anchor == journal.next_anchor_fingerprint => {
                 ResumeStep::SendVaultCopy
-            } else if facts.now >= journal.activation_at {
-                ResumeStep::InstallDeadlinePassed
-            } else {
-                ResumeStep::Install
             }
-        }
+            GatewayAnchor::Named(_) if facts.now >= journal.activation_at => {
+                ResumeStep::InstallDeadlinePassed
+            }
+            GatewayAnchor::Named(_) => ResumeStep::Install,
+        },
         JournalStage::Installed => ResumeStep::SendVaultCopy,
     }
 }
@@ -601,20 +798,9 @@ fn next_step_of_signed(journal: &RotationJournal, facts: &ResumeFacts) -> Resume
     let Some(authority) = &facts.authority else {
         return ResumeStep::ReadAuthority;
     };
-    let (current, next) = match journal.kind {
-        RotationKind::CaPq => (
-            Some(authority.ca_fingerprint),
-            authority.next_ca_fingerprint,
-        ),
-        RotationKind::CaTls => (
-            authority.ca_tls_fingerprint,
-            authority.next_ca_tls_fingerprint,
-        ),
-    };
-    let accepted = [current, next].contains(&Some(journal.next_anchor_fingerprint));
-    if accepted {
+    if authority_holds(journal, authority) {
         ResumeStep::ApplyLocal
-    } else if next.is_some() || journal.next.is_none() {
+    } else if anchors_of(journal.kind, authority).1.is_some() || journal.next.is_none() {
         // With no `next`, the vault in place is already the rotated one, and
         // clearing the only record of that would hide what Astra does not know.
         ResumeStep::DomainConflict
@@ -623,9 +809,46 @@ fn next_step_of_signed(journal: &RotationJournal, facts: &ResumeFacts) -> Resume
     }
 }
 
+fn next_step_of_accepted(journal: &RotationJournal, facts: &ResumeFacts) -> ResumeStep {
+    if !journal.awaits_confirmation() {
+        return ResumeStep::ApplyLocal;
+    }
+    // Applying a rotation Astra never heard of would stage it on the gateway and
+    // replace Astra's copy, with Astra left on the anchor the gateway then retires.
+    match &facts.authority {
+        None => ResumeStep::ReadAuthority,
+        Some(authority) if authority_holds(journal, authority) => ResumeStep::ApplyLocal,
+        // Not `Discard`: the vault may have moved before this journal was adopted.
+        Some(_) => ResumeStep::DomainConflict,
+    }
+}
+
+fn authority_holds(journal: &RotationJournal, authority: &OperatorAuthorityStatus) -> bool {
+    let (current, next) = anchors_of(journal.kind, authority);
+    [current, next].contains(&Some(journal.next_anchor_fingerprint))
+}
+
+/// The authority's current and next anchors of that kind.
+fn anchors_of(
+    kind: RotationKind,
+    authority: &OperatorAuthorityStatus,
+) -> (Option<Fingerprint>, Option<Fingerprint>) {
+    match kind {
+        RotationKind::CaPq => (
+            Some(authority.ca_fingerprint),
+            authority.next_ca_fingerprint,
+        ),
+        RotationKind::CaTls => (
+            authority.ca_tls_fingerprint,
+            authority.next_ca_tls_fingerprint,
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vault::{KeySlot, SlotRole};
     use aether::certificates::encoding::{DerCertificate, MlDsa87Signature, WireGuardKey};
     use aether::certificates::status::CampaignApproval;
     use aether::certificates::transport::OperatorAuthorityStatus;
@@ -649,7 +872,16 @@ mod tests {
             rp_id: "astra.helios.test".into(),
             created_at: 1,
             salt: "sel".into(),
-            slots: Vec::new(),
+            slots: vec![KeySlot {
+                slot_id: [seed; 16],
+                role: SlotRole::Primary,
+                label: "clé".into(),
+                credential_id: "aWQ=".into(),
+                credential_public_key: String::new(),
+                aaguid: [0; 16],
+                enrolled_at: 1,
+                wrapped_master: format!("maître enveloppé {seed}"),
+            }],
             sealed_payload: format!("corps scellé {seed}"),
         }
     }
@@ -687,7 +919,7 @@ mod tests {
         }
     }
 
-    fn deposit() -> JournalDeposit {
+    fn deposit_of(object: TrustUpdateObject) -> JournalDeposit {
         JournalDeposit {
             operation_id: Id16::new([4; 16]).expect("id"),
             result_token: "jeton-de-depot".into(),
@@ -700,11 +932,17 @@ mod tests {
                     approved_at: NOW,
                     approvals: Vec::new(),
                 }),
-                objects: Vec::new(),
+                objects: vec![object],
                 credential_registry: None,
                 issuer_authorization: None,
             },
         }
+    }
+
+    fn deposit() -> JournalDeposit {
+        deposit_of(TrustUpdateObject::ClientTlsCaTransition(Box::new(
+            ca_tls_transition(),
+        )))
     }
 
     fn next_local() -> NextLocal {
@@ -754,9 +992,20 @@ mod tests {
         };
         RotationJournal {
             kind: RotationKind::CaPq,
+            deposit: Some(deposit_of(TrustUpdateObject::CaTransition(Box::new(
+                transition.clone(),
+            )))),
             next_anchor_fingerprint: transition.next_ca_fingerprint,
             transition: RotationTransition::CaPq(Box::new(transition)),
             ..journal(stage)
+        }
+    }
+
+    /// A CA-PQ journal adopted from `astra-signer`, which nothing has confirmed.
+    fn unconfirmed() -> RotationJournal {
+        RotationJournal {
+            deposit: None,
+            ..ca_pq_journal(JournalStage::Accepted)
         }
     }
 
@@ -765,7 +1014,14 @@ mod tests {
             now,
             deposit_refused: false,
             authority: None,
-            gateway_next: None,
+            gateway_next: GatewayAnchor::NotRead,
+        }
+    }
+
+    fn with_gateway(now: u64, gateway_next: GatewayAnchor) -> ResumeFacts {
+        ResumeFacts {
+            gateway_next,
+            ..facts(now)
         }
     }
 
@@ -931,11 +1187,13 @@ mod tests {
         );
     }
 
+    /// The anchor in service is another one: the ordinary first installation.
     #[test]
     fn applied_before_activation_installs() {
         let applied = journal(JournalStage::Applied);
+        let elsewhere = GatewayAnchor::Named(Fingerprint::of(b"ancre en service"));
         assert_eq!(
-            next_step(&applied, &facts(ACTIVATION - 1)),
+            next_step(&applied, &with_gateway(ACTIVATION - 1, elsewhere)),
             ResumeStep::Install
         );
     }
@@ -943,18 +1201,13 @@ mod tests {
     #[test]
     fn applied_past_activation_and_not_on_the_gateway_is_a_dead_end() {
         let applied = journal(JournalStage::Applied);
-        assert_eq!(
-            next_step(&applied, &facts(ACTIVATION)),
-            ResumeStep::InstallDeadlinePassed
-        );
-        let other = ResumeFacts {
-            gateway_next: Some(Fingerprint::of(b"une autre")),
-            ..facts(NOT_AFTER)
-        };
-        assert_eq!(
-            next_step(&applied, &other),
-            ResumeStep::InstallDeadlinePassed
-        );
+        let elsewhere = GatewayAnchor::Named(Fingerprint::of(b"une autre"));
+        for now in [ACTIVATION, NOT_AFTER] {
+            assert_eq!(
+                next_step(&applied, &with_gateway(now, elsewhere)),
+                ResumeStep::InstallDeadlinePassed
+            );
+        }
     }
 
     /// `gateway_next` is the next anchor, or the current one when nothing is in
@@ -962,11 +1215,154 @@ mod tests {
     #[test]
     fn applied_past_activation_but_present_on_the_gateway_moves_on() {
         let applied = journal(JournalStage::Applied);
-        let present = ResumeFacts {
-            gateway_next: Some(applied.next_anchor_fingerprint),
-            ..facts(NOT_AFTER + 1)
+        let present = GatewayAnchor::Named(applied.next_anchor_fingerprint);
+        for now in [ACTIVATION - 1, ACTIVATION, NOT_AFTER + 1] {
+            assert_eq!(
+                next_step(&applied, &with_gateway(now, present)),
+                ResumeStep::SendVaultCopy
+            );
+        }
+    }
+
+    /// Not read decides nothing, on either side of the deadline.
+    #[test]
+    fn applied_with_the_gateway_not_read_asks_for_the_read() {
+        let applied = journal(JournalStage::Applied);
+        for now in [ACTIVATION - 1, ACTIVATION, NOT_AFTER + 1] {
+            assert_eq!(
+                next_step(&applied, &with_gateway(now, GatewayAnchor::NotRead)),
+                ResumeStep::ReadGateway
+            );
+        }
+    }
+
+    /// A gateway older than the fields may hold the rotation all the same, so
+    /// its silence is never the dead end: it asks for an update, and stays open.
+    #[test]
+    fn applied_with_a_gateway_naming_no_anchor_asks_for_an_update() {
+        let applied = journal(JournalStage::Applied);
+        for now in [ACTIVATION - 1, ACTIVATION, NOT_AFTER + 1] {
+            assert_eq!(
+                next_step(&applied, &with_gateway(now, GatewayAnchor::NotNamed)),
+                ResumeStep::GatewayOutdated
+            );
+        }
+    }
+
+    #[test]
+    fn what_the_tunnel_reads_is_a_named_anchor_or_none_named() {
+        let anchor = Fingerprint::of(b"ancre");
+        assert_eq!(
+            GatewayAnchor::from(Some(anchor)),
+            GatewayAnchor::Named(anchor)
+        );
+        assert_eq!(GatewayAnchor::from(None), GatewayAnchor::NotNamed);
+    }
+
+    // An adoption nothing has confirmed: the format is written with or without
+    // a deposit, and only Astra can say which it was.
+
+    #[test]
+    fn an_unconfirmed_adoption_reads_the_authority_first() {
+        let adopted = unconfirmed();
+        assert_eq!(next_step(&adopted, &facts(NOW)), ResumeStep::ReadAuthority);
+    }
+
+    #[test]
+    fn an_unconfirmed_adoption_applies_once_astra_holds_it() {
+        let adopted = unconfirmed();
+        let fingerprint = adopted.next_anchor_fingerprint;
+        for status in [
+            OperatorAuthorityStatus {
+                next_ca_fingerprint: Some(fingerprint),
+                ..authority()
+            },
+            OperatorAuthorityStatus {
+                ca_fingerprint: fingerprint,
+                ..authority()
+            },
+        ] {
+            assert_eq!(
+                next_step(&adopted, &with_authority(NOW, status)),
+                ResumeStep::ApplyLocal
+            );
+        }
+    }
+
+    /// Not `Discard`: the vault may already have moved. The other family's
+    /// anchor is no confirmation either.
+    #[test]
+    fn an_unconfirmed_adoption_astra_does_not_hold_conflicts() {
+        let adopted = unconfirmed();
+        for status in [
+            authority(),
+            OperatorAuthorityStatus {
+                next_ca_fingerprint: Some(Fingerprint::of(b"une autre")),
+                ..authority()
+            },
+            OperatorAuthorityStatus {
+                next_ca_tls_fingerprint: Some(adopted.next_anchor_fingerprint),
+                ..authority()
+            },
+        ] {
+            assert_eq!(
+                next_step(&adopted, &with_authority(NOW, status)),
+                ResumeStep::DomainConflict
+            );
+        }
+    }
+
+    /// A journal that made its own deposit needs no such read.
+    #[test]
+    fn accepted_with_a_deposit_applies_without_reading_astra() {
+        let accepted = ca_pq_journal(JournalStage::Accepted);
+        assert_eq!(next_step(&accepted, &facts(NOW)), ResumeStep::ApplyLocal);
+    }
+
+    /// Past the apply, the question is settled and the table goes on as usual.
+    #[test]
+    fn an_applied_adoption_installs_with_no_further_read() {
+        let applied = RotationJournal {
+            deposit: None,
+            next: None,
+            ..ca_pq_journal(JournalStage::Applied)
         };
-        assert_eq!(next_step(&applied, &present), ResumeStep::SendVaultCopy);
+        let elsewhere = GatewayAnchor::Named(Fingerprint::of(b"ancre en service"));
+        assert_eq!(
+            next_step(&applied, &with_gateway(NOW, elsewhere)),
+            ResumeStep::Install
+        );
+    }
+
+    // Recording Astra's acceptance.
+
+    #[test]
+    fn recording_acceptance_moves_the_journal_on_disk() {
+        let place = place();
+        let mut signed = journal(JournalStage::Signed);
+        save(&place.journal_path, &signed).expect("save");
+
+        record_accepted(&place.vault_path, &mut signed).expect("recorded");
+
+        assert_eq!(signed.stage, JournalStage::Accepted);
+        assert_eq!(load(&place.journal_path).expect("load"), Some(signed));
+    }
+
+    /// It never pulls a journal back, and a replay is the same as the first.
+    #[test]
+    fn recording_acceptance_past_it_changes_nothing() {
+        let place = place();
+        for stage in [
+            JournalStage::Accepted,
+            JournalStage::Applied,
+            JournalStage::Installed,
+        ] {
+            let mut further = journal(stage);
+            save(&place.journal_path, &further).expect("save");
+            record_accepted(&place.vault_path, &mut further).expect("recorded");
+            assert_eq!(further.stage, stage);
+            assert_eq!(load(&place.journal_path).expect("load"), Some(further));
+        }
     }
 
     #[test]
@@ -987,6 +1383,7 @@ mod tests {
             journal(JournalStage::Signed),
             journal(JournalStage::Installed),
             ca_pq_journal(JournalStage::Accepted),
+            unconfirmed(),
         ] {
             save(&place.journal_path, &candidate).expect("save");
             assert_eq!(load(&place.journal_path).expect("load"), Some(candidate));
@@ -1072,6 +1469,36 @@ mod tests {
                 deposit: None,
                 ..journal(JournalStage::Signed)
             },
+            // Only an adopted CA-PQ journal may lack its deposit.
+            RotationJournal {
+                deposit: None,
+                ..journal(JournalStage::Accepted)
+            },
+            RotationJournal {
+                deposit: None,
+                next: None,
+                ..journal(JournalStage::Applied)
+            },
+            // A deposit that would announce something else than this transition.
+            RotationJournal {
+                deposit: Some(JournalDeposit {
+                    result: AstraSignerResult {
+                        objects: Vec::new(),
+                        ..deposit().result
+                    },
+                    ..deposit()
+                }),
+                ..journal(JournalStage::Signed)
+            },
+            RotationJournal {
+                deposit: Some(deposit_of(TrustUpdateObject::ClientTlsCaTransition(
+                    Box::new(ClientTlsCaTransition {
+                        next_ca_tls_epoch: 9,
+                        ..ca_tls_transition()
+                    }),
+                ))),
+                ..journal(JournalStage::Signed)
+            },
             // A vault left to apply, past the stage that applies it.
             RotationJournal {
                 next: Some(next_local()),
@@ -1102,9 +1529,15 @@ mod tests {
     }
 
     #[test]
-    fn the_deposit_token_never_reaches_a_log_through_debug() {
+    fn neither_the_token_nor_the_sealed_vault_reach_a_log_through_debug() {
         let rendered = format!("{:?}", journal(JournalStage::Signed));
         assert!(!rendered.contains("jeton-de-depot"), "{rendered}");
+        assert!(!rendered.contains("corps scellé"), "{rendered}");
+        assert!(!rendered.contains("maître enveloppé"), "{rendered}");
+        assert!(!rendered.contains("sel"), "{rendered}");
+        // What a reader needs to tell two of them apart stays.
+        let vault_fingerprint = vault(2).fingerprint().expect("fingerprint");
+        assert!(rendered.contains(&vault_fingerprint.to_hex()), "{rendered}");
     }
 
     /// Review Focus 3: a disk that refuses the journal leaves nothing behind
@@ -1307,6 +1740,44 @@ mod tests {
         assert!(ensure_none_in_flight(&place.vault_path).is_err());
     }
 
+    /// Only that one journal lets the older command through, and only while the
+    /// file it resumes is there to resume.
+    #[test]
+    fn only_an_unconfirmed_adoption_lets_the_ca_pq_command_resume() {
+        let place = place();
+        let legacy_path = legacy_ca_pq_path_beside(&place.vault_path);
+        ensure_ca_pq_may_run(&place.vault_path).expect("no journal");
+
+        save(&place.journal_path, &unconfirmed()).expect("save");
+        assert!(
+            ensure_ca_pq_may_run(&place.vault_path).is_err(),
+            "with no file to resume, the command would sign a new rotation"
+        );
+        std::fs::write(&legacy_path, b"{}").expect("write");
+        ensure_ca_pq_may_run(&place.vault_path).expect("the unconfirmed adoption");
+
+        for other in [
+            journal(JournalStage::Signed),
+            journal(JournalStage::Accepted),
+            ca_pq_journal(JournalStage::Accepted),
+            journal(JournalStage::Applied),
+            RotationJournal {
+                deposit: None,
+                next: None,
+                ..ca_pq_journal(JournalStage::Applied)
+            },
+        ] {
+            save(&place.journal_path, &other).expect("save");
+            assert!(
+                ensure_ca_pq_may_run(&place.vault_path).is_err(),
+                "{other:?}"
+            );
+        }
+
+        std::fs::write(&place.journal_path, b"illisible").expect("write");
+        assert!(ensure_ca_pq_may_run(&place.vault_path).is_err());
+    }
+
     // Adoption's refusals; the two formats themselves are in
     // `tests/rotation_journal_legacy.rs`, where a real ceremony writes them.
 
@@ -1326,7 +1797,10 @@ mod tests {
             kind: crate::prepared::PreparedKind::CaTls,
             operation_id: deposit.operation_id.to_hex(),
             result_token: deposit.result_token.clone(),
-            result: deposit.result,
+            result: AstraSignerResult {
+                objects: Vec::new(),
+                ..deposit.result
+            },
             transition_path: "/tmp/transition.json".into(),
             next_ca_tls_epoch: 2,
             next_ca_tls_certificate: "REVS".into(),
@@ -1335,6 +1809,7 @@ mod tests {
             submitted: false,
             prepared_at: NOW,
             manifest: None,
+            adopted: false,
         };
         let prepared_path = crate::prepared::path_beside(&place.vault_path);
         crate::prepared::save(&prepared_path, &record).expect("save");

@@ -30,7 +30,7 @@ pub(crate) fn rotate_ca_pq(
     origin: Option<&str>,
     transport: Transport,
 ) -> Result<()> {
-    rotation_journal::ensure_none_in_flight(path)?;
+    rotation_journal::ensure_ca_pq_may_run(path)?;
     let output_path = absolute_path(out)?;
     let journal_path = rotation_journal::legacy_ca_pq_path_beside(path);
     if journal_path.exists() {
@@ -44,6 +44,9 @@ pub(crate) fn rotate_ca_pq(
         }
         journal.validate()?;
         apply_ca_pq_rotation(path, &journal)?;
+        // The adoption first: a stop between the two leaves this file, from which
+        // this command and an adoption both still recover.
+        rotation_journal::clear(&rotation_journal::path_beside(path))?;
         std::fs::remove_file(&journal_path)
             .with_context(|| format!("suppression de {}", journal_path.display()))?;
         print_ca_pq_rotation(&journal);

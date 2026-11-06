@@ -84,6 +84,13 @@ pub struct PreparedRotation {
     /// decision after the companion or Orion restarted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest: Option<AstraCaTlsManifest>,
+    /// Carried over into the rotation journal. The record stays, for
+    /// `promote-ca-tls`, and this keeps it from being adopted again: a journal
+    /// that has ended must not come back holding the token.
+    ///
+    /// Optional on disk, so a record written before this field still reads.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub adopted: bool,
 }
 
 /// Where the prepared rotation sits: beside the vault, whatever its path.
@@ -165,7 +172,26 @@ mod tests {
             submitted: false,
             prepared_at: 10,
             manifest: None,
+            adopted: false,
         }
+    }
+
+    /// A record written before the marker existed still reads, and one that has
+    /// not been adopted keeps the bytes an older reader takes.
+    #[test]
+    fn the_adoption_marker_is_optional_on_disk() {
+        let mut value = serde_json::to_value(record()).expect("value");
+        assert!(value.get("adopted").is_none());
+        value.as_object_mut().expect("object").remove("adopted");
+        let read: PreparedRotation = serde_json::from_value(value).expect("read");
+        assert!(!read.adopted);
+
+        let adopted = PreparedRotation {
+            adopted: true,
+            ..record()
+        };
+        let value = serde_json::to_value(&adopted).expect("value");
+        assert_eq!(value["adopted"], serde_json::json!(true));
     }
 
     #[test]

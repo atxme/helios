@@ -9,7 +9,9 @@ mod support;
 
 use std::path::{Path, PathBuf};
 
-use aether::certificates::encoding::{DerCertificate, Fingerprint, Id16, MlDsa87PublicKey};
+use aether::certificates::encoding::{
+    generate_ml_dsa_87_keypair, DerCertificate, Fingerprint, Id16, MlDsa87PublicKey,
+};
 use aether::certificates::operator_ipc::AstraCaTlsManifest;
 use aether::certificates::status::{AstraSignerResult, CampaignApproval};
 use aether::certificates::transport::{OperatorAuthorityStatus, TrustUpdateObject};
@@ -19,7 +21,7 @@ use astra_operator::authenticator::Opened;
 use astra_operator::gestures::{self, NewAuthority, NewKey};
 use astra_operator::prepared::{self, PreparedKind, PreparedRotation};
 use astra_operator::rotation_journal::{
-    self, JournalStage, LegacyCaPqJournal, ResumeFacts, ResumeStep, RotationKind,
+    self, GatewayAnchor, JournalStage, LegacyCaPqJournal, ResumeFacts, ResumeStep, RotationKind,
     RotationTransition, LEGACY_CA_PQ_JOURNAL_VERSION,
 };
 use astra_operator::vault::{AuthorityVault, SlotRole};
@@ -94,7 +96,8 @@ fn domain() -> Domain {
     }
 }
 
-/// What `rotate_ca_pq` of `astra-signer` writes once the deposit went through.
+/// What `rotate_ca_pq` of `astra-signer` writes, with a deposit behind it or,
+/// with no `--authority-url`, none: the file is the same either way.
 fn legacy_ca_pq(domain: &Domain) -> LegacyCaPqJournal {
     let mut vault = store::load(&domain.path).expect("vault");
     let relay = handoff::DomainHandoff::beside(&domain.path, &vault).expect("relay");
@@ -175,6 +178,7 @@ fn legacy_prepared(domain: &Domain, submitted: bool) -> (PreparedRotation, Autho
         not_after: NOT_AFTER,
         submitted,
         prepared_at: NOW,
+        adopted: false,
         manifest: Some(AstraCaTlsManifest {
             reason: "remplacement".into(),
             requested_by: "opératrice".into(),
@@ -197,7 +201,14 @@ fn facts(now: u64) -> ResumeFacts {
         now,
         deposit_refused: false,
         authority: None,
-        gateway_next: None,
+        gateway_next: GatewayAnchor::NotRead,
+    }
+}
+
+fn with_authority(status: OperatorAuthorityStatus) -> ResumeFacts {
+    ResumeFacts {
+        authority: Some(status),
+        ..facts(NOW)
     }
 }
 
@@ -247,20 +258,17 @@ fn the_legacy_ca_pq_format_keeps_its_field_names() {
     );
 }
 
-/// Astra already holds it and the vault has not moved: dropping this record
-/// would lose the only copy of the keys the rotation installs.
+/// Adopted, and nothing has moved: the file cannot say whether a deposit went
+/// out, so until Astra answers, the vault and the file stay as they are.
 #[test]
-fn a_legacy_ca_pq_journal_is_accepted_with_its_vault_still_to_apply() {
+fn a_legacy_ca_pq_journal_waits_for_astra_with_its_vault_still_to_apply() {
     let domain = domain();
     let legacy = legacy_ca_pq(&domain);
-    let next_vault = legacy.vault.clone();
-    let next_handoff = legacy.handoff.clone();
-    let next_bindings = legacy.bindings.clone();
     let next_anchor = legacy.transition.next_ca_public_key.authority_fingerprint();
     let legacy_path = write_legacy_ca_pq(&domain.path, &legacy);
     let vault_before = std::fs::read(&domain.path).expect("vault");
 
-    let mut journal = rotation_journal::adopt_legacy(&domain.path)
+    let journal = rotation_journal::adopt_legacy(&domain.path)
         .expect("adopted")
         .expect("a journal");
 
@@ -277,7 +285,7 @@ fn a_legacy_ca_pq_journal_is_accepted_with_its_vault_still_to_apply() {
     );
     assert!(matches!(journal.transition, RotationTransition::CaPq(_)));
     assert_eq!(std::fs::read(&domain.path).expect("vault"), vault_before);
-    assert!(!legacy_path.exists(), "carried over, it goes");
+    assert!(legacy_path.exists(), "it stays until Astra confirms");
     let journal_path = rotation_journal::path_beside(&domain.path);
     assert_eq!(
         rotation_journal::load(&journal_path)
@@ -285,27 +293,162 @@ fn a_legacy_ca_pq_journal_is_accepted_with_its_vault_still_to_apply() {
             .as_ref(),
         Some(&journal)
     );
-
     assert_eq!(
         rotation_journal::next_step(&journal, &facts(NOW)),
-        ResumeStep::ApplyLocal
+        ResumeStep::ReadAuthority
     );
+}
+
+/// `rotate-ca-pq` with no `--authority-url`: Astra never heard of it, and the
+/// vault must not move, nor the gateway stage what Astra would keep refusing.
+#[test]
+fn an_offline_record_astra_does_not_hold_conflicts_and_moves_nothing() {
+    let domain = domain();
+    let legacy = legacy_ca_pq(&domain);
+    let legacy_path = write_legacy_ca_pq(&domain.path, &legacy);
+    let vault_before = std::fs::read(&domain.path).expect("vault");
+    let relay_before = std::fs::read(handoff::path_beside(&domain.path)).expect("relay");
+
+    let journal = rotation_journal::adopt_legacy(&domain.path)
+        .expect("adopted")
+        .expect("a journal");
+
+    for status in [
+        nothing_in_flight(),
+        OperatorAuthorityStatus {
+            next_ca_fingerprint: Some(Fingerprint::of(b"une autre")),
+            ..nothing_in_flight()
+        },
+    ] {
+        assert_eq!(
+            rotation_journal::next_step(&journal, &with_authority(status)),
+            ResumeStep::DomainConflict
+        );
+    }
+    assert_eq!(std::fs::read(&domain.path).expect("vault"), vault_before);
+    assert_eq!(
+        std::fs::read(handoff::path_beside(&domain.path)).expect("relay"),
+        relay_before
+    );
+    assert!(legacy_path.exists());
+}
+
+/// The vault already moved: a stop inside `astra-signer` after its first write.
+/// Adopted all the same, and still not discarded when Astra does not hold it.
+#[test]
+fn an_offline_record_whose_vault_already_moved_is_not_discarded() {
+    let domain = domain();
+    let legacy = legacy_ca_pq(&domain);
+    store::save(&domain.path, &legacy.vault).expect("the vault moved");
+    write_legacy_ca_pq(&domain.path, &legacy);
+
+    let journal = rotation_journal::adopt_legacy(&domain.path)
+        .expect("adopted")
+        .expect("a journal");
+
+    assert_eq!(
+        rotation_journal::next_step(&journal, &with_authority(nothing_in_flight())),
+        ResumeStep::DomainConflict
+    );
+}
+
+/// Astra holds it, as next or already as current: the deposit went through. The
+/// file goes only here, once the journal has taken over from it.
+#[test]
+fn a_legacy_ca_pq_journal_astra_holds_applies_and_only_then_lets_the_file_go() {
+    let next_in_flight = |anchor| OperatorAuthorityStatus {
+        next_ca_fingerprint: Some(anchor),
+        ..nothing_in_flight()
+    };
+    let promoted = |anchor| OperatorAuthorityStatus {
+        ca_fingerprint: anchor,
+        ..nothing_in_flight()
+    };
+    let statuses: [&dyn Fn(Fingerprint) -> OperatorAuthorityStatus; 2] =
+        [&next_in_flight, &promoted];
+    for status_of in statuses {
+        let domain = domain();
+        let legacy = legacy_ca_pq(&domain);
+        let next_vault = legacy.vault.clone();
+        let next_handoff = legacy.handoff.clone();
+        let next_bindings = legacy.bindings.clone();
+        let legacy_path = write_legacy_ca_pq(&domain.path, &legacy);
+
+        let mut journal = rotation_journal::adopt_legacy(&domain.path)
+            .expect("adopted")
+            .expect("a journal");
+        let status = status_of(journal.next_anchor_fingerprint);
+        assert_eq!(
+            rotation_journal::next_step(&journal, &with_authority(status)),
+            ResumeStep::ApplyLocal
+        );
+
+        rotation_journal::apply_local(&domain.path, &mut journal).expect("applied");
+
+        assert!(!legacy_path.exists());
+        assert_eq!(store::load(&domain.path).expect("vault"), next_vault);
+        assert_eq!(
+            handoff::load(&handoff::path_beside(&domain.path)).expect("relay"),
+            next_handoff
+        );
+        assert_eq!(
+            credentials::load(&credentials::path_beside(&domain.path)).expect("document"),
+            Some(next_bindings)
+        );
+        assert_eq!(journal.next, None);
+        let elsewhere = GatewayAnchor::Named(Fingerprint::of(b"ancre en service"));
+        assert_eq!(
+            rotation_journal::next_step(
+                &journal,
+                &ResumeFacts {
+                    gateway_next: elsewhere,
+                    ..facts(NOW)
+                }
+            ),
+            ResumeStep::Install
+        );
+    }
+}
+
+/// A file for a vault this machine does not hold is someone else's rotation, or
+/// a restored backup: applying it would replace the vault with a stranger.
+#[test]
+fn a_legacy_ca_pq_journal_for_a_vault_holding_neither_key_is_refused() {
+    let domain = domain();
+    let legacy = legacy_ca_pq(&domain);
+    let legacy_path = write_legacy_ca_pq(&domain.path, &legacy);
+    let mut stranger = store::load(&domain.path).expect("vault");
+    let (_, unrelated) = generate_ml_dsa_87_keypair().expect("keys");
+    stranger.ca_pq_public_key = unrelated.to_base64();
+    store::save(&domain.path, &stranger).expect("vault");
+
+    assert!(rotation_journal::adopt_legacy(&domain.path).is_err());
+
+    assert!(legacy_path.exists());
+    assert_eq!(store::load(&domain.path).expect("vault"), stranger);
+    assert_eq!(
+        rotation_journal::load(&rotation_journal::path_beside(&domain.path)).expect("load"),
+        None
+    );
+}
+
+/// The CLI may finish what it started while nothing has confirmed the adoption,
+/// and not after: past the apply, the journal is carrying the rotation alone.
+#[test]
+fn the_ca_pq_command_may_resume_only_until_astra_confirmed() {
+    let domain = domain();
+    let legacy = legacy_ca_pq(&domain);
+    let legacy_path = write_legacy_ca_pq(&domain.path, &legacy);
+    let mut journal = rotation_journal::adopt_legacy(&domain.path)
+        .expect("adopted")
+        .expect("a journal");
+    rotation_journal::ensure_ca_pq_may_run(&domain.path).expect("unconfirmed");
+
     rotation_journal::apply_local(&domain.path, &mut journal).expect("applied");
+    write_legacy_ca_pq(&domain.path, &legacy);
 
-    assert_eq!(store::load(&domain.path).expect("vault"), next_vault);
-    assert_eq!(
-        handoff::load(&handoff::path_beside(&domain.path)).expect("relay"),
-        next_handoff
-    );
-    assert_eq!(
-        credentials::load(&credentials::path_beside(&domain.path)).expect("document"),
-        Some(next_bindings)
-    );
-    assert_eq!(journal.next, None);
-    assert_eq!(
-        rotation_journal::next_step(&journal, &facts(NOW)),
-        ResumeStep::Install
-    );
+    assert!(rotation_journal::ensure_ca_pq_may_run(&domain.path).is_err());
+    assert!(legacy_path.exists());
 }
 
 /// The signatures are checked as `astra-signer` checks them when it resumes.
@@ -405,26 +548,113 @@ fn a_submitted_prepared_record_is_accepted_with_no_next() {
 }
 
 /// `promote-ca-tls` reads this record until `not_after`, and it alone names the
-/// incoming certificate for the relay.
+/// incoming certificate for the relay. It stays, marked, and is adopted once:
+/// outliving its window, it would otherwise read as a permanent "Délai dépassé".
 #[test]
-fn the_prepared_record_stays_for_the_promotion() {
+fn a_prepared_record_is_adopted_once_and_stays_for_the_promotion() {
     let domain = domain();
     let (record, _) = legacy_prepared(&domain, true);
+    let prepared_path = prepared::path_beside(&domain.path);
     let journal_path = rotation_journal::path_beside(&domain.path);
 
     rotation_journal::adopt_legacy(&domain.path)
         .expect("adopted")
         .expect("a journal");
+    let kept = prepared::load(&prepared_path).expect("load").expect("kept");
+    assert!(kept.adopted);
     assert_eq!(
-        prepared::load(&prepared::path_beside(&domain.path)).expect("load"),
-        Some(record)
+        PreparedRotation {
+            adopted: false,
+            ..kept
+        },
+        record
     );
 
-    // The end of that journal leaves the record, and the next look replays it.
     rotation_journal::clear(&journal_path).expect("clear");
-    assert!(rotation_journal::adopt_legacy(&domain.path)
+    assert_eq!(
+        rotation_journal::adopt_legacy(&domain.path).expect("adopted"),
+        None,
+        "its journal has ended, and no new one holds the token again"
+    );
+    assert_eq!(rotation_journal::load(&journal_path).expect("load"), None);
+    assert!(prepared::load(&prepared_path).expect("load").is_some());
+}
+
+/// A stop between saving the journal and marking the record: the next look
+/// finishes the marking, so the record is still adopted only once.
+#[test]
+fn a_stop_before_the_marker_does_not_adopt_the_record_twice() {
+    let domain = domain();
+    let (record, _) = legacy_prepared(&domain, true);
+    let prepared_path = prepared::path_beside(&domain.path);
+    let journal_path = rotation_journal::path_beside(&domain.path);
+    let journal = rotation_journal::adopt_legacy(&domain.path)
         .expect("adopted")
-        .is_some());
+        .expect("a journal");
+    prepared::save(&prepared_path, &record).expect("the marker never landed");
+
+    assert_eq!(
+        rotation_journal::adopt_legacy(&domain.path).expect("adopted"),
+        Some(journal)
+    );
+    assert!(
+        prepared::load(&prepared_path)
+            .expect("load")
+            .expect("kept")
+            .adopted
+    );
+
+    rotation_journal::clear(&journal_path).expect("clear");
+    assert_eq!(
+        rotation_journal::adopt_legacy(&domain.path).expect("adopted"),
+        None
+    );
+}
+
+/// Orion carries the deposit, and `promote-ca-tls` must not then say it never
+/// happened: the command stays the recourse for this rotation.
+#[test]
+fn recording_acceptance_tells_the_prepared_record() {
+    let domain = domain();
+    legacy_prepared(&domain, false);
+    let prepared_path = prepared::path_beside(&domain.path);
+    let mut journal = rotation_journal::adopt_legacy(&domain.path)
+        .expect("adopted")
+        .expect("a journal");
+    assert!(
+        !prepared::load(&prepared_path)
+            .expect("load")
+            .expect("kept")
+            .submitted
+    );
+
+    rotation_journal::record_accepted(&domain.path, &mut journal).expect("recorded");
+
+    assert_eq!(journal.stage, JournalStage::Accepted);
+    let kept = prepared::load(&prepared_path).expect("load").expect("kept");
+    assert!(kept.submitted);
+    assert!(kept.adopted);
+    assert_eq!(
+        rotation_journal::load(&rotation_journal::path_beside(&domain.path)).expect("load"),
+        Some(journal)
+    );
+}
+
+/// A record of another operation says nothing about this one.
+#[test]
+fn recording_acceptance_leaves_another_record_alone() {
+    let domain = domain();
+    let (mut record, _) = legacy_prepared(&domain, false);
+    let mut journal = rotation_journal::adopt_legacy(&domain.path)
+        .expect("adopted")
+        .expect("a journal");
+    record.operation_id = Id16::new([9; 16]).expect("id").to_hex();
+    let prepared_path = prepared::path_beside(&domain.path);
+    prepared::save(&prepared_path, &record).expect("record");
+
+    rotation_journal::record_accepted(&domain.path, &mut journal).expect("recorded");
+
+    assert_eq!(prepared::load(&prepared_path).expect("load"), Some(record));
 }
 
 #[test]
@@ -529,6 +759,9 @@ fn the_unapplied_ca_pq_vault_goes_before_a_prepared_record() {
         .expect("a journal");
     assert_eq!(same, journal);
 
+    // The CA-PQ journal ends through its apply, which lets its file go.
+    let mut journal = journal;
+    rotation_journal::apply_local(&domain.path, &mut journal).expect("applied");
     rotation_journal::clear(&journal_path).expect("clear");
     let after = rotation_journal::adopt_legacy(&domain.path)
         .expect("adopted")
@@ -536,9 +769,9 @@ fn the_unapplied_ca_pq_vault_goes_before_a_prepared_record() {
     assert_eq!(after.kind, RotationKind::CaTls);
 }
 
-/// A journal Orion wrote is returned as it stands, with nothing legacy around.
+/// A second look returns the journal in place, not a second adoption.
 #[test]
-fn a_journal_in_place_with_nothing_legacy_is_what_comes_back() {
+fn adopting_again_returns_the_journal_in_place() {
     let domain = domain();
     let legacy = legacy_ca_pq(&domain);
     write_legacy_ca_pq(&domain.path, &legacy);
