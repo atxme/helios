@@ -11,13 +11,18 @@ use std::sync::mpsc;
 use std::thread;
 
 use aether::certificates::approval::{AstraCredentialApprovalRequest, CredentialRegistry};
+use aether::certificates::authority::{CaTransition, ClientTlsCaTransition};
 use aether::certificates::encoding::{
-    Fingerprint, Id16, MlDsa87Signature, TrustDomainId, WireGuardKey,
+    DerCertificate, Fingerprint, Id16, MlDsa87Signature, TrustDomainId, WireGuardKey,
 };
 use aether::certificates::transport::{
     ClientRenewalOperationState, ClientRenewalOperationView, ClientRenewalSignerRequest,
+    OperatorAuthorityStatus, OperatorOpenAction, OperatorOpenRequest, OperatorOpened,
+    OperatorVaultCopied, OperatorVaultCopy,
 };
-use astra_operator::tunnel::Tunnel;
+use aether::certificates::window::TransitionWindow;
+use astra_operator::rotation_journal::RotationKind;
+use astra_operator::tunnel::{Tunnel, TunnelRefusal, VaultCopySent};
 
 const RP_ID: &str = "astra.helios.test";
 
@@ -443,5 +448,342 @@ fn sample_approval(operation_id: Id16) -> aether::certificates::approval::AstraR
         expires_at: 1_700_000_300,
         astra_service_key_epoch: 1,
         astra_signature: MlDsa87Signature::placeholder(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The administrator routes a rotation travels on (lot 5b).
+// ---------------------------------------------------------------------------
+
+fn fingerprint_hex(seed: &[u8]) -> String {
+    Fingerprint::of(seed).to_hex()
+}
+
+fn refusal_status(error: &anyhow::Error) -> Option<u16> {
+    error
+        .downcast_ref::<TunnelRefusal>()
+        .map(|refusal| refusal.status)
+}
+
+/// A rotation's opening, as the gateway's route takes it.
+#[test]
+fn a_campaign_opens_on_the_operator_route() {
+    let opened = OperatorOpened {
+        operation_id: operation(),
+        campaign_id: Id16::new([5; 16]).expect("id"),
+        campaign_fingerprint: Fingerprint::of(b"campagne"),
+        scope: aether::certificates::status::CampaignScope::TrustAuthorities,
+        target_count: 1,
+        required_credentials: 2,
+        expires_at: 1_700_000_300,
+        revocation_expiries: None,
+        delegation_request: None,
+    };
+    let stub = Stub::serving(vec![(200, serde_json::to_string(&opened).expect("json"))]);
+    let request = OperatorOpenRequest {
+        action: OperatorOpenAction::TrustAuthorities,
+        reason: "remplacement".into(),
+        requested_by: "opératrice".into(),
+        window_secs: 300,
+    };
+    let answer = Tunnel::new(&stub.base)
+        .expect("tunnel")
+        .open_campaign(&request)
+        .expect("opened");
+    assert_eq!(answer, opened);
+
+    let seen = stub.next();
+    assert_eq!(seen.method, "POST");
+    assert_eq!(seen.path, "/api/certificates/operator/campaigns");
+    assert_eq!(seen.authorization, None);
+    let sent: OperatorOpenRequest = serde_json::from_slice(&seen.body).expect("body");
+    assert_eq!(sent, request);
+}
+
+#[test]
+fn the_authority_status_is_read_on_the_operator_route() {
+    let status = OperatorAuthorityStatus {
+        ca_epoch: 1,
+        ca_fingerprint: Fingerprint::of(b"ca"),
+        next_ca_fingerprint: None,
+        ca_tls_epoch: 1,
+        ca_tls_fingerprint: None,
+        next_ca_tls_fingerprint: Some(Fingerprint::of(b"suivante")),
+        issuer: None,
+        vault_copy_fingerprint: None,
+        credential_registry_epoch: None,
+    };
+    let stub = Stub::serving(vec![(200, serde_json::to_string(&status).expect("json"))]);
+    let answer = Tunnel::new(&stub.base)
+        .expect("tunnel")
+        .authority_status()
+        .expect("status");
+    assert_eq!(answer, status);
+    let seen = stub.next();
+    assert_eq!(seen.method, "GET");
+    assert_eq!(seen.path, "/api/certificates/operator/status");
+}
+
+/// A vault above the 64 KiB relay bound travels whole: it has a route bound of
+/// its own, and this side must not assume the smaller one.
+#[test]
+fn a_vault_copy_above_the_relay_bound_is_sent_whole() {
+    let copied = OperatorVaultCopied {
+        fingerprint: Fingerprint::of(b"coffre"),
+        credential_registry_epoch: None,
+    };
+    let stub = Stub::serving(vec![(200, serde_json::to_string(&copied).expect("json"))]);
+    let copy = OperatorVaultCopy {
+        vault_base64: "A".repeat(100 * 1024),
+        credentials: None,
+    };
+    let answer = Tunnel::new(&stub.base)
+        .expect("tunnel")
+        .send_vault_copy(&copy)
+        .expect("sent");
+    assert_eq!(answer, VaultCopySent::Copied(copied));
+
+    let seen = stub.next();
+    assert_eq!(seen.method, "POST");
+    assert_eq!(seen.path, "/api/certificates/operator/vault-copy");
+    let sent: OperatorVaultCopy = serde_json::from_slice(&seen.body).expect("body");
+    assert_eq!(sent.vault_base64.len(), 100 * 1024);
+}
+
+/// Held back by a live operation is a result, and not a failure: the rotation
+/// goes on, and the same copy passes once that operation is over.
+#[test]
+fn a_vault_copy_held_back_is_its_own_result() {
+    let stub = Stub::serving(vec![(409, "{}".into())]);
+    let copy = OperatorVaultCopy {
+        vault_base64: "e30=".into(),
+        credentials: None,
+    };
+    let answer = Tunnel::new(&stub.base)
+        .expect("tunnel")
+        .send_vault_copy(&copy)
+        .expect("not a failure");
+    assert_eq!(answer, VaultCopySent::HeldBack);
+}
+
+/// A copy refused for what it is will not pass later: it stays a failure, and
+/// says so apart from a body over the bound.
+#[test]
+fn a_vault_copy_refused_for_good_stays_a_failure() {
+    for status in [403u16, 413, 503] {
+        let stub = Stub::serving(vec![(status, "{}".into())]);
+        let copy = OperatorVaultCopy {
+            vault_base64: "e30=".into(),
+            credentials: None,
+        };
+        let refusal = Tunnel::new(&stub.base)
+            .expect("tunnel")
+            .send_vault_copy(&copy)
+            .expect_err("refused");
+        assert_eq!(refusal_status(&refusal), Some(status), "{refusal:#}");
+    }
+}
+
+#[test]
+fn the_two_transitions_install_on_their_own_routes() {
+    let tls = client_tls_transition();
+    let stub = Stub::serving(vec![(200, r#"{"already_present":true}"#.into())]);
+    Tunnel::new(&stub.base)
+        .expect("tunnel")
+        .install_client_tls_ca_transition(&tls)
+        .expect("installed");
+    let seen = stub.next();
+    assert_eq!(seen.method, "POST");
+    assert_eq!(seen.path, "/api/certificates/client-tls-ca-transition");
+    let sent: ClientTlsCaTransition = serde_json::from_slice(&seen.body).expect("body");
+    assert_eq!(sent, tls);
+
+    let pq = ca_transition();
+    let stub = Stub::serving(vec![(200, r#"{"already_present":false}"#.into())]);
+    Tunnel::new(&stub.base)
+        .expect("tunnel")
+        .install_ca_transition(&pq)
+        .expect("installed");
+    let seen = stub.next();
+    assert_eq!(seen.path, "/api/certificates/ca-transition");
+    let sent: CaTransition = serde_json::from_slice(&seen.body).expect("body");
+    assert_eq!(sent, pq);
+}
+
+/// The gateway names why it refused an installation, for the operator's sake
+/// (`GatewayActionRefusal`), and past the deadline that sentence is the answer.
+#[test]
+fn a_refused_installation_carries_the_gateways_sentence() {
+    let stub = Stub::serving(vec![(
+        409,
+        r#"{"message":"TLS CA rotation activates in the past"}"#.into(),
+    )]);
+    let refusal = Tunnel::new(&stub.base)
+        .expect("tunnel")
+        .install_client_tls_ca_transition(&client_tls_transition())
+        .expect_err("refused");
+    assert_eq!(refusal_status(&refusal), Some(409));
+    assert!(
+        format!("{refusal:#}").contains("activates in the past"),
+        "{refusal:#}"
+    );
+}
+
+/// The domain view has many fields this side does not read, and will gain more.
+#[test]
+fn the_gateway_anchor_is_the_next_or_else_the_current() {
+    let anchor = |kind, answer: serde_json::Value| {
+        let stub = Stub::serving(vec![(200, answer.to_string())]);
+        let read = Tunnel::new(&stub.base)
+            .expect("tunnel")
+            .gateway_next_anchor(kind)
+            .expect("read");
+        let seen = stub.next();
+        assert_eq!(seen.method, "GET");
+        assert_eq!(seen.path, "/api/certificates");
+        read
+    };
+    let current = fingerprint_hex(b"courante");
+    let next = fingerprint_hex(b"suivante");
+
+    assert_eq!(
+        anchor(
+            RotationKind::CaPq,
+            serde_json::json!({
+                "ca_pq_fingerprint": current,
+                "next_ca_fingerprint": next,
+                "client_tls_ca_fingerprint": fingerprint_hex(b"autre famille"),
+                "unknown_to_this_build": [1, 2, 3],
+            })
+        ),
+        Some(Fingerprint::of(b"suivante"))
+    );
+    assert_eq!(
+        anchor(
+            RotationKind::CaPq,
+            serde_json::json!({ "ca_pq_fingerprint": current, "next_ca_fingerprint": null })
+        ),
+        Some(Fingerprint::of(b"courante"))
+    );
+    assert_eq!(
+        anchor(
+            RotationKind::CaTls,
+            serde_json::json!({
+                "ca_pq_fingerprint": fingerprint_hex(b"autre famille"),
+                "client_tls_ca_fingerprint": current,
+                "next_client_tls_ca_fingerprint": next,
+            })
+        ),
+        Some(Fingerprint::of(b"suivante"))
+    );
+    assert_eq!(
+        anchor(
+            RotationKind::CaTls,
+            serde_json::json!({
+                "ca_pq_fingerprint": fingerprint_hex(b"autre famille"),
+                "client_tls_ca_fingerprint": current,
+            })
+        ),
+        Some(Fingerprint::of(b"courante"))
+    );
+    // A gateway older than these two fields names no such anchor.
+    assert_eq!(
+        anchor(
+            RotationKind::CaTls,
+            serde_json::json!({ "ca_pq_fingerprint": current })
+        ),
+        None
+    );
+}
+
+/// A domain with many peers is a larger answer than any operator object.
+#[test]
+fn the_domain_read_has_a_bound_of_its_own() {
+    let padded = serde_json::json!({
+        "ca_pq_fingerprint": fingerprint_hex(b"courante"),
+        "peers": "x".repeat(512 * 1024),
+    });
+    let stub = Stub::serving(vec![(200, padded.to_string())]);
+    assert_eq!(
+        Tunnel::new(&stub.base)
+            .expect("tunnel")
+            .gateway_next_anchor(RotationKind::CaPq)
+            .expect("read"),
+        Some(Fingerprint::of(b"courante"))
+    );
+}
+
+/// A resume tells a refusal from a silence by this type: the first decides the
+/// journal's fate, the second only postpones it.
+#[test]
+fn a_refused_deposit_can_be_told_from_a_lost_connection() {
+    let stub = Stub::serving(vec![(403, "{}".into())]);
+    let result = aether::certificates::status::AstraSignerResult {
+        format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+        approval: Box::new(aether::certificates::status::CampaignApproval {
+            campaign_id: Id16::new([5; 16]).expect("id"),
+            campaign_fingerprint: Fingerprint::of(b"campagne"),
+            required_credentials: 2,
+            approved_at: 1,
+            approvals: Vec::new(),
+        }),
+        objects: Vec::new(),
+        credential_registry: None,
+        issuer_authorization: None,
+    };
+    let tunnel = Tunnel::new(&stub.base).expect("tunnel");
+    let refused = tunnel
+        .submit_campaign(&operation(), "jeton", &result)
+        .expect_err("refused");
+    assert_eq!(refusal_status(&refused), Some(403));
+
+    // Nobody listens on the address any more.
+    let closed = {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        format!("http://{}", listener.local_addr().expect("addr"))
+    };
+    let lost = Tunnel::new(&closed)
+        .expect("tunnel")
+        .submit_campaign(&operation(), "jeton", &result)
+        .expect_err("no gateway");
+    assert_eq!(refusal_status(&lost), None, "{lost:#}");
+}
+
+fn client_tls_transition() -> ClientTlsCaTransition {
+    ClientTlsCaTransition {
+        format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+        trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+        ca_epoch: 1,
+        current_ca_tls_epoch: 1,
+        next_ca_tls_epoch: 2,
+        active_client_tls_ca_fingerprint: Fingerprint::of(b"sortante"),
+        next_client_tls_ca_certificate: DerCertificate::new(vec![0x30, 0x03, 0x02, 0x01, 0x00])
+            .expect("certificate"),
+        window: TransitionWindow {
+            not_before: 10,
+            activation_at: 20,
+            not_after: 30,
+        },
+        ca_pq_signature: MlDsa87Signature::placeholder(),
+    }
+}
+
+fn ca_transition() -> CaTransition {
+    let (_, public) = aether::certificates::encoding::generate_ml_dsa_87_keypair().expect("keys");
+    CaTransition {
+        format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+        trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+        current_ca_epoch: 1,
+        next_ca_epoch: 2,
+        current_ca_fingerprint: Fingerprint::of(b"sortante"),
+        next_ca_fingerprint: public.authority_fingerprint(),
+        next_ca_public_key: public,
+        window: TransitionWindow {
+            not_before: 10,
+            activation_at: 20,
+            not_after: 30,
+        },
+        current_ca_signature: MlDsa87Signature::placeholder(),
+        next_ca_signature: MlDsa87Signature::placeholder(),
     }
 }

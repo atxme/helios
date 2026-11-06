@@ -84,3 +84,42 @@ fn enroll_subcommands_parse() {
         assert!(Cli::try_parse_from(&words).is_err(), "{refused}");
     }
 }
+
+/// A rotation Orion is carrying to the gateway has a journal beside the vault,
+/// and a second one signed over it would name the same outgoing anchor. Refused
+/// before anything else is read, so a damaged journal refuses as well.
+#[test]
+fn neither_rotation_opens_over_a_rotation_journal() {
+    let directory = tempfile::tempdir().expect("dir");
+    let vault = directory.path().join("authority-vault.json");
+    let out = directory.path().join("transition.json");
+    std::fs::write(
+        astra_operator::rotation_journal::path_beside(&vault),
+        b"illisible",
+    )
+    .expect("journal");
+
+    let ca_pq = commands::rotate_ca_pq(&vault, &out, 7, 30, None, None, None, Transport::default())
+        .expect_err("refused");
+    assert!(
+        format!("{ca_pq:#}").contains("rotation est en cours"),
+        "{ca_pq:#}"
+    );
+
+    let channel = astra_operator::campaign::Campaign::select(None, Some("http://127.0.0.1:9"))
+        .expect("channel");
+    let ca_tls = commands::rotate_ca_tls(
+        &vault,
+        channel,
+        &"0".repeat(32),
+        None,
+        &out,
+        (7, 30, 1825),
+        Transport::default(),
+    )
+    .expect_err("refused");
+    assert!(
+        format!("{ca_tls:#}").contains("rotation est en cours"),
+        "{ca_tls:#}"
+    );
+}

@@ -3,28 +3,21 @@
 
 use super::*;
 
-/// Prepared before any of the four files of a CA-PQ rotation is replaced.
-///
-/// A filesystem cannot atomically rename four unrelated destinations.  This
-/// private journal makes the operation replayable instead: after it exists,
-/// every destination is an idempotent projection of these exact bytes.  A
-/// crash can therefore leave an old or new value at each path, never an
-/// unrecoverable rotation whose outgoing private key vanished before its
-/// public transition was written.
-const CA_PQ_ROTATION_JOURNAL: &str = "ca-pq-rotation.pending.json";
-const CA_PQ_ROTATION_JOURNAL_VERSION: u16 = 1;
-
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CaPqRotationJournal {
-    format_version: u16,
-    output_path: PathBuf,
-    current_ca_public_key: MlDsa87PublicKey,
-    vault: AuthorityVault,
-    bindings: aether::certificates::approval::CredentialRegistry,
-    transition: aether::certificates::authority::CaTransition,
-    handoff: handoff::DomainHandoff,
-}
+// Prepared before any of the four files of a CA-PQ rotation is replaced.
+//
+// A filesystem cannot atomically rename four unrelated destinations. This
+// private journal makes the operation replayable instead: after it exists,
+// every destination is an idempotent projection of these exact bytes. A crash
+// can therefore leave an old or new value at each path, never an unrecoverable
+// rotation whose outgoing private key vanished before its public transition was
+// written.
+//
+// The format lives in `rotation_journal`, which also adopts such a file into
+// Orion's journal: an unapplied vault must not depend on which of the two resumes
+// it.
+use astra_operator::rotation_journal::{
+    self, LegacyCaPqJournal as CaPqRotationJournal, LEGACY_CA_PQ_JOURNAL_VERSION,
+};
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn rotate_ca_pq(
@@ -37,8 +30,9 @@ pub(crate) fn rotate_ca_pq(
     origin: Option<&str>,
     transport: Transport,
 ) -> Result<()> {
+    rotation_journal::ensure_none_in_flight(path)?;
     let output_path = absolute_path(out)?;
-    let journal_path = ca_pq_rotation_journal_path(path);
+    let journal_path = rotation_journal::legacy_ca_pq_path_beside(path);
     if journal_path.exists() {
         let journal: CaPqRotationJournal =
             documents::read(&journal_path).context("reprise de la rotation CA-PQ préparée")?;
@@ -48,7 +42,7 @@ pub(crate) fn rotate_ca_pq(
                 journal.output_path.display()
             );
         }
-        validate_ca_pq_rotation_journal(&journal)?;
+        journal.validate()?;
         apply_ca_pq_rotation(path, &journal)?;
         std::fs::remove_file(&journal_path)
             .with_context(|| format!("suppression de {}", journal_path.display()))?;
@@ -212,7 +206,7 @@ pub(crate) fn rotate_ca_pq(
     next_handoff.adopt(&vault)?;
     next_handoff.ca_epoch = Some(identity.ca_epoch + 1);
     let journal = CaPqRotationJournal {
-        format_version: CA_PQ_ROTATION_JOURNAL_VERSION,
+        format_version: LEGACY_CA_PQ_JOURNAL_VERSION,
         output_path,
         current_ca_public_key,
         vault,
@@ -220,7 +214,7 @@ pub(crate) fn rotate_ca_pq(
         transition: rotated.transition,
         handoff: next_handoff,
     };
-    validate_ca_pq_rotation_journal(&journal)?;
+    journal.validate()?;
 
     if let (Some((client, request, _)), Some(approval)) = (&online, &approval) {
         let result = campaign_result(
@@ -284,13 +278,6 @@ fn anchor_probe(
     )
 }
 
-fn ca_pq_rotation_journal_path(vault_path: &Path) -> PathBuf {
-    vault_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join(CA_PQ_ROTATION_JOURNAL)
-}
-
 fn absolute_path(path: &Path) -> Result<PathBuf> {
     if path.is_absolute() {
         Ok(path.to_path_buf())
@@ -299,39 +286,6 @@ fn absolute_path(path: &Path) -> Result<PathBuf> {
             .context("lecture du répertoire courant")?
             .join(path))
     }
-}
-
-fn validate_ca_pq_rotation_journal(journal: &CaPqRotationJournal) -> Result<()> {
-    if journal.format_version != CA_PQ_ROTATION_JOURNAL_VERSION {
-        bail!("version de journal de rotation CA-PQ non supportée");
-    }
-    let domain = TrustDomainId::parse_hex(&journal.handoff.trust_domain_id)?;
-    let gateway = WireGuardKey::parse(journal.handoff.require(
-        journal.handoff.gateway_wg_public_key.as_ref(),
-        "la clé publique de la gateway",
-        "--gateway-wg-public-key",
-    )?)?;
-    journal.transition.verify(
-        &journal.current_ca_public_key,
-        &domain,
-        journal.transition.current_ca_epoch,
-    )?;
-    let next_ca = MlDsa87PublicKey::parse(journal.vault.ca_pq_public_key.trim())?;
-    if next_ca != journal.transition.next_ca_public_key
-        || journal.handoff.ca_epoch != Some(journal.transition.next_ca_epoch)
-        || journal.handoff.ca_pq_public_key != journal.vault.ca_pq_public_key
-        || journal.handoff.vault_fingerprint != journal.vault.fingerprint()?.to_hex()
-    {
-        bail!("le journal CA-PQ ne décrit pas un coffre, une transition et un relais uniques");
-    }
-    journal.bindings.verify(
-        &next_ca,
-        &domain,
-        &gateway,
-        journal.transition.next_ca_epoch,
-        journal.bindings.credential_registry_epoch,
-    )?;
-    Ok(())
 }
 
 fn apply_ca_pq_rotation(vault_path: &Path, journal: &CaPqRotationJournal) -> Result<()> {

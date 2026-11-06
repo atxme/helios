@@ -58,6 +58,7 @@ pub mod origin;
 pub mod orion;
 pub mod overview;
 pub mod prepared;
+pub mod rotation_journal;
 pub mod signing;
 pub mod store;
 pub mod tunnel;

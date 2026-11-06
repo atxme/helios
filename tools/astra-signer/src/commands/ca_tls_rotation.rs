@@ -24,6 +24,7 @@ pub(crate) fn rotate_ca_tls(
 ) -> Result<()> {
     use aether::certificates::transport::TrustUpdateObject;
 
+    astra_operator::rotation_journal::ensure_none_in_flight(path)?;
     let operation = Id16::parse_hex(operation_id)
         .map_err(|error| anyhow::anyhow!("--operation-id : {error}"))?;
     let mut vault = store::load(path)?;
