@@ -293,3 +293,252 @@ async fn a_redirect_is_reported_instead_of_followed() {
     ));
     assert_eq!(store.state(), &before);
 }
+
+struct SignedFixture {
+    directory: tempfile::TempDir,
+    domain: Domain,
+    service_private: Zeroizing<Vec<u8>>,
+    store: TrustStore,
+}
+
+impl SignedFixture {
+    fn new() -> Self {
+        let directory = tempfile::tempdir().expect("directory");
+        let domain = domain();
+        let (service_private, service_public) = generate_ml_dsa_87_keypair().expect("service key");
+        let mut state = crate::test_domain::store(directory.path(), &domain)
+            .state()
+            .clone();
+        state.astra.active_astra_service_public_key = service_public;
+        let store = TrustStore::new(directory.path().join("trust.json"), state);
+        store.save().expect("persist fixture");
+        Self {
+            directory,
+            domain,
+            service_private,
+            store,
+        }
+    }
+
+    fn transaction(&self) -> (TrustUpdateTransactionManifest, Vec<TrustUpdateChunk>) {
+        transaction(&self.store, &self.domain, &self.service_private)
+    }
+
+    async fn refuse(
+        &mut self,
+        manifest: &TrustUpdateTransactionManifest,
+        chunks: &[TrustUpdateChunk],
+    ) -> TrustUpdateError {
+        let path = self.directory.path().join("trust.json");
+        let before = self.store.state().clone();
+        let original = std::fs::read(&path).expect("persisted state");
+        let replies = chunks
+            .iter()
+            .map(|chunk| (200, reply(manifest, chunk)))
+            .collect();
+        let (url, seen, server) = server(replies, path.clone(), original.clone()).await;
+        let result =
+            run_with_watchdog(session(&self.store, &self.domain, &url), &mut self.store).await;
+        finish_server(server).await;
+        assert_eq!(seen.lock().expect("requests").len(), 2);
+        assert_eq!(self.store.state(), &before);
+        assert_eq!(std::fs::read(&path).expect("durable state"), original);
+        assert_eq!(
+            TrustStore::load(&path)
+                .expect("reload")
+                .expect("persisted store")
+                .state(),
+            &before,
+        );
+        result.expect_err("the complete transaction must be refused")
+    }
+}
+
+fn reattribute(manifest: &TrustUpdateTransactionManifest, chunks: &mut [TrustUpdateChunk]) {
+    for chunk in chunks {
+        chunk.manifest_fingerprint = manifest.fingerprint();
+    }
+}
+
+#[tokio::test]
+async fn an_unpinned_manifest_signer_is_refused_after_the_final_fragment() {
+    let mut fixture = SignedFixture::new();
+    let (manifest, mut chunks) = fixture.transaction();
+    let (untrusted_private, _) = generate_ml_dsa_87_keypair().expect("untrusted key");
+    let manifest = manifest
+        .sign(&untrusted_private)
+        .expect("untrusted signature");
+    reattribute(&manifest, &mut chunks);
+    assert!(matches!(
+        fixture.refuse(&manifest, &chunks).await,
+        TrustUpdateError::Store(TrustError::Certificate(CertificateError::InvalidSignature))
+    ));
+}
+
+#[tokio::test]
+async fn an_authenticated_manifest_cannot_address_another_domain_or_peer() {
+    use aether::certificates::encoding::{TrustDomainId, WireGuardKey};
+
+    let mut fixture = SignedFixture::new();
+    for target in 0..3 {
+        let (mut manifest, mut chunks) = fixture.transaction();
+        let expected = match target {
+            0 => {
+                manifest.trust_domain_id = TrustDomainId::new([99; 16]).expect("other domain");
+                CertificateError::TrustDomainMismatch
+            }
+            1 => {
+                manifest.gateway_wg_public_key = WireGuardKey::from_bytes([99; 32]);
+                CertificateError::GatewayIdentityMismatch
+            }
+            _ => {
+                manifest.client_wg_public_key = WireGuardKey::from_bytes([99; 32]);
+                CertificateError::ClientIdentityMismatch
+            }
+        };
+        let manifest = manifest
+            .sign(&fixture.service_private)
+            .expect("signed target");
+        reattribute(&manifest, &mut chunks);
+        let error = fixture.refuse(&manifest, &chunks).await;
+        let TrustUpdateError::Store(TrustError::Certificate(actual)) = error else {
+            panic!("expected a store certificate refusal: {error:?}");
+        };
+        assert_eq!(actual, expected);
+    }
+}
+
+#[tokio::test]
+async fn an_online_manifest_cannot_select_another_authority_or_epoch() {
+    use aether::certificates::transport::ManifestAuthority;
+
+    let mut fixture = SignedFixture::new();
+    for ca_authority in [false, true] {
+        let (mut manifest, mut chunks) = fixture.transaction();
+        if ca_authority {
+            manifest.manifest_authority_kind = ManifestAuthority::CaPq;
+            manifest = manifest
+                .sign(&fixture.domain.ca_pq_private)
+                .expect("CA signature");
+        } else {
+            manifest.manifest_authority_epoch += 1;
+            manifest = manifest
+                .sign(&fixture.service_private)
+                .expect("service signature");
+        }
+        reattribute(&manifest, &mut chunks);
+        assert!(matches!(
+            fixture.refuse(&manifest, &chunks).await,
+            TrustUpdateError::Store(TrustError::Certificate(
+                CertificateError::UnauthorizedIssuer
+            ))
+        ));
+    }
+}
+
+#[tokio::test]
+async fn a_complete_transaction_is_refused_at_expiry_or_earliest_activation() {
+    let mut fixture = SignedFixture::new();
+    for expired in [true, false] {
+        let (mut manifest, mut chunks) = fixture.transaction();
+        let expected = if expired {
+            manifest.expires_at = NOW;
+            CertificateError::InvalidLease
+        } else {
+            manifest.minimum_activation_at = NOW;
+            CertificateError::InvalidTransaction("minimum activation reached")
+        };
+        let manifest = manifest
+            .sign(&fixture.service_private)
+            .expect("signed window");
+        reattribute(&manifest, &mut chunks);
+        let error = fixture.refuse(&manifest, &chunks).await;
+        let TrustUpdateError::Store(TrustError::Certificate(actual)) = error else {
+            panic!("expected a store certificate refusal: {error:?}");
+        };
+        assert_eq!(actual, expected);
+    }
+}
+
+#[tokio::test]
+async fn an_authentic_envelope_does_not_authorize_an_invalid_last_object() {
+    let mut fixture = SignedFixture::new();
+    let (mut manifest, mut chunks) = fixture.transaction();
+    let TrustUpdateObject::CertificateRevocation(revocation) = &mut chunks[1].objects[0] else {
+        panic!("the final fixture object is a revocation");
+    };
+    revocation.ca_signature = MlDsa87Signature::placeholder();
+    // Authenticate the altered object as transport content. The first valid
+    // revocation may be evaluated in a candidate, but the envelope never
+    // replaces the last object's own CA authorization.
+    manifest.objects[1].object_fingerprint = chunks[1].objects[0]
+        .fingerprint()
+        .expect("altered object fingerprint");
+    let manifest = manifest
+        .sign(&fixture.service_private)
+        .expect("authentic envelope");
+    reattribute(&manifest, &mut chunks);
+    assert!(matches!(
+        fixture.refuse(&manifest, &chunks).await,
+        TrustUpdateError::Store(TrustError::Certificate(CertificateError::InvalidSignature))
+    ));
+}
+
+#[tokio::test]
+async fn substituting_the_last_object_is_refused_before_store_application() {
+    let mut fixture = SignedFixture::new();
+    let (manifest, mut chunks) = fixture.transaction();
+    let TrustUpdateObject::CertificateRevocation(revocation) = &mut chunks[1].objects[0] else {
+        panic!("the final fixture object is a revocation");
+    };
+    revocation.revocation_epoch += 1;
+    assert!(matches!(
+        fixture.refuse(&manifest, &chunks).await,
+        TrustUpdateError::Certificate(CertificateError::FingerprintMismatch("transaction object"))
+    ));
+}
+
+#[tokio::test]
+async fn a_fresh_session_can_apply_the_whole_transaction_after_losing_the_last_page() {
+    let mut fixture = SignedFixture::new();
+    let (manifest, chunks) = fixture.transaction();
+    let path = fixture.directory.path().join("trust.json");
+    let original = std::fs::read(&path).expect("original");
+    let before = fixture.store.state().clone();
+    let replies = VecDeque::from([(200, reply(&manifest, &chunks[0])), (503, Vec::new())]);
+    let (url, _, failed_server) = server(replies, path.clone(), original.clone()).await;
+    assert!(matches!(
+        run_with_watchdog(
+            session(&fixture.store, &fixture.domain, &url),
+            &mut fixture.store,
+        )
+        .await,
+        Err(TrustUpdateError::Status { status: 503 })
+    ));
+    finish_server(failed_server).await;
+    assert_eq!(fixture.store.state(), &before);
+    assert_eq!(std::fs::read(&path).expect("after failure"), original);
+
+    let mut reloaded = TrustStore::load(&path).expect("reload").expect("store");
+    let replies = chunks
+        .iter()
+        .map(|chunk| (200, reply(&manifest, chunk)))
+        .collect();
+    let (url, seen, complete_server) = server(replies, path.clone(), original).await;
+    assert_eq!(
+        run_with_watchdog(session(&reloaded, &fixture.domain, &url), &mut reloaded)
+            .await
+            .expect("fresh session applies both fragments"),
+        TrustUpdateOutcome::Applied { objects: 2 }
+    );
+    finish_server(complete_server).await;
+    assert_eq!(seen.lock().expect("requests").len(), 2);
+    assert_eq!(reloaded.state().ledger.scheduled_revocations.len(), 2);
+    assert_eq!(
+        TrustStore::load(&path)
+            .expect("reload committed state")
+            .expect("committed store")
+            .state(),
+        reloaded.state()
+    );
+}

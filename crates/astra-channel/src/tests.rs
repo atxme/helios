@@ -120,6 +120,7 @@ fn self_signed(name: &str, role: PinnedRole, days: i64) -> (Vec<u8>, Vec<u8>) {
 
 struct SpyHandler {
     seen: Mutex<Vec<&'static str>>,
+    published: Mutex<Vec<GatewayTransitionPublished>>,
 }
 
 #[async_trait]
@@ -145,12 +146,13 @@ impl AstraChannelHandler for SpyHandler {
 
     async fn gateway_transition_published(
         &self,
-        _published: GatewayTransitionPublished,
+        published: GatewayTransitionPublished,
     ) -> Result<(), TrustUpdateRefusal> {
         self.seen
             .lock()
             .unwrap()
             .push("gateway_transition_published");
+        self.published.lock().unwrap().push(published);
         Err(TrustUpdateRefusal::Rejected)
     }
 
@@ -187,6 +189,7 @@ impl AstraChannelHandler for SpyHandler {
 fn spy() -> Arc<SpyHandler> {
     Arc::new(SpyHandler {
         seen: Mutex::new(Vec::new()),
+        published: Mutex::new(Vec::new()),
     })
 }
 
@@ -606,3 +609,197 @@ fn a_relayed_open_carries_the_operator_and_the_request() {
     extra["path"] = serde_json::json!("/x");
     assert!(serde_json::from_value::<RelayedOperatorOpen>(extra).is_err());
 }
+
+#[tokio::test]
+async fn every_mutation_bounds_the_body_before_registry_dispatch() {
+    for path in [
+        STAGE_PATH,
+        STAGE_COMMIT_PATH,
+        REVOKE_PATH,
+        DISTRIBUTION_PATH,
+        GATEWAY_PUBLISHED_PATH,
+    ] {
+        for (length, expected) in [
+            (MAX_INTERNAL_BODY_BYTES, StatusCode::BAD_REQUEST),
+            (MAX_INTERNAL_BODY_BYTES + 1, StatusCode::PAYLOAD_TOO_LARGE),
+        ] {
+            let handler = spy();
+            // A body inside the allowance reaches JSON decoding; one byte over
+            // must be refused by the bound, before the registry sees anything.
+            let response = router(handler.clone())
+                .oneshot(
+                    Request::post(path)
+                        .body(Body::from(vec![b' '; length]))
+                        .expect("request"),
+                )
+                .await
+                .expect("router responds");
+            assert_eq!(response.status(), expected, "{path}, {length} bytes");
+            assert!(handler.seen.lock().unwrap().is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn publication_names_the_exact_transition_and_rejects_ambiguous_json() {
+    let published = GatewayTransitionPublished {
+        gateway_identity_epoch: 7,
+        transition_fingerprint: Fingerprint::of(b"published transition"),
+    };
+    let valid = serde_json::to_string(&published).expect("publication JSON");
+    let unknown = valid.replacen('{', "{\"untrusted_override\":true,", 1);
+    let duplicate = valid.replacen('{', "{\"gateway_identity_epoch\":8,", 1);
+    for body in [unknown, duplicate] {
+        let handler = spy();
+        let response = router(handler.clone())
+            .oneshot(
+                Request::post(GATEWAY_PUBLISHED_PATH)
+                    .body(Body::from(body))
+                    .expect("request"),
+            )
+            .await
+            .expect("router responds");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(handler.seen.lock().unwrap().is_empty());
+    }
+    let handler = spy();
+    let response = router(handler.clone())
+        .oneshot(
+            Request::post(GATEWAY_PUBLISHED_PATH)
+                .body(Body::from(valid))
+                .expect("request"),
+        )
+        .await
+        .expect("router responds");
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        handler.seen.lock().unwrap().as_slice(),
+        ["gateway_transition_published"]
+    );
+    assert_eq!(handler.published.lock().unwrap().as_slice(), [published]);
+    let body = axum::body::to_bytes(response.into_body(), MAX_INTERNAL_BODY_BYTES)
+        .await
+        .expect("refusal body");
+    assert!(
+        body.is_empty(),
+        "a private refusal carries no registry detail"
+    );
+}
+
+#[tokio::test]
+async fn the_identity_route_dispatches_only_reads() {
+    let handler = spy();
+    assert_eq!(
+        status_of(handler.clone(), "GET", GATEWAY_IDENTITY_PATH).await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        handler.seen.lock().unwrap().as_slice(),
+        ["gateway_identity"]
+    );
+
+    for (method, path) in [
+        ("POST", GATEWAY_IDENTITY_PATH),
+        ("GET", STAGE_PATH),
+        ("GET", STAGE_COMMIT_PATH),
+        ("GET", REVOKE_PATH),
+        ("GET", DISTRIBUTION_PATH),
+        ("GET", GATEWAY_PUBLISHED_PATH),
+    ] {
+        let handler = spy();
+        assert_eq!(
+            status_of(handler.clone(), method, path).await,
+            StatusCode::METHOD_NOT_ALLOWED,
+            "{method} {path}"
+        );
+        assert!(handler.seen.lock().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn a_pinned_certificate_uses_a_half_open_validity_window() {
+    use std::time::Duration;
+
+    for role in [PinnedRole::Client, PinnedRole::Server] {
+        let identity = disposable("validity.internal", role);
+        let facts = x509::inspect(&identity.certificate).expect("certificate facts");
+        let verifier = PinnedPeer::new(&identity.certificate, role, provider()).expect("pin");
+        let certificate = CertificateDer::from(identity.certificate.as_bytes().to_vec());
+        for now in [facts.not_before, facts.not_after - 1] {
+            assert!(verifier
+                .accept(
+                    &certificate,
+                    &[],
+                    UnixTime::since_unix_epoch(Duration::from_secs(now))
+                )
+                .is_ok());
+        }
+        assert!(matches!(
+            verifier.accept(
+                &certificate,
+                &[],
+                UnixTime::since_unix_epoch(Duration::from_secs(facts.not_before - 1)),
+            ),
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::NotValidYet
+            ))
+        ));
+        assert!(matches!(
+            verifier.accept(
+                &certificate,
+                &[],
+                UnixTime::since_unix_epoch(Duration::from_secs(facts.not_after)),
+            ),
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::Expired
+            ))
+        ));
+    }
+}
+
+#[test]
+fn a_pinned_certificate_must_allow_handshake_signatures() {
+    use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, KeyPair, KeyUsagePurpose};
+
+    for (role, usage) in [
+        (PinnedRole::Client, ExtendedKeyUsagePurpose::ClientAuth),
+        (PinnedRole::Server, ExtendedKeyUsagePurpose::ServerAuth),
+    ] {
+        let mut params = CertificateParams::new(vec!["usage.internal".into()]).expect("params");
+        params.key_usages = vec![KeyUsagePurpose::KeyEncipherment];
+        params.extended_key_usages = vec![usage];
+        let key = KeyPair::generate().expect("test key");
+        let certificate = params.self_signed(&key).expect("certificate");
+        let der = DerCertificate::new(certificate.der().to_vec()).expect("DER");
+        assert!(matches!(
+            PinnedPeer::new(&der, role, provider()),
+            Err(ChannelError::Pin(_))
+        ));
+    }
+}
+
+#[test]
+fn malformed_transport_material_fails_during_configuration() {
+    let gateway = disposable(INTERNAL_SERVER_NAME, PinnedRole::Server);
+    let astra = disposable("astra.internal", PinnedRole::Client);
+    let malformed = DerCertificate::new(vec![1, 2, 3]).expect("bounded DER wrapper");
+    assert!(matches!(
+        server_config(&gateway.identity, &malformed),
+        Err(ChannelError::Pin(_))
+    ));
+    assert!(matches!(
+        client_config(&astra.identity, &malformed),
+        Err(ChannelError::Pin(_))
+    ));
+    let broken_identity = ChannelIdentity {
+        certificate_der: gateway.identity.certificate_der,
+        private_key_der: vec![1, 2, 3],
+    };
+    assert!(matches!(
+        server_config(&broken_identity, &astra.certificate),
+        Err(ChannelError::Tls(_))
+    ));
+}
+
+#[path = "tests/http_client.rs"]
+mod http_client;

@@ -1705,3 +1705,576 @@ fn the_base_state_fingerprint_is_pinned() {
     .expect("issuer snapshot fingerprint");
     assert_ne!(issuer_fingerprint, baseline);
 }
+
+mod astra_profile_transitions {
+    use super::*;
+    use crate::certificates::approval::CredentialState;
+    use crate::certificates::encoding::MlDsa87Signature;
+    use crate::certificates::CERTIFICATE_FORMAT_VERSION;
+
+    fn service_key(seed: u8) -> MlDsa87PublicKey {
+        MlDsa87PublicKey::new(vec![seed; 2_592]).expect("service key fixture")
+    }
+
+    fn profile() -> AstraProfile {
+        AstraProfile {
+            authority_url: "https://astra.example".into(),
+            webauthn_rp_id: "astra.example".into(),
+            astra_policy_fingerprint: AstraPolicyPin::new(Fingerprint::of(b"policy"))
+                .expect("policy pin"),
+            credential_registry_epoch: 7,
+            credential_bindings: BTreeMap::new(),
+            active_astra_service_public_key: service_key(0),
+            next_astra_service_public_key: None,
+            next_service_key_transition_fingerprint: None,
+            astra_service_key_epoch: 3,
+            service_key_activation_at: None,
+            service_key_retire_active_at: None,
+            service_key_revocation_epoch: 2,
+            last_emergency_replacement_fingerprint: None,
+        }
+    }
+
+    fn binding() -> AstraCredentialBinding {
+        AstraCredentialBinding {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            credential_id: vec![1],
+            credential_public_key: vec![2],
+            aaguid: [3; 16],
+            trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+            gateway_wg_public_key: WireGuardKey::from_bytes([2; 32]),
+            state: CredentialState::Active,
+            credential_epoch: 1,
+            credential_registry_epoch: 8,
+            ca_epoch: 1,
+            created_at: 1,
+            ca_pq_signature: MlDsa87Signature::placeholder(),
+        }
+    }
+
+    // These transitions exercise guards before signature verification. A
+    // placeholder signature must never get past any of those guards.
+    fn transition(profile: &AstraProfile) -> AstraServiceKeyTransition {
+        let next = service_key(1);
+        AstraServiceKeyTransition {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+            ca_epoch: 1,
+            current_service_key_epoch: profile.astra_service_key_epoch,
+            next_service_key_epoch: profile.astra_service_key_epoch + 1,
+            current_service_key_fingerprint: profile
+                .active_astra_service_public_key
+                .authority_fingerprint(),
+            next_service_key_fingerprint: next.authority_fingerprint(),
+            next_service_public_key: next,
+            window: TransitionWindow::new(1_000, 2_000, 3_000).expect("window"),
+            reason: RotationReason::Scheduled,
+            current_service_key_signature: MlDsa87Signature::placeholder(),
+            next_service_key_signature: MlDsa87Signature::placeholder(),
+            ca_pq_signature: MlDsa87Signature::placeholder(),
+        }
+    }
+
+    #[test]
+    fn accepting_and_replaying_a_binding_keeps_one_registry_decision() {
+        let mut profile = profile();
+        let binding = binding();
+        assert_eq!(
+            profile.accept_credential_binding(&binding),
+            Ok(InstallOutcome::Installed)
+        );
+        assert_eq!(profile.credential_registry_epoch, 8);
+        assert_eq!(profile.credential_bindings.len(), 1);
+        assert_eq!(profile.credential_bindings.values().next(), Some(&binding));
+        let installed = profile.clone();
+        assert_eq!(
+            profile.accept_credential_binding(&binding),
+            Ok(InstallOutcome::AlreadyPresent)
+        );
+        assert_eq!(profile, installed);
+    }
+
+    #[test]
+    fn a_conflicting_binding_does_not_replace_the_accepted_decision() {
+        let mut profile = profile();
+        let binding = binding();
+        profile
+            .accept_credential_binding(&binding)
+            .expect("binding");
+        let before = profile.clone();
+        let mut conflicting = binding;
+        conflicting.created_at += 1;
+        assert!(matches!(
+            profile.accept_credential_binding(&conflicting),
+            Err(CertificateError::GenerationConflict { generation: 8 })
+        ));
+        assert_eq!(profile, before);
+    }
+
+    #[test]
+    fn a_higher_registry_epoch_cannot_revive_a_revoked_credential() {
+        let mut profile = profile();
+        let mut revoked = binding();
+        revoked.state = CredentialState::Revoked;
+        profile
+            .accept_credential_binding(&revoked)
+            .expect("revocation");
+        let before = profile.clone();
+        let mut restored = revoked;
+        restored.state = CredentialState::Active;
+        restored.credential_epoch += 1;
+        restored.credential_registry_epoch += 1;
+        assert!(matches!(
+            profile.accept_credential_binding(&restored),
+            Err(CertificateError::Revoked)
+        ));
+        assert_eq!(profile, before);
+    }
+
+    #[test]
+    fn service_key_promotion_clears_overlap_and_never_restores_the_outgoing_key() {
+        let mut profile = profile();
+        let next = service_key(1);
+        profile.next_astra_service_public_key = Some(next.clone());
+        profile.next_service_key_transition_fingerprint = Some(Fingerprint::of(b"transition"));
+        profile.service_key_activation_at = Some(2_000);
+        profile.service_key_retire_active_at = Some(3_000);
+        let before = profile.clone();
+        assert!(!profile.promote_service_key_if_due(2_999));
+        assert_eq!(profile, before);
+        assert!(profile.promote_service_key_if_due(3_000));
+        assert_eq!(profile.active_astra_service_public_key, next);
+        assert_eq!(profile.astra_service_key_epoch, 4);
+        assert_eq!(profile.service_key_revocation_epoch, 2);
+        assert!(profile.next_astra_service_public_key.is_none());
+        assert!(profile.next_service_key_transition_fingerprint.is_none());
+        assert!(profile.service_key_activation_at.is_none());
+        assert!(profile.service_key_retire_active_at.is_none());
+        assert!(profile.service_key_for(3, 1_000).is_none());
+        assert_eq!(profile.service_key_for(4, 1_000), Some(&next));
+        let promoted = profile.clone();
+        assert!(!profile.promote_service_key_if_due(4_000));
+        assert_eq!(profile, promoted);
+    }
+
+    #[test]
+    fn a_retirement_without_a_successor_does_not_promote_or_change_the_epoch() {
+        let mut profile = profile();
+        profile.service_key_retire_active_at = Some(3_000);
+        let before = profile.clone();
+        assert!(!profile.promote_service_key_if_due(3_000));
+        assert_eq!(profile, before);
+        assert!(profile.service_key_for(3, 3_000).is_none());
+        assert!(profile.service_key_for(4, 3_000).is_none());
+    }
+
+    #[test]
+    fn a_second_service_transition_cannot_replace_the_staged_successor() {
+        let mut profile = profile();
+        let transition = transition(&profile);
+        profile.next_astra_service_public_key = Some(service_key(2));
+        profile.next_service_key_transition_fingerprint = Some(Fingerprint::of(b"other"));
+        let before = profile.clone();
+        assert!(matches!(
+            profile.apply_service_key_transition(
+                &transition,
+                &service_key(3),
+                &transition.trust_domain_id,
+                1,
+                &TrustLedger::default(),
+            ),
+            Err(CertificateError::IllegalStateTransition(_))
+        ));
+        assert_eq!(profile, before);
+    }
+
+    #[test]
+    fn a_replayed_staged_service_transition_keeps_the_existing_state() {
+        let mut profile = profile();
+        let transition = transition(&profile);
+        profile.next_astra_service_public_key = Some(transition.next_service_public_key.clone());
+        profile.next_service_key_transition_fingerprint = Some(transition.fingerprint());
+        profile.service_key_activation_at = Some(2_000);
+        profile.service_key_retire_active_at = Some(3_000);
+        let before = profile.clone();
+        assert_eq!(
+            profile.apply_service_key_transition(
+                &transition,
+                &service_key(3),
+                &transition.trust_domain_id,
+                1,
+                &TrustLedger::default(),
+            ),
+            Ok(InstallOutcome::AlreadyPresent)
+        );
+        assert_eq!(profile, before);
+    }
+
+    #[test]
+    fn a_revoked_service_successor_is_refused_even_for_a_staged_replay() {
+        let mut profile = profile();
+        let transition = transition(&profile);
+        profile.next_astra_service_public_key = Some(transition.next_service_public_key.clone());
+        profile.next_service_key_transition_fingerprint = Some(transition.fingerprint());
+        let mut ledger = TrustLedger::default();
+        ledger
+            .remember(
+                RevocationTombstone {
+                    scope: RevocationScope::Gateway,
+                    family: RevokedFamily::Pq,
+                    fingerprint: transition.next_service_key_fingerprint,
+                    revocation_epoch: 1,
+                    expires_at: 10_000,
+                    revocation_fingerprint: None,
+                },
+                1_000,
+            )
+            .expect("tombstone");
+        let before = profile.clone();
+        let ledger_before = ledger.clone();
+        assert!(matches!(
+            profile.apply_service_key_transition(
+                &transition,
+                &service_key(3),
+                &transition.trust_domain_id,
+                1,
+                &ledger,
+            ),
+            Err(CertificateError::Revoked)
+        ));
+        assert_eq!(profile, before);
+        assert_eq!(ledger, ledger_before);
+    }
+
+    #[cfg(feature = "key-negotiation-signing")]
+    mod signed_service_changes {
+        use super::*;
+        use crate::certificates::encoding::generate_ml_dsa_87_keypair;
+        use zeroize::Zeroizing;
+
+        struct Key {
+            private: Zeroizing<Vec<u8>>,
+            public: MlDsa87PublicKey,
+        }
+
+        fn key() -> Key {
+            let (private, public) = generate_ml_dsa_87_keypair().expect("keygen");
+            Key { private, public }
+        }
+
+        struct Fixture {
+            ca: Key,
+            current: Key,
+            next: Key,
+            profile: AstraProfile,
+        }
+
+        impl Fixture {
+            fn new() -> Self {
+                let current = key();
+                let mut profile = profile();
+                profile.active_astra_service_public_key = current.public.clone();
+                Self {
+                    ca: key(),
+                    current,
+                    next: key(),
+                    profile,
+                }
+            }
+
+            fn transition(&self) -> AstraServiceKeyTransition {
+                let mut transition = transition(&self.profile);
+                transition.next_service_public_key = self.next.public.clone();
+                transition.next_service_key_fingerprint = self.next.public.authority_fingerprint();
+                transition
+                    .sign(&self.current.private, &self.next.private, &self.ca.private)
+                    .expect("signed service transition")
+            }
+
+            fn replacement(&self) -> EmergencyAstraServiceKeyReplacement {
+                EmergencyAstraServiceKeyReplacement {
+                    format_version: CERTIFICATE_FORMAT_VERSION,
+                    trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+                    ca_epoch: 1,
+                    current_service_key_epoch: 3,
+                    next_service_key_epoch: 4,
+                    revoked_service_key_fingerprint: self.current.public.authority_fingerprint(),
+                    next_service_public_key: self.next.public.clone(),
+                    next_service_key_fingerprint: self.next.public.authority_fingerprint(),
+                    revocation_epoch: 3,
+                    effective_at: 2_000,
+                    reason: RotationReason::EmergencyReplacement,
+                    next_service_key_signature: MlDsa87Signature::placeholder(),
+                    ca_pq_signature: MlDsa87Signature::placeholder(),
+                }
+                .sign(&self.next.private, &self.ca.private)
+                .expect("signed emergency replacement")
+            }
+
+            fn apply_transition(
+                &mut self,
+                transition: &AstraServiceKeyTransition,
+            ) -> Result<InstallOutcome, CertificateError> {
+                self.profile.apply_service_key_transition(
+                    transition,
+                    &self.ca.public,
+                    &transition.trust_domain_id,
+                    1,
+                    &TrustLedger::default(),
+                )
+            }
+
+            fn apply_replacement(
+                &mut self,
+                replacement: &EmergencyAstraServiceKeyReplacement,
+                now: u64,
+            ) -> Result<InstallOutcome, CertificateError> {
+                self.profile.apply_emergency_replacement(
+                    replacement,
+                    &self.ca.public,
+                    &replacement.trust_domain_id,
+                    1,
+                    &TrustLedger::default(),
+                    now,
+                )
+            }
+        }
+
+        #[test]
+        fn a_signed_service_transition_installs_only_an_overlapping_successor() {
+            let mut fixture = Fixture::new();
+            let transition = fixture.transition();
+            assert_eq!(
+                fixture.apply_transition(&transition),
+                Ok(InstallOutcome::Installed)
+            );
+            assert_eq!(fixture.profile.astra_service_key_epoch, 3);
+            assert_eq!(fixture.profile.service_key_revocation_epoch, 2);
+            assert_eq!(
+                fixture.profile.active_astra_service_public_key,
+                fixture.current.public
+            );
+            assert_eq!(
+                fixture.profile.next_astra_service_public_key,
+                Some(fixture.next.public.clone())
+            );
+            assert_eq!(
+                fixture.profile.next_service_key_transition_fingerprint,
+                Some(transition.fingerprint())
+            );
+            assert_eq!(fixture.profile.service_key_activation_at, Some(2_000));
+            assert_eq!(fixture.profile.service_key_retire_active_at, Some(3_000));
+            assert!(fixture.profile.service_key_for(4, 1_999).is_none());
+            assert_eq!(
+                fixture.profile.service_key_for(4, 2_000),
+                Some(&fixture.next.public)
+            );
+            assert!(fixture.profile.service_key_for(3, 3_000).is_none());
+        }
+
+        #[test]
+        fn each_invalid_transition_signature_leaves_the_whole_profile_unchanged() {
+            let mut fixture = Fixture::new();
+            let signed = fixture.transition();
+            let before = fixture.profile.clone();
+            for signature in 0..3 {
+                let mut broken = signed.clone();
+                match signature {
+                    0 => broken.current_service_key_signature = MlDsa87Signature::placeholder(),
+                    1 => broken.next_service_key_signature = MlDsa87Signature::placeholder(),
+                    _ => broken.ca_pq_signature = MlDsa87Signature::placeholder(),
+                }
+                assert!(matches!(
+                    fixture.apply_transition(&broken),
+                    Err(CertificateError::InvalidSignature)
+                ));
+                assert_eq!(fixture.profile, before);
+            }
+        }
+
+        #[test]
+        fn an_emergency_replacement_waits_until_effective_then_cancels_any_planned_rotation() {
+            let mut fixture = Fixture::new();
+            let planned = key();
+            let mut transition = transition(&fixture.profile);
+            transition.next_service_public_key = planned.public.clone();
+            transition.next_service_key_fingerprint = planned.public.authority_fingerprint();
+            let transition = transition
+                .sign(
+                    &fixture.current.private,
+                    &planned.private,
+                    &fixture.ca.private,
+                )
+                .expect("distinct planned successor");
+            fixture
+                .apply_transition(&transition)
+                .expect("planned rotation");
+            let replacement = fixture.replacement();
+            let before = fixture.profile.clone();
+            assert!(matches!(
+                fixture.apply_replacement(&replacement, 1_999),
+                Err(CertificateError::IllegalStateTransition(_))
+            ));
+            assert_eq!(fixture.profile, before);
+            assert_eq!(
+                fixture.apply_replacement(&replacement, 2_000),
+                Ok(InstallOutcome::Installed)
+            );
+            assert_eq!(
+                fixture.profile.active_astra_service_public_key,
+                fixture.next.public
+            );
+            assert_ne!(
+                fixture.profile.active_astra_service_public_key,
+                planned.public
+            );
+            assert_eq!(fixture.profile.astra_service_key_epoch, 4);
+            assert_eq!(fixture.profile.service_key_revocation_epoch, 3);
+            assert_eq!(
+                fixture.profile.last_emergency_replacement_fingerprint,
+                Some(replacement.fingerprint())
+            );
+            assert!(fixture.profile.next_astra_service_public_key.is_none());
+            assert!(fixture
+                .profile
+                .next_service_key_transition_fingerprint
+                .is_none());
+            assert!(fixture.profile.service_key_activation_at.is_none());
+            assert!(fixture.profile.service_key_retire_active_at.is_none());
+            assert!(fixture.profile.service_key_for(3, 2_000).is_none());
+        }
+
+        #[test]
+        fn a_validly_signed_replacement_of_another_outgoing_key_is_atomic_refusal() {
+            let mut fixture = Fixture::new();
+            let mut replacement = fixture.replacement();
+            replacement.revoked_service_key_fingerprint = Fingerprint::of(b"another outgoing key");
+            let replacement = replacement
+                .sign(&fixture.next.private, &fixture.ca.private)
+                .expect("signed different target");
+            let before = fixture.profile.clone();
+            assert!(matches!(
+                fixture.apply_replacement(&replacement, 2_000),
+                Err(CertificateError::FingerprintMismatch("revoked service key"))
+            ));
+            assert_eq!(fixture.profile, before);
+        }
+
+        #[test]
+        fn replacement_idempotency_belongs_to_the_signed_document_not_the_installed_key() {
+            let mut fixture = Fixture::new();
+            let replacement = fixture.replacement();
+            fixture
+                .apply_replacement(&replacement, 2_000)
+                .expect("replacement");
+            let before = fixture.profile.clone();
+            assert_eq!(
+                fixture.apply_replacement(&replacement, 2_001),
+                Ok(InstallOutcome::AlreadyPresent)
+            );
+            assert_eq!(fixture.profile, before);
+            let mut different = replacement;
+            different.effective_at += 1;
+            let different = different
+                .sign(&fixture.next.private, &fixture.ca.private)
+                .expect("different signed replacement");
+            assert!(matches!(
+                fixture.apply_replacement(&different, 2_001),
+                Err(CertificateError::GenerationRollback {
+                    current: 4,
+                    proposed: 3
+                })
+            ));
+            assert_eq!(fixture.profile, before);
+        }
+
+        #[test]
+        fn either_invalid_emergency_signature_preserves_the_existing_rotation() {
+            let mut fixture = Fixture::new();
+            let transition = fixture.transition();
+            fixture
+                .apply_transition(&transition)
+                .expect("planned rotation");
+            let signed = fixture.replacement();
+            let before = fixture.profile.clone();
+            for signature in 0..2 {
+                let mut broken = signed.clone();
+                if signature == 0 {
+                    broken.next_service_key_signature = MlDsa87Signature::placeholder();
+                } else {
+                    broken.ca_pq_signature = MlDsa87Signature::placeholder();
+                }
+                assert!(matches!(
+                    fixture.apply_replacement(&broken, 2_000),
+                    Err(CertificateError::InvalidSignature)
+                ));
+                assert_eq!(fixture.profile, before);
+            }
+        }
+
+        #[test]
+        fn an_emergency_replacement_cannot_reinstall_a_revoked_successor() {
+            let mut fixture = Fixture::new();
+            let replacement = fixture.replacement();
+            let mut ledger = TrustLedger::default();
+            ledger
+                .remember(
+                    RevocationTombstone {
+                        scope: RevocationScope::Gateway,
+                        family: RevokedFamily::Pq,
+                        fingerprint: replacement.next_service_key_fingerprint,
+                        revocation_epoch: 2,
+                        expires_at: 10_000,
+                        revocation_fingerprint: None,
+                    },
+                    1_000,
+                )
+                .expect("revocation");
+            let before = fixture.profile.clone();
+            let ledger_before = ledger.clone();
+            assert!(matches!(
+                fixture.profile.apply_emergency_replacement(
+                    &replacement,
+                    &fixture.ca.public,
+                    &replacement.trust_domain_id,
+                    1,
+                    &ledger,
+                    2_000
+                ),
+                Err(CertificateError::Revoked)
+            ));
+            assert_eq!(fixture.profile, before);
+            assert_eq!(ledger, ledger_before);
+        }
+
+        #[test]
+        fn an_emergency_replacement_must_advance_its_own_revocation_counter() {
+            let mut fixture = Fixture::new();
+            for proposed in [1, 2, 4] {
+                let mut replacement = fixture.replacement();
+                replacement.revocation_epoch = proposed;
+                let replacement = replacement
+                    .sign(&fixture.next.private, &fixture.ca.private)
+                    .expect("signed counter decision");
+                let before = fixture.profile.clone();
+                let expected = match proposed {
+                    1 => CertificateError::GenerationRollback {
+                        current: 2,
+                        proposed,
+                    },
+                    2 => CertificateError::GenerationConflict { generation: 2 },
+                    _ => CertificateError::GenerationSkipped {
+                        current: 2,
+                        proposed,
+                        expected: 3,
+                    },
+                };
+                assert_eq!(
+                    fixture.apply_replacement(&replacement, 2_000),
+                    Err(expected)
+                );
+                assert_eq!(fixture.profile, before);
+            }
+        }
+    }
+}
