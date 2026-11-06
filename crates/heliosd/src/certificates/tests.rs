@@ -882,6 +882,30 @@ fn the_domain_view_counts_the_fragments_a_peer_has_not_collected() {
     assert_eq!(pending_after(3), 0);
 }
 
+/// A resume compares these with its journal: without them a CA-TLS rotation has
+/// no way to tell it is on the gateway, or already promoted.
+#[test]
+fn the_domain_view_names_both_client_tls_anchors() {
+    let mut state = state();
+    let active = state
+        .client_tls_ca
+        .active_client_tls_ca_certificate
+        .fingerprint();
+    let view = domain_view(&state, 0);
+    assert_eq!(view.client_tls_ca_fingerprint, active.to_hex());
+    assert_eq!(view.next_client_tls_ca_fingerprint, None);
+
+    let next =
+        aether::certificates::encoding::DerCertificate::new(vec![0x30, 0x03, 0x02, 0x01, 0x00])
+            .expect("certificate");
+    state.client_tls_ca.next_client_tls_ca_certificate = Some(next.clone());
+    let view = domain_view(&state, 0);
+    assert_eq!(
+        view.next_client_tls_ca_fingerprint,
+        Some(next.fingerprint().to_hex())
+    );
+}
+
 /// The operator read carries no certificate body, and no key.
 ///
 /// It is served on the admin surface, so nothing here is secret — but a

@@ -616,6 +616,7 @@ impl AstraRenewalRelay {
                 match status.as_u16() {
                     400 => TrustUpdateRefusal::Protocol,
                     403 => TrustUpdateRefusal::Rejected,
+                    409 => TrustUpdateRefusal::Conflict,
                     429 => TrustUpdateRefusal::Throttled,
                     501 | 503 => TrustUpdateRefusal::Unavailable,
                     _ => TrustUpdateRefusal::Internal,
@@ -964,6 +965,18 @@ mod tests {
             ::astra_channel::ChannelError::Status(axum::http::StatusCode::TOO_MANY_REQUESTS),
         );
         assert_eq!(refusal, TrustUpdateRefusal::Throttled);
+    }
+
+    /// A copy held back is relayed as such: `Internal` would have Orion show a
+    /// gateway fault for what passes at the next attempt.
+    #[test]
+    fn relayed_409_is_a_conflict_and_not_internal() {
+        use helios_api::certificates::TrustUpdateRefusal;
+        let refusal = AstraRenewalRelay::refuse(
+            "operator-vault-copy",
+            ::astra_channel::ChannelError::Status(axum::http::StatusCode::CONFLICT),
+        );
+        assert_eq!(refusal, TrustUpdateRefusal::Conflict);
     }
 
     /// A gateway with no channel document is a gateway without an authority,

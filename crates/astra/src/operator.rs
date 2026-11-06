@@ -50,7 +50,7 @@ use axum::{
     Json, Router,
 };
 
-use crate::door::{DoorConnector, DoorOutcome, DoorRequest};
+use crate::door::{DoorConnector, DoorOutcome, DoorRefusal, DoorRequest};
 use crate::service::{
     operator_encrypted_vault, operator_operation, operator_signer_request, operator_signer_result,
     AstraService, ServiceError,
@@ -418,6 +418,12 @@ async fn vault_copy(
                 "the door answered a vault copy with something other than a copy"
             );
             refuse(&operator, "vault-copy", ServiceError::Internal)
+        }
+        // The two refusals a later attempt can pass, told apart from the
+        // indistinct one because the sender retries them. This route answers
+        // only an administrator, who already reads those operations in `pending`.
+        Err(DoorRefusal::AlreadyOpen { .. } | DoorRefusal::CredentialsDuringRotation) => {
+            refuse(&operator, "vault-copy", ServiceError::HeldBack)
         }
         Err(refusal) => refuse(&operator, "vault-copy", refusal.class()),
     }

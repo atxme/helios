@@ -168,42 +168,6 @@ pub struct RelayedOperatorOpen {
     pub request: OperatorOpenRequest,
 }
 
-/// What an administrator sends to replace Astra's vault copy (spec §5.9).
-///
-/// The vault stays encrypted: this carries bytes neither the gateway nor Astra
-/// can open. The credential document, when present, is signed under `CA-PQ`
-/// and Astra verifies it itself before taking it.
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct OperatorVaultCopy {
-    pub vault_base64: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub credentials: Option<Box<aether::certificates::approval::CredentialRegistry>>,
-}
-
-/// Prints what the copy is made of and never its content: the vault is the
-/// field a `{:?}` in a log would otherwise carry whole.
-impl std::fmt::Debug for OperatorVaultCopy {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("OperatorVaultCopy")
-            .field("vault_base64_chars", &self.vault_base64.len())
-            .field("credentials", &self.credentials.is_some())
-            .finish()
-    }
-}
-
-/// What Astra holds after a vault copy, for Orion to read back.
-///
-/// `credential_registry_epoch` has the meaning it has in
-/// [`OperatorAuthorityStatus`]: `None` when no document is served.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct OperatorVaultCopied {
-    pub fingerprint: Fingerprint,
-    pub credential_registry_epoch: Option<u64>,
-}
-
 /// What the gateway relays for a vault copy: the administrator it resolved,
 /// for the structured log, and the copy.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -213,11 +177,12 @@ pub struct RelayedOperatorVaultCopy {
     pub copy: OperatorVaultCopy,
 }
 
-/// The two operator shapes both ends parse, defined once in `aether`.
+/// The operator shapes both ends parse, defined once in `aether`.
 pub use aether::certificates::transport::{
     OperatorAuthorityStatus, OperatorIssuerStatus, OperatorOpenAction, OperatorOpenRequest,
     OperatorOpened, OperatorPendingList, OperatorPendingOperation, OperatorSignerRequestResponse,
-    RevocationExpiries, SigningOperationState, SigningOperationView,
+    OperatorVaultCopied, OperatorVaultCopy, RevocationExpiries, SigningOperationState,
+    SigningOperationView,
 };
 
 /// The name the gateway puts in SNI when it dials Astra.

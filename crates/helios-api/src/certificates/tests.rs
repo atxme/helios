@@ -219,7 +219,10 @@ impl OperatorCampaignRelay for SpyCampaign {
         _copy: astra_channel::OperatorVaultCopy,
     ) -> Result<astra_channel::OperatorVaultCopied, TrustUpdateRefusal> {
         *self.seen.lock().unwrap() = Some(operator.clone());
-        Err(TrustUpdateRefusal::Rejected)
+        match self.answer {
+            Err(refusal) => Err(refusal),
+            Ok(_) => Err(TrustUpdateRefusal::Rejected),
+        }
     }
 
     async fn open(
@@ -699,6 +702,26 @@ async fn a_body_the_api_cannot_use_never_reaches_the_state_machine() {
         StatusCode::PAYLOAD_TOO_LARGE
     );
     assert!(handler.seen.lock().unwrap().is_none());
+}
+
+/// Held back by a live operation is `409` to the sender, who retries it, and not
+/// the `403` of a copy that will never pass.
+#[tokio::test]
+async fn a_vault_copy_held_back_answers_a_conflict() {
+    let relay = Arc::new(SpyCampaign {
+        answer: Err(TrustUpdateRefusal::Conflict),
+        seen: Mutex::new(None),
+        opened: Mutex::new(None),
+    });
+    let state = state_with(None).with_operator_campaign(Arc::clone(&relay) as Arc<_>);
+    let response = operator_vault_copy(
+        State(state),
+        Extension(operator_caller_at(true)),
+        Bytes::from_static(br#"{"vault_base64":"e30="}"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert!(relay.seen.lock().unwrap().is_some());
 }
 
 #[tokio::test]

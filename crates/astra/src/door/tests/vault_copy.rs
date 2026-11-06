@@ -459,6 +459,84 @@ async fn an_approved_vault_operation_does_not_hold_a_replacement_back() {
         .expect("the post-rotation copy passes");
 }
 
+/// Held back answers `409` and not the indistinct `403`: the sender retries this
+/// one, and the same administrator can already read the operation in `pending`.
+#[tokio::test]
+async fn the_private_route_says_a_copy_is_held_back_by_a_live_operation() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture(dir.path());
+    *service.encrypted_vault.write().expect("vault lock") =
+        Some(Arc::new(vault_of(DOMAIN, "held")));
+    // On the real clock, which is the one the route reads.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+    opened(
+        service
+            .door(
+                tunnel(),
+                DoorRequest::TrustAuthorities { text: text() },
+                now,
+            )
+            .await,
+    );
+    let listener = listen(Arc::clone(&service)).await;
+
+    let (status, _) = post_to(
+        &listener,
+        OPERATOR_VAULT_COPY_ROUTE,
+        &relayed_copy(&vault_of(DOMAIN, "later")),
+    )
+    .await;
+    assert_eq!(status, 409);
+    assert_eq!(on_disk(&service, VAULT_FILE), None);
+}
+
+/// A document refused for the duration of a rotation passes after it: `409` as
+/// well. One refused for what it is stays the indistinct `403`.
+#[tokio::test]
+async fn the_private_route_says_credentials_wait_for_the_rotation() {
+    use crate::registry::CaPqRotation;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (service, ca_private) = build_service_with_ca(dir.path(), None, None);
+    let service = Arc::new(service);
+    let relayed = |signer: &[u8]| {
+        serde_json::to_vec(&RelayedOperatorVaultCopy {
+            operator: OperatorIdentity::WireGuard {
+                public_key: tunnel_key(),
+            },
+            copy: OperatorVaultCopy {
+                vault_base64: base64::engine::general_purpose::STANDARD
+                    .encode(vault_of(DOMAIN, "with document")),
+                credentials: Some(credentials_at(signer, 2)),
+            },
+        })
+        .expect("relayed copy")
+    };
+    let listener = listen(Arc::clone(&service)).await;
+
+    let (forger, next) = generate_ml_dsa_87_keypair().expect("next CA-PQ");
+    let (status, _) = post_to(&listener, OPERATOR_VAULT_COPY_ROUTE, &relayed(&forger)).await;
+    assert_eq!(
+        status, 403,
+        "a document that does not verify will never pass"
+    );
+
+    rewrite_registry(&service, |state| {
+        state.ca_rotation = Some(CaPqRotation {
+            next_ca_epoch: 2,
+            next_ca_public_key: next,
+            activation_at: NOW,
+            retire_active_at: NOW + 10,
+        });
+    })
+    .await;
+    let (status, _) = post_to(&listener, OPERATOR_VAULT_COPY_ROUTE, &relayed(&ca_private)).await;
+    assert_eq!(status, 409);
+}
+
 #[tokio::test]
 async fn credentials_are_refused_while_a_promotion_document_is_pending() {
     let dir = tempfile::tempdir().expect("temp dir");

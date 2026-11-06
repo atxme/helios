@@ -786,6 +786,10 @@ pub enum TrustUpdateRefusal {
     /// The authority holds as many live operations as it accepts. Retrying
     /// later is the right advice, and unlike `Unavailable` it says why.
     Throttled,
+    /// A live operation or rotation holds this back, and the same request can
+    /// pass once it is over. Answered only where the caller can already read
+    /// that operation: this is no oracle on anyone else's state.
+    Conflict,
     /// The gateway failed on its own side.
     Internal,
 }
@@ -1303,6 +1307,42 @@ pub struct OperatorIssuerStatus {
     pub ca_epoch: u64,
     pub ca_tls_epoch: u64,
     pub not_after: u64,
+}
+
+/// What an administrator sends to replace Astra's vault copy (spec §5.9).
+///
+/// The vault stays encrypted: this carries bytes neither the gateway nor Astra
+/// can open. The credential document, when present, is signed under `CA-PQ`
+/// and Astra verifies it itself before taking it.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorVaultCopy {
+    pub vault_base64: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credentials: Option<Box<crate::certificates::approval::CredentialRegistry>>,
+}
+
+/// Prints what the copy is made of and never its content: the vault is the
+/// field a `{:?}` in a log would otherwise carry whole.
+impl std::fmt::Debug for OperatorVaultCopy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OperatorVaultCopy")
+            .field("vault_base64_chars", &self.vault_base64.len())
+            .field("credentials", &self.credentials.is_some())
+            .finish()
+    }
+}
+
+/// What Astra holds after a vault copy, for Orion to read back.
+///
+/// `credential_registry_epoch` has the meaning it has in
+/// [`OperatorAuthorityStatus`]: `None` when no document is served.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorVaultCopied {
+    pub fingerprint: Fingerprint,
+    pub credential_registry_epoch: Option<u64>,
 }
 
 /// Everything waiting for an operator, at one instant.

@@ -111,6 +111,7 @@ fn every_refusal_maps_to_one_bounded_status() {
         (ServiceError::Protocol, StatusCode::BAD_REQUEST),
         (ServiceError::Refused, StatusCode::FORBIDDEN),
         (ServiceError::Throttled, StatusCode::TOO_MANY_REQUESTS),
+        (ServiceError::HeldBack, StatusCode::CONFLICT),
         (
             ServiceError::OperatorCredentialUnavailable,
             StatusCode::NOT_IMPLEMENTED,

@@ -98,6 +98,8 @@ pub enum ServiceError {
     Refused,
     #[error("too many requests from this source")]
     Throttled,
+    #[error("held back by a live operation")]
+    HeldBack,
     #[error(
         "this operation needs the operator approval protocol, whose routes and signing commands \
          are not implemented"
@@ -113,6 +115,7 @@ impl IntoResponse for ServiceError {
             Self::Protocol => StatusCode::BAD_REQUEST,
             Self::Refused => StatusCode::FORBIDDEN,
             Self::Throttled => StatusCode::TOO_MANY_REQUESTS,
+            Self::HeldBack => StatusCode::CONFLICT,
             Self::OperatorCredentialUnavailable => StatusCode::NOT_IMPLEMENTED,
             Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         };

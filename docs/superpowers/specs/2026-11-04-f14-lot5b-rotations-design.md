@@ -239,7 +239,9 @@ ouvre le suivi d'une réparation.
   c'est la gateway qui vérifie, comme par la commande.
 
 Après installation, Orion relit `CertificateDomainView` : l'état affiché vient de la
-gateway, pas de ce qu'Orion croit avoir fait.
+gateway, pas de ce qu'Orion croit avoir fait. La vue gagne pour cela les empreintes
+`client_tls_ca_fingerprint` et `next_client_tls_ca_fingerprint` : sans elles, la reprise ne
+saurait pas qu'une rotation CA TLS est déjà sur la gateway, ou déjà promue.
 
 ### 5.6 Suivis du lot 5a
 
@@ -305,6 +307,10 @@ sert aussi de sauvegarde hors du poste. Astra la lit au démarrage, comme le doc
   supprimé. Orion relit l'empreinte après l'envoi.
 - **Moment** : au prérequis si elle manque ou diffère, puis après chaque rotation, comme dernière
   étape du suivi. Un échec ne remet pas la rotation en cause : la ligne reste « À faire ».
+- **Copie retenue** : une copie retenue par une opération vivante, ou un document de credentials
+  retenu par une rotation, répond `409` et non le `403` indistinct : rien n'est écrit et la même
+  copie passe ensuite. Cette route ne répond qu'à un administrateur, qui lit déjà ces opérations
+  dans `pending`.
 - **Document de credentials** : deux moments distincts.
   - **Rotation CA-PQ** : le nouveau document est signé sous la nouvelle ancre, et Astra le tient déjà
     dans l'objet accepté. Astra l'adopte lui-même à `not_after`, dans la passe qui promeut l'ancre
