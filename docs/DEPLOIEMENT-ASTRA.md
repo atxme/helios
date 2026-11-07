@@ -666,6 +666,13 @@ d'effet qu'au redémarrage suivant, et `up -d` ne recrée pas un service dont
 rien n'a changé : l'étape redémarre donc Astra explicitement, et seulement dans
 ce cas.
 
+Depuis le lot 5b, ce fichier n'est plus qu'un point de départ : après une
+rotation `CA-PQ`, Astra adopte lui-même le nouveau document à `not_after` et le
+rend durable ; après un changement de clé, Orion l'envoie avec la copie du coffre
+et Astra l'adopte en mémoire, hors recouvrement seulement. Aucun redémarrage n'est
+prescrit. Une adoption qui échoue au démarrage est journalisée et réessayée par la
+passe suivante, Astra refusant les approbations entre-temps.
+
 Sans lui, Astra tourne, sert ses statuts et tient son canal — et refuse chaque
 renouvellement ordinaire en le disant. C'est ce à quoi une installation
 incomplète doit ressembler.
@@ -677,6 +684,16 @@ que le compagnon **ouvre** le coffre. Il le télécharge par
 `GET /v1/vaults/<empreinte>`, sous un jeton de capacité, et Astra ne peut le
 servir que s'il en détient une copie : `/var/lib/astra/authority-vault.json`.
 
+**Depuis le lot 5b de F14, Orion l'envoie à votre place** : sur un poste
+administrateur du tunnel, le prérequis « Copie du coffre » de l'onglet
+*Astra* › *Rotations* est rouge (« Absente » ou « Ancienne ») tant qu'Astra ne
+tient pas le coffre du poste, et le bouton « Envoyer » la dépose par le tunnel,
+sans clé et sans redémarrage. Orion la renvoie aussi après chaque rotation. Astra
+l'écrit de façon atomique sous le verrou du volume, garde la copie précédente
+et ne lit du coffre que son domaine : il ne peut pas l'ouvrir. La copie est
+bornée à 128 Kio. C'est le chemin par défaut ; la procédure ci-dessous est le
+**recours** (gateway hors d'atteinte du tunnel, premier amorçage).
+
 Le déploiement ne la fait pas à votre place, et c'est délibéré. Le coffre
 contient `CA-PQ` — chiffré, inouvrable sans deux clés de sécurité, mais c'est
 le seul fichier du domaine dont la perte ou la fuite compte vraiment. Le poser
@@ -684,7 +701,7 @@ sur la gateway est une décision d'exploitation : elle donne une sauvegarde hors
 du poste opérateur, et elle met le fichier là où tourne le service. Les deux
 sont défendables ; aucune n'est un défaut à choisir dans un script.
 
-Copier. Le contexte de compose est celui que `deploy.sh` dépose, et son
+Copier (recours). Le contexte de compose est celui que `deploy.sh` dépose, et son
 `.env` est le témoin durable — les mêmes que toutes les autres commandes de
 cette page :
 
@@ -698,10 +715,11 @@ ssh cible "cd ~/astra-build && sudo docker compose -f deploy/astra/compose.yaml 
 ssh cible 'rm -f /tmp/vault.json'
 ```
 
-Il est lu au démarrage, comme le document de credentials, et pour la même
-raison : ce sont des octets qu'Astra transporte, jamais qu'il interprète. La
-porte vérifie sa présence sur cette copie de démarrage : un coffre copié dans
-un service déjà en marche n'existe pour elle qu'après le redémarrage.
+Par cette procédure il est lu au démarrage, comme le document de credentials, et
+pour la même raison : ce sont des octets qu'Astra transporte, jamais qu'il
+interprète. Un coffre copié ainsi dans un service déjà en marche n'existe pour la
+porte qu'après le redémarrage, ce qui est précisément ce que la route d'Orion
+évite : elle remplace la valeur en mémoire en même temps que le fichier.
 Son empreinte apparaît au journal de démarrage — c'est elle que la demande
 signée nomme, et que le compagnon compare avant d'ouvrir quoi que ce soit.
 
@@ -714,6 +732,12 @@ Sans lui, Astra tourne et refuse chaque renouvellement ordinaire en le disant :
 il ne détient aucune clé autorisée à émettre. `CA-PQ` ne quitte jamais le
 coffre, donc la délégation se signe sur le poste opérateur, à la clé de
 sécurité, et fait un aller-retour.
+
+**Depuis le lot 5b, Orion renouvelle la délégation** : ligne « Renouveler la
+délégation » de l'onglet *Rotations*, qui ouvre la campagne par le tunnel, reçoit
+la demande dans la réponse (sans fichier), fait approuver par une clé, dépose la
+délégation, et **Astra l'adopte sans redémarrer**. Les trois commandes
+ci-dessous sont le recours.
 
 Trois commandes, dans cet ordre :
 
@@ -739,9 +763,10 @@ astra-signer authorize-issuer --request delegation-request.json \
     --authority-url https://astra.example --operation-id <identifiant> \
     --days 30 --leaf-days 90
 
-# 3. Astra a enregistré la délégation ; il reste à le redémarrer.
-ssh <gateway> "cd ~/astra-build && sudo docker compose -f deploy/astra/compose.yaml \
-    --env-file /var/lib/helios/astra-compose.env restart astra"
+# 3. Astra en marche a enregistré la délégation et l'adopte seul, sans
+#    redémarrage. Si l'adoption échoue, son journal le dit et l'émetteur
+#    précédent reste servi. Un `astra issuer install` fait service arrêté
+#    s'adopte au démarrage suivant.
 ```
 
 La demande sort sur la **sortie standard** — d'où le `>` de l'étape 1 — et
@@ -761,7 +786,8 @@ satisfait les trois est une délégation avec laquelle cette autorité peut
 réellement émettre ; l'alternative est d'annoncer une délégation dont le
 premier usage échoue à 80 % de la vie d'une feuille cliente.
 
-La délégation est lue **au démarrage**, d'où le redémarrage explicite.
+Astra en marche adopte la délégation à son enregistrement ; arrêté, il la lit
+**au démarrage**. Aucun redémarrage explicite n'est plus à faire.
 
 ### Ce qui fait qu'une feuille renouvelée se connecte encore
 

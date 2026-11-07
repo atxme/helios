@@ -266,9 +266,11 @@ pub(crate) enum Command {
         out: Option<PathBuf>,
         /// API de la gateway **dans** WireGuard, p. ex. http://100.64.0.1:8080.
         ///
-        /// C'est le chemin que l'IHM Orion lance (§12.2), et il suppose que ce
-        /// compagnon tourne sur la machine du client : les routes de
-        /// renouvellement authentifient le pair par sa VIP source.
+        /// Orion ne lance plus cet outil : sa cérémonie tourne dans l'IHM
+        /// (§12.2). Ce transport reste pour un opérateur qui préfère la ligne
+        /// de commande, et suppose que cet outil tourne sur la machine du
+        /// client : les routes de renouvellement authentifient le pair par sa
+        /// VIP source.
         #[arg(long, requires = "operation_id")]
         heliosd_url: Option<String>,
         /// Opération à approuver, 32 caractères hexadécimaux.
@@ -532,8 +534,10 @@ pub(crate) enum Command {
     /// `ca_tls_epoch` à l'identique et ne l'avance qu'à `not_after`. Appelée
     /// trop tôt, la commande n'écrit rien et dit quelle seconde elle attend.
     ///
-    /// Limite connue : rien ne la lance à `not_after`. Le compagnon attend
-    /// l'opérateur, et émet sous l'ancienne époque jusque-là.
+    /// Limite connue : rien ne la lance à `not_after`. Cet outil attend
+    /// l'opérateur, et émet sous l'ancienne époque jusque-là. Orion affiche
+    /// « Terminer la rotation CA TLS » dès `not_after`, à l'ouverture de son
+    /// onglet : c'est son rappel, et le recours de cette commande.
     PromoteCaTls,
     /// Signe l'annulation d'une transition gateway en attente (§6.3).
     ///

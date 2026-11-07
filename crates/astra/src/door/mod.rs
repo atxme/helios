@@ -502,6 +502,10 @@ impl DoorRefusal {
     /// A malformed text is the caller's own input and says nothing about the
     /// domain; a full store is a budget. Every decision about the domain —
     /// policy, uniqueness, targets, vault — is the same indistinct refusal.
+    /// The one exception is not decided here: `POST /operator/vault-copy`
+    /// answers `409` for `AlreadyOpen` and `CredentialsDuringRotation`, because
+    /// the sender retries them and only an administrator reaches that route
+    /// (spec §8.5.4).
     pub fn class(&self) -> ServiceError {
         match self {
             Self::TextMissing

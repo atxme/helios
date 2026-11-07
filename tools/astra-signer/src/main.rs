@@ -52,8 +52,9 @@
 //! `approve` sait désormais travailler **dans le tunnel** du client :
 //! `--heliosd-url` et `--operation-id` remplacent `--request` et `--out`, et le
 //! compagnon récupère la demande puis dépose son assertion par les routes
-//! typées de `helios-api` (§8.1.2). C'est le chemin que l'IHM Orion lance, et
-//! il tient debout parce que le compagnon tourne sur la machine du client : ces
+//! typées de `helios-api` (§8.1.2). Orion ne lance plus cet outil (sa cérémonie
+//! tourne dans l'IHM, §12.2) : ce chemin est un recours en ligne de commande, et
+//! il tient debout parce que l'outil tourne sur la machine du client : ces
 //! routes authentifient le pair par sa VIP source, pas par un jeton porteur.
 //!
 //! Le transport ne décide de rien. La demande récupérée est signée par la clé

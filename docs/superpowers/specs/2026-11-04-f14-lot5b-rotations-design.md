@@ -4,6 +4,8 @@ Date : 4 novembre 2026. Branche `feat/f14-lot5b-rotations`, depuis `main`
 b3db983. Deuxième des trois sous-lots du lot 5 de F14 (5a porte unique, livré ;
 5b rotations ; 5c révocation d'un poste).
 
+*Amendé le 7 novembre 2026 : le §10 corrige ce que le code livré a changé (recouvrement CA-PQ, ancre entrante, table de reprise, copie du coffre, limites connues).*
+
 ## 1. Intention
 
 L'opérateur ne fait pas ses rotations lui-même : les commandes sont
@@ -391,3 +393,172 @@ adoption du document de credentials par Astra à `not_after` ; « Délai dépass
 qu'un redémarrage par Orion ; route de lecture unique `operator/status` ; copie précédente gardée
 sur la gateway, sans historique plus long ; document de credentials envoyé avec le coffre après
 un changement de clé.
+
+## 10. Amendement du 7 novembre 2026 : ce que le code livré a changé
+
+Écrit à la clôture du lot, après relecture du code livré. Le texte ci-dessus
+reste celui du 4 novembre 2026, pour que l'on voie ce qui a été décidé avant et
+ce que la construction a corrigé. **Là où ce § 10 et les §§ 1 à 9 diffèrent, le
+§ 10 dit ce qu'Orion et Astra font.**
+
+### 10.1 Recouvrement CA-PQ : plus aucune approbation sous le document local (renverse le §5.1)
+
+Le §5.1 écrivait « Renouveler les postes reste possible » pendant un
+recouvrement CA-PQ, et le §5.9 le subordonnait à un test de bout en bout.
+Ce test a eu lieu, côté Astra, et le résultat est négatif : **pendant un
+recouvrement CA-PQ, Astra refuse après le toucher toute approbation faite sous
+le document de credentials local**. La liaison d'un credential couvre
+`ca_epoch`, l'époque du registre et la signature `CA-PQ` du document ; le coffre
+local est déjà sous la nouvelle ancre, alors qu'Astra garde l'ancien document
+jusqu'à `not_after` (§5.9).
+
+Conséquence, construite au lot : pendant un recouvrement CA-PQ
+(`next_ca_fingerprint` renseigné), Orion **désactive, avec la raison affichée**,
+« Renouveler les postes », chaque lancement de l'onglet *Approbations*, la
+récupération et la délégation (déjà désactivée par le §5.8). Une rotation CA TLS
+n'est pas bloquée par cette garde : le code lit qu'elle ne re-signe pas le
+document de credentials (lu, non exercé par un test). Cette garde ne couvre que
+le recouvrement CA-PQ.
+
+Le renouvellement d'un client **par le moteur d'Orion** (la feuille cliente à
+80 %, §1 de `RENOUVELLEMENT-CERTIFICATS.md`) se lit comme toujours possible :
+un test côté Orion le couvre, la partie Astra n'est pas exercée.
+
+### 10.2 L'ancre entrante ne se montre pas au toucher
+
+Le §5.1 (étape 3) gardait « l'empreinte de la CA-PQ entrante » parmi ce que
+l'opérateur lit avant d'approuver. Elle n'existe pas avant la signature :
+l'ancre est créée par la cérémonie. Orion la montre **juste après la
+signature**, puis **sur la ligne « Remplacer la CA-PQ » pendant tout le
+recouvrement** (« Ancre entrante … »). Ce que l'opérateur approuve au toucher,
+c'est la campagne, et la clé la lie ; c'est la signature `CA-PQ` qui lie
+l'ancre. C'est la situation de la commande `astra-signer rotate-ca-pq`. Le
+contrôle du §9.1 de la spécification (comparer l'empreinte affichée à celle
+que l'on a créée) se fait donc après la signature, pas avant.
+
+### 10.3 Table de reprise du §5.4, telle que livrée
+
+| État du journal | Reprise | Clé ? |
+| --- | --- | --- |
+| Signé, campagne vivante, dépôt non refusé | rejoue le même dépôt (`Deposit`) | non |
+| Signé, campagne morte ou dépôt refusé | lit Astra (`ReadAuthority`) ; si Astra tient l'ancre du journal, `ApplyLocal` ; sinon `Discard` ou `DomainConflict` selon la règle d'abandon ci-dessous | non |
+| Accepté **avec** dépôt | applique le coffre, les credentials et le relais (`ApplyLocal`) | non |
+| Accepté **sans** dépôt (journal CA-PQ ancien, adopté d'`astra-signer`) | **lit Astra d'abord** : ce journal n'est pas la preuve d'une acceptation. L'ancre courante ou suivante d'Astra égale à celle du journal donne `ApplyLocal`, toute autre `DomainConflict`, et rien ne bouge | non |
+| Appliqué | lit la gateway (`ReadGateway`) ; installe, ou `SendVaultCopy` si elle tient déjà l'ancre ; `GatewayOutdated` si elle ne nomme aucune ancre de ce type ; `InstallDeadlinePassed` si `activation_at` est passé | non |
+| Installé | envoie la copie du coffre | non |
+
+- **`ReadGateway`** : la gateway n'a pas encore été interrogée ; la lecture
+  précède toute décision.
+- **`GatewayOutdated`** : la gateway ne nomme aucune ancre de ce type. Ce n'est
+  jamais le délai dépassé : une gateway plus ancienne que les nouveaux champs
+  afficherait sinon un faux blocage. Rien n'est effacé, le même journal reprend
+  une fois la gateway mise à jour. Pour une CA TLS, une gateway à jour sans
+  CA TLS configurée se lit pareil ; le libellé ne donne donc pas la mise à jour
+  comme seule cause.
+- **Abandon** : un journal Signé n'est effacé (`Discard`) que si **l'ancre
+  courante de l'autorité égale l'ancre sortante de la transition** et qu'aucune
+  rotation n'est en cours. Toute autre situation est `DomainConflict` : l'autorité
+  d'un autre domaine, ou qui a pu accepter puis promouvoir, ne dit rien d'une
+  rotation que ce poste peut oublier. L'effacement est irréversible, d'où la
+  règle.
+- **Adoption d'un enregistrement d'`astra-signer`** : un enregistrement préparé
+  n'est adopté qu'une fois (marqueur posé après l'enregistrement du journal), et
+  l'adoption d'un coffre ancien exige que ses identifiants de credentials
+  correspondent à ceux du coffre en place. Les gestes sur les clés et les
+  renommages sont refusés tant qu'un coffre scellé attend d'écraser celui en
+  place.
+
+### 10.4 Reprise automatique : où et quand
+
+- La reprise démarre à la montée du tunnel (§5.4), **seulement si la gateway du
+  profil connecté est celle du domaine du journal** : Orion compare la clé
+  WireGuard de la gateway portée par le relais à celle du pair connecté, avant
+  toute reprise automatique ou manuelle. Orion tient plusieurs profils et un
+  seul emplacement de coffre ; sur le profil d'un autre domaine, la reprise
+  attend le bon profil.
+- **Derrière l'écran terminé de l'opérateur lui-même**, une reprise attend que
+  cet écran soit fermé : un seul clic, sans clé. Un front « tunnel monté » qui
+  rencontre une session encore en cours attend sa fin, puis regarde une fois ;
+  la fermeture de l'écran et le choix d'un emplacement de coffre regardent
+  aussi une fois. Il n'y a ni boucle ni tâche de fond.
+- Une opération annoncée par un journal en cours s'affiche même sans session
+  vivante, avec sa date limite.
+
+### 10.5 Copie du coffre : 128 Kio, et le `409`
+
+- La borne d'une copie est de **128 Kio**, ce que la route de téléchargement
+  porte (`MAX_OPERATOR_ANSWER_BYTES`), et non 256 Kio : une copie plus grosse
+  n'aurait pas pu être téléchargée et aurait cassé chaque cérémonie suivante.
+  La route d'écriture a sa propre borne de corps, au-dessus de celle des autres
+  routes opérateur (64 Kio), pour le base64.
+- **Une copie différente est refusée par un `409`** tant qu'une opération en
+  attente de l'opérateur nomme un coffre : la copie ferait de son téléchargement
+  une erreur pendant cinq minutes. Une copie identique passe. Un document de
+  credentials joint pendant une rotation en cours (ou une promotion en attente)
+  est refusé en `409` aussi, puisqu'un nouvel essai passera ; une époque plus
+  ancienne que celle servie reste le `403` indistinct. La phrase de la porte
+  reste dans le journal d'Astra.
+- Astra vérifie le document de credentials joint à une copie sous son ancre
+  courante avant de l'adopter : un administrateur du tunnel ne peut pas
+  installer une liste d'autorisations forgée.
+
+### 10.6 Document de credentials et adoption
+
+- **Rotation CA-PQ** : Astra tient le nouveau document dans l'objet accepté et
+  l'adopte lui-même **à `not_after`**, dans la passe qui promeut l'ancre
+  (§5.9). Une adoption qui échoue au démarrage est journalisée et ignorée : si
+  le fichier reste signé sous l'ancre sortante, Astra démarre sans credentials
+  et la passe suivante réessaie ; les approbations sont refusées entre-temps, et
+  l'état est visible.
+- `advance` envoie la copie du coffre **sans** document de credentials ; l'envoi
+  manuel joint les credentials locaux seulement s'ils sont plus récents que
+  l'époque servie (ou si aucune n'est servie), et retente avec le seul coffre
+  sur une réponse « retenue ».
+- Hors recouvrement, un changement de clé envoie le document avec la copie (§5.9).
+
+### 10.7 Écran et libellés
+
+- « Terminer la rotation CA TLS » reste visible depuis `not_after`.
+- Une délégation ouverte ne se reprend pas : sa demande n'existait que dans la
+  réponse d'ouverture. L'écran montre « Opération ouverte jusqu'au … » et la
+  réouverture est possible une fois la fenêtre close (300 s au plus).
+- Une opération `trust_authorities` vivante garde « Reprendre » sur les deux
+  lignes « Remplacer » : la campagne couvre les deux autorités, la signature
+  `CA-PQ` dit laquelle.
+- L'expiration de la CA TLS vient du certificat public actif du coffre s'il se
+  lit sans l'ouvrir ; sinon la ligne n'affiche que l'époque et l'empreinte.
+- « Expire bientôt » vaut 30 jours, en une constante.
+- Les clés approuvantes s'affichent avec leur état (validée, a approuvé).
+
+### 10.8 Limites connues à la livraison
+
+Reprises dans `RENOUVELLEMENT-CERTIFICATS.md` (« Limites connues des rotations
+dans Orion ») et, pour les suivis, dans `ROADMAP.md` (F14-a à F14-f).
+
+- **« Délai dépassé » n'a pas de réparation** (§5.4, inchangé).
+- **De `Applied` à `not_after` (37 jours au plus par défaut), la révocation
+  d'urgence est impossible** : la clé sortante a quitté le coffre alors qu'Astra
+  vérifie encore sous elle. Existant dans la commande ; à lever avec le lot 5c.
+- **Les campagnes de parc ne portent aucune signature de CA.** Garder
+  l'ancien document pour les approbations rétablirait « Renouveler les postes »
+  pendant un recouvrement : décision de conception, non prise.
+- **Un dialogue de clé de la plateforme qui ne revient jamais** n'a pas de
+  borne sur les ouvertures gardées en mémoire (`pCancellationId` est nul dans
+  `webauthn.rs`, les lectures HID n'ont pas de délai) : seul un redémarrage
+  d'Orion y met fin. Rien n'est écrit avant la signature. Un GUID d'annulation
+  fermerait le cas sous Windows.
+- **Le recours en ligne de commande** : la reprise de `astra-signer rotate-ca-pq`
+  déplace le coffre, les credentials et le relais sans parole d'Astra, par le
+  geste voulu de l'opérateur (exception à « le coffre ne bouge qu'après
+  l'acceptation »). Son successeur, quand F14 absorbe `astra-signer` au lot 7,
+  reste à nommer.
+- **Copie du coffre** : un administrateur du tunnel peut la remplacer ; une
+  génération précédente est gardée ; une sauvegarde hors de la gateway n'est pas
+  couverte. Deux postes tenant un même domaine peuvent écraser une copie plus
+  récente d'Astra, seul le domaine étant contrôlé. `write_domain_relay` n'est
+  pas couvert par la garde d'écrasement.
+- **De `not_after` à la re-délégation**, l'émission en ligne est refusée (§5.8).
+- Une écriture qui échoue après son renommage, suivie de la mort de la
+  campagne avant un rejeu, efface le journal alors que le fichier d'Astra tient
+  l'ancre ; cela demande un échec de synchronisation du dossier et aucun rejeu
+  en 300 s, sur un volume déjà défaillant. La réparation est manuelle.

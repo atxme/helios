@@ -935,7 +935,9 @@ enrôlée dans le coffre d'essai.
     clé** : deux dialogues Windows, et une autre clé présentée au second est
     refusée (`KeyDeclined`). Fin : « Délégation enregistrée par Astra. Redémarrer
     Astra pour qu'il émette sous elle. » Redémarrer Astra et constater qu'il émet
-    sous la nouvelle délégation. Refus à constater **sans aucun dialogue** : une
+    sous la nouvelle délégation. *(Texte du lot 4 ; depuis le lot 5b, Astra
+    adopte la délégation sans redémarrage et le message n'existe plus : voir
+    l'étape 49.)* Refus à constater **sans aucun dialogue** : une
     demande modifiée (« La campagne ne nomme pas cette demande… »), un fichier
     illisible, une CA-TLS expirée ou proche de l'expiration (« La CA-TLS du
     domaine expire avant la fin de cette délégation… »). Le refus d'une campagne d'une
@@ -1027,6 +1029,143 @@ astra_exec='sudo docker compose -f deploy/astra/compose.yaml
     dans un conteneur jetable écrit localement et réussit ; `astra status`,
     service arrêté, lit le registre sans le modifier (la date de modification
     de `registry.json` ne bouge pas).
+
+**G. Lot 5b : les rotations dans Orion**
+
+Rien de ce qui suit ne se valide sous WSL2 : la cérémonie touche de vraies clés,
+le tunnel monte vers une vraie gateway et Astra tourne dans son conteneur. Les
+tests Rust et Vitest couvrent la logique ; **la cible et Windows sont requis**
+pour la recette. Les étapes marquées **[cible seulement]** dépendent de ce que
+WSL2 ne reproduit pas : dialogue WebAuthn de Windows, lecture HID de la clé,
+`flock` du volume d'Astra entre deux conteneurs, coupure réelle du tunnel. Le 5a
+(« F ») n'a pas encore été joué sur cible : le jouer d'abord. Prérequis : la
+gateway et le domaine d'essai de « E » et « F », un poste Orion pair
+**administrateur** du tunnel, **deux clés de sécurité distinctes** enregistrées
+dans le coffre, Astra déployé avec son canal privé, et le `astra_exec` de « F ».
+Chaque étape : action, puis état attendu. Onglet *Astra* › *Rotations*.
+
+41. **Liste et prérequis.** Ouvrir l'onglet. Attendu : les lignes dans l'ordre
+    Terminer, Reprendre (si besoin), Renouveler les postes, Remplacer la CA-PQ,
+    Remplacer la CA TLS, Renouveler la délégation ; une ligne « À faire » passe en
+    tête. Tunnel coupé : « Tunnel connecté » rouge et aucune ouverture possible ;
+    poste non administrateur : « Administrateur du tunnel » rouge ; service Astra
+    arrêté : « Service Astra » rouge (« Démarrer Astra »). « Vérifier » rejoue
+    tout. Aucune campagne n'apparaît dans `pending` tant qu'une ligne est rouge.
+42. **Renouveler les postes.** « Renouveler » › « Approuver ». Attendu : la
+    campagne s'ouvre à ce clic (et non avant), le manifeste vérifié s'affiche, un
+    toucher par clé de la campagne ; les postes couverts qui envoient leur demande
+    dans les 300 s sont renouvelés sans rien redemander. Un second clic ne rouvre
+    pas une deuxième opération (`AlreadyOpen` repris).
+43. **Partir d'une gateway sans copie du coffre.** Retirer
+    `authority-vault.json` du volume d'Astra et redémarrer Astra (essai jetable).
+    Attendu : prérequis « Copie du coffre » rouge, « Absente » ; « Envoyer » le
+    passe au vert sans clé ni redémarrage, et l'empreinte relue est celle du coffre
+    local. Un coffre ancien donne « Ancienne ». **[cible seulement]** (volume réel).
+44. **Remplacer la CA-PQ, de bout en bout.** « Remplacer la CA-PQ ». Attendu :
+    « Clé 1 : à valider » puis « validée » avec son libellé ; « Clé 2 » de même ;
+    « Approuver » ouvre la campagne ; quatre touchers au total (la clé 1 revient
+    après la clé 2) ; l'empreinte de l'ancre **entrante** s'affiche juste après la
+    signature, puis sur la ligne pendant tout le recouvrement. Suivi : signée,
+    déposée, installée sur la gateway, copie du coffre envoyée. **[cible
+    seulement]** (clés réelles, WebAuthn).
+45. **Clé répétée, clé hors du coffre.** À l'étape de validation, toucher deux
+    fois la même clé : refus « Même clé que la clé 1 ». Une clé non enregistrée :
+    refus « Clé absente du coffre ». Dans les deux cas on peut réessayer, et rien n'est
+    ouvert. **[cible seulement]** (clés réelles).
+46. **Recouvrement CA-PQ : gestes désactivés.** Pendant le recouvrement de
+    l'étape 44. Attendu : « Renouveler les postes », chaque lancement de
+    *Approbations*, la récupération et « Renouveler la délégation » sont
+    désactivés, la raison affichée (« Recouvrement CA-PQ en cours ») ; les deux
+    « Remplacer » aussi (une seule rotation de CA à la fois). Le renouvellement
+    d'une feuille cliente par le moteur d'Orion (« Renouveler maintenant » sur un
+    poste) reste à constater : attendu qu'il aboutisse, **non exercé côté Astra**.
+47. **Remplacer la CA TLS.** Même déroulé qu'à l'étape 44 (durée de validité par
+    défaut 1825 jours, derrière « Modifier »). Attendu : la ligne affiche la fin
+    de recouvrement ; la route `client-tls-ca-transition` de la gateway accepte
+    l'objet ; un second essai identique répond `already_present` sans effet.
+48. **Terminer la rotation CA TLS.** À `not_after` (réduire le recouvrement pour
+    l'essai), ouvrir l'onglet. Attendu : « Terminer » en tête, « À faire » ; un
+    toucher d'une clé ; la rotation se referme, le coffre émet sous la nouvelle
+    époque. Rouvrir l'onglet : la ligne a disparu.
+49. **Renouveler la délégation, puis un poste.** Après une rotation (CA-PQ à
+    `not_after`, CA TLS après « Terminer »), la ligne passe « À faire » ; pendant
+    un recouvrement elle est désactivée (« Le coffre a une époque d'avance »).
+    « Renouveler » : une seule clé. Attendu : aucune étape fichier, Astra adopte
+    **sans redémarrage** (journal : « delegation adopted »). Puis renouveler un
+    poste : la feuille est émise sous la nouvelle délégation.
+50. **Couper Orion à chaque étape.** Rotation CA-PQ ; fermer Orion de force
+    (a) après la signature avant le dépôt, (b) après le dépôt, (c) après
+    l'application locale, (d) après l'installation sur la gateway. Rouvrir Orion,
+    tunnel monté. Attendu : la reprise est **automatique et sans clé**, la ligne
+    « Reprendre » (ou le badge) montre la date limite d'installation tant que la
+    gateway n'a pas la transition ; aucune clé n'est redemandée, la rotation va au
+    bout, le coffre en place n'a bougé qu'après l'acceptation d'Astra.
+51. **Coupure du tunnel pendant le dépôt, puis à l'installation.** Couper le
+    tunnel (a) pendant le dépôt, (b) pendant l'installation sur la gateway.
+    Attendu : un message d'échec sans perte ; à la remontée du tunnel la reprise
+    rejoue le même dépôt (résultat identique traité comme le même par Astra) ou
+    l'installation (`already_present` au rejeu). **[cible seulement]**.
+52. **Campagne expirée, journal non accepté.** Signer, couper Orion avant le
+    dépôt, attendre plus de 300 s (ou redémarrer Astra, qui perd l'opération).
+    Rouvrir, tunnel monté. Attendu : Astra ne tient pas la transition, le journal
+    est effacé, le coffre n'a pas bougé, l'écran dit « Rotation expirée.
+    Recommencer » ; refaire les quatre touchers. Variante : Astra tient une
+    **autre** transition : refus (conflit de domaine), rien n'est effacé.
+53. **Reprise avec un profil sur la gateway d'un autre domaine.** Rotation
+    interrompue du domaine A, puis connecter le profil du domaine B. Attendu :
+    aucune reprise automatique ni manuelle (la clé WireGuard de la gateway du relais
+    n'est pas celle du pair connecté) ; rien n'est effacé ; reconnecter le profil
+    de A reprend seule.
+54. **Reprise derrière l'écran de l'opérateur.** Pendant sa propre rotation, couper
+    le tunnel : l'écran se termine en échec. Remonter le tunnel. Attendu : la
+    reprise attend la fermeture de cet écran ; un clic pour fermer cet écran, sans clé,
+    la lance une fois.
+55. **Délai dépassé (limite connue).** Rotation signée avec 1 jour de
+    préparation, ne pas installer, attendre `activation_at` (horloge d'essai).
+    Attendu : état bloquant « Délai dépassé », date de coupure (`not_after`) et
+    « Intervention manuelle requise » ; aucune réparation proposée, rien effacé.
+    `ROADMAP.md`, F14-a.
+56. **Gateway plus ancienne.** Contre une gateway sans les nouveaux champs :
+    attendu un message qui demande la mise à jour de la gateway (et, pour la CA TLS,
+    rappelle le cas d'une gateway sans CA TLS), journal conservé, jamais « Délai
+    dépassé » ; le même journal reprend après la mise à jour.
+57. **Expiration d'inactivité à l'étape des clés.** Valider la clé 1, ne rien
+    faire cinq minutes. Attendu : les ouvertures gardées en mémoire sont
+    effacées, la validation est à refaire, aucune campagne n'a été ouverte.
+58. **Retrait d'une clé pendant qu'un coffre scellé attend.** Rotation en pause
+    après l'acceptation (coffre suivant scellé dans le journal, non appliqué). Dans
+    *Coffre*, marquer perdue, retirer ou renommer une clé. Attendu : refus tant que
+    le coffre scellé attend d'écraser celui en place ; hors cet état (journal
+    appliqué), le geste passe. Une clé volée reste révocable au « Délai dépassé ».
+59. **Copie du coffre pendant une opération ouverte (409).** Ouvrir une rotation de
+    CA et laisser la campagne attendre l'opérateur (elle nomme le coffre). Depuis
+    un autre poste administrateur, `curl --request POST … /api/certificates/operator/vault-copy`
+    avec un coffre **différent** du domaine. Attendu : `409`, rien d'écrit, le
+    téléchargement de la campagne en cours reste possible. Le même corps une fois
+    la campagne expirée (300 s) : `200`. Un coffre **identique** passe pendant la
+    campagne. Un coffre d'un autre domaine : `403`. Plus de 128 Kio : `413`.
+60. **Copie du coffre par un administrateur du tunnel (limite).** Remplacer la copie
+    par un autre coffre du même domaine. Attendu : acceptée, la copie précédente
+    est gardée à côté, l'empreinte et l'opérateur sont au journal d'Astra ; elle
+    ne peut ni ouvrir le coffre ni signer. `ROADMAP.md`, F14-f.
+61. **Ancien enregistrement `astra-signer`, adopté puis terminé.** Interrompre
+    `astra-signer rotate-ca-tls` (enregistrement `astra-prepared.json`) ou
+    `rotate-ca-pq` (journal historique) avant la fin, puis ouvrir Orion. Attendu :
+    la ligne « Reprendre » apparaît sans clé ; un journal CA-PQ ancien lit **d'abord
+    Astra** : s'il tient l'ancre du journal, la rotation continue ; sinon conflit de
+    domaine et rien ne bouge. Après adoption l'enregistrement n'est plus rejoué à
+    chaque montée de tunnel. La rotation va au bout, sans clé redemandée.
+62. **Windows, WebAuthn, HID, `flock`.** **[cible seulement]** Contrôler sur
+    Windows : le dialogue de clé s'ouvre au-dessus d'Orion, sans champ PIN ;
+    avec une clé HID sous Linux le champ PIN reste et n'atteint jamais le moteur ;
+    deux `astra run` sur un même volume : le second refuse (`flock`). Une clé
+    débranchée en plein dialogue : aucune limite de temps (limite connue, seul un
+    redémarrage d'Orion y met fin, `ROADMAP.md` F14-d).
+63. **Recours en ligne de commande.** `astra-signer rotate-ca-pq` avec
+    `--authority-url` et `--operation-id` d'une campagne ouverte par `astra
+    campaign open` : la rotation se joue comme avant et son enregistrement est
+    ensuite repris par Orion (étape 61). Orion n'a lancé aucun `astra-signer`
+    pendant tout « G ».
 
 ### Le chemin manuel
 

@@ -188,7 +188,7 @@ pub(crate) fn rotate_ca_tls(
         prepared_at: now,
         // The same public campaign summary the terminal printed above. A
         // window survives its ceremony by days, and whatever resumes it — this
-        // binary or the Orion companion — must be able to name what was
+        // binary or Orion's own rotation journal — must be able to name what was
         // approved without re-fetching a campaign that is already closed.
         manifest: Some(prepared::manifest_of(
             &campaign,
