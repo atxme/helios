@@ -60,12 +60,7 @@ async fn http_429_is_throttled() {
 }
 
 #[tokio::test]
-async fn other_statuses_and_no_answer_are_unreachable() {
-    let reach = answered(500, "", async |url| domain(url).await).await;
-    assert_eq!(reach, Reach::Unreachable);
-    // A redirect is not followed: the answer is the 302 itself.
-    let reach = answered(302, "", async |url| domain(url).await).await;
-    assert_eq!(reach, Reach::Unreachable);
+async fn no_answer_is_unreachable() {
     assert_eq!(
         domain("http://127.0.0.1:9").await,
         Reach::<GatewayDomainRead>::Unreachable
@@ -106,7 +101,8 @@ async fn unknown_fields_of_the_domain_view_are_ignored() {
     assert_eq!(domain.ca_retire_active_at, Some(99));
     assert!(domain.client_tls_ca_transition_pending);
     assert!(!domain.ca_transition_pending, "defaulted when absent");
-    assert_eq!(domain.peers, vec![PeerExpiry { not_after: 1234 }]);
+    assert_eq!(domain.peers.len(), 1);
+    assert_eq!(domain.peers[0].not_after, 1234);
 }
 
 #[tokio::test]
@@ -165,5 +161,93 @@ async fn the_routes_are_the_gateways_own_and_a_slash_does_not_double() {
             "GET /api/certificates/operator/status HTTP/1.1",
             "GET /api/certificates HTTP/1.1",
         ]
+    );
+}
+
+#[tokio::test]
+async fn a_refusal_is_told_apart_from_a_gateway_that_does_not_answer() {
+    // An older gateway without the route answers 404: it is up, and says no.
+    let reach = answered(404, "", async |url| authority_status(url).await).await;
+    assert_eq!(reach, Reach::Refused(404));
+    let reach = answered(500, "", async |url| domain(url).await).await;
+    assert_eq!(reach, Reach::Refused(500));
+    // A redirect is not followed: the answer is the 302 itself.
+    let reach = answered(302, "", async |url| domain(url).await).await;
+    assert_eq!(reach, Reach::Refused(302));
+    let value = serde_json::to_value(Reach::<u8>::Refused(404)).unwrap();
+    assert_eq!(value, serde_json::json!({"state": "refused", "value": 404}));
+}
+
+#[tokio::test]
+async fn an_authority_status_that_gains_a_field_still_reads() {
+    let mut status = serde_json::to_value(OperatorAuthorityStatus {
+        ca_epoch: 4,
+        ca_fingerprint: Fingerprint::of(b"a"),
+        next_ca_fingerprint: None,
+        ca_tls_epoch: 2,
+        ca_tls_fingerprint: None,
+        next_ca_tls_fingerprint: None,
+        issuer: None,
+        vault_copy_fingerprint: Some(Fingerprint::of(b"v")),
+        credential_registry_epoch: Some(7),
+    })
+    .unwrap();
+    status["a_field_a_later_astra_adds"] = serde_json::json!(true);
+    let Reach::Ok(read) = answered(200, &status.to_string(), async |url| {
+        authority_status(url).await
+    })
+    .await
+    else {
+        panic!("a field added later must not blind the screen");
+    };
+    assert_eq!(read.ca_epoch, 4);
+    assert_eq!(read.credential_registry_epoch, Some(7));
+    assert_eq!(
+        read.vault_copy_fingerprint,
+        Some(Fingerprint::of(b"v").to_hex())
+    );
+}
+
+#[tokio::test]
+async fn a_pending_list_that_gains_a_field_still_reads() {
+    let body = serde_json::json!({
+        "operations": [{
+            "operation_id": "00".repeat(16), "scope": "fleet_leafs", "reason": "r",
+            "requested_by": "u", "target_count": 3, "required_credentials": 2,
+            "campaign_fingerprint": "ab".repeat(32), "created_at": 1, "expires_at": 2,
+            "a_field_a_later_gateway_adds": 1
+        }],
+        "and_another": true
+    });
+    let Reach::Ok(list) = answered(200, &body.to_string(), async |url| pending(url).await).await
+    else {
+        panic!("read");
+    };
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].target_count, 3);
+    assert_eq!(list[0].scope, "fleet_leafs");
+}
+
+#[tokio::test]
+async fn revoked_peers_are_left_out_and_the_gateways_clock_is_kept() {
+    let body = serde_json::json!({
+        "now_unix": 1_000,
+        "ca_epoch": 1, "ca_pq_fingerprint": "ab".repeat(32), "client_tls_ca_epoch": 1,
+        "peers": [
+            {"not_after": 10, "revoked": false},
+            {"not_after": 5, "revoked": true},
+            {"not_after": 20},
+        ],
+    });
+    let Reach::Ok(read) = answered(200, &body.to_string(), async |url| domain(url).await).await
+    else {
+        panic!("read");
+    };
+    assert_eq!(read.now_unix, Some(1_000));
+    let ends: Vec<u64> = read.peers.iter().map(|peer| peer.not_after).collect();
+    assert_eq!(
+        ends,
+        vec![10, 20],
+        "a revoked leaf is not a workstation to renew"
     );
 }

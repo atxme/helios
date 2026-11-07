@@ -24,8 +24,7 @@
 
 use std::time::Duration;
 
-use aether::certificates::transport::OperatorPendingList;
-pub use aether::certificates::transport::{OperatorAuthorityStatus, OperatorPendingOperation};
+use aether::certificates::transport::OperatorAuthorityStatus;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 /// How long the gateway has to answer before the screen stops waiting.
@@ -47,13 +46,28 @@ pub enum Reach<T> {
     NotAdmin,
     /// `503`: the gateway relays no authority.
     AstraUnavailable,
-    /// No answer, an answer of another status, or one that cannot be read.
+    /// No answer, or one that cannot be read or is too large.
     Unreachable,
     /// `429`: too many operations are waiting.
     Throttled,
+    /// Any other status: the gateway is up and says no. A `404` is an older gateway
+    /// without the route, which is not a gateway that is down.
+    Refused(u16),
 }
 
 impl<T> Reach<T> {
+    /// The same answer with its value transformed; a failed read stays as it was.
+    pub fn map<U>(self, change: impl FnOnce(T) -> U) -> Reach<U> {
+        match self {
+            Self::Ok(value) => Reach::Ok(change(value)),
+            Self::NotAdmin => Reach::NotAdmin,
+            Self::AstraUnavailable => Reach::AstraUnavailable,
+            Self::Unreachable => Reach::Unreachable,
+            Self::Throttled => Reach::Throttled,
+            Self::Refused(status) => Reach::Refused(status),
+        }
+    }
+
     /// The value, when the read went through.
     pub fn ok(&self) -> Option<&T> {
         match self {
@@ -69,6 +83,9 @@ impl<T> Reach<T> {
 /// know. The names are the screen's; the aliases are the view's.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GatewayDomainRead {
+    /// The gateway's clock when it answered: screens must not use the operator's.
+    #[serde(default)]
+    pub now_unix: Option<u64>,
     #[serde(alias = "ca_pq_fingerprint")]
     pub ca_fingerprint: String,
     pub ca_epoch: u64,
@@ -82,6 +99,8 @@ pub struct GatewayDomainRead {
     pub next_ca_fingerprint: Option<String>,
     #[serde(default)]
     pub client_tls_ca_transition_pending: bool,
+    /// The peers a fleet renewal targets: revoked ones are left out, as Astra's
+    /// `fleet_leaf_rows` does.
     #[serde(default)]
     pub peers: Vec<PeerExpiry>,
 }
@@ -91,27 +110,98 @@ pub struct GatewayDomainRead {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerExpiry {
     pub not_after: u64,
+    #[serde(default, skip_serializing)]
+    pub revoked: bool,
+}
+
+/// What Astra says of its authority state: a tolerant subset of
+/// [`OperatorAuthorityStatus`], which refuses a field it does not know. Fingerprints
+/// are hexadecimal text; a missing optional field reads as absent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthorityStatusRead {
+    pub ca_epoch: u64,
+    pub ca_fingerprint: String,
+    #[serde(default)]
+    pub next_ca_fingerprint: Option<String>,
+    pub ca_tls_epoch: u64,
+    #[serde(default)]
+    pub ca_tls_fingerprint: Option<String>,
+    #[serde(default)]
+    pub next_ca_tls_fingerprint: Option<String>,
+    #[serde(default)]
+    pub issuer: Option<IssuerRead>,
+    #[serde(default)]
+    pub vault_copy_fingerprint: Option<String>,
+    /// `None`: Astra serves no document. Not epoch 0.
+    #[serde(default)]
+    pub credential_registry_epoch: Option<u64>,
+}
+
+/// The delegation, as the status reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssuerRead {
+    pub recorded_epoch: u64,
+    #[serde(default)]
+    pub serving_epoch: Option<u64>,
+    pub ca_epoch: u64,
+    pub ca_tls_epoch: u64,
+    pub not_after: u64,
+}
+
+impl From<OperatorAuthorityStatus> for AuthorityStatusRead {
+    fn from(status: OperatorAuthorityStatus) -> Self {
+        Self {
+            ca_epoch: status.ca_epoch,
+            ca_fingerprint: status.ca_fingerprint.to_hex(),
+            next_ca_fingerprint: status.next_ca_fingerprint.map(|f| f.to_hex()),
+            ca_tls_epoch: status.ca_tls_epoch,
+            ca_tls_fingerprint: status.ca_tls_fingerprint.map(|f| f.to_hex()),
+            next_ca_tls_fingerprint: status.next_ca_tls_fingerprint.map(|f| f.to_hex()),
+            issuer: status.issuer.map(|issuer| IssuerRead {
+                recorded_epoch: issuer.recorded_epoch,
+                serving_epoch: issuer.serving_epoch,
+                ca_epoch: issuer.ca_epoch,
+                ca_tls_epoch: issuer.ca_tls_epoch,
+                not_after: issuer.not_after,
+            }),
+            vault_copy_fingerprint: status.vault_copy_fingerprint.map(|f| f.to_hex()),
+            credential_registry_epoch: status.credential_registry_epoch,
+        }
+    }
+}
+
+/// One operation waiting for an operator, as the list names it. No capability token.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingOperationRead {
+    pub operation_id: String,
+    pub scope: String,
+    pub reason: String,
+    pub requested_by: String,
+    pub target_count: u64,
+    pub required_credentials: u64,
+    pub campaign_fingerprint: String,
+    pub created_at: u64,
+    pub expires_at: u64,
+}
+
+#[derive(Deserialize)]
+struct PendingListRead {
+    operations: Vec<PendingOperationRead>,
 }
 
 /// Everything waiting for an operator, through one gateway.
-pub async fn pending(gateway: &str) -> Reach<Vec<OperatorPendingOperation>> {
-    match read::<OperatorPendingList>(
+pub async fn pending(gateway: &str) -> Reach<Vec<PendingOperationRead>> {
+    read::<PendingListRead>(
         gateway,
         "/api/certificates/operator/pending",
         MAX_ANSWER_BYTES,
     )
     .await
-    {
-        Reach::Ok(list) => Reach::Ok(list.operations),
-        Reach::NotAdmin => Reach::NotAdmin,
-        Reach::AstraUnavailable => Reach::AstraUnavailable,
-        Reach::Unreachable => Reach::Unreachable,
-        Reach::Throttled => Reach::Throttled,
-    }
+    .map(|list| list.operations)
 }
 
 /// What Astra holds of its authority state: fingerprints and epochs.
-pub async fn authority_status(gateway: &str) -> Reach<OperatorAuthorityStatus> {
+pub async fn authority_status(gateway: &str) -> Reach<AuthorityStatusRead> {
     read(
         gateway,
         "/api/certificates/operator/status",
@@ -122,7 +212,12 @@ pub async fn authority_status(gateway: &str) -> Reach<OperatorAuthorityStatus> {
 
 /// The gateway's own view of the domain.
 pub async fn domain(gateway: &str) -> Reach<GatewayDomainRead> {
-    read(gateway, "/api/certificates", MAX_DOMAIN_ANSWER_BYTES).await
+    read::<GatewayDomainRead>(gateway, "/api/certificates", MAX_DOMAIN_ANSWER_BYTES)
+        .await
+        .map(|mut domain| {
+            domain.peers.retain(|peer| !peer.revoked);
+            domain
+        })
 }
 
 /// One `GET`, resolved against the profile's gateway and nothing else.
@@ -147,7 +242,7 @@ async fn read<T: DeserializeOwned>(gateway: &str, path: &str, max_bytes: usize) 
         403 => return Reach::NotAdmin,
         429 => return Reach::Throttled,
         503 => return Reach::AstraUnavailable,
-        _ => return Reach::Unreachable,
+        other => return Reach::Refused(other),
     }
     if response
         .content_length()

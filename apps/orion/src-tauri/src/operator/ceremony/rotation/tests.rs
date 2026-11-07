@@ -273,6 +273,8 @@ struct Remote {
     gateway_anchor: Mutex<Option<Fingerprint>>,
     install_refused: Mutex<Option<u16>>,
     copies: Mutex<VecDeque<VaultCopySent>>,
+    /// Whether each copy sent carried the credential document.
+    sent_with_credentials: Mutex<Vec<bool>>,
 }
 
 impl Remote {
@@ -346,8 +348,12 @@ impl RotationRemote for Remote {
             .expect("an authority"))
     }
 
-    fn send_vault_copy(&self, _copy: &OperatorVaultCopy) -> anyhow::Result<VaultCopySent> {
+    fn send_vault_copy(&self, copy: &OperatorVaultCopy) -> anyhow::Result<VaultCopySent> {
         self.note("send_vault_copy");
+        self.sent_with_credentials
+            .lock()
+            .expect("lock")
+            .push(copy.credentials.is_some());
         Ok(self
             .copies
             .lock()
@@ -2925,7 +2931,7 @@ mod overview {
         RotationsOverview, VaultCopyOutcome,
     };
     use aether::certificates::transport::OperatorOpenAction;
-    use orion_core::operator_rotations::{GatewayDomainRead, Reach};
+    use orion_core::operator_rotations::{AuthorityStatusRead, GatewayDomainRead, Reach};
 
     fn local(bench: &Bench) -> crate::operator::rotations::Local {
         read_local(&Ok(bench.path.clone()), bench.clock.load(Ordering::SeqCst))
@@ -2942,7 +2948,7 @@ mod overview {
         RotationsOverview::assemble(
             true,
             Reach::Ok(Vec::new()),
-            Reach::Ok(authority),
+            Reach::Ok(authority.into()),
             Reach::<GatewayDomainRead>::Unreachable,
             local(bench),
         )
@@ -3166,7 +3172,7 @@ mod overview {
             &towards_another_gateway(),
             || {
                 read.set(true);
-                Reach::Ok(bench.nothing_in_flight())
+                Reach::Ok(bench.nothing_in_flight().into())
             },
         )
         .expect_err("refused");
@@ -3179,7 +3185,7 @@ mod overview {
     fn a_manual_send_stops_on_an_authority_it_could_not_read() {
         let bench = bench();
         let error = send_copy_with(&bench.remote, &bench.path, &target_of(&bench), || {
-            Reach::AstraUnavailable
+            Reach::<AuthorityStatusRead>::AstraUnavailable
         })
         .expect_err("stopped");
         assert!(error.contains("Astra"), "{error}");
@@ -3190,7 +3196,7 @@ mod overview {
     fn a_manual_send_goes_through_and_a_held_back_copy_is_an_answer() {
         let bench = bench();
         let sent = send_copy_with(&bench.remote, &bench.path, &target_of(&bench), || {
-            Reach::Ok(bench.nothing_in_flight())
+            Reach::Ok(bench.nothing_in_flight().into())
         })
         .expect("sent");
         assert!(matches!(sent, VaultCopyOutcome::Copied { .. }));
@@ -3200,8 +3206,15 @@ mod overview {
             .lock()
             .expect("lock")
             .push_back(VaultCopySent::HeldBack);
+        // The served document is current: the vault goes alone, and held back stays so.
         let held = send_copy_with(&bench.remote, &bench.path, &target_of(&bench), || {
-            Reach::Ok(bench.nothing_in_flight())
+            Reach::Ok(
+                OperatorAuthorityStatus {
+                    credential_registry_epoch: Some(u64::MAX),
+                    ..bench.nothing_in_flight()
+                }
+                .into(),
+            )
         })
         .expect("answered");
         assert_eq!(held, VaultCopyOutcome::HeldBack);
@@ -3223,13 +3236,14 @@ mod overview {
     fn a_location_that_cannot_be_resolved_is_told_and_not_hidden() {
         let local = read_local(&Err("réglage illisible".into()), 0);
         assert!(local.vault.is_none());
-        assert_eq!(local.vault_error.as_deref(), Some("réglage illisible"));
+        assert_eq!(local.vault_error, Some("emplacement"));
     }
 
     #[test]
     fn the_manual_copy_is_the_compact_vault_whose_fingerprint_is_the_vaults() {
         let bench = bench();
-        let copy = copy_to_send(&bench.path, &bench.nothing_in_flight(), false).expect("copy");
+        let copy =
+            copy_to_send(&bench.path, &bench.nothing_in_flight().into(), false).expect("copy");
         let sent = vault_bytes_of(&copy);
         // What Astra fingerprints is the bytes it receives.
         assert_eq!(Fingerprint::of(&sent).to_hex(), bench_fingerprint(&bench));
@@ -3240,14 +3254,15 @@ mod overview {
     #[test]
     fn the_credentials_go_with_the_copy_unless_an_overlap_or_a_resumption_holds_them() {
         let bench = bench();
-        let free = bench.nothing_in_flight();
+        let free: AuthorityStatusRead = bench.nothing_in_flight().into();
         let with = copy_to_send(&bench.path, &free, false).expect("copy");
         assert!(with.credentials.is_some(), "the document beside the vault");
 
-        let overlap = OperatorAuthorityStatus {
+        let overlap: AuthorityStatusRead = OperatorAuthorityStatus {
             next_ca_fingerprint: Some(Fingerprint::of(b"suivante")),
             ..bench.nothing_in_flight()
-        };
+        }
+        .into();
         assert!(copy_to_send(&bench.path, &overlap, false)
             .expect("copy")
             .credentials
@@ -3271,5 +3286,128 @@ mod overview {
         .unwrap();
         assert_eq!(copied["state"], "copied");
         assert!(copied["credential_registry_epoch"].is_null());
+    }
+
+    fn local_credentials_epoch(bench: &Bench) -> u64 {
+        astra_operator::credentials::load(&astra_operator::credentials::path_beside(&bench.path))
+            .expect("document")
+            .expect("a document")
+            .credential_registry_epoch
+    }
+
+    fn served(bench: &Bench, epoch: Option<u64>) -> AuthorityStatusRead {
+        OperatorAuthorityStatus {
+            credential_registry_epoch: epoch,
+            ..bench.nothing_in_flight()
+        }
+        .into()
+    }
+
+    #[test]
+    fn the_document_goes_only_if_newer_than_the_one_astra_serves() {
+        let bench = bench();
+        let mine = local_credentials_epoch(&bench);
+        for (served_epoch, goes) in [
+            (None, true),
+            (Some(mine - 1), true),
+            (Some(mine), false),
+            (Some(mine + 1), false),
+        ] {
+            let copy =
+                copy_to_send(&bench.path, &served(&bench, served_epoch), false).expect("copy");
+            assert_eq!(copy.credentials.is_some(), goes, "served {served_epoch:?}");
+        }
+    }
+
+    #[test]
+    fn a_held_back_copy_that_carried_a_document_is_sent_again_with_the_vault_alone() {
+        let bench = bench();
+        bench
+            .remote
+            .copies
+            .lock()
+            .expect("lock")
+            .push_back(VaultCopySent::HeldBack);
+        let sent = send_copy_with(&bench.remote, &bench.path, &target_of(&bench), || {
+            Reach::Ok(served(&bench, None))
+        })
+        .expect("sent");
+        assert!(matches!(sent, VaultCopyOutcome::Copied { .. }));
+        assert_eq!(
+            *bench.remote.sent_with_credentials.lock().expect("lock"),
+            vec![true, false]
+        );
+    }
+
+    #[test]
+    fn a_copy_without_a_document_held_back_is_not_sent_again() {
+        let bench = bench();
+        bench
+            .remote
+            .copies
+            .lock()
+            .expect("lock")
+            .push_back(VaultCopySent::HeldBack);
+        let mine = local_credentials_epoch(&bench);
+        let held = send_copy_with(&bench.remote, &bench.path, &target_of(&bench), || {
+            Reach::Ok(served(&bench, Some(mine)))
+        })
+        .expect("answered");
+        assert_eq!(held, VaultCopyOutcome::HeldBack);
+        assert_eq!(
+            *bench.remote.sent_with_credentials.lock().expect("lock"),
+            vec![false]
+        );
+    }
+
+    #[test]
+    fn a_corrupt_vault_or_location_error_shows_no_path() {
+        let bench = bench();
+        std::fs::write(&bench.path, b"{ not a vault").expect("corrupt");
+        let directory = bench.path.parent().expect("folder").display().to_string();
+        let overview = assembled(&bench, bench.nothing_in_flight());
+        assert_eq!(overview.vault_error, Some("illisible"));
+        assert!(overview.vault.is_none());
+        let shown = serde_json::to_string(&overview).expect("json");
+        assert!(!shown.contains(&directory), "{shown}");
+
+        let unresolved = read_local(&Err(format!("réglage {directory}/orion.json illisible")), 0);
+        assert_eq!(unresolved.vault_error, Some("emplacement"));
+        let shown = serde_json::to_string(&RotationsOverview::assemble(
+            false,
+            Reach::Unreachable,
+            Reach::Unreachable,
+            Reach::Unreachable,
+            unresolved,
+        ))
+        .expect("json");
+        assert!(!shown.contains(&directory), "{shown}");
+    }
+
+    #[test]
+    fn the_close_has_a_date_and_the_ca_tls_has_an_expiry() {
+        let bench = bench();
+        let before = local(&bench);
+        assert_eq!(before.ca_tls_close_at, None);
+        let record = bench.rotated_client_tls();
+        let after = local(&bench);
+        assert_eq!(after.ca_tls_close_at, Some(record.not_after));
+        assert!(after.ca_tls_close_due);
+        bench.set_clock(record.not_after - 1);
+        let early = local(&bench);
+        assert_eq!(early.ca_tls_close_at, Some(record.not_after));
+        assert!(!early.ca_tls_close_due);
+
+        // The public certificate of the relay, read without opening the vault.
+        let relay = bench.relay();
+        let der = DerCertificate::parse(relay.ca_tls_certificate.as_ref().expect("CA-TLS"))
+            .expect("certificate");
+        let not_after = aether::certificates::x509::inspect(&der)
+            .expect("facts")
+            .not_after;
+        assert_eq!(after.ca_tls_not_after, Some(not_after));
+        let value = serde_json::to_value(assembled(&bench, bench.nothing_in_flight())).unwrap();
+        assert_eq!(value["localCaTlsNotAfter"], serde_json::json!(not_after));
+        assert_eq!(value["caTlsCloseAt"], serde_json::json!(record.not_after));
     }
 }

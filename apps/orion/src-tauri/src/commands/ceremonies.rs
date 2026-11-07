@@ -377,27 +377,31 @@ pub(crate) async fn operator_rotations_overview(
 
     let vault_path = state.vault_location.path_to_look_at();
     let target = connected_target(&state).await.ok();
-    let (pending, authority, domain) = match &target {
-        Some(target) => {
-            tokio::join!(
-                reads::pending(&target.address),
-                reads::authority_status(&target.address),
-                reads::domain(&target.address),
-            )
+    // Concurrent: a gateway that hangs for its whole wait must not delay the vault.
+    let reads = async {
+        match &target {
+            Some(target) => {
+                tokio::join!(
+                    reads::pending(&target.address),
+                    reads::authority_status(&target.address),
+                    reads::domain(&target.address),
+                )
+            }
+            None => (
+                reads::Reach::Unreachable,
+                reads::Reach::Unreachable,
+                reads::Reach::Unreachable,
+            ),
         }
-        None => (
-            reads::Reach::Unreachable,
-            reads::Reach::Unreachable,
-            reads::Reach::Unreachable,
-        ),
     };
     let now = crate::operator::now_unix();
     let local = on_work_stack(
         "orion-rotations-overview",
         "la lecture du coffre",
         move || Ok(read_local(&vault_path, now)),
-    )
-    .await?;
+    );
+    let ((pending, authority, domain), local) = tokio::join!(reads, local);
+    let local = local?;
     Ok(RotationsOverview::assemble(
         target.is_some(),
         pending,

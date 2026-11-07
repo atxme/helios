@@ -27,7 +27,7 @@ use astra_operator::rotation_journal::{self, JournalStage, RotationJournal, Rota
 use astra_operator::tunnel::VaultCopySent;
 use astra_operator::{credentials, prepared};
 use orion_core::operator_rotations::{
-    GatewayDomainRead, OperatorAuthorityStatus, OperatorPendingOperation, Reach,
+    AuthorityStatusRead, GatewayDomainRead, PendingOperationRead, Reach,
 };
 use serde::Serialize;
 
@@ -93,25 +93,33 @@ pub fn send_copy_with(
     remote: &dyn RotationRemote,
     vault_path: &Path,
     target: &GatewayTarget,
-    authority: impl FnOnce() -> Reach<OperatorAuthorityStatus>,
+    authority: impl FnOnce() -> Reach<AuthorityStatusRead>,
 ) -> Result<VaultCopyOutcome, String> {
     ensure_domains_gateway(vault_path, target)?;
     let authority = match authority() {
         Reach::Ok(authority) => authority,
-        other => {
-            return Err(unreached(&other)
-                .unwrap_or("l'autorité ne répond pas")
-                .to_string())
-        }
+        other => return Err(unreached(&other).unwrap_or_default()),
     };
     let resumable =
         rotation_journal::something_to_resume(vault_path).map_err(|error| format!("{error:#}"))?;
     let copy =
         copy_to_send(vault_path, &authority, resumable).map_err(|error| format!("{error:#}"))?;
-    remote
+    let carried_a_document = copy.credentials.is_some();
+    let mut sent = remote
         .send_vault_copy(&copy)
-        .map(VaultCopyOutcome::of)
-        .map_err(|error| format!("{error:#}"))
+        .map_err(|error| format!("{error:#}"))?;
+    // A document held back by a promotion the status does not show holds the whole
+    // copy back with it. The vault alone passes, and the document follows later.
+    if carried_a_document && sent == VaultCopySent::HeldBack {
+        let alone = OperatorVaultCopy {
+            credentials: None,
+            ..copy
+        };
+        sent = remote
+            .send_vault_copy(&alone)
+            .map_err(|error| format!("{error:#}"))?;
+    }
+    Ok(VaultCopyOutcome::of(sent))
 }
 
 /// A rotation signed and not yet at its end, as the page may be told of it.
@@ -157,13 +165,21 @@ impl JournalView {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Local {
     pub vault: Option<VaultOverview>,
-    /// Why the vault could not be read, when it could not.
-    pub vault_error: Option<String>,
+    /// Why the vault could not be read, as a fixed label: `illisible` for a vault
+    /// that cannot be read, `emplacement` for a location that cannot be resolved.
+    /// The detail names paths, so it goes to the log and never to the page.
+    pub vault_error: Option<&'static str>,
     pub journal: Option<JournalView>,
     /// Something calls for a resumption: a journal, a legacy CA-PQ file or an
     /// unadopted record. A thing that cannot be read counts, so it is not hidden.
     pub resumable: bool,
     pub ca_tls_close_due: bool,
+    /// When « Terminer » falls due: the `not_after` of a client TLS rotation the
+    /// gateway holds, whether or not that instant has passed.
+    pub ca_tls_close_at: Option<u64>,
+    /// When the CA TLS in the relay beside the vault ends. A public certificate, read
+    /// without opening the vault; `None` when the relay holds none.
+    pub ca_tls_not_after: Option<u64>,
 }
 
 /// Reads the vault and what rotations left beside it, without a key.
@@ -171,16 +187,21 @@ pub fn read_local(vault_path: &Result<std::path::PathBuf, String>, now: u64) -> 
     let path = match vault_path {
         Ok(path) => path,
         Err(error) => {
+            tracing::warn!(%error, "emplacement du coffre illisible");
             return Local {
-                vault_error: Some(error.clone()),
+                vault_error: Some("emplacement"),
                 ..Local::default()
-            }
+            };
         }
     };
     let (vault, vault_error) = match astra_operator::overview::read(path) {
         Ok(overview) => (Some(overview), None),
-        Err(error) => (None, Some(format!("{error:#}"))),
+        Err(error) => {
+            tracing::warn!(error = %format!("{error:#}"), "coffre illisible");
+            (None, Some("illisible"))
+        }
     };
+    let close_at = ca_tls_close_at(path);
     let journal_path = rotation_journal::path_beside(path);
     let journal = rotation_journal::load(&journal_path)
         .ok()
@@ -191,19 +212,36 @@ pub fn read_local(vault_path: &Result<std::path::PathBuf, String>, now: u64) -> 
         vault_error,
         journal,
         resumable: rotation_journal::something_to_resume(path).unwrap_or(true),
-        ca_tls_close_due: ca_tls_close_due(path, now),
+        ca_tls_close_due: close_at.is_some_and(|at| now >= at),
+        ca_tls_close_at: close_at,
+        ca_tls_not_after: ca_tls_not_after(path),
     }
 }
 
-/// « Terminer » is due: a client TLS rotation went through a journal, the gateway
-/// holds it, its overlap is over, and nothing is left to resume. The conditions of
-/// `CaTlsFinish::begin`, read without opening anything.
-fn ca_tls_close_due(vault_path: &Path, now: u64) -> bool {
-    rotation_journal::ensure_none_in_flight(vault_path).is_ok()
-        && matches!(
-            prepared::load(&prepared::path_beside(vault_path)),
-            Ok(Some(record)) if record.submitted && record.adopted && now >= record.not_after
-        )
+/// The expiry of the CA TLS the relay records. Nothing is opened: the relay and the
+/// certificate in it are public.
+fn ca_tls_not_after(vault_path: &Path) -> Option<u64> {
+    let relay =
+        astra_operator::handoff::load(&astra_operator::handoff::path_beside(vault_path)).ok()?;
+    let der =
+        aether::certificates::encoding::DerCertificate::parse(relay.ca_tls_certificate.as_deref()?)
+            .ok()?;
+    aether::certificates::x509::inspect(&der)
+        .ok()
+        .map(|facts| facts.not_after)
+}
+
+/// When « Terminer » falls due: a client TLS rotation went through a journal, the
+/// gateway holds it, and nothing is left to resume. The conditions of
+/// `CaTlsFinish::begin`, read without opening anything; its overlap may still run.
+fn ca_tls_close_at(vault_path: &Path) -> Option<u64> {
+    if rotation_journal::ensure_none_in_flight(vault_path).is_err() {
+        return None;
+    }
+    match prepared::load(&prepared::path_beside(vault_path)) {
+        Ok(Some(record)) if record.submitted && record.adopted => Some(record.not_after),
+        _ => None,
+    }
 }
 
 /// Everything the screen needs, in one answer.
@@ -211,14 +249,16 @@ fn ca_tls_close_due(vault_path: &Path, now: u64) -> bool {
 #[serde(rename_all = "camelCase")]
 pub struct RotationsOverview {
     pub tunnel: bool,
-    pub pending: Reach<Vec<OperatorPendingOperation>>,
-    pub authority: Reach<OperatorAuthorityStatus>,
+    pub pending: Reach<Vec<PendingOperationRead>>,
+    pub authority: Reach<AuthorityStatusRead>,
     pub domain: Reach<GatewayDomainRead>,
     pub vault: Option<VaultOverview>,
-    pub vault_error: Option<String>,
+    pub vault_error: Option<&'static str>,
     pub local_vault_fingerprint: Option<String>,
     pub local_ca_epoch: Option<u64>,
     pub local_ca_tls_epoch: Option<u64>,
+    /// When the CA TLS recorded beside the vault ends.
+    pub local_ca_tls_not_after: Option<u64>,
     /// A rotation signed and not finished, with its install deadline.
     pub journal: Option<JournalView>,
     /// Something to resume, journal or not (legacy file, unadopted record).
@@ -231,13 +271,14 @@ pub struct RotationsOverview {
     /// a screen that read it as one would spend a touch the overlap then refuses.
     pub ca_pq_overlap: Option<bool>,
     pub ca_tls_close_due: bool,
+    pub ca_tls_close_at: Option<u64>,
 }
 
 impl RotationsOverview {
     pub fn assemble(
         tunnel: bool,
-        pending: Reach<Vec<OperatorPendingOperation>>,
-        authority: Reach<OperatorAuthorityStatus>,
+        pending: Reach<Vec<PendingOperationRead>>,
+        authority: Reach<AuthorityStatusRead>,
         domain: Reach<GatewayDomainRead>,
         local: Local,
     ) -> Self {
@@ -247,6 +288,8 @@ impl RotationsOverview {
             journal,
             resumable,
             ca_tls_close_due,
+            ca_tls_close_at,
+            ca_tls_not_after,
         } = local;
         let ca_pq_overlap = authority
             .ok()
@@ -270,12 +313,14 @@ impl RotationsOverview {
                 .as_ref()
                 .and_then(|vault| vault.domain.as_ref())
                 .and_then(|domain| domain.ca_tls_epoch),
+            local_ca_tls_not_after: ca_tls_not_after,
             vault,
             vault_error,
             journal,
             resumable,
             ca_pq_overlap,
             ca_tls_close_due,
+            ca_tls_close_at,
         }
     }
 }
@@ -311,32 +356,41 @@ impl VaultCopyOutcome {
 ///
 /// The vault in its compact form, so that Astra's fingerprint of the bytes it
 /// receives equals the vault's own and the copy does not read « Ancienne » beside
-/// the vault it was taken from. The credential document goes with it unless a CA-PQ
-/// overlap is in flight or a rotation is waiting to be resumed: in the first case
-/// Astra adopts the new document itself at the promotion, and in the second the
-/// resumption sends it with the copy.
+/// the vault it was taken from. The credential document goes with it only when it is
+/// newer than the one Astra serves (or Astra serves none): Astra answers an
+/// indistinct refusal to an older one, and a vault that would have passed alone must
+/// not be refused for it. It is also left out during a CA-PQ overlap, where Astra
+/// adopts the new document itself at the promotion, and while a rotation waits to be
+/// resumed, whose resumption sends it with the copy.
 pub fn copy_to_send(
     vault_path: &Path,
-    authority: &OperatorAuthorityStatus,
+    authority: &AuthorityStatusRead,
     resumable: bool,
 ) -> anyhow::Result<OperatorVaultCopy> {
     let mut copy = operation::vault_copy(vault_path)?;
     if authority.next_ca_fingerprint.is_none() && !resumable {
-        copy.credentials = credentials::load(&credentials::path_beside(vault_path))
-            .context("lecture du document de credentials")?
+        let document = credentials::load(&credentials::path_beside(vault_path))
+            .context("lecture du document de credentials")?;
+        copy.credentials = document
+            .filter(|document| {
+                authority
+                    .credential_registry_epoch
+                    .is_none_or(|served| document.credential_registry_epoch > served)
+            })
             .map(Box::new);
     }
     Ok(copy)
 }
 
 /// Why a read that did not go through stops a send, in a few words.
-pub fn unreached<T>(reach: &Reach<T>) -> Option<&'static str> {
+pub fn unreached<T>(reach: &Reach<T>) -> Option<String> {
     match reach {
         Reach::Ok(_) => None,
-        Reach::NotAdmin => Some("ce poste n'est pas administrateur de la gateway"),
-        Reach::AstraUnavailable => Some("Astra n'est pas joignable par la gateway"),
-        Reach::Throttled => Some("la gateway est saturée : réessayer plus tard"),
-        Reach::Unreachable => Some("la gateway ne répond pas"),
+        Reach::NotAdmin => Some("ce poste n'est pas administrateur de la gateway".into()),
+        Reach::AstraUnavailable => Some("Astra n'est pas joignable par la gateway".into()),
+        Reach::Throttled => Some("la gateway est saturée : réessayer plus tard".into()),
+        Reach::Unreachable => Some("la gateway ne répond pas".into()),
+        Reach::Refused(status) => Some(format!("la gateway a refusé la lecture ({status})")),
     }
 }
 

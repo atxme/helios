@@ -1074,6 +1074,8 @@ export interface OperatorPendingOperation {
 export type Reach<T> =
   | { state: 'ok'; value: T }
   | { state: 'not_admin' | 'astra_unavailable' | 'unreachable' | 'throttled' }
+  /** La gateway répond et refuse (un 404 : gateway plus ancienne, sans la route). */
+  | { state: 'refused'; value: number }
 
 /** Ce que l'autorité (Astra) dit de son état : empreintes et époques, aucun jeton. */
 export interface OperatorAuthorityStatus {
@@ -1099,6 +1101,8 @@ export interface OperatorAuthorityStatus {
 
 /** Le sous-ensemble de `GET /api/certificates` que l'écran lit. */
 export interface GatewayDomainRead {
+  /** L'horloge de la gateway à sa réponse : celle de l'opérateur ne sert pas. */
+  now_unix: number | null
   ca_fingerprint: string
   ca_epoch: number
   ca_tls_epoch: number
@@ -1106,6 +1110,7 @@ export interface GatewayDomainRead {
   ca_retire_active_at: number | null
   next_ca_fingerprint: string | null
   client_tls_ca_transition_pending: boolean
+  /** Les postes qu'un renouvellement vise : les pairs révoqués n'y figurent pas. */
   peers: { not_after: number }[]
 }
 
@@ -1127,10 +1132,13 @@ export interface RotationsOverview {
   domain: Reach<GatewayDomainRead>
   /** `vault_path` y est vide : l'emplacement s'affiche par `VaultLocationView`. */
   vault: VaultOverview | null
-  vaultError: string | null
+  /** `illisible` (coffre) ou `emplacement` ; le détail, qui nomme des chemins, reste au journal. */
+  vaultError: 'illisible' | 'emplacement' | null
   localVaultFingerprint: string | null
   localCaEpoch: number | null
   localCaTlsEpoch: number | null
+  /** Fin de la CA TLS inscrite au relais du coffre ; `null` si le relais n'en porte pas. */
+  localCaTlsNotAfter: number | null
   journal: RotationJournalView | null
   /** Une reprise est à faire : journal, fichier CA-PQ ancien ou enregistrement non adopté. */
   resumable: boolean
@@ -1140,6 +1148,8 @@ export interface RotationsOverview {
    */
   caPqOverlap: boolean | null
   caTlsCloseDue: boolean
+  /** Quand « Terminer » est dû (fin du recouvrement), échu ou non ; `null` sans rotation à clore. */
+  caTlsCloseAt: number | null
 }
 
 /** La réponse à un envoi manuel de la copie du coffre. « Retenue » n'est pas un échec. */
