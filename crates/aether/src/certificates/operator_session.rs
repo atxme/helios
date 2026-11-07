@@ -675,7 +675,6 @@ pub struct CaRotationManifest {
     /// signature, which the approvals come before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_anchor_fingerprint: Option<Fingerprint>,
-    pub target_count: usize,
     /// The campaign the keys approve, when there is one. Absent for a rotation
     /// signed offline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -996,7 +995,6 @@ mod tests {
             not_after: 20,
             outgoing_anchor_fingerprint: Fingerprint::of(b"outgoing"),
             next_anchor_fingerprint: Some(Fingerprint::of(b"next")),
-            target_count: 3,
             campaign: None,
         });
         assert_eq!(manifest.kind(), OperationKind::RotateClientTlsCa);
@@ -1019,7 +1017,6 @@ mod tests {
             not_after: 20,
             outgoing_anchor_fingerprint: Fingerprint::of(b"outgoing"),
             next_anchor_fingerprint: None,
-            target_count: 1,
             campaign: None,
         };
         let encoded = serde_json::to_value(&manifest).expect("encoding");

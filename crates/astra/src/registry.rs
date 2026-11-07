@@ -304,6 +304,14 @@ pub struct AstraRegistry {
     state: AstraState,
 }
 
+impl RegistryError {
+    /// The registry could not be written, which nothing a caller sent is at fault
+    /// for. The only two ways [`AstraRegistry::save`] fails.
+    pub(crate) fn is_write_failure(&self) -> bool {
+        matches!(self, Self::Io(_) | Self::Corrupt(_))
+    }
+}
+
 impl AstraRegistry {
     pub fn new(path: PathBuf, state: AstraState) -> Self {
         Self { path, state }

@@ -999,6 +999,22 @@ async fn signer_result(
     ))
 }
 
+/// A deposit this authority could not write: a 500, and not a refusal.
+///
+/// Nothing the operator sent is at fault, and only an answer that says so makes the
+/// operator's side keep what it holds and send the identical deposit again. A
+/// refusal would have it give up on a rotation whose objects may even be in the file,
+/// since a save can fail after its rename.
+fn not_written(operation_id: &Id16, error: &crate::registry::RegistryError) -> ServiceError {
+    tracing::error!(
+        %operation_id,
+        %error,
+        "this deposit could not be written: the approval is not spent, and an identical deposit \
+         may be retried"
+    );
+    ServiceError::Internal
+}
+
 /// The submission itself, shared by both channels (§8.2, §8.5).
 pub(crate) async fn operator_signer_result(
     service: &Arc<AstraService>,
@@ -1048,7 +1064,7 @@ pub(crate) async fn operator_signer_result(
 
     if !verified.objects.is_empty() {
         let mut domain = service.registry.lock().await;
-        // Restored on a failed write: this answer says « not held », the status read
+        // Restored on a failed write: the answer says « not held », the status read
         // must say the same, and the operator's vault moves on that word.
         let accepted = domain
             .write_or_restore(|registry| {
@@ -1060,11 +1076,13 @@ pub(crate) async fn operator_signer_result(
                 )
             })
             .map_err(|error| {
+                if error.is_write_failure() {
+                    return not_written(&operation_id, &error);
+                }
                 tracing::error!(
                     %operation_id,
                     %error,
-                    "the transitions this campaign produced were refused: the approval is not \
-                     spent, and an identical deposit may be retried"
+                    "the transitions this campaign produced were refused: the approval is not spent"
                 );
                 ServiceError::Refused
             })?;
@@ -1116,21 +1134,31 @@ pub(crate) async fn operator_signer_result(
         // above and for the same reason: a delegation the operator approved
         // and this authority did not write is a ceremony to redo, whereas a
         // spent approval with nothing behind it is a ceremony that cannot be.
-        crate::issuer::adopt(
-            &mut domain,
-            *authorization,
-            &crate::issuer::pq_key_path(&service.state_dir, issuer_epoch),
-            &crate::issuer::tls_key_path(&service.state_dir, issuer_epoch),
-            now,
-        )
-        .map_err(|error| {
-            tracing::error!(
-                %operation_id,
-                %error,
-                "the delegation this campaign produced was refused: the approval is not spent,                  and an identical deposit may be retried"
-            );
-            ServiceError::Refused
-        })?;
+        // Restored on a failed write, or the retry would find the delegation already
+        // held, write nothing, and spend the approval behind a file that lacks it.
+        domain
+            .write_or_restore(|registry| {
+                crate::issuer::adopt(
+                    registry,
+                    *authorization,
+                    &crate::issuer::pq_key_path(&service.state_dir, issuer_epoch),
+                    &crate::issuer::tls_key_path(&service.state_dir, issuer_epoch),
+                    now,
+                )
+            })
+            .map_err(|error| {
+                if let crate::issuer::AdoptionError::Registry(failure) = &error {
+                    if failure.is_write_failure() {
+                        return not_written(&operation_id, failure);
+                    }
+                }
+                tracing::error!(
+                    %operation_id,
+                    %error,
+                    "the delegation this campaign produced was refused: the approval is not spent"
+                );
+                ServiceError::Refused
+            })?;
         match service.adopt_recorded_issuer(&domain) {
             true => tracing::info!(%operation_id, issuer_epoch, "delegation adopted"),
             false => tracing::error!(

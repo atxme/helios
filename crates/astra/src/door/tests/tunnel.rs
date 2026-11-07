@@ -539,35 +539,97 @@ fn assertion_for(
     }
 }
 
-/// A deposit Astra has every reason to accept, up to the write. A failed save
-/// answers 403 and an identical deposit is to be retried, so memory must still say
-/// what the file says: otherwise the status read reports the rotation as held, the
-/// operator's vault moves on that word, and a restart of Astra forgets it.
-#[tokio::test]
-async fn a_failed_save_of_a_deposit_leaves_nothing_in_flight() {
+/// A capability to deposit the result of `operation_id`.
+async fn submit_token(service: &AstraService, operation_id: &Id16) -> String {
+    use aether::certificates::capability::{CapabilityGrant, CapabilityScope};
+
+    let operations = service.signing.lock().await;
+    let operation = operations.get(operation_id, NOW).expect("operation held");
+    let grant = CapabilityGrant::new(
+        CapabilityScope::SignerResultSubmit,
+        *operation_id,
+        operation.manifest_fingerprint(),
+        None,
+        NOW,
+        NOW + 120,
+    )
+    .expect("grant");
+    service
+        .capabilities
+        .lock()
+        .await
+        .issue(&grant, operation.expires_at)
+        .expect("token")
+}
+
+/// A deposit Astra has every reason to accept, up to the write.
+struct Deposit {
+    service: Arc<AstraService>,
+    operation_id: Id16,
+    token: String,
+    result: Box<aether::certificates::status::AstraSignerResult>,
+    /// The file a save renames onto.
+    registry_path: std::path::PathBuf,
+}
+
+impl Deposit {
+    async fn send(
+        &self,
+    ) -> Result<crate::signing::SigningOperationView, crate::service::ServiceError> {
+        crate::service::operator_signer_result(
+            &self.service,
+            &self.operation_id,
+            &self.token,
+            self.result.clone(),
+            NOW,
+        )
+        .await
+    }
+
+    async fn state(&self) -> Vec<u8> {
+        serde_json::to_vec(self.service.registry.lock().await.state()).expect("state encoded")
+    }
+
+    /// Something in the way of the rename: the write fails, whoever runs this.
+    fn block_the_registry_file(&self) {
+        std::fs::remove_file(&self.registry_path).expect("registry file");
+        std::fs::create_dir(&self.registry_path).expect("in the way");
+    }
+
+    fn free_the_registry_file(&self) {
+        std::fs::remove_dir(&self.registry_path).expect("out of the way");
+    }
+
+    async fn status(&self) -> astra_channel::OperatorAuthorityStatus {
+        let listener = listen(Arc::clone(&self.service)).await;
+        let (status, body) = read_status(&listener).await;
+        assert_eq!(status, 200);
+        serde_json::from_slice(&body).expect("the status")
+    }
+}
+
+/// A client TLS transition under the fixture's CA-PQ, approved by two real keys.
+async fn client_tls_deposit(dir: &Path) -> (Deposit, Fingerprint) {
     use aether::certificates::approval::CredentialRegistry;
     use aether::certificates::authority::ClientTlsCaTransition;
-    use aether::certificates::capability::{CapabilityGrant, CapabilityScope};
     use aether::certificates::status::{AstraSignerResult, CampaignApproval};
     use aether::certificates::transport::TrustUpdateObject;
     use aether::certificates::window::TransitionWindow;
 
-    let dir = tempfile::tempdir().expect("temp dir");
     let active = Fingerprint::of(b"client tls ca");
-    let (mut built, ca_private) = build_service_with_ca(dir.path(), Some(active), None);
+    let (mut built, ca_private) = build_service_with_ca(dir, Some(active), None);
     let (first_key, first) = approving_credential(&ca_private, 1);
     let (second_key, second) = approving_credential(&ca_private, 2);
-    let registry = CredentialRegistry {
-        trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
-        gateway_wg_public_key: WireGuardKey::from_bytes([1; 32]),
-        ca_epoch: 1,
-        credential_registry_epoch: 1,
-        bindings: vec![first.clone(), second.clone()],
-    };
     built.approval_credentials = RwLock::new(Arc::new(crate::service::ApprovalCredentials {
         ids: vec![first.credential_id.clone(), second.credential_id.clone()],
         epoch: 1,
-        registry: Some(Box::new(registry)),
+        registry: Some(Box::new(CredentialRegistry {
+            trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+            gateway_wg_public_key: WireGuardKey::from_bytes([1; 32]),
+            ca_epoch: 1,
+            credential_registry_epoch: 1,
+            bindings: vec![first.clone(), second.clone()],
+        })),
     }));
     let service = Arc::new(built);
 
@@ -581,8 +643,6 @@ async fn a_failed_save_of_a_deposit_leaves_nothing_in_flight() {
             .await,
     );
     let campaign = campaign_of(&service, &opened).await;
-    let operation_id = opened.operation_id;
-
     let transition = ClientTlsCaTransition {
         format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
         trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
@@ -618,60 +678,243 @@ async fn a_failed_save_of_a_deposit_leaves_nothing_in_flight() {
         credential_registry: None,
         issuer_authorization: None,
     });
-    let token = {
-        let operations = service.signing.lock().await;
-        let operation = operations.get(&operation_id, NOW).expect("operation held");
-        let grant = CapabilityGrant::new(
-            CapabilityScope::SignerResultSubmit,
-            operation_id,
-            operation.manifest_fingerprint(),
-            None,
-            NOW,
-            NOW + 120,
-        )
-        .expect("grant");
-        service
-            .capabilities
-            .lock()
-            .await
-            .issue(&grant, operation.expires_at)
-            .expect("token")
+    let token = submit_token(&service, &opened.operation_id).await;
+    let deposit = Deposit {
+        registry_path: dir.join("registry.json"),
+        service,
+        operation_id: opened.operation_id,
+        token,
+        result,
     };
+    (deposit, incoming)
+}
 
-    let state_of = || async {
-        serde_json::to_vec(service.registry.lock().await.state()).expect("state encoded")
-    };
-    let before = state_of().await;
-    // Something in the way of the rename: the write fails, whoever runs this.
-    let registry_path = dir.path().join("registry.json");
-    std::fs::remove_file(&registry_path).expect("registry file");
-    std::fs::create_dir(&registry_path).expect("in the way");
+/// The write failed and nothing the operator sent is at fault: a 500, which Orion
+/// answers by keeping its journal and replaying. As a 403 with nothing in flight it
+/// would discard the journal, and with it the incoming key, while a save that failed
+/// after its rename left the file holding the anchor of that key.
+#[tokio::test]
+async fn a_failed_save_of_a_deposit_is_not_a_refusal_and_leaves_nothing_in_flight() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (deposit, incoming) = client_tls_deposit(dir.path()).await;
+    let before = deposit.state().await;
+    deposit.block_the_registry_file();
 
-    let refused = crate::service::operator_signer_result(
-        &service,
-        &operation_id,
-        &token,
-        result.clone(),
-        NOW,
-    )
+    let failed = deposit.send().await;
+
+    assert_eq!(
+        deposit.state().await,
+        before,
+        "memory says what the file says"
+    );
+    assert_eq!(failed.err(), Some(crate::service::ServiceError::Internal));
+    assert_eq!(deposit.status().await.next_ca_tls_fingerprint, None);
+
+    deposit.free_the_registry_file();
+    deposit.send().await.expect("the identical deposit lands");
+    assert_eq!(
+        deposit.status().await.next_ca_tls_fingerprint,
+        Some(incoming)
+    );
+}
+
+/// A document refused on its merits is still refused: retrying it would change
+/// nothing, and the answer is what lets a rotation be discarded.
+#[tokio::test]
+async fn a_transition_refused_on_its_merits_stays_a_refusal() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (deposit, _) = client_tls_deposit(dir.path()).await;
+    rewrite_registry(&deposit.service, |state| {
+        state.ca_tls_fingerprint = Some(Fingerprint::of(b"une autre ancre"));
+    })
     .await;
+    let before = deposit.state().await;
+
+    let refused = deposit.send().await;
 
     assert_eq!(refused.err(), Some(crate::service::ServiceError::Refused));
-    assert_eq!(state_of().await, before, "memory says what the file says");
-    let listener = listen(Arc::clone(&service)).await;
-    let (status, body) = read_status(&listener).await;
-    assert_eq!(status, 200);
-    let report: astra_channel::OperatorAuthorityStatus =
-        serde_json::from_slice(&body).expect("the status");
-    assert_eq!(report.next_ca_tls_fingerprint, None);
+    assert_eq!(deposit.state().await, before);
+}
 
-    // The volume comes back: the identical deposit is what was promised to work.
-    std::fs::remove_dir(&registry_path).expect("out of the way");
-    crate::service::operator_signer_result(&service, &operation_id, &token, result, NOW)
+/// A delegation under `delegated`'s CA-PQ, in the campaign that names its material,
+/// approved by one real key.
+async fn issuer_deposit(dir: &Path) -> Deposit {
+    use aether::certificates::approval::CredentialRegistry;
+    use aether::certificates::status::{
+        AstraRotationCampaign, AstraSignerRequest, AstraSignerResult, CampaignApproval,
+        CampaignTarget,
+    };
+
+    let mut built = build_service(dir, None, None);
+    let delegated = ready_to_install(&built).await;
+    let (key, binding) = approving_credential(&delegated.ca_private, 1);
+    let trust_domain_id = TrustDomainId::new([1; 16]).expect("domain");
+    let gateway_wg_public_key = WireGuardKey::from_bytes([1; 32]);
+    built.approval_credentials = RwLock::new(Arc::new(crate::service::ApprovalCredentials {
+        ids: vec![binding.credential_id.clone()],
+        epoch: 1,
+        registry: Some(Box::new(CredentialRegistry {
+            trust_domain_id,
+            gateway_wg_public_key,
+            ca_epoch: 1,
+            credential_registry_epoch: 1,
+            bindings: vec![binding.clone()],
+        })),
+    }));
+    let service = Arc::new(built);
+
+    let authorization = delegation(&delegated, 1);
+    let campaign = Box::new(AstraRotationCampaign {
+        format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+        campaign_id: Id16::new([0x71; 16]).expect("campaign"),
+        trust_domain_id,
+        gateway_wg_public_key,
+        server_name: "gateway.example".into(),
+        created_at: NOW,
+        expires_at: NOW + 300,
+        scope: CampaignScope::IssuerDelegation,
+        targets: vec![CampaignTarget {
+            certificate_kind: CertificateKind::AstraIssuer,
+            identity_key: gateway_wg_public_key,
+            epoch: 1,
+            generation: 1,
+            active_tls_certificate_fingerprint: Fingerprint::of(
+                &aether::certificates::x509::subject_public_key_info(&delegated.intermediate)
+                    .expect("public key info"),
+            ),
+            active_pq_certificate_fingerprint: Fingerprint::of(delegated.issuer_public.as_bytes()),
+        }],
+        reason: "delegate".into(),
+        requested_by: "operator".into(),
+        policy_fingerprint: authorization.policy_fingerprint,
+        required_credentials: CampaignScope::IssuerDelegation.required_credentials(),
+    });
+    let operation_id = Id16::new([0x72; 16]).expect("operation");
+    let request = Box::new(AstraSignerRequest {
+        format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+        operation_id,
+        campaign_fingerprint: campaign.fingerprint(),
+        authority_url: "https://astra.example".into(),
+        encrypted_vault_fingerprint: Fingerprint::of(b"placeholder encrypted vault"),
+        required_credentials: campaign.required_credentials,
+        created_at: NOW,
+        expires_at: NOW + 300,
+        astra_service_key_epoch: 1,
+        astra_signature: aether::certificates::encoding::MlDsa87Signature::placeholder(),
+    });
+    let result = Box::new(AstraSignerResult {
+        format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+        approval: Box::new(CampaignApproval {
+            campaign_id: campaign.campaign_id,
+            campaign_fingerprint: campaign.fingerprint(),
+            required_credentials: campaign.required_credentials,
+            approved_at: NOW,
+            approvals: vec![assertion_for(&key, &binding, &campaign)],
+        }),
+        objects: Vec::new(),
+        credential_registry: None,
+        issuer_authorization: Some(Box::new(authorization)),
+    });
+    let operation =
+        crate::signing::SigningOperation::new(campaign, request, NOW).expect("operation");
+    service
+        .signing
+        .lock()
         .await
-        .expect("the identical deposit lands");
-    let (_, body) = read_status(&listener).await;
-    let report: astra_channel::OperatorAuthorityStatus =
-        serde_json::from_slice(&body).expect("the status");
-    assert_eq!(report.next_ca_tls_fingerprint, Some(incoming));
+        .open(operation, NOW)
+        .expect("operation stored");
+    let token = submit_token(&service, &operation_id).await;
+    Deposit {
+        registry_path: dir.join("registry.json"),
+        service,
+        operation_id,
+        token,
+        result,
+    }
+}
+
+/// Left in memory, the delegation makes the retry a no-op that writes nothing and
+/// spends the approval: a restart then loses it behind a spent approval.
+#[tokio::test]
+async fn a_retry_after_a_failed_save_of_a_delegation_writes_the_file() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let deposit = issuer_deposit(dir.path()).await;
+    let before = deposit.state().await;
+    deposit.block_the_registry_file();
+
+    let failed = deposit.send().await;
+
+    assert_eq!(
+        deposit.state().await,
+        before,
+        "memory says what the file says"
+    );
+    assert_eq!(failed.err(), Some(crate::service::ServiceError::Internal));
+    assert_eq!(deposit.status().await.issuer, None);
+
+    deposit.free_the_registry_file();
+    deposit.send().await.expect("the identical deposit lands");
+    let on_disk: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&deposit.registry_path).expect("registry file"))
+            .expect("registry");
+    assert_eq!(on_disk["issuer"]["issuer_epoch"], serde_json::json!(1));
+    assert_eq!(
+        deposit
+            .status()
+            .await
+            .issuer
+            .map(|issuer| issuer.recorded_epoch),
+        Some(1)
+    );
+}
+
+/// No private material for its epoch is the document's fault, not a failed write.
+#[tokio::test]
+async fn a_delegation_refused_on_its_merits_stays_a_refusal() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let deposit = issuer_deposit(dir.path()).await;
+    std::fs::remove_file(crate::issuer::pq_key_path(dir.path(), 1)).expect("key removed");
+    let before = deposit.state().await;
+
+    let refused = deposit.send().await;
+
+    assert_eq!(refused.err(), Some(crate::service::ServiceError::Refused));
+    assert_eq!(deposit.state().await, before);
+}
+
+/// The registry itself refusing a document is not a failed write, though both come
+/// back as a registry error: another delegation already spent this epoch.
+#[tokio::test]
+async fn a_delegation_at_a_spent_epoch_stays_a_refusal() {
+    use aether::certificates::state::{AstraIssuerState, IssuerLifecycle};
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let deposit = issuer_deposit(dir.path()).await;
+    let mut other = deposit
+        .result
+        .issuer_authorization
+        .as_deref()
+        .expect("a delegation")
+        .clone();
+    other.not_after -= 1;
+    deposit
+        .service
+        .registry
+        .lock()
+        .await
+        .install_issuer(
+            AstraIssuerState {
+                issuer_epoch: other.issuer_epoch,
+                authorization: other,
+                state: IssuerLifecycle::Active,
+            },
+            NOW,
+        )
+        .expect("another delegation at this epoch");
+    let before = deposit.state().await;
+
+    let refused = deposit.send().await;
+
+    assert_eq!(refused.err(), Some(crate::service::ServiceError::Refused));
+    assert_eq!(deposit.state().await, before);
 }

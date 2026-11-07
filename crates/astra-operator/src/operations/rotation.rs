@@ -33,7 +33,7 @@ use aether::certificates::encoding::{DerCertificate, Fingerprint, Id16, MlDsa87P
 use aether::certificates::operator_session::{
     AffectedCa, AstraManifest, CaRotationManifest, CampaignManifest,
 };
-use aether::certificates::status::{AstraRotationCampaign, AstraSignerResult, CertificateKind};
+use aether::certificates::status::{AstraRotationCampaign, AstraSignerResult};
 use aether::certificates::transport::{
     OperatorAuthorityStatus, OperatorOpenAction, OperatorOpenRequest, OperatorOpened,
     OperatorVaultCopy, SigningOperationState, TrustUpdateObject,
@@ -423,29 +423,28 @@ pub fn open(
     })
 }
 
-/// What the touch does: the one authority replaced, though the campaign has a row
-/// for each. The incoming anchor does not exist before the signature, which waits
-/// for the approvals, so it is absent here and the journal gives it once signed.
+/// What the touch does, with the whole campaign it signs: the authority replaced, and
+/// every target that fingerprint covers. The incoming anchor does not exist before
+/// the signature, which waits for the approvals, so it is absent here and the journal
+/// gives it once signed.
 fn rotation_manifest(
     domain: &LocalDomain,
     window: TransitionWindow,
     campaign: &AstraRotationCampaign,
 ) -> AstraManifest {
-    let (affected_ca, certificate_kind, current_epoch, outgoing_anchor_fingerprint) =
-        match &domain.active_certificate {
-            None => (
-                AffectedCa::CaPq,
-                CertificateKind::CaPq,
-                domain.identity.ca_epoch,
-                domain.current_ca.authority_fingerprint(),
-            ),
-            Some(active) => (
-                AffectedCa::CaTls,
-                CertificateKind::CaTls,
-                domain.identity.ca_tls_epoch,
-                active.fingerprint(),
-            ),
-        };
+    let (affected_ca, current_epoch, outgoing_anchor_fingerprint) = match &domain.active_certificate
+    {
+        None => (
+            AffectedCa::CaPq,
+            domain.identity.ca_epoch,
+            domain.current_ca.authority_fingerprint(),
+        ),
+        Some(active) => (
+            AffectedCa::CaTls,
+            domain.identity.ca_tls_epoch,
+            active.fingerprint(),
+        ),
+    };
     AstraManifest::CaRotation(CaRotationManifest {
         trust_domain_id: domain.identity.trust_domain_id,
         affected_ca,
@@ -455,11 +454,6 @@ fn rotation_manifest(
         not_after: window.not_after,
         outgoing_anchor_fingerprint,
         next_anchor_fingerprint: None,
-        target_count: campaign
-            .targets
-            .iter()
-            .filter(|target| target.certificate_kind == certificate_kind)
-            .count(),
         campaign: Some(CampaignManifest {
             campaign: Box::new(campaign.clone()),
             fingerprint: campaign.fingerprint(),
@@ -580,6 +574,9 @@ impl OpenedRotation {
             // A dead campaign has no use for them, and they must not wait on the
             // caller dropping this value.
             self.keys.openings.clear();
+        }
+        // Empty only once expired, whatever a clock that moved back says now.
+        if self.keys.openings.is_empty() {
             return Err(KeyStep::Expired);
         }
         let offered = self.offered();

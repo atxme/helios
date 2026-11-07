@@ -11,12 +11,13 @@ import * as api from '../api'
 import { RULE } from '../theme'
 import type {
   AstraManifest,
+  CampaignManifest,
   GestureState,
   KeyRole,
   OperationKind,
   OperatorStatus,
-  RemoteState,
   Refusal,
+  RemoteState,
 } from '../types'
 
 /**
@@ -115,6 +116,19 @@ export function groupedHex(hex: string): string {
   return hex.replace(/\s+/g, '').replace(/(.{4})(?=.)/g, '$1 ')
 }
 
+/** Every target a campaign binds: the touch signs them all. */
+function targetRows(campaign: CampaignManifest['campaign']): [string, string][] {
+  return campaign.targets.flatMap((target, index): [string, string][] => [
+    [
+      `cible ${index + 1}`,
+      `${CERTIFICATE_KINDS[target.certificate_kind]} — ${target.identity_key}`,
+    ],
+    [`cible ${index + 1} état`, `époque ${target.epoch}, génération ${target.generation}`],
+    [`cible ${index + 1} TLS`, target.active_tls_certificate_fingerprint],
+    [`cible ${index + 1} PQ`, target.active_pq_certificate_fingerprint],
+  ])
+}
+
 /** The rows of one manifest, named here and never carried as text. */
 export function rowsOf(manifest: AstraManifest): [string, string][] {
   switch (manifest.operation) {
@@ -142,15 +156,7 @@ export function rowsOf(manifest: AstraManifest): [string, string][] {
         ['nom serveur', manifest.campaign.server_name],
         ['politique', manifest.campaign.policy_fingerprint],
         ['clés requises', String(manifest.campaign.required_credentials)],
-        ...manifest.campaign.targets.flatMap((target, index): [string, string][] => [
-          [
-            `cible ${index + 1}`,
-            `${CERTIFICATE_KINDS[target.certificate_kind]} — ${target.identity_key}`,
-          ],
-          [`cible ${index + 1} état`, `époque ${target.epoch}, génération ${target.generation}`],
-          [`cible ${index + 1} TLS`, target.active_tls_certificate_fingerprint],
-          [`cible ${index + 1} PQ`, target.active_pq_certificate_fingerprint],
-        ]),
+        ...targetRows(manifest.campaign),
         ['empreinte', manifest.fingerprint],
         ['domaine', manifest.campaign.trust_domain_id],
       ]
@@ -190,7 +196,6 @@ export function rowsOf(manifest: AstraManifest): [string, string][] {
         ['échéance', instant(manifest.not_after)],
         ['ancre sortante', manifest.outgoing_anchor_fingerprint],
         ['ancre entrante', manifest.next_anchor_fingerprint ?? 'créée à la signature'],
-        ['pairs concernés', String(manifest.target_count)],
         ['domaine', manifest.trust_domain_id],
       ]
       if (manifest.campaign) {
@@ -199,6 +204,9 @@ export function rowsOf(manifest: AstraManifest): [string, string][] {
           ['portée', CAMPAIGN_SCOPES[manifest.campaign.campaign.scope]],
           ['motif', manifest.campaign.campaign.reason],
           ['demandée par', manifest.campaign.campaign.requested_by],
+          ['clés requises', String(manifest.campaign.campaign.required_credentials)],
+          ['cibles', String(manifest.campaign.campaign.targets.length)],
+          ...targetRows(manifest.campaign.campaign),
           ['empreinte de campagne', manifest.campaign.fingerprint],
         )
       }

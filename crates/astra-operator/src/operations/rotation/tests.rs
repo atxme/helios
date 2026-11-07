@@ -1070,8 +1070,8 @@ fn a_vault_with_a_client_tls_window_still_open_opens_nothing() {
     assert!(!remote.called("open_campaign"));
 }
 
-/// What the touch does, stated before it: the authority replaced, not both rows
-/// of the campaign, and the incoming anchor absent since it does not exist yet.
+/// What the touch does, stated before it: the authority replaced, the campaign it
+/// approves, and the incoming anchor absent since it does not exist yet.
 #[test]
 fn the_manifest_states_what_the_touch_does() {
     for (kind, affected_ca) in [
@@ -1109,10 +1109,11 @@ fn the_manifest_states_what_the_touch_does() {
         assert_eq!(manifest.not_after, rotation.window().not_after);
         assert_eq!(manifest.outgoing_anchor_fingerprint, outgoing);
         assert_eq!(manifest.next_anchor_fingerprint, None);
-        assert_eq!(manifest.target_count, 1, "{kind:?}");
 
+        // The touch signs the campaign's fingerprint, so what it binds is all here.
         let campaign = manifest.campaign.as_ref().expect("the campaign");
         assert_eq!(campaign.fingerprint, campaign.campaign.fingerprint());
+        assert_eq!(campaign.campaign.targets.len(), 2, "{kind:?}");
         assert_eq!(campaign.campaign.scope, CampaignScope::TrustAuthorities);
     }
 }
@@ -1341,6 +1342,14 @@ fn a_clock_moving_back_after_the_expiry_signs_nothing() {
         rotation.approve(&domain.keys[2], EXPIRES),
         Err(KeyStep::Expired)
     );
+    let touches = domain.touches();
+
+    assert_eq!(
+        rotation.approve(&domain.keys[0], NOW + 1),
+        Err(KeyStep::Expired),
+        "the same answer as the signature, whatever the clock says now"
+    );
+    assert_eq!(domain.touches(), touches);
 
     let refused = rotation
         .sign_and_journal(&domain.path, NOW + 1)
@@ -1769,6 +1778,45 @@ fn a_transient_status_on_the_deposit_keeps_the_rotation() {
         // The next look replays the same deposit.
         let step = advance(&remote, &domain.path, &mut journal, NOW).expect("advanced");
         assert_eq!(step, ResumeStep::Finished, "{status}");
+    }
+}
+
+/// What Astra answers when its own write failed: a 500, and a status read showing
+/// nothing in flight. That is not a refusal, so nothing here may read it as the end
+/// of the rotation, and the journal holding the incoming key stays.
+#[test]
+fn a_500_with_nothing_held_keeps_the_rotation_and_the_replay_lands() {
+    for kind in [RotationKind::CaPq, RotationKind::CaTls] {
+        let domain = domain();
+        let mut journal = domain.signed(kind);
+        let before = journal.clone();
+        let next = journal.next.clone().expect("next");
+        let vault = std::fs::read(&domain.path).expect("vault");
+        let remote = Remote::watching(&domain.path);
+        remote.deposits.borrow_mut().push_back(Err(500));
+
+        advance(&remote, &domain.path, &mut journal, NOW).expect_err("an error to report");
+
+        assert_eq!(domain.journal_on_disk().as_ref(), Some(&before), "{kind:?}");
+        assert_eq!(before.stage, JournalStage::Signed);
+        assert_eq!(
+            std::fs::read(&domain.path).expect("vault"),
+            vault,
+            "{kind:?}"
+        );
+        assert_eq!(prepared_record_on_disk(&domain), None, "{kind:?}");
+
+        let mut resumed = domain.journal_on_disk().expect("journal");
+        let step = advance(&remote, &domain.path, &mut resumed, NOW).expect("advanced");
+
+        assert_eq!(step, ResumeStep::Finished, "{kind:?}");
+        assert_eq!(store::load(&domain.path).expect("vault"), next.vault);
+        let deposits = remote
+            .calls()
+            .iter()
+            .filter(|call| **call == "submit_campaign")
+            .count();
+        assert_eq!(deposits, 2, "{kind:?}");
     }
 }
 
