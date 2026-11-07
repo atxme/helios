@@ -66,6 +66,9 @@ export default function App() {
   // also owns certificate-authority operations an operator may start there;
   // this state drives only the attention badge.
   const [astraPending, setAstraPending] = useState(false)
+  // A rotation signed and not finished: its install deadline runs with no session open,
+  // and an operator who left a failure screen for Connexion has no other reminder.
+  const [rotationInFlight, setRotationInFlight] = useState(false)
   // The Certificates view is unmounted during the Astra ceremony. Keep the
   // committed result here so returning to it does not erase the operation the
   // user just completed.
@@ -106,6 +109,26 @@ export default function App() {
     }
     look()
     const timer = window.setInterval(look, 3000)
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+    }
+  }, [])
+
+  // The overview, not the ceremony: a finished session is not live, yet its journal is.
+  // Slow, since it reads through the tunnel; a failed read keeps what was last known.
+  useEffect(() => {
+    let cancelled = false
+    const look = () => {
+      void api
+        .operatorRotationsOverview()
+        .then((found) => {
+          if (!cancelled) setRotationInFlight(found.journal != null || found.resumable === true)
+        })
+        .catch(() => {})
+    }
+    look()
+    const timer = window.setInterval(look, 60_000)
     return () => {
       cancelled = true
       window.clearInterval(timer)
@@ -339,7 +362,7 @@ export default function App() {
               const pending =
                 value === 'logs' && view !== 'logs'
                   ? c.logs.length
-                  : value === 'astra' && astraPending && view !== 'astra'
+                  : value === 'astra' && (astraPending || rotationInFlight) && view !== 'astra'
                     ? 1
                     : 0
               return (

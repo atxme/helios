@@ -12,6 +12,7 @@ import {
 import {
   allGreen,
   effectiveNow,
+  journalLine,
   liveOperation,
   plainFingerprint,
   prerequisites,
@@ -411,6 +412,22 @@ describe('the stops', () => {
     expect(stopSentence('install_deadline_passed', journal)).toMatch(/Intervention manuelle requise/)
   })
 
+  it('an_install_deadline_gives_the_cut_date_apart_from_the_activation', () => {
+    const sentence = stopSentence('install_deadline_passed', journal)
+    expect(sentence).toMatch(/Coupure le .*2027/)
+    expect(sentence).toMatch(/Intervention manuelle requise\.$/)
+    expect(stopSentence('install_deadline_passed', null)).toBe(
+      'Délai dépassé. Intervention manuelle requise.',
+    )
+  })
+
+  it('the_label_of_a_gateway_naming_no_anchor_gives_both_causes', () => {
+    const label = stopSentence('gateway_names_no_anchor', { ...journal, kind: 'ca_tls' })
+    expect(label).toMatch(/CA TLS/)
+    expect(label).toMatch(/mise à jour/)
+    expect(label).not.toBe(stopSentence('domain_conflict', journal))
+  })
+
   it('an_offline_CA_PQ_conflict_points_to_the_signer', () => {
     expect(stopSentence('domain_conflict', journal)).toMatch(/astra-signer rotate-ca-pq/)
     expect(stopSentence('domain_conflict', { ...journal, kind: 'ca_tls' })).not.toMatch(/astra-signer/)
@@ -427,6 +444,37 @@ describe('the stops', () => {
     expect(stopSentence('gateway_names_no_anchor', journal)).not.toMatch(/CA TLS/)
     expect(stopSentence('gateway_names_no_anchor', { ...journal, kind: 'ca_tls' })).toMatch(/CA TLS/)
     expect(stopSentence('gateway_names_no_anchor', null)).toMatch(/sans CA TLS/)
+  })
+})
+
+describe('the journal line', () => {
+  const journal = {
+    kind: 'ca_pq' as const,
+    stage: 'applied' as const,
+    activationAt: NOW + 3 * DAY,
+    notAfter: NOW + 33 * DAY,
+    nextFingerprint: 'aa',
+    offline: false,
+  }
+
+  it('gives_the_deadline_of_a_rotation_still_to_install', () => {
+    const line = journalLine(journal, NOW)
+    expect(line.blocking).toBe(false)
+    expect(line.text).toMatch(/^Rotation CA-PQ · à installer avant le /)
+  })
+
+  it('past_the_activation_it_is_blocking_with_the_cut_date', () => {
+    const line = journalLine({ ...journal, activationAt: NOW - DAY }, NOW)
+    expect(line.blocking).toBe(true)
+    expect(line.text).toMatch(/^Délai dépassé le /)
+    expect(line.text).toMatch(/Coupure le /)
+    expect(line.text).toMatch(/Intervention manuelle requise/)
+  })
+
+  it('an_installed_rotation_only_awaits_its_copy', () => {
+    const line = journalLine({ ...journal, kind: 'ca_tls', stage: 'installed' }, NOW - 400 * DAY)
+    expect(line.blocking).toBe(false)
+    expect(line.text).toBe('Rotation CA TLS · copie du coffre en attente')
   })
 })
 

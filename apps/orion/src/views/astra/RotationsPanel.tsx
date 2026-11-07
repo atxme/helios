@@ -48,9 +48,13 @@ export interface RotationStepContext {
   existingOperation: OperatorPendingOperation | null
   /** The label of the first key, for `requested_by`. */
   operatorLabel: string
-  onCeremony: (status: OperatorStatus) => void
-  /** Reads the overview again. */
-  refresh: () => void
+  /**
+   * Hands a ceremony over to the screen. `existingOperation` is the campaign of the
+   * rotation to lead at the approval, when one was already open.
+   */
+  onCeremony: (status: OperatorStatus, existingOperation?: string | null) => void
+  /** Reads the overview again, once the read in flight has ended. */
+  refresh: () => Promise<RotationsOverview | null>
 }
 
 function operatorLabelOf(o: RotationsOverview): string {
@@ -124,11 +128,14 @@ export function RotationsPanel({
   onCeremony,
   onOverview,
   renderStep,
+  resumeStop,
 }: {
-  onCeremony: (status: OperatorStatus) => void
+  onCeremony: (status: OperatorStatus, existingOperation?: string | null) => void
   /** Every read, so the rest of the screen follows without a read of its own. */
   onOverview?: (overview: RotationsOverview) => void
   renderStep?: (context: RotationStepContext) => ReactNode
+  /** Where an automatic resumption stopped, said in its row: it never takes the tab. */
+  resumeStop?: string | null
 }) {
   const [overview, setOverview] = useState<RotationsOverview | null>(null)
   const [readError, setReadError] = useState<string | null>(null)
@@ -232,8 +239,12 @@ export function RotationsPanel({
     setNotice(null)
     try {
       if (row.action === 'renew_fleet') {
+        // Read again first: the poll may be old, and a campaign open since is led, not met
+        // as a refusal.
+        const fresh = await readAfter()
+        const current = fresh ? liveOperation(fresh, row.action) : existing
         const operationId =
-          existing?.operation_id ??
+          current?.operation_id ??
           (
             await api.operatorOpenCampaign(
               { action: 'fleet_leafs' },
@@ -331,6 +342,11 @@ export function RotationsPanel({
                 {`Opération ouverte · ${live.reason}`}
               </Typography>
             )}
+            {row.action === 'resume' && resumeStop && (
+              <Typography sx={{ fontSize: 11.5, color: '#B91C1C', fontWeight: 600 }}>
+                {resumeStop}
+              </Typography>
+            )}
             {row.disabledReason && row.disabledReason !== row.state && (
               <Typography color="text.secondary" sx={{ fontSize: 11.5 }}>
                 {row.disabledReason}
@@ -396,7 +412,7 @@ export function RotationsPanel({
                 onClick={() => void proceed(chosen)}
                 sx={{ minHeight: 30, fontSize: 12 }}
               >
-                {existing ? 'Reprendre' : 'Continuer'}
+                {existing ? 'Reprendre l’opération ouverte' : 'Continuer'}
               </Button>
             </Box>
           )}
@@ -411,7 +427,7 @@ export function RotationsPanel({
                   existingOperation: existing,
                   operatorLabel: operatorLabelOf(overview),
                   onCeremony,
-                  refresh: () => void readAfter(),
+                  refresh: readAfter,
                 })}
               </Box>
             )}

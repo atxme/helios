@@ -9,11 +9,13 @@ const api = vi.hoisted(() => ({
   operatorOpenCampaign: vi.fn(),
   beginOperatorCeremony: vi.fn(),
   beginIssuerCeremony: vi.fn(),
+  beginRotationCeremony: vi.fn(),
 }))
 vi.mock('../../api', () => api)
 
 import type { OperatorPendingOperation, RotationsOverview } from '../../types'
 import { RotationsPanel } from './RotationsPanel'
+import { RotationSteps } from './RotationSteps'
 import { NOW, authorityRead, overview } from './rotationFixtures'
 
 const operation = (scope: OperatorPendingOperation['scope']): OperatorPendingOperation => ({
@@ -128,7 +130,7 @@ describe('the prerequisites', () => {
     )
     expect(within(region('Renouveler les postes')).getByRole('button').textContent).toBe('Reprendre')
     choose('Renouveler les postes')
-    fireEvent.click(prerequisitesOf().getByRole('button', { name: 'Reprendre' }))
+    fireEvent.click(prerequisitesOf().getByRole('button', { name: 'Reprendre l’opération ouverte' }))
     await waitFor(() => expect(onCeremony).toHaveBeenCalled())
     expect(api.operatorOpenCampaign).not.toHaveBeenCalled()
     expect(api.beginOperatorCeremony).toHaveBeenCalledWith({
@@ -141,6 +143,8 @@ describe('the prerequisites', () => {
     api.operatorOpenCampaign.mockRejectedValue('refusé (403) : ...')
     await show()
     choose('Renouveler les postes')
+    // Nothing is pending at the read before the opening; the campaign appears in between.
+    api.operatorRotationsOverview.mockResolvedValueOnce(overview())
     api.operatorRotationsOverview.mockResolvedValue(
       overview({ pending: { state: 'ok', value: [operation('fleet_leafs')] } }),
     )
@@ -152,6 +156,22 @@ describe('the prerequisites', () => {
         'Reprendre',
       ),
     )
+  })
+
+  it('pending_is_read_again_before_the_fleet_opens_so_an_open_campaign_is_not_opened_twice', async () => {
+    api.beginOperatorCeremony.mockResolvedValue(ceremony)
+    const { onCeremony } = await show()
+    choose('Renouveler les postes')
+    api.operatorRotationsOverview.mockResolvedValue(
+      overview({ pending: { state: 'ok', value: [operation('fleet_leafs')] } }),
+    )
+    fireEvent.click(prerequisitesOf().getByRole('button', { name: 'Continuer' }))
+    await waitFor(() => expect(onCeremony).toHaveBeenCalledWith(ceremony))
+    expect(api.operatorOpenCampaign).not.toHaveBeenCalled()
+    expect(api.beginOperatorCeremony).toHaveBeenCalledWith({
+      kind: 'approve_campaign',
+      operation_id: 'c'.repeat(32),
+    })
   })
 
   it('a_refusal_with_nothing_pending_is_an_error', async () => {
@@ -238,6 +258,46 @@ describe('a row that becomes impossible after it was chosen', () => {
     api.operatorRotationsOverview.mockResolvedValue(overview({ resumable: true }))
     fireEvent.click(prerequisitesOf().getByRole('button', { name: 'Vérifier' }))
     await waitFor(() => expect(screen.queryByText('étape')).toBeNull())
+  })
+})
+
+describe('a step that has started', () => {
+  it('hands_over_even_when_the_row_turns_disabled_during_the_start', async () => {
+    let release: (value: unknown) => void = () => {}
+    api.beginRotationCeremony.mockImplementation(
+      () => new Promise((resolve) => (release = resolve)),
+    )
+    const onCeremony = vi.fn()
+    api.operatorRotationsOverview.mockResolvedValue(overview())
+    render(
+      <RotationsPanel
+        onCeremony={onCeremony}
+        renderStep={(context) => <RotationSteps {...context} />}
+      />,
+    )
+    await screen.findByRole('region', { name: 'Remplacer la CA TLS' })
+    choose('Remplacer la CA TLS')
+    fireEvent.click(await screen.findByRole('button', { name: 'Continuer' }))
+    await waitFor(() => expect(api.beginRotationCeremony).toHaveBeenCalled())
+
+    // A poll flips the row: the step is gone, but the start it made is not lost.
+    api.operatorRotationsOverview.mockResolvedValue(overview({ resumable: true }))
+    fireEvent.click(prerequisitesOf().getByRole('button', { name: 'Vérifier' }))
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Continuer' })).toBeNull())
+    release(ceremony)
+    await waitFor(() => expect(onCeremony).toHaveBeenCalledWith(ceremony, null))
+  })
+
+  it('shows_the_stop_of_an_automatic_resumption_in_its_row', async () => {
+    api.operatorRotationsOverview.mockResolvedValue(overview({ resumable: true }))
+    render(
+      <RotationsPanel
+        onCeremony={vi.fn()}
+        resumeStop="Délai dépassé le 15 janv. 2027. Intervention manuelle requise."
+      />,
+    )
+    const row = await screen.findByRole('region', { name: 'Reprendre une rotation' })
+    expect(within(row).getByText(/Intervention manuelle requise/)).toBeTruthy()
   })
 })
 

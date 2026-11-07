@@ -1068,28 +1068,5 @@ fn finish_manifest(
     }))
 }
 
-/// The label of a rotation that stopped, for the steps [`advance`] stops at.
-///
-/// A gateway naming no anchor of that kind is either older than the field, or
-/// current with no client TLS CA configured, and the two read the same: the label
-/// gives both.
-pub fn stop_label(step: ResumeStep) -> Option<&'static str> {
-    match step {
-        ResumeStep::Discard => Some("Rotation expirée. Recommencer"),
-        ResumeStep::DomainConflict => Some("Domaine en désaccord. Intervention manuelle requise"),
-        ResumeStep::InstallDeadlinePassed => Some("Délai dépassé"),
-        ResumeStep::GatewayOutdated => {
-            Some("Gateway sans CA TLS, ou mise à jour requise. Rotation conservée")
-        }
-        ResumeStep::SendVaultCopy => Some("Copie du coffre retenue. Nouvel essai à la reprise"),
-        ResumeStep::Deposit
-        | ResumeStep::ReadAuthority
-        | ResumeStep::ApplyLocal
-        | ResumeStep::Install
-        | ResumeStep::ReadGateway
-        | ResumeStep::Finished => None,
-    }
-}
-
 #[cfg(test)]
 mod tests;

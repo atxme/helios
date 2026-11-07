@@ -987,8 +987,11 @@ impl OperatorCeremony {
 }
 
 /// Said when a ceremony is already open and a second one is asked for.
-const BUSY: &str = "une cérémonie opérateur est déjà ouverte : la mener à son terme ou l'annuler \
-                    avant d'en ouvrir une autre";
+///
+/// Not « l'annuler » on its own: a resumption offers no Cancel, and a key dialog open
+/// cannot be cancelled until it returns.
+const BUSY: &str = "une cérémonie opérateur est déjà ouverte : attendre sa fin, ou l'annuler \
+                    quand elle le permet, avant d'en ouvrir une autre";
 
 /// Why a ceremony did not open.
 enum Opening {

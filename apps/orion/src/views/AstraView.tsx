@@ -7,11 +7,13 @@ import ButtonBase from '@mui/material/ButtonBase'
 import Typography from '@mui/material/Typography'
 
 import * as api from '../api'
-import { OperatorCeremonyPanel } from './OperatorCeremony'
+import { OperatorCeremonyPanel, refusalSentence } from './OperatorCeremony'
 import { DomainCreated } from './astra/DomainCreated'
 import { DomainPanel } from './astra/DomainPanel'
 import { ApprovalsPanel } from './astra/ApprovalsPanel'
 import { RotationsPanel } from './astra/RotationsPanel'
+import { RotationCeremony, RotationSteps, isRotationStatus } from './astra/RotationSteps'
+import { journalLine } from './astra/rotationRows'
 import { ArtifactDownloads } from './astra/ArtifactDownloads'
 import { EnrollmentOperatorPanel } from './astra/EnrollmentOperatorPanel'
 import { VaultPanel } from './astra/VaultPanel'
@@ -25,6 +27,19 @@ import type {
 /** Under the files of a bootstrap that failed after its leaf was written. */
 const BOOTSTRAP_LEAF_KEPT =
   'La feuille est émise et enregistrée à côté du coffre ; « Finaliser le domaine » reprend ce qui manque.'
+
+/**
+ * The sessions this operator opened. A rotation session found finished and not in here
+ * is a resumption that ran on its own when the tunnel came up: days later it must not
+ * take the tab, so its stop is said in its row. Module-level because the view is
+ * unmounted whenever another one is shown, and the operator's own finished screen stays
+ * theirs on their return.
+ */
+const OPENED_HERE = new Set<string>()
+
+const ENDED = ['done', 'failed', 'cancelled']
+const hasEnded = (status: OperatorStatus) =>
+  typeof status.gesture === 'string' && ENDED.includes(status.gesture)
 
 const TABS = [
   'Enrôlement',
@@ -64,6 +79,14 @@ export function AstraView({
   // read, which keeps every approval suspended rather than assuming there is no overlap.
   const [caPqOverlap, setCaPqOverlap] = useState<boolean | null>(null)
   const [journal, setJournal] = useState<RotationsOverview['journal']>(null)
+  const [resumable, setResumable] = useState(false)
+  // Whether `journal` was read after the ceremony ended: a copy held back leaves it in
+  // place, and the screen must not call the copy sent before knowing.
+  const [journalKnown, setJournalKnown] = useState(true)
+  // A campaign already open for the rotation being led, known before its first key.
+  const [existingOperation, setExistingOperation] = useState<string | null>(null)
+  // The finished session of an automatic resumption, said in its row.
+  const [automaticStop, setAutomaticStop] = useState<OperatorStatus | null>(null)
   const [tab, setTab] = useState<AstraTab>('Enrôlement')
   const [finishingRecovery, setFinishingRecovery] = useState(false)
   const recoveryAttempt = useRef<string | null>(null)
@@ -71,17 +94,21 @@ export function AstraView({
   const readRotations = useCallback(async (cancelled: () => boolean = () => false) => {
     try {
       const found = await api.operatorRotationsOverview()
-      if (cancelled()) return
+      if (cancelled()) return false
       setCaPqOverlap(found.caPqOverlap)
       setJournal(found.journal)
+      setResumable(found.resumable)
+      return true
     } catch {
       // Unread stays unread: approvals remain suspended.
+      return false
     }
   }, [])
 
   const takeOverview = useCallback((found: RotationsOverview) => {
     setCaPqOverlap(found.caPqOverlap)
     setJournal(found.journal)
+    setResumable(found.resumable)
     if (found.pending.state === 'ok') setPending(found.pending.value)
   }, [])
 
@@ -103,7 +130,12 @@ export function AstraView({
     void api
       .operatorCeremonyStatus()
       .then((found) => {
-        if (!cancelled) setCeremony(found)
+        if (cancelled || !found) return
+        if (isRotationStatus(found) && hasEnded(found) && !OPENED_HERE.has(found.session_id)) {
+          setAutomaticStop(found)
+          return
+        }
+        setCeremony(found)
       })
       .catch(() => {})
     void api
@@ -140,6 +172,36 @@ export function AstraView({
     return () => window.clearTimeout(timer)
   }, [ceremony])
 
+  // What a ceremony changed outside it: the overlap it opened or closed, and the journal it
+  // left or took away. Read again once it has ended, and until the read has gone through
+  // the journal stays unknown rather than assumed gone.
+  const ceremonyEnded = ceremony !== null && hasEnded(ceremony)
+  const endedSession = ceremony?.session_id
+  useEffect(() => {
+    if (!ceremonyEnded) return
+    let cancelled = false
+    let timer: number | undefined
+    setJournalKnown(false)
+    const look = () => {
+      void readRotations(() => cancelled).then((read) => {
+        if (cancelled) return
+        if (read) setJournalKnown(true)
+        else timer = window.setTimeout(look, 4000)
+      })
+      void api
+        .operatorPendingOperations()
+        .then((found) => {
+          if (!cancelled) setPending(found)
+        })
+        .catch(() => {})
+    }
+    look()
+    return () => {
+      cancelled = true
+      window.clearTimeout(timer)
+    }
+  }, [ceremonyEnded, endedSession, readRotations])
+
   // The helper owns the operator half only. Once it has released the grant,
   // Orion must immediately resume the client session it kept in Rust: that
   // installs the candidate and relays the signed commit to the gateway. The
@@ -171,7 +233,14 @@ export function AstraView({
     }
   }
 
-  const openCeremony = (next: OperatorStatus) => setCeremony(next)
+  // Every ceremony the operator opens passes here: it stays theirs once it has ended.
+  const openCeremony = (next: OperatorStatus, existing: string | null = null) => {
+    OPENED_HERE.add(next.session_id)
+    setExistingOperation(existing)
+    setJournalKnown(true)
+    setAutomaticStop(null)
+    setCeremony(next)
+  }
 
   // A live protocol-2 ceremony owns the tab entirely. It is not a section
   // beside the CA-TLS form: an operator holding a security key must not be
@@ -187,12 +256,22 @@ export function AstraView({
         <Typography color="text.secondary" sx={{ fontSize: 11.5, lineHeight: 1.55, mb: 1.5 }}>
           Une opération attend l’opérateur.
         </Typography>
-        <OperatorCeremonyPanel
-          status={ceremony}
-          onStatus={setCeremony}
-          onDismiss={() => void dismissCeremony()}
-          journal={journal}
-        />
+        {isRotationStatus(ceremony) ? (
+          <RotationCeremony
+            status={ceremony}
+            onStatus={setCeremony}
+            onDismiss={() => void dismissCeremony()}
+            journal={journalKnown ? journal : undefined}
+            existingOperation={existingOperation}
+          />
+        ) : (
+          <OperatorCeremonyPanel
+            status={ceremony}
+            onStatus={setCeremony}
+            onDismiss={() => void dismissCeremony()}
+            journal={journal}
+          />
+        )}
         {(ceremony.operation === 'invite_enrollment' ||
           ceremony.operation === 'accept_enrollment' ||
           ceremony.operation === 'finalize_domain' ||
@@ -280,13 +359,22 @@ export function AstraView({
     <RotationsPanel
       onCeremony={openCeremony}
       onOverview={takeOverview}
+      renderStep={(context) => <RotationSteps {...context} />}
+      resumeStop={
+        automaticStop?.refusal
+          ? refusalSentence(automaticStop.refusal, journal, automaticStop.operation)
+          : null
+      }
     />
   )
 
+  // A rotation signed and not finished has a deadline whether or not a session shows it.
+  const inFlight = journal ? journalLine(journal, Math.floor(Date.now() / 1000)) : null
+
   const panels: Record<AstraTab, ReactNode> = {
-    'Enrôlement': <EnrollmentOperatorPanel onCeremony={setCeremony} />,
-    'Coffre et clés': <VaultPanel onCeremony={setCeremony} />,
-    'Domaine': <DomainPanel onCeremony={setCeremony} />,
+    'Enrôlement': <EnrollmentOperatorPanel onCeremony={openCeremony} />,
+    'Coffre et clés': <VaultPanel onCeremony={openCeremony} />,
+    'Domaine': <DomainPanel onCeremony={openCeremony} />,
     'Approbations': approvals,
     'Rotations': rotations,
     'Gateways': (
@@ -299,6 +387,15 @@ export function AstraView({
       <Typography component="h2" sx={{ fontSize: 13, fontWeight: 700, mb: 0.5 }}>
         Astra
       </Typography>
+      {inFlight && (
+        <Alert
+          severity={inFlight.blocking ? 'error' : 'warning'}
+          variant="outlined"
+          sx={{ mb: 1, fontSize: 11.5 }}
+        >
+          {inFlight.text}
+        </Alert>
+      )}
       {/* A fixed grid rather than a tab strip: six labels in one row overflow
           the window Orion is drawn for, and a scrolling strip hides sections
           the operator must see. Three columns keep every section in view, in
@@ -311,7 +408,12 @@ export function AstraView({
       >
         {TABS.map((name) => {
           const selected = name === tab
-          const count = name === 'Approbations' ? pending.length : 0
+          const count =
+            name === 'Approbations'
+              ? pending.length
+              : name === 'Rotations' && (journal !== null || resumable)
+                ? 1
+                : 0
           return (
             <ButtonBase
               key={name}

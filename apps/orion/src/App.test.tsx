@@ -199,6 +199,26 @@ describe('App interactions', () => {
     await waitFor(() => expect(mocks.resizeForView).toHaveBeenCalledWith('astra'))
   })
 
+  it('badges Astra for a rotation in flight even when no session is live', async () => {
+    // A failure screen left for Connexion, or a journal nothing resumed: no live session,
+    // but the install deadline still runs.
+    mocks.operatorRotationsOverview.mockResolvedValue({
+      caPqOverlap: false,
+      resumable: true,
+      journal: { kind: 'ca_pq', stage: 'applied', activationAt: 1_800_000_000 },
+    })
+    render(<App />)
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: /Astra/ }).textContent).toMatch(/1/),
+    )
+  })
+
+  it('does not badge Astra when the overview shows nothing to resume', async () => {
+    render(<App />)
+    await waitFor(() => expect(mocks.operatorRotationsOverview).toHaveBeenCalled())
+    expect(screen.getByRole('button', { name: 'Astra' }).textContent).not.toMatch(/1/)
+  })
+
   it('keeps Astra available after a ceremony has finished', async () => {
     mocks.operatorCeremonyStatus.mockResolvedValue({
       session_id: 'a'.repeat(32),

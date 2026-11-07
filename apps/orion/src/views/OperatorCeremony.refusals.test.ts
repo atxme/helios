@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { gestureSentence, refusalSentence } from './OperatorCeremony'
+import { gestureSentence, refusalSentence, retryLabel } from './OperatorCeremony'
 
 describe('refusalSentence for the acceptance', () => {
   it('names the consumed invitation and where to resume it', () => {
@@ -104,5 +104,81 @@ describe('refusalSentence for the issuer delegation', () => {
     expect(gestureSentence(asked, 'rotate_anchor')).toBe(
       'Brancher la clé autorisée (1 sur 2), pour la valider.',
     )
+  })
+})
+
+describe('the words of a rotation', () => {
+  const journal = {
+    kind: 'ca_pq' as const,
+    stage: 'signed' as const,
+    activationAt: 1_800_000_000,
+    notAfter: 1_802_000_000,
+    nextFingerprint: 'aa',
+    offline: false,
+  }
+
+  it('a_gateway_that_cannot_be_reached_is_worded_for_a_rotation', () => {
+    for (const refusal of [
+      { refusal: 'gateway_unavailable' as const },
+      { refusal: 'gateway_refused' as const, status: 409 },
+    ]) {
+      const kept = refusalSentence(refusal, journal, 'rotate_anchor')
+      expect(kept).toMatch(/^Gateway (injoignable|refuse)/)
+      expect(kept).toMatch(/Rotation conservée/)
+      expect(kept).not.toMatch(/admission\.txt/)
+      const unknown = refusalSentence(refusal, null, 'rotate_client_tls_ca')
+      expect(unknown).not.toMatch(/admission\.txt/)
+      expect(unknown).not.toMatch(/conservée/)
+    }
+    expect(refusalSentence({ refusal: 'gateway_refused', status: 409 }, journal, 'rotate_anchor')).toMatch(
+      /409/,
+    )
+  })
+
+  it('an_enrollment_keeps_its_admission_wording', () => {
+    expect(refusalSentence({ refusal: 'gateway_unavailable' }, null, 'accept_enrollment')).toMatch(
+      /admission\.txt/,
+    )
+  })
+
+  it('the_door_and_the_campaign_have_their_labels_in_a_rotation', () => {
+    expect(refusalSentence({ refusal: 'window_expired' }, null, 'rotate_anchor')).toBe(
+      'Campagne expirée',
+    )
+    expect(
+      refusalSentence({ refusal: 'authority_refused', status: 429 }, null, 'rotate_anchor'),
+    ).toBe('Trop d’opérations en attente')
+    expect(
+      refusalSentence({ refusal: 'authority_refused', status: 403 }, null, 'rotate_anchor'),
+    ).toBe('Opération déjà ouverte')
+    expect(
+      refusalSentence({ refusal: 'authority_refused', status: 500 }, null, 'rotate_anchor'),
+    ).toBe('L’autorité a décliné (500).')
+    // Other ceremonies keep their sentences.
+    expect(refusalSentence({ refusal: 'window_expired' }, null, 'approve_campaign')).toMatch(
+      /refermée/,
+    )
+  })
+
+  it('a_cancel_after_the_opening_does_not_say_nothing_left_this_machine', () => {
+    expect(gestureSentence('cancelled', 'rotate_anchor')).toBe(
+      'Abandonné. Rien n’a quitté cette machine.',
+    )
+    const opened = gestureSentence('cancelled', 'rotate_anchor', true)
+    expect(opened).toBe('Abandonné. Campagne encore ouverte, 5 min au plus.')
+    expect(opened).not.toMatch(/Rien n’a quitté/)
+  })
+
+  it('the_reason_a_key_is_asked_again_is_a_label', () => {
+    const validating = 'validate_key' as const
+    expect(retryLabel({ refusal: 'key_repeated' }, validating)).toBe('Même clé que la clé 1')
+    expect(retryLabel({ refusal: 'key_repeated' }, 'approve_campaign')).toBe('Clé déjà approuvée')
+    expect(retryLabel({ refusal: 'key_not_enrolled' }, validating)).toBe('Clé absente du coffre')
+    expect(retryLabel({ refusal: 'key_not_validated' }, 'approve_campaign')).toBe(
+      'Autre clé attendue',
+    )
+    expect(retryLabel({ refusal: 'key_declined' }, validating)).toBe('Clé sans réponse')
+    expect(retryLabel({ refusal: 'terms_refused' }, null)).toBe('Durées hors limites')
+    expect(retryLabel({ refusal: 'foreground_unavailable' }, validating)).toMatch(/Windows/)
   })
 })

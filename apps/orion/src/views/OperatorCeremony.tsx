@@ -14,6 +14,7 @@ import type {
   AstraManifest,
   CampaignManifest,
   GestureState,
+  KeyPurpose,
   KeyRole,
   OperationKind,
   OperatorStatus,
@@ -302,7 +303,7 @@ export function rowsOf(manifest: AstraManifest): [string, string][] {
 }
 
 /** What the authority holds, said plainly. */
-function remoteSentence(remote: RemoteState): string {
+export function remoteSentence(remote: RemoteState): string {
   if (typeof remote === 'object') {
     return `Signée et commitée. La nouvelle génération prend effet le ${instant(
       remote.activation_deferred.activation_at,
@@ -331,7 +332,12 @@ function remoteSentence(remote: RemoteState): string {
 }
 
 /** What this machine is doing, said plainly. */
-export function gestureSentence(gesture: GestureState, operation: OperationKind): string {
+export function gestureSentence(
+  gesture: GestureState,
+  operation: OperationKind,
+  /** A campaign exists at the authority: abandoning does not undo it. */
+  opened = false,
+): string {
   if (typeof gesture === 'object') {
     if ('awaiting_key' in gesture) {
       const { index, of, purpose } = gesture.awaiting_key
@@ -370,9 +376,58 @@ export function gestureSentence(gesture: GestureState, operation: OperationKind)
     case 'done':
       return TITLES[operation] + ' : terminé.'
     case 'cancelled':
-      return 'Abandonné. Rien n’a quitté cette machine.'
+      // Open for up to its window, unable to be approved without the openings, and
+      // blocking its family: not « rien n'a quitté cette machine ».
+      return opened
+        ? 'Abandonné. Campagne encore ouverte, 5 min au plus.'
+        : 'Abandonné. Rien n’a quitté cette machine.'
     case 'failed':
       return 'La cérémonie s’est arrêtée.'
+  }
+}
+
+/**
+ * Refusals a rotation does not word like the other ceremonies: nothing of the enrollment's
+ * `admission.txt`, and the door's classes by their label. `null` leaves the usual sentence.
+ */
+function rotationRefusal(refusal: Refusal, journal: RotationJournalView | null): string | null {
+  const kept = (said: string) => (journal ? `${said}. Rotation conservée.` : said)
+  switch (refusal.refusal) {
+    case 'gateway_unavailable':
+      return kept('Gateway injoignable')
+    case 'gateway_refused':
+      return kept(`Gateway refuse l’installation (HTTP ${refusal.status})`)
+    case 'window_expired':
+      return 'Campagne expirée'
+    case 'authority_refused':
+      if (refusal.status === 429) return 'Trop d’opérations en attente'
+      if (refusal.status === 403) return 'Opération déjà ouverte'
+      return null
+    default:
+      return null
+  }
+}
+
+/**
+ * Why a key is asked for again, in a few words. The purpose tells a second key that
+ * repeats the first at validation from one that was already used to approve.
+ */
+export function retryLabel(retry: Refusal, purpose: KeyPurpose | null): string {
+  switch (retry.refusal) {
+    case 'key_repeated':
+      return purpose === 'validate_key' ? 'Même clé que la clé 1' : 'Clé déjà approuvée'
+    case 'key_not_enrolled':
+      return 'Clé absente du coffre'
+    case 'key_not_validated':
+      return 'Autre clé attendue'
+    case 'key_declined':
+      return 'Clé sans réponse'
+    case 'foreground_unavailable':
+      return 'Fenêtre Windows indisponible'
+    case 'terms_refused':
+      return 'Durées hors limites'
+    default:
+      return refusalSentence(retry)
   }
 }
 
@@ -381,7 +436,14 @@ export function refusalSentence(
   refusal: Refusal,
   /** The rotation journal, when the screen knows it: dates and recourse come from it. */
   journal: RotationJournalView | null = null,
+  /** The ceremony the refusal ends: a rotation words some refusals its own way. */
+  operation: OperationKind | null = null,
 ): string {
+  const rotation = operation === 'rotate_anchor' || operation === 'rotate_client_tls_ca'
+  if (rotation) {
+    const worded = rotationRefusal(refusal, journal)
+    if (worded !== null) return worded
+  }
   switch (refusal.refusal) {
     case 'vault_unavailable':
       return 'Coffre d’autorité absent, illisible, ou étranger à ce domaine.'
@@ -523,7 +585,14 @@ export function refusalSentence(
   }
 }
 
-function Row({ label, value }: { label: string; value: string }) {
+/** The purpose of the key being asked, when one is. */
+export function purposeOf(gesture: GestureState): KeyPurpose | null {
+  return typeof gesture === 'object' && 'awaiting_key' in gesture
+    ? gesture.awaiting_key.purpose
+    : null
+}
+
+export function Row({ label, value }: { label: string; value: string }) {
   return (
     <Box sx={{ display: 'flex', alignItems: 'baseline', gap: 1, minWidth: 0, py: 0.35 }}>
       <Typography
@@ -597,7 +666,7 @@ export function OperatorCeremonyPanel({
 
       <Box sx={{ mt: 1.25, pt: 1.25, borderTop: `1px solid ${RULE}` }}>
         <Typography sx={{ fontSize: 11.5, lineHeight: 1.55 }}>
-          {gestureSentence(status.gesture, status.operation)}
+          {gestureSentence(status.gesture, status.operation, status.remote !== 'local')}
         </Typography>
         <Typography color="text.secondary" sx={{ mt: 0.25, fontSize: 11.5, lineHeight: 1.55 }}>
           {remoteSentence(status.remote)}
@@ -612,13 +681,18 @@ export function OperatorCeremonyPanel({
         </Box>
       )}
 
+      {status.key_retry && !stopped && !done && (
+        <Alert severity="warning" variant="outlined" sx={{ mt: 1, fontSize: 11.5 }}>
+          {retryLabel(status.key_retry, purposeOf(status.gesture))}
+        </Alert>
+      )}
       {status.refusal && !done && (
         <Alert
           severity={status.refusal.refusal === 'cancelled' ? 'info' : 'error'}
           variant="outlined"
           sx={{ mt: 1, fontSize: 11.5 }}
         >
-          {refusalSentence(status.refusal, journal)}
+          {refusalSentence(status.refusal, journal, status.operation)}
         </Alert>
       )}
       {done && (

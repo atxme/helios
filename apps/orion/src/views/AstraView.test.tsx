@@ -1,12 +1,14 @@
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const api = vi.hoisted(() => ({
   operatorCeremonyStatus: vi.fn(),
   advanceOperatorCeremony: vi.fn(),
   beginOperatorCeremony: vi.fn(),
+  beginRotationCeremony: vi.fn(),
+  approveRotationCeremony: vi.fn(),
   operatorPendingOperations: vi.fn(),
   operatorRotationsOverview: vi.fn(),
   dismissOperatorCeremony: vi.fn(),
@@ -23,6 +25,7 @@ const api = vi.hoisted(() => ({
 vi.mock('../api', () => api)
 
 import { AstraView } from './AstraView'
+import { DAY, overview as fullOverview } from './astra/rotationFixtures'
 
 const openTab = (name: string | RegExp) => fireEvent.click(screen.getByRole('tab', { name }))
 
@@ -504,5 +507,135 @@ describe('AstraView', () => {
     expect(await screen.findByText(/commit temporairement indisponible/)).toBeTruthy()
     fireEvent.click(screen.getByRole('button', { name: 'Réessayer la finalisation' }))
     await waitFor(() => expect(onRecoveryReady).toHaveBeenCalledTimes(2))
+  })
+
+  it('shows_why_a_key_was_turned_down_on_any_ceremony', async () => {
+    api.operatorCeremonyStatus.mockResolvedValue({
+      session_id: '5'.repeat(32),
+      revision: 3,
+      operation: 'approve_campaign',
+      operation_id: 'e'.repeat(32),
+      remote: 'awaiting_operator',
+      gesture: { awaiting_key: { index: 2, of: 2, purpose: 'approve_campaign' } },
+      allowed: ['continue', 'cancel'],
+      key_retry: { refusal: 'key_not_enrolled' },
+    })
+    render(<AstraView />)
+    expect(await screen.findByText('Clé absente du coffre')).toBeTruthy()
+  })
+
+  describe('the rotation ceremonies', () => {
+    const keyStep = (session: string) => ({
+      session_id: session,
+      revision: 2,
+      operation: 'rotate_anchor' as const,
+      remote: 'local' as const,
+      gesture: { awaiting_key: { index: 1, of: 2, purpose: 'validate_key' as const } },
+      allowed: ['continue', 'cancel'] as const,
+    })
+    const journal = (extra: object = {}) => ({
+      kind: 'ca_pq' as const,
+      stage: 'applied' as const,
+      activationAt: Math.floor(Date.now() / 1000) + 3 * DAY,
+      notAfter: Math.floor(Date.now() / 1000) + 33 * DAY,
+      nextFingerprint: 'bb'.repeat(32),
+      offline: false,
+      ...extra,
+    })
+
+    const startReplacement = async (session: string) => {
+      api.operatorRotationsOverview.mockResolvedValue(fullOverview())
+      api.beginRotationCeremony.mockResolvedValue(keyStep(session))
+      render(<AstraView />)
+      openTab(/Rotations/)
+      const row = await screen.findByRole('region', { name: 'Remplacer la CA-PQ' })
+      fireEvent.click(within(row).getByRole('button'))
+      fireEvent.click(await screen.findByRole('button', { name: 'Continuer' }))
+    }
+
+    it('hands_the_rotation_to_the_ceremony_and_keeps_its_key_step_when_the_row_changes', async () => {
+      await startReplacement('1'.repeat(32))
+      expect(await screen.findByText('À valider')).toBeTruthy()
+      expect(api.beginRotationCeremony).toHaveBeenCalledWith({ gesture: 'replace_ca_pq' })
+      api.operatorRotationsOverview.mockResolvedValue(fullOverview({ resumable: true }))
+      await new Promise((resolve) => setTimeout(resolve, 900))
+      expect(screen.getByText('À valider')).toBeTruthy()
+      expect(screen.getByRole('listitem', { name: 'Clé 1' })).toBeTruthy()
+    })
+
+    it('reads_the_overview_again_when_the_ceremony_ends_and_shows_the_copy_as_pending', async () => {
+      const session = '2'.repeat(32)
+      const signing = { ...keyStep(session), remote: 'prepared' as const, gesture: 'signing' as const, allowed: [] }
+      api.operatorCeremonyStatus.mockResolvedValueOnce(signing)
+      api.operatorRotationsOverview.mockResolvedValue(fullOverview({ journal: null }))
+      render(<AstraView />)
+      await screen.findByRole('listitem', { name: 'Signée' })
+      const reads = api.operatorRotationsOverview.mock.calls.length
+      api.operatorRotationsOverview.mockResolvedValue(
+        fullOverview({ caPqOverlap: true, journal: journal({ stage: 'installed' }) }),
+      )
+      api.operatorCeremonyStatus.mockResolvedValue({
+        ...signing,
+        revision: 9,
+        remote: 'deposited' as const,
+        gesture: 'done' as const,
+      })
+      const copy = await screen.findByRole('listitem', { name: 'Copie du coffre' })
+      await waitFor(() => expect(within(copy).getByText('En attente')).toBeTruthy())
+      expect(api.operatorRotationsOverview.mock.calls.length).toBeGreaterThan(reads)
+    })
+
+    it('does_not_let_the_stop_of_an_automatic_resumption_take_the_tab', async () => {
+      api.operatorCeremonyStatus.mockResolvedValue({
+        session_id: '3'.repeat(32),
+        revision: 6,
+        operation: 'rotate_anchor',
+        remote: 'prepared',
+        gesture: 'failed',
+        allowed: [],
+        refusal: { refusal: 'install_deadline_passed' },
+      })
+      api.operatorRotationsOverview.mockResolvedValue(
+        fullOverview({ resumable: true, journal: journal() }),
+      )
+      render(<AstraView />)
+      expect(await screen.findByRole('tablist')).toBeTruthy()
+      expect(screen.queryByRole('button', { name: 'Retour aux opérations' })).toBeNull()
+      openTab(/Rotations/)
+      const row = await screen.findByRole('region', { name: 'Reprendre une rotation' })
+      expect(within(row).getByText(/Intervention manuelle requise/)).toBeTruthy()
+    })
+
+    it('keeps_an_operators_own_finished_screen_after_leaving_and_coming_back', async () => {
+      const session = '4'.repeat(32)
+      await startReplacement(session)
+      await screen.findByText('À valider')
+      cleanup()
+      api.operatorCeremonyStatus.mockResolvedValue({
+        ...keyStep(session),
+        revision: 8,
+        remote: 'prepared',
+        gesture: 'failed',
+        allowed: [],
+        refusal: { refusal: 'gateway_unavailable' },
+      })
+      render(<AstraView />)
+      expect(await screen.findByRole('button', { name: 'Retour aux opérations' })).toBeTruthy()
+    })
+
+    it('raises_a_line_with_the_deadline_of_a_journal_in_flight_with_no_session', async () => {
+      api.operatorRotationsOverview.mockResolvedValue(
+        fullOverview({ resumable: true, journal: journal() }),
+      )
+      render(<AstraView />)
+      expect(await screen.findByText(/^Rotation CA-PQ · à installer avant le /)).toBeTruthy()
+      expect(screen.getByRole('tab', { name: /Rotations/ }).textContent).toMatch(/1$/)
+    })
+
+    it('says_nothing_when_no_rotation_is_in_flight', async () => {
+      render(<AstraView />)
+      await waitFor(() => expect(api.operatorRotationsOverview).toHaveBeenCalled())
+      expect(screen.queryByText(/à installer avant le/)).toBeNull()
+    })
   })
 })

@@ -2040,29 +2040,6 @@ fn a_gateway_naming_no_anchor_stops_without_error_and_keeps_the_journal() {
     assert_eq!(step, ResumeStep::Finished);
 }
 
-/// An up-to-date gateway with no client TLS CA configured reads the same as an
-/// old one, so the label cannot give the update as the only cause.
-#[test]
-fn the_label_of_a_gateway_naming_no_anchor_gives_both_causes() {
-    let label = stop_label(ResumeStep::GatewayOutdated).expect("a label");
-    assert!(label.contains("CA TLS"), "{label}");
-    assert!(label.contains("mise à jour"), "{label}");
-    assert_ne!(
-        Some(label),
-        stop_label(ResumeStep::DomainConflict),
-        "a label of its own"
-    );
-    assert_eq!(stop_label(ResumeStep::Finished), None);
-    assert_eq!(
-        stop_label(ResumeStep::Discard),
-        Some("Rotation expirée. Recommencer")
-    );
-    assert_eq!(
-        stop_label(ResumeStep::InstallDeadlinePassed),
-        Some("Délai dépassé")
-    );
-}
-
 #[test]
 fn the_journal_is_gone_once_the_copy_was_attempted() {
     let answers: [Result<VaultCopySent, u16>; 3] = [

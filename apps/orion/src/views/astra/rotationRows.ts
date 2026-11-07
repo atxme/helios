@@ -514,8 +514,10 @@ export function stopSentence(
   journal: RotationJournalView | null,
 ): string {
   if (refusal === 'install_deadline_passed') {
+    // The cut date is where Astra moves alone and the gateway stays on the old anchor.
     return journal
-      ? `Délai dépassé le ${formatDateTime(journal.activationAt)}. Intervention manuelle requise.`
+      ? `Délai dépassé le ${formatDateTime(journal.activationAt)}. ` +
+          `Coupure le ${formatDateTime(journal.notAfter)}. Intervention manuelle requise.`
       : 'Délai dépassé. Intervention manuelle requise.'
   }
   if (refusal === 'gateway_names_no_anchor') {
@@ -527,4 +529,25 @@ export function stopSentence(
   return journal?.kind === 'ca_pq' && journal.offline
     ? 'Domaine en désaccord. Intervention manuelle requise : astra-signer rotate-ca-pq.'
     : 'Domaine en désaccord. Intervention manuelle requise.'
+}
+
+/**
+ * What a journal in flight says wherever the operator is, with no session to carry it:
+ * the install deadline, or the cut that passed. Blocking when no repair exists any more.
+ */
+export function journalLine(
+  journal: RotationJournalView,
+  now: number,
+): { text: string; blocking: boolean } {
+  const kind = KINDS[journal.kind]
+  if (journal.stage === 'installed') {
+    return { text: `Rotation ${kind} · copie du coffre en attente`, blocking: false }
+  }
+  if (now >= journal.activationAt) {
+    return { text: stopSentence('install_deadline_passed', journal), blocking: true }
+  }
+  return {
+    text: `Rotation ${kind} · à installer avant le ${formatDateTime(journal.activationAt)}`,
+    blocking: false,
+  }
 }
