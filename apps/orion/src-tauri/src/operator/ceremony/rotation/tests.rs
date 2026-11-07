@@ -2915,3 +2915,205 @@ fn a_rotation_past_its_install_deadline_is_retried_and_stops_the_same_way() {
         assert_eq!(bench.touches(), touches);
     }
 }
+
+// What the rotations screen reads (lot 5b, task 11).
+
+mod overview {
+    use super::*;
+    use crate::operator::rotations::{
+        copy_to_send, read_local, vault_bytes_of, RotationsOverview, VaultCopyOutcome,
+    };
+    use orion_core::operator_rotations::{GatewayDomainRead, Reach};
+
+    fn local(bench: &Bench) -> crate::operator::rotations::Local {
+        read_local(&Ok(bench.path.clone()), bench.clock.load(Ordering::SeqCst))
+    }
+
+    /// A rotation signed and kept, the deposit having failed.
+    fn with_a_journal_kept(bench: &Bench) -> RotationJournal {
+        bench.remote.deposits.lock().expect("lock").push_back(503);
+        bench.drive(RotationGesture::ReplaceCaPq, Bench::all_the_way);
+        bench.journal().expect("kept")
+    }
+
+    fn assembled(bench: &Bench, authority: OperatorAuthorityStatus) -> RotationsOverview {
+        RotationsOverview::assemble(
+            true,
+            Reach::Ok(Vec::new()),
+            Reach::Ok(authority),
+            Reach::<GatewayDomainRead>::Unreachable,
+            local(bench),
+        )
+    }
+
+    #[test]
+    fn the_overview_exposes_no_token_and_no_path() {
+        let bench = bench();
+        let journal = with_a_journal_kept(&bench);
+        let deposit = journal.deposit.as_ref().expect("deposit");
+        let overview = assembled(&bench, bench.nothing_in_flight());
+        let shown = serde_json::to_string(&overview).expect("json");
+        assert!(
+            !shown.contains(&deposit.result_token),
+            "no capability token"
+        );
+        let directory = bench.path.parent().expect("folder").display().to_string();
+        assert!(!shown.contains(&directory), "no path of this machine");
+        assert!(!shown.contains("transition_path") && !shown.contains("result_token"));
+        let value: serde_json::Value = serde_json::from_str(&shown).expect("value");
+        assert_eq!(value["vault"]["vault_path"], "");
+        assert_eq!(
+            value["localVaultFingerprint"],
+            serde_json::json!(bench_fingerprint(&bench))
+        );
+        assert_eq!(value["pending"]["state"], "ok");
+        assert_eq!(value["domain"]["state"], "unreachable");
+    }
+
+    fn bench_fingerprint(bench: &Bench) -> String {
+        store::load(&bench.path)
+            .expect("vault")
+            .fingerprint()
+            .expect("fingerprint")
+            .to_hex()
+    }
+
+    #[test]
+    fn a_journal_in_flight_shows_its_deadline_and_stage_with_no_session() {
+        let bench = bench();
+        let journal = with_a_journal_kept(&bench);
+        let local = local(&bench);
+        let view = local.journal.expect("a journal");
+        assert_eq!(view.kind, "ca_pq");
+        assert_eq!(view.activation_at, journal.activation_at);
+        assert_eq!(view.not_after, journal.not_after);
+        assert_eq!(
+            view.next_fingerprint,
+            journal.next_anchor_fingerprint.to_hex()
+        );
+        assert!(local.resumable);
+    }
+
+    #[test]
+    fn resumable_follows_the_resumption_and_not_the_journal_alone() {
+        let bench = bench();
+        assert!(!local(&bench).resumable, "nothing to resume");
+
+        // An unadopted record: no journal, and still something to resume.
+        bench
+            .drive(RotationGesture::ReplaceCaTls, Bench::all_the_way)
+            .done();
+        let record = bench.record().expect("record");
+        assert!(
+            !local(&bench).resumable,
+            "an adopted record waits for its promotion"
+        );
+        prepared::save(
+            &prepared::path_beside(&bench.path),
+            &prepared::PreparedRotation {
+                adopted: false,
+                submitted: false,
+                ..record
+            },
+        )
+        .expect("record");
+        let unadopted = local(&bench);
+        assert!(unadopted.journal.is_none());
+        assert!(unadopted.resumable);
+        assert!(!unadopted.ca_tls_close_due);
+    }
+
+    #[test]
+    fn the_client_tls_close_is_due_from_not_after() {
+        let bench = bench();
+        let record = bench.rotated_client_tls();
+        assert!(local(&bench).ca_tls_close_due);
+        bench.set_clock(record.not_after - 1);
+        assert!(!local(&bench).ca_tls_close_due, "the overlap still runs");
+    }
+
+    #[test]
+    fn a_ca_pq_overlap_is_read_from_the_authority_and_a_ca_tls_one_is_not() {
+        let bench = bench();
+        let quiet = assembled(&bench, bench.nothing_in_flight());
+        assert!(!quiet.ca_pq_overlap);
+
+        let tls = OperatorAuthorityStatus {
+            next_ca_tls_fingerprint: Some(Fingerprint::of(b"suivante")),
+            ..bench.nothing_in_flight()
+        };
+        assert!(!assembled(&bench, tls).ca_pq_overlap);
+
+        let pq = OperatorAuthorityStatus {
+            next_ca_fingerprint: Some(Fingerprint::of(b"suivante")),
+            ..bench.nothing_in_flight()
+        };
+        assert!(assembled(&bench, pq).ca_pq_overlap);
+    }
+
+    #[test]
+    fn a_vault_location_that_does_not_exist_is_not_created_by_looking() {
+        let bench = bench();
+        let missing = bench.path.parent().expect("folder").join("absent");
+        let path = missing.join("authority-vault.json");
+        let local = read_local(&Ok(path), 0);
+        assert!(!missing.exists(), "reading creates nothing");
+        let vault = local.vault.expect("a state, not a failure");
+        assert!(!vault.exists);
+        assert!(!local.resumable);
+    }
+
+    #[test]
+    fn a_location_that_cannot_be_resolved_is_told_and_not_hidden() {
+        let local = read_local(&Err("réglage illisible".into()), 0);
+        assert!(local.vault.is_none());
+        assert_eq!(local.vault_error.as_deref(), Some("réglage illisible"));
+    }
+
+    #[test]
+    fn the_manual_copy_is_the_compact_vault_whose_fingerprint_is_the_vaults() {
+        let bench = bench();
+        let copy = copy_to_send(&bench.path, &bench.nothing_in_flight(), false).expect("copy");
+        let sent = vault_bytes_of(&copy);
+        // What Astra fingerprints is the bytes it receives.
+        assert_eq!(Fingerprint::of(&sent).to_hex(), bench_fingerprint(&bench));
+        let vault = store::load(&bench.path).expect("vault");
+        assert_eq!(sent, serde_json::to_vec(&vault).expect("compact"));
+    }
+
+    #[test]
+    fn the_credentials_go_with_the_copy_unless_an_overlap_or_a_resumption_holds_them() {
+        let bench = bench();
+        let free = bench.nothing_in_flight();
+        let with = copy_to_send(&bench.path, &free, false).expect("copy");
+        assert!(with.credentials.is_some(), "the document beside the vault");
+
+        let overlap = OperatorAuthorityStatus {
+            next_ca_fingerprint: Some(Fingerprint::of(b"suivante")),
+            ..bench.nothing_in_flight()
+        };
+        assert!(copy_to_send(&bench.path, &overlap, false)
+            .expect("copy")
+            .credentials
+            .is_none());
+        assert!(copy_to_send(&bench.path, &free, true)
+            .expect("copy")
+            .credentials
+            .is_none());
+    }
+
+    #[test]
+    fn a_held_back_copy_is_an_answer_and_an_absent_document_is_not_epoch_zero() {
+        let held = serde_json::to_value(VaultCopyOutcome::of(VaultCopySent::HeldBack)).unwrap();
+        assert_eq!(held, serde_json::json!({ "state": "held_back" }));
+        let copied = serde_json::to_value(VaultCopyOutcome::of(VaultCopySent::Copied(
+            aether::certificates::transport::OperatorVaultCopied {
+                fingerprint: Fingerprint::of(b"copie"),
+                credential_registry_epoch: None,
+            },
+        )))
+        .unwrap();
+        assert_eq!(copied["state"], "copied");
+        assert!(copied["credential_registry_epoch"].is_null());
+    }
+}

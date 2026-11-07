@@ -1070,6 +1070,85 @@ export interface OperatorPendingOperation {
   expires_at: number
 }
 
+/** Une lecture de la gateway : sa valeur, ou la raison pour laquelle il n'y en a pas. */
+export type Reach<T> =
+  | { state: 'ok'; value: T }
+  | { state: 'not_admin' | 'astra_unavailable' | 'unreachable' | 'throttled' }
+
+/** Ce que l'autorité (Astra) dit de son état : empreintes et époques, aucun jeton. */
+export interface OperatorAuthorityStatus {
+  ca_epoch: number
+  ca_fingerprint: string
+  /** Renseignée pendant un recouvrement CA-PQ. */
+  next_ca_fingerprint: string | null
+  ca_tls_epoch: number
+  ca_tls_fingerprint: string | null
+  next_ca_tls_fingerprint: string | null
+  issuer: {
+    recorded_epoch: number
+    serving_epoch: number | null
+    ca_epoch: number
+    ca_tls_epoch: number
+    not_after: number
+  } | null
+  /** Empreinte de la copie du coffre qu'Astra détient. */
+  vault_copy_fingerprint: string | null
+  /** `null` : Astra ne sert aucun document. Ce n'est pas l'époque 0. */
+  credential_registry_epoch: number | null
+}
+
+/** Le sous-ensemble de `GET /api/certificates` que l'écran lit. */
+export interface GatewayDomainRead {
+  ca_fingerprint: string
+  ca_epoch: number
+  ca_tls_epoch: number
+  ca_transition_pending: boolean
+  ca_retire_active_at: number | null
+  next_ca_fingerprint: string | null
+  client_tls_ca_transition_pending: boolean
+  peers: { not_after: number }[]
+}
+
+/** Une rotation signée qui n'est pas allée au bout, avec son délai d'installation. */
+export interface RotationJournalView {
+  kind: 'ca_pq' | 'ca_tls'
+  stage: 'signed' | 'accepted' | 'applied' | 'installed'
+  /** Passé cet instant, la gateway refuse la transition. */
+  activationAt: number
+  notAfter: number
+  nextFingerprint: string
+}
+
+/** Tout ce que montre l'écran des rotations ; des données d'affichage, ni jeton, ni clé, ni chemin. */
+export interface RotationsOverview {
+  tunnel: boolean
+  pending: Reach<OperatorPendingOperation[]>
+  authority: Reach<OperatorAuthorityStatus>
+  domain: Reach<GatewayDomainRead>
+  /** `vault_path` y est vide : l'emplacement s'affiche par `VaultLocationView`. */
+  vault: VaultOverview | null
+  vaultError: string | null
+  localVaultFingerprint: string | null
+  localCaEpoch: number | null
+  localCaTlsEpoch: number | null
+  journal: RotationJournalView | null
+  /** Une reprise est à faire : journal, fichier CA-PQ ancien ou enregistrement non adopté. */
+  resumable: boolean
+  /** Un recouvrement CA-PQ court chez Astra ; un recouvrement CA TLS n'en fait pas partie. */
+  caPqOverlap: boolean
+  caTlsCloseDue: boolean
+}
+
+/** La réponse à un envoi manuel de la copie du coffre. « Retenue » n'est pas un échec. */
+export type VaultCopyOutcome =
+  | {
+      state: 'copied'
+      fingerprint: string
+      /** `null` : Astra ne sert aucun document. */
+      credential_registry_epoch: number | null
+    }
+  | { state: 'held_back' }
+
 /** Une invitation du registre de ce poste, telle que l'écran Enrôlement la liste. */
 export interface InvitationView {
   invitation_id: string

@@ -33,6 +33,8 @@ import {
   onEvent,
   onProfilePath,
   onTrayView,
+  operatorRotationsOverview,
+  operatorSendVaultCopy,
   resizeForView,
   runCertificateAction,
   runSpeedTest,
@@ -46,6 +48,18 @@ import {
 
 describe('Orion Tauri bridge', () => {
   beforeEach(() => vi.clearAllMocks())
+
+  it('reads the rotations screen and sends the vault copy without naming anything', async () => {
+    mocks.invoke.mockResolvedValue(undefined)
+
+    await operatorRotationsOverview()
+    await operatorSendVaultCopy()
+
+    expect(mocks.invoke.mock.calls).toEqual([
+      ['operator_rotations_overview'],
+      ['operator_send_vault_copy'],
+    ])
+  })
 
   it('only uses explicitly authorized commands', async () => {
     mocks.invoke.mockResolvedValue(undefined)

@@ -13,6 +13,8 @@ import type {
   OperationLocator,
   OperatorAction,
   OperatorPendingOperation,
+  RotationsOverview,
+  VaultCopyOutcome,
   OperatorStatus,
   OperatorArtifact,
   DomainDefaults,
@@ -387,6 +389,16 @@ export const resumeCertificateRecovery = (operationId: string) =>
  * rendrait lisible par quiconque l'atteint. */
 export const operatorPendingOperations = () =>
   invoke<OperatorPendingOperation[]>('operator_pending_operations')
+
+/** Tout ce que montre l'écran des rotations, lu sans clé ; aucun chemin ni jeton n'y figure. */
+export const operatorRotationsOverview = () =>
+  invoke<RotationsOverview>('operator_rotations_overview')
+
+/**
+ * Envoie la copie du coffre à Astra, sans rien nommer : le coffre et ses credentials
+ * sont lus côté Rust. « Retenue » est une réponse, pas un échec.
+ */
+export const operatorSendVaultCopy = () => invoke<VaultCopyOutcome>('operator_send_vault_copy')
 
 /**
  * Adjusts the window to the displayed view.

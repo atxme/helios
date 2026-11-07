@@ -811,6 +811,8 @@ fn main() {
             operator_ceremony_status,
             operator_overview,
             operator_pending_operations,
+            operator_rotations_overview,
+            operator_send_vault_copy,
             operator_vault_location,
             choose_vault_location,
             reset_vault_location,

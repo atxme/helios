@@ -363,6 +363,98 @@ pub(crate) async fn operator_overview(
     .await
 }
 
+/// Everything the rotations screen shows, in one read and with no key.
+///
+/// The gateway is the connected profile's. Without a tunnel the three reads are
+/// `unreachable` and `tunnel` says why. The vault is looked at where it is, and
+/// no folder is created for having looked. The page receives display data only.
+#[tauri::command]
+pub(crate) async fn operator_rotations_overview(
+    state: State<'_, AppState>,
+) -> Result<crate::operator::rotations::RotationsOverview, String> {
+    use crate::operator::rotations::{read_local, RotationsOverview};
+    use orion_core::operator_rotations as reads;
+
+    let vault_path = state.vault_location.path_to_look_at();
+    let target = connected_target(&state).await.ok();
+    let (pending, authority, domain) = match &target {
+        Some(target) => {
+            tokio::join!(
+                reads::pending(&target.address),
+                reads::authority_status(&target.address),
+                reads::domain(&target.address),
+            )
+        }
+        None => (
+            reads::Reach::Unreachable,
+            reads::Reach::Unreachable,
+            reads::Reach::Unreachable,
+        ),
+    };
+    let now = crate::operator::now_unix();
+    let local = on_work_stack(
+        "orion-rotations-overview",
+        "la lecture du coffre",
+        move || Ok(read_local(&vault_path, now)),
+    )
+    .await?;
+    Ok(RotationsOverview::assemble(
+        target.is_some(),
+        pending,
+        authority,
+        domain,
+        local,
+    ))
+}
+
+/// Sends the vault copy Astra keeps, and the credential document when it may.
+///
+/// The vault and the credentials are read here, from beside the vault; the page
+/// names nothing. The copy goes only to the gateway the domain's relay names: Orion
+/// holds several profiles and one vault, and another domain's gateway must not
+/// receive this one. A copy Astra holds back is an answer, not a failure.
+#[tauri::command]
+pub(crate) async fn operator_send_vault_copy(
+    state: State<'_, AppState>,
+) -> Result<crate::operator::rotations::VaultCopyOutcome, String> {
+    use crate::operator::rotations::{copy_to_send, unreached, VaultCopyOutcome};
+
+    ensure_no_open_ceremony(&state).await?;
+    let vault_path = state.vault_location.path_to_look_at()?;
+    let target = connected_target(&state).await?;
+    if !crate::operator::relay_names_peer(&vault_path, &target.peer_key)? {
+        return Err(NOT_THE_DOMAINS_GATEWAY.to_string());
+    }
+    let authority = match orion_core::operator_rotations::authority_status(&target.address).await {
+        orion_core::operator_rotations::Reach::Ok(authority) => authority,
+        other => {
+            return Err(unreached(&other)
+                .unwrap_or("l'autorité ne répond pas")
+                .to_string())
+        }
+    };
+    on_work_stack(
+        "orion-vault-copy",
+        "l'envoi de la copie du coffre",
+        move || {
+            let resumable = astra_operator::rotation_journal::something_to_resume(&vault_path)
+                .map_err(|error| format!("{error:#}"))?;
+            let copy = copy_to_send(&vault_path, &authority, resumable)
+                .map_err(|error| format!("{error:#}"))?;
+            let tunnel = astra_operator::tunnel::Tunnel::new(&target.address)
+                .map_err(|error| format!("{error:#}"))?;
+            tunnel
+                .send_vault_copy(&copy)
+                .map(VaultCopyOutcome::of)
+                .map_err(|error| format!("{error:#}"))
+        },
+    )
+    .await
+}
+
+const NOT_THE_DOMAINS_GATEWAY: &str =
+    "la gateway connectée n'est pas celle que nomme le relais du domaine";
+
 /// Where the operator vault is, and whether it is the default place. A
 /// location that cannot be resolved is a view that says why, not an error:
 /// the window must still offer to choose again or go back to the default.

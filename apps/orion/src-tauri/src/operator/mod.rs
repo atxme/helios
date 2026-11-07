@@ -34,6 +34,7 @@
 mod ceremony;
 pub mod invitations;
 pub mod location;
+pub mod rotations;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -559,7 +560,10 @@ pub struct GatewayTarget {
 ///
 /// A resumption reads the status of whatever authority answers, and sends the sealed
 /// vault to whatever gateway it reaches: another domain's must be neither.
-fn relay_names_peer(vault_path: &std::path::Path, peer_key: &str) -> Result<bool, String> {
+pub(crate) fn relay_names_peer(
+    vault_path: &std::path::Path,
+    peer_key: &str,
+) -> Result<bool, String> {
     use aether::certificates::encoding::WireGuardKey;
 
     let relay = astra_operator::handoff::load(&astra_operator::handoff::path_beside(vault_path))
