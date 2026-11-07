@@ -22,6 +22,7 @@ import { OrionMark } from './components/OrionMark'
 import { PosturePanel } from './components/PosturePanel'
 import { postureMeta } from './components/state'
 import { GUTTER, PINE } from './theme'
+import { overlapReason } from './views/astra/rotationRows'
 
 /**
  * Application shell — a navigation rail, a content area, nothing that scrolls.
@@ -113,6 +114,11 @@ export default function App() {
 
   /// Opens the §7.5 ceremony for one operation, and goes to where it shows.
   const approveRecovery = async (operationId: string) => {
+    // Astra refuses every approval under the local document during a CA-PQ overlap, after
+    // the touch: not read is treated as an overlap, so no touch is spent on a guess.
+    const { caPqOverlap } = await api.operatorRotationsOverview()
+    const suspended = overlapReason(caPqOverlap)
+    if (suspended) throw new Error(suspended)
     await api.beginOperatorCeremony({ kind: 'recover_identity', operation_id: operationId })
     setLocalRecoveryId(operationId)
     setAstraPending(true)

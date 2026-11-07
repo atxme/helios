@@ -139,10 +139,13 @@ pub struct JournalView {
     pub not_after: u64,
     /// The incoming anchor, hexadecimal.
     pub next_fingerprint: String,
+    /// No deposit of Orion's own: signed offline, or adopted from the CA-PQ file. Only
+    /// then is `astra-signer rotate-ca-pq` a recourse that cannot conflict with Orion.
+    pub offline: bool,
 }
 
 impl JournalView {
-    fn of(journal: &RotationJournal) -> Self {
+    pub(crate) fn of(journal: &RotationJournal) -> Self {
         Self {
             kind: match journal.kind {
                 RotationKind::CaPq => "ca_pq",
@@ -157,6 +160,7 @@ impl JournalView {
             activation_at: journal.activation_at,
             not_after: journal.not_after,
             next_fingerprint: journal.next_anchor_fingerprint.to_hex(),
+            offline: journal.deposit.is_none(),
         }
     }
 }

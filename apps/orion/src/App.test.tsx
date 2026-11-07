@@ -11,6 +11,7 @@ const mocks = vi.hoisted(() => ({
   operatorCeremonyStatus: vi.fn(),
   astraCaTlsRotationStatus: vi.fn(),
   beginOperatorCeremony: vi.fn(),
+  operatorRotationsOverview: vi.fn(),
   resumeCertificateRecovery: vi.fn(),
   dismissOperatorCeremony: vi.fn(),
   operatorPendingOperations: vi.fn(),
@@ -23,6 +24,7 @@ vi.mock('./api', () => ({
   operatorCeremonyStatus: mocks.operatorCeremonyStatus,
   astraCaTlsRotationStatus: mocks.astraCaTlsRotationStatus,
   beginOperatorCeremony: mocks.beginOperatorCeremony,
+  operatorRotationsOverview: mocks.operatorRotationsOverview,
   resumeCertificateRecovery: mocks.resumeCertificateRecovery,
   dismissOperatorCeremony: mocks.dismissOperatorCeremony,
   operatorPendingOperations: mocks.operatorPendingOperations,
@@ -68,7 +70,9 @@ vi.mock('./views/CertificatesView', () => ({
   }) => (
     <div>
       certificates-view
-      <button onClick={() => void onApprove?.('e'.repeat(32))}>test-start-recovery</button>
+      <button onClick={() => void onApprove?.('e'.repeat(32))?.catch(() => undefined)}>
+        test-start-recovery
+      </button>
       {completedRecovery?.portable && (
         <span>recovered-generation-{completedRecovery.portable.generation}</span>
       )}
@@ -121,6 +125,7 @@ beforeEach(() => {
   mocks.astraCaTlsRotationStatus.mockResolvedValue({ phase: 'idle' })
   mocks.operatorPendingOperations.mockResolvedValue([])
   mocks.beginOperatorCeremony.mockResolvedValue({})
+  mocks.operatorRotationsOverview.mockResolvedValue({ caPqOverlap: false })
   mocks.resumeCertificateRecovery.mockResolvedValue({
     progress: {
       portable: { step: 'recovered', generation: 5, activation_at: 1_789_198_911 },
@@ -229,6 +234,29 @@ describe('App interactions', () => {
       expect(mocks.resumeCertificateRecovery).toHaveBeenCalledWith('e'.repeat(32)),
     )
     expect(await screen.findByText('recovered-generation-5')).toBeTruthy()
+  })
+
+  it.each([[true], [null]])(
+    'does not open a recovery while the CA-PQ overlap is %s',
+    async (overlap) => {
+      mocks.operatorRotationsOverview.mockResolvedValue({ caPqOverlap: overlap })
+      render(<App />)
+      fireEvent.click(screen.getByRole('button', { name: 'Certificats' }))
+      fireEvent.click(await screen.findByRole('button', { name: 'test-start-recovery' }))
+      await waitFor(() => expect(mocks.operatorRotationsOverview).toHaveBeenCalled())
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      expect(mocks.beginOperatorCeremony).not.toHaveBeenCalled()
+      expect(screen.queryByText('astra-view')).toBeNull()
+    },
+  )
+
+  it('does not open a recovery when the overview cannot be read', async () => {
+    mocks.operatorRotationsOverview.mockRejectedValue('illisible')
+    render(<App />)
+    fireEvent.click(screen.getByRole('button', { name: 'Certificats' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'test-start-recovery' }))
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    expect(mocks.beginOperatorCeremony).not.toHaveBeenCalled()
   })
 
   it('opens and closes posture details and delegates error dismissal', () => {

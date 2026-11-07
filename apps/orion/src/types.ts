@@ -1122,6 +1122,8 @@ export interface RotationJournalView {
   activationAt: number
   notAfter: number
   nextFingerprint: string
+  /** Sans dépôt d'Orion : une rotation signée hors ligne, que `astra-signer` peut encore reprendre. */
+  offline: boolean
 }
 
 /** Tout ce que montre l'écran des rotations ; des données d'affichage, ni jeton, ni clé, ni chemin. */

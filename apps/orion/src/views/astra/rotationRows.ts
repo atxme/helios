@@ -151,15 +151,24 @@ export function overlapReason(caPqOverlap: boolean | null): string | null {
   return null
 }
 
-/** The live operation of the scope an action opens, if the gateway lists one. */
+/**
+ * The live operation of the scope an action opens, if the gateway lists one.
+ *
+ * The two CA rotations share a scope: the campaign covers both authorities and the CA-PQ
+ * signature binds which one, so the row shows the operation's reason and nothing signed
+ * can be the wrong one.
+ */
 export function liveOperation(
   o: RotationsOverview,
   action: RotationAction,
+  local: number = Math.floor(Date.now() / 1000),
 ): OperatorPendingOperation | null {
   const scope = SCOPES[action]
   const pending = valueOf(o.pending)
   if (!scope || !pending) return null
-  return pending.find((operation) => operation.scope === scope) ?? null
+  // An operation past its expiry on the gateway's clock is no longer one to resume.
+  const now = effectiveNow(o, local)
+  return pending.find((operation) => operation.scope === scope && operation.expires_at > now) ?? null
 }
 
 /** The activation keys the vault holds, whichever their role. */
@@ -340,6 +349,10 @@ function delegationRow(o: RotationsOverview, now: number): RotationRow {
       due = false
     }
   }
+  // Its request came only in the answer to the opening: an open delegation cannot be
+  // resumed, and a new opening is offered once the window closes.
+  const open = liveOperation(o, 'renew_delegation', now)
+  if (open) disabledReason ??= `Opération ouverte jusqu’au ${formatDateTime(open.expires_at)}`
   // Every approval under the local document is refused during a CA-PQ overlap.
   disabledReason ??= overlapReason(o.caPqOverlap)
 
@@ -483,6 +496,8 @@ export function prerequisites(o: RotationsOverview, action: RotationAction): Pre
   if (action === 'replace_ca_pq' || action === 'replace_ca_tls') {
     lines.push(keysPrerequisite(o), copyPrerequisite(o))
   }
+  // The door asks for the copy of the vault for every scope but the workstations'.
+  if (action === 'renew_delegation') lines.push(copyPrerequisite(o))
   lines.push(domainPrerequisite(o))
   return lines
 }
@@ -490,12 +505,12 @@ export function prerequisites(o: RotationsOverview, action: RotationAction): Pre
 export const allGreen = (lines: Prerequisite[]) => lines.every((line) => line.ok)
 
 /**
- * The sentence of a stop that gives its cause and its recourse. A rotation signed offline
- * (the file command) has `astra-signer rotate-ca-pq` as its one recourse until the
- * installation moves into Orion.
+ * The sentence of a stop that gives its cause and its recourse. `astra-signer rotate-ca-pq`
+ * is named only for a rotation signed offline: for one Orion carries, the command could
+ * conflict with it.
  */
 export function stopSentence(
-  refusal: 'domain_conflict' | 'install_deadline_passed',
+  refusal: 'domain_conflict' | 'install_deadline_passed' | 'gateway_names_no_anchor',
   journal: RotationJournalView | null,
 ): string {
   if (refusal === 'install_deadline_passed') {
@@ -503,7 +518,13 @@ export function stopSentence(
       ? `Délai dépassé le ${formatDateTime(journal.activationAt)}. Intervention manuelle requise.`
       : 'Délai dépassé. Intervention manuelle requise.'
   }
-  return journal?.kind === 'ca_pq'
+  if (refusal === 'gateway_names_no_anchor') {
+    // Not an update as the only cause: an up-to-date gateway with no CA TLS reads the same.
+    return journal?.kind === 'ca_pq'
+      ? 'Gateway sans CA-PQ suivante, ou mise à jour requise. Rotation conservée.'
+      : 'Gateway sans CA TLS, ou mise à jour requise. Rotation conservée.'
+  }
+  return journal?.kind === 'ca_pq' && journal.offline
     ? 'Domaine en désaccord. Intervention manuelle requise : astra-signer rotate-ca-pq.'
     : 'Domaine en désaccord. Intervention manuelle requise.'
 }

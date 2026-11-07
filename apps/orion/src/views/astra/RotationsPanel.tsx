@@ -69,13 +69,24 @@ function PrerequisiteLine({
 }) {
   return (
     <Box component="li" sx={{ listStyle: 'none', py: 0.4 }}>
-      <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, fontSize: 12.5 }}>
+      <Box
+        sx={{
+          display: 'flex',
+          alignItems: 'center',
+          flexWrap: 'wrap',
+          minWidth: 0,
+          gap: 0.75,
+          fontSize: 12.5,
+        }}
+      >
         {line.ok ? (
           <Check size={14} color={PINE} aria-label="Conforme" role="img" />
         ) : (
           <X size={14} color="#B91C1C" aria-label="Non conforme" role="img" />
         )}
-        <span>{line.label}</span>
+        <Box component="span" sx={{ minWidth: 0, overflowWrap: 'anywhere' }}>
+          {line.label}
+        </Box>
         {line.detail && (
           <Typography component="span" color="text.secondary" sx={{ fontSize: 11.5 }}>
             {line.detail}
@@ -112,14 +123,11 @@ function PrerequisiteLine({
 export function RotationsPanel({
   onCeremony,
   onOverview,
-  onOpenApprovals,
   renderStep,
 }: {
   onCeremony: (status: OperatorStatus) => void
   /** Every read, so the rest of the screen follows without a read of its own. */
   onOverview?: (overview: RotationsOverview) => void
-  /** The delegation of a campaign already open is approved from its request file. */
-  onOpenApprovals?: () => void
   renderStep?: (context: RotationStepContext) => ReactNode
 }) {
   const [overview, setOverview] = useState<RotationsOverview | null>(null)
@@ -166,14 +174,18 @@ export function RotationsPanel({
 
   useEffect(() => {
     alive.current = true
+    // Per effect: under StrictMode the first run's chain must end with its own cleanup,
+    // not resume because `alive` is true again after the remount.
+    let stopped = false
     let timer: number | undefined
     const tick = () => {
       void read().then(() => {
-        if (alive.current) timer = window.setTimeout(tick, POLL_MS)
+        if (!stopped) timer = window.setTimeout(tick, POLL_MS)
       })
     }
     tick()
     return () => {
+      stopped = true
       alive.current = false
       window.clearTimeout(timer)
     }
@@ -184,7 +196,9 @@ export function RotationsPanel({
   const chosen = overview && selected ? rows.find((row) => row.action === selected) : undefined
   const lines = overview && chosen ? prerequisites(overview, chosen.action) : []
   const green = allGreen(lines)
-  const existing = overview && chosen ? liveOperation(overview, chosen.action) : null
+  const existing = overview && chosen ? liveOperation(overview, chosen.action, now) : null
+  // The row can turn impossible after it was chosen: its step is then not offered.
+  const open = green && chosen?.disabledReason === null
 
   const choose = (action: RotationAction) => {
     setError(null)
@@ -231,11 +245,6 @@ export function RotationsPanel({
           await api.beginOperatorCeremony({ kind: 'approve_campaign', operation_id: operationId }),
         )
       } else if (row.action === 'renew_delegation') {
-        if (existing) {
-          // Its request is not served again: the Approbations tab asks for the file.
-          onOpenApprovals?.()
-          return
-        }
         const opened = await api.operatorOpenCampaign(
           { action: 'issuer_delegation' },
           reason.trim() || DEFAULT_REASON.renew_delegation!,
@@ -252,7 +261,7 @@ export function RotationsPanel({
       }
     } catch (cause) {
       const fresh = await readAfter()
-      const live = fresh && liveOperation(fresh, row.action)
+      const live = fresh && liveOperation(fresh, row.action, now)
       if (live) setNotice('Opération déjà ouverte')
       else setError(String(cause))
     } finally {
@@ -291,8 +300,8 @@ export function RotationsPanel({
         </Alert>
       )}
       {rows.map((row) => {
-        const live = liveOperation(overview, row.action)
-        const open = row.action === selected
+        const live = liveOperation(overview, row.action, now)
+        const resumable = live !== null && row.action !== 'renew_delegation'
         return (
           <Paper
             key={row.action}
@@ -317,9 +326,9 @@ export function RotationsPanel({
             >
               {row.state}
             </Typography>
-            {live && (
+            {live && row.disabledReason === null && (
               <Typography color="text.secondary" sx={{ fontSize: 11.5 }}>
-                Opération ouverte
+                {`Opération ouverte · ${live.reason}`}
               </Typography>
             )}
             {row.disabledReason && row.disabledReason !== row.state && (
@@ -331,11 +340,11 @@ export function RotationsPanel({
               size="small"
               variant={row.due ? 'contained' : 'outlined'}
               disabled={busy || row.disabledReason !== null}
-              aria-expanded={open}
+              aria-expanded={row.action === selected}
               onClick={() => choose(row.action)}
               sx={{ mt: 0.75, minHeight: 28, fontSize: 12 }}
             >
-              {live ? 'Reprendre' : row.button}
+              {resumable ? 'Reprendre' : row.button}
             </Button>
           </Paper>
         )
@@ -375,14 +384,14 @@ export function RotationsPanel({
                   onChange={(event) => setReason(event.target.value)}
                   size="small"
                   fullWidth
-                  disabled={busy || !green}
+                  disabled={busy || !open}
                   sx={{ mb: 1 }}
                 />
               )}
               <Button
                 size="small"
                 variant="contained"
-                disabled={busy || !green}
+                disabled={busy || !open}
                 startIcon={<KeyRound size={14} aria-hidden />}
                 onClick={() => void proceed(chosen)}
                 sx={{ minHeight: 30, fontSize: 12 }}
@@ -392,7 +401,7 @@ export function RotationsPanel({
             </Box>
           )}
           {renderStep &&
-            green &&
+            open &&
             chosen.action !== 'renew_fleet' &&
             chosen.action !== 'renew_delegation' && (
               <Box sx={{ mt: 1.25 }}>

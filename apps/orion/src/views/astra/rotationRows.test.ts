@@ -114,6 +114,7 @@ describe('finish and resume', () => {
       activationAt: NOW + 3 * DAY,
       notAfter: NOW + 30 * DAY,
       nextFingerprint: 'aa',
+      offline: false,
     }
     const found = row(overview({ resumable: true, journal }), 'resume')
     expect(found?.state).toMatch(/CA-PQ/)
@@ -135,6 +136,7 @@ describe('finish and resume', () => {
       activationAt: NOW - DAY,
       notAfter: NOW + 30 * DAY,
       nextFingerprint: 'aa',
+      offline: false,
     }
     expect(row(overview({ resumable: true, journal }), 'resume')?.state).toMatch(/délai dépassé/)
   })
@@ -320,7 +322,61 @@ describe('prerequisites', () => {
   })
 })
 
+describe('the delegation copy', () => {
+  it('the_delegation_needs_the_vault_copy_and_one_key', () => {
+    const labels = prerequisites(overview(), 'renew_delegation').map((p) => p.label)
+    expect(labels).toContain('Copie du coffre')
+    expect(labels).not.toContain('Deux clés enregistrées')
+  })
+})
+
+describe('a live delegation', () => {
+  it('is_shown_open_with_its_expiry_and_not_resumable_then_offered_once_closed', () => {
+    const live = {
+      operation_id: 'c'.repeat(32),
+      scope: 'issuer_delegation' as const,
+      reason: 'x',
+      requested_by: 'y',
+      target_count: 1,
+      required_credentials: 1,
+      campaign_fingerprint: 'a'.repeat(64),
+      created_at: NOW - 100,
+      expires_at: NOW + 200,
+    }
+    const open = row(overview({ pending: { state: 'ok', value: [live] } }), 'renew_delegation')
+    expect(open?.disabledReason).toMatch(/^Opération ouverte jusqu’au /)
+    const closed = row(
+      overview({ pending: { state: 'ok', value: [{ ...live, expires_at: NOW - 1 }] } }),
+      'renew_delegation',
+    )
+    expect(closed?.disabledReason).toBeNull()
+  })
+})
+
 describe('live operations', () => {
+  it('ignores_an_operation_past_its_expiry_on_the_gateway_clock', () => {
+    const stale = {
+      operation_id: 'c'.repeat(32),
+      scope: 'fleet_leafs' as const,
+      reason: 'x',
+      requested_by: 'y',
+      target_count: 1,
+      required_credentials: 1,
+      campaign_fingerprint: 'a'.repeat(64),
+      created_at: NOW - 500,
+      expires_at: NOW - 1,
+    }
+    const o = overview({ pending: { state: 'ok', value: [stale] } })
+    expect(liveOperation(o, 'renew_fleet', NOW)).toBeNull()
+    // The local clock is behind, the gateway's is not: the gateway's decides.
+    expect(liveOperation(o, 'renew_fleet', NOW - 1_000)).toBeNull()
+    const late = overview({
+      pending: { state: 'ok', value: [{ ...stale, expires_at: NOW + 50 }] },
+      domain: { state: 'unreachable' },
+    })
+    expect(liveOperation(late, 'renew_fleet', NOW)?.operation_id).toBe('c'.repeat(32))
+  })
+
   it('finds_the_operation_of_the_scope_an_action_opens', () => {
     const operation = {
       operation_id: 'c'.repeat(32),
@@ -334,9 +390,9 @@ describe('live operations', () => {
       expires_at: NOW + 300,
     }
     const o = overview({ pending: { state: 'ok', value: [operation] } })
-    expect(liveOperation(o, 'renew_fleet')?.operation_id).toBe('c'.repeat(32))
-    expect(liveOperation(o, 'renew_delegation')).toBeNull()
-    expect(liveOperation(overview({ pending: { state: 'not_admin' } }), 'renew_fleet')).toBeNull()
+    expect(liveOperation(o, 'renew_fleet', NOW)?.operation_id).toBe('c'.repeat(32))
+    expect(liveOperation(o, 'renew_delegation', NOW)).toBeNull()
+    expect(liveOperation(overview({ pending: { state: 'not_admin' } }), 'renew_fleet', NOW)).toBeNull()
   })
 })
 
@@ -347,6 +403,7 @@ describe('the stops', () => {
     activationAt: 1_800_000_000,
     notAfter: 1_802_000_000,
     nextFingerprint: 'aa',
+    offline: true,
   }
 
   it('an_install_deadline_shows_its_date', () => {
@@ -354,9 +411,22 @@ describe('the stops', () => {
     expect(stopSentence('install_deadline_passed', journal)).toMatch(/Intervention manuelle requise/)
   })
 
-  it('a_CA_PQ_conflict_points_to_the_signer', () => {
+  it('an_offline_CA_PQ_conflict_points_to_the_signer', () => {
     expect(stopSentence('domain_conflict', journal)).toMatch(/astra-signer rotate-ca-pq/)
     expect(stopSentence('domain_conflict', { ...journal, kind: 'ca_tls' })).not.toMatch(/astra-signer/)
+  })
+
+  it('a_conflict_on_a_rotation_Orion_carries_does_not_send_to_the_signer', () => {
+    const sentence = stopSentence('domain_conflict', { ...journal, offline: false })
+    expect(sentence).not.toMatch(/astra-signer/)
+    expect(sentence).toMatch(/Intervention manuelle requise/)
+  })
+
+  it('the_outdated_gateway_names_the_kind_of_the_journal', () => {
+    expect(stopSentence('gateway_names_no_anchor', journal)).toMatch(/CA-PQ/)
+    expect(stopSentence('gateway_names_no_anchor', journal)).not.toMatch(/CA TLS/)
+    expect(stopSentence('gateway_names_no_anchor', { ...journal, kind: 'ca_tls' })).toMatch(/CA TLS/)
+    expect(stopSentence('gateway_names_no_anchor', null)).toMatch(/sans CA TLS/)
   })
 })
 
@@ -372,6 +442,7 @@ describe('the wording', () => {
         activationAt: NOW + 1,
         notAfter: NOW + 2,
         nextFingerprint: 'aa',
+        offline: false,
       },
     })
     for (const variant of [o, overview({ caPqOverlap: true }), overview({ vault: null, vaultError: 'illisible', tunnel: false })]) {

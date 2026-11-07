@@ -280,7 +280,6 @@ export function AstraView({
     <RotationsPanel
       onCeremony={openCeremony}
       onOverview={takeOverview}
-      onOpenApprovals={() => setTab('Approbations')}
     />
   )
 

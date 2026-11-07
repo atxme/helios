@@ -14,7 +14,7 @@ vi.mock('../../api', () => api)
 
 import type { OperatorPendingOperation, RotationsOverview } from '../../types'
 import { RotationsPanel } from './RotationsPanel'
-import { DAY, NOW, authorityRead, domainRead, overview } from './rotationFixtures'
+import { NOW, authorityRead, overview } from './rotationFixtures'
 
 const operation = (scope: OperatorPendingOperation['scope']): OperatorPendingOperation => ({
   operation_id: 'c'.repeat(32),
@@ -37,16 +37,14 @@ const show = async (o: RotationsOverview = overview()) => {
   api.operatorRotationsOverview.mockResolvedValue(o)
   const onCeremony = vi.fn()
   const onOverview = vi.fn()
-  const onOpenApprovals = vi.fn()
   render(
     <RotationsPanel
       onCeremony={onCeremony}
       onOverview={onOverview}
-      onOpenApprovals={onOpenApprovals}
     />,
   )
   await screen.findByRole('region', { name: 'Renouveler les postes' })
-  return { onCeremony, onOverview, onOpenApprovals }
+  return { onCeremony, onOverview }
 }
 
 const choose = (title: string) =>
@@ -181,14 +179,65 @@ describe('the prerequisites', () => {
     })
   })
 
-  it('a_live_delegation_leads_to_the_approvals_tab', async () => {
-    const { onOpenApprovals } = await show(
-      overview({ pending: { state: 'ok', value: [operation('issuer_delegation')] } }),
+  it('a_live_delegation_is_shown_open_with_no_resume_and_no_new_opening', async () => {
+    await show(
+      overview({
+        pending: {
+          state: 'ok',
+          value: [{ ...operation('issuer_delegation'), expires_at: NOW + 200 }],
+        },
+      }),
     )
-    choose('Renouveler la délégation')
-    fireEvent.click(prerequisitesOf().getByRole('button', { name: 'Reprendre' }))
-    expect(onOpenApprovals).toHaveBeenCalled()
+    const row = within(region('Renouveler la délégation'))
+    expect(row.getByText(/Opération ouverte jusqu’au/)).toBeTruthy()
+    expect(row.queryByText('Reprendre')).toBeNull()
+    expect(row.getByRole('button').hasAttribute('disabled')).toBe(true)
     expect(api.operatorOpenCampaign).not.toHaveBeenCalled()
+  })
+
+  it('a_live_CA_campaign_shows_its_reason_on_both_replace_rows', async () => {
+    await show(
+      overview({
+        pending: { state: 'ok', value: [{ ...operation('trust_authorities'), reason: 'ancres 2027' }] },
+      }),
+    )
+    for (const title of ['Remplacer la CA-PQ', 'Remplacer la CA TLS']) {
+      const row = within(region(title))
+      expect(row.getByText(/ancres 2027/)).toBeTruthy()
+      expect(row.getByRole('button').textContent).toBe('Reprendre')
+    }
+  })
+})
+
+describe('a row that becomes impossible after it was chosen', () => {
+  it('keeps_the_next_step_from_starting', async () => {
+    api.beginOperatorCeremony.mockResolvedValue(ceremony)
+    await show()
+    choose('Renouveler les postes')
+    const next = prerequisitesOf().getByRole('button', { name: 'Continuer' })
+    expect(next.hasAttribute('disabled')).toBe(false)
+    api.operatorRotationsOverview.mockResolvedValue(overview({ caPqOverlap: true }))
+    fireEvent.click(prerequisitesOf().getByRole('button', { name: 'Vérifier' }))
+    await waitFor(() =>
+      expect(
+        prerequisitesOf().getByRole('button', { name: 'Continuer' }).hasAttribute('disabled'),
+      ).toBe(true),
+    )
+    fireEvent.click(prerequisitesOf().getByRole('button', { name: 'Continuer' }))
+    expect(api.operatorOpenCampaign).not.toHaveBeenCalled()
+    expect(api.beginOperatorCeremony).not.toHaveBeenCalled()
+  })
+
+  it('unmounts_a_CA_step_that_has_not_started_when_its_row_is_disabled', async () => {
+    const renderStep = vi.fn(() => <p>étape</p>)
+    api.operatorRotationsOverview.mockResolvedValue(overview())
+    render(<RotationsPanel onCeremony={vi.fn()} renderStep={renderStep} />)
+    await screen.findByRole('region', { name: 'Remplacer la CA TLS' })
+    choose('Remplacer la CA TLS')
+    expect(await screen.findByText('étape')).toBeTruthy()
+    api.operatorRotationsOverview.mockResolvedValue(overview({ resumable: true }))
+    fireEvent.click(prerequisitesOf().getByRole('button', { name: 'Vérifier' }))
+    await waitFor(() => expect(screen.queryByText('étape')).toBeNull())
   })
 })
 
@@ -307,13 +356,32 @@ describe('the poll', () => {
   })
 })
 
+describe('under StrictMode', () => {
+  it('runs_one_chain_of_reads_only', async () => {
+    vi.useFakeTimers()
+    api.operatorRotationsOverview.mockResolvedValue(overview())
+    const { StrictMode } = await import('react')
+    render(
+      <StrictMode>
+        <RotationsPanel onCeremony={vi.fn()} />
+      </StrictMode>,
+    )
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    const first = api.operatorRotationsOverview.mock.calls.length
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(15_000)
+    })
+    expect(api.operatorRotationsOverview.mock.calls.length - first).toBe(1)
+  })
+})
+
 describe('the wording', () => {
   it('the_screen_has_no_second_person_text', async () => {
     await show(overview({ resumable: true, caTlsCloseAt: NOW - 1, tunnel: false }))
     choose('Remplacer la CA-PQ')
     const text = document.body.textContent ?? ''
     expect(text).not.toMatch(/\b(tu|te|ton|ta|tes|toi)\b/i)
-    void domainRead
-    void DAY
   })
 })

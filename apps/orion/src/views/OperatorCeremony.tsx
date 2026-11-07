@@ -509,7 +509,7 @@ export function refusalSentence(
     case 'install_deadline_passed':
       return stopSentence('install_deadline_passed', journal)
     case 'gateway_names_no_anchor':
-      return 'Gateway sans CA TLS, ou mise à jour requise. Rotation conservée.'
+      return stopSentence('gateway_names_no_anchor', journal)
     case 'rotation_in_flight':
       return 'Rotation en cours. La mener à son terme d’abord.'
     case 'key_not_validated':

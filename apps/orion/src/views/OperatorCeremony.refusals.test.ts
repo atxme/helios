@@ -78,10 +78,15 @@ describe('refusalSentence for the issuer delegation', () => {
       activationAt: 1_800_000_000,
       notAfter: 1_802_000_000,
       nextFingerprint: 'aa',
+      offline: true,
     }
     expect(refusalSentence({ refusal: 'domain_conflict' }, journal)).toMatch(
       /astra-signer rotate-ca-pq/,
     )
+    expect(refusalSentence({ refusal: 'domain_conflict' }, { ...journal, offline: false })).not.toMatch(
+      /astra-signer/,
+    )
+    expect(refusalSentence({ refusal: 'gateway_names_no_anchor' }, journal)).toMatch(/CA-PQ/)
     expect(refusalSentence({ refusal: 'install_deadline_passed' }, journal)).toMatch(
       /^Délai dépassé le .*Intervention manuelle requise/,
     )

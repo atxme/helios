@@ -3000,6 +3000,18 @@ mod overview {
             journal.next_anchor_fingerprint.to_hex()
         );
         assert!(local.resumable);
+        assert!(!view.offline, "the journal holds Orion's own deposit");
+    }
+
+    #[test]
+    fn a_journal_with_no_deposit_is_shown_as_offline() {
+        let bench = bench();
+        let mut journal = with_a_journal_kept(&bench);
+        journal.deposit = None;
+        let view = crate::operator::rotations::JournalView::of(&journal);
+        assert!(view.offline);
+        let shown = serde_json::to_value(&view).expect("json");
+        assert_eq!(shown["offline"], true);
     }
 
     #[test]
