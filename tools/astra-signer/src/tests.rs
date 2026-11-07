@@ -438,7 +438,8 @@ fn key_slot_gestures_are_refused_while_a_rotation_journal_is_in_flight() {
     for refused in refusals {
         let refused = refused.expect_err("refused");
         assert!(
-            format!("{refused:#}").contains("une rotation est en cours"),
+            format!("{refused:#}").contains("remplacera celui-ci")
+                && !format!("{refused:#}").contains("avant d'en ouvrir"),
             "{refused:#}"
         );
     }

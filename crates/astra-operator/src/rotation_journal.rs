@@ -120,6 +120,14 @@ impl RotationTransition {
         }
     }
 
+    /// The outgoing anchor, as the authority reports it while it is still in service.
+    pub fn outgoing_anchor_fingerprint(&self) -> Fingerprint {
+        match self {
+            Self::CaPq(transition) => transition.current_ca_fingerprint,
+            Self::CaTls(transition) => transition.active_client_tls_ca_fingerprint,
+        }
+    }
+
     pub fn window(&self) -> TransitionWindow {
         match self {
             Self::CaPq(transition) => transition.window,
@@ -364,6 +372,34 @@ pub fn something_to_resume(vault_path: &Path) -> Result<bool> {
     Ok(prepared::load(&prepared::path_beside(vault_path))?.is_some_and(|record| !record.adopted))
 }
 
+/// Refuses a change of key slots or labels while a sealed vault waits to overwrite
+/// the one in place.
+///
+/// [`apply_local`] saves that vault whole, so a key added, removed, marked or
+/// renamed meanwhile would be undone, a removed key regaining access. It waits in
+/// the CA-PQ file `astra-signer` left, in a journal that carries `next`, and in a
+/// journal too damaged to say. A journal past `Applied` has no `next` and cannot
+/// overwrite anything: it must not hold a stolen key in the vault, which is the
+/// reason [`ensure_none_in_flight`], by presence, is not this check.
+pub fn ensure_vault_not_awaiting_overwrite(vault_path: &Path) -> Result<()> {
+    let refused = || {
+        anyhow::anyhow!(
+            "une rotation porte un coffre qui remplacera celui-ci : la mener à son terme dans \
+             Orion avant de changer les clés ou leurs noms. Rien n'a été modifié."
+        )
+    };
+    match std::fs::symlink_metadata(legacy_ca_pq_path_beside(vault_path)) {
+        Ok(_) => return Err(refused()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("lecture du journal CA-PQ"),
+    }
+    match load(&path_beside(vault_path)) {
+        Ok(Some(journal)) if journal.next.is_some() => Err(refused()),
+        Ok(_) => Ok(()),
+        Err(_) => Err(refused()),
+    }
+}
+
 /// What `rotate-ca-pq` checks in place of [`ensure_none_in_flight`].
 ///
 /// Its one exception is the rotation it wrote itself, adopted and not confirmed:
@@ -583,6 +619,18 @@ impl LegacyCaPqJournal {
             bail!(
                 "le journal CA-PQ décrit une rotation d'un autre coffre que celui en place. Rien \
                  n'a été modifié."
+            );
+        }
+        // A key removed after the file was written would come back with its access:
+        // the sealed vault replaces the one in place whole.
+        let mut in_place = vault.credential_ids()?;
+        let mut sealed = self.vault.credential_ids()?;
+        in_place.sort();
+        sealed.sort();
+        if in_place != sealed {
+            bail!(
+                "le journal CA-PQ porte d'autres clés que le coffre en place : l'appliquer \
+                 rendrait l'accès à une clé retirée. Rien n'a été modifié."
             );
         }
         Ok(())
@@ -864,11 +912,18 @@ fn next_step_of_signed(journal: &RotationJournal, facts: &ResumeFacts) -> Resume
     let Some(authority) = &facts.authority else {
         return ResumeStep::ReadAuthority;
     };
+    let (current, next) = anchors_of(journal.kind, authority);
     if authority_holds(journal, authority) {
         ResumeStep::ApplyLocal
-    } else if anchors_of(journal.kind, authority).1.is_some() || journal.next.is_none() {
+    } else if next.is_some()
+        || journal.next.is_none()
+        || current != Some(journal.transition.outgoing_anchor_fingerprint())
+    {
         // With no `next`, the vault in place is already the rotated one, and
         // clearing the only record of that would hide what Astra does not know.
+        // An authority serving another outgoing anchor is another domain's, or
+        // not this rotation's: it says nothing of an Astra that may have accepted
+        // and will promote, so the only copy of the next vault stays.
         ResumeStep::DomainConflict
     } else {
         ResumeStep::Discard
@@ -1094,10 +1149,10 @@ mod tests {
     fn authority() -> OperatorAuthorityStatus {
         OperatorAuthorityStatus {
             ca_epoch: 1,
-            ca_fingerprint: Fingerprint::of(b"ca en service"),
+            ca_fingerprint: Fingerprint::of(b"ancre sortante"),
             next_ca_fingerprint: None,
             ca_tls_epoch: 1,
-            ca_tls_fingerprint: Some(Fingerprint::of(b"ca tls en service")),
+            ca_tls_fingerprint: Some(Fingerprint::of(b"ancre sortante")),
             next_ca_tls_fingerprint: None,
             issuer: None,
             vault_copy_fingerprint: None,
@@ -1129,6 +1184,42 @@ mod tests {
             vault_path,
             journal_path,
         }
+    }
+
+    // Key gestures and a sealed vault waiting to overwrite this one.
+
+    #[test]
+    fn key_gestures_wait_only_for_a_sealed_vault_that_can_overwrite() {
+        let place = place();
+        ensure_vault_not_awaiting_overwrite(&place.vault_path).expect("nothing waits");
+
+        // A sealed vault to apply.
+        save(&place.journal_path, &journal(JournalStage::Signed)).expect("saved");
+        assert!(ensure_vault_not_awaiting_overwrite(&place.vault_path).is_err());
+        save(&place.journal_path, &journal(JournalStage::Accepted)).expect("saved");
+        assert!(ensure_vault_not_awaiting_overwrite(&place.vault_path).is_err());
+
+        // Applied: `next` is gone, nothing can overwrite the vault, a stolen key
+        // can be removed. So at `Installed` after a held-back copy.
+        for stage in [JournalStage::Applied, JournalStage::Installed] {
+            save(&place.journal_path, &journal(stage)).expect("saved");
+            ensure_vault_not_awaiting_overwrite(&place.vault_path).expect("nothing waits");
+        }
+
+        // One that cannot be read says nothing.
+        std::fs::write(&place.journal_path, b"illisible").expect("damaged");
+        assert!(ensure_vault_not_awaiting_overwrite(&place.vault_path).is_err());
+    }
+
+    #[test]
+    fn key_gestures_wait_for_the_legacy_ca_pq_file() {
+        let place = place();
+        std::fs::write(legacy_ca_pq_path_beside(&place.vault_path), b"{}").expect("legacy");
+        let refused = ensure_vault_not_awaiting_overwrite(&place.vault_path).expect_err("refused");
+        assert!(
+            format!("{refused:#}").contains("remplacera celui-ci"),
+            "{refused:#}"
+        );
     }
 
     // The table of §5.4.
@@ -1216,6 +1307,30 @@ mod tests {
             next_step(&signed, &with_authority(EXPIRES, authority())),
             ResumeStep::Discard
         );
+    }
+
+    /// Another domain's authority holds nothing of this rotation and has nothing in
+    /// flight either: it says nothing about Astra A, which may have accepted and
+    /// will promote at `not_after`. The only copy of the next vault stays.
+    #[test]
+    fn a_signed_journal_survives_another_domains_authority() {
+        for journal in [journal(JournalStage::Signed), {
+            let mut ca_pq = ca_pq_journal(JournalStage::Signed);
+            ca_pq.next = Some(next_local());
+            ca_pq
+        }] {
+            let elsewhere = OperatorAuthorityStatus {
+                ca_fingerprint: Fingerprint::of(b"ancre d'un autre domaine"),
+                ca_tls_fingerprint: Some(Fingerprint::of(b"ancre d'un autre domaine")),
+                ..authority()
+            };
+            assert_eq!(
+                next_step(&journal, &with_authority(EXPIRES, elsewhere)),
+                ResumeStep::DomainConflict,
+                "{:?}",
+                journal.kind
+            );
+        }
     }
 
     #[test]

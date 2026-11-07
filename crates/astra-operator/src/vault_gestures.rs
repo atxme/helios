@@ -76,20 +76,19 @@ pub enum SetupRefusal {
     )]
     PlanChanged,
     #[error(
-        "une rotation est en cours : la mener à son terme avant de changer les clés du coffre"
+        "une rotation porte un coffre qui remplacera celui-ci : la mener à son terme avant de \
+         changer les clés ou leurs noms"
     )]
     RotationInFlight,
 }
 
-/// Refuses a change of key slots while a rotation journal is in flight.
+/// Refuses a change of key slots or labels while a sealed vault waits to overwrite
+/// this one, see [`crate::rotation_journal::ensure_vault_not_awaiting_overwrite`].
 ///
-/// The rotation applies the vault signed before it, over the one in place: a key
-/// added, removed or marked in between would be undone, and a removed key would
-/// regain access. By presence, as `ensure_none_in_flight` reads it, so a journal too
-/// damaged to read refuses as well. Asked before any key, and again by each gesture
-/// that writes, since the journal may have appeared during the touches.
+/// Asked before any key, and again by each gesture that writes, since the file may
+/// have appeared during the touches.
 pub fn ensure_no_rotation_in_flight(vault_path: &Path) -> std::result::Result<(), SetupRefusal> {
-    crate::rotation_journal::ensure_none_in_flight(vault_path)
+    crate::rotation_journal::ensure_vault_not_awaiting_overwrite(vault_path)
         .map_err(|_| SetupRefusal::RotationInFlight)
 }
 
@@ -328,6 +327,7 @@ pub fn mark_key_with(
 /// Renames a key. No key is asked anything: the label is outside the slot
 /// digest, so the vault is not re-sealed.
 pub fn rename_key(vault_path: &Path, slot_id: &[u8; 16], label: &str) -> Result<()> {
+    ensure_no_rotation_in_flight(vault_path)?;
     let mut vault = store::load(vault_path)?;
     vault.slot(slot_id).map_err(|_| SetupRefusal::UnknownSlot)?;
     vault.rename_slot(slot_id, label)?;

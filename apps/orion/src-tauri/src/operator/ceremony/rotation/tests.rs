@@ -2379,6 +2379,23 @@ fn a_locator_does_not_open_a_rotation() {
 /// Nothing out of reach: the address no tunnel answers at.
 const NO_ONE_ANSWERS: &str = "http://127.0.0.1:1";
 
+/// The tunnel of the domain's own gateway, which no one answers at.
+fn towards_gateway(bench: &Bench) -> crate::operator::GatewayTarget {
+    let relay = bench.relay();
+    crate::operator::GatewayTarget {
+        address: NO_ONE_ANSWERS.into(),
+        peer_key: relay.gateway_wg_public_key.expect("a gateway"),
+    }
+}
+
+/// A tunnel to a gateway that is not the domain's.
+fn towards_another_gateway() -> crate::operator::GatewayTarget {
+    crate::operator::GatewayTarget {
+        address: NO_ONE_ANSWERS.into(),
+        peer_key: WireGuardKey::from_bytes([0x77; 32]).to_base64(),
+    }
+}
+
 /// A journal any look would find: only its presence counts to the trigger.
 fn leave_a_journal(bench: &Bench) {
     std::fs::write(rotation_journal::path_beside(&bench.path), b"{}").expect("journal");
@@ -2389,10 +2406,10 @@ async fn no_journal_means_no_ceremony() {
     let bench = bench();
     let ceremony = OperatorCeremony::default();
     let started = ceremony
-        .resume_on_tunnel_up(NO_ONE_ANSWERS.into(), bench.path.clone())
+        .resume_on_tunnel_up(towards_gateway(&bench), bench.path.clone())
         .await
         .expect("looked");
-    assert!(started.is_none());
+    assert!(!started.is_started());
     assert!(ceremony.status().await.is_none());
 }
 
@@ -2408,10 +2425,10 @@ async fn a_finished_rotation_means_no_ceremony() {
     assert!(bench.journal().is_none());
     let ceremony = OperatorCeremony::default();
     let started = ceremony
-        .resume_on_tunnel_up(NO_ONE_ANSWERS.into(), bench.path.clone())
+        .resume_on_tunnel_up(towards_gateway(&bench), bench.path.clone())
         .await
         .expect("looked");
-    assert!(started.is_none());
+    assert!(!started.is_started());
     assert!(ceremony.status().await.is_none());
 }
 
@@ -2436,10 +2453,10 @@ async fn an_unadopted_record_starts_a_resumption() {
     .expect("record");
     let ceremony = OperatorCeremony::default();
     let started = ceremony
-        .resume_on_tunnel_up(NO_ONE_ANSWERS.into(), bench.path.clone())
+        .resume_on_tunnel_up(towards_gateway(&bench), bench.path.clone())
         .await
         .expect("looked");
-    assert!(started.is_some());
+    assert!(started.is_started());
     let ended = until(&ceremony, |status| status.gesture.is_terminal()).await;
     assert_eq!(ended.refusal, Some(Refusal::GatewayUnavailable));
 }
@@ -2453,11 +2470,11 @@ async fn resume_waits_for_a_running_ceremony() {
     leave_a_journal(&bench);
 
     let started = ceremony
-        .resume_on_tunnel_up(NO_ONE_ANSWERS.into(), bench.path.clone())
+        .resume_on_tunnel_up(towards_gateway(&bench), bench.path.clone())
         .await
         .expect("looked");
 
-    assert!(started.is_none());
+    assert!(!started.is_started());
     assert_eq!(ceremony.status().await.expect("status"), waiting);
     ceremony
         .advance(OperatorAction::Cancel, waiting.revision, 0)
@@ -2480,22 +2497,23 @@ async fn resume_leaves_an_operators_finished_screen_alone() {
     leave_a_journal(&bench);
 
     let started = ceremony
-        .resume_on_tunnel_up(NO_ONE_ANSWERS.into(), bench.path.clone())
+        .resume_on_tunnel_up(towards_gateway(&bench), bench.path.clone())
         .await
         .expect("looked");
-    assert!(started.is_none());
+    assert!(!started.is_started());
     assert_eq!(ceremony.status().await.expect("status"), ended);
 
     ceremony.dismiss().await.expect("dismissed");
     assert!(ceremony
-        .resume_on_tunnel_up(NO_ONE_ANSWERS.into(), bench.path.clone())
+        .resume_on_tunnel_up(towards_gateway(&bench), bench.path.clone())
         .await
         .expect("looked")
-        .is_some());
+        .is_started());
 }
 
-/// A dead end is retried at each tunnel-up: its own finished session gives way, with
-/// the journal and the vault as they were and no key asked.
+/// A stopped rotation is retried at each tunnel-up (here against a tunnel nobody
+/// answers): its own finished session gives way, with the journal and the vault as
+/// they were and no key asked.
 #[tokio::test(flavor = "multi_thread")]
 async fn each_tunnel_up_retries_a_stopped_rotation_with_no_key() {
     let bench = bench();
@@ -2510,10 +2528,9 @@ async fn each_tunnel_up_retries_a_stopped_rotation_with_no_key() {
 
     for _ in 0..2 {
         ceremony
-            .resume_on_tunnel_up(NO_ONE_ANSWERS.into(), bench.path.clone())
+            .resume_on_tunnel_up(towards_gateway(&bench), bench.path.clone())
             .await
-            .expect("looked")
-            .expect("started");
+            .expect("looked");
         let ended = until(&ceremony, |status| status.gesture.is_terminal()).await;
         assert_eq!(ended.refusal, Some(Refusal::GatewayUnavailable));
         assert!(ended.keys.is_empty());
@@ -2521,6 +2538,21 @@ async fn each_tunnel_up_retries_a_stopped_rotation_with_no_key() {
         assert_eq!(bench.vault_bytes(), vault);
         assert_eq!(bench.touches(), touches);
     }
+}
+
+/// The engine's events, as the glue reads them: only a state change into `Up`, once.
+#[test]
+fn only_a_state_change_into_up_triggers() {
+    use aether::TunnelState;
+    use orion_core::ClientEvent;
+
+    let watch = crate::operator::TunnelWatch::default();
+    let state = |state| ClientEvent::StateChanged { state };
+    assert!(!watch.entered_up_by(&state(TunnelState::Down)));
+    assert!(watch.entered_up_by(&state(TunnelState::Up)));
+    assert!(!watch.entered_up_by(&state(TunnelState::Up)));
+    assert!(!watch.entered_up_by(&state(TunnelState::Down)));
+    assert!(watch.entered_up_by(&state(TunnelState::Up)));
 }
 
 /// The tunnel's up edge, once: a repeated report of the same state starts nothing.
@@ -2560,4 +2592,177 @@ fn a_copy_held_back_by_a_resumption_keeps_the_journal_and_is_not_a_failure() {
     let next = bench.drive(RotationGesture::Resume, Bench::all_the_way);
     next.done();
     assert!(bench.journal().is_none());
+}
+
+// Another domain's gateway, and the edges that meet a busy screen.
+
+/// Orion holds several profiles and one vault: a tunnel to a gateway the relay does
+/// not name reads another authority, which would call a live journal « nothing in
+/// flight » and have it discarded. Nothing starts, and no folder or screen appears.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_resume_towards_another_domains_gateway_starts_nothing() {
+    let bench = bench();
+    leave_a_journal(&bench);
+    let before = std::fs::read(rotation_journal::path_beside(&bench.path)).expect("journal");
+    let ceremony = OperatorCeremony::default();
+
+    let outcome = ceremony
+        .resume_on_tunnel_up(towards_another_gateway(), bench.path.clone())
+        .await
+        .expect("looked");
+
+    assert!(!outcome.is_started());
+    assert!(ceremony.status().await.is_none());
+    assert_eq!(
+        std::fs::read(rotation_journal::path_beside(&bench.path)).expect("journal"),
+        before
+    );
+}
+
+/// The gesture of the button says so, before any call, and moves nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_resume_gesture_is_refused_towards_another_domains_gateway() {
+    let bench = bench();
+    bench.remote.deposits.lock().expect("lock").push_back(503);
+    bench.drive(RotationGesture::ReplaceCaPq, Bench::all_the_way);
+    let (journal, vault) = (bench.journal().expect("kept"), bench.vault_bytes());
+    let ceremony = OperatorCeremony::default();
+
+    ceremony
+        .begin_rotation(
+            RotationGesture::Resume,
+            Some(towards_another_gateway()),
+            bench.path.clone(),
+        )
+        .await
+        .expect("a session");
+    let ended = until(&ceremony, |status| status.gesture.is_terminal()).await;
+
+    assert_eq!(ended.refusal, Some(Refusal::HandoffMismatch));
+    assert_eq!(bench.journal().as_ref(), Some(&journal));
+    assert_eq!(bench.vault_bytes(), vault);
+}
+
+/// An edge met while a ceremony runs is not lost: the look waits for its end and is
+/// made once. The finished screen is the operator's, so it stays, and dismissing it
+/// is what lets the look through.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_edge_met_during_a_running_ceremony_looks_once_after_its_end() {
+    let bench = bench();
+    let ceremony = Arc::new(OperatorCeremony::default());
+    open_session(&ceremony, &bench, RotationGesture::ReplaceCaPq).await;
+    let waiting = until(&ceremony, |status| awaits_validation(status, 1)).await;
+    leave_a_journal(&bench);
+
+    let look = {
+        let (ceremony, path, target) = (
+            ceremony.clone(),
+            bench.path.clone(),
+            towards_gateway(&bench),
+        );
+        tokio::spawn(async move {
+            crate::operator::resume_with(&ceremony, Ok(path), Ok(target)).await;
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!look.is_finished(), "waits for the running ceremony");
+    assert_eq!(ceremony.status().await.expect("status"), waiting);
+
+    ceremony
+        .advance(OperatorAction::Cancel, waiting.revision, 0)
+        .await
+        .expect("abandoned");
+    tokio::time::timeout(Duration::from_secs(10), look)
+        .await
+        .expect("the wait ends by itself")
+        .expect("joined");
+    let kept = ceremony.status().await.expect("a session");
+    assert_eq!(kept.session_id, waiting.session_id, "their screen stays");
+
+    ceremony.dismiss().await.expect("dismissed");
+    crate::operator::resume_with(
+        &ceremony,
+        Ok(bench.path.clone()),
+        Ok(towards_gateway(&bench)),
+    )
+    .await;
+    let after = ceremony.status().await.expect("a session");
+    assert_ne!(after.session_id, waiting.session_id, "a resumption ran");
+}
+
+/// A terminal screen of the operator's own, then dismissed: the look is made again.
+#[tokio::test(flavor = "multi_thread")]
+async fn dismissing_the_screen_that_was_in_the_way_lets_the_look_through() {
+    let bench = bench();
+    let ceremony = OperatorCeremony::default();
+    ceremony
+        .begin_rotation(RotationGesture::ReplaceCaTls, None, bench.path.clone())
+        .await
+        .expect("a session");
+    let ended = until(&ceremony, |status| status.gesture.is_terminal()).await;
+    leave_a_journal(&bench);
+
+    crate::operator::resume_with(
+        &ceremony,
+        Ok(bench.path.clone()),
+        Ok(towards_gateway(&bench)),
+    )
+    .await;
+    assert_eq!(ceremony.status().await.expect("status"), ended);
+
+    ceremony.dismiss().await.expect("dismissed");
+    crate::operator::resume_with(
+        &ceremony,
+        Ok(bench.path.clone()),
+        Ok(towards_gateway(&bench)),
+    )
+    .await;
+    let after = ceremony.status().await.expect("a session");
+    assert_ne!(after.session_id, ended.session_id);
+}
+
+/// A vault or a gateway that cannot be named is nothing to do.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_look_without_a_vault_or_a_gateway_does_nothing() {
+    let bench = bench();
+    leave_a_journal(&bench);
+    let ceremony = OperatorCeremony::default();
+    crate::operator::resume_with(
+        &ceremony,
+        Err("aucun coffre".into()),
+        Ok(towards_gateway(&bench)),
+    )
+    .await;
+    crate::operator::resume_with(
+        &ceremony,
+        Ok(bench.path.clone()),
+        Err("aucun tunnel".into()),
+    )
+    .await;
+    assert!(ceremony.status().await.is_none());
+}
+
+/// A real dead end, retried at each tunnel-up: past `activation_at` the transition is
+/// not on the gateway, and every resumption stops the same way with the journal and
+/// the vault as they were, no key asked.
+#[test]
+fn a_rotation_past_its_install_deadline_is_retried_and_stops_the_same_way() {
+    let bench = bench();
+    *bench.remote.install_refused.lock().expect("lock") = Some(503);
+    bench
+        .drive(RotationGesture::ReplaceCaPq, Bench::all_the_way)
+        .refused(Refusal::GatewayRefused { status: 503 });
+    let journal = bench.journal().expect("kept");
+    *bench.remote.install_refused.lock().expect("lock") = None;
+    bench.set_clock(journal.activation_at);
+    let (vault, touches) = (bench.vault_bytes(), bench.touches());
+
+    for _ in 0..2 {
+        let ran = bench.drive(RotationGesture::Resume, Bench::all_the_way);
+        ran.refused(Refusal::InstallDeadlinePassed);
+        assert!(ran.asked_no_key());
+        assert_eq!(bench.journal().as_ref(), Some(&journal));
+        assert_eq!(bench.vault_bytes(), vault);
+        assert_eq!(bench.touches(), touches);
+    }
 }

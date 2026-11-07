@@ -32,7 +32,10 @@ use astra_operator::rotation_journal::{
 use astra_operator::tunnel::{self, Tunnel, TunnelRefusal};
 
 use super::{connect_key, now_unix, Ceremony, Press};
-use crate::operator::RotationGesture;
+use crate::operator::{relay_names_peer, GatewayTarget, RotationGesture};
+
+/// Said when the tunnel leads to a gateway the domain's relay does not name.
+const WRONG_GATEWAY: &str = "la gateway jointe n'est pas celle que le relais du domaine désigne";
 
 /// How long an opening is kept for an operator who answers nothing.
 pub const VALIDATION_IDLE_SECS: u64 = 300;
@@ -52,7 +55,7 @@ const ROTATION_KEYS: u8 = 2;
 pub fn run_rotation(
     session_id: Id16,
     gesture: RotationGesture,
-    gateway: Option<String>,
+    gateway: Option<GatewayTarget>,
     presses: Receiver<Press>,
     publish: &mut dyn FnMut(OperatorStatus),
     vault_path: &Path,
@@ -68,11 +71,24 @@ pub fn run_rotation(
 
     let tunnel = gateway
         .ok_or_else(|| "aucun tunnel n'est monté vers la gateway".to_string())
-        .and_then(|address| Tunnel::new(&address).map_err(|error| format!("{error:#}")));
+        .and_then(|target| {
+            // Before any call: a resumption reads the status of whatever authority
+            // answers, and sends the sealed vault to whatever gateway it reaches.
+            if gesture == RotationGesture::Resume
+                && !relay_names_peer(vault_path, &target.peer_key).unwrap_or(false)
+            {
+                return Err(WRONG_GATEWAY.to_string());
+            }
+            Tunnel::new(&target.address).map_err(|error| format!("{error:#}"))
+        });
     let tunnel = match tunnel {
         Ok(tunnel) => tunnel,
         Err(message) => {
-            ceremony.refuse(Refusal::GatewayUnavailable);
+            ceremony.refuse(if message == WRONG_GATEWAY {
+                Refusal::HandoffMismatch
+            } else {
+                Refusal::GatewayUnavailable
+            });
             publish(ceremony.status());
             return Err(message);
         }

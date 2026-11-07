@@ -370,6 +370,29 @@ fn key_slot_gestures_are_refused_while_a_rotation_is_in_flight() {
     }
 }
 
+/// The CA-PQ file `astra-signer` left holds a sealed vault: renaming a key now would
+/// be reverted when it is applied. Refused, the label as it was.
+#[test]
+fn a_rename_is_refused_while_a_sealed_vault_waits() {
+    let domain = Domain::new("rename-waits");
+    let slot_id = first_slot_id(&domain);
+    std::fs::write(
+        astra_operator::rotation_journal::legacy_ca_pq_path_beside(&domain.vault_path),
+        b"{}",
+    )
+    .expect("legacy file");
+    let vault_bytes = std::fs::read(&domain.vault_path).expect("vault");
+
+    let refused = crate::operator::rename_key(&domain.vault_path, &slot_id, "autre nom")
+        .expect_err("refused");
+
+    assert!(refused.contains("remplacera celui-ci"), "{refused}");
+    assert_eq!(
+        std::fs::read(&domain.vault_path).expect("vault"),
+        vault_bytes
+    );
+}
+
 /// A domain carrying its CA-TLS and a document for every key has nothing
 /// left to issue.
 #[test]

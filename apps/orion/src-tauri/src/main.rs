@@ -221,14 +221,14 @@ fn ensure_frontend_dev_server() -> anyhow::Result<Option<FrontendDevServer>> {
 fn emit_sink(app: AppHandle) -> EventSink {
     let tunnel = operator::TunnelWatch::default();
     Arc::new(move |ev: ClientEvent| {
-        if let ClientEvent::StateChanged { state } = &ev {
+        if matches!(ev, ClientEvent::StateChanged { .. }) {
             tray::refresh(&app);
-            if tunnel.entered_up(*state == aether::TunnelState::Up) {
-                let app = app.clone();
-                tauri::async_runtime::spawn(async move {
-                    operator::resume_on_tunnel_up(&app).await;
-                });
-            }
+        }
+        if tunnel.entered_up_by(&ev) {
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move {
+                operator::resume_on_tunnel_up(&app).await;
+            });
         }
         let _ = app.emit("helios://event", &ev);
     })

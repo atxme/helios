@@ -101,8 +101,14 @@ pub(crate) async fn advance_operator_ceremony(
 
 /// Removes the final status once the operator has acknowledged it.
 #[tauri::command]
-pub(crate) async fn dismiss_operator_ceremony(state: State<'_, AppState>) -> Result<(), String> {
-    state.operator.dismiss().await
+pub(crate) async fn dismiss_operator_ceremony(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    state.operator.dismiss().await?;
+    // The screen that was in the way may have cost a tunnel-up its look.
+    look_for_a_rotation_again(app);
+    Ok(())
 }
 
 /// Everything waiting for an operator, through the gateway of one profile.
@@ -198,7 +204,7 @@ pub(crate) async fn begin_rotation_ceremony(
     gesture: crate::operator::RotationGesture,
 ) -> Result<aether::certificates::operator_session::OperatorStatus, String> {
     let vault_path = state.vault_location.path()?;
-    let gateway = connected_gateway(&state).await.ok();
+    let gateway = connected_target(&state).await.ok();
     state
         .operator
         .begin_rotation(gesture, gateway, vault_path)
@@ -373,6 +379,7 @@ pub(crate) async fn operator_vault_location(
 pub(crate) async fn choose_vault_location(
     state: State<'_, AppState>,
     window: tauri::Window,
+    app: tauri::AppHandle,
 ) -> Result<Option<crate::operator::location::VaultLocationView>, String> {
     #[cfg(target_os = "windows")]
     {
@@ -401,14 +408,16 @@ pub(crate) async fn choose_vault_location(
             // began.
             Some(path) => {
                 ensure_no_open_ceremony(&state).await?;
-                state.vault_location.choose(path).map(Some)
+                let view = state.vault_location.choose(path)?;
+                look_for_a_rotation_again(app);
+                Ok(Some(view))
             }
             None => Ok(None),
         }
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = (state, window);
+        let _ = (state, window, app);
         Err("le choix d'emplacement n'existe que sous Windows".to_string())
     }
 }
@@ -417,9 +426,20 @@ pub(crate) async fn choose_vault_location(
 #[tauri::command]
 pub(crate) async fn reset_vault_location(
     state: State<'_, AppState>,
+    app: tauri::AppHandle,
 ) -> Result<crate::operator::location::VaultLocationView, String> {
     ensure_no_open_ceremony(&state).await?;
-    state.vault_location.reset()
+    let view = state.vault_location.reset()?;
+    look_for_a_rotation_again(app);
+    Ok(view)
+}
+
+/// A vault the tunnel-up did not see may be in place now: the look is made again,
+/// once, as after a dismissed screen.
+fn look_for_a_rotation_again(app: tauri::AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        crate::operator::resume_on_tunnel_up(&app).await;
+    });
 }
 
 const CEREMONY_OPEN: &str =
@@ -521,8 +541,17 @@ const NO_CONNECTED_GATEWAY: &str = "Connectez d'abord le profil de la gateway, a
 /// the selected one and its tunnel up, because the admission rides the tunnel
 /// and a gateway reached any other way would not be the one the operator
 /// connected to.
-pub(crate) async fn connected_gateway(state: &AppState) -> Result<String, String> {
+async fn connected_gateway(state: &AppState) -> Result<String, String> {
     connected_profile(state).await.map(|(url, _)| url)
+}
+
+/// [`connected_gateway`] and the peer key, as the gateway a rotation may be carried to.
+pub(crate) async fn connected_target(
+    state: &AppState,
+) -> Result<crate::operator::GatewayTarget, String> {
+    connected_profile(state)
+        .await
+        .map(|(address, peer_key)| crate::operator::GatewayTarget { address, peer_key })
 }
 
 /// [`connected_gateway`], with the peer key of the connected profile read

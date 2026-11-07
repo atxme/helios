@@ -432,6 +432,28 @@ fn a_legacy_ca_pq_journal_for_a_vault_holding_neither_key_is_refused() {
     );
 }
 
+/// A key removed before the guard existed: applying the sealed vault would give its
+/// access back. Refused with both files intact.
+#[test]
+fn a_legacy_ca_pq_journal_whose_vault_holds_other_credentials_is_refused() {
+    let domain = domain();
+    let legacy = legacy_ca_pq(&domain);
+    let legacy_path = write_legacy_ca_pq(&domain.path, &legacy);
+    let mut in_place = store::load(&domain.path).expect("vault");
+    in_place.slots.pop();
+    store::save(&domain.path, &in_place).expect("vault");
+
+    let refused = rotation_journal::adopt_legacy(&domain.path).expect_err("refused");
+
+    assert!(format!("{refused:#}").contains("clés"), "{refused:#}");
+    assert!(legacy_path.exists());
+    assert_eq!(store::load(&domain.path).expect("vault"), in_place);
+    assert_eq!(
+        rotation_journal::load(&rotation_journal::path_beside(&domain.path)).expect("load"),
+        None
+    );
+}
+
 /// The CLI may finish what it started while nothing has confirmed the adoption,
 /// and not after: past the apply, the journal is carrying the rotation alone.
 #[test]

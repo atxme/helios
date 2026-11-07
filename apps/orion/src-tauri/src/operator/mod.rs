@@ -533,6 +533,43 @@ impl TunnelWatch {
         let was_up = self.0.swap(up, Ordering::AcqRel);
         up && !was_up
     }
+
+    /// [`Self::entered_up`], from an event of the engine: only a state change counts.
+    pub fn entered_up_by(&self, event: &orion_core::ClientEvent) -> bool {
+        match event {
+            orion_core::ClientEvent::StateChanged { state } => {
+                self.entered_up(*state == aether::TunnelState::Up)
+            }
+            _ => false,
+        }
+    }
+}
+
+/// The gateway a tunnel leads to: where it is, and whose it is.
+///
+/// The peer key is the connected profile's. Orion holds several profiles and one
+/// vault, so a rotation is carried only to the gateway the domain's relay names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayTarget {
+    pub address: String,
+    pub peer_key: String,
+}
+
+/// Whether the relay beside the vault names `peer_key` as the domain's gateway.
+///
+/// A resumption reads the status of whatever authority answers, and sends the sealed
+/// vault to whatever gateway it reaches: another domain's must be neither.
+fn relay_names_peer(vault_path: &std::path::Path, peer_key: &str) -> Result<bool, String> {
+    use aether::certificates::encoding::WireGuardKey;
+
+    let relay = astra_operator::handoff::load(&astra_operator::handoff::path_beside(vault_path))
+        .map_err(|error| format!("{error:#}"))?;
+    let named = relay
+        .gateway_wg_public_key
+        .as_deref()
+        .and_then(|key| WireGuardKey::parse(key.trim()).ok());
+    let connected = WireGuardKey::parse(peer_key.trim()).ok();
+    Ok(named.is_some() && named == connected)
 }
 
 /// The one ceremony Orion hosts at a time.
@@ -654,7 +691,7 @@ impl OperatorCeremony {
     pub async fn begin_rotation(
         &self,
         gesture: RotationGesture,
-        gateway: Option<String>,
+        gateway: Option<GatewayTarget>,
         vault_path: PathBuf,
     ) -> Result<OperatorStatus, String> {
         self.open(
@@ -713,23 +750,38 @@ impl OperatorCeremony {
     }
 
     /// Carries whatever a rotation left in flight, with no key, now that the tunnel
-    /// is up. `None` when there is nothing to do or the screen is not free for it.
+    /// is up.
     ///
     /// Nothing is started when no journal, no unadopted record and no CA-PQ file
-    /// stands beside the vault, when a ceremony is running, or when the operator's
-    /// own finished screen is still showing. The run asks no key and reaches no one
-    /// but the gateway the tunnel leads to; it ends by itself, so the next operator
-    /// action waits for no longer than the resumption does. A stop leaves the journal
-    /// for the next tunnel-up, or the button.
+    /// stands beside the vault, when the relay names another gateway than the
+    /// tunnel's, or when the operator's own finished screen is still showing
+    /// (dismissing it looks again). [`ResumeOutcome::Running`] says a ceremony was
+    /// running: the caller may wait for [`Self::ended`] and look once more. The run
+    /// asks no key; it ends by itself, so the next operator action waits for no longer
+    /// than the resumption does. A stop leaves the journal for the next tunnel-up, or
+    /// the button. Only a relay naming the tunnel's gateway lets it go, which is
+    /// what keeps another domain's authority from reading as « nothing in flight ».
     pub async fn resume_on_tunnel_up(
         &self,
-        gateway: String,
+        target: GatewayTarget,
         vault_path: PathBuf,
-    ) -> Result<Option<OperatorStatus>, String> {
-        let pending = astra_operator::rotation_journal::something_to_resume(&vault_path)
-            .map_err(|error| format!("{error:#}"))?;
-        if !pending {
-            return Ok(None);
+    ) -> Result<ResumeOutcome, String> {
+        // Blocking reads: two stats, a record's parse and the relay.
+        let looked = {
+            let (vault_path, peer_key) = (vault_path.clone(), target.peer_key.clone());
+            tokio::task::spawn_blocking(move || {
+                let pending = astra_operator::rotation_journal::something_to_resume(&vault_path)
+                    .map_err(|error| format!("{error:#}"))?;
+                if !pending {
+                    return Ok(false);
+                }
+                relay_names_peer(&vault_path, &peer_key)
+            })
+            .await
+            .map_err(|error| format!("lecture du coffre : {error}"))?
+        }?;
+        if !looked {
+            return Ok(ResumeOutcome::Nothing);
         }
         let gesture = RotationGesture::Resume;
         let started = self
@@ -740,7 +792,7 @@ impl OperatorCeremony {
                     ceremony::run_rotation(
                         session_id,
                         gesture,
-                        Some(gateway),
+                        Some(target),
                         presses,
                         publish,
                         &vault_path,
@@ -749,9 +801,25 @@ impl OperatorCeremony {
             )
             .await;
         match started {
-            Ok(status) => Ok(Some(status)),
-            Err(Opening::Busy) => Ok(None),
+            Ok(_) => Ok(ResumeOutcome::Started),
+            Err(Opening::Busy { running: true }) => Ok(ResumeOutcome::Running),
+            Err(Opening::Busy { running: false }) => Ok(ResumeOutcome::Nothing),
             Err(Opening::Failed(message)) => Err(message),
+        }
+    }
+
+    /// Returns once the ceremony open now has ended, at once when none is running.
+    /// Waits for a screen the operator is on, so it bounds itself by theirs: an
+    /// abandoned ceremony ends by its own idle limit.
+    pub async fn ended(&self) {
+        let mut status = match self.0.lock().await.as_ref() {
+            Some(session) => session.status.clone(),
+            None => return,
+        };
+        loop {
+            if status.borrow().gesture.is_terminal() || status.changed().await.is_err() {
+                return;
+            }
         }
     }
 
@@ -769,7 +837,7 @@ impl OperatorCeremony {
         self.open_as(kind, false, run)
             .await
             .map_err(|error| match error {
-                Opening::Busy => BUSY.to_string(),
+                Opening::Busy { .. } => BUSY.to_string(),
                 Opening::Failed(message) => message,
             })
     }
@@ -795,7 +863,9 @@ impl OperatorCeremony {
             let current = session.status.borrow_and_update().clone();
             // A resumption gives way to everything but its own finished session.
             if !current.gesture.is_terminal() || (automatic && !session.automatic) {
-                return Err(Opening::Busy);
+                return Err(Opening::Busy {
+                    running: !current.gesture.is_terminal(),
+                });
             }
         }
         *held = None;
@@ -909,7 +979,10 @@ const BUSY: &str = "une cérémonie opérateur est déjà ouverte : la mener à 
 
 /// Why a ceremony did not open.
 enum Opening {
-    Busy,
+    /// `running` tells a ceremony still going from a finished screen left showing.
+    Busy {
+        running: bool,
+    },
     Failed(String),
 }
 
@@ -919,30 +992,76 @@ impl From<String> for Opening {
     }
 }
 
+/// What a look at the rotation in flight came to.
+#[derive(Debug)]
+pub enum ResumeOutcome {
+    /// Nothing to resume, or not for this gateway, or the screen is not free.
+    Nothing,
+    Started,
+    /// A ceremony was running.
+    Running,
+}
+
+impl ResumeOutcome {
+    #[cfg(test)]
+    pub fn is_started(&self) -> bool {
+        matches!(self, Self::Started)
+    }
+}
+
 /// Carries a rotation left in flight as soon as the tunnel is up (spec §5.4).
 ///
-/// Called once per edge into `Up`, see [`TunnelWatch`]. It starts the resumption in
-/// its own ceremony and returns: no key is asked, nothing runs in the background
-/// beyond that one ceremony, and a stop is retried by the next tunnel-up or by
-/// « Reprendre », never by a loop here. Nothing secret is logged.
+/// Called once per edge into `Up`, see [`TunnelWatch`], and once when the operator
+/// dismisses a finished screen that was in the way.
 pub async fn resume_on_tunnel_up(app: &tauri::AppHandle) {
     use tauri::Manager;
 
     let state = app.state::<crate::AppState>();
-    let Ok(vault_path) = state.vault_location.path() else {
+    // A read that creates nothing: this runs on machines that never opened Astra.
+    let vault = state.vault_location.path_to_look_at();
+    let target = crate::commands::connected_target(&state).await;
+    resume_with(&state.operator, vault, target).await;
+}
+
+/// The look itself, on what the glue read. A vault or a gateway that cannot be
+/// named is nothing to do.
+///
+/// Meeting a running ceremony, it waits for that one to end and looks once more:
+/// the edge must not be lost, and nothing here loops. The second look does not wait
+/// in its turn. Nothing secret is logged.
+pub async fn resume_with(
+    ceremony: &OperatorCeremony,
+    vault: Result<PathBuf, String>,
+    target: Result<GatewayTarget, String>,
+) {
+    let (Ok(vault_path), Ok(target)) = (vault, target) else {
         return;
     };
-    let Ok(gateway) = crate::commands::connected_gateway(&state).await else {
-        return;
-    };
-    match state
-        .operator
-        .resume_on_tunnel_up(gateway, vault_path)
-        .await
-    {
-        Ok(Some(_)) => tracing::info!("reprise d'une rotation en cours au montage du tunnel"),
-        Ok(None) => {}
-        Err(error) => tracing::warn!(error = %error, "reprise d'une rotation impossible à lancer"),
+    for waited in [false, true] {
+        match ceremony
+            .resume_on_tunnel_up(target.clone(), vault_path.clone())
+            .await
+        {
+            Ok(ResumeOutcome::Started) => {
+                tracing::info!("reprise d'une rotation en cours au montage du tunnel");
+                return;
+            }
+            Ok(ResumeOutcome::Nothing) => return,
+            Ok(ResumeOutcome::Running) if !waited => {
+                tracing::debug!("une cérémonie est ouverte : la reprise attend sa fin");
+                ceremony.ended().await;
+            }
+            Ok(ResumeOutcome::Running) => {
+                tracing::debug!(
+                    "une cérémonie est de nouveau ouverte : reprise laissée au prochain montage"
+                );
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "reprise d'une rotation impossible à lancer");
+                return;
+            }
+        }
     }
 }
 

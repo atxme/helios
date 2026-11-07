@@ -1191,3 +1191,37 @@ fn resume_gestures_on_key_slots_are_refused_while_a_rotation_is_in_flight() {
         document_bytes
     );
 }
+
+/// The older CA-PQ file holds a sealed vault too: applying it would bring a removed
+/// key back, or undo a label. A rename is a change `apply_local` reverts as well.
+#[test]
+fn resume_gestures_on_key_slots_are_refused_with_the_legacy_file_and_rename_too() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = vault_path(&directory);
+    let (key1, key2, key3) = (FakeKey::new(1), FakeKey::new(2), FakeKey::new(3));
+    let first = create(&path, &key1);
+    add(&path, &first, &key2, "YubiKey du sac");
+    let (slot3, _) = add(&path, &first, &key3, "YubiKey perdue");
+    complete_relay(&path);
+    emit_document(&path, &first);
+    std::fs::write(
+        astra_operator::rotation_journal::legacy_ca_pq_path_beside(&path),
+        b"{}",
+    )
+    .expect("legacy");
+    let vault_bytes = std::fs::read(&path).expect("vault bytes");
+
+    assert_eq!(
+        refusal(remove_key_with(&path, &first, &slot3, NOW)),
+        Some(SetupRefusal::RotationInFlight)
+    );
+    assert_eq!(
+        refusal(mark_key_with(&path, &first, &slot3, true, NOW)),
+        Some(SetupRefusal::RotationInFlight)
+    );
+    assert_eq!(
+        refusal(rename_key(&path, &slot3, "autre nom")),
+        Some(SetupRefusal::RotationInFlight)
+    );
+    assert_eq!(std::fs::read(&path).expect("vault bytes"), vault_bytes);
+}
