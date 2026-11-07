@@ -124,6 +124,12 @@ struct Patience {
 }
 
 impl Patience {
+    /// When the wait ends if nobody answers: the idle bound, or the campaign's end.
+    fn ends_at(&self) -> u64 {
+        let idle = self.since.saturating_add(VALIDATION_IDLE_SECS);
+        self.until.map_or(idle, |until| idle.min(until))
+    }
+
     fn is_over(&self, now: u64) -> bool {
         now.saturating_sub(self.since) >= VALIDATION_IDLE_SECS
             || self.started.elapsed() >= Duration::from_secs(VALIDATION_IDLE_SECS)
@@ -264,6 +270,7 @@ impl RotationRun<'_> {
         self.ceremony.remote = RemoteState::Local;
         loop {
             let patience = self.patience();
+            self.ceremony.idle_until = Some(patience.ends_at());
             let offered = self.show();
             let press = self.await_press(&offered, &patience, answers_the_terms)?;
             let Some(terms) = press.terms else {
@@ -284,6 +291,7 @@ impl RotationRun<'_> {
 
     fn open_campaign(&mut self, kind: RotationKind, terms: &RotationTerms) -> Step<()> {
         self.ceremony.gesture = GestureState::Verifying;
+        self.ceremony.idle_until = None;
         self.show();
         let now = self.now();
         let Held::Keys(keys) = self.openings.take() else {
@@ -309,7 +317,11 @@ impl RotationRun<'_> {
                     return Err(self.nothing_held());
                 };
                 match opened.approve(key.as_ref(), now) {
-                    Ok(_) => {
+                    Ok(label) => {
+                        self.ceremony.approved.push(KeySlotLabel {
+                            slot: index.to_string(),
+                            label,
+                        });
                         self.ceremony.key_retry = None;
                         self.operator_seen();
                         break;
@@ -325,6 +337,7 @@ impl RotationRun<'_> {
         // The last moment: `Signing` offers no way back.
         self.honour_cancel()?;
         self.ceremony.gesture = GestureState::Signing;
+        self.ceremony.idle_until = None;
         self.show();
         let Held::Campaign(opened) = self.openings.take() else {
             return Err(self.nothing_held());
@@ -417,6 +430,7 @@ impl RotationRun<'_> {
         self.honour_cancel()?;
         self.ceremony.key_retry = None;
         self.ceremony.gesture = GestureState::Signing;
+        self.ceremony.idle_until = None;
         self.show();
 
         let now = self.now();
@@ -439,6 +453,7 @@ impl RotationRun<'_> {
             self.honour_cancel()?;
             self.ceremony.gesture = GestureState::AwaitingKey { index, of, purpose };
             let patience = self.patience();
+            self.ceremony.idle_until = Some(patience.ends_at());
             let offered = self.show();
             let press = self.await_press(&offered, &patience, answers_the_screen)?;
 
@@ -589,6 +604,7 @@ impl RotationRun<'_> {
     fn done(&mut self) {
         self.openings.erase();
         self.ceremony.gesture = GestureState::Done;
+        self.ceremony.idle_until = None;
         self.show();
     }
 }

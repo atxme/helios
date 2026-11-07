@@ -142,15 +142,19 @@ describe('the words of a rotation', () => {
   })
 
   it('the_door_and_the_campaign_have_their_labels_in_a_rotation', () => {
-    expect(refusalSentence({ refusal: 'window_expired' }, null, 'rotate_anchor')).toBe(
+    expect(refusalSentence({ refusal: 'window_expired' }, null, 'rotate_anchor', true)).toBe(
       'Campagne expirée',
+    )
+    // Before the opening there is no campaign to call expired.
+    expect(refusalSentence({ refusal: 'window_expired' }, null, 'rotate_anchor', false)).toBe(
+      'Délai écoulé. Clés oubliées. Recommencer',
     )
     expect(
       refusalSentence({ refusal: 'authority_refused', status: 429 }, null, 'rotate_anchor'),
     ).toBe('Trop d’opérations en attente')
     expect(
       refusalSentence({ refusal: 'authority_refused', status: 403 }, null, 'rotate_anchor'),
-    ).toBe('Opération déjà ouverte')
+    ).toBe('Opération déjà ouverte, ou poste non administrateur')
     expect(
       refusalSentence({ refusal: 'authority_refused', status: 500 }, null, 'rotate_anchor'),
     ).toBe('L’autorité a décliné (500).')

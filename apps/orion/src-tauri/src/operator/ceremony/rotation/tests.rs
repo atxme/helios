@@ -1114,6 +1114,54 @@ fn the_key_that_already_approved_asks_for_another() {
     assert!(tried);
 }
 
+/// The screen names which of its keys approved, by the label it validated under, so the
+/// operator is told what to plug in next.
+#[test]
+fn an_approval_names_the_key_that_gave_it() {
+    let bench = bench();
+    let mut seen = false;
+    let ran = bench.drive(RotationGesture::ReplaceCaPq, |status, bench| {
+        if awaits_approval(status, 1) {
+            assert!(status.approved.is_empty());
+        }
+        if awaits_approval(status, 2) {
+            seen = true;
+            assert_eq!(status.approved.len(), 1);
+            assert!(
+                status
+                    .keys
+                    .iter()
+                    .any(|key| key.label == status.approved[0].label),
+                "the approving label is one a key validated under"
+            );
+        }
+        Bench::all_the_way(status, bench)
+    });
+    ran.done();
+    assert!(seen);
+    assert!(ran.last().approved.is_empty() || ran.last().approved.len() == 2);
+}
+
+/// The end of a wait is carried to the screen, and only for the waits that have one.
+#[test]
+fn the_waits_for_the_operator_carry_their_end() {
+    let bench = bench();
+    let mut waits = 0;
+    let ran = bench.drive(RotationGesture::ReplaceCaPq, |status, bench| {
+        if awaits_validation(status, 1) || awaits_terms(status) || awaits_approval(status, 1) {
+            waits += 1;
+            assert!(status.idle_until.is_some(), "{status:?}");
+        }
+        if matches!(status.gesture, GestureState::Signing) {
+            assert_eq!(status.idle_until, None);
+        }
+        Bench::all_the_way(status, bench)
+    });
+    ran.done();
+    assert_eq!(waits, 3);
+    assert_eq!(ran.last().idle_until, None);
+}
+
 // Abandoning.
 
 /// Each stage a key or a press is waited on. Nothing was signed, and nothing moved.

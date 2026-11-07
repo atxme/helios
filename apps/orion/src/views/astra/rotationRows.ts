@@ -24,6 +24,8 @@ export interface RotationRow {
   disabledReason: string | null
   /** The verb on the row's button. */
   button: string
+  /** A second line of fact worth keeping in view, such as the incoming anchor. */
+  detail: string | null
 }
 
 export interface Prerequisite {
@@ -109,6 +111,19 @@ export function formatDate(seconds: number): string {
   )
 }
 
+/** A fingerprint read aloud, four digits at a time. */
+export function groupFingerprint(value: string): string {
+  return plainFingerprint(value).replace(/(.{4})(?=.)/g, '$1 ')
+}
+
+/** The time of day, to the second, for a wait that ends by itself. */
+export function formatTime(seconds: number): string {
+  return new Intl.DateTimeFormat('fr-FR', {
+    timeStyle: 'medium',
+    timeZone: 'Europe/Paris',
+  }).format(new Date(seconds * 1_000))
+}
+
 export function formatDateTime(seconds: number): string {
   return new Intl.DateTimeFormat('fr-FR', {
     dateStyle: 'medium',
@@ -191,6 +206,7 @@ function finishRow(o: RotationsOverview, now: number): RotationRow | null {
     due: true,
     disabledReason: null,
     button: BUTTONS.finish_ca_tls,
+    detail: null,
   }
 }
 
@@ -216,6 +232,7 @@ function resumeRow(o: RotationsOverview, now: number): RotationRow | null {
     due: true,
     disabledReason: null,
     button: BUTTONS.resume,
+    detail: null,
   }
 }
 
@@ -246,6 +263,7 @@ function fleetRow(o: RotationsOverview, now: number): RotationRow {
     // An approval under the local document is refused after the touch, during the overlap.
     disabledReason: overlapReason(o.caPqOverlap),
     button: BUTTONS.renew_fleet,
+    detail: null,
   }
 }
 
@@ -267,6 +285,10 @@ function keysLabel(o: RotationsOverview): string {
 }
 
 function replacePqRow(o: RotationsOverview): RotationRow {
+  const incoming =
+    o.caPqOverlap === true
+      ? (valueOf(o.authority)?.next_ca_fingerprint || valueOf(o.domain)?.next_ca_fingerprint || null)
+      : null
   const retireAt = valueOf(o.domain)?.ca_retire_active_at ?? null
   const state =
     o.caPqOverlap === true
@@ -281,6 +303,8 @@ function replacePqRow(o: RotationsOverview): RotationRow {
     due: false,
     disabledReason: replaceBlock(o),
     button: BUTTONS.replace_ca_pq,
+    // The journal that carried it is gone by the end: Astra and the gateway still name it.
+    detail: incoming === null ? null : `Ancre entrante ${groupFingerprint(incoming)}`,
   }
 }
 
@@ -304,6 +328,7 @@ function replaceTlsRow(o: RotationsOverview): RotationRow {
     due: false,
     disabledReason: replaceBlock(o),
     button: BUTTONS.replace_ca_tls,
+    detail: null,
   }
 }
 
@@ -364,6 +389,7 @@ function delegationRow(o: RotationsOverview, now: number): RotationRow {
     due,
     disabledReason,
     button: BUTTONS.renew_delegation,
+    detail: null,
   }
 }
 

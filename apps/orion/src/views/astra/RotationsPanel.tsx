@@ -256,6 +256,16 @@ export function RotationsPanel({
           await api.beginOperatorCeremony({ kind: 'approve_campaign', operation_id: operationId }),
         )
       } else if (row.action === 'renew_delegation') {
+        // The request exists only in the answer to the opening: a ceremony that cannot
+        // start would lose it, so the opening waits for one that can.
+        const running = await api.operatorCeremonyStatus()
+        if (
+          running &&
+          !(typeof running.gesture === 'string' && ['done', 'failed', 'cancelled'].includes(running.gesture))
+        ) {
+          setNotice('Cérémonie en cours')
+          return
+        }
         const opened = await api.operatorOpenCampaign(
           { action: 'issuer_delegation' },
           reason.trim() || DEFAULT_REASON.renew_delegation!,
@@ -340,6 +350,11 @@ export function RotationsPanel({
             {live && row.disabledReason === null && (
               <Typography color="text.secondary" sx={{ fontSize: 11.5 }}>
                 {`Opération ouverte · ${live.reason}`}
+              </Typography>
+            )}
+            {row.detail && (
+              <Typography color="text.secondary" sx={{ fontSize: 11, overflowWrap: 'anywhere' }}>
+                {row.detail}
               </Typography>
             )}
             {row.action === 'resume' && resumeStop && (

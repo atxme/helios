@@ -340,8 +340,19 @@ pub(crate) async fn operator_artifacts(
 #[tauri::command]
 pub(crate) async fn operator_ceremony_status(
     state: State<'_, AppState>,
-) -> Result<Option<aether::certificates::operator_session::OperatorStatus>, String> {
-    Ok(state.operator.status().await)
+) -> Result<Option<crate::operator::ObservedStatus>, String> {
+    Ok(state.operator.observed().await)
+}
+
+/// What rotations left beside the vault, and nothing else: no tunnel, no vault opened,
+/// no folder created. Read on a timer by the shell for every user, so it must cost
+/// nothing where there is nothing to show.
+#[tauri::command]
+pub(crate) async fn operator_rotation_journal(
+    state: State<'_, AppState>,
+) -> Result<crate::operator::rotations::LocalJournal, String> {
+    let vault_path = state.vault_location.path_to_look_at();
+    Ok(crate::operator::rotations::read_journal(&vault_path))
 }
 
 /// The operator vault and its trust domain, read without any key.

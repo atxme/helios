@@ -447,6 +447,28 @@ describe('the stops', () => {
   })
 })
 
+describe('the incoming anchor on its row', () => {
+  it('stays_visible_during_a_CA_PQ_overlap_from_the_authority', () => {
+    const o = overview({
+      caPqOverlap: true,
+      authority: { state: 'ok', value: authorityRead({ next_ca_fingerprint: 'cd'.repeat(32) }) },
+    })
+    expect(row(o, 'replace_ca_pq')?.detail).toBe(
+      `Ancre entrante ${'cdcd '.repeat(15)}cdcd`,
+    )
+  })
+
+  it('falls_back_on_the_gateway_and_is_absent_outside_an_overlap', () => {
+    const o = overview({
+      caPqOverlap: true,
+      authority: { state: 'unreachable' },
+      domain: { state: 'ok', value: domainRead({ next_ca_fingerprint: 'ef'.repeat(32) }) },
+    })
+    expect(row(o, 'replace_ca_pq')?.detail).toMatch(/^Ancre entrante efef /)
+    expect(row(overview(), 'replace_ca_pq')?.detail).toBeNull()
+  })
+})
+
 describe('the journal line', () => {
   const journal = {
     kind: 'ca_pq' as const,

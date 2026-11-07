@@ -27,7 +27,14 @@ import {
   rowsOf,
 } from '../OperatorCeremony'
 import type { RotationStepContext } from './RotationsPanel'
-import { formatDate, formatDateTime, liveOperation, stopSentence, valueOf } from './rotationRows'
+import {
+  formatDate,
+  formatDateTime,
+  formatTime,
+  liveOperation,
+  stopSentence,
+  valueOf,
+} from './rotationRows'
 
 /**
  * What follows the prerequisites of a CA rotation: the key step, the approval and the
@@ -126,7 +133,7 @@ export function RotationSteps({
     <Box>
       {existingOperation && (
         <Typography color="text.secondary" sx={{ mb: 0.75, fontSize: 11.5 }}>
-          {`Opération ouverte · ${existingOperation.reason}`}
+          {`Opération ouverte · ${existingOperation.reason} · jusqu’au ${formatDateTime(existingOperation.expires_at)}`}
         </Typography>
       )}
       <Button
@@ -218,7 +225,7 @@ function FollowUp({
   const dates = datesOf(journal, manifest)
   const done = status.gesture === 'done'
   const reached = journal ? STAGE_ORDER[journal.stage] : 0
-  const signed = status.remote !== 'local' && status.remote !== 'awaiting_operator'
+  const signed = (status.remote !== 'local' && status.remote !== 'awaiting_operator') || !!journal
   const deposited = done || status.remote === 'deposited' || reached >= STAGE_ORDER.accepted
   const installed = done || reached >= STAGE_ORDER.installed
 
@@ -280,11 +287,12 @@ function KeyRow({
 }: {
   index: number
   label: string | null
-  state: 'validated' | 'current' | 'retry' | 'processing' | 'waiting'
+  state: 'validated' | 'current' | 'retry' | 'processing' | 'waiting' | 'approved' | 'touch'
   reason: string | null
   action: { text: string; disabled: boolean; onClick: () => void } | null
 }) {
-  const border = state === 'retry' ? '#B91C1C' : state === 'validated' ? PINE : RULE
+  const border =
+    state === 'retry' ? '#B91C1C' : state === 'validated' || state === 'approved' ? PINE : RULE
   return (
     <Box
       component="li"
@@ -316,7 +324,11 @@ function KeyRow({
                 ? 'À valider'
                 : state === 'processing'
                   ? 'Lecture…'
-                  : 'En attente'}
+                  : state === 'approved'
+                    ? 'Approuvée'
+                    : state === 'touch'
+                      ? 'Brancher et toucher la clé'
+                      : 'En attente'}
         </Typography>
       </Box>
       {state === 'validated' && (
@@ -367,6 +379,7 @@ export function RotationCeremony({
   onDismiss,
   journal,
   existingOperation = null,
+  existingExpiresAt = null,
   now = Math.floor(Date.now() / 1000),
 }: {
   status: OperatorStatus
@@ -376,6 +389,8 @@ export function RotationCeremony({
   journal?: RotationJournalView | null
   /** A campaign already open at the authority, to be led by the approval. */
   existingOperation?: string | null
+  /** When that campaign ends: with seconds left, the keys are spent for nothing. */
+  existingExpiresAt?: number | null
   /** Seconds, for the deadline; the operator's clock when not given. */
   now?: number
 }) {
@@ -449,11 +464,16 @@ export function RotationCeremony({
     stage = 'keys'
   } else stage = 'wait'
 
+  const known = journal ? journal.kind : (manifest?.affected_ca ?? null)
+  const knownName = known === 'ca_pq' ? 'CA-PQ' : known === 'ca_tls' ? 'CA TLS' : null
   const title = finishing
     ? 'Terminer la rotation CA TLS'
     : stage === 'keys' || stage === 'touches'
       ? `Remplacer la ${name}`
-      : `Rotation ${name}`
+      : // Until the journal is read a resumption does not know which CA it carries.
+        knownName
+        ? `Rotation ${knownName}`
+        : 'Rotation'
 
   const canPress = awaiting !== null && status.allowed.includes('continue') && !busy
   const canCancel = status.allowed.includes('cancel')
@@ -520,7 +540,14 @@ export function RotationCeremony({
             ))}
           </Box>
           {existingOperation ? (
-            <Typography sx={{ mb: 1, fontSize: 12, fontWeight: 600 }}>Opération ouverte</Typography>
+            <Box sx={{ mb: 1 }}>
+              <Typography sx={{ fontSize: 12, fontWeight: 600 }}>Opération ouverte</Typography>
+              {existingExpiresAt !== null && (
+                <Typography color="text.secondary" sx={{ fontSize: 11.5 }}>
+                  {`Ouverte jusqu’au ${formatDateTime(existingExpiresAt)}`}
+                </Typography>
+              )}
+            </Box>
           ) : (
             field('reason', 'Motif')
           )}
@@ -630,8 +657,9 @@ export function RotationCeremony({
       )
     }
   } else if (stage === 'touches') {
-    const index = awaiting?.index ?? processing?.index ?? 1
     const of = awaiting?.of ?? processing?.of ?? 1
+    const approvedBy = new Set((status.approved ?? []).map((key) => key.label))
+    const signing = gesture === 'signing'
     body = (
       <Box sx={{ mt: 1.25 }}>
         {manifest && (
@@ -641,43 +669,40 @@ export function RotationCeremony({
             ))}
           </Box>
         )}
-        {of > 1 ? (
-          <Box component="ul" sx={{ m: 0, p: 0 }}>
-            {Array.from({ length: of }, (_, position) => position + 1).map((number) => {
-              const past = number < index
-              const current = number === index
-              return (
-                <Box
-                  component="li"
-                  key={number}
-                  aria-label={`Approbation ${number}`}
-                  sx={{ listStyle: 'none', display: 'flex', gap: 1, py: 0.3, fontSize: 12 }}
-                >
-                  <Box component="span">{`Approbation ${number}`}</Box>
-                  <Typography
-                    component="span"
-                    color={current && retry ? 'error' : 'text.secondary'}
-                    sx={{ fontSize: 11.5 }}
-                  >
-                    {past
-                      ? 'Approuvée'
-                      : current && processing
-                        ? 'Lecture…'
-                        : current
-                          ? (retry ?? 'Brancher et toucher la clé')
-                          : 'En attente'}
-                  </Typography>
-                </Box>
-              )
-            })}
-          </Box>
+        {signing ? (
+          <Typography sx={{ fontSize: 12 }}>Signature en cours</Typography>
         ) : (
-          <Typography sx={{ fontSize: 12 }}>
-            {processing ? 'Lecture…' : (retry ?? 'Brancher et toucher la clé')}
-          </Typography>
+          <>
+            {of > 1 && keys.length > 0 ? (
+              <Box component="ul" sx={{ m: 0, p: 0 }}>
+                {keys.map((key, position) => (
+                  <KeyRow
+                    key={key.slot}
+                    index={position + 1}
+                    label={null}
+                    state={approvedBy.has(key.label) ? 'approved' : 'touch'}
+                    reason={null}
+                    action={null}
+                  />
+                ))}
+              </Box>
+            ) : (
+              <Typography sx={{ fontSize: 12 }}>Brancher et toucher la clé</Typography>
+            )}
+            {processing && (
+              <Typography color="text.secondary" sx={{ mt: 0.5, fontSize: 11.5 }}>
+                Lecture…
+              </Typography>
+            )}
+            {retry && (
+              <Typography color="error" sx={{ mt: 0.5, fontSize: 11.5 }}>
+                {retry}
+              </Typography>
+            )}
+          </>
         )}
         <Box sx={{ display: 'flex', gap: 1, mt: 1 }}>
-          {status.allowed.includes('continue') && (
+          {!signing && status.allowed.includes('continue') && (
             <Button
               size="small"
               variant="contained"
@@ -707,12 +732,15 @@ export function RotationCeremony({
       </>
     )
   } else {
-    const dataOf = datesOf(journal, manifest)
-    const shownJournal = journal ?? dataOf
+    const shownJournal = journal ?? datesOf(journal, manifest)
     const refusal = status.refusal
+    // A rotation is in flight when something was signed or a journal says so, and not
+    // because a manifest with dates was shown: « Terminer » and a campaign abandoned
+    // during the touches carry dates and have signed nothing.
+    const inFlight = prepared || !!journal
     body = (
       <>
-        {(prepared || manifest) && <FollowUp status={status} journal={journal} now={now} />}
+        {inFlight && <FollowUp status={status} journal={journal} now={now} />}
         {refusal && status.gesture !== 'done' && (
           <Alert
             severity={refusal.refusal === 'cancelled' ? 'info' : 'error'}
@@ -721,10 +749,15 @@ export function RotationCeremony({
           >
             {refusal.refusal === 'cancelled'
               ? gestureSentence('cancelled', status.operation, opened)
-              : refusalSentence(refusal, shownJournal, status.operation)}
+              : refusalSentence(refusal, shownJournal, status.operation, opened)}
           </Alert>
         )}
-        {status.gesture === 'done' && journal === null && (
+        {status.gesture === 'done' && !prepared && !manifest && (
+          <Alert severity="info" variant="outlined" sx={{ mt: 1, fontSize: 11.5 }}>
+            Rien à reprendre
+          </Alert>
+        )}
+        {status.gesture === 'done' && ((prepared && journal === null) || (!prepared && manifest)) && (
           <Alert severity="success" variant="outlined" sx={{ mt: 1, fontSize: 11.5 }}>
             Rotation terminée
           </Alert>
@@ -757,6 +790,11 @@ export function RotationCeremony({
       <Typography component="h3" sx={{ fontSize: 13, fontWeight: 650 }}>
         {title}
       </Typography>
+      {status.idle_until !== undefined && !ended && (
+        <Typography color="text.secondary" sx={{ fontSize: 11.5 }}>
+          {`Délai jusqu’à ${formatTime(status.idle_until)}`}
+        </Typography>
+      )}
       {body}
       {error && (
         <Alert severity="error" variant="outlined" sx={{ mt: 0.75, fontSize: 11.5 }}>

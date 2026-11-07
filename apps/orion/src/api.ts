@@ -13,6 +13,7 @@ import type {
   OperationLocator,
   OperatorAction,
   OperatorPendingOperation,
+  LocalRotationJournal,
   RotationsOverview,
   OpenCampaignAction,
   OperatorOpened,
@@ -395,6 +396,10 @@ export const operatorPendingOperations = () =>
 /** Tout ce que montre l'écran des rotations, lu sans clé ; aucun chemin ni jeton n'y figure. */
 export const operatorRotationsOverview = () =>
   invoke<RotationsOverview>('operator_rotations_overview')
+
+/** Le journal de rotation et la reprise à faire : les fichiers à côté du coffre, rien d'autre. */
+export const operatorRotationJournal = () =>
+  invoke<LocalRotationJournal>('operator_rotation_journal')
 
 /**
  * Envoie la copie du coffre à Astra, sans rien nommer : le coffre et ses credentials

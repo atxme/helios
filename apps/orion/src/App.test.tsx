@@ -12,6 +12,7 @@ const mocks = vi.hoisted(() => ({
   astraCaTlsRotationStatus: vi.fn(),
   beginOperatorCeremony: vi.fn(),
   operatorRotationsOverview: vi.fn(),
+  operatorRotationJournal: vi.fn(),
   resumeCertificateRecovery: vi.fn(),
   dismissOperatorCeremony: vi.fn(),
   operatorPendingOperations: vi.fn(),
@@ -25,6 +26,7 @@ vi.mock('./api', () => ({
   astraCaTlsRotationStatus: mocks.astraCaTlsRotationStatus,
   beginOperatorCeremony: mocks.beginOperatorCeremony,
   operatorRotationsOverview: mocks.operatorRotationsOverview,
+  operatorRotationJournal: mocks.operatorRotationJournal,
   resumeCertificateRecovery: mocks.resumeCertificateRecovery,
   dismissOperatorCeremony: mocks.dismissOperatorCeremony,
   operatorPendingOperations: mocks.operatorPendingOperations,
@@ -126,6 +128,7 @@ beforeEach(() => {
   mocks.operatorPendingOperations.mockResolvedValue([])
   mocks.beginOperatorCeremony.mockResolvedValue({})
   mocks.operatorRotationsOverview.mockResolvedValue({ caPqOverlap: false })
+  mocks.operatorRotationJournal.mockResolvedValue({ journal: null, resumable: false })
   mocks.resumeCertificateRecovery.mockResolvedValue({
     progress: {
       portable: { step: 'recovered', generation: 5, activation_at: 1_789_198_911 },
@@ -202,8 +205,7 @@ describe('App interactions', () => {
   it('badges Astra for a rotation in flight even when no session is live', async () => {
     // A failure screen left for Connexion, or a journal nothing resumed: no live session,
     // but the install deadline still runs.
-    mocks.operatorRotationsOverview.mockResolvedValue({
-      caPqOverlap: false,
+    mocks.operatorRotationJournal.mockResolvedValue({
       resumable: true,
       journal: { kind: 'ca_pq', stage: 'applied', activationAt: 1_800_000_000 },
     })
@@ -213,9 +215,17 @@ describe('App interactions', () => {
     )
   })
 
+  it('watches journals through a local read and never through the overview', async () => {
+    // The overview reaches through the tunnel: three requests, a refusal for a poste that
+    // is not an administrator. A reminder shown to everyone must not cost any of that.
+    render(<App />)
+    await waitFor(() => expect(mocks.operatorRotationJournal).toHaveBeenCalled())
+    expect(mocks.operatorRotationsOverview).not.toHaveBeenCalled()
+  })
+
   it('does not badge Astra when the overview shows nothing to resume', async () => {
     render(<App />)
-    await waitFor(() => expect(mocks.operatorRotationsOverview).toHaveBeenCalled())
+    await waitFor(() => expect(mocks.operatorRotationJournal).toHaveBeenCalled())
     expect(screen.getByRole('button', { name: 'Astra' }).textContent).not.toMatch(/1/)
   })
 

@@ -186,6 +186,31 @@ pub struct Local {
     pub ca_tls_not_after: Option<u64>,
 }
 
+/// The journal and whether anything calls for a resumption, read from the files beside
+/// the vault and nothing more.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalJournal {
+    pub journal: Option<JournalView>,
+    pub resumable: bool,
+}
+
+/// A location that cannot be resolved, or a file that cannot be read, is nothing to
+/// show: this read raises a reminder for everyone, and the full overview is where an
+/// unreadable thing is reported.
+pub fn read_journal(vault_path: &Result<std::path::PathBuf, String>) -> LocalJournal {
+    let Ok(path) = vault_path else {
+        return LocalJournal::default();
+    };
+    LocalJournal {
+        journal: rotation_journal::load(&rotation_journal::path_beside(path))
+            .ok()
+            .flatten()
+            .map(|journal| JournalView::of(&journal)),
+        resumable: rotation_journal::something_to_resume(path).unwrap_or(false),
+    }
+}
+
 /// Reads the vault and what rotations left beside it, without a key.
 pub fn read_local(vault_path: &Result<std::path::PathBuf, String>, now: u64) -> Local {
     let path = match vault_path {
@@ -405,4 +430,48 @@ pub fn vault_bytes_of(copy: &OperatorVaultCopy) -> Vec<u8> {
     base64::engine::general_purpose::STANDARD
         .decode(&copy.vault_base64)
         .expect("base64")
+}
+
+#[cfg(test)]
+mod journal_tests {
+    use super::*;
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("orion-journal-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        dir
+    }
+
+    /// A shell that polls this for every user must not raise a reminder out of a
+    /// location it cannot resolve.
+    #[test]
+    fn an_unresolved_location_shows_nothing() {
+        assert_eq!(
+            read_journal(&Err("introuvable".into())),
+            LocalJournal::default()
+        );
+    }
+
+    /// Looking leaves nothing behind: no journal, no folder, no file.
+    #[test]
+    fn a_vault_with_nothing_beside_it_shows_nothing_and_creates_nothing() {
+        let dir = scratch("empty");
+        let vault = dir.join("vault.json");
+        assert_eq!(read_journal(&Ok(vault)), LocalJournal::default());
+        assert_eq!(std::fs::read_dir(&dir).expect("dir").count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_a_rotation_left_calls_for_a_resumption() {
+        let dir = scratch("left");
+        let vault = dir.join("vault.json");
+        std::fs::write(rotation_journal::path_beside(&vault), b"not a journal").expect("write");
+        let read = read_journal(&Ok(vault));
+        assert!(read.resumable);
+        // Unreadable is not shown as a journal with invented dates.
+        assert_eq!(read.journal, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

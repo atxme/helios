@@ -1727,6 +1727,10 @@ struct Ceremony {
     keys: Vec<KeySlotLabel>,
     /// Why the last key was turned down, while another is still being asked for.
     key_retry: Option<Refusal>,
+    /// The keys that approved, by the label they validated under.
+    approved: Vec<KeySlotLabel>,
+    /// When the wait now offered ends by itself.
+    idle_until: Option<u64>,
 }
 
 impl Ceremony {
@@ -1742,6 +1746,8 @@ impl Ceremony {
             refusal: None,
             keys: Vec::new(),
             key_retry: None,
+            approved: Vec::new(),
+            idle_until: None,
         }
     }
 
@@ -1764,6 +1770,8 @@ impl Ceremony {
         status.refusal = self.refusal;
         status.keys = self.keys.clone();
         status.key_retry = self.key_retry;
+        status.approved = self.approved.clone();
+        status.idle_until = self.idle_until;
         status
     }
 
@@ -1771,6 +1779,8 @@ impl Ceremony {
         self.gesture = GestureState::Failed;
         self.refusal = Some(refusal);
         self.key_retry = None;
+        self.approved.clear();
+        self.idle_until = None;
     }
 
     /// Abandoned by the operator, before anything left this machine.
@@ -1782,6 +1792,8 @@ impl Ceremony {
         self.gesture = GestureState::Cancelled;
         self.refusal = Some(Refusal::Cancelled);
         self.key_retry = None;
+        self.approved.clear();
+        self.idle_until = None;
     }
 }
 

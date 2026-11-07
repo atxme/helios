@@ -28,15 +28,6 @@ import type {
 const BOOTSTRAP_LEAF_KEPT =
   'La feuille est émise et enregistrée à côté du coffre ; « Finaliser le domaine » reprend ce qui manque.'
 
-/**
- * The sessions this operator opened. A rotation session found finished and not in here
- * is a resumption that ran on its own when the tunnel came up: days later it must not
- * take the tab, so its stop is said in its row. Module-level because the view is
- * unmounted whenever another one is shown, and the operator's own finished screen stays
- * theirs on their return.
- */
-const OPENED_HERE = new Set<string>()
-
 const ENDED = ['done', 'failed', 'cancelled']
 const hasEnded = (status: OperatorStatus) =>
   typeof status.gesture === 'string' && ENDED.includes(status.gesture)
@@ -131,7 +122,9 @@ export function AstraView({
       .operatorCeremonyStatus()
       .then((found) => {
         if (cancelled || !found) return
-        if (isRotationStatus(found) && hasEnded(found) && !OPENED_HERE.has(found.session_id)) {
+        // A resumption the tunnel started and that has ended days later is not the
+        // operator's screen: its stop is said in its row. The origin is the session's own.
+        if (isRotationStatus(found) && hasEnded(found) && found.automatic) {
           setAutomaticStop(found)
           return
         }
@@ -165,7 +158,14 @@ export function AstraView({
       void api
         .operatorCeremonyStatus()
         .then((found) => {
-          if (found && found.revision >= ceremony.revision) setCeremony(found)
+          if (!found || found.revision < ceremony.revision) return
+          if (isRotationStatus(found) && hasEnded(found) && found.automatic) {
+            // It ended while shown: the tab is the operator's again.
+            setAutomaticStop(found)
+            setCeremony(null)
+            return
+          }
+          setCeremony(found)
         })
         .catch((cause) => setError(String(cause)))
     }, 350)
@@ -233,9 +233,8 @@ export function AstraView({
     }
   }
 
-  // Every ceremony the operator opens passes here: it stays theirs once it has ended.
+  // Every ceremony the operator opens passes here, with the campaign it leads if any.
   const openCeremony = (next: OperatorStatus, existing: string | null = null) => {
-    OPENED_HERE.add(next.session_id)
     setExistingOperation(existing)
     setJournalKnown(true)
     setAutomaticStop(null)
@@ -246,6 +245,15 @@ export function AstraView({
   // beside the CA-TLS form: an operator holding a security key must not be
   // shown, in the same view, a second ceremony they could start by mistake.
   if (ceremony) {
+    // Read again from `pending` rather than remembered: the view is unmounted whenever
+    // another is shown, and an approval that forgot the open campaign would send none and
+    // meet a refusal after both keys were spent.
+    const led =
+      pending.find(
+        (operation) =>
+          operation.scope === 'trust_authorities' &&
+          operation.expires_at > Math.floor(Date.now() / 1000),
+      ) ?? null
     const inCampaign =
       ceremony.manifest?.operation === 'issuer_authorization' && ceremony.manifest.campaign != null
     return (
@@ -262,7 +270,8 @@ export function AstraView({
             onStatus={setCeremony}
             onDismiss={() => void dismissCeremony()}
             journal={journalKnown ? journal : undefined}
-            existingOperation={existingOperation}
+            existingOperation={led?.operation_id ?? existingOperation}
+            existingExpiresAt={led?.expires_at ?? null}
           />
         ) : (
           <OperatorCeremonyPanel

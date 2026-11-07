@@ -812,6 +812,7 @@ fn main() {
             operator_overview,
             operator_pending_operations,
             operator_rotations_overview,
+            operator_rotation_journal,
             operator_send_vault_copy,
             operator_open_campaign,
             operator_vault_location,

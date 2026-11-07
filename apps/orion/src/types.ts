@@ -979,6 +979,12 @@ export interface OperatorStatus {
   refusal?: Refusal
   /** Pourquoi la dernière réponse a été écartée (clé ou durées), tant qu'une autre est attendue. */
   key_retry?: Refusal
+  /** Les libellés des clés qui ont approuvé, dans l'ordre : de quoi dire laquelle brancher ensuite. */
+  approved?: KeySlotLabel[]
+  /** Quand l'attente offerte prend fin d'elle-même (secondes Unix) ; absent hors d'une rotation. */
+  idle_until?: number
+  /** Ouverte par une montée du tunnel et non par l'opérateur ; ne vient que de la lecture de l'état. */
+  automatic?: boolean
 }
 
 /** Un geste d'enrôlement (§15.2), fermé : la page ne choisit que parmi ces trois. */
@@ -1152,6 +1158,12 @@ export interface RotationsOverview {
   caTlsCloseDue: boolean
   /** Quand « Terminer » est dû (fin du recouvrement), échu ou non ; `null` sans rotation à clore. */
   caTlsCloseAt: number | null
+}
+
+/** Ce que les rotations ont laissé à côté du coffre, lu sans tunnel ni coffre ouvert. */
+export interface LocalRotationJournal {
+  journal: RotationJournalView | null
+  resumable: boolean
 }
 
 /** La réponse à un envoi manuel de la copie du coffre. « Retenue » n'est pas un échec. */

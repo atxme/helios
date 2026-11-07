@@ -115,15 +115,16 @@ export default function App() {
     }
   }, [])
 
-  // The overview, not the ceremony: a finished session is not live, yet its journal is.
-  // Slow, since it reads through the tunnel; a failed read keeps what was last known.
+  // The journal, not the ceremony: a finished session is not live, yet its journal is.
+  // A read of files beside the vault: the overview goes through the tunnel and is not for
+  // a timer that runs for every user. A failed read keeps what was last known.
   useEffect(() => {
     let cancelled = false
     const look = () => {
       void api
-        .operatorRotationsOverview()
+        .operatorRotationJournal()
         .then((found) => {
-          if (!cancelled) setRotationInFlight(found.journal != null || found.resumable === true)
+          if (!cancelled) setRotationInFlight(found.journal != null || found.resumable)
         })
         .catch(() => {})
     }

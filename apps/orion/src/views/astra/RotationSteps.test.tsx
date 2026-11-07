@@ -271,9 +271,10 @@ describe('the approval', () => {
   })
 
   it('an already open operation is offered instead of an error', async () => {
-    shown(approval(), { existingOperation: EXISTING })
+    shown(approval(), { existingOperation: EXISTING, existingExpiresAt: NOW + 20 })
     toApproval()
     expect(screen.getByText('Opération ouverte')).toBeTruthy()
+    expect(screen.getByText(/^Ouverte jusqu’au /)).toBeTruthy()
     // Its reason is the campaign's own: none is asked here.
     expect(screen.queryByLabelText('Motif')).toBeNull()
     api.approveRotationCeremony.mockResolvedValue(status())
@@ -298,34 +299,47 @@ describe('the approval', () => {
 })
 
 describe('the approval touches and the signature', () => {
-  it('lists what the touch signs and the approvals still to give', () => {
-    shown(
-      status({
-        gesture: awaiting(1, 'approve_campaign'),
-        remote: 'awaiting_operator',
-        operation_id: EXISTING,
-        keys: [first, second],
-        manifest: manifest(),
-      }),
-    )
-    expect(screen.getByText('Approbation 1')).toBeTruthy()
-    expect(screen.getByText('Brancher et toucher la clé')).toBeTruthy()
+  const touching = (extra: Partial<OperatorStatus> = {}) =>
+    status({
+      gesture: awaiting(1, 'approve_campaign'),
+      remote: 'awaiting_operator',
+      operation_id: EXISTING,
+      keys: [first, second],
+      manifest: manifest(),
+      ...extra,
+    })
+
+  it('lists what the touch signs and every key still to touch', () => {
+    shown(touching())
+    expect(row('Clé 1').getByText('Brancher et toucher la clé')).toBeTruthy()
+    expect(row('Clé 2').getByText('Brancher et toucher la clé')).toBeTruthy()
     expect(screen.getByText('autorité visée')).toBeTruthy()
     expect(screen.getByText('époque')).toBeTruthy()
   })
 
+  it('names the key that approved and the one to plug in next', () => {
+    shown(touching({ gesture: awaiting(2, 'approve_campaign'), approved: [{ slot: '1', label: 'YubiKey coffre' }] }))
+    expect(row('Clé 2').getByText('Approuvée')).toBeTruthy()
+    expect(row('Clé 1').getByText('Brancher et toucher la clé')).toBeTruthy()
+  })
+
   it('a key turned down at approval is named', () => {
     shown(
-      status({
+      touching({
         gesture: awaiting(2, 'approve_campaign'),
-        remote: 'awaiting_operator',
-        keys: [first, second],
-        manifest: manifest(),
+        approved: [{ slot: '1', label: 'YubiKey bureau' }],
         key_retry: { refusal: 'key_repeated' },
       }),
     )
-    expect(screen.getByText('Approbation 1').parentElement?.textContent).toMatch(/Approuvée/)
+    expect(row('Clé 1').getByText('Approuvée')).toBeTruthy()
     expect(screen.getByText('Clé déjà approuvée')).toBeTruthy()
+  })
+
+  it('says the signature is under way and asks for no touch', () => {
+    shown(touching({ gesture: 'signing', allowed: [] }))
+    expect(screen.getByText('Signature en cours')).toBeTruthy()
+    expect(screen.queryByText('Brancher et toucher la clé')).toBeNull()
+    expect(screen.queryByRole('button', { name: /Approuver/ })).toBeNull()
   })
 
   it('shows the incoming anchor right after signing', () => {
@@ -396,10 +410,9 @@ describe('the follow-up', () => {
   it('each terminal refusal has its label', () => {
     const cases: [Refusal, RegExp][] = [
       [{ refusal: 'rotation_expired' }, /^Rotation expirée\. Recommencer/],
-      [{ refusal: 'window_expired' }, /^Campagne expirée$/],
       [{ refusal: 'domain_conflict' }, /^Domaine en désaccord/],
       [{ refusal: 'authority_refused', status: 429 }, /^Trop d’opérations en attente$/],
-      [{ refusal: 'authority_refused', status: 403 }, /^Opération déjà ouverte$/],
+      [{ refusal: 'authority_refused', status: 403 }, /^Opération déjà ouverte, ou poste non administrateur$/],
       [{ refusal: 'rotation_in_flight' }, /^Rotation en cours/],
     ]
     for (const [refusal, label] of cases) {
@@ -459,6 +472,87 @@ describe('the follow-up', () => {
     )
     expect(document.body.textContent).toMatch(/Campagne encore ouverte/)
     expect(document.body.textContent).not.toMatch(/Rien n’a quitté/)
+    // Nothing was signed: no rotation is in flight, whatever the manifest's dates say.
+    expect(screen.queryByRole('listitem', { name: 'Signée' })).toBeNull()
+    expect(document.body.textContent).not.toMatch(/À installer avant/)
+  })
+
+  it('a replacement stopped during the touches is not a rotation in flight', () => {
+    shown(
+      status({
+        gesture: 'failed',
+        remote: 'awaiting_operator',
+        allowed: [],
+        refusal: { refusal: 'window_expired' },
+        manifest: manifest(),
+      }),
+    )
+    expect(screen.getByText('Campagne expirée')).toBeTruthy()
+    expect(screen.queryByRole('listitem', { name: 'Installée sur la gateway' })).toBeNull()
+  })
+
+  it('finishing, cancelled or refused, never reads as a missed install deadline', () => {
+    const finish = manifest({ affected_ca: 'ca_tls', activation_at: NOW - 40 * 86_400, campaign: undefined })
+    for (const [gesture, refusal] of [
+      ['cancelled', { refusal: 'cancelled' }],
+      ['failed', { refusal: 'rotation_in_flight' }],
+      ['failed', { refusal: 'domain_changed' }],
+    ] as const) {
+      const { unmount } = shown(
+        status({
+          operation: 'rotate_client_tls_ca',
+          gesture,
+          remote: 'local',
+          allowed: [],
+          refusal: refusal as Refusal,
+          manifest: finish,
+        }),
+      )
+      expect(document.body.textContent).not.toMatch(/Délai dépassé/)
+      expect(screen.queryByRole('listitem', { name: 'Signée' })).toBeNull()
+      unmount()
+    }
+  })
+
+  it('a finished « Terminer » says so', () => {
+    shown(
+      status({
+        operation: 'rotate_client_tls_ca',
+        gesture: 'done',
+        remote: 'local',
+        allowed: [],
+        manifest: manifest({ affected_ca: 'ca_tls', campaign: undefined }),
+      }),
+    )
+    expect(screen.getByText('Rotation terminée')).toBeTruthy()
+  })
+
+  it('an expiry before any campaign exists is not worded as one', () => {
+    shown(status({ gesture: 'failed', remote: 'local', allowed: [], refusal: { refusal: 'window_expired' } }))
+    expect(screen.getByText(/^Délai écoulé/)).toBeTruthy()
+    expect(screen.queryByText('Campagne expirée')).toBeNull()
+  })
+
+  it('a resumption that found nothing says so and names no kind', () => {
+    shown(status({ gesture: 'done', remote: 'local', allowed: [], keys: undefined }), { journal: null })
+    expect(screen.getByText('Rien à reprendre')).toBeTruthy()
+    expect(screen.queryByText('Rotation terminée')).toBeNull()
+    expect(screen.queryByText(/CA-PQ|CA TLS/)).toBeNull()
+  })
+
+  it('shows the end of the wait at the key step and at the terms', () => {
+    const idle = Date.UTC(2027, 0, 15, 10, 0, 0) / 1000
+    const { unmount } = shown(status({ idle_until: idle }))
+    expect(screen.getByText(/^Délai jusqu’à \d{2}:\d{2}:\d{2}$/)).toBeTruthy()
+    unmount()
+    shown(approval({ idle_until: idle }))
+    fireEvent.click(button('Continuer'))
+    expect(screen.getByText(/^Délai jusqu’à \d{2}:\d{2}:\d{2}$/)).toBeTruthy()
+  })
+
+  it('shows no end when the status carries none', () => {
+    shown(status())
+    expect(screen.queryByText(/Délai jusqu’à/)).toBeNull()
   })
 
   it('offers the way back once it has ended', () => {

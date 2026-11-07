@@ -767,6 +767,14 @@ pub struct OperatorStatus {
     /// ceremony: this ends nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_retry: Option<Refusal>,
+    /// The labels of the keys that approved, in the order they did. A key is named by
+    /// the label it validated under, so the screen can say which of its keys is done.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub approved: Vec<KeySlotLabel>,
+    /// When a wait for the operator ends by itself, unix seconds. Only a rotation's key
+    /// and terms steps set it: nothing the operator types renews it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_until: Option<u64>,
 }
 
 impl OperatorStatus {
@@ -789,6 +797,8 @@ impl OperatorStatus {
             keys: Vec::new(),
             refusal: None,
             key_retry: None,
+            approved: Vec::new(),
+            idle_until: None,
         }
     }
 

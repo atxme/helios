@@ -10,6 +10,7 @@ const api = vi.hoisted(() => ({
   beginOperatorCeremony: vi.fn(),
   beginIssuerCeremony: vi.fn(),
   beginRotationCeremony: vi.fn(),
+  operatorCeremonyStatus: vi.fn(),
 }))
 vi.mock('../../api', () => api)
 
@@ -55,6 +56,7 @@ const choose = (title: string) =>
 beforeEach(() => {
   vi.clearAllMocks()
   vi.useRealTimers()
+  api.operatorCeremonyStatus.mockResolvedValue(null)
 })
 afterEach(cleanup)
 
@@ -258,6 +260,41 @@ describe('a row that becomes impossible after it was chosen', () => {
     api.operatorRotationsOverview.mockResolvedValue(overview({ resumable: true }))
     fireEvent.click(prerequisitesOf().getByRole('button', { name: 'Vérifier' }))
     await waitFor(() => expect(screen.queryByText('étape')).toBeNull())
+  })
+})
+
+describe('the delegation opening', () => {
+  it('does_not_open_a_campaign_while_a_ceremony_is_running', async () => {
+    api.operatorCeremonyStatus.mockResolvedValue({
+      session_id: 's',
+      revision: 3,
+      operation: 'rotate_anchor',
+      remote: 'local',
+      gesture: 'idle',
+      allowed: ['cancel'],
+    })
+    await show()
+    choose('Renouveler la délégation')
+    fireEvent.click(prerequisitesOf().getByRole('button', { name: 'Continuer' }))
+    expect(await screen.findByText('Cérémonie en cours')).toBeTruthy()
+    expect(api.operatorOpenCampaign).not.toHaveBeenCalled()
+  })
+
+  it('opens_as_before_when_the_last_ceremony_has_ended', async () => {
+    api.operatorCeremonyStatus.mockResolvedValue({
+      session_id: 's',
+      revision: 9,
+      operation: 'rotate_anchor',
+      remote: 'local',
+      gesture: 'done',
+      allowed: [],
+    })
+    api.operatorOpenCampaign.mockResolvedValue({ operation_id: 'd'.repeat(32), delegation_request: '{}' })
+    api.beginIssuerCeremony.mockResolvedValue(ceremony)
+    await show()
+    choose('Renouveler la délégation')
+    fireEvent.click(prerequisitesOf().getByRole('button', { name: 'Continuer' }))
+    await waitFor(() => expect(api.beginIssuerCeremony).toHaveBeenCalled())
   })
 })
 

@@ -576,6 +576,18 @@ pub(crate) fn relay_names_peer(
     Ok(named.is_some() && named == connected)
 }
 
+/// What the window reads of a session: its status, and whether a tunnel coming up opened
+/// it rather than the operator.
+///
+/// A wrapper here and not a field of [`OperatorStatus`]: the session's origin is Orion's
+/// own, and the type shared with Astra rejects unknown fields.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ObservedStatus {
+    #[serde(flatten)]
+    pub status: OperatorStatus,
+    pub automatic: bool,
+}
+
 /// The one ceremony Orion hosts at a time.
 ///
 /// A second concurrent ceremony is refused rather than queued. Two of them
@@ -597,6 +609,14 @@ impl OperatorCeremony {
             .await
             .as_mut()
             .map(|session| session.status.borrow_and_update().clone())
+    }
+
+    /// [`Self::status`] with the origin of the session, for a view that did not open it.
+    pub async fn observed(&self) -> Option<ObservedStatus> {
+        self.0.lock().await.as_mut().map(|session| ObservedStatus {
+            status: session.status.borrow_and_update().clone(),
+            automatic: session.automatic,
+        })
     }
 
     /// Starts the ceremony in its own thread, against the vault at
@@ -1192,6 +1212,29 @@ mod tests {
             .advance(OperatorAction::Continue, 1, 0)
             .await
             .is_err());
+    }
+
+    /// The origin of a session reaches the window beside the status, without a field
+    /// of the shared type, and the status keeps its own names.
+    #[test]
+    fn an_observed_status_carries_its_origin_beside_the_status() {
+        let status = OperatorStatus::new(
+            session(),
+            4,
+            OperationKind::RotateAnchor,
+            RemoteState::Local,
+            GestureState::Done,
+        );
+        for automatic in [true, false] {
+            let value = serde_json::to_value(ObservedStatus {
+                status: status.clone(),
+                automatic,
+            })
+            .expect("serialises");
+            assert_eq!(value["automatic"], automatic);
+            assert_eq!(value["revision"], 4);
+            assert_eq!(value["operation"], "rotate_anchor");
+        }
     }
 
     /// A press on a screen the ceremony has already left must not be applied to

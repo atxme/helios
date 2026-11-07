@@ -390,7 +390,11 @@ export function gestureSentence(
  * Refusals a rotation does not word like the other ceremonies: nothing of the enrollment's
  * `admission.txt`, and the door's classes by their label. `null` leaves the usual sentence.
  */
-function rotationRefusal(refusal: Refusal, journal: RotationJournalView | null): string | null {
+function rotationRefusal(
+  refusal: Refusal,
+  journal: RotationJournalView | null,
+  opened: boolean,
+): string | null {
   const kept = (said: string) => (journal ? `${said}. Rotation conservée.` : said)
   switch (refusal.refusal) {
     case 'gateway_unavailable':
@@ -398,10 +402,13 @@ function rotationRefusal(refusal: Refusal, journal: RotationJournalView | null):
     case 'gateway_refused':
       return kept(`Gateway refuse l’installation (HTTP ${refusal.status})`)
     case 'window_expired':
-      return 'Campagne expirée'
+      // At the key steps and the terms nothing exists at the authority, and the keys
+      // held in memory are what ran out.
+      return opened ? 'Campagne expirée' : 'Délai écoulé. Clés oubliées. Recommencer'
     case 'authority_refused':
       if (refusal.status === 429) return 'Trop d’opérations en attente'
-      if (refusal.status === 403) return 'Opération déjà ouverte'
+      // The door answers 403 to a campaign already open and to a peer that is no admin.
+      if (refusal.status === 403) return 'Opération déjà ouverte, ou poste non administrateur'
       return null
     default:
       return null
@@ -438,10 +445,12 @@ export function refusalSentence(
   journal: RotationJournalView | null = null,
   /** The ceremony the refusal ends: a rotation words some refusals its own way. */
   operation: OperationKind | null = null,
+  /** A campaign exists at the authority; `true` when the screen does not say. */
+  opened = true,
 ): string {
   const rotation = operation === 'rotate_anchor' || operation === 'rotate_client_tls_ca'
   if (rotation) {
-    const worded = rotationRefusal(refusal, journal)
+    const worded = rotationRefusal(refusal, journal, opened)
     if (worded !== null) return worded
   }
   switch (refusal.refusal) {

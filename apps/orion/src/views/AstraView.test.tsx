@@ -543,23 +543,26 @@ describe('AstraView', () => {
       ...extra,
     })
 
-    const startReplacement = async (session: string) => {
+    it('hands_the_rotation_over_even_when_the_row_turns_impossible_before_the_answer', async () => {
+      let release: (value: unknown) => void = () => {}
       api.operatorRotationsOverview.mockResolvedValue(fullOverview())
-      api.beginRotationCeremony.mockResolvedValue(keyStep(session))
+      api.beginRotationCeremony.mockImplementation(
+        () => new Promise((resolve) => (release = resolve)),
+      )
       render(<AstraView />)
       openTab(/Rotations/)
       const row = await screen.findByRole('region', { name: 'Remplacer la CA-PQ' })
       fireEvent.click(within(row).getByRole('button'))
       fireEvent.click(await screen.findByRole('button', { name: 'Continuer' }))
-    }
+      await waitFor(() => expect(api.beginRotationCeremony).toHaveBeenCalled())
 
-    it('hands_the_rotation_to_the_ceremony_and_keeps_its_key_step_when_the_row_changes', async () => {
-      await startReplacement('1'.repeat(32))
-      expect(await screen.findByText('À valider')).toBeTruthy()
-      expect(api.beginRotationCeremony).toHaveBeenCalledWith({ gesture: 'replace_ca_pq' })
+      // The panel is still mounted: a forced read flips the row and unmounts the step.
       api.operatorRotationsOverview.mockResolvedValue(fullOverview({ resumable: true }))
-      await new Promise((resolve) => setTimeout(resolve, 900))
-      expect(screen.getByText('À valider')).toBeTruthy()
+      fireEvent.click(screen.getByRole('button', { name: 'Vérifier' }))
+      await waitFor(() => expect(screen.queryByRole('button', { name: 'Continuer' })).toBeNull())
+
+      release(keyStep('1'.repeat(32)))
+      expect(await screen.findByText('À valider')).toBeTruthy()
       expect(screen.getByRole('listitem', { name: 'Clé 1' })).toBeTruthy()
     })
 
@@ -587,6 +590,7 @@ describe('AstraView', () => {
 
     it('does_not_let_the_stop_of_an_automatic_resumption_take_the_tab', async () => {
       api.operatorCeremonyStatus.mockResolvedValue({
+        automatic: true,
         session_id: '3'.repeat(32),
         revision: 6,
         operation: 'rotate_anchor',
@@ -607,20 +611,73 @@ describe('AstraView', () => {
     })
 
     it('keeps_an_operators_own_finished_screen_after_leaving_and_coming_back', async () => {
-      const session = '4'.repeat(32)
-      await startReplacement(session)
-      await screen.findByText('À valider')
-      cleanup()
+      // No memory of this view: the origin is the session's own, so a reload changes nothing.
       api.operatorCeremonyStatus.mockResolvedValue({
-        ...keyStep(session),
+        ...keyStep('4'.repeat(32)),
+        automatic: false,
         revision: 8,
         remote: 'prepared',
         gesture: 'failed',
         allowed: [],
         refusal: { refusal: 'gateway_unavailable' },
       })
+      api.operatorRotationsOverview.mockResolvedValue(fullOverview({ resumable: true, journal: journal() }))
       render(<AstraView />)
       expect(await screen.findByRole('button', { name: 'Retour aux opérations' })).toBeTruthy()
+    })
+
+    it('lets_go_of_an_automatic_resumption_that_ends_while_the_tab_shows_it', async () => {
+      const running = {
+        ...keyStep('6'.repeat(32)),
+        automatic: true,
+        remote: 'deposited' as const,
+        gesture: 'idle' as const,
+        allowed: [],
+      }
+      api.operatorCeremonyStatus.mockResolvedValueOnce(running)
+      api.operatorRotationsOverview.mockResolvedValue(fullOverview({ resumable: true, journal: journal() }))
+      render(<AstraView />)
+      await screen.findByRole('listitem', { name: 'Signée' })
+      api.operatorCeremonyStatus.mockResolvedValue({
+        ...running,
+        revision: 9,
+        gesture: 'failed',
+        refusal: { refusal: 'gateway_unavailable' },
+      })
+      expect(await screen.findByRole('tablist')).toBeTruthy()
+      expect(screen.queryByRole('button', { name: 'Retour aux opérations' })).toBeNull()
+    })
+
+    it('finds_the_open_campaign_again_when_the_tab_comes_back_to_the_approval', async () => {
+      const operation = {
+        operation_id: 'f'.repeat(32),
+        scope: 'trust_authorities',
+        reason: 'ancres 2027',
+        requested_by: 'operator',
+        target_count: 2,
+        required_credentials: 2,
+        campaign_fingerprint: 'a'.repeat(64),
+        created_at: Math.floor(Date.now() / 1000),
+        expires_at: Math.floor(Date.now() / 1000) + 200,
+      }
+      api.operatorPendingOperations.mockResolvedValue([operation])
+      api.operatorCeremonyStatus.mockResolvedValue({
+        ...keyStep('7'.repeat(32)),
+        gesture: 'idle',
+        allowed: ['cancel'],
+        keys: [
+          { slot: '1', label: 'A' },
+          { slot: '2', label: 'B' },
+        ],
+      })
+      api.approveRotationCeremony.mockResolvedValue(keyStep('7'.repeat(32)))
+      render(<AstraView />)
+      fireEvent.click(await screen.findByRole('button', { name: 'Continuer' }))
+      expect(await screen.findByText('Opération ouverte')).toBeTruthy()
+      expect(screen.queryByLabelText('Motif')).toBeNull()
+      fireEvent.click(screen.getByRole('button', { name: 'Approuver' }))
+      await waitFor(() => expect(api.approveRotationCeremony).toHaveBeenCalled())
+      expect(api.approveRotationCeremony.mock.calls[0][0].existing_operation).toBe('f'.repeat(32))
     })
 
     it('raises_a_line_with_the_deadline_of_a_journal_in_flight_with_no_session', async () => {
