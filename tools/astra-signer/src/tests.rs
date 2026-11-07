@@ -397,3 +397,50 @@ fn the_ca_tls_command_refuses_an_unconfirmed_adoption_too() {
         "{refusal:#}"
     );
 }
+
+/// `apply_local` overwrites the vault with the one signed before the journal: a key
+/// added, removed or marked meanwhile would be undone, and a removed key would get
+/// its access back. Refused by presence, before any key, with the vault as it was.
+#[test]
+fn key_slot_gestures_are_refused_while_a_rotation_journal_is_in_flight() {
+    let directory = tempfile::tempdir().expect("dir");
+    let vault = directory.path().join("authority-vault.json");
+    std::fs::write(&vault, b"coffre").expect("vault");
+    std::fs::write(
+        astra_operator::rotation_journal::path_beside(&vault),
+        b"illisible",
+    )
+    .expect("journal");
+    let slot = "00".repeat(16);
+
+    let refusals = [
+        commands::enrol(
+            &vault,
+            "clé",
+            astra_operator::vault::SlotRole::Recovery,
+            Transport::default(),
+        ),
+        commands::remove(&vault, &slot, Transport::default()),
+        commands::bindings(
+            &vault,
+            std::slice::from_ref(&slot),
+            &[],
+            Transport::default(),
+        ),
+        commands::bindings(
+            &vault,
+            &[],
+            std::slice::from_ref(&slot),
+            Transport::default(),
+        ),
+    ];
+
+    for refused in refusals {
+        let refused = refused.expect_err("refused");
+        assert!(
+            format!("{refused:#}").contains("une rotation est en cours"),
+            "{refused:#}"
+        );
+    }
+    assert_eq!(std::fs::read(&vault).expect("vault"), b"coffre");
+}

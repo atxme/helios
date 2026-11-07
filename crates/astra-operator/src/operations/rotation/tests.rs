@@ -2707,3 +2707,183 @@ fn a_lost_connection_reads_apart_from_a_refusal() {
     assert!(!crate::tunnel::is_unreachable(&admin_refusal(503, None)));
     assert!(!crate::tunnel::is_unreachable(&anyhow::anyhow!("autre")));
 }
+
+// Resuming at a tunnel-up (spec §5.4, §5.5).
+
+/// A journal stopped at each stage is carried to its end by `advance` alone: a
+/// resumption asks no key.
+#[test]
+fn resume_after_a_stop_at_each_stage_asks_no_key() {
+    for kind in [RotationKind::CaPq, RotationKind::CaTls] {
+        for stage in [
+            JournalStage::Signed,
+            JournalStage::Accepted,
+            JournalStage::Applied,
+            JournalStage::Installed,
+        ] {
+            let domain = domain();
+            let mut journal = domain.signed(kind);
+            let next = journal.next.clone().expect("next");
+            let held_back = Remote::watching(&domain.path);
+            match stage {
+                JournalStage::Signed => {}
+                JournalStage::Accepted => {
+                    rotation_journal::record_accepted(&domain.path, &mut journal).expect("accepted")
+                }
+                JournalStage::Applied => {
+                    held_back.install_refused.set(Some(503));
+                    advance(&held_back, &domain.path, &mut journal, NOW).expect_err("stopped");
+                }
+                JournalStage::Installed => {
+                    held_back
+                        .copies
+                        .borrow_mut()
+                        .push_back(Ok(VaultCopySent::HeldBack));
+                    let step =
+                        advance(&held_back, &domain.path, &mut journal, NOW).expect("stopped");
+                    assert_eq!(step, ResumeStep::SendVaultCopy);
+                }
+            }
+            assert_eq!(domain.journal_on_disk().expect("kept").stage, stage);
+            let touches = domain.touches();
+            let remote = Remote::watching(&domain.path);
+
+            let step = advance(&remote, &domain.path, &mut journal, NOW).expect("resumed");
+
+            assert_eq!(step, ResumeStep::Finished, "{kind:?} {stage:?}");
+            assert_eq!(domain.touches(), touches);
+            assert_eq!(domain.journal_on_disk(), None);
+            assert_eq!(store::load(&domain.path).expect("vault"), next.vault);
+        }
+    }
+}
+
+/// Review focus 2: the tunnel drops after Astra accepted and before the gateway was
+/// told. The next tunnel-up finishes alone, and a gateway that already names the
+/// anchor is not sent the transition again.
+#[test]
+fn tunnel_cut_between_acceptance_and_install_resumes_alone() {
+    let domain = domain();
+    let mut journal = domain.signed(RotationKind::CaPq);
+    rotation_journal::record_accepted(&domain.path, &mut journal).expect("accepted");
+    let touches = domain.touches();
+
+    let cut = Remote::watching(&domain.path);
+    cut.gateway_read_fails.set(true);
+    advance(&cut, &domain.path, &mut journal, NOW).expect_err("the tunnel is down");
+    assert!(domain.journal_on_disk().is_some());
+    assert!(!cut.called("install_ca_transition"));
+
+    let back = Remote::watching(&domain.path);
+    *back.gateway_anchor.borrow_mut() = Some(journal.next_anchor_fingerprint);
+    let step = advance(&back, &domain.path, &mut journal, NOW).expect("resumed");
+
+    assert_eq!(step, ResumeStep::Finished);
+    assert!(!back.called("install_ca_transition"));
+    assert_eq!(domain.journal_on_disk(), None);
+    assert_eq!(domain.touches(), touches);
+}
+
+/// The three dead ends are retried at each tunnel-up with no key, and stop the same
+/// way each time, with the journal and the files as they were.
+#[test]
+fn resume_dead_ends_fail_safely_and_repeatedly() {
+    // The gateway names no anchor.
+    let domain = domain();
+    let mut journal = domain.signed(RotationKind::CaTls);
+    let remote = Remote::watching(&domain.path);
+    *remote.gateway_anchor.borrow_mut() = None;
+    advance(&remote, &domain.path, &mut journal, NOW).expect("stopped");
+    let (files, touches) = (domain.files(), domain.touches());
+    for _ in 0..2 {
+        let step = advance(&remote, &domain.path, &mut journal, NOW).expect("stopped");
+        assert_eq!(step, ResumeStep::GatewayOutdated);
+        assert_eq!(domain.files(), files);
+    }
+    assert_eq!(domain.touches(), touches);
+
+    // Past the activation, and still not installed.
+    let domain = domain_with_install_refused();
+    let (mut journal, remote) = domain.1;
+    let activation = journal.activation_at;
+    for _ in 0..2 {
+        let step = advance(&remote, &domain.0.path, &mut journal, activation).expect("stopped");
+        assert_eq!(step, ResumeStep::InstallDeadlinePassed);
+        assert!(domain.0.journal_on_disk().is_some());
+    }
+
+    // An adoption Astra does not hold.
+    let domain = self::domain();
+    adopted_legacy_journal(&domain);
+    let mut journal = domain.journal_on_disk().expect("adopted");
+    let remote = Remote::watching(&domain.path);
+    for _ in 0..2 {
+        let step = advance(&remote, &domain.path, &mut journal, NOW).expect("stopped");
+        assert_eq!(step, ResumeStep::DomainConflict);
+        assert!(domain.journal_on_disk().is_some());
+    }
+}
+
+fn domain_with_install_refused() -> (Domain, (RotationJournal, Remote)) {
+    let domain = domain();
+    let mut journal = domain.signed(RotationKind::CaPq);
+    let remote = Remote::watching(&domain.path);
+    remote.install_refused.set(Some(503));
+    advance(&remote, &domain.path, &mut journal, NOW).expect_err("not installed");
+    (domain, (journal, remote))
+}
+
+// What there is to resume.
+
+#[test]
+fn resume_trigger_counts_a_journal_an_unadopted_record_and_a_legacy_file() {
+    let domain = domain();
+    assert!(!rotation_journal::something_to_resume(&domain.path).expect("read"));
+
+    domain.signed(RotationKind::CaPq);
+    assert!(rotation_journal::something_to_resume(&domain.path).expect("read"));
+    rotation_journal::clear(&rotation_journal::path_beside(&domain.path)).expect("cleared");
+    assert!(!rotation_journal::something_to_resume(&domain.path).expect("read"));
+
+    std::fs::write(
+        rotation_journal::legacy_ca_pq_path_beside(&domain.path),
+        b"{}",
+    )
+    .expect("legacy");
+    assert!(rotation_journal::something_to_resume(&domain.path).expect("read"));
+}
+
+#[test]
+fn resume_trigger_counts_an_unadopted_record_and_not_an_adopted_one() {
+    let domain = domain();
+    finished_client_tls(&domain);
+    let record = record_of(&domain).expect("record");
+    let path = prepared::path_beside(&domain.path);
+
+    prepared::save(
+        &path,
+        &prepared::PreparedRotation {
+            adopted: true,
+            ..record.clone()
+        },
+    )
+    .expect("saved");
+    assert!(!rotation_journal::something_to_resume(&domain.path).expect("read"));
+
+    prepared::save(
+        &path,
+        &prepared::PreparedRotation {
+            adopted: false,
+            ..record
+        },
+    )
+    .expect("saved");
+    assert!(rotation_journal::something_to_resume(&domain.path).expect("read"));
+}
+
+#[test]
+fn resume_trigger_reads_a_record_it_cannot_parse_as_an_error() {
+    let domain = domain();
+    std::fs::write(prepared::path_beside(&domain.path), b"illisible").expect("written");
+    assert!(rotation_journal::something_to_resume(&domain.path).is_err());
+}

@@ -512,6 +512,27 @@ struct Session {
     presses: std::sync::mpsc::Sender<Press>,
     status: watch::Receiver<OperatorStatus>,
     artifacts: Artifacts,
+    /// Opened by a tunnel coming up, not by the operator. Only such a session is
+    /// replaced by the next one without being dismissed: a finished screen the
+    /// operator opened, and the files it produced, are theirs to leave.
+    automatic: bool,
+}
+
+/// Whether the tunnel just came up, from the states the engine reports.
+///
+/// The engine says its state more than once, and a resumption is for the edge: each
+/// report of `Up` after `Up` is the same tunnel-up. One look per edge is also what
+/// keeps a rotation that stops at a dead end from being retried in a loop.
+#[derive(Default)]
+pub struct TunnelWatch(std::sync::atomic::AtomicBool);
+
+impl TunnelWatch {
+    /// Records the state just reported, and says whether it is the edge into `Up`.
+    pub fn entered_up(&self, up: bool) -> bool {
+        use std::sync::atomic::Ordering;
+        let was_up = self.0.swap(up, Ordering::AcqRel);
+        up && !was_up
+    }
 }
 
 /// The one ceremony Orion hosts at a time.
@@ -691,7 +712,74 @@ impl OperatorCeremony {
         }
     }
 
+    /// Carries whatever a rotation left in flight, with no key, now that the tunnel
+    /// is up. `None` when there is nothing to do or the screen is not free for it.
+    ///
+    /// Nothing is started when no journal, no unadopted record and no CA-PQ file
+    /// stands beside the vault, when a ceremony is running, or when the operator's
+    /// own finished screen is still showing. The run asks no key and reaches no one
+    /// but the gateway the tunnel leads to; it ends by itself, so the next operator
+    /// action waits for no longer than the resumption does. A stop leaves the journal
+    /// for the next tunnel-up, or the button.
+    pub async fn resume_on_tunnel_up(
+        &self,
+        gateway: String,
+        vault_path: PathBuf,
+    ) -> Result<Option<OperatorStatus>, String> {
+        let pending = astra_operator::rotation_journal::something_to_resume(&vault_path)
+            .map_err(|error| format!("{error:#}"))?;
+        if !pending {
+            return Ok(None);
+        }
+        let gesture = RotationGesture::Resume;
+        let started = self
+            .open_as(
+                gesture.operation(),
+                true,
+                move |session_id, presses, publish, _artifacts| {
+                    ceremony::run_rotation(
+                        session_id,
+                        gesture,
+                        Some(gateway),
+                        presses,
+                        publish,
+                        &vault_path,
+                    )
+                },
+            )
+            .await;
+        match started {
+            Ok(status) => Ok(Some(status)),
+            Err(Opening::Busy) => Ok(None),
+            Err(Opening::Failed(message)) => Err(message),
+        }
+    }
+
     async fn open<F>(&self, kind: OperationKind, run: F) -> Result<OperatorStatus, String>
+    where
+        F: FnOnce(
+                Id16,
+                std::sync::mpsc::Receiver<Press>,
+                &mut dyn FnMut(OperatorStatus),
+                &Artifacts,
+            ) -> Result<(), String>
+            + Send
+            + 'static,
+    {
+        self.open_as(kind, false, run)
+            .await
+            .map_err(|error| match error {
+                Opening::Busy => BUSY.to_string(),
+                Opening::Failed(message) => message,
+            })
+    }
+
+    async fn open_as<F>(
+        &self,
+        kind: OperationKind,
+        automatic: bool,
+        run: F,
+    ) -> Result<OperatorStatus, Opening>
     where
         F: FnOnce(
                 Id16,
@@ -705,12 +793,9 @@ impl OperatorCeremony {
         let mut held = self.0.lock().await;
         if let Some(session) = held.as_mut() {
             let current = session.status.borrow_and_update().clone();
-            if !current.gesture.is_terminal() {
-                return Err(
-                    "une cérémonie opérateur est déjà ouverte : la mener à son terme ou \
-                     l'annuler avant d'en ouvrir une autre"
-                        .to_string(),
-                );
+            // A resumption gives way to everything but its own finished session.
+            if !current.gesture.is_terminal() || (automatic && !session.automatic) {
+                return Err(Opening::Busy);
             }
         }
         *held = None;
@@ -759,8 +844,9 @@ impl OperatorCeremony {
             presses,
             status,
             artifacts,
+            automatic,
         });
-        awaited(&mut session.status).await
+        Ok(awaited(&mut session.status).await?)
     }
 
     /// Takes the next step of the open ceremony.
@@ -814,6 +900,49 @@ impl OperatorCeremony {
         }
         *held = None;
         Ok(())
+    }
+}
+
+/// Said when a ceremony is already open and a second one is asked for.
+const BUSY: &str = "une cérémonie opérateur est déjà ouverte : la mener à son terme ou l'annuler \
+                    avant d'en ouvrir une autre";
+
+/// Why a ceremony did not open.
+enum Opening {
+    Busy,
+    Failed(String),
+}
+
+impl From<String> for Opening {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
+/// Carries a rotation left in flight as soon as the tunnel is up (spec §5.4).
+///
+/// Called once per edge into `Up`, see [`TunnelWatch`]. It starts the resumption in
+/// its own ceremony and returns: no key is asked, nothing runs in the background
+/// beyond that one ceremony, and a stop is retried by the next tunnel-up or by
+/// « Reprendre », never by a loop here. Nothing secret is logged.
+pub async fn resume_on_tunnel_up(app: &tauri::AppHandle) {
+    use tauri::Manager;
+
+    let state = app.state::<crate::AppState>();
+    let Ok(vault_path) = state.vault_location.path() else {
+        return;
+    };
+    let Ok(gateway) = crate::commands::connected_gateway(&state).await else {
+        return;
+    };
+    match state
+        .operator
+        .resume_on_tunnel_up(gateway, vault_path)
+        .await
+    {
+        Ok(Some(_)) => tracing::info!("reprise d'une rotation en cours au montage du tunnel"),
+        Ok(None) => {}
+        Err(error) => tracing::warn!(error = %error, "reprise d'une rotation impossible à lancer"),
     }
 }
 

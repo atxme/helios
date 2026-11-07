@@ -2373,3 +2373,191 @@ fn a_locator_does_not_open_a_rotation() {
         assert!(error.contains("s'ouvre par son geste"), "{error}");
     }
 }
+
+// The resumption at a tunnel-up (spec §5.4, §5.5).
+
+/// Nothing out of reach: the address no tunnel answers at.
+const NO_ONE_ANSWERS: &str = "http://127.0.0.1:1";
+
+/// A journal any look would find: only its presence counts to the trigger.
+fn leave_a_journal(bench: &Bench) {
+    std::fs::write(rotation_journal::path_beside(&bench.path), b"{}").expect("journal");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn no_journal_means_no_ceremony() {
+    let bench = bench();
+    let ceremony = OperatorCeremony::default();
+    let started = ceremony
+        .resume_on_tunnel_up(NO_ONE_ANSWERS.into(), bench.path.clone())
+        .await
+        .expect("looked");
+    assert!(started.is_none());
+    assert!(ceremony.status().await.is_none());
+}
+
+/// A rotation finished leaves its record, adopted, until the promotion: it must not
+/// run a resumption at every tunnel-up.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_finished_rotation_means_no_ceremony() {
+    let bench = bench();
+    bench
+        .drive(RotationGesture::ReplaceCaTls, Bench::all_the_way)
+        .done();
+    assert!(bench.record().expect("record").adopted);
+    assert!(bench.journal().is_none());
+    let ceremony = OperatorCeremony::default();
+    let started = ceremony
+        .resume_on_tunnel_up(NO_ONE_ANSWERS.into(), bench.path.clone())
+        .await
+        .expect("looked");
+    assert!(started.is_none());
+    assert!(ceremony.status().await.is_none());
+}
+
+/// An astra-signer record has no keyless way forward but this.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unadopted_record_starts_a_resumption() {
+    let bench = bench();
+    bench
+        .drive(RotationGesture::ReplaceCaTls, Bench::all_the_way)
+        .done();
+    let record = bench.record().expect("record");
+    prepared::save(
+        &prepared::path_beside(&bench.path),
+        &prepared::PreparedRotation {
+            result_token: Some("jeton-de-depot".into()),
+            transition_path: "/tmp/transition-ca-tls.json".into(),
+            submitted: false,
+            adopted: false,
+            ..record
+        },
+    )
+    .expect("record");
+    let ceremony = OperatorCeremony::default();
+    let started = ceremony
+        .resume_on_tunnel_up(NO_ONE_ANSWERS.into(), bench.path.clone())
+        .await
+        .expect("looked");
+    assert!(started.is_some());
+    let ended = until(&ceremony, |status| status.gesture.is_terminal()).await;
+    assert_eq!(ended.refusal, Some(Refusal::GatewayUnavailable));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resume_waits_for_a_running_ceremony() {
+    let bench = bench();
+    let ceremony = OperatorCeremony::default();
+    open_session(&ceremony, &bench, RotationGesture::ReplaceCaPq).await;
+    let waiting = until(&ceremony, |status| awaits_validation(status, 1)).await;
+    leave_a_journal(&bench);
+
+    let started = ceremony
+        .resume_on_tunnel_up(NO_ONE_ANSWERS.into(), bench.path.clone())
+        .await
+        .expect("looked");
+
+    assert!(started.is_none());
+    assert_eq!(ceremony.status().await.expect("status"), waiting);
+    ceremony
+        .advance(OperatorAction::Cancel, waiting.revision, 0)
+        .await
+        .expect("abandoned");
+    until(&ceremony, |status| status.gesture.is_terminal()).await;
+}
+
+/// The operator's finished screen is theirs: the resumption does not wipe it, nor its
+/// files. Once dismissed, it goes ahead.
+#[tokio::test(flavor = "multi_thread")]
+async fn resume_leaves_an_operators_finished_screen_alone() {
+    let bench = bench();
+    let ceremony = OperatorCeremony::default();
+    ceremony
+        .begin_rotation(RotationGesture::ReplaceCaTls, None, bench.path.clone())
+        .await
+        .expect("a session");
+    let ended = until(&ceremony, |status| status.gesture.is_terminal()).await;
+    leave_a_journal(&bench);
+
+    let started = ceremony
+        .resume_on_tunnel_up(NO_ONE_ANSWERS.into(), bench.path.clone())
+        .await
+        .expect("looked");
+    assert!(started.is_none());
+    assert_eq!(ceremony.status().await.expect("status"), ended);
+
+    ceremony.dismiss().await.expect("dismissed");
+    assert!(ceremony
+        .resume_on_tunnel_up(NO_ONE_ANSWERS.into(), bench.path.clone())
+        .await
+        .expect("looked")
+        .is_some());
+}
+
+/// A dead end is retried at each tunnel-up: its own finished session gives way, with
+/// the journal and the vault as they were and no key asked.
+#[tokio::test(flavor = "multi_thread")]
+async fn each_tunnel_up_retries_a_stopped_rotation_with_no_key() {
+    let bench = bench();
+    bench.remote.deposits.lock().expect("lock").push_back(503);
+    bench.drive(RotationGesture::ReplaceCaPq, Bench::all_the_way);
+    let (journal, vault, touches) = (
+        bench.journal().expect("kept"),
+        bench.vault_bytes(),
+        bench.touches(),
+    );
+    let ceremony = OperatorCeremony::default();
+
+    for _ in 0..2 {
+        ceremony
+            .resume_on_tunnel_up(NO_ONE_ANSWERS.into(), bench.path.clone())
+            .await
+            .expect("looked")
+            .expect("started");
+        let ended = until(&ceremony, |status| status.gesture.is_terminal()).await;
+        assert_eq!(ended.refusal, Some(Refusal::GatewayUnavailable));
+        assert!(ended.keys.is_empty());
+        assert_eq!(bench.journal().as_ref(), Some(&journal));
+        assert_eq!(bench.vault_bytes(), vault);
+        assert_eq!(bench.touches(), touches);
+    }
+}
+
+/// The tunnel's up edge, once: a repeated report of the same state starts nothing.
+#[test]
+fn only_the_edge_into_up_triggers() {
+    let watch = crate::operator::TunnelWatch::default();
+    assert!(!watch.entered_up(false));
+    assert!(watch.entered_up(true));
+    assert!(!watch.entered_up(true));
+    assert!(!watch.entered_up(false));
+    assert!(watch.entered_up(true));
+}
+
+/// A copy held back is no failure: the journal stays, and the next look or the button
+/// sends it again.
+#[test]
+fn a_copy_held_back_by_a_resumption_keeps_the_journal_and_is_not_a_failure() {
+    let bench = bench();
+    bench.remote.deposits.lock().expect("lock").push_back(503);
+    bench.drive(RotationGesture::ReplaceCaPq, Bench::all_the_way);
+    bench
+        .remote
+        .copies
+        .lock()
+        .expect("lock")
+        .push_back(VaultCopySent::HeldBack);
+
+    let held = bench.drive(RotationGesture::Resume, Bench::all_the_way);
+    held.done();
+    assert!(held.asked_no_key());
+    assert_eq!(held.last().refusal, None);
+    assert_eq!(
+        bench.journal().expect("kept").stage,
+        JournalStage::Installed
+    );
+
+    let next = bench.drive(RotationGesture::Resume, Bench::all_the_way);
+    next.done();
+    assert!(bench.journal().is_none());
+}

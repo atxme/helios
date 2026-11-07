@@ -215,10 +215,20 @@ fn ensure_frontend_dev_server() -> anyhow::Result<Option<FrontendDevServer>> {
 /// single point is what keeps the menu from claiming a tunnel that is gone.
 /// Only the transition, deliberately: telemetry arrives once a second, and
 /// rebuilding the menu at that rate would rebuild it under the pointer.
+///
+/// The edge into `Up` is also where a rotation left in flight is taken up again,
+/// once per edge (spec §5.4).
 fn emit_sink(app: AppHandle) -> EventSink {
+    let tunnel = operator::TunnelWatch::default();
     Arc::new(move |ev: ClientEvent| {
-        if matches!(ev, ClientEvent::StateChanged { .. }) {
+        if let ClientEvent::StateChanged { state } = &ev {
             tray::refresh(&app);
+            if tunnel.entered_up(*state == aether::TunnelState::Up) {
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    operator::resume_on_tunnel_up(&app).await;
+                });
+            }
         }
         let _ = app.emit("helios://event", &ev);
     })

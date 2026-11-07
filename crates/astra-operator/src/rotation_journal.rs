@@ -341,6 +341,29 @@ pub fn ensure_none_in_flight(vault_path: &Path) -> Result<()> {
     }
 }
 
+/// Whether anything beside the vault calls for a resumption: a rotation journal, a
+/// prepared record no journal has adopted, or `astra-signer`'s CA-PQ journal file.
+///
+/// What [`adopt_legacy`] would take up, read without taking it. An adopted record
+/// with no journal is a finished rotation waiting for its promotion and counts for
+/// nothing, so a tunnel-up does not run a resumption each time. A prepared record
+/// that cannot be read is an error and not an absence.
+pub fn something_to_resume(vault_path: &Path) -> Result<bool> {
+    for path in [
+        path_beside(vault_path),
+        legacy_ca_pq_path_beside(vault_path),
+    ] {
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => return Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("lecture de {}", path.display()))
+            }
+        }
+    }
+    Ok(prepared::load(&prepared::path_beside(vault_path))?.is_some_and(|record| !record.adopted))
+}
+
 /// What `rotate-ca-pq` checks in place of [`ensure_none_in_flight`].
 ///
 /// Its one exception is the rotation it wrote itself, adopted and not confirmed:

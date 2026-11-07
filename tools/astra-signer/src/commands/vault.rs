@@ -69,6 +69,9 @@ pub(crate) fn init(
 }
 
 pub(crate) fn enrol(path: &Path, label: &str, role: SlotRole, transport: Transport) -> Result<()> {
+    // A rotation applies the vault it signed over this one: a key slot changed
+    // meanwhile would be undone, and a removed key would get its access back.
+    astra_operator::rotation_journal::ensure_none_in_flight(path)?;
     let mut vault = store::load(path)?;
     if vault.slots.len() >= MAX_SLOTS {
         bail!("le coffre est plafonné à {MAX_SLOTS} key-slots : en retirer un d'abord");
@@ -160,6 +163,9 @@ pub(crate) fn list(path: &Path) -> Result<()> {
 }
 
 pub(crate) fn remove(path: &Path, slot: &str, transport: Transport) -> Result<()> {
+    // A rotation applies the vault it signed over this one: a key slot changed
+    // meanwhile would be undone, and a removed key would get its access back.
+    astra_operator::rotation_journal::ensure_none_in_flight(path)?;
     let mut vault = store::load(path)?;
     let removed = parse_slot_id(slot)?;
     let target: KeySlot = vault.slot(&removed)?.clone();
@@ -384,6 +390,9 @@ pub(crate) fn bindings(
     active: &[String],
     transport: Transport,
 ) -> Result<()> {
+    // A rotation applies the vault it signed over this one: a key slot changed
+    // meanwhile would be undone, and a removed key would get its access back.
+    astra_operator::rotation_journal::ensure_none_in_flight(path)?;
     let vault = store::load(path)?;
     let handoff = handoff::DomainHandoff::beside(path, &vault)?;
     let identity = handoff::identity_of(&handoff)?;

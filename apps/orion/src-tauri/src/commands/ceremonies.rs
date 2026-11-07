@@ -521,7 +521,7 @@ const NO_CONNECTED_GATEWAY: &str = "Connectez d'abord le profil de la gateway, a
 /// the selected one and its tunnel up, because the admission rides the tunnel
 /// and a gateway reached any other way would not be the one the operator
 /// connected to.
-async fn connected_gateway(state: &AppState) -> Result<String, String> {
+pub(crate) async fn connected_gateway(state: &AppState) -> Result<String, String> {
     connected_profile(state).await.map(|(url, _)| url)
 }
 
