@@ -71,6 +71,22 @@ describe('refusalSentence for the issuer delegation', () => {
     expect(refusalSentence({ refusal: 'nothing_to_finish' })).toBe('Aucune rotation à terminer.')
   })
 
+  it('the_stops_use_the_journal_when_the_screen_has_one', () => {
+    const journal = {
+      kind: 'ca_pq' as const,
+      stage: 'applied' as const,
+      activationAt: 1_800_000_000,
+      notAfter: 1_802_000_000,
+      nextFingerprint: 'aa',
+    }
+    expect(refusalSentence({ refusal: 'domain_conflict' }, journal)).toMatch(
+      /astra-signer rotate-ca-pq/,
+    )
+    expect(refusalSentence({ refusal: 'install_deadline_passed' }, journal)).toMatch(
+      /^Délai dépassé le .*Intervention manuelle requise/,
+    )
+  })
+
   it('a_gateway_naming_no_anchor_does_not_give_an_update_as_its_only_cause', () => {
     const sentence = refusalSentence({ refusal: 'gateway_names_no_anchor' })
     expect(sentence).toMatch(/sans CA TLS/)

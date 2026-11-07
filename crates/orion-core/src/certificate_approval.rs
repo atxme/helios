@@ -437,6 +437,11 @@ mod tests {
     }
 
     fn setup() -> Setup {
+        setup_in(|_| {})
+    }
+
+    /// `adjust` shapes the profile's state before the request is verified against it.
+    fn setup_in(adjust: impl FnOnce(&mut TrustState)) -> Setup {
         let mut domain = domain();
         let (service_private, service_public) = generate_ml_dsa_87_keypair().expect("service");
         domain.service_public = service_public;
@@ -448,6 +453,7 @@ mod tests {
         state.astra.webauthn_rp_id = RP_ID.into();
         // Distinct values, so a round trip that swapped the two would show.
         state.client_tls_ca.ca_tls_epoch = 2;
+        adjust(&mut state);
 
         let binding = AstraCredentialBinding {
             format_version: CERTIFICATE_FORMAT_VERSION,
@@ -512,6 +518,22 @@ mod tests {
             binding,
             persisted_generation: state.certificates.active.generation,
         }
+    }
+
+    /// A CA-PQ overlap does not stop a workstation renewing through Orion's engine: Astra
+    /// serves the old document, signed under the old anchor, and the profile still pins
+    /// that anchor and epoch until the promotion. The new anchor is only staged.
+    #[test]
+    fn renewal_during_a_ca_pq_overlap_verifies_the_old_document_under_the_profile_anchor() {
+        let (_, next_ca) = generate_ml_dsa_87_keypair().expect("next anchor");
+        let overlap = setup_in(|state| {
+            state.gateway.next_ca_public_key = Some(next_ca);
+            state.gateway.ca_activation_at = Some(NOW - 100);
+            state.gateway.ca_retire_active_at = Some(NOW + 1_000);
+        });
+        // `setup_in` verified the served request; what it verified against is the old anchor.
+        assert_eq!(overlap.verified.material.ca_pq, overlap.domain.ca_pq_public);
+        assert_eq!(overlap.verified.material.registry.ca_epoch, 1);
     }
 
     /// The approval the interface process would hand back, with the fields

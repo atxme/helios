@@ -4,15 +4,12 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const api = vi.hoisted(() => ({
-  startAstraCaTlsRotation: vi.fn(),
-  continueAstraCaTlsRotation: vi.fn(),
-  cancelAstraCaTlsRotation: vi.fn(),
-  astraCaTlsRotationStatus: vi.fn(),
   operatorCeremonyStatus: vi.fn(),
   advanceOperatorCeremony: vi.fn(),
   beginOperatorCeremony: vi.fn(),
   beginIssuerCeremony: vi.fn(),
   operatorPendingOperations: vi.fn(),
+  operatorRotationsOverview: vi.fn(),
   dismissOperatorCeremony: vi.fn(),
   operatorOverview: vi.fn(),
   operatorArtifacts: vi.fn(),
@@ -83,11 +80,22 @@ beforeEach(() => {
   api.getConfig.mockResolvedValue({ profiles: [], selected: null })
   api.operatorOverview.mockResolvedValue(overview(null))
   api.dismissOperatorCeremony.mockResolvedValue(undefined)
-  api.astraCaTlsRotationStatus.mockResolvedValue({
-    phase: 'idle',
-    message: '',
-    can_continue: false,
-    can_cancel: false,
+  api.operatorRotationsOverview.mockResolvedValue({
+    tunnel: true,
+    pending: { state: 'ok', value: [] },
+    authority: { state: 'unreachable' },
+    domain: { state: 'unreachable' },
+    vault: null,
+    vaultError: null,
+    localVaultFingerprint: null,
+    localCaEpoch: null,
+    localCaTlsEpoch: null,
+    localCaTlsNotAfter: null,
+    journal: null,
+    resumable: false,
+    caPqOverlap: false,
+    caTlsCloseDue: false,
+    caTlsCloseAt: null,
   })
 })
 afterEach(cleanup)

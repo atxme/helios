@@ -4,14 +4,11 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const api = vi.hoisted(() => ({
-  startAstraCaTlsRotation: vi.fn(),
-  continueAstraCaTlsRotation: vi.fn(),
-  cancelAstraCaTlsRotation: vi.fn(),
-  astraCaTlsRotationStatus: vi.fn(),
   operatorCeremonyStatus: vi.fn(),
   advanceOperatorCeremony: vi.fn(),
   beginOperatorCeremony: vi.fn(),
   operatorPendingOperations: vi.fn(),
+  operatorRotationsOverview: vi.fn(),
   dismissOperatorCeremony: vi.fn(),
   operatorOverview: vi.fn(),
   operatorVaultLocation: vi.fn(),
@@ -27,37 +24,32 @@ vi.mock('../api', () => api)
 
 import { AstraView } from './AstraView'
 
-const fillForm = () => {
-  fireEvent.change(screen.getByLabelText('Coffre d’autorité'), {
-    target: { value: 'C:\\astra\\authority-vault.json' },
-  })
-  fireEvent.change(screen.getByLabelText('Identifiant de l’opération'), {
-    target: { value: 'a'.repeat(32) },
-  })
-  fireEvent.change(screen.getByLabelText('Fichier de sortie'), {
-    target: { value: 'C:\\astra\\ca-tls-transition.json' },
-  })
-}
-
 const openTab = (name: string | RegExp) => fireEvent.click(screen.getByRole('tab', { name }))
 
-const manifest = {
-  reason: 'rotation planifiée',
-  requested_by: 'christophe',
-  fingerprint: 'b'.repeat(64),
-  current_ca_tls_epoch: 1,
-  next_ca_tls_epoch: 2,
-  activation_at: 1_789_198_911,
-  not_after: 1_791_790_911,
-  outgoing_anchor_fingerprint: 'c'.repeat(64),
-  affected_ca: 'client_tls' as const,
-  target_count: 12,
-}
+const rotations = (extra: object = {}) => ({
+  tunnel: true,
+  pending: { state: 'ok', value: [] },
+  authority: { state: 'unreachable' },
+  domain: { state: 'unreachable' },
+  vault: null,
+  vaultError: null,
+  localVaultFingerprint: null,
+  localCaEpoch: null,
+  localCaTlsEpoch: null,
+  localCaTlsNotAfter: null,
+  journal: null,
+  resumable: false,
+  caPqOverlap: false,
+  caTlsCloseDue: false,
+  caTlsCloseAt: null,
+  ...extra,
+})
 
 beforeEach(() => {
   vi.clearAllMocks()
   api.operatorCeremonyStatus.mockResolvedValue(null)
   api.operatorPendingOperations.mockResolvedValue([])
+  api.operatorRotationsOverview.mockResolvedValue(rotations())
   api.operatorInvitations.mockResolvedValue([])
   api.operatorArtifacts.mockResolvedValue([])
   api.getState.mockResolvedValue('down')
@@ -81,44 +73,6 @@ beforeEach(() => {
   })
   api.operatorDomainDefaults.mockResolvedValue({ rp_id: null })
   api.dismissOperatorCeremony.mockResolvedValue(undefined)
-  api.astraCaTlsRotationStatus.mockResolvedValue({
-    phase: 'idle',
-    message: '',
-    can_continue: false,
-    can_cancel: false,
-  })
-  api.startAstraCaTlsRotation.mockResolvedValue({
-    phase: 'awaiting_first_key',
-    message: 'première clé attendue',
-    can_continue: true,
-    can_cancel: true,
-    manifest,
-  })
-  api.continueAstraCaTlsRotation
-    .mockResolvedValueOnce({
-      phase: 'awaiting_second_key',
-      message: 'seconde clé attendue',
-      can_continue: true,
-      can_cancel: true,
-      manifest,
-      first_key_label: 'YubiKey portable',
-    })
-    .mockResolvedValueOnce({
-      phase: 'deposited',
-      message: 'déposée',
-      can_continue: false,
-      can_cancel: false,
-      manifest,
-      first_key_label: 'YubiKey portable',
-      second_key_label: 'YubiKey home',
-      output_path: 'C:\\astra\\ca-tls-transition.json',
-    })
-  api.cancelAstraCaTlsRotation.mockResolvedValue({
-    phase: 'cancelled',
-    message: 'annulée',
-    can_continue: false,
-    can_cancel: false,
-  })
 })
 
 afterEach(cleanup)
@@ -160,10 +114,11 @@ describe('AstraView', () => {
     expect(screen.getByRole('button', { name: /Accepter une demande/ })).toBeTruthy()
   })
 
-  it('the_rotation_flow_still_renders_under_rotations', () => {
+  it('the_rotations_tab_lists_the_rotations_and_not_the_old_form', async () => {
     render(<AstraView />)
     openTab('Rotations')
-    expect(screen.getByRole('button', { name: 'Démarrer la rotation' })).toBeTruthy()
+    expect(await screen.findByRole('region', { name: 'Renouveler les postes' })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Démarrer la rotation' })).toBeNull()
   })
 
   it('verify_key_opens_the_ceremony_over_the_tabs', async () => {
@@ -315,67 +270,6 @@ describe('AstraView', () => {
     expect(screen.queryByText(/reprend ce qui manque/)).toBeNull()
   })
 
-  it('starts from an existing operation and sends the four typed fields', async () => {
-    render(<AstraView />)
-    openTab('Rotations')
-
-    expect(screen.getByRole('button', { name: 'Démarrer la rotation' }).hasAttribute('disabled')).toBe(true)
-    fillForm()
-    fireEvent.click(screen.getByRole('button', { name: 'Démarrer la rotation' }))
-
-    await waitFor(() =>
-      expect(api.startAstraCaTlsRotation).toHaveBeenCalledWith({
-        vault_path: 'C:\\astra\\authority-vault.json',
-        heliosd_url: 'http://100.64.0.1:8080',
-        operation_id: 'a'.repeat(32),
-        output_path: 'C:\\astra\\ca-tls-transition.json',
-      }),
-    )
-    expect(await screen.findByText(/première clé attendue/)).toBeTruthy()
-    expect(screen.getByText(/Campagne vérifiée/)).toBeTruthy()
-    expect(screen.getByText('rotation planifiée')).toBeTruthy()
-    expect(screen.getByText('1 → 2')).toBeTruthy()
-  })
-
-  it('separates both key gestures and describes the deposited transition precisely', async () => {
-    render(<AstraView />)
-    openTab('Rotations')
-    fillForm()
-    fireEvent.click(screen.getByRole('button', { name: 'Démarrer la rotation' }))
-
-    fireEvent.click(
-      await screen.findByRole('button', { name: 'Première clé branchée — continuer' }),
-    )
-    await waitFor(() => expect(screen.getByText(/Clé reconnue : YubiKey portable/)).toBeTruthy())
-
-    fireEvent.click(
-      screen.getByRole('button', { name: 'Seconde clé branchée — continuer' }),
-    )
-    await waitFor(() => expect(screen.getByText(/Clé reconnue : YubiKey home/)).toBeTruthy())
-    expect(screen.getByText(/Transition CA-TLS déposée/)).toBeTruthy()
-    expect(screen.getByText(/La promotion reste à faire/)).toBeTruthy()
-    expect(api.continueAstraCaTlsRotation).toHaveBeenCalledTimes(2)
-  })
-
-  it('can cancel an open ceremony and reports backend failures', async () => {
-    const { unmount } = render(<AstraView />)
-    openTab('Rotations')
-    fillForm()
-    fireEvent.click(screen.getByRole('button', { name: 'Démarrer la rotation' }))
-    fireEvent.click(await screen.findByRole('button', { name: 'Annuler' }))
-
-    await waitFor(() => expect(api.cancelAstraCaTlsRotation).toHaveBeenCalledOnce())
-    expect(await screen.findByText(/Aucune transition n’a été produite/)).toBeTruthy()
-
-    unmount()
-    api.startAstraCaTlsRotation.mockRejectedValue('coffre illisible')
-    render(<AstraView />)
-    openTab('Rotations')
-    fillForm()
-    fireEvent.click(screen.getByRole('button', { name: 'Démarrer la rotation' }))
-    expect(await screen.findByText('coffre illisible')).toBeTruthy()
-  })
-
   it('polls past processing so a campaign can reach its next key', async () => {
     api.operatorCeremonyStatus
       .mockResolvedValueOnce({
@@ -433,7 +327,7 @@ describe('AstraView', () => {
     api.operatorPendingOperations.mockResolvedValue([
       {
         operation_id: 'f'.repeat(32),
-        scope: 'trust_authorities',
+        scope: 'emergency_revocation',
         reason: 'rotation des ancres',
         requested_by: 'operator',
         target_count: 2,
@@ -453,6 +347,61 @@ describe('AstraView', () => {
     expect(screen.getByText(/n’est pas encore disponible dans Orion/)).toBeTruthy()
     fireEvent.click(open)
     expect(api.beginOperatorCeremony).not.toHaveBeenCalled()
+  })
+
+  it('leads_a_CA_rotation_campaign_to_the_rotations_tab', async () => {
+    api.operatorPendingOperations.mockResolvedValue([
+      {
+        operation_id: 'f'.repeat(32),
+        scope: 'trust_authorities',
+        reason: 'rotation des ancres',
+        requested_by: 'operator',
+        target_count: 2,
+        required_credentials: 2,
+        campaign_fingerprint: 'a'.repeat(64),
+        created_at: 1_800_000_000,
+        expires_at: 1_800_000_300,
+      },
+    ])
+    render(<AstraView />)
+    openTab(/Approbations/)
+    await screen.findByText('rotation des ancres')
+    const open = screen.getByRole('button', { name: 'Ouvrir dans Rotations' })
+    await waitFor(() => expect(open.hasAttribute('disabled')).toBe(false))
+    fireEvent.click(open)
+    expect(await screen.findByRole('region', { name: 'Renouveler les postes' })).toBeTruthy()
+    expect(api.beginOperatorCeremony).not.toHaveBeenCalled()
+  })
+
+  it('suspends_every_launch_during_a_CA_PQ_overlap_or_when_the_authority_is_unread', async () => {
+    const delegation = {
+      operation_id: 'f'.repeat(32),
+      scope: 'issuer_delegation',
+      reason: 'déléguer Astra',
+      requested_by: 'operator',
+      target_count: 1,
+      required_credentials: 1,
+      campaign_fingerprint: 'a'.repeat(64),
+      created_at: 1_800_000_000,
+      expires_at: 1_800_000_300,
+    }
+    api.operatorPendingOperations.mockResolvedValue([delegation])
+    for (const [overlap, reason] of [
+      [true, 'Recouvrement CA-PQ en cours'],
+      [null, 'Autorité non lue'],
+    ] as const) {
+      api.operatorRotationsOverview.mockResolvedValue(rotations({ caPqOverlap: overlap }))
+      const view = render(<AstraView />)
+      openTab(/Approbations/)
+      await screen.findByText('déléguer Astra')
+      await screen.findByText(reason)
+      for (const button of screen.getAllByRole('button', { name: 'Ouvrir la cérémonie' })) {
+        expect(button.hasAttribute('disabled')).toBe(true)
+      }
+      fireEvent.click(screen.getAllByRole('button', { name: 'Ouvrir la cérémonie' })[0])
+      expect(screen.queryByLabelText('Demande de délégation')).toBeNull()
+      view.unmount()
+    }
   })
 
   it('ends a domain creation on its fingerprints and next steps', async () => {

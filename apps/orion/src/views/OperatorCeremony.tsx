@@ -9,6 +9,7 @@ import { KeyRound, X } from 'lucide-react'
 
 import * as api from '../api'
 import { RULE } from '../theme'
+import { stopSentence } from './astra/rotationRows'
 import type {
   AstraManifest,
   CampaignManifest,
@@ -18,6 +19,7 @@ import type {
   OperatorStatus,
   Refusal,
   RemoteState,
+  RotationJournalView,
 } from '../types'
 
 /**
@@ -375,7 +377,11 @@ export function gestureSentence(gesture: GestureState, operation: OperationKind)
 }
 
 /** Why it stopped. Typed, so the words are ours. */
-export function refusalSentence(refusal: Refusal): string {
+export function refusalSentence(
+  refusal: Refusal,
+  /** The rotation journal, when the screen knows it: dates and recourse come from it. */
+  journal: RotationJournalView | null = null,
+): string {
   switch (refusal.refusal) {
     case 'vault_unavailable':
       return 'Coffre d’autorité absent, illisible, ou étranger à ce domaine.'
@@ -499,9 +505,9 @@ export function refusalSentence(refusal: Refusal): string {
     case 'rotation_expired':
       return 'Rotation expirée. Recommencer.'
     case 'domain_conflict':
-      return 'Domaine en désaccord. Intervention manuelle requise.'
+      return stopSentence('domain_conflict', journal)
     case 'install_deadline_passed':
-      return 'Délai dépassé. Intervention manuelle requise.'
+      return stopSentence('install_deadline_passed', journal)
     case 'gateway_names_no_anchor':
       return 'Gateway sans CA TLS, ou mise à jour requise. Rotation conservée.'
     case 'rotation_in_flight':
@@ -545,10 +551,12 @@ export function OperatorCeremonyPanel({
   status,
   onStatus,
   onDismiss,
+  journal = null,
 }: {
   status: OperatorStatus
   onStatus: (next: OperatorStatus) => void
   onDismiss?: () => void
+  journal?: RotationJournalView | null
 }) {
   const [busy, setBusy] = useState(false)
   const [refusal, setRefusal] = useState<string | null>(null)
@@ -610,7 +618,7 @@ export function OperatorCeremonyPanel({
           variant="outlined"
           sx={{ mt: 1, fontSize: 11.5 }}
         >
-          {refusalSentence(status.refusal)}
+          {refusalSentence(status.refusal, journal)}
         </Alert>
       )}
       {done && (
