@@ -1,54 +1,8 @@
-//! The Astra CA-TLS rotation and the operator ceremonies, driven from this
-//! window and signed in the companion.
+//! The operator ceremonies, driven and signed from this window.
 
 use super::*;
 
 use orion_engine::{ConfigView, EngineCommand, EngineReply};
-
-/// Opens the two-key CA-TLS ceremony described in ADR-008 §9.4.
-///
-/// Everything that decides anything happens in the companion: the campaign is
-/// fetched and verified there, under the Astra service key the vault's
-/// hand-off pins, and the two credentials are exercised there. This command
-/// starts it and returns the first state it publishes.
-#[tauri::command]
-pub(crate) async fn start_astra_ca_tls_rotation(
-    state: State<'_, AppState>,
-    input: astra::RotationInput,
-) -> Result<aether::certificates::operator_ipc::AstraCaTlsStatus, String> {
-    state.astra.start(input).await
-}
-
-/// Takes the next step, once the operator says the requested key is plugged in.
-#[tauri::command]
-pub(crate) async fn continue_astra_ca_tls_rotation(
-    state: State<'_, AppState>,
-) -> Result<aether::certificates::operator_ipc::AstraCaTlsStatus, String> {
-    state
-        .astra
-        .advance(aether::certificates::operator_ipc::AstraIpcCommand::Continue)
-        .await
-}
-
-/// Abandons the ceremony, which only the phases before the first durable write
-/// accept.
-#[tauri::command]
-pub(crate) async fn cancel_astra_ca_tls_rotation(
-    state: State<'_, AppState>,
-) -> Result<aether::certificates::operator_ipc::AstraCaTlsStatus, String> {
-    state
-        .astra
-        .advance(aether::certificates::operator_ipc::AstraIpcCommand::Cancel)
-        .await
-}
-
-/// The ceremony's current state, for a view that was opened after it started.
-#[tauri::command]
-pub(crate) async fn astra_ca_tls_rotation_status(
-    state: State<'_, AppState>,
-) -> Result<aether::certificates::operator_ipc::AstraCaTlsStatus, String> {
-    Ok(state.astra.status().await)
-}
 
 /// Opens an operator ceremony for the operation the WebView names.
 ///

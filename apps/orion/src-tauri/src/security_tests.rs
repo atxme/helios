@@ -360,6 +360,42 @@ fn no_capability_launches_the_renewal_companion() {
     );
 }
 
+/// Orion no longer hands a rotation to `astra-signer`: the rotation screen
+/// runs the ceremony itself, and nothing here may start that binary again.
+#[test]
+fn orion_no_longer_spawns_astra_signer() {
+    // Split so this test's own scan does not match itself.
+    let program = concat!("astra", "-signer");
+    let launcher = concat!("spawn_", "astra_signer");
+    for (name, source) in [
+        ("launch.rs", include_str!("launch.rs")),
+        ("main.rs", include_str!("main.rs")),
+        (
+            "commands/ceremonies.rs",
+            include_str!("commands/ceremonies.rs"),
+        ),
+    ] {
+        let code = without_line_comments(source);
+        assert!(
+            !code.contains(launcher),
+            "{name} still defines or calls {launcher}"
+        );
+        assert!(
+            !code.contains(&format!("\"{program}\"")),
+            "{name} still names the {program} program"
+        );
+    }
+    let main = without_line_comments(include_str!("main.rs"));
+    assert!(
+        !main.contains("mod companion"),
+        "the companion launcher is gone"
+    );
+    assert!(
+        !main.contains("mod astra;"),
+        "the CA-TLS companion driver is gone"
+    );
+}
+
 #[test]
 fn association_only_forwards_orion_profiles() {
     let args = vec![
@@ -520,8 +556,8 @@ fn every_launch_checks_elevation_first() {
         );
     }
     assert!(
-        launches >= 2,
-        "the ssh terminal and the companion must both launch through `Command`, found {launches}"
+        launches >= 1,
+        "the ssh terminal must launch through `Command`, found {launches}"
     );
     // One launch per public function, and none anywhere else: a private helper
     // that spawned would sit in the chunk of the function above it, behind that

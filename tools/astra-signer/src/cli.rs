@@ -481,42 +481,6 @@ pub(crate) enum Command {
         #[arg(long, default_value_t = 1825)]
         validity_days: u64,
     },
-    /// Mène la rotation CA-TLS sous la conduite d'Orion, sans console (§9.4).
-    ///
-    /// Même cérémonie que `rotate-ca-tls`, et exactement les mêmes
-    /// vérifications : seules les invites changent de support. Orion tient une
-    /// socket loopback et un jeton à usage unique, ce compagnon s'y reconnecte
-    /// et n'y publie que des états publics. Le coffre, le PIN et le geste FIDO
-    /// ne quittent jamais ce processus.
-    ///
-    /// Les arguments sont composés par Orion, jamais saisis : la sous-commande
-    /// n'est pas destinée à une frappe manuelle.
-    #[command(hide = true)]
-    Orion {
-        /// API de la gateway dans le tunnel (§8.5).
-        #[arg(long)]
-        heliosd_url: String,
-        #[arg(long)]
-        operation_id: String,
-        /// Où écrire la transition signée, pour la porter sur la gateway.
-        #[arg(long)]
-        out: PathBuf,
-        /// Point d'écoute loopback ouvert par Orion.
-        #[arg(long)]
-        ipc_address: String,
-        /// Jeton d'authentification du canal, 32 octets en hexadécimal.
-        #[arg(long, env = "ASTRA_ORION_IPC_TOKEN", hide_env_values = true)]
-        ipc_token: String,
-        /// Délai avant `activation_at`, en jours.
-        #[arg(long, default_value_t = 7)]
-        prepare_days: u64,
-        /// Recouvrement pendant lequel les deux ancres sont acceptées.
-        #[arg(long, default_value_t = 30)]
-        overlap_days: u64,
-        /// Durée de vie de l'ancre entrante, en jours.
-        #[arg(long, default_value_t = 1825)]
-        validity_days: u64,
-    },
     /// Rejoue le dépôt d'une rotation préparée mais jamais déposée.
     ///
     /// La cérémonie écrit sa décision avant d'en parler à quiconque. Si la

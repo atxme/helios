@@ -77,8 +77,8 @@ export default function App() {
     RenewalProgress
   > | null>(null)
 
-  // What makes the tab live: a protocol-2 ceremony the helper is running, or
-  // the legacy CA-TLS rotation still in flight. Polled rather than pushed
+  // What makes the tab live: a ceremony the helper is running, or an operation
+  // waiting for the operator. Polled rather than pushed
   // because a ceremony outlives any one view, and an operator who switched
   // away must find it again where they left it.
   useEffect(() => {
@@ -86,19 +86,16 @@ export default function App() {
     const look = () => {
       void Promise.allSettled([
         api.operatorCeremonyStatus(),
-        api.astraCaTlsRotationStatus(),
         api.operatorPendingOperations(),
-      ]).then(([operator, legacy, pending]) => {
+      ]).then(([operator, pending]) => {
         if (cancelled) return
         const live =
           (operator.status === 'fulfilled' && operatorCeremonyIsLive(operator.value)) ||
-          (legacy.status === 'fulfilled' && legacy.value.phase !== 'idle') ||
           (pending.status === 'fulfilled' && pending.value.length > 0)
         if (live) {
           setAstraPending(true)
         } else if (
           operator.status === 'fulfilled' &&
-          legacy.status === 'fulfilled' &&
           pending.status === 'fulfilled'
         ) {
           // Only a complete observation may grey the entry. A transient

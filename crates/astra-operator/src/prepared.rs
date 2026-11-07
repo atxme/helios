@@ -35,10 +35,14 @@
 
 use std::path::{Path, PathBuf};
 
+use aether::certificates::encoding::DerCertificate;
 use aether::certificates::operator_ipc::AstraCaTlsManifest;
-use aether::certificates::status::AstraSignerResult;
+use aether::certificates::status::{AstraRotationCampaign, AstraSignerResult};
+use aether::certificates::window::TransitionWindow;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+
+use crate::signing::DomainIdentity;
 
 /// Name of the prepared-rotation file, beside the vault.
 pub const PREPARED_FILE: &str = "astra-prepared.json";
@@ -144,6 +148,34 @@ pub fn clear(path: &Path) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error).with_context(|| format!("suppression de {}", path.display())),
     }
+}
+
+/// The campaign summary a prepared record keeps.
+///
+/// One constructor for every terminal rotation: the manifest is what a resume
+/// names as approved, and two renderings of it could disagree about the very
+/// values that decide whether the ceremony should continue.
+pub fn manifest_of(
+    campaign: &AstraRotationCampaign,
+    identity: &DomainIdentity,
+    active_certificate: &DerCertificate,
+    window: TransitionWindow,
+) -> Result<AstraCaTlsManifest> {
+    Ok(AstraCaTlsManifest {
+        reason: campaign.reason.clone(),
+        requested_by: campaign.requested_by.clone(),
+        fingerprint: campaign.fingerprint().to_hex(),
+        current_ca_tls_epoch: identity.ca_tls_epoch,
+        next_ca_tls_epoch: identity
+            .ca_tls_epoch
+            .checked_add(1)
+            .context("époque CA-TLS hors bornes")?,
+        activation_at: window.activation_at,
+        not_after: window.not_after,
+        outgoing_anchor_fingerprint: active_certificate.fingerprint().to_hex(),
+        affected_ca: "client_tls".into(),
+        target_count: campaign.targets.len(),
+    })
 }
 
 #[cfg(test)]

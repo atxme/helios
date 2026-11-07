@@ -8,8 +8,6 @@ import type {
   VaultOverview,
   About,
   ApprovalManifest,
-  AstraRotationInput,
-  AstraRotationStatus,
   OperationLocator,
   OperatorAction,
   OperatorPendingOperation,
@@ -292,22 +290,6 @@ export const disconnect = () => invoke<void>('disconnect')
 
 /** Renews the ML-KEM PSK now, through the tunnel. */
 export const renewPsk = () => invoke<void>('renew_psk')
-
-/** Opens the Rust-owned, two-key CA-TLS signing ceremony. */
-export const startAstraCaTlsRotation = (input: AstraRotationInput) =>
-  invoke<AstraRotationStatus>('start_astra_ca_tls_rotation', { input })
-
-/** Advances the open ceremony after the requested security key was connected. */
-export const continueAstraCaTlsRotation = () =>
-  invoke<AstraRotationStatus>('continue_astra_ca_tls_rotation')
-
-/** Stops the open signer session without producing a transition. */
-export const cancelAstraCaTlsRotation = () =>
-  invoke<AstraRotationStatus>('cancel_astra_ca_tls_rotation')
-
-/** Restores or polls the Rust-owned ceremony after a view change. */
-export const astraCaTlsRotationStatus = () =>
-  invoke<AstraRotationStatus>('astra_ca_tls_rotation_status')
 
 /* Cérémonies opérateur (protocole 2). Le WebView ne nomme qu'un localisateur ;
  * l'origine, le RP ID, le domaine et la clé de service viennent du hand-off que

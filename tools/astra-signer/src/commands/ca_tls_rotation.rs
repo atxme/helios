@@ -190,7 +190,7 @@ pub(crate) fn rotate_ca_tls(
         // window survives its ceremony by days, and whatever resumes it — this
         // binary or the Orion companion — must be able to name what was
         // approved without re-fetching a campaign that is already closed.
-        manifest: Some(orion::manifest_of(
+        manifest: Some(prepared::manifest_of(
             &campaign,
             &identity,
             &active_certificate,

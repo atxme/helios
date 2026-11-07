@@ -820,3 +820,36 @@ fn adopting_again_returns_the_journal_in_place() {
         Some(journal)
     );
 }
+
+/// What the Orion ceremony of the previous build left: the same record, with
+/// no transition file when the rotation went through the tunnel. Resuming it
+/// asks for no key and reads the manifest it recorded.
+#[test]
+fn a_record_the_old_orion_ceremony_left_is_still_adopted() {
+    let domain = domain();
+    let (record, _) = legacy_prepared(&domain, true);
+    let prepared_path = prepared::path_beside(&domain.path);
+    prepared::save(
+        &prepared_path,
+        &PreparedRotation {
+            transition_path: String::new(),
+            ..record.clone()
+        },
+    )
+    .expect("record");
+
+    let journal = rotation_journal::adopt_legacy(&domain.path)
+        .expect("adopted")
+        .expect("a journal");
+    assert_eq!(
+        journal.next_anchor_fingerprint,
+        rotation_journal::load(&rotation_journal::path_beside(&domain.path))
+            .expect("load")
+            .expect("saved")
+            .next_anchor_fingerprint
+    );
+    let kept = prepared::load(&prepared_path).expect("load").expect("kept");
+    assert!(kept.adopted);
+    assert_eq!(kept.manifest, record.manifest);
+    assert!(kept.transition_path.is_empty());
+}

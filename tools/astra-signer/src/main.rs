@@ -100,7 +100,7 @@ use astra_operator::credentials;
 use astra_operator::gestures::{self, NewAuthority, NewKey};
 use astra_operator::signing::{self, DelegationBounds, IssuerDelegationRequest};
 use astra_operator::vault::{AuthorityVault, KeySlot, SlotRole, MAX_SLOTS, REQUIRED_SLOTS};
-use astra_operator::{authenticator, documents, handoff, orion, prepared, store, tunnel};
+use astra_operator::{authenticator, documents, handoff, prepared, store, tunnel};
 use clap::{Parser, Subcommand, ValueEnum};
 use zeroize::Zeroizing;
 
@@ -327,26 +327,6 @@ fn run() -> Result<()> {
             (prepare_days, overlap_days, validity_days),
             transport,
         ),
-        Command::Orion {
-            heliosd_url,
-            operation_id,
-            out,
-            ipc_address,
-            ipc_token,
-            prepare_days,
-            overlap_days,
-            validity_days,
-        } => orion::run_helper(orion::HelperOptions {
-            vault_path: path,
-            heliosd_url,
-            operation_id,
-            output_path: out,
-            ipc_address,
-            ipc_token: Zeroizing::new(ipc_token),
-            prepare_days,
-            overlap_days,
-            validity_days,
-        }),
         Command::ResumeRotation {
             authority_url,
             heliosd_url,

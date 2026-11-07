@@ -55,7 +55,6 @@ pub mod gestures;
 pub mod handoff;
 pub mod operations;
 pub mod origin;
-pub mod orion;
 pub mod overview;
 pub mod prepared;
 pub mod rotation_journal;

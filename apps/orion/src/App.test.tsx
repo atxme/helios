@@ -9,7 +9,6 @@ const mocks = vi.hoisted(() => ({
   vaultPosture: vi.fn(),
   useClient: vi.fn(),
   operatorCeremonyStatus: vi.fn(),
-  astraCaTlsRotationStatus: vi.fn(),
   beginOperatorCeremony: vi.fn(),
   operatorRotationsOverview: vi.fn(),
   operatorRotationJournal: vi.fn(),
@@ -23,7 +22,6 @@ vi.mock('./api', () => ({
   resizeForView: mocks.resizeForView,
   vaultPosture: mocks.vaultPosture,
   operatorCeremonyStatus: mocks.operatorCeremonyStatus,
-  astraCaTlsRotationStatus: mocks.astraCaTlsRotationStatus,
   beginOperatorCeremony: mocks.beginOperatorCeremony,
   operatorRotationsOverview: mocks.operatorRotationsOverview,
   operatorRotationJournal: mocks.operatorRotationJournal,
@@ -124,7 +122,6 @@ beforeEach(() => {
   // Nothing waits on the operator by default: Astra remains accessible and
   // simply carries no attention badge.
   mocks.operatorCeremonyStatus.mockResolvedValue(null)
-  mocks.astraCaTlsRotationStatus.mockResolvedValue({ phase: 'idle' })
   mocks.operatorPendingOperations.mockResolvedValue([])
   mocks.beginOperatorCeremony.mockResolvedValue({})
   mocks.operatorRotationsOverview.mockResolvedValue({ caPqOverlap: false })
