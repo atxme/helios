@@ -1251,6 +1251,22 @@ fn the_same_key_twice_at_approval_is_repeated() {
     assert_eq!(domain.touches(), touches);
 }
 
+/// The key still plugged in after the first approval: the platform is only offered
+/// the other one, so it answers as a stranger would, and the words must hold for both.
+#[test]
+fn the_key_that_already_approved_is_asked_to_make_way() {
+    let domain = domain();
+    let remote = domain.armed_remote();
+    let mut rotation = domain.opened(RotationKind::CaPq, &remote);
+    rotation.approve(&domain.keys[0], NOW).expect("first");
+    let refused = rotation
+        .approve(&domain.keys[0], NOW)
+        .expect_err("offered the other");
+    assert_eq!(refused, KeyStep::NotValidated);
+    assert_eq!(refused.to_string(), "autre clé attendue");
+    rotation.approve(&domain.keys[1], NOW).expect("second");
+}
+
 #[test]
 fn a_declined_approval_loses_nothing() {
     let domain = domain();
@@ -2285,7 +2301,7 @@ fn finishing_moves_the_vault_and_the_relay_then_clears_the_record_and_sends_the_
     let opening = finish.open(&domain.keys[1]).expect("one key");
     assert_eq!(domain.touches(), touches + 1);
     finish
-        .finish(&remote, &domain.path, &opening, not_after)
+        .finish(&remote, &domain.path, opening, not_after)
         .expect("finished");
 
     assert_eq!(domain.touches(), touches + 1, "one key, one touch");
@@ -2364,7 +2380,7 @@ fn a_stop_between_the_vault_and_the_relay_is_finished_by_the_next_press() {
     let finish = CaTlsFinish::begin(&domain.path, not_after).expect("still to finish");
     let opening = finish.open(&domain.keys[0]).expect("one key");
     finish
-        .finish(&remote, &domain.path, &opening, not_after)
+        .finish(&remote, &domain.path, opening, not_after)
         .expect("the relay is finished");
 
     assert_eq!(std::fs::read(&domain.path).expect("vault"), vault_bytes);
@@ -2393,7 +2409,7 @@ fn a_stop_between_the_relay_and_the_clearing_is_finished_by_the_next_press() {
     let finish = CaTlsFinish::begin(&domain.path, not_after).expect("ready");
     let opening = finish.open(&domain.keys[0]).expect("one key");
     finish
-        .finish(&remote, &domain.path, &opening, not_after)
+        .finish(&remote, &domain.path, opening, not_after)
         .expect("finished");
     let relay = domain.relay();
     prepared::save(&prepared::path_beside(&domain.path), &record).expect("put back");
@@ -2401,7 +2417,7 @@ fn a_stop_between_the_relay_and_the_clearing_is_finished_by_the_next_press() {
     let finish = CaTlsFinish::begin(&domain.path, not_after).expect("still to finish");
     let opening = finish.open(&domain.keys[0]).expect("one key");
     finish
-        .finish(&remote, &domain.path, &opening, not_after)
+        .finish(&remote, &domain.path, opening, not_after)
         .expect("finished again");
 
     assert_eq!(domain.relay(), relay);
@@ -2462,7 +2478,7 @@ fn what_moved_during_the_touch_stops_the_finish() {
     std::fs::write(&journal_path, b"{}").expect("a journal appears");
     let files = domain.files();
     let refused = finish
-        .finish(&remote, &domain.path, &opening, not_after)
+        .finish(&remote, &domain.path, opening, not_after)
         .expect_err("refused");
     assert!(matches!(
         refusal_of_finish(&refused),
@@ -2478,7 +2494,7 @@ fn what_moved_during_the_touch_stops_the_finish() {
     store::save(&domain.path, &moved).expect("saved");
     let files = domain.files();
     let refused = finish
-        .finish(&remote, &domain.path, &opening, not_after)
+        .finish(&remote, &domain.path, opening, not_after)
         .expect_err("refused");
     assert!(matches!(refusal_of_finish(&refused), FinishRefusal::Moved));
     assert_eq!(domain.files(), files);
@@ -2575,7 +2591,7 @@ fn a_record_naming_another_certificate_moves_nothing() {
         let finish = CaTlsFinish::begin(&domain.path, not_after).expect("readable");
         let opening = finish.open(&domain.keys[0]).expect("one key");
         let refused = finish
-            .finish(&remote, &domain.path, &opening, not_after)
+            .finish(&remote, &domain.path, opening, not_after)
             .expect_err("refused");
 
         assert!(
@@ -2606,7 +2622,7 @@ fn a_key_outside_the_vault_is_turned_down_and_another_can_finish() {
         .finish(
             &Remote::watching(&domain.path),
             &domain.path,
-            &opening,
+            opening,
             not_after,
         )
         .expect("finished");
@@ -2625,7 +2641,7 @@ fn a_copy_refused_or_held_back_does_not_undo_the_finish() {
         let finish = CaTlsFinish::begin(&domain.path, not_after).expect("ready");
         let opening = finish.open(&domain.keys[0]).expect("one key");
         finish
-            .finish(&remote, &domain.path, &opening, not_after)
+            .finish(&remote, &domain.path, opening, not_after)
             .expect("finished");
 
         assert!(remote.called("send_vault_copy"));

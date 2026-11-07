@@ -303,12 +303,10 @@ pub fn allowed_actions(remote: RemoteState, gesture: GestureState) -> Vec<Operat
         return Vec::new();
     }
     let mut actions = Vec::new();
-    // Nothing is open at `Local` and `Idle`: the keys are validated, and the
-    // operator's approval is what opens the campaign.
     if matches!(gesture, GestureState::AwaitingKey { .. })
         || matches!(
             (remote, gesture),
-            (RemoteState::Prepared, GestureState::Idle) | (RemoteState::Local, GestureState::Idle)
+            (RemoteState::Prepared, GestureState::Idle)
         )
     {
         actions.push(OperatorAction::Continue);
@@ -429,8 +427,14 @@ pub enum Refusal {
     GatewayNamesNoAnchor,
     /// A rotation stands in the way, or is not at the step this gesture takes.
     RotationInFlight,
-    /// A key of the vault, but not one of the two validated for this ceremony.
+    /// The key that answered is not the one this step can take: outside the two
+    /// validated, or one that has already approved.
     KeyNotValidated,
+    /// The approval screen's terms are outside what a rotation accepts. Nothing was
+    /// sent, and the screen stays.
+    TermsRefused,
+    /// No client TLS rotation is waiting to end.
+    NothingToFinish,
     /// Anything the ceremony could not classify. Deliberately last and
     /// deliberately opaque: an unclassified failure must not become a channel
     /// for text.
@@ -758,8 +762,9 @@ pub struct OperatorStatus {
     pub keys: Vec<KeySlotLabel>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refusal: Option<Refusal>,
-    /// Why the last key was turned down, on a status still asking for one.
-    /// Distinct from [`Self::refusal`], which ends the ceremony: this ends nothing.
+    /// Why the last answer was turned down, on a status still asking for another: a
+    /// key, or a rotation's terms. Distinct from [`Self::refusal`], which ends the
+    /// ceremony: this ends nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_retry: Option<Refusal>,
 }
@@ -899,12 +904,13 @@ mod tests {
         );
     }
 
-    /// Both keys validated, nothing open yet: the operator approves or abandons.
+    /// Both keys validated, nothing open yet. Approving takes its terms and has a
+    /// command of its own, so a Continue offered here could only be refused.
     #[test]
     fn the_wait_for_the_terms_may_be_answered_and_abandoned() {
         assert_eq!(
             allowed_actions(RemoteState::Local, GestureState::Idle),
-            vec![OperatorAction::Continue, OperatorAction::Cancel]
+            vec![OperatorAction::Cancel]
         );
     }
 
@@ -955,6 +961,8 @@ mod tests {
             (Refusal::GatewayNamesNoAnchor, "gateway_names_no_anchor"),
             (Refusal::RotationInFlight, "rotation_in_flight"),
             (Refusal::KeyNotValidated, "key_not_validated"),
+            (Refusal::TermsRefused, "terms_refused"),
+            (Refusal::NothingToFinish, "nothing_to_finish"),
         ] {
             assert_eq!(
                 serde_json::to_value(refusal).expect("refusal"),

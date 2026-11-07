@@ -507,7 +507,11 @@ export function refusalSentence(refusal: Refusal): string {
     case 'rotation_in_flight':
       return 'Rotation en cours. La mener à son terme d’abord.'
     case 'key_not_validated':
-      return 'Clé non validée.'
+      return 'Autre clé attendue.'
+    case 'terms_refused':
+      return 'Durées hors limites. Rien n’a été envoyé.'
+    case 'nothing_to_finish':
+      return 'Aucune rotation à terminer.'
     case 'internal':
       return 'Le processus opérateur s’est arrêté sans conclure.'
   }

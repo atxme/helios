@@ -8,13 +8,12 @@
 //!
 //! The openings two validated keys released are held for the length of a screen the
 //! operator may walk away from, and neither [`ValidatedKeys`] nor [`OpenedRotation`]
-//! has a clock. [`Openings`] is what bounds them: it cannot cross a thread, and
+//! has a clock. Neither can cross a thread, and [`Openings`] is what bounds them:
 //! every way out of a ceremony erases it, abandoned, failed, finished, or idle for
 //! [`VALIDATION_IDLE_SECS`]. No status carries more than a label.
 
-use std::marker::PhantomData;
 use std::path::Path;
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
 use std::time::{Duration, Instant};
 
 use aether::certificates::encoding::Id16;
@@ -121,19 +120,18 @@ enum Held {
 
 /// The vault openings of the ceremony in progress.
 ///
-/// The marker removes `Send` and `Sync`: what unwraps the vault cannot leave the
-/// ceremony's thread, whatever a later change would like to do with it. Neither
-/// `Debug` nor `Serialize` is implemented, for the same reason.
+/// Neither `Send` nor `Sync`, through [`ValidatedKeys`]: what unwraps the vault cannot
+/// leave the ceremony's thread, whatever a later change would like to do with it.
+/// Neither `Debug` nor `Serialize` is implemented, for the same reason. The one opening
+/// of « Terminer » is not held here: it lives in that function, and `finish` consumes it.
 struct Openings {
     held: Held,
-    _thread: PhantomData<*const ()>,
 }
 
 impl Openings {
     fn none() -> Self {
         Self {
             held: Held::Nothing,
-            _thread: PhantomData,
         }
     }
 
@@ -160,6 +158,8 @@ struct RotationRun<'a> {
     reach: &'a Reach<'a>,
     openings: Openings,
     until: Option<u64>,
+    /// When the operator last pressed, on both clocks.
+    last_press: Option<(u64, Instant)>,
 }
 
 impl RotationRun<'_> {
@@ -178,6 +178,7 @@ impl RotationRun<'_> {
             reach,
             openings: Openings::none(),
             until: None,
+            last_press: None,
         }
     }
 
@@ -205,7 +206,7 @@ impl RotationRun<'_> {
         self.openings.held = Held::Keys(keys);
 
         self.validate_keys()?;
-        let terms = self.await_terms()?;
+        let terms = self.await_terms(kind)?;
         self.open_campaign(kind, &terms)?;
         self.approve_campaign()?;
         let journal = self.sign()?;
@@ -235,16 +236,28 @@ impl RotationRun<'_> {
         Ok(())
     }
 
-    /// The approval screen. Nothing exists at the authority yet.
-    fn await_terms(&mut self) -> Step<RotationTerms> {
+    /// The approval screen. Nothing exists at the authority yet, so terms it would
+    /// refuse cost nothing: the screen stays, and so do both keys.
+    fn await_terms(&mut self, kind: RotationKind) -> Step<RotationTerms> {
+        self.honour_cancel()?;
         self.ceremony.gesture = GestureState::Idle;
         self.ceremony.remote = RemoteState::Local;
-        let patience = self.patience();
-        let offered = self.show();
         loop {
-            let press = self.await_press(&offered, &patience)?;
-            if let Some(terms) = press.terms {
-                return Ok(terms);
+            let patience = self.patience();
+            let offered = self.show();
+            let press = self.await_press(&offered, &patience, answers_the_terms)?;
+            let Some(terms) = press.terms else {
+                continue;
+            };
+            match rotation::check_terms(kind, &terms, self.now()) {
+                Ok(()) => {
+                    self.ceremony.key_retry = None;
+                    return Ok(terms);
+                }
+                Err(error) => {
+                    tracing::warn!(error = %format!("{error:#}"), "durées de rotation refusées");
+                    self.ceremony.key_retry = Some(Refusal::TermsRefused);
+                }
             }
         }
     }
@@ -253,8 +266,6 @@ impl RotationRun<'_> {
         self.ceremony.gesture = GestureState::Verifying;
         self.show();
         let now = self.now();
-        rotation::check_terms(kind, terms, now)
-            .map_err(|error| self.refuse(Refusal::ManifestMismatch, format!("{error:#}")))?;
         let Held::Keys(keys) = self.openings.take() else {
             return Err(self.nothing_held());
         };
@@ -290,6 +301,8 @@ impl RotationRun<'_> {
     }
 
     fn sign(&mut self) -> Step<RotationJournal> {
+        // The last moment: `Signing` offers no way back.
+        self.honour_cancel()?;
         self.ceremony.gesture = GestureState::Signing;
         self.show();
         let Held::Campaign(opened) = self.openings.take() else {
@@ -320,7 +333,7 @@ impl RotationRun<'_> {
     fn carry(&mut self, mut journal: RotationJournal) -> Step<()> {
         let now = self.now();
         let advanced = rotation::advance(self.reach.remote, self.vault_path, &mut journal, now);
-        if journal.stage != JournalStage::Signed && self.ceremony.remote != RemoteState::Deposited {
+        if is_deposited(&journal) && self.ceremony.remote != RemoteState::Deposited {
             self.ceremony.remote = RemoteState::Deposited;
             self.show();
         }
@@ -356,9 +369,10 @@ impl RotationRun<'_> {
         };
         self.ceremony.operation_id = journal.deposit.as_ref().map(|deposit| deposit.operation_id);
         // Never `Prepared` and `Idle`, which would offer a press this run does not read.
-        (self.ceremony.remote, self.ceremony.gesture) = match journal.stage {
-            JournalStage::Signed => (RemoteState::Prepared, GestureState::Signing),
-            _ => (RemoteState::Deposited, GestureState::Idle),
+        (self.ceremony.remote, self.ceremony.gesture) = if is_deposited(&journal) {
+            (RemoteState::Deposited, GestureState::Idle)
+        } else {
+            (RemoteState::Prepared, GestureState::Signing)
         };
         self.show();
         self.carry(journal)
@@ -379,14 +393,13 @@ impl RotationRun<'_> {
                 Err(step) => self.turned_down(step)?,
             }
         };
+        self.honour_cancel()?;
         self.ceremony.key_retry = None;
         self.ceremony.gesture = GestureState::Signing;
         self.show();
 
         let now = self.now();
-        let finished = finish.finish(self.reach.remote, self.vault_path, &opening, now);
-        drop(opening);
-        match finished {
+        match finish.finish(self.reach.remote, self.vault_path, opening, now) {
             Ok(()) => {
                 self.done();
                 Ok(())
@@ -402,10 +415,11 @@ impl RotationRun<'_> {
     /// costs nothing that was already validated, so it asks again rather than ending.
     fn ask_key(&mut self, index: u8, of: u8, purpose: KeyPurpose) -> Step<Box<dyn Authenticator>> {
         loop {
+            self.honour_cancel()?;
             self.ceremony.gesture = GestureState::AwaitingKey { index, of, purpose };
             let patience = self.patience();
             let offered = self.show();
-            let press = self.await_press(&offered, &patience)?;
+            let press = self.await_press(&offered, &patience, answers_the_screen)?;
 
             self.ceremony.key_retry = None;
             self.ceremony.gesture = GestureState::ProcessingKey { index, of };
@@ -440,17 +454,40 @@ impl RotationRun<'_> {
         Ok(())
     }
 
+    /// Reads what came in while this thread was busy, before the screen it was busy on
+    /// is left. That screen offered Cancel, and the next one has a revision of its own
+    /// that would lose it. Run before anything is published: the revision is that
+    /// screen's. Anything else in the queue answers a screen already gone.
+    fn honour_cancel(&mut self) -> Step<()> {
+        let left = self.ceremony.revision;
+        loop {
+            match self.presses.try_recv() {
+                Ok(press) if press.action == OperatorAction::Cancel && press.revision == left => {
+                    return Err(self.cancel());
+                }
+                Ok(_) => {}
+                Err(TryRecvError::Empty) => return Ok(()),
+                Err(TryRecvError::Disconnected) => return Err(self.cancel()),
+            }
+        }
+    }
+
     /// Waits for the operator's answer to one status, for as long as `patience` allows.
     ///
-    /// A press naming another revision answers a screen already left, and is ignored.
+    /// A press `takes` does not want answers a screen already left, and is ignored.
     /// Every sender gone means the window holding the ceremony was closed.
-    fn await_press(&mut self, offered: &OperatorStatus, patience: &Patience) -> Step<Press> {
+    fn await_press(
+        &mut self,
+        offered: &OperatorStatus,
+        patience: &Patience,
+        takes: fn(&OperatorStatus, &Press) -> bool,
+    ) -> Step<Press> {
         loop {
             if patience.is_over(self.now()) {
                 return Err(self.expired());
             }
             match self.presses.recv_timeout(WAIT_TICK) {
-                Ok(press) if offered.accepts(press.action, press.revision) => {
+                Ok(press) if takes(offered, &press) => {
                     if press.action == OperatorAction::Cancel {
                         return Err(self.cancel());
                     }
@@ -458,6 +495,7 @@ impl RotationRun<'_> {
                     if patience.is_over(self.now()) {
                         return Err(self.expired());
                     }
+                    self.last_press = Some((self.now(), Instant::now()));
                     return Ok(press);
                 }
                 Ok(_) | Err(RecvTimeoutError::Timeout) => {}
@@ -466,11 +504,16 @@ impl RotationRun<'_> {
         }
     }
 
-    /// Taken before the status it bounds is published: a wait begins as it is offered.
+    /// Counted from the last press rather than from this offer: a dialog that timed
+    /// out with nobody there buys no more time. Taken before the status it bounds is
+    /// published, for the first wait, which begins as it is offered.
     fn patience(&self) -> Patience {
+        let (since, started) = self
+            .last_press
+            .unwrap_or_else(|| (self.now(), Instant::now()));
         Patience {
-            since: self.now(),
-            started: Instant::now(),
+            since,
+            started,
             until: self.until,
         }
     }
@@ -523,6 +566,24 @@ impl RotationRun<'_> {
     }
 }
 
+fn answers_the_screen(status: &OperatorStatus, press: &Press) -> bool {
+    status.accepts(press.action, press.revision)
+}
+
+/// The approval screen offers only Cancel in `allowed`: the terms have a command of
+/// their own, which is the one way a press there carries them.
+fn answers_the_terms(status: &OperatorStatus, press: &Press) -> bool {
+    press.revision == status.revision
+        && (press.action == OperatorAction::Cancel
+            || (press.action == OperatorAction::Continue && press.terms.is_some()))
+}
+
+/// Whether the authority is known to hold the deposit: past `Signed`, except for an
+/// adoption that nothing has confirmed, and that may yet prove a conflict.
+fn is_deposited(journal: &RotationJournal) -> bool {
+    journal.stage != JournalStage::Signed && !journal.awaits_confirmation()
+}
+
 fn refusal_of_open(error: &anyhow::Error) -> Refusal {
     if tunnel::is_unreachable(error) {
         return Refusal::GatewayUnavailable;
@@ -569,7 +630,8 @@ fn refusal_of_finish(error: &anyhow::Error) -> Option<Refusal> {
         .downcast_ref::<FinishRefusal>()
         .map(|refusal| match refusal {
             FinishRefusal::InFlight | FinishRefusal::NotYet { .. } => Refusal::RotationInFlight,
-            FinishRefusal::Nothing | FinishRefusal::Moved => Refusal::DomainChanged,
+            FinishRefusal::Nothing => Refusal::NothingToFinish,
+            FinishRefusal::Moved => Refusal::DomainChanged,
             FinishRefusal::Mismatch => Refusal::HandoffMismatch,
         })
 }

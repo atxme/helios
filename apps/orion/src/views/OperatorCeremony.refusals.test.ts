@@ -64,7 +64,11 @@ describe('refusalSentence for the issuer delegation', () => {
     expect(refusalSentence({ refusal: 'rotation_in_flight' })).toBe(
       'Rotation en cours. La mener à son terme d’abord.',
     )
-    expect(refusalSentence({ refusal: 'key_not_validated' })).toBe('Clé non validée.')
+    expect(refusalSentence({ refusal: 'key_not_validated' })).toBe('Autre clé attendue.')
+    expect(refusalSentence({ refusal: 'terms_refused' })).toBe(
+      'Durées hors limites. Rien n’a été envoyé.',
+    )
+    expect(refusalSentence({ refusal: 'nothing_to_finish' })).toBe('Aucune rotation à terminer.')
   })
 
   it('a_gateway_naming_no_anchor_does_not_give_an_update_as_its_only_cause', () => {

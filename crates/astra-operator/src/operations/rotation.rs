@@ -31,6 +31,7 @@
 //! tried again, [`ResumeStep`] for a rotation that stopped, and neither is a failure
 //! of the rotation.
 
+use std::marker::PhantomData;
 use std::path::Path;
 
 use aether::certificates::approval::CredentialRegistry;
@@ -96,8 +97,9 @@ pub enum KeyStep {
     /// This key has already answered: two touches of one token are not two people.
     #[error("clé déjà utilisée")]
     Repeated,
-    /// A key of the vault, but not one of the two validated for this ceremony.
-    #[error("clé non validée")]
+    /// Not a key this step can take: outside the two validated, or one that has
+    /// approved already, which the platform cannot tell apart once it is not offered.
+    #[error("autre clé attendue")]
     NotValidated,
     /// No key answered, or the operator cancelled the gesture.
     #[error("geste de la clé annulé")]
@@ -180,9 +182,13 @@ impl RotationRemote for Tunnel {
 /// The keys proved so far, and what each one released.
 ///
 /// Dropping it wipes the openings, which is what abandoning a ceremony comes to.
+///
+/// The marker removes `Send` and `Sync` from it and from whatever holds it, so these
+/// openings stay on the thread of the ceremony that asked for them.
 pub struct ValidatedKeys {
     vault: AuthorityVault,
     openings: Vec<Opened>,
+    _thread: PhantomData<*const ()>,
 }
 
 impl ValidatedKeys {
@@ -190,6 +196,7 @@ impl ValidatedKeys {
         Ok(Self {
             vault: store::load(vault_path)?,
             openings: Vec::with_capacity(ANCHOR_ROTATION_CREDENTIALS),
+            _thread: PhantomData,
         })
     }
 
@@ -664,6 +671,7 @@ impl OpenedRotation {
         let ValidatedKeys {
             mut vault,
             openings,
+            ..
         } = keys;
         let LocalDomain {
             mut relay,
@@ -978,11 +986,14 @@ impl CaTlsFinish {
     /// that state finishes the relay, once the vault proves it holds that certificate.
     /// As after a rotation, a copy that fails undoes nothing: the prerequisite reads
     /// what Astra holds, and the screen offers to send it (spec §5.9).
+    ///
+    /// Takes the opening so as to wipe it before the copy, a network call nothing in
+    /// it is needed for.
     pub fn finish(
         self,
         remote: &dyn RotationRemote,
         vault_path: &Path,
-        opening: &Opened,
+        opening: Opened,
         now: u64,
     ) -> Result<()> {
         let Self {
@@ -996,8 +1007,8 @@ impl CaTlsFinish {
         if store::load(vault_path)?.fingerprint()? != vault.fingerprint()? {
             return Err(FinishRefusal::Moved.into());
         }
-        ensure_vault_holds(&vault, opening, &incoming)?;
-        match signing::advance_ca_tls(&mut vault, opening, now)? {
+        ensure_vault_holds(&vault, &opening, &incoming)?;
+        match signing::advance_ca_tls(&mut vault, &opening, now)? {
             CaTlsAdvance::Rotated { .. } => store::save(vault_path, &vault)?,
             CaTlsAdvance::Idle => {}
             CaTlsAdvance::Awaiting { at } => return Err(FinishRefusal::NotYet { at }.into()),
@@ -1007,6 +1018,7 @@ impl CaTlsFinish {
         relay.ca_tls_certificate = Some(record.next_ca_tls_certificate);
         handoff::save(&handoff::path_beside(vault_path), &relay)?;
         prepared::clear(&prepared::path_beside(vault_path))?;
+        drop(opening);
         let _ = vault_copy(vault_path).and_then(|copy| remote.send_vault_copy(&copy));
         Ok(())
     }

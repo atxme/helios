@@ -259,7 +259,7 @@ impl RotationJournal {
 
     /// An adoption nothing has confirmed: no deposit to show for it, and Astra
     /// has not been heard naming its anchor.
-    fn awaits_confirmation(&self) -> bool {
+    pub fn awaits_confirmation(&self) -> bool {
         self.deposit.is_none() && self.stage == JournalStage::Accepted
     }
 }

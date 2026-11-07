@@ -169,10 +169,13 @@ impl Authenticator for TestKey {
     fn approve(
         &self,
         rp_id: &str,
-        _credentials: &[Vec<u8>],
+        credentials: &[Vec<u8>],
         client_data_json: &[u8],
         _pin: &str,
     ) -> aether_fido::authenticator::Result<Approval> {
+        if !credentials.contains(&self.credential_id()) {
+            return Err(AuthenticatorError::UnknownCredential);
+        }
         let credential_id = self.answer()?;
         let digest = |bytes: &[u8]| {
             aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, bytes)
@@ -528,6 +531,7 @@ impl Ran {
 enum Answer {
     Nothing,
     Press(Press),
+    Presses(Vec<Press>),
     /// The window is closed: every sender is gone.
     Close,
 }
@@ -739,6 +743,13 @@ impl Bench {
                 Answer::Press(press) => {
                     if let Some(sender) = &sender {
                         sender.send(press).expect("sent");
+                    }
+                }
+                Answer::Presses(presses) => {
+                    if let Some(sender) = &sender {
+                        for press in presses {
+                            sender.send(press).expect("sent");
+                        }
                     }
                 }
                 Answer::Close => sender = None,
@@ -1072,6 +1083,31 @@ fn a_campaign_dead_at_the_touch_expires() {
     assert!(bench.journal().is_none());
 }
 
+/// The platform only offers the key not yet used, so the one still plugged in answers
+/// that it is not among them, though it was validated: the words must hold for it.
+#[test]
+fn the_key_that_already_approved_asks_for_another() {
+    let bench = bench();
+    let mut tried = false;
+    let ran = bench.drive(RotationGesture::ReplaceCaPq, |status, bench| {
+        if awaits_approval(status, 2) {
+            if !tried {
+                tried = true;
+                assert_eq!(status.key_retry, None);
+                bench.plug(1);
+                return proceed(status);
+            }
+            assert_eq!(status.key_retry, Some(Refusal::KeyNotValidated));
+            assert!(status.accepts(OperatorAction::Continue, status.revision));
+            bench.plug(0);
+            return proceed(status);
+        }
+        Bench::all_the_way(status, bench)
+    });
+    ran.done();
+    assert!(tried);
+}
+
 // Abandoning.
 
 /// Each stage a key or a press is waited on. Nothing was signed, and nothing moved.
@@ -1119,25 +1155,270 @@ fn a_dropped_ceremony_at_each_stage_erases() {
     }
 }
 
-// Opening.
+// A press that arrives while the thread is busy.
+
+/// `allowed` offers Cancel during a key call, and nothing reads it until the call
+/// returns. The next screen has a revision of its own, which would lose it.
+#[test]
+fn a_cancel_sent_during_a_key_call_is_honoured_when_it_returns() {
+    for during in 0..4u32 {
+        let bench = bench();
+        let before = bench.vault_bytes();
+        let mut seen = 0;
+        let ran = bench.drive(RotationGesture::ReplaceCaTls, |status, bench| {
+            if matches!(status.gesture, GestureState::ProcessingKey { .. }) {
+                seen += 1;
+                if seen == during + 1 {
+                    assert!(status.allowed.contains(&OperatorAction::Cancel));
+                    return cancel_it(status);
+                }
+                return Answer::Nothing;
+            }
+            Bench::all_the_way(status, bench)
+        });
+        ran.cancelled();
+        assert_eq!(bench.touches(), during + 1, "that touch, and no other");
+        let before_the_end = &ran.published[ran.published.len() - 2];
+        assert!(
+            matches!(before_the_end.gesture, GestureState::ProcessingKey { .. }),
+            "no other screen at {during}: {:?}",
+            before_the_end.gesture
+        );
+        assert!(bench.journal().is_none());
+        assert_eq!(bench.vault_bytes(), before);
+    }
+}
 
 #[test]
-fn terms_that_would_be_refused_open_nothing() {
+fn a_cancel_sent_during_the_opening_is_honoured_when_it_returns() {
     let bench = bench();
     let ran = bench.drive(RotationGesture::ReplaceCaPq, |status, bench| {
-        if awaits_terms(status) {
-            return approve_it(
-                status,
-                RotationTerms {
-                    prepare_days: 0,
-                    ..terms()
-                },
-            );
+        if status.gesture == GestureState::Verifying && status.keys.len() == 2 {
+            assert!(status.allowed.contains(&OperatorAction::Cancel));
+            return cancel_it(status);
         }
         Bench::all_the_way(status, bench)
     });
-    ran.refused(Refusal::ManifestMismatch);
-    assert!(!bench.remote.called("authority_status"));
+    ran.cancelled();
+    assert!(bench.remote.called("open_campaign"));
+    assert!(!ran.purpose_asked(KeyPurpose::ApproveCampaign));
+    assert_eq!(bench.touches(), 2);
+}
+
+/// A key turned down, or none in reach: the operator has left, and no retry is due.
+#[test]
+fn a_cancel_sent_during_a_key_that_fails_is_honoured() {
+    for reachable in [true, false] {
+        let bench = bench();
+        let ran = bench.drive(RotationGesture::ReplaceCaPq, |status, bench| {
+            if awaits_validation(status, 1) {
+                if status.key_retry.is_some() {
+                    return cancel_it(status);
+                }
+                bench.plug(STRANGER);
+                if !reachable {
+                    *bench.unreachable.lock().expect("lock") = Some(Refusal::KeyDeclined);
+                }
+                return proceed(status);
+            }
+            if matches!(status.gesture, GestureState::ProcessingKey { .. }) {
+                return cancel_it(status);
+            }
+            Answer::Nothing
+        });
+        ran.cancelled();
+        assert!(ran
+            .published
+            .iter()
+            .all(|status| status.key_retry.is_none()));
+    }
+}
+
+#[test]
+fn a_cancel_sent_during_the_touch_of_the_finish_moves_nothing() {
+    let bench = bench();
+    let record = bench.rotated_client_tls();
+    let (vault, relay) = (bench.vault_bytes(), bench.relay());
+    let ran = bench.drive(RotationGesture::FinishCaTls, |status, bench| {
+        if matches!(status.gesture, GestureState::ProcessingKey { .. }) {
+            return cancel_it(status);
+        }
+        Bench::all_the_way(status, bench)
+    });
+    ran.cancelled();
+    assert!(ran
+        .published
+        .iter()
+        .all(|status| status.gesture != GestureState::Signing));
+    assert_eq!(bench.vault_bytes(), vault);
+    assert_eq!(bench.relay(), relay);
+    assert_eq!(bench.record(), Some(record));
+}
+
+/// Only the screen just left: an older revision was answering something else.
+#[test]
+fn a_cancel_naming_an_older_screen_stays_ignored() {
+    let bench = bench();
+    let mut sent = false;
+    let ran = bench.drive(RotationGesture::ReplaceCaPq, |status, bench| {
+        if matches!(status.gesture, GestureState::ProcessingKey { .. }) && !sent {
+            sent = true;
+            return Answer::Press(Press {
+                action: OperatorAction::Cancel,
+                revision: status.revision - 1,
+                owner: 0,
+                terms: None,
+            });
+        }
+        Bench::all_the_way(status, bench)
+    });
+    ran.done();
+}
+
+/// Nobody touched anything: a dialog closing by itself buys no more time, with a
+/// key already holding an opening.
+#[test]
+fn a_dialog_that_timed_out_does_not_restart_the_bound() {
+    for at_the_key in [true, false] {
+        let bench = bench();
+        let ran = bench.drive(RotationGesture::ReplaceCaPq, |status, bench| {
+            if awaits_validation(status, 1) {
+                bench.plug(0);
+                return proceed(status);
+            }
+            if awaits_validation(status, 2) {
+                if status.key_retry.is_some() {
+                    // Too late, and it must not count: the bound passed before it.
+                    return cancel_it(status);
+                }
+                bench.plug(1);
+                bench
+                    .touch_ends_at
+                    .store(NOW + VALIDATION_IDLE_SECS, Ordering::SeqCst);
+                if at_the_key {
+                    bench.keys[1].declines.store(true, Ordering::SeqCst);
+                } else {
+                    *bench.unreachable.lock().expect("lock") = Some(Refusal::KeyDeclined);
+                }
+                return proceed(status);
+            }
+            Answer::Nothing
+        });
+        ran.refused(Refusal::WindowExpired);
+        assert_eq!(bench.keys[1].touches.load(Ordering::SeqCst), 0);
+    }
+}
+
+/// A press is the operator being there: the bound counts from the last one.
+#[test]
+fn a_press_restarts_the_bound() {
+    let bench = bench();
+    let mut pressed = false;
+    let ran = bench.drive(RotationGesture::ReplaceCaPq, |status, bench| {
+        if !awaits_validation(status, 1) {
+            return Answer::Nothing;
+        }
+        if !pressed {
+            pressed = true;
+            bench.set_clock(NOW + VALIDATION_IDLE_SECS - 1);
+            *bench.unreachable.lock().expect("lock") = Some(Refusal::KeyDeclined);
+            return proceed(status);
+        }
+        bench.set_clock(NOW + 2 * VALIDATION_IDLE_SECS - 2);
+        cancel_it(status)
+    });
+    ran.cancelled();
+}
+
+// Opening.
+
+fn out_of_bounds() -> RotationTerms {
+    RotationTerms {
+        prepare_days: 0,
+        ..terms()
+    }
+}
+
+/// Refused terms sent nothing and took nothing: the screen stays, and so do both keys.
+#[test]
+fn refused_terms_keep_the_keys_and_a_corrected_answer_needs_no_further_touch() {
+    let bench = bench();
+    let mut refused = 0;
+    let ran = bench.drive(RotationGesture::ReplaceCaPq, |status, bench| {
+        if awaits_terms(status) {
+            if status.key_retry.is_none() {
+                return approve_it(status, out_of_bounds());
+            }
+            refused += 1;
+            assert_eq!(status.key_retry, Some(Refusal::TermsRefused));
+            assert_eq!(status.refusal, None);
+            assert!(!status.gesture.is_terminal());
+            assert_eq!(status.manifest, None);
+            let labels: Vec<_> = status.keys.iter().map(|key| key.label.as_str()).collect();
+            assert_eq!(labels, ["Clé 1", "Clé 2"]);
+            assert_eq!(bench.touches(), 2);
+            assert!(!bench.remote.called("authority_status"));
+            assert!(!bench.remote.called("open_campaign"));
+            if refused == 1 {
+                return approve_it(status, out_of_bounds());
+            }
+            return approve_it(status, terms());
+        }
+        if awaits_approval(status, 1) {
+            assert_eq!(status.key_retry, None, "answered");
+            assert_eq!(bench.touches(), 2, "no further validation");
+        }
+        Bench::all_the_way(status, bench)
+    });
+    ran.done();
+    assert_eq!(refused, 2);
+    assert_eq!(bench.touches(), 4);
+}
+
+#[test]
+fn refused_terms_wait_under_the_same_bound() {
+    let bench = bench();
+    let ran = bench.drive(RotationGesture::ReplaceCaPq, |status, bench| {
+        if awaits_terms(status) {
+            if status.key_retry.is_none() {
+                return approve_it(status, out_of_bounds());
+            }
+            bench.set_clock(bench.clock.load(Ordering::SeqCst) + VALIDATION_IDLE_SECS);
+            return Answer::Nothing;
+        }
+        Bench::all_the_way(status, bench)
+    });
+    ran.refused(Refusal::WindowExpired);
+    assert!(!bench.remote.called("open_campaign"));
+}
+
+/// `allowed` decides what the window draws, and only `approve_rotation` carries terms.
+#[test]
+fn the_approval_screen_offers_only_cancel_and_takes_only_terms() {
+    let bench = bench();
+    let ran = bench.drive(RotationGesture::ReplaceCaPq, |status, bench| {
+        if awaits_terms(status) {
+            assert_eq!(status.allowed, [OperatorAction::Cancel]);
+            let with = |terms, revision| Press {
+                action: OperatorAction::Continue,
+                revision,
+                owner: 0,
+                terms,
+            };
+            return Answer::Presses(vec![
+                with(None, status.revision),
+                with(Some(terms()), status.revision - 1),
+                Press {
+                    action: OperatorAction::Cancel,
+                    revision: status.revision,
+                    owner: 0,
+                    terms: None,
+                },
+            ]);
+        }
+        Bench::all_the_way(status, bench)
+    });
+    ran.cancelled();
     assert!(!bench.remote.called("open_campaign"));
 }
 
@@ -1471,6 +1752,107 @@ fn a_journal_it_cannot_read_stops_the_resumption() {
     assert!(bench.remote.calls.lock().expect("lock").is_empty());
 }
 
+/// What `rotate-ca-pq` leaves, once adopted: nothing shows a deposit ever went out.
+fn adopted_with_no_deposit(bench: &Bench) -> RotationJournal {
+    bench.remote.deposits.lock().expect("lock").push_back(503);
+    bench.drive(RotationGesture::ReplaceCaPq, Bench::all_the_way);
+    let journal = RotationJournal {
+        stage: JournalStage::Accepted,
+        deposit: None,
+        ..bench.journal().expect("kept")
+    };
+    rotation_journal::save(&rotation_journal::path_beside(&bench.path), &journal).expect("journal");
+    journal
+}
+
+#[test]
+fn an_adoption_nothing_confirms_never_reads_as_deposited() {
+    let bench = bench();
+    adopted_with_no_deposit(&bench);
+
+    let ran = bench.drive(RotationGesture::Resume, Bench::all_the_way);
+
+    ran.refused(Refusal::DomainConflict);
+    assert!(ran
+        .published
+        .iter()
+        .all(|status| status.remote != RemoteState::Deposited));
+}
+
+#[test]
+fn an_adoption_reads_as_deposited_once_the_authority_confirms_it() {
+    let bench = bench();
+    let journal = adopted_with_no_deposit(&bench);
+    *bench.remote.authority.lock().expect("lock") = Some(OperatorAuthorityStatus {
+        next_ca_fingerprint: Some(journal.next_anchor_fingerprint),
+        ..bench.nothing_in_flight()
+    });
+
+    let ran = bench.drive(RotationGesture::Resume, Bench::all_the_way);
+
+    ran.done();
+    assert_eq!(ran.published[1].remote, RemoteState::Prepared);
+    assert_eq!(ran.last().remote, RemoteState::Deposited);
+}
+
+/// A record the CLI left: vault rotated, token kept, no journal, not adopted. Neither
+/// gesture of the screen takes it until the resumption has.
+#[test]
+fn a_record_astra_signer_left_is_resumed_then_finished() {
+    for submitted in [false, true] {
+        let bench = bench();
+        bench
+            .drive(RotationGesture::ReplaceCaTls, Bench::all_the_way)
+            .done();
+        let carried = bench.record().expect("the record");
+        let record_path = prepared::path_beside(&bench.path);
+        prepared::save(
+            &record_path,
+            &prepared::PreparedRotation {
+                result_token: Some("jeton-de-depot".into()),
+                transition_path: "/tmp/transition-ca-tls.json".into(),
+                submitted,
+                adopted: false,
+                ..carried.clone()
+            },
+        )
+        .expect("record");
+        *bench.remote.gateway_anchor.lock().expect("lock") =
+            Some(Fingerprint::of(b"ancre sortante"));
+        let touches = bench.touches();
+
+        bench.set_clock(carried.not_after);
+        let finish = bench.drive(RotationGesture::FinishCaTls, Bench::all_the_way);
+        finish.refused(Refusal::RotationInFlight);
+        assert!(finish.asked_no_key());
+        let replace = bench.drive(RotationGesture::ReplaceCaTls, Bench::all_the_way);
+        replace.refused(Refusal::RotationInFlight);
+        assert!(replace.asked_no_key());
+
+        bench.set_clock(NOW);
+        let resume = bench.drive(RotationGesture::Resume, Bench::all_the_way);
+        resume.done();
+        assert!(resume.asked_no_key());
+        assert_eq!(resume.last().operation, OperationKind::RotateClientTlsCa);
+        assert!(bench.journal().is_none());
+        let adopted = bench.record().expect("still there until the end");
+        assert!(adopted.adopted && adopted.submitted);
+        assert_eq!(bench.touches(), touches);
+
+        bench.set_clock(carried.not_after);
+        let finish = bench.drive(RotationGesture::FinishCaTls, Bench::all_the_way);
+        finish.done();
+        assert_eq!(bench.touches(), touches + 1);
+        assert_eq!(bench.record(), None);
+        let relay = bench.relay();
+        assert_eq!(relay.ca_tls_epoch, Some(carried.next_ca_tls_epoch));
+        assert_eq!(
+            relay.ca_tls_certificate.as_deref(),
+            Some(carried.next_ca_tls_certificate.as_str())
+        );
+    }
+}
+
 // « Terminer ».
 
 #[test]
@@ -1548,7 +1930,7 @@ fn a_journal_in_flight_refuses_the_finish_before_any_key() {
 fn finishing_too_early_or_with_nothing_asks_no_key() {
     let bench = bench();
     let ran = bench.drive(RotationGesture::FinishCaTls, Bench::all_the_way);
-    ran.refused(Refusal::DomainChanged);
+    ran.refused(Refusal::NothingToFinish);
     assert!(ran.asked_no_key());
 
     let record = bench.rotated_client_tls();
@@ -1670,6 +2052,12 @@ fn what_the_touches_released_cannot_leave_this_thread() {
     }
     lacks!(Openings, Send);
     lacks!(Openings, Sync);
+    lacks!(Held, Send);
+    lacks!(Held, Sync);
+    lacks!(ValidatedKeys, Send);
+    lacks!(ValidatedKeys, Sync);
+    lacks!(OpenedRotation, Send);
+    lacks!(OpenedRotation, Sync);
     lacks!(Openings, std::fmt::Debug);
     lacks!(Openings, serde::Serialize);
     lacks!(ValidatedKeys, std::fmt::Debug);
@@ -1786,6 +2174,41 @@ async fn a_stale_revision_is_refused() {
     let ended = until(&ceremony, |status| status.gesture.is_terminal()).await;
     assert_eq!(ended.refusal, Some(Refusal::Cancelled));
     ceremony.dismiss().await.expect("dismissed");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_corrected_approval_opens_with_no_further_touch() {
+    let bench = bench();
+    let ceremony = OperatorCeremony::default();
+    open_session(&ceremony, &bench, RotationGesture::ReplaceCaPq).await;
+    let screen = on_the_approval_screen(&ceremony, &bench).await;
+
+    let refused = ceremony
+        .approve_rotation(out_of_bounds(), screen.revision)
+        .await
+        .expect("answered");
+    assert_eq!(refused.key_retry, Some(Refusal::TermsRefused));
+    assert!(awaits_terms(&refused));
+    assert_eq!(refused.keys.len(), 2);
+    assert!(refused.revision > screen.revision);
+    assert!(!bench.remote.called("open_campaign"));
+
+    ceremony
+        .approve_rotation(terms(), screen.revision)
+        .await
+        .expect_err("that screen has been left");
+    ceremony
+        .approve_rotation(terms(), refused.revision)
+        .await
+        .expect("corrected");
+    let touch = until(&ceremony, |status| awaits_approval(status, 1)).await;
+    assert!(bench.remote.called("open_campaign"));
+    assert_eq!(bench.touches(), 2);
+    ceremony
+        .advance(OperatorAction::Cancel, touch.revision, 0)
+        .await
+        .expect("abandoned");
+    until(&ceremony, |status| status.gesture.is_terminal()).await;
 }
 
 /// The window never reaches an opening: every gesture of every key came from the

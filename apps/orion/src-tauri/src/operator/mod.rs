@@ -406,7 +406,7 @@ impl IssuerGesture {
 /// Closed, and it names no value: the dates and the reason come with the press that
 /// approves, and everything else from the files beside the vault.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(tag = "gesture", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "gesture", rename_all = "snake_case")]
 pub enum RotationGesture {
     /// Replaces the domain anchor: two keys validated, then two approvals.
     ReplaceCaPq,
@@ -660,7 +660,7 @@ impl OperatorCeremony {
             .ok_or_else(|| "aucune cérémonie opérateur n'est ouverte".to_string())?;
 
         let current = session.status.borrow_and_update().clone();
-        if !awaits_terms(&current) || !current.accepts(OperatorAction::Continue, revision) {
+        if !awaits_terms(&current) || current.revision != revision {
             return Err(
                 "cette étape n'accepte pas cette action : l'écran a changé depuis la pression"
                     .to_string(),
@@ -781,9 +781,7 @@ impl OperatorCeremony {
             .ok_or_else(|| "aucune cérémonie opérateur n'est ouverte".to_string())?;
 
         let current = session.status.borrow_and_update().clone();
-        // A press there needs its terms, and only `approve_rotation` carries them.
-        let wants_terms = action == OperatorAction::Continue && awaits_terms(&current);
-        if wants_terms || !current.accepts(action, revision) {
+        if !current.accepts(action, revision) {
             return Err(
                 "cette étape n'accepte pas cette action : l'écran a changé depuis la pression"
                     .to_string(),

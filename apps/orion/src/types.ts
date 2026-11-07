@@ -751,6 +751,8 @@ export type Refusal =
   | { refusal: 'gateway_names_no_anchor' }
   | { refusal: 'rotation_in_flight' }
   | { refusal: 'key_not_validated' }
+  | { refusal: 'terms_refused' }
+  | { refusal: 'nothing_to_finish' }
   | { refusal: 'internal' }
 
 export interface RecoveryManifest {
@@ -975,7 +977,7 @@ export interface OperatorStatus {
   manifest?: AstraManifest
   keys?: KeySlotLabel[]
   refusal?: Refusal
-  /** Pourquoi la dernière clé a été écartée, tant qu'une autre est attendue. */
+  /** Pourquoi la dernière réponse a été écartée (clé ou durées), tant qu'une autre est attendue. */
   key_retry?: Refusal
 }
 
