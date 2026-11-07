@@ -74,8 +74,11 @@ pub fn run_rotation(
         .and_then(|target| {
             // Before any call: a resumption reads the status of whatever authority
             // answers, and sends the sealed vault to whatever gateway it reaches.
-            if gesture == RotationGesture::Resume
-                && !relay_names_peer(vault_path, &target.peer_key).unwrap_or(false)
+            // « Terminer » too: it sends the vault copy at its end.
+            if matches!(
+                gesture,
+                RotationGesture::Resume | RotationGesture::FinishCaTls
+            ) && !relay_names_peer(vault_path, &target.peer_key).unwrap_or(false)
             {
                 return Err(WRONG_GATEWAY.to_string());
             }

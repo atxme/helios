@@ -2527,10 +2527,11 @@ async fn each_tunnel_up_retries_a_stopped_rotation_with_no_key() {
     let ceremony = OperatorCeremony::default();
 
     for _ in 0..2 {
-        ceremony
+        let outcome = ceremony
             .resume_on_tunnel_up(towards_gateway(&bench), bench.path.clone())
             .await
             .expect("looked");
+        assert!(outcome.is_started());
         let ended = until(&ceremony, |status| status.gesture.is_terminal()).await;
         assert_eq!(ended.refusal, Some(Refusal::GatewayUnavailable));
         assert!(ended.keys.is_empty());
@@ -2643,56 +2644,187 @@ async fn the_resume_gesture_is_refused_towards_another_domains_gateway() {
     assert_eq!(bench.vault_bytes(), vault);
 }
 
-/// An edge met while a ceremony runs is not lost: the look waits for its end and is
-/// made once. The finished screen is the operator's, so it stays, and dismissing it
-/// is what lets the look through.
+/// The look the glue makes, on the bench's vault and the domain's own gateway.
+async fn look(ceremony: &OperatorCeremony, bench: &Bench) {
+    crate::operator::resume_with(ceremony, || async {
+        (Ok(bench.path.clone()), Ok(towards_gateway(bench)))
+    })
+    .await;
+}
+
+/// A resumption of its own that runs until released, standing for one on a dying
+/// tunnel.
+async fn blocked_resumption(
+    ceremony: &OperatorCeremony,
+) -> (std::sync::mpsc::Sender<()>, OperatorStatus) {
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let status = ceremony
+        .open_as(
+            RotationGesture::Resume.operation(),
+            true,
+            move |session_id, _presses, publish, _artifacts| {
+                publish(OperatorStatus::new(
+                    session_id,
+                    1,
+                    OperationKind::RotateAnchor,
+                    RemoteState::Prepared,
+                    GestureState::Signing,
+                ));
+                let _ = held.recv();
+                Ok(())
+            },
+        )
+        .await
+        .ok()
+        .expect("opened");
+    (release, status)
+}
+
+/// A ceremony of the operator's can wait on them for as long as they like: an edge
+/// that meets one returns at once, and dismissing their screen is what looks again.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_edge_met_during_a_running_ceremony_looks_once_after_its_end() {
+async fn an_edge_met_during_an_operators_ceremony_returns_at_once() {
     let bench = bench();
-    let ceremony = Arc::new(OperatorCeremony::default());
+    let ceremony = OperatorCeremony::default();
     open_session(&ceremony, &bench, RotationGesture::ReplaceCaPq).await;
     let waiting = until(&ceremony, |status| awaits_validation(status, 1)).await;
     leave_a_journal(&bench);
 
-    let look = {
-        let (ceremony, path, target) = (
-            ceremony.clone(),
-            bench.path.clone(),
-            towards_gateway(&bench),
-        );
-        tokio::spawn(async move {
-            crate::operator::resume_with(&ceremony, Ok(path), Ok(target)).await;
-        })
-    };
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert!(!look.is_finished(), "waits for the running ceremony");
-    assert_eq!(ceremony.status().await.expect("status"), waiting);
+    tokio::time::timeout(Duration::from_secs(5), look(&ceremony, &bench))
+        .await
+        .expect("returns without waiting");
 
+    assert_eq!(ceremony.status().await.expect("status"), waiting);
     ceremony
         .advance(OperatorAction::Cancel, waiting.revision, 0)
         .await
         .expect("abandoned");
-    tokio::time::timeout(Duration::from_secs(10), look)
+    until(&ceremony, |status| status.gesture.is_terminal()).await;
+}
+
+/// An edge that meets a resumption still running is not lost: the look waits for that
+/// one to end, reads the vault and the gateway again, and looks once more.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_edge_met_during_a_resumption_waits_then_looks_once_more() {
+    let bench = bench();
+    leave_a_journal(&bench);
+    let ceremony = Arc::new(OperatorCeremony::default());
+    let (release, running) = blocked_resumption(&ceremony).await;
+    let reads = Arc::new(AtomicUsize::new(0));
+
+    let waiting = {
+        let (ceremony, bench, reads) = (ceremony.clone(), bench.clone(), reads.clone());
+        tokio::spawn(async move {
+            crate::operator::resume_with(&ceremony, || async {
+                reads.fetch_add(1, Ordering::SeqCst);
+                (Ok(bench.path.clone()), Ok(towards_gateway(&bench)))
+            })
+            .await;
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!waiting.is_finished(), "waits for the running resumption");
+    assert_eq!(reads.load(Ordering::SeqCst), 1);
+
+    release.send(()).expect("released");
+    tokio::time::timeout(Duration::from_secs(10), waiting)
         .await
         .expect("the wait ends by itself")
         .expect("joined");
-    let kept = ceremony.status().await.expect("a session");
-    assert_eq!(kept.session_id, waiting.session_id, "their screen stays");
 
-    ceremony.dismiss().await.expect("dismissed");
-    crate::operator::resume_with(
-        &ceremony,
-        Ok(bench.path.clone()),
-        Ok(towards_gateway(&bench)),
-    )
-    .await;
+    assert_eq!(reads.load(Ordering::SeqCst), 2, "read again");
     let after = ceremony.status().await.expect("a session");
-    assert_ne!(after.session_id, waiting.session_id, "a resumption ran");
+    assert_ne!(after.session_id, running.session_id, "looked once more");
+    until(&ceremony, |status| status.gesture.is_terminal()).await;
 }
 
-/// A terminal screen of the operator's own, then dismissed: the look is made again.
+/// The profile may have changed during the wait: the second look goes by what is read
+/// then, and a gateway the relay does not name starts nothing.
 #[tokio::test(flavor = "multi_thread")]
-async fn dismissing_the_screen_that_was_in_the_way_lets_the_look_through() {
+async fn the_look_after_the_wait_goes_by_the_target_read_then() {
+    let bench = bench();
+    leave_a_journal(&bench);
+    let ceremony = Arc::new(OperatorCeremony::default());
+    let (release, running) = blocked_resumption(&ceremony).await;
+    let reads = Arc::new(AtomicUsize::new(0));
+
+    let waiting = {
+        let (ceremony, bench, reads) = (ceremony.clone(), bench.clone(), reads.clone());
+        tokio::spawn(async move {
+            crate::operator::resume_with(&ceremony, || async {
+                let target = if reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                    towards_gateway(&bench)
+                } else {
+                    towards_another_gateway()
+                };
+                (Ok(bench.path.clone()), Ok(target))
+            })
+            .await;
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    release.send(()).expect("released");
+    tokio::time::timeout(Duration::from_secs(10), waiting)
+        .await
+        .expect("the wait ends by itself")
+        .expect("joined");
+
+    let after = ceremony.status().await.expect("a session");
+    assert_eq!(after.session_id, running.session_id, "nothing started");
+}
+
+/// The second look does not wait in its turn: another resumption met then is left to
+/// the next tunnel-up, and nothing loops.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_second_look_does_not_wait_in_its_turn() {
+    let bench = bench();
+    leave_a_journal(&bench);
+    let ceremony = Arc::new(OperatorCeremony::default());
+    let (release, _) = blocked_resumption(&ceremony).await;
+    let second: Arc<Mutex<Option<std::sync::mpsc::Sender<()>>>> = Arc::default();
+    let reads = Arc::new(AtomicUsize::new(0));
+
+    let waiting = {
+        let (ceremony, bench, reads, second) = (
+            ceremony.clone(),
+            bench.clone(),
+            reads.clone(),
+            second.clone(),
+        );
+        tokio::spawn(async move {
+            let again = ceremony.clone();
+            crate::operator::resume_with(&ceremony, || async {
+                if reads.fetch_add(1, Ordering::SeqCst) == 1 {
+                    // Another edge's run begins before the second look.
+                    let (release, _) = blocked_resumption(&again).await;
+                    *second.lock().expect("lock") = Some(release);
+                }
+                (Ok(bench.path.clone()), Ok(towards_gateway(&bench)))
+            })
+            .await;
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    release.send(()).expect("released");
+    tokio::time::timeout(Duration::from_secs(10), waiting)
+        .await
+        .expect("returns without waiting a second time")
+        .expect("joined");
+
+    assert_eq!(reads.load(Ordering::SeqCst), 2);
+    second
+        .lock()
+        .expect("lock")
+        .take()
+        .expect("the second run")
+        .send(())
+        .expect("released");
+}
+
+/// The operator's own screen is what kept the look out: dismissing it looks again. A
+/// resumption's own dead end, dismissed, brings nothing back.
+#[tokio::test(flavor = "multi_thread")]
+async fn only_dismissing_the_operators_screen_calls_for_a_look() {
     let bench = bench();
     let ceremony = OperatorCeremony::default();
     ceremony
@@ -2702,23 +2834,19 @@ async fn dismissing_the_screen_that_was_in_the_way_lets_the_look_through() {
     let ended = until(&ceremony, |status| status.gesture.is_terminal()).await;
     leave_a_journal(&bench);
 
-    crate::operator::resume_with(
-        &ceremony,
-        Ok(bench.path.clone()),
-        Ok(towards_gateway(&bench)),
-    )
-    .await;
+    look(&ceremony, &bench).await;
     assert_eq!(ceremony.status().await.expect("status"), ended);
 
-    ceremony.dismiss().await.expect("dismissed");
-    crate::operator::resume_with(
-        &ceremony,
-        Ok(bench.path.clone()),
-        Ok(towards_gateway(&bench)),
-    )
-    .await;
+    assert!(ceremony.dismiss().await.expect("dismissed"), "theirs");
+    look(&ceremony, &bench).await;
     let after = ceremony.status().await.expect("a session");
     assert_ne!(after.session_id, ended.session_id);
+    until(&ceremony, |status| status.gesture.is_terminal()).await;
+
+    assert!(
+        !ceremony.dismiss().await.expect("dismissed"),
+        "a resumption's dead end"
+    );
 }
 
 /// A vault or a gateway that cannot be named is nothing to do.
@@ -2727,19 +2855,40 @@ async fn a_look_without_a_vault_or_a_gateway_does_nothing() {
     let bench = bench();
     leave_a_journal(&bench);
     let ceremony = OperatorCeremony::default();
-    crate::operator::resume_with(
-        &ceremony,
-        Err("aucun coffre".into()),
-        Ok(towards_gateway(&bench)),
-    )
+    crate::operator::resume_with(&ceremony, || async {
+        (Err("aucun coffre".into()), Ok(towards_gateway(&bench)))
+    })
     .await;
-    crate::operator::resume_with(
-        &ceremony,
-        Ok(bench.path.clone()),
-        Err("aucun tunnel".into()),
-    )
+    crate::operator::resume_with(&ceremony, || async {
+        (Ok(bench.path.clone()), Err("aucun tunnel".into()))
+    })
     .await;
     assert!(ceremony.status().await.is_none());
+}
+
+/// « Terminer » sends the vault copy at its end: towards another domain's gateway it is
+/// refused before any key, and nothing moves.
+#[tokio::test(flavor = "multi_thread")]
+async fn finishing_is_refused_towards_another_domains_gateway() {
+    let bench = bench();
+    let record = bench.rotated_client_tls();
+    let (vault, touches) = (bench.vault_bytes(), bench.touches());
+    let ceremony = OperatorCeremony::default();
+
+    ceremony
+        .begin_rotation(
+            RotationGesture::FinishCaTls,
+            Some(towards_another_gateway()),
+            bench.path.clone(),
+        )
+        .await
+        .expect("a session");
+    let ended = until(&ceremony, |status| status.gesture.is_terminal()).await;
+
+    assert_eq!(ended.refusal, Some(Refusal::HandoffMismatch));
+    assert_eq!(bench.record().as_ref(), Some(&record));
+    assert_eq!(bench.vault_bytes(), vault);
+    assert_eq!(bench.touches(), touches);
 }
 
 /// A real dead end, retried at each tunnel-up: past `activation_at` the transition is

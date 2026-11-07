@@ -1330,6 +1330,17 @@ mod tests {
                 "{:?}",
                 journal.kind
             );
+            // An authority naming no anchor of that family at all.
+            let silent = OperatorAuthorityStatus {
+                ca_tls_fingerprint: None,
+                ..authority()
+            };
+            if journal.kind == RotationKind::CaTls {
+                assert_eq!(
+                    next_step(&journal, &with_authority(EXPIRES, silent)),
+                    ResumeStep::DomainConflict
+                );
+            }
         }
     }
 

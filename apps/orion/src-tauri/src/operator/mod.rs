@@ -809,8 +809,10 @@ impl OperatorCeremony {
     }
 
     /// Returns once the ceremony open now has ended, at once when none is running.
-    /// Waits for a screen the operator is on, so it bounds itself by theirs: an
-    /// abandoned ceremony ends by its own idle limit.
+    ///
+    /// Only for a resumption's own session, which ends by itself: a ceremony of the
+    /// operator's can wait on them indefinitely, which is why [`ResumeOutcome::Running`]
+    /// is reported for an automatic session alone.
     pub async fn ended(&self) {
         let mut status = match self.0.lock().await.as_ref() {
             Some(session) => session.status.clone(),
@@ -864,7 +866,8 @@ impl OperatorCeremony {
             // A resumption gives way to everything but its own finished session.
             if !current.gesture.is_terminal() || (automatic && !session.automatic) {
                 return Err(Opening::Busy {
-                    running: !current.gesture.is_terminal(),
+                    // Only a resumption's own run is worth waiting for.
+                    running: !current.gesture.is_terminal() && session.automatic,
                 });
             }
         }
@@ -960,16 +963,22 @@ impl OperatorCeremony {
     /// A live session cannot be dismissed: dropping its press channel would
     /// look like cancellation even after the ceremony crossed the point where
     /// cancellation is honest.
-    pub async fn dismiss(&self) -> Result<(), String> {
+    ///
+    /// Says whether the screen was the operator's own: only that one may have kept a
+    /// resumption out, and only then is a look worth making. Dismissing a resumption's
+    /// own dead end must not start another.
+    pub async fn dismiss(&self) -> Result<bool, String> {
         let mut held = self.0.lock().await;
+        let mut operators = false;
         if let Some(session) = held.as_mut() {
             let current = session.status.borrow_and_update().clone();
             if !current.gesture.is_terminal() {
                 return Err("la cérémonie opérateur est encore en cours".to_string());
             }
+            operators = !session.automatic;
         }
         *held = None;
-        Ok(())
+        Ok(operators)
     }
 }
 
@@ -979,7 +988,8 @@ const BUSY: &str = "une cérémonie opérateur est déjà ouverte : la mener à 
 
 /// Why a ceremony did not open.
 enum Opening {
-    /// `running` tells a ceremony still going from a finished screen left showing.
+    /// `running` tells a resumption still going from a ceremony of the operator's or a
+    /// finished screen left showing, neither of which is waited for.
     Busy {
         running: bool,
     },
@@ -1012,48 +1022,52 @@ impl ResumeOutcome {
 /// Carries a rotation left in flight as soon as the tunnel is up (spec §5.4).
 ///
 /// Called once per edge into `Up`, see [`TunnelWatch`], and once when the operator
-/// dismisses a finished screen that was in the way.
+/// dismisses a finished screen of their own that was in the way, or chooses or
+/// resets the vault location.
 pub async fn resume_on_tunnel_up(app: &tauri::AppHandle) {
     use tauri::Manager;
 
     let state = app.state::<crate::AppState>();
-    // A read that creates nothing: this runs on machines that never opened Astra.
-    let vault = state.vault_location.path_to_look_at();
-    let target = crate::commands::connected_target(&state).await;
-    resume_with(&state.operator, vault, target).await;
+    resume_with(&state.operator, || async {
+        // A read that creates nothing: this runs on machines that never opened Astra.
+        (
+            state.vault_location.path_to_look_at(),
+            crate::commands::connected_target(&state).await,
+        )
+    })
+    .await;
 }
 
-/// The look itself, on what the glue read. A vault or a gateway that cannot be
-/// named is nothing to do.
+/// The look itself, on what `read` finds: the vault and the gateway, or why they
+/// cannot be named, which is nothing to do.
 ///
-/// Meeting a running ceremony, it waits for that one to end and looks once more:
-/// the edge must not be lost, and nothing here loops. The second look does not wait
-/// in its turn. Nothing secret is logged.
-pub async fn resume_with(
-    ceremony: &OperatorCeremony,
-    vault: Result<PathBuf, String>,
-    target: Result<GatewayTarget, String>,
-) {
-    let (Ok(vault_path), Ok(target)) = (vault, target) else {
-        return;
-    };
+/// Meeting a resumption still running, it waits for that one to end and looks once
+/// more, reading again: the edge must not be lost, the profile may have changed
+/// meanwhile, and nothing here loops. The second look does not wait in its turn. A
+/// ceremony of the operator's is not waited for, dismissing its screen looks.
+/// Nothing secret is logged.
+pub async fn resume_with<R, Fut>(ceremony: &OperatorCeremony, read: R)
+where
+    R: Fn() -> Fut,
+    Fut: std::future::Future<Output = (Result<PathBuf, String>, Result<GatewayTarget, String>)>,
+{
     for waited in [false, true] {
-        match ceremony
-            .resume_on_tunnel_up(target.clone(), vault_path.clone())
-            .await
-        {
+        let (Ok(vault_path), Ok(target)) = read().await else {
+            return;
+        };
+        match ceremony.resume_on_tunnel_up(target, vault_path).await {
             Ok(ResumeOutcome::Started) => {
                 tracing::info!("reprise d'une rotation en cours au montage du tunnel");
                 return;
             }
             Ok(ResumeOutcome::Nothing) => return,
             Ok(ResumeOutcome::Running) if !waited => {
-                tracing::debug!("une cérémonie est ouverte : la reprise attend sa fin");
+                tracing::debug!("une reprise est en cours : la suivante attend sa fin");
                 ceremony.ended().await;
             }
             Ok(ResumeOutcome::Running) => {
                 tracing::debug!(
-                    "une cérémonie est de nouveau ouverte : reprise laissée au prochain montage"
+                    "une reprise est de nouveau en cours : laissée au prochain montage"
                 );
                 return;
             }

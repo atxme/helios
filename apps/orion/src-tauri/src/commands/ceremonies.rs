@@ -105,9 +105,11 @@ pub(crate) async fn dismiss_operator_ceremony(
     state: State<'_, AppState>,
     app: tauri::AppHandle,
 ) -> Result<(), String> {
-    state.operator.dismiss().await?;
-    // The screen that was in the way may have cost a tunnel-up its look.
-    look_for_a_rotation_again(app);
+    // The operator's own screen may have cost a tunnel-up its look. A resumption's
+    // dead end does not: dismissing it must not bring it back.
+    if state.operator.dismiss().await? {
+        look_for_a_rotation_again(app);
+    }
     Ok(())
 }
 

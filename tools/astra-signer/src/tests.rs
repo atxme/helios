@@ -400,7 +400,8 @@ fn the_ca_tls_command_refuses_an_unconfirmed_adoption_too() {
 
 /// `apply_local` overwrites the vault with the one signed before the journal: a key
 /// added, removed or marked meanwhile would be undone, and a removed key would get
-/// its access back. Refused by presence, before any key, with the vault as it was.
+/// its access back. Refused before any key, while a sealed vault waits (a journal that
+/// carries one, or that cannot be read), with the vault as it was.
 #[test]
 fn key_slot_gestures_are_refused_while_a_rotation_journal_is_in_flight() {
     let directory = tempfile::tempdir().expect("dir");
@@ -433,6 +434,7 @@ fn key_slot_gestures_are_refused_while_a_rotation_journal_is_in_flight() {
             std::slice::from_ref(&slot),
             Transport::default(),
         ),
+        commands::rename(&vault, &slot, "autre nom"),
     ];
 
     for refused in refusals {
