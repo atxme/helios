@@ -31,7 +31,88 @@ use orion_core::operator_rotations::{
 };
 use serde::Serialize;
 
-use aether::certificates::transport::OperatorVaultCopy;
+use aether::certificates::transport::{
+    OperatorOpenAction, OperatorOpenRequest, OperatorOpened, OperatorVaultCopy,
+};
+use astra_operator::operations::rotation::RotationRemote;
+
+use crate::operator::{relay_names_peer, GatewayTarget};
+
+const NOT_THE_DOMAINS_GATEWAY: &str =
+    "la gateway connectée n'est pas celle que nomme le relais du domaine";
+
+/// The window of a campaign this screen opens: the door's own ceiling.
+const OPEN_WINDOW_SECS: u64 = 300;
+
+/// Refuses a gateway that is not the one the domain's relay names, before any call.
+fn ensure_domains_gateway(vault_path: &Path, target: &GatewayTarget) -> Result<(), String> {
+    if relay_names_peer(vault_path, &target.peer_key)? {
+        Ok(())
+    } else {
+        Err(NOT_THE_DOMAINS_GATEWAY.to_string())
+    }
+}
+
+/// Opens a campaign for the two actions this screen runs outside a ceremony.
+///
+/// The CA rotations open on the ceremony thread, at « Approuver », and a revocation
+/// names a peer no screen of this kind offers. A `403` comes back as the gateway's
+/// refusal, unchanged: the door answers `AlreadyOpen` that way, so the caller reads
+/// what is pending after any of them.
+pub fn open_campaign_with(
+    remote: &dyn RotationRemote,
+    vault_path: &Path,
+    target: &GatewayTarget,
+    action: OperatorOpenAction,
+    reason: &str,
+    requested_by: &str,
+) -> Result<OperatorOpened, String> {
+    if !matches!(
+        action,
+        OperatorOpenAction::FleetLeafs | OperatorOpenAction::IssuerDelegation
+    ) {
+        return Err(
+            "cette action ne s'ouvre pas ici : les rotations de CA s'ouvrent à \
+                    « Approuver », dans leur cérémonie"
+                .to_string(),
+        );
+    }
+    ensure_domains_gateway(vault_path, target)?;
+    remote
+        .open_campaign(&OperatorOpenRequest {
+            action,
+            reason: reason.to_string(),
+            requested_by: requested_by.to_string(),
+            window_secs: OPEN_WINDOW_SECS,
+        })
+        .map_err(|error| format!("{error:#}"))
+}
+
+/// The manual send. `authority` is read only once the gateway has been checked.
+pub fn send_copy_with(
+    remote: &dyn RotationRemote,
+    vault_path: &Path,
+    target: &GatewayTarget,
+    authority: impl FnOnce() -> Reach<OperatorAuthorityStatus>,
+) -> Result<VaultCopyOutcome, String> {
+    ensure_domains_gateway(vault_path, target)?;
+    let authority = match authority() {
+        Reach::Ok(authority) => authority,
+        other => {
+            return Err(unreached(&other)
+                .unwrap_or("l'autorité ne répond pas")
+                .to_string())
+        }
+    };
+    let resumable =
+        rotation_journal::something_to_resume(vault_path).map_err(|error| format!("{error:#}"))?;
+    let copy =
+        copy_to_send(vault_path, &authority, resumable).map_err(|error| format!("{error:#}"))?;
+    remote
+        .send_vault_copy(&copy)
+        .map(VaultCopyOutcome::of)
+        .map_err(|error| format!("{error:#}"))
+}
 
 /// A rotation signed and not yet at its end, as the page may be told of it.
 ///
@@ -145,7 +226,10 @@ pub struct RotationsOverview {
     /// A CA-PQ overlap is in flight at Astra. Renewing the workstations, every
     /// launch of an approval and recovery wait for it; a CA TLS overlap gates none
     /// of them.
-    pub ca_pq_overlap: bool,
+    ///
+    /// `None` when the authority could not be read: that is not « no overlap », and
+    /// a screen that read it as one would spend a touch the overlap then refuses.
+    pub ca_pq_overlap: Option<bool>,
     pub ca_tls_close_due: bool,
 }
 
@@ -166,7 +250,7 @@ impl RotationsOverview {
         } = local;
         let ca_pq_overlap = authority
             .ok()
-            .is_some_and(|status| status.next_ca_fingerprint.is_some());
+            .map(|status| status.next_ca_fingerprint.is_some());
         if let Some(vault) = vault.as_mut() {
             vault.vault_path = String::new();
         }
@@ -246,7 +330,7 @@ pub fn copy_to_send(
 }
 
 /// Why a read that did not go through stops a send, in a few words.
-pub fn unreached(reach: &Reach<OperatorAuthorityStatus>) -> Option<&'static str> {
+pub fn unreached<T>(reach: &Reach<T>) -> Option<&'static str> {
     match reach {
         Reach::Ok(_) => None,
         Reach::NotAdmin => Some("ce poste n'est pas administrateur de la gateway"),

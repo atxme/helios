@@ -813,6 +813,7 @@ fn main() {
             operator_pending_operations,
             operator_rotations_overview,
             operator_send_vault_copy,
+            operator_open_campaign,
             operator_vault_location,
             choose_vault_location,
             reset_vault_location,

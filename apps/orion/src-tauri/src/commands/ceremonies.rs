@@ -417,43 +417,59 @@ pub(crate) async fn operator_rotations_overview(
 pub(crate) async fn operator_send_vault_copy(
     state: State<'_, AppState>,
 ) -> Result<crate::operator::rotations::VaultCopyOutcome, String> {
-    use crate::operator::rotations::{copy_to_send, unreached, VaultCopyOutcome};
-
     ensure_no_open_ceremony(&state).await?;
     let vault_path = state.vault_location.path_to_look_at()?;
     let target = connected_target(&state).await?;
-    if !crate::operator::relay_names_peer(&vault_path, &target.peer_key)? {
-        return Err(NOT_THE_DOMAINS_GATEWAY.to_string());
-    }
-    let authority = match orion_core::operator_rotations::authority_status(&target.address).await {
-        orion_core::operator_rotations::Reach::Ok(authority) => authority,
-        other => {
-            return Err(unreached(&other)
-                .unwrap_or("l'autorité ne répond pas")
-                .to_string())
-        }
-    };
+    let handle = tokio::runtime::Handle::current();
     on_work_stack(
         "orion-vault-copy",
         "l'envoi de la copie du coffre",
         move || {
-            let resumable = astra_operator::rotation_journal::something_to_resume(&vault_path)
-                .map_err(|error| format!("{error:#}"))?;
-            let copy = copy_to_send(&vault_path, &authority, resumable)
-                .map_err(|error| format!("{error:#}"))?;
             let tunnel = astra_operator::tunnel::Tunnel::new(&target.address)
                 .map_err(|error| format!("{error:#}"))?;
-            tunnel
-                .send_vault_copy(&copy)
-                .map(VaultCopyOutcome::of)
-                .map_err(|error| format!("{error:#}"))
+            crate::operator::rotations::send_copy_with(&tunnel, &vault_path, &target, || {
+                handle.block_on(orion_core::operator_rotations::authority_status(
+                    &target.address,
+                ))
+            })
         },
     )
     .await
 }
 
-const NOT_THE_DOMAINS_GATEWAY: &str =
-    "la gateway connectée n'est pas celle que nomme le relais du domaine";
+/// Opens a campaign for the actions this screen runs outside a rotation ceremony:
+/// renewing the workstations and the issuer's delegation.
+///
+/// `OperatorOpened` is public: identifiers, a fingerprint, counts, an expiry and the
+/// delegation's public request. No token and no secret. The gateway is the
+/// connected profile's, and must be the one the domain's relay names.
+#[tauri::command]
+pub(crate) async fn operator_open_campaign(
+    state: State<'_, AppState>,
+    action: aether::certificates::transport::OperatorOpenAction,
+    reason: String,
+    requested_by: String,
+) -> Result<aether::certificates::transport::OperatorOpened, String> {
+    let vault_path = state.vault_location.path_to_look_at()?;
+    let target = connected_target(&state).await?;
+    on_work_stack(
+        "orion-open-campaign",
+        "l'ouverture de la campagne",
+        move || {
+            let tunnel = astra_operator::tunnel::Tunnel::new(&target.address)
+                .map_err(|error| format!("{error:#}"))?;
+            crate::operator::rotations::open_campaign_with(
+                &tunnel,
+                &vault_path,
+                &target,
+                action,
+                &reason,
+                &requested_by,
+            )
+        },
+    )
+    .await
+}
 
 /// Where the operator vault is, and whether it is the default place. A
 /// location that cannot be resolved is a view that says why, not an error:

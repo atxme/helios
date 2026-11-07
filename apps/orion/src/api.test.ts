@@ -35,6 +35,7 @@ import {
   onTrayView,
   operatorRotationsOverview,
   operatorSendVaultCopy,
+  operatorOpenCampaign,
   resizeForView,
   runCertificateAction,
   runSpeedTest,
@@ -54,10 +55,15 @@ describe('Orion Tauri bridge', () => {
 
     await operatorRotationsOverview()
     await operatorSendVaultCopy()
+    await operatorOpenCampaign({ action: 'fleet_leafs' }, 'raison', 'christophe')
 
     expect(mocks.invoke.mock.calls).toEqual([
       ['operator_rotations_overview'],
       ['operator_send_vault_copy'],
+      [
+        'operator_open_campaign',
+        { action: { action: 'fleet_leafs' }, reason: 'raison', requestedBy: 'christophe' },
+      ],
     ])
   })
 

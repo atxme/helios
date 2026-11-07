@@ -14,6 +14,8 @@ import type {
   OperatorAction,
   OperatorPendingOperation,
   RotationsOverview,
+  OpenCampaignAction,
+  OperatorOpened,
   VaultCopyOutcome,
   OperatorStatus,
   OperatorArtifact,
@@ -399,6 +401,16 @@ export const operatorRotationsOverview = () =>
  * sont lus côté Rust. « Retenue » est une réponse, pas un échec.
  */
 export const operatorSendVaultCopy = () => invoke<VaultCopyOutcome>('operator_send_vault_copy')
+
+/**
+ * Ouvre une campagne (postes ou délégation de l'émetteur). Un 403 revient tel quel :
+ * la porte répond ainsi quand une opération est déjà ouverte, lire alors `pending`.
+ */
+export const operatorOpenCampaign = (
+  action: OpenCampaignAction,
+  reason: string,
+  requestedBy: string,
+) => invoke<OperatorOpened>('operator_open_campaign', { action, reason, requestedBy })
 
 /**
  * Adjusts the window to the displayed view.

@@ -1134,8 +1134,11 @@ export interface RotationsOverview {
   journal: RotationJournalView | null
   /** Une reprise est à faire : journal, fichier CA-PQ ancien ou enregistrement non adopté. */
   resumable: boolean
-  /** Un recouvrement CA-PQ court chez Astra ; un recouvrement CA TLS n'en fait pas partie. */
-  caPqOverlap: boolean
+  /**
+   * Un recouvrement CA-PQ court chez Astra ; un recouvrement CA TLS n'en fait pas partie.
+   * `null` : l'autorité n'a pas été lue, ce qui n'est pas « aucun recouvrement » (désactivé).
+   */
+  caPqOverlap: boolean | null
   caTlsCloseDue: boolean
 }
 
@@ -1260,4 +1263,23 @@ export interface VaultLocationView {
 /** Ce dont part le formulaire de création de domaine. */
 export interface DomainDefaults {
   rp_id: string | null
+}
+
+/** Les actions que l'écran ouvre hors d'une cérémonie de rotation. */
+export type OpenCampaignAction = { action: 'fleet_leafs' } | { action: 'issuer_delegation' }
+
+/**
+ * Ce que l'ouverture d'une campagne produit : public, sans jeton ni secret. La
+ * demande de délégation n'est présente que pour `issuer_delegation`.
+ */
+export interface OperatorOpened {
+  operation_id: string
+  campaign_id: string
+  campaign_fingerprint: string
+  scope: CampaignScope
+  target_count: number
+  required_credentials: number
+  expires_at: number
+  revocation_expiries?: { tls_not_after: number | null; pq_not_after: number | null }
+  delegation_request?: string
 }

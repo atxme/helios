@@ -2921,8 +2921,10 @@ fn a_rotation_past_its_install_deadline_is_retried_and_stops_the_same_way() {
 mod overview {
     use super::*;
     use crate::operator::rotations::{
-        copy_to_send, read_local, vault_bytes_of, RotationsOverview, VaultCopyOutcome,
+        copy_to_send, open_campaign_with, read_local, send_copy_with, vault_bytes_of,
+        RotationsOverview, VaultCopyOutcome,
     };
+    use aether::certificates::transport::OperatorOpenAction;
     use orion_core::operator_rotations::{GatewayDomainRead, Reach};
 
     fn local(bench: &Bench) -> crate::operator::rotations::Local {
@@ -3036,19 +3038,173 @@ mod overview {
     fn a_ca_pq_overlap_is_read_from_the_authority_and_a_ca_tls_one_is_not() {
         let bench = bench();
         let quiet = assembled(&bench, bench.nothing_in_flight());
-        assert!(!quiet.ca_pq_overlap);
+        assert_eq!(quiet.ca_pq_overlap, Some(false));
 
         let tls = OperatorAuthorityStatus {
             next_ca_tls_fingerprint: Some(Fingerprint::of(b"suivante")),
             ..bench.nothing_in_flight()
         };
-        assert!(!assembled(&bench, tls).ca_pq_overlap);
+        assert_eq!(assembled(&bench, tls).ca_pq_overlap, Some(false));
 
         let pq = OperatorAuthorityStatus {
             next_ca_fingerprint: Some(Fingerprint::of(b"suivante")),
             ..bench.nothing_in_flight()
         };
-        assert!(assembled(&bench, pq).ca_pq_overlap);
+        assert_eq!(assembled(&bench, pq).ca_pq_overlap, Some(true));
+    }
+
+    /// A read that failed must not look like a clear path: a touch would be wasted.
+    #[test]
+    fn an_overlap_not_read_is_not_an_overlap_absent() {
+        let bench = bench();
+        for unread in [
+            Reach::NotAdmin,
+            Reach::AstraUnavailable,
+            Reach::Unreachable,
+            Reach::Throttled,
+        ] {
+            let overview = RotationsOverview::assemble(
+                true,
+                Reach::Unreachable,
+                unread,
+                Reach::<GatewayDomainRead>::Unreachable,
+                local(&bench),
+            );
+            assert_eq!(overview.ca_pq_overlap, None);
+            let value = serde_json::to_value(&overview).expect("json");
+            assert!(value["caPqOverlap"].is_null());
+        }
+    }
+
+    fn target_of(bench: &Bench) -> crate::operator::GatewayTarget {
+        towards_gateway(bench)
+    }
+
+    fn fleet() -> OperatorOpenAction {
+        OperatorOpenAction::FleetLeafs
+    }
+
+    #[test]
+    fn only_the_fleet_and_the_delegation_open_outside_a_ceremony() {
+        let bench = bench();
+        for action in [fleet(), OperatorOpenAction::IssuerDelegation] {
+            open_campaign_with(
+                &bench.remote,
+                &bench.path,
+                &target_of(&bench),
+                action,
+                "r",
+                "u",
+            )
+            .expect("opened");
+        }
+        let calls = bench.remote.calls.lock().expect("lock").len();
+        assert_eq!(calls, 2);
+        for action in [
+            OperatorOpenAction::TrustAuthorities,
+            OperatorOpenAction::ClientRevocation {
+                peer: WireGuardKey::from_bytes([3; 32]),
+            },
+        ] {
+            let error = open_campaign_with(
+                &bench.remote,
+                &bench.path,
+                &target_of(&bench),
+                action,
+                "r",
+                "u",
+            )
+            .expect_err("refused");
+            assert!(error.contains("Approuver"), "{error}");
+        }
+        assert_eq!(
+            bench.remote.calls.lock().expect("lock").len(),
+            calls,
+            "no call"
+        );
+    }
+
+    #[test]
+    fn opening_towards_another_domains_gateway_calls_nothing() {
+        let bench = bench();
+        let error = open_campaign_with(
+            &bench.remote,
+            &bench.path,
+            &towards_another_gateway(),
+            fleet(),
+            "r",
+            "u",
+        )
+        .expect_err("refused");
+        assert!(error.contains("relais"), "{error}");
+        assert!(bench.remote.calls.lock().expect("lock").is_empty());
+    }
+
+    #[test]
+    fn a_403_on_opening_keeps_its_refusal() {
+        let bench = bench();
+        *bench.remote.open_refused.lock().expect("lock") = Some(403);
+        let error = open_campaign_with(
+            &bench.remote,
+            &bench.path,
+            &target_of(&bench),
+            fleet(),
+            "r",
+            "u",
+        )
+        .expect_err("refused");
+        assert!(error.contains("(403)"), "{error}");
+    }
+
+    #[test]
+    fn a_manual_send_towards_another_domains_gateway_reads_and_sends_nothing() {
+        let bench = bench();
+        let read = std::cell::Cell::new(false);
+        let error = send_copy_with(
+            &bench.remote,
+            &bench.path,
+            &towards_another_gateway(),
+            || {
+                read.set(true);
+                Reach::Ok(bench.nothing_in_flight())
+            },
+        )
+        .expect_err("refused");
+        assert!(error.contains("relais"), "{error}");
+        assert!(!read.get());
+        assert!(bench.remote.calls.lock().expect("lock").is_empty());
+    }
+
+    #[test]
+    fn a_manual_send_stops_on_an_authority_it_could_not_read() {
+        let bench = bench();
+        let error = send_copy_with(&bench.remote, &bench.path, &target_of(&bench), || {
+            Reach::AstraUnavailable
+        })
+        .expect_err("stopped");
+        assert!(error.contains("Astra"), "{error}");
+        assert!(!bench.remote.called("send_vault_copy"));
+    }
+
+    #[test]
+    fn a_manual_send_goes_through_and_a_held_back_copy_is_an_answer() {
+        let bench = bench();
+        let sent = send_copy_with(&bench.remote, &bench.path, &target_of(&bench), || {
+            Reach::Ok(bench.nothing_in_flight())
+        })
+        .expect("sent");
+        assert!(matches!(sent, VaultCopyOutcome::Copied { .. }));
+        bench
+            .remote
+            .copies
+            .lock()
+            .expect("lock")
+            .push_back(VaultCopySent::HeldBack);
+        let held = send_copy_with(&bench.remote, &bench.path, &target_of(&bench), || {
+            Reach::Ok(bench.nothing_in_flight())
+        })
+        .expect("answered");
+        assert_eq!(held, VaultCopyOutcome::HeldBack);
     }
 
     #[test]
