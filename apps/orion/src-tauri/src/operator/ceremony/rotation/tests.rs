@@ -1275,11 +1275,17 @@ fn a_cancel_naming_an_older_screen_stays_ignored() {
     ran.done();
 }
 
-/// Nobody touched anything: a dialog closing by itself buys no more time, with a
-/// key already holding an opening.
+/// Nobody is shown to be there: a dialog closing by itself, or a key turned down, buys
+/// no more time, with a key already holding an opening.
 #[test]
-fn a_dialog_that_timed_out_does_not_restart_the_bound() {
-    for at_the_key in [true, false] {
+fn a_dialog_that_timed_out_or_a_refused_key_does_not_restart_the_bound() {
+    #[derive(Clone, Copy)]
+    enum Late {
+        KeyTimedOut,
+        DialogTimedOut,
+        KeyRefused,
+    }
+    for late in [Late::KeyTimedOut, Late::DialogTimedOut, Late::KeyRefused] {
         let bench = bench();
         let ran = bench.drive(RotationGesture::ReplaceCaPq, |status, bench| {
             if awaits_validation(status, 1) {
@@ -1295,10 +1301,12 @@ fn a_dialog_that_timed_out_does_not_restart_the_bound() {
                 bench
                     .touch_ends_at
                     .store(NOW + VALIDATION_IDLE_SECS, Ordering::SeqCst);
-                if at_the_key {
-                    bench.keys[1].declines.store(true, Ordering::SeqCst);
-                } else {
-                    *bench.unreachable.lock().expect("lock") = Some(Refusal::KeyDeclined);
+                match late {
+                    Late::KeyTimedOut => bench.keys[1].declines.store(true, Ordering::SeqCst),
+                    Late::DialogTimedOut => {
+                        *bench.unreachable.lock().expect("lock") = Some(Refusal::KeyDeclined);
+                    }
+                    Late::KeyRefused => bench.plug(STRANGER),
                 }
                 return proceed(status);
             }
@@ -1306,6 +1314,42 @@ fn a_dialog_that_timed_out_does_not_restart_the_bound() {
         });
         ran.refused(Refusal::WindowExpired);
         assert_eq!(bench.keys[1].touches.load(Ordering::SeqCst), 0);
+    }
+}
+
+/// A touch that went through is the operator being there, however long it took: the
+/// next key has the whole bound, and no more than that.
+#[test]
+fn a_late_successful_touch_leaves_the_full_bound_for_the_next_key() {
+    const TOUCH_ENDS: u64 = NOW + 290;
+    for (next_press_at, kept) in [
+        (TOUCH_ENDS + VALIDATION_IDLE_SECS - 1, true),
+        (TOUCH_ENDS + VALIDATION_IDLE_SECS, false),
+    ] {
+        let bench = bench();
+        let ran = bench.drive(RotationGesture::ReplaceCaPq, |status, bench| {
+            if awaits_validation(status, 1) {
+                bench.plug(0);
+                bench.touch_ends_at.store(TOUCH_ENDS, Ordering::SeqCst);
+                return proceed(status);
+            }
+            if awaits_validation(status, 2) {
+                bench.set_clock(next_press_at);
+                bench.plug(1);
+                return proceed(status);
+            }
+            if awaits_terms(status) {
+                return cancel_it(status);
+            }
+            Answer::Nothing
+        });
+        if kept {
+            ran.cancelled();
+            assert_eq!(bench.touches(), 2);
+        } else {
+            ran.refused(Refusal::WindowExpired);
+            assert_eq!(bench.touches(), 1);
+        }
     }
 }
 

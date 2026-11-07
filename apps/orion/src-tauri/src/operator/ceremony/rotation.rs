@@ -158,8 +158,8 @@ struct RotationRun<'a> {
     reach: &'a Reach<'a>,
     openings: Openings,
     until: Option<u64>,
-    /// When the operator last pressed, on both clocks.
-    last_press: Option<(u64, Instant)>,
+    /// When the operator was last shown to be there, on both clocks.
+    last_seen: Option<(u64, Instant)>,
 }
 
 impl RotationRun<'_> {
@@ -178,7 +178,7 @@ impl RotationRun<'_> {
             reach,
             openings: Openings::none(),
             until: None,
-            last_press: None,
+            last_seen: None,
         }
     }
 
@@ -227,6 +227,7 @@ impl RotationRun<'_> {
                             label,
                         });
                         self.ceremony.key_retry = None;
+                        self.operator_seen();
                         break;
                     }
                     Err(step) => self.turned_down(step)?,
@@ -291,6 +292,7 @@ impl RotationRun<'_> {
                 match opened.approve(key.as_ref(), now) {
                     Ok(_) => {
                         self.ceremony.key_retry = None;
+                        self.operator_seen();
                         break;
                     }
                     Err(step) => self.turned_down(step)?,
@@ -495,7 +497,7 @@ impl RotationRun<'_> {
                     if patience.is_over(self.now()) {
                         return Err(self.expired());
                     }
-                    self.last_press = Some((self.now(), Instant::now()));
+                    self.operator_seen();
                     return Ok(press);
                 }
                 Ok(_) | Err(RecvTimeoutError::Timeout) => {}
@@ -504,12 +506,18 @@ impl RotationRun<'_> {
         }
     }
 
-    /// Counted from the last press rather than from this offer: a dialog that timed
-    /// out with nobody there buys no more time. Taken before the status it bounds is
-    /// published, for the first wait, which begins as it is offered.
+    /// A press, or a touch that went through. Not a dialog that timed out nor a key
+    /// turned down, which show nobody.
+    fn operator_seen(&mut self) {
+        self.last_seen = Some((self.now(), Instant::now()));
+    }
+
+    /// Counted from when the operator was last seen rather than from this offer, so a
+    /// dialog that timed out with nobody there buys no more time. Taken before the
+    /// status it bounds is published, for the first wait, which begins as it is offered.
     fn patience(&self) -> Patience {
         let (since, started) = self
-            .last_press
+            .last_seen
             .unwrap_or_else(|| (self.now(), Instant::now()));
         Patience {
             since,
