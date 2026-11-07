@@ -2232,3 +2232,462 @@ fn fleet_approval_under_the_rotated_document_is_refused_by_astra_during_overlap(
         Err(CertificateError::InvalidAssertion("credential binding"))
     );
 }
+
+// « Terminer ».
+
+/// A client TLS rotation carried to its end, with its prepared record left beside
+/// the vault, and the instant its overlap is over.
+fn finished_client_tls(domain: &Domain) -> u64 {
+    let mut journal = domain.signed(RotationKind::CaTls);
+    let remote = Remote::watching(&domain.path);
+    assert_eq!(
+        advance(&remote, &domain.path, &mut journal, NOW).expect("advanced"),
+        ResumeStep::Finished
+    );
+    journal.not_after
+}
+
+fn refusal_of_finish(error: &anyhow::Error) -> &FinishRefusal {
+    error.downcast_ref::<FinishRefusal>().expect("a refusal")
+}
+
+fn record_of(domain: &Domain) -> Option<prepared::PreparedRotation> {
+    prepared::load(&prepared::path_beside(&domain.path)).expect("record")
+}
+
+/// What is in the vault's issuing slot, seen from the certificate it should match.
+fn assert_issues_under(domain: &Domain, key: &TestKey, certificate: &str) {
+    let vault = store::load(&domain.path).expect("vault");
+    let opening = gestures::open_with_authorized_key(key, &vault, "").expect("opened");
+    let certificate = DerCertificate::parse(certificate).expect("certificate");
+    assert!(signing::issues_under(&vault, &opening, &certificate).expect("read"));
+    assert_eq!(
+        vault
+            .ca_tls_window(&opening.credential_id, &opening.secret)
+            .expect("window"),
+        None
+    );
+}
+
+/// The incoming certificate comes from the record the journal left, nothing
+/// remains to be promoted, and the copy that follows is the vault that moved.
+#[test]
+fn finishing_moves_the_vault_and_the_relay_then_clears_the_record_and_sends_the_copy() {
+    let domain = domain();
+    let not_after = finished_client_tls(&domain);
+    let record = record_of(&domain).expect("the record survives the journal");
+    let relay_before = domain.relay();
+    let touches = domain.touches();
+    let remote = Remote::watching(&domain.path);
+
+    let finish = CaTlsFinish::begin(&domain.path, not_after).expect("ready");
+    assert_eq!(domain.touches(), touches, "nothing is asked before the key");
+    let opening = finish.open(&domain.keys[1]).expect("one key");
+    assert_eq!(domain.touches(), touches + 1);
+    finish
+        .finish(&remote, &domain.path, &opening, not_after)
+        .expect("finished");
+
+    assert_eq!(domain.touches(), touches + 1, "one key, one touch");
+    let relay = domain.relay();
+    assert_eq!(relay.ca_tls_epoch, Some(record.next_ca_tls_epoch));
+    assert_eq!(
+        relay.ca_tls_certificate.as_deref(),
+        Some(record.next_ca_tls_certificate.as_str())
+    );
+    assert_ne!(relay.ca_tls_certificate, relay_before.ca_tls_certificate);
+    let vault = store::load(&domain.path).expect("vault");
+    assert_eq!(
+        relay.vault_fingerprint,
+        vault.fingerprint().expect("fingerprint").to_hex()
+    );
+    assert_eq!(record_of(&domain), None);
+    assert_issues_under(&domain, &domain.keys[0], &record.next_ca_tls_certificate);
+
+    assert_eq!(remote.calls(), vec!["send_vault_copy"]);
+    let copies = remote.copies_sent.borrow();
+    assert_eq!(
+        copies[0].vault_base64,
+        vault_copy(&domain.path).expect("copy").vault_base64
+    );
+    assert_eq!(copies[0].credentials, None);
+}
+
+/// What the touch does: the certificate going and the one coming, by fingerprint,
+/// with no campaign, since this executes one already approved.
+#[test]
+fn the_finish_shows_the_two_anchors_before_the_key() {
+    let domain = domain();
+    let outgoing = DerCertificate::parse(domain.relay().ca_tls_certificate.as_ref().expect("cert"))
+        .expect("certificate");
+    let not_after = finished_client_tls(&domain);
+    let record = record_of(&domain).expect("record");
+    let incoming = DerCertificate::parse(&record.next_ca_tls_certificate).expect("certificate");
+
+    let finish = CaTlsFinish::begin(&domain.path, not_after).expect("ready");
+
+    let AstraManifest::CaRotation(manifest) = finish.manifest() else {
+        panic!("a rotation manifest")
+    };
+    assert_eq!(manifest.trust_domain_id, trust_domain());
+    assert_eq!(manifest.affected_ca, AffectedCa::CaTls);
+    assert_eq!(manifest.current_epoch, record.next_ca_tls_epoch - 1);
+    assert_eq!(manifest.next_epoch, record.next_ca_tls_epoch);
+    assert_eq!(manifest.activation_at, record.activation_at);
+    assert_eq!(manifest.not_after, record.not_after);
+    assert_eq!(manifest.outgoing_anchor_fingerprint, outgoing.fingerprint());
+    assert_eq!(
+        manifest.next_anchor_fingerprint,
+        Some(incoming.fingerprint())
+    );
+    assert_eq!(manifest.campaign, None);
+}
+
+/// The vault was saved and the machine stopped before the relay: the vault reads
+/// as idle while the record is still there. The command-line tool gives up at this
+/// point. This one has what it takes to finish, and rewrites no vault.
+#[test]
+fn a_stop_between_the_vault_and_the_relay_is_finished_by_the_next_press() {
+    let domain = domain();
+    let not_after = finished_client_tls(&domain);
+    let record = record_of(&domain).expect("record");
+    let mut vault = store::load(&domain.path).expect("vault");
+    let opening = gestures::open_with_authorized_key(&domain.keys[0], &vault, "").expect("opened");
+    assert!(matches!(
+        signing::advance_ca_tls(&mut vault, &opening, not_after).expect("advanced"),
+        crate::vault::CaTlsAdvance::Rotated { .. }
+    ));
+    store::save(&domain.path, &vault).expect("saved");
+    let vault_bytes = std::fs::read(&domain.path).expect("vault");
+    let remote = Remote::watching(&domain.path);
+
+    let finish = CaTlsFinish::begin(&domain.path, not_after).expect("still to finish");
+    let opening = finish.open(&domain.keys[0]).expect("one key");
+    finish
+        .finish(&remote, &domain.path, &opening, not_after)
+        .expect("the relay is finished");
+
+    assert_eq!(std::fs::read(&domain.path).expect("vault"), vault_bytes);
+    let relay = domain.relay();
+    assert_eq!(relay.ca_tls_epoch, Some(record.next_ca_tls_epoch));
+    assert_eq!(
+        relay.ca_tls_certificate.as_deref(),
+        Some(record.next_ca_tls_certificate.as_str())
+    );
+    assert_eq!(
+        relay.vault_fingerprint,
+        vault.fingerprint().expect("fingerprint").to_hex()
+    );
+    assert_eq!(record_of(&domain), None);
+    assert!(remote.called("send_vault_copy"));
+}
+
+/// A stop after the relay, before the record is cleared: the same press, and the
+/// relay is written the same.
+#[test]
+fn a_stop_between_the_relay_and_the_clearing_is_finished_by_the_next_press() {
+    let domain = domain();
+    let not_after = finished_client_tls(&domain);
+    let record = record_of(&domain).expect("record");
+    let remote = Remote::watching(&domain.path);
+    let finish = CaTlsFinish::begin(&domain.path, not_after).expect("ready");
+    let opening = finish.open(&domain.keys[0]).expect("one key");
+    finish
+        .finish(&remote, &domain.path, &opening, not_after)
+        .expect("finished");
+    let relay = domain.relay();
+    prepared::save(&prepared::path_beside(&domain.path), &record).expect("put back");
+
+    let finish = CaTlsFinish::begin(&domain.path, not_after).expect("still to finish");
+    let opening = finish.open(&domain.keys[0]).expect("one key");
+    finish
+        .finish(&remote, &domain.path, &opening, not_after)
+        .expect("finished again");
+
+    assert_eq!(domain.relay(), relay);
+    assert_eq!(record_of(&domain), None);
+}
+
+/// A journal stuck past `not_after` has not reached the gateway: promoting would
+/// destroy the outgoing key while the gateway never installed the successor.
+#[test]
+fn a_journal_stuck_on_the_gateway_is_never_promoted() {
+    let elsewhere = Some(Fingerprint::of(b"ancre en service"));
+    for (read, stop, late) in [
+        (None, ResumeStep::GatewayOutdated, false),
+        (elsewhere, ResumeStep::InstallDeadlinePassed, true),
+    ] {
+        let domain = domain();
+        let mut journal = domain.signed(RotationKind::CaTls);
+        let remote = Remote::watching(&domain.path);
+        remote.install_refused.set(Some(503));
+        advance(&remote, &domain.path, &mut journal, NOW).expect_err("not installed");
+        assert_eq!(journal.stage, JournalStage::Applied);
+        remote.install_refused.set(None);
+        *remote.gateway_anchor.borrow_mut() = read;
+        let at = if late { journal.activation_at } else { NOW };
+        assert_eq!(
+            advance(&remote, &domain.path, &mut journal, at).expect("stopped"),
+            stop
+        );
+        let record = record_of(&domain).expect("the apply left its record");
+        assert!(record.submitted && record.adopted);
+        let files = domain.files();
+        let touches = domain.touches();
+
+        let refused = CaTlsFinish::begin(&domain.path, journal.not_after + 1)
+            .err()
+            .expect("refused");
+
+        assert!(matches!(
+            refusal_of_finish(&refused),
+            FinishRefusal::InFlight
+        ));
+        assert_eq!(domain.touches(), touches, "{stop:?}");
+        assert_eq!(domain.files(), files, "{stop:?}");
+    }
+}
+
+/// A journal is written while the key is being touched: read again before anything
+/// moves. So is a vault that changed in that time.
+#[test]
+fn what_moved_during_the_touch_stops_the_finish() {
+    let domain = domain();
+    let not_after = finished_client_tls(&domain);
+    let remote = Remote::watching(&domain.path);
+
+    let finish = CaTlsFinish::begin(&domain.path, not_after).expect("ready");
+    let opening = finish.open(&domain.keys[0]).expect("one key");
+    let journal_path = rotation_journal::path_beside(&domain.path);
+    std::fs::write(&journal_path, b"{}").expect("a journal appears");
+    let files = domain.files();
+    let refused = finish
+        .finish(&remote, &domain.path, &opening, not_after)
+        .expect_err("refused");
+    assert!(matches!(
+        refusal_of_finish(&refused),
+        FinishRefusal::InFlight
+    ));
+    assert_eq!(domain.files(), files);
+    std::fs::remove_file(&journal_path).expect("gone");
+
+    let finish = CaTlsFinish::begin(&domain.path, not_after).expect("ready");
+    let opening = finish.open(&domain.keys[0]).expect("one key");
+    let mut moved = store::load(&domain.path).expect("vault");
+    moved.created_at += 1;
+    store::save(&domain.path, &moved).expect("saved");
+    let files = domain.files();
+    let refused = finish
+        .finish(&remote, &domain.path, &opening, not_after)
+        .expect_err("refused");
+    assert!(matches!(refusal_of_finish(&refused), FinishRefusal::Moved));
+    assert_eq!(domain.files(), files);
+    assert!(!remote.called("send_vault_copy"));
+}
+
+#[test]
+fn nothing_to_finish_asks_no_key() {
+    let domain = domain();
+    let touches = domain.touches();
+    let refused = CaTlsFinish::begin(&domain.path, NOW)
+        .err()
+        .expect("refused");
+    assert!(matches!(
+        refusal_of_finish(&refused),
+        FinishRefusal::Nothing
+    ));
+    assert_eq!(domain.touches(), touches);
+}
+
+/// Too early, and said before the key: the overlap is what the gateway relies on.
+#[test]
+fn the_finish_waits_for_not_after_before_any_key() {
+    let domain = domain();
+    let not_after = finished_client_tls(&domain);
+    let touches = domain.touches();
+    let refused = CaTlsFinish::begin(&domain.path, not_after - 1)
+        .err()
+        .expect("refused");
+    assert!(matches!(
+        refusal_of_finish(&refused),
+        FinishRefusal::NotYet { at } if *at == not_after
+    ));
+    assert_eq!(domain.touches(), touches);
+}
+
+/// A record `astra-signer` left, which no journal has carried to the gateway yet,
+/// or one never deposited: the resumption comes first.
+#[test]
+fn a_record_no_journal_has_carried_is_resumed_before_it_is_finished() {
+    let domain = domain();
+    let not_after = finished_client_tls(&domain);
+    let record = record_of(&domain).expect("record");
+    let path = prepared::path_beside(&domain.path);
+    for unfinished in [
+        prepared::PreparedRotation {
+            adopted: false,
+            ..record.clone()
+        },
+        prepared::PreparedRotation {
+            submitted: false,
+            ..record.clone()
+        },
+    ] {
+        prepared::save(&path, &unfinished).expect("saved");
+        let refused = CaTlsFinish::begin(&domain.path, not_after)
+            .err()
+            .expect("refused");
+        assert!(matches!(
+            refusal_of_finish(&refused),
+            FinishRefusal::InFlight
+        ));
+    }
+}
+
+/// The two files do not describe one vault: the certificate named is not the one
+/// the vault holds, whether it has already advanced or not. Nothing moves.
+#[test]
+fn a_record_naming_another_certificate_moves_nothing() {
+    for vault_advanced in [false, true] {
+        let domain = domain();
+        let not_after = finished_client_tls(&domain);
+        let record = record_of(&domain).expect("record");
+        if vault_advanced {
+            let mut vault = store::load(&domain.path).expect("vault");
+            let opening =
+                gestures::open_with_authorized_key(&domain.keys[0], &vault, "").expect("opened");
+            signing::advance_ca_tls(&mut vault, &opening, not_after).expect("advanced");
+            store::save(&domain.path, &vault).expect("saved");
+        }
+        // A certificate of the domain, and not the incoming one.
+        let another = domain.relay().ca_tls_certificate.expect("cert");
+        prepared::save(
+            &prepared::path_beside(&domain.path),
+            &prepared::PreparedRotation {
+                next_ca_tls_certificate: another,
+                ..record
+            },
+        )
+        .expect("saved");
+        let files = domain.files();
+        let remote = Remote::watching(&domain.path);
+
+        let finish = CaTlsFinish::begin(&domain.path, not_after).expect("readable");
+        let opening = finish.open(&domain.keys[0]).expect("one key");
+        let refused = finish
+            .finish(&remote, &domain.path, &opening, not_after)
+            .expect_err("refused");
+
+        assert!(
+            matches!(refusal_of_finish(&refused), FinishRefusal::Mismatch),
+            "{vault_advanced}"
+        );
+        assert_eq!(domain.files(), files, "{vault_advanced}");
+        assert_eq!(remote.calls(), Vec::<&str>::new());
+    }
+}
+
+#[test]
+fn a_key_outside_the_vault_is_turned_down_and_another_can_finish() {
+    let domain = domain();
+    let not_after = finished_client_tls(&domain);
+    let finish = CaTlsFinish::begin(&domain.path, not_after).expect("ready");
+    let stranger = TestKey::new(9);
+    stranger.registered.set(true);
+    assert!(matches!(finish.open(&stranger), Err(KeyStep::NotEnrolled)));
+    domain.keys[0].declines.set(true);
+    assert!(matches!(
+        finish.open(&domain.keys[0]),
+        Err(KeyStep::Declined)
+    ));
+    domain.keys[0].declines.set(false);
+    let opening = finish.open(&domain.keys[0]).expect("one key");
+    finish
+        .finish(
+            &Remote::watching(&domain.path),
+            &domain.path,
+            &opening,
+            not_after,
+        )
+        .expect("finished");
+}
+
+/// As after a rotation (§5.9): the copy lost or held back does not undo the vault,
+/// and the prerequisite reads what Astra holds.
+#[test]
+fn a_copy_refused_or_held_back_does_not_undo_the_finish() {
+    for answer in [Err(503), Ok(VaultCopySent::HeldBack)] {
+        let domain = domain();
+        let not_after = finished_client_tls(&domain);
+        let remote = Remote::watching(&domain.path);
+        remote.copies.borrow_mut().push_back(answer);
+
+        let finish = CaTlsFinish::begin(&domain.path, not_after).expect("ready");
+        let opening = finish.open(&domain.keys[0]).expect("one key");
+        finish
+            .finish(&remote, &domain.path, &opening, not_after)
+            .expect("finished");
+
+        assert!(remote.called("send_vault_copy"));
+        assert_eq!(record_of(&domain), None);
+    }
+}
+
+// What Orion asks before any key.
+
+#[test]
+fn what_stands_in_the_way_is_readable_before_any_key() {
+    let domain = domain();
+    ensure_nothing_outstanding(&domain.path).expect("nothing outstanding");
+    let keys = ValidatedKeys::new(&domain.path).expect("keys");
+    keys.ensure_domain_readable(&domain.path, RotationKind::CaTls)
+        .expect("readable");
+
+    let mut relay = domain.relay();
+    relay.ca_tls_certificate = None;
+    handoff::save(&handoff::path_beside(&domain.path), &relay).expect("relay");
+    assert!(keys
+        .ensure_domain_readable(&domain.path, RotationKind::CaTls)
+        .is_err());
+    keys.ensure_domain_readable(&domain.path, RotationKind::CaPq)
+        .expect("a CA-PQ rotation does not read it");
+    assert_eq!(domain.touches(), 0);
+
+    std::fs::write(rotation_journal::path_beside(&domain.path), b"{}").expect("journal");
+    assert!(ensure_nothing_outstanding(&domain.path).is_err());
+}
+
+#[test]
+fn terms_that_would_be_refused_are_read_before_they_cost_anything() {
+    check_terms(RotationKind::CaTls, &terms(), NOW).expect("the defaults");
+    let short = RotationTerms {
+        prepare_days: 0,
+        ..terms()
+    };
+    assert!(check_terms(RotationKind::CaPq, &short, NOW).is_err());
+    let brief = RotationTerms {
+        validity_days: DEFAULT_PREPARE_DAYS + DEFAULT_OVERLAP_DAYS,
+        ..terms()
+    };
+    assert!(check_terms(RotationKind::CaTls, &brief, NOW).is_err());
+    check_terms(RotationKind::CaPq, &brief, NOW).expect("no certificate to outlive");
+}
+
+#[test]
+fn an_opened_rotation_says_which_operation_and_until_when() {
+    let domain = domain();
+    let remote = domain.armed_remote();
+    let rotation = domain.opened(RotationKind::CaTls, &remote);
+    assert_eq!(rotation.operation_id(), operation());
+    assert_eq!(rotation.campaign_expires_at(), EXPIRES);
+}
+
+/// A gateway out of reach, told from one that answered.
+#[test]
+fn a_lost_connection_reads_apart_from_a_refusal() {
+    let tunnel = crate::tunnel::Tunnel::new("http://127.0.0.1:1").expect("tunnel");
+    let lost = tunnel.authority_status().expect_err("nothing listens");
+    assert!(crate::tunnel::is_unreachable(&lost));
+    assert!(!crate::tunnel::is_unreachable(&admin_refusal(503, None)));
+    assert!(!crate::tunnel::is_unreachable(&anyhow::anyhow!("autre")));
+}

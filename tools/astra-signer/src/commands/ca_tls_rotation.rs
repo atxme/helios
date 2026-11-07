@@ -310,6 +310,9 @@ pub(crate) fn record_to_promote(prepared_path: &Path) -> Result<prepared::Prepar
 pub(crate) fn promote_ca_tls(path: &Path, transport: Transport) -> Result<()> {
     use astra_operator::vault::CaTlsAdvance;
 
+    // That rotation has not reached the gateway: promoting would destroy the
+    // outgoing key while the gateway never installed its successor.
+    astra_operator::rotation_journal::ensure_none_in_flight(path)?;
     let mut vault = store::load(path)?;
     let prepared_path = prepared::path_beside(path);
     let record = record_to_promote(&prepared_path)?;

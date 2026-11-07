@@ -786,6 +786,8 @@ fn main() {
             begin_operator_ceremony,
             begin_vault_ceremony,
             begin_issuer_ceremony,
+            begin_rotation_ceremony,
+            approve_rotation_ceremony,
             rename_operator_key,
             write_domain_relay,
             adopt_connected_gateway,

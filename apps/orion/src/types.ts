@@ -695,6 +695,7 @@ export type KeyPurpose =
   | 'second_approval'
   | 'promotion'
   | 'register_key'
+  | 'validate_key'
 
 /** Où en est la cérémonie **sur ce poste**. */
 export type GestureState =
@@ -744,6 +745,12 @@ export type Refusal =
   | { refusal: 'manifest_mismatch' }
   | { refusal: 'protocol_violation' }
   | { refusal: 'cancelled' }
+  | { refusal: 'rotation_expired' }
+  | { refusal: 'domain_conflict' }
+  | { refusal: 'install_deadline_passed' }
+  | { refusal: 'gateway_names_no_anchor' }
+  | { refusal: 'rotation_in_flight' }
+  | { refusal: 'key_not_validated' }
   | { refusal: 'internal' }
 
 export interface RecoveryManifest {
@@ -968,6 +975,8 @@ export interface OperatorStatus {
   manifest?: AstraManifest
   keys?: KeySlotLabel[]
   refusal?: Refusal
+  /** Pourquoi la dernière clé a été écartée, tant qu'une autre est attendue. */
+  key_retry?: Refusal
 }
 
 /** Un geste d'enrôlement (§15.2), fermé : la page ne choisit que parmi ces trois. */
@@ -1006,6 +1015,24 @@ export type EnrollmentGesture =
 export type IssuerGesture =
   | { gesture: 'authorize_issuer'; operation_id: string; request: string }
   | { gesture: 'authorize_issuer_offline'; request: string }
+
+/** Un geste de rotation, fermé. Il ne porte aucune valeur : les dates viennent de l'approbation. */
+export type RotationGesture =
+  | { gesture: 'replace_ca_pq' }
+  | { gesture: 'replace_ca_tls' }
+  | { gesture: 'finish_ca_tls' }
+  | { gesture: 'resume' }
+
+/** Ce que l'écran d'approbation fixe. Public, comme le manifeste qui en découle. */
+export interface RotationTerms {
+  /** Une campagne déjà ouverte à reprendre, sinon `null`. */
+  existing_operation: string | null
+  reason: string
+  requested_by: string
+  prepare_days: number
+  overlap_days: number
+  validity_days: number
+}
 
 /** Un fichier produit par la cérémonie, à enregistrer par l'IHM. Contenu public. */
 export interface OperatorArtifact {

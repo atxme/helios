@@ -56,6 +56,7 @@ fn a_press_on_a_stale_revision_is_ignored_and_the_right_one_is_taken() {
             action: OperatorAction::Continue,
             revision: offered.revision + 5,
             owner: 0,
+            terms: None,
         })
         .expect("sent");
     presses
@@ -63,6 +64,7 @@ fn a_press_on_a_stale_revision_is_ignored_and_the_right_one_is_taken() {
             action: OperatorAction::Continue,
             revision: offered.revision,
             owner: 7,
+            terms: None,
         })
         .expect("sent");
 

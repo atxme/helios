@@ -19,6 +19,12 @@
 //! rotation until then. `apply_local` does not check the acceptance for itself:
 //! [`next_step`] is the only barrier, which is why [`advance`] is the only caller.
 //!
+//! # Ending a client TLS rotation
+//!
+//! [`CaTlsFinish`] is « Terminer »: one key, and the record [`advance`] left names the
+//! incoming certificate. It holds out while a journal is in flight, since that
+//! rotation has not reached the gateway and the outgoing key is all that still works.
+//!
 //! # What the words are
 //!
 //! This module decides and the caller shows. [`KeyStep`] is for a key that can be
@@ -56,7 +62,7 @@ use crate::signing::{
     MAX_CA_TLS_LIFETIME_SECS,
 };
 use crate::tunnel::{Tunnel, TunnelRefusal, VaultCopySent};
-use crate::vault::AuthorityVault;
+use crate::vault::{AuthorityVault, CaTlsAdvance};
 use crate::{credentials, prepared, store};
 
 /// Default of « Modifier » on the approval screen (spec §5.1).
@@ -213,6 +219,12 @@ impl ValidatedKeys {
         self.openings.len()
     }
 
+    /// What [`open`] would refuse of the files beside this vault, asked before a key
+    /// is touched for nothing.
+    pub fn ensure_domain_readable(&self, vault_path: &Path, kind: RotationKind) -> Result<()> {
+        LocalDomain::read(vault_path, &self.vault, kind).map(|_| ())
+    }
+
     fn is_validated(&self, credential_id: &[u8]) -> bool {
         self.openings
             .iter()
@@ -343,6 +355,11 @@ impl Schedule {
     }
 }
 
+/// What [`open`] would refuse of these terms, so that they cost no validated key.
+pub fn check_terms(kind: RotationKind, terms: &RotationTerms, now: u64) -> Result<()> {
+    Schedule::of(kind, terms, now).map(|_| ())
+}
+
 /// Opens the campaign, or reads the one named, and verifies it before any approval.
 ///
 /// Everything this machine can refuse by itself comes first, so that a campaign
@@ -464,7 +481,7 @@ fn rotation_manifest(
 /// A journal, or what will become one: a second rotation over it would name its
 /// outgoing anchor. The prepared record lasts until the promotion, and so does the
 /// window it describes.
-fn ensure_nothing_outstanding(vault_path: &Path) -> Result<()> {
+pub fn ensure_nothing_outstanding(vault_path: &Path) -> Result<()> {
     rotation_journal::ensure_none_in_flight(vault_path)?;
     if rotation_journal::legacy_ca_pq_path_beside(vault_path).exists() {
         bail!(
@@ -554,6 +571,16 @@ impl OpenedRotation {
     /// The dates the transition will carry.
     pub fn window(&self) -> TransitionWindow {
         self.schedule.window
+    }
+
+    /// The operation the approvals answer.
+    pub fn operation_id(&self) -> Id16 {
+        self.request.operation_id
+    }
+
+    /// When the campaign dies, and [`Self::approve`] with it.
+    pub fn campaign_expires_at(&self) -> u64 {
+        self.request.campaign.expires_at
     }
 
     /// The credentials still to answer: validated, not yet approved.
@@ -868,6 +895,165 @@ fn finish_with_the_copy(
             Ok(ResumeStep::Finished)
         }
     }
+}
+
+/// Why « Terminer » did not go through. Nothing moved, and no key was asked unless
+/// the refusal came after it.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum FinishRefusal {
+    /// A journal is in flight, or a record has yet to be carried by one: that rotation
+    /// has not reached the gateway, and promoting would destroy the outgoing key.
+    #[error("une rotation reste à reprendre avant de terminer. Rien n'a été modifié.")]
+    InFlight,
+    /// The overlap still runs: the gateway requires the outgoing generation.
+    #[error("le recouvrement court jusqu'à {at}. Rien n'a été modifié.")]
+    NotYet { at: u64 },
+    /// No rotation is waiting to end.
+    #[error("aucune rotation CA TLS à terminer")]
+    Nothing,
+    /// The vault changed between the manifest and the signature.
+    #[error("le coffre a changé depuis l'affichage. Rien n'a été modifié.")]
+    Moved,
+    /// The vault and the record do not describe one rotation.
+    #[error(
+        "le coffre ne détient pas l'ancre que nomme la rotation préparée. Rien n'a été modifié."
+    )]
+    Mismatch,
+}
+
+/// « Terminer », read with no key: the prepared record, and what it would do.
+pub struct CaTlsFinish {
+    vault: AuthorityVault,
+    record: prepared::PreparedRotation,
+    incoming: DerCertificate,
+    manifest: AstraManifest,
+}
+
+impl CaTlsFinish {
+    /// Everything refused here is refused before the key.
+    ///
+    /// The record is the same one whichever wrote it, and it names the certificate
+    /// because the journal is gone by now. It must have been through a journal, which
+    /// is what proves the gateway named the anchor. A record `astra-signer` left is
+    /// adopted by the resumption first, and comes back here marked so.
+    pub fn begin(vault_path: &Path, now: u64) -> Result<Self> {
+        rotation_journal::ensure_none_in_flight(vault_path).context(FinishRefusal::InFlight)?;
+        let record =
+            prepared::load(&prepared::path_beside(vault_path))?.ok_or(FinishRefusal::Nothing)?;
+        if !record.submitted || !record.adopted {
+            return Err(FinishRefusal::InFlight.into());
+        }
+        if now < record.not_after {
+            return Err(FinishRefusal::NotYet {
+                at: record.not_after,
+            }
+            .into());
+        }
+        let vault = store::load(vault_path)?;
+        let incoming = DerCertificate::parse(&record.next_ca_tls_certificate)
+            .context(FinishRefusal::Mismatch)?;
+        let manifest = finish_manifest(vault_path, &vault, &record, &incoming)?;
+        Ok(Self {
+            vault,
+            record,
+            incoming,
+            manifest,
+        })
+    }
+
+    /// What the touch does.
+    pub fn manifest(&self) -> &AstraManifest {
+        &self.manifest
+    }
+
+    /// One touch: this executes what two keys approved, and authorises nothing new.
+    pub fn open(&self, key: &dyn Authenticator) -> Result<Opened, KeyStep> {
+        gestures::open_with_authorized_key(key, &self.vault, NO_PIN).map_err(key_step_of_opening)
+    }
+
+    /// Moves the vault, then the relay, clears the record and sends the copy.
+    ///
+    /// Each write is atomic and this order survives a stop anywhere in it. A stop
+    /// after the vault leaves [`CaTlsAdvance::Idle`] beside a record still there, so
+    /// that state finishes the relay, once the vault proves it holds that certificate.
+    /// As after a rotation, a copy that fails undoes nothing: the prerequisite reads
+    /// what Astra holds, and the screen offers to send it (spec §5.9).
+    pub fn finish(
+        self,
+        remote: &dyn RotationRemote,
+        vault_path: &Path,
+        opening: &Opened,
+        now: u64,
+    ) -> Result<()> {
+        let Self {
+            mut vault,
+            record,
+            incoming,
+            ..
+        } = self;
+        // The operator may have stood at the prompt for a while.
+        rotation_journal::ensure_none_in_flight(vault_path).context(FinishRefusal::InFlight)?;
+        if store::load(vault_path)?.fingerprint()? != vault.fingerprint()? {
+            return Err(FinishRefusal::Moved.into());
+        }
+        ensure_vault_holds(&vault, opening, &incoming)?;
+        match signing::advance_ca_tls(&mut vault, opening, now)? {
+            CaTlsAdvance::Rotated { .. } => store::save(vault_path, &vault)?,
+            CaTlsAdvance::Idle => {}
+            CaTlsAdvance::Awaiting { at } => return Err(FinishRefusal::NotYet { at }.into()),
+        }
+        let mut relay = DomainHandoff::beside(vault_path, &vault)?;
+        relay.ca_tls_epoch = Some(record.next_ca_tls_epoch);
+        relay.ca_tls_certificate = Some(record.next_ca_tls_certificate);
+        handoff::save(&handoff::path_beside(vault_path), &relay)?;
+        prepared::clear(&prepared::path_beside(vault_path))?;
+        let _ = vault_copy(vault_path).and_then(|copy| remote.send_vault_copy(&copy));
+        Ok(())
+    }
+}
+
+/// The vault's window names `incoming`, or it has closed on it. Checked before the
+/// vault moves: an advance destroys the outgoing key, and a relay naming another
+/// certificate than the key would have nothing issue under it.
+fn ensure_vault_holds(
+    vault: &AuthorityVault,
+    opening: &Opened,
+    incoming: &DerCertificate,
+) -> Result<()> {
+    let holds = match vault.ca_tls_window(&opening.credential_id, &opening.secret)? {
+        Some((fingerprint, _)) => fingerprint == incoming.fingerprint().to_hex(),
+        None => signing::issues_under(vault, opening, incoming)?,
+    };
+    if holds {
+        Ok(())
+    } else {
+        Err(FinishRefusal::Mismatch.into())
+    }
+}
+
+fn finish_manifest(
+    vault_path: &Path,
+    vault: &AuthorityVault,
+    record: &prepared::PreparedRotation,
+    incoming: &DerCertificate,
+) -> Result<AstraManifest> {
+    let relay = DomainHandoff::beside(vault_path, vault)?;
+    let outgoing = DerCertificate::parse(relay.require(
+        relay.ca_tls_certificate.as_ref(),
+        "le certificat CA-TLS en service",
+        "--ca-tls-certificate",
+    )?)?;
+    Ok(AstraManifest::CaRotation(CaRotationManifest {
+        trust_domain_id: vault.trust_domain_id,
+        affected_ca: AffectedCa::CaTls,
+        current_epoch: record.next_ca_tls_epoch.saturating_sub(1),
+        next_epoch: record.next_ca_tls_epoch,
+        activation_at: record.activation_at,
+        not_after: record.not_after,
+        outgoing_anchor_fingerprint: outgoing.fingerprint(),
+        next_anchor_fingerprint: Some(incoming.fingerprint()),
+        campaign: None,
+    }))
 }
 
 /// The label of a rotation that stopped, for the steps [`advance`] stops at.

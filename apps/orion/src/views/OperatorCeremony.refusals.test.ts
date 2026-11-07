@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { refusalSentence } from './OperatorCeremony'
+import { gestureSentence, refusalSentence } from './OperatorCeremony'
 
 describe('refusalSentence for the acceptance', () => {
   it('names the consumed invitation and where to resume it', () => {
@@ -50,6 +50,34 @@ describe('refusalSentence for the issuer delegation', () => {
     )
     expect(refusalSentence({ refusal: 'ca_tls_unusable' })).toBe(
       'La CA-TLS du domaine expire avant la fin de cette délégation, ou n’est pas une autorité : la renouveler d’abord. Rien n’a été signé.',
+    )
+  })
+
+  it('the_rotation_refusals_have_their_labels', () => {
+    expect(refusalSentence({ refusal: 'rotation_expired' })).toBe('Rotation expirée. Recommencer.')
+    expect(refusalSentence({ refusal: 'domain_conflict' })).toBe(
+      'Domaine en désaccord. Intervention manuelle requise.',
+    )
+    expect(refusalSentence({ refusal: 'install_deadline_passed' })).toBe(
+      'Délai dépassé. Intervention manuelle requise.',
+    )
+    expect(refusalSentence({ refusal: 'rotation_in_flight' })).toBe(
+      'Rotation en cours. La mener à son terme d’abord.',
+    )
+    expect(refusalSentence({ refusal: 'key_not_validated' })).toBe('Clé non validée.')
+  })
+
+  it('a_gateway_naming_no_anchor_does_not_give_an_update_as_its_only_cause', () => {
+    const sentence = refusalSentence({ refusal: 'gateway_names_no_anchor' })
+    expect(sentence).toMatch(/sans CA TLS/)
+    expect(sentence).toMatch(/mise à jour/)
+    expect(sentence).toMatch(/conservée/)
+  })
+
+  it('a_validation_says_what_the_key_is_asked', () => {
+    const asked = { awaiting_key: { index: 1, of: 2, purpose: 'validate_key' as const } }
+    expect(gestureSentence(asked, 'rotate_anchor')).toBe(
+      'Brancher la clé autorisée (1 sur 2), pour la valider.',
     )
   })
 })

@@ -189,6 +189,33 @@ pub(crate) async fn begin_issuer_ceremony(
     state.operator.begin_issuer(gesture, vault_path).await
 }
 
+/// Opens a CA rotation gesture: replacing a CA, ending a client TLS rotation, or
+/// resuming one. The gateway is the connected profile's, read here from the engine;
+/// without one the gesture stops before any key.
+#[tauri::command]
+pub(crate) async fn begin_rotation_ceremony(
+    state: State<'_, AppState>,
+    gesture: crate::operator::RotationGesture,
+) -> Result<aether::certificates::operator_session::OperatorStatus, String> {
+    let vault_path = state.vault_location.path()?;
+    let gateway = connected_gateway(&state).await.ok();
+    state
+        .operator
+        .begin_rotation(gesture, gateway, vault_path)
+        .await
+}
+
+/// Answers the approval screen of a rotation, against the status the operator saw:
+/// this is what opens its campaign.
+#[tauri::command]
+pub(crate) async fn approve_rotation_ceremony(
+    state: State<'_, AppState>,
+    terms: astra_operator::operations::rotation::RotationTerms,
+    revision: u64,
+) -> Result<aether::certificates::operator_session::OperatorStatus, String> {
+    state.operator.approve_rotation(terms, revision).await
+}
+
 /// Renames a key. No key is asked anything: the label is outside what the
 /// vault seals.
 #[tauri::command]

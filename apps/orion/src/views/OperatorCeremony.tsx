@@ -350,6 +350,8 @@ export function gestureSentence(gesture: GestureState, operation: OperationKind)
             ? 'pour approuver la campagne affichée'
           : purpose === 'second_approval'
             ? 'pour la seconde approbation'
+          : purpose === 'validate_key'
+            ? 'pour la valider'
             : 'pour promouvoir ce qui a été préparé'
       return `Brancher la clé autorisée${which}, ${why}.`
     }
@@ -494,6 +496,18 @@ export function refusalSentence(refusal: Refusal): string {
       return 'Le canal local a été rompu.'
     case 'cancelled':
       return 'Abandonné.'
+    case 'rotation_expired':
+      return 'Rotation expirée. Recommencer.'
+    case 'domain_conflict':
+      return 'Domaine en désaccord. Intervention manuelle requise.'
+    case 'install_deadline_passed':
+      return 'Délai dépassé. Intervention manuelle requise.'
+    case 'gateway_names_no_anchor':
+      return 'Gateway sans CA TLS, ou mise à jour requise. Rotation conservée.'
+    case 'rotation_in_flight':
+      return 'Rotation en cours. La mener à son terme d’abord.'
+    case 'key_not_validated':
+      return 'Clé non validée.'
     case 'internal':
       return 'Le processus opérateur s’est arrêté sans conclure.'
   }

@@ -171,6 +171,31 @@ fn promote_reads_the_record_orion_leaves() {
     assert_eq!(commands::record_to_promote(&path).expect("read"), record);
 }
 
+/// A journal in flight is a rotation that has not reached the gateway: promoting
+/// would destroy the outgoing key while it never installed the successor. Refused
+/// by presence and before any key, with the record and the file as they were.
+#[test]
+fn promote_is_refused_while_a_rotation_journal_is_in_flight() {
+    let directory = tempfile::tempdir().expect("dir");
+    let vault = directory.path().join("vault.json");
+    let record_path = astra_operator::prepared::path_beside(&vault);
+    let record = record_left_by_orion(&record_path);
+    let journal = astra_operator::rotation_journal::path_beside(&vault);
+    std::fs::write(&journal, b"illisible").expect("journal");
+
+    let refused = commands::promote_ca_tls(&vault, Transport::default()).expect_err("refused");
+
+    assert!(
+        format!("{refused:#}").contains("une rotation est en cours"),
+        "{refused:#}"
+    );
+    assert_eq!(
+        astra_operator::prepared::load(&record_path).expect("read"),
+        Some(record)
+    );
+    assert_eq!(std::fs::read(&journal).expect("journal"), b"illisible");
+}
+
 /// Nothing to deposit again, so nothing to ask of the channel, which is out of
 /// reach here. A record that does want a deposit and holds no token says so.
 #[test]

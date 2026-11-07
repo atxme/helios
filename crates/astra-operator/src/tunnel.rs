@@ -89,6 +89,11 @@ pub struct TunnelRefusal {
     message: String,
 }
 
+/// Whether a call failed for want of an answer, rather than on what came back.
+pub fn is_unreachable(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<reqwest::Error>())
+}
+
 /// Where a vault copy landed.
 ///
 /// An enum rather than an error: [`VaultCopySent::HeldBack`] is an ordinary
@@ -633,7 +638,7 @@ impl Tunnel {
 }
 
 /// A refusal on the administrator surface, where no capability token is at play.
-pub(crate) fn admin_refusal(status: u16, reason: Option<String>) -> anyhow::Error {
+pub fn admin_refusal(status: u16, reason: Option<String>) -> anyhow::Error {
     let message = match (status, reason) {
         (_, Some(reason)) => format!("la gateway a refusé ({status}) : {reason}"),
         (403, None) => {

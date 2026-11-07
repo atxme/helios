@@ -44,6 +44,7 @@ use aether::certificates::operator_session::{
     RemoteState,
 };
 use aether_fido::authenticator::DialogOwner;
+use astra_operator::operations::rotation::RotationTerms;
 use ceremony::Press;
 use serde::{Deserialize, Deserializer, Serialize};
 use tokio::sync::{watch, Mutex};
@@ -400,6 +401,33 @@ impl IssuerGesture {
     }
 }
 
+/// A CA rotation gesture, as the WebView names it.
+///
+/// Closed, and it names no value: the dates and the reason come with the press that
+/// approves, and everything else from the files beside the vault.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(tag = "gesture", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RotationGesture {
+    /// Replaces the domain anchor: two keys validated, then two approvals.
+    ReplaceCaPq,
+    /// Replaces the client TLS CA, in the same four touches.
+    ReplaceCaTls,
+    /// Ends a client TLS rotation past `not_after`, with one key.
+    FinishCaTls,
+    /// Carries a signed rotation as far as it goes, with no key.
+    Resume,
+}
+
+impl RotationGesture {
+    /// `Resume` names what it found once it has read the journal.
+    fn operation(self) -> OperationKind {
+        match self {
+            Self::ReplaceCaPq | Self::Resume => OperationKind::RotateAnchor,
+            Self::ReplaceCaTls | Self::FinishCaTls => OperationKind::RotateClientTlsCa,
+        }
+    }
+}
+
 /// Renames the key `slot_id` of the vault at `vault_path`. No key is asked
 /// anything; the label is checked as a gesture's would be.
 pub fn rename_key(vault_path: &std::path::Path, slot_id: &str, label: &str) -> Result<(), String> {
@@ -596,6 +624,61 @@ impl OperatorCeremony {
         .await
     }
 
+    /// Starts a CA rotation gesture the same way, under the same rule of one
+    /// ceremony at a time.
+    ///
+    /// `gateway` is the control-plane address of the connected profile, read by
+    /// the caller from the engine, or `None` when no tunnel is up: every gesture
+    /// here goes through it, and none reaches a key without one.
+    pub async fn begin_rotation(
+        &self,
+        gesture: RotationGesture,
+        gateway: Option<String>,
+        vault_path: PathBuf,
+    ) -> Result<OperatorStatus, String> {
+        self.open(
+            gesture.operation(),
+            move |session_id, presses, publish, _artifacts| {
+                ceremony::run_rotation(session_id, gesture, gateway, presses, publish, &vault_path)
+            },
+        )
+        .await
+    }
+
+    /// Answers the wait for a rotation's terms, which opens its campaign.
+    ///
+    /// `revision` names the status the operator approved on. A press with no dialog
+    /// to own: the keys come after, each with a press of its own.
+    pub async fn approve_rotation(
+        &self,
+        terms: RotationTerms,
+        revision: u64,
+    ) -> Result<OperatorStatus, String> {
+        let mut held = self.0.lock().await;
+        let session = held
+            .as_mut()
+            .ok_or_else(|| "aucune cérémonie opérateur n'est ouverte".to_string())?;
+
+        let current = session.status.borrow_and_update().clone();
+        if !awaits_terms(&current) || !current.accepts(OperatorAction::Continue, revision) {
+            return Err(
+                "cette étape n'accepte pas cette action : l'écran a changé depuis la pression"
+                    .to_string(),
+            );
+        }
+
+        session
+            .presses
+            .send(Press {
+                action: OperatorAction::Continue,
+                revision,
+                owner: 0,
+                terms: Some(terms),
+            })
+            .map_err(|_| STOPPED.to_string())?;
+        awaited(&mut session.status).await
+    }
+
     /// The files the current session produced, or none.
     pub async fn artifacts(&self) -> Vec<OperatorArtifact> {
         match self.0.lock().await.as_ref() {
@@ -698,7 +781,9 @@ impl OperatorCeremony {
             .ok_or_else(|| "aucune cérémonie opérateur n'est ouverte".to_string())?;
 
         let current = session.status.borrow_and_update().clone();
-        if !current.accepts(action, revision) {
+        // A press there needs its terms, and only `approve_rotation` carries them.
+        let wants_terms = action == OperatorAction::Continue && awaits_terms(&current);
+        if wants_terms || !current.accepts(action, revision) {
             return Err(
                 "cette étape n'accepte pas cette action : l'écran a changé depuis la pression"
                     .to_string(),
@@ -711,6 +796,7 @@ impl OperatorCeremony {
                 action,
                 revision,
                 owner,
+                terms: None,
             })
             .map_err(|_| STOPPED.to_string())?;
         awaited(&mut session.status).await
@@ -731,6 +817,12 @@ impl OperatorCeremony {
         *held = None;
         Ok(())
     }
+}
+
+/// Whether a ceremony is waiting for a rotation's terms: its keys are validated and
+/// nothing is open yet. No other ceremony rests in this pair of states.
+fn awaits_terms(status: &OperatorStatus) -> bool {
+    status.gesture == GestureState::Idle && status.remote == RemoteState::Local
 }
 
 /// Publishes the end of a ceremony that stopped without one.

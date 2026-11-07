@@ -18,6 +18,8 @@ import type {
   DomainDefaults,
   EnrollmentGesture,
   IssuerGesture,
+  RotationGesture,
+  RotationTerms,
   RelayUpdate,
   VaultGesture,
   VaultLocationView,
@@ -318,6 +320,14 @@ export const beginEnrollmentCeremony = (gesture: EnrollmentGesture) =>
 /** Opens the delegation of Astra's issuer; only the request's text travels. */
 export const beginIssuerCeremony = (gesture: IssuerGesture) =>
   invoke<OperatorStatus>('begin_issuer_ceremony', { gesture })
+
+/** Opens a CA rotation gesture; the tunnel and the vault are read on the Rust side. */
+export const beginRotationCeremony = (gesture: RotationGesture) =>
+  invoke<OperatorStatus>('begin_rotation_ceremony', { gesture })
+
+/** Answers the approval screen, which opens the campaign. */
+export const approveRotationCeremony = (terms: RotationTerms, revision: number) =>
+  invoke<OperatorStatus>('approve_rotation_ceremony', { terms, revision })
 
 /** Opens a vault or domain gesture; the vault path is read on the Rust side. */
 export const beginVaultCeremony = (gesture: VaultGesture) =>

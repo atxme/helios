@@ -258,6 +258,8 @@ pub enum KeyPurpose {
     Promotion,
     /// A new key to register in the vault.
     RegisterKey,
+    /// Proving a key opens the vault, before any campaign exists.
+    ValidateKey,
 }
 
 /// Where the ceremony stands **on this machine**.
@@ -301,10 +303,12 @@ pub fn allowed_actions(remote: RemoteState, gesture: GestureState) -> Vec<Operat
         return Vec::new();
     }
     let mut actions = Vec::new();
+    // Nothing is open at `Local` and `Idle`: the keys are validated, and the
+    // operator's approval is what opens the campaign.
     if matches!(gesture, GestureState::AwaitingKey { .. })
         || matches!(
             (remote, gesture),
-            (RemoteState::Prepared, GestureState::Idle)
+            (RemoteState::Prepared, GestureState::Idle) | (RemoteState::Local, GestureState::Idle)
         )
     {
         actions.push(OperatorAction::Continue);
@@ -410,6 +414,23 @@ pub enum Refusal {
     /// certificate authority, or it does not cover the whole delegation
     /// window. Refused before any key.
     CaTlsUnusable,
+    /// Astra knows nothing of a rotation whose campaign died, and the vault never
+    /// moved. Its journal is gone: the rotation is started again.
+    RotationExpired,
+    /// The domain contradicts the rotation's journal. Nothing moved and nothing
+    /// was cleared: it is not for this machine to choose.
+    DomainConflict,
+    /// The transition did not reach the gateway before `activation_at`. The gateway
+    /// refuses it from now on, and no repair exists.
+    InstallDeadlinePassed,
+    /// The gateway names no anchor of this kind: it predates the field, or it is
+    /// current with no client TLS CA configured, and the two read the same. The
+    /// rotation is kept and resumes from its journal.
+    GatewayNamesNoAnchor,
+    /// A rotation stands in the way, or is not at the step this gesture takes.
+    RotationInFlight,
+    /// A key of the vault, but not one of the two validated for this ceremony.
+    KeyNotValidated,
     /// Anything the ceremony could not classify. Deliberately last and
     /// deliberately opaque: an unclassified failure must not become a channel
     /// for text.
@@ -737,6 +758,10 @@ pub struct OperatorStatus {
     pub keys: Vec<KeySlotLabel>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refusal: Option<Refusal>,
+    /// Why the last key was turned down, on a status still asking for one.
+    /// Distinct from [`Self::refusal`], which ends the ceremony: this ends nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_retry: Option<Refusal>,
 }
 
 impl OperatorStatus {
@@ -758,6 +783,7 @@ impl OperatorStatus {
             manifest: None,
             keys: Vec::new(),
             refusal: None,
+            key_retry: None,
         }
     }
 
@@ -850,6 +876,91 @@ mod tests {
     fn a_creation_manifest_with_an_extra_field_is_refused() {
         let text = r#"{"operation":"domain_creation","rp_id":"a.example","authority_url":"https://a.example","first_label":"a","second_label":"b","extra":1}"#;
         assert!(serde_json::from_str::<AstraManifest>(text).is_err());
+    }
+
+    /// Validating a key is a touch like any other: it can be taken or abandoned.
+    #[test]
+    fn a_key_validation_may_be_continued_and_abandoned() {
+        let actions = allowed_actions(
+            RemoteState::Local,
+            GestureState::AwaitingKey {
+                index: 1,
+                of: 2,
+                purpose: KeyPurpose::ValidateKey,
+            },
+        );
+        assert_eq!(
+            actions,
+            vec![OperatorAction::Continue, OperatorAction::Cancel]
+        );
+        assert_eq!(
+            serde_json::to_value(KeyPurpose::ValidateKey).expect("purpose"),
+            serde_json::json!("validate_key")
+        );
+    }
+
+    /// Both keys validated, nothing open yet: the operator approves or abandons.
+    #[test]
+    fn the_wait_for_the_terms_may_be_answered_and_abandoned() {
+        assert_eq!(
+            allowed_actions(RemoteState::Local, GestureState::Idle),
+            vec![OperatorAction::Continue, OperatorAction::Cancel]
+        );
+    }
+
+    /// A retry is not an end: the status still offers the key, and says why the
+    /// last one was turned down. Absent from the wire when there is none.
+    #[test]
+    fn a_key_retry_rides_a_status_that_stays_open() {
+        let mut status = OperatorStatus::new(
+            session(),
+            4,
+            OperationKind::RotateAnchor,
+            RemoteState::Local,
+            GestureState::AwaitingKey {
+                index: 2,
+                of: 2,
+                purpose: KeyPurpose::ValidateKey,
+            },
+        );
+        let bare = serde_json::to_value(&status).expect("status");
+        assert!(bare.get("key_retry").is_none());
+        assert_eq!(
+            serde_json::from_value::<OperatorStatus>(bare)
+                .expect("a status with no retry")
+                .key_retry,
+            None
+        );
+
+        status.key_retry = Some(Refusal::KeyRepeated);
+        let encoded = serde_json::to_value(&status).expect("status");
+        assert_eq!(
+            encoded["key_retry"],
+            serde_json::json!({ "refusal": "key_repeated" })
+        );
+        assert_eq!(
+            serde_json::from_value::<OperatorStatus>(encoded).expect("round trip"),
+            status
+        );
+        assert!(!status.gesture.is_terminal());
+        assert!(status.accepts(OperatorAction::Continue, 4));
+    }
+
+    #[test]
+    fn the_rotation_refusals_carry_no_text() {
+        for (refusal, wire) in [
+            (Refusal::RotationExpired, "rotation_expired"),
+            (Refusal::DomainConflict, "domain_conflict"),
+            (Refusal::InstallDeadlinePassed, "install_deadline_passed"),
+            (Refusal::GatewayNamesNoAnchor, "gateway_names_no_anchor"),
+            (Refusal::RotationInFlight, "rotation_in_flight"),
+            (Refusal::KeyNotValidated, "key_not_validated"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(refusal).expect("refusal"),
+                serde_json::json!({ "refusal": wire })
+            );
+        }
     }
 
     #[test]

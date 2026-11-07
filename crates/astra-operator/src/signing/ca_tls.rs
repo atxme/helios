@@ -184,6 +184,24 @@ pub fn rotate_ca_tls(
     })
 }
 
+/// Whether `certificate` certifies the key the vault issues under.
+///
+/// What an advanced vault says of its window, since it no longer holds one: the
+/// private half is all that remains to compare.
+pub fn issues_under(
+    vault: &AuthorityVault,
+    opening: &crate::authenticator::Opened,
+    certificate: &DerCertificate,
+) -> Result<bool> {
+    with_anchors(vault, opening, |secrets| {
+        let key_der = decode(&secrets.ca_tls_private_key, "clé privée CA-TLS")?;
+        let key = KeyPair::try_from(key_der.as_slice())
+            .map_err(|error| GestureError::Anchors(format!("clé privée CA-TLS : {error}")))?;
+        Ok(rcgen::PublicKeyData::subject_public_key_info(&key)
+            == aether::certificates::x509::subject_public_key_info(certificate)?)
+    })
+}
+
 /// Closes an open `CA-TLS` window once its `not_after` has passed (spec §9.2).
 ///
 /// A thin wrapper: the whole decision is [`AuthorityVault::advance_ca_tls`],
