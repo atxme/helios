@@ -220,6 +220,13 @@ corps de la requête :
 Le tableau est une donnée de la porte, testée comme telle. Élargir le tunnel à
 une action est un changement explicite de cette table, pas un effet de bord.
 
+**Amendement du 7 novembre 2026 (lot 5b).** Le tableau ci-dessus est celui du
+5a. Le 5b l'élargit, et le code livré dit : `IssuerDelegation` (délégation avec
+campagne) est ouverte au tunnel (`(true, true)`) ; `IssuerRequest` reste à la
+console seule ; `VaultCopy`, nouvelle variante, est au tunnel seul
+(`(false, true)`) : la console garde sa procédure. Les autres lignes sont
+inchangées. Voir `2026-11-04-f14-lot5b-rotations-design.md` §5.8, §5.9 et § 10.
+
 ### 5.3 Bornes tenues par la porte
 
 - `reason` et `requested_by` non vides ; fenêtre de 1 à 300 s (inchangé).

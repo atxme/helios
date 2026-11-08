@@ -258,6 +258,8 @@ pub enum KeyPurpose {
     Promotion,
     /// A new key to register in the vault.
     RegisterKey,
+    /// Proving a key opens the vault, before any campaign exists.
+    ValidateKey,
 }
 
 /// Where the ceremony stands **on this machine**.
@@ -397,8 +399,8 @@ pub enum Refusal {
     /// The domain moved between the manifest shown and the press: what would
     /// be signed is no longer what the operator saw. Nothing was signed.
     DomainChanged,
-    /// The credential document revokes the key that answered: it cannot
-    /// approve.
+    /// The credential document revokes the key that answered, or marks it
+    /// lost: it cannot approve.
     SignerRevoked,
     /// The file is not a delegation request that can be read: nothing was
     /// signed.
@@ -410,6 +412,37 @@ pub enum Refusal {
     /// certificate authority, or it does not cover the whole delegation
     /// window. Refused before any key.
     CaTlsUnusable,
+    /// Astra knows nothing of a rotation whose campaign died, and the vault never
+    /// moved. Its journal is gone: the rotation is started again.
+    RotationExpired,
+    /// The domain contradicts the rotation's journal, or Astra and the vault name
+    /// different anchors before any campaign. Nothing moved and nothing was
+    /// cleared: it is not for this machine to choose.
+    DomainConflict,
+    /// The transition did not reach the gateway before `activation_at`. The gateway
+    /// refuses it from now on, and no repair exists.
+    InstallDeadlinePassed,
+    /// The gateway names no anchor of this kind: it predates the field, or it is
+    /// current with no client TLS CA configured, and the two read the same. The
+    /// rotation is kept and resumes from its journal.
+    GatewayNamesNoAnchor,
+    /// A rotation stands in the way, or is not at the step this gesture takes.
+    RotationInFlight,
+    /// The campaign of a signed rotation has just closed, and Astra naming nothing
+    /// of it is not yet its last word: a deposit may still be committing. Nothing
+    /// was cleared; a look from `until` on decides.
+    CampaignClosing { until: u64 },
+    /// The key that answered is not the one this step can take: outside the two
+    /// validated, or one that has already approved.
+    KeyNotValidated,
+    /// The approval screen's terms are outside what a rotation accepts. Nothing was
+    /// sent, and the screen stays.
+    TermsRefused,
+    /// No client TLS rotation is waiting to end.
+    NothingToFinish,
+    /// The client TLS overlap runs until `until`, on this machine's clock: the
+    /// gateway still requires the outgoing generation. Nothing was modified.
+    OverlapRunning { until: u64 },
     /// Anything the ceremony could not classify. Deliberately last and
     /// deliberately opaque: an unclassified failure must not become a channel
     /// for text.
@@ -671,8 +704,14 @@ pub struct CaRotationManifest {
     pub activation_at: u64,
     pub not_after: u64,
     pub outgoing_anchor_fingerprint: Fingerprint,
-    pub next_anchor_fingerprint: Fingerprint,
-    pub target_count: usize,
+    /// Absent at the touch: the incoming anchor does not exist before the
+    /// signature, which the approvals come before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_anchor_fingerprint: Option<Fingerprint>,
+    /// The campaign the keys approve, when there is one. Absent for a rotation
+    /// signed offline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub campaign: Option<CampaignManifest>,
 }
 
 impl CaRotationManifest {
@@ -731,6 +770,19 @@ pub struct OperatorStatus {
     pub keys: Vec<KeySlotLabel>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refusal: Option<Refusal>,
+    /// Why the last answer was turned down, on a status still asking for another: a
+    /// key, or a rotation's terms. Distinct from [`Self::refusal`], which ends the
+    /// ceremony: this ends nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_retry: Option<Refusal>,
+    /// The labels of the keys that approved, in the order they did. A key is named by
+    /// the label it validated under, so the screen can say which of its keys is done.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub approved: Vec<KeySlotLabel>,
+    /// When a wait for the operator ends by itself, unix seconds. Only a rotation's key
+    /// and terms steps set it: nothing the operator types renews it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_until: Option<u64>,
 }
 
 impl OperatorStatus {
@@ -752,6 +804,9 @@ impl OperatorStatus {
             manifest: None,
             keys: Vec::new(),
             refusal: None,
+            key_retry: None,
+            approved: Vec::new(),
+            idle_until: None,
         }
     }
 
@@ -844,6 +899,107 @@ mod tests {
     fn a_creation_manifest_with_an_extra_field_is_refused() {
         let text = r#"{"operation":"domain_creation","rp_id":"a.example","authority_url":"https://a.example","first_label":"a","second_label":"b","extra":1}"#;
         assert!(serde_json::from_str::<AstraManifest>(text).is_err());
+    }
+
+    /// Validating a key is a touch like any other: it can be taken or abandoned.
+    #[test]
+    fn a_key_validation_may_be_continued_and_abandoned() {
+        let actions = allowed_actions(
+            RemoteState::Local,
+            GestureState::AwaitingKey {
+                index: 1,
+                of: 2,
+                purpose: KeyPurpose::ValidateKey,
+            },
+        );
+        assert_eq!(
+            actions,
+            vec![OperatorAction::Continue, OperatorAction::Cancel]
+        );
+        assert_eq!(
+            serde_json::to_value(KeyPurpose::ValidateKey).expect("purpose"),
+            serde_json::json!("validate_key")
+        );
+    }
+
+    /// Both keys validated, nothing open yet. Approving takes its terms and has a
+    /// command of its own, so a Continue offered here could only be refused.
+    #[test]
+    fn the_wait_for_the_terms_may_be_answered_and_abandoned() {
+        assert_eq!(
+            allowed_actions(RemoteState::Local, GestureState::Idle),
+            vec![OperatorAction::Cancel]
+        );
+    }
+
+    /// A retry is not an end: the status still offers the key, and says why the
+    /// last one was turned down. Absent from the wire when there is none.
+    #[test]
+    fn a_key_retry_rides_a_status_that_stays_open() {
+        let mut status = OperatorStatus::new(
+            session(),
+            4,
+            OperationKind::RotateAnchor,
+            RemoteState::Local,
+            GestureState::AwaitingKey {
+                index: 2,
+                of: 2,
+                purpose: KeyPurpose::ValidateKey,
+            },
+        );
+        let bare = serde_json::to_value(&status).expect("status");
+        assert!(bare.get("key_retry").is_none());
+        assert_eq!(
+            serde_json::from_value::<OperatorStatus>(bare)
+                .expect("a status with no retry")
+                .key_retry,
+            None
+        );
+
+        status.key_retry = Some(Refusal::KeyRepeated);
+        let encoded = serde_json::to_value(&status).expect("status");
+        assert_eq!(
+            encoded["key_retry"],
+            serde_json::json!({ "refusal": "key_repeated" })
+        );
+        assert_eq!(
+            serde_json::from_value::<OperatorStatus>(encoded).expect("round trip"),
+            status
+        );
+        assert!(!status.gesture.is_terminal());
+        assert!(status.accepts(OperatorAction::Continue, 4));
+    }
+
+    #[test]
+    fn the_rotation_refusals_carry_no_text() {
+        for (refusal, wire) in [
+            (Refusal::RotationExpired, "rotation_expired"),
+            (Refusal::DomainConflict, "domain_conflict"),
+            (Refusal::InstallDeadlinePassed, "install_deadline_passed"),
+            (Refusal::GatewayNamesNoAnchor, "gateway_names_no_anchor"),
+            (Refusal::RotationInFlight, "rotation_in_flight"),
+            (Refusal::KeyNotValidated, "key_not_validated"),
+            (Refusal::TermsRefused, "terms_refused"),
+            (Refusal::NothingToFinish, "nothing_to_finish"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(refusal).expect("refusal"),
+                serde_json::json!({ "refusal": wire })
+            );
+        }
+    }
+
+    /// A date, and still no text: the screen words it.
+    #[test]
+    fn the_dated_rotation_refusals_carry_their_instant_only() {
+        assert_eq!(
+            serde_json::to_value(Refusal::CampaignClosing { until: 7 }).expect("refusal"),
+            serde_json::json!({ "refusal": "campaign_closing", "until": 7 })
+        );
+        assert_eq!(
+            serde_json::to_value(Refusal::OverlapRunning { until: 9 }).expect("refusal"),
+            serde_json::json!({ "refusal": "overlap_running", "until": 9 })
+        );
     }
 
     #[test]
@@ -988,13 +1144,51 @@ mod tests {
             activation_at: 10,
             not_after: 20,
             outgoing_anchor_fingerprint: Fingerprint::of(b"outgoing"),
-            next_anchor_fingerprint: Fingerprint::of(b"next"),
-            target_count: 3,
+            next_anchor_fingerprint: Some(Fingerprint::of(b"next")),
+            campaign: None,
         });
         assert_eq!(manifest.kind(), OperationKind::RotateClientTlsCa);
         assert_eq!(
             manifest.trust_domain_id(),
             Some(Id16::new([1; 16]).expect("domain"))
+        );
+    }
+
+    /// At the touch there is no incoming anchor to name. A manifest that does name
+    /// one, written before these two fields were optional, still reads.
+    #[test]
+    fn a_rotation_manifest_may_name_no_incoming_anchor_and_no_campaign() {
+        let manifest = CaRotationManifest {
+            trust_domain_id: Id16::new([1; 16]).expect("domain"),
+            affected_ca: AffectedCa::CaPq,
+            current_epoch: 1,
+            next_epoch: 2,
+            activation_at: 10,
+            not_after: 20,
+            outgoing_anchor_fingerprint: Fingerprint::of(b"outgoing"),
+            next_anchor_fingerprint: None,
+            campaign: None,
+        };
+        let encoded = serde_json::to_value(&manifest).expect("encoding");
+        assert!(encoded.get("next_anchor_fingerprint").is_none());
+        assert!(encoded.get("campaign").is_none());
+        assert_eq!(
+            serde_json::from_value::<CaRotationManifest>(encoded).expect("decoding"),
+            manifest
+        );
+
+        let named = CaRotationManifest {
+            next_anchor_fingerprint: Some(Fingerprint::of(b"next")),
+            ..manifest
+        };
+        let encoded = serde_json::to_value(&named).expect("encoding");
+        assert_eq!(
+            encoded["next_anchor_fingerprint"],
+            serde_json::to_value(Fingerprint::of(b"next")).expect("fingerprint")
+        );
+        assert_eq!(
+            serde_json::from_value::<CaRotationManifest>(encoded).expect("decoding"),
+            named
         );
     }
 

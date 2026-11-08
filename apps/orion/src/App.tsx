@@ -22,6 +22,7 @@ import { OrionMark } from './components/OrionMark'
 import { PosturePanel } from './components/PosturePanel'
 import { postureMeta } from './components/state'
 import { GUTTER, PINE } from './theme'
+import { overlapReason } from './views/astra/rotationRows'
 
 /**
  * Application shell — a navigation rail, a content area, nothing that scrolls.
@@ -65,6 +66,9 @@ export default function App() {
   // also owns certificate-authority operations an operator may start there;
   // this state drives only the attention badge.
   const [astraPending, setAstraPending] = useState(false)
+  // A rotation signed and not finished: its install deadline runs with no session open,
+  // and an operator who left a failure screen for Connexion has no other reminder.
+  const [rotationInFlight, setRotationInFlight] = useState(false)
   // The Certificates view is unmounted during the Astra ceremony. Keep the
   // committed result here so returning to it does not erase the operation the
   // user just completed.
@@ -73,8 +77,8 @@ export default function App() {
     RenewalProgress
   > | null>(null)
 
-  // What makes the tab live: a protocol-2 ceremony the helper is running, or
-  // the legacy CA-TLS rotation still in flight. Polled rather than pushed
+  // What makes the tab live: a ceremony the helper is running, or an operation
+  // waiting for the operator. Polled rather than pushed
   // because a ceremony outlives any one view, and an operator who switched
   // away must find it again where they left it.
   useEffect(() => {
@@ -82,19 +86,16 @@ export default function App() {
     const look = () => {
       void Promise.allSettled([
         api.operatorCeremonyStatus(),
-        api.astraCaTlsRotationStatus(),
         api.operatorPendingOperations(),
-      ]).then(([operator, legacy, pending]) => {
+      ]).then(([operator, pending]) => {
         if (cancelled) return
         const live =
           (operator.status === 'fulfilled' && operatorCeremonyIsLive(operator.value)) ||
-          (legacy.status === 'fulfilled' && legacy.value.phase !== 'idle') ||
           (pending.status === 'fulfilled' && pending.value.length > 0)
         if (live) {
           setAstraPending(true)
         } else if (
           operator.status === 'fulfilled' &&
-          legacy.status === 'fulfilled' &&
           pending.status === 'fulfilled'
         ) {
           // Only a complete observation may grey the entry. A transient
@@ -111,8 +112,34 @@ export default function App() {
     }
   }, [])
 
+  // The journal, not the ceremony: a finished session is not live, yet its journal is.
+  // A read of files beside the vault: the overview goes through the tunnel and is not for
+  // a timer that runs for every user. A failed read keeps what was last known.
+  useEffect(() => {
+    let cancelled = false
+    const look = () => {
+      void api
+        .operatorRotationJournal()
+        .then((found) => {
+          if (!cancelled) setRotationInFlight(found.journal != null || found.resumable)
+        })
+        .catch(() => {})
+    }
+    look()
+    const timer = window.setInterval(look, 60_000)
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+    }
+  }, [])
+
   /// Opens the §7.5 ceremony for one operation, and goes to where it shows.
   const approveRecovery = async (operationId: string) => {
+    // Astra refuses every approval under the local document during a CA-PQ overlap, after
+    // the touch: not read is treated as an overlap, so no touch is spent on a guess.
+    const { caPqOverlap } = await api.operatorRotationsOverview()
+    const suspended = overlapReason(caPqOverlap)
+    if (suspended) throw new Error(suspended)
     await api.beginOperatorCeremony({ kind: 'recover_identity', operation_id: operationId })
     setLocalRecoveryId(operationId)
     setAstraPending(true)
@@ -333,7 +360,7 @@ export default function App() {
               const pending =
                 value === 'logs' && view !== 'logs'
                   ? c.logs.length
-                  : value === 'astra' && astraPending && view !== 'astra'
+                  : value === 'astra' && (astraPending || rotationInFlight) && view !== 'astra'
                     ? 1
                     : 0
               return (

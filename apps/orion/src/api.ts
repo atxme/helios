@@ -8,16 +8,21 @@ import type {
   VaultOverview,
   About,
   ApprovalManifest,
-  AstraRotationInput,
-  AstraRotationStatus,
   OperationLocator,
   OperatorAction,
   OperatorPendingOperation,
+  LocalRotationJournal,
+  RotationsOverview,
+  OpenCampaignAction,
+  OperatorOpened,
+  VaultCopyOutcome,
   OperatorStatus,
   OperatorArtifact,
   DomainDefaults,
   EnrollmentGesture,
   IssuerGesture,
+  RotationGesture,
+  RotationTerms,
   RelayUpdate,
   VaultGesture,
   VaultLocationView,
@@ -286,22 +291,6 @@ export const disconnect = () => invoke<void>('disconnect')
 /** Renews the ML-KEM PSK now, through the tunnel. */
 export const renewPsk = () => invoke<void>('renew_psk')
 
-/** Opens the Rust-owned, two-key CA-TLS signing ceremony. */
-export const startAstraCaTlsRotation = (input: AstraRotationInput) =>
-  invoke<AstraRotationStatus>('start_astra_ca_tls_rotation', { input })
-
-/** Advances the open ceremony after the requested security key was connected. */
-export const continueAstraCaTlsRotation = () =>
-  invoke<AstraRotationStatus>('continue_astra_ca_tls_rotation')
-
-/** Stops the open signer session without producing a transition. */
-export const cancelAstraCaTlsRotation = () =>
-  invoke<AstraRotationStatus>('cancel_astra_ca_tls_rotation')
-
-/** Restores or polls the Rust-owned ceremony after a view change. */
-export const astraCaTlsRotationStatus = () =>
-  invoke<AstraRotationStatus>('astra_ca_tls_rotation_status')
-
 /* Cérémonies opérateur (protocole 2). Le WebView ne nomme qu'un localisateur ;
  * l'origine, le RP ID, le domaine et la clé de service viennent du hand-off que
  * le processus opérateur épingle lui-même. */
@@ -318,6 +307,14 @@ export const beginEnrollmentCeremony = (gesture: EnrollmentGesture) =>
 /** Opens the delegation of Astra's issuer; only the request's text travels. */
 export const beginIssuerCeremony = (gesture: IssuerGesture) =>
   invoke<OperatorStatus>('begin_issuer_ceremony', { gesture })
+
+/** Opens a CA rotation gesture; the tunnel and the vault are read on the Rust side. */
+export const beginRotationCeremony = (gesture: RotationGesture) =>
+  invoke<OperatorStatus>('begin_rotation_ceremony', { gesture })
+
+/** Answers the approval screen, which opens the campaign. */
+export const approveRotationCeremony = (terms: RotationTerms, revision: number) =>
+  invoke<OperatorStatus>('approve_rotation_ceremony', { terms, revision })
 
 /** Opens a vault or domain gesture; the vault path is read on the Rust side. */
 export const beginVaultCeremony = (gesture: VaultGesture) =>
@@ -377,6 +374,30 @@ export const resumeCertificateRecovery = (operationId: string) =>
  * rendrait lisible par quiconque l'atteint. */
 export const operatorPendingOperations = () =>
   invoke<OperatorPendingOperation[]>('operator_pending_operations')
+
+/** Tout ce que montre l'écran des rotations, lu sans clé ; aucun chemin ni jeton n'y figure. */
+export const operatorRotationsOverview = () =>
+  invoke<RotationsOverview>('operator_rotations_overview')
+
+/** Le journal de rotation et la reprise à faire : les fichiers à côté du coffre, rien d'autre. */
+export const operatorRotationJournal = () =>
+  invoke<LocalRotationJournal>('operator_rotation_journal')
+
+/**
+ * Envoie la copie du coffre à Astra, sans rien nommer : le coffre et ses credentials
+ * sont lus côté Rust. « Retenue » est une réponse, pas un échec.
+ */
+export const operatorSendVaultCopy = () => invoke<VaultCopyOutcome>('operator_send_vault_copy')
+
+/**
+ * Ouvre une campagne (postes ou délégation de l'émetteur). Un 403 revient tel quel :
+ * la porte répond ainsi quand une opération est déjà ouverte, lire alors `pending`.
+ */
+export const operatorOpenCampaign = (
+  action: OpenCampaignAction,
+  reason: string,
+  requestedBy: string,
+) => invoke<OperatorOpened>('operator_open_campaign', { action, reason, requestedBy })
 
 /**
  * Adjusts the window to the displayed view.

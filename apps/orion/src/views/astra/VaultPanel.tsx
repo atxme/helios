@@ -18,6 +18,7 @@ import type { KeyRole, OperatorStatus, SlotView, VaultGesture, VaultLocationView
 import { CreateDomainForm } from './CreateDomainForm'
 import { KeyRow } from './KeyRow'
 import { useOverview } from './useOverview'
+import { VaultCopyLine } from './VaultCopy'
 
 const MIN_KEYS = 2
 const WAIT_GATEWAY = 'La gateway n’est pas encore dans le relais.'
@@ -286,6 +287,8 @@ export function VaultPanel({ onCeremony }: { onCeremony: (status: OperatorStatus
           </Alert>
         )}
       </Paper>
+      {/* A key change re-signs the document Astra checks approvals against (spec §5.9). */}
+      <VaultCopyLine />
       <Dialog open={removing !== null} onClose={() => setRemoving(null)} fullWidth maxWidth="xs">
         <DialogTitle sx={{ fontSize: 13 }}>Retirer une clé</DialogTitle>
         <DialogContent>

@@ -327,6 +327,7 @@ fn domain_pinned_to(policy: Fingerprint) -> PinnedDomain {
         astra_service_public_key: service,
         issuer: None,
         transitions: Vec::new(),
+        promoted_credentials: None,
         peers: std::collections::BTreeMap::new(),
         status_epochs: std::collections::BTreeMap::new(),
         audit: crate::audit::AuditChain::default(),

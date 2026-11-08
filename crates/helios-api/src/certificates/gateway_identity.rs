@@ -84,6 +84,24 @@ pub struct AnchorDecisionView {
     pub already_present: bool,
 }
 
+/// A staged rotation of the client `CA-TLS`, as the console displays it back
+/// (spec §9.4).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientTlsCaDecisionView {
+    /// The generation in service. It does not move here.
+    pub ca_tls_epoch: u64,
+    pub next_ca_tls_epoch: u64,
+    /// The incoming anchor, for the operator to compare with the companion.
+    pub next_ca_tls_fingerprint: String,
+    /// From this instant both chains are accepted.
+    pub activation_at: u64,
+    /// When the outgoing anchor is retired and the epoch finally moves.
+    pub not_after: u64,
+    /// `true` when this exact document was already applied.
+    pub already_present: bool,
+}
+
 /// The lifecycle gestures the console drives on this daemon's own registry
 /// (spec §12.2).
 ///
@@ -128,6 +146,12 @@ pub trait GatewayIdentityHandler: Send + Sync {
         &self,
         transition: Box<aether::certificates::authority::CaTransition>,
     ) -> Result<AnchorDecisionView, GatewayActionRefusal>;
+
+    /// Stages a rotation of the client `CA-TLS` (spec §9.4).
+    async fn install_client_tls_ca_transition(
+        &self,
+        transition: Box<aether::certificates::authority::ClientTlsCaTransition>,
+    ) -> Result<ClientTlsCaDecisionView, GatewayActionRefusal>;
 }
 
 /// Why a gateway identity gesture was refused, in words the operator reads.
@@ -227,6 +251,23 @@ pub async fn ca_transition_install(
         return gateway_identity_absent();
     };
     match handler.install_ca_transition(Box::new(transition)).await {
+        Ok(view) => (StatusCode::OK, Json(view)).into_response(),
+        Err(refusal) => refusal.into_response(),
+    }
+}
+
+/// `POST /api/certificates/client-tls-ca-transition`, on the admin surface.
+pub async fn client_tls_ca_transition_install(
+    State(s): State<AppState>,
+    Json(transition): Json<aether::certificates::authority::ClientTlsCaTransition>,
+) -> Response {
+    let Some(handler) = s.gateway_identity.as_ref() else {
+        return gateway_identity_absent();
+    };
+    match handler
+        .install_client_tls_ca_transition(Box::new(transition))
+        .await
+    {
         Ok(view) => (StatusCode::OK, Json(view)).into_response(),
         Err(refusal) => refusal.into_response(),
     }

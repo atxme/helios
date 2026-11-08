@@ -350,6 +350,24 @@ impl AstraRegistry {
     /// without the other.
     pub fn forget_expired_transitions(&mut self, now_unix: u64) -> Result<usize, RegistryError> {
         let before = self.state.transitions.len();
+        // Read before the retain below drops the transition this promotion
+        // consumes: the document it carries is what the daemon adopts.
+        let rotation_credentials = self.state.ca_rotation.as_ref().and_then(|rotation| {
+            if now_unix < rotation.retire_active_at {
+                return None;
+            }
+            self.state
+                .transitions
+                .iter()
+                .find_map(|stored| match &stored.object {
+                    aether::certificates::transport::TrustUpdateObject::CaTransition(
+                        transition,
+                    ) if transition.next_ca_epoch == rotation.next_ca_epoch => {
+                        stored.credential_registry.clone()
+                    }
+                    _ => None,
+                })
+        });
         self.state
             .transitions
             .retain(|stored| match retained_until(&stored.object) {
@@ -369,6 +387,10 @@ impl AstraRegistry {
             self.state.ca_epoch = rotation.next_ca_epoch;
             self.state.ca_public_key = rotation.next_ca_public_key;
             self.state.ca_rotation = None;
+            // Only a CA-PQ promotion feeds it: a CA-TLS one re-signs nothing.
+            if rotation_credentials.is_some() {
+                self.state.promoted_credentials = rotation_credentials;
+            }
             true
         } else {
             false
@@ -391,6 +413,27 @@ impl AstraRegistry {
             self.save()?;
         }
         Ok(dropped)
+    }
+
+    /// Hands out the credential document a promotion left to adopt, and
+    /// forgets it.
+    ///
+    /// Called last, once the file and the memory carry the document: replaying
+    /// any earlier step after a restart is harmless, whereas clearing first
+    /// would lose the document on a crash.
+    pub fn take_promoted_credentials(
+        &mut self,
+    ) -> Result<Option<Box<aether::certificates::approval::CredentialRegistry>>, RegistryError>
+    {
+        let Some(document) = self.state.promoted_credentials.take() else {
+            return Ok(None);
+        };
+        if let Err(error) = self.save() {
+            // Still pending in memory as on disk: the next pass retries.
+            self.state.promoted_credentials = Some(document);
+            return Err(error);
+        }
+        Ok(Some(document))
     }
 
     /// Lets a stored gateway decision leave the authority (spec §11.1 step 6).

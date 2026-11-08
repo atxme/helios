@@ -6,9 +6,9 @@
 //! The UI runs at medium integrity, with a manifest asking for `asInvoker`:
 //! WireGuard-NT is driven by the elevated engine, not by the window. A child
 //! started the ordinary way then inherits a non-elevated token, so a terminal
-//! or a companion cannot become an Administrator process by inheritance alone.
+//! cannot become an Administrator process by inheritance alone.
 //! The UI can still be started elevated (from an elevated shell, say), and
-//! then the refusal below is what keeps the terminal and the companion closed.
+//! then the refusal below is what keeps the terminal closed.
 //!
 //! # The post-condition is the actual safety property
 //!
@@ -115,24 +115,6 @@ pub fn spawn_ssh_terminal(target: &str) -> Result<(), String> {
 pub fn spawn_ssh_terminal(_target: &str) -> Result<(), String> {
     refuse_if_elevated()?;
     Err("l'ouverture d'un terminal SSH n'est disponible que sur Windows".into())
-}
-
-/// Starts the fixed Astra companion, in its own console.
-///
-/// Its only caller is the CA-TLS rotation (`astra.rs`) until lot 5. The
-/// arguments come from that rotation; the program does not. Keeping the
-/// executable literal at this boundary prevents a WebView or profile value from
-/// turning this into a general process launcher. The child is not waited for:
-/// Windows keeps no zombie.
-#[cfg(windows)]
-pub fn spawn_astra_signer(arguments: &[String]) -> Result<(), String> {
-    refuse_if_elevated()?;
-    let _child = std::process::Command::new("astra-signer")
-        .args(arguments)
-        .creation_flags(CREATE_NEW_CONSOLE)
-        .spawn()
-        .map_err(|error| format!("lancement du compagnon impossible : {error}"))?;
-    Ok(())
 }
 
 /// The UI's own primary token, read from the current process.

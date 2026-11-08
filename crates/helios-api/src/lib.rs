@@ -302,6 +302,10 @@ pub fn router(state: AppState) -> Router {
             "/api/certificates/ca-transition",
             post(certificates::ca_transition_install),
         )
+        .route(
+            "/api/certificates/client-tls-ca-transition",
+            post(certificates::client_tls_ca_transition_install),
+        )
         // The operator campaign, relayed from inside the tunnel (spec §8.5).
         // The surfaces Astra's public origin exposes, plus the opening, which
         // that origin refuses and Astra's door serves privately (lot 5a). On
@@ -313,6 +317,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/certificates/operator/pending",
             get(certificates::operator_pending),
+        )
+        .route(
+            "/api/certificates/operator/status",
+            get(certificates::operator_status),
         )
         .route(
             "/api/certificates/operator/operations/{operation}",
@@ -330,6 +338,14 @@ pub fn router(state: AppState) -> Router {
             "/api/certificates/operator/signer-results/{operation}",
             post(certificates::operator_signer_result).layer(DefaultBodyLimit::max(
                 astra_channel::MAX_OPERATOR_REQUEST_BYTES,
+            )),
+        )
+        // Its own body bound: the vault travels in base64 beside the
+        // credential document, and 64 KiB would refuse every real one.
+        .route(
+            "/api/certificates/operator/vault-copy",
+            post(certificates::operator_vault_copy).layer(DefaultBodyLimit::max(
+                astra_channel::MAX_OPERATOR_VAULT_COPY_BODY_BYTES,
             )),
         )
         .route(

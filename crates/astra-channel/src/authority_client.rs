@@ -116,6 +116,21 @@ impl AstraLifecycleClient {
         .await
     }
 
+    /// Reads what Astra holds of its authority state. No capability token
+    /// crosses.
+    pub async fn operator_status(
+        &self,
+        relayed: &RelayedOperatorCampaign,
+    ) -> Result<OperatorAuthorityStatus, ChannelError> {
+        self.post_bounded(
+            OPERATOR_STATUS_ROUTE,
+            relayed,
+            None,
+            MAX_OPERATOR_ANSWER_BYTES,
+        )
+        .await
+    }
+
     /// Fetches what the companion has to display before it asks for a touch.
     pub async fn operator_signer_request(
         &self,
@@ -190,6 +205,24 @@ impl AstraLifecycleClient {
         .await
     }
 
+    /// Sends the vault copy, and the credential document when there is one.
+    ///
+    /// Its own body ceiling: the 64 KiB of the other operator relays would
+    /// refuse every real vault. The answer is small and bounded like the rest.
+    pub async fn operator_vault_copy(
+        &self,
+        relayed: &RelayedOperatorVaultCopy,
+    ) -> Result<OperatorVaultCopied, ChannelError> {
+        self.post_within(
+            OPERATOR_VAULT_COPY_ROUTE,
+            relayed,
+            None,
+            MAX_OPERATOR_VAULT_COPY_RELAY_BODY_BYTES,
+            MAX_OPERATOR_ANSWER_BYTES,
+        )
+        .await
+    }
+
     async fn post<B: Serialize, R: serde::de::DeserializeOwned>(
         &self,
         path: &str,
@@ -209,9 +242,27 @@ impl AstraLifecycleClient {
         bearer: Option<&str>,
         max_answer_bytes: usize,
     ) -> Result<R, ChannelError> {
+        self.post_within(
+            path,
+            body,
+            bearer,
+            MAX_OPERATOR_RELAY_BODY_BYTES,
+            max_answer_bytes,
+        )
+        .await
+    }
+
+    async fn post_within<B: Serialize, R: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+        bearer: Option<&str>,
+        max_body_bytes: usize,
+        max_answer_bytes: usize,
+    ) -> Result<R, ChannelError> {
         let body =
             serde_json::to_vec(body).map_err(|error| ChannelError::Body(error.to_string()))?;
-        if body.len() > MAX_OPERATOR_RELAY_BODY_BYTES {
+        if body.len() > max_body_bytes {
             return Err(ChannelError::Body(format!(
                 "operator relay body is {} bytes, above the private route ceiling",
                 body.len()

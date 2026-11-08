@@ -30,13 +30,16 @@ use aether::key_negotiation::{
 };
 use aether_fido::authenticator::Authenticator;
 use astra_operator::enrollment::{AcceptedEnrollment, InvitationRegistry};
+use astra_operator::operations::rotation::RotationTerms;
 use astra_operator::vault::AuthorityVault;
 
 use super::{dialog_owner, now_unix, ArtifactEncoding, EnrollmentGesture, OperatorArtifact};
 
 mod issuer;
+mod rotation;
 mod vault;
 pub use issuer::run_issuer;
+pub use rotation::run_rotation;
 pub use vault::run_vault;
 
 /// One button pressed in the window: what it asks, the status it answers, and
@@ -45,11 +48,15 @@ pub use vault::run_vault;
 /// `owner` is the platform handle of that window, or `0` where there is none.
 /// It is read on the press that opens a key dialog and is the window the
 /// dialog belongs to, so it is carried per press rather than fixed at launch.
-#[derive(Debug, Clone, Copy)]
+///
+/// `terms` come with the one press that opens a rotation's campaign: what the
+/// operator chose on the approval screen. Public, as the manifest they lead to is.
+#[derive(Debug, Clone)]
 pub struct Press {
     pub action: OperatorAction,
     pub revision: u64,
     pub owner: isize,
+    pub terms: Option<RotationTerms>,
 }
 
 /// Runs one ceremony to its end against the vault at `vault_path`, publishing
@@ -82,7 +89,9 @@ pub fn run(
         | OperationKind::MarkKey
         | OperationKind::FinalizeDomain
         | OperationKind::IssueGatewayBootstrap
-        | OperationKind::AuthorizeIssuer => {
+        | OperationKind::AuthorizeIssuer
+        | OperationKind::RotateAnchor
+        | OperationKind::RotateClientTlsCa => {
             ceremony.refuse(Refusal::Internal);
             publish(ceremony.status());
             Err(format!(
@@ -1656,39 +1665,38 @@ fn open_key(
 
     ceremony.gesture = GestureState::ProcessingKey { index, of };
     publish(ceremony.status());
-    let owner = match dialog_owner(press.owner) {
-        Ok(owner) => owner,
-        Err(error) => {
-            ceremony.refuse(Refusal::ForegroundUnavailable);
+    match connect_key(press.owner) {
+        Ok(key) => Ok(Some(key)),
+        Err((refusal, message)) => {
+            ceremony.refuse(refusal);
             publish(ceremony.status());
-            return Err(error);
+            Err(message)
         }
-    };
-    let key = match aether_fido::authenticator::connect_owned(
+    }
+}
+
+/// Attaches the dialog to the window the press came from, connects the key, and
+/// refuses a transport that wants a PIN this process has no way to ask for.
+fn connect_key(owner: isize) -> Result<Box<dyn Authenticator>, (Refusal, String)> {
+    let owner = dialog_owner(owner).map_err(|error| (Refusal::ForegroundUnavailable, error))?;
+    let key = aether_fido::authenticator::connect_owned(
         aether_fido::authenticator::Transport::default(),
         owner,
-    ) {
-        Ok(key) => key,
-        Err(error) => {
-            ceremony.refuse(Refusal::KeyDeclined);
-            publish(ceremony.status());
-            return Err(format!("{error:#}"));
-        }
-    };
+    )
+    .map_err(|error| (Refusal::KeyDeclined, format!("{error:#}")))?;
     // The platform collects the PIN in its own dialog, so it never enters this
     // process. A transport that needs one has no way to ask from here — there
     // is no console — and saying so is better than an empty string that fails
     // three steps later as «clé refusée».
     if key.needs_pin() {
-        ceremony.refuse(Refusal::ProtocolViolation);
-        publish(ceremony.status());
-        return Err(
+        return Err((
+            Refusal::ProtocolViolation,
             "ce transport demande que le PIN soit saisi par le programme, et ce processus n'a \
              aucune interface pour le demander"
                 .to_string(),
-        );
+        ));
     }
-    Ok(Some(key))
+    Ok(key)
 }
 
 /// Waits for the operator's answer to one rendered status.
@@ -1717,6 +1725,12 @@ struct Ceremony {
     manifest: Option<AstraManifest>,
     refusal: Option<Refusal>,
     keys: Vec<KeySlotLabel>,
+    /// Why the last key was turned down, while another is still being asked for.
+    key_retry: Option<Refusal>,
+    /// The keys that approved, by the label they validated under.
+    approved: Vec<KeySlotLabel>,
+    /// When the wait now offered ends by itself.
+    idle_until: Option<u64>,
 }
 
 impl Ceremony {
@@ -1731,6 +1745,9 @@ impl Ceremony {
             manifest: None,
             refusal: None,
             keys: Vec::new(),
+            key_retry: None,
+            approved: Vec::new(),
+            idle_until: None,
         }
     }
 
@@ -1752,12 +1769,18 @@ impl Ceremony {
         status.manifest = self.manifest.clone();
         status.refusal = self.refusal;
         status.keys = self.keys.clone();
+        status.key_retry = self.key_retry;
+        status.approved = self.approved.clone();
+        status.idle_until = self.idle_until;
         status
     }
 
     fn refuse(&mut self, refusal: Refusal) {
         self.gesture = GestureState::Failed;
         self.refusal = Some(refusal);
+        self.key_retry = None;
+        self.approved.clear();
+        self.idle_until = None;
     }
 
     /// Abandoned by the operator, before anything left this machine.
@@ -1768,6 +1791,9 @@ impl Ceremony {
     fn cancel(&mut self) {
         self.gesture = GestureState::Cancelled;
         self.refusal = Some(Refusal::Cancelled);
+        self.key_retry = None;
+        self.approved.clear();
+        self.idle_until = None;
     }
 }
 

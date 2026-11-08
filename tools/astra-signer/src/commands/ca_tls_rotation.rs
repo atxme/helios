@@ -24,6 +24,7 @@ pub(crate) fn rotate_ca_tls(
 ) -> Result<()> {
     use aether::certificates::transport::TrustUpdateObject;
 
+    astra_operator::rotation_journal::ensure_none_in_flight(path)?;
     let operation = Id16::parse_hex(operation_id)
         .map_err(|error| anyhow::anyhow!("--operation-id : {error}"))?;
     let mut vault = store::load(path)?;
@@ -176,7 +177,7 @@ pub(crate) fn rotate_ca_tls(
     let record = prepared::PreparedRotation {
         kind: prepared::PreparedKind::CaTls,
         operation_id: request.operation_id.to_hex(),
-        result_token: request.result_token.clone(),
+        result_token: Some(request.result_token.clone()),
         result,
         transition_path: out.display().to_string(),
         next_ca_tls_epoch: identity.ca_tls_epoch + 1,
@@ -187,14 +188,15 @@ pub(crate) fn rotate_ca_tls(
         prepared_at: now,
         // The same public campaign summary the terminal printed above. A
         // window survives its ceremony by days, and whatever resumes it — this
-        // binary or the Orion companion — must be able to name what was
+        // binary or Orion's own rotation journal — must be able to name what was
         // approved without re-fetching a campaign that is already closed.
-        manifest: Some(orion::manifest_of(
+        manifest: Some(prepared::manifest_of(
             &campaign,
             &identity,
             &active_certificate,
             window,
         )?),
+        adopted: false,
     };
     // Written before the deposit is attempted, and holding the exact bytes of
     // it. A crash after this point is a replay; a crash before it is a
@@ -246,7 +248,11 @@ fn submit_prepared(
 ) -> Result<()> {
     let operation = Id16::parse_hex(&record.operation_id)
         .map_err(|error| anyhow::anyhow!("rotation préparée illisible : {error}"))?;
-    let state = client.submit(&operation, &record.result_token, &record.result)?;
+    let token = record
+        .result_token
+        .as_deref()
+        .context("cette rotation préparée ne porte aucun jeton de dépôt : elle ne se rejoue pas")?;
+    let state = client.submit(&operation, token, &record.result)?;
     record.submitted = true;
     prepared::save(prepared_path, &record)?;
     println!("état             : {state:?}");
@@ -284,13 +290,9 @@ pub(crate) fn resume_rotation(
     submit_prepared(&channel, &prepared_path, record)
 }
 
-/// Advances the open `CA-TLS` window by one step (§9.2).
-pub(crate) fn promote_ca_tls(path: &Path, transport: Transport) -> Result<()> {
-    use astra_operator::vault::CaTlsAdvance;
-
-    let mut vault = store::load(path)?;
-    let prepared_path = prepared::path_beside(path);
-    let Some(record) = prepared::load(&prepared_path)? else {
+/// The rotation `promote-ca-tls` would act on, read before any key is asked for.
+pub(crate) fn record_to_promote(prepared_path: &Path) -> Result<prepared::PreparedRotation> {
+    let Some(record) = prepared::load(prepared_path)? else {
         bail!("aucune rotation CA-TLS en cours : rien à promouvoir.");
     };
     if !record.submitted {
@@ -301,6 +303,19 @@ pub(crate) fn promote_ca_tls(path: &Path, transport: Transport) -> Result<()> {
             record.next_ca_tls_epoch
         );
     }
+    Ok(record)
+}
+
+/// Advances the open `CA-TLS` window by one step (§9.2).
+pub(crate) fn promote_ca_tls(path: &Path, transport: Transport) -> Result<()> {
+    use astra_operator::vault::CaTlsAdvance;
+
+    // That rotation has not reached the gateway: promoting would destroy the
+    // outgoing key while the gateway never installed its successor.
+    astra_operator::rotation_journal::ensure_none_in_flight(path)?;
+    let mut vault = store::load(path)?;
+    let prepared_path = prepared::path_beside(path);
+    let record = record_to_promote(&prepared_path)?;
 
     let now = now_unix();
     println!("rotation CA-TLS  : époque {}.", record.next_ca_tls_epoch);

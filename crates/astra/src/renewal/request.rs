@@ -171,7 +171,7 @@ pub async fn open(
         trust_domain_id,
         gateway_key,
         &rp_id,
-        service.approval_credential_registry_epoch,
+        &service.approval_credentials(),
         service_epoch,
         now_unix,
     )?;
@@ -265,7 +265,8 @@ async fn campaign_evidence(
     approval: aether::certificates::status::CampaignApproval,
 ) -> Result<AstraCampaignApprovalEvidence, RenewalError> {
     let registry = service
-        .approval_credential_registry
+        .approval_credentials()
+        .registry
         .as_deref()
         .cloned()
         .ok_or(RenewalError::NoOperatorCredential)?;

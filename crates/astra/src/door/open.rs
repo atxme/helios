@@ -167,6 +167,23 @@ fn is_format(character: char) -> bool {
     )
 }
 
+/// The fingerprint of the vault copy a campaign of `scope` names.
+///
+/// The companion needs the vault to open `CA-PQ`, and it fetches it from
+/// here. Opening the campaign anyway would spend an operator's window on a
+/// ceremony that cannot reach a private key. Shared with the delegation, which
+/// asks before it draws keys.
+pub(super) fn vault_fingerprint_for(
+    service: &AstraService,
+    scope: CampaignScope,
+) -> Result<Fingerprint, DoorRefusal> {
+    match service.encrypted_vault() {
+        Some(bytes) => Ok(Fingerprint::of(&bytes)),
+        None if scope.opens_vault() => Err(DoorRefusal::NoVault),
+        None => Ok(Fingerprint::of(NO_VAULT_FINGERPRINT_INPUT)),
+    }
+}
+
 /// Opens one campaign over the targets `resolve` reads from the registry.
 ///
 /// The registry and the operation store are never held together: the targets
@@ -201,14 +218,7 @@ pub(super) async fn open_campaign(
     if targets.len() > MAX_CAMPAIGN_TARGETS {
         return Err(DoorRefusal::TooManyTargets);
     }
-    let vault_fingerprint = match &service.encrypted_vault {
-        Some(bytes) => Fingerprint::of(bytes),
-        // The companion needs the vault to open `CA-PQ`, and it fetches it
-        // from here. Opening the campaign anyway would spend an operator's
-        // window on a ceremony that cannot reach a private key.
-        None if scope.opens_vault() => return Err(DoorRefusal::NoVault),
-        None => Fingerprint::of(NO_VAULT_FINGERPRINT_INPUT),
-    };
+    let vault_fingerprint = vault_fingerprint_for(service, scope)?;
 
     let mut store = service.signing.lock().await;
     if let Some(operation_id) = store.live_conflict(scope, &targets, now_unix) {
@@ -274,6 +284,7 @@ pub(super) async fn open_campaign(
         required_credentials: operation.campaign.required_credentials,
         expires_at: operation.expires_at,
         revocation_expiries,
+        delegation_request: None,
     };
     store
         .open(operation, now_unix)

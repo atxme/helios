@@ -4,40 +4,34 @@ import Alert from '@mui/material/Alert'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
 import ButtonBase from '@mui/material/ButtonBase'
-import CircularProgress from '@mui/material/CircularProgress'
-import Paper from '@mui/material/Paper'
-import Stack from '@mui/material/Stack'
-import TextField from '@mui/material/TextField'
 import Typography from '@mui/material/Typography'
-import { Check, KeyRound } from 'lucide-react'
 
 import * as api from '../api'
-import { OperatorCeremonyPanel } from './OperatorCeremony'
+import { OperatorCeremonyPanel, refusalSentence } from './OperatorCeremony'
 import { DomainCreated } from './astra/DomainCreated'
 import { DomainPanel } from './astra/DomainPanel'
 import { ApprovalsPanel } from './astra/ApprovalsPanel'
+import { RotationsPanel } from './astra/RotationsPanel'
+import { RotationCeremony, RotationSteps, isRotationStatus } from './astra/RotationSteps'
+import { journalLine } from './astra/rotationRows'
 import { ArtifactDownloads } from './astra/ArtifactDownloads'
 import { EnrollmentOperatorPanel } from './astra/EnrollmentOperatorPanel'
 import { VaultPanel } from './astra/VaultPanel'
+import { KeyChangeCopy } from './astra/VaultCopy'
 import { GUTTER, MINT, PINE, RULE } from '../theme'
 import type {
-  AstraRotationInput,
-  AstraRotationPhase,
-  AstraRotationStatus,
   OperatorPendingOperation,
   OperatorStatus,
+  RotationsOverview,
 } from '../types'
 
 /** Under the files of a bootstrap that failed after its leaf was written. */
 const BOOTSTRAP_LEAF_KEPT =
   'La feuille est émise et enregistrée à côté du coffre ; « Finaliser le domaine » reprend ce qui manque.'
 
-const EMPTY_INPUT: AstraRotationInput = {
-  vault_path: '',
-  heliosd_url: 'http://100.64.0.1:8080',
-  operation_id: '',
-  output_path: '',
-}
+const ENDED = ['done', 'failed', 'cancelled']
+const hasEnded = (status: OperatorStatus) =>
+  typeof status.gesture === 'string' && ENDED.includes(status.gesture)
 
 const TABS = [
   'Enrôlement',
@@ -57,73 +51,6 @@ function WaitingNote({ children }: { children: string }) {
   )
 }
 
-type StepState = 'pending' | 'active' | 'done'
-
-function stateOf(step: number, phase: AstraRotationPhase | 'idle'): StepState {
-  const active =
-    phase === 'idle' || phase === 'cancelled' || phase === 'failed' || phase === 'starting'
-      ? 0
-      : phase === 'awaiting_first_key' || phase === 'processing_first_key'
-        ? 1
-        : phase === 'awaiting_second_key' || phase === 'processing_second_key'
-          ? 2
-          : [
-                'finalizing',
-                'prepared',
-                'deposited',
-                'awaiting_promotion_key',
-                'promoting',
-                'promoted',
-              ].includes(phase)
-            ? 3
-            : 0
-  if (step < active || phase === 'deposited' || phase === 'promoted') return 'done'
-  return step === active ? 'active' : 'pending'
-}
-
-function CeremonyStep({
-  number,
-  title,
-  detail,
-  state,
-}: {
-  number: number
-  title: string
-  detail: string
-  state: StepState
-}) {
-  return (
-    <Box sx={{ display: 'grid', gridTemplateColumns: '28px 1fr', gap: 1.25 }}>
-      <Box
-        aria-hidden
-        sx={{
-          display: 'grid',
-          placeItems: 'center',
-          width: 26,
-          height: 26,
-          borderRadius: '50%',
-          border: 1,
-          borderColor: state === 'pending' ? 'divider' : 'primary.main',
-          bgcolor: state === 'done' ? 'primary.main' : state === 'active' ? MINT : 'transparent',
-          color: state === 'done' ? 'primary.contrastText' : state === 'active' ? PINE : 'text.disabled',
-          fontSize: 11,
-          fontWeight: 700,
-        }}
-      >
-        {state === 'done' ? <Check size={14} /> : number}
-      </Box>
-      <Box>
-        <Typography sx={{ fontSize: 12.5, fontWeight: state === 'active' ? 700 : 600 }}>
-          {title}
-        </Typography>
-        <Typography color={state === 'pending' ? 'text.disabled' : 'text.secondary'} sx={{ fontSize: 11, lineHeight: 1.5 }}>
-          {detail}
-        </Typography>
-      </Box>
-    </Box>
-  )
-}
-
 /** Operator surface for the two distinct credentials required by ADR-008 §7.6. */
 export function AstraView({
   onRecoveryReady,
@@ -134,18 +61,48 @@ export function AstraView({
   /** The one recovery opened from this machine's Certificats screen; any other is remote. */
   localRecoveryId?: string | null
 } = {}) {
-  const [input, setInput] = useState<AstraRotationInput>(EMPTY_INPUT)
-  const [status, setStatus] = useState<AstraRotationStatus | null>(null)
-  const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   // A protocol-2 ceremony, when one is open. It can outlive this view — the
   // helper keeps working while the operator looks at another tab — so it is
   // read on mount rather than only created here.
   const [ceremony, setCeremony] = useState<OperatorStatus | null>(null)
   const [pending, setPending] = useState<OperatorPendingOperation[]>([])
+  // What the Rotations read says outside its own tab: `null` until the authority has been
+  // read, which keeps every approval suspended rather than assuming there is no overlap.
+  const [caPqOverlap, setCaPqOverlap] = useState<boolean | null>(null)
+  const [journal, setJournal] = useState<RotationsOverview['journal']>(null)
+  const [resumable, setResumable] = useState(false)
+  // Whether `journal` was read after the ceremony ended: a copy held back leaves it in
+  // place, and the screen must not call the copy sent before knowing.
+  const [journalKnown, setJournalKnown] = useState(true)
+  // A campaign already open for the rotation being led, known before its first key.
+  const [existingOperation, setExistingOperation] = useState<string | null>(null)
+  // The finished session of an automatic resumption, said in its row.
+  const [automaticStop, setAutomaticStop] = useState<OperatorStatus | null>(null)
   const [tab, setTab] = useState<AstraTab>('Enrôlement')
   const [finishingRecovery, setFinishingRecovery] = useState(false)
   const recoveryAttempt = useRef<string | null>(null)
+
+  const readRotations = useCallback(async (cancelled: () => boolean = () => false) => {
+    try {
+      const found = await api.operatorRotationsOverview()
+      if (cancelled()) return false
+      setCaPqOverlap(found.caPqOverlap)
+      setJournal(found.journal)
+      setResumable(found.resumable)
+      return true
+    } catch {
+      // Unread stays unread: approvals remain suspended.
+      return false
+    }
+  }, [])
+
+  const takeOverview = useCallback((found: RotationsOverview) => {
+    setCaPqOverlap(found.caPqOverlap)
+    setJournal(found.journal)
+    setResumable(found.resumable)
+    if (found.pending.state === 'ok') setPending(found.pending.value)
+  }, [])
 
   const finishRecovery = useCallback(
     (operationId: string, attempt: string, force = false) => {
@@ -165,7 +122,14 @@ export function AstraView({
     void api
       .operatorCeremonyStatus()
       .then((found) => {
-        if (!cancelled) setCeremony(found)
+        if (cancelled || !found) return
+        // A resumption the tunnel started and that has ended days later is not the
+        // operator's screen: its stop is said in its row. The origin is the session's own.
+        if (isRotationStatus(found) && hasEnded(found) && found.automatic) {
+          setAutomaticStop(found)
+          return
+        }
+        setCeremony(found)
       })
       .catch(() => {})
     void api
@@ -174,10 +138,12 @@ export function AstraView({
         if (!cancelled) setPending(found)
       })
       .catch(() => {})
+    // One read at mount; the Rotations tab polls the same overview while it is shown.
+    void readRotations(() => cancelled)
     return () => {
       cancelled = true
     }
-  }, [])
+  }, [readRotations])
 
   // The command returns the first state after a press (usually
   // `processing_key`). The helper then continues on its own while Windows
@@ -193,12 +159,49 @@ export function AstraView({
       void api
         .operatorCeremonyStatus()
         .then((found) => {
-          if (found && found.revision >= ceremony.revision) setCeremony(found)
+          if (!found || found.revision < ceremony.revision) return
+          if (isRotationStatus(found) && hasEnded(found) && found.automatic) {
+            // It ended while shown: the tab is the operator's again.
+            setAutomaticStop(found)
+            setCeremony(null)
+            return
+          }
+          setCeremony(found)
         })
         .catch((cause) => setError(String(cause)))
     }, 350)
     return () => window.clearTimeout(timer)
   }, [ceremony])
+
+  // What a ceremony changed outside it: the overlap it opened or closed, and the journal it
+  // left or took away. Read again once it has ended, and until the read has gone through
+  // the journal stays unknown rather than assumed gone.
+  const ceremonyEnded = ceremony !== null && hasEnded(ceremony)
+  const endedSession = ceremony?.session_id
+  useEffect(() => {
+    if (!ceremonyEnded) return
+    let cancelled = false
+    let timer: number | undefined
+    setJournalKnown(false)
+    const look = () => {
+      void readRotations(() => cancelled).then((read) => {
+        if (cancelled) return
+        if (read) setJournalKnown(true)
+        else timer = window.setTimeout(look, 4000)
+      })
+      void api
+        .operatorPendingOperations()
+        .then((found) => {
+          if (!cancelled) setPending(found)
+        })
+        .catch(() => {})
+    }
+    look()
+    return () => {
+      cancelled = true
+      window.clearTimeout(timer)
+    }
+  }, [ceremonyEnded, endedSession, readRotations])
 
   // The helper owns the operator half only. Once it has released the grant,
   // Orion must immediately resume the client session it kept in Rust: that
@@ -220,104 +223,38 @@ export function AstraView({
   }, [ceremony, finishRecovery, onRecoveryReady, localRecoveryId])
 
   const dismissCeremony = async () => {
-    setBusy(true)
     setError(null)
     try {
       await api.dismissOperatorCeremony()
       setCeremony(null)
       setPending(await api.operatorPendingOperations())
+      void readRotations()
     } catch (cause) {
       setError(String(cause))
-    } finally {
-      setBusy(false)
     }
   }
 
-  const openCeremony = (next: OperatorStatus) => setCeremony(next)
-
-  const phase = status?.phase ?? 'idle'
-  const cancellable = status?.can_cancel === true
-  const locked = !['idle', 'failed', 'cancelled'].includes(phase)
-  const valid = Object.values(input).every((value) => value.trim().length > 0)
-
-  // A signer can outlive this view. Reading once restores its exact phase;
-  // processing phases are then polled while Rust owns a blocking key gesture.
-  useEffect(() => {
-    let cancelled = false
-    void api
-      .astraCaTlsRotationStatus()
-      .then((found) => {
-        if (!cancelled && found.phase !== 'idle') setStatus(found)
-      })
-      .catch(() => {})
-    return () => {
-      cancelled = true
-    }
-  }, [])
-
-  useEffect(() => {
-    const polling = [
-      'starting',
-      'processing_first_key',
-      'processing_second_key',
-      'finalizing',
-      'promoting',
-    ].includes(phase)
-    if (!polling) return
-    const timer = window.setTimeout(() => {
-      void api
-        .astraCaTlsRotationStatus()
-        .then(setStatus)
-        .catch((cause) => setError(String(cause)))
-    }, 350)
-    return () => window.clearTimeout(timer)
-  }, [phase, status])
-
-  const run = async (action: () => Promise<AstraRotationStatus>) => {
-    setBusy(true)
-    setError(null)
-    try {
-      setStatus(await action())
-    } catch (cause) {
-      setError(String(cause))
-    } finally {
-      setBusy(false)
-    }
+  // Every ceremony the operator opens passes here, with the campaign it leads if any.
+  const openCeremony = (next: OperatorStatus, existing: string | null = null) => {
+    setExistingOperation(existing)
+    setJournalKnown(true)
+    setAutomaticStop(null)
+    setCeremony(next)
   }
-
-  const update = (field: keyof AstraRotationInput, value: string) => {
-    setInput((current) => ({ ...current, [field]: value }))
-  }
-
-  const cancel = async () => {
-    await run(api.cancelAstraCaTlsRotation)
-  }
-
-  const primaryAction = () => {
-    if (status?.can_continue) {
-      void run(api.continueAstraCaTlsRotation)
-      return
-    }
-    void run(() => api.startAstraCaTlsRotation(input))
-  }
-
-  const primaryLabel =
-    phase === 'awaiting_first_key'
-      ? 'Première clé branchée — continuer'
-      : phase === 'awaiting_second_key'
-        ? 'Seconde clé branchée — continuer'
-        : phase === 'prepared'
-          ? 'Réessayer le dépôt'
-          : phase === 'awaiting_promotion_key'
-            ? 'Clé de promotion branchée — continuer'
-            : status?.can_continue
-              ? 'Réessayer'
-              : 'Démarrer la rotation'
 
   // A live protocol-2 ceremony owns the tab entirely. It is not a section
   // beside the CA-TLS form: an operator holding a security key must not be
   // shown, in the same view, a second ceremony they could start by mistake.
   if (ceremony) {
+    // Read again from `pending` rather than remembered: the view is unmounted whenever
+    // another is shown, and an approval that forgot the open campaign would send none and
+    // meet a refusal after both keys were spent.
+    const led =
+      pending.find(
+        (operation) =>
+          operation.scope === 'trust_authorities' &&
+          operation.expires_at > Math.floor(Date.now() / 1000),
+      ) ?? null
     const inCampaign =
       ceremony.manifest?.operation === 'issuer_authorization' && ceremony.manifest.campaign != null
     return (
@@ -328,11 +265,23 @@ export function AstraView({
         <Typography color="text.secondary" sx={{ fontSize: 11.5, lineHeight: 1.55, mb: 1.5 }}>
           Une opération attend l’opérateur.
         </Typography>
-        <OperatorCeremonyPanel
-          status={ceremony}
-          onStatus={setCeremony}
-          onDismiss={() => void dismissCeremony()}
-        />
+        {isRotationStatus(ceremony) ? (
+          <RotationCeremony
+            status={ceremony}
+            onStatus={setCeremony}
+            onDismiss={() => void dismissCeremony()}
+            journal={journalKnown ? journal : undefined}
+            existingOperation={led?.operation_id ?? existingOperation}
+            existingExpiresAt={led?.expires_at ?? null}
+          />
+        ) : (
+          <OperatorCeremonyPanel
+            status={ceremony}
+            onStatus={setCeremony}
+            onDismiss={() => void dismissCeremony()}
+            journal={journal}
+          />
+        )}
         {(ceremony.operation === 'invite_enrollment' ||
           ceremony.operation === 'accept_enrollment' ||
           ceremony.operation === 'finalize_domain' ||
@@ -363,11 +312,12 @@ export function AstraView({
         {ceremony.operation === 'authorize_issuer' && ceremony.gesture === 'done' && (
           <Typography color="text.secondary" sx={{ mt: 1, fontSize: 11.5 }}>
             {inCampaign
-              ? 'Délégation enregistrée par Astra. Redémarrer Astra pour qu’il émette sous elle.'
+              ? 'Délégation enregistrée par Astra.'
               : 'À installer sur l’hôte d’Astra : astra issuer install --authorization <fichier>.'}
           </Typography>
         )}
         {ceremony.operation === 'create_domain' && ceremony.gesture === 'done' && <DomainCreated />}
+        <KeyChangeCopy status={ceremony} />
         {finishingRecovery && (
           <Alert severity="info" variant="outlined" sx={{ mt: 1.25, fontSize: 11.5 }}>
             Grant reçu : installation et commit de la nouvelle identité…
@@ -407,179 +357,39 @@ export function AstraView({
   // Campaigns the domain opened and nobody has approved yet. Read from the
   // gateway in the tunnel: they are how an operator finds work without being
   // handed an identifier by whoever ran the command that created it.
-  const approvals = <ApprovalsPanel pending={pending} onCeremony={openCeremony} />
-
-  const rotations = (
-    <>
-      <Typography color="text.secondary" sx={{ fontSize: 11.5, lineHeight: 1.55, mb: 1.5 }}>
-        Rotation de l’autorité CA-TLS cliente.
-      </Typography>
-
-      <Paper variant="outlined" sx={{ p: 1.75 }}>
-        <Typography component="h3" sx={{ fontSize: 12.5, fontWeight: 700, mb: 1.25 }}>
-          Paramètres de la rotation
-        </Typography>
-        <Stack spacing={1.25}>
-          <TextField
-            label="Coffre d’autorité"
-            value={input.vault_path}
-            onChange={(event) => update('vault_path', event.target.value)}
-            placeholder="%APPDATA%\\astra\\authority-vault.json"
-            disabled={locked || busy}
-            size="small"
-            fullWidth
-          />
-          <TextField
-            label="URL heliosd"
-            value={input.heliosd_url}
-            onChange={(event) => update('heliosd_url', event.target.value)}
-            disabled={locked || busy}
-            size="small"
-            fullWidth
-          />
-          <TextField
-            label="Identifiant de l’opération"
-            value={input.operation_id}
-            onChange={(event) => update('operation_id', event.target.value)}
-            placeholder="32 caractères hexadécimaux"
-            disabled={locked || busy}
-            size="small"
-            fullWidth
-          />
-          <TextField
-            label="Fichier de sortie"
-            value={input.output_path}
-            onChange={(event) => update('output_path', event.target.value)}
-            placeholder="%USERPROFILE%\\Downloads\\ca-tls-transition.json"
-            disabled={locked || busy}
-            size="small"
-            fullWidth
-          />
-        </Stack>
-      </Paper>
-
-      <Paper variant="outlined" sx={{ mt: 1.25, p: 1.75 }}>
-        <Typography component="h3" sx={{ fontSize: 12.5, fontWeight: 700, mb: 1.5 }}>
-          Cérémonie à deux clés
-        </Typography>
-        <Stack spacing={1.5} divider={<Box sx={{ ml: '13px !important', borderLeft: `1px solid ${RULE}`, height: 7 }} />}>
-          <CeremonyStep
-            number={1}
-            title="Vérifier la campagne"
-            detail="Lecture de la campagne en cours."
-            state={stateOf(0, phase)}
-          />
-          <CeremonyStep
-            number={2}
-            title="Première clé autorisée"
-            detail={
-              status?.first_key_label
-                ? `Clé reconnue : ${status.first_key_label}`
-                : 'Branchez la clé principale, puis continuez.'
-            }
-            state={stateOf(1, phase)}
-          />
-          <CeremonyStep
-            number={3}
-            title="Seconde clé autorisée"
-            detail={
-              status?.second_key_label
-                ? `Clé reconnue : ${status.second_key_label}`
-                : 'Débranchez la première, branchez la clé de récupération, puis continuez.'
-            }
-            state={stateOf(2, phase)}
-          />
-        </Stack>
-
-        {status?.phase === 'awaiting_first_key' && (
-          <>
-            {status.manifest && <CampaignManifest status={status} />}
-            <Alert severity="info" variant="outlined" icon={<KeyRound size={17} />} sx={{ mt: 1.5, fontSize: 11.5 }}>
-              {status.message}
-            </Alert>
-          </>
-        )}
-        {status?.phase === 'awaiting_second_key' && (
-          <Alert severity="info" variant="outlined" icon={<KeyRound size={17} />} sx={{ mt: 1.5, fontSize: 11.5 }}>
-            {status.message}
-          </Alert>
-        )}
-        {['starting', 'processing_first_key', 'processing_second_key', 'finalizing'].includes(
-          phase,
-        ) && (
-          <Alert severity="info" variant="outlined" sx={{ mt: 1.5, fontSize: 11.5 }}>
-            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-              <CircularProgress size={14} />
-              <span>{status?.message}</span>
-            </Box>
-          </Alert>
-        )}
-        {status?.phase === 'prepared' && (
-          <Alert severity="warning" variant="outlined" sx={{ mt: 1.5, fontSize: 11.5 }}>
-            {status.message} Le dépôt n’est pas confirmé.
-          </Alert>
-        )}
-        {status?.phase === 'deposited' && (
-          <Alert severity="success" variant="outlined" sx={{ mt: 1.5, fontSize: 11.5 }}>
-            Transition CA-TLS déposée{status.output_path ? ` dans ${status.output_path}` : ''}.
-            La promotion reste à faire.
-          </Alert>
-        )}
-        {status?.phase === 'awaiting_promotion_key' && (
-          <Alert severity="info" variant="outlined" icon={<KeyRound size={17} />} sx={{ mt: 1.5, fontSize: 11.5 }}>
-            {status.message}
-          </Alert>
-        )}
-        {status?.phase === 'promoted' && (
-          <Alert severity="success" variant="outlined" sx={{ mt: 1.5, fontSize: 11.5 }}>
-            {status.message}
-          </Alert>
-        )}
-        {(status?.phase === 'failed' || error) && (
-          <Alert severity="error" variant="outlined" sx={{ mt: 1.5, fontSize: 11.5 }}>
-            {error ?? status?.message}
-          </Alert>
-        )}
-        {status?.phase === 'cancelled' && (
-          <Alert severity="info" variant="outlined" sx={{ mt: 1.5, fontSize: 11.5 }}>
-            Rotation annulée. Aucune transition n’a été produite.
-          </Alert>
-        )}
-
-        <Box sx={{ display: 'flex', gap: 1, mt: 1.5 }}>
-          {!['deposited', 'promoted', 'starting', 'processing_first_key', 'processing_second_key', 'finalizing', 'promoting'].includes(phase) && (
-            <Button
-              variant="contained"
-              onClick={primaryAction}
-              disabled={
-                busy ||
-                (phase === 'awaiting_first_key' && !status?.manifest) ||
-                (!status?.can_continue && !valid)
-              }
-              startIcon={busy ? <CircularProgress size={14} color="inherit" /> : undefined}
-            >
-              {primaryLabel}
-            </Button>
-          )}
-          {cancellable && (
-            <Button color="inherit" variant="outlined" onClick={() => void cancel()} disabled={busy}>
-              Annuler
-            </Button>
-          )}
-          {!cancellable && ['processing_first_key', 'processing_second_key'].includes(phase) && (
-            <Typography color="text.secondary" sx={{ alignSelf: 'center', fontSize: 11 }}>
-              Terminez ou annulez la demande de sécurité Windows pour continuer.
-            </Typography>
-          )}
-        </Box>
-      </Paper>
-    </>
+  const approvals = (
+    <ApprovalsPanel
+      pending={pending}
+      onCeremony={openCeremony}
+      caPqOverlap={caPqOverlap}
+      onOpenRotations={() => setTab('Rotations')}
+    />
   )
 
+  const rotations = (
+    <RotationsPanel
+      onCeremony={openCeremony}
+      onOverview={takeOverview}
+      renderStep={(context) => <RotationSteps {...context} />}
+      resumeStop={
+        automaticStop?.refusal
+          ? refusalSentence(automaticStop.refusal, journal, automaticStop.operation)
+          : null
+      }
+    />
+  )
+
+  // A rotation signed and not finished has a deadline whether or not a session shows it.
+  // Blocking only on the resumption's own answer: the journal and this clock cannot tell.
+  const deadlineStop = automaticStop?.refusal?.refusal === 'install_deadline_passed'
+  const inFlight = journal
+    ? journalLine(journal, Math.floor(Date.now() / 1000), deadlineStop)
+    : null
+
   const panels: Record<AstraTab, ReactNode> = {
-    'Enrôlement': <EnrollmentOperatorPanel onCeremony={setCeremony} />,
-    'Coffre et clés': <VaultPanel onCeremony={setCeremony} />,
-    'Domaine': <DomainPanel onCeremony={setCeremony} />,
+    'Enrôlement': <EnrollmentOperatorPanel onCeremony={openCeremony} />,
+    'Coffre et clés': <VaultPanel onCeremony={openCeremony} />,
+    'Domaine': <DomainPanel onCeremony={openCeremony} />,
     'Approbations': approvals,
     'Rotations': rotations,
     'Gateways': (
@@ -592,6 +402,15 @@ export function AstraView({
       <Typography component="h2" sx={{ fontSize: 13, fontWeight: 700, mb: 0.5 }}>
         Astra
       </Typography>
+      {inFlight && (
+        <Alert
+          severity={inFlight.blocking ? 'error' : 'warning'}
+          variant="outlined"
+          sx={{ mb: 1, fontSize: 11.5 }}
+        >
+          {inFlight.text}
+        </Alert>
+      )}
       {/* A fixed grid rather than a tab strip: six labels in one row overflow
           the window Orion is drawn for, and a scrolling strip hides sections
           the operator must see. Three columns keep every section in view, in
@@ -604,7 +423,12 @@ export function AstraView({
       >
         {TABS.map((name) => {
           const selected = name === tab
-          const count = name === 'Approbations' ? pending.length : 0
+          const count =
+            name === 'Approbations'
+              ? pending.length
+              : name === 'Rotations' && (journal !== null || resumable)
+                ? 1
+                : 0
           return (
             <ButtonBase
               key={name}
@@ -654,53 +478,6 @@ export function AstraView({
         })}
       </Box>
       {panels[tab]}
-    </Box>
-  )
-}
-
-function unixDate(seconds: number): string {
-  return new Intl.DateTimeFormat('fr-FR', {
-    dateStyle: 'medium',
-    timeStyle: 'short',
-    timeZone: 'Europe/Paris',
-  }).format(new Date(seconds * 1_000))
-}
-
-/** The campaign is read from the verified backend response, never rebuilt from form values. */
-function CampaignManifest({ status }: { status: AstraRotationStatus }) {
-  const manifest = status.manifest
-  if (!manifest) return null
-  const rows = [
-    ['Autorité affectée', 'CA-TLS cliente'],
-    ['Époque', `${manifest.current_ca_tls_epoch} → ${manifest.next_ca_tls_epoch}`],
-    ['Activation', unixDate(manifest.activation_at)],
-    ['Retrait', unixDate(manifest.not_after)],
-    ['Cibles', String(manifest.target_count)],
-    ['Motif', manifest.reason],
-    ['Demandée par', manifest.requested_by],
-    ['Ancre sortante', manifest.outgoing_anchor_fingerprint],
-    ['Empreinte de campagne', manifest.fingerprint],
-  ]
-  return (
-    <Box sx={{ mt: 1.5, borderTop: 1, borderColor: 'divider', pt: 1.5 }}>
-      <Typography sx={{ mb: 1, fontSize: 11.5, fontWeight: 700 }}>
-        Campagne vérifiée — contrôlez ces valeurs avant de continuer
-      </Typography>
-      <Box component="dl" sx={{ display: 'grid', gridTemplateColumns: '132px minmax(0, 1fr)', gap: '5px 12px', m: 0 }}>
-        {rows.map(([label, value]) => (
-          <Box key={label} sx={{ display: 'contents' }}>
-            <Typography component="dt" color="text.secondary" sx={{ fontSize: 10.5 }}>
-              {label}
-            </Typography>
-            <Typography
-              component="dd"
-              sx={{ m: 0, minWidth: 0, overflowWrap: 'anywhere', fontSize: 10.5, fontFamily: label.includes('Empreinte') || label.includes('Ancre') ? 'monospace' : 'inherit' }}
-            >
-              {value}
-            </Typography>
-          </Box>
-        ))}
-      </Box>
     </Box>
   )
 }

@@ -12,14 +12,11 @@ import {
   aboutOrion,
   adapterIsUp,
   allowUnencryptedVolume,
-  astraCaTlsRotationStatus,
-  cancelAstraCaTlsRotation,
   backendKind,
   certificateActions,
   certificateInventory,
   certificateOverview,
   connect,
-  continueAstraCaTlsRotation,
   deleteProfile,
   disconnect,
   renewPsk,
@@ -33,12 +30,14 @@ import {
   onEvent,
   onProfilePath,
   onTrayView,
+  operatorRotationsOverview,
+  operatorSendVaultCopy,
+  operatorOpenCampaign,
   resizeForView,
   runCertificateAction,
   runSpeedTest,
   saveProfile,
   selectProfile,
-  startAstraCaTlsRotation,
   validateProfile,
   vaultPosture,
   exportLogs,
@@ -46,6 +45,23 @@ import {
 
 describe('Orion Tauri bridge', () => {
   beforeEach(() => vi.clearAllMocks())
+
+  it('reads the rotations screen and sends the vault copy without naming anything', async () => {
+    mocks.invoke.mockResolvedValue(undefined)
+
+    await operatorRotationsOverview()
+    await operatorSendVaultCopy()
+    await operatorOpenCampaign({ action: 'fleet_leafs' }, 'raison', 'christophe')
+
+    expect(mocks.invoke.mock.calls).toEqual([
+      ['operator_rotations_overview'],
+      ['operator_send_vault_copy'],
+      [
+        'operator_open_campaign',
+        { action: { action: 'fleet_leafs' }, reason: 'raison', requestedBy: 'christophe' },
+      ],
+    ])
+  })
 
   it('only uses explicitly authorized commands', async () => {
     mocks.invoke.mockResolvedValue(undefined)
@@ -76,16 +92,6 @@ describe('Orion Tauri bridge', () => {
     await connect()
     await disconnect()
     await renewPsk()
-    const astraInput = {
-      vault_path: 'C:\\astra\\authority-vault.json',
-      heliosd_url: 'http://100.64.0.1:8080',
-      operation_id: 'a'.repeat(32),
-      output_path: 'C:\\astra\\ca-tls-transition.json',
-    }
-    await startAstraCaTlsRotation(astraInput)
-    await continueAstraCaTlsRotation()
-    await cancelAstraCaTlsRotation()
-    await astraCaTlsRotationStatus()
     await resizeForView('profiles')
     await exportLogs('orion-log', 'contents')
 
@@ -121,10 +127,6 @@ describe('Orion Tauri bridge', () => {
       ['connect', { name: null }],
       ['disconnect'],
       ['renew_psk'],
-      ['start_astra_ca_tls_rotation', { input: astraInput }],
-      ['continue_astra_ca_tls_rotation'],
-      ['cancel_astra_ca_tls_rotation'],
-      ['astra_ca_tls_rotation_status'],
       ['resize_for_view', { view: 'profiles' }],
       ['export_logs', { stem: 'orion-log', contents: 'contents' }],
     ])

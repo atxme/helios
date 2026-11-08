@@ -16,6 +16,7 @@ import type {
   OperatorStatus,
 } from '../../types'
 import { readFileText } from './readFileText'
+import { overlapReason } from './rotationRows'
 import { useOverview } from './useOverview'
 
 /** The scopes Orion can open a ceremony for; every other campaign is listed but not launchable. */
@@ -25,6 +26,8 @@ const OPENABLE_SCOPES = new Set<CampaignScope>([
   'fleet_leafs',
   'full_certificate_chain',
   'issuer_delegation',
+  // Led to the Rotations tab: a CA rotation is approved there, with its keys validated first.
+  'trust_authorities',
 ])
 
 const OPERATION_ID = /^[0-9a-f]{32}$/
@@ -94,9 +97,18 @@ function RequestFileButton({
 export function ApprovalsPanel({
   pending,
   onCeremony,
+  caPqOverlap,
+  onOpenRotations,
 }: {
   pending: OperatorPendingOperation[]
   onCeremony: (status: OperatorStatus) => void
+  /**
+   * A CA-PQ overlap, or `null` when the authority was not read. Astra refuses every
+   * approval under the local document during the overlap, after the touch, so no
+   * launch is offered then.
+   */
+  caPqOverlap: boolean | null
+  onOpenRotations: () => void
 }) {
   const { overview, error: overviewError } = useOverview()
   const [busy, setBusy] = useState(false)
@@ -120,11 +132,17 @@ export function ApprovalsPanel({
 
   const beginIssuer = (gesture: IssuerGesture) => begin(() => api.beginIssuerCeremony(gesture))
 
+  const gate = overlapReason(caPqOverlap)
   const loaded = overview != null
   const hasOrigin = loaded && Boolean(overview.domain?.astra_authority_url)
 
   return (
     <>
+      {gate && (
+        <Alert severity="warning" variant="outlined" sx={{ mb: 1.25, fontSize: 11.5 }}>
+          {gate}
+        </Alert>
+      )}
       <Typography color="text.secondary" sx={{ fontSize: 11.5, lineHeight: 1.55, mb: 1.5 }}>
         {pending.length === 0
           ? 'Aucune opération n’attend l’opérateur.'
@@ -136,6 +154,7 @@ export function ApprovalsPanel({
         {pending.map((operation) => {
           const supported = OPENABLE_SCOPES.has(operation.scope)
           const delegation = operation.scope === 'issuer_delegation'
+          const rotation = operation.scope === 'trust_authorities'
           return (
             <Paper key={operation.operation_id} variant="outlined" sx={{ px: 1.75, py: 1.5 }}>
               <Typography sx={{ fontSize: 12.5, fontWeight: 650 }}>{operation.reason}</Typography>
@@ -158,10 +177,12 @@ export function ApprovalsPanel({
                 <Button
                   size="small"
                   variant="contained"
-                  disabled={busy || !supported}
+                  disabled={busy || !supported || gate !== null}
                   startIcon={<KeyRound size={14} aria-hidden />}
                   onClick={() =>
-                    delegation
+                    rotation
+                      ? onOpenRotations()
+                      : delegation
                       ? setChoosing(operation.operation_id)
                       : void begin(() =>
                           api.beginOperatorCeremony({
@@ -172,13 +193,13 @@ export function ApprovalsPanel({
                   }
                   sx={{ mt: 1, minHeight: 30, fontSize: 11.5 }}
                 >
-                  Ouvrir la cérémonie
+                  {rotation ? 'Ouvrir dans Rotations' : 'Ouvrir la cérémonie'}
                 </Button>
                 {delegation && choosing === operation.operation_id && (
                   <RequestFileButton
                     label="Choisir la demande de délégation…"
                     inputLabel="Demande de délégation"
-                    disabled={busy}
+                    disabled={busy || gate !== null}
                     onUnreadable={() => setError(UNREADABLE_REQUEST)}
                     onText={(request) =>
                       void beginIssuer({
@@ -216,7 +237,7 @@ export function ApprovalsPanel({
         <Button
           size="small"
           variant="contained"
-          disabled={busy || !recoveryValid}
+          disabled={busy || !recoveryValid || gate !== null}
           startIcon={<KeyRound size={14} aria-hidden />}
           onClick={() =>
             void begin(() =>
@@ -251,7 +272,7 @@ export function ApprovalsPanel({
             <RequestFileButton
               label="Signer une délégation sans campagne…"
               inputLabel="Demande de délégation sans campagne"
-              disabled={busy}
+              disabled={busy || gate !== null}
               onUnreadable={() => setError(UNREADABLE_REQUEST)}
               onText={(request) =>
                 void beginIssuer({ gesture: 'authorize_issuer_offline', request })

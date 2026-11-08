@@ -135,6 +135,12 @@ impl VaultLocation {
         Ok(path)
     }
 
+    /// [`Self::path`] as a pure read: nothing is created. For a look that must not
+    /// leave a folder on a machine that never opened Astra.
+    pub fn path_to_look_at(&self) -> Result<PathBuf, String> {
+        resolved(&self.held(), &self.default)
+    }
+
     /// Where the vault is, or why that cannot be said, for the window.
     pub fn view(&self) -> VaultLocationView {
         view_of(&self.held(), &self.default)

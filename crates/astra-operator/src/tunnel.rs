@@ -38,11 +38,16 @@ use std::time::Duration;
 use aether::certificates::approval::{
     AstraCredentialApprovalRequest, AstraRenewalApproval, CredentialRegistry,
 };
-use aether::certificates::encoding::Id16;
+use aether::certificates::authority::{CaTransition, ClientTlsCaTransition};
+use aether::certificates::encoding::{Fingerprint, Id16};
 use aether::certificates::transport::{
     ClientRenewalOperationState, ClientRenewalOperationView, ClientRenewalSignerRequest,
+    OperatorAuthorityStatus, OperatorOpenRequest, OperatorOpened, OperatorVaultCopied,
+    OperatorVaultCopy,
 };
 use anyhow::{bail, Context, Result};
+
+use crate::rotation_journal::RotationKind;
 
 /// Per-call timeout.
 ///
@@ -50,7 +55,10 @@ use anyhow::{bail, Context, Result};
 /// slower than this is a gateway that is not answering, and the operator is
 /// standing at a prompt with a security key in hand — a long wait there is
 /// worse than a clear refusal.
-const CALL_TIMEOUT: Duration = Duration::from_secs(20);
+const CALL_TIMEOUT: Duration = Duration::from_secs(CALL_TIMEOUT_SECS);
+
+/// How long one call through the tunnel may take, in seconds.
+pub const CALL_TIMEOUT_SECS: u64 = 20;
 
 /// Ceiling on any answer.
 ///
@@ -59,6 +67,48 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(20);
 /// far above both, and the bound exists because the other end of the tunnel is
 /// still a peer.
 const MAX_ANSWER_BYTES: usize = 256 * 1024;
+
+/// Ceiling on the domain view, the one answer that grows with the fleet.
+///
+/// A peer costs a few hundred bytes there, so the ceiling of the other answers
+/// would make a rotation unresumable on a gateway with a thousand peers.
+const MAX_DOMAIN_ANSWER_BYTES: usize = 8 * 1024 * 1024;
+
+const NO_AUTHORITY: &str = "la gateway ne relaie aucune autorité (503) : Astra n'est pas déployé, \
+                            ou son canal privé est tombé.";
+
+/// The gateway answered with a status other than success.
+///
+/// Having an answer is all this type says, and a lost connection stays apart from
+/// it. What the answer means is in [`status`](Self::status): a deposit's 403 or
+/// 409 is the domain's word about a journal, while 429, 500 or 503 only say that
+/// the gateway or the authority could not answer, and say nothing about it. So a
+/// resume must not set `deposit_refused` from the type alone. Reached by
+/// `downcast_ref` on the error any call on the operator routes returns.
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub struct TunnelRefusal {
+    pub status: u16,
+    message: String,
+}
+
+/// Whether a call failed for want of an answer, rather than on what came back.
+pub fn is_unreachable(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<reqwest::Error>())
+}
+
+/// Where a vault copy landed.
+///
+/// An enum rather than an error: [`VaultCopySent::HeldBack`] is an ordinary
+/// answer the caller has to handle, not a failure of the rotation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VaultCopySent {
+    /// Astra holds it, and this is what it reads back.
+    Copied(OperatorVaultCopied),
+    /// A live operation names the vault in place, or a rotation holds the
+    /// document back. Nothing was written; the same copy can be sent again.
+    HeldBack,
+}
 
 /// What the companion has to show, and what it must not believe.
 ///
@@ -271,20 +321,22 @@ impl Tunnel {
             // what a caller learns is that it was refused. Two statuses are
             // still worth naming, because they send the operator somewhere
             // different — and neither is their own mistake to fix.
-            match status.as_u16() {
-                403 => bail!(
-                    "jeton de capacité refusé (403). Il vaut cinq minutes, pour une opération et \
-                     un manifeste : relancer l'approbation depuis le client."
-                ),
-                503 => bail!(
-                    "la gateway ne relaie aucune autorité (503) : Astra n'est pas déployé, ou son \
-                     canal privé est tombé."
-                ),
-                code => bail!(
+            let code = status.as_u16();
+            let message = match code {
+                403 => "jeton de capacité refusé (403). Il vaut cinq minutes, pour une opération \
+                        et un manifeste : relancer l'approbation depuis le client."
+                    .to_string(),
+                503 => NO_AUTHORITY.to_string(),
+                code => format!(
                     "la gateway a refusé ({code}). Le motif détaillé reste dans son journal : le \
                      canal in-tunnel ne le renvoie jamais à l'appelant."
                 ),
+            };
+            return Err(TunnelRefusal {
+                status: code,
+                message,
             }
+            .into());
         }
         let bytes = response.bytes().context("lecture de la réponse")?;
         if bytes.len() > max_answer_bytes {
@@ -427,4 +479,185 @@ impl Tunnel {
             Self::decode_bounded(response, crate::origin::MAX_ANSWER_BYTES)?;
         Ok(view.state)
     }
+}
+
+// ---------------------------------------------------------------------------
+// The administrator routes a rotation travels on (lot 5b).
+// ---------------------------------------------------------------------------
+
+/// The anchors of `GET /api/certificates`, out of everything it says.
+///
+/// Its own subset rather than the gateway's type, which this crate does not
+/// link, and which refuses a field it does not know: this read must outlive what
+/// that view gains. The client TLS pair is defaulted for a gateway older than it.
+#[derive(serde::Deserialize)]
+struct GatewayAnchors {
+    ca_pq_fingerprint: Fingerprint,
+    #[serde(default)]
+    next_ca_fingerprint: Option<Fingerprint>,
+    #[serde(default)]
+    client_tls_ca_fingerprint: Option<Fingerprint>,
+    #[serde(default)]
+    next_client_tls_ca_fingerprint: Option<Fingerprint>,
+}
+
+/// The sentence `GatewayActionRefusal` carries.
+#[derive(serde::Deserialize)]
+struct GatewayRefusalBody {
+    message: String,
+}
+
+impl Tunnel {
+    /// Opens a campaign through the door (lot 5a, §5.4).
+    pub fn open_campaign(&self, request: &OperatorOpenRequest) -> Result<OperatorOpened> {
+        let response = self
+            .post_admin(&format!("{OPERATOR_PREFIX}/campaigns"), request)
+            .context("ouverture de la campagne")?;
+        Self::read_admin(response, crate::origin::MAX_ANSWER_BYTES)
+            .context("ouverture de la campagne")
+    }
+
+    /// Reads what Astra holds (§5.9). Fingerprints and epochs, no token.
+    pub fn authority_status(&self) -> Result<OperatorAuthorityStatus> {
+        let response = self
+            .get_admin(&format!("{OPERATOR_PREFIX}/status"))
+            .context("lecture de l'autorité")?;
+        Self::read_admin(response, crate::origin::MAX_ANSWER_BYTES).context("lecture de l'autorité")
+    }
+
+    /// Replaces Astra's vault copy (§5.9).
+    ///
+    /// Unbounded here on purpose: the route has its own limit, far above the
+    /// relay's 64 KiB, and answers `413` above it. A larger vault fails as a
+    /// refusal that names its status, with nothing written.
+    pub fn send_vault_copy(&self, copy: &OperatorVaultCopy) -> Result<VaultCopySent> {
+        let response = self
+            .post_admin(&format!("{OPERATOR_PREFIX}/vault-copy"), copy)
+            .context("envoi de la copie du coffre")?;
+        if response.status() == reqwest::StatusCode::CONFLICT {
+            return Ok(VaultCopySent::HeldBack);
+        }
+        Self::read_admin(response, crate::origin::MAX_ANSWER_BYTES)
+            .map(VaultCopySent::Copied)
+            .context("envoi de la copie du coffre")
+    }
+
+    /// Installs a `CA-PQ` transition on the gateway, which checks it itself and
+    /// accepts a replay of the same one.
+    pub fn install_ca_transition(&self, transition: &CaTransition) -> Result<()> {
+        self.install("/api/certificates/ca-transition", transition)
+    }
+
+    /// Installs a client `CA-TLS` transition, on the same terms.
+    pub fn install_client_tls_ca_transition(
+        &self,
+        transition: &ClientTlsCaTransition,
+    ) -> Result<()> {
+        self.install("/api/certificates/client-tls-ca-transition", transition)
+    }
+
+    /// The anchor the gateway is heading to: its next one, or its current one
+    /// when no rotation of that kind is in flight.
+    ///
+    /// So a rotation already promoted still reads as installed. `None` is a
+    /// gateway that names no such anchor; a failed read is an error, and not
+    /// that.
+    pub fn gateway_next_anchor(&self, kind: RotationKind) -> Result<Option<Fingerprint>> {
+        let response = self
+            .get_admin("/api/certificates")
+            .context("lecture du domaine de la gateway")?;
+        let anchors: GatewayAnchors = Self::read_admin(response, MAX_DOMAIN_ANSWER_BYTES)
+            .context("lecture du domaine de la gateway")?;
+        Ok(match kind {
+            RotationKind::CaPq => Some(
+                anchors
+                    .next_ca_fingerprint
+                    .unwrap_or(anchors.ca_pq_fingerprint),
+            ),
+            RotationKind::CaTls => anchors
+                .next_client_tls_ca_fingerprint
+                .or(anchors.client_tls_ca_fingerprint),
+        })
+    }
+
+    fn install<T: serde::Serialize>(&self, path: &str, transition: &T) -> Result<()> {
+        let response = self
+            .post_admin(path, transition)
+            .context("installation de la transition sur la gateway")?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        // These routes name their reason, unlike the relayed ones: it is what
+        // the operator acts on, and a body too large to read is no reason.
+        let reason = response
+            .bytes()
+            .ok()
+            .filter(|bytes| bytes.len() <= crate::origin::MAX_ANSWER_BYTES)
+            .and_then(|bytes| serde_json::from_slice::<GatewayRefusalBody>(&bytes).ok())
+            .map(|body| body.message);
+        Err(admin_refusal(status.as_u16(), reason))
+            .context("installation de la transition sur la gateway")
+    }
+
+    fn get_admin(&self, path: &str) -> Result<reqwest::blocking::Response> {
+        self.http
+            .get(format!("{}{path}", self.base))
+            .send()
+            .context("appel de la gateway")
+    }
+
+    fn post_admin<T: serde::Serialize>(
+        &self,
+        path: &str,
+        body: &T,
+    ) -> Result<reqwest::blocking::Response> {
+        let body = serde_json::to_vec(body).context("encodage de la requête")?;
+        self.http
+            .post(format!("{}{path}", self.base))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body)
+            .send()
+            .context("appel de la gateway")
+    }
+
+    fn read_admin<T: serde::de::DeserializeOwned>(
+        response: reqwest::blocking::Response,
+        max_answer_bytes: usize,
+    ) -> Result<T> {
+        let status = response.status();
+        if !status.is_success() {
+            return Err(admin_refusal(status.as_u16(), None));
+        }
+        let bytes = response.bytes().context("lecture de la réponse")?;
+        if bytes.len() > max_answer_bytes {
+            bail!(
+                "la gateway a répondu {} octets : au-delà de la borne de cette route",
+                bytes.len()
+            );
+        }
+        serde_json::from_slice(&bytes).context("réponse illisible")
+    }
+}
+
+/// A refusal on the administrator surface, where no capability token is at play.
+pub fn admin_refusal(status: u16, reason: Option<String>) -> anyhow::Error {
+    let message = match (status, reason) {
+        (_, Some(reason)) => format!("la gateway a refusé ({status}) : {reason}"),
+        (403, None) => {
+            "refusé (403) : ce poste n'est pas administrateur de la gateway, ou l'autorité refuse \
+             cette demande. Le motif reste dans le journal d'Astra."
+                .to_string()
+        }
+        (413, None) => {
+            "la gateway refuse cette taille (413) : au-delà de la borne de cette route.".to_string()
+        }
+        (429, None) => "trop d'opérations en attente (429).".to_string(),
+        (503, None) => NO_AUTHORITY.to_string(),
+        (status, None) => format!(
+            "la gateway a refusé ({status}). Le motif détaillé reste dans son journal : le canal \
+             in-tunnel ne le renvoie jamais à l'appelant."
+        ),
+    };
+    TunnelRefusal { status, message }.into()
 }

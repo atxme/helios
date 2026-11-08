@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use aether::certificates::approval::AstraIssuancePolicy;
 use aether::certificates::client::ClientCertificateGeneration;
@@ -19,6 +19,7 @@ use crate::service::{SourceBudget, MAX_LIVE_CHALLENGES};
 use crate::AuditEvent;
 
 mod tunnel;
+mod vault_copy;
 
 /// The instant every test opens at.
 const NOW: u64 = 1_000_000;
@@ -84,7 +85,17 @@ fn build_service(
     ca_tls: Option<Fingerprint>,
     gateway: Option<crate::gateway::GatewayChannel>,
 ) -> AstraService {
-    let (_, ca_public_key) = generate_ml_dsa_87_keypair().expect("CA-PQ keypair");
+    build_service_with_ca(dir, ca_tls, gateway).0
+}
+
+/// The same authority, with the private half of its `CA-PQ` for a test that
+/// has to sign a document under it.
+fn build_service_with_ca(
+    dir: &Path,
+    ca_tls: Option<Fingerprint>,
+    gateway: Option<crate::gateway::GatewayChannel>,
+) -> (AstraService, zeroize::Zeroizing<Vec<u8>>) {
+    let (ca_private_key, ca_public_key) = generate_ml_dsa_87_keypair().expect("CA-PQ keypair");
     let (service_private_key, service_public_key) =
         generate_ml_dsa_87_keypair().expect("service keypair");
     let trust_domain_id = TrustDomainId::new([1; 16]).expect("domain");
@@ -114,6 +125,7 @@ fn build_service(
         astra_service_public_key: service_public_key.clone(),
         issuer: None,
         transitions: Vec::new(),
+        promoted_credentials: None,
         peers: Default::default(),
         status_epochs: Default::default(),
         audit: Default::default(),
@@ -130,10 +142,10 @@ fn build_service(
     for (name, seed) in PEERS {
         registry.admit(peer(name, seed), NOW - 80).expect("admit");
     }
-    AstraService {
+    let service = AstraService {
         state_dir: dir.to_path_buf(),
         registry: Mutex::new(registry),
-        issuer: None,
+        issuer: RwLock::new(None),
         challenges: Mutex::new(ChallengeStore::with_capacity(MAX_LIVE_CHALLENGES)),
         budgets: Mutex::new(SourceBudget::default()),
         service_private_key,
@@ -142,16 +154,19 @@ fn build_service(
         capabilities: Mutex::new(
             aether::certificates::capability::CapabilityTokens::new().expect("capability key"),
         ),
-        approval_credential_ids: Vec::new(),
-        approval_credential_registry_epoch: 1,
-        approval_credential_registry: None,
+        approval_credentials: RwLock::new(Arc::new(crate::service::ApprovalCredentials {
+            ids: Vec::new(),
+            epoch: 1,
+            registry: None,
+        })),
         signing: Mutex::new(crate::signing::SigningOperationStore::new()),
         recoveries: Mutex::new(crate::recovery::RecoveryStore::new()),
         reconciliation: Mutex::new(()),
-        encrypted_vault: Some(b"placeholder encrypted vault".to_vec()),
+        encrypted_vault: RwLock::new(Some(Arc::new(b"placeholder encrypted vault".to_vec()))),
         gateway,
         volume_writes: VolumeWrites::new(),
-    }
+    };
+    (service, ca_private_key)
 }
 
 fn text() -> OpeningText {
@@ -219,11 +234,12 @@ fn specified(request: &DoorRequest) -> (bool, bool) {
         DoorRequest::ChainOpen { .. } => (true, false),
         DoorRequest::ChainNext {} => (true, false),
         DoorRequest::ChainAbandon {} => (true, false),
-        DoorRequest::IssuerDelegation { .. } => (true, false),
+        DoorRequest::IssuerDelegation { .. } => (true, true),
         DoorRequest::IssuerRequest {} => (true, false),
         DoorRequest::PinCaTls { .. } => (true, false),
         DoorRequest::IssuerInstall { .. } => (true, false),
         DoorRequest::GatewayIdentityPublish { .. } => (true, false),
+        DoorRequest::VaultCopy { .. } => (false, true),
     }
 }
 
@@ -250,6 +266,10 @@ fn the_policy_table_is_exactly_the_specification() {
             authorization: Box::new(delegation(&delegated_material(), 1)),
         },
         DoorRequest::GatewayIdentityPublish { epoch: 5 },
+        DoorRequest::VaultCopy {
+            vault: Vec::new().into(),
+            credentials: None,
+        },
     ];
     let tunnels = [
         tunnel(),
@@ -667,7 +687,7 @@ async fn an_anchor_opening_without_a_vault_is_refused() {
     let mut service = fixture(dir.path());
     Arc::get_mut(&mut service)
         .expect("sole owner")
-        .encrypted_vault = None;
+        .encrypted_vault = RwLock::new(None);
     assert!(matches!(
         service
             .door(
@@ -1119,6 +1139,28 @@ fn chain_step(
         ),
         other => panic!("expected a chain step, got {other:?}"),
     }
+}
+
+/// The user's decision of 4 November 2026 widens one entry only: a tunnel
+/// opens a delegation, and still neither reads a bare request nor installs.
+#[tokio::test]
+async fn tunnel_still_cannot_request_or_install_a_delegation() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture(dir.path());
+    let delegated = delegated_material();
+    for request in [
+        DoorRequest::IssuerRequest {},
+        DoorRequest::IssuerInstall {
+            authorization: Box::new(delegation(&delegated, 1)),
+        },
+    ] {
+        let refusal = service
+            .door(tunnel(), request, NOW)
+            .await
+            .expect_err("the tunnel is refused");
+        assert!(matches!(refusal, DoorRefusal::NotAllowedHere));
+    }
+    assert!(!crate::issuer::pq_key_path(dir.path(), 1).exists());
 }
 
 #[tokio::test]
@@ -1710,6 +1752,33 @@ async fn an_installed_delegation_is_recorded_in_memory_and_on_disk() {
     let request: crate::issuer::IssuerDelegationRequest =
         serde_json::from_str(&request).expect("the request is JSON");
     assert_eq!(request.issuer_epoch, 2);
+}
+
+#[tokio::test]
+async fn a_console_install_is_adopted_too() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture(dir.path());
+    let delegated = ready_to_install(&service).await;
+    assert!(service.issuer().is_none());
+
+    service
+        .door(
+            console(),
+            DoorRequest::IssuerInstall {
+                authorization: Box::new(delegation(&delegated, 1)),
+            },
+            NOW,
+        )
+        .await
+        .expect("installed");
+    assert_eq!(
+        service
+            .issuer()
+            .expect("adopted")
+            .authorization
+            .issuer_epoch,
+        1
+    );
 }
 
 #[tokio::test]

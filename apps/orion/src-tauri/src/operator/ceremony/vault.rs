@@ -100,6 +100,9 @@ fn refusal_of_setup(refusal: SetupRefusal) -> Refusal {
         SetupRefusal::SignerRevoked => Refusal::SignerRevoked,
         // What would be written is no longer what the window showed.
         SetupRefusal::PlanChanged => Refusal::DomainChanged,
+        // A rotation applies the vault it signed: a key slot changed meanwhile
+        // would be undone.
+        SetupRefusal::RotationInFlight => Refusal::RotationInFlight,
     }
 }
 
@@ -141,6 +144,14 @@ impl VaultRun<'_> {
         self.ceremony.refuse(refusal);
         (self.publish)(self.ceremony.status());
         Err(message)
+    }
+
+    /// Before any key: the write refuses it again, but a touch is not to be wasted.
+    fn ensure_no_rotation(&mut self) -> Result<(), String> {
+        match gestures::ensure_no_rotation_in_flight(self.vault_path) {
+            Ok(()) => Ok(()),
+            Err(refusal) => self.refuse_setup(refusal),
+        }
     }
 
     fn refuse_setup<T>(&mut self, refusal: SetupRefusal) -> Result<T, String> {
@@ -328,6 +339,7 @@ impl VaultRun<'_> {
 
     /// A further key: one the vault opens for, then the new one.
     fn add_key(&mut self, label: &str, role: KeyRole) -> Result<(), String> {
+        self.ensure_no_rotation()?;
         let (vault, fingerprint) = self.load()?;
         if let Err(refusal) = gestures::check_addition(&vault) {
             return self.refuse_setup(refusal);
@@ -374,6 +386,7 @@ impl VaultRun<'_> {
 
     /// A key withdrawn, with another key's opening.
     fn remove_key(&mut self, slot_id: &str) -> Result<(), String> {
+        self.ensure_no_rotation()?;
         let slot = self.slot_id(slot_id)?;
         let (vault, fingerprint) = self.load()?;
         let manifest = match gestures::check_removal(&vault, &slot) {
@@ -402,6 +415,7 @@ impl VaultRun<'_> {
 
     /// A key signed lost, or active again.
     fn mark_key(&mut self, slot_id: &str, lost: bool) -> Result<(), String> {
+        self.ensure_no_rotation()?;
         let slot = self.slot_id(slot_id)?;
         let (vault, fingerprint) = self.load()?;
         let manifest = match gestures::check_marking(self.vault_path, &vault, &slot) {

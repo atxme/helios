@@ -202,6 +202,29 @@ impl OperatorCampaignRelay for SpyCampaign {
         self.answer.clone()
     }
 
+    async fn status(
+        &self,
+        operator: &astra_channel::OperatorIdentity,
+    ) -> Result<astra_channel::OperatorAuthorityStatus, TrustUpdateRefusal> {
+        *self.seen.lock().unwrap() = Some(operator.clone());
+        match self.answer {
+            Ok(_) => Ok(authority_status()),
+            Err(refusal) => Err(refusal),
+        }
+    }
+
+    async fn vault_copy(
+        &self,
+        operator: &astra_channel::OperatorIdentity,
+        _copy: astra_channel::OperatorVaultCopy,
+    ) -> Result<astra_channel::OperatorVaultCopied, TrustUpdateRefusal> {
+        *self.seen.lock().unwrap() = Some(operator.clone());
+        match self.answer {
+            Err(refusal) => Err(refusal),
+            Ok(_) => Err(TrustUpdateRefusal::Rejected),
+        }
+    }
+
     async fn open(
         &self,
         operator: &astra_channel::OperatorIdentity,
@@ -220,7 +243,28 @@ impl OperatorCampaignRelay for SpyCampaign {
                 required_credentials: view.required_credentials,
                 expires_at: view.expires_at,
                 revocation_expiries: None,
+                delegation_request: None,
             })
+    }
+}
+
+fn authority_status() -> astra_channel::OperatorAuthorityStatus {
+    astra_channel::OperatorAuthorityStatus {
+        ca_epoch: 2,
+        ca_fingerprint: Fingerprint::of(b"ca"),
+        next_ca_fingerprint: None,
+        ca_tls_epoch: 1,
+        ca_tls_fingerprint: Some(Fingerprint::of(b"ca-tls")),
+        next_ca_tls_fingerprint: None,
+        issuer: Some(astra_channel::OperatorIssuerStatus {
+            recorded_epoch: 3,
+            serving_epoch: Some(2),
+            ca_epoch: 1,
+            ca_tls_epoch: 1,
+            not_after: 99,
+        }),
+        vault_copy_fingerprint: Some(Fingerprint::of(b"vault")),
+        credential_registry_epoch: Some(4),
     }
 }
 
@@ -658,4 +702,63 @@ async fn a_body_the_api_cannot_use_never_reaches_the_state_machine() {
         StatusCode::PAYLOAD_TOO_LARGE
     );
     assert!(handler.seen.lock().unwrap().is_none());
+}
+
+/// Held back by a live operation is `409` to the sender, who retries it, and not
+/// the `403` of a copy that will never pass.
+#[tokio::test]
+async fn a_vault_copy_held_back_answers_a_conflict() {
+    let relay = Arc::new(SpyCampaign {
+        answer: Err(TrustUpdateRefusal::Conflict),
+        seen: Mutex::new(None),
+        opened: Mutex::new(None),
+    });
+    let state = state_with(None).with_operator_campaign(Arc::clone(&relay) as Arc<_>);
+    let response = operator_vault_copy(
+        State(state),
+        Extension(operator_caller_at(true)),
+        Bytes::from_static(br#"{"vault_base64":"e30="}"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert!(relay.seen.lock().unwrap().is_some());
+}
+
+#[tokio::test]
+async fn status_route_refuses_a_non_admin() {
+    let relay = SpyCampaign::granting();
+    let state = state_with(None).with_operator_campaign(Arc::clone(&relay) as Arc<_>);
+    let response = operator_status(State(state), Extension(operator_caller_at(false))).await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(
+        relay.seen.lock().unwrap().is_none(),
+        "the caller is checked before anything reaches the authority"
+    );
+}
+
+#[tokio::test]
+async fn an_administrator_reads_the_authority_status() {
+    let relay = SpyCampaign::granting();
+    let state = state_with(None).with_operator_campaign(Arc::clone(&relay) as Arc<_>);
+    let response = operator_status(State(state), Extension(operator_caller_at(true))).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let report: astra_channel::OperatorAuthorityStatus = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(report.credential_registry_epoch, Some(4));
+    assert_eq!(report.issuer.unwrap().serving_epoch, Some(2));
+    assert!(relay.seen.lock().unwrap().is_some());
+}
+
+#[tokio::test]
+async fn a_refused_status_relays_its_class_and_no_channel_is_unavailable() {
+    let relay = SpyCampaign::refusing();
+    let state = state_with(None).with_operator_campaign(Arc::clone(&relay) as Arc<_>);
+    let response = operator_status(State(state), Extension(operator_caller_at(true))).await;
+    assert_eq!(response.status(), TrustUpdateRefusal::Rejected.status());
+
+    let response =
+        operator_status(State(state_with(None)), Extension(operator_caller_at(true))).await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 }

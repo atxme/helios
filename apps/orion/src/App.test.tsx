@@ -9,8 +9,9 @@ const mocks = vi.hoisted(() => ({
   vaultPosture: vi.fn(),
   useClient: vi.fn(),
   operatorCeremonyStatus: vi.fn(),
-  astraCaTlsRotationStatus: vi.fn(),
   beginOperatorCeremony: vi.fn(),
+  operatorRotationsOverview: vi.fn(),
+  operatorRotationJournal: vi.fn(),
   resumeCertificateRecovery: vi.fn(),
   dismissOperatorCeremony: vi.fn(),
   operatorPendingOperations: vi.fn(),
@@ -21,8 +22,9 @@ vi.mock('./api', () => ({
   resizeForView: mocks.resizeForView,
   vaultPosture: mocks.vaultPosture,
   operatorCeremonyStatus: mocks.operatorCeremonyStatus,
-  astraCaTlsRotationStatus: mocks.astraCaTlsRotationStatus,
   beginOperatorCeremony: mocks.beginOperatorCeremony,
+  operatorRotationsOverview: mocks.operatorRotationsOverview,
+  operatorRotationJournal: mocks.operatorRotationJournal,
   resumeCertificateRecovery: mocks.resumeCertificateRecovery,
   dismissOperatorCeremony: mocks.dismissOperatorCeremony,
   operatorPendingOperations: mocks.operatorPendingOperations,
@@ -68,7 +70,9 @@ vi.mock('./views/CertificatesView', () => ({
   }) => (
     <div>
       certificates-view
-      <button onClick={() => void onApprove?.('e'.repeat(32))}>test-start-recovery</button>
+      <button onClick={() => void onApprove?.('e'.repeat(32))?.catch(() => undefined)}>
+        test-start-recovery
+      </button>
       {completedRecovery?.portable && (
         <span>recovered-generation-{completedRecovery.portable.generation}</span>
       )}
@@ -118,9 +122,10 @@ beforeEach(() => {
   // Nothing waits on the operator by default: Astra remains accessible and
   // simply carries no attention badge.
   mocks.operatorCeremonyStatus.mockResolvedValue(null)
-  mocks.astraCaTlsRotationStatus.mockResolvedValue({ phase: 'idle' })
   mocks.operatorPendingOperations.mockResolvedValue([])
   mocks.beginOperatorCeremony.mockResolvedValue({})
+  mocks.operatorRotationsOverview.mockResolvedValue({ caPqOverlap: false })
+  mocks.operatorRotationJournal.mockResolvedValue({ journal: null, resumable: false })
   mocks.resumeCertificateRecovery.mockResolvedValue({
     progress: {
       portable: { step: 'recovered', generation: 5, activation_at: 1_789_198_911 },
@@ -194,6 +199,33 @@ describe('App interactions', () => {
     await waitFor(() => expect(mocks.resizeForView).toHaveBeenCalledWith('astra'))
   })
 
+  it('badges Astra for a rotation in flight even when no session is live', async () => {
+    // A failure screen left for Connexion, or a journal nothing resumed: no live session,
+    // but the install deadline still runs.
+    mocks.operatorRotationJournal.mockResolvedValue({
+      resumable: true,
+      journal: { kind: 'ca_pq', stage: 'applied', activationAt: 1_800_000_000 },
+    })
+    render(<App />)
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: /Astra/ }).textContent).toMatch(/1/),
+    )
+  })
+
+  it('watches journals through a local read and never through the overview', async () => {
+    // The overview reaches through the tunnel: three requests, a refusal for a poste that
+    // is not an administrator. A reminder shown to everyone must not cost any of that.
+    render(<App />)
+    await waitFor(() => expect(mocks.operatorRotationJournal).toHaveBeenCalled())
+    expect(mocks.operatorRotationsOverview).not.toHaveBeenCalled()
+  })
+
+  it('does not badge Astra when the overview shows nothing to resume', async () => {
+    render(<App />)
+    await waitFor(() => expect(mocks.operatorRotationJournal).toHaveBeenCalled())
+    expect(screen.getByRole('button', { name: 'Astra' }).textContent).not.toMatch(/1/)
+  })
+
   it('keeps Astra available after a ceremony has finished', async () => {
     mocks.operatorCeremonyStatus.mockResolvedValue({
       session_id: 'a'.repeat(32),
@@ -229,6 +261,29 @@ describe('App interactions', () => {
       expect(mocks.resumeCertificateRecovery).toHaveBeenCalledWith('e'.repeat(32)),
     )
     expect(await screen.findByText('recovered-generation-5')).toBeTruthy()
+  })
+
+  it.each([[true], [null]])(
+    'does not open a recovery while the CA-PQ overlap is %s',
+    async (overlap) => {
+      mocks.operatorRotationsOverview.mockResolvedValue({ caPqOverlap: overlap })
+      render(<App />)
+      fireEvent.click(screen.getByRole('button', { name: 'Certificats' }))
+      fireEvent.click(await screen.findByRole('button', { name: 'test-start-recovery' }))
+      await waitFor(() => expect(mocks.operatorRotationsOverview).toHaveBeenCalled())
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      expect(mocks.beginOperatorCeremony).not.toHaveBeenCalled()
+      expect(screen.queryByText('astra-view')).toBeNull()
+    },
+  )
+
+  it('does not open a recovery when the overview cannot be read', async () => {
+    mocks.operatorRotationsOverview.mockRejectedValue('illisible')
+    render(<App />)
+    fireEvent.click(screen.getByRole('button', { name: 'Certificats' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'test-start-recovery' }))
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    expect(mocks.beginOperatorCeremony).not.toHaveBeenCalled()
   })
 
   it('opens and closes posture details and delegates error dismissal', () => {

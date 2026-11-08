@@ -9,14 +9,18 @@ import { KeyRound, X } from 'lucide-react'
 
 import * as api from '../api'
 import { RULE } from '../theme'
+import { formatDateTime, formatTime, stopSentence } from './astra/rotationRows'
 import type {
   AstraManifest,
+  CampaignManifest,
   GestureState,
+  KeyPurpose,
   KeyRole,
   OperationKind,
   OperatorStatus,
-  RemoteState,
   Refusal,
+  RemoteState,
+  RotationJournalView,
 } from '../types'
 
 /**
@@ -115,6 +119,19 @@ export function groupedHex(hex: string): string {
   return hex.replace(/\s+/g, '').replace(/(.{4})(?=.)/g, '$1 ')
 }
 
+/** Every target a campaign binds: the touch signs them all. */
+function targetRows(campaign: CampaignManifest['campaign']): [string, string][] {
+  return campaign.targets.flatMap((target, index): [string, string][] => [
+    [
+      `cible ${index + 1}`,
+      `${CERTIFICATE_KINDS[target.certificate_kind]} — ${target.identity_key}`,
+    ],
+    [`cible ${index + 1} état`, `époque ${target.epoch}, génération ${target.generation}`],
+    [`cible ${index + 1} TLS`, target.active_tls_certificate_fingerprint],
+    [`cible ${index + 1} PQ`, target.active_pq_certificate_fingerprint],
+  ])
+}
+
 /** The rows of one manifest, named here and never carried as text. */
 export function rowsOf(manifest: AstraManifest): [string, string][] {
   switch (manifest.operation) {
@@ -142,15 +159,7 @@ export function rowsOf(manifest: AstraManifest): [string, string][] {
         ['nom serveur', manifest.campaign.server_name],
         ['politique', manifest.campaign.policy_fingerprint],
         ['clés requises', String(manifest.campaign.required_credentials)],
-        ...manifest.campaign.targets.flatMap((target, index): [string, string][] => [
-          [
-            `cible ${index + 1}`,
-            `${CERTIFICATE_KINDS[target.certificate_kind]} — ${target.identity_key}`,
-          ],
-          [`cible ${index + 1} état`, `époque ${target.epoch}, génération ${target.generation}`],
-          [`cible ${index + 1} TLS`, target.active_tls_certificate_fingerprint],
-          [`cible ${index + 1} PQ`, target.active_pq_certificate_fingerprint],
-        ]),
+        ...targetRows(manifest.campaign),
         ['empreinte', manifest.fingerprint],
         ['domaine', manifest.campaign.trust_domain_id],
       ]
@@ -182,17 +191,30 @@ export function rowsOf(manifest: AstraManifest): [string, string][] {
       }
       return rows
     }
-    case 'ca_rotation':
-      return [
+    case 'ca_rotation': {
+      const rows: [string, string][] = [
         ['autorité visée', CA_NAMES[manifest.affected_ca]],
         ['époque', `${manifest.current_epoch} → ${manifest.next_epoch}`],
         ['activation', instant(manifest.activation_at)],
         ['échéance', instant(manifest.not_after)],
         ['ancre sortante', manifest.outgoing_anchor_fingerprint],
-        ['ancre entrante', manifest.next_anchor_fingerprint],
-        ['pairs concernés', String(manifest.target_count)],
+        ['ancre entrante', manifest.next_anchor_fingerprint ?? 'créée à la signature'],
         ['domaine', manifest.trust_domain_id],
       ]
+      if (manifest.campaign) {
+        rows.push(
+          ['campagne', manifest.campaign.campaign.campaign_id],
+          ['portée', CAMPAIGN_SCOPES[manifest.campaign.campaign.scope]],
+          ['motif', manifest.campaign.campaign.reason],
+          ['demandée par', manifest.campaign.campaign.requested_by],
+          ['clés requises', String(manifest.campaign.campaign.required_credentials)],
+          ['cibles', String(manifest.campaign.campaign.targets.length)],
+          ...targetRows(manifest.campaign.campaign),
+          ['empreinte de campagne', manifest.campaign.fingerprint],
+        )
+      }
+      return rows
+    }
     case 'revocation':
       return [
         ['cible', manifest.target],
@@ -281,7 +303,7 @@ export function rowsOf(manifest: AstraManifest): [string, string][] {
 }
 
 /** What the authority holds, said plainly. */
-function remoteSentence(remote: RemoteState): string {
+export function remoteSentence(remote: RemoteState): string {
   if (typeof remote === 'object') {
     return `Signée et commitée. La nouvelle génération prend effet le ${instant(
       remote.activation_deferred.activation_at,
@@ -310,7 +332,12 @@ function remoteSentence(remote: RemoteState): string {
 }
 
 /** What this machine is doing, said plainly. */
-export function gestureSentence(gesture: GestureState, operation: OperationKind): string {
+export function gestureSentence(
+  gesture: GestureState,
+  operation: OperationKind,
+  /** A campaign exists at the authority: abandoning does not undo it. */
+  opened = false,
+): string {
   if (typeof gesture === 'object') {
     if ('awaiting_key' in gesture) {
       const { index, of, purpose } = gesture.awaiting_key
@@ -331,6 +358,8 @@ export function gestureSentence(gesture: GestureState, operation: OperationKind)
             ? 'pour approuver la campagne affichée'
           : purpose === 'second_approval'
             ? 'pour la seconde approbation'
+          : purpose === 'validate_key'
+            ? 'pour la valider'
             : 'pour promouvoir ce qui a été préparé'
       return `Brancher la clé autorisée${which}, ${why}.`
     }
@@ -347,14 +376,88 @@ export function gestureSentence(gesture: GestureState, operation: OperationKind)
     case 'done':
       return TITLES[operation] + ' : terminé.'
     case 'cancelled':
-      return 'Abandonné. Rien n’a quitté cette machine.'
+      // Open for up to its window, unable to be approved without the openings, and
+      // blocking its family: not « rien n'a quitté cette machine ».
+      return opened
+        ? 'Abandonné. Campagne encore ouverte, 5 min au plus.'
+        : 'Abandonné. Rien n’a quitté cette machine.'
     case 'failed':
       return 'La cérémonie s’est arrêtée.'
   }
 }
 
+/**
+ * Refusals a rotation does not word like the other ceremonies: nothing of the enrollment's
+ * `admission.txt`, and the door's classes by their label. `null` leaves the usual sentence.
+ */
+function rotationRefusal(
+  refusal: Refusal,
+  journal: RotationJournalView | null,
+  opened: boolean,
+): string | null {
+  const kept = (said: string) => (journal ? `${said}. Rotation conservée.` : said)
+  switch (refusal.refusal) {
+    case 'gateway_unavailable':
+      return kept('Gateway injoignable')
+    case 'gateway_refused':
+      return kept(`Gateway refuse l’installation (HTTP ${refusal.status})`)
+    case 'signer_revoked':
+      // Found by `open`, once both keys were validated: the ceremony starts again.
+      return 'Clé validée marquée perdue ou révoquée. Recommencer avec une clé active.'
+    case 'window_expired':
+      // At the key steps and the terms nothing exists at the authority, and the keys
+      // held in memory are what ran out.
+      return opened ? 'Campagne expirée' : 'Délai écoulé. Clés oubliées. Recommencer'
+    case 'authority_refused':
+      if (refusal.status === 429) return 'Trop d’opérations en attente'
+      // The door answers 403 to a campaign already open and to a peer that is no admin.
+      if (refusal.status === 403) return 'Opération déjà ouverte, ou poste non administrateur'
+      return null
+    default:
+      return null
+  }
+}
+
+/**
+ * Why a key is asked for again, in a few words. The purpose tells a second key that
+ * repeats the first at validation from one that was already used to approve.
+ */
+export function retryLabel(retry: Refusal, purpose: KeyPurpose | null): string {
+  switch (retry.refusal) {
+    case 'key_repeated':
+      return purpose === 'validate_key' ? 'Même clé que la clé 1' : 'Clé déjà approuvée'
+    case 'key_not_enrolled':
+      return 'Clé absente du coffre'
+    case 'signer_revoked':
+      return 'Clé marquée perdue ou révoquée'
+    case 'key_not_validated':
+      return 'Autre clé attendue'
+    case 'key_declined':
+      return 'Clé sans réponse'
+    case 'foreground_unavailable':
+      return 'Fenêtre Windows indisponible'
+    case 'terms_refused':
+      return 'Durées hors limites'
+    default:
+      return refusalSentence(retry)
+  }
+}
+
 /** Why it stopped. Typed, so the words are ours. */
-export function refusalSentence(refusal: Refusal): string {
+export function refusalSentence(
+  refusal: Refusal,
+  /** The rotation journal, when the screen knows it: dates and recourse come from it. */
+  journal: RotationJournalView | null = null,
+  /** The ceremony the refusal ends: a rotation words some refusals its own way. */
+  operation: OperationKind | null = null,
+  /** A campaign exists at the authority; `true` when the screen does not say. */
+  opened = true,
+): string {
+  const rotation = operation === 'rotate_anchor' || operation === 'rotate_client_tls_ca'
+  if (rotation) {
+    const worded = rotationRefusal(refusal, journal, opened)
+    if (worded !== null) return worded
+  }
   switch (refusal.refusal) {
     case 'vault_unavailable':
       return 'Coffre d’autorité absent, illisible, ou étranger à ce domaine.'
@@ -475,12 +578,41 @@ export function refusalSentence(refusal: Refusal): string {
       return 'Le canal local a été rompu.'
     case 'cancelled':
       return 'Abandonné.'
+    case 'rotation_expired':
+      return 'Rotation expirée. Recommencer.'
+    case 'domain_conflict':
+      return stopSentence('domain_conflict', journal)
+    case 'install_deadline_passed':
+      return stopSentence('install_deadline_passed', journal)
+    case 'gateway_names_no_anchor':
+      return stopSentence('gateway_names_no_anchor', journal)
+    case 'rotation_in_flight':
+      return 'Rotation en cours. La mener à son terme d’abord.'
+    case 'campaign_closing':
+      // Astra's silence on a campaign that has only just closed is not yet its last word.
+      return `Campagne à peine close. Rotation conservée : reprendre après ${formatTime(refusal.until)}.`
+    case 'key_not_validated':
+      return 'Autre clé attendue.'
+    case 'terms_refused':
+      return 'Durées hors limites. Rien n’a été envoyé.'
+    case 'nothing_to_finish':
+      return 'Aucune rotation à terminer.'
+    case 'overlap_running':
+      // On this machine's clock, which the row's gateway clock may be ahead of.
+      return `Recouvrement jusqu’au ${formatDateTime(refusal.until)}. Rien n’a été modifié.`
     case 'internal':
       return 'Le processus opérateur s’est arrêté sans conclure.'
   }
 }
 
-function Row({ label, value }: { label: string; value: string }) {
+/** The purpose of the key being asked, when one is. */
+export function purposeOf(gesture: GestureState): KeyPurpose | null {
+  return typeof gesture === 'object' && 'awaiting_key' in gesture
+    ? gesture.awaiting_key.purpose
+    : null
+}
+
+export function Row({ label, value }: { label: string; value: string }) {
   return (
     <Box sx={{ display: 'flex', alignItems: 'baseline', gap: 1, minWidth: 0, py: 0.35 }}>
       <Typography
@@ -508,10 +640,12 @@ export function OperatorCeremonyPanel({
   status,
   onStatus,
   onDismiss,
+  journal = null,
 }: {
   status: OperatorStatus
   onStatus: (next: OperatorStatus) => void
   onDismiss?: () => void
+  journal?: RotationJournalView | null
 }) {
   const [busy, setBusy] = useState(false)
   const [refusal, setRefusal] = useState<string | null>(null)
@@ -552,7 +686,7 @@ export function OperatorCeremonyPanel({
 
       <Box sx={{ mt: 1.25, pt: 1.25, borderTop: `1px solid ${RULE}` }}>
         <Typography sx={{ fontSize: 11.5, lineHeight: 1.55 }}>
-          {gestureSentence(status.gesture, status.operation)}
+          {gestureSentence(status.gesture, status.operation, status.remote !== 'local')}
         </Typography>
         <Typography color="text.secondary" sx={{ mt: 0.25, fontSize: 11.5, lineHeight: 1.55 }}>
           {remoteSentence(status.remote)}
@@ -567,13 +701,18 @@ export function OperatorCeremonyPanel({
         </Box>
       )}
 
+      {status.key_retry && !stopped && !done && (
+        <Alert severity="warning" variant="outlined" sx={{ mt: 1, fontSize: 11.5 }}>
+          {retryLabel(status.key_retry, purposeOf(status.gesture))}
+        </Alert>
+      )}
       {status.refusal && !done && (
         <Alert
           severity={status.refusal.refusal === 'cancelled' ? 'info' : 'error'}
           variant="outlined"
           sx={{ mt: 1, fontSize: 11.5 }}
         >
-          {refusalSentence(status.refusal)}
+          {refusalSentence(status.refusal, journal, status.operation)}
         </Alert>
       )}
       {done && (

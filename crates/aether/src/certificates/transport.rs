@@ -768,7 +768,7 @@ impl OrionTrustUpdateDocument {
 /// `astra` must not depend on it (`docs/architecture/CRATE-REORGANIZATION.md`
 /// §7). Same reason [`ClientRenewalOperationView`] is here.
 ///
-/// The four shapes are deliberately coarse. The detailed reason goes to the
+/// The shapes are deliberately coarse. The detailed reason goes to the
 /// gateway's protected log: an error taxonomy served to an
 /// authenticated-but-hostile caller is an oracle on other peers' generations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -783,6 +783,13 @@ pub enum TrustUpdateRefusal {
     /// empty update to a client that is provably out of date would tell it the
     /// opposite of the truth, and it would stop asking.
     Unavailable,
+    /// The authority holds as many live operations as it accepts. Retrying
+    /// later is the right advice, and unlike `Unavailable` it says why.
+    Throttled,
+    /// A live operation or rotation holds this back, and the same request can
+    /// pass once it is over. Answered only where the caller can already read
+    /// that operation: this is no oracle on anyone else's state.
+    Conflict,
     /// The gateway failed on its own side.
     Internal,
 }
@@ -1157,7 +1164,12 @@ pub struct OperatorPendingOperation {
 pub enum OperatorOpenAction {
     FleetLeafs,
     TrustAuthorities,
-    ClientRevocation { peer: WireGuardKey },
+    ClientRevocation {
+        peer: WireGuardKey,
+    },
+    /// The next delegation of Astra's issuer (lot 5b, §5.8). It draws keys in
+    /// the volume, which grants nothing: the operator's touch does.
+    IssuerDelegation,
 }
 
 const DEFAULT_OPEN_WINDOW_SECS: u64 = 300;
@@ -1191,6 +1203,7 @@ enum OperatorOpenActionTag {
     FleetLeafs,
     TrustAuthorities,
     ClientRevocation,
+    IssuerDelegation,
 }
 
 #[derive(Deserialize)]
@@ -1211,6 +1224,7 @@ impl TryFrom<OperatorOpenRequestWire> for OperatorOpenRequest {
         let action = match (wire.action, wire.peer) {
             (OperatorOpenActionTag::FleetLeafs, None) => OperatorOpenAction::FleetLeafs,
             (OperatorOpenActionTag::TrustAuthorities, None) => OperatorOpenAction::TrustAuthorities,
+            (OperatorOpenActionTag::IssuerDelegation, None) => OperatorOpenAction::IssuerDelegation,
             (OperatorOpenActionTag::ClientRevocation, Some(peer)) => {
                 OperatorOpenAction::ClientRevocation { peer }
             }
@@ -1252,6 +1266,83 @@ pub struct OperatorOpened {
     pub expires_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revocation_expiries: Option<RevocationExpiries>,
+    /// The public request of an issuer delegation, as the console's
+    /// `issuer request` prints it. Present only for that scope: the keys it
+    /// names were just drawn in the volume, and this is their public half.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation_request: Option<String>,
+}
+
+/// What Astra reports of its own authority state, for Orion to decide what is
+/// left to do (lot 5b, §5.9).
+///
+/// Fingerprints and epochs only: no token, no key, no document. It is a read,
+/// so it needs no capability and mints none.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorAuthorityStatus {
+    pub ca_epoch: u64,
+    pub ca_fingerprint: Fingerprint,
+    pub next_ca_fingerprint: Option<Fingerprint>,
+    pub ca_tls_epoch: u64,
+    pub ca_tls_fingerprint: Option<Fingerprint>,
+    pub next_ca_tls_fingerprint: Option<Fingerprint>,
+    pub issuer: Option<OperatorIssuerStatus>,
+    /// Fingerprint of the encrypted vault copy Astra holds, if any.
+    pub vault_copy_fingerprint: Option<Fingerprint>,
+    /// The epoch of the credential document Astra serves, not the registry's
+    /// bootstrap floor. `None` when Astra serves no document.
+    pub credential_registry_epoch: Option<u64>,
+}
+
+/// The delegation: what the registry records and what Astra serves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorIssuerStatus {
+    /// The registry's epoch.
+    pub recorded_epoch: u64,
+    /// The epoch of the issuer in service; differs from the recorded one when
+    /// an adoption failed, and is absent when none is loaded.
+    pub serving_epoch: Option<u64>,
+    pub ca_epoch: u64,
+    pub ca_tls_epoch: u64,
+    pub not_after: u64,
+}
+
+/// What an administrator sends to replace Astra's vault copy (spec §5.9).
+///
+/// The vault stays encrypted: this carries bytes neither the gateway nor Astra
+/// can open. The credential document, when present, is signed under `CA-PQ`
+/// and Astra verifies it itself before taking it.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorVaultCopy {
+    pub vault_base64: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credentials: Option<Box<crate::certificates::approval::CredentialRegistry>>,
+}
+
+/// Prints what the copy is made of and never its content: the vault is the
+/// field a `{:?}` in a log would otherwise carry whole.
+impl std::fmt::Debug for OperatorVaultCopy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OperatorVaultCopy")
+            .field("vault_base64_chars", &self.vault_base64.len())
+            .field("credentials", &self.credentials.is_some())
+            .finish()
+    }
+}
+
+/// What Astra holds after a vault copy, for Orion to read back.
+///
+/// `credential_registry_epoch` has the meaning it has in
+/// [`OperatorAuthorityStatus`]: `None` when no document is served.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorVaultCopied {
+    pub fingerprint: Fingerprint,
+    pub credential_registry_epoch: Option<u64>,
 }
 
 /// Everything waiting for an operator, at one instant.

@@ -1,54 +1,8 @@
-//! The Astra CA-TLS rotation and the operator ceremonies, driven from this
-//! window and signed in the companion.
+//! The operator ceremonies, driven and signed from this window.
 
 use super::*;
 
 use orion_engine::{ConfigView, EngineCommand, EngineReply};
-
-/// Opens the two-key CA-TLS ceremony described in ADR-008 §9.4.
-///
-/// Everything that decides anything happens in the companion: the campaign is
-/// fetched and verified there, under the Astra service key the vault's
-/// hand-off pins, and the two credentials are exercised there. This command
-/// starts it and returns the first state it publishes.
-#[tauri::command]
-pub(crate) async fn start_astra_ca_tls_rotation(
-    state: State<'_, AppState>,
-    input: astra::RotationInput,
-) -> Result<aether::certificates::operator_ipc::AstraCaTlsStatus, String> {
-    state.astra.start(input).await
-}
-
-/// Takes the next step, once the operator says the requested key is plugged in.
-#[tauri::command]
-pub(crate) async fn continue_astra_ca_tls_rotation(
-    state: State<'_, AppState>,
-) -> Result<aether::certificates::operator_ipc::AstraCaTlsStatus, String> {
-    state
-        .astra
-        .advance(aether::certificates::operator_ipc::AstraIpcCommand::Continue)
-        .await
-}
-
-/// Abandons the ceremony, which only the phases before the first durable write
-/// accept.
-#[tauri::command]
-pub(crate) async fn cancel_astra_ca_tls_rotation(
-    state: State<'_, AppState>,
-) -> Result<aether::certificates::operator_ipc::AstraCaTlsStatus, String> {
-    state
-        .astra
-        .advance(aether::certificates::operator_ipc::AstraIpcCommand::Cancel)
-        .await
-}
-
-/// The ceremony's current state, for a view that was opened after it started.
-#[tauri::command]
-pub(crate) async fn astra_ca_tls_rotation_status(
-    state: State<'_, AppState>,
-) -> Result<aether::certificates::operator_ipc::AstraCaTlsStatus, String> {
-    Ok(state.astra.status().await)
-}
 
 /// Opens an operator ceremony for the operation the WebView names.
 ///
@@ -101,8 +55,16 @@ pub(crate) async fn advance_operator_ceremony(
 
 /// Removes the final status once the operator has acknowledged it.
 #[tauri::command]
-pub(crate) async fn dismiss_operator_ceremony(state: State<'_, AppState>) -> Result<(), String> {
-    state.operator.dismiss().await
+pub(crate) async fn dismiss_operator_ceremony(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    // The operator's own screen may have cost a tunnel-up its look. A resumption's
+    // dead end does not: dismissing it must not bring it back.
+    if state.operator.dismiss().await? {
+        look_for_a_rotation_again(app);
+    }
+    Ok(())
 }
 
 /// Everything waiting for an operator, through the gateway of one profile.
@@ -187,6 +149,33 @@ pub(crate) async fn begin_issuer_ceremony(
 ) -> Result<aether::certificates::operator_session::OperatorStatus, String> {
     let vault_path = state.vault_location.path()?;
     state.operator.begin_issuer(gesture, vault_path).await
+}
+
+/// Opens a CA rotation gesture: replacing a CA, ending a client TLS rotation, or
+/// resuming one. The gateway is the connected profile's, read here from the engine;
+/// without one the gesture stops before any key.
+#[tauri::command]
+pub(crate) async fn begin_rotation_ceremony(
+    state: State<'_, AppState>,
+    gesture: crate::operator::RotationGesture,
+) -> Result<aether::certificates::operator_session::OperatorStatus, String> {
+    let vault_path = state.vault_location.path()?;
+    let gateway = connected_target(&state).await.ok();
+    state
+        .operator
+        .begin_rotation(gesture, gateway, vault_path)
+        .await
+}
+
+/// Answers the approval screen of a rotation, against the status the operator saw:
+/// this is what opens its campaign.
+#[tauri::command]
+pub(crate) async fn approve_rotation_ceremony(
+    state: State<'_, AppState>,
+    terms: astra_operator::operations::rotation::RotationTerms,
+    revision: u64,
+) -> Result<aether::certificates::operator_session::OperatorStatus, String> {
+    state.operator.approve_rotation(terms, revision).await
 }
 
 /// Renames a key. No key is asked anything: the label is outside what the
@@ -305,8 +294,19 @@ pub(crate) async fn operator_artifacts(
 #[tauri::command]
 pub(crate) async fn operator_ceremony_status(
     state: State<'_, AppState>,
-) -> Result<Option<aether::certificates::operator_session::OperatorStatus>, String> {
-    Ok(state.operator.status().await)
+) -> Result<Option<crate::operator::ObservedStatus>, String> {
+    Ok(state.operator.observed().await)
+}
+
+/// What rotations left beside the vault, and nothing else: no tunnel, no vault opened,
+/// no folder created. Read on a timer by the shell for every user, so it must cost
+/// nothing where there is nothing to show.
+#[tauri::command]
+pub(crate) async fn operator_rotation_journal(
+    state: State<'_, AppState>,
+) -> Result<crate::operator::rotations::LocalJournal, String> {
+    let vault_path = state.vault_location.path_to_look_at();
+    Ok(crate::operator::rotations::read_journal(&vault_path))
 }
 
 /// The operator vault and its trust domain, read without any key.
@@ -328,6 +328,118 @@ pub(crate) async fn operator_overview(
     .await
 }
 
+/// Everything the rotations screen shows, in one read and with no key.
+///
+/// The gateway is the connected profile's. Without a tunnel the three reads are
+/// `unreachable` and `tunnel` says why. The vault is looked at where it is, and
+/// no folder is created for having looked. The page receives display data only.
+#[tauri::command]
+pub(crate) async fn operator_rotations_overview(
+    state: State<'_, AppState>,
+) -> Result<crate::operator::rotations::RotationsOverview, String> {
+    use crate::operator::rotations::{read_local, RotationsOverview};
+    use orion_core::operator_rotations as reads;
+
+    let vault_path = state.vault_location.path_to_look_at();
+    let target = connected_target(&state).await.ok();
+    // Concurrent: a gateway that hangs for its whole wait must not delay the vault.
+    let reads = async {
+        match &target {
+            Some(target) => {
+                tokio::join!(
+                    reads::pending(&target.address),
+                    reads::authority_status(&target.address),
+                    reads::domain(&target.address),
+                )
+            }
+            None => (
+                reads::Reach::Unreachable,
+                reads::Reach::Unreachable,
+                reads::Reach::Unreachable,
+            ),
+        }
+    };
+    let now = crate::operator::now_unix();
+    let local = on_work_stack(
+        "orion-rotations-overview",
+        "la lecture du coffre",
+        move || Ok(read_local(&vault_path, now)),
+    );
+    let ((pending, authority, domain), local) = tokio::join!(reads, local);
+    let local = local?;
+    Ok(RotationsOverview::assemble(
+        target.is_some(),
+        pending,
+        authority,
+        domain,
+        local,
+    ))
+}
+
+/// Sends the vault copy Astra keeps, and the credential document when it may.
+///
+/// The vault and the credentials are read here, from beside the vault; the page
+/// names nothing. The copy goes only to the gateway the domain's relay names: Orion
+/// holds several profiles and one vault, and another domain's gateway must not
+/// receive this one. A copy Astra holds back is an answer, not a failure.
+#[tauri::command]
+pub(crate) async fn operator_send_vault_copy(
+    state: State<'_, AppState>,
+) -> Result<crate::operator::rotations::VaultCopyOutcome, String> {
+    ensure_no_open_ceremony(&state).await?;
+    let vault_path = state.vault_location.path_to_look_at()?;
+    let target = connected_target(&state).await?;
+    let handle = tokio::runtime::Handle::current();
+    on_work_stack(
+        "orion-vault-copy",
+        "l'envoi de la copie du coffre",
+        move || {
+            let tunnel = astra_operator::tunnel::Tunnel::new(&target.address)
+                .map_err(|error| format!("{error:#}"))?;
+            crate::operator::rotations::send_copy_with(&tunnel, &vault_path, &target, || {
+                handle.block_on(orion_core::operator_rotations::authority_status(
+                    &target.address,
+                ))
+            })
+        },
+    )
+    .await
+}
+
+/// Opens a campaign for the actions this screen runs outside a rotation ceremony:
+/// renewing the workstations and the issuer's delegation.
+///
+/// `OperatorOpened` is public: identifiers, a fingerprint, counts, an expiry and the
+/// delegation's public request. No token and no secret. The gateway is the
+/// connected profile's, and must be the one the domain's relay names.
+#[tauri::command]
+pub(crate) async fn operator_open_campaign(
+    state: State<'_, AppState>,
+    action: aether::certificates::transport::OperatorOpenAction,
+    reason: String,
+    requested_by: String,
+) -> Result<aether::certificates::transport::OperatorOpened, String> {
+    let vault_path = state.vault_location.path_to_look_at()?;
+    let target = connected_target(&state).await?;
+    on_work_stack(
+        "orion-open-campaign",
+        "l'ouverture de la campagne",
+        move || {
+            let tunnel = astra_operator::tunnel::Tunnel::new(&target.address)
+                .map_err(|error| format!("{error:#}"))?;
+            crate::operator::rotations::open_campaign_with(
+                &tunnel,
+                &vault_path,
+                &target,
+                action,
+                &reason,
+                &requested_by,
+            )
+        },
+    )
+    .await
+}
+
 /// Where the operator vault is, and whether it is the default place. A
 /// location that cannot be resolved is a view that says why, not an error:
 /// the window must still offer to choose again or go back to the default.
@@ -346,6 +458,7 @@ pub(crate) async fn operator_vault_location(
 pub(crate) async fn choose_vault_location(
     state: State<'_, AppState>,
     window: tauri::Window,
+    app: tauri::AppHandle,
 ) -> Result<Option<crate::operator::location::VaultLocationView>, String> {
     #[cfg(target_os = "windows")]
     {
@@ -374,14 +487,16 @@ pub(crate) async fn choose_vault_location(
             // began.
             Some(path) => {
                 ensure_no_open_ceremony(&state).await?;
-                state.vault_location.choose(path).map(Some)
+                let view = state.vault_location.choose(path)?;
+                look_for_a_rotation_again(app);
+                Ok(Some(view))
             }
             None => Ok(None),
         }
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = (state, window);
+        let _ = (state, window, app);
         Err("le choix d'emplacement n'existe que sous Windows".to_string())
     }
 }
@@ -390,9 +505,20 @@ pub(crate) async fn choose_vault_location(
 #[tauri::command]
 pub(crate) async fn reset_vault_location(
     state: State<'_, AppState>,
+    app: tauri::AppHandle,
 ) -> Result<crate::operator::location::VaultLocationView, String> {
     ensure_no_open_ceremony(&state).await?;
-    state.vault_location.reset()
+    let view = state.vault_location.reset()?;
+    look_for_a_rotation_again(app);
+    Ok(view)
+}
+
+/// A vault the tunnel-up did not see may be in place now: the look is made again,
+/// once, as after a dismissed screen.
+fn look_for_a_rotation_again(app: tauri::AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        crate::operator::resume_on_tunnel_up(&app).await;
+    });
 }
 
 const CEREMONY_OPEN: &str =
@@ -496,6 +622,15 @@ const NO_CONNECTED_GATEWAY: &str = "Connectez d'abord le profil de la gateway, a
 /// connected to.
 async fn connected_gateway(state: &AppState) -> Result<String, String> {
     connected_profile(state).await.map(|(url, _)| url)
+}
+
+/// [`connected_gateway`] and the peer key, as the gateway a rotation may be carried to.
+pub(crate) async fn connected_target(
+    state: &AppState,
+) -> Result<crate::operator::GatewayTarget, String> {
+    connected_profile(state)
+        .await
+        .map(|(address, peer_key)| crate::operator::GatewayTarget { address, peer_key })
 }
 
 /// [`connected_gateway`], with the peer key of the connected profile read
