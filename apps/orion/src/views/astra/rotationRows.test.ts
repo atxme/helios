@@ -62,6 +62,20 @@ describe('one CA rotation at a time', () => {
     expect(row(o, 'renew_fleet')?.disabledReason).toBe('Recouvrement CA-PQ en cours')
   })
 
+  // Spec §5.4: nothing opens while the gateway holds a transition of the same kind, even
+  // one Astra has already promoted (the gateway's own lag) or never heard of.
+  it('a_CA_PQ_transition_the_gateway_holds_disables_the_replacements', () => {
+    for (const gateway of [
+      domainRead({ ca_transition_pending: true }),
+      domainRead({ next_ca_fingerprint: '12'.repeat(32) }),
+    ]) {
+      const o = overview({ caPqOverlap: false, domain: { state: 'ok', value: gateway } })
+      expect(row(o, 'replace_ca_pq')?.disabledReason).toBe('Recouvrement CA-PQ en cours')
+      expect(row(o, 'replace_ca_tls')?.disabledReason).toBe('Recouvrement CA-PQ en cours')
+    }
+    expect(row(overview(), 'replace_ca_pq')?.disabledReason).toBeNull()
+  })
+
   it('a_CA_TLS_overlap_disables_both_replacements_but_not_the_fleet', () => {
     const o = overview({
       domain: { state: 'ok', value: domainRead({ client_tls_ca_transition_pending: true }) },

@@ -267,9 +267,23 @@ function fleetRow(o: RotationsOverview, now: number): RotationRow {
   }
 }
 
+/**
+ * A CA-PQ transition is open: Astra says so, or the gateway still holds one. The gateway
+ * promotes on its own clock after Astra, and a transition it holds and Astra does not would
+ * make it refuse the next one's installation, past which nothing repairs (spec §5.4).
+ */
+function caPqWindowOpen(o: RotationsOverview): boolean {
+  const domain = valueOf(o.domain)
+  return (
+    o.caPqOverlap === true ||
+    domain?.ca_transition_pending === true ||
+    Boolean(domain?.next_ca_fingerprint)
+  )
+}
+
 /** One CA rotation at a time: the reason the other is not offered, if there is one. */
 function replaceBlock(o: RotationsOverview): string | null {
-  if (o.caPqOverlap === true) return OVERLAP_PQ
+  if (caPqWindowOpen(o)) return OVERLAP_PQ
   if (caTlsWindowOpen(o)) return OVERLAP_TLS
   if (o.resumable) return ROTATION_PENDING
   if (o.caPqOverlap === null) return AUTHORITY_UNREAD
