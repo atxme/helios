@@ -289,6 +289,51 @@ describe('prerequisites', () => {
     ])
   })
 
+  // What the step itself needs, and no more: the automatic resumption at tunnel-up does
+  // not wait for Astra past `Accepted`, and neither does the button.
+  it('a_resumption_on_the_gateway_alone_does_not_need_astra', () => {
+    const applied = {
+      kind: 'ca_tls' as const,
+      stage: 'applied' as const,
+      activationAt: NOW + DAY,
+      notAfter: NOW + 30 * DAY,
+      nextFingerprint: 'aa',
+      offline: false,
+    }
+    for (const stage of ['applied', 'installed'] as const) {
+      const o = overview({
+        resumable: true,
+        journal: { ...applied, stage },
+        pending: { state: 'astra_unavailable' },
+        authority: { state: 'astra_unavailable' },
+      })
+      const lines = prerequisites(o, 'resume')
+      expect(lines.map((p) => p.label)).toEqual([
+        'Tunnel connecté',
+        'Administrateur du tunnel',
+        'Coffre présent',
+      ])
+      expect(allGreen(lines)).toBe(true)
+    }
+    // Before Astra's acceptance is known, Astra is what the step asks.
+    const signed = overview({ resumable: true, journal: { ...applied, stage: 'signed' } })
+    expect(prerequisites(signed, 'resume').map((p) => p.label)).toContain('Service Astra')
+    expect(prerequisites(overview({ resumable: true }), 'resume').map((p) => p.label)).toContain(
+      'Service Astra',
+    )
+  })
+
+  it('terminer_needs_the_tunnel_and_the_vault_and_nothing_of_astra', () => {
+    const o = overview({
+      caTlsCloseAt: NOW - 1,
+      pending: { state: 'astra_unavailable' },
+      authority: { state: 'astra_unavailable' },
+    })
+    const lines = prerequisites(o, 'finish_ca_tls')
+    expect(lines.map((p) => p.label)).toEqual(['Tunnel connecté', 'Coffre présent'])
+    expect(allGreen(lines)).toBe(true)
+  })
+
   it('the_other_actions_need_neither_two_keys_nor_the_copy', () => {
     const labels = prerequisites(overview(), 'renew_fleet').map((p) => p.label)
     expect(labels).not.toContain('Deux clés enregistrées')

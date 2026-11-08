@@ -541,21 +541,31 @@ function domainPrerequisite(o: RotationsOverview): Prerequisite {
   }
 }
 
+/**
+ * A resumption past `Accepted` speaks to the gateway alone: it installs, or sends the copy,
+ * whose failure undoes nothing. The automatic resumption at tunnel-up does not wait for
+ * Astra there, and neither does the button.
+ */
+function resumesOnTheGatewayAlone(o: RotationsOverview): boolean {
+  return o.journal?.stage === 'applied' || o.journal?.stage === 'installed'
+}
+
 /** The checks before an action, one line each. A red line stops the next step. */
 export function prerequisites(o: RotationsOverview, action: RotationAction): Prerequisite[] {
   const [admin, astra] = adminPrerequisites(o)
-  const lines: Prerequisite[] = [
-    {
-      label: 'Tunnel connecté',
-      ok: o.tunnel,
-      fix: o.tunnel ? null : 'Connecter',
-      fixAction: null,
-      detail: null,
-    },
-    admin,
-    astra,
-    vaultPrerequisite(o),
-  ]
+  const tunnel: Prerequisite = {
+    label: 'Tunnel connecté',
+    ok: o.tunnel,
+    fix: o.tunnel ? null : 'Connecter',
+    fixAction: null,
+    detail: null,
+  }
+  // « Terminer » asks the key and moves the vault; its copy afterwards may fail.
+  if (action === 'finish_ca_tls') return [tunnel, vaultPrerequisite(o)]
+  if (action === 'resume' && resumesOnTheGatewayAlone(o)) {
+    return [tunnel, admin, vaultPrerequisite(o)]
+  }
+  const lines: Prerequisite[] = [tunnel, admin, astra, vaultPrerequisite(o)]
   if (action === 'replace_ca_pq' || action === 'replace_ca_tls') {
     lines.push(keysPrerequisite(o), vaultCopyPrerequisite(o))
   }
