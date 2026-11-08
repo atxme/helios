@@ -92,9 +92,8 @@ Postes                                                   ↻
   - la **gateway** tient l'admission (`/api/network`) et l'état de certificat
     de chaque poste admis ou coupé ; c'est la source de la liste, des noms et
     des échéances ;
-  - **Astra** ne connaît un poste qu'après son premier contact (renouvellement,
-    mise à jour de confiance, récupération : `renewal/request.rs`) ; l'enrôlement
-    est hors ligne. Elle seule sait qu'un poste est révoqué.
+  - **Astra** recopie les postes admis (§5.3) ; elle seule sait qu'un poste
+    est révoqué.
 
   Il faut une lecture des postes d'Astra par le tunnel : route en lecture
   seule, pair administrateur, relayée par heliosd comme `operator/status`
@@ -159,17 +158,27 @@ reste « Coupé, révocation à signer » avec « Reprendre », qui recommence �
 l'étape 3. Ce qui reste à faire se voit donc toujours, et rien n'est
 silencieusement perdu.
 
-**Un poste qu'Astra n'a jamais vu.** C'est le cas de tout poste dans sa
-première année : l'enrôlement est hors ligne, et Astra ne l'inscrit qu'à son
-premier contact. Aujourd'hui, l'ouverture `client_revocation` le refuse
-(`door/resolve.rs`, `PeerUnknown`), et après la coupure il ne la contactera
-plus jamais. **Changement côté Astra** : à l'ouverture d'une révocation
-cliente, un poste inconnu du registre est lu auprès de la gateway sur le canal
-privé (`peer_state` : l'état de certificat reste servi après la coupure),
-inscrit comme le ferait son premier contact, puis la campagne s'ouvre sur cet
-état. La gateway est la source de vérité de ce qu'elle a admis ; Astra ne
-devine rien. Un poste que la gateway ne connaît pas non plus est refusé par son
-nom.
+**Astra connaît tous les postes admis** (décision de l'utilisateur,
+8 novembre 2026 : « astra devrait connaître les pc admis, sinon cela peut
+causer ce genre de soucis »). Aujourd'hui, l'enrôlement est hors ligne et
+Astra n'inscrit un poste qu'à son premier contact : tout poste dans sa première
+année lui est inconnu, et l'ouverture `client_revocation` le refuse
+(`door/resolve.rs`, `PeerUnknown`). **Changement côté Astra et gateway** :
+
+- la gateway sert, sur le canal privé, la liste des états de certificat de ses
+  postes admis (route nouvelle, voisine de `state/{clé}` ; un poste coupé reste
+  servi, son état de certificat n'étant pas effacé par la coupure) ;
+- le balayage périodique d'Astra la lit et inscrit chaque poste qu'elle ne
+  connaît pas, par le même chemin que le premier contact
+  (`reconcile_peer` et ses règles d'adoption) ; un poste déjà connu n'est
+  réconcilié que par ses chemins actuels ;
+- l'ouverture d'une révocation cliente lit aussi ce poste auprès de la gateway
+  s'il est encore inconnu, pour ne pas dépendre du dernier balayage.
+
+ADR-008 le permet : « la gateway reste l'autorité sur l'admission ». Astra
+recopie ce que la gateway a admis, elle ne décide rien. Un poste que la gateway
+ne connaît pas non plus est refusé par son nom. La période du balayage et la
+forme de la route sont laissées au constructeur.
 
 ### 5.4 Pendant un recouvrement `CA-PQ` (F14-b)
 
@@ -363,8 +372,9 @@ version et posé huit questions. Choix faits, à vérifier par l'utilisateur :
 
 1. Le document sortant vient d'Astra par le tunnel, vérifié sous la clé
    publique sortante gardée au coffre (§5.4).
-2. Un poste inconnu d'Astra est lu auprès de la gateway à l'ouverture de sa
-   révocation : changement de la porte d'Astra (§5.3).
+2. Astra recopie tous les postes admis par la gateway, par son balayage et à
+   l'ouverture d'une révocation (§5.3). Décidé par l'utilisateur le
+   8 novembre 2026.
 3. « Ce poste » ne se révoque pas depuis lui-même, mais depuis un autre poste
    administrateur (§5.1).
 4. La coupure n'attend ni Astra, ni le coffre, ni la fin d'un recouvrement ;
