@@ -105,6 +105,7 @@ pub fn send_copy_with(
     let copy =
         copy_to_send(vault_path, &authority, resumable).map_err(|error| format!("{error:#}"))?;
     let carried_a_document = copy.credentials.is_some();
+    let local_epoch = local_credentials_epoch(vault_path);
     let mut sent = remote
         .send_vault_copy(&copy)
         .map_err(|error| format!("{error:#}"))?;
@@ -119,7 +120,16 @@ pub fn send_copy_with(
             .send_vault_copy(&alone)
             .map_err(|error| format!("{error:#}"))?;
     }
-    Ok(VaultCopyOutcome::of(sent))
+    Ok(VaultCopyOutcome::of(sent, local_epoch))
+}
+
+/// The epoch of the credential document beside the vault, read without verifying it:
+/// a number to compare with the one Astra serves, never a reason to trust the file.
+fn local_credentials_epoch(vault_path: &Path) -> Option<u64> {
+    credentials::load(&credentials::path_beside(vault_path))
+        .ok()
+        .flatten()
+        .map(|document| document.credential_registry_epoch)
 }
 
 /// A rotation signed and not yet at its end, as the page may be told of it.
@@ -184,6 +194,9 @@ pub struct Local {
     /// When the CA TLS in the relay beside the vault ends. A public certificate, read
     /// without opening the vault; `None` when the relay holds none.
     pub ca_tls_not_after: Option<u64>,
+    /// The epoch of the credential document beside the vault. A key added, removed or
+    /// marked puts it ahead of the one Astra serves until a copy carries it there.
+    pub credential_registry_epoch: Option<u64>,
 }
 
 /// The journal and whether anything calls for a resumption, read from the files beside
@@ -244,6 +257,7 @@ pub fn read_local(vault_path: &Result<std::path::PathBuf, String>, now: u64) -> 
         ca_tls_close_due: close_at.is_some_and(|at| now >= at),
         ca_tls_close_at: close_at,
         ca_tls_not_after: ca_tls_not_after(path),
+        credential_registry_epoch: local_credentials_epoch(path),
     }
 }
 
@@ -288,6 +302,9 @@ pub struct RotationsOverview {
     pub local_ca_tls_epoch: Option<u64>,
     /// When the CA TLS recorded beside the vault ends.
     pub local_ca_tls_not_after: Option<u64>,
+    /// The epoch of the credential document beside the vault, to compare with the one
+    /// Astra serves: a key change leaves it ahead until a copy carries the document.
+    pub local_credential_registry_epoch: Option<u64>,
     /// A rotation signed and not finished, with its install deadline.
     pub journal: Option<JournalView>,
     /// Something to resume, journal or not (legacy file, unadopted record).
@@ -319,6 +336,7 @@ impl RotationsOverview {
             ca_tls_close_due,
             ca_tls_close_at,
             ca_tls_not_after,
+            credential_registry_epoch,
         } = local;
         let ca_pq_overlap = authority
             .ok()
@@ -343,6 +361,7 @@ impl RotationsOverview {
                 .and_then(|vault| vault.domain.as_ref())
                 .and_then(|domain| domain.ca_tls_epoch),
             local_ca_tls_not_after: ca_tls_not_after,
+            local_credential_registry_epoch: credential_registry_epoch,
             vault,
             vault_error,
             journal,
@@ -363,6 +382,10 @@ pub enum VaultCopyOutcome {
         fingerprint: String,
         /// `None`: Astra serves no credential document. Not epoch 0.
         credential_registry_epoch: Option<u64>,
+        /// The document beside the vault is still ahead of the one Astra serves: an
+        /// overlap, a rotation or a promotion held it back, and a later send carries it.
+        /// Said, so that a key change that did not reach Astra is never silent.
+        document_waits: bool,
     },
     /// A live operation or a rotation holds the copy back. Nothing was written, the
     /// same copy passes later, and this is an answer rather than a failure.
@@ -370,11 +393,17 @@ pub enum VaultCopyOutcome {
 }
 
 impl VaultCopyOutcome {
-    pub fn of(sent: VaultCopySent) -> Self {
+    /// `local_epoch` is the epoch of the document beside the vault, if there is one.
+    pub fn of(sent: VaultCopySent, local_epoch: Option<u64>) -> Self {
         match sent {
             VaultCopySent::Copied(copied) => Self::Copied {
                 fingerprint: copied.fingerprint.to_hex(),
                 credential_registry_epoch: copied.credential_registry_epoch,
+                document_waits: local_epoch.is_some_and(|local| {
+                    copied
+                        .credential_registry_epoch
+                        .is_none_or(|served| served < local)
+                }),
             },
             VaultCopySent::HeldBack => Self::HeldBack,
         }
@@ -390,7 +419,9 @@ impl VaultCopyOutcome {
 /// indistinct refusal to an older one, and a vault that would have passed alone must
 /// not be refused for it. It is also left out during a CA-PQ overlap, where Astra
 /// adopts the new document itself at the promotion, and while a rotation waits to be
-/// resumed, whose resumption sends it with the copy.
+/// resumed: the document beside the vault is then the one that rotation replaces, and
+/// its resumption sends the copy without any (spec §10.6). A later send carries the
+/// document once neither holds it.
 pub fn copy_to_send(
     vault_path: &Path,
     authority: &AuthorityStatusRead,

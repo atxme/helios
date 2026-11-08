@@ -454,7 +454,22 @@ function keysPrerequisite(o: RotationsOverview): Prerequisite {
   }
 }
 
-function copyPrerequisite(o: RotationsOverview): Prerequisite {
+/**
+ * Whether the credential document beside the vault is ahead of the one Astra serves, where
+ * « Envoyer » would carry it: a key added, removed or marked lost changes the document, and
+ * a marking leaves the vault bytes as they were. Not during a CA-PQ overlap, where Astra
+ * adopts its own document at the promotion, nor with a rotation to resume, which replaces
+ * the document beside the vault: the send leaves it out in both.
+ */
+function documentAhead(o: RotationsOverview, authority: OperatorAuthorityStatus): boolean {
+  const local = o.localCredentialRegistryEpoch
+  if (local === null || o.resumable || authority.next_ca_fingerprint !== null) return false
+  const served = authority.credential_registry_epoch
+  return served === null || local > served
+}
+
+/** « Copie du coffre »: the vault copy Astra holds, and the credential document with it. */
+export function vaultCopyPrerequisite(o: RotationsOverview): Prerequisite {
   const label = 'Copie du coffre'
   const authority: OperatorAuthorityStatus | null = valueOf(o.authority)
   if (!authority) {
@@ -462,7 +477,9 @@ function copyPrerequisite(o: RotationsOverview): Prerequisite {
   }
   const held = authority.vault_copy_fingerprint
   const local = o.localVaultFingerprint
-  if (held !== null && local !== null && sameFingerprint(held, local)) {
+  const sameVault = held !== null && local !== null && sameFingerprint(held, local)
+  const ahead = documentAhead(o, authority)
+  if (sameVault && !ahead) {
     return { label, ok: true, fix: null, fixAction: null, detail: null }
   }
   // Nothing to send when the vault itself cannot be read.
@@ -472,7 +489,7 @@ function copyPrerequisite(o: RotationsOverview): Prerequisite {
     ok: false,
     fix: sendable ? 'Envoyer' : null,
     fixAction: sendable ? 'send_vault_copy' : null,
-    detail: held === null ? 'Absente' : 'Ancienne',
+    detail: held === null ? 'Absente' : sameVault ? 'Document ancien' : 'Ancienne',
   }
 }
 
@@ -520,10 +537,10 @@ export function prerequisites(o: RotationsOverview, action: RotationAction): Pre
     vaultPrerequisite(o),
   ]
   if (action === 'replace_ca_pq' || action === 'replace_ca_tls') {
-    lines.push(keysPrerequisite(o), copyPrerequisite(o))
+    lines.push(keysPrerequisite(o), vaultCopyPrerequisite(o))
   }
   // The door asks for the copy of the vault for every scope but the workstations'.
-  if (action === 'renew_delegation') lines.push(copyPrerequisite(o))
+  if (action === 'renew_delegation') lines.push(vaultCopyPrerequisite(o))
   lines.push(domainPrerequisite(o))
   return lines
 }

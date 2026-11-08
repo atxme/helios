@@ -78,6 +78,7 @@ export const overview = (extra: Partial<RotationsOverview> = {}): RotationsOverv
   localCaEpoch: 3,
   localCaTlsEpoch: 2,
   localCaTlsNotAfter: NOW + 1500 * DAY,
+  localCredentialRegistryEpoch: 5,
   journal: null,
   resumable: false,
   caPqOverlap: false,

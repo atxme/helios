@@ -1088,6 +1088,11 @@ export interface RotationsOverview {
   localCaTlsEpoch: number | null
   /** Fin de la CA TLS inscrite au relais du coffre ; `null` si le relais n'en porte pas. */
   localCaTlsNotAfter: number | null
+  /**
+   * Époque du document de credentials à côté du coffre. En avance sur celle qu'Astra sert
+   * après un changement de clé, tant qu'une copie ne l'a pas portée.
+   */
+  localCredentialRegistryEpoch: number | null
   journal: RotationJournalView | null
   /** Une reprise est à faire : journal, fichier CA-PQ ancien ou enregistrement non adopté. */
   resumable: boolean
@@ -1114,6 +1119,8 @@ export type VaultCopyOutcome =
       fingerprint: string
       /** `null` : Astra ne sert aucun document. */
       credential_registry_epoch: number | null
+      /** Le document local reste en avance sur celui qu'Astra sert : un envoi suivant le porte. */
+      document_waits: boolean
     }
   | { state: 'held_back' }
 

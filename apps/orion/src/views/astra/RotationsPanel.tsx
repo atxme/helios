@@ -62,7 +62,7 @@ function operatorLabelOf(o: RotationsOverview): string {
   return slot?.label.trim() || 'operator'
 }
 
-function PrerequisiteLine({
+export function PrerequisiteLine({
   line,
   busy,
   onFix,
@@ -222,6 +222,7 @@ export function RotationsPanel({
       const outcome = await api.operatorSendVaultCopy()
       // Held back is an answer, not a failure: the same copy passes later.
       if (outcome.state === 'held_back') setNotice('En attente : copie retenue')
+      else if (outcome.document_waits) setNotice('En attente : document de credentials retenu')
       await readAfter()
     } catch (cause) {
       setError(String(cause))

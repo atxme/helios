@@ -12,10 +12,13 @@ const api = vi.hoisted(() => ({
   operatorVaultLocation: vi.fn(),
   chooseVaultLocation: vi.fn(),
   resetVaultLocation: vi.fn(),
+  operatorRotationsOverview: vi.fn(),
+  operatorSendVaultCopy: vi.fn(),
 }))
 vi.mock('../../api', () => api)
 
 import type { SlotView, VaultOverview } from '../../types'
+import { overview as rotationsOverview } from './rotationFixtures'
 import { VaultPanel } from './VaultPanel'
 
 const overview: VaultOverview = {
@@ -339,5 +342,43 @@ describe('VaultPanel', () => {
       label: 'Clé voyage',
       role: 'recuperation',
     })
+  })
+
+  // Spec §5.9: a key change reaches Astra with the copy. A marking leaves the vault bytes
+  // as they were, so the copy reads old only by the document's epoch.
+  it('a_document_ahead_of_astra_offers_the_send_here', async () => {
+    api.operatorRotationsOverview
+      .mockResolvedValueOnce(rotationsOverview({ localCredentialRegistryEpoch: 6 }))
+      .mockResolvedValue(rotationsOverview({ localCredentialRegistryEpoch: 6 }))
+    api.operatorSendVaultCopy.mockResolvedValue({
+      state: 'copied',
+      fingerprint: 'ef'.repeat(32),
+      credential_registry_epoch: 6,
+      document_waits: false,
+    })
+    render(<VaultPanel onCeremony={vi.fn()} />)
+    const line = (await screen.findByText('Copie du coffre')).closest('li') as HTMLElement
+    expect(within(line).getByText('Document ancien')).toBeTruthy()
+    fireEvent.click(within(line).getByRole('button', { name: 'Envoyer' }))
+    await waitFor(() => expect(api.operatorSendVaultCopy).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(api.operatorRotationsOverview).toHaveBeenCalledTimes(2))
+  })
+
+  it('a_send_held_back_is_said_and_not_dropped', async () => {
+    api.operatorRotationsOverview.mockResolvedValue(
+      rotationsOverview({ localCredentialRegistryEpoch: 6 }),
+    )
+    api.operatorSendVaultCopy.mockResolvedValue({ state: 'held_back' })
+    render(<VaultPanel onCeremony={vi.fn()} />)
+    const line = (await screen.findByText('Copie du coffre')).closest('li') as HTMLElement
+    fireEvent.click(within(line).getByRole('button', { name: 'Envoyer' }))
+    expect(await screen.findByText(/Copie retenue par une opération en cours/)).toBeTruthy()
+  })
+
+  it('a_copy_in_step_shows_no_send', async () => {
+    api.operatorRotationsOverview.mockResolvedValue(rotationsOverview())
+    render(<VaultPanel onCeremony={vi.fn()} />)
+    const line = (await screen.findByText('Copie du coffre')).closest('li') as HTMLElement
+    expect(within(line).queryByRole('button', { name: 'Envoyer' })).toBeNull()
   })
 })

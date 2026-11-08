@@ -21,6 +21,7 @@ const api = vi.hoisted(() => ({
   getState: vi.fn(),
   getConfig: vi.fn(),
   beginEnrollmentCeremony: vi.fn(),
+  operatorSendVaultCopy: vi.fn(),
 }))
 vi.mock('../api', () => api)
 
@@ -40,6 +41,7 @@ const rotations = (extra: object = {}) => ({
   localCaEpoch: null,
   localCaTlsEpoch: null,
   localCaTlsNotAfter: null,
+  localCredentialRegistryEpoch: null,
   journal: null,
   resumable: false,
   caPqOverlap: false,
@@ -694,5 +696,99 @@ describe('AstraView', () => {
       await waitFor(() => expect(api.operatorRotationsOverview).toHaveBeenCalled())
       expect(screen.queryByText(/à installer avant le/)).toBeNull()
     })
+  })
+})
+
+// Spec §5.9: a key added, removed or marked reaches Astra with the copy, from Orion.
+describe('after a key change', () => {
+  const marked = {
+    session_id: '7'.repeat(32),
+    revision: 6,
+    operation: 'mark_key',
+    operation_id: null,
+    remote: 'local',
+    gesture: 'done',
+    allowed: [],
+  }
+
+  it('a_key_marked_lost_is_sent_to_astra_with_the_copy', async () => {
+    api.operatorCeremonyStatus.mockResolvedValue(marked)
+    api.operatorSendVaultCopy.mockResolvedValue({
+      state: 'copied',
+      fingerprint: 'ef'.repeat(32),
+      credential_registry_epoch: 6,
+      document_waits: false,
+    })
+    render(<AstraView />)
+    expect(
+      await screen.findByText('Copie du coffre et document de credentials envoyés à Astra'),
+    ).toBeTruthy()
+    expect(api.operatorSendVaultCopy).toHaveBeenCalledTimes(1)
+  })
+
+  it('a_document_held_by_a_rotation_is_said', async () => {
+    api.operatorCeremonyStatus.mockResolvedValue({
+      ...marked,
+      session_id: '8'.repeat(32),
+      operation: 'remove_key',
+    })
+    api.operatorSendVaultCopy.mockResolvedValue({
+      state: 'copied',
+      fingerprint: 'ef'.repeat(32),
+      credential_registry_epoch: 5,
+      document_waits: true,
+    })
+    render(<AstraView />)
+    expect(await screen.findByText(/document de credentials en attente/)).toBeTruthy()
+  })
+
+  it('a_copy_held_back_is_said', async () => {
+    api.operatorCeremonyStatus.mockResolvedValue({
+      ...marked,
+      session_id: '9'.repeat(32),
+      operation: 'add_key',
+    })
+    api.operatorSendVaultCopy.mockResolvedValue({ state: 'held_back' })
+    render(<AstraView />)
+    expect(await screen.findByText(/Copie retenue par une opération en cours/)).toBeTruthy()
+  })
+
+  it('a_send_that_failed_is_said_and_offered_again', async () => {
+    api.operatorCeremonyStatus.mockResolvedValue({ ...marked, session_id: 'a'.repeat(32) })
+    api.operatorSendVaultCopy
+      .mockRejectedValueOnce('la gateway ne répond pas')
+      .mockResolvedValue({
+        state: 'copied',
+        fingerprint: 'ef'.repeat(32),
+        credential_registry_epoch: 6,
+        document_waits: false,
+      })
+    render(<AstraView />)
+    expect(await screen.findByText(/Copie non envoyée à Astra : la gateway ne répond pas/)).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Réessayer l’envoi' }))
+    expect(
+      await screen.findByText('Copie du coffre et document de credentials envoyés à Astra'),
+    ).toBeTruthy()
+  })
+
+  it('a_failed_or_other_gesture_sends_nothing', async () => {
+    api.operatorCeremonyStatus.mockResolvedValue({
+      ...marked,
+      session_id: 'b'.repeat(32),
+      gesture: 'failed',
+      refusal: { refusal: 'key_declined' },
+    })
+    render(<AstraView />)
+    await screen.findByText(/Aucune clé n’a répondu/)
+    cleanup()
+    api.operatorCeremonyStatus.mockResolvedValue({
+      ...marked,
+      session_id: 'c'.repeat(32),
+      operation: 'finalize_domain',
+    })
+    render(<AstraView />)
+    await waitFor(() => expect(api.operatorCeremonyStatus).toHaveBeenCalled())
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    expect(api.operatorSendVaultCopy).not.toHaveBeenCalled()
   })
 })

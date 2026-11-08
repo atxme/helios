@@ -17,6 +17,7 @@ import { journalLine } from './astra/rotationRows'
 import { ArtifactDownloads } from './astra/ArtifactDownloads'
 import { EnrollmentOperatorPanel } from './astra/EnrollmentOperatorPanel'
 import { VaultPanel } from './astra/VaultPanel'
+import { KeyChangeCopy } from './astra/VaultCopy'
 import { GUTTER, MINT, PINE, RULE } from '../theme'
 import type {
   OperatorPendingOperation,
@@ -316,6 +317,7 @@ export function AstraView({
           </Typography>
         )}
         {ceremony.operation === 'create_domain' && ceremony.gesture === 'done' && <DomainCreated />}
+        <KeyChangeCopy status={ceremony} />
         {finishingRecovery && (
           <Alert severity="info" variant="outlined" sx={{ mt: 1.25, fontSize: 11.5 }}>
             Grant reçu : installation et commit de la nouvelle identité…

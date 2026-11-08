@@ -308,6 +308,38 @@ describe('prerequisites', () => {
     expect(find(overview(), 'Copie du coffre')?.ok).toBe(true)
   })
 
+  it('the_copy_reads_old_when_only_the_credential_epoch_is_ahead', () => {
+    // Same vault bytes: a key marked lost changes the document and not the vault.
+    const marked = overview({ localCredentialRegistryEpoch: 6 })
+    expect(find(marked, 'Copie du coffre')).toMatchObject({
+      ok: false,
+      detail: 'Document ancien',
+      fix: 'Envoyer',
+      fixAction: 'send_vault_copy',
+    })
+    const noneServed = overview({
+      localCredentialRegistryEpoch: 1,
+      authority: { state: 'ok', value: authorityRead({ credential_registry_epoch: null }) },
+    })
+    expect(find(noneServed, 'Copie du coffre')?.detail).toBe('Document ancien')
+    // Astra ahead or level: nothing to send.
+    expect(find(overview({ localCredentialRegistryEpoch: 4 }), 'Copie du coffre')?.ok).toBe(true)
+    expect(find(overview({ localCredentialRegistryEpoch: null }), 'Copie du coffre')?.ok).toBe(true)
+  })
+
+  it('the_document_is_not_offered_where_the_send_leaves_it_out', () => {
+    // During a CA-PQ overlap Astra adopts its own document at the promotion, and a
+    // rotation to resume replaces the one beside the vault: « Envoyer » would not carry it.
+    const overlap = overview({
+      localCredentialRegistryEpoch: 6,
+      caPqOverlap: true,
+      authority: { state: 'ok', value: authorityRead({ next_ca_fingerprint: '12'.repeat(32) }) },
+    })
+    expect(find(overlap, 'Copie du coffre')?.ok).toBe(true)
+    const resumable = overview({ localCredentialRegistryEpoch: 6, resumable: true })
+    expect(find(resumable, 'Copie du coffre')?.ok).toBe(true)
+  })
+
   it('two_keys_need_a_complete_document', () => {
     const one = overview({ vault: vaultOverview({ slots: vaultOverview().slots.slice(0, 1) }) })
     expect(find(one, 'Deux clés enregistrées')?.ok).toBe(false)

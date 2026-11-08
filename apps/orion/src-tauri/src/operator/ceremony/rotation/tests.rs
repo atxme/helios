@@ -275,6 +275,8 @@ struct Remote {
     copies: Mutex<VecDeque<VaultCopySent>>,
     /// Whether each copy sent carried the credential document.
     sent_with_credentials: Mutex<Vec<bool>>,
+    /// The last credential document a copy carried.
+    sent_document: Mutex<Option<aether::certificates::approval::CredentialRegistry>>,
 }
 
 impl Remote {
@@ -354,6 +356,9 @@ impl RotationRemote for Remote {
             .lock()
             .expect("lock")
             .push(copy.credentials.is_some());
+        if let Some(document) = &copy.credentials {
+            *self.sent_document.lock().expect("lock") = Some((**document).clone());
+        }
         Ok(self
             .copies
             .lock()
@@ -3335,17 +3340,162 @@ mod overview {
 
     #[test]
     fn a_held_back_copy_is_an_answer_and_an_absent_document_is_not_epoch_zero() {
-        let held = serde_json::to_value(VaultCopyOutcome::of(VaultCopySent::HeldBack)).unwrap();
+        let held =
+            serde_json::to_value(VaultCopyOutcome::of(VaultCopySent::HeldBack, Some(3))).unwrap();
         assert_eq!(held, serde_json::json!({ "state": "held_back" }));
-        let copied = serde_json::to_value(VaultCopyOutcome::of(VaultCopySent::Copied(
-            aether::certificates::transport::OperatorVaultCopied {
+        let copied = serde_json::to_value(VaultCopyOutcome::of(
+            VaultCopySent::Copied(aether::certificates::transport::OperatorVaultCopied {
                 fingerprint: Fingerprint::of(b"copie"),
                 credential_registry_epoch: None,
-            },
-        )))
+            }),
+            None,
+        ))
         .unwrap();
         assert_eq!(copied["state"], "copied");
         assert!(copied["credential_registry_epoch"].is_null());
+        assert_eq!(
+            copied["document_waits"], false,
+            "no document here, none waits"
+        );
+    }
+
+    /// Whether the document beside the vault is still ahead of what Astra says it serves.
+    #[test]
+    fn a_copy_says_when_the_document_beside_the_vault_did_not_reach_astra() {
+        let copied = |served: Option<u64>, local: Option<u64>| match VaultCopyOutcome::of(
+            VaultCopySent::Copied(aether::certificates::transport::OperatorVaultCopied {
+                fingerprint: Fingerprint::of(b"copie"),
+                credential_registry_epoch: served,
+            }),
+            local,
+        ) {
+            VaultCopyOutcome::Copied { document_waits, .. } => document_waits,
+            VaultCopyOutcome::HeldBack => unreachable!(),
+        };
+        assert!(copied(None, Some(2)));
+        assert!(copied(Some(1), Some(2)));
+        assert!(!copied(Some(2), Some(2)));
+        assert!(!copied(Some(3), Some(2)));
+        assert!(!copied(Some(1), None));
+    }
+
+    /// Marks the third key lost with the first, as « Marquer perdue » does.
+    fn mark_third_key_lost(bench: &Bench) -> Vec<u8> {
+        let vault = store::load(&bench.path).expect("vault");
+        let opening =
+            gestures::open_with_authorized_key(bench.keys[0].as_ref(), &vault, "").expect("opened");
+        let lost = bench.keys[2].credential_id();
+        let slot = vault.slot_for_credential(&lost).expect("slot").slot_id;
+        astra_operator::vault_gestures::mark_key_with(&bench.path, &opening, &slot, true, NOW)
+            .expect("marked");
+        lost
+    }
+
+    /// Spec §5.9: a key marked lost reaches Astra with the copy. Astra serving the
+    /// document from before the marking, the send carries the new one.
+    #[test]
+    fn a_key_marked_lost_goes_to_astra_with_the_copy() {
+        let bench = bench();
+        let before = local_credentials_epoch(&bench);
+        let lost = mark_third_key_lost(&bench);
+        let after = local_credentials_epoch(&bench);
+        assert!(after > before, "the marking re-signs the document");
+        let overview = assembled(
+            &bench,
+            OperatorAuthorityStatus {
+                credential_registry_epoch: Some(before),
+                ..bench.nothing_in_flight()
+            },
+        );
+        assert_eq!(overview.local_credential_registry_epoch, Some(after));
+
+        bench
+            .remote
+            .copies
+            .lock()
+            .expect("lock")
+            .push_back(VaultCopySent::Copied(OperatorVaultCopied {
+                fingerprint: Fingerprint::of(b"copie"),
+                credential_registry_epoch: Some(after),
+            }));
+        let sent = send_copy_with(&bench.remote, &bench.path, &target_of(&bench), || {
+            Reach::Ok(served(&bench, Some(before)))
+        })
+        .expect("sent");
+
+        let carried = bench
+            .remote
+            .sent_document
+            .lock()
+            .expect("lock")
+            .clone()
+            .expect("the copy carried the document");
+        assert_eq!(carried.credential_registry_epoch, after);
+        assert_eq!(
+            carried.binding(&lost).expect("row").state,
+            aether::certificates::approval::CredentialState::Lost
+        );
+        assert!(matches!(
+            sent,
+            VaultCopyOutcome::Copied {
+                document_waits: false,
+                ..
+            }
+        ));
+        // What the page is told: a fingerprint, an epoch and a flag. No byte of the vault.
+        let shown = serde_json::to_value(&sent).expect("json");
+        let mut fields: Vec<_> = shown.as_object().expect("object").keys().cloned().collect();
+        fields.sort();
+        assert_eq!(
+            fields,
+            [
+                "credential_registry_epoch",
+                "document_waits",
+                "fingerprint",
+                "state"
+            ]
+        );
+    }
+
+    /// During a CA-PQ overlap the document cannot go: the copy goes alone, and the
+    /// answer says the document waits, rather than nothing.
+    #[test]
+    fn a_key_marked_lost_during_an_overlap_is_said_to_wait() {
+        let bench = bench();
+        let before = local_credentials_epoch(&bench);
+        mark_third_key_lost(&bench);
+        let overlap = || {
+            Reach::Ok(
+                OperatorAuthorityStatus {
+                    next_ca_fingerprint: Some(Fingerprint::of(b"suivante")),
+                    credential_registry_epoch: Some(before),
+                    ..bench.nothing_in_flight()
+                }
+                .into(),
+            )
+        };
+        bench
+            .remote
+            .copies
+            .lock()
+            .expect("lock")
+            .push_back(VaultCopySent::Copied(OperatorVaultCopied {
+                fingerprint: Fingerprint::of(b"copie"),
+                credential_registry_epoch: Some(before),
+            }));
+        let sent =
+            send_copy_with(&bench.remote, &bench.path, &target_of(&bench), overlap).expect("sent");
+        assert_eq!(
+            *bench.remote.sent_with_credentials.lock().expect("lock"),
+            vec![false]
+        );
+        assert!(matches!(
+            sent,
+            VaultCopyOutcome::Copied {
+                document_waits: true,
+                ..
+            }
+        ));
     }
 
     fn local_credentials_epoch(bench: &Bench) -> u64 {

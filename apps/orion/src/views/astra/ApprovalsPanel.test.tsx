@@ -91,6 +91,7 @@ beforeEach(() => {
     localCaEpoch: null,
     localCaTlsEpoch: null,
     localCaTlsNotAfter: null,
+    localCredentialRegistryEpoch: null,
     journal: null,
     resumable: false,
     caPqOverlap: false,
