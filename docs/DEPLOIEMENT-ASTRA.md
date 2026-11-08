@@ -736,7 +736,9 @@ sécurité, et fait un aller-retour.
 **Depuis le lot 5b, Orion renouvelle la délégation** : ligne « Renouveler la
 délégation » de l'onglet *Rotations*, qui ouvre la campagne par le tunnel, reçoit
 la demande dans la réponse (sans fichier), fait approuver par une clé, dépose la
-délégation, et **Astra l'adopte sans redémarrer**. Les trois commandes
+délégation, et **Astra l'adopte sans redémarrer** (un échec d'adoption n'est écrit qu'au
+journal d'Astra, l'émetteur précédent restant servi ; la ligne de délégation
+d'Orion montre alors une époque servie différente de l'inscrite). Les trois commandes
 ci-dessous sont le recours.
 
 Trois commandes, dans cet ordre :
@@ -764,7 +766,7 @@ astra-signer authorize-issuer --request delegation-request.json \
     --days 30 --leaf-days 90
 
 # 3. Astra en marche a enregistré la délégation et l'adopte seul, sans
-#    redémarrage. Si l'adoption échoue, son journal le dit et l'émetteur
+#    redémarrage. Si l'adoption échoue, seul son journal le dit et l'émetteur
 #    précédent reste servi. Un `astra issuer install` fait service arrêté
 #    s'adopte au démarrage suivant.
 ```

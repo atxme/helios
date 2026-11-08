@@ -447,7 +447,7 @@ délégation tant que `next_ca_fingerprint` est renseigné. Une copie du coffre
 portant un document de credentials est refusée pendant une rotation en cours.
 
 **Refus de la copie du coffre.** Les refus indistincts du §8.5.4 valent, avec
-**deux exceptions** : une copie différente de celle d'Astra tant qu'une
+**une exception, deux décisions** : une copie différente de celle d'Astra tant qu'une
 opération en attente de l'opérateur nomme un coffre, et un document de
 credentials joint pendant une rotation en cours, reçoivent `409`. Rien n'est
 écrit et le même envoi passera une fois l'obstacle levé ; la route ne répond

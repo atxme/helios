@@ -311,7 +311,7 @@ export function AstraView({
         {ceremony.operation === 'authorize_issuer' && ceremony.gesture === 'done' && (
           <Typography color="text.secondary" sx={{ mt: 1, fontSize: 11.5 }}>
             {inCampaign
-              ? 'Délégation enregistrée par Astra. Redémarrer Astra pour qu’il émette sous elle.'
+              ? 'Délégation enregistrée par Astra.'
               : 'À installer sur l’hôte d’Astra : astra issuer install --authorization <fichier>.'}
           </Typography>
         )}

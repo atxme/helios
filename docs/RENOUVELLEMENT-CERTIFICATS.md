@@ -275,11 +275,14 @@ clientes **en ligne**, sans ouvrir le coffre. Il porte sa propre échéance.
 passe à « À faire » quand la délégation expire bientôt (30 jours) ou ne suit plus
 les époques de la CA, une fois le coffre au niveau de la gateway : à partir de
 `not_after` après une rotation CA-PQ, après « Terminer » pour la CA TLS. Pendant
-un recouvrement le bouton est désactivé. Orion ouvre la campagne par le tunnel ;
+un recouvrement CA-PQ le bouton est désactivé (pendant celui d'une CA TLS, il ne
+l'est que si le coffre a une époque d'avance sur la gateway). Orion ouvre la campagne par le tunnel ;
 Astra génère les clés dans son volume et renvoie la demande dans la réponse, sans
 fichier ; une clé approuve puis ouvre le coffre ; la délégation est déposée et
 **Astra l'adopte sans redémarrer** (Orion ne redémarre jamais Astra). Si
-l'adoption échoue, l'émetteur en place reste servi et Orion l'affiche. Une
+l'adoption échoue, Astra le journalise et l'émetteur en place reste servi ; la
+réponse de dépôt reste un succès, et Orion ne le montre qu'indirectement, par la
+ligne de délégation (« époque servie X, inscrite Y »). Une
 délégation ouverte dont la réponse s'est perdue ne se reprend pas : « Opération
 ouverte jusqu'au … », puis une nouvelle ouverture une fois la fenêtre close. Les
 commandes ci-dessous sont le recours, et **le redémarrage qu'elles prescrivent ne
@@ -314,8 +317,10 @@ la clé publique dont la PKCS#10 prouve la possession —, affiche le tout, pren
 l'assertion, signe et **redépose** la délégation (« Délégation enregistrée par
 Astra. »). Astra l'enregistre après avoir prouvé que les deux moitiés privées
 scellées dans son volume correspondent, puis **l'adopte en place** : aucun
-redémarrage n'est plus nécessaire depuis le lot 5b. Si l'adoption échoue, le
-message le dit et l'émetteur précédent reste servi.
+redémarrage n'est plus nécessaire depuis le lot 5b. Si l'adoption échoue, seul le
+journal d'Astra le dit (« delegation recorded but not adopted ») et l'émetteur
+précédent reste servi ; dans Orion, la ligne de délégation montre alors une
+époque servie différente de l'époque inscrite.
 
 Le fichier de demande voyage toujours par un canal quelconque : il est public,
 et c'est la campagne qui l'authentifie. Une demande substituée est refusée
@@ -1001,6 +1006,11 @@ dans [ROADMAP.md](ROADMAP.md) (F14-a à F14-f).
   de plus de 128 Kio est refusée (ce que le téléchargement porte). Une
   copie différente envoyée pendant une opération en attente de l'opérateur
   répond `409` : réessayer après son expiration (300 s au plus).
+- **Un écrasement raté peut effacer un journal à tort.** Si une écriture
+  échoue après son renommage et que la campagne meurt avant un rejeu, Orion
+  efface son journal alors que le fichier d'Astra tient l'ancre : réparation
+  manuelle. Il faut un échec de synchronisation du dossier et 300 s sans rejeu,
+  sur un volume déjà défaillant.
 - **`write_domain_relay` n'est pas couvert par la garde d'écrasement.** Les
   gestes sur les clés et les renommages sont refusés tant qu'un coffre scellé
   attend d'écraser celui en place (enregistrement `astra-signer` présent,

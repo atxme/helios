@@ -1056,13 +1056,14 @@ Chaque étape : action, puis état attendu. Onglet *Astra* › *Rotations*.
     toucher par clé de la campagne ; les postes couverts qui envoient leur demande
     dans les 300 s sont renouvelés sans rien redemander. Un second clic ne rouvre
     pas une deuxième opération (`AlreadyOpen` repris).
-43. **Partir d'une gateway sans copie du coffre.** Retirer
+43. **Partir d'une gateway sans copie du coffre.** Ouvrir « Remplacer la CA-PQ »
+    (le prérequis n'existe que sur les lignes de CA et de délégation). Retirer
     `authority-vault.json` du volume d'Astra et redémarrer Astra (essai jetable).
     Attendu : prérequis « Copie du coffre » rouge, « Absente » ; « Envoyer » le
     passe au vert sans clé ni redémarrage, et l'empreinte relue est celle du coffre
     local. Un coffre ancien donne « Ancienne ». **[cible seulement]** (volume réel).
 44. **Remplacer la CA-PQ, de bout en bout.** « Remplacer la CA-PQ ». Attendu :
-    « Clé 1 : à valider » puis « validée » avec son libellé ; « Clé 2 » de même ;
+    « Clé 1 » à « À valider » puis « ✓ Validée » avec son libellé ; « Clé 2 » de même ;
     « Approuver » ouvre la campagne ; quatre touchers au total (la clé 1 revient
     après la clé 2) ; l'empreinte de l'ancre **entrante** s'affiche juste après la
     signature, puis sur la ligne pendant tout le recouvrement. Suivi : signée,
@@ -1075,7 +1076,8 @@ Chaque étape : action, puis état attendu. Onglet *Astra* › *Rotations*.
 46. **Recouvrement CA-PQ : gestes désactivés.** Pendant le recouvrement de
     l'étape 44. Attendu : « Renouveler les postes », chaque lancement de
     *Approbations*, la récupération et « Renouveler la délégation » sont
-    désactivés, la raison affichée (« Recouvrement CA-PQ en cours ») ; les deux
+    désactivés, la raison affichée (« Recouvrement CA-PQ en cours » ; sur la
+    délégation, « Le coffre a une époque d'avance », qui passe en premier) ; les deux
     « Remplacer » aussi (une seule rotation de CA à la fois). Le renouvellement
     d'une feuille cliente par le moteur d'Orion (« Renouveler maintenant » sur un
     poste) reste à constater : attendu qu'il aboutisse, **non exercé côté Astra**.

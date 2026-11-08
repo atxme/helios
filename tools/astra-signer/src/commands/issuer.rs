@@ -244,8 +244,8 @@ pub(crate) fn authorize_issuer(
             )?;
             println!("état             : {state:?}");
             println!(
-                "la délégation est enregistrée par l'autorité ; redémarrer Astra pour émettre \
-                 sous elle"
+                "la délégation est enregistrée par l'autorité, qui l'adopte sans redémarrage ; \
+                 l'échec d'adoption se lit au journal d'Astra"
             );
         }
         _ => println!("à reporter sur l'autorité : astra issuer install --authorization <fichier>"),
