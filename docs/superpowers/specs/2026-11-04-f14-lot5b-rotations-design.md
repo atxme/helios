@@ -317,8 +317,9 @@ sert aussi de sauvegarde hors du poste. Astra la lit au démarrage, comme le doc
   - **Rotation CA-PQ** : le nouveau document est signé sous la nouvelle ancre, et Astra le tient déjà
     dans l'objet accepté. Astra l'adopte lui-même à `not_after`, dans la passe qui promeut l'ancre
     (`forget_expired_transitions`), et le rend durable. Orion ne l'envoie pas pendant le recouvrement.
-  - **Clé ajoutée, retirée ou marquée perdue** : Orion l'envoie avec la copie du coffre, et Astra
-    l'adopte en mémoire. Aucun terminal, mais hors recouvrement seulement.
+  - **Clé ajoutée, retirée, marquée perdue ou réactivée** : le geste terminé, Orion envoie la copie
+    du coffre et y joint le document, qu'Astra adopte en mémoire. Aucun terminal, mais hors
+    recouvrement seulement ; pendant un recouvrement, le document attend, et Orion le dit (§10.6).
 - **Renouveler les postes pendant un recouvrement CA-PQ** : le §5.1 l'autorise tant qu'un test de
   bout en bout le confirme. Astra vérifie alors sous l'ancien document, Orion sous le nouveau. Si le
   test échoue, le bouton est désactivé pendant le recouvrement, et cette limite est affichée.
@@ -461,6 +462,12 @@ que l'on a créée) se fait donc après la signature, pas avant.
   d'un autre domaine, ou qui a pu accepter puis promouvoir, ne dit rien d'une
   rotation que ce poste peut oublier. L'effacement est irréversible, d'où la
   règle.
+- **Marge avant l'abandon** : un journal Signé dont la campagne vient d'expirer
+  n'est lu auprès d'Astra qu'à `campaign_expires_at + DISCARD_MARGIN_SECS` (deux
+  délais d'appel du tunnel, 40 s) : un dépôt envoyé dans les dernières secondes
+  et encore en cours chez Astra aurait sinon pu être accepté après la lecture
+  qui efface le journal. Avant, la reprise répond `CampaignClosing` (« Campagne
+  à peine close. Rotation conservée : reprendre après … »), rien n'est effacé.
 - **Adoption d'un enregistrement d'`astra-signer`** : un enregistrement préparé
   n'est adopté qu'une fois (marqueur posé après l'enregistrement du journal), et
   l'adoption d'un coffre ancien exige que ses identifiants de credentials
@@ -514,7 +521,26 @@ que l'on a créée) se fait donc après la signature, pas avant.
   manuel joint les credentials locaux seulement s'ils sont plus récents que
   l'époque servie (ou si aucune n'est servie), et retente avec le seul coffre
   sur une réponse « retenue ».
-- Hors recouvrement, un changement de clé envoie le document avec la copie (§5.9).
+- Un changement de clé (ajout, retrait, perdue, réactivée) envoie le document
+  avec la copie (§5.9) : le geste terminé, l'écran appelle une fois, par
+  session, le même envoi manuel. Le résultat porte `document_waits`, vrai quand
+  l'époque locale du document reste au-dessus de celle qu'Astra sert après
+  l'envoi. Les lignes : « Copie du coffre et document de credentials envoyés à
+  Astra » ; « Copie envoyée · document de credentials en attente (rotation en
+  cours) » ; « Copie retenue par une opération en cours · à renvoyer ensuite » ;
+  un échec dit « Copie non envoyée à Astra : … » avec « Réessayer l'envoi ».
+  Aucun secret, code PIN ni octet du coffre ne passe dans la WebView ni au
+  journal.
+- *Coffre et clés* montre, tunnel monté, la ligne « Copie du coffre » avec son
+  « Envoyer ». Elle compare l'empreinte de la copie **et** l'époque du document
+  de credentials locaux (`localCredentialRegistryEpoch` de l'aperçu) à ce
+  qu'Astra sert : un marquage, qui ne change pas les octets du coffre, la fait
+  passer à « Document ancien ». La comparaison d'époque est ignorée pendant un
+  recouvrement `CA-PQ` et quand un journal se reprend, où le document n'est pas
+  joint.
+- **Écart résiduel** : une clé marquée perdue pendant un recouvrement `CA-PQ`
+  reste admise par Astra jusqu'à ce que « Envoyer » suive `not_after`, Astra
+  adoptant alors le document de la rotation, signé avant le marquage (§10.8).
 
 ### 10.7 Écran et libellés
 
@@ -529,6 +555,26 @@ que l'on a créée) se fait donc après la signature, pas avant.
   lit sans l'ouvrir ; sinon la ligne n'affiche que l'époque et l'empreinte.
 - « Expire bientôt » vaut 30 jours, en une constante.
 - Les clés approuvantes s'affichent avec leur état (validée, a approuvé).
+- Un journal dont `activation_at` est passé, lu sur les seules données du poste,
+  dit « Délai d'installation passé : à vérifier à la connexion »
+  (avertissement) ; « Délai dépassé · Intervention manuelle requise » ne
+  s'affiche que lorsqu'une reprise a rendu `InstallDeadlinePassed`.
+- « Terminer » trop tôt (horloge du poste en retard sur celle de la gateway)
+  répond « Recouvrement jusqu'au … . Rien n'a été modifié. »
+  (`Refusal::OverlapRunning`), et non « Rotation en cours ».
+- À « Approuver », une clé marquée perdue ou révoquée est refusée dès sa
+  validation et redemandée (« Clé marquée perdue ou révoquée ») ; une clé
+  marquée entre la validation et l'ouverture donne « Clé validée marquée perdue
+  ou révoquée. Recommencer avec une clé active. ». Les autres refus d'ouverture
+  sont nommés par leur cause : rotation en cours, ancres en désaccord
+  (`DomainConflict`).
+- « Remplacer » la CA-PQ est désactivé aussi quand la gateway tient une
+  transition `CA-PQ` en cours (`ca_transition_pending` ou
+  `next_ca_fingerprint`), et pas seulement quand Astra en tient une.
+- Prérequis : « Reprendre » d'un journal Appliqué ou Installé ne demande que le
+  tunnel, le droit d'administration et le coffre ; « Terminer » ne demande que
+  le tunnel et le coffre. Les autres lignes gardent le service Astra et le
+  domaine concordant.
 
 ### 10.8 Limites connues à la livraison
 
@@ -542,6 +588,11 @@ dans Orion ») et, pour les suivis, dans `ROADMAP.md` (F14-a à F14-f).
 - **Les campagnes de parc ne portent aucune signature de CA.** Garder
   l'ancien document pour les approbations rétablirait « Renouveler les postes »
   pendant un recouvrement : décision de conception, non prise.
+- **Une clé marquée perdue pendant un recouvrement `CA-PQ` reste admise par
+  Astra** jusqu'à un « Envoyer » fait après `not_after` : le document n'est pas
+  joint pendant le recouvrement, et Astra adopte à `not_after` celui de la
+  rotation, signé avant le marquage. « Copie du coffre » passe alors à
+  « Document ancien ».
 - **Un dialogue de clé de la plateforme qui ne revient jamais** n'a pas de
   borne sur les ouvertures gardées en mémoire (`pCancellationId` est nul dans
   `webauthn.rs`, les lectures HID n'ont pas de délai) : seul un redémarrage

@@ -751,9 +751,18 @@ construction le 7 :
   domaine), l'écrit de façon atomique sous le verrou du volume, garde une copie
   précédente et journalise l'empreinte et l'opérateur. Un administrateur du
   tunnel peut donc remplacer la sauvegarde, pas l'ouvrir. La borne est de
-  128 Kio, ce que le téléchargement du coffre porte. Une copie retenue par une
-  opération en attente répond `409`, seule exception aux refus indistincts, car
-  cette route ne répond qu'à un administrateur.
+  128 Kio, ce que le téléchargement du coffre porte. Deux refus répondent
+  `409`, seules exceptions aux refus indistincts, parce qu'un envoi ultérieur
+  les franchit et que cette route ne répond qu'à un administrateur : une copie
+  retenue par une opération en attente, et un document de credentials joint
+  pendant une rotation `CA-PQ` ou avant que la promotion de son document soit
+  durable.
+- **Un changement de clé atteint Astra avec la copie.** Après un ajout, un
+  retrait, une clé marquée perdue ou réactivée, Orion envoie la copie du coffre
+  et y joint le document de credentials lorsque son époque dépasse celle
+  qu'Astra sert, qui l'adopte en mémoire. Pendant un recouvrement `CA-PQ` le
+  document n'est pas joint ; Orion le dit, et « Copie du coffre » reste à
+  renvoyer dans *Coffre et clés*.
 - **Astra adopte sans redémarrer.** Une délégation enregistrée remplace
   l'émetteur en place après les contrôles du démarrage ; le document de
   credentials d'une rotation `CA-PQ` est adopté par Astra à `not_after`, dans la

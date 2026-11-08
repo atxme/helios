@@ -272,21 +272,20 @@ L'émetteur délégué est ce qui permet à Astra de renouveler les feuilles
 clientes **en ligne**, sans ouvrir le coffre. Il porte sa propre échéance.
 
 **Dans Orion** (chemin par défaut) : ligne « Renouveler la délégation ». Elle
-passe à « À faire » quand la délégation expire bientôt (30 jours) ou ne suit plus
-les époques de la CA, une fois le coffre au niveau de la gateway : à partir de
-`not_after` après une rotation CA-PQ, après « Terminer » pour la CA TLS. Pendant
-un recouvrement CA-PQ le bouton est désactivé (pendant celui d'une CA TLS, il ne
-l'est que si le coffre a une époque d'avance sur la gateway). Orion ouvre la campagne par le tunnel ;
-Astra génère les clés dans son volume et renvoie la demande dans la réponse, sans
-fichier ; une clé approuve puis ouvre le coffre ; la délégation est déposée et
-**Astra l'adopte sans redémarrer** (Orion ne redémarre jamais Astra). Si
-l'adoption échoue, Astra le journalise et l'émetteur en place reste servi ; la
-réponse de dépôt reste un succès, et Orion ne le montre qu'indirectement, par la
-ligne de délégation (« époque servie X, inscrite Y »). Une
-délégation ouverte dont la réponse s'est perdue ne se reprend pas : « Opération
-ouverte jusqu'au … », puis une nouvelle ouverture une fois la fenêtre close. Les
-commandes ci-dessous sont le recours, et **le redémarrage qu'elles prescrivent ne
-vaut que pour elles**.
+passe à « À faire » quand la délégation expire bientôt (30 jours) ou ne suit
+plus les époques de la CA, une fois le coffre au niveau de la gateway : à partir
+de `not_after` après une rotation CA-PQ, après « Terminer » pour la CA TLS.
+Pendant un recouvrement CA-PQ le bouton est désactivé (pendant celui d'une CA
+TLS, il ne l'est que si le coffre a une époque d'avance sur la gateway). Orion
+ouvre la campagne par le tunnel ; Astra génère les clés dans son volume et
+renvoie la demande dans la réponse, sans fichier ; une clé approuve puis ouvre
+le coffre ; la délégation est déposée et **Astra l'adopte sans redémarrer**
+(Orion ne redémarre jamais Astra). Si l'adoption échoue, Astra le journalise et
+l'émetteur en place reste servi ; la réponse de dépôt reste un succès, et Orion
+ne le montre qu'indirectement, par la ligne de délégation (« époque servie X,
+inscrite Y »). Une délégation ouverte dont la réponse s'est perdue ne se reprend
+pas : « Opération ouverte jusqu'au … », puis une nouvelle ouverture une fois la
+fenêtre close. Les commandes ci-dessous sont le recours.
 
 **Sur la gateway** — la demande et sa campagne, en un seul geste :
 
@@ -382,14 +381,35 @@ crée une continuité neuve au lieu d'en prolonger une.
 Une clé qu'on ne retrouve pas n'approuve plus rien, et son key-slot ouvre
 toujours le coffre. La retirer, elle, est définitif.
 
+**Dans Orion** (chemin par défaut) : onglet Astra › *Coffre et clés*, « Marquer
+perdue » ou « Réactiver » sur la clé, relais nommant la gateway. Orion réémet le
+document de credentials, puis envoie aussitôt la copie du coffre à Astra par le
+tunnel en y joignant ce document, qu'Astra adopte en mémoire, sans redémarrage.
+La ligne qui suit le geste dit ce qui est parti : « Copie du coffre et document
+de credentials envoyés à Astra », « Copie retenue par une opération en cours · à
+renvoyer ensuite », ou l'erreur avec « Réessayer l'envoi ». L'ajout et le
+retrait d'une clé suivent le même chemin.
+
+Pour vérifier, tunnel monté : la ligne « Copie du coffre » du bloc *Astra* de
+*Coffre et clés* compare l'époque du document local à celle qu'Astra sert.
+« Document ancien » ou « Ancienne » veut dire qu'Astra tient encore l'ancienne
+liste : « Envoyer » la lui porte. Pendant un recouvrement `CA-PQ`, Astra garde
+l'ancien document jusqu'à `not_after` : la ligne dit « Copie envoyée · document
+de credentials en attente (rotation en cours) », la clé perdue reste admise par
+Astra d'ici là, et « Envoyer » est à refaire après `not_after` (voir « Limites
+connues des rotations dans Orion »).
+
+Le recours, hors d'Orion :
+
 ```sh
 # sur le poste de l'opérateur
 astra-signer bindings --lost <key-slot>     # 32 caractères hexadécimaux
 astra-signer bindings --active <key-slot>   # la remettre en service
 ```
 
-Le document réémis est à copier dans le volume d'état d'Astra : c'est lui qui
-décide quelles rangées peuvent répondre à une approbation.
+Le document réémis est alors à copier dans le volume d'état d'Astra, puis Astra
+à redémarrer (il le lit au démarrage) : c'est lui qui décide quelles rangées
+peuvent répondre à une approbation.
 
 ## 7. Révoquer une identité compromise (§10)
 
@@ -967,12 +987,15 @@ soit pris pour un manque à combler.
 dans [ROADMAP.md](ROADMAP.md) (F14-a à F14-f).
 
 - **« Délai dépassé » n'a pas de réparation.** La gateway refuse une transition
-  une fois `activation_at` passé (7 jours après la signature par défaut,
-  1 jour au moins), et le coffre local ne peut plus en signer une autre : la clé
+  une fois `activation_at` passé (7 jours après la signature par défaut, 1 jour
+  au moins), et le coffre local ne peut plus en signer une autre : la clé
   sortante n'y est plus. L'écran affiche « Délai dépassé », la date de coupure
-  (`not_after`, où Astra avance seul et la gateway reste sur l'ancienne ancre) et
-  « Intervention manuelle requise ». Éviter le cas : laisser Orion installer
-  aussitôt après l'acceptation, et se connecter dans la semaine.
+  (`not_after`, où Astra avance seul et la gateway reste sur l'ancienne ancre)
+  et « Intervention manuelle requise » quand une reprise le constate auprès de
+  la gateway ; avant, d'après les seules données du poste, la ligne dit « Délai
+  d'installation passé : à vérifier à la connexion », car le journal peut encore
+  se reprendre sans dommage. Éviter le cas : laisser Orion installer aussitôt
+  après l'acceptation, et se connecter dans la semaine.
 - **De `Applied` à `not_after` (37 jours au plus par défaut), la révocation
   d'urgence est impossible.** La clé sortante a quitté le coffre, et Astra
   vérifie encore sous elle. C'est déjà le comportement de la commande ; cela
@@ -988,6 +1011,11 @@ dans [ROADMAP.md](ROADMAP.md) (F14-a à F14-f).
   signature de CA : garder l'ancien document pour les approbations rétablirait le
   renouvellement du parc pendant le recouvrement, décision de conception non
   prise.
+- **Une clé marquée perdue pendant un recouvrement CA-PQ reste admise par Astra
+  jusqu'après `not_after`.** Orion n'y joint pas le document de credentials, et
+  Astra adopte à `not_after` celui de la rotation, signé avant le marquage.
+  « Copie du coffre » passe alors à « Document ancien » : « Envoyer » dans
+  *Coffre et clés* porte le document à jour.
 - **Un dialogue de clé de la plateforme qui ne revient jamais** n'a pas de borne
   sur les ouvertures gardées en mémoire : seul un redémarrage d'Orion y met fin.
   Rien n'est écrit sur le disque avant la signature. Un GUID d'annulation
@@ -1005,7 +1033,10 @@ dans [ROADMAP.md](ROADMAP.md) (F14-a à F14-f).
   une copie plus récente d'Astra, seul le domaine étant contrôlé. Une copie
   de plus de 128 Kio est refusée (ce que le téléchargement porte). Une
   copie différente envoyée pendant une opération en attente de l'opérateur
-  répond `409` : réessayer après son expiration (300 s au plus).
+  répond `409` : réessayer après son expiration (300 s au plus). Un document de
+  credentials joint pendant une rotation `CA-PQ`, ou avant que la promotion de
+  son document soit durable, répond `409` aussi ; Orion renvoie alors le seul
+  coffre et dit que le document attend.
 - **Un écrasement raté peut effacer un journal à tort.** Si une écriture
   échoue après son renommage et que la campagne meurt avant un rejeu, Orion
   efface son journal alors que le fichier d'Astra tient l'ancre : réparation

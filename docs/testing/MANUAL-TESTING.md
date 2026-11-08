@@ -1071,8 +1071,9 @@ Chaque étape : action, puis état attendu. Onglet *Astra* › *Rotations*.
     seulement]** (clés réelles, WebAuthn).
 45. **Clé répétée, clé hors du coffre.** À l'étape de validation, toucher deux
     fois la même clé : refus « Même clé que la clé 1 ». Une clé non enregistrée :
-    refus « Clé absente du coffre ». Dans les deux cas on peut réessayer, et rien n'est
-    ouvert. **[cible seulement]** (clés réelles).
+    refus « Clé absente du coffre ». Une clé marquée perdue : refus « Clé
+    marquée perdue ou révoquée ». Dans les trois cas on peut réessayer, et rien
+    n'est ouvert. **[cible seulement]** (clés réelles).
 46. **Recouvrement CA-PQ : gestes désactivés.** Pendant le recouvrement de
     l'étape 44. Attendu : « Renouveler les postes », chaque lancement de
     *Approbations*, la récupération et « Renouveler la délégation » sont
@@ -1088,7 +1089,10 @@ Chaque étape : action, puis état attendu. Onglet *Astra* › *Rotations*.
 48. **Terminer la rotation CA TLS.** À `not_after` (réduire le recouvrement pour
     l'essai), ouvrir l'onglet. Attendu : « Terminer » en tête, « À faire » ; un
     toucher d'une clé ; la rotation se referme, le coffre émet sous la nouvelle
-    époque. Rouvrir l'onglet : la ligne a disparu.
+    époque. Rouvrir l'onglet : la ligne a disparu. Variante, horloge du poste en
+    retard sur la gateway : « Terminer » trop tôt répond « Recouvrement jusqu'au
+    … . Rien n'a été modifié. ». Astra arrêté, « Terminer » reste possible
+    (seuls le tunnel et le coffre sont demandés).
 49. **Renouveler la délégation, puis un poste.** Après une rotation (CA-PQ à
     `not_after`, CA TLS après « Terminer »), la ligne passe « À faire » ; pendant
     un recouvrement elle est désactivée (« Le coffre a une époque d'avance »).
@@ -1109,7 +1113,9 @@ Chaque étape : action, puis état attendu. Onglet *Astra* › *Rotations*.
     l'installation (`already_present` au rejeu). **[cible seulement]**.
 52. **Campagne expirée, journal non accepté.** Signer, couper Orion avant le
     dépôt, attendre plus de 300 s (ou redémarrer Astra, qui perd l'opération).
-    Rouvrir, tunnel monté. Attendu : Astra ne tient pas la transition, le journal
+    Rouvrir, tunnel monté, moins de 40 s après l'expiration : « Campagne à peine
+    close. Rotation conservée : reprendre après … », rien d'effacé. Plus tard :
+    Astra ne tient pas la transition, le journal
     est effacé, le coffre n'a pas bougé, l'écran dit « Rotation expirée.
     Recommencer » ; refaire les quatre touchers. Variante : Astra tient une
     **autre** transition : refus (conflit de domaine), rien n'est effacé.
@@ -1124,7 +1130,9 @@ Chaque étape : action, puis état attendu. Onglet *Astra* › *Rotations*.
     la lance une fois.
 55. **Délai dépassé (limite connue).** Rotation signée avec 1 jour de
     préparation, ne pas installer, attendre `activation_at` (horloge d'essai).
-    Attendu : état bloquant « Délai dépassé », date de coupure (`not_after`) et
+    Attendu, tunnel coupé : avertissement « Délai d'installation passé : à
+    vérifier à la connexion », rien de bloquant. Tunnel monté, la reprise lit la
+    gateway : état bloquant « Délai dépassé », date de coupure (`not_after`) et
     « Intervention manuelle requise » ; aucune réparation proposée, rien effacé.
     `ROADMAP.md`, F14-a.
 56. **Gateway plus ancienne.** Contre une gateway sans les nouveaux champs :
@@ -1168,6 +1176,34 @@ Chaque étape : action, puis état attendu. Onglet *Astra* › *Rotations*.
     campaign open` : la rotation se joue comme avant et son enregistrement est
     ensuite repris par Orion (étape 61). Orion n'a lancé aucun `astra-signer`
     pendant tout « G ».
+64. **Marquer une clé perdue atteint Astra.** Hors recouvrement, tunnel monté,
+    *Coffre et clés* : la ligne « Copie du coffre » du bloc *Astra* est verte ;
+    noter le champ `credential_registry_epoch` de la route `operator/status`
+    d'Astra. « Marquer perdue » sur la clé 2, un toucher de la clé 1. Attendu :
+    sous le geste, « Envoi de la copie du coffre à Astra… » puis « Copie du
+    coffre et document de credentials envoyés à Astra » ; « Copie du coffre »
+    reste verte et l'époque servie a monté, sans redémarrage d'Astra. Puis
+    lancer une campagne de renouvellement et la faire approuver par la clé 2 :
+    refusée par Astra. « Réactiver » la clé 2 : même envoi, la clé 2 approuve de
+    nouveau. Aucun code PIN ni octet du coffre dans la console de la WebView ni
+    au journal d'Orion. **[cible seulement]** (clés réelles).
+65. **Changement de clé sans tunnel, puis renvoi.** Tunnel coupé, « Marquer
+    perdue » (ou ajouter, ou retirer une clé). Attendu : « Copie non envoyée à
+    Astra : … » avec « Réessayer l'envoi » ; le geste lui-même est fait.
+    Remonter le tunnel : « Copie du coffre » est rouge (« Document ancien »
+    après un marquage, « Ancienne » après un ajout ou un retrait) ; « Envoyer »
+    ou « Réessayer l'envoi » la passe au vert, et l'étape 64 se vérifie de même.
+66. **Changement de clé pendant une opération ouverte, puis pendant un
+    recouvrement.** (a) Une campagne attend l'opérateur : ajouter ou retirer une
+    clé (le coffre change). Attendu : « Copie retenue par une opération en cours
+    · à renvoyer ensuite » ; après l'expiration de la campagne, « Envoyer » dans
+    *Coffre et clés* passe. Un marquage, qui laisse le coffre identique, passe
+    même pendant la campagne. (b) Pendant le recouvrement CA-PQ de l'étape 44 :
+    « Marquer perdue ». Attendu : « Copie envoyée · document de credentials en
+    attente (rotation en cours) », « Copie du coffre » verte pendant le
+    recouvrement (limite connue : Astra admet encore la clé). Après
+    `not_after` : « Document ancien », « Envoyer » porte le document, et la clé
+    est refusée.
 
 ### Le chemin manuel
 

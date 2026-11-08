@@ -656,6 +656,19 @@ connectée, ou restaurer le document de credentials depuis une sauvegarde. »
 Il n'existe aucun chemin dans Orion pour réparer un document illisible :
 restaurer `astra-credentials.json` depuis une sauvegarde, à côté du coffre.
 
+Le geste terminé, Orion envoie lui-même la copie du coffre à Astra par le
+tunnel, et y joint le document lorsque son époque dépasse celle qu'Astra sert :
+une clé marquée perdue cesse ainsi d'approuver, sans recopie ni redémarrage. Le
+résultat s'affiche sous le geste : « Copie du coffre et document de credentials
+envoyés à Astra » ; « Copie envoyée · document de credentials en attente
+(rotation en cours) » pendant un recouvrement `CA-PQ`, où Astra garde l'ancien
+document jusqu'à `not_after` ; « Copie retenue par une opération en cours · à
+renvoyer ensuite » ; ou l'erreur, avec « Réessayer l'envoi ». Tunnel monté, la
+ligne « Copie du coffre » de *Coffre et clés* compare l'empreinte du coffre et
+l'époque du document locaux à ce qu'Astra sert (« Ancienne », « Document
+ancien ») et propose « Envoyer ». Une clé marquée perdue pendant un recouvrement
+reste donc admise par Astra jusqu'à cet envoi, fait après `not_after`.
+
 Il ne porte rien de secret : ce sont les liaisons publiques des credentials,
 et c'est le **consommateur** qui les vérifie sous son ancre — Orion sous le
 `CA-PQ` de son profil, le compagnon sous celui de son coffre. Ni ce script, ni
@@ -668,10 +681,10 @@ ce cas.
 
 Depuis le lot 5b, ce fichier n'est plus qu'un point de départ : après une
 rotation `CA-PQ`, Astra adopte lui-même le nouveau document à `not_after` et le
-rend durable ; après un changement de clé, Orion l'envoie avec la copie du coffre
-et Astra l'adopte en mémoire, hors recouvrement seulement. Aucun redémarrage n'est
-prescrit. Une adoption qui échoue au démarrage est journalisée et réessayée par la
-passe suivante, Astra refusant les approbations entre-temps.
+rend durable ; après un changement de clé, Orion l'envoie avec la copie du
+coffre et Astra l'adopte en mémoire, hors recouvrement seulement. Aucun
+redémarrage n'est prescrit. Une adoption qui échoue au démarrage est journalisée
+et réessayée par la passe suivante, Astra refusant les approbations entre-temps.
 
 Sans lui, Astra tourne, sert ses statuts et tient son canal — et refuse chaque
 renouvellement ordinaire en le disant. C'est ce à quoi une installation
@@ -734,12 +747,12 @@ coffre, donc la délégation se signe sur le poste opérateur, à la clé de
 sécurité, et fait un aller-retour.
 
 **Depuis le lot 5b, Orion renouvelle la délégation** : ligne « Renouveler la
-délégation » de l'onglet *Rotations*, qui ouvre la campagne par le tunnel, reçoit
-la demande dans la réponse (sans fichier), fait approuver par une clé, dépose la
-délégation, et **Astra l'adopte sans redémarrer** (un échec d'adoption n'est écrit qu'au
-journal d'Astra, l'émetteur précédent restant servi ; la ligne de délégation
-d'Orion montre alors une époque servie différente de l'inscrite). Les trois commandes
-ci-dessous sont le recours.
+délégation » de l'onglet *Rotations*, qui ouvre la campagne par le tunnel,
+reçoit la demande dans la réponse (sans fichier), fait approuver par une clé,
+dépose la délégation, et **Astra l'adopte sans redémarrer** (un échec d'adoption
+n'est écrit qu'au journal d'Astra, l'émetteur précédent restant servi ; la ligne
+de délégation d'Orion montre alors une époque servie différente de l'inscrite).
+Les trois commandes ci-dessous sont le recours.
 
 Trois commandes, dans cet ordre :
 
