@@ -29,10 +29,12 @@ et remplacer la copie du coffre (F14-f), sans rien pouvoir signer.
 - **Pas de parcours d'urgence allégé** : l'utilisateur a toutes ses clés sous la
   main ; une révocation n'est pas un cas extrême pour lui. Le parcours est celui
   du 5b.
-- **F14-c tranché : les renouvellements restent bloqués pendant un recouvrement
-  `CA-PQ`**, avec un avertissement avant « Remplacer la CA-PQ » quand un poste
-  arrive en fin de certificat dans la fenêtre. Voir §5.6 pour ce que ce lot
-  apprend à ce sujet.
+- **F14-c tranché : « Renouveler les postes » reste bloqué pendant un
+  recouvrement `CA-PQ`**, avec un avertissement avant « Remplacer la CA-PQ »
+  quand un poste arrive en fin de certificat dans la fenêtre. Confirmé après
+  avoir appris que le document sortant deviendrait disponible (§5.6).
+- **Astra connaît tous les postes admis** (§5.3).
+- **« Ce poste » ne se révoque pas depuis lui-même** (§5.1).
 
 ## 3. Objectifs
 
@@ -85,9 +87,13 @@ Postes                                                   ↻
   signer » (§5.3), « Révoqué ». Les postes révoqués restent listés, grisés.
 - **Échéance** : celle du certificat actif.
 - **« Ce poste »** : le poste où tourne Orion, reconnu par sa clé WireGuard
-  dans le profil du domaine. Pas de bouton « Révoquer » sur cette ligne : la
-  coupure ôterait le tunnel dont la signature a besoin. La ligne dit « Se
-  révoque depuis un autre poste administrateur. » *(choix de conception, §10)*.
+  dans le profil du domaine. Pas de bouton « Révoquer » sur cette ligne :
+  révoquer un poste admin depuis lui-même n'a pas de sens, et la coupure ôterait
+  le tunnel dont la signature a besoin. La coupure se fait sur la gateway, par
+  l'outil `helios` (`helios peer revoke <nom>`, joignable par le lien Tailscale)
+  ; la ligne le dit en une phrase. La révocation se signe ensuite depuis un autre
+  poste administrateur, où la ligne apparaît « Coupé, révocation à signer »
+  (décision de l'utilisateur, 8 novembre 2026).
 - **Sources** :
   - la **gateway** tient l'admission (`/api/network`) et l'état de certificat
     de chaque poste admis ou coupé ; c'est la source de la liste, des noms et
@@ -375,8 +381,9 @@ version et posé huit questions. Choix faits, à vérifier par l'utilisateur :
 2. Astra recopie tous les postes admis par la gateway, par son balayage et à
    l'ouverture d'une révocation (§5.3). Décidé par l'utilisateur le
    8 novembre 2026.
-3. « Ce poste » ne se révoque pas depuis lui-même, mais depuis un autre poste
-   administrateur (§5.1).
+3. « Ce poste » ne se révoque pas depuis lui-même : coupure par `helios peer
+   revoke` sur la gateway, signature depuis un autre poste administrateur
+   (§5.1). Décidé par l'utilisateur le 8 novembre 2026.
 4. La coupure n'attend ni Astra, ni le coffre, ni la fin d'un recouvrement ;
    seule la signature peut attendre (§5.2).
 5. Les états sont calculés depuis la gateway et Astra, jamais enregistrés
