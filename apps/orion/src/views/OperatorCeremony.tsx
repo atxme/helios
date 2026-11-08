@@ -9,7 +9,7 @@ import { KeyRound, X } from 'lucide-react'
 
 import * as api from '../api'
 import { RULE } from '../theme'
-import { stopSentence } from './astra/rotationRows'
+import { formatTime, stopSentence } from './astra/rotationRows'
 import type {
   AstraManifest,
   CampaignManifest,
@@ -588,6 +588,9 @@ export function refusalSentence(
       return stopSentence('gateway_names_no_anchor', journal)
     case 'rotation_in_flight':
       return 'Rotation en cours. La mener à son terme d’abord.'
+    case 'campaign_closing':
+      // Astra's silence on a campaign that has only just closed is not yet its last word.
+      return `Campagne à peine close. Rotation conservée : reprendre après ${formatTime(refusal.until)}.`
     case 'key_not_validated':
       return 'Autre clé attendue.'
     case 'terms_refused':

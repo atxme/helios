@@ -55,7 +55,10 @@ use crate::rotation_journal::RotationKind;
 /// slower than this is a gateway that is not answering, and the operator is
 /// standing at a prompt with a security key in hand — a long wait there is
 /// worse than a clear refusal.
-const CALL_TIMEOUT: Duration = Duration::from_secs(20);
+const CALL_TIMEOUT: Duration = Duration::from_secs(CALL_TIMEOUT_SECS);
+
+/// How long one call through the tunnel may take, in seconds.
+pub const CALL_TIMEOUT_SECS: u64 = 20;
 
 /// Ceiling on any answer.
 ///

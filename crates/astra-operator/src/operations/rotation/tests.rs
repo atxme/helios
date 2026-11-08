@@ -30,7 +30,7 @@ use crate::authenticator::{
 };
 use crate::gestures::{self, NewAuthority, NewKey};
 use crate::rotation_journal::{
-    self, JournalStage, LegacyCaPqJournal, LEGACY_CA_PQ_JOURNAL_VERSION,
+    self, JournalStage, LegacyCaPqJournal, DISCARD_MARGIN_SECS, LEGACY_CA_PQ_JOURNAL_VERSION,
 };
 use crate::signing::{self, CampaignApprovalSession};
 use crate::tunnel::admin_refusal;
@@ -1654,6 +1654,9 @@ fn a_discarded_client_tls_rotation_leaves_no_record() {
     remote.deposits.borrow_mut().push_back(Err(403));
 
     let step = advance(&remote, &domain.path, &mut journal, NOW).expect("advanced");
+    assert_eq!(step, ResumeStep::CampaignClosing);
+    let closed = journal.campaign_expires_at + DISCARD_MARGIN_SECS;
+    let step = advance(&remote, &domain.path, &mut journal, closed).expect("advanced");
 
     assert_eq!(step, ResumeStep::Discard);
     assert_eq!(prepared_record_on_disk(&domain), None);
@@ -1801,7 +1804,12 @@ fn refused_deposit_of_a_dead_campaign_not_accepted_discards() {
         let remote = Remote::watching(&domain.path);
         remote.deposits.borrow_mut().push_back(Err(status));
 
+        // Refused, and Astra names nothing: not its last word while the campaign closes.
         let step = advance(&remote, &domain.path, &mut journal, NOW).expect("advanced");
+        assert_eq!(step, ResumeStep::CampaignClosing, "{status}");
+        assert!(domain.journal_on_disk().is_some(), "{status}: kept");
+        let closed = journal.campaign_expires_at + DISCARD_MARGIN_SECS;
+        let step = advance(&remote, &domain.path, &mut journal, closed).expect("advanced");
 
         assert_eq!(step, ResumeStep::Discard, "{status}");
         assert_eq!(domain.journal_on_disk(), None);
@@ -1911,6 +1919,9 @@ fn a_dead_campaign_is_decided_by_the_authority_and_never_deposited() {
     let mut journal = domain_gone.signed(RotationKind::CaPq);
     let remote = Remote::watching(&domain_gone.path);
     let step = advance(&remote, &domain_gone.path, &mut journal, EXPIRES).expect("advanced");
+    assert_eq!(step, ResumeStep::CampaignClosing);
+    let closed = EXPIRES + DISCARD_MARGIN_SECS;
+    let step = advance(&remote, &domain_gone.path, &mut journal, closed).expect("advanced");
     assert_eq!(step, ResumeStep::Discard);
     assert!(!remote.called("submit_campaign"));
     assert_eq!(domain_gone.journal_on_disk(), None);

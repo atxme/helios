@@ -809,6 +809,14 @@ pub fn adopt_legacy(vault_path: &Path) -> Result<Option<RotationJournal>> {
     Ok(Some(adopted))
 }
 
+/// How long past a campaign's end a signed journal waits before it may be discarded.
+///
+/// Astra's status names nothing of a deposit it has received and not yet committed: one
+/// sent in the campaign's last seconds, its answer lost, can be committed after a read
+/// made at once, which would then erase the only copy of a vault Astra has accepted.
+/// Two calls' worth of time covers the deposit and the read that follows it.
+pub const DISCARD_MARGIN_SECS: u64 = 2 * crate::tunnel::CALL_TIMEOUT_SECS;
+
 /// What the caller has learned so far, and what [`next_step`] decides from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResumeFacts {
@@ -871,6 +879,10 @@ pub enum ResumeStep {
     /// journal, and nothing is lost but the touches. Never for an adoption with no
     /// deposit, whose vault may have moved already.
     Discard,
+    /// What [`Self::Discard`] would decide, read too soon after the campaign's end to
+    /// be Astra's last word ([`DISCARD_MARGIN_SECS`]). Nothing is cleared, and a look
+    /// after the margin decides.
+    CampaignClosing,
     /// The domain contradicts this journal, or does not hold the rotation it
     /// adopted. Nothing is cleared and nothing moves: it is not for this machine
     /// to choose.
@@ -925,6 +937,12 @@ fn next_step_of_signed(journal: &RotationJournal, facts: &ResumeFacts) -> Resume
         // not this rotation's: it says nothing of an Astra that may have accepted
         // and will promote, so the only copy of the next vault stays.
         ResumeStep::DomainConflict
+    } else if facts.now
+        < journal
+            .campaign_expires_at
+            .saturating_add(DISCARD_MARGIN_SECS)
+    {
+        ResumeStep::CampaignClosing
     } else {
         ResumeStep::Discard
     }
@@ -1295,17 +1313,49 @@ mod tests {
             ..authority()
         };
         assert_eq!(
-            next_step(&signed, &with_authority(EXPIRES, other_family)),
+            next_step(&signed, &with_authority(CLOSED, other_family)),
             ResumeStep::Discard
         );
     }
+
+    /// Past the campaign's end and the margin a deposit sent in its last seconds may
+    /// still take to commit at Astra.
+    const CLOSED: u64 = EXPIRES + DISCARD_MARGIN_SECS;
 
     #[test]
     fn dead_and_nothing_in_flight_discards() {
         let signed = journal(JournalStage::Signed);
         assert_eq!(
-            next_step(&signed, &with_authority(EXPIRES, authority())),
+            next_step(&signed, &with_authority(CLOSED, authority())),
             ResumeStep::Discard
+        );
+    }
+
+    /// The erasure cannot be undone, and a deposit sent in the campaign's last seconds,
+    /// its answer lost, may be committed by Astra after a status read made at once.
+    #[test]
+    fn nothing_is_discarded_before_the_margin_past_the_campaign() {
+        assert_eq!(DISCARD_MARGIN_SECS, 2 * crate::tunnel::CALL_TIMEOUT_SECS);
+        let signed = journal(JournalStage::Signed);
+        for now in [EXPIRES, CLOSED - 1] {
+            assert_eq!(
+                next_step(&signed, &with_authority(now, authority())),
+                ResumeStep::CampaignClosing,
+                "{now}"
+            );
+        }
+        assert_eq!(
+            next_step(&signed, &with_authority(CLOSED, authority())),
+            ResumeStep::Discard
+        );
+        // An authority that holds the anchor is read as such at once: nothing waits.
+        let held = OperatorAuthorityStatus {
+            next_ca_tls_fingerprint: Some(signed.next_anchor_fingerprint),
+            ..authority()
+        };
+        assert_eq!(
+            next_step(&signed, &with_authority(EXPIRES, held)),
+            ResumeStep::ApplyLocal
         );
     }
 
@@ -1357,16 +1407,21 @@ mod tests {
         );
     }
 
-    /// A refused deposit reads the authority even inside the campaign's life,
-    /// and a read in hand decides at once.
+    /// A refused deposit reads the authority even inside the campaign's life. A read
+    /// naming the anchor applies at once; one naming nothing is not the last word
+    /// before the campaign has closed.
     #[test]
-    fn a_refused_deposit_is_decided_by_the_authority_while_the_campaign_lives() {
+    fn a_refused_deposit_is_decided_by_the_authority_once_the_campaign_closed() {
         let signed = journal(JournalStage::Signed);
-        let refused = ResumeFacts {
+        let refused = |now| ResumeFacts {
             deposit_refused: true,
-            ..with_authority(NOW, authority())
+            ..with_authority(now, authority())
         };
-        assert_eq!(next_step(&signed, &refused), ResumeStep::Discard);
+        assert_eq!(
+            next_step(&signed, &refused(NOW)),
+            ResumeStep::CampaignClosing
+        );
+        assert_eq!(next_step(&signed, &refused(CLOSED)), ResumeStep::Discard);
     }
 
     #[test]
@@ -1911,7 +1966,7 @@ mod tests {
         let signed = journal(JournalStage::Signed);
         save(&place.journal_path, &signed).expect("save");
         assert_eq!(
-            next_step(&signed, &with_authority(EXPIRES, authority())),
+            next_step(&signed, &with_authority(CLOSED, authority())),
             ResumeStep::Discard
         );
 

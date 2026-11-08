@@ -379,7 +379,7 @@ impl RotationRun<'_> {
                 Ok(())
             }
             Ok(step) => Err(self.refuse(
-                refusal_of_stop(step),
+                refusal_of_stop(step, &journal),
                 format!("rotation arrêtée : {step:?}"),
             )),
             Err(error) => Err(self.refuse(
@@ -648,9 +648,14 @@ fn refusal_of_open(error: &anyhow::Error) -> Refusal {
     }
 }
 
-fn refusal_of_stop(step: ResumeStep) -> Refusal {
+fn refusal_of_stop(step: ResumeStep, journal: &RotationJournal) -> Refusal {
     match step {
         ResumeStep::Discard => Refusal::RotationExpired,
+        ResumeStep::CampaignClosing => Refusal::CampaignClosing {
+            until: journal
+                .campaign_expires_at
+                .saturating_add(rotation_journal::DISCARD_MARGIN_SECS),
+        },
         ResumeStep::DomainConflict => Refusal::DomainConflict,
         ResumeStep::InstallDeadlinePassed => Refusal::InstallDeadlinePassed,
         ResumeStep::GatewayOutdated => Refusal::GatewayNamesNoAnchor,

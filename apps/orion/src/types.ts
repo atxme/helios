@@ -691,6 +691,7 @@ export type Refusal =
   | { refusal: 'install_deadline_passed' }
   | { refusal: 'gateway_names_no_anchor' }
   | { refusal: 'rotation_in_flight' }
+  | { refusal: 'campaign_closing'; until: number }
   | { refusal: 'key_not_validated' }
   | { refusal: 'terms_refused' }
   | { refusal: 'nothing_to_finish' }

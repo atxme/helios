@@ -99,6 +99,16 @@ describe('refusalSentence for the issuer delegation', () => {
     expect(sentence).toMatch(/conservée/)
   })
 
+  it('a_campaign_just_closed_keeps_the_rotation_and_says_when_to_look_again', () => {
+    const sentence = refusalSentence(
+      { refusal: 'campaign_closing', until: 1_800_000_040 },
+      null,
+      'rotate_anchor',
+    )
+    expect(sentence).toMatch(/^Campagne à peine close\. Rotation conservée : reprendre après /)
+    expect(sentence).toMatch(/\d{2}:\d{2}:\d{2}/)
+  })
+
   it('a_key_marked_lost_is_said_at_its_validation_and_at_approval', () => {
     expect(retryLabel({ refusal: 'signer_revoked' }, 'validate_key')).toBe(
       'Clé marquée perdue ou révoquée',

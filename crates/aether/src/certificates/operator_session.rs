@@ -428,6 +428,10 @@ pub enum Refusal {
     GatewayNamesNoAnchor,
     /// A rotation stands in the way, or is not at the step this gesture takes.
     RotationInFlight,
+    /// The campaign of a signed rotation has just closed, and Astra naming nothing
+    /// of it is not yet its last word: a deposit may still be committing. Nothing
+    /// was cleared; a look from `until` on decides.
+    CampaignClosing { until: u64 },
     /// The key that answered is not the one this step can take: outside the two
     /// validated, or one that has already approved.
     KeyNotValidated,
@@ -980,6 +984,15 @@ mod tests {
                 serde_json::json!({ "refusal": wire })
             );
         }
+    }
+
+    /// A date, and still no text: the screen words it.
+    #[test]
+    fn the_dated_rotation_refusals_carry_their_instant_only() {
+        assert_eq!(
+            serde_json::to_value(Refusal::CampaignClosing { until: 7 }).expect("refusal"),
+            serde_json::json!({ "refusal": "campaign_closing", "until": 7 })
+        );
     }
 
     #[test]

@@ -1758,14 +1758,23 @@ fn the_incoming_anchor_is_shown_from_the_journal() {
 
 // What stops a rotation, and what the journal keeps.
 
+/// A refused deposit Astra names nothing of is not its last word until the campaign has
+/// closed: the journal is kept until then, and the look after it expires the rotation.
 #[test]
 fn a_dead_campaign_nothing_heard_of_expires_the_rotation() {
     let bench = bench();
     let before = bench.vault_bytes();
     bench.remote.deposits.lock().expect("lock").push_back(409);
     let ran = bench.drive(RotationGesture::ReplaceCaPq, Bench::all_the_way);
-    ran.refused(Refusal::RotationExpired);
+    let closed = EXPIRES + rotation_journal::DISCARD_MARGIN_SECS;
+    ran.refused(Refusal::CampaignClosing { until: closed });
     assert_eq!(ran.last().remote, RemoteState::Prepared);
+    assert_eq!(bench.journal().expect("kept").stage, JournalStage::Signed);
+    assert_eq!(bench.vault_bytes(), before);
+
+    bench.set_clock(closed);
+    let ran = bench.drive(RotationGesture::Resume, Bench::all_the_way);
+    ran.refused(Refusal::RotationExpired);
     assert!(bench.journal().is_none());
     assert_eq!(bench.vault_bytes(), before);
 }

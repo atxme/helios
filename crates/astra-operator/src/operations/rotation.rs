@@ -823,7 +823,8 @@ pub fn vault_copy(vault_path: &Path) -> Result<OperatorVaultCopy> {
 ///   later, so the journal stays and the next look retries it.
 /// - [`ResumeStep::Discard`]: nothing was announced, and the journal is gone.
 /// - [`ResumeStep::GatewayOutdated`], [`ResumeStep::DomainConflict`],
-///   [`ResumeStep::InstallDeadlinePassed`]: stopped, with everything in place.
+///   [`ResumeStep::CampaignClosing`], [`ResumeStep::InstallDeadlinePassed`]: stopped,
+///   with everything in place.
 ///
 /// An `Err` is a call that failed, and the journal says what remains. The next look
 /// resumes from it.
@@ -874,6 +875,7 @@ pub fn advance(
             }
             stop @ (ResumeStep::GatewayOutdated
             | ResumeStep::DomainConflict
+            | ResumeStep::CampaignClosing
             | ResumeStep::InstallDeadlinePassed
             | ResumeStep::Finished) => return Ok(stop),
         }
