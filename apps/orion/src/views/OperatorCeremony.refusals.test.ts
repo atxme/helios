@@ -109,6 +109,16 @@ describe('refusalSentence for the issuer delegation', () => {
     expect(sentence).toMatch(/\d{2}:\d{2}:\d{2}/)
   })
 
+  it('a_finish_before_the_end_of_the_overlap_gives_its_date', () => {
+    const sentence = refusalSentence(
+      { refusal: 'overlap_running', until: 1_800_000_000 },
+      null,
+      'rotate_client_tls_ca',
+    )
+    expect(sentence).toMatch(/^Recouvrement jusqu’au .*2027/)
+    expect(sentence).not.toMatch(/Rotation en cours/)
+  })
+
   it('a_key_marked_lost_is_said_at_its_validation_and_at_approval', () => {
     expect(retryLabel({ refusal: 'signer_revoked' }, 'validate_key')).toBe(
       'Clé marquée perdue ou révoquée',

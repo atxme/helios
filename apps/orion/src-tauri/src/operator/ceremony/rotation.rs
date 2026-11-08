@@ -685,7 +685,8 @@ fn refusal_of_finish(error: &anyhow::Error) -> Option<Refusal> {
     error
         .downcast_ref::<FinishRefusal>()
         .map(|refusal| match refusal {
-            FinishRefusal::InFlight | FinishRefusal::NotYet { .. } => Refusal::RotationInFlight,
+            FinishRefusal::InFlight => Refusal::RotationInFlight,
+            FinishRefusal::NotYet { at } => Refusal::OverlapRunning { until: *at },
             FinishRefusal::Nothing => Refusal::NothingToFinish,
             FinishRefusal::Moved => Refusal::DomainChanged,
             FinishRefusal::Mismatch => Refusal::HandoffMismatch,

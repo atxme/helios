@@ -9,7 +9,7 @@ import { KeyRound, X } from 'lucide-react'
 
 import * as api from '../api'
 import { RULE } from '../theme'
-import { formatTime, stopSentence } from './astra/rotationRows'
+import { formatDateTime, formatTime, stopSentence } from './astra/rotationRows'
 import type {
   AstraManifest,
   CampaignManifest,
@@ -597,6 +597,9 @@ export function refusalSentence(
       return 'Durées hors limites. Rien n’a été envoyé.'
     case 'nothing_to_finish':
       return 'Aucune rotation à terminer.'
+    case 'overlap_running':
+      // On this machine's clock, which the row's gateway clock may be ahead of.
+      return `Recouvrement jusqu’au ${formatDateTime(refusal.until)}. Rien n’a été modifié.`
     case 'internal':
       return 'Le processus opérateur s’est arrêté sans conclure.'
   }

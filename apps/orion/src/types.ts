@@ -695,6 +695,7 @@ export type Refusal =
   | { refusal: 'key_not_validated' }
   | { refusal: 'terms_refused' }
   | { refusal: 'nothing_to_finish' }
+  | { refusal: 'overlap_running'; until: number }
   | { refusal: 'internal' }
 
 export interface RecoveryManifest {

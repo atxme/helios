@@ -440,6 +440,9 @@ pub enum Refusal {
     TermsRefused,
     /// No client TLS rotation is waiting to end.
     NothingToFinish,
+    /// The client TLS overlap runs until `until`, on this machine's clock: the
+    /// gateway still requires the outgoing generation. Nothing was modified.
+    OverlapRunning { until: u64 },
     /// Anything the ceremony could not classify. Deliberately last and
     /// deliberately opaque: an unclassified failure must not become a channel
     /// for text.
@@ -992,6 +995,10 @@ mod tests {
         assert_eq!(
             serde_json::to_value(Refusal::CampaignClosing { until: 7 }).expect("refusal"),
             serde_json::json!({ "refusal": "campaign_closing", "until": 7 })
+        );
+        assert_eq!(
+            serde_json::to_value(Refusal::OverlapRunning { until: 9 }).expect("refusal"),
+            serde_json::json!({ "refusal": "overlap_running", "until": 9 })
         );
     }
 

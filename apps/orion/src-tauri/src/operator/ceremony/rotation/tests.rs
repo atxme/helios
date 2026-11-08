@@ -2103,10 +2103,14 @@ fn finishing_too_early_or_with_nothing_asks_no_key() {
     ran.refused(Refusal::NothingToFinish);
     assert!(ran.asked_no_key());
 
+    // The row reads the gateway's clock and this refusal the workstation's: it gives the
+    // date, and does not call the overlap a rotation to lead first.
     let record = bench.rotated_client_tls();
     bench.set_clock(record.not_after - 1);
     let ran = bench.drive(RotationGesture::FinishCaTls, Bench::all_the_way);
-    ran.refused(Refusal::RotationInFlight);
+    ran.refused(Refusal::OverlapRunning {
+        until: record.not_after,
+    });
     assert!(ran.asked_no_key());
     assert_eq!(bench.record(), Some(record));
 }
