@@ -99,6 +99,15 @@ describe('refusalSentence for the issuer delegation', () => {
     expect(sentence).toMatch(/conservée/)
   })
 
+  it('a_key_marked_lost_is_said_at_its_validation_and_at_approval', () => {
+    expect(retryLabel({ refusal: 'signer_revoked' }, 'validate_key')).toBe(
+      'Clé marquée perdue ou révoquée',
+    )
+    expect(refusalSentence({ refusal: 'signer_revoked' }, null, 'rotate_anchor')).toBe(
+      'Clé validée marquée perdue ou révoquée. Recommencer avec une clé active.',
+    )
+  })
+
   it('a_validation_says_what_the_key_is_asked', () => {
     const asked = { awaiting_key: { index: 1, of: 2, purpose: 'validate_key' as const } }
     expect(gestureSentence(asked, 'rotate_anchor')).toBe(

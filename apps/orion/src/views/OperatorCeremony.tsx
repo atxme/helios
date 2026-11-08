@@ -401,6 +401,9 @@ function rotationRefusal(
       return kept('Gateway injoignable')
     case 'gateway_refused':
       return kept(`Gateway refuse l’installation (HTTP ${refusal.status})`)
+    case 'signer_revoked':
+      // Found by `open`, once both keys were validated: the ceremony starts again.
+      return 'Clé validée marquée perdue ou révoquée. Recommencer avec une clé active.'
     case 'window_expired':
       // At the key steps and the terms nothing exists at the authority, and the keys
       // held in memory are what ran out.
@@ -425,6 +428,8 @@ export function retryLabel(retry: Refusal, purpose: KeyPurpose | null): string {
       return purpose === 'validate_key' ? 'Même clé que la clé 1' : 'Clé déjà approuvée'
     case 'key_not_enrolled':
       return 'Clé absente du coffre'
+    case 'signer_revoked':
+      return 'Clé marquée perdue ou révoquée'
     case 'key_not_validated':
       return 'Autre clé attendue'
     case 'key_declined':

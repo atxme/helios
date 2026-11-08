@@ -399,8 +399,8 @@ pub enum Refusal {
     /// The domain moved between the manifest shown and the press: what would
     /// be signed is no longer what the operator saw. Nothing was signed.
     DomainChanged,
-    /// The credential document revokes the key that answered: it cannot
-    /// approve.
+    /// The credential document revokes the key that answered, or marks it
+    /// lost: it cannot approve.
     SignerRevoked,
     /// The file is not a delegation request that can be read: nothing was
     /// signed.
@@ -415,8 +415,9 @@ pub enum Refusal {
     /// Astra knows nothing of a rotation whose campaign died, and the vault never
     /// moved. Its journal is gone: the rotation is started again.
     RotationExpired,
-    /// The domain contradicts the rotation's journal. Nothing moved and nothing
-    /// was cleared: it is not for this machine to choose.
+    /// The domain contradicts the rotation's journal, or Astra and the vault name
+    /// different anchors before any campaign. Nothing moved and nothing was
+    /// cleared: it is not for this machine to choose.
     DomainConflict,
     /// The transition did not reach the gateway before `activation_at`. The gateway
     /// refuses it from now on, and no repair exists.

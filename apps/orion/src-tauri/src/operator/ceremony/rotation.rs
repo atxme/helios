@@ -23,8 +23,8 @@ use aether::certificates::operator_session::{
 };
 use aether_fido::authenticator::Authenticator;
 use astra_operator::operations::rotation::{
-    self, CaTlsFinish, FinishRefusal, KeyStep, OpenedRotation, RotationRemote, RotationTerms,
-    ValidatedKeys,
+    self, CaTlsFinish, FinishRefusal, KeyStep, OpenRefusal, OpenedRotation, RotationRemote,
+    RotationTerms, ValidatedKeys,
 };
 use astra_operator::rotation_journal::{
     self, JournalStage, ResumeStep, RotationJournal, RotationKind,
@@ -479,6 +479,7 @@ impl RotationRun<'_> {
     fn turned_down(&mut self, step: KeyStep) -> Step<()> {
         let retry = match step {
             KeyStep::NotEnrolled => Refusal::KeyNotEnrolled,
+            KeyStep::NotApprovable => Refusal::SignerRevoked,
             KeyStep::Repeated => Refusal::KeyRepeated,
             KeyStep::NotValidated => Refusal::KeyNotValidated,
             KeyStep::Declined => Refusal::KeyDeclined,
@@ -630,6 +631,13 @@ fn is_deposited(journal: &RotationJournal) -> bool {
 fn refusal_of_open(error: &anyhow::Error) -> Refusal {
     if tunnel::is_unreachable(error) {
         return Refusal::GatewayUnavailable;
+    }
+    if let Some(refused) = error.downcast_ref::<OpenRefusal>() {
+        return match refused {
+            OpenRefusal::KeyNotApprovable => Refusal::SignerRevoked,
+            OpenRefusal::RotationInFlight | OpenRefusal::CaTlsToFinish => Refusal::RotationInFlight,
+            OpenRefusal::AnchorsDisagree => Refusal::DomainConflict,
+        };
     }
     match error.downcast_ref::<TunnelRefusal>() {
         Some(refused) => Refusal::AuthorityRefused {

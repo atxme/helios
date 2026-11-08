@@ -881,10 +881,8 @@ fn a_rotation_is_refused_over_a_prepared_record() {
     assert!(!remote.called("open_campaign"));
 }
 
-/// It opens the vault and approves nothing: found out now, and not at the touch.
-#[test]
-fn a_validated_key_the_document_marks_lost_opens_nothing() {
-    let domain = domain();
+/// Marks the second key lost in the document beside the vault, with the third.
+fn mark_second_key_lost(domain: &Domain) {
     let vault = store::load(&domain.path).expect("vault");
     let identity = handoff::identity_of(&domain.relay()).expect("identity");
     let opening = gestures::open_with_authorized_key(&domain.keys[2], &vault, "").expect("opened");
@@ -898,18 +896,45 @@ fn a_validated_key_the_document_marks_lost_opens_nothing() {
     )
     .expect("signed");
     credentials::save(&credentials::path_beside(&domain.path), &document).expect("saved");
+}
+
+/// It opens the vault and approves nothing: found out at its validation, while the
+/// operator still holds it and can present another, and not after both touches.
+#[test]
+fn a_key_the_document_marks_lost_is_turned_down_at_its_validation() {
+    let domain = domain();
+    mark_second_key_lost(&domain);
+    let mut keys = ValidatedKeys::new(&domain.path).expect("keys");
+    keys.validate(&domain.keys[0]).expect("active");
+    assert_eq!(keys.validate(&domain.keys[1]), Err(KeyStep::NotApprovable));
+    assert_eq!(keys.count(), 1, "nothing kept of it");
+    keys.validate(&domain.keys[2])
+        .expect("another key is taken");
+}
+
+/// The document changed after the validation: `open` still finds it, before any campaign,
+/// and says so as its own refusal.
+#[test]
+fn a_validated_key_the_document_marks_lost_opens_nothing() {
+    let domain = domain();
+    let keys = domain.validated(&[0, 1]);
+    mark_second_key_lost(&domain);
 
     let remote = domain.armed_remote();
-    let keys = domain.validated(&[0, 1]);
-    assert!(open(
+    let refused = open(
         &remote,
         &domain.path,
         RotationKind::CaPq,
         keys,
         &terms(),
-        NOW
+        NOW,
     )
-    .is_err());
+    .err()
+    .expect("refused");
+    assert_eq!(
+        refused.downcast_ref::<OpenRefusal>(),
+        Some(&OpenRefusal::KeyNotApprovable)
+    );
     assert!(!remote.called("open_campaign"));
 }
 
@@ -929,7 +954,13 @@ fn a_rotation_is_refused_while_the_authority_has_one_in_flight() {
             overlap(&mut status);
             *remote.authority.borrow_mut() = Some(status);
             let keys = domain.validated(&[0, 1]);
-            assert!(open(&remote, &domain.path, kind, keys, &terms(), NOW).is_err());
+            let refused = open(&remote, &domain.path, kind, keys, &terms(), NOW)
+                .err()
+                .expect("refused");
+            assert_eq!(
+                refused.downcast_ref::<OpenRefusal>(),
+                Some(&OpenRefusal::RotationInFlight)
+            );
             assert!(!remote.called("open_campaign"));
         }
     }
@@ -979,8 +1010,14 @@ fn a_vault_out_of_step_with_astra_opens_no_campaign() {
             shift(&mut status);
             *remote.authority.borrow_mut() = Some(status);
             let keys = domain.validated(&[0, 1]);
-            let refused = open(&remote, &domain.path, *kind, keys, &terms(), NOW);
-            assert!(refused.is_err(), "{label}, {kind:?}");
+            let refused = open(&remote, &domain.path, *kind, keys, &terms(), NOW)
+                .err()
+                .unwrap_or_else(|| panic!("{label}, {kind:?}"));
+            assert_eq!(
+                refused.downcast_ref::<OpenRefusal>(),
+                Some(&OpenRefusal::AnchorsDisagree),
+                "{label}, {kind:?}"
+            );
             assert!(!remote.called("open_campaign"), "{label}, {kind:?}");
             assert!(!remote.called("fetch_campaign"), "{label}, {kind:?}");
         }
@@ -1058,15 +1095,20 @@ fn a_vault_with_a_client_tls_window_still_open_opens_nothing() {
 
     let remote = domain.armed_remote();
     let keys = domain.validated(&[0, 1]);
-    assert!(open(
+    let refused = open(
         &remote,
         &domain.path,
         RotationKind::CaTls,
         keys,
         &terms(),
-        NOW
+        NOW,
     )
-    .is_err());
+    .err()
+    .expect("refused");
+    assert_eq!(
+        refused.downcast_ref::<OpenRefusal>(),
+        Some(&OpenRefusal::CaTlsToFinish)
+    );
     assert!(!remote.called("open_campaign"));
 }
 

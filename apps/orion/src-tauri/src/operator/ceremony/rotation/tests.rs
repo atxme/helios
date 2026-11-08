@@ -938,6 +938,64 @@ fn a_key_outside_the_vault_publishes_a_retry() {
     ran.cancelled();
 }
 
+/// A key the document marks lost opens the vault and approves nothing: turned down at its
+/// validation, with another key still welcome, rather than after both touches.
+#[test]
+fn a_key_marked_lost_publishes_a_retry_at_its_validation() {
+    let bench = bench();
+    let vault = store::load(&bench.path).expect("vault");
+    let opening =
+        gestures::open_with_authorized_key(bench.keys[0].as_ref(), &vault, "").expect("opened");
+    let lost = vault
+        .slot_for_credential(&bench.keys[1].credential_id())
+        .expect("slot")
+        .slot_id;
+    astra_operator::vault_gestures::mark_key_with(&bench.path, &opening, &lost, true, NOW)
+        .expect("marked");
+    let mut tried = false;
+    let ran = bench.drive(RotationGesture::ReplaceCaPq, |status, bench| {
+        if awaits_validation(status, 2) {
+            if !tried {
+                tried = true;
+                bench.plug(1);
+                return proceed(status);
+            }
+            assert_eq!(status.key_retry, Some(Refusal::SignerRevoked));
+            assert_eq!(status.keys.len(), 1, "the first key stays validated");
+            return cancel_it(status);
+        }
+        Bench::all_the_way(status, bench)
+    });
+    ran.cancelled();
+    assert!(tried);
+}
+
+/// What `open` refuses of the domain is said as what it is, and not as a relay that
+/// does not match: the operator spent two touches, and needs to know why.
+#[test]
+fn the_refusals_at_approval_are_worded_by_their_cause() {
+    let overlap = |bench: &Bench| OperatorAuthorityStatus {
+        next_ca_fingerprint: Some(Fingerprint::of(b"suivante")),
+        ..bench.nothing_in_flight()
+    };
+    let other_anchor = |bench: &Bench| OperatorAuthorityStatus {
+        ca_fingerprint: Fingerprint::of(b"une autre ancre"),
+        ..bench.nothing_in_flight()
+    };
+    type Status = fn(&Bench) -> OperatorAuthorityStatus;
+    let rows: [(Status, Refusal); 2] = [
+        (overlap, Refusal::RotationInFlight),
+        (other_anchor, Refusal::DomainConflict),
+    ];
+    for (status, refusal) in rows {
+        let bench = bench();
+        *bench.remote.authority.lock().expect("lock") = Some(status(&bench));
+        let ran = bench.drive(RotationGesture::ReplaceCaPq, Bench::all_the_way);
+        ran.refused(refusal);
+        assert!(!bench.remote.called("open_campaign"));
+    }
+}
+
 /// No key plugged in, or a dialog that could not come up: nothing is lost by it.
 #[test]
 fn a_key_out_of_reach_publishes_a_retry() {

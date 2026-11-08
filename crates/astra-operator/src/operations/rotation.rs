@@ -94,6 +94,10 @@ pub enum KeyStep {
     /// This key does not open the vault.
     #[error("clé absente du coffre")]
     NotEnrolled,
+    /// This key opens the vault, and the credential document marks it lost or revoked:
+    /// it approves nothing, and another key can take its place.
+    #[error("clé marquée perdue ou révoquée")]
+    NotApprovable,
     /// This key has already answered: two touches of one token are not two people.
     #[error("clé déjà utilisée")]
     Repeated,
@@ -107,6 +111,26 @@ pub enum KeyStep {
     /// The campaign's window closed. Nothing was signed.
     #[error("campagne expirée")]
     Expired,
+}
+
+/// What [`open`] refuses of the domain before any campaign, by its cause. Anything else
+/// it refuses is a call that failed, or files that do not describe this domain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum OpenRefusal {
+    /// A validated key is no longer active in the credential document.
+    #[error(
+        "une clé validée n'est pas active dans le document de credentials. Rien n'a été signé."
+    )]
+    KeyNotApprovable,
+    /// Astra has a CA rotation in flight, of either kind.
+    #[error("une rotation de CA est en cours sur le domaine. Rien n'a été signé.")]
+    RotationInFlight,
+    /// The vault still holds a client TLS window, until « Terminer ».
+    #[error("la rotation CA TLS en cours reste à terminer. Rien n'a été signé.")]
+    CaTlsToFinish,
+    /// Astra and this vault do not name the same anchors.
+    #[error("Astra et ce coffre ne nomment pas la même ancre. Rien n'a été signé.")]
+    AnchorsDisagree,
 }
 
 /// What the operator chose on the approval screen.
@@ -187,6 +211,10 @@ impl RotationRemote for Tunnel {
 /// openings stay on the thread of the ceremony that asked for them.
 pub struct ValidatedKeys {
     vault: AuthorityVault,
+    /// The credential document beside the vault, read as it is to turn a key marked lost
+    /// down at its validation. Not trusted for anything else: [`open`] checks the keys
+    /// again against the document it has verified under `CA-PQ`.
+    registry: Option<Box<CredentialRegistry>>,
     openings: Vec<Opened>,
     _thread: PhantomData<*const ()>,
 }
@@ -195,6 +223,7 @@ impl ValidatedKeys {
     pub fn new(vault_path: &Path) -> Result<Self> {
         Ok(Self {
             vault: store::load(vault_path)?,
+            registry: credentials::load(&credentials::path_beside(vault_path))?.map(Box::new),
             openings: Vec::with_capacity(ANCHOR_ROTATION_CREDENTIALS),
             _thread: PhantomData,
         })
@@ -212,6 +241,12 @@ impl ValidatedKeys {
             return Err(KeyStep::Repeated);
         }
         gestures::prove_anchors_open(&self.vault, &opened).map_err(|_| KeyStep::NotEnrolled)?;
+        // With no document, `open` refuses before any campaign, whatever the keys.
+        if let Some(registry) = &self.registry {
+            if !may_approve(registry, &opened.credential_id) {
+                return Err(KeyStep::NotApprovable);
+            }
+        }
         let label = self
             .vault
             .slot_for_credential(&opened.credential_id)
@@ -510,18 +545,25 @@ fn ensure_same_vault(vault_path: &Path, vault: &AuthorityVault) -> Result<()> {
     Ok(())
 }
 
+/// Whether the document lets this credential approve: `active`, and nothing else.
+fn may_approve(registry: &CredentialRegistry, credential_id: &[u8]) -> bool {
+    registry
+        .approvable()
+        .iter()
+        .any(|binding| binding.credential_id == credential_id)
+}
+
 /// A key the document marks lost or revoked opens the vault and approves nothing.
 fn ensure_keys_may_approve(keys: &ValidatedKeys, registry: &CredentialRegistry) -> Result<()> {
-    let approvable = registry.approvable();
-    for opening in &keys.openings {
-        if !approvable
-            .iter()
-            .any(|binding| binding.credential_id == opening.credential_id)
-        {
-            bail!("une clé validée n'est pas active dans le document de credentials");
-        }
+    if keys
+        .openings
+        .iter()
+        .all(|opening| may_approve(registry, &opening.credential_id))
+    {
+        Ok(())
+    } else {
+        Err(OpenRefusal::KeyNotApprovable.into())
     }
-    Ok(())
 }
 
 /// A client TLS window Astra has already closed at `not_after` stays open in the
@@ -530,7 +572,7 @@ fn ensure_no_window_open(keys: &ValidatedKeys) -> Result<()> {
     let opening = &keys.openings[0];
     let secrets = keys.vault.open(&opening.credential_id, &opening.secret)?;
     if secrets.retained_ca_tls.is_some() {
-        bail!("la rotation CA TLS en cours reste à terminer. Rien n'a été signé.");
+        return Err(OpenRefusal::CaTlsToFinish.into());
     }
     Ok(())
 }
@@ -540,7 +582,7 @@ fn ensure_no_window_open(keys: &ValidatedKeys) -> Result<()> {
 /// so a transition would be refused after the touches.
 fn ensure_no_overlap(authority: &OperatorAuthorityStatus) -> Result<()> {
     if authority.next_ca_fingerprint.is_some() || authority.next_ca_tls_fingerprint.is_some() {
-        bail!("une rotation de CA est en cours sur le domaine. Rien n'a été signé.");
+        return Err(OpenRefusal::RotationInFlight.into());
     }
     Ok(())
 }
@@ -559,7 +601,7 @@ fn ensure_same_anchors(authority: &OperatorAuthorityStatus, domain: &LocalDomain
             && authority.ca_tls_fingerprint == Some(active.fingerprint())
     });
     if !(ca_pq_agrees && client_tls_agrees) {
-        bail!("Astra et ce coffre ne nomment pas la même ancre. Rien n'a été signé.");
+        return Err(OpenRefusal::AnchorsDisagree.into());
     }
     Ok(())
 }
