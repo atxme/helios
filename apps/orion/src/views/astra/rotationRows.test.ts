@@ -153,7 +153,11 @@ describe('finish and resume', () => {
       nextFingerprint: 'aa',
       offline: false,
     }
-    expect(row(overview({ resumable: true, journal }), 'resume')?.state).toMatch(/délai dépassé/)
+    // Local data and the workstation clock: a Signed journal Astra never heard of, or an
+    // Applied one already on the gateway, resume harmlessly. Not a dead end yet.
+    const state = row(overview({ resumable: true, journal }), 'resume')?.state ?? ''
+    expect(state).toMatch(/Délai d’installation passé : à vérifier à la connexion/)
+    expect(state).not.toMatch(/Intervention manuelle/)
   })
 })
 
@@ -531,8 +535,14 @@ describe('the journal line', () => {
     expect(line.text).toMatch(/^Rotation CA-PQ · à installer avant le /)
   })
 
-  it('past_the_activation_it_is_blocking_with_the_cut_date', () => {
+  it('past_the_activation_it_is_to_check_at_the_connection_and_not_a_dead_end', () => {
     const line = journalLine({ ...journal, activationAt: NOW - DAY }, NOW)
+    expect(line.blocking).toBe(false)
+    expect(line.text).toBe('Rotation CA-PQ · Délai d’installation passé : à vérifier à la connexion')
+  })
+
+  it('a_resumption_that_found_the_deadline_passed_is_blocking_with_the_cut_date', () => {
+    const line = journalLine({ ...journal, activationAt: NOW - DAY }, NOW, true)
     expect(line.blocking).toBe(true)
     expect(line.text).toMatch(/^Délai dépassé le /)
     expect(line.text).toMatch(/Coupure le /)

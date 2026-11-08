@@ -380,7 +380,11 @@ export function AstraView({
   )
 
   // A rotation signed and not finished has a deadline whether or not a session shows it.
-  const inFlight = journal ? journalLine(journal, Math.floor(Date.now() / 1000)) : null
+  // Blocking only on the resumption's own answer: the journal and this clock cannot tell.
+  const deadlineStop = automaticStop?.refusal?.refusal === 'install_deadline_passed'
+  const inFlight = journal
+    ? journalLine(journal, Math.floor(Date.now() / 1000), deadlineStop)
+    : null
 
   const panels: Record<AstraTab, ReactNode> = {
     'Enrôlement': <EnrollmentOperatorPanel onCeremony={openCeremony} />,

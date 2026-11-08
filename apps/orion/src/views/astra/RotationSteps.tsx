@@ -28,11 +28,11 @@ import {
 } from '../OperatorCeremony'
 import type { RotationStepContext } from './RotationsPanel'
 import {
+  INSTALL_DEADLINE_TO_CHECK,
   formatDate,
   formatDateTime,
   formatTime,
   liveOperation,
-  stopSentence,
   valueOf,
 } from './rotationRows'
 
@@ -234,7 +234,9 @@ function FollowUp({
   else if (installed) copy = 'waiting'
 
   const incoming = manifest?.next_anchor_fingerprint || journal?.nextFingerprint || null
-  const blocking =
+  // From the journal and this clock alone: the resumption's own refusal is the dead end,
+  // said by the ceremony.
+  const toCheck =
     dates !== null &&
     !installed &&
     now >= dates.activationAt &&
@@ -268,9 +270,9 @@ function FollowUp({
           </Typography>
         </Box>
       )}
-      {blocking && dates && (
-        <Alert severity="error" variant="outlined" sx={{ mt: 1, fontSize: 11.5 }}>
-          {stopSentence('install_deadline_passed', dates)}
+      {toCheck && (
+        <Alert severity="warning" variant="outlined" sx={{ mt: 1, fontSize: 11.5 }}>
+          {INSTALL_DEADLINE_TO_CHECK}
         </Alert>
       )}
     </Box>

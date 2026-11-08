@@ -438,12 +438,14 @@ describe('the follow-up', () => {
     expect(text).toMatch(/Intervention manuelle requise/)
   })
 
-  it('an install past activation is blocking even with no refusal', () => {
+  // Read from the journal and this clock alone, it may resume harmlessly: only the
+  // resumption's own answer is a dead end.
+  it('an install past activation with no refusal is to check, not blocking', () => {
     shown(finished({ gesture: 'idle', remote: 'deposited' }), {
       journal: journal({ stage: 'applied', activationAt: NOW - 60 * 86_400, notAfter: NOW - 30 * 86_400 }),
     })
-    const text = screen.getByText(/^Délai dépassé/).textContent ?? ''
-    expect(text).toMatch(/Intervention manuelle requise/)
+    expect(screen.getByText('Délai d’installation passé : à vérifier à la connexion')).toBeTruthy()
+    expect(screen.queryByText(/Intervention manuelle requise/)).toBeNull()
   })
 
   it('a gateway that cannot be reached says nothing of admission.txt', () => {

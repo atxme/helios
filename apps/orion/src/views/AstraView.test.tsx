@@ -691,6 +691,39 @@ describe('AstraView', () => {
       expect(screen.getByRole('tab', { name: /Rotations/ }).textContent).toMatch(/1$/)
     })
 
+    it('a_deadline_passed_on_local_data_alone_is_to_check_and_not_a_dead_end', async () => {
+      const past = { activationAt: Math.floor(Date.now() / 1000) - DAY }
+      api.operatorRotationsOverview.mockResolvedValue(
+        fullOverview({ resumable: true, journal: journal(past) }),
+      )
+      render(<AstraView />)
+      const line = await screen.findByText(
+        'Rotation CA-PQ · Délai d’installation passé : à vérifier à la connexion',
+      )
+      expect(line.closest('.MuiAlert-colorWarning')).toBeTruthy()
+      expect(screen.queryByText(/Intervention manuelle requise/)).toBeNull()
+    })
+
+    it('a_resumption_that_met_the_deadline_makes_the_line_blocking', async () => {
+      const past = { activationAt: Math.floor(Date.now() / 1000) - DAY }
+      api.operatorCeremonyStatus.mockResolvedValue({
+        automatic: true,
+        session_id: '2'.repeat(32),
+        revision: 6,
+        operation: 'rotate_anchor',
+        remote: 'prepared',
+        gesture: 'failed',
+        allowed: [],
+        refusal: { refusal: 'install_deadline_passed' },
+      })
+      api.operatorRotationsOverview.mockResolvedValue(
+        fullOverview({ resumable: true, journal: journal(past) }),
+      )
+      render(<AstraView />)
+      const line = await screen.findByText(/^Délai dépassé le .*Intervention manuelle requise/)
+      expect(line.closest('.MuiAlert-colorError')).toBeTruthy()
+    })
+
     it('says_nothing_when_no_rotation_is_in_flight', async () => {
       render(<AstraView />)
       await waitFor(() => expect(api.operatorRotationsOverview).toHaveBeenCalled())

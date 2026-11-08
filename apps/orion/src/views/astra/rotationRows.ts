@@ -50,6 +50,12 @@ export const AUTHORITY_UNREAD = 'Autorité non lue'
 const OVERLAP_TLS = 'Recouvrement CA TLS en cours'
 const ROTATION_PENDING = 'Rotation à reprendre'
 const VAULT_AHEAD = 'Le coffre a une époque d’avance'
+/**
+ * Past `activation_at` on the journal and this machine's clock alone. Not the dead end: a
+ * Signed journal Astra never heard of is discarded, and an Applied one the gateway already
+ * holds only sends its copy. The resumption's own answer says which.
+ */
+export const INSTALL_DEADLINE_TO_CHECK = 'Délai d’installation passé : à vérifier à la connexion'
 
 const TITLES: Record<RotationAction, string> = {
   finish_ca_tls: 'Terminer la rotation CA TLS',
@@ -219,7 +225,7 @@ function resumeRow(o: RotationsOverview, now: number): RotationRow | null {
     if (journal.stage !== 'installed') {
       parts.push(
         now >= journal.activationAt
-          ? `délai dépassé le ${formatDateTime(journal.activationAt)}`
+          ? INSTALL_DEADLINE_TO_CHECK
           : `installation avant le ${formatDateTime(journal.activationAt)}`,
       )
     }
@@ -590,18 +596,23 @@ export function stopSentence(
 
 /**
  * What a journal in flight says wherever the operator is, with no session to carry it:
- * the install deadline, or the cut that passed. Blocking when no repair exists any more.
+ * the install deadline, or that it passed. Blocking only once a resumption has answered
+ * `install_deadline_passed` (`deadlineStop`): no repair exists any more.
  */
 export function journalLine(
   journal: RotationJournalView,
   now: number,
+  deadlineStop = false,
 ): { text: string; blocking: boolean } {
   const kind = KINDS[journal.kind]
   if (journal.stage === 'installed') {
     return { text: `Rotation ${kind} · copie du coffre en attente`, blocking: false }
   }
-  if (now >= journal.activationAt) {
+  if (deadlineStop) {
     return { text: stopSentence('install_deadline_passed', journal), blocking: true }
+  }
+  if (now >= journal.activationAt) {
+    return { text: `Rotation ${kind} · ${INSTALL_DEADLINE_TO_CHECK}`, blocking: false }
   }
   return {
     text: `Rotation ${kind} · à installer avant le ${formatDateTime(journal.activationAt)}`,
