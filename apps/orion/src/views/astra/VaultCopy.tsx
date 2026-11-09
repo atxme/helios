@@ -6,12 +6,7 @@ import Paper from '@mui/material/Paper'
 import Typography from '@mui/material/Typography'
 
 import * as api from '../../api'
-import type {
-  OperationKind,
-  OperatorStatus,
-  RotationsOverview,
-  VaultCopyOutcome,
-} from '../../types'
+import type { OperationKind, OperatorStatus, RotationsOverview, VaultCopyOutcome } from '../../types'
 import { PrerequisiteLine } from './RotationsPanel'
 import { valueOf, vaultCopyPrerequisite } from './rotationRows'
 
@@ -32,15 +27,30 @@ function outcomeLine(outcome: VaultCopyOutcome): { text: string; complete: boole
 }
 
 /**
- * A send held back or failed and not yet delivered. It is kept outside the components, as the
- * sent-once set is, so the line and its « Réessayer l’envoi » survive a change of view.
+ * A send held back or failed and not yet delivered, with the vault it was meant for and the
+ * session that sent it. It is kept outside the components, as the sent-once set is, so the line
+ * and its « Réessayer l’envoi » survive a change of view.
  */
-let unsettled: { text: string } | null = null
+type Unsettled = { text: string; vault: string | null; sessionId: string | null }
+
+let unsettled: Unsettled | null = null
 const unsettledListeners = new Set<() => void>()
 
-function setUnsettled(next: { text: string } | null) {
+function setUnsettled(next: Unsettled | null) {
   unsettled = next
   for (const listener of unsettledListeners) listener()
+}
+
+/**
+ * A copy for this vault, or a retry from this session, reached Astra: the entry it settles goes.
+ * An entry is never cleared by another vault's copy.
+ */
+function clearUnsettled(vault: string | null, sessionId: string | null) {
+  const current = unsettled
+  if (!current) return
+  const sameVault = vault !== null && current.vault === vault
+  const sameSession = sessionId !== null && current.sessionId === sessionId
+  if (sameVault || sameSession) setUnsettled(null)
 }
 
 function subscribeUnsettled(listener: () => void) {
@@ -50,21 +60,39 @@ function subscribeUnsettled(listener: () => void) {
   }
 }
 
-function useUnsettled(): { text: string } | null {
+function useUnsettled(): Unsettled | null {
   return useSyncExternalStore(subscribeUnsettled, () => unsettled)
+}
+
+/** For tests only: the store outlives a rendered view, so each test starts with none. */
+export function resetForTests(): void {
+  setUnsettled(null)
+}
+
+/** The fingerprint of the local vault, or `null` when it cannot be read. */
+async function readVault(): Promise<string | null> {
+  try {
+    return (await api.operatorRotationsOverview()).localVaultFingerprint ?? null
+  } catch {
+    return null
+  }
 }
 
 /**
  * Sends the vault copy through the manual send. A send held back or failed stays on the line
- * until a send goes through; the outcome of one that reached Astra is returned.
+ * until a send for the same vault goes through; the outcome of one that reached Astra is returned.
  */
-async function sendVaultCopy(): Promise<{ text: string; complete: boolean } | null> {
+async function sendVaultCopy(
+  vault: string | null,
+  sessionId: string | null,
+): Promise<{ text: string; complete: boolean } | null> {
   try {
     const outcome = await api.operatorSendVaultCopy()
-    setUnsettled(outcome.state === 'held_back' ? { text: HELD_BACK } : null)
+    if (outcome.state === 'held_back') setUnsettled({ text: HELD_BACK, vault, sessionId })
+    else clearUnsettled(vault, sessionId)
     return outcomeLine(outcome)
   } catch (cause) {
-    setUnsettled({ text: `Copie non envoyée à Astra : ${String(cause)}` })
+    setUnsettled({ text: `Copie non envoyée à Astra : ${String(cause)}`, vault, sessionId })
     return null
   }
 }
@@ -111,14 +139,21 @@ const sentAfter = new Set<string>()
 export function KeyChangeCopy({ status }: { status: OperatorStatus }) {
   const applies = status.gesture === 'done' && KEY_CHANGES.includes(status.operation)
   const pending = useUnsettled()
+  const [vault, setVault] = useState<string | null>(null)
   const [line, setLine] = useState<{ text: string; complete: boolean } | null>(null)
   const [sending, setSending] = useState(false)
 
   const send = useCallback(async () => {
     setSending(true)
-    setLine(await sendVaultCopy())
+    const found = await readVault()
+    setVault(found)
+    setLine(await sendVaultCopy(found, status.session_id))
     setSending(false)
-  }, [])
+  }, [status.session_id])
+
+  useEffect(() => {
+    if (applies) void readVault().then(setVault)
+  }, [applies])
 
   useEffect(() => {
     if (!applies || sentAfter.has(status.session_id)) return
@@ -127,7 +162,11 @@ export function KeyChangeCopy({ status }: { status: OperatorStatus }) {
   }, [applies, status.session_id, send])
 
   if (!applies) return null
-  if (pending) {
+  // An entry of this session, or of this vault, is what this screen answers for.
+  const unsent =
+    pending !== null &&
+    (pending.sessionId === status.session_id || (vault !== null && pending.vault === vault))
+  if (unsent && pending) {
     return <UnsettledAlert text={pending.text} sending={sending} onRetry={() => void send()} />
   }
   if (!line) {
@@ -167,12 +206,16 @@ function documentWaitsForOverlap(o: RotationsOverview): boolean {
 export function VaultCopyLine() {
   const [overview, setOverview] = useState<RotationsOverview | null>(null)
   const [busy, setBusy] = useState(false)
+  const [subscriptionError, setSubscriptionError] = useState<string | null>(null)
   const pending = useUnsettled()
 
   const read = useCallback(async () => {
     try {
       const found = await api.operatorRotationsOverview()
-      if (found) setOverview(found)
+      if (!found) return
+      setOverview(found)
+      // A current copy has arrived, by whichever route: a send that failed before is not owed.
+      if (vaultCopyPrerequisite(found).ok) clearUnsettled(found.localVaultFingerprint ?? null, null)
     } catch {
       // Unread stays unshown: this line is a reminder, the Rotations tab reports reads.
     }
@@ -194,6 +237,9 @@ export function VaultCopyLine() {
         if (cancelled) stop()
         else unlisten = stop
       })
+      .catch((cause) => {
+        if (!cancelled) setSubscriptionError(String(cause))
+      })
     return () => {
       cancelled = true
       unlisten?.()
@@ -205,10 +251,13 @@ export function VaultCopyLine() {
   const line = documentWaitsForOverlap(overview)
     ? { ...prerequisite, detail: DOCUMENT_WAITS_OVERLAP }
     : prerequisite
+  const vault = overview.localVaultFingerprint ?? null
+  // Only an entry for this vault: another vault's failure is not this line's to show.
+  const unsent = pending !== null && vault !== null && pending.vault === vault ? pending : null
 
   const sendCopy = async () => {
     setBusy(true)
-    await sendVaultCopy()
+    await sendVaultCopy(vault, null)
     await read()
     setBusy(false)
   }
@@ -221,8 +270,13 @@ export function VaultCopyLine() {
       <Box component="ul" sx={{ m: 0, p: 0 }}>
         <PrerequisiteLine line={line} busy={busy} onFix={() => void sendCopy()} />
       </Box>
-      {pending && (
-        <UnsettledAlert text={pending.text} sending={busy} onRetry={() => void sendCopy()} />
+      {unsent && (
+        <UnsettledAlert text={unsent.text} sending={busy} onRetry={() => void sendCopy()} />
+      )}
+      {subscriptionError && (
+        <Alert severity="error" variant="outlined" sx={{ mt: 1, fontSize: 11.5 }}>
+          {`Suivi du tunnel impossible : ${subscriptionError}`}
+        </Alert>
       )}
     </Paper>
   )

@@ -20,6 +20,7 @@ vi.mock('../../api', () => api)
 
 import type { SlotView, VaultOverview } from '../../types'
 import { authorityRead, overview as rotationsOverview } from './rotationFixtures'
+import { resetForTests } from './VaultCopy'
 import { VaultPanel } from './VaultPanel'
 
 const overview: VaultOverview = {
@@ -57,6 +58,7 @@ const slot = (n: number): SlotView => ({
 
 beforeEach(() => {
   vi.clearAllMocks()
+  resetForTests()
   api.operatorOverview.mockResolvedValue(overview)
   api.operatorVaultLocation.mockResolvedValue({
     path: 'C:\\astra',
@@ -429,5 +431,67 @@ describe('VaultPanel', () => {
     render(<VaultPanel onCeremony={vi.fn()} />)
     const line = (await screen.findByText('Copie du coffre')).closest('li') as HTMLElement
     expect(within(line).getByText('Document en attente de la fin du recouvrement')).toBeTruthy()
+  })
+
+  it('an_arrived_copy_clears_the_unsent_line', async () => {
+    let onTunnelEvent: (event: unknown) => void = () => {}
+    api.onEvent.mockImplementation((cb: (event: unknown) => void) => {
+      onTunnelEvent = cb
+      return Promise.resolve(() => {})
+    })
+    // Mount and the read after the failed send find a document ahead of Astra's.
+    api.operatorRotationsOverview
+      .mockResolvedValueOnce(rotationsOverview({ localCredentialRegistryEpoch: 6 }))
+      .mockResolvedValueOnce(rotationsOverview({ localCredentialRegistryEpoch: 6 }))
+    api.operatorSendVaultCopy.mockRejectedValue('la gateway ne répond pas')
+    render(<VaultPanel onCeremony={vi.fn()} />)
+    const line = (await screen.findByText('Copie du coffre')).closest('li') as HTMLElement
+    fireEvent.click(within(line).getByRole('button', { name: 'Envoyer' }))
+    expect(await screen.findByText(/Copie non envoyée à Astra/)).toBeTruthy()
+    // Astra now serves the current copy, by another route: the tunnel comes up.
+    api.operatorRotationsOverview.mockResolvedValue(rotationsOverview({ localCredentialRegistryEpoch: 5 }))
+    act(() => onTunnelEvent({ type: 'state_changed', state: 'up' }))
+    await waitFor(() => expect(screen.queryByText(/Copie non envoyée à Astra/)).toBeNull())
+    expect(screen.queryByRole('button', { name: 'Réessayer l’envoi' })).toBeNull()
+  })
+
+  it('a_failure_for_another_vault_does_not_show', async () => {
+    api.operatorRotationsOverview.mockResolvedValue(
+      rotationsOverview({ localCredentialRegistryEpoch: 6 }),
+    )
+    api.operatorSendVaultCopy.mockRejectedValue('la gateway ne répond pas')
+    const first = render(<VaultPanel onCeremony={vi.fn()} />)
+    const line = (await screen.findByText('Copie du coffre')).closest('li') as HTMLElement
+    fireEvent.click(within(line).getByRole('button', { name: 'Envoyer' }))
+    expect(await screen.findByText(/Copie non envoyée à Astra/)).toBeTruthy()
+    first.unmount()
+
+    api.operatorRotationsOverview.mockResolvedValue(
+      rotationsOverview({ localCredentialRegistryEpoch: 6, localVaultFingerprint: 'aa'.repeat(32) }),
+    )
+    render(<VaultPanel onCeremony={vi.fn()} />)
+    await screen.findByText('Copie du coffre')
+    expect(screen.queryByText(/Copie non envoyée à Astra/)).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Réessayer l’envoi' })).toBeNull()
+  })
+
+  it('overlap_without_a_newer_document_says_nothing', async () => {
+    api.operatorRotationsOverview.mockResolvedValueOnce(
+      rotationsOverview({
+        localCredentialRegistryEpoch: 5,
+        authority: { state: 'ok', value: authorityRead({ next_ca_fingerprint: 'cd'.repeat(32) }) },
+      }),
+    )
+    const first = render(<VaultPanel onCeremony={vi.fn()} />)
+    await screen.findByText('Copie du coffre')
+    expect(screen.queryByText('Document en attente de la fin du recouvrement')).toBeNull()
+    first.unmount()
+
+    api.operatorRotationsOverview.mockResolvedValue(
+      rotationsOverview({ localCredentialRegistryEpoch: 6 }),
+    )
+    render(<VaultPanel onCeremony={vi.fn()} />)
+    await screen.findByText('Copie du coffre')
+    expect(screen.queryByText('Document en attente de la fin du recouvrement')).toBeNull()
   })
 })

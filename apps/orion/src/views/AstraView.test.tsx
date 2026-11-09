@@ -27,6 +27,7 @@ const api = vi.hoisted(() => ({
 vi.mock('../api', () => api)
 
 import { AstraView } from './AstraView'
+import { resetForTests } from './astra/VaultCopy'
 import { DAY, overview as fullOverview } from './astra/rotationFixtures'
 
 const openTab = (name: string | RegExp) => fireEvent.click(screen.getByRole('tab', { name }))
@@ -55,6 +56,7 @@ const rotations = (extra: object = {}) => ({
 
 beforeEach(() => {
   vi.clearAllMocks()
+  resetForTests()
   api.operatorCeremonyStatus.mockResolvedValue(null)
   api.operatorPendingOperations.mockResolvedValue([])
   api.operatorRotationsOverview.mockResolvedValue(rotations())
