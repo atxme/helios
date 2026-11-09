@@ -223,3 +223,98 @@ fn read_authorization(path: Option<&Path>) -> Result<Vec<u8>> {
     );
     Ok(buffer)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request_json() -> String {
+        serde_json::to_string(&astra::issuer::IssuerDelegationRequest {
+            trust_domain_id: "01".repeat(16),
+            issuer_epoch: 7,
+            pq_issuer_public_key: "public-key-base64".into(),
+            tls_intermediate_csr: "csr-base64".into(),
+        })
+        .expect("serialize issuer request")
+    }
+
+    #[test]
+    fn request_output_is_created_empty_and_removed_if_never_filled() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("request.json");
+
+        let output = RequestOut::open(&path).expect("create request output");
+        assert_eq!(std::fs::read(&path).expect("read empty output"), b"");
+        drop(output);
+
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn request_output_preserves_existing_content_until_write_then_replaces_it() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("request.json");
+        std::fs::write(&path, b"old request").expect("seed output");
+
+        let output = RequestOut::open(&path).expect("open existing output");
+        assert_eq!(
+            std::fs::read(&path).expect("read existing output"),
+            b"old request"
+        );
+        output.write("new request").expect("replace request");
+
+        assert_eq!(
+            std::fs::read(&path).expect("read replacement"),
+            b"new request"
+        );
+    }
+
+    #[test]
+    fn invalid_request_does_not_overwrite_a_preexisting_output() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("request.json");
+        std::fs::write(&path, b"keep this request").expect("seed output");
+        let output = RequestOut::open(&path).expect("open existing output");
+
+        assert!(print_issuer_request(Some(output), "not json", None).is_err());
+        assert_eq!(
+            std::fs::read(&path).expect("read preserved output"),
+            b"keep this request"
+        );
+    }
+
+    #[test]
+    fn a_valid_request_replaces_the_output_with_the_original_document() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("request.json");
+        std::fs::write(&path, b"stale request").expect("seed output");
+        let output = RequestOut::open(&path).expect("open existing output");
+        let request = request_json();
+
+        print_issuer_request(Some(output), &request, None).expect("print request");
+
+        assert_eq!(
+            std::fs::read(&path).expect("read request file"),
+            request.as_bytes()
+        );
+    }
+
+    #[test]
+    fn authorization_file_read_is_bounded_and_reports_missing_files() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("authorization.json");
+        let at_limit = vec![b'x'; MAX_DOOR_BODY_BYTES];
+        std::fs::write(&path, &at_limit).expect("write bounded authorization");
+
+        assert_eq!(
+            read_authorization(Some(&path)).expect("read exact limit"),
+            at_limit
+        );
+        std::fs::write(&path, vec![b'x'; MAX_DOOR_BODY_BYTES + 1])
+            .expect("write oversized authorization");
+        assert!(read_authorization(Some(&path)).is_err());
+
+        let absent = directory.path().join("absent.json");
+        assert!(read_authorization(Some(&absent)).is_err());
+    }
+}

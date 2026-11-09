@@ -126,3 +126,116 @@ pub(crate) fn private_listener(
     );
     Ok(Some((bind, config)))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn address() -> SocketAddr {
+        "192.0.2.10:9443".parse().expect("test address")
+    }
+
+    fn generated_pair(path: &Path) -> astra::gateway::TransportIdentities {
+        astra::gateway::initialize_pair(path, false).expect("generate channel identities")
+    }
+
+    #[test]
+    fn channel_open_is_optional_but_never_accepts_a_partial_pairing() {
+        let directory = tempfile::tempdir().expect("temp dir");
+
+        assert!(open_gateway_channel(directory.path(), None, None)
+            .expect("channel is optional")
+            .is_none());
+        assert!(open_gateway_channel(directory.path(), Some(address()), None).is_err());
+        assert!(open_gateway_channel(directory.path(), None, Some("pin")).is_err());
+    }
+
+    #[test]
+    fn channel_open_validates_the_pin_and_builds_without_network_io() {
+        let local = tempfile::tempdir().expect("local identity dir");
+        let gateway_dir = tempfile::tempdir().expect("gateway identity dir");
+        let local_pair = generated_pair(local.path());
+        let gateway_pair = generated_pair(gateway_dir.path());
+
+        assert!(open_gateway_channel(local.path(), Some(address()), Some("not DER")).is_err());
+        // The authority certificate is server-auth; Astra's own client-auth
+        // certificate is not interchangeable with the gateway pin.
+        assert!(open_gateway_channel(
+            local.path(),
+            Some(address()),
+            Some(&local_pair.client.to_base64())
+        )
+        .is_err());
+
+        let channel = open_gateway_channel(
+            local.path(),
+            Some(address()),
+            Some(&gateway_pair.authority.to_base64()),
+        )
+        .expect("construct pinned client without dialing")
+        .expect("configured channel");
+        assert_eq!(channel.address(), address());
+    }
+
+    #[test]
+    fn private_listener_is_optional_and_refuses_half_or_public_bindings() {
+        let directory = tempfile::tempdir().expect("state dir");
+
+        assert!(private_listener(directory.path(), None, None)
+            .expect("listener is optional")
+            .is_none());
+        assert!(private_listener(directory.path(), Some(address()), None).is_err());
+        assert!(private_listener(directory.path(), None, Some("pin")).is_err());
+        assert!(private_listener(
+            directory.path(),
+            Some("0.0.0.0:9443".parse().expect("wildcard")),
+            Some("malformed pin"),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn private_listener_builds_only_from_an_authority_and_client_pin() {
+        let authority_dir = tempfile::tempdir().expect("authority identity dir");
+        let gateway_dir = tempfile::tempdir().expect("gateway identity dir");
+        let authority_pair = generated_pair(authority_dir.path());
+        let gateway_pair = generated_pair(gateway_dir.path());
+
+        assert!(private_listener(authority_dir.path(), Some(address()), Some("not DER"),).is_err());
+        // The gateway's client-auth certificate is the listener's pin.
+        let listener = private_listener(
+            authority_dir.path(),
+            Some(address()),
+            Some(&gateway_pair.client.to_base64()),
+        )
+        .expect("build pinned TLS listener")
+        .expect("configured listener");
+        assert_eq!(listener.0, address());
+        drop(listener.1);
+
+        // A server-auth pin cannot authenticate the gateway's client role.
+        assert!(private_listener(
+            authority_dir.path(),
+            Some(address()),
+            Some(&authority_pair.authority.to_base64()),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn init_channel_creates_an_idempotent_pair_and_explicit_rotation_replaces_it() {
+        let directory = tempfile::tempdir().expect("state dir");
+        init_channel(directory.path(), false).expect("initialize channel");
+        let first = generated_pair(directory.path());
+
+        init_channel(directory.path(), false).expect("reuse channel");
+        let repeated = generated_pair(directory.path());
+        assert_eq!(first.client, repeated.client);
+        assert_eq!(first.authority, repeated.authority);
+
+        init_channel(directory.path(), true).expect("rotate channel");
+        let rotated = generated_pair(directory.path());
+        assert_ne!(first.client, rotated.client);
+        assert_ne!(first.authority, rotated.authority);
+    }
+}

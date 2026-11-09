@@ -202,3 +202,157 @@ fn a_revocation_is_retained_until_its_signed_expiry() {
         1
     );
 }
+
+fn client_tls_transition(
+    anchored: &Anchored,
+    window: TransitionWindow,
+) -> (TrustUpdateObject, Fingerprint) {
+    use aether::certificates::authority::ClientTlsCaTransition;
+
+    let next = aether::certificates::test_x509::client_material("retained-successor").authority;
+    let next_fingerprint = next.fingerprint();
+    let state = anchored.registry.state();
+    let object = ClientTlsCaTransition {
+        format_version: CERTIFICATE_FORMAT_VERSION,
+        trust_domain_id: state.trust_domain_id,
+        ca_epoch: state.ca_epoch,
+        current_ca_tls_epoch: state.ca_tls_epoch,
+        next_ca_tls_epoch: state.ca_tls_epoch + 1,
+        active_client_tls_ca_fingerprint: state
+            .ca_tls_fingerprint
+            .expect("the fixture pins client CA-TLS"),
+        next_client_tls_ca_certificate: next,
+        window,
+        ca_pq_signature: aether::certificates::encoding::MlDsa87Signature::placeholder(),
+    }
+    .sign(&anchored.ca_private)
+    .expect("sign client CA-TLS transition");
+    (
+        TrustUpdateObject::ClientTlsCaTransition(Box::new(object)),
+        next_fingerprint,
+    )
+}
+
+/// A later deposit prunes the expired CA-TLS object but leaves its slot live
+/// until the sweep. A restart must preserve that slot and promote it at expiry.
+#[test]
+fn an_expired_tls_transition_pruned_by_another_deposit_does_not_drop_its_slot() {
+    let mut anchored = anchored();
+    let (tls, expected_tls_fingerprint) = client_tls_transition(
+        &anchored,
+        TransitionWindow::new(1_000, 2_000, 3_000).expect("short TLS window"),
+    );
+    anchored
+        .registry
+        .accept_transitions(&anchor_campaign(), &[tls], None, 2_000)
+        .expect("accept CA-TLS transition");
+    let accepted_tls_slot = anchored
+        .registry
+        .state()
+        .ca_tls_rotation
+        .clone()
+        .expect("CA-TLS slot opened");
+
+    // Deposit CA-PQ at the TLS object's retirement instant, before the
+    // periodic expiry sweep has run. The PQ decision is still within its own
+    // long window, while this deposit's normal retention pass prunes TLS.
+    let pq = transition(&anchored, 1);
+    anchored
+        .registry
+        .accept_transitions(&anchor_campaign(), &[pq], None, 3_000)
+        .expect("accept CA-PQ transition");
+
+    assert_eq!(
+        anchored.registry.state().ca_tls_rotation,
+        Some(accepted_tls_slot.clone())
+    );
+    assert_eq!(anchored.registry.state().transitions.len(), 1);
+    assert!(matches!(
+        &anchored.registry.state().transitions[0].object,
+        TrustUpdateObject::CaTransition(_)
+    ));
+
+    let path = anchored._directory.path().join("astra.json");
+    let restored = AstraRegistry::load(&path, None)
+        .expect("a slot remains valid after its delivery object was pruned");
+    assert_eq!(restored.state().ca_epoch, 1);
+    assert_eq!(restored.state().ca_tls_epoch, 1);
+    assert_eq!(
+        restored.state().ca_tls_rotation,
+        Some(accepted_tls_slot.clone())
+    );
+    assert_eq!(restored.state().transitions.len(), 1);
+
+    let mut restored = restored;
+    restored
+        .forget_expired_transitions(3_000)
+        .expect("promote the retained CA-TLS slot");
+    assert_eq!(restored.state().ca_epoch, 1);
+    assert_eq!(restored.state().ca_tls_epoch, 2);
+    assert_eq!(
+        restored.state().ca_tls_fingerprint,
+        Some(expected_tls_fingerprint)
+    );
+    assert!(restored.state().ca_tls_rotation.is_none());
+    assert_eq!(restored.state().transitions.len(), 1);
+}
+
+/// CA-TLS can remain in overlap after the CA-PQ signer retires. Its explicit
+/// slot survives restart even though its retained object names the old PQ epoch.
+#[test]
+fn ca_tls_rotation_survives_restart_after_its_signing_ca_is_promoted() {
+    let mut anchored = anchored();
+    let pq = transition(&anchored, 1); // retires at 200_000
+    let (tls, next_tls_fingerprint) = client_tls_transition(
+        &anchored,
+        TransitionWindow::new(1_000, 250_000, 300_000).expect("TLS window"),
+    );
+    anchored
+        .registry
+        .accept_transitions(&anchor_campaign(), &[pq, tls], None, 2_000)
+        .expect("accept overlapping CA-PQ and CA-TLS rotations");
+
+    assert!(anchored.registry.state().ca_rotation.is_some());
+    assert_eq!(
+        anchored
+            .registry
+            .state()
+            .ca_tls_rotation
+            .as_ref()
+            .expect("TLS slot opened")
+            .next_ca_tls_fingerprint,
+        next_tls_fingerprint
+    );
+    assert_eq!(anchored.registry.state().transitions.len(), 2);
+
+    // CA-PQ retires first. This prunes its own signed object but keeps the
+    // longer-lived TLS object and slot; the latter was signed at ca_epoch 1.
+    anchored
+        .registry
+        .forget_expired_transitions(200_000)
+        .expect("promote CA-PQ first");
+    assert_eq!(anchored.registry.state().ca_epoch, 2);
+    assert!(anchored.registry.state().ca_rotation.is_none());
+    assert!(anchored.registry.state().ca_tls_rotation.is_some());
+    assert_eq!(anchored.registry.state().transitions.len(), 1);
+
+    let path = anchored._directory.path().join("astra.json");
+    let mut restored = AstraRegistry::load(&path, None)
+        .expect("retain the already-accepted TLS decision under its old signer");
+    assert_eq!(restored.state().ca_epoch, 2);
+    assert_eq!(restored.state().ca_tls_epoch, 1);
+    assert!(restored.state().ca_tls_rotation.is_some());
+    assert_eq!(restored.state().transitions.len(), 1);
+
+    restored
+        .forget_expired_transitions(300_000)
+        .expect("promote CA-TLS after its own overlap");
+    assert_eq!(restored.state().ca_epoch, 2);
+    assert_eq!(restored.state().ca_tls_epoch, 2);
+    assert_eq!(
+        restored.state().ca_tls_fingerprint,
+        Some(next_tls_fingerprint)
+    );
+    assert!(restored.state().ca_tls_rotation.is_none());
+    assert!(restored.state().transitions.is_empty());
+}

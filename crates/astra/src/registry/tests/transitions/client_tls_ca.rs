@@ -312,3 +312,45 @@ fn a_pinned_client_tls_ca_is_not_replaced_by_a_command() {
         .is_err());
     assert_eq!(anchored.registry.state().ca_tls_fingerprint, Some(held));
 }
+
+#[test]
+fn a_legacy_registry_with_ambiguous_client_tls_ca_successors_is_refused() {
+    let mut anchored = anchored();
+    let active = anchored
+        .registry
+        .state()
+        .ca_tls_fingerprint
+        .expect("active CA-TLS fingerprint");
+    let (first, _) = client_tls_ca_transition(&anchored, 1, active);
+    let (competing, _) = client_tls_ca_transition_with_window(
+        &anchored,
+        1,
+        active,
+        "competing-successor",
+        TransitionWindow::new(1_000, 3_500, 5_500).expect("competing window"),
+    );
+    anchored
+        .registry
+        .accept_transitions(&anchor_campaign(), &[first], None, 2_000)
+        .expect("first transition accepted");
+    let mut competing_record = anchored.registry.state.transitions[0].clone();
+    competing_record.object = competing;
+    anchored.registry.state.transitions.push(competing_record);
+    let mut encoded = serde_json::to_value(anchored.registry.state()).expect("encoding");
+    encoded
+        .as_object_mut()
+        .expect("registry object")
+        .remove("ca_tls_rotation");
+    let path = anchored._directory.path().join("astra.json");
+    let bytes = serde_json::to_vec_pretty(&encoded).expect("legacy encoding");
+    std::fs::write(&path, &bytes).expect("legacy registry written");
+    for result in [
+        AstraRegistry::load(&path, None).map(|_| ()),
+        AstraRegistry::read_state(&path, None).map(|_| ()),
+    ] {
+        assert!(
+            matches!(result, Err(RegistryError::Corrupt(message)) if message.contains("multiple client CA-TLS rotations target the active epoch"))
+        );
+    }
+    assert_eq!(std::fs::read(&path).expect("read unchanged file"), bytes);
+}

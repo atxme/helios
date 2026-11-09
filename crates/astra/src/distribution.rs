@@ -42,14 +42,17 @@
 //! chosen. A peer that stays away longer is repaired by an operator, not by a
 //! late delivery.
 //!
-//! # Limite connue : certaines transitions restent sans producteur
+//! # Trust objects are distributed only under their pinned conditions
 //!
-//! [`AstraIssuerAuthorization`](aether::certificates::authority::AstraIssuerAuthorization), the `CA-PQ` transition of §9.1 and emergency
-//! revocations are what this authority holds. `CA-TLS` transitions are refused at the registry
-//! rather than stored — it pins the epoch of that anchor without pinning the
-//! anchor itself, so it could only check such an object against a value the
-//! object carried. Gateway identity transitions have no producer. Pinning
-//! `ca_tls_fingerprint` at `init-trust-domain` is what unblocks the first.
+//! Astra distributes issuer authorizations, CA-PQ transitions, emergency
+//! revocations, client CA-TLS transitions, and gateway identity transitions.
+//! A client CA-TLS transition is accepted only after its active anchor is
+//! pinned with `astra pin-ca-tls`. Gateway transitions are selected only after
+//! publication and for peers naming the preceding decision and active leaf.
+//! Gateway abort distribution is incomplete: accepted aborts stay unpublished,
+//! and peers lacking the staged transition cannot apply the tombstone. A
+//! durable gateway acknowledgement and receiver support for sequential
+//! tombstones are needed to complete the recovery path described in §6.3.
 
 use std::sync::Arc;
 
@@ -711,5 +714,312 @@ mod tests {
             TrustUpdateObject::CertificateRevocation(_)
         ));
         assert!(select_objects(&state, &request(1), 60_000).is_empty());
+    }
+
+    fn state_with_gateway_abort(published: bool) -> crate::registry::AstraState {
+        use aether::certificates::gateway::{AbortReason, GatewayTransitionAbort};
+
+        let mut state = state_with_transition(1);
+        state.transitions = vec![crate::registry::StoredTransition {
+            campaign_id: Id16::new([5; 16]).expect("campaign id"),
+            accepted_at: 2_000,
+            object: TrustUpdateObject::GatewayTransitionAbort(Box::new(GatewayTransitionAbort {
+                format_version: CERTIFICATE_FORMAT_VERSION,
+                protocol_version: CERTIFICATE_PROTOCOL_VERSION,
+                trust_domain_id: state.trust_domain_id,
+                ca_epoch: state.ca_epoch,
+                gateway_wg_public_key: state.gateway_wg_public_key,
+                server_name: state.server_name.clone(),
+                gateway_identity_epoch: 2,
+                gateway_transition_fingerprint: Fingerprint::of(b"transition"),
+                aborted_at: 2_000,
+                reason: AbortReason::OperatorCancelled,
+                campaign_fingerprint: Fingerprint::of(b"campaign"),
+                ca_signature: MlDsa87Signature::placeholder(),
+            })),
+            published,
+            credential_registry: None,
+        }];
+        state
+    }
+
+    fn state_with_issuer(
+        lifecycle: aether::certificates::state::IssuerLifecycle,
+    ) -> crate::registry::AstraState {
+        use aether::certificates::{
+            authority::{AllowedUsage, AstraIssuerAuthorization},
+            encoding::DerCertificate,
+            state::AstraIssuerState,
+        };
+
+        let mut state = state_with_transition(1);
+        let (_, issuer_public_key) = generate_ml_dsa_87_keypair().expect("issuer key");
+        state.issuer = Some(AstraIssuerState {
+            issuer_epoch: 4,
+            authorization: AstraIssuerAuthorization {
+                format_version: CERTIFICATE_FORMAT_VERSION,
+                trust_domain_id: state.trust_domain_id,
+                ca_epoch: state.ca_epoch,
+                ca_tls_epoch: state.ca_tls_epoch,
+                gateway_wg_public_key: state.gateway_wg_public_key,
+                server_name: state.server_name.clone(),
+                issuer_epoch: 4,
+                pq_issuer_public_key: issuer_public_key,
+                tls_intermediate_certificate: DerCertificate::new(vec![1; 64])
+                    .expect("TLS intermediate"),
+                allowed_usage: AllowedUsage::AdmittedClientLeafRenewal,
+                maximum_leaf_lifetime_secs: 86_400,
+                policy_fingerprint: *state.astra_policy_fingerprint.fingerprint(),
+                not_before: 1_000,
+                not_after: 2_000,
+                ca_pq_signature: MlDsa87Signature::placeholder(),
+            },
+            state: lifecycle,
+        });
+        state
+    }
+
+    fn stage_authorization() -> aether::certificates::client::ClientCertificateStageAuthorization {
+        use aether::certificates::{
+            authority::RotationReason,
+            client::{ClientCertificateStageAuthorization, IssuerKind},
+            encoding::{DerCertificate, Id16},
+        };
+
+        ClientCertificateStageAuthorization {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            protocol_version: CERTIFICATE_PROTOCOL_VERSION,
+            trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+            ca_epoch: 1,
+            ca_tls_epoch: 1,
+            issuer_kind: IssuerKind::Astra,
+            issuer_epoch: 1,
+            issuer_authorization_fingerprint: Fingerprint::of(b"issuer"),
+            issuer_authorization: None,
+            stage_id: Id16::new([4; 16]).expect("stage id"),
+            request_fingerprint: Fingerprint::of(b"request"),
+            renewal_authorization_fingerprint: Fingerprint::of(b"approval"),
+            renewal_approval: None,
+            campaign_approval: None,
+            gateway_wg_public_key: WireGuardKey::from_bytes([1; 32]),
+            server_name: "gateway.example".into(),
+            client_wg_public_key: WireGuardKey::from_bytes([2; 32]),
+            active_generation: 1,
+            next_generation: 2,
+            active_tls_certificate_fingerprint: Fingerprint::of(b"active tls"),
+            active_pq_certificate_fingerprint: Fingerprint::of(b"active pq"),
+            next_tls_ca_certificate_fingerprint: Fingerprint::of(b"next ca"),
+            next_tls_certificate: DerCertificate::new(vec![1; 64]).expect("next TLS leaf"),
+            next_pq_certificate: request(1).certificate,
+            issued_at: 1_000,
+            stage_expires_at: 4_000,
+            window: TransitionWindow::new(1_000, 90_000, 200_000).expect("window"),
+            reason: RotationReason::Scheduled,
+            signature: MlDsa87Signature::placeholder(),
+        }
+    }
+
+    fn rotation_grant() -> aether::certificates::client::ClientCertificateRotationGrant {
+        use aether::certificates::{
+            authority::RotationReason,
+            client::{ClientCertificateRotationGrant, GatewayCertificateStageReceipt, IssuerKind},
+        };
+
+        let receipt = GatewayCertificateStageReceipt {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            protocol_version: CERTIFICATE_PROTOCOL_VERSION,
+            trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+            stage_id: Id16::new([4; 16]).expect("stage id"),
+            stage_authorization_fingerprint: Fingerprint::of(b"authorization"),
+            request_fingerprint: Fingerprint::of(b"request"),
+            renewal_authorization_fingerprint: Fingerprint::of(b"approval"),
+            gateway_wg_public_key: WireGuardKey::from_bytes([1; 32]),
+            client_wg_public_key: WireGuardKey::from_bytes([2; 32]),
+            active_generation: 1,
+            staged_generation: 2,
+            staged_tls_certificate_fingerprint: Fingerprint::of(b"next tls"),
+            staged_pq_certificate_fingerprint: Fingerprint::of(b"next pq"),
+            persisted_at: 1_100,
+            stage_expires_at: 4_000,
+            active_gateway_identity_epoch: 1,
+            gateway_decision_epoch: 1,
+            gateway_certificate_fingerprint: Fingerprint::of(b"gateway"),
+            gateway_signature: MlDsa87Signature::placeholder(),
+        };
+        ClientCertificateRotationGrant {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            protocol_version: CERTIFICATE_PROTOCOL_VERSION,
+            trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+            ca_epoch: 1,
+            ca_tls_epoch: 1,
+            issuer_kind: IssuerKind::Astra,
+            issuer_epoch: 1,
+            issuer_authorization_fingerprint: Fingerprint::of(b"issuer"),
+            issuer_authorization: None,
+            request_fingerprint: Fingerprint::of(b"request"),
+            renewal_authorization_fingerprint: Fingerprint::of(b"approval"),
+            renewal_approval: None,
+            campaign_approval: None,
+            stage_receipt_fingerprint: receipt.fingerprint(),
+            stage_receipt: receipt,
+            gateway_wg_public_key: WireGuardKey::from_bytes([1; 32]),
+            server_name: "gateway.example".into(),
+            client_wg_public_key: WireGuardKey::from_bytes([2; 32]),
+            active_generation: 1,
+            next_generation: 2,
+            active_tls_certificate_fingerprint: Fingerprint::of(b"active tls"),
+            active_pq_certificate_fingerprint: Fingerprint::of(b"active pq"),
+            next_tls_ca_certificate_fingerprint: Fingerprint::of(b"next ca"),
+            next_tls_certificate: aether::certificates::encoding::DerCertificate::new(vec![1; 64])
+                .expect("next TLS leaf"),
+            next_pq_certificate: request(1).certificate,
+            stage_expires_at: 4_000,
+            window: TransitionWindow::new(1_000, 90_000, 200_000).expect("window"),
+            reason: RotationReason::Scheduled,
+            signature: MlDsa87Signature::placeholder(),
+        }
+    }
+
+    #[test]
+    fn a_synthetic_published_gateway_abort_is_selected_for_its_decision_epoch() {
+        let state = state_with_gateway_abort(true);
+        let mut matching = request(1);
+        matching.request.gateway_decision_epoch = 2;
+        assert!(select_objects(&state, &matching, 2_000)
+            .iter()
+            .any(|object| matches!(object, TrustUpdateObject::GatewayTransitionAbort(_))));
+
+        let mut behind = request(1);
+        behind.request.gateway_decision_epoch = 1;
+        assert!(!select_objects(&state, &behind, 2_000)
+            .iter()
+            .any(|object| matches!(object, TrustUpdateObject::GatewayTransitionAbort(_))));
+
+        let mut ahead = request(1);
+        ahead.request.gateway_decision_epoch = 3;
+        assert!(!select_objects(&state, &ahead, 2_000)
+            .iter()
+            .any(|object| matches!(object, TrustUpdateObject::GatewayTransitionAbort(_))));
+
+        let unpublished = state_with_gateway_abort(false);
+        assert!(select_objects(&unpublished, &matching, 2_000).is_empty());
+    }
+
+    #[test]
+    fn a_delegation_is_offered_only_to_a_behind_peer_while_usable() {
+        use aether::certificates::state::IssuerLifecycle;
+
+        let active = state_with_issuer(IssuerLifecycle::Active);
+        let mut behind = request(1);
+        behind.request.issuer_epoch = 3;
+        assert!(select_objects(&active, &behind, 1_000)
+            .iter()
+            .any(|object| matches!(object, TrustUpdateObject::AstraIssuerAuthorization(_))));
+        assert!(select_objects(&active, &behind, 1_999)
+            .iter()
+            .any(|object| matches!(object, TrustUpdateObject::AstraIssuerAuthorization(_))));
+        assert!(!select_objects(&active, &behind, 999)
+            .iter()
+            .any(|object| matches!(object, TrustUpdateObject::AstraIssuerAuthorization(_))));
+        assert!(!select_objects(&active, &behind, 2_000)
+            .iter()
+            .any(|object| matches!(object, TrustUpdateObject::AstraIssuerAuthorization(_))));
+
+        for issuer_epoch in [4, 5] {
+            let mut current_or_ahead = request(1);
+            current_or_ahead.request.issuer_epoch = issuer_epoch;
+            assert!(!select_objects(&active, &current_or_ahead, 1_500)
+                .iter()
+                .any(|object| matches!(object, TrustUpdateObject::AstraIssuerAuthorization(_))));
+        }
+        let revoked = state_with_issuer(IssuerLifecycle::Revoked);
+        assert!(!select_objects(&revoked, &behind, 1_500)
+            .iter()
+            .any(|object| matches!(object, TrustUpdateObject::AstraIssuerAuthorization(_))));
+    }
+
+    #[test]
+    fn gateway_selection_does_not_wrap_maximum_client_decision_epoch() {
+        let state = state_with_gateway_transition(true);
+        let mut maximum = request(1);
+        maximum.request.gateway_decision_epoch = u64::MAX;
+
+        assert!(!select_objects(&state, &maximum, 2_000)
+            .iter()
+            .any(|object| matches!(object, TrustUpdateObject::GatewayIdentityTransition(_))));
+        assert!(!select_objects(&state, &request(1), 150_000)
+            .iter()
+            .any(|object| matches!(object, TrustUpdateObject::GatewayIdentityTransition(_))));
+    }
+
+    #[test]
+    fn activation_lookup_covers_windowed_and_immediate_objects() {
+        use aether::certificates::authority::AstraServiceKeyTransition;
+
+        let ca = state_with_transition(1).transitions[0].object.clone();
+        let tls = state_with_client_tls_ca_rotation().transitions[0]
+            .object
+            .clone();
+        let gateway = state_with_gateway_transition(true).transitions[0]
+            .object
+            .clone();
+        let service =
+            TrustUpdateObject::AstraServiceKeyTransition(Box::new(AstraServiceKeyTransition {
+                format_version: CERTIFICATE_FORMAT_VERSION,
+                trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+                ca_epoch: 1,
+                current_service_key_epoch: 1,
+                next_service_key_epoch: 2,
+                current_service_key_fingerprint: Fingerprint::of(b"current service"),
+                next_service_public_key: generate_ml_dsa_87_keypair().expect("service key").1,
+                next_service_key_fingerprint: Fingerprint::of(b"next service"),
+                window: TransitionWindow::new(1_000, 90_000, 200_000).expect("window"),
+                reason: aether::certificates::authority::RotationReason::Scheduled,
+                current_service_key_signature: MlDsa87Signature::placeholder(),
+                next_service_key_signature: MlDsa87Signature::placeholder(),
+                ca_pq_signature: MlDsa87Signature::placeholder(),
+            }));
+        let stage =
+            TrustUpdateObject::ClientCertificateStageAuthorization(Box::new(stage_authorization()));
+        let grant = TrustUpdateObject::ClientCertificateRotationGrant(Box::new(rotation_grant()));
+
+        for object in [&ca, &tls, &service, &gateway, &stage, &grant] {
+            assert_eq!(activation_of(object), Some(90_000));
+        }
+        let revocation = state_with_revocation().transitions[0].object.clone();
+        assert_eq!(activation_of(&revocation), None);
+        let delegation = TrustUpdateObject::AstraIssuerAuthorization(Box::new(
+            state_with_issuer(aether::certificates::state::IssuerLifecycle::Active)
+                .issuer
+                .expect("issuer")
+                .authorization,
+        ));
+        assert_eq!(activation_of(&delegation), None);
+    }
+
+    #[test]
+    fn prepare_refusal_classes_remain_coarse_for_the_private_api() {
+        use aether::certificates::transport::TrustUpdateRefusal;
+
+        assert_eq!(
+            PrepareError::CallerMismatch.refusal(),
+            TrustUpdateRefusal::Rejected
+        );
+        assert_eq!(
+            PrepareError::PeerMismatch.refusal(),
+            TrustUpdateRefusal::Rejected
+        );
+        assert_eq!(
+            PrepareError::Request(CertificateError::ArithmeticOverflow).refusal(),
+            TrustUpdateRefusal::Rejected
+        );
+        assert_eq!(
+            PrepareError::NoIssuer.refusal(),
+            TrustUpdateRefusal::Unavailable
+        );
+        assert_eq!(
+            PrepareError::Internal(CertificateError::ArithmeticOverflow).refusal(),
+            TrustUpdateRefusal::Internal
+        );
     }
 }

@@ -340,3 +340,292 @@ pub(crate) fn approve_campaign(
     );
     Ok(())
 }
+
+#[cfg(test)]
+mod precondition_tests {
+    use super::*;
+
+    fn invalid_channel(
+        request: Option<&Path>,
+        out: Option<&Path>,
+        heliosd_url: Option<&str>,
+        operation_id: Option<&str>,
+    ) -> anyhow::Error {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let unavailable_vault = directory.path().join("missing-vault");
+        approve(
+            &unavailable_vault,
+            request,
+            out,
+            heliosd_url,
+            operation_id,
+            None,
+            Transport::Hid,
+        )
+        .expect_err("invalid channel shape must fail")
+    }
+
+    #[test]
+    fn approval_rejects_incomplete_and_mixed_channels_before_opening_vault() {
+        let request = Path::new("request.json");
+        let out = Path::new("approval.json");
+        for error in [
+            invalid_channel(None, None, None, None),
+            invalid_channel(Some(request), None, None, None),
+            invalid_channel(None, Some(out), None, None),
+            invalid_channel(None, None, Some("http://127.0.0.1:1"), None),
+            invalid_channel(None, None, None, Some("01010101010101010101010101010101")),
+            invalid_channel(Some(request), Some(out), Some("http://127.0.0.1:1"), None),
+            invalid_channel(
+                Some(request),
+                Some(out),
+                None,
+                Some("01010101010101010101010101010101"),
+            ),
+            invalid_channel(
+                Some(request),
+                Some(out),
+                Some("http://127.0.0.1:1"),
+                Some("01010101010101010101010101010101"),
+            ),
+        ] {
+            assert!(
+                error.to_string().contains("choisir un chemin"),
+                "unexpected error: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_file_pair_is_selected_before_vault_load_without_touching_authenticator() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let vault = directory.path().join("missing-vault");
+        let error = approve(
+            &vault,
+            Some(Path::new("request.json")),
+            Some(Path::new("approval.json")),
+            None,
+            None,
+            None,
+            Transport::Hid,
+        )
+        .expect_err("missing vault follows valid file-channel selection");
+
+        assert!(!error.to_string().contains("choisir un chemin"));
+        assert!(format!("{error:#}").contains(&vault.display().to_string()));
+    }
+
+    #[test]
+    fn tunnel_channel_rejects_malformed_operation_id_before_vault_load() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let vault = directory.path().join("missing-vault");
+        let error = approve(
+            &vault,
+            None,
+            None,
+            Some("http://127.0.0.1:1"),
+            Some("not-an-operation-id"),
+            None,
+            Transport::Hid,
+        )
+        .expect_err("malformed operation id must fail before vault access");
+
+        assert!(error
+            .to_string()
+            .contains("identifiant d'opération invalide"));
+    }
+}
+#[cfg(test)]
+mod campaign_approval_precondition_tests {
+    use super::*;
+    use aether::certificates::{
+        approval::CredentialRegistry,
+        encoding::{Fingerprint, TrustDomainId, WireGuardKey},
+        status::{AstraRotationCampaign, CampaignScope},
+    };
+    use astra_operator::vault::{
+        AuthoritySecrets, AuthorityVault, SlotEnrolment, SlotRole, SlotSecret,
+    };
+    use base64::Engine as _;
+
+    struct Fixture {
+        _directory: tempfile::TempDir,
+        vault_path: PathBuf,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let directory = tempfile::tempdir().expect("temporary directory");
+            let vault_path = directory.path().join("authority-vault.json");
+            let (pq_private, pq_public) =
+                aether::certificates::encoding::generate_ml_dsa_87_keypair()
+                    .expect("ML-DSA keypair");
+            let encode = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+            let trust_domain_id = TrustDomainId::new([0x31; 16]).expect("domain id");
+            let gateway_key = WireGuardKey::from_bytes([0x42; 32]);
+            let vault = AuthorityVault::create(
+                trust_domain_id,
+                "astra.example",
+                astra_operator::vault::draw_salt().expect("vault salt"),
+                &AuthoritySecrets {
+                    ca_pq_private_key: encode(&pq_private),
+                    ca_pq_public_key: pq_public.to_base64(),
+                    ca_tls_private_key: encode(b"test-only TLS private key"),
+                    retained_ca_tls: None,
+                },
+                SlotEnrolment {
+                    role: SlotRole::Primary,
+                    label: "test slot".into(),
+                    credential_id: vec![0x51; 32],
+                    credential_public_key: vec![0xa5, 0x01],
+                    aaguid: [0; 16],
+                    enrolled_at: 1,
+                },
+                &SlotSecret::new(vec![0x61; 32]),
+                1,
+            )
+            .expect("test vault");
+            astra_operator::store::save(&vault_path, &vault).expect("save test vault");
+
+            let mut handoff =
+                astra_operator::handoff::DomainHandoff::of(&vault).expect("test handoff");
+            handoff.gateway_wg_public_key = Some(gateway_key.to_base64());
+            handoff.server_name = Some("gateway.example".into());
+            astra_operator::handoff::save(
+                &astra_operator::handoff::path_beside(&vault_path),
+                &handoff,
+            )
+            .expect("save test handoff");
+
+            credentials::save(
+                &credentials::path_beside(&vault_path),
+                &CredentialRegistry {
+                    trust_domain_id,
+                    gateway_wg_public_key: gateway_key,
+                    ca_epoch: 1,
+                    credential_registry_epoch: 1,
+                    bindings: Vec::new(),
+                },
+            )
+            .expect("save empty test registry");
+
+            Self {
+                _directory: directory,
+                vault_path,
+            }
+        }
+
+        fn campaign_file(&self, scope: CampaignScope) -> PathBuf {
+            let path = self._directory.path().join("campaign.json");
+            let trust_domain_id = TrustDomainId::new([0x31; 16]).expect("domain id");
+            let campaign = AstraRotationCampaign {
+                format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+                campaign_id: Id16::new([0x71; 16]).expect("campaign id"),
+                trust_domain_id,
+                gateway_wg_public_key: WireGuardKey::from_bytes([0x42; 32]),
+                server_name: "gateway.example".into(),
+                created_at: 1,
+                expires_at: 100,
+                scope,
+                targets: Vec::new(),
+                reason: "test fixture".into(),
+                requested_by: "test operator".into(),
+                policy_fingerprint: Fingerprint::of(b"test policy"),
+                required_credentials: scope.required_credentials(),
+            };
+            documents::write(&path, &campaign).expect("write campaign fixture");
+            path
+        }
+
+        fn approve_file(&self, campaign_path: &Path, out: &Path) -> anyhow::Error {
+            approve_campaign(
+                &self.vault_path,
+                Some(campaign_path),
+                Some(out),
+                None,
+                None,
+                None,
+                Transport::Hid,
+            )
+            .expect_err("fixture campaign must stop at a precondition")
+        }
+    }
+
+    #[test]
+    fn revocation_campaign_is_refused_before_any_key_prompt_or_output() {
+        let fixture = Fixture::new();
+        let campaign = fixture.campaign_file(CampaignScope::EmergencyRevocation);
+        let out = fixture._directory.path().join("approval.json");
+
+        let error = fixture.approve_file(&campaign, &out);
+
+        assert!(
+            format!("{error:#}").contains("retire une identité"),
+            "{error:#}"
+        );
+        assert!(
+            !out.exists(),
+            "a refused campaign must not produce an approval"
+        );
+    }
+
+    #[test]
+    fn authority_rotation_campaign_is_refused_before_any_key_prompt_or_output() {
+        let fixture = Fixture::new();
+        let campaign = fixture.campaign_file(CampaignScope::TrustAuthorities);
+        let out = fixture._directory.path().join("approval.json");
+
+        let error = fixture.approve_file(&campaign, &out);
+
+        assert!(
+            format!("{error:#}").contains("fait tourner une ancre"),
+            "{error:#}"
+        );
+        assert!(
+            !out.exists(),
+            "a refused campaign must not produce an approval"
+        );
+    }
+
+    #[test]
+    fn offline_approval_requires_campaign_and_output_before_touching_a_key() {
+        let fixture = Fixture::new();
+        let missing_campaign = fixture._directory.path().join("missing-campaign.json");
+
+        let missing_campaign_error = approve_campaign(
+            &fixture.vault_path,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Transport::Hid,
+        )
+        .expect_err("offline approval without a campaign must fail");
+        assert!(
+            format!("{missing_campaign_error:#}").contains("donner soit --campaign et --out"),
+            "{missing_campaign_error:#}"
+        );
+
+        let no_output_error = approve_campaign(
+            &fixture.vault_path,
+            Some(&missing_campaign),
+            None,
+            None,
+            None,
+            None,
+            Transport::Hid,
+        )
+        .expect_err("offline approval without an output path must fail");
+        assert!(
+            no_output_error
+                .to_string()
+                .contains("--out est requis avec --campaign"),
+            "{no_output_error:#}"
+        );
+        assert!(
+            !format!("{no_output_error:#}").contains("missing-campaign.json"),
+            "the missing output is rejected before reading the campaign: {no_output_error:#}"
+        );
+    }
+}

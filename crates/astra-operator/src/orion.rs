@@ -615,4 +615,139 @@ mod tests {
         assert_eq!(command, AstraIpcCommand::Continue);
         writer.join().expect("writer");
     }
+
+    fn tcp_pair() -> (TcpStream, TcpStream) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listen");
+        let address = listener.local_addr().expect("address");
+        let writer = TcpStream::connect(address).expect("connect");
+        let (reader, _) = listener.accept().expect("accept");
+        (reader, writer)
+    }
+
+    #[test]
+    fn ipc_reader_distinguishes_clean_eof_truncation_invalid_json_and_unknown_commands() {
+        use std::net::Shutdown;
+
+        let (mut reader, writer) = tcp_pair();
+        writer.shutdown(Shutdown::Write).expect("close cleanly");
+        assert_eq!(
+            read_frame::<AstraIpcCommand>(&mut reader).expect("clean EOF"),
+            None
+        );
+
+        let (mut reader, mut writer) = tcp_pair();
+        writer
+            .write_all(b"{\"command\":")
+            .expect("write partial frame");
+        writer.shutdown(Shutdown::Write).expect("truncate frame");
+        assert!(read_frame::<AstraIpcCommand>(&mut reader)
+            .expect_err("partial frame refused")
+            .to_string()
+            .contains("tronqué"));
+
+        let (mut reader, mut writer) = tcp_pair();
+        writer
+            .write_all(b"{not-json}\n")
+            .expect("write invalid JSON");
+        assert!(read_frame::<AstraIpcCommand>(&mut reader)
+            .expect_err("invalid JSON refused")
+            .to_string()
+            .contains("illisible"));
+
+        let (mut reader, mut writer) = tcp_pair();
+        writer
+            .write_all(b"{\"command\":\"approve\"}\n")
+            .expect("write unknown command");
+        assert!(read_frame::<AstraIpcCommand>(&mut reader).is_err());
+    }
+
+    #[test]
+    fn ipc_reader_enforces_the_exact_json_frame_ceiling() {
+        let (mut reader, mut writer) = tcp_pair();
+        let padded_json = format!("\"{}\"", "x".repeat(MAX_FRAME_BYTES - 2));
+        assert_eq!(padded_json.len(), MAX_FRAME_BYTES);
+        writer
+            .write_all(padded_json.as_bytes())
+            .expect("write maximum-sized JSON");
+        writer.write_all(b"\n").expect("terminate frame");
+        let decoded: String = read_frame(&mut reader)
+            .expect("frame within limit")
+            .expect("frame exists");
+        assert_eq!(decoded.len(), MAX_FRAME_BYTES - 2);
+
+        let (mut reader, mut writer) = tcp_pair();
+        let oversized = vec![b' '; MAX_FRAME_BYTES + 1];
+        writer.write_all(&oversized).expect("write oversized frame");
+        assert!(read_frame::<serde_json::Value>(&mut reader).is_err());
+    }
+
+    #[derive(serde::Serialize)]
+    struct SizedFrame {
+        payload: String,
+    }
+
+    #[test]
+    fn ipc_writer_accepts_the_limit_and_writes_nothing_over_it() {
+        use std::net::Shutdown;
+
+        let overhead = serde_json::to_vec(&SizedFrame {
+            payload: String::new(),
+        })
+        .expect("empty JSON")
+        .len();
+        let at_limit = SizedFrame {
+            payload: "x".repeat(MAX_FRAME_BYTES - overhead),
+        };
+        let (mut reader, mut writer) = tcp_pair();
+        send_frame(&mut writer, &at_limit).expect("exact maximum is accepted");
+        writer.shutdown(Shutdown::Write).expect("close writer");
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).expect("read frame");
+        assert_eq!(bytes.len(), MAX_FRAME_BYTES + 1);
+        assert_eq!(bytes.last(), Some(&b'\n'));
+
+        let over_limit = SizedFrame {
+            payload: "x".repeat(MAX_FRAME_BYTES + 1 - overhead),
+        };
+        let (mut reader, mut writer) = tcp_pair();
+        assert!(send_frame(&mut writer, &over_limit).is_err());
+        writer.shutdown(Shutdown::Write).expect("close writer");
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).expect("read empty stream");
+        assert!(bytes.is_empty(), "oversized frame writes no prefix");
+    }
+
+    #[test]
+    fn cancellation_is_rejected_after_durable_preparation_but_allowed_before_it() {
+        let (mut reader, mut writer) = tcp_pair();
+        send_frame(&mut writer, &AstraIpcCommand::Cancel).expect("send cancellation");
+        let durable = AstraCaTlsStatus::new(AstraCaTlsPhase::Prepared, "prepared");
+        assert!(wait_for_continue(&mut reader, &durable).is_err());
+
+        let (mut reader, mut writer) = tcp_pair();
+        send_frame(&mut writer, &AstraIpcCommand::Cancel).expect("send cancellation");
+        let waiting = AstraCaTlsStatus::new(AstraCaTlsPhase::AwaitingFirstKey, "waiting");
+        assert_eq!(
+            wait_for_continue(&mut reader, &waiting).expect("pre-commit cancellation"),
+            AstraIpcCommand::Cancel
+        );
+    }
+
+    #[test]
+    fn cancellation_status_is_terminal_and_preserves_public_context() {
+        let (mut reader, mut writer) = tcp_pair();
+        let mut previous = AstraCaTlsStatus::new(AstraCaTlsPhase::AwaitingFirstKey, "waiting");
+        previous.output_path = Some("transition.json".into());
+        previous.next_ca_tls_epoch = Some(8);
+        send_cancelled(&mut writer, &previous).expect("write cancelled state");
+        let cancelled: AstraCaTlsStatus = read_frame(&mut reader)
+            .expect("read status")
+            .expect("status frame");
+        assert_eq!(cancelled.phase, AstraCaTlsPhase::Cancelled);
+        assert!(!cancelled.can_continue);
+        assert!(!cancelled.can_cancel);
+        assert_eq!(cancelled.output_path.as_deref(), Some("transition.json"));
+        assert_eq!(cancelled.next_ca_tls_epoch, Some(8));
+        assert!(previous.can_cancel, "the prior status was not mutated");
+    }
 }

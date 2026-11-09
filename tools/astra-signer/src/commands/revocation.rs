@@ -221,3 +221,40 @@ pub(crate) fn revoke(
     println!("décision déposée : Astra la relaie à la gateway et la distribue aux clients");
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aether::certificates::revocation::{RevocationReason, RevocationScope};
+
+    #[test]
+    fn invalid_operation_ids_are_refused_before_loading_the_vault() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let missing_vault = directory.path().join("missing-vault");
+        for operation_id in [
+            "",
+            "00",
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+            "0101010101010101010101010101010101",
+        ] {
+            let error = revoke(
+                &missing_vault,
+                "https://example.invalid",
+                operation_id,
+                None,
+                RevocationInputs {
+                    scope: RevocationScope::Client,
+                    halves: RevokedHalvesArg::Both,
+                    tls_not_after: None,
+                    pq_not_after: None,
+                    reason: RevocationReason::KeyCompromise,
+                    replacement: None,
+                },
+                Transport::Hid,
+            )
+            .expect_err("malformed operation must be refused");
+            assert!(error.to_string().contains("--operation-id"), "{error:#}");
+            assert!(!missing_vault.exists());
+        }
+    }
+}
