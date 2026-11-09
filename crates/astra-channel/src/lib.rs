@@ -9,6 +9,7 @@
 //! POST /internal/v1/certificates/stage-commit
 //! POST /internal/v1/certificates/revoke
 //! GET  /internal/v1/certificates/state/<identity>
+//! GET  /internal/v1/certificates/peers
 //! ```
 //!
 //! # Why a second listener rather than a path on the administration API

@@ -121,7 +121,8 @@ fn self_signed(name: &str, role: PinnedRole, days: i64) -> (Vec<u8>, Vec<u8>) {
 struct SpyHandler {
     seen: Mutex<Vec<&'static str>>,
     published: Mutex<Vec<GatewayTransitionPublished>>,
-    listed: Vec<WireGuardKey>,
+    /// `None` makes the listing refuse; `Some` answers with these keys.
+    listed: Option<Vec<WireGuardKey>>,
 }
 
 #[async_trait]
@@ -183,7 +184,7 @@ impl AstraChannelHandler for SpyHandler {
 
     async fn peer_keys(&self) -> Result<Vec<WireGuardKey>, TrustUpdateRefusal> {
         self.seen.lock().unwrap().push("peer_keys");
-        Ok(self.listed.clone())
+        self.listed.clone().ok_or(TrustUpdateRefusal::Rejected)
     }
 
     async fn gateway_identity(&self) -> Result<GatewayIdentityView, TrustUpdateRefusal> {
@@ -196,7 +197,7 @@ fn spy() -> Arc<SpyHandler> {
     Arc::new(SpyHandler {
         seen: Mutex::new(Vec::new()),
         published: Mutex::new(Vec::new()),
-        listed: Vec::new(),
+        listed: None,
     })
 }
 
@@ -725,6 +726,19 @@ async fn the_identity_route_dispatches_only_reads() {
     }
 }
 
+/// A refused listing reaches no body and no 200: the handler's refusal class
+/// decides the status, as on every other route.
+#[tokio::test]
+async fn a_refused_peer_listing_is_not_a_success() {
+    let handler = spy();
+    assert_eq!(
+        status_of(Arc::clone(&handler), "GET", PEERS_PATH).await,
+        StatusCode::FORBIDDEN,
+        "Rejected maps to 403 on the peers route"
+    );
+    assert_eq!(handler.seen.lock().unwrap().as_slice(), ["peer_keys"]);
+}
+
 /// The listing answers every key the handler holds, in the wire shape Astra
 /// reads: `{"peers":["<base64>", ...]}`, and nothing else.
 #[tokio::test]
@@ -734,7 +748,7 @@ async fn peers_route_lists_every_certificate_record() {
     let handler = Arc::new(SpyHandler {
         seen: Mutex::new(Vec::new()),
         published: Mutex::new(Vec::new()),
-        listed: vec![admitted, cut],
+        listed: Some(vec![admitted, cut]),
     });
     let response = router(handler.clone())
         .oneshot(

@@ -262,7 +262,7 @@ pub struct GatewayTransitionPublished {
     pub transition_fingerprint: Fingerprint,
 }
 
-/// Builds the private router — the seven routes, and a refusal for the rest.
+/// Builds the private router — the eight routes, and a refusal for the rest.
 pub fn router(handler: Arc<dyn AstraChannelHandler>) -> Router {
     Router::new()
         .route(STAGE_PATH, post(stage))

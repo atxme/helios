@@ -780,11 +780,22 @@ async fn a_recovery_commit_must_name_the_staging_the_registry_recorded() {
         .is_err());
 }
 
-/// Removing a peer's admission leaves its certificate record in place, and the
-/// listing keeps naming it: Astra must learn every workstation the gateway
-/// still holds state for, including one that has just been cut.
+/// A peer stays listed whatever its admission says, because the two stores
+/// are independent: the admission lives in `NetworkConfig`, the listing in the
+/// certificate registry, and no code path joins them.
+///
+/// Evidence for the independence, read from the code:
+/// - `helios-api/src/routes/peers.rs` `peer_revoke` (around line 288) edits a
+///   copy of `NetworkConfig` with `helios_provisioning::revoke` and sends it to
+///   the orchestrator through `apply_network` (`routes/network.rs:229`);
+/// - `heliosd/src/orchestrator/commands.rs` `LoadNetworkConfig` (around line
+///   216) never names `CertificateService` or the registry.
+///
+/// So this test proves what it can: the registry listing does not change when
+/// a `NetworkConfig` loses the peer. It does not drive the API route, which
+/// the orchestrator would need to run.
 #[tokio::test]
-async fn a_cut_peer_is_still_listed() {
+async fn a_peer_stays_listed_whatever_its_admission() {
     use ::astra_channel::AstraChannelHandler;
 
     let (service, _directory) = service(state());
@@ -816,13 +827,15 @@ async fn a_cut_peer_is_still_listed() {
         }],
         ..aether::NetworkConfig::default()
     };
+    assert_eq!(service.peer_keys().await.expect("listing"), vec![peer_key]);
+
     helios_provisioning::revoke(&mut network, "workstation").expect("admission removed");
     assert!(network.peers.is_empty());
 
     assert_eq!(
         service.peer_keys().await.expect("listing"),
         vec![peer_key],
-        "a cut peer keeps its certificate record, so it stays listed"
+        "the registry record is untouched by a change to the network configuration"
     );
 }
 
