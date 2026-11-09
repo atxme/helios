@@ -57,9 +57,12 @@ pub enum KeyStep {
 /// openings stay on the thread of the ceremony that asked for them.
 pub struct ValidatedKeys {
     pub(super) vault: AuthorityVault,
-    /// The credential document beside the vault, read as it is to turn a key marked lost
-    /// down at its validation. Not trusted for anything else: [`open`] checks the keys
-    /// again against the document it has verified under `CA-PQ`.
+    /// The credential document beside the vault, read when the keys are validated, to
+    /// turn a key marked lost down at that point. It is the local copy only. A
+    /// rotation's [`open`](super::rotation::open) checks the keys again against the
+    /// document it has verified under `CA-PQ`. A revocation under the outgoing anchor
+    /// checks its approvals against the document Astra serves instead
+    /// ([`super::revocation::open`]), so the two can differ, and the served one decides.
     pub(super) registry: Option<Box<CredentialRegistry>>,
     pub(super) openings: Vec<Opened>,
     _thread: PhantomData<*const ()>,

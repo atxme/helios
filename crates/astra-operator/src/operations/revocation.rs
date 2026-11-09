@@ -531,21 +531,28 @@ pub fn deposit(
             bail!("Astra n'a pas enregistré ce dépôt")
         }
         // A refusal can mean the decision is already recorded, and the answer alone
-        // was lost: the domain's word on it is the state, read again.
-        Err(error)
-            if matches!(
-                error.downcast_ref::<TunnelRefusal>(),
-                Some(TunnelRefusal {
-                    status: 403 | 409,
-                    ..
-                })
-            ) && remote.authority_status()?.revoked_peers.contains(&peer) =>
-        {
-            clear(vault_path)?;
-            Ok(RevocationDeposit::AlreadyRevoked)
-        }
+        // was lost: the domain's word on it is the state, read again. If that read
+        // fails, the refusal stands as it was given.
+        Err(error) if is_a_deposit_refusal(&error) => match remote.authority_status() {
+            Ok(status) if status.revoked_peers.contains(&peer) => {
+                clear(vault_path)?;
+                Ok(RevocationDeposit::AlreadyRevoked)
+            }
+            _ => Err(error),
+        },
         Err(error) => Err(error),
     }
+}
+
+/// Whether the domain answered the deposit with a refusal of 403 or 409.
+fn is_a_deposit_refusal(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<TunnelRefusal>(),
+        Some(TunnelRefusal {
+            status: 403 | 409,
+            ..
+        })
+    )
 }
 
 /// The recorded decision, if one is waiting. A record whose campaign has expired is

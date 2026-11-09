@@ -16,6 +16,8 @@ use aether::certificates::transport::{
     SigningOperationState, TrustUpdateObject,
 };
 
+use aether::certificates::approval::{CredentialRegistry, CredentialState};
+use aether::certificates::revocation::RevocationScope;
 use aether::certificates::status::AstraSignerResult;
 
 use super::*;
@@ -23,7 +25,7 @@ use crate::operations::fixtures::{domain, nothing_in_flight, operation, Domain, 
 use crate::origin::CampaignRequest;
 use crate::rotation_journal::{self, RotationKind};
 use crate::tunnel::admin_refusal;
-use crate::{handoff, store};
+use crate::{gestures, handoff, signing, store};
 
 const TLS_NOT_AFTER: u64 = EXPIRES + 86_400;
 const PQ_NOT_AFTER: u64 = EXPIRES + 2 * 86_400;
@@ -67,6 +69,10 @@ struct Remote {
     /// Whether the record was on disk at the moment of a deposit.
     record_at_submit: Cell<Option<bool>>,
     open_refusal: Cell<Option<u16>>,
+    /// The expiries the door reports; a test removes them to see the refusal.
+    expiries: RefCell<Option<RevocationExpiries>>,
+    /// Whether a refused deposit also leaves the peer held as revoked.
+    revokes_on_submit: Cell<bool>,
     /// Whether the refused open also leaves the peer held as revoked, as the door
     /// does when the peer is already revoked.
     revokes_peer_on_refusal: Cell<bool>,
@@ -83,6 +89,11 @@ impl Remote {
             submitted: RefCell::default(),
             record_at_submit: Cell::new(None),
             open_refusal: Cell::new(None),
+            expiries: RefCell::new(Some(RevocationExpiries {
+                tls_not_after: Some(TLS_NOT_AFTER),
+                pq_not_after: Some(PQ_NOT_AFTER),
+            })),
+            revokes_on_submit: Cell::new(false),
             revokes_peer_on_refusal: Cell::new(false),
         }
     }
@@ -119,10 +130,7 @@ impl RevocationRemote for Remote {
             target_count: 1,
             required_credentials: 1,
             expires_at: EXPIRES,
-            revocation_expiries: Some(RevocationExpiries {
-                tls_not_after: Some(TLS_NOT_AFTER),
-                pq_not_after: Some(PQ_NOT_AFTER),
-            }),
+            revocation_expiries: *self.expiries.borrow(),
             delegation_request: None,
         })
     }
@@ -154,6 +162,11 @@ impl RevocationRemote for Remote {
                 .exists(),
         ));
         self.submitted.borrow_mut().push(result.clone());
+        if self.revokes_on_submit.get() {
+            if let Some(authority) = self.authority.borrow_mut().as_mut() {
+                authority.revoked_peers.push(peer());
+            }
+        }
         match self.replies.borrow_mut().pop_front() {
             None => Ok(SigningOperationState::Approved),
             Some(Ok(state)) => Ok(state),
@@ -234,9 +247,16 @@ fn opens_and_offers_only_active_keys_of_the_chosen_document() {
 #[test]
 fn outgoing_anchor_uses_the_served_document() {
     let domain = domain();
-    let served = domain.registry();
+    // Astra serves the document as it was before the rotation, with the second key
+    // lost. The local document after the rotation has all three keys active.
+    let served = served_with_second_key_lost(&domain);
     promoted(&domain);
     let (outgoing, outgoing_epoch) = retained(&domain);
+    let local_active = active_ids(&domain.registry());
+    let served_active = active_ids(&served);
+    assert_eq!(local_active.len(), 3);
+    assert_eq!(served_active.len(), 2);
+
     let mut status = nothing_in_flight(&domain.path);
     status.ca_fingerprint = outgoing.authority_fingerprint();
     status.ca_epoch = outgoing_epoch;
@@ -253,14 +273,14 @@ fn outgoing_anchor_uses_the_served_document() {
         NOW,
     )
     .expect("the outgoing anchor is checked");
-    let active: Vec<Vec<u8>> = served
-        .approvable()
-        .iter()
-        .map(|binding| binding.credential_id.clone())
-        .collect();
+    assert_ne!(
+        opened.offered(),
+        local_active,
+        "the local document is not the one offered"
+    );
     assert_eq!(
         opened.offered(),
-        active,
+        served_active,
         "the served document decides the offer"
     );
     opened.approve(&domain.keys[0], NOW).expect("approved");
@@ -279,6 +299,32 @@ fn outgoing_anchor_uses_the_served_document() {
     revocation
         .verify(&outgoing, &trust_domain, outgoing_epoch, 0)
         .expect("verifies under the outgoing anchor");
+}
+
+/// The document Astra serves before the rotation, with the second key marked lost:
+/// signed under the anchor the vault holds at that moment, and not in service locally.
+fn served_with_second_key_lost(domain: &Domain) -> CredentialRegistry {
+    let vault = store::load(&domain.path).expect("vault");
+    let identity = handoff::identity_of(&domain.relay()).expect("identity");
+    let opening = gestures::open_with_authorized_key(&domain.keys[2], &vault, "").expect("opened");
+    signing::sign_credential_bindings(
+        &vault,
+        &opening,
+        &identity,
+        Some(&domain.registry()),
+        &[(domain.keys[1].credential_id(), CredentialState::Lost)],
+        NOW,
+    )
+    .expect("signed")
+}
+
+/// The credentials a document lets approve, in its order.
+fn active_ids(registry: &CredentialRegistry) -> Vec<Vec<u8>> {
+    registry
+        .approvable()
+        .iter()
+        .map(|binding| binding.credential_id.clone())
+        .collect()
 }
 
 #[test]
@@ -515,4 +561,234 @@ fn already_revoked_is_named() {
     assert_eq!(refusal, RevocationRefusal::AlreadyRevoked);
     assert!(!remote.called("open_campaign"));
     assert_eq!(domain.touches(), 0);
+}
+
+/// One decision for the peer, opened, approved by the first key, and recorded.
+fn signed_decision(domain: &Domain, remote: &Remote) -> SignedRevocation {
+    let mut opened = open(
+        remote,
+        &domain.path,
+        &peer(),
+        RevocationReasonChoice::StolenOrLost,
+        NOW,
+    )
+    .expect("opened");
+    opened.approve(&domain.keys[0], NOW).expect("approved");
+    opened.sign_and_record(&domain.path, NOW).expect("signed")
+}
+
+#[test]
+fn a_pending_record_blocks_a_second_open() {
+    let domain = domain();
+    let remote = Remote::watching(&domain, vec![revocation_campaign(&domain, peer())]);
+    signed_decision(&domain, &remote);
+
+    let refusal = open(
+        &remote,
+        &domain.path,
+        &other_peer(),
+        RevocationReasonChoice::Replaced,
+        NOW,
+    )
+    .err()
+    .expect("refused");
+
+    assert_eq!(refusal, RevocationRefusal::AlreadyPending);
+    let opens = remote
+        .calls()
+        .into_iter()
+        .filter(|name| *name == "open_campaign")
+        .count();
+    assert_eq!(opens, 1, "only the first revocation opened a campaign");
+}
+
+#[test]
+fn deposit_already_revoked_clears_the_record() {
+    let domain = domain();
+
+    // Astra already holds the peer as revoked: the state is read before the deposit.
+    let remote = Remote::watching(
+        &domain,
+        vec![
+            revocation_campaign(&domain, peer()),
+            revocation_campaign(&domain, peer()),
+        ],
+    );
+    let signed = signed_decision(&domain, &remote);
+    remote
+        .authority
+        .borrow_mut()
+        .as_mut()
+        .expect("status")
+        .revoked_peers
+        .push(peer());
+    assert_eq!(
+        deposit(&remote, &domain.path, &signed).expect("deposited"),
+        RevocationDeposit::AlreadyRevoked
+    );
+    assert!(remote.submitted.borrow().is_empty(), "nothing is submitted");
+    assert!(!record_on_disk(&domain), "the record is cleared");
+
+    // The refusal of the deposit, with the peer held as revoked by then.
+    let remote = Remote::watching(
+        &domain,
+        vec![
+            revocation_campaign(&domain, peer()),
+            revocation_campaign(&domain, peer()),
+        ],
+    );
+    let signed = signed_decision(&domain, &remote);
+    remote.replies.borrow_mut().push_back(Err(403));
+    remote.revokes_on_submit.set(true);
+    assert_eq!(
+        deposit(&remote, &domain.path, &signed).expect("deposited"),
+        RevocationDeposit::AlreadyRevoked
+    );
+    assert_eq!(
+        remote.submitted.borrow().len(),
+        1,
+        "the deposit was sent once"
+    );
+    assert!(!record_on_disk(&domain), "the record is cleared");
+}
+
+#[test]
+fn a_record_redeposits_only_under_its_own_campaign() {
+    let domain = domain();
+    let remote = Remote::watching(
+        &domain,
+        vec![
+            revocation_campaign(&domain, peer()),
+            revocation_campaign(&domain, peer()),
+        ],
+    );
+    let signed = signed_decision(&domain, &remote);
+    let foreign = SignedRevocation {
+        campaign_id: Id16::new([1; 16]).expect("id"),
+        ..signed.clone()
+    };
+
+    assert!(deposit(&remote, &domain.path, &foreign).is_err());
+    assert!(
+        remote.submitted.borrow().is_empty(),
+        "nothing is submitted under another campaign"
+    );
+    assert!(
+        record_on_disk(&domain),
+        "the record stays for its own campaign"
+    );
+}
+
+#[test]
+fn the_signed_decision_names_both_leaves_and_their_expiries() {
+    let domain = domain();
+    let remote = Remote::watching(&domain, vec![revocation_campaign(&domain, peer())]);
+    let signed = signed_decision(&domain, &remote);
+
+    let TrustUpdateObject::CertificateRevocation(revocation) = &signed.result.objects[0] else {
+        panic!("the decision is a revocation");
+    };
+    assert_eq!(revocation.scope, RevocationScope::Client);
+    assert_eq!(revocation.identity_key, peer());
+    assert_eq!(revocation.server_name, None);
+    // The target's epoch is 0: the decision is the next one.
+    assert_eq!(revocation.revocation_epoch, 1);
+    assert_eq!(
+        revocation.revoked_tls_fingerprint,
+        Some(Fingerprint::of(b"tls leaf"))
+    );
+    assert_eq!(revocation.revoked_tls_not_after, Some(TLS_NOT_AFTER));
+    assert_eq!(
+        revocation.revoked_pq_fingerprint,
+        Some(Fingerprint::of(b"pq leaf"))
+    );
+    assert_eq!(revocation.revoked_pq_not_after, Some(PQ_NOT_AFTER));
+}
+
+#[test]
+fn missing_expiries_are_internal() {
+    let domain = domain();
+    let remote = Remote::watching(&domain, vec![revocation_campaign(&domain, peer())]);
+    let message =
+        "Astra n'a pas donné l'échéance des deux feuilles de ce poste : rien n'a été signé.";
+    let partial = |tls, pq| {
+        Some(RevocationExpiries {
+            tls_not_after: tls,
+            pq_not_after: pq,
+        })
+    };
+
+    for expiries in [
+        None,
+        partial(Some(TLS_NOT_AFTER), None),
+        partial(None, Some(PQ_NOT_AFTER)),
+    ] {
+        *remote.expiries.borrow_mut() = expiries;
+        let refusal = open(
+            &remote,
+            &domain.path,
+            &peer(),
+            RevocationReasonChoice::StolenOrLost,
+            NOW,
+        )
+        .err()
+        .expect("refused");
+        assert_eq!(refusal, RevocationRefusal::Internal(message.into()));
+    }
+    assert_eq!(domain.touches(), 0);
+}
+
+#[test]
+fn inside_the_margin_is_not_before() {
+    let domain = domain();
+    promoted(&domain);
+    let (outgoing, outgoing_epoch, not_after) = store::load(&domain.path)
+        .expect("vault")
+        .retained_outgoing_ca_pq_public()
+        .expect("the outgoing key is kept");
+    let mut status = nothing_in_flight(&domain.path);
+    status.ca_fingerprint = outgoing.authority_fingerprint();
+    status.ca_epoch = outgoing_epoch;
+    let remote = Remote::watching(&domain, vec![revocation_campaign(&domain, peer())]);
+    *remote.authority.borrow_mut() = Some(status);
+
+    // The margin before the retirement: the outgoing key is no longer used.
+    let now = not_after - signing::OUTGOING_REVOCATION_MARGIN_SECS;
+    let refusal = open(
+        &remote,
+        &domain.path,
+        &peer(),
+        RevocationReasonChoice::Replaced,
+        now,
+    )
+    .err()
+    .expect("refused");
+
+    assert_eq!(refusal, RevocationRefusal::NotBefore(not_after));
+    assert!(!remote.called("open_campaign"), "no campaign is opened");
+}
+
+#[test]
+fn an_unknown_anchor_is_refused() {
+    let domain = domain();
+    promoted(&domain);
+    let (_, outgoing_epoch) = retained(&domain);
+    let mut status = nothing_in_flight(&domain.path);
+    status.ca_fingerprint = Fingerprint::of(b"etranger");
+    status.ca_epoch = outgoing_epoch;
+    let remote = Remote::watching(&domain, vec![revocation_campaign(&domain, peer())]);
+    *remote.authority.borrow_mut() = Some(status);
+
+    let refusal = open(
+        &remote,
+        &domain.path,
+        &peer(),
+        RevocationReasonChoice::Replaced,
+        NOW,
+    )
+    .err()
+    .expect("refused");
+
+    assert_eq!(refusal, RevocationRefusal::UnknownAnchor);
+    assert!(!remote.called("open_campaign"));
 }
