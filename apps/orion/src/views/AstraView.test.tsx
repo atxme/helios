@@ -22,6 +22,7 @@ const api = vi.hoisted(() => ({
   getConfig: vi.fn(),
   beginEnrollmentCeremony: vi.fn(),
   operatorSendVaultCopy: vi.fn(),
+  onEvent: vi.fn(() => Promise.resolve(() => {})),
 }))
 vi.mock('../api', () => api)
 

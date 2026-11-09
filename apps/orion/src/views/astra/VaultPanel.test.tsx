@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const api = vi.hoisted(() => ({
@@ -14,11 +14,12 @@ const api = vi.hoisted(() => ({
   resetVaultLocation: vi.fn(),
   operatorRotationsOverview: vi.fn(),
   operatorSendVaultCopy: vi.fn(),
+  onEvent: vi.fn(),
 }))
 vi.mock('../../api', () => api)
 
 import type { SlotView, VaultOverview } from '../../types'
-import { overview as rotationsOverview } from './rotationFixtures'
+import { authorityRead, overview as rotationsOverview } from './rotationFixtures'
 import { VaultPanel } from './VaultPanel'
 
 const overview: VaultOverview = {
@@ -64,6 +65,7 @@ beforeEach(() => {
     error: null,
   })
   api.operatorDomainDefaults.mockResolvedValue({ rp_id: 'gw.tail.ts.net' })
+  api.onEvent.mockResolvedValue(() => {})
 })
 afterEach(cleanup)
 
@@ -380,5 +382,52 @@ describe('VaultPanel', () => {
     render(<VaultPanel onCeremony={vi.fn()} />)
     const line = (await screen.findByText('Copie du coffre')).closest('li') as HTMLElement
     expect(within(line).queryByRole('button', { name: 'Envoyer' })).toBeNull()
+  })
+
+  it('copy_line_rereads_when_the_tunnel_comes_up', async () => {
+    let onTunnelEvent: (event: unknown) => void = () => {}
+    api.onEvent.mockImplementation((cb: (event: unknown) => void) => {
+      onTunnelEvent = cb
+      return Promise.resolve(() => {})
+    })
+    api.operatorRotationsOverview.mockResolvedValueOnce(
+      rotationsOverview({ localCredentialRegistryEpoch: 5 }),
+    )
+    api.operatorRotationsOverview.mockResolvedValue(
+      rotationsOverview({ localCredentialRegistryEpoch: 6 }),
+    )
+    render(<VaultPanel onCeremony={vi.fn()} />)
+    await screen.findByText('Copie du coffre')
+    expect(screen.queryByText('Document ancien')).toBeNull()
+    act(() => onTunnelEvent({ type: 'state_changed', state: 'up' }))
+    expect(await screen.findByText('Document ancien')).toBeTruthy()
+  })
+
+  it('failed_send_survives_a_view_change', async () => {
+    api.operatorRotationsOverview.mockResolvedValue(
+      rotationsOverview({ localCredentialRegistryEpoch: 6 }),
+    )
+    api.operatorSendVaultCopy.mockRejectedValue('la gateway ne répond pas')
+    const first = render(<VaultPanel onCeremony={vi.fn()} />)
+    const line = (await screen.findByText('Copie du coffre')).closest('li') as HTMLElement
+    fireEvent.click(within(line).getByRole('button', { name: 'Envoyer' }))
+    expect(await screen.findByText(/Copie non envoyée à Astra : la gateway ne répond pas/)).toBeTruthy()
+    first.unmount()
+
+    render(<VaultPanel onCeremony={vi.fn()} />)
+    expect(await screen.findByText(/Copie non envoyée à Astra : la gateway ne répond pas/)).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Réessayer l’envoi' })).toBeTruthy()
+  })
+
+  it('overlap_shows_the_document_waiting', async () => {
+    api.operatorRotationsOverview.mockResolvedValue(
+      rotationsOverview({
+        localCredentialRegistryEpoch: 6,
+        authority: { state: 'ok', value: authorityRead({ next_ca_fingerprint: 'cd'.repeat(32) }) },
+      }),
+    )
+    render(<VaultPanel onCeremony={vi.fn()} />)
+    const line = (await screen.findByText('Copie du coffre')).closest('li') as HTMLElement
+    expect(within(line).getByText('Document en attente de la fin du recouvrement')).toBeTruthy()
   })
 })
