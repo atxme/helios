@@ -383,8 +383,9 @@ pub async fn operator_open(
 /// `GET /api/certificates/operator/status`.
 ///
 /// On the admin surface beside the other operator routes. A read: it carries
-/// no capability token and returns none, and what it answers is epochs and
-/// fingerprints.
+/// no capability token and returns none. What it answers is epochs,
+/// fingerprints, the revoked workstation keys and the credential document
+/// Astra serves, whole. That document is public and signed.
 pub async fn operator_status(
     State(s): State<AppState>,
     Extension(caller): Extension<crate::auth::Caller>,

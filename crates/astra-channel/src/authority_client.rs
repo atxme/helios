@@ -126,7 +126,7 @@ impl AstraLifecycleClient {
             OPERATOR_STATUS_ROUTE,
             relayed,
             None,
-            MAX_OPERATOR_ANSWER_BYTES,
+            MAX_OPERATOR_STATUS_BYTES,
         )
         .await
     }

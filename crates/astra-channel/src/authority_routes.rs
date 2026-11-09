@@ -64,6 +64,20 @@ pub const OPERATOR_OPEN_ROUTE: &str = "/internal/v1/operator/campaigns";
 /// call on this link.
 pub const MAX_OPERATOR_ANSWER_BYTES: usize = 128 * 1024;
 
+/// Ceiling on the status answer alone.
+///
+/// The status carries the whole credential document, and that document holds up
+/// to `MAX_CREDENTIAL_BINDINGS` signed rows. Each row is about 6.8 KiB: its
+/// ML-DSA-87 signature alone is 6172 bytes in base64, and the COSE key and the
+/// identifiers add the rest. Sixty-four rows make about 435 KiB, and the revoked
+/// keys and the JSON around them fit in what is left of 1 MiB. The other
+/// operator answers keep [`MAX_OPERATOR_ANSWER_BYTES`].
+pub const MAX_OPERATOR_STATUS_BYTES: usize = 1024 * 1024;
+
+const _: () = assert!(
+    MAX_OPERATOR_STATUS_BYTES > aether::certificates::approval::MAX_CREDENTIAL_BINDINGS * 7 * 1024
+);
+
 /// Largest canonical operator request accepted on either public surface.
 ///
 /// Operator results may contain several ML-DSA-87-signed transition objects.

@@ -33,6 +33,14 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 /// Ceiling on the small answers, as the blocking tunnel client's.
 const MAX_ANSWER_BYTES: usize = 256 * 1024;
 
+/// Ceiling on the status read alone: the answer carries the credential document
+/// whole. It mirrors `MAX_OPERATOR_STATUS_BYTES` in `astra-channel` (1 MiB),
+/// which orion-core does not depend on, so the two are kept equal by hand. The
+/// other reads keep `MAX_ANSWER_BYTES`.
+const MAX_STATUS_ANSWER_BYTES: usize = 1024 * 1024;
+
+const _: () = assert!(MAX_STATUS_ANSWER_BYTES >= 1024 * 1024);
+
 /// Ceiling on the domain view, the one answer that grows with the fleet: a peer
 /// costs a few hundred bytes there.
 const MAX_DOMAIN_ANSWER_BYTES: usize = 8 * 1024 * 1024;
@@ -178,9 +186,11 @@ impl From<OperatorAuthorityStatus> for AuthorityStatusRead {
                 .iter()
                 .map(|key| key.to_base64())
                 .collect(),
-            served_credentials: status.served_credentials.map(|document| {
-                serde_json::to_value(*document).expect("a credential document is plain JSON")
-            }),
+            // A derived `Serialize` over strings and integers does not fail. Should
+            // it, the screen reads no document, and nothing is trusted from it.
+            served_credentials: status
+                .served_credentials
+                .and_then(|document| serde_json::to_value(*document).ok()),
         }
     }
 }
@@ -215,12 +225,13 @@ pub async fn pending(gateway: &str) -> Reach<Vec<PendingOperationRead>> {
     .map(|list| list.operations)
 }
 
-/// What Astra holds of its authority state: fingerprints and epochs.
+/// What Astra holds of its authority state: fingerprints, epochs, the revoked
+/// peers and the credential document it serves.
 pub async fn authority_status(gateway: &str) -> Reach<AuthorityStatusRead> {
     read(
         gateway,
         "/api/certificates/operator/status",
-        MAX_ANSWER_BYTES,
+        MAX_STATUS_ANSWER_BYTES,
     )
     .await
 }

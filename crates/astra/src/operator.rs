@@ -444,13 +444,13 @@ mod tests {
     use crate::registry::CaPqRotation;
     use crate::service::ApprovalCredentials;
     use aether::certificates::approval::{
-        AstraCredentialBinding, CredentialRegistry, CredentialState,
+        AstraCredentialBinding, CredentialRegistry, CredentialState, MAX_CREDENTIAL_BINDINGS,
     };
     use aether::certificates::encoding::{
         generate_ml_dsa_87_keypair, MlDsa87Signature, TrustDomainId, WireGuardKey,
     };
     use aether::certificates::CERTIFICATE_FORMAT_VERSION;
-    use astra_channel::{OperatorIdentity, MAX_OPERATOR_ANSWER_BYTES};
+    use astra_channel::{OperatorIdentity, MAX_OPERATOR_STATUS_BYTES};
 
     const DOMAIN: [u8; 16] = [1; 16];
     const GATEWAY: [u8; 32] = [1; 32];
@@ -513,7 +513,7 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), axum::http::StatusCode::OK);
-        axum::body::to_bytes(response.into_body(), MAX_OPERATOR_ANSWER_BYTES)
+        axum::body::to_bytes(response.into_body(), MAX_OPERATOR_STATUS_BYTES)
             .await
             .expect("the answer stays within the operator bound")
             .to_vec()
@@ -539,7 +539,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn status_serves_the_outgoing_document_during_an_overlap() {
+    // The daemon test `the_overlap_keeps_serving_the_outgoing_document` owns the
+    // invariant that the outgoing document stays in service. This one checks
+    // only that the status reports what is held, while the rotation is pending.
+    async fn status_reports_the_held_document_while_a_rotation_is_pending() {
         let directory = tempfile::tempdir().expect("temp dir");
         let (ca_private, _) = generate_ml_dsa_87_keypair().expect("keygen");
         let (_, next) = generate_ml_dsa_87_keypair().expect("next CA-PQ");
@@ -566,24 +569,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn status_fits_the_answer_bound_with_eight_bindings() {
+    async fn status_fits_the_status_bound_at_the_binding_ceiling() {
         let directory = tempfile::tempdir().expect("temp dir");
         let (ca_private, _) = generate_ml_dsa_87_keypair().expect("keygen");
         let service = fixture(directory.path());
-        serve(&service, document(&ca_private, 1, 8));
+        serve(
+            &service,
+            document(&ca_private, 1, MAX_CREDENTIAL_BINDINGS as u8),
+        );
+        // Both workstations of the fixture are revoked: the answer names them.
+        {
+            let mut registry = service.registry.lock().await;
+            for seed in [2, 3] {
+                registry
+                    .revoke(&WireGuardKey::from_bytes([seed; 32]), 1, 1_000)
+                    .expect("revoked");
+            }
+        }
 
         let service = Arc::new(service);
-        let body = answer(&service).await;
         let body = answer(&service).await;
         let report: OperatorAuthorityStatus = serde_json::from_slice(&body).expect("status");
 
         assert_eq!(
             report.served_credentials.expect("document").bindings.len(),
-            8
+            MAX_CREDENTIAL_BINDINGS
         );
+        assert_eq!(report.revoked_peers.len(), 2);
         assert!(
-            body.len() < MAX_OPERATOR_ANSWER_BYTES / 2,
-            "the status took {} bytes, half the operator bound",
+            body.len() <= MAX_OPERATOR_STATUS_BYTES,
+            "the status took {} bytes, over the status bound",
             body.len()
         );
     }
