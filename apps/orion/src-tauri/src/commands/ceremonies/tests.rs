@@ -226,21 +226,37 @@ fn only_the_tunnel_gateway_is_adopted() {
 fn own_key_comes_from_the_domain_profile() {
     use crate::operator::peers::own_key_of;
 
-    let mut domain = profile("domaine", Some("http://100.64.0.1:8080"));
+    let url = "http://100.64.0.1:8080";
+    let mut domain = profile("domaine", Some(url));
     domain.public_key = Some(" OWNKEY= ".into());
     let mut other = profile("autre", Some("http://100.64.9.1:8080"));
     other.public_key = Some("OTHERKEY=".into());
 
     assert_eq!(
-        own_key_of(&view(Some("domaine"), vec![other.clone(), domain.clone()])).as_deref(),
+        own_key_of(
+            &view(Some("domaine"), vec![other.clone(), domain.clone()]),
+            Some(url)
+        )
+        .as_deref(),
         Some("OWNKEY="),
-        "the selected profile's public half, trimmed"
+        "the selected profile is the connected one: its public half, trimmed"
     );
     assert_eq!(
-        own_key_of(&view(None, vec![domain.clone(), other.clone()])),
+        own_key_of(&view(Some("domaine"), vec![domain.clone()]), None),
         None,
-        "no selected profile, no key"
+        "no connected gateway, no key"
+    );
+    assert_eq!(
+        own_key_of(
+            &view(Some("autre"), vec![domain.clone(), other.clone()]),
+            Some(url)
+        ),
+        None,
+        "a selected profile that is not the connected one shows no key"
     );
     domain.public_key = None;
-    assert_eq!(own_key_of(&view(Some("domaine"), vec![domain])), None);
+    assert_eq!(
+        own_key_of(&view(Some("domaine"), vec![domain]), Some(url)),
+        None
+    );
 }

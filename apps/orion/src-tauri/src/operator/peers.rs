@@ -18,6 +18,31 @@ use orion_core::operator_rotations::{
 /// targets, not the scope, tell them apart.
 const EMERGENCY_REVOCATION: &str = "emergency_revocation";
 
+/// The most campaign fetches one overview may make.
+///
+/// Each fetch is a signed campaign read over the tunnel, made in turn on a
+/// blocking thread. A list longer than this is not read in part: the answer is
+/// [`Reach::Unreachable`] and nothing is fetched, because a shorter list would
+/// show fewer revocations than are waiting.
+pub const MAX_PENDING_REVOCATION_FETCHES: usize = 8;
+
+fn is_emergency(operation: &PendingOperationRead) -> bool {
+    operation.scope == EMERGENCY_REVOCATION
+}
+
+/// Whether [`pending_revocations`] will fetch anything: at least one emergency
+/// revocation is pending, and not more than the cap. The caller opens its tunnel
+/// only then.
+pub fn will_fetch(pending: &Reach<Vec<PendingOperationRead>>) -> bool {
+    match pending {
+        Reach::Ok(operations) => {
+            let count = operations.iter().filter(|op| is_emergency(op)).count();
+            (1..=MAX_PENDING_REVOCATION_FETCHES).contains(&count)
+        }
+        _ => false,
+    }
+}
+
 /// Everything the tab shows, one source per field. Keys are WireGuard public
 /// keys in base64; names and dates are the gateway's. No private key, no
 /// certificate body, no token.
@@ -78,11 +103,13 @@ pub fn pending_revocations(
 ) -> Reach<Vec<String>> {
     match pending {
         Reach::Ok(operations) => {
+            let emergencies: Vec<&PendingOperationRead> =
+                operations.iter().filter(|op| is_emergency(op)).collect();
+            if emergencies.len() > MAX_PENDING_REVOCATION_FETCHES {
+                return Reach::Unreachable;
+            }
             let mut keys: Vec<String> = Vec::new();
-            for operation in operations
-                .iter()
-                .filter(|operation| operation.scope == EMERGENCY_REVOCATION)
-            {
+            for operation in emergencies {
                 let Ok(id) = Id16::parse_hex(&operation.operation_id) else {
                     return Reach::Unreachable;
                 };
@@ -107,13 +134,25 @@ pub fn pending_revocations(
     }
 }
 
-/// The selected profile's WireGuard public key, when it has one. The engine
-/// derives it from the stored private key and keeps the private key itself;
-/// this function reads only the public half.
-pub fn own_key_of(view: &orion_engine::ConfigView) -> Option<String> {
+/// This workstation's WireGuard public key, from the profile the connected
+/// gateway belongs to.
+///
+/// `connected_gateway` is the address of the connected target, which is the
+/// selected profile's gateway when the tunnel is up. The key is returned only
+/// when the selected profile is that one: with no connection, or with another
+/// profile selected, there is no key to show. The engine derives the public half
+/// from the stored private key and keeps the private key itself.
+pub fn own_key_of(
+    view: &orion_engine::ConfigView,
+    connected_gateway: Option<&str>,
+) -> Option<String> {
+    let connected = connected_gateway
+        .map(str::trim)
+        .filter(|url| !url.is_empty())?;
     view.selected
         .as_deref()
         .and_then(|name| view.profiles.iter().find(|profile| profile.name == name))
+        .filter(|profile| profile.heliosd_url.as_deref().map(str::trim) == Some(connected))
         .and_then(|profile| profile.public_key.as_deref())
         .map(str::trim)
         .filter(|key| !key.is_empty())
@@ -129,6 +168,7 @@ pub fn reach_of_admin<T>(result: Result<T, GatewayAdminError>) -> Reach<T> {
         Err(GatewayAdminError::Refused { status: 429, .. }) => Reach::Throttled,
         Err(GatewayAdminError::Refused { status: 503, .. }) => Reach::AstraUnavailable,
         Err(GatewayAdminError::Refused { status, .. }) => Reach::Refused(status),
+        Err(GatewayAdminError::UnknownPeer) => Reach::Refused(404),
         Err(GatewayAdminError::Unreachable | GatewayAdminError::Invalid(_)) => Reach::Unreachable,
     }
 }
@@ -252,6 +292,49 @@ mod tests {
             reach,
             Reach::Unreachable,
             "a partial list would show fewer revocations than are waiting"
+        );
+    }
+
+    #[test]
+    fn more_pending_revocations_than_the_cap_are_unreachable_and_fetch_nothing() {
+        let operations: Vec<PendingOperationRead> = (1..=MAX_PENDING_REVOCATION_FETCHES + 1)
+            .map(|index| pending_op(&format!("{index:032x}"), "emergency_revocation"))
+            .collect();
+        let mut calls = 0;
+        let reach = pending_revocations(Reach::Ok(operations.clone()), |_| {
+            calls += 1;
+            Ok(vec![target(CertificateKind::ClientPq, 1)])
+        });
+        assert_eq!(reach, Reach::Unreachable, "never a truncated list");
+        assert_eq!(calls, 0, "nothing is fetched past the cap");
+        assert!(!will_fetch(&Reach::Ok(operations)));
+    }
+
+    #[test]
+    fn a_list_at_the_cap_is_read_in_full() {
+        let operations: Vec<PendingOperationRead> = (1..=MAX_PENDING_REVOCATION_FETCHES)
+            .map(|index| pending_op(&format!("{index:032x}"), "emergency_revocation"))
+            .collect();
+        let mut calls = 0;
+        let reach = pending_revocations(Reach::Ok(operations.clone()), |_| {
+            calls += 1;
+            Ok(vec![target(CertificateKind::ClientPq, 1)])
+        });
+        assert_eq!(reach, Reach::Ok(vec![key(1).to_base64()]));
+        assert_eq!(calls, MAX_PENDING_REVOCATION_FETCHES);
+        assert!(will_fetch(&Reach::Ok(operations)));
+    }
+
+    #[test]
+    fn no_emergency_revocation_means_no_fetch_and_no_tunnel() {
+        let operations = vec![pending_op(&"07".repeat(16), "fleet_leafs")];
+        assert!(!will_fetch(&Reach::Ok(operations.clone())));
+        assert!(!will_fetch(&Reach::Unreachable));
+        assert_eq!(
+            pending_revocations(Reach::Ok(operations), |_| Err(
+                "must not be called".to_string()
+            )),
+            Reach::Ok(Vec::new())
         );
     }
 

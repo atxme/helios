@@ -82,6 +82,9 @@ pub enum GatewayAdminError {
     /// answer was a readable error text.
     #[error("{}", refusal_message(*status, reason.as_deref()))]
     Refused { status: u16, reason: Option<String> },
+    /// `404` on the revocation route: no admitted peer carries that name.
+    #[error("Aucun poste admis ne porte ce nom sur la gateway.")]
+    UnknownPeer,
     /// An answer the gateway should not have given, or a body that cannot be sent.
     #[error("Réponse de la gateway inacceptable : {0}")]
     Invalid(String),
@@ -397,6 +400,7 @@ pub async fn revoke_peer(client: &Client, base: &str, name: &str) -> Result<(), 
     .await?;
     match status {
         200..=299 => Ok(()),
+        404 => Err(GatewayAdminError::UnknownPeer),
         status => Err(status_error(status, &response)),
     }
 }

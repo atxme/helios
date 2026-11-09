@@ -512,6 +512,7 @@ fn gateway_refusal(error: &orion_core::gateway_admin::GatewayAdminError) -> Refu
     match error {
         E::Forbidden => Refusal::GatewayForbidden,
         E::Refused { status, .. } => Refusal::GatewayRefused { status: *status },
+        E::UnknownPeer => Refusal::GatewayRefused { status: 404 },
         E::Unreachable | E::Invalid(_) => Refusal::GatewayUnavailable,
     }
 }

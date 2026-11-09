@@ -138,12 +138,23 @@ type Routes = Vec<(&'static str, u16, String)>;
 
 /// A gateway that answers from a table and records every request line.
 async fn fake_gateway(routes: Routes) -> (String, Arc<Mutex<Vec<String>>>) {
+    let (base, lines, _) = fake_gateway_with_bodies(routes).await;
+    (base, lines)
+}
+
+/// As [`fake_gateway`], and it also records each request body, read to its
+/// `Content-Length`, so a test can assert what was actually sent.
+async fn fake_gateway_with_bodies(
+    routes: Routes,
+) -> (String, Arc<Mutex<Vec<String>>>, Arc<Mutex<Vec<String>>>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("local listener");
     let address = listener.local_addr().expect("address");
     let seen = Arc::new(Mutex::new(Vec::new()));
+    let bodies = Arc::new(Mutex::new(Vec::new()));
     let recorded = Arc::clone(&seen);
+    let recorded_bodies = Arc::clone(&bodies);
     tokio::spawn(async move {
         while let Ok((mut stream, _)) = listener.accept().await {
             let mut request = Vec::new();
@@ -151,13 +162,32 @@ async fn fake_gateway(routes: Routes) -> (String, Arc<Mutex<Vec<String>>>) {
                 let mut chunk = [0u8; 4096];
                 let read = stream.read(&mut chunk).await.unwrap_or(0);
                 request.extend_from_slice(&chunk[..read]);
-                if read == 0 || request.windows(4).any(|w| w == b"\r\n\r\n") {
+                if read == 0 {
                     break;
+                }
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                    let length = head
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if request.len() >= end + 4 + length {
+                        break;
+                    }
                 }
             }
             let text = String::from_utf8_lossy(&request).into_owned();
             let line = text.lines().next().unwrap_or_default().to_string();
             recorded.lock().expect("lock").push(line.clone());
+            let body_start = request
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .map_or(request.len(), |end| end + 4);
+            recorded_bodies
+                .lock()
+                .expect("lock")
+                .push(String::from_utf8_lossy(&request[body_start..]).into_owned());
             let path = line.split_whitespace().nth(1).unwrap_or_default();
             let (status, body) = routes
                 .iter()
@@ -172,7 +202,7 @@ async fn fake_gateway(routes: Routes) -> (String, Arc<Mutex<Vec<String>>>) {
             let _ = stream.shutdown().await;
         }
     });
-    (format!("http://{address}"), seen)
+    (format!("http://{address}"), seen, bodies)
 }
 
 #[tokio::test]
@@ -439,13 +469,19 @@ async fn the_admitted_peers_carry_their_names_and_keys() {
 
 #[tokio::test]
 async fn revoking_a_peer_posts_its_name_to_the_gateway() {
-    let (base, seen) = fake_gateway(vec![("/api/peers/revoke", 200, "{}".into())]).await;
+    let (base, seen, bodies) =
+        fake_gateway_with_bodies(vec![("/api/peers/revoke", 200, "{}".into())]).await;
     revoke_peer(&client(), &format!("{base}/"), "PORTABLE")
         .await
         .unwrap();
     assert_eq!(
         seen.lock().unwrap().as_slice(),
         ["POST /api/peers/revoke HTTP/1.1"]
+    );
+    assert_eq!(
+        bodies.lock().unwrap().as_slice(),
+        [r#"{"name":"PORTABLE"}"#],
+        "the body sent is the name alone"
     );
 }
 
@@ -456,13 +492,24 @@ fn the_revocation_body_carries_the_name_and_nothing_else() {
 }
 
 #[tokio::test]
-async fn a_gateway_refusing_the_revocation_says_so() {
+async fn a_revocation_of_an_unknown_name_says_so() {
     let (base, _) = fake_gateway(vec![("/api/peers/revoke", 404, "unknown peer".into())]).await;
+    let error = revoke_peer(&client(), &base, "ghost").await.unwrap_err();
+    assert_eq!(error, GatewayAdminError::UnknownPeer);
     assert_eq!(
-        revoke_peer(&client(), &base, "ghost").await.unwrap_err(),
+        error.to_string(),
+        "Aucun poste admis ne porte ce nom sur la gateway."
+    );
+}
+
+#[tokio::test]
+async fn a_refused_revocation_keeps_the_gateways_status() {
+    let (base, _) = fake_gateway(vec![("/api/peers/revoke", 409, "conflict".into())]).await;
+    assert_eq!(
+        revoke_peer(&client(), &base, "PORTABLE").await.unwrap_err(),
         GatewayAdminError::Refused {
-            status: 404,
-            reason: Some("unknown peer".into())
+            status: 409,
+            reason: Some("conflict".into())
         }
     );
 }

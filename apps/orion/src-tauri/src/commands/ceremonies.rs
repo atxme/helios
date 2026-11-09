@@ -394,9 +394,10 @@ pub(crate) async fn operator_peers_overview(
         EngineReply::Config(view) => view,
         _ => return Err(unexpected_engine_reply()),
     };
-    let own_key = peers::own_key_of(&view);
     let vault_path = state.vault_location.path_to_look_at();
     let target = connected_target(&state).await.ok();
+    // The key of the profile the connected target belongs to, and no other.
+    let own_key = peers::own_key_of(&view, target.as_ref().map(|target| target.address.as_str()));
     // Concurrent: a gateway that hangs for its whole wait must not delay the others.
     let gateway_reads = async {
         match &target {
@@ -429,19 +430,23 @@ pub(crate) async fn operator_peers_overview(
     let now = peers::clock_of(&certificates).unwrap_or_else(crate::operator::now_unix);
     let gateway_address = target.map(|target| target.address);
     on_work_stack("orion-peers-overview", "la lecture des postes", move || {
-        // One tunnel for the campaign fetches, on the work stack: they block.
-        let pending_revocations = match gateway_address.as_deref() {
-            Some(address) => match astra_operator::tunnel::Tunnel::new(address) {
-                Ok(tunnel) => peers::pending_revocations(pending, |id| {
-                    tunnel
-                        .fetch_campaign(id)
-                        .map(|campaign| campaign.campaign.targets.clone())
-                        .map_err(|error| format!("{error:#}"))
-                }),
-                Err(_) => Reach::Unreachable,
-            },
-            None => Reach::Unreachable,
+        // The tunnel is opened only when a campaign will be fetched: a blocking
+        // read, on the work stack, and none at all when nothing is pending.
+        let tunnel = match gateway_address.as_deref() {
+            Some(address) if peers::will_fetch(&pending) => {
+                astra_operator::tunnel::Tunnel::new(address).ok()
+            }
+            _ => None,
         };
+        let pending_revocations = peers::pending_revocations(pending, |id| {
+            let tunnel = tunnel
+                .as_ref()
+                .ok_or_else(|| "aucun tunnel pour lire la campagne".to_string())?;
+            tunnel
+                .fetch_campaign(id)
+                .map(|campaign| campaign.campaign.targets.clone())
+                .map_err(|error| format!("{error:#}"))
+        });
         let local_pending = match vault_path {
             Ok(path) => match astra_operator::operations::revocation::pending(&path, now) {
                 Ok(Some(signed)) => signed.peer().ok().map(|key| key.to_base64()),
