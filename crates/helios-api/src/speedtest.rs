@@ -708,6 +708,8 @@ pub async fn upload(
 mod tests {
     use super::*;
 
+    mod protocol_tests;
+
     fn test_state() -> AppState {
         let network = Arc::new(tokio::sync::RwLock::new(aether::NetworkConfig::default()));
         let tunnel_state = Arc::new(tokio::sync::RwLock::new(aether::TunnelState::Down));
@@ -741,6 +743,101 @@ mod tests {
                 .requested_bytes()
                 .expect("default size"),
             DEFAULT_TRANSFER_BYTES
+        );
+    }
+
+    #[tokio::test]
+    async fn download_streams_exact_length_with_non_cacheable_headers() {
+        let length = STREAM_CHUNK_BYTES + 7;
+        let response = download(Query(TransferQuery {
+            bytes: Some(length),
+        }))
+        .await
+        .expect("valid download");
+        assert_eq!(
+            response.headers()[header::CONTENT_LENGTH],
+            length.to_string()
+        );
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "application/octet-stream"
+        );
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "no-store, no-transform"
+        );
+        let body = axum::body::to_bytes(response.into_body(), length)
+            .await
+            .expect("complete body");
+        assert_eq!(body.len(), length);
+        assert_eq!(&body[..STREAM_CHUNK_BYTES], DOWNLOAD_CHUNK.as_ref());
+        assert_eq!(&body[STREAM_CHUNK_BYTES..], &DOWNLOAD_CHUNK[..7]);
+        assert_eq!(
+            download(Query(TransferQuery { bytes: Some(0) }))
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_requires_matching_length_and_a_complete_bounded_body() {
+        async fn send(
+            declared: Option<&str>,
+            body: Body,
+        ) -> Result<StatusCode, (StatusCode, String)> {
+            let mut builder = Request::builder();
+            if let Some(length) = declared {
+                builder = builder.header(header::CONTENT_LENGTH, length);
+            }
+            upload(
+                Query(TransferQuery { bytes: Some(4) }),
+                builder.body(body).expect("request"),
+            )
+            .await
+        }
+        assert_eq!(
+            send(None, Body::from("data")).await.unwrap_err().0,
+            StatusCode::LENGTH_REQUIRED
+        );
+        assert_eq!(
+            send(Some("invalid"), Body::from("data"))
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::LENGTH_REQUIRED
+        );
+        assert_eq!(
+            send(Some("3"), Body::from("data")).await.unwrap_err().0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            send(Some("4"), Body::from("abc")).await.unwrap_err().0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            send(Some("4"), Body::from("abcde")).await.unwrap_err().0,
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        let chunks = stream::iter(vec![
+            Ok::<_, std::io::Error>(Bytes::from_static(b"ab")),
+            Ok(Bytes::from_static(b"cd")),
+        ]);
+        assert_eq!(
+            send(Some("4"), Body::from_stream(chunks)).await.unwrap(),
+            StatusCode::NO_CONTENT
+        );
+        let broken = stream::iter(vec![
+            Ok(Bytes::from_static(b"ab")),
+            Err(std::io::Error::other("connection lost")),
+        ]);
+        assert_eq!(
+            send(Some("4"), Body::from_stream(broken))
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::BAD_REQUEST
         );
     }
 

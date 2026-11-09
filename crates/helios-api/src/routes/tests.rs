@@ -473,3 +473,140 @@ async fn explicit_error_if_orchestrator_is_absent() {
     assert!(!response.ok);
     assert_eq!(response.error.as_deref(), Some("orchestrator unreachable"));
 }
+
+mod key_negotiation_route_tests {
+    use super::*;
+    use axum::{
+        body::{to_bytes, Body},
+        http::Request,
+    };
+    use base64::Engine as _;
+    use tower::ServiceExt as _;
+
+    fn certificate() -> aether::key_negotiation::PqCertificate {
+        aether::key_negotiation::PqCertificate {
+            version: aether::key_negotiation::PQ_CERTIFICATE_VERSION,
+            serial: [0x21; aether::key_negotiation::KEY_NEGOTIATION_NONCE_LEN],
+            subject: "gateway.example.test".into(),
+            issuer: "Helios test CA".into(),
+            role: aether::key_negotiation::PqCertificateRole::Gateway,
+            wireguard_public_key: super::PEER_KEY.into(),
+            // fingerprint() checks the canonical public-key length, not its signature.
+            ml_dsa_87_public_key: base64::engine::general_purpose::STANDARD
+                .encode(vec![4; aether::key_negotiation::ML_DSA_87_PUBLIC_KEY_LEN]),
+            not_before_unix: 100,
+            not_after_unix: 200,
+            ml_dsa_87_signature: base64::engine::general_purpose::STANDARD
+                .encode(vec![0; aether::key_negotiation::ML_DSA_87_SIGNATURE_LEN]),
+        }
+    }
+
+    async fn get_key_negotiation(state: AppState) -> axum::response::Response {
+        crate::router(state)
+            .oneshot(
+                Request::get("/api/key-negotiation")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("router response")
+    }
+
+    #[tokio::test]
+    async fn key_negotiation_route_distinguishes_an_absent_service() {
+        let (state, _commands) = super::app_state(TunnelState::Up);
+        let response = get_key_negotiation(state).await;
+
+        assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let message = String::from_utf8(body.to_vec()).expect("UTF-8 error");
+        assert!(message.contains("runs no key-negotiation service"));
+        assert!(!message.contains("null"));
+    }
+
+    #[tokio::test]
+    async fn key_negotiation_route_reports_unreadable_certificate_without_echoing_disk_bytes() {
+        let (state, _commands) = super::app_state(TunnelState::Up);
+        let marker = b"private fixture bytes must not be returned";
+        let state = state.with_key_negotiation(crate::KeyNegotiationMaterial {
+            certificate_der: vec![0x30, 0x01],
+            pq_certificate_json: marker.to_vec(),
+        });
+
+        let response = get_key_negotiation(state).await;
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let message = String::from_utf8(body.to_vec()).expect("UTF-8 error");
+        assert!(message.contains("PQ certificate on disk is unreadable"));
+        assert!(!message.contains(std::str::from_utf8(marker).expect("marker UTF-8")));
+    }
+
+    #[tokio::test]
+    async fn key_negotiation_route_exports_only_the_expected_public_profile_material() {
+        let (state, _commands) = super::app_state(TunnelState::Up);
+        let certificate = certificate();
+        let pq_json = serde_json::to_vec(&certificate).expect("certificate JSON");
+        let expected_fingerprint = certificate.fingerprint().expect("fingerprint");
+        let der = vec![0x30, 0x03, 0x01, 0x02, 0x03];
+        let state = state.with_key_negotiation(crate::KeyNegotiationMaterial {
+            certificate_der: der.clone(),
+            pq_certificate_json: pq_json.clone(),
+        });
+
+        let response = get_key_negotiation(state).await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let text = String::from_utf8(body.to_vec()).expect("UTF-8 JSON");
+        let json: serde_json::Value = serde_json::from_str(&text).expect("response JSON");
+
+        assert_eq!(json["port"], 51821);
+        assert_eq!(json["server_name"], "gateway.example.test");
+        assert_eq!(
+            json["gateway_ca_der"],
+            base64::engine::general_purpose::STANDARD.encode(&der)
+        );
+        assert_eq!(
+            json["gateway_pq_certificate"],
+            base64::engine::general_purpose::STANDARD.encode(&pq_json)
+        );
+        assert_eq!(json["pq_certificate_sha256"], expected_fingerprint);
+        assert_eq!(json["wireguard_public_key"], super::PEER_KEY);
+        assert!(!text.contains(super::PRIVATE_KEY));
+        assert!(!text.contains("pq-secret-must-not-leak"));
+        assert!(!text.contains("private_key"));
+    }
+
+    #[tokio::test]
+    async fn key_negotiation_route_rejects_a_certificate_that_cannot_be_fingerprinted() {
+        let (state, _commands) = super::app_state(TunnelState::Up);
+        let mut certificate = certificate();
+        certificate.ml_dsa_87_signature.clear();
+        let pq_json = serde_json::to_vec(&certificate).expect("certificate JSON");
+        let state = state.with_key_negotiation(crate::KeyNegotiationMaterial {
+            certificate_der: vec![0x30, 0x01],
+            pq_certificate_json: pq_json,
+        });
+
+        let response = get_key_negotiation(state).await;
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let message = String::from_utf8(body.to_vec()).expect("UTF-8 error");
+        assert!(message.contains("PQ certificate cannot be fingerprinted"));
+        assert!(!message.contains("signature"));
+        assert!(!message.contains("private"));
+    }
+}

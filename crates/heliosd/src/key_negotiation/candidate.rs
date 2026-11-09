@@ -330,3 +330,69 @@ pub(crate) fn discard_candidate_identity() -> Result<()> {
     remove_if_present(&next_private_keystore_path())?;
     remove_if_present(&next_certificate_path())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn candidate_sealing_context_is_the_canonical_gateway_and_epoch_pair() {
+        let context = candidate_identity_context("gateway-key", 0x0102_0304_0506_0708);
+        let expected = helios_tpm::Context::new()
+            .field("gateway_wg_public_key", b"gateway-key")
+            .field(
+                "gateway_identity_epoch",
+                &0x0102_0304_0506_0708_u64.to_be_bytes(),
+            );
+
+        assert_eq!(context, expected);
+    }
+
+    #[test]
+    fn candidate_sealing_context_cannot_be_reused_for_another_gateway_or_epoch() {
+        let original = candidate_identity_context("gateway-key", 17);
+        assert_ne!(original, candidate_identity_context("other-gateway", 17));
+        assert_ne!(original, candidate_identity_context("gateway-key", 18));
+    }
+
+    #[test]
+    fn stored_candidate_keeps_tls_rotation_presence_distinct_from_an_empty_key() {
+        let pq_private_key = "pq-private-base64";
+        let without_tls = StoredCandidateIdentity {
+            pq_private_key: pq_private_key.into(),
+            tls_private_key: None,
+        };
+        let encoded_without_tls = serde_json::to_vec(&without_tls).expect("serialize candidate");
+        let decoded_without_tls: StoredCandidateIdentity =
+            serde_json::from_slice(&encoded_without_tls).expect("deserialize candidate");
+        assert_eq!(decoded_without_tls.pq_private_key, pq_private_key);
+        assert_eq!(decoded_without_tls.tls_private_key, None);
+
+        let with_empty_tls = StoredCandidateIdentity {
+            pq_private_key: pq_private_key.into(),
+            tls_private_key: Some(String::new()),
+        };
+        let encoded_with_empty_tls =
+            serde_json::to_vec(&with_empty_tls).expect("serialize candidate");
+        let decoded_with_empty_tls: StoredCandidateIdentity =
+            serde_json::from_slice(&encoded_with_empty_tls).expect("deserialize candidate");
+        assert_eq!(decoded_with_empty_tls.tls_private_key.as_deref(), Some(""));
+        assert_ne!(
+            decoded_without_tls.tls_private_key,
+            decoded_with_empty_tls.tls_private_key
+        );
+    }
+
+    #[test]
+    fn stored_candidate_rejects_unknown_fields_and_missing_pq_material() {
+        for malformed in [
+            br#"{"pq_private_key":"pq","tls_private_key":null,"extra":true}"#.as_slice(),
+            br#"{"tls_private_key":null}"#.as_slice(),
+        ] {
+            assert!(
+                serde_json::from_slice::<StoredCandidateIdentity>(malformed).is_err(),
+                "malformed candidate record should be refused"
+            );
+        }
+    }
+}

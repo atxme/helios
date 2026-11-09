@@ -6,5 +6,6 @@ mod generation_limits;
 mod identity;
 mod interop;
 mod renewal;
+mod server_startup;
 mod transaction;
 mod transaction_cancellation;
