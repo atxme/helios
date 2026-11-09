@@ -61,10 +61,11 @@ const motif = () => within(screen.getByRole('group', { name: 'Motif' }))
 /** Shows the screen with the given reads and waits for the first read to end. */
 const show = async (
   peersRead: PeersOverview = peers(),
-  rotations: RotationsOverview = rotationsOverview(),
+  rotations: RotationsOverview | 'reject' = rotationsOverview(),
 ) => {
   api.operatorPeersOverview.mockResolvedValue(peersRead)
-  api.operatorRotationsOverview.mockResolvedValue(rotations)
+  if (rotations === 'reject') api.operatorRotationsOverview.mockRejectedValue('Astra indisponible.')
+  else api.operatorRotationsOverview.mockResolvedValue(rotations)
   const onCeremony = vi.fn()
   render(<PeersPanel onCeremony={onCeremony} />)
   await waitFor(() => expect(screen.queryByLabelText('Lecture en cours')).toBeNull())
@@ -165,6 +166,44 @@ describe('the revocation path', () => {
     fireEvent.click(within(region('PORTABLE')).getByRole('button', { name: 'Révoquer' }))
     expect(prerequisites().getByText('Connecter')).toBeTruthy()
     expect(screen.queryByRole('group', { name: 'Motif' })).toBeNull()
+  })
+
+  it('the_cut_stays_open_when_the_signing_prerequisites_cannot_be_read', async () => {
+    api.beginRevocationCeremony.mockResolvedValue(status())
+    const { onCeremony } = await show(undefined, 'reject')
+    fireEvent.click(within(region('PORTABLE')).getByRole('button', { name: 'Révoquer' }))
+    expect(prerequisites().getByText('Prérequis de signature non lus.')).toBeTruthy()
+    fireEvent.click(motif().getByRole('button', { name: 'Compromis' }))
+    fireEvent.click(within(region('Confirmation')).getByRole('button', { name: 'Révoquer' }))
+    await waitFor(() => expect(onCeremony).toHaveBeenCalledWith(status()))
+    expect(api.beginRevocationCeremony).toHaveBeenCalledWith({
+      gesture: 'revoke',
+      peer: KEY_A,
+      name: 'PORTABLE',
+      reason: 'compromised',
+    })
+  })
+
+  it('reprendre_is_offered_when_the_gateway_is_down_and_the_signing_prerequisites_are_green', async () => {
+    api.beginRevocationCeremony.mockResolvedValue(status())
+    const { onCeremony } = await show(
+      peers({
+        certificates: { state: 'ok', value: [peer({ name: 'PC_BUREAU', wg_public_key: KEY_B })] },
+        admitted: { state: 'ok', value: [] },
+        astra_revoked: { state: 'ok', value: [] },
+      }),
+      rotationsOverview({ tunnel: false, domain: { state: 'unreachable' } }),
+    )
+    fireEvent.click(within(region('PC_BUREAU')).getByRole('button', { name: 'Reprendre' }))
+    expect(prerequisites().getByText('Tunnel connecté')).toBeTruthy()
+    fireEvent.click(motif().getByRole('button', { name: 'Remplacé' }))
+    fireEvent.click(within(region('Confirmation')).getByRole('button', { name: 'Reprendre' }))
+    await waitFor(() => expect(onCeremony).toHaveBeenCalled())
+    expect(api.beginRevocationCeremony).toHaveBeenCalledWith({
+      gesture: 'resume',
+      peer: KEY_B,
+      reason: 'replaced',
+    })
   })
 
   it('a_red_signing_prerequisite_does_not_stop_the_cut', async () => {

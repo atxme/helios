@@ -69,7 +69,7 @@ export function PrerequisiteLine({
 }: {
   line: Prerequisite
   busy: boolean
-  onFix: (line: Prerequisite) => void
+  onFix?: (line: Prerequisite) => void
 }) {
   return (
     <Box component="li" sx={{ listStyle: 'none', py: 0.4 }}>
@@ -101,7 +101,7 @@ export function PrerequisiteLine({
             size="small"
             variant="outlined"
             disabled={busy}
-            onClick={() => onFix(line)}
+            onClick={() => onFix?.(line)}
             sx={{ ml: 'auto', minHeight: 26, fontSize: 11.5 }}
           >
             {line.fix}

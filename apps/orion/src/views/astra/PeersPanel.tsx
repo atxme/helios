@@ -36,30 +36,66 @@ const UNREAD_NAMES = {
   pending_revocations: 'Révocations en attente',
 } as const
 
+function named(lines: Prerequisite[], label: string): Prerequisite[] {
+  return lines.filter((line) => line.label === label)
+}
+
 /**
- * What cutting a workstation needs (tunnel, administrator, gateway) and what signing it needs
- * (Astra, vault, concordant domain, a CA-PQ overlap not running). Only the first group stops
- * the cut: a red line of the second leaves the row « Coupé, révocation à signer ».
+ * What cutting a workstation needs: the tunnel, the administrator and the gateway. The rotations
+ * overview states them when it was read; the peers read states them otherwise. Neither needs
+ * Astra or the vault, so a failed rotations read never blocks the cut.
  */
-function linesOf(o: RotationsOverview, gateway: PeersOverview['certificates']) {
-  const lines = prerequisites(o, 'renew_fleet')
-  const named = (label: string): Prerequisite[] => lines.filter((line) => line.label === label)
-  const gatewayLine: Prerequisite = {
-    label: 'Gateway du domaine',
-    ok: gateway.state === 'ok',
+function cutLines(peers: PeersOverview, rotations: RotationsOverview | null): Prerequisite[] {
+  if (rotations) {
+    const base = prerequisites(rotations, 'renew_fleet')
+    return [
+      ...named(base, 'Tunnel connecté'),
+      ...named(base, 'Administrateur du tunnel'),
+      {
+        label: 'Gateway du domaine',
+        ok: rotations.domain.state === 'ok',
+        fix: null,
+        fixAction: null,
+        detail: reachLabel(rotations.domain),
+      },
+    ]
+  }
+  const reach = peers.certificates
+  const ok = reach.state === 'ok'
+  const detail = reachLabel(reach)
+  return ['Tunnel connecté', 'Administrateur du tunnel', 'Gateway du domaine'].map((label) => ({
+    label,
+    ok,
     fix: null,
     fixAction: null,
-    detail: reachLabel(gateway),
+    detail,
+  }))
+}
+
+/**
+ * What signing needs: Astra, the vault, a concordant domain, and no CA-PQ overlap running. A
+ * red line here leaves the row « Coupé, révocation à signer » rather than stopping the cut.
+ */
+function signLines(rotations: RotationsOverview | null): Prerequisite[] {
+  if (!rotations) {
+    return [
+      {
+        label: 'Prérequis de signature non lus.',
+        ok: false,
+        fix: null,
+        fixAction: null,
+        detail: null,
+      },
+    ]
   }
-  const overlap = overlapReason(o.caPqOverlap)
-  const cut = [...named('Tunnel connecté'), ...named('Administrateur du tunnel'), gatewayLine]
-  const sign = [
-    ...named('Service Astra'),
-    ...named('Coffre présent'),
-    ...named('Domaine concordant'),
+  const base = prerequisites(rotations, 'renew_fleet')
+  const overlap = overlapReason(rotations.caPqOverlap)
+  return [
+    ...named(base, 'Service Astra'),
+    ...named(base, 'Coffre présent'),
+    ...named(base, 'Domaine concordant'),
     { label: 'Signature possible', ok: overlap === null, fix: null, fixAction: null, detail: overlap },
   ]
-  return { cut, sign }
 }
 
 /** The line of the reads that failed, above the list: the way the rotations tab says it. */
@@ -82,7 +118,6 @@ export function PeersPanel({ onCeremony }: { onCeremony: (status: OperatorStatus
   const [peers, setPeers] = useState<PeersOverview | null>(null)
   const [peersError, setPeersError] = useState<string | null>(null)
   const [rotations, setRotations] = useState<RotationsOverview | null>(null)
-  const [rotationsError, setRotationsError] = useState<string | null>(null)
   const [selected, setSelected] = useState<string | null>(null)
   const [motif, setMotif] = useState<RevocationReasonChoice | null>(null)
   const [busy, setBusy] = useState(false)
@@ -102,13 +137,7 @@ export function PeersPanel({ onCeremony }: { onCeremony: (status: OperatorStatus
     } else {
       setPeersError(String(peersRead.reason))
     }
-    if (rotationsRead.status === 'fulfilled') {
-      setRotations(rotationsRead.value)
-      setRotationsError(null)
-    } else {
-      setRotations(null)
-      setRotationsError(String(rotationsRead.reason))
-    }
+    setRotations(rotationsRead.status === 'fulfilled' ? rotationsRead.value : null)
   }, [])
 
   useEffect(() => {
@@ -121,9 +150,11 @@ export function PeersPanel({ onCeremony }: { onCeremony: (status: OperatorStatus
 
   const rows = peers ? peerRows(peers) : []
   const chosen = rows.find((row) => row.key === selected && row.action !== null) ?? null
-  const lines = rotations && peers ? linesOf(rotations, peers.certificates) : null
+  const lines = peers ? { cut: cutLines(peers, rotations), sign: signLines(rotations) } : null
   const cutReady = lines !== null && lines.cut.every((line) => line.ok)
   const signReady = lines !== null && lines.sign.every((line) => line.ok)
+  // « Révoquer » cuts first, so it needs the cut group; « Reprendre » only signs, so it needs the sign group.
+  const gateOpen = chosen?.action === 'resume' ? signReady : cutReady
 
   const choose = (row: PeerRow) => {
     setError(null)
@@ -246,25 +277,21 @@ export function PeersPanel({ onCeremony }: { onCeremony: (status: OperatorStatus
           <Typography component="h3" sx={{ mb: 0.5, fontSize: 12.5, fontWeight: 700 }}>
             Prérequis
           </Typography>
-          {lines ? (
+          {lines && (
             <Box component="ul" sx={{ m: 0, p: 0 }}>
               {[...lines.cut, ...lines.sign].map((line) => (
-                <PrerequisiteLine key={line.label} line={line} busy={busy} onFix={() => {}} />
+                <PrerequisiteLine key={line.label} line={line} busy={busy} />
               ))}
             </Box>
-          ) : (
-            <Alert severity="warning" variant="outlined" sx={{ fontSize: 11.5 }}>
-              {`Prérequis non lus : ${rotationsError ?? 'lecture impossible'}`}
-            </Alert>
           )}
-          {lines && !signReady && (
+          {chosen.action === 'revoke' && !signReady && (
             <Typography color="text.secondary" sx={{ mt: 0.75, fontSize: 11.5 }}>
               Signature impossible pour l’instant : la coupure se fait quand même et la ligne reste
               « Coupé, révocation à signer », avec la raison.
             </Typography>
           )}
 
-          {cutReady && (
+          {gateOpen && (
             <Box sx={{ mt: 1.25 }}>
               <MotifChoice
                 legend="Motif"
