@@ -408,6 +408,11 @@ impl OpenedRevocation {
         }
     }
 
+    /// When the verified campaign closes: the second after which nothing may be approved.
+    pub fn campaign_expires_at(&self) -> u64 {
+        self.request.campaign.expires_at
+    }
+
     /// The workstation the campaign names, as the campaign carries it.
     pub fn subject_name(&self) -> &str {
         &self.subject

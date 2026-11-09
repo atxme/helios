@@ -672,3 +672,87 @@ fn opened_is_erased_on_every_exit() {
     assert!(outcome.is_err(), "already revoked");
     assert!(!held, "refused at the opening");
 }
+
+/// A resumption runs for a workstation already cut, and a refusal it says tells so.
+#[test]
+fn a_failing_resume_says_the_workstation_is_cut() {
+    let domain = domain();
+    let gateway = Gateway::admitting("poste-1", &peer());
+    let unanswering = Tunnel::new(NO_ONE_ANSWERS).expect("tunnel");
+    let ran = drive(
+        &domain,
+        RevocationGesture::Resume {
+            peer: peer().to_base64(),
+            reason: RevocationReasonChoice::StolenOrLost,
+        },
+        &target(None),
+        &gateway,
+        &unanswering,
+        Answer::Keys,
+    );
+
+    ran.refused(Refusal::AuthorityUnreachable);
+    assert!(
+        ran.last().peer_cut,
+        "the refusal says the workstation is cut"
+    );
+    assert_eq!(gateway.cuts.get(), 0, "a resumption cuts nothing");
+}
+
+/// Every JSON key, at any depth, of what the window receives.
+fn json_keys(value: &serde_json::Value, keys: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, inner) in map {
+                keys.push(key.clone());
+                json_keys(inner, keys);
+            }
+        }
+        serde_json::Value::Array(items) => items.iter().for_each(|item| json_keys(item, keys)),
+        _ => {}
+    }
+}
+
+/// The revocation's statuses carry labels only: no key name that names a secret, no
+/// deposit token, and no credential's bytes in any form the window could receive.
+#[test]
+fn the_webview_status_carries_labels_only() {
+    use base64::Engine as _;
+    let domain = domain();
+    let gateway = Gateway::admitting("poste-1", &peer());
+    let remote = Remote::armed(&domain, 2);
+    let ran = drive(
+        &domain,
+        revoke(&peer(), "poste-1"),
+        &target(None),
+        &gateway,
+        &remote,
+        Answer::Keys,
+    );
+    ran.outcome.as_ref().expect("the revocation completes");
+    let credential = TestKey::new(1).credential_id();
+
+    for status in &ran.published {
+        let value = serde_json::to_value(status).expect("status");
+        let mut keys = Vec::new();
+        json_keys(&value, &mut keys);
+        for key in &keys {
+            let lowered = key.to_lowercase();
+            for forbidden in ["secret", "pin", "token", "wrapped", "sealed", "opening"] {
+                assert!(!lowered.contains(forbidden), "{key}");
+            }
+        }
+        let text = value.to_string();
+        assert!(!text.contains("jeton-de-depot"), "the deposit's token");
+        let hex: String = credential
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let standard = base64::engine::general_purpose::STANDARD.encode(&credential);
+        let url = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&credential);
+        let raw = serde_json::to_string(&credential).expect("array");
+        for form in [hex, standard, url, raw] {
+            assert!(!text.contains(&form), "a credential's bytes as {form}");
+        }
+    }
+}

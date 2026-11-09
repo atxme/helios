@@ -387,7 +387,7 @@ impl RotationRun<'_> {
             match astra_operator::gestures::open_with_authorized_key(key.as_ref(), &vault, "") {
                 Ok(opening) => break opening,
                 Err(error) => {
-                    self.turned_down(astra_operator::operations::keys::key_step_of_opening(error))?
+                    self.turned_down(astra_operator::operations::key_step_of_opening(error))?
                 }
             }
         };

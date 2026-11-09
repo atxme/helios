@@ -120,6 +120,8 @@ fn run_with(
     reach: &Reach<'_>,
 ) -> Result<(), String> {
     let mut ceremony = Ceremony::new(session_id, locator_of(&gesture));
+    // A resumption runs for a workstation already cut: every refusal it says says so.
+    ceremony.peer_cut = matches!(gesture, RevocationGesture::Resume { .. });
     publish(ceremony.status());
 
     // Before anything is cut, and before any call: the tunnel leads to the domain's
@@ -285,6 +287,7 @@ impl<'a> RevocationRun<'a> {
         let now = self.now();
         let opened = revocation::open(self.reach.remote, self.vault_path, &self.peer, reason, now)
             .map_err(|error| self.refuse(refusal_of_open(&error), error.to_string()))?;
+        self.until = Some(opened.campaign_expires_at());
         // Shown before the first key: the operator reads what the campaign names.
         self.ceremony.remote = RemoteState::AwaitingOperator;
         self.ceremony.manifest = Some(AstraManifest::Revocation(opened.manifest(now)));

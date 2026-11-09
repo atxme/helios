@@ -221,7 +221,7 @@ export function rowsOf(manifest: AstraManifest): [string, string][] {
         ['portée', manifest.scope],
         ['motif', manifest.reason],
         ['époque de révocation', String(manifest.revocation_epoch)],
-        ['effet', instant(manifest.effective_at)],
+        ['effet au plus tôt', instant(manifest.effective_at)],
         ['domaine', manifest.trust_domain_id],
       ]
     case 'key_check':
@@ -443,7 +443,6 @@ export function retryLabel(retry: Refusal, purpose: KeyPurpose | null): string {
   }
 }
 
-/** Why it stopped. Typed, so the words are ours. */
 /** Said after any refusal once the workstation of a revocation is cut at its gateway. */
 export const CUT_PENDING_SENTENCE = 'Le poste est coupé ; la révocation reste à signer.'
 
@@ -458,6 +457,7 @@ export function refusalWithCut(
   return peerCut ? `${sentence} ${CUT_PENDING_SENTENCE}` : sentence
 }
 
+/** Why it stopped. Typed, so the words are ours. */
 export function refusalSentence(
   refusal: Refusal,
   /** The rotation journal, when the screen knows it: dates and recourse come from it. */

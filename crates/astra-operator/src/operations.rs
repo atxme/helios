@@ -8,7 +8,9 @@
 
 pub mod campaign;
 pub mod issuer;
-pub mod keys;
+pub(crate) mod keys;
+
+pub use keys::key_step_of_opening;
 pub mod recovery;
 pub mod revocation;
 pub mod rotation;
