@@ -499,6 +499,9 @@ struct GatewayAnchors {
     client_tls_ca_fingerprint: Option<Fingerprint>,
     #[serde(default)]
     next_client_tls_ca_fingerprint: Option<Fingerprint>,
+    /// When the outgoing `CA-PQ` stops being accepted, while an overlap runs.
+    #[serde(default)]
+    ca_retire_active_at: Option<u64>,
 }
 
 /// The sentence `GatewayActionRefusal` carries.
@@ -563,11 +566,7 @@ impl Tunnel {
     /// gateway that names no such anchor; a failed read is an error, and not
     /// that.
     pub fn gateway_next_anchor(&self, kind: RotationKind) -> Result<Option<Fingerprint>> {
-        let response = self
-            .get_admin("/api/certificates")
-            .context("lecture du domaine de la gateway")?;
-        let anchors: GatewayAnchors = Self::read_admin(response, MAX_DOMAIN_ANSWER_BYTES)
-            .context("lecture du domaine de la gateway")?;
+        let anchors = self.gateway_anchors()?;
         Ok(match kind {
             RotationKind::CaPq => Some(
                 anchors
@@ -578,6 +577,22 @@ impl Tunnel {
                 .next_client_tls_ca_fingerprint
                 .or(anchors.client_tls_ca_fingerprint),
         })
+    }
+
+    /// When the gateway retires the outgoing `CA-PQ`, while an overlap runs.
+    ///
+    /// Read from the same view as [`Self::gateway_next_anchor`]. `None` is a
+    /// gateway with no overlap in flight.
+    pub fn gateway_overlap_not_after(&self) -> Result<Option<u64>> {
+        Ok(self.gateway_anchors()?.ca_retire_active_at)
+    }
+
+    fn gateway_anchors(&self) -> Result<GatewayAnchors> {
+        let response = self
+            .get_admin("/api/certificates")
+            .context("lecture du domaine de la gateway")?;
+        Self::read_admin(response, MAX_DOMAIN_ANSWER_BYTES)
+            .context("lecture du domaine de la gateway")
     }
 
     fn install<T: serde::Serialize>(&self, path: &str, transition: &T) -> Result<()> {

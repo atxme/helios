@@ -8,8 +8,13 @@
 
 pub mod campaign;
 pub mod issuer;
+pub(crate) mod keys;
 pub mod recovery;
+pub mod revocation;
 pub mod rotation;
+
+#[cfg(test)]
+pub(crate) mod fixtures;
 
 use aether::certificates::status::{AstraSignerResult, CampaignApproval};
 use anyhow::{bail, Result};

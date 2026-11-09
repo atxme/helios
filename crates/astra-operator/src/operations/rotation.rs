@@ -31,7 +31,6 @@
 //! tried again, [`ResumeStep`] for a rotation that stopped, and neither is a failure
 //! of the rotation.
 
-use std::marker::PhantomData;
 use std::path::Path;
 
 use aether::certificates::approval::CredentialRegistry;
@@ -51,8 +50,9 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 use crate::authenticator::{Authenticator, AuthenticatorError, Opened};
-use crate::gestures::{self, GestureError};
+use crate::gestures;
 use crate::handoff::{self, DomainHandoff};
+use crate::operations::keys::{key_step_of_opening, may_approve, NO_PIN};
 use crate::origin::CampaignRequest;
 use crate::rotation_journal::{
     self, next_step, GatewayAnchor, JournalDeposit, JournalStage, NextLocal, ResumeFacts,
@@ -65,6 +65,8 @@ use crate::signing::{
 use crate::tunnel::{Tunnel, TunnelRefusal, VaultCopySent};
 use crate::vault::{AuthorityVault, CaTlsAdvance};
 use crate::{credentials, prepared, store};
+
+pub use super::keys::{KeyStep, ValidatedKeys};
 
 /// Default of « Modifier » on the approval screen (spec §5.1).
 pub const DEFAULT_PREPARE_DAYS: u64 = 7;
@@ -79,39 +81,6 @@ const DAY_SECS: u64 = 86_400;
 
 /// The longest a campaign may live (§7.6).
 const CAMPAIGN_WINDOW_SECS: u64 = 300;
-
-/// This ceremony has no way to ask for a PIN: the platform's dialog does, and the
-/// value never crosses into this process. Orion refuses a transport that wants one
-/// before reaching here.
-const NO_PIN: &str = "";
-
-/// Why a key was turned down. Nothing is lost: the operator can try again.
-///
-/// An error type so that [`OpenedRotation::sign_and_journal`] can also say
-/// [`KeyStep::Expired`], which a caller reads with `downcast_ref`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum KeyStep {
-    /// This key does not open the vault.
-    #[error("clé absente du coffre")]
-    NotEnrolled,
-    /// This key opens the vault, and the credential document marks it lost or revoked:
-    /// it approves nothing, and another key can take its place.
-    #[error("clé marquée perdue ou révoquée")]
-    NotApprovable,
-    /// This key has already answered: two touches of one token are not two people.
-    #[error("clé déjà utilisée")]
-    Repeated,
-    /// Not a key this step can take: outside the two validated, or one that has
-    /// approved already, which the platform cannot tell apart once it is not offered.
-    #[error("autre clé attendue")]
-    NotValidated,
-    /// No key answered, or the operator cancelled the gesture.
-    #[error("geste de la clé annulé")]
-    Declined,
-    /// The campaign's window closed. Nothing was signed.
-    #[error("campagne expirée")]
-    Expired,
-}
 
 /// What [`open`] refuses of the domain before any campaign, by its cause. Anything else
 /// it refuses is a call that failed, or files that do not describe this domain.
@@ -203,84 +172,11 @@ impl RotationRemote for Tunnel {
     }
 }
 
-/// The keys proved so far, and what each one released.
-///
-/// Dropping it wipes the openings, which is what abandoning a ceremony comes to.
-///
-/// The marker removes `Send` and `Sync` from it and from whatever holds it, so these
-/// openings stay on the thread of the ceremony that asked for them.
-pub struct ValidatedKeys {
-    vault: AuthorityVault,
-    /// The credential document beside the vault, read as it is to turn a key marked lost
-    /// down at its validation. Not trusted for anything else: [`open`] checks the keys
-    /// again against the document it has verified under `CA-PQ`.
-    registry: Option<Box<CredentialRegistry>>,
-    openings: Vec<Opened>,
-    _thread: PhantomData<*const ()>,
-}
-
 impl ValidatedKeys {
-    pub fn new(vault_path: &Path) -> Result<Self> {
-        Ok(Self {
-            vault: store::load(vault_path)?,
-            registry: credentials::load(&credentials::path_beside(vault_path))?.map(Box::new),
-            openings: Vec::with_capacity(ANCHOR_ROTATION_CREDENTIALS),
-            _thread: PhantomData,
-        })
-    }
-
-    /// One touch: proves this key opens the anchors, and returns the label of its
-    /// slot. Opens no campaign, and asks the remote nothing.
-    pub fn validate(&mut self, key: &dyn Authenticator) -> Result<String, KeyStep> {
-        if self.openings.len() >= ANCHOR_ROTATION_CREDENTIALS {
-            return Err(KeyStep::NotValidated);
-        }
-        let opened = gestures::open_with_authorized_key(key, &self.vault, NO_PIN)
-            .map_err(key_step_of_opening)?;
-        if self.is_validated(&opened.credential_id) {
-            return Err(KeyStep::Repeated);
-        }
-        gestures::prove_anchors_open(&self.vault, &opened).map_err(|_| KeyStep::NotEnrolled)?;
-        // With no document, `open` refuses before any campaign, whatever the keys.
-        if let Some(registry) = &self.registry {
-            if !may_approve(registry, &opened.credential_id) {
-                return Err(KeyStep::NotApprovable);
-            }
-        }
-        let label = self
-            .vault
-            .slot_for_credential(&opened.credential_id)
-            .map_err(|_| KeyStep::NotEnrolled)?
-            .label
-            .clone();
-        self.openings.push(opened);
-        Ok(label)
-    }
-
-    pub fn count(&self) -> usize {
-        self.openings.len()
-    }
-
     /// What [`open`] would refuse of the files beside this vault, asked before a key
     /// is touched for nothing.
     pub fn ensure_domain_readable(&self, vault_path: &Path, kind: RotationKind) -> Result<()> {
         LocalDomain::read(vault_path, &self.vault, kind).map(|_| ())
-    }
-
-    fn is_validated(&self, credential_id: &[u8]) -> bool {
-        self.openings
-            .iter()
-            .any(|opening| opening.credential_id == credential_id)
-    }
-}
-
-/// The token did not say which credential it holds: it holds none of those offered,
-/// or something got in the way of the gesture.
-fn key_step_of_opening(error: GestureError) -> KeyStep {
-    match error {
-        GestureError::Authenticator(AuthenticatorError::UnknownCredential)
-        | GestureError::Vault(_) => KeyStep::NotEnrolled,
-        _ => KeyStep::Declined,
     }
 }
 
@@ -538,19 +434,11 @@ pub fn ensure_nothing_outstanding(vault_path: &Path) -> Result<()> {
 
 /// What is shown must be what is signed, and the keys were proved against this
 /// vault: one that moved since (a key added, another ceremony) is not it any more.
-fn ensure_same_vault(vault_path: &Path, vault: &AuthorityVault) -> Result<()> {
+pub(super) fn ensure_same_vault(vault_path: &Path, vault: &AuthorityVault) -> Result<()> {
     if store::load(vault_path)?.fingerprint()? != vault.fingerprint()? {
         bail!("le coffre a changé depuis la validation des clés. Rien n'a été signé.");
     }
     Ok(())
-}
-
-/// Whether the document lets this credential approve: `active`, and nothing else.
-fn may_approve(registry: &CredentialRegistry, credential_id: &[u8]) -> bool {
-    registry
-        .approvable()
-        .iter()
-        .any(|binding| binding.credential_id == credential_id)
 }
 
 /// A key the document marks lost or revoked opens the vault and approves nothing.
