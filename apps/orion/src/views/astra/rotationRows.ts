@@ -10,6 +10,7 @@ import type {
 
 export type RotationAction =
   | 'finish_ca_tls'
+  | 'finish_ca_pq'
   | 'resume'
   | 'renew_fleet'
   | 'replace_ca_pq'
@@ -49,6 +50,8 @@ export const OVERLAP_PQ = 'Recouvrement CA-PQ en cours'
 export const AUTHORITY_UNREAD = 'Autorité non lue'
 const OVERLAP_TLS = 'Recouvrement CA TLS en cours'
 const ROTATION_PENDING = 'Rotation à reprendre'
+/** The refusal the vault gives an anchor rotation while the outgoing CA-PQ is kept. */
+const PQ_KEPT = "Terminer d'abord la rotation CA-PQ précédente."
 const VAULT_AHEAD = 'Le coffre a une époque d’avance'
 /**
  * Past `activation_at` on the journal and this machine's clock alone. Not the dead end: a
@@ -59,6 +62,7 @@ export const INSTALL_DEADLINE_TO_CHECK = 'Délai d’installation passé : à v�
 
 const TITLES: Record<RotationAction, string> = {
   finish_ca_tls: 'Terminer la rotation CA TLS',
+  finish_ca_pq: 'Terminer la rotation CA-PQ',
   resume: 'Reprendre une rotation',
   renew_fleet: 'Renouveler les postes',
   replace_ca_pq: 'Remplacer la CA-PQ',
@@ -68,6 +72,7 @@ const TITLES: Record<RotationAction, string> = {
 
 const BUTTONS: Record<RotationAction, string> = {
   finish_ca_tls: 'Terminer',
+  finish_ca_pq: 'Terminer',
   resume: 'Reprendre',
   renew_fleet: 'Renouveler',
   replace_ca_pq: 'Remplacer',
@@ -77,6 +82,7 @@ const BUTTONS: Record<RotationAction, string> = {
 
 const SCOPES: Record<RotationAction, CampaignScope | null> = {
   finish_ca_tls: null,
+  finish_ca_pq: null,
   resume: null,
   renew_fleet: 'fleet_leafs',
   replace_ca_pq: 'trust_authorities',
@@ -216,6 +222,23 @@ function finishRow(o: RotationsOverview, now: number): RotationRow | null {
   }
 }
 
+/**
+ * « Terminer la rotation CA-PQ », due at the end of the outgoing key's validity: the same
+ * rule as « Terminer » for the CA TLS.
+ */
+function finishPqRow(o: RotationsOverview, now: number): RotationRow | null {
+  if (o.retainedCaPqNotAfter === null || now < o.retainedCaPqNotAfter) return null
+  return {
+    action: 'finish_ca_pq',
+    title: TITLES.finish_ca_pq,
+    state: `À faire · fin le ${formatDate(o.retainedCaPqNotAfter)}`,
+    due: true,
+    disabledReason: null,
+    button: BUTTONS.finish_ca_pq,
+    detail: null,
+  }
+}
+
 function resumeRow(o: RotationsOverview, now: number): RotationRow | null {
   if (!o.resumable) return null
   const journal = o.journal
@@ -290,6 +313,7 @@ function caPqWindowOpen(o: RotationsOverview): boolean {
 /** One CA rotation at a time: the reason the other is not offered, if there is one. */
 function replaceBlock(o: RotationsOverview): string | null {
   if (caPqWindowOpen(o)) return OVERLAP_PQ
+  if (o.retainedCaPqNotAfter !== null) return PQ_KEPT
   if (caTlsWindowOpen(o)) return OVERLAP_TLS
   if (o.resumable) return ROTATION_PENDING
   if (o.caPqOverlap === null) return AUTHORITY_UNREAD
@@ -418,6 +442,7 @@ export function rotationRows(o: RotationsOverview, local: number): RotationRow[]
   const now = effectiveNow(o, local)
   const rows = [
     finishRow(o, now),
+    finishPqRow(o, now),
     resumeRow(o, now),
     fleetRow(o, now),
     replacePqRow(o),
@@ -561,7 +586,9 @@ export function prerequisites(o: RotationsOverview, action: RotationAction): Pre
     detail: null,
   }
   // « Terminer » asks the key and moves the vault; its copy afterwards may fail.
-  if (action === 'finish_ca_tls') return [tunnel, vaultPrerequisite(o)]
+  if (action === 'finish_ca_tls' || action === 'finish_ca_pq') {
+    return [tunnel, vaultPrerequisite(o)]
+  }
   if (action === 'resume' && resumesOnTheGatewayAlone(o)) {
     return [tunnel, admin, vaultPrerequisite(o)]
   }
@@ -576,6 +603,40 @@ export function prerequisites(o: RotationsOverview, action: RotationAction): Pre
 }
 
 export const allGreen = (lines: Prerequisite[]) => lines.every((line) => line.ok)
+
+/**
+ * The terms « Remplacer » proposes at « Approuver » (`RotationSteps`). The warning measures
+ * the window they open, before the operator has changed any of them.
+ */
+export const PROPOSED_TERMS = { prepare_days: 7, overlap_days: 30 } as const
+
+/** « 12/01/2027 », the day-month-year form the warning uses. */
+function formatDayMonthYear(seconds: number): string {
+  return new Intl.DateTimeFormat('fr-FR', {
+    day: '2-digit',
+    month: '2-digit',
+    year: 'numeric',
+    timeZone: 'Europe/Paris',
+  }).format(new Date(seconds * 1_000))
+}
+
+/**
+ * One line per workstation whose certificate ends before the planned window of « Remplacer
+ * la CA-PQ » closes, measured on the gateway clock. The gateway lists only the workstations
+ * it has not revoked. A warning only: it blocks nothing.
+ */
+export function expiringWorkstationWarnings(o: RotationsOverview, local: number): string[] {
+  const workstations = valueOf(o.workstations)
+  if (!workstations) return []
+  const windowEnd =
+    effectiveNow(o, local) + (PROPOSED_TERMS.prepare_days + PROPOSED_TERMS.overlap_days) * DAY
+  return workstations
+    .filter((workstation) => workstation.not_after < windowEnd)
+    .map(
+      (workstation) =>
+        `${workstation.name} expire le ${formatDayMonthYear(workstation.not_after)}, pendant le changement.`,
+    )
+}
 
 /**
  * The sentence of a stop that gives its cause and its recourse. `astra-signer rotate-ca-pq`

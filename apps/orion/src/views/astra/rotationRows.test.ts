@@ -12,6 +12,7 @@ import {
 import {
   allGreen,
   effectiveNow,
+  expiringWorkstationWarnings,
   journalLine,
   liveOperation,
   plainFingerprint,
@@ -624,5 +625,65 @@ describe('the wording', () => {
     }
     texts.push(stopSentence('domain_conflict', null), stopSentence('install_deadline_passed', null))
     for (const text of texts) expect(text).not.toMatch(/\b(tu|te|ton|ta|tes|toi)\b/i)
+  })
+})
+
+describe('the CA-PQ finish row', () => {
+  it('finish_ca_pq_row_appears_at_not_after', () => {
+    const before = overview({ retainedCaPqNotAfter: NOW + 5 })
+    expect(row(before, 'finish_ca_pq')).toBeUndefined()
+    const at = overview({ retainedCaPqNotAfter: NOW })
+    expect(row(at, 'finish_ca_pq')?.due).toBe(true)
+    expect(row(at, 'finish_ca_pq')?.title).toBe('Terminer la rotation CA-PQ')
+    expect(row(at, 'finish_ca_pq')?.state).toMatch(/^À faire · fin le /)
+    expect(row(at, 'finish_ca_pq')?.button).toBe('Terminer')
+    expect(row(overview(), 'finish_ca_pq')).toBeUndefined()
+  })
+
+  it('finish_ca_pq_needs_the_tunnel_and_the_vault_only', () => {
+    const o = overview({
+      retainedCaPqNotAfter: NOW - 1,
+      pending: { state: 'astra_unavailable' },
+      authority: { state: 'astra_unavailable' },
+    })
+    const lines = prerequisites(o, 'finish_ca_pq')
+    expect(lines.map((p) => p.label)).toEqual(['Tunnel connecté', 'Coffre présent'])
+    expect(allGreen(lines)).toBe(true)
+  })
+
+  it('replace_rows_wait_for_finish_ca_pq', () => {
+    const reason = "Terminer d'abord la rotation CA-PQ précédente."
+    for (const o of [
+      overview({ retainedCaPqNotAfter: NOW + 5 }),
+      overview({ retainedCaPqNotAfter: NOW }),
+    ]) {
+      expect(row(o, 'replace_ca_pq')?.disabledReason).toBe(reason)
+      expect(row(o, 'replace_ca_tls')?.disabledReason).toBe(reason)
+    }
+    // An overlap still running keeps its own reason: it is the first cause the operator meets.
+    const overlap = overview({ retainedCaPqNotAfter: NOW, caPqOverlap: true })
+    expect(row(overlap, 'replace_ca_pq')?.disabledReason).toBe('Recouvrement CA-PQ en cours')
+    expect(row(overview(), 'replace_ca_pq')?.disabledReason).toBeNull()
+  })
+
+  it('replace_ca_pq_warns_about_expiring_peers', () => {
+    const o = overview({
+      workstations: {
+        state: 'ok',
+        value: [
+          { name: 'PORTABLE', not_after: NOW + 10 * DAY },
+          { name: 'FIXE', not_after: NOW + 60 * DAY },
+          { name: 'BORDURE', not_after: NOW + 37 * DAY },
+        ],
+      },
+    })
+    // The window is prepare (7) + overlap (30) days from now on the gateway clock.
+    expect(expiringWorkstationWarnings(o, NOW)).toEqual([
+      'PORTABLE expire le 25/01/2027, pendant le changement.',
+    ])
+    // A warning, not a block: the row stays open and its prerequisites green.
+    expect(row(o, 'replace_ca_pq')?.disabledReason).toBeNull()
+    expect(allGreen(prerequisites(o, 'replace_ca_pq'))).toBe(true)
+    expect(expiringWorkstationWarnings(overview({ workstations: { state: 'unreachable' } }), NOW)).toEqual([])
   })
 })

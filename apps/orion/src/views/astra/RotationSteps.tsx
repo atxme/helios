@@ -29,6 +29,7 @@ import {
 import type { RotationStepContext } from './RotationsPanel'
 import {
   INSTALL_DEADLINE_TO_CHECK,
+  PROPOSED_TERMS,
   formatDate,
   formatDateTime,
   formatTime,
@@ -49,7 +50,7 @@ import {
  * that is shown.
  */
 
-const TERMS_DEFAULT = { prepare_days: 7, overlap_days: 30, validity_days: 1825 }
+const TERMS_DEFAULT = { ...PROPOSED_TERMS, validity_days: 1825 }
 /** The authority's own limit on a campaign's reason. */
 const REASON_MAX_CHARS = 1024
 /** Two distinct keys, each touched to validate and again to approve. */
@@ -78,6 +79,7 @@ const GESTURES = {
   replace_ca_pq: { gesture: 'replace_ca_pq' },
   replace_ca_tls: { gesture: 'replace_ca_tls' },
   finish_ca_tls: { gesture: 'finish_ca_tls' },
+  finish_ca_pq: { gesture: 'finish_ca_pq' },
   resume: { gesture: 'resume' },
 } as const
 
@@ -85,6 +87,7 @@ const START_LABELS = {
   replace_ca_pq: 'Continuer',
   replace_ca_tls: 'Continuer',
   finish_ca_tls: 'Terminer',
+  finish_ca_pq: 'Terminer',
   resume: 'Reprendre',
 } as const
 
@@ -508,7 +511,9 @@ export function RotationCeremony({
   const known = journal ? journal.kind : (manifest?.affected_ca ?? null)
   const knownName = known === 'ca_pq' ? 'CA-PQ' : known === 'ca_tls' ? 'CA TLS' : null
   const title = finishing
-    ? 'Terminer la rotation CA TLS'
+    ? operation === 'rotate_anchor'
+      ? 'Terminer la rotation CA-PQ'
+      : 'Terminer la rotation CA TLS'
     : stage === 'keys' || stage === 'touches'
       ? `Remplacer la ${name}`
       : // Until the journal is read a resumption does not know which CA it carries.

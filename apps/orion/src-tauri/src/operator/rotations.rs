@@ -27,7 +27,7 @@ use astra_operator::rotation_journal::{self, JournalStage, RotationJournal, Rota
 use astra_operator::tunnel::VaultCopySent;
 use astra_operator::{credentials, prepared};
 use orion_core::operator_rotations::{
-    AuthorityStatusRead, GatewayDomainRead, PendingOperationRead, Reach,
+    AuthorityStatusRead, GatewayDomainRead, PeerCertificatesRead, PendingOperationRead, Reach,
 };
 use serde::Serialize;
 
@@ -197,6 +197,9 @@ pub struct Local {
     /// The epoch of the credential document beside the vault. A key added, removed or
     /// marked puts it ahead of the one Astra serves until a copy carries it there.
     pub credential_registry_epoch: Option<u64>,
+    /// When the outgoing CA-PQ the vault keeps ends, for « Terminer la rotation CA-PQ ».
+    /// Read from the clear copy, without a key; `None` when no key is kept.
+    pub retained_ca_pq_not_after: Option<u64>,
 }
 
 /// The journal and whether anything calls for a resumption, read from the files beside
@@ -258,7 +261,17 @@ pub fn read_local(vault_path: &Result<std::path::PathBuf, String>, now: u64) -> 
         ca_tls_close_at: close_at,
         ca_tls_not_after: ca_tls_not_after(path),
         credential_registry_epoch: local_credentials_epoch(path),
+        retained_ca_pq_not_after: retained_ca_pq_not_after(path),
     }
+}
+
+/// The end of the outgoing CA-PQ the vault keeps, read without a key: the clear copy of
+/// it, which only « Terminer » removes.
+fn retained_ca_pq_not_after(vault_path: &Path) -> Option<u64> {
+    let vault = astra_operator::store::load(vault_path).ok()?;
+    vault
+        .retained_outgoing_ca_pq_public()
+        .map(|(_, _, not_after)| not_after)
 }
 
 /// The expiry of the CA TLS the relay records. Nothing is opened: the relay and the
@@ -285,6 +298,28 @@ fn ca_tls_close_at(vault_path: &Path) -> Option<u64> {
         Ok(Some(record)) if record.submitted && record.adopted => Some(record.not_after),
         _ => None,
     }
+}
+
+/// A workstation as the warning before « Remplacer la CA-PQ » names it: its name and
+/// when its certificate ends. No key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WorkstationExpiry {
+    pub name: String,
+    pub not_after: u64,
+}
+
+/// The workstations the gateway has not revoked, as [`WorkstationExpiry`].
+pub fn workstations_of(certificates: Reach<PeerCertificatesRead>) -> Reach<Vec<WorkstationExpiry>> {
+    certificates.map(|read| {
+        read.peers
+            .into_iter()
+            .filter(|peer| !peer.revoked)
+            .map(|peer| WorkstationExpiry {
+                name: peer.name,
+                not_after: peer.not_after,
+            })
+            .collect()
+    })
 }
 
 /// Everything the screen needs, in one answer.
@@ -318,6 +353,11 @@ pub struct RotationsOverview {
     pub ca_pq_overlap: Option<bool>,
     pub ca_tls_close_due: bool,
     pub ca_tls_close_at: Option<u64>,
+    /// When « Terminer la rotation CA-PQ » falls due: the end of the outgoing CA-PQ the
+    /// vault keeps. `None` when none is kept.
+    pub retained_ca_pq_not_after: Option<u64>,
+    /// The workstations not revoked, for the warning before « Remplacer la CA-PQ ».
+    pub workstations: Reach<Vec<WorkstationExpiry>>,
 }
 
 impl RotationsOverview {
@@ -326,6 +366,7 @@ impl RotationsOverview {
         pending: Reach<Vec<PendingOperationRead>>,
         authority: Reach<AuthorityStatusRead>,
         domain: Reach<GatewayDomainRead>,
+        certificates: Reach<PeerCertificatesRead>,
         local: Local,
     ) -> Self {
         let Local {
@@ -337,6 +378,7 @@ impl RotationsOverview {
             ca_tls_close_at,
             ca_tls_not_after,
             credential_registry_epoch,
+            retained_ca_pq_not_after,
         } = local;
         let ca_pq_overlap = authority
             .ok()
@@ -369,6 +411,8 @@ impl RotationsOverview {
             ca_pq_overlap,
             ca_tls_close_due,
             ca_tls_close_at,
+            retained_ca_pq_not_after,
+            workstations: workstations_of(certificates),
         }
     }
 }
@@ -504,5 +548,67 @@ mod journal_tests {
         // Unreadable is not shown as a journal with invented dates.
         assert_eq!(read.journal, None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod overview_tests {
+    use super::*;
+    use orion_core::operator_rotations::{PeerCertificateRead, PeerCertificatesRead};
+
+    fn peer(name: &str, not_after: u64, revoked: bool) -> PeerCertificateRead {
+        PeerCertificateRead {
+            name: name.into(),
+            wg_public_key: "a".repeat(44),
+            not_before: 0,
+            not_after,
+            revoked,
+            renewing: false,
+        }
+    }
+
+    fn assembled(local: Local, certificates: Reach<PeerCertificatesRead>) -> RotationsOverview {
+        RotationsOverview::assemble(
+            true,
+            Reach::Unreachable,
+            Reach::Unreachable,
+            Reach::Unreachable,
+            certificates,
+            local,
+        )
+    }
+
+    /// The kept key's expiry reaches the page, and nothing of the key does.
+    #[test]
+    fn rotations_overview_carries_the_kept_expiry_and_no_key() {
+        let local = Local {
+            retained_ca_pq_not_after: Some(1_900_000_000),
+            ..Local::default()
+        };
+        let shown = serde_json::to_value(assembled(local, Reach::Unreachable)).expect("json");
+        assert_eq!(shown["retainedCaPqNotAfter"], 1_900_000_000);
+
+        let kept_nothing =
+            serde_json::to_value(assembled(Local::default(), Reach::Unreachable)).expect("json");
+        assert!(kept_nothing["retainedCaPqNotAfter"].is_null());
+    }
+
+    /// Only the workstations not revoked reach the page, with their name and expiry.
+    #[test]
+    fn rotations_overview_lists_the_workstations_not_revoked() {
+        let certificates = Reach::Ok(PeerCertificatesRead {
+            now_unix: Some(1),
+            peers: vec![peer("PORTABLE", 10, false), peer("ANCIEN", 5, true)],
+        });
+        let shown = serde_json::to_value(assembled(Local::default(), certificates)).expect("json");
+        assert_eq!(shown["workstations"]["state"], "ok");
+        assert_eq!(
+            shown["workstations"]["value"],
+            serde_json::json!([{ "name": "PORTABLE", "not_after": 10 }])
+        );
+
+        let unread =
+            serde_json::to_value(assembled(Local::default(), Reach::Unreachable)).expect("json");
+        assert_eq!(unread["workstations"]["state"], "unreachable");
     }
 }

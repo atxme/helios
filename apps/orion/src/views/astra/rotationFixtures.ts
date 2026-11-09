@@ -84,6 +84,8 @@ export const overview = (extra: Partial<RotationsOverview> = {}): RotationsOverv
   caPqOverlap: false,
   caTlsCloseDue: false,
   caTlsCloseAt: null,
+  retainedCaPqNotAfter: null,
+  workstations: { state: 'ok', value: [] },
   ...extra,
 })
 

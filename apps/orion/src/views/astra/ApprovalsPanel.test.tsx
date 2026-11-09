@@ -97,6 +97,8 @@ beforeEach(() => {
     caPqOverlap: false,
     caTlsCloseDue: false,
     caTlsCloseAt: null,
+    retainedCaPqNotAfter: null,
+    workstations: { state: 'ok', value: [] },
   })
 })
 afterEach(cleanup)

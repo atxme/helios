@@ -984,6 +984,7 @@ export type RotationGesture =
   | { gesture: 'replace_ca_pq' }
   | { gesture: 'replace_ca_tls' }
   | { gesture: 'finish_ca_tls' }
+  | { gesture: 'finish_ca_pq' }
   | { gesture: 'resume' }
 
 /** Ce que l'écran d'approbation fixe. Public, comme le manifeste qui en découle. */
@@ -1118,6 +1119,19 @@ export interface RotationsOverview {
   caTlsCloseDue: boolean
   /** Quand « Terminer » est dû (fin du recouvrement), échu ou non ; `null` sans rotation à clore. */
   caTlsCloseAt: number | null
+  /**
+   * Fin de la CA-PQ sortante gardée pour « Terminer la rotation CA-PQ » ; `null` si aucune
+   * n'est gardée. Date publique seulement, jamais la clé.
+   */
+  retainedCaPqNotAfter: number | null
+  /** Les postes non révoqués, nom et échéance, pour l'avertissement de « Remplacer la CA-PQ ». */
+  workstations: Reach<WorkstationExpiry[]>
+}
+
+/** Un poste non révoqué : son nom et la fin de son certificat. Ni clé ni jeton. */
+export interface WorkstationExpiry {
+  name: string
+  not_after: number
 }
 
 /** Un poste tel que le registre de certificats de la gateway le donne, révoqué compris. */

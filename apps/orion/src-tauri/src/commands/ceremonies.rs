@@ -366,9 +366,11 @@ pub(crate) async fn operator_rotations_overview(
                     reads::pending(&target.address),
                     reads::authority_status(&target.address),
                     reads::domain(&target.address),
+                    reads::peer_certificates(&target.address),
                 )
             }
             None => (
+                reads::Reach::Unreachable,
                 reads::Reach::Unreachable,
                 reads::Reach::Unreachable,
                 reads::Reach::Unreachable,
@@ -381,13 +383,14 @@ pub(crate) async fn operator_rotations_overview(
         "la lecture du coffre",
         move || Ok(read_local(&vault_path, now)),
     );
-    let ((pending, authority, domain), local) = tokio::join!(reads, local);
+    let ((pending, authority, domain, certificates), local) = tokio::join!(reads, local);
     let local = local?;
     Ok(RotationsOverview::assemble(
         target.is_some(),
         pending,
         authority,
         domain,
+        certificates,
         local,
     ))
 }

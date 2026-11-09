@@ -18,6 +18,7 @@ import type {
 } from '../../types'
 import {
   allGreen,
+  expiringWorkstationWarnings,
   liveOperation,
   prerequisites,
   reachLabel,
@@ -406,6 +407,13 @@ export function RotationsPanel({
           >
             Vérifier
           </Button>
+          {/* A warning, not a block: the workstations are named, the step stays open. */}
+          {chosen.action === 'replace_ca_pq' &&
+            expiringWorkstationWarnings(overview, now).map((warning) => (
+              <Typography key={warning} sx={{ mt: 0.75, fontSize: 11.5, color: DUE_BORDER }}>
+                {warning}
+              </Typography>
+            ))}
 
           {(chosen.action === 'renew_fleet' || chosen.action === 'renew_delegation') && (
             <Box sx={{ mt: 1.25 }}>

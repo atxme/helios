@@ -3094,6 +3094,7 @@ mod overview {
             Reach::Ok(Vec::new()),
             Reach::Ok(authority.into()),
             Reach::<GatewayDomainRead>::Unreachable,
+            Reach::Unreachable,
             local(bench),
         )
     }
@@ -3230,6 +3231,7 @@ mod overview {
                 Reach::Unreachable,
                 unread,
                 Reach::<GatewayDomainRead>::Unreachable,
+                Reach::Unreachable,
                 local(&bench),
             );
             assert_eq!(overview.ca_pq_overlap, None);
@@ -3676,6 +3678,7 @@ mod overview {
         assert_eq!(unresolved.vault_error, Some("emplacement"));
         let shown = serde_json::to_string(&RotationsOverview::assemble(
             false,
+            Reach::Unreachable,
             Reach::Unreachable,
             Reach::Unreachable,
             Reach::Unreachable,
