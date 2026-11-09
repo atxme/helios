@@ -220,8 +220,8 @@ async fn the_admitted_keys_are_those_of_the_peers() {
     let network = serde_json::json!({
         "wg_public_key": GATEWAY_KEY, "wg_address": "100.64.0.1/10",
         "peers": [
-            {"public_key": "AAA", "address": "100.64.1.2/32"},
-            {"public_key": " BBB ", "address": "100.64.1.3/32"}
+            {"name": "PC_FIXE", "public_key": "AAA", "address": "100.64.1.2/32"},
+            {"name": "PORTABLE", "public_key": " BBB ", "address": "100.64.1.3/32"}
         ]
     });
     let (base, _) = fake_gateway(vec![("/api/network", 200, network.to_string())]).await;
@@ -243,7 +243,7 @@ fn negotiation_view(bound_to: &str) -> String {
 fn network_view(wg_public_key: Option<&str>) -> String {
     serde_json::json!({
         "wg_public_key": wg_public_key, "wg_address": "100.64.0.1/10",
-        "peers": [{"public_key": CLIENT_KEY, "address": "100.64.1.2/32",
+        "peers": [{"name": "PC_FIXE", "public_key": CLIENT_KEY, "address": "100.64.1.2/32",
                    "address_v6": " "}]
     })
     .to_string()
@@ -410,4 +410,59 @@ fn a_pq_leaf_is_read_from_json_or_base64_only() {
     assert!(decode_pq_certificate("").is_err());
     assert!(decode_pq_certificate("{\"version\":1}").is_err());
     assert!(decode_pq_certificate(&STANDARD.encode("not json")).is_err());
+}
+
+#[tokio::test]
+async fn the_admitted_peers_carry_their_names_and_keys() {
+    let network = serde_json::json!({
+        "wg_public_key": GATEWAY_KEY, "wg_address": "100.64.0.1/10",
+        "peers": [
+            {"name": "PC_FIXE", "public_key": "AAA", "address": "100.64.1.2/32"},
+            {"name": "PORTABLE", "public_key": " BBB ", "address": "100.64.1.3/32"}
+        ]
+    });
+    let (base, _) = fake_gateway(vec![("/api/network", 200, network.to_string())]).await;
+    assert_eq!(
+        admitted_peers(&client(), &base).await.unwrap(),
+        [
+            AdmittedPeer {
+                name: "PC_FIXE".into(),
+                wg_public_key: "AAA".into()
+            },
+            AdmittedPeer {
+                name: "PORTABLE".into(),
+                wg_public_key: "BBB".into()
+            },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn revoking_a_peer_posts_its_name_to_the_gateway() {
+    let (base, seen) = fake_gateway(vec![("/api/peers/revoke", 200, "{}".into())]).await;
+    revoke_peer(&client(), &format!("{base}/"), "PORTABLE")
+        .await
+        .unwrap();
+    assert_eq!(
+        seen.lock().unwrap().as_slice(),
+        ["POST /api/peers/revoke HTTP/1.1"]
+    );
+}
+
+#[test]
+fn the_revocation_body_carries_the_name_and_nothing_else() {
+    let body = serde_json::to_value(RevokeWire { name: "PORTABLE" }).unwrap();
+    assert_eq!(body, serde_json::json!({"name": "PORTABLE"}));
+}
+
+#[tokio::test]
+async fn a_gateway_refusing_the_revocation_says_so() {
+    let (base, _) = fake_gateway(vec![("/api/peers/revoke", 404, "unknown peer".into())]).await;
+    assert_eq!(
+        revoke_peer(&client(), &base, "ghost").await.unwrap_err(),
+        GatewayAdminError::Refused {
+            status: 404,
+            reason: Some("unknown peer".into())
+        }
+    );
 }

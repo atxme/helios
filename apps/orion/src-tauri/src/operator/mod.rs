@@ -34,6 +34,7 @@
 mod ceremony;
 pub mod invitations;
 pub mod location;
+pub mod peers;
 pub mod rotations;
 
 use std::path::PathBuf;

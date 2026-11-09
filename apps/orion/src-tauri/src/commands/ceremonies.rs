@@ -376,6 +376,95 @@ pub(crate) async fn operator_rotations_overview(
     ))
 }
 
+/// Everything the *Postes* tab shows, in one read and with no key.
+///
+/// Each source answers on its own; see [`crate::operator::peers`]. Without a
+/// connected gateway the gateway and Astra reads are `unreachable`. The decision
+/// waiting on this machine and the workstation's own key are read whatever the
+/// tunnel does. The page receives names, public keys and dates only.
+#[tauri::command]
+pub(crate) async fn operator_peers_overview(
+    state: State<'_, AppState>,
+) -> Result<crate::operator::peers::PeersOverview, String> {
+    use crate::operator::peers;
+    use orion_core::gateway_admin;
+    use orion_core::operator_rotations::{self as reads, Reach};
+
+    let view = match state.client.call(EngineCommand::GetConfig).await? {
+        EngineReply::Config(view) => view,
+        _ => return Err(unexpected_engine_reply()),
+    };
+    let own_key = peers::own_key_of(&view);
+    let vault_path = state.vault_location.path_to_look_at();
+    let target = connected_target(&state).await.ok();
+    // Concurrent: a gateway that hangs for its whole wait must not delay the others.
+    let gateway_reads = async {
+        match &target {
+            Some(target) => {
+                let admitted = async {
+                    match gateway_admin::orion_client() {
+                        Ok(http) => peers::reach_of_admin(
+                            gateway_admin::admitted_peers(&http, &target.address).await,
+                        ),
+                        Err(_) => Reach::Unreachable,
+                    }
+                };
+                tokio::join!(
+                    reads::peer_certificates(&target.address),
+                    admitted,
+                    reads::authority_status(&target.address),
+                    reads::pending(&target.address),
+                )
+            }
+            None => (
+                Reach::Unreachable,
+                Reach::Unreachable,
+                Reach::Unreachable,
+                Reach::Unreachable,
+            ),
+        }
+    };
+    let (certificates, admitted, astra, pending) = gateway_reads.await;
+    // The gateway's clock when it answered: the local one only when it did not.
+    let now = peers::clock_of(&certificates).unwrap_or_else(crate::operator::now_unix);
+    let gateway_address = target.map(|target| target.address);
+    on_work_stack("orion-peers-overview", "la lecture des postes", move || {
+        // One tunnel for the campaign fetches, on the work stack: they block.
+        let pending_revocations = match gateway_address.as_deref() {
+            Some(address) => match astra_operator::tunnel::Tunnel::new(address) {
+                Ok(tunnel) => peers::pending_revocations(pending, |id| {
+                    tunnel
+                        .fetch_campaign(id)
+                        .map(|campaign| campaign.campaign.targets.clone())
+                        .map_err(|error| format!("{error:#}"))
+                }),
+                Err(_) => Reach::Unreachable,
+            },
+            None => Reach::Unreachable,
+        };
+        let local_pending = match vault_path {
+            Ok(path) => match astra_operator::operations::revocation::pending(&path, now) {
+                Ok(Some(signed)) => signed.peer().ok().map(|key| key.to_base64()),
+                Ok(None) => None,
+                Err(error) => {
+                    tracing::warn!(%error, "révocation en attente illisible");
+                    None
+                }
+            },
+            Err(_) => None,
+        };
+        Ok(peers::assemble(
+            certificates,
+            admitted,
+            astra,
+            pending_revocations,
+            own_key,
+            local_pending,
+        ))
+    })
+    .await
+}
+
 /// Sends the vault copy Astra keeps, and the credential document when it may.
 ///
 /// The vault and the credentials are read here, from beside the vault; the page

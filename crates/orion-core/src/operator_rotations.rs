@@ -236,6 +236,72 @@ pub async fn authority_status(gateway: &str) -> Reach<AuthorityStatusRead> {
     .await
 }
 
+/// One admitted peer's certificate, as the gateway's registry holds it: what the
+/// console draws of a workstation. Names, keys and dates; no certificate body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerCertificateRead {
+    pub name: String,
+    pub wg_public_key: String,
+    pub not_before: u64,
+    pub not_after: u64,
+    pub revoked: bool,
+    /// A renewal is under way: a candidate generation is leased, or a successor
+    /// is committed and waits for its activation.
+    pub renewing: bool,
+}
+
+/// Every peer of the domain's certificate registry, revoked ones included, with
+/// the gateway's clock when it answered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerCertificatesRead {
+    pub now_unix: Option<u64>,
+    pub peers: Vec<PeerCertificateRead>,
+}
+
+/// The part of `GET /api/certificates` the peers screen draws from. Tolerant
+/// like the other reads: a field a later gateway adds does not blind the screen.
+#[derive(Deserialize)]
+struct PeerCertificatesWire {
+    #[serde(default)]
+    now_unix: Option<u64>,
+    peers: Vec<PeerCertificateWire>,
+}
+
+#[derive(Deserialize)]
+struct PeerCertificateWire {
+    name: String,
+    wg_public_key: String,
+    not_before: u64,
+    not_after: u64,
+    revoked: bool,
+    #[serde(default)]
+    pending: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    next_generation: Option<u64>,
+}
+
+/// The gateway's registry of peers, every one of them: the domain read above
+/// leaves the revoked ones out, and the peers screen needs them.
+pub async fn peer_certificates(gateway: &str) -> Reach<PeerCertificatesRead> {
+    read::<PeerCertificatesWire>(gateway, "/api/certificates", MAX_DOMAIN_ANSWER_BYTES)
+        .await
+        .map(|wire| PeerCertificatesRead {
+            now_unix: wire.now_unix,
+            peers: wire
+                .peers
+                .into_iter()
+                .map(|peer| PeerCertificateRead {
+                    renewing: peer.pending.is_some() || peer.next_generation.is_some(),
+                    name: peer.name,
+                    wg_public_key: peer.wg_public_key,
+                    not_before: peer.not_before,
+                    not_after: peer.not_after,
+                    revoked: peer.revoked,
+                })
+                .collect(),
+        })
+}
+
 /// The gateway's own view of the domain.
 pub async fn domain(gateway: &str) -> Reach<GatewayDomainRead> {
     read::<GatewayDomainRead>(gateway, "/api/certificates", MAX_DOMAIN_ANSWER_BYTES)

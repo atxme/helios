@@ -303,3 +303,38 @@ async fn status_read_tolerates_the_new_fields() {
     assert!(older.revoked_peers.is_empty());
     assert_eq!(older.served_credentials, None);
 }
+
+#[tokio::test]
+async fn the_peer_certificates_keep_the_revoked_peers_and_the_gateways_clock() {
+    let body = serde_json::json!({
+        "now_unix": 5_000,
+        "ca_epoch": 1,
+        "peers": [
+            {"name": "PC_FIXE", "wg_public_key": "AAA", "generation": 2,
+             "not_before": 100, "not_after": 900, "revoked": false,
+             "pending": null, "next_generation": null},
+            {"name": "PORTABLE", "wg_public_key": "BBB", "generation": 1,
+             "not_before": 100, "not_after": 800, "revoked": false,
+             "pending": {"generation": 3, "state": "leased", "stage_expires_at": 9},
+             "next_generation": null},
+            {"name": "PC_BUREAU", "wg_public_key": "CCC", "generation": 4,
+             "not_before": 10, "not_after": 700, "revoked": true,
+             "pending": null, "next_generation": 5}
+        ]
+    });
+    let Reach::Ok(read) = answered(200, &body.to_string(), async |url| {
+        peer_certificates(url).await
+    })
+    .await
+    else {
+        panic!("the domain view must read");
+    };
+    assert_eq!(read.now_unix, Some(5_000));
+    let names: Vec<_> = read.peers.iter().map(|peer| peer.name.as_str()).collect();
+    assert_eq!(names, ["PC_FIXE", "PORTABLE", "PC_BUREAU"]);
+    assert!(read.peers[2].revoked, "a revoked peer stays listed");
+    assert_eq!(read.peers[2].wg_public_key, "CCC");
+    assert_eq!(read.peers[2].not_after, 700);
+    let renewing: Vec<_> = read.peers.iter().map(|peer| peer.renewing).collect();
+    assert_eq!(renewing, [false, true, true]);
+}

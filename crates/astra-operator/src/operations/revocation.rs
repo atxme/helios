@@ -206,7 +206,7 @@ pub struct SignedRevocation {
 
 impl SignedRevocation {
     /// The workstation this decision revokes.
-    fn peer(&self) -> Result<WireGuardKey> {
+    pub fn peer(&self) -> Result<WireGuardKey> {
         match self.result.objects.first() {
             Some(TrustUpdateObject::CertificateRevocation(revocation)) => {
                 Ok(revocation.identity_key)

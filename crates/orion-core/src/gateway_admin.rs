@@ -125,6 +125,7 @@ struct NetworkView {
 
 #[derive(Deserialize)]
 struct PeerView {
+    name: String,
     public_key: String,
     address: String,
     #[serde(default)]
@@ -347,6 +348,57 @@ pub async fn gateway_material(
         trust,
     };
     Ok((material, admission))
+}
+
+/// A peer the gateway has admitted: the name it was admitted under, and its
+/// WireGuard public key. Nothing else of the view is kept.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdmittedPeer {
+    pub name: String,
+    pub wg_public_key: String,
+}
+
+/// The name and public key of every peer the gateway has admitted.
+pub async fn admitted_peers(
+    client: &Client,
+    base: &str,
+) -> Result<Vec<AdmittedPeer>, GatewayAdminError> {
+    let network = network_view(client, base).await?;
+    Ok(network
+        .peers
+        .into_iter()
+        .map(|peer| AdmittedPeer {
+            name: peer.name.trim().to_string(),
+            wg_public_key: peer.public_key.trim().to_string(),
+        })
+        .collect())
+}
+
+/// The body of `POST /api/peers/revoke`: the name, as the gateway holds it.
+#[derive(Serialize)]
+struct RevokeWire<'a> {
+    name: &'a str,
+}
+
+/// Withdraws a peer's admission, by the name the gateway admitted it under.
+///
+/// The gateway names a peer only once (`NameTaken`), so the name is the
+/// peer's identity on this route. The caller checks that it designates the
+/// key it means before calling: this function does not.
+pub async fn revoke_peer(client: &Client, base: &str, name: &str) -> Result<(), GatewayAdminError> {
+    let body = serde_json::to_vec(&RevokeWire { name })
+        .map_err(|_| invalid("la révocation n'a pas pu être encodée"))?;
+    let (status, response) = exchange(
+        client
+            .post(url(base, "/api/peers/revoke"))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body),
+    )
+    .await?;
+    match status {
+        200..=299 => Ok(()),
+        status => Err(status_error(status, &response)),
+    }
 }
 
 /// The public keys of every peer the gateway has admitted.
