@@ -19,7 +19,7 @@ use super::*;
 ///
 /// Without a channel this is exactly the old behaviour — an unknown peer stays
 /// unknown, and the renewal is refused by name.
-pub async fn transcribe_peer(
+pub(crate) async fn transcribe_peer(
     service: &AstraService,
     caller: &WireGuardKey,
     now_unix: u64,
@@ -41,7 +41,14 @@ pub async fn transcribe_peer(
     let view = gateway
         .peer_state(caller)
         .await
-        .map_err(|error| RenewalError::Gateway(error.to_string()))?;
+        .map_err(|error| match error {
+            // The gateway answered and refuses the key: it does not admit it.
+            // Any other failure is a channel that could not be read.
+            astra_channel::ChannelError::Status(status) if status.as_u16() == 403 => {
+                RenewalError::UnknownPeer
+            }
+            error => RenewalError::Gateway(error.to_string()),
+        })?;
     if view.active_pq_certificate.wireguard_public_key.trim() != caller.to_base64() {
         return Err(RenewalError::UnknownPeer);
     }
@@ -67,6 +74,40 @@ pub async fn transcribe_peer(
         .await
         .reconcile_peer(record, now_unix)?;
     Ok(view)
+}
+
+/// Why a peer the registry does not hold could not be learned.
+#[derive(Debug, thiserror::Error)]
+pub enum LearnError {
+    /// The gateway answered, and does not admit this key.
+    #[error("the gateway answered and does not admit this peer")]
+    NotAdmitted,
+    /// The gateway could not be read, or did not answer.
+    #[error("the gateway could not be read: {0}")]
+    Channel(String),
+    /// This authority could not record what the gateway said.
+    #[error("the gateway's answer could not be recorded: {0}")]
+    Local(String),
+}
+
+/// Learns one admitted peer for a caller outside the renewal flow.
+///
+/// Carries no gateway view out: the caller needs to know that the peer is now
+/// held, or why it is not. The call is not bounded here; a caller that must
+/// not wait bounds it itself.
+pub async fn learn_peer(
+    service: &AstraService,
+    caller: &WireGuardKey,
+    now_unix: u64,
+) -> Result<(), LearnError> {
+    transcribe_peer(service, caller, now_unix)
+        .await
+        .map(|_| ())
+        .map_err(|error| match error {
+            RenewalError::UnknownPeer => LearnError::NotAdmitted,
+            RenewalError::Gateway(reason) => LearnError::Channel(reason),
+            other => LearnError::Local(other.to_string()),
+        })
 }
 
 /// Step 1: opens an operation for a request the gateway just relayed.

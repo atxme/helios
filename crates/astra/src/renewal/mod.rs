@@ -177,8 +177,8 @@ mod request;
 mod stage;
 
 pub use companion::{read, signer_request, signer_result};
-pub use request::open;
-pub use request::transcribe_peer;
+pub(crate) use request::transcribe_peer;
+pub use request::{learn_peer, open, LearnError};
 
 // What the steps name of each other, through `use super::*`.
 use self::{approval::*, stage::*};

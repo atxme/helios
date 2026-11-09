@@ -899,6 +899,36 @@ async fn a_peer_unknown_to_both_is_refused_by_name() {
 }
 
 #[tokio::test]
+async fn a_gateway_that_cannot_be_read_is_not_said_to_hold_no_such_peer() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let service = fixture_with_fake(
+        dir.path(),
+        FakeGateway {
+            unavailable: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let refusal = service
+        .door(console(), revocation(5), NOW)
+        .await
+        .expect_err("the gateway cannot be read");
+    assert!(matches!(refusal, DoorRefusal::GatewayChannelUnavailable));
+    assert!(service.registry.lock().await.peer(&peer_key(5)).is_none());
+}
+
+#[tokio::test]
+async fn a_mute_gateway_refuses_the_revocation_on_the_channel() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let service = fixture_with_mute_gateway(dir.path()).await;
+    let refusal = service
+        .door_within(console(), revocation(5), NOW, MUTE_GATEWAY_BOUND)
+        .await
+        .expect_err("the gateway never answers");
+    assert!(matches!(refusal, DoorRefusal::GatewayChannelUnavailable));
+}
+
+#[tokio::test]
 async fn a_revoked_peer_is_refused() {
     let dir = tempfile::tempdir().expect("tempdir");
     let service = fixture(dir.path());
@@ -983,6 +1013,9 @@ fn served_leaf() -> PqCertificate {
 #[derive(Default)]
 struct FakeGateway {
     peers: Vec<(WireGuardKey, astra_channel::PeerCertificateStateView)>,
+    /// Refuses every peer read as unavailable, the way a gateway that is
+    /// down answers, rather than as a key it does not admit.
+    unavailable: bool,
 }
 
 /// A peer the gateway admitted, as its private channel reads it back. The
@@ -1107,6 +1140,9 @@ impl astra_channel::AstraChannelHandler for FakeGateway {
         astra_channel::PeerCertificateStateView,
         aether::certificates::transport::TrustUpdateRefusal,
     > {
+        if self.unavailable {
+            return Err(aether::certificates::transport::TrustUpdateRefusal::Unavailable);
+        }
         self.peers
             .iter()
             .find(|(key, _)| key == identity)
@@ -1156,6 +1192,18 @@ async fn fixture_with_gateway_peers(
     dir: &Path,
     peers: Vec<(WireGuardKey, astra_channel::PeerCertificateStateView)>,
 ) -> Arc<AstraService> {
+    fixture_with_fake(
+        dir,
+        FakeGateway {
+            peers,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+/// The same, with the given fake answering on the channel.
+async fn fixture_with_fake(dir: &Path, fake: FakeGateway) -> Arc<AstraService> {
     let (astra_certificate, identity, gateway_certificate) = channel_identities(dir);
     let config = astra_channel::server_config(&identity, &astra_certificate).expect("server");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1163,7 +1211,7 @@ async fn fixture_with_gateway_peers(
         .expect("bind");
     let address = listener.local_addr().expect("address");
     drop(listener);
-    let router = astra_channel::router(Arc::new(FakeGateway { peers }));
+    let router = astra_channel::router(Arc::new(fake));
     tokio::spawn(async move {
         let _ = astra_channel::serve(address, config, router, astra_channel::INTERNAL_PREFIX).await;
     });

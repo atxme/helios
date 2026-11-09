@@ -723,7 +723,8 @@ impl AstraService {
             .await
             .map(DoorOutcome::Opened),
             DoorRequest::ClientRevocation { peer, text } => {
-                self.learn_peer(&peer, now_unix, gateway_bound).await;
+                self.learn_unknown_peer(&peer, now_unix, gateway_bound)
+                    .await?;
                 open::open_campaign(
                     self,
                     connector,
@@ -866,47 +867,74 @@ impl AstraService {
         .await
     }
 
-    /// Transcribes an admitted peer this registry has never held, before a
+    /// Learns an admitted peer this registry has never held, before a
     /// revocation resolves it.
     ///
-    /// The gateway admits; a peer admitted since the last sweep is known to it
-    /// and not yet here. The registry is checked under its lock, which is
-    /// released before the call: the transcription awaits the channel. A
-    /// refusal is logged and left to the resolve, which refuses the peer by
-    /// name if it is still unknown, so this never turns a gateway fault into a
-    /// different answer.
-    async fn learn_peer(&self, peer: &WireGuardKey, now_unix: u64, gateway_bound: Duration) {
-        if self.gateway.is_none() {
-            return;
+    /// Three answers, kept apart. The gateway admits the peer: it is held
+    /// now. The gateway answers that it does not know the key: nothing is
+    /// learned, and the resolve refuses the peer by name (`PeerUnknown`). The
+    /// gateway cannot be read, or does not answer within the bound: the door
+    /// cannot tell an unknown peer from an unread one, so it refuses on the
+    /// channel instead of saying the peer does not exist.
+    ///
+    /// The registry is checked under its lock, which is released before the
+    /// call: the transcription awaits the channel.
+    async fn learn_unknown_peer(
+        &self,
+        peer: &WireGuardKey,
+        now_unix: u64,
+        gateway_bound: Duration,
+    ) -> Result<(), DoorRefusal> {
+        if self.gateway.is_none() || self.holds_peer(peer).await {
+            return Ok(());
         }
-        let known = {
-            let registry = self.registry.lock().await;
-            registry.peer(peer).is_some()
-        };
-        if known {
-            return;
-        }
-        match tokio::time::timeout(
+        let outcome = tokio::time::timeout(
             gateway_bound,
-            crate::renewal::transcribe_peer(self, peer, now_unix),
+            crate::renewal::learn_peer(self, peer, now_unix),
         )
-        .await
-        {
-            Ok(Ok(_)) => tracing::info!(
-                peer = %peer.to_base64(),
-                "an admitted peer unknown to this registry was learned from the gateway"
-            ),
-            Ok(Err(error)) => tracing::warn!(
-                peer = %peer.to_base64(),
-                %error,
-                "the gateway did not confirm this peer; the revocation is resolved on what is held"
-            ),
-            Err(_) => tracing::error!(
-                peer = %peer.to_base64(),
-                bound_ms = gateway_bound.as_millis(),
-                "the gateway did not answer the peer read within the bound"
-            ),
+        .await;
+        match outcome {
+            Ok(Ok(())) => {
+                tracing::info!(
+                    peer = %peer.to_base64(),
+                    "an admitted peer unknown to this registry was learned from the gateway"
+                );
+                Ok(())
+            }
+            Ok(Err(crate::renewal::LearnError::NotAdmitted)) => Ok(()),
+            Ok(Err(crate::renewal::LearnError::Channel(reason))) => {
+                if self.holds_peer(peer).await {
+                    return Ok(());
+                }
+                tracing::error!(
+                    peer = %peer.to_base64(),
+                    %reason,
+                    "the door could not read the peer from the gateway"
+                );
+                Err(DoorRefusal::GatewayChannelUnavailable)
+            }
+            Ok(Err(crate::renewal::LearnError::Local(reason))) => {
+                tracing::error!(
+                    peer = %peer.to_base64(),
+                    %reason,
+                    "the gateway answered, but this authority could not record it"
+                );
+                Err(DoorRefusal::Internal)
+            }
+            Err(_) => {
+                tracing::error!(
+                    peer = %peer.to_base64(),
+                    bound_ms = gateway_bound.as_millis(),
+                    "the gateway did not answer the peer read within the bound"
+                );
+                Err(DoorRefusal::GatewayChannelUnavailable)
+            }
         }
+    }
+
+    async fn holds_peer(&self, peer: &WireGuardKey) -> bool {
+        let registry = self.registry.lock().await;
+        registry.peer(peer).is_some()
     }
 
     /// What the daemon serves right now, read before any lock is taken.

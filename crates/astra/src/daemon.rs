@@ -381,7 +381,8 @@ fn spawn_peer_sweep(service: Arc<AstraService>) {
 ///
 /// A channel error is logged and the next pass retries it: nothing here is
 /// fatal, because the gateway being down is the ordinary case at boot, and a
-/// peer or a revocation that waits one more minute loses nothing.
+/// peer or a revocation that waits one more minute loses nothing. Every call
+/// to the gateway is bounded: a mute gateway must not stall the loop.
 pub(crate) async fn sweep_peers(service: &Arc<AstraService>, now_unix: u64) -> SweepReport {
     let mut report = SweepReport {
         transcribed: 0,
@@ -391,7 +392,7 @@ pub(crate) async fn sweep_peers(service: &Arc<AstraService>, now_unix: u64) -> S
         return report;
     };
 
-    match gateway.peer_keys().await {
+    match bounded(gateway.peer_keys()).await {
         Ok(keys) => {
             // Read under the lock, then released: the transcription below
             // awaits the channel and takes the lock itself.
@@ -402,18 +403,18 @@ pub(crate) async fn sweep_peers(service: &Arc<AstraService>, now_unix: u64) -> S
                     .collect()
             };
             for key in unknown {
-                match astra::renewal::transcribe_peer(service, &key, now_unix).await {
-                    Ok(_) => report.transcribed += 1,
-                    Err(error) => tracing::warn!(
+                match bounded(astra::renewal::learn_peer(service, &key, now_unix)).await {
+                    Ok(()) => report.transcribed += 1,
+                    Err(reason) => tracing::warn!(
                         peer = %key.to_base64(),
-                        %error,
-                        "peer sweep: an admitted peer could not be transcribed from the gateway"
+                        %reason,
+                        "peer sweep: an admitted peer could not be learned from the gateway"
                     ),
                 }
             }
         }
-        Err(error) => tracing::warn!(
-            %error,
+        Err(reason) => tracing::warn!(
+            %reason,
             "peer sweep: the gateway's peer list could not be read; the next pass retries it"
         ),
     }
@@ -437,12 +438,13 @@ pub(crate) async fn sweep_peers(service: &Arc<AstraService>, now_unix: u64) -> S
             .collect()
     };
     for revocation in revocations {
-        let view = match gateway.peer_state(&revocation.identity_key).await {
+        let peer = revocation.identity_key.to_base64();
+        let view = match bounded(gateway.peer_state(&revocation.identity_key)).await {
             Ok(view) => view,
-            Err(error) => {
+            Err(reason) => {
                 tracing::warn!(
-                    peer = %revocation.identity_key.to_base64(),
-                    %error,
+                    %peer,
+                    %reason,
                     "peer sweep: the gateway state of a revoked peer could not be read; the next pass retries it"
                 );
                 continue;
@@ -451,22 +453,34 @@ pub(crate) async fn sweep_peers(service: &Arc<AstraService>, now_unix: u64) -> S
         if view.state.revoked {
             continue;
         }
-        match gateway.revoke(&revocation).await {
+        match bounded(gateway.revoke(&revocation)).await {
             Ok(()) => {
                 report.relayed += 1;
-                tracing::info!(
-                    peer = %revocation.identity_key.to_base64(),
-                    "peer sweep: a recorded revocation the gateway lacked is applied on it"
-                );
+                tracing::info!(%peer, "peer sweep: a recorded revocation the gateway lacked is applied on it");
             }
-            Err(error) => tracing::warn!(
-                peer = %revocation.identity_key.to_base64(),
-                %error,
+            Err(reason) => tracing::warn!(
+                %peer,
+                %reason,
                 "peer sweep: the revocation could not be relayed to the gateway; the next pass retries it"
             ),
         }
     }
     report
+}
+
+/// Cuts one gateway call short at the door's own bound, and reads its answer
+/// as text: the sweep logs a failure and keeps going.
+async fn bounded<T, E: std::fmt::Display>(
+    call: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T, String> {
+    match tokio::time::timeout(astra::door::GATEWAY_CALL_BOUND, call).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(_) => Err(format!(
+            "no answer within {} s",
+            astra::door::GATEWAY_CALL_BOUND.as_secs()
+        )),
+    }
 }
 
 /// The credentials an ordinary renewal may be approved by.
@@ -962,6 +976,8 @@ mod tests {
     struct Ledger {
         peers: tokio::sync::Mutex<Vec<(WireGuardKey, PeerCertificateStateView)>>,
         revocations: AtomicUsize,
+        /// Revocations still to be refused as unavailable, before one applies.
+        refusals: AtomicUsize,
     }
 
     impl Ledger {
@@ -969,11 +985,16 @@ mod tests {
             Self {
                 peers: tokio::sync::Mutex::new(peers),
                 revocations: AtomicUsize::new(0),
+                refusals: AtomicUsize::new(0),
             }
         }
 
         fn revocations(&self) -> usize {
             self.revocations.load(Ordering::SeqCst)
+        }
+
+        fn refuse_next_revocations(&self, count: usize) {
+            self.refusals.store(count, Ordering::SeqCst);
         }
     }
 
@@ -997,6 +1018,10 @@ mod tests {
             revocation: Box<EmergencyCertificateRevocation>,
         ) -> Result<(), TrustUpdateRefusal> {
             self.revocations.fetch_add(1, Ordering::SeqCst);
+            if self.refusals.load(Ordering::SeqCst) > 0 {
+                self.refusals.fetch_sub(1, Ordering::SeqCst);
+                return Err(TrustUpdateRefusal::Unavailable);
+            }
             let mut peers = self.peers.lock().await;
             let (_, view) = peers
                 .iter_mut()
@@ -1240,6 +1265,102 @@ mod tests {
         let registry = service.registry.lock().await;
         assert!(registry.peer(&known_key).is_some());
         assert!(registry.peer(&unknown_key).is_some());
+    }
+
+    /// A gateway-scope revocation is not the peer sweep's to relay: the door
+    /// opens it and the gateway is asked once, there.
+    #[tokio::test]
+    async fn the_sweep_never_relays_a_gateway_revocation() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let mut service = authority(directory.path());
+        let (key, peer) = admitted("workstation", 2);
+        service
+            .registry
+            .get_mut()
+            .admit(record_of(&peer, key), NOW)
+            .expect("admitted");
+        let mut revocation = client_revocation(2);
+        revocation.scope = RevocationScope::Gateway;
+        revocation.server_name = Some("gateway.example".into());
+        record_revocation(&mut service, revocation);
+        let ledger = Arc::new(Ledger::new(vec![(key, peer)]));
+        let (channel, _server) = ledger_channel(directory.path(), ledger.clone()).await;
+        service.gateway = Some(channel);
+        let service = Arc::new(service);
+
+        assert_eq!(
+            sweep_peers(&service, NOW).await,
+            SweepReport {
+                transcribed: 0,
+                relayed: 0
+            }
+        );
+        assert_eq!(ledger.revocations(), 0);
+    }
+
+    /// A peer whose state cannot be read is not sent a revocation on a guess.
+    #[tokio::test]
+    async fn a_failed_state_read_causes_no_resend() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let mut service = authority(directory.path());
+        let (key, peer) = admitted("workstation", 2);
+        service
+            .registry
+            .get_mut()
+            .admit(record_of(&peer, key), NOW)
+            .expect("admitted");
+        record_revocation(&mut service, client_revocation(2));
+        // The gateway holds no record of the peer: its state read is refused.
+        let ledger = Arc::new(Ledger::new(Vec::new()));
+        let (channel, _server) = ledger_channel(directory.path(), ledger.clone()).await;
+        service.gateway = Some(channel);
+        let service = Arc::new(service);
+
+        assert_eq!(
+            sweep_peers(&service, NOW).await,
+            SweepReport {
+                transcribed: 0,
+                relayed: 0
+            }
+        );
+        assert_eq!(ledger.revocations(), 0);
+    }
+
+    /// A revocation the gateway refuses is sent again on the next pass.
+    #[tokio::test]
+    async fn a_refused_relay_is_retried_at_the_next_pass() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let mut service = authority(directory.path());
+        let (key, peer) = admitted("workstation", 2);
+        service
+            .registry
+            .get_mut()
+            .admit(record_of(&peer, key), NOW)
+            .expect("admitted");
+        record_revocation(&mut service, client_revocation(2));
+        let ledger = Arc::new(Ledger::new(vec![(key, peer)]));
+        ledger.refuse_next_revocations(1);
+        let (channel, _server) = ledger_channel(directory.path(), ledger.clone()).await;
+        service.gateway = Some(channel);
+        let service = Arc::new(service);
+
+        assert_eq!(
+            sweep_peers(&service, NOW).await,
+            SweepReport {
+                transcribed: 0,
+                relayed: 0
+            }
+        );
+        assert_eq!(ledger.revocations(), 1);
+
+        assert_eq!(
+            sweep_peers(&service, NOW + 60).await,
+            SweepReport {
+                transcribed: 0,
+                relayed: 1
+            }
+        );
+        assert_eq!(ledger.revocations(), 2);
     }
 
     #[tokio::test]
