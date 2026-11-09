@@ -110,6 +110,21 @@ impl GatewayIdentityHandler for StubIdentity {
             already_present: false,
         })
     }
+
+    async fn install_client_tls_ca_transition(
+        &self,
+        _transition: Box<aether::certificates::authority::ClientTlsCaTransition>,
+    ) -> Result<ClientTlsCaDecisionView, GatewayActionRefusal> {
+        self.called();
+        self.result(ClientTlsCaDecisionView {
+            ca_tls_epoch: 3,
+            next_ca_tls_epoch: 4,
+            next_ca_tls_fingerprint: "66".repeat(32),
+            activation_at: 1_700_000_300,
+            not_after: 1_702_592_300,
+            already_present: false,
+        })
+    }
 }
 
 fn app_state(handler: Option<Arc<StubIdentity>>, admin: bool) -> AppState {
@@ -162,7 +177,7 @@ fn request(path: &str, body: serde_json::Value) -> Request<Body> {
 
 fn route_fixtures() -> Vec<(&'static str, serde_json::Value)> {
     use aether::certificates::{
-        authority::CaTransition,
+        authority::{CaTransition, ClientTlsCaTransition},
         encoding::{Fingerprint, Id16, MlDsa87PublicKey, MlDsa87Signature, WireGuardKey},
         gateway::{AbortReason, GatewayIdentityTransition, GatewayTransitionAbort},
         status::CertificateServiceRollbackAuthorization,
@@ -232,10 +247,30 @@ fn route_fixtures() -> Vec<(&'static str, serde_json::Value)> {
         next_ca_fingerprint: fingerprint(11),
         window,
         current_ca_signature: signature.clone(),
-        next_ca_signature: signature,
+        next_ca_signature: signature.clone(),
+    };
+
+    let tls_ca_transition = ClientTlsCaTransition {
+        format_version: CERTIFICATE_FORMAT_VERSION,
+        trust_domain_id: domain,
+        ca_epoch: 1,
+        current_ca_tls_epoch: 1,
+        next_ca_tls_epoch: 2,
+        active_client_tls_ca_fingerprint: fingerprint(12),
+        next_client_tls_ca_certificate: aether::certificates::encoding::DerCertificate::new(vec![
+            1;
+            64
+        ])
+        .expect("TLS CA fixture"),
+        window,
+        ca_pq_signature: signature,
     };
 
     vec![
+        (
+            "/api/certificates/client-tls-ca-transition",
+            serde_json::to_value(tls_ca_transition).expect("TLS CA transition JSON"),
+        ),
         (
             "/api/certificates/gateway-renewal",
             serde_json::json!({"rotate_tls": true, "new_key": false, "key_recovery": false}),
@@ -293,6 +328,11 @@ async fn every_gateway_identity_route_reaches_the_admin_router_and_returns_handl
             "/api/certificates/gateway-transition/rollback" => {
                 assert_eq!(json["selected_certificate_fingerprint"], "44".repeat(32));
                 assert_eq!(json["expires_at"], 1_700_000_200u64);
+            }
+            "/api/certificates/client-tls-ca-transition" => {
+                assert_eq!(json["ca_tls_epoch"], 3);
+                assert_eq!(json["next_ca_tls_epoch"], 4);
+                assert_eq!(json["next_ca_tls_fingerprint"], "66".repeat(32));
             }
             "/api/certificates/ca-transition" => {
                 assert_eq!(json["ca_epoch"], 3);

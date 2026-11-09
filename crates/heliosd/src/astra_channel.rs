@@ -612,10 +612,12 @@ impl AstraRenewalRelay {
             // reporting it as `500` would send an Orion into retrying
             // something that will never succeed.
             ChannelError::Status(status) => {
-                tracing::warn!(route, %status, "the authority refused a relayed renewal");
+                tracing::warn!(route, %status, "the authority refused a relayed request");
                 match status.as_u16() {
                     400 => TrustUpdateRefusal::Protocol,
                     403 => TrustUpdateRefusal::Rejected,
+                    409 => TrustUpdateRefusal::Conflict,
+                    429 => TrustUpdateRefusal::Throttled,
                     501 | 503 => TrustUpdateRefusal::Unavailable,
                     _ => TrustUpdateRefusal::Internal,
                 }
@@ -671,6 +673,21 @@ impl helios_api::certificates::OperatorCampaignRelay for AstraRenewalRelay {
             })
             .await
             .map_err(|error| Self::refuse("operator-pending", error))
+    }
+
+    async fn status(
+        &self,
+        operator: &::astra_channel::OperatorIdentity,
+    ) -> Result<
+        ::astra_channel::OperatorAuthorityStatus,
+        helios_api::certificates::TrustUpdateRefusal,
+    > {
+        self.client
+            .operator_status(&::astra_channel::RelayedOperatorCampaign {
+                operator: operator.clone(),
+            })
+            .await
+            .map_err(|error| Self::refuse("operator-status", error))
     }
 
     async fn operation(
@@ -748,6 +765,23 @@ impl helios_api::certificates::OperatorCampaignRelay for AstraRenewalRelay {
             )
             .await
             .map_err(|error| Self::refuse("operator-signer-result", error))
+    }
+
+    /// Relays the vault copy to Astra's door, with the administrator it came
+    /// through. The content is never logged: only the refusal class is.
+    async fn vault_copy(
+        &self,
+        operator: &::astra_channel::OperatorIdentity,
+        copy: ::astra_channel::OperatorVaultCopy,
+    ) -> Result<::astra_channel::OperatorVaultCopied, helios_api::certificates::TrustUpdateRefusal>
+    {
+        self.client
+            .operator_vault_copy(&::astra_channel::RelayedOperatorVaultCopy {
+                operator: operator.clone(),
+                copy,
+            })
+            .await
+            .map_err(|error| Self::refuse("operator-vault-copy", error))
     }
 
     /// Relays an opening to Astra's door, with the administrator it came
@@ -918,6 +952,31 @@ mod tests {
         let guard = LOCK.lock().unwrap_or_else(|error| error.into_inner());
         std::env::set_var("HELIOS_ASTRA_CHANNEL", directory.join("astra-channel.json"));
         guard
+    }
+
+    /// A full store on the authority is a `429`, relayed as such: collapsing
+    /// it to `Internal` would show an operator a gateway fault for what is a
+    /// queue to drain.
+    #[test]
+    fn relayed_429_is_throttled_and_not_internal() {
+        use helios_api::certificates::TrustUpdateRefusal;
+        let refusal = AstraRenewalRelay::refuse(
+            "operator-open",
+            ::astra_channel::ChannelError::Status(axum::http::StatusCode::TOO_MANY_REQUESTS),
+        );
+        assert_eq!(refusal, TrustUpdateRefusal::Throttled);
+    }
+
+    /// A copy held back is relayed as such: `Internal` would have Orion show a
+    /// gateway fault for what passes at the next attempt.
+    #[test]
+    fn relayed_409_is_a_conflict_and_not_internal() {
+        use helios_api::certificates::TrustUpdateRefusal;
+        let refusal = AstraRenewalRelay::refuse(
+            "operator-vault-copy",
+            ::astra_channel::ChannelError::Status(axum::http::StatusCode::CONFLICT),
+        );
+        assert_eq!(refusal, TrustUpdateRefusal::Conflict);
     }
 
     /// A gateway with no channel document is a gateway without an authority,

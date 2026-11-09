@@ -665,7 +665,8 @@ manifeste ait été montré, ni sur un autre objet que celui montré.
 Ce que le dialogue WebAuthn rattaché à la fenêtre produit sous Windows, une
 récupération approuvée depuis un second poste et une délégation suivie du
 redémarrage d'Astra ne se vérifient pas dans le dépôt : à valider en recette
-(MANUAL-TESTING, « E. Lot 4 »).
+(MANUAL-TESTING, « E. Lot 4 »). *(Le redémarrage d'Astra après une délégation
+n'existe plus depuis le lot 5b : amendement du 7 novembre 2026.)*
 
 #### Amendement du 2 novembre 2026 : Astra tient la porte (F14, lot 5a)
 
@@ -698,7 +699,8 @@ puis à recopier un identifiant d'opération — et, pour une révocation, des
   4 septembre 2026 (§2) : identité établie avant tout relais, cohérence
   d'origine, refus publics grossiers. Le tunnel peut ouvrir `fleet_leafs`,
   `trust_authorities` et la révocation d'un client ; le reste demeure à la
-  console locale. La réponse d'une révocation porte ses échéances signées, que
+  console locale *(amendé le 7 novembre 2026, ci-dessous : le tunnel ouvre aussi
+  la délégation d'émetteur avec campagne et écrit la copie du coffre)*. La réponse d'une révocation porte ses échéances signées, que
   l'opérateur ne recopie plus. L'origine publique n'ouvre toujours rien.
 - **La console devient un connecteur.** Ses ouvreurs parlent au service par un
   socket Unix de son volume d'état (`operator.sock`, mode `0600`) et
@@ -727,6 +729,63 @@ spécification.
 Ce qu'un pair administrateur réel obtient en ouvrant par le tunnel, et la suite
 jusqu'à l'approbation dans Orion, ne se vérifient pas dans le dépôt : à valider
 en recette (MANUAL-TESTING, « F. Lot 5a »).
+
+#### Amendement du 7 novembre 2026 : les rotations se jouent dans Orion (F14, lot 5b)
+
+Les rotations de CA, la délégation de l'émetteur et la copie du coffre
+demandaient des commandes, des fichiers à transporter et un redémarrage
+d'Astra. Décidé par l'utilisateur le 4 novembre 2026, corrigé par la
+construction le 7 :
+
+- **Le tunnel ouvre plus que le 2 novembre.** La table de la porte accorde au
+  tunnel, pour un pair administrateur, la délégation d'émetteur **avec
+  campagne** (les clés sont générées dans le volume d'Astra et la demande
+  publique revient dans la réponse) et l'écriture de la **copie du coffre**
+  (`POST /api/certificates/operator/vault-copy`, absente de la console). Le
+  reste de l'amendement du 2 novembre tient : `IssuerRequest`, `IssuerInstall`,
+  la chaîne, la gateway et les trois écritures de la console demeurent à la
+  console locale. L'amendement du 2 novembre, qui limitait le tunnel à trois
+  ouvertures, n'est plus exact sur ce point.
+- **Une copie du coffre écrite par le tunnel ne donne ni ouverture ni
+  signature.** Astra ne lit du coffre que ce qu'on lit sans clé (version et
+  domaine), l'écrit de façon atomique sous le verrou du volume, garde une copie
+  précédente et journalise l'empreinte et l'opérateur. Un administrateur du
+  tunnel peut donc remplacer la sauvegarde, pas l'ouvrir. La borne est de
+  128 Kio, ce que le téléchargement du coffre porte. Deux refus répondent
+  `409`, seules exceptions aux refus indistincts, parce qu'un envoi ultérieur
+  les franchit et que cette route ne répond qu'à un administrateur : une copie
+  retenue par une opération en attente, et un document de credentials joint
+  pendant une rotation `CA-PQ` ou avant que la promotion de son document soit
+  durable.
+- **Un changement de clé atteint Astra avec la copie.** Après un ajout, un
+  retrait, une clé marquée perdue ou réactivée, Orion envoie la copie du coffre
+  et y joint le document de credentials lorsque son époque dépasse celle
+  qu'Astra sert, qui l'adopte en mémoire. Pendant un recouvrement `CA-PQ` le
+  document n'est pas joint ; Orion le dit, et « Copie du coffre » reste à
+  renvoyer dans *Coffre et clés*.
+- **Astra adopte sans redémarrer.** Une délégation enregistrée remplace
+  l'émetteur en place après les contrôles du démarrage ; le document de
+  credentials d'une rotation `CA-PQ` est adopté par Astra à `not_after`, dans la
+  passe qui promeut l'ancre. Orion ne redémarre jamais Astra, qui n'a pas accès à
+  Docker.
+- **Le coffre en place ne bouge qu'après l'acceptation d'Astra.** Un journal de
+  rotation, écrit avant toute annonce, porte le coffre suivant scellé, les
+  credentials, le relais, la transition et le résultat à déposer ; la reprise est
+  automatique à la montée du tunnel vers la gateway du domaine, sans clé.
+- **Pendant un recouvrement `CA-PQ`, toute approbation sous le document local est
+  refusée par Astra** après le toucher : la liaison d'un credential couvre
+  `ca_epoch`, l'époque du registre et la signature `CA-PQ`, et Astra garde
+  l'ancien document jusqu'à `not_after`. Orion désactive ces gestes avec la
+  raison.
+- **Limites acceptées.** Un délai d'installation dépassé n'a pas de réparation ;
+  de `Applied` à `not_after` la révocation d'urgence est impossible ; un
+  administrateur du tunnel peut remplacer la copie du coffre (une génération
+  gardée, sauvegarde hors gateway non couverte). Le détail est dans la
+  spécification (§0.10) et la conception du lot 5b (§ 10).
+
+Les étapes qui exigent le toucher d'une vraie clé, le dialogue WebAuthn de
+Windows et le verrou de fichier du volume ne se vérifient pas sous WSL : à valider
+en recette (MANUAL-TESTING, « G. Lot 5b »).
 
 ### 8. Avortement, leases et atomicité logique
 

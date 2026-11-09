@@ -166,4 +166,42 @@ impl helios_api::certificates::GatewayIdentityHandler for CertificateService {
             ),
         })
     }
+
+    /// §9.4, applied to the client `CA-TLS` this gateway accepts.
+    ///
+    /// The gateway verifies the `CA-PQ` signature itself, as the offline
+    /// command does: Orion's word that it signed the object proves nothing.
+    /// Both chains are accepted from `activation_at`; the outgoing anchor is
+    /// retired by the maintenance pass at `not_after`.
+    async fn install_client_tls_ca_transition(
+        &self,
+        transition: Box<aether::certificates::authority::ClientTlsCaTransition>,
+    ) -> Result<helios_api::certificates::ClientTlsCaDecisionView, GatewayActionRefusal> {
+        let now = now_unix();
+        let mut registry = self.registry.lock().await;
+        let outcome = registry
+            .install_client_tls_ca_transition(&transition, now)
+            .map_err(|error| {
+                tracing::warn!(%error, "client TLS CA rotation refused");
+                GatewayActionRefusal::new(format!("{error:#}"))
+            })?;
+        tracing::warn!(
+            next_ca_tls_epoch = transition.next_ca_tls_epoch,
+            "client TLS CA rotation staged from the console; both chains are accepted from activation_at"
+        );
+        Ok(helios_api::certificates::ClientTlsCaDecisionView {
+            ca_tls_epoch: transition.current_ca_tls_epoch,
+            next_ca_tls_epoch: transition.next_ca_tls_epoch,
+            next_ca_tls_fingerprint: transition
+                .next_client_tls_ca_certificate
+                .fingerprint()
+                .to_hex(),
+            activation_at: transition.window.activation_at,
+            not_after: transition.window.not_after,
+            already_present: matches!(
+                outcome,
+                aether::certificates::state::InstallOutcome::AlreadyPresent
+            ),
+        })
+    }
 }

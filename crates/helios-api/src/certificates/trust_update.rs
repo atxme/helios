@@ -98,6 +98,8 @@ impl TrustUpdateRefusalStatus for TrustUpdateRefusal {
             TrustUpdateRefusal::Protocol => StatusCode::BAD_REQUEST,
             TrustUpdateRefusal::Rejected => StatusCode::FORBIDDEN,
             TrustUpdateRefusal::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+            TrustUpdateRefusal::Throttled => StatusCode::TOO_MANY_REQUESTS,
+            TrustUpdateRefusal::Conflict => StatusCode::CONFLICT,
             TrustUpdateRefusal::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }

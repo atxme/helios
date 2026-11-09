@@ -100,6 +100,10 @@ pub struct CertificateDomainView {
     /// §9.1 makes that comparison the check, not the signature alone.
     pub next_ca_fingerprint: Option<String>,
     pub client_tls_ca_epoch: u64,
+    /// The client TLS anchor in service, lowercase hex. With the next one, what
+    /// tells a resuming rotation that the gateway holds it, or has promoted it.
+    pub client_tls_ca_fingerprint: String,
+    pub next_client_tls_ca_fingerprint: Option<String>,
     pub client_tls_ca_transition_pending: bool,
     pub gateway_identity_epoch: u64,
     pub gateway_tls_fingerprint: String,

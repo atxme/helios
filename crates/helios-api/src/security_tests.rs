@@ -156,6 +156,28 @@ async fn the_operator_campaign_routes_live_behind_the_admin_barrier() {
     );
 }
 
+/// The status read sits on the admin surface like the rest of the campaign.
+#[tokio::test]
+async fn the_operator_status_is_an_admin_read() {
+    const URI: &str = "/api/certificates/operator/status";
+
+    let (unknown_state, _cmd_rx) = state();
+    let mut unknown = Request::builder().uri(URI).body(Body::empty()).unwrap();
+    unknown.extensions_mut().insert(ConnectInfo(
+        "100.64.9.9:4242".parse::<SocketAddr>().unwrap(),
+    ));
+    let response = router(unknown_state).oneshot(unknown).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let (admin_state, _cmd_rx) = state();
+    let mut administrator = Request::builder().uri(URI).body(Body::empty()).unwrap();
+    administrator.extensions_mut().insert(ConnectInfo(
+        "100.64.1.2:4242".parse::<SocketAddr>().unwrap(),
+    ));
+    let response = router(admin_state).oneshot(administrator).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
 /// Operator results have their own 64 KiB contract.
 ///
 /// The trust-update protocol is chunked and uses a smaller 32 KiB request
@@ -190,6 +212,53 @@ async fn operator_results_use_the_operator_body_bound() {
     );
     let response = router(oversized_state).oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+/// The vault copy has a bound of its own: a vault is larger than an operator
+/// result, and the 64 KiB bound would refuse every real one.
+#[tokio::test]
+async fn vault_copy_route_refuses_a_non_admin_and_an_oversized_body() {
+    const URI: &str = "/api/certificates/operator/vault-copy";
+    const BODY: &str = r#"{"vault_base64":"e30="}"#;
+
+    let (non_admin_state, _cmd_rx) = state();
+    non_admin_state.network.write().await.peers[0].admin = false;
+    let response = router(non_admin_state)
+        .oneshot(admin_request(URI, BODY))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    let (within_state, _cmd_rx) = state();
+    let within = " ".repeat(astra_channel::MAX_OPERATOR_REQUEST_BYTES + 1024);
+    let response = router(within_state)
+        .oneshot(admin_request(URI, &within))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "above the operator result bound, within the vault copy bound: the parser is reached"
+    );
+
+    let (oversized_state, _cmd_rx) = state();
+    let oversized = " ".repeat(astra_channel::MAX_OPERATOR_VAULT_COPY_BODY_BYTES + 1);
+    let response = router(oversized_state)
+        .oneshot(admin_request(URI, &oversized))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+    let (admin_state, _cmd_rx) = state();
+    let response = router(admin_state)
+        .oneshot(admin_request(URI, BODY))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "the administrator is admitted; what is missing is the private channel"
+    );
 }
 
 /// Opening a campaign is an administrative mutation like any other.
@@ -1104,4 +1173,47 @@ async fn status_reports_the_daemon_version() {
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let status: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(status["version"], "9.9.9");
+}
+
+/// The CA-TLS rotation moves the anchor every client chain is judged against:
+/// an admitted peer that is not an administrator must not even reach the
+/// handler.
+#[tokio::test]
+async fn client_tls_ca_route_refuses_a_non_admin() {
+    let (non_admin_state, _cmd_rx) = state();
+    non_admin_state.network.write().await.peers[0].admin = false;
+
+    let response = router(non_admin_state)
+        .oneshot(admin_request(
+            "/api/certificates/client-tls-ca-transition",
+            "{}",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+/// A body that is not a transition stops at the extractor: the gateway never
+/// guesses what an unreadable document meant.
+#[tokio::test]
+async fn client_tls_ca_route_refuses_an_unreadable_body() {
+    let (admin_state, _cmd_rx) = state();
+
+    let response = router(admin_state)
+        .oneshot(admin_request(
+            "/api/certificates/client-tls-ca-transition",
+            r#"{"not":"a transition"}"#,
+        ))
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(
+            response.status(),
+            StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY
+        ),
+        "got {}",
+        response.status()
+    );
 }

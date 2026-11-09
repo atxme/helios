@@ -539,65 +539,6 @@ export interface SpeedTestResult {
   measurement_rounds: number
 }
 
-/** Paths and existing Astra campaign chosen by the operator for a CA-TLS rotation. */
-export interface AstraRotationInput {
-  vault_path: string
-  heliosd_url: string
-  operation_id: string
-  output_path: string
-}
-
-/** One observable boundary of the two-key CA-TLS ceremony. */
-export type AstraRotationPhase =
-  | 'idle'
-  | 'starting'
-  | 'awaiting_first_key'
-  | 'processing_first_key'
-  | 'awaiting_second_key'
-  | 'processing_second_key'
-  | 'finalizing'
-  | 'prepared'
-  | 'deposited'
-  | 'awaiting_promotion_key'
-  | 'promoting'
-  | 'promoted'
-  | 'failed'
-  | 'cancelled'
-
-/** Verified campaign fields displayed before either credential is exercised. */
-export interface AstraCaTlsRotationManifest {
-  reason: string
-  requested_by: string
-  fingerprint: string
-  current_ca_tls_epoch: number
-  next_ca_tls_epoch: number
-  activation_at: number
-  not_after: number
-  outgoing_anchor_fingerprint: string
-  affected_ca: 'client_tls'
-  target_count: number
-}
-
-/**
- * State returned by the Rust-owned signer session.
- *
- * Labels identify the credentials that actually answered; the WebView never
- * discovers security keys or handles their PINs itself.
- */
-export interface AstraRotationStatus {
-  phase: AstraRotationPhase
-  message: string
-  can_continue: boolean
-  can_cancel: boolean
-  manifest?: AstraCaTlsRotationManifest | null
-  first_key_label?: string | null
-  second_key_label?: string | null
-  output_path?: string | null
-  next_ca_tls_epoch?: number | null
-  activation_at?: number | null
-  not_after?: number | null
-}
-
 /**
  * What the vault can honestly claim about itself (ADR-006 §3).
  *
@@ -695,6 +636,7 @@ export type KeyPurpose =
   | 'second_approval'
   | 'promotion'
   | 'register_key'
+  | 'validate_key'
 
 /** Où en est la cérémonie **sur ce poste**. */
 export type GestureState =
@@ -744,6 +686,16 @@ export type Refusal =
   | { refusal: 'manifest_mismatch' }
   | { refusal: 'protocol_violation' }
   | { refusal: 'cancelled' }
+  | { refusal: 'rotation_expired' }
+  | { refusal: 'domain_conflict' }
+  | { refusal: 'install_deadline_passed' }
+  | { refusal: 'gateway_names_no_anchor' }
+  | { refusal: 'rotation_in_flight' }
+  | { refusal: 'campaign_closing'; until: number }
+  | { refusal: 'key_not_validated' }
+  | { refusal: 'terms_refused' }
+  | { refusal: 'nothing_to_finish' }
+  | { refusal: 'overlap_running'; until: number }
   | { refusal: 'internal' }
 
 export interface RecoveryManifest {
@@ -835,8 +787,10 @@ export interface CaRotationManifest {
   activation_at: number
   not_after: number
   outgoing_anchor_fingerprint: string
-  next_anchor_fingerprint: string
-  target_count: number
+  /** Absent at the touch: the incoming anchor does not exist before the signature. */
+  next_anchor_fingerprint?: string
+  /** The campaign the keys approve; absent for a rotation signed offline. */
+  campaign?: { campaign: CampaignManifest['campaign']; fingerprint: string }
 }
 
 export interface RevocationManifest {
@@ -966,6 +920,14 @@ export interface OperatorStatus {
   manifest?: AstraManifest
   keys?: KeySlotLabel[]
   refusal?: Refusal
+  /** Pourquoi la dernière réponse a été écartée (clé ou durées), tant qu'une autre est attendue. */
+  key_retry?: Refusal
+  /** Les libellés des clés qui ont approuvé, dans l'ordre : de quoi dire laquelle brancher ensuite. */
+  approved?: KeySlotLabel[]
+  /** Quand l'attente offerte prend fin d'elle-même (secondes Unix) ; absent hors d'une rotation. */
+  idle_until?: number
+  /** Ouverte par une montée du tunnel et non par l'opérateur ; ne vient que de la lecture de l'état. */
+  automatic?: boolean
 }
 
 /** Un geste d'enrôlement (§15.2), fermé : la page ne choisit que parmi ces trois. */
@@ -1005,6 +967,24 @@ export type IssuerGesture =
   | { gesture: 'authorize_issuer'; operation_id: string; request: string }
   | { gesture: 'authorize_issuer_offline'; request: string }
 
+/** Un geste de rotation, fermé. Il ne porte aucune valeur : les dates viennent de l'approbation. */
+export type RotationGesture =
+  | { gesture: 'replace_ca_pq' }
+  | { gesture: 'replace_ca_tls' }
+  | { gesture: 'finish_ca_tls' }
+  | { gesture: 'resume' }
+
+/** Ce que l'écran d'approbation fixe. Public, comme le manifeste qui en découle. */
+export interface RotationTerms {
+  /** Une campagne déjà ouverte à reprendre, sinon `null`. */
+  existing_operation: string | null
+  reason: string
+  requested_by: string
+  prepare_days: number
+  overlap_days: number
+  validity_days: number
+}
+
 /** Un fichier produit par la cérémonie, à enregistrer par l'IHM. Contenu public. */
 export interface OperatorArtifact {
   file_name: string
@@ -1038,6 +1018,113 @@ export interface OperatorPendingOperation {
   created_at: number
   expires_at: number
 }
+
+/** Une lecture de la gateway : sa valeur, ou la raison pour laquelle il n'y en a pas. */
+export type Reach<T> =
+  | { state: 'ok'; value: T }
+  | { state: 'not_admin' | 'astra_unavailable' | 'unreachable' | 'throttled' }
+  /** La gateway répond et refuse (un 404 : gateway plus ancienne, sans la route). */
+  | { state: 'refused'; value: number }
+
+/** Ce que l'autorité (Astra) dit de son état : empreintes et époques, aucun jeton. */
+export interface OperatorAuthorityStatus {
+  ca_epoch: number
+  ca_fingerprint: string
+  /** Renseignée pendant un recouvrement CA-PQ. */
+  next_ca_fingerprint: string | null
+  ca_tls_epoch: number
+  ca_tls_fingerprint: string | null
+  next_ca_tls_fingerprint: string | null
+  issuer: {
+    recorded_epoch: number
+    serving_epoch: number | null
+    ca_epoch: number
+    ca_tls_epoch: number
+    not_after: number
+  } | null
+  /** Empreinte de la copie du coffre qu'Astra détient. */
+  vault_copy_fingerprint: string | null
+  /** `null` : Astra ne sert aucun document. Ce n'est pas l'époque 0. */
+  credential_registry_epoch: number | null
+}
+
+/** Le sous-ensemble de `GET /api/certificates` que l'écran lit. */
+export interface GatewayDomainRead {
+  /** L'horloge de la gateway à sa réponse : celle de l'opérateur ne sert pas. */
+  now_unix: number | null
+  ca_fingerprint: string
+  ca_epoch: number
+  ca_tls_epoch: number
+  ca_transition_pending: boolean
+  ca_retire_active_at: number | null
+  next_ca_fingerprint: string | null
+  client_tls_ca_transition_pending: boolean
+  /** Les postes qu'un renouvellement vise : les pairs révoqués n'y figurent pas. */
+  peers: { not_after: number }[]
+}
+
+/** Une rotation signée qui n'est pas allée au bout, avec son délai d'installation. */
+export interface RotationJournalView {
+  kind: 'ca_pq' | 'ca_tls'
+  stage: 'signed' | 'accepted' | 'applied' | 'installed'
+  /** Passé cet instant, la gateway refuse la transition. */
+  activationAt: number
+  notAfter: number
+  nextFingerprint: string
+  /** Sans dépôt d'Orion : une rotation signée hors ligne, que `astra-signer` peut encore reprendre. */
+  offline: boolean
+}
+
+/** Tout ce que montre l'écran des rotations ; des données d'affichage, ni jeton, ni clé, ni chemin. */
+export interface RotationsOverview {
+  tunnel: boolean
+  pending: Reach<OperatorPendingOperation[]>
+  authority: Reach<OperatorAuthorityStatus>
+  domain: Reach<GatewayDomainRead>
+  /** `vault_path` y est vide : l'emplacement s'affiche par `VaultLocationView`. */
+  vault: VaultOverview | null
+  /** `illisible` (coffre) ou `emplacement` ; le détail, qui nomme des chemins, reste au journal. */
+  vaultError: 'illisible' | 'emplacement' | null
+  localVaultFingerprint: string | null
+  localCaEpoch: number | null
+  localCaTlsEpoch: number | null
+  /** Fin de la CA TLS inscrite au relais du coffre ; `null` si le relais n'en porte pas. */
+  localCaTlsNotAfter: number | null
+  /**
+   * Époque du document de credentials à côté du coffre. En avance sur celle qu'Astra sert
+   * après un changement de clé, tant qu'une copie ne l'a pas portée.
+   */
+  localCredentialRegistryEpoch: number | null
+  journal: RotationJournalView | null
+  /** Une reprise est à faire : journal, fichier CA-PQ ancien ou enregistrement non adopté. */
+  resumable: boolean
+  /**
+   * Un recouvrement CA-PQ court chez Astra ; un recouvrement CA TLS n'en fait pas partie.
+   * `null` : l'autorité n'a pas été lue, ce qui n'est pas « aucun recouvrement » (désactivé).
+   */
+  caPqOverlap: boolean | null
+  caTlsCloseDue: boolean
+  /** Quand « Terminer » est dû (fin du recouvrement), échu ou non ; `null` sans rotation à clore. */
+  caTlsCloseAt: number | null
+}
+
+/** Ce que les rotations ont laissé à côté du coffre, lu sans tunnel ni coffre ouvert. */
+export interface LocalRotationJournal {
+  journal: RotationJournalView | null
+  resumable: boolean
+}
+
+/** La réponse à un envoi manuel de la copie du coffre. « Retenue » n'est pas un échec. */
+export type VaultCopyOutcome =
+  | {
+      state: 'copied'
+      fingerprint: string
+      /** `null` : Astra ne sert aucun document. */
+      credential_registry_epoch: number | null
+      /** Le document local reste en avance sur celui qu'Astra sert : un envoi suivant le porte. */
+      document_waits: boolean
+    }
+  | { state: 'held_back' }
 
 /** Une invitation du registre de ce poste, telle que l'écran Enrôlement la liste. */
 export interface InvitationView {
@@ -1150,4 +1237,23 @@ export interface VaultLocationView {
 /** Ce dont part le formulaire de création de domaine. */
 export interface DomainDefaults {
   rp_id: string | null
+}
+
+/** Les actions que l'écran ouvre hors d'une cérémonie de rotation. */
+export type OpenCampaignAction = { action: 'fleet_leafs' } | { action: 'issuer_delegation' }
+
+/**
+ * Ce que l'ouverture d'une campagne produit : public, sans jeton ni secret. La
+ * demande de délégation n'est présente que pour `issuer_delegation`.
+ */
+export interface OperatorOpened {
+  operation_id: string
+  campaign_id: string
+  campaign_fingerprint: string
+  scope: CampaignScope
+  target_count: number
+  required_credentials: number
+  expires_at: number
+  revocation_expiries?: { tls_not_after: number | null; pq_not_after: number | null }
+  delegation_request?: string
 }

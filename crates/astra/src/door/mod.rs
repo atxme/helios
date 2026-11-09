@@ -45,6 +45,7 @@ pub mod local;
 mod lock;
 mod open;
 mod resolve;
+mod vault_copy;
 pub mod write;
 
 #[cfg(test)]
@@ -52,6 +53,7 @@ mod tests;
 
 use std::time::Duration;
 
+use aether::certificates::approval::CredentialRegistry;
 use aether::certificates::authority::AstraIssuerAuthorization;
 use aether::certificates::encoding::{Fingerprint, Id16, WireGuardKey};
 use aether::certificates::status::CampaignScope;
@@ -66,6 +68,7 @@ use crate::signing::SigningError;
 pub use lock::{VolumeLock, VolumeWrites, VolumeWritesHeld, VOLUME_LOCK_FILE};
 use open::Resolved;
 pub use open::{MAX_OPENING_WINDOW_SECS, MAX_REASON_CHARS, MAX_REQUESTED_BY_CHARS};
+pub use vault_copy::VaultBytes;
 
 /// The service's Unix socket in the state volume, the console's connector.
 pub const DOOR_SOCKET_FILE: &str = "operator.sock";
@@ -179,6 +182,13 @@ pub enum DoorRequest {
     },
     /// Lets the signed gateway transition of this epoch leave the authority.
     GatewayIdentityPublish { epoch: u64 },
+    /// Replaces the encrypted vault copy, and the credential document when
+    /// one travels with it (§5.9). The tunnel's alone: the console keeps its
+    /// own procedure, which is a file copy.
+    VaultCopy {
+        vault: VaultBytes,
+        credentials: Option<Box<CredentialRegistry>>,
+    },
 }
 
 impl DoorRequest {
@@ -198,6 +208,7 @@ impl DoorRequest {
             Self::PinCaTls { .. } => "pin_ca_tls",
             Self::IssuerInstall { .. } => "issuer_install",
             Self::GatewayIdentityPublish { .. } => "gateway_identity_publish",
+            Self::VaultCopy { .. } => "vault_copy",
         }
     }
 }
@@ -217,6 +228,7 @@ impl From<OperatorOpenRequest> for DoorRequest {
             OperatorOpenAction::FleetLeafs => Self::FleetLeafs { text },
             OperatorOpenAction::TrustAuthorities => Self::TrustAuthorities { text },
             OperatorOpenAction::ClientRevocation { peer } => Self::ClientRevocation { peer, text },
+            OperatorOpenAction::IssuerDelegation => Self::IssuerDelegation { text },
         }
     }
 }
@@ -295,8 +307,8 @@ pub enum DoorOutcome {
         audit_head: Fingerprint,
         changed: bool,
     },
-    /// A delegation is recorded. Astra issues under it once restarted: the
-    /// delegated issuer is read at start-up, beside its private keys.
+    /// A delegation is recorded, and adopted by the running service when its
+    /// key files check out; a standalone console only records it.
     IssuerInstalled {
         issuer_epoch: u64,
         not_after: u64,
@@ -311,6 +323,12 @@ pub enum DoorOutcome {
         /// When the transition takes effect, from its signed window.
         activation_at: u64,
         confirmed: bool,
+    },
+    /// The vault copy in service is the one just sent. `credential_registry_epoch`
+    /// is the epoch of the document Astra serves, `None` when it serves none.
+    VaultCopied {
+        fingerprint: Fingerprint,
+        credential_registry_epoch: Option<u64>,
     },
 }
 
@@ -448,6 +466,21 @@ pub enum DoorRefusal {
     )]
     PublicationChannelUnavailable,
     #[error(
+        "cette copie n'est pas celle d'un coffre de ce domaine, ou son document de credentials ne \
+         se vérifie pas sous l'ancre en service : rien n'a été écrit"
+    )]
+    VaultCopyRefused,
+    #[error(
+        "ce document de credentials est d'une époque inférieure à celui en service : le remplacer \
+         ferait reculer la liste des clés, et rien n'a été écrit"
+    )]
+    CredentialsRollback,
+    #[error(
+        "une rotation CA-PQ est en cours : Astra adopte lui-même le nouveau document à l'échéance, \
+         et rien n'a été écrit"
+    )]
+    CredentialsDuringRotation,
+    #[error(
         "erreur interne d'Astra : rien n'a été enregistré, le détail est dans le journal du service"
     )]
     NotRecorded,
@@ -469,6 +502,10 @@ impl DoorRefusal {
     /// A malformed text is the caller's own input and says nothing about the
     /// domain; a full store is a budget. Every decision about the domain —
     /// policy, uniqueness, targets, vault — is the same indistinct refusal.
+    /// The one exception is not decided here: `POST /operator/vault-copy`
+    /// answers `409` for `AlreadyOpen` and `CredentialsDuringRotation`, because
+    /// the sender retries them and only an administrator reaches that route
+    /// (spec §8.5.4).
     pub fn class(&self) -> ServiceError {
         match self {
             Self::TextMissing
@@ -491,7 +528,10 @@ impl DoorRefusal {
             | Self::ClientTlsAnchorAlreadyPinned
             | Self::DelegationRefused(_)
             | Self::NoGatewayTransition { .. }
-            | Self::GatewayTransitionAborted { .. } => ServiceError::Refused,
+            | Self::GatewayTransitionAborted { .. }
+            | Self::VaultCopyRefused
+            | Self::CredentialsRollback
+            | Self::CredentialsDuringRotation => ServiceError::Refused,
             Self::Store(SigningError::Full) => ServiceError::Throttled,
             Self::Store(_)
             | Self::GatewayChannelUnavailable
@@ -526,11 +566,12 @@ pub fn allowed(connector: &DoorConnector, request: &DoorRequest) -> bool {
         DoorRequest::ChainOpen { .. } => (true, false),
         DoorRequest::ChainNext {} => (true, false),
         DoorRequest::ChainAbandon {} => (true, false),
-        DoorRequest::IssuerDelegation { .. } => (true, false),
+        DoorRequest::IssuerDelegation { .. } => (true, true),
         DoorRequest::IssuerRequest {} => (true, false),
         DoorRequest::PinCaTls { .. } => (true, false),
         DoorRequest::IssuerInstall { .. } => (true, false),
         DoorRequest::GatewayIdentityPublish { .. } => (true, false),
+        DoorRequest::VaultCopy { .. } => (false, true),
     };
     match connector {
         DoorConnector::Console { .. } => console,
@@ -619,7 +660,7 @@ impl AstraService {
                 issuer_epoch,
                 not_after,
                 %audit_head,
-                "delegation recorded through the door; restart Astra to issue under it"
+                "delegation recorded through the door"
             ),
             Ok(DoorOutcome::Published {
                 epoch, confirmed, ..
@@ -629,6 +670,18 @@ impl AstraService {
                 epoch,
                 confirmed,
                 "gateway transition marked published through the door"
+            ),
+            // The fingerprint and the connector, which names the operator:
+            // never the content, which is the vault itself.
+            Ok(DoorOutcome::VaultCopied {
+                fingerprint,
+                credential_registry_epoch,
+            }) => tracing::info!(
+                connector = %connector,
+                action,
+                %fingerprint,
+                credential_registry_epoch,
+                "vault copy replaced through the door"
             ),
             Err(refusal) => tracing::warn!(
                 connector = %connector,
@@ -730,12 +783,28 @@ impl AstraService {
                 // request writes, by epoch: the two never interleave.
                 let _volume = self.volume_writes.lock().await;
                 let mut registry = self.registry.lock().await;
-                write::issuer_install(&mut registry, &self.state_dir, *authorization, now_unix)
-                    .map(DoorOutcome::from)
+                let installed = write::issuer_install(
+                    &mut registry,
+                    &self.state_dir,
+                    *authorization,
+                    now_unix,
+                )?;
+                if self.adopt_recorded_issuer(&registry) {
+                    tracing::info!(issuer_epoch = installed.issuer_epoch, "delegation adopted");
+                } else {
+                    tracing::error!(
+                        issuer_epoch = installed.issuer_epoch,
+                        "delegation recorded but not adopted: the previous issuer keeps serving"
+                    );
+                }
+                Ok(DoorOutcome::from(installed))
             }
             DoorRequest::GatewayIdentityPublish { epoch } => {
                 self.publish_gateway_transition(epoch, now_unix, gateway_bound)
                     .await
+            }
+            DoorRequest::VaultCopy { vault, credentials } => {
+                self.copy_vault(vault, credentials, now_unix).await
             }
         }
     }

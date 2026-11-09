@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest'
 import { rowsOf } from './OperatorCeremony'
-import type { AcceptanceManifest, InvitationManifest, IssuerManifest } from '../types'
+import type {
+  AcceptanceManifest,
+  CaRotationManifest,
+  InvitationManifest,
+  IssuerManifest,
+} from '../types'
 
 const acceptance: AcceptanceManifest = {
   operation: 'enrollment_acceptance',
@@ -104,5 +109,89 @@ describe('rowsOf for the issuer delegation', () => {
       ['demandée par', 'operator'],
       ['empreinte de campagne', 'f'.repeat(64)],
     ])
+  })
+})
+
+describe('rowsOf for a CA rotation', () => {
+  const rotation: CaRotationManifest = {
+    operation: 'ca_rotation',
+    trust_domain_id: 'td',
+    affected_ca: 'ca_tls',
+    current_epoch: 1,
+    next_epoch: 2,
+    activation_at: 1_800_000_000,
+    not_after: 1_802_000_000,
+    outgoing_anchor_fingerprint: 'o'.repeat(64),
+  }
+
+  it('the_incoming_anchor_is_named_as_still_to_come_at_the_touch', () => {
+    const rows = rowsOf(rotation)
+    expect(rows).toContainEqual(['autorité visée', 'CA-TLS cliente'])
+    expect(rows).toContainEqual(['époque', '1 → 2'])
+    expect(rows).toContainEqual(['ancre sortante', 'o'.repeat(64)])
+    expect(rows).toContainEqual(['ancre entrante', 'créée à la signature'])
+    expect(rows.map(([label]) => label)).not.toContain('campagne')
+  })
+
+  it('the_incoming_anchor_is_shown_once_it_exists', () => {
+    const rows = rowsOf({ ...rotation, next_anchor_fingerprint: 'n'.repeat(64) })
+    expect(rows).toContainEqual(['ancre entrante', 'n'.repeat(64)])
+  })
+
+  it('the_touch_lists_every_target_the_campaign_binds', () => {
+    const rows = rowsOf({
+      ...rotation,
+      campaign: {
+        campaign: {
+          format_version: 1,
+          campaign_id: 'c'.repeat(32),
+          trust_domain_id: 'td',
+          gateway_wg_public_key: 'k',
+          server_name: 'gw',
+          created_at: 1,
+          expires_at: 2,
+          scope: 'trust_authorities',
+          targets: [
+            {
+              certificate_kind: 'ca_pq',
+              identity_key: 'g',
+              epoch: 3,
+              generation: 3,
+              active_tls_certificate_fingerprint: 'a'.repeat(64),
+              active_pq_certificate_fingerprint: 'b'.repeat(64),
+            },
+            {
+              certificate_kind: 'ca_tls',
+              identity_key: 'g',
+              epoch: 1,
+              generation: 1,
+              active_tls_certificate_fingerprint: 'd'.repeat(64),
+              active_pq_certificate_fingerprint: 'e'.repeat(64),
+            },
+          ],
+          reason: 'renouveler',
+          requested_by: 'operator',
+          policy_fingerprint: 'p'.repeat(64),
+          required_credentials: 2,
+        },
+        fingerprint: 'f'.repeat(64),
+      },
+    })
+    expect(rows).toContainEqual(['autorité visée', 'CA-TLS cliente'])
+    expect(rows).toContainEqual(['portée', 'les ancres du domaine'])
+    expect(rows).toContainEqual(['clés requises', '2'])
+    expect(rows).toContainEqual(['cibles', '2'])
+    expect(rows).toContainEqual(['cible 1 état', 'époque 3, génération 3'])
+    expect(rows).toContainEqual(['cible 1 TLS', 'a'.repeat(64)])
+    expect(rows).toContainEqual(['cible 1 PQ', 'b'.repeat(64)])
+    expect(rows).toContainEqual(['cible 2 état', 'époque 1, génération 1'])
+    expect(rows).toContainEqual(['cible 2 TLS', 'd'.repeat(64)])
+    expect(rows).toContainEqual(['cible 2 PQ', 'e'.repeat(64)])
+    expect(rows).toContainEqual(['empreinte de campagne', 'f'.repeat(64)])
+    expect(rows.map(([label]) => label)).toEqual(expect.arrayContaining(['cible 1', 'cible 2']))
+  })
+
+  it('names_no_peer_count_the_campaign_does_not_state', () => {
+    expect(rowsOf(rotation).map(([label]) => label)).not.toContain('pairs concernés')
   })
 })

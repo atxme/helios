@@ -114,6 +114,16 @@ pub fn domain_view(
             .as_ref()
             .map(|key| key.authority_fingerprint().to_hex()),
         client_tls_ca_epoch: state.client_tls_ca.ca_tls_epoch,
+        client_tls_ca_fingerprint: state
+            .client_tls_ca
+            .active_client_tls_ca_certificate
+            .fingerprint()
+            .to_hex(),
+        next_client_tls_ca_fingerprint: state
+            .client_tls_ca
+            .next_client_tls_ca_certificate
+            .as_ref()
+            .map(|certificate| certificate.fingerprint().to_hex()),
         client_tls_ca_transition_pending: state
             .client_tls_ca
             .next_client_tls_ca_certificate

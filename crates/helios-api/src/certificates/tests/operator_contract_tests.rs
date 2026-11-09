@@ -52,6 +52,13 @@ impl OperatorCampaignRelay for RecordingRelay {
         self.record("pending", operator, String::new(), "")?;
         Ok(astra_channel::OperatorPendingList { operations: vec![] })
     }
+    async fn status(
+        &self,
+        operator: &astra_channel::OperatorIdentity,
+    ) -> Result<astra_channel::OperatorAuthorityStatus, TrustUpdateRefusal> {
+        self.record("status", operator, String::new(), "")?;
+        Ok(authority_status())
+    }
     async fn operation(
         &self,
         operator: &astra_channel::OperatorIdentity,
@@ -89,6 +96,24 @@ impl OperatorCampaignRelay for RecordingRelay {
         *self.deposited.lock().unwrap() = Some(*result);
         Ok(campaign_view())
     }
+    async fn vault_copy(
+        &self,
+        operator: &astra_channel::OperatorIdentity,
+        copy: astra_channel::OperatorVaultCopy,
+    ) -> Result<astra_channel::OperatorVaultCopied, TrustUpdateRefusal> {
+        self.record(
+            "vault-copy",
+            operator,
+            format!("{}:{}", copy.vault_base64.len(), copy.credentials.is_some()),
+            "",
+        )?;
+        Ok(astra_channel::OperatorVaultCopied {
+            fingerprint: Fingerprint::of(b"recorded encrypted vault"),
+            credential_registry_epoch: copy
+                .credentials
+                .map(|registry| registry.credential_registry_epoch),
+        })
+    }
     async fn open(
         &self,
         operator: &astra_channel::OperatorIdentity,
@@ -97,6 +122,60 @@ impl OperatorCampaignRelay for RecordingRelay {
         self.record("open", operator, String::new(), "")?;
         Err(TrustUpdateRefusal::Rejected)
     }
+}
+
+#[tokio::test]
+async fn status_relay_receives_resolved_operator_without_a_capability() {
+    let relay = RecordingRelay::new(None);
+    let response = operator_status(State(state(&relay)), Extension(operator_caller_at(true))).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+    let report: astra_channel::OperatorAuthorityStatus = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(report, authority_status());
+    assert_eq!(
+        *relay.calls.lock().unwrap(),
+        vec![Call {
+            route: "status",
+            operator: expected_operator(),
+            id: String::new(),
+            token: String::new(),
+        }]
+    );
+}
+
+#[tokio::test]
+async fn vault_copy_is_relayed_once_without_recording_its_encrypted_content() {
+    let relay = RecordingRelay::new(None);
+    let copy = astra_channel::OperatorVaultCopy {
+        vault_base64: "Y2lwaGVydGV4dA==".into(),
+        credentials: None,
+    };
+    let body = Bytes::from(serde_json::to_vec(&copy).unwrap());
+    let response = operator_vault_copy(
+        State(state(&relay)),
+        Extension(operator_caller_at(true)),
+        body,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+    let copied: astra_channel::OperatorVaultCopied = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        copied.fingerprint,
+        Fingerprint::of(b"recorded encrypted vault")
+    );
+    assert_eq!(copied.credential_registry_epoch, None);
+    assert_eq!(
+        *relay.calls.lock().unwrap(),
+        vec![Call {
+            route: "vault-copy",
+            operator: expected_operator(),
+            id: format!("{}:false", "Y2lwaGVydGV4dA==".len()),
+            token: String::new(),
+        }]
+    );
 }
 fn state(relay: &Arc<RecordingRelay>) -> AppState {
     state_with(None).with_operator_campaign(Arc::clone(relay) as Arc<_>)

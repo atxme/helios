@@ -1,6 +1,6 @@
 [package]
 name = "heliosd"
-version = "2.41.1"
+version = "3.0.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -66,6 +66,8 @@ tempfile = "3"
 # is one Orion accepts (`certificates.rs`).
 orion-core = { workspace = true }
 rcgen = { workspace = true }
+# `StatusCode` for `ChannelError::Status`, to test how statuses are relayed.
+axum = { workspace = true }
 
 # `prctl(PR_SET_DUMPABLE, 0)` avant le chargement de la première clé
 # (ADR-006 §6). Déjà présente transitivement via tokio : aucun coût

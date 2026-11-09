@@ -1025,6 +1025,7 @@ change la composition de l’arbre, sans changer le nombre de binaires livrés
 | `crates/orion-engine/` | **ajouté** | Crate portable partagée par l’IHM et le moteur : protocole de trames JSON bornées (`wire`, `command`, `events`), jeton de session, cycle de vie du moteur (`lifecycle`), service du moteur (`service`), serveur et client du canal (`serve`, `client`), tube nommé Windows (`pipe`), nettoyage de l’ancien coffre (`legacy_cleanup`). Dépend d’`orion-core` et d’`aether`. |
 | `tools/helios-astra-helper/` | **retiré** | Les cérémonies opérateur s’exécutent dans l’IHM non élevée (`apps/orion/src-tauri/src/operator/`) ; aucun compagnon n’est livré. |
 | `apps/orion/src-tauri/src/deelevate.rs` | **renommé `launch.rs`** | Il ne désélève plus : l’IHM est non élevée, et `launch.rs` refuse de lancer un enfant (terminal SSH, `astra-signer`) si son propre jeton est élevé. |
+| `apps/orion/src-tauri/src/astra.rs`, `companion.rs`, `crates/astra-operator/src/orion.rs` | **retirés (F14 lot 5b)** | Orion ne lance plus `astra-signer` : les rotations se jouent dans l’IHM (`operator/ceremony/`), reprises par le journal `astra_operator::rotation_journal`. Le mode caché `astra-signer orion` est retiré ; `astra-signer` reste un outil en ligne de commande, recours transitoire jusqu’au lot 7. |
 | `apps/orion/src-tauri/src/engine_host.rs`, `engine_launch.rs` | **ajoutés** | Le moteur (`orion.exe --engine`, élevé) et son lancement par l’IHM (`ShellExecuteExW` `runas`). |
 | `orion-core::protected_root` | **ajouté** | Racine protégée sous `%ProgramData%`, contrôle de l’installation ; la migration de l’ancien coffre est `vault/relocation.rs`. |
 
@@ -1084,7 +1085,7 @@ crates/astra/src/
 
 crates/astra-operator/src/
   lib.rs authority.rs campaign.rs credentials.rs documents.rs gestures.rs
-  handoff.rs origin.rs orion.rs prepared.rs store.rs tunnel.rs vault.rs
+  handoff.rs origin.rs prepared.rs rotation_journal.rs store.rs tunnel.rs vault.rs
   operations.rs operations/{campaign,recovery}.rs
 
 crates/helios-tpm/src/
@@ -1130,8 +1131,8 @@ tools/helios-installer/src/         main.rs
 tools/helios-publisher/src/         main.rs
 tools/xtask/src/                    lib.rs main.rs orion_deps.rs orion_helper.rs
 
-apps/orion/src-tauri/src/           main.rs astra.rs companion.rs deelevate.rs
-                                    operator.rs tray.rs
+apps/orion/src-tauri/src/           main.rs launch.rs operator/ tray.rs
+                                    (astra.rs et companion.rs retirés : F14 lot 5b)
 ```
 
 `fuzz/` possède son propre workspace hors du workspace racine ; ses harnesses

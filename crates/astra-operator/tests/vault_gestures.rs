@@ -1135,3 +1135,93 @@ fn the_overview_shows_states_only_from_a_verified_document() {
     assert!(!view.credentials_complete);
     assert!(view.slots.iter().all(|slot| slot.state.is_none()));
 }
+
+/// `apply_local` overwrites the vault with the one signed before: a key added,
+/// removed or marked in between would be undone, a removed key regaining access.
+/// Each gesture that changes a key slot is refused by the journal's presence, with
+/// the vault and the document as they were.
+#[test]
+fn resume_gestures_on_key_slots_are_refused_while_a_rotation_is_in_flight() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = vault_path(&directory);
+    let (key1, key2, key3, key4) = (
+        FakeKey::new(1),
+        FakeKey::new(2),
+        FakeKey::new(3),
+        FakeKey::new(4),
+    );
+    let first = create(&path, &key1);
+    add(&path, &first, &key2, "YubiKey du sac");
+    let (slot3, _) = add(&path, &first, &key3, "YubiKey perdue");
+    complete_relay(&path);
+    emit_document(&path, &first);
+    // Damaged on purpose: presence is what counts.
+    std::fs::write(
+        astra_operator::rotation_journal::path_beside(&path),
+        b"illisible",
+    )
+    .expect("journal");
+    let vault_bytes = std::fs::read(&path).expect("vault bytes");
+    let document_bytes = std::fs::read(credentials::path_beside(&path)).expect("document bytes");
+    let assertions = key4.assertions();
+
+    assert_eq!(
+        refusal(add_key_with(
+            &path,
+            &first,
+            &key4,
+            &new_key("de plus"),
+            PIN,
+            NOW
+        )),
+        Some(SetupRefusal::RotationInFlight)
+    );
+    assert_eq!(
+        refusal(remove_key_with(&path, &first, &slot3, NOW)),
+        Some(SetupRefusal::RotationInFlight)
+    );
+    assert_eq!(
+        refusal(mark_key_with(&path, &first, &slot3, true, NOW)),
+        Some(SetupRefusal::RotationInFlight)
+    );
+    assert_eq!(key4.assertions(), assertions);
+    assert_eq!(std::fs::read(&path).expect("vault bytes"), vault_bytes);
+    assert_eq!(
+        std::fs::read(credentials::path_beside(&path)).expect("document bytes"),
+        document_bytes
+    );
+}
+
+/// The older CA-PQ file holds a sealed vault too: applying it would bring a removed
+/// key back, or undo a label. A rename is a change `apply_local` reverts as well.
+#[test]
+fn resume_gestures_on_key_slots_are_refused_with_the_legacy_file_and_rename_too() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = vault_path(&directory);
+    let (key1, key2, key3) = (FakeKey::new(1), FakeKey::new(2), FakeKey::new(3));
+    let first = create(&path, &key1);
+    add(&path, &first, &key2, "YubiKey du sac");
+    let (slot3, _) = add(&path, &first, &key3, "YubiKey perdue");
+    complete_relay(&path);
+    emit_document(&path, &first);
+    std::fs::write(
+        astra_operator::rotation_journal::legacy_ca_pq_path_beside(&path),
+        b"{}",
+    )
+    .expect("legacy");
+    let vault_bytes = std::fs::read(&path).expect("vault bytes");
+
+    assert_eq!(
+        refusal(remove_key_with(&path, &first, &slot3, NOW)),
+        Some(SetupRefusal::RotationInFlight)
+    );
+    assert_eq!(
+        refusal(mark_key_with(&path, &first, &slot3, true, NOW)),
+        Some(SetupRefusal::RotationInFlight)
+    );
+    assert_eq!(
+        refusal(rename_key(&path, &slot3, "autre nom")),
+        Some(SetupRefusal::RotationInFlight)
+    );
+    assert_eq!(std::fs::read(&path).expect("vault bytes"), vault_bytes);
+}

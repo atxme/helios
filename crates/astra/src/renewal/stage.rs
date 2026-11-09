@@ -13,7 +13,7 @@ pub(super) async fn resume_stage(
     operation_id: &Id16,
     now_unix: u64,
 ) -> Result<(), RenewalError> {
-    let issuer = service.issuer.as_ref().ok_or(RenewalError::NoIssuer)?;
+    let issuer = service.issuer().ok_or(RenewalError::NoIssuer)?;
     let gateway = service
         .gateway
         .as_ref()

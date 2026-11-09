@@ -113,7 +113,7 @@ async fn persist_readable_operation(fixture: &Fixture) -> Id16 {
         domain(),
         gateway_key(),
         &rp_id,
-        1,
+        &fixture.service.approval_credentials(),
         1,
         now,
     )
@@ -328,7 +328,7 @@ async fn unknown_and_expired_operations_have_the_same_coarse_refusal_without_mut
         domain(),
         gateway_key(),
         &rp_id,
-        1,
+        &fixture.service.approval_credentials(),
         1,
         now,
     )

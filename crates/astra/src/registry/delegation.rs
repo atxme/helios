@@ -36,6 +36,21 @@ impl AstraRegistry {
         adopted_policy: Option<AstraPolicyPin>,
         now_unix: u64,
     ) -> Result<(), RegistryError> {
+        // Installing the delegation already held is a no-op, not a walk-back: a
+        // companion whose response was lost retries the same bytes, and §8.2 makes
+        // that replay the repair. Only a *different* delegation at a spent epoch is
+        // the substitution this refuses.
+        let already_held = self.state.issuer.as_ref() == Some(&issuer);
+        if let Some(installed) = self.state.issuer.as_ref().filter(|_| !already_held) {
+            if issuer.issuer_epoch <= installed.issuer_epoch {
+                return Err(RegistryError::IssuerEpochNotAdvancing {
+                    installed: installed.issuer_epoch,
+                    offered: issuer.issuer_epoch,
+                });
+            }
+        }
+        // After the refusal and not before it: a pin left in memory would be persisted
+        // by the next unrelated save, without its delegation.
         if let Some(policy) = adopted_policy {
             self.state.astra_policy_fingerprint = policy;
             self.state.audit.append(
@@ -45,26 +60,14 @@ impl AstraRegistry {
                 now_unix,
             );
         }
-        if let Some(installed) = &self.state.issuer {
-            // Installing the delegation already held is a no-op, not a
-            // walk-back: a companion whose response was lost retries the same
-            // bytes, and §8.2 makes that replay the repair. Only a *different*
-            // delegation at a spent epoch is the substitution this refuses.
-            if installed == &issuer {
-                // The delegation is already held. The pin may still have moved
-                // just above, so the write is not skipped with it.
-                return if adopted_policy.is_some() {
-                    self.save()
-                } else {
-                    Ok(())
-                };
-            }
-            if issuer.issuer_epoch <= installed.issuer_epoch {
-                return Err(RegistryError::IssuerEpochNotAdvancing {
-                    installed: installed.issuer_epoch,
-                    offered: issuer.issuer_epoch,
-                });
-            }
+        if already_held {
+            // The pin may still have moved just above, so the write is not skipped
+            // with the install.
+            return if adopted_policy.is_some() {
+                self.save()
+            } else {
+                Ok(())
+            };
         }
         let issuer_epoch = issuer.issuer_epoch;
         self.state.issuer = Some(issuer);

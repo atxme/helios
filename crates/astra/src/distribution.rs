@@ -477,6 +477,7 @@ mod tests {
             }],
             peers: Default::default(),
             status_epochs: Default::default(),
+            promoted_credentials: None,
             audit: Default::default(),
         }
     }

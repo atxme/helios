@@ -267,3 +267,16 @@ fn only_one_picker_is_open_at_a_time() {
     assert!(failed().is_err());
     assert!(location.begin_pick().is_ok());
 }
+
+/// A look at the tunnel-up runs on machines that never opened Astra: it reads the
+/// location and creates nothing, where `path` makes the default folder.
+#[test]
+fn looking_at_the_location_creates_no_folder() {
+    let scratch = Scratch::new("look-creates-nothing");
+    let location = scratch.location();
+
+    let looked = location.path_to_look_at().expect("resolved");
+
+    assert_eq!(looked, scratch.default_vault());
+    assert!(!looked.parent().expect("folder").exists());
+}

@@ -78,9 +78,9 @@ pub struct IssuerInstalled {
 /// The anchor the registry pins, the policy it computed at bootstrap, and the
 /// private keys this state volume holds for its epoch: the same
 /// [`crate::issuer::adopt`] the operator result of §8.2 goes through. A
-/// delegation installed here is recorded, not yet used: the delegated issuer
-/// is read at start-up, beside the private keys it names, so Astra issues
-/// under it once restarted.
+/// delegation installed here is recorded only: the running service adopts it
+/// afterwards (`AstraService::adopt_recorded_issuer`), a standalone console
+/// leaves that to the next start.
 pub fn issuer_install(
     registry: &mut AstraRegistry,
     state_dir: &Path,

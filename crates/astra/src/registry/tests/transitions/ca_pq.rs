@@ -383,3 +383,108 @@ fn a_legacy_registry_with_ambiguous_ca_pq_successors_is_refused() {
     }
     assert_eq!(std::fs::read(&path).expect("read unchanged file"), bytes);
 }
+
+fn rotated_credentials(
+    anchored: &Anchored,
+) -> Box<aether::certificates::approval::CredentialRegistry> {
+    Box::new(aether::certificates::approval::CredentialRegistry {
+        trust_domain_id: anchored.registry.state().trust_domain_id,
+        gateway_wg_public_key: anchored.registry.state().gateway_wg_public_key,
+        ca_epoch: 2,
+        credential_registry_epoch: 2,
+        bindings: Vec::new(),
+    })
+}
+
+fn accept_with_credentials(
+    anchored: &mut Anchored,
+) -> Box<aether::certificates::approval::CredentialRegistry> {
+    let object = transition_from(
+        &anchored.registry,
+        &anchored.ca_private,
+        &anchored.ca_public,
+        1,
+        TransitionWindow::new(1_000, 3_000, 5_000).expect("window"),
+    )
+    .0;
+    let document = rotated_credentials(anchored);
+    anchored
+        .registry
+        .accept_transitions(&anchor_campaign(), &[object], Some(document.clone()), 2_000)
+        .expect("accepted");
+    document
+}
+
+#[test]
+fn promotion_keeps_the_rotation_credentials_for_adoption() {
+    let mut anchored = anchored();
+    let document = accept_with_credentials(&mut anchored);
+
+    anchored
+        .registry
+        .forget_expired_transitions(4_999)
+        .expect("sweep before retirement");
+    assert!(anchored.registry.state().promoted_credentials.is_none());
+
+    anchored
+        .registry
+        .forget_expired_transitions(5_000)
+        .expect("promotion");
+    assert!(anchored.registry.state().transitions.is_empty());
+    assert_eq!(
+        anchored.registry.state().promoted_credentials.as_deref(),
+        Some(&*document)
+    );
+    assert_eq!(
+        anchored
+            .registry
+            .take_promoted_credentials()
+            .expect("taken")
+            .as_deref(),
+        Some(&*document)
+    );
+    assert!(anchored
+        .registry
+        .take_promoted_credentials()
+        .expect("nothing left")
+        .is_none());
+}
+
+#[test]
+fn adoption_survives_a_restart_between_promotion_and_file_write() {
+    let mut anchored = anchored();
+    let document = accept_with_credentials(&mut anchored);
+    anchored
+        .registry
+        .forget_expired_transitions(5_000)
+        .expect("promotion");
+
+    let path = anchored._directory.path().join("astra.json");
+    let mut reloaded = AstraRegistry::load(&path, None).expect("reload");
+    assert_eq!(reloaded.state().ca_epoch, 2);
+    assert_eq!(
+        reloaded
+            .take_promoted_credentials()
+            .expect("taken")
+            .as_deref(),
+        Some(&*document)
+    );
+    let reloaded = AstraRegistry::load(&path, None).expect("reload after take");
+    assert!(reloaded.state().promoted_credentials.is_none());
+}
+
+#[test]
+fn a_transition_without_credentials_promotes_nothing_to_adopt() {
+    let mut anchored = anchored();
+    let object = transition(&anchored, 1);
+    anchored
+        .registry
+        .accept_transitions(&anchor_campaign(), &[object], None, 2_000)
+        .expect("accepted");
+    anchored
+        .registry
+        .forget_expired_transitions(200_000)
+        .expect("promotion");
+    assert_eq!(anchored.registry.state().ca_epoch, 2);
+    assert!(anchored.registry.state().promoted_credentials.is_none());
+}

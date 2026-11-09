@@ -52,6 +52,20 @@ use aether::certificates::{
 /// looping, and growing memory on that is how a bound stops being one.
 pub const MAX_LIVE_SIGNING_OPERATIONS: usize = 64;
 
+/// How much of a campaign's free text the pending list carries.
+const PENDING_TEXT_CHARS: usize = 128;
+
+/// The first [`PENDING_TEXT_CHARS`] characters, with an ellipsis if cut.
+///
+/// Cut on `char` boundaries, never bytes: the text is operator-written and
+/// may be multi-byte.
+fn shorten(text: &str) -> String {
+    match text.char_indices().nth(PENDING_TEXT_CHARS) {
+        Some((end, _)) => format!("{}…", &text[..end]),
+        None => text.to_owned(),
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SigningError {
     #[error("no such operator operation")]
@@ -238,6 +252,12 @@ impl SigningOperationStore {
     /// Carries no capability token. Tokens are minted for the caller about to
     /// act on the operation they named; a list that carried them would hand
     /// every reader a credential for every operation on it.
+    ///
+    /// `reason` and `requested_by` are cut at [`PENDING_TEXT_CHARS`]: the list
+    /// only tells operations apart, and the full text is read on the one the
+    /// operator opens. Without the cut, [`MAX_LIVE_SIGNING_OPERATIONS`] entries
+    /// of the longest accepted text would outgrow the answer bound the client
+    /// enforces.
     pub fn pending(
         &self,
         now_unix: u64,
@@ -254,8 +274,8 @@ impl SigningOperationStore {
                 |operation| aether::certificates::transport::OperatorPendingOperation {
                     operation_id: operation.operation_id,
                     scope: operation.campaign.scope,
-                    reason: operation.campaign.reason.clone(),
-                    requested_by: operation.campaign.requested_by.clone(),
+                    reason: shorten(&operation.campaign.reason),
+                    requested_by: shorten(&operation.campaign.requested_by),
                     target_count: operation.campaign.targets.len(),
                     required_credentials: operation.campaign.required_credentials,
                     campaign_fingerprint: operation.campaign.fingerprint(),
@@ -372,6 +392,32 @@ impl SigningOperationStore {
                         .is_some_and(|held| held.matches(vault))
             })
             .collect()
+    }
+
+    /// Test-only: approves one held operation without a ceremony.
+    #[cfg(test)]
+    pub(crate) fn approve_without_ceremony(&mut self, id: &Id16) {
+        self.operations
+            .get_mut(id.as_bytes())
+            .expect("operation held")
+            .approve_without_ceremony();
+    }
+
+    /// A live operation still waiting for its operator to open the vault, if
+    /// any.
+    ///
+    /// Not [`Self::awaiting_vault`]: that one ignores the state, and an
+    /// approved operation that has not yet expired no longer downloads
+    /// anything, so it must not hold a vault replacement back.
+    pub fn awaiting_operator_with_vault(&self, now_unix: u64) -> Option<Id16> {
+        self.operations
+            .values()
+            .find(|operation| {
+                !operation.is_expired(now_unix)
+                    && operation.state == SigningOperationState::AwaitingOperator
+                    && operation.vault_fingerprint().is_some()
+            })
+            .map(|operation| operation.operation_id)
     }
 
     /// The approved campaign that authorizes rotating one client's generation.
@@ -607,6 +653,74 @@ mod tests {
         let mut store = SigningOperationStore::new();
         store.open(operation, 1_050).expect("store");
         store
+    }
+
+    /// Inserts one live operation whose campaign carries this text, under an
+    /// operation identifier of its own. Identifiers are drawn from `index`.
+    fn open_with_text(
+        store: &mut SigningOperationStore,
+        index: u8,
+        reason: String,
+        requested_by: String,
+    ) {
+        let mut campaign = campaign(CampaignScope::FleetLeafs);
+        // Distinct from every operation identifier drawn from `index`.
+        campaign.campaign_id = Id16::new([200; 16]).expect("id");
+        campaign.reason = reason;
+        campaign.requested_by = requested_by;
+        let mut request = request(&campaign, Fingerprint::of(b"vault"));
+        request.operation_id = Id16::new([index; 16]).expect("id");
+        let operation = SigningOperation::new(campaign, request, 1_050).expect("open");
+        store.operations.insert([index; 16], operation);
+    }
+
+    #[test]
+    fn pending_list_of_64_longest_operations_fits_the_answer_bound() {
+        use crate::door::{MAX_REASON_CHARS, MAX_REQUESTED_BY_CHARS};
+        // Multi-byte on purpose: the bound is in bytes, the limits in chars.
+        let reason: String = "é€😀".chars().cycle().take(MAX_REASON_CHARS).collect();
+        let requested_by: String = "😀é€"
+            .chars()
+            .cycle()
+            .take(MAX_REQUESTED_BY_CHARS)
+            .collect();
+        let mut store = SigningOperationStore::new();
+        for index in 1..=MAX_LIVE_SIGNING_OPERATIONS as u8 {
+            open_with_text(&mut store, index, reason.clone(), requested_by.clone());
+        }
+        let list = aether::certificates::transport::OperatorPendingList {
+            operations: store.pending(1_100),
+        };
+        assert_eq!(list.operations.len(), MAX_LIVE_SIGNING_OPERATIONS);
+        let body = serde_json::to_vec(&list).unwrap();
+        assert!(
+            body.len() <= astra_channel::MAX_OPERATOR_ANSWER_BYTES,
+            "{} bytes",
+            body.len()
+        );
+    }
+
+    #[test]
+    fn pending_cuts_reason_and_requester_at_128_chars_with_an_ellipsis() {
+        let mut store = SigningOperationStore::new();
+        open_with_text(&mut store, 1, "é".repeat(300), "😀".repeat(200));
+        open_with_text(&mut store, 2, "motif court".into(), "a".repeat(128));
+        let pending = store.pending(1_100);
+        let long = pending
+            .iter()
+            .find(|op| op.operation_id.as_bytes()[0] == 1)
+            .unwrap();
+        assert_eq!(long.reason.chars().count(), 129);
+        assert!(long.reason.ends_with('…'));
+        assert_eq!(long.requested_by.chars().count(), 129);
+        assert!(long.requested_by.ends_with('…'));
+        let short = pending
+            .iter()
+            .find(|op| op.operation_id.as_bytes()[0] == 2)
+            .unwrap();
+        assert_eq!(short.reason, "motif court");
+        // Exactly at the limit is not cut.
+        assert_eq!(short.requested_by, "a".repeat(128));
     }
 
     /// The lookup the delegated renewal path runs before asking anyone for a

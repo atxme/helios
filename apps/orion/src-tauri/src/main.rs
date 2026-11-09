@@ -79,23 +79,14 @@ mod engine_launch;
 /// launch, so an engine elevated under another account can observe it.
 mod ui_access;
 
-/// Launches from the UI (SSH terminal, Astra companion). Each one is refused
+/// Launches from the UI (the SSH terminal). Each one is refused
 /// while the UI's own token is elevated; only that check is Windows-specific.
 mod launch;
-
-/// Fixed launcher of `astra-signer`. Its only caller is the CA-TLS rotation in
-/// `astra`, until lot 5 brings that rotation into Orion; renewal approval no
-/// longer uses it.
-mod companion;
 
 /// Notification-area menu. Its model and labels are portable and tested
 /// everywhere; only the wiring inside is Windows-only.
 mod tray;
 
-/// The Astra CA-TLS ceremony, driven from this window and signed elsewhere.
-/// The vault, the PIN and the FIDO gesture stay inside the companion; only
-/// the public progress states cross into Orion.
-mod astra;
 mod operator;
 
 /// The commands the frontend invokes, one child per capability.
@@ -107,15 +98,7 @@ struct AppState {
     /// The shell's session with the engine. Commands go through it.
     client: orion_engine::client::EngineClient,
     pending_profile_paths: StdMutex<VecDeque<PathBuf>>,
-    /// The Astra CA-TLS rotation this window is hosting, if one is open.
-    ///
-    /// Owned by Rust, not by the WebView: the ceremony outlives the view that
-    /// started it — leaving the screen mid-rotation must not abandon a
-    /// companion that is about to write a durable decision — and its phase is
-    /// the one thing a reload has to be able to recover.
-    astra: astra::Ceremony,
-    /// The protocol-2 ceremony, which every operation but the `CA-TLS`
-    /// rotation now runs through.
+    /// The ceremony every operator operation runs through, rotations included.
     operator: operator::OperatorCeremony,
     /// Where every operator gesture opens the vault, as the operator chose it.
     vault_location: operator::location::VaultLocation,
@@ -215,10 +198,20 @@ fn ensure_frontend_dev_server() -> anyhow::Result<Option<FrontendDevServer>> {
 /// single point is what keeps the menu from claiming a tunnel that is gone.
 /// Only the transition, deliberately: telemetry arrives once a second, and
 /// rebuilding the menu at that rate would rebuild it under the pointer.
+///
+/// The edge into `Up` is also where a rotation left in flight is taken up again,
+/// once per edge (spec §5.4).
 fn emit_sink(app: AppHandle) -> EventSink {
+    let tunnel = operator::TunnelWatch::default();
     Arc::new(move |ev: ClientEvent| {
         if matches!(ev, ClientEvent::StateChanged { .. }) {
             tray::refresh(&app);
+        }
+        if tunnel.entered_up_by(&ev) {
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move {
+                operator::resume_on_tunnel_up(&app).await;
+            });
         }
         let _ = app.emit("helios://event", &ev);
     })
@@ -704,7 +697,6 @@ fn main() {
             app.manage(AppState {
                 client,
                 pending_profile_paths: StdMutex::new(pending_profile_paths),
-                astra: astra::Ceremony::default(),
                 operator: operator::OperatorCeremony::default(),
                 vault_location: operator::location::VaultLocation::load(),
                 quitting: AtomicBool::new(false),
@@ -779,13 +771,11 @@ fn main() {
             last_certificate_error,
             run_speed_test,
             vault_posture,
-            start_astra_ca_tls_rotation,
-            continue_astra_ca_tls_rotation,
-            cancel_astra_ca_tls_rotation,
-            astra_ca_tls_rotation_status,
             begin_operator_ceremony,
             begin_vault_ceremony,
             begin_issuer_ceremony,
+            begin_rotation_ceremony,
+            approve_rotation_ceremony,
             rename_operator_key,
             write_domain_relay,
             adopt_connected_gateway,
@@ -799,6 +789,10 @@ fn main() {
             operator_ceremony_status,
             operator_overview,
             operator_pending_operations,
+            operator_rotations_overview,
+            operator_rotation_journal,
+            operator_send_vault_copy,
+            operator_open_campaign,
             operator_vault_location,
             choose_vault_location,
             reset_vault_location,

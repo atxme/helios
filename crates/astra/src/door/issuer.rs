@@ -88,6 +88,9 @@ impl AstraService {
         // keys a live one pins.
         open::check_text(&text)?;
         self.refuse_live_delegation(now_unix).await?;
+        // Same refusal `open_campaign` would give, but before the keys: a
+        // refused opening must not rewrite the files of the epoch.
+        open::vault_fingerprint_for(self, CampaignScope::IssuerDelegation)?;
         let Material { request, target } = self.prepare_issuer_material(volume).await?;
         let opened = open::open_campaign(
             self,

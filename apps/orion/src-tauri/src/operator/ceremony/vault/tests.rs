@@ -331,6 +331,68 @@ fn marking_without_the_gateway_is_refused_before_the_key() {
     refused_before_the_key(&published, Refusal::GatewayIdentityMissing);
 }
 
+/// A rotation applies the vault it signed over the one in place: a key slot changed
+/// meanwhile would be undone, a removed key regaining access. Refused before the key,
+/// with the vault as it was.
+#[test]
+fn key_slot_gestures_are_refused_while_a_rotation_is_in_flight() {
+    use crate::operator::{KeyRole, VaultGesture};
+
+    let domain = Domain::new("rotation-in-flight");
+    let slot_id = first_slot_id(&domain);
+    std::fs::write(
+        astra_operator::rotation_journal::path_beside(&domain.vault_path),
+        b"illisible",
+    )
+    .expect("journal");
+    let vault_bytes = std::fs::read(&domain.vault_path).expect("vault");
+
+    for gesture in [
+        VaultGesture::AddKey {
+            label: "neuve".into(),
+            role: KeyRole::Recovery,
+        },
+        VaultGesture::RemoveKey {
+            slot_id: slot_id.clone(),
+        },
+        VaultGesture::MarkKey {
+            slot_id: slot_id.clone(),
+            lost: true,
+        },
+    ] {
+        let (outcome, published, _) = run_vault_gesture(gesture, &domain.vault_path);
+        outcome.expect_err("refused while a rotation is in flight");
+        refused_before_the_key(&published, Refusal::RotationInFlight);
+        assert_eq!(
+            std::fs::read(&domain.vault_path).expect("vault"),
+            vault_bytes
+        );
+    }
+}
+
+/// The CA-PQ file `astra-signer` left holds a sealed vault: renaming a key now would
+/// be reverted when it is applied. Refused, the label as it was.
+#[test]
+fn a_rename_is_refused_while_a_sealed_vault_waits() {
+    let domain = Domain::new("rename-waits");
+    let slot_id = first_slot_id(&domain);
+    std::fs::write(
+        astra_operator::rotation_journal::legacy_ca_pq_path_beside(&domain.vault_path),
+        b"{}",
+    )
+    .expect("legacy file");
+    let vault_bytes = std::fs::read(&domain.vault_path).expect("vault");
+
+    let refused = crate::operator::rename_key(&domain.vault_path, &slot_id, "autre nom")
+        .expect_err("refused");
+
+    assert!(refused.contains("remplacera celui-ci"), "{refused}");
+    assert_eq!(
+        std::fs::read(&domain.vault_path).expect("vault"),
+        vault_bytes
+    );
+}
+
 /// A domain carrying its CA-TLS and a document for every key has nothing
 /// left to issue.
 #[test]

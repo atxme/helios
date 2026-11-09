@@ -296,6 +296,12 @@ demander est une donnée de la porte, testée ligne par ligne :
 | délégation d'émetteur, avec ou sans campagne | oui | non | non |
 | `pin-ca-tls`, `issuer install`, `gateway-identity publish` | oui | non | non |
 
+*Amendé le 7 novembre 2026 (§0.10) : le tunnel ouvre aussi la délégation
+d'émetteur **avec campagne** (`IssuerDelegation`) et écrit la copie du coffre
+(`VaultCopy`, absente de la console). `IssuerRequest` et `IssuerInstall`, la
+délégation sans campagne, restent à la console. La table en vigueur est celle
+du §0.10.*
+
 Élargir le tunnel à une action est un changement explicite de cette table, pas
 un effet de bord.
 
@@ -369,6 +375,91 @@ vérification par Orion du manifeste sous la clé de service épinglée, asserti
 WebAuthn, signatures `CA-PQ` et refus de dépôt par Astra sont inchangés. Les
 §7.6, §8.5, §11.6 et §12.3 sont alignés sur cet amendement ; ADR-008 §7 porte
 le même.
+
+### 0.10 Amendement des rotations dans Orion du 7 novembre 2026
+
+Décidé par l'utilisateur les 4 et 7 novembre 2026 (F14, lot 5b). Les
+rotations, la délégation de l'émetteur et la copie du coffre se font depuis
+Orion, par le tunnel, sans commande ni fichier à transporter. Le lot est
+conçu dans `docs/superpowers/specs/2026-11-04-f14-lot5b-rotations-design.md`,
+dont le § 10 est l'amendement du code livré. Ce qui suit est normatif et
+remplace, là où ils diffèrent, le tableau du §0.9, le §8.5.4 d'avant et le
+minimum d'affichage de §7.6.
+
+**La table de la porte, en vigueur.**
+
+| Action | Console locale | Tunnel (pair admin) | Origine publique |
+| --- | --- | --- | --- |
+| `fleet_leafs` | oui | oui | non |
+| `trust_authorities` | oui | oui | non |
+| révocation d'un client | oui | oui | non |
+| révocation de la gateway, identité gateway | oui | non (lot 6b) | non |
+| chaîne : ouvrir, avancer, abandonner | oui | non | non |
+| délégation d'émetteur **avec campagne** (`IssuerDelegation`) | oui | **oui** | non |
+| `IssuerRequest`, `IssuerInstall`, `pin-ca-tls`, `gateway-identity publish` | oui | non | non |
+| copie du coffre (`VaultCopy`) | **non** | **oui** | non |
+
+**Ce que le tunnel ouvre de plus.** La délégation d'émetteur : la porte génère
+les clés dans le volume d'Astra et renvoie la demande publique dans la réponse,
+ce qui n'autorise rien sans le toucher des clés sur le manifeste. La copie du
+coffre : `POST /api/certificates/operator/vault-copy`, administrateur, sur le
+canal privé. Astra l'écrit sous le verrou du volume, de façon atomique, garde
+la copie précédente (une génération), remplace la valeur en mémoire et
+journalise l'empreinte et l'opérateur ; elle ne lit du coffre que ce qui se lit
+sans clé (une version et le domaine), si bien qu'un administrateur du tunnel
+peut remplacer la sauvegarde sans pouvoir ouvrir le coffre ni signer. La borne
+d'une copie est de 128 Kio, ce que le téléchargement du coffre porte (§8.2) ;
+une copie plus grosse ne pourrait pas être servie. Une lecture sans secret,
+`GET /api/certificates/operator/status`, donne l'empreinte de la copie, l'époque
+du document de credentials, l'époque, l'échéance et les époques CA de la
+délégation. Une transition de CA TLS s'installe par
+`POST /api/certificates/client-tls-ca-transition`, que la gateway vérifie sous
+sa `CA-PQ` comme la commande `install-client-tls-ca`.
+
+**Le coffre en place ne bouge qu'après l'acceptation d'Astra.** Pour les deux
+CA, Orion écrit un journal de rotation à côté du coffre avant d'annoncer quoi
+que ce soit : la transition, le coffre suivant (scellé comme tout coffre), les
+credentials, le relais et le résultat à déposer. Le coffre, les credentials et
+le relais n'y sont appliqués qu'une fois Astra ayant accepté. La reprise est
+automatique à la montée du tunnel **vers la gateway du domaine du journal
+seulement**, sans clé ; derrière l'écran terminé de l'opérateur lui-même, elle
+attend sa fermeture. Un journal Signé n'est effacé que si l'ancre courante de
+l'autorité égale l'ancre sortante de la transition ; un journal `Accepted` sans
+dépôt (CA-PQ ancien, adopté d'`astra-signer`) se lit d'abord auprès d'Astra,
+parce qu'il n'est pas la preuve d'une acceptation. La table de reprise est au
+§ 10.3 de la conception du lot.
+
+**Adoption sans redémarrage.** Astra remplace en place l'émetteur délégué
+quand une délégation est enregistrée, après les mêmes contrôles qu'au
+démarrage (clés contre délégation, politique) ; si l'adoption échoue, l'émetteur
+en place reste servi. Orion ne redémarre pas Astra : celui-ci n'a pas accès à
+Docker (ADR-008) et sortir du processus perdrait les opérations en mémoire.
+
+**Document de credentials à `not_after`.** Lors d'une rotation `CA-PQ`, le
+nouveau document de credentials est signé sous la nouvelle ancre ; Astra le
+tient dans l'objet accepté et l'adopte lui-même à `not_after`, dans la passe qui
+promeut l'ancre, puis le rend durable. Pendant le recouvrement, **Astra garde
+l'ancien document** : toute approbation faite sous le document local (liaison
+du credential : `ca_epoch`, époque du registre, signature `CA-PQ`) est refusée
+par Astra après le toucher. Orion désactive donc, avec la raison affichée,
+« Renouveler les postes », tout lancement d'approbation, la récupération et la
+délégation tant que `next_ca_fingerprint` est renseigné. Une copie du coffre
+portant un document de credentials est refusée pendant une rotation en cours.
+
+**Refus de la copie du coffre.** Les refus indistincts du §8.5.4 valent, avec
+**une exception, deux décisions** : une copie différente de celle d'Astra tant qu'une
+opération en attente de l'opérateur nomme un coffre, et un document de
+credentials joint pendant une rotation en cours, reçoivent `409`. Rien n'est
+écrit et le même envoi passera une fois l'obstacle levé ; la route ne répond
+qu'à un administrateur, qui lit déjà ces opérations dans `pending`. Une copie
+identique passe.
+
+**Limites connues.** De `Applied` à `not_after`, la révocation d'urgence est
+impossible (la clé sortante a quitté le coffre, Astra vérifie sous elle) ; de
+`not_after` à la re-délégation, l'émission en ligne d'Astra est refusée ;
+un délai d'installation dépassé n'a pas de réparation ; une copie du coffre
+peut être remplacée par un administrateur du tunnel. Détail et suivis : § 10.8
+de la conception du lot, `ROADMAP.md` (F14-a à F14-f).
 
 ## 1. Périmètre
 
@@ -1803,12 +1894,18 @@ n'en ouvre aucune.
 
 Astra signe ensuite `AstraSignerRequest` de §2.4. Pour un profil actif, la
 requête et le résultat suivent le relais de §8.1.2 ; Orion n'ouvre plus de
-compagnon pour l'approuver : sa cérémonie tourne dans l'IHM non élevée (§12.2).
-Une récupération ou une console opérateur hors tunnel emploie `authority_url`.
-`astra-signer` (le compagnon des cérémonies qui n'ont pas encore migré) récupère lui-même la requête
+compagnon pour l'approuver : sa cérémonie tourne dans l'IHM non élevée (§12.2),
+y compris pour les rotations de CA depuis le lot 5b (§0.10). Une récupération
+ou une console opérateur hors tunnel emploie `authority_url`.
+`astra-signer` (l'outil en ligne de commande, recours des cérémonies et
+transitoire jusqu'au lot 7 de F14) récupère lui-même la requête
 et le manifeste, vérifie leurs signatures et affiche au minimum le scope, le
 nombre de cibles, les empreintes actives, les générations et les autorités
-touchées. Pour une simple opération déléguée, il renvoie l'assertion FIDO liée
+touchées. **Le minimum d'affichage vaut pour toute cérémonie, Orion compris** :
+la ligne de la gateway et la politique n'ont pas de ligne propre dans le
+manifeste d'une campagne de CA (la gateway figure dans l'identité de chaque
+cible) ; l'empreinte d'une ancre **entrante** n'existe pas avant la signature
+et se montre juste après (§0.10, conception du lot § 10.2). Pour une simple opération déléguée, il renvoie l'assertion FIDO liée
 au manifeste. Quand `CA-PQ` ou `CA-TLS` doit signer, il télécharge aussi le
 coffre chiffré, l'ouvre avec le ou les key-slots exigés, produit localement les
 signatures puis zéroïse les clés. Il ne renvoie jamais le secret PRF, une clé
@@ -2485,6 +2582,16 @@ inconnu ou déjà révoqué — reçoit le même refus indistinct. La phrase com
 la porte va au journal structuré d'Astra ; seule la console locale, qui n'est
 pas une surface réseau, la reçoit en réponse.
 
+**Exception, amendement du 7 novembre 2026 (§0.10).** La route d'écriture de la
+copie du coffre (`POST /api/certificates/operator/vault-copy`) répond `409` et
+non le refus indistinct pour deux décisions que le prochain essai passera :
+une copie différente alors qu'une opération en attente de l'opérateur nomme un
+coffre (`AlreadyOpen`), et un document de credentials joint pendant une
+rotation en cours (`CredentialsDuringRotation`). Ces deux seules décisions se
+distinguent, parce que cette route ne répond qu'à un pair administrateur, qui
+lit déjà ces opérations dans `pending` ; tout autre refus de cette route reste
+indistinct (`403`), et un corps trop gros reste `413`.
+
 #### 8.5.5 Choix du transport, sans repli
 
 `astra-signer` porte trois transports pour une campagne, et le choix est
@@ -2523,13 +2630,15 @@ La récupération d'une identité expirée (§7.5) reste sur l'origine publique 
 construction : ce qui a expiré est précisément le tunnel.
 
 Depuis l'amendement du 2 novembre 2026 (§0.9), le tunnel couvre aussi
-l'**ouverture**, pour les trois actions que la table de la porte lui accorde :
-`fleet_leafs`, `trust_authorities` et la révocation d'un client. Les autres
-ouvertures — révocation et identité de la gateway (lot 6b de F14), chaîne,
-délégation d'émetteur — et les trois écritures de la console restent réservées
-à la console locale : les élargir est un changement de cette table. Les écrans
-d'Orion qui emploieront la route viennent avec les lots 5b et 5c ; jusque-là,
-elle s'appelle directement depuis un poste administrateur du tunnel.
+l'**ouverture**, pour les trois actions que la table de la porte lui accordait :
+`fleet_leafs`, `trust_authorities` et la révocation d'un client. Depuis
+l'amendement du 7 novembre 2026 (§0.10) il couvre en plus la délégation
+d'émetteur avec campagne et l'écriture de la copie du coffre. Les autres
+ouvertures — révocation et identité de la gateway (lot 6b de F14), chaîne — et
+les écritures `pin-ca-tls`, `issuer install` et `gateway-identity publish`
+restent réservées à la console locale : les élargir est un changement de cette
+table. Les écrans d'Orion qui emploient la route sont ceux du lot 5b
+(rotations) ; ceux de la révocation d'un poste viennent avec le lot 5c.
 
 ## 9. Rotation de `CA-PQ`
 

@@ -356,6 +356,65 @@ impl DelegatedIssuer {
     }
 }
 
+/// Builds the delegated issuer, when the domain has one **and** its private
+/// material is on disk.
+///
+/// The three parts are independent on purpose: the authorization is public and
+/// travels in the registry, while the two private keys are generated and
+/// sealed locally. A registry that names a delegation whose keys are missing is
+/// an incomplete install, and it is reported as such — an issuer silently
+/// forced to `None` would refuse every ordinary renewal with no explanation,
+/// at 80 % of a leaf's life.
+pub fn load_from_registry(
+    state_dir: &std::path::Path,
+    registry: &crate::registry::AstraRegistry,
+) -> anyhow::Result<Option<DelegatedIssuer>> {
+    use anyhow::Context as _;
+    let Some(installed) = registry.state().issuer.as_ref() else {
+        tracing::warn!(
+            "no delegated issuer in the registry: ordinary renewals stay refused until \
+             `AstraIssuerAuthorization` is signed by the operator companion"
+        );
+        return Ok(None);
+    };
+    let pq_key = self::pq_key_path(state_dir, installed.issuer_epoch);
+    let tls_key = self::tls_key_path(state_dir, installed.issuer_epoch);
+    if !pq_key.exists() || !tls_key.exists() {
+        tracing::error!(
+            issuer_epoch = installed.issuer_epoch,
+            pq_key = %pq_key.display(),
+            tls_key = %tls_key.display(),
+            "the registry names a delegated issuer but its private material is missing: \
+             ordinary renewals will be refused"
+        );
+        return Ok(None);
+    }
+    let pq_private_key =
+        Zeroizing::new(std::fs::read(&pq_key).context("reading the delegated issuer PQ key")?);
+    let tls_private_key =
+        Zeroizing::new(std::fs::read(&tls_key).context("reading the delegated issuer TLS key")?);
+    registry
+        .state()
+        .astra_policy_fingerprint
+        .assert_authorizes(&installed.authorization)
+        .context("the delegated issuer does not match the pinned Astra policy")?;
+    // Present is not the same as correct: the keys and the delegation come
+    // from two different places, and a mismatch would only show up at the
+    // first renewal.
+    let issuer = DelegatedIssuer::load(
+        installed.authorization.clone(),
+        pq_private_key,
+        tls_private_key,
+    )
+    .context("checking the delegated issuer's private material against the registry")?;
+    tracing::info!(
+        issuer_epoch = installed.issuer_epoch,
+        not_after = installed.authorization.not_after,
+        "delegated issuer loaded"
+    );
+    Ok(Some(issuer))
+}
+
 #[cfg(test)]
 mod tests;
 

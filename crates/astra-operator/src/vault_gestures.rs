@@ -75,6 +75,21 @@ pub enum SetupRefusal {
         "le domaine a changé depuis l'affichage de ce qui allait être signé : recommencer le geste"
     )]
     PlanChanged,
+    #[error(
+        "une rotation porte un coffre qui remplacera celui-ci : la mener à son terme avant de \
+         changer les clés ou leurs noms"
+    )]
+    RotationInFlight,
+}
+
+/// Refuses a change of key slots or labels while a sealed vault waits to overwrite
+/// this one, see [`crate::rotation_journal::ensure_vault_not_awaiting_overwrite`].
+///
+/// Asked before any key, and again by each gesture that writes, since the file may
+/// have appeared during the touches.
+pub fn ensure_no_rotation_in_flight(vault_path: &Path) -> std::result::Result<(), SetupRefusal> {
+    crate::rotation_journal::ensure_vault_not_awaiting_overwrite(vault_path)
+        .map_err(|_| SetupRefusal::RotationInFlight)
 }
 
 // --- Keys -------------------------------------------------------------------
@@ -157,6 +172,7 @@ pub fn add_key_with(
     pin: &str,
     now_unix: u64,
 ) -> Result<AddedKey> {
+    ensure_no_rotation_in_flight(vault_path)?;
     let mut vault = store::load(vault_path)?;
     check_addition(&vault)?;
     let document = pending_document(vault_path, &vault)?;
@@ -235,6 +251,7 @@ pub fn remove_key_with(
     slot_id: &[u8; 16],
     now_unix: u64,
 ) -> Result<()> {
+    ensure_no_rotation_in_flight(vault_path)?;
     let mut vault = store::load(vault_path)?;
     let removed = check_removal(&vault, slot_id)?.credential_id()?;
     if removed == opening.credential_id {
@@ -292,6 +309,7 @@ pub fn mark_key_with(
     lost: bool,
     now_unix: u64,
 ) -> Result<u64> {
+    ensure_no_rotation_in_flight(vault_path)?;
     let vault = store::load(vault_path)?;
     let credential_id = check_marking(vault_path, &vault, slot_id)?.credential_id()?;
     let state = if lost {
@@ -309,6 +327,7 @@ pub fn mark_key_with(
 /// Renames a key. No key is asked anything: the label is outside the slot
 /// digest, so the vault is not re-sealed.
 pub fn rename_key(vault_path: &Path, slot_id: &[u8; 16], label: &str) -> Result<()> {
+    ensure_no_rotation_in_flight(vault_path)?;
     let mut vault = store::load(vault_path)?;
     vault.slot(slot_id).map_err(|_| SetupRefusal::UnknownSlot)?;
     vault.rename_slot(slot_id, label)?;

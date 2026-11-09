@@ -232,6 +232,15 @@ pub struct AstraState {
     /// the whole domain to add a list that starts empty.
     #[serde(default)]
     pub transitions: Vec<StoredTransition>,
+    /// The credential document re-signed under the `CA-PQ` that was just
+    /// promoted, until the file and the memory of the daemon carry it.
+    ///
+    /// Written in the same atomic registry write as the promotion, so a crash
+    /// between the promotion and the file leaves the document here rather than
+    /// a file signed under an anchor nobody pins any more. Cleared by
+    /// [`AstraRegistry::take_promoted_credentials`] once adopted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promoted_credentials: Option<Box<aether::certificates::approval::CredentialRegistry>>,
     pub peers: BTreeMap<String, PeerRecord>,
     /// Monotonic status counter per certificate fingerprint (spec §4.2).
     pub status_epochs: BTreeMap<String, u64>,
@@ -293,6 +302,14 @@ pub enum RegistryError {
 pub struct AstraRegistry {
     path: PathBuf,
     state: AstraState,
+}
+
+impl RegistryError {
+    /// The registry could not be written, which nothing a caller sent is at fault
+    /// for. The only two ways [`AstraRegistry::save`] fails.
+    pub(crate) fn is_write_failure(&self) -> bool {
+        matches!(self, Self::Io(_) | Self::Corrupt(_))
+    }
 }
 
 impl AstraRegistry {

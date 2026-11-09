@@ -1,6 +1,7 @@
-//! Rotating the `CA-PQ` anchor.
+//! Rotating the `CA-PQ` anchor, and comparing a campaign to the anchors in service.
 
 use super::*;
+use aether::certificates::transport::TrustUpdateObject;
 
 /// What an anchor rotation produced.
 pub struct RotatedAnchor {
@@ -131,4 +132,57 @@ pub fn rotate_ca_pq(
         next_ca_public_key: next_public_key,
         bindings,
     })
+}
+
+/// The object a campaign target is compared against, before anything signs.
+///
+/// A placeholder transition carrying the outgoing epoch and fingerprint: what
+/// [`AstraRotationCampaign::covers_authority_object`] reads is exactly those two
+/// values, so comparing here costs no signature and answers the only question that
+/// matters before a key is touched: does the authority name the anchor this vault
+/// holds.
+pub fn anchor_probe(
+    identity: &DomainIdentity,
+    current: &MlDsa87PublicKey,
+    window: TransitionWindow,
+) -> Result<TrustUpdateObject> {
+    Ok(TrustUpdateObject::CaTransition(Box::new(CaTransition {
+        format_version: CERTIFICATE_FORMAT_VERSION,
+        trust_domain_id: identity.trust_domain_id,
+        current_ca_epoch: identity.ca_epoch,
+        next_ca_epoch: identity
+            .ca_epoch
+            .checked_add(1)
+            .ok_or(CertificateError::ArithmeticOverflow)?,
+        current_ca_fingerprint: current.authority_fingerprint(),
+        next_ca_public_key: current.clone(),
+        next_ca_fingerprint: current.authority_fingerprint(),
+        window,
+        current_ca_signature: MlDsa87Signature::placeholder(),
+        next_ca_signature: MlDsa87Signature::placeholder(),
+    })))
+}
+
+/// [`anchor_probe`], for the client TLS anchor in service.
+pub fn client_tls_probe(
+    identity: &DomainIdentity,
+    active: &DerCertificate,
+    window: TransitionWindow,
+) -> Result<TrustUpdateObject> {
+    Ok(TrustUpdateObject::ClientTlsCaTransition(Box::new(
+        ClientTlsCaTransition {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            trust_domain_id: identity.trust_domain_id,
+            ca_epoch: identity.ca_epoch,
+            current_ca_tls_epoch: identity.ca_tls_epoch,
+            next_ca_tls_epoch: identity
+                .ca_tls_epoch
+                .checked_add(1)
+                .ok_or(CertificateError::ArithmeticOverflow)?,
+            active_client_tls_ca_fingerprint: active.fingerprint(),
+            next_client_tls_ca_certificate: active.clone(),
+            window,
+            ca_pq_signature: MlDsa87Signature::placeholder(),
+        },
+    )))
 }

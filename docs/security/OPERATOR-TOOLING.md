@@ -462,17 +462,23 @@ Tout le parcours est **à valider en recette sous Windows** (MANUAL-TESTING,
   l'a pas ouverte depuis *Certificats*) ; le poste expiré reprend de son côté.
 * **Délégation de l'émetteur d'Astra.** Astra › Approbations. En campagne
   (`issuer_delegation`) : fichier de demande de `astra issuer request`, une seule
-  clé, dépôt sur l'origine, puis redémarrage d'Astra. Hors campagne, dernier
+  clé, dépôt sur l'origine ; depuis le lot 5b Astra en marche adopte la délégation
+  sans redémarrage (amendement du 8 novembre 2026). Hors campagne, dernier
   recours : seulement si le relais ne nomme aucune origine Astra ; avertissement
   « Rien ne rattache ce fichier à Astra… », aucun dépôt, `issuer-authorization.json`
   à installer sur l'hôte d'Astra par `astra issuer install`. Une CA-TLS expirée,
   trop proche de l'expiration ou qui n'est pas une autorité est refusée avant la
   clé.
-* **Hors périmètre.** La rotation CA-TLS reste sur `astra-signer` jusqu'au
-  lot 5. `approve-campaign` hors ligne n'est pas porté : aucun composant du dépôt
-  ne lit un fichier `CampaignApproval`. Les campagnes d'ancre, de révocation,
-  d'identité de gateway et d'amorçage restent « pas encore disponibles » dans
-  *Approbations* (lots 5 et 6b). `astra-signer` disparaît au lot 7.
+* **Rotations (amendement du 8 novembre 2026, F14 lot 5b).** Les rotations de
+  CA-PQ et de CA TLS, « Terminer », la reprise, le renouvellement de la
+  délégation et l'envoi de la copie du coffre se jouent dans Orion (onglet
+  *Astra* › *Rotations*), sans commande ni fichier ; les commandes
+  d'`astra-signer` restent le recours jusqu'au lot 7. Voir
+  `RENOUVELLEMENT-CERTIFICATS.md`.
+* **Hors périmètre.** `approve-campaign` hors ligne n'est pas porté : aucun composant du dépôt
+  ne lit un fichier `CampaignApproval`. Les campagnes de révocation, d'identité de
+  gateway et d'amorçage restent « pas encore disponibles » dans *Approbations*
+  (lots 5c et 6b) ; celles d'ancre se lancent depuis *Rotations*. `astra-signer` disparaît au lot 7.
 
 ## Ce que cet outillage ne fait pas
 
