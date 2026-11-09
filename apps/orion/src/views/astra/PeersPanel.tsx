@@ -19,7 +19,7 @@ import { MotifChoice } from './RotationSteps'
 import { PrerequisiteLine } from './RotationsPanel'
 import { STATE, peerRows } from './peerRows'
 import type { PeerRow } from './peerRows'
-import { formatDate, overlapReason, prerequisites, reachLabel } from './rotationRows'
+import { formatDate, prerequisites, reachLabel } from './rotationRows'
 import type { Prerequisite } from './rotationRows'
 
 const MOTIFS: { value: RevocationReasonChoice; label: string }[] = [
@@ -73,8 +73,10 @@ function cutLines(peers: PeersOverview, rotations: RotationsOverview | null): Pr
 }
 
 /**
- * What signing needs: Astra, the vault, a concordant domain, and no CA-PQ overlap running. A
- * red line here leaves the row « Coupé, révocation à signer » rather than stopping the cut.
+ * What signing needs: Astra, the vault and a concordant domain. A CA-PQ overlap is not among them:
+ * the signature is made under the kept outgoing key (spec §5.4), and the gateway refuses it with
+ * NotBefore only in the window or with no kept key. A red line here leaves the row « Coupé,
+ * révocation à signer » rather than stopping the cut.
  */
 function signLines(rotations: RotationsOverview | null): Prerequisite[] {
   if (!rotations) {
@@ -89,12 +91,10 @@ function signLines(rotations: RotationsOverview | null): Prerequisite[] {
     ]
   }
   const base = prerequisites(rotations, 'renew_fleet')
-  const overlap = overlapReason(rotations.caPqOverlap)
   return [
     ...named(base, 'Service Astra'),
     ...named(base, 'Coffre présent'),
     ...named(base, 'Domaine concordant'),
-    { label: 'Signature possible', ok: overlap === null, fix: null, fixAction: null, detail: overlap },
   ]
 }
 

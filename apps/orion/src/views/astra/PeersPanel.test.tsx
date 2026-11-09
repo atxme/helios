@@ -161,6 +161,29 @@ describe('the revocation path', () => {
     })
   })
 
+  it('signing_stays_possible_during_a_ca_pq_overlap', async () => {
+    api.beginRevocationCeremony.mockResolvedValue(status())
+    const { onCeremony } = await show(
+      peers({
+        certificates: { state: 'ok', value: [peer({ name: 'PC_BUREAU', wg_public_key: KEY_B })] },
+        admitted: { state: 'ok', value: [] },
+        astra_revoked: { state: 'ok', value: [] },
+      }),
+      rotationsOverview({ caPqOverlap: true }),
+    )
+    fireEvent.click(within(region('PC_BUREAU')).getByRole('button', { name: 'Reprendre' }))
+    expect(prerequisites().queryByText('Signature possible')).toBeNull()
+    expect(prerequisites().queryByText(/Recouvrement/)).toBeNull()
+    fireEvent.click(motif().getByRole('button', { name: 'Remplacé' }))
+    fireEvent.click(within(region('Confirmation')).getByRole('button', { name: 'Reprendre' }))
+    await waitFor(() => expect(onCeremony).toHaveBeenCalled())
+    expect(api.beginRevocationCeremony).toHaveBeenCalledWith({
+      gesture: 'resume',
+      peer: KEY_B,
+      reason: 'replaced',
+    })
+  })
+
   it('a_red_cut_prerequisite_offers_no_motif', async () => {
     await show(undefined, rotationsOverview({ tunnel: false }))
     fireEvent.click(within(region('PORTABLE')).getByRole('button', { name: 'Révoquer' }))
