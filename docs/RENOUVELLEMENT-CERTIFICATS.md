@@ -1074,11 +1074,11 @@ dans [ROADMAP.md](ROADMAP.md) (F14-a à F14-f).
   pendant le recouvrement. « Remplacer la CA-PQ » affiche, à ses prérequis, les
   postes qui expirent pendant le changement : c'est un avertissement, non un
   blocage.
-- **L'onglet *Postes* ne lève pas encore le blocage d'affichage.** Pendant un
-  recouvrement CA-PQ, sa ligne « Signature possible » reste rouge (« Recouvrement
-  CA-PQ en cours ») et « Reprendre » est désactivé. « Révoquer » reste offert : la
-  coupure, puis la signature sous la clé sortante, suivent la même cérémonie.
-  Une reprise de signature attend donc la fin du recouvrement.
+- **Révocation pendant un recouvrement CA-PQ.** La signature se fait sous la clé
+  sortante gardée, y compris pendant le recouvrement, « Reprendre » compris. Elle
+  est refusée dans la dernière heure avant `not_after`, et pour une rotation qui
+  n'a pas gardé sa clé ; dans les deux cas, la coupure reste faite et le refus
+  dit « Révocation possible après le … ».
 - **Une clé marquée perdue pendant un recouvrement CA-PQ reste admise par Astra
   jusqu'après `not_after`.** Orion n'y joint pas le document de credentials, et
   Astra adopte à `not_after` celui de la rotation, signé avant le marquage.

@@ -1244,10 +1244,8 @@ attendu.
     affiche « Coupé, révocation à signer ». **[cible]** (Tailscale, gateway cible).
 74. **Révocation pendant un recouvrement CA-PQ.** Pendant le recouvrement de l'étape
     44 de « G », révoquer PORTABLE. Attendu : la coupure se fait, puis la signature
-    sous la clé sortante ; Astra accepte, et la ligne passe « Révoqué ». L'écran
-    affiche « Signature possible » en rouge (« Recouvrement CA-PQ en cours ») et
-    « Reprendre » reste désactivé jusqu'à la fin du recouvrement : c'est la limite
-    connue. **[cible]** (clés réelles).
+    sous la clé sortante ; Astra accepte, et la ligne passe « Révoqué ». « Reprendre »
+    reste disponible pendant le recouvrement. **[cible]** (clés réelles).
 75. **Recours refusé pendant un recouvrement.** Sur le poste de l'opérateur,
     `astra-signer revoke …` pendant le même recouvrement. Attendu : « Changement de
     CA-PQ en cours : révoquer ce poste depuis Orion. Rien n'a été signé. ». **[cible]**
