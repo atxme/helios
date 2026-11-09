@@ -442,4 +442,232 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&directory);
     }
+
+    fn transit_utf16(text: &str, little_endian: bool) -> Vec<u8> {
+        let mut bytes = if little_endian {
+            vec![0xFF, 0xFE]
+        } else {
+            vec![0xFE, 0xFF]
+        };
+        for unit in text.encode_utf16() {
+            let encoded = if little_endian {
+                unit.to_le_bytes()
+            } else {
+                unit.to_be_bytes()
+            };
+            bytes.extend_from_slice(&encoded);
+        }
+        bytes
+    }
+
+    #[test]
+    fn read_request_accepts_transit_utf16_and_preserves_the_request() {
+        use aether::key_negotiation::encode_request_file;
+
+        let expected = request();
+        let text = encode_request_file(&expected);
+        let directory = tempfile::tempdir().expect("temporary request directory");
+
+        for (name, little_endian) in [("request-le", true), ("request-be", false)] {
+            let path = directory.path().join(name);
+            std::fs::write(&path, transit_utf16(&text, little_endian))
+                .expect("write UTF-16 request");
+
+            let actual = read_request(&path).expect("read UTF-16 request");
+            assert_eq!(actual.fingerprint(), expected.fingerprint(), "{name}");
+            assert_eq!(actual.request_id, expected.request_id, "{name}");
+        }
+    }
+
+    #[test]
+    fn read_request_names_a_missing_file() {
+        let directory = tempfile::tempdir().expect("temporary request directory");
+        let path = directory.path().join("absent.helios-request");
+
+        let error = read_request(&path).expect_err("missing request must fail");
+        let message = format!("{error:#}");
+        assert!(message.contains("reading"), "{message}");
+        assert!(message.contains(&path.display().to_string()), "{message}");
+    }
+
+    #[test]
+    fn read_request_rejects_invalid_utf8_and_truncated_utf16_with_path_context() {
+        let directory = tempfile::tempdir().expect("temporary request directory");
+        for (name, bytes) in [
+            ("invalid-utf8", vec![0xC3]),
+            ("truncated-utf16", vec![0xFF, 0xFE, 0x41]),
+        ] {
+            let path = directory.path().join(name);
+            std::fs::write(&path, bytes).expect("write malformed request");
+
+            let error = read_request(&path).expect_err("malformed text must fail");
+            let message = format!("{error:#}");
+            assert!(message.contains("not readable text"), "{message}");
+            assert!(message.contains(&path.display().to_string()), "{message}");
+        }
+    }
+
+    #[test]
+    fn read_request_rejects_json_that_is_not_a_request_envelope() {
+        let directory = tempfile::tempdir().expect("temporary request directory");
+        let path = directory.path().join("wrong-format.helios-request");
+        std::fs::write(&path, br#"{"format":"not-a-helios-request","request":{}}"#)
+            .expect("write wrong envelope");
+
+        let error = read_request(&path).expect_err("wrong request envelope must fail");
+        let message = format!("{error:#}");
+        assert!(message.contains("not an enrollment request"), "{message}");
+        assert!(message.contains(&path.display().to_string()), "{message}");
+    }
+
+    #[test]
+    fn read_file_names_the_missing_path() {
+        let directory = tempfile::tempdir().expect("temporary input directory");
+        let path = directory.path().join("absent.bin");
+
+        let error = read_file(&path).expect_err("missing file must fail");
+        let message = format!("{error:#}");
+        assert!(message.contains("reading"), "{message}");
+        assert!(message.contains(&path.display().to_string()), "{message}");
+    }
+
+    #[test]
+    fn offline_material_names_missing_gateway_certificate_files() {
+        let directory = tempfile::tempdir().expect("temporary certificate directory");
+        let der_path = directory.path().join("gateway.der");
+        let pq_path = directory.path().join("gateway-pq.json");
+        let inputs = |gateway_certificate: &std::path::Path,
+                      gateway_pq_certificate: &std::path::Path| {
+            OfflineInputs {
+                gateway_certificate: gateway_certificate.to_path_buf(),
+                gateway_pq_certificate: gateway_pq_certificate.to_path_buf(),
+                address: "100.64.1.2/32".into(),
+                address_v6: None,
+                heliosd_url: None,
+                trust_material: None,
+            }
+        };
+
+        let der_error = offline_material(&inputs(&der_path, &pq_path))
+            .err()
+            .expect("missing DER file must fail first");
+        let der_message = format!("{der_error:#}");
+        assert!(
+            der_message.contains("reading the gateway certificate"),
+            "{der_message}"
+        );
+        assert!(
+            der_message.contains(&der_path.display().to_string()),
+            "{der_message}"
+        );
+
+        std::fs::write(&der_path, [0x30, 0x01]).expect("write DER fixture");
+        let pq_error = offline_material(&inputs(&der_path, &pq_path))
+            .err()
+            .expect("missing PQ certificate file must fail");
+        let pq_message = format!("{pq_error:#}");
+        assert!(
+            pq_message.contains("reading the gateway PQ certificate"),
+            "{pq_message}"
+        );
+        assert!(
+            pq_message.contains(&pq_path.display().to_string()),
+            "{pq_message}"
+        );
+    }
+
+    #[test]
+    fn offline_material_rejects_a_pq_certificate_that_cannot_be_fingerprinted() {
+        use aether::key_negotiation::{PqCertificate, PqCertificateRole, PQ_CERTIFICATE_VERSION};
+        use base64::Engine as _;
+
+        let directory = tempfile::tempdir().expect("temporary certificate directory");
+        let der_path = directory.path().join("gateway.der");
+        let pq_path = directory.path().join("gateway-pq.json");
+        std::fs::write(&der_path, [0x30, 0x01]).expect("write DER fixture");
+
+        let certificate = PqCertificate {
+            version: PQ_CERTIFICATE_VERSION,
+            serial: [5; aether::key_negotiation::KEY_NEGOTIATION_NONCE_LEN],
+            subject: "vpn.example.test".into(),
+            issuer: "test CA".into(),
+            role: PqCertificateRole::Gateway,
+            wireguard_public_key: "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=".into(),
+            ml_dsa_87_public_key: base64::engine::general_purpose::STANDARD
+                .encode(vec![4; aether::key_negotiation::ML_DSA_87_PUBLIC_KEY_LEN]),
+            not_before_unix: 1,
+            not_after_unix: 2,
+            // Fingerprinting requires a canonical base64 signature of the protocol length.
+            ml_dsa_87_signature: "not-base64".into(),
+        };
+        std::fs::write(
+            &pq_path,
+            serde_json::to_vec(&certificate).expect("certificate JSON"),
+        )
+        .expect("write malformed signature fixture");
+        let inputs = OfflineInputs {
+            gateway_certificate: der_path,
+            gateway_pq_certificate: pq_path,
+            address: "100.64.1.2/32".into(),
+            address_v6: None,
+            heliosd_url: None,
+            trust_material: None,
+        };
+
+        let error = offline_material(&inputs)
+            .err()
+            .expect("invalid fingerprint input must fail");
+        let message = format!("{error:#}");
+        assert!(message.contains("PQ certificate is invalid"), "{message}");
+        assert!(!message.contains("not-base64"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn invalid_client_certificate_is_rejected_before_contacting_the_gateway() {
+        let directory = tempfile::tempdir().expect("temporary enrollment directory");
+        let request_path = directory.path().join("request.helios-request");
+        let tls = directory.path().join("client.der");
+        let pq = directory.path().join("client-pq.json");
+        let output = directory.path().join("draft.orion");
+        std::fs::write(
+            &request_path,
+            aether::key_negotiation::encode_request_file(&request()),
+        )
+        .expect("request");
+        std::fs::write(&tls, []).expect("empty TLS certificate");
+        std::fs::write(&pq, b"not JSON").expect("bad PQ certificate");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("gateway listener");
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let options = || DocumentOptions {
+            request: request_path.clone(),
+            tls_certificate: tls.clone(),
+            pq_certificate: pq.clone(),
+            endpoint: "vpn.example:51820".into(),
+            negotiation_endpoint: None,
+            allowed_ips: None,
+            ssh_target: None,
+            output: output.clone(),
+            offline: None,
+        };
+        let client = reqwest::Client::new();
+        let error = document(&client, &base, options())
+            .await
+            .expect_err("empty TLS certificate");
+        assert!(format!("{error:#}").contains("not a DER certificate"));
+        assert!(!output.exists());
+        std::fs::write(&tls, [0x30, 0x01]).expect("bounded TLS fixture");
+        let error = document(&client, &base, options())
+            .await
+            .expect_err("malformed PQ certificate");
+        assert!(format!("{error:#}").contains("not a PQ certificate"));
+        assert!(!output.exists());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "invalid local inputs must not contact the gateway"
+        );
+    }
 }

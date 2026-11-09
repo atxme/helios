@@ -731,6 +731,298 @@ pub async fn run(client: &Client, base: &str, opts: Options) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aether::enroll::ProvisionRequest;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+    };
+
+    #[derive(Default)]
+    struct LoopbackFaults {
+        wrong_admission_status: bool,
+        leak_private_key: bool,
+        accept_plain_text_mutation: bool,
+        unstable_vip: bool,
+    }
+
+    struct ObservedRequest {
+        method: String,
+        target: String,
+        content_type: Option<String>,
+        body: Vec<u8>,
+    }
+
+    async fn read_request(stream: &mut TcpStream) -> ObservedRequest {
+        let mut bytes = Vec::new();
+        let header_end = loop {
+            if let Some(index) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                break index + 4;
+            }
+            let mut chunk = [0; 2048];
+            let read = stream.read(&mut chunk).await.expect("read HTTP request");
+            assert_ne!(read, 0, "request has complete headers");
+            bytes.extend_from_slice(&chunk[..read]);
+        };
+        let headers = String::from_utf8(bytes[..header_end].to_vec()).expect("HTTP headers");
+        let mut request_line = headers
+            .lines()
+            .next()
+            .expect("request line")
+            .split_whitespace();
+        let method = request_line.next().expect("HTTP method").to_owned();
+        let target = request_line.next().expect("request target").to_owned();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().expect("content length"))
+            })
+            .unwrap_or_default();
+        let body_end = header_end + content_length;
+        while bytes.len() < body_end {
+            let mut chunk = [0; 2048];
+            let read = stream.read(&mut chunk).await.expect("read HTTP body");
+            assert_ne!(read, 0, "request body is complete");
+            bytes.extend_from_slice(&chunk[..read]);
+        }
+        let content_type = headers.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-type")
+                .then(|| value.trim().to_owned())
+        });
+        ObservedRequest {
+            method,
+            target,
+            content_type,
+            body: bytes[header_end..body_end].to_vec(),
+        }
+    }
+
+    async fn respond_json<T: serde::Serialize>(
+        stream: &mut TcpStream,
+        status: u16,
+        reason: &str,
+        value: &T,
+    ) {
+        let body = serde_json::to_vec(value).expect("response JSON");
+        let mut response = format!(
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(&body);
+        stream
+            .write_all(&response)
+            .await
+            .expect("write HTTP response");
+    }
+
+    async fn loopback_gateway(
+        admitted_key: String,
+        gateway_key: String,
+        faults: LoopbackFaults,
+    ) -> (String, tokio::task::JoinHandle<Vec<ObservedRequest>>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback listener");
+        let base = format!(
+            "http://{}",
+            listener.local_addr().expect("listener address")
+        );
+        let server = tokio::spawn(async move {
+            let mut observed = Vec::new();
+            let mut accepted_sessions = 0u8;
+            // A protocol-only run performs five admitted provisions, then one
+            // unknown-peer provision, one safe API read, and one bad-content
+            // type mutation.
+            for _ in 0..8 {
+                let (mut stream, _) =
+                    tokio::time::timeout(std::time::Duration::from_secs(10), listener.accept())
+                        .await
+                        .expect("campaign request arrived before timeout")
+                        .expect("client connection");
+                let request = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    read_request(&mut stream),
+                )
+                .await
+                .expect("HTTP request completed before timeout");
+                match (request.method.as_str(), request.target.as_str()) {
+                    ("POST", "/api/provision") => {
+                        let provision: ProvisionRequest =
+                            serde_json::from_slice(&request.body).expect("provision JSON");
+                        provision.validate().expect("well-formed provision request");
+                        assert!(
+                            secret_field(&serde_json::from_slice(&request.body).expect("JSON"))
+                                .is_none(),
+                            "provision request contains no private secret field"
+                        );
+                        if provision.client_wg_public_key != admitted_key {
+                            let status = if faults.wrong_admission_status {
+                                401
+                            } else {
+                                403
+                            };
+                            let reason = if status == 403 {
+                                "Forbidden"
+                            } else {
+                                "Unauthorized"
+                            };
+                            respond_json(&mut stream, status, reason, &serde_json::json!({})).await;
+                        } else {
+                            let mut response =
+                                response_for(&provision.kem_public_key, &gateway_key);
+                            response.gateway_nonce = [accepted_sessions.wrapping_add(1); 16];
+                            if faults.unstable_vip && accepted_sessions == 4 {
+                                response.assigned_address = "100.64.1.3/32".into();
+                            }
+                            accepted_sessions += 1;
+                            respond_json(&mut stream, 200, "OK", &response).await;
+                        }
+                    }
+                    ("GET", "/api/network") => {
+                        let value = if faults.leak_private_key {
+                            serde_json::json!({"peers": [{"private_key": "fixture-only"}]})
+                        } else {
+                            serde_json::json!({
+                                "wg_private_key_configured": true,
+                                "peers": [{"preshared_key_configured": true}]
+                            })
+                        };
+                        respond_json(&mut stream, 200, "OK", &value).await;
+                    }
+                    ("POST", "/api/tunnel/start") => {
+                        assert_eq!(request.content_type.as_deref(), Some("text/plain"));
+                        assert_eq!(request.body, b"connect");
+                        let (status, reason) = if faults.accept_plain_text_mutation {
+                            (200, "OK")
+                        } else {
+                            (415, "Unsupported Media Type")
+                        };
+                        respond_json(&mut stream, status, reason, &serde_json::json!({})).await;
+                    }
+                    route => panic!("unexpected campaign request: {route:?}"),
+                }
+                observed.push(request);
+            }
+            observed
+        });
+        (base, server)
+    }
+
+    fn protocol_options(client_key: String, gateway_key: String) -> Options {
+        Options {
+            client_key: Some(client_key),
+            gateway_key: Some(gateway_key),
+            wg_iface: None,
+            only: Some(Category::Protocole),
+            repeat: 1,
+            profile: None,
+            soak: false,
+        }
+    }
+
+    fn assert_protocol_requests(requests: &[ObservedRequest], admitted_key: &str) {
+        assert_eq!(requests.len(), 8);
+        for request in &requests[..5] {
+            assert_eq!(request.method, "POST");
+            assert_eq!(request.target, "/api/provision");
+            let provision: ProvisionRequest =
+                serde_json::from_slice(&request.body).expect("provision JSON");
+            assert_eq!(provision.client_wg_public_key, admitted_key);
+            assert_eq!(provision.protocol_version, PROTOCOL_VERSION);
+            assert!(secret_field(&serde_json::from_slice(&request.body).expect("JSON")).is_none());
+        }
+        let unknown: ProvisionRequest =
+            serde_json::from_slice(&requests[5].body).expect("unknown-peer provision JSON");
+        assert_eq!(requests[5].method, "POST");
+        assert_eq!(requests[5].target, "/api/provision");
+        assert_ne!(unknown.client_wg_public_key, admitted_key);
+        assert!(secret_field(&serde_json::from_slice(&requests[5].body).expect("JSON")).is_none());
+        assert_eq!(requests[6].method, "GET");
+        assert_eq!(requests[6].target, "/api/network");
+        assert_eq!(requests[7].method, "POST");
+        assert_eq!(requests[7].target, "/api/tunnel/start");
+        assert_eq!(requests[7].content_type.as_deref(), Some("text/plain"));
+        assert_eq!(requests[7].body, b"connect");
+    }
+
+    #[tokio::test]
+    async fn client_only_campaign_runs_without_profile_or_gateway() {
+        let client = Client::builder().no_proxy().build().expect("HTTP client");
+        let options = Options {
+            client_key: None,
+            gateway_key: None,
+            wg_iface: None,
+            only: Some(Category::Client),
+            repeat: 1,
+            profile: None,
+            soak: false,
+        };
+
+        run(&client, "http://127.0.0.1:1", options)
+            .await
+            .expect("offline client scenarios pass without profile keys");
+    }
+
+    #[tokio::test]
+    async fn protocol_campaign_runs_against_a_loopback_gateway() {
+        const PRIVATE: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+        let admitted_key = public_from_private(PRIVATE).expect("valid client key");
+        let gateway_key = base64::engine::general_purpose::STANDARD.encode([9u8; 32]);
+        let (base, server) = loopback_gateway(
+            admitted_key.clone(),
+            gateway_key.clone(),
+            LoopbackFaults::default(),
+        )
+        .await;
+        let client = Client::builder().no_proxy().build().expect("HTTP client");
+
+        run(
+            &client,
+            &base,
+            protocol_options(PRIVATE.into(), gateway_key),
+        )
+        .await
+        .expect("all protocol scenarios pass");
+
+        let requests = server.await.expect("fake gateway task");
+        assert_protocol_requests(&requests, &admitted_key);
+    }
+
+    #[tokio::test]
+    async fn protocol_campaign_reports_gateway_policy_and_api_leaks_as_failures() {
+        const PRIVATE: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+        let admitted_key = public_from_private(PRIVATE).expect("valid client key");
+        let gateway_key = base64::engine::general_purpose::STANDARD.encode([9u8; 32]);
+        let (base, server) = loopback_gateway(
+            admitted_key.clone(),
+            gateway_key.clone(),
+            LoopbackFaults {
+                wrong_admission_status: true,
+                leak_private_key: true,
+                accept_plain_text_mutation: true,
+                unstable_vip: true,
+            },
+        )
+        .await;
+        let client = Client::builder().no_proxy().build().expect("HTTP client");
+
+        assert!(
+            run(
+                &client,
+                &base,
+                protocol_options(PRIVATE.into(), gateway_key)
+            )
+            .await
+            .is_err(),
+            "wrong admission status, leaked secret, unstable VIP and accepted text mutation fail"
+        );
+
+        let requests = server.await.expect("fake gateway task");
+        assert_protocol_requests(&requests, &admitted_key);
+    }
 
     #[test]
     fn the_public_key_derives_from_the_private_key_and_is_stable() {
@@ -820,5 +1112,35 @@ mod tests {
     fn outcome_check_translates_the_condition() {
         assert!(matches!(Outcome::check(true, "d", "e"), Outcome::Pass(_)));
         assert!(matches!(Outcome::check(false, "d", "e"), Outcome::Fail(_)));
+    }
+
+    #[test]
+    fn private_key_is_detected_at_the_root_and_deep_inside_arrays_and_objects() {
+        let at_root = serde_json::json!({"private_key": "secret"});
+        assert_eq!(secret_field(&at_root).as_deref(), Some("private_key"));
+
+        // Non-secret array entries before the target ensure the traversal keeps
+        // searching; alternating arrays and objects exercises both recursive arms.
+        let deeply_nested = serde_json::json!({
+            "profiles": [
+                {"name": "first", "private_key_configured": true},
+                {"items": [{"label": "second"}, {"credentials": {"private_key": "secret"}}]}
+            ]
+        });
+        assert_eq!(secret_field(&deeply_nested).as_deref(), Some("private_key"));
+    }
+
+    #[test]
+    fn all_secret_presence_indicators_remain_non_leaking() {
+        let indicators_only = serde_json::json!({
+            "wg_private_key_configured": true,
+            "preshared_key_configured": true,
+            "private_key_configured": true,
+            "nested": [
+                {"private_key_configured": false},
+                {"preshared_key_configured": true}
+            ]
+        });
+        assert_eq!(secret_field(&indicators_only), None);
     }
 }
