@@ -143,7 +143,10 @@ pub enum RevocationRefusal {
     AlreadyRevoked,
     #[error("une révocation de ce poste attend déjà. Reprendre celle-ci.")]
     AlreadyPending,
-    /// Astra refuses to open a revocation for a key it does not know.
+    /// Astra does not know this workstation. [`open`] never produces it: the door's
+    /// refusals reach the tunnel as a bare 403, which says nothing finer, so a refused
+    /// open is read from the domain's state instead (see `refused_by_door`). Orion
+    /// checks the name and the key against the gateway before it opens (Task 9).
     #[error("Astra ne connaît pas ce poste. Rien n'a été signé.")]
     PeerUnknown,
     /// The `CA-PQ` Astra checks is the outgoing one, and it may be signed under only
@@ -316,9 +319,7 @@ pub fn open(
             window_secs: CAMPAIGN_WINDOW_SECS,
         })
         .map_err(|error| match error.downcast_ref::<TunnelRefusal>() {
-            // The door answers an unknown peer with its coarse refusal, and the
-            // wire carries nothing finer: a 403 here is read as that refusal.
-            Some(refusal) if refusal.status == 403 => RevocationRefusal::PeerUnknown,
+            Some(refusal) if refusal.status == 403 => refused_by_door(remote, peer),
             _ => unreachable_or_internal(error),
         })?;
     let (Some(tls_not_after), Some(pq_not_after)) = opened
@@ -591,6 +592,20 @@ fn clear(vault_path: &Path) -> Result<()> {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error).with_context(|| format!("suppression de {}", path.display())),
+    }
+}
+
+/// A 403 on the door's open call. The door refuses an unknown peer, a peer it holds
+/// as revoked, and a campaign it will not open alike, and the tunnel exposes only the
+/// status. So the domain's state is read again: a peer now held as revoked is that
+/// fact, and anything else is an unnamed refusal, never `PeerUnknown`.
+fn refused_by_door(remote: &dyn RevocationRemote, peer: &WireGuardKey) -> RevocationRefusal {
+    match remote.authority_status() {
+        Ok(status) if status.revoked_peers.contains(peer) => RevocationRefusal::AlreadyRevoked,
+        Ok(_) => {
+            RevocationRefusal::Internal("Astra a refusé d'ouvrir la révocation de ce poste.".into())
+        }
+        Err(error) => unreachable_or_internal(error),
     }
 }
 

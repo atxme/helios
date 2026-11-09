@@ -67,6 +67,9 @@ struct Remote {
     /// Whether the record was on disk at the moment of a deposit.
     record_at_submit: Cell<Option<bool>>,
     open_refusal: Cell<Option<u16>>,
+    /// Whether the refused open also leaves the peer held as revoked, as the door
+    /// does when the peer is already revoked.
+    revokes_peer_on_refusal: Cell<bool>,
 }
 
 impl Remote {
@@ -80,6 +83,7 @@ impl Remote {
             submitted: RefCell::default(),
             record_at_submit: Cell::new(None),
             open_refusal: Cell::new(None),
+            revokes_peer_on_refusal: Cell::new(false),
         }
     }
 
@@ -100,6 +104,11 @@ impl RevocationRemote for Remote {
     fn open_campaign(&self, _request: &OperatorOpenRequest) -> Result<OperatorOpened> {
         self.note("open_campaign");
         if let Some(status) = self.open_refusal.get() {
+            if self.revokes_peer_on_refusal.get() {
+                if let Some(authority) = self.authority.borrow_mut().as_mut() {
+                    authority.revoked_peers.push(peer());
+                }
+            }
             return Err(admin_refusal(status, None));
         }
         Ok(OperatorOpened {
@@ -439,6 +448,46 @@ fn expired_campaign_discards_the_record() {
 
     assert_eq!(pending(&domain.path, EXPIRES).expect("read"), None);
     assert!(!record_on_disk(&domain), "the expired record is removed");
+}
+
+#[test]
+fn a_door_refusal_is_not_read_as_an_unknown_peer() {
+    let domain = domain();
+    let remote = Remote::watching(&domain, vec![revocation_campaign(&domain, peer())]);
+    remote.open_refusal.set(Some(403));
+
+    let refusal = open(
+        &remote,
+        &domain.path,
+        &peer(),
+        RevocationReasonChoice::Replaced,
+        NOW,
+    )
+    .err()
+    .expect("refused");
+
+    assert_eq!(
+        refusal,
+        RevocationRefusal::Internal("Astra a refusé d'ouvrir la révocation de ce poste.".into())
+    );
+    assert_ne!(refusal, RevocationRefusal::PeerUnknown);
+    assert_eq!(domain.touches(), 0);
+
+    // The same refusal, when the domain now holds the peer as revoked, is that fact.
+    let remote = Remote::watching(&domain, vec![revocation_campaign(&domain, peer())]);
+    remote.open_refusal.set(Some(403));
+    remote.revokes_peer_on_refusal.set(true);
+    let refusal = open(
+        &remote,
+        &domain.path,
+        &peer(),
+        RevocationReasonChoice::Replaced,
+        NOW,
+    )
+    .err()
+    .expect("refused");
+    assert_eq!(refusal, RevocationRefusal::AlreadyRevoked);
+    assert_eq!(domain.touches(), 0);
 }
 
 #[test]
