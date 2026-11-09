@@ -1696,6 +1696,9 @@ pair, aux empreintes et à la génération demandée. Le validateur historique
 contrôle signature, chaîne, identités, empreintes et dernière génération
 enregistrée, mais ne contrôle pas la période ; il est un type séparé et ne peut
 pas être appelé par la négociation.
+Lors du suivi et après dépôt du commit, Orion refuse une réponse qui ne porte
+pas le même identifiant d'opération, la même empreinte de demande et la même
+clé WireGuard cliente. Le commit local attend une réponse `Committed`.
 
 La récupération emploie une seule cérémonie `GetAssertion` pour le credential
 requis. Le challenge est celui ci-dessus et la même requête transporte le sel
@@ -1723,9 +1726,16 @@ confirmé par Helios peut être redemandé après une réponse perdue : seul le
 commit signé strictement identique, identifié par son empreinte canonique
 incluant les deux signatures, retourne de nouveau l’état `Committed`, sans
 nouvel envoi au gateway. Un contenu différent ou une opération expirée reste
-refusé. Ce souvenir n’est pas persistant et ne garantit pas le rejeu de
-l’opération après redémarrage d’Astra ; l’intent de réconciliation durable
-couvre séparément l’adoption de la génération déjà installée par Helios.
+refusé. Orion conserve lui aussi le commit signé exact en mémoire pendant la
+session et sérialise ses tentatives, afin de le redéposer sans le resigner.
+Cette reprise reste bornée par l’expiration de l’opération Astra : une réponse
+perdue suivie d’une tentative après échéance ne peut pas être confirmée par ce
+rejeu et nécessite la réconciliation de la génération installée. Elle ne
+survit pas non plus au redémarrage d’Orion : elle exigerait de conserver
+durablement le commit signé avant son envoi. Le souvenir d’Astra n’est pas
+persistant non plus et ne garantit pas le rejeu après son redémarrage ;
+l’intent de réconciliation durable couvre séparément l’adoption de la
+génération déjà installée par Helios.
 
 Une seule YubiKey suffit ici parce qu'elle ne constitue pas l'unique preuve :
 la clé PQ privée de la dernière génération admise signe aussi le challenge, la

@@ -123,6 +123,8 @@ pub struct RecoverySession {
     operation_id: Id16,
     request: Box<ExpiredCertificateRecoveryRequest>,
     keys: CandidateKeys,
+    // The authority accepts only the identical signed commit on a retry.
+    pending_commit: tokio::sync::Mutex<Option<ClientCertificateStageCommit>>,
 }
 
 struct CandidateKeys {
@@ -319,6 +321,7 @@ pub async fn begin(
         operation_id: view.operation_id,
         request: Box::new(request),
         keys,
+        pending_commit: tokio::sync::Mutex::new(None),
     };
     let step = session.step_of(&view)?;
     Ok((session, step))
@@ -353,11 +356,12 @@ pub async fn resume(
 }
 
 impl RecoverySession {
-    /// The answer must be about **this** request and **this** client.
+    /// The answer must name this operation, request and client.
     fn step_of(&self, view: &ExpiredRecoveryOperationView) -> Result<RecoveryStep, RecoveryError> {
-        if !view
-            .request_fingerprint
-            .matches(&self.request.fingerprint())
+        if view.operation_id != self.operation_id
+            || !view
+                .request_fingerprint
+                .matches(&self.request.fingerprint())
             || view.client_wg_public_key != self.request.client_wg_public_key
         {
             return Err(RecoveryError::Refused);
@@ -372,6 +376,34 @@ impl RecoverySession {
                 operation_id: self.operation_id,
             },
         })
+    }
+
+    /// A successful HTTP response confirms a commit only for this operation.
+    fn confirm_commit(&self, view: &ExpiredRecoveryOperationView) -> Result<(), RecoveryError> {
+        self.step_of(view)?;
+        if view.state != ExpiredRecoveryState::Committed {
+            return Err(RecoveryError::Refused);
+        }
+        Ok(())
+    }
+
+    async fn deposit_commit(
+        &self,
+        commit: &ClientCertificateStageCommit,
+    ) -> Result<(), RecoveryError> {
+        let confirmation: ExpiredRecoveryOperationView = post_json(
+            &self.http,
+            &format!(
+                "{}/v1/client-rotation/recovery/{}/commit",
+                self.base,
+                self.operation_id.to_hex()
+            ),
+            &ExpiredRecoveryCommitDeposit {
+                commit: Box::new(commit.clone()),
+            },
+        )
+        .await?;
+        self.confirm_commit(&confirmation)
     }
 }
 
@@ -390,6 +422,9 @@ async fn install(
     grant: ClientCertificateRotationGrant,
     now_unix: u64,
 ) -> Result<RecoveryStep, RecoveryError> {
+    // One operation owns its candidate and exact signed commit. Serializing
+    // installation also keeps concurrent retries from signing different bytes.
+    let mut pending_commit = session.pending_commit.lock().await;
     let identity = settings.identity.trim();
     let identities = ProtectedIdentityStore::for_current_user()
         .map_err(|error| RecoveryError::Identity(error.to_string()))?;
@@ -428,10 +463,19 @@ async fn install(
         )?;
     }
 
-    // A crash or protected-store failure can happen after the local commit
-    // and before promotion. At that point the remote commit is irreversible,
-    // so a resumed recovery must retry the remaining local move instead of
-    // trying to stage the same candidate over an existing `next` slot.
+    let grant_fingerprint = grant.fingerprint()?;
+    if let Some(commit) = pending_commit.as_ref() {
+        if commit.stage_id != grant.stage_receipt.stage_id
+            || commit.grant_fingerprint != grant_fingerprint
+        {
+            return Err(RecoveryError::Refused);
+        }
+    }
+
+    // A protected-store failure can happen after the local commit and before
+    // promotion. A retry within this session must complete the local move
+    // instead of staging the same candidate over an existing `next` slot.
+    // Recovery sessions and their exact signed commits do not survive restart.
     let candidate_generation = grant.candidate()?;
     let already_committed = store
         .state()
@@ -473,38 +517,34 @@ async fn install(
     let expired_pq_private_key =
         decode_secret(bundle.pq_private_key.expose(), "clé privée PQ expirée")?;
     let receipt = &grant.stage_receipt;
-    let commit = ClientCertificateStageCommit {
-        format_version: CERTIFICATE_FORMAT_VERSION,
-        protocol_version: aether::certificates::CERTIFICATE_PROTOCOL_VERSION,
-        trust_domain_id: grant.trust_domain_id,
-        stage_id: receipt.stage_id,
-        grant_fingerprint: grant.fingerprint()?,
-        stage_receipt_fingerprint: grant.stage_receipt_fingerprint,
-        gateway_wg_public_key: grant.gateway_wg_public_key,
-        client_wg_public_key: grant.client_wg_public_key,
-        active_generation: grant.active_generation,
-        staged_generation: grant.next_generation,
-        staged_tls_certificate_fingerprint: grant.next_tls_certificate.fingerprint(),
-        staged_pq_certificate_fingerprint: receipt.staged_pq_certificate_fingerprint,
-        stage_expires_at: grant.stage_expires_at,
-        committed_at: now_unix,
-        active_pq_signature: MlDsa87Signature::placeholder(),
-        staged_pq_signature: MlDsa87Signature::placeholder(),
-    }
-    .sign(&expired_pq_private_key, &session.keys.pq_private_key)?;
-
-    let _: ExpiredRecoveryOperationView = post_json(
-        &session.http,
-        &format!(
-            "{}/v1/client-rotation/recovery/{}/commit",
-            session.base,
-            session.operation_id.to_hex()
-        ),
-        &ExpiredRecoveryCommitDeposit {
-            commit: Box::new(commit.clone()),
+    let commit = cached_recovery_commit(
+        &mut pending_commit,
+        receipt.stage_id,
+        grant_fingerprint,
+        || {
+            Ok(ClientCertificateStageCommit {
+                format_version: CERTIFICATE_FORMAT_VERSION,
+                protocol_version: aether::certificates::CERTIFICATE_PROTOCOL_VERSION,
+                trust_domain_id: grant.trust_domain_id,
+                stage_id: receipt.stage_id,
+                grant_fingerprint,
+                stage_receipt_fingerprint: grant.stage_receipt_fingerprint,
+                gateway_wg_public_key: grant.gateway_wg_public_key,
+                client_wg_public_key: grant.client_wg_public_key,
+                active_generation: grant.active_generation,
+                staged_generation: grant.next_generation,
+                staged_tls_certificate_fingerprint: grant.next_tls_certificate.fingerprint(),
+                staged_pq_certificate_fingerprint: receipt.staged_pq_certificate_fingerprint,
+                stage_expires_at: grant.stage_expires_at,
+                committed_at: now_unix,
+                active_pq_signature: MlDsa87Signature::placeholder(),
+                staged_pq_signature: MlDsa87Signature::placeholder(),
+            }
+            .sign(&expired_pq_private_key, &session.keys.pq_private_key)?)
         },
-    )
-    .await?;
+    )?;
+
+    session.deposit_commit(&commit).await?;
 
     store.commit_staged_candidate(&receipt.stage_id, &commit.fingerprint(), now_unix)?;
     // Recovery activation is already due when the double commit succeeds.
@@ -515,6 +555,27 @@ async fn install(
         generation: grant.next_generation,
         activation_at: grant.window.activation_at,
     })
+}
+
+/// Builds once and reuses the exact signed commit for this session's retry.
+fn cached_recovery_commit(
+    cached: &mut Option<ClientCertificateStageCommit>,
+    stage_id: Id16,
+    grant_fingerprint: Fingerprint,
+    build: impl FnOnce() -> Result<ClientCertificateStageCommit, RecoveryError>,
+) -> Result<ClientCertificateStageCommit, RecoveryError> {
+    if let Some(commit) = cached.as_ref() {
+        if commit.stage_id != stage_id || commit.grant_fingerprint != grant_fingerprint {
+            return Err(RecoveryError::Refused);
+        }
+        return Ok(commit.clone());
+    }
+    let commit = build()?;
+    if commit.stage_id != stage_id || commit.grant_fingerprint != grant_fingerprint {
+        return Err(RecoveryError::Refused);
+    }
+    *cached = Some(commit.clone());
+    Ok(commit)
 }
 
 /// The nonce Astra issues for one recovery request.
@@ -733,6 +794,94 @@ mod tests {
     /// one, nobody can approve it — and the profile says so instead of posting
     /// a request that Astra would open and no touch could ever close.
     #[test]
+    fn recovery_starts_at_expiry_and_the_signed_request_verifies() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let domain = domain();
+        let (leaf, private) = expired_leaf(&domain);
+        let expiry = leaf.not_after_unix;
+        let state = state_with(
+            directory.path(),
+            &domain,
+            vec![binding(CredentialState::Active)],
+            &leaf,
+        );
+        assert!(matches!(
+            build_request(
+                &state,
+                leaf.clone(),
+                domain.active_client_tls.clone(),
+                &private,
+                [7; 32],
+                expiry - 1
+            ),
+            Err(RecoveryError::NotExpired)
+        ));
+        let (request, _) = build_request(
+            &state,
+            leaf,
+            domain.active_client_tls.clone(),
+            &private,
+            [7; 32],
+            expiry,
+        )
+        .expect("recovery at expiry");
+        assert_eq!(request.created_at, expiry);
+        request
+            .verify_historical(
+                &[&domain.ca_pq_public],
+                &state.trust_domain_id,
+                &state.gateway.gateway_wg_public_key,
+                SERVER_NAME,
+                &state.client_wg_public_key,
+                &state.certificates.active,
+                &[7; 32],
+                expiry,
+            )
+            .expect("signed request at expiry");
+    }
+
+    #[test]
+    fn recovery_rejects_generation_and_expiry_overflow() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let domain = domain();
+        let (leaf, private) = expired_leaf(&domain);
+        let mut state = state_with(
+            directory.path(),
+            &domain,
+            vec![binding(CredentialState::Active)],
+            &leaf,
+        );
+        state.certificates.active.generation = u64::MAX;
+        assert!(matches!(
+            build_request(
+                &state,
+                leaf.clone(),
+                domain.active_client_tls.clone(),
+                &private,
+                [7; 32],
+                LATER
+            ),
+            Err(RecoveryError::Certificate(
+                CertificateError::ArithmeticOverflow
+            ))
+        ));
+        state.certificates.active.generation = 4;
+        assert!(matches!(
+            build_request(
+                &state,
+                leaf,
+                domain.active_client_tls.clone(),
+                &private,
+                [7; 32],
+                u64::MAX
+            ),
+            Err(RecoveryError::Certificate(
+                CertificateError::ArithmeticOverflow
+            ))
+        ));
+    }
+
+    #[test]
     fn a_profile_with_no_active_operator_credential_is_refused_by_name() {
         let directory = tempfile::tempdir().expect("tempdir");
         let domain = domain();
@@ -850,6 +999,7 @@ mod tests {
             operation_id,
             request: Box::new(request),
             keys,
+            pending_commit: tokio::sync::Mutex::new(None),
         };
 
         let view = |fingerprint: Fingerprint, client: WireGuardKey| ExpiredRecoveryOperationView {
@@ -883,6 +1033,484 @@ mod tests {
             session.step_of(&view(mine, WireGuardKey::from_bytes([0x5A; 32]))),
             Err(RecoveryError::Refused)
         ));
+    }
+
+    #[cfg(test)]
+    mod lifecycle_tests {
+        use super::*;
+        use aether::certificates::encoding::{Fingerprint, Id16, WireGuardKey};
+        use aether::certificates::transport::{ExpiredRecoveryOperationView, ExpiredRecoveryState};
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        fn view(
+            session: &RecoverySession,
+            state: ExpiredRecoveryState,
+        ) -> ExpiredRecoveryOperationView {
+            ExpiredRecoveryOperationView {
+                operation_id: session.operation_id,
+                state,
+                client_wg_public_key: session.request.client_wg_public_key,
+                request_fingerprint: session.request.fingerprint(),
+                created_at: LATER,
+                expires_at: LATER + 300,
+                request: None,
+                receipt: None,
+                gateway_pq_certificate: None,
+                grant: None,
+            }
+        }
+
+        fn recovery_session(base: String) -> RecoverySession {
+            let directory = tempfile::tempdir().expect("fixture directory");
+            let domain = domain();
+            let (expired, expired_private) = expired_leaf(&domain);
+            let state = state_with(
+                directory.path(),
+                &domain,
+                vec![binding(CredentialState::Active)],
+                &expired,
+            );
+            let (request, keys) = build_request(
+                &state,
+                expired,
+                domain.active_client_tls.clone(),
+                &expired_private,
+                [0x37; 32],
+                LATER,
+            )
+            .expect("build a valid recovery request");
+            // The request and generated keys own their data; the trust fixture can
+            // be dropped once the session has been assembled.
+            RecoverySession {
+                base,
+                http: reqwest::Client::builder()
+                    .no_proxy()
+                    .timeout(Duration::from_secs(3))
+                    .build()
+                    .expect("HTTP client"),
+                operation_id: Id16::new([0x42; 16]).expect("operation id"),
+                request: Box::new(request),
+                keys,
+                pending_commit: tokio::sync::Mutex::new(None),
+            }
+        }
+
+        async fn mock_json_server(
+            responses: Vec<(u16, Vec<u8>)>,
+        ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind mock server");
+            let address = listener.local_addr().expect("mock address");
+            let task = tokio::spawn(async move {
+                let mut requests = Vec::new();
+                for (status, body) in responses {
+                    let (mut stream, _) = listener.accept().await.expect("accept request");
+                    let mut bytes = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    while !bytes.windows(4).any(|part| part == b"\r\n\r\n") {
+                        let read = stream.read(&mut chunk).await.expect("read request");
+                        assert_ne!(read, 0, "request headers completed");
+                        bytes.extend_from_slice(&chunk[..read]);
+                    }
+                    requests.push(
+                        String::from_utf8_lossy(&bytes)
+                            .lines()
+                            .next()
+                            .unwrap_or_default()
+                            .to_string(),
+                    );
+                    let reason = match status {
+                        200 => "OK",
+                        403 => "Forbidden",
+                        503 => "Service Unavailable",
+                        _ => "Response",
+                    };
+                    let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                    stream
+                        .write_all(response.as_bytes())
+                        .await
+                        .expect("write response headers");
+                    stream.write_all(&body).await.expect("write response body");
+                }
+                requests
+            });
+            (format!("http://{address}"), task)
+        }
+
+        fn json_response(status: u16, view: &ExpiredRecoveryOperationView) -> (u16, Vec<u8>) {
+            (
+                status,
+                serde_json::to_vec(view).expect("serialize operation view"),
+            )
+        }
+
+        #[test]
+        fn step_of_maps_each_authority_state_and_refuses_a_different_identity() {
+            let session = recovery_session("http://127.0.0.1:1".into());
+            for state in [
+                ExpiredRecoveryState::AwaitingOperator,
+                ExpiredRecoveryState::Staged,
+                ExpiredRecoveryState::Granted,
+                ExpiredRecoveryState::Committed,
+            ] {
+                let result = session
+                    .step_of(&view(&session, state))
+                    .expect("own operation");
+                match state {
+                    ExpiredRecoveryState::AwaitingOperator => assert_eq!(
+                        result,
+                        RecoveryStep::AwaitingOperator {
+                            operation_id: session.operation_id
+                        }
+                    ),
+                    _ => assert_eq!(
+                        result,
+                        RecoveryStep::Issuing {
+                            operation_id: session.operation_id
+                        }
+                    ),
+                }
+            }
+
+            let mut wrong_request = view(&session, ExpiredRecoveryState::AwaitingOperator);
+            wrong_request.request_fingerprint = Fingerprint::of(b"different recovery");
+            assert!(matches!(
+                session.step_of(&wrong_request),
+                Err(RecoveryError::Refused)
+            ));
+
+            let mut wrong_client = view(&session, ExpiredRecoveryState::Granted);
+            wrong_client.client_wg_public_key = WireGuardKey::from_bytes([0x55; 32]);
+            assert!(matches!(
+                session.step_of(&wrong_client),
+                Err(RecoveryError::Refused)
+            ));
+        }
+
+        #[tokio::test]
+        async fn resume_repeats_awaiting_operator_and_uses_the_operation_route() {
+            let mut session = recovery_session(String::new());
+            let first = view(&session, ExpiredRecoveryState::AwaitingOperator);
+            let second = first.clone();
+            let (base, server) = mock_json_server(vec![
+                json_response(200, &first),
+                json_response(200, &second),
+            ])
+            .await;
+            session.base = base;
+            let settings = crate::test_domain::settings(&domain());
+
+            for _ in 0..2 {
+                assert_eq!(
+                    resume(&session, &settings, LATER)
+                        .await
+                        .expect("still waiting"),
+                    RecoveryStep::AwaitingOperator {
+                        operation_id: session.operation_id
+                    }
+                );
+            }
+            let requests = server.await.expect("mock server task");
+            assert_eq!(requests.len(), 2);
+            assert!(requests.iter().all(|request| {
+                request
+                    == &format!(
+                        "GET /v1/client-rotation/recovery/{} HTTP/1.1",
+                        session.operation_id.to_hex()
+                    )
+            }));
+        }
+
+        #[tokio::test]
+        async fn resume_keeps_staged_granted_and_committed_states_issuing_without_a_grant() {
+            for state in [
+                ExpiredRecoveryState::Staged,
+                ExpiredRecoveryState::Granted,
+                ExpiredRecoveryState::Committed,
+            ] {
+                let mut session = recovery_session(String::new());
+                let response = view(&session, state);
+                let (base, server) = mock_json_server(vec![json_response(200, &response)]).await;
+                session.base = base;
+                let settings = crate::test_domain::settings(&domain());
+                assert_eq!(
+                    resume(&session, &settings, LATER)
+                        .await
+                        .expect("no grant to install"),
+                    RecoveryStep::Issuing {
+                        operation_id: session.operation_id
+                    },
+                    "{state:?} without grant remains Issuing"
+                );
+                let requests = server.await.expect("mock server task");
+                assert_eq!(requests.len(), 1);
+            }
+        }
+
+        #[tokio::test]
+        async fn resume_refuses_status_and_operation_identity_mismatches() {
+            for status in [403, 503] {
+                let mut session = recovery_session(String::new());
+                let (base, server) = mock_json_server(vec![(status, b"{}".to_vec())]).await;
+                session.base = base;
+                let settings = crate::test_domain::settings(&domain());
+                assert!(
+                    matches!(
+                        resume(&session, &settings, LATER).await,
+                        Err(RecoveryError::Status { status: returned }) if returned == status
+                    ),
+                    "expected HTTP {status} refusal"
+                );
+                server.await.expect("mock server task");
+            }
+
+            let mut session = recovery_session(String::new());
+            let (base, server) = mock_json_server(vec![(200, b"{".to_vec())]).await;
+            session.base = base;
+            let settings = crate::test_domain::settings(&domain());
+            assert!(matches!(
+                resume(&session, &settings, LATER).await,
+                Err(RecoveryError::Malformed(_))
+            ));
+            server.await.expect("mock server task");
+
+            for mismatch in ["request", "client", "operation"] {
+                let mut session = recovery_session(String::new());
+                let mut response = view(&session, ExpiredRecoveryState::AwaitingOperator);
+                if mismatch == "request" {
+                    response.request_fingerprint = Fingerprint::of(b"unrelated request");
+                } else if mismatch == "client" {
+                    response.client_wg_public_key = WireGuardKey::from_bytes([0x66; 32]);
+                } else {
+                    response.operation_id = Id16::new([0x43; 16]).expect("different operation");
+                }
+                let (base, server) = mock_json_server(vec![json_response(200, &response)]).await;
+                session.base = base;
+                let settings = crate::test_domain::settings(&domain());
+                assert!(
+                    matches!(
+                        resume(&session, &settings, LATER).await,
+                        Err(RecoveryError::Refused)
+                    ),
+                    "{mismatch} mismatch must be refused"
+                );
+                server.await.expect("mock server task");
+            }
+        }
+
+        fn sample_commit(
+            stage: Id16,
+            grant: Fingerprint,
+            committed_at: u64,
+        ) -> ClientCertificateStageCommit {
+            ClientCertificateStageCommit {
+                format_version: CERTIFICATE_FORMAT_VERSION,
+                protocol_version: aether::certificates::CERTIFICATE_PROTOCOL_VERSION,
+                trust_domain_id: Id16::new([1; 16]).unwrap(),
+                stage_id: stage,
+                grant_fingerprint: grant,
+                stage_receipt_fingerprint: Fingerprint::of(b"receipt"),
+                gateway_wg_public_key: WireGuardKey::from_bytes([2; 32]),
+                client_wg_public_key: WireGuardKey::from_bytes([3; 32]),
+                active_generation: 4,
+                staged_generation: 5,
+                staged_tls_certificate_fingerprint: Fingerprint::of(b"TLS"),
+                staged_pq_certificate_fingerprint: Fingerprint::of(b"PQ"),
+                stage_expires_at: LATER + 300,
+                committed_at,
+                active_pq_signature: MlDsa87Signature::placeholder(),
+                staged_pq_signature: MlDsa87Signature::placeholder(),
+            }
+        }
+
+        #[test]
+        fn a_retry_reuses_the_exact_commit_and_refuses_a_different_binding() {
+            let stage = Id16::new([5; 16]).unwrap();
+            let grant = Fingerprint::of(b"grant");
+            let mut cache = None;
+            let first = cached_recovery_commit(&mut cache, stage, grant, || {
+                Ok(sample_commit(stage, grant, 10))
+            })
+            .unwrap();
+            let second = cached_recovery_commit(&mut cache, stage, grant, || {
+                panic!("a retry must not re-sign")
+            })
+            .unwrap();
+            assert_eq!(first, second);
+            assert_eq!(first.fingerprint(), second.fingerprint());
+            assert!(matches!(
+                cached_recovery_commit(&mut cache, Id16::new([6; 16]).unwrap(), grant, || panic!(
+                    "different stage"
+                )),
+                Err(RecoveryError::Refused)
+            ));
+            assert!(matches!(
+                cached_recovery_commit(
+                    &mut cache,
+                    stage,
+                    Fingerprint::of(b"other grant"),
+                    || panic!("different grant")
+                ),
+                Err(RecoveryError::Refused)
+            ));
+            assert_eq!(cache, Some(first));
+        }
+
+        #[tokio::test]
+        async fn concurrent_attempts_build_a_single_commit() {
+            use std::sync::{
+                atomic::{AtomicUsize, Ordering},
+                Arc,
+            };
+            let session = Arc::new(recovery_session(String::new()));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let stage = Id16::new([5; 16]).unwrap();
+            let grant = Fingerprint::of(b"grant");
+            let mut tasks = Vec::new();
+            for now in [10, 20] {
+                let session = Arc::clone(&session);
+                let calls = Arc::clone(&calls);
+                tasks.push(tokio::spawn(async move {
+                    let mut cache = session.pending_commit.lock().await;
+                    cached_recovery_commit(&mut cache, stage, grant, || {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(sample_commit(stage, grant, now))
+                    })
+                    .unwrap()
+                }));
+            }
+            let first = tasks.remove(0).await.unwrap();
+            let second = tasks.remove(0).await.unwrap();
+            assert_eq!(first, second);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn a_lost_commit_response_is_retried_with_the_same_signed_document() {
+            let mut session = recovery_session(String::new());
+            let committed = view(&session, ExpiredRecoveryState::Committed);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            session.base = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let mut bodies = Vec::new();
+                for attempt in 0..2 {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut bytes = Vec::new();
+                    let mut chunk = [0u8; 2048];
+                    let body_start = loop {
+                        let count = stream.read(&mut chunk).await.unwrap();
+                        assert_ne!(count, 0);
+                        bytes.extend_from_slice(&chunk[..count]);
+                        if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let headers = std::str::from_utf8(&bytes[..end]).unwrap();
+                            let length: usize = headers
+                                .lines()
+                                .find_map(|line| {
+                                    let (name, value) = line.split_once(':')?;
+                                    name.eq_ignore_ascii_case("content-length")
+                                        .then(|| value.trim().parse().unwrap())
+                                })
+                                .unwrap();
+                            if bytes.len() >= end + 4 + length {
+                                break end + 4;
+                            }
+                        }
+                    };
+                    bodies.push(bytes[body_start..].to_vec());
+                    if attempt == 0 {
+                        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{").await.unwrap();
+                    } else {
+                        let body = serde_json::to_vec(&committed).unwrap();
+                        stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).await.unwrap();
+                        stream.write_all(&body).await.unwrap();
+                    }
+                }
+                bodies
+            });
+            let stage = Id16::new([5; 16]).unwrap();
+            let grant = Fingerprint::of(b"grant");
+            let first = {
+                let mut cache = session.pending_commit.lock().await;
+                cached_recovery_commit(&mut cache, stage, grant, || {
+                    Ok(sample_commit(stage, grant, 10))
+                })
+                .unwrap()
+            };
+            assert!(session.deposit_commit(&first).await.is_err());
+            let retry = {
+                let mut cache = session.pending_commit.lock().await;
+                cached_recovery_commit(&mut cache, stage, grant, || {
+                    panic!("must reuse prior commit")
+                })
+                .unwrap()
+            };
+            session
+                .deposit_commit(&retry)
+                .await
+                .expect("matching committed confirmation");
+            let bodies = tokio::time::timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(bodies.len(), 2);
+            assert_eq!(
+                bodies[0], bodies[1],
+                "retry must transmit the identical commit"
+            );
+        }
+
+        #[test]
+        fn commit_confirmation_requires_the_same_operation_and_committed_state() {
+            let session = recovery_session("http://127.0.0.1:1".into());
+            let valid = view(&session, ExpiredRecoveryState::Committed);
+            session
+                .confirm_commit(&valid)
+                .expect("matching committed operation");
+            for state in [
+                ExpiredRecoveryState::AwaitingOperator,
+                ExpiredRecoveryState::Staged,
+                ExpiredRecoveryState::Granted,
+            ] {
+                assert!(matches!(
+                    session.confirm_commit(&view(&session, state)),
+                    Err(RecoveryError::Refused)
+                ));
+            }
+            let mut wrong = valid.clone();
+            wrong.operation_id = Id16::new([0x43; 16]).unwrap();
+            assert!(matches!(
+                session.confirm_commit(&wrong),
+                Err(RecoveryError::Refused)
+            ));
+            wrong = valid.clone();
+            wrong.request_fingerprint = Fingerprint::of(b"other request");
+            assert!(matches!(
+                session.confirm_commit(&wrong),
+                Err(RecoveryError::Refused)
+            ));
+            wrong = valid;
+            wrong.client_wg_public_key = WireGuardKey::from_bytes([0x55; 32]);
+            assert!(matches!(
+                session.confirm_commit(&wrong),
+                Err(RecoveryError::Refused)
+            ));
+        }
+
+        #[test]
+        fn step_of_refuses_a_different_operation_id() {
+            let session = recovery_session("http://127.0.0.1:1".into());
+            let mut response = view(&session, ExpiredRecoveryState::AwaitingOperator);
+            response.operation_id = Id16::new([0x43; 16]).expect("other id");
+            assert!(matches!(
+                session.step_of(&response),
+                Err(RecoveryError::Refused)
+            ));
+        }
     }
 
     /// The known limit of §7.5, as an error rather than a panic: without the
