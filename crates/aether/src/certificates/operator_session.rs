@@ -806,6 +806,10 @@ pub struct OperatorStatus {
     /// and terms steps set it: nothing the operator types renews it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_until: Option<u64>,
+    /// The workstation of a revocation is cut at its gateway: every refusal after that
+    /// point says so, and the operator is told what is left to do.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub peer_cut: bool,
 }
 
 impl OperatorStatus {
@@ -830,6 +834,7 @@ impl OperatorStatus {
             key_retry: None,
             approved: Vec::new(),
             idle_until: None,
+            peer_cut: false,
         }
     }
 

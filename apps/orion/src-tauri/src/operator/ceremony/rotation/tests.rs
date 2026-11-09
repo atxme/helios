@@ -401,6 +401,9 @@ struct Bench {
     service_key: Zeroizing<Vec<u8>>,
     remote: Remote,
     clock: AtomicU64,
+    /// The gateway's clock, and whether the gateway answers at all to read it.
+    gateway_clock: AtomicU64,
+    gateway_clock_known: AtomicBool,
     /// Which key answers the next gesture; [`STRANGER`] for one outside the vault.
     plugged: AtomicUsize,
     /// The refusal the next connection fails with, if any.
@@ -477,6 +480,8 @@ fn bench() -> Arc<Bench> {
         service_key,
         remote: Remote::default(),
         clock: AtomicU64::new(NOW),
+        gateway_clock: AtomicU64::new(NOW),
+        gateway_clock_known: AtomicBool::new(true),
         plugged: AtomicUsize::new(0),
         unreachable: Mutex::default(),
         touch_ends_at: AtomicU64::new(0),
@@ -612,6 +617,7 @@ impl Bench {
 
     fn set_clock(&self, now: u64) {
         self.clock.store(now, Ordering::SeqCst);
+        self.gateway_clock.store(now, Ordering::SeqCst);
     }
 
     fn touches(&self) -> u32 {
@@ -747,10 +753,16 @@ impl Bench {
         let mut published = Vec::new();
         let connect = |owner: isize| self.connect(owner);
         let now = || self.clock.load(Ordering::SeqCst);
+        let gateway_now = || {
+            self.gateway_clock_known
+                .load(Ordering::SeqCst)
+                .then(|| self.gateway_clock.load(Ordering::SeqCst))
+        };
         let reach = Reach {
             remote,
             connect: &connect,
             now: &now,
+            gateway_now: &gateway_now,
         };
         let mut publish = |status: OperatorStatus| {
             match script(&status, self) {
@@ -2259,10 +2271,12 @@ async fn open_session(
             move |session_id, presses, publish, _artifacts| {
                 let connect = |owner: isize| running.connect(owner);
                 let now = || running.clock.load(Ordering::SeqCst);
+                let gateway_now = || Some(running.gateway_clock.load(Ordering::SeqCst));
                 let reach = Reach {
                     remote: &running.remote,
                     connect: &connect,
                     now: &now,
+                    gateway_now: &gateway_now,
                 };
                 let mut state = Ceremony::new(
                     session_id,
@@ -3729,4 +3743,62 @@ fn finish_ca_pq_retires_and_sends_the_copy() {
         .retained_outgoing_ca_pq_public()
         .is_none());
     assert!(bench.remote.called("send_vault_copy"));
+}
+
+/// « Terminer » of a `CA-PQ` judges its end by the gateway's clock when it can read it,
+/// and by the local one when it cannot.
+#[test]
+fn finish_ca_pq_judges_its_end_by_the_gateway_clock_then_the_local_one() {
+    let bench = bench();
+    bench
+        .drive(RotationGesture::ReplaceCaPq, Bench::all_the_way)
+        .done();
+    let (_, _, not_after) = astra_operator::store::load(&bench.path)
+        .expect("the vault")
+        .retained_outgoing_ca_pq_public()
+        .expect("the outgoing CA-PQ is kept");
+
+    // The local clock is past the end, the gateway's is not: the gateway decides.
+    bench.set_clock(not_after);
+    bench.gateway_clock.store(not_after - 1, Ordering::SeqCst);
+    let early = bench.drive(RotationGesture::FinishCaPq, Bench::all_the_way);
+    early.refused(Refusal::OutgoingCaPqKept { until: not_after });
+    assert!(early.asked_no_key());
+
+    // The gateway does not answer: the local clock decides.
+    bench.gateway_clock_known.store(false, Ordering::SeqCst);
+    bench
+        .drive(RotationGesture::FinishCaPq, Bench::all_the_way)
+        .done();
+}
+
+/// A key the vault does not hold is said to be not enrolled, and asked for again.
+#[test]
+fn finish_ca_pq_says_a_stranger_key_is_not_enrolled() {
+    let bench = bench();
+    bench
+        .drive(RotationGesture::ReplaceCaPq, Bench::all_the_way)
+        .done();
+    let (_, _, not_after) = astra_operator::store::load(&bench.path)
+        .expect("the vault")
+        .retained_outgoing_ca_pq_public()
+        .expect("the outgoing CA-PQ is kept");
+    bench.set_clock(not_after);
+
+    let mut strangers = 1;
+    let ran = bench.drive(RotationGesture::FinishCaPq, |status, bench| {
+        if strangers > 0 && matches!(status.gesture, GestureState::AwaitingKey { .. }) {
+            strangers -= 1;
+            bench.plug(STRANGER);
+            return proceed(status);
+        }
+        Bench::all_the_way(status, bench)
+    });
+    assert!(
+        ran.published
+            .iter()
+            .any(|status| status.key_retry == Some(Refusal::KeyNotEnrolled)),
+        "the stranger's key is named as not enrolled"
+    );
+    ran.done();
 }

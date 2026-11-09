@@ -127,7 +127,7 @@ impl ValidatedKeys {
 
 /// The token did not say which credential it holds: it holds none of those offered,
 /// or something got in the way of the gesture.
-pub(super) fn key_step_of_opening(error: GestureError) -> KeyStep {
+pub fn key_step_of_opening(error: GestureError) -> KeyStep {
     match error {
         GestureError::Authenticator(AuthenticatorError::UnknownCredential)
         | GestureError::Vault(_) => KeyStep::NotEnrolled,

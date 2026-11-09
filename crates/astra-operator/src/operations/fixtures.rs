@@ -5,6 +5,7 @@
 //! each test's own remote. Every signature and the vault are the production code.
 
 use std::cell::Cell;
+#[cfg(test)]
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -28,20 +29,21 @@ use crate::authenticator::{
 };
 use crate::gestures::{NewAuthority, NewKey};
 use crate::origin::CampaignRequest;
+#[cfg(test)]
 use crate::rotation_journal::{self, RotationJournal};
 use crate::vault::{SlotRole, SlotSecret};
 use crate::vault_gestures::{add_key_with, create_first_key, finalize_with};
 use crate::{credentials, handoff};
 
-pub(crate) const NOW: u64 = 1_800_000_000;
-pub(crate) const EXPIRES: u64 = NOW + 300;
+pub const NOW: u64 = 1_800_000_000;
+pub const EXPIRES: u64 = NOW + 300;
 pub(crate) const RP_ID: &str = "astra.helios.test";
 pub(crate) const ORIGIN: &str = "https://astra.helios.test";
 pub(crate) const AUTHORITY_URL: &str = "https://astra.helios.test/";
 pub(crate) const SERVER_NAME: &str = "gateway.helios.test";
-pub(crate) const OPERATION: [u8; 16] = [0x0B; 16];
+pub const OPERATION: [u8; 16] = [0x0B; 16];
 
-pub(crate) fn operation() -> Id16 {
+pub fn operation() -> Id16 {
     Id16::new(OPERATION).expect("operation")
 }
 
@@ -50,16 +52,16 @@ pub(crate) fn operation() -> Id16 {
 /// `derive` answers `hmac-secret` in shape and `approve` signs a real assertion.
 /// A key that ignores the allow-list stands for what Windows WebAuthn does: the
 /// key present answers, whichever was asked for.
-pub(crate) struct TestKey {
-    pub(crate) serial: u8,
-    pub(crate) registered: Cell<bool>,
-    pub(crate) touches: Cell<u32>,
+pub struct TestKey {
+    pub serial: u8,
+    pub registered: Cell<bool>,
+    pub touches: Cell<u32>,
     pub(crate) ignores_allow_list: Cell<bool>,
-    pub(crate) declines: Cell<bool>,
+    pub declines: Cell<bool>,
 }
 
 impl TestKey {
-    pub(crate) fn new(serial: u8) -> Self {
+    pub fn new(serial: u8) -> Self {
         Self {
             serial,
             registered: Cell::new(false),
@@ -69,7 +71,7 @@ impl TestKey {
         }
     }
 
-    pub(crate) fn credential_id(&self) -> Vec<u8> {
+    pub fn credential_id(&self) -> Vec<u8> {
         vec![self.serial; 64]
     }
 
@@ -168,22 +170,22 @@ impl Authenticator for TestKey {
 }
 
 /// A finished domain with three enrolled keys and a pinned service key.
-pub(crate) struct Domain {
+pub struct Domain {
     pub(crate) _directory: tempfile::TempDir,
-    pub(crate) path: PathBuf,
-    pub(crate) keys: [TestKey; 3],
+    pub path: PathBuf,
+    pub keys: [TestKey; 3],
     pub(crate) service_key: Zeroizing<Vec<u8>>,
 }
 
-pub(crate) fn trust_domain() -> TrustDomainId {
+pub fn trust_domain() -> TrustDomainId {
     TrustDomainId::new([0x2A; 16]).expect("domain")
 }
 
-pub(crate) fn gateway_key() -> WireGuardKey {
+pub fn gateway_key() -> WireGuardKey {
     WireGuardKey::from_bytes([0x11; 32])
 }
 
-pub(crate) fn domain() -> Domain {
+pub fn domain() -> Domain {
     let directory = tempfile::tempdir().expect("dir");
     let path = directory.path().join("authority-vault.json");
     let keys = [TestKey::new(1), TestKey::new(2), TestKey::new(3)];
@@ -227,21 +229,22 @@ pub(crate) fn domain() -> Domain {
 }
 
 impl Domain {
-    pub(crate) fn relay(&self) -> handoff::DomainHandoff {
+    pub fn relay(&self) -> handoff::DomainHandoff {
         handoff::load(&handoff::path_beside(&self.path)).expect("relay")
     }
 
-    pub(crate) fn registry(&self) -> CredentialRegistry {
+    pub fn registry(&self) -> CredentialRegistry {
         credentials::load(&credentials::path_beside(&self.path))
             .expect("document")
             .expect("present")
     }
 
-    pub(crate) fn touches(&self) -> u32 {
+    pub fn touches(&self) -> u32 {
         self.keys.iter().map(|key| key.touches.get()).sum()
     }
 
     /// Every file of the directory, to tell that nothing was written.
+    #[cfg(test)]
     pub(crate) fn files(&self) -> BTreeMap<PathBuf, Vec<u8>> {
         std::fs::read_dir(self.path.parent().expect("parent"))
             .expect("listing")
@@ -253,13 +256,14 @@ impl Domain {
             .collect()
     }
 
+    #[cfg(test)]
     pub(crate) fn journal_on_disk(&self) -> Option<RotationJournal> {
         rotation_journal::load(&rotation_journal::path_beside(&self.path)).expect("journal")
     }
 
     /// The campaign the door resolves for `trust_authorities`: one row per
     /// anchor, each naming what the domain holds now.
-    pub(crate) fn authority_campaign(&self, expires_at: u64) -> AstraRotationCampaign {
+    pub fn authority_campaign(&self, expires_at: u64) -> AstraRotationCampaign {
         let relay = self.relay();
         let identity = handoff::identity_of(&relay).expect("identity");
         let anchor = MlDsa87PublicKey::parse(relay.ca_pq_public_key.trim())
@@ -286,7 +290,7 @@ impl Domain {
         )
     }
 
-    pub(crate) fn campaign(
+    pub fn campaign(
         &self,
         scope: CampaignScope,
         targets: Vec<CampaignTarget>,
@@ -315,7 +319,7 @@ impl Domain {
         }
     }
 
-    pub(crate) fn request(&self, campaign: AstraRotationCampaign) -> CampaignRequest {
+    pub fn request(&self, campaign: AstraRotationCampaign) -> CampaignRequest {
         let signer_request = AstraSignerRequest {
             format_version: CERTIFICATE_FORMAT_VERSION,
             operation_id: operation(),
@@ -343,7 +347,7 @@ impl Domain {
 }
 
 /// What Astra says of a domain in step with the vault at `vault_path`.
-pub(crate) fn nothing_in_flight(vault_path: &Path) -> OperatorAuthorityStatus {
+pub fn nothing_in_flight(vault_path: &Path) -> OperatorAuthorityStatus {
     let relay = handoff::load(&handoff::path_beside(vault_path)).expect("relay");
     let identity = handoff::identity_of(&relay).expect("identity");
     let anchor = MlDsa87PublicKey::parse(relay.ca_pq_public_key.trim()).expect("anchor");

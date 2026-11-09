@@ -60,6 +60,9 @@ windows-sys = { version = "0.61", features = [
 aws-lc-rs.workspace = true
 # Chercher les ouvertures, sous leurs encodages, dans ce que reçoit la fenêtre.
 base64.workspace = true
+# Le domaine fini et les campagnes qu'Astra signerait, pour les tests de la révocation.
+# La feature n'existe que pour les tests : aucun build de production ne l'active.
+astra-operator = { workspace = true, features = ["test-fixtures"] }
 
 [features]
 default = []

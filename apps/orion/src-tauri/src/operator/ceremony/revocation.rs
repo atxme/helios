@@ -23,7 +23,8 @@ use std::sync::mpsc::Receiver;
 
 use aether::certificates::encoding::{Id16, WireGuardKey};
 use aether::certificates::operator_session::{
-    GestureState, KeyPurpose, KeySlotLabel, OperationLocator, OperatorStatus, Refusal, RemoteState,
+    AstraManifest, GestureState, KeyPurpose, KeySlotLabel, OperationLocator, OperatorStatus,
+    Refusal, RemoteState,
 };
 use aether_fido::authenticator::Authenticator;
 use astra_operator::operations::revocation::{
@@ -249,6 +250,7 @@ impl<'a> RevocationRun<'a> {
             self.refuse(refusal, error.to_string())
         })?;
         // The cut stands from here: nothing after it may undo it, and every failure says so.
+        self.ceremony.peer_cut = true;
         self.ceremony.gesture = GestureState::Idle;
         self.show();
         Ok(())
@@ -283,7 +285,9 @@ impl<'a> RevocationRun<'a> {
         let now = self.now();
         let opened = revocation::open(self.reach.remote, self.vault_path, &self.peer, reason, now)
             .map_err(|error| self.refuse(refusal_of_open(&error), error.to_string()))?;
+        // Shown before the first key: the operator reads what the campaign names.
         self.ceremony.remote = RemoteState::AwaitingOperator;
+        self.ceremony.manifest = Some(AstraManifest::Revocation(opened.manifest(now)));
         self.held = Some(Box::new(opened));
         self.show();
         Ok(())

@@ -34,6 +34,12 @@ thiserror.workspace = true
 # Les périodes de validité X.509 que `rcgen` attend.
 time.workspace = true
 zeroize.workspace = true
+# Only the `test-fixtures` feature needs it at run time; the tests have it as a dev-dependency.
+tempfile = { version = "3", optional = true }
+
+[features]
+# The ceremonies' test fixtures, for another crate's tests. No production build enables it.
+test-fixtures = ["dep:tempfile"]
 
 [dev-dependencies]
 tempfile = "3"

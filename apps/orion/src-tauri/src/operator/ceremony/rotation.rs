@@ -65,6 +65,7 @@ pub fn run_rotation(
     );
     publish(ceremony.status());
 
+    let gateway_address = gateway.as_ref().map(|target| target.address.clone());
     let tunnel = gateway
         .ok_or_else(|| "aucun tunnel n'est monté vers la gateway".to_string())
         .and_then(|target| {
@@ -95,12 +96,22 @@ pub fn run_rotation(
         }
     };
 
+    let gateway_now = move || gateway_address.as_deref().and_then(read_gateway_clock);
     let reach = Reach {
         remote: &tunnel,
         connect: &connect_key,
         now: &now_unix,
+        gateway_now: &gateway_now,
     };
     RotationRun::new(&mut ceremony, &presses, publish, vault_path, &reach).run(gesture)
+}
+
+/// The gateway's clock, read from its certificate answer: the source Task 8's
+/// `peers::clock_of` reads too. `None` when the gateway does not answer.
+fn read_gateway_clock(address: &str) -> Option<u64> {
+    let answer =
+        tauri::async_runtime::block_on(orion_core::operator_rotations::peer_certificates(address));
+    crate::operator::peers::clock_of(&answer)
 }
 
 /// What a ceremony reaches outside this process, and the time it reads.
@@ -108,6 +119,9 @@ struct Reach<'a> {
     remote: &'a dyn RotationRemote,
     connect: &'a dyn Fn(isize) -> Result<Box<dyn Authenticator>, (Refusal, String)>,
     now: &'a dyn Fn() -> u64,
+    /// The gateway's clock, when its answer can be read: what « Terminer » of a `CA-PQ`
+    /// judges its end by, before the local clock.
+    gateway_now: &'a dyn Fn() -> Option<u64>,
 }
 
 enum Held {
@@ -340,6 +354,12 @@ impl RotationRun<'_> {
         Ok(journal)
     }
 
+    /// The clock « Terminer » of a `CA-PQ` judges by: the gateway's when it can be read,
+    /// the local one otherwise.
+    fn finish_now(&self) -> u64 {
+        (self.reach.gateway_now)().unwrap_or_else(|| self.now())
+    }
+
     /// « Terminer » a CA-PQ rotation: one key destroys the outgoing `CA-PQ` in one sealed
     /// write, and the copy of the vault goes to Astra as after any key gesture.
     fn finish_ca_pq(&mut self) -> Step<()> {
@@ -355,7 +375,7 @@ impl RotationRun<'_> {
                 "aucune CA-PQ sortante n'est gardée".to_string(),
             ));
         };
-        let now = self.now();
+        let now = self.finish_now();
         if now < not_after {
             return Err(self.refuse(
                 Refusal::OutgoingCaPqKept { until: not_after },
@@ -366,7 +386,9 @@ impl RotationRun<'_> {
             let key = self.ask_key(1, 1, KeyPurpose::Promotion)?;
             match astra_operator::gestures::open_with_authorized_key(key.as_ref(), &vault, "") {
                 Ok(opening) => break opening,
-                Err(_) => self.turned_down(KeyStep::Declined)?,
+                Err(error) => {
+                    self.turned_down(astra_operator::operations::keys::key_step_of_opening(error))?
+                }
             }
         };
         self.honour_cancel()?;
@@ -375,7 +397,7 @@ impl RotationRun<'_> {
         self.ceremony.idle_until = None;
         self.show();
 
-        let now = self.now();
+        let now = self.finish_now();
         vault
             .retire_outgoing_ca_pq(&opening, now)
             .map_err(|error| {

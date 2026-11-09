@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { gestureSentence, refusalSentence, retryLabel } from './OperatorCeremony'
+import { gestureSentence, refusalSentence, refusalWithCut, retryLabel } from './OperatorCeremony'
 
 describe('refusalSentence for the acceptance', () => {
   it('names the consumed invitation and where to resume it', () => {
@@ -229,13 +229,30 @@ describe('refusalSentence for the revocation', () => {
       null,
       'revoke_certificate',
     )
-    expect(sentence).toMatch(/^Révocation possible après le .*2027/)
-    expect(sentence).toMatch(/Le poste est coupé ; la révocation reste à signer\.$/)
+    expect(sentence).toMatch(/^Révocation possible après le .*2027, \d{2}:\d{2}\.$/)
   })
 
-  it('astra_unreachable_after_the_cut_says_the_revocation_is_still_to_sign', () => {
+  it('astra_unreachable_is_said_once_and_the_cut_is_said_after_it', () => {
     expect(refusalSentence({ refusal: 'authority_unreachable' }, null, 'revoke_certificate')).toBe(
-      'Astra injoignable. Le poste est coupé ; la révocation reste à signer.',
+      'Astra injoignable.',
+    )
+    expect(
+      refusalWithCut({ refusal: 'authority_unreachable' }, null, 'revoke_certificate', true),
+    ).toBe('Astra injoignable. Le poste est coupé ; la révocation reste à signer.')
+    expect(
+      refusalWithCut({ refusal: 'authority_unreachable' }, null, 'revoke_certificate', false),
+    ).toBe('Astra injoignable.')
+  })
+})
+
+describe('the cut of a revocation', () => {
+  it('the_cut_is_appended_to_any_refusal_once_the_workstation_is_cut', () => {
+    const cut = 'Le poste est coupé ; la révocation reste à signer.'
+    expect(refusalWithCut({ refusal: 'internal' }, null, 'revoke_certificate', true)).toBe(
+      `Le processus opérateur s’est arrêté sans conclure. ${cut}`,
+    )
+    expect(refusalWithCut({ refusal: 'internal' }, null, 'revoke_certificate', false)).toBe(
+      'Le processus opérateur s’est arrêté sans conclure.',
     )
   })
 })

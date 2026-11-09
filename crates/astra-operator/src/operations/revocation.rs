@@ -26,6 +26,7 @@
 use std::path::Path;
 
 use aether::certificates::encoding::{Id16, MlDsa87PublicKey, WireGuardKey};
+use aether::certificates::operator_session::RevocationManifest;
 use aether::certificates::revocation::{RevocationReason, RevocationScope};
 use aether::certificates::status::AstraSignerResult;
 use aether::certificates::transport::{
@@ -230,6 +231,12 @@ pub struct OpenedRevocation {
     reason: RevocationReason,
     approval: CampaignApprovalSession,
     subject: String,
+    /// The epoch the decision will carry: the workstation's, plus one.
+    revocation_epoch: u64,
+    /// The campaign's scope, as it names itself on the wire.
+    scope: String,
+    /// The reason the operator chose, in the words the campaign carries.
+    reason_label: &'static str,
 }
 
 /// Opens the revocation of `peer`, or refuses it. Nothing before the last step
@@ -361,6 +368,14 @@ pub fn open(
     )
     .map_err(internal)?;
     let subject = target.identity_key.to_base64();
+    let revocation_epoch = target
+        .epoch
+        .checked_add(1)
+        .ok_or_else(|| RevocationRefusal::Internal("époque de révocation hors bornes".into()))?;
+    let scope = serde_json::to_value(campaign.scope)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_default();
     Ok(OpenedRevocation {
         keys,
         request: Box::new(request),
@@ -372,10 +387,27 @@ pub fn open(
         reason: reason.reason(),
         approval,
         subject,
+        revocation_epoch,
+        scope,
+        reason_label: reason.label(),
     })
 }
 
 impl OpenedRevocation {
+    /// What the operator reads before the first key: the workstation, the scope and the
+    /// reason the verified campaign names, the epoch the decision carries, and the
+    /// instant the operator is shown for it to take effect.
+    pub fn manifest(&self, effective_at: u64) -> RevocationManifest {
+        RevocationManifest {
+            trust_domain_id: self.identity.trust_domain_id,
+            target: self.subject.clone(),
+            scope: self.scope.clone(),
+            reason: self.reason_label.to_string(),
+            revocation_epoch: self.revocation_epoch,
+            effective_at,
+        }
+    }
+
     /// The workstation the campaign names, as the campaign carries it.
     pub fn subject_name(&self) -> &str {
         &self.subject

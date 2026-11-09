@@ -938,6 +938,8 @@ export interface OperatorStatus {
   idle_until?: number
   /** Ouverte par une montée du tunnel et non par l'opérateur ; ne vient que de la lecture de l'état. */
   automatic?: boolean
+  /** Le poste d'une révocation est coupé à sa gateway : toute raison suivante le dit. */
+  peer_cut?: boolean
 }
 
 /** Un geste d'enrôlement (§15.2), fermé : la page ne choisit que parmi ces trois. */

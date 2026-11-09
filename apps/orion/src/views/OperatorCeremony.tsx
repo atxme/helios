@@ -444,6 +444,20 @@ export function retryLabel(retry: Refusal, purpose: KeyPurpose | null): string {
 }
 
 /** Why it stopped. Typed, so the words are ours. */
+/** Said after any refusal once the workstation of a revocation is cut at its gateway. */
+export const CUT_PENDING_SENTENCE = 'Le poste est coupé ; la révocation reste à signer.'
+
+/** A refusal's sentence, with the cut said after it when the workstation is cut. */
+export function refusalWithCut(
+  refusal: Refusal,
+  journal: RotationJournalView | null,
+  operation: OperationKind | null,
+  peerCut: boolean,
+): string {
+  const sentence = refusalSentence(refusal, journal, operation)
+  return peerCut ? `${sentence} ${CUT_PENDING_SENTENCE}` : sentence
+}
+
 export function refusalSentence(
   refusal: Refusal,
   /** The rotation journal, when the screen knows it: dates and recourse come from it. */
@@ -607,20 +621,19 @@ export function refusalSentence(
     case 'revocation_awaits_deposit':
       return 'Une révocation attend son dépôt : la reprendre d’abord.'
     case 'revocation_not_before':
-      // Signing is refused until the margin: the cut has already happened.
-      return `Révocation possible après le ${formatDateTime(refusal.until)}. Le poste est coupé ; la révocation reste à signer.`
+      return `Révocation possible après le ${formatDateTime(refusal.until)}.`
     case 'revocation_anchor_unknown':
-      return 'Astra vérifie sous une ancre que ce coffre ne détient pas. Le poste est coupé ; la révocation reste à signer.'
+      return 'Astra vérifie sous une ancre que ce coffre ne détient pas.'
     case 'credentials_unverified':
-      return 'Le document de credentials ne se vérifie pas sous l’ancre à signer. Le poste est coupé ; la révocation reste à signer.'
+      return 'Le document de credentials ne se vérifie pas sous l’ancre à signer.'
     case 'campaign_mismatch':
-      return 'La campagne d’Astra ne nomme pas ce poste. Le poste est coupé ; la révocation reste à signer.'
+      return 'La campagne d’Astra ne nomme pas ce poste.'
     case 'peer_already_revoked':
       return 'Poste déjà révoqué.'
     case 'outgoing_ca_pq_kept':
       return `L’ancienne CA-PQ est gardée jusqu’au ${formatDateTime(refusal.until)} : « Terminer » attendra. Rien n’a été modifié.`
     case 'authority_unreachable':
-      return 'Astra injoignable. Le poste est coupé ; la révocation reste à signer.'
+      return 'Astra injoignable.'
     case 'internal':
       return 'Le processus opérateur s’est arrêté sans conclure.'
   }
@@ -733,7 +746,7 @@ export function OperatorCeremonyPanel({
           variant="outlined"
           sx={{ mt: 1, fontSize: 11.5 }}
         >
-          {refusalSentence(status.refusal, journal, status.operation)}
+          {refusalWithCut(status.refusal, journal, status.operation, status.peer_cut === true)}
         </Alert>
       )}
       {done && (

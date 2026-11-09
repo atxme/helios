@@ -1736,6 +1736,8 @@ struct Ceremony {
     approved: Vec<KeySlotLabel>,
     /// When the wait now offered ends by itself.
     idle_until: Option<u64>,
+    /// A revocation's workstation is cut at its gateway.
+    peer_cut: bool,
 }
 
 impl Ceremony {
@@ -1753,6 +1755,7 @@ impl Ceremony {
             key_retry: None,
             approved: Vec::new(),
             idle_until: None,
+            peer_cut: false,
         }
     }
 
@@ -1777,6 +1780,7 @@ impl Ceremony {
         status.key_retry = self.key_retry;
         status.approved = self.approved.clone();
         status.idle_until = self.idle_until;
+        status.peer_cut = self.peer_cut;
         status
     }
 
