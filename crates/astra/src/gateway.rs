@@ -141,6 +141,11 @@ impl GatewayChannel {
         self.client.peer_state(identity).await
     }
 
+    /// Lists every peer the gateway holds a certificate record for.
+    pub async fn peer_keys(&self) -> Result<Vec<WireGuardKey>, ChannelError> {
+        self.client.peer_keys().await
+    }
+
     /// Reads back the leaf the gateway **serves**.
     ///
     /// Not the one Astra recorded: a receipt is signed by what the daemon

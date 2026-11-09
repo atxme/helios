@@ -6,6 +6,7 @@ use aether::certificates::client::ClientCertificateGeneration;
 use aether::certificates::encoding::{
     generate_ml_dsa_87_keypair, Fingerprint, TrustDomainId, WireGuardKey,
 };
+use aether::certificates::state::ClientCertificateState;
 use aether::certificates::status::CertificateKind;
 use aether::key_negotiation::{PqCertificate, PqCertificateRole, PQ_CERTIFICATE_VERSION};
 use tokio::sync::Mutex;
@@ -863,6 +864,41 @@ async fn an_unknown_peer_is_refused() {
 }
 
 #[tokio::test]
+async fn a_revocation_opens_for_a_peer_astra_never_saw() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let service = fixture_with_gateway_peers(dir.path(), vec![gateway_view("tablet", 5)]).await;
+    assert!(service.registry.lock().await.peer(&peer_key(5)).is_none());
+
+    let outcome = service
+        .door(console(), revocation(5), NOW)
+        .await
+        .expect("the door opens");
+    let DoorOutcome::Opened(opening) = outcome else {
+        panic!("expected a campaign, got {outcome:?}");
+    };
+    assert_eq!(
+        opening.subject,
+        OpenedSubject::Client {
+            name: "tablet".into(),
+            generation: 4,
+            revocation_epoch: 0,
+        }
+    );
+    assert!(service.registry.lock().await.peer(&peer_key(5)).is_some());
+}
+
+#[tokio::test]
+async fn a_peer_unknown_to_both_is_refused_by_name() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let service = fixture_with_gateway(dir.path()).await;
+    let refusal = service
+        .door(console(), revocation(77), NOW)
+        .await
+        .expect_err("unknown to the registry and to the gateway");
+    assert!(matches!(refusal, DoorRefusal::PeerUnknown));
+}
+
+#[tokio::test]
 async fn a_revoked_peer_is_refused() {
     let dir = tempfile::tempdir().expect("tempdir");
     let service = fixture(dir.path());
@@ -942,8 +978,55 @@ fn served_leaf() -> PqCertificate {
     .expect("signed leaf")
 }
 
-/// A gateway that answers the identity read and refuses everything else.
-struct FakeGateway;
+/// A gateway that answers the identity read and refuses everything else,
+/// except that it lists and reads back the peers it was given.
+#[derive(Default)]
+struct FakeGateway {
+    peers: Vec<(WireGuardKey, astra_channel::PeerCertificateStateView)>,
+}
+
+/// A peer the gateway admitted, as its private channel reads it back. The
+/// leaf names the key and its fingerprint is the one the active generation
+/// holds, which is what the transcription checks before it believes a view.
+fn gateway_view(name: &str, seed: u8) -> (WireGuardKey, astra_channel::PeerCertificateStateView) {
+    use base64::Engine as _;
+    let key = peer_key(seed);
+    let (ca_private, _) = aether::key_negotiation::generate_ml_dsa_87_keypair().expect("keygen");
+    let (_, subject_public) =
+        aether::key_negotiation::generate_ml_dsa_87_keypair().expect("keygen");
+    let leaf = aether::key_negotiation::issue_pq_certificate(
+        PqCertificate {
+            version: PQ_CERTIFICATE_VERSION,
+            serial: [seed; 16],
+            subject: name.into(),
+            issuer: "CA-PQ".into(),
+            role: PqCertificateRole::Client,
+            wireguard_public_key: key.to_base64(),
+            ml_dsa_87_public_key: base64::engine::general_purpose::STANDARD.encode(&subject_public),
+            not_before_unix: 0,
+            not_after_unix: NOW * 2,
+            ml_dsa_87_signature: String::new(),
+        },
+        &ca_private,
+    )
+    .expect("signed leaf");
+    let active = ClientCertificateGeneration {
+        pq_certificate_fingerprint: aether::certificates::gateway::pq_certificate_fingerprint(
+            &leaf,
+        )
+        .expect("fingerprint"),
+        ..generation(seed)
+    };
+    (
+        key,
+        astra_channel::PeerCertificateStateView {
+            name: name.into(),
+            state: ClientCertificateState::new(active),
+            active_pq_certificate: leaf,
+            admission_pq_ca: None,
+        },
+    )
+}
 
 #[async_trait::async_trait]
 impl astra_channel::AstraStageHandler for FakeGateway {
@@ -994,7 +1077,7 @@ impl astra_channel::AstraChannelHandler for FakeGateway {
         Vec<aether::certificates::encoding::WireGuardKey>,
         aether::certificates::transport::TrustUpdateRefusal,
     > {
-        Ok(Vec::new())
+        Ok(self.peers.iter().map(|(key, _)| *key).collect())
     }
 
     async fn gateway_identity(
@@ -1019,12 +1102,16 @@ impl astra_channel::AstraChannelHandler for FakeGateway {
 
     async fn peer_state(
         &self,
-        _: &WireGuardKey,
+        identity: &WireGuardKey,
     ) -> Result<
         astra_channel::PeerCertificateStateView,
         aether::certificates::transport::TrustUpdateRefusal,
     > {
-        Err(aether::certificates::transport::TrustUpdateRefusal::Rejected)
+        self.peers
+            .iter()
+            .find(|(key, _)| key == identity)
+            .map(|(_, view)| view.clone())
+            .ok_or(aether::certificates::transport::TrustUpdateRefusal::Rejected)
     }
 }
 
@@ -1061,6 +1148,14 @@ fn channel_identities(
 
 /// The fixture, with its gateway channel dialing a fake gateway on loopback.
 async fn fixture_with_gateway(dir: &Path) -> Arc<AstraService> {
+    fixture_with_gateway_peers(dir, Vec::new()).await
+}
+
+/// The same, with a gateway that admits `peers`.
+async fn fixture_with_gateway_peers(
+    dir: &Path,
+    peers: Vec<(WireGuardKey, astra_channel::PeerCertificateStateView)>,
+) -> Arc<AstraService> {
     let (astra_certificate, identity, gateway_certificate) = channel_identities(dir);
     let config = astra_channel::server_config(&identity, &astra_certificate).expect("server");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1068,7 +1163,7 @@ async fn fixture_with_gateway(dir: &Path) -> Arc<AstraService> {
         .expect("bind");
     let address = listener.local_addr().expect("address");
     drop(listener);
-    let router = astra_channel::router(Arc::new(FakeGateway));
+    let router = astra_channel::router(Arc::new(FakeGateway { peers }));
     tokio::spawn(async move {
         let _ = astra_channel::serve(address, config, router, astra_channel::INTERNAL_PREFIX).await;
     });

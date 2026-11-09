@@ -178,7 +178,7 @@ mod stage;
 
 pub use companion::{read, signer_request, signer_result};
 pub use request::open;
-pub(crate) use request::transcribe_peer;
+pub use request::transcribe_peer;
 
 // What the steps name of each other, through `use super::*`.
 use self::{approval::*, stage::*};

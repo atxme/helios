@@ -11,7 +11,9 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 
-use aether::certificates::encoding::Fingerprint;
+use aether::certificates::encoding::{Fingerprint, WireGuardKey};
+use aether::certificates::revocation::{EmergencyCertificateRevocation, RevocationScope};
+use aether::certificates::transport::TrustUpdateObject;
 use anyhow::{Context, Result};
 use astra::registry::{AstraRegistry, ChallengeStore};
 use astra::service::{
@@ -45,6 +47,13 @@ const MAX_VAULT_BYTES: u64 = 4 * 1024 * 1024;
 /// Two seconds, the period of the campaign inbox drain this sweep used to
 /// share a loop with.
 const TRANSITION_SWEEP_INTERVAL_SECS: u64 = 2;
+/// How often the gateway is read for the peers it admitted, and how often a
+/// recorded client revocation it does not report as applied is sent again.
+///
+/// One minute: a workstation the gateway admitted is known here within a
+/// minute, and a revocation the gateway missed is replayed within one. The
+/// revocation is also the only thing that must not wait for an operator.
+const PEER_SWEEP_INTERVAL_SECS: u64 = 60;
 
 pub(crate) fn run(
     state_dir: &Path,
@@ -156,6 +165,7 @@ pub(crate) fn run(
         }
         spawn_reconciliation_repair(service.clone());
         spawn_transition_sweep(service.clone());
+        spawn_peer_sweep(service.clone());
         let listener = tokio::net::TcpListener::bind(bind)
             .await
             .with_context(|| format!("binding {bind}"))?;
@@ -332,6 +342,133 @@ fn spawn_transition_sweep(service: Arc<AstraService>) {
     });
 }
 
+/// What one pass of the peer sweep did.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SweepReport {
+    /// Admitted peers this authority did not hold, and holds now.
+    pub(crate) transcribed: usize,
+    /// Recorded client revocations the gateway did not report as applied, and
+    /// that were sent to it again.
+    pub(crate) relayed: usize,
+}
+
+/// Learns the peers the gateway admitted and keeps relaying recorded
+/// revocations until the gateway applies them.
+///
+/// Its own loop, for the same reason as the transition sweep: it must not
+/// wait behind a ceremony, and a gateway that was down when a revocation was
+/// deposited must still receive it.
+fn spawn_peer_sweep(service: Arc<AstraService>) {
+    tokio::spawn(async move {
+        let mut ticker =
+            tokio::time::interval(std::time::Duration::from_secs(PEER_SWEEP_INTERVAL_SECS));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            let report = sweep_peers(&service, now_unix()).await;
+            if report.transcribed + report.relayed > 0 {
+                tracing::info!(
+                    transcribed = report.transcribed,
+                    relayed = report.relayed,
+                    "peer sweep: admitted peers learned, revocations sent to the gateway"
+                );
+            }
+        }
+    });
+}
+
+/// One pass of the peer sweep. Without a gateway channel it does nothing.
+///
+/// A channel error is logged and the next pass retries it: nothing here is
+/// fatal, because the gateway being down is the ordinary case at boot, and a
+/// peer or a revocation that waits one more minute loses nothing.
+pub(crate) async fn sweep_peers(service: &Arc<AstraService>, now_unix: u64) -> SweepReport {
+    let mut report = SweepReport {
+        transcribed: 0,
+        relayed: 0,
+    };
+    let Some(gateway) = service.gateway.as_ref() else {
+        return report;
+    };
+
+    match gateway.peer_keys().await {
+        Ok(keys) => {
+            // Read under the lock, then released: the transcription below
+            // awaits the channel and takes the lock itself.
+            let unknown: Vec<WireGuardKey> = {
+                let registry = service.registry.lock().await;
+                keys.into_iter()
+                    .filter(|key| registry.peer(key).is_none())
+                    .collect()
+            };
+            for key in unknown {
+                match astra::renewal::transcribe_peer(service, &key, now_unix).await {
+                    Ok(_) => report.transcribed += 1,
+                    Err(error) => tracing::warn!(
+                        peer = %key.to_base64(),
+                        %error,
+                        "peer sweep: an admitted peer could not be transcribed from the gateway"
+                    ),
+                }
+            }
+        }
+        Err(error) => tracing::warn!(
+            %error,
+            "peer sweep: the gateway's peer list could not be read; the next pass retries it"
+        ),
+    }
+
+    // Client revocations only: a gateway revocation is relayed by its own
+    // door opening, and nothing here re-signs anything.
+    let revocations: Vec<Box<EmergencyCertificateRevocation>> = {
+        let registry = service.registry.lock().await;
+        registry
+            .state()
+            .transitions
+            .iter()
+            .filter_map(|stored| match &stored.object {
+                TrustUpdateObject::CertificateRevocation(revocation)
+                    if revocation.scope == RevocationScope::Client =>
+                {
+                    Some(revocation.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    for revocation in revocations {
+        let view = match gateway.peer_state(&revocation.identity_key).await {
+            Ok(view) => view,
+            Err(error) => {
+                tracing::warn!(
+                    peer = %revocation.identity_key.to_base64(),
+                    %error,
+                    "peer sweep: the gateway state of a revoked peer could not be read; the next pass retries it"
+                );
+                continue;
+            }
+        };
+        if view.state.revoked {
+            continue;
+        }
+        match gateway.revoke(&revocation).await {
+            Ok(()) => {
+                report.relayed += 1;
+                tracing::info!(
+                    peer = %revocation.identity_key.to_base64(),
+                    "peer sweep: a recorded revocation the gateway lacked is applied on it"
+                );
+            }
+            Err(error) => tracing::warn!(
+                peer = %revocation.identity_key.to_base64(),
+                %error,
+                "peer sweep: the revocation could not be relayed to the gateway; the next pass retries it"
+            ),
+        }
+    }
+    report
+}
+
 /// The credentials an ordinary renewal may be approved by.
 ///
 /// The document is **verified** here, under the `CA-PQ` the registry already
@@ -504,9 +641,24 @@ pub(crate) async fn adopt_promoted_credentials(service: &AstraService) -> Result
 mod tests {
     use super::*;
     use aether::certificates::approval::CredentialRegistry;
-    use aether::certificates::encoding::WireGuardKey;
-    use aether::certificates::encoding::{generate_ml_dsa_87_keypair, TrustDomainId};
-    use astra::registry::{AstraState, CaPqRotation};
+    use aether::certificates::client::ClientCertificateGeneration;
+    use aether::certificates::encoding::{
+        generate_ml_dsa_87_keypair, DerCertificate, Fingerprint, Id16, MlDsa87Signature,
+        TrustDomainId, WireGuardKey,
+    };
+    use aether::certificates::gateway::pq_certificate_fingerprint;
+    use aether::certificates::revocation::{
+        EmergencyCertificateRevocation, RevocationReason, RevocationScope,
+    };
+    use aether::certificates::state::ClientCertificateState;
+    use aether::certificates::transport::{TrustUpdateObject, TrustUpdateRefusal};
+    use aether::certificates::CERTIFICATE_FORMAT_VERSION;
+    use aether::key_negotiation::{PqCertificate, PqCertificateRole, PQ_CERTIFICATE_VERSION};
+    use astra::registry::{AstraState, CaPqRotation, PeerRecord, StoredTransition};
+    use astra_channel::{
+        AstraChannelHandler, AstraStageHandler, GatewayIdentityView, PeerCertificateStateView,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     const DOMAIN: [u8; 16] = [1; 16];
     const GATEWAY: [u8; 32] = [1; 32];
@@ -800,5 +952,331 @@ mod tests {
 
         assert!(adopt_promoted_credentials(&service).await.is_err());
         assert_eq!(service.approval_credentials().epoch, 5);
+    }
+
+    const NOW: u64 = 1_000_000;
+
+    /// The gateway's peers and revocations, as its private channel serves
+    /// them. A revocation is applied the way the gateway applies it: the peer
+    /// reads back revoked from then on.
+    struct Ledger {
+        peers: tokio::sync::Mutex<Vec<(WireGuardKey, PeerCertificateStateView)>>,
+        revocations: AtomicUsize,
+    }
+
+    impl Ledger {
+        fn new(peers: Vec<(WireGuardKey, PeerCertificateStateView)>) -> Self {
+            Self {
+                peers: tokio::sync::Mutex::new(peers),
+                revocations: AtomicUsize::new(0),
+            }
+        }
+
+        fn revocations(&self) -> usize {
+            self.revocations.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AstraStageHandler for Ledger {
+        async fn stage_from_astra(
+            &self,
+            _: Box<aether::certificates::client::ClientCertificateStageAuthorization>,
+        ) -> Result<
+            Box<aether::certificates::client::GatewayCertificateStageReceipt>,
+            TrustUpdateRefusal,
+        > {
+            Err(TrustUpdateRefusal::Rejected)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AstraChannelHandler for Ledger {
+        async fn revoke(
+            &self,
+            revocation: Box<EmergencyCertificateRevocation>,
+        ) -> Result<(), TrustUpdateRefusal> {
+            self.revocations.fetch_add(1, Ordering::SeqCst);
+            let mut peers = self.peers.lock().await;
+            let (_, view) = peers
+                .iter_mut()
+                .find(|(key, _)| *key == revocation.identity_key)
+                .ok_or(TrustUpdateRefusal::Rejected)?;
+            view.state.revoked = true;
+            Ok(())
+        }
+
+        async fn distribute(
+            &self,
+            _: Box<astra_channel::TrustDistribution>,
+        ) -> Result<(), TrustUpdateRefusal> {
+            Err(TrustUpdateRefusal::Rejected)
+        }
+
+        async fn commit_recovery(
+            &self,
+            _: Box<astra_channel::RelayedStageCommit>,
+        ) -> Result<(), TrustUpdateRefusal> {
+            Err(TrustUpdateRefusal::Rejected)
+        }
+
+        async fn gateway_transition_published(
+            &self,
+            _: astra_channel::GatewayTransitionPublished,
+        ) -> Result<(), TrustUpdateRefusal> {
+            Err(TrustUpdateRefusal::Rejected)
+        }
+
+        async fn peer_keys(&self) -> Result<Vec<WireGuardKey>, TrustUpdateRefusal> {
+            Ok(self
+                .peers
+                .lock()
+                .await
+                .iter()
+                .map(|(key, _)| *key)
+                .collect())
+        }
+
+        async fn gateway_identity(&self) -> Result<GatewayIdentityView, TrustUpdateRefusal> {
+            Err(TrustUpdateRefusal::Rejected)
+        }
+
+        async fn peer_state(
+            &self,
+            identity: &WireGuardKey,
+        ) -> Result<PeerCertificateStateView, TrustUpdateRefusal> {
+            self.peers
+                .lock()
+                .await
+                .iter()
+                .find(|(key, _)| key == identity)
+                .map(|(_, view)| view.clone())
+                .ok_or(TrustUpdateRefusal::Rejected)
+        }
+    }
+
+    /// The ledger on a loopback port, dialed the way `astra run` dials its
+    /// gateway: the channel identities are the ones `astra` creates.
+    async fn ledger_channel(
+        dir: &Path,
+        ledger: Arc<Ledger>,
+    ) -> (astra::gateway::GatewayChannel, tokio::task::JoinHandle<()>) {
+        let astra_certificate = astra::gateway::initialize(dir, false).expect("Astra identity");
+        let mut params =
+            rcgen::CertificateParams::new(vec![astra_channel::INTERNAL_SERVER_NAME.to_string()])
+                .expect("parameters");
+        params.is_ca = rcgen::IsCa::NoCa;
+        params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        params.not_before = time::OffsetDateTime::now_utc() - time::Duration::minutes(5);
+        params.not_after = time::OffsetDateTime::now_utc() + time::Duration::days(1);
+        let key = rcgen::KeyPair::generate().expect("gateway TLS key");
+        let certificate = params.self_signed(&key).expect("gateway certificate");
+        let gateway_certificate =
+            DerCertificate::new(certificate.der().to_vec()).expect("DER certificate");
+        let identity = astra_channel::ChannelIdentity {
+            certificate_der: gateway_certificate.as_bytes().to_vec(),
+            private_key_der: key.serialize_der(),
+        };
+        let config =
+            astra_channel::server_config(&identity, &astra_certificate).expect("pinned server");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback port");
+        let address = listener.local_addr().expect("address");
+        drop(listener);
+        let server = tokio::spawn(async move {
+            let _ = astra_channel::serve(
+                address,
+                config,
+                astra_channel::router(ledger),
+                astra_channel::INTERNAL_PREFIX,
+            )
+            .await;
+        });
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(address).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let channel = astra::gateway::GatewayChannel::open(dir, address, &gateway_certificate)
+            .expect("mutually pinned client");
+        (channel, server)
+    }
+
+    /// A peer the gateway admitted: its key, and the view it serves. The leaf
+    /// names the key and its fingerprint is the active one's.
+    fn admitted(name: &str, seed: u8) -> (WireGuardKey, PeerCertificateStateView) {
+        use base64::Engine as _;
+        let key = WireGuardKey::from_bytes([seed; 32]);
+        let (ca_private, _) =
+            aether::key_negotiation::generate_ml_dsa_87_keypair().expect("keygen");
+        let (_, subject_public) =
+            aether::key_negotiation::generate_ml_dsa_87_keypair().expect("keygen");
+        let leaf = aether::key_negotiation::issue_pq_certificate(
+            PqCertificate {
+                version: PQ_CERTIFICATE_VERSION,
+                serial: [seed; 16],
+                subject: name.into(),
+                issuer: "CA-PQ".into(),
+                role: PqCertificateRole::Client,
+                wireguard_public_key: key.to_base64(),
+                ml_dsa_87_public_key: base64::engine::general_purpose::STANDARD
+                    .encode(&subject_public),
+                not_before_unix: 0,
+                not_after_unix: NOW * 2,
+                ml_dsa_87_signature: String::new(),
+            },
+            &ca_private,
+        )
+        .expect("signed leaf");
+        let active = ClientCertificateGeneration {
+            generation: 4,
+            ca_tls_epoch: 1,
+            tls_ca_certificate_fingerprint: Fingerprint::of(b"client tls ca"),
+            tls_certificate_fingerprint: Fingerprint::of(&[seed, 1]),
+            pq_certificate_fingerprint: pq_certificate_fingerprint(&leaf).expect("fingerprint"),
+            not_before: 0,
+            not_after: NOW * 2,
+        };
+        (
+            key,
+            PeerCertificateStateView {
+                name: name.into(),
+                state: ClientCertificateState::new(active),
+                active_pq_certificate: leaf,
+                admission_pq_ca: None,
+            },
+        )
+    }
+
+    /// The registry's record of a peer the gateway served.
+    fn record_of(view: &PeerCertificateStateView, key: WireGuardKey) -> PeerRecord {
+        PeerRecord {
+            name: view.name.clone(),
+            client_wg_public_key: key,
+            active: view.state.active.clone(),
+            active_pq_certificate: view.active_pq_certificate.clone(),
+            pending: None,
+            revoked: false,
+            revocation_epoch: 0,
+            admission_pq_ca: None,
+        }
+    }
+
+    /// A client revocation as the signer would have produced it. The sweep
+    /// does not verify the signature: the gateway does.
+    fn client_revocation(seed: u8) -> EmergencyCertificateRevocation {
+        EmergencyCertificateRevocation {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            trust_domain_id: TrustDomainId::new(DOMAIN).expect("domain"),
+            ca_epoch: 1,
+            scope: RevocationScope::Client,
+            identity_key: WireGuardKey::from_bytes([seed; 32]),
+            server_name: None,
+            revocation_epoch: 1,
+            revoked_tls_fingerprint: None,
+            revoked_tls_not_after: Some(NOW * 2),
+            revoked_pq_fingerprint: None,
+            revoked_pq_not_after: Some(NOW * 2),
+            effective_at: NOW,
+            reason: RevocationReason::KeyCompromise,
+            replacement_transition_fingerprint: None,
+            ca_signature: MlDsa87Signature::placeholder(),
+        }
+    }
+
+    /// Stores a recorded revocation the way an approved campaign leaves it.
+    fn record_revocation(service: &mut AstraService, revocation: EmergencyCertificateRevocation) {
+        let registry = service.registry.get_mut();
+        let mut state = registry.state().clone();
+        state.transitions.push(StoredTransition {
+            campaign_id: Id16::new([5; 16]).expect("campaign"),
+            accepted_at: NOW,
+            published: false,
+            object: TrustUpdateObject::CertificateRevocation(Box::new(revocation)),
+            credential_registry: None,
+        });
+        *registry = AstraRegistry::new(service.state_dir.join(REGISTRY_FILE), state);
+    }
+
+    fn authority(dir: &Path) -> AstraService {
+        let (_, ca_public) = generate_ml_dsa_87_keypair().expect("keygen");
+        service(dir, ca_public, 1, None, None)
+    }
+
+    #[tokio::test]
+    async fn the_sweep_transcribes_a_peer_astra_never_saw() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let mut service = authority(directory.path());
+        let (known_key, known) = admitted("workstation", 2);
+        service
+            .registry
+            .get_mut()
+            .admit(record_of(&known, known_key), NOW)
+            .expect("admitted");
+        let (unknown_key, unknown) = admitted("laptop", 3);
+        let (channel, _server) = ledger_channel(
+            directory.path(),
+            Arc::new(Ledger::new(vec![
+                (known_key, known),
+                (unknown_key, unknown),
+            ])),
+        )
+        .await;
+        service.gateway = Some(channel);
+        let service = Arc::new(service);
+
+        let report = sweep_peers(&service, NOW).await;
+
+        assert_eq!(
+            report,
+            SweepReport {
+                transcribed: 1,
+                relayed: 0
+            }
+        );
+        let registry = service.registry.lock().await;
+        assert!(registry.peer(&known_key).is_some());
+        assert!(registry.peer(&unknown_key).is_some());
+    }
+
+    #[tokio::test]
+    async fn the_sweep_relays_a_recorded_revocation_the_gateway_lacks() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let mut service = authority(directory.path());
+        let (key, peer) = admitted("workstation", 2);
+        service
+            .registry
+            .get_mut()
+            .admit(record_of(&peer, key), NOW)
+            .expect("admitted");
+        record_revocation(&mut service, client_revocation(2));
+        let ledger = Arc::new(Ledger::new(vec![(key, peer)]));
+        let (channel, _server) = ledger_channel(directory.path(), ledger.clone()).await;
+        service.gateway = Some(channel);
+        let service = Arc::new(service);
+
+        let first = sweep_peers(&service, NOW).await;
+        assert_eq!(
+            first,
+            SweepReport {
+                transcribed: 0,
+                relayed: 1
+            }
+        );
+        assert_eq!(ledger.revocations(), 1);
+
+        // The gateway reads back revoked now: the next pass sends nothing.
+        let second = sweep_peers(&service, NOW + 60).await;
+        assert_eq!(
+            second,
+            SweepReport {
+                transcribed: 0,
+                relayed: 0
+            }
+        );
+        assert_eq!(ledger.revocations(), 1);
     }
 }

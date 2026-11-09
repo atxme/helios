@@ -19,8 +19,8 @@ use super::*;
 ///
 /// Without a channel this is exactly the old behaviour — an unknown peer stays
 /// unknown, and the renewal is refused by name.
-pub(crate) async fn transcribe_peer(
-    service: &Arc<AstraService>,
+pub async fn transcribe_peer(
+    service: &AstraService,
     caller: &WireGuardKey,
     now_unix: u64,
 ) -> Result<astra_channel::PeerCertificateStateView, RenewalError> {
