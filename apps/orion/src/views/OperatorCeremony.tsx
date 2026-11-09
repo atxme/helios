@@ -600,6 +600,27 @@ export function refusalSentence(
     case 'overlap_running':
       // On this machine's clock, which the row's gateway clock may be ahead of.
       return `Recouvrement jusqu’au ${formatDateTime(refusal.until)}. Rien n’a été modifié.`
+    case 'peer_name_mismatch':
+      return 'Ce nom ne désigne pas ce poste sur la gateway. Rien n’a été coupé.'
+    case 'self_revocation':
+      return 'Ce poste ne peut pas se révoquer lui-même : utiliser `helios peer revoke <nom>` sur la gateway.'
+    case 'revocation_awaits_deposit':
+      return 'Une révocation attend son dépôt : la reprendre d’abord.'
+    case 'revocation_not_before':
+      // Signing is refused until the margin: the cut has already happened.
+      return `Révocation possible après le ${formatDateTime(refusal.until)}. Le poste est coupé ; la révocation reste à signer.`
+    case 'revocation_anchor_unknown':
+      return 'Astra vérifie sous une ancre que ce coffre ne détient pas. Le poste est coupé ; la révocation reste à signer.'
+    case 'credentials_unverified':
+      return 'Le document de credentials ne se vérifie pas sous l’ancre à signer. Le poste est coupé ; la révocation reste à signer.'
+    case 'campaign_mismatch':
+      return 'La campagne d’Astra ne nomme pas ce poste. Le poste est coupé ; la révocation reste à signer.'
+    case 'peer_already_revoked':
+      return 'Poste déjà révoqué.'
+    case 'outgoing_ca_pq_kept':
+      return `L’ancienne CA-PQ est gardée jusqu’au ${formatDateTime(refusal.until)} : « Terminer » attendra. Rien n’a été modifié.`
+    case 'authority_unreachable':
+      return 'Astra injoignable. Le poste est coupé ; la révocation reste à signer.'
     case 'internal':
       return 'Le processus opérateur s’est arrêté sans conclure.'
   }

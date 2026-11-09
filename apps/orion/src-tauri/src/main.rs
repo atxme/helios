@@ -775,6 +775,7 @@ fn main() {
             begin_vault_ceremony,
             begin_issuer_ceremony,
             begin_rotation_ceremony,
+            begin_revocation_ceremony,
             approve_rotation_ceremony,
             rename_operator_key,
             write_domain_relay,

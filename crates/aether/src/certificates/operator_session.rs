@@ -443,6 +443,29 @@ pub enum Refusal {
     /// The client TLS overlap runs until `until`, on this machine's clock: the
     /// gateway still requires the outgoing generation. Nothing was modified.
     OverlapRunning { until: u64 },
+    /// The workstation named by the revocation is not the key the gesture means: the
+    /// gateway binds that name to another key, or does not admit it. Nothing was cut.
+    PeerNameMismatch,
+    /// The workstation to revoke is this one: revoking it would cut the console itself.
+    /// Refused before anything is cut.
+    SelfRevocation,
+    /// Another revocation waits for its deposit: it must be finished first.
+    RevocationAwaitsDeposit,
+    /// The outgoing `CA-PQ` may sign a revocation only until this second, the margin
+    /// before its retirement.
+    RevocationNotBefore { until: u64 },
+    /// Astra verifies the revocation under an anchor this vault does not hold.
+    RevocationAnchorUnknown,
+    /// The credential document does not verify under the anchor the revocation signs.
+    CredentialsUnverified,
+    /// The campaign does not name the workstation the operator chose.
+    CampaignMismatch,
+    /// Astra already holds the workstation as revoked.
+    PeerAlreadyRevoked,
+    /// The outgoing `CA-PQ` is kept until this second: « Terminer » is refused before it.
+    OutgoingCaPqKept { until: u64 },
+    /// Astra did not answer through the gateway.
+    AuthorityUnreachable,
     /// Anything the ceremony could not classify. Deliberately last and
     /// deliberately opaque: an unclassified failure must not become a channel
     /// for text.
@@ -968,6 +991,39 @@ mod tests {
         );
         assert!(!status.gesture.is_terminal());
         assert!(status.accepts(OperatorAction::Continue, 4));
+    }
+
+    #[test]
+    fn the_revocation_refusals_carry_no_text() {
+        for (refusal, wire) in [
+            (Refusal::PeerNameMismatch, "peer_name_mismatch"),
+            (Refusal::SelfRevocation, "self_revocation"),
+            (
+                Refusal::RevocationAwaitsDeposit,
+                "revocation_awaits_deposit",
+            ),
+            (
+                Refusal::RevocationAnchorUnknown,
+                "revocation_anchor_unknown",
+            ),
+            (Refusal::CredentialsUnverified, "credentials_unverified"),
+            (Refusal::CampaignMismatch, "campaign_mismatch"),
+            (Refusal::PeerAlreadyRevoked, "peer_already_revoked"),
+            (Refusal::AuthorityUnreachable, "authority_unreachable"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(refusal).expect("refusal"),
+                serde_json::json!({ "refusal": wire })
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(Refusal::RevocationNotBefore { until: 9 }).expect("refusal"),
+            serde_json::json!({ "refusal": "revocation_not_before", "until": 9 })
+        );
+        assert_eq!(
+            serde_json::to_value(Refusal::OutgoingCaPqKept { until: 9 }).expect("refusal"),
+            serde_json::json!({ "refusal": "outgoing_ca_pq_kept", "until": 9 })
+        );
     }
 
     #[test]

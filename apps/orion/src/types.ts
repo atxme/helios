@@ -696,6 +696,16 @@ export type Refusal =
   | { refusal: 'terms_refused' }
   | { refusal: 'nothing_to_finish' }
   | { refusal: 'overlap_running'; until: number }
+  | { refusal: 'peer_name_mismatch' }
+  | { refusal: 'self_revocation' }
+  | { refusal: 'revocation_awaits_deposit' }
+  | { refusal: 'revocation_not_before'; until: number }
+  | { refusal: 'revocation_anchor_unknown' }
+  | { refusal: 'credentials_unverified' }
+  | { refusal: 'campaign_mismatch' }
+  | { refusal: 'peer_already_revoked' }
+  | { refusal: 'outgoing_ca_pq_kept'; until: number }
+  | { refusal: 'authority_unreachable' }
   | { refusal: 'internal' }
 
 export interface RecoveryManifest {

@@ -36,9 +36,12 @@ use astra_operator::vault::AuthorityVault;
 use super::{dialog_owner, now_unix, ArtifactEncoding, EnrollmentGesture, OperatorArtifact};
 
 mod issuer;
+mod revocation;
 mod rotation;
 mod vault;
+mod wait;
 pub use issuer::run_issuer;
+pub use revocation::run_revocation;
 pub use rotation::run_rotation;
 pub use vault::run_vault;
 
@@ -91,7 +94,8 @@ pub fn run(
         | OperationKind::IssueGatewayBootstrap
         | OperationKind::AuthorizeIssuer
         | OperationKind::RotateAnchor
-        | OperationKind::RotateClientTlsCa => {
+        | OperationKind::RotateClientTlsCa
+        | OperationKind::RevokeCertificate => {
             ceremony.refuse(Refusal::Internal);
             publish(ceremony.status());
             Err(format!(

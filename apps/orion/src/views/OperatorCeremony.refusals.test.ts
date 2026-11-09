@@ -215,3 +215,27 @@ describe('the words of a rotation', () => {
     expect(retryLabel({ refusal: 'foreground_unavailable' }, validating)).toMatch(/Windows/)
   })
 })
+
+describe('refusalSentence for the revocation', () => {
+  it('a_self_revocation_is_refused_with_the_command_that_does_it', () => {
+    expect(refusalSentence({ refusal: 'self_revocation' }, null, 'revoke_certificate')).toBe(
+      'Ce poste ne peut pas se révoquer lui-même : utiliser `helios peer revoke <nom>` sur la gateway.',
+    )
+  })
+
+  it('a_revocation_not_yet_signable_names_its_date_and_leaves_the_cut_standing', () => {
+    const sentence = refusalSentence(
+      { refusal: 'revocation_not_before', until: 1_800_000_000 },
+      null,
+      'revoke_certificate',
+    )
+    expect(sentence).toMatch(/^Révocation possible après le .*2027/)
+    expect(sentence).toMatch(/Le poste est coupé ; la révocation reste à signer\.$/)
+  })
+
+  it('astra_unreachable_after_the_cut_says_the_revocation_is_still_to_sign', () => {
+    expect(refusalSentence({ refusal: 'authority_unreachable' }, null, 'revoke_certificate')).toBe(
+      'Astra injoignable. Le poste est coupé ; la révocation reste à signer.',
+    )
+  })
+})

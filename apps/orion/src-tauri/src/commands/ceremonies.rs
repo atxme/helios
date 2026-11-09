@@ -167,6 +167,22 @@ pub(crate) async fn begin_rotation_ceremony(
         .await
 }
 
+/// Opens a revocation gesture: cutting a workstation at the gateway, then its campaign,
+/// or resuming one already cut. The gateway is the connected profile's, read here from
+/// the engine; without one the gesture stops before any cut.
+#[tauri::command]
+pub(crate) async fn begin_revocation_ceremony(
+    state: State<'_, AppState>,
+    gesture: crate::operator::RevocationGesture,
+) -> Result<aether::certificates::operator_session::OperatorStatus, String> {
+    let vault_path = state.vault_location.path()?;
+    let gateway = connected_target(&state).await.ok();
+    state
+        .operator
+        .begin_revocation(gesture, gateway, vault_path)
+        .await
+}
+
 /// Answers the approval screen of a rotation, against the status the operator saw:
 /// this is what opens its campaign.
 #[tauri::command]
@@ -219,7 +235,7 @@ pub(crate) async fn adopt_connected_gateway(state: State<'_, AppState>) -> Resul
 
     ensure_no_open_ceremony(&state).await?;
     let vault_path = state.vault_location.path()?;
-    let (base, tunnel_peer_key) = connected_profile(&state).await?;
+    let (base, tunnel_peer_key, _) = connected_profile(&state).await?;
     let client = admin::orion_client().map_err(|error| error.to_string())?;
     let material = admin::gateway_negotiation(&client, &base)
         .await
@@ -715,7 +731,7 @@ const NO_CONNECTED_GATEWAY: &str = "Connectez d'abord le profil de la gateway, a
 /// and a gateway reached any other way would not be the one the operator
 /// connected to.
 async fn connected_gateway(state: &AppState) -> Result<String, String> {
-    connected_profile(state).await.map(|(url, _)| url)
+    connected_profile(state).await.map(|(url, _, _)| url)
 }
 
 /// [`connected_gateway`] and the peer key, as the gateway a rotation may be carried to.
@@ -724,12 +740,18 @@ pub(crate) async fn connected_target(
 ) -> Result<crate::operator::GatewayTarget, String> {
     connected_profile(state)
         .await
-        .map(|(address, peer_key)| crate::operator::GatewayTarget { address, peer_key })
+        .map(
+            |(address, peer_key, own_key)| crate::operator::GatewayTarget {
+                address,
+                peer_key,
+                own_key,
+            },
+        )
 }
 
-/// [`connected_gateway`], with the peer key of the connected profile read
-/// from the same answer of the engine.
-async fn connected_profile(state: &AppState) -> Result<(String, String), String> {
+/// [`connected_gateway`], with the peer key of the connected profile and this
+/// workstation's own key, both read from the same answer of the engine.
+async fn connected_profile(state: &AppState) -> Result<(String, String, Option<String>), String> {
     let tunnel = match state.client.call(EngineCommand::GetState).await? {
         EngineReply::State(value) => value,
         _ => return Err(unexpected_engine_reply()),
@@ -738,8 +760,10 @@ async fn connected_profile(state: &AppState) -> Result<(String, String), String>
         EngineReply::Config(value) => value,
         _ => return Err(unexpected_engine_reply()),
     };
-    gateway_profile(&tunnel, &view)
-        .map(|(url, profile)| (url, profile.peer_public_key.trim().to_string()))
+    let (url, profile) = gateway_profile(&tunnel, &view)?;
+    let peer_key = profile.peer_public_key.trim().to_string();
+    let own_key = crate::operator::peers::own_key_of(&view, Some(&url));
+    Ok((url, peer_key, own_key))
 }
 
 /// The decision of [`connected_gateway`], on what the engine answered: the

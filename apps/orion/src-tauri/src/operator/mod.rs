@@ -416,6 +416,8 @@ pub enum RotationGesture {
     ReplaceCaTls,
     /// Ends a client TLS rotation past `not_after`, with one key.
     FinishCaTls,
+    /// Ends a CA-PQ rotation: destroys the outgoing `CA-PQ` kept for the overlap, with one key.
+    FinishCaPq,
     /// Carries a signed rotation as far as it goes, with no key.
     Resume,
 }
@@ -424,9 +426,66 @@ impl RotationGesture {
     /// `Resume` names what it found once it has read the journal.
     fn operation(self) -> OperationKind {
         match self {
-            Self::ReplaceCaPq | Self::Resume => OperationKind::RotateAnchor,
+            Self::ReplaceCaPq | Self::FinishCaPq | Self::Resume => OperationKind::RotateAnchor,
             Self::ReplaceCaTls | Self::FinishCaTls => OperationKind::RotateClientTlsCa,
         }
+    }
+}
+
+/// A revocation gesture, as the WebView names it.
+///
+/// Closed like the others: the workstation is named by its WireGuard key and by the
+/// name the gateway admitted it under, and nothing else crosses. The Astra campaign,
+/// the approvals and the signature come from the ceremony, never from the page.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "gesture", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RevocationGesture {
+    /// Cuts the workstation at the gateway, then opens, approves, signs and deposits.
+    Revoke {
+        /// The workstation's WireGuard public key, base64.
+        peer: String,
+        /// The name the gateway admitted the workstation under.
+        name: String,
+        reason: astra_operator::operations::revocation::RevocationReasonChoice,
+    },
+    /// Already cut: deposits the decision on record for it, or opens a new one.
+    Resume {
+        peer: String,
+        reason: astra_operator::operations::revocation::RevocationReasonChoice,
+    },
+}
+
+/// The longest name a gateway admits a workstation under, in characters.
+const MAX_PEER_NAME_CHARS: usize = 64;
+
+impl RevocationGesture {
+    /// Refuses what no ceremony should be opened for.
+    fn validate(&self) -> Result<(), String> {
+        use aether::certificates::encoding::WireGuardKey;
+
+        if WireGuardKey::parse(self.peer().trim()).is_err() {
+            return Err("la clé du poste est une clé WireGuard en base64".to_string());
+        }
+        if let Self::Revoke { name, .. } = self {
+            let name = name.trim();
+            if name.is_empty() || name.chars().count() > MAX_PEER_NAME_CHARS {
+                return Err(format!(
+                    "le nom du poste tient en 1 à {MAX_PEER_NAME_CHARS} caractères"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The workstation's key, as the page named it.
+    fn peer(&self) -> &str {
+        match self {
+            Self::Revoke { peer, .. } | Self::Resume { peer, .. } => peer,
+        }
+    }
+
+    fn operation(&self) -> OperationKind {
+        OperationKind::RevokeCertificate
     }
 }
 
@@ -555,6 +614,9 @@ impl TunnelWatch {
 pub struct GatewayTarget {
     pub address: String,
     pub peer_key: String,
+    /// This workstation's own WireGuard public key, from the connected profile, when
+    /// the profile is the one the tunnel leads by. A revocation refuses to cut it.
+    pub own_key: Option<String>,
 }
 
 /// Whether the relay beside the vault names `peer_key` as the domain's gateway.
@@ -725,6 +787,26 @@ impl OperatorCeremony {
                 ceremony::run_rotation(session_id, gesture, gateway, presses, publish, &vault_path)
             },
         )
+        .await
+    }
+
+    /// Starts a revocation gesture the same way, under the same rule of one ceremony at
+    /// a time.
+    ///
+    /// `gateway` is the control-plane address of the connected profile, with its key and
+    /// this workstation's, read by the caller: a revocation cuts the admission at that
+    /// gateway, and refuses to cut the workstation the tunnel runs on.
+    pub async fn begin_revocation(
+        &self,
+        gesture: RevocationGesture,
+        gateway: Option<GatewayTarget>,
+        vault_path: PathBuf,
+    ) -> Result<OperatorStatus, String> {
+        gesture.validate()?;
+        let kind = gesture.operation();
+        self.open(kind, move |session_id, presses, publish, _artifacts| {
+            ceremony::run_revocation(session_id, gesture, gateway, presses, publish, &vault_path)
+        })
         .await
     }
 

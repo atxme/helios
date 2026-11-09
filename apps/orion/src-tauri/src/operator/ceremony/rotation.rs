@@ -12,14 +12,14 @@
 //! every way out of a ceremony erases it, abandoned, failed, finished, or idle for
 //! [`VALIDATION_IDLE_SECS`]. No status carries more than a label.
 
+use std::ops::{Deref, DerefMut};
 use std::path::Path;
-use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
-use std::time::{Duration, Instant};
+use std::sync::mpsc::Receiver;
 
 use aether::certificates::encoding::Id16;
 use aether::certificates::operator_session::{
     AstraManifest, GestureState, KeyPurpose, KeySlotLabel, OperationKind, OperationLocator,
-    OperatorAction, OperatorStatus, Refusal, RemoteState,
+    OperatorStatus, Refusal, RemoteState,
 };
 use aether_fido::authenticator::Authenticator;
 use astra_operator::operations::rotation::{
@@ -30,18 +30,14 @@ use astra_operator::rotation_journal::{
     self, JournalStage, ResumeStep, RotationJournal, RotationKind,
 };
 use astra_operator::tunnel::{self, Tunnel, TunnelRefusal};
+use astra_operator::vault::VaultError;
 
+use super::wait::{answers_the_terms, Ended, Step, Waiting};
 use super::{connect_key, now_unix, Ceremony, Press};
 use crate::operator::{relay_names_peer, GatewayTarget, RotationGesture};
 
 /// Said when the tunnel leads to a gateway the domain's relay does not name.
 const WRONG_GATEWAY: &str = "la gateway jointe n'est pas celle que le relais du domaine désigne";
-
-/// How long an opening is kept for an operator who answers nothing.
-pub const VALIDATION_IDLE_SECS: u64 = 300;
-
-/// How often a wait looks at the clock: nothing else would end it, with no press.
-const WAIT_TICK: Duration = Duration::from_secs(1);
 
 /// A rotation takes two distinct keys, each touched once to validate and once to
 /// approve.
@@ -74,10 +70,12 @@ pub fn run_rotation(
         .and_then(|target| {
             // Before any call: a resumption reads the status of whatever authority
             // answers, and sends the sealed vault to whatever gateway it reaches.
-            // « Terminer » too: it sends the vault copy at its end.
+            // « Terminer », of either kind: each sends the vault copy at its end.
             if matches!(
                 gesture,
-                RotationGesture::Resume | RotationGesture::FinishCaTls
+                RotationGesture::Resume
+                    | RotationGesture::FinishCaTls
+                    | RotationGesture::FinishCaPq
             ) && !relay_names_peer(vault_path, &target.peer_key).unwrap_or(false)
             {
                 return Err(WRONG_GATEWAY.to_string());
@@ -112,34 +110,11 @@ struct Reach<'a> {
     now: &'a dyn Fn() -> u64,
 }
 
-/// How long one wait for the operator may last.
-///
-/// Both clocks count: the wall clock goes on through a machine asleep, and the
-/// monotonic one is not fooled by a wall clock set back.
-struct Patience {
-    since: u64,
-    started: Instant,
-    /// The end of the campaign being approved, when one is open.
-    until: Option<u64>,
-}
-
-impl Patience {
-    /// When the wait ends if nobody answers: the idle bound, or the campaign's end.
-    fn ends_at(&self) -> u64 {
-        let idle = self.since.saturating_add(VALIDATION_IDLE_SECS);
-        self.until.map_or(idle, |until| idle.min(until))
-    }
-
-    fn is_over(&self, now: u64) -> bool {
-        now.saturating_sub(self.since) >= VALIDATION_IDLE_SECS
-            || self.started.elapsed() >= Duration::from_secs(VALIDATION_IDLE_SECS)
-            || self.until.is_some_and(|until| now >= until)
-    }
-}
-
 enum Held {
     Nothing,
-    Keys(ValidatedKeys),
+    /// Boxed: the validated keys are the largest variant by far, and every held opening
+    /// lives in this enum.
+    Keys(Box<ValidatedKeys>),
     Campaign(Box<OpenedRotation>),
 }
 
@@ -170,21 +145,25 @@ impl Openings {
     }
 }
 
-/// A ceremony over before the end of its steps, already published as such.
-struct Ended(Result<(), String>);
-
-type Step<T> = Result<T, Ended>;
-
 struct RotationRun<'a> {
-    ceremony: &'a mut Ceremony,
-    presses: &'a Receiver<Press>,
-    publish: &'a mut dyn FnMut(OperatorStatus),
+    wait: Waiting<'a>,
     vault_path: &'a Path,
     reach: &'a Reach<'a>,
     openings: Openings,
-    until: Option<u64>,
-    /// When the operator was last shown to be there, on both clocks.
-    last_seen: Option<(u64, Instant)>,
+}
+
+impl<'a> Deref for RotationRun<'a> {
+    type Target = Waiting<'a>;
+
+    fn deref(&self) -> &Waiting<'a> {
+        &self.wait
+    }
+}
+
+impl DerefMut for RotationRun<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.wait
+    }
 }
 
 impl RotationRun<'_> {
@@ -196,14 +175,10 @@ impl RotationRun<'_> {
         reach: &'a Reach<'a>,
     ) -> RotationRun<'a> {
         RotationRun {
-            ceremony,
-            presses,
-            publish,
+            wait: Waiting::new(ceremony, presses, publish, reach.connect, reach.now),
             vault_path,
             reach,
             openings: Openings::none(),
-            until: None,
-            last_seen: None,
         }
     }
 
@@ -212,8 +187,11 @@ impl RotationRun<'_> {
             RotationGesture::ReplaceCaPq => self.replace(RotationKind::CaPq),
             RotationGesture::ReplaceCaTls => self.replace(RotationKind::CaTls),
             RotationGesture::FinishCaTls => self.finish_ca_tls(),
+            RotationGesture::FinishCaPq => self.finish_ca_pq(),
             RotationGesture::Resume => self.resume(),
         };
+        // Every exit of the ceremony erases what it held, whatever the step ended with.
+        self.openings.erase();
         match stepped {
             Ok(()) => Ok(()),
             Err(Ended(end)) => end,
@@ -228,7 +206,7 @@ impl RotationRun<'_> {
             .map_err(|error| self.refuse(Refusal::VaultUnavailable, format!("{error:#}")))?;
         keys.ensure_domain_readable(vault_path, kind)
             .map_err(|error| self.refuse(Refusal::HandoffMismatch, format!("{error:#}")))?;
-        self.openings.held = Held::Keys(keys);
+        self.openings.held = Held::Keys(Box::new(keys));
 
         self.validate_keys()?;
         let terms = self.await_terms(kind)?;
@@ -297,7 +275,7 @@ impl RotationRun<'_> {
         let Held::Keys(keys) = self.openings.take() else {
             return Err(self.nothing_held());
         };
-        let opened = rotation::open(self.reach.remote, self.vault_path, kind, keys, terms, now)
+        let opened = rotation::open(self.reach.remote, self.vault_path, kind, *keys, terms, now)
             .map_err(|error| self.refuse(refusal_of_open(&error), format!("{error:#}")))?;
         self.ceremony.remote = RemoteState::AwaitingOperator;
         self.ceremony.operation_id = Some(opened.operation_id());
@@ -360,6 +338,62 @@ impl RotationRun<'_> {
         }
         self.show();
         Ok(journal)
+    }
+
+    /// « Terminer » a CA-PQ rotation: one key destroys the outgoing `CA-PQ` in one sealed
+    /// write, and the copy of the vault goes to Astra as after any key gesture.
+    fn finish_ca_pq(&mut self) -> Step<()> {
+        let vault_path = self.vault_path;
+        rotation_journal::ensure_none_in_flight(vault_path)
+            .map_err(|error| self.refuse(Refusal::RotationInFlight, format!("{error:#}")))?;
+        let mut vault = astra_operator::store::load(vault_path)
+            .map_err(|error| self.refuse(Refusal::VaultUnavailable, format!("{error:#}")))?;
+        // Read before any key: what it would refuse costs no touch.
+        let Some((_, _, not_after)) = vault.retained_outgoing_ca_pq_public() else {
+            return Err(self.refuse(
+                Refusal::NothingToFinish,
+                "aucune CA-PQ sortante n'est gardée".to_string(),
+            ));
+        };
+        let now = self.now();
+        if now < not_after {
+            return Err(self.refuse(
+                Refusal::OutgoingCaPqKept { until: not_after },
+                "la CA-PQ sortante est gardée jusqu'à son échéance".to_string(),
+            ));
+        }
+        let opening = loop {
+            let key = self.ask_key(1, 1, KeyPurpose::Promotion)?;
+            match astra_operator::gestures::open_with_authorized_key(key.as_ref(), &vault, "") {
+                Ok(opening) => break opening,
+                Err(_) => self.turned_down(KeyStep::Declined)?,
+            }
+        };
+        self.honour_cancel()?;
+        self.ceremony.key_retry = None;
+        self.ceremony.gesture = GestureState::Signing;
+        self.ceremony.idle_until = None;
+        self.show();
+
+        let now = self.now();
+        vault
+            .retire_outgoing_ca_pq(&opening, now)
+            .map_err(|error| {
+                let refusal = match error {
+                    VaultError::OutgoingCaPqKept { at } => Refusal::OutgoingCaPqKept { until: at },
+                    _ => Refusal::Internal,
+                };
+                self.refuse(refusal, error.to_string())
+            })?;
+        astra_operator::store::save(vault_path, &vault)
+            .map_err(|error| self.refuse(Refusal::VaultUnavailable, format!("{error:#}")))?;
+        // Wiped before the copy, a network call nothing in it is needed for. A copy that
+        // fails undoes nothing: the screen offers to send it again (spec §5.9).
+        drop(opening);
+        let _ = rotation::vault_copy(vault_path)
+            .and_then(|copy| self.reach.remote.send_vault_copy(&copy));
+        self.done();
+        Ok(())
     }
 
     /// Carries a signed rotation as far as it goes. Asks no key: everything from here
@@ -445,181 +479,6 @@ impl RotationRun<'_> {
             }
         }
     }
-
-    /// Offers a key and connects it once the operator presses. A key out of reach
-    /// costs nothing that was already validated, so it asks again rather than ending.
-    fn ask_key(&mut self, index: u8, of: u8, purpose: KeyPurpose) -> Step<Box<dyn Authenticator>> {
-        loop {
-            self.honour_cancel()?;
-            self.ceremony.gesture = GestureState::AwaitingKey { index, of, purpose };
-            let patience = self.patience();
-            self.ceremony.idle_until = Some(patience.ends_at());
-            let offered = self.show();
-            let press = self.await_press(&offered, &patience, answers_the_screen)?;
-
-            self.ceremony.key_retry = None;
-            self.ceremony.gesture = GestureState::ProcessingKey { index, of };
-            self.show();
-            match (self.reach.connect)(press.owner) {
-                Ok(key) => return Ok(key),
-                Err((
-                    refusal @ (Refusal::KeyDeclined | Refusal::ForegroundUnavailable),
-                    message,
-                )) => {
-                    tracing::warn!(error = %message, "clé de sécurité injoignable");
-                    self.ceremony.key_retry = Some(refusal);
-                }
-                Err((refusal, message)) => return Err(self.refuse(refusal, message)),
-            }
-        }
-    }
-
-    /// A key that answered and cannot be used is asked for again, except once the
-    /// campaign is dead, which no key changes.
-    fn turned_down(&mut self, step: KeyStep) -> Step<()> {
-        let retry = match step {
-            KeyStep::NotEnrolled => Refusal::KeyNotEnrolled,
-            KeyStep::NotApprovable => Refusal::SignerRevoked,
-            KeyStep::Repeated => Refusal::KeyRepeated,
-            KeyStep::NotValidated => Refusal::KeyNotValidated,
-            KeyStep::Declined => Refusal::KeyDeclined,
-            KeyStep::Expired => {
-                return Err(self.refuse(Refusal::WindowExpired, step.to_string()));
-            }
-        };
-        self.ceremony.key_retry = Some(retry);
-        Ok(())
-    }
-
-    /// Reads what came in while this thread was busy, before the screen it was busy on
-    /// is left. That screen offered Cancel, and the next one has a revision of its own
-    /// that would lose it. Run before anything is published: the revision is that
-    /// screen's. Anything else in the queue answers a screen already gone.
-    fn honour_cancel(&mut self) -> Step<()> {
-        let left = self.ceremony.revision;
-        loop {
-            match self.presses.try_recv() {
-                Ok(press) if press.action == OperatorAction::Cancel && press.revision == left => {
-                    return Err(self.cancel());
-                }
-                Ok(_) => {}
-                Err(TryRecvError::Empty) => return Ok(()),
-                Err(TryRecvError::Disconnected) => return Err(self.cancel()),
-            }
-        }
-    }
-
-    /// Waits for the operator's answer to one status, for as long as `patience` allows.
-    ///
-    /// A press `takes` does not want answers a screen already left, and is ignored.
-    /// Every sender gone means the window holding the ceremony was closed.
-    fn await_press(
-        &mut self,
-        offered: &OperatorStatus,
-        patience: &Patience,
-        takes: fn(&OperatorStatus, &Press) -> bool,
-    ) -> Step<Press> {
-        loop {
-            if patience.is_over(self.now()) {
-                return Err(self.expired());
-            }
-            match self.presses.recv_timeout(WAIT_TICK) {
-                Ok(press) if takes(offered, &press) => {
-                    if press.action == OperatorAction::Cancel {
-                        return Err(self.cancel());
-                    }
-                    // Past the bound, a press in the queue opens nothing.
-                    if patience.is_over(self.now()) {
-                        return Err(self.expired());
-                    }
-                    self.operator_seen();
-                    return Ok(press);
-                }
-                Ok(_) | Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => return Err(self.cancel()),
-            }
-        }
-    }
-
-    /// A press, or a touch that went through. Not a dialog that timed out nor a key
-    /// turned down, which show nobody.
-    fn operator_seen(&mut self) {
-        self.last_seen = Some((self.now(), Instant::now()));
-    }
-
-    /// Counted from when the operator was last seen rather than from this offer, so a
-    /// dialog that timed out with nobody there buys no more time. Taken before the
-    /// status it bounds is published, for the first wait, which begins as it is offered.
-    fn patience(&self) -> Patience {
-        let (since, started) = self
-            .last_seen
-            .unwrap_or_else(|| (self.now(), Instant::now()));
-        Patience {
-            since,
-            started,
-            until: self.until,
-        }
-    }
-
-    fn now(&self) -> u64 {
-        (self.reach.now)()
-    }
-
-    fn show(&mut self) -> OperatorStatus {
-        let status = self.ceremony.status();
-        (self.publish)(status.clone());
-        status
-    }
-
-    fn expired(&mut self) -> Ended {
-        self.refuse(
-            Refusal::WindowExpired,
-            "aucune réponse dans le délai : les ouvertures sont effacées".to_string(),
-        )
-    }
-
-    /// An opening a step needed was gone: this code's own contradiction.
-    fn nothing_held(&mut self) -> Ended {
-        self.refuse(
-            Refusal::Internal,
-            "aucune ouverture n'est détenue à cette étape de la cérémonie".to_string(),
-        )
-    }
-
-    fn refuse(&mut self, refusal: Refusal, message: String) -> Ended {
-        self.openings.erase();
-        self.ceremony.keys.clear();
-        self.ceremony.refuse(refusal);
-        self.show();
-        Ended(Err(message))
-    }
-
-    fn cancel(&mut self) -> Ended {
-        self.openings.erase();
-        self.ceremony.keys.clear();
-        self.ceremony.cancel();
-        self.show();
-        Ended(Ok(()))
-    }
-
-    fn done(&mut self) {
-        self.openings.erase();
-        self.ceremony.gesture = GestureState::Done;
-        self.ceremony.idle_until = None;
-        self.show();
-    }
-}
-
-fn answers_the_screen(status: &OperatorStatus, press: &Press) -> bool {
-    status.accepts(press.action, press.revision)
-}
-
-/// The approval screen offers only Cancel in `allowed`: the terms have a command of
-/// their own, which is the one way a press there carries them.
-fn answers_the_terms(status: &OperatorStatus, press: &Press) -> bool {
-    press.revision == status.revision
-        && (press.action == OperatorAction::Cancel
-            || (press.action == OperatorAction::Continue && press.terms.is_some()))
 }
 
 /// Whether the authority is known to hold the deposit: past `Signed`, except for an

@@ -10,7 +10,9 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use super::super::wait::{Patience, VALIDATION_IDLE_SECS};
 
 use aether::certificates::approval::AstraIssuancePolicy;
 use aether::certificates::authority::{CaTransition, ClientTlsCaTransition};
@@ -2517,6 +2519,7 @@ fn towards_gateway(bench: &Bench) -> crate::operator::GatewayTarget {
     crate::operator::GatewayTarget {
         address: NO_ONE_ANSWERS.into(),
         peer_key: relay.gateway_wg_public_key.expect("a gateway"),
+        own_key: None,
     }
 }
 
@@ -2525,6 +2528,7 @@ fn towards_another_gateway() -> crate::operator::GatewayTarget {
     crate::operator::GatewayTarget {
         address: NO_ONE_ANSWERS.into(),
         peer_key: WireGuardKey::from_bytes([0x77; 32]).to_base64(),
+        own_key: None,
     }
 }
 
@@ -3693,4 +3697,36 @@ mod overview {
         assert_eq!(value["localCaTlsNotAfter"], serde_json::json!(not_after));
         assert_eq!(value["caTlsCloseAt"], serde_json::json!(record.not_after));
     }
+}
+
+/// « Terminer » a CA-PQ rotation: refused before the outgoing key's end without a key
+/// touched; at its end, one key destroys the outgoing key and the copy goes to Astra.
+#[test]
+fn finish_ca_pq_retires_and_sends_the_copy() {
+    let bench = bench();
+    bench
+        .drive(RotationGesture::ReplaceCaPq, Bench::all_the_way)
+        .done();
+    let (_, _, not_after) = astra_operator::store::load(&bench.path)
+        .expect("the vault")
+        .retained_outgoing_ca_pq_public()
+        .expect("the outgoing CA-PQ is kept for the overlap");
+
+    bench.set_clock(not_after - 1);
+    let before = bench.vault_bytes();
+    let early = bench.drive(RotationGesture::FinishCaPq, Bench::all_the_way);
+    early.refused(Refusal::OutgoingCaPqKept { until: not_after });
+    assert!(early.asked_no_key());
+    assert_eq!(bench.vault_bytes(), before);
+
+    bench.set_clock(not_after);
+    bench.remote.calls.lock().expect("lock").clear();
+    bench
+        .drive(RotationGesture::FinishCaPq, Bench::all_the_way)
+        .done();
+    assert!(astra_operator::store::load(&bench.path)
+        .expect("the vault")
+        .retained_outgoing_ca_pq_public()
+        .is_none());
+    assert!(bench.remote.called("send_vault_copy"));
 }
