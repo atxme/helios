@@ -83,7 +83,7 @@ beforeEach(() => {
 afterEach(cleanup)
 
 describe('AstraView', () => {
-  it('the_astra_tab_lists_six_sections_in_order', () => {
+  it('the_astra_tab_lists_seven_sections_in_order', () => {
     render(<AstraView />)
     expect(screen.getAllByRole('tab').map((tab) => tab.textContent)).toEqual([
       'Enrôlement',
@@ -91,16 +91,17 @@ describe('AstraView', () => {
       'Domaine',
       'Approbations',
       'Rotations',
+      'Postes',
       'Gateways',
     ])
     openTab('Gateways')
     expect(screen.getByText(/arrivera dans une prochaine version/)).toBeTruthy()
   })
 
-  it('the_section_menu_fits_the_base_window_in_two_rows', () => {
+  it('the_section_menu_fits_the_base_window_in_three_columns', () => {
     render(<AstraView />)
     const menu = screen.getByRole('tablist', { name: 'Sections Astra' })
-    // A fixed three-column grid: the six sections take two rows whatever the
+    // A fixed three-column grid: the seven sections take three rows whatever the
     // labels, and the menu never scrolls nor widens the view.
     expect(menu.style.gridTemplateColumns || getComputedStyle(menu).gridTemplateColumns).toBe(
       'repeat(3, minmax(0, 1fr))',

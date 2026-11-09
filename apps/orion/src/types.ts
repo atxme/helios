@@ -1120,6 +1120,46 @@ export interface RotationsOverview {
   caTlsCloseAt: number | null
 }
 
+/** Un poste tel que le registre de certificats de la gateway le donne, révoqué compris. */
+export interface PeerCertificateRead {
+  name: string
+  wg_public_key: string
+  /** Début de validité : sert à distinguer deux postes réenrôlés sous un même nom. */
+  not_before: number
+  not_after: number
+  revoked: boolean
+  /** Un renouvellement est en cours (génération candidate ou successeur engagé). */
+  renewing: boolean
+}
+
+/** Un poste que la gateway admet : son nom d'admission et sa clé WireGuard. */
+export interface AdmittedPeer {
+  name: string
+  wg_public_key: string
+}
+
+/** Tout ce que montre l'onglet Postes ; des noms, des clés et des dates, ni jeton ni clé privée. */
+export interface PeersOverview {
+  certificates: Reach<PeerCertificateRead[]>
+  admitted: Reach<AdmittedPeer[]>
+  /** Clés révoquées chez Astra. */
+  astra_revoked: Reach<string[]>
+  /** Clés nommées par une révocation cliente en attente. */
+  pending_revocations: Reach<string[]>
+  own_key: string | null
+  now_unix: number | null
+  /** Clé de la décision enregistrée sur ce poste, en attente de dépôt. */
+  local_pending: string | null
+}
+
+/** Les quatre motifs de révocation, en noms de fil (`RevocationReasonChoice`). */
+export type RevocationReasonChoice = 'stolen_or_lost' | 'compromised' | 'no_longer_used' | 'replaced'
+
+/** Un geste de l'onglet Postes ; la clé WireGuard et le nom viennent de la ligne choisie. */
+export type RevocationGesture =
+  | { gesture: 'revoke'; peer: string; name: string; reason: RevocationReasonChoice }
+  | { gesture: 'resume'; peer: string; reason: RevocationReasonChoice }
+
 /** Ce que les rotations ont laissé à côté du coffre, lu sans tunnel ni coffre ouvert. */
 export interface LocalRotationJournal {
   journal: RotationJournalView | null

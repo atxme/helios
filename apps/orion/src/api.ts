@@ -22,6 +22,8 @@ import type {
   EnrollmentGesture,
   IssuerGesture,
   RotationGesture,
+  RevocationGesture,
+  PeersOverview,
   RotationTerms,
   RelayUpdate,
   VaultGesture,
@@ -316,6 +318,10 @@ export const beginRotationCeremony = (gesture: RotationGesture) =>
 export const approveRotationCeremony = (terms: RotationTerms, revision: number) =>
   invoke<OperatorStatus>('approve_rotation_ceremony', { terms, revision })
 
+/** Opens a revocation of a workstation, or resumes one already cut. The gateway is read on the Rust side. */
+export const beginRevocationCeremony = (gesture: RevocationGesture) =>
+  invoke<OperatorStatus>('begin_revocation_ceremony', { gesture })
+
 /** Opens a vault or domain gesture; the vault path is read on the Rust side. */
 export const beginVaultCeremony = (gesture: VaultGesture) =>
   invoke<OperatorStatus>('begin_vault_ceremony', { gesture })
@@ -378,6 +384,9 @@ export const operatorPendingOperations = () =>
 /** Tout ce que montre l'écran des rotations, lu sans clé ; aucun chemin ni jeton n'y figure. */
 export const operatorRotationsOverview = () =>
   invoke<RotationsOverview>('operator_rotations_overview')
+
+/** Les postes du domaine, leur admission et leur révocation ; aucune clé privée ni jeton. */
+export const operatorPeersOverview = () => invoke<PeersOverview>('operator_peers_overview')
 
 /** Le journal de rotation et la reprise à faire : les fichiers à côté du coffre, rien d'autre. */
 export const operatorRotationJournal = () =>

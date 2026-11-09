@@ -155,6 +155,45 @@ export function RotationSteps({
   )
 }
 
+/**
+ * The Motif step: one short choice among a few, shown as buttons. The revocation's four
+ * reasons use it; a rotation's reason stays a text field.
+ */
+export function MotifChoice<T extends string>({
+  legend,
+  choices,
+  value,
+  disabled,
+  onChoose,
+}: {
+  legend: string
+  choices: readonly { value: T; label: string }[]
+  value: T | null
+  disabled: boolean
+  onChoose: (value: T) => void
+}) {
+  return (
+    <Box role="group" aria-label={legend} sx={{ mb: 1 }}>
+      <Typography sx={{ mb: 0.5, fontSize: 12, fontWeight: 600 }}>{legend}</Typography>
+      <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.75 }}>
+        {choices.map((choice) => (
+          <Button
+            key={choice.value}
+            size="small"
+            variant={choice.value === value ? 'contained' : 'outlined'}
+            aria-pressed={choice.value === value}
+            disabled={disabled}
+            onClick={() => onChoose(choice.value)}
+            sx={{ minHeight: 28, fontSize: 12 }}
+          >
+            {choice.label}
+          </Button>
+        ))}
+      </Box>
+    </Box>
+  )
+}
+
 /** The journal when the screen has one, else what the manifest already says of it. */
 function datesOf(
   journal: RotationJournalView | null | undefined,

@@ -12,6 +12,7 @@ import { DomainCreated } from './astra/DomainCreated'
 import { DomainPanel } from './astra/DomainPanel'
 import { ApprovalsPanel } from './astra/ApprovalsPanel'
 import { RotationsPanel } from './astra/RotationsPanel'
+import { PeersPanel } from './astra/PeersPanel'
 import { RotationCeremony, RotationSteps, isRotationStatus } from './astra/RotationSteps'
 import { journalLine } from './astra/rotationRows'
 import { ArtifactDownloads } from './astra/ArtifactDownloads'
@@ -39,6 +40,7 @@ const TABS = [
   'Domaine',
   'Approbations',
   'Rotations',
+  'Postes',
   'Gateways',
 ] as const
 type AstraTab = (typeof TABS)[number]
@@ -392,6 +394,7 @@ export function AstraView({
     'Domaine': <DomainPanel onCeremony={openCeremony} />,
     'Approbations': approvals,
     'Rotations': rotations,
+    'Postes': <PeersPanel onCeremony={openCeremony} />,
     'Gateways': (
       <WaitingNote>La gestion des gateways arrivera dans une prochaine version d’Orion.</WaitingNote>
     ),
@@ -411,10 +414,10 @@ export function AstraView({
           {inFlight.text}
         </Alert>
       )}
-      {/* A fixed grid rather than a tab strip: six labels in one row overflow
+      {/* A fixed grid rather than a tab strip: seven labels in one row overflow
           the window Orion is drawn for, and a scrolling strip hides sections
           the operator must see. Three columns keep every section in view, in
-          two rows, at the base size. */}
+          three rows, at the base size. */}
       <Box
         role="tablist"
         aria-label="Sections Astra"
