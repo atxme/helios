@@ -265,6 +265,8 @@ fn authority_status() -> astra_channel::OperatorAuthorityStatus {
         }),
         vault_copy_fingerprint: Some(Fingerprint::of(b"vault")),
         credential_registry_epoch: Some(4),
+        revoked_peers: Vec::new(),
+        served_credentials: None,
     }
 }
 

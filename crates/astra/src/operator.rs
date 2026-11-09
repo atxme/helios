@@ -150,11 +150,17 @@ async fn status(
     // What Astra serves, from the document it holds: neither
     // `state.credential_registry_epoch`, which is only the floor the registry
     // was bootstrapped with, nor a number when no document is served.
-    let credential_registry_epoch = service
-        .approval_credentials()
+    let approval_credentials = service.approval_credentials();
+    let credential_registry_epoch = approval_credentials
         .registry
         .as_ref()
         .map(|document| document.credential_registry_epoch);
+    let revoked_peers = state
+        .peers
+        .values()
+        .filter(|peer| peer.revoked)
+        .map(|peer| peer.client_wg_public_key)
+        .collect();
     let serving_epoch = service
         .issuer()
         .map(|issuer| issuer.authorization.issuer_epoch);
@@ -183,6 +189,8 @@ async fn status(
         }),
         vault_copy_fingerprint,
         credential_registry_epoch,
+        revoked_peers,
+        served_credentials: approval_credentials.registry.clone(),
     };
     drop(registry);
     (axum::http::StatusCode::OK, Json(report)).into_response()
@@ -426,5 +434,157 @@ async fn vault_copy(
             refuse(&operator, "vault-copy", ServiceError::HeldBack)
         }
         Err(refusal) => refuse(&operator, "vault-copy", refusal.class()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::door::tests::{fixture, rewrite_registry};
+    use crate::registry::CaPqRotation;
+    use crate::service::ApprovalCredentials;
+    use aether::certificates::approval::{
+        AstraCredentialBinding, CredentialRegistry, CredentialState,
+    };
+    use aether::certificates::encoding::{
+        generate_ml_dsa_87_keypair, MlDsa87Signature, TrustDomainId, WireGuardKey,
+    };
+    use aether::certificates::CERTIFICATE_FORMAT_VERSION;
+    use astra_channel::{OperatorIdentity, MAX_OPERATOR_ANSWER_BYTES};
+
+    const DOMAIN: [u8; 16] = [1; 16];
+    const GATEWAY: [u8; 32] = [1; 32];
+
+    /// A well-formed COSE key. The status never verifies the document, so the
+    /// key only has to be the shape a real one is.
+    fn cose_key() -> Vec<u8> {
+        let mut key = vec![0xa5, 0x01, 0x02, 0x03, 0x26, 0x20, 0x01, 0x21, 0x58, 0x20];
+        key.extend_from_slice(&[1; 32]);
+        key.extend_from_slice(&[0x22, 0x58, 0x20]);
+        key.extend_from_slice(&[2; 32]);
+        key
+    }
+
+    /// A credential document of `bindings` rows, each signed under `ca_private`.
+    fn document(ca_private: &[u8], registry_epoch: u64, bindings: u8) -> Box<CredentialRegistry> {
+        let rows = (1..=bindings)
+            .map(|index| {
+                AstraCredentialBinding {
+                    format_version: CERTIFICATE_FORMAT_VERSION,
+                    credential_id: vec![index; 16],
+                    credential_public_key: cose_key(),
+                    aaguid: [0; 16],
+                    trust_domain_id: TrustDomainId::new(DOMAIN).expect("domain"),
+                    gateway_wg_public_key: WireGuardKey::from_bytes(GATEWAY),
+                    state: CredentialState::Active,
+                    credential_epoch: 1,
+                    credential_registry_epoch: registry_epoch,
+                    ca_epoch: 1,
+                    created_at: 500,
+                    ca_pq_signature: MlDsa87Signature::placeholder(),
+                }
+                .sign(ca_private)
+                .expect("sign")
+            })
+            .collect();
+        Box::new(CredentialRegistry {
+            trust_domain_id: TrustDomainId::new(DOMAIN).expect("domain"),
+            gateway_wg_public_key: WireGuardKey::from_bytes(GATEWAY),
+            ca_epoch: 1,
+            credential_registry_epoch: registry_epoch,
+            bindings: rows,
+        })
+    }
+
+    /// Serves `document` as the one Astra holds for approvals.
+    fn serve(service: &AstraService, document: Box<CredentialRegistry>) {
+        *service.approval_credentials.write().expect("credentials") =
+            Arc::new(ApprovalCredentials::from_document(document));
+    }
+
+    /// The status as the tunnel relays it: the handler's own answer, read back
+    /// under the bound the channel client applies to it.
+    async fn answer(service: &Arc<AstraService>) -> Vec<u8> {
+        let response = status(
+            State(Arc::clone(service)),
+            Json(RelayedOperatorCampaign {
+                operator: OperatorIdentity::DevLoopback,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), MAX_OPERATOR_ANSWER_BYTES)
+            .await
+            .expect("the answer stays within the operator bound")
+            .to_vec()
+    }
+
+    #[tokio::test]
+    async fn status_names_revoked_peers() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let service = fixture(directory.path());
+        let laptop = WireGuardKey::from_bytes([3; 32]);
+        service
+            .registry
+            .lock()
+            .await
+            .revoke(&laptop, 1, 1_000)
+            .expect("revoked");
+
+        let service = Arc::new(service);
+        let report: OperatorAuthorityStatus =
+            serde_json::from_slice(&answer(&service).await).expect("status");
+
+        assert_eq!(report.revoked_peers, vec![laptop]);
+    }
+
+    #[tokio::test]
+    async fn status_serves_the_outgoing_document_during_an_overlap() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let (ca_private, _) = generate_ml_dsa_87_keypair().expect("keygen");
+        let (_, next) = generate_ml_dsa_87_keypair().expect("next CA-PQ");
+        let service = fixture(directory.path());
+        rewrite_registry(&service, |state| {
+            state.ca_rotation = Some(CaPqRotation {
+                next_ca_epoch: 2,
+                next_ca_public_key: next,
+                activation_at: 1_000,
+                retire_active_at: 5_000,
+            });
+        })
+        .await;
+        let outgoing = document(&ca_private, 1, 2);
+        serve(&service, outgoing.clone());
+
+        let service = Arc::new(service);
+        let report: OperatorAuthorityStatus =
+            serde_json::from_slice(&answer(&service).await).expect("status");
+
+        assert!(report.next_ca_fingerprint.is_some());
+        assert_eq!(report.credential_registry_epoch, Some(1));
+        assert_eq!(report.served_credentials, Some(outgoing));
+    }
+
+    #[tokio::test]
+    async fn status_fits_the_answer_bound_with_eight_bindings() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let (ca_private, _) = generate_ml_dsa_87_keypair().expect("keygen");
+        let service = fixture(directory.path());
+        serve(&service, document(&ca_private, 1, 8));
+
+        let service = Arc::new(service);
+        let body = answer(&service).await;
+        let body = answer(&service).await;
+        let report: OperatorAuthorityStatus = serde_json::from_slice(&body).expect("status");
+
+        assert_eq!(
+            report.served_credentials.expect("document").bindings.len(),
+            8
+        );
+        assert!(
+            body.len() < MAX_OPERATOR_ANSWER_BYTES / 2,
+            "the status took {} bytes, half the operator bound",
+            body.len()
+        );
     }
 }

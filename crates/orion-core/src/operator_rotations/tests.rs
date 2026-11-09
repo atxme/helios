@@ -1,5 +1,5 @@
 use super::*;
-use aether::certificates::encoding::Fingerprint;
+use aether::certificates::encoding::{Fingerprint, WireGuardKey};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -131,6 +131,8 @@ async fn the_authority_status_keeps_none_distinct_from_zero() {
         issuer: None,
         vault_copy_fingerprint: None,
         credential_registry_epoch: None,
+        revoked_peers: Vec::new(),
+        served_credentials: None,
     };
     let body = serde_json::to_string(&status).unwrap();
     let Reach::Ok(read) = answered(200, &body, async |url| authority_status(url).await).await
@@ -190,6 +192,8 @@ async fn an_authority_status_that_gains_a_field_still_reads() {
         issuer: None,
         vault_copy_fingerprint: Some(Fingerprint::of(b"v")),
         credential_registry_epoch: Some(7),
+        revoked_peers: Vec::new(),
+        served_credentials: None,
     })
     .unwrap();
     status["a_field_a_later_astra_adds"] = serde_json::json!(true);
@@ -250,4 +254,52 @@ async fn revoked_peers_are_left_out_and_the_gateways_clock_is_kept() {
         vec![10, 20],
         "a revoked leaf is not a workstation to renew"
     );
+}
+
+#[tokio::test]
+async fn status_read_tolerates_the_new_fields() {
+    let base = serde_json::to_value(OperatorAuthorityStatus {
+        ca_epoch: 4,
+        ca_fingerprint: Fingerprint::of(b"a"),
+        next_ca_fingerprint: None,
+        ca_tls_epoch: 2,
+        ca_tls_fingerprint: None,
+        next_ca_tls_fingerprint: None,
+        issuer: None,
+        vault_copy_fingerprint: None,
+        credential_registry_epoch: Some(7),
+        revoked_peers: Vec::new(),
+        served_credentials: None,
+    })
+    .unwrap();
+
+    // An Astra that names a revoked peer and serves its document.
+    let key = WireGuardKey::from_bytes([3; 32]).to_base64();
+    let mut named = base.clone();
+    named["revoked_peers"] = serde_json::json!([key]);
+    named["served_credentials"] = serde_json::json!({
+        "credential_registry_epoch": 7,
+        "bindings": [{"credential_id": [1, 2, 3]}],
+    });
+    let Reach::Ok(read) = answered(200, &named.to_string(), async |url| {
+        authority_status(url).await
+    })
+    .await
+    else {
+        panic!("the new fields must not blind the screen");
+    };
+    assert_eq!(read.revoked_peers, vec![key]);
+    let document = read.served_credentials.expect("the served document");
+    assert_eq!(document["credential_registry_epoch"], 7);
+
+    // An older Astra, without the fields, reads as no revoked peer and no document.
+    let Reach::Ok(older) = answered(200, &base.to_string(), async |url| {
+        authority_status(url).await
+    })
+    .await
+    else {
+        panic!("an older Astra must still read");
+    };
+    assert!(older.revoked_peers.is_empty());
+    assert_eq!(older.served_credentials, None);
 }

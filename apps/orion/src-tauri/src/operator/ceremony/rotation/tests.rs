@@ -652,6 +652,8 @@ impl Bench {
             issuer: None,
             vault_copy_fingerprint: None,
             credential_registry_epoch: None,
+            revoked_peers: Vec::new(),
+            served_credentials: None,
         }
     }
 

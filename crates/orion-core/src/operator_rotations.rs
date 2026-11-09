@@ -135,6 +135,13 @@ pub struct AuthorityStatusRead {
     /// `None`: Astra serves no document. Not epoch 0.
     #[serde(default)]
     pub credential_registry_epoch: Option<u64>,
+    /// The workstations Astra holds as revoked, as WireGuard keys in base64.
+    #[serde(default)]
+    pub revoked_peers: Vec<String>,
+    /// The credential document Astra serves, kept raw. Nothing here trusts it:
+    /// it is verified before any decision rests on it.
+    #[serde(default)]
+    pub served_credentials: Option<serde_json::Value>,
 }
 
 /// The delegation, as the status reports it.
@@ -166,6 +173,14 @@ impl From<OperatorAuthorityStatus> for AuthorityStatusRead {
             }),
             vault_copy_fingerprint: status.vault_copy_fingerprint.map(|f| f.to_hex()),
             credential_registry_epoch: status.credential_registry_epoch,
+            revoked_peers: status
+                .revoked_peers
+                .iter()
+                .map(|key| key.to_base64())
+                .collect(),
+            served_credentials: status.served_credentials.map(|document| {
+                serde_json::to_value(*document).expect("a credential document is plain JSON")
+            }),
         }
     }
 }

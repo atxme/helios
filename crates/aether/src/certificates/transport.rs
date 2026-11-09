@@ -1276,8 +1276,10 @@ pub struct OperatorOpened {
 /// What Astra reports of its own authority state, for Orion to decide what is
 /// left to do (lot 5b, §5.9).
 ///
-/// Fingerprints and epochs only: no token, no key, no document. It is a read,
-/// so it needs no capability and mints none.
+/// Fingerprints, epochs, the peers held as revoked, and the credential document
+/// Astra serves. The document is public and signed under `CA-PQ`, so it may
+/// cross; no token and no key do. It is a read, so it needs no capability and
+/// mints none.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OperatorAuthorityStatus {
@@ -1293,6 +1295,12 @@ pub struct OperatorAuthorityStatus {
     /// The epoch of the credential document Astra serves, not the registry's
     /// bootstrap floor. `None` when Astra serves no document.
     pub credential_registry_epoch: Option<u64>,
+    /// The workstations Astra holds as revoked, by WireGuard key.
+    #[serde(default)]
+    pub revoked_peers: Vec<WireGuardKey>,
+    /// The credential document Astra serves, whole. `None` when it serves none.
+    #[serde(default)]
+    pub served_credentials: Option<Box<crate::certificates::approval::CredentialRegistry>>,
 }
 
 /// The delegation: what the registry records and what Astra serves.

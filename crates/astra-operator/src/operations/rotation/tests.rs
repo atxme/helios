@@ -410,6 +410,8 @@ fn nothing_in_flight(vault_path: &Path) -> OperatorAuthorityStatus {
         issuer: None,
         vault_copy_fingerprint: None,
         credential_registry_epoch: None,
+        revoked_peers: Vec::new(),
+        served_credentials: None,
     }
 }
 

@@ -1714,7 +1714,7 @@ fn delegation(
 
 /// Rewrites the service's registry in memory and on disk, as if it had been
 /// bootstrapped that way.
-async fn rewrite_registry(service: &AstraService, change: impl FnOnce(&mut AstraState)) {
+pub(crate) async fn rewrite_registry(service: &AstraService, change: impl FnOnce(&mut AstraState)) {
     let mut registry = service.registry.lock().await;
     let mut state = registry.state().clone();
     change(&mut state);

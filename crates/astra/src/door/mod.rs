@@ -49,7 +49,7 @@ mod vault_copy;
 pub mod write;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use std::time::Duration;
 

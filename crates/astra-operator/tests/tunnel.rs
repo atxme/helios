@@ -512,6 +512,8 @@ fn the_authority_status_is_read_on_the_operator_route() {
         issuer: None,
         vault_copy_fingerprint: None,
         credential_registry_epoch: None,
+        revoked_peers: Vec::new(),
+        served_credentials: None,
     };
     let stub = Stub::serving(vec![(200, serde_json::to_string(&status).expect("json"))]);
     let answer = Tunnel::new(&stub.base)
