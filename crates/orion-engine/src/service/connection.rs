@@ -303,3 +303,6 @@ fn raise_key_negotiation_floor(
         }
     });
 }
+
+#[cfg(test)]
+mod tests;

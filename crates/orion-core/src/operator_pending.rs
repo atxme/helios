@@ -91,6 +91,44 @@ fn route(heliosd_url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn serve_once(
+        status: u16,
+        body: &'static [u8],
+    ) -> (String, tokio::task::JoinHandle<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("address");
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("request");
+            let mut request = Vec::new();
+            let mut chunk = [0; 1024];
+            loop {
+                let read = stream.read(&mut chunk).await.expect("read request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request = String::from_utf8(request).expect("ASCII HTTP request");
+            let head = format!(
+                "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(head.as_bytes())
+                .await
+                .expect("write headers");
+            stream.write_all(body).await.expect("write body");
+            request
+        });
+        (format!("http://{address}/"), task)
+    }
 
     #[test]
     fn the_route_is_resolved_against_the_gateway_and_nothing_else() {
@@ -103,5 +141,71 @@ mod tests {
             "http://100.64.0.1:8080/api/certificates/operator/pending",
             "a trailing slash on the profile's gateway must not double in the path"
         );
+    }
+
+    #[tokio::test]
+    async fn pending_fetches_and_decodes_the_operator_list_without_capabilities() {
+        let body = br#"{"operations":[{"operation_id":"01010101010101010101010101010101","scope":"fleet_leafs","reason":"Scheduled rotation","requested_by":"admin","target_count":3,"required_credentials":1,"campaign_fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","created_at":10,"expires_at":20}]}"#;
+        let (url, request) = serve_once(200, body).await;
+        let result = pending(&url).await.expect("pending list");
+        assert_eq!(result.operations.len(), 1);
+        assert_eq!(result.operations[0].reason, "Scheduled rotation");
+        assert_eq!(result.operations[0].requested_by, "admin");
+        assert_eq!(result.operations[0].target_count, 3);
+        assert_eq!(result.operations[0].required_credentials, 1);
+        let serialized = serde_json::to_value(&result).expect("serialize public list");
+        assert!(serialized["operations"][0]
+            .get("signer_request_token")
+            .is_none());
+        assert!(serialized["operations"][0].get("vault_token").is_none());
+        assert!(serialized["operations"][0]
+            .get("signer_result_token")
+            .is_none());
+        let request = request.await.expect("server task");
+        let first_line = request.lines().next().expect("request line");
+        assert_eq!(
+            first_line,
+            "GET /api/certificates/operator/pending HTTP/1.1"
+        );
+        assert!(!request.to_ascii_lowercase().contains("authorization:"));
+    }
+
+    #[tokio::test]
+    async fn pending_accepts_an_empty_list() {
+        let (url, request) = serve_once(200, br#"{"operations":[]}"#).await;
+        let result = pending(&url).await.expect("empty list");
+        assert!(result.operations.is_empty());
+        request.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn pending_maps_non_success_statuses_to_refused() {
+        for status in [401, 403, 500] {
+            let (url, request) = serve_once(status, b"{}").await;
+            assert!(
+                matches!(pending(&url).await, Err(PendingError::Refused { status: actual }) if actual == status)
+            );
+            request.await.expect("server task");
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_rejects_malformed_json_and_unknown_fields() {
+        for body in [b"{".as_slice(), br#"{"operations":[],"unexpected":true}"#] {
+            let (url, request) = serve_once(200, body).await;
+            assert!(matches!(
+                pending(&url).await,
+                Err(PendingError::Malformed(_))
+            ));
+            request.await.expect("server task");
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_maps_an_unparseable_gateway_url_to_unreachable() {
+        assert!(matches!(
+            pending("://invalid").await,
+            Err(PendingError::Unreachable(_))
+        ));
     }
 }

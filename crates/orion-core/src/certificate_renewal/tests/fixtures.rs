@@ -20,7 +20,7 @@ use crate::certificate_renewal::{ActiveIdentity, RenewalSession};
 use crate::certificates::TrustStore;
 use crate::test_domain::*;
 
-fn active_identity(domain: &Domain) -> ActiveIdentity {
+pub(super) fn active_identity(domain: &Domain) -> ActiveIdentity {
     ActiveIdentity {
         pq_private_key: domain.active_client_private.clone(),
         tls_private_key_der: Zeroizing::new(vec![7; 64]),
@@ -153,4 +153,77 @@ pub(super) fn session(store: &TrustStore, domain: &Domain) -> RenewalSession {
         RenewalSession::prepare(store, SUBJECT, "http://100.64.0.1:8080", NOW).expect("prepare");
     session.sign(&active_identity(domain)).expect("sign");
     session
+}
+
+/// A request observed by the local HTTP peer used by renewal adapter tests.
+pub(super) struct ObservedHttpRequest {
+    pub(super) headers: String,
+    pub(super) body: Vec<u8>,
+}
+
+pub(super) async fn read_http_request(stream: &mut tokio::net::TcpStream) -> ObservedHttpRequest {
+    use tokio::io::AsyncReadExt as _;
+
+    let mut bytes = Vec::new();
+    let header_end = loop {
+        let mut chunk = [0; 2048];
+        let read = stream.read(&mut chunk).await.expect("read request");
+        assert_ne!(read, 0, "request headers complete");
+        bytes.extend_from_slice(&chunk[..read]);
+        if let Some(index) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+            break index + 4;
+        }
+    };
+    let headers = String::from_utf8(bytes[..header_end].to_vec()).expect("HTTP headers");
+    let content_length = headers
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().expect("content length"))
+        })
+        .unwrap_or_default();
+    let body_end = header_end + content_length;
+    while bytes.len() < body_end {
+        let mut chunk = [0; 2048];
+        let read = stream.read(&mut chunk).await.expect("read request body");
+        assert_ne!(read, 0, "complete request body");
+        bytes.extend_from_slice(&chunk[..read]);
+    }
+    ObservedHttpRequest {
+        headers,
+        body: bytes[header_end..body_end].to_vec(),
+    }
+}
+
+pub(super) fn json_http_response<T: serde::Serialize>(status: &str, body: &T) -> Vec<u8> {
+    let body = serde_json::to_vec(body).expect("response JSON");
+    let mut response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    response.extend_from_slice(&body);
+    response
+}
+
+pub(super) async fn scripted_peer(
+    listener: tokio::net::TcpListener,
+    responses: Vec<Vec<u8>>,
+) -> (
+    tokio::sync::mpsc::UnboundedReceiver<ObservedHttpRequest>,
+    tokio::task::JoinHandle<()>,
+) {
+    use tokio::io::AsyncWriteExt as _;
+
+    let (request_sender, request_receiver) = tokio::sync::mpsc::unbounded_channel();
+    let task = tokio::spawn(async move {
+        for response in responses {
+            let (mut stream, _) = listener.accept().await.expect("client connection");
+            let request = read_http_request(&mut stream).await;
+            request_sender.send(request).expect("test receiver");
+            stream.write_all(&response).await.expect("write response");
+        }
+    });
+    (request_receiver, task)
 }

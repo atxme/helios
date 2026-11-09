@@ -491,3 +491,36 @@ async fn a_stop_during_the_hello_tears_nothing_down() {
     assert!(matches!(ended(session).await, ServeOutcome::Stopped));
     assert_eq!(fake.teardowns.load(Ordering::SeqCst), 0);
 }
+
+#[tokio::test]
+async fn a_failed_reply_write_ends_the_session_as_a_disconnected_client() {
+    let (sender, mut frames) = mpsc::channel(INCOMING_FRAMES);
+    sender
+        .send(Ok(ClientFrame::Request {
+            id: 42,
+            command: Box::new(EngineCommand::GetState),
+        }))
+        .await
+        .expect("request queued");
+    let (mut writer, client) = tokio::io::duplex(PIPE);
+    drop(client);
+    let (queue, mut events) = EventQueue::new();
+    let engine = Arc::new(Fake::default());
+    let stop = std::future::pending::<()>();
+    tokio::pin!(stop);
+    let result = tokio::time::timeout(
+        WAIT,
+        run(
+            &mut writer,
+            &mut frames,
+            &mut events,
+            &queue,
+            &engine,
+            &mut stop,
+        ),
+    )
+    .await
+    .expect("write failure terminates the session");
+    assert!(matches!(result, ServeOutcome::ClientLeft), "{result:?}");
+    assert!(!sender.is_closed(), "the request channel remained open");
+}

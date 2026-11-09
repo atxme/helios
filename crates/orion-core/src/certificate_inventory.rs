@@ -410,6 +410,8 @@ fn retained_operator_inventory(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_domain::{domain, settings, NOW};
+    use base64::engine::general_purpose::STANDARD;
 
     fn period(not_before: u64, not_after: u64, now: u64) -> CertificatePhase {
         CertificateFacts::new(
@@ -553,5 +555,92 @@ mod tests {
         assert_eq!(facts.fingerprint, material.leaf.fingerprint().to_hex());
         assert!(facts.not_after > facts.renewal_at);
         assert!(facts.renewal_at > facts.not_before);
+    }
+
+    #[test]
+    fn gateway_inventory_projects_both_valid_pins_without_client_state() {
+        let domain = domain();
+        let mut settings = settings(&domain);
+        settings.gateway_pq_certificate = STANDARD.encode(
+            serde_json::to_vec(&domain.gateway_leaf).expect("encode gateway PQ certificate"),
+        );
+        settings.gateway_ca_der = STANDARD.encode(domain.tls_ca_der.as_bytes());
+        let mut inventory = CertificateInventory::default();
+
+        gateway_inventory(&settings, NOW, &mut inventory);
+
+        let pq = inventory.gateway_pq.expect("gateway PQ facts");
+        assert_eq!(pq.subject, domain.gateway_leaf.subject);
+        assert_eq!(pq.issuer, domain.gateway_leaf.issuer);
+        assert_eq!(
+            pq.fingerprint,
+            domain.gateway_leaf.fingerprint().expect("PQ fingerprint")
+        );
+        assert_eq!(pq.not_before, domain.gateway_leaf.not_before_unix);
+        assert_eq!(pq.not_after, domain.gateway_leaf.not_after_unix);
+        assert_eq!(pq.phase, CertificatePhase::Valid);
+
+        let ca = inventory.gateway_ca_tls.expect("gateway CA-TLS facts");
+        assert_eq!(ca.fingerprint, domain.tls_ca_der.fingerprint().to_hex());
+        assert_eq!(ca.phase, CertificatePhase::Valid);
+        assert!(inventory.client_tls.is_none());
+        assert!(inventory.client_pq.is_none());
+        assert!(inventory.faults.is_empty());
+    }
+
+    #[test]
+    fn an_unreadable_gateway_pq_pin_does_not_hide_the_valid_tls_anchor() {
+        let domain = domain();
+        let mut settings = settings(&domain);
+        settings.gateway_pq_certificate = STANDARD.encode(br#"{"wrong":"shape"}"#);
+        settings.gateway_ca_der = STANDARD.encode(domain.tls_ca_der.as_bytes());
+        let mut inventory = CertificateInventory::default();
+
+        gateway_inventory(&settings, NOW, &mut inventory);
+
+        assert!(inventory.gateway_pq.is_none());
+        assert!(inventory.gateway_ca_tls.is_some());
+        assert_eq!(inventory.faults.len(), 1);
+        assert!(inventory.faults[0].contains("PQ de la gateway"));
+    }
+
+    #[test]
+    fn an_incoherent_gateway_pq_period_is_named_as_a_fault() {
+        let domain = domain();
+        let mut invalid = domain.gateway_leaf.clone();
+        invalid.not_after_unix = invalid.not_before_unix;
+        let mut settings = settings(&domain);
+        settings.gateway_pq_certificate =
+            STANDARD.encode(serde_json::to_vec(&invalid).expect("encode malformed period"));
+        settings.gateway_ca_der = STANDARD.encode(domain.tls_ca_der.as_bytes());
+        let mut inventory = CertificateInventory::default();
+
+        gateway_inventory(&settings, NOW, &mut inventory);
+
+        assert!(inventory.gateway_pq.is_none());
+        assert!(inventory.gateway_ca_tls.is_some());
+        assert_eq!(inventory.faults.len(), 1);
+        assert!(inventory.faults[0].contains("période de validité incohérente"));
+    }
+
+    #[test]
+    fn an_unreadable_gateway_tls_anchor_does_not_hide_the_valid_pq_pin() {
+        let domain = domain();
+        let malformed_der = STANDARD.encode(b"not DER");
+        for invalid_anchor in ["not base64 !", malformed_der.as_str()] {
+            let mut settings = settings(&domain);
+            settings.gateway_pq_certificate = STANDARD.encode(
+                serde_json::to_vec(&domain.gateway_leaf).expect("encode gateway PQ certificate"),
+            );
+            settings.gateway_ca_der = invalid_anchor.to_string();
+            let mut inventory = CertificateInventory::default();
+
+            gateway_inventory(&settings, NOW, &mut inventory);
+
+            assert!(inventory.gateway_pq.is_some());
+            assert!(inventory.gateway_ca_tls.is_none());
+            assert_eq!(inventory.faults.len(), 1);
+            assert!(inventory.faults[0].contains("CA TLS de la gateway"));
+        }
     }
 }

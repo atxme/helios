@@ -9,7 +9,9 @@ use aether::certificates::transport::{ClientRenewalOperationState, ClientRenewal
 use aether::certificates::CertificateError;
 use zeroize::Zeroizing;
 
-use super::fixtures::{grant, session, window};
+use super::fixtures::{
+    active_identity, grant, json_http_response, read_http_request, scripted_peer, session, window,
+};
 use crate::certificate_renewal::{ActiveIdentity, RenewalError, RenewalSession, RenewalStep};
 use crate::test_domain::*;
 
@@ -291,4 +293,286 @@ fn an_authority_still_awaiting_an_operator_is_reported_as_obsolete() {
     // The session stays on the operation: the remedy the error names is to
     // migrate the authority, not to approve a request by hand.
     assert_eq!(session.operation_id(), Some(operation_id));
+}
+
+fn operation_view(
+    request_fingerprint: Fingerprint,
+    operation_id: Id16,
+) -> ClientRenewalOperationView {
+    ClientRenewalOperationView {
+        operation_id,
+        state: ClientRenewalOperationState::PendingGrant,
+        client_wg_public_key: client_key(),
+        request_fingerprint,
+        operation_manifest_fingerprint: Fingerprint::of(b"approval manifest"),
+        created_at: NOW,
+        expires_at: NOW + 300,
+        signer_request_token: Some("read-capability".into()),
+        signer_result_token: Some("submit-capability".into()),
+        grant: None,
+    }
+}
+
+/// Exercise the client adapter against a local HTTP peer: the signed request
+/// goes only to the tunnel route, then a PendingGrant poll stays on that same
+/// gateway and does not carry companion capabilities.
+#[tokio::test]
+async fn session_posts_a_signed_request_and_polls_pending_grant_on_the_tunnel_routes() {
+    use tokio::net::TcpListener;
+
+    let directory = tempfile::tempdir().expect("temp directory");
+    let domain = domain();
+    let mut store = store(directory.path(), &domain);
+    let operation_id = Id16::new([0x68; 16]).expect("operation ID");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("loopback listener");
+    let base = format!(
+        "http://{}",
+        listener.local_addr().expect("listener address")
+    );
+    let mut session =
+        RenewalSession::prepare(&store, SUBJECT, &base, NOW).expect("prepare request");
+    session
+        .sign(&active_identity(&domain))
+        .expect("sign request");
+    let request_fingerprint = session.request_fingerprint();
+    let view = operation_view(request_fingerprint, operation_id);
+    let response = json_http_response("200 OK", &view);
+    let second_response = json_http_response("200 OK", &view);
+    let (mut requests, server) = scripted_peer(listener, vec![response, second_response]).await;
+
+    let opened = session.open().await.expect("open through tunnel");
+    assert_eq!(opened, RenewalStep::Issuing { operation_id });
+    assert_eq!(session.operation_id(), Some(operation_id));
+    let active_public = MlDsa87PublicKey::parse(&domain.active_client_leaf.ml_dsa_87_public_key)
+        .expect("active public key");
+    let post = requests.recv().await.expect("request POST");
+    assert!(post
+        .headers
+        .starts_with("POST /api/key-negotiation/certificate-renewal/request"));
+    let request: aether::certificates::client::ClientCertificateRotationRequest =
+        serde_json::from_slice(&post.body).expect("rotation request JSON");
+    request
+        .verify(
+            &active_public,
+            &domain_id(),
+            &gateway_key(),
+            SERVER_NAME,
+            &active_generation(&domain),
+            &client_key(),
+            NOW,
+        )
+        .expect("both active and candidate signatures verify");
+    assert_eq!(request.fingerprint(), request_fingerprint);
+
+    let advanced = session
+        .advance(
+            &mut store,
+            &crate::ProtectedIdentityStore::at(directory.path().join("identities")),
+            SUBJECT,
+            &active_identity(&domain),
+            NOW,
+        )
+        .await
+        .expect("pending grant stays in issuing state");
+    assert_eq!(advanced, RenewalStep::Issuing { operation_id });
+    let poll = requests.recv().await.expect("operation poll request");
+    assert!(poll.headers.starts_with(&format!(
+        "GET /api/key-negotiation/certificate-renewal/operations/{operation_id} "
+    )));
+    assert!(
+        !poll.headers.to_ascii_lowercase().contains("authorization:"),
+        "the operation poll does not use a companion token"
+    );
+    server.await.expect("scripted peer task");
+}
+
+/// A redirect must remain a coarse refusal; the client never follows a
+/// gateway-selected host or falls back to a public Astra origin.
+#[tokio::test]
+async fn renewal_open_refuses_a_redirect_without_following_it() {
+    use tokio::io::AsyncWriteExt as _;
+    use tokio::net::TcpListener;
+    use tokio::time::{timeout, Duration};
+
+    let directory = tempfile::tempdir().expect("temp directory");
+    let domain = domain();
+    let store = store(directory.path(), &domain);
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("loopback listener");
+    let address = listener.local_addr().expect("listener address");
+    let base = format!("http://{address}");
+    let redirect_location = format!("{base}/public-astra-fallback");
+    let (observed_sender, observed_receiver) = tokio::sync::oneshot::channel();
+    let (followed_sender, followed_receiver) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("first request");
+        let request = read_http_request(&mut stream).await;
+        let _ = observed_sender.send(request);
+        let response = format!(
+            "HTTP/1.1 302 Found\r\nLocation: {redirect_location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .expect("write redirect");
+
+        let followed = if let Ok(Ok((mut redirected, _))) =
+            timeout(Duration::from_millis(250), listener.accept()).await
+        {
+            let _ = read_http_request(&mut redirected).await;
+            redirected
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .await
+                .expect("write redirect response");
+            true
+        } else {
+            false
+        };
+        let _ = followed_sender.send(followed);
+    });
+
+    let mut session = RenewalSession::prepare(&store, SUBJECT, &base, NOW).expect("prepare");
+    session
+        .sign(&active_identity(&domain))
+        .expect("sign request");
+    let error = session.open().await.expect_err("redirect is not followed");
+    assert!(
+        matches!(error, RenewalError::Refused { status: 302 }),
+        "{error}"
+    );
+    let request = observed_receiver.await.expect("observed request");
+    assert!(request
+        .headers
+        .starts_with("POST /api/key-negotiation/certificate-renewal/request"));
+    assert!(!followed_receiver.await.expect("redirect observation"));
+    server.await.expect("redirect server task");
+}
+
+/// An HTTP 200 is still refused when the gateway describes somebody else's
+/// request; a well-formed response does not make an unrelated operation ours.
+#[tokio::test]
+async fn session_refuses_an_operation_view_for_another_request() {
+    use tokio::net::TcpListener;
+
+    let directory = tempfile::tempdir().expect("temp directory");
+    let domain = domain();
+    let store = store(directory.path(), &domain);
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("loopback listener");
+    let base = format!(
+        "http://{}",
+        listener.local_addr().expect("listener address")
+    );
+    let mut session = RenewalSession::prepare(&store, SUBJECT, &base, NOW).expect("prepare");
+    session
+        .sign(&active_identity(&domain))
+        .expect("sign request");
+
+    let mut unrelated = operation_view(
+        Fingerprint::of(b"another client's request"),
+        Id16::new([0x71; 16]).expect("operation ID"),
+    );
+    unrelated.client_wg_public_key = client_key();
+    let response = json_http_response("200 OK", &unrelated);
+    let (mut requests, server) = scripted_peer(listener, vec![response]).await;
+
+    let error = session
+        .open()
+        .await
+        .expect_err("unrelated operation refused");
+    assert!(matches!(error, RenewalError::OperationMismatch { .. }));
+    assert_eq!(session.operation_id(), None);
+    let request = requests.recv().await.expect("observed POST");
+    assert!(request
+        .headers
+        .starts_with("POST /api/key-negotiation/certificate-renewal/request"));
+    server.await.expect("scripted peer task");
+}
+
+/// HTTP refusals stay coarse, and a missing certificate authority is the one
+/// status that receives its dedicated actionable error.
+#[tokio::test]
+async fn session_maps_gateway_refusals_without_decoding_their_bodies() {
+    use tokio::net::TcpListener;
+
+    for (status, expected) in [
+        (403, RenewalError::Refused { status: 403 }),
+        (503, RenewalError::AuthorityUnavailable),
+    ] {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let domain = domain();
+        let store = store(directory.path(), &domain);
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback listener");
+        let base = format!(
+            "http://{}",
+            listener.local_addr().expect("listener address")
+        );
+        let mut session = RenewalSession::prepare(&store, SUBJECT, &base, NOW).expect("prepare");
+        session
+            .sign(&active_identity(&domain))
+            .expect("sign request");
+        let wire = format!(
+            "HTTP/1.1 {status} Refused\r\nContent-Length: 999999\r\nConnection: close\r\n\r\n"
+        )
+        .into_bytes();
+        let (mut requests, server) = scripted_peer(listener, vec![wire]).await;
+
+        let error = session.open().await.expect_err("gateway refusal");
+        match expected {
+            RenewalError::AuthorityUnavailable => {
+                assert!(matches!(error, RenewalError::AuthorityUnavailable));
+            }
+            RenewalError::Refused {
+                status: expected_status,
+            } => {
+                assert!(
+                    matches!(error, RenewalError::Refused { status } if status == expected_status)
+                );
+            }
+            other => panic!("unexpected expected error: {other:?}"),
+        }
+        let request = requests.recv().await.expect("observed POST");
+        assert!(request
+            .headers
+            .starts_with("POST /api/key-negotiation/certificate-renewal/request"));
+        server.await.expect("scripted peer task");
+    }
+}
+
+/// A successful status with a prematurely closed JSON body is a transport
+/// failure; it cannot be adopted as an operation or retried as a public call.
+#[tokio::test]
+async fn session_reports_a_truncated_operation_response_as_transport_failure() {
+    use tokio::net::TcpListener;
+
+    let directory = tempfile::tempdir().expect("temp directory");
+    let domain = domain();
+    let store = store(directory.path(), &domain);
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("loopback listener");
+    let base = format!(
+        "http://{}",
+        listener.local_addr().expect("listener address")
+    );
+    let mut session = RenewalSession::prepare(&store, SUBJECT, &base, NOW).expect("prepare");
+    session
+        .sign(&active_identity(&domain))
+        .expect("sign request");
+    let wire = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 64\r\nConnection: close\r\n\r\n{".to_vec();
+    let (mut requests, server) = scripted_peer(listener, vec![wire]).await;
+
+    let error = session.open().await.expect_err("truncated body refused");
+    assert!(matches!(error, RenewalError::Transport(_)), "{error}");
+    let request = requests.recv().await.expect("observed POST");
+    assert!(request
+        .headers
+        .starts_with("POST /api/key-negotiation/certificate-renewal/request"));
+    server.await.expect("scripted peer task");
 }
