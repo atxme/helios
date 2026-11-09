@@ -92,6 +92,17 @@ fn a_first_preparation_seals_the_epoch_after_the_last_decision() {
     );
 }
 
+#[test]
+fn preparation_refuses_to_wrap_the_gateway_decision_epoch() {
+    let mut gateway = gateway();
+    gateway.gateway_decision_epoch = u64::MAX;
+
+    let error = plan(&gateway, None, true, false, NOW)
+        .expect_err("a new candidate must not wrap the decision epoch");
+
+    assert!(error.to_string().contains("maximum"));
+}
+
 /// The operator holds one fingerprint. Re-signing would hand them a second.
 #[test]
 fn a_valid_request_for_the_same_epoch_is_returned_unchanged() {
@@ -119,6 +130,20 @@ fn an_expired_request_is_resigned_over_the_key_already_sealed() {
 }
 
 #[test]
+fn a_request_expiring_at_the_current_instant_is_resigned() {
+    let held = request(4, NOW);
+    let expected = held.new_ml_dsa_87_public_key.clone();
+
+    assert_eq!(
+        plan(&gateway(), Some(held), false, false, NOW).expect("plan"),
+        Plan::Resign {
+            epoch: 4,
+            pq_public_key: expected,
+        }
+    );
+}
+
+#[test]
 fn new_key_replaces_the_candidate_even_while_its_request_is_valid() {
     assert_eq!(
         plan(&gateway(), Some(request(4, NOW + 3600)), true, false, NOW).expect("plan"),
@@ -132,6 +157,14 @@ fn new_key_replaces_the_candidate_even_while_its_request_is_valid() {
 fn a_request_from_an_earlier_epoch_is_not_a_resumption() {
     assert_eq!(
         plan(&gateway(), Some(request(3, NOW + 3600)), false, false, NOW).expect("plan"),
+        Plan::Seal { epoch: 4 }
+    );
+}
+
+#[test]
+fn a_request_from_a_future_epoch_is_not_a_resumption() {
+    assert_eq!(
+        plan(&gateway(), Some(request(5, NOW + 3600)), false, false, NOW).expect("plan"),
         Plan::Seal { epoch: 4 }
     );
 }
@@ -198,6 +231,17 @@ fn an_absent_request_is_not_an_error() {
         read_pending(&directory.path().join("absent.json")).expect("read"),
         None
     );
+}
+
+#[test]
+fn a_malformed_pending_request_is_not_treated_as_absent() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("gateway-certificate-request.json");
+    std::fs::write(&path, b"{not-json").expect("write malformed request");
+
+    let error = read_pending(&path).expect_err("malformed state must fail closed");
+
+    assert!(error.to_string().contains("decoding the pending request"));
 }
 
 fn leaf_for(public_key: &MlDsa87PublicKey) -> PqCertificate {
@@ -325,6 +369,12 @@ fn a_tls_leaf_with_no_candidate_sealed_here_is_refused() {
     assert!(refusal.to_string().contains("--rotate-tls"));
 }
 
+#[test]
+fn a_transition_that_keeps_both_gateway_leaves_needs_no_local_candidate() {
+    candidate_is_held(&transition(4, None, None), None, None)
+        .expect("an unchanged identity has no candidate to compare");
+}
+
 /// A registry on disk, so the promotion path is exercised where it runs.
 fn registry_in(
     directory: &std::path::Path,
@@ -440,6 +490,46 @@ fn a_staged_transition_is_not_promoted_before_its_not_after() {
         !maintain_gateway_identity_in(&mut registry, None, NOW + 1_999, &documents)
             .expect("still in overlap")
     );
+    assert!(documents.transition.exists());
+}
+
+#[test]
+fn a_due_transition_for_another_epoch_fails_without_changing_the_registry() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let documents = documents_in(directory.path());
+    write_document(&documents.transition, &staged_transition(5), "transition")
+        .expect("write transition");
+    let mut gateway = gateway();
+    gateway.next_gateway_identity_epoch = Some(4);
+    gateway.activation_at = Some(NOW + 1_000);
+    gateway.retire_active_at = Some(NOW + 2_000);
+    gateway.published = true;
+    let mut registry = registry_in(directory.path(), gateway);
+
+    let error = maintain_gateway_identity_in(&mut registry, None, NOW + 2_000, &documents)
+        .expect_err("the due transition must match the staged epoch");
+
+    assert!(error
+        .to_string()
+        .contains("while epoch 4 must be finalized"));
+    assert_eq!(registry.state().gateway.active_gateway_identity_epoch, 3);
+    assert!(documents.transition.exists());
+}
+
+#[test]
+fn malformed_retained_transition_fails_without_changing_the_registry() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let documents = documents_in(directory.path());
+    std::fs::write(&documents.transition, b"{not-json").expect("write malformed transition");
+    let mut registry = registry_in(directory.path(), gateway());
+
+    let error = maintain_gateway_identity_in(&mut registry, None, NOW, &documents)
+        .expect_err("malformed persisted state must fail closed");
+
+    assert!(error
+        .to_string()
+        .contains("decoding the staged gateway transition"));
+    assert_eq!(registry.state().gateway.active_gateway_identity_epoch, 3);
     assert!(documents.transition.exists());
 }
 

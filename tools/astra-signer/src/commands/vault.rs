@@ -477,3 +477,21 @@ fn parse_slot_id(value: &str) -> Result<[u8; 16]> {
         .try_into()
         .map_err(|_| anyhow::anyhow!("un identifiant de key-slot fait 32 caractères hexadécimaux"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::parse_slot_id;
+
+    #[test]
+    fn slot_id_parser_accepts_trimmed_hex_and_rejects_bad_width_or_encoding() {
+        let expected = [0xabu8; 16];
+        assert_eq!(
+            parse_slot_id(&format!("  {}  ", hex::encode(expected))).expect("trimmed id"),
+            expected
+        );
+
+        for invalid in [String::new(), "00".into(), "gg".repeat(16), "00".repeat(17)] {
+            assert!(parse_slot_id(&invalid).is_err(), "accepted {invalid:?}");
+        }
+    }
+}
