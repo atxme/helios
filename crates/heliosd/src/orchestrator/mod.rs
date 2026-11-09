@@ -238,6 +238,8 @@ pub async fn run(
     tokio::pin!(shutdown);
     let mut unsupported_mss_clamp_reported = false;
 
+    // Errors inside the command loop must still pass through shutdown cleanup.
+    let loop_result: anyhow::Result<()> = async {
     loop {
         tokio::select! {
             shutdown_result = &mut shutdown => {
@@ -366,6 +368,8 @@ pub async fn run(
             }
         }
     }
+    Ok(())
+    }.await;
     if let Err(error) = transition(
         &shared_state,
         &event_tx,
@@ -389,7 +393,7 @@ pub async fn run(
     // it is state the daemon put there and must take back.
     let ipv6 = shared_ipv6.read().await.clone();
     unpin_peer_vips(dry_run, &ipv6).await;
-    Ok(())
+    loop_result
 }
 
 async fn wait_api_ready(api_ready: &AtomicBool) -> anyhow::Result<()> {
