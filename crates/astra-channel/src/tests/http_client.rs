@@ -193,6 +193,28 @@ async fn the_typed_peer_query_encodes_its_identity_and_rejects_invalid_json() {
 }
 
 #[tokio::test]
+async fn the_typed_peer_listing_reads_every_key_and_refuses_a_malformed_one() {
+    let listed = WireGuardKey::from_bytes([7; 32]);
+    let body = format!(r#"{{"peers":["{}"]}}"#, listed.to_base64());
+    let server = response_server(fixed_response(200, body.as_bytes())).await;
+    let client = GatewayLifecycleClient::new(server.address, server.client_tls);
+    assert_eq!(
+        within_deadline(client.peer_keys()).await.expect("listing"),
+        vec![listed]
+    );
+    let request = String::from_utf8(finish(server.request).await).expect("request text");
+    assert!(request.starts_with(&format!("GET {PEERS_PATH} HTTP/1.1\r\n")));
+
+    let server = response_server(fixed_response(200, br#"{"peers":["AAAA"]}"#)).await;
+    let client = GatewayLifecycleClient::new(server.address, server.client_tls);
+    assert!(matches!(
+        within_deadline(client.peer_keys()).await,
+        Err(ChannelError::Body(_))
+    ));
+    finish(server.request).await;
+}
+
+#[tokio::test]
 async fn publication_serializes_the_exact_document_on_its_typed_route() {
     let server = response_server(fixed_response(204, b"")).await;
     let client = GatewayLifecycleClient::new(server.address, server.client_tls);

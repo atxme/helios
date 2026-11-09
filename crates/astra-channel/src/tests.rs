@@ -121,6 +121,7 @@ fn self_signed(name: &str, role: PinnedRole, days: i64) -> (Vec<u8>, Vec<u8>) {
 struct SpyHandler {
     seen: Mutex<Vec<&'static str>>,
     published: Mutex<Vec<GatewayTransitionPublished>>,
+    listed: Vec<WireGuardKey>,
 }
 
 #[async_trait]
@@ -180,6 +181,11 @@ impl AstraChannelHandler for SpyHandler {
         Err(TrustUpdateRefusal::Rejected)
     }
 
+    async fn peer_keys(&self) -> Result<Vec<WireGuardKey>, TrustUpdateRefusal> {
+        self.seen.lock().unwrap().push("peer_keys");
+        Ok(self.listed.clone())
+    }
+
     async fn gateway_identity(&self) -> Result<GatewayIdentityView, TrustUpdateRefusal> {
         self.seen.lock().unwrap().push("gateway_identity");
         Err(TrustUpdateRefusal::Rejected)
@@ -190,6 +196,7 @@ fn spy() -> Arc<SpyHandler> {
     Arc::new(SpyHandler {
         seen: Mutex::new(Vec::new()),
         published: Mutex::new(Vec::new()),
+        listed: Vec::new(),
     })
 }
 
@@ -706,6 +713,7 @@ async fn the_identity_route_dispatches_only_reads() {
         ("GET", REVOKE_PATH),
         ("GET", DISTRIBUTION_PATH),
         ("GET", GATEWAY_PUBLISHED_PATH),
+        ("POST", PEERS_PATH),
     ] {
         let handler = spy();
         assert_eq!(
@@ -715,6 +723,37 @@ async fn the_identity_route_dispatches_only_reads() {
         );
         assert!(handler.seen.lock().unwrap().is_empty());
     }
+}
+
+/// The listing answers every key the handler holds, in the wire shape Astra
+/// reads: `{"peers":["<base64>", ...]}`, and nothing else.
+#[tokio::test]
+async fn peers_route_lists_every_certificate_record() {
+    let admitted = WireGuardKey::from_bytes([1; 32]);
+    let cut = WireGuardKey::from_bytes([2; 32]);
+    let handler = Arc::new(SpyHandler {
+        seen: Mutex::new(Vec::new()),
+        published: Mutex::new(Vec::new()),
+        listed: vec![admitted, cut],
+    });
+    let response = router(handler.clone())
+        .oneshot(
+            Request::get(PEERS_PATH)
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("router responds");
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), MAX_INTERNAL_BODY_BYTES)
+        .await
+        .expect("bounded body");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON body");
+    assert_eq!(
+        body,
+        serde_json::json!({"peers": [admitted.to_base64(), cut.to_base64()]})
+    );
+    assert_eq!(handler.seen.lock().unwrap().as_slice(), ["peer_keys"]);
 }
 
 #[test]

@@ -76,6 +76,14 @@ impl GatewayLifecycleClient {
         serde_json::from_slice(&answer).map_err(|error| ChannelError::Body(error.to_string()))
     }
 
+    /// Lists every peer the gateway holds a certificate record for.
+    pub async fn peer_keys(&self) -> Result<Vec<WireGuardKey>, ChannelError> {
+        let answer = self.http.request("GET", PEERS_PATH, None, None).await?;
+        let view: PeerKeysView = serde_json::from_slice(&answer)
+            .map_err(|error| ChannelError::Body(error.to_string()))?;
+        Ok(view.peers)
+    }
+
     /// Reads the leaf the gateway serves, so a receipt can be verified under
     /// the key that actually signed it.
     /// Leaves a signed transaction for the peer the manifest names (§8.1.1).

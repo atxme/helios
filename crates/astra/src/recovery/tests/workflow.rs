@@ -113,6 +113,10 @@ impl astra_channel::AstraChannelHandler for RecoveryGateway {
         Ok(self.peer_view.lock().await.clone())
     }
 
+    async fn peer_keys(&self) -> Result<Vec<WireGuardKey>, TrustUpdateRefusal> {
+        Ok(Vec::new())
+    }
+
     async fn gateway_identity(
         &self,
     ) -> Result<astra_channel::GatewayIdentityView, TrustUpdateRefusal> {

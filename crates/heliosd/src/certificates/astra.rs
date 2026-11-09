@@ -140,6 +140,28 @@ impl ::astra_channel::AstraChannelHandler for CertificateService {
         })
     }
 
+    /// Every peer the registry holds a certificate record for.
+    ///
+    /// Read from the registry `peer_state` reads, and not from admission: a
+    /// peer whose admission was removed keeps its record, and stays listed
+    /// until its record itself goes. A stored key that does not parse is an
+    /// internal fault, refused rather than skipped, so the list never silently
+    /// omits a peer.
+    async fn peer_keys(&self) -> Result<Vec<WireGuardKey>, TrustUpdateRefusal> {
+        let registry = self.registry.lock().await;
+        registry
+            .state()
+            .peers
+            .keys()
+            .map(|key| {
+                WireGuardKey::parse(key).map_err(|error| {
+                    tracing::error!(%error, "a stored peer key does not parse");
+                    TrustUpdateRefusal::Internal
+                })
+            })
+            .collect()
+    }
+
     /// The served leaf and the two counters that date it.
     ///
     /// The certificate comes from the negotiation handler — what is *served* —

@@ -988,6 +988,15 @@ impl astra_channel::AstraChannelHandler for FakeGateway {
         Err(aether::certificates::transport::TrustUpdateRefusal::Rejected)
     }
 
+    async fn peer_keys(
+        &self,
+    ) -> Result<
+        Vec<aether::certificates::encoding::WireGuardKey>,
+        aether::certificates::transport::TrustUpdateRefusal,
+    > {
+        Ok(Vec::new())
+    }
+
     async fn gateway_identity(
         &self,
     ) -> Result<

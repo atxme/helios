@@ -780,6 +780,52 @@ async fn a_recovery_commit_must_name_the_staging_the_registry_recorded() {
         .is_err());
 }
 
+/// Removing a peer's admission leaves its certificate record in place, and the
+/// listing keeps naming it: Astra must learn every workstation the gateway
+/// still holds state for, including one that has just been cut.
+#[tokio::test]
+async fn a_cut_peer_is_still_listed() {
+    use ::astra_channel::AstraChannelHandler;
+
+    let (service, _directory) = service(state());
+    let peer_key = key(2);
+    let material = aether::certificates::test_x509::client_material("workstation");
+    let leaf = client_leaf(&peer_key, 500_000);
+    service
+        .admit_peer(
+            "workstation",
+            &peer_key.to_base64(),
+            material.leaf.clone(),
+            Box::new(leaf),
+        )
+        .await
+        .expect("admission");
+
+    let mut network = aether::NetworkConfig {
+        peers: vec![aether::WgPeer {
+            name: "workstation".into(),
+            public_key: peer_key.to_base64(),
+            address: "100.64.1.2/32".into(),
+            address_v6: None,
+            admin: false,
+            preshared_key: None,
+            key_negotiation_certificate_sha256: None,
+            key_negotiation_pq_certificate_sha256: None,
+            minimum_key_negotiation_mode: None,
+            persistent_keepalive_secs: aether::config::DEFAULT_PERSISTENT_KEEPALIVE_SECS,
+        }],
+        ..aether::NetworkConfig::default()
+    };
+    helios_provisioning::revoke(&mut network, "workstation").expect("admission removed");
+    assert!(network.peers.is_empty());
+
+    assert_eq!(
+        service.peer_keys().await.expect("listing"),
+        vec![peer_key],
+        "a cut peer keeps its certificate record, so it stays listed"
+    );
+}
+
 #[tokio::test]
 async fn an_empty_queue_makes_the_gateway_ask_the_authority() {
     let mut state = state();

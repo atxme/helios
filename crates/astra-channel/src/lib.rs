@@ -139,6 +139,12 @@ pub const DISTRIBUTION_PATH: &str = "/internal/v1/certificates/distribution";
 /// the class of deployment error `deploy.sh` exists to remove. Nothing secret
 /// crosses: the leaf is the public object every client already pins.
 pub const GATEWAY_IDENTITY_PATH: &str = "/internal/v1/certificates/gateway-identity";
+/// Every peer the gateway holds a certificate record for, admitted or cut.
+///
+/// Astra needs the whole set to know every admitted workstation, and a peer
+/// whose admission was removed keeps its record: it must stay listed, or the
+/// authority would lose track of a certificate that is still valid.
+pub const PEERS_PATH: &str = "/internal/v1/certificates/peers";
 /// Where the authority reports that a staged transition may no longer be
 /// aborted (spec §6.3, §11.1 step 6).
 pub const GATEWAY_PUBLISHED_PATH: &str = "/internal/v1/certificates/gateway-transition/published";

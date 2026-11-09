@@ -127,6 +127,11 @@ impl AstraChannelHandler for Recorder {
         Ok(())
     }
 
+    async fn peer_keys(&self) -> Result<Vec<WireGuardKey>, TrustUpdateRefusal> {
+        self.seen.lock().unwrap().push("peers".into());
+        Ok(Vec::new())
+    }
+
     async fn gateway_identity(&self) -> Result<GatewayIdentityView, TrustUpdateRefusal> {
         self.seen.lock().unwrap().push("identity".into());
         let pq_certificate = served_leaf();

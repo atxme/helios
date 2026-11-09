@@ -270,6 +270,10 @@ impl AstraChannelHandler for Gateway {
         }
         Ok(self.view.lock().await.clone())
     }
+    async fn peer_keys(&self) -> Result<Vec<WireGuardKey>, TrustUpdateRefusal> {
+        Ok(Vec::new())
+    }
+
     async fn gateway_identity(&self) -> Result<GatewayIdentityView, TrustUpdateRefusal> {
         let gate = self.identity_gate.lock().await.clone();
         if let Some(gate) = gate {

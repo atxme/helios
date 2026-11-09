@@ -134,6 +134,9 @@ pub trait AstraChannelHandler: AstraStageHandler {
         identity: &WireGuardKey,
     ) -> Result<PeerCertificateStateView, TrustUpdateRefusal>;
 
+    /// Lists every peer with a certificate record, admitted or cut.
+    async fn peer_keys(&self) -> Result<Vec<WireGuardKey>, TrustUpdateRefusal>;
+
     /// The gateway's own served leaf, so the authority can verify a receipt
     /// under the key that signed it rather than under a copy it was handed.
     async fn gateway_identity(&self) -> Result<GatewayIdentityView, TrustUpdateRefusal>;
@@ -164,6 +167,16 @@ pub trait AstraChannelHandler: AstraStageHandler {
         &self,
         relayed: Box<RelayedStageCommit>,
     ) -> Result<(), TrustUpdateRefusal>;
+}
+
+/// The peers the gateway holds certificate state for.
+///
+/// Keys only: the listing says which identities the gateway knows, and nothing
+/// about any of them. The state of one peer is read on its own route.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerKeysView {
+    pub peers: Vec<WireGuardKey>,
 }
 
 /// A commit relayed on the private link, for a recovery only (spec §7.3).
@@ -256,6 +269,7 @@ pub fn router(handler: Arc<dyn AstraChannelHandler>) -> Router {
         .route(STAGE_COMMIT_PATH, post(stage_commit))
         .route(REVOKE_PATH, post(revoke))
         .route(STATE_ROUTE, get(peer_state))
+        .route(PEERS_PATH, get(peer_keys))
         .route(GATEWAY_IDENTITY_PATH, get(gateway_identity))
         .route(GATEWAY_PUBLISHED_PATH, post(gateway_transition_published))
         .route(DISTRIBUTION_PATH, post(distribute))
@@ -376,6 +390,14 @@ async fn peer_state(
     };
     match handler.peer_state(&identity).await {
         Ok(view) => (StatusCode::OK, Json(view)).into_response(),
+        Err(refusal) => InternalRefusal::from(refusal).into_response(),
+    }
+}
+
+/// `GET /internal/v1/certificates/peers`.
+async fn peer_keys(State(handler): State<Arc<dyn AstraChannelHandler>>) -> Response {
+    match handler.peer_keys().await {
+        Ok(peers) => (StatusCode::OK, Json(PeerKeysView { peers })).into_response(),
         Err(refusal) => InternalRefusal::from(refusal).into_response(),
     }
 }
