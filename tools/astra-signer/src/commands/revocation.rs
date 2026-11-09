@@ -36,6 +36,12 @@ pub(crate) fn revoke(
     let operation = Id16::parse_hex(operation_id)
         .map_err(|error| anyhow::anyhow!("--operation-id : {error}"))?;
     let vault = store::load(path)?;
+    // While an outgoing CA-PQ is kept, Astra may check either anchor, and this
+    // command cannot see which one from the signed campaign. Refused before any
+    // key is asked for, so nothing is signed under a guess.
+    if vault.retained_outgoing_ca_pq_public.is_some() {
+        bail!("Changement de CA-PQ en cours : révoquer ce poste depuis Orion. Rien n'a été signé.");
+    }
     let handoff = handoff::DomainHandoff::beside(path, &vault)?;
     let identity = handoff::identity_of(&handoff)?;
     let ca_pq_public_key = MlDsa87PublicKey::parse(&handoff.ca_pq_public_key)?;
@@ -202,6 +208,7 @@ pub(crate) fn revoke(
         &ca_pq_public_key,
         &decision,
         target.epoch,
+        signing::RevocationAnchor::Current,
     )?;
     campaign
         .covers_revocation(&revocation)

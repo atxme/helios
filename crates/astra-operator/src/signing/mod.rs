@@ -177,11 +177,6 @@ fn to_offset_date_time(seconds: u64) -> Result<time::OffsetDateTime> {
         .map_err(|_| GestureError::Anchors("horodatage hors bornes".into()))
 }
 
-/// Opens the anchors for the length of one operation.
-///
-/// A single helper so every gesture below reaches the private keys the same
-/// way — through a slot the authenticator just opened — and none of them holds
-/// the secrets any longer than the closure it is given.
 /// What an anchor rotation is refused with while the outgoing `CA-PQ` is kept.
 const PENDING_CA_PQ_ROTATION: &str = "Terminer d'abord la rotation CA-PQ précédente.";
 
@@ -194,6 +189,11 @@ fn refuse_while_outgoing_ca_pq_is_kept(vault: &AuthorityVault) -> Result<()> {
     Ok(())
 }
 
+/// Opens the anchors for the length of one operation.
+///
+/// A single helper so every gesture below reaches the private keys the same
+/// way — through a slot the authenticator just opened — and none of them holds
+/// the secrets any longer than the closure it is given.
 fn with_anchors<T>(
     vault: &AuthorityVault,
     opening: &crate::authenticator::Opened,
@@ -260,7 +260,10 @@ pub use gateway::{
 };
 pub use issuer::authorize_issuer;
 pub use recovery::{grant_recovered_identity, recover_expired_identity, RecoveryAuthorization};
-pub use revocation::{sign_revocation, RevocationDecision};
+pub use revocation::{
+    revocation_anchor, sign_revocation, RevocationAnchor, RevocationAnchorRefusal,
+    RevocationDecision, OUTGOING_REVOCATION_MARGIN_SECS,
+};
 
 // What the gestures name of each other, through `use super::*`.
 use self::bindings::*;

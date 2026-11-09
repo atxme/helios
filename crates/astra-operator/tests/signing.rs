@@ -34,7 +34,8 @@ use astra_operator::gestures::{
 };
 use astra_operator::signing::{
     self, issue_ca_tls, CampaignApprovalSession, DelegationBounds, DomainIdentity,
-    IssuerDelegationRequest, MAX_CA_TLS_LIFETIME_SECS,
+    IssuerDelegationRequest, RevocationAnchor, RevocationAnchorRefusal, MAX_CA_TLS_LIFETIME_SECS,
+    OUTGOING_REVOCATION_MARGIN_SECS,
 };
 use astra_operator::vault::{AuthorityVault, SlotRole};
 use base64::Engine as _;
@@ -211,6 +212,7 @@ fn an_emergency_revocation_is_signed_by_the_master_anchor() {
         &ca_pq_public_key(&vault),
         &decision,
         0,
+        RevocationAnchor::Current,
     )
     .expect("revocation signs");
     revocation
@@ -1171,4 +1173,267 @@ fn an_expired_recovery_refuses_a_key_the_request_does_not_name() {
     )
     .is_err());
     assert_eq!(second.assertions(), before);
+}
+
+/// A vault whose `CA-PQ` has rotated once: it holds the outgoing key, sealed
+/// and in the clear, until « Terminer ». Returns the outgoing anchor too.
+fn rotated_vault(first: &FakeKey, second: &FakeKey) -> (AuthorityVault, MlDsa87PublicKey) {
+    let mut vault = bootstrapped(first, second);
+    let registry = bindings(&vault, &open(first, &vault));
+    let previous_anchor = ca_pq_public_key(&vault);
+    let window = TransitionWindow::new(NOW, NOW + 3_600, NOW + 7_200).expect("window");
+    let (first_opening, second_opening) = (open(first, &vault), open(second, &vault));
+    signing::rotate_ca_pq(
+        &mut vault,
+        &[&first_opening, &second_opening],
+        &identity(),
+        Some(&registry),
+        window,
+        NOW,
+    )
+    .expect("the anchor rotates");
+    (vault, previous_anchor)
+}
+
+/// The rotated vault's outgoing key is retired at this second.
+const OVERLAP_END: u64 = NOW + 7_200;
+
+#[test]
+fn outgoing_signature_verifies_under_the_outgoing_anchor() {
+    let first = FakeKey::new(1);
+    let second = FakeKey::new(2);
+    let (vault, previous) = rotated_vault(&first, &second);
+    let anchor = signing::revocation_anchor(
+        &vault,
+        &previous.authority_fingerprint(),
+        1,
+        2,
+        Some(OVERLAP_END),
+        NOW,
+    )
+    .expect("Astra still checks the outgoing anchor");
+    assert_eq!(anchor, RevocationAnchor::Outgoing);
+
+    let opening = open(&first, &vault);
+    let decision = signing::RevocationDecision {
+        scope: RevocationScope::Client,
+        identity_key: WireGuardKey::from_bytes([7; 32]),
+        server_name: None,
+        revocation_epoch: 1,
+        revoked_tls: Some((Fingerprint::of(b"tls leaf"), NOW + 86_400)),
+        revoked_pq: None,
+        effective_at: NOW,
+        reason: RevocationReason::KeyCompromise,
+        replacement_transition_fingerprint: None,
+    };
+    let revocation = signing::sign_revocation(
+        &vault,
+        &opening,
+        &identity(),
+        &ca_pq_public_key(&vault),
+        &decision,
+        0,
+        anchor,
+    )
+    .expect("signs under the outgoing key");
+
+    assert_eq!(
+        revocation.ca_epoch, 1,
+        "the outgoing epoch, not the current one"
+    );
+    revocation
+        .verify(&previous, &domain(), 1, 0)
+        .expect("verifies under the outgoing anchor and epoch");
+    assert!(revocation
+        .verify(&ca_pq_public_key(&vault), &domain(), 1, 0)
+        .is_err());
+}
+
+#[test]
+fn outgoing_signature_refused_inside_the_margin() {
+    let first = FakeKey::new(1);
+    let second = FakeKey::new(2);
+    let (vault, previous) = rotated_vault(&first, &second);
+    let fingerprint = previous.authority_fingerprint();
+    let anchor_at =
+        |now: u64| signing::revocation_anchor(&vault, &fingerprint, 1, 2, Some(OVERLAP_END), now);
+
+    let last_outside = OVERLAP_END - OUTGOING_REVOCATION_MARGIN_SECS - 1;
+    assert_eq!(anchor_at(last_outside), Ok(RevocationAnchor::Outgoing));
+    let margin_start = OVERLAP_END - OUTGOING_REVOCATION_MARGIN_SECS;
+    assert_eq!(
+        anchor_at(margin_start),
+        Err(RevocationAnchorRefusal::NotBefore(OVERLAP_END))
+    );
+    assert_eq!(
+        anchor_at(OVERLAP_END),
+        Err(RevocationAnchorRefusal::NotBefore(OVERLAP_END))
+    );
+}
+
+#[test]
+fn current_anchor_outside_a_rotation() {
+    let first = FakeKey::new(1);
+    let second = FakeKey::new(2);
+    let vault = bootstrapped(&first, &second);
+    let anchor = signing::revocation_anchor(
+        &vault,
+        &ca_pq_public_key(&vault).authority_fingerprint(),
+        1,
+        1,
+        None,
+        NOW,
+    );
+    assert_eq!(anchor, Ok(RevocationAnchor::Current));
+}
+
+/// A vault from before this lot keeps no outgoing key. Astra still on the
+/// previous anchor is refused until the gateway says when the overlap ends, and
+/// refused for good when it does not say.
+#[test]
+fn no_retained_key_means_after_not_after() {
+    let first = FakeKey::new(1);
+    let second = FakeKey::new(2);
+    let vault = bootstrapped(&first, &second);
+    let (_, previous) = generate_ml_dsa_87_keypair().expect("previous anchor");
+    let previous_fingerprint = previous.authority_fingerprint();
+
+    assert_eq!(
+        signing::revocation_anchor(&vault, &previous_fingerprint, 1, 2, Some(OVERLAP_END), NOW),
+        Err(RevocationAnchorRefusal::NotBefore(OVERLAP_END))
+    );
+    assert_eq!(
+        signing::revocation_anchor(&vault, &previous_fingerprint, 1, 2, None, NOW),
+        Err(RevocationAnchorRefusal::UnknownAnchor)
+    );
+}
+
+#[test]
+fn unknown_anchor_is_refused() {
+    let first = FakeKey::new(1);
+    let second = FakeKey::new(2);
+    let (vault, previous) = rotated_vault(&first, &second);
+    let overlap = Some(OVERLAP_END);
+
+    let stranger = Fingerprint::of(b"an anchor this vault never held");
+    assert_eq!(
+        signing::revocation_anchor(&vault, &stranger, 1, 2, overlap, NOW),
+        Err(RevocationAnchorRefusal::UnknownAnchor)
+    );
+    // The outgoing fingerprint with the wrong epoch.
+    assert_eq!(
+        signing::revocation_anchor(
+            &vault,
+            &previous.authority_fingerprint(),
+            0,
+            2,
+            overlap,
+            NOW
+        ),
+        Err(RevocationAnchorRefusal::UnknownAnchor)
+    );
+    // The current fingerprint at an epoch that is not the current one.
+    assert_eq!(
+        signing::revocation_anchor(
+            &vault,
+            &ca_pq_public_key(&vault).authority_fingerprint(),
+            1,
+            2,
+            overlap,
+            NOW
+        ),
+        Err(RevocationAnchorRefusal::UnknownAnchor)
+    );
+}
+
+/// Each other signing path is handed the vault with a different outgoing key
+/// kept, and each signature verifies under the current anchor, not the
+/// outgoing one. The `CA-TLS` transition is refused while the outgoing key is
+/// kept, so it is asserted refused rather than signed.
+#[test]
+fn no_other_signing_path_reads_the_outgoing_key() {
+    let first = FakeKey::new(1);
+    let second = FakeKey::new(2);
+    let (vault, previous) = rotated_vault(&first, &second);
+    let rotated = DomainIdentity {
+        ca_epoch: 2,
+        ..identity()
+    };
+    let current = ca_pq_public_key(&vault);
+    assert_ne!(current, previous, "the outgoing key is a different key");
+    let opening = open(&first, &vault);
+
+    let registry = signing::sign_credential_bindings(&vault, &opening, &rotated, None, &[], NOW)
+        .expect("bindings");
+    for binding in &registry.bindings {
+        binding
+            .verify(
+                &current,
+                &rotated.trust_domain_id,
+                &rotated.gateway_wg_public_key,
+                2,
+                0,
+            )
+            .expect("bindings verify under the current anchor");
+        assert!(binding
+            .verify(
+                &previous,
+                &rotated.trust_domain_id,
+                &rotated.gateway_wg_public_key,
+                1,
+                0
+            )
+            .is_err());
+    }
+
+    let ca_tls = signing::issue_ca_tls(&vault, &opening, &rotated, NOW, NOW + 365 * 86_400)
+        .expect("CA-TLS issues");
+    let (_, issuer_public) = generate_ml_dsa_87_keypair().expect("issuer keypair");
+    let issuer_tls_key = rcgen::KeyPair::generate().expect("issuer TLS key");
+    let mut csr_params = rcgen::CertificateParams::new(vec![SERVER_NAME.into()]).expect("params");
+    csr_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "Astra delegated issuer");
+    let csr = csr_params
+        .serialize_request(&issuer_tls_key)
+        .expect("PKCS#10");
+    let request = IssuerDelegationRequest {
+        trust_domain_id: rotated.trust_domain_id.to_hex(),
+        issuer_epoch: 1,
+        pq_issuer_public_key: issuer_public.to_base64(),
+        tls_intermediate_csr: base64::engine::general_purpose::STANDARD.encode(csr.der()),
+    };
+    let bounds = DelegationBounds {
+        maximum_leaf_lifetime_secs: 90 * 86_400,
+        not_before: NOW,
+        not_after: NOW + 30 * 86_400,
+    };
+    let delegation =
+        signing::authorize_issuer(&vault, &opening, &rotated, &ca_tls, &request, &bounds, NOW)
+            .expect("the delegation signs");
+    delegation
+        .verify(
+            &current,
+            &rotated.trust_domain_id,
+            rotated.ca_epoch,
+            rotated.ca_tls_epoch,
+            &rotated.gateway_wg_public_key,
+            &rotated.server_name,
+            NOW,
+        )
+        .expect("the delegation verifies under the current anchor");
+
+    let window = TransitionWindow::new(NOW, NOW + 3_600, NOW + 7_200).expect("window");
+    let refused = signing::rotate_ca_tls(
+        &mut vault.clone(),
+        &opening,
+        &rotated,
+        &ca_tls,
+        window,
+        (NOW, NOW + 30 * 86_400),
+    );
+    assert!(matches!(
+        refused,
+        Err(GestureError::Anchors(ref message)) if message.as_str() == PENDING_ROTATION
+    ));
 }

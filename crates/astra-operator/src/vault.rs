@@ -1008,6 +1008,25 @@ impl AuthorityVault {
         Some((key, public.ca_epoch, public.not_after))
     }
 
+    /// Runs `operation` on the outgoing `CA-PQ`'s sealed half, for the length of
+    /// that closure and no longer. `Ok(None)` when no key is kept.
+    ///
+    /// Reserved for `sign_revocation`: nothing else may read the outgoing
+    /// private key, and a signing path that wants a current-anchor signature
+    /// goes through `with_anchors` instead.
+    pub(crate) fn with_retained_outgoing_ca_pq<T, E: From<VaultError>>(
+        &self,
+        opening_credential: &[u8],
+        opening_secret: &SlotSecret,
+        operation: impl FnOnce(&RetainedOutgoingCaPq) -> std::result::Result<T, E>,
+    ) -> std::result::Result<Option<T>, E> {
+        let secrets = self.open(opening_credential, opening_secret)?;
+        let Some(retained) = secrets.retained_outgoing_ca_pq.as_ref() else {
+            return Ok(None);
+        };
+        operation(retained).map(Some)
+    }
+
     /// What the vault holds beside the issuing `CA-TLS` key, if anything.
     ///
     /// Public material only: the caller learns which window is open and when

@@ -448,3 +448,74 @@ fn key_slot_gestures_are_refused_while_a_rotation_journal_is_in_flight() {
     }
     assert_eq!(std::fs::read(&vault).expect("vault"), b"coffre");
 }
+
+/// While an outgoing `CA-PQ` is kept, Astra may check either anchor and this
+/// command cannot tell which from the campaign. Refused before any key is
+/// asked for, and before anything is fetched.
+#[test]
+fn revoke_is_refused_while_an_outgoing_ca_pq_is_kept() {
+    use aether::certificates::encoding::{generate_ml_dsa_87_keypair, Id16};
+    use aether::certificates::revocation::{RevocationReason, RevocationScope};
+    use astra_operator::vault::{
+        draw_salt, AuthoritySecrets, RetainedOutgoingCaPq, SlotEnrolment, SlotRole, SlotSecret,
+    };
+    use base64::Engine as _;
+
+    let directory = tempfile::tempdir().expect("dir");
+    let path = directory.path().join("authority-vault.json");
+    let encoder = base64::engine::general_purpose::STANDARD;
+    let (private, public) = generate_ml_dsa_87_keypair().expect("keys");
+    let (outgoing_private, outgoing_public) = generate_ml_dsa_87_keypair().expect("outgoing");
+    let secrets = AuthoritySecrets {
+        ca_pq_private_key: encoder.encode(&*private),
+        ca_pq_public_key: public.to_base64(),
+        ca_tls_private_key: encoder.encode(b"tls"),
+        retained_ca_tls: None,
+        retained_outgoing_ca_pq: Some(RetainedOutgoingCaPq {
+            private_key: encoder.encode(&*outgoing_private),
+            public_key: outgoing_public.to_base64(),
+            ca_epoch: 1,
+            not_after: 9_000,
+        }),
+    };
+    let enrolment = SlotEnrolment {
+        role: SlotRole::Primary,
+        label: "clé".into(),
+        credential_id: vec![1; 64],
+        credential_public_key: vec![0xa5, 0x01],
+        aaguid: [1; 16],
+        enrolled_at: 1_000,
+    };
+    let vault = AuthorityVault::create(
+        TrustDomainId::new([1; 16]).expect("domain"),
+        "astra.helios.test",
+        draw_salt().expect("salt"),
+        &secrets,
+        enrolment,
+        &SlotSecret::new(vec![1; 32]),
+        1_000,
+    )
+    .expect("vault");
+    store::save(&path, &vault).expect("vault saved");
+
+    let error = commands::revoke(
+        &path,
+        "https://astra.helios.test",
+        &Id16::new([2; 16]).expect("id").to_hex(),
+        None,
+        commands::RevocationInputs {
+            scope: RevocationScope::Client,
+            halves: RevokedHalvesArg::Both,
+            tls_not_after: Some(5_000),
+            pq_not_after: Some(5_000),
+            reason: RevocationReason::KeyCompromise,
+            replacement: None,
+        },
+        Transport::default(),
+    )
+    .expect_err("refused");
+    assert_eq!(
+        format!("{error}"),
+        "Changement de CA-PQ en cours : révoquer ce poste depuis Orion. Rien n'a été signé."
+    );
+}
