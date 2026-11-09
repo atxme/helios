@@ -787,6 +787,25 @@ Les étapes qui exigent le toucher d'une vraie clé, le dialogue WebAuthn de
 Windows et le verrou de fichier du volume ne se vérifient pas sous WSL : à valider
 en recette (MANUAL-TESTING, « G. Lot 5b »).
 
+#### Amendement du 9 novembre 2026 : révocation d'un poste depuis Orion (F14, lot 5c)
+
+La révocation d'un poste client se fait depuis Orion (onglet *Postes*). Décidé
+par l'utilisateur le 8 novembre 2026 ; détail dans la spécification (§0.11) et la
+conception du lot 5c.
+
+- **La gateway reste l'autorité sur l'admission.** Orion retire d'abord
+  l'admission à la gateway, avant toute signature ; la coupure n'attend ni Astra,
+  ni le coffre. Astra recopie les postes que la gateway admet (balayage toutes les
+  60 s, et à l'ouverture d'une révocation pour un poste inconnu) ; elle ne décide
+  rien de l'admission, et un poste que la gateway ne connaît pas est refusé.
+- **Une révocation pendant un recouvrement `CA-PQ` est possible (F14-b levé).**
+  Le coffre garde la clé `CA-PQ` sortante jusqu'à « Terminer la rotation CA-PQ » ;
+  la révocation se signe sous l'ancre qu'Astra vérifie, à plus d'une heure de
+  `not_after`. Un test de bout en bout côté Astra (`crates/astra/src/door/tests/overlap_revocation.rs`)
+  la fait accepter par Astra, sous le document sortant, puis vérifier sous l'ancre
+  de la gateway ; ce dernier contrôle y est reproduit sur un état de gateway, sans
+  appeler `heliosd`. Une rotation antérieure à ce lot ne garde pas sa clé sortante.
+
 ### 8. Avortement, leases et atomicité logique
 
 Une transition gateway peut être avortée sans révocation seulement tant

@@ -874,6 +874,29 @@ depuis.
 La réponse à un credential réellement compromis n'est donc pas un retrait de
 slot, c'est une rotation de `CA-PQ`.
 
+## Notes de version : lot 5c de F14
+
+- **Mettre à niveau Astra et `heliosd` ensemble.** La réponse de statut
+  d'Astra (`operator/status`) porte désormais `revoked_peers` et
+  `served_credentials`. Sa structure refuse les champs inconnus
+  (`OperatorAuthorityStatus`, `deny_unknown_fields`,
+  `crates/aether/src/certificates/transport.rs:1284`) : un `heliosd` plus ancien
+  rejette la réponse de statut d'un Astra plus récent. Cette réponse a sa propre
+  borne, 1 MiB (`MAX_OPERATOR_STATUS_BYTES`, `crates/astra-channel/src/authority_routes.rs:75`).
+- **Route des postes.** Astra recopie les postes admis à partir de
+  `/internal/v1/certificates/peers`, que `heliosd` doit servir. Sans elle, Astra
+  ne recopie aucun poste, et la révocation d'un poste qu'elle ne connaît pas est
+  refusée sur le canal.
+- **Un coffre écrit par ce lot ne s'ouvre plus avec un Orion ou un `astra-signer`
+  plus ancien**, dès qu'il détient une clé `CA-PQ` sortante, c'est-à-dire entre la
+  signature d'une rotation `CA-PQ` et « Terminer la rotation CA-PQ ». Les structures
+  refusent les champs inconnus (`crates/astra-operator/src/vault.rs:270` et `:412`).
+  Un coffre sans clé sortante se sérialise comme avant : les deux champs ne sont
+  écrits que s'ils sont présents (`skip_serializing_if`, `vault.rs:290` et `:427`).
+  Mettre Orion et `astra-signer` à jour avant la prochaine rotation `CA-PQ`.
+- **Révocation pendant une rotation `CA-PQ`.** `astra-signer revoke` refuse dans
+  cet état et renvoie vers Orion ; c'est Orion qui signe.
+
 ## Essais sur cible
 
 Voir [testing/TESTING.md](testing/TESTING.md), sections « coffre d'autorité

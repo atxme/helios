@@ -41,6 +41,7 @@ lance plus `astra-signer`.
 | Remplacer la CA-PQ | ouvre `trust_authorities`, signe, dépose, installe sur la gateway | §3 |
 | Remplacer la CA TLS | idem pour la CA TLS | §9 |
 | Renouveler la délégation | délégation de l'émetteur, sans fichier ni redémarrage | §4 |
+| Révoquer un poste | onglet *Postes* : coupe le poste tout de suite, puis signe la révocation (lot 5c) | §7 |
 
 Orion vérifie des **prérequis** avant toute ouverture (tunnel, administrateur,
 service Astra, coffre, deux clés, copie du coffre, domaine concordant) et dit
@@ -90,8 +91,9 @@ Trois ouvertures se font aussi **depuis un poste administrateur du tunnel**,
 sans entrer dans le conteneur : `fleet_leafs` (§2), `trust_authorities` (§3,
 §9) et la révocation d'un client (§7), par `POST
 /api/certificates/operator/campaigns`. Orion l'emploie depuis le lot 5b pour
-les rotations (onglet *Rotations*) ; l'écran de révocation d'un poste vient avec
-le lot 5c, et d'ici là cette route s'appelle directement. Le tunnel ouvre aussi,
+les rotations (onglet *Rotations*) et, depuis le lot 5c, pour la révocation d'un
+poste (onglet *Postes*, §7) ; la route reste appelable directement pour le
+recours. Le tunnel ouvre aussi,
 depuis le lot 5b, la délégation d'émetteur avec campagne (§4) et reçoit la copie
 du coffre (`POST /api/certificates/operator/vault-copy`).
 
@@ -397,7 +399,8 @@ liste : « Envoyer » la lui porte. Pendant un recouvrement `CA-PQ`, Astra garde
 l'ancien document jusqu'à `not_after` : la ligne dit « Copie envoyée · document
 de credentials en attente (rotation en cours) », la clé perdue reste admise par
 Astra d'ici là, et « Envoyer » est à refaire après `not_after` (voir « Limites
-connues des rotations dans Orion »).
+connues des rotations dans Orion »). Une clé perdue ne coupe pas le poste qui la
+porte : pour couper le poste, voir §7.
 
 Le recours, hors d'Orion :
 
@@ -417,7 +420,61 @@ Une révocation n'est pas un renouvellement. Elle retire les feuilles actives
 immédiatement, annule tout staging concurrent et laisse l'identité dans l'état
 terminal `revoked` : le poste devra être réadmis, pas rétabli.
 
-**Sur la gateway**, dans le conteneur Astra :
+**Depuis Orion (chemin par défaut, lot 5c).** Onglet *Astra* › *Postes*, une
+ligne par poste du domaine. Pour un poste client :
+
+1. **« Révoquer »** sur la ligne, puis un motif : « Volé ou perdu »
+   (`suspected_compromise`), « Compromis » (`key_compromise`), « Plus utilisé »
+   (`cessation`) ou « Remplacé » (`superseded`).
+2. La confirmation : « Révoquer PORTABLE ? Le poste sera coupé tout de suite.
+   C'est définitif. »
+3. **La coupure, d'abord.** Orion lit l'admission de la gateway (`/api/network`)
+   et vérifie que le nom désigne la clé WireGuard du poste. Sinon, il refuse
+   et ne coupe rien : « Ce nom ne désigne pas ce poste sur la gateway. Rien n'a
+   été coupé. » Sinon, il retire l'admission par `POST /api/peers/revoke`, par le
+   tunnel. Cette étape n'attend ni Astra, ni le coffre, ni une clé.
+4. **La signature.** Les clés que la campagne d'Astra demande, une par une, avec
+   leur état affiché ; puis « Révoquer ». La décision est signée sous `CA-PQ` et
+   déposée à Astra, qui marque le poste `revoked` et le relaie à la gateway.
+
+Après la coupure, tout refus ou annulation est suivi de la phrase « Le poste est
+coupé ; la révocation reste à signer. ». La ligne reste « Coupé, révocation à
+signer », avec « Reprendre ». « Reprendre » ne refait pas la coupure. Une décision
+déjà signée, et non confirmée, se redépose sans clé tant que sa campagne vit ;
+passé ce délai, elle est jetée, et une nouvelle campagne s'ouvre avec ses clés.
+
+Les états sont calculés à chaque ouverture de l'onglet, au bouton ↻ et après
+chaque geste, à partir de la gateway et d'Astra ; rien n'est enregistré sur le
+poste. Astra recopie les postes admis par la gateway, par un balayage toutes les
+60 s, et à l'ouverture d'une révocation pour un poste qu'elle ne connaît pas
+encore. Un poste que la gateway ne connaît pas non plus est refusé par son nom.
+
+| État | Sens |
+| --- | --- |
+| Actif | admis à la gateway, non révoqué chez Astra |
+| Renouvellement en cours | comme « Actif », avec un renouvellement du certificat en cours |
+| Coupé, révocation à signer | plus admis à la gateway, non révoqué chez Astra |
+| Révoqué | révoqué chez Astra |
+| Révoqué, gateway pas encore informée | révoqué chez Astra, encore admis à la gateway ; Astra renvoie la révocation à la gateway jusqu'à son accusé |
+
+**Le poste où tourne Orion** n'a pas de bouton « Révoquer » : sa ligne porte
+« Ce poste » et la phrase « Se coupe sur la gateway : helios peer revoke <nom>. ».
+Il ne se coupe pas depuis lui-même : la coupure se fait sur la gateway, par
+l'outil `helios`, puis la révocation se signe depuis un autre poste
+administrateur, où la ligne apparaît « Coupé, révocation à signer ».
+
+**Pendant un recouvrement `CA-PQ`.** Le coffre garde la clé `CA-PQ` sortante, à
+partir de la signature de la rotation, jusqu'à « Terminer la rotation CA-PQ »,
+offert dès `not_after` et confirmé par une clé. Une révocation se signe sous
+l'ancre qu'Astra vérifie : pendant le recouvrement, la clé sortante. Cette
+signature est refusée à moins d'une heure de `not_after` (« Révocation possible
+après … »). Une rotation faite avant le lot 5c ne garde pas sa clé sortante : la
+signature y reste refusée jusqu'à `not_after`.
+
+**Recours en ligne de commande** (jusqu'au lot 7). `astra-signer revoke` refuse
+pendant un recouvrement `CA-PQ` : « Changement de CA-PQ en cours : révoquer ce
+poste depuis Orion. Rien n'a été signé. ». Les commandes suivantes restent le
+recours, dans le conteneur Astra :
 
 ```sh
 astra revocation open --scope client --peer <clé-wg-base64> \
@@ -996,21 +1053,32 @@ dans [ROADMAP.md](ROADMAP.md) (F14-a à F14-f).
   d'installation passé : à vérifier à la connexion », car le journal peut encore
   se reprendre sans dommage. Éviter le cas : laisser Orion installer aussitôt
   après l'acceptation, et se connecter dans la semaine.
-- **De `Applied` à `not_after` (37 jours au plus par défaut), la révocation
-  d'urgence est impossible.** La clé sortante a quitté le coffre, et Astra
-  vérifie encore sous elle. C'est déjà le comportement de la commande ; cela
-  compte pour le lot 5c (révocation d'un poste).
+- **De `Applied` à `not_after` (37 jours au plus par défaut), une révocation
+  n'est signable que si la rotation garde la clé sortante.** Depuis le lot 5c,
+  une rotation `CA-PQ` signée depuis ce lot garde sa clé sortante au coffre
+  jusqu'à « Terminer la rotation CA-PQ ». Une rotation antérieure ne la garde
+  pas : la révocation d'un poste y est refusée jusqu'à `not_after`, après la
+  coupure (§7).
 - **De `not_after` à la re-délégation (§4), l'émission en ligne est refusée.**
   Les feuilles déjà émises restent valides jusqu'à leur échéance ; rien ne
   prévient hors d'Orion.
-- **Pendant un recouvrement CA-PQ, rien ne s'approuve sous le document local.**
-  « Renouveler les postes », tout lancement d'*Approbations*, la récupération et
-  la délégation sont désactivés, avec la raison. Le renouvellement d'une feuille
-  cliente par le moteur d'Orion se lit comme toujours possible (testé côté
-  Orion ; côté Astra, non exercé). Les campagnes de parc ne portent aucune
-  signature de CA : garder l'ancien document pour les approbations rétablirait le
-  renouvellement du parc pendant le recouvrement, décision de conception non
-  prise.
+- **Pendant un recouvrement CA-PQ, rien ne s'approuve sous le document local,
+  sauf la révocation d'un poste.** « Renouveler les postes », tout lancement
+  d'*Approbations*, la récupération et la délégation sont désactivés, avec la
+  raison. La révocation d'un poste s'approuve sous le document que sert Astra
+  (§7). Le renouvellement d'une feuille cliente par le moteur d'Orion se lit
+  comme toujours possible (testé côté Orion ; côté Astra, non exercé).
+  « Renouveler les postes » reste bloqué pendant un recouvrement CA-PQ, décision
+  du 8 novembre 2026 : les campagnes de parc ne portent aucune signature de CA,
+  et garder l'ancien document pour elles rétablirait le renouvellement du parc
+  pendant le recouvrement. « Remplacer la CA-PQ » affiche, à ses prérequis, les
+  postes qui expirent pendant le changement : c'est un avertissement, non un
+  blocage.
+- **L'onglet *Postes* ne lève pas encore le blocage d'affichage.** Pendant un
+  recouvrement CA-PQ, sa ligne « Signature possible » reste rouge (« Recouvrement
+  CA-PQ en cours ») et « Reprendre » est désactivé. « Révoquer » reste offert : la
+  coupure, puis la signature sous la clé sortante, suivent la même cérémonie.
+  Une reprise de signature attend donc la fin du recouvrement.
 - **Une clé marquée perdue pendant un recouvrement CA-PQ reste admise par Astra
   jusqu'après `not_after`.** Orion n'y joint pas le document de credentials, et
   Astra adopte à `not_after` celui de la rotation, signé avant le marquage.

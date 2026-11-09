@@ -461,6 +461,49 @@ un délai d'installation dépassé n'a pas de réparation ; une copie du coffre
 peut être remplacée par un administrateur du tunnel. Détail et suivis : § 10.8
 de la conception du lot, `ROADMAP.md` (F14-a à F14-f).
 
+### 0.11 Amendement de la révocation depuis Orion du 9 novembre 2026
+
+Décidé par l'utilisateur le 8 novembre 2026 (F14, lot 5c). La révocation d'un
+poste client se fait depuis l'onglet *Postes* d'Orion. La conception est
+`docs/superpowers/specs/2026-11-08-f14-lot5c-revocation-design.md`. Ce qui suit
+remplace, pour la révocation, la limite du §0.10 (« de `Applied` à `not_after`,
+la révocation d'urgence est impossible »).
+
+- **Retrait d'admission d'abord (§10.2).** Orion retire l'admission du poste à
+  la gateway, par `POST /api/peers/revoke`, après avoir vérifié que le nom
+  désigne la clé du poste. Cette coupure n'attend ni Astra, ni le coffre, ni la
+  signature. Tout échec après elle laisse le poste coupé, la révocation à signer.
+- **Clé `CA-PQ` sortante gardée (§9.2).** Dès la signature d'une rotation
+  `CA-PQ`, le coffre garde la clé sortante, sa clé publique et son époque,
+  jusqu'à « Terminer la rotation CA-PQ » (offert dès `not_after`). Elle ne sert
+  qu'à signer une révocation sous l'ancre que vérifie Astra, pendant un
+  recouvrement. Elle est détruite à « Terminer », en une écriture scellée ;
+  toute rotation d'ancre, `CA-PQ` ou `CA TLS`, est refusée tant que ce n'est
+  pas fait. Une rotation antérieure à cet amendement ne garde pas sa clé.
+- **Marge avant `not_after`.** Une révocation ne se signe pas sous la clé
+  sortante à moins d'une heure de `not_after` (`OUTGOING_REVOCATION_MARGIN_SECS`,
+  3600 s). La coupure reste possible à ce moment.
+- **Approbation sous le document servi.** Pendant un recouvrement, la campagne
+  de révocation s'approuve sous le document de credentials que sert Astra, vérifié
+  sous la clé sortante gardée. Ce document est lu dans `operator/status`.
+- **`operator/status` porte désormais `revoked_peers` et `served_credentials`.**
+  `revoked_peers` liste, par clé WireGuard, les postes qu'Astra tient pour
+  révoqués. `served_credentials` est le document de credentials servi, entier
+  (`None` s'il n'en sert aucun). La réponse a sa propre borne, 1 MiB.
+- **Postes recopiés par Astra.** La gateway sert, sur le canal privé, la liste
+  des clés de ses enregistrements de certificat, admis ou coupés
+  (`/internal/v1/certificates/peers`). Astra la lit toutes les 60 s et inscrit
+  chaque poste admis qu'elle ne connaît pas, en le relisant à la gateway ; elle
+  le fait aussi à l'ouverture d'une révocation pour un poste inconnu. Un poste
+  que la gateway ne connaît pas est refusé par son nom. Astra ne décide rien de
+  l'admission : la gateway reste l'autorité.
+- **Relais rejoué.** Une révocation enregistrée par Astra, que la gateway
+  n'accuse pas, est renvoyée à la gateway par le balayage périodique, jusqu'à
+  son accusé.
+- **États calculés.** Les états des postes (Actif, Coupé, Révoqué, etc.) se
+  calculent à chaque lecture, à partir de la gateway et d'Astra. Rien n'est
+  enregistré localement.
+
 ## 1. Périmètre
 
 Huit cycles de vie sont distincts :

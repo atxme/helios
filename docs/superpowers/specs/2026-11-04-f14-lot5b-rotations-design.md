@@ -585,9 +585,14 @@ dans Orion ») et, pour les suivis, dans `ROADMAP.md` (F14-a à F14-f).
 - **De `Applied` à `not_after` (37 jours au plus par défaut), la révocation
   d'urgence est impossible** : la clé sortante a quitté le coffre alors qu'Astra
   vérifie encore sous elle. Existant dans la commande ; à lever avec le lot 5c.
+  *Levée au lot 5c, le 9 novembre 2026, sauf pour une rotation faite avant ce
+  lot : voir `docs/superpowers/specs/2026-11-08-f14-lot5c-revocation-design.md`
+  §5.4.*
 - **Les campagnes de parc ne portent aucune signature de CA.** Garder
   l'ancien document pour les approbations rétablirait « Renouveler les postes »
   pendant un recouvrement : décision de conception, non prise.
+  *Décision prise le 8 novembre 2026 (lot 5c, §2 et §5.6) : « Renouveler les
+  postes » reste bloqué pendant un recouvrement `CA-PQ`.*
 - **Une clé marquée perdue pendant un recouvrement `CA-PQ` reste admise par
   Astra** jusqu'à un « Envoyer » fait après `not_after` : le document n'est pas
   joint pendant le recouvrement, et Astra adopte à `not_after` celui de la

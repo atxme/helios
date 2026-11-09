@@ -1205,6 +1205,65 @@ Chaque étape : action, puis état attendu. Onglet *Astra* › *Rotations*.
     `not_after` : « Document ancien », « Envoyer » porte le document, et la clé
     est refusée.
 
+**H. Lot 5c : révoquer un poste depuis Orion**
+
+Les tests Rust et Vitest couvrent la logique (`apps/orion/src/views/astra/peerRows.test.ts`,
+`PeersPanel.test.tsx`, `crates/astra/src/door/tests/overlap_revocation.rs`). Les
+étapes marquées **[cible]** dépendent de ce que WSL2 ne reproduit pas : vraies clés
+de sécurité, Windows, gateway cible, et `helios peer revoke` joint par le lien
+Tailscale. Prérequis : le domaine d'essai de « G », un poste Orion pair
+**administrateur** du tunnel, deux clés enregistrées dans le coffre, Astra déployé
+avec son canal privé. Onglet *Astra* › *Postes*. Chaque étape : action, puis état
+attendu.
+
+67. **Liste et états.** Ouvrir l'onglet. Attendu : une ligne par poste du domaine,
+    avec son état et son échéance. Le poste où tourne Orion porte « Ce poste »,
+    sans bouton, avec « Se coupe sur la gateway : helios peer revoke <nom>. ». Un
+    poste révoqué est grisé. ↻ relit l'onglet.
+68. **Nom qui ne désigne pas la clé.** Sur un poste dont le nom ne désigne pas sa clé
+    à la gateway (essai : un poste renommé à la gateway), « Révoquer » puis
+    confirmer. Attendu : « Ce nom ne désigne pas ce poste sur la gateway. Rien n'a
+    été coupé. » ; le poste reste admis.
+69. **Révocation d'un poste client.** « Révoquer » sur PORTABLE, motif « Plus
+    utilisé », confirmer. Attendu : le poste disparaît de l'admission (`/api/network`)
+    avant tout toucher de clé ; un toucher par clé demandée, avec son libellé ;
+    signature, dépôt ; la ligne passe « Révoqué ». **[cible]** (clés réelles).
+70. **Astra arrêté après la coupure.** Arrêter Astra après la coupure, avant le
+    dépôt. Attendu : « Astra injoignable. Le poste est coupé ; la révocation reste à
+    signer. » ; la ligne « Coupé, révocation à signer » avec « Reprendre ». **[cible]**.
+71. **Reprise sans clé.** Redémarrer Astra, puis « Reprendre ». Attendu : une
+    décision déjà signée est déposée sans toucher de clé ; sinon une campagne
+    s'ouvre et ses clés sont demandées. La ligne passe « Révoqué ». **[cible]** (clés réelles).
+72. **Relais rejoué.** Arrêter la gateway au moment où Astra marque le poste révoqué.
+    Attendu : « Révoqué, gateway pas encore informée ». Remonter la gateway : la ligne
+    passe « Révoqué » au balayage suivant d'Astra (toutes les 60 s). **[cible]**
+    (gateway cible).
+73. **Auto-révocation refusée.** Sur le poste Orion : aucun bouton « Révoquer » sur
+    sa ligne. Sur la gateway, par le lien Tailscale : `helios peer revoke <nom>`.
+    Attendu : le poste est coupé ; sur un autre poste administrateur, sa ligne
+    affiche « Coupé, révocation à signer ». **[cible]** (Tailscale, gateway cible).
+74. **Révocation pendant un recouvrement CA-PQ.** Pendant le recouvrement de l'étape
+    44 de « G », révoquer PORTABLE. Attendu : la coupure se fait, puis la signature
+    sous la clé sortante ; Astra accepte, et la ligne passe « Révoqué ». L'écran
+    affiche « Signature possible » en rouge (« Recouvrement CA-PQ en cours ») et
+    « Reprendre » reste désactivé jusqu'à la fin du recouvrement : c'est la limite
+    connue. **[cible]** (clés réelles).
+75. **Recours refusé pendant un recouvrement.** Sur le poste de l'opérateur,
+    `astra-signer revoke …` pendant le même recouvrement. Attendu : « Changement de
+    CA-PQ en cours : révoquer ce poste depuis Orion. Rien n'a été signé. ». **[cible]**
+    (coffre et clés réelles).
+76. **Marge d'une heure.** Avec une horloge d'essai, ouvrir une révocation à moins
+    d'une heure de `not_after` de la clé sortante. Attendu : la coupure se fait, la
+    signature est refusée, « Révocation possible après … » avec la date et l'heure.
+    **[cible]** (clés réelles).
+77. **Avertissement avant « Remplacer la CA-PQ ».** Pendant un recouvrement, « Renouveler
+    les postes » est désactivé, avec « Recouvrement CA-PQ en cours ». Ouvrir « Remplacer
+    la CA-PQ » avec un poste dont l'échéance tombe dans la fenêtre prévue : une ligne
+    « <nom> expire le JJ/MM/AAAA, pendant le changement. » s'affiche, sans bloquer.
+78. **Poste inconnu d'Astra.** Un poste admis à la gateway qu'Astra n'a jamais lu.
+    Attendu : la révocation de ce poste aboutit, Astra l'ayant inscrit à l'ouverture.
+    **[cible]** (gateway cible).
+
 ### Le chemin manuel
 
 Dans un autre terminal, générer deux identités de test :
