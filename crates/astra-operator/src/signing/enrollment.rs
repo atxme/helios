@@ -131,8 +131,7 @@ pub fn sign_invitation(
     )?;
 
     let invitation = with_anchors(vault, opening, |secrets| {
-        let ca_pq_private_key =
-            Zeroizing::new(decode(&secrets.ca_pq_private_key, "clé privée CA-PQ")?);
+        let ca_pq_private_key = decode(&secrets.ca_pq_private_key, "clé privée CA-PQ")?;
         EnrollmentInvitation {
             format_version: ENROLLMENT_FORMAT_VERSION,
             protocol_version: ENROLLMENT_PROTOCOL_VERSION,
@@ -215,8 +214,7 @@ pub fn accept_request(
                 params.distinguished_name = subject;
             },
         )?;
-        let ca_pq_private_key =
-            Zeroizing::new(decode(&secrets.ca_pq_private_key, "clé privée CA-PQ")?);
+        let ca_pq_private_key = decode(&secrets.ca_pq_private_key, "clé privée CA-PQ")?;
         let pq_certificate = aether::key_negotiation::issue_pq_certificate(
             PqCertificate {
                 version: aether::key_negotiation::PQ_CERTIFICATE_VERSION,
@@ -365,8 +363,7 @@ pub fn sign_document(
     }
 
     let signed = with_anchors(vault, opening, |secrets| {
-        let ca_pq_private_key =
-            Zeroizing::new(decode(&secrets.ca_pq_private_key, "clé privée CA-PQ")?);
+        let ca_pq_private_key = decode(&secrets.ca_pq_private_key, "clé privée CA-PQ")?;
         draft
             .sign(&ca_pq_private_key)
             .map_err(|error| GestureError::Anchors(format!("document : {error}")))

@@ -160,9 +160,12 @@ pub use aether_fido::DomainIdentity;
 /// re-derives from the campaign and the `CA-PQ`-signed registry.
 pub use aether::certificates::status::{CampaignApproval, CredentialAssertion};
 
-fn decode(value: &str, what: &str) -> Result<Vec<u8>> {
+/// Decodes base64 key material. Zeroized on drop: most callers decode a
+/// private key, and a plain `Vec` would leave it in freed memory.
+fn decode(value: &str, what: &str) -> Result<zeroize::Zeroizing<Vec<u8>>> {
     base64::engine::general_purpose::STANDARD
         .decode(value.trim())
+        .map(zeroize::Zeroizing::new)
         .map_err(|_| GestureError::Anchors(format!("{what} : base64 illisible")))
 }
 

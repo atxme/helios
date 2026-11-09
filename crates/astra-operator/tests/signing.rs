@@ -1437,3 +1437,74 @@ fn no_other_signing_path_reads_the_outgoing_key() {
         Err(GestureError::Anchors(ref message)) if message.as_str() == PENDING_ROTATION
     ));
 }
+
+/// An overlap that ends inside its first hour leaves no margin at all: at no
+/// second, the zero one included, is the outgoing key usable.
+#[test]
+fn an_overlap_ending_inside_the_first_hour_is_always_refused() {
+    let first = FakeKey::new(1);
+    let second = FakeKey::new(2);
+    let mut vault = bootstrapped(&first, &second);
+    let registry = bindings(&vault, &open(&first, &vault));
+    let previous = ca_pq_public_key(&vault);
+    let window = TransitionWindow::new(0, 1, 2).expect("window");
+    let (first_opening, second_opening) = (open(&first, &vault), open(&second, &vault));
+    signing::rotate_ca_pq(
+        &mut vault,
+        &[&first_opening, &second_opening],
+        &identity(),
+        Some(&registry),
+        window,
+        NOW,
+    )
+    .expect("the anchor rotates");
+
+    for now in [0, 1, 2, NOW] {
+        assert_eq!(
+            signing::revocation_anchor(
+                &vault,
+                &previous.authority_fingerprint(),
+                1,
+                2,
+                Some(2),
+                now
+            ),
+            Err(RevocationAnchorRefusal::NotBefore(2)),
+            "at now = {now}"
+        );
+    }
+}
+
+/// `Outgoing` names a key the vault does not keep: the call is refused, and
+/// nothing is returned that could be taken for a signed revocation.
+#[test]
+fn an_outgoing_revocation_without_a_kept_key_signs_nothing() {
+    let first = FakeKey::new(1);
+    let second = FakeKey::new(2);
+    let vault = bootstrapped(&first, &second);
+    let opening = open(&first, &vault);
+    let decision = signing::RevocationDecision {
+        scope: RevocationScope::Client,
+        identity_key: WireGuardKey::from_bytes([7; 32]),
+        server_name: None,
+        revocation_epoch: 1,
+        revoked_tls: Some((Fingerprint::of(b"tls leaf"), NOW + 86_400)),
+        revoked_pq: None,
+        effective_at: NOW,
+        reason: RevocationReason::KeyCompromise,
+        replacement_transition_fingerprint: None,
+    };
+    let result = signing::sign_revocation(
+        &vault,
+        &opening,
+        &identity(),
+        &ca_pq_public_key(&vault),
+        &decision,
+        0,
+        RevocationAnchor::Outgoing,
+    );
+    assert!(matches!(
+        result,
+        Err(GestureError::Anchors(ref message)) if message.contains("aucune CA-PQ sortante")
+    ));
+}

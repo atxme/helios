@@ -60,7 +60,7 @@ pub fn authorize_issuer(
         let ca_tls_key = KeyPair::try_from(ca_tls_key_der.as_slice())
             .map_err(|error| GestureError::Anchors(format!("clé privée CA-TLS : {error}")))?;
 
-        let mut csr = CertificateSigningRequestParams::from_der(&csr_der.into())
+        let mut csr = CertificateSigningRequestParams::from_der(&csr_der.as_slice().into())
             .map_err(|error| GestureError::Anchors(format!("CSR de l'émetteur : {error}")))?;
         // A PKCS#10 request carries no validity and no basic constraints, and
         // must not: both are the issuer's decision. Left alone, the
