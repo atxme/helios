@@ -472,7 +472,7 @@ async fn a_delegation_opening_refused_for_lack_of_a_vault_leaves_the_key_files()
 
 /// One approving credential of the fixture's document: a software ES256 key, which
 /// proves the protocol and says nothing of a physical authenticator.
-fn approving_credential(
+pub(super) fn approving_credential(
     ca_private: &[u8],
     serial: u8,
 ) -> (
@@ -508,7 +508,7 @@ fn approving_credential(
 }
 
 /// A credential's real answer to a campaign, as `verify` will check it.
-fn assertion_for(
+pub(super) fn assertion_for(
     key: &rcgen::KeyPair,
     binding: &aether::certificates::approval::AstraCredentialBinding,
     campaign: &aether::certificates::status::AstraRotationCampaign,
@@ -540,7 +540,7 @@ fn assertion_for(
 }
 
 /// A capability to deposit the result of `operation_id`.
-async fn submit_token(service: &AstraService, operation_id: &Id16) -> String {
+pub(super) async fn submit_token(service: &AstraService, operation_id: &Id16) -> String {
     use aether::certificates::capability::{CapabilityGrant, CapabilityScope};
 
     let operations = service.signing.lock().await;

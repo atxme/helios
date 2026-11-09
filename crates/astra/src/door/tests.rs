@@ -19,6 +19,7 @@ use crate::registry::{AstraRegistry, AstraState, ChallengeStore, PeerRecord};
 use crate::service::{SourceBudget, MAX_LIVE_CHALLENGES};
 use crate::AuditEvent;
 
+mod overlap_revocation;
 mod tunnel;
 mod vault_copy;
 
@@ -1016,6 +1017,8 @@ struct FakeGateway {
     /// Refuses every peer read as unavailable, the way a gateway that is
     /// down answers, rather than as a key it does not admit.
     unavailable: bool,
+    /// Accepts the relayed revocation, as a gateway that verified it does.
+    accepts_revocations: bool,
 }
 
 /// A peer the gateway admitted, as its private channel reads it back. The
@@ -1080,6 +1083,9 @@ impl astra_channel::AstraChannelHandler for FakeGateway {
         &self,
         _: Box<aether::certificates::revocation::EmergencyCertificateRevocation>,
     ) -> Result<(), aether::certificates::transport::TrustUpdateRefusal> {
+        if self.accepts_revocations {
+            return Ok(());
+        }
         Err(aether::certificates::transport::TrustUpdateRefusal::Rejected)
     }
 
@@ -1204,6 +1210,12 @@ async fn fixture_with_gateway_peers(
 
 /// The same, with the given fake answering on the channel.
 async fn fixture_with_fake(dir: &Path, fake: FakeGateway) -> Arc<AstraService> {
+    let channel = gateway_channel(dir, fake).await;
+    Arc::new(build_service(dir, None, Some(channel)))
+}
+
+/// A channel from Astra to a fake gateway serving `fake`.
+async fn gateway_channel(dir: &Path, fake: FakeGateway) -> crate::gateway::GatewayChannel {
     let (astra_certificate, identity, gateway_certificate) = channel_identities(dir);
     let config = astra_channel::server_config(&identity, &astra_certificate).expect("server");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1221,9 +1233,7 @@ async fn fixture_with_fake(dir: &Path, fake: FakeGateway) -> Arc<AstraService> {
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    let channel = crate::gateway::GatewayChannel::open(dir, address, &gateway_certificate)
-        .expect("channel opens");
-    Arc::new(build_service(dir, None, Some(channel)))
+    crate::gateway::GatewayChannel::open(dir, address, &gateway_certificate).expect("channel opens")
 }
 
 #[tokio::test]
