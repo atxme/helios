@@ -2,21 +2,30 @@
 //!
 //! The overlap keeps the outgoing anchor in two places: Astra verifies under
 //! `state.ca_public_key` until the rotation retires it, and the gateway holds
-//! the same key as `state.gateway.current_ca_public_key`. A revocation signed
-//! with the outgoing key, under its `ca_epoch`, must pass both.
+//! the same key as `state.gateway.current_ca_public_key`, installed by the
+//! signed `CaTransition` the rotation describes. A revocation signed with the
+//! outgoing key, under its `ca_epoch`, must pass both, and stop passing once
+//! the gateway promotes at `ca_retire_active_at`.
 //!
 //! Signing mirrors `astra-operator`'s `sign_revocation` under
-//! `RevocationAnchor::Outgoing`, which `signing/revocation.rs` tests on its
-//! own. This file does not depend on `astra-operator` or `heliosd`.
+//! `RevocationAnchor::Outgoing`. This file does not depend on `astra-operator`
+//! or `heliosd`: the gateway state is aether's own type, built as a literal
+//! (every field is public) and driven through its public transition methods.
 
 use aether::certificates::approval::CredentialRegistry;
-use aether::certificates::encoding::{generate_ml_dsa_87_keypair, MlDsa87Signature};
+use aether::certificates::authority::CaTransition;
+use aether::certificates::encoding::{
+    generate_ml_dsa_87_keypair, DerCertificate, MlDsa87Signature,
+};
 use aether::certificates::revocation::{
     EmergencyCertificateRevocation, RevocationReason, RevocationScope,
 };
+use aether::certificates::state::{GatewayCertificateState, TrustLedger};
 use aether::certificates::status::{AstraSignerResult, CampaignApproval};
 use aether::certificates::transport::TrustUpdateObject;
+use aether::certificates::window::TransitionWindow;
 use aether::certificates::CERTIFICATE_FORMAT_VERSION;
+use aether::key_negotiation::{PqCertificate, PqCertificateRole, PQ_CERTIFICATE_VERSION};
 
 use super::tunnel::{approving_credential, assertion_for, submit_token};
 use super::*;
@@ -34,7 +43,7 @@ async fn a_revocation_during_a_ca_pq_overlap_is_accepted_by_astra_and_the_gatewa
     // The outgoing key, kept by the vault and served by Astra; the incoming
     // key, accepted by the rotation and not yet active.
     let (outgoing_private, outgoing_public) = generate_ml_dsa_87_keypair().expect("outgoing");
-    let (_, incoming_public) = generate_ml_dsa_87_keypair().expect("incoming");
+    let (incoming_private, incoming_public) = generate_ml_dsa_87_keypair().expect("incoming");
 
     let channel = gateway_channel(
         dir.path(),
@@ -136,15 +145,96 @@ async fn a_revocation_during_a_ca_pq_overlap_is_accepted_by_astra_and_the_gatewa
         "Astra holds the peer as revoked"
     );
 
+    // The gateway's own state. The CA-PQ transition the rotation describes is
+    // signed by both anchors and applied before its activation, as heliosd
+    // installs it; the gateway then holds the outgoing anchor until
+    // `ca_retire_active_at`.
+    let window = TransitionWindow::new(NOW - 1_000, NOW - 100, NOW + 10_000).expect("window");
+    let transition = CaTransition {
+        format_version: CERTIFICATE_FORMAT_VERSION,
+        trust_domain_id: domain,
+        current_ca_epoch: OUTGOING_EPOCH,
+        next_ca_epoch: OUTGOING_EPOCH + 1,
+        current_ca_fingerprint: outgoing_public.authority_fingerprint(),
+        next_ca_public_key: incoming_public.clone(),
+        next_ca_fingerprint: incoming_public.authority_fingerprint(),
+        window,
+        current_ca_signature: MlDsa87Signature::placeholder(),
+        next_ca_signature: MlDsa87Signature::placeholder(),
+    }
+    .sign(&outgoing_private, &incoming_private)
+    .expect("signed by both anchors");
+    let mut gateway = GatewayCertificateState {
+        trust_domain_id: domain,
+        gateway_wg_public_key: WireGuardKey::from_bytes([1; 32]),
+        server_name: "gateway.example".into(),
+        ca_epoch: OUTGOING_EPOCH,
+        current_ca_public_key: outgoing_public.clone(),
+        next_ca_public_key: None,
+        next_ca_transition_fingerprint: None,
+        ca_activation_at: None,
+        ca_retire_active_at: None,
+        active_gateway_identity_epoch: 1,
+        gateway_decision_epoch: 1,
+        next_gateway_identity_epoch: None,
+        next_transition_fingerprint: None,
+        last_aborted_transition: None,
+        active_gateway_tls_certificate: DerCertificate::new(vec![1; 64]).expect("der"),
+        next_gateway_tls_certificate: None,
+        active_gateway_certificate: PqCertificate {
+            version: PQ_CERTIFICATE_VERSION,
+            serial: [3; 16],
+            subject: "gateway.example".into(),
+            issuer: "CA-PQ".into(),
+            role: PqCertificateRole::Gateway,
+            wireguard_public_key: WireGuardKey::from_bytes([1; 32]).to_base64(),
+            ml_dsa_87_public_key: String::new(),
+            not_before_unix: 0,
+            not_after_unix: NOW * 2,
+            ml_dsa_87_signature: String::new(),
+        },
+        next_gateway_certificate: None,
+        activation_at: None,
+        retire_active_at: None,
+        published: false,
+        revoked: false,
+        revocation_epoch: 0,
+        service_rollback: None,
+        awaited_replacement: None,
+    };
+    gateway
+        .apply_ca_transition(&transition, &TrustLedger::default(), NOW - 200)
+        .expect("the overlap installs");
+    assert!(
+        !gateway.promote_ca_if_due(NOW),
+        "the outgoing anchor still serves inside the overlap"
+    );
+
     // The gateway side: the check heliosd's `revoke` runs
-    // (`heliosd/src/certificates/astra.rs`), under the gateway's current anchor
-    // and `ca_epoch`, against the peer's current revocation epoch. In overlap
-    // that anchor is still the outgoing key.
-    signed
-        .verify(&outgoing_public, &domain, OUTGOING_EPOCH, epoch)
-        .expect("the gateway verifies the revocation under its current anchor");
+    // (`heliosd/src/certificates/astra.rs`), under the gateway's current
+    // anchor, its `ca_epoch`, and the peer's current revocation epoch.
+    let verify_as_gateway = |gateway: &GatewayCertificateState| {
+        signed.verify(
+            &gateway.current_ca_public_key,
+            &gateway.trust_domain_id,
+            gateway.ca_epoch,
+            epoch,
+        )
+    };
+    verify_as_gateway(&gateway).expect("the gateway verifies it under its current anchor");
     // The anchor is what makes it pass: the incoming key does not verify it.
     assert!(signed
         .verify(&incoming_public, &domain, OUTGOING_EPOCH, epoch)
         .is_err());
+
+    // The window is pinned: still valid one second before `ca_retire_active_at`,
+    // and refused once the gateway promotes.
+    assert!(!gateway.promote_ca_if_due(NOW + 9_999));
+    verify_as_gateway(&gateway).expect("still verifies one second before retirement");
+    assert!(gateway.promote_ca_if_due(NOW + 10_000));
+    assert_eq!(gateway.ca_epoch, OUTGOING_EPOCH + 1);
+    assert!(
+        verify_as_gateway(&gateway).is_err(),
+        "the outgoing revocation does not verify under the promoted anchor"
+    );
 }
