@@ -8,6 +8,7 @@ pub fn secrets() -> AuthoritySecrets {
         ca_pq_public_key: "Y2EtcHEtcHVibGlj".into(),
         ca_tls_private_key: "Y2EtdGxzLXByaXZhdGU=".into(),
         retained_ca_tls: None,
+        retained_outgoing_ca_pq: None,
     }
 }
 

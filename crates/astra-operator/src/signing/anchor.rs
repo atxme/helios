@@ -32,6 +32,7 @@ pub fn rotate_ca_pq(
     window: TransitionWindow,
     now_unix: u64,
 ) -> Result<RotatedAnchor> {
+    refuse_while_outgoing_ca_pq_is_kept(vault)?;
     if openings.len() != ANCHOR_ROTATION_CREDENTIALS {
         return Err(GestureError::Anchors(format!(
             "une rotation d'ancre exige {ANCHOR_ROTATION_CREDENTIALS} confirmations, {} \
@@ -71,6 +72,7 @@ pub fn rotate_ca_pq(
 
     let (next_private_key, next_public_key) = generate_ml_dsa_87_keypair()?;
     let current_public_key = MlDsa87PublicKey::parse(vault.ca_pq_public_key.trim())?;
+    let outgoing_not_after = window.not_after;
     let transition = with_anchors(vault, openings[0], |secrets| {
         let current_private_key = decode(&secrets.ca_pq_private_key, "clé privée CA-PQ")?;
         let transition = CaTransition {
@@ -92,6 +94,15 @@ pub fn rotate_ca_pq(
             identity.ca_epoch,
         )?;
 
+        // The outgoing private key stays sealed until `not_after`: a revocation
+        // signed during the overlap verifies under the anchor the fleet still
+        // accepts. §9.1 destroys it only at « Terminer ».
+        let outgoing = RetainedOutgoingCaPq {
+            private_key: secrets.ca_pq_private_key.clone(),
+            public_key: current_public_key.to_base64(),
+            ca_epoch: identity.ca_epoch,
+            not_after: outgoing_not_after,
+        };
         // The `CA-TLS` key rides through unchanged: §9.1 rotates the operator
         // anchor, and §9.4 is a separate transition with its own overlap. A
         // rotation that quietly replaced both would invalidate every mTLS
@@ -103,6 +114,7 @@ pub fn rotate_ca_pq(
                 ca_pq_public_key: next_public_key.to_base64(),
                 ca_tls_private_key: secrets.ca_tls_private_key.clone(),
                 retained_ca_tls: secrets.retained_ca_tls.clone(),
+                retained_outgoing_ca_pq: Some(outgoing),
             },
         ))
     })?;

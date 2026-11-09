@@ -243,6 +243,7 @@ fn interrupted_ca_pq_rotation(
         ca_pq_public_key: public.to_base64(),
         ca_tls_private_key: encoder.encode(b"tls"),
         retained_ca_tls: None,
+        retained_outgoing_ca_pq: None,
     };
     let enrolment = |seed: u8, role| SlotEnrolment {
         role,

@@ -1008,6 +1008,7 @@ mod tests {
             vault_id: [seed; 16],
             trust_domain_id: domain(),
             ca_pq_public_key: format!("clé publique {seed}"),
+            retained_outgoing_ca_pq_public: None,
             rp_id: "astra.helios.test".into(),
             created_at: 1,
             salt: "sel".into(),

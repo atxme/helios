@@ -67,7 +67,7 @@
 //! it is target-only, like DPAPI and the TPM.
 //! See [`docs/testing/TESTING.md`](../../../docs/testing/TESTING.md).
 
-use aether::certificates::encoding::{Fingerprint, TrustDomainId};
+use aether::certificates::encoding::{Fingerprint, MlDsa87PublicKey, TrustDomainId};
 use aether_vault::{Context, Unlock};
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
@@ -164,6 +164,11 @@ pub enum VaultError {
          `astra-signer promote-ca-tls` avant d'en ouvrir une seconde"
     )]
     CaTlsWindowOpen,
+    #[error(
+        "la clé CA-PQ sortante reste conservée jusqu'à la seconde {at} : elle ne peut être \
+         détruite avant"
+    )]
+    OutgoingCaPqKept { at: u64 },
     #[error("contenu du coffre illisible : {0}")]
     Corrupt(String),
 }
@@ -280,6 +285,10 @@ pub struct AuthoritySecrets {
     /// one (spec §9.2, §9.4). `None` outside a rotation.
     #[serde(default)]
     pub retained_ca_tls: Option<RetainedCaTls>,
+    /// The outgoing `CA-PQ`, kept from the signature of a rotation until
+    /// « Terminer ». `None` outside that window.
+    #[serde(default)]
+    pub retained_outgoing_ca_pq: Option<RetainedOutgoingCaPq>,
 }
 
 /// The successor `CA-TLS` key, sealed beside the one that issues.
@@ -330,6 +339,52 @@ pub struct RetainedCaTls {
     pub not_after: u64,
 }
 
+/// The outgoing `CA-PQ`, sealed beside the anchor that replaced it.
+///
+/// A revocation signed during the overlap must still verify under the anchor
+/// the fleet trusts until `not_after`, so the outgoing private half is kept
+/// from the signature of the rotation and destroyed only by
+/// [`AuthorityVault::retire_outgoing_ca_pq`] at that second.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Zeroize)]
+#[serde(deny_unknown_fields)]
+pub struct RetainedOutgoingCaPq {
+    /// ML-DSA-87 private key of the outgoing anchor, base64.
+    pub private_key: String,
+    /// The matching public key, base64.
+    #[zeroize(skip)]
+    pub public_key: String,
+    /// The `CA-PQ` epoch this key was the anchor of.
+    #[zeroize(skip)]
+    pub ca_epoch: u64,
+    /// The rotation window's `not_after`: the second the old anchor stops
+    /// being accepted, and the only second this key may be destroyed.
+    #[zeroize(skip)]
+    pub not_after: u64,
+}
+
+impl RetainedOutgoingCaPq {
+    fn public(&self) -> OutgoingCaPqPublic {
+        OutgoingCaPqPublic {
+            public_key: self.public_key.clone(),
+            ca_epoch: self.ca_epoch,
+            not_after: self.not_after,
+        }
+    }
+}
+
+/// The public half of [`RetainedOutgoingCaPq`], kept in the clear on the vault
+/// beside `ca_pq_public_key`, so that a revocation can be verified under the
+/// outgoing anchor without opening it. Checked against the sealed copy at every
+/// unlock.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutgoingCaPqPublic {
+    /// ML-DSA-87 public key of the outgoing anchor, base64.
+    pub public_key: String,
+    pub ca_epoch: u64,
+    pub not_after: u64,
+}
+
 /// What one call to [`AuthorityVault::advance_ca_tls`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CaTlsAdvance {
@@ -367,6 +422,10 @@ pub struct AuthorityVault {
     /// vault is opened, so an edited file is caught at the next unlock rather
     /// than propagated into a trust domain.
     pub ca_pq_public_key: String,
+    /// The outgoing `CA-PQ`'s public half, in the clear, while one is kept.
+    /// Mirrors the sealed copy and is checked against it at every unlock.
+    #[serde(default)]
+    pub retained_outgoing_ca_pq_public: Option<OutgoingCaPqPublic>,
     /// WebAuthn RP ID the credentials are registered under. An assertion must
     /// name the same one it was created with, so the vault carries it rather
     /// than asking an operator to remember it.
@@ -546,6 +605,10 @@ impl AuthorityVault {
             vault_id,
             trust_domain_id,
             ca_pq_public_key: secrets.ca_pq_public_key.clone(),
+            retained_outgoing_ca_pq_public: secrets
+                .retained_outgoing_ca_pq
+                .as_ref()
+                .map(RetainedOutgoingCaPq::public),
             rp_id: rp_id.to_string(),
             created_at: now_unix,
             salt: encode(&salt),
@@ -664,6 +727,13 @@ impl AuthorityVault {
         // whole point of keeping it in the clear is that it is read without a
         // key, so this is the only place the substitution can be caught.
         if secrets.ca_pq_public_key != self.ca_pq_public_key {
+            return Err(VaultError::AnchorMismatch);
+        }
+        let sealed_outgoing = secrets
+            .retained_outgoing_ca_pq
+            .as_ref()
+            .map(RetainedOutgoingCaPq::public);
+        if sealed_outgoing != self.retained_outgoing_ca_pq_public {
             return Err(VaultError::AnchorMismatch);
         }
         Ok(secrets)
@@ -789,10 +859,24 @@ impl AuthorityVault {
                 "le remplacement d'ancre ne conserve pas la fenêtre CA-TLS ouverte".into(),
             ));
         }
+        // The same for the outgoing `CA-PQ`: a replacement may keep it or
+        // start keeping one, never drop one before « Terminer ».
+        if current.retained_outgoing_ca_pq.is_some()
+            && current.retained_outgoing_ca_pq != secrets.retained_outgoing_ca_pq
+        {
+            return Err(VaultError::Corrupt(
+                "le remplacement d'ancre ne conserve pas la clé CA-PQ sortante".into(),
+            ));
+        }
         let slots = self.slots.clone();
         let public_key = secrets.ca_pq_public_key.clone();
+        let outgoing = secrets
+            .retained_outgoing_ca_pq
+            .as_ref()
+            .map(RetainedOutgoingCaPq::public);
         self.reseal(slots, &master, secrets)?;
         self.ca_pq_public_key = public_key;
+        self.retained_outgoing_ca_pq_public = outgoing;
         Ok(())
     }
 
@@ -833,6 +917,7 @@ impl AuthorityVault {
             ca_pq_public_key: secrets.ca_pq_public_key.clone(),
             ca_tls_private_key: secrets.ca_tls_private_key.clone(),
             retained_ca_tls: Some(successor),
+            retained_outgoing_ca_pq: secrets.retained_outgoing_ca_pq.clone(),
         };
         let slots = self.slots.clone();
         self.reseal(slots, &master, &staged)
@@ -870,6 +955,7 @@ impl AuthorityVault {
             ca_pq_public_key: secrets.ca_pq_public_key.clone(),
             ca_tls_private_key: retained.private_key.clone(),
             retained_ca_tls: None,
+            retained_outgoing_ca_pq: secrets.retained_outgoing_ca_pq.clone(),
         };
         let slots = self.slots.clone();
         self.reseal(slots, &master, &rotated)?;
@@ -877,6 +963,49 @@ impl AuthorityVault {
             certificate_fingerprint: retained.certificate_fingerprint.clone(),
             destroyed_fingerprint: retained.counterpart_fingerprint.clone(),
         })
+    }
+
+    /// Destroys the outgoing `CA-PQ` at `not_after` (spec §9.1), in one sealed
+    /// write. Refused before that second, naming it.
+    ///
+    /// Nothing to retire is not an error: the call writes nothing and returns
+    /// `Ok`, so an operator who repeats « Terminer » is not told it failed.
+    pub fn retire_outgoing_ca_pq(
+        &mut self,
+        opening: &crate::authenticator::Opened,
+        now_unix: u64,
+    ) -> Result<()> {
+        let opening_slot = self.slot_for_credential(&opening.credential_id)?.slot_id;
+        let master = self.master(&opening_slot, &opening.secret)?;
+        let secrets = self.open_payload(&master)?;
+        let Some(retained) = secrets.retained_outgoing_ca_pq.as_ref() else {
+            return Ok(());
+        };
+        if now_unix < retained.not_after {
+            return Err(VaultError::OutgoingCaPqKept {
+                at: retained.not_after,
+            });
+        }
+        let retired = AuthoritySecrets {
+            ca_pq_private_key: secrets.ca_pq_private_key.clone(),
+            ca_pq_public_key: secrets.ca_pq_public_key.clone(),
+            ca_tls_private_key: secrets.ca_tls_private_key.clone(),
+            retained_ca_tls: secrets.retained_ca_tls.clone(),
+            retained_outgoing_ca_pq: None,
+        };
+        let slots = self.slots.clone();
+        self.reseal(slots, &master, &retired)?;
+        self.retained_outgoing_ca_pq_public = None;
+        Ok(())
+    }
+
+    /// The outgoing `CA-PQ`'s public key, its epoch and its `not_after`, read
+    /// without a key. `None` when no rotation is awaiting « Terminer », or when
+    /// the clear copy is not a key at all — which the unlock refuses anyway.
+    pub fn retained_outgoing_ca_pq_public(&self) -> Option<(MlDsa87PublicKey, u64, u64)> {
+        let public = self.retained_outgoing_ca_pq_public.as_ref()?;
+        let key = MlDsa87PublicKey::parse(public.public_key.trim()).ok()?;
+        Some((key, public.ca_epoch, public.not_after))
     }
 
     /// What the vault holds beside the issuing `CA-TLS` key, if anything.

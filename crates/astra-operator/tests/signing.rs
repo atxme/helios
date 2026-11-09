@@ -30,11 +30,11 @@ use aether::certificates::CERTIFICATE_FORMAT_VERSION;
 use astra_operator::authenticator::Opened;
 use astra_operator::credentials::CredentialRegistry;
 use astra_operator::gestures::{
-    add_key, create_authority, open_with_authorized_key, NewAuthority, NewKey,
+    add_key, create_authority, open_with_authorized_key, GestureError, NewAuthority, NewKey,
 };
 use astra_operator::signing::{
-    self, CampaignApprovalSession, DelegationBounds, DomainIdentity, IssuerDelegationRequest,
-    MAX_CA_TLS_LIFETIME_SECS,
+    self, issue_ca_tls, CampaignApprovalSession, DelegationBounds, DomainIdentity,
+    IssuerDelegationRequest, MAX_CA_TLS_LIFETIME_SECS,
 };
 use astra_operator::vault::{AuthorityVault, SlotRole};
 use base64::Engine as _;
@@ -754,6 +754,116 @@ fn rotating_the_anchor_leaves_every_key_slot_working() {
     let mut other = bootstrapped(&third, &fourth);
     let only = open(&third, &other);
     assert!(signing::rotate_ca_pq(&mut other, &[&only], &identity, None, window, NOW,).is_err());
+}
+
+/// The message a second rotation is refused with, while « Terminer » is pending.
+const PENDING_ROTATION: &str = "Terminer d'abord la rotation CA-PQ précédente.";
+
+/// A rotation keeps the outgoing `CA-PQ` sealed, and says in the clear which
+/// epoch it belongs to and the second it is retired at.
+#[test]
+fn rotate_ca_pq_keeps_the_outgoing_key() {
+    let first = FakeKey::new(1);
+    let second = FakeKey::new(2);
+    let mut vault = bootstrapped(&first, &second);
+    let identity = identity();
+    let registry = bindings(&vault, &open(&first, &vault));
+    let previous_anchor = ca_pq_public_key(&vault);
+    let previous_private = {
+        let opening = open(&first, &vault);
+        let secrets = vault
+            .open(&opening.credential_id, &opening.secret)
+            .expect("opens");
+        secrets.ca_pq_private_key.clone()
+    };
+    let window = TransitionWindow::new(NOW, NOW + 3_600, NOW + 7_200).expect("window");
+    let (first_opening, second_opening) = (open(&first, &vault), open(&second, &vault));
+    signing::rotate_ca_pq(
+        &mut vault,
+        &[&first_opening, &second_opening],
+        &identity,
+        Some(&registry),
+        window,
+        NOW,
+    )
+    .expect("the anchor rotates");
+
+    let opening = open(&first, &vault);
+    let secrets = vault
+        .open(&opening.credential_id, &opening.secret)
+        .expect("opens");
+    let outgoing = secrets
+        .retained_outgoing_ca_pq
+        .as_ref()
+        .expect("the outgoing CA-PQ is kept");
+    assert_eq!(outgoing.private_key, previous_private);
+    assert_eq!(outgoing.public_key, previous_anchor.to_base64());
+    assert_eq!(outgoing.ca_epoch, identity.ca_epoch);
+    assert_eq!(outgoing.not_after, NOW + 7_200);
+
+    let (public, ca_epoch, not_after) = vault
+        .retained_outgoing_ca_pq_public()
+        .expect("readable without the key");
+    assert_eq!(public, previous_anchor);
+    assert_eq!((ca_epoch, not_after), (identity.ca_epoch, NOW + 7_200));
+}
+
+/// Until « Terminer », neither anchor rotation starts: each is refused before
+/// any key is generated or moved.
+#[test]
+fn no_anchor_rotation_while_an_outgoing_key_is_kept() {
+    let first = FakeKey::new(1);
+    let second = FakeKey::new(2);
+    let mut vault = bootstrapped(&first, &second);
+    let identity = identity();
+    let registry = bindings(&vault, &open(&first, &vault));
+    let window = TransitionWindow::new(NOW, NOW + 3_600, NOW + 7_200).expect("window");
+    let (first_opening, second_opening) = (open(&first, &vault), open(&second, &vault));
+    signing::rotate_ca_pq(
+        &mut vault,
+        &[&first_opening, &second_opening],
+        &identity,
+        Some(&registry),
+        window,
+        NOW,
+    )
+    .expect("the anchor rotates");
+
+    let (first_opening, second_opening) = (open(&first, &vault), open(&second, &vault));
+    let refused_pq = signing::rotate_ca_pq(
+        &mut vault,
+        &[&first_opening, &second_opening],
+        &identity,
+        None,
+        window,
+        NOW,
+    );
+    assert!(matches!(
+        refused_pq,
+        Err(GestureError::Anchors(ref message)) if message.as_str() == PENDING_ROTATION
+    ));
+
+    let active = issue_ca_tls(
+        &vault,
+        &open(&first, &vault),
+        &identity,
+        NOW,
+        NOW + 365 * 86_400,
+    )
+    .expect("issued");
+    let first_opening = open(&first, &vault);
+    let refused_tls = signing::rotate_ca_tls(
+        &mut vault,
+        &first_opening,
+        &identity,
+        &active,
+        window,
+        (NOW, NOW + 30 * 86_400),
+    );
+    assert!(matches!(
+        refused_tls,
+        Err(GestureError::Anchors(ref message)) if message.as_str() == PENDING_ROTATION
+    ));
 }
 
 /// The signing gestures must fit the stack the binary reserves, like the

@@ -97,6 +97,7 @@ pub fn rotate_ca_tls(
     window: TransitionWindow,
     validity: (u64, u64),
 ) -> Result<RotatedClientTlsCa> {
+    refuse_while_outgoing_ca_pq_is_kept(vault)?;
     if validity.1 <= validity.0 || validity.1 - validity.0 > MAX_CA_TLS_LIFETIME_SECS {
         return Err(GestureError::Anchors(format!(
             "période de validité hors bornes : au plus {MAX_CA_TLS_LIFETIME_SECS} secondes"

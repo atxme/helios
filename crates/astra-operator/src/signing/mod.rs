@@ -57,7 +57,9 @@
 //! — l'assertion, le binding, les quatre empreintes — est produit et
 //! **vérifié** ici, de sorte qu'Astra ne peut que signer un fait déjà établi.
 
-use crate::vault::{AuthoritySecrets, AuthorityVault, CaTlsAdvance, RetainedCaTls};
+use crate::vault::{
+    AuthoritySecrets, AuthorityVault, CaTlsAdvance, RetainedCaTls, RetainedOutgoingCaPq,
+};
 use aether::certificates::approval::{
     AstraCredentialBinding, CredentialState, ExpiredRecoveryApproval,
     ExpiredRecoveryApprovalEvidence,
@@ -180,6 +182,18 @@ fn to_offset_date_time(seconds: u64) -> Result<time::OffsetDateTime> {
 /// A single helper so every gesture below reaches the private keys the same
 /// way — through a slot the authenticator just opened — and none of them holds
 /// the secrets any longer than the closure it is given.
+/// What an anchor rotation is refused with while the outgoing `CA-PQ` is kept.
+const PENDING_CA_PQ_ROTATION: &str = "Terminer d'abord la rotation CA-PQ précédente.";
+
+/// Refuses a new anchor rotation until « Terminer » has destroyed the outgoing
+/// `CA-PQ`. Read from the clear copy, so no key is asked for to refuse.
+fn refuse_while_outgoing_ca_pq_is_kept(vault: &AuthorityVault) -> Result<()> {
+    if vault.retained_outgoing_ca_pq_public.is_some() {
+        return Err(GestureError::Anchors(PENDING_CA_PQ_ROTATION.into()));
+    }
+    Ok(())
+}
+
 fn with_anchors<T>(
     vault: &AuthorityVault,
     opening: &crate::authenticator::Opened,

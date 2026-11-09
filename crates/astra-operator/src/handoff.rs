@@ -299,6 +299,7 @@ mod tests {
                 ca_pq_public_key: "cHVibGlj".into(),
                 ca_tls_private_key: "dGxz".into(),
                 retained_ca_tls: None,
+                retained_outgoing_ca_pq: None,
             },
             SlotEnrolment {
                 role: SlotRole::Primary,

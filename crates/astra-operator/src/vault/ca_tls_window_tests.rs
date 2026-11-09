@@ -120,6 +120,7 @@ fn replacing_the_pq_anchor_may_not_drop_an_open_window() {
         ca_pq_public_key: "bmV3LXBxLXB1Yg==".into(),
         ca_tls_private_key: "Y2EtdGxzLXByaXZhdGU=".into(),
         retained_ca_tls: None,
+        retained_outgoing_ca_pq: None,
     };
     let refused = vault.replace_anchors(&credential(1), &material(1), &dropped);
     assert!(matches!(refused, Err(VaultError::Corrupt(_))));
@@ -128,6 +129,7 @@ fn replacing_the_pq_anchor_may_not_drop_an_open_window() {
         ca_pq_public_key: dropped.ca_pq_public_key.clone(),
         ca_tls_private_key: dropped.ca_tls_private_key.clone(),
         retained_ca_tls: Some(successor()),
+        retained_outgoing_ca_pq: None,
     };
     vault
         .replace_anchors(&credential(1), &material(1), &carried)

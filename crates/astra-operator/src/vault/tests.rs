@@ -7,6 +7,7 @@ fn secrets() -> AuthoritySecrets {
         ca_pq_public_key: "Y2EtcHEtcHVibGlj".into(),
         ca_tls_private_key: "Y2EtdGxzLXByaXZhdGU=".into(),
         retained_ca_tls: None,
+        retained_outgoing_ca_pq: None,
     }
 }
 
@@ -397,4 +398,166 @@ fn an_edited_clear_anchor_is_caught_at_the_next_unlock() {
 fn the_clear_anchor_is_the_one_the_vault_seals() {
     let vault = vault();
     assert_eq!(vault.ca_pq_public_key, secrets().ca_pq_public_key);
+}
+
+/// The outgoing `CA-PQ` a rotation keeps: a real ML-DSA-87 pair, so that the
+/// clear copy parses as the anchor it is.
+fn outgoing_ca_pq(ca_epoch: u64, not_after: u64) -> RetainedOutgoingCaPq {
+    let (private_key, public_key) =
+        aether::certificates::encoding::generate_ml_dsa_87_keypair().expect("keypair");
+    RetainedOutgoingCaPq {
+        private_key: encode(&private_key),
+        public_key: public_key.to_base64(),
+        ca_epoch,
+        not_after,
+    }
+}
+
+fn opening(seed: u8) -> crate::authenticator::Opened {
+    crate::authenticator::Opened {
+        credential_id: credential(seed),
+        secret: material(seed),
+    }
+}
+
+/// The anchors a `CA-PQ` rotation writes, keeping `retained` as the outgoing key.
+fn rotated_with(
+    retained: Option<RetainedOutgoingCaPq>,
+    window: Option<RetainedCaTls>,
+) -> AuthoritySecrets {
+    AuthoritySecrets {
+        ca_pq_private_key: "bmV3LXBx".into(),
+        ca_pq_public_key: "bmV3LXBxLXB1Yg==".into(),
+        ca_tls_private_key: "Y2EtdGxzLXByaXZhdGU=".into(),
+        retained_ca_tls: window,
+        retained_outgoing_ca_pq: retained,
+    }
+}
+
+fn vault_after_rotation(retained: RetainedOutgoingCaPq) -> AuthorityVault {
+    let mut vault = vault();
+    vault
+        .replace_anchors(
+            &credential(1),
+            &material(1),
+            &rotated_with(Some(retained), None),
+        )
+        .expect("rotate");
+    vault
+}
+
+/// A vault written before the outgoing key was kept still opens, and reads as
+/// holding none: the field is an addition, not a migration.
+#[test]
+fn a_vault_written_before_this_lot_opens() {
+    let mut value = serde_json::to_value(vault()).expect("json");
+    value
+        .as_object_mut()
+        .expect("object")
+        .remove("retained_outgoing_ca_pq_public");
+    let older: AuthorityVault = serde_json::from_value(value).expect("older vault reads");
+    assert!(older.retained_outgoing_ca_pq_public.is_none());
+    let opened = older.open(&credential(1), &material(1)).expect("opens");
+    assert_eq!(opened.retained_outgoing_ca_pq, None);
+    let older_body: AuthoritySecrets = serde_json::from_str(
+        r#"{"ca_pq_private_key":"YQ==","ca_pq_public_key":"Yg==","ca_tls_private_key":"Yw=="}"#,
+    )
+    .expect("older body reads");
+    assert_eq!(older_body.retained_outgoing_ca_pq, None);
+}
+
+/// A rotation seals the outgoing key beside the new anchor, and the clear copy
+/// says which epoch and which second it belongs to, with no key needed.
+#[test]
+fn the_outgoing_key_is_readable_without_opening_the_vault() {
+    let outgoing = outgoing_ca_pq(4, 9_000);
+    let vault = vault_after_rotation(outgoing.clone());
+    let (public, ca_epoch, not_after) = vault
+        .retained_outgoing_ca_pq_public()
+        .expect("the outgoing anchor is held");
+    assert_eq!(public.to_base64(), outgoing.public_key);
+    assert_eq!((ca_epoch, not_after), (4, 9_000));
+}
+
+/// The clear copy is checked against the sealed one at every unlock, as the
+/// clear anchor is.
+#[test]
+fn an_edited_clear_outgoing_key_is_caught_at_the_next_unlock() {
+    let mut vault = vault_after_rotation(outgoing_ca_pq(4, 9_000));
+    vault
+        .retained_outgoing_ca_pq_public
+        .as_mut()
+        .expect("held")
+        .ca_epoch = 5;
+    assert!(matches!(
+        vault.open(&credential(1), &material(1)),
+        Err(VaultError::AnchorMismatch)
+    ));
+}
+
+/// Before `not_after` the outgoing key is still the one a revocation may be
+/// signed under: destroying it early would strand the overlap.
+#[test]
+fn retire_refuses_before_not_after() {
+    let mut vault = vault_after_rotation(outgoing_ca_pq(4, 9_000));
+    let sealed = vault.sealed_payload.clone();
+    let refused = vault.retire_outgoing_ca_pq(&opening(1), 8_999);
+    assert!(matches!(
+        refused,
+        Err(VaultError::OutgoingCaPqKept { at: 9_000 })
+    ));
+    assert_eq!(vault.sealed_payload, sealed);
+    assert!(vault.retained_outgoing_ca_pq_public().is_some());
+}
+
+/// At `not_after` one sealed write destroys the outgoing key and leaves the
+/// new anchor, its key and the slot table as they were.
+#[test]
+fn retire_destroys_the_outgoing_key() {
+    let mut vault = vault_after_rotation(outgoing_ca_pq(4, 9_000));
+    let before = vault.open(&credential(1), &material(1)).expect("open");
+    vault
+        .retire_outgoing_ca_pq(&opening(1), 9_000)
+        .expect("retires");
+    let after = vault.open(&credential(1), &material(1)).expect("open");
+    assert_eq!(after.retained_outgoing_ca_pq, None);
+    assert_eq!(after.ca_pq_private_key, before.ca_pq_private_key);
+    assert_eq!(after.ca_pq_public_key, before.ca_pq_public_key);
+    assert!(vault.retained_outgoing_ca_pq_public().is_none());
+    assert_eq!(vault.slots.len(), 1);
+}
+
+/// Staging a `CA-TLS` successor carries the outgoing `CA-PQ` through, and so
+/// does an anchor replacement; dropping it there is refused.
+#[test]
+fn ca_tls_staging_keeps_the_outgoing_ca_pq() {
+    let outgoing = outgoing_ca_pq(4, 9_000);
+    let mut vault = vault_after_rotation(outgoing.clone());
+    let successor = RetainedCaTls {
+        private_key: "c3VjY2Vzc2V1cg==".into(),
+        certificate_fingerprint: "b".repeat(64),
+        counterpart_fingerprint: "a".repeat(64),
+        activation_at: 5_000,
+        not_after: 9_000,
+    };
+    vault
+        .stage_ca_tls_successor(&credential(1), &material(1), successor.clone())
+        .expect("stage");
+    let after = vault.open(&credential(1), &material(1)).expect("open");
+    assert_eq!(after.retained_outgoing_ca_pq, Some(outgoing.clone()));
+
+    // The open `CA-TLS` window is carried as well, or the replacement is refused
+    // on that account rather than on the outgoing key.
+    let dropped = vault.replace_anchors(
+        &credential(1),
+        &material(1),
+        &rotated_with(None, Some(successor.clone())),
+    );
+    assert!(matches!(dropped, Err(VaultError::Corrupt(_))));
+    let carried = rotated_with(Some(outgoing.clone()), Some(successor));
+    vault
+        .replace_anchors(&credential(1), &material(1), &carried)
+        .expect("replace");
+    let after = vault.open(&credential(1), &material(1)).expect("open");
+    assert_eq!(after.retained_outgoing_ca_pq, Some(outgoing));
 }
