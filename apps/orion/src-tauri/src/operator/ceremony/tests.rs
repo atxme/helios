@@ -183,6 +183,7 @@ impl Domain {
             ca_pq_public_key: ca_public_key.to_base64(),
             ca_tls_private_key: "Y2EtdGxzLXByaXZhdGU=".into(),
             retained_ca_tls: None,
+            retained_outgoing_ca_pq: None,
         };
         let vault = AuthorityVault::create(
             TrustDomainId::new([3; 16]).expect("domain"),

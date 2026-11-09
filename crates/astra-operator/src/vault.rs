@@ -287,7 +287,7 @@ pub struct AuthoritySecrets {
     pub retained_ca_tls: Option<RetainedCaTls>,
     /// The outgoing `CA-PQ`, kept from the signature of a rotation until
     /// « Terminer ». `None` outside that window.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retained_outgoing_ca_pq: Option<RetainedOutgoingCaPq>,
 }
 
@@ -424,7 +424,7 @@ pub struct AuthorityVault {
     pub ca_pq_public_key: String,
     /// The outgoing `CA-PQ`'s public half, in the clear, while one is kept.
     /// Mirrors the sealed copy and is checked against it at every unlock.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retained_outgoing_ca_pq_public: Option<OutgoingCaPqPublic>,
     /// WebAuthn RP ID the credentials are registered under. An assertion must
     /// name the same one it was created with, so the vault carries it rather

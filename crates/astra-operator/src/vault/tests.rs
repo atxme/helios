@@ -561,3 +561,15 @@ fn ca_tls_staging_keeps_the_outgoing_ca_pq() {
     let after = vault.open(&credential(1), &material(1)).expect("open");
     assert_eq!(after.retained_outgoing_ca_pq, Some(outgoing));
 }
+
+/// A vault with nothing retained serialises as it did before the outgoing key
+/// was kept: neither new field appears, so its fingerprint does not move.
+#[test]
+fn a_vault_without_outgoing_key_serialises_as_before() {
+    let vault = vault();
+    assert!(vault.retained_outgoing_ca_pq_public.is_none());
+    let serialised = serde_json::to_string(&vault).expect("json");
+    assert!(!serialised.contains("retained_outgoing_ca_pq"));
+    let body = serde_json::to_string(&secrets()).expect("json");
+    assert!(!body.contains("retained_outgoing_ca_pq"));
+}
