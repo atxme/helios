@@ -17,8 +17,8 @@ use aether::certificates::encoding::{
 };
 use aether::certificates::transport::{
     ClientRenewalOperationState, ClientRenewalOperationView, ClientRenewalSignerRequest,
-    OperatorAuthorityStatus, OperatorOpenAction, OperatorOpenRequest, OperatorOpened,
-    OperatorVaultCopied, OperatorVaultCopy,
+    OperatorAuthorityStatus, OperatorGatewayPublish, OperatorGatewayPublished, OperatorOpenAction,
+    OperatorOpenRequest, OperatorOpened, OperatorVaultCopied, OperatorVaultCopy,
 };
 use aether::certificates::window::TransitionWindow;
 use astra_operator::rotation_journal::RotationKind;
@@ -551,6 +551,34 @@ fn a_vault_copy_above_the_relay_bound_is_sent_whole() {
     assert_eq!(seen.path, "/api/certificates/operator/vault-copy");
     let sent: OperatorVaultCopy = serde_json::from_slice(&seen.body).expect("body");
     assert_eq!(sent.vault_base64.len(), 100 * 1024);
+}
+
+/// The publication goes to its own route, with the epoch it names, and the
+/// answer says whether the gateway confirmed the relay.
+#[test]
+fn a_gateway_publication_posts_its_epoch_to_its_route() {
+    let published = OperatorGatewayPublished {
+        epoch: 7,
+        relayed: true,
+    };
+    let stub = Stub::serving(vec![(
+        200,
+        serde_json::to_string(&published).expect("json"),
+    )]);
+    let answer = Tunnel::new(&stub.base)
+        .expect("tunnel")
+        .publish_gateway_transition(7)
+        .expect("published");
+    assert_eq!(answer, published);
+
+    let seen = stub.next();
+    assert_eq!(seen.method, "POST");
+    assert_eq!(
+        seen.path,
+        "/api/certificates/operator/gateway-identity/publish"
+    );
+    let sent: OperatorGatewayPublish = serde_json::from_slice(&seen.body).expect("body");
+    assert_eq!(sent, OperatorGatewayPublish { epoch: 7 });
 }
 
 /// Held back by a live operation is a result, and not a failure: the rotation

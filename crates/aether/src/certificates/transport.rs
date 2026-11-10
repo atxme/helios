@@ -1359,6 +1359,25 @@ impl std::fmt::Debug for OperatorVaultCopy {
     }
 }
 
+/// What an administrator asks Astra to publish: the gateway identity transition
+/// of one epoch, which Astra marks published and then relays to the gateway
+/// (F14 lot 6b).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorGatewayPublish {
+    pub epoch: u64,
+}
+
+/// What Astra answers to a publication. `relayed` says whether the gateway
+/// confirmed the relay on this call: a publication is asked again to retry a
+/// relay that failed, and the mark it left in place is not undone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorGatewayPublished {
+    pub epoch: u64,
+    pub relayed: bool,
+}
+
 /// What Astra holds after a vault copy, for Orion to read back.
 ///
 /// `credential_registry_epoch` has the meaning it has in

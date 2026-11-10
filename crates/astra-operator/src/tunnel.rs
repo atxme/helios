@@ -42,8 +42,8 @@ use aether::certificates::authority::{CaTransition, ClientTlsCaTransition};
 use aether::certificates::encoding::{Fingerprint, Id16};
 use aether::certificates::transport::{
     ClientRenewalOperationState, ClientRenewalOperationView, ClientRenewalSignerRequest,
-    OperatorAuthorityStatus, OperatorOpenRequest, OperatorOpened, OperatorVaultCopied,
-    OperatorVaultCopy,
+    OperatorAuthorityStatus, OperatorGatewayPublish, OperatorGatewayPublished, OperatorOpenRequest,
+    OperatorOpened, OperatorVaultCopied, OperatorVaultCopy,
 };
 use anyhow::{bail, Context, Result};
 
@@ -518,6 +518,20 @@ impl Tunnel {
             .context("ouverture de la campagne")?;
         Self::read_admin(response, crate::origin::MAX_ANSWER_BYTES)
             .context("ouverture de la campagne")
+    }
+
+    /// Publishes the signed gateway transition of `epoch` (F14 lot 6b): Astra
+    /// marks it published, then relays it to the gateway. Asking again retries
+    /// a relay the gateway did not confirm; `relayed` says whether it did.
+    pub fn publish_gateway_transition(&self, epoch: u64) -> Result<OperatorGatewayPublished> {
+        let response = self
+            .post_admin(
+                &format!("{OPERATOR_PREFIX}/gateway-identity/publish"),
+                &OperatorGatewayPublish { epoch },
+            )
+            .context("publication de la transition gateway")?;
+        Self::read_admin(response, crate::origin::MAX_ANSWER_BYTES)
+            .context("publication de la transition gateway")
     }
 
     /// Reads what Astra holds (§5.9). Fingerprints and epochs, no token.

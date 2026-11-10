@@ -7,7 +7,10 @@
 use std::net::SocketAddr;
 use std::time::{Duration, SystemTime};
 
-use astra_channel::{OperatorOpenAction, OperatorOpenRequest, RelayedOperatorOpen};
+use astra_channel::{
+    OperatorGatewayPublish, OperatorGatewayPublished, OperatorOpenAction, OperatorOpenRequest,
+    RelayedOperatorGatewayPublish, RelayedOperatorOpen, OPERATOR_GATEWAY_PUBLISH_ROUTE,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -985,4 +988,115 @@ async fn a_delegation_at_a_spent_epoch_stays_a_refusal() {
 
     assert_eq!(refused.err(), Some(crate::service::ServiceError::Refused));
     assert_eq!(deposit.state().await, before);
+}
+
+fn relayed_publication(epoch: u64) -> Vec<u8> {
+    serde_json::to_vec(&RelayedOperatorGatewayPublish {
+        operator: administrator(),
+        request: OperatorGatewayPublish { epoch },
+    })
+    .expect("relayed publication")
+}
+
+/// A gateway that accepts the publication it is told of: the relay is confirmed.
+async fn fixture_with_accepting_gateway(dir: &Path) -> Arc<AstraService> {
+    fixture_with_fake(
+        dir,
+        FakeGateway {
+            accepts_publications: true,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+/// The tunnel's publication reaches the door, which marks the transition and
+/// relays it; the answer says the gateway confirmed it.
+#[tokio::test]
+async fn publish_route_relays_to_the_door() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture_with_accepting_gateway(dir.path()).await;
+    rewrite_registry(&service, |state| {
+        state.transitions.push(stored_gateway_transition(5))
+    })
+    .await;
+    let listener = listen(Arc::clone(&service)).await;
+
+    let (status, body) = post_to(
+        &listener,
+        OPERATOR_GATEWAY_PUBLISH_ROUTE,
+        &relayed_publication(5),
+    )
+    .await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let answer: OperatorGatewayPublished = serde_json::from_slice(&body).expect("the answer");
+    assert_eq!(
+        answer,
+        OperatorGatewayPublished {
+            epoch: 5,
+            relayed: true,
+        }
+    );
+    assert!(published_on_disk(dir.path()));
+}
+
+/// Asking twice for the same epoch answers twice: the second call finds the
+/// mark already written, and relays again.
+#[tokio::test]
+async fn publish_twice_answers_twice() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture_with_accepting_gateway(dir.path()).await;
+    rewrite_registry(&service, |state| {
+        state.transitions.push(stored_gateway_transition(5))
+    })
+    .await;
+    let listener = listen(Arc::clone(&service)).await;
+
+    for _ in 0..2 {
+        let (status, body) = post_to(
+            &listener,
+            OPERATOR_GATEWAY_PUBLISH_ROUTE,
+            &relayed_publication(5),
+        )
+        .await;
+        assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+        let answer: OperatorGatewayPublished = serde_json::from_slice(&body).expect("the answer");
+        assert_eq!(
+            answer,
+            OperatorGatewayPublished {
+                epoch: 5,
+                relayed: true,
+            }
+        );
+    }
+}
+
+/// A gateway that refuses the relay leaves the mark in place, and the answer
+/// says the relay was not confirmed: the administrator asks again.
+#[tokio::test]
+async fn publish_whose_relay_is_refused_answers_not_relayed() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture_with_gateway(dir.path()).await;
+    rewrite_registry(&service, |state| {
+        state.transitions.push(stored_gateway_transition(5))
+    })
+    .await;
+    let listener = listen(Arc::clone(&service)).await;
+
+    let (status, body) = post_to(
+        &listener,
+        OPERATOR_GATEWAY_PUBLISH_ROUTE,
+        &relayed_publication(5),
+    )
+    .await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let answer: OperatorGatewayPublished = serde_json::from_slice(&body).expect("the answer");
+    assert_eq!(
+        answer,
+        OperatorGatewayPublished {
+            epoch: 5,
+            relayed: false,
+        }
+    );
+    assert!(published_on_disk(dir.path()));
 }

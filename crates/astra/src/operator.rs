@@ -36,10 +36,11 @@ use std::sync::Arc;
 
 use aether::certificates::encoding::{Fingerprint, Id16};
 use astra_channel::{
-    OperatorAuthorityStatus, OperatorIdentity, OperatorIssuerStatus, OperatorVaultCopied,
-    RelayedOperatorCampaign, RelayedOperatorOpen, RelayedOperatorSignerResult,
-    RelayedOperatorVaultCopy, MAX_OPERATOR_RELAY_BODY_BYTES,
-    MAX_OPERATOR_VAULT_COPY_RELAY_BODY_BYTES, OPERATOR_OPEN_ROUTE, OPERATOR_OPERATION_ROUTE,
+    OperatorAuthorityStatus, OperatorGatewayPublished, OperatorIdentity, OperatorIssuerStatus,
+    OperatorVaultCopied, RelayedOperatorCampaign, RelayedOperatorGatewayPublish,
+    RelayedOperatorOpen, RelayedOperatorSignerResult, RelayedOperatorVaultCopy,
+    MAX_OPERATOR_RELAY_BODY_BYTES, MAX_OPERATOR_VAULT_COPY_RELAY_BODY_BYTES,
+    OPERATOR_GATEWAY_PUBLISH_ROUTE, OPERATOR_OPEN_ROUTE, OPERATOR_OPERATION_ROUTE,
     OPERATOR_PENDING_ROUTE, OPERATOR_SIGNER_REQUEST_ROUTE, OPERATOR_SIGNER_RESULT_ROUTE,
     OPERATOR_STATUS_ROUTE, OPERATOR_VAULT_COPY_ROUTE, OPERATOR_VAULT_ROUTE,
 };
@@ -56,7 +57,7 @@ use crate::service::{
     AstraService, ServiceError,
 };
 
-/// The eight private operator routes, for the listener of §8.3 to merge.
+/// The nine private operator routes, for the listener of §8.3 to merge.
 pub fn private_routes() -> Router<Arc<AstraService>> {
     Router::new()
         .route(
@@ -77,6 +78,10 @@ pub fn private_routes() -> Router<Arc<AstraService>> {
         .route(
             OPERATOR_SIGNER_RESULT_ROUTE,
             post(signer_result).layer(DefaultBodyLimit::max(MAX_OPERATOR_RELAY_BODY_BYTES)),
+        )
+        .route(
+            OPERATOR_GATEWAY_PUBLISH_ROUTE,
+            post(gateway_publish).layer(DefaultBodyLimit::max(MAX_OPERATOR_RELAY_BODY_BYTES)),
         )
 }
 
@@ -446,6 +451,83 @@ async fn vault_copy(
             refuse(&operator, "vault-copy", ServiceError::HeldBack)
         }
         Err(refusal) => refuse(&operator, "vault-copy", refusal.class()),
+    }
+}
+
+/// Lets the signed gateway transition of one epoch leave the authority, for an
+/// administrator relayed from the tunnel (F14 lot 6b).
+///
+/// The door marks it published and relays it, and it asks again on every call:
+/// a publication of an epoch already marked answers again, and `relayed` says
+/// whether the gateway confirmed this one. Spawned like the other door writes,
+/// so a dropped connection cannot end the relay half way.
+async fn gateway_publish(
+    State(service): State<Arc<AstraService>>,
+    relayed: Result<Json<RelayedOperatorGatewayPublish>, JsonRejection>,
+) -> Response {
+    let Json(relayed) = match relayed {
+        Ok(relayed) => relayed,
+        Err(rejection) => {
+            tracing::warn!(
+                route = "gateway-identity-publish",
+                status = %rejection.status(),
+                "private operator route refused an unreadable publication"
+            );
+            return ServiceError::Protocol.into_response();
+        }
+    };
+    let operator = relayed.operator;
+    let epoch = relayed.request.epoch;
+    let connector = DoorConnector::Tunnel {
+        operator: operator.clone(),
+    };
+    let publication = tokio::spawn({
+        let service = Arc::clone(&service);
+        async move {
+            service
+                .door(
+                    connector,
+                    DoorRequest::GatewayIdentityPublish { epoch },
+                    now_unix(),
+                )
+                .await
+        }
+    })
+    .await;
+    let publication = match publication {
+        Ok(publication) => publication,
+        Err(error) => {
+            tracing::error!(operator = %operator, %error, "the door task did not finish");
+            return refuse(
+                &operator,
+                "gateway-identity-publish",
+                ServiceError::Internal,
+            );
+        }
+    };
+    match publication {
+        Ok(DoorOutcome::Published {
+            epoch, confirmed, ..
+        }) => (
+            axum::http::StatusCode::OK,
+            Json(OperatorGatewayPublished {
+                epoch,
+                relayed: confirmed,
+            }),
+        )
+            .into_response(),
+        Ok(_) => {
+            tracing::error!(
+                operator = %operator,
+                "the door answered a publication with something other than a publication"
+            );
+            refuse(
+                &operator,
+                "gateway-identity-publish",
+                ServiceError::Internal,
+            )
+        }
+        Err(refusal) => refuse(&operator, "gateway-identity-publish", refusal.class()),
     }
 }
 

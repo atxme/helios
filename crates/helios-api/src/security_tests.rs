@@ -261,6 +261,34 @@ async fn vault_copy_route_refuses_a_non_admin_and_an_oversized_body() {
     );
 }
 
+/// The gateway publication is an administrative mutation: refused to a peer
+/// that is not an administrator, and admitted to one, whatever the authority
+/// behind it says.
+#[tokio::test]
+async fn publish_is_refused_to_a_non_admin() {
+    const URI: &str = "/api/certificates/operator/gateway-identity/publish";
+    const BODY: &str = r#"{"epoch":5}"#;
+
+    let (non_admin_state, _cmd_rx) = state();
+    non_admin_state.network.write().await.peers[0].admin = false;
+    let response = router(non_admin_state)
+        .oneshot(admin_request(URI, BODY))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    let (admin_state, _cmd_rx) = state();
+    let response = router(admin_state)
+        .oneshot(admin_request(URI, BODY))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "the administrator is admitted; what is missing is the private channel"
+    );
+}
+
 /// Opening a campaign is an administrative mutation like any other.
 ///
 /// Mounted beside the signer results, it inherits the same barriers in the

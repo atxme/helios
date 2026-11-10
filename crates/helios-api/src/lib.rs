@@ -349,6 +349,12 @@ pub fn router(state: AppState) -> Router {
             )),
         )
         .route(
+            "/api/certificates/operator/gateway-identity/publish",
+            post(certificates::operator_gateway_publish).layer(DefaultBodyLimit::max(
+                astra_channel::MAX_OPERATOR_REQUEST_BYTES,
+            )),
+        )
+        .route(
             "/api/certificates/operator/campaigns",
             post(certificates::operator_open).layer(DefaultBodyLimit::max(
                 astra_channel::MAX_OPERATOR_REQUEST_BYTES,

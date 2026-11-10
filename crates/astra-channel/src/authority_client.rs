@@ -223,6 +223,21 @@ impl AstraLifecycleClient {
         .await
     }
 
+    /// Asks Astra to publish the gateway transition of the epoch named. No
+    /// bearer token: publishing carries no capability, the signed transition does.
+    pub async fn operator_gateway_publish(
+        &self,
+        relayed: &RelayedOperatorGatewayPublish,
+    ) -> Result<OperatorGatewayPublished, ChannelError> {
+        self.post_bounded(
+            OPERATOR_GATEWAY_PUBLISH_ROUTE,
+            relayed,
+            None,
+            MAX_OPERATOR_ANSWER_BYTES,
+        )
+        .await
+    }
+
     async fn post<B: Serialize, R: serde::de::DeserializeOwned>(
         &self,
         path: &str,

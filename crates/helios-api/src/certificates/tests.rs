@@ -227,6 +227,15 @@ impl OperatorCampaignRelay for SpyCampaign {
         }
     }
 
+    async fn publish_gateway_transition(
+        &self,
+        operator: &astra_channel::OperatorIdentity,
+        _request: astra_channel::OperatorGatewayPublish,
+    ) -> Result<astra_channel::OperatorGatewayPublished, TrustUpdateRefusal> {
+        *self.seen.lock().unwrap() = Some(operator.clone());
+        Err(TrustUpdateRefusal::Rejected)
+    }
+
     async fn open(
         &self,
         operator: &astra_channel::OperatorIdentity,

@@ -114,6 +114,17 @@ impl OperatorCampaignRelay for RecordingRelay {
                 .map(|registry| registry.credential_registry_epoch),
         })
     }
+    async fn publish_gateway_transition(
+        &self,
+        operator: &astra_channel::OperatorIdentity,
+        request: astra_channel::OperatorGatewayPublish,
+    ) -> Result<astra_channel::OperatorGatewayPublished, TrustUpdateRefusal> {
+        self.record("gateway-publish", operator, request.epoch.to_string(), "")?;
+        Ok(astra_channel::OperatorGatewayPublished {
+            epoch: request.epoch,
+            relayed: true,
+        })
+    }
     async fn open(
         &self,
         operator: &astra_channel::OperatorIdentity,
@@ -122,6 +133,41 @@ impl OperatorCampaignRelay for RecordingRelay {
         self.record("open", operator, String::new(), "")?;
         Err(TrustUpdateRefusal::Rejected)
     }
+}
+
+/// The publication is relayed once, with the epoch and no capability token,
+/// and the answer is the epoch and the relay's confirmation.
+#[tokio::test]
+async fn gateway_publish_is_relayed_once_with_its_epoch() {
+    let relay = RecordingRelay::new(None);
+    let body = Bytes::from_static(br#"{"epoch":5}"#);
+    let response = operator_gateway_publish(
+        State(state(&relay)),
+        Extension(operator_caller_at(true)),
+        body,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+    let published: astra_channel::OperatorGatewayPublished =
+        serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        published,
+        astra_channel::OperatorGatewayPublished {
+            epoch: 5,
+            relayed: true,
+        }
+    );
+    assert_eq!(
+        *relay.calls.lock().unwrap(),
+        vec![Call {
+            route: "gateway-publish",
+            operator: expected_operator(),
+            id: "5".into(),
+            token: String::new(),
+        }]
+    );
 }
 
 #[tokio::test]

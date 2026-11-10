@@ -784,6 +784,26 @@ impl helios_api::certificates::OperatorCampaignRelay for AstraRenewalRelay {
             .map_err(|error| Self::refuse("operator-vault-copy", error))
     }
 
+    /// Relays the gateway publication to Astra's door, with the administrator
+    /// it came through. The door marks the transition and relays it to the
+    /// gateway; this end carries the epoch and maps the answer onto its class.
+    async fn publish_gateway_transition(
+        &self,
+        operator: &::astra_channel::OperatorIdentity,
+        request: ::astra_channel::OperatorGatewayPublish,
+    ) -> Result<
+        ::astra_channel::OperatorGatewayPublished,
+        helios_api::certificates::TrustUpdateRefusal,
+    > {
+        self.client
+            .operator_gateway_publish(&::astra_channel::RelayedOperatorGatewayPublish {
+                operator: operator.clone(),
+                request,
+            })
+            .await
+            .map_err(|error| Self::refuse("operator-gateway-publish", error))
+    }
+
     /// Relays an opening to Astra's door, with the administrator it came
     /// through. The door decides what the tunnel may open; this end only
     /// carries the request and maps the answer onto its coarse class.

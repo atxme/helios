@@ -52,6 +52,9 @@ pub const OPERATOR_STATUS_ROUTE: &str = "/internal/v1/operator/status";
 /// Replaces the encrypted vault copy, and optionally the credential document,
 /// for an administrator relayed from the tunnel (spec §5.9).
 pub const OPERATOR_VAULT_COPY_ROUTE: &str = "/internal/v1/operator/vault-copy";
+/// Publishes the signed gateway transition of an epoch, for an administrator
+/// relayed from the tunnel (F14 lot 6b).
+pub const OPERATOR_GATEWAY_PUBLISH_ROUTE: &str = "/internal/v1/operator/gateway-identity/publish";
 /// Opens a campaign for an administrator relayed from the tunnel. Carries no
 /// capability token: opening grants nothing, the operator's credential does.
 pub const OPERATOR_OPEN_ROUTE: &str = "/internal/v1/operator/campaigns";
@@ -191,10 +194,20 @@ pub struct RelayedOperatorVaultCopy {
     pub copy: OperatorVaultCopy,
 }
 
+/// What the gateway relays for a publication: the administrator it resolved,
+/// for the structured log, and the epoch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelayedOperatorGatewayPublish {
+    pub operator: OperatorIdentity,
+    pub request: OperatorGatewayPublish,
+}
+
 /// The operator shapes both ends parse, defined once in `aether`.
 pub use aether::certificates::transport::{
-    OperatorAuthorityStatus, OperatorIssuerStatus, OperatorOpenAction, OperatorOpenRequest,
-    OperatorOpened, OperatorPendingList, OperatorPendingOperation, OperatorSignerRequestResponse,
+    OperatorAuthorityStatus, OperatorGatewayPublish, OperatorGatewayPublished,
+    OperatorIssuerStatus, OperatorOpenAction, OperatorOpenRequest, OperatorOpened,
+    OperatorPendingList, OperatorPendingOperation, OperatorSignerRequestResponse,
     OperatorVaultCopied, OperatorVaultCopy, RevocationExpiries, SigningOperationState,
     SigningOperationView,
 };

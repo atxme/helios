@@ -81,6 +81,15 @@ pub trait OperatorCampaignRelay: Send + Sync {
         copy: astra_channel::OperatorVaultCopy,
     ) -> Result<astra_channel::OperatorVaultCopied, TrustUpdateRefusal>;
 
+    /// Asks Astra to publish the signed gateway transition of the epoch named,
+    /// for this administrator (F14 lot 6b). Carries no capability token: the
+    /// transition's own signatures are what Astra checks.
+    async fn publish_gateway_transition(
+        &self,
+        operator: &astra_channel::OperatorIdentity,
+        request: astra_channel::OperatorGatewayPublish,
+    ) -> Result<astra_channel::OperatorGatewayPublished, TrustUpdateRefusal>;
+
     /// Asks Astra's door to open a campaign for this administrator.
     ///
     /// The door resolves the targets and appends this identity to
@@ -439,6 +448,43 @@ pub async fn operator_vault_copy(
     };
     match relay.vault_copy(&operator, copy).await {
         Ok(copied) => (StatusCode::OK, Json(copied)).into_response(),
+        Err(refusal) => refusal.status().into_response(),
+    }
+}
+
+/// `POST /api/certificates/operator/gateway-identity/publish`.
+///
+/// The caller is an administrator before the body is read, as for the opening.
+/// The body is one epoch, bounded by the operator request bound. The answer is
+/// the epoch and whether the gateway confirmed the relay; a refusal is its class.
+pub async fn operator_gateway_publish(
+    State(s): State<AppState>,
+    Extension(caller): Extension<crate::auth::Caller>,
+    body: Bytes,
+) -> Response {
+    let operator = match operator_caller(&caller, "gateway-publish") {
+        Ok(operator) => operator,
+        Err(status) => return status.into_response(),
+    };
+    if body.len() > astra_channel::MAX_OPERATOR_REQUEST_BYTES {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    }
+    let request: astra_channel::OperatorGatewayPublish = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(error) => {
+            tracing::warn!(
+                operator = %operator,
+                %error,
+                "operator gateway publication refused: unreadable request"
+            );
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+    };
+    let Some(relay) = s.operator_campaign.as_ref() else {
+        return operator_unavailable(&operator, "gateway-publish");
+    };
+    match relay.publish_gateway_transition(&operator, request).await {
+        Ok(published) => (StatusCode::OK, Json(published)).into_response(),
         Err(refusal) => refusal.status().into_response(),
     }
 }

@@ -1019,6 +1019,9 @@ struct FakeGateway {
     unavailable: bool,
     /// Accepts the relayed revocation, as a gateway that verified it does.
     accepts_revocations: bool,
+    /// Accepts the relayed publication of a transition, as a gateway does once
+    /// it has checked the transition.
+    accepts_publications: bool,
 }
 
 /// A peer the gateway admitted, as its private channel reads it back. The
@@ -1107,6 +1110,9 @@ impl astra_channel::AstraChannelHandler for FakeGateway {
         &self,
         _: astra_channel::GatewayTransitionPublished,
     ) -> Result<(), aether::certificates::transport::TrustUpdateRefusal> {
+        if self.accepts_publications {
+            return Ok(());
+        }
         Err(aether::certificates::transport::TrustUpdateRefusal::Rejected)
     }
 
