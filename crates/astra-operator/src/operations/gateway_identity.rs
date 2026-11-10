@@ -46,12 +46,11 @@ use aether::certificates::window::TransitionWindow;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::authenticator::{Authenticator, AuthenticatorError, Opened};
+use crate::authenticator::Authenticator;
 use crate::credentials;
-use crate::gestures;
 use crate::handoff::{self, DomainHandoff};
 use crate::operations::campaign_result;
-use crate::operations::keys::{key_step_of_opening, KeyStep, ValidatedKeys, NO_PIN};
+use crate::operations::keys::{approve_one, KeyStep, ValidatedKeys};
 use crate::operations::recovery::random_id;
 use crate::operations::rotation::ensure_same_vault;
 use crate::origin::CampaignRequest;
@@ -190,6 +189,9 @@ pub enum GatewayRefusal {
     RequestMismatch,
     #[error("Astra ou la gateway est injoignable. Rien n'est perdu : la reprise continue là où elle s'est arrêtée.")]
     Unreachable,
+    /// Unreachable before anything was signed: the one case where nothing was signed.
+    #[error("Astra ou la gateway est injoignable. Rien n'a été signé.")]
+    UnreachableBeforeSigning,
     /// The gateway refused the document for good, and said why.
     #[error("{0}")]
     GatewayRefused(String),
@@ -222,6 +224,9 @@ pub struct SignedGatewayDecision {
     pub expires_at: u64,
     /// One gateway transition.
     pub result: AstraSignerResult,
+    /// Astra holds the decision: a resume deposits nothing again, and the record outlives
+    /// the campaign, since installation and publication need no campaign.
+    pub deposited: bool,
     /// The gateway holds the transition.
     pub installed: bool,
     /// Astra relayed the transition to the gateway.
@@ -262,7 +267,7 @@ pub fn open_renewal(
     if pending(vault_path, now).map_err(internal)?.is_some() {
         return Err(GatewayRefusal::AlreadyOpen);
     }
-    let gateway = remote.gateway().map_err(unreachable_or_internal)?;
+    let gateway = remote.gateway().map_err(before_signing)?;
     if gateway.gateway_transition_pending {
         return Err(GatewayRefusal::TransitionInFlight);
     }
@@ -271,7 +276,7 @@ pub fn open_renewal(
     if vault.retained_outgoing_ca_pq_public.is_some()
         || remote
             .overlap_not_after()
-            .map_err(unreachable_or_internal)?
+            .map_err(before_signing)?
             .is_some()
     {
         return Err(GatewayRefusal::CaPqOverlap);
@@ -286,7 +291,7 @@ pub fn open_renewal(
             new_key: false,
             key_recovery: options.key_recovery,
         })
-        .map_err(unreachable_or_internal)?;
+        .map_err(before_signing)?;
 
     let opened = remote
         .open_campaign(&OperatorOpenRequest {
@@ -297,7 +302,7 @@ pub fn open_renewal(
         })
         .map_err(|error| match error.downcast_ref::<TunnelRefusal>() {
             Some(refusal) if refusal.status == 403 => refused_by_door(vault_path, now),
-            _ => unreachable_or_internal(error),
+            _ => before_signing(error),
         })?;
     let served = opened.gateway_certificate.ok_or_else(|| {
         GatewayRefusal::Internal(
@@ -307,9 +312,9 @@ pub fn open_renewal(
 
     let request = remote
         .fetch_campaign(&opened.operation_id)
-        .map_err(unreachable_or_internal)?;
-    let renewal = remote.renewal_request().map_err(unreachable_or_internal)?;
-    let candidate = remote.candidate_tls().map_err(unreachable_or_internal)?;
+        .map_err(before_signing)?;
+    let renewal = remote.renewal_request().map_err(before_signing)?;
+    let candidate = remote.candidate_tls().map_err(before_signing)?;
     let authority_url = relay
         .astra_authority_url
         .clone()
@@ -367,6 +372,13 @@ pub fn open_renewal(
     if !announced.matches(&renewal.fingerprint()) || prepared.key_recovery != options.key_recovery {
         return Err(GatewayRefusal::RequestMismatch);
     }
+    // The TLS leaf moves exactly when the terms say so: a candidate without the flag, or
+    // the flag without a candidate, is not the renewal the operator approves.
+    if prepared.candidate_tls_fingerprint.is_some() != options.rotate_tls
+        || candidate.is_some() != options.rotate_tls
+    {
+        return Err(GatewayRefusal::RequestMismatch);
+    }
     let candidate_tls = match (prepared.candidate_tls_fingerprint.as_deref(), candidate) {
         (None, None) => None,
         (Some(announced), Some(der)) => {
@@ -422,39 +434,13 @@ impl OpenedGatewayRenewal {
     /// Two touches, in that order. A refusal at either one loses nothing, and the
     /// same or another key can answer again.
     pub fn approve(&mut self, key: &dyn Authenticator, now: u64) -> Result<String, KeyStep> {
-        if now >= self.campaign.campaign.expires_at {
-            // A dead campaign has no use for the openings, and they must not wait on
-            // the caller dropping this value.
-            self.keys.openings.clear();
-            return Err(KeyStep::Expired);
-        }
-        let offered = self.approval.offered_credentials();
-        if offered.is_empty() {
-            return Err(KeyStep::Repeated);
-        }
-        let assertion = key
-            .approve(
-                self.approval.webauthn_rp_id(),
-                &offered,
-                self.approval.client_data_json(),
-                NO_PIN,
-            )
-            .map_err(|error| match error {
-                AuthenticatorError::UnknownCredential => KeyStep::NotValidated,
-                _ => KeyStep::Declined,
-            })?;
-        let credential_id = assertion.credential_id.clone();
-        if !offered.contains(&credential_id) {
-            return Err(KeyStep::NotApprovable);
-        }
-        let opened: Opened =
-            gestures::open_with_credential(key, &self.keys.vault, &credential_id, NO_PIN)
-                .map_err(key_step_of_opening)?;
-        let label = self.keys.keep(opened)?;
-        self.approval
-            .accept_for(assertion, Some(&credential_id), now)
-            .map_err(|_| KeyStep::NotValidated)?;
-        Ok(label)
+        approve_one(
+            &mut self.keys,
+            &mut self.approval,
+            self.campaign.campaign.expires_at,
+            key,
+            now,
+        )
     }
 
     /// Signs the renewal's transition under `CA-PQ`, and records it before any deposit.
@@ -548,6 +534,7 @@ impl OpenedGatewayRenewal {
                 ))],
                 None,
             ),
+            deposited: false,
             installed: false,
             published: false,
         };
@@ -569,7 +556,7 @@ pub fn carry(
     now: u64,
 ) -> Result<GatewayCarried, GatewayRefusal> {
     let transition = transition_of(&decision)?.clone();
-    if !decision.installed {
+    if !decision.deposited {
         if now >= decision.expires_at {
             clear(vault_path).map_err(internal)?;
             return Err(GatewayRefusal::Internal(
@@ -578,13 +565,17 @@ pub fn carry(
             ));
         }
         deposit(remote, &decision)?;
+        decision.deposited = true;
+        save(&record_path(vault_path), &decision).map_err(internal)?;
+    }
+    if !decision.installed {
         remote.install(&transition).map_err(refused_by_gateway)?;
         decision.installed = true;
         save(&record_path(vault_path), &decision).map_err(internal)?;
     }
     let relay = remote
         .publish(transition.gateway_identity_epoch)
-        .map_err(unreachable_or_internal)?;
+        .map_err(refused_by_gateway)?;
     if !relay.relayed {
         return Err(GatewayRefusal::Internal(
             "la gateway n'a pas confirmé la relève : reprendre pour la lui demander à nouveau."
@@ -628,8 +619,8 @@ fn deposit(
 }
 
 /// The recorded decision, if one is waiting. A decision whose campaign has expired before
-/// the deposit was accepted is discarded: an expired campaign cannot take it. Once the
-/// gateway holds it, it waits for the publication whatever the clock says.
+/// Astra accepted the deposit is discarded: an expired campaign cannot take it. Once it is
+/// deposited it waits for the installation and the publication whatever the clock says.
 pub fn pending(vault_path: &Path, now: u64) -> Result<Option<SignedGatewayDecision>> {
     let path = record_path(vault_path);
     let bytes = match std::fs::read(&path) {
@@ -643,7 +634,7 @@ pub fn pending(vault_path: &Path, now: u64) -> Result<Option<SignedGatewayDecisi
             path.display()
         )
     })?;
-    if now >= signed.expires_at && !signed.installed {
+    if now >= signed.expires_at && !signed.deposited {
         clear(vault_path)?;
         return Ok(None);
     }
@@ -738,6 +729,14 @@ fn refused_by_gateway(error: anyhow::Error) -> GatewayRefusal {
             GatewayRefusal::GatewayRefused(refusal.to_string())
         }
         _ => unreachable_or_internal(error),
+    }
+}
+
+/// An unreachable call before any signature says so.
+fn before_signing(error: anyhow::Error) -> GatewayRefusal {
+    match unreachable_or_internal(error) {
+        GatewayRefusal::Unreachable => GatewayRefusal::UnreachableBeforeSigning,
+        other => other,
     }
 }
 

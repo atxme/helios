@@ -691,3 +691,102 @@ fn an_unconfirmed_decision_of_an_expired_campaign_is_discarded() {
     assert_eq!(pending(&domain.path, EXPIRES).expect("read"), None);
     assert!(!record_on_disk(domain));
 }
+
+#[test]
+fn a_lost_install_answer_resumes_without_redepositing() {
+    let scenario = Scenario::new(false);
+    let remote = Remote::new(&scenario);
+    let domain = &scenario.domain;
+    remote.install_replies.borrow_mut().push_back(503);
+    let decision = signed_decision(&remote, domain, options());
+
+    let refusal =
+        carry(&remote, &domain.path, decision, NOW).expect_err("the install answer was lost");
+    assert_eq!(refusal, GatewayRefusal::Unreachable);
+    let waiting = pending(&domain.path, NOW)
+        .expect("read")
+        .expect("the decision waits");
+    assert!(waiting.deposited, "Astra holds the decision");
+    assert!(!waiting.installed);
+
+    carry(&remote, &domain.path, waiting, NOW).expect("published on resume");
+
+    assert_eq!(remote.count("submit_campaign"), 1, "no second deposit");
+    assert_eq!(
+        remote.count("install"),
+        2,
+        "the installation is asked again"
+    );
+    assert!(!record_on_disk(domain));
+}
+
+#[test]
+fn a_deposited_decision_survives_campaign_expiry() {
+    let scenario = Scenario::new(false);
+    let remote = Remote::new(&scenario);
+    let domain = &scenario.domain;
+    remote.install_replies.borrow_mut().push_back(503);
+    let decision = signed_decision(&remote, domain, options());
+    carry(&remote, &domain.path, decision, NOW).expect_err("the install answer was lost");
+
+    let waiting = pending(&domain.path, EXPIRES)
+        .expect("read")
+        .expect("a deposited decision outlives its campaign");
+    carry(&remote, &domain.path, waiting, EXPIRES).expect("published without the campaign");
+
+    assert_eq!(
+        remote.count("submit_campaign"),
+        1,
+        "no deposit after expiry"
+    );
+    assert!(!record_on_disk(domain));
+}
+
+#[test]
+fn a_definitive_publish_refusal_keeps_the_record() {
+    let scenario = Scenario::new(false);
+    let remote = Remote::new(&scenario);
+    let domain = &scenario.domain;
+    remote.publish_replies.borrow_mut().push_back(Err(409));
+    let decision = signed_decision(&remote, domain, options());
+
+    let refusal = carry(&remote, &domain.path, decision, NOW).expect_err("refused");
+
+    assert!(matches!(refusal, GatewayRefusal::GatewayRefused(_)));
+    let waiting = pending(&domain.path, NOW)
+        .expect("read")
+        .expect("the record stays");
+    assert!(waiting.installed && !waiting.published);
+}
+
+#[test]
+fn rotate_tls_without_a_candidate_is_refused() {
+    let scenario = Scenario::new(false);
+    let remote = Remote::new(&scenario);
+    let rotating = RenewalOptions {
+        rotate_tls: true,
+        ..options()
+    };
+
+    let refusal = open_renewal(&remote, &scenario.domain.path, rotating, NOW)
+        .err()
+        .expect("refused");
+
+    assert_eq!(refusal, GatewayRefusal::RequestMismatch);
+    assert_eq!(scenario.domain.touches(), 0, "no key is touched");
+}
+
+#[test]
+fn a_candidate_without_rotate_tls_is_refused() {
+    let scenario = Scenario::new(false);
+    let mut remote = Remote::new(&scenario);
+    remote.candidate = Some(scenario.candidate.clone());
+    remote.prepared.candidate_tls_fingerprint = Some(scenario.candidate.fingerprint().to_hex());
+
+    let refusal = open_renewal(&remote, &scenario.domain.path, options(), NOW)
+        .err()
+        .expect("refused");
+
+    assert_eq!(refusal, GatewayRefusal::RequestMismatch);
+    assert_eq!(scenario.domain.touches(), 0, "no key is touched");
+}

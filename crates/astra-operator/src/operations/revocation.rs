@@ -36,12 +36,11 @@ use aether::certificates::transport::{
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::authenticator::{Authenticator, Opened};
+use crate::authenticator::Authenticator;
 use crate::credentials;
-use crate::gestures;
 use crate::handoff::{self, DomainHandoff};
 use crate::operations::campaign_result;
-use crate::operations::keys::{key_step_of_opening, KeyStep, ValidatedKeys, NO_PIN};
+use crate::operations::keys::{approve_one, KeyStep, ValidatedKeys};
 use crate::operations::rotation::ensure_same_vault;
 use crate::origin::CampaignRequest;
 use crate::signing::{
@@ -433,41 +432,13 @@ impl OpenedRevocation {
     /// Two touches, in that order. A refusal at either one loses nothing, and the
     /// same or another key can answer again.
     pub fn approve(&mut self, key: &dyn Authenticator, now: u64) -> Result<String, KeyStep> {
-        if now >= self.request.campaign.expires_at {
-            // A dead campaign has no use for the openings, and they must not wait on
-            // the caller dropping this value.
-            self.keys.openings.clear();
-            return Err(KeyStep::Expired);
-        }
-        let offered = self.offered();
-        if offered.is_empty() {
-            return Err(KeyStep::Repeated);
-        }
-        let assertion = key
-            .approve(
-                self.approval.webauthn_rp_id(),
-                &offered,
-                self.approval.client_data_json(),
-                NO_PIN,
-            )
-            .map_err(|error| match error {
-                crate::authenticator::AuthenticatorError::UnknownCredential => {
-                    KeyStep::NotValidated
-                }
-                _ => KeyStep::Declined,
-            })?;
-        let credential_id = assertion.credential_id.clone();
-        if !offered.contains(&credential_id) {
-            return Err(KeyStep::NotApprovable);
-        }
-        let opened: Opened =
-            gestures::open_with_credential(key, &self.keys.vault, &credential_id, NO_PIN)
-                .map_err(key_step_of_opening)?;
-        let label = self.keys.keep(opened)?;
-        self.approval
-            .accept_for(assertion, Some(&credential_id), now)
-            .map_err(|_| KeyStep::NotValidated)?;
-        Ok(label)
+        approve_one(
+            &mut self.keys,
+            &mut self.approval,
+            self.request.campaign.expires_at,
+            key,
+            now,
+        )
     }
 
     /// Signs the decision under the anchor Astra checks, and records it before any

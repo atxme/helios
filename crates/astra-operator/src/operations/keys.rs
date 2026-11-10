@@ -12,7 +12,7 @@ use anyhow::Result;
 
 use crate::authenticator::{Authenticator, AuthenticatorError, Opened};
 use crate::gestures::{self, GestureError};
-use crate::signing::ANCHOR_ROTATION_CREDENTIALS;
+use crate::signing::{CampaignApprovalSession, ANCHOR_ROTATION_CREDENTIALS};
 use crate::vault::AuthorityVault;
 use crate::{credentials, store};
 
@@ -133,6 +133,52 @@ pub fn key_step_of_opening(error: GestureError) -> KeyStep {
         | GestureError::Vault(_) => KeyStep::NotEnrolled,
         _ => KeyStep::Declined,
     }
+}
+
+/// One approval, shared by the ceremonies that open a campaign for one credential
+/// (the revocation and the gateway renewal).
+///
+/// Two touches, in that order: the assertion first, and the vault opened with the
+/// credential only when that assertion is accepted for it. A refusal at either one
+/// loses nothing, and the same or another key can answer again. A campaign past its
+/// expiry drops the openings at once rather than waiting on the caller.
+pub(super) fn approve_one(
+    keys: &mut ValidatedKeys,
+    approval: &mut CampaignApprovalSession,
+    expires_at: u64,
+    key: &dyn Authenticator,
+    now: u64,
+) -> Result<String, KeyStep> {
+    if now >= expires_at {
+        keys.openings.clear();
+        return Err(KeyStep::Expired);
+    }
+    let offered = approval.offered_credentials();
+    if offered.is_empty() {
+        return Err(KeyStep::Repeated);
+    }
+    let assertion = key
+        .approve(
+            approval.webauthn_rp_id(),
+            &offered,
+            approval.client_data_json(),
+            NO_PIN,
+        )
+        .map_err(|error| match error {
+            AuthenticatorError::UnknownCredential => KeyStep::NotValidated,
+            _ => KeyStep::Declined,
+        })?;
+    let credential_id = assertion.credential_id.clone();
+    if !offered.contains(&credential_id) {
+        return Err(KeyStep::NotApprovable);
+    }
+    let opened: Opened = gestures::open_with_credential(key, &keys.vault, &credential_id, NO_PIN)
+        .map_err(key_step_of_opening)?;
+    let label = keys.keep(opened)?;
+    approval
+        .accept_for(assertion, Some(&credential_id), now)
+        .map_err(|_| KeyStep::NotValidated)?;
+    Ok(label)
 }
 
 /// Whether the document lets this credential approve: `active`, and nothing else.
