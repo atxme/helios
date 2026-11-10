@@ -80,6 +80,179 @@ struct UnsupportedMssFirewall {
     applied: AtomicBool,
 }
 
+struct TransitionFirewall {
+    states: std::sync::Mutex<Vec<TunnelState>>,
+    refuse: bool,
+}
+
+#[async_trait::async_trait]
+impl FirewallBackend for TransitionFirewall {
+    fn capabilities(&self) -> FirewallCapabilities {
+        FirewallCapabilities::default()
+    }
+
+    async fn apply(&self, _policy: &FirewallPolicy, state: TunnelState) -> aether::Result<()> {
+        self.states
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(state);
+        if self.refuse {
+            Err(aether::HeliosError::Firewall("test refusal".into()))
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn teardown(&self) -> aether::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn transition_updates_state_broadcasts_and_applies_the_matching_policy_state() {
+    let state = Arc::new(RwLock::new(TunnelState::Down));
+    let (event_tx, mut events) = broadcast::channel(4);
+    let firewall = TransitionFirewall {
+        states: std::sync::Mutex::new(Vec::new()),
+        refuse: false,
+    };
+    let policy = configured_network().firewall_policy();
+
+    transition(&state, &event_tx, TunnelState::Up, &firewall, &policy)
+        .await
+        .expect("firewall accepts the transition");
+
+    assert_eq!(*state.read().await, TunnelState::Up);
+    assert!(matches!(
+        events.try_recv(),
+        Ok(HeliosEvent::StateChanged {
+            state: TunnelState::Up
+        })
+    ));
+    assert_eq!(
+        *firewall
+            .states
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()),
+        [TunnelState::Up]
+    );
+}
+
+#[tokio::test]
+async fn transition_propagates_firewall_refusal() {
+    let state = Arc::new(RwLock::new(TunnelState::Down));
+    let (event_tx, _events) = broadcast::channel(4);
+    let firewall = TransitionFirewall {
+        states: std::sync::Mutex::new(Vec::new()),
+        refuse: true,
+    };
+    let policy = configured_network().firewall_policy();
+
+    let error = transition(&state, &event_tx, TunnelState::Up, &firewall, &policy)
+        .await
+        .expect_err("firewall refusal must propagate");
+
+    assert!(format!("{error:#}").contains("applying the firewall"));
+    assert_eq!(
+        *firewall
+            .states
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()),
+        [TunnelState::Up]
+    );
+}
+
+#[test]
+fn emitted_logs_preserve_level_and_message_in_the_event_stream() {
+    let (tx, mut events) = broadcast::channel(4);
+
+    for (level, message) in [
+        ("error", "failed"),
+        ("warn", "degraded"),
+        ("info", "ready"),
+        ("other", "default level"),
+    ] {
+        emit_log(&tx, level, message);
+        assert!(matches!(
+            events.try_recv(),
+            Ok(HeliosEvent::Log {
+                level: event_level,
+                message: event_message
+            }) if event_level == level && event_message == message
+        ));
+    }
+}
+
+fn run_readiness_test_child(test_name: &str, path: &std::path::Path) {
+    let status = std::process::Command::new(std::env::current_exe().expect("test executable"))
+        .args(["--exact", test_name, "--nocapture"])
+        .env("HELIOS_TEST_READY_CHILD", "1")
+        .env("HELIOS_READY_PATH", path)
+        .status()
+        .expect("isolated readiness test starts");
+    assert!(status.success(), "isolated readiness test must succeed");
+}
+
+#[test]
+fn readiness_marker_reports_real_dry_run_and_maintenance_modes() {
+    const CHILD: &str = "HELIOS_TEST_READY_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let directory = tempfile::tempdir().expect("temporary readiness directory");
+        run_readiness_test_child(
+            "orchestrator::tests::readiness_marker_reports_real_dry_run_and_maintenance_modes",
+            &directory.path().join("nested/ready"),
+        );
+        return;
+    }
+
+    let path = std::path::PathBuf::from(
+        std::env::var_os("HELIOS_READY_PATH").expect("child readiness path"),
+    );
+
+    publish_readiness(true, FirewallMode::Enforced).expect("publish dry-run readiness");
+    let dry_run = std::fs::read_to_string(&path).expect("dry-run marker");
+    assert!(dry_run.contains("mode_reel=false\n"));
+    assert!(dry_run.contains("firewall_enforced=false\n"));
+
+    publish_readiness(false, FirewallMode::Enforced).expect("publish real readiness");
+    let enforced = std::fs::read_to_string(&path).expect("enforced marker");
+    assert!(enforced.contains("mode_reel=true\n"));
+    assert!(enforced.contains("firewall_enforced=true\n"));
+
+    publish_readiness(false, FirewallMode::DisabledForMaintenance)
+        .expect("publish maintenance readiness");
+    let maintenance = std::fs::read_to_string(&path).expect("maintenance marker");
+    assert!(maintenance.contains("mode_reel=true\n"));
+    assert!(maintenance.contains("firewall_enforced=false\n"));
+    assert!(!path.with_extension("tmp").exists());
+}
+
+#[test]
+fn readiness_marker_refuses_parent_creation_errors_without_a_partial_marker() {
+    const CHILD: &str = "HELIOS_TEST_READY_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let directory = tempfile::tempdir().expect("temporary readiness directory");
+        let parent = directory.path().join("not-a-directory");
+        std::fs::write(&parent, b"blocker").expect("create parent blocker");
+        run_readiness_test_child(
+            "orchestrator::tests::readiness_marker_refuses_parent_creation_errors_without_a_partial_marker",
+            &parent.join("ready"),
+        );
+        return;
+    }
+
+    let path = std::path::PathBuf::from(
+        std::env::var_os("HELIOS_READY_PATH").expect("child readiness path"),
+    );
+    let parent = path.parent().expect("parent blocker path");
+
+    let result = publish_readiness(false, FirewallMode::Enforced);
+
+    assert!(result.is_err());
+    assert!(!path.exists());
+    assert_eq!(std::fs::read(parent).expect("blocker remains"), b"blocker");
+}
+
 #[async_trait::async_trait]
 impl FirewallBackend for UnsupportedMssFirewall {
     fn capabilities(&self) -> FirewallCapabilities {
