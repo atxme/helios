@@ -307,7 +307,7 @@ dependencies = [
 
 [[package]]
 name = "astra-signer"
-version = "3.0.1"
+version = "3.0.2"
 dependencies = [
  "aether",
  "aether-fido",
@@ -3880,7 +3880,7 @@ dependencies = [
 
 [[package]]
 name = "orion"
-version = "4.0.0"
+version = "4.0.1"
 dependencies = [
  "aether",
  "aether-fido",
