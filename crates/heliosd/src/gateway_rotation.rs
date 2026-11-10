@@ -447,6 +447,25 @@ fn read_staged_transition(path: &std::path::Path) -> Result<Option<GatewayIdenti
     read_optional_document(path, "staged gateway transition")
 }
 
+/// What the console may read of the staged transition, given the registry.
+///
+/// Outside a registered transition a document on disk is stale — a preparation
+/// may have written it before its installation was refused — and reads as
+/// absent. Inside one, a missing document is a refusal: the rollback and the
+/// abort both need the bytes, and `null` would hide that they are gone.
+pub(crate) fn staged_answer(
+    in_transition: bool,
+    document: Option<GatewayIdentityTransition>,
+) -> Result<Option<GatewayIdentityTransition>> {
+    match (in_transition, document) {
+        (false, _) => Ok(None),
+        (true, Some(transition)) => Ok(Some(transition)),
+        (true, None) => {
+            anyhow::bail!("la transition en cours n'a plus son document")
+        }
+    }
+}
+
 /// Reads a signed decision an operator carried back from the ceremony.
 pub(crate) fn read_signed_document<T: serde::de::DeserializeOwned>(
     source: &std::path::Path,

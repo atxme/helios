@@ -760,3 +760,26 @@ fn renewal_request_and_candidate_tls_are_readable_after_prepare() {
         None
     );
 }
+
+/// A registered transition whose document is gone cannot be rolled back or
+/// aborted: the console is told so, rather than shown an empty answer.
+#[test]
+fn a_staged_transition_without_its_document_is_refused() {
+    let error = staged_answer(true, None).expect_err("the document is required");
+    assert!(
+        error
+            .to_string()
+            .contains("la transition en cours n'a plus son document"),
+        "{error:#}"
+    );
+}
+
+/// A document left by a preparation whose installation was refused is stale
+/// outside a transition, and must not be served as one.
+#[test]
+fn a_stale_document_outside_a_transition_reads_null() {
+    assert_eq!(
+        staged_answer(false, Some(staged_transition(4))).expect("answer"),
+        None
+    );
+}

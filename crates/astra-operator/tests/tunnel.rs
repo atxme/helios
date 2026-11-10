@@ -1085,3 +1085,25 @@ fn the_gateway_decisions_post_to_their_routes_and_read_back() {
     );
     assert_eq!(read.expires_at, 250);
 }
+
+/// An installation's success is an acknowledgement: an empty answer that the
+/// gateway accepted must not fail the rotation after the fact.
+#[test]
+fn a_ca_installation_acknowledged_with_an_empty_answer_succeeds() {
+    let stub = Stub::serving(vec![(200, String::new())]);
+    Tunnel::new(&stub.base)
+        .expect("tunnel")
+        .install_ca_transition(&ca_transition())
+        .expect("accepted");
+    assert_eq!(stub.next().path, "/api/certificates/ca-transition");
+
+    let stub = Stub::serving(vec![(200, "pas du JSON".into())]);
+    Tunnel::new(&stub.base)
+        .expect("tunnel")
+        .install_client_tls_ca_transition(&client_tls_transition())
+        .expect("accepted");
+    assert_eq!(
+        stub.next().path,
+        "/api/certificates/client-tls-ca-transition"
+    );
+}

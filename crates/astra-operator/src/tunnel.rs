@@ -634,12 +634,11 @@ impl Tunnel {
     /// Installs a `CA-PQ` transition on the gateway, which checks it itself and
     /// accepts a replay of the same one.
     pub fn install_ca_transition(&self, transition: &CaTransition) -> Result<()> {
-        self.install::<_, serde::de::IgnoredAny>(
+        self.install_acknowledged(
             "/api/certificates/ca-transition",
             transition,
             "installation de la transition sur la gateway",
         )
-        .map(drop)
     }
 
     /// Installs a client `CA-TLS` transition, on the same terms.
@@ -647,12 +646,11 @@ impl Tunnel {
         &self,
         transition: &ClientTlsCaTransition,
     ) -> Result<()> {
-        self.install::<_, serde::de::IgnoredAny>(
+        self.install_acknowledged(
             "/api/certificates/client-tls-ca-transition",
             transition,
             "installation de la transition sur la gateway",
         )
-        .map(drop)
     }
 
     /// Asks the gateway to prepare its next identity and export its request
@@ -704,10 +702,10 @@ impl Tunnel {
         }
         let response = self
             .get_admin("/api/certificates/gateway-transition")
-            .context("lecture de la transition staged")?;
+            .context("lecture de la transition en attente")?;
         Self::read_admin::<Staged>(response, MAX_ANSWER_BYTES)
             .map(|staged| staged.transition)
-            .context("lecture de la transition staged")
+            .context("lecture de la transition en attente")
     }
 
     /// Cancels a staged, unpublished transition (spec §5.3).
@@ -783,19 +781,28 @@ impl Tunnel {
         let response = self
             .post_admin(path, body)
             .with_context(|| what.to_string())?;
-        let status = response.status();
-        if !status.is_success() {
-            // These routes name their reason, unlike the relayed ones: it is what
-            // the operator acts on, and a body too large to read is no reason.
-            let reason = response
-                .bytes()
-                .ok()
-                .filter(|bytes| bytes.len() <= crate::origin::MAX_ANSWER_BYTES)
-                .and_then(|bytes| serde_json::from_slice::<GatewayRefusalBody>(&bytes).ok())
-                .map(|body| body.message);
-            return Err(admin_refusal(status.as_u16(), reason)).with_context(|| what.to_string());
+        if !response.status().is_success() {
+            return Err(refused_installation(response, what));
         }
         Self::read_admin(response, MAX_ANSWER_BYTES).with_context(|| what.to_string())
+    }
+
+    /// Like [`Self::install`], for a route whose success is only an
+    /// acknowledgement: an empty or non-JSON `2xx` is accepted, as the
+    /// gateway already accepted the document.
+    fn install_acknowledged<T: serde::Serialize>(
+        &self,
+        path: &str,
+        body: &T,
+        what: &str,
+    ) -> Result<()> {
+        let response = self
+            .post_admin(path, body)
+            .with_context(|| what.to_string())?;
+        if response.status().is_success() {
+            return Ok(());
+        }
+        Err(refused_installation(response, what))
     }
 
     fn get_admin(&self, path: &str) -> Result<reqwest::blocking::Response> {
@@ -836,6 +843,20 @@ impl Tunnel {
         }
         serde_json::from_slice(&bytes).context("réponse illisible")
     }
+}
+
+/// The refusal of an installation route, with the gateway's sentence when it
+/// names one: these routes say why, unlike the relayed ones.
+fn refused_installation(response: reqwest::blocking::Response, what: &str) -> anyhow::Error {
+    let status = response.status();
+    // A body too large to read is no reason.
+    let reason = response
+        .bytes()
+        .ok()
+        .filter(|bytes| bytes.len() <= crate::origin::MAX_ANSWER_BYTES)
+        .and_then(|bytes| serde_json::from_slice::<GatewayRefusalBody>(&bytes).ok())
+        .map(|body| body.message);
+    admin_refusal(status.as_u16(), reason).context(what.to_string())
 }
 
 /// A refusal on the administrator surface, where no capability token is at play.

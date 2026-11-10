@@ -139,8 +139,19 @@ impl helios_api::certificates::GatewayIdentityHandler for CertificateService {
         Option<Box<aether::certificates::gateway::GatewayIdentityTransition>>,
         GatewayActionRefusal,
     > {
-        let _registry = self.registry.lock().await;
-        crate::gateway_rotation::staged_gateway_transition()
+        let registry = self.registry.lock().await;
+        let in_transition = registry
+            .state()
+            .gateway
+            .next_gateway_identity_epoch
+            .is_some();
+        let document = if in_transition {
+            crate::gateway_rotation::staged_gateway_transition()
+                .map_err(|error| GatewayActionRefusal::new(format!("{error:#}")))?
+        } else {
+            None
+        };
+        crate::gateway_rotation::staged_answer(in_transition, document)
             .map(|transition| transition.map(Box::new))
             .map_err(|error| GatewayActionRefusal::new(format!("{error:#}")))
     }
