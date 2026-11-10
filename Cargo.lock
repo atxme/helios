@@ -31,7 +31,7 @@ dependencies = [
 
 [[package]]
 name = "aether"
-version = "3.0.0"
+version = "3.1.0"
 dependencies = [
  "aws-lc-rs",
  "aws-lc-sys",
@@ -237,7 +237,7 @@ dependencies = [
 
 [[package]]
 name = "astra"
-version = "1.4.1"
+version = "1.5.0"
 dependencies = [
  "aether",
  "anyhow",
@@ -264,7 +264,7 @@ dependencies = [
 
 [[package]]
 name = "astra-channel"
-version = "1.2.1"
+version = "1.3.0"
 dependencies = [
  "aether",
  "async-trait",
@@ -285,7 +285,7 @@ dependencies = [
 
 [[package]]
 name = "astra-operator"
-version = "2.0.1"
+version = "3.0.0"
 dependencies = [
  "aether",
  "aether-fido",
@@ -307,7 +307,7 @@ dependencies = [
 
 [[package]]
 name = "astra-signer"
-version = "2.0.2"
+version = "3.0.0"
 dependencies = [
  "aether",
  "aether-fido",
@@ -2302,7 +2302,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "helios"
-version = "3.0.2"
+version = "3.1.0"
 dependencies = [
  "aether",
  "aether-key-negotiation",
@@ -2336,7 +2336,7 @@ dependencies = [
 
 [[package]]
 name = "helios-api"
-version = "1.18.1"
+version = "1.19.0"
 dependencies = [
  "aether",
  "anyhow",
@@ -2472,7 +2472,7 @@ dependencies = [
 
 [[package]]
 name = "heliosd"
-version = "3.0.2"
+version = "3.1.0"
 dependencies = [
  "aether",
  "aether-key-negotiation",
@@ -3880,7 +3880,7 @@ dependencies = [
 
 [[package]]
 name = "orion"
-version = "3.0.1"
+version = "4.0.0"
 dependencies = [
  "aether",
  "aether-fido",
@@ -3905,7 +3905,7 @@ dependencies = [
 
 [[package]]
 name = "orion-core"
-version = "3.32.1"
+version = "3.33.0"
 dependencies = [
  "aether",
  "aether-fido",
