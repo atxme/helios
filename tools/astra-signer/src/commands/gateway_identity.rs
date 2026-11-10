@@ -694,3 +694,224 @@ pub(crate) fn document_nu(
     };
     encoded.context("encodage de la décision signée")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aether::certificates::{
+        authority::RotationReason,
+        encoding::{Fingerprint, TrustDomainId, WireGuardKey},
+        gateway::GatewayIdentityTransition,
+        window::TransitionWindow,
+        CERTIFICATE_FORMAT_VERSION, CERTIFICATE_PROTOCOL_VERSION,
+    };
+    use astra_operator::vault::{
+        AuthoritySecrets, AuthorityVault, SlotEnrolment, SlotRole, SlotSecret,
+    };
+    use base64::Engine as _;
+
+    struct Fixture {
+        _directory: tempfile::TempDir,
+        vault_path: PathBuf,
+        gateway_key: WireGuardKey,
+        trust_domain_id: TrustDomainId,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let directory = tempfile::tempdir().expect("temporary directory");
+            let vault_path = directory.path().join("authority-vault.json");
+            let (pq_private, pq_public) =
+                aether::certificates::encoding::generate_ml_dsa_87_keypair()
+                    .expect("CA-PQ keypair");
+            let encode = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+            let trust_domain_id = TrustDomainId::new([0x31; 16]).expect("domain id");
+            let vault = AuthorityVault::create(
+                trust_domain_id,
+                "astra.example",
+                astra_operator::vault::draw_salt().expect("vault salt"),
+                &AuthoritySecrets {
+                    ca_pq_private_key: encode(&pq_private),
+                    ca_pq_public_key: pq_public.to_base64(),
+                    ca_tls_private_key: encode(b"test-only TLS private key"),
+                    retained_ca_tls: None,
+                    retained_outgoing_ca_pq: None,
+                },
+                SlotEnrolment {
+                    role: SlotRole::Primary,
+                    label: "test slot".into(),
+                    credential_id: vec![0x51; 32],
+                    credential_public_key: vec![0xa5, 0x01],
+                    aaguid: [0; 16],
+                    enrolled_at: 1,
+                },
+                &SlotSecret::new(vec![0x61; 32]),
+                1,
+            )
+            .expect("test vault");
+            astra_operator::store::save(&vault_path, &vault).expect("save vault");
+            let gateway_key = WireGuardKey::from_bytes([0x42; 32]);
+            let mut handoff = astra_operator::handoff::DomainHandoff::of(&vault).expect("handoff");
+            handoff.gateway_wg_public_key = Some(gateway_key.to_base64());
+            handoff.server_name = Some("gateway.example".into());
+            astra_operator::handoff::save(
+                &astra_operator::handoff::path_beside(&vault_path),
+                &handoff,
+            )
+            .expect("save handoff");
+            credentials::save(
+                &credentials::path_beside(&vault_path),
+                &aether::certificates::approval::CredentialRegistry {
+                    trust_domain_id,
+                    gateway_wg_public_key: gateway_key,
+                    ca_epoch: 1,
+                    credential_registry_epoch: 1,
+                    bindings: Vec::new(),
+                },
+            )
+            .expect("save credential registry");
+
+            Self {
+                _directory: directory,
+                vault_path,
+                gateway_key,
+                trust_domain_id,
+            }
+        }
+
+        fn transition(&self, activation_at: u64, not_after: u64) -> GatewayIdentityTransition {
+            GatewayIdentityTransition {
+                format_version: CERTIFICATE_FORMAT_VERSION,
+                protocol_version: CERTIFICATE_PROTOCOL_VERSION,
+                trust_domain_id: self.trust_domain_id,
+                ca_epoch: 1,
+                gateway_identity_epoch: 2,
+                gateway_wg_public_key: self.gateway_key,
+                server_name: "gateway.example".into(),
+                active_gateway_tls_certificate_fingerprint: Fingerprint::of(b"active TLS"),
+                next_gateway_tls_certificate: None,
+                active_gateway_certificate_fingerprint: Fingerprint::of(b"active PQ"),
+                next_gateway_certificate: None,
+                window: TransitionWindow::new(1, activation_at, not_after).expect("window"),
+                reason: RotationReason::Scheduled,
+                ca_signature: aether::certificates::encoding::MlDsa87Signature::new(vec![0; 4627])
+                    .expect("signature shape"),
+            }
+        }
+
+        fn rollback(
+            &self,
+            transition: &GatewayIdentityTransition,
+            hours: u64,
+        ) -> anyhow::Result<()> {
+            let transition_path = self._directory.path().join("transition.json");
+            let out = self._directory.path().join("rollback.json");
+            std::fs::write(
+                &transition_path,
+                serde_json::to_vec(transition).expect("serialize transition"),
+            )
+            .expect("write transition");
+            sign_gateway_rollback(
+                &self.vault_path,
+                &transition_path,
+                &out,
+                hours,
+                "test incident",
+                "test operator",
+                None,
+                Transport::Hid,
+            )
+        }
+    }
+
+    #[test]
+    fn rollback_refuses_a_transition_for_another_gateway_before_time_checks() {
+        let fixture = Fixture::new();
+        let now = now_unix();
+        let mut transition = fixture.transition(now + 600, now + 3_600);
+        transition.gateway_wg_public_key = WireGuardKey::from_bytes([0x77; 32]);
+
+        let error = fixture
+            .rollback(&transition, 1)
+            .expect_err("wrong identity");
+
+        assert!(error.to_string().contains("autre gateway"));
+    }
+
+    #[test]
+    fn rollback_is_refused_before_activation() {
+        let fixture = Fixture::new();
+        let now = now_unix();
+        let transition = fixture.transition(now + 600, now + 3_600);
+
+        let error = fixture
+            .rollback(&transition, 1)
+            .expect_err("not active yet");
+
+        assert!(error
+            .to_string()
+            .contains("activation_at n'est pas atteint"));
+    }
+
+    #[test]
+    fn rollback_is_refused_at_or_after_the_exact_overlap_end() {
+        let fixture = Fixture::new();
+        let captured_now = now_unix();
+        let transition = fixture.transition(captured_now - 3_600, captured_now);
+
+        let error = fixture
+            .rollback(&transition, 1)
+            .expect_err("overlap boundary reached");
+
+        assert!(error.to_string().contains("recouvrement est terminé"));
+    }
+
+    #[test]
+    fn rollback_refuses_duration_overflow_before_the_operator_prompt() {
+        let fixture = Fixture::new();
+        let now = now_unix();
+        let transition = fixture.transition(now - 1, now + 3_600);
+
+        let error = fixture
+            .rollback(&transition, u64::MAX)
+            .expect_err("unrepresentable rollback duration");
+
+        assert!(error.to_string().contains("durée hors bornes"));
+    }
+
+    #[test]
+    fn abort_documents_are_written_as_bare_gateway_objects() {
+        let abort = aether::certificates::gateway::GatewayTransitionAbort {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            protocol_version: CERTIFICATE_PROTOCOL_VERSION,
+            trust_domain_id: TrustDomainId::new([0x31; 16]).expect("domain id"),
+            ca_epoch: 1,
+            gateway_wg_public_key: WireGuardKey::from_bytes([0x42; 32]),
+            server_name: "gateway.example".into(),
+            gateway_identity_epoch: 2,
+            gateway_transition_fingerprint: Fingerprint::of(b"transition"),
+            aborted_at: 10,
+            reason: aether::certificates::gateway::AbortReason::OperatorCancelled,
+            campaign_fingerprint: Fingerprint::of(b"campaign"),
+            ca_signature: aether::certificates::encoding::MlDsa87Signature::new(vec![0; 4627])
+                .expect("signature shape"),
+        };
+        let object = aether::certificates::transport::TrustUpdateObject::GatewayTransitionAbort(
+            Box::new(abort.clone()),
+        );
+
+        let encoded = document_nu(&object).expect("encode abort");
+        let value: serde_json::Value = serde_json::from_slice(&encoded).expect("JSON document");
+        assert!(
+            value.get("kind").is_none(),
+            "gateway reader rejects envelopes"
+        );
+        assert_eq!(
+            serde_json::from_slice::<aether::certificates::gateway::GatewayTransitionAbort>(
+                &encoded
+            )
+            .expect("gateway abort document"),
+            abort
+        );
+    }
+}
