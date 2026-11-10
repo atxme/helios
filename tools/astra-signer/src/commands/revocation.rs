@@ -292,6 +292,7 @@ mod tests {
                     ca_pq_public_key: pq_public.to_base64(),
                     ca_tls_private_key: encode(b"test-only CA-TLS private key"),
                     retained_ca_tls: None,
+                    retained_outgoing_ca_pq: None,
                 },
                 astra_operator::vault::SlotEnrolment {
                     role: astra_operator::vault::SlotRole::Primary,
