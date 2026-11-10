@@ -194,6 +194,10 @@ mod http_routes {
     }
 
     async fn fixture() -> Fixture {
+        fixture_with_encrypted_vault(None).await
+    }
+
+    async fn fixture_with_encrypted_vault(encrypted_vault: Option<Vec<u8>>) -> Fixture {
         let directory = tempfile::tempdir().expect("temporary state directory");
         let domain = TrustDomainId::new([1; 16]).expect("domain");
         let gateway = WireGuardKey::from_bytes([2; 32]);
@@ -255,7 +259,7 @@ mod http_routes {
             signing: tokio::sync::Mutex::new(crate::signing::SigningOperationStore::new()),
             recoveries: tokio::sync::Mutex::new(crate::recovery::RecoveryStore::new()),
             reconciliation: tokio::sync::Mutex::new(()),
-            encrypted_vault: RwLock::new(None),
+            encrypted_vault: RwLock::new(encrypted_vault.map(Arc::new)),
             state_dir,
             gateway: None,
             volume_writes: crate::door::VolumeWrites::new(),
@@ -912,6 +916,469 @@ mod http_routes {
             .await
             .0,
             405
+        );
+    }
+
+    #[tokio::test]
+    async fn challenge_store_saturation_returns_429_without_evicting_live_challenges() {
+        let fixture = fixture().await;
+        let now = now_unix();
+        let preserved = [0x91; 32];
+        {
+            let mut challenges = fixture._service.challenges.lock().await;
+            assert!(challenges.issue(preserved, now));
+            for index in 1..MAX_LIVE_CHALLENGES {
+                let mut challenge = [0; 32];
+                challenge[..8].copy_from_slice(&(index as u64).to_be_bytes());
+                assert!(challenges.issue(challenge, now));
+            }
+        }
+
+        let response = request(&fixture, "POST", "/v1/status/challenge", &[], b"").await;
+
+        assert_eq!(response.0, 429);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&response.2).expect("error JSON")["error"],
+            "too many requests from this source"
+        );
+        assert!(
+            fixture
+                ._service
+                .challenges
+                .lock()
+                .await
+                .consume(&preserved, now_unix()),
+            "saturation must refuse the new challenge without evicting an issued one"
+        );
+    }
+
+    async fn vault_read_capability(fixture: &Fixture, vault: &[u8]) -> (Fingerprint, String) {
+        use aether::certificates::{
+            capability::{CapabilityGrant, CapabilityScope},
+            status::{
+                AstraRotationCampaign, AstraSignerRequest, CampaignScope, CampaignTarget,
+                CertificateKind,
+            },
+            CERTIFICATE_FORMAT_VERSION,
+        };
+
+        let now = now_unix();
+        let operation_id = Id16::new([0x73; 16]).expect("operation ID");
+        let domain = TrustDomainId::new([1; 16]).expect("domain");
+        let gateway = WireGuardKey::from_bytes([2; 32]);
+        let vault_fingerprint = Fingerprint::of(vault);
+        let campaign = Box::new(AstraRotationCampaign {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            campaign_id: Id16::new([0x74; 16]).expect("campaign ID"),
+            trust_domain_id: domain,
+            gateway_wg_public_key: gateway,
+            server_name: "astra.example".into(),
+            created_at: now,
+            expires_at: now + 3_000,
+            scope: CampaignScope::TrustAuthorities,
+            targets: vec![CampaignTarget {
+                certificate_kind: CertificateKind::CaPq,
+                identity_key: gateway,
+                epoch: 1,
+                generation: 1,
+                active_tls_certificate_fingerprint: Fingerprint::of(b"active TLS CA"),
+                active_pq_certificate_fingerprint: Fingerprint::of(b"active PQ CA"),
+            }],
+            reason: "scheduled anchor rotation".into(),
+            requested_by: "test operator".into(),
+            policy_fingerprint: AstraIssuancePolicy::standard(
+                domain,
+                gateway,
+                "astra.example".into(),
+            )
+            .fingerprint()
+            .expect("policy fingerprint"),
+            required_credentials: CampaignScope::TrustAuthorities.required_credentials(),
+        });
+        let signer_request = Box::new(AstraSignerRequest {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            operation_id,
+            campaign_fingerprint: campaign.fingerprint(),
+            authority_url: "https://astra.example".into(),
+            encrypted_vault_fingerprint: vault_fingerprint,
+            required_credentials: campaign.required_credentials,
+            created_at: now,
+            expires_at: now + 3_000,
+            astra_service_key_epoch: 1,
+            astra_signature: aether::certificates::encoding::MlDsa87Signature::placeholder(),
+        });
+        let operation =
+            crate::signing::SigningOperation::new(campaign.clone(), signer_request, now)
+                .expect("valid authority campaign");
+        fixture
+            ._service
+            .signing
+            .lock()
+            .await
+            .open(operation, now)
+            .expect("store operator campaign");
+
+        let grant = CapabilityGrant::new(
+            CapabilityScope::EncryptedVaultRead,
+            operation_id,
+            campaign.fingerprint(),
+            Some(vault_fingerprint),
+            now,
+            now + 120,
+        )
+        .expect("vault-read capability");
+        let token = fixture
+            ._service
+            .capabilities
+            .lock()
+            .await
+            .issue(&grant, now + 3_000)
+            .expect("issue vault-read capability");
+        (vault_fingerprint, token)
+    }
+
+    #[tokio::test]
+    async fn encrypted_vault_route_requires_its_scope_and_exact_operation_fingerprint() {
+        use aether::certificates::capability::{CapabilityGrant, CapabilityScope};
+
+        let vault = b"encrypted HVLT fixture";
+        let fixture = fixture_with_encrypted_vault(Some(vault.to_vec())).await;
+        let (fingerprint, token) = vault_read_capability(&fixture, vault).await;
+        let authorization = format!("Bearer {token}");
+        let response = request(
+            &fixture,
+            "GET",
+            &format!("/v1/vaults/{fingerprint}"),
+            &[("authorization", authorization.as_str())],
+            b"",
+        )
+        .await;
+        assert_eq!(response.0, 200);
+        assert!(response.1.starts_with("application/octet-stream"));
+        assert_eq!(response.2, vault);
+
+        let operation_id = Id16::new([0x73; 16]).expect("operation ID");
+        let campaign_fingerprint = fixture
+            ._service
+            .signing
+            .lock()
+            .await
+            .get(&operation_id, now_unix())
+            .expect("stored campaign")
+            .manifest_fingerprint();
+        let wrong_scope = CapabilityGrant::new(
+            CapabilityScope::SignerRequestRead,
+            operation_id,
+            campaign_fingerprint,
+            None,
+            now_unix(),
+            now_unix() + 120,
+        )
+        .expect("request-read capability");
+        let wrong_scope_token = fixture
+            ._service
+            .capabilities
+            .lock()
+            .await
+            .issue(&wrong_scope, now_unix() + 3_000)
+            .expect("issue request-read capability");
+        let wrong_scope_authorization = format!("Bearer {wrong_scope_token}");
+        let wrong_scope_response = request(
+            &fixture,
+            "GET",
+            &format!("/v1/vaults/{fingerprint}"),
+            &[("authorization", wrong_scope_authorization.as_str())],
+            b"",
+        )
+        .await;
+        assert_eq!(wrong_scope_response.0, 403);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&wrong_scope_response.2)
+                .expect("coarse capability error")["error"],
+            "refused"
+        );
+
+        let other_fingerprint = Fingerprint::of(b"another encrypted vault");
+        let mismatched_path = request(
+            &fixture,
+            "GET",
+            &format!("/v1/vaults/{other_fingerprint}"),
+            &[("authorization", authorization.as_str())],
+            b"",
+        )
+        .await;
+        assert_eq!(mismatched_path.0, 403);
+        assert_eq!(mismatched_path.2, wrong_scope_response.2);
+    }
+
+    #[tokio::test]
+    async fn encrypted_vault_route_reports_volume_size_and_fingerprint_mismatches_as_internal() {
+        let vault = b"encrypted HVLT fixture";
+        let oversized_vault = vec![0x55; MAX_RESPONSE_BYTES + 1];
+        let fixture = fixture_with_encrypted_vault(Some(oversized_vault)).await;
+        let (fingerprint, token) = vault_read_capability(&fixture, vault).await;
+        let authorization = format!("Bearer {token}");
+
+        let oversized = request(
+            &fixture,
+            "GET",
+            &format!("/v1/vaults/{fingerprint}"),
+            &[("authorization", authorization.as_str())],
+            b"",
+        )
+        .await;
+        assert_eq!(oversized.0, 500);
+        assert!(!String::from_utf8_lossy(&oversized.2).contains("vault"));
+
+        let mismatched_fixture =
+            fixture_with_encrypted_vault(Some(b"different encrypted vault".to_vec())).await;
+        let (mismatched_fingerprint, mismatched_token) =
+            vault_read_capability(&mismatched_fixture, vault).await;
+        assert_eq!(mismatched_fingerprint, fingerprint);
+        let mismatched_authorization = format!("Bearer {mismatched_token}");
+        let mismatched_volume = request(
+            &mismatched_fixture,
+            "GET",
+            &format!("/v1/vaults/{fingerprint}"),
+            &[("authorization", mismatched_authorization.as_str())],
+            b"",
+        )
+        .await;
+        assert_eq!(mismatched_volume.0, 500);
+        assert_eq!(mismatched_volume.2, oversized.2);
+    }
+
+    async fn simultaneous_vault_operation(
+        fixture: &Fixture,
+        vault_fingerprint: Fingerprint,
+        operation_bytes: [u8; 16],
+        campaign_bytes: [u8; 16],
+        scope: aether::certificates::status::CampaignScope,
+        certificate_kind: aether::certificates::status::CertificateKind,
+        identity_key: WireGuardKey,
+    ) -> (Id16, String, String) {
+        use aether::certificates::{
+            capability::{CapabilityGrant, CapabilityScope},
+            status::{AstraRotationCampaign, AstraSignerRequest, CampaignTarget},
+            CERTIFICATE_FORMAT_VERSION,
+        };
+
+        let now = now_unix();
+        let operation_id = Id16::new(operation_bytes).expect("operation ID");
+        let domain = TrustDomainId::new([1; 16]).expect("domain");
+        let gateway = WireGuardKey::from_bytes([2; 32]);
+        let campaign = Box::new(AstraRotationCampaign {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            campaign_id: Id16::new(campaign_bytes).expect("campaign ID"),
+            trust_domain_id: domain,
+            gateway_wg_public_key: gateway,
+            server_name: "astra.example".into(),
+            created_at: now,
+            expires_at: now + 3_000,
+            scope,
+            targets: vec![CampaignTarget {
+                certificate_kind,
+                identity_key,
+                epoch: 1,
+                generation: 1,
+                active_tls_certificate_fingerprint: Fingerprint::of(b"active TLS"),
+                active_pq_certificate_fingerprint: Fingerprint::of(b"active PQ"),
+            }],
+            reason: "test operation".into(),
+            requested_by: "test operator".into(),
+            policy_fingerprint: AstraIssuancePolicy::standard(
+                domain,
+                gateway,
+                "astra.example".into(),
+            )
+            .fingerprint()
+            .expect("policy fingerprint"),
+            required_credentials: scope.required_credentials(),
+        });
+        let signer_request = Box::new(AstraSignerRequest {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            operation_id,
+            campaign_fingerprint: campaign.fingerprint(),
+            authority_url: "https://astra.example".into(),
+            encrypted_vault_fingerprint: vault_fingerprint,
+            required_credentials: campaign.required_credentials,
+            created_at: now,
+            expires_at: now + 3_000,
+            astra_service_key_epoch: 1,
+            astra_signature: aether::certificates::encoding::MlDsa87Signature::placeholder(),
+        });
+        let operation =
+            crate::signing::SigningOperation::new(campaign.clone(), signer_request, now)
+                .expect("valid vault campaign");
+        fixture
+            ._service
+            .signing
+            .lock()
+            .await
+            .open(operation, now)
+            .expect("store simultaneous operation");
+
+        let capabilities = fixture._service.capabilities.lock().await;
+        let request_grant = CapabilityGrant::new(
+            CapabilityScope::SignerRequestRead,
+            operation_id,
+            campaign.fingerprint(),
+            None,
+            now,
+            now + 120,
+        )
+        .expect("signer-request capability");
+        let request_token = capabilities
+            .issue(&request_grant, now + 3_000)
+            .expect("issue signer-request capability");
+        let vault_grant = CapabilityGrant::new(
+            CapabilityScope::EncryptedVaultRead,
+            operation_id,
+            campaign.fingerprint(),
+            Some(vault_fingerprint),
+            now,
+            now + 120,
+        )
+        .expect("vault-read capability");
+        let vault_token = capabilities
+            .issue(&vault_grant, now + 3_000)
+            .expect("issue vault-read capability");
+        (operation_id, request_token, vault_token)
+    }
+
+    #[tokio::test]
+    async fn simultaneous_authority_and_revocation_operations_share_only_the_named_vault() {
+        use aether::certificates::{
+            capability::{CapabilityGrant, CapabilityScope},
+            status::{CampaignScope, CertificateKind},
+        };
+
+        let vault = b"shared encrypted HVLT fixture";
+        let fixture = fixture_with_encrypted_vault(Some(vault.to_vec())).await;
+        let fingerprint = Fingerprint::of(vault);
+        let (authority_id, authority_request_token, authority_vault_token) =
+            simultaneous_vault_operation(
+                &fixture,
+                fingerprint,
+                [0x81; 16],
+                [0x82; 16],
+                CampaignScope::TrustAuthorities,
+                CertificateKind::CaPq,
+                WireGuardKey::from_bytes([2; 32]),
+            )
+            .await;
+        let (revocation_id, revocation_request_token, revocation_vault_token) =
+            simultaneous_vault_operation(
+                &fixture,
+                fingerprint,
+                [0x83; 16],
+                [0x84; 16],
+                CampaignScope::EmergencyRevocation,
+                CertificateKind::ClientPq,
+                WireGuardKey::from_bytes([0x39; 32]),
+            )
+            .await;
+
+        let authority_request = format!("Bearer {authority_request_token}");
+        let authority_read = request(
+            &fixture,
+            "GET",
+            &format!("/v1/signer-requests/{authority_id}"),
+            &[("authorization", authority_request.as_str())],
+            b"",
+        )
+        .await;
+        assert_eq!(authority_read.0, 200);
+        let authority_request_body: serde_json::Value =
+            serde_json::from_slice(&authority_read.2).expect("authority request JSON");
+        assert_eq!(
+            authority_request_body["signer_request"]["operation_id"],
+            authority_id.to_string()
+        );
+
+        let revocation_request = format!("Bearer {revocation_request_token}");
+        let revocation_read = request(
+            &fixture,
+            "GET",
+            &format!("/v1/signer-requests/{revocation_id}"),
+            &[("authorization", revocation_request.as_str())],
+            b"",
+        )
+        .await;
+        assert_eq!(revocation_read.0, 200);
+        let revocation_request_body: serde_json::Value =
+            serde_json::from_slice(&revocation_read.2).expect("revocation request JSON");
+        assert_eq!(
+            revocation_request_body["signer_request"]["operation_id"],
+            revocation_id.to_string()
+        );
+
+        for (path_id, wrong_token) in [
+            (authority_id, revocation_request.as_str()),
+            (revocation_id, authority_request.as_str()),
+        ] {
+            let wrong_operation = request(
+                &fixture,
+                "GET",
+                &format!("/v1/signer-requests/{path_id}"),
+                &[("authorization", wrong_token)],
+                b"",
+            )
+            .await;
+            assert_eq!(wrong_operation.0, 403);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&wrong_operation.2)
+                    .expect("coarse capability error")["error"],
+                "refused"
+            );
+        }
+
+        for token in [&authority_vault_token, &revocation_vault_token] {
+            let authorization = format!("Bearer {token}");
+            let response = request(
+                &fixture,
+                "GET",
+                &format!("/v1/vaults/{fingerprint}"),
+                &[("authorization", authorization.as_str())],
+                b"",
+            )
+            .await;
+            assert_eq!(response.0, 200);
+            assert_eq!(response.2, vault);
+        }
+
+        let unknown_operation = Id16::new([0x85; 16]).expect("unknown operation ID");
+        let now = now_unix();
+        let unknown_grant = CapabilityGrant::new(
+            CapabilityScope::EncryptedVaultRead,
+            unknown_operation,
+            Fingerprint::of(b"unregistered campaign"),
+            Some(fingerprint),
+            now,
+            now + 120,
+        )
+        .expect("unregistered-operation capability");
+        let unknown_token = fixture
+            ._service
+            .capabilities
+            .lock()
+            .await
+            .issue(&unknown_grant, now + 300)
+            .expect("issue unregistered-operation capability");
+        let unknown_authorization = format!("Bearer {unknown_token}");
+        let unknown_vault_read = request(
+            &fixture,
+            "GET",
+            &format!("/v1/vaults/{fingerprint}"),
+            &[("authorization", unknown_authorization.as_str())],
+            b"",
+        )
+        .await;
+        assert_eq!(unknown_vault_read.0, 403);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&unknown_vault_read.2)
+                .expect("coarse capability error")["error"],
+            "refused"
         );
     }
 }

@@ -282,3 +282,141 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     aether::private_file::write_private_atomic(path, bytes)
         .with_context(|| format!("écriture de {}", path.display()))
 }
+
+#[cfg(test)]
+mod transit_text_tests {
+    use super::read_text;
+
+    #[test]
+    fn request_reader_accepts_utf16_little_and_big_endian_files() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let little = directory.path().join("request-le.json");
+        let big = directory.path().join("request-be.json");
+        let text = "{\"requested_name\":\"étoile\"}";
+        let units: Vec<u16> = text.encode_utf16().collect();
+        let mut le_bytes = vec![0xFF, 0xFE];
+        let mut be_bytes = vec![0xFE, 0xFF];
+        for unit in units {
+            le_bytes.extend_from_slice(&unit.to_le_bytes());
+            be_bytes.extend_from_slice(&unit.to_be_bytes());
+        }
+        std::fs::write(&little, le_bytes).expect("write little endian text");
+        std::fs::write(&big, be_bytes).expect("write big endian text");
+
+        assert_eq!(read_text(&little).expect("decode UTF-16LE"), text);
+        assert_eq!(read_text(&big).expect("decode UTF-16BE"), text);
+    }
+
+    #[test]
+    fn request_reader_rejects_odd_and_invalid_utf16_before_document_parsing() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let odd = directory.path().join("odd.json");
+        let invalid = directory.path().join("invalid.json");
+        std::fs::write(&odd, [0xFF, 0xFE, 0x7B]).expect("write odd UTF-16");
+        std::fs::write(&invalid, [0xFF, 0xFE, 0x00, 0xD8]).expect("write unpaired surrogate");
+
+        assert!(read_text(&odd).is_err());
+        assert!(read_text(&invalid).is_err());
+    }
+}
+
+#[cfg(test)]
+mod private_output_tests {
+    use super::{read_text, write_private};
+
+    #[test]
+    fn private_writer_creates_and_replaces_the_complete_file() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("invitation.json");
+
+        write_private(&path, b"first complete document").expect("initial private write");
+        assert_eq!(
+            std::fs::read(&path).expect("read initial document"),
+            b"first complete document"
+        );
+        write_private(&path, b"second complete document").expect("replace private file");
+        assert_eq!(
+            std::fs::read(&path).expect("read replacement"),
+            b"second complete document"
+        );
+        assert_eq!(
+            std::fs::read_dir(directory.path())
+                .expect("list output directory")
+                .count(),
+            1,
+            "temporary files are removed after publication"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path)
+                .expect("output metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                mode, 0o600,
+                "enrollment output must be private from creation"
+            );
+        }
+    }
+
+    #[test]
+    fn private_writer_rejects_symlinks_and_missing_parent_without_losing_existing_data() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let target = directory.path().join("target.json");
+        std::fs::write(&target, b"preserve this").expect("write target");
+
+        #[cfg(unix)]
+        {
+            let link = directory.path().join("link.json");
+            std::os::unix::fs::symlink(&target, &link).expect("create symlink");
+            assert!(write_private(&link, b"must not follow symlink").is_err());
+            assert_eq!(
+                std::fs::read(&target).expect("read target"),
+                b"preserve this"
+            );
+            assert!(std::fs::symlink_metadata(&link)
+                .expect("inspect link")
+                .file_type()
+                .is_symlink());
+        }
+
+        let missing_parent = directory.path().join("missing").join("output.json");
+        assert!(write_private(&missing_parent, b"no parent").is_err());
+        assert_eq!(
+            std::fs::read(&target).expect("read target"),
+            b"preserve this"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::read_dir(directory.path())
+                .expect("list output directory")
+                .count(),
+            2,
+            "failed writes leave no staging file"
+        );
+        #[cfg(not(unix))]
+        assert_eq!(
+            std::fs::read_dir(directory.path())
+                .expect("list output directory")
+                .count(),
+            1,
+            "failed writes leave no staging file"
+        );
+    }
+
+    #[test]
+    fn request_reader_reports_missing_and_non_text_files_with_path_context() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let missing = directory.path().join("missing.request");
+        let invalid = directory.path().join("invalid.request");
+        std::fs::write(&invalid, [0xFF, 0xFE, 0x00, 0xD8]).expect("write invalid UTF-16");
+
+        let missing_error = read_text(&missing).expect_err("missing requests are refused");
+        assert!(format!("{missing_error:#}").contains("missing.request"));
+        let invalid_error = read_text(&invalid).expect_err("invalid UTF-16 is refused");
+        assert!(format!("{invalid_error:#}").contains("invalid.request"));
+    }
+}

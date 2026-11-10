@@ -34,6 +34,7 @@ struct RecoveryGateway {
     stage_calls: std::sync::atomic::AtomicUsize,
     commit_fingerprints: Mutex<Vec<Fingerprint>>,
     lose_first_reply: std::sync::atomic::AtomicBool,
+    fail_next_peer_state: std::sync::atomic::AtomicBool,
     gateway_leaf: aether::key_negotiation::PqCertificate,
     expected_authorization: ClientCertificateStageAuthorization,
     stage_receipt: GatewayCertificateStageReceipt,
@@ -107,6 +108,12 @@ impl astra_channel::AstraChannelHandler for RecoveryGateway {
         &self,
         identity: &WireGuardKey,
     ) -> Result<astra_channel::PeerCertificateStateView, TrustUpdateRefusal> {
+        if self
+            .fail_next_peer_state
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(TrustUpdateRefusal::Unavailable);
+        }
         if identity != &self.peer {
             return Err(TrustUpdateRefusal::Rejected);
         }
@@ -964,6 +971,7 @@ async fn install_recovery_gateway(
         stage_calls: std::sync::atomic::AtomicUsize::new(0),
         commit_fingerprints: Mutex::new(Vec::new()),
         lose_first_reply: std::sync::atomic::AtomicBool::new(true),
+        fail_next_peer_state: std::sync::atomic::AtomicBool::new(false),
         gateway_leaf,
         ca_public,
         gateway_public,
@@ -1178,6 +1186,34 @@ async fn a_commit_applied_before_a_lost_reply_is_replayed_and_reconciled() {
             .expect("release signed grant after receipt");
         assert_eq!(granted.state, ExpiredRecoveryState::Granted);
 
+        // The durable reconciliation intent must exist before Helios sees
+        // the commit. A deterministic non-directory state path forces that
+        // write to fail without relying on Unix permission behavior.
+        let blocked_state_dir = directory.path().join("state-dir-is-a-file");
+        std::fs::write(&blocked_state_dir, b"not a directory").expect("blocker file");
+        let state_dir = service.state_dir.clone();
+        Arc::get_mut(&mut service)
+            .expect("the service has no outstanding Arc clones")
+            .state_dir = blocked_state_dir;
+        assert!(matches!(
+            bounded_commit(&service, &operation_id, stage_commit.clone(), now + 1).await,
+            Err(RecoveryError::Reconciliation(_))
+        ));
+        assert!(handler.commit_fingerprints.lock().await.is_empty());
+        assert_eq!(
+            service
+                .recoveries
+                .lock()
+                .await
+                .get(&operation_id, now + 1)
+                .expect("failed intent write keeps the grant available")
+                .state,
+            ExpiredRecoveryState::Granted
+        );
+        Arc::get_mut(&mut service)
+            .expect("the service has no outstanding Arc clones")
+            .state_dir = state_dir;
+
         assert!(matches!(
             bounded_commit(&service, &operation_id, stage_commit.clone(), now + 1).await,
             Err(RecoveryError::Gateway(_))
@@ -1258,6 +1294,149 @@ async fn a_commit_applied_before_a_lost_reply_is_replayed_and_reconciled() {
     })
     .await
     .expect("the complete recovery workflow finishes within fifteen seconds");
+}
+
+#[tokio::test]
+async fn reconciliation_retry_keeps_intent_until_the_recovered_generation_is_active() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let now = 20_000;
+        let (mut service, directory, ca_private) = service();
+        let (gateway_private, gateway_public) =
+            generate_ml_dsa_87_keypair().expect("gateway signing key");
+        let (
+            operation,
+            stage_grant,
+            _stage_commit,
+            gateway_leaf,
+            old_client_public,
+            candidate_client_public,
+            tls_anchor,
+            stage_authorization,
+            _approval_evidence,
+        ) = granted_recovery(
+            33,
+            now,
+            &ca_private,
+            &gateway_private,
+            gateway_public.as_bytes(),
+        );
+        let client = operation.request.client_wg_public_key;
+        let old_generation = generation(
+            operation.request.expired_generation,
+            &operation.request.expired_pq_certificate,
+            &tls_anchor,
+            &operation.request.expired_tls_certificate,
+        );
+        let candidate = stage_authorization
+            .candidate()
+            .expect("signed authorization candidate");
+        let (handler, _server_task) = install_recovery_gateway(
+            &mut service,
+            &directory,
+            &operation,
+            RecoveryGatewayMaterial {
+                ca_public: service_ca_public(&ca_private),
+                gateway_public,
+                gateway_leaf,
+                old_client_public,
+                candidate_client_public,
+                tls_anchor,
+                authorization: stage_authorization.clone(),
+                receipt: stage_grant.stage_receipt,
+            },
+            false,
+            now,
+        )
+        .await;
+
+        crate::reconciliation::record(
+            directory.path(),
+            &crate::reconciliation::PendingReconciliation {
+                peer: client,
+                expected_generation: candidate.generation,
+                recorded_at: now,
+            },
+        )
+        .expect("commit intent persisted before the gateway operation");
+
+        // A commit may already be durable at Helios while its readback is
+        // unavailable. The repair intent must survive that failed read.
+        handler
+            .fail_next_peer_state
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(matches!(
+            reconcile(&service, &client, candidate.generation, now).await,
+            Err(RecoveryError::Gateway(_))
+        ));
+        assert_eq!(
+            crate::reconciliation::load(directory.path())
+                .expect("intent survives read failure")
+                .len(),
+            1
+        );
+
+        // Helios has committed the candidate, but it remains in `next` until
+        // its activation boundary. Astra must not claim it as active yet.
+        {
+            let mut view = handler.peer_view.lock().await;
+            view.state = ClientCertificateState::new(old_generation.clone());
+            view.state.next = Some(candidate.clone());
+            view.state.activation_at = Some(now);
+            view.state.retire_active_at = Some(now + 1);
+            view.active_pq_certificate = operation.request.expired_pq_certificate.clone();
+        }
+        assert!(!reconcile(&service, &client, candidate.generation, now + 1)
+            .await
+            .expect("pending next generation is not yet active"));
+        assert_eq!(
+            crate::reconciliation::load(directory.path())
+                .expect("pending intent remains")
+                .len(),
+            1
+        );
+        assert_eq!(
+            service
+                .registry
+                .lock()
+                .await
+                .peer(&client)
+                .expect("old generation remains recorded")
+                .active
+                .generation,
+            old_generation.generation
+        );
+
+        // Once the gateway reports the candidate as active, the same repair
+        // adopts it and removes the durable marker. Repeating the repair is
+        // harmless.
+        {
+            let mut view = handler.peer_view.lock().await;
+            assert!(view.state.promote_if_due(now + 2));
+            view.active_pq_certificate = stage_authorization.next_pq_certificate.clone();
+        }
+        assert!(reconcile(&service, &client, candidate.generation, now + 2)
+            .await
+            .expect("active generation closes reconciliation"));
+        assert!(crate::reconciliation::load(directory.path())
+            .expect("intent removed after adoption")
+            .is_empty());
+        assert_eq!(
+            service
+                .registry
+                .lock()
+                .await
+                .peer(&client)
+                .expect("promoted generation adopted")
+                .active
+                .generation,
+            candidate.generation
+        );
+        assert!(reconcile(&service, &client, candidate.generation, now + 3)
+            .await
+            .expect("replayed repair is idempotent"));
+    })
+    .await
+    .expect("reconciliation retry finishes within fifteen seconds");
 }
 
 #[tokio::test]

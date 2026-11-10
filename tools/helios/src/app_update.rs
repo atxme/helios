@@ -375,6 +375,8 @@ mod tests {
     use aether::sig::{ArtifactSignature, BinaryReleasePayload, SignedEnvelope};
     use tokio::io::AsyncWriteExt;
 
+    const MOCK_SERVER_TIMEOUT: Duration = Duration::from_secs(5);
+
     fn directory(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
             "helios-app-update-{name}-{}-{:?}",
@@ -414,6 +416,59 @@ mod tests {
                 sig: "test".into(),
             }],
         }
+    }
+
+    fn write_inputs(root: &Path) -> (PathBuf, PathBuf, SignedBinaryRelease) {
+        let binary = root.join("heliosd");
+        let manifest_path = root.join("release.json");
+        fs::write(&binary, x86_elf()).unwrap();
+        let release = manifest(&binary, 42);
+        fs::write(&manifest_path, serde_json::to_vec(&release).unwrap()).unwrap();
+        (manifest_path, binary, release)
+    }
+
+    fn status_body(
+        highest_confirmed_sequence: u64,
+        active_version: Option<&str>,
+        staged: &[FinalizedRelease],
+        activation_pending: Option<u64>,
+    ) -> String {
+        serde_json::to_string(&UpdateStatus {
+            highest_confirmed_sequence,
+            active_version: active_version.map(str::to_owned),
+            staged: staged.to_vec(),
+            activation_pending,
+            channel: "production".into(),
+            target: "x86_64-unknown-linux-gnu".into(),
+        })
+        .unwrap()
+    }
+
+    fn finalized_body(release: &SignedBinaryRelease) -> String {
+        serde_json::json!({
+            "release": {
+                "release_sequence": release.payload.release_sequence,
+                "version": release.payload.version,
+                "sha256": hex::encode(release.payload.sha256)
+            }
+        })
+        .to_string()
+    }
+
+    fn test_client() -> Client {
+        Client::builder().no_proxy().build().unwrap()
+    }
+
+    async fn within_test_timeout<F: std::future::Future>(future: F) -> F::Output {
+        tokio::time::timeout(MOCK_SERVER_TIMEOUT, future)
+            .await
+            .expect("loopback update operation completes within its test deadline")
+    }
+
+    async fn finish_server(server: tokio::task::JoinHandle<Vec<String>>) -> Vec<String> {
+        within_test_timeout(server)
+            .await
+            .expect("fake update server task completes")
     }
 
     async fn read_request(stream: &mut tokio::net::TcpStream) -> String {
@@ -456,8 +511,15 @@ mod tests {
         let task = tokio::spawn(async move {
             let mut requests = Vec::new();
             for (status, body) in responses {
-                let (mut stream, _) = listener.accept().await.expect("HTTP request");
-                requests.push(read_request(&mut stream).await);
+                let (mut stream, _) = tokio::time::timeout(MOCK_SERVER_TIMEOUT, listener.accept())
+                    .await
+                    .expect("HTTP client connects within the test deadline")
+                    .expect("HTTP request");
+                requests.push(
+                    tokio::time::timeout(MOCK_SERVER_TIMEOUT, read_request(&mut stream))
+                        .await
+                        .expect("HTTP request body completes within the test deadline"),
+                );
                 let response = format!(
                     "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
@@ -556,7 +618,7 @@ mod tests {
             ),
         ];
         let (base, server) = response_server(responses).await;
-        let client = Client::new();
+        let client = test_client();
 
         let finalized = transfer(&client, &base, &release, &binary)
             .await
@@ -564,7 +626,7 @@ mod tests {
         assert_eq!(finalized.release_sequence, 42);
         activate(&client, &base, 42).await.expect("activation");
 
-        let requests = server.await.unwrap();
+        let requests = finish_server(server).await;
         assert_eq!(requests.len(), 4);
         for (request, route) in requests.iter().zip([
             "/api/update/stage",
@@ -585,6 +647,171 @@ mod tests {
         let activation_body = requests[3].split_once("\r\n\r\n").unwrap().1;
         let activation: serde_json::Value = serde_json::from_str(activation_body).unwrap();
         assert_eq!(activation["confirmation"], "INSTALLER 42");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn run_stage_only_transfers_the_exact_release_without_requesting_activation() {
+        let root = directory("run-stage-only");
+        let (manifest_path, binary, release) = write_inputs(&root);
+        let finalized = finalized_body(&release);
+        let responses = vec![
+            ("200 OK", status_body(41, Some("1.2.2"), &[], None)),
+            ("200 OK", finalized.clone()),
+            (
+                "200 OK",
+                format!(r#"{{"next_offset":{}}}"#, release.payload.binary_size),
+            ),
+            ("200 OK", finalized),
+        ];
+        let (base, server) = response_server(responses).await;
+
+        within_test_timeout(run(
+            &test_client(),
+            &base,
+            Options {
+                manifest: manifest_path,
+                binary,
+                stage_only: true,
+                yes: false,
+            },
+        ))
+        .await
+        .expect("stage-only run completes successfully");
+
+        let requests = finish_server(server).await;
+        assert_eq!(requests.len(), 4);
+        assert!(requests[0].starts_with("GET /api/update HTTP/1.1"));
+        for (request, route) in requests[1..].iter().zip([
+            "/api/update/stage",
+            "/api/update/chunk",
+            "/api/update/finalize",
+        ]) {
+            assert!(request.starts_with(&format!("POST {route} ")), "{request}");
+        }
+        let chunk_body = requests[2].split_once("\r\n\r\n").unwrap().1;
+        let chunk: serde_json::Value = serde_json::from_str(chunk_body).unwrap();
+        assert_eq!(chunk["release_sequence"], 42);
+        assert_eq!(chunk["offset"], 0);
+        assert_eq!(
+            STANDARD.decode(chunk["data"].as_str().unwrap()).unwrap(),
+            x86_elf()
+        );
+        assert!(requests
+            .iter()
+            .all(|request| !request.contains("/activate")));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn run_resumes_an_exact_staged_release_without_reuploading_and_confirms_it() {
+        let root = directory("run-resume");
+        let (manifest_path, binary, release) = write_inputs(&root);
+        let staged = FinalizedRelease {
+            release_sequence: release.payload.release_sequence,
+            version: release.payload.version.clone(),
+            sha256: hex::encode(release.payload.sha256),
+        };
+        let responses = vec![
+            (
+                "200 OK",
+                status_body(41, Some("1.2.2"), std::slice::from_ref(&staged), None),
+            ),
+            (
+                "202 Accepted",
+                r#"{"accepted":true,"release_sequence":42}"#.into(),
+            ),
+            ("200 OK", status_body(42, Some("1.2.3"), &[], None)),
+        ];
+        let (base, server) = response_server(responses).await;
+
+        within_test_timeout(run(
+            &test_client(),
+            &base,
+            Options {
+                manifest: manifest_path,
+                binary,
+                stage_only: false,
+                yes: true,
+            },
+        ))
+        .await
+        .expect("resumed activation completes, including confirmation polling");
+
+        let requests = finish_server(server).await;
+        assert_eq!(requests.len(), 3);
+        assert!(requests[0].starts_with("GET /api/update HTTP/1.1"));
+        assert!(requests[1].starts_with("POST /api/update/activate "));
+        assert!(requests[2].starts_with("GET /api/update HTTP/1.1"));
+        assert!(requests
+            .iter()
+            .all(|request| !request.contains("/api/update/stage")));
+        let activation_body = requests[1].split_once("\r\n\r\n").unwrap().1;
+        let activation: serde_json::Value = serde_json::from_str(activation_body).unwrap();
+        assert_eq!(activation["release_sequence"], 42);
+        assert_eq!(activation["confirmation"], "INSTALLER 42");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn run_refuses_an_incompatible_gateway_before_any_update_mutation() {
+        let root = directory("run-channel-refusal");
+        let (manifest_path, binary, _) = write_inputs(&root);
+        let (base, server) = response_server(vec![(
+            "200 OK",
+            serde_json::json!({
+                "highest_confirmed_sequence": 41,
+                "active_version": "1.2.2",
+                "staged": [],
+                "activation_pending": null,
+                "channel": "testing",
+                "target": "x86_64-unknown-linux-gnu"
+            })
+            .to_string(),
+        )])
+        .await;
+
+        let error = within_test_timeout(run(
+            &test_client(),
+            &base,
+            Options {
+                manifest: manifest_path,
+                binary,
+                stage_only: true,
+                yes: false,
+            },
+        ))
+        .await
+        .expect_err("testing gateway must refuse production release");
+
+        assert!(error.to_string().contains("gateway channel is testing"));
+        let requests = finish_server(server).await;
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("GET /api/update HTTP/1.1"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn transfer_stops_when_the_gateway_acknowledges_the_wrong_offset() {
+        let root = directory("wrong-offset");
+        let binary = root.join("heliosd");
+        fs::write(&binary, x86_elf()).unwrap();
+        let release = manifest(&binary, 42);
+        let responses = vec![
+            ("200 OK", finalized_body(&release)),
+            ("200 OK", r#"{"next_offset":19}"#.into()),
+        ];
+        let (base, server) = response_server(responses).await;
+
+        let error = within_test_timeout(transfer(&test_client(), &base, &release, &binary))
+            .await
+            .expect_err("wrong byte offset must stop the transfer");
+        assert!(error.to_string().contains("acknowledged offset 19"));
+
+        let requests = finish_server(server).await;
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].starts_with("POST /api/update/stage "));
+        assert!(requests[1].starts_with("POST /api/update/chunk "));
         let _ = fs::remove_dir_all(root);
     }
 }

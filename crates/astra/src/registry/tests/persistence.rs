@@ -136,3 +136,69 @@ fn a_read_migrates_in_memory_and_leaves_the_file_untouched() {
         Err(RegistryError::Audit(_))
     ));
 }
+/// A persisted per-peer lifecycle suffix is accepted on daemon restart, but
+/// remains a fork for the strict restore path. Display reads never rewrite it.
+#[test]
+fn a_persisted_peer_lifecycle_suffix_is_accepted_only_by_the_restart_path() {
+    let (mut registry, directory) = registry();
+    let path = directory.path().join("astra.json");
+    let witness = registry.audit_head();
+
+    assert!(registry
+        .reconcile_peer(served(5), 2_000)
+        .expect("adopt generation"));
+    let persisted = std::fs::read(&path).expect("read persisted suffix");
+
+    assert!(matches!(
+        AstraRegistry::load(&path, Some(&witness)),
+        Err(RegistryError::Audit(AuditError::Forked))
+    ));
+
+    let restarted = AstraRegistry::load_allowing_unattended_tail(&path, Some(&witness))
+        .expect("restart accepts per-peer lifecycle tail");
+    assert_eq!(
+        restarted
+            .peer(&WireGuardKey::from_bytes([2; 32]))
+            .expect("peer survived restart")
+            .active
+            .generation,
+        5
+    );
+
+    let read = AstraRegistry::read_state_allowing_unattended_tail(&path, Some(&witness))
+        .expect("display read accepts per-peer lifecycle tail");
+    assert_eq!(read.peers, restarted.state().peers);
+    assert_eq!(
+        std::fs::read(&path).expect("read after display"),
+        persisted,
+        "display read must not rewrite the registry"
+    );
+}
+
+/// A witnessed chain that grows through an authority decision is never
+/// accepted by the restart or display path, even if it is otherwise valid.
+#[test]
+fn an_authority_decision_after_the_witness_blocks_restart_and_read() {
+    let (mut registry, directory) = registry();
+    let path = directory.path().join("astra.json");
+    let witness = registry.audit_head();
+
+    registry
+        .record(AuditEvent::IssuerInstalled { issuer_epoch: 2 }, 2_000)
+        .expect("persist authority decision");
+    let persisted = std::fs::read(&path).expect("read persisted decision");
+
+    assert!(matches!(
+        AstraRegistry::load_allowing_unattended_tail(&path, Some(&witness)),
+        Err(RegistryError::Audit(AuditError::WitnessOutdated { .. }))
+    ));
+    assert!(matches!(
+        AstraRegistry::read_state_allowing_unattended_tail(&path, Some(&witness)),
+        Err(RegistryError::Audit(AuditError::WitnessOutdated { .. }))
+    ));
+    assert_eq!(
+        std::fs::read(&path).expect("read after rejected display"),
+        persisted,
+        "a rejected display read must not rewrite the registry"
+    );
+}

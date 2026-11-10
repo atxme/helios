@@ -1,4 +1,6 @@
 use super::*;
+
+mod operator_contract_tests;
 use aether::certificates::encoding::{
     Fingerprint, Id16, MlDsa87Signature, TrustDomainId, WireGuardKey,
 };

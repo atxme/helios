@@ -513,6 +513,38 @@ mod tests {
         }
     }
 
+    struct FailingWindowReadTpm(DryRunTpm);
+
+    impl TpmSealer for FailingWindowReadTpm {
+        fn current_pcr_digest(&mut self) -> Result<[u8; 32]> {
+            self.0.current_pcr_digest()
+        }
+
+        fn seal(&mut self, secret: &SecretKey) -> Result<crate::tpm_interface::SealedBlob> {
+            self.0.seal(secret)
+        }
+
+        fn unseal(&mut self, blob: &crate::tpm_interface::SealedBlob) -> Result<SecretKey> {
+            self.0.unseal(blob)
+        }
+
+        fn arm_update_window(&mut self, payload: &[u8]) -> Result<()> {
+            self.0.arm_update_window(payload)
+        }
+
+        fn unseal_update_window(&mut self) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+            Err(TpmError::Connection("injected NV read failure".into()))
+        }
+
+        fn revoke_update_window(&mut self) -> Result<()> {
+            self.0.revoke_update_window()
+        }
+
+        fn update_window_armed(&mut self) -> Result<bool> {
+            self.0.update_window_armed()
+        }
+    }
+
     struct LostArmResponseTpm {
         inner: DryRunTpm,
         revoke_fails: bool,
@@ -662,6 +694,138 @@ mod tests {
         assert!(matches!(recovered, BootDecision::Unsealed(_)));
         assert_eq!(recovered.secret().unwrap().as_bytes(), before.as_slice());
         assert!(std::path::Path::new(&cfg.ticket_path).exists());
+    }
+
+    #[test]
+    fn a_window_read_connection_failure_preserves_the_ticket_and_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(dir.path(), true);
+        let store = BlobStore::new(&cfg);
+        let nv = crate::tpm_interface::NvState::default();
+
+        let provisioned = boot_with(&cfg, &store, &nv, [1u8; 32], [9u8; 32], 0).unwrap();
+        let original_secret = provisioned.secret().unwrap().as_bytes().to_vec();
+        let original_blob = std::fs::read(&cfg.sealed_blob_path).unwrap();
+        let mut arm_tpm = DryRunTpm::with_digest([1u8; 32])
+            .with_window_digest([9u8; 32])
+            .sharing_nv(&nv);
+        provisioning::arm_window(&mut arm_tpm, &store, provisioned.secret().unwrap(), 1_000)
+            .unwrap();
+        write_ticket(std::path::Path::new(&cfg.ticket_path), 1, None);
+
+        let mut failing = FailingWindowReadTpm(
+            DryRunTpm::with_digest([2u8; 32])
+                .with_window_digest([9u8; 32])
+                .sharing_nv(&nv),
+        );
+        assert!(matches!(
+            BootController::run_flow_at(&cfg, &mut failing, &store, 500),
+            Err(TpmError::Connection(message)) if message == "injected NV read failure"
+        ));
+
+        assert_eq!(std::fs::read(&cfg.sealed_blob_path).unwrap(), original_blob);
+        assert!(std::path::Path::new(&cfg.ticket_path).exists());
+        assert!(failing.update_window_armed().unwrap());
+        assert!(std::path::Path::new(&cfg.update_window_marker_path).exists());
+
+        // The original nominal blob still unlocks the exact identity on its original PCRs.
+        let nominal = boot_with(&cfg, &store, &nv, [1u8; 32], [9u8; 32], 600).unwrap();
+        assert_eq!(
+            nominal.secret().unwrap().as_bytes().as_slice(),
+            original_secret.as_slice()
+        );
+    }
+
+    #[test]
+    fn a_malformed_marker_is_revoked_before_the_ticket_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(dir.path(), true);
+        let store = BlobStore::new(&cfg);
+        let nv = crate::tpm_interface::NvState::default();
+
+        let provisioned = boot_with(&cfg, &store, &nv, [1u8; 32], [9u8; 32], 0).unwrap();
+        let mut arm_tpm = DryRunTpm::with_digest([1u8; 32])
+            .with_window_digest([9u8; 32])
+            .sharing_nv(&nv);
+        provisioning::arm_window(&mut arm_tpm, &store, provisioned.secret().unwrap(), 1_000)
+            .unwrap();
+        std::fs::write(&cfg.update_window_marker_path, b"invalid marker").unwrap();
+        write_ticket(std::path::Path::new(&cfg.ticket_path), 1, None);
+
+        let result = boot_with(&cfg, &store, &nv, [2u8; 32], [9u8; 32], 500).unwrap();
+        assert!(matches!(result, BootDecision::Resealed(_)));
+        assert!(!std::path::Path::new(&cfg.ticket_path).exists());
+        assert!(!std::path::Path::new(&cfg.update_window_marker_path).exists());
+
+        let mut status = DryRunTpm::with_digest([2u8; 32])
+            .with_window_digest([9u8; 32])
+            .sharing_nv(&nv);
+        assert!(!status.update_window_armed().unwrap());
+    }
+
+    #[test]
+    fn a_malformed_marker_with_failed_revocation_keeps_the_ticket_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(dir.path(), true);
+        let store = BlobStore::new(&cfg);
+        let nv = crate::tpm_interface::NvState::default();
+
+        let provisioned = boot_with(&cfg, &store, &nv, [1u8; 32], [9u8; 32], 0).unwrap();
+        let original_blob = std::fs::read(&cfg.sealed_blob_path).unwrap();
+        let mut arm_tpm = DryRunTpm::with_digest([1u8; 32])
+            .with_window_digest([9u8; 32])
+            .sharing_nv(&nv);
+        provisioning::arm_window(&mut arm_tpm, &store, provisioned.secret().unwrap(), 1_000)
+            .unwrap();
+        std::fs::write(&cfg.update_window_marker_path, b"invalid marker").unwrap();
+        write_ticket(std::path::Path::new(&cfg.ticket_path), 1, None);
+
+        let mut failing = FailingRevokeTpm(
+            DryRunTpm::with_digest([2u8; 32])
+                .with_window_digest([9u8; 32])
+                .sharing_nv(&nv),
+        );
+        assert!(matches!(
+            BootController::run_flow_at(&cfg, &mut failing, &store, 500),
+            Err(TpmError::Connection(message)) if message == "injected NV write failure"
+        ));
+
+        assert_eq!(std::fs::read(&cfg.sealed_blob_path).unwrap(), original_blob);
+        assert!(std::path::Path::new(&cfg.ticket_path).exists());
+        assert_eq!(
+            std::fs::read(&cfg.update_window_marker_path).unwrap(),
+            b"invalid marker"
+        );
+        assert!(failing.update_window_armed().unwrap());
+    }
+
+    #[test]
+    fn a_window_is_still_valid_at_its_exact_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(dir.path(), true);
+        let store = BlobStore::new(&cfg);
+        let nv = crate::tpm_interface::NvState::default();
+
+        let provisioned = boot_with(&cfg, &store, &nv, [1u8; 32], [9u8; 32], 0).unwrap();
+        let original_secret = provisioned.secret().unwrap().as_bytes().to_vec();
+        let mut arm_tpm = DryRunTpm::with_digest([1u8; 32])
+            .with_window_digest([9u8; 32])
+            .sharing_nv(&nv);
+        provisioning::arm_window(&mut arm_tpm, &store, provisioned.secret().unwrap(), 1_000)
+            .unwrap();
+
+        let result = boot_with(&cfg, &store, &nv, [2u8; 32], [9u8; 32], 1_000).unwrap();
+        assert!(matches!(result, BootDecision::WindowResealed(_)));
+        assert_eq!(
+            result.secret().unwrap().as_bytes().as_slice(),
+            original_secret.as_slice()
+        );
+        assert!(!std::path::Path::new(&cfg.update_window_marker_path).exists());
+
+        let mut status = DryRunTpm::with_digest([2u8; 32])
+            .with_window_digest([9u8; 32])
+            .sharing_nv(&nv);
+        assert!(!status.update_window_armed().unwrap());
     }
 
     /// A window is good for one consumption. The second reboot must not be

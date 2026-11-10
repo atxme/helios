@@ -394,6 +394,42 @@ fn an_abort_cancels_the_transition_already_stored() {
     assert_eq!(anchored.registry.state().transitions.len(), 2);
 }
 
+/// The authority persists an accepted abort as an unpublished tombstone, and
+/// a restart must preserve that decision and keep its transition unpublishable.
+#[test]
+fn an_accepted_abort_stays_unpublished_after_reload_and_blocks_publication() {
+    let mut anchored = anchored();
+    let tls = Fingerprint::of(b"gateway tls in service");
+    let pq = Fingerprint::of(b"gateway pq in service");
+    let transition = gateway_transition(&anchored, 5, tls, pq);
+    anchored
+        .registry
+        .accept_transitions(
+            &gateway_campaign(4, tls, pq),
+            std::slice::from_ref(&transition),
+            None,
+            2_000,
+        )
+        .expect("stage transition");
+    let abort = gateway_abort(&anchored, &transition, 2_100);
+    anchored
+        .registry
+        .accept_transitions(&gateway_campaign(5, tls, pq), &[abort], None, 2_200)
+        .expect("accept abort");
+
+    let path = anchored._directory.path().join("astra.json");
+    let mut restored = AstraRegistry::load(&path, None).expect("reload accepted abort");
+    let stored_abort = restored
+        .state()
+        .transitions
+        .iter()
+        .find(|stored| matches!(&stored.object, TrustUpdateObject::GatewayTransitionAbort(_)))
+        .expect("persisted abort tombstone");
+    assert!(!stored_abort.published);
+
+    assert!(restored.publish_gateway_transition(5, 2_300).is_err());
+}
+
 /// The ceiling refuses rather than evicting: dropping the oldest would
 /// drop the one a lagging peer is still missing.
 #[test]

@@ -536,6 +536,349 @@ mod tests {
         }
     }
 
+    struct ObservedRequest {
+        headers: String,
+        body: Vec<u8>,
+    }
+
+    fn loopback_origin(
+        responses: Vec<Vec<u8>>,
+    ) -> (
+        Origin,
+        std::sync::mpsc::Receiver<ObservedRequest>,
+        std::thread::JoinHandle<()>,
+    ) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listen");
+        let address = listener.local_addr().expect("listener address");
+        listener.set_nonblocking(true).expect("bounded accept mode");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            for response in responses {
+                let (mut stream, _) = accept_with_timeout(&listener);
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .expect("request timeout");
+                let mut bytes = Vec::new();
+                let header_end = loop {
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).expect("request header");
+                    bytes.push(byte[0]);
+                    if bytes.ends_with(b"\r\n\r\n") {
+                        break bytes.len();
+                    }
+                };
+                let headers = String::from_utf8(bytes[..header_end].to_vec()).expect("headers");
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().expect("content length"))
+                    })
+                    .unwrap_or_default();
+                let mut body = vec![0; content_length];
+                stream.read_exact(&mut body).expect("request body");
+                sender
+                    .send(ObservedRequest { headers, body })
+                    .expect("request observer");
+                stream.write_all(&response).expect("write response");
+            }
+        });
+        let base = format!("http://{address}");
+        // The production constructor requires HTTPS. These loopback adapter
+        // tests bypass TLS construction to exercise route and HTTP semantics
+        // without creating a certificate authority or reaching the network.
+        let origin = Origin {
+            base,
+            http: reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(2))
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("test HTTP client"),
+        };
+        (origin, receiver, server)
+    }
+
+    fn accept_with_timeout(
+        listener: &std::net::TcpListener,
+    ) -> (std::net::TcpStream, std::net::SocketAddr) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match listener.accept() {
+                Ok(connection) => return connection,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("timed out waiting for loopback request: {error}"),
+            }
+        }
+    }
+
+    fn json_response<T: serde::Serialize>(status: &str, value: &T) -> Vec<u8> {
+        let body = serde_json::to_vec(value).expect("JSON response");
+        let mut response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(&body);
+        response
+    }
+
+    fn signer_answer_json(answer: &SignerRequestAnswer) -> serde_json::Value {
+        serde_json::json!({
+            "signer_request": answer.signer_request,
+            "campaign": answer.campaign,
+            "credential_registry": answer.credential_registry,
+            "webauthn_rp_id": answer.webauthn_rp_id,
+            "webauthn_origin": answer.webauthn_origin,
+        })
+    }
+
+    #[test]
+    fn fetch_uses_the_read_capability_only_on_the_signer_request_route() {
+        let campaign = campaign();
+        let vault_fingerprint = Fingerprint::of(b"encrypted vault");
+        let operation_id = operation();
+        let operation_view = view(&campaign);
+        let signer_answer = answer(campaign.clone(), vault_fingerprint);
+        let responses = vec![
+            json_response("200 OK", &operation_view),
+            json_response("200 OK", &signer_answer_json(&signer_answer)),
+        ];
+        let (origin, observed, server) = loopback_origin(responses);
+
+        let fetched = origin.fetch(&operation_id).expect("fetch campaign");
+        assert_eq!(fetched.result_token, "submit");
+        assert_eq!(fetched.campaign.fingerprint(), campaign.fingerprint());
+        let first = observed
+            .recv_timeout(Duration::from_secs(5))
+            .expect("operation read");
+        let second = observed
+            .recv_timeout(Duration::from_secs(5))
+            .expect("signer request read");
+        assert!(first
+            .headers
+            .starts_with(&format!("GET /v1/operations/{} ", operation_id.to_hex())));
+        assert!(!first
+            .headers
+            .to_ascii_lowercase()
+            .contains("authorization:"));
+        assert!(second.headers.starts_with(&format!(
+            "GET /v1/signer-requests/{} ",
+            operation_id.to_hex()
+        )));
+        assert!(second
+            .headers
+            .to_ascii_lowercase()
+            .contains("authorization: bearer read"));
+        assert!(first.body.is_empty() && second.body.is_empty());
+        server.join().expect("loopback server");
+    }
+
+    #[test]
+    fn submit_posts_the_approval_with_the_result_capability() {
+        use aether::certificates::status::CampaignApproval;
+
+        let campaign = campaign();
+        let operation_id = operation();
+        let mut expected_view = view(&campaign);
+        expected_view.state = SigningOperationState::Approved;
+        let (origin, observed, server) =
+            loopback_origin(vec![json_response("200 OK", &expected_view)]);
+        let result = AstraSignerResult {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            approval: Box::new(CampaignApproval {
+                campaign_id: campaign.campaign_id,
+                campaign_fingerprint: campaign.fingerprint(),
+                required_credentials: campaign.required_credentials,
+                approved_at: NOW + 1,
+                approvals: Vec::new(),
+            }),
+            objects: Vec::new(),
+            credential_registry: None,
+            issuer_authorization: None,
+        };
+
+        assert_eq!(
+            origin
+                .submit(&operation_id, "submit-secret", &result)
+                .expect("approval submitted"),
+            SigningOperationState::Approved
+        );
+        let request = observed
+            .recv_timeout(Duration::from_secs(5))
+            .expect("result POST");
+        assert!(request.headers.starts_with(&format!(
+            "POST /v1/signer-results/{} ",
+            operation_id.to_hex()
+        )));
+        assert!(request
+            .headers
+            .to_ascii_lowercase()
+            .contains("authorization: bearer submit-secret"));
+        assert!(request
+            .headers
+            .to_ascii_lowercase()
+            .contains("content-type: application/json"));
+        let decoded: AstraSignerResult =
+            serde_json::from_slice(&request.body).expect("posted result JSON");
+        assert_eq!(decoded, result);
+        server.join().expect("loopback server");
+    }
+
+    #[test]
+    fn encrypted_vault_fetch_is_fingerprint_bound_and_requires_its_capability() {
+        let campaign = campaign();
+        let operation_id = operation();
+        let bytes = b"encrypted HVLT fixture".to_vec();
+        let fingerprint = Fingerprint::of(&bytes);
+        let mut operation_view = view(&campaign);
+        operation_view.vault_token = Some("vault-secret".into());
+        let request = Origin::accept(
+            &operation_id,
+            operation_view,
+            answer(campaign.clone(), fingerprint),
+        )
+        .expect("accepted campaign answer");
+        let response = {
+            let mut response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                bytes.len()
+            )
+            .into_bytes();
+            response.extend_from_slice(&bytes);
+            response
+        };
+        let (origin, observed, server) = loopback_origin(vec![response]);
+        assert_eq!(
+            origin
+                .encrypted_vault(&request)
+                .expect("download encrypted bytes")
+                .as_slice(),
+            bytes.as_slice()
+        );
+        let wire = observed
+            .recv_timeout(Duration::from_secs(5))
+            .expect("vault request");
+        assert!(wire
+            .headers
+            .starts_with(&format!("GET /v1/vaults/{} ", fingerprint.to_hex())));
+        assert!(wire
+            .headers
+            .to_ascii_lowercase()
+            .contains("authorization: bearer vault-secret"));
+        server.join().expect("loopback server");
+
+        let mut no_token_view = view(&campaign);
+        no_token_view.vault_token = None;
+        let no_token_request =
+            Origin::accept(&operation_id, no_token_view, answer(campaign, fingerprint))
+                .expect("campaign without vault capability");
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("token-check listener");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking token-check listener");
+        let address = listener.local_addr().expect("listener address");
+        let no_token_origin = Origin {
+            base: format!("http://{address}"),
+            http: reqwest::blocking::Client::builder()
+                .timeout(Duration::from_millis(250))
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("test HTTP client"),
+        };
+        let error = no_token_origin
+            .encrypted_vault(&no_token_request)
+            .expect_err("missing vault capability must fail before HTTP");
+        assert!(error
+            .to_string()
+            .contains("ne délivre pas de jeton de coffre"));
+        assert!(
+            matches!(
+                listener.accept(),
+                Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock
+            ),
+            "a missing capability must produce no TCP connection"
+        );
+    }
+
+    #[test]
+    fn public_refusal_statuses_hide_the_authority_response_body() {
+        let detail = b"private operator detail";
+        for (status, expected_hint) in [
+            (400, "400"),
+            (403, "Rouvrir la campagne"),
+            (429, "une minute"),
+            (501, "version d'Astra"),
+            (503, "503"),
+        ] {
+            let mut response = format!(
+                "HTTP/1.1 {status} Refused\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                detail.len()
+            )
+            .into_bytes();
+            response.extend_from_slice(detail);
+            let (origin, observed, server) = loopback_origin(vec![response]);
+            let error = origin.fetch(&operation()).expect_err("status refusal");
+            let message = format!("{error:#}");
+            assert!(message.contains(expected_hint), "{message}");
+            assert!(
+                !message.contains("private operator detail"),
+                "the response body must not cross the public error boundary"
+            );
+            let request = observed
+                .recv_timeout(Duration::from_secs(5))
+                .expect("operation GET");
+            assert!(request.headers.starts_with("GET /v1/operations/"));
+            server.join().expect("loopback server");
+        }
+    }
+
+    #[test]
+    fn oversized_operation_answers_stop_before_the_signer_request_route() {
+        let campaign = campaign();
+        let valid_view = view(&campaign);
+        let mut oversized = serde_json::to_vec(&valid_view).expect("valid operation JSON");
+        assert!(oversized.len() < MAX_ANSWER_BYTES);
+        oversized.resize(MAX_ANSWER_BYTES + 1, b' ');
+        let _: SigningOperationView =
+            serde_json::from_slice(&oversized).expect("oversized body remains valid JSON");
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            oversized.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(&oversized);
+        let (origin, observed, server) = loopback_origin(vec![response]);
+        let error = origin
+            .fetch(&operation())
+            .expect_err("answer ceiling enforced");
+        assert!(
+            format!("{error:#}").contains("au-delà de la borne"),
+            "{error:#}"
+        );
+        let request = observed
+            .recv_timeout(Duration::from_secs(5))
+            .expect("operation GET");
+        assert!(request.headers.starts_with("GET /v1/operations/"));
+        assert!(
+            observed.try_recv().is_err(),
+            "no signer request after oversized view"
+        );
+        server.join().expect("loopback server");
+    }
+
     /// This channel leaves the tunnel, so TLS is what authenticates it. A
     /// plain-text origin is refused before a single token could travel on it.
     #[test]

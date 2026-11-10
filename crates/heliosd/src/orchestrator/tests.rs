@@ -1,5 +1,77 @@
 use super::*;
 use helios_firewall::FirewallCapabilities;
+use std::sync::atomic::AtomicUsize;
+
+struct ObservedPeersBackend {
+    peers: Option<Vec<PeerStatus>>,
+}
+
+#[async_trait::async_trait]
+impl WireguardBackend for ObservedPeersBackend {
+    async fn up(&self, _: &InterfaceConfig, _: &[PeerConfig]) -> helios_wireguard::Result<()> {
+        Err(WgError::Unavailable("unexpected up".into()))
+    }
+    async fn down(&self) -> helios_wireguard::Result<()> {
+        Err(WgError::Unavailable("unexpected down".into()))
+    }
+    async fn sync_peers(&self, _: &[PeerConfig]) -> helios_wireguard::Result<()> {
+        Err(WgError::Unavailable("unexpected sync".into()))
+    }
+    async fn peers(&self) -> helios_wireguard::Result<Vec<PeerStatus>> {
+        self.peers
+            .clone()
+            .ok_or_else(|| WgError::Unavailable("peer read failed".into()))
+    }
+    fn is_up(&self) -> bool {
+        true
+    }
+    fn kind(&self) -> &'static str {
+        "test"
+    }
+}
+
+#[tokio::test]
+async fn handshake_observation_distinguishes_peer_absence_from_backend_failure() {
+    async fn observe(
+        backend: &ObservedPeersBackend,
+        key: &str,
+    ) -> Result<Option<std::time::SystemTime>, String> {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        observe_peer_handshake(
+            ObserveHandshakeRequest {
+                public_key: key.into(),
+                reply,
+            },
+            backend,
+        )
+        .await;
+        response.await.expect("observation reply")
+    }
+    let mut observed = connected_peer("127.0.0.1:1234");
+    let handshake = std::time::UNIX_EPOCH + Duration::from_secs(12345);
+    observed.last_handshake = Some(handshake);
+    let backend = ObservedPeersBackend {
+        peers: Some(vec![observed.clone()]),
+    };
+    assert_eq!(
+        observe(&backend, PEER_KEY).await.expect("read"),
+        Some(handshake)
+    );
+    assert_eq!(observe(&backend, PRIVATE_KEY).await.expect("read"), None);
+    observed.last_handshake = None;
+    let without_handshake = ObservedPeersBackend {
+        peers: Some(vec![observed]),
+    };
+    assert_eq!(
+        observe(&without_handshake, PEER_KEY).await.expect("read"),
+        None
+    );
+    let failed = ObservedPeersBackend { peers: None };
+    assert!(observe(&failed, PEER_KEY)
+        .await
+        .expect_err("read failure must not be a handshake")
+        .contains("peer read failed"));
+}
 
 const PRIVATE_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 const PEER_KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
@@ -45,6 +117,88 @@ fn configured_network() -> NetworkConfig {
         }],
         ..NetworkConfig::default()
     }
+}
+
+/// Exercise the file watcher in a child process: its configuration path is a
+/// process-wide environment variable and must not affect concurrent tests.
+#[tokio::test(start_paused = true)]
+async fn network_watcher_keeps_runtime_secrets_and_refuses_invalid_changes() {
+    const CHILD: &str = "HELIOS_TEST_NETWORK_WATCHER_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let directory = tempfile::tempdir().expect("temporary configuration directory");
+        let status = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "orchestrator::tests::network_watcher_keeps_runtime_secrets_and_refuses_invalid_changes",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("HELIOS_NETWORK_CONFIG", directory.path().join("network.toml"))
+            .status()
+            .expect("isolated watcher test starts");
+        assert!(status.success(), "isolated watcher test must succeed");
+        return;
+    }
+
+    let running = configured_network();
+    running.save_redacted().expect("initial public config");
+    let path = NetworkConfig::path();
+    let initial_file = std::fs::read_to_string(&path).expect("public config");
+    assert!(!initial_file.contains(PRIVATE_KEY));
+    assert!(!initial_file.contains("psk-test"));
+    let shared = Arc::new(RwLock::new(running));
+    let (sender, mut received) = mpsc::channel(4);
+    spawn_network_config_watcher(Arc::clone(&shared), sender);
+    tokio::task::yield_now().await;
+
+    std::fs::write(&path, "invalid = [").expect("invalid config");
+    time::advance(Duration::from_secs(3)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        received.try_recv().is_err(),
+        "invalid TOML must not be applied"
+    );
+
+    let mut incompatible = shared.read().await.duplicate();
+    incompatible.wg_address_v6 = Some("fd3c:91a2:7e04::1/64".parse().expect("prefix"));
+    incompatible
+        .save_redacted()
+        .expect("config with changed prefix");
+    let loaded = NetworkConfig::load().expect("changed prefix is valid on disk");
+    assert!(loaded.check_hot_reload(&*shared.read().await).is_err());
+    time::advance(Duration::from_secs(3)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        received.try_recv().is_err(),
+        "a new tunnel prefix requires restart"
+    );
+
+    let mut updated = shared.read().await.duplicate();
+    updated.peers[0].name = "renamed workstation".into();
+    updated.save_redacted().expect("changed public config");
+    time::advance(Duration::from_secs(3)).await;
+    tokio::task::yield_now().await;
+    let command = received.try_recv().expect("reload command");
+    let OrchestratorCmd::LoadNetworkConfig(config) = command else {
+        panic!("expected a network reload");
+    };
+    assert_eq!(config.peers[0].name, "renamed workstation");
+    assert_eq!(config.wg_private_key.expose(), PRIVATE_KEY);
+    assert_eq!(
+        config.peers[0]
+            .preshared_key
+            .as_ref()
+            .expect("runtime PSK")
+            .expose(),
+        "psk-test"
+    );
+    *shared.write().await = *config;
+    time::advance(Duration::from_secs(4)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        received.try_recv().is_err(),
+        "unchanged config must not reload twice"
+    );
 }
 
 /// The poller must **not** write the state itself: it holds neither the
@@ -592,6 +746,137 @@ async fn disconnection_tears_down_wireguard_and_re_engages_the_kill_switch() {
     assert_eq!(policy.read().await.mss_clamp, None);
 }
 
+/// A failed firewall transition must not prevent an explicit disconnect from
+/// tearing down WireGuard. The command still reports the firewall failure.
+#[tokio::test]
+async fn disconnect_firewall_refusal_still_tears_down_wireguard() {
+    let network = configured_network();
+    let shared_network = Arc::new(RwLock::new(network.duplicate()));
+    let state = Arc::new(RwLock::new(TunnelState::Up));
+    let shared_policy = Arc::new(RwLock::new(network.firewall_policy()));
+    let mut current_policy = network.firewall_policy();
+    let (events, mut received) = broadcast::channel(8);
+    let (internal_tx, _internal_rx) = mpsc::channel(1);
+    let wireguard = helios_wireguard::DryRunBackend::new();
+    let (iface, peers) = wg_config(&network, &Ipv6TunnelStatus::NotConfigured);
+    wireguard
+        .up(&iface, &peers)
+        .await
+        .expect("initial interface");
+
+    let result = handle_external_cmd(
+        OrchestratorCmd::Disconnect,
+        &shared_network,
+        true,
+        &wireguard,
+        &state,
+        &events,
+        &RefusingFirewall,
+        &mut current_policy,
+        &internal_tx,
+        &shared_policy,
+        &helios_tpm::BootDecision::Disabled,
+        &Arc::new(RwLock::new(Ipv6TunnelStatus::NotConfigured)),
+    )
+    .await;
+
+    assert!(
+        result.is_err(),
+        "the refused firewall transition propagates"
+    );
+    assert_eq!(*state.read().await, TunnelState::Down);
+    assert!(
+        !wireguard.is_up(),
+        "the explicit disconnect must tear down WireGuard despite the firewall error"
+    );
+    assert_eq!(*shared_policy.read().await, network.firewall_policy());
+    let emitted: Vec<_> = std::iter::from_fn(|| received.try_recv().ok()).collect();
+    assert!(emitted.iter().any(|event| matches!(
+        event,
+        HeliosEvent::StateChanged {
+            state: TunnelState::Down
+        }
+    )));
+}
+
+#[tokio::test]
+async fn disconnect_wireguard_teardown_failure_is_reported() {
+    let network = configured_network();
+    let shared_network = Arc::new(RwLock::new(network.duplicate()));
+    let state = Arc::new(RwLock::new(TunnelState::Up));
+    let shared_policy = Arc::new(RwLock::new(network.firewall_policy()));
+    let mut current_policy = network.firewall_policy();
+    let (events, _received) = broadcast::channel(8);
+    let (internal_tx, _internal_rx) = mpsc::channel(1);
+    let wireguard = PartiallyFailingWireguard::new(true, None);
+    let (iface, peers) = wg_config(&network, &Ipv6TunnelStatus::NotConfigured);
+    wireguard
+        .up(&iface, &peers)
+        .await
+        .expect("initial interface");
+
+    let error = handle_external_cmd(
+        OrchestratorCmd::Disconnect,
+        &shared_network,
+        true,
+        &wireguard,
+        &state,
+        &events,
+        &TrackingFirewall::accepting(),
+        &mut current_policy,
+        &internal_tx,
+        &shared_policy,
+        &helios_tpm::BootDecision::Disabled,
+        &Arc::new(RwLock::new(Ipv6TunnelStatus::NotConfigured)),
+    )
+    .await
+    .expect_err("a failed interface teardown must be reported");
+
+    assert!(error.to_string().contains("WireGuard teardown refused"));
+    assert_eq!(wireguard.down_attempts(), 1);
+    assert!(wireguard.is_up());
+}
+
+#[tokio::test]
+async fn disconnect_reports_both_firewall_and_wireguard_teardown_failures() {
+    let network = configured_network();
+    let shared_network = Arc::new(RwLock::new(network.duplicate()));
+    let state = Arc::new(RwLock::new(TunnelState::Up));
+    let shared_policy = Arc::new(RwLock::new(network.firewall_policy()));
+    let mut current_policy = network.firewall_policy();
+    let (events, _received) = broadcast::channel(8);
+    let (internal_tx, _internal_rx) = mpsc::channel(1);
+    let wireguard = PartiallyFailingWireguard::new(true, None);
+    let (iface, peers) = wg_config(&network, &Ipv6TunnelStatus::NotConfigured);
+    wireguard
+        .up(&iface, &peers)
+        .await
+        .expect("initial interface");
+
+    let error = handle_external_cmd(
+        OrchestratorCmd::Disconnect,
+        &shared_network,
+        true,
+        &wireguard,
+        &state,
+        &events,
+        &TrackingFirewall::refuses_down(),
+        &mut current_policy,
+        &internal_tx,
+        &shared_policy,
+        &helios_tpm::BootDecision::Disabled,
+        &Arc::new(RwLock::new(Ipv6TunnelStatus::NotConfigured)),
+    )
+    .await
+    .expect_err("both cleanup failures must be reported");
+
+    let message = format!("{error:#}");
+    assert!(message.contains("firewall down refused"), "{message}");
+    assert!(message.contains("WireGuard teardown refused"), "{message}");
+    assert_eq!(wireguard.down_attempts(), 1);
+    assert!(wireguard.is_up());
+}
+
 /// Hands `incoming` to the orchestrator as a reload, the way the API and the
 /// `network.toml` watcher both do, and returns the events it emitted.
 async fn reload(
@@ -629,6 +914,254 @@ async fn reload(
         emitted.push(event);
     }
     emitted
+}
+
+/// Exercise a reload while the data plane is already up. The regular `reload`
+/// helper deliberately uses a down interface, so it does not reach the live
+/// peer synchronization branch.
+async fn reload_on_live_tunnel(
+    shared_network: &Arc<RwLock<NetworkConfig>>,
+    incoming: NetworkConfig,
+    wireguard: &dyn WireguardBackend,
+    firewall: &dyn FirewallBackend,
+) -> (
+    anyhow::Result<()>,
+    Vec<HeliosEvent>,
+    FirewallPolicy,
+    Arc<RwLock<TunnelState>>,
+    Arc<RwLock<FirewallPolicy>>,
+) {
+    let running = shared_network.read().await.duplicate();
+    let state = Arc::new(RwLock::new(TunnelState::Up));
+    let shared_policy = Arc::new(RwLock::new(running.firewall_policy()));
+    let mut current_policy = running.firewall_policy();
+    let (events, mut received) = broadcast::channel(8);
+    let (internal_tx, _internal_rx) = mpsc::channel(1);
+
+    let result = handle_external_cmd(
+        OrchestratorCmd::LoadNetworkConfig(Box::new(incoming)),
+        shared_network,
+        true,
+        wireguard,
+        &state,
+        &events,
+        firewall,
+        &mut current_policy,
+        &internal_tx,
+        &shared_policy,
+        &helios_tpm::BootDecision::Disabled,
+        &Arc::new(RwLock::new(Ipv6TunnelStatus::NotConfigured)),
+    )
+    .await;
+    let mut emitted = Vec::new();
+    while let Ok(event) = received.try_recv() {
+        emitted.push(event);
+    }
+    (result, emitted, current_policy, state, shared_policy)
+}
+
+fn two_peer_test_network() -> NetworkConfig {
+    let mut network = configured_network();
+    network.peers.push(aether::WgPeer {
+        name: "second workstation".into(),
+        public_key: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [2u8; 32]),
+        address: "100.64.1.3/32".into(),
+        address_v6: None,
+        admin: false,
+        preshared_key: Some(aether::SecretString::new("second-psk")),
+        key_negotiation_certificate_sha256: None,
+        key_negotiation_pq_certificate_sha256: None,
+        minimum_key_negotiation_mode: None,
+        persistent_keepalive_secs: aether::config::DEFAULT_PERSISTENT_KEEPALIVE_SECS,
+    });
+    network
+}
+
+fn duplicate_peer_config_for_test(peer: &PeerConfig) -> PeerConfig {
+    PeerConfig {
+        public_key: peer.public_key.clone(),
+        allowed_ips: peer.allowed_ips.clone(),
+        preshared_key: peer
+            .preshared_key
+            .as_ref()
+            .map(|key| Zeroizing::new(key.to_string())),
+        persistent_keepalive_secs: peer.persistent_keepalive_secs,
+    }
+}
+
+/// A live reload synchronizes the actual peer table after the policy and
+/// configuration have been accepted.
+#[tokio::test]
+async fn an_accepted_live_reload_synchronizes_wireguard_peers() {
+    let running = configured_network();
+    let shared_network = Arc::new(RwLock::new(running.duplicate()));
+    let wireguard = helios_wireguard::DryRunBackend::new();
+    let (iface, peers) = wg_config(&running, &Ipv6TunnelStatus::NotConfigured);
+    wireguard
+        .up(&iface, &peers)
+        .await
+        .expect("initial interface");
+
+    let mut incoming = running.duplicate();
+    let added_key = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [2u8; 32]);
+    let added = aether::WgPeer {
+        name: "second workstation".into(),
+        public_key: added_key.clone(),
+        address: "100.64.1.3/32".into(),
+        address_v6: None,
+        admin: false,
+        preshared_key: None,
+        key_negotiation_certificate_sha256: None,
+        key_negotiation_pq_certificate_sha256: None,
+        minimum_key_negotiation_mode: None,
+        persistent_keepalive_secs: aether::config::DEFAULT_PERSISTENT_KEEPALIVE_SECS,
+    };
+    incoming.peers.push(added);
+
+    let (result, events, _, _, _) =
+        reload_on_live_tunnel(&shared_network, incoming, &wireguard, &DryRunBackend).await;
+
+    result.expect("the compatible reload applies");
+    assert_eq!(shared_network.read().await.peers.len(), 2);
+    let installed = wireguard.peers().await.expect("read live peers");
+    assert_eq!(installed.len(), 2);
+    assert!(installed.iter().any(|peer| peer.public_key
+        == base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &added_key,)
+            .expect("added public key")));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        HeliosEvent::Log { level, message }
+            if level == "info" && message == "Network configuration applied"
+    )));
+}
+
+/// A failed, partially mutating peer synchronization must keep the running
+/// configuration and secrets, apply the fail-closed firewall state, and tear
+/// down the interface before returning the error.
+#[tokio::test]
+async fn failed_live_reload_sync_preserves_config_and_closes_the_data_plane() {
+    let running = two_peer_test_network();
+    let shared_network = Arc::new(RwLock::new(running.duplicate()));
+    let (iface, peers) = wg_config(&running, &Ipv6TunnelStatus::NotConfigured);
+    let revoked_key = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, PEER_KEY)
+        .expect("revoked fixture key");
+    let wireguard =
+        PartiallyFailingWireguard::new(false, Some(duplicate_peer_config_for_test(&peers[0])));
+    wireguard
+        .up(&iface, &peers)
+        .await
+        .expect("initial interface");
+    let mut incoming = running.duplicate();
+    incoming.peers.remove(0);
+    incoming.peers[0].address = "100.64.1.4/32".into();
+    let firewall = TrackingFirewall::accepting();
+
+    let (result, events, policy, state, shared_policy) =
+        reload_on_live_tunnel(&shared_network, incoming, &wireguard, &firewall).await;
+
+    let error = result.expect_err("a failed synchronization is reported");
+    assert!(error.to_string().contains("partial peer synchronization"));
+    assert_eq!(
+        *shared_network.read().await,
+        running,
+        "retain secrets/config"
+    );
+    assert_eq!(
+        shared_network.read().await.peers[0]
+            .preshared_key
+            .as_ref()
+            .map(aether::SecretString::expose),
+        Some("psk-test"),
+        "the revoked peer's PSK remains in the retained running configuration"
+    );
+    assert_eq!(policy, running.firewall_policy());
+    assert_eq!(*shared_policy.read().await, running.firewall_policy());
+    assert_eq!(*state.read().await, TunnelState::Down);
+    assert!(
+        !wireguard.is_up(),
+        "the interface is closed after sync failure"
+    );
+    let closed_peers = wireguard.peers().await.expect("closed peer table");
+    assert!(closed_peers.is_empty());
+    assert!(!closed_peers
+        .iter()
+        .any(|peer| peer.public_key == revoked_key));
+    assert_eq!(
+        firewall.applied_states(),
+        [TunnelState::Up, TunnelState::Down]
+    );
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        HeliosEvent::Log { message, .. } if message == "Network configuration applied"
+    )));
+}
+
+/// If both cleanup backends fail after partial peer mutation, surface all
+/// failures and preserve the old configuration rather than claiming success.
+#[tokio::test]
+async fn failed_live_reload_reports_firewall_and_wireguard_teardown_errors() {
+    let running = two_peer_test_network();
+    let shared_network = Arc::new(RwLock::new(running.duplicate()));
+    let (iface, peers) = wg_config(&running, &Ipv6TunnelStatus::NotConfigured);
+    let revoked_key = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, PEER_KEY)
+        .expect("revoked fixture key");
+    let wireguard =
+        PartiallyFailingWireguard::new(true, Some(duplicate_peer_config_for_test(&peers[0])));
+    wireguard
+        .up(&iface, &peers)
+        .await
+        .expect("initial interface");
+    let mut incoming = running.duplicate();
+    incoming.peers.remove(0);
+    incoming.peers[0].address = "100.64.1.4/32".into();
+    let firewall = TrackingFirewall::refuses_down();
+
+    let (result, events, policy, state, shared_policy) =
+        reload_on_live_tunnel(&shared_network, incoming, &wireguard, &firewall).await;
+
+    let error = result.expect_err("cleanup failures are returned");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("partial peer synchronization"),
+        "{message}"
+    );
+    assert!(message.contains("firewall down refused"), "{message}");
+    assert!(message.contains("WireGuard teardown refused"), "{message}");
+    assert_eq!(
+        *shared_network.read().await,
+        running,
+        "retain secrets/config"
+    );
+    assert_eq!(
+        shared_network.read().await.peers[0]
+            .preshared_key
+            .as_ref()
+            .map(aether::SecretString::expose),
+        Some("psk-test")
+    );
+    assert_eq!(policy, running.firewall_policy());
+    assert_eq!(*shared_policy.read().await, running.firewall_policy());
+    assert_eq!(*state.read().await, TunnelState::Down);
+    assert_eq!(wireguard.down_attempts(), 1, "teardown was attempted");
+    assert!(
+        wireguard.is_up(),
+        "the fake refuses to remove the interface"
+    );
+    let installed = wireguard.peers().await.expect("partially changed peers");
+    assert_eq!(installed.len(), 2);
+    let retained_key = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [2u8; 32]),
+    )
+    .expect("retained peer key");
+    assert!(installed.iter().any(|peer| peer.public_key == revoked_key));
+    assert!(installed
+        .iter()
+        .any(|peer| { peer.public_key == retained_key && peer.allowed_ips == ["100.64.1.4/32"] }));
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        HeliosEvent::Log { message, .. } if message == "Network configuration applied"
+    )));
 }
 
 fn dual_stack_network() -> NetworkConfig {
@@ -695,6 +1228,123 @@ impl FirewallBackend for RefusingFirewall {
 
     async fn teardown(&self) -> aether::Result<()> {
         Ok(())
+    }
+}
+
+struct TrackingFirewall {
+    applied: std::sync::Mutex<Vec<TunnelState>>,
+    refuse_down: bool,
+}
+
+impl TrackingFirewall {
+    fn accepting() -> Self {
+        Self {
+            applied: std::sync::Mutex::new(Vec::new()),
+            refuse_down: false,
+        }
+    }
+
+    fn refuses_down() -> Self {
+        Self {
+            applied: std::sync::Mutex::new(Vec::new()),
+            refuse_down: true,
+        }
+    }
+
+    fn applied_states(&self) -> Vec<TunnelState> {
+        self.applied
+            .lock()
+            .expect("recorded firewall states")
+            .clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl FirewallBackend for TrackingFirewall {
+    fn capabilities(&self) -> FirewallCapabilities {
+        FirewallCapabilities::default()
+    }
+
+    async fn apply(&self, _policy: &FirewallPolicy, state: TunnelState) -> aether::Result<()> {
+        self.applied
+            .lock()
+            .expect("record firewall state")
+            .push(state);
+        if self.refuse_down && state == TunnelState::Down {
+            return Err(aether::HeliosError::Firewall(
+                "firewall down refused".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn teardown(&self) -> aether::Result<()> {
+        Ok(())
+    }
+}
+
+struct PartiallyFailingWireguard {
+    inner: helios_wireguard::DryRunBackend,
+    fail_down: bool,
+    retained_peer: std::sync::Mutex<Option<PeerConfig>>,
+    down_attempts: AtomicUsize,
+}
+
+impl PartiallyFailingWireguard {
+    fn new(fail_down: bool, retained_peer: Option<PeerConfig>) -> Self {
+        Self {
+            inner: helios_wireguard::DryRunBackend::new(),
+            fail_down,
+            retained_peer: std::sync::Mutex::new(retained_peer),
+            down_attempts: AtomicUsize::new(0),
+        }
+    }
+
+    fn down_attempts(&self) -> usize {
+        self.down_attempts.load(Ordering::Relaxed)
+    }
+}
+
+#[async_trait::async_trait]
+impl WireguardBackend for PartiallyFailingWireguard {
+    async fn up(
+        &self,
+        config: &InterfaceConfig,
+        peers: &[PeerConfig],
+    ) -> helios_wireguard::Result<()> {
+        self.inner.up(config, peers).await
+    }
+
+    async fn down(&self) -> helios_wireguard::Result<()> {
+        self.down_attempts.fetch_add(1, Ordering::Relaxed);
+        if self.fail_down {
+            return Err(WgError::Unavailable("WireGuard teardown refused".into()));
+        }
+        self.inner.down().await
+    }
+
+    async fn sync_peers(&self, peers: &[PeerConfig]) -> helios_wireguard::Result<()> {
+        let mut partially_applied: Vec<_> =
+            peers.iter().map(duplicate_peer_config_for_test).collect();
+        if let Some(stale_peer) = self.retained_peer.lock().expect("stale test peer").take() {
+            partially_applied.push(stale_peer);
+        }
+        self.inner.sync_peers(&partially_applied).await?;
+        Err(WgError::Unavailable(
+            "partial peer synchronization refused".into(),
+        ))
+    }
+
+    async fn peers(&self) -> helios_wireguard::Result<Vec<PeerStatus>> {
+        self.inner.peers().await
+    }
+
+    fn is_up(&self) -> bool {
+        self.inner.is_up()
+    }
+
+    fn kind(&self) -> &'static str {
+        "partial-failure-test"
     }
 }
 
@@ -1515,4 +2165,43 @@ async fn an_uplink_refresh_on_the_external_channel_is_ignored() {
     result.expect("the loop must continue");
     assert_eq!(*shared_network.read().await, configured_network());
     assert_eq!(policy, running);
+}
+
+/// The handshake poller is the only source allowed to promote the state; an
+/// API-originated copy of the internal command cannot change it.
+#[tokio::test]
+async fn an_inferred_tunnel_state_on_the_external_channel_is_ignored() {
+    let network = configured_network();
+    let shared_network = Arc::new(RwLock::new(network.duplicate()));
+    let state = Arc::new(RwLock::new(TunnelState::Connecting));
+    let running = network.firewall_policy();
+    let mut policy = running.clone();
+    let shared_policy = Arc::new(RwLock::new(running.clone()));
+    let (events, mut received) = broadcast::channel(8);
+    let (internal_tx, _internal_rx) = mpsc::channel(1);
+
+    handle_external_cmd(
+        OrchestratorCmd::TunnelStateInferred(TunnelState::Up),
+        &shared_network,
+        true,
+        &helios_wireguard::DryRunBackend::new(),
+        &state,
+        &events,
+        &DryRunBackend,
+        &mut policy,
+        &internal_tx,
+        &shared_policy,
+        &helios_tpm::BootDecision::Disabled,
+        &Arc::new(RwLock::new(Ipv6TunnelStatus::NotConfigured)),
+    )
+    .await
+    .expect("an untrusted internal command is ignored");
+
+    assert_eq!(*state.read().await, TunnelState::Connecting);
+    assert_eq!(policy, running);
+    assert_eq!(*shared_policy.read().await, running);
+    assert!(
+        received.try_recv().is_err(),
+        "the ignored internal command emits no state event"
+    );
 }

@@ -317,3 +317,455 @@ async fn a_client_refuses_a_wrong_pin_and_an_unrelated_alpn() {
         );
     }
 }
+
+#[tokio::test]
+async fn an_oversized_operator_open_is_refused_before_connecting() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("loopback listener");
+    let gateway = disposable(INTERNAL_SERVER_NAME, PinnedRole::Server);
+    let astra = disposable("astra.internal", PinnedRole::Client);
+    let tls = client_config(&astra.identity, &gateway.certificate).expect("client TLS");
+    let client = AstraLifecycleClient::new(listener.local_addr().expect("address"), tls);
+    let request = RelayedOperatorOpen {
+        operator: OperatorIdentity::DevLoopback,
+        request: OperatorOpenRequest {
+            action: OperatorOpenAction::TrustAuthorities,
+            reason: "x".repeat(MAX_OPERATOR_RELAY_BODY_BYTES + 1),
+            requested_by: "operator".to_owned(),
+            window_secs: 300,
+        },
+    };
+    assert!(matches!(
+        within_deadline(client.operator_open(&request)).await,
+        Err(ChannelError::Body(_))
+    ));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+            .await
+            .is_err(),
+        "an invalid relay must not reach Astra"
+    );
+}
+
+fn client_renewal_view() -> ClientRenewalOperationView {
+    ClientRenewalOperationView {
+        operation_id: Id16::new([7; 16]).expect("operation id"),
+        state: ClientRenewalOperationState::AwaitingOperator,
+        client_wg_public_key: WireGuardKey::from_bytes([9; 32]),
+        request_fingerprint: Fingerprint::of(b"rotation request"),
+        operation_manifest_fingerprint: Fingerprint::of(b"approval manifest"),
+        created_at: 10,
+        expires_at: 20,
+        signer_request_token: Some("read-token".into()),
+        signer_result_token: Some("write-token".into()),
+        grant: None,
+    }
+}
+
+fn rotation_request() -> aether::certificates::client::ClientCertificateRotationRequest {
+    use aether::certificates::{
+        client::ClientCertificateRotationRequest,
+        encoding::{DerCertificate, MlDsa87PublicKey, MlDsa87Signature},
+        CERTIFICATE_FORMAT_VERSION, CERTIFICATE_PROTOCOL_VERSION,
+    };
+    ClientCertificateRotationRequest {
+        format_version: CERTIFICATE_FORMAT_VERSION,
+        protocol_version: CERTIFICATE_PROTOCOL_VERSION,
+        request_id: Id16::new([1; 16]).expect("request id"),
+        trust_domain_id: Id16::new([2; 16]).expect("trust domain"),
+        gateway_wg_public_key: WireGuardKey::from_bytes([3; 32]),
+        server_name: "gateway.example".into(),
+        client_wg_public_key: WireGuardKey::from_bytes([9; 32]),
+        active_generation: 4,
+        requested_generation: 5,
+        active_tls_certificate_fingerprint: Fingerprint::of(b"active tls"),
+        active_pq_certificate_fingerprint: Fingerprint::of(b"active pq"),
+        // The authority owns CSR/proof validation. These values exercise only
+        // the gateway client's typed serialization and response decoding.
+        tls_csr: DerCertificate::new(vec![1]).expect("bounded CSR wrapper"),
+        new_ml_dsa_87_public_key: MlDsa87PublicKey::new(vec![22; 2592])
+            .expect("test public key encoding"),
+        created_at: 10,
+        expires_at: 20,
+        active_pq_signature: MlDsa87Signature::placeholder(),
+        new_pq_signature: MlDsa87Signature::placeholder(),
+    }
+}
+
+fn captured_parts(request: &[u8]) -> (&str, &str) {
+    let text = std::str::from_utf8(request).expect("HTTP request text");
+    let (headers, body) = text.split_once("\r\n\r\n").expect("HTTP body separator");
+    (headers, body)
+}
+
+#[tokio::test]
+async fn authority_rotation_request_uses_the_private_route_and_decodes_the_typed_answer() {
+    let expected_view = client_renewal_view();
+    let response = serde_json::to_vec(&expected_view).expect("operation view");
+    let server = response_server(fixed_response(200, &response)).await;
+    let client = AstraLifecycleClient::new(server.address, server.client_tls);
+    let relayed = RelayedRotationRequest {
+        caller_wg_public_key: WireGuardKey::from_bytes([9; 32]),
+        request: Box::new(rotation_request()),
+    };
+
+    let actual = within_deadline(client.request_rotation(&relayed))
+        .await
+        .expect("typed operation answer");
+    assert_eq!(actual.operation_id, expected_view.operation_id);
+    assert_eq!(actual.state, ClientRenewalOperationState::AwaitingOperator);
+    let request = finish(server.request).await;
+    let (headers, body) = captured_parts(&request);
+    assert!(headers.starts_with(format!("POST {ROTATION_REQUEST_PATH} HTTP/1.1\r\n").as_str()));
+    assert!(headers
+        .lines()
+        .any(|line| line.eq_ignore_ascii_case(&format!("host: {ASTRA_INTERNAL_SERVER_NAME}"))));
+    assert!(!headers
+        .lines()
+        .any(|line| line.to_ascii_lowercase().starts_with("authorization:")));
+    let decoded: RelayedRotationRequest = serde_json::from_str(body).expect("relayed request");
+    assert_eq!(decoded.caller_wg_public_key, relayed.caller_wg_public_key);
+    assert_eq!(*decoded.request, *relayed.request);
+}
+
+#[tokio::test]
+async fn authority_operation_query_uses_its_collection_and_caller_body() {
+    let response = serde_json::to_vec(&client_renewal_view()).expect("operation view");
+    let server = response_server(fixed_response(200, &response)).await;
+    let client = AstraLifecycleClient::new(server.address, server.client_tls);
+    let operation = Id16::new([7; 16]).expect("operation id");
+    let caller = WireGuardKey::from_bytes([9; 32]);
+    let actual = within_deadline(client.operation(
+        &operation,
+        &RelayedOperationQuery {
+            caller_wg_public_key: caller,
+        },
+    ))
+    .await
+    .expect("typed operation answer");
+    assert_eq!(actual.operation_id, operation);
+    let request = finish(server.request).await;
+    let (headers, body) = captured_parts(&request);
+    assert!(headers.starts_with(
+        format!(
+            "POST {} HTTP/1.1\r\n",
+            operation_path("operations", &operation)
+        )
+        .as_str()
+    ));
+    let decoded: RelayedOperationQuery = serde_json::from_str(body).expect("caller query");
+    assert_eq!(decoded.caller_wg_public_key, caller);
+    assert!(!headers
+        .lines()
+        .any(|line| line.to_ascii_lowercase().starts_with("authorization:")));
+}
+
+#[tokio::test]
+async fn renewal_signer_request_keeps_its_capability_in_the_header_only() {
+    let server = response_server(fixed_response(200, b"{}")).await;
+    let client = AstraLifecycleClient::new(server.address, server.client_tls);
+    let operation = Id16::new([7; 16]).expect("operation id");
+    let result = within_deadline(client.signer_request(
+        &operation,
+        "renewal-capability-secret",
+        &RelayedOperationQuery {
+            caller_wg_public_key: WireGuardKey::from_bytes([9; 32]),
+        },
+    ))
+    .await;
+    assert!(matches!(result, Err(ChannelError::Body(_))));
+    let request = finish(server.request).await;
+    let (headers, body) = captured_parts(&request);
+    assert!(headers.starts_with(
+        format!(
+            "POST {} HTTP/1.1\r\n",
+            operation_path("signer-requests", &operation)
+        )
+        .as_str()
+    ));
+    assert!(headers
+        .lines()
+        .any(|line| line.eq_ignore_ascii_case("authorization: bearer renewal-capability-secret")));
+    assert!(!headers
+        .lines()
+        .next()
+        .unwrap()
+        .contains("renewal-capability-secret"));
+    assert!(!body.contains("renewal-capability-secret"));
+    assert_eq!(
+        serde_json::from_str::<RelayedOperationQuery>(body)
+            .expect("caller query")
+            .caller_wg_public_key,
+        WireGuardKey::from_bytes([9; 32])
+    );
+}
+
+#[tokio::test]
+async fn operator_pending_and_open_use_operator_paths_without_capabilities() {
+    let pending_server = response_server(fixed_response(200, br#"{"operations":[]}"#)).await;
+    let client = AstraLifecycleClient::new(pending_server.address, pending_server.client_tls);
+    let relayed = RelayedOperatorCampaign {
+        operator: OperatorIdentity::DevLoopback,
+    };
+    let pending = within_deadline(client.operator_pending(&relayed))
+        .await
+        .expect("empty pending list");
+    assert!(pending.operations.is_empty());
+    let request = finish(pending_server.request).await;
+    let (headers, body) = captured_parts(&request);
+    assert!(headers.starts_with(format!("POST {OPERATOR_PENDING_ROUTE} HTTP/1.1\r\n").as_str()));
+    assert_eq!(
+        serde_json::from_str::<RelayedOperatorCampaign>(body)
+            .unwrap()
+            .operator,
+        relayed.operator
+    );
+    assert!(!headers
+        .lines()
+        .any(|line| line.to_ascii_lowercase().starts_with("authorization:")));
+
+    let opened = OperatorOpened {
+        operation_id: Id16::new([7; 16]).expect("operation id"),
+        campaign_id: Id16::new([8; 16]).expect("campaign id"),
+        campaign_fingerprint: Fingerprint::of(b"campaign"),
+        scope: aether::certificates::status::CampaignScope::TrustAuthorities,
+        target_count: 1,
+        required_credentials: 1,
+        expires_at: 30,
+        revocation_expiries: None,
+        delegation_request: None,
+    };
+    let open_server = response_server(fixed_response(
+        200,
+        &serde_json::to_vec(&opened).expect("opened campaign"),
+    ))
+    .await;
+    let client = AstraLifecycleClient::new(open_server.address, open_server.client_tls);
+    let request_value = RelayedOperatorOpen {
+        operator: OperatorIdentity::DevLoopback,
+        request: OperatorOpenRequest {
+            action: OperatorOpenAction::TrustAuthorities,
+            reason: "rotation".into(),
+            requested_by: "operator".into(),
+            window_secs: 300,
+        },
+    };
+    let actual = within_deadline(client.operator_open(&request_value))
+        .await
+        .expect("opened campaign");
+    assert_eq!(actual, opened);
+    let request = finish(open_server.request).await;
+    let (headers, body) = captured_parts(&request);
+    assert!(headers.starts_with(format!("POST {OPERATOR_OPEN_ROUTE} HTTP/1.1\r\n").as_str()));
+    assert_eq!(
+        serde_json::from_str::<RelayedOperatorOpen>(body)
+            .unwrap()
+            .request,
+        request_value.request
+    );
+    assert!(!headers
+        .lines()
+        .any(|line| line.to_ascii_lowercase().starts_with("authorization:")));
+}
+
+fn operator_view() -> SigningOperationView {
+    SigningOperationView {
+        operation_id: Id16::new([7; 16]).expect("operation id"),
+        state: SigningOperationState::AwaitingOperator,
+        scope: aether::certificates::status::CampaignScope::TrustAuthorities,
+        target_count: 1,
+        required_credentials: 1,
+        campaign_fingerprint: Fingerprint::of(b"campaign"),
+        created_at: 10,
+        expires_at: 30,
+        signer_request_token: Some("read-token".into()),
+        vault_token: None,
+        signer_result_token: Some("write-token".into()),
+    }
+}
+
+#[tokio::test]
+async fn operator_operation_uses_campaign_prefix_and_decodes_typed_view() {
+    let expected = operator_view();
+    let server = response_server(fixed_response(
+        200,
+        &serde_json::to_vec(&expected).expect("campaign view"),
+    ))
+    .await;
+    let client = AstraLifecycleClient::new(server.address, server.client_tls);
+    let operation = Id16::new([7; 16]).expect("operation id");
+    let relayed = RelayedOperatorCampaign {
+        operator: OperatorIdentity::DevLoopback,
+    };
+    let actual = within_deadline(client.operator_operation(&operation, &relayed))
+        .await
+        .expect("campaign view");
+    assert_eq!(actual.operation_id, operation);
+    let request = finish(server.request).await;
+    let (headers, body) = captured_parts(&request);
+    let expected_path = operator_path("operations", &operation.to_string());
+    assert!(headers.starts_with(format!("POST {expected_path} HTTP/1.1\r\n").as_str()));
+    assert!(expected_path.starts_with(ASTRA_OPERATOR_PREFIX));
+    assert!(!expected_path.starts_with(ASTRA_INTERNAL_PREFIX));
+    assert_eq!(
+        serde_json::from_str::<RelayedOperatorCampaign>(body)
+            .unwrap()
+            .operator,
+        relayed.operator
+    );
+    assert!(!headers
+        .lines()
+        .any(|line| line.to_ascii_lowercase().starts_with("authorization:")));
+}
+
+#[tokio::test]
+async fn operator_signer_request_keeps_capability_out_of_url_and_reports_bad_answer_json() {
+    let server = response_server(fixed_response(200, b"not-json")).await;
+    let client = AstraLifecycleClient::new(server.address, server.client_tls);
+    let operation = Id16::new([7; 16]).expect("operation id");
+    let relayed = RelayedOperatorCampaign {
+        operator: OperatorIdentity::DevLoopback,
+    };
+    assert!(matches!(
+        within_deadline(client.operator_signer_request(
+            &operation,
+            "campaign-capability-secret",
+            &relayed,
+        ))
+        .await,
+        Err(ChannelError::Body(_))
+    ));
+    let request = finish(server.request).await;
+    let (headers, body) = captured_parts(&request);
+    assert!(headers.starts_with(
+        format!(
+            "POST {} HTTP/1.1\r\n",
+            operator_path("signer-requests", &operation.to_string())
+        )
+        .as_str()
+    ));
+    assert!(headers
+        .lines()
+        .any(|line| line.eq_ignore_ascii_case("authorization: bearer campaign-capability-secret")));
+    assert!(!headers
+        .lines()
+        .next()
+        .unwrap()
+        .contains("campaign-capability-secret"));
+    assert!(!body.contains("campaign-capability-secret"));
+}
+
+#[tokio::test]
+async fn operator_signer_result_sends_the_entire_typed_deposit_with_header_capability() {
+    use aether::certificates::status::{AstraSignerResult, CampaignApproval};
+    let view = operator_view();
+    let server = response_server(fixed_response(200, &serde_json::to_vec(&view).unwrap())).await;
+    let client = AstraLifecycleClient::new(server.address, server.client_tls);
+    let operation = Id16::new([7; 16]).unwrap();
+    let result = RelayedOperatorSignerResult {
+        operator: OperatorIdentity::DevLoopback,
+        result: Box::new(AstraSignerResult {
+            format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+            approval: Box::new(CampaignApproval {
+                campaign_id: Id16::new([8; 16]).unwrap(),
+                campaign_fingerprint: Fingerprint::of(b"campaign"),
+                required_credentials: 1,
+                approved_at: 10,
+                approvals: vec![],
+            }),
+            objects: vec![],
+            credential_registry: None,
+            issuer_authorization: None,
+        }),
+    };
+    let answer =
+        within_deadline(client.operator_signer_result(&operation, "deposit-secret", &result))
+            .await
+            .expect("typed response");
+    assert_eq!(answer.operation_id, operation);
+    let captured = finish(server.request).await;
+    let (headers, body) = captured_parts(&captured);
+    assert!(headers.starts_with(&format!(
+        "POST {} HTTP/1.1\r\n",
+        operator_path("signer-results", &operation.to_string())
+    )));
+    assert!(headers
+        .lines()
+        .any(|line| line.eq_ignore_ascii_case("authorization: bearer deposit-secret")));
+    assert!(!headers.lines().next().unwrap().contains("deposit-secret"));
+    assert!(!body.contains("deposit-secret"));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(body).unwrap(),
+        serde_json::to_value(&result).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn renewal_signer_result_sends_the_approval_for_the_resolved_peer() {
+    use aether::certificates::{
+        approval::{AstraCredentialBinding, AstraRenewalApproval, CredentialState},
+        encoding::MlDsa87Signature,
+        webauthn::WebAuthnAssertion,
+        CERTIFICATE_FORMAT_VERSION,
+    };
+    let view = client_renewal_view();
+    let server = response_server(fixed_response(200, &serde_json::to_vec(&view).unwrap())).await;
+    let client = AstraLifecycleClient::new(server.address, server.client_tls);
+    let operation = Id16::new([7; 16]).unwrap();
+    let peer = WireGuardKey::from_bytes([9; 32]);
+    let fingerprint = Fingerprint::of(b"fixture");
+    let result = ClientRenewalSignerResult {
+        caller_wg_public_key: peer,
+        approval: Box::new(AstraRenewalApproval {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            operation_id: operation,
+            request_fingerprint: fingerprint,
+            approval_request_fingerprint: fingerprint,
+            credential_binding: AstraCredentialBinding {
+                format_version: CERTIFICATE_FORMAT_VERSION,
+                credential_id: vec![1],
+                credential_public_key: vec![2],
+                aaguid: [0; 16],
+                trust_domain_id: Id16::new([3; 16]).unwrap(),
+                gateway_wg_public_key: WireGuardKey::from_bytes([4; 32]),
+                state: CredentialState::Active,
+                credential_epoch: 1,
+                credential_registry_epoch: 1,
+                ca_epoch: 1,
+                created_at: 10,
+                ca_pq_signature: MlDsa87Signature::placeholder(),
+            },
+            credential_fingerprint: fingerprint,
+            assertion_fingerprint: fingerprint,
+            webauthn_assertion: WebAuthnAssertion {
+                authenticator_data: vec![1],
+                client_data_json: vec![2],
+                signature: vec![3],
+            },
+            approved_at: 10,
+            expires_at: 20,
+            astra_service_key_epoch: 1,
+            astra_signature: MlDsa87Signature::placeholder(),
+        }),
+    };
+    let answer = within_deadline(client.signer_result(&operation, "renewal-secret", &result))
+        .await
+        .expect("typed response");
+    assert_eq!(answer.operation_id, operation);
+    let captured = finish(server.request).await;
+    let (headers, body) = captured_parts(&captured);
+    assert!(headers.starts_with(&format!(
+        "POST {} HTTP/1.1\r\n",
+        operation_path("signer-results", &operation)
+    )));
+    assert!(headers
+        .lines()
+        .any(|line| line.eq_ignore_ascii_case("authorization: bearer renewal-secret")));
+    assert!(!headers.lines().next().unwrap().contains("renewal-secret"));
+    assert!(!body.contains("renewal-secret"));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(body).unwrap(),
+        serde_json::to_value(&result).unwrap()
+    );
+}

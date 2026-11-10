@@ -20,9 +20,37 @@ use defguard_wireguard_rs::{
     key::Key, net::IpAddrMask, peer::Peer, InterfaceConfiguration, Kernel, WGApi,
     WireguardInterfaceApi,
 };
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::{InterfaceConfig, PeerConfig, PeerStatus, Result, WgError, WireguardBackend};
+
+/// Removes every peer outside the requested set and reports any failed
+/// revocation. Continue after an individual error so one failure does not
+/// prevent the other stale peers from being removed; the caller must not
+/// proceed as though synchronization succeeded.
+fn remove_revoked_peers<K, E>(
+    existing: impl IntoIterator<Item = K>,
+    is_wanted: impl Fn(&K) -> bool,
+    mut remove: impl FnMut(&K) -> std::result::Result<(), E>,
+) -> std::result::Result<(), String>
+where
+    E: std::fmt::Display,
+{
+    let mut failures = Vec::new();
+    for peer in existing {
+        if !is_wanted(&peer) {
+            if let Err(error) = remove(&peer) {
+                failures.push(error.to_string());
+            }
+        }
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
+}
 
 pub struct KernelBackend {
     ifname: String,
@@ -187,14 +215,12 @@ impl WireguardBackend for KernelBackend {
         let host = api.read_interface_data().map_err(|e| self.iface_err(e))?;
 
         // Removes peers that are no longer admitted (revocation).
-        for existing in host.peers.keys() {
-            if !wanted.iter().any(|p| &p.public_key == existing) {
-                match api.remove_peer(existing) {
-                    Ok(()) => info!("revoked peer removed from {}", self.ifname),
-                    Err(e) => warn!("could not remove a revoked peer: {e}"),
-                }
-            }
-        }
+        remove_revoked_peers(
+            host.peers.keys(),
+            |existing| wanted.iter().any(|peer| &peer.public_key == *existing),
+            |existing| api.remove_peer(existing),
+        )
+        .map_err(|error| self.iface_err(format!("could not remove revoked peer(s): {error}")))?;
 
         // Adds or updates admitted peers (`configure_peer` does both).
         for peer in &wanted {
@@ -242,6 +268,46 @@ mod tests {
     use zeroize::Zeroizing;
 
     const KEY_B: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+
+    #[test]
+    fn failed_revocation_is_reported_after_all_stale_peers_are_attempted() {
+        let existing = ["admitted", "revoked-one", "revoked-two"];
+        let mut attempted = Vec::new();
+
+        let result = remove_revoked_peers(
+            existing,
+            |peer| *peer == "admitted",
+            |peer| {
+                attempted.push(*peer);
+                if *peer == "revoked-one" {
+                    Err("injected remove failure")
+                } else {
+                    Ok(())
+                }
+            },
+        );
+
+        assert_eq!(attempted, ["revoked-one", "revoked-two"]);
+        assert!(matches!(result, Err(message) if message.contains("injected remove failure")));
+    }
+
+    #[test]
+    fn successful_revocation_skips_peers_in_the_requested_set() {
+        let existing = ["admitted", "revoked"];
+        let mut removed = Vec::new();
+
+        remove_revoked_peers(
+            existing,
+            |peer| *peer == "admitted",
+            |peer| {
+                removed.push(*peer);
+                Ok::<_, &'static str>(())
+            },
+        )
+        .expect("all revoked peers removed");
+
+        assert_eq!(removed, ["revoked"]);
+    }
 
     /// Pure conversion: testable without a data plane.
     #[test]

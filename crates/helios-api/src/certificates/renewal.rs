@@ -196,3 +196,7 @@ fn renewal_unavailable(caller_key: &str, route: &str) -> Response {
     );
     StatusCode::SERVICE_UNAVAILABLE.into_response()
 }
+
+#[cfg(test)]
+#[path = "renewal/tests.rs"]
+mod tests;

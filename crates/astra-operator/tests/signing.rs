@@ -1508,3 +1508,231 @@ fn an_outgoing_revocation_without_a_kept_key_signs_nothing() {
         Err(GestureError::Anchors(ref message)) if message.contains("aucune CA-PQ sortante")
     ));
 }
+
+fn signed_gateway_transition(
+    vault: &AuthorityVault,
+    opening: &Opened,
+) -> aether::certificates::gateway::GatewayIdentityTransition {
+    let identity = identity();
+    let (_, next_pq_public_key) = generate_ml_dsa_87_keypair().expect("next gateway PQ key");
+    let window = TransitionWindow::new(NOW, NOW + 3_600, NOW + 86_400).expect("window");
+    let active_tls_fingerprint = Fingerprint::of(b"active gateway TLS");
+    let active_pq_fingerprint = Fingerprint::of(b"active gateway PQ");
+
+    signing::sign_gateway_transition(
+        vault,
+        opening,
+        &identity,
+        &ca_pq_public_key(vault),
+        &signing::GatewayTransitionDecision {
+            gateway_identity_epoch: 2,
+            gateway_wg_public_key: identity.gateway_wg_public_key,
+            server_name: identity.server_name.clone(),
+            active_tls_fingerprint,
+            active_pq_fingerprint,
+            next_pq_public_key,
+            next_tls_certificate: None,
+            window,
+            leaf_validity: (NOW, NOW + 2 * 86_400),
+            reason: aether::certificates::authority::RotationReason::Scheduled,
+            serial: [0x42; 16],
+        },
+    )
+    .expect("gateway transition signed")
+}
+
+/// The gateway leaf and transition form one decision, with the next PQ
+/// identity issued under the domain CA and bound to the stable gateway pair.
+#[test]
+fn a_gateway_transition_issues_and_verifies_the_next_pq_leaf() {
+    let first = FakeKey::new(1);
+    let second = FakeKey::new(2);
+    let vault = bootstrapped(&first, &second);
+    let opening = open(&first, &vault);
+    let identity = identity();
+    let transition = signed_gateway_transition(&vault, &opening);
+    let leaf = transition
+        .next_gateway_certificate
+        .as_ref()
+        .expect("candidate PQ leaf");
+
+    leaf.verify(
+        ca_pq_public_key(&vault).as_bytes(),
+        aether::key_negotiation::PqCertificateRole::Gateway,
+        Some(&identity.server_name),
+        &identity.gateway_wg_public_key.to_base64(),
+        NOW,
+    )
+    .expect("candidate leaf verifies under CA-PQ");
+    assert_eq!(transition.gateway_identity_epoch, 2);
+    assert_eq!(
+        transition.gateway_wg_public_key,
+        identity.gateway_wg_public_key
+    );
+    assert_eq!(transition.server_name, identity.server_name);
+    assert!(transition.next_gateway_tls_certificate.is_none());
+    transition
+        .verify(
+            &ca_pq_public_key(&vault),
+            &identity.trust_domain_id,
+            identity.ca_epoch,
+            1,
+            &identity.gateway_wg_public_key,
+            &identity.server_name,
+            &Fingerprint::of(b"active gateway TLS"),
+            &Fingerprint::of(b"active gateway PQ"),
+        )
+        .expect("transition is installable from the current decision epoch");
+}
+
+/// A leaf that expires inside the transition's overlap is rejected before
+/// the ceremony can return an installable transition.
+#[test]
+fn gateway_transition_refuses_a_candidate_leaf_shorter_than_its_window() {
+    let first = FakeKey::new(1);
+    let second = FakeKey::new(2);
+    let vault = bootstrapped(&first, &second);
+    let opening = open(&first, &vault);
+    let identity = identity();
+    let (_, next_pq_public_key) = generate_ml_dsa_87_keypair().expect("next key");
+    let window = TransitionWindow::new(NOW, NOW + 3_600, NOW + 86_400).expect("window");
+    let refusal = signing::sign_gateway_transition(
+        &vault,
+        &opening,
+        &identity,
+        &ca_pq_public_key(&vault),
+        &signing::GatewayTransitionDecision {
+            gateway_identity_epoch: 2,
+            gateway_wg_public_key: identity.gateway_wg_public_key,
+            server_name: identity.server_name.clone(),
+            active_tls_fingerprint: Fingerprint::of(b"active gateway TLS"),
+            active_pq_fingerprint: Fingerprint::of(b"active gateway PQ"),
+            next_pq_public_key,
+            next_tls_certificate: None,
+            window,
+            leaf_validity: (NOW, window.not_after - 1),
+            reason: aether::certificates::authority::RotationReason::Scheduled,
+            serial: [0x43; 16],
+        },
+    )
+    .expect_err("short-lived candidate cannot cover the overlap");
+    assert!(refusal.to_string().contains("validité de la feuille"));
+}
+
+/// A transition may be cancelled strictly before activation, and the signed
+/// tombstone preserves its consumed epoch. The boundary itself is closed.
+#[test]
+fn gateway_abort_is_signed_before_activation_and_refused_at_the_boundary() {
+    let first = FakeKey::new(1);
+    let second = FakeKey::new(2);
+    let vault = bootstrapped(&first, &second);
+    let opening = open(&first, &vault);
+    let transition = signed_gateway_transition(&vault, &opening);
+    let campaign_fingerprint = Fingerprint::of(b"approved cancellation campaign");
+    let aborted_at = transition.window.activation_at - 1;
+    let abort = signing::sign_gateway_abort(
+        &vault,
+        &opening,
+        &identity(),
+        &ca_pq_public_key(&vault),
+        &signing::GatewayAbortDecision {
+            transition: &transition,
+            reason: aether::certificates::gateway::AbortReason::OperatorCancelled,
+            campaign_fingerprint,
+            aborted_at,
+        },
+    )
+    .expect("pre-activation abort signs");
+    abort
+        .verify(&ca_pq_public_key(&vault), &transition, false, aborted_at)
+        .expect("abort binds the exact unpublished transition");
+    assert_eq!(abort.tombstone().gateway_identity_epoch, 2);
+    assert_eq!(
+        abort.tombstone().gateway_transition_fingerprint,
+        transition.fingerprint().expect("transition fingerprint")
+    );
+
+    assert!(signing::sign_gateway_abort(
+        &vault,
+        &opening,
+        &identity(),
+        &ca_pq_public_key(&vault),
+        &signing::GatewayAbortDecision {
+            transition: &transition,
+            reason: aether::certificates::gateway::AbortReason::OperatorCancelled,
+            campaign_fingerprint,
+            aborted_at: transition.window.activation_at,
+        },
+    )
+    .is_err());
+}
+
+/// A service rollback selects only the outgoing leaf and cannot outlive the
+/// overlap, including at the exact `not_after` ceiling.
+#[test]
+fn gateway_service_rollback_is_bounded_by_the_transition_overlap() {
+    let first = FakeKey::new(1);
+    let second = FakeKey::new(2);
+    let vault = bootstrapped(&first, &second);
+    let opening = open(&first, &vault);
+    let identity = identity();
+    let transition = signed_gateway_transition(&vault, &opening);
+    let campaign_fingerprint = Fingerprint::of(b"approved rollback campaign");
+    let authorization = signing::sign_service_rollback(
+        &vault,
+        &opening,
+        &identity,
+        &ca_pq_public_key(&vault),
+        &signing::ServiceRollbackDecision {
+            transition: &transition,
+            campaign_fingerprint,
+            expires_at: transition.window.not_after,
+        },
+        transition.window.activation_at,
+    )
+    .expect("rollback may reach but not exceed not_after");
+    assert_eq!(
+        authorization.selected_certificate_fingerprint,
+        transition.active_gateway_tls_certificate_fingerprint
+    );
+    authorization
+        .verify(
+            &ca_pq_public_key(&vault),
+            &identity.trust_domain_id,
+            identity.ca_epoch,
+            &identity.gateway_wg_public_key,
+            &identity.server_name,
+            &transition.fingerprint().expect("transition fingerprint"),
+            &transition.active_gateway_tls_certificate_fingerprint,
+            transition.window.not_after,
+            transition.window.activation_at,
+        )
+        .expect("rollback verifies under the outgoing CA-PQ pin");
+
+    assert!(signing::sign_service_rollback(
+        &vault,
+        &opening,
+        &identity,
+        &ca_pq_public_key(&vault),
+        &signing::ServiceRollbackDecision {
+            transition: &transition,
+            campaign_fingerprint,
+            expires_at: transition.window.not_after + 1,
+        },
+        transition.window.activation_at,
+    )
+    .is_err());
+    assert!(signing::sign_service_rollback(
+        &vault,
+        &opening,
+        &identity,
+        &ca_pq_public_key(&vault),
+        &signing::ServiceRollbackDecision {
+            transition: &transition,
+            campaign_fingerprint,
+            expires_at: transition.window.activation_at,
+        },
+        transition.window.activation_at,
+    )
+    .is_err());
+}

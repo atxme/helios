@@ -30,6 +30,21 @@ use super::promotion::{candidate_identity_of, promote_due};
 use super::trust_store::open_identity_store;
 use super::RenewalError;
 
+/// The renewal's narrow write boundary for the candidate identity.
+///
+/// Production only implements this with [`ProtectedIdentityStore`]. Keeping
+/// the port crate-internal lets lifecycle tests inject persistence outcomes
+/// without introducing a software or plaintext backend into the application.
+pub(super) trait CandidateIdentityWriter {
+    fn persist_candidate(&self, bundle: &ClientIdentityBundle) -> anyhow::Result<()>;
+}
+
+impl CandidateIdentityWriter for ProtectedIdentityStore {
+    fn persist_candidate(&self, bundle: &ClientIdentityBundle) -> anyhow::Result<()> {
+        self.store(bundle).map(|_| ())
+    }
+}
+
 /// How long a rotation request stays valid once signed.
 ///
 /// One hour, well under the 24 h ceiling `MAX_REQUEST_LIFETIME_SECS` allows.
@@ -412,6 +427,20 @@ impl RenewalSession {
         active: &ActiveIdentity,
         now_unix: u64,
     ) -> Result<RenewalStep, RenewalError> {
+        self.advance_with_identity_writer(store, identities, identity, active, now_unix)
+            .await
+    }
+
+    /// Testable lifecycle core; callers in production enter through
+    /// [`Self::advance`], which supplies the OS-protected identity store.
+    pub(super) async fn advance_with_identity_writer<W: CandidateIdentityWriter + ?Sized>(
+        &mut self,
+        store: &mut TrustStore,
+        identities: &W,
+        identity: &str,
+        active: &ActiveIdentity,
+        now_unix: u64,
+    ) -> Result<RenewalStep, RenewalError> {
         let operation_id = self.operation_id.ok_or_else(|| {
             RenewalError::Malformed("advanced a session that has not opened an operation".into())
         })?;
@@ -441,10 +470,10 @@ impl RenewalSession {
     /// gateway has never heard of, and would present it at activation to a
     /// peer that refuses it.
     #[allow(clippy::too_many_arguments)]
-    async fn commit(
+    async fn commit<W: CandidateIdentityWriter + ?Sized>(
         &mut self,
         store: &mut TrustStore,
-        identities: &ProtectedIdentityStore,
+        identities: &W,
         identity: &str,
         active: &ActiveIdentity,
         grant: ClientCertificateRotationGrant,
@@ -481,7 +510,7 @@ impl RenewalSession {
         let candidate_identity = candidate_identity_of(identity);
         let bundle = self.candidate_bundle(&candidate_identity, &grant)?;
         identities
-            .store(&bundle)
+            .persist_candidate(&bundle)
             .map_err(|error| RenewalError::Identity(error.to_string()))?;
 
         // Persisted before the commit travels, in state `pending_commit`: an

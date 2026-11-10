@@ -1052,10 +1052,18 @@ mod tests {
         sealed: bool,
         events: Vec<String>,
         preflight_ok: bool,
+        preflight_calls: usize,
+        preflight_fail_at: Option<usize>,
+        stop_ok: bool,
         installer_ok: bool,
         install_ok: bool,
+        reboot_applies: bool,
         restore_ok: bool,
+        restore_applied: bool,
+        restore_applies_then_loses_reply: bool,
+        restore_frame_fingerprints: Vec<aether::certificates::encoding::Fingerprint>,
         ready: bool,
+        reboot_during_health: bool,
         version: String,
         update_state: Option<u32>,
     }
@@ -1086,11 +1094,16 @@ mod tests {
             anyhow::bail!("export not called in transaction tests")
         }
         fn preflight(&mut self, _: &[u8]) -> Result<()> {
-            anyhow::ensure!(self.preflight_ok, "invalid authorization");
+            self.preflight_calls += 1;
+            anyhow::ensure!(
+                self.preflight_ok && self.preflight_fail_at != Some(self.preflight_calls),
+                "invalid authorization"
+            );
             Ok(())
         }
         fn stop(&mut self) -> Result<()> {
             self.events.push("stop".into());
+            anyhow::ensure!(self.stop_ok, "service stop failed");
             Ok(())
         }
         fn install(&mut self, device: &str, version: &str) -> Result<()> {
@@ -1100,18 +1113,30 @@ mod tests {
         }
         fn reboot(&mut self) -> Result<()> {
             self.events.push("reboot".into());
-            self.identity.boot = "new-boot".into();
-            self.version = "2023".into();
+            if self.reboot_applies {
+                self.identity.boot = "new-boot".into();
+                self.version = "2023".into();
+            }
             anyhow::bail!("SSH response lost after reboot request")
         }
-        fn restore(&mut self, _: &[u8]) -> Result<()> {
+        fn restore(&mut self, frame: &[u8]) -> Result<()> {
             self.events.push("restore".into());
+            self.restore_frame_fingerprints
+                .push(aether::certificates::encoding::Fingerprint::of(frame));
+            if self.restore_applies_then_loses_reply && !self.restore_applied {
+                self.restore_applied = true;
+                anyhow::bail!("SSH response lost after TPM restore was applied")
+            }
             anyhow::ensure!(self.restore_ok, "restore unavailable");
+            self.restore_applied = true;
             Ok(())
         }
         fn start_and_check(&mut self) -> Result<()> {
             self.events.push("health".into());
             anyhow::ensure!(self.ready, "service not ready");
+            if self.reboot_during_health {
+                self.identity.boot = "reboot-during-health".into();
+            }
             Ok(())
         }
     }
@@ -1148,10 +1173,18 @@ mod tests {
             sealed,
             events: vec![],
             preflight_ok: true,
+            preflight_calls: 0,
+            preflight_fail_at: None,
+            stop_ok: true,
             installer_ok: true,
             install_ok: true,
+            reboot_applies: true,
             restore_ok: true,
+            restore_applied: false,
+            restore_applies_then_loses_reply: false,
+            restore_frame_fingerprints: vec![],
             ready: true,
+            reboot_during_health: false,
             version: "2011".into(),
             update_state: None,
         };
@@ -1203,6 +1236,92 @@ mod tests {
         assert!(gateway.events.is_empty());
         assert_eq!(load_plan(&path).unwrap().phase, Phase::Prepared);
     }
+
+    #[test]
+    fn a_second_preflight_refusal_after_stop_never_flashes_firmware() {
+        let (_dir, path, mut plan, mut gateway) = transaction(true);
+        gateway.preflight_fail_at = Some(2);
+
+        assert!(install_prepared(&mut gateway, &mut plan, &path, Some(b"authorization")).is_err());
+
+        assert_eq!(gateway.preflight_calls, 2);
+        assert_eq!(gateway.events, ["stop"]);
+        assert_eq!(load_plan(&path).unwrap().phase, Phase::Installing);
+        assert!(install_prepared(&mut gateway, &mut plan, &path, Some(b"authorization")).is_err());
+        assert_eq!(
+            gateway.events,
+            ["stop"],
+            "an ambiguous phase is never retried automatically"
+        );
+    }
+
+    #[test]
+    fn a_service_stop_failure_never_starts_the_firmware_install() {
+        let (_dir, path, mut plan, mut gateway) = transaction(false);
+        gateway.stop_ok = false;
+
+        assert!(install_prepared(&mut gateway, &mut plan, &path, None).is_err());
+
+        assert_eq!(gateway.events, ["stop"]);
+        assert_eq!(load_plan(&path).unwrap().phase, Phase::Installing);
+        assert!(matches!(
+            finish(
+                &mut gateway,
+                &mut plan,
+                &path,
+                None,
+                Duration::ZERO,
+            ),
+            Err(error) if matches!(
+                error.downcast_ref::<FirmwareError>(),
+                Some(FirmwareError::InstallationUncertain)
+            )
+        ));
+        assert_eq!(gateway.events, ["stop"]);
+    }
+
+    #[test]
+    fn an_unobserved_reboot_is_not_requested_again_on_resume() {
+        let (_dir, path, mut plan, mut gateway) = transaction(false);
+        plan.phase = Phase::Installed;
+        gateway.reboot_applies = false;
+
+        assert!(matches!(
+            finish(
+                &mut gateway,
+                &mut plan,
+                &path,
+                None,
+                Duration::ZERO,
+            ),
+            Err(error) if error.downcast_ref::<FirmwareError>().is_some_and(|error| matches!(error, FirmwareError::GatewayUnavailable))
+        ));
+        assert_eq!(load_plan(&path).unwrap().phase, Phase::RebootRequested);
+        assert_eq!(gateway.events, ["reboot"]);
+
+        assert!(!try_finish(&mut gateway, &mut plan, &path, None)
+            .expect("the unchanged boot is not a completed update"));
+        assert_eq!(load_plan(&path).unwrap().phase, Phase::RebootRequested);
+        assert!(plan.after_boot.is_none());
+        assert_eq!(gateway.events, ["reboot"]);
+
+        assert!(matches!(
+            finish(
+                &mut gateway,
+                &mut plan,
+                &path,
+                None,
+                Duration::ZERO,
+            ),
+            Err(error) if error.downcast_ref::<FirmwareError>().is_some_and(|error| matches!(error, FirmwareError::GatewayUnavailable))
+        ));
+        assert_eq!(
+            gateway.events,
+            ["reboot"],
+            "resume observes the saved intent and does not reboot twice"
+        );
+        assert_eq!(load_plan(&path).unwrap().phase, Phase::RebootRequested);
+    }
     #[test]
     fn pending_or_failed_firmware_never_receives_a_recovery_secret() {
         for state in [1, 3, 4, 5, 6, 99] {
@@ -1253,6 +1372,46 @@ mod tests {
             .iter()
             .any(|event| event.starts_with("install") || event == "reboot"));
     }
+
+    #[test]
+    fn an_applied_restore_with_a_lost_reply_retries_the_same_frame() {
+        let (_dir, path, mut plan, mut gateway) = transaction(true);
+        plan.phase = Phase::RebootRequested;
+        gateway.identity.boot = "new-boot".into();
+        gateway.version = "2023".into();
+        gateway.restore_applies_then_loses_reply = true;
+        let frame = b"opaque recovery frame";
+
+        assert!(try_finish(&mut gateway, &mut plan, &path, Some(frame)).is_err());
+        assert!(gateway.restore_applied);
+        assert_eq!(load_plan(&path).unwrap().phase, Phase::Restoring);
+        assert!(try_finish(&mut gateway, &mut plan, &path, Some(frame)).unwrap());
+
+        assert_eq!(gateway.restore_frame_fingerprints.len(), 2);
+        assert!(
+            gateway.restore_frame_fingerprints[0].matches(&gateway.restore_frame_fingerprints[1])
+        );
+        assert_eq!(load_plan(&path).unwrap().phase, Phase::Complete);
+        assert!(!gateway
+            .events
+            .iter()
+            .any(|event| event.starts_with("install") || event == "reboot"));
+    }
+
+    #[test]
+    fn a_gateway_reboot_during_readiness_cannot_complete_the_plan() {
+        let (_dir, path, mut plan, mut gateway) = transaction(false);
+        plan.phase = Phase::RebootRequested;
+        gateway.identity.boot = "new-boot".into();
+        gateway.version = "2023".into();
+        gateway.reboot_during_health = true;
+
+        assert!(try_finish(&mut gateway, &mut plan, &path, None).is_err());
+
+        assert_eq!(gateway.events, ["health"]);
+        assert_eq!(load_plan(&path).unwrap().phase, Phase::Verifying);
+        assert_ne!(plan.phase, Phase::Complete);
+    }
     #[test]
     fn old_boot_wrong_machine_and_wrong_version_never_report_success() {
         let (_dir, path, mut plan, mut gateway) = transaction(false);
@@ -1281,6 +1440,225 @@ mod tests {
         assert_eq!(
             std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
             0o600
+        );
+    }
+    /// Run the real SSH adapter against a synthetic executable in an isolated
+    /// test process. PATH is child-local, so unrelated tests never see the shim.
+    #[test]
+    fn ssh_gateway_adapter_uses_a_fake_ssh_process_without_putting_input_in_arguments() {
+        const CHILD: &str = "HELIOS_TEST_SSH_ADAPTER_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let directory = tempfile::tempdir().expect("temporary SSH fixture");
+            let bin = directory.path().join("bin");
+            std::fs::create_dir(&bin).expect("fake bin directory");
+            let executable = bin.join("ssh");
+            std::fs::write(
+                &executable,
+                r##"#!/bin/sh
+set -eu
+printf '%s\n' "$@" > "$HELIOS_TEST_SSH_ARGS"
+remote=''
+for arg in "$@"; do remote=$arg; done
+/bin/cat > "$HELIOS_TEST_SSH_STDIN"
+mode="${HELIOS_TEST_SSH_MODE:-success}"
+if [ "$mode" = "ssh-failure" ]; then printf 'denied \033[31m\n' >&2; exit 17; fi
+case "$remote" in
+  *"cat /etc/machine-id /proc/sys/kernel/random/boot_id"*)
+    if [ "$mode" = "identity-invalid" ]; then printf 'bad\nboot\n'; else printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n12345678-1234-1234-1234-123456789abc\n'; fi ;;
+  *"fwupdmgr --version --json"*)
+    if [ "$mode" = "installer-old" ]; then printf '%s\n' '{"Versions":[{"Type":"compile","AppstreamId":"org.freedesktop.fwupd","Version":"2.0.19"}]}' ; else printf '%s\n' '{"Versions":[{"Type":"compile","AppstreamId":"org.freedesktop.fwupd","Version":"2.0.20"}]}' ; fi ;;
+  *"sealing-status"*)
+    case "$mode" in
+      sealing-unknown) printf 'maybe\n' ;;
+      sealing-disabled) printf 'disabled\n' ;;
+      *) printf 'enabled\n' ;;
+    esac ;;
+  *"firmware-preflight"*)
+    if [ "$mode" = "preflight-ambiguous" ]; then printf 'almost-ready\n'; else printf 'ready\n'; fi ;;
+  *"export-firmware"*) /bin/cat "$HELIOS_TEST_SSH_BACKUP" ;;
+  *"fwupdmgr get-updates --json"*|*"fwupdmgr get-devices --json"*)
+    if [ "$mode" = "inventory-malformed" ]; then printf '{broken'; else printf '%s\n' '{"Devices":[{"DeviceId":"5bc922b7bd1adb5b6f99592611404036bd9f42d0","Name":"UEFI DBX","Version":"2022","Releases":[{"Version":"2023"}]}]}'; fi ;;
+  *"fwupdmgr install"*) printf 'installed\n' ;;
+  *"restore-firmware"*)
+    case "$mode" in
+      restore-ambiguous) printf 'unknown\n' ;;
+      restore-unchanged) printf 'unchanged\n' ;;
+      *) printf 'restored\n' ;;
+    esac ;;
+  *"cat /run/helios/ready"*)
+    case "$mode" in
+      readiness-pid-mismatch) printf 'pid=4243\nmode_reel=true\nfirewall_enforced=true\n' ;;
+      readiness-not-enforced) printf 'pid=4242\nmode_reel=true\nfirewall_enforced=false\n' ;;
+      *) printf 'pid=4242\nmode_reel=true\nfirewall_enforced=true\n' ;;
+    esac ;;
+  *"systemctl show --property=MainPID --value heliosd.service"*) printf '4242\n' ;;
+  *"systemctl start heliosd.service"*|*"systemctl stop heliosd.service"*|*"systemctl reboot"*|*"systemctl is-active --quiet heliosd.service"*) : ;;
+  *) printf 'unexpected remote command\n' >&2; exit 19 ;;
+esac
+"##,
+            )
+            .expect("write fake ssh");
+            let mut permissions = std::fs::metadata(&executable)
+                .expect("fake ssh metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&executable, permissions).expect("make fake ssh executable");
+
+            let backup = FirmwareBackup {
+                request: aether::sig::FirmwareRecoveryPayload {
+                    version: 1,
+                    sealed_blob_anchor: [1; 32],
+                    secret_commitment: [2; 32],
+                    device_id: ID.into(),
+                    target_version: "2023".into(),
+                },
+                encrypted_secret: vec![3, 4, 5],
+            };
+            let backup_path = directory.path().join("backup.json");
+            std::fs::write(
+                &backup_path,
+                serde_json::to_vec(&backup).expect("backup JSON"),
+            )
+            .expect("write backup fixture");
+
+            // Only the fixture directory is on PATH: if the shim is absent or
+            // unusable, the child cannot fall through to a real system ssh.
+            let child_path = std::env::join_paths([bin]).expect("child PATH");
+            let mut child = std::process::Command::new(
+                std::env::current_exe().expect("test executable"),
+            )
+            .args([
+                "--exact",
+                "firmware::tests::ssh_gateway_adapter_uses_a_fake_ssh_process_without_putting_input_in_arguments",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("PATH", child_path)
+            .env("HELIOS_TEST_SSH_ARGS", directory.path().join("args.txt"))
+            .env("HELIOS_TEST_SSH_STDIN", directory.path().join("stdin.bin"))
+            .env("HELIOS_TEST_SSH_BACKUP", backup_path)
+            .spawn()
+            .expect("isolated SSH adapter test starts");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                if let Some(status) = child.try_wait().expect("poll isolated test child") {
+                    assert!(status.success(), "isolated SSH adapter test succeeds");
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("isolated SSH adapter test exceeded 30 seconds");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            return;
+        }
+
+        let args_path = std::env::var_os("HELIOS_TEST_SSH_ARGS").expect("args trace path");
+        let stdin_path = std::env::var_os("HELIOS_TEST_SSH_STDIN").expect("stdin trace path");
+        let mut gateway = SshGateway::new("operator@gateway:2222").expect("valid target");
+        assert!(SshGateway::new("operator@gateway;reboot").is_err());
+
+        let identity = gateway.identity().expect("gateway identity");
+        assert_eq!(identity.machine, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert_eq!(identity.boot, "12345678-1234-1234-1234-123456789abc");
+        let args = std::fs::read_to_string(&args_path).expect("identity command trace");
+        assert!(args.contains("-T\n-o\nBatchMode=yes"));
+        assert!(args.contains("StrictHostKeyChecking=yes"));
+        assert!(args.contains("-p\n2222"));
+        assert!(args.contains("operator@gateway"));
+        assert!(args.contains("timeout --signal=TERM 30s sh -c"));
+        assert!(std::fs::read(&stdin_path).expect("empty input").is_empty());
+
+        gateway.check_installer().expect("supported fwupd version");
+        std::env::set_var("HELIOS_TEST_SSH_MODE", "installer-old");
+        assert!(gateway.check_installer().is_err());
+        std::env::set_var("HELIOS_TEST_SSH_MODE", "success");
+        assert!(gateway.sealing().expect("sealed TPM posture"));
+        std::env::set_var("HELIOS_TEST_SSH_MODE", "sealing-disabled");
+        assert!(!gateway.sealing().expect("disabled TPM posture"));
+        std::env::set_var("HELIOS_TEST_SSH_MODE", "success");
+        let devices = gateway.inventory(true).expect("updates inventory");
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].id, ID);
+        assert_eq!(devices[0].releases[0].version, "2023");
+        assert_eq!(gateway.inventory(false).expect("full inventory").len(), 1);
+
+        let backup = gateway
+            .export(&[8; 32], ID, "2023")
+            .expect("encrypted firmware backup");
+        assert_eq!(backup.request.device_id, ID);
+        assert_eq!(backup.encrypted_secret, [3, 4, 5]);
+
+        let auth = b"synthetic-auth-input";
+        gateway.preflight(auth).expect("exact preflight response");
+        assert_eq!(std::fs::read(&stdin_path).expect("preflight stdin"), auth);
+        let args = std::fs::read_to_string(&args_path).expect("preflight command trace");
+        assert!(!args.contains(std::str::from_utf8(auth).expect("auth marker")));
+        assert!(args.contains("firmware-preflight"));
+
+        gateway.stop().expect("stop gateway service");
+        gateway
+            .install(ID, "2023")
+            .expect("pinned firmware installation");
+        let args = std::fs::read_to_string(&args_path).expect("install command trace");
+        let remote = args.lines().last().expect("remote install command");
+        assert!(remote.starts_with("sudo -n fwupdmgr install"));
+        assert!(remote.contains(ID));
+        assert!(remote.contains("'2023' --assume-yes --no-reboot-check"));
+        assert!(!remote.contains("timeout --signal=TERM"));
+        gateway.reboot().expect("gateway reboot command");
+
+        let frame = b"synthetic-restore-frame";
+        gateway.restore(frame).expect("restored response");
+        assert_eq!(std::fs::read(&stdin_path).expect("restore stdin"), frame);
+        let args = std::fs::read_to_string(&args_path).expect("restore command trace");
+        assert!(!args.contains(std::str::from_utf8(frame).expect("frame marker")));
+        assert!(args.contains("restore-firmware"));
+        std::env::set_var("HELIOS_TEST_SSH_MODE", "restore-unchanged");
+        gateway
+            .restore(frame)
+            .expect("idempotent unchanged response");
+
+        std::env::set_var("HELIOS_TEST_SSH_MODE", "success");
+        gateway
+            .start_and_check()
+            .expect("active service and real enforced readiness");
+        std::env::set_var("HELIOS_TEST_SSH_MODE", "readiness-pid-mismatch");
+        assert!(gateway
+            .start_and_check()
+            .expect_err("readiness from another process refused")
+            .to_string()
+            .contains("another service process"));
+        std::env::set_var("HELIOS_TEST_SSH_MODE", "readiness-not-enforced");
+        assert!(gateway
+            .start_and_check()
+            .expect_err("non-enforced readiness refused")
+            .to_string()
+            .contains("real, enforced readiness"));
+
+        std::env::set_var("HELIOS_TEST_SSH_MODE", "sealing-unknown");
+        assert!(gateway.sealing().is_err());
+        std::env::set_var("HELIOS_TEST_SSH_MODE", "preflight-ambiguous");
+        assert!(gateway.preflight(auth).is_err());
+        std::env::set_var("HELIOS_TEST_SSH_MODE", "restore-ambiguous");
+        assert!(gateway.restore(frame).is_err());
+        std::env::set_var("HELIOS_TEST_SSH_MODE", "inventory-malformed");
+        assert!(gateway.inventory(true).is_err());
+        std::env::set_var("HELIOS_TEST_SSH_MODE", "identity-invalid");
+        assert!(gateway.identity().is_err());
+        std::env::set_var("HELIOS_TEST_SSH_MODE", "ssh-failure");
+        let error = gateway
+            .stop()
+            .expect_err("non-zero ssh status surfaced")
+            .to_string();
+        assert!(error.contains("gateway operation failed"));
+        assert!(
+            !error.contains('\u{1b}'),
+            "terminal control bytes are removed"
         );
     }
 }

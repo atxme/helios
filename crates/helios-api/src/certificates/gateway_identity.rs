@@ -282,3 +282,7 @@ fn gateway_identity_absent() -> Response {
     )
         .into_response()
 }
+
+#[cfg(test)]
+#[path = "gateway_identity_tests.rs"]
+mod tests;

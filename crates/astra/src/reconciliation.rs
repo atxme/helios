@@ -276,4 +276,173 @@ mod tests {
         .expect("written");
         assert_eq!(load(directory.path()).expect("legacy"), vec![intent()]);
     }
+
+    fn set(entries: Vec<PendingReconciliation>) -> ReconciliationSet {
+        ReconciliationSet {
+            version: RECONCILIATION_VERSION,
+            entries,
+        }
+    }
+
+    fn persist_raw(directory: &Path, bytes: &[u8]) {
+        std::fs::write(path_of(directory), bytes).expect("write reconciliation fixture");
+    }
+
+    #[test]
+    fn loader_rejects_unknown_versions_duplicate_peers_and_oversized_sets() {
+        let directory = tempfile::tempdir().expect("temp");
+        let unsupported = serde_json::to_vec(&ReconciliationSet {
+            version: RECONCILIATION_VERSION + 1,
+            entries: vec![intent()],
+        })
+        .expect("encode unsupported version");
+        persist_raw(directory.path(), &unsupported);
+        assert!(matches!(
+            load(directory.path()),
+            Err(ReconciliationError::Corrupt(_))
+        ));
+
+        let duplicate = set(vec![intent(), intent()]);
+        persist_raw(
+            directory.path(),
+            &serde_json::to_vec(&duplicate).expect("encode duplicate peers"),
+        );
+        assert!(matches!(
+            load(directory.path()),
+            Err(ReconciliationError::Corrupt(message)) if message.contains("same peer")
+        ));
+
+        let oversized = (0..=MAX_PENDING_RECONCILIATIONS)
+            .map(|index| PendingReconciliation {
+                peer: WireGuardKey::from_bytes([index as u8 + 1; 32]),
+                expected_generation: 1,
+                recorded_at: index as u64,
+            })
+            .collect();
+        persist_raw(
+            directory.path(),
+            &serde_json::to_vec(&set(oversized)).expect("encode oversized set"),
+        );
+        assert!(matches!(
+            load(directory.path()),
+            Err(ReconciliationError::Corrupt(message)) if message.contains("ceiling")
+        ));
+    }
+
+    #[test]
+    fn loader_reports_non_not_found_io_errors() {
+        let directory = tempfile::tempdir().expect("temp");
+        std::fs::create_dir(path_of(directory.path())).expect("directory at file path");
+
+        assert!(matches!(
+            load(directory.path()),
+            Err(ReconciliationError::Io(_))
+        ));
+    }
+
+    #[test]
+    fn recording_is_monotone_and_stale_or_equal_generations_are_no_ops() {
+        let directory = tempfile::tempdir().expect("temp");
+        let first = intent();
+        let second = PendingReconciliation {
+            peer: WireGuardKey::from_bytes([8; 32]),
+            expected_generation: 7,
+            recorded_at: 1_001,
+        };
+        record(directory.path(), &first).expect("record first generation");
+        record(directory.path(), &second).expect("record independent peer");
+
+        let replacement = PendingReconciliation {
+            expected_generation: 3,
+            recorded_at: 900,
+            ..first.clone()
+        };
+        record(directory.path(), &replacement).expect("record higher generation");
+        let expected = vec![replacement.clone(), second];
+        assert_eq!(load(directory.path()).expect("read updated set"), expected);
+
+        let path = path_of(directory.path());
+        let before_stale_record = std::fs::read(&path).expect("read persisted set");
+        record(directory.path(), &first).expect("stale generation is harmless");
+        let equal_generation = PendingReconciliation {
+            recorded_at: 1,
+            ..replacement
+        };
+        record(directory.path(), &equal_generation).expect("equal generation is harmless");
+        assert_eq!(
+            std::fs::read(path).expect("read unchanged set"),
+            before_stale_record
+        );
+    }
+
+    #[test]
+    fn capacity_is_exactly_bounded_and_rejection_preserves_all_intents() {
+        let directory = tempfile::tempdir().expect("temp");
+        for seed in 1..=MAX_PENDING_RECONCILIATIONS as u8 {
+            record(
+                directory.path(),
+                &PendingReconciliation {
+                    peer: WireGuardKey::from_bytes([seed; 32]),
+                    expected_generation: u64::from(seed),
+                    recorded_at: u64::from(seed),
+                },
+            )
+            .expect("entry within bound");
+        }
+        let full_set = load(directory.path()).expect("maximum-size set");
+        assert_eq!(full_set.len(), MAX_PENDING_RECONCILIATIONS);
+        let persisted = std::fs::read(path_of(directory.path())).expect("persisted maximum set");
+        let over_limit = PendingReconciliation {
+            peer: WireGuardKey::from_bytes([MAX_PENDING_RECONCILIATIONS as u8 + 1; 32]),
+            expected_generation: 99,
+            recorded_at: 99,
+        };
+
+        assert!(matches!(
+            record(directory.path(), &over_limit),
+            Err(ReconciliationError::Full)
+        ));
+        assert_eq!(
+            load(directory.path()).expect("all original entries remain"),
+            full_set
+        );
+        assert_eq!(
+            std::fs::read(path_of(directory.path())).expect("unchanged persisted set"),
+            persisted
+        );
+    }
+
+    #[test]
+    fn clear_keeps_a_future_generation_then_removes_only_reached_intents() {
+        let directory = tempfile::tempdir().expect("temp");
+        let first = PendingReconciliation {
+            expected_generation: 5,
+            ..intent()
+        };
+        let second = PendingReconciliation {
+            peer: WireGuardKey::from_bytes([8; 32]),
+            expected_generation: 9,
+            recorded_at: 1_001,
+        };
+        record(directory.path(), &first).expect("first intent");
+        record(directory.path(), &second).expect("second intent");
+
+        clear(directory.path(), &first.peer, 4).expect("future generation remains pending");
+        assert_eq!(
+            load(directory.path()).expect("both remain"),
+            vec![first.clone(), second.clone()]
+        );
+
+        clear(directory.path(), &first.peer, 5).expect("reached first intent");
+        assert_eq!(
+            load(directory.path()).expect("second remains"),
+            vec![second.clone()]
+        );
+
+        clear(directory.path(), &second.peer, 9).expect("reached final intent");
+        assert!(
+            !path_of(directory.path()).exists(),
+            "empty set removes its file"
+        );
+    }
 }

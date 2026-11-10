@@ -440,6 +440,42 @@ mod tests {
     }
 
     #[test]
+    fn browser_origins_require_the_exact_host_and_port() {
+        for (origin, host, admitted) in [
+            (None, None, true),
+            (Some("http://gateway:8080"), Some("gateway:8080"), true),
+            (Some("https://gateway:8080"), Some("gateway:8080"), true),
+            (Some("https://gateway"), Some("gateway:8080"), false),
+            (
+                Some("https://gateway:8080.attacker"),
+                Some("gateway:8080"),
+                false,
+            ),
+            (
+                Some("https://gateway:8080/path"),
+                Some("gateway:8080"),
+                false,
+            ),
+            (Some("null"), Some("gateway:8080"), false),
+            (Some("https://gateway:8080"), None, false),
+        ] {
+            let mut builder = Request::builder();
+            if let Some(origin) = origin {
+                builder = builder.header(header::ORIGIN, origin);
+            }
+            if let Some(host) = host {
+                builder = builder.header(header::HOST, host);
+            }
+            let request = builder.body(Body::empty()).expect("request");
+            assert_eq!(
+                same_origin(&request),
+                admitted,
+                "origin {origin:?}, host {host:?}"
+            );
+        }
+    }
+
+    #[test]
     fn cross_origin_is_refused() {
         let request = Request::builder()
             .header(header::HOST, "100.64.0.1:8080")

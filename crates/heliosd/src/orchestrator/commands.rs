@@ -122,18 +122,45 @@ pub(super) async fn handle_external_cmd(
             policy.mss_clamp = None;
             // Engage the fail-closed verdict before modifying the interface:
             // same order as a systemd stop for an update.
-            transition(shared_state, event_tx, TunnelState::Down, fw, policy).await?;
-            if let Err(e) = wg.down().await {
-                warn!("tearing down the WireGuard interface: {e}");
+            // Disconnect is explicit: even if the firewall cannot apply the
+            // fail-closed ruleset, remove the WireGuard interface and its VIP
+            // routes before returning the firewall error. Otherwise `?` here
+            // leaves the data plane running and the daemon exits its main loop
+            // without reaching the shutdown cleanup below.
+            let firewall_result =
+                transition(shared_state, event_tx, TunnelState::Down, fw, policy).await;
+            let mut failures = Vec::new();
+            if let Err(error) = firewall_result {
+                failures.push(format!(
+                    "applying the fail-closed firewall state: {error:#}"
+                ));
                 emit_log(
                     event_tx,
-                    "warn",
-                    &format!("Tearing down the interface: {e}"),
+                    "error",
+                    &format!("Could not apply the firewall state for disconnect: {error:#}"),
                 );
             }
+            let interface_removed = match wg.down().await {
+                Ok(()) => true,
+                Err(error) => {
+                    failures.push(format!("tearing down WireGuard: {error}"));
+                    warn!("tearing down the WireGuard interface: {error}");
+                    emit_log(
+                        event_tx,
+                        "error",
+                        &format!("Could not tear down the WireGuard interface: {error}"),
+                    );
+                    false
+                }
+            };
             let ipv6 = shared_ipv6.read().await.clone();
-            unpin_peer_vips(dry_run, &ipv6).await;
+            if interface_removed {
+                unpin_peer_vips(dry_run, &ipv6).await;
+            }
             sync_policy(shared_policy, policy).await;
+            if !failures.is_empty() {
+                return Err(anyhow::anyhow!(failures.join("; ")));
+            }
         }
 
         OrchestratorCmd::AcknowledgeCaptivePortal => {
@@ -229,11 +256,14 @@ pub(super) async fn handle_external_cmd(
                 return Ok(());
             }
             // Same refusal for what only the firewall can judge — an address
-            // in `split_tunnel_cidrs` or `allow_ssh_from`, say. The file or
-            // API body is the operator's, and a typo in it must not stop the
-            // gateway; the configuration in force stays whole, as above.
+            // in `split_tunnel_cidrs` or `allow_ssh_from`, say. Apply the
+            // candidate against a private copy: neither the running policy nor
+            // the configuration is published until the data plane agrees.
             let state = *shared_state.read().await;
-            if let Err(error) = commit_policy(fw, policy, new_cfg.firewall_policy(), state).await {
+            let mut candidate_policy = policy.clone();
+            if let Err(error) =
+                commit_policy(fw, &mut candidate_policy, new_cfg.firewall_policy(), state).await
+            {
                 emit_log(
                     event_tx,
                     "error",
@@ -244,22 +274,53 @@ pub(super) async fn handle_external_cmd(
                 );
                 return Ok(());
             }
-            info!("network config reloaded: {} peer(s)", new_cfg.peers.len());
-            *shared_network.write().await = *new_cfg;
-            sync_policy(shared_policy, policy).await;
 
             // Aligns the data plane with the new peer list (client
-            // enrollment, or revocation).
+            // enrollment, or revocation). `sync_peers` may partially apply
+            // before it fails, so fail closed before returning and do not
+            // forget the old configuration or its runtime secrets.
             if wg.is_up() {
                 let ipv6 = shared_ipv6.read().await.clone();
-                let (iface, peers, prefix) = {
-                    let network = shared_network.read().await;
-                    let (iface, peers) = wg_config(&network, &ipv6);
-                    (iface, peers, installed_prefix(&network, &ipv6))
-                };
-                if let Err(e) = wg.sync_peers(&peers).await {
-                    warn!("WireGuard peer synchronization: {e}");
-                    emit_log(event_tx, "warn", &format!("Peer synchronization: {e}"));
+                let (iface, peers) = wg_config(&new_cfg, &ipv6);
+                let prefix = installed_prefix(&new_cfg, &ipv6);
+                if let Err(sync_error) = wg.sync_peers(&peers).await {
+                    let mut failures = vec![format!(
+                        "WireGuard peer synchronization failed: {sync_error}"
+                    )];
+                    emit_log(
+                        event_tx,
+                        "warn",
+                        &format!("Peer synchronization failed; keeping the running configuration: {sync_error}"),
+                    );
+
+                    if let Err(error) =
+                        transition(shared_state, event_tx, TunnelState::Down, fw, policy).await
+                    {
+                        failures.push(format!(
+                            "applying the fail-closed firewall state: {error:#}"
+                        ));
+                        emit_log(
+                            event_tx,
+                            "error",
+                            &format!("Could not engage the firewall after peer synchronization failed: {error:#}"),
+                        );
+                    }
+                    let interface_removed = match wg.down().await {
+                        Ok(()) => true,
+                        Err(error) => {
+                            failures.push(format!("tearing down WireGuard: {error}"));
+                            emit_log(
+                                event_tx,
+                                "error",
+                                &format!("Could not tear down WireGuard after peer synchronization failed: {error}"),
+                            );
+                            false
+                        }
+                    };
+                    if interface_removed {
+                        unpin_peer_vips(dry_run, &ipv6).await;
+                    }
+                    return Err(anyhow::anyhow!(failures.join("; ")));
                 }
                 // An admission adds a VIP and a revocation removes one; the
                 // pinned table has to follow both, or a freshly admitted
@@ -268,6 +329,11 @@ pub(super) async fn handle_external_cmd(
                 // client works.
                 pin_peer_vips(dry_run, &iface, &peers, prefix, event_tx).await;
             }
+
+            info!("network config reloaded: {} peer(s)", new_cfg.peers.len());
+            *shared_network.write().await = *new_cfg;
+            *policy = candidate_policy;
+            sync_policy(shared_policy, policy).await;
             emit_log(event_tx, "info", "Network configuration applied");
         }
         // Emitted by the handshake poller on the **internal** channel, never

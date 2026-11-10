@@ -433,6 +433,26 @@ async fn speedtest_download_is_bounded_and_returns_the_requested_size() {
 }
 
 #[tokio::test]
+async fn spoofed_proxy_headers_cannot_authorize_an_admin_mutation() {
+    let (app_state, mut commands) = state_real();
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/tunnel/start")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("x-forwarded-for", "100.64.1.2")
+        .header("x-real-ip", "100.64.1.2")
+        .header("forwarded", "for=100.64.1.2")
+        .body(Body::from("{}"))
+        .expect("request");
+    let response = router(app_state).oneshot(request).await.expect("router");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(
+        commands.try_recv().is_err(),
+        "a spoofed source must not reach the orchestrator"
+    );
+}
+
+#[tokio::test]
 async fn mutation_requires_the_admin_peer_identified_by_its_vip() {
     let (non_admin_state, mut cmd_rx) = state();
     non_admin_state.network.write().await.peers[0].admin = false;

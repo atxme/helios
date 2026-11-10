@@ -339,6 +339,51 @@ fn an_expired_transition_is_forgotten() {
     assert!(anchored.registry.state().transitions.is_empty());
 }
 
+#[test]
+fn a_legacy_registry_with_ambiguous_ca_pq_successors_is_refused() {
+    let mut anchored = anchored();
+    let first = transition_from(
+        &anchored.registry,
+        &anchored.ca_private,
+        &anchored.ca_public,
+        1,
+        TransitionWindow::new(1_000, 3_000, 5_000).expect("first window"),
+    )
+    .0;
+    let competing = transition_from(
+        &anchored.registry,
+        &anchored.ca_private,
+        &anchored.ca_public,
+        1,
+        TransitionWindow::new(1_000, 3_500, 5_500).expect("competing window"),
+    )
+    .0;
+    anchored
+        .registry
+        .accept_transitions(&anchor_campaign(), &[first], None, 2_000)
+        .expect("first transition accepted");
+    let mut competing_record = anchored.registry.state.transitions[0].clone();
+    competing_record.object = competing;
+    anchored.registry.state.transitions.push(competing_record);
+    let mut encoded = serde_json::to_value(anchored.registry.state()).expect("encoding");
+    encoded
+        .as_object_mut()
+        .expect("registry object")
+        .remove("ca_rotation");
+    let path = anchored._directory.path().join("astra.json");
+    let bytes = serde_json::to_vec_pretty(&encoded).expect("legacy encoding");
+    std::fs::write(&path, &bytes).expect("legacy registry written");
+    for result in [
+        AstraRegistry::load(&path, None).map(|_| ()),
+        AstraRegistry::read_state(&path, None).map(|_| ()),
+    ] {
+        assert!(
+            matches!(result, Err(RegistryError::Corrupt(message)) if message.contains("multiple CA-PQ rotations target the active epoch"))
+        );
+    }
+    assert_eq!(std::fs::read(&path).expect("read unchanged file"), bytes);
+}
+
 fn rotated_credentials(
     anchored: &Anchored,
 ) -> Box<aether::certificates::approval::CredentialRegistry> {

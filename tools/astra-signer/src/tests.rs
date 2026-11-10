@@ -85,6 +85,190 @@ fn enroll_subcommands_parse() {
     }
 }
 
+/// CLI-level constraints for the two approval transports. Handler tests cover
+/// the complementary pair-completeness checks performed after parsing.
+#[test]
+fn approval_cli_accepts_complete_channels_and_refuses_mixed_or_incomplete_tunnels() {
+    use clap::Parser as _;
+
+    for line in [
+        "astra-signer approve --request request.json --out approval.json",
+        "astra-signer approve --heliosd-url http://100.64.0.1:8080 --operation-id 01010101010101010101010101010101",
+        "astra-signer approve-campaign --campaign campaign.json --out approval.json",
+        "astra-signer approve-campaign --authority-url https://astra.example --operation-id 01010101010101010101010101010101",
+    ] {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        assert!(Cli::try_parse_from(&words).is_ok(), "{line}");
+    }
+
+    for line in [
+        "astra-signer approve --heliosd-url http://100.64.0.1:8080",
+        "astra-signer approve --operation-id 01010101010101010101010101010101",
+        "astra-signer approve --request request.json --heliosd-url http://100.64.0.1:8080 --operation-id 01010101010101010101010101010101",
+        "astra-signer approve-campaign --authority-url https://astra.example",
+        "astra-signer approve-campaign --operation-id 01010101010101010101010101010101",
+        "astra-signer approve-campaign --campaign campaign.json --authority-url https://astra.example --operation-id 01010101010101010101010101010101",
+    ] {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        assert!(Cli::try_parse_from(&words).is_err(), "{line}");
+    }
+}
+
+/// Required arguments, value enums, transport placement and numeric edges are
+/// part of the operator interface: reject typos before any gesture starts.
+#[test]
+fn cli_rejects_missing_required_arguments_and_invalid_scalar_values() {
+    use clap::{error::ErrorKind, Parser as _};
+
+    for line in [
+        "astra-signer init",
+        "astra-signer enrol",
+        "astra-signer remove",
+        "astra-signer rename --slot abc",
+    ] {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        assert_eq!(
+            Cli::try_parse_from(&words)
+                .err()
+                .expect("CLI should reject input")
+                .kind(),
+            ErrorKind::MissingRequiredArgument,
+            "{line}"
+        );
+    }
+
+    for line in [
+        "astra-signer domain --astra-service-key-epoch nope",
+        "astra-signer issue-ca-tls --days nope",
+        "astra-signer enroll invite --gateway-certificate gw --out invite --valid-for-hours 18446744073709551616",
+    ] {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        assert_eq!(
+            Cli::try_parse_from(&words).err().expect("CLI should reject input").kind(),
+            ErrorKind::ValueValidation,
+            "{line}"
+        );
+    }
+}
+
+#[test]
+fn cli_unknown_enum_values_are_invalid_value_errors_after_required_args() {
+    use clap::{error::ErrorKind, Parser as _};
+
+    for line in [
+        "astra-signer revoke --authority-url https://astra.example --operation-id op --scope server",
+        "astra-signer revoke --authority-url https://astra.example --operation-id op --halves tls-pq",
+        "astra-signer revoke --authority-url https://astra.example --operation-id op --reason unknown",
+        "astra-signer abort-gateway-transition --authority-url https://astra.example --operation-id op --transition t --out o --reason unknown",
+    ] {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        assert_eq!(
+            Cli::try_parse_from(&words).err().expect("CLI should reject input").kind(),
+            ErrorKind::InvalidValue,
+            "{line}"
+        );
+    }
+}
+
+#[test]
+fn global_transport_is_accepted_on_either_side_and_rejects_unknown_values() {
+    use clap::Parser as _;
+
+    for line in [
+        "astra-signer --transport hid list",
+        "astra-signer list --transport hid",
+        "astra-signer --transport platform verify",
+        "astra-signer verify --transport platform",
+    ] {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        assert!(Cli::try_parse_from(&words).is_ok(), "{line}");
+    }
+    for line in [
+        "astra-signer --transport usb list",
+        "astra-signer list --transport usb",
+    ] {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        assert!(Cli::try_parse_from(&words).is_err(), "{line}");
+    }
+}
+
+#[test]
+fn enrollment_lifetime_and_readmission_flag_edges_parse_correctly() {
+    use clap::Parser as _;
+
+    for line in [
+        "astra-signer enroll invite --gateway-certificate gw --valid-for-hours 1 --out invite",
+        "astra-signer enroll invite --gateway-certificate gw --valid-for-hours 24 --out invite",
+        "astra-signer enroll accept --request req --validity-days 1 --out-dir leaves",
+        "astra-signer enroll accept --request req --validity-days 365 --out-dir leaves",
+    ] {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        assert!(Cli::try_parse_from(&words).is_ok(), "{line}");
+    }
+    for line in [
+        "astra-signer enroll invite --gateway-certificate gw --valid-for-hours 0 --out invite",
+        "astra-signer enroll invite --gateway-certificate gw --valid-for-hours 25 --out invite",
+        "astra-signer enroll invite --gateway-certificate gw --out invite --allow-readmission --valid-for-hours 0",
+        "astra-signer enroll accept --request req --validity-days 0 --out-dir leaves",
+    ] {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let parsed = Cli::try_parse_from(&words);
+        if line.contains("valid-for-hours") {
+            assert!(parsed.is_err(), "{line}");
+        } else {
+            assert!(parsed.is_ok(), "{line}");
+        }
+    }
+}
+
+#[test]
+fn signing_commands_expose_mutually_exclusive_transport_options() {
+    use clap::Parser as _;
+
+    for line in [
+        "astra-signer sign-gateway-transition --operation-id op --request req --out out --authority-url https://astra.example",
+        "astra-signer sign-gateway-transition --operation-id op --request req --out out --heliosd-url http://100.64.0.1:8080",
+        "astra-signer rotate-ca-tls --operation-id op --out out --authority-url https://astra.example",
+        "astra-signer rotate-ca-tls --operation-id op --out out --heliosd-url http://100.64.0.1:8080",
+        "astra-signer abort-gateway-transition --operation-id op --transition t --out out --authority-url https://astra.example",
+        "astra-signer abort-gateway-transition --operation-id op --transition t --out out --heliosd-url http://100.64.0.1:8080",
+    ] {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        assert!(Cli::try_parse_from(&words).is_ok(), "{line}");
+    }
+    for line in [
+        "astra-signer sign-gateway-transition --operation-id op --request req --out out --authority-url https://astra.example --heliosd-url http://100.64.0.1:8080",
+        "astra-signer rotate-ca-tls --operation-id op --out out --authority-url https://astra.example --heliosd-url http://100.64.0.1:8080",
+        "astra-signer abort-gateway-transition --operation-id op --transition t --out out --authority-url https://astra.example --heliosd-url http://100.64.0.1:8080",
+    ] {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        assert!(Cli::try_parse_from(&words).is_err(), "{line}");
+    }
+}
+
+#[test]
+fn approval_generation_and_optional_source_combinations_parse() {
+    use clap::Parser as _;
+
+    for line in [
+        "astra-signer approve --request req --out out --active-generation 0",
+        "astra-signer approve --request req --out out --active-generation 18446744073709551615",
+        "astra-signer approve-campaign --campaign campaign --out out --origin https://astra.example",
+        "astra-signer approve-campaign --authority-url https://astra.example --operation-id 00000000000000000000000000000000 --origin https://login.example",
+    ] {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        assert!(Cli::try_parse_from(&words).is_ok(), "{line}");
+    }
+    for line in [
+        "astra-signer approve --request req --active-generation -1",
+        "astra-signer approve --request req --active-generation 18446744073709551616",
+        "astra-signer approve-campaign --authority-url https://astra.example --operation-id 00000000000000000000000000000000 --campaign campaign",
+    ] {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        assert!(Cli::try_parse_from(&words).is_err(), "{line}");
+    }
+}
+
 /// A rotation Orion is carrying to the gateway has a journal beside the vault,
 /// and a second one signed over it would name the same outgoing anchor. Refused
 /// before anything else is read, so a damaged journal refuses as well.
