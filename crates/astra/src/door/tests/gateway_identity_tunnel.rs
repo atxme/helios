@@ -502,8 +502,15 @@ impl Fixture {
 
 /// An activation after `NOW` and a window that outlives the test's instants.
 const STAGED: (u64, u64, u64) = (NOW - 100, NOW + 100, NOW + 10_000);
-/// An emergency replacement is inert on the gateway: it installs at once.
-const INERT: (u64, u64, u64) = (NOW - 100, NOW - 50, NOW + 10_000);
+/// The cause the gateway names when an emergency replacement is refused outside a revocation.
+const EMERGENCY_CAUSE: &str = "emergency_replacement belongs to a revoked identity";
+const DAY: u64 = 86_400;
+
+/// The window `astra-operator` signs for a replacement (`REPLACEMENT_TERMS`, seven
+/// days of preparation and seven of overlap): it starts at `NOW`, activates a week
+/// later and ends a week after that. The gateway installs an emergency replacement at
+/// once, so these instants are inert.
+const INERT: (u64, u64, u64) = (NOW, NOW + 7 * DAY, NOW + 14 * DAY);
 
 fn relayed_publication(epoch: u64) -> Vec<u8> {
     serde_json::to_vec(&RelayedOperatorGatewayPublish {
@@ -622,7 +629,7 @@ async fn a_gateway_revocation_with_replacement_lands_in_order() {
     // A healthy gateway refuses the replacement on its own.
     assert!(matches!(
         fixture.install(&replacement),
-        Err(CertificateError::IllegalStateTransition(_))
+        Err(CertificateError::IllegalStateTransition(cause)) if cause.contains(EMERGENCY_CAUSE)
     ));
 
     let revocation_round = fixture.open(OperatorOpenAction::GatewayRevocation).await;
@@ -697,7 +704,7 @@ async fn an_emergency_replacement_is_refused_by_a_healthy_gateway() {
 
     assert!(matches!(
         fixture.install(&replacement),
-        Err(CertificateError::IllegalStateTransition(_))
+        Err(CertificateError::IllegalStateTransition(cause)) if cause.contains(EMERGENCY_CAUSE)
     ));
     assert_eq!(fixture.gateway.with(|state| state.clone()), before);
 }
