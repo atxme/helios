@@ -1,5 +1,70 @@
 use super::*;
 
+async fn read_http_request(stream: &mut tokio::net::TcpStream) -> String {
+    use tokio::io::AsyncReadExt as _;
+
+    let mut request = Vec::new();
+    let mut buffer = [0; 2048];
+    loop {
+        let count =
+            tokio::time::timeout(std::time::Duration::from_secs(3), stream.read(&mut buffer))
+                .await
+                .expect("HTTP request arrives within the test deadline")
+                .expect("read HTTP request");
+        if count == 0 {
+            break;
+        }
+        request.extend_from_slice(&buffer[..count]);
+        let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n") else {
+            continue;
+        };
+        let headers = String::from_utf8_lossy(&request[..header_end + 4]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        if request.len() >= header_end + 4 + content_length {
+            break;
+        }
+    }
+    String::from_utf8_lossy(&request).into_owned()
+}
+
+async fn one_response_server(
+    status: &'static str,
+    body: &'static str,
+) -> (String, tokio::task::JoinHandle<String>) {
+    use tokio::io::AsyncWriteExt as _;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("local HTTP listener");
+    let address = listener.local_addr().expect("listener address");
+    let task = tokio::spawn(async move {
+        let (mut stream, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(3), listener.accept())
+                .await
+                .expect("HTTP client connects within the test deadline")
+                .expect("HTTP request");
+        let request = read_http_request(&mut stream).await;
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .expect("write HTTP response");
+        request
+    });
+    (format!("http://{address}"), task)
+}
+
 /// `network load` sends the operator's document, not a re-serialized
 /// `NetworkConfig`. The gateway still has to be able to read it.
 ///
@@ -299,6 +364,111 @@ fn command_responses_preserve_refusal_details() {
     )
     .unwrap_err();
     assert!(unknown.to_string().contains("unknown error"));
+}
+
+#[tokio::test]
+async fn connect_and_disconnect_send_their_typed_commands_and_propagate_refusals() {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("HTTP test client");
+
+    let (base, server) = one_response_server("200 OK", r#"{"ok":true,"error":null}"#).await;
+    cmd_connect(&client, &base)
+        .await
+        .expect("accepted start command succeeds");
+    let request = server.await.expect("start server completes");
+    assert!(request.starts_with("POST /api/tunnel/start "), "{request}");
+    assert!(request.ends_with("{}"), "request body: {request}");
+
+    let (base, server) = one_response_server("200 OK", r#"{"ok":false,"error":"busy"}"#).await;
+    let error = cmd_disconnect(&client, &base)
+        .await
+        .expect_err("refused stop command must fail");
+    assert!(error.to_string().contains("busy"), "{error:#}");
+    let request = server.await.expect("stop server completes");
+    assert!(request.starts_with("POST /api/tunnel/stop "), "{request}");
+}
+
+#[tokio::test]
+async fn network_load_preserves_secrets_in_the_posted_configuration() {
+    use std::io::Write as _;
+
+    let directory = tempfile::tempdir().expect("temporary network config directory");
+    let path = directory.path().join("network.toml");
+    let document = r#"
+        wan_iface = "eth0"
+        wg_private_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        wg_address = "100.64.0.1/10"
+        [[peers]]
+        name = "alice"
+        public_key = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="
+        address = "100.64.1.2/32"
+        preshared_key = "cHNrLXN0YXRpcXVl"
+    "#;
+    std::fs::File::create(&path)
+        .expect("create config")
+        .write_all(document.as_bytes())
+        .expect("write config");
+
+    let (base, server) = one_response_server("200 OK", r#"{"ok":true,"error":null}"#).await;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("HTTP test client");
+    cmd_network_load(&client, &base, &path)
+        .await
+        .expect("valid network document is accepted");
+    let request = server.await.expect("network server completes");
+    assert!(request.starts_with("POST /api/network "), "{request}");
+    let body = request
+        .split_once("\r\n\r\n")
+        .expect("HTTP request separator")
+        .1;
+    let received: NetworkConfig = serde_json::from_str(body).expect("gateway-readable JSON");
+    assert_eq!(
+        received.wg_private_key.expose(),
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+    );
+    assert_eq!(
+        received.peers[0]
+            .preshared_key
+            .as_ref()
+            .map(aether::secret::SecretString::expose),
+        Some("cHNrLXN0YXRpcXVl")
+    );
+    received.validate().expect("received config validates");
+
+    let (base, server) =
+        one_response_server("200 OK", r#"{"ok":false,"error":"invalid config"}"#).await;
+    let error = cmd_network_load(&client, &base, &path)
+        .await
+        .expect_err("gateway refusal must fail the load");
+    assert!(error.to_string().contains("invalid config"), "{error:#}");
+    assert!(server
+        .await
+        .expect("refusal server completes")
+        .starts_with("POST /api/network "));
+}
+
+#[tokio::test]
+async fn network_load_rejects_invalid_toml_before_contacting_the_gateway() {
+    let directory = tempfile::tempdir().expect("temporary network config directory");
+    let path = directory.path().join("invalid.toml");
+    std::fs::write(&path, "wan_iface = [not valid TOML").expect("write invalid TOML");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("local HTTP listener");
+    let address = listener.local_addr().expect("listener address");
+    let error = cmd_network_load(&reqwest::Client::new(), &format!("http://{address}"), &path)
+        .await
+        .expect_err("invalid TOML must be rejected locally");
+    assert!(format!("{error:#}").contains("invalid TOML"), "{error:#}");
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept())
+            .await
+            .is_err()
+    );
 }
 
 /// Without `--url`, the transport decides (local socket or in-tunnel API):
