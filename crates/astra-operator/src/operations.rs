@@ -7,6 +7,7 @@
 //! window can both do so without either shape leaking into the other.
 
 pub mod campaign;
+pub mod gateway_identity;
 pub mod issuer;
 pub(crate) mod keys;
 

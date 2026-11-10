@@ -285,7 +285,7 @@ impl Verified {
     }
 }
 
-fn random_id() -> Result<[u8; 16]> {
+pub(super) fn random_id() -> Result<[u8; 16]> {
     let mut out = [0u8; 16];
     aether::random::fill_secret(&mut out)
         .map_err(|error| anyhow::anyhow!("générateur approuvé indisponible : {error}"))?;
