@@ -144,6 +144,7 @@ impl RotationRemote for Remote {
             expires_at: EXPIRES,
             revocation_expiries: None,
             delegation_request: None,
+            gateway_certificate: None,
         })
     }
 

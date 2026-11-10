@@ -478,6 +478,7 @@ fn a_campaign_opens_on_the_operator_route() {
         expires_at: 1_700_000_300,
         revocation_expiries: None,
         delegation_request: None,
+        gateway_certificate: None,
     };
     let stub = Stub::serving(vec![(200, serde_json::to_string(&opened).expect("json"))]);
     let request = OperatorOpenRequest {

@@ -227,6 +227,13 @@ console seule ; `VaultCopy`, nouvelle variante, est au tunnel seul
 (`(false, true)`) : la console garde sa procédure. Les autres lignes sont
 inchangées. Voir `2026-11-04-f14-lot5b-rotations-design.md` §5.8, §5.9 et § 10.
 
+**Amendement du 10 novembre 2026 (lot 6b).** Le tunnel ouvre aussi
+`GatewayIdentity`, `GatewayRevocation` et `ChainOpen`. La porte accorde en plus
+au tunnel `ChainNext`, `ChainAbandon` et `GatewayIdentityPublish` (`(true, true)`),
+voir `2026-11-10-f14-lot6b-identite-gateway-design.md` §5.1. `IssuerRequest`,
+`PinCaTls` et `IssuerInstall` restent à la console seule. Les autres lignes sont
+inchangées.
+
 ### 5.3 Bornes tenues par la porte
 
 - `reason` et `requested_by` non vides ; fenêtre de 1 à 300 s (inchangé).

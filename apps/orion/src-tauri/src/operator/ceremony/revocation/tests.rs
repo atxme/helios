@@ -123,6 +123,7 @@ impl RevocationRemote for Remote {
                 pq_not_after: Some(PQ_NOT_AFTER),
             }),
             delegation_request: None,
+            gateway_certificate: None,
         })
     }
 

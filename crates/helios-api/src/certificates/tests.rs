@@ -246,6 +246,7 @@ impl OperatorCampaignRelay for SpyCampaign {
                 expires_at: view.expires_at,
                 revocation_expiries: None,
                 delegation_request: None,
+                gateway_certificate: None,
             })
     }
 }
@@ -504,7 +505,7 @@ async fn an_oversized_open_is_refused_before_the_relay() {
     let unreadable = operator_open(
         State(state),
         Extension(operator_caller_at(true)),
-        Bytes::from_static(br#"{"action":"chain_open","reason":"x","requested_by":"y"}"#),
+        Bytes::from_static(br#"{"action":"pin_ca_tls","reason":"x","requested_by":"y"}"#),
     )
     .await;
     assert_eq!(unreadable.status(), StatusCode::BAD_REQUEST);

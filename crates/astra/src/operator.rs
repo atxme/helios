@@ -341,6 +341,18 @@ async fn open(
             opened.delegation_request = Some(request);
             (axum::http::StatusCode::OK, Json(opened)).into_response()
         }
+        // A chain step is the campaign it opened, with the public request of
+        // its delegation step when it has one. A step that opened nothing is
+        // the refusal below: the tunnel's chain always opens one.
+        Ok(DoorOutcome::ChainStep {
+            opened: Some(opening),
+            delegation_request,
+            ..
+        }) => {
+            let mut opened = opening.opened;
+            opened.delegation_request = delegation_request;
+            (axum::http::StatusCode::OK, Json(opened)).into_response()
+        }
         Ok(_) => {
             tracing::error!(
                 operator = %operator,

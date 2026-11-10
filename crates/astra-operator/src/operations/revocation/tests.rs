@@ -132,6 +132,7 @@ impl RevocationRemote for Remote {
             expires_at: EXPIRES,
             revocation_expiries: *self.expiries.borrow(),
             delegation_request: None,
+            gateway_certificate: None,
         })
     }
 

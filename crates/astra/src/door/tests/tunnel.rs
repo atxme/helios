@@ -130,6 +130,74 @@ async fn a_tunnel_open_lands_in_pending() {
     );
 }
 
+fn relayed_opening(action: OperatorOpenAction) -> Vec<u8> {
+    serde_json::to_vec(&RelayedOperatorOpen {
+        operator: administrator(),
+        request: OperatorOpenRequest {
+            action,
+            reason: "scheduled gateway renewal".into(),
+            requested_by: "alice".into(),
+            window_secs: 300,
+        },
+    })
+    .expect("relayed opening")
+}
+
+/// The gateway leaf in service comes back with the campaign that freezes it,
+/// and its fingerprint is the one the campaign names.
+#[tokio::test]
+async fn a_tunnel_gateway_identity_opening_returns_the_leaf_in_service() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let service = fixture_with_gateway(dir.path()).await;
+    let listener = listen(Arc::clone(&service)).await;
+
+    let (status, body) = post_open(
+        &listener,
+        &relayed_opening(OperatorOpenAction::GatewayIdentity),
+    )
+    .await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let opened: OperatorOpened = serde_json::from_slice(&body).expect("the tunnel's answer");
+    assert_eq!(opened.scope, CampaignScope::GatewayIdentity);
+
+    let leaf = opened
+        .gateway_certificate
+        .clone()
+        .expect("the answer carries the leaf in service");
+    // The fixture serves one leaf, with a fixed serial (`served_leaf`).
+    assert_eq!(leaf.serial, [0x31; 16]);
+    let campaign = campaign_of(&service, &opened).await;
+    assert_eq!(
+        campaign.targets[0].active_pq_certificate_fingerprint,
+        aether::certificates::gateway::pq_certificate_fingerprint(&leaf).expect("fingerprint"),
+    );
+}
+
+/// The first step of a chain is the delegation: through the tunnel its
+/// public request travels in the answer, as it does for `issuer_delegation`.
+#[tokio::test]
+async fn a_tunnel_chain_open_answers_its_first_step() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture(dir.path());
+    let listener = listen(Arc::clone(&service)).await;
+
+    let (status, body) =
+        post_open(&listener, &relayed_opening(OperatorOpenAction::ChainOpen)).await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let opened: OperatorOpened = serde_json::from_slice(&body).expect("the tunnel's answer");
+    assert_eq!(opened.scope, CampaignScope::IssuerDelegation);
+    let request: crate::issuer::IssuerDelegationRequest = serde_json::from_str(
+        opened
+            .delegation_request
+            .as_deref()
+            .expect("the first step carries its public request"),
+    )
+    .expect("the request is JSON");
+    assert_eq!(request.issuer_epoch, 1);
+    assert!(plan_path(dir.path()).exists());
+    assert_eq!(service.signing.lock().await.pending(wall_clock()).len(), 1);
+}
+
 /// The tunnel's enum has no console action, so the body is refused before
 /// the door is reached — and the refusal names neither the action nor the
 /// ones that exist.
@@ -142,7 +210,7 @@ async fn a_tunnel_open_of_a_console_action_is_refused_coarsely() {
     let body = serde_json::json!({
         "operator": administrator(),
         "request": {
-            "action": "chain_open",
+            "action": "pin_ca_tls",
             "reason": "quarterly rotation",
             "requested_by": "alice",
         },

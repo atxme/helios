@@ -535,6 +535,7 @@ async fn operator_pending_and_open_use_operator_paths_without_capabilities() {
         expires_at: 30,
         revocation_expiries: None,
         delegation_request: None,
+        gateway_certificate: None,
     };
     let open_server = response_server(fixed_response(
         200,

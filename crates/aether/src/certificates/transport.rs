@@ -1170,6 +1170,12 @@ pub enum OperatorOpenAction {
     /// The next delegation of Astra's issuer (lot 5b, §5.8). It draws keys in
     /// the volume, which grants nothing: the operator's touch does.
     IssuerDelegation,
+    /// The gateway identity in service, frozen for a signed transition (lot 6b).
+    GatewayIdentity,
+    /// The gateway's own leaves, withdrawn (lot 6b).
+    GatewayRevocation,
+    /// The first step of the certificate chain of §7.6 (lot 6b).
+    ChainOpen,
 }
 
 const DEFAULT_OPEN_WINDOW_SECS: u64 = 300;
@@ -1204,6 +1210,9 @@ enum OperatorOpenActionTag {
     TrustAuthorities,
     ClientRevocation,
     IssuerDelegation,
+    GatewayIdentity,
+    GatewayRevocation,
+    ChainOpen,
 }
 
 #[derive(Deserialize)]
@@ -1225,6 +1234,11 @@ impl TryFrom<OperatorOpenRequestWire> for OperatorOpenRequest {
             (OperatorOpenActionTag::FleetLeafs, None) => OperatorOpenAction::FleetLeafs,
             (OperatorOpenActionTag::TrustAuthorities, None) => OperatorOpenAction::TrustAuthorities,
             (OperatorOpenActionTag::IssuerDelegation, None) => OperatorOpenAction::IssuerDelegation,
+            (OperatorOpenActionTag::GatewayIdentity, None) => OperatorOpenAction::GatewayIdentity,
+            (OperatorOpenActionTag::GatewayRevocation, None) => {
+                OperatorOpenAction::GatewayRevocation
+            }
+            (OperatorOpenActionTag::ChainOpen, None) => OperatorOpenAction::ChainOpen,
             (OperatorOpenActionTag::ClientRevocation, Some(peer)) => {
                 OperatorOpenAction::ClientRevocation { peer }
             }
@@ -1271,6 +1285,9 @@ pub struct OperatorOpened {
     /// names were just drawn in the volume, and this is their public half.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delegation_request: Option<String>,
+    /// The gateway PQ leaf in service, frozen with a `gateway_identity` campaign.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_certificate: Option<PqCertificate>,
 }
 
 /// What Astra reports of its own authority state, for Orion to decide what is

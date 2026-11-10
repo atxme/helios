@@ -231,16 +231,16 @@ fn specified(request: &DoorRequest) -> (bool, bool) {
         DoorRequest::FleetLeafs { .. } => (true, true),
         DoorRequest::TrustAuthorities { .. } => (true, true),
         DoorRequest::ClientRevocation { .. } => (true, true),
-        DoorRequest::GatewayRevocation { .. } => (true, false),
-        DoorRequest::GatewayIdentity { .. } => (true, false),
-        DoorRequest::ChainOpen { .. } => (true, false),
-        DoorRequest::ChainNext {} => (true, false),
-        DoorRequest::ChainAbandon {} => (true, false),
+        DoorRequest::GatewayRevocation { .. } => (true, true),
+        DoorRequest::GatewayIdentity { .. } => (true, true),
+        DoorRequest::ChainOpen { .. } => (true, true),
+        DoorRequest::ChainNext {} => (true, true),
+        DoorRequest::ChainAbandon {} => (true, true),
         DoorRequest::IssuerDelegation { .. } => (true, true),
         DoorRequest::IssuerRequest {} => (true, false),
         DoorRequest::PinCaTls { .. } => (true, false),
         DoorRequest::IssuerInstall { .. } => (true, false),
-        DoorRequest::GatewayIdentityPublish { .. } => (true, false),
+        DoorRequest::GatewayIdentityPublish { .. } => (true, true),
         DoorRequest::VaultCopy { .. } => (false, true),
     }
 }
@@ -1330,12 +1330,105 @@ async fn a_tunnel_cannot_reach_a_console_action() {
     let dir = tempfile::tempdir().expect("temp dir");
     let service = fixture(dir.path());
     let refusal = service
-        .door(tunnel(), DoorRequest::ChainOpen { text: text() }, NOW)
+        .door(
+            tunnel(),
+            DoorRequest::PinCaTls {
+                fingerprint: Fingerprint::of(b"client tls ca"),
+            },
+            NOW,
+        )
         .await
         .expect_err("the tunnel is refused");
     assert!(matches!(refusal, DoorRefusal::NotAllowedHere));
     assert!(service.signing.lock().await.pending(NOW).is_empty());
     assert!(!plan_path(dir.path()).exists());
+}
+
+/// The rows of §5.1 that the tunnel gains in lot 6b, one assertion per row.
+#[test]
+fn the_tunnel_may_open_gateway_actions() {
+    let rows = [
+        (
+            DoorRequest::GatewayIdentity { text: text() },
+            "gateway_identity",
+        ),
+        (DoorRequest::GatewayIdentityPublish { epoch: 5 }, "publish"),
+        (
+            DoorRequest::GatewayRevocation { text: text() },
+            "gateway_revocation",
+        ),
+        (DoorRequest::ChainOpen { text: text() }, "chain_open"),
+        (DoorRequest::ChainNext {}, "chain_next"),
+        (DoorRequest::ChainAbandon {}, "chain_abandon"),
+    ];
+    for (request, row) in &rows {
+        assert!(allowed(&console(), request), "console, {row}");
+        assert!(allowed(&tunnel(), request), "tunnel, {row}");
+    }
+    // What stays at the console: the three rows of §5.1 left out.
+    for request in [
+        DoorRequest::IssuerRequest {},
+        DoorRequest::PinCaTls {
+            fingerprint: Fingerprint::of(b"client tls ca"),
+        },
+        DoorRequest::IssuerInstall {
+            authorization: Box::new(delegation(&delegated_material(), 1)),
+        },
+    ] {
+        assert!(
+            allowed(&console(), &request),
+            "console, {}",
+            request.action()
+        );
+        assert!(
+            !allowed(&tunnel(), &request),
+            "tunnel, {}",
+            request.action()
+        );
+    }
+}
+
+#[test]
+fn the_tunnel_maps_every_gateway_action_to_its_door_request() {
+    let gateway = |action| OperatorOpenRequest {
+        action,
+        reason: "quarterly rotation".into(),
+        requested_by: "alice".into(),
+        window_secs: 300,
+    };
+    assert_eq!(
+        DoorRequest::from(gateway(OperatorOpenAction::GatewayIdentity)),
+        DoorRequest::GatewayIdentity { text: text() }
+    );
+    assert_eq!(
+        DoorRequest::from(gateway(OperatorOpenAction::GatewayRevocation)),
+        DoorRequest::GatewayRevocation { text: text() }
+    );
+    assert_eq!(
+        DoorRequest::from(gateway(OperatorOpenAction::ChainOpen)),
+        DoorRequest::ChainOpen { text: text() }
+    );
+}
+
+/// The `requested_by` rule of 5a §5.3, for a gateway action: the tunnel's
+/// campaign names the peer the gateway resolved, after the text it wrote.
+#[tokio::test]
+async fn requested_by_names_the_resolved_peer_for_gateway_actions() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let service = fixture_with_gateway(dir.path()).await;
+    let opened = opened(
+        service
+            .door(
+                tunnel(),
+                DoorRequest::GatewayRevocation { text: text() },
+                NOW,
+            )
+            .await,
+    );
+    assert_eq!(
+        campaign_of(&service, &opened).await.requested_by,
+        format!("alice — pair wireguard:{}", tunnel_key())
+    );
 }
 
 #[tokio::test]

@@ -672,6 +672,36 @@ fn an_open_request_spells_its_action() {
 }
 
 #[test]
+fn wire_opens_gateway_actions() {
+    for (action, name) in [
+        (OperatorOpenAction::GatewayIdentity, "gateway_identity"),
+        (OperatorOpenAction::GatewayRevocation, "gateway_revocation"),
+        (OperatorOpenAction::ChainOpen, "chain_open"),
+    ] {
+        let request = OperatorOpenRequest {
+            action,
+            reason: "scheduled".to_owned(),
+            requested_by: "alice".to_owned(),
+            window_secs: 300,
+        };
+        let value = serde_json::to_value(&request).expect("serialize");
+        assert_eq!(value["action"], name);
+        assert!(value.get("peer").is_none());
+        let back: OperatorOpenRequest = serde_json::from_value(value).expect("round trip");
+        assert_eq!(back, request);
+    }
+
+    // A gateway action names no peer: the gateway is the only one it concerns.
+    let naming_a_peer = serde_json::json!({
+        "action": "gateway_identity",
+        "peer": serde_json::to_value(client_key()).expect("peer"),
+        "reason": "scheduled",
+        "requested_by": "alice",
+    });
+    assert!(serde_json::from_value::<OperatorOpenRequest>(naming_a_peer).is_err());
+}
+
+#[test]
 fn an_open_request_defaults_its_window_to_300() {
     let request: OperatorOpenRequest = serde_json::from_value(serde_json::json!({
         "action": "fleet_leafs",
@@ -694,6 +724,7 @@ fn an_opened_answer_omits_absent_expiries() {
         expires_at: 1_000,
         revocation_expiries: None,
         delegation_request: None,
+        gateway_certificate: None,
     };
     let value = serde_json::to_value(&opened).expect("serialize");
     assert!(value.get("revocation_expiries").is_none());

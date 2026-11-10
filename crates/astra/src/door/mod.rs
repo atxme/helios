@@ -229,6 +229,9 @@ impl From<OperatorOpenRequest> for DoorRequest {
             OperatorOpenAction::TrustAuthorities => Self::TrustAuthorities { text },
             OperatorOpenAction::ClientRevocation { peer } => Self::ClientRevocation { peer, text },
             OperatorOpenAction::IssuerDelegation => Self::IssuerDelegation { text },
+            OperatorOpenAction::GatewayIdentity => Self::GatewayIdentity { text },
+            OperatorOpenAction::GatewayRevocation => Self::GatewayRevocation { text },
+            OperatorOpenAction::ChainOpen => Self::ChainOpen { text },
         }
     }
 }
@@ -561,16 +564,16 @@ pub fn allowed(connector: &DoorConnector, request: &DoorRequest) -> bool {
         DoorRequest::FleetLeafs { .. } => (true, true),
         DoorRequest::TrustAuthorities { .. } => (true, true),
         DoorRequest::ClientRevocation { .. } => (true, true),
-        DoorRequest::GatewayRevocation { .. } => (true, false),
-        DoorRequest::GatewayIdentity { .. } => (true, false),
-        DoorRequest::ChainOpen { .. } => (true, false),
-        DoorRequest::ChainNext {} => (true, false),
-        DoorRequest::ChainAbandon {} => (true, false),
+        DoorRequest::GatewayRevocation { .. } => (true, true),
+        DoorRequest::GatewayIdentity { .. } => (true, true),
+        DoorRequest::ChainOpen { .. } => (true, true),
+        DoorRequest::ChainNext {} => (true, true),
+        DoorRequest::ChainAbandon {} => (true, true),
         DoorRequest::IssuerDelegation { .. } => (true, true),
         DoorRequest::IssuerRequest {} => (true, false),
         DoorRequest::PinCaTls { .. } => (true, false),
         DoorRequest::IssuerInstall { .. } => (true, false),
-        DoorRequest::GatewayIdentityPublish { .. } => (true, false),
+        DoorRequest::GatewayIdentityPublish { .. } => (true, true),
         DoorRequest::VaultCopy { .. } => (false, true),
     };
     match connector {
@@ -856,7 +859,7 @@ impl AstraService {
         // pins. Written before the opening, so that a write that fails leaves
         // nothing pending.
         self.export_active_gateway_certificate(&identity)?;
-        open::open_campaign(
+        let mut opening = open::open_campaign(
             self,
             connector,
             CampaignScope::GatewayIdentity,
@@ -864,7 +867,11 @@ impl AstraService {
             |state| Ok(resolve::gateway_identity(state, &identity)),
             now_unix,
         )
-        .await
+        .await?;
+        // The tunnel has no file to read: the leaf travels in the answer, and
+        // Orion checks it against the fingerprint the campaign froze.
+        opening.opened.gateway_certificate = Some(identity.pq_certificate);
+        Ok(opening)
     }
 
     /// Learns an admitted peer this registry has never held, before a
