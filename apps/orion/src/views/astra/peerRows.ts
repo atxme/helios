@@ -37,6 +37,9 @@ const valueOf = <T>(reach: Reach<T>): T | null => (reach.state === 'ok' ? reach.
 
 /**
  * The state of one registry peer. The admission is matched by WireGuard key, never by name.
+ * A peer revoked at Astra reads as not yet informed while the gateway still admits it or its
+ * registry certificate is not revoked: Astra may have recorded a revocation the gateway lacks
+ * (spec §5.7). Revoked reads only once the gateway holds it too.
  * Without Astra's list, an admitted peer reads as active and a cut one as unknown: revoked and
  * cut cannot be told apart from here.
  */
@@ -49,7 +52,9 @@ function stateOf(
   const isAdmitted = admitted.has(peer.wg_public_key)
   const active = peer.renewing ? STATE.RENEWING : STATE.ACTIVE
   if (revoked === null) return isAdmitted ? active : STATE.UNKNOWN
-  if (revoked.has(peer.wg_public_key)) return isAdmitted ? STATE.REVOKED_NOT_INFORMED : STATE.REVOKED
+  if (revoked.has(peer.wg_public_key)) {
+    return isAdmitted || !peer.revoked ? STATE.REVOKED_NOT_INFORMED : STATE.REVOKED
+  }
   return isAdmitted ? active : STATE.CUT
 }
 

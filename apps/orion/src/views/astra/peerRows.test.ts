@@ -99,6 +99,37 @@ describe('the state of each workstation', () => {
     })
   })
 
+  it('a_revoked_peer_not_admitted_whose_gateway_certificate_is_not_revoked_is_not_yet_informed', () => {
+    const rows = peerRows(
+      overview({
+        certificates: {
+          state: 'ok',
+          value: [peer({ name: 'PC_BUREAU', wg_public_key: KEY_B, revoked: false })],
+        },
+        admitted: { state: 'ok', value: [] },
+        astra_revoked: { state: 'ok', value: [KEY_B] },
+      }),
+    )
+    expect(one(rows, KEY_B)).toMatchObject({
+      state: 'Révoqué, gateway pas encore informée',
+      action: null,
+    })
+  })
+
+  it('a_revoked_peer_not_admitted_whose_gateway_certificate_is_revoked_is_revoked', () => {
+    const rows = peerRows(
+      overview({
+        certificates: {
+          state: 'ok',
+          value: [peer({ name: 'PC_BUREAU', wg_public_key: KEY_B, revoked: true })],
+        },
+        admitted: { state: 'ok', value: [] },
+        astra_revoked: { state: 'ok', value: [KEY_B] },
+      }),
+    )
+    expect(one(rows, KEY_B)).toMatchObject({ state: 'Révoqué', action: null })
+  })
+
   it('rows_match_the_admission_by_wireguard_key_never_by_name', () => {
     const rows = peerRows(
       overview({
