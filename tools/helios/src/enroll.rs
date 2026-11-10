@@ -342,6 +342,15 @@ mod tests {
     }
 
     #[test]
+    fn shell_word_quotes_empty_whitespace_and_embedded_quotes_safely() {
+        assert_eq!(shell_word(""), "''");
+        assert_eq!(shell_word("plain-1/path"), "plain-1/path");
+        assert_eq!(shell_word("a b"), "'a b'");
+        assert_eq!(shell_word("a'b"), "'a'\\''b'");
+        assert_eq!(shell_word("$(touch marker)"), "'$(touch marker)'");
+    }
+
+    #[test]
     fn the_old_one_shot_options_are_gone() {
         use clap::Parser as _;
         let base = [
@@ -528,6 +537,62 @@ mod tests {
         let error = read_file(&path).expect_err("missing file must fail");
         let message = format!("{error:#}");
         assert!(message.contains("reading"), "{message}");
+        assert!(message.contains(&path.display().to_string()), "{message}");
+    }
+
+    #[test]
+    fn read_trust_material_reports_missing_and_malformed_files_with_context() {
+        let directory = tempfile::tempdir().expect("temporary trust directory");
+        let missing = directory.path().join("absent-trust.json");
+
+        let error = read_trust_material(&missing).expect_err("missing trust file must fail");
+        let message = format!("{error:#}");
+        assert!(message.contains("reading the trust block"), "{message}");
+        assert!(
+            message.contains(&missing.display().to_string()),
+            "{message}"
+        );
+
+        let malformed = directory.path().join("malformed-trust.json");
+        std::fs::write(&malformed, b"{not-json").expect("write malformed trust block");
+        let error = read_trust_material(&malformed).expect_err("malformed trust JSON must fail");
+        let message = format!("{error:#}");
+        assert!(message.contains("is not a trust block"), "{message}");
+        assert!(
+            message.contains(&malformed.display().to_string()),
+            "{message}"
+        );
+        assert!(message.contains("show-trust-enrolment"), "{message}");
+    }
+
+    #[test]
+    fn read_trust_material_validates_decoded_fields_before_returning() {
+        let directory = tempfile::tempdir().expect("temporary trust directory");
+        let path = directory.path().join("invalid-trust.json");
+        let trust = orion_core::TrustMaterial {
+            trust_domain_id: "not-a-domain-id".into(),
+            ca_epoch: 1,
+            ca_pq_public_key: String::new(),
+            ca_tls_epoch: 1,
+            client_tls_ca_der: String::new(),
+            client_generation: 1,
+            active_gateway_identity_epoch: 1,
+            gateway_decision_epoch: 1,
+            astra_authority_url: "https://astra.example".into(),
+            webauthn_rp_id: "astra.example".into(),
+            astra_policy_fingerprint: String::new(),
+            credential_registry_epoch: 1,
+            astra_credential_bindings: Vec::new(),
+            astra_service_key_epoch: 1,
+            astra_service_public_key: String::new(),
+        };
+        std::fs::write(&path, serde_json::to_vec(&trust).expect("trust JSON"))
+            .expect("write invalid trust block");
+
+        let error = read_trust_material(&path).expect_err("invalid trust fields must fail");
+        let message = format!("{error:#}");
+        assert!(message.contains("trust block"), "{message}");
+        assert!(message.contains("unusable"), "{message}");
         assert!(message.contains(&path.display().to_string()), "{message}");
     }
 
