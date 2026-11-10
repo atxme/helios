@@ -25,6 +25,7 @@
 
 use std::path::Path;
 
+use aether::certificates::approval::CredentialRegistry;
 use aether::certificates::encoding::{Id16, MlDsa87PublicKey, WireGuardKey};
 use aether::certificates::operator_session::RevocationManifest;
 use aether::certificates::revocation::{RevocationReason, RevocationScope};
@@ -48,6 +49,7 @@ use crate::signing::{
     RevocationAnchorRefusal, RevocationDecision,
 };
 use crate::tunnel::{is_unreachable, Tunnel, TunnelRefusal};
+use crate::vault::AuthorityVault;
 
 /// The name of the record, beside the vault.
 const PENDING_FILE: &str = "pending-revocation.json";
@@ -73,7 +75,7 @@ pub enum RevocationReasonChoice {
 }
 
 impl RevocationReasonChoice {
-    fn reason(self) -> RevocationReason {
+    pub(super) fn reason(self) -> RevocationReason {
         match self {
             Self::StolenOrLost => RevocationReason::SuspectedCompromise,
             Self::Compromised => RevocationReason::KeyCompromise,
@@ -83,7 +85,7 @@ impl RevocationReasonChoice {
     }
 
     /// The text the campaign carries, which the operator reads on the door's screen.
-    fn label(self) -> &'static str {
+    pub(super) fn label(self) -> &'static str {
         match self {
             Self::StolenOrLost => "Volé ou perdu",
             Self::Compromised => "Compromis",
@@ -168,7 +170,7 @@ pub enum RevocationRefusal {
 }
 
 /// A UTC instant, for the refusal that names when signing becomes possible.
-fn utc_label(at: u64) -> String {
+pub(super) fn utc_label(at: u64) -> String {
     match i64::try_from(at)
         .ok()
         .and_then(|seconds| time::OffsetDateTime::from_unix_timestamp(seconds).ok())
@@ -262,60 +264,12 @@ pub fn open(
     let overlap = remote
         .overlap_not_after()
         .map_err(unreachable_or_internal)?;
-    let anchor = revocation_anchor(
-        vault,
-        &authority.ca_fingerprint,
-        authority.ca_epoch,
-        identity.ca_epoch,
-        overlap,
-        now,
-    )
-    .map_err(|refusal| match refusal {
-        RevocationAnchorRefusal::NotBefore(at) => RevocationRefusal::NotBefore(at),
-        RevocationAnchorRefusal::UnknownAnchor => RevocationRefusal::UnknownAnchor,
-    })?;
-
-    // The key and the epoch that the anchor names, which are the ones checked.
-    let (anchor_key, anchor_identity) = match anchor {
-        RevocationAnchor::Current => (
-            MlDsa87PublicKey::parse(vault.ca_pq_public_key.trim()).map_err(internal)?,
-            identity.clone(),
-        ),
-        RevocationAnchor::Outgoing => {
-            let (key, ca_epoch, _) = vault.retained_outgoing_ca_pq_public().ok_or_else(|| {
-                RevocationRefusal::Internal("aucune CA-PQ sortante gardée".into())
-            })?;
-            (
-                key,
-                DomainIdentity {
-                    ca_epoch,
-                    ..identity.clone()
-                },
-            )
-        }
-    };
-
-    // The document the approval is checked against: the one Astra serves under the
-    // outgoing anchor, and the local one under the current anchor.
-    let document = match anchor {
-        RevocationAnchor::Current => credentials::load(&credentials::path_beside(vault_path))
-            .map_err(internal)?
-            .ok_or(RevocationRefusal::CredentialsUnverified)?,
-        RevocationAnchor::Outgoing => authority
-            .served_credentials
-            .take()
-            .map(|served| *served)
-            .ok_or(RevocationRefusal::CredentialsUnverified)?,
-    };
-    document
-        .verify(
-            &anchor_key,
-            &anchor_identity.trust_domain_id,
-            &anchor_identity.gateway_wg_public_key,
-            anchor_identity.ca_epoch,
-            document.credential_registry_epoch,
-        )
-        .map_err(|_| RevocationRefusal::CredentialsUnverified)?;
+    let SelectedAnchor {
+        anchor,
+        key: anchor_key,
+        identity: anchor_identity,
+        document,
+    } = select_anchor(vault, vault_path, &mut authority, overlap, &identity, now)?;
 
     let opened = remote
         .open_campaign(&OperatorOpenRequest {
@@ -608,6 +562,89 @@ fn clear(vault_path: &Path) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error).with_context(|| format!("suppression de {}", path.display())),
     }
+}
+
+/// The anchor a revocation is checked under, with the key and the identity it names, and
+/// the document its approvals are checked against. Shared by the client revocation and the
+/// gateway's (lot 6b).
+pub(super) struct SelectedAnchor {
+    pub(super) anchor: RevocationAnchor,
+    pub(super) key: MlDsa87PublicKey,
+    pub(super) identity: DomainIdentity,
+    pub(super) document: CredentialRegistry,
+}
+
+/// Chooses the anchor Astra checks, then reads the key and the document that go with it.
+/// Nothing here asks for a key.
+pub(super) fn select_anchor(
+    vault: &AuthorityVault,
+    vault_path: &Path,
+    authority: &mut OperatorAuthorityStatus,
+    overlap: Option<u64>,
+    identity: &DomainIdentity,
+    now: u64,
+) -> Result<SelectedAnchor, RevocationRefusal> {
+    let anchor = revocation_anchor(
+        vault,
+        &authority.ca_fingerprint,
+        authority.ca_epoch,
+        identity.ca_epoch,
+        overlap,
+        now,
+    )
+    .map_err(|refusal| match refusal {
+        RevocationAnchorRefusal::NotBefore(at) => RevocationRefusal::NotBefore(at),
+        RevocationAnchorRefusal::UnknownAnchor => RevocationRefusal::UnknownAnchor,
+    })?;
+
+    // The key and the epoch that the anchor names, which are the ones checked.
+    let (anchor_key, anchor_identity) = match anchor {
+        RevocationAnchor::Current => (
+            MlDsa87PublicKey::parse(vault.ca_pq_public_key.trim()).map_err(internal)?,
+            identity.clone(),
+        ),
+        RevocationAnchor::Outgoing => {
+            let (key, ca_epoch, _) = vault.retained_outgoing_ca_pq_public().ok_or_else(|| {
+                RevocationRefusal::Internal("aucune CA-PQ sortante gardée".into())
+            })?;
+            (
+                key,
+                DomainIdentity {
+                    ca_epoch,
+                    ..identity.clone()
+                },
+            )
+        }
+    };
+
+    // The document the approval is checked against: the one Astra serves under the
+    // outgoing anchor, and the local one under the current anchor.
+    let document = match anchor {
+        RevocationAnchor::Current => credentials::load(&credentials::path_beside(vault_path))
+            .map_err(internal)?
+            .ok_or(RevocationRefusal::CredentialsUnverified)?,
+        RevocationAnchor::Outgoing => authority
+            .served_credentials
+            .take()
+            .map(|served| *served)
+            .ok_or(RevocationRefusal::CredentialsUnverified)?,
+    };
+    document
+        .verify(
+            &anchor_key,
+            &anchor_identity.trust_domain_id,
+            &anchor_identity.gateway_wg_public_key,
+            anchor_identity.ca_epoch,
+            document.credential_registry_epoch,
+        )
+        .map_err(|_| RevocationRefusal::CredentialsUnverified)?;
+
+    Ok(SelectedAnchor {
+        anchor,
+        key: anchor_key,
+        identity: anchor_identity,
+        document,
+    })
 }
 
 /// A 403 on the door's open call. The door refuses an unknown peer, a peer it holds

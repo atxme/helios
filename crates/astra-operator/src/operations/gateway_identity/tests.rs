@@ -37,12 +37,12 @@ use crate::tunnel::admin_refusal;
 use crate::{gestures, store};
 
 const DAY: u64 = 86_400;
-const ACTIVE_TLS: &[u8] = b"la TLS de la gateway en service";
+pub(crate) const ACTIVE_TLS: &[u8] = b"la TLS de la gateway en service";
 
 /// The gateway's key, and the leaf Astra signed for it, as the domain holds them.
-struct InService {
-    key: Zeroizing<Vec<u8>>,
-    leaf: PqCertificate,
+pub(crate) struct InService {
+    pub(crate) key: Zeroizing<Vec<u8>>,
+    pub(crate) leaf: PqCertificate,
 }
 
 fn gateway_in_service(domain: &Domain) -> InService {
@@ -99,7 +99,7 @@ fn prepared_request(
 }
 
 /// A self-signed TLS leaf of the gateway: not a CA, serving TLS for its name.
-fn gateway_tls_leaf() -> DerCertificate {
+pub(crate) fn gateway_tls_leaf() -> DerCertificate {
     let mut params = rcgen::CertificateParams::new(vec![SERVER_NAME.to_string()]).expect("params");
     params.is_ca = rcgen::IsCa::NoCa;
     params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
@@ -110,16 +110,16 @@ fn gateway_tls_leaf() -> DerCertificate {
 }
 
 /// One renewal's inputs: the domain, the gateway in service, and what it prepares.
-struct Scenario {
-    domain: Domain,
-    in_service: InService,
-    key_recovery: bool,
-    request: GatewayCertificateRequest,
-    candidate: DerCertificate,
+pub(crate) struct Scenario {
+    pub(crate) domain: Domain,
+    pub(crate) in_service: InService,
+    pub(crate) key_recovery: bool,
+    pub(crate) request: GatewayCertificateRequest,
+    pub(crate) candidate: DerCertificate,
 }
 
 impl Scenario {
-    fn new(key_recovery: bool) -> Self {
+    pub(crate) fn new(key_recovery: bool) -> Self {
         let domain = domain();
         let in_service = gateway_in_service(&domain);
         let (new_key, new_public) = generate_ml_dsa_87_keypair().expect("next key");
@@ -135,12 +135,12 @@ impl Scenario {
         }
     }
 
-    fn leaf(&self) -> Fingerprint {
+    pub(crate) fn leaf(&self) -> Fingerprint {
         pq_certificate_fingerprint(&self.in_service.leaf).expect("fingerprint")
     }
 
     /// The campaign Astra freezes for the gateway's leaf `leaf`, one decision forward.
-    fn campaign(&self, leaf: Fingerprint) -> AstraRotationCampaign {
+    pub(crate) fn campaign(&self, leaf: Fingerprint) -> AstraRotationCampaign {
         self.domain.campaign(
             CampaignScope::GatewayIdentity,
             vec![CampaignTarget {
@@ -156,7 +156,7 @@ impl Scenario {
     }
 }
 
-fn gateway_read() -> GatewayIdentityRead {
+pub(crate) fn gateway_read() -> GatewayIdentityRead {
     GatewayIdentityRead {
         now_unix: None,
         ca_pq_fingerprint: Fingerprint::of(b"ca-pq"),

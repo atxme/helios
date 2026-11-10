@@ -53,8 +53,10 @@ use crate::authenticator::Authenticator;
 use crate::credentials;
 use crate::handoff::{self, DomainHandoff};
 use crate::operations::campaign_result;
+use crate::operations::gateway_revocation::pending_revocation;
 use crate::operations::keys::{approve_one, KeyStep, ValidatedKeys};
 use crate::operations::recovery::random_id;
+use crate::operations::revocation::{utc_label, RevocationRefusal};
 use crate::operations::rotation::ensure_same_vault;
 use crate::origin::CampaignRequest;
 use crate::signing::{
@@ -72,10 +74,10 @@ use crate::vault_gestures::DAY_SECS;
 const PENDING_FILE: &str = "pending-gateway-decision.json";
 
 /// The window of the campaign, as the door opens it (spec §7.6).
-const CAMPAIGN_WINDOW_SECS: u64 = 300;
+pub(super) const CAMPAIGN_WINDOW_SECS: u64 = 300;
 
 /// What the campaign's text names as the requester: the console, not a person.
-const REQUESTED_BY: &str = "Orion";
+pub(super) const REQUESTED_BY: &str = "Orion";
 
 /// What the renewal needs from the far side of the tunnel.
 ///
@@ -216,6 +218,29 @@ pub enum GatewayRefusal {
     /// The gateway is revoked: no outgoing identity can be selected for it.
     #[error("la gateway est révoquée : aucune identité ne la remplace. Rien n'a été signé.")]
     Revoked,
+    /// The gateway is already revoked. The tunnel exposes no gateway-revoked flag, so this is
+    /// declared for the console and never produced here.
+    #[error("la gateway est déjà révoquée. Rien n'a été signé.")]
+    AlreadyRevoked,
+    /// The replacement waits for the end of the overlap: the gateway verifies it under the
+    /// outgoing `CA-PQ` until then, and the vault cannot sign under that key (lot 6b, §7.1).
+    #[error("le remplacement de la gateway est possible après le {}. Rien n'a été signé.", utc_label(*.0))]
+    ReplacementNotBefore(u64),
+    /// A revocation of the gateway refused by its own anchor rule (lot 5c, shared).
+    #[error("{0}")]
+    Revocation(RevocationRefusal),
+    /// A gateway revocation waits for its next step: reopening it would overwrite the record.
+    #[error("une révocation de la gateway attend déjà. Reprendre celle-ci.")]
+    RevocationAlreadyOpen,
+    /// A gateway revocation waits in the record: the renewal and the cancellation wait for it.
+    #[error("une révocation de la gateway attend dans le registre : la reprendre ou la jeter avant d'ouvrir une autre décision. Rien n'a été modifié.")]
+    RevocationPending,
+    /// A renewal or a cancellation waits in the record: the revocation waits for it.
+    #[error("une décision d'identité de la gateway attend dans le registre : la reprendre ou la jeter avant d'ouvrir une révocation. Rien n'a été modifié.")]
+    DecisionPending,
+    /// The replacement is deposited: the revocation still needs its own approval. Nothing is revoked yet.
+    #[error("le remplaçant de la gateway est déposé : la révocation reste à signer, par une nouvelle approbation. Rien n'est révoqué.")]
+    RevocationToSign,
     /// The gateway refused the document for good, and said why.
     #[error("{0}")]
     GatewayRefused(String),
@@ -301,6 +326,12 @@ pub fn open_renewal(
     // would overwrite it before it is deposited.
     if pending(vault_path, now).map_err(internal)?.is_some() {
         return Err(GatewayRefusal::AlreadyOpen);
+    }
+    if pending_revocation(vault_path, now)
+        .map_err(internal)?
+        .is_some()
+    {
+        return Err(GatewayRefusal::RevocationPending);
     }
     let gateway = remote.gateway().map_err(before_signing)?;
     if gateway.gateway_transition_pending {
@@ -477,12 +508,15 @@ impl OpenedGatewayRenewal {
         vault_path: &Path,
         now: u64,
     ) -> Result<SignedGatewayDecision, GatewayRefusal> {
-        self.sign_and_record_as(vault_path, now, false)
+        let signed = self.sign_decision(vault_path, now, false)?;
+        save(&record_path(vault_path), &signed).map_err(internal)?;
+        Ok(signed)
     }
 
-    /// The signature with the reason named by the caller. Only the emergency replacement
-    /// of Task 6 says `emergency_replacement`: the public terms never do.
-    pub(crate) fn sign_and_record_as(
+    /// The signature, with the reason named by the caller and nothing recorded: the caller
+    /// writes the record, which is what the gateway revocation does for its replacement.
+    /// Only that replacement says `emergency_replacement`: the public terms never do.
+    pub(crate) fn sign_decision(
         self,
         vault_path: &Path,
         now: u64,
@@ -567,7 +601,6 @@ impl OpenedGatewayRenewal {
             installed: false,
             published: false,
         };
-        save(&record_path(vault_path), &signed).map_err(internal)?;
         Ok(signed)
     }
 }
@@ -650,6 +683,12 @@ pub fn open_abort(
 ) -> Result<OpenedGatewayAbort, GatewayRefusal> {
     if pending(vault_path, now).map_err(internal)?.is_some() {
         return Err(GatewayRefusal::AlreadyOpen);
+    }
+    if pending_revocation(vault_path, now)
+        .map_err(internal)?
+        .is_some()
+    {
+        return Err(GatewayRefusal::RevocationPending);
     }
     let gateway = remote.gateway().map_err(before_signing)?;
     let transition = remote
@@ -1007,7 +1046,7 @@ pub fn carry_rollback(
 
 /// The transition the gateway holds must name this domain's gateway. Checked before any key
 /// is asked for, as the signer checks it before it asks for one.
-fn bound_to_domain(
+pub(super) fn bound_to_domain(
     transition: &GatewayIdentityTransition,
     identity: &DomainIdentity,
 ) -> Result<(), GatewayRefusal> {
@@ -1031,23 +1070,34 @@ fn abort_of(decision: &SignedGatewayDecision) -> Result<&GatewayTransitionAbort,
 
 /// Sends the decision to Astra. A lost answer is replayed with the same bytes and no key:
 /// the campaign is asked again for a fresh token, and Astra takes the identical result.
-fn deposit(
+pub(super) fn deposit(
     remote: &dyn GatewayIdentityRemote,
     decision: &SignedGatewayDecision,
 ) -> Result<(), GatewayRefusal> {
+    deposit_result(
+        remote,
+        &decision.operation_id,
+        &decision.campaign_id,
+        &decision.result,
+    )
+}
+
+/// The deposit of any signed result of a campaign: a renewal, a cancellation, or a revocation.
+pub(super) fn deposit_result(
+    remote: &dyn GatewayIdentityRemote,
+    operation_id: &Id16,
+    campaign_id: &Id16,
+    result: &AstraSignerResult,
+) -> Result<(), GatewayRefusal> {
     let request = remote
-        .fetch_campaign(&decision.operation_id)
+        .fetch_campaign(operation_id)
         .map_err(unreachable_or_internal)?;
-    if request.campaign.campaign_id != decision.campaign_id {
+    if request.campaign.campaign_id != *campaign_id {
         return Err(GatewayRefusal::Internal(
             "la campagne relue n'est pas celle de la décision enregistrée.".into(),
         ));
     }
-    match remote.submit_campaign(
-        &decision.operation_id,
-        &request.result_token,
-        &decision.result,
-    ) {
+    match remote.submit_campaign(operation_id, &request.result_token, result) {
         Ok(SigningOperationState::Approved) => Ok(()),
         Ok(SigningOperationState::AwaitingOperator) => Err(GatewayRefusal::Internal(
             "Astra n'a pas enregistré ce dépôt.".into(),
@@ -1090,7 +1140,7 @@ pub fn discard_pending(vault_path: &Path) -> Result<()> {
     clear(vault_path)
 }
 
-fn transition_of(
+pub(super) fn transition_of(
     decision: &SignedGatewayDecision,
 ) -> Result<&GatewayIdentityTransition, GatewayRefusal> {
     match decision.result.objects.first() {
@@ -1110,7 +1160,7 @@ fn renewal_reason(emergency_replacement: bool, key_recovery: bool) -> RotationRe
 }
 
 /// The credential document beside the vault, which the approvals are checked against.
-fn credential_document(vault_path: &Path) -> Result<CredentialRegistry, GatewayRefusal> {
+pub(super) fn credential_document(vault_path: &Path) -> Result<CredentialRegistry, GatewayRefusal> {
     credentials::load(&credentials::path_beside(vault_path))
         .map_err(internal)?
         .ok_or_else(|| {
@@ -1192,7 +1242,7 @@ fn refused_by_door(vault_path: &Path, now: u64) -> GatewayRefusal {
 /// A refusal the gateway or Astra gives for good (any status but the three that say only
 /// that something could not answer) keeps its sentence. The record stays: nothing is
 /// retried on its own.
-fn refused_by_gateway(error: anyhow::Error) -> GatewayRefusal {
+pub(super) fn refused_by_gateway(error: anyhow::Error) -> GatewayRefusal {
     match error.downcast_ref::<TunnelRefusal>() {
         Some(refusal) if !matches!(refusal.status, 429 | 500 | 503) => {
             GatewayRefusal::GatewayRefused(refusal.to_string())
@@ -1202,7 +1252,7 @@ fn refused_by_gateway(error: anyhow::Error) -> GatewayRefusal {
 }
 
 /// An unreachable call before any signature says so.
-fn before_signing(error: anyhow::Error) -> GatewayRefusal {
+pub(super) fn before_signing(error: anyhow::Error) -> GatewayRefusal {
     match unreachable_or_internal(error) {
         GatewayRefusal::Unreachable => GatewayRefusal::UnreachableBeforeSigning,
         other => other,
@@ -1211,7 +1261,7 @@ fn before_signing(error: anyhow::Error) -> GatewayRefusal {
 
 /// A call that failed for want of an answer is `Unreachable`; a gateway answer of 503
 /// says the same about Astra behind it. Anything else is a failure to name.
-fn unreachable_or_internal(error: anyhow::Error) -> GatewayRefusal {
+pub(super) fn unreachable_or_internal(error: anyhow::Error) -> GatewayRefusal {
     match error.downcast_ref::<TunnelRefusal>() {
         Some(refusal) if refusal.status == 503 => GatewayRefusal::Unreachable,
         _ if is_unreachable(&error) => GatewayRefusal::Unreachable,
@@ -1219,9 +1269,9 @@ fn unreachable_or_internal(error: anyhow::Error) -> GatewayRefusal {
     }
 }
 
-fn internal<E: Into<anyhow::Error>>(error: E) -> GatewayRefusal {
+pub(super) fn internal<E: Into<anyhow::Error>>(error: E) -> GatewayRefusal {
     GatewayRefusal::Internal(format!("{:#}", error.into()))
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

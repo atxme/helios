@@ -8,6 +8,7 @@
 
 pub mod campaign;
 pub mod gateway_identity;
+pub mod gateway_revocation;
 pub mod issuer;
 pub(crate) mod keys;
 
