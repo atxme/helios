@@ -61,6 +61,7 @@ use crate::signing::{
     self, CampaignApprovalSession, DomainIdentity, GatewayAbortDecision, GatewayTransitionDecision,
     ServiceRollbackDecision,
 };
+use crate::store;
 use crate::tunnel::{
     is_unreachable, GatewayDecisionRead, GatewayIdentityRead, GatewayRenewalRead,
     GatewayRollbackRead, RenewalAsk, Tunnel, TunnelRefusal,
@@ -206,6 +207,12 @@ pub enum GatewayRefusal {
     /// No overlap runs on the gateway now: the outgoing identity is not the one in service.
     #[error("aucun recouvrement en cours : l'ancienne identité n'est pas celle qui sert. Rien n'a été signé.")]
     NoOverlap,
+    /// The record waiting holds the other kind of decision: it is resumed by its own path.
+    #[error("une autre décision d'identité de la gateway attend dans le registre : la reprendre par son propre parcours. Rien n'a été modifié.")]
+    OtherKindPending,
+    /// A rollback went unconfirmed: nothing is recorded, and a new approval starts it again.
+    #[error("Astra ou la gateway est injoignable : le retour arrière n'est pas confirmé. Rien n'est enregistré côté poste ; le relancer demande une nouvelle approbation.")]
+    RollbackUnreachable,
     /// The gateway is revoked: no outgoing identity can be selected for it.
     #[error("la gateway est révoquée : aucune identité ne la remplace. Rien n'a été signé.")]
     Revoked,
@@ -239,7 +246,9 @@ pub struct SignedGatewayDecision {
     pub operation_id: Id16,
     pub campaign_id: Id16,
     pub expires_at: u64,
-    /// One gateway transition.
+    /// Which decision the record holds, so that each resume reads only its own.
+    pub kind: GatewayDecisionKind,
+    /// The object the decision carries: one gateway transition, or one cancellation.
     pub result: AstraSignerResult,
     /// Astra holds the decision: a resume deposits nothing again, and the record outlives
     /// the campaign, since installation and publication need no campaign.
@@ -248,6 +257,15 @@ pub struct SignedGatewayDecision {
     pub installed: bool,
     /// Astra relayed the transition to the gateway.
     pub published: bool,
+}
+
+/// The decisions a record can hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GatewayDecisionKind {
+    /// A transition that renews the gateway's identity.
+    Renewal,
+    /// The cancellation of a staged transition.
+    Abort,
 }
 
 /// How a carried renewal ended.
@@ -544,6 +562,7 @@ impl OpenedGatewayRenewal {
                 ))],
                 None,
             ),
+            kind: GatewayDecisionKind::Renewal,
             deposited: false,
             installed: false,
             published: false,
@@ -565,6 +584,9 @@ pub fn carry(
     mut decision: SignedGatewayDecision,
     now: u64,
 ) -> Result<GatewayCarried, GatewayRefusal> {
+    if decision.kind != GatewayDecisionKind::Renewal {
+        return Err(GatewayRefusal::OtherKindPending);
+    }
     let transition = transition_of(&decision)?.clone();
     if !decision.deposited {
         if now >= decision.expires_at {
@@ -639,10 +661,13 @@ pub fn open_abort(
         return Err(GatewayRefusal::AbortTooLate(activation_at));
     }
 
+    let stored = store::load(vault_path).map_err(internal)?;
+    let relay = DomainHandoff::beside(vault_path, &stored).map_err(internal)?;
+    let identity = handoff::identity_of(&relay).map_err(internal)?;
+    bound_to_domain(&transition, &identity)?;
+
     let keys = ValidatedKeys::new(vault_path).map_err(internal)?;
     let vault = &keys.vault;
-    let relay = DomainHandoff::beside(vault_path, vault).map_err(internal)?;
-    let identity = handoff::identity_of(&relay).map_err(internal)?;
     let anchor_key = MlDsa87PublicKey::parse(vault.ca_pq_public_key.trim()).map_err(internal)?;
 
     let opened = remote
@@ -768,6 +793,7 @@ impl OpenedGatewayAbort {
                 vec![TrustUpdateObject::GatewayTransitionAbort(Box::new(abort))],
                 None,
             ),
+            kind: GatewayDecisionKind::Abort,
             deposited: false,
             installed: false,
             published: false,
@@ -785,6 +811,9 @@ pub fn carry_abort(
     mut decision: SignedGatewayDecision,
     now: u64,
 ) -> Result<(), GatewayRefusal> {
+    if decision.kind != GatewayDecisionKind::Abort {
+        return Err(GatewayRefusal::OtherKindPending);
+    }
     let abort = abort_of(&decision)?.clone();
     if !decision.deposited {
         if now >= decision.expires_at {
@@ -850,10 +879,13 @@ pub fn open_rollback(
         .map(|expiry| expiry.min(window.not_after))
         .ok_or_else(|| GatewayRefusal::Internal("durée hors bornes".into()))?;
 
+    let stored = store::load(vault_path).map_err(internal)?;
+    let relay = DomainHandoff::beside(vault_path, &stored).map_err(internal)?;
+    let identity = handoff::identity_of(&relay).map_err(internal)?;
+    bound_to_domain(&transition, &identity)?;
+
     let keys = ValidatedKeys::new(vault_path).map_err(internal)?;
     let vault = &keys.vault;
-    let relay = DomainHandoff::beside(vault_path, vault).map_err(internal)?;
-    let identity = handoff::identity_of(&relay).map_err(internal)?;
     let anchor_key = MlDsa87PublicKey::parse(vault.ca_pq_public_key.trim()).map_err(internal)?;
 
     let campaign = AstraRotationCampaign {
@@ -965,7 +997,27 @@ pub fn carry_rollback(
     remote: &dyn GatewayIdentityRemote,
     authorization: CertificateServiceRollbackAuthorization,
 ) -> Result<GatewayRollbackRead, GatewayRefusal> {
-    remote.rollback(&authorization).map_err(refused_by_gateway)
+    remote
+        .rollback(&authorization)
+        .map_err(|error| match refused_by_gateway(error) {
+            GatewayRefusal::Unreachable => GatewayRefusal::RollbackUnreachable,
+            other => other,
+        })
+}
+
+/// The transition the gateway holds must name this domain's gateway. Checked before any key
+/// is asked for, as the signer checks it before it asks for one.
+fn bound_to_domain(
+    transition: &GatewayIdentityTransition,
+    identity: &DomainIdentity,
+) -> Result<(), GatewayRefusal> {
+    if transition.trust_domain_id != identity.trust_domain_id
+        || transition.gateway_wg_public_key != identity.gateway_wg_public_key
+        || transition.server_name != identity.server_name
+    {
+        return Err(GatewayRefusal::CampaignMismatch);
+    }
+    Ok(())
 }
 
 fn abort_of(decision: &SignedGatewayDecision) -> Result<&GatewayTransitionAbort, GatewayRefusal> {
@@ -1025,6 +1077,17 @@ pub fn pending(vault_path: &Path, now: u64) -> Result<Option<SignedGatewayDecisi
         return Ok(None);
     }
     Ok(Some(signed))
+}
+
+/// The kind of the decision waiting, if one is. Read by the console to offer the right path.
+pub fn pending_kind(vault_path: &Path, now: u64) -> Result<Option<GatewayDecisionKind>> {
+    Ok(pending(vault_path, now)?.map(|decision| decision.kind))
+}
+
+/// Removes the waiting record. Offered only after the gateway refused a deposited decision
+/// for good: the record otherwise blocks every new opening.
+pub fn discard_pending(vault_path: &Path) -> Result<()> {
+    clear(vault_path)
 }
 
 fn transition_of(

@@ -10,7 +10,7 @@ use std::collections::VecDeque;
 use aether::certificates::authority::RotationReason;
 use aether::certificates::encoding::{
     generate_ml_dsa_87_keypair, DerCertificate, Fingerprint, Id16, MlDsa87PublicKey,
-    MlDsa87Signature,
+    MlDsa87Signature, WireGuardKey,
 };
 use aether::certificates::gateway::{
     pq_certificate_fingerprint, GatewayBootstrapRequest, GatewayCertificateRequest,
@@ -204,6 +204,8 @@ struct Remote<'a> {
     /// Answers to the cancellations, in order; once empty, the gateway takes them.
     abort_replies: RefCell<VecDeque<u16>>,
     aborted: RefCell<Vec<GatewayTransitionAbort>>,
+    /// Answers to the rollbacks, in order; a number is a refusal with that status.
+    rollback_replies: RefCell<VecDeque<u16>>,
     rolled: RefCell<Vec<CertificateServiceRollbackAuthorization>>,
 }
 
@@ -235,6 +237,7 @@ impl<'a> Remote<'a> {
             staged: None,
             abort_replies: RefCell::default(),
             aborted: RefCell::default(),
+            rollback_replies: RefCell::default(),
             rolled: RefCell::default(),
         }
     }
@@ -370,6 +373,9 @@ impl GatewayIdentityRemote for Remote<'_> {
     ) -> Result<GatewayRollbackRead> {
         self.note("rollback");
         self.rolled.borrow_mut().push(authorization.clone());
+        if let Some(status) = self.rollback_replies.borrow_mut().pop_front() {
+            return Err(admin_refusal(status, None));
+        }
         Ok(GatewayRollbackRead {
             expires_at: authorization.expires_at,
         })
@@ -1042,4 +1048,166 @@ fn rollback_hours_are_capped_by_not_after() {
     let authorization = opened.sign(&domain.path, clock).expect("signed");
 
     assert_eq!(authorization.expires_at, transition.window.not_after);
+}
+
+/// The transition the gateway holds, moved to another gateway's key.
+fn foreign(transition: &GatewayIdentityTransition) -> GatewayIdentityTransition {
+    GatewayIdentityTransition {
+        gateway_wg_public_key: WireGuardKey::from_bytes([0x22; 32]),
+        ..transition.clone()
+    }
+}
+
+#[test]
+fn abort_refuses_a_transition_for_another_gateway() {
+    let scenario = Scenario::new(false);
+    let transition = staged(&scenario);
+    let remote = remote_with(&scenario, &foreign(&transition), Some(NOW), false);
+
+    let error = refusal(open_abort(&remote, &scenario.domain.path, NOW));
+
+    assert_eq!(error, GatewayRefusal::CampaignMismatch);
+    assert!(!remote.called("open_campaign"));
+    assert!(no_key_touched(&scenario.domain));
+}
+
+#[test]
+fn rollback_refuses_a_transition_for_another_gateway() {
+    let scenario = Scenario::new(false);
+    let transition = staged(&scenario);
+    let clock = NOW + 8 * DAY;
+    let remote = remote_with(&scenario, &foreign(&transition), Some(clock), true);
+
+    let error = refusal(open_rollback(
+        &remote,
+        &scenario.domain.path,
+        24,
+        "r",
+        "p",
+        clock,
+    ));
+
+    assert_eq!(error, GatewayRefusal::CampaignMismatch);
+    assert!(no_key_touched(&scenario.domain));
+}
+
+#[test]
+fn abort_with_nothing_staged_is_refused() {
+    let scenario = Scenario::new(false);
+    let remote = Remote::new(&scenario);
+
+    let error = refusal(open_abort(&remote, &scenario.domain.path, NOW));
+
+    assert_eq!(error, GatewayRefusal::NothingToAbort);
+    assert!(!remote.called("open_campaign"));
+}
+
+#[test]
+fn rollback_of_an_unpublished_transition_is_refused() {
+    let scenario = Scenario::new(false);
+    let transition = staged(&scenario);
+    let clock = NOW + 8 * DAY;
+    let remote = remote_with(&scenario, &transition, Some(clock), false);
+
+    let error = refusal(open_rollback(
+        &remote,
+        &scenario.domain.path,
+        24,
+        "r",
+        "p",
+        clock,
+    ));
+
+    assert_eq!(error, GatewayRefusal::NoOverlap);
+    assert!(no_key_touched(&scenario.domain));
+}
+
+#[test]
+fn abort_refuses_a_campaign_of_another_epoch() {
+    let scenario = Scenario::new(false);
+    let transition = staged(&scenario);
+    let mut remote = remote_with(&scenario, &transition, Some(NOW), false);
+    remote.campaign = cancellation_campaign(&scenario, transition.gateway_identity_epoch + 1);
+
+    let error = refusal(open_abort(&remote, &scenario.domain.path, NOW));
+
+    assert_eq!(error, GatewayRefusal::CampaignMismatch);
+    assert!(no_key_touched(&scenario.domain));
+}
+
+#[test]
+fn a_record_of_the_other_kind_is_refused_and_named() {
+    let scenario = Scenario::new(false);
+    let transition = staged(&scenario);
+    let domain = &scenario.domain;
+
+    // A renewal waits: the abort's resume refuses it, and the record stays.
+    let renewal = Remote::new(&scenario);
+    let decision = signed_decision(&renewal, domain, options());
+    assert_eq!(
+        pending_kind(&domain.path, NOW).expect("read"),
+        Some(GatewayDecisionKind::Renewal)
+    );
+    let remote = remote_with(&scenario, &transition, Some(NOW), false);
+    assert_eq!(
+        carry_abort(&remote, &domain.path, decision, NOW),
+        Err(GatewayRefusal::OtherKindPending)
+    );
+    assert!(record_on_disk(domain));
+
+    // Now the cancellation waits: the renewal's resume refuses it.
+    discard_pending(&domain.path).expect("discarded");
+    let mut opened = open_abort(&remote, &domain.path, NOW).expect("opened");
+    opened.approve(&domain.keys[0], NOW).expect("approved");
+    let abort = opened.sign_and_record(&domain.path, NOW).expect("signed");
+    assert_eq!(
+        pending_kind(&domain.path, NOW).expect("read"),
+        Some(GatewayDecisionKind::Abort)
+    );
+    assert_eq!(
+        carry(&renewal, &domain.path, abort, NOW),
+        Err(GatewayRefusal::OtherKindPending)
+    );
+}
+
+#[test]
+fn a_discarded_record_no_longer_blocks_a_renewal() {
+    let scenario = Scenario::new(false);
+    let remote = Remote::new(&scenario);
+    let domain = &scenario.domain;
+    remote.submit_replies.borrow_mut().push_back(Err(409));
+
+    let decision = signed_decision(&remote, domain, options());
+    assert!(matches!(
+        carry(&remote, &domain.path, decision, NOW),
+        Err(GatewayRefusal::GatewayRefused(_))
+    ));
+    assert!(matches!(
+        open_renewal(&remote, &domain.path, options(), NOW),
+        Err(GatewayRefusal::AlreadyOpen)
+    ));
+
+    discard_pending(&domain.path).expect("discarded");
+
+    assert!(!record_on_disk(domain));
+    assert!(open_renewal(&remote, &domain.path, options(), NOW).is_ok());
+}
+
+#[test]
+fn an_unconfirmed_rollback_says_it_is_not_resumed() {
+    let scenario = Scenario::new(false);
+    let transition = staged(&scenario);
+    let clock = NOW + 8 * DAY;
+    let remote = remote_with(&scenario, &transition, Some(clock), true);
+    remote.rollback_replies.borrow_mut().push_back(503);
+    let domain = &scenario.domain;
+
+    let mut opened = open_rollback(&remote, &domain.path, 24, "r", "p", clock).expect("opened");
+    opened.approve(&domain.keys[0], clock).expect("approved");
+    let authorization = opened.sign(&domain.path, clock).expect("signed");
+
+    assert_eq!(
+        carry_rollback(&remote, authorization),
+        Err(GatewayRefusal::RollbackUnreachable)
+    );
 }
