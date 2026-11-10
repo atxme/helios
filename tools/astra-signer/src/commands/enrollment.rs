@@ -420,3 +420,248 @@ mod private_output_tests {
         assert!(format!("{invalid_error:#}").contains("invalid.request"));
     }
 }
+
+#[cfg(test)]
+mod command_preflight_tests {
+    use super::*;
+    use aether::certificates::encoding::{DerCertificate, TrustDomainId, WireGuardKey};
+    use aether::key_negotiation::{
+        encode_request_file, EnrollmentRequest, ENROLLMENT_FORMAT_VERSION,
+        ENROLLMENT_PROTOCOL_VERSION,
+    };
+    use astra_operator::vault::{
+        AuthoritySecrets, AuthorityVault, SlotEnrolment, SlotRole, SlotSecret,
+    };
+    use base64::Engine as _;
+
+    struct Fixture {
+        _directory: tempfile::TempDir,
+        vault_path: PathBuf,
+        registry: InvitationRegistry,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let directory = tempfile::tempdir().expect("temporary directory");
+            let vault_path = directory.path().join("authority-vault.json");
+            let (pq_private, pq_public) =
+                aether::certificates::encoding::generate_ml_dsa_87_keypair()
+                    .expect("CA-PQ keypair");
+            let encode = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+            let trust_domain_id = TrustDomainId::new([0x31; 16]).expect("domain id");
+            let vault = AuthorityVault::create(
+                trust_domain_id,
+                "astra.example",
+                astra_operator::vault::draw_salt().expect("vault salt"),
+                &AuthoritySecrets {
+                    ca_pq_private_key: encode(&pq_private),
+                    ca_pq_public_key: pq_public.to_base64(),
+                    ca_tls_private_key: encode(b"test-only TLS private key"),
+                    retained_ca_tls: None,
+                    retained_outgoing_ca_pq: None,
+                },
+                SlotEnrolment {
+                    role: SlotRole::Primary,
+                    label: "test slot".into(),
+                    credential_id: vec![0x51; 32],
+                    credential_public_key: vec![0xa5, 0x01],
+                    aaguid: [0; 16],
+                    enrolled_at: 1,
+                },
+                &SlotSecret::new(vec![0x61; 32]),
+                1,
+            )
+            .expect("test vault");
+            astra_operator::store::save(&vault_path, &vault).expect("save vault");
+            let registry = InvitationRegistry::at(directory.path().join("invitations"));
+            Self {
+                _directory: directory,
+                vault_path,
+                registry,
+            }
+        }
+
+        fn write_handoff(&self, gateway: bool, ca_tls: bool) {
+            let vault = store::load(&self.vault_path).expect("load vault");
+            let mut handoff = handoff::DomainHandoff::of(&vault).expect("handoff");
+            if gateway {
+                handoff.gateway_wg_public_key =
+                    Some(WireGuardKey::from_bytes([0x42; 32]).to_base64());
+                handoff.server_name = Some("gateway.example".into());
+            }
+            if ca_tls {
+                handoff.ca_tls_certificate = Some(
+                    DerCertificate::new(vec![0x30, 0x00])
+                        .expect("CA-TLS bytes")
+                        .to_base64(),
+                );
+            }
+            handoff::save(&handoff::path_beside(&self.vault_path), &handoff).expect("save handoff");
+        }
+
+        fn request_file(&self) -> PathBuf {
+            let (_, public) = aether::certificates::encoding::generate_ml_dsa_87_keypair()
+                .expect("client public key");
+            let request = EnrollmentRequest {
+                format_version: ENROLLMENT_FORMAT_VERSION,
+                protocol_version: ENROLLMENT_PROTOCOL_VERSION,
+                invitation_id: Id16::new([0x61; 16]).expect("invitation id"),
+                invitation_fingerprint: aether::certificates::encoding::Fingerprint::of(
+                    b"invitation",
+                ),
+                request_id: Id16::new([0x62; 16]).expect("request id"),
+                timestamp_unix: 1,
+                requested_name: "client.example".into(),
+                client_wg_public_key: WireGuardKey::from_bytes([0x71; 32]),
+                tls_csr: DerCertificate::new(vec![0x30, 0x00]).expect("CSR bytes"),
+                client_ml_dsa_87_public_key: public,
+                wireguard_proof: [0x73; 32],
+                client_signature: aether::certificates::encoding::MlDsa87Signature::placeholder(),
+            };
+            let path = self._directory.path().join("request.helios-request");
+            std::fs::write(&path, encode_request_file(&request)).expect("write request");
+            path
+        }
+
+        fn out_dir(&self) -> PathBuf {
+            self._directory.path().join("leaves")
+        }
+    }
+
+    #[test]
+    fn invite_refuses_an_uninitialized_gateway_before_reading_its_certificate() {
+        let fixture = Fixture::new();
+        let missing_certificate = fixture._directory.path().join("missing-certificate.json");
+        let out = fixture._directory.path().join("invitation.helios-invite");
+
+        let error = invite(
+            &fixture.vault_path,
+            &fixture.registry,
+            &missing_certificate,
+            1,
+            false,
+            &out,
+            Transport::Hid,
+        )
+        .expect_err("domain without a gateway");
+
+        assert!(format!("{error:#}").contains("ne nomme encore aucune gateway"));
+        assert!(!out.exists());
+        assert!(!fixture.registry.directory().exists());
+    }
+
+    #[test]
+    fn invite_rejects_a_malformed_gateway_leaf_before_key_access_or_registry_write() {
+        let fixture = Fixture::new();
+        fixture.write_handoff(true, false);
+        let certificate = fixture._directory.path().join("gateway-pq.json");
+        let out = fixture._directory.path().join("invitation.helios-invite");
+        std::fs::write(&certificate, b"{not-json").expect("write malformed leaf");
+
+        let error = invite(
+            &fixture.vault_path,
+            &fixture.registry,
+            &certificate,
+            1,
+            false,
+            &out,
+            Transport::Hid,
+        )
+        .expect_err("invalid gateway leaf");
+
+        assert!(format!("{error:#}").contains("gateway-pq.json"));
+        assert!(!out.exists());
+        assert!(!fixture.registry.directory().exists());
+    }
+
+    #[test]
+    fn accept_requires_a_client_ca_before_reading_or_emitting_anything() {
+        let fixture = Fixture::new();
+        let missing_request = fixture._directory.path().join("missing-request");
+
+        let error = accept(
+            &fixture.vault_path,
+            &fixture.registry,
+            &missing_request,
+            30,
+            &fixture.out_dir(),
+            Transport::Hid,
+        )
+        .expect_err("missing CA-TLS anchor");
+
+        assert!(format!("{error:#}").contains("aucun CA-TLS dans le relais"));
+        assert!(!format!("{error:#}").contains("missing-request"));
+        assert!(!fixture.out_dir().exists());
+    }
+
+    #[test]
+    fn accept_rejects_invalid_transit_text_before_key_access() {
+        let fixture = Fixture::new();
+        fixture.write_handoff(false, true);
+        let request = fixture._directory.path().join("invalid-request");
+        std::fs::write(&request, [0xFF, 0xFE, 0x00, 0xD8]).expect("write invalid UTF-16");
+
+        let error = accept(
+            &fixture.vault_path,
+            &fixture.registry,
+            &request,
+            30,
+            &fixture.out_dir(),
+            Transport::Hid,
+        )
+        .expect_err("invalid request text");
+
+        assert!(format!("{error:#}").contains("n'est pas un texte lisible"));
+        assert!(format!("{error:#}").contains("invalid-request"));
+        assert!(!fixture.out_dir().exists());
+    }
+
+    #[test]
+    fn accept_rejects_unrepresentable_validity_after_parsing_public_request_but_before_key() {
+        let fixture = Fixture::new();
+        fixture.write_handoff(false, true);
+        let request = fixture.request_file();
+
+        let error = accept(
+            &fixture.vault_path,
+            &fixture.registry,
+            &request,
+            u64::MAX,
+            &fixture.out_dir(),
+            Transport::Hid,
+        )
+        .expect_err("unrepresentable leaf validity");
+
+        assert!(error.to_string().contains("durée de validité hors bornes"));
+        assert!(!fixture.out_dir().exists());
+    }
+
+    #[test]
+    fn sign_document_rejects_invalid_drafts_before_operator_key_access() {
+        let fixture = Fixture::new();
+        let draft = fixture._directory.path().join("invalid-draft.orion");
+        let out = fixture._directory.path().join("signed.orion");
+        std::fs::write(&draft, b"not a v5 enrollment document").expect("write draft");
+
+        let error = sign_document(
+            &fixture.vault_path,
+            &fixture.registry,
+            &draft,
+            &out,
+            Transport::Hid,
+        )
+        .expect_err("malformed document draft");
+
+        assert!(format!("{error:#}").contains("n'est pas un brouillon de document v5"));
+        assert!(!out.exists());
+    }
+
+    #[test]
+    fn listing_an_empty_operator_registry_is_a_valid_noop() {
+        let fixture = Fixture::new();
+
+        list_invitations(&fixture.registry).expect("empty registry listing");
+
+        assert!(!fixture.registry.directory().exists());
+    }
+}
