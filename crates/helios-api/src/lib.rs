@@ -284,11 +284,16 @@ pub fn router(state: AppState) -> Router {
         .route("/api/update/activate", post(update::activate))
         .route(
             "/api/certificates/gateway-renewal",
-            post(certificates::gateway_renewal),
+            get(certificates::gateway_renewal_request).post(certificates::gateway_renewal),
+        )
+        .route(
+            "/api/certificates/gateway-renewal/tls",
+            get(certificates::gateway_candidate_tls),
         )
         .route(
             "/api/certificates/gateway-transition",
-            post(certificates::gateway_transition_install),
+            get(certificates::gateway_transition_staged)
+                .post(certificates::gateway_transition_install),
         )
         .route(
             "/api/certificates/gateway-transition/abort",

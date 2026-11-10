@@ -107,6 +107,31 @@ pub struct GatewayDomainRead {
     pub next_ca_fingerprint: Option<String>,
     #[serde(default)]
     pub client_tls_ca_transition_pending: bool,
+    /// The gateway's own identity (F14 lot 6b). Every field is defaulted: a
+    /// gateway older than these names none of them, and the read still goes
+    /// through.
+    #[serde(default)]
+    pub gateway_identity_epoch: u64,
+    #[serde(default)]
+    pub gateway_tls_fingerprint: String,
+    #[serde(default)]
+    pub gateway_pq_fingerprint: String,
+    #[serde(default)]
+    pub gateway_tls_not_after: Option<u64>,
+    #[serde(default)]
+    pub gateway_pq_not_after: Option<u64>,
+    #[serde(default)]
+    pub gateway_transition_pending: bool,
+    #[serde(default)]
+    pub gateway_transition_published: bool,
+    #[serde(default)]
+    pub gateway_activation_at: Option<u64>,
+    #[serde(default)]
+    pub gateway_retire_active_at: Option<u64>,
+    #[serde(default)]
+    pub gateway_rollback_expires_at: Option<u64>,
+    #[serde(default)]
+    pub gateway_restart_due: Option<String>,
     /// The peers a fleet renewal targets: revoked ones are left out, as Astra's
     /// `fleet_leaf_rows` does.
     #[serde(default)]

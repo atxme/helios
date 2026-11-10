@@ -131,6 +131,40 @@ impl helios_api::certificates::GatewayIdentityHandler for CertificateService {
         })
     }
 
+    /// Reads the staged transition under the registry lock, so the answer
+    /// never shows a document an install is in the middle of writing.
+    async fn staged_transition(
+        &self,
+    ) -> Result<
+        Option<Box<aether::certificates::gateway::GatewayIdentityTransition>>,
+        GatewayActionRefusal,
+    > {
+        let _registry = self.registry.lock().await;
+        crate::gateway_rotation::staged_gateway_transition()
+            .map(|transition| transition.map(Box::new))
+            .map_err(|error| GatewayActionRefusal::new(format!("{error:#}")))
+    }
+
+    async fn renewal_request(
+        &self,
+    ) -> Result<
+        Option<Box<aether::certificates::gateway::GatewayCertificateRequest>>,
+        GatewayActionRefusal,
+    > {
+        let _registry = self.registry.lock().await;
+        crate::gateway_rotation::pending_renewal_request()
+            .map(|request| request.map(Box::new))
+            .map_err(|error| GatewayActionRefusal::new(format!("{error:#}")))
+    }
+
+    async fn candidate_tls(
+        &self,
+    ) -> Result<Option<aether::certificates::encoding::DerCertificate>, GatewayActionRefusal> {
+        let _registry = self.registry.lock().await;
+        crate::key_negotiation::candidate_tls_certificate()
+            .map_err(|error| GatewayActionRefusal::new(format!("{error:#}")))
+    }
+
     /// §9.1, applied to the anchor this gateway pins.
     ///
     /// The registry is the daemon's own, under the same lock as every other

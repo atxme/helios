@@ -1680,3 +1680,24 @@ async fn client_tls_ca_install_replay_answers_already_present() {
     assert!(!first.already_present);
     assert!(replay.already_present);
 }
+
+/// The console places both leaves on the calendar: the PQ expiry is carried
+/// as registered, the TLS expiry is read from the DER and absent when the
+/// DER cannot be read.
+#[test]
+fn the_domain_view_names_the_gateway_leaf_expiries() {
+    let mut state = state();
+    assert_eq!(
+        domain_view(&state, 0).gateway_tls_not_after,
+        None,
+        "a DER that is not a certificate has no expiry to name"
+    );
+    assert_eq!(domain_view(&state, 0).gateway_pq_not_after, Some(1_000_000));
+
+    let leaf = aether::certificates::test_x509::client_material("gateway").leaf;
+    let expected = aether::certificates::x509::inspect(&leaf)
+        .expect("inspect the leaf")
+        .not_after;
+    state.gateway.active_gateway_tls_certificate = leaf;
+    assert_eq!(domain_view(&state, 0).gateway_tls_not_after, Some(expected));
+}

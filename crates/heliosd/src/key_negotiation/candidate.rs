@@ -197,16 +197,21 @@ pub(crate) fn sign_certificate_request(
 /// either there — the renewal rotates TLS — or it is not.
 pub(crate) fn candidate_tls_certificate(
 ) -> Result<Option<aether::certificates::encoding::DerCertificate>> {
+    read_candidate_tls_certificate(&next_certificate_path())
+}
+
+/// Reads a candidate TLS leaf from `path`; absent when the file is.
+pub(crate) fn read_candidate_tls_certificate(
+    path: &std::path::Path,
+) -> Result<Option<aether::certificates::encoding::DerCertificate>> {
     use aether::certificates::encoding::DerCertificate;
 
-    match std::fs::read(next_certificate_path()) {
-        Ok(der) => Ok(Some(DerCertificate::new(der).with_context(|| {
-            format!("reading {}", next_certificate_path().display())
-        })?)),
+    match std::fs::read(path) {
+        Ok(der) => Ok(Some(
+            DerCertificate::new(der).with_context(|| format!("reading {}", path.display()))?,
+        )),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => {
-            Err(error).with_context(|| format!("reading {}", next_certificate_path().display()))
-        }
+        Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
     }
 }
 

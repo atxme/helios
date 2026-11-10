@@ -39,7 +39,11 @@ use aether::certificates::approval::{
     AstraCredentialApprovalRequest, AstraRenewalApproval, CredentialRegistry,
 };
 use aether::certificates::authority::{CaTransition, ClientTlsCaTransition};
-use aether::certificates::encoding::{Fingerprint, Id16};
+use aether::certificates::encoding::{DerCertificate, Fingerprint, Id16};
+use aether::certificates::gateway::{
+    GatewayCertificateRequest, GatewayIdentityTransition, GatewayTransitionAbort,
+};
+use aether::certificates::status::CertificateServiceRollbackAuthorization;
 use aether::certificates::transport::{
     ClientRenewalOperationState, ClientRenewalOperationView, ClientRenewalSignerRequest,
     OperatorAuthorityStatus, OperatorGatewayPublish, OperatorGatewayPublished, OperatorOpenRequest,
@@ -485,23 +489,91 @@ impl Tunnel {
 // The administrator routes a rotation travels on (lot 5b).
 // ---------------------------------------------------------------------------
 
-/// The anchors of `GET /api/certificates`, out of everything it says.
+/// The gateway's view of its domain, out of everything `GET /api/certificates`
+/// says: the anchors, and the identity of the gateway itself (F14 lot 6b).
 ///
 /// Its own subset rather than the gateway's type, which this crate does not
 /// link, and which refuses a field it does not know: this read must outlive what
-/// that view gains. The client TLS pair is defaulted for a gateway older than it.
-#[derive(serde::Deserialize)]
-struct GatewayAnchors {
-    ca_pq_fingerprint: Fingerprint,
+/// that view gains. Every field newer than the anchors is defaulted, so a
+/// gateway older than it still reads. The names are those of Orion's
+/// `GatewayDomainRead`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct GatewayIdentityRead {
+    pub ca_pq_fingerprint: Fingerprint,
     #[serde(default)]
-    next_ca_fingerprint: Option<Fingerprint>,
+    pub next_ca_fingerprint: Option<Fingerprint>,
     #[serde(default)]
-    client_tls_ca_fingerprint: Option<Fingerprint>,
+    pub client_tls_ca_fingerprint: Option<Fingerprint>,
     #[serde(default)]
-    next_client_tls_ca_fingerprint: Option<Fingerprint>,
+    pub next_client_tls_ca_fingerprint: Option<Fingerprint>,
     /// When the outgoing `CA-PQ` stops being accepted, while an overlap runs.
     #[serde(default)]
-    ca_retire_active_at: Option<u64>,
+    pub ca_retire_active_at: Option<u64>,
+    #[serde(default)]
+    pub gateway_identity_epoch: u64,
+    #[serde(default)]
+    pub gateway_tls_fingerprint: String,
+    #[serde(default)]
+    pub gateway_pq_fingerprint: String,
+    #[serde(default)]
+    pub gateway_tls_not_after: Option<u64>,
+    #[serde(default)]
+    pub gateway_pq_not_after: Option<u64>,
+    #[serde(default)]
+    pub gateway_transition_pending: bool,
+    #[serde(default)]
+    pub gateway_transition_published: bool,
+    #[serde(default)]
+    pub gateway_activation_at: Option<u64>,
+    #[serde(default)]
+    pub gateway_retire_active_at: Option<u64>,
+    #[serde(default)]
+    pub gateway_rollback_expires_at: Option<u64>,
+    #[serde(default)]
+    pub gateway_restart_due: Option<String>,
+}
+
+/// What `POST /api/certificates/gateway-renewal` is asked (spec §5.2, step 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct RenewalAsk {
+    /// Replace the self-signed TLS leaf too.
+    pub rotate_tls: bool,
+    /// Discard the sealed candidate and draw a fresh key.
+    pub new_key: bool,
+    /// Build the request without a continuity signature.
+    pub key_recovery: bool,
+}
+
+/// The gateway's answer to a preparation, as far as the companion reads it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct GatewayRenewalRead {
+    pub gateway_identity_epoch: u64,
+    pub request_fingerprint: String,
+    pub expires_at: u64,
+    /// Fingerprint of the candidate TLS leaf, absent when TLS does not change.
+    pub candidate_tls_fingerprint: Option<String>,
+    /// `true` when a request already prepared for this epoch came back unchanged.
+    pub reused: bool,
+    pub key_recovery: bool,
+}
+
+/// The gateway's answer to a staged or cancelled decision.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct GatewayDecisionRead {
+    pub gateway_identity_epoch: u64,
+    pub fingerprint: String,
+    /// `true` when this exact document was already applied.
+    pub already_present: bool,
+    /// Set for an installation: the instant the identity switches.
+    pub activation_at: Option<u64>,
+    /// Set for an installation: the instant the outgoing leaf retires.
+    pub not_after: Option<u64>,
+}
+
+/// The gateway's answer to a service rollback: when the selection lapses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+pub struct GatewayRollbackRead {
+    pub expires_at: u64,
 }
 
 /// The sentence `GatewayActionRefusal` carries.
@@ -562,7 +634,12 @@ impl Tunnel {
     /// Installs a `CA-PQ` transition on the gateway, which checks it itself and
     /// accepts a replay of the same one.
     pub fn install_ca_transition(&self, transition: &CaTransition) -> Result<()> {
-        self.install("/api/certificates/ca-transition", transition)
+        self.install::<_, serde::de::IgnoredAny>(
+            "/api/certificates/ca-transition",
+            transition,
+            "installation de la transition sur la gateway",
+        )
+        .map(drop)
     }
 
     /// Installs a client `CA-TLS` transition, on the same terms.
@@ -570,7 +647,91 @@ impl Tunnel {
         &self,
         transition: &ClientTlsCaTransition,
     ) -> Result<()> {
-        self.install("/api/certificates/client-tls-ca-transition", transition)
+        self.install::<_, serde::de::IgnoredAny>(
+            "/api/certificates/client-tls-ca-transition",
+            transition,
+            "installation de la transition sur la gateway",
+        )
+        .map(drop)
+    }
+
+    /// Asks the gateway to prepare its next identity and export its request
+    /// (spec §5.2, step 1). The answer is the request's fingerprint, not the
+    /// request: [`Self::gateway_renewal_request`] reads that.
+    pub fn prepare_gateway_renewal(&self, ask: &RenewalAsk) -> Result<GatewayRenewalRead> {
+        self.install(
+            "/api/certificates/gateway-renewal",
+            ask,
+            "préparation du renouvellement de la gateway",
+        )
+    }
+
+    /// The public request the gateway prepared, for the ceremony.
+    pub fn gateway_renewal_request(&self) -> Result<GatewayCertificateRequest> {
+        let response = self
+            .get_admin("/api/certificates/gateway-renewal")
+            .context("lecture de la demande de la gateway")?;
+        Self::read_admin(response, MAX_ANSWER_BYTES).context("lecture de la demande de la gateway")
+    }
+
+    /// The candidate TLS leaf sealed for that request, `None` when TLS does
+    /// not change (spec §5.2, step 3).
+    pub fn gateway_candidate_tls(&self) -> Result<Option<DerCertificate>> {
+        let response = self
+            .get_admin("/api/certificates/gateway-renewal/tls")
+            .context("lecture de la feuille TLS candidate")?;
+        Self::read_admin(response, MAX_ANSWER_BYTES).context("lecture de la feuille TLS candidate")
+    }
+
+    /// Installs a signed gateway transition (spec §5.2, step 6).
+    pub fn install_gateway_transition(
+        &self,
+        transition: &GatewayIdentityTransition,
+    ) -> Result<GatewayDecisionRead> {
+        self.install(
+            "/api/certificates/gateway-transition",
+            transition,
+            "installation de la transition sur la gateway",
+        )
+    }
+
+    /// The transition the gateway holds staged, `None` outside an overlap
+    /// (spec §5.4). A rollback and an abort are verified against it.
+    pub fn staged_gateway_transition(&self) -> Result<Option<GatewayIdentityTransition>> {
+        #[derive(serde::Deserialize)]
+        struct Staged {
+            transition: Option<GatewayIdentityTransition>,
+        }
+        let response = self
+            .get_admin("/api/certificates/gateway-transition")
+            .context("lecture de la transition staged")?;
+        Self::read_admin::<Staged>(response, MAX_ANSWER_BYTES)
+            .map(|staged| staged.transition)
+            .context("lecture de la transition staged")
+    }
+
+    /// Cancels a staged, unpublished transition (spec §5.3).
+    pub fn abort_gateway_transition(
+        &self,
+        abort: &GatewayTransitionAbort,
+    ) -> Result<GatewayDecisionRead> {
+        self.install(
+            "/api/certificates/gateway-transition/abort",
+            abort,
+            "annulation de la transition sur la gateway",
+        )
+    }
+
+    /// Selects the outgoing leaf for the rest of the overlap (spec §5.4).
+    pub fn install_gateway_rollback(
+        &self,
+        authorization: &CertificateServiceRollbackAuthorization,
+    ) -> Result<GatewayRollbackRead> {
+        self.install(
+            "/api/certificates/gateway-transition/rollback",
+            authorization,
+            "retour arrière de la gateway",
+        )
     }
 
     /// The anchor the gateway is heading to: its next one, or its current one
@@ -580,7 +741,7 @@ impl Tunnel {
     /// gateway that names no such anchor; a failed read is an error, and not
     /// that.
     pub fn gateway_next_anchor(&self, kind: RotationKind) -> Result<Option<Fingerprint>> {
-        let anchors = self.gateway_anchors()?;
+        let anchors = self.gateway_identity()?;
         Ok(match kind {
             RotationKind::CaPq => Some(
                 anchors
@@ -598,10 +759,11 @@ impl Tunnel {
     /// Read from the same view as [`Self::gateway_next_anchor`]. `None` is a
     /// gateway with no overlap in flight.
     pub fn gateway_overlap_not_after(&self) -> Result<Option<u64>> {
-        Ok(self.gateway_anchors()?.ca_retire_active_at)
+        Ok(self.gateway_identity()?.ca_retire_active_at)
     }
 
-    fn gateway_anchors(&self) -> Result<GatewayAnchors> {
+    /// The gateway's domain, read once: the anchors and its own identity.
+    pub fn gateway_identity(&self) -> Result<GatewayIdentityRead> {
         let response = self
             .get_admin("/api/certificates")
             .context("lecture du domaine de la gateway")?;
@@ -609,24 +771,31 @@ impl Tunnel {
             .context("lecture du domaine de la gateway")
     }
 
-    fn install<T: serde::Serialize>(&self, path: &str, transition: &T) -> Result<()> {
+    /// Posts a document to a gateway route and reads the decision it answers.
+    ///
+    /// `what` names the operation in the error chain: the refusal the gateway
+    /// gives is the sentence the operator acts on, and it says what was refused.
+    fn install<T, R>(&self, path: &str, body: &T, what: &str) -> Result<R>
+    where
+        T: serde::Serialize,
+        R: serde::de::DeserializeOwned,
+    {
         let response = self
-            .post_admin(path, transition)
-            .context("installation de la transition sur la gateway")?;
+            .post_admin(path, body)
+            .with_context(|| what.to_string())?;
         let status = response.status();
-        if status.is_success() {
-            return Ok(());
+        if !status.is_success() {
+            // These routes name their reason, unlike the relayed ones: it is what
+            // the operator acts on, and a body too large to read is no reason.
+            let reason = response
+                .bytes()
+                .ok()
+                .filter(|bytes| bytes.len() <= crate::origin::MAX_ANSWER_BYTES)
+                .and_then(|bytes| serde_json::from_slice::<GatewayRefusalBody>(&bytes).ok())
+                .map(|body| body.message);
+            return Err(admin_refusal(status.as_u16(), reason)).with_context(|| what.to_string());
         }
-        // These routes name their reason, unlike the relayed ones: it is what
-        // the operator acts on, and a body too large to read is no reason.
-        let reason = response
-            .bytes()
-            .ok()
-            .filter(|bytes| bytes.len() <= crate::origin::MAX_ANSWER_BYTES)
-            .and_then(|bytes| serde_json::from_slice::<GatewayRefusalBody>(&bytes).ok())
-            .map(|body| body.message);
-        Err(admin_refusal(status.as_u16(), reason))
-            .context("installation de la transition sur la gateway")
+        Self::read_admin(response, MAX_ANSWER_BYTES).with_context(|| what.to_string())
     }
 
     fn get_admin(&self, path: &str) -> Result<reqwest::blocking::Response> {

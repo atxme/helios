@@ -139,6 +139,14 @@ pub fn domain_view(
             .active_pq_fingerprint()
             .map(|fingerprint| fingerprint.to_hex())
             .unwrap_or_default(),
+        // The TLS expiry is read from the DER; a DER that is not a certificate
+        // has none to show, and the console says so instead of guessing.
+        gateway_tls_not_after: aether::certificates::x509::inspect(
+            &state.gateway.active_gateway_tls_certificate,
+        )
+        .ok()
+        .map(|facts| facts.not_after),
+        gateway_pq_not_after: Some(state.gateway.active_gateway_certificate.not_after_unix),
         gateway_transition_pending: state.gateway.next_gateway_certificate.is_some(),
         gateway_activation_at: state.gateway.activation_at,
         gateway_retire_active_at: state.gateway.retire_active_at,

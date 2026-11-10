@@ -22,7 +22,7 @@ use aether::certificates::transport::{
 };
 use aether::certificates::window::TransitionWindow;
 use astra_operator::rotation_journal::RotationKind;
-use astra_operator::tunnel::{Tunnel, TunnelRefusal, VaultCopySent};
+use astra_operator::tunnel::{RenewalAsk, Tunnel, TunnelRefusal, VaultCopySent};
 
 const RP_ID: &str = "astra.helios.test";
 
@@ -817,4 +817,271 @@ fn ca_transition() -> CaTransition {
         current_ca_signature: MlDsa87Signature::placeholder(),
         next_ca_signature: MlDsa87Signature::placeholder(),
     }
+}
+
+fn gateway_transition() -> aether::certificates::gateway::GatewayIdentityTransition {
+    use aether::certificates::{
+        authority::RotationReason, gateway::GatewayIdentityTransition, CERTIFICATE_FORMAT_VERSION,
+        CERTIFICATE_PROTOCOL_VERSION,
+    };
+    GatewayIdentityTransition {
+        format_version: CERTIFICATE_FORMAT_VERSION,
+        protocol_version: CERTIFICATE_PROTOCOL_VERSION,
+        trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+        ca_epoch: 1,
+        gateway_identity_epoch: 2,
+        gateway_wg_public_key: WireGuardKey::from_bytes([2; 32]),
+        server_name: "gateway.example.test".into(),
+        active_gateway_tls_certificate_fingerprint: Fingerprint::of(b"tls"),
+        next_gateway_tls_certificate: None,
+        active_gateway_certificate_fingerprint: Fingerprint::of(b"pq"),
+        next_gateway_certificate: None,
+        window: TransitionWindow {
+            not_before: 100,
+            activation_at: 200,
+            not_after: 300,
+        },
+        reason: RotationReason::Scheduled,
+        ca_signature: MlDsa87Signature::placeholder(),
+    }
+}
+
+fn gateway_request() -> aether::certificates::gateway::GatewayCertificateRequest {
+    use aether::certificates::{
+        encoding::{MlDsa87PublicKey, MlDsa87Signature},
+        gateway::GatewayCertificateRequest,
+        CERTIFICATE_FORMAT_VERSION,
+    };
+    GatewayCertificateRequest {
+        format_version: CERTIFICATE_FORMAT_VERSION,
+        trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+        gateway_identity_epoch: 8,
+        gateway_wg_public_key: WireGuardKey::from_bytes([2; 32]),
+        server_name: "gateway.example.test".into(),
+        new_ml_dsa_87_public_key: MlDsa87PublicKey::new(vec![23; 2592]).expect("public key"),
+        request_id: Id16::new([24; 16]).expect("request id"),
+        created_at: 1_700_000_000,
+        expires_at: 1_700_086_400,
+        new_key_proof: MlDsa87Signature::placeholder(),
+        current_key_authorization: None,
+    }
+}
+
+/// The identity read is tolerant: a gateway older than the leaf expiries
+/// answers without them, and the anchors it always answered still read.
+#[test]
+fn the_gateway_identity_read_names_the_leaf_expiries_and_tolerates_their_absence() {
+    let newer = serde_json::json!({
+        "ca_pq_fingerprint": fingerprint_hex(b"courante"),
+        "gateway_identity_epoch": 3,
+        "gateway_tls_fingerprint": fingerprint_hex(b"tls"),
+        "gateway_pq_fingerprint": fingerprint_hex(b"pq"),
+        "gateway_tls_not_after": 900,
+        "gateway_pq_not_after": 1000,
+        "gateway_transition_pending": true,
+        "gateway_transition_published": false,
+        "gateway_activation_at": 950,
+        "gateway_retire_active_at": 1100,
+        "gateway_rollback_expires_at": null,
+        "gateway_restart_due": null,
+    });
+    let stub = Stub::serving(vec![(200, newer.to_string())]);
+    let read = Tunnel::new(&stub.base)
+        .expect("tunnel")
+        .gateway_identity()
+        .expect("read");
+    let seen = stub.next();
+    assert_eq!(
+        (seen.method.as_str(), seen.path.as_str()),
+        ("GET", "/api/certificates")
+    );
+    assert_eq!(read.gateway_identity_epoch, 3);
+    assert_eq!(read.gateway_tls_not_after, Some(900));
+    assert_eq!(read.gateway_pq_not_after, Some(1000));
+    assert!(read.gateway_transition_pending);
+    assert!(!read.gateway_transition_published);
+    assert_eq!(read.gateway_activation_at, Some(950));
+    assert_eq!(read.gateway_retire_active_at, Some(1100));
+
+    let older = serde_json::json!({ "ca_pq_fingerprint": fingerprint_hex(b"courante") });
+    let stub = Stub::serving(vec![(200, older.to_string())]);
+    let read = Tunnel::new(&stub.base)
+        .expect("tunnel")
+        .gateway_identity()
+        .expect("read");
+    assert_eq!(read.gateway_identity_epoch, 0);
+    assert_eq!(read.gateway_tls_not_after, None);
+    assert!(!read.gateway_transition_pending);
+}
+
+#[test]
+fn the_renewal_is_prepared_on_the_gateway_route_and_its_request_read_back() {
+    let read = serde_json::json!({
+        "gateway_identity_epoch": 8,
+        "request_fingerprint": fingerprint_hex(b"demande"),
+        "expires_at": 1_700_086_400u64,
+        "candidate_tls_fingerprint": null,
+        "reused": false,
+        "key_recovery": false,
+    });
+    let stub = Stub::serving(vec![(200, read.to_string())]);
+    let ask = RenewalAsk {
+        rotate_tls: true,
+        new_key: false,
+        key_recovery: false,
+    };
+    let prepared = Tunnel::new(&stub.base)
+        .expect("tunnel")
+        .prepare_gateway_renewal(&ask)
+        .expect("prepared");
+    let seen = stub.next();
+    assert_eq!(seen.method, "POST");
+    assert_eq!(seen.path, "/api/certificates/gateway-renewal");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&seen.body).expect("body"),
+        serde_json::json!({"rotate_tls": true, "new_key": false, "key_recovery": false})
+    );
+    assert_eq!(prepared.gateway_identity_epoch, 8);
+    assert_eq!(prepared.candidate_tls_fingerprint, None);
+    assert!(!prepared.reused);
+
+    let request = gateway_request();
+    let stub = Stub::serving(vec![(200, serde_json::to_string(&request).expect("json"))]);
+    let back = Tunnel::new(&stub.base)
+        .expect("tunnel")
+        .gateway_renewal_request()
+        .expect("request");
+    assert_eq!(stub.next().path, "/api/certificates/gateway-renewal");
+    assert_eq!(back, request);
+}
+
+/// The candidate TLS leaf is absent when TLS does not change, and an absent
+/// request is a refusal rather than an empty request.
+#[test]
+fn the_candidate_tls_leaf_is_null_or_the_der() {
+    let stub = Stub::serving(vec![(200, "null".into())]);
+    assert_eq!(
+        Tunnel::new(&stub.base)
+            .expect("tunnel")
+            .gateway_candidate_tls()
+            .expect("read"),
+        None
+    );
+    assert_eq!(stub.next().path, "/api/certificates/gateway-renewal/tls");
+
+    let der = DerCertificate::new(vec![7; 64]).expect("der");
+    let stub = Stub::serving(vec![(200, serde_json::to_string(&der).expect("json"))]);
+    assert_eq!(
+        Tunnel::new(&stub.base)
+            .expect("tunnel")
+            .gateway_candidate_tls()
+            .expect("read"),
+        Some(der)
+    );
+
+    let stub = Stub::serving(vec![(404, "pas de demande".into())]);
+    let refusal = Tunnel::new(&stub.base)
+        .expect("tunnel")
+        .gateway_renewal_request()
+        .expect_err("no request is a refusal");
+    assert_eq!(refusal_status(&refusal), Some(404));
+}
+
+#[test]
+fn the_staged_transition_is_null_outside_a_transition_and_the_document_within_one() {
+    let stub = Stub::serving(vec![(200, r#"{"transition":null}"#.into())]);
+    assert_eq!(
+        Tunnel::new(&stub.base)
+            .expect("tunnel")
+            .staged_gateway_transition()
+            .expect("read"),
+        None
+    );
+    assert_eq!(stub.next().path, "/api/certificates/gateway-transition");
+
+    let transition = gateway_transition();
+    let answer = serde_json::json!({ "transition": transition });
+    let stub = Stub::serving(vec![(200, answer.to_string())]);
+    assert_eq!(
+        Tunnel::new(&stub.base)
+            .expect("tunnel")
+            .staged_gateway_transition()
+            .expect("read"),
+        Some(transition)
+    );
+}
+
+/// The three installations post the signed document to their own routes and
+/// read the gateway's decision back.
+#[test]
+fn the_gateway_decisions_post_to_their_routes_and_read_back() {
+    let decision = serde_json::json!({
+        "gateway_identity_epoch": 2,
+        "fingerprint": fingerprint_hex(b"decision"),
+        "already_present": false,
+        "activation_at": 200,
+        "not_after": 300,
+    });
+    let transition = gateway_transition();
+    let stub = Stub::serving(vec![(200, decision.to_string())]);
+    let read = Tunnel::new(&stub.base)
+        .expect("tunnel")
+        .install_gateway_transition(&transition)
+        .expect("installed");
+    let seen = stub.next();
+    assert_eq!(seen.path, "/api/certificates/gateway-transition");
+    let sent: aether::certificates::gateway::GatewayIdentityTransition =
+        serde_json::from_slice(&seen.body).expect("body");
+    assert_eq!(sent, transition);
+    assert_eq!(read.gateway_identity_epoch, 2);
+    assert_eq!(read.fingerprint, fingerprint_hex(b"decision"));
+    assert_eq!(read.activation_at, Some(200));
+    assert_eq!(read.not_after, Some(300));
+
+    let abort = aether::certificates::gateway::GatewayTransitionAbort {
+        format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+        protocol_version: aether::certificates::CERTIFICATE_PROTOCOL_VERSION,
+        trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+        ca_epoch: 1,
+        gateway_wg_public_key: WireGuardKey::from_bytes([2; 32]),
+        server_name: "gateway.example.test".into(),
+        gateway_identity_epoch: 2,
+        gateway_transition_fingerprint: Fingerprint::of(b"transition"),
+        aborted_at: 150,
+        reason: aether::certificates::gateway::AbortReason::OperatorCancelled,
+        campaign_fingerprint: Fingerprint::of(b"campaign"),
+        ca_signature: MlDsa87Signature::placeholder(),
+    };
+    let stub = Stub::serving(vec![(200, decision.to_string())]);
+    Tunnel::new(&stub.base)
+        .expect("tunnel")
+        .abort_gateway_transition(&abort)
+        .expect("aborted");
+    assert_eq!(
+        stub.next().path,
+        "/api/certificates/gateway-transition/abort"
+    );
+
+    let rollback = aether::certificates::status::CertificateServiceRollbackAuthorization {
+        format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+        trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+        ca_epoch: 1,
+        gateway_wg_public_key: WireGuardKey::from_bytes([2; 32]),
+        server_name: "gateway.example.test".into(),
+        transition_fingerprint: Fingerprint::of(b"transition"),
+        selected_certificate_fingerprint: Fingerprint::of(b"outgoing"),
+        campaign_fingerprint: Fingerprint::of(b"campaign"),
+        expires_at: 250,
+        ca_signature: MlDsa87Signature::placeholder(),
+    };
+    let stub = Stub::serving(vec![(200, r#"{"gateway_identity_epoch":2,"selected_certificate_fingerprint":"aa","expires_at":250,"already_present":false}"#.into())]);
+    let read = Tunnel::new(&stub.base)
+        .expect("tunnel")
+        .install_gateway_rollback(&rollback)
+        .expect("rollback");
+    assert_eq!(
+        stub.next().path,
+        "/api/certificates/gateway-transition/rollback"
+    );
+    assert_eq!(read.expires_at, 250);
 }

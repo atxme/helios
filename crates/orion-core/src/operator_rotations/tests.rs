@@ -105,6 +105,59 @@ async fn unknown_fields_of_the_domain_view_are_ignored() {
     assert_eq!(domain.peers[0].not_after, 1234);
 }
 
+/// A gateway older than the identity fields answers without them: the read
+/// goes through with defaults, and a newer one's leaf expiries are kept.
+#[tokio::test]
+async fn domain_read_tolerates_the_gateway_fields() {
+    let older = serde_json::json!({
+        "ca_epoch": 1, "ca_pq_fingerprint": "ab".repeat(32), "client_tls_ca_epoch": 1,
+        "peers": [],
+    });
+    let Reach::Ok(read) = answered(200, &older.to_string(), async |url| domain(url).await).await
+    else {
+        panic!("an older gateway's domain must still read");
+    };
+    assert_eq!(read.gateway_identity_epoch, 0);
+    assert_eq!(read.gateway_tls_fingerprint, "");
+    assert_eq!(read.gateway_pq_fingerprint, "");
+    assert_eq!(read.gateway_tls_not_after, None);
+    assert_eq!(read.gateway_pq_not_after, None);
+    assert!(!read.gateway_transition_pending);
+    assert!(!read.gateway_transition_published);
+    assert_eq!(read.gateway_activation_at, None);
+    assert_eq!(read.gateway_retire_active_at, None);
+    assert_eq!(read.gateway_rollback_expires_at, None);
+    assert_eq!(read.gateway_restart_due, None);
+
+    let newer = serde_json::json!({
+        "ca_epoch": 1, "ca_pq_fingerprint": "ab".repeat(32), "client_tls_ca_epoch": 1,
+        "gateway_identity_epoch": 3,
+        "gateway_tls_fingerprint": "cd".repeat(32),
+        "gateway_pq_fingerprint": "ef".repeat(32),
+        "gateway_tls_not_after": 900,
+        "gateway_pq_not_after": 1000,
+        "gateway_transition_pending": true,
+        "gateway_transition_published": true,
+        "gateway_activation_at": 950,
+        "gateway_retire_active_at": 1100,
+        "gateway_rollback_expires_at": 960,
+        "gateway_restart_due": "retour arrière",
+        "peers": [],
+    });
+    let Reach::Ok(read) = answered(200, &newer.to_string(), async |url| domain(url).await).await
+    else {
+        panic!("a newer gateway's domain must read");
+    };
+    assert_eq!(read.gateway_identity_epoch, 3);
+    assert_eq!(read.gateway_tls_not_after, Some(900));
+    assert_eq!(read.gateway_pq_not_after, Some(1000));
+    assert!(read.gateway_transition_pending && read.gateway_transition_published);
+    assert_eq!(read.gateway_activation_at, Some(950));
+    assert_eq!(read.gateway_retire_active_at, Some(1100));
+    assert_eq!(read.gateway_rollback_expires_at, Some(960));
+    assert_eq!(read.gateway_restart_due.as_deref(), Some("retour arrière"));
+}
+
 #[tokio::test]
 async fn the_domain_read_shows_neither_a_peer_name_nor_a_peer_key() {
     let body = serde_json::json!({

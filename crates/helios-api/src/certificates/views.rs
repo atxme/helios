@@ -108,6 +108,13 @@ pub struct CertificateDomainView {
     pub gateway_identity_epoch: u64,
     pub gateway_tls_fingerprint: String,
     pub gateway_pq_fingerprint: String,
+    /// When the TLS leaf in service expires, read from its DER. Absent when
+    /// the DER cannot be read, which the console then says rather than guesses.
+    #[serde(default)]
+    pub gateway_tls_not_after: Option<u64>,
+    /// When the PQ leaf in service expires, as the gateway registered it.
+    #[serde(default)]
+    pub gateway_pq_not_after: Option<u64>,
     pub gateway_transition_pending: bool,
     pub gateway_activation_at: Option<u64>,
     /// End of the overlap: when the incoming leaf is promoted and the outgoing

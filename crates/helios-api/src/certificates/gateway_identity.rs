@@ -39,6 +39,14 @@ pub struct GatewayRenewalView {
     pub key_recovery: bool,
 }
 
+/// The staged transition, as `GET /api/certificates/gateway-transition`
+/// answers it: `null` when none is staged.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayStagedTransitionView {
+    pub transition: Option<Box<aether::certificates::gateway::GatewayIdentityTransition>>,
+}
+
 /// A staged or cancelled decision, as the console displays it back.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -141,6 +149,30 @@ pub trait GatewayIdentityHandler: Send + Sync {
         authorization: Box<aether::certificates::status::CertificateServiceRollbackAuthorization>,
     ) -> Result<GatewayRollbackView, GatewayActionRefusal>;
 
+    /// The transition staged and not yet promoted, as it was signed (spec §5.4).
+    /// It stays served through the overlap: a rollback and an abort are
+    /// verified against its exact bytes.
+    async fn staged_transition(
+        &self,
+    ) -> Result<
+        Option<Box<aether::certificates::gateway::GatewayIdentityTransition>>,
+        GatewayActionRefusal,
+    >;
+
+    /// The request a preparation left waiting for its ceremony (spec §5.2).
+    async fn renewal_request(
+        &self,
+    ) -> Result<
+        Option<Box<aether::certificates::gateway::GatewayCertificateRequest>>,
+        GatewayActionRefusal,
+    >;
+
+    /// The candidate TLS leaf sealed for that request, absent when TLS does
+    /// not change (spec §5.2, step 3).
+    async fn candidate_tls(
+        &self,
+    ) -> Result<Option<aether::certificates::encoding::DerCertificate>, GatewayActionRefusal>;
+
     /// Stages a rotation of the domain anchor `CA-PQ` (spec §9.1).
     async fn install_ca_transition(
         &self,
@@ -194,6 +226,54 @@ pub async fn gateway_renewal(
     };
     match handler.prepare_renewal(request).await {
         Ok(view) => (StatusCode::OK, Json(view)).into_response(),
+        Err(refusal) => refusal.into_response(),
+    }
+}
+
+/// `GET /api/certificates/gateway-renewal`, on the admin surface.
+///
+/// The public request only: its public key, its proofs and its identifiers.
+/// `404` when no request waits for its ceremony.
+pub async fn gateway_renewal_request(State(s): State<AppState>) -> Response {
+    let Some(handler) = s.gateway_identity.as_ref() else {
+        return gateway_identity_absent();
+    };
+    match handler.renewal_request().await {
+        Ok(Some(request)) => (StatusCode::OK, Json(request)).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            "aucune demande de renouvellement n'attend sa cérémonie sur cette gateway",
+        )
+            .into_response(),
+        Err(refusal) => refusal.into_response(),
+    }
+}
+
+/// `GET /api/certificates/gateway-renewal/tls`, on the admin surface.
+///
+/// The candidate TLS leaf in DER, which is public. `null` when TLS does not
+/// change.
+pub async fn gateway_candidate_tls(State(s): State<AppState>) -> Response {
+    let Some(handler) = s.gateway_identity.as_ref() else {
+        return gateway_identity_absent();
+    };
+    match handler.candidate_tls().await {
+        Ok(certificate) => (StatusCode::OK, Json(certificate)).into_response(),
+        Err(refusal) => refusal.into_response(),
+    }
+}
+
+/// `GET /api/certificates/gateway-transition`, on the admin surface.
+pub async fn gateway_transition_staged(State(s): State<AppState>) -> Response {
+    let Some(handler) = s.gateway_identity.as_ref() else {
+        return gateway_identity_absent();
+    };
+    match handler.staged_transition().await {
+        Ok(transition) => (
+            StatusCode::OK,
+            Json(GatewayStagedTransitionView { transition }),
+        )
+            .into_response(),
         Err(refusal) => refusal.into_response(),
     }
 }

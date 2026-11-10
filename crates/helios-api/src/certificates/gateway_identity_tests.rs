@@ -13,6 +13,9 @@ use tower::ServiceExt as _;
 
 struct StubIdentity {
     refuse: bool,
+    /// Whether a transition is staged and a request is pending: the state
+    /// after a preparation, before anything is installed.
+    present: bool,
     calls: AtomicUsize,
 }
 
@@ -20,6 +23,15 @@ impl StubIdentity {
     fn new(refuse: bool) -> Arc<Self> {
         Arc::new(Self {
             refuse,
+            present: true,
+            calls: AtomicUsize::new(0),
+        })
+    }
+
+    fn absent() -> Arc<Self> {
+        Arc::new(Self {
+            refuse: false,
+            present: false,
             calls: AtomicUsize::new(0),
         })
     }
@@ -94,6 +106,33 @@ impl GatewayIdentityHandler for StubIdentity {
             expires_at: 1_700_000_200,
             already_present: false,
         })
+    }
+
+    async fn staged_transition(
+        &self,
+    ) -> Result<
+        Option<Box<aether::certificates::gateway::GatewayIdentityTransition>>,
+        GatewayActionRefusal,
+    > {
+        self.called();
+        self.result(self.present.then(|| Box::new(transition_fixture())))
+    }
+
+    async fn renewal_request(
+        &self,
+    ) -> Result<
+        Option<Box<aether::certificates::gateway::GatewayCertificateRequest>>,
+        GatewayActionRefusal,
+    > {
+        self.called();
+        self.result(self.present.then(|| Box::new(request_fixture())))
+    }
+
+    async fn candidate_tls(
+        &self,
+    ) -> Result<Option<aether::certificates::encoding::DerCertificate>, GatewayActionRefusal> {
+        self.called();
+        self.result(self.present.then(candidate_tls_fixture))
     }
 
     async fn install_ca_transition(
@@ -175,11 +214,69 @@ fn request(path: &str, body: serde_json::Value) -> Request<Body> {
     request
 }
 
+/// The domain of every gateway fixture below.
+fn transition_fixture() -> aether::certificates::gateway::GatewayIdentityTransition {
+    use aether::certificates::{
+        encoding::{Fingerprint, Id16, MlDsa87Signature, WireGuardKey},
+        gateway::GatewayIdentityTransition,
+        window::TransitionWindow,
+        CERTIFICATE_FORMAT_VERSION, CERTIFICATE_PROTOCOL_VERSION,
+    };
+
+    GatewayIdentityTransition {
+        format_version: CERTIFICATE_FORMAT_VERSION,
+        protocol_version: CERTIFICATE_PROTOCOL_VERSION,
+        trust_domain_id: Id16::new([1; 16]).expect("domain id"),
+        ca_epoch: 1,
+        gateway_identity_epoch: 2,
+        gateway_wg_public_key: WireGuardKey::from_bytes([2; 32]),
+        server_name: "gateway.example.test".into(),
+        active_gateway_tls_certificate_fingerprint: Fingerprint::from_bytes([3; 32]),
+        next_gateway_tls_certificate: None,
+        active_gateway_certificate_fingerprint: Fingerprint::from_bytes([4; 32]),
+        next_gateway_certificate: None,
+        window: TransitionWindow {
+            not_before: 100,
+            activation_at: 200,
+            not_after: 300,
+        },
+        reason: aether::certificates::authority::RotationReason::Scheduled,
+        ca_signature: MlDsa87Signature::placeholder(),
+    }
+}
+
+/// A request as a preparation exports it: public halves and proofs only.
+fn request_fixture() -> aether::certificates::gateway::GatewayCertificateRequest {
+    use aether::certificates::{
+        encoding::{Id16, MlDsa87PublicKey, MlDsa87Signature, TrustDomainId, WireGuardKey},
+        gateway::GatewayCertificateRequest,
+        CERTIFICATE_FORMAT_VERSION,
+    };
+
+    GatewayCertificateRequest {
+        format_version: CERTIFICATE_FORMAT_VERSION,
+        trust_domain_id: TrustDomainId::new([1; 16]).expect("domain id"),
+        gateway_identity_epoch: 8,
+        gateway_wg_public_key: WireGuardKey::from_bytes([2; 32]),
+        server_name: "gateway.example.test".into(),
+        new_ml_dsa_87_public_key: MlDsa87PublicKey::new(vec![23; 2592]).expect("public key"),
+        request_id: Id16::new([24; 16]).expect("request id"),
+        created_at: 1_700_000_000,
+        expires_at: 1_700_086_400,
+        new_key_proof: MlDsa87Signature::placeholder(),
+        current_key_authorization: None,
+    }
+}
+
+fn candidate_tls_fixture() -> aether::certificates::encoding::DerCertificate {
+    aether::certificates::encoding::DerCertificate::new(vec![7; 64]).expect("TLS fixture")
+}
+
 fn route_fixtures() -> Vec<(&'static str, serde_json::Value)> {
     use aether::certificates::{
         authority::{CaTransition, ClientTlsCaTransition},
         encoding::{Fingerprint, Id16, MlDsa87PublicKey, MlDsa87Signature, WireGuardKey},
-        gateway::{AbortReason, GatewayIdentityTransition, GatewayTransitionAbort},
+        gateway::{AbortReason, GatewayTransitionAbort},
         status::CertificateServiceRollbackAuthorization,
         window::TransitionWindow,
         CERTIFICATE_FORMAT_VERSION, CERTIFICATE_PROTOCOL_VERSION,
@@ -194,22 +291,7 @@ fn route_fixtures() -> Vec<(&'static str, serde_json::Value)> {
         activation_at: 200,
         not_after: 300,
     };
-    let transition = GatewayIdentityTransition {
-        format_version: CERTIFICATE_FORMAT_VERSION,
-        protocol_version: CERTIFICATE_PROTOCOL_VERSION,
-        trust_domain_id: domain,
-        ca_epoch: 1,
-        gateway_identity_epoch: 2,
-        gateway_wg_public_key: gateway,
-        server_name: "gateway.example.test".into(),
-        active_gateway_tls_certificate_fingerprint: fingerprint(3),
-        next_gateway_tls_certificate: None,
-        active_gateway_certificate_fingerprint: fingerprint(4),
-        next_gateway_certificate: None,
-        window,
-        reason: aether::certificates::authority::RotationReason::Scheduled,
-        ca_signature: signature.clone(),
-    };
+    let transition = transition_fixture();
     let abort = GatewayTransitionAbort {
         format_version: CERTIFICATE_FORMAT_VERSION,
         protocol_version: CERTIFICATE_PROTOCOL_VERSION,
@@ -380,6 +462,123 @@ async fn gateway_identity_routes_are_admin_only_in_the_real_router() {
     for (path, body) in route_fixtures() {
         let handler = StubIdentity::new(false);
         let response = send(app_state(Some(Arc::clone(&handler)), false), path, body).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+        assert_eq!(handler.calls.load(Ordering::SeqCst), 0, "{path}");
+    }
+}
+
+fn get_request(path: &str) -> Request<Body> {
+    let mut request = Request::get(path)
+        .body(Body::empty())
+        .expect("build request");
+    let address: std::net::SocketAddr = "100.64.1.2:40123".parse().expect("test socket address");
+    request
+        .extensions_mut()
+        .insert(axum::extract::ConnectInfo(address));
+    request
+}
+
+async fn get_json(state: AppState, path: &str) -> (StatusCode, serde_json::Value) {
+    let response = crate::router(state)
+        .oneshot(get_request(path))
+        .await
+        .expect("router response");
+    let status = response.status();
+    let payload = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("response body");
+    let json = serde_json::from_slice(&payload).unwrap_or(serde_json::Value::Null);
+    (status, json)
+}
+
+/// The staged transition is what the gateway serves while the overlap runs:
+/// the rollback and the abort are verified against its exact bytes.
+#[tokio::test]
+async fn staged_transition_is_served_until_promotion() {
+    let handler = StubIdentity::new(false);
+    let (status, json) = get_json(
+        app_state(Some(Arc::clone(&handler)), true),
+        "/api/certificates/gateway-transition",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let served: Option<aether::certificates::gateway::GatewayIdentityTransition> =
+        serde_json::from_value(json["transition"].clone()).expect("transition document");
+    assert_eq!(served, Some(transition_fixture()));
+    assert_eq!(handler.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn staged_transition_is_null_without_one() {
+    let (status, json) = get_json(
+        app_state(Some(StubIdentity::absent()), true),
+        "/api/certificates/gateway-transition",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(json["transition"].is_null(), "{json}");
+}
+
+/// The ceremony needs the whole public request and the candidate TLS leaf,
+/// and both come back exactly as the preparation wrote them.
+#[tokio::test]
+async fn renewal_request_and_candidate_tls_are_readable_after_prepare() {
+    let handler = StubIdentity::new(false);
+    let (status, json) = get_json(
+        app_state(Some(Arc::clone(&handler)), true),
+        "/api/certificates/gateway-renewal",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let request: aether::certificates::gateway::GatewayCertificateRequest =
+        serde_json::from_value(json).expect("request document");
+    assert_eq!(request, request_fixture());
+
+    let (status, json) = get_json(
+        app_state(Some(Arc::clone(&handler)), true),
+        "/api/certificates/gateway-renewal/tls",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let tls: Option<aether::certificates::encoding::DerCertificate> =
+        serde_json::from_value(json).expect("candidate TLS leaf");
+    assert_eq!(tls, Some(candidate_tls_fixture()));
+}
+
+/// No request pending is a fact the console must not mistake for a request
+/// with no fields: it is an absence, answered as one.
+#[tokio::test]
+async fn renewal_request_is_not_found_without_one() {
+    let (status, _) = get_json(
+        app_state(Some(StubIdentity::absent()), true),
+        "/api/certificates/gateway-renewal",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, json) = get_json(
+        app_state(Some(StubIdentity::absent()), true),
+        "/api/certificates/gateway-renewal/tls",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(json.is_null(), "{json}");
+}
+
+#[tokio::test]
+async fn gateway_identity_reads_are_admin_only_in_the_real_router() {
+    for path in [
+        "/api/certificates/gateway-transition",
+        "/api/certificates/gateway-renewal",
+        "/api/certificates/gateway-renewal/tls",
+    ] {
+        let handler = StubIdentity::new(false);
+        let response = crate::router(app_state(Some(Arc::clone(&handler)), false))
+            .oneshot(get_request(path))
+            .await
+            .expect("router response");
         assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
         assert_eq!(handler.calls.load(Ordering::SeqCst), 0, "{path}");
     }

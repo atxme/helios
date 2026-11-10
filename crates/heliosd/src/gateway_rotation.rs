@@ -430,6 +430,23 @@ pub(crate) fn open_registry_for_command() -> Result<CertificateRegistry> {
         })
 }
 
+/// The request a preparation left for its ceremony, as the console reads it.
+pub(crate) fn pending_renewal_request() -> Result<Option<GatewayCertificateRequest>> {
+    read_pending(&pending_request_path())
+}
+
+/// The staged transition document, as the console reads it (spec §5.4).
+///
+/// Present from the installation until the promotion or the abort removes it,
+/// which is the whole overlap: a rollback needs the document it lives in.
+pub(crate) fn staged_gateway_transition() -> Result<Option<GatewayIdentityTransition>> {
+    read_staged_transition(&staged_transition_path())
+}
+
+fn read_staged_transition(path: &std::path::Path) -> Result<Option<GatewayIdentityTransition>> {
+    read_optional_document(path, "staged gateway transition")
+}
+
 /// Reads a signed decision an operator carried back from the ceremony.
 pub(crate) fn read_signed_document<T: serde::de::DeserializeOwned>(
     source: &std::path::Path,

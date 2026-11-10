@@ -690,3 +690,73 @@ fn a_marker_for_an_epoch_never_reached_is_refused() {
     assert!(maintain_gateway_identity_in(&mut registry, None, NOW, &documents).is_err());
     assert!(documents.marker.exists());
 }
+
+/// The console reads the staged document while the overlap runs: the
+/// rollback and the abort both need the exact bytes the registry staged.
+#[test]
+fn staged_transition_is_served_until_promotion() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let documents = documents_in(directory.path());
+    let transition = staged_transition(4);
+    write_document(&documents.transition, &transition, "transition").expect("write");
+    let mut gateway = gateway();
+    gateway.next_gateway_identity_epoch = Some(4);
+    gateway.activation_at = Some(NOW + 1_000);
+    gateway.retire_active_at = Some(NOW + 2_000);
+    gateway.published = true;
+    let mut registry = registry_in(directory.path(), gateway);
+
+    assert_eq!(
+        read_staged_transition(&documents.transition).expect("read"),
+        Some(transition.clone())
+    );
+    assert!(
+        !maintain_gateway_identity_in(&mut registry, None, NOW + 1_999, &documents)
+            .expect("still in overlap")
+    );
+    assert_eq!(
+        read_staged_transition(&documents.transition).expect("read"),
+        Some(transition)
+    );
+}
+
+#[test]
+fn staged_transition_is_null_without_one() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let documents = documents_in(directory.path());
+
+    assert_eq!(
+        read_staged_transition(&documents.transition).expect("read"),
+        None
+    );
+}
+
+/// What a preparation writes is what the console reads back: the request for
+/// the ceremony and the candidate TLS leaf, both public.
+#[test]
+fn renewal_request_and_candidate_tls_are_readable_after_prepare() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let documents = documents_in(directory.path());
+    let prepared = request(4, NOW + 1_000);
+    write_pending(&documents.pending_request, &prepared).expect("write request");
+    assert_eq!(
+        read_pending(&documents.pending_request).expect("read request"),
+        Some(prepared)
+    );
+
+    let candidate = aether::certificates::encoding::DerCertificate::new(vec![7; 64]).expect("der");
+    let candidate_path = directory.path().join("next.der");
+    std::fs::write(&candidate_path, candidate.as_bytes()).expect("write candidate");
+    assert_eq!(
+        crate::key_negotiation::read_candidate_tls_certificate(&candidate_path)
+            .expect("read candidate"),
+        Some(candidate)
+    );
+    assert_eq!(
+        crate::key_negotiation::read_candidate_tls_certificate(
+            &directory.path().join("absent.der")
+        )
+        .expect("read absent candidate"),
+        None
+    );
+}
