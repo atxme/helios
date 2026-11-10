@@ -520,6 +520,174 @@ async fn a_queued_console_admission_becomes_a_generation() {
     );
 }
 
+#[tokio::test]
+async fn queued_admission_decode_failures_leave_the_registry_unchanged() {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+    let (service, directory) = service(state());
+    let valid_tls = aether::certificates::test_x509::client_material("workstation");
+    let valid_pq = client_leaf(&key(2), 500_000);
+    let tls = STANDARD.encode(valid_tls.leaf.as_bytes());
+    let pq = STANDARD.encode(serde_json::to_vec(&valid_pq).expect("PQ JSON"));
+    let invalid_tls_base64 = serde_json::to_vec(&QueuedAdmission {
+        name: "workstation".into(),
+        client_wg_public_key: key(2).to_base64(),
+        tls_certificate: "%%%".into(),
+        pq_certificate: pq,
+    })
+    .expect("admission JSON");
+    let invalid_pq_base64 = serde_json::to_vec(&QueuedAdmission {
+        name: "workstation".into(),
+        client_wg_public_key: key(2).to_base64(),
+        tls_certificate: tls.clone(),
+        pq_certificate: "%%%".into(),
+    })
+    .expect("admission JSON");
+    let invalid_pq_json = serde_json::to_vec(&QueuedAdmission {
+        name: "workstation".into(),
+        client_wg_public_key: key(2).to_base64(),
+        tls_certificate: tls.clone(),
+        pq_certificate: STANDARD.encode(b"not JSON"),
+    })
+    .expect("admission JSON");
+    let mismatched_peer = serde_json::to_vec(&QueuedAdmission {
+        name: "workstation".into(),
+        client_wg_public_key: key(2).to_base64(),
+        tls_certificate: tls,
+        pq_certificate: STANDARD
+            .encode(serde_json::to_vec(&client_leaf(&key(3), 500_000)).expect("PQ JSON")),
+    })
+    .expect("admission JSON");
+
+    for (name, document, expected_error) in [
+        ("bad-json", b"{".as_slice(), "reading the queued admission"),
+        (
+            "bad-tls-base64",
+            invalid_tls_base64.as_slice(),
+            "TLS certificate is not base64",
+        ),
+        (
+            "bad-pq-base64",
+            invalid_pq_base64.as_slice(),
+            "PQ certificate is not base64",
+        ),
+        (
+            "bad-pq-json",
+            invalid_pq_json.as_slice(),
+            "PQ certificate is not a JSON document",
+        ),
+        (
+            "mismatched-peer",
+            mismatched_peer.as_slice(),
+            "registry refused it: Rejected",
+        ),
+    ] {
+        let path = directory.path().join(name);
+        std::fs::write(&path, document).expect("write queued document");
+        let error = service
+            .record_queued_admission(&path)
+            .await
+            .expect_err("invalid admission document");
+        assert!(error.to_string().contains(expected_error), "{error:#}");
+        assert!(service.registry.lock().await.state().peers.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn admission_drain_records_valid_files_and_removes_refused_json_only() {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+    let (service, directory) = service(state());
+    let registry_path = directory.path().join("certificates.json");
+    let peer_key = key(2);
+    let material = aether::certificates::test_x509::client_material("workstation");
+    let leaf = client_leaf(&peer_key, 500_000);
+    let valid_path = queue_admission(
+        &registry_path,
+        &QueuedAdmission {
+            name: "workstation".into(),
+            client_wg_public_key: peer_key.to_base64(),
+            tls_certificate: STANDARD.encode(material.leaf.as_bytes()),
+            pq_certificate: STANDARD.encode(serde_json::to_vec(&leaf).expect("PQ JSON")),
+        },
+    )
+    .expect("queue valid admission");
+    let inbox = super::admission::admission_inbox(&registry_path);
+    let refused_path = inbox.join("refused.json");
+    let ignored_path = inbox.join("notes.txt");
+    std::fs::write(&refused_path, b"not JSON").expect("write refused admission");
+    std::fs::write(&ignored_path, b"not an admission").expect("write unrelated file");
+
+    super::admission::drain_admission_inbox(&service, &inbox).await;
+
+    assert!(!valid_path.exists(), "recorded JSON is consumed");
+    assert!(!refused_path.exists(), "refused JSON is consumed too");
+    assert!(ignored_path.exists(), "non-JSON files are left alone");
+    let registry = service.registry.lock().await;
+    assert_eq!(registry.state().peers.len(), 1);
+    assert_eq!(
+        registry
+            .peer(&peer_key)
+            .expect("recorded peer")
+            .state
+            .active
+            .generation,
+        1
+    );
+}
+
+#[test]
+fn admission_queue_replaces_the_same_identity_and_uses_private_permissions() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let registry_path = directory.path().join("certificates.json");
+    let admission = QueuedAdmission {
+        name: "workstation".into(),
+        client_wg_public_key: key(2).to_base64(),
+        tls_certificate: "tls-first".into(),
+        pq_certificate: "pq-first".into(),
+    };
+    let first = queue_admission(&registry_path, &admission).expect("first queue");
+    let replacement = QueuedAdmission {
+        tls_certificate: "tls-second".into(),
+        pq_certificate: "pq-second".into(),
+        ..admission
+    };
+    let second = queue_admission(&registry_path, &replacement).expect("replacement queue");
+
+    assert_eq!(first, second);
+    assert_eq!(
+        std::fs::read_dir(super::admission::admission_inbox(&registry_path))
+            .expect("inbox")
+            .count(),
+        1
+    );
+    let stored: QueuedAdmission =
+        serde_json::from_slice(&std::fs::read(&second).expect("stored admission"))
+            .expect("decode stored admission");
+    assert_eq!(stored.tls_certificate, "tls-second");
+    assert_eq!(stored.pq_certificate, "pq-second");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            std::fs::metadata(&first)
+                .expect("file metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(super::admission::admission_inbox(&registry_path))
+                .expect("directory metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+    }
+}
+
 /// The block a profile carries is exactly what the registry holds, and it
 /// is readable by the consumer that will use it. Eleven values copied by
 /// hand between two shells is eleven places to paste the wrong one, and

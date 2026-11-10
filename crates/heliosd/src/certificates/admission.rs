@@ -1,6 +1,7 @@
 //! The admission inbox, and the first generation of an admitted peer.
 
 use super::*;
+use std::path::Path;
 
 /// One admission, as the console leaves it for the daemon.
 ///
@@ -84,29 +85,35 @@ pub fn spawn_admission_drain(service: Arc<CertificateService>, registry_path: Pa
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
-            let Ok(entries) = std::fs::read_dir(&directory) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
-                    continue;
-                }
-                match service.record_queued_admission(&path).await {
-                    Ok(name) => {
-                        tracing::info!(peer = %name, "console admission recorded");
-                    }
-                    Err(error) => {
-                        tracing::error!(
-                            file = %path.display(),
-                            %error,
-                            "console admission refused: this peer has no certificate generation, \
-                             so it will connect but never renew. Re-admit it."
-                        );
-                    }
-                }
-                let _ = std::fs::remove_file(&path);
-            }
+            drain_admission_inbox(&service, &directory).await;
         }
     });
+}
+
+/// Processes one inbox snapshot so its file-handling behavior can be tested
+/// without waiting on the daemon's polling loop.
+pub(super) async fn drain_admission_inbox(service: &CertificateService, directory: &Path) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+            continue;
+        }
+        match service.record_queued_admission(&path).await {
+            Ok(name) => {
+                tracing::info!(peer = %name, "console admission recorded");
+            }
+            Err(error) => {
+                tracing::error!(
+                    file = %path.display(),
+                    %error,
+                    "console admission refused: this peer has no certificate generation, \
+                     so it will connect but never renew. Re-admit it."
+                );
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+    }
 }
