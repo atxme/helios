@@ -85,6 +85,8 @@ struct Remote<'a> {
     /// Answers to the installations, in order; a number is a refusal with that status.
     install_replies: RefCell<VecDeque<u16>>,
     calls: RefCell<Vec<&'static str>>,
+    /// The labels the openings carried, in order.
+    reasons: RefCell<Vec<String>>,
     submitted: RefCell<Vec<AstraSignerResult>>,
     installed: RefCell<Vec<GatewayIdentityTransition>>,
 }
@@ -119,6 +121,7 @@ impl<'a> Remote<'a> {
             submit_replies: RefCell::default(),
             install_replies: RefCell::default(),
             calls: RefCell::default(),
+            reasons: RefCell::default(),
             submitted: RefCell::default(),
             installed: RefCell::default(),
         }
@@ -147,6 +150,7 @@ impl<'a> Remote<'a> {
 
 impl GatewayIdentityRemote for Remote<'_> {
     fn open_campaign(&self, request: &OperatorOpenRequest) -> Result<OperatorOpened> {
+        self.reasons.borrow_mut().push(request.reason.clone());
         match &request.action {
             OperatorOpenAction::GatewayIdentity => {
                 self.note("open_identity");
@@ -559,6 +563,158 @@ fn both_halves_are_revoked_with_the_campaign_expiries() {
         "the leaf in service is the one revoked"
     );
     assert_eq!(object.revoked_pq_not_after, Some(PQ_NOT_AFTER));
+}
+
+/// The replacement deposited, then the revocation accepted by Astra with its answer lost: the
+/// record holds the revocation unapplied.
+fn lost_revocation_answer(remote: &Remote<'_>, domain: &Domain) -> SignedGatewayRevocation {
+    let replacement = sign_replacement(remote, domain);
+    carry_revocation(remote, &domain.path, replacement, NOW)
+        .expect_err("the revocation is to sign");
+    let signed = sign_revocation(remote, domain, true);
+    remote.submit_replies.borrow_mut().push_back(Err(500));
+    carry_revocation(remote, &domain.path, signed, NOW).expect_err("the answer was lost");
+    pending_revocation(&domain.path, NOW)
+        .expect("read")
+        .expect("the record waits")
+}
+
+fn record_bytes(domain: &Domain) -> Vec<u8> {
+    std::fs::read(domain.path.parent().expect("parent").join(PENDING_FILE)).expect("record")
+}
+
+#[test]
+fn an_accepted_revocation_whose_answer_was_lost_is_completed_by_the_replacement() {
+    let scenario = Scenario::new(true);
+    let remote = Remote::new(&scenario);
+    let domain = &scenario.domain;
+    let kept = lost_revocation_answer(&remote, domain);
+    assert!(!kept.revocation_applied, "the answer was lost");
+    let rounds = remote.count("open_revocation");
+
+    // The campaign has closed. The gateway accepts the replacement: it was revoked.
+    let at_expiry = pending_revocation(&domain.path, EXPIRES)
+        .expect("read")
+        .expect("the record still waits");
+    carry_revocation(&remote, &domain.path, at_expiry, EXPIRES).expect("completed");
+
+    assert_eq!(
+        remote.count("open_revocation"),
+        rounds,
+        "no new revocation round"
+    );
+    assert_eq!(
+        remote.installed.borrow().len(),
+        1,
+        "the replacement is installed once"
+    );
+    assert!(!record_on_disk(domain));
+}
+
+#[test]
+fn a_refused_probe_returns_to_sign_and_keeps_the_replacement() {
+    let scenario = Scenario::new(true);
+    let remote = Remote::new(&scenario);
+    let domain = &scenario.domain;
+    lost_revocation_answer(&remote, domain);
+    // The gateway refuses the replacement: the revocation never applied.
+    remote.install_replies.borrow_mut().push_back(409);
+    let at_expiry = pending_revocation(&domain.path, EXPIRES)
+        .expect("read")
+        .expect("the record still waits");
+
+    let refusal = carry_revocation(&remote, &domain.path, at_expiry, EXPIRES)
+        .expect_err("the revocation is to sign again");
+
+    assert_eq!(refusal, GatewayRefusal::RevocationToSign);
+    let kept = pending_revocation(&domain.path, EXPIRES)
+        .expect("read")
+        .expect("the replacement waits");
+    assert!(
+        kept.revocation.is_none(),
+        "the expired revocation is dropped"
+    );
+    assert!(kept.replacement.as_ref().expect("replacement").deposited);
+    open_gateway_revocation(
+        &remote,
+        &domain.path,
+        RevocationReasonChoice::Compromised,
+        true,
+        NOW,
+    )
+    .expect("the revocation round opens again");
+}
+
+#[test]
+fn an_unreachable_probe_keeps_the_record_unchanged() {
+    let scenario = Scenario::new(true);
+    let remote = Remote::new(&scenario);
+    let domain = &scenario.domain;
+    lost_revocation_answer(&remote, domain);
+    remote.install_replies.borrow_mut().push_back(500);
+    let before = record_bytes(domain);
+    let at_expiry = pending_revocation(&domain.path, EXPIRES)
+        .expect("read")
+        .expect("the record still waits");
+    let before_probe = record_bytes(domain);
+    assert_eq!(before, before_probe);
+
+    let refusal = carry_revocation(&remote, &domain.path, at_expiry, EXPIRES)
+        .expect_err("the gateway did not answer");
+
+    assert!(
+        matches!(refusal, GatewayRefusal::Internal(_)),
+        "{refusal:?}"
+    );
+    assert_eq!(record_bytes(domain), before, "nothing is dropped");
+}
+
+#[test]
+fn the_replacement_round_carries_its_own_label() {
+    let scenario = Scenario::new(true);
+    let remote = Remote::new(&scenario);
+    sign_replacement(&remote, &scenario.domain);
+    assert_eq!(
+        remote.reasons.borrow().as_slice(),
+        ["Identité de remplacement de la gateway, avant sa révocation".to_string()],
+    );
+}
+
+#[test]
+fn an_overlap_end_already_past_names_no_date() {
+    let scenario = Scenario::new(true);
+    let mut remote = Remote::new(&scenario);
+    let domain = &scenario.domain;
+    remote.overlap = Some(NOW - 1);
+
+    let refusal = open_gateway_revocation(
+        &remote,
+        &domain.path,
+        RevocationReasonChoice::Compromised,
+        true,
+        NOW,
+    )
+    .err()
+    .expect("refused");
+
+    assert_eq!(refusal, GatewayRefusal::ReplacementAwaitsOverlap);
+    assert!(!remote.called("open_identity"), "no campaign is opened");
+    assert_eq!(domain.touches(), 0);
+}
+
+#[test]
+fn rollback_is_refused_while_a_revocation_waits() {
+    let scenario = Scenario::new(false);
+    let remote = Remote::new(&scenario);
+    let domain = &scenario.domain;
+    sign_revocation(&remote, domain, false);
+
+    let refusal = gateway_identity::open_rollback(&remote, &domain.path, 1, "motif", "Orion", NOW)
+        .err()
+        .expect("refused");
+
+    assert_eq!(refusal, GatewayRefusal::RevocationPending);
+    assert!(!remote.called("gateway"), "the gateway is not read");
 }
 
 #[test]

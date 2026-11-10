@@ -44,7 +44,7 @@ use crate::authenticator::Authenticator;
 use crate::handoff::{self, DomainHandoff};
 use crate::operations::campaign_result;
 use crate::operations::gateway_identity::{
-    self, before_signing, bound_to_domain, deposit_result, internal, open_renewal,
+    self, before_signing, bound_to_domain, deposit_result, internal, open_renewal_as,
     refused_by_gateway, transition_of, GatewayIdentityRemote, GatewayRefusal, OpenedGatewayRenewal,
     RenewalOptions, SignedGatewayDecision, CAMPAIGN_WINDOW_SECS, REQUESTED_BY,
 };
@@ -74,6 +74,9 @@ const REPLACEMENT_TERMS: RenewalOptions = RenewalOptions {
     overlap_days: 7,
     validity_days: 365,
 };
+
+/// The campaign label of the replacement round, which the operator reads on the door's screen.
+const REPLACEMENT_LABEL: &str = "Identité de remplacement de la gateway, avant sa révocation";
 
 /// What the gateway revocation has done so far, as the record holds it. Public: it is the
 /// record the resume reads.
@@ -224,12 +227,7 @@ pub fn carry_revocation(
     };
     if !signed.revocation_applied {
         if now >= revocation.expires_at {
-            signed.revocation = None;
-            keep(vault_path, &signed).map_err(internal)?;
-            return Err(GatewayRefusal::Internal(
-                "la campagne de la révocation a expiré avant le dépôt : la révocation est jetée. Reprendre la préparation."
-                    .into(),
-            ));
+            return probe_expired_revocation(remote, vault_path, signed);
         }
         deposit_result(
             remote,
@@ -254,9 +252,43 @@ pub fn carry_revocation(
     clear(vault_path).map_err(internal)
 }
 
+/// The revocation's campaign closed before its answer came back, so Astra may still hold it. The
+/// gateway takes the replacement only once it is revoked and names it, which tells whether the
+/// revocation applied: accepted, both steps are done; refused for good, it did not apply and the
+/// revocation is dropped to be signed again; unreachable, the record is left as it is.
+fn probe_expired_revocation(
+    remote: &dyn GatewayIdentityRemote,
+    vault_path: &Path,
+    mut signed: SignedGatewayRevocation,
+) -> Result<(), GatewayRefusal> {
+    let Some(replacement) = signed.replacement.as_ref() else {
+        // Without a replacement nothing tells whether the revocation applied: it is dropped.
+        clear(vault_path).map_err(internal)?;
+        return Err(GatewayRefusal::Internal(
+            "la campagne de la révocation a expiré avant le dépôt : la révocation est jetée. Reprendre la préparation."
+                .into(),
+        ));
+    };
+    match remote.install(transition_of(replacement)?) {
+        Ok(_) => {
+            signed.revocation_applied = true;
+            signed.replacement_installed = true;
+            clear(vault_path).map_err(internal)
+        }
+        Err(error) => match refused_by_gateway(error) {
+            GatewayRefusal::GatewayRefused(_) => {
+                signed.revocation = None;
+                keep(vault_path, &signed).map_err(internal)?;
+                Err(GatewayRefusal::RevocationToSign)
+            }
+            other => Err(other),
+        },
+    }
+}
+
 /// The recorded gateway revocation, if one waits. A replacement that no campaign can deposit
-/// any more is discarded with the record, and so is an unapplied revocation whose campaign has
-/// closed: the replacement stays, and the next round asks for the revocation again.
+/// any more is discarded with the record. An unapplied revocation past its campaign stays: the
+/// next carry decides whether it applied.
 pub fn pending_revocation(vault_path: &Path, now: u64) -> Result<Option<SignedGatewayRevocation>> {
     let path = record_path(vault_path);
     let bytes = match std::fs::read(&path) {
@@ -264,13 +296,12 @@ pub fn pending_revocation(vault_path: &Path, now: u64) -> Result<Option<SignedGa
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error).with_context(|| format!("lecture de {}", path.display())),
     };
-    let mut signed: SignedGatewayRevocation =
-        serde_json::from_slice(&bytes).with_context(|| {
-            format!(
-                "lecture de la révocation de la gateway en attente {}",
-                path.display()
-            )
-        })?;
+    let signed: SignedGatewayRevocation = serde_json::from_slice(&bytes).with_context(|| {
+        format!(
+            "lecture de la révocation de la gateway en attente {}",
+            path.display()
+        )
+    })?;
     if signed
         .replacement
         .as_ref()
@@ -278,14 +309,6 @@ pub fn pending_revocation(vault_path: &Path, now: u64) -> Result<Option<SignedGa
     {
         clear(vault_path)?;
         return Ok(None);
-    }
-    if signed
-        .revocation
-        .as_ref()
-        .is_some_and(|r| !signed.revocation_applied && now >= r.expires_at)
-    {
-        signed.revocation = None;
-        keep(vault_path, &signed)?;
     }
     if signed.replacement.is_none() && signed.revocation.is_none() {
         clear(vault_path)?;
@@ -311,8 +334,8 @@ fn open_replacement(
     let keys = ValidatedKeys::new(vault_path).map_err(internal)?;
     let vault = &keys.vault;
     let overlap = remote.overlap_not_after().map_err(before_signing)?;
-    if let Some(end) = overlap_end(vault, overlap)? {
-        return Err(GatewayRefusal::ReplacementNotBefore(end));
+    if let Some(refusal) = replacement_overlap(vault, overlap, now)? {
+        return Err(refusal);
     }
     let relay = DomainHandoff::beside(vault_path, vault).map_err(internal)?;
     let identity = handoff::identity_of(&relay).map_err(internal)?;
@@ -325,7 +348,13 @@ fn open_replacement(
                 .into(),
         ));
     }
-    let renewal = open_renewal(remote, vault_path, REPLACEMENT_TERMS, now)?;
+    let renewal = open_renewal_as(
+        remote,
+        vault_path,
+        REPLACEMENT_TERMS,
+        REPLACEMENT_LABEL,
+        now,
+    )?;
     Ok(OpenedGatewayRevocation {
         stage: Stage::Replacement(Box::new(renewal)),
     })
@@ -349,8 +378,8 @@ fn open_revocation(
     if let Some(transition) = transition {
         bound_to_domain(transition, &identity)?;
         // The replacement is signed under the current anchor: an overlap started since refuses it.
-        if let Some(end) = overlap_end(vault, overlap)? {
-            return Err(GatewayRefusal::ReplacementNotBefore(end));
+        if let Some(refusal) = replacement_overlap(vault, overlap, now)? {
+            return Err(refusal);
         }
     }
     let mut authority = remote.authority_status().map_err(before_signing)?;
@@ -537,12 +566,14 @@ fn transition_fingerprint(
     transition.fingerprint().map_err(internal)
 }
 
-/// When the overlap ends, while one runs: the gateway's retirement instant, or the instant the
-/// vault keeps for its outgoing key. `None` outside an overlap.
-fn overlap_end(
+/// The refusal that keeps a replacement out of an overlap, if one runs. The end is the gateway's
+/// retirement instant, or the instant the vault keeps for its outgoing key. An end already past
+/// by this clock names no date.
+fn replacement_overlap(
     vault: &AuthorityVault,
     overlap: Option<u64>,
-) -> Result<Option<u64>, GatewayRefusal> {
+    now: u64,
+) -> Result<Option<GatewayRefusal>, GatewayRefusal> {
     let kept = match vault.retained_outgoing_ca_pq_public() {
         Some((_, _, not_after)) => Some(not_after),
         None if vault.retained_outgoing_ca_pq_public.is_some() => {
@@ -552,7 +583,13 @@ fn overlap_end(
         }
         None => None,
     };
-    Ok(overlap.or(kept))
+    Ok(overlap.or(kept).map(|end| {
+        if end > now {
+            GatewayRefusal::ReplacementNotBefore(end)
+        } else {
+            GatewayRefusal::ReplacementAwaitsOverlap
+        }
+    }))
 }
 
 fn from_revocation(refusal: RevocationRefusal) -> GatewayRefusal {

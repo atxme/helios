@@ -224,8 +224,12 @@ pub enum GatewayRefusal {
     AlreadyRevoked,
     /// The replacement waits for the end of the overlap: the gateway verifies it under the
     /// outgoing `CA-PQ` until then, and the vault cannot sign under that key (lot 6b, §7.1).
-    #[error("le remplacement de la gateway est possible après le {}. Rien n'a été signé.", utc_label(*.0))]
+    #[error("le remplacement de la gateway est possible après le {}. La révocation sans remplaçant reste possible. Rien n'a été signé.", utc_label(*.0))]
     ReplacementNotBefore(u64),
+    /// The overlap's end has already passed by the workstation's clock: the replacement waits
+    /// for the gateway to lift the overlap, and no date is named.
+    #[error("le remplacement de la gateway attend la fin du recouvrement de CA-PQ. La révocation sans remplaçant reste possible. Rien n'a été signé.")]
+    ReplacementAwaitsOverlap,
     /// A revocation of the gateway refused by its own anchor rule (lot 5c, shared).
     #[error("{0}")]
     Revocation(RevocationRefusal),
@@ -322,6 +326,18 @@ pub fn open_renewal(
     options: RenewalOptions,
     now: u64,
 ) -> Result<OpenedGatewayRenewal, GatewayRefusal> {
+    open_renewal_as(remote, vault_path, options, reason_label(options), now)
+}
+
+/// [`open_renewal`] with the campaign's label named by the caller: the emergency replacement
+/// carries its own, not the renewal's.
+pub(super) fn open_renewal_as(
+    remote: &dyn GatewayIdentityRemote,
+    vault_path: &Path,
+    options: RenewalOptions,
+    reason: &str,
+    now: u64,
+) -> Result<OpenedGatewayRenewal, GatewayRefusal> {
     // A decision still waiting belongs to a campaign that is open or was: a new one
     // would overwrite it before it is deposited.
     if pending(vault_path, now).map_err(internal)?.is_some() {
@@ -362,7 +378,7 @@ pub fn open_renewal(
     let opened = remote
         .open_campaign(&OperatorOpenRequest {
             action: OperatorOpenAction::GatewayIdentity,
-            reason: reason_label(options).to_string(),
+            reason: reason.to_string(),
             requested_by: REQUESTED_BY.to_string(),
             window_secs: CAMPAIGN_WINDOW_SECS,
         })
@@ -899,6 +915,12 @@ pub fn open_rollback(
     requested_by: &str,
     now: u64,
 ) -> Result<OpenedGatewayRollback, GatewayRefusal> {
+    if pending_revocation(vault_path, now)
+        .map_err(internal)?
+        .is_some()
+    {
+        return Err(GatewayRefusal::RevocationPending);
+    }
     let gateway = remote.gateway().map_err(before_signing)?;
     let transition = remote
         .staged_transition()
