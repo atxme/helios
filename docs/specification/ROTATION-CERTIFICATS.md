@@ -455,7 +455,7 @@ qu'à un administrateur, qui lit déjà ces opérations dans `pending`. Une copi
 identique passe.
 
 **Limites connues.** De `Applied` à `not_after`, la révocation d'urgence est
-impossible (la clé sortante a quitté le coffre, Astra vérifie sous elle) ; de
+impossible (la clé sortante a quitté le coffre, Astra vérifie sous elle ; levé le 9 novembre 2026, voir § 0.11) ; de
 `not_after` à la re-délégation, l'émission en ligne d'Astra est refusée ;
 un délai d'installation dépassé n'a pas de réparation ; une copie du coffre
 peut être remplacée par un administrateur du tunnel. Détail et suivis : § 10.8

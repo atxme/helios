@@ -1218,7 +1218,7 @@ attendu.
 
 67. **Liste et états.** Ouvrir l'onglet. Attendu : une ligne par poste du domaine,
     avec son état et son échéance. Le poste où tourne Orion porte « Ce poste »,
-    sans bouton, avec « Se coupe sur la gateway : helios peer revoke <nom>. ». Un
+    sans bouton, avec « Se coupe sur la gateway : helios peer revoke `<nom>`. ». Un
     poste révoqué est grisé. ↻ relit l'onglet.
 68. **Nom qui ne désigne pas la clé.** Sur un poste dont le nom ne désigne pas sa clé
     à la gateway (essai : un poste renommé à la gateway), « Révoquer » puis
@@ -1234,10 +1234,12 @@ attendu.
 71. **Reprise sans clé.** Redémarrer Astra, puis « Reprendre ». Attendu : une
     décision déjà signée est déposée sans toucher de clé ; sinon une campagne
     s'ouvre et ses clés sont demandées. La ligne passe « Révoqué ». **[cible]** (clés réelles).
-72. **Relais rejoué.** Arrêter la gateway au moment où Astra marque le poste révoqué.
-    Attendu : « Révoqué, gateway pas encore informée ». Remonter la gateway : la ligne
-    passe « Révoqué » au balayage suivant d'Astra (toutes les 60 s). **[cible]**
-    (gateway cible).
+72. **Relais rejoué.** Le dépôt accepté, couper seulement le canal privé d'Astra vers la
+    gateway (l'adresse `gateway_channel` ; l'accès d'Orion à `/api` reste ouvert).
+    Attendu : le poste n'est plus admis, et la ligne passe « Révoqué, gateway pas encore
+    informée ». Rétablir le canal. Au balayage suivant d'Astra (toutes les 60 s), la ligne
+    passe « Révoqué » ; le journal d'Astra porte `peer sweep: a recorded revocation the
+    gateway lacked is applied on it`. **[cible]** (veth, gateway cible).
 73. **Auto-révocation refusée.** Sur le poste Orion : aucun bouton « Révoquer » sur
     sa ligne. Sur la gateway, par le lien Tailscale : `helios peer revoke <nom>`.
     Attendu : le poste est coupé ; sur un autre poste administrateur, sa ligne
@@ -1253,11 +1255,12 @@ attendu.
 76. **Marge d'une heure.** Avec une horloge d'essai, ouvrir une révocation à moins
     d'une heure de `not_after` de la clé sortante. Attendu : la coupure se fait, la
     signature est refusée, « Révocation possible après … » avec la date et l'heure.
-    **[cible]** (clés réelles).
+    Une rotation dont l'ancre n'est pas détenue par ce coffre refuse avec « Astra vérifie
+    sous une ancre que ce coffre ne détient pas ». **[cible]** (clés réelles).
 77. **Avertissement avant « Remplacer la CA-PQ ».** Pendant un recouvrement, « Renouveler
     les postes » est désactivé, avec « Recouvrement CA-PQ en cours ». Ouvrir « Remplacer
     la CA-PQ » avec un poste dont l'échéance tombe dans la fenêtre prévue : une ligne
-    « <nom> expire le JJ/MM/AAAA, pendant le changement. » s'affiche, sans bloquer.
+    « `<nom>` expire le JJ/MM/AAAA, pendant le changement. » s'affiche, sans bloquer.
 78. **Poste inconnu d'Astra.** Un poste admis à la gateway qu'Astra n'a jamais lu.
     Attendu : la révocation de ce poste aboutit, Astra l'ayant inscrit à l'ouverture.
     **[cible]** (gateway cible).
@@ -1466,9 +1469,9 @@ relecture et l'écran sont exercés (`scripts/wsl-cargo test -p orion-core`,
 6. **Adaptateur sans IPv6.** Avec `DisabledComponents = 0xFF` comme dans
    « Capture réellement appliquée », connecter le profil dual-stack. Attendu,
    en plus de l'erreur `::/0` de ce contrôle : l'avertissement « adresse non
-   posée par le pilote sur l'adaptateur : <VIP IPv6>/128 — le tunnel ne porte
+   posée par le pilote sur l'adaptateur : `<VIP IPv6>/128` — le tunnel ne porte
    pas cette famille d'adresses », et la ligne « adresse » en ambre
-   (« … — <VIP IPv6>/128 non posée par le pilote »). Le tunnel IPv4 fonctionne.
+   (« … — `<VIP IPv6>/128` non posée par le pilote »). Le tunnel IPv4 fonctionne.
    Remettre la valeur d'origine et redémarrer.
 7. **Profil périmé.** Sur un profil portant `heliosd_url` sans bloc de
    négociation (chemin de provisioning après montage), remplacer la VIP IPv6

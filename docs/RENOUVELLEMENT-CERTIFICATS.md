@@ -454,11 +454,11 @@ encore. Un poste que la gateway ne connaît pas non plus est refusé par son nom
 | Actif | admis à la gateway, non révoqué chez Astra |
 | Renouvellement en cours | comme « Actif », avec un renouvellement du certificat en cours |
 | Coupé, révocation à signer | plus admis à la gateway, non révoqué chez Astra |
-| Révoqué | révoqué chez Astra |
-| Révoqué, gateway pas encore informée | révoqué chez Astra, encore admis à la gateway ; Astra renvoie la révocation à la gateway jusqu'à son accusé |
+| Révoqué | révoqué chez Astra et au registre de la gateway |
+| Révoqué, gateway pas encore informée | révoqué chez Astra, pas encore appliqué par la gateway : le registre de la gateway ne le tient pas révoqué, ou le poste est encore admis ; Astra renvoie la révocation à la gateway jusqu'à son accusé |
 
 **Le poste où tourne Orion** n'a pas de bouton « Révoquer » : sa ligne porte
-« Ce poste » et la phrase « Se coupe sur la gateway : helios peer revoke <nom>. ».
+« Ce poste » et la phrase « Se coupe sur la gateway : helios peer revoke `<nom>`. ».
 Il ne se coupe pas depuis lui-même : la coupure se fait sur la gateway, par
 l'outil `helios`, puis la révocation se signe depuis un autre poste
 administrateur, où la ligne apparaît « Coupé, révocation à signer ».
@@ -1078,7 +1078,9 @@ dans [ROADMAP.md](ROADMAP.md) (F14-a à F14-f).
   sortante gardée, y compris pendant le recouvrement, « Reprendre » compris. Elle
   est refusée dans la dernière heure avant `not_after`, et pour une rotation qui
   n'a pas gardé sa clé ; dans les deux cas, la coupure reste faite et le refus
-  dit « Révocation possible après le … ».
+  dit « Révocation possible après le … ». Une rotation dont l'ancre n'est pas
+  détenue par ce coffre refuse avec « Astra vérifie sous une ancre que ce coffre
+  ne détient pas ».
 - **Une clé marquée perdue pendant un recouvrement CA-PQ reste admise par Astra
   jusqu'après `not_after`.** Orion n'y joint pas le document de credentials, et
   Astra adopte à `not_after` celui de la rotation, signé avant le marquage.

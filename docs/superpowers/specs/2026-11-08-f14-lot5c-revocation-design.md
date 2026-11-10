@@ -110,9 +110,10 @@ Postes                                                   ↻
   - « Coupé, révocation à signer » : plus admis à la gateway, non révoqué chez
     Astra. Cela couvre aussi un poste retiré depuis la console web, et un autre
     poste administrateur voit le même état ;
-  - « Révoqué » : révoqué chez Astra ;
-  - « Révoqué, gateway pas encore informée » : révoqué chez Astra et encore
-    admis à la gateway (§5.7).
+  - « Révoqué » : révoqué chez Astra et au registre de la gateway ;
+  - « Révoqué, gateway pas encore informée » : révoqué chez Astra, mais pas encore
+    appliqué par la gateway : encore admis, ou certificat non révoqué au registre
+    de la gateway (§5.7).
 - Pas de lecture continue : à l'ouverture de l'onglet, au bouton ↻ et après
   chaque geste *(choix de conception, cohérent avec le 5b)*.
 

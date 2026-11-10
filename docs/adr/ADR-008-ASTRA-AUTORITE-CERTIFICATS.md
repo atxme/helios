@@ -778,7 +778,7 @@ construction le 7 :
   l'ancien document jusqu'à `not_after`. Orion désactive ces gestes avec la
   raison.
 - **Limites acceptées.** Un délai d'installation dépassé n'a pas de réparation ;
-  de `Applied` à `not_after` la révocation d'urgence est impossible ; un
+  de `Applied` à `not_after` la révocation d'urgence est impossible (levé le 9 novembre 2026, voir l'amendement ci-dessous) ; un
   administrateur du tunnel peut remplacer la copie du coffre (une génération
   gardée, sauvegarde hors gateway non couverte). Le détail est dans la
   spécification (§0.10) et la conception du lot 5b (§ 10).
