@@ -472,6 +472,7 @@ mod campaign_approval_precondition_tests {
                     ca_pq_public_key: pq_public.to_base64(),
                     ca_tls_private_key: encode(b"test-only TLS private key"),
                     retained_ca_tls: None,
+                    retained_outgoing_ca_pq: None,
                 },
                 SlotEnrolment {
                     role: SlotRole::Primary,
