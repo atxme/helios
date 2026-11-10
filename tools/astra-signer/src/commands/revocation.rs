@@ -257,4 +257,169 @@ mod tests {
             assert!(!missing_vault.exists());
         }
     }
+
+    use base64::Engine as _;
+
+    struct Fixture {
+        _directory: tempfile::TempDir,
+        vault_path: std::path::PathBuf,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let directory = tempfile::tempdir().expect("temporary directory");
+            let vault_path = directory.path().join("authority-vault.json");
+            let (pq_private, pq_public) =
+                aether::certificates::encoding::generate_ml_dsa_87_keypair()
+                    .expect("CA-PQ keypair");
+            let encode = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+            let trust_domain_id = aether::certificates::encoding::TrustDomainId::new([0x31; 16])
+                .expect("trust domain");
+            let gateway_key = aether::certificates::encoding::WireGuardKey::from_bytes([0x42; 32]);
+            let vault = astra_operator::vault::AuthorityVault::create(
+                trust_domain_id,
+                "astra.example",
+                astra_operator::vault::draw_salt().expect("vault salt"),
+                &astra_operator::vault::AuthoritySecrets {
+                    ca_pq_private_key: encode(&pq_private),
+                    ca_pq_public_key: pq_public.to_base64(),
+                    ca_tls_private_key: encode(b"test-only CA-TLS private key"),
+                    retained_ca_tls: None,
+                },
+                astra_operator::vault::SlotEnrolment {
+                    role: astra_operator::vault::SlotRole::Primary,
+                    label: "test slot".into(),
+                    credential_id: vec![0x51; 32],
+                    credential_public_key: vec![0xa5, 0x01],
+                    aaguid: [0; 16],
+                    enrolled_at: 1,
+                },
+                &astra_operator::vault::SlotSecret::new(vec![0x61; 32]),
+                1,
+            )
+            .expect("test vault");
+            astra_operator::store::save(&vault_path, &vault).expect("save vault");
+
+            let mut handoff =
+                astra_operator::handoff::DomainHandoff::of(&vault).expect("domain handoff");
+            handoff.gateway_wg_public_key = Some(gateway_key.to_base64());
+            handoff.server_name = Some("gateway.example".into());
+            astra_operator::handoff::save(
+                &astra_operator::handoff::path_beside(&vault_path),
+                &handoff,
+            )
+            .expect("save handoff");
+            credentials::save(
+                &credentials::path_beside(&vault_path),
+                &aether::certificates::approval::CredentialRegistry {
+                    trust_domain_id,
+                    gateway_wg_public_key: gateway_key,
+                    ca_epoch: 1,
+                    credential_registry_epoch: 1,
+                    bindings: Vec::new(),
+                },
+            )
+            .expect("save credential registry");
+
+            Self {
+                _directory: directory,
+                vault_path,
+            }
+        }
+
+        fn load_handoff(&self) -> astra_operator::handoff::DomainHandoff {
+            astra_operator::handoff::load(&astra_operator::handoff::path_beside(&self.vault_path))
+                .expect("load handoff")
+        }
+
+        fn save_handoff(&self, handoff: &astra_operator::handoff::DomainHandoff) {
+            astra_operator::handoff::save(
+                &astra_operator::handoff::path_beside(&self.vault_path),
+                handoff,
+            )
+            .expect("save handoff");
+        }
+
+        fn revoke(&self, authority_url: &str) -> anyhow::Result<()> {
+            super::revoke(
+                &self.vault_path,
+                authority_url,
+                "01010101010101010101010101010101",
+                None,
+                RevocationInputs {
+                    scope: RevocationScope::Client,
+                    halves: RevokedHalvesArg::Both,
+                    tls_not_after: Some(10_000),
+                    pq_not_after: Some(10_000),
+                    reason: RevocationReason::KeyCompromise,
+                    replacement: None,
+                },
+                Transport::Hid,
+            )
+        }
+    }
+
+    #[test]
+    fn non_https_authority_origins_are_refused_before_a_request_or_key_touch() {
+        let fixture = Fixture::new();
+
+        let error = fixture
+            .revoke("http://astra.example")
+            .expect_err("the authority must authenticate this public channel with TLS");
+
+        assert!(
+            error.to_string().contains("doit être en https://"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn revocation_refuses_a_handoff_without_the_gateway_server_name() {
+        let fixture = Fixture::new();
+        let mut handoff = fixture.load_handoff();
+        handoff.server_name = None;
+        fixture.save_handoff(&handoff);
+
+        let error = fixture
+            .revoke("http://astra.example")
+            .expect_err("the signed decision must be bound to its gateway identity");
+
+        assert!(
+            error.to_string().contains("nom de service de la gateway"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn revocation_refuses_an_unreadable_ca_pq_anchor_before_networking() {
+        let fixture = Fixture::new();
+        let mut vault = store::load(&fixture.vault_path).expect("load vault");
+        vault.ca_pq_public_key = "A".into();
+        store::save(&fixture.vault_path, &vault).expect("persist malformed test anchor");
+
+        let error = fixture
+            .revoke("http://astra.example")
+            .expect_err("a revocation cannot be signed under an unreadable trust anchor");
+
+        assert!(
+            error.to_string().contains("public key is malformed"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn revocation_refuses_to_contact_astra_without_credential_bindings() {
+        let fixture = Fixture::new();
+        std::fs::remove_file(credentials::path_beside(&fixture.vault_path))
+            .expect("remove credential bindings");
+
+        let error = fixture
+            .revoke("http://astra.example")
+            .expect_err("the signed credential registry is required before a campaign");
+
+        assert!(
+            error.to_string().contains("document de credentials"),
+            "{error:#}"
+        );
+    }
 }
