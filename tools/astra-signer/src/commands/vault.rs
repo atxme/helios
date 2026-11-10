@@ -295,11 +295,8 @@ pub(crate) fn domain(
         handoff.astra_service_key_epoch = Some(epoch);
     }
     if let Some(value) = astra_authority_url {
-        let value = value.trim();
-        if !value.starts_with("https://") {
-            bail!("l'origine de l'autorité doit être une URL https:// : {value}");
-        }
-        handoff.astra_authority_url = Some(value.trim_end_matches('/').to_string());
+        handoff.astra_authority_url =
+            Some(astra_operator::vault_gestures::authority_origin(value)?);
     }
     handoff::save(&handoff_path, &handoff)?;
 
@@ -480,7 +477,86 @@ fn parse_slot_id(value: &str) -> Result<[u8; 16]> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_slot_id;
+    use super::{domain, parse_slot_id};
+    use aether::certificates::encoding::{TrustDomainId, WireGuardKey};
+    use astra_operator::vault::{
+        AuthoritySecrets, AuthorityVault, SlotEnrolment, SlotRole, SlotSecret,
+    };
+    use base64::Engine as _;
+    use std::path::{Path, PathBuf};
+
+    struct DomainFixture {
+        _directory: tempfile::TempDir,
+        vault_path: PathBuf,
+        service_public_key: String,
+    }
+
+    impl DomainFixture {
+        fn new() -> Self {
+            let directory = tempfile::tempdir().expect("temporary directory");
+            let vault_path = directory.path().join("authority-vault.json");
+            let (pq_private, pq_public) =
+                aether::certificates::encoding::generate_ml_dsa_87_keypair()
+                    .expect("ML-DSA keypair");
+            let encode = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+            let domain_id = TrustDomainId::new([0x31; 16]).expect("domain id");
+            let vault = AuthorityVault::create(
+                domain_id,
+                "astra.example",
+                astra_operator::vault::draw_salt().expect("vault salt"),
+                &AuthoritySecrets {
+                    ca_pq_private_key: encode(&pq_private),
+                    ca_pq_public_key: pq_public.to_base64(),
+                    ca_tls_private_key: encode(b"test-only TLS private key"),
+                    retained_ca_tls: None,
+                    retained_outgoing_ca_pq: None,
+                },
+                SlotEnrolment {
+                    role: SlotRole::Primary,
+                    label: "primary".into(),
+                    credential_id: vec![0x51; 32],
+                    credential_public_key: vec![0xa5, 0x01],
+                    aaguid: [0; 16],
+                    enrolled_at: 1,
+                },
+                &SlotSecret::new(vec![0x61; 32]),
+                1,
+            )
+            .expect("test vault");
+            astra_operator::store::save(&vault_path, &vault).expect("save vault");
+            let mut handoff = astra_operator::handoff::DomainHandoff::of(&vault).expect("handoff");
+            handoff.gateway_wg_public_key = Some(WireGuardKey::from_bytes([0x42; 32]).to_base64());
+            handoff.server_name = Some("gateway.example".into());
+            handoff.astra_authority_url = Some("https://astra.example".into());
+            let (service_private, service_public) =
+                aether::certificates::encoding::generate_ml_dsa_87_keypair()
+                    .expect("service keypair");
+            drop(service_private);
+            handoff.astra_service_public_key = Some(service_public.to_base64());
+            handoff.astra_service_key_epoch = Some(4);
+            astra_operator::handoff::save(
+                &astra_operator::handoff::path_beside(&vault_path),
+                &handoff,
+            )
+            .expect("save handoff");
+            Self {
+                _directory: directory,
+                vault_path,
+                service_public_key: service_public.to_base64(),
+            }
+        }
+
+        fn handoff(&self) -> astra_operator::handoff::DomainHandoff {
+            let vault = astra_operator::store::load(&self.vault_path).expect("load vault");
+            astra_operator::handoff::DomainHandoff::beside(&self.vault_path, &vault)
+                .expect("load handoff")
+        }
+
+        fn handoff_bytes(&self) -> Vec<u8> {
+            std::fs::read(astra_operator::handoff::path_beside(&self.vault_path))
+                .expect("handoff bytes")
+        }
+    }
 
     #[test]
     fn slot_id_parser_accepts_trimmed_hex_and_rejects_bad_width_or_encoding() {
@@ -493,5 +569,141 @@ mod tests {
         for invalid in [String::new(), "00".into(), "gg".repeat(16), "00".repeat(17)] {
             assert!(parse_slot_id(&invalid).is_err(), "accepted {invalid:?}");
         }
+    }
+
+    #[test]
+    fn domain_updates_each_supported_field_after_trimming_and_normalizing() {
+        let fixture = DomainFixture::new();
+        let original = fixture.handoff();
+        let new_wg = WireGuardKey::from_bytes([0x77; 32]).to_base64();
+        domain(
+            &fixture.vault_path,
+            Some(&format!("  {new_wg}  ")),
+            Some("  gw-2.example  "),
+            Some(&fixture.service_public_key),
+            Some(9),
+            Some(" https://authority.example:8443/// "),
+        )
+        .expect("valid domain update");
+
+        let saved = fixture.handoff();
+        assert_eq!(
+            saved.gateway_wg_public_key.as_deref(),
+            Some(new_wg.as_str())
+        );
+        assert_eq!(saved.server_name.as_deref(), Some("gw-2.example"));
+        assert_eq!(
+            saved.astra_service_public_key.as_deref(),
+            Some(fixture.service_public_key.as_str())
+        );
+        assert_eq!(saved.astra_service_key_epoch, Some(9));
+        assert_eq!(
+            saved.astra_authority_url.as_deref(),
+            Some("https://authority.example:8443")
+        );
+        assert_eq!(saved.ca_pq_public_key, original.ca_pq_public_key);
+    }
+
+    #[test]
+    fn domain_update_preserves_existing_values_when_options_are_absent() {
+        let fixture = DomainFixture::new();
+        let before = fixture.handoff();
+        domain(&fixture.vault_path, None, None, None, None, None).expect("no-op refresh");
+        let after = fixture.handoff();
+        assert_eq!(after.gateway_wg_public_key, before.gateway_wg_public_key);
+        assert_eq!(after.server_name, before.server_name);
+        assert_eq!(
+            after.astra_service_public_key,
+            before.astra_service_public_key
+        );
+        assert_eq!(
+            after.astra_service_key_epoch,
+            before.astra_service_key_epoch
+        );
+        assert_eq!(after.astra_authority_url, before.astra_authority_url);
+        assert_eq!(after.trust_domain_id, before.trust_domain_id);
+        assert_eq!(after.ca_pq_public_key, before.ca_pq_public_key);
+    }
+
+    #[test]
+    fn domain_rejects_invalid_gateway_key_without_rewriting_handoff() {
+        let fixture = DomainFixture::new();
+        let before = fixture.handoff_bytes();
+        let error = domain(
+            &fixture.vault_path,
+            Some("not-base64"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect_err("invalid WireGuard key");
+        assert!(format!("{error:#}").contains("clé publique WireGuard"));
+        assert_eq!(fixture.handoff_bytes(), before);
+    }
+
+    #[test]
+    fn domain_rejects_invalid_server_names_without_rewriting_handoff() {
+        for name in ["", "has space.example", "bad/name", &"a".repeat(254)] {
+            let fixture = DomainFixture::new();
+            let before = fixture.handoff_bytes();
+            assert!(
+                domain(&fixture.vault_path, None, Some(name), None, None, None).is_err(),
+                "accepted {name:?}"
+            );
+            assert_eq!(fixture.handoff_bytes(), before, "rewrote for {name:?}");
+        }
+    }
+
+    #[test]
+    fn domain_rejects_malformed_service_keys_without_rewriting_handoff() {
+        for key in ["", "not a key", "AA=="] {
+            let fixture = DomainFixture::new();
+            let before = fixture.handoff_bytes();
+            let error = domain(&fixture.vault_path, None, None, Some(key), None, None)
+                .expect_err("invalid ML-DSA-87 public key");
+            assert!(format!("{error:#}").contains("clé publique de service"));
+            assert_eq!(fixture.handoff_bytes(), before);
+        }
+    }
+
+    #[test]
+    fn domain_rejects_zero_service_epoch_without_rewriting_handoff() {
+        let fixture = DomainFixture::new();
+        let before = fixture.handoff_bytes();
+        let error =
+            domain(&fixture.vault_path, None, None, None, Some(0), None).expect_err("zero epoch");
+        assert!(error.to_string().contains("non nulle"));
+        assert_eq!(fixture.handoff_bytes(), before);
+    }
+
+    #[test]
+    fn domain_rejects_invalid_authority_origins_without_rewriting_handoff() {
+        for origin in [
+            "http://astra.example",
+            "astra.example",
+            " https:// ",
+            "https://astra.example/path",
+            "https://astra.example?x=1",
+            "https://operator@astra.example",
+            "https://astra.example:65536",
+        ] {
+            let fixture = DomainFixture::new();
+            let before = fixture.handoff_bytes();
+            let error = domain(&fixture.vault_path, None, None, None, None, Some(origin))
+                .expect_err("origin must use HTTPS");
+            assert!(format!("{error:#}").contains("origine de l'autorité"));
+            assert_eq!(fixture.handoff_bytes(), before);
+        }
+    }
+
+    #[test]
+    fn domain_update_fails_when_vault_is_missing_without_creating_handoff() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let missing_vault = directory.path().join("absent-vault.json");
+        let error =
+            domain(&missing_vault, None, None, None, None, None).expect_err("missing vault");
+        assert!(format!("{error:#}").contains("absent-vault.json"));
+        assert!(!Path::new(&astra_operator::handoff::path_beside(&missing_vault)).exists());
     }
 }
