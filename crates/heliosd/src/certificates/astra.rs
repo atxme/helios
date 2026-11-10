@@ -66,13 +66,13 @@ impl ::astra_channel::AstraChannelHandler for CertificateService {
     ) -> Result<(), TrustUpdateRefusal> {
         use aether::certificates::revocation::RevocationScope;
 
-        let now = now_unix();
-        let mut registry = self.registry.lock().await;
-        let state = registry.state();
-
         if revocation.scope == RevocationScope::Gateway {
             return self.revoke_gateway_identity(&revocation).await;
         }
+
+        let now = now_unix();
+        let mut registry = self.registry.lock().await;
+        let state = registry.state();
         // The peer is resolved **before** the signature is checked, because the
         // counter the signature is checked against belongs to that peer: two
         // peers' revocation counters are independent, and comparing against a

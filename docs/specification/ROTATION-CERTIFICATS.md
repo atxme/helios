@@ -2939,6 +2939,13 @@ fait refuser toute la transaction.
 
 ### 10.2 Effet
 
+**Limitation actuelle :** Astra refuse les révocations dont `effective_at` est
+dans le futur avant leur distribution. Le gestionnaire du canal privé Helios
+ne planifie pas encore ces décisions et appliquerait immédiatement un tel objet
+s'il le recevait ; le garde Astra protège le parcours de production actuel.
+La prise en charge complète nécessite une file durable, la réservation des
+compteurs anti-rejeu et une application à échéance, y compris après redémarrage.
+
 À `effective_at`, l'empreinte nommée est retirée même si sa validité ou son
 chevauchement n'est pas terminé. La révocation domine `staged`, `overlap`, un
 rollback de service et tout callback d'une génération antérieure. Si aucune

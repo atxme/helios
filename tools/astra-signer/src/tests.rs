@@ -703,3 +703,83 @@ fn revoke_is_refused_while_an_outgoing_ca_pq_is_kept() {
         "Changement de CA-PQ en cours : révoquer ce poste depuis Orion. Rien n'a été signé."
     );
 }
+
+/// Commands that accept an operation identifier reject malformed values
+/// before opening the vault or reaching a hardware-key prompt.
+#[test]
+fn signing_commands_reject_bad_operation_ids_before_reading_the_vault() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let missing_vault = directory.path().join("missing-vault.json");
+    let channel = || {
+        astra_operator::campaign::Campaign::select(None, Some("http://127.0.0.1:9"))
+            .expect("local test channel")
+    };
+    let malformed = "not-an-operation-id";
+
+    let recovery = commands::recover(
+        &missing_vault,
+        "http://127.0.0.1:9",
+        malformed,
+        None,
+        Transport::Hid,
+    )
+    .expect_err("malformed recovery operation must fail");
+    assert!(
+        recovery.to_string().contains("--operation-id"),
+        "{recovery:#}"
+    );
+
+    let ca_tls = commands::rotate_ca_tls(
+        &missing_vault,
+        channel(),
+        malformed,
+        None,
+        &directory.path().join("transition.json"),
+        (1, 1, 30),
+        Transport::Hid,
+    )
+    .expect_err("malformed CA-TLS operation must fail");
+    assert!(ca_tls.to_string().contains("--operation-id"), "{ca_tls:#}");
+
+    let transition = commands::sign_gateway_transition(
+        &missing_vault,
+        channel(),
+        malformed,
+        None,
+        commands::GatewayTransitionInputs {
+            request: &directory.path().join("request.json"),
+            active_certificate: None,
+            tls_certificate: None,
+            out: &directory.path().join("transition.json"),
+            validity_days: 30,
+            prepare_days: 1,
+            overlap_days: 1,
+            key_recovery: false,
+            emergency_replacement: false,
+        },
+        Transport::Hid,
+    )
+    .expect_err("malformed gateway transition operation must fail");
+    assert!(
+        transition.to_string().contains("--operation-id"),
+        "{transition:#}"
+    );
+
+    let abort = commands::abort_gateway_transition(
+        &missing_vault,
+        channel(),
+        malformed,
+        None,
+        &directory.path().join("transition.json"),
+        &directory.path().join("abort.json"),
+        aether::certificates::gateway::AbortReason::SupersededBeforeActivation,
+        Transport::Hid,
+    )
+    .expect_err("malformed abort operation must fail");
+    assert!(abort.to_string().contains("--operation-id"), "{abort:#}");
+
+    assert!(
+        !missing_vault.exists(),
+        "no command should create the vault"
+    );
+}
