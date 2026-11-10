@@ -268,3 +268,182 @@ fn pem_of(certificate: &DerCertificate) -> String {
     pem.push_str("-----END CERTIFICATE-----\n");
     pem
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use astra_operator::vault::{
+        AuthoritySecrets, AuthorityVault, SlotEnrolment, SlotRole, SlotSecret,
+    };
+    use base64::Engine as _;
+
+    struct Fixture {
+        _directory: tempfile::TempDir,
+        vault_path: PathBuf,
+        handoff_path: PathBuf,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let directory = tempfile::tempdir().expect("temporary directory");
+            let vault_path = directory.path().join("authority-vault.json");
+            let (pq_private, pq_public) =
+                aether::certificates::encoding::generate_ml_dsa_87_keypair()
+                    .expect("CA-PQ keypair");
+            let encode = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+            let trust_domain_id = aether::certificates::encoding::TrustDomainId::new([0x31; 16])
+                .expect("trust domain");
+            let vault = AuthorityVault::create(
+                trust_domain_id,
+                "astra.example",
+                astra_operator::vault::draw_salt().expect("vault salt"),
+                &AuthoritySecrets {
+                    ca_pq_private_key: encode(&pq_private),
+                    ca_pq_public_key: pq_public.to_base64(),
+                    ca_tls_private_key: encode(b"test-only CA-TLS private key"),
+                    retained_ca_tls: None,
+                },
+                SlotEnrolment {
+                    role: SlotRole::Primary,
+                    label: "test slot".into(),
+                    credential_id: vec![0x51; 32],
+                    credential_public_key: vec![0xa5, 0x01],
+                    aaguid: [0; 16],
+                    enrolled_at: 1,
+                },
+                &SlotSecret::new(vec![0x61; 32]),
+                1,
+            )
+            .expect("test vault");
+            astra_operator::store::save(&vault_path, &vault).expect("save vault");
+
+            let mut handoff =
+                astra_operator::handoff::DomainHandoff::of(&vault).expect("domain handoff");
+            handoff.gateway_wg_public_key = Some(
+                aether::certificates::encoding::WireGuardKey::from_bytes([0x42; 32]).to_base64(),
+            );
+            handoff.server_name = Some("gateway.example".into());
+            let certificate =
+                aether::certificates::test_x509::client_material("gateway.example").authority;
+            handoff.ca_tls_epoch = Some(1);
+            handoff.ca_tls_certificate = Some(certificate.to_base64());
+            let handoff_path = astra_operator::handoff::path_beside(&vault_path);
+            astra_operator::handoff::save(&handoff_path, &handoff).expect("save handoff");
+
+            Self {
+                _directory: directory,
+                vault_path,
+                handoff_path,
+            }
+        }
+    }
+
+    fn request() -> aether::certificates::authority::IssuerDelegationRequest {
+        aether::certificates::authority::IssuerDelegationRequest {
+            trust_domain_id: "31".repeat(16),
+            issuer_epoch: 1,
+            pq_issuer_public_key: String::new(),
+            tls_intermediate_csr: String::new(),
+        }
+    }
+
+    #[test]
+    fn issue_ca_tls_refuses_to_replace_an_existing_anchor_before_any_gesture() {
+        let fixture = Fixture::new();
+        let before = std::fs::read(&fixture.handoff_path).expect("handoff before");
+        let output = fixture._directory.path().join("ca-tls.pem");
+
+        let error = issue_ca_tls(&fixture.vault_path, 30, Some(&output), Transport::Hid)
+            .expect_err("initialization must not replace a CA-TLS anchor");
+
+        assert!(error.to_string().contains("déjà une CA-TLS"));
+        assert_eq!(
+            std::fs::read(&fixture.handoff_path).expect("handoff after"),
+            before
+        );
+        assert!(!output.exists(), "a refused rotation writes no PEM");
+    }
+
+    #[test]
+    fn issuer_authorization_rejects_an_invalid_operation_id_before_network_or_key_access() {
+        let fixture = Fixture::new();
+        let absent_request = fixture._directory.path().join("request.json");
+
+        let error = authorize_issuer(
+            &fixture.vault_path,
+            &absent_request,
+            None,
+            Some(("https://astra.example", "not-an-operation-id")),
+            30,
+            90,
+            None,
+            Transport::Hid,
+        )
+        .expect_err("invalid operation id must stop before fetch or FIDO");
+
+        assert!(error.to_string().contains("--operation-id"));
+        assert!(!absent_request.exists());
+    }
+
+    #[test]
+    fn issuer_authorization_reports_duration_overflow_before_opening_the_vault() {
+        let fixture = Fixture::new();
+        let request_path = fixture._directory.path().join("request.json");
+        std::fs::write(
+            &request_path,
+            serde_json::to_vec(&request()).expect("request JSON"),
+        )
+        .expect("write request");
+
+        let error = authorize_issuer(
+            &fixture.vault_path,
+            &request_path,
+            None,
+            None,
+            u64::MAX,
+            1,
+            None,
+            Transport::Hid,
+        )
+        .expect_err("overflow must stop before a hardware-key gesture");
+
+        assert!(error.to_string().contains("durée hors bornes"));
+    }
+
+    #[test]
+    fn issuer_authorization_does_not_treat_a_malformed_request_as_absent() {
+        let fixture = Fixture::new();
+        let request_path = fixture._directory.path().join("request.json");
+        std::fs::write(&request_path, b"{not-json").expect("write malformed request");
+
+        let error = authorize_issuer(
+            &fixture.vault_path,
+            &request_path,
+            None,
+            None,
+            30,
+            90,
+            None,
+            Transport::Hid,
+        )
+        .expect_err("malformed request must stop before a hardware-key gesture");
+
+        assert!(format!("{error:#}").contains("request.json"));
+    }
+
+    #[test]
+    fn pem_output_wraps_base64_at_sixty_four_columns() {
+        let certificate = DerCertificate::new(vec![0x55; 96]).expect("DER bytes");
+
+        let pem = pem_of(&certificate);
+        let lines: Vec<_> = pem.lines().collect();
+
+        assert_eq!(lines.first(), Some(&"-----BEGIN CERTIFICATE-----"));
+        assert_eq!(lines.last(), Some(&"-----END CERTIFICATE-----"));
+        assert!(lines[1..lines.len() - 1]
+            .iter()
+            .all(|line| line.len() <= 64));
+        assert_eq!(lines[1].len(), 64);
+        assert_eq!(lines[2].len(), 64);
+    }
+}
