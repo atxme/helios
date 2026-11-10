@@ -84,3 +84,196 @@ pub(crate) fn recover(
     );
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use astra_operator::vault::{
+        AuthoritySecrets, AuthorityVault, SlotEnrolment, SlotRole, SlotSecret,
+    };
+    use base64::Engine as _;
+
+    struct Fixture {
+        _directory: tempfile::TempDir,
+        vault_path: PathBuf,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let directory = tempfile::tempdir().expect("temporary directory");
+            let vault_path = directory.path().join("authority-vault.json");
+            let (pq_private, pq_public) =
+                aether::certificates::encoding::generate_ml_dsa_87_keypair()
+                    .expect("CA-PQ keypair");
+            let encode = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+            let trust_domain_id = aether::certificates::encoding::TrustDomainId::new([0x31; 16])
+                .expect("trust domain");
+            let gateway_key = aether::certificates::encoding::WireGuardKey::from_bytes([0x42; 32]);
+            let vault = AuthorityVault::create(
+                trust_domain_id,
+                "astra.example",
+                astra_operator::vault::draw_salt().expect("vault salt"),
+                &AuthoritySecrets {
+                    ca_pq_private_key: encode(&pq_private),
+                    ca_pq_public_key: pq_public.to_base64(),
+                    ca_tls_private_key: encode(b"test-only CA-TLS private key"),
+                    retained_ca_tls: None,
+                },
+                SlotEnrolment {
+                    role: SlotRole::Primary,
+                    label: "test slot".into(),
+                    credential_id: vec![0x51; 32],
+                    credential_public_key: vec![0xa5, 0x01],
+                    aaguid: [0; 16],
+                    enrolled_at: 1,
+                },
+                &SlotSecret::new(vec![0x61; 32]),
+                1,
+            )
+            .expect("test vault");
+            astra_operator::store::save(&vault_path, &vault).expect("save vault");
+
+            let mut handoff =
+                astra_operator::handoff::DomainHandoff::of(&vault).expect("domain handoff");
+            handoff.gateway_wg_public_key = Some(gateway_key.to_base64());
+            handoff.server_name = Some("gateway.example".into());
+            handoff.astra_authority_url = Some("https://astra.example".into());
+            handoff.ca_tls_certificate = Some(
+                aether::certificates::test_x509::client_material("gateway.example")
+                    .authority
+                    .to_base64(),
+            );
+            astra_operator::handoff::save(
+                &astra_operator::handoff::path_beside(&vault_path),
+                &handoff,
+            )
+            .expect("save handoff");
+            credentials::save(
+                &credentials::path_beside(&vault_path),
+                &aether::certificates::approval::CredentialRegistry {
+                    trust_domain_id,
+                    gateway_wg_public_key: gateway_key,
+                    ca_epoch: 1,
+                    credential_registry_epoch: 1,
+                    bindings: Vec::new(),
+                },
+            )
+            .expect("save credential registry");
+
+            Self {
+                _directory: directory,
+                vault_path,
+            }
+        }
+
+        fn load_handoff(&self) -> astra_operator::handoff::DomainHandoff {
+            astra_operator::handoff::load(&astra_operator::handoff::path_beside(&self.vault_path))
+                .expect("load handoff")
+        }
+
+        fn save_handoff(&self, handoff: &astra_operator::handoff::DomainHandoff) {
+            astra_operator::handoff::save(
+                &astra_operator::handoff::path_beside(&self.vault_path),
+                handoff,
+            )
+            .expect("save handoff");
+        }
+    }
+
+    const OPERATION_ID: &str = "01010101010101010101010101010101";
+
+    #[test]
+    fn malformed_operation_ids_are_rejected_before_vault_access() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let missing_vault = directory.path().join("missing-vault.json");
+
+        for operation_id in ["", "00", "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"] {
+            let error = recover(
+                &missing_vault,
+                "not a URL",
+                operation_id,
+                None,
+                Transport::Hid,
+            )
+            .expect_err("malformed operation id must be rejected first");
+
+            assert!(error.to_string().contains("--operation-id"), "{error:#}");
+            assert!(!missing_vault.exists());
+        }
+    }
+
+    #[test]
+    fn recovery_refuses_to_proceed_without_credential_bindings() {
+        let fixture = Fixture::new();
+        std::fs::remove_file(credentials::path_beside(&fixture.vault_path))
+            .expect("remove credential bindings");
+
+        let error = recover(
+            &fixture.vault_path,
+            "https://astra.example",
+            OPERATION_ID,
+            None,
+            Transport::Hid,
+        )
+        .expect_err("recovery must name an operator credential before networking");
+
+        assert!(
+            error.to_string().contains("document de credentials"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn recovery_refuses_a_domain_without_its_client_tls_anchor() {
+        let fixture = Fixture::new();
+        let mut handoff = fixture.load_handoff();
+        handoff.ca_tls_certificate = None;
+        fixture.save_handoff(&handoff);
+
+        let error = recover(
+            &fixture.vault_path,
+            "https://astra.example",
+            OPERATION_ID,
+            None,
+            Transport::Hid,
+        )
+        .expect_err("recovery cannot issue a client identity without its CA-TLS anchor");
+
+        assert!(error.to_string().contains("CA-TLS cliente"), "{error:#}");
+    }
+
+    #[test]
+    fn recovery_rejects_an_unreadable_client_tls_anchor_before_networking() {
+        let fixture = Fixture::new();
+        let mut handoff = fixture.load_handoff();
+        handoff.ca_tls_certificate = Some("not-base64!".into());
+        fixture.save_handoff(&handoff);
+
+        let error = recover(
+            &fixture.vault_path,
+            "https://astra.example",
+            OPERATION_ID,
+            None,
+            Transport::Hid,
+        )
+        .expect_err("an unreadable CA-TLS anchor must fail closed");
+
+        assert!(error.to_string().contains("CA-TLS cliente"), "{error:#}");
+    }
+
+    #[test]
+    fn recovery_rejects_a_caller_origin_that_disagrees_with_the_pinned_domain() {
+        let fixture = Fixture::new();
+
+        let error = recover(
+            &fixture.vault_path,
+            "https://attacker.example",
+            OPERATION_ID,
+            None,
+            Transport::Hid,
+        )
+        .expect_err("the caller must not redirect the recovery ceremony");
+
+        assert!(error.to_string().contains("épingle l'origine"), "{error:#}");
+    }
+}
