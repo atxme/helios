@@ -1,7 +1,10 @@
 use super::*;
 use aether::certificates::client::ClientCertificateGeneration;
 use aether::certificates::encoding::{
-    generate_ml_dsa_87_keypair, DerCertificate, Fingerprint, Id16, TrustDomainId,
+    generate_ml_dsa_87_keypair, DerCertificate, Fingerprint, Id16, MlDsa87Signature, TrustDomainId,
+};
+use aether::certificates::revocation::{
+    EmergencyCertificateRevocation, RevocationReason, RevocationScope,
 };
 use aether::certificates::state::{
     AstraProfile, ClientCertificateState, ClientTlsCaState, GatewayCertificateState,
@@ -1006,6 +1009,184 @@ async fn a_gateway_without_an_authority_asks_no_one() {
         )
         .expect("readable")
         .is_none());
+}
+
+fn gateway_revocation(
+    state: &RegistryState,
+    ca_private_key: &[u8],
+    epoch: u64,
+    pq_fingerprint: Fingerprint,
+) -> EmergencyCertificateRevocation {
+    EmergencyCertificateRevocation {
+        format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+        trust_domain_id: state.trust_domain_id,
+        ca_epoch: state.gateway.ca_epoch,
+        scope: RevocationScope::Gateway,
+        identity_key: state.gateway.gateway_wg_public_key,
+        server_name: Some(state.gateway.server_name.clone()),
+        revocation_epoch: epoch,
+        revoked_tls_fingerprint: None,
+        revoked_tls_not_after: None,
+        revoked_pq_fingerprint: Some(pq_fingerprint),
+        revoked_pq_not_after: Some(state.gateway.active_gateway_certificate.not_after_unix),
+        effective_at: 0,
+        reason: RevocationReason::KeyCompromise,
+        replacement_transition_fingerprint: None,
+        ca_signature: MlDsa87Signature::placeholder(),
+    }
+    .sign(ca_private_key)
+    .expect("sign gateway revocation")
+}
+
+#[tokio::test]
+async fn maintenance_purges_expired_stages_and_promotes_due_generations_atomically() {
+    use aether::certificates::state::{ClientCertificatePendingStage, PendingStageState};
+    use aether::certificates::window::TransitionWindow;
+
+    let mut registry_state = state();
+    let mut expiring = peer();
+    expiring.state.pending = Some(ClientCertificatePendingStage {
+        stage_id: Id16::new([11; 16]).expect("stage id"),
+        authorization_fingerprint: Fingerprint::of(b"authorization"),
+        request_fingerprint: Fingerprint::of(b"request"),
+        candidate: ClientCertificateGeneration {
+            generation: 5,
+            ..generation()
+        },
+        state: PendingStageState::PendingGrant,
+        stage_expires_at: 100,
+        window: TransitionWindow::new(0, 200, 300).expect("window"),
+    });
+    registry_state.peers.insert(key(2).to_base64(), expiring);
+
+    let mut promoting = peer();
+    promoting.state.next = Some(ClientCertificateGeneration {
+        generation: 5,
+        ..generation()
+    });
+    promoting.state.activation_at = Some(200);
+    promoting.state.retire_active_at = Some(300);
+    registry_state.peers.insert(key(3).to_base64(), promoting);
+
+    let (service, _directory) = service(registry_state);
+    service.maintain(99).await.expect("not due yet");
+    {
+        let registry = service.registry.lock().await;
+        let expiring = registry.peer(&key(2)).expect("expiring peer");
+        assert!(
+            expiring.state.pending.is_some(),
+            "lease is live before expiry"
+        );
+        let promoting = registry.peer(&key(3)).expect("promoting peer");
+        assert_eq!(promoting.state.active.generation, 4);
+        assert!(promoting.state.next.is_some(), "overlap has not ended");
+    }
+
+    service
+        .maintain(300)
+        .await
+        .expect("maintenance at deadlines");
+    let registry = service.registry.lock().await;
+    let expiring = registry.peer(&key(2)).expect("expiring peer");
+    assert!(expiring.state.pending.is_none(), "expired stage is purged");
+    let promoting = registry.peer(&key(3)).expect("promoting peer");
+    assert_eq!(promoting.state.active.generation, 5);
+    assert!(promoting.state.next.is_none());
+    assert_eq!(promoting.state.retire_active_at, None);
+}
+
+#[tokio::test]
+async fn maintenance_without_a_gateway_transition_leaves_identity_unchanged() {
+    let registry_state = state();
+    let (service, _directory) = service(registry_state);
+
+    service
+        .maintain(200)
+        .await
+        .expect("a gateway with no due transition needs no TPM secret");
+    assert_eq!(
+        service
+            .registry
+            .lock()
+            .await
+            .state()
+            .gateway
+            .active_gateway_identity_epoch,
+        3,
+        "maintenance without a transition leaves the active identity untouched"
+    );
+}
+
+#[tokio::test]
+async fn gateway_revocation_is_authenticated_scoped_and_terminal() {
+    let mut registry_state = state();
+    let (ca_private, ca_public) = generate_ml_dsa_87_keypair().expect("CA keypair");
+    registry_state.gateway.current_ca_public_key = ca_public;
+    let active_pq_fingerprint = aether::certificates::gateway::pq_certificate_fingerprint(
+        &registry_state.gateway.active_gateway_certificate,
+    )
+    .expect("active PQ fingerprint");
+    let (service, _directory) = service(registry_state);
+
+    let wrong_identity = {
+        let registry = service.registry.lock().await;
+        let state = registry.state().clone();
+        let mut revocation = gateway_revocation(&state, &ca_private, 1, active_pq_fingerprint);
+        revocation.identity_key = key(8);
+        revocation
+            .sign(&ca_private)
+            .expect("sign wrong-identity object")
+    };
+    assert!(matches!(
+        service.revoke_gateway_identity(&wrong_identity).await,
+        Err(TrustUpdateRefusal::Rejected)
+    ));
+    assert!(!service.registry.lock().await.state().gateway.revoked);
+
+    let revocation = {
+        let registry = service.registry.lock().await;
+        gateway_revocation(registry.state(), &ca_private, 1, active_pq_fingerprint)
+    };
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        ::astra_channel::AstraChannelHandler::revoke(&service, Box::new(revocation)),
+    )
+    .await
+    .expect("gateway revocation handler must not deadlock")
+    .expect("valid authority revocation");
+    let registry = service.registry.lock().await;
+    assert!(registry.state().gateway.revoked);
+    assert_eq!(registry.state().gateway.revocation_epoch, 1);
+    assert!(registry.state().gateway.awaited_replacement.is_none());
+}
+
+#[tokio::test]
+async fn gateway_revocation_rejects_a_bad_signature_without_consuming_its_epoch() {
+    let mut registry_state = state();
+    let (ca_private, ca_public) = generate_ml_dsa_87_keypair().expect("CA keypair");
+    registry_state.gateway.current_ca_public_key = ca_public;
+    let fingerprint = aether::certificates::gateway::pq_certificate_fingerprint(
+        &registry_state.gateway.active_gateway_certificate,
+    )
+    .expect("active PQ fingerprint");
+    let (service, _directory) = service(registry_state);
+    let revocation = {
+        let registry = service.registry.lock().await;
+        gateway_revocation(registry.state(), &ca_private, 1, fingerprint)
+    };
+    let (other_private, _) = generate_ml_dsa_87_keypair().expect("other keypair");
+    let forged = revocation
+        .clone()
+        .sign(&other_private)
+        .expect("sign forged revocation");
+
+    assert!(matches!(
+        service.revoke_gateway_identity(&forged).await,
+        Err(TrustUpdateRefusal::Rejected)
+    ));
+    let registry = service.registry.lock().await;
+    assert!(!registry.state().gateway.revoked);
+    assert_eq!(registry.state().gateway.revocation_epoch, 0);
 }
 
 /// The console draws the same rungs the protocol decides on.
