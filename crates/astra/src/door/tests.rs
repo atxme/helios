@@ -19,6 +19,7 @@ use crate::registry::{AstraRegistry, AstraState, ChallengeStore, PeerRecord};
 use crate::service::{SourceBudget, MAX_LIVE_CHALLENGES};
 use crate::AuditEvent;
 
+mod gateway_identity_tunnel;
 mod overlap_revocation;
 mod tunnel;
 mod vault_copy;
