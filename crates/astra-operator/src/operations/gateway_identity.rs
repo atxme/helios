@@ -29,20 +29,23 @@
 
 use std::path::Path;
 
+use aether::certificates::approval::CredentialRegistry;
 use aether::certificates::authority::RotationReason;
 use aether::certificates::encoding::{DerCertificate, Fingerprint, Id16, MlDsa87PublicKey};
 use aether::certificates::gateway::{
-    pq_certificate_fingerprint, Continuity, GatewayCertificateRequest, GatewayIdentityTransition,
-    GatewayTransitionAbort,
+    pq_certificate_fingerprint, AbortReason, Continuity, GatewayCertificateRequest,
+    GatewayIdentityTransition, GatewayTransitionAbort,
 };
 use aether::certificates::status::{
-    AstraSignerResult, CampaignFamily, CertificateServiceRollbackAuthorization,
+    AstraRotationCampaign, AstraSignerResult, CampaignFamily, CampaignScope, CampaignTarget,
+    CertificateKind, CertificateServiceRollbackAuthorization,
 };
 use aether::certificates::transport::{
     OperatorAuthorityStatus, OperatorGatewayPublished, OperatorOpenAction, OperatorOpenRequest,
     OperatorOpened, SigningOperationState, TrustUpdateObject,
 };
 use aether::certificates::window::TransitionWindow;
+use aether::certificates::CERTIFICATE_FORMAT_VERSION;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
@@ -54,7 +57,10 @@ use crate::operations::keys::{approve_one, KeyStep, ValidatedKeys};
 use crate::operations::recovery::random_id;
 use crate::operations::rotation::ensure_same_vault;
 use crate::origin::CampaignRequest;
-use crate::signing::{self, CampaignApprovalSession, DomainIdentity, GatewayTransitionDecision};
+use crate::signing::{
+    self, CampaignApprovalSession, DomainIdentity, GatewayAbortDecision, GatewayTransitionDecision,
+    ServiceRollbackDecision,
+};
 use crate::tunnel::{
     is_unreachable, GatewayDecisionRead, GatewayIdentityRead, GatewayRenewalRead,
     GatewayRollbackRead, RenewalAsk, Tunnel, TunnelRefusal,
@@ -72,9 +78,8 @@ const REQUESTED_BY: &str = "Orion";
 
 /// What the renewal needs from the far side of the tunnel.
 ///
-/// The abort, the rollback and the staged transition are declared here for the
-/// operations that cancel and roll back a renewal; this module only reads and writes
-/// the renewal itself.
+/// The abort, the rollback and the staged transition are declared here with the renewal,
+/// which reads the staged transition and which the cancellations act on.
 pub trait GatewayIdentityRemote {
     fn open_campaign(&self, request: &OperatorOpenRequest) -> Result<OperatorOpened>;
     fn fetch_campaign(&self, operation_id: &Id16) -> Result<CampaignRequest>;
@@ -192,6 +197,18 @@ pub enum GatewayRefusal {
     /// Unreachable before anything was signed: the one case where nothing was signed.
     #[error("Astra ou la gateway est injoignable. Rien n'a été signé.")]
     UnreachableBeforeSigning,
+    /// Nothing is staged on the gateway: there is no transition to cancel.
+    #[error("aucune transition de l'identité de la gateway à annuler. Rien n'a été signé.")]
+    NothingToAbort,
+    /// The transition is published, or its activation is reached: it no longer cancels.
+    #[error("la transition ne s'annule plus : elle est publiée, ou son activation est à {0} (horloge de la gateway). Rien n'a été signé.")]
+    AbortTooLate(u64),
+    /// No overlap runs on the gateway now: the outgoing identity is not the one in service.
+    #[error("aucun recouvrement en cours : l'ancienne identité n'est pas celle qui sert. Rien n'a été signé.")]
+    NoOverlap,
+    /// The gateway is revoked: no outgoing identity can be selected for it.
+    #[error("la gateway est révoquée : aucune identité ne la remplace. Rien n'a été signé.")]
+    Revoked,
     /// The gateway refused the document for good, and said why.
     #[error("{0}")]
     GatewayRefused(String),
@@ -392,14 +409,7 @@ pub fn open_renewal(
         _ => return Err(GatewayRefusal::RequestMismatch),
     };
 
-    let document = credentials::load(&credentials::path_beside(vault_path))
-        .map_err(internal)?
-        .ok_or_else(|| {
-            GatewayRefusal::Internal(
-                "aucun document de credentials : l'émettre par `astra-signer bindings`. Rien n'a été signé."
-                    .into(),
-            )
-        })?;
+    let document = credential_document(vault_path)?;
     let approval = CampaignApprovalSession::new(
         campaign,
         &document,
@@ -591,6 +601,382 @@ pub fn carry(
     })
 }
 
+/// The label the cancellation's campaign carries.
+const ABORT_LABEL: &str = "Annulation de la transition de l'identité de la gateway";
+
+/// A cancellation opened on the staged transition: the campaign Astra froze for it, the
+/// keys proved so far, and the session the approvals go into.
+pub struct OpenedGatewayAbort {
+    keys: ValidatedKeys,
+    campaign: Box<CampaignRequest>,
+    transition: Box<GatewayIdentityTransition>,
+    identity: DomainIdentity,
+    anchor_key: MlDsa87PublicKey,
+    approval: CampaignApprovalSession,
+}
+
+/// Opens the cancellation of the transition the gateway holds staged, or refuses it. The
+/// transition comes from the gateway, never from a file the operator supplies, and
+/// nothing before the last step asks for a key.
+///
+/// Before activation, on the gateway's clock: the gateway checks the same bound when it
+/// installs the cancellation.
+pub fn open_abort(
+    remote: &dyn GatewayIdentityRemote,
+    vault_path: &Path,
+    now: u64,
+) -> Result<OpenedGatewayAbort, GatewayRefusal> {
+    if pending(vault_path, now).map_err(internal)?.is_some() {
+        return Err(GatewayRefusal::AlreadyOpen);
+    }
+    let gateway = remote.gateway().map_err(before_signing)?;
+    let transition = remote
+        .staged_transition()
+        .map_err(before_signing)?
+        .ok_or(GatewayRefusal::NothingToAbort)?;
+    let activation_at = transition.window.activation_at;
+    if gateway.gateway_transition_published || gateway_clock(&gateway, now) >= activation_at {
+        return Err(GatewayRefusal::AbortTooLate(activation_at));
+    }
+
+    let keys = ValidatedKeys::new(vault_path).map_err(internal)?;
+    let vault = &keys.vault;
+    let relay = DomainHandoff::beside(vault_path, vault).map_err(internal)?;
+    let identity = handoff::identity_of(&relay).map_err(internal)?;
+    let anchor_key = MlDsa87PublicKey::parse(vault.ca_pq_public_key.trim()).map_err(internal)?;
+
+    let opened = remote
+        .open_campaign(&OperatorOpenRequest {
+            action: OperatorOpenAction::GatewayIdentity,
+            reason: ABORT_LABEL.to_string(),
+            requested_by: REQUESTED_BY.to_string(),
+            window_secs: CAMPAIGN_WINDOW_SECS,
+        })
+        .map_err(|error| match error.downcast_ref::<TunnelRefusal>() {
+            Some(refusal) if refusal.status == 403 => refused_by_door(vault_path, now),
+            _ => before_signing(error),
+        })?;
+    let request = remote
+        .fetch_campaign(&opened.operation_id)
+        .map_err(before_signing)?;
+    let authority_url = relay
+        .astra_authority_url
+        .clone()
+        .ok_or_else(|| GatewayRefusal::Internal("l'origine de l'autorité est absente".into()))?;
+    handoff::verify_campaign_request(&relay, vault, &request, &authority_url, now)
+        .map_err(internal)?;
+
+    // The campaign names the decision being cancelled: one target, at its epoch.
+    let campaign = request.campaign.as_ref();
+    let [target] = campaign.targets.as_slice() else {
+        return Err(GatewayRefusal::CampaignMismatch);
+    };
+    if !matches!(campaign.scope.family(), CampaignFamily::GatewayIdentity)
+        || target.identity_key != campaign.gateway_wg_public_key
+        || campaign.gateway_wg_public_key != identity.gateway_wg_public_key
+        || campaign.server_name != identity.server_name
+        || target.epoch != transition.gateway_identity_epoch
+    {
+        return Err(GatewayRefusal::CampaignMismatch);
+    }
+
+    let document = credential_document(vault_path)?;
+    let approval = CampaignApprovalSession::new(
+        campaign,
+        &document,
+        &identity,
+        &anchor_key,
+        &vault.rp_id,
+        &format!("https://{}", vault.rp_id),
+        now,
+    )
+    .map_err(internal)?;
+
+    Ok(OpenedGatewayAbort {
+        keys,
+        campaign: Box::new(request),
+        transition: Box::new(transition),
+        identity,
+        anchor_key,
+        approval,
+    })
+}
+
+impl OpenedGatewayAbort {
+    /// One key: its approval, then the proof that the same key opens the vault.
+    pub fn approve(&mut self, key: &dyn Authenticator, now: u64) -> Result<String, KeyStep> {
+        approve_one(
+            &mut self.keys,
+            &mut self.approval,
+            self.campaign.campaign.expires_at,
+            key,
+            now,
+        )
+    }
+
+    /// Signs the cancellation under `CA-PQ`, and records it before any deposit.
+    pub fn sign_and_record(
+        self,
+        vault_path: &Path,
+        now: u64,
+    ) -> Result<SignedGatewayDecision, GatewayRefusal> {
+        let Self {
+            keys,
+            campaign: request,
+            transition,
+            identity,
+            anchor_key,
+            approval,
+        } = self;
+        let campaign = request.campaign.as_ref();
+        if now >= campaign.expires_at || keys.openings.is_empty() {
+            return Err(GatewayRefusal::Internal(
+                "la campagne a expiré avant la signature : rien n'a été signé.".into(),
+            ));
+        }
+        ensure_same_vault(vault_path, &keys.vault).map_err(internal)?;
+        let approval = approval.finish(now).map_err(internal)?;
+
+        let ValidatedKeys {
+            vault, openings, ..
+        } = keys;
+        let abort = signing::sign_gateway_abort(
+            &vault,
+            &openings[0],
+            &identity,
+            &anchor_key,
+            &GatewayAbortDecision {
+                transition: &transition,
+                reason: AbortReason::OperatorCancelled,
+                campaign_fingerprint: campaign.fingerprint(),
+                aborted_at: now,
+            },
+        )
+        .map_err(internal)?;
+        campaign.covers_gateway_abort(&abort).map_err(|_| {
+            GatewayRefusal::Internal(
+                "l'annulation signée ne correspond pas à la campagne approuvée".into(),
+            )
+        })?;
+
+        let signed = SignedGatewayDecision {
+            operation_id: request.operation_id,
+            campaign_id: campaign.campaign_id,
+            expires_at: campaign.expires_at,
+            result: campaign_result(
+                &approval,
+                vec![TrustUpdateObject::GatewayTransitionAbort(Box::new(abort))],
+                None,
+            ),
+            deposited: false,
+            installed: false,
+            published: false,
+        };
+        save(&record_path(vault_path), &signed).map_err(internal)?;
+        Ok(signed)
+    }
+}
+
+/// Sends the recorded cancellation to Astra, then installs it on the gateway. Each step is
+/// recorded before the next one starts, as for the renewal. No key is asked for here.
+pub fn carry_abort(
+    remote: &dyn GatewayIdentityRemote,
+    vault_path: &Path,
+    mut decision: SignedGatewayDecision,
+    now: u64,
+) -> Result<(), GatewayRefusal> {
+    let abort = abort_of(&decision)?.clone();
+    if !decision.deposited {
+        if now >= decision.expires_at {
+            clear(vault_path).map_err(internal)?;
+            return Err(GatewayRefusal::Internal(
+                "la campagne a expiré avant le dépôt : l'annulation est jetée. Reprendre la préparation."
+                    .into(),
+            ));
+        }
+        deposit(remote, &decision)?;
+        decision.deposited = true;
+        save(&record_path(vault_path), &decision).map_err(internal)?;
+    }
+    if !decision.installed {
+        remote.abort(&abort).map_err(refused_by_gateway)?;
+        decision.installed = true;
+        save(&record_path(vault_path), &decision).map_err(internal)?;
+    }
+    clear(vault_path).map_err(internal)
+}
+
+/// A rollback opened on the published transition: the campaign resolved here from that
+/// transition, the keys proved so far, and the session the approval goes into.
+pub struct OpenedGatewayRollback {
+    keys: ValidatedKeys,
+    campaign: Box<AstraRotationCampaign>,
+    transition: Box<GatewayIdentityTransition>,
+    identity: DomainIdentity,
+    anchor_key: MlDsa87PublicKey,
+    approval: CampaignApprovalSession,
+}
+
+/// Opens the selection of the outgoing gateway leaf, for the rest of the overlap, or refuses
+/// it. Astra opens no campaign for it: a rollback moves no counter and reaches no client, so
+/// its campaign is resolved from the transition the operator is shown, as the signer does.
+///
+/// The overlap is read on the gateway's clock, and the selection lasts `hours` at most,
+/// never past `not_after`.
+pub fn open_rollback(
+    remote: &dyn GatewayIdentityRemote,
+    vault_path: &Path,
+    hours: u64,
+    reason: &str,
+    requested_by: &str,
+    now: u64,
+) -> Result<OpenedGatewayRollback, GatewayRefusal> {
+    let gateway = remote.gateway().map_err(before_signing)?;
+    let transition = remote
+        .staged_transition()
+        .map_err(before_signing)?
+        .ok_or(GatewayRefusal::NoOverlap)?;
+    let clock = gateway_clock(&gateway, now);
+    let window = transition.window;
+    if !gateway.gateway_transition_published
+        || clock < window.activation_at
+        || clock >= window.not_after
+    {
+        return Err(GatewayRefusal::NoOverlap);
+    }
+    let expires_at = hours
+        .checked_mul(3_600)
+        .and_then(|span| clock.checked_add(span))
+        .map(|expiry| expiry.min(window.not_after))
+        .ok_or_else(|| GatewayRefusal::Internal("durée hors bornes".into()))?;
+
+    let keys = ValidatedKeys::new(vault_path).map_err(internal)?;
+    let vault = &keys.vault;
+    let relay = DomainHandoff::beside(vault_path, vault).map_err(internal)?;
+    let identity = handoff::identity_of(&relay).map_err(internal)?;
+    let anchor_key = MlDsa87PublicKey::parse(vault.ca_pq_public_key.trim()).map_err(internal)?;
+
+    let campaign = AstraRotationCampaign {
+        format_version: CERTIFICATE_FORMAT_VERSION,
+        campaign_id: Id16::new(random_id().map_err(internal)?).map_err(internal)?,
+        trust_domain_id: identity.trust_domain_id,
+        gateway_wg_public_key: identity.gateway_wg_public_key,
+        server_name: identity.server_name.clone(),
+        created_at: now,
+        expires_at,
+        scope: CampaignScope::GatewayIdentity,
+        targets: vec![CampaignTarget {
+            certificate_kind: CertificateKind::GatewayTls,
+            identity_key: identity.gateway_wg_public_key,
+            epoch: transition.gateway_identity_epoch,
+            generation: transition.gateway_identity_epoch,
+            active_tls_certificate_fingerprint: transition
+                .active_gateway_tls_certificate_fingerprint,
+            active_pq_certificate_fingerprint: transition.active_gateway_certificate_fingerprint,
+        }],
+        reason: reason.to_string(),
+        requested_by: requested_by.to_string(),
+        policy_fingerprint: identity
+            .policy()
+            .map_err(internal)?
+            .fingerprint()
+            .map_err(internal)?,
+        required_credentials: CampaignScope::GatewayIdentity.required_credentials(),
+    };
+
+    let document = credential_document(vault_path)?;
+    let approval = CampaignApprovalSession::new(
+        &campaign,
+        &document,
+        &identity,
+        &anchor_key,
+        &vault.rp_id,
+        &format!("https://{}", vault.rp_id),
+        now,
+    )
+    .map_err(internal)?;
+
+    Ok(OpenedGatewayRollback {
+        keys,
+        campaign: Box::new(campaign),
+        transition: Box::new(transition),
+        identity,
+        anchor_key,
+        approval,
+    })
+}
+
+impl OpenedGatewayRollback {
+    /// One key: its approval, then the proof that the same key opens the vault.
+    pub fn approve(&mut self, key: &dyn Authenticator, now: u64) -> Result<String, KeyStep> {
+        approve_one(
+            &mut self.keys,
+            &mut self.approval,
+            self.campaign.expires_at,
+            key,
+            now,
+        )
+    }
+
+    /// Signs the selection under `CA-PQ`. Nothing is recorded: the authorization goes to the
+    /// gateway at once, and a refusal there needs a new approval.
+    pub fn sign(
+        self,
+        vault_path: &Path,
+        now: u64,
+    ) -> Result<CertificateServiceRollbackAuthorization, GatewayRefusal> {
+        let Self {
+            keys,
+            campaign,
+            transition,
+            identity,
+            anchor_key,
+            approval,
+        } = self;
+        if now >= campaign.expires_at || keys.openings.is_empty() {
+            return Err(GatewayRefusal::Internal(
+                "la campagne a expiré avant la signature : rien n'a été signé.".into(),
+            ));
+        }
+        ensure_same_vault(vault_path, &keys.vault).map_err(internal)?;
+        let approval = approval.finish(now).map_err(internal)?;
+
+        let ValidatedKeys {
+            vault, openings, ..
+        } = keys;
+        signing::sign_service_rollback(
+            &vault,
+            &openings[0],
+            &identity,
+            &anchor_key,
+            &ServiceRollbackDecision {
+                transition: &transition,
+                campaign_fingerprint: approval.campaign_fingerprint,
+                expires_at: campaign.expires_at,
+            },
+            now,
+        )
+        .map_err(internal)
+    }
+}
+
+/// Installs the signed selection on the gateway. The gateway answers when it lapses.
+pub fn carry_rollback(
+    remote: &dyn GatewayIdentityRemote,
+    authorization: CertificateServiceRollbackAuthorization,
+) -> Result<GatewayRollbackRead, GatewayRefusal> {
+    remote.rollback(&authorization).map_err(refused_by_gateway)
+}
+
+fn abort_of(decision: &SignedGatewayDecision) -> Result<&GatewayTransitionAbort, GatewayRefusal> {
+    match decision.result.objects.first() {
+        Some(TrustUpdateObject::GatewayTransitionAbort(abort)) => Ok(&**abort),
+        _ => Err(GatewayRefusal::Internal(
+            "la décision enregistrée ne contient pas d'annulation gateway.".into(),
+        )),
+    }
+}
+
 /// Sends the decision to Astra. A lost answer is replayed with the same bytes and no key:
 /// the campaign is asked again for a fresh token, and Astra takes the identical result.
 fn deposit(
@@ -658,6 +1044,26 @@ fn renewal_reason(emergency_replacement: bool, key_recovery: bool) -> RotationRe
         (false, true) => RotationReason::KeyRecovery,
         (false, false) => RotationReason::Scheduled,
     }
+}
+
+/// The credential document beside the vault, which the approvals are checked against.
+fn credential_document(vault_path: &Path) -> Result<CredentialRegistry, GatewayRefusal> {
+    credentials::load(&credentials::path_beside(vault_path))
+        .map_err(internal)?
+        .ok_or_else(|| {
+            GatewayRefusal::Internal(
+                "aucun document de credentials : l'émettre par `astra-signer bindings`. Rien n'a été signé."
+                    .into(),
+            )
+        })
+}
+
+/// The gateway's clock, which bounds the cancellation and the overlap. An older gateway
+/// sends none, and the workstation's instant stands in: the gateway checks both bounds
+/// again on its own clock when it installs the document, so this check only spares a
+/// touch, and refusing here would block the gesture for no safety gain.
+fn gateway_clock(gateway: &GatewayIdentityRead, now: u64) -> u64 {
+    gateway.now_unix.unwrap_or(now)
 }
 
 /// The label the campaign carries, which the operator reads on the door's screen.

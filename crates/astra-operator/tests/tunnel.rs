@@ -867,6 +867,30 @@ fn gateway_request() -> aether::certificates::gateway::GatewayCertificateRequest
     }
 }
 
+/// The gateway's clock is read from the same answer, and its absence (a gateway older
+/// than the field) reads as `None`, not as a refusal.
+#[test]
+fn the_gateway_clock_is_read_and_its_absence_tolerated() {
+    let with_clock = serde_json::json!({
+        "ca_pq_fingerprint": fingerprint_hex(b"courante"),
+        "now_unix": 1234,
+    });
+    let stub = Stub::serving(vec![(200, with_clock.to_string())]);
+    let read = Tunnel::new(&stub.base)
+        .expect("tunnel")
+        .gateway_identity()
+        .expect("read");
+    assert_eq!(read.now_unix, Some(1234));
+
+    let without = serde_json::json!({ "ca_pq_fingerprint": fingerprint_hex(b"courante") });
+    let stub = Stub::serving(vec![(200, without.to_string())]);
+    let read = Tunnel::new(&stub.base)
+        .expect("tunnel")
+        .gateway_identity()
+        .expect("read");
+    assert_eq!(read.now_unix, None);
+}
+
 /// The identity read is tolerant: a gateway older than the leaf expiries
 /// answers without them, and the anchors it always answered still read.
 #[test]

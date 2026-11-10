@@ -158,6 +158,7 @@ impl Scenario {
 
 fn gateway_read() -> GatewayIdentityRead {
     GatewayIdentityRead {
+        now_unix: None,
         ca_pq_fingerprint: Fingerprint::of(b"ca-pq"),
         next_ca_fingerprint: None,
         client_tls_ca_fingerprint: None,
@@ -198,6 +199,12 @@ struct Remote<'a> {
     calls: RefCell<Vec<&'static str>>,
     submitted: RefCell<Vec<AstraSignerResult>>,
     installed: RefCell<Vec<GatewayIdentityTransition>>,
+    /// The transition the gateway holds staged, if any.
+    staged: Option<GatewayIdentityTransition>,
+    /// Answers to the cancellations, in order; once empty, the gateway takes them.
+    abort_replies: RefCell<VecDeque<u16>>,
+    aborted: RefCell<Vec<GatewayTransitionAbort>>,
+    rolled: RefCell<Vec<CertificateServiceRollbackAuthorization>>,
 }
 
 impl<'a> Remote<'a> {
@@ -225,6 +232,10 @@ impl<'a> Remote<'a> {
             calls: RefCell::default(),
             submitted: RefCell::default(),
             installed: RefCell::default(),
+            staged: None,
+            abort_replies: RefCell::default(),
+            aborted: RefCell::default(),
+            rolled: RefCell::default(),
         }
     }
 
@@ -338,20 +349,35 @@ impl GatewayIdentityRemote for Remote<'_> {
         }
     }
 
-    fn abort(&self, _abort: &GatewayTransitionAbort) -> Result<GatewayDecisionRead> {
-        unreachable!("the abort is Task 5's, and no test of this task calls it")
+    fn abort(&self, abort: &GatewayTransitionAbort) -> Result<GatewayDecisionRead> {
+        self.note("abort");
+        self.aborted.borrow_mut().push(abort.clone());
+        match self.abort_replies.borrow_mut().pop_front() {
+            Some(status) => Err(admin_refusal(status, Some("motif de la gateway".into()))),
+            None => Ok(GatewayDecisionRead {
+                gateway_identity_epoch: abort.gateway_identity_epoch,
+                fingerprint: String::new(),
+                already_present: false,
+                activation_at: None,
+                not_after: None,
+            }),
+        }
     }
 
     fn rollback(
         &self,
-        _authorization: &CertificateServiceRollbackAuthorization,
+        authorization: &CertificateServiceRollbackAuthorization,
     ) -> Result<GatewayRollbackRead> {
-        unreachable!("the rollback is Task 5's, and no test of this task calls it")
+        self.note("rollback");
+        self.rolled.borrow_mut().push(authorization.clone());
+        Ok(GatewayRollbackRead {
+            expires_at: authorization.expires_at,
+        })
     }
 
     fn staged_transition(&self) -> Result<Option<GatewayIdentityTransition>> {
         self.note("staged_transition");
-        Ok(None)
+        Ok(self.staged.clone())
     }
 
     fn gateway(&self) -> Result<GatewayIdentityRead> {
@@ -789,4 +815,231 @@ fn a_candidate_without_rotate_tls_is_refused() {
 
     assert_eq!(refusal, GatewayRefusal::RequestMismatch);
     assert_eq!(scenario.domain.touches(), 0, "no key is touched");
+}
+
+/// The campaign a cancellation or a rollback is approved under: the transition's own epoch.
+fn cancellation_campaign(scenario: &Scenario, epoch: u64) -> AstraRotationCampaign {
+    scenario.domain.campaign(
+        CampaignScope::GatewayIdentity,
+        vec![CampaignTarget {
+            certificate_kind: CertificateKind::GatewayPq,
+            identity_key: gateway_key(),
+            epoch,
+            generation: epoch,
+            active_tls_certificate_fingerprint: Fingerprint::of(ACTIVE_TLS),
+            active_pq_certificate_fingerprint: scenario.leaf(),
+        }],
+        EXPIRES,
+    )
+}
+
+/// A transition the renewal signed and the gateway holds staged. The record is removed,
+/// as it is once the gateway holds the transition: no deposit waits.
+fn staged(scenario: &Scenario) -> GatewayIdentityTransition {
+    let remote = Remote::new(scenario);
+    let decision = signed_decision(&remote, &scenario.domain, options());
+    std::fs::remove_file(record_path(&scenario.domain.path)).expect("record removed");
+    scenario
+        .domain
+        .keys
+        .iter()
+        .for_each(|key| key.touches.set(0));
+    transition_of(&decision).expect("transition").clone()
+}
+
+/// The tunnel with `transition` staged, and the gateway's clock at `clock`. `published`
+/// says whether Astra has relayed it, which ends the cancellation.
+fn remote_with<'a>(
+    scenario: &'a Scenario,
+    transition: &GatewayIdentityTransition,
+    clock: Option<u64>,
+    published: bool,
+) -> Remote<'a> {
+    let mut remote = Remote::new(scenario);
+    remote.campaign = cancellation_campaign(scenario, transition.gateway_identity_epoch);
+    remote.staged = Some(transition.clone());
+    remote.gateway = GatewayIdentityRead {
+        now_unix: clock,
+        gateway_identity_epoch: transition.gateway_identity_epoch,
+        gateway_transition_pending: true,
+        gateway_transition_published: published,
+        gateway_activation_at: Some(transition.window.activation_at),
+        ..gateway_read()
+    };
+    remote
+}
+
+fn refusal<T>(result: Result<T, GatewayRefusal>) -> GatewayRefusal {
+    match result {
+        Ok(_) => panic!("a refusal was expected"),
+        Err(error) => error,
+    }
+}
+
+fn no_key_touched(domain: &Domain) -> bool {
+    domain.keys.iter().all(|key| key.touches.get() == 0)
+}
+
+#[test]
+fn abort_runs_before_activation() {
+    let scenario = Scenario::new(false);
+    let transition = staged(&scenario);
+    let remote = remote_with(&scenario, &transition, Some(NOW), false);
+    let domain = &scenario.domain;
+
+    let mut opened = open_abort(&remote, &domain.path, NOW).expect("opened");
+    opened.approve(&domain.keys[0], NOW).expect("approved");
+    let decision = opened.sign_and_record(&domain.path, NOW).expect("signed");
+    carry_abort(&remote, &domain.path, decision, NOW).expect("carried");
+
+    let aborted = remote.aborted.borrow();
+    assert_eq!(aborted.len(), 1);
+    assert!(matches!(aborted[0].reason, AbortReason::OperatorCancelled));
+    assert_eq!(
+        aborted[0].gateway_identity_epoch,
+        transition.gateway_identity_epoch
+    );
+    assert!(!record_on_disk(domain));
+}
+
+#[test]
+fn abort_refused_at_activation() {
+    let scenario = Scenario::new(false);
+    let transition = staged(&scenario);
+    let activation = transition.window.activation_at;
+    let remote = remote_with(&scenario, &transition, Some(activation), false);
+
+    let error = refusal(open_abort(&remote, &scenario.domain.path, NOW));
+
+    assert_eq!(error, GatewayRefusal::AbortTooLate(activation));
+    assert!(!remote.called("open_campaign"));
+    assert!(no_key_touched(&scenario.domain));
+}
+
+#[test]
+fn abort_refused_once_published() {
+    let scenario = Scenario::new(false);
+    let transition = staged(&scenario);
+    let remote = remote_with(&scenario, &transition, Some(NOW), true);
+
+    let error = refusal(open_abort(&remote, &scenario.domain.path, NOW));
+
+    assert_eq!(
+        error,
+        GatewayRefusal::AbortTooLate(transition.window.activation_at)
+    );
+    assert!(!remote.called("open_campaign"));
+    assert!(no_key_touched(&scenario.domain));
+}
+
+#[test]
+fn a_live_gateway_operation_blocks_the_abort_by_name() {
+    let scenario = Scenario::new(false);
+    let transition = staged(&scenario);
+    // A renewal decision still waits in the record.
+    let renewal = Remote::new(&scenario);
+    signed_decision(&renewal, &scenario.domain, options());
+    let remote = remote_with(&scenario, &transition, Some(NOW), false);
+
+    let error = refusal(open_abort(&remote, &scenario.domain.path, NOW));
+
+    assert_eq!(error, GatewayRefusal::AlreadyOpen);
+    assert!(error.to_string().contains("identité de la gateway"));
+    assert!(!remote.called("open_campaign"));
+}
+
+#[test]
+fn the_abort_clock_is_the_gateways_and_the_workstations_without_it() {
+    let scenario = Scenario::new(false);
+    let transition = staged(&scenario);
+    let activation = transition.window.activation_at;
+
+    // The gateway says it is past activation, while this workstation is not.
+    let ahead = remote_with(&scenario, &transition, Some(activation), false);
+    assert_eq!(
+        refusal(open_abort(&ahead, &scenario.domain.path, NOW)),
+        GatewayRefusal::AbortTooLate(activation)
+    );
+
+    // An older gateway sends no clock: the workstation's instant decides.
+    let silent = remote_with(&scenario, &transition, None, false);
+    assert!(open_abort(&silent, &scenario.domain.path, NOW).is_ok());
+    assert_eq!(
+        refusal(open_abort(&silent, &scenario.domain.path, activation)),
+        GatewayRefusal::AbortTooLate(activation)
+    );
+}
+
+#[test]
+fn a_refused_abort_keeps_the_record() {
+    let scenario = Scenario::new(false);
+    let transition = staged(&scenario);
+    let remote = remote_with(&scenario, &transition, Some(NOW), false);
+    let domain = &scenario.domain;
+    remote.abort_replies.borrow_mut().push_back(409);
+
+    let mut opened = open_abort(&remote, &domain.path, NOW).expect("opened");
+    opened.approve(&domain.keys[0], NOW).expect("approved");
+    let decision = opened.sign_and_record(&domain.path, NOW).expect("signed");
+    let error = carry_abort(&remote, &domain.path, decision, NOW).expect_err("refused");
+
+    assert!(matches!(error, GatewayRefusal::GatewayRefused(_)));
+    assert!(record_on_disk(domain));
+}
+
+#[test]
+fn rollback_runs_inside_the_overlap() {
+    let scenario = Scenario::new(false);
+    let transition = staged(&scenario);
+    let clock = NOW + 8 * DAY;
+    let remote = remote_with(&scenario, &transition, Some(clock), true);
+    let domain = &scenario.domain;
+
+    let mut opened =
+        open_rollback(&remote, &domain.path, 24, "Retour arrière", "poste", clock).expect("opened");
+    opened.approve(&domain.keys[0], clock).expect("approved");
+    let authorization = opened.sign(&domain.path, clock).expect("signed");
+    let read = carry_rollback(&remote, authorization.clone()).expect("carried");
+
+    assert!(!remote.called("open_campaign"));
+    assert_eq!(remote.rolled.borrow().len(), 1);
+    assert_eq!(authorization.expires_at, clock + DAY);
+    assert_eq!(read.expires_at, authorization.expires_at);
+}
+
+#[test]
+fn rollback_refused_before_activation_and_after_not_after() {
+    let scenario = Scenario::new(false);
+    let transition = staged(&scenario);
+    let domain = &scenario.domain;
+
+    let early = transition.window.activation_at - 1;
+    let remote = remote_with(&scenario, &transition, Some(early), true);
+    assert_eq!(
+        refusal(open_rollback(&remote, &domain.path, 24, "r", "p", early)),
+        GatewayRefusal::NoOverlap
+    );
+
+    let late = transition.window.not_after;
+    let remote = remote_with(&scenario, &transition, Some(late), true);
+    assert_eq!(
+        refusal(open_rollback(&remote, &domain.path, 24, "r", "p", late)),
+        GatewayRefusal::NoOverlap
+    );
+    assert!(no_key_touched(domain));
+}
+
+#[test]
+fn rollback_hours_are_capped_by_not_after() {
+    let scenario = Scenario::new(false);
+    let transition = staged(&scenario);
+    let clock = transition.window.not_after - DAY;
+    let remote = remote_with(&scenario, &transition, Some(clock), true);
+    let domain = &scenario.domain;
+
+    let mut opened = open_rollback(&remote, &domain.path, 1_000, "r", "p", clock).expect("opened");
+    opened.approve(&domain.keys[0], clock).expect("approved");
+    let authorization = opened.sign(&domain.path, clock).expect("signed");
+
+    assert_eq!(authorization.expires_at, transition.window.not_after);
 }

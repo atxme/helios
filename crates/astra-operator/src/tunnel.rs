@@ -499,6 +499,9 @@ impl Tunnel {
 /// `GatewayDomainRead`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 pub struct GatewayIdentityRead {
+    /// The gateway's clock when it answered. Absent on a gateway older than the field.
+    #[serde(default)]
+    pub now_unix: Option<u64>,
     pub ca_pq_fingerprint: Fingerprint,
     #[serde(default)]
     pub next_ca_fingerprint: Option<Fingerprint>,
