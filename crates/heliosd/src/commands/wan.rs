@@ -18,10 +18,17 @@ use crate::uplink;
 /// name rather than a marker. The file keeps `auto`: it describes the
 /// operator's intent, not the machine's current cabling.
 pub(crate) fn resolve_uplink(network: &mut NetworkConfig) -> anyhow::Result<()> {
+    resolve_uplink_with(network, uplink::resolve)
+}
+
+fn resolve_uplink_with(
+    network: &mut NetworkConfig,
+    resolve: impl FnOnce() -> Result<uplink::Selection, uplink::UplinkError>,
+) -> anyhow::Result<()> {
     if !network.wan_iface_is_auto() {
         return Ok(());
     }
-    let selection = uplink::resolve().context("choosing the WAN interface")?;
+    let selection = resolve().context("choosing the WAN interface")?;
     for warning in &selection.warnings {
         warn!("{warning}");
     }
@@ -42,8 +49,16 @@ pub(crate) fn show_uplink() -> anyhow::Result<()> {
         std::path::Path::new("/proc"),
     )
     .context("reading the kernel's network state")?;
+    for line in uplink_report(&facts) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+fn uplink_report(facts: &[uplink::InterfaceFacts]) -> Vec<String> {
+    let mut report = Vec::new();
     for interface in facts.iter().filter(|facts| facts.physical) {
-        println!(
+        report.push(format!(
             "{:<12} {:<9} carrier={} default_route={}",
             interface.name,
             if interface.wireless {
@@ -56,22 +71,120 @@ pub(crate) fn show_uplink() -> anyhow::Result<()> {
                 Some(metric) => format!("metric {metric}"),
                 None => "none".to_string(),
             }
-        );
+        ));
     }
-    println!();
-    match uplink::select(&facts) {
+    report.push(String::new());
+    match uplink::select(facts) {
         Ok(selection) => {
             for warning in &selection.warnings {
-                println!("attention : {warning}");
+                report.push(format!("attention : {warning}"));
             }
-            println!("permises : {}", selection.interfaces.join(", "));
-            println!(
+            report.push(format!("permises : {}", selection.interfaces.join(", ")));
+            report.push(format!(
                 "préférée : {} — {}",
                 selection.preferred(),
                 selection.reason
-            );
+            ));
         }
-        Err(error) => println!("aucune interface retenue : {error}"),
+        Err(error) => report.push(format!("aucune interface retenue : {error}")),
     }
-    Ok(())
+    report
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uplink::{InterfaceFacts, Selection, SelectionReason};
+
+    fn facts(
+        name: &str,
+        physical: bool,
+        wireless: bool,
+        carrier: bool,
+        metric: Option<u32>,
+    ) -> InterfaceFacts {
+        InterfaceFacts {
+            name: name.to_string(),
+            physical,
+            wireless,
+            carrier,
+            default_route_metric: metric,
+        }
+    }
+
+    #[test]
+    fn named_wan_does_not_enumerate_or_replace_the_operator_choice() {
+        let mut network = NetworkConfig {
+            wan_ifaces: vec!["eth9".into()],
+            ..NetworkConfig::default()
+        };
+        let result = resolve_uplink_with(&mut network, || {
+            panic!("a named WAN must not inspect the kernel")
+        });
+
+        assert!(result.is_ok());
+        assert_eq!(network.wan_ifaces, ["eth9"]);
+    }
+
+    #[test]
+    fn automatic_wan_keeps_every_resolved_uplink_in_selection_order() {
+        let mut network = NetworkConfig {
+            wan_ifaces: vec!["auto".into()],
+            ..NetworkConfig::default()
+        };
+        let selection = Selection {
+            interfaces: vec!["eth0".into(), "wlan0".into()],
+            reason: SelectionReason::WiredDefaultRoute,
+            warnings: Vec::new(),
+        };
+        let result = resolve_uplink_with(&mut network, || Ok(selection));
+
+        assert!(result.is_ok());
+        assert_eq!(network.wan_ifaces, ["eth0", "wlan0"]);
+    }
+
+    #[test]
+    fn automatic_wan_preserves_resolution_failure_context_and_config() {
+        let mut network = NetworkConfig {
+            wan_ifaces: vec!["auto".into()],
+            ..NetworkConfig::default()
+        };
+        let result = resolve_uplink_with(&mut network, || {
+            Err(uplink::UplinkError::NoPhysicalInterface)
+        });
+        let message = result
+            .expect_err("missing physical uplink is fatal")
+            .to_string();
+
+        assert!(message.contains("choosing the WAN interface"));
+        assert_eq!(network.wan_ifaces, ["auto"]);
+    }
+
+    #[test]
+    fn report_lists_physical_interfaces_and_selected_order_with_warning() {
+        let facts = [
+            facts("lo", false, false, true, Some(0)),
+            facts("eth0", true, false, true, None),
+            facts("wlan0", true, true, true, Some(10)),
+        ];
+
+        let report = uplink_report(&facts);
+
+        assert_eq!(report.len(), 6);
+        assert!(report[0].starts_with("eth0"));
+        assert!(report[1].starts_with("wlan0"));
+        assert_eq!(report[2], "");
+        assert!(report[3].starts_with("attention :"));
+        assert_eq!(report[4], "permises : wlan0, eth0");
+        assert!(report[5].starts_with("préférée : wlan0"));
+    }
+
+    #[test]
+    fn report_explains_when_no_physical_uplink_exists() {
+        let report = uplink_report(&[facts("lo", false, false, true, None)]);
+
+        assert_eq!(report.len(), 2);
+        assert_eq!(report[0], "");
+        assert!(report[1].starts_with("aucune interface retenue :"));
+    }
 }

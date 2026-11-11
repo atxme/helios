@@ -804,7 +804,10 @@ describe('after a key change', () => {
       })
     render(<AstraView />)
     expect(await screen.findByText(/Copie non envoyée à Astra : la gateway ne répond pas/)).toBeTruthy()
-    fireEvent.click(screen.getByRole('button', { name: 'Réessayer l’envoi' }))
+    const retry = screen.getByRole('button', { name: 'Réessayer l’envoi' })
+    await waitFor(() => expect((retry as HTMLButtonElement).disabled).toBe(false))
+    fireEvent.click(retry)
+    await waitFor(() => expect(api.operatorSendVaultCopy).toHaveBeenCalledTimes(2))
     expect(
       await screen.findByText('Copie du coffre et document de credentials envoyés à Astra'),
     ).toBeTruthy()

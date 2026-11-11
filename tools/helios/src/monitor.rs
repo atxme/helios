@@ -183,3 +183,234 @@ pub(super) async fn scenario_flap(client: &Client, base: &str) -> Result<()> {
     );
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::SinkExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+    const MOCK_TIMEOUT: Duration = Duration::from_secs(5);
+
+    fn test_client() -> Client {
+        Client::builder()
+            .no_proxy()
+            .build()
+            .expect("test HTTP client")
+    }
+
+    fn status(state: &str) -> String {
+        serde_json::json!({
+            "state": state,
+            "version": "test",
+            "wan_ifaces": [],
+            "lan_ifaces": [],
+            "wg_peers": [],
+            "allow_ssh_from": [],
+            "peers": [],
+            "wg_iface": "helios0",
+            "dry_run": true,
+            "split_tunnel_cidrs": [],
+            "mss_clamp": null,
+            "captive_portal_gateway": null
+        })
+        .to_string()
+    }
+
+    fn command(ok: bool) -> String {
+        serde_json::json!({"ok": ok, "error": if ok { None } else { Some("refused") }}).to_string()
+    }
+
+    /// One connection per request keeps ordering and request paths explicit.
+    async fn http_server(
+        responses: Vec<(&'static str, String)>,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("local listener");
+        let address = listener.local_addr().expect("listener address");
+        let task = tokio::spawn(async move {
+            let mut paths = Vec::new();
+            for (expected_path, body) in responses {
+                let (mut stream, _) = tokio::time::timeout(MOCK_TIMEOUT, listener.accept())
+                    .await
+                    .expect("HTTP client connects")
+                    .expect("accept local HTTP connection");
+                let mut request = Vec::new();
+                let mut buffer = [0; 2048];
+                loop {
+                    let count = tokio::time::timeout(MOCK_TIMEOUT, stream.read(&mut buffer))
+                        .await
+                        .expect("HTTP request arrives")
+                        .expect("read HTTP request");
+                    if count == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..count]);
+                    let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n")
+                    else {
+                        continue;
+                    };
+                    let headers = String::from_utf8_lossy(&request[..header_end + 4]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= header_end + 4 + content_length {
+                        break;
+                    }
+                }
+                let request = String::from_utf8_lossy(&request);
+                let first_line = request.lines().next().unwrap_or_default();
+                let path = first_line.split_whitespace().nth(1).unwrap_or_default();
+                assert_eq!(path, expected_path, "unexpected request: {first_line}");
+                paths.push(path.to_string());
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write HTTP response");
+            }
+            paths
+        });
+        (format!("http://{address}"), task)
+    }
+
+    #[tokio::test]
+    async fn watch_events_accepts_text_events_and_returns_on_websocket_close() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("local listener");
+        let address = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept websocket client");
+            let mut websocket = accept_async(stream).await.expect("websocket handshake");
+            for message in [
+                Message::Text(r#"{"type":"state_changed","state":"up"}"#.into()),
+                Message::Text(r#"{"type":"log","level":"error","message":"failed"}"#.into()),
+                Message::Text(r#"{"type":"log","message":"default level"}"#.into()),
+                Message::Text(r#"{"type":"future"}"#.into()),
+                Message::Text("not-json".into()),
+                Message::Binary(vec![0, 1, 2].into()),
+            ] {
+                websocket.send(message).await.expect("send websocket event");
+            }
+            websocket.close(None).await.expect("close websocket");
+        });
+
+        let (websocket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/ws"))
+            .await
+            .expect("connect websocket client");
+        tokio::time::timeout(MOCK_TIMEOUT, watch_events(websocket))
+            .await
+            .expect("watch exits after peer closes")
+            .expect("closed websocket is a normal end");
+        server.await.expect("websocket server completes");
+    }
+
+    #[tokio::test]
+    async fn wait_state_reads_the_target_and_reports_timeout() {
+        let (base, server) = http_server(vec![("/api/status", status("up"))]).await;
+        let elapsed = wait_state(&test_client(), &base, "up", 1)
+            .await
+            .expect("target state arrives");
+        assert!(elapsed < MOCK_TIMEOUT);
+        assert_eq!(
+            server.await.expect("HTTP server completes"),
+            ["/api/status"]
+        );
+
+        let error = wait_state(&test_client(), "http://127.0.0.1:1", "down", 0)
+            .await
+            .expect_err("zero timeout must expire");
+        assert!(error.to_string().contains("timeout: state 'down'"));
+    }
+
+    #[tokio::test]
+    async fn flap_scenario_completes_five_dry_run_cycles() {
+        let mut responses = vec![("/api/status", status("down"))];
+        for _ in 0..5 {
+            responses.extend([
+                ("/api/tunnel/start", command(true)),
+                ("/api/status", status("connecting")),
+                ("/api/tunnel/stop", command(true)),
+                ("/api/status", status("down")),
+            ]);
+        }
+        let (base, server) = http_server(responses).await;
+        scenario_flap(&test_client(), &base)
+            .await
+            .expect("all five cycles complete");
+        let paths = server.await.expect("HTTP server completes");
+        assert_eq!(paths.len(), 21);
+        assert_eq!(paths[0], "/api/status");
+        assert_eq!(
+            paths
+                .iter()
+                .filter(|path| *path == "/api/tunnel/start")
+                .count(),
+            5
+        );
+        assert_eq!(
+            paths
+                .iter()
+                .filter(|path| *path == "/api/tunnel/stop")
+                .count(),
+            5
+        );
+    }
+
+    #[tokio::test]
+    async fn flap_scenario_stops_on_a_refused_start_command() {
+        let (base, server) = http_server(vec![
+            ("/api/status", status("down")),
+            ("/api/tunnel/start", command(false)),
+        ])
+        .await;
+        let error = scenario_flap(&test_client(), &base)
+            .await
+            .expect_err("refused start must abort the scenario");
+        assert!(error
+            .to_string()
+            .contains("bringing up the interface refused: refused"));
+        assert_eq!(
+            server.await.expect("HTTP server completes"),
+            ["/api/status", "/api/tunnel/start"]
+        );
+    }
+
+    #[tokio::test]
+    async fn nominal_scenario_starts_waits_stops_and_reaches_down() {
+        let (base, server) = http_server(vec![
+            ("/api/status", status("down")),
+            ("/api/tunnel/start", command(true)),
+            ("/api/status", status("connecting")),
+            ("/api/tunnel/stop", command(true)),
+            ("/api/status", status("down")),
+        ])
+        .await;
+        scenario_nominal(&test_client(), &base)
+            .await
+            .expect("nominal tunnel lifecycle completes");
+        assert_eq!(
+            server.await.expect("HTTP server completes"),
+            [
+                "/api/status",
+                "/api/tunnel/start",
+                "/api/status",
+                "/api/tunnel/stop",
+                "/api/status"
+            ]
+        );
+    }
+}

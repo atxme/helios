@@ -996,6 +996,20 @@ mod tests {
         path
     }
 
+    fn astra_authority_certificate(directory: &Path, name: &str) -> PathBuf {
+        use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose};
+        std::fs::create_dir_all(directory).unwrap();
+        let mut params = CertificateParams::new(vec![name.to_string()]).unwrap();
+        params.is_ca = IsCa::NoCa;
+        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        let key_pair = KeyPair::generate().unwrap();
+        let certificate = params.self_signed(&key_pair).unwrap();
+        let path = directory.join("astra-authority.der");
+        std::fs::write(&path, certificate.der().as_ref()).unwrap();
+        path
+    }
+
     /// `HELIOS_ASTRA_CHANNEL` is process-wide, exactly like
     /// `HELIOS_NETWORK_CONFIG`: without a lock two parallel tests read each
     /// other's file.
@@ -1152,6 +1166,238 @@ mod tests {
         let rotated =
             initialize("10.88.0.1:8444".parse().unwrap(), &other, None, None, true).unwrap();
         assert_ne!(rotated.served.as_bytes(), served.served.as_bytes());
+    }
+
+    #[test]
+    fn a_complete_authority_pair_loads_and_builds_the_pinned_client() {
+        let directory = tempfile::tempdir().unwrap();
+        let _guard = isolated(directory.path());
+        let astra_client = astra_certificate(directory.path());
+        let astra_server = astra_authority_certificate(
+            directory.path(),
+            ::astra_channel::ASTRA_INTERNAL_SERVER_NAME,
+        );
+
+        let identities = initialize(
+            "10.88.0.1:8444".parse().unwrap(),
+            &astra_client,
+            Some("10.88.0.2:8444".parse().unwrap()),
+            Some(&astra_server),
+            false,
+        )
+        .expect("complete dialling pair");
+
+        assert!(identities.client.is_some());
+        let channel = AstraChannel::load().unwrap().expect("stored channel");
+        assert_eq!(
+            channel.authority.as_ref().unwrap().address,
+            "10.88.0.2:8444".parse().unwrap()
+        );
+        assert!(channel
+            .authority_client()
+            .expect("client TLS configuration")
+            .is_some());
+    }
+
+    #[test]
+    fn every_incomplete_authority_pair_is_refused_when_loaded() {
+        let directory = tempfile::tempdir().unwrap();
+        let _guard = isolated(directory.path());
+        let astra = astra_certificate(directory.path());
+        let astra_server = astra_authority_certificate(
+            directory.path(),
+            ::astra_channel::ASTRA_INTERNAL_SERVER_NAME,
+        );
+        initialize(
+            "10.88.0.1:8444".parse().unwrap(),
+            &astra,
+            Some("10.88.0.2:8444".parse().unwrap()),
+            Some(&astra_server),
+            false,
+        )
+        .unwrap();
+
+        let path = path();
+        let document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let fields = [
+            "authority",
+            "client_certificate",
+            "client_private_key",
+            "astra_authority_certificate",
+        ];
+        for mask in 0u8..(1 << fields.len()) {
+            let mut candidate = document.clone();
+            for (index, field) in fields.iter().enumerate() {
+                if mask & (1 << index) == 0 {
+                    candidate.as_object_mut().unwrap().remove(*field);
+                }
+            }
+            std::fs::write(&path, serde_json::to_vec(&candidate).unwrap()).unwrap();
+            let loaded = AstraChannel::load_from(&path);
+            if mask == 0 || mask == (1 << fields.len()) - 1 {
+                assert!(loaded.is_ok(), "complete tuple mask {mask:#06b}");
+            } else {
+                let error = loaded.err().expect("partial tuple must be refused");
+                assert!(
+                    error.to_string().contains("only part of the dialling half"),
+                    "mask {mask:#06b}: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn initialization_requires_both_authority_arguments() {
+        let directory = tempfile::tempdir().unwrap();
+        let _guard = isolated(directory.path());
+        let missing = directory.path().join("not-read-before-argument-check.der");
+
+        for (authority, certificate) in [
+            (Some("10.88.0.2:8444".parse().unwrap()), None),
+            (None, Some(missing.as_path())),
+        ] {
+            let error = initialize(
+                "10.88.0.1:8444".parse().unwrap(),
+                &missing,
+                authority,
+                certificate,
+                false,
+            )
+            .err()
+            .expect("half a dialling configuration must be rejected");
+            assert!(error.to_string().contains("needs both"), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn initialization_reports_a_missing_authority_certificate_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let _guard = isolated(directory.path());
+        let astra_client = astra_certificate(directory.path());
+        let missing = directory.path().join("missing-authority.der");
+
+        let error = initialize(
+            "10.88.0.1:8444".parse().unwrap(),
+            &astra_client,
+            Some("10.88.0.2:8444".parse().unwrap()),
+            Some(&missing),
+            false,
+        )
+        .err()
+        .expect("an unreadable authority pin must prevent initialization");
+
+        assert!(
+            error
+                .to_string()
+                .contains("reading Astra's authority certificate"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn initialization_rejects_a_malformed_authority_certificate() {
+        let directory = tempfile::tempdir().unwrap();
+        let _guard = isolated(directory.path());
+        let astra_client = astra_certificate(directory.path());
+        let malformed = directory.path().join("malformed-authority.der");
+        std::fs::write(&malformed, b"not a DER certificate").unwrap();
+
+        let error = initialize(
+            "10.88.0.1:8444".parse().unwrap(),
+            &astra_client,
+            Some("10.88.0.2:8444".parse().unwrap()),
+            Some(&malformed),
+            false,
+        )
+        .err()
+        .expect("a malformed pin must prevent initialization");
+
+        assert!(
+            error.to_string().contains("pinned peer certificate"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn initialization_rejects_an_authority_pin_without_server_auth_usage() {
+        let directory = tempfile::tempdir().unwrap();
+        let _guard = isolated(directory.path());
+        let astra_client = astra_certificate(directory.path());
+
+        // This valid certificate is suitable for Astra to authenticate the
+        // gateway, but not for the gateway to authenticate Astra as server.
+        let error = initialize(
+            "10.88.0.1:8444".parse().unwrap(),
+            &astra_client,
+            Some("10.88.0.2:8444".parse().unwrap()),
+            Some(&astra_client),
+            false,
+        )
+        .err()
+        .expect("the authority pin must carry serverAuth");
+
+        assert!(
+            error.to_string().contains("Server end can use"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn initialization_accepts_a_pinned_server_certificate_with_another_dns_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let _guard = isolated(directory.path());
+        let astra_client = astra_certificate(directory.path());
+        let wrong_name = astra_authority_certificate(directory.path(), "another-name.internal");
+
+        let result = initialize(
+            "10.88.0.1:8444".parse().unwrap(),
+            &astra_client,
+            Some("10.88.0.2:8444".parse().unwrap()),
+            Some(&wrong_name),
+            false,
+        );
+
+        assert!(
+            result.is_ok(),
+            "initialization checks the server role and pin bytes, not the certificate DNS name"
+        );
+    }
+
+    #[test]
+    fn loading_a_pair_defers_private_key_parsing_until_client_construction() {
+        let directory = tempfile::tempdir().unwrap();
+        let _guard = isolated(directory.path());
+        let astra_client = astra_certificate(directory.path());
+        let astra_server = astra_authority_certificate(
+            directory.path(),
+            ::astra_channel::ASTRA_INTERNAL_SERVER_NAME,
+        );
+        initialize(
+            "10.88.0.1:8444".parse().unwrap(),
+            &astra_client,
+            Some("10.88.0.2:8444".parse().unwrap()),
+            Some(&astra_server),
+            false,
+        )
+        .unwrap();
+
+        let path = path();
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        document["client_private_key"] = serde_json::json!(
+            base64::engine::general_purpose::STANDARD.encode(b"not a PKCS#8 key")
+        );
+        std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+
+        let channel = AstraChannel::load()
+            .unwrap()
+            .expect("decoded channel document");
+        let error = channel
+            .authority_client()
+            .err()
+            .expect("invalid key must not build a TLS client");
+        assert!(error.to_string().contains("key"), "{error}");
     }
 
     /// A wildcard bind publishes the lifecycle API on the WAN and inside the

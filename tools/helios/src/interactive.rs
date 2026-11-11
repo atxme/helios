@@ -472,6 +472,50 @@ pub(super) fn confirm(label: &str) -> Result<bool> {
 mod tests {
     use super::*;
 
+    async fn status_server(
+        body: &'static str,
+        delay: Duration,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("local status listener");
+        let address = listener.local_addr().expect("listener address");
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = tokio::time::timeout(Duration::from_secs(3), listener.accept())
+                .await
+                .expect("status client connects within test deadline")
+                .expect("status request");
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+            while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                let count = tokio::time::timeout(Duration::from_secs(3), stream.read(&mut buffer))
+                    .await
+                    .expect("status request arrives within test deadline")
+                    .expect("read status request");
+                if count == 0 {
+                    return;
+                }
+                request.extend_from_slice(&buffer[..count]);
+            }
+            tokio::time::sleep(delay).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+        (format!("http://{address}"), task)
+    }
+
+    fn test_client() -> Client {
+        Client::builder()
+            .no_proxy()
+            .build()
+            .expect("HTTP test client")
+    }
+
     #[test]
     fn menu_hints_filter_reset_selection_and_never_complete_footer_text() {
         let mut tree = Cli::command();
@@ -528,6 +572,64 @@ mod tests {
         let done = async { Ok(()) };
         let never = std::future::pending::<()>();
         assert!(matches!(interruptible(done, never).await, Some(Ok(()))));
+    }
+
+    #[tokio::test]
+    async fn probe_reports_gateway_state_and_counts_only_fresh_handshakes() {
+        let body = r#"{
+            "state":"up","version":"test-version","dry_run":false,
+            "wan_ifaces":[],"lan_ifaces":[],"wg_peers":[],"allow_ssh_from":[],
+            "peers":[
+                {"name":"fresh","public_key":"k","address":"100.64.1.2/32","post_quantum":false,"last_handshake_age_seconds":150},
+                {"name":"stale","public_key":"k","address":"100.64.1.3/32","post_quantum":false,"last_handshake_age_seconds":151},
+                {"name":"never","public_key":"k","address":"100.64.1.4/32","post_quantum":false,"last_handshake_age_seconds":null}
+            ],
+            "wg_iface":"helios0","handshake_stale_after_seconds":150,
+            "split_tunnel_cidrs":[],"mss_clamp":null,"captive_portal_gateway":null
+        }"#;
+        let (base, server) = status_server(body, Duration::ZERO).await;
+        let gateway = probe(&test_client(), &base).await;
+        assert!(matches!(
+            gateway,
+            Gateway::Reachable {
+                state,
+                version,
+                dry_run: false,
+                peers_online: 1,
+                peers_total: 3,
+            } if state == "up" && version == "test-version"
+        ));
+        server.await.expect("status server completes");
+    }
+
+    #[tokio::test]
+    async fn probe_distinguishes_incompatible_responses_from_no_answer() {
+        let (base, server) = status_server("not-json", Duration::ZERO).await;
+        assert!(matches!(
+            probe(&test_client(), &base).await,
+            Gateway::Unavailable(Unavailable::Incompatible)
+        ));
+        server.await.expect("malformed status server completes");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("unused local port");
+        let address = listener.local_addr().expect("listener address");
+        drop(listener);
+        assert!(matches!(
+            probe(&test_client(), &format!("http://{address}")).await,
+            Gateway::Unavailable(Unavailable::NoAnswer)
+        ));
+    }
+
+    #[tokio::test]
+    async fn probe_timeout_is_reported_as_no_answer() {
+        let (base, server) = status_server("{}", PROBE_TIMEOUT + Duration::from_millis(100)).await;
+        assert!(matches!(
+            probe(&test_client(), &base).await,
+            Gateway::Unavailable(Unavailable::NoAnswer)
+        ));
+        server.abort();
     }
 
     #[test]

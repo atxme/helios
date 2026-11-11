@@ -232,26 +232,7 @@ fn write_escrow(network: &NetworkConfig, private_key: &str) {
 /// that would be an identity substitution vector.
 fn try_recovery(secret: &helios_tpm::SecretKey) -> Option<SecretString> {
     let path = PathBuf::from(recovery_path());
-    if !path.exists() {
-        return None;
-    }
-
-    // Both buffers hold the key in the clear: the file's bytes, then the
-    // trimmed copy. `Zeroizing` is what makes them go away on every exit
-    // path — including the four `return None` below (ADR-006 §5).
-    let raw = match std::fs::read_to_string(&path).map(Zeroizing::new) {
-        Ok(s) => s,
-        Err(e) => {
-            warn!("unreadable recovery file: {e}");
-            return None;
-        }
-    };
-    let key = Zeroizing::new(raw.trim().to_string());
-
-    if let Err(e) = validate_wg_key(&key) {
-        warn!("invalid recovery file ({e}) — ignored, not consumed");
-        return None;
-    }
+    let key = read_recovery_key(&path)?;
 
     // Reseals immediately under the new TPM secret.
     let context = match identity_context(&key) {
@@ -278,6 +259,30 @@ fn try_recovery(secret: &helios_tpm::SecretKey) -> Option<SecretString> {
 
     warn!("WireGuard identity restored from escrow and resealed");
     Some(SecretString::new(key.as_str()))
+}
+
+/// Reads and validates the operator-delivered recovery file without
+/// consuming it. Invalid or unreadable files remain available for correction.
+/// Both the original contents and the trimmed key are wiped on every path
+/// (ADR-006 §5).
+fn read_recovery_key(path: &std::path::Path) -> Option<Zeroizing<String>> {
+    if !path.exists() {
+        return None;
+    }
+
+    let raw = match std::fs::read_to_string(path).map(Zeroizing::new) {
+        Ok(contents) => contents,
+        Err(error) => {
+            warn!("unreadable recovery file: {error}");
+            return None;
+        }
+    };
+    let key = Zeroizing::new(raw.trim().to_string());
+    if let Err(error) = validate_wg_key(&key) {
+        warn!("invalid recovery file ({error}) — ignored, not consumed");
+        return None;
+    }
+    Some(key)
 }
 
 fn write_atomic(path: &str, bytes: &[u8]) -> std::io::Result<()> {
@@ -790,6 +795,89 @@ mod tests {
             );
             assert!(!dir.join("wg-key.escrow").exists());
         });
+    }
+
+    #[test]
+    fn recovery_file_absence_is_not_an_error() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("missing-recovery");
+
+        assert!(read_recovery_key(&path).is_none());
+    }
+
+    #[test]
+    fn unreadable_recovery_path_is_refused_without_consuming_it() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("recovery-directory");
+        std::fs::create_dir(&path).expect("create directory at recovery path");
+
+        assert!(read_recovery_key(&path).is_none());
+        assert!(path.is_dir());
+    }
+
+    #[test]
+    fn invalid_recovery_key_is_left_in_place_for_operator_correction() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("wg-key.recovery");
+        std::fs::write(&path, "not-a-wireguard-key\n").expect("write invalid recovery key");
+
+        assert!(read_recovery_key(&path).is_none());
+        assert_eq!(
+            std::fs::read_to_string(path).expect("recovery file remains"),
+            "not-a-wireguard-key\n"
+        );
+    }
+
+    #[test]
+    fn valid_recovery_key_is_trimmed_before_returning_to_the_seal_path() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("wg-key.recovery");
+        std::fs::write(&path, format!("  {VALID}\n")).expect("write recovery key");
+
+        let key = read_recovery_key(&path).expect("valid recovery key");
+
+        assert_eq!(key.as_str(), VALID);
+        assert!(
+            path.exists(),
+            "reading alone must not consume the recovery file"
+        );
+    }
+
+    #[test]
+    fn atomic_write_replaces_the_destination_with_complete_bytes() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("nested/identity.bin");
+        std::fs::create_dir_all(path.parent().expect("destination parent"))
+            .expect("create destination parent");
+        std::fs::write(&path, b"stale identity").expect("create existing destination");
+
+        write_atomic(
+            path.to_str().expect("UTF-8 test path"),
+            b"complete identity",
+        )
+        .expect("atomic write");
+
+        assert_eq!(
+            std::fs::read(path).expect("read destination"),
+            b"complete identity"
+        );
+    }
+
+    #[test]
+    fn atomic_write_reports_parent_creation_failure_without_partial_destination() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let parent = directory.path().join("parent-file");
+        std::fs::write(&parent, b"not a directory").expect("create blocking file");
+        let path = parent.join("identity.bin");
+
+        let result = write_atomic(path.to_str().expect("UTF-8 test path"), b"secret");
+
+        assert!(result.is_err());
+        assert!(!path.exists());
+        assert_eq!(
+            std::fs::read(parent).expect("blocking file unchanged"),
+            b"not a directory"
+        );
     }
 
     #[test]

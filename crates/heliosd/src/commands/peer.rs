@@ -58,6 +58,7 @@ pub(crate) fn peer_command(mut network: NetworkConfig, command: PeerCommand) -> 
             // certificates cannot be queued must not leave a peer admitted
             // with no certificate generation.
             let queued = queue_console_admission(
+                &helios_provisioning::certificates::CertificateRegistry::path(),
                 &name,
                 &public_key,
                 certificate.as_deref(),
@@ -173,6 +174,7 @@ pub(crate) fn peer_command(mut network: NetworkConfig, command: PeerCommand) -> 
 /// profile that connects and can never renew. That is refused here rather than
 /// discovered months later.
 fn queue_console_admission(
+    registry_path: &Path,
     name: &str,
     public_key: &str,
     certificate: Option<&Path>,
@@ -180,7 +182,7 @@ fn queue_console_admission(
 ) -> anyhow::Result<Option<certificates::QueuedAdmission>> {
     use base64::Engine as _;
 
-    if !helios_provisioning::certificates::CertificateRegistry::path().exists() {
+    if !registry_path.exists() {
         return Ok(None);
     }
     let (Some(certificate), Some(pq_certificate)) = (certificate, pq_certificate) else {
@@ -252,5 +254,109 @@ mod tests {
             ..NetworkConfig::default()
         };
         peer_command(network, PeerCommand::List).unwrap();
+    }
+
+    #[test]
+    fn admission_without_a_trust_domain_does_not_require_certificates() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let registry = directory.path().join("missing-registry.json");
+
+        let queued = queue_console_admission(&registry, "alice", " public ", None, None)
+            .expect("admission without a trust domain");
+
+        assert!(queued.is_none());
+    }
+
+    #[test]
+    fn trust_domain_refuses_missing_client_certificates_before_admission() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let registry = directory.path().join("registry.json");
+        std::fs::write(&registry, b"registry present").expect("create registry marker");
+
+        let error = queue_console_admission(&registry, "alice", "public", None, None)
+            .expect_err("both certificate objects are required");
+
+        assert!(error.to_string().contains("trust domain"));
+        assert!(error.to_string().contains("--certificate"));
+    }
+
+    #[test]
+    fn trust_domain_reads_and_encodes_both_client_certificates() {
+        use base64::Engine as _;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let registry = directory.path().join("registry.json");
+        std::fs::write(&registry, b"registry present").expect("create registry marker");
+        let tls_path = directory.path().join("client.der");
+        let pq_path = directory.path().join("client-pq.json");
+        std::fs::write(&tls_path, [0x30, 0x01, 0xff]).expect("write TLS certificate");
+        std::fs::write(&pq_path, br#"{"leaf":"pq"}"#).expect("write PQ certificate");
+
+        let queued = queue_console_admission(
+            &registry,
+            "alice",
+            "  public-key  ",
+            Some(&tls_path),
+            Some(&pq_path),
+        )
+        .expect("queue certificate material")
+        .expect("trust domain creates a queue entry");
+
+        assert_eq!(queued.name, "alice");
+        assert_eq!(queued.client_wg_public_key, "public-key");
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(queued.tls_certificate)
+                .expect("decode TLS bytes"),
+            [0x30, 0x01, 0xff]
+        );
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(queued.pq_certificate)
+                .expect("decode PQ bytes"),
+            br#"{"leaf":"pq"}"#
+        );
+    }
+
+    #[test]
+    fn unreadable_tls_certificate_is_reported_with_its_path() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let registry = directory.path().join("registry.json");
+        std::fs::write(&registry, b"registry present").expect("create registry marker");
+        let missing_tls = directory.path().join("missing-client.der");
+        let pq_path = directory.path().join("client-pq.json");
+        std::fs::write(&pq_path, b"pq").expect("write PQ certificate");
+
+        let error = queue_console_admission(
+            &registry,
+            "alice",
+            "public",
+            Some(&missing_tls),
+            Some(&pq_path),
+        )
+        .expect_err("missing TLS certificate is an admission error");
+
+        assert!(error.to_string().contains("missing-client.der"));
+    }
+
+    #[test]
+    fn unreadable_pq_certificate_is_reported_with_its_path() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let registry = directory.path().join("registry.json");
+        std::fs::write(&registry, b"registry present").expect("create registry marker");
+        let tls_path = directory.path().join("client.der");
+        let missing_pq = directory.path().join("missing-client-pq.json");
+        std::fs::write(&tls_path, b"tls").expect("write TLS certificate");
+
+        let error = queue_console_admission(
+            &registry,
+            "alice",
+            "public",
+            Some(&tls_path),
+            Some(&missing_pq),
+        )
+        .expect_err("missing PQ certificate is an admission error");
+
+        assert!(error.to_string().contains("missing-client-pq.json"));
     }
 }
