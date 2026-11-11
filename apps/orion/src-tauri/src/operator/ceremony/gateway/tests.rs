@@ -228,6 +228,44 @@ fn renew_runs_to_published() {
 }
 
 #[test]
+fn a_reused_request_is_said_before_the_keys() {
+    let scenario = Scenario::new(false);
+    let mut reused = RenewalRemote::new(&scenario);
+    reused.prepared.reused = true;
+    let ran = drive(
+        &scenario.domain,
+        &reused,
+        gateway_key(),
+        renewal(false, false),
+        "",
+        Answer::Keys,
+        NOW,
+    );
+    assert_eq!(ran.outcome, Ok(()));
+    let asked = ran.awaiting_keys();
+    assert!(
+        asked[0].request_reused,
+        "the first status asking for a key says the request was reused"
+    );
+
+    let fresh = RenewalRemote::new(&scenario);
+    let ran = drive(
+        &scenario.domain,
+        &fresh,
+        gateway_key(),
+        renewal(false, false),
+        "",
+        Answer::Keys,
+        NOW,
+    );
+    assert_eq!(ran.outcome, Ok(()));
+    assert!(
+        !ran.awaiting_keys()[0].request_reused,
+        "a request prepared now is not said to be reused"
+    );
+}
+
+#[test]
 fn abort_runs_to_its_end() {
     let scenario = Scenario::new(false);
     let mut remote = RenewalRemote::new(&scenario);

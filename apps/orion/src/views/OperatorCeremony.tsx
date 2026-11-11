@@ -454,6 +454,10 @@ export function retryLabel(retry: Refusal, purpose: KeyPurpose | null): string {
   }
 }
 
+/** Said before the keys when the gateway resumed the request it had prepared, with no new key. */
+export const REUSED_REQUEST_SENTENCE =
+  'Demande déjà préparée par la gateway pour cette époque : elle est reprise, sans nouvelle clé.'
+
 /** Said after any refusal once the workstation of a revocation is cut at its gateway. */
 export const CUT_PENDING_SENTENCE = 'Le poste est coupé ; la révocation reste à signer.'
 
@@ -739,6 +743,12 @@ export function OperatorCeremonyPanel({
           {remoteSentence(status.remote)}
         </Typography>
       </Box>
+
+      {status.request_reused === true && purposeOf(status.gesture) !== null && (
+        <Alert severity="info" variant="outlined" sx={{ mt: 1, fontSize: 11.5 }}>
+          {REUSED_REQUEST_SENTENCE}
+        </Alert>
+      )}
 
       {status.keys && status.keys.length > 0 && (
         <Box sx={{ mt: 0.75 }}>

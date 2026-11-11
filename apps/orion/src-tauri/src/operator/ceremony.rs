@@ -1741,6 +1741,8 @@ struct Ceremony {
     idle_until: Option<u64>,
     /// A revocation's workstation is cut at its gateway.
     peer_cut: bool,
+    /// The gateway resumed the request it had prepared: said before the keys.
+    request_reused: bool,
 }
 
 impl Ceremony {
@@ -1759,6 +1761,7 @@ impl Ceremony {
             approved: Vec::new(),
             idle_until: None,
             peer_cut: false,
+            request_reused: false,
         }
     }
 
@@ -1784,6 +1787,7 @@ impl Ceremony {
         status.approved = self.approved.clone();
         status.idle_until = self.idle_until;
         status.peer_cut = self.peer_cut;
+        status.request_reused = self.request_reused;
         status
     }
 

@@ -332,6 +332,18 @@ impl Held {
         }
     }
 
+    /// Whether the gateway resumed the request it had prepared. Only a renewal and a
+    /// revocation's replacement can have been reused; the others never are.
+    fn request_reused(&self) -> bool {
+        match self {
+            Self::Nothing | Self::Abort(_) | Self::Rollback(_) => false,
+            Self::Renewal(held) => held.get().is_some_and(OpenedGatewayRenewal::request_reused),
+            Self::Revocation(held) => held
+                .get()
+                .is_some_and(OpenedGatewayRevocation::request_reused),
+        }
+    }
+
     /// One key: its approval. `None` when nothing is held.
     fn approve(&mut self, key: &dyn Authenticator, now: u64) -> Option<Result<String, KeyStep>> {
         match self {
@@ -441,6 +453,7 @@ impl<'a> GatewayRun<'a> {
     fn hold(&mut self, held: Held, now: u64) -> Step<()> {
         self.ceremony.remote = RemoteState::AwaitingOperator;
         self.ceremony.manifest = held.manifest(now);
+        self.ceremony.request_reused = held.request_reused();
         self.until = held.expires_at();
         self.held = held;
         self.show();

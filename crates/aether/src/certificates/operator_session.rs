@@ -819,6 +819,10 @@ pub struct OperatorStatus {
     /// point says so, and the operator is told what is left to do.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub peer_cut: bool,
+    /// The gateway resumed a request it had prepared already, for this epoch: the
+    /// operator is told before the keys that no new key is asked for it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub request_reused: bool,
 }
 
 impl OperatorStatus {
@@ -844,6 +848,7 @@ impl OperatorStatus {
             approved: Vec::new(),
             idle_until: None,
             peer_cut: false,
+            request_reused: false,
         }
     }
 

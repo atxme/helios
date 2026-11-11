@@ -944,6 +944,8 @@ export interface OperatorStatus {
   automatic?: boolean
   /** Le poste d'une révocation est coupé à sa gateway : toute raison suivante le dit. */
   peer_cut?: boolean
+  /** La gateway a repris une demande qu'elle avait déjà préparée pour cette époque : dit avant les clés. */
+  request_reused?: boolean
 }
 
 /** Un geste d'enrôlement (§15.2), fermé : la page ne choisit que parmi ces trois. */
