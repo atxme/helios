@@ -1306,13 +1306,16 @@ attendu.
 85. **Annulation avant publication.** **[cible]** (clés réelles, gateway cible). Ligne
     « Installée, publication à faire ». « Annuler », puis « Confirmer l’annulation ».
     Attendu : « L'époque reste consommée. » ; un toucher par clé ; la ligne revient à son
-    état sans transition en attente.
+    état sans transition en attente. Refaire l'essai après une publication refusée par
+    Astra, donc avec la décision de renouvellement encore en attente (installée, non
+    publiée) : l'annulation s'ouvre et remplace cette décision.
 86. **Pas d'annulation après publication.** **[cible]** (gateway cible). Sur la ligne
     « Bascule le … » : aucun bouton « Annuler ».
 87. **Reprise sans clé.** **[cible]** (clés réelles, gateway cible). Fermer Orion après
-    le dépôt de la décision, avant la publication ; rouvrir. Attendu : « Installée,
-    publication à faire » ; « Reprendre » publie sans toucher de clé, puis la ligne passe
-    à « Bascule le … ».
+    la signature, avant l'installation de la décision ; rouvrir. Attendu : « Décision à
+    reprendre » ; « Reprendre » dépose, installe et publie sans toucher de clé, puis la
+    ligne passe à « Bascule le … ». Fermée entre l'installation et la publication, la
+    ligne lit « Installée, publication à faire » et « Reprendre » publie.
 88. **Bornes du retour arrière.** **[cible]** (gateway cible). Pendant « Recouvrement
     jusqu'au … », « Revenir à l'ancienne identité ». Durée 0 : « Durée : de 1 à 168
     heures ». Motif vide, puis un motif de 201 caractères : « Motif : de 1 à 200
@@ -1329,8 +1332,13 @@ attendu.
     remplaçant, puis la révocation. » ; la première série porte le libellé « Identité de
     remplacement de la gateway, avant sa révocation » ; la seconde affiche
     « empreinte du remplaçant ».
-92. **Révocation refusée pendant un recouvrement CA-PQ.** **[cible]** (gateway cible).
-    Pendant un recouvrement, « Avec remplaçant ». Attendu, avant toute clé : « le
+92. **Révocation avec remplaçant refusée pendant une transition ou un recouvrement.**
+    **[cible]** (gateway cible). Sur la ligne « Bascule le … » ou « Recouvrement jusqu'au
+    … », « Révoquer la gateway », un motif. Attendu : « Avec remplaçant » est
+    désactivé, avec « Une transition est en cours : le remplaçant n'est possible qu'après
+    sa fin. » ; aucun des deux choix n'est présélectionné et rien n'est lancé ; « Sans
+    remplaçant » garde sa seconde confirmation. Pendant un recouvrement `CA-PQ` (hors de
+    ces deux lignes), « Avec remplaçant ». Attendu, avant toute clé : « le
     remplacement de la gateway est possible après le … » ou « … attend la fin du
     recouvrement de CA-PQ » ; et « La révocation sans remplaçant reste possible. ».
 93. **Révocation sans remplaçant.** **[cible]** (clés réelles, gateway cible). « Sans

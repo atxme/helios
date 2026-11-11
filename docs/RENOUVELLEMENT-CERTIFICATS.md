@@ -580,7 +580,9 @@ reconstruire le domaine. Le champ `replacement_transition_fingerprint` du
 **Dans Orion (chemin par défaut, lot 6b).** Onglet *Rotations*, bloc « Identité
 de la gateway », bouton « Révoquer la gateway ». Le motif est celui du poste
 (§7) : « Volé ou perdu », « Compromis », « Plus utilisé » ou « Remplacé ». Puis
-le remplaçant : « Avec remplaçant » (par défaut) ou « Sans remplaçant ».
+le remplaçant : « Avec remplaçant » (par défaut) ou « Sans remplaçant ». Pendant
+« Bascule le … » et « Recouvrement jusqu'au … », rien n'est présélectionné (voir
+« Refus avant toute clé »).
 
 - **Avec remplaçant : deux séries de touches**, annoncées avant de commencer
   (« Deux séries de touches : le remplaçant, puis la révocation. »).
@@ -599,6 +601,22 @@ le remplaçant : « Avec remplaçant » (par défaut) ou « Sans remplaçant ».
 
 **Refus avant toute clé.**
 
+- **Pas de remplaçant pendant une transition.** `heliosd` ne prépare aucune demande
+  tant qu'une transition gateway est installée, en attente d'activation ou en
+  recouvrement. Pendant « Bascule le … » et « Recouvrement jusqu'au … », Orion
+  désactive donc « Avec remplaçant » et écrit : « Une transition est en cours : le
+  remplaçant n'est possible qu'après sa fin. ». Aucun choix n'est présélectionné ;
+  « Sans remplaçant » reste possible, avec sa seconde confirmation, et n'est jamais
+  pris par défaut.
+- **Demande déjà préparée avec d'autres options.** La gateway garde sa demande
+  préparée jusqu'à son expiration, et la rend telle quelle. Le remplaçant se prépare
+  avec la perte de clé et la feuille TLS ; si une demande gardée a d'autres options,
+  Orion refuse avant d'ouvrir la campagne : « la demande déjà préparée par la gateway
+  diffère des options choisies : la feuille TLS candidate. Elle reste valable
+  jusqu'au …. Attendre son expiration, ou reprendre avec les mêmes options. Rien n'a
+  été signé. » (la cause est « la feuille TLS candidate », « la perte de clé » ou
+  « la feuille TLS candidate et la perte de clé »). Aucune nouvelle clé n'est
+  demandée de façon implicite.
 - Pendant un recouvrement `CA-PQ`, le remplaçant est refusé, avec la date de fin
   du recouvrement quand elle est connue : « le remplacement de la gateway est
   possible après le …. La révocation sans remplaçant reste possible. ». Si la fin
@@ -656,8 +674,9 @@ Orion continue d'afficher le registre jusqu'à la reconstruction du domaine.
   servira plus, et le domaine doit être reconstruit.
 - **Publication refusée définitivement** : une décision de renouvellement installée
   sur la gateway, dont la publication est refusée pour de bon (`carry`,
-  `gateway_identity.rs:677-679`). Le registre reste, installé et non publié : ni
-  reprise qui aboutisse, ni jet.
+  `gateway_identity.rs`). Le registre reste, installé et non publié : ni reprise qui
+  aboutisse, ni jet. « Annuler » en est l'issue tant que l'activation n'est pas
+  atteinte : l'annulation remplace ce registre.
 
 **Recours en ligne de commande** (jusqu'au lot 7). Les quatre étapes suivantes
 sont celles de la machine à états, en commandes.
@@ -741,8 +760,10 @@ validité 365 jours. « Continuer » lance la cérémonie. Les prérequis sont c
 Déroulé :
 
 1. **Refus avant toute clé** : une décision ou une révocation en attente, une
-   transition gateway déjà en cours, ou un recouvrement `CA-PQ` (le bouton est
-   alors désactivé, avec « Recouvrement CA-PQ en cours »).
+   transition gateway déjà en cours, un recouvrement `CA-PQ` (le bouton est
+   alors désactivé, avec « Recouvrement CA-PQ en cours »), ou une demande déjà
+   préparée par la gateway avec d'autres options (« la demande déjà préparée par la
+   gateway diffère des options choisies : … Rien n'a été signé. », voir §7.1).
 2. **Préparation et campagne.** La gateway prépare sa demande sur sa clé scellée,
    sans nouvelle clé (`new_key` est toujours faux). Astra ouvre la campagne
    `gateway_identity` par le tunnel. Orion vérifie, avant la première clé, que la
@@ -777,11 +798,11 @@ ne demande aucune clé.
 | À faire | une échéance de feuille gateway est à moins de 30 jours. « Renouveler », « Révoquer la gateway » |
 | Échéance le … | la plus proche des deux échéances, au-delà de 30 jours. « Renouveler », « Révoquer la gateway » |
 | Échéance inconnue | aucune échéance lue. « Renouveler », « Révoquer la gateway » |
-| Installée, publication à faire | transition installée, non publiée. « Annuler » tant que l'activation n'est pas atteinte |
+| Installée, publication à faire | transition installée, non publiée. « Annuler » tant que l'activation n'est pas atteinte (l'annulation remplace la décision de renouvellement en attente, pour l'époque en attente) ; avec une décision en attente : aussi « Reprendre » et « Jeter la décision en attente » (ce dernier est refusé, voir ci-dessous) |
 | Décision à reprendre | décision en attente non installée. « Reprendre », « Jeter la décision en attente » |
 | Annulation à reprendre | annulation en attente. « Reprendre », « Jeter la décision en attente » ; jamais une nouvelle annulation |
-| Bascule le … | publiée, avant l'activation. « Révoquer la gateway » |
-| Recouvrement jusqu'au … | l'ancienne et la nouvelle identité servent. « Revenir à l'ancienne identité », « Révoquer la gateway » |
+| Bascule le … | publiée, avant l'activation. « Révoquer la gateway », sans remplaçant : « Avec remplaçant » est désactivé (§7.1) |
+| Recouvrement jusqu'au … | l'ancienne et la nouvelle identité servent. « Revenir à l'ancienne identité », « Révoquer la gateway », sans remplaçant : « Avec remplaçant » est désactivé (§7.1) |
 | Révocation à signer | remplaçant déposé, révocation à signer. « Révoquer la gateway », « Jeter la décision en attente » |
 | Révocation à reprendre | révocation en attente, non appliquée. « Reprendre », « Jeter la décision en attente » |
 | Révocation appliquée, reprise à faire | révocation appliquée, remplaçant à installer. « Reprendre », « Jeter la décision en attente » |
@@ -909,8 +930,14 @@ install-gateway-transition`), et la décision est aussi déposée chez Astra.
 **Puis, une fois l'installation faite** :
 
 ```sh
-astra gateway-identity publish --epoch <n>
+astra gateway-identity publish --epoch <n> --transition <empreinte>
 ```
+
+La publication nomme la transition par son empreinte (64 caractères hexadécimaux), et
+non par la seule époque : deux transitions peuvent être conservées à la même époque
+(un dépôt dont la réponse s'est perdue, déposé de nouveau), et la marque est
+irréversible. Astra ne publie que celle dont l'empreinte est donnée, et refuse si
+aucune ne l'a. Orion envoie l'empreinte de la transition qu'il vient d'installer.
 
 C'est l'étape 6, et le dernier instant où un avortement est encore légitime
 est **avant** cette commande. Après, un client peut détenir la décision,
