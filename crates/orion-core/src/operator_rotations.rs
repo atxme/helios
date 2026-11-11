@@ -24,6 +24,7 @@
 
 use std::time::Duration;
 
+use aether::certificates::status::CampaignScope;
 use aether::certificates::transport::OperatorAuthorityStatus;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
@@ -175,6 +176,20 @@ pub struct AuthorityStatusRead {
     /// it is verified before any decision rests on it.
     #[serde(default)]
     pub served_credentials: Option<serde_json::Value>,
+    /// The certificate chain Astra has open. Absent from an Astra older than
+    /// the chain, which reads as no chain.
+    #[serde(default)]
+    pub chain: Option<ChainViewRead>,
+}
+
+/// The chain the status names: its steps by scope name, the step awaiting its
+/// effect, and the campaign deposited for it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChainViewRead {
+    pub steps: Vec<String>,
+    pub current: usize,
+    #[serde(default)]
+    pub operation_id: Option<String>,
 }
 
 /// The delegation, as the status reports it.
@@ -216,8 +231,22 @@ impl From<OperatorAuthorityStatus> for AuthorityStatusRead {
             served_credentials: status
                 .served_credentials
                 .and_then(|document| serde_json::to_value(*document).ok()),
+            chain: status.chain.map(|chain| ChainViewRead {
+                steps: chain.steps.into_iter().map(scope_name).collect(),
+                current: chain.current,
+                operation_id: chain.operation_id.map(|id| id.to_hex()),
+            }),
         }
     }
+}
+
+/// A campaign scope's wire name, as the status and the pending list carry it.
+/// Empty only if a unit variant fails to encode, which it cannot.
+fn scope_name(scope: CampaignScope) -> String {
+    serde_json::to_value(scope)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_default()
 }
 
 /// One operation waiting for an operator, as the list names it. No capability token.

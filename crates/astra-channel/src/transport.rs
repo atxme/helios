@@ -43,6 +43,10 @@ pub enum ChannelError {
     Status(StatusCode),
     /// The answer was not the object this route returns.
     Body(String),
+    /// The authority refused the step in progress with its own sentence, which
+    /// names what has not happened yet (F14 lot 6b). The sentence is the
+    /// operator's to read, so it is kept rather than reduced to a status.
+    Plan(String),
 }
 
 impl std::fmt::Display for ChannelError {
@@ -53,6 +57,7 @@ impl std::fmt::Display for ChannelError {
             Self::Io(error) => write!(formatter, "private channel input/output: {error}"),
             Self::Status(status) => write!(formatter, "private channel answered {status}"),
             Self::Body(reason) => write!(formatter, "private channel answer: {reason}"),
+            Self::Plan(reason) => write!(formatter, "private channel refused the step: {reason}"),
         }
     }
 }
@@ -472,6 +477,25 @@ impl PinnedHttpClient {
         bearer: Option<&str>,
         max_answer_bytes: usize,
     ) -> Result<Bytes, ChannelError> {
+        let (status, answer) = self
+            .exchange(method, path, body, bearer, max_answer_bytes)
+            .await?;
+        if !status.is_success() {
+            return Err(ChannelError::Status(status));
+        }
+        Ok(answer)
+    }
+
+    /// One request, and the status and the bounded body it answered with,
+    /// whatever the status. For the routes whose refusal carries a sentence.
+    pub(super) async fn exchange(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Vec<u8>>,
+        bearer: Option<&str>,
+        max_answer_bytes: usize,
+    ) -> Result<(StatusCode, Bytes), ChannelError> {
         use http_body_util::BodyExt as _;
         use hyper_util::rt::TokioIo;
 
@@ -519,10 +543,7 @@ impl PinnedHttpClient {
             .to_bytes();
         drop(sender);
         driver.abort();
-        if !status.is_success() {
-            return Err(ChannelError::Status(status));
-        }
-        Ok(collected)
+        Ok((status, collected))
     }
 }
 

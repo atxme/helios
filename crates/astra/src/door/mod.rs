@@ -40,6 +40,7 @@
 //! running service holds for its whole life (§5.9).
 
 mod chain;
+pub(crate) use chain::chain_view;
 mod issuer;
 pub mod local;
 mod lock;
@@ -431,10 +432,7 @@ pub enum DoorRefusal {
     NoChain,
     #[error("cette chaîne est terminée : il ne reste rien à ouvrir")]
     ChainFinished,
-    #[error(
-        "l'étape en cours n'a pas pris effet ({0}) : l'approuver avant d'avancer, ou abandonner la \
-         chaîne"
-    )]
+    #[error("{0}. Approuver cette étape avant d'avancer, ou abandonner la chaîne.")]
     ChainStepIncomplete(String),
     #[error(
         "ce domaine n'épingle aucune CA TLS cliente : `pin-ca-tls` l'enregistre une fois, et une \

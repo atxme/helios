@@ -17,8 +17,9 @@ use aether::certificates::encoding::{
 };
 use aether::certificates::transport::{
     ClientRenewalOperationState, ClientRenewalOperationView, ClientRenewalSignerRequest,
-    OperatorAuthorityStatus, OperatorGatewayPublish, OperatorGatewayPublished, OperatorOpenAction,
-    OperatorOpenRequest, OperatorOpened, OperatorVaultCopied, OperatorVaultCopy,
+    OperatorAuthorityStatus, OperatorChainStep, OperatorGatewayPublish, OperatorGatewayPublished,
+    OperatorOpenAction, OperatorOpenRequest, OperatorOpened, OperatorVaultCopied,
+    OperatorVaultCopy,
 };
 use aether::certificates::window::TransitionWindow;
 use astra_operator::rotation_journal::RotationKind;
@@ -504,6 +505,7 @@ fn a_campaign_opens_on_the_operator_route() {
 #[test]
 fn the_authority_status_is_read_on_the_operator_route() {
     let status = OperatorAuthorityStatus {
+        chain: None,
         ca_epoch: 1,
         ca_fingerprint: Fingerprint::of(b"ca"),
         next_ca_fingerprint: None,
@@ -1130,4 +1132,51 @@ fn a_ca_installation_acknowledged_with_an_empty_answer_succeeds() {
         stub.next().path,
         "/api/certificates/client-tls-ca-transition"
     );
+}
+
+/// The next step goes to its route, and a finished chain is an answer, not a
+/// failure.
+#[test]
+fn chain_next_posts_to_its_route_and_reads_the_outcome() {
+    let stub = Stub::serving(vec![(200, r#"{"outcome":"finished"}"#.to_string())]);
+    let answer = Tunnel::new(&stub.base)
+        .expect("tunnel")
+        .chain_next()
+        .expect("answered");
+    assert_eq!(answer, OperatorChainStep::Finished);
+
+    let seen = stub.next();
+    assert_eq!(seen.method, "POST");
+    assert_eq!(seen.path, "/api/certificates/operator/chain/next");
+}
+
+/// A step not yet in effect reaches the operator with Astra's sentence, not as
+/// a bare refusal.
+#[test]
+fn chain_next_names_the_step_that_has_not_taken_effect() {
+    let stub = Stub::serving(vec![(
+        409,
+        r#"{"message":"l'étape 2 (trust_authorities (CA-TLS)) n'a pas pris effet"}"#.to_string(),
+    )]);
+    let error = Tunnel::new(&stub.base)
+        .expect("tunnel")
+        .chain_next()
+        .expect_err("refused");
+    assert!(
+        format!("{error:#}").contains("n'a pas pris effet"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn chain_abandon_posts_to_its_route() {
+    let stub = Stub::serving(vec![(204, String::new())]);
+    Tunnel::new(&stub.base)
+        .expect("tunnel")
+        .chain_abandon()
+        .expect("abandoned");
+
+    let seen = stub.next();
+    assert_eq!(seen.method, "POST");
+    assert_eq!(seen.path, "/api/certificates/operator/chain/abandon");
 }

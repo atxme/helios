@@ -235,6 +235,7 @@ mod tests {
             credential_registry_epoch: None,
             revoked_peers,
             served_credentials: None,
+            chain: None,
         }
     }
 

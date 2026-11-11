@@ -804,6 +804,38 @@ impl helios_api::certificates::OperatorCampaignRelay for AstraRenewalRelay {
             .map_err(|error| Self::refuse("operator-gateway-publish", error))
     }
 
+    /// Relays the next chain step to Astra's door, for the administrator it
+    /// came through. A step not yet in effect keeps the sentence Astra gave,
+    /// which the operator reads; any other failure is its class.
+    async fn chain_next(
+        &self,
+        operator: &::astra_channel::OperatorIdentity,
+    ) -> Result<::astra_channel::OperatorChainStep, helios_api::certificates::ChainRefusal> {
+        use helios_api::certificates::ChainRefusal;
+        self.client
+            .operator_chain_next(&::astra_channel::RelayedOperatorCampaign {
+                operator: operator.clone(),
+            })
+            .await
+            .map_err(|error| match error {
+                ::astra_channel::ChannelError::Plan(reason) => ChainRefusal::Reason(reason),
+                error => ChainRefusal::Class(Self::refuse("operator-chain-next", error)),
+            })
+    }
+
+    /// Relays the abandonment of the chain's plan to Astra's door.
+    async fn chain_abandon(
+        &self,
+        operator: &::astra_channel::OperatorIdentity,
+    ) -> Result<(), helios_api::certificates::TrustUpdateRefusal> {
+        self.client
+            .operator_chain_abandon(&::astra_channel::RelayedOperatorCampaign {
+                operator: operator.clone(),
+            })
+            .await
+            .map_err(|error| Self::refuse("operator-chain-abandon", error))
+    }
+
     /// Relays an opening to Astra's door, with the administrator it came
     /// through. The door decides what the tunnel may open; this end only
     /// carries the request and maps the answer onto its coarse class.

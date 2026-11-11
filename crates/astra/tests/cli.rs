@@ -279,7 +279,7 @@ fn chain_status_reads_a_registry_that_needs_migration_without_writing_it() {
         String::from_utf8_lossy(&current.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&current.stderr).contains("has not taken effect yet"),
+        String::from_utf8_lossy(&current.stderr).contains("n'a pas pris effet"),
         "the registry was read for the deposited step: {}",
         String::from_utf8_lossy(&current.stderr)
     );

@@ -15,6 +15,8 @@ struct RecordingRelay {
     calls: Mutex<Vec<Call>>,
     refusal: Option<TrustUpdateRefusal>,
     deposited: Mutex<Option<AstraSignerResult>>,
+    /// The sentence a chain step is refused with, when a test sets one.
+    chain_reason: Mutex<Option<String>>,
 }
 impl RecordingRelay {
     fn new(refusal: Option<TrustUpdateRefusal>) -> Arc<Self> {
@@ -22,6 +24,7 @@ impl RecordingRelay {
             calls: Mutex::new(Vec::new()),
             deposited: Mutex::new(None),
             refusal,
+            chain_reason: Mutex::new(None),
         })
     }
     fn record(
@@ -133,6 +136,66 @@ impl OperatorCampaignRelay for RecordingRelay {
         self.record("open", operator, String::new(), "")?;
         Err(TrustUpdateRefusal::Rejected)
     }
+    async fn chain_next(
+        &self,
+        operator: &astra_channel::OperatorIdentity,
+    ) -> Result<astra_channel::OperatorChainStep, ChainRefusal> {
+        self.record("chain-next", operator, String::new(), "")
+            .map_err(ChainRefusal::Class)?;
+        match self.chain_reason.lock().unwrap().clone() {
+            Some(reason) => Err(ChainRefusal::Reason(reason)),
+            None => Ok(astra_channel::OperatorChainStep::Finished),
+        }
+    }
+    async fn chain_abandon(
+        &self,
+        operator: &astra_channel::OperatorIdentity,
+    ) -> Result<(), TrustUpdateRefusal> {
+        self.record("chain-abandon", operator, String::new(), "")
+    }
+}
+
+/// A chain step that has not taken effect is refused with its sentence in a
+/// `409` body, and the relay is asked once; a finished chain answers `200`.
+#[tokio::test]
+async fn chain_next_carries_a_step_refusal_with_its_reason() {
+    let relay = RecordingRelay::new(None);
+    *relay.chain_reason.lock().unwrap() = Some("l'étape 1 n'a pas pris effet".into());
+    let response =
+        operator_chain_next(State(state(&relay)), Extension(operator_caller_at(true))).await;
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+        serde_json::json!({ "message": "l'étape 1 n'a pas pris effet" })
+    );
+    assert_eq!(
+        *relay.calls.lock().unwrap(),
+        vec![Call {
+            route: "chain-next",
+            operator: expected_operator(),
+            id: String::new(),
+            token: String::new(),
+        }]
+    );
+}
+
+#[tokio::test]
+async fn chain_next_answers_its_outcome_and_abandon_answers_no_content() {
+    let relay = RecordingRelay::new(None);
+    let response =
+        operator_chain_next(State(state(&relay)), Extension(operator_caller_at(true))).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+        serde_json::json!({ "outcome": "finished" })
+    );
+
+    let response =
+        operator_chain_abandon(State(state(&relay)), Extension(operator_caller_at(true))).await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
 }
 
 /// The publication is relayed once, with the epoch and no capability token,

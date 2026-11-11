@@ -354,6 +354,7 @@ pub fn nothing_in_flight(vault_path: &Path) -> OperatorAuthorityStatus {
     let client_tls = DerCertificate::parse(relay.ca_tls_certificate.as_ref().expect("CA-TLS"))
         .expect("certificate");
     OperatorAuthorityStatus {
+        chain: None,
         ca_epoch: identity.ca_epoch,
         ca_fingerprint: anchor.authority_fingerprint(),
         next_ca_fingerprint: None,

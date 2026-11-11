@@ -8,8 +8,10 @@ use std::net::SocketAddr;
 use std::time::{Duration, SystemTime};
 
 use astra_channel::{
-    OperatorGatewayPublish, OperatorGatewayPublished, OperatorOpenAction, OperatorOpenRequest,
-    RelayedOperatorGatewayPublish, RelayedOperatorOpen, OPERATOR_GATEWAY_PUBLISH_ROUTE,
+    OperatorChainRefusal, OperatorChainStep, OperatorGatewayPublish, OperatorGatewayPublished,
+    OperatorOpenAction, OperatorOpenRequest, RelayedOperatorCampaign,
+    RelayedOperatorGatewayPublish, RelayedOperatorOpen, OPERATOR_CHAIN_ABANDON_ROUTE,
+    OPERATOR_CHAIN_NEXT_ROUTE, OPERATOR_GATEWAY_PUBLISH_ROUTE,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -1099,4 +1101,176 @@ async fn publish_whose_relay_is_refused_answers_not_relayed() {
         }
     );
     assert!(published_on_disk(dir.path()));
+}
+
+fn relayed_administrator() -> Vec<u8> {
+    serde_json::to_vec(&RelayedOperatorCampaign {
+        operator: administrator(),
+    })
+    .expect("relayed campaign read")
+}
+
+/// The chain the tunnel opens, as the tunnel reads it back.
+fn chain_answer(body: &[u8]) -> OperatorChainStep {
+    serde_json::from_slice(body).expect("the chain's answer")
+}
+
+/// Rewrites the plan on disk, the way the registry effects of a step are
+/// stood in for: the issuer and the gateway cannot be produced in a test.
+fn rewrite_plan(dir: &Path, edit: impl FnOnce(&mut crate::chain::ChainPlan)) {
+    let mut plan = read_plan(dir);
+    edit(&mut plan);
+    std::fs::write(plan_path(dir), serde_json::to_vec(&plan).expect("encodes"))
+        .expect("plan rewritten");
+}
+
+/// Open, then advance through each step over the tunnel until the plan is
+/// finished. The steps whose effect needs a companion or a live gateway are
+/// taken as landed by rewriting the plan, as the door's own tests do.
+#[tokio::test]
+async fn chain_runs_through_the_tunnel() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture_with_ca_tls(dir.path());
+    let listener = listen(Arc::clone(&service)).await;
+
+    let (status, body) =
+        post_open(&listener, &relayed_opening(OperatorOpenAction::ChainOpen)).await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+
+    rewrite_plan(dir.path(), |plan| {
+        plan.steps[0].effect = crate::chain::ChainEffect::SpentByPeers;
+    });
+    let (status, body) = post_to(
+        &listener,
+        OPERATOR_CHAIN_NEXT_ROUTE,
+        &relayed_administrator(),
+    )
+    .await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let OperatorChainStep::Opened(second) = chain_answer(&body) else {
+        panic!("the second step opens");
+    };
+    assert_eq!(second.scope, CampaignScope::TrustAuthorities);
+
+    // The gateway step needs a live gateway: its deposit and effect are
+    // stood in for, and the next step is the fleet's.
+    rewrite_plan(dir.path(), |plan| {
+        plan.steps[1].effect = crate::chain::ChainEffect::SpentByPeers;
+        plan.current = 2;
+        plan.steps[2].operation_id = Some(Id16::new([9; 16]).expect("id"));
+        plan.steps[2].effect = crate::chain::ChainEffect::SpentByPeers;
+    });
+    let (status, body) = post_to(
+        &listener,
+        OPERATOR_CHAIN_NEXT_ROUTE,
+        &relayed_administrator(),
+    )
+    .await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let OperatorChainStep::Opened(fleet) = chain_answer(&body) else {
+        panic!("the fleet step opens");
+    };
+    assert_eq!(fleet.scope, CampaignScope::FleetLeafs);
+
+    // The fleet's effect is spent by the peers: the next answer finishes.
+    let (status, body) = post_to(
+        &listener,
+        OPERATOR_CHAIN_NEXT_ROUTE,
+        &relayed_administrator(),
+    )
+    .await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(chain_answer(&body), OperatorChainStep::Finished);
+    assert!(!plan_path(dir.path()).exists());
+}
+
+/// A step whose campaign was deposited and whose effect is not visible yet
+/// refuses with its reason in the body, not as a bare refusal.
+#[tokio::test]
+async fn chain_next_refuses_until_the_effect_lands_with_a_reason() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture(dir.path());
+    let listener = listen(Arc::clone(&service)).await;
+
+    let (status, _) = post_open(&listener, &relayed_opening(OperatorOpenAction::ChainOpen)).await;
+    assert_eq!(status, 200);
+
+    let (status, body) = post_to(
+        &listener,
+        OPERATOR_CHAIN_NEXT_ROUTE,
+        &relayed_administrator(),
+    )
+    .await;
+    assert_eq!(status, 409, "{}", String::from_utf8_lossy(&body));
+    let refusal: OperatorChainRefusal = serde_json::from_slice(&body).expect("the reason");
+    assert!(
+        refusal.message.contains("n'a pas pris effet"),
+        "{}",
+        refusal.message
+    );
+    assert_eq!(read_plan(dir.path()).current, 0);
+}
+
+/// The status names the open chain: its steps, the one awaiting its effect,
+/// and the campaign waiting for its operator.
+#[tokio::test]
+async fn status_names_the_chain() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture(dir.path());
+    let listener = listen(Arc::clone(&service)).await;
+
+    let (status, body) =
+        post_open(&listener, &relayed_opening(OperatorOpenAction::ChainOpen)).await;
+    assert_eq!(status, 200);
+    let opened: OperatorOpened = serde_json::from_slice(&body).expect("the opening");
+
+    let (status, body) = read_status(&listener).await;
+    assert_eq!(status, 200);
+    let report: astra_channel::OperatorAuthorityStatus =
+        serde_json::from_slice(&body).expect("the status");
+    let chain = report.chain.expect("the status names the chain");
+    assert_eq!(
+        chain.steps,
+        vec![
+            CampaignScope::IssuerDelegation,
+            CampaignScope::TrustAuthorities,
+            CampaignScope::GatewayIdentity,
+            CampaignScope::FleetLeafs,
+        ]
+    );
+    assert_eq!(chain.current, 0);
+    assert_eq!(chain.operation_id, Some(opened.operation_id));
+}
+
+/// Abandoning drops the plan over the tunnel, and a second abandon finds none.
+#[tokio::test]
+async fn abandon_drops_the_plan() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture(dir.path());
+    let listener = listen(Arc::clone(&service)).await;
+
+    let (status, _) = post_open(&listener, &relayed_opening(OperatorOpenAction::ChainOpen)).await;
+    assert_eq!(status, 200);
+
+    let (status, body) = post_to(
+        &listener,
+        OPERATOR_CHAIN_ABANDON_ROUTE,
+        &relayed_administrator(),
+    )
+    .await;
+    assert_eq!(status, 204, "{}", String::from_utf8_lossy(&body));
+    assert!(!plan_path(dir.path()).exists());
+
+    let (_, body) = read_status(&listener).await;
+    let report: astra_channel::OperatorAuthorityStatus =
+        serde_json::from_slice(&body).expect("the status");
+    assert_eq!(report.chain, None);
+
+    let (status, _) = post_to(
+        &listener,
+        OPERATOR_CHAIN_ABANDON_ROUTE,
+        &relayed_administrator(),
+    )
+    .await;
+    assert_eq!(status, 403);
 }

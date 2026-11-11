@@ -663,6 +663,7 @@ impl Bench {
             credential_registry_epoch: None,
             revoked_peers: Vec::new(),
             served_credentials: None,
+            chain: None,
         }
     }
 

@@ -175,6 +175,7 @@ async fn the_domain_read_shows_neither_a_peer_name_nor_a_peer_key() {
 #[tokio::test]
 async fn the_authority_status_keeps_none_distinct_from_zero() {
     let status = OperatorAuthorityStatus {
+        chain: None,
         ca_epoch: 1,
         ca_fingerprint: Fingerprint::of(b"a"),
         next_ca_fingerprint: None,
@@ -236,6 +237,7 @@ async fn a_refusal_is_told_apart_from_a_gateway_that_does_not_answer() {
 #[tokio::test]
 async fn an_authority_status_that_gains_a_field_still_reads() {
     let mut status = serde_json::to_value(OperatorAuthorityStatus {
+        chain: None,
         ca_epoch: 4,
         ca_fingerprint: Fingerprint::of(b"a"),
         next_ca_fingerprint: None,
@@ -312,6 +314,7 @@ async fn revoked_peers_are_left_out_and_the_gateways_clock_is_kept() {
 #[tokio::test]
 async fn status_read_tolerates_the_new_fields() {
     let base = serde_json::to_value(OperatorAuthorityStatus {
+        chain: None,
         ca_epoch: 4,
         ca_fingerprint: Fingerprint::of(b"a"),
         next_ca_fingerprint: None,

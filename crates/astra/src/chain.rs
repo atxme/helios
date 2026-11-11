@@ -55,10 +55,7 @@ pub enum ChainError {
     NoPlan,
     #[error("a certificate chain is already open: {0} steps remain")]
     AlreadyOpen(usize),
-    #[error(
-        "step {step} ({scope}) has not taken effect yet: {expected}. Approve it before advancing, \
-         or abandon the chain."
-    )]
+    #[error("l'étape {step} ({scope}) n'a pas pris effet : {expected}")]
     StepIncomplete {
         step: usize,
         scope: &'static str,
@@ -93,16 +90,16 @@ impl ChainEffect {
     pub fn expected(&self) -> String {
         match self {
             Self::IssuerEpochAbove { issuer_epoch } => {
-                format!("the delegated issuer is still at epoch {issuer_epoch}")
+                format!("la délégation émise est encore à l'époque {issuer_epoch}")
             }
             Self::ClientTlsCaSucceeds { ca_tls_epoch } => {
-                format!("the client TLS anchor is still alone at epoch {ca_tls_epoch}")
+                format!("l'ancre CA TLS cliente est encore seule à l'époque {ca_tls_epoch}")
             }
             Self::GatewayDecisionStored { campaign_id } => format!(
-                "no gateway identity decision was stored for campaign {}",
+                "aucune décision d'identité gateway n'a été enregistrée pour la campagne {}",
                 campaign_id.to_hex()
             ),
-            Self::SpentByPeers => "nothing is observed for this step".to_string(),
+            Self::SpentByPeers => "rien n'est observé pour cette étape".to_string(),
         }
     }
 }
@@ -449,7 +446,7 @@ mod tests {
         assert!(plan.steps[3]
             .effect
             .expected()
-            .contains("nothing is observed"));
+            .contains("rien n'est observé"));
     }
 
     fn issuer_authorization() -> aether::certificates::authority::AstraIssuerAuthorization {

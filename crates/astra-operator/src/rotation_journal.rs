@@ -1167,6 +1167,7 @@ mod tests {
 
     fn authority() -> OperatorAuthorityStatus {
         OperatorAuthorityStatus {
+            chain: None,
             ca_epoch: 1,
             ca_fingerprint: Fingerprint::of(b"ancre sortante"),
             next_ca_fingerprint: None,

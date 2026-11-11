@@ -365,6 +365,14 @@ pub fn router(state: AppState) -> Router {
                 astra_channel::MAX_OPERATOR_REQUEST_BYTES,
             )),
         )
+        .route(
+            "/api/certificates/operator/chain/next",
+            post(certificates::operator_chain_next),
+        )
+        .route(
+            "/api/certificates/operator/chain/abandon",
+            post(certificates::operator_chain_abandon),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_admin,

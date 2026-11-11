@@ -214,6 +214,7 @@ fn with_authority(status: OperatorAuthorityStatus) -> ResumeFacts {
 
 fn nothing_in_flight() -> OperatorAuthorityStatus {
     OperatorAuthorityStatus {
+        chain: None,
         ca_epoch: 1,
         ca_fingerprint: Fingerprint::of(b"ca en service"),
         next_ca_fingerprint: None,

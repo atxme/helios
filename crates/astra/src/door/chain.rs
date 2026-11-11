@@ -23,6 +23,7 @@ use std::time::Duration;
 
 use crate::chain::{ChainError, ChainPlan};
 use aether::certificates::status::CampaignScope;
+use aether::certificates::transport::OperatorChainView;
 
 use super::open::{self, Resolved};
 use super::{
@@ -53,6 +54,21 @@ fn load_plan(service: &AstraService) -> Result<Option<ChainPlan>, DoorRefusal> {
         DoorRefusal::Internal
     })?;
     Ok(Some(plan))
+}
+
+/// The chain the status names: its steps, the step awaiting its effect, and
+/// the campaign deposited for it. A plan that cannot be read is logged by
+/// `load_plan` and reads as no chain, so the status still answers.
+pub(crate) fn chain_view(service: &AstraService) -> Option<OperatorChainView> {
+    let plan = load_plan(service).ok()??;
+    Some(OperatorChainView {
+        steps: plan.steps.iter().map(|step| step.scope).collect(),
+        current: plan.current,
+        operation_id: plan
+            .steps
+            .get(plan.current)
+            .and_then(|step| step.operation_id),
+    })
 }
 
 /// Writes the plan where a crash leaves either the old one or the new one.

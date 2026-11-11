@@ -55,6 +55,12 @@ pub const OPERATOR_VAULT_COPY_ROUTE: &str = "/internal/v1/operator/vault-copy";
 /// Publishes the signed gateway transition of an epoch, for an administrator
 /// relayed from the tunnel (F14 lot 6b).
 pub const OPERATOR_GATEWAY_PUBLISH_ROUTE: &str = "/internal/v1/operator/gateway-identity/publish";
+/// Opens the next step of the certificate chain, once the previous one has
+/// taken effect, for an administrator relayed from the tunnel (F14 lot 6b).
+pub const OPERATOR_CHAIN_NEXT_ROUTE: &str = "/internal/v1/operator/chain/next";
+/// Drops the certificate chain's plan, for an administrator relayed from the
+/// tunnel (F14 lot 6b). Campaigns already approved keep their effect.
+pub const OPERATOR_CHAIN_ABANDON_ROUTE: &str = "/internal/v1/operator/chain/abandon";
 /// Opens a campaign for an administrator relayed from the tunnel. Carries no
 /// capability token: opening grants nothing, the operator's credential does.
 pub const OPERATOR_OPEN_ROUTE: &str = "/internal/v1/operator/campaigns";
@@ -205,11 +211,11 @@ pub struct RelayedOperatorGatewayPublish {
 
 /// The operator shapes both ends parse, defined once in `aether`.
 pub use aether::certificates::transport::{
-    OperatorAuthorityStatus, OperatorGatewayPublish, OperatorGatewayPublished,
-    OperatorIssuerStatus, OperatorOpenAction, OperatorOpenRequest, OperatorOpened,
-    OperatorPendingList, OperatorPendingOperation, OperatorSignerRequestResponse,
-    OperatorVaultCopied, OperatorVaultCopy, RevocationExpiries, SigningOperationState,
-    SigningOperationView,
+    OperatorAuthorityStatus, OperatorChainRefusal, OperatorChainStep, OperatorChainView,
+    OperatorGatewayPublish, OperatorGatewayPublished, OperatorIssuerStatus, OperatorOpenAction,
+    OperatorOpenRequest, OperatorOpened, OperatorPendingList, OperatorPendingOperation,
+    OperatorSignerRequestResponse, OperatorVaultCopied, OperatorVaultCopy, RevocationExpiries,
+    SigningOperationState, SigningOperationView,
 };
 
 /// The name the gateway puts in SNI when it dials Astra.

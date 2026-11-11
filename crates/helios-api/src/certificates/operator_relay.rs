@@ -3,6 +3,15 @@
 
 use super::*;
 
+/// Why a chain step was not opened: a coarse class, like every relayed answer,
+/// or the sentence of a step that has not taken effect yet, which the operator
+/// has to read to know what to do (F14 lot 6b).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChainRefusal {
+    Class(TrustUpdateRefusal),
+    Reason(String),
+}
+
 /// The gateway's half of the in-tunnel operator campaign (spec §8.5).
 ///
 /// One operation per surface Astra's public origin exposes, plus the
@@ -99,6 +108,19 @@ pub trait OperatorCampaignRelay: Send + Sync {
         operator: &astra_channel::OperatorIdentity,
         request: astra_channel::OperatorOpenRequest,
     ) -> Result<astra_channel::OperatorOpened, TrustUpdateRefusal>;
+
+    /// Asks Astra to open the next step of the certificate chain, for this
+    /// administrator (F14 lot 6b). No capability token: the step is the plan's.
+    async fn chain_next(
+        &self,
+        operator: &astra_channel::OperatorIdentity,
+    ) -> Result<astra_channel::OperatorChainStep, ChainRefusal>;
+
+    /// Asks Astra to drop the certificate chain's plan (F14 lot 6b).
+    async fn chain_abandon(
+        &self,
+        operator: &astra_channel::OperatorIdentity,
+    ) -> Result<(), TrustUpdateRefusal>;
 }
 
 /// The administrator behind an operator route, or nothing.
@@ -485,6 +507,50 @@ pub async fn operator_gateway_publish(
     };
     match relay.publish_gateway_transition(&operator, request).await {
         Ok(published) => (StatusCode::OK, Json(published)).into_response(),
+        Err(refusal) => refusal.status().into_response(),
+    }
+}
+
+/// `POST /api/certificates/operator/chain/next`.
+///
+/// The caller is an administrator before anything else is read; the route takes
+/// no body, the step is the plan's. A step that has not taken effect is a `409`
+/// with its sentence in the body, as the gateway's own gesture refusals carry
+/// theirs; any other refusal is its class.
+pub async fn operator_chain_next(
+    State(s): State<AppState>,
+    Extension(caller): Extension<crate::auth::Caller>,
+) -> Response {
+    let operator = match operator_caller(&caller, "chain-next") {
+        Ok(operator) => operator,
+        Err(status) => return status.into_response(),
+    };
+    let Some(relay) = s.operator_campaign.as_ref() else {
+        return operator_unavailable(&operator, "chain-next");
+    };
+    match relay.chain_next(&operator).await {
+        Ok(step) => (StatusCode::OK, Json(step)).into_response(),
+        Err(ChainRefusal::Class(refusal)) => refusal.status().into_response(),
+        Err(ChainRefusal::Reason(message)) => GatewayActionRefusal::new(message).into_response(),
+    }
+}
+
+/// `POST /api/certificates/operator/chain/abandon`.
+///
+/// Answers `204` on success. What was approved keeps its effect.
+pub async fn operator_chain_abandon(
+    State(s): State<AppState>,
+    Extension(caller): Extension<crate::auth::Caller>,
+) -> Response {
+    let operator = match operator_caller(&caller, "chain-abandon") {
+        Ok(operator) => operator,
+        Err(status) => return status.into_response(),
+    };
+    let Some(relay) = s.operator_campaign.as_ref() else {
+        return operator_unavailable(&operator, "chain-abandon");
+    };
+    match relay.chain_abandon(&operator).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(refusal) => refusal.status().into_response(),
     }
 }

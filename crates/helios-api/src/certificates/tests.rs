@@ -236,6 +236,22 @@ impl OperatorCampaignRelay for SpyCampaign {
         Err(TrustUpdateRefusal::Rejected)
     }
 
+    async fn chain_next(
+        &self,
+        operator: &astra_channel::OperatorIdentity,
+    ) -> Result<astra_channel::OperatorChainStep, ChainRefusal> {
+        *self.seen.lock().unwrap() = Some(operator.clone());
+        Err(ChainRefusal::Class(TrustUpdateRefusal::Rejected))
+    }
+
+    async fn chain_abandon(
+        &self,
+        operator: &astra_channel::OperatorIdentity,
+    ) -> Result<(), TrustUpdateRefusal> {
+        *self.seen.lock().unwrap() = Some(operator.clone());
+        Err(TrustUpdateRefusal::Rejected)
+    }
+
     async fn open(
         &self,
         operator: &astra_channel::OperatorIdentity,
@@ -262,6 +278,7 @@ impl OperatorCampaignRelay for SpyCampaign {
 
 fn authority_status() -> astra_channel::OperatorAuthorityStatus {
     astra_channel::OperatorAuthorityStatus {
+        chain: None,
         ca_epoch: 2,
         ca_fingerprint: Fingerprint::of(b"ca"),
         next_ca_fingerprint: None,

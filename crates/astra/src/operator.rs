@@ -36,13 +36,15 @@ use std::sync::Arc;
 
 use aether::certificates::encoding::{Fingerprint, Id16};
 use astra_channel::{
-    OperatorAuthorityStatus, OperatorGatewayPublished, OperatorIdentity, OperatorIssuerStatus,
-    OperatorVaultCopied, RelayedOperatorCampaign, RelayedOperatorGatewayPublish,
-    RelayedOperatorOpen, RelayedOperatorSignerResult, RelayedOperatorVaultCopy,
-    MAX_OPERATOR_RELAY_BODY_BYTES, MAX_OPERATOR_VAULT_COPY_RELAY_BODY_BYTES,
-    OPERATOR_GATEWAY_PUBLISH_ROUTE, OPERATOR_OPEN_ROUTE, OPERATOR_OPERATION_ROUTE,
-    OPERATOR_PENDING_ROUTE, OPERATOR_SIGNER_REQUEST_ROUTE, OPERATOR_SIGNER_RESULT_ROUTE,
-    OPERATOR_STATUS_ROUTE, OPERATOR_VAULT_COPY_ROUTE, OPERATOR_VAULT_ROUTE,
+    OperatorAuthorityStatus, OperatorChainRefusal, OperatorChainStep, OperatorGatewayPublished,
+    OperatorIdentity, OperatorIssuerStatus, OperatorVaultCopied, RelayedOperatorCampaign,
+    RelayedOperatorGatewayPublish, RelayedOperatorOpen, RelayedOperatorSignerResult,
+    RelayedOperatorVaultCopy, MAX_OPERATOR_RELAY_BODY_BYTES,
+    MAX_OPERATOR_VAULT_COPY_RELAY_BODY_BYTES, OPERATOR_CHAIN_ABANDON_ROUTE,
+    OPERATOR_CHAIN_NEXT_ROUTE, OPERATOR_GATEWAY_PUBLISH_ROUTE, OPERATOR_OPEN_ROUTE,
+    OPERATOR_OPERATION_ROUTE, OPERATOR_PENDING_ROUTE, OPERATOR_SIGNER_REQUEST_ROUTE,
+    OPERATOR_SIGNER_RESULT_ROUTE, OPERATOR_STATUS_ROUTE, OPERATOR_VAULT_COPY_ROUTE,
+    OPERATOR_VAULT_ROUTE,
 };
 use axum::{
     extract::{rejection::JsonRejection, DefaultBodyLimit, Path, State},
@@ -57,7 +59,7 @@ use crate::service::{
     AstraService, ServiceError,
 };
 
-/// The nine private operator routes, for the listener of §8.3 to merge.
+/// The eleven private operator routes, for the listener of §8.3 to merge.
 pub fn private_routes() -> Router<Arc<AstraService>> {
     Router::new()
         .route(
@@ -82,6 +84,14 @@ pub fn private_routes() -> Router<Arc<AstraService>> {
         .route(
             OPERATOR_GATEWAY_PUBLISH_ROUTE,
             post(gateway_publish).layer(DefaultBodyLimit::max(MAX_OPERATOR_RELAY_BODY_BYTES)),
+        )
+        .route(
+            OPERATOR_CHAIN_NEXT_ROUTE,
+            post(chain_next).layer(DefaultBodyLimit::max(MAX_OPERATOR_RELAY_BODY_BYTES)),
+        )
+        .route(
+            OPERATOR_CHAIN_ABANDON_ROUTE,
+            post(chain_abandon).layer(DefaultBodyLimit::max(MAX_OPERATOR_RELAY_BODY_BYTES)),
         )
 }
 
@@ -172,6 +182,7 @@ async fn status(
     let vault_copy_fingerprint = service
         .encrypted_vault()
         .map(|bytes| Fingerprint::of(&bytes));
+    let chain = crate::door::chain_view(&service);
     let report = OperatorAuthorityStatus {
         ca_epoch: state.ca_epoch,
         ca_fingerprint: state.ca_public_key.authority_fingerprint(),
@@ -196,6 +207,7 @@ async fn status(
         credential_registry_epoch,
         revoked_peers,
         served_credentials: approval_credentials.registry.clone(),
+        chain,
     };
     drop(registry);
     (axum::http::StatusCode::OK, Json(report)).into_response()
@@ -528,6 +540,120 @@ async fn gateway_publish(
             )
         }
         Err(refusal) => refuse(&operator, "gateway-identity-publish", refusal.class()),
+    }
+}
+
+/// Opens the next step of the certificate chain, once the step in progress
+/// has taken effect, for an administrator relayed from the tunnel (F14 lot 6b).
+///
+/// The door decides. A step that has not taken effect yet is the one refusal
+/// whose sentence crosses back, in a `409`: it names what the operator still has
+/// to do. Every other refusal is its class, as everywhere on this surface.
+async fn chain_next(
+    State(service): State<Arc<AstraService>>,
+    Json(relayed): Json<RelayedOperatorCampaign>,
+) -> Response {
+    let operator = relayed.operator;
+    let connector = DoorConnector::Tunnel {
+        operator: operator.clone(),
+    };
+    // Detached, as the other door writes: a dropped connection must not end
+    // the plan's update half way.
+    let step = tokio::spawn({
+        let service = Arc::clone(&service);
+        async move {
+            service
+                .door(connector, DoorRequest::ChainNext {}, now_unix())
+                .await
+        }
+    })
+    .await;
+    let step = match step {
+        Ok(step) => step,
+        Err(error) => {
+            tracing::error!(operator = %operator, %error, "the door task did not finish");
+            return refuse(&operator, "chain-next", ServiceError::Internal);
+        }
+    };
+    match step {
+        Ok(DoorOutcome::ChainStep {
+            opened: Some(opening),
+            delegation_request,
+            ..
+        }) => {
+            let mut opened = opening.opened;
+            opened.delegation_request = delegation_request;
+            (
+                axum::http::StatusCode::OK,
+                Json(OperatorChainStep::Opened(Box::new(opened))),
+            )
+                .into_response()
+        }
+        Ok(DoorOutcome::ChainStep { opened: None, .. }) => (
+            axum::http::StatusCode::OK,
+            Json(OperatorChainStep::Finished),
+        )
+            .into_response(),
+        Ok(_) => {
+            tracing::error!(
+                operator = %operator,
+                "the door answered a chain step with something other than a step"
+            );
+            refuse(&operator, "chain-next", ServiceError::Internal)
+        }
+        Err(refusal @ DoorRefusal::ChainStepIncomplete(_)) => {
+            tracing::warn!(
+                operator = %operator,
+                route = "chain-next",
+                "private operator route refused a step that has not taken effect"
+            );
+            (
+                axum::http::StatusCode::CONFLICT,
+                Json(OperatorChainRefusal {
+                    message: refusal.to_string(),
+                }),
+            )
+                .into_response()
+        }
+        Err(refusal) => refuse(&operator, "chain-next", refusal.class()),
+    }
+}
+
+/// Drops the certificate chain's plan, for an administrator relayed from the
+/// tunnel (F14 lot 6b). What was approved keeps its effect: the door says so.
+async fn chain_abandon(
+    State(service): State<Arc<AstraService>>,
+    Json(relayed): Json<RelayedOperatorCampaign>,
+) -> Response {
+    let operator = relayed.operator;
+    let connector = DoorConnector::Tunnel {
+        operator: operator.clone(),
+    };
+    let abandoned = tokio::spawn({
+        let service = Arc::clone(&service);
+        async move {
+            service
+                .door(connector, DoorRequest::ChainAbandon {}, now_unix())
+                .await
+        }
+    })
+    .await;
+    match abandoned {
+        Ok(Ok(DoorOutcome::ChainAbandoned { .. })) => {
+            axum::http::StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(Ok(_)) => {
+            tracing::error!(
+                operator = %operator,
+                "the door answered an abandon with something other than an abandon"
+            );
+            refuse(&operator, "chain-abandon", ServiceError::Internal)
+        }
+        Ok(Err(refusal)) => refuse(&operator, "chain-abandon", refusal.class()),
+        Err(error) => {
+            tracing::error!(operator = %operator, %error, "the door task did not finish");
+            refuse(&operator, "chain-abandon", ServiceError::Internal)
+        }
     }
 }
 

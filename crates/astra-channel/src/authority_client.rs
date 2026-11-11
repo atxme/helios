@@ -238,6 +238,62 @@ impl AstraLifecycleClient {
         .await
     }
 
+    /// Opens the next step of the certificate chain for a relayed
+    /// administrator. No bearer token: the step is the plan's own. A step not
+    /// yet in effect is refused with its sentence, carried as
+    /// [`ChannelError::Plan`]; any other refusal is its status.
+    pub async fn operator_chain_next(
+        &self,
+        relayed: &RelayedOperatorCampaign,
+    ) -> Result<OperatorChainStep, ChannelError> {
+        let body =
+            serde_json::to_vec(relayed).map_err(|error| ChannelError::Body(error.to_string()))?;
+        let (status, answer) = self
+            .http
+            .exchange(
+                "POST",
+                OPERATOR_CHAIN_NEXT_ROUTE,
+                Some(body),
+                None,
+                MAX_OPERATOR_ANSWER_BYTES,
+            )
+            .await?;
+        if status == StatusCode::CONFLICT {
+            if let Ok(refusal) = serde_json::from_slice::<OperatorChainRefusal>(&answer) {
+                return Err(ChannelError::Plan(refusal.message));
+            }
+        }
+        if !status.is_success() {
+            return Err(ChannelError::Status(status));
+        }
+        serde_json::from_slice(&answer).map_err(|error| ChannelError::Body(error.to_string()))
+    }
+
+    /// Drops the certificate chain's plan for a relayed administrator. The
+    /// answer is an acknowledgement with no body.
+    pub async fn operator_chain_abandon(
+        &self,
+        relayed: &RelayedOperatorCampaign,
+    ) -> Result<(), ChannelError> {
+        let body =
+            serde_json::to_vec(relayed).map_err(|error| ChannelError::Body(error.to_string()))?;
+        let (status, _) = self
+            .http
+            .exchange(
+                "POST",
+                OPERATOR_CHAIN_ABANDON_ROUTE,
+                Some(body),
+                None,
+                MAX_OPERATOR_ANSWER_BYTES,
+            )
+            .await?;
+        if status.is_success() {
+            Ok(())
+        } else {
+            Err(ChannelError::Status(status))
+        }
+    }
+
     async fn post<B: Serialize, R: serde::de::DeserializeOwned>(
         &self,
         path: &str,

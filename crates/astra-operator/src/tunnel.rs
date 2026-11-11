@@ -46,8 +46,8 @@ use aether::certificates::gateway::{
 use aether::certificates::status::CertificateServiceRollbackAuthorization;
 use aether::certificates::transport::{
     ClientRenewalOperationState, ClientRenewalOperationView, ClientRenewalSignerRequest,
-    OperatorAuthorityStatus, OperatorGatewayPublish, OperatorGatewayPublished, OperatorOpenRequest,
-    OperatorOpened, OperatorVaultCopied, OperatorVaultCopy,
+    OperatorAuthorityStatus, OperatorChainStep, OperatorGatewayPublish, OperatorGatewayPublished,
+    OperatorOpenRequest, OperatorOpened, OperatorVaultCopied, OperatorVaultCopy,
 };
 use anyhow::{bail, Context, Result};
 
@@ -607,6 +607,39 @@ impl Tunnel {
             .context("publication de la transition gateway")?;
         Self::read_admin(response, crate::origin::MAX_ANSWER_BYTES)
             .context("publication de la transition gateway")
+    }
+
+    /// Opens the next step of the certificate chain (F14 lot 6b), once the
+    /// step in progress has taken effect. `Finished` when nothing remains. A
+    /// step not yet in effect is refused with Astra's sentence in the error.
+    pub fn chain_next(&self) -> Result<OperatorChainStep> {
+        let response = self
+            .http
+            .post(format!("{}{OPERATOR_PREFIX}/chain/next", self.base))
+            .send()
+            .context("passage à l'étape suivante de la chaîne")?;
+        if !response.status().is_success() {
+            return Err(refused_installation(
+                response,
+                "passage à l'étape suivante de la chaîne",
+            ));
+        }
+        Self::read_admin(response, crate::origin::MAX_ANSWER_BYTES)
+            .context("passage à l'étape suivante de la chaîne")
+    }
+
+    /// Drops the certificate chain's plan (F14 lot 6b). What was approved keeps
+    /// its effect.
+    pub fn chain_abandon(&self) -> Result<()> {
+        let response = self
+            .http
+            .post(format!("{}{OPERATOR_PREFIX}/chain/abandon", self.base))
+            .send()
+            .context("abandon de la chaîne")?;
+        if response.status().is_success() {
+            return Ok(());
+        }
+        Err(refused_installation(response, "abandon de la chaîne"))
     }
 
     /// Reads what Astra holds (§5.9). Fingerprints and epochs, no token.

@@ -1318,6 +1318,10 @@ pub struct OperatorAuthorityStatus {
     /// The credential document Astra serves, whole. `None` when it serves none.
     #[serde(default)]
     pub served_credentials: Option<Box<crate::certificates::approval::CredentialRegistry>>,
+    /// The certificate chain the tunnel has open, if one is. Absent from an
+    /// Astra older than the chain, which reads as no chain.
+    #[serde(default)]
+    pub chain: Option<OperatorChainView>,
 }
 
 /// The delegation: what the registry records and what Astra serves.
@@ -1332,6 +1336,38 @@ pub struct OperatorIssuerStatus {
     pub ca_epoch: u64,
     pub ca_tls_epoch: u64,
     pub not_after: u64,
+}
+
+/// The certificate chain the operator's tunnel has open, as the status names
+/// it (F14 lot 6b).
+///
+/// `steps` are the campaigns of the plan in order, `current` is the index of
+/// the step awaiting its effect, and `operation_id` is the campaign deposited
+/// for that step, when one is waiting for its operator.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorChainView {
+    pub steps: Vec<CampaignScope>,
+    pub current: usize,
+    pub operation_id: Option<Id16>,
+}
+
+/// What `chain next` answers: the campaign it opened, or that nothing remained
+/// to open because the chain is finished.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum OperatorChainStep {
+    Opened(Box<OperatorOpened>),
+    Finished,
+}
+
+/// The sentence a `chain next` is refused with when the step in progress has
+/// not taken effect yet. Carried in the body of a `409`, so Orion can show the
+/// operator what to do instead of a bare refusal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorChainRefusal {
+    pub message: String,
 }
 
 /// What an administrator sends to replace Astra's vault copy (spec §5.9).
