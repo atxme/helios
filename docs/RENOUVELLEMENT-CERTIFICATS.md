@@ -644,6 +644,21 @@ le remplaçant : « Avec remplaçant » (par défaut) ou « Sans remplaçant ».
   Une annulation ne publie rien : elle se jette. Un remplaçant seul, déposé ou non,
   se jette, mais le remplaçant déjà déposé chez Astra n'y est pas annulé.
 
+Deux cas sans issue par Orion. Le registre reste en place : il ne se reprend
+pas et ne se jette pas, car jeter ne donnerait à la gateway rien qu'elle accepte.
+Orion continue d'afficher le registre jusqu'à la reconstruction du domaine.
+
+- **Remplaçant refusé définitivement** : une gateway révoquée refuse pour de bon le
+  remplaçant qui lui est nommé. La révocation est appliquée, le remplaçant ne
+  s'installe pas (`gateway_revocation.rs:297`, installation du remplaçant dans
+  `carry_revocation`).
+  Ce n'est pas réparable, comme une révocation sans remplaçant : la gateway ne
+  servira plus, et le domaine doit être reconstruit.
+- **Publication refusée définitivement** : une décision de renouvellement installée
+  sur la gateway, dont la publication est refusée pour de bon (`carry`,
+  `gateway_identity.rs:677-679`). Le registre reste, installé et non publié : ni
+  reprise qui aboutisse, ni jet.
+
 **Recours en ligne de commande** (jusqu'au lot 7). Les quatre étapes suivantes
 sont celles de la machine à états, en commandes.
 
