@@ -788,3 +788,19 @@ fn a_discard_refused_by_the_record_reaches_the_page() {
         .expect("read")
         .is_some());
 }
+
+/// The term bound and the revoked refusals reach the page as their own sentence, never as the
+/// internal failure.
+#[test]
+fn the_term_and_revocation_refusals_reach_the_page_as_sentences() {
+    for refusal in [
+        GatewayRefusal::TermsOutOfRange,
+        GatewayRefusal::Revoked,
+        GatewayRefusal::AlreadyRevoked,
+    ] {
+        let page = page_sentence(&refusal);
+        assert_eq!(page, refusal.to_string());
+        assert!(page.ends_with("Rien n'a été signé."), "{page}");
+        assert!(!page.starts_with("Erreur interne"), "{page}");
+    }
+}

@@ -452,7 +452,8 @@ fn revocation_with_replacement_applies_revocation_then_transition() {
             // Deposited before the revocation's campaign is opened.
             "fetch_campaign",
             "submit",
-            // The revocation's round, then its deposit, then the installation.
+            // The revocation's round reads the gateway first, then its deposit, then the installation.
+            "gateway",
             "overlap_not_after",
             "authority_status",
             "open_revocation",
@@ -748,6 +749,8 @@ fn rollback_is_refused_while_a_revocation_waits() {
     let remote = Remote::new(&scenario);
     let domain = &scenario.domain;
     sign_revocation(&remote, domain, false);
+
+    remote.calls.borrow_mut().clear();
 
     let refusal = gateway_identity::open_rollback(&remote, &domain.path, 1, "motif", "Orion", NOW)
         .err()
@@ -1204,4 +1207,96 @@ fn a_finished_replacement_is_discarded() {
     discard_pending_revocation(&domain.path).expect("discarded");
 
     assert!(!record_on_disk(domain));
+}
+
+#[test]
+fn revocation_of_a_revoked_gateway_is_refused() {
+    let scenario = Scenario::new(false);
+    let mut remote = Remote::new(&scenario);
+    let domain = &scenario.domain;
+    remote.gateway.gateway_revoked = true;
+
+    let refusal = open_gateway_revocation(
+        &remote,
+        &domain.path,
+        RevocationReasonChoice::Compromised,
+        false,
+        NOW,
+    )
+    .err()
+    .expect("refused");
+
+    assert_eq!(refusal, GatewayRefusal::AlreadyRevoked);
+    assert!(!remote.called("open_revocation"), "no campaign is opened");
+    assert!(!remote.called("open_identity"), "no campaign is opened");
+    assert_eq!(domain.touches(), 0);
+}
+
+#[test]
+fn replacement_carries_a_reused_request() {
+    let scenario = Scenario::new(true);
+    let mut remote = Remote::new(&scenario);
+    let domain = &scenario.domain;
+
+    remote.prepared.reused = true;
+    let opened = open_gateway_revocation(
+        &remote,
+        &domain.path,
+        RevocationReasonChoice::Compromised,
+        true,
+        NOW,
+    )
+    .expect("the replacement opens");
+    assert!(opened.request_reused());
+
+    remote.prepared.reused = false;
+    let opened = open_gateway_revocation(
+        &remote,
+        &domain.path,
+        RevocationReasonChoice::Compromised,
+        true,
+        NOW,
+    )
+    .expect("the replacement opens");
+    assert!(!opened.request_reused());
+}
+
+#[test]
+fn the_revocation_round_keeps_the_reused_flag_of_its_replacement() {
+    let scenario = Scenario::new(true);
+    let mut remote = Remote::new(&scenario);
+    let domain = &scenario.domain;
+    remote.prepared.reused = true;
+
+    let replacement = sign_replacement(&remote, domain);
+    assert!(replacement.replacement_reused);
+    carry_revocation(&remote, &domain.path, replacement, NOW).expect_err("to sign");
+    let opened = open_gateway_revocation(
+        &remote,
+        &domain.path,
+        RevocationReasonChoice::Compromised,
+        true,
+        NOW,
+    )
+    .expect("the revocation round opens");
+
+    assert!(opened.request_reused());
+}
+
+#[test]
+fn a_revocation_without_replacement_reports_no_reused_request() {
+    let scenario = Scenario::new(false);
+    let mut remote = Remote::new(&scenario);
+    remote.prepared.reused = true;
+
+    let opened = open_gateway_revocation(
+        &remote,
+        &scenario.domain.path,
+        RevocationReasonChoice::Compromised,
+        false,
+        NOW,
+    )
+    .expect("the revocation opens");
+
+    assert!(!opened.request_reused());
 }

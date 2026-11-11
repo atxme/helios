@@ -489,8 +489,8 @@ impl RevocationGesture {
     }
 }
 
-/// The longest term a gateway renewal may set, in days.
-pub const MAX_GATEWAY_TERM_DAYS: u64 = 3_650;
+/// The longest term a gateway renewal may set, in days: owned by `astra-operator`.
+pub use astra_operator::operations::gateway_identity::MAX_GATEWAY_TERM_DAYS;
 
 /// The longest rollback a gateway may be asked for, in hours: the overlap is bounded by its end.
 const MAX_ROLLBACK_HOURS: u64 = 168;

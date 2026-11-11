@@ -80,6 +80,10 @@ pub(super) const CAMPAIGN_WINDOW_SECS: u64 = 300;
 /// What the campaign's text names as the requester: the console, not a person.
 pub(super) const REQUESTED_BY: &str = "Orion";
 
+/// The longest term a gateway renewal may set, in days: each of the three terms runs from one
+/// day to this bound. The console reads the same constant to refuse its input.
+pub const MAX_GATEWAY_TERM_DAYS: u64 = 3_650;
+
 /// What the renewal needs from the far side of the tunnel.
 ///
 /// The abort, the rollback and the staged transition are declared here with the renewal,
@@ -238,10 +242,13 @@ pub enum GatewayRefusal {
     /// The gateway is revoked: no outgoing identity can be selected for it.
     #[error("la gateway est révoquée : aucune identité ne la remplace. Rien n'a été signé.")]
     Revoked,
-    /// The gateway is already revoked. The tunnel exposes no gateway-revoked flag, so this is
-    /// declared for the console and never produced here.
+    /// The gateway is already revoked: a revocation has nothing left to revoke. Produced before
+    /// any campaign is opened.
     #[error("la gateway est déjà révoquée. Rien n'a été signé.")]
     AlreadyRevoked,
+    /// A renewal term is outside `1..=MAX_GATEWAY_TERM_DAYS`: refused before the gateway is asked.
+    #[error("les termes vont de 1 à {MAX_GATEWAY_TERM_DAYS} jours. Rien n'a été signé.")]
+    TermsOutOfRange,
     /// The replacement waits for the end of the overlap: the gateway verifies it under the
     /// outgoing `CA-PQ` until then, and the vault cannot sign under that key (lot 6b, §7.1).
     #[error("le remplacement de la gateway est possible après le {}. La révocation sans remplaçant reste possible. Rien n'a été signé.", utc_label(*.0))]
@@ -342,6 +349,8 @@ pub struct OpenedGatewayRenewal {
     anchor_key: MlDsa87PublicKey,
     approval: CampaignApprovalSession,
     options: RenewalOptions,
+    /// The gateway kept a request prepared earlier for this epoch, and returned it unchanged.
+    reused: bool,
 }
 
 /// Opens the renewal of the gateway's identity, or refuses it. Nothing before the last
@@ -364,6 +373,10 @@ pub(super) fn open_renewal_as(
     reason: &str,
     now: u64,
 ) -> Result<OpenedGatewayRenewal, GatewayRefusal> {
+    // Refused before the gateway is asked anything: the terms are the operator's input.
+    if !terms_in_range(options) {
+        return Err(GatewayRefusal::TermsOutOfRange);
+    }
     // A decision still waiting belongs to a campaign that is open or was: a new one
     // would overwrite it before it is deposited.
     if pending(vault_path, now).map_err(internal)?.is_some() {
@@ -376,6 +389,9 @@ pub(super) fn open_renewal_as(
         return Err(GatewayRefusal::RevocationPending);
     }
     let gateway = remote.gateway().map_err(before_signing)?;
+    if gateway.gateway_revoked {
+        return Err(GatewayRefusal::Revoked);
+    }
     if gateway.gateway_transition_pending {
         return Err(GatewayRefusal::TransitionInFlight);
     }
@@ -540,6 +556,7 @@ pub(super) fn open_renewal_as(
         anchor_key,
         approval,
         options,
+        reused: prepared.reused,
     })
 }
 
@@ -547,6 +564,11 @@ impl OpenedGatewayRenewal {
     /// How many credentials approve the campaign this renewal opened.
     pub fn required_credentials(&self) -> u8 {
         self.campaign.campaign.required_credentials
+    }
+
+    /// Whether the gateway resumed a request it had prepared already, with no new key.
+    pub fn request_reused(&self) -> bool {
+        self.reused
     }
 
     /// When the campaign closes: the second after which nothing may be approved.
@@ -607,6 +629,7 @@ impl OpenedGatewayRenewal {
             anchor_key,
             approval,
             options,
+            reused: _,
         } = self;
         let campaign = request.campaign.as_ref();
         if now >= campaign.expires_at || keys.openings.is_empty() {
@@ -790,6 +813,9 @@ pub fn open_abort(
         return Err(GatewayRefusal::RevocationPending);
     }
     let gateway = remote.gateway().map_err(before_signing)?;
+    if gateway.gateway_revoked {
+        return Err(GatewayRefusal::Revoked);
+    }
     let transition = remote
         .staged_transition()
         .map_err(before_signing)?
@@ -1025,6 +1051,9 @@ pub fn open_rollback(
         return Err(GatewayRefusal::RevocationPending);
     }
     let gateway = remote.gateway().map_err(before_signing)?;
+    if gateway.gateway_revoked {
+        return Err(GatewayRefusal::Revoked);
+    }
     let transition = remote
         .staged_transition()
         .map_err(before_signing)?
@@ -1342,6 +1371,17 @@ fn reason_label(options: RenewalOptions) -> &'static str {
     } else {
         "Renouvellement de l'identité de la gateway"
     }
+}
+
+/// Whether each term is a whole number of days within `1..=MAX_GATEWAY_TERM_DAYS`.
+fn terms_in_range(options: RenewalOptions) -> bool {
+    [
+        options.prepare_days,
+        options.overlap_days,
+        options.validity_days,
+    ]
+    .into_iter()
+    .all(|days| (1..=MAX_GATEWAY_TERM_DAYS).contains(&days))
 }
 
 /// `at` plus `days`, or a refusal when the span does not fit.

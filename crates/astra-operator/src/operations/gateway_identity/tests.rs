@@ -1411,3 +1411,81 @@ fn a_finished_decision_leaves_nothing_to_discard() {
 
     assert!(!record_on_disk(&scenario.domain));
 }
+
+#[test]
+fn renewal_refuses_terms_out_of_range_before_any_remote_call() {
+    let scenario = Scenario::new(false);
+    let remote = Remote::new(&scenario);
+    let cases = [
+        RenewalOptions {
+            prepare_days: 0,
+            ..options()
+        },
+        RenewalOptions {
+            validity_days: 3_651,
+            ..options()
+        },
+        RenewalOptions {
+            overlap_days: 0,
+            ..options()
+        },
+    ];
+    for asked in cases {
+        let refusal = refusal(open_renewal(&remote, &scenario.domain.path, asked, NOW));
+
+        assert_eq!(refusal, GatewayRefusal::TermsOutOfRange);
+        assert_eq!(
+            refusal.to_string(),
+            "les termes vont de 1 à 3650 jours. Rien n'a été signé."
+        );
+    }
+    assert!(remote.calls().is_empty(), "{:?}", remote.calls());
+    assert!(no_key_touched(&scenario.domain));
+}
+
+#[test]
+fn renewal_carries_a_reused_request() {
+    let scenario = Scenario::new(false);
+    let mut remote = Remote::new(&scenario);
+
+    remote.prepared.reused = true;
+    let opened = open_renewal(&remote, &scenario.domain.path, options(), NOW).expect("opened");
+    assert!(opened.request_reused());
+
+    remote.prepared.reused = false;
+    let opened = open_renewal(&remote, &scenario.domain.path, options(), NOW).expect("opened");
+    assert!(!opened.request_reused());
+}
+
+#[test]
+fn renewal_abort_and_rollback_refuse_a_revoked_gateway() {
+    let scenario = Scenario::new(false);
+    let domain = &scenario.domain;
+
+    let mut remote = Remote::new(&scenario);
+    remote.gateway.gateway_revoked = true;
+    let error = refusal(open_renewal(&remote, &domain.path, options(), NOW));
+    assert_eq!(error, GatewayRefusal::Revoked);
+    assert!(!remote.called("open_campaign"), "no campaign is opened");
+
+    let transition = staged(&scenario);
+    let mut remote = remote_with(&scenario, &transition, Some(NOW), false);
+    remote.gateway.gateway_revoked = true;
+    let error = refusal(open_abort(&remote, &domain.path, NOW));
+    assert_eq!(error, GatewayRefusal::Revoked);
+    assert!(!remote.called("open_campaign"), "no campaign is opened");
+
+    let mut remote = Remote::new(&scenario);
+    remote.gateway.gateway_revoked = true;
+    let error = refusal(open_rollback(
+        &remote,
+        &domain.path,
+        1,
+        "motif",
+        "Orion",
+        NOW,
+    ));
+    assert_eq!(error, GatewayRefusal::Revoked);
+    assert!(!remote.called("open_campaign"), "no campaign is opened");
+    assert!(no_key_touched(domain));
+}

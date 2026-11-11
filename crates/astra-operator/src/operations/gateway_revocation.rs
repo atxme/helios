@@ -94,6 +94,10 @@ pub struct SignedGatewayRevocation {
     pub revocation_applied: bool,
     /// The gateway holds the replacement.
     pub replacement_installed: bool,
+    /// The replacement's request was one the gateway had prepared already and returned unchanged.
+    /// Kept so the revocation's round, opened later, still reports it.
+    #[serde(default)]
+    pub replacement_reused: bool,
 }
 
 /// A gateway revocation opened on its current round: the replacement's campaign, or the
@@ -124,6 +128,8 @@ struct OpenedRevocation {
     approval: CampaignApprovalSession,
     /// The replacement the revocation names, deposited and recorded beside it.
     replacement: Option<SignedGatewayDecision>,
+    /// Whether the replacement's request was reused, as the record holds it.
+    reused: bool,
 }
 
 /// Opens the revocation of the gateway, or refuses it. Nothing before a key is asked for can
@@ -157,7 +163,8 @@ pub fn open_gateway_revocation(
         Some(replacement)
             if with_replacement && record.revocation.is_none() && replacement.deposited =>
         {
-            open_revocation(remote, vault_path, reason, Some(replacement), now)
+            let reused = record.replacement_reused;
+            open_revocation(remote, vault_path, reason, Some((replacement, reused)), now)
         }
         _ => Err(GatewayRefusal::RevocationAlreadyOpen),
     }
@@ -169,6 +176,16 @@ impl OpenedGatewayRevocation {
         match &self.stage {
             Stage::Replacement(renewal) => renewal.required_credentials(),
             Stage::Revocation(round) => round.campaign.campaign.required_credentials,
+        }
+    }
+
+    /// Whether the gateway resumed the request of the replacement this revocation names. The
+    /// replacement's round reports it as it opens; the revocation's round carries it from there.
+    /// Without a replacement it is `false`.
+    pub fn request_reused(&self) -> bool {
+        match &self.stage {
+            Stage::Replacement(renewal) => renewal.request_reused(),
+            Stage::Revocation(round) => round.reused,
         }
     }
 
@@ -223,12 +240,14 @@ impl OpenedGatewayRevocation {
     ) -> Result<SignedGatewayRevocation, GatewayRefusal> {
         match self.stage {
             Stage::Replacement(renewal) => {
+                let replacement_reused = renewal.request_reused();
                 let decision = renewal.sign_decision(vault_path, now, true)?;
                 let signed = SignedGatewayRevocation {
                     replacement: Some(decision),
                     revocation: None,
                     revocation_applied: false,
                     replacement_installed: false,
+                    replacement_reused,
                 };
                 save(&record_path(vault_path), &signed).map_err(internal)?;
                 Ok(signed)
@@ -427,13 +446,19 @@ fn open_replacement(
                 .into(),
         ));
     }
+    // The renewal reads the gateway, and refuses a revoked one as the renewal does: a
+    // revocation names it as `AlreadyRevoked`.
     let renewal = open_renewal_as(
         remote,
         vault_path,
         REPLACEMENT_TERMS,
         REPLACEMENT_LABEL,
         now,
-    )?;
+    )
+    .map_err(|refusal| match refusal {
+        GatewayRefusal::Revoked => GatewayRefusal::AlreadyRevoked,
+        other => other,
+    })?;
     Ok(OpenedGatewayRevocation {
         stage: Stage::Replacement(Box::new(renewal)),
     })
@@ -445,9 +470,12 @@ fn open_revocation(
     remote: &dyn GatewayIdentityRemote,
     vault_path: &Path,
     reason: RevocationReasonChoice,
-    replacement: Option<SignedGatewayDecision>,
+    replacement: Option<(SignedGatewayDecision, bool)>,
     now: u64,
 ) -> Result<OpenedGatewayRevocation, GatewayRefusal> {
+    refuse_if_revoked(remote)?;
+    let reused = replacement.as_ref().is_some_and(|(_, reused)| *reused);
+    let replacement = replacement.map(|(decision, _)| decision);
     let keys = ValidatedKeys::new(vault_path).map_err(internal)?;
     let vault = &keys.vault;
     let overlap = remote.overlap_not_after().map_err(before_signing)?;
@@ -546,6 +574,7 @@ fn open_revocation(
             reason_label: reason.label(),
             approval,
             replacement,
+            reused,
         })),
     })
 }
@@ -569,6 +598,7 @@ fn sign_revocation_round(
         reason_label: _,
         approval,
         replacement,
+        reused,
     } = round;
     let campaign = request.campaign.as_ref();
     if now >= campaign.expires_at || keys.openings.is_empty() {
@@ -634,9 +664,18 @@ fn sign_revocation_round(
         revocation: Some(signed_revocation),
         revocation_applied: false,
         replacement_installed: false,
+        replacement_reused: reused,
     };
     save(&record_path(vault_path), &signed).map_err(internal)?;
     Ok(signed)
+}
+
+/// Refuses the revocation of a gateway already revoked, before any campaign is opened.
+fn refuse_if_revoked(remote: &dyn GatewayIdentityRemote) -> Result<(), GatewayRefusal> {
+    if remote.gateway().map_err(before_signing)?.gateway_revoked {
+        return Err(GatewayRefusal::AlreadyRevoked);
+    }
+    Ok(())
 }
 
 /// The fingerprint of the transition a revocation names, read from the signed transition.
