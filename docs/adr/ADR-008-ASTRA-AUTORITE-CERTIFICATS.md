@@ -822,7 +822,11 @@ Renvoi à la spécification du lot 6b (§5.1) ; la recette est dans MANUAL-TESTI
   pair administrateur (`crates/helios-api/src/lib.rs`).
 - **Gestes.** Orion renouvelle, annule, revient à l'ancienne identité, révoque la
   gateway et reprend ou jette une décision en attente, par le tunnel, sans
-  `astra-signer`. Les commandes restent le recours jusqu'au lot 7.
+  `astra-signer`. Jeter est refusé tant qu'il reste un travail à finir sur la
+  gateway (une décision installée et non publiée, une révocation non terminée) :
+  la phrase de refus finit par « Rien n'a été jeté. ». Une révocation refusée
+  définitivement au dépôt garde son remplaçant et redevient à signer. Les commandes
+  restent le recours jusqu'au lot 7.
 - **Hors lot.** « Tout renouveler » n'est pas dans Orion : le plan reste sur la
   console d'Astra. Les routes des pas du plan sont en place, sans écran qui les appelle.
 

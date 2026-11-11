@@ -615,6 +615,13 @@ le remplaçant : « Avec remplaçant » (par défaut) ou « Sans remplaçant ».
   été révoqué. ». La reprise, si elle est appelée, refuse sans rien appeler avec
   « La révocation reste à signer : choisir « Révoquer la gateway ». Rien n'a été
   révoqué. ».
+- **Dépôt de la révocation refusé définitivement par Astra** (réponse HTTP autre
+  que 429, 500 ou 503, par exemple 409) : la révocation est retirée du registre, le
+  remplaçant reste déposé, et l'état devient « Révocation à signer ». « Révoquer la
+  gateway » signe une nouvelle révocation. Sans remplaçant, il ne reste rien et le
+  registre est effacé. Un dépôt sans réponse (429, 500, 503, ou injoignable) garde
+  au contraire la révocation : « Reprendre » la redépose, sans clé, avec les mêmes
+  octets.
 - Une campagne de révocation expirée sans réponse : « Reprendre » tente d'installer
   le remplaçant, sans clé. Accepté, les deux étapes sont faites. Refusé
   définitivement par la gateway, la révocation n'a pas été appliquée : elle est
@@ -625,7 +632,17 @@ le remplaçant : « Avec remplaçant » (par défaut) ou « Sans remplaçant ».
 - « Jeter la décision en attente » retire le registre sans clé, après la
   confirmation « La décision signée sera perdue. L'époque reste consommée. ».
   Orion ne le propose que lorsqu'un registre attend, et ne l'exécute pas pendant
-  une cérémonie ouverte.
+  une cérémonie ouverte. Il est **refusé** tant qu'il reste un travail à finir ; la
+  phrase du refus dit ce qui reste et se termine par « Rien n'a été jeté. » :
+  - décision de renouvellement installée sur la gateway, non publiée :
+    « la décision est installée sur la gateway mais pas encore publiée : la
+    reprendre pour la publier. Rien n'a été jeté. » ;
+  - révocation signée, non appliquée, ou dont le remplaçant n'est pas encore installé
+    (le registre ne dit pas si un dépôt sans réponse est arrivé à Astra) :
+    « la révocation de la gateway n'est pas finie : la reprendre pour la terminer.
+    Rien n'a été jeté. ».
+  Une annulation ne publie rien : elle se jette. Un remplaçant seul, déposé ou non,
+  se jette, mais le remplaçant déjà déposé chez Astra n'y est pas annulé.
 
 **Recours en ligne de commande** (jusqu'au lot 7). Les quatre étapes suivantes
 sont celles de la machine à états, en commandes.
@@ -753,6 +770,11 @@ ne demande aucune clé.
 | Révocation à signer | remplaçant déposé, révocation à signer. « Révoquer la gateway », « Jeter la décision en attente » |
 | Révocation à reprendre | révocation en attente, non appliquée. « Reprendre », « Jeter la décision en attente » |
 | Révocation appliquée, reprise à faire | révocation appliquée, remplaçant à installer. « Reprendre », « Jeter la décision en attente » |
+
+« Jeter la décision en attente » est refusé tant qu'un travail reste à finir. Pour
+une décision installée et non publiée : « la décision est installée sur la gateway
+mais pas encore publiée : la reprendre pour la publier. Rien n'a été jeté. » (§7.1
+pour les révocations).
 
 Quand la gateway signale un redémarrage à faire (`gateway_restart_due`), la ligne
 affiche « Redémarrer heliosd sur la gateway. », avec la raison donnée par la

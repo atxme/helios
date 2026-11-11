@@ -1347,11 +1347,25 @@ attendu.
     cible). Campagne de révocation expirée sans réponse. « Reprendre ». Attendu : sans
     clé, le remplaçant est installé si la gateway a appliqué la révocation ; sinon la
     ligne repasse « Révocation à signer ».
-96. **Jeter la décision en attente.** **[cible]** (clés réelles, gateway cible). « Jeter la
-    décision en attente », puis la confirmation « La décision signée sera perdue. L'époque
-    reste consommée. ». Attendu : aucune clé demandée ; la ligne revient à son état sans
-    registre.
-97. **Pas de « Tout renouveler » dans Orion.** Attendu : aucune ligne « Tout renouveler »
+96. **Jeter un remplaçant seul.** **[cible]** (clés réelles, gateway cible). Dans
+    « Révocation à signer » avec son remplaçant déposé, « Jeter la décision en attente »,
+    puis la confirmation « La décision signée sera perdue. L'époque reste consommée. ».
+    Attendu : aucune clé demandée ; la ligne revient à son état sans registre. Le
+    remplaçant déjà déposé chez Astra n'est pas annulé : le journal d'Astra le montre
+    encore.
+97. **Jeter refusé tant qu'un travail reste.** **[cible]** (clés réelles, gateway cible).
+    Une décision installée sur la gateway, non publiée (fermer Orion avant la
+    publication, comme à l'étape 87). « Jeter la décision en attente », puis confirmer.
+    Attendu : « la décision est installée sur la gateway mais pas encore publiée : la
+    reprendre pour la publier. Rien n'a été jeté. » ; le registre est conservé ; « Reprendre »
+    publie sans clé.
+98. **Dépôt de la révocation refusé par Astra.** **[cible]** (Astra en refus, gateway
+    cible ; la campagne est refusée par Astra, par exemple 409). Attendu : la ligne passe
+    « Révocation à signer » avec « Le remplaçant est déposé ; la révocation reste à signer.
+    Rien n'a été révoqué. ». « Révoquer la gateway » ouvre une nouvelle révocation ; sans
+    remplaçant, le registre est effacé. Un dépôt sans réponse (429, 500, 503) ne fait
+    rien perdre : « Reprendre » le redépose.
+99. **Pas de « Tout renouveler » dans Orion.** Attendu : aucune ligne « Tout renouveler »
     dans l'onglet ; le plan se joue sur la console d'Astra (`astra chain open`, voir
     RENOUVELLEMENT-CERTIFICATS.md, §10).
 
