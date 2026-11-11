@@ -213,6 +213,8 @@ pub struct Remote<'a> {
     /// Answers to the rollbacks, in order; a number is a refusal with that status.
     pub rollback_replies: RefCell<VecDeque<u16>>,
     pub rolled: RefCell<Vec<CertificateServiceRollbackAuthorization>>,
+    /// The gateway's view cannot be read: the network is down.
+    pub gateway_unreachable: Cell<bool>,
 }
 
 impl<'a> Remote<'a> {
@@ -246,6 +248,7 @@ impl<'a> Remote<'a> {
             aborted: RefCell::default(),
             rollback_replies: RefCell::default(),
             rolled: RefCell::default(),
+            gateway_unreachable: Cell::new(false),
         }
     }
 
@@ -402,6 +405,9 @@ impl GatewayIdentityRemote for Remote<'_> {
 
     fn gateway(&self) -> Result<GatewayIdentityRead> {
         self.note("gateway");
+        if self.gateway_unreachable.get() {
+            return Err(network_failure());
+        }
         Ok(self.gateway.clone())
     }
 
@@ -1488,4 +1494,187 @@ fn renewal_abort_and_rollback_refuse_a_revoked_gateway() {
     assert_eq!(error, GatewayRefusal::Revoked);
     assert!(!remote.called("open_campaign"), "no campaign is opened");
     assert!(no_key_touched(domain));
+}
+
+/// A failure of the network, as the tunnel's client reports it.
+fn network_failure() -> anyhow::Error {
+    reqwest::Client::new()
+        .get("http://[")
+        .build()
+        .expect_err("an invalid URL never builds")
+        .into()
+}
+
+/// The activation the renewal of `options()` sets, on the gateway's clock.
+const ACTIVATION: u64 = NOW + 7 * DAY;
+/// The sentence of a forced discard before activation, for a publication refused for good.
+const CANCEL_FIRST: &str =
+    "la transition s'annule encore : choisir « Annuler ». Rien n'a été jeté.";
+/// The sentence of a forced discard when nothing shows the decision is dead.
+const STILL_POSSIBLE: &str =
+    "cette décision peut encore aboutir : la reprendre. Rien n'a été jeté.";
+
+/// Sets the gateway's clock and its activation instant, as the gateway reports them.
+fn clock_at(remote: &mut Remote, now_unix: Option<u64>, activation: Option<u64>) {
+    remote.gateway = GatewayIdentityRead {
+        now_unix,
+        gateway_activation_at: activation,
+        ..gateway_read()
+    };
+}
+
+/// A renewal installed on the gateway, and refused by Astra's publication for good.
+fn publication_refused(scenario: &Scenario) -> Remote<'_> {
+    let remote = Remote::new(scenario);
+    remote.publish_replies.borrow_mut().push_back(Err(409));
+    let decision = signed_decision(&remote, &scenario.domain, options());
+    carry(&remote, &scenario.domain.path, decision, NOW).expect_err("the publication is refused");
+    remote
+}
+
+#[test]
+fn a_definitive_publication_refusal_is_recorded() {
+    let scenario = Scenario::new(false);
+    let remote = Remote::new(&scenario);
+    let domain = &scenario.domain;
+    remote.publish_replies.borrow_mut().push_back(Err(409));
+    let decision = signed_decision(&remote, domain, options());
+
+    let refusal = carry(&remote, &domain.path, decision, NOW).expect_err("refused");
+
+    let waiting = pending(&domain.path, NOW)
+        .expect("read")
+        .expect("the record stays");
+    let GatewayRefusal::GatewayRefused(reason) = refusal else {
+        panic!("a definitive refusal is GatewayRefused");
+    };
+    assert_eq!(waiting.publication_refused, Some(reason));
+}
+
+#[test]
+fn a_transient_publication_refusal_is_not_recorded() {
+    let scenario = Scenario::new(false);
+    let remote = Remote::new(&scenario);
+    let domain = &scenario.domain;
+    remote.publish_replies.borrow_mut().push_back(Err(503));
+    let decision = signed_decision(&remote, domain, options());
+
+    let refusal = carry(&remote, &domain.path, decision, NOW).expect_err("refused");
+
+    assert_eq!(refusal, GatewayRefusal::Unreachable);
+    let waiting = pending(&domain.path, NOW)
+        .expect("read")
+        .expect("the record stays");
+    assert_eq!(waiting.publication_refused, None);
+}
+
+#[test]
+fn a_6b_record_reads_back() {
+    let scenario = Scenario::new(false);
+    let remote = Remote::new(&scenario);
+    let domain = &scenario.domain;
+    signed_decision(&remote, domain, options());
+    let path = domain.path.parent().expect("parent").join(PENDING_FILE);
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("read")).expect("json");
+    record
+        .as_object_mut()
+        .expect("object")
+        .remove("publication_refused");
+    std::fs::write(&path, serde_json::to_vec_pretty(&record).expect("json")).expect("written");
+
+    let waiting = pending(&domain.path, NOW)
+        .expect("read")
+        .expect("the record waits");
+    assert_eq!(waiting.publication_refused, None);
+}
+
+#[test]
+fn force_discard_with_no_record_is_ok() {
+    let scenario = Scenario::new(false);
+    let remote = Remote::new(&scenario);
+
+    force_discard_pending(&remote, &scenario.domain.path, NOW).expect("nothing to discard");
+}
+
+#[test]
+fn force_discard_publication_refused_before_activation_is_refused() {
+    let scenario = Scenario::new(false);
+    let mut remote = publication_refused(&scenario);
+    clock_at(&mut remote, Some(NOW), Some(ACTIVATION));
+
+    let refusal = force_discard_pending(&remote, &scenario.domain.path, NOW).expect_err("refused");
+
+    assert_eq!(
+        refusal,
+        GatewayRefusal::NotForceDiscardable(CANCEL_FIRST.into())
+    );
+    assert!(record_on_disk(&scenario.domain), "the record stays");
+}
+
+#[test]
+fn force_discard_publication_refused_at_activation() {
+    let scenario = Scenario::new(false);
+    let mut remote = publication_refused(&scenario);
+    clock_at(&mut remote, Some(ACTIVATION), Some(ACTIVATION));
+
+    force_discard_pending(&remote, &scenario.domain.path, NOW).expect("discarded");
+
+    assert!(!record_on_disk(&scenario.domain));
+}
+
+#[test]
+fn force_discard_refuses_a_publishable_record() {
+    let scenario = Scenario::new(false);
+    let mut remote = Remote::new(&scenario);
+    signed_decision(&remote, &scenario.domain, options());
+    clock_at(&mut remote, Some(ACTIVATION + DAY), Some(ACTIVATION));
+
+    let refusal = force_discard_pending(&remote, &scenario.domain.path, NOW).expect_err("refused");
+
+    assert_eq!(
+        refusal,
+        GatewayRefusal::NotForceDiscardable(STILL_POSSIBLE.into())
+    );
+    assert!(record_on_disk(&scenario.domain), "the record stays");
+}
+
+#[test]
+fn force_discard_refuses_without_the_gateway_clock() {
+    let scenario = Scenario::new(false);
+    let mut remote = publication_refused(&scenario);
+    clock_at(&mut remote, None, Some(ACTIVATION));
+
+    let refusal = force_discard_pending(&remote, &scenario.domain.path, NOW).expect_err("refused");
+
+    assert_eq!(
+        refusal,
+        GatewayRefusal::NotForceDiscardable(STILL_POSSIBLE.into())
+    );
+    assert!(record_on_disk(&scenario.domain), "the record stays");
+}
+
+#[test]
+fn force_discard_on_a_revoked_gateway() {
+    let scenario = Scenario::new(false);
+    let mut remote = Remote::new(&scenario);
+    signed_decision(&remote, &scenario.domain, options());
+    remote.gateway.gateway_revoked = true;
+
+    force_discard_pending(&remote, &scenario.domain.path, NOW).expect("discarded");
+
+    assert!(!record_on_disk(&scenario.domain));
+}
+
+#[test]
+fn force_discard_without_the_view_discards_nothing() {
+    let scenario = Scenario::new(false);
+    let remote = Remote::new(&scenario);
+    signed_decision(&remote, &scenario.domain, options());
+    remote.gateway_unreachable.set(true);
+
+    let refusal = force_discard_pending(&remote, &scenario.domain.path, NOW).expect_err("refused");
+
+    assert_eq!(refusal, GatewayRefusal::Unreachable);
+    assert!(record_on_disk(&scenario.domain), "the record stays");
 }

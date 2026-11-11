@@ -1494,3 +1494,94 @@ fn a_revocation_without_replacement_reports_no_reused_request() {
 
     assert!(!opened.request_reused());
 }
+
+/// The sentence of a forced discard when the gateway awaits the record's replacement.
+const AWAITED_REPLACEMENT: &str =
+    "la gateway attend ce remplaçant : le reprendre pour l'installer. Rien n'a été jeté.";
+/// The sentence of a forced discard when nothing shows the revocation is dead.
+const STILL_POSSIBLE: &str =
+    "cette décision peut encore aboutir : la reprendre. Rien n'a été jeté.";
+
+#[test]
+fn force_discard_with_no_record_is_ok() {
+    let scenario = Scenario::new(true);
+    let remote = Remote::new(&scenario);
+
+    force_discard_pending_revocation(&remote, &scenario.domain.path).expect("nothing to discard");
+}
+
+#[test]
+fn force_discard_refuses_the_awaited_replacement() {
+    let scenario = Scenario::new(true);
+    let mut remote = Remote::new(&scenario);
+    let domain = &scenario.domain;
+    let signed = sign_replacement(&remote, domain);
+    let awaited = transition_of_record(&signed)
+        .fingerprint()
+        .expect("fingerprint");
+    revoked_awaiting(&mut remote, Some(awaited));
+
+    let refusal = force_discard_pending_revocation(&remote, &domain.path).expect_err("refused");
+
+    assert_eq!(
+        refusal,
+        GatewayRefusal::NotForceDiscardable(AWAITED_REPLACEMENT.into())
+    );
+    assert!(record_on_disk(domain), "the record stays");
+}
+
+#[test]
+fn force_discard_impasse_a_discards_the_record() {
+    let scenario = Scenario::new(true);
+    let mut remote = Remote::new(&scenario);
+    let domain = &scenario.domain;
+    sign_replacement(&remote, domain);
+    revoked_awaiting(&mut remote, Some(another_replacement()));
+
+    force_discard_pending_revocation(&remote, &domain.path).expect("discarded");
+
+    assert!(!record_on_disk(domain));
+}
+
+#[test]
+fn force_discard_on_a_revoked_gateway_without_replacement() {
+    let scenario = Scenario::new(false);
+    let mut remote = Remote::new(&scenario);
+    let domain = &scenario.domain;
+    sign_revocation(&remote, domain, false);
+    revoked_awaiting(&mut remote, None);
+
+    force_discard_pending_revocation(&remote, &domain.path).expect("discarded");
+
+    assert!(!record_on_disk(domain));
+}
+
+#[test]
+fn force_discard_refuses_a_revocation_the_gateway_does_not_show() {
+    let scenario = Scenario::new(true);
+    let remote = Remote::new(&scenario);
+    let domain = &scenario.domain;
+    sign_replacement(&remote, domain);
+
+    let refusal = force_discard_pending_revocation(&remote, &domain.path).expect_err("refused");
+
+    assert_eq!(
+        refusal,
+        GatewayRefusal::NotForceDiscardable(STILL_POSSIBLE.into())
+    );
+    assert!(record_on_disk(domain), "the record stays");
+}
+
+#[test]
+fn force_discard_without_the_view_discards_nothing() {
+    let scenario = Scenario::new(true);
+    let remote = Remote::new(&scenario);
+    let domain = &scenario.domain;
+    sign_replacement(&remote, domain);
+    remote.gateway_unreachable.set(true);
+
+    let refusal = force_discard_pending_revocation(&remote, &domain.path).expect_err("refused");
+
+    assert_eq!(refusal, GatewayRefusal::Unreachable);
+    assert!(record_on_disk(domain), "the record stays");
+}

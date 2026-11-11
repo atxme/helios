@@ -48,7 +48,7 @@ use crate::operations::gateway_identity::{
     self, before_signing, bound_to_domain, deposit_result, internal, open_renewal_as,
     refused_by_gateway, transition_of, unreachable_or_internal, GatewayIdentityRemote,
     GatewayRefusal, OpenedGatewayRenewal, RenewalOptions, SignedGatewayDecision,
-    CAMPAIGN_WINDOW_SECS, REQUESTED_BY,
+    CAMPAIGN_WINDOW_SECS, FORCE_STILL_POSSIBLE, REQUESTED_BY,
 };
 use crate::operations::keys::{approve_one, KeyStep, ValidatedKeys};
 use crate::operations::revocation::{
@@ -504,6 +504,51 @@ pub fn discard_pending_revocation(vault_path: &Path) -> Result<(), GatewayRefusa
         ));
     }
     clear(vault_path).map_err(internal)
+}
+
+/// The sentence of a forced discard while the gateway awaits the record's own replacement: it
+/// installs once it is resumed.
+const FORCE_AWAITED_REPLACEMENT: &str =
+    "la gateway attend ce remplaçant : le reprendre pour l'installer. Rien n'a été jeté.";
+
+/// Removes the waiting revocation when the gateway's own view proves its replacement will never
+/// install (§5.4, impasse A): the gateway is revoked and awaits no replacement, or another one than
+/// the record's. A revocation the gateway does not show applied, or that awaits the record's own
+/// replacement, is refused with the sentence that says what remains possible. The view is read
+/// with the same probe the carry uses, and nothing is discarded when it cannot be read. An ordinary
+/// [`discard_pending_revocation`] keeps its refusals.
+pub fn force_discard_pending_revocation(
+    remote: &dyn GatewayIdentityRemote,
+    vault_path: &Path,
+) -> Result<(), GatewayRefusal> {
+    let Some(signed) = stored_record(vault_path)? else {
+        return Ok(());
+    };
+    match probe_revocation(remote, &signed)? {
+        RevocationProbe::AppliedWithoutThisReplacement | RevocationProbe::AppliedNoReplacement => {
+            clear(vault_path).map_err(internal)
+        }
+        RevocationProbe::AppliedWithThisReplacement => Err(GatewayRefusal::NotForceDiscardable(
+            FORCE_AWAITED_REPLACEMENT.into(),
+        )),
+        RevocationProbe::NotApplied => Err(GatewayRefusal::NotForceDiscardable(
+            FORCE_STILL_POSSIBLE.into(),
+        )),
+    }
+}
+
+/// The record as it is stored, whatever its steps. The forced discard has no clock to drop an
+/// expired replacement with, as [`pending_revocation`] does: the view decides.
+fn stored_record(vault_path: &Path) -> Result<Option<SignedGatewayRevocation>, GatewayRefusal> {
+    let path = record_path(vault_path);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(internal(anyhow::Error::from(error))),
+    };
+    serde_json::from_slice(&bytes).map(Some).map_err(|error| {
+        internal(anyhow::Error::from(error).context("lecture de la révocation à jeter"))
+    })
 }
 
 /// The replacement's round: the gateway's renewal, under the terms of a replacement.

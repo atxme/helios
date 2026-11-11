@@ -239,6 +239,10 @@ pub enum GatewayRefusal {
     /// sentence is the one the page shows.
     #[error("{0}")]
     NotDiscardable(String),
+    /// A forced discard that the gateway's view does not prove dead. The sentence says what
+    /// remains possible, and ends by saying nothing was discarded.
+    #[error("{0}")]
+    NotForceDiscardable(String),
     /// The gateway is revoked: no outgoing identity can be selected for it.
     #[error("la gateway est révoquée : aucune identité ne la remplace. Rien n'a été signé.")]
     Revoked,
@@ -323,6 +327,10 @@ pub struct SignedGatewayDecision {
     pub installed: bool,
     /// Astra relayed the transition to the gateway.
     pub published: bool,
+    /// Astra refused the publication for good, and said why. Set only by a definitive refusal:
+    /// a transient one or an unreachable gateway leaves it unset.
+    #[serde(default)]
+    pub publication_refused: Option<String>,
 }
 
 /// The decisions a record can hold.
@@ -703,6 +711,7 @@ impl OpenedGatewayRenewal {
             deposited: false,
             installed: false,
             published: false,
+            publication_refused: None,
         };
         Ok(signed)
     }
@@ -744,9 +753,19 @@ pub fn carry(
     // Names the document installed, not only its epoch: Astra may hold another
     // transition at this epoch, and the mark it writes is irreversible.
     let transition_fingerprint = transition.fingerprint().map_err(internal)?;
-    let relay = remote
-        .publish(transition.gateway_identity_epoch, transition_fingerprint)
-        .map_err(refused_by_gateway)?;
+    let relay = match remote.publish(transition.gateway_identity_epoch, transition_fingerprint) {
+        Ok(relay) => relay,
+        Err(error) => {
+            let refusal = refused_by_gateway(error);
+            // Kept in the record, so that a discard can tell the refusal is final. A retry that
+            // succeeds clears the record below, as before.
+            if let GatewayRefusal::GatewayRefused(reason) = &refusal {
+                decision.publication_refused = Some(reason.clone());
+                save(&record_path(vault_path), &decision).map_err(internal)?;
+            }
+            return Err(refusal);
+        }
+    };
     if !relay.relayed {
         return Err(GatewayRefusal::Guidance(
             "la gateway n'a pas confirmé la relève : reprendre pour la lui demander à nouveau."
@@ -985,6 +1004,7 @@ impl OpenedGatewayAbort {
             deposited: false,
             installed: false,
             published: false,
+            publication_refused: None,
         };
         save(&record_path(vault_path), &signed).map_err(internal)?;
         Ok(signed)
@@ -1327,6 +1347,54 @@ pub fn discard_pending(vault_path: &Path) -> Result<(), GatewayRefusal> {
         ));
     }
     clear(vault_path).map_err(internal)
+}
+
+/// The sentence of a forced discard before activation, for a publication refused for good: the
+/// cancellation is still possible, and it is the way out.
+pub(super) const FORCE_CANCEL_FIRST: &str =
+    "la transition s'annule encore : choisir « Annuler ». Rien n'a été jeté.";
+
+/// The sentence of a forced discard that the gateway's view does not prove dead.
+pub(super) const FORCE_STILL_POSSIBLE: &str =
+    "cette décision peut encore aboutir : la reprendre. Rien n'a été jeté.";
+
+/// Removes the waiting decision when the gateway's own view proves it has no way out (§5.4,
+/// impasse B): a renewal installed and refused for good by the publication, once the gateway's
+/// clock has reached its activation; or any decision on a revoked gateway. The view is read
+/// first, and nothing is discarded when it cannot be read. The clock is the gateway's, never the
+/// workstation's `now`, which only reads the record. An ordinary [`discard_pending`] keeps its
+/// refusals.
+pub fn force_discard_pending(
+    remote: &dyn GatewayIdentityRemote,
+    vault_path: &Path,
+    now: u64,
+) -> Result<(), GatewayRefusal> {
+    let Some(decision) = pending(vault_path, now).map_err(internal)? else {
+        return Ok(());
+    };
+    let view = remote.gateway().map_err(unreachable_or_internal)?;
+    let refused_by_astra = decision.kind == GatewayDecisionKind::Renewal
+        && decision.installed
+        && !decision.published
+        && decision.publication_refused.is_some();
+    if view.gateway_revoked || (refused_by_astra && gateway_past_activation(&view) == Some(true)) {
+        return clear(vault_path).map_err(internal);
+    }
+    let sentence = if refused_by_astra && gateway_past_activation(&view) == Some(false) {
+        FORCE_CANCEL_FIRST
+    } else {
+        FORCE_STILL_POSSIBLE
+    };
+    Err(GatewayRefusal::NotForceDiscardable(sentence.into()))
+}
+
+/// Whether the gateway's clock has reached its activation. `None` when the view does not give
+/// both: an older gateway sends no clock, and then no rule on the activation holds.
+pub(super) fn gateway_past_activation(view: &GatewayIdentityRead) -> Option<bool> {
+    match (view.now_unix, view.gateway_activation_at) {
+        (Some(clock), Some(activation)) => Some(clock >= activation),
+        _ => None,
+    }
 }
 
 pub(super) fn transition_of(
