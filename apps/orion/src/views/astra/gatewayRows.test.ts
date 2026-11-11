@@ -12,6 +12,8 @@ const pending = (extra: Partial<GatewayPendingView> = {}): GatewayPendingView =>
   revocation_applied: false,
   decision_kind: 'renewal',
   revocation_to_sign: false,
+  publication_refused: false,
+  replacement_fingerprint: null,
   ...extra,
 })
 

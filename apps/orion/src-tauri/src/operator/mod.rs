@@ -530,6 +530,9 @@ pub enum GatewayGesture {
     Resume,
     /// Drops the waiting record, when the gateway refused it for good.
     Discard,
+    /// Drops the waiting record when the gateway's own view proves it has no way out. Takes no
+    /// key and goes through the tunnel; a refusal says what remains possible.
+    ForceDiscard,
 }
 
 fn gateway_prepare_days() -> u64 {
@@ -578,7 +581,11 @@ impl GatewayGesture {
                 }
                 Ok(())
             }
-            Self::Abort | Self::Revoke { .. } | Self::Resume | Self::Discard => Ok(()),
+            Self::Abort
+            | Self::Revoke { .. }
+            | Self::Resume
+            | Self::Discard
+            | Self::ForceDiscard => Ok(()),
         }
     }
 
@@ -586,9 +593,11 @@ impl GatewayGesture {
     fn operation(&self) -> OperationKind {
         match self {
             Self::Revoke { .. } => OperationKind::RevokeCertificate,
-            Self::Renew { .. } | Self::Abort | Self::Rollback { .. } | Self::Discard => {
-                OperationKind::GatewayIdentity
-            }
+            Self::Renew { .. }
+            | Self::Abort
+            | Self::Rollback { .. }
+            | Self::Discard
+            | Self::ForceDiscard => OperationKind::GatewayIdentity,
             Self::Resume => OperationKind::GatewayIdentity,
         }
     }
@@ -599,6 +608,20 @@ impl GatewayGesture {
 pub(crate) fn discard_gateway_record(vault_path: &std::path::Path) -> Result<(), String> {
     ceremony::discard_waiting(vault_path)
 }
+
+/// Drops the gateway record waiting beside the vault when the gateway's view, read through
+/// `remote` (the tunnel to `target`), proves it has no way out. Takes no key; the caller has
+/// checked that no ceremony is open.
+pub(crate) fn force_discard_gateway_record(
+    target: &GatewayTarget,
+    remote: &dyn astra_operator::operations::gateway_identity::GatewayIdentityRemote,
+    vault_path: &std::path::Path,
+) -> Result<(), String> {
+    ceremony::force_discard_at(target, remote, vault_path)
+}
+
+/// Said when no tunnel is up to the gateway.
+pub(crate) use ceremony::NO_TUNNEL;
 
 /// Renames the key `slot_id` of the vault at `vault_path`. No key is asked
 /// anything; the label is checked as a gesture's would be.

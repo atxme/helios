@@ -25,7 +25,9 @@ use astra_operator::tunnel::GatewayIdentityRead;
 
 use super::super::Press;
 use super::probe;
-use super::{discard_waiting, page_sentence, run_with, Reach};
+use super::{
+    discard_waiting, force_discard_at, force_discard_waiting, page_sentence, run_with, Reach,
+};
 use crate::operator::rotations::{gateway_pending_of, Local, RotationsOverview};
 use crate::operator::{GatewayGesture, GatewayTarget, Words};
 
@@ -841,4 +843,151 @@ fn the_term_and_revocation_refusals_reach_the_page_as_sentences() {
         assert!(page.ends_with("Rien n'a été signé."), "{page}");
         assert!(!page.starts_with("Erreur interne"), "{page}");
     }
+}
+
+/// The forced discard goes through the tunnel's view: a gateway revoked for good proves the
+/// waiting renewal has no way out, and the record is dropped.
+#[test]
+fn force_discard_goes_through_the_tunnel() {
+    let scenario = Scenario::new(false);
+    let mut remote = RenewalRemote::new(&scenario);
+    let first = refused_install(&scenario, &remote);
+    assert!(first.outcome.is_err());
+    remote.gateway.gateway_revoked = true;
+
+    force_discard_waiting(&remote, &scenario.domain.path).expect("discarded");
+
+    assert!(gateway_identity::pending(&scenario.domain.path, NOW)
+        .expect("read")
+        .is_none());
+}
+
+/// A forced discard the gateway's view does not prove dead reaches the page as its sentence,
+/// and the record stays.
+#[test]
+fn force_discard_refusal_reaches_the_page_as_is() {
+    let scenario = Scenario::new(false);
+    let remote = RenewalRemote::new(&scenario);
+    let first = refused_install(&scenario, &remote);
+    assert!(first.outcome.is_err());
+
+    let page = force_discard_waiting(&remote, &scenario.domain.path).expect_err("refused");
+
+    assert!(page.ends_with("Rien n'a été jeté."), "{page}");
+    assert!(!page.starts_with("Erreur interne"), "{page}");
+    assert!(gateway_identity::pending(&scenario.domain.path, NOW)
+        .expect("read")
+        .is_some());
+}
+
+/// The pending view names the replacement of a revocation, and says for a decision whether
+/// Astra refused its publication. The refusal's text never reaches the view.
+#[test]
+fn pending_view_names_the_replacement_and_the_refused_publication() {
+    // A revocation whose replacement is deposited and not yet signed.
+    let scenario = Scenario::new(true);
+    let remote = RevocationRemote::new(&scenario);
+    let stopped = drive(
+        &scenario.domain,
+        &remote,
+        gateway_key(),
+        GatewayGesture::Revoke {
+            reason: RevocationReasonChoice::StolenOrLost,
+            with_replacement: true,
+        },
+        "",
+        Answer::CancelSecondRound,
+        NOW,
+    );
+    assert_eq!(stopped.outcome, Ok(()));
+    let asked = stopped.awaiting_keys();
+    let Some(AstraManifest::Revocation(revocation)) = &asked.last().expect("a round").manifest
+    else {
+        panic!("the second round shows the revocation");
+    };
+    let expected = revocation
+        .replacement_transition_fingerprint
+        .expect("a replacement")
+        .to_hex();
+
+    let view = gateway_pending_of(&scenario.domain.path, NOW).expect("a revocation waits");
+    assert_eq!(view.kind, "revocation");
+    assert_eq!(
+        view.replacement_fingerprint.as_deref(),
+        Some(expected.as_str())
+    );
+    assert!(!view.publication_refused, "a revocation has no publication");
+
+    // A decision whose publication Astra refused for good.
+    let scenario = Scenario::new(false);
+    let remote = RenewalRemote::new(&scenario);
+    remote.publish_replies.borrow_mut().push_back(Err(409));
+    let ran = drive(
+        &scenario.domain,
+        &remote,
+        gateway_key(),
+        renewal(false, false),
+        "",
+        Answer::Keys,
+        NOW,
+    );
+    assert!(ran.outcome.is_err());
+
+    let view = gateway_pending_of(&scenario.domain.path, NOW).expect("a decision waits");
+    assert_eq!(view.kind, "decision");
+    assert!(view.publication_refused);
+    assert_eq!(view.replacement_fingerprint, None);
+    let shown = serde_json::to_value(&view).expect("json");
+    assert_eq!(shown["publication_refused"], true);
+    assert!(shown["replacement_fingerprint"].is_null());
+}
+
+/// A forced discard is no ceremony: it refuses internally, like an ordinary discard, before
+/// any call or key.
+#[test]
+fn force_discard_is_no_ceremony() {
+    let scenario = Scenario::new(false);
+    let remote = RenewalRemote::new(&scenario);
+    let ran = drive(
+        &scenario.domain,
+        &remote,
+        gateway_key(),
+        GatewayGesture::ForceDiscard,
+        "",
+        Answer::Keys,
+        NOW,
+    );
+
+    assert_eq!(
+        ran.outcome,
+        Err("jeter une décision en attente ne se fait pas en cérémonie".to_string())
+    );
+    assert_eq!(ran.last().refusal, Some(Refusal::Internal));
+    assert!(remote.calls().is_empty(), "nothing is asked of the gateway");
+    assert_eq!(ran.keys_connected, 0);
+}
+
+/// A forced discard through the connected gateway never asks another domain's gateway: the
+/// relay names another peer, so the record stays and nothing is called.
+#[test]
+fn force_discard_refuses_another_domains_gateway() {
+    let scenario = Scenario::new(false);
+    let mut remote = RenewalRemote::new(&scenario);
+    let first = refused_install(&scenario, &remote);
+    assert!(first.outcome.is_err());
+    // The view would clear the record, if it were asked.
+    remote.gateway.gateway_revoked = true;
+    let calls_before = remote.calls().len();
+
+    let page = force_discard_at(&target(other_gateway()), &remote, &scenario.domain.path)
+        .expect_err("another domain's gateway");
+
+    assert_eq!(
+        page,
+        "la gateway jointe n'est pas celle que le relais du domaine désigne"
+    );
+    assert_eq!(remote.calls().len(), calls_before, "nothing is asked");
+    assert!(gateway_identity::pending(&scenario.domain.path, NOW)
+        .expect("read")
+        .is_some());
 }

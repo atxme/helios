@@ -43,9 +43,10 @@ use crate::operator::{relay_names_peer, GatewayGesture, GatewayTarget, Words};
 const WRONG_GATEWAY: &str = "la gateway jointe n'est pas celle que le relais du domaine désigne";
 
 /// Said when no tunnel is up to the gateway.
-const NO_TUNNEL: &str = "aucun tunnel n'est monté vers la gateway";
+pub(crate) const NO_TUNNEL: &str = "aucun tunnel n'est monté vers la gateway";
 
-/// Said when a discard is asked of a ceremony: it takes no key and runs no ceremony.
+/// Said when a discard, forced or not, is asked of a ceremony: it takes no key and runs no
+/// ceremony.
 const DISCARD_IS_NO_CEREMONY: &str = "jeter une décision en attente ne se fait pas en cérémonie";
 
 /// Said when the record waiting for the gateway cannot be read. The detail names paths: it goes
@@ -422,7 +423,7 @@ impl<'a> GatewayRun<'a> {
                 with_replacement,
             } => self.revoke(reason, with_replacement),
             GatewayGesture::Resume => self.resume(),
-            GatewayGesture::Discard => {
+            GatewayGesture::Discard | GatewayGesture::ForceDiscard => {
                 Err(self.fail(Refusal::Internal, DISCARD_IS_NO_CEREMONY.to_string()))
             }
         };
@@ -716,6 +717,49 @@ pub(crate) fn discard_waiting(vault_path: &Path) -> Result<(), String> {
         gateway_revocation::discard_pending_revocation(vault_path).map_err(discard_sentence)
     } else {
         gateway_identity::discard_pending(vault_path).map_err(discard_sentence)
+    }
+}
+
+/// Drops the waiting record when the gateway's own view proves it has no way out: the
+/// revocation's when one waits, the decision's otherwise. Takes no key, and reads the view
+/// through `remote`, the tunnel. A refusal's sentence reaches the page as it is; any other
+/// failure is said as a fixed sentence.
+pub(crate) fn force_discard_waiting(
+    remote: &dyn GatewayIdentityRemote,
+    vault_path: &Path,
+) -> Result<(), String> {
+    let now = now_unix();
+    let revocation = gateway_revocation::pending_revocation(vault_path, now)
+        .map_err(|error| unreadable_record(&error))?;
+    if revocation.is_some() {
+        gateway_revocation::force_discard_pending_revocation(remote, vault_path)
+            .map_err(force_discard_sentence)
+    } else {
+        gateway_identity::force_discard_pending(remote, vault_path, now)
+            .map_err(force_discard_sentence)
+    }
+}
+
+/// [`force_discard_waiting`] for the connected gateway. As for every gateway gesture, the tunnel
+/// must lead to the gateway the domain's relay names before any call: another domain's gateway
+/// is never asked, and its view never clears the record.
+pub(crate) fn force_discard_at(
+    target: &GatewayTarget,
+    remote: &dyn GatewayIdentityRemote,
+    vault_path: &Path,
+) -> Result<(), String> {
+    if !relay_names_peer(vault_path, &target.peer_key).unwrap_or(false) {
+        return Err(WRONG_GATEWAY.to_string());
+    }
+    force_discard_waiting(remote, vault_path)
+}
+
+/// The sentence a forced discard puts on the page: a refusal's own sentence, or the failure's
+/// fixed sentence.
+fn force_discard_sentence(refusal: GatewayRefusal) -> String {
+    match refusal {
+        GatewayRefusal::NotForceDiscardable(sentence) => sentence,
+        other => page_sentence(&other),
     }
 }
 

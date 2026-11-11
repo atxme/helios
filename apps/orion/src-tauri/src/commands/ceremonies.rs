@@ -185,8 +185,9 @@ pub(crate) async fn begin_revocation_ceremony(
 
 /// Opens a gateway identity gesture: renewing, cancelling, rolling back or revoking the
 /// gateway's identity, or carrying what one left waiting. A discard takes no key and opens no
-/// ceremony. The gateway is the connected profile's; without one the gesture stops before
-/// any call. A refusal before a key is an error carrying its sentence.
+/// ceremony; a forced discard goes through the tunnel to the gateway's view, and takes no key
+/// either. The gateway is the connected profile's; without one the gesture stops before any
+/// call. A refusal before a key is an error carrying its sentence.
 #[tauri::command]
 pub(crate) async fn begin_gateway_ceremony(
     state: State<'_, AppState>,
@@ -200,6 +201,18 @@ pub(crate) async fn begin_gateway_ceremony(
         })
         .await
         .map_err(|error| format!("suppression de la décision en attente : {error}"))?;
+    }
+    if matches!(gesture, crate::operator::GatewayGesture::ForceDiscard) {
+        ensure_no_open_ceremony(&state).await?;
+        let target = connected_target(&state).await.ok();
+        return tokio::task::spawn_blocking(move || {
+            let target = target.ok_or_else(|| crate::operator::NO_TUNNEL.to_string())?;
+            let tunnel = astra_operator::tunnel::Tunnel::new(&target.address)
+                .map_err(|error| format!("{error:#}"))?;
+            crate::operator::force_discard_gateway_record(&target, &tunnel, &vault_path)
+        })
+        .await
+        .map_err(|error| format!("suppression forcée de la décision en attente : {error}"))?;
     }
     let requested_by = match gesture {
         crate::operator::GatewayGesture::Rollback { .. } => connected_workstation(&state).await?,

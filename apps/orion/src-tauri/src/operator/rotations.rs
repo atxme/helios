@@ -32,7 +32,7 @@ use orion_core::operator_rotations::{
 use serde::Serialize;
 
 use aether::certificates::transport::{
-    OperatorOpenAction, OperatorOpenRequest, OperatorOpened, OperatorVaultCopy,
+    OperatorOpenAction, OperatorOpenRequest, OperatorOpened, OperatorVaultCopy, TrustUpdateObject,
 };
 use astra_operator::operations::rotation::RotationRemote;
 
@@ -191,6 +191,12 @@ pub struct GatewayPendingView {
     pub decision_kind: Option<String>,
     /// The replacement is deposited and the revocation is not signed yet: nothing is revoked.
     pub revocation_to_sign: bool,
+    /// Astra refused the decision's publication for good. The refusal's own text is kept in the
+    /// record and never shown here. A revocation has no publication: always `false`.
+    pub publication_refused: bool,
+    /// The fingerprint, in hex, of the replacement transition a revocation carries. `None` for a
+    /// decision, and for a revocation without replacement.
+    pub replacement_fingerprint: Option<String>,
 }
 
 /// The gateway record waiting beside the vault, if one does. A revocation's record is the one
@@ -212,6 +218,11 @@ pub fn gateway_pending_of(vault_path: &Path, now: u64) -> Option<GatewayPendingV
                     .as_ref()
                     .is_some_and(|replacement| replacement.deposited)
                     && record.revocation.is_none(),
+                publication_refused: false,
+                replacement_fingerprint: record
+                    .replacement
+                    .as_ref()
+                    .and_then(transition_fingerprint_of),
             })
         }
         Ok(None) => {}
@@ -234,10 +245,31 @@ pub fn gateway_pending_of(vault_path: &Path, now: u64) -> Option<GatewayPendingV
                 .to_string(),
             ),
             revocation_to_sign: false,
+            publication_refused: decision.publication_refused.is_some(),
+            replacement_fingerprint: None,
         }),
         Ok(None) => None,
         Err(error) => {
             tracing::warn!(error = %format!("{error:#}"), "décision gateway illisible");
+            None
+        }
+    }
+}
+
+/// The fingerprint, in hex, of the gateway transition a recorded decision carries. `None` when it
+/// carries none, or when the transition cannot be fingerprinted: the failure goes to the log.
+fn transition_fingerprint_of(
+    decision: &astra_operator::operations::gateway_identity::SignedGatewayDecision,
+) -> Option<String> {
+    let Some(TrustUpdateObject::GatewayIdentityTransition(transition)) =
+        decision.result.objects.first()
+    else {
+        return None;
+    };
+    match transition.fingerprint() {
+        Ok(fingerprint) => Some(fingerprint.to_hex()),
+        Err(error) => {
+            tracing::warn!(error = %error, "transition gateway illisible");
             None
         }
     }

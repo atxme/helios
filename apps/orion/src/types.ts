@@ -1118,6 +1118,10 @@ export interface GatewayPendingView {
   decision_kind: 'renewal' | 'abort' | null
   /** Le remplaçant est déposé et la révocation n'est pas encore signée : rien n'est révoqué. */
   revocation_to_sign: boolean
+  /** Astra a refusé la publication de la décision pour de bon. Le motif reste côté Rust ; une révocation n'a pas cette étape : `false`. */
+  publication_refused: boolean
+  /** Hex de la transition de remplacement d'une révocation ; `null` pour une décision, et pour une révocation sans remplaçant. */
+  replacement_fingerprint: string | null
 }
 
 /** Une rotation signée qui n'est pas allée au bout, avec son délai d'installation. */
@@ -1230,6 +1234,7 @@ export type GatewayGesture =
   | { gesture: 'revoke'; reason: RevocationReasonChoice; with_replacement: boolean }
   | { gesture: 'resume' }
   | { gesture: 'discard' }
+  | { gesture: 'force_discard' }
 
 /** Un geste de l'onglet Postes ; la clé WireGuard et le nom viennent de la ligne choisie. */
 export type RevocationGesture =
