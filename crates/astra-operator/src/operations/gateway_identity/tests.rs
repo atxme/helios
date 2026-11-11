@@ -974,7 +974,7 @@ fn abort_refused_once_published() {
 fn a_live_gateway_operation_blocks_the_abort_by_name() {
     let scenario = Scenario::new(false);
     let transition = staged(&scenario);
-    // A renewal decision still waits in the record.
+    // A renewal decision still waits in the record, not installed on the gateway.
     let renewal = Remote::new(&scenario);
     signed_decision(&renewal, &scenario.domain, options());
     let remote = remote_with(&scenario, &transition, Some(NOW), false);
@@ -983,6 +983,56 @@ fn a_live_gateway_operation_blocks_the_abort_by_name() {
 
     assert_eq!(error, GatewayRefusal::AlreadyOpen);
     assert!(error.to_string().contains("identité de la gateway"));
+    assert!(!remote.called("open_campaign"));
+}
+
+/// A renewal installed on the gateway and not published is what the cancellation
+/// cancels: the abort record supersedes it at the same path.
+#[test]
+fn an_abort_supersedes_the_renewal_installed_and_not_published() {
+    let scenario = Scenario::new(false);
+    let domain = &scenario.domain;
+    let renewal = Remote::new(&scenario);
+    renewal.publish_replies.borrow_mut().push_back(Err(503));
+    let decision = signed_decision(&renewal, domain, options());
+    let transition = transition_of(&decision).expect("transition").clone();
+    carry(&renewal, &domain.path, decision, NOW).expect_err("the publication was not confirmed");
+    let waiting = pending(&domain.path, NOW)
+        .expect("read")
+        .expect("the renewal waits");
+    assert!(waiting.installed && !waiting.published);
+    domain.keys.iter().for_each(|key| key.touches.set(0));
+    let remote = remote_with(&scenario, &transition, Some(NOW), false);
+
+    let mut opened = open_abort(&remote, &domain.path, NOW).expect("the renewal does not block");
+    opened.approve(&domain.keys[0], NOW).expect("approved");
+    let signed = opened.sign_and_record(&domain.path, NOW).expect("signed");
+
+    let recorded = pending(&domain.path, NOW)
+        .expect("read")
+        .expect("the abort waits");
+    assert_eq!(recorded.kind, GatewayDecisionKind::Abort);
+    assert_eq!(recorded, signed);
+    carry_abort(&remote, &domain.path, recorded, NOW).expect("carried");
+    assert!(!record_on_disk(domain));
+}
+
+/// Only the renewal of the epoch staged is superseded.
+#[test]
+fn an_abort_does_not_supersede_a_renewal_of_another_epoch() {
+    let scenario = Scenario::new(false);
+    let domain = &scenario.domain;
+    let renewal = Remote::new(&scenario);
+    renewal.publish_replies.borrow_mut().push_back(Err(503));
+    let decision = signed_decision(&renewal, domain, options());
+    let mut transition = transition_of(&decision).expect("transition").clone();
+    carry(&renewal, &domain.path, decision, NOW).expect_err("not confirmed");
+    transition.gateway_identity_epoch += 1;
+    let remote = remote_with(&scenario, &transition, Some(NOW), false);
+
+    let error = refusal(open_abort(&remote, &domain.path, NOW));
+
+    assert_eq!(error, GatewayRefusal::AlreadyOpen);
     assert!(!remote.called("open_campaign"));
 }
 

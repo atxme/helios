@@ -736,9 +736,21 @@ pub fn open_abort(
     vault_path: &Path,
     now: u64,
 ) -> Result<OpenedGatewayAbort, GatewayRefusal> {
-    if pending(vault_path, now).map_err(internal)?.is_some() {
-        return Err(GatewayRefusal::AlreadyOpen);
-    }
+    // A renewal installed on the gateway and not published is the one record the
+    // cancellation supersedes, for the epoch staged: it is exactly what is being
+    // cancelled, and the abort record replaces it at the same path. Any other
+    // record keeps blocking.
+    let supersedable = match pending(vault_path, now).map_err(internal)? {
+        None => None,
+        Some(record)
+            if record.kind == GatewayDecisionKind::Renewal
+                && record.installed
+                && !record.published =>
+        {
+            Some(record)
+        }
+        Some(_) => return Err(GatewayRefusal::AlreadyOpen),
+    };
     if pending_revocation(vault_path, now)
         .map_err(internal)?
         .is_some()
@@ -750,6 +762,11 @@ pub fn open_abort(
         .staged_transition()
         .map_err(before_signing)?
         .ok_or(GatewayRefusal::NothingToAbort)?;
+    if let Some(record) = supersedable {
+        if transition_of(&record)?.gateway_identity_epoch != transition.gateway_identity_epoch {
+            return Err(GatewayRefusal::AlreadyOpen);
+        }
+    }
     let activation_at = transition.window.activation_at;
     if gateway.gateway_transition_published || gateway_clock(&gateway, now) >= activation_at {
         return Err(GatewayRefusal::AbortTooLate(activation_at));
