@@ -272,12 +272,20 @@ pub fn carry_revocation(
         if now >= revocation.expires_at {
             return probe_expired_revocation(remote, vault_path, signed);
         }
-        deposit_result(
+        if let Err(refusal) = deposit_result(
             remote,
             &revocation.operation_id,
             &revocation.campaign_id,
             &revocation.result,
-        )?;
+        ) {
+            // A definitive answer proves Astra did not accept the deposit: the revocation is
+            // dropped and the replacement waits for a new signature. Other failures keep it.
+            if matches!(refusal, GatewayRefusal::GatewayRefused(_)) {
+                signed.revocation = None;
+                keep(vault_path, &signed).map_err(internal)?;
+            }
+            return Err(refusal);
+        }
         signed.revocation_applied = true;
         save(&record_path(vault_path), &signed).map_err(internal)?;
     }

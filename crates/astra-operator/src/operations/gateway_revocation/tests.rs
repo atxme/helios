@@ -906,7 +906,7 @@ fn an_expired_replacement_campaign_discards_the_record() {
 }
 
 #[test]
-fn a_refused_revocation_is_not_discarded_while_its_state_is_unknown() {
+fn a_definitive_refusal_without_replacement_clears_the_record() {
     let scenario = Scenario::new(false);
     let remote = Remote::new(&scenario);
     let domain = &scenario.domain;
@@ -919,27 +919,67 @@ fn a_refused_revocation_is_not_discarded_while_its_state_is_unknown() {
         matches!(refusal, GatewayRefusal::GatewayRefused(_)),
         "{refusal:?}"
     );
-    assert!(record_on_disk(domain), "the refused decision waits");
-    let blocked = open_gateway_revocation(
+    assert!(!record_on_disk(domain), "nothing is left to finish");
+    open_gateway_revocation(
         &remote,
         &domain.path,
         RevocationReasonChoice::Compromised,
         false,
         NOW,
     )
-    .err()
-    .expect("blocked");
-    assert_eq!(blocked, GatewayRefusal::RevocationAlreadyOpen);
+    .expect("a new revocation opens");
+}
 
-    // The record cannot tell a refusal from an answer lost after Astra recorded it: a discard
-    // would leave a revoked gateway with no replacement, so it is refused.
-    let discard = discard_pending_revocation(&domain.path).expect_err("refused");
+#[test]
+fn a_definitive_deposit_refusal_leaves_the_replacement_only() {
+    let scenario = Scenario::new(true);
+    let remote = Remote::new(&scenario);
+    let domain = &scenario.domain;
+    let replacement = sign_replacement(&remote, domain);
+    carry_revocation(&remote, &domain.path, replacement, NOW).expect_err("to sign");
+    let signed = sign_revocation(&remote, domain, true);
+    remote.submit_replies.borrow_mut().push_back(Err(409));
 
-    assert_eq!(
-        discard,
-        GatewayRefusal::NotDiscardable(REVOCATION_LEFT.into())
+    let refusal =
+        carry_revocation(&remote, &domain.path, signed, NOW).expect_err("refused for good");
+    assert!(
+        matches!(refusal, GatewayRefusal::GatewayRefused(_)),
+        "{refusal:?}"
     );
-    assert!(record_on_disk(domain));
+    let kept = pending_revocation(&domain.path, NOW)
+        .expect("read")
+        .expect("the replacement waits");
+    assert!(
+        kept.revocation.is_none(),
+        "the refused revocation is dropped"
+    );
+    assert!(kept.replacement.as_ref().expect("replacement").deposited);
+
+    discard_pending_revocation(&domain.path).expect("discard allowed on a replacement-only record");
+    assert!(!record_on_disk(domain));
+}
+
+#[test]
+fn a_503_deposit_keeps_the_revocation_in_the_record() {
+    let scenario = Scenario::new(true);
+    let remote = Remote::new(&scenario);
+    let domain = &scenario.domain;
+    let replacement = sign_replacement(&remote, domain);
+    carry_revocation(&remote, &domain.path, replacement, NOW).expect_err("to sign");
+    let signed = sign_revocation(&remote, domain, true);
+    remote.submit_replies.borrow_mut().push_back(Err(503));
+
+    let refusal = carry_revocation(&remote, &domain.path, signed, NOW).expect_err("unreachable");
+
+    assert_eq!(refusal, GatewayRefusal::Unreachable);
+    let kept = pending_revocation(&domain.path, NOW)
+        .expect("read")
+        .expect("the record waits");
+    assert!(
+        kept.revocation.is_some(),
+        "the revocation stays for a retry"
+    );
+    assert!(!kept.revocation_applied);
 }
 
 #[test]
