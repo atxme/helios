@@ -7,7 +7,7 @@ import Typography from '@mui/material/Typography'
 
 import * as api from '../../api'
 import type { OperationKind, OperatorStatus, RotationsOverview, VaultCopyOutcome } from '../../types'
-import { PrerequisiteLine } from './RotationsPanel'
+import { PrerequisiteLine } from './PrerequisiteLine'
 import { valueOf, vaultCopyPrerequisite } from './rotationRows'
 
 /** The gestures that re-sign the credential document (spec §5.9). */

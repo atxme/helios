@@ -7,10 +7,10 @@ import CircularProgress from '@mui/material/CircularProgress'
 import Paper from '@mui/material/Paper'
 import TextField from '@mui/material/TextField'
 import Typography from '@mui/material/Typography'
-import { Check, KeyRound, X } from 'lucide-react'
+import { KeyRound } from 'lucide-react'
 
 import * as api from '../../api'
-import { GRAPHITE, PINE, RULE } from '../../theme'
+import { DUE_BACKGROUND, DUE_BORDER, GRAPHITE, RULE } from '../../theme'
 import type {
   OperatorPendingOperation,
   OperatorStatus,
@@ -24,8 +24,9 @@ import {
   reachLabel,
   rotationRows,
 } from './rotationRows'
-import type { Prerequisite, RotationAction, RotationRow } from './rotationRows'
+import type { RotationAction, RotationRow } from './rotationRows'
 import { GatewayIdentityBlock } from './GatewayIdentityBlock'
+import { PrerequisiteLine } from './PrerequisiteLine'
 
 /**
  * The overview is the one thing read here. It already carries `pending`, so nothing else
@@ -34,8 +35,6 @@ import { GatewayIdentityBlock } from './GatewayIdentityBlock'
 const POLL_MS = 15_000
 
 /** The amber of a row to do, as in the mockup the operator approved. */
-const DUE_BORDER = '#B45309'
-const DUE_BACKGROUND = '#FFFBEB'
 
 const DEFAULT_REASON: Partial<Record<RotationAction, string>> = {
   renew_fleet: 'Renouvellement des postes',
@@ -62,61 +61,6 @@ export interface RotationStepContext {
 function operatorLabelOf(o: RotationsOverview): string {
   const slot = o.vault?.slots.find((candidate) => candidate.state === null || candidate.state === 'active')
   return slot?.label.trim() || 'operator'
-}
-
-export function PrerequisiteLine({
-  line,
-  busy,
-  onFix,
-}: {
-  line: Prerequisite
-  busy: boolean
-  onFix?: (line: Prerequisite) => void
-}) {
-  return (
-    <Box component="li" sx={{ listStyle: 'none', py: 0.4 }}>
-      <Box
-        sx={{
-          display: 'flex',
-          alignItems: 'center',
-          flexWrap: 'wrap',
-          minWidth: 0,
-          gap: 0.75,
-          fontSize: 12.5,
-        }}
-      >
-        {line.ok ? (
-          <Check size={14} color={PINE} aria-label="Conforme" role="img" />
-        ) : (
-          <X size={14} color="#B91C1C" aria-label="Non conforme" role="img" />
-        )}
-        <Box component="span" sx={{ minWidth: 0, overflowWrap: 'anywhere' }}>
-          {line.label}
-        </Box>
-        {line.detail && (
-          <Typography component="span" color="text.secondary" sx={{ fontSize: 11.5 }}>
-            {line.detail}
-          </Typography>
-        )}
-        {line.fixAction === 'send_vault_copy' && (
-          <Button
-            size="small"
-            variant="outlined"
-            disabled={busy}
-            onClick={() => onFix?.(line)}
-            sx={{ ml: 'auto', minHeight: 26, fontSize: 11.5 }}
-          >
-            {line.fix}
-          </Button>
-        )}
-      </Box>
-      {!line.ok && line.fix && line.fixAction === null && (
-        <Typography color="text.secondary" sx={{ ml: 2.75, fontSize: 11.5 }}>
-          {line.fix}
-        </Typography>
-      )}
-    </Box>
-  )
 }
 
 /**

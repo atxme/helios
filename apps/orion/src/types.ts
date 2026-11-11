@@ -1211,7 +1211,6 @@ export interface PeersOverview {
 /** Les quatre motifs de révocation, en noms de fil (`RevocationReasonChoice`). */
 export type RevocationReasonChoice = 'stolen_or_lost' | 'compromised' | 'no_longer_used' | 'replaced'
 
-/** Un geste de l'onglet Postes ; la clé WireGuard et le nom viennent de la ligne choisie. */
 /** Un geste sur l'identité de la gateway (lot 6b), en noms de fil (`GatewayGesture`). */
 export type GatewayGesture =
   | {
@@ -1228,6 +1227,7 @@ export type GatewayGesture =
   | { gesture: 'resume' }
   | { gesture: 'discard' }
 
+/** Un geste de l'onglet Postes ; la clé WireGuard et le nom viennent de la ligne choisie. */
 export type RevocationGesture =
   | { gesture: 'revoke'; peer: string; name: string; reason: RevocationReasonChoice }
   | { gesture: 'resume'; peer: string; reason: RevocationReasonChoice }

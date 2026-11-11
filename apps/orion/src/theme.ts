@@ -31,6 +31,9 @@ export const GRAPHITE = '#5A6B65'
 export const SLATE = '#8A9691'
 /** Rules and separators. */
 export const RULE = '#E2E8E5'
+/** The amber of a row to do. */
+export const DUE_BORDER = '#B45309'
+export const DUE_BACKGROUND = '#FFFBEB'
 /** The brand's green: primary action and protected state, nothing else. */
 export const PINE = '#0B6B4E'
 /**

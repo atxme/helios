@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import type { ReactNode } from 'react'
 import Alert from '@mui/material/Alert'
 import Box from '@mui/material/Box'
@@ -11,7 +11,7 @@ import Typography from '@mui/material/Typography'
 import { KeyRound } from 'lucide-react'
 
 import * as api from '../../api'
-import { RULE } from '../../theme'
+import { DUE_BACKGROUND, DUE_BORDER, RULE } from '../../theme'
 import type {
   GatewayGesture,
   OperatorStatus,
@@ -19,14 +19,10 @@ import type {
   RotationsOverview,
 } from '../../types'
 import { MotifChoice } from './RotationSteps'
-import { PrerequisiteLine } from './RotationsPanel'
+import { PrerequisiteLine } from './PrerequisiteLine'
 import { GATEWAY_LABELS, gatewayRow } from './gatewayRows'
 import type { GatewayAction } from './gatewayRows'
 import { allGreen, prerequisites } from './rotationRows'
-
-/** The amber of a row to do, as the rotations rows show it. */
-const DUE_BORDER = '#B45309'
-const DUE_BACKGROUND = '#FFFBEB'
 
 /** The terms a gateway renewal is sent with: the gateway's own defaults. */
 const RENEW_TERMS = { prepare_days: 7, overlap_days: 7, validity_days: 365 } as const
@@ -85,6 +81,11 @@ export function GatewayIdentityBlock({
   const green = allGreen(lines)
 
   const [selected, setSelected] = useState<GatewayAction | null>(null)
+  // A refresh may take the chosen action away (a resumption ended, a rollback expired): its flow closes.
+  const offered = row.actions.join(',')
+  useEffect(() => {
+    setSelected((current) => (current !== null && !offered.split(',').includes(current) ? null : current))
+  }, [offered])
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [rotateTls, setRotateTls] = useState(false)
@@ -118,7 +119,7 @@ export function GatewayIdentityBlock({
       if (status) onCeremony(status)
       else setError('Aucune cérémonie ouverte.')
     } catch (cause) {
-      setError(String(cause))
+      setError(cause instanceof Error ? cause.message : String(cause))
     } finally {
       setBusy(false)
     }
@@ -185,7 +186,7 @@ export function GatewayIdentityBlock({
         {keyLost && (
           <Paper component="section" aria-label="Confirmation" variant="outlined" sx={{ px: 1.5, py: 1, mb: 1 }}>
             <Typography sx={{ fontSize: 12, mb: 0.5 }}>
-              La demande ne porte aucune signature de continuité.
+              Aucune preuve de continuité. Réservé à une clé disparue.
             </Typography>
             <FormControlLabel
               control={
@@ -347,7 +348,7 @@ export function GatewayIdentityBlock({
           onClick={() => void launch({ gesture: 'discard' })}
           sx={{ minHeight: 30, fontSize: 12 }}
         >
-          Jeter la décision
+          Jeter la décision en attente
         </Button>
       </Paper>
     )
@@ -380,6 +381,11 @@ export function GatewayIdentityBlock({
       {row.restart && (
         <Alert severity="warning" variant="outlined" sx={{ mt: 0.75, fontSize: 11.5 }}>
           {row.restart}
+          {row.restartMotif && (
+            <Typography component="span" color="text.secondary" sx={{ display: 'block', mt: 0.25, fontSize: 10.5 }}>
+              {`Détail technique : ${row.restartMotif}`}
+            </Typography>
+          )}
         </Alert>
       )}
       <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.75, mt: 0.75 }}>
@@ -388,7 +394,7 @@ export function GatewayIdentityBlock({
             key={action}
             size="small"
             variant={action === row.actions[0] && row.due ? 'contained' : 'outlined'}
-            disabled={busy}
+            disabled={busy || (action === 'renew' && row.renewReason !== null)}
             aria-expanded={selected === action}
             onClick={() => choose(action)}
             sx={{ minHeight: 28, fontSize: 12 }}
@@ -397,6 +403,11 @@ export function GatewayIdentityBlock({
           </Button>
         ))}
       </Box>
+      {row.renewReason && (
+        <Typography color="text.secondary" sx={{ mt: 0.5, fontSize: 11.5 }}>
+          {row.renewReason}
+        </Typography>
+      )}
 
       {selected && selected !== 'discard' && (
         <Paper component="section" aria-label="Prérequis de la gateway" variant="outlined" sx={{ mt: 1.25, px: 1.5, py: 1 }}>

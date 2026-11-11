@@ -110,19 +110,34 @@ describe('gatewayRow', () => {
 
   it('renew_disabled_during_a_ca_pq_overlap', () => {
     const row = gatewayRow(withGateway({}, { caPqOverlap: true }), NOW)
-    expect(row.actions).not.toContain('renew')
+    // Listed, so the button is there, but its reason says why it cannot be started.
+    expect(row.actions).toContain('renew')
+    expect(row.renewReason).toBe(OVERLAP_PQ)
     expect(row.actions).toContain('revoke')
-    expect(row.detail).toBe(OVERLAP_PQ)
+    expect(gatewayRow(withGateway(), NOW).renewReason).toBeNull()
+  })
+
+  it('abort_record_reads_the_cancellation_to_resume_and_never_offers_abort', () => {
+    const row = gatewayRow(
+      withGateway(
+        { gateway_transition_pending: true, gateway_activation_at: NOW + 7 * DAY },
+        { gatewayPending: pending({ decision_kind: 'abort', installed: true, published: false }) },
+      ),
+      NOW,
+    )
+    expect(row.state).toBe('Annulation à reprendre')
+    expect(row.actions).toEqual(['resume', 'discard'])
   })
 
   it('restart_due_shows_the_reason_and_the_sentence', () => {
     const row = gatewayRow(
-      withGateway({ gateway_restart_due: 'une rotation de service est en vigueur' }),
+      withGateway({ gateway_restart_due: 'a service rollback is in force' }),
       NOW,
     )
-    expect(row.restart).toBe(
-      'une rotation de service est en vigueur. Redémarrer heliosd sur la gateway.',
-    )
+    // The sentence is the main text; heliosd's English motif is kept apart, as a detail.
+    expect(row.restart).toBe('Redémarrer heliosd sur la gateway.')
+    expect(row.restartMotif).toBe('a service rollback is in force')
+    expect(gatewayRow(withGateway(), NOW).restart).toBeNull()
   })
 
   it('discard_is_offered_whenever_a_record_waits', () => {

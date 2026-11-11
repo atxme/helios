@@ -16,7 +16,7 @@ import type {
   RotationsOverview,
 } from '../../types'
 import { MotifChoice } from './RotationSteps'
-import { PrerequisiteLine } from './RotationsPanel'
+import { PrerequisiteLine } from './PrerequisiteLine'
 import { STATE, peerRows } from './peerRows'
 import type { PeerRow } from './peerRows'
 import { formatDate, prerequisites, reachLabel } from './rotationRows'

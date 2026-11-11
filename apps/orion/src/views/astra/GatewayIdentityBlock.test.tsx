@@ -52,7 +52,7 @@ afterEach(() => {
 describe('GatewayIdentityBlock', () => {
   it('renew_runs_prerequisites_options_and_terms_then_hands_over_the_ceremony', async () => {
     const { onCeremony } = renderBlock(withDomain())
-    fireEvent.click(block().getByRole('button', { name: 'Renouveler' }))
+    fireEvent.click(block().getByRole('button', { name: "Renouveler l'identité de la gateway" }))
     expect(screen.getByRole('region', { name: 'Prérequis de la gateway' })).toBeTruthy()
     expect(screen.getByText('Termes : préparation 7 jours, recouvrement 7 jours, validité 365 jours.')).toBeTruthy()
     fireEvent.click(screen.getByRole('checkbox', { name: 'Remplacer aussi la feuille TLS' }))
@@ -72,22 +72,24 @@ describe('GatewayIdentityBlock', () => {
 
   it('key_loss_needs_its_own_confirmation_before_renewing', () => {
     renderBlock(withDomain())
-    fireEvent.click(block().getByRole('button', { name: 'Renouveler' }))
+    fireEvent.click(block().getByRole('button', { name: "Renouveler l'identité de la gateway" }))
     fireEvent.click(screen.getByRole('checkbox', { name: 'La clé de la gateway est perdue' }))
+    expect(screen.getByText('Aucune preuve de continuité. Réservé à une clé disparue.')).toBeTruthy()
     expect(screen.getByRole('button', { name: 'Continuer' }).hasAttribute('disabled')).toBe(true)
     fireEvent.click(screen.getByRole('checkbox', { name: 'Je confirme la perte de la clé' }))
     expect(screen.getByRole('button', { name: 'Continuer' }).hasAttribute('disabled')).toBe(false)
   })
 
-  it('renew_is_not_offered_during_a_ca_pq_overlap', () => {
+  it('renew_is_disabled_during_a_ca_pq_overlap', () => {
     renderBlock(withDomain({}, { caPqOverlap: true }))
-    expect(block().queryByRole('button', { name: 'Renouveler' })).toBeNull()
+    const renew = block().getByRole('button', { name: "Renouveler l'identité de la gateway" })
+    expect(renew.hasAttribute('disabled')).toBe(true)
     expect(block().getByText('Recouvrement CA-PQ en cours')).toBeTruthy()
   })
 
   it('nothing_is_started_while_prerequisites_are_red', () => {
     renderBlock(withDomain({}, { tunnel: false }))
-    fireEvent.click(block().getByRole('button', { name: 'Renouveler' }))
+    fireEvent.click(block().getByRole('button', { name: "Renouveler l'identité de la gateway" }))
     expect(screen.getByText('Tunnel connecté')).toBeTruthy()
     expect(screen.queryByRole('button', { name: 'Continuer' })).toBeNull()
   })
@@ -99,7 +101,7 @@ describe('GatewayIdentityBlock', () => {
         { gatewayPending: pending({ installed: true, published: false }) },
       ),
     )
-    fireEvent.click(block().getByRole('button', { name: 'Annuler la transition' }))
+    fireEvent.click(block().getByRole('button', { name: 'Annuler' }))
     expect(screen.getByText("L'époque reste consommée.")).toBeTruthy()
     fireEvent.click(screen.getByRole('button', { name: 'Confirmer l’annulation' }))
     await waitFor(() => expect(api.beginGatewayCeremony).toHaveBeenCalledWith({ gesture: 'abort' }))
@@ -113,7 +115,7 @@ describe('GatewayIdentityBlock', () => {
         gateway_retire_active_at: NOW + 6 * DAY,
       }),
     )
-    fireEvent.click(block().getByRole('button', { name: 'Revenir en arrière' }))
+    fireEvent.click(block().getByRole('button', { name: "Revenir à l'ancienne identité" }))
     expect((screen.getByLabelText('Durée (heures)') as HTMLInputElement).value).toBe('24')
     fireEvent.click(screen.getByRole('button', { name: 'Lancer le retour arrière' }))
     expect(screen.getByText('Motif : de 1 à 200 caractères')).toBeTruthy()
@@ -191,7 +193,7 @@ describe('GatewayIdentityBlock', () => {
     const { refresh, onCeremony } = renderBlock(withDomain({}, { gatewayPending: pending() }))
     fireEvent.click(block().getByRole('button', { name: 'Jeter la décision en attente' }))
     expect(screen.getByText("La décision signée sera perdue. L'époque reste consommée.")).toBeTruthy()
-    fireEvent.click(screen.getByRole('button', { name: 'Jeter la décision' }))
+    fireEvent.click(confirmation().getByRole('button', { name: 'Jeter la décision en attente' }))
     await waitFor(() => expect(api.beginGatewayCeremony).toHaveBeenCalledWith({ gesture: 'discard' }))
     await waitFor(() => expect(refresh).toHaveBeenCalled())
     expect(api.operatorCeremonyStatus).not.toHaveBeenCalled()
@@ -202,7 +204,7 @@ describe('GatewayIdentityBlock', () => {
     api.beginGatewayCeremony.mockRejectedValue('Une cérémonie est ouverte : la terminer d’abord.')
     renderBlock(withDomain({}, { gatewayPending: pending() }))
     fireEvent.click(block().getByRole('button', { name: 'Jeter la décision en attente' }))
-    fireEvent.click(screen.getByRole('button', { name: 'Jeter la décision' }))
+    fireEvent.click(confirmation().getByRole('button', { name: 'Jeter la décision en attente' }))
     expect(await screen.findByText('Une cérémonie est ouverte : la terminer d’abord.')).toBeTruthy()
   })
 
@@ -215,5 +217,39 @@ describe('GatewayIdentityBlock', () => {
     fireEvent.click(block().getAllByRole('button', { name: 'Reprendre' })[1])
     await waitFor(() => expect(api.beginGatewayCeremony).toHaveBeenCalledWith({ gesture: 'resume' }))
     await waitFor(() => expect(onCeremony).toHaveBeenCalledWith(ceremony))
+  })
+
+  it('restart_shows_the_sentence_and_the_raw_motif_as_a_quiet_detail', () => {
+    renderBlock(withDomain({ gateway_restart_due: 'a service rollback is in force' }))
+    expect(screen.getByText('Redémarrer heliosd sur la gateway.')).toBeTruthy()
+    expect(screen.getByText('Détail technique : a service rollback is in force')).toBeTruthy()
+  })
+
+  it('a_flow_closes_when_a_refresh_takes_its_action_away', () => {
+    const rollbackable = withDomain({
+      gateway_transition_published: true,
+      gateway_activation_at: NOW - DAY,
+      gateway_retire_active_at: NOW + 6 * DAY,
+    })
+    const onCeremony = vi.fn()
+    const refresh = vi.fn()
+    const { rerender } = render(
+      <GatewayIdentityBlock overview={rollbackable} now={NOW} onCeremony={onCeremony} refresh={refresh} />,
+    )
+    fireEvent.click(block().getByRole('button', { name: "Revenir à l'ancienne identité" }))
+    expect(screen.getByRole('button', { name: 'Lancer le retour arrière' })).toBeTruthy()
+    rerender(
+      <GatewayIdentityBlock overview={withDomain()} now={NOW} onCeremony={onCeremony} refresh={refresh} />,
+    )
+    expect(screen.queryByRole('button', { name: 'Lancer le retour arrière' })).toBeNull()
+  })
+
+  it('an_error_shows_its_message_without_an_error_prefix', async () => {
+    api.beginGatewayCeremony.mockRejectedValue(new Error('la gateway ne répond pas'))
+    renderBlock(withDomain({}, { gatewayPending: pending() }))
+    fireEvent.click(block().getByRole('button', { name: 'Jeter la décision en attente' }))
+    fireEvent.click(confirmation().getByRole('button', { name: 'Jeter la décision en attente' }))
+    expect(await screen.findByText('la gateway ne répond pas')).toBeTruthy()
+    expect(screen.queryByText(/Error:/)).toBeNull()
   })
 })

@@ -16,17 +16,21 @@ export interface GatewayRow {
   /** The identity is to renew now: its expiry is near, or a publication waits. */
   due: boolean
   actions: GatewayAction[]
-  /** The reason the daemon must restart, then the sentence that says so. */
+  /** The sentence that says the daemon must restart; `null` when none is due. */
   restart: string | null
+  /** The motif heliosd gave for the restart, raw: a technical detail, never the main text. */
+  restartMotif: string | null
+  /** Why renew is listed but disabled; `null` when it can be started. */
+  renewReason: string | null
   /** A second line of fact, such as a rollback in force or what a stop leaves untouched. */
   detail: string | null
 }
 
 /** The button labels of the block, one per action. */
 export const GATEWAY_LABELS: Record<GatewayAction, string> = {
-  renew: 'Renouveler',
-  abort: 'Annuler la transition',
-  rollback: 'Revenir en arrière',
+  renew: "Renouveler l'identité de la gateway",
+  abort: 'Annuler',
+  rollback: "Revenir à l'ancienne identité",
   revoke: 'Révoquer la gateway',
   resume: 'Reprendre',
   discard: 'Jeter la décision en attente',
@@ -46,9 +50,8 @@ export function gatewayRow(o: RotationsOverview, local: number): GatewayRow {
   const now = effectiveNow(o, local)
   const domain = valueOf(o.domain)
   const waiting = o.gatewayPending
-  const restart = domain?.gateway_restart_due
-    ? `${domain.gateway_restart_due.replace(/\.?$/, '.')} ${RESTART_SENTENCE}`
-    : null
+  const restart = domain?.gateway_restart_due ? RESTART_SENTENCE : null
+  const restartMotif = domain?.gateway_restart_due ?? null
 
   if (waiting?.kind === 'revocation') {
     const toSign = waiting.revocation_to_sign
@@ -61,11 +64,14 @@ export function gatewayRow(o: RotationsOverview, local: number): GatewayRow {
       due: true,
       actions: toSign ? ['revoke', 'discard'] : ['resume', 'discard'],
       restart,
+      restartMotif,
+      renewReason: null,
       detail: toSign ? REVOCATION_TO_SIGN : null,
     }
   }
 
   const detail: string[] = []
+  let renewReason: string | null = null
   let state: string
   let due = false
   let actions: GatewayAction[] = []
@@ -83,7 +89,11 @@ export function gatewayRow(o: RotationsOverview, local: number): GatewayRow {
       detail.push(`Retour arrière jusqu'au ${formatDateTime(domain.gateway_rollback_expires_at)}`)
     }
 
-    if (waiting?.kind === 'decision' && !waiting.installed) {
+    if (waiting?.kind === 'decision' && waiting.decision_kind === 'abort') {
+      // The cancellation is only to be carried on: a new abort of it is never offered.
+      state = 'Annulation à reprendre'
+      due = true
+    } else if (waiting?.kind === 'decision' && !waiting.installed) {
       state = 'Décision à reprendre'
       due = true
     } else if (
@@ -112,10 +122,7 @@ export function gatewayRow(o: RotationsOverview, local: number): GatewayRow {
       }
       actions = ['renew', 'revoke']
       // Renewing waits for a CA-PQ overlap to end: every approval under it is refused.
-      if (o.caPqOverlap === true) {
-        actions = actions.filter((action) => action !== 'renew')
-        detail.push(OVERLAP_PQ)
-      }
+      if (o.caPqOverlap === true) renewReason = OVERLAP_PQ
     }
   }
 
@@ -130,6 +137,8 @@ export function gatewayRow(o: RotationsOverview, local: number): GatewayRow {
     due,
     actions,
     restart,
+    restartMotif,
+    renewReason,
     detail: detail.length > 0 ? detail.join(' · ') : null,
   }
 }
