@@ -700,6 +700,7 @@ export type Refusal =
   | { refusal: 'peer_name_mismatch' }
   | { refusal: 'self_revocation' }
   | { refusal: 'revocation_awaits_deposit' }
+  | { refusal: 'revocation_to_sign' }
   | { refusal: 'revocation_not_before'; until: number }
   | { refusal: 'revocation_anchor_unknown' }
   | { refusal: 'credentials_unverified' }

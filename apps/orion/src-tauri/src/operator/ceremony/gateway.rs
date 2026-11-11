@@ -8,8 +8,8 @@
 //! # What stays here
 //!
 //! The openings a campaign released are held for the length of the approval, and nothing
-//! else. Every exit of the ceremony erases them, whatever the step ended with: see
-//! [`GatewayRun::run`].
+//! else. Each one is an [`Opening`]: it is dropped when it is signed or when the ceremony
+//! ends, whatever the step ended with, and under test each drop is counted.
 //!
 //! # Whose gateway
 //!
@@ -47,6 +47,19 @@ const NO_TUNNEL: &str = "aucun tunnel n'est monté vers la gateway";
 
 /// Said when a discard is asked of a ceremony: it takes no key and runs no ceremony.
 const DISCARD_IS_NO_CEREMONY: &str = "jeter une décision en attente ne se fait pas en cérémonie";
+
+/// Said when the record waiting for the gateway cannot be read. The detail names paths: it goes
+/// to the log, never to the page.
+pub(crate) const RECORD_UNREADABLE: &str =
+    "le registre de l'identité de la gateway ne se lit pas : rien n'a été changé";
+
+/// Said when the waiting record could not be dropped. The detail names paths: it goes to the
+/// log, never to the page.
+const DISCARD_FAILED: &str = "la décision en attente n'a pas pu être jetée : rien n'a été changé";
+
+/// Said when the revocation's replacement is deposited and the revocation is still to sign.
+const REVOCATION_TO_SIGN: &str =
+    "La révocation reste à signer : choisir « Révoquer la gateway ». Rien n'a été révoqué.";
 
 /// Runs one gateway gesture to its end against the vault at `vault_path`, publishing every
 /// state it reaches. `requested_by` is the workstation's name, which a rollback's campaign
@@ -100,7 +113,6 @@ pub fn run_gateway(
         words,
         &reach,
     )
-    .0
 }
 
 /// What a gateway gesture reaches outside this process, and the time it reads.
@@ -111,7 +123,7 @@ struct Reach<'a> {
 }
 
 /// [`run_gateway`] with what it reaches named, so a test can stand in for the gateway and for
-/// Astra. Returns the outcome, and whether the openings were erased at the exit.
+/// Astra.
 #[allow(clippy::too_many_arguments)]
 fn run_with(
     session_id: Id16,
@@ -123,7 +135,7 @@ fn run_with(
     requested_by: &str,
     words: &Words,
     reach: &Reach<'_>,
-) -> (Result<(), String>, bool) {
+) -> Result<(), String> {
     let mut ceremony = Ceremony::new(
         session_id,
         OperationLocator {
@@ -133,14 +145,13 @@ fn run_with(
     );
     publish(ceremony.status());
     if !relay_names_peer(vault_path, &target.peer_key).unwrap_or(false) {
-        let result = stop(
+        return stop(
             &mut ceremony,
             publish,
             words,
             Refusal::HandoffMismatch,
             WRONG_GATEWAY.to_string(),
         );
-        return (result, true);
     }
     let mut run = GatewayRun::new(
         &mut ceremony,
@@ -187,49 +198,120 @@ fn refusal_of(error: &GatewayRefusal) -> Refusal {
     }
 }
 
+/// The record waiting for the gateway could not be read: the detail goes to the log only.
+pub(crate) fn unreadable_record(error: &anyhow::Error) -> String {
+    tracing::warn!(error = %format!("{error:#}"), "registre de la gateway illisible");
+    RECORD_UNREADABLE.to_string()
+}
+
+/// An opening the ceremony holds until it is signed or the ceremony ends. Its drop is where
+/// the ceremony erases what the campaign released; under test, each drop is counted against
+/// each opening made.
+struct Opening<T> {
+    inner: Option<T>,
+}
+
+#[cfg(test)]
+mod probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Openings made, and openings dropped, on this thread.
+        static OPENINGS: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+    }
+
+    pub(super) fn reset() {
+        OPENINGS.with(|counts| counts.set((0, 0)));
+    }
+
+    pub(super) fn made() {
+        OPENINGS.with(|counts| {
+            let (made, dropped) = counts.get();
+            counts.set((made + 1, dropped));
+        });
+    }
+
+    pub(super) fn dropped() {
+        OPENINGS.with(|counts| {
+            let (made, dropped) = counts.get();
+            counts.set((made, dropped + 1));
+        });
+    }
+
+    pub(super) fn counts() -> (usize, usize) {
+        OPENINGS.with(Cell::get)
+    }
+}
+
+impl<T> Opening<T> {
+    fn new(inner: T) -> Self {
+        #[cfg(test)]
+        probe::made();
+        Self { inner: Some(inner) }
+    }
+
+    fn get(&self) -> Option<&T> {
+        self.inner.as_ref()
+    }
+
+    fn get_mut(&mut self) -> Option<&mut T> {
+        self.inner.as_mut()
+    }
+
+    /// Takes the opening out to sign it. What remains is dropped at once.
+    fn take(mut self) -> Option<T> {
+        self.inner.take()
+    }
+}
+
+impl<T> Drop for Opening<T> {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        probe::dropped();
+    }
+}
+
 /// The openings a gesture holds between its approval and its signature. Neither `Send` nor
-/// `Sync`: they stay on the ceremony's thread, and dropping them wipes them.
+/// `Sync`: they stay on the ceremony's thread.
 enum Held {
     Nothing,
-    Renewal(Box<OpenedGatewayRenewal>),
-    Abort(Box<OpenedGatewayAbort>),
-    Rollback(Box<OpenedGatewayRollback>),
-    Revocation(Box<OpenedGatewayRevocation>),
+    Renewal(Opening<OpenedGatewayRenewal>),
+    Abort(Opening<OpenedGatewayAbort>),
+    Rollback(Opening<OpenedGatewayRollback>),
+    Revocation(Opening<OpenedGatewayRevocation>),
 }
 
 impl Held {
-    fn is_nothing(&self) -> bool {
-        matches!(self, Self::Nothing)
-    }
-
     /// How many credentials approve what is held, or `None` when nothing is.
     fn required(&self) -> Option<u8> {
         match self {
             Self::Nothing => None,
-            Self::Renewal(held) => Some(held.required_credentials()),
-            Self::Abort(held) => Some(held.required_credentials()),
-            Self::Rollback(held) => Some(held.required_credentials()),
-            Self::Revocation(held) => Some(held.required_credentials()),
+            Self::Renewal(held) => held.get().map(OpenedGatewayRenewal::required_credentials),
+            Self::Abort(held) => held.get().map(OpenedGatewayAbort::required_credentials),
+            Self::Rollback(held) => held.get().map(OpenedGatewayRollback::required_credentials),
+            Self::Revocation(held) => held
+                .get()
+                .map(OpenedGatewayRevocation::required_credentials),
         }
     }
 
     fn expires_at(&self) -> Option<u64> {
         match self {
             Self::Nothing => None,
-            Self::Renewal(held) => Some(held.campaign_expires_at()),
-            Self::Abort(held) => Some(held.campaign_expires_at()),
-            Self::Rollback(held) => Some(held.campaign_expires_at()),
-            Self::Revocation(held) => Some(held.campaign_expires_at()),
+            Self::Renewal(held) => held.get().map(OpenedGatewayRenewal::campaign_expires_at),
+            Self::Abort(held) => held.get().map(OpenedGatewayAbort::campaign_expires_at),
+            Self::Rollback(held) => held.get().map(OpenedGatewayRollback::campaign_expires_at),
+            Self::Revocation(held) => held.get().map(OpenedGatewayRevocation::campaign_expires_at),
         }
     }
 
     fn manifest(&self, now: u64) -> Option<AstraManifest> {
         match self {
             Self::Nothing => None,
-            Self::Renewal(held) => Some(held.manifest()),
-            Self::Abort(held) => Some(held.manifest()),
-            Self::Rollback(held) => Some(held.manifest()),
-            Self::Revocation(held) => Some(held.manifest(now)),
+            Self::Renewal(held) => held.get().map(OpenedGatewayRenewal::manifest),
+            Self::Abort(held) => held.get().map(OpenedGatewayAbort::manifest),
+            Self::Rollback(held) => held.get().map(OpenedGatewayRollback::manifest),
+            Self::Revocation(held) => held.get().map(|opened| opened.manifest(now)),
         }
     }
 
@@ -237,10 +319,10 @@ impl Held {
     fn approve(&mut self, key: &dyn Authenticator, now: u64) -> Option<Result<String, KeyStep>> {
         match self {
             Self::Nothing => None,
-            Self::Renewal(held) => Some(held.approve(key, now)),
-            Self::Abort(held) => Some(held.approve(key, now)),
-            Self::Rollback(held) => Some(held.approve(key, now)),
-            Self::Revocation(held) => Some(held.approve(key, now)),
+            Self::Renewal(held) => held.get_mut().map(|opened| opened.approve(key, now)),
+            Self::Abort(held) => held.get_mut().map(|opened| opened.approve(key, now)),
+            Self::Rollback(held) => held.get_mut().map(|opened| opened.approve(key, now)),
+            Self::Revocation(held) => held.get_mut().map(|opened| opened.approve(key, now)),
         }
     }
 }
@@ -288,9 +370,8 @@ impl<'a> GatewayRun<'a> {
         }
     }
 
-    /// Runs the gesture. Returns the outcome and whether nothing is held once it has ended:
-    /// every exit erases what the ceremony held, whatever the step ended with.
-    fn run(&mut self, gesture: GatewayGesture) -> (Result<(), String>, bool) {
+    /// Runs the gesture. Whatever it ended with, the openings it held are dropped here.
+    fn run(&mut self, gesture: GatewayGesture) -> Result<(), String> {
         let stepped = match gesture {
             GatewayGesture::Renew {
                 rotate_tls,
@@ -317,10 +398,9 @@ impl<'a> GatewayRun<'a> {
             }
         };
         self.held = Held::Nothing;
-        let erased = self.held.is_nothing();
         match stepped {
-            Ok(()) => (Ok(()), erased),
-            Err(Ended(end)) => (end, erased),
+            Ok(()) => Ok(()),
+            Err(Ended(end)) => end,
         }
     }
 
@@ -332,6 +412,12 @@ impl<'a> GatewayRun<'a> {
 
     fn fail_with(&mut self, error: &GatewayRefusal) -> Ended {
         self.fail(refusal_of(error), error.to_string())
+    }
+
+    /// A record that cannot be read: its detail to the log, a fixed sentence to the page.
+    fn unreadable(&mut self, error: &anyhow::Error) -> Ended {
+        let message = unreadable_record(error);
+        self.fail(Refusal::Internal, message)
     }
 
     /// Holds what a campaign opened, and shows the operator what it names before the first key.
@@ -388,9 +474,12 @@ impl<'a> GatewayRun<'a> {
         let opened =
             gateway_identity::open_renewal(self.reach.remote, self.vault_path, options, now)
                 .map_err(|error| self.fail_with(&error))?;
-        self.hold(Held::Renewal(Box::new(opened)), now)?;
+        self.hold(Held::Renewal(Opening::new(opened)), now)?;
         self.approve()?;
-        let Held::Renewal(opened) = self.sign_gate()? else {
+        let Held::Renewal(opening) = self.sign_gate()? else {
+            return Err(self.nothing_held());
+        };
+        let Some(opened) = opening.take() else {
             return Err(self.nothing_held());
         };
         let now = self.now();
@@ -416,9 +505,12 @@ impl<'a> GatewayRun<'a> {
         let now = self.now();
         let opened = gateway_identity::open_abort(self.reach.remote, self.vault_path, now)
             .map_err(|error| self.fail_with(&error))?;
-        self.hold(Held::Abort(Box::new(opened)), now)?;
+        self.hold(Held::Abort(Opening::new(opened)), now)?;
         self.approve()?;
-        let Held::Abort(opened) = self.sign_gate()? else {
+        let Held::Abort(opening) = self.sign_gate()? else {
+            return Err(self.nothing_held());
+        };
+        let Some(opened) = opening.take() else {
             return Err(self.nothing_held());
         };
         let now = self.now();
@@ -455,9 +547,12 @@ impl<'a> GatewayRun<'a> {
             now,
         )
         .map_err(|error| self.fail_with(&error))?;
-        self.hold(Held::Rollback(Box::new(opened)), now)?;
+        self.hold(Held::Rollback(Opening::new(opened)), now)?;
         self.approve()?;
-        let Held::Rollback(opened) = self.sign_gate()? else {
+        let Held::Rollback(opening) = self.sign_gate()? else {
+            return Err(self.nothing_held());
+        };
+        let Some(opened) = opening.take() else {
             return Err(self.nothing_held());
         };
         let now = self.now();
@@ -488,9 +583,12 @@ impl<'a> GatewayRun<'a> {
                 now,
             )
             .map_err(|error| self.fail_with(&error))?;
-            self.hold(Held::Revocation(Box::new(opened)), now)?;
+            self.hold(Held::Revocation(Opening::new(opened)), now)?;
             self.approve()?;
-            let Held::Revocation(opened) = self.sign_gate()? else {
+            let Held::Revocation(opening) = self.sign_gate()? else {
+                return Err(self.nothing_held());
+            };
+            let Some(opened) = opening.take() else {
                 return Err(self.nothing_held());
             };
             let now = self.now();
@@ -529,8 +627,18 @@ impl<'a> GatewayRun<'a> {
     fn resume(&mut self) -> Step<()> {
         let now = self.now();
         let revocation = gateway_revocation::pending_revocation(self.vault_path, now)
-            .map_err(|error| self.fail(Refusal::Internal, format!("{error:#}")))?;
+            .map_err(|error| self.unreadable(&error))?;
         if let Some(signed) = revocation {
+            // Only the revocation is left to sign: the approval that signs it is a new gesture,
+            // which takes the reason. Nothing is called before this refusal.
+            if signed.revocation.is_none()
+                && signed
+                    .replacement
+                    .as_ref()
+                    .is_some_and(|replacement| replacement.deposited)
+            {
+                return Err(self.fail(Refusal::RevocationToSign, REVOCATION_TO_SIGN.to_string()));
+            }
             self.ceremony.operation = OperationKind::RevokeCertificate;
             self.ceremony.gesture = GestureState::Signing;
             self.show();
@@ -550,7 +658,7 @@ impl<'a> GatewayRun<'a> {
             };
         }
         let decision = gateway_identity::pending(self.vault_path, now)
-            .map_err(|error| self.fail(Refusal::Internal, format!("{error:#}")))?;
+            .map_err(|error| self.unreadable(&error))?;
         match decision {
             Some(decision) => {
                 self.ceremony.gesture = GestureState::Signing;
@@ -569,16 +677,20 @@ impl<'a> GatewayRun<'a> {
 }
 
 /// Drops the waiting record: the revocation's when one waits, the decision's otherwise. Takes
-/// no key. The operations decide whether a discard is allowed, and their error is surfaced.
+/// no key. The operations decide whether a discard is allowed, and their error is surfaced
+/// as a fixed sentence when it is a read.
 pub(crate) fn discard_waiting(vault_path: &Path) -> Result<(), String> {
     let revocation = gateway_revocation::pending_revocation(vault_path, now_unix())
-        .map_err(|error| format!("{error:#}"))?;
+        .map_err(|error| unreadable_record(&error))?;
     if revocation.is_some() {
         gateway_revocation::discard_pending_revocation(vault_path)
     } else {
         gateway_identity::discard_pending(vault_path)
     }
-    .map_err(|error| format!("{error:#}"))
+    .map_err(|error| {
+        tracing::warn!(error = %format!("{error:#}"), "décision gateway non jetée");
+        DISCARD_FAILED.to_string()
+    })
 }
 
 #[cfg(test)]

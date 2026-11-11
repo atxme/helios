@@ -453,6 +453,9 @@ pub enum Refusal {
     SelfRevocation,
     /// Another revocation waits for its deposit: it must be finished first.
     RevocationAwaitsDeposit,
+    /// The replacement is deposited and the revocation still waits for its own approval:
+    /// nothing is revoked yet.
+    RevocationToSign,
     /// The outgoing `CA-PQ` may sign a revocation only until this second, the margin
     /// before its retirement.
     RevocationNotBefore { until: u64 },
@@ -1013,6 +1016,7 @@ mod tests {
                 Refusal::RevocationAwaitsDeposit,
                 "revocation_awaits_deposit",
             ),
+            (Refusal::RevocationToSign, "revocation_to_sign"),
             (
                 Refusal::RevocationAnchorUnknown,
                 "revocation_anchor_unknown",

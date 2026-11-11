@@ -622,6 +622,8 @@ export function refusalSentence(
       return 'Ce poste ne peut pas se révoquer lui-même : utiliser `helios peer revoke <nom>` sur la gateway.'
     case 'revocation_awaits_deposit':
       return 'Une révocation attend son dépôt : la reprendre d’abord.'
+    case 'revocation_to_sign':
+      return "La révocation reste à signer : choisir « Révoquer la gateway ». Rien n'a été révoqué."
     case 'revocation_not_before':
       return `Révocation possible après le ${formatDateTime(refusal.until)}.`
     case 'revocation_anchor_unknown':

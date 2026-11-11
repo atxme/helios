@@ -554,6 +554,7 @@ impl GatewayGesture {
                 validity_days,
                 ..
             } => {
+                // A sanity bound on the input, not a policy value.
                 for days in [prepare_days, overlap_days, validity_days] {
                     if !(1..=MAX_GATEWAY_TERM_DAYS).contains(days) {
                         return Err(format!(
@@ -951,7 +952,7 @@ impl OperatorCeremony {
                 })
                 .await
                 .map_err(|error| format!("lecture de la révocation en attente : {error}"))?
-                .map_err(|error| format!("{error:#}"))?;
+                .map_err(|error| ceremony::unreadable_record(&error))?;
                 if waiting.is_some() {
                     OperationKind::RevokeCertificate
                 } else {
