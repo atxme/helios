@@ -218,14 +218,12 @@ pub(crate) fn status(state_dir: &Path, expected_audit_head: Option<&str>) -> Res
         {
             if let Ok(fingerprint) = transition.fingerprint() {
                 println!(
-                    "gateway transition: époque {} — {} — {}",
-                    transition.gateway_identity_epoch,
-                    fingerprint,
-                    if stored.published {
-                        "publiée"
-                    } else {
-                        "non publiée"
-                    }
+                    "{}",
+                    transition_line(
+                        transition.gateway_identity_epoch,
+                        &fingerprint,
+                        stored.published
+                    )
                 );
             }
         }
@@ -245,4 +243,35 @@ pub(crate) fn status(state_dir: &Path, expected_audit_head: Option<&str>) -> Res
         );
     }
     Ok(())
+}
+
+/// The `status` line for one stored gateway transition: the fingerprint to give to
+/// `gateway-identity publish --transition`.
+fn transition_line(epoch: u64, fingerprint: &Fingerprint, published: bool) -> String {
+    format!(
+        "gateway transition: époque {epoch} — {fingerprint} — {}",
+        if published {
+            "publiée"
+        } else {
+            "non publiée"
+        }
+    )
+}
+
+#[cfg(test)]
+mod transition_line_tests {
+    use super::*;
+
+    #[test]
+    fn the_status_line_names_the_epoch_the_fingerprint_and_the_mark() {
+        let fingerprint = Fingerprint::of(b"a transition");
+        assert_eq!(
+            transition_line(5, &fingerprint, false),
+            format!("gateway transition: époque 5 — {fingerprint} — non publiée")
+        );
+        assert_eq!(
+            transition_line(6, &fingerprint, true),
+            format!("gateway transition: époque 6 — {fingerprint} — publiée")
+        );
+    }
 }

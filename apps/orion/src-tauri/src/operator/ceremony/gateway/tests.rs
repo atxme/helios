@@ -723,9 +723,42 @@ fn a_guidance_sentence_reaches_the_page_verbatim() {
     let message = ran.outcome.expect_err("not confirmed");
     assert_eq!(
         message,
+        "la gateway n'a pas confirmé la relève : reprendre pour la lui demander à nouveau."
+    );
+    assert_eq!(ran.words.as_deref(), Some(message.as_str()));
+}
+
+/// An internal failure that names the vault's path ends the ceremony on the fixed sentence,
+/// and neither the page's words nor the outcome carry the path.
+#[test]
+fn an_internal_failure_in_a_ceremony_hides_its_path() {
+    let scenario = Scenario::new(false);
+    let remote = RenewalRemote::new(&scenario);
+    // The vault is gone: opening it fails with a context that names its path.
+    std::fs::remove_file(&scenario.domain.path).expect("vault removed");
+    let ran = drive(
+        &scenario.domain,
+        &remote,
+        gateway_key(),
+        renewal(false, false),
+        "",
+        Answer::Keys,
+        NOW,
+    );
+    let message = ran.outcome.expect_err("internal failure");
+    assert_eq!(
+        message,
         "Erreur interne d'Orion ; le détail est dans le journal."
     );
     assert_eq!(ran.words.as_deref(), Some(message.as_str()));
+    let directory = scenario
+        .domain
+        .path
+        .parent()
+        .expect("parent")
+        .to_string_lossy()
+        .to_string();
+    assert!(!message.contains(&directory), "{message}");
 }
 
 #[test]

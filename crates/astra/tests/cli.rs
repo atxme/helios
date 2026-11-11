@@ -1204,3 +1204,41 @@ fn no_console_command_reads_the_service_key_or_writes_the_registry() {
         offences.join("\n")
     );
 }
+
+/// The publication names its transition: without `--transition` the command is not run.
+#[test]
+fn gateway_identity_publish_requires_a_transition() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let output = astra(dir.path(), &["gateway-identity", "publish", "--epoch", "5"]);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--transition"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// A fingerprint that is not 64 hexadecimal characters is refused before anything is read.
+#[test]
+fn gateway_identity_publish_rejects_a_bad_fingerprint() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    for bad in ["zz", "abcd", ""] {
+        let output = astra(
+            dir.path(),
+            &[
+                "gateway-identity",
+                "publish",
+                "--epoch",
+                "5",
+                "--transition",
+                bad,
+            ],
+        );
+        assert!(!output.status.success(), "{bad:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("--transition"),
+            "{bad:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
