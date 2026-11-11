@@ -815,7 +815,7 @@ fn an_unconfirmed_decision_of_an_expired_campaign_is_discarded() {
 
     let refusal = carry(&remote, &domain.path, decision, EXPIRES).expect_err("refused");
 
-    assert!(matches!(refusal, GatewayRefusal::Internal(_)));
+    assert!(matches!(refusal, GatewayRefusal::Guidance(_)));
     assert_eq!(pending(&domain.path, EXPIRES).expect("read"), None);
     assert!(!record_on_disk(domain));
 }

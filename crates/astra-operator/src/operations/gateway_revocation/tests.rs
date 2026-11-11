@@ -778,7 +778,7 @@ fn a_missing_expiry_refuses_before_a_key() {
     .expect("refused");
 
     assert!(
-        matches!(refusal, GatewayRefusal::Internal(_)),
+        matches!(refusal, GatewayRefusal::Guidance(_)),
         "{refusal:?}"
     );
     assert_eq!(domain.touches(), 0, "no key is touched");
@@ -933,7 +933,7 @@ fn an_expired_replacement_campaign_discards_the_record() {
         .expect_err("expired before the deposit");
 
     assert!(
-        matches!(refusal, GatewayRefusal::Internal(_)),
+        matches!(refusal, GatewayRefusal::Guidance(_)),
         "{refusal:?}"
     );
     assert!(

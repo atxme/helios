@@ -691,17 +691,23 @@ fn an_internal_failure_shows_a_fixed_sentence_and_no_path() {
         "Erreur interne d'Orion ; le détail est dans le journal."
     );
     assert!(!page.contains("/home"));
-    // The other refusals keep their own sentence.
+    // A guidance sentence and the other refusals keep their own sentence.
+    assert_eq!(
+        page_sentence(&GatewayRefusal::Guidance(
+            "Reprendre la préparation.".into()
+        )),
+        "Reprendre la préparation."
+    );
     assert_eq!(
         page_sentence(&GatewayRefusal::NothingToAbort),
         GatewayRefusal::NothingToAbort.to_string()
     );
 }
 
-/// The same, end to end: a publication the gateway did not confirm ends the ceremony on the
-/// fixed sentence, which is also what the page reads.
+/// A guidance sentence written for the operator reaches the page verbatim, end to end: a
+/// publication the gateway did not confirm ends the ceremony on it.
 #[test]
-fn an_internal_failure_in_a_ceremony_reaches_the_page_as_the_fixed_sentence() {
+fn a_guidance_sentence_reaches_the_page_verbatim() {
     let scenario = Scenario::new(false);
     let remote = RenewalRemote::new(&scenario);
     remote.publish_replies.borrow_mut().push_back(Ok(false));

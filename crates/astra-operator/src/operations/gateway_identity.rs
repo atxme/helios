@@ -268,6 +268,12 @@ pub enum GatewayRefusal {
     /// The gateway refused the document for good, and said why.
     #[error("{0}")]
     GatewayRefused(String),
+    /// A sentence written in the code for the operator, with no path or source error in it:
+    /// shown as it is.
+    #[error("{0}")]
+    Guidance(String),
+    /// An error built from a source (I/O, serde, anyhow contexts) that can carry a path: its
+    /// detail is for the log, never for the page.
     #[error("{0}")]
     Internal(String),
 }
@@ -426,7 +432,7 @@ pub(super) fn open_renewal_as(
             _ => before_signing(error),
         })?;
     let served = opened.gateway_certificate.ok_or_else(|| {
-        GatewayRefusal::Internal(
+        GatewayRefusal::Guidance(
             "Astra n'a pas donné la feuille gateway en service : rien n'a été signé.".into(),
         )
     })?;
@@ -439,7 +445,7 @@ pub(super) fn open_renewal_as(
     let authority_url = relay
         .astra_authority_url
         .clone()
-        .ok_or_else(|| GatewayRefusal::Internal("l'origine de l'autorité est absente".into()))?;
+        .ok_or_else(|| GatewayRefusal::Guidance("l'origine de l'autorité est absente".into()))?;
     handoff::verify_campaign_request(&relay, vault, &request, &authority_url, now)
         .map_err(internal)?;
 
@@ -457,7 +463,7 @@ pub(super) fn open_renewal_as(
     let epoch = target
         .epoch
         .checked_add(1)
-        .ok_or_else(|| GatewayRefusal::Internal("époque de décision hors bornes".into()))?;
+        .ok_or_else(|| GatewayRefusal::Guidance("époque de décision hors bornes".into()))?;
     if prepared.gateway_identity_epoch != epoch || renewal.gateway_identity_epoch != epoch {
         return Err(GatewayRefusal::CampaignMismatch);
     }
@@ -604,7 +610,7 @@ impl OpenedGatewayRenewal {
         } = self;
         let campaign = request.campaign.as_ref();
         if now >= campaign.expires_at || keys.openings.is_empty() {
-            return Err(GatewayRefusal::Internal(
+            return Err(GatewayRefusal::Guidance(
                 "la campagne a expiré avant la signature : rien n'a été signé.".into(),
             ));
         }
@@ -616,7 +622,7 @@ impl OpenedGatewayRenewal {
         let epoch = target
             .epoch
             .checked_add(1)
-            .ok_or_else(|| GatewayRefusal::Internal("époque de décision hors bornes".into()))?;
+            .ok_or_else(|| GatewayRefusal::Guidance("époque de décision hors bornes".into()))?;
         let activation_at = after(now, options.prepare_days)?;
         let window = TransitionWindow::new(
             now,
@@ -650,7 +656,7 @@ impl OpenedGatewayRenewal {
         campaign
             .covers_gateway_transition(&transition)
             .map_err(|_| {
-                GatewayRefusal::Internal(
+                GatewayRefusal::Guidance(
                     "la transition signée ne correspond pas à la campagne approuvée".into(),
                 )
             })?;
@@ -694,7 +700,7 @@ pub fn carry(
     if !decision.deposited {
         if now >= decision.expires_at {
             clear(vault_path).map_err(internal)?;
-            return Err(GatewayRefusal::Internal(
+            return Err(GatewayRefusal::Guidance(
                 "la campagne a expiré avant le dépôt : la décision est jetée. Reprendre la préparation."
                     .into(),
             ));
@@ -715,7 +721,7 @@ pub fn carry(
         .publish(transition.gateway_identity_epoch, transition_fingerprint)
         .map_err(refused_by_gateway)?;
     if !relay.relayed {
-        return Err(GatewayRefusal::Internal(
+        return Err(GatewayRefusal::Guidance(
             "la gateway n'a pas confirmé la relève : reprendre pour la lui demander à nouveau."
                 .into(),
         ));
@@ -824,7 +830,7 @@ pub fn open_abort(
     let authority_url = relay
         .astra_authority_url
         .clone()
-        .ok_or_else(|| GatewayRefusal::Internal("l'origine de l'autorité est absente".into()))?;
+        .ok_or_else(|| GatewayRefusal::Guidance("l'origine de l'autorité est absente".into()))?;
     handoff::verify_campaign_request(&relay, vault, &request, &authority_url, now)
         .map_err(internal)?;
 
@@ -907,7 +913,7 @@ impl OpenedGatewayAbort {
         } = self;
         let campaign = request.campaign.as_ref();
         if now >= campaign.expires_at || keys.openings.is_empty() {
-            return Err(GatewayRefusal::Internal(
+            return Err(GatewayRefusal::Guidance(
                 "la campagne a expiré avant la signature : rien n'a été signé.".into(),
             ));
         }
@@ -931,7 +937,7 @@ impl OpenedGatewayAbort {
         )
         .map_err(internal)?;
         campaign.covers_gateway_abort(&abort).map_err(|_| {
-            GatewayRefusal::Internal(
+            GatewayRefusal::Guidance(
                 "l'annulation signée ne correspond pas à la campagne approuvée".into(),
             )
         })?;
@@ -970,7 +976,7 @@ pub fn carry_abort(
     if !decision.deposited {
         if now >= decision.expires_at {
             clear(vault_path).map_err(internal)?;
-            return Err(GatewayRefusal::Internal(
+            return Err(GatewayRefusal::Guidance(
                 "la campagne a expiré avant le dépôt : l'annulation est jetée. Reprendre la préparation."
                     .into(),
             ));
@@ -1035,7 +1041,7 @@ pub fn open_rollback(
         .checked_mul(3_600)
         .and_then(|span| clock.checked_add(span))
         .map(|expiry| expiry.min(window.not_after))
-        .ok_or_else(|| GatewayRefusal::Internal("durée hors bornes".into()))?;
+        .ok_or_else(|| GatewayRefusal::Guidance("durée hors bornes".into()))?;
 
     let stored = store::load(vault_path).map_err(internal)?;
     let relay = DomainHandoff::beside(vault_path, &stored).map_err(internal)?;
@@ -1139,7 +1145,7 @@ impl OpenedGatewayRollback {
             approval,
         } = self;
         if now >= campaign.expires_at || keys.openings.is_empty() {
-            return Err(GatewayRefusal::Internal(
+            return Err(GatewayRefusal::Guidance(
                 "la campagne a expiré avant la signature : rien n'a été signé.".into(),
             ));
         }
@@ -1196,7 +1202,7 @@ pub(super) fn bound_to_domain(
 fn abort_of(decision: &SignedGatewayDecision) -> Result<&GatewayTransitionAbort, GatewayRefusal> {
     match decision.result.objects.first() {
         Some(TrustUpdateObject::GatewayTransitionAbort(abort)) => Ok(&**abort),
-        _ => Err(GatewayRefusal::Internal(
+        _ => Err(GatewayRefusal::Guidance(
             "la décision enregistrée ne contient pas d'annulation gateway.".into(),
         )),
     }
@@ -1227,13 +1233,13 @@ pub(super) fn deposit_result(
         .fetch_campaign(operation_id)
         .map_err(unreachable_or_internal)?;
     if request.campaign.campaign_id != *campaign_id {
-        return Err(GatewayRefusal::Internal(
+        return Err(GatewayRefusal::Guidance(
             "la campagne relue n'est pas celle de la décision enregistrée.".into(),
         ));
     }
     match remote.submit_campaign(operation_id, &request.result_token, result) {
         Ok(SigningOperationState::Approved) => Ok(()),
-        Ok(SigningOperationState::AwaitingOperator) => Err(GatewayRefusal::Internal(
+        Ok(SigningOperationState::AwaitingOperator) => Err(GatewayRefusal::Guidance(
             "Astra n'a pas enregistré ce dépôt.".into(),
         )),
         Err(error) => Err(refused_by_gateway(error)),
@@ -1295,7 +1301,7 @@ pub(super) fn transition_of(
 ) -> Result<&GatewayIdentityTransition, GatewayRefusal> {
     match decision.result.objects.first() {
         Some(TrustUpdateObject::GatewayIdentityTransition(transition)) => Ok(&**transition),
-        _ => Err(GatewayRefusal::Internal(
+        _ => Err(GatewayRefusal::Guidance(
             "la décision enregistrée ne contient pas de transition gateway.".into(),
         )),
     }
@@ -1314,7 +1320,7 @@ pub(super) fn credential_document(vault_path: &Path) -> Result<CredentialRegistr
     credentials::load(&credentials::path_beside(vault_path))
         .map_err(internal)?
         .ok_or_else(|| {
-            GatewayRefusal::Internal(
+            GatewayRefusal::Guidance(
                 "aucun document de credentials : l'émettre par `astra-signer bindings`. Rien n'a été signé."
                     .into(),
             )
@@ -1342,7 +1348,7 @@ fn reason_label(options: RenewalOptions) -> &'static str {
 fn after(at: u64, days: u64) -> Result<u64, GatewayRefusal> {
     days.checked_mul(DAY_SECS)
         .and_then(|span| at.checked_add(span))
-        .ok_or_else(|| GatewayRefusal::Internal("durée hors bornes".into()))
+        .ok_or_else(|| GatewayRefusal::Guidance("durée hors bornes".into()))
 }
 
 fn record_path(vault_path: &Path) -> std::path::PathBuf {
@@ -1382,7 +1388,7 @@ fn clear(vault_path: &Path) -> Result<()> {
 fn refused_by_door(vault_path: &Path, now: u64) -> GatewayRefusal {
     match pending(vault_path, now) {
         Ok(Some(_)) => GatewayRefusal::AlreadyOpen,
-        Ok(None) => GatewayRefusal::Internal(
+        Ok(None) => GatewayRefusal::Guidance(
             "Astra a refusé d'ouvrir la campagne d'identité de la gateway.".into(),
         ),
         Err(error) => internal(error),

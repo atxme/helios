@@ -937,7 +937,9 @@ La publication nomme la transition par son empreinte (64 caractères hexadécima
 non par la seule époque : deux transitions peuvent être conservées à la même époque
 (un dépôt dont la réponse s'est perdue, déposé de nouveau), et la marque est
 irréversible. Astra ne publie que celle dont l'empreinte est donnée, et refuse si
-aucune ne l'a. Orion envoie l'empreinte de la transition qu'il vient d'installer.
+aucune ne l'a. L'empreinte à recopier se lit avec `astra status` : une ligne
+« gateway transition: époque … — <empreinte> — non publiée » par transition conservée.
+Orion envoie l'empreinte de la transition qu'il vient d'installer.
 
 C'est l'étape 6, et le dernier instant où un avortement est encore légitime
 est **avant** cette commande. Après, un client peut détenir la décision,

@@ -253,7 +253,7 @@ pub fn carry_revocation(
     if let Some(replacement) = signed.replacement.as_ref().filter(|r| !r.deposited) {
         if now >= replacement.expires_at {
             clear(vault_path).map_err(internal)?;
-            return Err(GatewayRefusal::Internal(
+            return Err(GatewayRefusal::Guidance(
                 "la campagne du remplaçant a expiré avant son dépôt : la décision est jetée. Reprendre la préparation."
                     .into(),
             ));
@@ -320,7 +320,7 @@ fn probe_expired_revocation(
     let Some(replacement) = signed.replacement.as_ref() else {
         // Without a replacement nothing tells whether the revocation applied: it is dropped.
         clear(vault_path).map_err(internal)?;
-        return Err(GatewayRefusal::Internal(
+        return Err(GatewayRefusal::Guidance(
             "la campagne de la révocation a expiré avant le dépôt : la révocation est jetée. Reprendre la préparation."
                 .into(),
         ));
@@ -422,7 +422,7 @@ fn open_replacement(
     let selected = select_anchor(vault, vault_path, &mut authority, None, &identity, now)
         .map_err(from_revocation)?;
     if selected.anchor != RevocationAnchor::Current {
-        return Err(GatewayRefusal::Internal(
+        return Err(GatewayRefusal::Guidance(
             "Astra vérifie sous la CA-PQ sortante : le remplacement ne peut pas être signé. Rien n'a été signé."
                 .into(),
         ));
@@ -489,7 +489,7 @@ fn open_revocation(
     let authority_url = relay
         .astra_authority_url
         .clone()
-        .ok_or_else(|| GatewayRefusal::Internal("l'origine de l'autorité est absente".into()))?;
+        .ok_or_else(|| GatewayRefusal::Guidance("l'origine de l'autorité est absente".into()))?;
     handoff::verify_campaign_request(&relay, vault, &request, &authority_url, now)
         .map_err(internal)?;
 
@@ -572,7 +572,7 @@ fn sign_revocation_round(
     } = round;
     let campaign = request.campaign.as_ref();
     if now >= campaign.expires_at || keys.openings.is_empty() {
-        return Err(GatewayRefusal::Internal(
+        return Err(GatewayRefusal::Guidance(
             "la campagne a expiré avant la signature : rien n'a été signé.".into(),
         ));
     }
@@ -588,7 +588,7 @@ fn sign_revocation_round(
         revocation_epoch: target
             .epoch
             .checked_add(1)
-            .ok_or_else(|| GatewayRefusal::Internal("époque de révocation hors bornes".into()))?,
+            .ok_or_else(|| GatewayRefusal::Guidance("époque de révocation hors bornes".into()))?,
         revoked_tls: Some((target.active_tls_certificate_fingerprint, tls_not_after)),
         revoked_pq: Some((target.active_pq_certificate_fingerprint, pq_not_after)),
         effective_at: now,
@@ -612,7 +612,7 @@ fn sign_revocation_round(
     )
     .map_err(internal)?;
     campaign.covers_revocation(&revocation).map_err(|_| {
-        GatewayRefusal::Internal(
+        GatewayRefusal::Guidance(
             "la révocation signée ne correspond pas à la campagne approuvée".into(),
         )
     })?;
@@ -658,7 +658,7 @@ fn replacement_overlap(
     let kept = match vault.retained_outgoing_ca_pq_public() {
         Some((_, _, not_after)) => Some(not_after),
         None if vault.retained_outgoing_ca_pq_public.is_some() => {
-            return Err(GatewayRefusal::Internal(
+            return Err(GatewayRefusal::Guidance(
                 "la CA-PQ sortante gardée n'est pas lisible".into(),
             ))
         }
@@ -682,7 +682,7 @@ fn from_revocation(refusal: RevocationRefusal) -> GatewayRefusal {
 }
 
 fn missing_expiries() -> GatewayRefusal {
-    GatewayRefusal::Internal(
+    GatewayRefusal::Guidance(
         "Astra n'a pas donné l'échéance des deux feuilles de la gateway : rien n'a été signé."
             .into(),
     )
@@ -693,7 +693,7 @@ fn refused_by_door(vault_path: &Path, now: u64) -> GatewayRefusal {
     match pending_revocation(vault_path, now) {
         Ok(Some(_)) => GatewayRefusal::RevocationAlreadyOpen,
         Ok(None) => {
-            GatewayRefusal::Internal("Astra a refusé d'ouvrir la révocation de la gateway.".into())
+            GatewayRefusal::Guidance("Astra a refusé d'ouvrir la révocation de la gateway.".into())
         }
         Err(error) => internal(error),
     }

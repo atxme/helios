@@ -210,6 +210,26 @@ pub(crate) fn status(state_dir: &Path, expected_audit_head: Option<&str>) -> Res
     );
     println!("audit head       : {}", state.audit.head());
     println!("peers            : {}", state.peers.len());
+    // The fingerprint `gateway-identity publish --transition` names, one per stored transition.
+    for stored in &state.transitions {
+        if let aether::certificates::transport::TrustUpdateObject::GatewayIdentityTransition(
+            transition,
+        ) = &stored.object
+        {
+            if let Ok(fingerprint) = transition.fingerprint() {
+                println!(
+                    "gateway transition: époque {} — {} — {}",
+                    transition.gateway_identity_epoch,
+                    fingerprint,
+                    if stored.published {
+                        "publiée"
+                    } else {
+                        "non publiée"
+                    }
+                );
+            }
+        }
+    }
 
     let now = now_unix();
     for peer in state.peers.values() {
