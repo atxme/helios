@@ -177,6 +177,8 @@ pub fn gateway_read() -> GatewayIdentityRead {
         gateway_retire_active_at: None,
         gateway_rollback_expires_at: None,
         gateway_restart_due: None,
+        gateway_revoked: false,
+        gateway_awaited_replacement: None,
     }
 }
 

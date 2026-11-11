@@ -133,6 +133,13 @@ pub struct GatewayDomainRead {
     pub gateway_rollback_expires_at: Option<u64>,
     #[serde(default)]
     pub gateway_restart_due: Option<String>,
+    /// The served gateway identity is revoked (F14 lot 6c). Defaulted: a
+    /// gateway older than the field names no revocation.
+    #[serde(default)]
+    pub gateway_revoked: bool,
+    /// Fingerprint, lowercase hex, of the replacement a revoked gateway awaits.
+    #[serde(default)]
+    pub gateway_awaited_replacement: Option<String>,
     /// The peers a fleet renewal targets: revoked ones are left out, as Astra's
     /// `fleet_leaf_rows` does.
     #[serde(default)]

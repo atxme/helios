@@ -534,6 +534,13 @@ pub struct GatewayIdentityRead {
     pub gateway_rollback_expires_at: Option<u64>,
     #[serde(default)]
     pub gateway_restart_due: Option<String>,
+    /// The served gateway identity is revoked (spec §10.1). Absent on a gateway
+    /// older than the field, which names no revocation.
+    #[serde(default)]
+    pub gateway_revoked: bool,
+    /// The replacement a revoked gateway awaits, read from its lowercase hex.
+    #[serde(default)]
+    pub gateway_awaited_replacement: Option<Fingerprint>,
 }
 
 /// What `POST /api/certificates/gateway-renewal` is asked (spec §5.2, step 1).

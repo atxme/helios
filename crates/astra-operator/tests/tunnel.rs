@@ -902,6 +902,38 @@ fn the_gateway_clock_is_read_and_its_absence_tolerated() {
 
 /// The identity read is tolerant: a gateway older than the leaf expiries
 /// answers without them, and the anchors it always answered still read.
+/// A gateway older than the revocation field names no revocation, and the
+/// read goes through.
+#[test]
+fn an_older_gateway_reads_as_not_revoked() {
+    let older = serde_json::json!({ "ca_pq_fingerprint": fingerprint_hex(b"courante") });
+    let stub = Stub::serving(vec![(200, older.to_string())]);
+    let read = Tunnel::new(&stub.base)
+        .expect("tunnel")
+        .gateway_identity()
+        .expect("read");
+    assert!(!read.gateway_revoked);
+    assert_eq!(read.gateway_awaited_replacement, None);
+}
+
+/// The awaited replacement is read back as the fingerprint it was written as.
+#[test]
+fn a_revoked_view_reads_its_awaited_replacement() {
+    let replacement = Fingerprint::of(b"remplacant");
+    let revoked = serde_json::json!({
+        "ca_pq_fingerprint": fingerprint_hex(b"courante"),
+        "gateway_revoked": true,
+        "gateway_awaited_replacement": replacement.to_hex(),
+    });
+    let stub = Stub::serving(vec![(200, revoked.to_string())]);
+    let read = Tunnel::new(&stub.base)
+        .expect("tunnel")
+        .gateway_identity()
+        .expect("read");
+    assert!(read.gateway_revoked);
+    assert_eq!(read.gateway_awaited_replacement, Some(replacement));
+}
+
 #[test]
 fn the_gateway_identity_read_names_the_leaf_expiries_and_tolerates_their_absence() {
     let newer = serde_json::json!({

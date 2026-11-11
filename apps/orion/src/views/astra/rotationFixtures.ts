@@ -31,6 +31,8 @@ export const domainRead = (extra: Partial<GatewayDomainRead> = {}): GatewayDomai
   gateway_retire_active_at: null,
   gateway_rollback_expires_at: null,
   gateway_restart_due: null,
+  gateway_revoked: false,
+  gateway_awaited_replacement: null,
   peers: [{ not_after: NOW + 90 * DAY }, { not_after: NOW + 120 * DAY }],
   ...extra,
 })

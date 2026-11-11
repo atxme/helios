@@ -423,3 +423,37 @@ async fn the_peer_certificates_keep_the_revoked_peers_and_the_gateways_clock() {
     let renewing: Vec<_> = read.peers.iter().map(|peer| peer.renewing).collect();
     assert_eq!(renewing, [false, true, true]);
 }
+
+#[tokio::test]
+async fn an_older_gateway_reads_as_not_revoked() {
+    let older = serde_json::json!({
+        "ca_epoch": 1,
+        "ca_pq_fingerprint": "ab".repeat(32),
+        "client_tls_ca_epoch": 1,
+        "peers": [],
+    });
+    let Reach::Ok(read) = answered(200, &older.to_string(), async |url| domain(url).await).await
+    else {
+        panic!("an older gateway's domain must read");
+    };
+    assert!(!read.gateway_revoked);
+    assert_eq!(read.gateway_awaited_replacement, None);
+}
+
+#[tokio::test]
+async fn a_revoked_view_reads_its_awaited_replacement() {
+    let revoked = serde_json::json!({
+        "ca_epoch": 1,
+        "ca_pq_fingerprint": "ab".repeat(32),
+        "client_tls_ca_epoch": 1,
+        "gateway_revoked": true,
+        "gateway_awaited_replacement": "cd".repeat(32),
+        "peers": [],
+    });
+    let Reach::Ok(read) = answered(200, &revoked.to_string(), async |url| domain(url).await).await
+    else {
+        panic!("a revoked gateway's domain must read");
+    };
+    assert!(read.gateway_revoked);
+    assert_eq!(read.gateway_awaited_replacement, Some("cd".repeat(32)));
+}

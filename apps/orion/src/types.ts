@@ -1093,6 +1093,8 @@ export interface GatewayDomainRead {
   gateway_rollback_expires_at: number | null
   /** Motif du redémarrage de heliosd, `null` quand aucun n'est dû. */
   gateway_restart_due: string | null
+  gateway_revoked: boolean
+  gateway_awaited_replacement: string | null
   /** Les postes qu'un renouvellement vise : les pairs révoqués n'y figurent pas. */
   peers: { not_after: number }[]
 }
