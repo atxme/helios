@@ -18,14 +18,14 @@ use astra_operator::operations::fixtures::{gateway_key, Domain, TestKey, EXPIRES
 use astra_operator::operations::gateway_identity::tests::{
     gateway_read, Remote as RenewalRemote, Scenario, ACTIVE_TLS,
 };
-use astra_operator::operations::gateway_identity::{self, GatewayIdentityRemote};
+use astra_operator::operations::gateway_identity::{self, GatewayIdentityRemote, GatewayRefusal};
 use astra_operator::operations::gateway_revocation::tests::Remote as RevocationRemote;
 use astra_operator::operations::revocation::RevocationReasonChoice;
 use astra_operator::tunnel::GatewayIdentityRead;
 
 use super::super::Press;
 use super::probe;
-use super::{discard_waiting, run_with, Reach};
+use super::{discard_waiting, page_sentence, run_with, Reach};
 use crate::operator::rotations::{gateway_pending_of, Local, RotationsOverview};
 use crate::operator::{GatewayGesture, GatewayTarget, Words};
 
@@ -678,6 +678,41 @@ fn a_refusal_after_the_deposit_keeps_its_sentence_for_the_page() {
     let message = ran.outcome.expect_err("refused");
     assert_eq!(ran.words.as_deref(), Some(message.as_str()));
     assert!(!message.is_empty());
+}
+
+/// An internal failure carries its detail, paths included: the page reads a fixed sentence.
+#[test]
+fn an_internal_failure_shows_a_fixed_sentence_and_no_path() {
+    let detail = "écriture de /home/operateur/.helios/vault/gateway-pending.json : permission refusée";
+    let page = page_sentence(&GatewayRefusal::Internal(detail.to_string()));
+    assert_eq!(page, "Erreur interne d'Orion ; le détail est dans le journal.");
+    assert!(!page.contains("/home"));
+    // The other refusals keep their own sentence.
+    assert_eq!(
+        page_sentence(&GatewayRefusal::NothingToAbort),
+        GatewayRefusal::NothingToAbort.to_string()
+    );
+}
+
+/// The same, end to end: a publication the gateway did not confirm ends the ceremony on the
+/// fixed sentence, which is also what the page reads.
+#[test]
+fn an_internal_failure_in_a_ceremony_reaches_the_page_as_the_fixed_sentence() {
+    let scenario = Scenario::new(false);
+    let remote = RenewalRemote::new(&scenario);
+    remote.publish_replies.borrow_mut().push_back(Ok(false));
+    let ran = drive(
+        &scenario.domain,
+        &remote,
+        gateway_key(),
+        renewal(false, false),
+        "",
+        Answer::Keys,
+        NOW,
+    );
+    let message = ran.outcome.expect_err("not confirmed");
+    assert_eq!(message, "Erreur interne d'Orion ; le détail est dans le journal.");
+    assert_eq!(ran.words.as_deref(), Some(message.as_str()));
 }
 
 #[test]

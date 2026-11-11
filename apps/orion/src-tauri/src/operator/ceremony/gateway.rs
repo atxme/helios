@@ -53,6 +53,12 @@ const DISCARD_IS_NO_CEREMONY: &str = "jeter une décision en attente ne se fait 
 pub(crate) const RECORD_UNREADABLE: &str =
     "le registre de l'identité de la gateway ne se lit pas : rien n'a été changé";
 
+/// Said for an internal failure of Orion's own. Its detail can name the vault and the record's
+/// paths: it goes to the log, never to the page. The failure can happen after the signature,
+/// so the sentence does not say that nothing was signed.
+pub(crate) const INTERNAL_FAILURE: &str =
+    "Erreur interne d'Orion ; le détail est dans le journal.";
+
 /// Said when the waiting record could not be dropped. The detail names paths: it goes to the
 /// log, never to the page.
 const DISCARD_FAILED: &str = "la décision en attente n'a pas pu être jetée : rien n'a été changé";
@@ -195,6 +201,18 @@ fn refusal_of(error: &GatewayRefusal) -> Refusal {
         | GatewayRefusal::UnreachableBeforeSigning
         | GatewayRefusal::RollbackUnreachable => Refusal::AuthorityUnreachable,
         _ => Refusal::Internal,
+    }
+}
+
+/// The sentence a refusal puts on the page. An internal failure is logged with its detail,
+/// which can name paths, and said as a fixed sentence; every other refusal is its own sentence.
+pub(crate) fn page_sentence(error: &GatewayRefusal) -> String {
+    match error {
+        GatewayRefusal::Internal(detail) => {
+            tracing::warn!(error = %detail, "échec interne d'une cérémonie gateway");
+            INTERNAL_FAILURE.to_string()
+        }
+        other => other.to_string(),
     }
 }
 
@@ -411,7 +429,7 @@ impl<'a> GatewayRun<'a> {
     }
 
     fn fail_with(&mut self, error: &GatewayRefusal) -> Ended {
-        self.fail(refusal_of(error), error.to_string())
+        self.fail(refusal_of(error), page_sentence(error))
     }
 
     /// A record that cannot be read: its detail to the log, a fixed sentence to the page.
