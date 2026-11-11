@@ -216,6 +216,10 @@ pub enum GatewayRefusal {
     /// A rollback went unconfirmed: nothing is recorded, and a new approval starts it again.
     #[error("Astra ou la gateway est injoignable : le retour arrière n'est pas confirmé. Rien n'est enregistré côté poste ; le relancer demande une nouvelle approbation.")]
     RollbackUnreachable,
+    /// The record still has work to finish, so discarding it would leave that undone. The
+    /// sentence is the one the page shows.
+    #[error("{0}")]
+    NotDiscardable(String),
     /// The gateway is revoked: no outgoing identity can be selected for it.
     #[error("la gateway est révoquée : aucune identité ne la remplace. Rien n'a été signé.")]
     Revoked,
@@ -1210,10 +1214,26 @@ pub fn pending_kind(vault_path: &Path, now: u64) -> Result<Option<GatewayDecisio
     Ok(pending(vault_path, now)?.map(|decision| decision.kind))
 }
 
-/// Removes the waiting record. Offered only after the gateway refused a deposited decision
-/// for good: the record otherwise blocks every new opening.
-pub fn discard_pending(vault_path: &Path) -> Result<()> {
-    clear(vault_path)
+/// Removes the waiting record, when nothing is left to finish on it. A renewal installed on the
+/// gateway but not yet published is kept: only « Reprendre » publishes it. Offered after a
+/// refusal for good, the record otherwise blocks every new opening.
+pub fn discard_pending(vault_path: &Path) -> Result<(), GatewayRefusal> {
+    let path = record_path(vault_path);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(internal(anyhow::Error::from(error))),
+    };
+    let decision: SignedGatewayDecision = serde_json::from_slice(&bytes).map_err(|error| {
+        internal(anyhow::Error::from(error).context("lecture de la décision gateway à jeter"))
+    })?;
+    if decision.kind == GatewayDecisionKind::Renewal && decision.installed && !decision.published {
+        return Err(GatewayRefusal::NotDiscardable(
+            "la décision est installée sur la gateway mais pas encore publiée : la reprendre pour la publier. Rien n'a été jeté."
+                .into(),
+        ));
+    }
+    clear(vault_path).map_err(internal)
 }
 
 pub(super) fn transition_of(

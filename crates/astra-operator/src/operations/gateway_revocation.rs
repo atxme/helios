@@ -360,10 +360,30 @@ pub fn pending_revocation(vault_path: &Path, now: u64) -> Result<Option<SignedGa
     Ok(Some(signed))
 }
 
-/// Removes the waiting record. Offered only after the gateway refused a deposit for good: the
-/// record otherwise blocks every new gesture on the gateway's identity.
-pub fn discard_pending_revocation(vault_path: &Path) -> Result<()> {
-    clear(vault_path)
+/// Removes the waiting record, when nothing is left to finish on it. A revocation whose
+/// replacement is not installed is kept, and so is one whose state the record cannot tell
+/// (deposited with its answer lost, or not deposited at all): « Reprendre » settles it. Offered
+/// after a refusal for good, the record otherwise blocks every new gesture on the gateway.
+pub fn discard_pending_revocation(vault_path: &Path) -> Result<(), GatewayRefusal> {
+    let path = record_path(vault_path);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(internal(anyhow::Error::from(error))),
+    };
+    let signed: SignedGatewayRevocation = serde_json::from_slice(&bytes).map_err(|error| {
+        internal(anyhow::Error::from(error).context("lecture de la révocation à jeter"))
+    })?;
+    let work_left = signed.revocation.is_some()
+        && !signed.replacement_installed
+        && (signed.replacement.is_some() || !signed.revocation_applied);
+    if work_left {
+        return Err(GatewayRefusal::NotDiscardable(
+            "la révocation de la gateway n'est pas finie : la reprendre pour la terminer. Rien n'a été jeté."
+                .into(),
+        ));
+    }
+    clear(vault_path).map_err(internal)
 }
 
 /// The replacement's round: the gateway's renewal, under the terms of a replacement.

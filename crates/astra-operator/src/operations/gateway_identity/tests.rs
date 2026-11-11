@@ -1213,3 +1213,55 @@ fn an_unconfirmed_rollback_says_it_is_not_resumed() {
         Err(GatewayRefusal::RollbackUnreachable)
     );
 }
+
+const PUBLISH_LEFT: &str = "la décision est installée sur la gateway mais pas encore publiée : la reprendre pour la publier. Rien n'a été jeté.";
+
+#[test]
+fn a_decision_installed_but_not_published_is_not_discarded() {
+    let scenario = Scenario::new(false);
+    let remote = Remote::new(&scenario);
+    remote.publish_replies.borrow_mut().push_back(Err(409));
+    let decision = signed_decision(&remote, &scenario.domain, options());
+    carry(&remote, &scenario.domain.path, decision, NOW).expect_err("the publication is refused");
+
+    let refusal = discard_pending(&scenario.domain.path).expect_err("refused");
+
+    assert_eq!(refusal, GatewayRefusal::NotDiscardable(PUBLISH_LEFT.into()));
+    assert!(record_on_disk(&scenario.domain), "the record is kept");
+}
+
+#[test]
+fn a_decision_never_deposited_is_discarded() {
+    let scenario = Scenario::new(false);
+    let remote = Remote::new(&scenario);
+    signed_decision(&remote, &scenario.domain, options());
+
+    discard_pending(&scenario.domain.path).expect("discarded");
+
+    assert!(!record_on_disk(&scenario.domain));
+}
+
+#[test]
+fn a_decision_deposited_but_not_installed_is_discarded() {
+    let scenario = Scenario::new(false);
+    let remote = Remote::new(&scenario);
+    remote.install_replies.borrow_mut().push_back(409);
+    let decision = signed_decision(&remote, &scenario.domain, options());
+    carry(&remote, &scenario.domain.path, decision, NOW).expect_err("the install is refused");
+
+    discard_pending(&scenario.domain.path).expect("discarded");
+
+    assert!(!record_on_disk(&scenario.domain));
+}
+
+#[test]
+fn a_finished_decision_leaves_nothing_to_discard() {
+    let scenario = Scenario::new(false);
+    let remote = Remote::new(&scenario);
+    let decision = signed_decision(&remote, &scenario.domain, options());
+    carry(&remote, &scenario.domain.path, decision, NOW).expect("published");
+
+    discard_pending(&scenario.domain.path).expect("nothing to discard");
+
+    assert!(!record_on_disk(&scenario.domain));
+}

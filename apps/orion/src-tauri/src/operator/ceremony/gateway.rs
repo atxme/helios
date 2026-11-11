@@ -677,20 +677,28 @@ impl<'a> GatewayRun<'a> {
 }
 
 /// Drops the waiting record: the revocation's when one waits, the decision's otherwise. Takes
-/// no key. The operations decide whether a discard is allowed, and their error is surfaced
-/// as a fixed sentence when it is a read.
+/// no key. The operations decide whether a discard is allowed: a refusal's sentence reaches the
+/// page as it is, and a failed read or write is said as a fixed sentence.
 pub(crate) fn discard_waiting(vault_path: &Path) -> Result<(), String> {
     let revocation = gateway_revocation::pending_revocation(vault_path, now_unix())
         .map_err(|error| unreadable_record(&error))?;
     if revocation.is_some() {
-        gateway_revocation::discard_pending_revocation(vault_path)
+        gateway_revocation::discard_pending_revocation(vault_path).map_err(discard_sentence)
     } else {
-        gateway_identity::discard_pending(vault_path)
+        gateway_identity::discard_pending(vault_path).map_err(discard_sentence)
     }
-    .map_err(|error| {
-        tracing::warn!(error = %format!("{error:#}"), "décision gateway non jetée");
-        DISCARD_FAILED.to_string()
-    })
+}
+
+/// The sentence a discard puts on the page. A record that still has work to finish names what
+/// is left; any other failure is logged and said as a fixed sentence.
+fn discard_sentence(refusal: GatewayRefusal) -> String {
+    match refusal {
+        GatewayRefusal::NotDiscardable(sentence) => sentence,
+        other => {
+            tracing::warn!(error = %other, "décision gateway non jetée");
+            DISCARD_FAILED.to_string()
+        }
+    }
 }
 
 #[cfg(test)]

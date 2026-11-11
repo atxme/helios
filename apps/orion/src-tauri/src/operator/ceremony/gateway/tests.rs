@@ -679,3 +679,31 @@ fn a_refusal_after_the_deposit_keeps_its_sentence_for_the_page() {
     assert_eq!(ran.words.as_deref(), Some(message.as_str()));
     assert!(!message.is_empty());
 }
+
+#[test]
+fn a_discard_refused_by_the_record_reaches_the_page() {
+    let scenario = Scenario::new(false);
+    let remote = RenewalRemote::new(&scenario);
+    // The renewal is installed, and the publication is refused: only « Reprendre » can finish it.
+    remote.publish_replies.borrow_mut().push_back(Err(409));
+    let ran = drive(
+        &scenario.domain,
+        &remote,
+        gateway_key(),
+        renewal(false, false),
+        "",
+        Answer::Keys,
+        NOW,
+    );
+    assert!(ran.outcome.is_err());
+
+    let page = discard_waiting(&scenario.domain.path).expect_err("refused");
+
+    assert_eq!(
+        page,
+        "la décision est installée sur la gateway mais pas encore publiée : la reprendre pour la publier. Rien n'a été jeté."
+    );
+    assert!(gateway_identity::pending(&scenario.domain.path, NOW)
+        .expect("read")
+        .is_some());
+}
