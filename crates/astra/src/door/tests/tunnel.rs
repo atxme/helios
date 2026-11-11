@@ -1273,4 +1273,14 @@ async fn abandon_drops_the_plan() {
     )
     .await;
     assert_eq!(status, 403);
+
+    // With the plan gone, the next step has nothing to continue: a refusal
+    // of the class, not a step.
+    let (status, _) = post_to(
+        &listener,
+        OPERATOR_CHAIN_NEXT_ROUTE,
+        &relayed_administrator(),
+    )
+    .await;
+    assert_eq!(status, 403);
 }

@@ -619,10 +619,7 @@ impl Tunnel {
             .send()
             .context("passage à l'étape suivante de la chaîne")?;
         if !response.status().is_success() {
-            return Err(refused_installation(
-                response,
-                "passage à l'étape suivante de la chaîne",
-            ));
+            return Err(chain_next_refusal(response));
         }
         Self::read_admin(response, crate::origin::MAX_ANSWER_BYTES)
             .context("passage à l'étape suivante de la chaîne")
@@ -878,6 +875,25 @@ impl Tunnel {
             );
         }
         serde_json::from_slice(&bytes).context("réponse illisible")
+    }
+}
+
+/// The refusal of `chain next`. A step not yet in effect carries Astra's own
+/// sentence in the body, and that sentence is shown as it is: Astra produced
+/// it, and the gateway only relayed it. Any other refusal is the class alone.
+fn chain_next_refusal(response: reqwest::blocking::Response) -> anyhow::Error {
+    let status = response.status();
+    let sentence = response
+        .bytes()
+        .ok()
+        .filter(|bytes| bytes.len() <= crate::origin::MAX_ANSWER_BYTES)
+        .and_then(|bytes| serde_json::from_slice::<GatewayRefusalBody>(&bytes).ok())
+        .map(|body| body.message);
+    match sentence {
+        Some(sentence) => anyhow::anyhow!("{sentence}"),
+        None => {
+            admin_refusal(status.as_u16(), None).context("passage à l'étape suivante de la chaîne")
+        }
     }
 }
 

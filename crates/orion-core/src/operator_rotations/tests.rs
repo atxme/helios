@@ -348,8 +348,12 @@ async fn status_read_tolerates_the_new_fields() {
     let document = read.served_credentials.expect("the served document");
     assert_eq!(document["credential_registry_epoch"], 7);
 
-    // An older Astra, without the fields, reads as no revoked peer and no document.
-    let Reach::Ok(older) = answered(200, &base.to_string(), async |url| {
+    // An older Astra, without the fields, reads as no revoked peer, no document
+    // and no chain. The key is removed, not nulled: that is what an older Astra
+    // sends.
+    let mut older_body = base.clone();
+    older_body.as_object_mut().unwrap().remove("chain");
+    let Reach::Ok(older) = answered(200, &older_body.to_string(), async |url| {
         authority_status(url).await
     })
     .await
@@ -358,6 +362,31 @@ async fn status_read_tolerates_the_new_fields() {
     };
     assert!(older.revoked_peers.is_empty());
     assert_eq!(older.served_credentials, None);
+    assert_eq!(older.chain, None);
+}
+
+/// The same tolerance one layer down: an Astra older than the chain omits the
+/// key, and the shared shape still parses it as no chain.
+#[test]
+fn an_older_status_without_the_chain_key_parses_as_no_chain() {
+    let mut base = serde_json::to_value(OperatorAuthorityStatus {
+        chain: None,
+        ca_epoch: 4,
+        ca_fingerprint: Fingerprint::of(b"a"),
+        next_ca_fingerprint: None,
+        ca_tls_epoch: 2,
+        ca_tls_fingerprint: None,
+        next_ca_tls_fingerprint: None,
+        issuer: None,
+        vault_copy_fingerprint: None,
+        credential_registry_epoch: Some(7),
+        revoked_peers: Vec::new(),
+        served_credentials: None,
+    })
+    .unwrap();
+    base.as_object_mut().unwrap().remove("chain");
+    let parsed: OperatorAuthorityStatus = serde_json::from_value(base).unwrap();
+    assert_eq!(parsed.chain, None);
 }
 
 #[tokio::test]

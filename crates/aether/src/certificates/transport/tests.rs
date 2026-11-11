@@ -784,3 +784,32 @@ fn an_open_request_refuses_unknown_fields() {
     }));
     assert!(missing_peer.is_err());
 }
+
+/// An Astra older than the chain omits the `chain` key altogether. The shared
+/// shape reads that as no chain, and the key it writes is the one it reads.
+#[test]
+fn an_operator_status_without_the_chain_key_parses_as_no_chain() {
+    let status = OperatorAuthorityStatus {
+        ca_epoch: 4,
+        ca_fingerprint: Fingerprint::of(b"a"),
+        next_ca_fingerprint: None,
+        ca_tls_epoch: 2,
+        ca_tls_fingerprint: None,
+        next_ca_tls_fingerprint: None,
+        issuer: None,
+        vault_copy_fingerprint: None,
+        credential_registry_epoch: Some(7),
+        revoked_peers: Vec::new(),
+        served_credentials: None,
+        chain: Some(OperatorChainView {
+            steps: vec![CampaignScope::FleetLeafs],
+            current: 0,
+            operation_id: None,
+        }),
+    };
+    let mut value = serde_json::to_value(&status).expect("encoded");
+    assert!(value.get("chain").is_some());
+    value.as_object_mut().expect("object").remove("chain");
+    let parsed: OperatorAuthorityStatus = serde_json::from_value(value).expect("older status");
+    assert_eq!(parsed.chain, None);
+}
