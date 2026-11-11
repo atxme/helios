@@ -303,10 +303,15 @@ pub fn carry_revocation(
     clear(vault_path).map_err(internal)
 }
 
+/// What a gateway that was never revoked says when it refuses an emergency replacement
+/// (`aether`, the gateway identity state): the sign that the revocation did not apply.
+const NOT_REVOKED_CAUSE: &str = "emergency_replacement belongs to a revoked identity";
+
 /// The revocation's campaign closed before its answer came back, so Astra may still hold it. The
 /// gateway takes the replacement only once it is revoked and names it, which tells whether the
-/// revocation applied: accepted, both steps are done; refused for good, it did not apply and the
-/// revocation is dropped to be signed again; unreachable, the record is left as it is.
+/// revocation applied: accepted, both steps are done; refused by the emergency-replacement rule,
+/// it did not apply and the revocation is dropped to be signed again; refused for any other
+/// reason or unreachable, the record is left as it is.
 fn probe_expired_revocation(
     remote: &dyn GatewayIdentityRemote,
     vault_path: &Path,
@@ -327,7 +332,10 @@ fn probe_expired_revocation(
             clear(vault_path).map_err(internal)
         }
         Err(error) => match refused_by_gateway(error) {
-            GatewayRefusal::GatewayRefused(_) => {
+            // Only the gateway's own rule says the revocation did not apply: a healthy identity
+            // refuses an emergency replacement by name. Any other refusal proves nothing, and an
+            // unknown outcome keeps the record as it is.
+            GatewayRefusal::GatewayRefused(cause) if cause.contains(NOT_REVOKED_CAUSE) => {
                 signed.revocation = None;
                 keep(vault_path, &signed).map_err(internal)?;
                 Err(GatewayRefusal::RevocationToSign)

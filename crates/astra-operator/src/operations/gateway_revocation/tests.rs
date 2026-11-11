@@ -86,6 +86,8 @@ pub struct Remote<'a> {
     pub submit_replies: RefCell<VecDeque<Result<SigningOperationState, u16>>>,
     /// Answers to the installations, in order; a number is a refusal with that status.
     pub install_replies: RefCell<VecDeque<u16>>,
+    /// The cause the gateway gives to an installation it refuses.
+    pub install_cause: RefCell<String>,
     pub calls: RefCell<Vec<&'static str>>,
     /// The labels the openings carried, in order.
     pub reasons: RefCell<Vec<String>>,
@@ -122,6 +124,7 @@ impl<'a> Remote<'a> {
             open_refusal: Cell::new(None),
             submit_replies: RefCell::default(),
             install_replies: RefCell::default(),
+            install_cause: RefCell::new("motif de la gateway".into()),
             calls: RefCell::default(),
             reasons: RefCell::default(),
             submitted: RefCell::default(),
@@ -244,7 +247,10 @@ impl GatewayIdentityRemote for Remote<'_> {
         self.note("install");
         self.installed.borrow_mut().push(transition.clone());
         match self.install_replies.borrow_mut().pop_front() {
-            Some(status) => Err(admin_refusal(status, Some("motif de la gateway".into()))),
+            Some(status) => Err(admin_refusal(
+                status,
+                Some(self.install_cause.borrow().clone()),
+            )),
             None => Ok(GatewayDecisionRead {
                 gateway_identity_epoch: transition.gateway_identity_epoch,
                 fingerprint: String::new(),
@@ -619,8 +625,11 @@ fn a_refused_probe_returns_to_sign_and_keeps_the_replacement() {
     let remote = Remote::new(&scenario);
     let domain = &scenario.domain;
     lost_revocation_answer(&remote, domain);
-    // The gateway refuses the replacement: the revocation never applied.
+    // The gateway refuses the replacement by its own rule: the revocation never applied.
     remote.install_replies.borrow_mut().push_back(409);
+    *remote.install_cause.borrow_mut() =
+        "emergency_replacement belongs to a revoked identity awaiting exactly this document, and nothing else does"
+            .into();
     let at_expiry = pending_revocation(&domain.path, EXPIRES)
         .expect("read")
         .expect("the record still waits");
@@ -645,6 +654,31 @@ fn a_refused_probe_returns_to_sign_and_keeps_the_replacement() {
         NOW,
     )
     .expect("the revocation round opens again");
+}
+
+/// A refusal that does not name the emergency-replacement rule proves nothing about the
+/// revocation: the record is kept as it is, and the revocation is not dropped.
+#[test]
+fn a_probe_refused_for_another_reason_keeps_the_record_unchanged() {
+    let scenario = Scenario::new(true);
+    let remote = Remote::new(&scenario);
+    let domain = &scenario.domain;
+    lost_revocation_answer(&remote, domain);
+    remote.install_replies.borrow_mut().push_back(409);
+    *remote.install_cause.borrow_mut() = "la fenêtre de la transition est échue".into();
+    let before = record_bytes(domain);
+    let at_expiry = pending_revocation(&domain.path, EXPIRES)
+        .expect("read")
+        .expect("the record still waits");
+
+    let refusal = carry_revocation(&remote, &domain.path, at_expiry, EXPIRES)
+        .expect_err("the gateway refused for another reason");
+
+    assert!(
+        matches!(&refusal, GatewayRefusal::GatewayRefused(cause) if cause.contains("fenêtre")),
+        "{refusal:?}"
+    );
+    assert_eq!(record_bytes(domain), before, "the revocation is not dropped");
 }
 
 #[test]
