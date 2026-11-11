@@ -196,4 +196,96 @@ describe('gatewayRow', () => {
     })
     expect(gatewayRow(waiting, NOW).actions).toEqual(['resume', 'discard'])
   })
+  const FP = 'cc'.repeat(32)
+  const OTHER_FP = 'dd'.repeat(32)
+  const revocation = (extra: Partial<GatewayPendingView> = {}) =>
+    pending({ kind: 'revocation', decision_kind: null, installed: true, revocation_applied: true, ...extra })
+
+  it('revoked_awaiting_this_replacement_offers_resume_only', () => {
+    const row = gatewayRow(
+      withGateway(
+        { gateway_revoked: true, gateway_awaited_replacement: FP },
+        { gatewayPending: revocation({ replacement_fingerprint: FP }) },
+      ),
+      NOW,
+    )
+    expect(row.state).toBe('Révoquée, remplaçant à installer')
+    expect(row.detail).toBe("Le remplaçant nommé par la révocation n'est pas sur ce poste.")
+    expect(row.actions).toEqual(['resume'])
+    expect(row.forceKind).toBeNull()
+  })
+
+  it('revoked_awaiting_another_replacement_offers_force_discard', () => {
+    const row = gatewayRow(
+      withGateway(
+        { gateway_revoked: true, gateway_awaited_replacement: OTHER_FP },
+        { gatewayPending: revocation({ replacement_fingerprint: FP }) },
+      ),
+      NOW,
+    )
+    expect(row.state).toBe('Révoquée, remplaçant attendu')
+    expect(row.detail).toBe("Le remplaçant nommé par la révocation n'est pas sur ce poste.")
+    expect(row.actions).toEqual(['force_discard'])
+    expect(row.forceKind).toBe('replacement')
+  })
+
+  it('revoked_without_replacement_and_no_record_offers_nothing', () => {
+    const row = gatewayRow(withGateway({ gateway_revoked: true }), NOW)
+    expect(row.state).toBe('Révoquée')
+    expect(row.detail).toBe('La gateway ne sert plus. Le domaine doit être reconstruit.')
+    expect(row.actions).toEqual([])
+    expect(row.forceKind).toBe('replacement')
+    // An awaited replacement with no record to lean on: still nothing to force.
+    const awaiting = gatewayRow(withGateway({ gateway_revoked: true, gateway_awaited_replacement: FP }), NOW)
+    expect(awaiting.state).toBe('Révoquée, remplaçant attendu')
+    expect(awaiting.actions).toEqual([])
+  })
+
+  it('revoked_without_replacement_with_a_record_offers_force_discard', () => {
+    const row = gatewayRow(withGateway({ gateway_revoked: true }, { gatewayPending: pending() }), NOW)
+    expect(row.state).toBe('Révoquée')
+    expect(row.actions).toEqual(['force_discard'])
+    expect(row.forceKind).toBe('replacement')
+  })
+
+  it('publication_refused_switches_from_abort_to_force_at_activation', () => {
+    const activation = NOW + 7 * DAY
+    const refused = withGateway(
+      { gateway_transition_pending: true, gateway_activation_at: activation },
+      { gatewayPending: pending({ installed: true, published: false, publication_refused: true }) },
+    )
+    const before = gatewayRow(refused, NOW)
+    expect(before.state).toBe('Installée, publication à faire')
+    expect(before.detail).toBe(
+      `La publication est refusée : annuler la transition avant le ${formatDateTime(activation)}.`,
+    )
+    expect(before.actions).toEqual(['abort', 'resume'])
+    expect(before.forceKind).toBeNull()
+
+    const atActivation = withGateway(
+      { gateway_transition_pending: true, gateway_activation_at: activation, now_unix: activation },
+      { gatewayPending: pending({ installed: true, published: false, publication_refused: true }) },
+    )
+    const after = gatewayRow(atActivation, NOW)
+    expect(after.state).toBe('Installée, publication à faire')
+    expect(after.detail).toBeNull()
+    expect(after.actions).toEqual(['force_discard', 'resume'])
+    expect(after.forceKind).toBe('publication')
+  })
+
+  it('a_revoked_gateway_never_offers_renew_rollback_or_revoke', () => {
+    const forbidden = ['renew', 'abort', 'rollback', 'revoke', 'discard']
+    const cases = [
+      withGateway({ gateway_revoked: true, gateway_rollback_expires_at: NOW + DAY }, { caPqOverlap: true }),
+      withGateway({ gateway_revoked: true, gateway_awaited_replacement: FP }, { gatewayPending: pending() }),
+      withGateway(
+        { gateway_revoked: true, gateway_transition_pending: true, gateway_activation_at: NOW + DAY },
+        { gatewayPending: pending({ installed: true, publication_refused: true }) },
+      ),
+    ]
+    for (const o of cases) {
+      const row = gatewayRow(o, NOW)
+      for (const action of forbidden) expect(row.actions).not.toContain(action)
+    }
+  })
 })

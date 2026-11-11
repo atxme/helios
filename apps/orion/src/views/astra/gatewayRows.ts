@@ -9,7 +9,7 @@ import {
   valueOf,
 } from './rotationRows'
 
-export type GatewayAction = 'renew' | 'abort' | 'rollback' | 'revoke' | 'resume' | 'discard'
+export type GatewayAction = 'renew' | 'abort' | 'rollback' | 'revoke' | 'resume' | 'discard' | 'force_discard'
 
 export interface GatewayRow {
   state: string
@@ -29,6 +29,8 @@ export interface GatewayRow {
    * replacement while a transition is staged or overlapping.
    */
   replacementReason: string | null
+  /** Which confirmation a forced discard asks for: a dead end with a replacement, or a refused publication. */
+  forceKind: 'replacement' | 'publication' | null
 }
 
 /** The button labels of the block, one per action. */
@@ -39,6 +41,7 @@ export const GATEWAY_LABELS: Record<GatewayAction, string> = {
   revoke: 'Révoquer la gateway',
   resume: 'Reprendre',
   discard: 'Jeter la décision en attente',
+  force_discard: 'Abandonner la décision',
 }
 
 /** Why a replacement waits for the end of a transition: heliosd prepares none while one is staged. */
@@ -51,6 +54,12 @@ export const RESTART_SENTENCE = 'Redémarrer heliosd sur la gateway.'
 export const REVOCATION_TO_SIGN =
   "Le remplaçant est déposé ; la révocation reste à signer. Rien n'a été révoqué."
 
+/** What a revoked gateway that awaits a replacement not on this poste says. */
+const REPLACEMENT_NOT_HERE = "Le remplaçant nommé par la révocation n'est pas sur ce poste."
+
+/** What a revoked gateway with no replacement to come says: it is a dead end. */
+const REVOKED_FOR_GOOD = 'La gateway ne sert plus. Le domaine doit être reconstruit.'
+
 /**
  * The gateway's identity row: where it stands on the gateway's clock, and what the operator
  * may do from there. A waiting record (`gatewayPending`) takes the state and the first action.
@@ -61,6 +70,28 @@ export function gatewayRow(o: RotationsOverview, local: number): GatewayRow {
   const waiting = o.gatewayPending
   const restart = domain?.gateway_restart_due ? RESTART_SENTENCE : null
   const restartMotif = domain?.gateway_restart_due ?? null
+
+  // A revoked gateway takes no renewal, rollback or revocation: only the record's way out.
+  if (domain?.gateway_revoked) {
+    const awaited = domain.gateway_awaited_replacement
+    const base = { due: true, restart, restartMotif, renewReason: null, replacementReason: null }
+    if (awaited !== null && waiting?.replacement_fingerprint === awaited) {
+      return {
+        ...base,
+        state: 'Révoquée, remplaçant à installer',
+        actions: ['resume'],
+        detail: REPLACEMENT_NOT_HERE,
+        forceKind: null,
+      }
+    }
+    return {
+      ...base,
+      state: awaited !== null ? 'Révoquée, remplaçant attendu' : 'Révoquée',
+      actions: waiting ? ['force_discard'] : [],
+      detail: awaited !== null ? REPLACEMENT_NOT_HERE : REVOKED_FOR_GOOD,
+      forceKind: 'replacement',
+    }
+  }
 
   if (waiting?.kind === 'revocation') {
     const toSign = waiting.revocation_to_sign
@@ -77,6 +108,7 @@ export function gatewayRow(o: RotationsOverview, local: number): GatewayRow {
       renewReason: null,
       detail: toSign ? REVOCATION_TO_SIGN : null,
       replacementReason: null,
+      forceKind: null,
     }
   }
 
@@ -86,6 +118,9 @@ export function gatewayRow(o: RotationsOverview, local: number): GatewayRow {
   let due = false
   let actions: GatewayAction[] = []
   let replacementReason: string | null = null
+  let forceKind: GatewayRow['forceKind'] = null
+  // A renewal installed, never published, and refused by Astra: led by the cancellation, then by the force.
+  let refused = false
 
   if (!domain) {
     state = reachLabel(o.domain) ?? 'Identité non lue'
@@ -113,7 +148,24 @@ export function gatewayRow(o: RotationsOverview, local: number): GatewayRow {
     ) {
       state = 'Installée, publication à faire'
       due = true
-      if (abortable) actions = ['abort']
+      refused =
+        waiting?.kind === 'decision' &&
+        waiting.decision_kind === 'renewal' &&
+        waiting.installed &&
+        waiting.publication_refused
+      if (refused) {
+        if (abortable) {
+          if (activation !== null) {
+            detail.push(`La publication est refusée : annuler la transition avant le ${formatDateTime(activation)}.`)
+          }
+          actions = ['abort', 'resume']
+        } else {
+          actions = ['force_discard', 'resume']
+          forceKind = 'publication'
+        }
+      } else if (abortable) {
+        actions = ['abort']
+      }
     } else if (published && activation !== null && now < activation) {
       state = `Bascule le ${formatDate(activation)}`
       actions = ['revoke']
@@ -140,10 +192,13 @@ export function gatewayRow(o: RotationsOverview, local: number): GatewayRow {
   }
 
   // A waiting decision is led by its resumption, and a record can always be discarded.
-  if (waiting?.kind === 'decision') {
-    actions = ['resume', ...actions.filter((action) => action !== 'resume')]
+  // A refused publication sets its own actions: its discard is the forced one.
+  if (!refused) {
+    if (waiting?.kind === 'decision') {
+      actions = ['resume', ...actions.filter((action) => action !== 'resume')]
+    }
+    if (waiting) actions = [...actions, 'discard']
   }
-  if (waiting) actions = [...actions, 'discard']
 
   return {
     state,
@@ -154,5 +209,6 @@ export function gatewayRow(o: RotationsOverview, local: number): GatewayRow {
     renewReason,
     detail: detail.length > 0 ? detail.join(' · ') : null,
     replacementReason,
+    forceKind,
   }
 }

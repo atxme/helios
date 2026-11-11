@@ -56,7 +56,7 @@ describe('GatewayIdentityBlock', () => {
     const { onCeremony } = renderBlock(withDomain())
     fireEvent.click(block().getByRole('button', { name: "Renouveler l'identité de la gateway" }))
     expect(screen.getByRole('region', { name: 'Prérequis de la gateway' })).toBeTruthy()
-    expect(screen.getByText('Termes : préparation 7 jours, recouvrement 7 jours, validité 365 jours.')).toBeTruthy()
+    expect(screen.getByLabelText('Préparation (jours)')).toBeTruthy()
     fireEvent.click(screen.getByRole('checkbox', { name: 'Remplacer aussi la feuille TLS' }))
     fireEvent.click(screen.getByRole('button', { name: 'Continuer' }))
     await waitFor(() =>
@@ -302,5 +302,89 @@ describe('GatewayIdentityBlock', () => {
     fireEvent.click(confirmation().getByRole('button', { name: 'Jeter la décision en attente' }))
     expect(await screen.findByText('la gateway ne répond pas')).toBeTruthy()
     expect(screen.queryByText(/Error:/)).toBeNull()
+  })
+  const openRenew = () => fireEvent.click(block().getByRole('button', { name: "Renouveler l'identité de la gateway" }))
+  const terms = {
+    prepare: () => screen.getByLabelText('Préparation (jours)') as HTMLInputElement,
+    overlap: () => screen.getByLabelText('Recouvrement (jours)') as HTMLInputElement,
+    validity: () => screen.getByLabelText('Validité (jours)') as HTMLInputElement,
+  }
+
+  it('renew_defaults_are_7_7_365', () => {
+    renderBlock(withDomain())
+    openRenew()
+    expect(terms.prepare().value).toBe('7')
+    expect(terms.overlap().value).toBe('7')
+    expect(terms.validity().value).toBe('365')
+  })
+
+  it('renew_sends_the_terms_typed', async () => {
+    renderBlock(withDomain())
+    openRenew()
+    fireEvent.change(terms.prepare(), { target: { value: '10' } })
+    fireEvent.change(terms.overlap(), { target: { value: '14' } })
+    fireEvent.change(terms.validity(), { target: { value: '400' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Continuer' }))
+    await waitFor(() =>
+      expect(api.beginGatewayCeremony).toHaveBeenCalledWith({
+        gesture: 'renew',
+        rotate_tls: false,
+        key_recovery: false,
+        prepare_days: 10,
+        overlap_days: 14,
+        validity_days: 400,
+      }),
+    )
+  })
+
+  it('renew_refuses_terms_out_of_range_before_any_call', () => {
+    renderBlock(withDomain())
+    openRenew()
+    fireEvent.change(terms.prepare(), { target: { value: '0' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Continuer' }))
+    expect(screen.getByText('Préparation : de 1 à 3650 jours')).toBeTruthy()
+    fireEvent.change(terms.prepare(), { target: { value: '3651' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Continuer' }))
+    expect(screen.getByText('Préparation : de 1 à 3650 jours')).toBeTruthy()
+    expect(api.beginGatewayCeremony).not.toHaveBeenCalled()
+  })
+
+  it('force_discard_requires_its_confirmation', async () => {
+    // Impasse A: a revoked gateway with a record to drop.
+    const first = renderBlock(withDomain({ gateway_revoked: true }, { gatewayPending: pending() }))
+    fireEvent.click(block().getByRole('button', { name: 'Abandonner la décision' }))
+    expect(
+      screen.getByText(
+        'La révocation est appliquée ; le remplaçant ne sera jamais installé. La gateway ne servira plus et le domaine devra être reconstruit.',
+      ),
+    ).toBeTruthy()
+    const force = () => confirmation().getByRole('button', { name: 'Abandonner la décision' })
+    expect(force().hasAttribute('disabled')).toBe(true)
+    fireEvent.click(screen.getByRole('checkbox', { name: "Je confirme l'abandon de la décision" }))
+    fireEvent.click(force())
+    await waitFor(() => expect(api.beginGatewayCeremony).toHaveBeenCalledWith({ gesture: 'force_discard' }))
+    await waitFor(() => expect(first.refresh).toHaveBeenCalled())
+    expect(api.operatorCeremonyStatus).not.toHaveBeenCalled()
+    expect(first.onCeremony).not.toHaveBeenCalled()
+
+    // Impasse B: a renewal refused at its publication, once activated.
+    cleanup()
+    api.beginGatewayCeremony.mockClear()
+    renderBlock(
+      withDomain(
+        { gateway_transition_pending: true, gateway_activation_at: NOW - DAY },
+        { gatewayPending: pending({ installed: true, published: false, publication_refused: true }) },
+      ),
+    )
+    fireEvent.click(block().getByRole('button', { name: 'Abandonner la décision' }))
+    expect(
+      screen.getByText(
+        'La transition reste installée sur la gateway, sans publication. heliosd ne redémarrera plus sur cette identité. Seule une révocation de la gateway sans remplaçant reste possible.',
+      ),
+    ).toBeTruthy()
+    expect(confirmation().getByRole('button', { name: 'Abandonner la décision' }).hasAttribute('disabled')).toBe(true)
+    fireEvent.click(screen.getByRole('checkbox', { name: "Je confirme l'abandon de la décision" }))
+    fireEvent.click(confirmation().getByRole('button', { name: 'Abandonner la décision' }))
+    await waitFor(() => expect(api.beginGatewayCeremony).toHaveBeenCalledWith({ gesture: 'force_discard' }))
   })
 })

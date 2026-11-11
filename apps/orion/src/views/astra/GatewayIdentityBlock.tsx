@@ -24,8 +24,7 @@ import { GATEWAY_LABELS, gatewayRow } from './gatewayRows'
 import type { GatewayAction } from './gatewayRows'
 import { allGreen, prerequisites } from './rotationRows'
 
-/** The terms a gateway renewal is sent with: the gateway's own defaults. */
-const RENEW_TERMS = { prepare_days: 7, overlap_days: 7, validity_days: 365 } as const
+const TERMS_DAYS_MAX = 3650
 const HOURS_MAX = 168
 const REASON_MAX_CHARS = 200
 const ROLLBACK_HOURS_DEFAULT = '24'
@@ -36,6 +35,36 @@ const MOTIFS: { value: RevocationReasonChoice; label: string }[] = [
   { value: 'no_longer_used', label: 'Plus utilisé' },
   { value: 'replaced', label: 'Remplacé' },
 ]
+
+/** The renewal terms as typed: strings, checked on the click. Starts on the gateway's own defaults. */
+interface TermsDraft {
+  prepare: string
+  overlap: string
+  validity: string
+}
+
+const TERMS_DEFAULT: TermsDraft = { prepare: '7', overlap: '7', validity: '365' }
+
+/** What is wrong with the renewal terms, before any call; `null` when they can be sent. */
+function termsError(draft: TermsDraft): string | null {
+  const whole = (value: string) => value.trim() !== '' && Number.isSafeInteger(Number(value))
+  const fields: [string, string][] = [
+    ['Préparation', draft.prepare],
+    ['Recouvrement', draft.overlap],
+    ['Validité', draft.validity],
+  ]
+  for (const [label, value] of fields) {
+    if (!whole(value) || Number(value) < 1 || Number(value) > TERMS_DAYS_MAX) {
+      return `${label} : de 1 à ${TERMS_DAYS_MAX} jours`
+    }
+  }
+  return null
+}
+
+const FORCE_REPLACEMENT =
+  'La révocation est appliquée ; le remplaçant ne sera jamais installé. La gateway ne servira plus et le domaine devra être reconstruit.'
+const FORCE_PUBLICATION =
+  'La transition reste installée sur la gateway, sans publication. heliosd ne redémarrera plus sur cette identité. Seule une révocation de la gateway sans remplaçant reste possible.'
 
 type Mode = 'with' | 'without'
 
@@ -91,6 +120,8 @@ export function GatewayIdentityBlock({
   const [rotateTls, setRotateTls] = useState(false)
   const [keyLost, setKeyLost] = useState(false)
   const [keyLossConfirmed, setKeyLossConfirmed] = useState(false)
+  const [terms, setTerms] = useState<TermsDraft>(TERMS_DEFAULT)
+  const [forceConfirmed, setForceConfirmed] = useState(false)
   const [hours, setHours] = useState(ROLLBACK_HOURS_DEFAULT)
   const [reason, setReason] = useState('')
   const [motif, setMotif] = useState<RevocationReasonChoice | null>(null)
@@ -101,6 +132,7 @@ export function GatewayIdentityBlock({
   const choose = (action: GatewayAction) => {
     setError(null)
     setInvalid(null)
+    setForceConfirmed(false)
     setSelected((current) => (current === action ? null : action))
   }
 
@@ -110,7 +142,7 @@ export function GatewayIdentityBlock({
     setError(null)
     try {
       await api.beginGatewayCeremony(gesture)
-      if (gesture.gesture === 'discard') {
+      if (gesture.gesture === 'discard' || gesture.gesture === 'force_discard') {
         await refresh()
         setSelected(null)
         return
@@ -125,13 +157,19 @@ export function GatewayIdentityBlock({
     }
   }
 
-  const renew = () =>
+  const renew = () => {
+    const wrong = termsError(terms)
+    setInvalid(wrong)
+    if (wrong) return
     void launch({
       gesture: 'renew',
       rotate_tls: rotateTls,
       key_recovery: keyLost,
-      ...RENEW_TERMS,
+      prepare_days: Number(terms.prepare),
+      overlap_days: Number(terms.overlap),
+      validity_days: Number(terms.validity),
     })
+  }
 
   const rollback = () => {
     const wrong = rollbackError(hours, reason)
@@ -158,8 +196,22 @@ export function GatewayIdentityBlock({
     void launch({ gesture: 'revoke', reason: motif, with_replacement: withReplacement })
   }
 
-  // Each flow below needs its prerequisites green, except the discard, which takes no key.
-  const flowOpen = selected === 'discard' || green
+  // Each flow below needs its prerequisites green, except the discards, which take no key.
+  const dropping = selected === 'discard' || selected === 'force_discard'
+  const flowOpen = dropping || green
+
+  const termField = (key: keyof TermsDraft, label: string) => (
+    <TextField
+      label={label}
+      value={terms[key]}
+      onChange={(event) => setTerms({ ...terms, [key]: event.target.value })}
+      size="small"
+      disabled={busy}
+      fullWidth
+      sx={{ mb: 1 }}
+      slotProps={{ htmlInput: { inputMode: 'numeric' } }}
+    />
+  )
 
   let flow: ReactNode = null
   if (selected === 'renew') {
@@ -205,9 +257,14 @@ export function GatewayIdentityBlock({
             />
           </Paper>
         )}
-        <Typography color="text.secondary" sx={{ mb: 1, fontSize: 11.5 }}>
-          Termes : préparation 7 jours, recouvrement 7 jours, validité 365 jours.
-        </Typography>
+        {termField('prepare', 'Préparation (jours)')}
+        {termField('overlap', 'Recouvrement (jours)')}
+        {termField('validity', 'Validité (jours)')}
+        {invalid && (
+          <Alert severity="warning" variant="outlined" sx={{ mb: 1, fontSize: 11.5 }}>
+            {invalid}
+          </Alert>
+        )}
         <Button
           size="small"
           variant="contained"
@@ -341,6 +398,33 @@ export function GatewayIdentityBlock({
         {GATEWAY_LABELS.resume}
       </Button>
     )
+  } else if (selected === 'force_discard') {
+    flow = (
+      <Paper component="section" aria-label="Confirmation" variant="outlined" sx={{ px: 1.5, py: 1 }}>
+        <Typography sx={{ mb: 0.75, fontSize: 12 }}>
+          {row.forceKind === 'publication' ? FORCE_PUBLICATION : FORCE_REPLACEMENT}
+        </Typography>
+        <FormControlLabel
+          control={
+            <Checkbox
+              checked={forceConfirmed}
+              disabled={busy}
+              onChange={(event) => setForceConfirmed(event.target.checked)}
+            />
+          }
+          label="Je confirme l'abandon de la décision"
+        />
+        <Button
+          size="small"
+          variant="contained"
+          disabled={busy || !forceConfirmed}
+          onClick={() => void launch({ gesture: 'force_discard' })}
+          sx={{ minHeight: 30, fontSize: 12 }}
+        >
+          {GATEWAY_LABELS.force_discard}
+        </Button>
+      </Paper>
+    )
   } else if (selected === 'discard') {
     flow = (
       <Paper component="section" aria-label="Confirmation" variant="outlined" sx={{ px: 1.5, py: 1 }}>
@@ -415,7 +499,7 @@ export function GatewayIdentityBlock({
         </Typography>
       )}
 
-      {selected && selected !== 'discard' && (
+      {selected && !dropping && (
         <Paper component="section" aria-label="Prérequis de la gateway" variant="outlined" sx={{ mt: 1.25, px: 1.5, py: 1 }}>
           <Typography component="h4" sx={{ mb: 0.5, fontSize: 12.5, fontWeight: 700 }}>
             Prérequis
