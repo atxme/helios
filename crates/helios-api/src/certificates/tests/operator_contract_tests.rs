@@ -122,7 +122,12 @@ impl OperatorCampaignRelay for RecordingRelay {
         operator: &astra_channel::OperatorIdentity,
         request: astra_channel::OperatorGatewayPublish,
     ) -> Result<astra_channel::OperatorGatewayPublished, TrustUpdateRefusal> {
-        self.record("gateway-publish", operator, request.epoch.to_string(), "")?;
+        self.record(
+            "gateway-publish",
+            operator,
+            format!("{}:{}", request.epoch, request.transition_fingerprint),
+            "",
+        )?;
         Ok(astra_channel::OperatorGatewayPublished {
             epoch: request.epoch,
             relayed: true,
@@ -203,7 +208,10 @@ async fn chain_next_answers_its_outcome_and_abandon_answers_no_content() {
 #[tokio::test]
 async fn gateway_publish_is_relayed_once_with_its_epoch() {
     let relay = RecordingRelay::new(None);
-    let body = Bytes::from_static(br#"{"epoch":5}"#);
+    let fingerprint = Fingerprint::of(b"the transition installed");
+    let body = Bytes::from(format!(
+        r#"{{"epoch":5,"transition_fingerprint":"{fingerprint}"}}"#
+    ));
     let response = operator_gateway_publish(
         State(state(&relay)),
         Extension(operator_caller_at(true)),
@@ -227,7 +235,7 @@ async fn gateway_publish_is_relayed_once_with_its_epoch() {
         vec![Call {
             route: "gateway-publish",
             operator: expected_operator(),
-            id: "5".into(),
+            id: format!("5:{fingerprint}"),
             token: String::new(),
         }]
     );

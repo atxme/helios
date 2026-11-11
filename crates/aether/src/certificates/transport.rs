@@ -1398,10 +1398,16 @@ impl std::fmt::Debug for OperatorVaultCopy {
 /// What an administrator asks Astra to publish: the gateway identity transition
 /// of one epoch, which Astra marks published and then relays to the gateway
 /// (F14 lot 6b).
+///
+/// The request names the exact document, not only its epoch: two transitions
+/// may be stored at one epoch (one deposited, lost, then deposited again), and
+/// the mark is irreversible, so Astra publishes the one whose fingerprint this
+/// is and refuses if it holds none.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OperatorGatewayPublish {
     pub epoch: u64,
+    pub transition_fingerprint: Fingerprint,
 }
 
 /// What Astra answers to a publication. `relayed` says whether the gateway

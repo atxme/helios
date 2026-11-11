@@ -181,8 +181,12 @@ pub enum DoorRequest {
     IssuerInstall {
         authorization: Box<AstraIssuerAuthorization>,
     },
-    /// Lets the signed gateway transition of this epoch leave the authority.
-    GatewayIdentityPublish { epoch: u64 },
+    /// Lets the signed gateway transition of this epoch, the one with this
+    /// fingerprint, leave the authority.
+    GatewayIdentityPublish {
+        epoch: u64,
+        transition_fingerprint: Fingerprint,
+    },
     /// Replaces the encrypted vault copy, and the credential document when
     /// one travels with it (§5.9). The tunnel's alone: the console keeps its
     /// own procedure, which is a file copy.
@@ -804,9 +808,17 @@ impl AstraService {
                 }
                 Ok(DoorOutcome::from(installed))
             }
-            DoorRequest::GatewayIdentityPublish { epoch } => {
-                self.publish_gateway_transition(epoch, now_unix, gateway_bound)
-                    .await
+            DoorRequest::GatewayIdentityPublish {
+                epoch,
+                transition_fingerprint,
+            } => {
+                self.publish_gateway_transition(
+                    epoch,
+                    &transition_fingerprint,
+                    now_unix,
+                    gateway_bound,
+                )
+                .await
             }
             DoorRequest::VaultCopy { vault, credentials } => {
                 self.copy_vault(vault, credentials, now_unix).await
@@ -822,6 +834,7 @@ impl AstraService {
     async fn publish_gateway_transition(
         &self,
         epoch: u64,
+        transition_fingerprint: &Fingerprint,
         now_unix: u64,
         gateway_bound: Duration,
     ) -> Result<DoorOutcome, DoorRefusal> {
@@ -833,7 +846,12 @@ impl AstraService {
             .ok_or(DoorRefusal::PublicationChannelUnavailable)?;
         let mark = {
             let mut registry = self.registry.lock().await;
-            write::mark_gateway_transition_published(&mut registry, epoch, now_unix)?
+            write::mark_gateway_transition_published(
+                &mut registry,
+                epoch,
+                transition_fingerprint,
+                now_unix,
+            )?
         };
         let confirmed = write::relay_gateway_publication(channel, &mark, gateway_bound).await;
         Ok(DoorOutcome::published(mark, confirmed))

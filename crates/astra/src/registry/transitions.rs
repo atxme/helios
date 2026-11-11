@@ -442,12 +442,17 @@ impl AstraRegistry {
     /// transition that has been distributed can no longer be aborted: a client
     /// may hold it, go offline, and promote on its own at `not_after`.
     ///
+    /// The publication names the exact document: several transitions may be
+    /// stored at one epoch, and publishing "the first at this epoch" could
+    /// close the abort window on one the gateway never installed.
+    ///
     /// Idempotent, because the relay to the gateway that follows may fail
     /// after this write. Re-running the step must be able to finish the relay
     /// without asking `CA-PQ` to sign anything again.
     pub fn publish_gateway_transition(
         &mut self,
         gateway_identity_epoch: u64,
+        transition_fingerprint: &Fingerprint,
         now_unix: u64,
     ) -> Result<aether::certificates::gateway::GatewayIdentityTransition, RegistryError> {
         use aether::certificates::transport::TrustUpdateObject;
@@ -459,6 +464,9 @@ impl AstraRegistry {
             .position(|stored| match &stored.object {
                 TrustUpdateObject::GatewayIdentityTransition(transition) => {
                     transition.gateway_identity_epoch == gateway_identity_epoch
+                        && transition
+                            .fingerprint()
+                            .is_ok_and(|held| held.matches(transition_fingerprint))
                 }
                 _ => false,
             })

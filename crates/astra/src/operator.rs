@@ -490,6 +490,7 @@ async fn gateway_publish(
     };
     let operator = relayed.operator;
     let epoch = relayed.request.epoch;
+    let transition_fingerprint = relayed.request.transition_fingerprint;
     let connector = DoorConnector::Tunnel {
         operator: operator.clone(),
     };
@@ -499,7 +500,10 @@ async fn gateway_publish(
             service
                 .door(
                     connector,
-                    DoorRequest::GatewayIdentityPublish { epoch },
+                    DoorRequest::GatewayIdentityPublish {
+                        epoch,
+                        transition_fingerprint,
+                    },
                     now_unix(),
                 )
                 .await

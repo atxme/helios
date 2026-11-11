@@ -267,7 +267,7 @@ async fn vault_copy_route_refuses_a_non_admin_and_an_oversized_body() {
 #[tokio::test]
 async fn publish_is_refused_to_a_non_admin() {
     const URI: &str = "/api/certificates/operator/gateway-identity/publish";
-    const BODY: &str = r#"{"epoch":5}"#;
+    const BODY: &str = r#"{"epoch":5,"transition_fingerprint":"0000000000000000000000000000000000000000000000000000000000000000"}"#;
 
     let (non_admin_state, _cmd_rx) = state();
     non_admin_state.network.write().await.peers[0].admin = false;

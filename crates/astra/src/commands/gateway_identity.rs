@@ -83,10 +83,19 @@ pub(super) fn print_gateway_identity(
 ///
 /// Replayable: the mark is persisted before the relay, and a second run
 /// finishes a relay the first could not confirm.
-pub(crate) fn gateway_identity_publish(state_dir: &Path, epoch: u64) -> Result<()> {
+pub(crate) fn gateway_identity_publish(
+    state_dir: &Path,
+    epoch: u64,
+    transition: &str,
+) -> Result<()> {
+    let transition_fingerprint =
+        super::trust_domain::parse_fingerprint(transition).context("--transition")?;
     let outcome = console::write(
         state_dir,
-        DoorRequest::GatewayIdentityPublish { epoch },
+        DoorRequest::GatewayIdentityPublish {
+            epoch,
+            transition_fingerprint,
+        },
         |registry| {
             let channel = configured_gateway_channel(state_dir)?;
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -98,6 +107,7 @@ pub(crate) fn gateway_identity_publish(state_dir: &Path, epoch: u64) -> Result<(
                     registry,
                     &channel,
                     epoch,
+                    &transition_fingerprint,
                     now_unix(),
                 ))?;
             Ok(DoorOutcome::published(mark, confirmed))

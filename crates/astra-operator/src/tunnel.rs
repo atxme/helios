@@ -595,14 +595,21 @@ impl Tunnel {
             .context("ouverture de la campagne")
     }
 
-    /// Publishes the signed gateway transition of `epoch` (F14 lot 6b): Astra
+    /// Publishes the signed gateway transition of `epoch` with this fingerprint (F14 lot 6b): Astra
     /// marks it published, then relays it to the gateway. Asking again retries
     /// a relay the gateway did not confirm; `relayed` says whether it did.
-    pub fn publish_gateway_transition(&self, epoch: u64) -> Result<OperatorGatewayPublished> {
+    pub fn publish_gateway_transition(
+        &self,
+        epoch: u64,
+        transition_fingerprint: Fingerprint,
+    ) -> Result<OperatorGatewayPublished> {
         let response = self
             .post_admin(
                 &format!("{OPERATOR_PREFIX}/gateway-identity/publish"),
-                &OperatorGatewayPublish { epoch },
+                &OperatorGatewayPublish {
+                    epoch,
+                    transition_fingerprint,
+                },
             )
             .context("publication de la transition gateway")?;
         Self::read_admin(response, crate::origin::MAX_ANSWER_BYTES)

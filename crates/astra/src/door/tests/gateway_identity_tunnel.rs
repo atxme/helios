@@ -208,8 +208,14 @@ fn gateway_wg() -> WireGuardKey {
     WireGuardKey::from_bytes(GATEWAY_KEY)
 }
 
-/// A gateway leaf under `authority`, for a fresh subject key.
+/// A gateway leaf under `authority`, for a fresh subject key, valid until
+/// [`LEAF_NOT_AFTER`].
 fn leaf(authority: &Authority, serial: u8) -> PqCertificate {
+    leaf_valid(authority, serial, (0, LEAF_NOT_AFTER))
+}
+
+/// A gateway leaf under `authority` valid over `validity`.
+fn leaf_valid(authority: &Authority, serial: u8, validity: (u64, u64)) -> PqCertificate {
     let (_, subject_public) = generate_ml_dsa_87_keypair().expect("subject key");
     issue_pq_certificate(
         PqCertificate {
@@ -221,8 +227,8 @@ fn leaf(authority: &Authority, serial: u8) -> PqCertificate {
             wireguard_public_key: gateway_wg().to_base64(),
             ml_dsa_87_public_key: base64::engine::general_purpose::STANDARD
                 .encode(subject_public.as_bytes()),
-            not_before_unix: 0,
-            not_after_unix: LEAF_NOT_AFTER,
+            not_before_unix: validity.0,
+            not_after_unix: validity.1,
             ml_dsa_87_signature: String::new(),
         },
         &authority.private,
@@ -256,6 +262,13 @@ fn sign_transition(
     rotate_tls: bool,
     serial: u8,
 ) -> GatewayIdentityTransition {
+    // As `astra-operator` issues it: from now for a year, and covering the whole
+    // window, so that a leaf never expires inside its own overlap.
+    let validity = (NOW, NOW + 365 * DAY);
+    assert!(
+        validity.0 <= window.0 && validity.1 >= window.2,
+        "the leaf's validity must cover the transition window"
+    );
     let next_tls = rotate_tls.then(gateway_tls_successor);
     let tls = state.active_tls_fingerprint();
     let pq = state.active_pq_fingerprint().expect("active leaf");
@@ -270,7 +283,7 @@ fn sign_transition(
         active_gateway_tls_certificate_fingerprint: tls,
         next_gateway_tls_certificate: next_tls,
         active_gateway_certificate_fingerprint: pq,
-        next_gateway_certificate: Some(leaf(authority, serial)),
+        next_gateway_certificate: Some(leaf_valid(authority, serial, validity)),
         window: TransitionWindow::new(window.0, window.1, window.2).expect("window"),
         reason,
         ca_signature: MlDsa87Signature::placeholder(),
@@ -501,7 +514,7 @@ impl Fixture {
 }
 
 /// An activation after `NOW` and a window that outlives the test's instants.
-const STAGED: (u64, u64, u64) = (NOW - 100, NOW + 100, NOW + 10_000);
+const STAGED: (u64, u64, u64) = (NOW, NOW + 100, NOW + 10_000);
 /// The cause the gateway names when an emergency replacement is refused outside a revocation.
 const EMERGENCY_CAUSE: &str = "emergency_replacement belongs to a revoked identity";
 const DAY: u64 = 86_400;
@@ -512,10 +525,13 @@ const DAY: u64 = 86_400;
 /// once, so these instants are inert.
 const INERT: (u64, u64, u64) = (NOW, NOW + 7 * DAY, NOW + 14 * DAY);
 
-fn relayed_publication(epoch: u64) -> Vec<u8> {
+fn relayed_publication(transition: &GatewayIdentityTransition) -> Vec<u8> {
     serde_json::to_vec(&RelayedOperatorGatewayPublish {
         operator: administrator(),
-        request: OperatorGatewayPublish { epoch },
+        request: OperatorGatewayPublish {
+            epoch: transition.gateway_identity_epoch,
+            transition_fingerprint: transition.fingerprint().expect("fingerprint"),
+        },
     })
     .expect("relayed publication")
 }
@@ -565,7 +581,7 @@ async fn a_gateway_renewal_runs_through_the_tunnel() {
     let (status, body) = post_to(
         &fixture.listener,
         OPERATOR_GATEWAY_PUBLISH_ROUTE,
-        &relayed_publication(DECISION_EPOCH + 1),
+        &relayed_publication(&transition),
     )
     .await;
     assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));

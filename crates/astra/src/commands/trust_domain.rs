@@ -170,7 +170,9 @@ pub(crate) fn pin_ca_tls(state_dir: &Path, fingerprint: &str) -> Result<()> {
 }
 
 /// Reads a SHA-256 an operator confirmed out of band.
-fn parse_fingerprint(value: &str) -> Result<aether::certificates::encoding::Fingerprint> {
+pub(crate) fn parse_fingerprint(
+    value: &str,
+) -> Result<aether::certificates::encoding::Fingerprint> {
     aether::certificates::encoding::Fingerprint::parse_hex(value.trim())
         .map_err(|error| anyhow::anyhow!("{error}"))
 }

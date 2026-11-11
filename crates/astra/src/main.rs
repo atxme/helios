@@ -360,6 +360,10 @@ enum GatewayIdentityCommand {
         /// L'époque de la transition à publier.
         #[arg(long)]
         epoch: u64,
+        /// L'empreinte de la transition à publier, en hexadécimal : deux
+        /// transitions peuvent être conservées à la même époque.
+        #[arg(long)]
+        transition: String,
     },
 }
 
@@ -536,8 +540,8 @@ fn main() -> Result<()> {
                 requested_by,
                 window_secs,
             } => gateway_identity_open(&cli.state_dir, &reason, &requested_by, window_secs),
-            GatewayIdentityCommand::Publish { epoch } => {
-                gateway_identity_publish(&cli.state_dir, epoch)
+            GatewayIdentityCommand::Publish { epoch, transition } => {
+                gateway_identity_publish(&cli.state_dir, epoch, &transition)
             }
         },
         Command::Status {

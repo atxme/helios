@@ -97,7 +97,11 @@ pub trait GatewayIdentityRemote {
     fn renewal_request(&self) -> Result<GatewayCertificateRequest>;
     fn candidate_tls(&self) -> Result<Option<DerCertificate>>;
     fn install(&self, transition: &GatewayIdentityTransition) -> Result<GatewayDecisionRead>;
-    fn publish(&self, epoch: u64) -> Result<OperatorGatewayPublished>;
+    fn publish(
+        &self,
+        epoch: u64,
+        transition_fingerprint: Fingerprint,
+    ) -> Result<OperatorGatewayPublished>;
     fn abort(&self, abort: &GatewayTransitionAbort) -> Result<GatewayDecisionRead>;
     fn rollback(
         &self,
@@ -144,8 +148,12 @@ impl GatewayIdentityRemote for Tunnel {
         Tunnel::install_gateway_transition(self, transition)
     }
 
-    fn publish(&self, epoch: u64) -> Result<OperatorGatewayPublished> {
-        Tunnel::publish_gateway_transition(self, epoch)
+    fn publish(
+        &self,
+        epoch: u64,
+        transition_fingerprint: Fingerprint,
+    ) -> Result<OperatorGatewayPublished> {
+        Tunnel::publish_gateway_transition(self, epoch, transition_fingerprint)
     }
 
     fn abort(&self, abort: &GatewayTransitionAbort) -> Result<GatewayDecisionRead> {
@@ -674,8 +682,11 @@ pub fn carry(
         decision.installed = true;
         save(&record_path(vault_path), &decision).map_err(internal)?;
     }
+    // Names the document installed, not only its epoch: Astra may hold another
+    // transition at this epoch, and the mark it writes is irreversible.
+    let transition_fingerprint = transition.fingerprint().map_err(internal)?;
     let relay = remote
-        .publish(transition.gateway_identity_epoch)
+        .publish(transition.gateway_identity_epoch, transition_fingerprint)
         .map_err(refused_by_gateway)?;
     if !relay.relayed {
         return Err(GatewayRefusal::Internal(

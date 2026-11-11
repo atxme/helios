@@ -137,10 +137,13 @@ pub struct PublicationMark {
 pub fn mark_gateway_transition_published(
     registry: &mut AstraRegistry,
     epoch: u64,
+    transition_fingerprint: &Fingerprint,
     now_unix: u64,
 ) -> Result<PublicationMark, DoorRefusal> {
     let transition = registry
-        .write_or_restore(|registry| registry.publish_gateway_transition(epoch, now_unix))
+        .write_or_restore(|registry| {
+            registry.publish_gateway_transition(epoch, transition_fingerprint, now_unix)
+        })
         .map_err(|error| match error {
             RegistryError::UnknownPeer => DoorRefusal::NoGatewayTransition { epoch },
             RegistryError::Transition(_) => DoorRefusal::GatewayTransitionAborted { epoch },
@@ -205,9 +208,11 @@ pub async fn publish_gateway_transition(
     registry: &mut AstraRegistry,
     channel: &GatewayChannel,
     epoch: u64,
+    transition_fingerprint: &Fingerprint,
     now_unix: u64,
 ) -> Result<(PublicationMark, bool), DoorRefusal> {
-    let mark = mark_gateway_transition_published(registry, epoch, now_unix)?;
+    let mark =
+        mark_gateway_transition_published(registry, epoch, transition_fingerprint, now_unix)?;
     let confirmed = relay_gateway_publication(channel, &mark, super::GATEWAY_CALL_BOUND).await;
     Ok((mark, confirmed))
 }

@@ -992,10 +992,13 @@ async fn a_delegation_at_a_spent_epoch_stays_a_refusal() {
     assert_eq!(deposit.state().await, before);
 }
 
-fn relayed_publication(epoch: u64) -> Vec<u8> {
+fn relayed_publication(stored: &crate::registry::StoredTransition) -> Vec<u8> {
     serde_json::to_vec(&RelayedOperatorGatewayPublish {
         operator: administrator(),
-        request: OperatorGatewayPublish { epoch },
+        request: OperatorGatewayPublish {
+            epoch: 5,
+            transition_fingerprint: stored_fingerprint(stored),
+        },
     })
     .expect("relayed publication")
 }
@@ -1018,16 +1021,14 @@ async fn fixture_with_accepting_gateway(dir: &Path) -> Arc<AstraService> {
 async fn publish_route_relays_to_the_door() {
     let dir = tempfile::tempdir().expect("temp dir");
     let service = fixture_with_accepting_gateway(dir.path()).await;
-    rewrite_registry(&service, |state| {
-        state.transitions.push(stored_gateway_transition(5))
-    })
-    .await;
+    let stored = stored_gateway_transition(5);
+    rewrite_registry(&service, |state| state.transitions.push(stored.clone())).await;
     let listener = listen(Arc::clone(&service)).await;
 
     let (status, body) = post_to(
         &listener,
         OPERATOR_GATEWAY_PUBLISH_ROUTE,
-        &relayed_publication(5),
+        &relayed_publication(&stored),
     )
     .await;
     assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
@@ -1048,17 +1049,15 @@ async fn publish_route_relays_to_the_door() {
 async fn publish_twice_answers_twice() {
     let dir = tempfile::tempdir().expect("temp dir");
     let service = fixture_with_accepting_gateway(dir.path()).await;
-    rewrite_registry(&service, |state| {
-        state.transitions.push(stored_gateway_transition(5))
-    })
-    .await;
+    let stored = stored_gateway_transition(5);
+    rewrite_registry(&service, |state| state.transitions.push(stored.clone())).await;
     let listener = listen(Arc::clone(&service)).await;
 
     for _ in 0..2 {
         let (status, body) = post_to(
             &listener,
             OPERATOR_GATEWAY_PUBLISH_ROUTE,
-            &relayed_publication(5),
+            &relayed_publication(&stored),
         )
         .await;
         assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
@@ -1079,16 +1078,14 @@ async fn publish_twice_answers_twice() {
 async fn publish_whose_relay_is_refused_answers_not_relayed() {
     let dir = tempfile::tempdir().expect("temp dir");
     let service = fixture_with_gateway(dir.path()).await;
-    rewrite_registry(&service, |state| {
-        state.transitions.push(stored_gateway_transition(5))
-    })
-    .await;
+    let stored = stored_gateway_transition(5);
+    rewrite_registry(&service, |state| state.transitions.push(stored.clone())).await;
     let listener = listen(Arc::clone(&service)).await;
 
     let (status, body) = post_to(
         &listener,
         OPERATOR_GATEWAY_PUBLISH_ROUTE,
-        &relayed_publication(5),
+        &relayed_publication(&stored),
     )
     .await;
     assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));

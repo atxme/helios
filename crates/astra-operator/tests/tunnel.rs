@@ -559,6 +559,7 @@ fn a_vault_copy_above_the_relay_bound_is_sent_whole() {
 /// answer says whether the gateway confirmed the relay.
 #[test]
 fn a_gateway_publication_posts_its_epoch_to_its_route() {
+    let fingerprint = Fingerprint::of(b"the transition installed");
     let published = OperatorGatewayPublished {
         epoch: 7,
         relayed: true,
@@ -569,7 +570,7 @@ fn a_gateway_publication_posts_its_epoch_to_its_route() {
     )]);
     let answer = Tunnel::new(&stub.base)
         .expect("tunnel")
-        .publish_gateway_transition(7)
+        .publish_gateway_transition(7, fingerprint)
         .expect("published");
     assert_eq!(answer, published);
 
@@ -580,7 +581,13 @@ fn a_gateway_publication_posts_its_epoch_to_its_route() {
         "/api/certificates/operator/gateway-identity/publish"
     );
     let sent: OperatorGatewayPublish = serde_json::from_slice(&seen.body).expect("body");
-    assert_eq!(sent, OperatorGatewayPublish { epoch: 7 });
+    assert_eq!(
+        sent,
+        OperatorGatewayPublish {
+            epoch: 7,
+            transition_fingerprint: fingerprint,
+        }
+    );
 }
 
 /// Held back by a live operation is a result, and not a failure: the rotation

@@ -268,7 +268,10 @@ fn the_policy_table_is_exactly_the_specification() {
         DoorRequest::IssuerInstall {
             authorization: Box::new(delegation(&delegated_material(), 1)),
         },
-        DoorRequest::GatewayIdentityPublish { epoch: 5 },
+        DoorRequest::GatewayIdentityPublish {
+            epoch: 5,
+            transition_fingerprint: Fingerprint::of(b"a transition"),
+        },
         DoorRequest::VaultCopy {
             vault: Vec::new().into(),
             credentials: None,
@@ -1359,7 +1362,13 @@ fn the_tunnel_may_open_gateway_actions() {
             DoorRequest::GatewayIdentity { text: text() },
             "gateway_identity",
         ),
-        (DoorRequest::GatewayIdentityPublish { epoch: 5 }, "publish"),
+        (
+            DoorRequest::GatewayIdentityPublish {
+                epoch: 5,
+                transition_fingerprint: Fingerprint::of(b"a transition"),
+            },
+            "publish",
+        ),
         (
             DoorRequest::GatewayRevocation { text: text() },
             "gateway_revocation",
@@ -2122,6 +2131,29 @@ fn stored_gateway_transition(epoch: u64) -> crate::registry::StoredTransition {
     }
 }
 
+/// The fingerprint a publication names for the transition stored by
+/// [`stored_gateway_transition`] at this epoch: the stored document's own.
+fn stored_fingerprint(stored: &crate::registry::StoredTransition) -> Fingerprint {
+    let aether::certificates::transport::TrustUpdateObject::GatewayIdentityTransition(transition) =
+        &stored.object
+    else {
+        panic!("a gateway transition");
+    };
+    transition.fingerprint().expect("fingerprint")
+}
+
+fn publication_of(stored: &crate::registry::StoredTransition) -> DoorRequest {
+    let aether::certificates::transport::TrustUpdateObject::GatewayIdentityTransition(transition) =
+        &stored.object
+    else {
+        panic!("a gateway transition");
+    };
+    DoorRequest::GatewayIdentityPublish {
+        epoch: transition.gateway_identity_epoch,
+        transition_fingerprint: stored_fingerprint(stored),
+    }
+}
+
 fn published_on_disk(dir: &Path) -> bool {
     registry_on_disk(dir)
         .state()
@@ -2149,7 +2181,7 @@ async fn a_publication_is_marked_before_the_relay() {
     };
     rewrite_registry(&service, |state| state.transitions.push(stored.clone())).await;
 
-    let request = DoorRequest::GatewayIdentityPublish { epoch: 5 };
+    let request = publication_of(&stored);
     let outcome = service
         .door(console(), request.clone(), NOW)
         .await
@@ -2171,16 +2203,10 @@ async fn a_publication_is_marked_before_the_relay() {
 async fn a_publication_without_the_service_channel_marks_nothing() {
     let dir = tempfile::tempdir().expect("temp dir");
     let service = fixture(dir.path());
-    rewrite_registry(&service, |state| {
-        state.transitions.push(stored_gateway_transition(5))
-    })
-    .await;
+    let stored = stored_gateway_transition(5);
+    rewrite_registry(&service, |state| state.transitions.push(stored.clone())).await;
     let refusal = service
-        .door(
-            console(),
-            DoorRequest::GatewayIdentityPublish { epoch: 5 },
-            NOW,
-        )
+        .door(console(), publication_of(&stored), NOW)
         .await
         .expect_err("nowhere to relay");
     assert!(matches!(
@@ -2197,7 +2223,10 @@ async fn a_publication_names_a_stored_transition() {
     let refusal = service
         .door(
             console(),
-            DoorRequest::GatewayIdentityPublish { epoch: 5 },
+            DoorRequest::GatewayIdentityPublish {
+                epoch: 5,
+                transition_fingerprint: Fingerprint::of(b"nothing stored"),
+            },
             NOW,
         )
         .await
@@ -2300,18 +2329,11 @@ async fn a_mute_gateway_releases_the_volume_gate_at_the_bound() {
 async fn a_publication_to_a_mute_gateway_is_unconfirmed_at_the_bound() {
     let dir = tempfile::tempdir().expect("temp dir");
     let service = fixture_with_mute_gateway(dir.path()).await;
-    rewrite_registry(&service, |state| {
-        state.transitions.push(stored_gateway_transition(5))
-    })
-    .await;
+    let stored = stored_gateway_transition(5);
+    rewrite_registry(&service, |state| state.transitions.push(stored.clone())).await;
     let outcome = tokio::time::timeout(
         WEDGE_GUARD,
-        service.door_within(
-            console(),
-            DoorRequest::GatewayIdentityPublish { epoch: 5 },
-            NOW,
-            MUTE_GATEWAY_BOUND,
-        ),
+        service.door_within(console(), publication_of(&stored), NOW, MUTE_GATEWAY_BOUND),
     )
     .await
     .expect("the relay ends at the bound")
@@ -2338,11 +2360,22 @@ fn the_writes_are_bodies_of_the_socket() {
         serde_json::from_str::<DoorRequest>(&body).expect("decodes"),
         DoorRequest::PinCaTls { fingerprint }
     );
-    assert_eq!(
-        serde_json::from_str::<DoorRequest>(r#"{"action":"gateway_identity_publish","epoch":5}"#)
-            .expect("decodes"),
-        DoorRequest::GatewayIdentityPublish { epoch: 5 }
+    let transition_fingerprint = Fingerprint::of(b"a transition");
+    let body = format!(
+        r#"{{"action":"gateway_identity_publish","epoch":5,"transition_fingerprint":"{transition_fingerprint}"}}"#
     );
+    assert_eq!(
+        serde_json::from_str::<DoorRequest>(&body).expect("decodes"),
+        DoorRequest::GatewayIdentityPublish {
+            epoch: 5,
+            transition_fingerprint
+        }
+    );
+    // The transition is named: a publication by epoch alone is not a request.
+    assert!(serde_json::from_str::<DoorRequest>(
+        r#"{"action":"gateway_identity_publish","epoch":5}"#
+    )
+    .is_err());
     let delegated = delegated_material();
     let install = DoorRequest::IssuerInstall {
         authorization: Box::new(delegation(&delegated, 1)),
@@ -2351,7 +2384,7 @@ fn the_writes_are_bodies_of_the_socket() {
         serde_json::from_slice(&serde_json::to_vec(&install).expect("encoded")).expect("decoded");
     assert_eq!(round_trip, install);
     assert!(serde_json::from_str::<DoorRequest>(
-        r#"{"action":"gateway_identity_publish","epoch":5,"gateway_channel":"127.0.0.1:1"}"#
+        &body.replace('}', r#","gateway_channel":"127.0.0.1:1"}"#)
     )
     .is_err());
 }
@@ -2409,13 +2442,11 @@ async fn an_install_whose_save_fails_leaves_memory_as_it_was() {
 async fn a_publication_whose_save_fails_is_not_relayed() {
     let dir = tempfile::tempdir().expect("temp dir");
     let service = fixture_with_gateway(dir.path()).await;
-    rewrite_registry(&service, |state| {
-        state.transitions.push(stored_gateway_transition(5))
-    })
-    .await;
+    let stored = stored_gateway_transition(5);
+    rewrite_registry(&service, |state| state.transitions.push(stored.clone())).await;
     make_registry_unwritable(&service).await;
     let before = memory_of(&service).await;
-    let request = DoorRequest::GatewayIdentityPublish { epoch: 5 };
+    let request = publication_of(&stored);
 
     // Refused before the relay, which only ever follows a saved mark; and
     // memory still says unpublished, so a replay marks again rather than
@@ -2435,23 +2466,86 @@ async fn a_publication_whose_save_fails_is_not_relayed() {
 async fn a_replayed_publication_is_saved_before_it_is_relayed() {
     let dir = tempfile::tempdir().expect("temp dir");
     let service = fixture_with_gateway(dir.path()).await;
-    rewrite_registry(&service, |state| {
-        let mut stored = stored_gateway_transition(5);
-        stored.published = true;
-        state.transitions.push(stored)
-    })
-    .await;
+    let mut stored = stored_gateway_transition(5);
+    stored.published = true;
+    rewrite_registry(&service, |state| state.transitions.push(stored.clone())).await;
     make_registry_unwritable(&service).await;
 
     // Already marked in memory: the replay still has to land the mark on
     // disk, and refuses rather than relaying when it cannot.
     let refusal = service
-        .door(
-            console(),
-            DoorRequest::GatewayIdentityPublish { epoch: 5 },
-            NOW,
-        )
+        .door(console(), publication_of(&stored), NOW)
         .await
         .expect_err("the save fails");
     assert!(matches!(refusal, DoorRefusal::NotPublished));
+}
+
+/// Two transitions stored at one epoch (a deposit whose answer was lost, then
+/// deposited again): the publication marks the one it names, and the other is
+/// left unmarked.
+#[tokio::test]
+async fn a_publication_marks_the_transition_it_names_among_two_at_one_epoch() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture_with_gateway(dir.path()).await;
+    let first = stored_gateway_transition(5);
+    let second = stored_gateway_transition(5);
+    assert_ne!(stored_fingerprint(&first), stored_fingerprint(&second));
+    rewrite_registry(&service, |state| {
+        state.transitions.push(first.clone());
+        state.transitions.push(second.clone());
+    })
+    .await;
+
+    let outcome = service
+        .door(console(), publication_of(&second), NOW)
+        .await
+        .expect("marked although the relay failed");
+
+    assert!(
+        matches!(
+            &outcome,
+            DoorOutcome::Published { transition_fingerprint, .. }
+                if transition_fingerprint.matches(&stored_fingerprint(&second))
+        ),
+        "{outcome:?}"
+    );
+    let on_disk = registry_on_disk(dir.path());
+    let marks: Vec<Fingerprint> = on_disk
+        .state()
+        .transitions
+        .iter()
+        .filter(|stored| stored.published)
+        .map(stored_fingerprint)
+        .collect();
+    assert_eq!(marks.len(), 1, "exactly one mark");
+    assert!(marks[0].matches(&stored_fingerprint(&second)));
+}
+
+/// A fingerprint no stored transition has is refused, and nothing is marked.
+#[tokio::test]
+async fn a_publication_naming_an_unknown_transition_marks_nothing() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture_with_gateway(dir.path()).await;
+    let stored = stored_gateway_transition(5);
+    rewrite_registry(&service, |state| state.transitions.push(stored.clone())).await;
+    let head = registry_on_disk(dir.path()).audit_head();
+
+    let refusal = service
+        .door(
+            console(),
+            DoorRequest::GatewayIdentityPublish {
+                epoch: 5,
+                transition_fingerprint: Fingerprint::of(b"another transition"),
+            },
+            NOW,
+        )
+        .await
+        .expect_err("no stored transition has this fingerprint");
+
+    assert!(matches!(
+        refusal,
+        DoorRefusal::NoGatewayTransition { epoch: 5 }
+    ));
+    assert!(!published_on_disk(dir.path()));
+    assert_eq!(registry_on_disk(dir.path()).audit_head(), head);
 }

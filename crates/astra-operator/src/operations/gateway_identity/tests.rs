@@ -199,6 +199,8 @@ pub struct Remote<'a> {
     /// Answers to the publications, in order; once empty, the gateway relays.
     pub publish_replies: RefCell<VecDeque<Result<bool, u16>>>,
     pub calls: RefCell<Vec<&'static str>>,
+    /// What each publication named: the epoch and the transition's fingerprint.
+    pub published: RefCell<Vec<(u64, Fingerprint)>>,
     pub submitted: RefCell<Vec<AstraSignerResult>>,
     pub installed: RefCell<Vec<GatewayIdentityTransition>>,
     /// The transition the gateway holds staged, if any.
@@ -234,6 +236,7 @@ impl<'a> Remote<'a> {
             install_replies: RefCell::default(),
             publish_replies: RefCell::default(),
             calls: RefCell::default(),
+            published: RefCell::default(),
             submitted: RefCell::default(),
             installed: RefCell::default(),
             staged: None,
@@ -342,8 +345,15 @@ impl GatewayIdentityRemote for Remote<'_> {
         }
     }
 
-    fn publish(&self, epoch: u64) -> Result<OperatorGatewayPublished> {
+    fn publish(
+        &self,
+        epoch: u64,
+        transition_fingerprint: Fingerprint,
+    ) -> Result<OperatorGatewayPublished> {
         self.note("publish");
+        self.published
+            .borrow_mut()
+            .push((epoch, transition_fingerprint));
         match self.publish_replies.borrow_mut().pop_front() {
             None => Ok(OperatorGatewayPublished {
                 epoch,
@@ -615,6 +625,26 @@ fn a_candidate_der_of_another_fingerprint_is_refused() {
 
     assert_eq!(refusal, GatewayRefusal::RequestMismatch);
     assert_eq!(scenario.domain.touches(), 0);
+}
+
+/// The publication names the transition that was installed, not only its epoch.
+#[test]
+fn the_publication_names_the_transition_it_installed() {
+    let scenario = Scenario::new(false);
+    let remote = Remote::new(&scenario);
+    let domain = &scenario.domain;
+    let decision = signed_decision(&remote, domain, options());
+    let transition = transition_of(&decision).expect("transition").clone();
+
+    carry(&remote, &domain.path, decision, NOW).expect("carried");
+
+    assert_eq!(
+        *remote.published.borrow(),
+        vec![(
+            transition.gateway_identity_epoch,
+            transition.fingerprint().expect("fingerprint"),
+        )]
+    );
 }
 
 #[test]

@@ -255,7 +255,7 @@ impl GatewayIdentityRemote for Remote<'_> {
         }
     }
 
-    fn publish(&self, _epoch: u64) -> Result<OperatorGatewayPublished> {
+    fn publish(&self, _epoch: u64, _transition: Fingerprint) -> Result<OperatorGatewayPublished> {
         unreachable!("an emergency replacement is installed at once, never published")
     }
 

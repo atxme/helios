@@ -329,7 +329,7 @@ fn an_abort_is_refused_once_the_transition_has_been_published() {
         .expect("staged");
     anchored
         .registry
-        .publish_gateway_transition(5, 2_050)
+        .publish_gateway_transition(5, &transition.fingerprint().expect("fingerprint"), 2_050)
         .expect("published");
     let abort = gateway_abort(&anchored, &transition, 2_100);
 
@@ -363,7 +363,7 @@ fn an_aborted_transition_is_not_published_afterwards() {
 
     assert!(anchored
         .registry
-        .publish_gateway_transition(5, 2_300)
+        .publish_gateway_transition(5, &transition.fingerprint().expect("fingerprint"), 2_300)
         .is_err());
 }
 
@@ -427,7 +427,9 @@ fn an_accepted_abort_stays_unpublished_after_reload_and_blocks_publication() {
         .expect("persisted abort tombstone");
     assert!(!stored_abort.published);
 
-    assert!(restored.publish_gateway_transition(5, 2_300).is_err());
+    assert!(restored
+        .publish_gateway_transition(5, &transition.fingerprint().expect("fingerprint"), 2_300)
+        .is_err());
 }
 
 /// The ceiling refuses rather than evicting: dropping the oldest would
