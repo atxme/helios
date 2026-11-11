@@ -76,8 +76,10 @@ Toutes les autres décisions de ce document sont des choix du concepteur.
 
 `GatewayRenewalView.reused` existe déjà (`crates/helios-api/src/certificates/gateway_identity.rs`)
 et `heliosd` le remplit. L'ouverture du renouvellement (`open_renewal`,
-`crates/astra-operator/src/operations/gateway_identity.rs`) le lit et le garde
-dans l'opération ouverte. Le statut de la cérémonie le porte jusqu'à l'IHM.
+`crates/astra-operator/src/operations/gateway_identity.rs`) le lit aujourd'hui
+pour le seul refus `PreparedRequestDiffers`. Le lot ajoute un champ à
+l'opération ouverte et au statut de la cérémonie, qui le portent jusqu'à
+l'IHM.
 Avant les clés, l'écran affiche « Demande déjà préparée par la gateway pour
 cette époque : elle est reprise, sans nouvelle clé. ».
 
@@ -92,16 +94,19 @@ et « Validité (jours) ». Leurs valeurs par défaut sont 7, 7 et 365. Le champ
 sa validation reprennent le modèle des termes du 5b (`RotationSteps.tsx`,
 fonction `field` et brouillon `draft`), sans nouveau composant.
 
-- **Bornes** : celles qu'impose déjà la signature (`after`, `RenewalOptions`).
-  Le builder les lit dans `astra-operator` et dans l'état de la gateway
-  (`GatewayIdentityTransition::verify` et la fenêtre). L'IHM et le backend
-  appliquent les mêmes bornes, définies à un seul endroit par crate. Une valeur
-  hors bornes est refusée avant toute clé, avec la plage dans le message, comme
-  au 5b.
-- **Cohérence avec l'ancre** : si la feuille ne peut pas dépasser l'échéance de
-  `CA-PQ` (ou si la gateway la refuse dans ce cas), le refus a lieu avant les
-  clés et nomme la date. Au builder de vérifier ce que le code impose. Il ne
-  faut pas inventer de règle.
+- **Bornes** : de 1 à 3650 jours pour chacun des trois termes. Ce sont celles
+  qu'Orion applique déjà à la désérialisation du geste
+  (`MAX_GATEWAY_TERM_DAYS`, `apps/orion/src-tauri/src/operator/mod.rs`).
+  `RenewalOptions` n'a pas de borne aujourd'hui, `after` ne garde que le
+  dépassement : `astra-operator` gagne la même borne dans une constante unique,
+  qu'Orion réutilise au lieu de la sienne. Une valeur hors bornes est refusée
+  avant toute clé, avec la plage dans le message, comme au 5b. L'IHM montre la
+  même plage sous le champ.
+- **Cohérence avec l'ancre** : aucune règle n'a été trouvée qui interdise à la
+  feuille de dépasser l'échéance de `CA-PQ`. Le builder vérifie
+  `GatewayIdentityTransition::verify` et l'installation par `heliosd`. S'il en
+  trouve une, le refus a lieu avant les clés et nomme la date. Sinon, rien
+  n'est ajouté : le lot n'invente pas de règle.
 - La révocation avec remplaçant garde ses termes fixes (`gateway_revocation.rs:74`).
   C'est un geste d'urgence, et le lot n'y ajoute aucun champ.
 - Les termes sont signés dans la décision, pas dans la demande. Une demande
@@ -111,13 +116,18 @@ fonction `field` et brouillon `draft`), sans nouveau composant.
 
 **Côté gateway.** `CertificateDomainView`
 (`crates/helios-api/src/certificates/views.rs`, construite dans
-`crates/heliosd/src/certificates/views.rs`) gagne deux champs, en
-`#[serde(default)]` comme les échéances ajoutées au 6b :
+`crates/heliosd/src/certificates/views.rs`) gagne deux champs. Il faut les
+ajouter aussi à sa lecture côté poste, `astra_operator::tunnel::GatewayIdentityRead`
+(lue par `Tunnel::gateway_identity` et `GatewayIdentityRemote::gateway()`),
+puis aux types TypeScript d'Orion. Partout ils sont en `#[serde(default)]`,
+comme les échéances ajoutées au 6b :
 
 - `gateway_revoked: bool`, lu dans `state.gateway.revoked` ;
 - `gateway_awaited_replacement: Option<String>`, l'empreinte en hex minuscule
   lue dans `state.gateway.awaited_replacement`. Ce champ est public : il nomme
-  un document signé que la gateway acceptera, ce n'est pas un secret.
+  un document signé que la gateway acceptera, ce n'est pas un secret. Côté
+  poste, il est lu comme un `Fingerprint` et comparé à l'empreinte de la
+  transition enregistrée (`transition.fingerprint()`), jamais comme du texte.
 
 Les champs sont ajoutés aux types de la console web et d'Orion. La console web
 peut les afficher sans nouvel écran : elle a déjà une ligne d'identité. Au
@@ -159,9 +169,13 @@ renouvellement est installée, mais Astra refuse sa publication pour de bon
 (`NoGatewayTransition` ou `GatewayTransitionAborted`, voir
 `crates/astra/src/door/write.rs`). Le registre enregistre ce refus définitif
 dans un nouveau champ `publication_refused: Option<String>` (la raison, en
-`#[serde(default)]`). Il n'est rempli que par un `GatewayRefusal::GatewayRefused`
-renvoyé par la publication. Un refus transitoire ou une gateway injoignable
-n'y touchent pas.
+`#[serde(default)]`). Il est rempli par tout `GatewayRefusal::GatewayRefused`
+renvoyé par la publication : c'est le classement existant des réponses
+définitives (`refused_by_gateway`), pas une lecture du texte. Un refus
+transitoire ou une gateway injoignable n'y touchent pas. « Reprendre » reste
+proposé et retente la publication, qui est idempotente côté Astra : un succès
+termine le registre comme au 6b, un nouveau refus définitif met la raison à
+jour.
 
 Pour l'impasse B, l'issue dépend de l'horloge de la gateway :
 
@@ -172,7 +186,10 @@ Pour l'impasse B, l'issue dépend de l'horloge de la gateway :
 - **après `activation_at`** : aucune issue sur la gateway (`heliosd` refuse de
   démarrer sur une transition activée et non publiée,
   `key_negotiation/identity.rs`). Le jet forcé est proposé pour débloquer les
-  autres gestes, en premier lieu « Révoquer la gateway ».
+  autres gestes, en premier lieu « Révoquer la gateway » sans remplaçant. La
+  révocation de l'identité en service efface la transition installée
+  (`apply_revocation`, `aether`). Le remplaçant reste impossible, puisque
+  `heliosd` ne prépare aucune demande tant qu'une transition est installée.
 
 **Le jet forcé.** C'est une fonction distincte du jet ordinaire dans chacun des
 deux modules : `force_discard_pending_revocation` et `force_discard_pending`.
@@ -187,7 +204,7 @@ hors tunnel ne force rien.
   reconstruit. » Une case à cocher, comme pour la révocation sans remplaçant.
 - Confirmation, impasse B : « La transition reste installée sur la gateway,
   sans publication. heliosd ne redémarrera plus sur cette identité. Seule une
-  révocation de la gateway reste possible. » Même case.
+  révocation de la gateway sans remplaçant reste possible. » Même case.
 - Après le jet, le bloc relit la vue et affiche l'état du §5.3, ou l'état
   ordinaire.
 
@@ -203,6 +220,11 @@ gateway :
 - `gateway_revoked` vrai et `gateway_awaited_replacement` égal au remplaçant
   enregistré : la révocation est appliquée. Le registre passe à
   `revocation_applied` et la reprise continue avec l'installation du remplaçant ;
+- `gateway_revoked` vrai, un remplaçant enregistré, et un
+  `gateway_awaited_replacement` absent ou différent : la révocation est
+  appliquée, mais pas avec ce remplaçant. Le registre passe à
+  `revocation_applied` et la reprise s'arrête sur l'impasse A (§5.4), sans
+  tenter l'installation ;
 - `gateway_revoked` vrai sans remplaçant enregistré : la révocation est
   appliquée et le registre est effacé ;
 - `gateway_revoked` faux : comportement du 6b, la révocation est retirée et
@@ -231,7 +253,8 @@ fonction de sonde doit servir les deux cas, sans dupliquer la logique.
   et l'API publique ne retire rien.
 - Le registre local d'Orion change de forme (`publication_refused`) :
   `serde(default)`, pour qu'un registre écrit au 6b se relise.
-  `deny_unknown_fields` reste.
+  `deny_unknown_fields` reste. Un Orion du 6b ne relira pas un registre écrit
+  au 6c. Ce cas est accepté : Orion ne revient pas en arrière de version.
 - Versions : `scripts/version.py merge` à la fusion, jamais à la main.
 - `docs/audits` reste intouché.
 
@@ -272,5 +295,3 @@ fonction de sonde doit servir les deux cas, sans dupliquer la logique.
 - Les bornes exactes des termes (§5.2), lues dans le code existant.
 - L'affichage dans la console web des deux champs de la vue (§5.3).
 - L'unification des sondes (§5.5).
-- Par où la vue de la gateway passe pour `GatewayIdentityRemote`, que ce soit
-  une méthode existante ou une nouvelle.
