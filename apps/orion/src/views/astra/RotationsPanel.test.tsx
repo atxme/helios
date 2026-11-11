@@ -70,7 +70,11 @@ describe('the rows', () => {
 
   it('a_row_to_do_comes_first_and_a_disabled_row_says_why', async () => {
     await show(overview({ caPqOverlap: true, caTlsCloseAt: NOW - 1 }))
-    const titles = screen.getAllByRole('region').map((r) => r.getAttribute('aria-label'))
+    // The gateway block leads the panel; the rows follow it in their own order.
+    const titles = screen
+      .getAllByRole('region')
+      .map((r) => r.getAttribute('aria-label'))
+      .filter((title) => title !== 'Identité de la gateway')
     expect(titles[0]).toBe('Terminer la rotation CA TLS')
     const replace = region('Remplacer la CA-PQ')
     expect(within(replace).getByText('Recouvrement CA-PQ en cours')).toBeTruthy()
@@ -85,6 +89,12 @@ describe('the rows', () => {
     await show(overview({ domain: { state: 'refused', value: 404 } }))
     expect(screen.getAllByText(/Gateway ancienne ou refus \(404\)/).length).toBeGreaterThan(0)
     expect(screen.queryByText(/injoignable/)).toBeNull()
+  })
+
+  it('the_gateway_identity_block_leads_the_panel', async () => {
+    await show(overview({ caPqOverlap: true, caTlsCloseAt: NOW - 1 }))
+    const first = screen.getAllByRole('region')[0]
+    expect(first.getAttribute('aria-label')).toBe('Identité de la gateway')
   })
 
   it('a_resumable_rotation_shows_a_resume_row_without_a_journal', async () => {

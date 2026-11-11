@@ -22,6 +22,7 @@ import type {
   EnrollmentGesture,
   IssuerGesture,
   RotationGesture,
+  GatewayGesture,
   RevocationGesture,
   PeersOverview,
   RotationTerms,
@@ -321,6 +322,13 @@ export const approveRotationCeremony = (terms: RotationTerms, revision: number) 
 /** Opens a revocation of a workstation, or resumes one already cut. The gateway is read on the Rust side. */
 export const beginRevocationCeremony = (gesture: RevocationGesture) =>
   invoke<OperatorStatus>('begin_revocation_ceremony', { gesture })
+
+/**
+ * Opens a gateway identity gesture (lot 6b). The command returns nothing: the ceremony it
+ * opens is read with `operatorCeremonyStatus`. A discard opens none.
+ */
+export const beginGatewayCeremony = (gesture: GatewayGesture) =>
+  invoke<void>('begin_gateway_ceremony', { gesture })
 
 /** Opens a vault or domain gesture; the vault path is read on the Rust side. */
 export const beginVaultCeremony = (gesture: VaultGesture) =>

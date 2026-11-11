@@ -1,10 +1,11 @@
 import { describe, expect, it } from 'vitest'
-import { rowsOf } from './OperatorCeremony'
+import { groupedHex, rowsOf } from './OperatorCeremony'
 import type {
   AcceptanceManifest,
   CaRotationManifest,
   InvitationManifest,
   IssuerManifest,
+  RevocationManifest,
 } from '../types'
 
 const acceptance: AcceptanceManifest = {
@@ -193,5 +194,28 @@ describe('rowsOf for a CA rotation', () => {
 
   it('names_no_peer_count_the_campaign_does_not_state', () => {
     expect(rowsOf(rotation).map(([label]) => label)).not.toContain('pairs concernés')
+  })
+})
+
+describe('rowsOf for the gateway revocation', () => {
+  const revocation: RevocationManifest = {
+    operation: 'revocation',
+    trust_domain_id: 'td',
+    target: 'k'.repeat(44),
+    scope: 'gateway',
+    reason: 'Compromis',
+    revocation_epoch: 5,
+    effective_at: 1_800_000_000,
+  }
+
+  it('shows_the_replacement_fingerprint_the_second_round_publishes', () => {
+    const fingerprint = 'ab'.repeat(32)
+    const rows = rowsOf({ ...revocation, replacement_transition_fingerprint: fingerprint })
+    expect(rows).toContainEqual(['empreinte du remplaçant', groupedHex(fingerprint)])
+  })
+
+  it('shows_no_replacement_row_for_a_revocation_without_one', () => {
+    const rows = rowsOf(revocation)
+    expect(rows.some(([label]) => label === 'empreinte du remplaçant')).toBe(false)
   })
 })

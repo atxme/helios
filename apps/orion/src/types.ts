@@ -813,6 +813,8 @@ export interface RevocationManifest {
   reason: string
   revocation_epoch: number
   effective_at: number
+  /** L'empreinte du remplaçant, au second tour d'une révocation avec remplaçant. */
+  replacement_transition_fingerprint?: string
 }
 
 export interface KeyCheckManifest {
@@ -1074,8 +1076,44 @@ export interface GatewayDomainRead {
   ca_retire_active_at: number | null
   next_ca_fingerprint: string | null
   client_tls_ca_transition_pending: boolean
+  /** Identité de la gateway (lot 6b) : époque, empreintes et échéances de ses feuilles. */
+  gateway_identity_epoch: number
+  gateway_tls_fingerprint: string
+  gateway_pq_fingerprint: string
+  gateway_tls_not_after: number | null
+  gateway_pq_not_after: number | null
+  gateway_transition_pending: boolean
+  /** Passée à `true` une fois la transition distribuée : plus d'annulation possible. */
+  gateway_transition_published: boolean
+  /** Instant d'activation de la transition staged, `null` sans transition. */
+  gateway_activation_at: number | null
+  /** Fin du recouvrement : la feuille sortante est retirée à cet instant. */
+  gateway_retire_active_at: number | null
+  /** Fin d'un retour arrière en vigueur, `null` sans retour arrière. */
+  gateway_rollback_expires_at: number | null
+  /** Motif du redémarrage de heliosd, `null` quand aucun n'est dû. */
+  gateway_restart_due: string | null
   /** Les postes qu'un renouvellement vise : les pairs révoqués n'y figurent pas. */
   peers: { not_after: number }[]
+}
+
+/**
+ * Le dépôt d'identité de la gateway en attente, lu à côté du coffre. Champs en
+ * `snake_case`, comme `GatewayPendingView` côté Rust ; la clé de l'aperçu, elle, est
+ * `gatewayPending`.
+ */
+export interface GatewayPendingView {
+  kind: 'decision' | 'revocation'
+  /** La gateway détient la transition en attente, ou le remplaçant d'une révocation. */
+  installed: boolean
+  /** Astra a relayé la transition. Une révocation n'a pas cette étape : toujours `false`. */
+  published: boolean
+  /** La révocation est parvenue à la gateway. */
+  revocation_applied: boolean
+  /** `renewal` ou `abort` pour une décision ; `null` pour une révocation. */
+  decision_kind: 'renewal' | 'abort' | null
+  /** Le remplaçant est déposé et la révocation n'est pas encore signée : rien n'est révoqué. */
+  revocation_to_sign: boolean
 }
 
 /** Une rotation signée qui n'est pas allée au bout, avec son délai d'installation. */
@@ -1128,6 +1166,8 @@ export interface RotationsOverview {
   retainedCaPqNotAfter: number | null
   /** Les postes non révoqués, nom et échéance, pour l'avertissement de « Remplacer la CA-PQ ». */
   workstations: Reach<WorkstationExpiry[]>
+  /** Le dépôt d'identité de la gateway en attente à côté du coffre, `null` sans dépôt. */
+  gatewayPending: GatewayPendingView | null
 }
 
 /** Un poste non révoqué : son nom et la fin de son certificat. Ni clé ni jeton. */
@@ -1172,6 +1212,22 @@ export interface PeersOverview {
 export type RevocationReasonChoice = 'stolen_or_lost' | 'compromised' | 'no_longer_used' | 'replaced'
 
 /** Un geste de l'onglet Postes ; la clé WireGuard et le nom viennent de la ligne choisie. */
+/** Un geste sur l'identité de la gateway (lot 6b), en noms de fil (`GatewayGesture`). */
+export type GatewayGesture =
+  | {
+      gesture: 'renew'
+      rotate_tls: boolean
+      key_recovery: boolean
+      prepare_days: number
+      overlap_days: number
+      validity_days: number
+    }
+  | { gesture: 'abort' }
+  | { gesture: 'rollback'; hours: number; reason: string }
+  | { gesture: 'revoke'; reason: RevocationReasonChoice; with_replacement: boolean }
+  | { gesture: 'resume' }
+  | { gesture: 'discard' }
+
 export type RevocationGesture =
   | { gesture: 'revoke'; peer: string; name: string; reason: RevocationReasonChoice }
   | { gesture: 'resume'; peer: string; reason: RevocationReasonChoice }

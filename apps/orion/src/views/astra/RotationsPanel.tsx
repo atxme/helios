@@ -25,6 +25,7 @@ import {
   rotationRows,
 } from './rotationRows'
 import type { Prerequisite, RotationAction, RotationRow } from './rotationRows'
+import { GatewayIdentityBlock } from './GatewayIdentityBlock'
 
 /**
  * The overview is the one thing read here. It already carries `pending`, so nothing else
@@ -312,6 +313,12 @@ export function RotationsPanel({
 
   return (
     <>
+      <GatewayIdentityBlock
+        overview={overview}
+        now={now}
+        onCeremony={onCeremony}
+        refresh={readAfter}
+      />
       {unread.length > 0 && (
         <Typography color="text.secondary" sx={{ fontSize: 11.5, mb: 1 }}>
           {unread.map(([name, label]) => `${name} : ${label}`).join(' · ')}

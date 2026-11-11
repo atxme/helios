@@ -20,6 +20,17 @@ export const domainRead = (extra: Partial<GatewayDomainRead> = {}): GatewayDomai
   ca_retire_active_at: null,
   next_ca_fingerprint: null,
   client_tls_ca_transition_pending: false,
+  gateway_identity_epoch: 4,
+  gateway_tls_fingerprint: 'aa'.repeat(32),
+  gateway_pq_fingerprint: 'bb'.repeat(32),
+  gateway_tls_not_after: NOW + 200 * DAY,
+  gateway_pq_not_after: NOW + 200 * DAY,
+  gateway_transition_pending: false,
+  gateway_transition_published: false,
+  gateway_activation_at: null,
+  gateway_retire_active_at: null,
+  gateway_rollback_expires_at: null,
+  gateway_restart_due: null,
   peers: [{ not_after: NOW + 90 * DAY }, { not_after: NOW + 120 * DAY }],
   ...extra,
 })
@@ -86,6 +97,7 @@ export const overview = (extra: Partial<RotationsOverview> = {}): RotationsOverv
   caTlsCloseAt: null,
   retainedCaPqNotAfter: null,
   workstations: { state: 'ok', value: [] },
+  gatewayPending: null,
   ...extra,
 })
 

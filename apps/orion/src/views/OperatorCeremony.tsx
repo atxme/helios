@@ -217,8 +217,8 @@ export function rowsOf(manifest: AstraManifest): [string, string][] {
       }
       return rows
     }
-    case 'revocation':
-      return [
+    case 'revocation': {
+      const rows: [string, string][] = [
         ['cible', manifest.target],
         ['portée', manifest.scope],
         ['motif', manifest.reason],
@@ -226,6 +226,15 @@ export function rowsOf(manifest: AstraManifest): [string, string][] {
         ['effet au plus tôt', instant(manifest.effective_at)],
         ['domaine', manifest.trust_domain_id],
       ]
+      // The second round of a revocation with a replacement names the document it accepts.
+      if (manifest.replacement_transition_fingerprint) {
+        rows.push([
+          'empreinte du remplaçant',
+          groupedHex(manifest.replacement_transition_fingerprint),
+        ])
+      }
+      return rows
+    }
     case 'key_check':
       return [['coffre', manifest.vault_fingerprint]]
     case 'invitation':
