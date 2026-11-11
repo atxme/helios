@@ -46,8 +46,9 @@ use crate::handoff::{self, DomainHandoff};
 use crate::operations::campaign_result;
 use crate::operations::gateway_identity::{
     self, before_signing, bound_to_domain, deposit_result, internal, open_renewal_as,
-    refused_by_gateway, transition_of, GatewayIdentityRemote, GatewayRefusal, OpenedGatewayRenewal,
-    RenewalOptions, SignedGatewayDecision, CAMPAIGN_WINDOW_SECS, REQUESTED_BY,
+    refused_by_gateway, transition_of, unreachable_or_internal, GatewayIdentityRemote,
+    GatewayRefusal, OpenedGatewayRenewal, RenewalOptions, SignedGatewayDecision,
+    CAMPAIGN_WINDOW_SECS, REQUESTED_BY,
 };
 use crate::operations::keys::{approve_one, KeyStep, ValidatedKeys};
 use crate::operations::revocation::{
@@ -261,6 +262,10 @@ impl OpenedGatewayRevocation {
 /// installs the replacement, in that order, each step recorded before the next. A step is
 /// replayed from the record with no key.
 ///
+/// A definitive refusal of the revocation's deposit is not trusted alone: the gateway's view
+/// is read first, because the deposit may have been accepted with its answer lost. The
+/// replacement is installed only when the gateway awaits it ([`probe_revocation`]).
+///
 /// Returns [`GatewayRefusal::RevocationToSign`] once the replacement is deposited and the
 /// revocation is still to sign: that step needs a key, and it is taken by a new round.
 pub fn carry_revocation(
@@ -287,31 +292,50 @@ pub fn carry_revocation(
     let Some(revocation) = signed.revocation.as_ref() else {
         return Err(GatewayRefusal::RevocationToSign);
     };
+    // Set once this call has settled the revocation: Astra accepted it, or the gateway's view
+    // showed it applied. Otherwise the view is read before the installation below.
+    let mut settled = false;
     if !signed.revocation_applied {
         if now >= revocation.expires_at {
             return probe_expired_revocation(remote, vault_path, signed);
         }
-        if let Err(refusal) = deposit_result(
+        match deposit_result(
             remote,
             &revocation.operation_id,
             &revocation.campaign_id,
             &revocation.result,
         ) {
-            // A definitive answer proves Astra did not accept the deposit: the revocation is
-            // dropped and the replacement waits for a new signature. Other failures keep it.
-            if matches!(refusal, GatewayRefusal::GatewayRefused(_)) {
-                signed.revocation = None;
-                keep(vault_path, &signed).map_err(internal)?;
+            Ok(()) => {
+                signed.revocation_applied = true;
+                save(&record_path(vault_path), &signed).map_err(internal)?;
+                settled = true;
             }
-            return Err(refusal);
+            Err(refusal) => {
+                if !matches!(refusal, GatewayRefusal::GatewayRefused(_)) {
+                    return Err(refusal);
+                }
+                // A definitive refusal proves the revocation did not apply only if the gateway
+                // agrees. Otherwise the record is kept, and so is the revocation.
+                let probe = probe_revocation(remote, &signed)?;
+                if probe == RevocationProbe::NotApplied {
+                    signed.revocation = None;
+                    keep(vault_path, &signed).map_err(internal)?;
+                    return Err(refusal);
+                }
+                signed.revocation_applied = true;
+                save(&record_path(vault_path), &signed).map_err(internal)?;
+                ensure_awaited(probe)?;
+                settled = true;
+            }
         }
-        signed.revocation_applied = true;
-        save(&record_path(vault_path), &signed).map_err(internal)?;
     }
 
     if let Some(replacement) = signed.replacement.as_ref() {
         if !signed.replacement_installed {
-            // Only once the revocation is applied: the gateway takes its replacement then.
+            // Only once the revocation is applied, and only the replacement the gateway awaits.
+            if !settled {
+                ensure_awaited(probe_revocation(remote, &signed)?)?;
+            }
             remote
                 .install(transition_of(replacement)?)
                 .map_err(refused_by_gateway)?;
@@ -322,21 +346,71 @@ pub fn carry_revocation(
     clear(vault_path).map_err(internal)
 }
 
+/// What the gateway's view says of the record's revocation. The one place that compares the
+/// replacement the gateway awaits with the one the record holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RevocationProbe {
+    /// The gateway is revoked and awaits the replacement the record holds.
+    AppliedWithThisReplacement,
+    /// The gateway is revoked, and awaits another replacement, or none: the recorded one is
+    /// never installed.
+    AppliedWithoutThisReplacement,
+    /// The gateway is revoked, and the record holds no replacement.
+    AppliedNoReplacement,
+    /// The gateway is not revoked: the revocation did not apply.
+    NotApplied,
+}
+
+/// Reads the gateway's view and says whether the record's revocation applied, and with which
+/// replacement. A view that cannot be read is [`GatewayRefusal::Unreachable`]: nothing is
+/// concluded from it.
+fn probe_revocation(
+    remote: &dyn GatewayIdentityRemote,
+    signed: &SignedGatewayRevocation,
+) -> Result<RevocationProbe, GatewayRefusal> {
+    let view = remote.gateway().map_err(unreachable_or_internal)?;
+    if !view.gateway_revoked {
+        return Ok(RevocationProbe::NotApplied);
+    }
+    let Some(replacement) = signed.replacement.as_ref() else {
+        return Ok(RevocationProbe::AppliedNoReplacement);
+    };
+    if view.gateway_awaited_replacement == Some(transition_fingerprint(replacement)?) {
+        Ok(RevocationProbe::AppliedWithThisReplacement)
+    } else {
+        Ok(RevocationProbe::AppliedWithoutThisReplacement)
+    }
+}
+
+/// The impasse A (§5.4): the revocation applied, but not with the replacement the record holds,
+/// which therefore never installs.
+fn ensure_awaited(probe: RevocationProbe) -> Result<(), GatewayRefusal> {
+    match probe {
+        RevocationProbe::AppliedWithoutThisReplacement => {
+            Err(GatewayRefusal::ReplacementNotAwaited)
+        }
+        RevocationProbe::AppliedWithThisReplacement
+        | RevocationProbe::AppliedNoReplacement
+        | RevocationProbe::NotApplied => Ok(()),
+    }
+}
+
 /// What a gateway that was never revoked says when it refuses an emergency replacement
 /// (`aether`, the gateway identity state): the sign that the revocation did not apply.
 const NOT_REVOKED_CAUSE: &str = "emergency_replacement belongs to a revoked identity";
 
 /// The revocation's campaign closed before its answer came back, so Astra may still hold it. The
-/// gateway takes the replacement only once it is revoked and names it, which tells whether the
-/// revocation applied: accepted, both steps are done; refused by the emergency-replacement rule,
-/// it did not apply and the revocation is dropped to be signed again; refused for any other
-/// reason or unreachable, the record is left as it is.
+/// gateway's view is read first when it answers: a revocation it shows applied is settled, and
+/// the replacement installs only if the gateway awaits it. Otherwise the installation itself is
+/// the probe. The gateway takes the replacement only once it is revoked and names it, so a
+/// refusal by the emergency-replacement rule means the revocation did not apply: it is dropped to
+/// be signed again. Any other refusal, or an unknown outcome, keeps the record as it is.
 fn probe_expired_revocation(
     remote: &dyn GatewayIdentityRemote,
     vault_path: &Path,
     mut signed: SignedGatewayRevocation,
 ) -> Result<(), GatewayRefusal> {
-    let Some(replacement) = signed.replacement.as_ref() else {
+    let Some(replacement) = signed.replacement.clone() else {
         // Without a replacement nothing tells whether the revocation applied: it is dropped.
         clear(vault_path).map_err(internal)?;
         return Err(GatewayRefusal::Guidance(
@@ -344,7 +418,18 @@ fn probe_expired_revocation(
                 .into(),
         ));
     };
-    match remote.install(transition_of(replacement)?) {
+    match probe_revocation(remote, &signed) {
+        Ok(RevocationProbe::NotApplied) => {}
+        Ok(probe) => {
+            signed.revocation_applied = true;
+            save(&record_path(vault_path), &signed).map_err(internal)?;
+            ensure_awaited(probe)?;
+        }
+        // Without an answer, the installation below is the probe, as it always was.
+        Err(GatewayRefusal::Unreachable) => {}
+        Err(other) => return Err(other),
+    }
+    match remote.install(transition_of(&replacement)?) {
         Ok(_) => {
             signed.revocation_applied = true;
             signed.replacement_installed = true;

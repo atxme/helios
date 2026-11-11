@@ -81,6 +81,8 @@ pub struct Remote<'a> {
     pub expiries: RefCell<Option<RevocationExpiries>>,
     /// A status that refuses every opening.
     pub open_refusal: Cell<Option<u16>>,
+    /// The gateway's view cannot be read: the network is down.
+    pub gateway_unreachable: Cell<bool>,
     /// Answers to the deposits, in order; once empty, Astra accepts. A number is a
     /// refusal with that status.
     pub submit_replies: RefCell<VecDeque<Result<SigningOperationState, u16>>>,
@@ -122,6 +124,7 @@ impl<'a> Remote<'a> {
                 pq_not_after: Some(PQ_NOT_AFTER),
             })),
             open_refusal: Cell::new(None),
+            gateway_unreachable: Cell::new(false),
             submit_replies: RefCell::default(),
             install_replies: RefCell::default(),
             install_cause: RefCell::new("motif de la gateway".into()),
@@ -283,6 +286,9 @@ impl GatewayIdentityRemote for Remote<'_> {
 
     fn gateway(&self) -> Result<GatewayIdentityRead> {
         self.note("gateway");
+        if self.gateway_unreachable.get() {
+            return Err(network_failure());
+        }
         Ok(self.gateway.clone())
     }
 
@@ -295,6 +301,16 @@ impl GatewayIdentityRemote for Remote<'_> {
         self.note("overlap_not_after");
         Ok(self.overlap)
     }
+}
+
+/// A failure of the network, as the tunnel's client reports it: a `reqwest` error, built
+/// without any connection.
+fn network_failure() -> anyhow::Error {
+    reqwest::Client::new()
+        .get("http://[")
+        .build()
+        .expect_err("an invalid URL never builds")
+        .into()
 }
 
 fn reset_touches(domain: &Domain) {
@@ -708,6 +724,184 @@ fn an_unreachable_probe_keeps_the_record_unchanged() {
         "{refusal:?}"
     );
     assert_eq!(record_bytes(domain), before, "nothing is dropped");
+}
+
+/// The replacement deposited, the revocation signed, and nothing deposited yet.
+fn signed_revocation_after_replacement(
+    remote: &Remote,
+    domain: &Domain,
+) -> SignedGatewayRevocation {
+    let replacement = sign_replacement(remote, domain);
+    carry_revocation(remote, &domain.path, replacement, NOW)
+        .expect_err("the revocation is to sign");
+    sign_revocation(remote, domain, true)
+}
+
+/// The gateway's view once Astra refused the revocation's deposit: revoked, awaiting `awaited`.
+fn revoked_awaiting(remote: &mut Remote, awaited: Option<Fingerprint>) {
+    remote.gateway.gateway_revoked = true;
+    remote.gateway.gateway_awaited_replacement = awaited;
+}
+
+fn another_replacement() -> Fingerprint {
+    Fingerprint::of(b"un autre remplacant")
+}
+
+#[test]
+fn late_refusal_on_an_applied_revocation_carries_on() {
+    let scenario = Scenario::new(true);
+    let mut remote = Remote::new(&scenario);
+    let domain = &scenario.domain;
+    let signed = signed_revocation_after_replacement(&remote, domain);
+    let awaited = transition_of_record(&signed)
+        .fingerprint()
+        .expect("fingerprint");
+    remote.submit_replies.borrow_mut().push_back(Err(409));
+    revoked_awaiting(&mut remote, Some(awaited));
+
+    // The gateway refuses the replacement once: the record shows the revocation applied.
+    remote.install_replies.borrow_mut().push_back(409);
+    carry_revocation(&remote, &domain.path, signed, NOW).expect_err("the installation is refused");
+    let kept = pending_revocation(&domain.path, NOW)
+        .expect("read")
+        .expect("the record waits");
+    assert!(
+        kept.revocation_applied,
+        "the gateway shows the revocation applied"
+    );
+    assert!(!kept.replacement_installed);
+
+    carry_revocation(&remote, &domain.path, kept, NOW).expect("carried on");
+    assert_eq!(
+        remote.installed.borrow().len(),
+        2,
+        "installed on each attempt"
+    );
+    assert!(!record_on_disk(domain), "the record is cleared at the end");
+}
+
+#[test]
+fn late_refusal_with_another_awaited_replacement_stops_at_impasse_a_before_installing() {
+    let scenario = Scenario::new(true);
+    let mut remote = Remote::new(&scenario);
+    let domain = &scenario.domain;
+    let signed = signed_revocation_after_replacement(&remote, domain);
+    remote.submit_replies.borrow_mut().push_back(Err(409));
+    revoked_awaiting(&mut remote, Some(another_replacement()));
+
+    let refusal = carry_revocation(&remote, &domain.path, signed, NOW)
+        .expect_err("the gateway awaits another replacement");
+
+    assert_eq!(refusal, GatewayRefusal::ReplacementNotAwaited);
+    let kept = pending_revocation(&domain.path, NOW)
+        .expect("read")
+        .expect("the record waits");
+    assert!(kept.revocation_applied, "the revocation is applied");
+    assert!(!remote.called("install"), "no installation is tried");
+}
+
+#[test]
+fn late_refusal_without_replacement_clears_the_record() {
+    let scenario = Scenario::new(false);
+    let mut remote = Remote::new(&scenario);
+    let domain = &scenario.domain;
+    let signed = sign_revocation(&remote, domain, false);
+    remote.submit_replies.borrow_mut().push_back(Err(409));
+    revoked_awaiting(&mut remote, None);
+
+    carry_revocation(&remote, &domain.path, signed, NOW).expect("the revocation applied");
+
+    assert!(!record_on_disk(domain), "the record is cleared");
+    assert!(
+        !remote.called("install"),
+        "there is no replacement to install"
+    );
+}
+
+#[test]
+fn late_refusal_on_a_serving_gateway_drops_the_revocation() {
+    let scenario = Scenario::new(true);
+    let remote = Remote::new(&scenario);
+    let domain = &scenario.domain;
+    let signed = signed_revocation_after_replacement(&remote, domain);
+    remote.submit_replies.borrow_mut().push_back(Err(409));
+
+    let refusal = carry_revocation(&remote, &domain.path, signed, NOW)
+        .expect_err("the gateway serves: the revocation is refused");
+
+    assert!(
+        matches!(refusal, GatewayRefusal::GatewayRefused(_)),
+        "{refusal:?}"
+    );
+    let kept = pending_revocation(&domain.path, NOW)
+        .expect("read")
+        .expect("the replacement waits");
+    assert!(kept.revocation.is_none(), "the revocation is dropped");
+    assert!(!kept.revocation_applied);
+}
+
+#[test]
+fn probe_unreachable_keeps_the_revocation() {
+    let scenario = Scenario::new(true);
+    let remote = Remote::new(&scenario);
+    let domain = &scenario.domain;
+    let signed = signed_revocation_after_replacement(&remote, domain);
+    remote.submit_replies.borrow_mut().push_back(Err(409));
+    remote.gateway_unreachable.set(true);
+    let before = record_bytes(domain);
+
+    let refusal = carry_revocation(&remote, &domain.path, signed, NOW)
+        .expect_err("the gateway cannot be read");
+
+    assert_eq!(refusal, GatewayRefusal::Unreachable);
+    assert_eq!(
+        record_bytes(domain),
+        before,
+        "the record is unchanged, byte for byte"
+    );
+}
+
+#[test]
+fn carry_stops_at_impasse_a_before_installing() {
+    let scenario = Scenario::new(true);
+    let mut remote = Remote::new(&scenario);
+    let domain = &scenario.domain;
+    signed_revocation_after_replacement(&remote, domain);
+    rewrite_record(domain, |signed| signed.revocation_applied = true);
+    let signed = pending_revocation(&domain.path, NOW)
+        .expect("read")
+        .expect("the record waits");
+    revoked_awaiting(&mut remote, Some(another_replacement()));
+    let submits = remote.count("submit");
+
+    let refusal = carry_revocation(&remote, &domain.path, signed, NOW)
+        .expect_err("the gateway awaits another replacement");
+
+    assert_eq!(refusal, GatewayRefusal::ReplacementNotAwaited);
+    assert!(!remote.called("install"), "nothing is installed");
+    assert_eq!(remote.count("submit"), submits, "nothing is deposited");
+}
+
+#[test]
+fn expired_probe_stops_at_impasse_a_before_installing() {
+    let scenario = Scenario::new(true);
+    let mut remote = Remote::new(&scenario);
+    let domain = &scenario.domain;
+    lost_revocation_answer(&remote, domain);
+    revoked_awaiting(&mut remote, Some(another_replacement()));
+    let at_expiry = pending_revocation(&domain.path, EXPIRES)
+        .expect("read")
+        .expect("the record still waits");
+
+    let refusal = carry_revocation(&remote, &domain.path, at_expiry, EXPIRES)
+        .expect_err("the gateway awaits another replacement");
+
+    assert_eq!(refusal, GatewayRefusal::ReplacementNotAwaited);
+    assert!(!remote.called("install"), "nothing is installed");
+    let kept = pending_revocation(&domain.path, EXPIRES)
+        .expect("read")
+        .expect("the record waits");
+    assert!(kept.revocation_applied, "the revocation is applied");
 }
 
 #[test]

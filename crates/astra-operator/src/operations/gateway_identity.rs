@@ -257,6 +257,10 @@ pub enum GatewayRefusal {
     /// for the gateway to lift the overlap, and no date is named.
     #[error("le remplacement de la gateway attend la fin du recouvrement de CA-PQ. La révocation sans remplaçant reste possible. Rien n'a été signé.")]
     ReplacementAwaitsOverlap,
+    /// The gateway is revoked, but it awaits another replacement than the one recorded: the
+    /// recorded one is never installed (§5.4, impasse A).
+    #[error("la gateway est révoquée mais n'attend pas ce remplaçant : il ne s'installera pas. « Abandonner la décision » retire le registre ; le domaine devra être reconstruit.")]
+    ReplacementNotAwaited,
     /// A revocation of the gateway refused by its own anchor rule (lot 5c, shared).
     #[error("{0}")]
     Revocation(RevocationRefusal),
