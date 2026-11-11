@@ -540,7 +540,13 @@ fn a_reused_request_with_other_options_is_refused_before_any_campaign() {
         // (kept TLS candidate, kept key recovery, asked rotate_tls, asked key_recovery, cause)
         (false, false, true, false, "la feuille TLS candidate"),
         (false, false, false, true, "la perte de clé"),
-        (false, false, true, true, "la feuille TLS candidate et la perte de clé"),
+        (
+            false,
+            false,
+            true,
+            true,
+            "la feuille TLS candidate et la perte de clé",
+        ),
         (true, false, false, false, "la feuille TLS candidate"),
     ];
     for (kept_tls, kept_recovery, rotate_tls, key_recovery, cause) in cases {
@@ -568,7 +574,10 @@ fn a_reused_request_with_other_options_is_refused_before_any_campaign() {
         );
         let sentence = refusal.to_string();
         assert!(sentence.contains(cause), "{sentence}");
-        assert!(sentence.contains(&utc_label(remote.prepared.expires_at)), "{sentence}");
+        assert!(
+            sentence.contains(&utc_label(remote.prepared.expires_at)),
+            "{sentence}"
+        );
         assert!(sentence.ends_with("Rien n'a été signé."), "{sentence}");
         assert!(!remote.called("open_campaign"), "no campaign is opened");
         assert_eq!(scenario.domain.touches(), 0, "no key is touched");

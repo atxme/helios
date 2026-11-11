@@ -56,8 +56,7 @@ pub(crate) const RECORD_UNREADABLE: &str =
 /// Said for an internal failure of Orion's own. Its detail can name the vault and the record's
 /// paths: it goes to the log, never to the page. The failure can happen after the signature,
 /// so the sentence does not say that nothing was signed.
-pub(crate) const INTERNAL_FAILURE: &str =
-    "Erreur interne d'Orion ; le détail est dans le journal.";
+pub(crate) const INTERNAL_FAILURE: &str = "Erreur interne d'Orion ; le détail est dans le journal.";
 
 /// Said when the waiting record could not be dropped. The detail names paths: it goes to the
 /// log, never to the page.

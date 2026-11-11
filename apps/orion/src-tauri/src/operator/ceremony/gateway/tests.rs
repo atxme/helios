@@ -683,9 +683,13 @@ fn a_refusal_after_the_deposit_keeps_its_sentence_for_the_page() {
 /// An internal failure carries its detail, paths included: the page reads a fixed sentence.
 #[test]
 fn an_internal_failure_shows_a_fixed_sentence_and_no_path() {
-    let detail = "écriture de /home/operateur/.helios/vault/gateway-pending.json : permission refusée";
+    let detail =
+        "écriture de /home/operateur/.helios/vault/gateway-pending.json : permission refusée";
     let page = page_sentence(&GatewayRefusal::Internal(detail.to_string()));
-    assert_eq!(page, "Erreur interne d'Orion ; le détail est dans le journal.");
+    assert_eq!(
+        page,
+        "Erreur interne d'Orion ; le détail est dans le journal."
+    );
     assert!(!page.contains("/home"));
     // The other refusals keep their own sentence.
     assert_eq!(
@@ -711,7 +715,10 @@ fn an_internal_failure_in_a_ceremony_reaches_the_page_as_the_fixed_sentence() {
         NOW,
     );
     let message = ran.outcome.expect_err("not confirmed");
-    assert_eq!(message, "Erreur interne d'Orion ; le détail est dans le journal.");
+    assert_eq!(
+        message,
+        "Erreur interne d'Orion ; le détail est dans le journal."
+    );
     assert_eq!(ran.words.as_deref(), Some(message.as_str()));
 }
 

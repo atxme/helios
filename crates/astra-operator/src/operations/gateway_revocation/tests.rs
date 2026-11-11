@@ -678,7 +678,11 @@ fn a_probe_refused_for_another_reason_keeps_the_record_unchanged() {
         matches!(&refusal, GatewayRefusal::GatewayRefused(cause) if cause.contains("fenêtre")),
         "{refusal:?}"
     );
-    assert_eq!(record_bytes(domain), before, "the revocation is not dropped");
+    assert_eq!(
+        record_bytes(domain),
+        before,
+        "the revocation is not dropped"
+    );
 }
 
 #[test]
