@@ -531,6 +531,61 @@ fn renewal_refuses_while_a_transition_is_staged() {
     assert!(!remote.called("open_campaign"), "no campaign is opened");
 }
 
+/// A request the gateway kept is the one that stays: asked again with other options, it is
+/// refused before any campaign opens, with the cause and the request's expiry.
+#[test]
+fn a_reused_request_with_other_options_is_refused_before_any_campaign() {
+    let scenario = Scenario::new(false);
+    let cases = [
+        // (kept TLS candidate, kept key recovery, asked rotate_tls, asked key_recovery, cause)
+        (false, false, true, false, "la feuille TLS candidate"),
+        (false, false, false, true, "la perte de clé"),
+        (false, false, true, true, "la feuille TLS candidate et la perte de clé"),
+        (true, false, false, false, "la feuille TLS candidate"),
+    ];
+    for (kept_tls, kept_recovery, rotate_tls, key_recovery, cause) in cases {
+        let mut remote = Remote::new(&scenario);
+        remote.prepared.reused = true;
+        remote.prepared.candidate_tls_fingerprint =
+            kept_tls.then(|| Fingerprint::of(b"kept TLS").to_hex());
+        remote.prepared.key_recovery = kept_recovery;
+        let asked = RenewalOptions {
+            rotate_tls,
+            key_recovery,
+            ..options()
+        };
+
+        let refusal = open_renewal(&remote, &scenario.domain.path, asked, NOW)
+            .err()
+            .expect("refused");
+
+        assert_eq!(
+            refusal,
+            GatewayRefusal::PreparedRequestDiffers {
+                cause,
+                expires_at: remote.prepared.expires_at,
+            }
+        );
+        let sentence = refusal.to_string();
+        assert!(sentence.contains(cause), "{sentence}");
+        assert!(sentence.contains(&utc_label(remote.prepared.expires_at)), "{sentence}");
+        assert!(sentence.ends_with("Rien n'a été signé."), "{sentence}");
+        assert!(!remote.called("open_campaign"), "no campaign is opened");
+        assert_eq!(scenario.domain.touches(), 0, "no key is touched");
+    }
+}
+
+/// The same request, asked with the options it was prepared with, goes on.
+#[test]
+fn a_reused_request_with_the_same_options_is_not_refused() {
+    let scenario = Scenario::new(false);
+    let mut remote = Remote::new(&scenario);
+    remote.prepared.reused = true;
+
+    assert!(open_renewal(&remote, &scenario.domain.path, options(), NOW).is_ok());
+    assert!(remote.called("open_campaign"));
+}
+
 #[test]
 fn renewal_refuses_a_request_other_than_the_one_announced() {
     let scenario = Scenario::new(false);

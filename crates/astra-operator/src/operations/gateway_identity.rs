@@ -204,6 +204,13 @@ pub enum GatewayRefusal {
     LeafMismatch,
     #[error("la demande de la gateway ne correspond pas à la campagne. Rien n'a été signé.")]
     RequestMismatch,
+    /// The gateway kept an earlier request, and its options are not the ones asked now:
+    /// the request is reused until it expires, never silently replaced by a new key.
+    #[error("la demande déjà préparée par la gateway diffère des options choisies : {cause}. Elle reste valable jusqu'au {}. Attendre son expiration, ou reprendre avec les mêmes options. Rien n'a été signé.", utc_label(*.expires_at))]
+    PreparedRequestDiffers {
+        cause: &'static str,
+        expires_at: u64,
+    },
     #[error("Astra ou la gateway est injoignable. Rien n'est perdu : la reprise continue là où elle s'est arrêtée.")]
     Unreachable,
     /// Unreachable before anything was signed: the one case where nothing was signed.
@@ -387,6 +394,25 @@ pub(super) fn open_renewal_as(
             key_recovery: options.key_recovery,
         })
         .map_err(before_signing)?;
+    // A request the gateway kept answers the options it was prepared with. Asked again with
+    // others, it would end in a mismatch after the campaign was opened, and that campaign
+    // blocks the family for its whole window: refused here, before it.
+    if prepared.reused {
+        let tls = prepared.candidate_tls_fingerprint.is_some() != options.rotate_tls;
+        let recovery = prepared.key_recovery != options.key_recovery;
+        let cause = match (tls, recovery) {
+            (false, false) => None,
+            (true, false) => Some("la feuille TLS candidate"),
+            (false, true) => Some("la perte de clé"),
+            (true, true) => Some("la feuille TLS candidate et la perte de clé"),
+        };
+        if let Some(cause) = cause {
+            return Err(GatewayRefusal::PreparedRequestDiffers {
+                cause,
+                expires_at: prepared.expires_at,
+            });
+        }
+    }
 
     let opened = remote
         .open_campaign(&OperatorOpenRequest {
