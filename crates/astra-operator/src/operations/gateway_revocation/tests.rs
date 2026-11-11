@@ -3,6 +3,8 @@
 //! The vault, the campaigns, the signatures and the record are the production code.
 //! Only the CTAP2 boundary and the tunnel are simulated.
 
+#![cfg_attr(not(test), allow(dead_code, unused_imports))]
+
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 
@@ -62,37 +64,37 @@ fn revocation_campaign(domain: &Domain, leaf: Fingerprint) -> AstraRotationCampa
 }
 
 /// The tunnel, as a test scripts it. Each call is recorded by name.
-struct Remote<'a> {
-    domain: &'a Domain,
-    served: PqCertificate,
-    request: GatewayCertificateRequest,
-    candidate: DerCertificate,
-    prepared: GatewayRenewalRead,
-    gateway: GatewayIdentityRead,
+pub struct Remote<'a> {
+    pub domain: &'a Domain,
+    pub served: PqCertificate,
+    pub request: GatewayCertificateRequest,
+    pub candidate: DerCertificate,
+    pub prepared: GatewayRenewalRead,
+    pub gateway: GatewayIdentityRead,
     /// The overlap the gateway reports, if one runs.
-    overlap: Option<u64>,
-    status: RefCell<OperatorAuthorityStatus>,
-    identity: AstraRotationCampaign,
-    revocation: AstraRotationCampaign,
+    pub overlap: Option<u64>,
+    pub status: RefCell<OperatorAuthorityStatus>,
+    pub identity: AstraRotationCampaign,
+    pub revocation: AstraRotationCampaign,
     /// The campaign the last opening opened: what a fetch and a deposit name.
-    current: RefCell<Option<AstraRotationCampaign>>,
-    expiries: RefCell<Option<RevocationExpiries>>,
+    pub current: RefCell<Option<AstraRotationCampaign>>,
+    pub expiries: RefCell<Option<RevocationExpiries>>,
     /// A status that refuses every opening.
-    open_refusal: Cell<Option<u16>>,
+    pub open_refusal: Cell<Option<u16>>,
     /// Answers to the deposits, in order; once empty, Astra accepts. A number is a
     /// refusal with that status.
-    submit_replies: RefCell<VecDeque<Result<SigningOperationState, u16>>>,
+    pub submit_replies: RefCell<VecDeque<Result<SigningOperationState, u16>>>,
     /// Answers to the installations, in order; a number is a refusal with that status.
-    install_replies: RefCell<VecDeque<u16>>,
-    calls: RefCell<Vec<&'static str>>,
+    pub install_replies: RefCell<VecDeque<u16>>,
+    pub calls: RefCell<Vec<&'static str>>,
     /// The labels the openings carried, in order.
-    reasons: RefCell<Vec<String>>,
-    submitted: RefCell<Vec<AstraSignerResult>>,
-    installed: RefCell<Vec<GatewayIdentityTransition>>,
+    pub reasons: RefCell<Vec<String>>,
+    pub submitted: RefCell<Vec<AstraSignerResult>>,
+    pub installed: RefCell<Vec<GatewayIdentityTransition>>,
 }
 
 impl<'a> Remote<'a> {
-    fn new(scenario: &'a Scenario) -> Self {
+    pub fn new(scenario: &'a Scenario) -> Self {
         let leaf = scenario.leaf();
         Self {
             domain: &scenario.domain,
@@ -127,15 +129,15 @@ impl<'a> Remote<'a> {
         }
     }
 
-    fn calls(&self) -> Vec<&'static str> {
+    pub fn calls(&self) -> Vec<&'static str> {
         self.calls.borrow().clone()
     }
 
-    fn called(&self, name: &'static str) -> bool {
+    pub fn called(&self, name: &'static str) -> bool {
         self.calls.borrow().contains(&name)
     }
 
-    fn count(&self, name: &'static str) -> usize {
+    pub fn count(&self, name: &'static str) -> usize {
         self.calls
             .borrow()
             .iter()
@@ -143,7 +145,7 @@ impl<'a> Remote<'a> {
             .count()
     }
 
-    fn note(&self, name: &'static str) {
+    pub fn note(&self, name: &'static str) {
         self.calls.borrow_mut().push(name);
     }
 }
@@ -998,6 +1000,7 @@ fn remote_bytes_of(signed: &SignedGatewayRevocation) -> Vec<u8> {
 }
 
 /// The vault after a CA-PQ rotation: the outgoing key is kept until the overlap ends.
+#[cfg(test)]
 fn promoted(domain: &Domain) {
     let mut journal = domain.signed(crate::rotation_journal::RotationKind::CaPq);
     crate::rotation_journal::record_accepted(&domain.path, &mut journal).expect("accepted");

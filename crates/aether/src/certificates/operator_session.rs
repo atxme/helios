@@ -126,6 +126,8 @@ pub enum OperationKind {
     MarkKey,
     /// The domain's first gateway identity and certificates, issued once.
     FinalizeDomain,
+    /// The gateway's own identity: a renewal, a cancellation or a rollback of its transition (lot 6b).
+    GatewayIdentity,
     /// A gateway's first identity and leaves, issued from its bootstrap request.
     IssueGatewayBootstrap,
 }
@@ -756,6 +758,10 @@ pub struct RevocationManifest {
     pub reason: String,
     pub revocation_epoch: u64,
     pub effective_at: u64,
+    /// The emergency replacement the revocation names, when there is one: the fingerprint
+    /// the gateway accepts as its next document (lot 6b).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement_transition_fingerprint: Option<Fingerprint>,
 }
 
 /// The label of a key-slot that answered.

@@ -35,11 +35,14 @@ use astra_operator::vault::AuthorityVault;
 
 use super::{dialog_owner, now_unix, ArtifactEncoding, EnrollmentGesture, OperatorArtifact};
 
+mod gateway;
 mod issuer;
 mod revocation;
 mod rotation;
 mod vault;
 mod wait;
+pub(crate) use gateway::discard_waiting;
+pub use gateway::run_gateway;
 pub use issuer::run_issuer;
 pub use revocation::run_revocation;
 pub use rotation::run_rotation;

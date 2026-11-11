@@ -36,6 +36,7 @@ use aether::certificates::gateway::{
     pq_certificate_fingerprint, AbortReason, Continuity, GatewayCertificateRequest,
     GatewayIdentityTransition, GatewayTransitionAbort,
 };
+use aether::certificates::operator_session::{AstraManifest, CampaignManifest};
 use aether::certificates::status::{
     AstraRotationCampaign, AstraSignerResult, CampaignFamily, CampaignScope, CampaignTarget,
     CertificateKind, CertificateServiceRollbackAuthorization,
@@ -499,6 +500,21 @@ pub(super) fn open_renewal_as(
 }
 
 impl OpenedGatewayRenewal {
+    /// How many credentials approve the campaign this renewal opened.
+    pub fn required_credentials(&self) -> u8 {
+        self.campaign.campaign.required_credentials
+    }
+
+    /// When the campaign closes: the second after which nothing may be approved.
+    pub fn campaign_expires_at(&self) -> u64 {
+        self.campaign.campaign.expires_at
+    }
+
+    /// What the operator reads before the first key: the campaign, whole, with its fingerprint.
+    pub fn manifest(&self) -> AstraManifest {
+        campaign_manifest(&self.campaign.campaign)
+    }
+
     /// The keys the renewal has proved so far.
     pub fn keys(&self) -> &ValidatedKeys {
         &self.keys
@@ -672,6 +688,14 @@ pub fn carry(
     })
 }
 
+/// The campaign as the operator reads it, with the fingerprint its credentials approve.
+fn campaign_manifest(campaign: &AstraRotationCampaign) -> AstraManifest {
+    AstraManifest::Campaign(CampaignManifest {
+        campaign: Box::new(campaign.clone()),
+        fingerprint: campaign.fingerprint(),
+    })
+}
+
 /// The label the cancellation's campaign carries.
 const ABORT_LABEL: &str = "Annulation de la transition de l'identité de la gateway";
 
@@ -783,6 +807,21 @@ pub fn open_abort(
 }
 
 impl OpenedGatewayAbort {
+    /// How many credentials approve the cancellation's campaign.
+    pub fn required_credentials(&self) -> u8 {
+        self.campaign.campaign.required_credentials
+    }
+
+    /// When the campaign closes: the second after which nothing may be approved.
+    pub fn campaign_expires_at(&self) -> u64 {
+        self.campaign.campaign.expires_at
+    }
+
+    /// What the operator reads before the first key: the campaign, whole, with its fingerprint.
+    pub fn manifest(&self) -> AstraManifest {
+        campaign_manifest(&self.campaign.campaign)
+    }
+
     /// One key: its approval, then the proof that the same key opens the vault.
     pub fn approve(&mut self, key: &dyn Authenticator, now: u64) -> Result<String, KeyStep> {
         approve_one(
@@ -1000,6 +1039,21 @@ pub fn open_rollback(
 }
 
 impl OpenedGatewayRollback {
+    /// How many credentials approve the selection's campaign.
+    pub fn required_credentials(&self) -> u8 {
+        self.campaign.required_credentials
+    }
+
+    /// When the campaign closes: the second after which nothing may be approved.
+    pub fn campaign_expires_at(&self) -> u64 {
+        self.campaign.expires_at
+    }
+
+    /// What the operator reads before the first key: the campaign, whole, with its fingerprint.
+    pub fn manifest(&self) -> AstraManifest {
+        campaign_manifest(&self.campaign)
+    }
+
     /// One key: its approval, then the proof that the same key opens the vault.
     pub fn approve(&mut self, key: &dyn Authenticator, now: u64) -> Result<String, KeyStep> {
         approve_one(
@@ -1295,5 +1349,5 @@ pub(super) fn internal<E: Into<anyhow::Error>>(error: E) -> GatewayRefusal {
     GatewayRefusal::Internal(format!("{:#}", error.into()))
 }
 
-#[cfg(test)]
-pub(crate) mod tests;
+#[cfg(any(test, feature = "test-fixtures"))]
+pub mod tests;

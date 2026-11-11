@@ -52,6 +52,7 @@ const TITLES: Record<OperationKind, string> = {
   mark_key: 'Changer l’état d’une clé',
   finalize_domain: 'Finaliser le domaine',
   issue_gateway_bootstrap: 'Amorcer la gateway',
+  gateway_identity: 'Identité de la gateway',
 }
 
 /** The verb of the button that goes through with it, per operation. */
@@ -71,6 +72,7 @@ const VERBS: Record<OperationKind, string> = {
   mark_key: 'Signer avec la clé',
   finalize_domain: 'Finaliser avec la clé',
   issue_gateway_bootstrap: 'Amorcer avec les deux clés',
+  gateway_identity: 'Signer avec la clé',
 }
 
 function instant(unix: number): string {

@@ -175,6 +175,74 @@ impl JournalView {
     }
 }
 
+/// The gateway's waiting record, as the screen may be told of it: which kind it is and how
+/// far it went. Read from the record beside the vault, with no key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GatewayPendingView {
+    /// `decision` (a renewal or a cancellation) or `revocation`.
+    pub kind: &'static str,
+    /// The gateway holds the waiting transition, or the replacement of a revocation.
+    pub installed: bool,
+    /// Astra relayed the transition. A revocation has no such step: always `false`.
+    pub published: bool,
+    /// The revocation reached the gateway.
+    pub revocation_applied: bool,
+    /// `renewal` or `abort` for a decision; absent for a revocation.
+    pub decision_kind: Option<String>,
+    /// The replacement is deposited and the revocation is not signed yet: nothing is revoked.
+    pub revocation_to_sign: bool,
+}
+
+/// The gateway record waiting beside the vault, if one does. A revocation's record is the one
+/// the resumption reads first. A record that cannot be read is nothing to show here: the
+/// gateway ceremony that reads it says why.
+pub fn gateway_pending_of(vault_path: &Path, now: u64) -> Option<GatewayPendingView> {
+    use astra_operator::operations::{gateway_identity, gateway_revocation};
+
+    match gateway_revocation::pending_revocation(vault_path, now) {
+        Ok(Some(record)) => {
+            return Some(GatewayPendingView {
+                kind: "revocation",
+                installed: record.replacement_installed,
+                published: false,
+                revocation_applied: record.revocation_applied,
+                decision_kind: None,
+                revocation_to_sign: record
+                    .replacement
+                    .as_ref()
+                    .is_some_and(|replacement| replacement.deposited)
+                    && record.revocation.is_none(),
+            })
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(error = %format!("{error:#}"), "révocation gateway illisible");
+            return None;
+        }
+    }
+    match gateway_identity::pending(vault_path, now) {
+        Ok(Some(decision)) => Some(GatewayPendingView {
+            kind: "decision",
+            installed: decision.installed,
+            published: decision.published,
+            revocation_applied: false,
+            decision_kind: Some(
+                match decision.kind {
+                    gateway_identity::GatewayDecisionKind::Renewal => "renewal",
+                    gateway_identity::GatewayDecisionKind::Abort => "abort",
+                }
+                .to_string(),
+            ),
+            revocation_to_sign: false,
+        }),
+        Ok(None) => None,
+        Err(error) => {
+            tracing::warn!(error = %format!("{error:#}"), "décision gateway illisible");
+            None
+        }
+    }
+}
+
 /// What this machine holds, read from the files beside the vault.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Local {
@@ -200,6 +268,8 @@ pub struct Local {
     /// When the outgoing CA-PQ the vault keeps ends, for « Terminer la rotation CA-PQ ».
     /// Read from the clear copy, without a key; `None` when no key is kept.
     pub retained_ca_pq_not_after: Option<u64>,
+    /// The gateway's identity record waiting beside the vault, if one does.
+    pub gateway_pending: Option<GatewayPendingView>,
 }
 
 /// The journal and whether anything calls for a resumption, read from the files beside
@@ -262,6 +332,7 @@ pub fn read_local(vault_path: &Result<std::path::PathBuf, String>, now: u64) -> 
         ca_tls_not_after: ca_tls_not_after(path),
         credential_registry_epoch: local_credentials_epoch(path),
         retained_ca_pq_not_after: retained_ca_pq_not_after(path),
+        gateway_pending: gateway_pending_of(path, now),
     }
 }
 
@@ -358,6 +429,8 @@ pub struct RotationsOverview {
     pub retained_ca_pq_not_after: Option<u64>,
     /// The workstations not revoked, for the warning before « Remplacer la CA-PQ ».
     pub workstations: Reach<Vec<WorkstationExpiry>>,
+    /// The gateway's identity record waiting beside the vault, if one does.
+    pub gateway_pending: Option<GatewayPendingView>,
 }
 
 impl RotationsOverview {
@@ -379,6 +452,7 @@ impl RotationsOverview {
             ca_tls_not_after,
             credential_registry_epoch,
             retained_ca_pq_not_after,
+            gateway_pending,
         } = local;
         let ca_pq_overlap = authority
             .ok()
@@ -413,6 +487,7 @@ impl RotationsOverview {
             ca_tls_close_at,
             retained_ca_pq_not_after,
             workstations: workstations_of(certificates),
+            gateway_pending,
         }
     }
 }

@@ -35,6 +35,7 @@ use std::path::Path;
 
 use aether::certificates::encoding::MlDsa87PublicKey;
 use aether::certificates::gateway::GatewayIdentityTransition;
+use aether::certificates::operator_session::{AstraManifest, RevocationManifest};
 use aether::certificates::revocation::{RevocationReason, RevocationScope};
 use aether::certificates::transport::{OperatorOpenAction, OperatorOpenRequest, TrustUpdateObject};
 use anyhow::{Context, Result};
@@ -118,6 +119,8 @@ struct OpenedRevocation {
     tls_not_after: u64,
     pq_not_after: u64,
     reason: RevocationReason,
+    /// The label the operator reads for the reason, as the manifest names it.
+    reason_label: &'static str,
     approval: CampaignApprovalSession,
     /// The replacement the revocation names, deposited and recorded beside it.
     replacement: Option<SignedGatewayDecision>,
@@ -161,6 +164,46 @@ pub fn open_gateway_revocation(
 }
 
 impl OpenedGatewayRevocation {
+    /// How many credentials approve the current round's campaign.
+    pub fn required_credentials(&self) -> u8 {
+        match &self.stage {
+            Stage::Replacement(renewal) => renewal.required_credentials(),
+            Stage::Revocation(round) => round.campaign.campaign.required_credentials,
+        }
+    }
+
+    /// When the current round's campaign closes.
+    pub fn campaign_expires_at(&self) -> u64 {
+        match &self.stage {
+            Stage::Replacement(renewal) => renewal.campaign_expires_at(),
+            Stage::Revocation(round) => round.campaign.campaign.expires_at,
+        }
+    }
+
+    /// What the operator reads before the first key of the current round. The revocation's
+    /// round names the replacement's fingerprint, read from the signed record, so the second
+    /// approval shows the document the gateway will accept.
+    pub fn manifest(&self, effective_at: u64) -> AstraManifest {
+        match &self.stage {
+            Stage::Replacement(renewal) => renewal.manifest(),
+            Stage::Revocation(round) => {
+                let target = &round.campaign.campaign.targets[0];
+                AstraManifest::Revocation(RevocationManifest {
+                    trust_domain_id: round.identity.trust_domain_id,
+                    target: round.campaign.campaign.gateway_wg_public_key.to_base64(),
+                    scope: "gateway".to_string(),
+                    reason: round.reason_label.to_string(),
+                    revocation_epoch: target.epoch.saturating_add(1),
+                    effective_at,
+                    replacement_transition_fingerprint: round
+                        .replacement
+                        .as_ref()
+                        .and_then(|decision| transition_fingerprint(decision).ok()),
+                })
+            }
+        }
+    }
+
     /// One key: its approval, then the proof that the same key opens the vault.
     pub fn approve(&mut self, key: &dyn Authenticator, now: u64) -> Result<String, KeyStep> {
         match &mut self.stage {
@@ -464,6 +507,7 @@ fn open_revocation(
             tls_not_after,
             pq_not_after,
             reason: reason.reason(),
+            reason_label: reason.label(),
             approval,
             replacement,
         })),
@@ -486,6 +530,7 @@ fn sign_revocation_round(
         tls_not_after,
         pq_not_after,
         reason,
+        reason_label: _,
         approval,
         replacement,
     } = round;
@@ -657,5 +702,5 @@ fn clear(vault_path: &Path) -> Result<()> {
     }
 }
 
-#[cfg(test)]
-mod tests;
+#[cfg(any(test, feature = "test-fixtures"))]
+pub mod tests;

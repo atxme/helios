@@ -2813,6 +2813,7 @@ async fn blocked_resumption(
         .open_as(
             RotationGesture::Resume.operation(),
             true,
+            None,
             move |session_id, _presses, publish, _artifacts| {
                 publish(OperatorStatus::new(
                     session_id,

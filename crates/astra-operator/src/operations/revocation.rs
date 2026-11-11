@@ -358,6 +358,7 @@ impl OpenedRevocation {
             reason: self.reason_label.to_string(),
             revocation_epoch: self.revocation_epoch,
             effective_at,
+            replacement_transition_fingerprint: None,
         }
     }
 

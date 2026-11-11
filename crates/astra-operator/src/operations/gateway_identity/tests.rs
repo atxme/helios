@@ -4,6 +4,8 @@
 //! signature are the production code. Only the CTAP2 boundary and the tunnel are
 //! simulated.
 
+#![cfg_attr(not(test), allow(dead_code, unused_imports))]
+
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 
@@ -37,12 +39,12 @@ use crate::tunnel::admin_refusal;
 use crate::{gestures, store};
 
 const DAY: u64 = 86_400;
-pub(crate) const ACTIVE_TLS: &[u8] = b"la TLS de la gateway en service";
+pub const ACTIVE_TLS: &[u8] = b"la TLS de la gateway en service";
 
 /// The gateway's key, and the leaf Astra signed for it, as the domain holds them.
-pub(crate) struct InService {
-    pub(crate) key: Zeroizing<Vec<u8>>,
-    pub(crate) leaf: PqCertificate,
+pub struct InService {
+    pub key: Zeroizing<Vec<u8>>,
+    pub leaf: PqCertificate,
 }
 
 fn gateway_in_service(domain: &Domain) -> InService {
@@ -99,7 +101,7 @@ fn prepared_request(
 }
 
 /// A self-signed TLS leaf of the gateway: not a CA, serving TLS for its name.
-pub(crate) fn gateway_tls_leaf() -> DerCertificate {
+pub fn gateway_tls_leaf() -> DerCertificate {
     let mut params = rcgen::CertificateParams::new(vec![SERVER_NAME.to_string()]).expect("params");
     params.is_ca = rcgen::IsCa::NoCa;
     params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
@@ -110,16 +112,16 @@ pub(crate) fn gateway_tls_leaf() -> DerCertificate {
 }
 
 /// One renewal's inputs: the domain, the gateway in service, and what it prepares.
-pub(crate) struct Scenario {
-    pub(crate) domain: Domain,
-    pub(crate) in_service: InService,
-    pub(crate) key_recovery: bool,
-    pub(crate) request: GatewayCertificateRequest,
-    pub(crate) candidate: DerCertificate,
+pub struct Scenario {
+    pub domain: Domain,
+    pub in_service: InService,
+    pub key_recovery: bool,
+    pub request: GatewayCertificateRequest,
+    pub candidate: DerCertificate,
 }
 
 impl Scenario {
-    pub(crate) fn new(key_recovery: bool) -> Self {
+    pub fn new(key_recovery: bool) -> Self {
         let domain = domain();
         let in_service = gateway_in_service(&domain);
         let (new_key, new_public) = generate_ml_dsa_87_keypair().expect("next key");
@@ -135,12 +137,12 @@ impl Scenario {
         }
     }
 
-    pub(crate) fn leaf(&self) -> Fingerprint {
+    pub fn leaf(&self) -> Fingerprint {
         pq_certificate_fingerprint(&self.in_service.leaf).expect("fingerprint")
     }
 
     /// The campaign Astra freezes for the gateway's leaf `leaf`, one decision forward.
-    pub(crate) fn campaign(&self, leaf: Fingerprint) -> AstraRotationCampaign {
+    pub fn campaign(&self, leaf: Fingerprint) -> AstraRotationCampaign {
         self.domain.campaign(
             CampaignScope::GatewayIdentity,
             vec![CampaignTarget {
@@ -156,7 +158,7 @@ impl Scenario {
     }
 }
 
-pub(crate) fn gateway_read() -> GatewayIdentityRead {
+pub fn gateway_read() -> GatewayIdentityRead {
     GatewayIdentityRead {
         now_unix: None,
         ca_pq_fingerprint: Fingerprint::of(b"ca-pq"),
@@ -179,38 +181,38 @@ pub(crate) fn gateway_read() -> GatewayIdentityRead {
 }
 
 /// The tunnel, as a test scripts it. Each call is recorded by name.
-struct Remote<'a> {
-    domain: &'a Domain,
-    campaign: AstraRotationCampaign,
-    served: PqCertificate,
-    request: GatewayCertificateRequest,
-    candidate: Option<DerCertificate>,
-    prepared: GatewayRenewalRead,
-    gateway: GatewayIdentityRead,
-    overlap: Option<u64>,
-    open_refusal: Cell<Option<u16>>,
+pub struct Remote<'a> {
+    pub domain: &'a Domain,
+    pub campaign: AstraRotationCampaign,
+    pub served: PqCertificate,
+    pub request: GatewayCertificateRequest,
+    pub candidate: Option<DerCertificate>,
+    pub prepared: GatewayRenewalRead,
+    pub gateway: GatewayIdentityRead,
+    pub overlap: Option<u64>,
+    pub open_refusal: Cell<Option<u16>>,
     /// Answers to the deposits, in order; once empty, Astra accepts. A number is a
     /// refusal or a lost answer with that status.
-    submit_replies: RefCell<VecDeque<Result<SigningOperationState, u16>>>,
+    pub submit_replies: RefCell<VecDeque<Result<SigningOperationState, u16>>>,
     /// Answers to the installations, in order; a number is a refusal with that status.
-    install_replies: RefCell<VecDeque<u16>>,
+    pub install_replies: RefCell<VecDeque<u16>>,
     /// Answers to the publications, in order; once empty, the gateway relays.
-    publish_replies: RefCell<VecDeque<Result<bool, u16>>>,
-    calls: RefCell<Vec<&'static str>>,
-    submitted: RefCell<Vec<AstraSignerResult>>,
-    installed: RefCell<Vec<GatewayIdentityTransition>>,
+    pub publish_replies: RefCell<VecDeque<Result<bool, u16>>>,
+    pub calls: RefCell<Vec<&'static str>>,
+    pub submitted: RefCell<Vec<AstraSignerResult>>,
+    pub installed: RefCell<Vec<GatewayIdentityTransition>>,
     /// The transition the gateway holds staged, if any.
-    staged: Option<GatewayIdentityTransition>,
+    pub staged: Option<GatewayIdentityTransition>,
     /// Answers to the cancellations, in order; once empty, the gateway takes them.
-    abort_replies: RefCell<VecDeque<u16>>,
-    aborted: RefCell<Vec<GatewayTransitionAbort>>,
+    pub abort_replies: RefCell<VecDeque<u16>>,
+    pub aborted: RefCell<Vec<GatewayTransitionAbort>>,
     /// Answers to the rollbacks, in order; a number is a refusal with that status.
-    rollback_replies: RefCell<VecDeque<u16>>,
-    rolled: RefCell<Vec<CertificateServiceRollbackAuthorization>>,
+    pub rollback_replies: RefCell<VecDeque<u16>>,
+    pub rolled: RefCell<Vec<CertificateServiceRollbackAuthorization>>,
 }
 
 impl<'a> Remote<'a> {
-    fn new(scenario: &'a Scenario) -> Self {
+    pub fn new(scenario: &'a Scenario) -> Self {
         Self {
             domain: &scenario.domain,
             campaign: scenario.campaign(scenario.leaf()),
@@ -242,15 +244,15 @@ impl<'a> Remote<'a> {
         }
     }
 
-    fn calls(&self) -> Vec<&'static str> {
+    pub fn calls(&self) -> Vec<&'static str> {
         self.calls.borrow().clone()
     }
 
-    fn called(&self, name: &'static str) -> bool {
+    pub fn called(&self, name: &'static str) -> bool {
         self.calls.borrow().contains(&name)
     }
 
-    fn count(&self, name: &'static str) -> usize {
+    pub fn count(&self, name: &'static str) -> usize {
         self.calls
             .borrow()
             .iter()
@@ -258,7 +260,7 @@ impl<'a> Remote<'a> {
             .count()
     }
 
-    fn note(&self, name: &'static str) {
+    pub fn note(&self, name: &'static str) {
         self.calls.borrow_mut().push(name);
     }
 }

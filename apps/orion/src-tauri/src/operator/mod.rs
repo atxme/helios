@@ -489,6 +489,116 @@ impl RevocationGesture {
     }
 }
 
+/// The longest term a gateway renewal may set, in days.
+pub const MAX_GATEWAY_TERM_DAYS: u64 = 3_650;
+
+/// The longest rollback a gateway may be asked for, in hours: the overlap is bounded by its end.
+const MAX_ROLLBACK_HOURS: u64 = 168;
+
+/// The longest reason a rollback carries, in characters.
+const MAX_ROLLBACK_REASON_CHARS: usize = 200;
+
+/// A gateway identity gesture, as the WebView names it (F14 lot 6b).
+///
+/// Closed like the others: the terms and the reason come with the gesture, and the
+/// campaign, the approvals, the signatures and the requester's name come from the
+/// ceremony, never from the page. `Discard` takes no key.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "gesture", rename_all = "snake_case", deny_unknown_fields)]
+pub enum GatewayGesture {
+    /// Renews the gateway's identity, with the terms chosen before any key is asked for.
+    Renew {
+        rotate_tls: bool,
+        key_recovery: bool,
+        #[serde(default = "gateway_prepare_days")]
+        prepare_days: u64,
+        #[serde(default = "gateway_overlap_days")]
+        overlap_days: u64,
+        #[serde(default = "gateway_validity_days")]
+        validity_days: u64,
+    },
+    /// Cancels the transition the gateway holds staged, before its activation.
+    Abort,
+    /// Returns to the outgoing identity for `hours` at most, for the rest of the overlap.
+    Rollback { hours: u64, reason: String },
+    /// Revokes the gateway, with or without its emergency replacement.
+    Revoke {
+        reason: astra_operator::operations::revocation::RevocationReasonChoice,
+        with_replacement: bool,
+    },
+    /// Carries what a gateway gesture left waiting, with no key.
+    Resume,
+    /// Drops the waiting record, when the gateway refused it for good.
+    Discard,
+}
+
+fn gateway_prepare_days() -> u64 {
+    7
+}
+
+fn gateway_overlap_days() -> u64 {
+    7
+}
+
+fn gateway_validity_days() -> u64 {
+    365
+}
+
+impl GatewayGesture {
+    /// Refuses what no ceremony should be opened for.
+    fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::Renew {
+                prepare_days,
+                overlap_days,
+                validity_days,
+                ..
+            } => {
+                for days in [prepare_days, overlap_days, validity_days] {
+                    if !(1..=MAX_GATEWAY_TERM_DAYS).contains(days) {
+                        return Err(format!(
+                            "les durées se comptent en jours, de 1 à {MAX_GATEWAY_TERM_DAYS}"
+                        ));
+                    }
+                }
+                Ok(())
+            }
+            Self::Rollback { hours, reason } => {
+                if !(1..=MAX_ROLLBACK_HOURS).contains(hours) {
+                    return Err(format!(
+                        "le retour arrière dure de 1 à {MAX_ROLLBACK_HOURS} heures"
+                    ));
+                }
+                let reason = reason.trim();
+                if reason.is_empty() || reason.chars().count() > MAX_ROLLBACK_REASON_CHARS {
+                    return Err(format!(
+                        "le motif tient en 1 à {MAX_ROLLBACK_REASON_CHARS} caractères"
+                    ));
+                }
+                Ok(())
+            }
+            Self::Abort | Self::Revoke { .. } | Self::Resume | Self::Discard => Ok(()),
+        }
+    }
+
+    /// The operation a ceremony for this gesture reports. `Resume` reads the record it carries.
+    fn operation(&self) -> OperationKind {
+        match self {
+            Self::Revoke { .. } => OperationKind::RevokeCertificate,
+            Self::Renew { .. } | Self::Abort | Self::Rollback { .. } | Self::Discard => {
+                OperationKind::GatewayIdentity
+            }
+            Self::Resume => OperationKind::GatewayIdentity,
+        }
+    }
+}
+
+/// Drops the gateway record waiting beside the vault. Takes no key; the callers have checked
+/// that no ceremony is open.
+pub(crate) fn discard_gateway_record(vault_path: &std::path::Path) -> Result<(), String> {
+    ceremony::discard_waiting(vault_path)
+}
+
 /// Renames the key `slot_id` of the vault at `vault_path`. No key is asked
 /// anything; the label is checked as a gesture's would be.
 pub fn rename_key(vault_path: &std::path::Path, slot_id: &str, label: &str) -> Result<(), String> {
@@ -557,6 +667,9 @@ pub enum ArtifactEncoding {
 /// The files of one session, written by its ceremony and read by the window.
 type Artifacts = std::sync::Arc<std::sync::Mutex<Vec<OperatorArtifact>>>;
 
+/// The French sentence of the refusal a gateway ceremony ended on, for the page to show.
+pub(crate) type Words = std::sync::Arc<std::sync::Mutex<Option<String>>>;
+
 /// Keeps a produced file for the window.
 ///
 /// A poisoned lock is recovered, not skipped: the list holds plain values, and
@@ -573,6 +686,9 @@ struct Session {
     presses: std::sync::mpsc::Sender<Press>,
     status: watch::Receiver<OperatorStatus>,
     artifacts: Artifacts,
+    /// The sentence of a gateway refusal, set before its failure is published. Read only
+    /// by a gateway ceremony, which answers with it as an error.
+    words: Option<Words>,
     /// Opened by a tunnel coming up, not by the operator. Only such a session is
     /// replaced by the next one without being dismissed: a finished screen the
     /// operator opened, and the files it produced, are theirs to leave.
@@ -810,6 +926,87 @@ impl OperatorCeremony {
         .await
     }
 
+    /// Starts a gateway identity gesture the same way, under the same rule of one ceremony at
+    /// a time, and returns once it waits for a key, or has ended.
+    ///
+    /// A refusal before any key comes back as an error carrying its sentence, which is how the
+    /// page shows what the gateway or Astra said. `gateway` is the connected profile's target,
+    /// and `requested_by` the workstation's name, which a rollback's campaign names.
+    pub async fn begin_gateway(
+        &self,
+        gesture: GatewayGesture,
+        gateway: Option<GatewayTarget>,
+        vault_path: PathBuf,
+        requested_by: String,
+    ) -> Result<OperatorStatus, String> {
+        gesture.validate()?;
+        let kind = match &gesture {
+            GatewayGesture::Resume => {
+                let path = vault_path.clone();
+                let waiting = tokio::task::spawn_blocking(move || {
+                    astra_operator::operations::gateway_revocation::pending_revocation(
+                        &path,
+                        now_unix(),
+                    )
+                })
+                .await
+                .map_err(|error| format!("lecture de la révocation en attente : {error}"))?
+                .map_err(|error| format!("{error:#}"))?;
+                if waiting.is_some() {
+                    OperationKind::RevokeCertificate
+                } else {
+                    OperationKind::GatewayIdentity
+                }
+            }
+            other => other.operation(),
+        };
+        let words: Words = Default::default();
+        let thread_words = words.clone();
+        let mut status = self
+            .open_as(
+                kind,
+                false,
+                Some(words.clone()),
+                move |session_id, presses, publish, _artifacts| {
+                    ceremony::run_gateway(
+                        session_id,
+                        gesture,
+                        gateway,
+                        presses,
+                        publish,
+                        &vault_path,
+                        &requested_by,
+                        &thread_words,
+                    )
+                },
+            )
+            .await
+            .map_err(|error| match error {
+                Opening::Busy { .. } => BUSY.to_string(),
+                Opening::Failed(message) => message,
+            })?;
+        // Waits while the gesture works on its own: what it needs from the operator is a key,
+        // and what it ends on is a terminal state.
+        while matches!(
+            status.gesture,
+            GestureState::Verifying | GestureState::Signing | GestureState::ProcessingKey { .. }
+        ) {
+            let mut held = self.0.lock().await;
+            let Some(session) = held.as_mut() else {
+                break;
+            };
+            status = awaited(&mut session.status).await?;
+        }
+        if status.gesture == GestureState::Failed {
+            return Err(words
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+                .unwrap_or_else(|| GATEWAY_FAILED.to_string()));
+        }
+        Ok(status)
+    }
+
     /// Answers the wait for a rotation's terms, which opens its campaign.
     ///
     /// `revision` names the status the operator approved on. A press with no dialog
@@ -895,6 +1092,7 @@ impl OperatorCeremony {
             .open_as(
                 gesture.operation(),
                 true,
+                None,
                 move |session_id, presses, publish, _artifacts| {
                     ceremony::run_rotation(
                         session_id,
@@ -943,7 +1141,7 @@ impl OperatorCeremony {
             + Send
             + 'static,
     {
-        self.open_as(kind, false, run)
+        self.open_as(kind, false, None, run)
             .await
             .map_err(|error| match error {
                 Opening::Busy { .. } => BUSY.to_string(),
@@ -955,6 +1153,7 @@ impl OperatorCeremony {
         &self,
         kind: OperationKind,
         automatic: bool,
+        words: Option<Words>,
         run: F,
     ) -> Result<OperatorStatus, Opening>
     where
@@ -1024,6 +1223,7 @@ impl OperatorCeremony {
             presses,
             status,
             artifacts,
+            words,
             automatic,
         });
         Ok(awaited(&mut session.status).await?)
@@ -1063,7 +1263,9 @@ impl OperatorCeremony {
                 terms: None,
             })
             .map_err(|_| STOPPED.to_string())?;
-        awaited(&mut session.status).await
+        let status = awaited(&mut session.status).await?;
+        failure_words(&session.words, &status)?;
+        Ok(status)
     }
 
     /// Forgets a completed session after its final state has been shown.
@@ -1086,6 +1288,28 @@ impl OperatorCeremony {
         }
         *held = None;
         Ok(operators)
+    }
+}
+
+/// Said when a gateway ceremony failed without a sentence of its own.
+const GATEWAY_FAILED: &str = "la gestion de l'identité de la gateway a échoué : rien n'a été \
+                              signé ou rien n'a été changé sur la gateway";
+
+/// The sentence of a failed gateway ceremony, when the ceremony wrote one.
+fn failure_words(words: &Option<Words>, status: &OperatorStatus) -> Result<(), String> {
+    if status.gesture != GestureState::Failed {
+        return Ok(());
+    }
+    match words {
+        Some(words) => match words
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            Some(sentence) => Err(sentence),
+            None => Ok(()),
+        },
+        None => Ok(()),
     }
 }
 

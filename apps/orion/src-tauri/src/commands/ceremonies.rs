@@ -183,6 +183,51 @@ pub(crate) async fn begin_revocation_ceremony(
         .await
 }
 
+/// Opens a gateway identity gesture: renewing, cancelling, rolling back or revoking the
+/// gateway's identity, or carrying what one left waiting. A discard takes no key and opens no
+/// ceremony. The gateway is the connected profile's; without one the gesture stops before
+/// any call. A refusal before a key is an error carrying its sentence.
+#[tauri::command]
+pub(crate) async fn begin_gateway_ceremony(
+    state: State<'_, AppState>,
+    gesture: crate::operator::GatewayGesture,
+) -> Result<(), String> {
+    let vault_path = state.vault_location.path()?;
+    if matches!(gesture, crate::operator::GatewayGesture::Discard) {
+        ensure_no_open_ceremony(&state).await?;
+        return tokio::task::spawn_blocking(move || {
+            crate::operator::discard_gateway_record(&vault_path)
+        })
+        .await
+        .map_err(|error| format!("suppression de la décision en attente : {error}"))?;
+    }
+    let requested_by = match gesture {
+        crate::operator::GatewayGesture::Rollback { .. } => connected_workstation(&state).await?,
+        _ => String::new(),
+    };
+    let gateway = connected_target(&state).await.ok();
+    state
+        .operator
+        .begin_gateway(gesture, gateway, vault_path, requested_by)
+        .await
+        .map(|_| ())
+}
+
+/// The name of the workstation in the connected profile of the domain: the name a rollback's
+/// campaign carries as its requester.
+async fn connected_workstation(state: &AppState) -> Result<String, String> {
+    let view = match state.client.call(EngineCommand::GetConfig).await? {
+        EngineReply::Config(view) => view,
+        _ => return Err(unexpected_engine_reply()),
+    };
+    view.selected
+        .as_deref()
+        .and_then(|name| view.profiles.iter().find(|profile| profile.name == name))
+        .map(|profile| profile.name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| NO_CONNECTED_GATEWAY.to_string())
+}
+
 /// Answers the approval screen of a rotation, against the status the operator saw:
 /// this is what opens its campaign.
 #[tauri::command]

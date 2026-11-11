@@ -608,6 +608,7 @@ export type OperationKind =
   | 'mark_key'
   | 'finalize_domain'
   | 'issue_gateway_bootstrap'
+  | 'gateway_identity'
 
 /** Ce que le WebView a le droit de nommer : un genre, au plus un identifiant. */
 export interface OperationLocator {
