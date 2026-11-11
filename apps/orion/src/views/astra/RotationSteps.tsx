@@ -167,12 +167,15 @@ export function MotifChoice<T extends string>({
   choices,
   value,
   disabled,
+  unavailable,
   onChoose,
 }: {
   legend: string
   choices: readonly { value: T; label: string }[]
   value: T | null
   disabled: boolean
+  /** Choices that cannot be taken now, each with the sentence that says why. */
+  unavailable?: Partial<Record<T, string>>
   onChoose: (value: T) => void
 }) {
   return (
@@ -185,7 +188,7 @@ export function MotifChoice<T extends string>({
             size="small"
             variant={choice.value === value ? 'contained' : 'outlined'}
             aria-pressed={choice.value === value}
-            disabled={disabled}
+            disabled={disabled || unavailable?.[choice.value] !== undefined}
             onClick={() => onChoose(choice.value)}
             sx={{ minHeight: 28, fontSize: 12 }}
           >
@@ -193,6 +196,14 @@ export function MotifChoice<T extends string>({
           </Button>
         ))}
       </Box>
+      {choices.map((choice) => {
+        const reason = unavailable?.[choice.value]
+        return reason ? (
+          <Typography key={choice.value} color="text.secondary" sx={{ mt: 0.5, fontSize: 11.5 }}>
+            {reason}
+          </Typography>
+        ) : null
+      })}
     </Box>
   )
 }

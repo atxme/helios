@@ -88,6 +88,30 @@ describe('gatewayRow', () => {
     expect(row.actions).toEqual(['revoke'])
   })
 
+  it('a_staged_or_overlapping_transition_forbids_the_replacement_with_its_reason', () => {
+    const sentence = "Une transition est en cours : le remplaçant n'est possible qu'après sa fin."
+    const switching = gatewayRow(
+      withGateway({
+        gateway_transition_pending: true,
+        gateway_transition_published: true,
+        gateway_activation_at: NOW + 7 * DAY,
+      }),
+      NOW,
+    )
+    const overlapping = gatewayRow(
+      withGateway({
+        gateway_transition_pending: true,
+        gateway_transition_published: true,
+        gateway_activation_at: NOW - DAY,
+        gateway_retire_active_at: NOW + 6 * DAY,
+      }),
+      NOW,
+    )
+    expect(switching.replacementReason).toBe(sentence)
+    expect(overlapping.replacementReason).toBe(sentence)
+    expect(gatewayRow(withGateway({}), NOW).replacementReason).toBeNull()
+  })
+
   it('overlap_reads_the_retirement_date_and_offers_rollback', () => {
     const row = gatewayRow(
       withGateway({

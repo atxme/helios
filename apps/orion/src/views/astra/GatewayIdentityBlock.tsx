@@ -94,7 +94,7 @@ export function GatewayIdentityBlock({
   const [hours, setHours] = useState(ROLLBACK_HOURS_DEFAULT)
   const [reason, setReason] = useState('')
   const [motif, setMotif] = useState<RevocationReasonChoice | null>(null)
-  const [mode, setMode] = useState<Mode>('with')
+  const [chosenMode, setMode] = useState<Mode | null>('with')
   const [withoutConfirmed, setWithoutConfirmed] = useState(false)
   const [invalid, setInvalid] = useState<string | null>(null)
 
@@ -142,14 +142,19 @@ export function GatewayIdentityBlock({
 
   // With a replacement the revocation runs two rounds, each with its own keys; a round that
   // only revokes is one. A waiting replacement fixes the mode: it is already deposited.
+  // While a transition is staged or overlapping, heliosd prepares no replacement: the choice is
+  // then left to the operator, and « sans remplaçant » is never taken for them.
+  const noReplacement = row.replacementReason !== null
+  const mode: Mode | null = noReplacement && chosenMode === 'with' ? null : chosenMode
   const withReplacement = toSign || mode === 'with'
+  const decided = toSign || mode !== null
   const touches =
     mode === 'with' && !toSign
       ? 'Deux séries de touches : le remplaçant, puis la révocation.'
       : 'Une série de touches : la révocation.'
 
   const revoke = () => {
-    if (!motif) return
+    if (!motif || !decided) return
     void launch({ gesture: 'revoke', reason: motif, with_replacement: withReplacement })
   }
 
@@ -284,13 +289,14 @@ export function GatewayIdentityBlock({
             choices={MODES}
             value={mode}
             disabled={busy}
+            unavailable={noReplacement ? { with: row.replacementReason ?? '' } : undefined}
             onChoose={(next) => {
               setMode(next)
               setWithoutConfirmed(false)
             }}
           />
         )}
-        {motif && (
+        {motif && decided && (
           <Paper component="section" aria-label="Confirmation" variant="outlined" sx={{ px: 1.5, py: 1 }}>
             <Typography sx={{ mb: 0.75, fontSize: 12 }}>{touches}</Typography>
             {!withReplacement && (

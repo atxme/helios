@@ -165,6 +165,55 @@ describe('GatewayIdentityBlock', () => {
     )
   })
 
+  const SWITCH_SOON = {
+    gateway_transition_pending: true,
+    gateway_transition_published: true,
+    gateway_activation_at: NOW + 7 * DAY,
+  }
+  const OVERLAP = {
+    gateway_transition_pending: true,
+    gateway_transition_published: true,
+    gateway_activation_at: NOW - DAY,
+    gateway_retire_active_at: NOW + 6 * DAY,
+  }
+  const IN_FLIGHT = "Une transition est en cours : le remplaçant n'est possible qu'après sa fin."
+
+  it.each([
+    ['bascule', SWITCH_SOON],
+    ['recouvrement', OVERLAP],
+  ])('during_%s_the_replacement_is_disabled_with_its_reason_and_nothing_is_preselected', async (_name, domain) => {
+    renderBlock(withDomain(domain))
+    fireEvent.click(block().getByRole('button', { name: 'Révoquer la gateway' }))
+    fireEvent.click(block().getByRole('button', { name: 'Compromis' }))
+
+    const withReplacement = screen.getByRole('button', { name: 'Avec remplaçant' })
+    expect(withReplacement.hasAttribute('disabled')).toBe(true)
+    expect(withReplacement.getAttribute('aria-pressed')).toBe('false')
+    expect(screen.getByRole('button', { name: 'Sans remplaçant' }).getAttribute('aria-pressed')).toBe('false')
+    expect(screen.getByText(IN_FLIGHT)).toBeTruthy()
+    // Nothing is asked to be confirmed, or launched, until the operator picks « sans remplaçant ».
+    expect(screen.queryByRole('region', { name: 'Confirmation' })).toBeNull()
+    expect(api.beginGatewayCeremony).not.toHaveBeenCalled()
+  })
+
+  it('during_a_transition_sans_remplacant_keeps_its_second_confirmation', async () => {
+    renderBlock(withDomain(SWITCH_SOON))
+    fireEvent.click(block().getByRole('button', { name: 'Révoquer la gateway' }))
+    fireEvent.click(block().getByRole('button', { name: 'Compromis' }))
+    fireEvent.click(block().getByRole('button', { name: 'Sans remplaçant' }))
+    const revoke = () => confirmation().getByRole('button', { name: 'Révoquer la gateway' })
+    expect(revoke().hasAttribute('disabled')).toBe(true)
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Je confirme la révocation sans remplaçant' }))
+    fireEvent.click(revoke())
+    await waitFor(() =>
+      expect(api.beginGatewayCeremony).toHaveBeenCalledWith({
+        gesture: 'revoke',
+        reason: 'compromised',
+        with_replacement: false,
+      }),
+    )
+  })
+
   it('a_deposited_replacement_puts_revoke_first_without_resume_and_one_series', async () => {
     renderBlock(
       withDomain({}, {

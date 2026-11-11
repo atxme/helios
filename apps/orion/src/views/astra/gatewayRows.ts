@@ -24,6 +24,11 @@ export interface GatewayRow {
   renewReason: string | null
   /** A second line of fact, such as a rollback in force or what a stop leaves untouched. */
   detail: string | null
+  /**
+   * Why a revocation « avec remplaçant » cannot start; `null` when it can. heliosd prepares no
+   * replacement while a transition is staged or overlapping.
+   */
+  replacementReason: string | null
 }
 
 /** The button labels of the block, one per action. */
@@ -35,6 +40,10 @@ export const GATEWAY_LABELS: Record<GatewayAction, string> = {
   resume: 'Reprendre',
   discard: 'Jeter la décision en attente',
 }
+
+/** Why a replacement waits for the end of a transition: heliosd prepares none while one is staged. */
+export const REPLACEMENT_IN_TRANSITION =
+  "Une transition est en cours : le remplaçant n'est possible qu'après sa fin."
 
 export const RESTART_SENTENCE = 'Redémarrer heliosd sur la gateway.'
 
@@ -67,6 +76,7 @@ export function gatewayRow(o: RotationsOverview, local: number): GatewayRow {
       restartMotif,
       renewReason: null,
       detail: toSign ? REVOCATION_TO_SIGN : null,
+      replacementReason: null,
     }
   }
 
@@ -75,6 +85,7 @@ export function gatewayRow(o: RotationsOverview, local: number): GatewayRow {
   let state: string
   let due = false
   let actions: GatewayAction[] = []
+  let replacementReason: string | null = null
 
   if (!domain) {
     state = reachLabel(o.domain) ?? 'Identité non lue'
@@ -106,9 +117,11 @@ export function gatewayRow(o: RotationsOverview, local: number): GatewayRow {
     } else if (published && activation !== null && now < activation) {
       state = `Bascule le ${formatDate(activation)}`
       actions = ['revoke']
+      replacementReason = REPLACEMENT_IN_TRANSITION
     } else if (activation !== null && retire !== null && now >= activation && now < retire) {
       state = `Recouvrement jusqu'au ${formatDate(retire)}`
       actions = ['rollback', 'revoke']
+      replacementReason = REPLACEMENT_IN_TRANSITION
     } else {
       const expiries = [domain.gateway_tls_not_after, domain.gateway_pq_not_after].filter(
         (at): at is number => at !== null,
@@ -140,5 +153,6 @@ export function gatewayRow(o: RotationsOverview, local: number): GatewayRow {
     restartMotif,
     renewReason,
     detail: detail.length > 0 ? detail.join(' · ') : null,
+    replacementReason,
   }
 }
