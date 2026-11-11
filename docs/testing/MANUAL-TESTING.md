@@ -1265,6 +1265,96 @@ attendu.
     Attendu : la révocation de ce poste aboutit, Astra l'ayant inscrit à l'ouverture.
     **[cible]** (gateway cible).
 
+**I. Lot 6b : l'identité de la gateway depuis Orion**
+
+Les tests Rust et Vitest couvrent la logique (`apps/orion/src/views/astra/gatewayRows.test.ts`,
+`GatewayIdentityBlock.test.tsx`, `apps/orion/src-tauri/src/operator/ceremony/gateway/tests.rs`,
+`crates/astra/src/door/tests/gateway_identity_tunnel.rs`,
+`crates/astra-operator/src/operations/gateway_revocation/tests.rs`). Les étapes
+marquées **[cible]** demandent de vraies clés, une gateway cible ou le redémarrage
+de `heliosd` : WSL2 ne les joue pas. Les autres ne touchent aucune clé et ne
+redémarrent rien ; elles se jouent avec le tunnel monté vers une gateway et Astra
+en marche. Prérequis : un poste Orion pair **administrateur** du tunnel, deux clés
+enregistrées dans le coffre, Astra déployé avec son canal privé. Onglet *Astra* ›
+*Rotations*, bloc « Identité de la gateway ». Chaque étape : action, puis état
+attendu.
+
+79. **Bloc, états et prérequis.** Ouvrir l'onglet. Attendu : le bloc « Identité de la
+    gateway » est en tête, avec son état (« Échéance le … », ou « À faire » si une
+    feuille expire dans moins de 30 jours) et les boutons de cet état. « Renouveler
+    l'identité de la gateway » ouvre le panneau « Prérequis » : « Tunnel connecté »,
+    « Administrateur du tunnel », « Service Astra », « Coffre présent », « Domaine
+    concordant ». Aucune clé n'est demandée.
+80. **Tunnel coupé.** Couper le tunnel, puis « Renouveler l'identité de la gateway ».
+    Attendu : « Tunnel connecté » en rouge ; aucune case ni « Continuer ». Rétablir le
+    tunnel.
+81. **Options et termes.** Prérequis verts. Cocher « La clé de la gateway est perdue ».
+    Attendu : « Aucune preuve de continuité. Réservé à une clé disparue. » ; « Continuer »
+    reste désactivé tant que « Je confirme la perte de la clé » n'est pas coché. Attendu
+    aussi : « Termes : préparation 7 jours, recouvrement 7 jours, validité 365 jours. ».
+    Décocher, sans cliquer « Continuer ».
+82. **Renouvellement complet.** **[cible]** (clés réelles, gateway cible). Options
+    décochées, « Continuer ». Attendu : la campagne s'ouvre à ce clic ; le manifeste
+    s'affiche ; un « Approuver avec la clé » par clé demandée. À la fin, la ligne passe à
+    « Bascule le JJ/MM/AAAA » et ne propose plus que « Révoquer la gateway ».
+83. **Remplacement aussi de la feuille TLS.** **[cible]** (clés réelles, gateway cible).
+    Même déroulé, avec « Remplacer aussi la feuille TLS ». Attendu : la feuille TLS
+    candidate est vérifiée avant la première clé.
+84. **Clé perdue.** **[cible]** (clés réelles, gateway cible). Cocher « La clé de la
+    gateway est perdue » et « Je confirme la perte de la clé », puis « Continuer ».
+    Attendu : la campagne porte le libellé « Récupération de la clé de la gateway ».
+85. **Annulation avant publication.** **[cible]** (clés réelles, gateway cible). Ligne
+    « Installée, publication à faire ». « Annuler », puis « Confirmer l’annulation ».
+    Attendu : « L'époque reste consommée. » ; un toucher par clé ; la ligne revient à son
+    état sans transition en attente.
+86. **Pas d'annulation après publication.** **[cible]** (gateway cible). Sur la ligne
+    « Bascule le … » : aucun bouton « Annuler ».
+87. **Reprise sans clé.** **[cible]** (clés réelles, gateway cible). Fermer Orion après
+    le dépôt de la décision, avant la publication ; rouvrir. Attendu : « Installée,
+    publication à faire » ; « Reprendre » publie sans toucher de clé, puis la ligne passe
+    à « Bascule le … ».
+88. **Bornes du retour arrière.** **[cible]** (gateway cible). Pendant « Recouvrement
+    jusqu'au … », « Revenir à l'ancienne identité ». Durée 0 : « Durée : de 1 à 168
+    heures ». Motif vide, puis un motif de 201 caractères : « Motif : de 1 à 200
+    caractères ». Aucun appel, aucune clé.
+89. **Retour arrière.** **[cible]** (clés réelles, gateway cible). Durée 24 par défaut,
+    motif renseigné, « Lancer le retour arrière », un toucher par clé. Attendu : la ligne
+    affiche « Retour arrière jusqu'au … ».
+90. **Redémarrage de heliosd.** **[cible]** (redémarrage de `heliosd`). Attendu : la
+    ligne affiche « Redémarrer heliosd sur la gateway. » et « Détail technique : … ».
+    Orion ne redémarre rien : redémarrer `heliosd` sur la gateway, puis ↻. Attendu : la
+    phrase disparaît.
+91. **Révocation avec remplaçant.** **[cible]** (clés réelles, gateway cible). « Révoquer
+    la gateway », motif, « Avec remplaçant ». Attendu : « Deux séries de touches : le
+    remplaçant, puis la révocation. » ; la première série porte le libellé « Identité de
+    remplacement de la gateway, avant sa révocation » ; la seconde affiche
+    « empreinte du remplaçant ».
+92. **Révocation refusée pendant un recouvrement CA-PQ.** **[cible]** (gateway cible).
+    Pendant un recouvrement, « Avec remplaçant ». Attendu, avant toute clé : « le
+    remplacement de la gateway est possible après le … » ou « … attend la fin du
+    recouvrement de CA-PQ » ; et « La révocation sans remplaçant reste possible. ».
+93. **Révocation sans remplaçant.** **[cible]** (clés réelles, gateway cible). « Sans
+    remplaçant » ; la confirmation « La gateway ne servira plus. Le domaine devra être
+    reconstruit. » ; cocher « Je confirme la révocation sans remplaçant », puis « Révoquer
+    la gateway ». Attendu : une série de touches. Le bloc n'affiche pas d'état « Révoquée » :
+    le résultat se lit sur la gateway et dans le journal d'Astra.
+94. **Révocation à signer.** **[cible]** (clés réelles, gateway cible). Fermer Orion après
+    le dépôt du remplaçant, avant la seconde série ; rouvrir. Attendu : « Révocation à
+    signer » avec « Le remplaçant est déposé ; la révocation reste à signer. Rien n'a été
+    révoqué. » ; « Révoquer la gateway » et « Jeter la décision en attente » ; pas de
+    « Reprendre ».
+95. **Reprise sans clé après une réponse perdue.** **[cible]** (Astra arrêté, gateway
+    cible). Campagne de révocation expirée sans réponse. « Reprendre ». Attendu : sans
+    clé, le remplaçant est installé si la gateway a appliqué la révocation ; sinon la
+    ligne repasse « Révocation à signer ».
+96. **Jeter la décision en attente.** **[cible]** (clés réelles, gateway cible). « Jeter la
+    décision en attente », puis la confirmation « La décision signée sera perdue. L'époque
+    reste consommée. ». Attendu : aucune clé demandée ; la ligne revient à son état sans
+    registre.
+97. **Pas de « Tout renouveler » dans Orion.** Attendu : aucune ligne « Tout renouveler »
+    dans l'onglet ; le plan se joue sur la console d'Astra (`astra chain open`, voir
+    RENOUVELLEMENT-CERTIFICATS.md, §10).
+
 ### Le chemin manuel
 
 Dans un autre terminal, générer deux identités de test :

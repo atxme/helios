@@ -23,7 +23,7 @@ Quatre choses tournent sans qu'un opérateur intervienne, et c'est voulu :
 
 Tout le reste ci-dessous est une action délibérée.
 
-## Le chemin par défaut : Orion (F14, lot 5b)
+## Le chemin par défaut : Orion (F14, lots 5b et 6b)
 
 Depuis le lot 5b, les rotations se font **depuis Orion**, sur un poste
 administrateur du tunnel : onglet *Astra* › *Rotations*, une liste d'actions
@@ -32,6 +32,12 @@ document (`astra campaign open`, `astra-signer rotate-ca-pq`, `heliosd
 install-*`, `promote-ca-tls`, `resume-rotation`) restent décrites comme
 **recours** : elles servent quand Orion ne peut pas, jamais par défaut. Orion ne
 lance plus `astra-signer`.
+
+Depuis le lot 6b, l'identité de la gateway se gère aussi depuis Orion, par le
+tunnel, sans fichier ni commande (§7.1, §8, §8.1). Les commandes gateway de ce
+document (`astra-signer sign-gateway-transition`, `sign-gateway-rollback`,
+`revoke --scope gateway`, `astra gateway-identity …`) restent le recours jusqu'au
+lot 7. « Tout renouveler » n'est pas encore dans Orion (§10).
 
 | Ligne | Ce qu'elle fait | Section |
 | --- | --- | --- |
@@ -42,6 +48,7 @@ lance plus `astra-signer`.
 | Remplacer la CA TLS | idem pour la CA TLS | §9 |
 | Renouveler la délégation | délégation de l'émetteur, sans fichier ni redémarrage | §4 |
 | Révoquer un poste | onglet *Postes* : coupe le poste tout de suite, puis signe la révocation (lot 5c) | §7 |
+| Identité de la gateway | bloc en tête de *Rotations* : renouvelle, annule, revient à l'ancienne identité, révoque la gateway ; reprend ou jette une décision en attente (lot 6b) | §7.1, §8, §8.1 |
 
 Orion vérifie des **prérequis** avant toute ouverture (tunnel, administrateur,
 service Astra, coffre, deux clés, copie du coffre, domaine concordant) et dit
@@ -96,6 +103,12 @@ poste (onglet *Postes*, §7) ; la route reste appelable directement pour le
 recours. Le tunnel ouvre aussi,
 depuis le lot 5b, la délégation d'émetteur avec campagne (§4) et reçoit la copie
 du coffre (`POST /api/certificates/operator/vault-copy`).
+
+Depuis le lot 6b, le même tunnel ouvre aussi l'identité de la gateway
+(`gateway_identity`, §8), la révocation de la gateway (`gateway_revocation`,
+§7.1) et le premier pas du plan (`chain_open`, §10). Il porte la publication
+d'une transition (`POST /api/certificates/operator/gateway-identity/publish`) et
+les pas suivants du plan (`…/chain/next`, `…/chain/abandon`).
 
 ## 1. Renouveler la feuille d'un poste (§7.1 → §7.3)
 
@@ -523,7 +536,8 @@ Deux révocations de deux postes différents peuvent attendre l'opérateur en
 même temps ; une seconde révocation du **même** poste est refusée tant que la
 première attend.
 
-**Révoquer la gateway elle-même** — même cérémonie, une résolution en plus :
+**Révoquer la gateway elle-même** — recours en ligne de commande (jusqu'au lot 7) ;
+la voie d'Orion est au §7.1. Même cérémonie, une résolution en plus :
 
 ```sh
 astra revocation open --scope gateway \
@@ -543,8 +557,8 @@ l'incident.
 Ce canal est celui du service (`ASTRA_GATEWAY_CHANNEL` et
 `ASTRA_GATEWAY_CERTIFICATE` d'`astra run`, que `deploy.sh` renseigne) : la
 commande ne prend plus d'adresse, et sans canal privé dans le service elle est
-refusée par son nom. Cette révocation ne s'ouvre que depuis la console de
-l'hôte d'Astra, pas par le tunnel (lot 6b de F14).
+refusée par son nom. Depuis le lot 6b, Orion ouvre aussi cette révocation par
+le tunnel (§7.1) ; la commande ci-dessus reste le recours.
 
 Les deux feuilles gateway n'expirent pas ensemble, contrairement à une
 génération cliente : leurs échéances se nomment séparément, et une moitié sans
@@ -562,6 +576,59 @@ Sans cette suite, une révocation gateway est une panne de service définitive :
 plus aucune transition ne s'installe, sur aucun détenteur, et il faut
 reconstruire le domaine. Le champ `replacement_transition_fingerprint` du
 §10.1 existe pour ça.
+
+**Dans Orion (chemin par défaut, lot 6b).** Onglet *Rotations*, bloc « Identité
+de la gateway », bouton « Révoquer la gateway ». Le motif est celui du poste
+(§7) : « Volé ou perdu », « Compromis », « Plus utilisé » ou « Remplacé ». Puis
+le remplaçant : « Avec remplaçant » (par défaut) ou « Sans remplaçant ».
+
+- **Avec remplaçant : deux séries de touches**, annoncées avant de commencer
+  (« Deux séries de touches : le remplaçant, puis la révocation. »).
+  1. Campagne « Identité de remplacement de la gateway, avant sa révocation » :
+     la transition de remplacement est signée en récupération de clé, avec des
+     termes fixes de 7 jours, 7 jours et 365 jours, et les deux feuilles
+     remplacées. Elle est déposée chez Astra, sans clé, puis enregistrée à côté
+     du coffre (`pending-gateway-revocation.json`).
+  2. La révocation, sous son propre libellé. Son manifeste affiche l'empreinte
+     du remplaçant, lue sur l'objet signé et non saisie. Les deux moitiés, TLS et
+     PQ, sont révoquées.
+  Le remplaçant est installé après la révocation, dans cet ordre (étape 4 ci-dessous).
+- **Sans remplaçant : une série de touches.** La confirmation dit « La gateway
+  ne servira plus. Le domaine devra être reconstruit. » ; la case « Je confirme
+  la révocation sans remplaçant » doit être cochée.
+
+**Refus avant toute clé.**
+
+- Pendant un recouvrement `CA-PQ`, le remplaçant est refusé, avec la date de fin
+  du recouvrement quand elle est connue : « le remplacement de la gateway est
+  possible après le …. La révocation sans remplaçant reste possible. ». Si la fin
+  est déjà passée sur l'horloge du poste, la phrase ne donne pas de date.
+- La révocation **sans** remplaçant pendant un recouvrement suit la règle du
+  poste (§7) : elle est refusée avec « révocation possible après le … » dans la
+  dernière heure avant la fin, ou pour une rotation qui n'a pas gardé sa clé sortante.
+
+**Reprise.**
+
+- Un remplaçant déposé dont la révocation n'est pas encore signée : Orion affiche
+  « Révocation à signer » avec « Révoquer la gateway » (et non « Reprendre »), et
+  la phrase « Le remplaçant est déposé ; la révocation reste à signer. Rien n'a
+  été révoqué. ». La reprise, si elle est appelée, refuse sans rien appeler avec
+  « La révocation reste à signer : choisir « Révoquer la gateway ». Rien n'a été
+  révoqué. ».
+- Une campagne de révocation expirée sans réponse : « Reprendre » tente d'installer
+  le remplaçant, sans clé. Accepté, les deux étapes sont faites. Refusé
+  définitivement par la gateway, la révocation n'a pas été appliquée : elle est
+  retirée, et l'état redevient « Révocation à signer ». Injoignable, le registre
+  est gardé pour une reprise. Sans remplaçant, la révocation expirée est jetée
+  (« la campagne de la révocation a expiré avant le dépôt : la révocation est
+  jetée. Reprendre la préparation. »).
+- « Jeter la décision en attente » retire le registre sans clé, après la
+  confirmation « La décision signée sera perdue. L'époque reste consommée. ».
+  Orion ne le propose que lorsqu'un registre attend, et ne l'exécute pas pendant
+  une cérémonie ouverte.
+
+**Recours en ligne de commande** (jusqu'au lot 7). Les quatre étapes suivantes
+sont celles de la machine à états, en commandes.
 
 L'ordre est imposé, et par la machine à états plutôt que par la consigne.
 
@@ -625,6 +692,77 @@ l'opérateur, et rien ici ne peut la prendre à sa place.
 La gateway génère et scelle sa propre clé suivante, puis exporte une demande.
 Aucune clé privée gateway ne quitte jamais la machine qui l'a créée : ce qui
 part est une clé publique et deux preuves.
+
+### Dans Orion (chemin par défaut, lot 6b)
+
+Onglet *Rotations*, bloc « Identité de la gateway » en tête. Le bouton
+« Renouveler l'identité de la gateway » ouvre deux options, décochées par défaut :
+
+- « Remplacer aussi la feuille TLS » ;
+- « La clé de la gateway est perdue », avec « Aucune preuve de continuité.
+  Réservé à une clé disparue. » et la case « Je confirme la perte de la clé ».
+
+Les termes sont fixes dans l'IHM : préparation 7 jours, recouvrement 7 jours,
+validité 365 jours. « Continuer » lance la cérémonie. Les prérequis sont ceux de
+*Rotations* : tunnel, administrateur, service Astra, coffre, domaine concordant.
+
+Déroulé :
+
+1. **Refus avant toute clé** : une décision ou une révocation en attente, une
+   transition gateway déjà en cours, ou un recouvrement `CA-PQ` (le bouton est
+   alors désactivé, avec « Recouvrement CA-PQ en cours »).
+2. **Préparation et campagne.** La gateway prépare sa demande sur sa clé scellée,
+   sans nouvelle clé (`new_key` est toujours faux). Astra ouvre la campagne
+   `gateway_identity` par le tunnel. Orion vérifie, avant la première clé, que la
+   feuille PQ en service est celle que la campagne fige, que la signature de
+   continuité la couvre (sauf clé perdue), que la demande annoncée correspond, et
+   que la feuille TLS candidate est présente si et seulement si la case est
+   cochée. Une différence arrête le geste (« la feuille gateway en service n'est
+   pas celle que la campagne fige », « la demande de la gateway ne correspond pas
+   à la campagne », ou « la campagne d'Astra ne nomme pas cette gateway »).
+3. **Cérémonie.** Une approbation par clé demandée (« Approuver avec la clé »).
+   Le coffre émet la feuille PQ suivante et signe la transition dans le même
+   geste. La décision est enregistrée à côté du coffre
+   (`pending-gateway-decision.json`) avant tout dépôt.
+4. **Dépôt, installation, publication.** La décision est déposée chez Astra, puis
+   installée sur la gateway, qui la vérifie sous ses ancres et la refuse si la
+   clé privée d'une feuille n'est pas scellée chez elle. Enfin Astra la publie
+   (`gateway-identity/publish`). Une publication non confirmée se reprend.
+
+Après publication, la ligne affiche « Bascule le … ». La transition ne prend
+effet qu'à la date d'activation, et ce basculement demande le redémarrage de
+`heliosd` (§11).
+
+**Reprise.** Une décision enregistrée et non déposée, dont la campagne a expiré,
+est jetée à la lecture : la préparation repart de zéro. Une décision déposée
+attend l'installation et la publication, quelle que soit l'heure. « Reprendre »
+ne demande aucune clé.
+
+**États de la ligne**, lus à chaque ouverture, au bouton ↻ et après chaque geste :
+
+| État | Sens et actions |
+| --- | --- |
+| À faire | une échéance de feuille gateway est à moins de 30 jours. « Renouveler », « Révoquer la gateway » |
+| Échéance le … | la plus proche des deux échéances, au-delà de 30 jours. « Renouveler », « Révoquer la gateway » |
+| Échéance inconnue | aucune échéance lue. « Renouveler », « Révoquer la gateway » |
+| Installée, publication à faire | transition installée, non publiée. « Annuler » tant que l'activation n'est pas atteinte |
+| Décision à reprendre | décision en attente non installée. « Reprendre », « Jeter la décision en attente » |
+| Annulation à reprendre | annulation en attente. « Reprendre », « Jeter la décision en attente » ; jamais une nouvelle annulation |
+| Bascule le … | publiée, avant l'activation. « Révoquer la gateway » |
+| Recouvrement jusqu'au … | l'ancienne et la nouvelle identité servent. « Revenir à l'ancienne identité », « Révoquer la gateway » |
+| Révocation à signer | remplaçant déposé, révocation à signer. « Révoquer la gateway », « Jeter la décision en attente » |
+| Révocation à reprendre | révocation en attente, non appliquée. « Reprendre », « Jeter la décision en attente » |
+| Révocation appliquée, reprise à faire | révocation appliquée, remplaçant à installer. « Reprendre », « Jeter la décision en attente » |
+
+Quand la gateway signale un redémarrage à faire (`gateway_restart_due`), la ligne
+affiche « Redémarrer heliosd sur la gateway. », avec la raison donnée par la
+gateway en « Détail technique : … ». Rien ne redémarre à sa place.
+
+**Limites de cette version.** La réponse « demande reprise » de la gateway n'est
+pas affichée dans Orion. Les termes ne se règlent pas dans l'IHM ; le backend
+d'Orion accepte pourtant des durées de 1 à 3650 jours.
+
+### Recours en ligne de commande (jusqu'au lot 7)
 
 **Sur la gateway**, depuis la console — *Sécurité → Certificats* — avec
 « Préparer la demande ». C'est le chemin normal : la console passe par le
@@ -776,7 +914,32 @@ feuille sortante. C'est un rollback **de service**, pas d'état : aucun compteur
 ne bouge, le slot suivant reste scellé, et sa promotion a lieu à `not_after`
 comme prévu.
 
-Au poste opérateur :
+**Dans Orion (chemin par défaut, lot 6b).** Le bouton « Revenir à l'ancienne
+identité » n'apparaît que pendant le recouvrement, entre l'activation et la fin
+du recouvrement. Deux saisies :
+
+- la durée, en heures, de 1 à 168, 24 par défaut ; la durée ne dépasse jamais la
+  fin du recouvrement ;
+- le motif, de 1 à 200 caractères.
+
+Les bornes sont vérifiées avant tout appel. Le demandeur est le nom du poste
+connecté. Aucune campagne Astra ne s'ouvre : la sélection est résolue depuis la
+transition que la gateway tient, affichée en entier, puis signée après un
+toucher par clé demandée. La pose se fait par la gateway elle-même.
+
+Refus avant toute clé :
+
+- transition non publiée, avant l'activation, ou après la fin du recouvrement :
+  « aucun recouvrement en cours : l'ancienne identité n'est pas celle qui sert.
+  Rien n'a été signé. » ;
+- une révocation de la gateway en attente : « une révocation de la gateway attend
+  dans le registre : la reprendre ou la jeter avant d'ouvrir une autre décision. »
+
+Après la pose, la ligne affiche « Retour arrière jusqu'au … » tant que la
+sélection tient. Si Orion affiche « Redémarrer heliosd sur la gateway. », le
+redémarrage reste à faire par l'opérateur (§11).
+
+**Recours en ligne de commande** (jusqu'au lot 7) :
 
 ```sh
 astra-signer sign-gateway-rollback --transition transition.json \
@@ -958,6 +1121,14 @@ commande, le fichier `astra-prepared.json` en garde la trace et
 « Toute la chaîne » couvre l'émetteur délégué, la CA TLS cliente, l'identité
 gateway et les feuilles du parc — **pas `CA-PQ`**, qui a sa propre cérémonie
 (§3 de cette note).
+
+**Dans Orion : pas encore.** « Tout renouveler » n'est pas dans Orion : le lot 6b
+l'a détaché, parce que chaque geste du plan devrait être contrôlé avant l'ouverture
+du plan, ce qui change la conception (suivi F14-g dans [ROADMAP.md](ROADMAP.md)).
+Le plan se joue sur la console d'Astra, comme ci-dessous. Le tunnel porte déjà les
+routes du plan (`POST /api/certificates/operator/chain/next` et `…/chain/abandon`,
+et l'ouverture `chain_open`) ; Orion ne les appelle pas. Le statut lu par le
+tunnel (`GET /api/certificates/operator/status`) nomme le plan en cours (`chain`).
 
 Ce n'est pas une campagne, c'est un **plan de quatre campagnes ordonnées**. Ces
 quatre choses appartiennent à quatre familles d'objets signés, et une famille

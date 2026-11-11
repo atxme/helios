@@ -806,6 +806,26 @@ conception du lot 5c.
   de la gateway ; ce dernier contrôle y est reproduit sur un état de gateway, sans
   appeler `heliosd`. Une rotation antérieure à ce lot ne garde pas sa clé sortante.
 
+#### Amendement du 10 novembre 2026 : les gestes de l'identité gateway se jouent dans Orion (F14, lot 6b)
+
+Renvoi à la spécification du lot 6b (§5.1) ; la recette est dans MANUAL-TESTING,
+« I. Lot 6b ».
+
+- **Table de la porte.** Le tunnel ouvre désormais `GatewayIdentity`,
+  `GatewayIdentityPublish`, `GatewayRevocation`, `ChainOpen`, `ChainNext` et
+  `ChainAbandon` (`crates/astra/src/door/mod.rs`, `allowed`). Restent à la console
+  seule : `IssuerRequest`, `PinCaTls` et `IssuerInstall`.
+- **Fil.** Les ouvertures `GatewayIdentity`, `GatewayRevocation` et `ChainOpen` sont
+  des variantes de `OperatorOpenAction` (`crates/aether/src/certificates/transport.rs`).
+  La publication et les pas du plan ont leurs routes du tunnel
+  (`crates/astra-channel/src/authority_routes.rs`) et leurs routes `/api` de
+  pair administrateur (`crates/helios-api/src/lib.rs`).
+- **Gestes.** Orion renouvelle, annule, revient à l'ancienne identité, révoque la
+  gateway et reprend ou jette une décision en attente, par le tunnel, sans
+  `astra-signer`. Les commandes restent le recours jusqu'au lot 7.
+- **Hors lot.** « Tout renouveler » n'est pas dans Orion : le plan reste sur la
+  console d'Astra. Les routes des pas du plan sont en place, sans écran qui les appelle.
+
 ### 8. Avortement, leases et atomicité logique
 
 Une transition gateway peut être avortée sans révocation seulement tant
