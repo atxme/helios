@@ -168,7 +168,8 @@ function TransitionTimeline({ domain }: { domain: CertificateDomain }) {
     domain.ca_transition_pending ||
     domain.client_tls_ca_transition_pending ||
     domain.gateway_transition_pending ||
-    domain.gateway_rollback_expires_at !== null
+    domain.gateway_rollback_expires_at !== null ||
+    domain.gateway_revoked
   if (!anything) return null
 
   const now = domain.now_unix
@@ -253,6 +254,17 @@ function TransitionTimeline({ domain }: { domain: CertificateDomain }) {
             label="Rollback en force"
             value={`ancienne feuille servie · jusqu’à ${at(domain.gateway_rollback_expires_at)}`}
             hint="Rollback de service, pas d’état : aucun compteur ne bouge et la promotion a lieu comme prévu. Son expiration est elle aussi un redémarrage."
+          />
+        )}
+
+        {domain.gateway_revoked && (
+          <DataRow
+            label="Révoquée"
+            value={
+              domain.gateway_awaited_replacement !== null
+                ? 'remplaçant attendu'
+                : 'domaine à reconstruire'
+            }
           />
         )}
       </Box>

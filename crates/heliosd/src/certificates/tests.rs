@@ -1701,3 +1701,35 @@ fn the_domain_view_names_the_gateway_leaf_expiries() {
     state.gateway.active_gateway_tls_certificate = leaf;
     assert_eq!(domain_view(&state, 0).gateway_tls_not_after, Some(expected));
 }
+
+/// The console says a revoked gateway is revoked, and names the one
+/// replacement the revocation awaits.
+#[test]
+fn view_names_a_revoked_gateway_and_its_awaited_replacement() {
+    let mut state = state();
+    let replacement = Fingerprint::from_bytes([7; 32]);
+    state.gateway.revoked = true;
+    state.gateway.awaited_replacement = Some(replacement);
+
+    let view = domain_view(&state, 0);
+    assert!(view.gateway_revoked);
+    assert_eq!(view.gateway_awaited_replacement, Some(replacement.to_hex()));
+}
+
+#[test]
+fn view_of_a_revoked_gateway_without_replacement() {
+    let mut state = state();
+    state.gateway.revoked = true;
+    state.gateway.awaited_replacement = None;
+
+    let view = domain_view(&state, 0);
+    assert!(view.gateway_revoked);
+    assert_eq!(view.gateway_awaited_replacement, None);
+}
+
+#[test]
+fn view_of_a_serving_gateway_is_not_revoked() {
+    let view = domain_view(&state(), 0);
+    assert!(!view.gateway_revoked);
+    assert_eq!(view.gateway_awaited_replacement, None);
+}

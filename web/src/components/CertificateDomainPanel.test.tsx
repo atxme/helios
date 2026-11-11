@@ -52,6 +52,8 @@ const DOMAIN: CertificateDomain = {
   gateway_transition_published: false,
   gateway_rollback_expires_at: null,
   gateway_restart_due: null,
+  gateway_revoked: false,
+  gateway_awaited_replacement: null,
   astra_authority_url: 'https://astra.example',
   astra_service_key_epoch: 5,
   astra_policy_fingerprint: '34'.repeat(32),
@@ -264,6 +266,26 @@ describe('CertificateDomainPanel', () => {
     await screen.findByText('Transitions en cours')
     expect(screen.getByText('époque 1 → 2')).toBeTruthy()
     expect(screen.getByText('ab'.repeat(32))).toBeTruthy()
+  })
+
+  it('shows_a_revoked_gateway', async () => {
+    answer({
+      ...DOMAIN,
+      gateway_revoked: true,
+      gateway_awaited_replacement: '56'.repeat(32),
+    })
+    mount()
+
+    await screen.findByText('Révoquée')
+    expect(screen.getByText('remplaçant attendu')).toBeTruthy()
+  })
+
+  it('shows a revoked gateway without replacement as needing a rebuilt domain', async () => {
+    answer({ ...DOMAIN, gateway_revoked: true, gateway_awaited_replacement: null })
+    mount()
+
+    await screen.findByText('Révoquée')
+    expect(screen.getByText('domaine à reconstruire')).toBeTruthy()
   })
 
   /** A selection in force is a restart pending, so it is never silent. */

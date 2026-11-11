@@ -125,6 +125,15 @@ pub struct CertificateDomainView {
     pub gateway_transition_published: bool,
     /// End of a service rollback in force, absent when none is (spec §4.4).
     pub gateway_rollback_expires_at: Option<u64>,
+    /// The served gateway identity has been revoked (spec §10.1). Nothing
+    /// local repairs it; only the one replacement the revocation names can.
+    #[serde(default)]
+    pub gateway_revoked: bool,
+    /// Fingerprint, lowercase hex, of the replacement a revoked gateway
+    /// awaits. Absent when the gateway is not revoked, or when the domain has
+    /// to be rebuilt instead.
+    #[serde(default)]
+    pub gateway_awaited_replacement: Option<String>,
     /// Why the daemon must be restarted, when the registry has moved past the
     /// leaf this process serves.
     ///

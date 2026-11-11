@@ -155,6 +155,11 @@ pub fn domain_view(
             .gateway
             .active_service_rollback(now_unix)
             .map(|rollback| rollback.expires_at),
+        gateway_revoked: state.gateway.revoked,
+        gateway_awaited_replacement: state
+            .gateway
+            .awaited_replacement
+            .map(|fingerprint| fingerprint.to_hex()),
         gateway_restart_due: crate::key_negotiation::restart_due(Some(&state.gateway), now_unix),
         astra_authority_url: state.astra.authority_url.clone(),
         astra_service_key_epoch: state.astra.astra_service_key_epoch,

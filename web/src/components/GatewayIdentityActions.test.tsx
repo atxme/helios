@@ -37,6 +37,8 @@ const DOMAIN: CertificateDomain = {
   gateway_transition_published: false,
   gateway_rollback_expires_at: null,
   gateway_restart_due: null,
+  gateway_revoked: false,
+  gateway_awaited_replacement: null,
   astra_authority_url: 'https://astra.example',
   astra_service_key_epoch: 5,
   astra_policy_fingerprint: '34'.repeat(32),

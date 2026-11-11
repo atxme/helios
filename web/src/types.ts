@@ -278,6 +278,8 @@ export interface CertificateDomain {
   gateway_transition_published: boolean
   gateway_rollback_expires_at: number | null
   gateway_restart_due: string | null
+  gateway_revoked: boolean
+  gateway_awaited_replacement: string | null
   astra_authority_url: string
   astra_service_key_epoch: number
   astra_policy_fingerprint: string
