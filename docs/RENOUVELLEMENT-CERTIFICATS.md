@@ -639,8 +639,11 @@ le remplaçant : « Avec remplaçant » (par défaut) ou « Sans remplaçant ».
 - Un remplaçant déposé dont la révocation n'est pas encore signée : Orion affiche
   « Révocation à signer » avec « Révoquer la gateway » (et non « Reprendre »), et
   la phrase « Le remplaçant est déposé ; la révocation reste à signer. Rien n'a
-  été révoqué. ». La reprise, si elle est appelée, refuse sans rien appeler avec
-  « La révocation reste à signer : choisir « Révoquer la gateway ». Rien n'a été
+  été révoqué. ». La reprise lit d'abord la vue de la gateway, par le tunnel, sans
+  clé. Si la gateway est révoquée par un autre chemin et attend exactement ce
+  remplaçant, la reprise l'installe sans clé, et la révocation n'est pas signée.
+  Dans tout autre cas, elle refuse, sans rien modifier au registre, avec « La
+  révocation reste à signer : choisir « Révoquer la gateway ». Rien n'a été
   révoqué. ».
 - **Dépôt de la révocation refusé définitivement par Astra** (réponse HTTP autre
   que 429, 500 ou 503, par exemple 409) : le dépôt a pu être accepté avant que la
@@ -847,7 +850,7 @@ ne demande aucune clé.
 | Annulation à reprendre | annulation en attente. « Reprendre », « Jeter la décision en attente » ; jamais une nouvelle annulation |
 | Bascule le … | publiée, avant l'activation. « Révoquer la gateway », sans remplaçant : « Avec remplaçant » est désactivé (§7.1) |
 | Recouvrement jusqu'au … | l'ancienne et la nouvelle identité servent. « Revenir à l'ancienne identité », « Révoquer la gateway », sans remplaçant : « Avec remplaçant » est désactivé (§7.1) |
-| Révocation à signer | remplaçant déposé, révocation à signer. « Révoquer la gateway », « Jeter la décision en attente » |
+| Révocation à signer | remplaçant déposé, révocation à signer, gateway non révoquée. « Révoquer la gateway », « Jeter la décision en attente » ; sur une gateway révoquée, voir les états « Révoquée » |
 | Révocation à reprendre | révocation en attente, non appliquée. « Reprendre », « Jeter la décision en attente » |
 | Révocation appliquée, reprise à faire | révocation appliquée, remplaçant à installer. « Reprendre », « Jeter la décision en attente » |
 | Révoquée, remplaçant à installer | gateway révoquée, qui attend le remplaçant du registre. « Reprendre », seul |
