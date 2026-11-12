@@ -267,7 +267,9 @@ impl OpenedGatewayRevocation {
 /// replacement is installed only when the gateway awaits it ([`probe_revocation`]).
 ///
 /// Returns [`GatewayRefusal::RevocationToSign`] once the replacement is deposited and the
-/// revocation is still to sign: that step needs a key, and it is taken by a new round.
+/// revocation is still to sign: that step needs a key, and it is taken by a new round. Unless
+/// the gateway already shows the revocation applied with exactly this replacement, which was
+/// revoked by another path: the replacement is then installed with no key.
 pub fn carry_revocation(
     remote: &dyn GatewayIdentityRemote,
     vault_path: &Path,
@@ -289,13 +291,24 @@ pub fn carry_revocation(
         save(&record_path(vault_path), &signed).map_err(internal)?;
     }
 
-    let Some(revocation) = signed.revocation.as_ref() else {
-        return Err(GatewayRefusal::RevocationToSign);
-    };
     // Set once this call has settled the revocation: Astra accepted it, or the gateway's view
     // showed it applied. Otherwise the view is read before the installation below.
     let mut settled = false;
-    if !signed.revocation_applied {
+    if signed.revocation.is_none() {
+        // Not signed here, so nothing can be deposited. The view decides, and the record is kept
+        // as it is unless the gateway awaits exactly the recorded replacement.
+        if !awaits_recorded_replacement(remote, &signed)? {
+            return Err(GatewayRefusal::RevocationToSign);
+        }
+        signed.revocation_applied = true;
+        save(&record_path(vault_path), &signed).map_err(internal)?;
+        settled = true;
+    }
+    if let Some(revocation) = signed
+        .revocation
+        .as_ref()
+        .filter(|_| !signed.revocation_applied)
+    {
         if now >= revocation.expires_at {
             return probe_expired_revocation(remote, vault_path, signed);
         }
@@ -344,6 +357,18 @@ pub fn carry_revocation(
         }
     }
     clear(vault_path).map_err(internal)
+}
+
+/// Whether the gateway's view shows the record's revocation applied, and awaiting exactly the
+/// record's replacement. A record without replacement has nothing to await, and reads no view.
+fn awaits_recorded_replacement(
+    remote: &dyn GatewayIdentityRemote,
+    signed: &SignedGatewayRevocation,
+) -> Result<bool, GatewayRefusal> {
+    if signed.replacement.is_none() {
+        return Ok(false);
+    }
+    Ok(probe_revocation(remote, signed)? == RevocationProbe::AppliedWithThisReplacement)
 }
 
 /// What the gateway's view says of the record's revocation. The one place that compares the

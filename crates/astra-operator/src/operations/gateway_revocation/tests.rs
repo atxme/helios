@@ -465,9 +465,11 @@ fn revocation_with_replacement_applies_revocation_then_transition() {
             "fetch_campaign",
             "renewal_request",
             "candidate_tls",
-            // Deposited before the revocation's campaign is opened.
+            // Deposited before the revocation's campaign is opened, then the view is read before
+            // the revocation is found still to sign.
             "fetch_campaign",
             "submit",
+            "gateway",
             // The revocation's round reads the gateway first, then its deposit, then the installation.
             "gateway",
             "overlap_not_after",
@@ -1119,6 +1121,82 @@ fn a_recorded_replacement_is_deposited_once_and_replayed_without_a_key() {
     );
 }
 
+/// The replacement deposited, the revocation not yet signed: the record a `RevocationToSign`
+/// refusal leaves. Returns the record as the next call reads it.
+fn deposited_replacement_to_sign(remote: &Remote, domain: &Domain) -> SignedGatewayRevocation {
+    let replacement = sign_replacement(remote, domain);
+    carry_revocation(remote, &domain.path, replacement, NOW)
+        .expect_err("the revocation is to sign");
+    pending_revocation(&domain.path, NOW)
+        .expect("read")
+        .expect("the replacement waits")
+}
+
+#[test]
+fn to_sign_record_installs_when_the_gateway_awaits_it() {
+    let scenario = Scenario::new(true);
+    let mut remote = Remote::new(&scenario);
+    let domain = &scenario.domain;
+    let kept = deposited_replacement_to_sign(&remote, domain);
+    let awaited = transition_of_record(&kept)
+        .fingerprint()
+        .expect("fingerprint");
+    // Another path revoked the gateway, and it awaits exactly this replacement.
+    revoked_awaiting(&mut remote, Some(awaited));
+    let submits = remote.count("submit");
+
+    carry_revocation(&remote, &domain.path, kept, NOW).expect("the replacement is installed");
+
+    assert_eq!(remote.installed.borrow().len(), 1, "installed once");
+    assert_eq!(
+        remote.count("submit"),
+        submits,
+        "nothing is deposited again"
+    );
+    assert!(!record_on_disk(domain), "the record is cleared");
+}
+
+#[test]
+fn to_sign_record_stays_to_sign_on_a_serving_gateway() {
+    let scenario = Scenario::new(true);
+    let remote = Remote::new(&scenario);
+    let domain = &scenario.domain;
+    let kept = deposited_replacement_to_sign(&remote, domain);
+    let before = record_bytes(domain);
+
+    let refusal = carry_revocation(&remote, &domain.path, kept, NOW)
+        .expect_err("the gateway serves: the revocation is still to sign");
+
+    assert_eq!(refusal, GatewayRefusal::RevocationToSign);
+    assert!(!remote.called("install"), "nothing is installed");
+    assert_eq!(
+        record_bytes(domain),
+        before,
+        "the record is unchanged, byte for byte"
+    );
+}
+
+#[test]
+fn to_sign_record_unreachable_view_is_untouched() {
+    let scenario = Scenario::new(true);
+    let remote = Remote::new(&scenario);
+    let domain = &scenario.domain;
+    let kept = deposited_replacement_to_sign(&remote, domain);
+    let before = record_bytes(domain);
+    remote.gateway_unreachable.set(true);
+
+    let refusal =
+        carry_revocation(&remote, &domain.path, kept, NOW).expect_err("the gateway cannot be read");
+
+    assert_eq!(refusal, GatewayRefusal::Unreachable);
+    assert!(!remote.called("install"), "nothing is installed");
+    assert_eq!(
+        record_bytes(domain),
+        before,
+        "the record is unchanged, byte for byte"
+    );
+}
+
 #[test]
 fn an_expired_replacement_campaign_discards_the_record() {
     let scenario = Scenario::new(true);
@@ -1570,6 +1648,19 @@ fn force_discard_refuses_a_revocation_the_gateway_does_not_show() {
         GatewayRefusal::NotForceDiscardable(STILL_POSSIBLE.into())
     );
     assert!(record_on_disk(domain), "the record stays");
+}
+
+#[test]
+fn force_discard_discards_a_to_sign_record_the_gateway_does_not_await() {
+    let scenario = Scenario::new(true);
+    let mut remote = Remote::new(&scenario);
+    let domain = &scenario.domain;
+    deposited_replacement_to_sign(&remote, domain);
+    revoked_awaiting(&mut remote, Some(another_replacement()));
+
+    force_discard_pending_revocation(&remote, &domain.path).expect("discarded");
+
+    assert!(!record_on_disk(domain));
 }
 
 #[test]
