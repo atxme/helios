@@ -210,7 +210,7 @@ describe('gatewayRow', () => {
       NOW,
     )
     expect(row.state).toBe('Révoquée, remplaçant à installer')
-    expect(row.detail).toBe("Le remplaçant nommé par la révocation n'est pas sur ce poste.")
+    expect(row.detail).toBeNull()
     expect(row.actions).toEqual(['resume'])
     expect(row.forceKind).toBeNull()
   })
@@ -287,5 +287,30 @@ describe('gatewayRow', () => {
       const row = gatewayRow(o, NOW)
       for (const action of forbidden) expect(row.actions).not.toContain(action)
     }
+  })
+  it('revoked_with_an_unapplied_revocation_record_keeps_its_6b_state_and_actions', () => {
+    const unappliedToResume = gatewayRow(
+      withGateway(
+        { gateway_revoked: true },
+        { gatewayPending: revocation({ revocation_applied: false, revocation_to_sign: false }) },
+      ),
+      NOW,
+    )
+    expect(unappliedToResume.state).toBe('Révocation à reprendre')
+    expect(unappliedToResume.actions).toEqual(['resume', 'discard'])
+    expect(unappliedToResume.detail).toBeNull()
+    expect(unappliedToResume.forceKind).toBeNull()
+
+    const toSign = gatewayRow(
+      withGateway(
+        { gateway_revoked: true },
+        { gatewayPending: revocation({ revocation_applied: false, revocation_to_sign: true }) },
+      ),
+      NOW,
+    )
+    expect(toSign.state).toBe('Révocation à signer')
+    expect(toSign.actions).toEqual(['revoke', 'discard'])
+    expect(toSign.detail).toBe("Le remplaçant est déposé ; la révocation reste à signer. Rien n'a été révoqué.")
+    expect(toSign.forceKind).toBeNull()
   })
 })

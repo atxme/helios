@@ -72,7 +72,10 @@ export function gatewayRow(o: RotationsOverview, local: number): GatewayRow {
   const restartMotif = domain?.gateway_restart_due ?? null
 
   // A revoked gateway takes no renewal, rollback or revocation: only the record's way out.
-  if (domain?.gateway_revoked) {
+  // An unapplied revocation record is the exception: its answer may have been lost, and
+  // « Reprendre » settles it through the probe, so it keeps the 6b state below.
+  const unappliedRevocation = waiting?.kind === 'revocation' && !waiting.revocation_applied
+  if (domain?.gateway_revoked && !unappliedRevocation) {
     const awaited = domain.gateway_awaited_replacement
     const base = { due: true, restart, restartMotif, renewReason: null, replacementReason: null }
     if (awaited !== null && waiting?.replacement_fingerprint === awaited) {
@@ -80,7 +83,7 @@ export function gatewayRow(o: RotationsOverview, local: number): GatewayRow {
         ...base,
         state: 'Révoquée, remplaçant à installer',
         actions: ['resume'],
-        detail: REPLACEMENT_NOT_HERE,
+        detail: null,
         forceKind: null,
       }
     }
