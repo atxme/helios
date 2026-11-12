@@ -25,6 +25,7 @@ import type { GatewayAction } from './gatewayRows'
 import { allGreen, prerequisites } from './rotationRows'
 
 const TERMS_DAYS_MAX = 3650
+const TERMS_RANGE = `De 1 à ${TERMS_DAYS_MAX} jours.`
 const HOURS_MAX = 168
 const REASON_MAX_CHARS = 200
 const ROLLBACK_HOURS_DEFAULT = '24'
@@ -209,6 +210,7 @@ export function GatewayIdentityBlock({
       disabled={busy}
       fullWidth
       sx={{ mb: 1 }}
+      helperText={TERMS_RANGE}
       slotProps={{ htmlInput: { inputMode: 'numeric' } }}
     />
   )

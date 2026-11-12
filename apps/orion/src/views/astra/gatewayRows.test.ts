@@ -313,4 +313,27 @@ describe('gatewayRow', () => {
     expect(toSign.detail).toBe("Le remplaçant est déposé ; la révocation reste à signer. Rien n'a été révoqué.")
     expect(toSign.forceKind).toBeNull()
   })
+  it('forced_discard_leaves_an_installed_transition_before_activation_with_abort', () => {
+    // No record any more, the transition is still staged on the gateway, before its activation.
+    const row = gatewayRow(
+      withGateway({ gateway_transition_pending: true, gateway_activation_at: NOW + 7 * DAY }),
+      NOW,
+    )
+    expect(row.state).toBe('Installée, publication à faire')
+    expect(row.actions).toEqual(['abort'])
+    expect(row.replacementReason).toBeNull()
+  })
+
+  it('forced_discard_unblocks_a_revoke_without_replacement_after_activation', () => {
+    // No record any more, the transition is staged and its activation reached: the revocation clears it.
+    const row = gatewayRow(
+      withGateway({ gateway_transition_pending: true, gateway_activation_at: NOW - DAY }),
+      NOW,
+    )
+    expect(row.state).toBe('Installée, publication à faire')
+    expect(row.actions).toEqual(['revoke'])
+    expect(row.replacementReason).toBe(
+      "Une transition est en cours : le remplaçant n'est possible qu'après sa fin.",
+    )
+  })
 })

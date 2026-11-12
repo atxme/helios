@@ -387,4 +387,9 @@ describe('GatewayIdentityBlock', () => {
     fireEvent.click(confirmation().getByRole('button', { name: 'Abandonner la décision' }))
     await waitFor(() => expect(api.beginGatewayCeremony).toHaveBeenCalledWith({ gesture: 'force_discard' }))
   })
+  it('renew_shows_the_range_under_each_term', () => {
+    renderBlock(withDomain())
+    openRenew()
+    expect(screen.getAllByText('De 1 à 3650 jours.')).toHaveLength(3)
+  })
 })

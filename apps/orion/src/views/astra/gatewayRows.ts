@@ -156,6 +156,12 @@ export function gatewayRow(o: RotationsOverview, local: number): GatewayRow {
         waiting.decision_kind === 'renewal' &&
         waiting.installed &&
         waiting.publication_refused
+      // Once activated, heliosd refuses the staged transition: a forced discard of the record
+      // leaves it on the gateway, and a revocation without replacement is what clears it.
+      if (!waiting && !abortable) {
+        actions = ['revoke']
+        replacementReason = REPLACEMENT_IN_TRANSITION
+      }
       if (refused) {
         if (abortable) {
           if (activation !== null) {
