@@ -1377,10 +1377,11 @@ pub fn force_discard_pending(
         && decision.installed
         && !decision.published
         && decision.publication_refused.is_some();
-    if view.gateway_revoked || (refused_by_astra && gateway_past_activation(&view) == Some(true)) {
+    let past_activation = gateway_past_activation(&view);
+    if view.gateway_revoked || (refused_by_astra && past_activation == Some(true)) {
         return clear(vault_path).map_err(internal);
     }
-    let sentence = if refused_by_astra && gateway_past_activation(&view) == Some(false) {
+    let sentence = if refused_by_astra && past_activation == Some(false) {
         FORCE_CANCEL_FIRST
     } else {
         FORCE_STILL_POSSIBLE
