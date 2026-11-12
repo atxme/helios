@@ -23,7 +23,7 @@ Quatre choses tournent sans qu'un opérateur intervienne, et c'est voulu :
 
 Tout le reste ci-dessous est une action délibérée.
 
-## Le chemin par défaut : Orion (F14, lots 5b et 6b)
+## Le chemin par défaut : Orion (F14, lots 5b, 6b et 6c)
 
 Depuis le lot 5b, les rotations se font **depuis Orion**, sur un poste
 administrateur du tunnel : onglet *Astra* › *Rotations*, une liste d'actions
@@ -39,6 +39,10 @@ document (`astra-signer sign-gateway-transition`, `sign-gateway-rollback`,
 `revoke --scope gateway`, `astra gateway-identity …`) restent le recours jusqu'au
 lot 7. « Tout renouveler » n'est pas encore dans Orion (§10).
 
+Depuis le lot 6c, les durées de l'identité gateway se règlent dans Orion, une gateway
+révoquée s'affiche comme telle, et les impasses de la gateway se jettent par « Abandonner
+la décision » (§7.1, §8).
+
 | Ligne | Ce qu'elle fait | Section |
 | --- | --- | --- |
 | Terminer la rotation CA TLS | remplace `promote-ca-tls` ; visible dès `not_after` | §9 |
@@ -48,7 +52,7 @@ lot 7. « Tout renouveler » n'est pas encore dans Orion (§10).
 | Remplacer la CA TLS | idem pour la CA TLS | §9 |
 | Renouveler la délégation | délégation de l'émetteur, sans fichier ni redémarrage | §4 |
 | Révoquer un poste | onglet *Postes* : coupe le poste tout de suite, puis signe la révocation (lot 5c) | §7 |
-| Identité de la gateway | bloc en tête de *Rotations* : renouvelle, annule, revient à l'ancienne identité, révoque la gateway ; reprend ou jette une décision en attente (lot 6b) | §7.1, §8, §8.1 |
+| Identité de la gateway | bloc en tête de *Rotations* : renouvelle, annule, revient à l'ancienne identité, révoque la gateway ; reprend ou jette une décision en attente, et abandonne les impasses (lots 6b et 6c) | §7.1, §8, §8.1 |
 
 Orion vérifie des **prérequis** avant toute ouverture (tunnel, administrateur,
 service Astra, coffre, deux clés, copie du coffre, domaine concordant) et dit
@@ -627,6 +631,11 @@ le remplaçant : « Avec remplaçant » (par défaut) ou « Sans remplaçant ».
 
 **Reprise.**
 
+- **Gateway révoquée.** La ligne affiche « Révoquée » (table des états, §8). Une gateway
+  révoquée n'offre ni « Renouveler », ni « Annuler », ni « Revenir à l'ancienne identité »,
+  ni « Révoquer la gateway » ; la gateway les refuse aussi (`Revoked`, `AlreadyRevoked`).
+  Le remplaçant nommé s'installe par « Reprendre ». Une fois installé, la gateway n'est plus
+  révoquée, et la ligne revient à ses états ordinaires.
 - Un remplaçant déposé dont la révocation n'est pas encore signée : Orion affiche
   « Révocation à signer » avec « Révoquer la gateway » (et non « Reprendre »), et
   la phrase « Le remplaçant est déposé ; la révocation reste à signer. Rien n'a
@@ -634,12 +643,24 @@ le remplaçant : « Avec remplaçant » (par défaut) ou « Sans remplaçant ».
   « La révocation reste à signer : choisir « Révoquer la gateway ». Rien n'a été
   révoqué. ».
 - **Dépôt de la révocation refusé définitivement par Astra** (réponse HTTP autre
-  que 429, 500 ou 503, par exemple 409) : la révocation est retirée du registre, le
-  remplaçant reste déposé, et l'état devient « Révocation à signer ». « Révoquer la
-  gateway » signe une nouvelle révocation. Sans remplaçant, il ne reste rien et le
-  registre est effacé. Un dépôt sans réponse (429, 500, 503, ou injoignable) garde
-  au contraire la révocation : « Reprendre » la redépose, sans clé, avec les mêmes
-  octets.
+  que 429, 500 ou 503, par exemple 409) : le dépôt a pu être accepté avant que la
+  réponse ne se perde. Orion lit donc d'abord la vue de la gateway, par le tunnel :
+  - révoquée avec le remplaçant du registre : la révocation est appliquée, et la
+    reprise installe ce remplaçant, sans clé ;
+  - révoquée, avec un autre remplaçant attendu ou sans remplaçant attendu : la
+    révocation est appliquée, mais le remplaçant du registre ne s'installera pas. La
+    reprise s'arrête sur l'impasse A (plus bas) : « la gateway est révoquée mais
+    n'attend pas ce remplaçant : il ne s'installera pas. « Abandonner la décision »
+    retire le registre ; le domaine devra être reconstruit. » ;
+  - révoquée, sans remplaçant dans le registre : la révocation est appliquée, et le
+    registre est effacé ;
+  - non révoquée : la révocation est retirée, le remplaçant reste déposé, et l'état
+    devient « Révocation à signer ». « Révoquer la gateway » signe une nouvelle
+    révocation. Sans remplaçant, il ne reste rien et le registre est effacé ;
+  - vue injoignable : le registre est gardé tel quel, pour une nouvelle reprise.
+
+  Un dépôt sans réponse (429, 500, 503, ou injoignable) garde au contraire la
+  révocation : « Reprendre » la redépose, sans clé, avec les mêmes octets.
 - Une campagne de révocation expirée sans réponse : « Reprendre » tente d'installer
   le remplaçant, sans clé. Accepté, les deux étapes sont faites. Refusé
   définitivement par la gateway, la révocation n'a pas été appliquée : elle est
@@ -662,21 +683,36 @@ le remplaçant : « Avec remplaçant » (par défaut) ou « Sans remplaçant ».
   Une annulation ne publie rien : elle se jette. Un remplaçant seul, déposé ou non,
   se jette, mais le remplaçant déjà déposé chez Astra n'y est pas annulé.
 
-Deux cas sans issue par Orion. Le registre reste en place : il ne se reprend
-pas et ne se jette pas, car jeter ne donnerait à la gateway rien qu'elle accepte.
-Orion continue d'afficher le registre jusqu'à la reconstruction du domaine.
+**Deux impasses, et le jet forcé.** Deux registres ne peuvent plus aboutir par Orion :
+la reprise ne réussit pas, et le jet ordinaire est refusé. Le registre reste donc en
+place jusqu'au jet forcé, « Abandonner la décision », derrière la case « Je confirme
+l'abandon de la décision ». Le jet forcé relit la vue de la gateway par le tunnel, et ne
+retire le registre que si la vue prouve l'impasse. Un poste hors du tunnel ne jette rien,
+ni une gateway injoignable. Un poste relié à une autre gateway que celle du relais du
+domaine est refusé avant tout appel.
 
-- **Remplaçant refusé définitivement** : une gateway révoquée refuse pour de bon le
-  remplaçant qui lui est nommé. La révocation est appliquée, le remplaçant ne
-  s'installe pas (`gateway_revocation.rs:297`, installation du remplaçant dans
-  `carry_revocation`).
-  Ce n'est pas réparable, comme une révocation sans remplaçant : la gateway ne
-  servira plus, et le domaine doit être reconstruit.
-- **Publication refusée définitivement** : une décision de renouvellement installée
-  sur la gateway, dont la publication est refusée pour de bon (`carry`,
-  `gateway_identity.rs`). Le registre reste, installé et non publié : ni reprise qui
-  aboutisse, ni jet. « Annuler » en est l'issue tant que l'activation n'est pas
-  atteinte : l'annulation remplace ce registre.
+- **Impasse A : remplaçant refusé définitivement.** La révocation est appliquée, mais la
+  gateway révoquée n'attend pas ce remplaçant. La reprise refuse avec la phrase de
+  l'impasse A (§7.1, « Reprise »). Ce n'est pas réparable, comme une révocation sans
+  remplaçant : la gateway ne servira plus, et le domaine doit être reconstruit. La
+  confirmation dit : « La révocation est appliquée ; le remplaçant ne sera jamais
+  installé. La gateway ne servira plus et le domaine devra être reconstruit. ».
+- **Impasse B : publication refusée définitivement.** Une décision de renouvellement est
+  installée sur la gateway, et Astra refuse sa publication pour de bon. Le registre garde
+  ce refus. Un refus transitoire, ou une gateway injoignable, ne le change pas. Avant
+  l'activation, l'issue est « Annuler » : la ligne affiche « La publication est refusée :
+  annuler la transition avant le … », sans jet forcé. Après l'activation, « Abandonner la
+  décision » est proposé, avec la confirmation : « La transition reste installée sur la
+  gateway, sans publication. heliosd ne redémarrera plus sur cette identité. Seule une
+  révocation de la gateway sans remplaçant reste possible. ». Le jet retire le registre ;
+  la transition installée reste sur la gateway. Après ce jet, la ligne n'offre plus de geste
+  sur cette transition.
+
+Un jet forcé que la vue ne justifie pas est refusé. La phrase dit ce qui reste possible,
+et finit par « Rien n'a été jeté. » : « la gateway attend ce remplaçant : le reprendre pour
+l'installer. Rien n'a été jeté. » ; « cette décision peut encore aboutir : la reprendre.
+Rien n'a été jeté. » ; avant l'activation, « la transition s'annule encore : choisir
+« Annuler ». Rien n'a été jeté. ».
 
 **Recours en ligne de commande** (jusqu'au lot 7). Les quatre étapes suivantes
 sont celles de la machine à états, en commandes.
@@ -744,7 +780,7 @@ La gateway génère et scelle sa propre clé suivante, puis exporte une demande.
 Aucune clé privée gateway ne quitte jamais la machine qui l'a créée : ce qui
 part est une clé publique et deux preuves.
 
-### Dans Orion (chemin par défaut, lot 6b)
+### Dans Orion (chemin par défaut, lots 6b et 6c)
 
 Onglet *Rotations*, bloc « Identité de la gateway » en tête. Le bouton
 « Renouveler l'identité de la gateway » ouvre deux options, décochées par défaut :
@@ -753,9 +789,12 @@ Onglet *Rotations*, bloc « Identité de la gateway » en tête. Le bouton
 - « La clé de la gateway est perdue », avec « Aucune preuve de continuité.
   Réservé à une clé disparue. » et la case « Je confirme la perte de la clé ».
 
-Les termes sont fixes dans l'IHM : préparation 7 jours, recouvrement 7 jours,
-validité 365 jours. « Continuer » lance la cérémonie. Les prérequis sont ceux de
-*Rotations* : tunnel, administrateur, service Astra, coffre, domaine concordant.
+Les termes se règlent dans trois champs : « Préparation (jours) »,
+« Recouvrement (jours) » et « Validité (jours) », à 7, 7 et 365 jours par défaut.
+Chacun va de 1 à 3650 jours. Une valeur vide, non entière ou hors de ces bornes est
+refusée avant toute clé : « Continuer » affiche alors le champ et la plage, par exemple
+« Préparation : de 1 à 3650 jours ». « Continuer » lance la cérémonie. Les prérequis sont
+ceux de *Rotations* : tunnel, administrateur, service Astra, coffre, domaine concordant.
 
 Déroulé :
 
@@ -772,7 +811,10 @@ Déroulé :
    que la feuille TLS candidate est présente si et seulement si la case est
    cochée. Une différence arrête le geste (« la feuille gateway en service n'est
    pas celle que la campagne fige », « la demande de la gateway ne correspond pas
-   à la campagne », ou « la campagne d'Astra ne nomme pas cette gateway »).
+   à la campagne », ou « la campagne d'Astra ne nomme pas cette gateway »). Si la gateway rend
+   une demande déjà préparée pour l'époque, la cérémonie l'écrit avant les clés : « Demande
+   déjà préparée par la gateway pour cette époque : elle est reprise, sans nouvelle clé. ». La
+   même phrase s'affiche pour une révocation avec remplaçant (§7.1).
 3. **Cérémonie.** Une approbation par clé demandée (« Approuver avec la clé »).
    Le coffre émet la feuille PQ suivante et signe la transition dans le même
    geste. La décision est enregistrée à côté du coffre
@@ -798,7 +840,7 @@ ne demande aucune clé.
 | À faire | une échéance de feuille gateway est à moins de 30 jours. « Renouveler », « Révoquer la gateway » |
 | Échéance le … | la plus proche des deux échéances, au-delà de 30 jours. « Renouveler », « Révoquer la gateway » |
 | Échéance inconnue | aucune échéance lue. « Renouveler », « Révoquer la gateway » |
-| Installée, publication à faire | transition installée, non publiée. « Annuler » tant que l'activation n'est pas atteinte (l'annulation remplace la décision de renouvellement en attente, pour l'époque en attente) ; avec une décision en attente : aussi « Reprendre » et « Jeter la décision en attente » (ce dernier est refusé, voir ci-dessous) |
+| Installée, publication à faire | transition installée, non publiée. « Annuler » tant que l'activation n'est pas atteinte (l'annulation remplace la décision de renouvellement en attente, pour l'époque en attente) ; avec une décision en attente : aussi « Reprendre » et « Jeter la décision en attente » (ce dernier est refusé, voir ci-dessous). Publication refusée pour de bon : avant l'activation, « Annuler » et « Reprendre », avec « La publication est refusée : annuler la transition avant le … » ; après, « Abandonner la décision » et « Reprendre » (§7.1, impasse B) |
 | Décision à reprendre | décision en attente non installée. « Reprendre », « Jeter la décision en attente » |
 | Annulation à reprendre | annulation en attente. « Reprendre », « Jeter la décision en attente » ; jamais une nouvelle annulation |
 | Bascule le … | publiée, avant l'activation. « Révoquer la gateway », sans remplaçant : « Avec remplaçant » est désactivé (§7.1) |
@@ -806,19 +848,27 @@ ne demande aucune clé.
 | Révocation à signer | remplaçant déposé, révocation à signer. « Révoquer la gateway », « Jeter la décision en attente » |
 | Révocation à reprendre | révocation en attente, non appliquée. « Reprendre », « Jeter la décision en attente » |
 | Révocation appliquée, reprise à faire | révocation appliquée, remplaçant à installer. « Reprendre », « Jeter la décision en attente » |
+| Révoquée, remplaçant à installer | gateway révoquée, qui attend le remplaçant du registre. « Reprendre », seul |
+| Révoquée, remplaçant attendu | gateway révoquée, qui attend un autre remplaçant, ou aucun registre. Détail : « Le remplaçant nommé par la révocation n'est pas sur ce poste. ». Sans registre, aucun geste ; avec un registre, l'impasse A : « Abandonner la décision » |
+| Révoquée | gateway révoquée, sans remplaçant attendu. Détail : « La gateway ne sert plus. Le domaine doit être reconstruit. ». Sans registre, aucun geste ; avec un registre, « Abandonner la décision » |
 
 « Jeter la décision en attente » est refusé tant qu'un travail reste à finir. Pour
 une décision installée et non publiée : « la décision est installée sur la gateway
 mais pas encore publiée : la reprendre pour la publier. Rien n'a été jeté. » (§7.1
 pour les révocations).
 
+Sur une gateway révoquée, « Renouveler », « Annuler », « Revenir à l'ancienne identité » et
+« Révoquer la gateway » ne sont jamais proposés. Un registre de révocation non appliqué garde
+son état du lot 6b. La console web porte la même révocation sur sa ligne d'identité :
+« Révoquée », avec « remplaçant attendu » ou « domaine à reconstruire ».
+
 Quand la gateway signale un redémarrage à faire (`gateway_restart_due`), la ligne
 affiche « Redémarrer heliosd sur la gateway. », avec la raison donnée par la
 gateway en « Détail technique : … ». Rien ne redémarre à sa place.
 
-**Limites de cette version.** La réponse « demande reprise » de la gateway n'est
-pas affichée dans Orion. Les termes ne se règlent pas dans l'IHM ; le backend
-d'Orion accepte pourtant des durées de 1 à 3650 jours.
+**Limites de cette version.** Les termes d'une révocation avec remplaçant restent fixes,
+à 7, 7 et 365 jours : c'est un geste d'urgence (§7.1). Une gateway révoquée sans
+remplaçant ne se répare pas dans Orion : le domaine se reconstruit.
 
 ### Recours en ligne de commande (jusqu'au lot 7)
 

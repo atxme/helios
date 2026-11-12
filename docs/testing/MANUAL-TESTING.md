@@ -1291,7 +1291,8 @@ attendu.
 81. **Options et termes.** Prérequis verts. Cocher « La clé de la gateway est perdue ».
     Attendu : « Aucune preuve de continuité. Réservé à une clé disparue. » ; « Continuer »
     reste désactivé tant que « Je confirme la perte de la clé » n'est pas coché. Attendu
-    aussi : « Termes : préparation 7 jours, recouvrement 7 jours, validité 365 jours. ».
+    aussi : les champs « Préparation (jours) », « Recouvrement (jours) » et « Validité
+    (jours) », valant 7, 7 et 365 jours.
     Décocher, sans cliquer « Continuer ».
 82. **Renouvellement complet.** **[cible]** (clés réelles, gateway cible). Options
     décochées, « Continuer ». Attendu : la campagne s'ouvre à ce clic ; le manifeste
@@ -1344,8 +1345,8 @@ attendu.
 93. **Révocation sans remplaçant.** **[cible]** (clés réelles, gateway cible). « Sans
     remplaçant » ; la confirmation « La gateway ne servira plus. Le domaine devra être
     reconstruit. » ; cocher « Je confirme la révocation sans remplaçant », puis « Révoquer
-    la gateway ». Attendu : une série de touches. Le bloc n'affiche pas d'état « Révoquée » :
-    le résultat se lit sur la gateway et dans le journal d'Astra.
+    la gateway ». Attendu : une série de touches. Ensuite, la ligne affiche « Révoquée » avec
+    « La gateway ne sert plus. Le domaine doit être reconstruit. » (étape 107).
 94. **Révocation à signer.** **[cible]** (clés réelles, gateway cible). Fermer Orion après
     le dépôt du remplaçant, avant la seconde série ; rouvrir. Attendu : « Révocation à
     signer » avec « Le remplaçant est déposé ; la révocation reste à signer. Rien n'a été
@@ -1376,6 +1377,90 @@ attendu.
 99. **Pas de « Tout renouveler » dans Orion.** Attendu : aucune ligne « Tout renouveler »
     dans l'onglet ; le plan se joue sur la console d'Astra (`astra chain open`, voir
     RENOUVELLEMENT-CERTIFICATS.md, §10).
+
+**J. Lot 6c : suivis de l'identité de la gateway**
+
+Les tests Rust et Vitest couvrent la logique (`apps/orion/src/views/astra/gatewayRows.test.ts`,
+`GatewayIdentityBlock.test.tsx`, `OperatorCeremony.reuse.test.tsx`,
+`apps/orion/src-tauri/src/operator/ceremony/gateway/tests.rs`,
+`crates/astra-operator/src/operations/gateway_revocation/tests.rs`,
+`crates/astra-operator/src/operations/gateway_identity/tests.rs`). Les étapes marquées
+**[cible]** demandent de vraies clés, une gateway cible ou un refus réel d'Astra. Les
+autres se jouent sans clé, avec le tunnel monté vers une gateway et Astra en marche. Mêmes
+prérequis que la section I. Chaque étape : action, puis état attendu.
+
+100. **Durées réglables, valeurs par défaut.** Ouvrir « Renouveler l'identité de la gateway ».
+    Attendu : trois champs, « Préparation (jours) » à 7, « Recouvrement (jours) » à 7 et
+    « Validité (jours) » à 365. Aucune clé n'est demandée.
+101. **Durées hors bornes.** Mettre 0 dans « Préparation (jours) », puis « Continuer ».
+    Attendu : « Préparation : de 1 à 3650 jours » ; aucune campagne ouverte (le journal
+    d'Astra n'a rien de nouveau). Essayer aussi 3651 dans « Validité (jours) » et 7,5 dans
+    « Recouvrement (jours) » : même message, avec son nom de champ. Remettre 7, 7 et 365.
+102. **Durées réglées.** **[cible]** (clés réelles, gateway cible). Préparation 2,
+    recouvrement 10, validité 30 ; « Continuer », un toucher par clé. Attendu : la ligne
+    affiche « Bascule le JJ/MM/AAAA », à deux jours de la signature ; la fin du recouvrement
+    tombe dix jours après l'activation.
+103. **Demande reprise.** **[cible]** (gateway cible). Ouvrir un renouvellement avec des
+    options données, puis l'annuler avant la première clé. Ouvrir à nouveau avec les mêmes
+    options. Attendu : « Demande déjà préparée par la gateway pour cette époque : elle est
+    reprise, sans nouvelle clé. », avant toute demande de clé.
+104. **Demande reprise sur une révocation avec remplaçant.** **[cible]** (gateway cible).
+    Même essai avec « Révoquer la gateway », motif, « Avec remplaçant », annulé avant la
+    première clé puis relancé. Attendu : la même phrase, avant la première clé de la série du
+    remplaçant.
+105. **Gateway révoquée, remplaçant à installer.** **[cible]** (clés réelles, gateway cible).
+    Fermer Orion après que la révocation a été acceptée par Astra, avant l'installation du
+    remplaçant ; rouvrir. Attendu : « Révoquée, remplaçant à installer » ; seul « Reprendre »
+    est proposé. « Reprendre » installe le remplaçant sans clé ; la ligne n'affiche plus
+    « Révoquée ».
+106. **Gateway révoquée, remplaçant attendu.** **[cible]** (gateway révoquée sans remplaçant
+    dans le registre, par exemple une révocation faite en ligne de commande avec un
+    remplaçant). Attendu : « Révoquée, remplaçant attendu » avec « Le remplaçant nommé par
+    la révocation n'est pas sur ce poste. » ; aucun bouton « Renouveler », « Annuler »,
+    « Revenir à l'ancienne identité » ni « Révoquer la gateway ». Sur la console web,
+    « Révoquée » avec « remplaçant attendu ».
+107. **Gateway révoquée, sans remplaçant.** **[cible]** (gateway cible, après l'étape 93).
+    Attendu : « Révoquée » avec « La gateway ne sert plus. Le domaine doit être
+    reconstruit. », sans bouton. Sur la console web (*Sécurité → Certificats*) : « Révoquée »
+    avec « domaine à reconstruire ».
+108. **Impasse A : abandon du registre.** **[cible]** (gateway révoquée avec un remplaçant
+    différent de celui du registre, par exemple après une révocation faite en ligne de
+    commande ; gateway cible). Attendu : la ligne affiche « Révoquée, remplaçant attendu »
+    avec « Abandonner la décision ». Ouvrir ce geste : sans case cochée, le bouton est
+    désactivé ; la confirmation dit « La révocation est appliquée ; le remplaçant ne sera
+    jamais installé. La gateway ne servira plus et le domaine devra être reconstruit. ».
+    Cocher « Je confirme l'abandon de la décision », puis confirmer. Attendu : le registre
+    disparaît ; la ligne reste « Révoquée, remplaçant attendu », sans bouton.
+109. **Impasse A : pas de « Reprendre ».** **[cible]** (même gateway qu'à l'étape 108, avant
+    l'abandon). Attendu : la ligne ne propose que « Abandonner la décision ». La reprise, si
+    elle est appelée par le tunnel, refuse avec « la gateway est révoquée mais n'attend pas ce
+    remplaçant : il ne s'installera pas. « Abandonner la décision » retire le registre ; le
+    domaine devra être reconstruit. » et le registre est conservé.
+110. **Impasse B avant activation.** **[cible]** (Astra refusant la publication, gateway
+    cible, avant `activation_at`). Attendu : la ligne affiche « Installée, publication à
+    faire » et « La publication est refusée : annuler la transition avant le JJ/MM/AAAA. » ;
+    boutons « Annuler » et « Reprendre », sans « Abandonner la décision ».
+111. **Impasse B après activation.** **[cible]** (Astra refusant la publication, gateway dont
+    l'horloge a atteint `activation_at`). Attendu : « Abandonner la décision » et « Reprendre »,
+    sans « Annuler » ;
+    la confirmation dit « La transition reste installée sur la gateway, sans publication.
+    heliosd ne redémarrera plus sur cette identité. Seule une révocation de la gateway sans
+    remplaçant reste possible. ». Cocher la case, confirmer. Attendu : le registre disparaît,
+    et la ligne n'offre plus de geste sur cette transition. Constat à traiter avant la recette :
+    la conception (§5.4) prévoit « Révoquer la gateway » sans remplaçant à ce stade, et l'IHM
+    ne le propose pas.
+112. **Sonde sur refus tardif d'une révocation.** **[cible]** (Astra et gateway cibles ; une
+    réponse de dépôt perdue, puis un refus d'Astra au second dépôt, 403 ou 409). « Reprendre ».
+    Attendu, selon la vue de la gateway :
+    - révoquée avec le remplaçant du registre : le remplaçant s'installe, sans clé ;
+    - révoquée avec un autre remplaçant : la ligne passe à l'impasse A, avec « Abandonner la
+      décision » (étape 108) ;
+    - non révoquée : la ligne repasse « Révocation à signer » ;
+    - gateway injoignable : le registre est gardé, la ligne ne change pas.
+113. **Jet ordinaire inchangé.** Sur une décision installée et non publiée (étape 97),
+    « Jeter la décision en attente » reste refusé avec « Rien n'a été jeté. ». « Abandonner la
+    décision » n'apparaît que sur une gateway révoquée avec un registre (étapes 106 et 108) et
+    dans l'impasse B (étapes 110-111).
 
 ### Le chemin manuel
 
