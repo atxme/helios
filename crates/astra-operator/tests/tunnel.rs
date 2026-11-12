@@ -900,10 +900,6 @@ fn the_gateway_clock_is_read_and_its_absence_tolerated() {
     assert_eq!(read.now_unix, None);
 }
 
-/// The identity read is tolerant: a gateway older than the leaf expiries
-/// answers without them, and the anchors it always answered still read.
-/// A gateway older than the revocation field names no revocation, and the
-/// read goes through.
 #[test]
 fn an_older_gateway_reads_as_not_revoked() {
     let older = serde_json::json!({ "ca_pq_fingerprint": fingerprint_hex(b"courante") });
@@ -934,6 +930,10 @@ fn a_revoked_view_reads_its_awaited_replacement() {
     assert_eq!(read.gateway_awaited_replacement, Some(replacement));
 }
 
+/// The identity read is tolerant: a gateway older than the leaf expiries
+/// answers without them, and the anchors it always answered still read.
+/// A gateway older than the revocation field names no revocation, and the
+/// read goes through.
 #[test]
 fn the_gateway_identity_read_names_the_leaf_expiries_and_tolerates_their_absence() {
     let newer = serde_json::json!({
