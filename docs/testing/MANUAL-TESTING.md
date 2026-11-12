@@ -1391,7 +1391,8 @@ prérequis que la section I. Chaque étape : action, puis état attendu.
 
 100. **Durées réglables, valeurs par défaut.** Ouvrir « Renouveler l'identité de la gateway ».
     Attendu : trois champs, « Préparation (jours) » à 7, « Recouvrement (jours) » à 7 et
-    « Validité (jours) » à 365. Aucune clé n'est demandée.
+    « Validité (jours) » à 365, avec « De 1 à 3650 jours. » sous chaque champ. Aucune clé n'est
+    demandée.
 101. **Durées hors bornes.** Mettre 0 dans « Préparation (jours) », puis « Continuer ».
     Attendu : « Préparation : de 1 à 3650 jours » ; aucune campagne ouverte (le journal
     d'Astra n'a rien de nouveau). Essayer aussi 3651 dans « Validité (jours) » et 7,5 dans
@@ -1446,9 +1447,9 @@ prérequis que la section I. Chaque étape : action, puis état attendu.
     la confirmation dit « La transition reste installée sur la gateway, sans publication.
     heliosd ne redémarrera plus sur cette identité. Seule une révocation de la gateway sans
     remplaçant reste possible. ». Cocher la case, confirmer. Attendu : le registre disparaît,
-    et la ligne n'offre plus de geste sur cette transition. Constat à traiter avant la recette :
-    la conception (§5.4) prévoit « Révoquer la gateway » sans remplaçant à ce stade, et l'IHM
-    ne le propose pas.
+    et la ligne propose « Révoquer la gateway », sans remplaçant seulement : « Avec remplaçant »
+    est désactivé, avec « Une transition est en cours : le remplaçant n'est possible qu'après sa
+    fin. ». Cette révocation retire la transition installée (étape 93).
 112. **Sonde sur refus tardif d'une révocation.** **[cible]** (Astra et gateway cibles ; une
     réponse de dépôt perdue, puis un refus d'Astra au second dépôt, 403 ou 409). « Reprendre ».
     Attendu, selon la vue de la gateway :

@@ -705,8 +705,9 @@ domaine est refusé avant tout appel.
   décision » est proposé, avec la confirmation : « La transition reste installée sur la
   gateway, sans publication. heliosd ne redémarrera plus sur cette identité. Seule une
   révocation de la gateway sans remplaçant reste possible. ». Le jet retire le registre ;
-  la transition installée reste sur la gateway. Après ce jet, la ligne n'offre plus de geste
-  sur cette transition.
+  la transition installée reste sur la gateway. Après ce jet, la ligne ne propose plus que
+  « Révoquer la gateway », sans remplaçant : « Avec remplaçant » est désactivé, avec « Une
+  transition est en cours : le remplaçant n'est possible qu'après sa fin. ».
 
 Un jet forcé que la vue ne justifie pas est refusé. La phrase dit ce qui reste possible,
 et finit par « Rien n'a été jeté. » : « la gateway attend ce remplaçant : le reprendre pour
@@ -791,7 +792,8 @@ Onglet *Rotations*, bloc « Identité de la gateway » en tête. Le bouton
 
 Les termes se règlent dans trois champs : « Préparation (jours) »,
 « Recouvrement (jours) » et « Validité (jours) », à 7, 7 et 365 jours par défaut.
-Chacun va de 1 à 3650 jours. Une valeur vide, non entière ou hors de ces bornes est
+Chacun va de 1 à 3650 jours, et le champ l'affiche sous lui : « De 1 à 3650 jours. ». Une
+valeur vide, non entière ou hors de ces bornes est
 refusée avant toute clé : « Continuer » affiche alors le champ et la plage, par exemple
 « Préparation : de 1 à 3650 jours ». « Continuer » lance la cérémonie. Les prérequis sont
 ceux de *Rotations* : tunnel, administrateur, service Astra, coffre, domaine concordant.
@@ -840,7 +842,7 @@ ne demande aucune clé.
 | À faire | une échéance de feuille gateway est à moins de 30 jours. « Renouveler », « Révoquer la gateway » |
 | Échéance le … | la plus proche des deux échéances, au-delà de 30 jours. « Renouveler », « Révoquer la gateway » |
 | Échéance inconnue | aucune échéance lue. « Renouveler », « Révoquer la gateway » |
-| Installée, publication à faire | transition installée, non publiée. « Annuler » tant que l'activation n'est pas atteinte (l'annulation remplace la décision de renouvellement en attente, pour l'époque en attente) ; avec une décision en attente : aussi « Reprendre » et « Jeter la décision en attente » (ce dernier est refusé, voir ci-dessous). Publication refusée pour de bon : avant l'activation, « Annuler » et « Reprendre », avec « La publication est refusée : annuler la transition avant le … » ; après, « Abandonner la décision » et « Reprendre » (§7.1, impasse B) |
+| Installée, publication à faire | transition installée, non publiée. « Annuler » tant que l'activation n'est pas atteinte (l'annulation remplace la décision de renouvellement en attente, pour l'époque en attente) ; avec une décision en attente : aussi « Reprendre » et « Jeter la décision en attente » (ce dernier est refusé, voir ci-dessous). Publication refusée pour de bon : avant l'activation, « Annuler » et « Reprendre », avec « La publication est refusée : annuler la transition avant le … » ; après, « Abandonner la décision » et « Reprendre » (§7.1, impasse B). Sans registre, après l'activation (transition laissée par un jet forcé) : « Révoquer la gateway », sans remplaçant seulement |
 | Décision à reprendre | décision en attente non installée. « Reprendre », « Jeter la décision en attente » |
 | Annulation à reprendre | annulation en attente. « Reprendre », « Jeter la décision en attente » ; jamais une nouvelle annulation |
 | Bascule le … | publiée, avant l'activation. « Révoquer la gateway », sans remplaçant : « Avec remplaçant » est désactivé (§7.1) |
