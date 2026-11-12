@@ -300,18 +300,35 @@ describe('gatewayRow', () => {
     expect(unappliedToResume.actions).toEqual(['resume', 'discard'])
     expect(unappliedToResume.detail).toBeNull()
     expect(unappliedToResume.forceKind).toBeNull()
+  })
 
-    const toSign = gatewayRow(
+  it('revoked_to_sign_record_awaiting_this_replacement_offers_resume_only', () => {
+    // Another path revoked the gateway with this replacement: the record installs it, no key.
+    const row = gatewayRow(
       withGateway(
-        { gateway_revoked: true },
-        { gatewayPending: revocation({ revocation_applied: false, revocation_to_sign: true }) },
+        { gateway_revoked: true, gateway_awaited_replacement: FP },
+        { gatewayPending: revocation({ revocation_applied: false, revocation_to_sign: true, replacement_fingerprint: FP }) },
       ),
       NOW,
     )
-    expect(toSign.state).toBe('Révocation à signer')
-    expect(toSign.actions).toEqual(['revoke', 'discard'])
-    expect(toSign.detail).toBe("Le remplaçant est déposé ; la révocation reste à signer. Rien n'a été révoqué.")
-    expect(toSign.forceKind).toBeNull()
+    expect(row.state).toBe('Révoquée, remplaçant à installer')
+    expect(row.actions).toEqual(['resume'])
+    expect(row.detail).toBeNull()
+    expect(row.forceKind).toBeNull()
+  })
+
+  it('revoked_to_sign_record_awaiting_another_replacement_offers_force_discard', () => {
+    const row = gatewayRow(
+      withGateway(
+        { gateway_revoked: true, gateway_awaited_replacement: OTHER_FP },
+        { gatewayPending: revocation({ revocation_applied: false, revocation_to_sign: true, replacement_fingerprint: FP }) },
+      ),
+      NOW,
+    )
+    expect(row.state).toBe('Révoquée, remplaçant attendu')
+    expect(row.detail).toBe("Le remplaçant nommé par la révocation n'est pas sur ce poste.")
+    expect(row.actions).toEqual(['force_discard'])
+    expect(row.forceKind).toBe('replacement')
   })
   it('forced_discard_leaves_an_installed_transition_before_activation_with_abort', () => {
     // No record any more, the transition is still staged on the gateway, before its activation.
