@@ -12,13 +12,14 @@ use aether::certificates::operator_session::{
     AstraManifest, GestureState, OperatorAction, OperatorStatus, Refusal,
 };
 use aether::certificates::status::{CampaignScope, CampaignTarget, CertificateKind};
-use aether::certificates::transport::SigningOperationState;
+use aether::certificates::transport::{SigningOperationState, TrustUpdateObject};
 use aether_fido::authenticator::Authenticator;
 use astra_operator::operations::fixtures::{gateway_key, Domain, TestKey, EXPIRES, NOW};
 use astra_operator::operations::gateway_identity::tests::{
     gateway_read, Remote as RenewalRemote, Scenario, ACTIVE_TLS,
 };
 use astra_operator::operations::gateway_identity::{self, GatewayIdentityRemote, GatewayRefusal};
+use astra_operator::operations::gateway_revocation;
 use astra_operator::operations::gateway_revocation::tests::Remote as RevocationRemote;
 use astra_operator::operations::revocation::RevocationReasonChoice;
 use astra_operator::tunnel::GatewayIdentityRead;
@@ -535,7 +536,7 @@ fn resume_applies_a_signed_revocation_whose_apply_was_lost() {
 }
 
 #[test]
-fn resume_of_a_revocation_to_sign_says_so_before_any_call() {
+fn resume_of_a_revocation_to_sign_reads_the_view_and_says_so() {
     let scenario = Scenario::new(true);
     let remote = RevocationRemote::new(&scenario);
     // The replacement is deposited; the operator cancels before signing the revocation.
@@ -568,12 +569,74 @@ fn resume_of_a_revocation_to_sign_says_so_before_any_call() {
     assert_eq!(ran.last().refusal, Some(Refusal::RevocationToSign));
     assert_eq!(ran.words.as_deref(), Some(REVOCATION_TO_SIGN));
     assert_eq!(
-        remote.calls().len(),
-        calls_before,
-        "nothing is called before the refusal"
+        remote.calls()[calls_before..].to_vec(),
+        vec!["gateway"],
+        "the view is read, and nothing else is called"
     );
     assert_eq!(ran.keys_connected, 0);
     assert!(remote.installed.borrow().is_empty(), "nothing is revoked");
+}
+
+/// The replacement is deposited, and another path revoked the gateway with it: the resume
+/// installs the replacement with no key, and no revocation is signed.
+#[test]
+fn resume_installs_a_replacement_the_gateway_already_awaits() {
+    let scenario = Scenario::new(true);
+    let mut remote = RevocationRemote::new(&scenario);
+    let stopped = drive(
+        &scenario.domain,
+        &remote,
+        gateway_key(),
+        GatewayGesture::Revoke {
+            reason: RevocationReasonChoice::StolenOrLost,
+            with_replacement: true,
+        },
+        "",
+        Answer::CancelSecondRound,
+        NOW,
+    );
+    assert_eq!(stopped.outcome, Ok(()));
+    let record = gateway_revocation::pending_revocation(&scenario.domain.path, NOW)
+        .expect("read")
+        .expect("the replacement waits");
+    let awaited = match record
+        .replacement
+        .as_ref()
+        .expect("replacement")
+        .result
+        .objects
+        .first()
+    {
+        Some(TrustUpdateObject::GatewayIdentityTransition(transition)) => {
+            transition.fingerprint().expect("fingerprint")
+        }
+        _ => panic!("the replacement is a transition"),
+    };
+    remote.gateway.gateway_revoked = true;
+    remote.gateway.gateway_awaited_replacement = Some(awaited);
+
+    let ran = drive(
+        &scenario.domain,
+        &remote,
+        gateway_key(),
+        GatewayGesture::Resume,
+        "",
+        Answer::Keys,
+        NOW,
+    );
+
+    assert_eq!(ran.outcome, Ok(()));
+    assert_eq!(
+        ran.keys_connected, 0,
+        "the replacement is installed with no key"
+    );
+    assert_eq!(remote.installed.borrow().len(), 1, "installed once");
+    assert!(
+        gateway_revocation::pending_revocation(&scenario.domain.path, NOW)
+            .expect("read")
+            .is_none(),
+        "the record is cleared"
+    );
 }
 
 #[test]

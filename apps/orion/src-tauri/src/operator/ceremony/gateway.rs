@@ -660,16 +660,8 @@ impl<'a> GatewayRun<'a> {
         let revocation = gateway_revocation::pending_revocation(self.vault_path, now)
             .map_err(|error| self.unreadable(&error))?;
         if let Some(signed) = revocation {
-            // Only the revocation is left to sign: the approval that signs it is a new gesture,
-            // which takes the reason. Nothing is called before this refusal.
-            if signed.revocation.is_none()
-                && signed
-                    .replacement
-                    .as_ref()
-                    .is_some_and(|replacement| replacement.deposited)
-            {
-                return Err(self.fail(Refusal::RevocationToSign, REVOCATION_TO_SIGN.to_string()));
-            }
+            // The carry decides: it reads the gateway's view once when only the revocation is left
+            // to sign, and refuses with RevocationToSign unless the view shows it applied.
             self.ceremony.operation = OperationKind::RevokeCertificate;
             self.ceremony.gesture = GestureState::Signing;
             self.show();
@@ -684,6 +676,10 @@ impl<'a> GatewayRun<'a> {
                     self.ceremony.remote = RemoteState::Committed;
                     self.done();
                     Ok(())
+                }
+                // The approval that signs the revocation is a new gesture, which takes the reason.
+                Err(GatewayRefusal::RevocationToSign) => {
+                    Err(self.fail(Refusal::RevocationToSign, REVOCATION_TO_SIGN.to_string()))
                 }
                 Err(error) => Err(self.fail_with(&error)),
             };
