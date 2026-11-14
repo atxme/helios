@@ -1280,8 +1280,8 @@ ouvre aussitôt sa campagne. Pour la CA TLS, le panneau de la rotation s'ouvre s
 la ligne, avec ses clés : l'étape n'est prise à Astra qu'à l'approbation, par la
 cérémonie elle-même, une fois les clés validées et les contrôles de la rotation passés
 (un contrôle qui refuse ne coûte donc aucune étape du plan) ; pour l'identité gateway, les durées et « Remplacer aussi
-la feuille TLS » se règlent avant le clic. Un refus d'Astra s'affiche tel quel,
-avec « Relire plus tard ».
+la feuille TLS » se règlent avant le clic. Un refus d'Astra s'affiche tel quel :
+sous la ligne, avec « Relire plus tard » ; pour la CA TLS, sous l'approbation du panneau.
 
 « Rouvrir l'étape » redépose l'étape courante, avec les mêmes contrôles. Astra
 refuse une étape jamais déposée (« l'étape n'a pas été ouverte : continuer le
