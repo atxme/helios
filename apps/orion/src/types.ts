@@ -1065,6 +1065,8 @@ export interface OperatorAuthorityStatus {
   vault_copy_fingerprint: string | null
   /** `null` : Astra ne sert aucun document. Ce n'est pas l'époque 0. */
   credential_registry_epoch: number | null
+  /** Le plan « Tout renouveler » qu'Astra tient ; `null` : aucun plan. Absent d'un Astra plus ancien. */
+  chain?: { steps: CampaignScope[]; current: number; operation_id: string | null } | null
 }
 
 /** Le sous-ensemble de `GET /api/certificates` que l'écran lit. */
@@ -1219,16 +1221,22 @@ export interface PeersOverview {
 /** Les quatre motifs de révocation, en noms de fil (`RevocationReasonChoice`). */
 export type RevocationReasonChoice = 'stolen_or_lost' | 'compromised' | 'no_longer_used' | 'replaced'
 
+/** Les termes d'un renouvellement de l'identité de la gateway, en noms de fil. */
+export interface GatewayRenewTerms {
+  rotate_tls: boolean
+  key_recovery: boolean
+  prepare_days: number
+  overlap_days: number
+  validity_days: number
+}
+
 /** Un geste sur l'identité de la gateway (lot 6b), en noms de fil (`GatewayGesture`). */
 export type GatewayGesture =
-  | {
+  | ({
       gesture: 'renew'
-      rotate_tls: boolean
-      key_recovery: boolean
-      prepare_days: number
-      overlap_days: number
-      validity_days: number
-    }
+      /** Sous le plan « Tout renouveler » : la campagne que le plan tient, et non une nouvelle. */
+      in_chain?: boolean
+    } & GatewayRenewTerms)
   | { gesture: 'abort' }
   | { gesture: 'rollback'; hours: number; reason: string }
   | { gesture: 'revoke'; reason: RevocationReasonChoice; with_replacement: boolean }
@@ -1390,3 +1398,9 @@ export interface OperatorOpened {
   revocation_expiries?: { tls_not_after: number | null; pq_not_after: number | null }
   delegation_request?: string
 }
+
+/**
+ * Ce que rend `operator_chain_next` : la campagne ouverte pour l'étape suivante, ou la fin du
+ * plan. Même forme que `OperatorOpened`, avec l'étiquette `outcome`.
+ */
+export type ChainStepOutcome = ({ outcome: 'opened' } & OperatorOpened) | { outcome: 'finished' }

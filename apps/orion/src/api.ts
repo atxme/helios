@@ -15,6 +15,8 @@ import type {
   RotationsOverview,
   OpenCampaignAction,
   OperatorOpened,
+  ChainStepOutcome,
+  GatewayRenewTerms,
   VaultCopyOutcome,
   OperatorStatus,
   OperatorArtifact,
@@ -415,6 +417,37 @@ export const operatorOpenCampaign = (
   reason: string,
   requestedBy: string,
 ) => invoke<OperatorOpened>('operator_open_campaign', { action, reason, requestedBy })
+
+/**
+ * Démarre « Tout renouveler » à sa première étape. Renvoie la campagne ouverte pour elle ; un
+ * refus (étape bloquée, opération déjà ouverte) revient tel quel.
+ */
+export const operatorChainStart = (reason: string, requestedBy: string) =>
+  invoke<OperatorOpened>('operator_chain_start', { reason, requestedBy })
+
+/**
+ * Ouvre l'étape suivante du plan, une fois celle en cours prise en effet. `expectedStep` est
+ * l'étape que l'écran affiche : une étape déjà passée est refusée.
+ */
+export const operatorChainNext = (expectedStep: number) =>
+  invoke<ChainStepOutcome>('operator_chain_next', { expectedStep })
+
+/** Rouvre l'étape courante du plan, une fois sa campagne close : une nouvelle est déposée. */
+export const operatorChainReopen = (expectedStep: number) =>
+  invoke<OperatorOpened>('operator_chain_reopen', { expectedStep })
+
+/** Abandonne le plan. Ce qui est déjà approuvé garde son effet. */
+export const operatorChainAbandon = () => invoke<void>('operator_chain_abandon')
+
+/** La campagne de l'étape que le plan tient, si Orion en tient une ; `null` sinon. */
+export const operatorChainHeld = () => invoke<OperatorOpened | null>('operator_chain_held')
+
+/**
+ * Vérifie, dans le tunnel, qu'un renouvellement de l'identité de la gateway peut partir avec
+ * ces termes, avant qu'une clé ne soit demandée. Ne renvoie rien en cas de succès.
+ */
+export const operatorGatewayCheckRenewal = (terms: GatewayRenewTerms) =>
+  invoke<void>('operator_gateway_check_renewal', { terms })
 
 /**
  * Adjusts the window to the displayed view.
