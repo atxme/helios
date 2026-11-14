@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest'
 import type { OperatorOpened, OperatorPendingOperation, RotationsOverview } from '../../types'
 import { chainRow, stepBlocker, type ChainRowInput } from './chainRow'
 import { DAY, NOW, authorityRead, domainRead, overview } from './rotationFixtures'
-import { OVERLAP_PQ, formatDateTime } from './rotationRows'
+import { OVERLAP_PQ, formatDateTime, prerequisites } from './rotationRows'
 
 const STEPS = ['issuer_delegation', 'trust_authorities', 'gateway_identity', 'fleet_leafs'] as const
 
@@ -186,5 +186,13 @@ describe('stepBlocker, the gateway branch', () => {
   it('gateway_step_blocked_by_renew_reason', () => {
     const o = overview({ caPqOverlap: true })
     expect(stepBlocker(o, 'gateway_identity', NOW)).toBe(OVERLAP_PQ)
+  })
+
+  it('gateway_step_blocked_by_the_prerequisites_its_block_requires', () => {
+    const o = overview({ vault: null })
+    expect(stepBlocker(o, 'gateway_identity', NOW)).toBe(
+      prerequisites(o, 'renew_fleet').find((line) => !line.ok)?.label,
+    )
+    expect(stepBlocker(o, 'gateway_identity', NOW)).not.toBeNull()
   })
 })

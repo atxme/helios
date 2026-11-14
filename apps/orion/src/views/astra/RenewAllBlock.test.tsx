@@ -121,6 +121,15 @@ describe('the row without a plan', () => {
     expect(onCeremony).toHaveBeenCalledWith(ceremony({ operation: 'authorize_issuer' }))
   })
 
+  it('start_is_refused_when_the_fresh_read_blocks_any_of_the_four_steps', async () => {
+    const o = withChain(null)
+    const blocked = withChain(null, { pending: { state: 'ok', value: [pendingOp('fleet_leafs')] } })
+    const { refresh } = show(o)
+    refresh.mockResolvedValue(blocked)
+    fireEvent.click(button('Commencer'))
+    await waitFor(() => expect(row().getByText(/Postes est déjà ouverte/)).toBeTruthy())
+    expect(api.operatorChainStart).not.toHaveBeenCalled()
+  })
   it('a_blocked_start_is_disabled_with_its_reason', () => {
     show(withChain(null, { tunnel: false }))
     expect((button('Commencer') as HTMLButtonElement).disabled).toBe(true)
@@ -215,6 +224,25 @@ describe('the steps of a plan', () => {
     await waitFor(() => expect(row().getByText(/Parc autorisé ; chaque poste se renouvelle/)).toBeTruthy())
     expect(row().getByText(/Terminer la rotation CA TLS/)).toBeTruthy()
     expect(api.operatorChainNext).toHaveBeenCalledWith(3)
+  })
+
+  it('finish_is_not_sent_when_the_fresh_read_no_longer_offers_it', async () => {
+    const closed = withChain(chain(3, OP))
+    // The fleet campaign turned out to be open: finishing the plan now would close it unapproved.
+    const live = withChain(chain(3, OP), { pending: { state: 'ok', value: [pendingOp('fleet_leafs')] } })
+    const { refresh } = show(closed)
+    refresh.mockResolvedValue(live)
+    fireEvent.click(button('Terminer le plan'))
+    await waitFor(() => expect(refresh).toHaveBeenCalled())
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(api.operatorChainNext).not.toHaveBeenCalled()
+  })
+
+  it('finish_is_sent_when_the_fresh_read_still_offers_it', async () => {
+    api.operatorChainNext.mockResolvedValue({ outcome: 'finished' })
+    show(withChain(chain(3, OP)))
+    fireEvent.click(button('Terminer le plan'))
+    await waitFor(() => expect(api.operatorChainNext).toHaveBeenCalledWith(3))
   })
 
   it('fleet_done_this_session_offers_continue', () => {

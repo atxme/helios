@@ -36,7 +36,7 @@ export interface ChainRow {
 }
 
 /** The four steps, in the order the chain runs them. */
-const PLAN_STEPS: CampaignScope[] = [
+export const PLAN_STEPS: CampaignScope[] = [
   'issuer_delegation',
   'trust_authorities',
   'gateway_identity',
@@ -85,6 +85,9 @@ export function stepBlocker(o: RotationsOverview, scope: CampaignScope, now: num
     if (!row.actions.includes('renew') || row.renewReason !== null) {
       return row.renewReason ?? row.state
     }
+    // The block the step opens asks the fleet's prerequisites green, whatever the row says.
+    const failing = prerequisites(o, 'renew_fleet').find((line) => !line.ok)
+    if (failing) return failing.label
   } else {
     const action = ROTATION_OF_STEP[scope]
     if (action) {

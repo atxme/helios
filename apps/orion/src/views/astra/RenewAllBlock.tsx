@@ -21,7 +21,7 @@ import type {
 import { GATEWAY_LABELS } from './gatewayRows'
 import { TERMS_DEFAULT, TermsFields, termsError } from './GatewayIdentityBlock'
 import type { TermsDraft } from './GatewayIdentityBlock'
-import { chainRow, stepBlocker } from './chainRow'
+import { PLAN_STEPS, chainRow, stepBlocker } from './chainRow'
 import type { ChainAction } from './chainRow'
 import { liveOperation, prerequisites, rotationRows, valueOf } from './rotationRows'
 import type { CeremonyHandoff, RotationStepContext } from './RotationsPanel'
@@ -195,7 +195,10 @@ export function RenewAllBlock({
   /** « Commencer » : the delegation's controls, then the chain, then the delegation's ceremony. */
   const start = async () => {
     const fresh = await readFresh()
-    const blocker = stepBlocker(fresh, 'issuer_delegation', nowSeconds())
+    // The four steps, as the row read them to offer « Commencer »: a plan started over a step
+    // that cannot run would stop there with the first campaign already spent.
+    const at = nowSeconds()
+    const blocker = PLAN_STEPS.map((scope) => stepBlocker(fresh, scope, at)).find((reason) => reason !== null)
     if (blocker) throw new Error(blocker)
     if (!(await ceremonyFree())) return
     await openedCeremony(await api.operatorChainStart(reason.trim() || DEFAULT_REASON, operatorLabel))
@@ -231,6 +234,12 @@ export function RenewAllBlock({
   const advance = async (action: 'continue' | 'reopen' | 'finish') => {
     const fresh = await readFresh()
     const current = planOf(fresh)
+    // The row offered « Terminer le plan » on an older read: closing a plan whose last campaign
+    // is open would leave it unapproved, so the fresh row decides, and is shown.
+    if (action === 'finish') {
+      const offered = chainRow({ overview: fresh, now: nowSeconds(), held, fleetApprovedThisSession })
+      if (!offered.actions.includes('finish')) return
+    }
     if (!(await ceremonyFree())) return
     const scope = stepOf(current, action)
     if (scope === 'trust_authorities') return // The CA TLS step is led by its own ceremony.
