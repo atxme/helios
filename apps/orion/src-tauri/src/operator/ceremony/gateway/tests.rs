@@ -12,9 +12,9 @@ use aether::certificates::operator_session::{
     AstraManifest, GestureState, OperatorAction, OperatorStatus, Refusal,
 };
 use aether::certificates::status::{CampaignScope, CampaignTarget, CertificateKind};
-use aether::certificates::transport::{SigningOperationState, TrustUpdateObject};
+use aether::certificates::transport::{OperatorOpened, SigningOperationState, TrustUpdateObject};
 use aether_fido::authenticator::Authenticator;
-use astra_operator::operations::fixtures::{gateway_key, Domain, TestKey, EXPIRES, NOW};
+use astra_operator::operations::fixtures::{gateway_key, operation, Domain, TestKey, EXPIRES, NOW};
 use astra_operator::operations::gateway_identity::tests::{
     gateway_read, Remote as RenewalRemote, Scenario, ACTIVE_TLS,
 };
@@ -99,6 +99,7 @@ fn renewal(rotate_tls: bool, key_recovery: bool) -> GatewayGesture {
         prepare_days: 7,
         overlap_days: 7,
         validity_days: 365,
+        in_chain: false,
     }
 }
 
@@ -111,6 +112,30 @@ fn drive(
     requested_by: &str,
     answer: Answer,
     now: u64,
+) -> Ran {
+    drive_under(
+        domain,
+        remote,
+        peer,
+        gesture,
+        requested_by,
+        answer,
+        now,
+        None,
+    )
+}
+
+/// [`drive`], with the chain's held step the gesture may run under.
+#[allow(clippy::too_many_arguments)]
+fn drive_under(
+    domain: &Domain,
+    remote: &dyn GatewayIdentityRemote,
+    peer: WireGuardKey,
+    gesture: GatewayGesture,
+    requested_by: &str,
+    answer: Answer,
+    now: u64,
+    chain: Option<OperatorOpened>,
 ) -> Ran {
     let (sender, received) = channel::<Press>();
     let connected = Cell::new(0_u32);
@@ -157,6 +182,7 @@ fn drive(
             &domain.path,
             requested_by,
             &words,
+            chain,
             &reach,
         )
     };
@@ -1053,4 +1079,131 @@ fn force_discard_refuses_another_domains_gateway() {
     assert!(gateway_identity::pending(&scenario.domain.path, NOW)
         .expect("read")
         .is_some());
+}
+
+/// The campaign the chain opened for the gateway, as the chain's own step holds it.
+fn held_step(remote: &RenewalRemote<'_>, scope: CampaignScope) -> OperatorOpened {
+    OperatorOpened {
+        operation_id: operation(),
+        campaign_id: remote.campaign.campaign_id,
+        campaign_fingerprint: remote.campaign.fingerprint(),
+        scope,
+        target_count: 1,
+        required_credentials: 1,
+        expires_at: EXPIRES,
+        revocation_expiries: None,
+        delegation_request: None,
+        gateway_certificate: Some(remote.served.clone()),
+    }
+}
+
+/// The renewal of the gateway under the chain's own step: the step's campaign is the one
+/// the renewal signs, and no campaign is opened.
+#[test]
+fn renew_in_chain_uses_the_held_campaign() {
+    let scenario = Scenario::new(false);
+    let remote = RenewalRemote::new(&scenario);
+    let held = held_step(&remote, CampaignScope::GatewayIdentity);
+    let gesture = GatewayGesture::Renew {
+        rotate_tls: false,
+        key_recovery: false,
+        prepare_days: 7,
+        overlap_days: 7,
+        validity_days: 365,
+        in_chain: true,
+    };
+
+    let ran = drive_under(
+        &scenario.domain,
+        &remote,
+        gateway_key(),
+        gesture,
+        "",
+        Answer::Keys,
+        NOW,
+        Some(held),
+    );
+
+    assert_eq!(ran.outcome, Ok(()));
+    assert_eq!(ran.last().gesture, GestureState::Done);
+    assert!(
+        !remote.called("open_campaign"),
+        "the chain's campaign is the one signed"
+    );
+    assert!(
+        remote.called("fetch_campaign"),
+        "the held campaign is fetched"
+    );
+    assert!(remote.called("publish"), "the transition is published");
+}
+
+/// A renewal under the chain with no held step is refused before any key, with the sentence
+/// that names what happened.
+#[test]
+fn renew_in_chain_without_a_held_step_is_refused_before_any_key() {
+    let scenario = Scenario::new(false);
+    let remote = RenewalRemote::new(&scenario);
+    let gesture = GatewayGesture::Renew {
+        rotate_tls: false,
+        key_recovery: false,
+        prepare_days: 7,
+        overlap_days: 7,
+        validity_days: 365,
+        in_chain: true,
+    };
+
+    let ran = drive_under(
+        &scenario.domain,
+        &remote,
+        gateway_key(),
+        gesture,
+        "",
+        Answer::Keys,
+        NOW,
+        None,
+    );
+
+    let sentence =
+        "La campagne de l'étape n'est plus connue d'Orion : rouvrir l'étape après son échéance.";
+    assert_eq!(ran.outcome, Err(sentence.to_string()));
+    assert_eq!(ran.words.as_deref(), Some(sentence));
+    assert_eq!(ran.keys_connected, 0, "no key is reached");
+    assert!(!remote.called("open_campaign"), "no campaign is opened");
+}
+
+/// A held step of another scope than the gateway's identity is refused the same way: the
+/// renewal cannot sign a campaign of another family.
+#[test]
+fn renew_in_chain_refuses_a_held_step_of_another_scope() {
+    let scenario = Scenario::new(false);
+    let remote = RenewalRemote::new(&scenario);
+    let held = held_step(&remote, CampaignScope::FleetLeafs);
+    let gesture = GatewayGesture::Renew {
+        rotate_tls: false,
+        key_recovery: false,
+        prepare_days: 7,
+        overlap_days: 7,
+        validity_days: 365,
+        in_chain: true,
+    };
+
+    let ran = drive_under(
+        &scenario.domain,
+        &remote,
+        gateway_key(),
+        gesture,
+        "",
+        Answer::Keys,
+        NOW,
+        Some(held),
+    );
+
+    let sentence =
+        "La campagne de l'étape n'est plus connue d'Orion : rouvrir l'étape après son échéance.";
+    assert_eq!(ran.outcome, Err(sentence.to_string()));
+    assert_eq!(ran.keys_connected, 0, "no key is reached");
+    assert!(
+        !remote.called("fetch_campaign"),
+        "nothing of the campaign is read"
+    );
 }

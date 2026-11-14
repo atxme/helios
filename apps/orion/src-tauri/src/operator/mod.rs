@@ -45,6 +45,7 @@ use aether::certificates::operator_session::{
     GestureState, OperationKind, OperationLocator, OperatorAction, OperatorStatus, Refusal,
     RemoteState,
 };
+use aether::certificates::transport::OperatorOpened;
 use aether_fido::authenticator::DialogOwner;
 use astra_operator::operations::rotation::RotationTerms;
 use ceremony::Press;
@@ -516,6 +517,10 @@ pub enum GatewayGesture {
         overlap_days: u64,
         #[serde(default = "gateway_validity_days")]
         validity_days: u64,
+        /// Runs under the campaign the certificate chain opened for this step, which Orion holds
+        /// in memory. Absent, the renewal opens its own campaign.
+        #[serde(default)]
+        in_chain: bool,
     },
     /// Cancels the transition the gateway holds staged, before its activation.
     Abort,
@@ -547,6 +552,50 @@ fn gateway_validity_days() -> u64 {
     365
 }
 
+/// The terms of a gateway renewal, as the page chooses them before any key is asked for. The
+/// same values a [`GatewayGesture::Renew`] carries, read by the check that runs before a chain
+/// step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayRenewTermsArg {
+    pub rotate_tls: bool,
+    pub key_recovery: bool,
+    pub prepare_days: u64,
+    pub overlap_days: u64,
+    pub validity_days: u64,
+}
+
+impl GatewayRenewTermsArg {
+    /// Refuses durations outside the sanity bound, as the renewal gesture does.
+    pub fn validate(&self) -> Result<(), String> {
+        validate_renew_days(self.prepare_days, self.overlap_days, self.validity_days)
+    }
+
+    /// The renewal's options: what the gesture and the check both hand the gateway identity.
+    pub fn options(&self) -> astra_operator::operations::gateway_identity::RenewalOptions {
+        astra_operator::operations::gateway_identity::RenewalOptions {
+            rotate_tls: self.rotate_tls,
+            key_recovery: self.key_recovery,
+            prepare_days: self.prepare_days,
+            overlap_days: self.overlap_days,
+            validity_days: self.validity_days,
+        }
+    }
+}
+
+/// The renewal's durations, each from 1 to [`MAX_GATEWAY_TERM_DAYS`] days.
+fn validate_renew_days(prepare: u64, overlap: u64, validity: u64) -> Result<(), String> {
+    // A sanity bound on the input, not a policy value.
+    for days in [prepare, overlap, validity] {
+        if !(1..=MAX_GATEWAY_TERM_DAYS).contains(&days) {
+            return Err(format!(
+                "les durées se comptent en jours, de 1 à {MAX_GATEWAY_TERM_DAYS}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl GatewayGesture {
     /// Refuses what no ceremony should be opened for.
     fn validate(&self) -> Result<(), String> {
@@ -556,17 +605,7 @@ impl GatewayGesture {
                 overlap_days,
                 validity_days,
                 ..
-            } => {
-                // A sanity bound on the input, not a policy value.
-                for days in [prepare_days, overlap_days, validity_days] {
-                    if !(1..=MAX_GATEWAY_TERM_DAYS).contains(days) {
-                        return Err(format!(
-                            "les durées se comptent en jours, de 1 à {MAX_GATEWAY_TERM_DAYS}"
-                        ));
-                    }
-                }
-                Ok(())
-            }
+            } => validate_renew_days(*prepare_days, *overlap_days, *validity_days),
             Self::Rollback { hours, reason } => {
                 if !(1..=MAX_ROLLBACK_HOURS).contains(hours) {
                     return Err(format!(
@@ -955,13 +994,15 @@ impl OperatorCeremony {
     ///
     /// A refusal before any key comes back as an error carrying its sentence, which is how the
     /// page shows what the gateway or Astra said. `gateway` is the connected profile's target,
-    /// and `requested_by` the workstation's name, which a rollback's campaign names.
+    /// `requested_by` the workstation's name, which a rollback's campaign names, and `chain` the
+    /// certificate chain's held step, which a renewal under the chain runs under.
     pub async fn begin_gateway(
         &self,
         gesture: GatewayGesture,
         gateway: Option<GatewayTarget>,
         vault_path: PathBuf,
         requested_by: String,
+        chain: Option<OperatorOpened>,
     ) -> Result<OperatorStatus, String> {
         gesture.validate()?;
         let kind = match &gesture {
@@ -1001,6 +1042,7 @@ impl OperatorCeremony {
                         &vault_path,
                         &requested_by,
                         &thread_words,
+                        chain,
                     )
                 },
             )

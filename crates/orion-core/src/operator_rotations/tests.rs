@@ -457,3 +457,76 @@ async fn a_revoked_view_reads_its_awaited_replacement() {
     assert!(read.gateway_revoked);
     assert_eq!(read.gateway_awaited_replacement, Some("cd".repeat(32)));
 }
+
+/// The chain Astra names reads into the screen's shape: its steps by scope name, the step
+/// awaiting its effect and the campaign deposited for it.
+#[test]
+fn authority_status_reads_the_chain() {
+    use aether::certificates::encoding::Id16;
+    use aether::certificates::status::CampaignScope;
+    use aether::certificates::transport::OperatorChainView;
+
+    let operation = Id16::new([7; 16]).expect("id");
+    let mut status = OperatorAuthorityStatus {
+        chain: Some(OperatorChainView {
+            steps: vec![
+                CampaignScope::IssuerDelegation,
+                CampaignScope::GatewayIdentity,
+            ],
+            current: 1,
+            operation_id: Some(operation),
+        }),
+        ca_epoch: 4,
+        ca_fingerprint: Fingerprint::of(b"a"),
+        next_ca_fingerprint: None,
+        ca_tls_epoch: 2,
+        ca_tls_fingerprint: None,
+        next_ca_tls_fingerprint: None,
+        issuer: None,
+        vault_copy_fingerprint: None,
+        credential_registry_epoch: None,
+        revoked_peers: Vec::new(),
+        served_credentials: None,
+    };
+    let read = AuthorityStatusRead::from(status.clone());
+    assert_eq!(
+        read.chain,
+        Some(ChainRead {
+            steps: vec!["issuer_delegation".into(), "gateway_identity".into()],
+            current: 1,
+            operation_id: Some(operation.to_hex()),
+        })
+    );
+
+    // Read back from the wire too: the chain's keys are what Astra sends.
+    let wire = serde_json::to_value(&status).expect("json");
+    let parsed: AuthorityStatusRead = serde_json::from_value(wire).expect("read");
+    assert_eq!(parsed.chain, read.chain);
+
+    status.chain = None;
+    let wire = serde_json::to_value(&status).expect("json");
+    let parsed: AuthorityStatusRead = serde_json::from_value(wire).expect("read");
+    assert_eq!(parsed.chain, None);
+}
+
+/// An Astra older than the chain omits the key: the screen reads no chain, and the shared
+/// read still parses the status.
+#[test]
+fn authority_status_without_chain_reads_none() {
+    let body = serde_json::json!({
+        "ca_epoch": 4,
+        "ca_fingerprint": "ab".repeat(32),
+        "ca_tls_epoch": 2,
+    });
+    let read: AuthorityStatusRead = serde_json::from_value(body).expect("read");
+    assert_eq!(read.chain, None);
+
+    let with_null = serde_json::json!({
+        "ca_epoch": 4,
+        "ca_fingerprint": "ab".repeat(32),
+        "ca_tls_epoch": 2,
+        "chain": null,
+    });
+    let read: AuthorityStatusRead = serde_json::from_value(with_null).expect("read");
+    assert_eq!(read.chain, None);
+}

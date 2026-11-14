@@ -25,6 +25,8 @@ use aether::certificates::operator_session::{
     AstraManifest, GestureState, KeyPurpose, KeySlotLabel, OperationKind, OperationLocator,
     OperatorStatus, Refusal, RemoteState,
 };
+use aether::certificates::status::CampaignScope;
+use aether::certificates::transport::OperatorOpened;
 use aether_fido::authenticator::Authenticator;
 use astra_operator::operations::gateway_identity::{
     self, GatewayDecisionKind, GatewayIdentityRemote, GatewayRefusal, OpenedGatewayAbort,
@@ -63,6 +65,11 @@ pub(crate) const INTERNAL_FAILURE: &str = "Erreur interne d'Orion ; le détail e
 /// log, never to the page.
 const DISCARD_FAILED: &str = "la décision en attente n'a pas pu être jetée : rien n'a été changé";
 
+/// Said when a renewal runs under the chain but no campaign of the gateway's identity is held for
+/// it: the step was never opened in this session, or it was of another family.
+const CHAIN_CAMPAIGN_UNKNOWN: &str =
+    "La campagne de l'étape n'est plus connue d'Orion : rouvrir l'étape après son échéance.";
+
 /// Said when the revocation's replacement is deposited and the revocation is still to sign.
 const REVOCATION_TO_SIGN: &str =
     "La révocation reste à signer : choisir « Révoquer la gateway ». Rien n'a été révoqué.";
@@ -83,6 +90,7 @@ pub fn run_gateway(
     vault_path: &Path,
     requested_by: &str,
     words: &Words,
+    chain: Option<OperatorOpened>,
 ) -> Result<(), String> {
     // Before the first status, which is the ceremony's own: a tunnel that cannot be made is
     // the only failure answered here, before anything the gesture runs.
@@ -117,6 +125,7 @@ pub fn run_gateway(
         vault_path,
         requested_by,
         words,
+        chain,
         &reach,
     )
 }
@@ -140,6 +149,7 @@ fn run_with(
     vault_path: &Path,
     requested_by: &str,
     words: &Words,
+    chain: Option<OperatorOpened>,
     reach: &Reach<'_>,
 ) -> Result<(), String> {
     let mut ceremony = Ceremony::new(
@@ -168,7 +178,7 @@ fn run_with(
         words,
         reach,
     );
-    run.run(gesture)
+    run.run(gesture, chain)
 }
 
 /// Stops before any call: the refusal is published, its sentence stored for the page.
@@ -400,8 +410,13 @@ impl<'a> GatewayRun<'a> {
         }
     }
 
-    /// Runs the gesture. Whatever it ended with, the openings it held are dropped here.
-    fn run(&mut self, gesture: GatewayGesture) -> Result<(), String> {
+    /// Runs the gesture. `chain` is the step the certificate chain holds, read by a renewal
+    /// that runs under it. Whatever the gesture ended with, the openings it held are dropped here.
+    fn run(
+        &mut self,
+        gesture: GatewayGesture,
+        chain: Option<OperatorOpened>,
+    ) -> Result<(), String> {
         let stepped = match gesture {
             GatewayGesture::Renew {
                 rotate_tls,
@@ -409,13 +424,18 @@ impl<'a> GatewayRun<'a> {
                 prepare_days,
                 overlap_days,
                 validity_days,
-            } => self.renew(RenewalOptions {
-                rotate_tls,
-                key_recovery,
-                prepare_days,
-                overlap_days,
-                validity_days,
-            }),
+                in_chain,
+            } => self.renew(
+                RenewalOptions {
+                    rotate_tls,
+                    key_recovery,
+                    prepare_days,
+                    overlap_days,
+                    validity_days,
+                },
+                in_chain,
+                chain,
+            ),
             GatewayGesture::Abort => self.abort(),
             GatewayGesture::Rollback { hours, reason } => self.rollback(hours, reason.trim()),
             GatewayGesture::Revoke {
@@ -500,11 +520,38 @@ impl<'a> GatewayRun<'a> {
         Ok(std::mem::replace(&mut self.held, Held::Nothing))
     }
 
-    fn renew(&mut self, options: RenewalOptions) -> Step<()> {
+    /// Renews the gateway's identity. Under the chain, the campaign is the step's own, held
+    /// since the chain opened it; a step that is not a gateway identity's is refused before any
+    /// key is asked for.
+    fn renew(
+        &mut self,
+        options: RenewalOptions,
+        in_chain: bool,
+        chain: Option<OperatorOpened>,
+    ) -> Step<()> {
         let now = self.now();
-        let opened =
-            gateway_identity::open_renewal(self.reach.remote, self.vault_path, options, now)
-                .map_err(|error| self.fail_with(&error))?;
+        let opened = match (in_chain, chain) {
+            (false, _) => {
+                gateway_identity::open_renewal(self.reach.remote, self.vault_path, options, now)
+                    .map_err(|error| self.fail_with(&error))?
+            }
+            (true, Some(held)) if held.scope == CampaignScope::GatewayIdentity => {
+                gateway_identity::open_renewal_in(
+                    self.reach.remote,
+                    self.vault_path,
+                    held,
+                    options,
+                    now,
+                )
+                .map_err(|error| self.fail_with(&error))?
+            }
+            (true, _) => {
+                return Err(self.fail(
+                    Refusal::ManifestMismatch,
+                    CHAIN_CAMPAIGN_UNKNOWN.to_string(),
+                ))
+            }
+        };
         self.hold(Held::Renewal(Opening::new(opened)), now)?;
         self.approve()?;
         let Held::Renewal(opening) = self.sign_gate()? else {

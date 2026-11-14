@@ -42,7 +42,9 @@ mod rotation;
 mod vault;
 mod wait;
 pub use gateway::run_gateway;
-pub(crate) use gateway::{discard_waiting, force_discard_at, unreadable_record, NO_TUNNEL};
+pub(crate) use gateway::{
+    discard_waiting, force_discard_at, page_sentence, unreadable_record, NO_TUNNEL,
+};
 pub use issuer::run_issuer;
 pub use revocation::run_revocation;
 pub use rotation::run_rotation;

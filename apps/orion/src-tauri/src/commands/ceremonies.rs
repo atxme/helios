@@ -218,10 +218,16 @@ pub(crate) async fn begin_gateway_ceremony(
         crate::operator::GatewayGesture::Rollback { .. } => connected_workstation(&state).await?,
         _ => String::new(),
     };
+    // A renewal under the chain runs under the step the chain holds; the ceremony refuses one that
+    // is not there.
+    let chain = match gesture {
+        crate::operator::GatewayGesture::Renew { in_chain: true, .. } => held_chain(&state),
+        _ => None,
+    };
     let gateway = connected_target(&state).await.ok();
     state
         .operator
-        .begin_gateway(gesture, gateway, vault_path, requested_by)
+        .begin_gateway(gesture, gateway, vault_path, requested_by, chain)
         .await
         .map(|_| ())
 }
@@ -605,6 +611,163 @@ pub(crate) async fn operator_open_campaign(
                 action,
                 &reason,
                 &requested_by,
+            )
+        },
+    )
+    .await
+}
+
+/// The certificate chain's held step, a copy. Read under the lock, which is never held across
+/// a call.
+fn held_chain(state: &AppState) -> Option<aether::certificates::transport::OperatorOpened> {
+    state
+        .chain_opened
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// Starts the certificate chain « Tout renouveler » at its first step: opens that step's
+/// campaign through the tunnel and holds it. The answer is public (identifiers, a fingerprint, the
+/// delegation's public request); nothing is written or logged.
+#[tauri::command]
+pub(crate) async fn operator_chain_start(
+    state: State<'_, AppState>,
+    reason: String,
+    requested_by: String,
+) -> Result<aether::certificates::transport::OperatorOpened, String> {
+    ensure_no_open_ceremony(&state).await?;
+    let vault_path = state.vault_location.path_to_look_at()?;
+    let target = connected_target(&state).await?;
+    let held = state.chain_opened.clone();
+    on_work_stack(
+        "orion-chain-start",
+        "l'ouverture de la chaîne",
+        move || {
+            let tunnel = astra_operator::tunnel::Tunnel::new(&target.address)
+                .map_err(|error| format!("{error:#}"))?;
+            crate::operator::rotations::chain_start_with(
+                &tunnel,
+                &vault_path,
+                &target,
+                &reason,
+                &requested_by,
+                &held,
+            )
+        },
+    )
+    .await
+}
+
+/// Opens the chain's next step, once the step in progress has taken effect. `expected_step` is
+/// the step the page read: Astra refuses a plan that has moved on from it.
+#[tauri::command]
+pub(crate) async fn operator_chain_next(
+    state: State<'_, AppState>,
+    expected_step: usize,
+) -> Result<crate::operator::rotations::ChainStepOutcome, String> {
+    ensure_no_open_ceremony(&state).await?;
+    let vault_path = state.vault_location.path_to_look_at()?;
+    let target = connected_target(&state).await?;
+    let held = state.chain_opened.clone();
+    on_work_stack(
+        "orion-chain-next",
+        "le passage à l'étape suivante",
+        move || {
+            let tunnel = astra_operator::tunnel::Tunnel::new(&target.address)
+                .map_err(|error| format!("{error:#}"))?;
+            crate::operator::rotations::chain_next_with(
+                &tunnel,
+                &vault_path,
+                &target,
+                expected_step,
+                &held,
+            )
+        },
+    )
+    .await
+}
+
+/// Redeposits the chain's current step once its campaign has ended, and holds the campaign it
+/// opens in its place.
+#[tauri::command]
+pub(crate) async fn operator_chain_reopen(
+    state: State<'_, AppState>,
+    expected_step: usize,
+) -> Result<aether::certificates::transport::OperatorOpened, String> {
+    ensure_no_open_ceremony(&state).await?;
+    let vault_path = state.vault_location.path_to_look_at()?;
+    let target = connected_target(&state).await?;
+    let held = state.chain_opened.clone();
+    on_work_stack(
+        "orion-chain-reopen",
+        "la réouverture de l'étape",
+        move || {
+            let tunnel = astra_operator::tunnel::Tunnel::new(&target.address)
+                .map_err(|error| format!("{error:#}"))?;
+            crate::operator::rotations::chain_reopen_with(
+                &tunnel,
+                &vault_path,
+                &target,
+                expected_step,
+                &held,
+            )
+        },
+    )
+    .await
+}
+
+/// Drops the chain's plan. What was approved keeps its effect. Allowed while a ceremony is open:
+/// it is how the operator leaves a plan it cannot finish.
+#[tauri::command]
+pub(crate) async fn operator_chain_abandon(state: State<'_, AppState>) -> Result<(), String> {
+    let vault_path = state.vault_location.path_to_look_at()?;
+    let target = connected_target(&state).await?;
+    let held = state.chain_opened.clone();
+    on_work_stack("orion-chain-abandon", "l'abandon du plan", move || {
+        let tunnel = astra_operator::tunnel::Tunnel::new(&target.address)
+            .map_err(|error| format!("{error:#}"))?;
+        crate::operator::rotations::chain_abandon_with(&tunnel, &vault_path, &target, &held)
+    })
+    .await
+}
+
+/// The campaign of the step the chain holds, if Orion holds one. A copy of what the status shows,
+/// with the same public content as the step's own answer.
+#[tauri::command]
+pub(crate) async fn operator_chain_held(
+    state: State<'_, AppState>,
+) -> Result<Option<aether::certificates::transport::OperatorOpened>, String> {
+    Ok(held_chain(&state))
+}
+
+/// Checks that a gateway renewal on `terms` would open now, through the tunnel to the connected
+/// gateway, before the chain's step is taken. No key, no campaign: a refusal is its sentence.
+#[tauri::command]
+pub(crate) async fn operator_gateway_check_renewal(
+    state: State<'_, AppState>,
+    terms: crate::operator::GatewayRenewTermsArg,
+) -> Result<(), String> {
+    terms.validate()?;
+    let vault_path = state.vault_location.path_to_look_at()?;
+    let target = connected_target(&state).await?;
+    let options = terms.options();
+    on_work_stack(
+        "orion-gateway-check",
+        "la vérification du renouvellement",
+        move || {
+            let tunnel = astra_operator::tunnel::Tunnel::new(&target.address)
+                .map_err(|error| format!("{error:#}"))?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            crate::operator::rotations::check_renewal_with(
+                &tunnel,
+                &vault_path,
+                &target,
+                options,
+                now,
             )
         },
     )

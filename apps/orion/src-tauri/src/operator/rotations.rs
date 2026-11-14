@@ -24,7 +24,7 @@ use anyhow::Context as _;
 use astra_operator::operations::rotation as operation;
 use astra_operator::overview::VaultOverview;
 use astra_operator::rotation_journal::{self, JournalStage, RotationJournal, RotationKind};
-use astra_operator::tunnel::VaultCopySent;
+use astra_operator::tunnel::{Tunnel, VaultCopySent};
 use astra_operator::{credentials, prepared};
 use orion_core::operator_rotations::{
     AuthorityStatusRead, GatewayDomainRead, PeerCertificatesRead, PendingOperationRead, Reach,
@@ -32,10 +32,13 @@ use orion_core::operator_rotations::{
 use serde::Serialize;
 
 use aether::certificates::transport::{
-    OperatorOpenAction, OperatorOpenRequest, OperatorOpened, OperatorVaultCopy, TrustUpdateObject,
+    OperatorChainStep, OperatorOpenAction, OperatorOpenRequest, OperatorOpened, OperatorVaultCopy,
+    TrustUpdateObject,
 };
+use astra_operator::operations::gateway_identity::{self, GatewayIdentityRemote, RenewalOptions};
 use astra_operator::operations::rotation::RotationRemote;
 
+use crate::operator::ceremony::page_sentence;
 use crate::operator::{relay_names_peer, GatewayTarget};
 
 const NOT_THE_DOMAINS_GATEWAY: &str =
@@ -86,6 +89,157 @@ pub fn open_campaign_with(
             window_secs: OPEN_WINDOW_SECS,
         })
         .map_err(|error| format!("{error:#}"))
+}
+
+/// The chain's calls the tunnel answers, named so a test can stand in for it.
+pub trait ChainRemote {
+    fn open_campaign(&self, request: &OperatorOpenRequest) -> anyhow::Result<OperatorOpened>;
+    fn chain_next(&self, expected_step: Option<usize>) -> anyhow::Result<OperatorChainStep>;
+    fn chain_reopen(&self, expected_step: Option<usize>) -> anyhow::Result<OperatorChainStep>;
+    fn chain_abandon(&self) -> anyhow::Result<()>;
+}
+
+impl ChainRemote for Tunnel {
+    fn open_campaign(&self, request: &OperatorOpenRequest) -> anyhow::Result<OperatorOpened> {
+        Tunnel::open_campaign(self, request)
+    }
+
+    fn chain_next(&self, expected_step: Option<usize>) -> anyhow::Result<OperatorChainStep> {
+        Tunnel::chain_next(self, expected_step)
+    }
+
+    fn chain_reopen(&self, expected_step: Option<usize>) -> anyhow::Result<OperatorChainStep> {
+        Tunnel::chain_reopen(self, expected_step)
+    }
+
+    fn chain_abandon(&self) -> anyhow::Result<()> {
+        Tunnel::chain_abandon(self)
+    }
+}
+
+/// What a `chain next` answers: the campaign it opened for the next step, or that the plan is
+/// finished. The campaign's delegation request, when it carries one, is public.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum ChainStepOutcome {
+    Opened(Box<OperatorOpened>),
+    Finished,
+}
+
+/// Said when a reopen is asked of a plan that has finished: there is no step to reopen.
+const CHAIN_FINISHED: &str = "le plan est fini : rien à rouvrir.";
+
+/// Replaces the step Orion holds in memory. Never written, never logged: its delegation request
+/// is public, but nothing gains from being on disk.
+fn hold(held: &std::sync::Mutex<Option<OperatorOpened>>, step: Option<OperatorOpened>) {
+    *held
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = step;
+}
+
+/// Holds what a chain answer opened, or nothing when the plan is finished, and says which.
+fn answered(
+    step: OperatorChainStep,
+    held: &std::sync::Mutex<Option<OperatorOpened>>,
+) -> ChainStepOutcome {
+    match step {
+        OperatorChainStep::Opened(opened) => {
+            hold(held, Some((*opened).clone()));
+            ChainStepOutcome::Opened(opened)
+        }
+        OperatorChainStep::Finished => {
+            hold(held, None);
+            ChainStepOutcome::Finished
+        }
+    }
+}
+
+/// Opens the certificate chain: its first step's campaign, which the gateway's pair check and
+/// the chain's own refusal guard. The campaign is held until the next step or the abandon.
+pub fn chain_start_with(
+    remote: &dyn ChainRemote,
+    vault_path: &Path,
+    target: &GatewayTarget,
+    reason: &str,
+    requested_by: &str,
+    held: &std::sync::Mutex<Option<OperatorOpened>>,
+) -> Result<OperatorOpened, String> {
+    ensure_domains_gateway(vault_path, target)?;
+    let opened = remote
+        .open_campaign(&OperatorOpenRequest {
+            action: OperatorOpenAction::ChainOpen,
+            reason: reason.to_string(),
+            requested_by: requested_by.to_string(),
+            window_secs: OPEN_WINDOW_SECS,
+        })
+        .map_err(|error| format!("{error:#}"))?;
+    hold(held, Some(opened.clone()));
+    Ok(opened)
+}
+
+/// Opens the chain's next step. `expected_step` is the step the caller read: Astra refuses a
+/// plan that has moved on, and its sentence reaches the page as it is.
+pub fn chain_next_with(
+    remote: &dyn ChainRemote,
+    vault_path: &Path,
+    target: &GatewayTarget,
+    expected_step: usize,
+    held: &std::sync::Mutex<Option<OperatorOpened>>,
+) -> Result<ChainStepOutcome, String> {
+    ensure_domains_gateway(vault_path, target)?;
+    let step = remote
+        .chain_next(Some(expected_step))
+        .map_err(|error| format!("{error:#}"))?;
+    Ok(answered(step, held))
+}
+
+/// Redeposits the chain's current step once its campaign has ended. The campaign it opens
+/// replaces the one held.
+pub fn chain_reopen_with(
+    remote: &dyn ChainRemote,
+    vault_path: &Path,
+    target: &GatewayTarget,
+    expected_step: usize,
+    held: &std::sync::Mutex<Option<OperatorOpened>>,
+) -> Result<OperatorOpened, String> {
+    ensure_domains_gateway(vault_path, target)?;
+    let step = remote
+        .chain_reopen(Some(expected_step))
+        .map_err(|error| format!("{error:#}"))?;
+    match answered(step, held) {
+        ChainStepOutcome::Opened(opened) => Ok(*opened),
+        ChainStepOutcome::Finished => Err(CHAIN_FINISHED.to_string()),
+    }
+}
+
+/// Drops the chain's plan. What was approved keeps its effect; the held step goes with it.
+pub fn chain_abandon_with(
+    remote: &dyn ChainRemote,
+    vault_path: &Path,
+    target: &GatewayTarget,
+    held: &std::sync::Mutex<Option<OperatorOpened>>,
+) -> Result<(), String> {
+    ensure_domains_gateway(vault_path, target)?;
+    remote
+        .chain_abandon()
+        .map_err(|error| format!("{error:#}"))?;
+    hold(held, None);
+    Ok(())
+}
+
+/// Whether a gateway renewal on `terms` would be opened now, read through `remote` before the
+/// chain's step is taken: the checks the renewal makes before it opens a campaign, and no key.
+/// A refusal is its sentence, a failed read Orion's fixed one.
+pub fn check_renewal_with(
+    remote: &dyn GatewayIdentityRemote,
+    vault_path: &Path,
+    target: &GatewayTarget,
+    options: RenewalOptions,
+    now: u64,
+) -> Result<(), String> {
+    ensure_domains_gateway(vault_path, target)?;
+    gateway_identity::check_renewal(remote, vault_path, options, now)
+        .map_err(|refusal| page_sentence(&refusal))
 }
 
 /// The manual send. `authority` is read only once the gateway has been checked.
@@ -717,5 +871,211 @@ mod overview_tests {
         let unread =
             serde_json::to_value(assembled(Local::default(), Reach::Unreachable)).expect("json");
         assert_eq!(unread["workstations"]["state"], "unreachable");
+    }
+}
+
+#[cfg(test)]
+mod chain_tests {
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    use aether::certificates::encoding::{Fingerprint, Id16, WireGuardKey};
+    use aether::certificates::status::CampaignScope;
+    use aether::certificates::transport::{OperatorChainStep, OperatorOpenRequest};
+    use astra_operator::operations::fixtures::gateway_key;
+    use astra_operator::operations::gateway_identity::tests::Scenario;
+
+    use super::*;
+
+    /// A tunnel that answers the chain's calls from scripts, and records what it was asked.
+    #[derive(Default)]
+    struct Fake {
+        opened: Option<OperatorOpened>,
+        /// What `chain_next` and `chain_reopen` answer, in turn: a refusal is Astra's sentence.
+        steps: RefCell<VecDeque<Result<OperatorChainStep, String>>>,
+        requests: RefCell<Vec<OperatorOpenRequest>>,
+        expected: RefCell<Vec<Option<usize>>>,
+    }
+
+    impl Fake {
+        fn answering(opened: OperatorOpened) -> Self {
+            Self {
+                opened: Some(opened),
+                ..Self::default()
+            }
+        }
+
+        fn then(self, step: Result<OperatorChainStep, String>) -> Self {
+            self.steps.borrow_mut().push_back(step);
+            self
+        }
+
+        fn next_step(&self, expected: Option<usize>) -> anyhow::Result<OperatorChainStep> {
+            self.expected.borrow_mut().push(expected);
+            match self.steps.borrow_mut().pop_front() {
+                Some(Ok(step)) => Ok(step),
+                Some(Err(sentence)) => Err(anyhow::anyhow!("{sentence}")),
+                None => panic!("no step scripted"),
+            }
+        }
+    }
+
+    impl ChainRemote for Fake {
+        fn open_campaign(&self, request: &OperatorOpenRequest) -> anyhow::Result<OperatorOpened> {
+            self.requests.borrow_mut().push(request.clone());
+            self.opened
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("no campaign scripted"))
+        }
+
+        fn chain_next(&self, expected_step: Option<usize>) -> anyhow::Result<OperatorChainStep> {
+            self.next_step(expected_step)
+        }
+
+        fn chain_reopen(&self, expected_step: Option<usize>) -> anyhow::Result<OperatorChainStep> {
+            self.next_step(expected_step)
+        }
+
+        fn chain_abandon(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn opened(serial: u8) -> OperatorOpened {
+        OperatorOpened {
+            operation_id: Id16::new([serial; 16]).expect("id"),
+            campaign_id: Id16::new([serial + 1; 16]).expect("id"),
+            campaign_fingerprint: Fingerprint::of(b"campaign"),
+            scope: CampaignScope::IssuerDelegation,
+            target_count: 1,
+            required_credentials: 2,
+            expires_at: 1_900_000_000,
+            revocation_expiries: None,
+            delegation_request: Some("demande publique".into()),
+            gateway_certificate: None,
+        }
+    }
+
+    /// A vault whose relay names the gateway of the returned target.
+    fn domain_gateway() -> (Scenario, GatewayTarget) {
+        let scenario = Scenario::new(false);
+        let target = GatewayTarget {
+            address: "http://127.0.0.1:1".into(),
+            peer_key: gateway_key().to_base64(),
+            own_key: None,
+        };
+        (scenario, target)
+    }
+
+    fn held_with(opened: Option<OperatorOpened>) -> Mutex<Option<OperatorOpened>> {
+        Mutex::new(opened)
+    }
+
+    fn read(held: &Mutex<Option<OperatorOpened>>) -> Option<OperatorOpened> {
+        held.lock().expect("lock").clone()
+    }
+
+    #[test]
+    fn chain_start_keeps_the_opened_step() {
+        let (scenario, target) = domain_gateway();
+        let fake = Fake::answering(opened(3));
+        let held = held_with(None);
+
+        let started = chain_start_with(
+            &fake,
+            &scenario.domain.path,
+            &target,
+            "renouvellement",
+            "poste",
+            &held,
+        )
+        .expect("started");
+
+        assert_eq!(started, opened(3));
+        assert_eq!(read(&held), Some(opened(3)), "the step is held");
+        let request = fake.requests.borrow()[0].clone();
+        assert_eq!(request.action, OperatorOpenAction::ChainOpen);
+        assert_eq!(request.reason, "renouvellement");
+        assert_eq!(request.requested_by, "poste");
+    }
+
+    #[test]
+    fn chain_next_finished_clears_the_held_step() {
+        let (scenario, target) = domain_gateway();
+        let fake = Fake::default().then(Ok(OperatorChainStep::Finished));
+        let held = held_with(Some(opened(3)));
+
+        let outcome =
+            chain_next_with(&fake, &scenario.domain.path, &target, 2, &held).expect("next");
+
+        assert_eq!(outcome, ChainStepOutcome::Finished);
+        assert_eq!(read(&held), None, "a finished chain holds no step");
+        assert_eq!(
+            *fake.expected.borrow(),
+            vec![Some(2)],
+            "the expected step is sent"
+        );
+    }
+
+    #[test]
+    fn chain_reopen_replaces_the_held_step() {
+        let (scenario, target) = domain_gateway();
+        let fake = Fake::default().then(Ok(OperatorChainStep::Opened(Box::new(opened(5)))));
+        let held = held_with(Some(opened(3)));
+
+        let reopened =
+            chain_reopen_with(&fake, &scenario.domain.path, &target, 1, &held).expect("reopen");
+
+        assert_eq!(reopened, opened(5));
+        assert_eq!(
+            read(&held),
+            Some(opened(5)),
+            "the reopened step replaces the old one"
+        );
+        assert_eq!(*fake.expected.borrow(), vec![Some(1)]);
+    }
+
+    #[test]
+    fn chain_abandon_clears_the_held_step() {
+        let (scenario, target) = domain_gateway();
+        let fake = Fake::default();
+        let held = held_with(Some(opened(3)));
+
+        chain_abandon_with(&fake, &scenario.domain.path, &target, &held).expect("abandon");
+
+        assert_eq!(read(&held), None);
+    }
+
+    #[test]
+    fn chain_next_refusal_is_astras_sentence() {
+        let (scenario, target) = domain_gateway();
+        let sentence = "l'étape n'a pas été ouverte : continuer le plan";
+        let fake = Fake::default().then(Err(sentence.to_string()));
+        let held = held_with(Some(opened(3)));
+
+        let refused =
+            chain_next_with(&fake, &scenario.domain.path, &target, 1, &held).expect_err("refused");
+
+        assert_eq!(refused, sentence, "Astra's sentence, unchanged");
+        assert_eq!(
+            read(&held),
+            Some(opened(3)),
+            "a refused step keeps the held one"
+        );
+    }
+
+    #[test]
+    fn chain_refuses_a_gateway_the_relay_does_not_name() {
+        let (scenario, mut target) = domain_gateway();
+        target.peer_key = WireGuardKey::from_bytes([9; 32]).to_base64();
+        let fake = Fake::answering(opened(3));
+        let held = held_with(None);
+
+        let refused = chain_start_with(&fake, &scenario.domain.path, &target, "r", "p", &held)
+            .expect_err("another domain's gateway");
+
+        assert_eq!(refused, NOT_THE_DOMAINS_GATEWAY);
+        assert!(fake.requests.borrow().is_empty(), "no campaign is opened");
     }
 }

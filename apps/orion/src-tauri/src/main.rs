@@ -102,6 +102,9 @@ struct AppState {
     operator: operator::OperatorCeremony,
     /// Where every operator gesture opens the vault, as the operator chose it.
     vault_location: operator::location::VaultLocation,
+    /// The certificate chain's held step, in memory only: its delegation request is never written
+    /// or logged. Shared with the work that opens or answers a step, which runs off this thread.
+    chain_opened: Arc<StdMutex<Option<aether::certificates::transport::OperatorOpened>>>,
     /// Set when Orion is quitting: the engine's session ends on purpose, and
     /// that end is not a failure to report.
     quitting: AtomicBool,
@@ -699,6 +702,7 @@ fn main() {
                 pending_profile_paths: StdMutex::new(pending_profile_paths),
                 operator: operator::OperatorCeremony::default(),
                 vault_location: operator::location::VaultLocation::load(),
+                chain_opened: Arc::new(StdMutex::new(None)),
                 quitting: AtomicBool::new(false),
                 #[cfg(windows)]
                 engine: Arc::new(engine_process),
@@ -777,6 +781,12 @@ fn main() {
             begin_rotation_ceremony,
             begin_revocation_ceremony,
             begin_gateway_ceremony,
+            operator_chain_start,
+            operator_chain_next,
+            operator_chain_reopen,
+            operator_chain_abandon,
+            operator_chain_held,
+            operator_gateway_check_renewal,
             approve_rotation_ceremony,
             rename_operator_key,
             write_domain_relay,

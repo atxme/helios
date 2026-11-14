@@ -186,13 +186,13 @@ pub struct AuthorityStatusRead {
     /// The certificate chain Astra has open. Absent from an Astra older than
     /// the chain, which reads as no chain.
     #[serde(default)]
-    pub chain: Option<ChainViewRead>,
+    pub chain: Option<ChainRead>,
 }
 
 /// The chain the status names: its steps by scope name, the step awaiting its
 /// effect, and the campaign deposited for it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ChainViewRead {
+pub struct ChainRead {
     pub steps: Vec<String>,
     pub current: usize,
     #[serde(default)]
@@ -238,7 +238,7 @@ impl From<OperatorAuthorityStatus> for AuthorityStatusRead {
             served_credentials: status
                 .served_credentials
                 .and_then(|document| serde_json::to_value(*document).ok()),
-            chain: status.chain.map(|chain| ChainViewRead {
+            chain: status.chain.map(|chain| ChainRead {
                 steps: chain.steps.into_iter().map(scope_name).collect(),
                 current: chain.current,
                 operation_id: chain.operation_id.map(|id| id.to_hex()),
