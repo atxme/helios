@@ -365,6 +365,39 @@ pub struct OpenedGatewayRenewal {
     reused: bool,
 }
 
+/// The checks [`open_renewal`] makes before it opens a campaign, and what they leave for the rest.
+struct Checked {
+    keys: ValidatedKeys,
+    relay: DomainHandoff,
+    identity: DomainIdentity,
+    anchor_key: MlDsa87PublicKey,
+    prepared: GatewayRenewalRead,
+}
+
+/// Everything [`open_renewal`] refuses before it opens a campaign, and nothing else: it calls
+/// `prepare_renewal` as the opening does, asks no key for anything, and opens no campaign.
+pub fn check_renewal(
+    remote: &dyn GatewayIdentityRemote,
+    vault_path: &Path,
+    options: RenewalOptions,
+    now: u64,
+) -> Result<(), GatewayRefusal> {
+    checks(remote, vault_path, options, now).map(|_| ())
+}
+
+/// [`open_renewal`] under a campaign the chain opened: the same checks again, then `opened`
+/// instead of an opening. Its family is checked before any key is asked for.
+pub fn open_renewal_in(
+    remote: &dyn GatewayIdentityRemote,
+    vault_path: &Path,
+    opened: OperatorOpened,
+    options: RenewalOptions,
+    now: u64,
+) -> Result<OpenedGatewayRenewal, GatewayRefusal> {
+    let checked = checks(remote, vault_path, options, now)?;
+    renew_under(remote, vault_path, checked, opened, options, now)
+}
+
 /// Opens the renewal of the gateway's identity, or refuses it. Nothing before the last
 /// step asks for a key.
 pub fn open_renewal(
@@ -385,6 +418,29 @@ pub(super) fn open_renewal_as(
     reason: &str,
     now: u64,
 ) -> Result<OpenedGatewayRenewal, GatewayRefusal> {
+    let checked = checks(remote, vault_path, options, now)?;
+    let opened = remote
+        .open_campaign(&OperatorOpenRequest {
+            action: OperatorOpenAction::GatewayIdentity,
+            reason: reason.to_string(),
+            requested_by: REQUESTED_BY.to_string(),
+            window_secs: CAMPAIGN_WINDOW_SECS,
+        })
+        .map_err(|error| match error.downcast_ref::<TunnelRefusal>() {
+            Some(refusal) if refusal.status == 403 => refused_by_door(vault_path, now),
+            _ => before_signing(error),
+        })?;
+    renew_under(remote, vault_path, checked, opened, options, now)
+}
+
+/// The checks before a campaign: the terms, the waiting records, the gateway's state, the
+/// overlap, and the request the gateway prepared. Nothing here asks for a key.
+fn checks(
+    remote: &dyn GatewayIdentityRemote,
+    vault_path: &Path,
+    options: RenewalOptions,
+    now: u64,
+) -> Result<Checked, GatewayRefusal> {
     // Refused before the gateway is asked anything: the terms are the operator's input.
     if !terms_in_range(options) {
         return Err(GatewayRefusal::TermsOutOfRange);
@@ -417,7 +473,6 @@ pub(super) fn open_renewal_as(
     {
         return Err(GatewayRefusal::CaPqOverlap);
     }
-
     let relay = DomainHandoff::beside(vault_path, vault).map_err(internal)?;
     let identity = handoff::identity_of(&relay).map_err(internal)?;
     let anchor_key = MlDsa87PublicKey::parse(vault.ca_pq_public_key.trim()).map_err(internal)?;
@@ -447,18 +502,34 @@ pub(super) fn open_renewal_as(
             });
         }
     }
+    Ok(Checked {
+        keys,
+        relay,
+        identity,
+        anchor_key,
+        prepared,
+    })
+}
 
-    let opened = remote
-        .open_campaign(&OperatorOpenRequest {
-            action: OperatorOpenAction::GatewayIdentity,
-            reason: reason.to_string(),
-            requested_by: REQUESTED_BY.to_string(),
-            window_secs: CAMPAIGN_WINDOW_SECS,
-        })
-        .map_err(|error| match error.downcast_ref::<TunnelRefusal>() {
-            Some(refusal) if refusal.status == 403 => refused_by_door(vault_path, now),
-            _ => before_signing(error),
-        })?;
+/// The renewal under the campaign `opened` names: the gateway's frozen leaf, the request
+/// verified against the campaign, and the approval session. Shared by the opening and the
+/// chain's campaign.
+fn renew_under(
+    remote: &dyn GatewayIdentityRemote,
+    vault_path: &Path,
+    checked: Checked,
+    opened: OperatorOpened,
+    options: RenewalOptions,
+    now: u64,
+) -> Result<OpenedGatewayRenewal, GatewayRefusal> {
+    let Checked {
+        keys,
+        relay,
+        identity,
+        anchor_key,
+        prepared,
+    } = checked;
+    let vault = &keys.vault;
     let served = opened.gateway_certificate.ok_or_else(|| {
         GatewayRefusal::Guidance(
             "Astra n'a pas donné la feuille gateway en service : rien n'a été signé.".into(),

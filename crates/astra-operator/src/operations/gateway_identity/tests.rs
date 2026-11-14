@@ -34,6 +34,7 @@ use crate::operations::fixtures::{
     domain, gateway_key, nothing_in_flight, operation, trust_domain, Domain, EXPIRES, NOW,
     SERVER_NAME,
 };
+use crate::operations::gateway_revocation::tests::{sign_revocation, Remote as RevocationRemote};
 use crate::origin::CampaignRequest;
 use crate::tunnel::admin_refusal;
 use crate::{gestures, store};
@@ -1461,6 +1462,150 @@ fn renewal_carries_a_reused_request() {
     remote.prepared.reused = false;
     let opened = open_renewal(&remote, &scenario.domain.path, options(), NOW).expect("opened");
     assert!(!opened.request_reused());
+}
+
+/// The campaign the chain opened, as the tunnel hands it over: the answer the door gives an
+/// opening, without an opening, since the chain made the call.
+fn chain_opened(remote: &Remote, scope: CampaignScope) -> OperatorOpened {
+    OperatorOpened {
+        operation_id: operation(),
+        campaign_id: remote.campaign.campaign_id,
+        campaign_fingerprint: remote.campaign.fingerprint(),
+        scope,
+        target_count: 1,
+        required_credentials: 1,
+        expires_at: EXPIRES,
+        revocation_expiries: None,
+        delegation_request: None,
+        gateway_certificate: Some(remote.served.clone()),
+    }
+}
+
+fn no_key_touched_after_setup(scenario: &Scenario) {
+    scenario
+        .domain
+        .keys
+        .iter()
+        .for_each(|key| key.touches.set(0));
+}
+
+/// Each refusal `open_renewal` gives before a campaign is opened, `check_renewal` gives too,
+/// and opens nothing.
+#[test]
+fn check_renewal_refuses_what_open_renewal_refuses() {
+    type Setup = fn(&Scenario, &mut Remote<'_>);
+    let cases: [(Setup, RenewalOptions, GatewayRefusal); 7] = [
+        (
+            |_, _| {},
+            RenewalOptions {
+                prepare_days: 0,
+                ..options()
+            },
+            GatewayRefusal::TermsOutOfRange,
+        ),
+        (
+            |scenario, _| {
+                signed_decision(&Remote::new(scenario), &scenario.domain, options());
+            },
+            options(),
+            GatewayRefusal::AlreadyOpen,
+        ),
+        (
+            |scenario, _| {
+                sign_revocation(&RevocationRemote::new(scenario), &scenario.domain, false);
+            },
+            options(),
+            GatewayRefusal::RevocationPending,
+        ),
+        (
+            |_, remote| remote.gateway.gateway_revoked = true,
+            options(),
+            GatewayRefusal::Revoked,
+        ),
+        (
+            |_, remote| remote.gateway.gateway_transition_pending = true,
+            options(),
+            GatewayRefusal::TransitionInFlight,
+        ),
+        (
+            |_, remote| remote.overlap = Some(NOW + DAY),
+            options(),
+            GatewayRefusal::CaPqOverlap,
+        ),
+        (
+            |_, remote| {
+                remote.prepared.reused = true;
+                remote.prepared.candidate_tls_fingerprint =
+                    Some(Fingerprint::of(b"kept TLS").to_hex());
+            },
+            options(),
+            GatewayRefusal::PreparedRequestDiffers {
+                cause: "la feuille TLS candidate",
+                expires_at: NOW + 3_600,
+            },
+        ),
+    ];
+    for (setup, asked, expected) in cases {
+        let scenario = Scenario::new(false);
+        let mut remote = Remote::new(&scenario);
+        setup(&scenario, &mut remote);
+        no_key_touched_after_setup(&scenario);
+
+        let refusal =
+            check_renewal(&remote, &scenario.domain.path, asked, NOW).expect_err("refused");
+
+        assert_eq!(refusal, expected);
+        assert!(!remote.called("open_campaign"), "no campaign is opened");
+        assert!(no_key_touched(&scenario.domain));
+    }
+}
+
+#[test]
+fn check_renewal_passes_and_opens_nothing() {
+    let scenario = Scenario::new(false);
+    let remote = Remote::new(&scenario);
+
+    check_renewal(&remote, &scenario.domain.path, options(), NOW).expect("checked");
+
+    assert_eq!(remote.count("open_campaign"), 0, "no campaign is opened");
+    assert_eq!(remote.count("prepare_renewal"), 1);
+    assert!(no_key_touched(&scenario.domain));
+}
+
+#[test]
+fn open_renewal_in_opens_no_campaign() {
+    let scenario = Scenario::new(false);
+    let remote = Remote::new(&scenario);
+    let opened = chain_opened(&remote, CampaignScope::GatewayIdentity);
+
+    let renewal = open_renewal_in(&remote, &scenario.domain.path, opened, options(), NOW)
+        .expect("renewal under the chain's campaign");
+
+    assert_eq!(remote.count("open_campaign"), 0, "no campaign is opened");
+    assert_eq!(remote.count("fetch_campaign"), 1);
+    assert_eq!(renewal.campaign.operation_id, operation());
+    assert!(no_key_touched(&scenario.domain));
+}
+
+#[test]
+fn open_renewal_in_refuses_another_family() {
+    let scenario = Scenario::new(false);
+    let mut remote = Remote::new(&scenario);
+    let mut campaign = scenario.campaign(scenario.leaf());
+    campaign.scope = CampaignScope::FleetLeafs;
+    remote.campaign = campaign;
+    let opened = chain_opened(&remote, CampaignScope::FleetLeafs);
+
+    let refusal = refusal(open_renewal_in(
+        &remote,
+        &scenario.domain.path,
+        opened,
+        options(),
+        NOW,
+    ));
+
+    assert_eq!(refusal, GatewayRefusal::CampaignMismatch);
+    assert!(no_key_touched(&scenario.domain), "no key is asked for");
 }
 
 #[test]

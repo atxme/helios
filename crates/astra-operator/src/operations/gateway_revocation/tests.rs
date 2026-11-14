@@ -360,7 +360,7 @@ fn sign_replacement(remote: &Remote, domain: &Domain) -> SignedGatewayRevocation
 }
 
 /// The revocation's round, under the second key.
-fn sign_revocation(
+pub(crate) fn sign_revocation(
     remote: &Remote,
     domain: &Domain,
     with_replacement: bool,
