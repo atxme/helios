@@ -92,6 +92,7 @@ export function RenewAllBlock({
   refresh,
   renderStep,
   operatorLabel,
+  fleetApprovedThisSession = null,
 }: {
   overview: RotationsOverview
   onCeremony: CeremonyHandoff
@@ -100,12 +101,13 @@ export function RenewAllBlock({
   renderStep?: (context: RotationStepContext) => ReactNode
   /** The label of the first key, for `requested_by`. */
   operatorLabel: string
+  /** The campaign whose fleet approval ended `done` in this session, kept by the screen. */
+  fleetApprovedThisSession?: string | null
 }) {
   const plan = valueOf(overview.authority)?.chain ?? null
   const planKey = plan ? `${plan.current}|${plan.operation_id}|${plan.steps.join(',')}` : ''
   const [held, setHeld] = useState<OperatorOpened | null>(null)
   const [running, setRunning] = useState(false)
-  const [fleetApproved, setFleetApproved] = useState<string | null>(null)
   const [pick, setPick] = useState<ChainAction | null>(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -115,7 +117,7 @@ export function RenewAllBlock({
   const [terms, setTerms] = useState<TermsDraft>(TERMS_DEFAULT)
   const [rotateTls, setRotateTls] = useState(false)
 
-  // Read when the plan moves, and on mount: the request Orion holds, and the ceremony's state.
+  // Read when the plan moves, and on mount: the request Orion holds, and whether a ceremony is open.
   useEffect(() => {
     let alive = true
     void (async () => {
@@ -129,7 +131,6 @@ export function RenewAllBlock({
         const status = await api.operatorCeremonyStatus()
         if (!alive) return
         setRunning(status !== null && !isEnded(status))
-        setFleetApproved(status && status.gesture === 'done' ? (status.operation_id ?? null) : null)
       } catch {
         // The last reading stands: the next read of the plan tries again.
       }
@@ -140,7 +141,7 @@ export function RenewAllBlock({
   }, [planKey])
 
   const now = nowSeconds()
-  const row = chainRow({ overview, now, held, fleetApprovedThisSession: fleetApproved })
+  const row = chainRow({ overview, now, held, fleetApprovedThisSession })
   const picked = pick && row.actions.includes(pick) ? pick : null
 
   const readFresh = async (): Promise<RotationsOverview> => {

@@ -82,6 +82,7 @@ export function RotationsPanel({
   onOverview,
   renderStep,
   resumeStop,
+  fleetApprovedThisSession = null,
 }: {
   onCeremony: CeremonyHandoff
   /** Every read, so the rest of the screen follows without a read of its own. */
@@ -89,6 +90,8 @@ export function RotationsPanel({
   renderStep?: (context: RotationStepContext) => ReactNode
   /** Where an automatic resumption stopped, said in its row: it never takes the tab. */
   resumeStop?: string | null
+  /** The campaign whose fleet approval ended `done` in this session, if any (see AstraView). */
+  fleetApprovedThisSession?: string | null
 }) {
   const [overview, setOverview] = useState<RotationsOverview | null>(null)
   const [readError, setReadError] = useState<string | null>(null)
@@ -286,6 +289,7 @@ export function RotationsPanel({
         refresh={readAfter}
         renderStep={renderStep}
         operatorLabel={operatorLabelOf(overview)}
+        fleetApprovedThisSession={fleetApprovedThisSession}
       />
       {rows.map((row) => {
         const live = liveOperation(overview, row.action, now)

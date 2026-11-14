@@ -68,6 +68,10 @@ export function AstraView({
   // helper keeps working while the operator looks at another tab — so it is
   // read on mount rather than only created here.
   const [ceremony, setCeremony] = useState<OperatorStatus | null>(null)
+  // The campaign whose fleet approval ended `done` in this session. Kept here, not with the
+  // ceremony: the panels unmount while a ceremony is shown, and it is dismissed before the
+  // Rotations tab reads the chain again.
+  const [fleetApproved, setFleetApproved] = useState<string | null>(null)
   const [pending, setPending] = useState<OperatorPendingOperation[]>([])
   // What the Rotations read says outside its own tab: `null` until the authority has been
   // read, which keeps every approval suspended rather than assuming there is no overlap.
@@ -148,6 +152,14 @@ export function AstraView({
       cancelled = true
     }
   }, [readRotations])
+
+  // Every status the screen receives passes through `ceremony`: a fleet approval that ended is
+  // recorded here, whichever path it came by.
+  useEffect(() => {
+    if (ceremony?.operation === 'approve_campaign' && ceremony.gesture === 'done' && ceremony.operation_id) {
+      setFleetApproved(ceremony.operation_id)
+    }
+  }, [ceremony])
 
   // The command returns the first state after a press (usually
   // `processing_key`). The helper then continues on its own while Windows
@@ -380,6 +392,7 @@ export function AstraView({
     <RotationsPanel
       onCeremony={openCeremony}
       onOverview={takeOverview}
+      fleetApprovedThisSession={fleetApproved}
       renderStep={(context) => <RotationSteps {...context} />}
       resumeStop={
         automaticStop?.refusal

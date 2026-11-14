@@ -26,9 +26,10 @@ const api = vi.hoisted(() => ({
 }))
 vi.mock('../api', () => api)
 
+import type { CampaignScope } from '../types'
 import { AstraView } from './AstraView'
 import { resetForTests } from './astra/VaultCopy'
-import { DAY, overview as fullOverview } from './astra/rotationFixtures'
+import { DAY, authorityRead, overview as fullOverview } from './astra/rotationFixtures'
 
 const openTab = (name: string | RegExp) => fireEvent.click(screen.getByRole('tab', { name }))
 
@@ -358,6 +359,54 @@ describe('AstraView', () => {
     expect(screen.getByText(/n’est pas encore disponible dans Orion/)).toBeTruthy()
     fireEvent.click(open)
     expect(api.beginOperatorCeremony).not.toHaveBeenCalled()
+  })
+
+  it('fleet_approval_survives_the_ceremony_dismissal', async () => {
+    const OP = 'c'.repeat(32)
+    const steps: CampaignScope[] = ['issuer_delegation', 'trust_authorities', 'gateway_identity', 'fleet_leafs']
+    api.operatorRotationsOverview.mockResolvedValue(
+      fullOverview({
+        authority: {
+          state: 'ok',
+          value: authorityRead({ chain: { steps, current: 3, operation_id: OP } }),
+        },
+      }),
+    )
+    api.operatorOverview.mockResolvedValue({
+      vault_path: 'v.json',
+      exists: true,
+      location_available: true,
+      bootstrapped: true,
+      credentials_complete: true,
+      vault_fingerprint: 'ab12',
+      slots: [],
+      max_slots: 8,
+      domain: null,
+    })
+    // The fleet campaign's approval ends `done`; the ceremony is then dismissed.
+    api.beginOperatorCeremony.mockResolvedValue({
+      session_id: 'd'.repeat(32),
+      revision: 2,
+      operation: 'approve_campaign',
+      operation_id: OP,
+      remote: 'not_required',
+      gesture: 'done',
+      allowed: [],
+    })
+    api.dismissOperatorCeremony.mockResolvedValue(undefined)
+    api.operatorPendingOperations.mockResolvedValue([])
+    render(<AstraView />)
+    openTab('Coffre et clés')
+    fireEvent.click(await screen.findByRole('button', { name: 'Vérifier une clé' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Retour aux opérations' }))
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Retour aux opérations' })).toBeNull())
+    await waitFor(() => expect(screen.getByRole('tab', { name: /Rotations/ })).toBeTruthy())
+    openTab(/Rotations/)
+    const chainRow = await screen.findByRole('region', { name: 'Tout renouveler' })
+    await waitFor(() =>
+      expect(within(chainRow).getByRole('button', { name: 'Continuer' })).toBeTruthy(),
+    )
+    expect(within(chainRow).queryByRole('button', { name: "Rouvrir l'étape" })).toBeNull()
   })
 
   it('leads_a_CA_rotation_campaign_to_the_rotations_tab', async () => {

@@ -208,9 +208,8 @@ describe('the steps of a plan', () => {
   })
 
   it('finished_reads_fleet_authorized', async () => {
-    api.operatorCeremonyStatus.mockResolvedValue(ceremony({ gesture: 'done', operation_id: OP }))
     api.operatorChainNext.mockResolvedValue({ outcome: 'finished' })
-    show(withChain(chain(3, OP), { caTlsCloseAt: NOW + 86_400 }))
+    show(withChain(chain(3, OP), { caTlsCloseAt: NOW + 86_400 }), { fleetApprovedThisSession: OP })
     await waitFor(() => expect(button('Continuer')).toBeTruthy())
     fireEvent.click(button('Continuer'))
     await waitFor(() => expect(row().getByText(/Parc autorisé ; chaque poste se renouvelle/)).toBeTruthy())
@@ -218,11 +217,17 @@ describe('the steps of a plan', () => {
     expect(api.operatorChainNext).toHaveBeenCalledWith(3)
   })
 
-  it('fleet_done_this_session_offers_continue', async () => {
-    api.operatorCeremonyStatus.mockResolvedValue(ceremony({ gesture: 'done', operation_id: OP }))
-    show(withChain(chain(3, OP)))
-    await waitFor(() => expect(button('Continuer')).toBeTruthy())
+  it('fleet_done_this_session_offers_continue', () => {
+    // The approval comes from the screen, not from a read of the ceremony: no status is read here.
+    show(withChain(chain(3, OP)), { fleetApprovedThisSession: OP })
+    expect(button('Continuer')).toBeTruthy()
     expect(row().queryByRole('button', { name: "Rouvrir l'étape" })).toBeNull()
+  })
+
+  it('an_approval_of_another_campaign_does_not_count', () => {
+    show(withChain(chain(3, OP)), { fleetApprovedThisSession: 'f'.repeat(32) })
+    expect(row().queryByRole('button', { name: 'Continuer' })).toBeNull()
+    expect(button("Rouvrir l'étape")).toBeTruthy()
   })
 
   it('resume_delegation_leads_the_held_request', async () => {
