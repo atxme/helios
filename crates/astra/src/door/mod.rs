@@ -452,7 +452,7 @@ pub enum DoorRefusal {
     ChainStepNotDeposited,
     #[error("l'étape a pris effet : continuer le plan")]
     ChainStepLanded,
-    #[error("la campagne de l'étape est encore ouverte jusqu'à {} : l'approuver", utc_minute(.expires_at))]
+    #[error("la campagne de l'étape est encore ouverte jusqu'à {} : l'approuver", aether::display_time::format_paris_timestamp(*.expires_at))]
     ChainStepStillOpen { expires_at: u64 },
     #[error("le plan n'est plus sur cette étape : relire le plan")]
     ChainStepMoved { current: usize },
@@ -576,27 +576,6 @@ impl DoorRefusal {
             _ => None,
         }
     }
-}
-
-/// A Unix time as the UTC minute an operator reads, `AAAA-MM-JJ HH:MM UTC`.
-///
-/// Refusal sentences that name a deadline carry it through this, because the
-/// console has no clock of its own to put beside it.
-fn utc_minute(seconds: &u64) -> String {
-    let Ok(seconds) = i64::try_from(*seconds) else {
-        return format!("{seconds} (horodatage hors plage)");
-    };
-    let Ok(utc) = time::OffsetDateTime::from_unix_timestamp(seconds) else {
-        return format!("{seconds} (horodatage illisible)");
-    };
-    format!(
-        "{:04}-{:02}-{:02} {:02}:{:02} UTC",
-        utc.year(),
-        u8::from(utc.month()),
-        utc.day(),
-        utc.hour(),
-        utc.minute()
-    )
 }
 
 /// What each connector may reach: exactly the table of §5.2.

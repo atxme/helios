@@ -1759,10 +1759,10 @@ async fn reopen_refuses_while_the_operation_lives() {
         }
         other => panic!("expected ChainStepStillOpen, got {other:?}"),
     }
-    // The window ends at NOW + 300 s: 1970-01-12 13:51 UTC.
+    // The window ends at NOW + 300 s: 1970-01-12 14:51 CET (Paris, winter).
     assert_eq!(
         refused.expect_err("refused").to_string(),
-        "la campagne de l'étape est encore ouverte jusqu'à 1970-01-12 13:51 UTC : l'approuver"
+        "la campagne de l'étape est encore ouverte jusqu'à 1970-01-12 14:51 CET : l'approuver"
     );
 }
 
