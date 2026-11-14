@@ -1280,15 +1280,15 @@ async fn abandon_drops_the_plan() {
     .await;
     assert_eq!(status, 403);
 
-    // With the plan gone, the next step has nothing to continue: a refusal
-    // of the class, not a step.
+    // With the plan gone, the next step has nothing to continue: a plan
+    // refusal with its sentence, not a step.
     let (status, _) = post_to(
         &listener,
         OPERATOR_CHAIN_NEXT_ROUTE,
         &relayed_administrator(),
     )
     .await;
-    assert_eq!(status, 403);
+    assert_eq!(status, 409);
 }
 
 /// A step whose campaign has ended reopens over the tunnel and opens a new
@@ -1350,6 +1350,24 @@ async fn chain_reopen_refusal_crosses_with_its_sentence() {
         refusal.message
     );
     assert_eq!(read_plan(dir.path()).current, 0);
+}
+
+/// With no plan held, `next` and `reopen` answer the sentence of the missing chain as a 409.
+#[tokio::test]
+async fn chain_steps_without_a_plan_cross_as_a_refusal_with_their_sentence() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture(dir.path());
+    let listener = listen(Arc::clone(&service)).await;
+    for route in [OPERATOR_CHAIN_NEXT_ROUTE, OPERATOR_CHAIN_REOPEN_ROUTE] {
+        let (status, body) = post_to(&listener, route, &relayed_step(None)).await;
+        assert_eq!(status, 409, "{route}: {}", String::from_utf8_lossy(&body));
+        let refusal: OperatorChainRefusal = serde_json::from_slice(&body).expect("the reason");
+        assert!(
+            refusal.message.contains("aucune chaîne de certificats"),
+            "{}",
+            refusal.message
+        );
+    }
 }
 
 /// A caller that expects another step is refused before anything opens: the

@@ -181,7 +181,9 @@ pub struct RelayedOperatorCampaign {
 #[serde(deny_unknown_fields)]
 pub struct RelayedChainStep {
     pub operator: OperatorIdentity,
-    #[serde(default)]
+    /// Omitted when absent, so that an older Astra, which refuses a field it does not know,
+    /// still accepts a step asked of the current one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_step: Option<usize>,
 }
 

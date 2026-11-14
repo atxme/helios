@@ -656,16 +656,19 @@ async fn chain_step(
     }
 }
 
-/// The refusals of a chain step whose sentence the operator reads: the step
-/// has not taken effect, has not been opened, is still open, or the plan has
-/// moved on from the step the caller expected.
+/// The refusals of a chain step whose sentence the operator reads: there is no
+/// plan or it is finished, the step has not taken effect, has not been opened,
+/// is still open, or the plan has moved on from the step the caller expected.
 fn is_plan_refusal(refusal: &DoorRefusal) -> bool {
     matches!(
         refusal,
-        DoorRefusal::ChainStepIncomplete(_)
+        DoorRefusal::NoChain
+            | DoorRefusal::ChainFinished
+            | DoorRefusal::ChainStepIncomplete(_)
             | DoorRefusal::ChainStepNotDeposited
             | DoorRefusal::ChainStepLanded
             | DoorRefusal::ChainStepStillOpen { .. }
+            | DoorRefusal::ChainStepApproved { .. }
             | DoorRefusal::ChainStepMoved { .. }
     )
 }
@@ -705,6 +708,20 @@ async fn chain_abandon(
             tracing::error!(operator = %operator, %error, "the door task did not finish");
             refuse(&operator, "chain-abandon", ServiceError::Internal)
         }
+    }
+}
+
+#[cfg(test)]
+mod plan_refusal_tests {
+    use super::*;
+
+    /// The sentences of a plan that has none to give or none left cross as a refusal, like
+    /// the five that precede them.
+    #[test]
+    fn no_chain_and_a_finished_chain_are_plan_refusals() {
+        assert!(is_plan_refusal(&DoorRefusal::NoChain));
+        assert!(is_plan_refusal(&DoorRefusal::ChainFinished));
+        assert!(!is_plan_refusal(&DoorRefusal::NoVault));
     }
 }
 

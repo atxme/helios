@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use crate::chain::{ChainError, ChainPlan};
 use aether::certificates::status::CampaignScope;
-use aether::certificates::transport::OperatorChainView;
+use aether::certificates::transport::{OperatorChainView, SigningOperationState};
 
 use super::open::{self, Resolved};
 use super::{
@@ -211,9 +211,16 @@ impl AstraService {
         if let Some(operation_id) = plan.pending().and_then(|step| step.operation_id) {
             let store = self.signing.lock().await;
             if let Ok(operation) = store.get(&operation_id, now_unix) {
-                return Err(DoorRefusal::ChainStepStillOpen {
-                    expires_at: operation.expires_at,
-                });
+                let expires_at = operation.expires_at;
+                // An approved campaign is no longer waiting for anyone: telling the operator to
+                // approve it would send them to a ceremony that has nothing left to ask.
+                return Err(
+                    if operation.state == SigningOperationState::AwaitingOperator {
+                        DoorRefusal::ChainStepStillOpen { expires_at }
+                    } else {
+                        DoorRefusal::ChainStepApproved { expires_at }
+                    },
+                );
             }
         }
         self.chain_deposit_current(&volume, connector, plan, now_unix, gateway_bound)

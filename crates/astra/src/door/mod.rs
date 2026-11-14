@@ -454,6 +454,8 @@ pub enum DoorRefusal {
     ChainStepLanded,
     #[error("la campagne de l'étape est encore ouverte jusqu'à {} : l'approuver", aether::display_time::format_paris_timestamp(*.expires_at))]
     ChainStepStillOpen { expires_at: u64 },
+    #[error("la campagne de l'étape a été approuvée et reste ouverte jusqu'à {} : attendre son échéance", aether::display_time::format_paris_timestamp(*.expires_at))]
+    ChainStepApproved { expires_at: u64 },
     #[error("le plan n'est plus sur cette étape : relire le plan")]
     ChainStepMoved { current: usize },
     #[error(
@@ -549,6 +551,7 @@ impl DoorRefusal {
             | Self::ChainStepNotDeposited
             | Self::ChainStepLanded
             | Self::ChainStepStillOpen { .. }
+            | Self::ChainStepApproved { .. }
             | Self::ChainStepMoved { .. }
             | Self::NoClientTlsAnchor
             | Self::IssuerEpochMoved { .. }

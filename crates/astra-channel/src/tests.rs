@@ -619,6 +619,27 @@ fn a_relayed_open_carries_the_operator_and_the_request() {
     assert!(serde_json::from_value::<RelayedOperatorOpen>(extra).is_err());
 }
 
+/// An older Astra refuses an unknown field: a step asked of the current one must not carry an
+/// `expected_step` at all.
+#[test]
+fn a_relayed_chain_step_without_an_expected_step_omits_the_field() {
+    let current = RelayedChainStep {
+        operator: OperatorIdentity::DevLoopback,
+        expected_step: None,
+    };
+    let value = serde_json::to_value(&current).expect("serialize");
+    assert!(value.get("expected_step").is_none(), "{value}");
+    let back: RelayedChainStep = serde_json::from_value(value).expect("round trip");
+    assert_eq!(back.expected_step, None);
+
+    let named = RelayedChainStep {
+        expected_step: Some(2),
+        ..current
+    };
+    let value = serde_json::to_value(&named).expect("serialize");
+    assert_eq!(value["expected_step"], 2);
+}
+
 #[tokio::test]
 async fn every_mutation_bounds_the_body_before_registry_dispatch() {
     for path in [

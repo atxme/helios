@@ -1766,6 +1766,44 @@ async fn reopen_refuses_while_the_operation_lives() {
     );
 }
 
+/// An approved step is not « encore ouverte à approuver »: it stays open until its deadline, and
+/// the operator is told to wait for it.
+#[tokio::test]
+async fn reopen_refuses_an_approved_step_with_its_own_sentence() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture(dir.path());
+    let (opened, ..) = chain_step(
+        service
+            .door(console(), DoorRequest::ChainOpen { text: text() }, NOW)
+            .await,
+    );
+    let opened = opened.expect("the first step opens");
+    service
+        .signing
+        .lock()
+        .await
+        .approve_without_ceremony(&opened.operation_id);
+    let refused = service
+        .door(
+            console(),
+            DoorRequest::ChainReopen {
+                expected_step: None,
+            },
+            NOW + 1,
+        )
+        .await
+        .expect_err("refused");
+    match &refused {
+        DoorRefusal::ChainStepApproved { expires_at } => assert_eq!(*expires_at, opened.expires_at),
+        other => panic!("expected ChainStepApproved, got {other:?}"),
+    }
+    assert_eq!(
+        refused.to_string(),
+        "la campagne de l'étape a été approuvée et reste ouverte jusqu'à 1970-01-12 14:51 CET : \
+         attendre son échéance"
+    );
+}
+
 #[tokio::test]
 async fn reopen_redeposits_an_expired_step_only() {
     let dir = tempfile::tempdir().expect("temp dir");
