@@ -422,6 +422,33 @@ describe('the follow-up', () => {
     }
   })
 
+  it('a refused chain step shows the plan’s own sentence, not a rotation in flight', () => {
+    const sentence = "le plan n'est plus sur cette étape : relire le plan"
+    shown(
+      status({
+        operation: 'rotate_client_tls_ca',
+        gesture: 'failed',
+        allowed: [],
+        refusal: { refusal: 'chain_step_refused' },
+        failure_sentence: sentence,
+      }),
+    )
+    expect(screen.getByText(sentence)).toBeTruthy()
+    expect(document.body.textContent).not.toMatch(/Rotation en cours/)
+  })
+
+  it('a refused chain step with no sentence of its own says the plan refused it', () => {
+    shown(
+      status({
+        operation: 'rotate_client_tls_ca',
+        gesture: 'failed',
+        allowed: [],
+        refusal: { refusal: 'chain_step_refused' },
+      }),
+    )
+    expect(screen.getByText('Le plan de renouvellement a refusé cette étape.')).toBeTruthy()
+  })
+
   it('Délai dépassé shows the cut date', () => {
     shown(
       status({

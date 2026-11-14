@@ -481,6 +481,8 @@ export function refusalSentence(
   operation: OperationKind | null = null,
   /** A campaign exists at the authority; `true` when the screen does not say. */
   opened = true,
+  /** The plan's own sentence for a refused chain step, carried by the status that ends there. */
+  failureSentence: string | null = null,
 ): string {
   const rotation = operation === 'rotate_anchor' || operation === 'rotate_client_tls_ca'
   if (rotation) {
@@ -617,6 +619,10 @@ export function refusalSentence(
       return stopSentence('gateway_names_no_anchor', journal)
     case 'rotation_in_flight':
       return 'Rotation en cours. La mener à son terme d’abord.'
+    case 'chain_step_refused':
+      // The plan's sentence is Astra's or Orion's, carried as it is; the fallback is said only
+      // when the status carries none.
+      return failureSentence ?? 'Le plan de renouvellement a refusé cette étape.'
     case 'campaign_closing':
       // Astra's silence on a campaign that has only just closed is not yet its last word.
       return `Campagne à peine close. Rotation conservée : reprendre après ${formatTime(refusal.until)}.`

@@ -1745,6 +1745,8 @@ struct Ceremony {
     peer_cut: bool,
     /// The gateway resumed the request it had prepared: said before the keys.
     request_reused: bool,
+    /// The plan's sentence for a refused chain step, set with [`Refusal::ChainStepRefused`].
+    failure_sentence: Option<String>,
 }
 
 impl Ceremony {
@@ -1764,6 +1766,7 @@ impl Ceremony {
             idle_until: None,
             peer_cut: false,
             request_reused: false,
+            failure_sentence: None,
         }
     }
 
@@ -1790,15 +1793,23 @@ impl Ceremony {
         status.idle_until = self.idle_until;
         status.peer_cut = self.peer_cut;
         status.request_reused = self.request_reused;
+        status.failure_sentence = self.failure_sentence.clone();
         status
     }
 
     fn refuse(&mut self, refusal: Refusal) {
         self.gesture = GestureState::Failed;
         self.refusal = Some(refusal);
+        self.failure_sentence = None;
         self.key_retry = None;
         self.approved.clear();
         self.idle_until = None;
+    }
+
+    /// Refuses a chain step, with the plan's own sentence for the page.
+    fn refuse_chain_step(&mut self, sentence: String) {
+        self.refuse(Refusal::ChainStepRefused);
+        self.failure_sentence = Some(sentence);
     }
 
     /// Abandoned by the operator, before anything left this machine.

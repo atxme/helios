@@ -430,6 +430,10 @@ pub enum Refusal {
     GatewayNamesNoAnchor,
     /// A rotation stands in the way, or is not at the step this gesture takes.
     RotationInFlight,
+    /// The certificate chain refused the step a rotation's approval takes, or the plan has
+    /// finished. The plan's own sentence is in [`OperatorStatus::failure_sentence`], and only
+    /// this class carries it.
+    ChainStepRefused,
     /// The campaign of a signed rotation has just closed, and Astra naming nothing
     /// of it is not yet its last word: a deposit may still be committing. Nothing
     /// was cleared; a look from `until` on decides.
@@ -823,6 +827,10 @@ pub struct OperatorStatus {
     /// operator is told before the keys that no new key is asked for it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub request_reused: bool,
+    /// The plan's sentence for a refused chain step: set with [`Refusal::ChainStepRefused`]
+    /// and no other refusal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_sentence: Option<String>,
 }
 
 impl OperatorStatus {
@@ -849,6 +857,7 @@ impl OperatorStatus {
             idle_until: None,
             peer_cut: false,
             request_reused: false,
+            failure_sentence: None,
         }
     }
 
@@ -1054,6 +1063,7 @@ mod tests {
             (Refusal::InstallDeadlinePassed, "install_deadline_passed"),
             (Refusal::GatewayNamesNoAnchor, "gateway_names_no_anchor"),
             (Refusal::RotationInFlight, "rotation_in_flight"),
+            (Refusal::ChainStepRefused, "chain_step_refused"),
             (Refusal::KeyNotValidated, "key_not_validated"),
             (Refusal::TermsRefused, "terms_refused"),
             (Refusal::NothingToFinish, "nothing_to_finish"),

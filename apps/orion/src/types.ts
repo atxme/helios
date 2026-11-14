@@ -692,6 +692,7 @@ export type Refusal =
   | { refusal: 'install_deadline_passed' }
   | { refusal: 'gateway_names_no_anchor' }
   | { refusal: 'rotation_in_flight' }
+  | { refusal: 'chain_step_refused' }
   | { refusal: 'campaign_closing'; until: number }
   | { refusal: 'key_not_validated' }
   | { refusal: 'terms_refused' }
@@ -946,6 +947,8 @@ export interface OperatorStatus {
   peer_cut?: boolean
   /** La gateway a repris une demande qu'elle avait déjà préparée pour cette époque : dit avant les clés. */
   request_reused?: boolean
+  /** La phrase du plan pour une étape de chaîne refusée, avec `chain_step_refused` seul. */
+  failure_sentence?: string
 }
 
 /** Un geste d'enrôlement (§15.2), fermé : la page ne choisit que parmi ces trois. */

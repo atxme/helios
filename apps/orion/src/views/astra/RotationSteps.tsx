@@ -815,7 +815,13 @@ export function RotationCeremony({
           >
             {refusal.refusal === 'cancelled'
               ? gestureSentence('cancelled', status.operation, opened)
-              : refusalSentence(refusal, shownJournal, status.operation, opened)}
+              : refusalSentence(
+                  refusal,
+                  shownJournal,
+                  status.operation,
+                  opened,
+                  status.failure_sentence ?? null,
+                )}
           </Alert>
         )}
         {status.gesture === 'done' && !prepared && !manifest && (

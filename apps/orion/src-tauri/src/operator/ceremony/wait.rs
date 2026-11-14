@@ -253,6 +253,14 @@ impl Waiting<'_> {
         Ended(Err(message))
     }
 
+    /// Refuses a chain step, with the plan's sentence on the status that ends the ceremony.
+    pub(super) fn refuse_chain_step(&mut self, sentence: String) -> Ended {
+        self.ceremony.keys.clear();
+        self.ceremony.refuse_chain_step(sentence.clone());
+        self.show();
+        Ended(Err(sentence))
+    }
+
     pub(super) fn cancel(&mut self) -> Ended {
         self.ceremony.keys.clear();
         self.ceremony.cancel();

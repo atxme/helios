@@ -64,6 +64,12 @@ describe('refusalSentence for the issuer delegation', () => {
     expect(refusalSentence({ refusal: 'rotation_in_flight' })).toBe(
       'Rotation en cours. La mener à son terme d’abord.',
     )
+    expect(refusalSentence({ refusal: 'chain_step_refused' }, null, 'rotate_client_tls_ca', true, 'la phrase du plan')).toBe(
+      'la phrase du plan',
+    )
+    expect(refusalSentence({ refusal: 'chain_step_refused' })).toBe(
+      'Le plan de renouvellement a refusé cette étape.',
+    )
     expect(refusalSentence({ refusal: 'key_not_validated' })).toBe('Autre clé attendue.')
     expect(refusalSentence({ refusal: 'terms_refused' })).toBe(
       'Durées hors limites. Rien n’a été envoyé.',

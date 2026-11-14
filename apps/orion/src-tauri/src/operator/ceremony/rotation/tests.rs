@@ -297,6 +297,8 @@ enum ChainAnswer {
     Finished,
     /// The plan refuses, with its sentence in the body, as the gateway relays it.
     Refused(String),
+    /// No answer at all: the tunnel's call fails, as at a gateway that is out of reach.
+    Unreachable,
 }
 
 impl ChainRemote for Remote {
@@ -337,6 +339,7 @@ impl Remote {
             }))),
             ChainAnswer::Finished => Ok(OperatorChainStep::Finished),
             ChainAnswer::Refused(sentence) => Err(anyhow::anyhow!(sentence)),
+            ChainAnswer::Unreachable => Err(anyhow::anyhow!("reached through a tunnel instead")),
         }
     }
 }
@@ -685,7 +688,16 @@ impl Bench {
             .expect("lock")
             .push((ask.reopen, ask.expected_step));
         let held = Mutex::default();
-        obtain_chain_step(&self.remote, &self.path, &towards_gateway(self), ask, &held)
+        let gateway = towards_gateway(self);
+        // An unreachable gateway is a real tunnel call that gets no answer.
+        if matches!(
+            *self.remote.chain_answer.lock().expect("lock"),
+            ChainAnswer::Unreachable
+        ) {
+            let tunnel = Tunnel::new(&gateway.address).expect("tunnel");
+            return obtain_chain_step(&tunnel, &self.path, &gateway, ask, &held);
+        }
+        obtain_chain_step(&self.remote, &self.path, &gateway, ask, &held)
     }
 
     fn chain_asked(&self) -> Vec<(bool, usize)> {
@@ -1021,11 +1033,31 @@ fn a_refused_chain_step_ends_the_ceremony_with_its_sentence() {
     });
     assert_eq!(ran.outcome, Err(sentence.to_string()));
     assert_eq!(ran.words.as_deref(), Some(sentence));
-    ran.refused(Refusal::RotationInFlight);
+    ran.refused(Refusal::ChainStepRefused);
+    assert_eq!(ran.last().failure_sentence.as_deref(), Some(sentence));
     assert!(!ran.still_held);
     assert_eq!(bench.chain_asked(), [(false, 1)]);
     assert!(!bench.remote.called("open_campaign"));
     assert!(!bench.remote.called("submit_campaign"));
+}
+
+/// A gateway out of reach at the chain's step is still the gateway being unavailable: it carries
+/// no sentence of the plan.
+#[test]
+fn an_unreachable_chain_step_stays_gateway_unavailable_without_a_sentence() {
+    let bench = bench();
+    *bench.remote.chain_answer.lock().expect("lock") = ChainAnswer::Unreachable;
+    let ran = bench.drive(RotationGesture::ReplaceCaTls, |status, bench| {
+        if awaits_terms(status) {
+            return approve_it(status, chain_terms(false));
+        }
+        Bench::all_the_way(status, bench)
+    });
+    assert!(ran.outcome.is_err());
+    assert_eq!(ran.words, None);
+    ran.refused(Refusal::GatewayUnavailable);
+    assert_eq!(ran.last().failure_sentence, None);
+    assert!(!bench.remote.called("open_campaign"));
 }
 
 /// A plan that has finished says so in Orion's own words, whichever step was asked.
@@ -1042,7 +1074,12 @@ fn a_finished_chain_plan_ends_the_ceremony_with_its_sentence() {
         });
         assert_eq!(ran.outcome, Err(sentence.to_string()), "reopen {reopen}");
         assert_eq!(ran.words.as_deref(), Some(sentence), "reopen {reopen}");
-        ran.refused(Refusal::RotationInFlight);
+        ran.refused(Refusal::ChainStepRefused);
+        assert_eq!(
+            ran.last().failure_sentence.as_deref(),
+            Some(sentence),
+            "reopen {reopen}"
+        );
         assert!(!bench.remote.called("open_campaign"));
     }
 }
@@ -2608,10 +2645,9 @@ async fn a_corrected_approval_opens_with_no_further_touch() {
     until(&ceremony, |status| status.gesture.is_terminal()).await;
 }
 
-/// The approval answers with the chain's sentence, the words the page shows, and no campaign is
-/// opened.
+/// The failed status carries the chain's sentence, and no campaign is opened.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_refused_chain_step_reaches_the_approval_as_its_sentence() {
+async fn a_refused_chain_step_fails_the_ceremony_with_its_sentence() {
     let bench = bench();
     let sentence = "le plan a avancé : relire avant de reprendre";
     *bench.remote.chain_answer.lock().expect("lock") = ChainAnswer::Refused(sentence.into());
@@ -2619,11 +2655,14 @@ async fn a_refused_chain_step_reaches_the_approval_as_its_sentence() {
     open_session(&ceremony, &bench, RotationGesture::ReplaceCaTls).await;
     let screen = on_the_approval_screen(&ceremony, &bench).await;
 
-    let refused = ceremony
+    ceremony
         .approve_rotation(chain_terms(false), screen.revision)
         .await
-        .expect_err("the chain refused");
-    assert_eq!(refused, sentence);
+        .expect("answered");
+    let ended = until(&ceremony, |status| status.gesture.is_terminal()).await;
+    assert_eq!(ended.gesture, GestureState::Failed);
+    assert_eq!(ended.refusal, Some(Refusal::ChainStepRefused));
+    assert_eq!(ended.failure_sentence.as_deref(), Some(sentence));
     assert!(!bench.remote.called("open_campaign"));
     ceremony.dismiss().await.expect("dismissed");
 }

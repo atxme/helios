@@ -49,8 +49,8 @@ const WRONG_GATEWAY: &str = "la gateway jointe n'est pas celle que le relais du 
 const ROTATION_KEYS: u8 = 2;
 
 /// Runs one rotation gesture to its end against the vault at `vault_path`, publishing
-/// every state it reaches. What a chain step refuses is stored in `words` before its failure
-/// is published, for the page to read back.
+/// every state it reaches. What a chain step refuses is stored in `words`, as the gateway
+/// step stores its own, and the failed status carries the same sentence.
 ///
 /// Called from the ceremony's own thread, which is what lets the tunnel be used with
 /// a blocking wait: that thread is not a runtime worker.
@@ -342,10 +342,10 @@ impl RotationRun<'_> {
             _ => rotation::open(self.reach.remote, self.vault_path, kind, *keys, terms, now),
         }
         .map_err(|error| match error.downcast_ref::<ChainStepRefusal>() {
-            // The plan's own word, stored before the failure is published: the page reads it.
+            // The plan's own word goes on the failed status, and into the words the session keeps.
             Some(refused) => {
                 store_words(self.words, &refused.0);
-                self.refuse(Refusal::RotationInFlight, refused.0.clone())
+                self.refuse_chain_step(refused.0.clone())
             }
             None => self.refuse(refusal_of_open(&error), format!("{error:#}")),
         })?;

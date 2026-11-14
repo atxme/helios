@@ -962,7 +962,7 @@ impl OperatorCeremony {
         vault_path: PathBuf,
         chain_opened: Arc<StdMutex<Option<OperatorOpened>>>,
     ) -> Result<OperatorStatus, String> {
-        // The sentence a chain step refuses with, read back by the approval that takes it.
+        // The words the rotation run stores for a refused chain step, as the gateway step does.
         let words: Words = Default::default();
         let thread_words = words.clone();
         self.open_as(
@@ -1102,48 +1102,29 @@ impl OperatorCeremony {
         terms: RotationTerms,
         revision: u64,
     ) -> Result<OperatorStatus, String> {
-        let mut status = {
-            let mut held = self.0.lock().await;
-            let session = held
-                .as_mut()
-                .ok_or_else(|| "aucune cérémonie opérateur n'est ouverte".to_string())?;
+        let mut held = self.0.lock().await;
+        let session = held
+            .as_mut()
+            .ok_or_else(|| "aucune cérémonie opérateur n'est ouverte".to_string())?;
 
-            let current = session.status.borrow_and_update().clone();
-            if !awaits_terms(&current) || current.revision != revision {
-                return Err(
-                    "cette étape n'accepte pas cette action : l'écran a changé depuis la pression"
-                        .to_string(),
-                );
-            }
+        let current = session.status.borrow_and_update().clone();
+        if !awaits_terms(&current) || current.revision != revision {
+            return Err(
+                "cette étape n'accepte pas cette action : l'écran a changé depuis la pression"
+                    .to_string(),
+            );
+        }
 
-            session
-                .presses
-                .send(Press {
-                    action: OperatorAction::Continue,
-                    revision,
-                    owner: 0,
-                    terms: Some(terms),
-                })
-                .map_err(|_| STOPPED.to_string())?;
-            awaited(&mut session.status).await?
-        };
-        // Waits while the campaign opens on its own: the chain's step is taken there, and what
-        // it refuses is said on this answer, not only on a later poll.
-        while matches!(
-            status.gesture,
-            GestureState::Verifying | GestureState::Signing | GestureState::ProcessingKey { .. }
-        ) {
-            let mut held = self.0.lock().await;
-            let Some(session) = held.as_mut() else {
-                break;
-            };
-            status = awaited(&mut session.status).await?;
-        }
-        let held = self.0.lock().await;
-        if let Some(session) = held.as_ref() {
-            failure_words(&session.words, &status)?;
-        }
-        Ok(status)
+        session
+            .presses
+            .send(Press {
+                action: OperatorAction::Continue,
+                revision,
+                owner: 0,
+                terms: Some(terms),
+            })
+            .map_err(|_| STOPPED.to_string())?;
+        awaited(&mut session.status).await
     }
 
     /// The files the current session produced, or none.
