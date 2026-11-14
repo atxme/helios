@@ -105,6 +105,9 @@ fn plan_refusal(error: ChainError) -> DoorRefusal {
         ChainError::NoPlan => DoorRefusal::NoChain,
         ChainError::AlreadyOpen(remaining) => DoorRefusal::ChainAlreadyOpen { remaining },
         ChainError::Finished => DoorRefusal::ChainFinished,
+        ChainError::NotDeposited => DoorRefusal::ChainStepNotDeposited,
+        ChainError::Landed => DoorRefusal::ChainStepLanded,
+        ChainError::Moved { current } => DoorRefusal::ChainStepMoved { current },
         ChainError::StepIncomplete { .. } => DoorRefusal::ChainStepIncomplete(error.to_string()),
         ChainError::UnsupportedFormatVersion { .. } => {
             tracing::error!(%error, "the chain plan cannot be used");
@@ -149,11 +152,13 @@ impl AstraService {
     pub(super) async fn chain_next(
         &self,
         connector: &DoorConnector,
+        expected_step: Option<usize>,
         now_unix: u64,
         gateway_bound: Duration,
     ) -> Result<DoorOutcome, DoorRefusal> {
         let volume = self.volume_writes.lock().await;
         let mut plan = load_plan(self)?.ok_or(DoorRefusal::NoChain)?;
+        plan.assert_expected(expected_step).map_err(plan_refusal)?;
         {
             let registry = self.registry.lock().await;
             plan.assert_current_landed(registry.state())
@@ -172,6 +177,44 @@ impl AstraService {
                 remaining: 0,
                 plan: None,
             });
+        }
+        self.chain_deposit_current(&volume, connector, plan, now_unix, gateway_bound)
+            .await
+    }
+
+    /// Redeposits the current step, once its campaign has expired without
+    /// taking effect.
+    ///
+    /// The step is deposited again under the same motive and requester, as if
+    /// the plan had reached it now. The plan keeps its position and its other
+    /// steps. A step whose operation is still in the store is refused, and so
+    /// is one whose effect has landed; an operation the store no longer holds,
+    /// after a restart for instance, counts as expired.
+    pub(super) async fn chain_reopen(
+        &self,
+        connector: &DoorConnector,
+        expected_step: Option<usize>,
+        now_unix: u64,
+        gateway_bound: Duration,
+    ) -> Result<DoorOutcome, DoorRefusal> {
+        let volume = self.volume_writes.lock().await;
+        let plan = load_plan(self)?.ok_or(DoorRefusal::NoChain)?;
+        if plan.pending().is_none() {
+            return Err(plan_refusal(ChainError::Finished));
+        }
+        plan.assert_expected(expected_step).map_err(plan_refusal)?;
+        {
+            let registry = self.registry.lock().await;
+            plan.assert_reopenable(registry.state())
+                .map_err(plan_refusal)?;
+        }
+        if let Some(operation_id) = plan.pending().and_then(|step| step.operation_id) {
+            let store = self.signing.lock().await;
+            if let Ok(operation) = store.get(&operation_id, now_unix) {
+                return Err(DoorRefusal::ChainStepStillOpen {
+                    expires_at: operation.expires_at,
+                });
+            }
         }
         self.chain_deposit_current(&volume, connector, plan, now_unix, gateway_bound)
             .await

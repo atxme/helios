@@ -235,7 +235,8 @@ fn specified(request: &DoorRequest) -> (bool, bool) {
         DoorRequest::GatewayRevocation { .. } => (true, true),
         DoorRequest::GatewayIdentity { .. } => (true, true),
         DoorRequest::ChainOpen { .. } => (true, true),
-        DoorRequest::ChainNext {} => (true, true),
+        DoorRequest::ChainNext { .. } => (true, true),
+        DoorRequest::ChainReopen { .. } => (true, true),
         DoorRequest::ChainAbandon {} => (true, true),
         DoorRequest::IssuerDelegation { .. } => (true, true),
         DoorRequest::IssuerRequest {} => (true, false),
@@ -258,7 +259,12 @@ fn the_policy_table_is_exactly_the_specification() {
         DoorRequest::GatewayRevocation { text: text() },
         DoorRequest::GatewayIdentity { text: text() },
         DoorRequest::ChainOpen { text: text() },
-        DoorRequest::ChainNext {},
+        DoorRequest::ChainNext {
+            expected_step: None,
+        },
+        DoorRequest::ChainReopen {
+            expected_step: None,
+        },
         DoorRequest::ChainAbandon {},
         DoorRequest::IssuerDelegation { text: text() },
         DoorRequest::IssuerRequest {},
@@ -1374,7 +1380,18 @@ fn the_tunnel_may_open_gateway_actions() {
             "gateway_revocation",
         ),
         (DoorRequest::ChainOpen { text: text() }, "chain_open"),
-        (DoorRequest::ChainNext {}, "chain_next"),
+        (
+            DoorRequest::ChainNext {
+                expected_step: None,
+            },
+            "chain_next",
+        ),
+        (
+            DoorRequest::ChainReopen {
+                expected_step: None,
+            },
+            "chain_reopen",
+        ),
         (DoorRequest::ChainAbandon {}, "chain_abandon"),
     ];
     for (request, row) in &rows {
@@ -1535,7 +1552,13 @@ async fn a_chain_step_and_a_fleet_campaign_block_each_other() {
             .await,
     );
     match service
-        .door(console(), DoorRequest::ChainNext {}, NOW + 3)
+        .door(
+            console(),
+            DoorRequest::ChainNext {
+                expected_step: None,
+            },
+            NOW + 3,
+        )
         .await
     {
         Err(DoorRefusal::AlreadyOpen { operation_id }) => {
@@ -1552,7 +1575,13 @@ async fn chain_next_refuses_a_step_that_has_not_landed() {
     let service = fixture(dir.path());
     assert!(matches!(
         service
-            .door(console(), DoorRequest::ChainNext {}, NOW)
+            .door(
+                console(),
+                DoorRequest::ChainNext {
+                    expected_step: None
+                },
+                NOW
+            )
             .await,
         Err(DoorRefusal::NoChain)
     ));
@@ -1562,7 +1591,13 @@ async fn chain_next_refuses_a_step_that_has_not_landed() {
             .await,
     );
     let refused = service
-        .door(console(), DoorRequest::ChainNext {}, NOW + 1)
+        .door(
+            console(),
+            DoorRequest::ChainNext {
+                expected_step: None,
+            },
+            NOW + 1,
+        )
         .await;
     assert!(
         matches!(refused, Err(DoorRefusal::ChainStepIncomplete(_))),
@@ -1592,7 +1627,13 @@ async fn chain_next_opens_the_following_step_once_the_previous_has_landed() {
 
     let (opened, request, remaining) = chain_step(
         service
-            .door(console(), DoorRequest::ChainNext {}, NOW + 1)
+            .door(
+                console(),
+                DoorRequest::ChainNext {
+                    expected_step: None,
+                },
+                NOW + 1,
+            )
             .await,
     );
     let opened = opened.expect("the second step opens");
@@ -1602,6 +1643,315 @@ async fn chain_next_opens_the_following_step_once_the_previous_has_landed() {
     let campaign = campaign_of(&service, &opened).await;
     assert_eq!(campaign.targets.len(), 1);
     assert_eq!(campaign.targets[0].certificate_kind, CertificateKind::CaTls);
+    assert_eq!(read_plan(dir.path()).current, 1);
+}
+
+/// The instant past the five-minute window every chain test opens with.
+const PAST_WINDOW: u64 = NOW + 301;
+
+/// Writes the plan back after a test has set its state by hand.
+fn rewrite_plan(dir: &Path, change: impl FnOnce(&mut crate::chain::ChainPlan)) {
+    let mut plan = read_plan(dir);
+    change(&mut plan);
+    std::fs::write(plan_path(dir), serde_json::to_vec(&plan).expect("encodes"))
+        .expect("plan rewritten");
+}
+
+#[tokio::test]
+async fn reopen_without_a_plan_is_no_chain() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture(dir.path());
+    assert!(matches!(
+        service
+            .door(
+                console(),
+                DoorRequest::ChainReopen {
+                    expected_step: None
+                },
+                NOW
+            )
+            .await,
+        Err(DoorRefusal::NoChain)
+    ));
+}
+
+#[tokio::test]
+async fn reopen_refuses_a_step_never_deposited() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture(dir.path());
+    chain_step(
+        service
+            .door(console(), DoorRequest::ChainOpen { text: text() }, NOW)
+            .await,
+    );
+    rewrite_plan(dir.path(), |plan| plan.steps[0].operation_id = None);
+    let refused = service
+        .door(
+            console(),
+            DoorRequest::ChainReopen {
+                expected_step: None,
+            },
+            PAST_WINDOW,
+        )
+        .await;
+    assert!(
+        matches!(refused, Err(DoorRefusal::ChainStepNotDeposited)),
+        "{refused:?}"
+    );
+}
+
+#[tokio::test]
+async fn reopen_refuses_a_step_that_landed() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture(dir.path());
+    chain_step(
+        service
+            .door(console(), DoorRequest::ChainOpen { text: text() }, NOW)
+            .await,
+    );
+    // The delegation lands: the issuer epoch is installed, past the one the
+    // plan resolved at its opening (0, no issuer yet).
+    rewrite_registry(&service, |state| {
+        state.issuer = Some(aether::certificates::state::AstraIssuerState {
+            issuer_epoch: 1,
+            authorization: delegation(&delegated_material(), 1),
+            state: aether::certificates::state::IssuerLifecycle::Active,
+        });
+    })
+    .await;
+    let refused = service
+        .door(
+            console(),
+            DoorRequest::ChainReopen {
+                expected_step: None,
+            },
+            PAST_WINDOW,
+        )
+        .await;
+    assert!(
+        matches!(refused, Err(DoorRefusal::ChainStepLanded)),
+        "{refused:?}"
+    );
+}
+
+#[tokio::test]
+async fn reopen_refuses_while_the_operation_lives() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture(dir.path());
+    let (opened, ..) = chain_step(
+        service
+            .door(console(), DoorRequest::ChainOpen { text: text() }, NOW)
+            .await,
+    );
+    let opened = opened.expect("the first step opens");
+    let refused = service
+        .door(
+            console(),
+            DoorRequest::ChainReopen {
+                expected_step: None,
+            },
+            NOW + 1,
+        )
+        .await;
+    match &refused {
+        Err(DoorRefusal::ChainStepStillOpen { expires_at }) => {
+            assert_eq!(*expires_at, opened.expires_at)
+        }
+        other => panic!("expected ChainStepStillOpen, got {other:?}"),
+    }
+    // The window ends at NOW + 300 s: 1970-01-12 13:51 UTC.
+    assert_eq!(
+        refused.expect_err("refused").to_string(),
+        "la campagne de l'étape est encore ouverte jusqu'à 1970-01-12 13:51 UTC : l'approuver"
+    );
+}
+
+#[tokio::test]
+async fn reopen_redeposits_an_expired_step_only() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture(dir.path());
+    let (first, ..) = chain_step(
+        service
+            .door(console(), DoorRequest::ChainOpen { text: text() }, NOW)
+            .await,
+    );
+    let first = first.expect("the first step opens");
+    let before = read_plan(dir.path());
+    let (reopened, request, remaining) = chain_step(
+        service
+            .door(
+                console(),
+                DoorRequest::ChainReopen {
+                    expected_step: None,
+                },
+                PAST_WINDOW,
+            )
+            .await,
+    );
+    let reopened = reopened.expect("the expired step is deposited again");
+    assert_eq!(reopened.scope, CampaignScope::IssuerDelegation);
+    assert_ne!(reopened.operation_id, first.operation_id);
+    assert!(request.is_some(), "the delegation step returns its request");
+    assert_eq!(remaining, 4);
+    let after = read_plan(dir.path());
+    assert_eq!(after.current, before.current);
+    assert_eq!(after.steps[0].operation_id, Some(reopened.operation_id));
+    assert_eq!(after.steps[1..], before.steps[1..]);
+}
+
+#[tokio::test]
+async fn reopen_gateway_step_takes_the_new_campaign() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture_with_gateway(dir.path()).await;
+    chain_step(
+        service
+            .door(console(), DoorRequest::ChainOpen { text: text() }, NOW)
+            .await,
+    );
+    rewrite_plan(dir.path(), |plan| {
+        plan.current = 2;
+        plan.steps[2].operation_id = Some(Id16::new([6; 16]).expect("id"));
+        plan.steps[2].effect = crate::chain::ChainEffect::GatewayDecisionStored {
+            campaign_id: Id16::new([7; 16]).expect("id"),
+        };
+    });
+    // The deposited campaign is no longer in the store: it counts as expired.
+    let (reopened, ..) = chain_step(
+        service
+            .door(
+                console(),
+                DoorRequest::ChainReopen {
+                    expected_step: None,
+                },
+                NOW,
+            )
+            .await,
+    );
+    let reopened = reopened.expect("the gateway step opens");
+    assert_eq!(reopened.scope, CampaignScope::GatewayIdentity);
+    let after = read_plan(dir.path());
+    assert_eq!(
+        after.steps[2].effect,
+        crate::chain::ChainEffect::GatewayDecisionStored {
+            campaign_id: reopened.campaign_id
+        }
+    );
+    assert_eq!(after.steps[2].operation_id, Some(reopened.operation_id));
+}
+
+#[tokio::test]
+async fn reopen_fleet_step_reopens_although_spent_by_peers() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture(dir.path());
+    chain_step(
+        service
+            .door(console(), DoorRequest::ChainOpen { text: text() }, NOW)
+            .await,
+    );
+    rewrite_plan(dir.path(), |plan| {
+        plan.current = 3;
+        plan.steps[3].operation_id = Some(Id16::new([8; 16]).expect("id"));
+    });
+    let (reopened, ..) = chain_step(
+        service
+            .door(
+                console(),
+                DoorRequest::ChainReopen {
+                    expected_step: None,
+                },
+                NOW,
+            )
+            .await,
+    );
+    let reopened = reopened.expect("the fleet step opens again");
+    assert_eq!(reopened.scope, CampaignScope::FleetLeafs);
+    assert_eq!(
+        read_plan(dir.path()).steps[3].operation_id,
+        Some(reopened.operation_id)
+    );
+}
+
+#[tokio::test]
+async fn reopen_after_a_restart_counts_as_expired() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let before_restart = fixture(dir.path());
+    let (first, ..) = chain_step(
+        before_restart
+            .door(console(), DoorRequest::ChainOpen { text: text() }, NOW)
+            .await,
+    );
+    let first = first.expect("the first step opens");
+    drop(before_restart);
+    // A new service on the same volume: its operation store starts empty,
+    // and the clock has not reached the window's end.
+    let after_restart = fixture(dir.path());
+    let (reopened, ..) = chain_step(
+        after_restart
+            .door(
+                console(),
+                DoorRequest::ChainReopen {
+                    expected_step: None,
+                },
+                NOW + 1,
+            )
+            .await,
+    );
+    let reopened = reopened.expect("the forgotten step is deposited again");
+    assert_ne!(reopened.operation_id, first.operation_id);
+}
+
+#[tokio::test]
+async fn next_and_reopen_refuse_a_moved_plan() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture(dir.path());
+    chain_step(
+        service
+            .door(console(), DoorRequest::ChainOpen { text: text() }, NOW)
+            .await,
+    );
+    // The step the caller read is still awaiting its effect: the expectation
+    // holds, and the refusal is the one about the effect.
+    let stale = service
+        .door(
+            console(),
+            DoorRequest::ChainNext {
+                expected_step: Some(0),
+            },
+            NOW + 1,
+        )
+        .await;
+    assert!(
+        matches!(stale, Err(DoorRefusal::ChainStepIncomplete(_))),
+        "{stale:?}"
+    );
+    // A console advanced the plan in the meantime.
+    rewrite_plan(dir.path(), |plan| plan.current = 1);
+    let next = service
+        .door(
+            console(),
+            DoorRequest::ChainNext {
+                expected_step: Some(0),
+            },
+            NOW + 1,
+        )
+        .await;
+    assert!(
+        matches!(next, Err(DoorRefusal::ChainStepMoved { current: 1 })),
+        "{next:?}"
+    );
+    let reopen = service
+        .door(
+            console(),
+            DoorRequest::ChainReopen {
+                expected_step: Some(0),
+            },
+            PAST_WINDOW,
+        )
+        .await;
+    assert!(
+        matches!(reopen, Err(DoorRefusal::ChainStepMoved { current: 1 })),
+        "{reopen:?}"
+    );
     assert_eq!(read_plan(dir.path()).current, 1);
 }
 
@@ -1733,7 +2083,24 @@ async fn a_refused_delegation_leaves_the_keys_it_would_have_replaced() {
 #[test]
 fn the_requests_without_text_are_a_bare_action_on_the_socket() {
     for (body, expected) in [
-        (r#"{"action":"chain_next"}"#, DoorRequest::ChainNext {}),
+        (
+            r#"{"action":"chain_next"}"#,
+            DoorRequest::ChainNext {
+                expected_step: None,
+            },
+        ),
+        (
+            r#"{"action":"chain_reopen"}"#,
+            DoorRequest::ChainReopen {
+                expected_step: None,
+            },
+        ),
+        (
+            r#"{"action":"chain_next","expected_step":2}"#,
+            DoorRequest::ChainNext {
+                expected_step: Some(2),
+            },
+        ),
         (
             r#"{"action":"chain_abandon"}"#,
             DoorRequest::ChainAbandon {},
@@ -2293,7 +2660,9 @@ async fn a_mute_gateway_releases_the_volume_gate_at_the_bound() {
             service
                 .door_within(
                     console(),
-                    DoorRequest::ChainNext {},
+                    DoorRequest::ChainNext {
+                        expected_step: None,
+                    },
                     NOW + 1,
                     MUTE_GATEWAY_BOUND,
                 )

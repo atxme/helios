@@ -159,11 +159,20 @@ pub enum DoorRequest {
     ChainOpen { text: OpeningText },
     /// Opens the next step, once the previous one has taken effect.
     ///
-    /// Carries nothing: the text is the plan's, and the gateway is the one
-    /// the service already holds a channel to. An empty struct variant and
-    /// not a unit one, so that `deny_unknown_fields` still refuses a body
-    /// that names a field (a unit variant would ignore it).
-    ChainNext {},
+    /// The text is the plan's, and the gateway is the one the service already
+    /// holds a channel to. `expected_step` is the step the caller read as
+    /// current; the door refuses when the plan has moved on from it. `None`
+    /// acts on whatever step is current.
+    ChainNext {
+        #[serde(default)]
+        expected_step: Option<usize>,
+    },
+    /// Redeposits the current step once its campaign has expired without
+    /// taking effect. `expected_step` works as on [`Self::ChainNext`].
+    ChainReopen {
+        #[serde(default)]
+        expected_step: Option<usize>,
+    },
     /// Drops the plan. Campaigns already approved keep their effect.
     ChainAbandon {},
     /// Draws a delegation's keys, returns its public request, and opens the
@@ -206,7 +215,8 @@ impl DoorRequest {
             Self::GatewayRevocation { .. } => "gateway_revocation",
             Self::GatewayIdentity { .. } => "gateway_identity",
             Self::ChainOpen { .. } => "chain_open",
-            Self::ChainNext {} => "chain_next",
+            Self::ChainNext { .. } => "chain_next",
+            Self::ChainReopen { .. } => "chain_reopen",
             Self::ChainAbandon {} => "chain_abandon",
             Self::IssuerDelegation { .. } => "issuer_delegation",
             Self::IssuerRequest {} => "issuer_request",
@@ -438,6 +448,14 @@ pub enum DoorRefusal {
     ChainFinished,
     #[error("{0}. Approuver cette étape avant d'avancer, ou abandonner la chaîne.")]
     ChainStepIncomplete(String),
+    #[error("l'étape n'a pas été ouverte : continuer le plan")]
+    ChainStepNotDeposited,
+    #[error("l'étape a pris effet : continuer le plan")]
+    ChainStepLanded,
+    #[error("la campagne de l'étape est encore ouverte jusqu'à {} : l'approuver", utc_minute(.expires_at))]
+    ChainStepStillOpen { expires_at: u64 },
+    #[error("le plan n'est plus sur cette étape : relire le plan")]
+    ChainStepMoved { current: usize },
     #[error(
         "ce domaine n'épingle aucune CA TLS cliente : `pin-ca-tls` l'enregistre une fois, et une \
          rotation ne se vérifie pas sans elle"
@@ -528,6 +546,10 @@ impl DoorRefusal {
             | Self::NoChain
             | Self::ChainFinished
             | Self::ChainStepIncomplete(_)
+            | Self::ChainStepNotDeposited
+            | Self::ChainStepLanded
+            | Self::ChainStepStillOpen { .. }
+            | Self::ChainStepMoved { .. }
             | Self::NoClientTlsAnchor
             | Self::IssuerEpochMoved { .. }
             | Self::ClientTlsAnchorAlreadyPinned
@@ -556,6 +578,27 @@ impl DoorRefusal {
     }
 }
 
+/// A Unix time as the UTC minute an operator reads, `AAAA-MM-JJ HH:MM UTC`.
+///
+/// Refusal sentences that name a deadline carry it through this, because the
+/// console has no clock of its own to put beside it.
+fn utc_minute(seconds: &u64) -> String {
+    let Ok(seconds) = i64::try_from(*seconds) else {
+        return format!("{seconds} (horodatage hors plage)");
+    };
+    let Ok(utc) = time::OffsetDateTime::from_unix_timestamp(seconds) else {
+        return format!("{seconds} (horodatage illisible)");
+    };
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02} UTC",
+        utc.year(),
+        u8::from(utc.month()),
+        utc.day(),
+        utc.hour(),
+        utc.minute()
+    )
+}
+
 /// What each connector may reach: exactly the table of §5.2.
 ///
 /// A datum, not a consequence: widening the tunnel to one more action is a
@@ -569,7 +612,8 @@ pub fn allowed(connector: &DoorConnector, request: &DoorRequest) -> bool {
         DoorRequest::GatewayRevocation { .. } => (true, true),
         DoorRequest::GatewayIdentity { .. } => (true, true),
         DoorRequest::ChainOpen { .. } => (true, true),
-        DoorRequest::ChainNext {} => (true, true),
+        DoorRequest::ChainNext { .. } => (true, true),
+        DoorRequest::ChainReopen { .. } => (true, true),
         DoorRequest::ChainAbandon {} => (true, true),
         DoorRequest::IssuerDelegation { .. } => (true, true),
         DoorRequest::IssuerRequest {} => (true, false),
@@ -763,7 +807,14 @@ impl AstraService {
                 self.chain_open(connector, text, now_unix, gateway_bound)
                     .await
             }
-            DoorRequest::ChainNext {} => self.chain_next(connector, now_unix, gateway_bound).await,
+            DoorRequest::ChainNext { expected_step } => {
+                self.chain_next(connector, expected_step, now_unix, gateway_bound)
+                    .await
+            }
+            DoorRequest::ChainReopen { expected_step } => {
+                self.chain_reopen(connector, expected_step, now_unix, gateway_bound)
+                    .await
+            }
             DoorRequest::ChainAbandon {} => self.chain_abandon().await,
             DoorRequest::IssuerDelegation { text } => {
                 let volume = self.volume_writes.lock().await;

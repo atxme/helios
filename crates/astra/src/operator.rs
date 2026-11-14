@@ -567,7 +567,13 @@ async fn chain_next(
         let service = Arc::clone(&service);
         async move {
             service
-                .door(connector, DoorRequest::ChainNext {}, now_unix())
+                .door(
+                    connector,
+                    DoorRequest::ChainNext {
+                        expected_step: None,
+                    },
+                    now_unix(),
+                )
                 .await
         }
     })

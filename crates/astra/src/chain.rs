@@ -63,6 +63,12 @@ pub enum ChainError {
     },
     #[error("this chain is finished; nothing remains to deposit")]
     Finished,
+    #[error("l'étape n'a pas été ouverte : continuer le plan")]
+    NotDeposited,
+    #[error("l'étape a pris effet : continuer le plan")]
+    Landed,
+    #[error("le plan n'est plus sur cette étape : relire le plan")]
+    Moved { current: usize },
     #[error("unsupported chain plan format {received}, this build writes {supported}")]
     UnsupportedFormatVersion { received: u16, supported: u16 },
 }
@@ -279,6 +285,41 @@ impl ChainPlan {
         })
     }
 
+    /// Refuses an action on a step other than the one the caller expects.
+    ///
+    /// `None` expects whatever step is current, which is what the console
+    /// asks for. A caller that read the plan before acting names the step it
+    /// read, so that a plan advanced in between is not acted on under the
+    /// controls of another step.
+    pub fn assert_expected(&self, expected: Option<usize>) -> Result<(), ChainError> {
+        match expected {
+            Some(step) if step != self.current => Err(ChainError::Moved {
+                current: self.current,
+            }),
+            _ => Ok(()),
+        }
+    }
+
+    /// Refusals of a reopen that need only the plan and the registry.
+    ///
+    /// A step whose effect the registry shows has landed and is not reopened.
+    /// The fleet step is the exception: its effect is spent by the peers and
+    /// cannot be observed, so it is always reopenable once its operation has
+    /// ended. The operation's own liveness is checked by the door, which holds
+    /// the operation store.
+    pub fn assert_reopenable(&self, state: &crate::registry::AstraState) -> Result<(), ChainError> {
+        let Some(step) = self.pending() else {
+            return Err(ChainError::Finished);
+        };
+        if step.operation_id.is_none() {
+            return Err(ChainError::NotDeposited);
+        }
+        if !matches!(step.effect, ChainEffect::SpentByPeers) && step.completed_by(state) {
+            return Err(ChainError::Landed);
+        }
+        Ok(())
+    }
+
     /// Records what a deposit produced for the current step.
     pub fn record_deposit(
         &mut self,
@@ -447,6 +488,23 @@ mod tests {
             .effect
             .expected()
             .contains("rien n'est observé"));
+    }
+
+    /// A caller acting on a plan it read earlier names the step it read. A
+    /// plan advanced since is refused, not acted on under another step's
+    /// controls.
+    #[test]
+    fn an_expected_step_must_be_the_current_one() {
+        let state = state();
+        let mut plan = plan(&state);
+        plan.assert_expected(None).expect("no expectation");
+        plan.assert_expected(Some(0))
+            .expect("the step read is current");
+        plan.current = 1;
+        assert!(matches!(
+            plan.assert_expected(Some(0)),
+            Err(ChainError::Moved { current: 1 })
+        ));
     }
 
     fn issuer_authorization() -> aether::certificates::authority::AstraIssuerAuthorization {

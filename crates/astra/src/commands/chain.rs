@@ -129,7 +129,12 @@ pub(crate) fn chain_open(
 
 pub(crate) fn chain_next(state_dir: &Path, issuer_request_out: Option<&Path>) -> Result<()> {
     let issuer_request_out = issuer_request_out.map(RequestOut::open).transpose()?;
-    let outcome = console::open(state_dir, DoorRequest::ChainNext {})?;
+    let outcome = console::open(
+        state_dir,
+        DoorRequest::ChainNext {
+            expected_step: None,
+        },
+    )?;
     match &outcome {
         DoorOutcome::ChainStep { opened: None, .. } => {
             eprintln!(
