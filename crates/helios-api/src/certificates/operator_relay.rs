@@ -111,9 +111,20 @@ pub trait OperatorCampaignRelay: Send + Sync {
 
     /// Asks Astra to open the next step of the certificate chain, for this
     /// administrator (F14 lot 6b). No capability token: the step is the plan's.
+    /// `expected_step` is the step the caller read; `None` acts on the current one.
     async fn chain_next(
         &self,
         operator: &astra_channel::OperatorIdentity,
+        expected_step: Option<usize>,
+    ) -> Result<astra_channel::OperatorChainStep, ChainRefusal>;
+
+    /// Asks Astra to redeposit the current step of the certificate chain, once
+    /// its campaign has ended, for this administrator (F14-g). Takes the same
+    /// `expected_step` as [`Self::chain_next`].
+    async fn chain_reopen(
+        &self,
+        operator: &astra_channel::OperatorIdentity,
+        expected_step: Option<usize>,
     ) -> Result<astra_channel::OperatorChainStep, ChainRefusal>;
 
     /// Asks Astra to drop the certificate chain's plan (F14 lot 6b).
@@ -511,24 +522,89 @@ pub async fn operator_gateway_publish(
     }
 }
 
+/// The body of the chain routes `next` and `reopen`: the step the caller
+/// expects. An empty body is the default, which acts on the current step.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorChainAsk {
+    #[serde(default)]
+    pub expected_step: Option<usize>,
+}
+
+/// Reads the chain route's body: empty is the default, anything else must be
+/// an [`OperatorChainAsk`]. A body that is neither is a `400`.
+fn chain_ask(
+    route: &str,
+    operator: &astra_channel::OperatorIdentity,
+    body: &Bytes,
+) -> Result<OperatorChainAsk, StatusCode> {
+    if body.is_empty() {
+        return Ok(OperatorChainAsk::default());
+    }
+    serde_json::from_slice(body).map_err(|error| {
+        // The parser's message can quote the input: only that it failed.
+        tracing::warn!(
+            operator = %operator,
+            route,
+            kind = ?error.classify(),
+            "operator chain step refused: unreadable body"
+        );
+        StatusCode::BAD_REQUEST
+    })
+}
+
 /// `POST /api/certificates/operator/chain/next`.
 ///
-/// The caller is an administrator before anything else is read; the route takes
-/// no body, the step is the plan's. A step that has not taken effect is a `409`
-/// with its sentence in the body, as the gateway's own gesture refusals carry
-/// theirs; any other refusal is its class.
+/// The caller is an administrator before anything else is read. The body is
+/// empty or `{"expected_step": n}`. A plan refusal (a step that has not taken
+/// effect, or a plan that moved on) is a `409` with its sentence in the body,
+/// as the gateway's own gesture refusals carry theirs; any other refusal is its
+/// class.
 pub async fn operator_chain_next(
     State(s): State<AppState>,
     Extension(caller): Extension<crate::auth::Caller>,
+    body: Bytes,
 ) -> Response {
     let operator = match operator_caller(&caller, "chain-next") {
         Ok(operator) => operator,
         Err(status) => return status.into_response(),
     };
+    let ask = match chain_ask("chain-next", &operator, &body) {
+        Ok(ask) => ask,
+        Err(status) => return status.into_response(),
+    };
     let Some(relay) = s.operator_campaign.as_ref() else {
         return operator_unavailable(&operator, "chain-next");
     };
-    match relay.chain_next(&operator).await {
+    chain_answer(relay.chain_next(&operator, ask.expected_step).await)
+}
+
+/// `POST /api/certificates/operator/chain/reopen`.
+///
+/// Redeposits the current step once its campaign has ended. The caller, the
+/// body and the answers are those of `next`.
+pub async fn operator_chain_reopen(
+    State(s): State<AppState>,
+    Extension(caller): Extension<crate::auth::Caller>,
+    body: Bytes,
+) -> Response {
+    let operator = match operator_caller(&caller, "chain-reopen") {
+        Ok(operator) => operator,
+        Err(status) => return status.into_response(),
+    };
+    let ask = match chain_ask("chain-reopen", &operator, &body) {
+        Ok(ask) => ask,
+        Err(status) => return status.into_response(),
+    };
+    let Some(relay) = s.operator_campaign.as_ref() else {
+        return operator_unavailable(&operator, "chain-reopen");
+    };
+    chain_answer(relay.chain_reopen(&operator, ask.expected_step).await)
+}
+
+/// The answer of a chain step: the step, or its refusal as the operator reads it.
+fn chain_answer(outcome: Result<astra_channel::OperatorChainStep, ChainRefusal>) -> Response {
+    match outcome {
         Ok(step) => (StatusCode::OK, Json(step)).into_response(),
         Err(ChainRefusal::Class(refusal)) => refusal.status().into_response(),
         Err(ChainRefusal::Reason(message)) => GatewayActionRefusal::new(message).into_response(),

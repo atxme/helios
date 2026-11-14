@@ -37,14 +37,14 @@ use std::sync::Arc;
 use aether::certificates::encoding::{Fingerprint, Id16};
 use astra_channel::{
     OperatorAuthorityStatus, OperatorChainRefusal, OperatorChainStep, OperatorGatewayPublished,
-    OperatorIdentity, OperatorIssuerStatus, OperatorVaultCopied, RelayedOperatorCampaign,
-    RelayedOperatorGatewayPublish, RelayedOperatorOpen, RelayedOperatorSignerResult,
-    RelayedOperatorVaultCopy, MAX_OPERATOR_RELAY_BODY_BYTES,
+    OperatorIdentity, OperatorIssuerStatus, OperatorVaultCopied, RelayedChainStep,
+    RelayedOperatorCampaign, RelayedOperatorGatewayPublish, RelayedOperatorOpen,
+    RelayedOperatorSignerResult, RelayedOperatorVaultCopy, MAX_OPERATOR_RELAY_BODY_BYTES,
     MAX_OPERATOR_VAULT_COPY_RELAY_BODY_BYTES, OPERATOR_CHAIN_ABANDON_ROUTE,
-    OPERATOR_CHAIN_NEXT_ROUTE, OPERATOR_GATEWAY_PUBLISH_ROUTE, OPERATOR_OPEN_ROUTE,
-    OPERATOR_OPERATION_ROUTE, OPERATOR_PENDING_ROUTE, OPERATOR_SIGNER_REQUEST_ROUTE,
-    OPERATOR_SIGNER_RESULT_ROUTE, OPERATOR_STATUS_ROUTE, OPERATOR_VAULT_COPY_ROUTE,
-    OPERATOR_VAULT_ROUTE,
+    OPERATOR_CHAIN_NEXT_ROUTE, OPERATOR_CHAIN_REOPEN_ROUTE, OPERATOR_GATEWAY_PUBLISH_ROUTE,
+    OPERATOR_OPEN_ROUTE, OPERATOR_OPERATION_ROUTE, OPERATOR_PENDING_ROUTE,
+    OPERATOR_SIGNER_REQUEST_ROUTE, OPERATOR_SIGNER_RESULT_ROUTE, OPERATOR_STATUS_ROUTE,
+    OPERATOR_VAULT_COPY_ROUTE, OPERATOR_VAULT_ROUTE,
 };
 use axum::{
     extract::{rejection::JsonRejection, DefaultBodyLimit, Path, State},
@@ -59,7 +59,7 @@ use crate::service::{
     AstraService, ServiceError,
 };
 
-/// The eleven private operator routes, for the listener of §8.3 to merge.
+/// The twelve private operator routes, for the listener of §8.3 to merge.
 pub fn private_routes() -> Router<Arc<AstraService>> {
     Router::new()
         .route(
@@ -88,6 +88,10 @@ pub fn private_routes() -> Router<Arc<AstraService>> {
         .route(
             OPERATOR_CHAIN_NEXT_ROUTE,
             post(chain_next).layer(DefaultBodyLimit::max(MAX_OPERATOR_RELAY_BODY_BYTES)),
+        )
+        .route(
+            OPERATOR_CHAIN_REOPEN_ROUTE,
+            post(chain_reopen).layer(DefaultBodyLimit::max(MAX_OPERATOR_RELAY_BODY_BYTES)),
         )
         .route(
             OPERATOR_CHAIN_ABANDON_ROUTE,
@@ -550,14 +554,42 @@ async fn gateway_publish(
 /// Opens the next step of the certificate chain, once the step in progress
 /// has taken effect, for an administrator relayed from the tunnel (F14 lot 6b).
 ///
-/// The door decides. A step that has not taken effect yet is the one refusal
-/// whose sentence crosses back, in a `409`: it names what the operator still has
-/// to do. Every other refusal is its class, as everywhere on this surface.
+/// The door decides. A plan refusal (`ChainStepIncomplete` and the refusals
+/// of `reopen`) is the one class whose sentence crosses back, in a `409`: it
+/// names what the operator still has to do. Every other refusal is its class,
+/// as everywhere on this surface.
 async fn chain_next(
     State(service): State<Arc<AstraService>>,
-    Json(relayed): Json<RelayedOperatorCampaign>,
+    Json(relayed): Json<RelayedChainStep>,
+) -> Response {
+    chain_step(service, relayed, "chain-next", |expected_step| {
+        DoorRequest::ChainNext { expected_step }
+    })
+    .await
+}
+
+/// Redeposits the chain's current step once its campaign has ended, for an
+/// administrator relayed from the tunnel (F14-g). Answers as `next` does.
+async fn chain_reopen(
+    State(service): State<Arc<AstraService>>,
+    Json(relayed): Json<RelayedChainStep>,
+) -> Response {
+    chain_step(service, relayed, "chain-reopen", |expected_step| {
+        DoorRequest::ChainReopen { expected_step }
+    })
+    .await
+}
+
+/// The shared body of `next` and `reopen`: one door request, its step or its
+/// refusal.
+async fn chain_step(
+    service: Arc<AstraService>,
+    relayed: RelayedChainStep,
+    route: &'static str,
+    request: impl FnOnce(Option<usize>) -> DoorRequest + Send + 'static,
 ) -> Response {
     let operator = relayed.operator;
+    let expected_step = relayed.expected_step;
     let connector = DoorConnector::Tunnel {
         operator: operator.clone(),
     };
@@ -567,13 +599,7 @@ async fn chain_next(
         let service = Arc::clone(&service);
         async move {
             service
-                .door(
-                    connector,
-                    DoorRequest::ChainNext {
-                        expected_step: None,
-                    },
-                    now_unix(),
-                )
+                .door(connector, request(expected_step), now_unix())
                 .await
         }
     })
@@ -582,7 +608,7 @@ async fn chain_next(
         Ok(step) => step,
         Err(error) => {
             tracing::error!(operator = %operator, %error, "the door task did not finish");
-            return refuse(&operator, "chain-next", ServiceError::Internal);
+            return refuse(&operator, route, ServiceError::Internal);
         }
     };
     match step {
@@ -607,15 +633,16 @@ async fn chain_next(
         Ok(_) => {
             tracing::error!(
                 operator = %operator,
+                route,
                 "the door answered a chain step with something other than a step"
             );
-            refuse(&operator, "chain-next", ServiceError::Internal)
+            refuse(&operator, route, ServiceError::Internal)
         }
-        Err(refusal @ DoorRefusal::ChainStepIncomplete(_)) => {
+        Err(refusal) if is_plan_refusal(&refusal) => {
             tracing::warn!(
                 operator = %operator,
-                route = "chain-next",
-                "private operator route refused a step that has not taken effect"
+                route,
+                "private operator route refused a chain step"
             );
             (
                 axum::http::StatusCode::CONFLICT,
@@ -625,8 +652,22 @@ async fn chain_next(
             )
                 .into_response()
         }
-        Err(refusal) => refuse(&operator, "chain-next", refusal.class()),
+        Err(refusal) => refuse(&operator, route, refusal.class()),
     }
+}
+
+/// The refusals of a chain step whose sentence the operator reads: the step
+/// has not taken effect, has not been opened, is still open, or the plan has
+/// moved on from the step the caller expected.
+fn is_plan_refusal(refusal: &DoorRefusal) -> bool {
+    matches!(
+        refusal,
+        DoorRefusal::ChainStepIncomplete(_)
+            | DoorRefusal::ChainStepNotDeposited
+            | DoorRefusal::ChainStepLanded
+            | DoorRefusal::ChainStepStillOpen { .. }
+            | DoorRefusal::ChainStepMoved { .. }
+    )
 }
 
 /// Drops the certificate chain's plan, for an administrator relayed from the

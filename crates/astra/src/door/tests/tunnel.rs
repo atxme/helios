@@ -9,9 +9,9 @@ use std::time::{Duration, SystemTime};
 
 use astra_channel::{
     OperatorChainRefusal, OperatorChainStep, OperatorGatewayPublish, OperatorGatewayPublished,
-    OperatorOpenAction, OperatorOpenRequest, RelayedOperatorCampaign,
+    OperatorOpenAction, OperatorOpenRequest, RelayedChainStep, RelayedOperatorCampaign,
     RelayedOperatorGatewayPublish, RelayedOperatorOpen, OPERATOR_CHAIN_ABANDON_ROUTE,
-    OPERATOR_CHAIN_NEXT_ROUTE, OPERATOR_GATEWAY_PUBLISH_ROUTE,
+    OPERATOR_CHAIN_NEXT_ROUTE, OPERATOR_CHAIN_REOPEN_ROUTE, OPERATOR_GATEWAY_PUBLISH_ROUTE,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -1107,6 +1107,15 @@ fn relayed_administrator() -> Vec<u8> {
     .expect("relayed campaign read")
 }
 
+/// A chain step relayed with the step the caller expects, as the tunnel sends it.
+fn relayed_step(expected_step: Option<usize>) -> Vec<u8> {
+    serde_json::to_vec(&RelayedChainStep {
+        operator: administrator(),
+        expected_step,
+    })
+    .expect("relayed step")
+}
+
 /// The chain the tunnel opens, as the tunnel reads it back.
 fn chain_answer(body: &[u8]) -> OperatorChainStep {
     serde_json::from_slice(body).expect("the chain's answer")
@@ -1280,4 +1289,87 @@ async fn abandon_drops_the_plan() {
     )
     .await;
     assert_eq!(status, 403);
+}
+
+/// A step whose campaign has ended reopens over the tunnel and opens a new
+/// campaign for the same step. The restart forgets the operation, which counts
+/// as expired.
+#[tokio::test]
+async fn chain_reopen_runs_through_the_tunnel() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture_with_ca_tls(dir.path());
+    let listener = listen(Arc::clone(&service)).await;
+
+    let (status, body) =
+        post_open(&listener, &relayed_opening(OperatorOpenAction::ChainOpen)).await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    rewrite_plan(dir.path(), |plan| {
+        plan.steps[0].effect = crate::chain::ChainEffect::SpentByPeers;
+    });
+    let (status, body) = post_to(&listener, OPERATOR_CHAIN_NEXT_ROUTE, &relayed_step(None)).await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let OperatorChainStep::Opened(first) = chain_answer(&body) else {
+        panic!("the second step opens");
+    };
+    assert_eq!(first.scope, CampaignScope::TrustAuthorities);
+
+    drop(listener);
+    let service = fixture_with_ca_tls(dir.path());
+    let listener = listen(Arc::clone(&service)).await;
+    let (status, body) = post_to(
+        &listener,
+        OPERATOR_CHAIN_REOPEN_ROUTE,
+        &relayed_step(Some(1)),
+    )
+    .await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let OperatorChainStep::Opened(again) = chain_answer(&body) else {
+        panic!("the step reopens");
+    };
+    assert_eq!(again.scope, CampaignScope::TrustAuthorities);
+    assert_ne!(again.operation_id, first.operation_id);
+    assert_eq!(read_plan(dir.path()).current, 1);
+}
+
+/// A reopen while the step's campaign is still open is refused, and the
+/// refusal names the time the campaign closes, as a 409.
+#[tokio::test]
+async fn chain_reopen_refusal_crosses_with_its_sentence() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture(dir.path());
+    let listener = listen(Arc::clone(&service)).await;
+    let (status, _) = post_open(&listener, &relayed_opening(OperatorOpenAction::ChainOpen)).await;
+    assert_eq!(status, 200);
+
+    let (status, body) = post_to(&listener, OPERATOR_CHAIN_REOPEN_ROUTE, &relayed_step(None)).await;
+    assert_eq!(status, 409, "{}", String::from_utf8_lossy(&body));
+    let refusal: OperatorChainRefusal = serde_json::from_slice(&body).expect("the reason");
+    assert!(
+        refusal.message.contains("encore ouverte jusqu'à"),
+        "{}",
+        refusal.message
+    );
+    assert_eq!(read_plan(dir.path()).current, 0);
+}
+
+/// A caller that expects another step is refused before anything opens: the
+/// plan has moved on since the caller read it.
+#[tokio::test]
+async fn chain_next_with_a_moved_step_is_refused() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture(dir.path());
+    let listener = listen(Arc::clone(&service)).await;
+    let (status, _) = post_open(&listener, &relayed_opening(OperatorOpenAction::ChainOpen)).await;
+    assert_eq!(status, 200);
+
+    let (status, body) =
+        post_to(&listener, OPERATOR_CHAIN_NEXT_ROUTE, &relayed_step(Some(2))).await;
+    assert_eq!(status, 409, "{}", String::from_utf8_lossy(&body));
+    let refusal: OperatorChainRefusal = serde_json::from_slice(&body).expect("the reason");
+    assert!(
+        refusal.message.contains("n'est plus sur cette étape"),
+        "{}",
+        refusal.message
+    );
+    assert_eq!(read_plan(dir.path()).current, 0);
 }

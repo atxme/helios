@@ -1180,7 +1180,7 @@ fn chain_next_posts_to_its_route_and_reads_the_outcome() {
     let stub = Stub::serving(vec![(200, r#"{"outcome":"finished"}"#.to_string())]);
     let answer = Tunnel::new(&stub.base)
         .expect("tunnel")
-        .chain_next()
+        .chain_next(None)
         .expect("answered");
     assert_eq!(answer, OperatorChainStep::Finished);
 
@@ -1199,12 +1199,60 @@ fn chain_next_names_the_step_that_has_not_taken_effect() {
     )]);
     let error = Tunnel::new(&stub.base)
         .expect("tunnel")
-        .chain_next()
+        .chain_next(None)
         .expect_err("refused");
     assert!(
         format!("{error:#}").contains("n'a pas pris effet"),
         "{error:#}"
     );
+}
+
+/// The reopen goes to its route with the step the caller expects, and the
+/// opened step is the answer.
+#[test]
+fn chain_reopen_returns_the_opened_step() {
+    let opened = OperatorOpened {
+        operation_id: operation(),
+        campaign_id: Id16::new([6; 16]).expect("id"),
+        campaign_fingerprint: Fingerprint::of(b"campagne rouverte"),
+        scope: aether::certificates::status::CampaignScope::TrustAuthorities,
+        target_count: 1,
+        required_credentials: 2,
+        expires_at: 1_700_000_600,
+        revocation_expiries: None,
+        delegation_request: None,
+        gateway_certificate: None,
+    };
+    let body =
+        serde_json::to_string(&OperatorChainStep::Opened(Box::new(opened.clone()))).expect("json");
+    let stub = Stub::serving(vec![(200, body)]);
+    let answer = Tunnel::new(&stub.base)
+        .expect("tunnel")
+        .chain_reopen(Some(1))
+        .expect("reopened");
+    assert_eq!(answer, OperatorChainStep::Opened(Box::new(opened)));
+
+    let seen = stub.next();
+    assert_eq!(seen.method, "POST");
+    assert_eq!(seen.path, "/api/certificates/operator/chain/reopen");
+    let sent: serde_json::Value = serde_json::from_slice(&seen.body).expect("the expected step");
+    assert_eq!(sent, serde_json::json!({ "expected_step": 1 }));
+}
+
+/// A reopen refused for a step still open reaches the operator with Astra's
+/// sentence.
+#[test]
+fn chain_reopen_refusal_is_astras_sentence() {
+    let stub = Stub::serving(vec![(
+        409,
+        r#"{"message":"la campagne de l'étape est encore ouverte jusqu'à 10:00 : l'approuver"}"#
+            .to_string(),
+    )]);
+    let error = Tunnel::new(&stub.base)
+        .expect("tunnel")
+        .chain_reopen(None)
+        .expect_err("refused");
+    assert!(format!("{error:#}").contains("encore ouverte"), "{error:#}");
 }
 
 #[test]

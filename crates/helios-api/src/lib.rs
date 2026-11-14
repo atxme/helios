@@ -367,7 +367,15 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/api/certificates/operator/chain/next",
-            post(certificates::operator_chain_next),
+            post(certificates::operator_chain_next).layer(DefaultBodyLimit::max(
+                astra_channel::MAX_OPERATOR_REQUEST_BYTES,
+            )),
+        )
+        .route(
+            "/api/certificates/operator/chain/reopen",
+            post(certificates::operator_chain_reopen).layer(DefaultBodyLimit::max(
+                astra_channel::MAX_OPERATOR_REQUEST_BYTES,
+            )),
         )
         .route(
             "/api/certificates/operator/chain/abandon",

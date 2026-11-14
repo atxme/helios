@@ -234,6 +234,13 @@ voir `2026-11-10-f14-lot6b-identite-gateway-design.md` §5.1. `IssuerRequest`,
 `PinCaTls` et `IssuerInstall` restent à la console seule. Les autres lignes sont
 inchangées.
 
+**Amendement du 14 novembre 2026 (lot g).** La table ci-dessus porte aussi la
+ligne `ChainReopen` (`chain_reopen`) : console et tunnel `(true, true)`, origine
+publique non, comme `ChainNext`. Le tunnel la reçoit par
+`POST /internal/v1/operator/chain/reopen`. Voir
+`2026-11-14-f14-g-tout-renouveler-design.md` §6.1. Les autres lignes sont
+inchangées.
+
 ### 5.3 Bornes tenues par la porte
 
 - `reason` et `requested_by` non vides ; fenêtre de 1 à 300 s (inchangé).

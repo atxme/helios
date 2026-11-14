@@ -11,6 +11,11 @@ struct Call {
     token: String,
 }
 
+/// The expected step as a recorded call names it.
+fn expected(step: Option<usize>) -> String {
+    step.map_or_else(|| "none".to_string(), |step| step.to_string())
+}
+
 struct RecordingRelay {
     calls: Mutex<Vec<Call>>,
     refusal: Option<TrustUpdateRefusal>,
@@ -144,8 +149,21 @@ impl OperatorCampaignRelay for RecordingRelay {
     async fn chain_next(
         &self,
         operator: &astra_channel::OperatorIdentity,
+        expected_step: Option<usize>,
     ) -> Result<astra_channel::OperatorChainStep, ChainRefusal> {
-        self.record("chain-next", operator, String::new(), "")
+        self.record("chain-next", operator, expected(expected_step), "")
+            .map_err(ChainRefusal::Class)?;
+        match self.chain_reason.lock().unwrap().clone() {
+            Some(reason) => Err(ChainRefusal::Reason(reason)),
+            None => Ok(astra_channel::OperatorChainStep::Finished),
+        }
+    }
+    async fn chain_reopen(
+        &self,
+        operator: &astra_channel::OperatorIdentity,
+        expected_step: Option<usize>,
+    ) -> Result<astra_channel::OperatorChainStep, ChainRefusal> {
+        self.record("chain-reopen", operator, expected(expected_step), "")
             .map_err(ChainRefusal::Class)?;
         match self.chain_reason.lock().unwrap().clone() {
             Some(reason) => Err(ChainRefusal::Reason(reason)),
@@ -166,8 +184,12 @@ impl OperatorCampaignRelay for RecordingRelay {
 async fn chain_next_carries_a_step_refusal_with_its_reason() {
     let relay = RecordingRelay::new(None);
     *relay.chain_reason.lock().unwrap() = Some("l'étape 1 n'a pas pris effet".into());
-    let response =
-        operator_chain_next(State(state(&relay)), Extension(operator_caller_at(true))).await;
+    let response = operator_chain_next(
+        State(state(&relay)),
+        Extension(operator_caller_at(true)),
+        Bytes::new(),
+    )
+    .await;
 
     assert_eq!(response.status(), StatusCode::CONFLICT);
     let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
@@ -180,17 +202,106 @@ async fn chain_next_carries_a_step_refusal_with_its_reason() {
         vec![Call {
             route: "chain-next",
             operator: expected_operator(),
-            id: String::new(),
+            id: "none".into(),
             token: String::new(),
         }]
     );
 }
 
+/// A reopen whose step has not taken effect, or is still open, carries the
+/// plan's sentence in a `409`, as `next` does.
+#[tokio::test]
+async fn operator_chain_reopen_relays_the_plan_sentence_as_409() {
+    let relay = RecordingRelay::new(None);
+    *relay.chain_reason.lock().unwrap() = Some("la campagne de l'étape est encore ouverte".into());
+    let response = operator_chain_reopen(
+        State(state(&relay)),
+        Extension(operator_caller_at(true)),
+        Bytes::from_static(br#"{"expected_step":1}"#),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+        serde_json::json!({ "message": "la campagne de l'étape est encore ouverte" })
+    );
+    assert_eq!(
+        *relay.calls.lock().unwrap(),
+        vec![Call {
+            route: "chain-reopen",
+            operator: expected_operator(),
+            id: "1".into(),
+            token: String::new(),
+        }]
+    );
+}
+
+/// A reopen is admin-only: a caller that is not one is refused before the
+/// relay is asked.
+#[tokio::test]
+async fn operator_chain_reopen_is_admin_only() {
+    let relay = RecordingRelay::new(None);
+    let response = operator_chain_reopen(
+        State(state(&relay)),
+        Extension(operator_caller_at(false)),
+        Bytes::new(),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(relay.calls.lock().unwrap().is_empty());
+}
+
+/// The route takes no body, or `{"expected_step": n}`; a body that is neither
+/// is a `400`, and the relay is not asked.
+#[tokio::test]
+async fn operator_chain_next_accepts_an_empty_body_and_an_expected_step() {
+    let relay = RecordingRelay::new(None);
+    let response = operator_chain_next(
+        State(state(&relay)),
+        Extension(operator_caller_at(true)),
+        Bytes::new(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = operator_chain_next(
+        State(state(&relay)),
+        Extension(operator_caller_at(true)),
+        Bytes::from_static(br#"{"expected_step":2}"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = operator_chain_next(
+        State(state(&relay)),
+        Extension(operator_caller_at(true)),
+        Bytes::from_static(b"pas du JSON"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let ids: Vec<String> = relay
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|call| call.id.clone())
+        .collect();
+    assert_eq!(ids, vec!["none".to_string(), "2".to_string()]);
+}
+
 #[tokio::test]
 async fn chain_next_answers_its_outcome_and_abandon_answers_no_content() {
     let relay = RecordingRelay::new(None);
-    let response =
-        operator_chain_next(State(state(&relay)), Extension(operator_caller_at(true))).await;
+    let response = operator_chain_next(
+        State(state(&relay)),
+        Extension(operator_caller_at(true)),
+        Bytes::new(),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::OK);
     let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
     assert_eq!(

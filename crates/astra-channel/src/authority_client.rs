@@ -244,29 +244,18 @@ impl AstraLifecycleClient {
     /// [`ChannelError::Plan`]; any other refusal is its status.
     pub async fn operator_chain_next(
         &self,
-        relayed: &RelayedOperatorCampaign,
+        relayed: &RelayedChainStep,
     ) -> Result<OperatorChainStep, ChannelError> {
-        let body =
-            serde_json::to_vec(relayed).map_err(|error| ChannelError::Body(error.to_string()))?;
-        let (status, answer) = self
-            .http
-            .exchange(
-                "POST",
-                OPERATOR_CHAIN_NEXT_ROUTE,
-                Some(body),
-                None,
-                MAX_OPERATOR_ANSWER_BYTES,
-            )
-            .await?;
-        if status == StatusCode::CONFLICT {
-            if let Ok(refusal) = serde_json::from_slice::<OperatorChainRefusal>(&answer) {
-                return Err(ChannelError::Plan(refusal.message));
-            }
-        }
-        if !status.is_success() {
-            return Err(ChannelError::Status(status));
-        }
-        serde_json::from_slice(&answer).map_err(|error| ChannelError::Body(error.to_string()))
+        self.chain_step(OPERATOR_CHAIN_NEXT_ROUTE, relayed).await
+    }
+
+    /// Redeposits the chain's current step for a relayed administrator, once
+    /// its campaign has ended. Refused like [`Self::operator_chain_next`].
+    pub async fn operator_chain_reopen(
+        &self,
+        relayed: &RelayedChainStep,
+    ) -> Result<OperatorChainStep, ChannelError> {
+        self.chain_step(OPERATOR_CHAIN_REOPEN_ROUTE, relayed).await
     }
 
     /// Drops the certificate chain's plan for a relayed administrator. The
@@ -292,6 +281,29 @@ impl AstraLifecycleClient {
         } else {
             Err(ChannelError::Status(status))
         }
+    }
+
+    /// Posts one chain step and reads the step Astra opened, or its refusal.
+    async fn chain_step(
+        &self,
+        route: &str,
+        relayed: &RelayedChainStep,
+    ) -> Result<OperatorChainStep, ChannelError> {
+        let body =
+            serde_json::to_vec(relayed).map_err(|error| ChannelError::Body(error.to_string()))?;
+        let (status, answer) = self
+            .http
+            .exchange("POST", route, Some(body), None, MAX_OPERATOR_ANSWER_BYTES)
+            .await?;
+        if status == StatusCode::CONFLICT {
+            if let Ok(refusal) = serde_json::from_slice::<OperatorChainRefusal>(&answer) {
+                return Err(ChannelError::Plan(refusal.message));
+            }
+        }
+        if !status.is_success() {
+            return Err(ChannelError::Status(status));
+        }
+        serde_json::from_slice(&answer).map_err(|error| ChannelError::Body(error.to_string()))
     }
 
     async fn post<B: Serialize, R: serde::de::DeserializeOwned>(

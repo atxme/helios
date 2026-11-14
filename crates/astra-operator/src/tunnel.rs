@@ -592,6 +592,13 @@ struct GatewayRefusalBody {
     message: String,
 }
 
+/// The body of the chain routes: the step the caller expects, `None` for the
+/// current one.
+#[derive(serde::Serialize)]
+struct ChainAsk {
+    expected_step: Option<usize>,
+}
+
 impl Tunnel {
     /// Opens a campaign through the door (lot 5a, §5.4).
     pub fn open_campaign(&self, request: &OperatorOpenRequest) -> Result<OperatorOpened> {
@@ -624,19 +631,46 @@ impl Tunnel {
     }
 
     /// Opens the next step of the certificate chain (F14 lot 6b), once the
-    /// step in progress has taken effect. `Finished` when nothing remains. A
-    /// step not yet in effect is refused with Astra's sentence in the error.
-    pub fn chain_next(&self) -> Result<OperatorChainStep> {
+    /// step in progress has taken effect. `expected_step` is the step the
+    /// caller read: Astra refuses if the plan has moved on from it. `Finished`
+    /// when nothing remains. A step not yet in effect is refused with Astra's
+    /// sentence in the error.
+    pub fn chain_next(&self, expected_step: Option<usize>) -> Result<OperatorChainStep> {
+        self.chain_step(
+            "next",
+            expected_step,
+            "passage à l'étape suivante de la chaîne",
+        )
+    }
+
+    /// Redeposits the chain's current step once its campaign has ended (F14-g),
+    /// and answers with the campaign opened for it. Takes `expected_step` as
+    /// [`Self::chain_next`] does, and is refused the same way.
+    pub fn chain_reopen(&self, expected_step: Option<usize>) -> Result<OperatorChainStep> {
+        self.chain_step(
+            "reopen",
+            expected_step,
+            "réouverture de l'étape de la chaîne",
+        )
+    }
+
+    /// Posts one chain step (`next` or `reopen`) and reads what Astra answers.
+    fn chain_step(
+        &self,
+        route: &str,
+        expected_step: Option<usize>,
+        what: &str,
+    ) -> Result<OperatorChainStep> {
         let response = self
-            .http
-            .post(format!("{}{OPERATOR_PREFIX}/chain/next", self.base))
-            .send()
-            .context("passage à l'étape suivante de la chaîne")?;
+            .post_admin(
+                &format!("{OPERATOR_PREFIX}/chain/{route}"),
+                &ChainAsk { expected_step },
+            )
+            .context(what.to_string())?;
         if !response.status().is_success() {
-            return Err(chain_next_refusal(response));
+            return Err(chain_step_refusal(response, what));
         }
-        Self::read_admin(response, crate::origin::MAX_ANSWER_BYTES)
-            .context("passage à l'étape suivante de la chaîne")
+        Self::read_admin(response, crate::origin::MAX_ANSWER_BYTES).context(what.to_string())
     }
 
     /// Drops the certificate chain's plan (F14 lot 6b). What was approved keeps
@@ -892,10 +926,10 @@ impl Tunnel {
     }
 }
 
-/// The refusal of `chain next`. A step not yet in effect carries Astra's own
+/// The refusal of a chain step. A step the plan refuses carries Astra's own
 /// sentence in the body, and that sentence is shown as it is: Astra produced
 /// it, and the gateway only relayed it. Any other refusal is the class alone.
-fn chain_next_refusal(response: reqwest::blocking::Response) -> anyhow::Error {
+fn chain_step_refusal(response: reqwest::blocking::Response, what: &str) -> anyhow::Error {
     let status = response.status();
     let sentence = response
         .bytes()
@@ -905,9 +939,7 @@ fn chain_next_refusal(response: reqwest::blocking::Response) -> anyhow::Error {
         .map(|body| body.message);
     match sentence {
         Some(sentence) => anyhow::anyhow!("{sentence}"),
-        None => {
-            admin_refusal(status.as_u16(), None).context("passage à l'étape suivante de la chaîne")
-        }
+        None => admin_refusal(status.as_u16(), None).context(what.to_string()),
     }
 }
 

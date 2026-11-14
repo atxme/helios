@@ -830,6 +830,22 @@ Renvoi à la spécification du lot 6b (§5.1) ; la recette est dans MANUAL-TESTI
 - **Hors lot.** « Tout renouveler » n'est pas dans Orion : le plan reste sur la
   console d'Astra. Les routes des pas du plan sont en place, sans écran qui les appelle.
 
+#### Amendement du 14 novembre 2026 : « Tout renouveler » rouvre l'étape courante (F14, lot g)
+
+Renvoi à la spécification du lot g (§6.1, `2026-11-14-f14-g-tout-renouveler-design.md`).
+
+- **Table de la porte.** Le tunnel ouvre aussi `ChainReopen` (`chain_reopen`) :
+  rouvrir l'étape courante dont la campagne a expiré, sans qu'elle ait pris effet.
+  Console et tunnel `(true, true)`, comme `ChainNext`.
+- **Fil.** `POST /internal/v1/operator/chain/reopen` (`astra-channel`) et
+  `POST /api/certificates/operator/chain/reopen` (route administrateur, réservée
+  comme `next`). `next` et `reopen` portent l'étape attendue, optionnelle
+  (`expected_step`) : Astra refuse si le plan n'est plus sur cette étape. Le corps
+  vide reste accepté.
+- **Refus.** Les cinq refus de plan (`ChainStepIncomplete`, `ChainStepNotDeposited`,
+  `ChainStepLanded`, `ChainStepStillOpen`, `ChainStepMoved`) traversent en `409`
+  avec leur phrase, par le tunnel comme par la route administrateur.
+
 ### 8. Avortement, leases et atomicité logique
 
 Une transition gateway peut être avortée sans révocation seulement tant

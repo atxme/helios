@@ -58,6 +58,9 @@ pub const OPERATOR_GATEWAY_PUBLISH_ROUTE: &str = "/internal/v1/operator/gateway-
 /// Opens the next step of the certificate chain, once the previous one has
 /// taken effect, for an administrator relayed from the tunnel (F14 lot 6b).
 pub const OPERATOR_CHAIN_NEXT_ROUTE: &str = "/internal/v1/operator/chain/next";
+/// Redeposits the chain's current step once its campaign has ended, for an
+/// administrator relayed from the tunnel (F14-g).
+pub const OPERATOR_CHAIN_REOPEN_ROUTE: &str = "/internal/v1/operator/chain/reopen";
 /// Drops the certificate chain's plan, for an administrator relayed from the
 /// tunnel (F14 lot 6b). Campaigns already approved keep their effect.
 pub const OPERATOR_CHAIN_ABANDON_ROUTE: &str = "/internal/v1/operator/chain/abandon";
@@ -167,6 +170,19 @@ impl std::fmt::Display for OperatorIdentity {
 #[serde(deny_unknown_fields)]
 pub struct RelayedOperatorCampaign {
     pub operator: OperatorIdentity,
+}
+
+/// What the gateway relays for a chain step (`next` and `reopen`): the
+/// administrator, and the step the caller expects, `None` for the current one.
+///
+/// Astra refuses a step other than the expected one, so a plan advanced in
+/// between is not stepped on by a stale click.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelayedChainStep {
+    pub operator: OperatorIdentity,
+    #[serde(default)]
+    pub expected_step: Option<usize>,
 }
 
 /// What the companion deposits, relayed with its administrator (spec §8.5).

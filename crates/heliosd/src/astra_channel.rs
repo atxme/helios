@@ -599,6 +599,18 @@ impl AstraRenewalRelay {
         })
     }
 
+    /// A plan refusal keeps Astra's sentence; any other failure is its class.
+    fn chain_refusal(
+        route: &str,
+        error: ::astra_channel::ChannelError,
+    ) -> helios_api::certificates::ChainRefusal {
+        use helios_api::certificates::ChainRefusal;
+        match error {
+            ::astra_channel::ChannelError::Plan(reason) => ChainRefusal::Reason(reason),
+            error => ChainRefusal::Class(Self::refuse(route, error)),
+        }
+    }
+
     /// One channel failure, logged with its reason and answered with a class.
     fn refuse(
         route: &str,
@@ -805,22 +817,36 @@ impl helios_api::certificates::OperatorCampaignRelay for AstraRenewalRelay {
     }
 
     /// Relays the next chain step to Astra's door, for the administrator it
-    /// came through. A step not yet in effect keeps the sentence Astra gave,
-    /// which the operator reads; any other failure is its class.
+    /// came through. A plan refusal keeps the sentence Astra gave, which the
+    /// operator reads; any other failure is its class.
     async fn chain_next(
         &self,
         operator: &::astra_channel::OperatorIdentity,
+        expected_step: Option<usize>,
     ) -> Result<::astra_channel::OperatorChainStep, helios_api::certificates::ChainRefusal> {
-        use helios_api::certificates::ChainRefusal;
         self.client
-            .operator_chain_next(&::astra_channel::RelayedOperatorCampaign {
+            .operator_chain_next(&::astra_channel::RelayedChainStep {
                 operator: operator.clone(),
+                expected_step,
             })
             .await
-            .map_err(|error| match error {
-                ::astra_channel::ChannelError::Plan(reason) => ChainRefusal::Reason(reason),
-                error => ChainRefusal::Class(Self::refuse("operator-chain-next", error)),
+            .map_err(|error| Self::chain_refusal("operator-chain-next", error))
+    }
+
+    /// Relays the reopening of the chain's current step to Astra's door. Its
+    /// refusals are read as `chain_next`'s are.
+    async fn chain_reopen(
+        &self,
+        operator: &::astra_channel::OperatorIdentity,
+        expected_step: Option<usize>,
+    ) -> Result<::astra_channel::OperatorChainStep, helios_api::certificates::ChainRefusal> {
+        self.client
+            .operator_chain_reopen(&::astra_channel::RelayedChainStep {
+                operator: operator.clone(),
+                expected_step,
             })
+            .await
+            .map_err(|error| Self::chain_refusal("operator-chain-reopen", error))
     }
 
     /// Relays the abandonment of the chain's plan to Astra's door.
