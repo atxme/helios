@@ -79,6 +79,8 @@ export function AstraView({
   const [journalKnown, setJournalKnown] = useState(true)
   // A campaign already open for the rotation being led, known before its first key.
   const [existingOperation, setExistingOperation] = useState<string | null>(null)
+  // Opens that campaign at the approval, when the chain has none open yet.
+  const [obtainOperation, setObtainOperation] = useState<(() => Promise<string>) | null>(null)
   // The finished session of an automatic resumption, said in its row.
   const [automaticStop, setAutomaticStop] = useState<OperatorStatus | null>(null)
   const [tab, setTab] = useState<AstraTab>('Enrôlement')
@@ -237,8 +239,13 @@ export function AstraView({
   }
 
   // Every ceremony the operator opens passes here, with the campaign it leads if any.
-  const openCeremony = (next: OperatorStatus, existing: string | null = null) => {
+  const openCeremony = (
+    next: OperatorStatus,
+    existing: string | null = null,
+    obtain: (() => Promise<string>) | null = null,
+  ) => {
     setExistingOperation(existing)
+    setObtainOperation(() => obtain)
     setJournalKnown(true)
     setAutomaticStop(null)
     setCeremony(next)
@@ -275,6 +282,7 @@ export function AstraView({
             journal={journalKnown ? journal : undefined}
             existingOperation={led?.operation_id ?? existingOperation}
             existingExpiresAt={led?.expires_at ?? null}
+            obtainOperation={obtainOperation ?? undefined}
           />
         ) : (
           <OperatorCeremonyPanel

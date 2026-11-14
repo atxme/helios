@@ -11,6 +11,7 @@ const api = vi.hoisted(() => ({
   beginIssuerCeremony: vi.fn(),
   beginRotationCeremony: vi.fn(),
   operatorCeremonyStatus: vi.fn(),
+  operatorChainHeld: vi.fn(),
 }))
 vi.mock('../../api', () => api)
 
@@ -57,6 +58,7 @@ beforeEach(() => {
   vi.clearAllMocks()
   vi.useRealTimers()
   api.operatorCeremonyStatus.mockResolvedValue(null)
+  api.operatorChainHeld.mockResolvedValue(null)
 })
 afterEach(cleanup)
 
@@ -70,11 +72,11 @@ describe('the rows', () => {
 
   it('a_row_to_do_comes_first_and_a_disabled_row_says_why', async () => {
     await show(overview({ caPqOverlap: true, caTlsCloseAt: NOW - 1 }))
-    // The gateway block leads the panel; the rows follow it in their own order.
+    // The gateway block leads the panel, then the chain row; the rows follow in their own order.
     const titles = screen
       .getAllByRole('region')
       .map((r) => r.getAttribute('aria-label'))
-      .filter((title) => title !== 'Identité de la gateway')
+      .filter((title) => title !== 'Identité de la gateway' && title !== 'Tout renouveler')
     expect(titles[0]).toBe('Terminer la rotation CA TLS')
     const replace = region('Remplacer la CA-PQ')
     expect(within(replace).getByText('Recouvrement CA-PQ en cours')).toBeTruthy()

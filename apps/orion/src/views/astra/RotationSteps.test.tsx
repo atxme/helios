@@ -674,3 +674,48 @@ describe('starting a rotation', () => {
     expect(await screen.findByText(/déjà ouverte/)).toBeTruthy()
   })
 })
+
+describe('the operation obtained at the approval', () => {
+  const OBTAINED = 'e'.repeat(32)
+
+  it('obtain_operation_runs_after_prerequisites_and_feeds_existing_operation', async () => {
+    const obtainOperation = vi.fn().mockResolvedValue(OBTAINED)
+    shown(approval({ operation: 'rotate_client_tls_ca' }), { obtainOperation })
+    fireEvent.click(button('Continuer'))
+    // Nothing is asked of Astra before the approval.
+    expect(obtainOperation).not.toHaveBeenCalled()
+
+    // Terms refused: the prerequisites fail first, the operation is not obtained.
+    fireEvent.click(button('Modifier'))
+    fireEvent.change(screen.getByLabelText('Préparation (jours)'), { target: { value: '0' } })
+    fireEvent.click(button('Approuver'))
+    expect(obtainOperation).not.toHaveBeenCalled()
+    expect(api.approveRotationCeremony).not.toHaveBeenCalled()
+    fireEvent.change(screen.getByLabelText('Préparation (jours)'), { target: { value: '7' } })
+
+    // The first approval fails after the operation was obtained.
+    api.approveRotationCeremony.mockRejectedValueOnce(new Error('refus'))
+    fireEvent.click(button('Approuver'))
+    await waitFor(() => expect(api.approveRotationCeremony).toHaveBeenCalledTimes(1))
+    expect(obtainOperation).toHaveBeenCalledTimes(1)
+    expect(obtainOperation.mock.invocationCallOrder[0]).toBeLessThan(
+      api.approveRotationCeremony.mock.invocationCallOrder[0],
+    )
+
+    // A retry reuses the stored id and never obtains again.
+    api.approveRotationCeremony.mockResolvedValueOnce(status())
+    fireEvent.click(button('Approuver'))
+    await waitFor(() => expect(api.approveRotationCeremony).toHaveBeenCalledTimes(2))
+    expect(obtainOperation).toHaveBeenCalledTimes(1)
+    expect(api.approveRotationCeremony.mock.calls[1][0].existing_operation).toBe(OBTAINED)
+  })
+
+  it('a_rejected_obtain_shows_its_message_and_approves_nothing', async () => {
+    const obtainOperation = vi.fn().mockRejectedValue(new Error('Le plan a changé : relire la ligne.'))
+    shown(approval({ operation: 'rotate_client_tls_ca' }), { obtainOperation })
+    fireEvent.click(button('Continuer'))
+    fireEvent.click(button('Approuver'))
+    await waitFor(() => expect(screen.getByText('Le plan a changé : relire la ligne.')).toBeTruthy())
+    expect(api.approveRotationCeremony).not.toHaveBeenCalled()
+  })
+})

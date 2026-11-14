@@ -26,6 +26,7 @@ import {
 } from './rotationRows'
 import type { RotationAction, RotationRow } from './rotationRows'
 import { GatewayIdentityBlock } from './GatewayIdentityBlock'
+import { RenewAllBlock } from './RenewAllBlock'
 import { PrerequisiteLine } from './PrerequisiteLine'
 
 /**
@@ -41,6 +42,16 @@ const DEFAULT_REASON: Partial<Record<RotationAction, string>> = {
   renew_delegation: 'Renouvellement de la délégation',
 }
 
+/**
+ * Hands a ceremony over to the screen. `existingOperation` is the campaign already open for
+ * the rotation led at the approval; `obtainOperation` opens it there, when none is open yet.
+ */
+export type CeremonyHandoff = (
+  status: OperatorStatus,
+  existingOperation?: string | null,
+  obtainOperation?: () => Promise<string>,
+) => void
+
 /** What a step is given to run once every prerequisite is green. */
 export interface RotationStepContext {
   action: RotationAction
@@ -49,11 +60,7 @@ export interface RotationStepContext {
   existingOperation: OperatorPendingOperation | null
   /** The label of the first key, for `requested_by`. */
   operatorLabel: string
-  /**
-   * Hands a ceremony over to the screen. `existingOperation` is the campaign of the
-   * rotation to lead at the approval, when one was already open.
-   */
-  onCeremony: (status: OperatorStatus, existingOperation?: string | null) => void
+  onCeremony: CeremonyHandoff
   /** Reads the overview again, once the read in flight has ended. */
   refresh: () => Promise<RotationsOverview | null>
 }
@@ -76,7 +83,7 @@ export function RotationsPanel({
   renderStep,
   resumeStop,
 }: {
-  onCeremony: (status: OperatorStatus, existingOperation?: string | null) => void
+  onCeremony: CeremonyHandoff
   /** Every read, so the rest of the screen follows without a read of its own. */
   onOverview?: (overview: RotationsOverview) => void
   renderStep?: (context: RotationStepContext) => ReactNode
@@ -273,6 +280,13 @@ export function RotationsPanel({
           {readError}
         </Alert>
       )}
+      <RenewAllBlock
+        overview={overview}
+        onCeremony={onCeremony}
+        refresh={readAfter}
+        renderStep={renderStep}
+        operatorLabel={operatorLabelOf(overview)}
+      />
       {rows.map((row) => {
         const live = liveOperation(overview, row.action, now)
         const resumable = live !== null && row.action !== 'renew_delegation'

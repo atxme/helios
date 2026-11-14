@@ -38,16 +38,48 @@ const MOTIFS: { value: RevocationReasonChoice; label: string }[] = [
 ]
 
 /** The renewal terms as typed: strings, checked on the click. Starts on the gateway's own defaults. */
-interface TermsDraft {
+export interface TermsDraft {
   prepare: string
   overlap: string
   validity: string
 }
 
-const TERMS_DEFAULT: TermsDraft = { prepare: '7', overlap: '7', validity: '365' }
+export const TERMS_DEFAULT: TermsDraft = { prepare: '7', overlap: '7', validity: '365' }
+
+/** The three durations of a renewal, as the gateway's block and the « Tout renouveler » row show them. */
+export function TermsFields({
+  terms,
+  onChange,
+  disabled,
+}: {
+  terms: TermsDraft
+  onChange: (next: TermsDraft) => void
+  disabled: boolean
+}) {
+  const field = (key: keyof TermsDraft, label: string) => (
+    <TextField
+      label={label}
+      value={terms[key]}
+      onChange={(event) => onChange({ ...terms, [key]: event.target.value })}
+      size="small"
+      disabled={disabled}
+      fullWidth
+      sx={{ mb: 1 }}
+      helperText={TERMS_RANGE}
+      slotProps={{ htmlInput: { inputMode: 'numeric' } }}
+    />
+  )
+  return (
+    <>
+      {field('prepare', 'Préparation (jours)')}
+      {field('overlap', 'Recouvrement (jours)')}
+      {field('validity', 'Validité (jours)')}
+    </>
+  )
+}
 
 /** What is wrong with the renewal terms, before any call; `null` when they can be sent. */
-function termsError(draft: TermsDraft): string | null {
+export function termsError(draft: TermsDraft): string | null {
   const whole = (value: string) => value.trim() !== '' && Number.isSafeInteger(Number(value))
   const fields: [string, string][] = [
     ['Préparation', draft.prepare],
@@ -201,20 +233,6 @@ export function GatewayIdentityBlock({
   const dropping = selected === 'discard' || selected === 'force_discard'
   const flowOpen = dropping || green
 
-  const termField = (key: keyof TermsDraft, label: string) => (
-    <TextField
-      label={label}
-      value={terms[key]}
-      onChange={(event) => setTerms({ ...terms, [key]: event.target.value })}
-      size="small"
-      disabled={busy}
-      fullWidth
-      sx={{ mb: 1 }}
-      helperText={TERMS_RANGE}
-      slotProps={{ htmlInput: { inputMode: 'numeric' } }}
-    />
-  )
-
   let flow: ReactNode = null
   if (selected === 'renew') {
     flow = (
@@ -259,9 +277,7 @@ export function GatewayIdentityBlock({
             />
           </Paper>
         )}
-        {termField('prepare', 'Préparation (jours)')}
-        {termField('overlap', 'Recouvrement (jours)')}
-        {termField('validity', 'Validité (jours)')}
+        <TermsFields terms={terms} onChange={setTerms} disabled={busy} />
         {invalid && (
           <Alert severity="warning" variant="outlined" sx={{ mb: 1, fontSize: 11.5 }}>
             {invalid}
