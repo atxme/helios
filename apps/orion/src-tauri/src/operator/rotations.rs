@@ -24,7 +24,7 @@ use anyhow::Context as _;
 use astra_operator::operations::rotation as operation;
 use astra_operator::overview::VaultOverview;
 use astra_operator::rotation_journal::{self, JournalStage, RotationJournal, RotationKind};
-use astra_operator::tunnel::{Tunnel, VaultCopySent};
+use astra_operator::tunnel::{self, Tunnel, VaultCopySent};
 use astra_operator::{credentials, prepared};
 use orion_core::operator_rotations::{
     AuthorityStatusRead, GatewayDomainRead, PeerCertificatesRead, PendingOperationRead, Reach,
@@ -128,7 +128,7 @@ pub enum ChainStepOutcome {
 }
 
 /// Said when a reopen is asked of a plan that has finished: there is no step to reopen.
-const CHAIN_FINISHED: &str = "le plan est fini : rien à rouvrir.";
+pub(crate) const CHAIN_FINISHED: &str = "le plan est fini : rien à rouvrir.";
 
 /// Replaces the step Orion holds in memory. Never written, never logged: its delegation request
 /// is public, but nothing gains from being on disk.
@@ -214,12 +214,26 @@ pub fn chain_reopen_with(
 }
 
 /// Said when the chain's next step is asked of a plan that has finished.
-const CHAIN_FINISHED_NEXT: &str = "le plan est fini : rien à passer à l'étape suivante.";
+pub(crate) const CHAIN_FINISHED_NEXT: &str = "le plan est fini : rien à passer à l'étape suivante.";
+
+/// A chain step that did not open, with the sentence the page shows for it: Astra's own, relayed
+/// by the gateway, or Orion's when the plan is finished. An unreachable gateway is not one of
+/// these, and stays an error of its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainStepRefusal(pub String);
+
+impl std::fmt::Display for ChainStepRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ChainStepRefusal {}
 
 /// Takes the chain's step from inside a rotation ceremony, once every check that precedes an
 /// opening has passed: the campaign it opens is the one the ceremony leads. The step is held as
-/// `chain_next`/`chain_reopen` hold theirs. A refusal keeps its error, so Astra's sentence and
-/// status reach the ceremony as they are.
+/// `chain_next`/`chain_reopen` hold theirs. A refusal is a [`ChainStepRefusal`] carrying its
+/// sentence, so the ceremony can say it as it is.
 pub fn obtain_chain_step(
     remote: &dyn ChainRemote,
     vault_path: &Path,
@@ -228,19 +242,32 @@ pub fn obtain_chain_step(
     held: &std::sync::Mutex<Option<OperatorOpened>>,
 ) -> anyhow::Result<Id16> {
     ensure_domains_gateway(vault_path, target).map_err(|sentence| anyhow::anyhow!(sentence))?;
-    let step = if ask.reopen {
-        remote.chain_reopen(Some(ask.expected_step))?
+    let answer = if ask.reopen {
+        remote.chain_reopen(Some(ask.expected_step))
     } else {
-        remote.chain_next(Some(ask.expected_step))?
+        remote.chain_next(Some(ask.expected_step))
     };
+    let step = answer.map_err(chain_refusal)?;
     match answered(step, held) {
         ChainStepOutcome::Opened(opened) => Ok(opened.operation_id),
-        ChainStepOutcome::Finished => Err(anyhow::anyhow!(if ask.reopen {
-            CHAIN_FINISHED
-        } else {
-            CHAIN_FINISHED_NEXT
-        })),
+        ChainStepOutcome::Finished => {
+            let sentence = if ask.reopen {
+                CHAIN_FINISHED
+            } else {
+                CHAIN_FINISHED_NEXT
+            };
+            Err(ChainStepRefusal(sentence.to_string()).into())
+        }
     }
+}
+
+/// What a failed chain call says: the sentence the call carries, as it is. A call that got no
+/// answer stays as it is, so that it is still named unreachable.
+fn chain_refusal(error: anyhow::Error) -> anyhow::Error {
+    if tunnel::is_unreachable(&error) {
+        return error;
+    }
+    ChainStepRefusal(format!("{error:#}")).into()
 }
 
 /// Drops the chain's plan. What was approved keeps its effect; the held step goes with it.
@@ -916,6 +943,7 @@ mod chain_tests {
     use aether::certificates::transport::{OperatorChainStep, OperatorOpenRequest};
     use astra_operator::operations::fixtures::gateway_key;
     use astra_operator::operations::gateway_identity::tests::Scenario;
+    use astra_operator::tunnel;
 
     use super::*;
 
@@ -1117,7 +1145,17 @@ mod chain_tests {
             let refused = obtain_chain_step(&fake, &scenario.domain.path, &target, &ask, &held)
                 .expect_err("finished");
 
-            assert!(format!("{refused:#}").starts_with("le plan est fini"));
+            let sentence = if reopen {
+                CHAIN_FINISHED
+            } else {
+                CHAIN_FINISHED_NEXT
+            };
+            assert_eq!(format!("{refused:#}"), sentence);
+            assert_eq!(
+                refused.downcast_ref::<ChainStepRefusal>(),
+                Some(&ChainStepRefusal(sentence.to_string())),
+                "the page reads the sentence from the refusal"
+            );
             assert_eq!(read(&held), None, "a finished chain holds no step");
         }
     }
@@ -1137,7 +1175,31 @@ mod chain_tests {
             .expect_err("refused");
 
         assert_eq!(format!("{refused:#}"), sentence);
+        assert_eq!(
+            refused.downcast_ref::<ChainStepRefusal>(),
+            Some(&ChainStepRefusal(sentence.to_string())),
+            "Astra's sentence, verbatim, as the refusal"
+        );
         assert_eq!(read(&held), Some(opened(3)));
+    }
+
+    /// A gateway that cannot be reached is not a sentence of the plan: the ceremony still names
+    /// it unreachable.
+    #[test]
+    fn an_obtained_step_with_no_answer_is_not_a_sentence() {
+        let (scenario, target) = domain_gateway();
+        let tunnel = Tunnel::new(&target.address).expect("tunnel");
+        let held = held_with(None);
+        let ask = ChainStepAsk {
+            reopen: false,
+            expected_step: 1,
+        };
+
+        let error = obtain_chain_step(&tunnel, &scenario.domain.path, &target, &ask, &held)
+            .expect_err("no answer");
+
+        assert!(tunnel::is_unreachable(&error));
+        assert!(error.downcast_ref::<ChainStepRefusal>().is_none());
     }
 
     #[test]

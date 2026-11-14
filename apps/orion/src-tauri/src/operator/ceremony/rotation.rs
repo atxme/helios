@@ -35,9 +35,11 @@ use astra_operator::rotation_journal::{
 use astra_operator::tunnel::{self, Tunnel, TunnelRefusal};
 use astra_operator::vault::VaultError;
 
+use super::gateway::store_words;
 use super::wait::{answers_the_terms, Ended, Step, Waiting};
 use super::{connect_key, now_unix, Ceremony, Press};
-use crate::operator::{relay_names_peer, GatewayTarget, RotationGesture};
+use crate::operator::rotations::ChainStepRefusal;
+use crate::operator::{relay_names_peer, GatewayTarget, RotationGesture, Words};
 
 /// Said when the tunnel leads to a gateway the domain's relay does not name.
 const WRONG_GATEWAY: &str = "la gateway jointe n'est pas celle que le relais du domaine désigne";
@@ -47,10 +49,12 @@ const WRONG_GATEWAY: &str = "la gateway jointe n'est pas celle que le relais du 
 const ROTATION_KEYS: u8 = 2;
 
 /// Runs one rotation gesture to its end against the vault at `vault_path`, publishing
-/// every state it reaches.
+/// every state it reaches. What a chain step refuses is stored in `words` before its failure
+/// is published, for the page to read back.
 ///
 /// Called from the ceremony's own thread, which is what lets the tunnel be used with
 /// a blocking wait: that thread is not a runtime worker.
+#[allow(clippy::too_many_arguments)]
 pub fn run_rotation(
     session_id: Id16,
     gesture: RotationGesture,
@@ -59,6 +63,7 @@ pub fn run_rotation(
     publish: &mut dyn FnMut(OperatorStatus),
     vault_path: &Path,
     chain_opened: &Mutex<Option<OperatorOpened>>,
+    words: &Words,
 ) -> Result<(), String> {
     let mut ceremony = Ceremony::new(
         session_id,
@@ -121,7 +126,7 @@ pub fn run_rotation(
         gateway_now: &gateway_now,
         chain: &chain,
     };
-    RotationRun::new(&mut ceremony, &presses, publish, vault_path, &reach).run(gesture)
+    RotationRun::new(&mut ceremony, &presses, publish, vault_path, words, &reach).run(gesture)
 }
 
 /// The gateway's clock, read from its certificate answer: the source Task 8's
@@ -182,6 +187,7 @@ impl Openings {
 struct RotationRun<'a> {
     wait: Waiting<'a>,
     vault_path: &'a Path,
+    words: &'a Words,
     reach: &'a Reach<'a>,
     openings: Openings,
     /// The operation the chain gave this ceremony, so that a second opening reuses it and never
@@ -209,11 +215,13 @@ impl RotationRun<'_> {
         presses: &'a Receiver<Press>,
         publish: &'a mut dyn FnMut(OperatorStatus),
         vault_path: &'a Path,
+        words: &'a Words,
         reach: &'a Reach<'a>,
     ) -> RotationRun<'a> {
         RotationRun {
             wait: Waiting::new(ceremony, presses, publish, reach.connect, reach.now),
             vault_path,
+            words,
             reach,
             openings: Openings::none(),
             obtained: Cell::new(None),
@@ -333,7 +341,14 @@ impl RotationRun<'_> {
             }
             _ => rotation::open(self.reach.remote, self.vault_path, kind, *keys, terms, now),
         }
-        .map_err(|error| self.refuse(refusal_of_open(&error), format!("{error:#}")))?;
+        .map_err(|error| match error.downcast_ref::<ChainStepRefusal>() {
+            // The plan's own word, stored before the failure is published: the page reads it.
+            Some(refused) => {
+                store_words(self.words, &refused.0);
+                self.refuse(Refusal::RotationInFlight, refused.0.clone())
+            }
+            None => self.refuse(refusal_of_open(&error), format!("{error:#}")),
+        })?;
         self.ceremony.remote = RemoteState::AwaitingOperator;
         self.ceremony.operation_id = Some(opened.operation_id());
         self.ceremony.manifest = Some(opened.manifest().clone());

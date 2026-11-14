@@ -197,7 +197,7 @@ fn stop(
 
 /// Stores the sentence a gateway ceremony ends on. Written before its failure is published,
 /// so that the page reads it as soon as it sees the failure.
-fn store_words(words: &Words, message: &str) {
+pub(super) fn store_words(words: &Words, message: &str) {
     *words
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(message.to_string());

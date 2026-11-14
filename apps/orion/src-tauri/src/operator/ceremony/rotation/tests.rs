@@ -29,8 +29,8 @@ use aether::certificates::status::{
     CertificateKind,
 };
 use aether::certificates::transport::{
-    OperatorAuthorityStatus, OperatorOpenRequest, OperatorOpened, OperatorVaultCopied,
-    OperatorVaultCopy, SigningOperationState,
+    OperatorAuthorityStatus, OperatorChainStep, OperatorOpenRequest, OperatorOpened,
+    OperatorVaultCopied, OperatorVaultCopy, SigningOperationState,
 };
 use aether::certificates::webauthn::WebAuthnAssertion;
 use aether::certificates::CERTIFICATE_FORMAT_VERSION;
@@ -52,7 +52,10 @@ use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair as _};
 use zeroize::Zeroizing;
 
 use super::*;
-use crate::operator::{OperatorCeremony, RotationGesture};
+use crate::operator::rotations::{
+    obtain_chain_step, ChainRemote, CHAIN_FINISHED, CHAIN_FINISHED_NEXT,
+};
+use crate::operator::{OperatorCeremony, RotationGesture, Words};
 
 const NOW: u64 = 1_800_000_000;
 const EXPIRES: u64 = NOW + 300;
@@ -280,6 +283,62 @@ struct Remote {
     sent_with_credentials: Mutex<Vec<bool>>,
     /// The last credential document a copy carried.
     sent_document: Mutex<Option<aether::certificates::approval::CredentialRegistry>>,
+    /// What the chain's route answers, each time a step is asked.
+    chain_answer: Mutex<ChainAnswer>,
+}
+
+/// What Astra's chain route answers, as the bench scripts it.
+#[derive(Clone, Default)]
+enum ChainAnswer {
+    /// The step opens: its campaign is the one the rotation then reads.
+    #[default]
+    Opened,
+    /// The plan is finished: there is no step to take.
+    Finished,
+    /// The plan refuses, with its sentence in the body, as the gateway relays it.
+    Refused(String),
+}
+
+impl ChainRemote for Remote {
+    fn open_campaign(&self, _request: &OperatorOpenRequest) -> anyhow::Result<OperatorOpened> {
+        Err(anyhow::anyhow!(
+            "the rotation's approval opens its own campaign"
+        ))
+    }
+
+    fn chain_next(&self, _expected_step: Option<usize>) -> anyhow::Result<OperatorChainStep> {
+        self.chain_step()
+    }
+
+    fn chain_reopen(&self, _expected_step: Option<usize>) -> anyhow::Result<OperatorChainStep> {
+        self.chain_step()
+    }
+
+    fn chain_abandon(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+impl Remote {
+    fn chain_step(&self) -> anyhow::Result<OperatorChainStep> {
+        self.note("chain_step");
+        match self.chain_answer.lock().expect("lock").clone() {
+            ChainAnswer::Opened => Ok(OperatorChainStep::Opened(Box::new(OperatorOpened {
+                operation_id: operation(),
+                campaign_id: Id16::new([0x0C; 16]).expect("id"),
+                campaign_fingerprint: Fingerprint::of(b"campaign"),
+                scope: CampaignScope::IssuerDelegation,
+                target_count: 1,
+                required_credentials: 2,
+                expires_at: EXPIRES,
+                revocation_expiries: None,
+                delegation_request: Some("demande publique".into()),
+                gateway_certificate: None,
+            }))),
+            ChainAnswer::Finished => Ok(OperatorChainStep::Finished),
+            ChainAnswer::Refused(sentence) => Err(anyhow::anyhow!(sentence)),
+        }
+    }
 }
 
 impl Remote {
@@ -415,8 +474,6 @@ struct Bench {
     touch_ends_at: AtomicU64,
     /// The chain steps asked at the approval, as (reopen, expected step).
     chain_asked: Mutex<Vec<(bool, usize)>>,
-    /// What the chain answers: the operation it opened, or the sentence it refused with.
-    chain_answer: Mutex<Result<Id16, String>>,
 }
 
 const STRANGER: usize = usize::MAX;
@@ -492,7 +549,6 @@ fn bench() -> Arc<Bench> {
         unreachable: Mutex::default(),
         touch_ends_at: AtomicU64::new(0),
         chain_asked: Mutex::default(),
-        chain_answer: Mutex::new(Ok(operation())),
     };
     bench.arm(EXPIRES);
     *bench.remote.authority.lock().expect("lock") = Some(bench.nothing_in_flight());
@@ -506,6 +562,8 @@ struct Ran {
     published: Vec<OperatorStatus>,
     /// Whether the run still held an opening when it returned.
     still_held: bool,
+    /// The sentence the failed ceremony stored for the page, if it stored one.
+    words: Option<String>,
 }
 
 impl Ran {
@@ -620,17 +678,14 @@ fn awaits_terms(status: &OperatorStatus) -> bool {
 }
 
 impl Bench {
-    /// The chain's step, as the tunnel would answer it.
+    /// The chain's step, taken as the ceremony takes it: through the tunnel's chain route.
     fn chain(&self, ask: &ChainStepAsk) -> anyhow::Result<Id16> {
         self.chain_asked
             .lock()
             .expect("lock")
             .push((ask.reopen, ask.expected_step));
-        self.chain_answer
-            .lock()
-            .expect("lock")
-            .clone()
-            .map_err(|sentence| anyhow::anyhow!(sentence))
+        let held = Mutex::default();
+        obtain_chain_step(&self.remote, &self.path, &towards_gateway(self), ask, &held)
     }
 
     fn chain_asked(&self) -> Vec<(bool, usize)> {
@@ -793,6 +848,7 @@ impl Bench {
             gateway_now: &gateway_now,
             chain: &chain,
         };
+        let words = Words::default();
         let mut publish = |status: OperatorStatus| {
             match script(&status, self) {
                 Answer::Nothing => {}
@@ -820,14 +876,26 @@ impl Bench {
             },
         );
         publish(ceremony.status());
-        let mut run = RotationRun::new(&mut ceremony, &received, &mut publish, &self.path, &reach);
+        let mut run = RotationRun::new(
+            &mut ceremony,
+            &received,
+            &mut publish,
+            &self.path,
+            &words,
+            &reach,
+        );
         let outcome = run.run(gesture);
         let still_held = !matches!(run.openings.held, Held::Nothing);
         drop(run);
+        let words = words
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         Ran {
             outcome,
             published,
             still_held,
+            words,
         }
     }
 
@@ -938,23 +1006,45 @@ fn a_refusal_before_the_opening_takes_no_chain_step() {
     assert!(bench.chain_asked().is_empty());
 }
 
-/// Astra's sentence about the plan (finished, moved on, step still open) reaches the page as it
-/// is, and the ceremony ends there.
+/// Astra's sentence about the plan (moved on, step still open) reaches the page as it is, and
+/// the ceremony ends there: the page's rotation refusal is the one that says the rotation waits.
 #[test]
 fn a_refused_chain_step_ends_the_ceremony_with_its_sentence() {
     let bench = bench();
-    *bench.chain_answer.lock().expect("lock") = Err("le plan est fini".to_string());
+    let sentence = "le plan a avancé : relire avant de reprendre";
+    *bench.remote.chain_answer.lock().expect("lock") = ChainAnswer::Refused(sentence.into());
     let ran = bench.drive(RotationGesture::ReplaceCaTls, |status, bench| {
         if awaits_terms(status) {
             return approve_it(status, chain_terms(false));
         }
         Bench::all_the_way(status, bench)
     });
-    assert_eq!(ran.outcome, Err("le plan est fini".to_string()));
-    assert_eq!(ran.last().gesture, GestureState::Failed);
+    assert_eq!(ran.outcome, Err(sentence.to_string()));
+    assert_eq!(ran.words.as_deref(), Some(sentence));
+    ran.refused(Refusal::RotationInFlight);
     assert!(!ran.still_held);
     assert_eq!(bench.chain_asked(), [(false, 1)]);
     assert!(!bench.remote.called("open_campaign"));
+    assert!(!bench.remote.called("submit_campaign"));
+}
+
+/// A plan that has finished says so in Orion's own words, whichever step was asked.
+#[test]
+fn a_finished_chain_plan_ends_the_ceremony_with_its_sentence() {
+    for (reopen, sentence) in [(false, CHAIN_FINISHED_NEXT), (true, CHAIN_FINISHED)] {
+        let bench = bench();
+        *bench.remote.chain_answer.lock().expect("lock") = ChainAnswer::Finished;
+        let ran = bench.drive(RotationGesture::ReplaceCaTls, |status, bench| {
+            if awaits_terms(status) {
+                return approve_it(status, chain_terms(reopen));
+            }
+            Bench::all_the_way(status, bench)
+        });
+        assert_eq!(ran.outcome, Err(sentence.to_string()), "reopen {reopen}");
+        assert_eq!(ran.words.as_deref(), Some(sentence), "reopen {reopen}");
+        ran.refused(Refusal::RotationInFlight);
+        assert!(!bench.remote.called("open_campaign"));
+    }
 }
 
 // The tunnel.
@@ -979,6 +1069,7 @@ fn without_a_tunnel_no_gesture_reaches_a_key() {
             &mut |status| published.push(status),
             &bench.path,
             &Mutex::default(),
+            &Words::default(),
         );
         drop(presses);
         outcome.expect_err("no tunnel");
@@ -2364,9 +2455,13 @@ async fn open_session(
     gesture: RotationGesture,
 ) -> OperatorStatus {
     let running = bench.clone();
+    let words = Words::default();
+    let thread_words = words.clone();
     ceremony
-        .open(
+        .open_as(
             gesture.operation(),
+            false,
+            Some(words),
             move |session_id, presses, publish, _artifacts| {
                 let connect = |owner: isize| running.connect(owner);
                 let now = || running.clock.load(Ordering::SeqCst);
@@ -2387,10 +2482,19 @@ async fn open_session(
                     },
                 );
                 publish(state.status());
-                RotationRun::new(&mut state, &presses, publish, &running.path, &reach).run(gesture)
+                RotationRun::new(
+                    &mut state,
+                    &presses,
+                    publish,
+                    &running.path,
+                    &thread_words,
+                    &reach,
+                )
+                .run(gesture)
             },
         )
         .await
+        .ok()
         .expect("opened")
 }
 
@@ -2502,6 +2606,26 @@ async fn a_corrected_approval_opens_with_no_further_touch() {
         .await
         .expect("abandoned");
     until(&ceremony, |status| status.gesture.is_terminal()).await;
+}
+
+/// The approval answers with the chain's sentence, the words the page shows, and no campaign is
+/// opened.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_chain_step_reaches_the_approval_as_its_sentence() {
+    let bench = bench();
+    let sentence = "le plan a avancé : relire avant de reprendre";
+    *bench.remote.chain_answer.lock().expect("lock") = ChainAnswer::Refused(sentence.into());
+    let ceremony = OperatorCeremony::default();
+    open_session(&ceremony, &bench, RotationGesture::ReplaceCaTls).await;
+    let screen = on_the_approval_screen(&ceremony, &bench).await;
+
+    let refused = ceremony
+        .approve_rotation(chain_terms(false), screen.revision)
+        .await
+        .expect_err("the chain refused");
+    assert_eq!(refused, sentence);
+    assert!(!bench.remote.called("open_campaign"));
+    ceremony.dismiss().await.expect("dismissed");
 }
 
 /// The window never reaches an opening: every gesture of every key came from the
