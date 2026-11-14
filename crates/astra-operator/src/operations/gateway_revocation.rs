@@ -519,9 +519,12 @@ pub fn discard_pending_revocation(vault_path: &Path) -> Result<(), GatewayRefusa
     let signed: SignedGatewayRevocation = serde_json::from_slice(&bytes).map_err(|error| {
         internal(anyhow::Error::from(error).context("lecture de la révocation à jeter"))
     })?;
-    let work_left = signed.revocation.is_some()
+    let work_left = (signed.revocation.is_some()
         && !signed.replacement_installed
-        && (signed.replacement.is_some() || !signed.revocation_applied);
+        && (signed.replacement.is_some() || !signed.revocation_applied))
+        || (signed.revocation_applied
+            && signed.replacement.is_some()
+            && !signed.replacement_installed);
     if work_left {
         return Err(GatewayRefusal::NotDiscardable(
             "la révocation de la gateway n'est pas finie : la reprendre pour la terminer. Rien n'a été jeté."

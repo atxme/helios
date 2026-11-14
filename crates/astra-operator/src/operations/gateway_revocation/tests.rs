@@ -1451,6 +1451,41 @@ fn a_deposited_replacement_without_revocation_is_discarded() {
 }
 
 #[test]
+fn a_probe_applied_revocation_whose_replacement_is_not_installed_is_not_discarded() {
+    let scenario = Scenario::new(true);
+    let remote = Remote::new(&scenario);
+    let domain = &scenario.domain;
+    let replacement = sign_replacement(&remote, domain);
+    carry_revocation(&remote, &domain.path, replacement, NOW).expect_err("to sign");
+    rewrite_record(domain, |signed| signed.revocation_applied = true);
+
+    let refusal = discard_pending_revocation(&domain.path).expect_err("refused");
+
+    assert_eq!(
+        refusal,
+        GatewayRefusal::NotDiscardable(REVOCATION_LEFT.into())
+    );
+    assert!(record_on_disk(domain), "the replacement is kept");
+}
+
+#[test]
+fn a_probe_applied_revocation_whose_replacement_is_installed_is_discarded() {
+    let scenario = Scenario::new(true);
+    let remote = Remote::new(&scenario);
+    let domain = &scenario.domain;
+    let replacement = sign_replacement(&remote, domain);
+    carry_revocation(&remote, &domain.path, replacement, NOW).expect_err("to sign");
+    rewrite_record(domain, |signed| {
+        signed.revocation_applied = true;
+        signed.replacement_installed = true;
+    });
+
+    discard_pending_revocation(&domain.path).expect("discarded");
+
+    assert!(!record_on_disk(domain));
+}
+
+#[test]
 fn an_applied_revocation_without_replacement_is_discarded() {
     let scenario = Scenario::new(false);
     let remote = Remote::new(&scenario);
