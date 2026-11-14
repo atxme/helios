@@ -1277,7 +1277,9 @@ l'ouverture `chain_open`.
 
 « Continuer » contrôle l'étape suivante **avant** `chain/next`, puisque `next`
 ouvre aussitôt sa campagne. Pour la CA TLS, le panneau de la rotation s'ouvre sous
-la ligne, avec ses clés ; pour l'identité gateway, les durées et « Remplacer aussi
+la ligne, avec ses clés : l'étape n'est prise à Astra qu'à l'approbation, par la
+cérémonie elle-même, une fois les clés validées et les contrôles de la rotation passés
+(un contrôle qui refuse ne coûte donc aucune étape du plan) ; pour l'identité gateway, les durées et « Remplacer aussi
 la feuille TLS » se règlent avant le clic. Un refus d'Astra s'affiche tel quel,
 avec « Relire plus tard ».
 
@@ -1285,7 +1287,9 @@ avec « Relire plus tard ».
 refuse une étape jamais déposée (« l'étape n'a pas été ouverte : continuer le
 plan »), une étape dont l'effet est visible au registre (« l'étape a pris effet :
 continuer le plan ») et une campagne encore ouverte (« la campagne de l'étape est
-encore ouverte jusqu'à … : l'approuver »). L'étape du parc fait exception à la
+encore ouverte jusqu'à … : l'approuver »). Une campagne déjà approuvée reste ouverte
+jusqu'à son échéance : « la campagne de l'étape a été approuvée et reste ouverte
+jusqu'à … : attendre son échéance ». L'étape du parc fait exception à la
 deuxième règle : son effet n'est pas observable, elle se rouvre dès que sa campagne
 est expirée. Pour la délégation de l'émetteur, la nouvelle demande garde la même
 époque et tire une **nouvelle clé** : la première tentative n'a jamais été installée.

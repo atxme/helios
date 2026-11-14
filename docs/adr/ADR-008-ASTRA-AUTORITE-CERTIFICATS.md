@@ -842,9 +842,12 @@ Renvoi à la spécification du lot g (§6.1, `2026-11-14-f14-g-tout-renouveler-d
   comme `next`). `next` et `reopen` portent l'étape attendue, optionnelle
   (`expected_step`) : Astra refuse si le plan n'est plus sur cette étape. Le corps
   vide reste accepté.
-- **Refus.** Les cinq refus de plan (`ChainStepIncomplete`, `ChainStepNotDeposited`,
-  `ChainStepLanded`, `ChainStepStillOpen`, `ChainStepMoved`) traversent en `409`
-  avec leur phrase, par le tunnel comme par la route administrateur.
+- **Refus.** Les refus de plan (`NoChain`, `ChainFinished`, `ChainStepIncomplete`,
+  `ChainStepNotDeposited`, `ChainStepLanded`, `ChainStepStillOpen`,
+  `ChainStepApproved`, `ChainStepMoved`) traversent en `409` avec leur phrase, par le
+  tunnel comme par la route administrateur. `ChainStepApproved` distingue la
+  campagne déjà approuvée, qui reste ouverte jusqu'à son échéance, de celle qui
+  attend encore l'opérateur (`ChainStepStillOpen`).
 
 ### 8. Avortement, leases et atomicité logique
 

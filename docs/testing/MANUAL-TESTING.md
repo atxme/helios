@@ -1490,7 +1490,9 @@ deux clés dans le coffre pour les étapes **[cible]**. Onglet *Astra* › *Rota
     Attendu : « Tout renouveler » sans plan ; « Commencer » désactivé avec « Une opération
     Délégation de l'émetteur est déjà ouverte » jusqu'à l'échéance de la campagne d'essai,
     puis actif. `astra chain status` ne montre plus de plan.
-117. **« Continuer » bloqué par un contrôle.** Refaire 115 sans abandonner, puis attendre
+117. **« Continuer » bloqué par un contrôle.** Refaire 115 sans abandonner, mais seulement
+    après l'échéance de la campagne de délégation d'essai ouverte à l'étape 116 (l'abandon ne
+    la ferme pas : tant qu'elle court, `astra chain open` est refusé), puis attendre
     l'échéance affichée. Attendu : « Étape 1 sur 4 : Délégation de l'émetteur · campagne
     close », avec « Continuer », « Rouvrir l'étape » et « Abandonner le plan ». « Continuer »
     ouvre le panneau de la CA TLS sous la ligne, qui affiche sa raison (par exemple « Deux clés
