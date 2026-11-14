@@ -1078,4 +1078,18 @@ mod chain_tests {
         assert_eq!(refused, NOT_THE_DOMAINS_GATEWAY);
         assert!(fake.requests.borrow().is_empty(), "no campaign is opened");
     }
+
+    /// The page reads the outcome from its tag: an opened step carries the campaign's fields at
+    /// the top level, and a finished plan is the tag alone.
+    #[test]
+    fn chain_step_outcome_serializes_with_its_outcome_tag() {
+        let opened_wire =
+            serde_json::to_value(ChainStepOutcome::Opened(Box::new(opened(3)))).expect("json");
+        assert_eq!(opened_wire["outcome"], "opened");
+        assert_eq!(opened_wire["operation_id"], opened(3).operation_id.to_hex());
+        assert_eq!(opened_wire["scope"], "issuer_delegation");
+
+        let finished_wire = serde_json::to_value(ChainStepOutcome::Finished).expect("json");
+        assert_eq!(finished_wire, serde_json::json!({"outcome": "finished"}));
+    }
 }
