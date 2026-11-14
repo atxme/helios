@@ -255,7 +255,7 @@ describe('the steps of a plan', () => {
     await waitFor(() => expect(api.operatorChainAbandon).toHaveBeenCalledTimes(1))
   })
 
-  it('the_ca_tls_step_hands_its_obtain_to_the_ceremony_on_continue', async () => {
+  it('the_ca_tls_step_hands_its_chain_step_to_the_ceremony_on_continue', async () => {
     type Context = Parameters<NonNullable<React.ComponentProps<typeof RenewAllBlock>['renderStep']>>[0]
     const renderStep = vi.fn((_context: Context) => null)
     const { onCeremony } = show(withChain(chain(0)), { renderStep })
@@ -263,10 +263,22 @@ describe('the steps of a plan', () => {
     expect(renderStep).toHaveBeenCalledWith(
       expect.objectContaining({ action: 'replace_ca_tls', existingOperation: null }),
     )
-    // The step's own ceremony hands the screen over with the obtain that opens the campaign.
+    // The step's own ceremony hands the screen over with the step its approval takes.
     const context = renderStep.mock.calls[renderStep.mock.calls.length - 1][0]
     context.onCeremony(ceremony({ operation: 'rotate_client_tls_ca' }), null)
-    expect(onCeremony).toHaveBeenCalledWith(expect.anything(), null, expect.any(Function))
+    expect(onCeremony).toHaveBeenCalledWith(expect.anything(), null, { reopen: false, expected_step: 0 })
     expect(api.operatorChainNext).not.toHaveBeenCalled()
+    expect(api.operatorChainReopen).not.toHaveBeenCalled()
+  })
+
+  it('the_ca_tls_reopening_hands_a_reopen_step_at_the_current_plan_step', () => {
+    type Context = Parameters<NonNullable<React.ComponentProps<typeof RenewAllBlock>['renderStep']>>[0]
+    const renderStep = vi.fn((_context: Context) => null)
+    const { onCeremony } = show(withChain(chain(1)), { renderStep })
+    fireEvent.click(button("Rouvrir l'étape"))
+    const context = renderStep.mock.calls[renderStep.mock.calls.length - 1][0]
+    context.onCeremony(ceremony({ operation: 'rotate_client_tls_ca' }), null)
+    expect(onCeremony).toHaveBeenCalledWith(expect.anything(), null, { reopen: true, expected_step: 1 })
+    expect(api.operatorChainReopen).not.toHaveBeenCalled()
   })
 })

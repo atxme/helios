@@ -1002,6 +1002,14 @@ export interface RotationTerms {
   prepare_days: number
   overlap_days: number
   validity_days: number
+  /** Le pas du plan « Tout renouveler » que l'approbation obtient, sinon absent. */
+  chain_step?: ChainStepAsk
+}
+
+/** Le pas du plan que Orion prend à l'approbation : `reopen` le rouvre, sinon le suivant. */
+export interface ChainStepAsk {
+  reopen: boolean
+  expected_step: number
 }
 
 /** Un fichier produit par la cérémonie, à enregistrer par l'IHM. Contenu public. */

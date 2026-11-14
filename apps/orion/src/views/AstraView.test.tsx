@@ -9,6 +9,9 @@ const api = vi.hoisted(() => ({
   beginOperatorCeremony: vi.fn(),
   beginRotationCeremony: vi.fn(),
   approveRotationCeremony: vi.fn(),
+  operatorChainNext: vi.fn(),
+  operatorChainReopen: vi.fn(),
+  operatorChainHeld: vi.fn(),
   operatorPendingOperations: vi.fn(),
   operatorRotationsOverview: vi.fn(),
   dismissOperatorCeremony: vi.fn(),
@@ -407,6 +410,59 @@ describe('AstraView', () => {
       expect(within(chainRow).getByRole('button', { name: 'Continuer' })).toBeTruthy(),
     )
     expect(within(chainRow).queryByRole('button', { name: "Rouvrir l'étape" })).toBeNull()
+  })
+
+  it('the_ca_tls_step_of_the_plan_is_approved_with_its_chain_step_while_the_panel_is_gone', async () => {
+    const steps: CampaignScope[] = ['issuer_delegation', 'trust_authorities', 'gateway_identity', 'fleet_leafs']
+    api.operatorChainHeld.mockResolvedValue(null)
+    api.operatorRotationsOverview.mockResolvedValue(
+      fullOverview({
+        authority: {
+          state: 'ok',
+          value: authorityRead({ chain: { steps, current: 0, operation_id: null } }),
+        },
+      }),
+    )
+    api.beginRotationCeremony.mockResolvedValue({
+      session_id: 's'.repeat(32),
+      revision: 3,
+      operation: 'rotate_client_tls_ca' as const,
+      remote: 'local' as const,
+      gesture: 'idle' as const,
+      allowed: ['cancel'] as const,
+      keys: [
+        { slot: '1', label: 'YubiKey bureau' },
+        { slot: '2', label: 'YubiKey coffre' },
+      ],
+    })
+    api.approveRotationCeremony.mockResolvedValue({
+      session_id: 's'.repeat(32),
+      revision: 4,
+      operation: 'rotate_client_tls_ca' as const,
+      remote: 'local' as const,
+      gesture: 'verifying' as const,
+      allowed: [],
+    })
+    render(<AstraView />)
+    openTab(/Rotations/)
+    const chainRow = await screen.findByRole('region', { name: 'Tout renouveler' })
+    await waitFor(() =>
+      expect(within(chainRow).getByRole('button', { name: 'Continuer' })).toBeTruthy(),
+    )
+    fireEvent.click(within(chainRow).getByRole('button', { name: 'Continuer' }))
+    // The CA TLS step's own panel: its Continuer opens the ceremony.
+    const stepButtons = await screen.findAllByRole('button', { name: 'Continuer' })
+    fireEvent.click(stepButtons[stepButtons.length - 1])
+    await waitFor(() => expect(api.beginRotationCeremony).toHaveBeenCalled())
+    // The panel is unmounted by the ceremony: nothing reads the plan at the approval.
+    fireEvent.click(await screen.findByRole('button', { name: 'Continuer' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Approuver' }))
+    await waitFor(() => expect(api.approveRotationCeremony).toHaveBeenCalledTimes(1))
+    const [terms] = api.approveRotationCeremony.mock.calls[0]
+    expect(terms.chain_step).toEqual({ reopen: false, expected_step: 0 })
+    expect(terms.existing_operation).toBeNull()
+    expect(api.operatorChainNext).not.toHaveBeenCalled()
+    expect(api.operatorChainReopen).not.toHaveBeenCalled()
   })
 
   it('leads_a_CA_rotation_campaign_to_the_rotations_tab', async () => {

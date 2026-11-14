@@ -12,19 +12,22 @@
 //! every way out of a ceremony erases it, abandoned, failed, finished, or idle for
 //! [`VALIDATION_IDLE_SECS`]. No status carries more than a label.
 
+use std::cell::Cell;
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
 use std::sync::mpsc::Receiver;
+use std::sync::Mutex;
 
 use aether::certificates::encoding::Id16;
 use aether::certificates::operator_session::{
     AstraManifest, GestureState, KeyPurpose, KeySlotLabel, OperationKind, OperationLocator,
     OperatorStatus, Refusal, RemoteState,
 };
+use aether::certificates::transport::OperatorOpened;
 use aether_fido::authenticator::Authenticator;
 use astra_operator::operations::rotation::{
-    self, CaTlsFinish, FinishRefusal, KeyStep, OpenRefusal, OpenedRotation, RotationRemote,
-    RotationTerms, ValidatedKeys,
+    self, CaTlsFinish, ChainStepAsk, FinishRefusal, KeyStep, OpenRefusal, OpenedRotation,
+    OperationSource, RotationRemote, RotationTerms, ValidatedKeys,
 };
 use astra_operator::rotation_journal::{
     self, JournalStage, ResumeStep, RotationJournal, RotationKind,
@@ -55,6 +58,7 @@ pub fn run_rotation(
     presses: Receiver<Press>,
     publish: &mut dyn FnMut(OperatorStatus),
     vault_path: &Path,
+    chain_opened: &Mutex<Option<OperatorOpened>>,
 ) -> Result<(), String> {
     let mut ceremony = Ceremony::new(
         session_id,
@@ -66,6 +70,7 @@ pub fn run_rotation(
     publish(ceremony.status());
 
     let gateway_address = gateway.as_ref().map(|target| target.address.clone());
+    let chain_target = gateway.clone();
     let tunnel = gateway
         .ok_or_else(|| "aucun tunnel n'est monté vers la gateway".to_string())
         .and_then(|target| {
@@ -97,11 +102,24 @@ pub fn run_rotation(
     };
 
     let gateway_now = move || gateway_address.as_deref().and_then(read_gateway_clock);
+    // The chain's step is taken here, under this ceremony: the page cannot call the chain while
+    // a ceremony is open, and a read of the plan at the approval would meet a dead panel.
+    let chain = |ask: &ChainStepAsk| match &chain_target {
+        Some(target) => crate::operator::rotations::obtain_chain_step(
+            &tunnel,
+            vault_path,
+            target,
+            ask,
+            chain_opened,
+        ),
+        None => Err(anyhow::anyhow!("aucun tunnel n'est monté vers la gateway")),
+    };
     let reach = Reach {
         remote: &tunnel,
         connect: &connect_key,
         now: &now_unix,
         gateway_now: &gateway_now,
+        chain: &chain,
     };
     RotationRun::new(&mut ceremony, &presses, publish, vault_path, &reach).run(gesture)
 }
@@ -122,6 +140,8 @@ struct Reach<'a> {
     /// The gateway's clock, when its answer can be read: what « Terminer » of a `CA-PQ`
     /// judges its end by, before the local clock.
     gateway_now: &'a dyn Fn() -> Option<u64>,
+    /// Takes the chain's step an approval asked for, and says the operation it opened.
+    chain: &'a dyn Fn(&ChainStepAsk) -> anyhow::Result<Id16>,
 }
 
 enum Held {
@@ -164,6 +184,9 @@ struct RotationRun<'a> {
     vault_path: &'a Path,
     reach: &'a Reach<'a>,
     openings: Openings,
+    /// The operation the chain gave this ceremony, so that a second opening reuses it and never
+    /// takes another step.
+    obtained: Cell<Option<Id16>>,
 }
 
 impl<'a> Deref for RotationRun<'a> {
@@ -193,6 +216,7 @@ impl RotationRun<'_> {
             vault_path,
             reach,
             openings: Openings::none(),
+            obtained: Cell::new(None),
         }
     }
 
@@ -289,8 +313,27 @@ impl RotationRun<'_> {
         let Held::Keys(keys) = self.openings.take() else {
             return Err(self.nothing_held());
         };
-        let opened = rotation::open(self.reach.remote, self.vault_path, kind, *keys, terms, now)
-            .map_err(|error| self.refuse(refusal_of_open(&error), format!("{error:#}")))?;
+        let opened = match (terms.existing_operation, terms.chain_step) {
+            (None, Some(ask)) => {
+                let obtain = || match self.obtained.get() {
+                    Some(operation_id) => Ok(operation_id),
+                    None => (self.reach.chain)(&ask).inspect(|operation_id| {
+                        self.obtained.set(Some(*operation_id));
+                    }),
+                };
+                rotation::open_with(
+                    self.reach.remote,
+                    self.vault_path,
+                    kind,
+                    *keys,
+                    terms,
+                    OperationSource::Obtain(&obtain),
+                    now,
+                )
+            }
+            _ => rotation::open(self.reach.remote, self.vault_path, kind, *keys, terms, now),
+        }
+        .map_err(|error| self.refuse(refusal_of_open(&error), format!("{error:#}")))?;
         self.ceremony.remote = RemoteState::AwaitingOperator;
         self.ceremony.operation_id = Some(opened.operation_id());
         self.ceremony.manifest = Some(opened.manifest().clone());

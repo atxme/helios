@@ -15,6 +15,7 @@ import type {
   CaRotationManifest,
   OperatorStatus,
   RotationJournalView,
+  ChainStepAsk,
   RotationTerms,
 } from '../../types'
 import {
@@ -435,7 +436,7 @@ export function RotationCeremony({
   journal,
   existingOperation = null,
   existingExpiresAt = null,
-  obtainOperation,
+  chainStep,
   now = Math.floor(Date.now() / 1000),
 }: {
   status: OperatorStatus
@@ -448,10 +449,11 @@ export function RotationCeremony({
   /** When that campaign ends: with seconds left, the keys are spent for nothing. */
   existingExpiresAt?: number | null
   /**
-   * Opens the campaign at the approval, once the prerequisites passed, when none is open yet:
-   * its id becomes `existing_operation`. A retry of the approval reuses that id.
+   * The chain's step this rotation leads: the approval carries it in its terms and Orion takes
+   * the step there, once every check that precedes an opening has passed. No campaign is open
+   * before, so `existingOperation` is ignored.
    */
-  obtainOperation?: () => Promise<string>
+  chainStep?: ChainStepAsk
   /** Seconds, for the deadline; the operator's clock when not given. */
   now?: number
 }) {
@@ -468,8 +470,6 @@ export function RotationCeremony({
     validity: String(TERMS_DEFAULT.validity_days),
   })
   const [invalid, setInvalid] = useState<string | null>(null)
-  // The operation obtained at the approval, kept so that a retry does not open another.
-  const [obtained, setObtained] = useState<string | null>(null)
 
   const act = async (action: 'continue' | 'cancel') => {
     setBusy(true)
@@ -491,26 +491,14 @@ export function RotationCeremony({
     setBusy(true)
     setError(null)
     try {
-      let existing = existingOperation
-      if (existing === null && obtainOperation) {
-        existing = obtained
-        if (existing === null) {
-          try {
-            existing = await obtainOperation()
-          } catch (cause) {
-            setError(cause instanceof Error ? cause.message : String(cause))
-            return
-          }
-          setObtained(existing)
-        }
-      }
       const terms: RotationTerms = {
-        existing_operation: existing,
+        existing_operation: chainStep ? null : existingOperation,
         reason: draft.reason.trim(),
         requested_by: status.keys?.[0]?.label ?? 'operator',
         prepare_days: Number(draft.prepare),
         overlap_days: Number(draft.overlap),
         validity_days: Number(draft.validity),
+        ...(chainStep ? { chain_step: chainStep } : {}),
       }
       onStatus(await api.approveRotationCeremony(terms, status.revision))
     } catch (cause) {

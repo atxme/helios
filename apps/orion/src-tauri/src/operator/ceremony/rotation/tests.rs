@@ -39,7 +39,8 @@ use aether_fido::authenticator::{
 };
 use astra_operator::gestures::{NewAuthority, NewKey};
 use astra_operator::operations::rotation::{
-    RotationTerms, DEFAULT_CA_TLS_VALIDITY_DAYS, DEFAULT_OVERLAP_DAYS, DEFAULT_PREPARE_DAYS,
+    ChainStepAsk, RotationTerms, DEFAULT_CA_TLS_VALIDITY_DAYS, DEFAULT_OVERLAP_DAYS,
+    DEFAULT_PREPARE_DAYS,
 };
 use astra_operator::origin::CampaignRequest;
 use astra_operator::rotation_journal::{self, JournalStage, RotationJournal, RotationKind};
@@ -412,6 +413,10 @@ struct Bench {
     /// Where the clock jumps at the next connection, standing for a touch that
     /// took that long.
     touch_ends_at: AtomicU64,
+    /// The chain steps asked at the approval, as (reopen, expected step).
+    chain_asked: Mutex<Vec<(bool, usize)>>,
+    /// What the chain answers: the operation it opened, or the sentence it refused with.
+    chain_answer: Mutex<Result<Id16, String>>,
 }
 
 const STRANGER: usize = usize::MAX;
@@ -486,6 +491,8 @@ fn bench() -> Arc<Bench> {
         plugged: AtomicUsize::new(0),
         unreachable: Mutex::default(),
         touch_ends_at: AtomicU64::new(0),
+        chain_asked: Mutex::default(),
+        chain_answer: Mutex::new(Ok(operation())),
     };
     bench.arm(EXPIRES);
     *bench.remote.authority.lock().expect("lock") = Some(bench.nothing_in_flight());
@@ -590,6 +597,7 @@ fn terms() -> RotationTerms {
         prepare_days: DEFAULT_PREPARE_DAYS,
         overlap_days: DEFAULT_OVERLAP_DAYS,
         validity_days: DEFAULT_CA_TLS_VALIDITY_DAYS,
+        chain_step: None,
     }
 }
 
@@ -612,6 +620,23 @@ fn awaits_terms(status: &OperatorStatus) -> bool {
 }
 
 impl Bench {
+    /// The chain's step, as the tunnel would answer it.
+    fn chain(&self, ask: &ChainStepAsk) -> anyhow::Result<Id16> {
+        self.chain_asked
+            .lock()
+            .expect("lock")
+            .push((ask.reopen, ask.expected_step));
+        self.chain_answer
+            .lock()
+            .expect("lock")
+            .clone()
+            .map_err(|sentence| anyhow::anyhow!(sentence))
+    }
+
+    fn chain_asked(&self) -> Vec<(bool, usize)> {
+        self.chain_asked.lock().expect("lock").clone()
+    }
+
     fn plug(&self, key: usize) {
         self.plugged.store(key, Ordering::SeqCst);
     }
@@ -760,11 +785,13 @@ impl Bench {
                 .load(Ordering::SeqCst)
                 .then(|| self.gateway_clock.load(Ordering::SeqCst))
         };
+        let chain = |ask: &ChainStepAsk| self.chain(ask);
         let reach = Reach {
             remote,
             connect: &connect,
             now: &now,
             gateway_now: &gateway_now,
+            chain: &chain,
         };
         let mut publish = |status: OperatorStatus| {
             match script(&status, self) {
@@ -861,6 +888,75 @@ impl Bench {
     }
 }
 
+// The chain's step, obtained at the approval.
+
+fn chain_terms(reopen: bool) -> RotationTerms {
+    RotationTerms {
+        chain_step: Some(ChainStepAsk {
+            reopen,
+            expected_step: 1,
+        }),
+        ..terms()
+    }
+}
+
+/// The step is taken once, after the checks that precede an opening, and in place of it: the
+/// campaign the chain opened is the one read, verified and approved.
+#[test]
+fn an_approval_with_a_chain_step_obtains_it_instead_of_opening() {
+    for reopen in [false, true] {
+        let bench = bench();
+        let ran = bench.drive(RotationGesture::ReplaceCaTls, |status, bench| {
+            if awaits_terms(status) {
+                return approve_it(status, chain_terms(reopen));
+            }
+            Bench::all_the_way(status, bench)
+        });
+        ran.done();
+        assert_eq!(bench.chain_asked(), [(reopen, 1)]);
+        assert!(!bench.remote.called("open_campaign"));
+        assert!(bench.remote.called("fetch_campaign"));
+    }
+}
+
+/// A prerequisite this machine can refuse costs no step of the chain: the plan stays where it
+/// was, and the next try finds the step still to take.
+#[test]
+fn a_refusal_before_the_opening_takes_no_chain_step() {
+    let bench = bench();
+    *bench.remote.authority.lock().expect("lock") = Some(OperatorAuthorityStatus {
+        next_ca_fingerprint: Some(Fingerprint::of(b"suivante")),
+        ..bench.nothing_in_flight()
+    });
+    let ran = bench.drive(RotationGesture::ReplaceCaTls, |status, bench| {
+        if awaits_terms(status) {
+            return approve_it(status, chain_terms(false));
+        }
+        Bench::all_the_way(status, bench)
+    });
+    ran.refused(Refusal::RotationInFlight);
+    assert!(bench.chain_asked().is_empty());
+}
+
+/// Astra's sentence about the plan (finished, moved on, step still open) reaches the page as it
+/// is, and the ceremony ends there.
+#[test]
+fn a_refused_chain_step_ends_the_ceremony_with_its_sentence() {
+    let bench = bench();
+    *bench.chain_answer.lock().expect("lock") = Err("le plan est fini".to_string());
+    let ran = bench.drive(RotationGesture::ReplaceCaTls, |status, bench| {
+        if awaits_terms(status) {
+            return approve_it(status, chain_terms(false));
+        }
+        Bench::all_the_way(status, bench)
+    });
+    assert_eq!(ran.outcome, Err("le plan est fini".to_string()));
+    assert_eq!(ran.last().gesture, GestureState::Failed);
+    assert!(!ran.still_held);
+    assert_eq!(bench.chain_asked(), [(false, 1)]);
+    assert!(!bench.remote.called("open_campaign"));
+}
+
 // The tunnel.
 
 #[test]
@@ -882,6 +978,7 @@ fn without_a_tunnel_no_gesture_reaches_a_key() {
             received,
             &mut |status| published.push(status),
             &bench.path,
+            &Mutex::default(),
         );
         drop(presses);
         outcome.expect_err("no tunnel");
@@ -2274,11 +2371,13 @@ async fn open_session(
                 let connect = |owner: isize| running.connect(owner);
                 let now = || running.clock.load(Ordering::SeqCst);
                 let gateway_now = || Some(running.gateway_clock.load(Ordering::SeqCst));
+                let chain = |ask: &ChainStepAsk| running.chain(ask);
                 let reach = Reach {
                     remote: &running.remote,
                     connect: &connect,
                     now: &now,
                     gateway_now: &gateway_now,
+                    chain: &chain,
                 };
                 let mut state = Ceremony::new(
                     session_id,
@@ -2443,7 +2542,12 @@ async fn begin_rotation_without_a_tunnel_reports_the_refusal() {
     let bench = bench();
     let ceremony = OperatorCeremony::default();
     ceremony
-        .begin_rotation(RotationGesture::ReplaceCaTls, None, bench.path.clone())
+        .begin_rotation(
+            RotationGesture::ReplaceCaTls,
+            None,
+            bench.path.clone(),
+            Arc::default(),
+        )
         .await
         .expect("a session");
     let ended = until(&ceremony, |status| status.gesture.is_terminal()).await;
@@ -2458,7 +2562,12 @@ async fn a_second_ceremony_waits_for_the_rotation() {
     open_session(&ceremony, &bench, RotationGesture::ReplaceCaPq).await;
     let waiting = until(&ceremony, |status| awaits_validation(status, 1)).await;
     ceremony
-        .begin_rotation(RotationGesture::Resume, None, bench.path.clone())
+        .begin_rotation(
+            RotationGesture::Resume,
+            None,
+            bench.path.clone(),
+            Arc::default(),
+        )
         .await
         .expect_err("one at a time");
     ceremony
@@ -2642,7 +2751,12 @@ async fn resume_leaves_an_operators_finished_screen_alone() {
     let bench = bench();
     let ceremony = OperatorCeremony::default();
     ceremony
-        .begin_rotation(RotationGesture::ReplaceCaTls, None, bench.path.clone())
+        .begin_rotation(
+            RotationGesture::ReplaceCaTls,
+            None,
+            bench.path.clone(),
+            Arc::default(),
+        )
         .await
         .expect("a session");
     let ended = until(&ceremony, |status| status.gesture.is_terminal()).await;
@@ -2786,6 +2900,7 @@ async fn the_resume_gesture_is_refused_towards_another_domains_gateway() {
             RotationGesture::Resume,
             Some(towards_another_gateway()),
             bench.path.clone(),
+            Arc::default(),
         )
         .await
         .expect("a session");
@@ -2981,7 +3096,12 @@ async fn only_dismissing_the_operators_screen_calls_for_a_look() {
     let bench = bench();
     let ceremony = OperatorCeremony::default();
     ceremony
-        .begin_rotation(RotationGesture::ReplaceCaTls, None, bench.path.clone())
+        .begin_rotation(
+            RotationGesture::ReplaceCaTls,
+            None,
+            bench.path.clone(),
+            Arc::default(),
+        )
         .await
         .expect("a session");
     let ended = until(&ceremony, |status| status.gesture.is_terminal()).await;
@@ -3033,6 +3153,7 @@ async fn finishing_is_refused_towards_another_domains_gateway() {
             RotationGesture::FinishCaTls,
             Some(towards_another_gateway()),
             bench.path.clone(),
+            Arc::default(),
         )
         .await
         .expect("a session");

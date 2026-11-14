@@ -114,6 +114,31 @@ pub struct RotationTerms {
     pub overlap_days: u64,
     /// Read for a client TLS rotation only: the `CA-PQ` key has no certificate.
     pub validity_days: u64,
+    /// A chain step to obtain from Astra at the opening, in place of opening a campaign: only
+    /// the ceremony that carries the chain reads it ([`open`] never does).
+    #[serde(default)]
+    pub chain_step: Option<ChainStepAsk>,
+}
+
+/// The step of the certificate chain a rotation approval obtains its campaign from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChainStepAsk {
+    /// Redeposits the current step rather than moving to the next one.
+    pub reopen: bool,
+    /// The step the operator read: Astra refuses a plan that has moved on.
+    pub expected_step: usize,
+}
+
+/// Where the campaign a rotation leads comes from.
+pub enum OperationSource<'a> {
+    /// A campaign already open, to be led here.
+    Existing(Id16),
+    /// Opened here, through the remote.
+    Open,
+    /// Obtained by the caller (the chain's step), once every check made before an opening has
+    /// passed. Called at most once.
+    Obtain(&'a dyn Fn() -> Result<Id16>),
 }
 
 /// What a rotation needs from the far side of the tunnel.
@@ -310,6 +335,23 @@ pub fn open(
     terms: &RotationTerms,
     now: u64,
 ) -> Result<OpenedRotation> {
+    let source = match terms.existing_operation {
+        Some(operation_id) => OperationSource::Existing(operation_id),
+        None => OperationSource::Open,
+    };
+    open_with(remote, vault_path, kind, keys, terms, source, now)
+}
+
+/// [`open`], with the campaign's source named: the checks that come before it are the same.
+pub fn open_with(
+    remote: &dyn RotationRemote,
+    vault_path: &Path,
+    kind: RotationKind,
+    keys: ValidatedKeys,
+    terms: &RotationTerms,
+    source: OperationSource<'_>,
+    now: u64,
+) -> Result<OpenedRotation> {
     ensure_nothing_outstanding(vault_path)?;
     ensure_same_vault(vault_path, &keys.vault)?;
     if keys.count() != ANCHOR_ROTATION_CREDENTIALS {
@@ -326,9 +368,10 @@ pub fn open(
     ensure_no_overlap(&authority)?;
     ensure_same_anchors(&authority, &domain)?;
 
-    let operation_id = match terms.existing_operation {
-        Some(operation_id) => operation_id,
-        None => {
+    let operation_id = match source {
+        OperationSource::Existing(operation_id) => operation_id,
+        OperationSource::Obtain(obtain) => obtain()?,
+        OperationSource::Open => {
             remote
                 .open_campaign(&OperatorOpenRequest {
                     action: OperatorOpenAction::TrustAuthorities,

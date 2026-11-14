@@ -31,12 +31,13 @@ use orion_core::operator_rotations::{
 };
 use serde::Serialize;
 
+use aether::certificates::encoding::Id16;
 use aether::certificates::transport::{
     OperatorChainStep, OperatorOpenAction, OperatorOpenRequest, OperatorOpened, OperatorVaultCopy,
     TrustUpdateObject,
 };
 use astra_operator::operations::gateway_identity::{self, GatewayIdentityRemote, RenewalOptions};
-use astra_operator::operations::rotation::RotationRemote;
+use astra_operator::operations::rotation::{ChainStepAsk, RotationRemote};
 
 use crate::operator::ceremony::page_sentence;
 use crate::operator::{relay_names_peer, GatewayTarget};
@@ -209,6 +210,36 @@ pub fn chain_reopen_with(
     match answered(step, held) {
         ChainStepOutcome::Opened(opened) => Ok(*opened),
         ChainStepOutcome::Finished => Err(CHAIN_FINISHED.to_string()),
+    }
+}
+
+/// Said when the chain's next step is asked of a plan that has finished.
+const CHAIN_FINISHED_NEXT: &str = "le plan est fini : rien à passer à l'étape suivante.";
+
+/// Takes the chain's step from inside a rotation ceremony, once every check that precedes an
+/// opening has passed: the campaign it opens is the one the ceremony leads. The step is held as
+/// `chain_next`/`chain_reopen` hold theirs. A refusal keeps its error, so Astra's sentence and
+/// status reach the ceremony as they are.
+pub fn obtain_chain_step(
+    remote: &dyn ChainRemote,
+    vault_path: &Path,
+    target: &GatewayTarget,
+    ask: &ChainStepAsk,
+    held: &std::sync::Mutex<Option<OperatorOpened>>,
+) -> anyhow::Result<Id16> {
+    ensure_domains_gateway(vault_path, target).map_err(|sentence| anyhow::anyhow!(sentence))?;
+    let step = if ask.reopen {
+        remote.chain_reopen(Some(ask.expected_step))?
+    } else {
+        remote.chain_next(Some(ask.expected_step))?
+    };
+    match answered(step, held) {
+        ChainStepOutcome::Opened(opened) => Ok(opened.operation_id),
+        ChainStepOutcome::Finished => Err(anyhow::anyhow!(if ask.reopen {
+            CHAIN_FINISHED
+        } else {
+            CHAIN_FINISHED_NEXT
+        })),
     }
 }
 
@@ -1034,6 +1065,79 @@ mod chain_tests {
             "the reopened step replaces the old one"
         );
         assert_eq!(*fake.expected.borrow(), vec![Some(1)]);
+    }
+
+    #[test]
+    fn an_obtained_next_step_is_held_and_names_its_operation() {
+        let (scenario, target) = domain_gateway();
+        let fake = Fake::default().then(Ok(OperatorChainStep::Opened(Box::new(opened(5)))));
+        let held = held_with(Some(opened(3)));
+        let ask = ChainStepAsk {
+            reopen: false,
+            expected_step: 1,
+        };
+
+        let obtained =
+            obtain_chain_step(&fake, &scenario.domain.path, &target, &ask, &held).expect("step");
+
+        assert_eq!(obtained, opened(5).operation_id);
+        assert_eq!(read(&held), Some(opened(5)));
+        assert_eq!(*fake.expected.borrow(), vec![Some(1)]);
+    }
+
+    #[test]
+    fn an_obtained_reopening_replaces_the_held_step() {
+        let (scenario, target) = domain_gateway();
+        let fake = Fake::default().then(Ok(OperatorChainStep::Opened(Box::new(opened(7)))));
+        let held = held_with(Some(opened(3)));
+        let ask = ChainStepAsk {
+            reopen: true,
+            expected_step: 2,
+        };
+
+        let obtained =
+            obtain_chain_step(&fake, &scenario.domain.path, &target, &ask, &held).expect("step");
+
+        assert_eq!(obtained, opened(7).operation_id);
+        assert_eq!(read(&held), Some(opened(7)));
+        assert_eq!(*fake.expected.borrow(), vec![Some(2)]);
+    }
+
+    #[test]
+    fn an_obtained_step_of_a_finished_plan_is_a_sentence() {
+        for reopen in [false, true] {
+            let (scenario, target) = domain_gateway();
+            let fake = Fake::default().then(Ok(OperatorChainStep::Finished));
+            let held = held_with(Some(opened(3)));
+            let ask = ChainStepAsk {
+                reopen,
+                expected_step: 1,
+            };
+
+            let refused = obtain_chain_step(&fake, &scenario.domain.path, &target, &ask, &held)
+                .expect_err("finished");
+
+            assert!(format!("{refused:#}").starts_with("le plan est fini"));
+            assert_eq!(read(&held), None, "a finished chain holds no step");
+        }
+    }
+
+    #[test]
+    fn an_obtained_step_refused_keeps_astras_sentence_and_the_held_step() {
+        let (scenario, target) = domain_gateway();
+        let sentence = "le plan a avancé : relire";
+        let fake = Fake::default().then(Err(sentence.to_string()));
+        let held = held_with(Some(opened(3)));
+        let ask = ChainStepAsk {
+            reopen: false,
+            expected_step: 1,
+        };
+
+        let refused = obtain_chain_step(&fake, &scenario.domain.path, &target, &ask, &held)
+            .expect_err("refused");
+
+        assert_eq!(format!("{refused:#}"), sentence);
+        assert_eq!(read(&held), Some(opened(3)));
     }
 
     #[test]

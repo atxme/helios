@@ -38,6 +38,7 @@ pub mod peers;
 pub mod rotations;
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use aether::certificates::encoding::Id16;
@@ -959,11 +960,20 @@ impl OperatorCeremony {
         gesture: RotationGesture,
         gateway: Option<GatewayTarget>,
         vault_path: PathBuf,
+        chain_opened: Arc<StdMutex<Option<OperatorOpened>>>,
     ) -> Result<OperatorStatus, String> {
         self.open(
             gesture.operation(),
             move |session_id, presses, publish, _artifacts| {
-                ceremony::run_rotation(session_id, gesture, gateway, presses, publish, &vault_path)
+                ceremony::run_rotation(
+                    session_id,
+                    gesture,
+                    gateway,
+                    presses,
+                    publish,
+                    &vault_path,
+                    &chain_opened,
+                )
             },
         )
         .await
@@ -1167,6 +1177,7 @@ impl OperatorCeremony {
                         presses,
                         publish,
                         &vault_path,
+                        &StdMutex::new(None),
                     )
                 },
             )

@@ -307,8 +307,8 @@ export function RenewAllBlock({
     run(action)
   }
 
-  // The CA TLS step: its prerequisites first, then the step's own ceremony, which asks Astra for
-  // the operation only at the approval (`obtainOperation`).
+  // The CA TLS step: its prerequisites first, then the step's own ceremony, whose approval takes
+  // the chain's step itself (`chainStep`), once Orion's own checks have passed.
   const caTlsBody = (action: BodyAction) => {
     const blocker =
       action === 'resume_step'
@@ -316,29 +316,16 @@ export function RenewAllBlock({
         : stepBlocker(overview, 'trust_authorities', now)
     if (blocker) return <Typography sx={{ fontSize: 11.5, color: 'text.secondary' }}>{blocker}</Typography>
     if (!renderStep) return null
-    const obtain = action === 'resume_step' ? undefined : obtainChainOperation(action === 'reopen')
+    const chainStep =
+      action === 'resume_step' || !plan ? undefined : { reopen: action === 'reopen', expected_step: plan.current }
     return renderStep({
       action: 'replace_ca_tls',
       overview,
       existingOperation: action === 'resume_step' ? liveOperation(overview, 'replace_ca_tls', now) : null,
       operatorLabel,
-      onCeremony: (status, existingOperation) => onCeremony(status, existingOperation, obtain),
+      onCeremony: (status, existingOperation) => onCeremony(status, existingOperation, chainStep),
       refresh,
     })
-  }
-
-  // Read again at the approval: the operation is obtained only once the keys are validated.
-  const obtainChainOperation = (reopen: boolean) => async (): Promise<string> => {
-    const fresh = await readFresh()
-    const current = planOf(fresh)
-    const scope = stepOf(current, reopen ? 'reopen' : 'continue')
-    if (scope !== 'trust_authorities') throw new Error(STALE)
-    const blocker = stepBlocker(fresh, 'trust_authorities', nowSeconds())
-    if (blocker) throw new Error(blocker)
-    if (reopen) return (await api.operatorChainReopen(current.current)).operation_id
-    const outcome = await api.operatorChainNext(current.current)
-    if (outcome.outcome === 'finished') throw new Error(STALE)
-    return outcome.operation_id
   }
 
   const gatewayBody = (action: BodyAction) => (

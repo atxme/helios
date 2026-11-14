@@ -675,47 +675,44 @@ describe('starting a rotation', () => {
   })
 })
 
-describe('the operation obtained at the approval', () => {
-  const OBTAINED = 'e'.repeat(32)
+describe('the chain step taken at the approval', () => {
+  const STEP = { reopen: false, expected_step: 1 }
 
-  it('obtain_operation_runs_after_prerequisites_and_feeds_existing_operation', async () => {
-    const obtainOperation = vi.fn().mockResolvedValue(OBTAINED)
-    shown(approval({ operation: 'rotate_client_tls_ca' }), { obtainOperation })
+  it('chain_step_rides_the_terms_with_no_existing_operation', async () => {
+    shown(approval({ operation: 'rotate_client_tls_ca' }), {
+      chainStep: STEP,
+      existingOperation: 'e'.repeat(32),
+    })
     fireEvent.click(button('Continuer'))
-    // Nothing is asked of Astra before the approval.
-    expect(obtainOperation).not.toHaveBeenCalled()
+    api.approveRotationCeremony.mockResolvedValueOnce(status())
+    fireEvent.click(button('Approuver'))
+    await waitFor(() => expect(api.approveRotationCeremony).toHaveBeenCalledTimes(1))
+    const terms = api.approveRotationCeremony.mock.calls[0][0]
+    expect(terms.chain_step).toEqual(STEP)
+    expect(terms.existing_operation).toBeNull()
+  })
 
-    // Terms refused: the prerequisites fail first, the operation is not obtained.
+  it('refused_terms_send_nothing_and_a_rotation_without_a_step_carries_none', async () => {
+    shown(approval({ operation: 'rotate_client_tls_ca' }), { chainStep: STEP })
+    fireEvent.click(button('Continuer'))
     fireEvent.click(button('Modifier'))
     fireEvent.change(screen.getByLabelText('Préparation (jours)'), { target: { value: '0' } })
     fireEvent.click(button('Approuver'))
-    expect(obtainOperation).not.toHaveBeenCalled()
     expect(api.approveRotationCeremony).not.toHaveBeenCalled()
-    fireEvent.change(screen.getByLabelText('Préparation (jours)'), { target: { value: '7' } })
-
-    // The first approval fails after the operation was obtained.
-    api.approveRotationCeremony.mockRejectedValueOnce(new Error('refus'))
-    fireEvent.click(button('Approuver'))
-    await waitFor(() => expect(api.approveRotationCeremony).toHaveBeenCalledTimes(1))
-    expect(obtainOperation).toHaveBeenCalledTimes(1)
-    expect(obtainOperation.mock.invocationCallOrder[0]).toBeLessThan(
-      api.approveRotationCeremony.mock.invocationCallOrder[0],
-    )
-
-    // A retry reuses the stored id and never obtains again.
+    cleanup()
+    shown(approval({ operation: 'rotate_client_tls_ca' }))
+    fireEvent.click(button('Continuer'))
     api.approveRotationCeremony.mockResolvedValueOnce(status())
     fireEvent.click(button('Approuver'))
-    await waitFor(() => expect(api.approveRotationCeremony).toHaveBeenCalledTimes(2))
-    expect(obtainOperation).toHaveBeenCalledTimes(1)
-    expect(api.approveRotationCeremony.mock.calls[1][0].existing_operation).toBe(OBTAINED)
+    await waitFor(() => expect(api.approveRotationCeremony).toHaveBeenCalledTimes(1))
+    expect('chain_step' in api.approveRotationCeremony.mock.calls[0][0]).toBe(false)
   })
 
-  it('a_rejected_obtain_shows_its_message_and_approves_nothing', async () => {
-    const obtainOperation = vi.fn().mockRejectedValue(new Error('Le plan a changé : relire la ligne.'))
-    shown(approval({ operation: 'rotate_client_tls_ca' }), { obtainOperation })
+  it('a_refusal_of_the_approval_shows_its_sentence', async () => {
+    shown(approval({ operation: 'rotate_client_tls_ca' }), { chainStep: STEP })
     fireEvent.click(button('Continuer'))
+    api.approveRotationCeremony.mockRejectedValueOnce('le plan a avancé : relire')
     fireEvent.click(button('Approuver'))
-    await waitFor(() => expect(screen.getByText('Le plan a changé : relire la ligne.')).toBeTruthy())
-    expect(api.approveRotationCeremony).not.toHaveBeenCalled()
+    await waitFor(() => expect(screen.getByText(/le plan a avancé : relire/)).toBeTruthy())
   })
 })

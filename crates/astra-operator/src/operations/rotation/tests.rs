@@ -35,6 +35,7 @@ fn terms() -> RotationTerms {
         prepare_days: DEFAULT_PREPARE_DAYS,
         overlap_days: DEFAULT_OVERLAP_DAYS,
         validity_days: DEFAULT_CA_TLS_VALIDITY_DAYS,
+        chain_step: None,
     }
 }
 
@@ -357,6 +358,84 @@ fn an_existing_operation_is_read_and_not_opened_again() {
     .expect("opened");
     assert!(remote.called("fetch_campaign"));
     assert!(!remote.called("open_campaign"));
+}
+
+#[test]
+fn an_obtained_operation_replaces_the_opening_and_is_read() {
+    let domain = domain();
+    let remote = domain.armed_remote();
+    let obtained = Cell::new(0);
+    let obtain = || {
+        obtained.set(obtained.get() + 1);
+        Ok(operation())
+    };
+    let keys = domain.validated(&[0, 1]);
+    open_with(
+        &remote,
+        &domain.path,
+        RotationKind::CaTls,
+        keys,
+        &terms(),
+        OperationSource::Obtain(&obtain),
+        NOW,
+    )
+    .expect("opened");
+    assert_eq!(obtained.get(), 1);
+    assert!(remote.called("fetch_campaign"));
+    assert!(!remote.called("open_campaign"));
+}
+
+#[test]
+fn an_obtained_operation_is_not_asked_when_a_pre_open_check_refuses() {
+    let domain = domain();
+    let remote = domain.armed_remote();
+    let mut status = nothing_in_flight(&domain.path);
+    status.next_ca_tls_fingerprint = Some(Fingerprint::of(b"suivante"));
+    *remote.authority.borrow_mut() = Some(status);
+    let obtained = Cell::new(0);
+    let obtain = || {
+        obtained.set(obtained.get() + 1);
+        Ok(operation())
+    };
+    let keys = domain.validated(&[0, 1]);
+    let refused = open_with(
+        &remote,
+        &domain.path,
+        RotationKind::CaTls,
+        keys,
+        &terms(),
+        OperationSource::Obtain(&obtain),
+        NOW,
+    )
+    .err()
+    .expect("refused");
+    assert_eq!(
+        refused.downcast_ref::<OpenRefusal>(),
+        Some(&OpenRefusal::RotationInFlight)
+    );
+    assert_eq!(obtained.get(), 0);
+    assert!(!remote.called("fetch_campaign"));
+}
+
+#[test]
+fn a_refused_obtaining_ends_the_opening_with_its_sentence() {
+    let domain = domain();
+    let remote = domain.armed_remote();
+    let obtain = || Err(anyhow::anyhow!("le plan est fini"));
+    let keys = domain.validated(&[0, 1]);
+    let refused = open_with(
+        &remote,
+        &domain.path,
+        RotationKind::CaTls,
+        keys,
+        &terms(),
+        OperationSource::Obtain(&obtain),
+        NOW,
+    )
+    .err()
+    .expect("refused");
+    assert_eq!(format!("{refused:#}"), "le plan est fini");
+    assert!(!remote.called("fetch_campaign"));
 }
 
 #[test]

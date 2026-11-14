@@ -21,6 +21,7 @@ import { VaultPanel } from './astra/VaultPanel'
 import { KeyChangeCopy } from './astra/VaultCopy'
 import { GUTTER, MINT, PINE, RULE } from '../theme'
 import type {
+  ChainStepAsk,
   OperatorPendingOperation,
   OperatorStatus,
   RotationsOverview,
@@ -83,8 +84,8 @@ export function AstraView({
   const [journalKnown, setJournalKnown] = useState(true)
   // A campaign already open for the rotation being led, known before its first key.
   const [existingOperation, setExistingOperation] = useState<string | null>(null)
-  // Opens that campaign at the approval, when the chain has none open yet.
-  const [obtainOperation, setObtainOperation] = useState<(() => Promise<string>) | null>(null)
+  // The chain's step the approval takes, when the chain has no campaign open yet.
+  const [chainStep, setChainStep] = useState<ChainStepAsk | null>(null)
   // The finished session of an automatic resumption, said in its row.
   const [automaticStop, setAutomaticStop] = useState<OperatorStatus | null>(null)
   const [tab, setTab] = useState<AstraTab>('Enrôlement')
@@ -254,10 +255,10 @@ export function AstraView({
   const openCeremony = (
     next: OperatorStatus,
     existing: string | null = null,
-    obtain: (() => Promise<string>) | null = null,
+    step: ChainStepAsk | null = null,
   ) => {
     setExistingOperation(existing)
-    setObtainOperation(() => obtain)
+    setChainStep(step)
     setJournalKnown(true)
     setAutomaticStop(null)
     setCeremony(next)
@@ -292,9 +293,9 @@ export function AstraView({
             onStatus={setCeremony}
             onDismiss={() => void dismissCeremony()}
             journal={journalKnown ? journal : undefined}
-            existingOperation={led?.operation_id ?? existingOperation}
-            existingExpiresAt={led?.expires_at ?? null}
-            obtainOperation={obtainOperation ?? undefined}
+            existingOperation={chainStep ? null : (led?.operation_id ?? existingOperation)}
+            existingExpiresAt={chainStep ? null : (led?.expires_at ?? null)}
+            chainStep={chainStep ?? undefined}
           />
         ) : (
           <OperatorCeremonyPanel

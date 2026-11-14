@@ -12,6 +12,7 @@ import { KeyRound } from 'lucide-react'
 import * as api from '../../api'
 import { DUE_BACKGROUND, DUE_BORDER, GRAPHITE, RULE } from '../../theme'
 import type {
+  ChainStepAsk,
   OperatorPendingOperation,
   OperatorStatus,
   RotationsOverview,
@@ -44,12 +45,13 @@ const DEFAULT_REASON: Partial<Record<RotationAction, string>> = {
 
 /**
  * Hands a ceremony over to the screen. `existingOperation` is the campaign already open for
- * the rotation led at the approval; `obtainOperation` opens it there, when none is open yet.
+ * the rotation led at the approval; `chainStep` is the plan's step the approval takes instead,
+ * when none is open yet.
  */
 export type CeremonyHandoff = (
   status: OperatorStatus,
   existingOperation?: string | null,
-  obtainOperation?: () => Promise<string>,
+  chainStep?: ChainStepAsk,
 ) => void
 
 /** What a step is given to run once every prerequisite is green. */

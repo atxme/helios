@@ -163,7 +163,7 @@ pub(crate) async fn begin_rotation_ceremony(
     let gateway = connected_target(&state).await.ok();
     state
         .operator
-        .begin_rotation(gesture, gateway, vault_path)
+        .begin_rotation(gesture, gateway, vault_path, state.chain_opened.clone())
         .await
 }
 
