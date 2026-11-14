@@ -1,9 +1,9 @@
 import { describe, expect, it } from 'vitest'
 
 import type { OperatorOpened, OperatorPendingOperation, RotationsOverview } from '../../types'
-import { chainRow, type ChainRowInput } from './chainRow'
+import { chainRow, stepBlocker, type ChainRowInput } from './chainRow'
 import { DAY, NOW, authorityRead, domainRead, overview } from './rotationFixtures'
-import { formatDateTime } from './rotationRows'
+import { OVERLAP_PQ, formatDateTime } from './rotationRows'
 
 const STEPS = ['issuer_delegation', 'trust_authorities', 'gateway_identity', 'fleet_leafs'] as const
 
@@ -164,5 +164,27 @@ describe('the « Tout renouveler » row', () => {
       fleetApprovedThisSession: null,
     })
     expect(expired.actions).toEqual(['continue', 'reopen', 'abandon'])
+  })
+
+  it('unread_pending_offers_only_abandon', () => {
+    const o = chained(plan(3, 'op-1'), { pending: { state: 'unreachable' } })
+    const row = chainRow(input(o, { fleetApprovedThisSession: 'op-1' }))
+    expect(row.state).toBe('Étape 4 sur 4 : Postes · opérations non lues')
+    expect(row.actions).toEqual(['abandon'])
+    expect(row.detail).toBe(
+      "Les opérations d'Astra ne sont pas lues : relire avant de continuer.",
+    )
+  })
+})
+
+describe('stepBlocker, the gateway branch', () => {
+  it('gateway_step_blocked_when_renew_is_not_offered', () => {
+    const o = overview({ domain: { state: 'ok', value: domainRead({ gateway_revoked: true }) } })
+    expect(stepBlocker(o, 'gateway_identity', NOW)).toBe('Révoquée')
+  })
+
+  it('gateway_step_blocked_by_renew_reason', () => {
+    const o = overview({ caPqOverlap: true })
+    expect(stepBlocker(o, 'gateway_identity', NOW)).toBe(OVERLAP_PQ)
   })
 })

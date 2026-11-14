@@ -63,6 +63,9 @@ const NO_PLAN =
 const FLEET_UNKNOWN =
   "Orion ne peut pas savoir si les postes ont été autorisés : rouvrir l'étape si la cérémonie n'a pas abouti."
 
+const UNREAD_DETAIL =
+  "Les opérations d'Astra ne sont pas lues : relire avant de continuer."
+
 const lostDetail = (expiresAt: number) =>
   `Campagne de l'étape perdue par Orion : rouvrir l'étape après ${formatDateTime(expiresAt)}.`
 
@@ -119,6 +122,9 @@ export function chainRow({
 
   const scope = chain.steps[chain.current]
   const head = `Étape ${chain.current + 1} sur ${chain.steps.length} : ${STEP_NAMES[scope] ?? scope}`
+  // Without the operations there is no telling open from closed: finishing a fleet step then
+  // could close the plan over a campaign that is still open and unapproved.
+  if (o.pending.state !== 'ok') return chainRowOf(`${head} · opérations non lues`, ['abandon'], UNREAD_DETAIL)
   const live =
     chain.operation_id === null
       ? undefined
