@@ -1463,6 +1463,78 @@ prérequis que la section I. Chaque étape : action, puis état attendu.
     décision » n'apparaît que sur une gateway révoquée avec un registre (étapes 106 et 108) et
     dans l'impasse B (étapes 110-111).
 
+**K. F14-g : « Tout renouveler » depuis Orion**
+
+Les tests Rust et Vitest couvrent la logique (`apps/orion/src/views/astra/chainRow.test.ts`,
+`RenewAllBlock.test.tsx`, `crates/astra/src/door/tests.rs`, `crates/astra-operator/tests/tunnel.rs`,
+`crates/helios-api/src/certificates/tests/operator_contract_tests.rs`). Les étapes marquées
+**[cible]** demandent de vraies clés, une gateway cible ou un refus réel d'Astra. Les
+autres se jouent avec Astra en marche et le tunnel monté, sans clé ; les commandes
+`astra chain` se lancent dans le conteneur Astra. Mêmes prérequis que la section I, avec
+deux clés dans le coffre pour les étapes **[cible]**. Onglet *Astra* › *Rotations*, bloc
+« Tout renouveler », en tête. Chaque étape : action, puis état attendu.
+
+114. **Sans plan, « Commencer » désactivé.** Couper le tunnel, puis ouvrir l'onglet.
+    Attendu : « Tout renouveler », le texte « Quatre étapes, une cérémonie chacune :
+    délégation de l'émetteur, CA TLS cliente, identité de la gateway, postes. CA-PQ n'en fait
+    pas partie. Chaque cérémonie demande ses clés. », le champ « Motif » valant « Tout
+    renouveler », et « Commencer » désactivé, avec la raison en clair au-dessus du bouton
+    (« Tunnel connecté »). Rétablir le tunnel.
+115. **Plan ouvert à la console, campagne non tenue par Orion.** Dans le conteneur Astra :
+    `astra chain open --reason "essai F14-g" --requested-by "essai" --issuer-request-out
+    demande.json`. Ouvrir l'onglet. Attendu : « Étape 1 sur 4 : Délégation de
+    l'émetteur · opération ouverte jusqu’au … » avec « Campagne de l'étape perdue par Orion :
+    rouvrir l'étape après … » ; seul « Abandonner le plan » est proposé.
+116. **Abandon, puis « Commencer » bloqué.** Suite de 115 : « Abandonner le plan », lire
+    « Ce qui est déjà approuvé garde son effet. », puis « Confirmer l'abandon du plan ».
+    Attendu : « Tout renouveler » sans plan ; « Commencer » désactivé avec « Une opération
+    Délégation de l'émetteur est déjà ouverte » jusqu'à l'échéance de la campagne d'essai,
+    puis actif. `astra chain status` ne montre plus de plan.
+117. **« Continuer » bloqué par un contrôle.** Refaire 115 sans abandonner, puis attendre
+    l'échéance affichée. Attendu : « Étape 1 sur 4 : Délégation de l'émetteur · campagne
+    close », avec « Continuer », « Rouvrir l'étape » et « Abandonner le plan ». « Continuer »
+    ouvre le panneau de la CA TLS sous la ligne, qui affiche sa raison (par exemple « Deux clés
+    enregistrées » si le coffre n'en compte pas deux) et aucun bouton d'ouverture. Aucun appel
+    à Astra : `astra chain status` reste sur l'étape 1. Abandonner ensuite le plan pour
+    nettoyer.
+118. **Campagne expirée, puis « Rouvrir l'étape ».** **[cible]** (une clé pour la cérémonie).
+    « Commencer » avec un motif, puis fermer la cérémonie sans approuver. Attendre l'échéance.
+    Attendu : « campagne close », comme à l'étape 117. « Rouvrir l'étape » : la cérémonie
+    `authorize_issuer` s'ouvre avec une nouvelle demande, qui porte une autre clé que celle de
+    la campagne expirée (« nouvelle clé » : même époque d'émetteur). Approuver la délégation :
+    la ligne reste sur « Étape 1 sur 4 » avec « campagne close », « Continuer » et « Rouvrir
+    l'étape ». Le plan ne passe à l'étape 2 qu'au « Continuer ».
+119. **« Rouvrir l'étape » refusé, effet visible.** **[cible]** (suite de 118). Sur l'étape 1
+    approuvée et encore courante, cliquer « Rouvrir l'étape ». Attendu : « l'étape a pris effet :
+    continuer le plan », affiché tel quel, avec « Relire plus tard ». Le plan ne change pas ;
+    « Continuer » le fait avancer.
+120. **Plan avancé à la console, puis clic dans Orion.** **[cible]** (une étape approuvée).
+    Pendant qu'Orion affiche l'étape courante close, avancer le plan avec `astra chain next`
+    dans le conteneur. Attendu : après relecture, la ligne affiche l'étape suivante. Un clic
+    dont le plan a bougé entre la lecture et l'appel est refusé avec « le plan n'est plus sur
+    cette étape : relire le plan ».
+121. **Orion fermé pendant l'étape gateway.** **[cible]** (clés réelles, gateway cible). À
+    l'étape 3, « Identité de la gateway », fermer Orion pendant sa cérémonie, après
+    « Continuer ». Rouvrir Orion. Attendu : « Campagne de l'étape perdue par Orion : rouvrir l'étape après … » et
+    seul « Abandonner le plan ». Après l'échéance : « Rouvrir l'étape » ouvre le bloc de la
+    gateway (« Remplacer aussi la feuille TLS », durées, « Renouveler l'identité de la
+    gateway ») ; la nouvelle campagne et sa cérémonie suivent.
+122. **Étape du parc sans cérémonie réussie.** **[cible]** (clés réelles). Amener le plan à
+    l'étape 4, « Postes », puis fermer la cérémonie des postes sans l'approuver. Attendre
+    l'échéance. Attendu : « Étape 4 sur 4 : Postes · campagne close » avec « Rouvrir
+    l'étape », « Terminer le plan » et « Abandonner le plan », et la phrase « Orion ne peut
+    pas savoir si les postes ont été autorisés : rouvrir l'étape si la cérémonie n'a pas
+    abouti. ». Pas de « Continuer ». « Terminer le plan » affiche « Parc autorisé ; chaque
+    poste se renouvelle à sa prochaine connexion. ».
+123. **Étape du parc avec cérémonie réussie.** **[cible]** (clés réelles). Comme à l'étape 122,
+    mais approuver la campagne des postes jusqu'à la fin de la cérémonie. Attendu : la ligne
+    propose « Continuer » et « Abandonner le plan », sans la phrase d'avertissement. « Continuer »
+    termine le plan, avec le même message.
+124. **Plan complet.** **[cible]** (clés réelles, gateway cible). « Commencer » avec un motif, puis
+    chaque cérémonie approuvée dans l'ordre, « Continuer » entre les étapes après chacune. Attendu :
+    « Étape k sur 4 » progresse ; la ligne ne lance jamais l'étape suivante seule ; à la fin, le
+    message « Parc autorisé ; … » s'affiche, et la ligne revient à « Tout renouveler » sans plan.
+
 ### Le chemin manuel
 
 Dans un autre terminal, générer deux identités de test :

@@ -37,7 +37,8 @@ Depuis le lot 6b, l'identité de la gateway se gère aussi depuis Orion, par le
 tunnel, sans fichier ni commande (§7.1, §8, §8.1). Les commandes gateway de ce
 document (`astra-signer sign-gateway-transition`, `sign-gateway-rollback`,
 `revoke --scope gateway`, `astra gateway-identity …`) restent le recours jusqu'au
-lot 7. « Tout renouveler » n'est pas encore dans Orion (§10).
+lot 7. « Tout renouveler » se joue aussi dans Orion, en tête de *Rotations* (§10) :
+la console reste le recours.
 
 Depuis le lot 6c, les durées de l'identité gateway se règlent dans Orion, une gateway
 révoquée s'affiche comme telle, et les impasses de la gateway se jettent par « Abandonner
@@ -53,6 +54,7 @@ la décision » (§7.1, §8).
 | Renouveler la délégation | délégation de l'émetteur, sans fichier ni redémarrage | §4 |
 | Révoquer un poste | onglet *Postes* : coupe le poste tout de suite, puis signe la révocation (lot 5c) | §7 |
 | Identité de la gateway | bloc en tête de *Rotations* : renouvelle, annule, revient à l'ancienne identité, révoque la gateway ; reprend ou jette une décision en attente, et abandonne les impasses (lots 6b et 6c) | §7.1, §8, §8.1 |
+| Tout renouveler | ligne en tête de *Rotations* : commence le plan, continue, reprend ou rouvre une étape, termine ou abandonne (F14-g) | §10 |
 
 Orion vérifie des **prérequis** avant toute ouverture (tunnel, administrateur,
 service Astra, coffre, deux clés, copie du coffre, domaine concordant) et dit
@@ -112,7 +114,7 @@ Depuis le lot 6b, le même tunnel ouvre aussi l'identité de la gateway
 (`gateway_identity`, §8), la révocation de la gateway (`gateway_revocation`,
 §7.1) et le premier pas du plan (`chain_open`, §10). Il porte la publication
 d'une transition (`POST /api/certificates/operator/gateway-identity/publish`) et
-les pas suivants du plan (`…/chain/next`, `…/chain/abandon`).
+les pas suivants du plan (`…/chain/next`, `…/chain/reopen`, `…/chain/abandon`).
 
 ## 1. Renouveler la feuille d'un poste (§7.1 → §7.3)
 
@@ -1243,13 +1245,68 @@ commande, le fichier `astra-prepared.json` en garde la trace et
 gateway et les feuilles du parc — **pas `CA-PQ`**, qui a sa propre cérémonie
 (§3 de cette note).
 
-**Dans Orion : pas encore.** « Tout renouveler » n'est pas dans Orion : le lot 6b
-l'a détaché, parce que chaque geste du plan devrait être contrôlé avant l'ouverture
-du plan, ce qui change la conception (suivi F14-g dans [ROADMAP.md](ROADMAP.md)).
-Le plan se joue sur la console d'Astra, comme ci-dessous. Le tunnel porte déjà les
-routes du plan (`POST /api/certificates/operator/chain/next` et `…/chain/abandon`,
-et l'ouverture `chain_open`) ; Orion ne les appelle pas. Le statut lu par le
-tunnel (`GET /api/certificates/operator/status`) nomme le plan en cours (`chain`).
+**Dans Orion, d'abord.** « Tout renouveler » est la première ligne de l'onglet
+*Rotations*, au-dessus des lignes par action (suivi F14-g dans
+[ROADMAP.md](ROADMAP.md)). Elle lit le plan que tient Astra (le champ `chain` de
+`GET /api/certificates/operator/status`) et relit ce plan avant chaque geste :
+Astra refuse ce qui ne se tient plus. La console (`astra chain`, plus bas) reste
+le recours, quand Orion ne peut pas.
+
+Le tunnel porte les routes du plan : `POST /api/certificates/operator/chain/next`,
+`…/chain/reopen` (corps optionnel `{"expected_step": n}`), `…/chain/abandon`, et
+l'ouverture `chain_open`.
+
+- **Sans plan** : la ligne décrit les quatre étapes et propose « Commencer », avec
+  le champ « Motif » (« Tout renouveler » par défaut). « Commencer » est désactivé,
+  la raison en clair au-dessus du bouton, si une des lignes concernées est bloquée
+  (par exemple « Tunnel connecté » quand le tunnel est coupé) ou si une opération de
+  la même famille est déjà ouverte (« Une opération Délégation de l'émetteur est
+  déjà ouverte »).
+- **Plan ouvert** : la ligne dit « Étape k sur 4 : <nom> », puis l'état de l'étape.
+  - *Campagne ouverte* : « Reprendre l'étape » mène la cérémonie sur l'opération
+    ouverte, sans rien rouvrir ; « Abandonner le plan ».
+  - *Campagne close* : « Continuer » (l'étape a peut-être pris effet), « Rouvrir
+    l'étape » et « Abandonner le plan ».
+  - *Opérations d'Astra non lues* : « Abandonner le plan », seul, avec « Les
+    opérations d'Astra ne sont pas lues : relire avant de continuer. »
+  - *Campagne perdue par Orion* (Orion a redémarré pendant une délégation ou une
+    identité gateway) : « Abandonner le plan », seul, avec « Campagne de l'étape
+    perdue par Orion : rouvrir l'étape après <échéance>. » Une fois l'échéance
+    passée, la campagne est close et la ligne propose « Continuer », « Rouvrir
+    l'étape » et « Abandonner le plan ».
+
+« Continuer » contrôle l'étape suivante **avant** `chain/next`, puisque `next`
+ouvre aussitôt sa campagne. Pour la CA TLS, le panneau de la rotation s'ouvre sous
+la ligne, avec ses clés ; pour l'identité gateway, les durées et « Remplacer aussi
+la feuille TLS » se règlent avant le clic. Un refus d'Astra s'affiche tel quel,
+avec « Relire plus tard ».
+
+« Rouvrir l'étape » redépose l'étape courante, avec les mêmes contrôles. Astra
+refuse une étape jamais déposée (« l'étape n'a pas été ouverte : continuer le
+plan »), une étape dont l'effet est visible au registre (« l'étape a pris effet :
+continuer le plan ») et une campagne encore ouverte (« la campagne de l'étape est
+encore ouverte jusqu'à … : l'approuver »). L'étape du parc fait exception à la
+deuxième règle : son effet n'est pas observable, elle se rouvre dès que sa campagne
+est expirée. Pour la délégation de l'émetteur, la nouvelle demande garde la même
+époque et tire une **nouvelle clé** : la première tentative n'a jamais été installée.
+
+**Étape du parc.** Astra ne peut pas voir si les postes ont été autorisés. Orion
+n'offre « Continuer » qu'après une cérémonie réussie dans cette session. Sinon, la
+campagne étant close, la ligne offre « Rouvrir l'étape » et « Terminer le plan »,
+avec « Orion ne peut pas savoir si les postes ont été autorisés : rouvrir l'étape si
+la cérémonie n'a pas abouti. ». « Terminer le plan » clôt le plan sans preuve ;
+c'est un choix de l'opérateur, pas une vérification.
+
+**Abandonner** demande une confirmation, avec « Ce qui est déjà approuvé garde son
+effet. » Une campagne déjà ouverte reste ouverte jusqu'à son échéance, et
+« Commencer » reste refusé d'ici là.
+
+Une cérémonie déjà en cours (un autre geste) désactive ces boutons.
+
+Quand la dernière étape réussit, Orion affiche « Parc autorisé ; chaque poste se
+renouvelle à sa prochaine connexion. » (avec le rappel « Rappel : Terminer la
+rotation CA TLS à son échéance. » si une rotation CA TLS a été faite) ; la ligne
+redevient « Tout renouveler », sans plan.
 
 Ce n'est pas une campagne, c'est un **plan de quatre campagnes ordonnées**. Ces
 quatre choses appartiennent à quatre familles d'objets signés, et une famille
@@ -1263,7 +1320,7 @@ astra chain open --reason "renouvellement annuel" --requested-by "prénom.nom" \
   --issuer-request-out issuer-request.json
 ```
 
-La première étape est ouverte. Ensuite, pour chacune des suivantes :
+À la console, la première étape s'ouvre ainsi. Pour chacune des suivantes :
 
 ```sh
 # depuis le poste opérateur : approuver l'étape en cours, avec sa commande
@@ -1290,6 +1347,11 @@ de gateway. Le plan reste dans le volume d'état, et le service seul l'écrit.
 astra chain status     # où en est le plan
 astra chain abandon    # l'abandonner ; ce qui est approuvé garde son effet
 ```
+
+La console n'a pas de `chain reopen` : une étape close dont l'effet n'a pas abouti
+se rouvre depuis Orion (« Rouvrir l'étape »). Orion lit un plan ouvert à la console,
+mais ne tient pas la demande de sa délégation : la ligne le signale comme une
+campagne perdue (§10, plus haut).
 
 **L'ordre n'est pas une préférence.** L'émetteur signe les feuilles clientes,
 l'ancre TLS est ce à quoi elles se chaînent, l'identité gateway est ce que
