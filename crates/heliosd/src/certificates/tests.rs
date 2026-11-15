@@ -363,6 +363,104 @@ fn service(state: RegistryState) -> (CertificateService, tempfile::TempDir) {
     )
 }
 
+#[tokio::test]
+async fn trust_enrolment_rejects_malformed_and_unadmitted_keys() {
+    let (service, _directory) = service(state());
+
+    assert!(matches!(
+        service.trust_enrolment("not a wireguard key").await,
+        Err(TrustUpdateRefusal::Rejected)
+    ));
+    assert!(matches!(
+        service.trust_enrolment(&key(2).to_base64()).await,
+        Err(TrustUpdateRefusal::Rejected)
+    ));
+}
+
+#[tokio::test]
+async fn trust_enrolment_returns_the_registered_peer_trust_block() {
+    let peer_key = key(2);
+    let mut registry_state = state();
+    registry_state.peers.insert(peer_key.to_base64(), peer());
+    let expected_domain = registry_state.trust_domain_id.to_hex();
+    let expected_anchor = registry_state.gateway.current_ca_public_key.to_base64();
+    let (service, _directory) = service(registry_state);
+
+    let view = service
+        .trust_enrolment(&peer_key.to_base64())
+        .await
+        .expect("admitted peer has an enrolment view");
+
+    assert_eq!(view.trust_domain_id, expected_domain);
+    assert_eq!(view.ca_pq_public_key, expected_anchor);
+    assert_eq!(view.ca_epoch, 1);
+    assert_eq!(view.ca_tls_epoch, 2);
+    assert_eq!(view.client_generation, 4);
+    assert_eq!(view.active_gateway_identity_epoch, 3);
+    assert_eq!(view.gateway_decision_epoch, 3);
+    assert_eq!(view.astra_authority_url, "https://astra.example");
+    assert_eq!(view.webauthn_rp_id, "astra.example");
+}
+
+#[tokio::test]
+async fn domain_returns_a_single_registry_snapshot_including_peer_state() {
+    let peer_key = key(2);
+    let mut registry_state = state();
+    registry_state.peers.insert(peer_key.to_base64(), peer());
+    let expected_domain = registry_state.trust_domain_id.to_hex();
+    let (service, _directory) = service(registry_state);
+
+    let view = service.domain().await.expect("domain snapshot");
+
+    assert_eq!(view.trust_domain_id, expected_domain);
+    assert_eq!(view.server_name, "gateway.example");
+    assert_eq!(view.ca_epoch, 1);
+    assert_eq!(view.client_tls_ca_epoch, 2);
+    assert_eq!(view.gateway_identity_epoch, 3);
+    assert!(view.now_unix > 0);
+    assert_eq!(view.peers.len(), 1);
+    assert_eq!(view.peers[0].name, "workstation");
+    assert_eq!(view.peers[0].wg_public_key, peer_key.to_base64());
+    assert_eq!(view.peers[0].generation, 4);
+}
+
+#[tokio::test]
+async fn malformed_stage_commit_caller_is_rejected_without_registry_mutation() {
+    let peer_key = key(2);
+    let mut registry_state = state();
+    registry_state.peers.insert(peer_key.to_base64(), peer());
+    let (service, _directory) = service(registry_state);
+    let before = service.registry.lock().await.state().clone();
+    let relayed = relayed_commit();
+    let request = Box::new(aether::certificates::client::StageCommitRequest {
+        commit: *relayed.commit,
+        grant: *relayed.grant,
+    });
+
+    assert_eq!(
+        service.stage_commit("not a wireguard key", request).await,
+        Err(TrustUpdateRefusal::Rejected)
+    );
+    assert_eq!(*service.registry.lock().await.state(), before);
+}
+
+#[tokio::test]
+async fn malformed_trust_update_caller_is_rejected_before_authority_io() {
+    let peer_key = key(2);
+    let mut registry_state = state();
+    registry_state.peers.insert(peer_key.to_base64(), peer());
+    let (service, _directory) = service(registry_state);
+    let before = service.registry.lock().await.state().clone();
+
+    assert!(matches!(
+        service
+            .trust_update("not a wireguard key", authenticated_request(&key(2)))
+            .await,
+        Err(TrustUpdateRefusal::Rejected)
+    ));
+    assert_eq!(*service.registry.lock().await.state(), before);
+}
+
 /// A client leaf issued to one exact WireGuard key, with a real signature.
 fn client_leaf(wg_public_key: &WireGuardKey, not_after: u64) -> PqCertificate {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
