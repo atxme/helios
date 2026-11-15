@@ -1503,9 +1503,11 @@ dans [ROADMAP.md](ROADMAP.md) (F14-a à F14-f).
   ce poste, ou qui a divergé. Récupérez le coffre à jour sur le poste qui le
   tient. » Le bouton « Remplacer quand même », avec l'avertissement « La copie
   d’Astra sera remplacée par ce coffre. À ne faire que si vous savez que la
-  copie d’Astra est fausse. », n'est offert que dans *Coffre et clés*, et jamais
-  pendant la reprise d'une rotation : l'onglet *Rotations* n'affiche que le
-  refus. Une copie refusée ne remet pas une rotation en cause : à la fin d'une
+  copie d’Astra est fausse. », n'est offert que là où l'envoi part du coffre :
+  la ligne « Copie du coffre » de *Coffre et clés*, et le résultat d'un geste sur
+  les clés (ajout, retrait, marquage). Il n'est jamais offert dans l'onglet
+  *Rotations*, qui n'affiche que le refus, ni pendant la reprise d'une rotation.
+  Une copie refusée ne remet pas une rotation en cause : à la fin d'une
   rotation, elle l'achève, et la ligne « Copie du coffre » reste « À faire ».
 - **Sauvegarde et poste en retard.** « Exporter le coffre », dans *Coffre et
   clés*, écrit le seul fichier chiffré du coffre, sans clé ni tunnel, dans un

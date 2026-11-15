@@ -1629,6 +1629,13 @@ action, puis état attendu.
     « Exporter le coffre » : « Coffre exporté ». Sur B, « Changer… » sous « Coffre opérateur »,
     puis choisir le fichier exporté. Attendu : l'empreinte affichée de B est celle de A, et la
     ligne « Copie du coffre » de B est à jour, sans détail, comme sur A.
+138. **[cible] Geste sur les clés sur le poste en retard.** Suite de 132, sur B, tunnel
+    monté, avec un coffre plus ancien que celui d'Astra. Faire le même geste sur une clé que
+    sur A (« Marquer perdue »). Attendu : le refus « Astra tient un coffre plus récent que
+    celui de ce poste, ou qui a divergé. Récupérez le coffre à jour sur le poste qui le tient. »
+    s'affiche sous le geste, avec « Remplacer quand même » et l'avertissement « La copie
+    d’Astra sera remplacée par ce coffre. À ne faire que si vous savez que la copie d’Astra
+    est fausse. ». Ouvrir ensuite *Rotations* : le refus seul, sans bouton.
 
 ### Le chemin manuel
 
