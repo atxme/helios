@@ -212,6 +212,11 @@ pub struct RotationJournal {
     pub activation_at: u64,
     pub not_after: u64,
     pub signed_at: u64,
+    /// No campaign exists: the operator's gesture stands for the acceptance, and
+    /// resumes never read Astra. Absent in journals written before this mark, which
+    /// read as in a campaign.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub without_campaign: bool,
 }
 
 impl RotationJournal {
@@ -230,6 +235,16 @@ impl RotationJournal {
             || self.not_after != window.not_after
         {
             bail!("le journal de rotation ne décrit pas la transition qu'il porte");
+        }
+        if self.without_campaign
+            && (self.deposit.is_some()
+                || self.kind != RotationKind::CaPq
+                || self.stage == JournalStage::Signed)
+        {
+            bail!(
+                "un journal de rotation sans campagne ne porte ni dépôt, ni rotation CA TLS, ni \
+                 signature en attente"
+            );
         }
         match &self.deposit {
             None if self.stage == JournalStage::Signed => {
@@ -265,10 +280,17 @@ impl RotationJournal {
         Ok(())
     }
 
-    /// An adoption nothing has confirmed: no deposit to show for it, and Astra
-    /// has not been heard naming its anchor.
-    pub fn awaits_confirmation(&self) -> bool {
+    /// Accepted, with no deposit of its own: whether a campaign confirms it or not.
+    /// What the older CA-PQ file waits for, before it may go.
+    pub fn without_deposit_unapplied(&self) -> bool {
         self.deposit.is_none() && self.stage == JournalStage::Accepted
+    }
+
+    /// An adoption nothing has confirmed: no deposit to show for it, and Astra
+    /// has not been heard naming its anchor. A rotation without a campaign has no
+    /// Astra to confirm it, so it never awaits one.
+    pub fn awaits_confirmation(&self) -> bool {
+        self.without_deposit_unapplied() && !self.without_campaign
     }
 }
 
@@ -410,7 +432,7 @@ pub fn ensure_ca_pq_may_run(vault_path: &Path) -> Result<()> {
     // A journal it cannot read is not that exception, and is refused by presence.
     let unconfirmed = matches!(
         load(&path_beside(vault_path)),
-        Ok(Some(journal)) if journal.awaits_confirmation()
+        Ok(Some(journal)) if journal.without_deposit_unapplied()
     );
     if unconfirmed && legacy_ca_pq_path_beside(vault_path).exists() {
         return Ok(());
@@ -506,7 +528,7 @@ pub fn apply_local(vault_path: &Path, journal: &mut RotationJournal) -> Result<(
         ..journal.clone()
     };
     save(&path_beside(vault_path), &applied)?;
-    let unconfirmed = journal.awaits_confirmation();
+    let unconfirmed = journal.without_deposit_unapplied();
     *journal = applied;
     if unconfirmed {
         remove_legacy_ca_pq(vault_path)?;
@@ -658,6 +680,7 @@ impl LegacyCaPqJournal {
             activation_at: window.activation_at,
             not_after: window.not_after,
             signed_at: window.not_before,
+            without_campaign: false,
         })
     }
 }
@@ -722,6 +745,7 @@ fn adopted_prepared(record: prepared::PreparedRotation) -> Result<RotationJourna
         activation_at,
         not_after,
         signed_at: prepared_at,
+        without_campaign: false,
     })
 }
 
@@ -755,7 +779,11 @@ pub fn adopt_legacy(vault_path: &Path) -> Result<Option<RotationJournal>> {
     };
     if let Some(legacy) = legacy_ca_pq {
         legacy.ensure_describes_vault_at(vault_path)?;
-        let adopted = legacy.adopted()?;
+        let mut adopted = legacy.adopted()?;
+        // The CLI never changes the origin, so the relay in place says whether a
+        // campaign can exist. With an origin, the adoption waits for Astra as before.
+        let relay = handoff::load(&handoff::path_beside(vault_path))?;
+        adopted.without_campaign = relay.astra_authority_url.is_none();
         let Some(in_place) = in_place else {
             save(&journal_path, &adopted)?;
             return Ok(Some(adopted));
@@ -772,7 +800,7 @@ pub fn adopt_legacy(vault_path: &Path) -> Result<Option<RotationJournal>> {
         }
         // A stop between the apply and the removal: the journal is further along,
         // and the older file is what remains to go.
-        if !in_place.awaits_confirmation() {
+        if !in_place.without_deposit_unapplied() {
             remove_legacy_ca_pq(vault_path)?;
         }
         return Ok(Some(in_place));
@@ -949,6 +977,7 @@ fn next_step_of_signed(journal: &RotationJournal, facts: &ResumeFacts) -> Resume
 }
 
 fn next_step_of_accepted(journal: &RotationJournal, facts: &ResumeFacts) -> ResumeStep {
+    // Without a campaign there is no Astra to ask: the operator's gesture stands for it.
     if !journal.awaits_confirmation() {
         return ResumeStep::ApplyLocal;
     }
@@ -1112,6 +1141,7 @@ mod tests {
             activation_at: ACTIVATION,
             not_after: NOT_AFTER,
             signed_at: NOW,
+            without_campaign: false,
         }
     }
 
@@ -2071,5 +2101,73 @@ mod tests {
             crate::prepared::load(&prepared_path).expect("load"),
             Some(record)
         );
+    }
+
+    // The mark of a rotation without a campaign.
+
+    /// A journal written with the mark reads back equal, and one without the key
+    /// reads as in a campaign.
+    #[test]
+    fn without_campaign_journal_round_trips_and_old_journals_read_false() {
+        let place = place();
+        let marked = RotationJournal {
+            without_campaign: true,
+            ..unconfirmed()
+        };
+        save(&place.journal_path, &marked).expect("save");
+        assert_eq!(load(&place.journal_path).expect("load"), Some(marked));
+
+        let plain = unconfirmed();
+        save(&place.journal_path, &plain).expect("save");
+        let written = std::fs::read_to_string(&place.journal_path).expect("read");
+        assert!(!written.contains("without_campaign"), "{written}");
+        let read = load(&place.journal_path).expect("load").expect("journal");
+        assert!(!read.without_campaign);
+    }
+
+    /// The mark is only for a CA-PQ acceptance with no deposit of its own, and
+    /// never for a signature still waiting: each refused by `save` and by `load`.
+    #[test]
+    fn validate_refuses_without_campaign_with_a_deposit_or_ca_tls_or_signed() {
+        let place = place();
+        let refused = [
+            RotationJournal {
+                without_campaign: true,
+                ..ca_pq_journal(JournalStage::Accepted)
+            },
+            RotationJournal {
+                without_campaign: true,
+                ..journal(JournalStage::Accepted)
+            },
+            RotationJournal {
+                without_campaign: true,
+                deposit: None,
+                ..ca_pq_journal(JournalStage::Signed)
+            },
+        ];
+        for candidate in refused {
+            assert!(
+                save(&place.journal_path, &candidate).is_err(),
+                "{candidate:?}"
+            );
+            std::fs::write(
+                &place.journal_path,
+                serde_json::to_vec(&candidate).expect("bytes"),
+            )
+            .expect("write");
+            assert!(load(&place.journal_path).is_err(), "{candidate:?}");
+        }
+    }
+
+    /// Accepted with no campaign: nothing is awaited from Astra, and the resume
+    /// applies the vault without reading it.
+    #[test]
+    fn without_campaign_accepted_applies_without_reading_astra() {
+        let accepted = RotationJournal {
+            without_campaign: true,
+            ..unconfirmed()
+        };
+        assert!(!accepted.awaits_confirmation());
+        assert_eq!(next_step(&accepted, &facts(NOW)), ResumeStep::ApplyLocal);
     }
 }

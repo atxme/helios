@@ -724,6 +724,7 @@ impl OpenedRotation {
             activation_at: schedule.window.activation_at,
             not_after: schedule.window.not_after,
             signed_at: now,
+            without_campaign: false,
         };
         rotation_journal::save(&rotation_journal::path_beside(vault_path), &journal)?;
         Ok(journal)
@@ -749,7 +750,8 @@ pub fn vault_copy(vault_path: &Path) -> Result<OperatorVaultCopy> {
 /// - [`ResumeStep::Finished`]: the copy was attempted and the journal is gone. A
 ///   copy that failed does not undo anything: the prerequisite reads it and the
 ///   screen offers to send it (spec §5.9). A client TLS rotation still has its
-///   prepared record, until « Terminer ».
+///   prepared record, until « Terminer ». A rotation without a campaign ends here
+///   with no copy at all, and Astra is not called.
 /// - [`ResumeStep::SendVaultCopy`]: Astra holds the copy back. The same copy passes
 ///   later, so the journal stays and the next look retries it.
 /// - [`ResumeStep::Discard`]: nothing was announced, and the journal is gone.
@@ -798,6 +800,11 @@ pub fn advance(
                 install(remote, journal)?;
                 install_sent = true;
                 facts.gateway_next = GatewayAnchor::NotRead;
+            }
+            // Without a campaign, Astra holds no copy to hold back: the journal ends here.
+            ResumeStep::SendVaultCopy if journal.without_campaign => {
+                rotation_journal::clear(&rotation_journal::path_beside(vault_path))?;
+                return Ok(ResumeStep::Finished);
             }
             ResumeStep::SendVaultCopy => return finish_with_the_copy(remote, vault_path, journal),
             ResumeStep::Discard => {

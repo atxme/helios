@@ -1700,6 +1700,14 @@ fn a_dead_campaign_with_the_status_read_failing_keeps_the_journal() {
 /// What `astra-signer` leaves behind, adopted: it holds no deposit and does not
 /// say whether one went out.
 fn adopted_legacy_journal(domain: &Domain) -> RotationJournal {
+    write_legacy_ca_pq(domain);
+    rotation_journal::adopt_legacy(&domain.path)
+        .expect("adopted")
+        .expect("a journal")
+}
+
+/// Writes the CA-PQ file `astra-signer` leaves beside the vault, and names it.
+fn write_legacy_ca_pq(domain: &Domain) -> PathBuf {
     let mut vault = store::load(&domain.path).expect("vault");
     let relay = domain.relay();
     let identity = handoff::identity_of(&relay).expect("identity");
@@ -1727,14 +1735,9 @@ fn adopted_legacy_journal(domain: &Domain) -> RotationJournal {
         transition: rotated.transition,
         handoff: next_handoff,
     };
-    documents::write(
-        &rotation_journal::legacy_ca_pq_path_beside(&domain.path),
-        &legacy,
-    )
-    .expect("written");
-    rotation_journal::adopt_legacy(&domain.path)
-        .expect("adopted")
-        .expect("a journal")
+    let legacy_path = rotation_journal::legacy_ca_pq_path_beside(&domain.path);
+    documents::write(&legacy_path, &legacy).expect("written");
+    legacy_path
 }
 
 /// The user's rule, and `next_step` is its only barrier: `apply_local` does not
@@ -2658,4 +2661,142 @@ fn resume_trigger_reads_a_record_it_cannot_parse_as_an_error() {
     let domain = domain();
     std::fs::write(prepared::path_beside(&domain.path), b"illisible").expect("written");
     assert!(rotation_journal::something_to_resume(&domain.path).is_err());
+}
+
+/// The domain's relay in place, with no Astra origin: no campaign exists for it.
+fn without_origin(domain: &Domain) {
+    let path = handoff::path_beside(&domain.path);
+    let mut relay = handoff::load(&path).expect("relay");
+    relay.astra_authority_url = None;
+    handoff::save(&path, &relay).expect("relay saved");
+}
+
+/// A rotation without a campaign: the gateway names the outgoing anchor until the
+/// transition is installed, then the next one. Astra is never called.
+struct WithoutCampaign {
+    outgoing: Fingerprint,
+    next: Fingerprint,
+    installs: Cell<u32>,
+}
+
+impl RotationRemote for WithoutCampaign {
+    fn open_campaign(&self, _: &OperatorOpenRequest) -> Result<OperatorOpened> {
+        panic!("a rotation without a campaign opens none")
+    }
+
+    fn fetch_campaign(&self, _: &Id16) -> Result<CampaignRequest> {
+        panic!("a rotation without a campaign fetches none")
+    }
+
+    fn submit_campaign(
+        &self,
+        _: &Id16,
+        _: &str,
+        _: &AstraSignerResult,
+    ) -> Result<SigningOperationState> {
+        panic!("a rotation without a campaign deposits nothing")
+    }
+
+    fn authority_status(&self) -> Result<OperatorAuthorityStatus> {
+        panic!("a rotation without a campaign never reads Astra")
+    }
+
+    fn send_vault_copy(&self, _: &OperatorVaultCopy) -> Result<VaultCopySent> {
+        panic!("a rotation without a campaign sends no copy")
+    }
+
+    fn install_ca_transition(&self, _: &CaTransition) -> Result<()> {
+        self.installs.set(self.installs.get() + 1);
+        Ok(())
+    }
+
+    fn install_client_tls_ca_transition(&self, _: &ClientTlsCaTransition) -> Result<()> {
+        panic!("a CA-PQ rotation installs no client TLS transition")
+    }
+
+    fn gateway_next_anchor(&self, kind: RotationKind) -> Result<Option<Fingerprint>> {
+        assert_eq!(kind, RotationKind::CaPq);
+        Ok(Some(if self.installs.get() == 0 {
+            self.outgoing
+        } else {
+            self.next
+        }))
+    }
+}
+
+#[test]
+fn advance_without_campaign_finishes_without_the_copy() {
+    let domain = domain();
+    let mut journal = RotationJournal {
+        without_campaign: true,
+        deposit: None,
+        stage: JournalStage::Accepted,
+        ..domain.signed(RotationKind::CaPq)
+    };
+    let next_vault = journal.next.as_ref().expect("next").vault.clone();
+    rotation_journal::save(&rotation_journal::path_beside(&domain.path), &journal).expect("saved");
+    let remote = WithoutCampaign {
+        outgoing: journal.transition.outgoing_anchor_fingerprint(),
+        next: journal.next_anchor_fingerprint,
+        installs: Cell::new(0),
+    };
+
+    let step = advance(&remote, &domain.path, &mut journal, NOW).expect("advanced");
+
+    assert_eq!(step, ResumeStep::Finished);
+    assert_eq!(remote.installs.get(), 1);
+    assert_eq!(domain.journal_on_disk(), None);
+    assert_eq!(store::load(&domain.path).expect("vault"), next_vault);
+}
+
+/// Without an origin, the file beside the vault is a rotation with no campaign.
+#[test]
+fn adopt_legacy_without_origin_marks_without_campaign() {
+    let domain = domain();
+    without_origin(&domain);
+    write_legacy_ca_pq(&domain);
+
+    let journal = rotation_journal::adopt_legacy(&domain.path)
+        .expect("adopted")
+        .expect("a journal");
+
+    assert!(journal.without_campaign);
+    assert!(!journal.awaits_confirmation());
+}
+
+/// With an origin, the adoption is the one that waits for Astra, whatever its value.
+#[test]
+fn legacy_ca_pq_with_origin_still_awaits_confirmation() {
+    let domain = domain();
+    write_legacy_ca_pq(&domain);
+
+    let journal = rotation_journal::adopt_legacy(&domain.path)
+        .expect("adopted")
+        .expect("a journal");
+
+    assert!(!journal.without_campaign);
+    assert!(journal.awaits_confirmation());
+}
+
+/// The older file is what a stop leaves behind: it goes only once the vault is
+/// applied, so a second adoption before that keeps it.
+#[test]
+fn legacy_file_stays_until_applied_without_campaign() {
+    let domain = domain();
+    without_origin(&domain);
+    let legacy_path = write_legacy_ca_pq(&domain);
+    let mut journal = rotation_journal::adopt_legacy(&domain.path)
+        .expect("adopted")
+        .expect("a journal");
+
+    let again = rotation_journal::adopt_legacy(&domain.path)
+        .expect("adopted again")
+        .expect("a journal");
+
+    assert_eq!(again, journal);
+    assert!(legacy_path.exists(), "it stays until the vault is applied");
+
+    rotation_journal::apply_local(&domain.path, &mut journal).expect("applied");
+
+    assert!(!legacy_path.exists());
 }
