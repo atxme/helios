@@ -608,6 +608,9 @@ dans Orion ») et, pour les suivis, dans `ROADMAP.md` (F14-a à F14-f).
   geste voulu de l'opérateur (exception à « le coffre ne bouge qu'après
   l'acceptation »). Son successeur, quand F14 absorbe `astra-signer` au lot 7,
   reste à nommer.
+  *Amendement du 15 novembre 2026 : le successeur est « Remplacer la CA-PQ sans campagne… »
+  dans Orion (F14-e), et l'exception ne vaut que sans origine Astra (conception
+  `docs/superpowers/specs/2026-11-15-f14-e-ca-pq-sans-campagne-design.md`, §5.5).*
 - **Copie du coffre** : un administrateur du tunnel peut la remplacer ; une
   génération précédente est gardée ; une sauvegarde hors de la gateway n'est pas
   couverte. Deux postes tenant un même domaine peuvent écraser une copie plus
