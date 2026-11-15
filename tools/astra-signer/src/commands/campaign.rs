@@ -276,7 +276,19 @@ pub(crate) fn approve_campaign(
         );
     }
 
-    let required = usize::from(campaign.required_credentials);
+    // Validate the manifest, bindings, domain pin and active credential count
+    // before asking the operator to connect a key. Keep the session across the
+    // ceremony so each physical key answers while it is still plugged in.
+    let session = signing::CampaignApprovalSession::new(
+        &campaign,
+        &registry,
+        &identity,
+        &ca_pq_public_key,
+        &vault.rp_id,
+        &origin,
+        now_unix(),
+    )?;
+    let required = session.required();
     println!("campagne         : {}", campaign.campaign_id.to_hex());
     println!("portée           : {:?}", campaign.scope);
     println!("cibles           : {}", campaign.targets.len());
@@ -285,33 +297,13 @@ pub(crate) fn approve_campaign(
     println!("empreinte        : {}", campaign.fingerprint());
     println!("confirmations    : {required} clé(s) distincte(s)");
 
-    // Plugged one at a time, and each connection is its own: two touches of
-    // one token is what `approve_campaign` refuses, and asking for the keys
-    // one after another is how an operator finds that out at the second.
-    let mut keys = Vec::new();
-    let mut pins = Vec::new();
-    for index in 1..=required {
+    let approval = approve_campaign_sequentially(session, |index| {
         eprintln!("Brancher la clé {index}/{required}, puis appuyer sur Entrée.");
         wait_for_operator()?;
         let key = authenticator::connect(transport)?;
-        pins.push(pin_for(key.as_ref(), "PIN de la clé de sécurité : ")?);
-        keys.push(key);
-    }
-    let key_refs: Vec<&dyn astra_operator::authenticator::Authenticator> =
-        keys.iter().map(|key| key.as_ref()).collect();
-    let pin_refs: Vec<&str> = pins.iter().map(|pin| pin.as_str()).collect();
-
-    let approval = signing::approve_campaign(
-        &key_refs,
-        &campaign,
-        &registry,
-        &identity,
-        &ca_pq_public_key,
-        &vault.rp_id,
-        &origin,
-        &pin_refs,
-        now_unix(),
-    )?;
+        let pin = pin_for(key.as_ref(), "PIN de la clé de sécurité : ")?;
+        Ok((key, pin))
+    })?;
 
     match (&online, out) {
         (Some((client, request)), _) => {
@@ -339,6 +331,35 @@ pub(crate) fn approve_campaign(
          refusée, pas réapprouvée"
     );
     Ok(())
+}
+
+/// Collects each campaign assertion before asking for the next physical key.
+///
+/// The factory is injected so tests can use simulated authenticators without a
+/// terminal or HID device; production supplies one after every prompt. The
+/// shrinking allow-list belongs to the session and is read only after the next
+/// authenticator has been connected.
+fn approve_campaign_sequentially<'key>(
+    mut session: signing::CampaignApprovalSession,
+    mut connect_key: impl FnMut(
+        usize,
+    ) -> Result<(
+        Box<dyn astra_operator::authenticator::Authenticator + 'key>,
+        Zeroizing<String>,
+    )>,
+) -> Result<aether::certificates::status::CampaignApproval> {
+    for index in 1..=session.required() {
+        let (key, pin) = connect_key(index)?;
+        let offered = session.offered_credentials();
+        let assertion = key.approve(
+            session.webauthn_rp_id(),
+            &offered,
+            session.client_data_json(),
+            &pin,
+        )?;
+        session.accept(assertion, now_unix())?;
+    }
+    Ok(session.finish(now_unix())?)
 }
 
 #[cfg(test)]
@@ -441,7 +462,7 @@ mod campaign_approval_precondition_tests {
     use aether::certificates::{
         approval::CredentialRegistry,
         encoding::{Fingerprint, TrustDomainId, WireGuardKey},
-        status::{AstraRotationCampaign, CampaignScope},
+        status::{AstraRotationCampaign, CampaignScope, CampaignTarget, CertificateKind},
     };
     use astra_operator::vault::{
         AuthoritySecrets, AuthorityVault, SlotEnrolment, SlotRole, SlotSecret,
@@ -516,26 +537,42 @@ mod campaign_approval_precondition_tests {
             }
         }
 
-        fn campaign_file(&self, scope: CampaignScope) -> PathBuf {
-            let path = self._directory.path().join("campaign.json");
+        fn campaign(&self, scope: CampaignScope) -> AstraRotationCampaign {
+            let now = now_unix();
             let trust_domain_id = TrustDomainId::new([0x31; 16]).expect("domain id");
-            let campaign = AstraRotationCampaign {
+            AstraRotationCampaign {
                 format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
                 campaign_id: Id16::new([0x71; 16]).expect("campaign id"),
                 trust_domain_id,
                 gateway_wg_public_key: WireGuardKey::from_bytes([0x42; 32]),
                 server_name: "gateway.example".into(),
-                created_at: 1,
-                expires_at: 100,
+                created_at: now.saturating_sub(1),
+                expires_at: now.saturating_add(300),
                 scope,
-                targets: Vec::new(),
+                targets: vec![CampaignTarget {
+                    certificate_kind: CertificateKind::GatewayTls,
+                    identity_key: WireGuardKey::from_bytes([0x42; 32]),
+                    epoch: 1,
+                    generation: 1,
+                    active_tls_certificate_fingerprint: Fingerprint::of(b"active TLS"),
+                    active_pq_certificate_fingerprint: Fingerprint::of(b"active PQ"),
+                }],
                 reason: "test fixture".into(),
                 requested_by: "test operator".into(),
                 policy_fingerprint: Fingerprint::of(b"test policy"),
                 required_credentials: scope.required_credentials(),
-            };
+            }
+        }
+
+        fn write_campaign(&self, campaign: &AstraRotationCampaign) -> PathBuf {
+            let path = self._directory.path().join("campaign.json");
             documents::write(&path, &campaign).expect("write campaign fixture");
             path
+        }
+
+        fn campaign_file(&self, scope: CampaignScope) -> PathBuf {
+            let campaign = self.campaign(scope);
+            self.write_campaign(&campaign)
         }
 
         fn approve_file(&self, campaign_path: &Path, out: &Path) -> anyhow::Error {
@@ -628,5 +665,218 @@ mod campaign_approval_precondition_tests {
             !format!("{no_output_error:#}").contains("missing-campaign.json"),
             "the missing output is rejected before reading the campaign: {no_output_error:#}"
         );
+    }
+
+    #[test]
+    fn offline_campaign_lease_is_checked_before_requesting_a_key() {
+        let fixture = Fixture::new();
+        let mut campaign = fixture.campaign(CampaignScope::GatewayIdentity);
+        campaign.expires_at = now_unix();
+        let campaign_path = fixture.write_campaign(&campaign);
+        let out = fixture._directory.path().join("approval.json");
+
+        let error = fixture.approve_file(&campaign_path, &out);
+
+        assert!(format!("{error:#}").contains("lease"), "{error:#}");
+        assert!(!format!("{error:#}").contains("terminal"));
+        assert!(!out.exists());
+    }
+
+    #[test]
+    fn offline_campaign_requires_a_usable_credential_registry_before_requesting_a_key() {
+        let fixture = Fixture::new();
+        let campaign = fixture.campaign(CampaignScope::GatewayIdentity);
+        let campaign_path = fixture.write_campaign(&campaign);
+        let out = fixture._directory.path().join("approval.json");
+
+        let error = fixture.approve_file(&campaign_path, &out);
+
+        assert!(format!("{error:#}").contains("empty document"), "{error:#}");
+        assert!(!format!("{error:#}").contains("terminal"));
+        assert!(!out.exists());
+    }
+}
+
+#[cfg(test)]
+mod sequential_approval_tests {
+    use super::*;
+    use std::{cell::RefCell, collections::VecDeque, rc::Rc};
+
+    use astra_operator::{
+        authenticator::{
+            Approval, ApprovedOpening, Authenticator, AuthenticatorError, CredentialSubject,
+            Opened, Registration,
+        },
+        operations::fixtures::{self, Domain, TestKey},
+    };
+
+    type OfferedHistory = Rc<RefCell<Vec<Vec<Vec<u8>>>>>;
+
+    struct RecordingAuthenticator<'a> {
+        inner: &'a TestKey,
+        offered: OfferedHistory,
+    }
+
+    impl Authenticator for RecordingAuthenticator<'_> {
+        fn register(
+            &self,
+            _rp_id: &str,
+            _subject: &CredentialSubject,
+            _exclude: &[Vec<u8>],
+            _pin: &str,
+        ) -> std::result::Result<Registration, AuthenticatorError> {
+            Err(AuthenticatorError::Device("unused in campaign test".into()))
+        }
+
+        fn derive(
+            &self,
+            _rp_id: &str,
+            _credentials: &[Vec<u8>],
+            _salt: &[u8; 32],
+            _pin: &str,
+        ) -> std::result::Result<Opened, AuthenticatorError> {
+            Err(AuthenticatorError::Device("unused in campaign test".into()))
+        }
+
+        fn approve(
+            &self,
+            rp_id: &str,
+            credentials: &[Vec<u8>],
+            client_data_json: &[u8],
+            pin: &str,
+        ) -> std::result::Result<Approval, AuthenticatorError> {
+            self.offered.borrow_mut().push(credentials.to_vec());
+            self.inner
+                .approve(rp_id, credentials, client_data_json, pin)
+        }
+
+        fn approve_and_derive(
+            &self,
+            _rp_id: &str,
+            _credentials: &[Vec<u8>],
+            _client_data_json: &[u8],
+            _salt: &[u8; 32],
+            _pin: &str,
+        ) -> std::result::Result<ApprovedOpening, AuthenticatorError> {
+            Err(AuthenticatorError::Device("unused in campaign test".into()))
+        }
+    }
+
+    struct CampaignFixture {
+        session: signing::CampaignApprovalSession,
+        domain: Domain,
+    }
+
+    impl CampaignFixture {
+        fn new() -> Self {
+            let now = now_unix();
+            let domain = fixtures::domain();
+            let relay = domain.relay();
+            let identity = handoff::identity_of(&relay).expect("domain identity");
+            let vault = store::load(&domain.path).expect("operator vault");
+            let registry = domain.registry();
+            let ca_pq =
+                aether::certificates::encoding::MlDsa87PublicKey::parse(&relay.ca_pq_public_key)
+                    .expect("read test CA-PQ public key");
+            let mut campaign = domain.authority_campaign(fixtures::NOW + 300);
+            campaign.created_at = now;
+            campaign.expires_at = now.saturating_add(300);
+            let session = signing::CampaignApprovalSession::new(
+                &campaign,
+                &registry,
+                &identity,
+                &ca_pq,
+                &vault.rp_id,
+                &format!("https://{}", vault.rp_id),
+                now,
+            )
+            .expect("valid campaign session");
+
+            Self { session, domain }
+        }
+
+        fn credential_ids(&self) -> [Vec<u8>; 2] {
+            let vault = store::load(&self.domain.path).expect("operator vault");
+            [
+                vault.slots[0].credential_id().expect("first credential id"),
+                vault.slots[1]
+                    .credential_id()
+                    .expect("second credential id"),
+            ]
+        }
+    }
+
+    fn recording_key<'a>(
+        inner: &'a TestKey,
+        history: &OfferedHistory,
+    ) -> Box<dyn Authenticator + 'a> {
+        Box::new(RecordingAuthenticator {
+            inner,
+            offered: Rc::clone(history),
+        })
+    }
+
+    #[test]
+    fn helper_collects_two_real_assertions_with_a_shrinking_allow_list() {
+        let fixture = CampaignFixture::new();
+        let [first_id, second_id] = fixture.credential_ids();
+        let initial_offered = fixture.session.offered_credentials();
+        assert_eq!(initial_offered.len(), 3);
+        let history = Rc::new(RefCell::new(Vec::new()));
+        let first_key = &fixture.domain.keys[0];
+        let second_key = &fixture.domain.keys[1];
+        let mut keys = VecDeque::from([
+            recording_key(first_key, &history),
+            recording_key(second_key, &history),
+        ]);
+
+        let approval = approve_campaign_sequentially(fixture.session, |_| {
+            let key = keys
+                .pop_front()
+                .ok_or_else(|| anyhow::anyhow!("no simulated key remains"))?;
+            Ok((key, Zeroizing::new(String::new())))
+        })
+        .expect("both physical keys approve sequentially");
+
+        let offered = history.borrow();
+        assert_eq!(offered.len(), 2);
+        assert_eq!(offered[0], initial_offered);
+        assert_eq!(offered[1].len(), 2);
+        assert!(!offered[1].contains(&first_id));
+        assert!(offered[1].contains(&second_id));
+        assert!(offered[0].contains(&first_id));
+        assert_eq!(approval.approvals.len(), 2);
+        assert_eq!(approval.approvals[0].credential_id, first_id);
+        assert_eq!(approval.approvals[1].credential_id, second_id);
+    }
+
+    #[test]
+    fn a_repeated_simulated_key_is_refused_after_first_assertion() {
+        let fixture = CampaignFixture::new();
+        let [first_id, second_id] = fixture.credential_ids();
+        let history = Rc::new(RefCell::new(Vec::new()));
+        let first_key = &fixture.domain.keys[0];
+        let mut keys = VecDeque::from([
+            recording_key(first_key, &history),
+            recording_key(first_key, &history),
+        ]);
+        let mut supplied = 0;
+
+        let error = approve_campaign_sequentially(fixture.session, |_| {
+            supplied += 1;
+            let key = keys
+                .pop_front()
+                .ok_or_else(|| anyhow::anyhow!("no simulated key remains"))?;
+            Ok((key, Zeroizing::new(String::new())))
+        })
+        .expect_err("a repeated key cannot answer the narrowed allow-list");
+
+        let offered = history.borrow();
+        assert_eq!(supplied, 2);
+        assert_eq!(offered.len(), 2);
+        assert_eq!(offered[1].len(), 2);
+        assert!(!offered[1].contains(&first_id));
+        assert!(offered[1].contains(&second_id));
+        assert!(format!("{error:#}").contains("credential"));
     }
 }
