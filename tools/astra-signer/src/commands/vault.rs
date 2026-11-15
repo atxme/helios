@@ -477,7 +477,7 @@ fn parse_slot_id(value: &str) -> Result<[u8; 16]> {
 
 #[cfg(test)]
 mod tests {
-    use super::{domain, parse_slot_id};
+    use super::{bindings, domain, init, parse_slot_id, rename};
     use aether::certificates::encoding::{TrustDomainId, WireGuardKey};
     use astra_operator::vault::{
         AuthoritySecrets, AuthorityVault, SlotEnrolment, SlotRole, SlotSecret,
@@ -705,5 +705,68 @@ mod tests {
             domain(&missing_vault, None, None, None, None, None).expect_err("missing vault");
         assert!(format!("{error:#}").contains("absent-vault.json"));
         assert!(!Path::new(&astra_operator::handoff::path_beside(&missing_vault)).exists());
+    }
+
+    #[test]
+    fn init_refuses_to_replace_an_existing_vault_before_terminal_or_key_access() {
+        let fixture = DomainFixture::new();
+        let before = std::fs::read(&fixture.vault_path).expect("vault bytes");
+
+        let error = init(
+            &fixture.vault_path,
+            "astra.example",
+            None,
+            "second authority",
+            SlotRole::Primary,
+            astra_operator::authenticator::Transport::Hid,
+        )
+        .expect_err("existing vault must not be initialized again");
+
+        assert!(format!("{error:#}").contains("un coffre existe déjà"));
+        assert_eq!(
+            std::fs::read(&fixture.vault_path).expect("vault remains"),
+            before
+        );
+    }
+
+    #[test]
+    fn rename_changes_only_the_slot_label_without_resealing_the_vault() {
+        let fixture = DomainFixture::new();
+        let before = astra_operator::store::load(&fixture.vault_path).expect("load vault");
+        let slot_id = before.slots[0].slot_id;
+
+        rename(&fixture.vault_path, &hex::encode(slot_id), "backup key")
+            .expect("rename does not require an authenticator");
+
+        let after = astra_operator::store::load(&fixture.vault_path).expect("reload vault");
+        assert_eq!(after.slots[0].label, "backup key");
+        assert_eq!(after.slots[0].slot_id, before.slots[0].slot_id);
+        assert_eq!(after.sealed_payload, before.sealed_payload);
+        assert_eq!(after.trust_domain_id, before.trust_domain_id);
+    }
+
+    #[test]
+    fn bindings_rejects_bad_or_unknown_slots_before_key_access_or_registry_write() {
+        let fixture = DomainFixture::new();
+        let registry_path = astra_operator::credentials::path_beside(&fixture.vault_path);
+
+        let malformed = bindings(
+            &fixture.vault_path,
+            &["not-hex".into()],
+            &[],
+            astra_operator::authenticator::Transport::Hid,
+        )
+        .expect_err("malformed slot id");
+        assert!(format!("{malformed:#}").contains("identifiant de key-slot"));
+
+        let unknown = bindings(
+            &fixture.vault_path,
+            &[hex::encode([0x99; 16])],
+            &[],
+            astra_operator::authenticator::Transport::Hid,
+        )
+        .expect_err("unknown slot id");
+        assert!(format!("{unknown:#}").contains("aucun key-slot"));
+        assert!(!registry_path.exists());
     }
 }
