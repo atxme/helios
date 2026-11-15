@@ -20,6 +20,9 @@
 
 use std::path::Path;
 
+/// The name the transition is saved under.
+pub const TRANSITION_FILE: &str = "ca-pq-transition.json";
+
 use anyhow::Context as _;
 use astra_operator::operations::rotation as operation;
 use astra_operator::overview::VaultOverview;
@@ -30,6 +33,8 @@ use orion_core::operator_rotations::{
     AuthorityStatusRead, GatewayDomainRead, PeerCertificatesRead, PendingOperationRead, Reach,
 };
 use serde::Serialize;
+
+use super::{ArtifactEncoding, OperatorArtifact};
 
 use aether::certificates::encoding::Id16;
 use aether::certificates::transport::{
@@ -546,6 +551,47 @@ pub fn read_journal(vault_path: &Result<std::path::PathBuf, String>) -> LocalJou
             .map(|journal| JournalView::of(&journal)),
         resumable: rotation_journal::something_to_resume(path).unwrap_or(false),
     }
+}
+
+/// The file a CA-PQ replacement without a campaign hands the operator when the gateway has
+/// not taken its transition: the journal's `CaTransition`, written as `documents::write`
+/// writes a document. Nothing for another kind of journal.
+pub fn transition_artifact(journal: &RotationJournal) -> Option<OperatorArtifact> {
+    let rotation_journal::RotationTransition::CaPq(transition) = &journal.transition else {
+        return None;
+    };
+    match serde_json::to_string_pretty(transition.as_ref()) {
+        Ok(mut contents) => {
+            contents.push('\n');
+            Some(OperatorArtifact {
+                file_name: TRANSITION_FILE.to_string(),
+                contents,
+                encoding: ArtifactEncoding::Text,
+                fingerprint: None,
+            })
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "the CA-PQ transition could not be serialized");
+            None
+        }
+    }
+}
+
+/// The transition file of a rotation without a campaign whose vault has moved and whose
+/// gateway has not taken it, read beside the vault: no tunnel, no key, no session. The
+/// file stays downloadable as long as that journal does, across restarts. Nothing for any
+/// other journal, and nothing for a journal that cannot be read.
+pub fn read_transition_file(
+    vault_path: &Result<std::path::PathBuf, String>,
+) -> Option<OperatorArtifact> {
+    let path = vault_path.as_ref().ok()?;
+    let journal = rotation_journal::load(&rotation_journal::path_beside(path))
+        .ok()
+        .flatten()?;
+    if !journal.without_campaign || journal.stage != JournalStage::Applied {
+        return None;
+    }
+    transition_artifact(&journal)
 }
 
 /// Reads the vault and what rotations left beside it, without a key.

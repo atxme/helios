@@ -30,7 +30,7 @@ use astra_operator::operations::rotation::{
     OpenedWithoutCampaign, OperationSource, RotationRemote, RotationTerms, ValidatedKeys,
 };
 use astra_operator::rotation_journal::{
-    self, JournalStage, ResumeStep, RotationJournal, RotationKind, RotationTransition,
+    self, JournalStage, ResumeStep, RotationJournal, RotationKind,
 };
 use astra_operator::tunnel::{self, Tunnel, TunnelRefusal};
 use astra_operator::vault::VaultError;
@@ -38,16 +38,11 @@ use astra_operator::vault::VaultError;
 use super::gateway::store_words;
 use super::wait::{answers_the_terms, Ended, Step, Waiting};
 use super::{connect_key, now_unix, Ceremony, Press};
-use crate::operator::rotations::ChainStepRefusal;
-use crate::operator::{
-    relay_names_peer, ArtifactEncoding, GatewayTarget, OperatorArtifact, RotationGesture, Words,
-};
+use crate::operator::rotations::{self, ChainStepRefusal};
+use crate::operator::{relay_names_peer, GatewayTarget, OperatorArtifact, RotationGesture, Words};
 
 /// Said when the tunnel leads to a gateway the domain's relay does not name.
 const WRONG_GATEWAY: &str = "la gateway jointe n'est pas celle que le relais du domaine désigne";
-
-/// The file a CA-PQ rotation without a campaign offers when the gateway did not take it.
-const TRANSITION_FILE: &str = "ca-pq-transition.json";
 
 /// A rotation takes two distinct keys, each touched once to validate and once to
 /// approve.
@@ -554,11 +549,13 @@ impl RotationRun<'_> {
             self.show();
         }
         // Without a campaign, the transition is what the operator takes to the gateway
-        // by hand when it stops short of its end.
+        // by hand when it stops short of its end: only once the vault has moved, and
+        // never when the relay gained an origin, which makes it no longer theirs to pose.
         if journal.without_campaign
+            && journal.stage == JournalStage::Applied
             && !matches!(
                 advanced,
-                Ok(ResumeStep::Finished | ResumeStep::SendVaultCopy)
+                Ok(ResumeStep::Finished | ResumeStep::SendVaultCopy | ResumeStep::DomainConflict)
             )
         {
             self.offer_transition(&journal);
@@ -581,25 +578,10 @@ impl RotationRun<'_> {
         }
     }
 
-    /// Deposits `ca-pq-transition.json`: the journal's `CaTransition`, written as
-    /// `documents::write` writes a document.
+    /// Deposits `ca-pq-transition.json` (see [`rotations::transition_artifact`]).
     fn offer_transition(&mut self, journal: &RotationJournal) {
-        let RotationTransition::CaPq(transition) = &journal.transition else {
-            return;
-        };
-        match serde_json::to_string_pretty(transition.as_ref()) {
-            Ok(mut contents) => {
-                contents.push('\n');
-                (self.deposit)(OperatorArtifact {
-                    file_name: TRANSITION_FILE.to_string(),
-                    contents,
-                    encoding: ArtifactEncoding::Text,
-                    fingerprint: None,
-                });
-            }
-            Err(error) => {
-                tracing::warn!(error = %error, "the CA-PQ transition could not be serialized");
-            }
+        if let Some(artifact) = rotations::transition_artifact(journal) {
+            (self.deposit)(artifact);
         }
     }
 

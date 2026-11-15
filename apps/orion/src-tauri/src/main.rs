@@ -804,6 +804,7 @@ fn main() {
             operator_rotations_overview,
             operator_peers_overview,
             operator_rotation_journal,
+            operator_rotation_transition_file,
             operator_send_vault_copy,
             operator_open_campaign,
             operator_vault_location,
