@@ -460,4 +460,131 @@ mod lifecycle {
         task.await.expect("automatic task exits cleanly");
         assert!(service.renewals.lock().await.is_empty());
     }
+
+    #[tokio::test]
+    async fn empty_fleet_renewal_returns_a_clear_error_without_recording_profile_failures() {
+        let scratch = Scratch::new("empty-renewal-fleet");
+        let service = service(&scratch);
+
+        let error = service
+            .run_certificate_action(
+                String::new(),
+                orion_core::CertificateAction::RenewEveryProfile,
+            )
+            .await
+            .expect_err("an empty fleet has nothing to renew");
+
+        assert_eq!(error, "aucun profil Helios sur cet appareil");
+        assert!(service.last_certificate_error.lock().await.is_empty());
+        assert!(service.renewals.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn overview_reports_each_profile_kind_and_its_last_action_error() {
+        let scratch = Scratch::new("overview-last-errors");
+        let service = service(&scratch);
+        {
+            let mut config = service.config.lock().await;
+            config
+                .profiles
+                .push(profile("classic", ProfileKind::Classic));
+            let mut helios = profile("bureau", ProfileKind::HeliosKeyNegotiation);
+            helios.key_negotiation = Some(key_negotiation("sealed-identity"));
+            config.profiles.push(helios);
+        }
+        service
+            .record_certificate_error("bureau", "refus de renouvellement simulé".into())
+            .await;
+
+        let overview = service
+            .certificate_overview()
+            .await
+            .expect("certificate overview is available");
+
+        assert_eq!(overview.len(), 2);
+        let classic = overview
+            .iter()
+            .find(|row| row.name == "classic")
+            .expect("classic profile is included");
+        assert!(!classic.negotiates);
+        assert!(classic.identity.is_empty());
+        assert_eq!(classic.last_error, None);
+
+        let helios = overview
+            .iter()
+            .find(|row| row.name == "bureau")
+            .expect("Helios profile is included");
+        assert!(helios.negotiates);
+        assert_eq!(helios.identity, "sealed-identity");
+        assert_eq!(
+            helios.last_error.as_deref(),
+            Some("refus de renouvellement simulé")
+        );
+    }
+
+    #[tokio::test]
+    async fn single_profile_actions_refuse_before_starting_with_a_missing_identity() {
+        let scratch = Scratch::new("actions-missing-identity");
+        let service = service(&scratch);
+        {
+            let mut config = service.config.lock().await;
+            let mut helios = profile("bureau", ProfileKind::HeliosKeyNegotiation);
+            helios.key_negotiation = Some(key_negotiation("sealed-identity"));
+            config.profiles.push(helios);
+        }
+
+        for action in [
+            orion_core::CertificateAction::RenewNow,
+            orion_core::CertificateAction::RecoverExpired,
+            orion_core::CertificateAction::RollbackToPrevious,
+        ] {
+            let error = service
+                .run_certificate_action("bureau".into(), action)
+                .await
+                .expect_err("the configured identity is absent from the protected store");
+            assert!(
+                error.contains("Aucune identité protégée nommée"),
+                "{action:?}: {error}"
+            );
+            assert_eq!(
+                service.last_certificate_error("bureau".into()).await,
+                Some(error)
+            );
+        }
+
+        assert!(service.renewals.lock().await.is_empty());
+        assert!(service.recoveries.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejected_single_profile_action_is_recorded_for_the_overview() {
+        let scratch = Scratch::new("action-refusal-overview");
+        let service = service(&scratch);
+        {
+            let mut config = service.config.lock().await;
+            config
+                .profiles
+                .push(profile("classic", ProfileKind::Classic));
+        }
+
+        let error = service
+            .run_certificate_action(
+                "classic".into(),
+                orion_core::CertificateAction::RecoverExpired,
+            )
+            .await
+            .expect_err("a classic profile cannot recover a Helios identity");
+
+        assert_eq!(
+            service.last_certificate_error("classic".into()).await,
+            Some(error.clone())
+        );
+        let overview = service
+            .certificate_overview()
+            .await
+            .expect("refusal remains visible in the overview");
+        assert_eq!(overview.len(), 1);
+        assert_eq!(overview[0].last_error.as_deref(), Some(error.as_str()));
+        assert!(service.recoveries.lock().await.is_empty());
+    }
 }

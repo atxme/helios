@@ -74,7 +74,10 @@
 //! inert meanwhile: the routes it points at named the interface, and went with
 //! it.
 
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::{
+    future::Future,
+    net::{Ipv4Addr, Ipv6Addr},
+};
 
 use aether::net::TunnelPrefixV6;
 use helios_wireguard::PeerConfig;
@@ -328,13 +331,25 @@ fn is_table_flush(args: &[String]) -> bool {
 
 /// Runs one family's commands after clearing that family's rules.
 async fn install(family: Family, commands: &[Vec<String>]) -> Result<(), RoutingError> {
-    flush_rules(family).await?;
+    install_with(family, commands, |args| async move { run(&args).await }).await
+}
+
+async fn install_with<F, Fut>(
+    family: Family,
+    commands: &[Vec<String>],
+    run_command: F,
+) -> Result<(), RoutingError>
+where
+    F: Fn(Vec<String>) -> Fut,
+    Fut: Future<Output = Result<(), RoutingError>>,
+{
+    flush_rules_with(family, &run_command).await?;
     for args in commands {
         // `route flush` on a table that was never created is a success on some
         // kernels and an error on others, and neither says anything about the
         // routes we are about to add. Only the rule and the routes are
         // load-bearing.
-        match run(args).await {
+        match run_command(args.clone()).await {
             Ok(()) => {}
             Err(error) if is_table_flush(args) => {
                 tracing::debug!(%error, "clearing the VIP table found nothing to clear");
@@ -346,10 +361,18 @@ async fn install(family: Family, commands: &[Vec<String>]) -> Result<(), Routing
 }
 
 async fn remove(family: Family) -> Result<(), RoutingError> {
-    flush_rules(family).await?;
+    remove_with(family, |args| async move { run(&args).await }).await
+}
+
+async fn remove_with<F, Fut>(family: Family, run_command: F) -> Result<(), RoutingError>
+where
+    F: Fn(Vec<String>) -> Fut,
+    Fut: Future<Output = Result<(), RoutingError>>,
+{
+    flush_rules_with(family, &run_command).await?;
     // Left for last and unchecked: with the rule gone the table is
     // unreachable, so a route that survives is inert rather than harmful.
-    if let Err(error) = run(&table_flush(family)).await {
+    if let Err(error) = run_command(table_flush(family)).await {
         tracing::debug!(%error, "clearing the VIP table found nothing to clear");
     }
     Ok(())
@@ -360,9 +383,13 @@ async fn remove(family: Family) -> Result<(), RoutingError> {
 ///
 /// The priority is the ownership marker: nothing else in the system is
 /// expected to claim it, and a crashed `heliosd` leaves its rule behind.
-async fn flush_rules(family: Family) -> Result<(), RoutingError> {
+async fn flush_rules_with<F, Fut>(family: Family, run_command: &F) -> Result<(), RoutingError>
+where
+    F: Fn(Vec<String>) -> Fut,
+    Fut: Future<Output = Result<(), RoutingError>>,
+{
     for _ in 0..MAX_STALE_RULES {
-        if run(&rule_delete(family)).await.is_err() {
+        if run_command(rule_delete(family)).await.is_err() {
             return Ok(());
         }
     }
@@ -539,6 +566,124 @@ mod tests {
 
     fn prefix() -> TunnelPrefixV6 {
         "fd3c:91a2:7e04::1/64".parse().unwrap()
+    }
+
+    fn command_error(args: &[String]) -> RoutingError {
+        RoutingError::CommandFailed(args.join(" "), "mock failure".into())
+    }
+
+    #[tokio::test]
+    async fn install_ignores_only_the_table_flush_failure_and_runs_in_order() {
+        use std::{cell::RefCell, rc::Rc};
+
+        let calls = Rc::new(RefCell::new(Vec::<Vec<String>>::new()));
+        let recorded = Rc::clone(&calls);
+        let plan = plan("helios0", "100.64.0.1/10", &[peer("100.64.98.223/32")]).unwrap();
+        install_with(Family::V4, &plan.commands(), move |args| {
+            recorded.borrow_mut().push(args.clone());
+            async move {
+                let deleting_rule = args.first().map(String::as_str) == Some("rule")
+                    && args.get(1).map(String::as_str) == Some("del");
+                if deleting_rule || args.get(1).map(String::as_str) == Some("flush") {
+                    Err(command_error(&args))
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            rendered(&calls.borrow()),
+            [
+                "rule del priority 32000",
+                "route flush table 51820",
+                "route replace 100.64.98.223/32 dev helios0 src 100.64.0.1 table 51820",
+                "rule add to 100.64.0.0/10 lookup 51820 priority 32000",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn install_stops_and_returns_an_error_when_a_peer_route_fails() {
+        use std::{cell::RefCell, rc::Rc};
+
+        let calls = Rc::new(RefCell::new(Vec::<Vec<String>>::new()));
+        let recorded = Rc::clone(&calls);
+        let plan = plan("helios0", "100.64.0.1/10", &[peer("100.64.98.223/32")]).unwrap();
+        let result = install_with(Family::V4, &plan.commands(), move |args| {
+            recorded.borrow_mut().push(args.clone());
+            async move {
+                let deleting_rule = args.first().map(String::as_str) == Some("rule")
+                    && args.get(1).map(String::as_str) == Some("del");
+                if deleting_rule
+                    || args.get(1).map(String::as_str) == Some("flush")
+                    || args.get(1).map(String::as_str) == Some("replace")
+                {
+                    Err(command_error(&args))
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(
+            result,
+            Err(RoutingError::CommandFailed(
+                "route replace 100.64.98.223/32 dev helios0 src 100.64.0.1 table 51820".into(),
+                "mock failure".into(),
+            ))
+        );
+        assert_eq!(
+            rendered(&calls.borrow()),
+            [
+                "rule del priority 32000",
+                "route flush table 51820",
+                "route replace 100.64.98.223/32 dev helios0 src 100.64.0.1 table 51820",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn withdrawal_finishes_after_rules_are_gone_even_if_table_flush_fails() {
+        use std::{cell::RefCell, rc::Rc};
+
+        let calls = Rc::new(RefCell::new(Vec::<Vec<String>>::new()));
+        let recorded = Rc::clone(&calls);
+        remove_with(Family::V6, move |args| {
+            recorded.borrow_mut().push(args.clone());
+            async move { Err(command_error(&args)) }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            rendered(&calls.borrow()),
+            ["-6 rule del priority 32000", "-6 route flush table 51820"]
+        );
+    }
+
+    #[tokio::test]
+    async fn rule_cleanup_is_bounded_even_if_every_delete_succeeds() {
+        use std::{cell::RefCell, rc::Rc};
+
+        let calls = Rc::new(RefCell::new(Vec::<Vec<String>>::new()));
+        let recorded = Rc::clone(&calls);
+        let commands = [table_flush(Family::V6)];
+        install_with(Family::V6, &commands, move |args| {
+            recorded.borrow_mut().push(args);
+            async { Ok(()) }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(calls.borrow().len(), MAX_STALE_RULES + 1);
+        assert!(calls.borrow()[..MAX_STALE_RULES]
+            .iter()
+            .all(|args| args == &rule_delete(Family::V6)));
+        assert_eq!(calls.borrow().last(), Some(&table_flush(Family::V6)));
     }
 
     /// Criterion 6: the IPv4 sequence is the one this module always ran,
