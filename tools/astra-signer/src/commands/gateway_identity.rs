@@ -809,6 +809,64 @@ mod tests {
             }
         }
 
+        fn bootstrap_request(
+            &self,
+            gateway_key: WireGuardKey,
+            server_name: &str,
+        ) -> aether::certificates::gateway::GatewayBootstrapRequest {
+            let (private_key, public_key) =
+                aether::certificates::encoding::generate_ml_dsa_87_keypair()
+                    .expect("gateway keypair");
+            aether::certificates::gateway::GatewayBootstrapRequest {
+                format_version: CERTIFICATE_FORMAT_VERSION,
+                gateway_wg_public_key: gateway_key,
+                server_name: server_name.to_string(),
+                ml_dsa_87_public_key: public_key,
+                key_possession_proof: aether::certificates::encoding::MlDsa87Signature::placeholder(
+                ),
+            }
+            .sign(&private_key)
+            .expect("signed gateway bootstrap request")
+        }
+
+        fn issue_bootstrap(
+            &self,
+            request: &aether::certificates::gateway::GatewayBootstrapRequest,
+        ) -> anyhow::Result<()> {
+            let request_path = self._directory.path().join("bootstrap-request.json");
+            let out = self._directory.path().join("gateway-certificate.json");
+            std::fs::write(
+                &request_path,
+                serde_json::to_vec(request).expect("serialize bootstrap request"),
+            )
+            .expect("write bootstrap request");
+            issue_gateway_bootstrap(&self.vault_path, &request_path, &out, 365, Transport::Hid)
+        }
+
+        fn assert_bootstrap_refusal_is_read_only(
+            &self,
+            request: &aether::certificates::gateway::GatewayBootstrapRequest,
+        ) -> anyhow::Error {
+            let error = self
+                .issue_bootstrap(request)
+                .expect_err("invalid bootstrap input must be refused");
+            assert!(!self
+                ._directory
+                .path()
+                .join("gateway-certificate.json")
+                .exists());
+            let vault = store::load(&self.vault_path).expect("vault remains readable");
+            let handoff = astra_operator::handoff::DomainHandoff::beside(&self.vault_path, &vault)
+                .expect("handoff remains readable");
+            let expected_gateway_key = self.gateway_key.to_base64();
+            assert_eq!(
+                handoff.gateway_wg_public_key.as_deref(),
+                Some(expected_gateway_key.as_str())
+            );
+            assert_eq!(handoff.server_name.as_deref(), Some("gateway.example"));
+            error
+        }
+
         fn rollback(
             &self,
             transition: &GatewayIdentityTransition,
@@ -832,6 +890,141 @@ mod tests {
                 Transport::Hid,
             )
         }
+    }
+
+    #[test]
+    fn bootstrap_refuses_a_different_gateway_key_before_requesting_credentials() {
+        let fixture = Fixture::new();
+        let request =
+            fixture.bootstrap_request(WireGuardKey::from_bytes([0x77; 32]), "gateway.example");
+
+        let error = fixture.assert_bootstrap_refusal_is_read_only(&request);
+
+        assert!(error.to_string().contains("autre gateway"));
+        assert!(!format!("{error:#}").contains("terminal"));
+    }
+
+    #[test]
+    fn bootstrap_refuses_a_different_service_name_before_requesting_credentials() {
+        let fixture = Fixture::new();
+        let request = fixture.bootstrap_request(fixture.gateway_key, "other.example");
+
+        let error = fixture.assert_bootstrap_refusal_is_read_only(&request);
+
+        assert!(error.to_string().contains("autre gateway"));
+        assert!(!format!("{error:#}").contains("terminal"));
+    }
+
+    #[test]
+    fn bootstrap_refuses_an_invalid_service_name_without_changing_handoff() {
+        let fixture = Fixture::new();
+        let request = fixture.bootstrap_request(fixture.gateway_key, "not a dns name");
+
+        let error = fixture.assert_bootstrap_refusal_is_read_only(&request);
+
+        assert!(!format!("{error:#}").contains("terminal"));
+    }
+
+    #[test]
+    fn bootstrap_refuses_an_unsupported_request_version_without_changing_handoff() {
+        let fixture = Fixture::new();
+        let mut request = fixture.bootstrap_request(fixture.gateway_key, "gateway.example");
+        request.format_version = u16::MAX;
+
+        let error = fixture.assert_bootstrap_refusal_is_read_only(&request);
+
+        assert!(format!("{error:#}").contains("version"), "{error:#}");
+        assert!(!format!("{error:#}").contains("terminal"));
+    }
+
+    #[test]
+    fn bootstrap_refuses_a_substituted_gateway_public_key_without_changing_handoff() {
+        let fixture = Fixture::new();
+        let mut request = fixture.bootstrap_request(fixture.gateway_key, "gateway.example");
+        request.gateway_wg_public_key = WireGuardKey::from_bytes([0x77; 32]);
+
+        let error = fixture.assert_bootstrap_refusal_is_read_only(&request);
+
+        assert!(
+            format!("{error:#}").contains("bootstrap gateway"),
+            "{error:#}"
+        );
+        assert!(!format!("{error:#}").contains("terminal"));
+    }
+
+    #[test]
+    fn bootstrap_refuses_a_substituted_pq_public_key_without_changing_handoff() {
+        let fixture = Fixture::new();
+        let mut request = fixture.bootstrap_request(fixture.gateway_key, "gateway.example");
+        let (_, substituted_public_key) =
+            aether::certificates::encoding::generate_ml_dsa_87_keypair()
+                .expect("substitute gateway keypair");
+        request.ml_dsa_87_public_key = substituted_public_key;
+
+        let error = fixture.assert_bootstrap_refusal_is_read_only(&request);
+
+        assert!(
+            format!("{error:#}").contains("bootstrap gateway"),
+            "{error:#}"
+        );
+        assert!(!format!("{error:#}").contains("terminal"));
+    }
+
+    #[test]
+    fn bootstrap_refuses_a_missing_request_before_changing_handoff() {
+        let fixture = Fixture::new();
+        let request_path = fixture._directory.path().join("missing-request.json");
+        let out = fixture._directory.path().join("gateway-certificate.json");
+
+        let error = issue_gateway_bootstrap(
+            &fixture.vault_path,
+            &request_path,
+            &out,
+            365,
+            Transport::Hid,
+        )
+        .expect_err("missing bootstrap request must fail");
+
+        assert!(format!("{error:#}").contains("missing-request.json"));
+        assert!(!out.exists());
+        let vault = store::load(&fixture.vault_path).expect("vault remains readable");
+        let handoff = astra_operator::handoff::DomainHandoff::beside(&fixture.vault_path, &vault)
+            .expect("handoff remains readable");
+        let expected_gateway_key = fixture.gateway_key.to_base64();
+        assert_eq!(
+            handoff.gateway_wg_public_key.as_deref(),
+            Some(expected_gateway_key.as_str())
+        );
+        assert_eq!(handoff.server_name.as_deref(), Some("gateway.example"));
+    }
+
+    #[test]
+    fn bootstrap_refuses_malformed_json_before_changing_handoff() {
+        let fixture = Fixture::new();
+        let request_path = fixture._directory.path().join("malformed-request.json");
+        let out = fixture._directory.path().join("gateway-certificate.json");
+        std::fs::write(&request_path, b"{not-json").expect("write malformed request");
+
+        let error = issue_gateway_bootstrap(
+            &fixture.vault_path,
+            &request_path,
+            &out,
+            365,
+            Transport::Hid,
+        )
+        .expect_err("malformed bootstrap request must fail");
+
+        assert!(format!("{error:#}").contains("décodage"), "{error:#}");
+        assert!(!out.exists());
+        let vault = store::load(&fixture.vault_path).expect("vault remains readable");
+        let handoff = astra_operator::handoff::DomainHandoff::beside(&fixture.vault_path, &vault)
+            .expect("handoff remains readable");
+        let expected_gateway_key = fixture.gateway_key.to_base64();
+        assert_eq!(
+            handoff.gateway_wg_public_key.as_deref(),
+            Some(expected_gateway_key.as_str())
+        );
+        assert_eq!(handoff.server_name.as_deref(), Some("gateway.example"));
     }
 
     #[test]
