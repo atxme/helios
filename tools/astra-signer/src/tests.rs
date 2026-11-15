@@ -525,13 +525,28 @@ fn the_ca_pq_command_finishes_a_rotation_astra_has_not_confirmed() {
         .expect("adopted")
         .expect("a journal");
     assert!(journal_path.exists());
+    let replaced = store::revision_on_disk(&path);
 
     resume_ca_pq(&path, &out).expect("resumed");
 
     assert!(!journal_path.exists());
     assert!(!legacy_path.exists());
     assert!(out.exists());
-    assert_eq!(store::load(&path).expect("vault"), journal.vault);
+    // The vault lands one revision past the file it replaces, and the relay names
+    // the file as it landed.
+    let landed = store::load(&path).expect("vault");
+    assert_eq!(
+        landed,
+        astra_operator::vault::AuthorityVault {
+            revision: journal.vault.revision.max(replaced).saturating_add(1),
+            ..journal.vault.clone()
+        }
+    );
+    let relay = handoff::load(&handoff::path_beside(&path)).expect("relay");
+    assert_eq!(
+        relay.vault_fingerprint,
+        landed.fingerprint().expect("fingerprint").to_hex()
+    );
 }
 
 /// Past the apply the journal carries the rotation, and the command stays out.

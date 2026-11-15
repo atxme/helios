@@ -122,6 +122,21 @@ fn state_of(path: &Path, slot_id: &[u8; 16]) -> CredentialState {
 
 /// The creation is two presses, one per key, and the trial of both keys that
 /// ADR-008 §4 asks for reuses those two openings rather than a third press.
+/// The relay names the vault file as it was written, revision included.
+#[test]
+fn the_relay_names_the_vault_as_it_landed() {
+    let directory = tempfile::tempdir().expect("dir");
+    let path = vault_path(&directory);
+    create(&path, &FakeKey::new(1));
+
+    let relay = handoff::load(&handoff::path_beside(&path)).expect("relay");
+    let on_disk = store::load(&path).expect("vault");
+    assert_eq!(
+        relay.vault_fingerprint,
+        on_disk.fingerprint().expect("fingerprint").to_hex()
+    );
+}
+
 #[test]
 fn creating_a_domain_takes_one_assertion_per_key() {
     let directory = tempfile::tempdir().expect("tempdir");

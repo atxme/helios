@@ -351,10 +351,13 @@ pub(crate) fn promote_ca_tls(path: &Path, transport: Transport) -> Result<()> {
             destroyed_fingerprint,
         } => {
             store::save(path, &vault)?;
+            // The save wrote a revision of its own: the hand-off names the file as
+            // it landed.
+            let landed = store::load(path)?;
             // The hand-off moves with the vault, and only now: every issuance
             // command resolves its anchor and its generation from it, and the
             // gateway advances its own `ca_tls_epoch` at this same second.
-            let mut handoff = handoff::DomainHandoff::beside(path, &vault)?;
+            let mut handoff = handoff::DomainHandoff::beside(path, &landed)?;
             handoff.ca_tls_epoch = Some(record.next_ca_tls_epoch);
             handoff.ca_tls_certificate = Some(record.next_ca_tls_certificate.clone());
             handoff::save(&handoff::path_beside(path), &handoff)?;

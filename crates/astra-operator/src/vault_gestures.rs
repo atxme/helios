@@ -141,6 +141,8 @@ pub fn create_first_key(
     let mut relay = handoff::DomainHandoff::of(&created.vault)?;
     relay.astra_authority_url = Some(authority_url);
     store::save_new(vault_path, &created.vault)?;
+    // `save_new` wrote a revision of its own: the relay names the file as it landed.
+    relay.adopt(&store::load(vault_path)?)?;
     handoff::save(&handoff::path_beside(vault_path), &relay)?;
     Ok(created.opening)
 }

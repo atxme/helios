@@ -41,16 +41,19 @@ pub(crate) fn init(
         now_unix(),
     )?;
     store::save_new(path, &created.vault)?;
+    // The file as it landed: `save_new` wrote a revision of its own, so the
+    // fingerprints below are the file's, not the in-memory copy's.
+    let landed = store::load(path)?;
     // Written straight away: the three values below are what two other
     // programs need, and retyping a base64 anchor is where a deployment goes
     // wrong — silently, with the failure surfacing much later.
     let handoff_path = handoff::path_beside(path);
-    handoff::save(&handoff_path, &handoff::DomainHandoff::of(&created.vault)?)?;
+    handoff::save(&handoff_path, &handoff::DomainHandoff::of(&landed)?)?;
 
     println!("coffre            : {}", path.display());
     println!("relais            : {}", handoff_path.display());
     println!("domaine           : {}", created.vault.trust_domain_id);
-    println!("empreinte coffre  : {}", created.vault.fingerprint()?);
+    println!("empreinte coffre  : {}", landed.fingerprint()?);
     println!(
         "CA-PQ (publique)  : {}",
         created.ca_pq_public_key.to_base64()
@@ -108,6 +111,8 @@ pub(crate) fn enrol(path: &Path, label: &str, role: SlotRole, transport: Transpo
         now_unix(),
     )?;
     store::save(path, &vault)?;
+    // The file as it landed, which is what the fingerprint below names.
+    let vault = store::load(path)?;
     // The credential document is rebuilt from the table that just moved, in
     // the same operation (spec §2.4). The key still plugged in is the new one,
     // and it is now a slot of this vault — so it can sign the document that
@@ -190,6 +195,8 @@ pub(crate) fn remove(path: &Path, slot: &str, transport: Transport) -> Result<()
     let opened = gestures::open_with_authorized_key(key.as_ref(), &vault, &pin)?;
     resign_bindings(path, &vault, &opened)?;
     store::save(path, &vault)?;
+    // The file as it landed, which is what the fingerprint below names.
+    let vault = store::load(path)?;
 
     println!("key-slot retiré  : {}", hex::encode(removed));
     println!("empreinte coffre : {}", vault.fingerprint()?);

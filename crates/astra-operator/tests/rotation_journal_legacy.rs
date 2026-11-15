@@ -406,6 +406,17 @@ fn a_legacy_ca_pq_journal_astra_holds_applies_and_only_then_lets_the_file_go() {
             handoff::load(&handoff::path_beside(&domain.path)).expect("relay"),
             next_relay
         );
+        // And the fingerprint it records is the one of the file on disk.
+        assert_eq!(
+            handoff::load(&handoff::path_beside(&domain.path))
+                .expect("relay")
+                .vault_fingerprint,
+            store::load(&domain.path)
+                .expect("vault")
+                .fingerprint()
+                .expect("fingerprint")
+                .to_hex()
+        );
         assert_eq!(
             credentials::load(&credentials::path_beside(&domain.path)).expect("document"),
             Some(next_bindings)
